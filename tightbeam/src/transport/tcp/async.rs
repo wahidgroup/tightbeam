@@ -1,3 +1,8 @@
+//! Async TCP transport.
+//!
+//! [`TcpTransport`] runs over any [`AsyncProtocolStream`], and [`TokioStream`]
+//! carries it over a tokio TCP socket. An established transport splits into
+//! a [`TransportReader`] and a [`TransportWriter`] for the multiplexed plane.
 use std::sync::Arc;
 
 #[cfg(feature = "tokio")]
@@ -31,7 +36,6 @@ use crate::builder::TypeBuilder;
 use crate::der::Encode;
 use crate::policy::TransitStatus;
 use crate::transport::error::TransportFailure;
-use crate::transport::io::decode_transport_envelope;
 use crate::transport::protocols::{AsyncProtocolStream, AsyncReadStream, AsyncWriteStream, SplittableStream};
 use crate::transport::ResponsePackage;
 use crate::transport::{
@@ -100,6 +104,8 @@ mod policy {
 #[cfg(feature = "transport-policy")]
 use policy::*;
 
+/// Tokio TCP stream that carries DER-framed envelopes through the byte-level
+/// traits.
 #[cfg(feature = "tokio")]
 pub struct TokioStream {
 	stream: TcpStream,
@@ -190,6 +196,10 @@ pub struct TokioListener<P: CryptoProvider = DefaultCryptoProvider> {
 #[cfg(feature = "tokio")]
 impl<P: CryptoProvider + Send + Sync + 'static> TokioListener<P> {
 	/// The local address that the listener is bound to.
+	///
+	/// # Errors
+	///
+	/// - The I/O error of a socket that reports no local address.
 	pub fn local_addr(&self) -> Result<SocketAddr, IoError> {
 		self.listener.local_addr()
 	}
@@ -198,6 +208,10 @@ impl<P: CryptoProvider + Send + Sync + 'static> TokioListener<P> {
 	///
 	/// Accepted transports carry no confidentiality, integrity, or peer
 	/// authentication. See [`EndpointConfig::cleartext`].
+	///
+	/// # Errors
+	///
+	/// - The I/O error of a bind that fails.
 	pub async fn bind(addr: impl AsRef<str>) -> Result<Self, IoError> {
 		let listener = TcpListener::bind(addr.as_ref()).await?;
 		let config = EndpointConfig::cleartext();
@@ -207,6 +221,10 @@ impl<P: CryptoProvider + Send + Sync + 'static> TokioListener<P> {
 
 	/// Accept one connection as a transport built from this listener's
 	/// configuration.
+	///
+	/// # Errors
+	///
+	/// - The I/O error of an accept that fails.
 	pub async fn accept(&self) -> Result<(TcpTransport<TokioStream, P>, SocketAddr), IoError> {
 		let (stream, peer_addr) = self.listener.accept().await?;
 		let tokio_stream = TokioStream::from(stream);
@@ -233,7 +251,6 @@ impl<P: CryptoProvider + Send + Sync + 'static> Protocol for TokioListener<P> {
 		let listener = TcpListener::bind(addr.0).await?;
 		let bound_addr = listener.local_addr()?;
 		let config = EndpointConfig::cleartext();
-
 		Ok((Self { listener, config }, TightBeamSocketAddr(bound_addr)))
 	}
 
@@ -289,13 +306,12 @@ where
 	any(feature = "transport-cms", feature = "transport-ecies")
 ))]
 mod mux {
-	pub(crate) use crate::transport::io::take_rekey_context;
 	pub use crate::transport::multiplex::{
 		IntoMuxOffer, MuxCapable, MuxConnector, MuxRekeyContext, MuxRole, MuxTransport,
 	};
 
 	#[cfg(feature = "transport-policy")]
-	pub(crate) use crate::transport::messaging::{collect_step, CollectStep};
+	pub(crate) use crate::transport::io::CollectStep;
 	#[cfg(feature = "transport-policy")]
 	pub use crate::transport::multiplex::{GatedHalves, MuxAcceptor};
 }
@@ -364,15 +380,15 @@ where
 	///
 	/// # Errors
 	///
-	/// - `InvalidState` when the peer did not negotiate multiplexing, or the
-	///   handshake has not completed.
+	/// - [`TransportError::InvalidState`] -- the peer did not negotiate
+	///   multiplexing, or the handshake has not completed.
 	/// - A rekey harvest or split failure from the underlying transport.
 	pub fn into_mux(mut self, role: MuxRole) -> TransportResult<SplitMuxTransport<S>> {
 		let Some(settings) = self.negotiated_mux() else {
 			return Err(TransportError::InvalidState);
 		};
 
-		let rekey = take_rekey_context(&mut self, role)?;
+		let rekey = MuxRekeyContext::detach(&mut self, role)?;
 		let (reader, writer) = self.into_split()?;
 
 		let mut mux = MuxTransport::new(reader, writer, role, settings);
@@ -422,7 +438,7 @@ where
 	}
 
 	fn take_rekey(&mut self) -> TransportResult<Option<MuxRekeyContext>> {
-		take_rekey_context(self, MuxRole::Client)
+		MuxRekeyContext::detach(self, MuxRole::Client)
 	}
 
 	fn handshake_peer_certificate(&self) -> Option<Arc<Certificate>> {
@@ -457,7 +473,7 @@ where
 		}
 
 		while !matches!(self.state.phase(), SessionPhase::Encrypted(_)) {
-			match collect_step(self).await? {
+			match self.collect_step().await? {
 				CollectStep::Handshake(request) => {
 					self.perform_server_handshake(request).await?;
 				}
@@ -469,7 +485,7 @@ where
 	}
 
 	fn take_rekey(&mut self) -> TransportResult<Option<MuxRekeyContext>> {
-		take_rekey_context(self, MuxRole::Server)
+		MuxRekeyContext::detach(self, MuxRole::Server)
 	}
 
 	#[cfg(feature = "transport-policy")]
@@ -540,12 +556,10 @@ where
 	/// `remaining_records` counts down ([RFC 9846 § 5.5][rfc9846-5.5]).
 	///
 	/// The value sets trigger policy only. Decryption refuses records at the
-	/// AES-GCM volume bound ([`DEFAULT_REKEY_RECORD_LIMIT`]) whatever this
-	/// value is. A cleartext half never rekeys, so the limit does not apply to
-	/// it.
+	/// AES-GCM volume bounds whatever this value is. A cleartext half never
+	/// rekeys, so the limit does not apply to it.
 	///
 	/// [rfc9846-5.5]: https://datatracker.ietf.org/doc/html/rfc9846#section-5.5
-	/// [`DEFAULT_REKEY_RECORD_LIMIT`]: crate::constants::DEFAULT_REKEY_RECORD_LIMIT
 	pub fn with_rekey_limit(mut self, limit: u64) -> Self {
 		if let SplitRecv::Encrypted(cipher) = self.mode {
 			self.mode = SplitRecv::Encrypted(cipher.with_rekey_limit(limit));
@@ -585,7 +599,7 @@ where
 			(SplitRecv::Encrypted(_), WireEnvelope::Cleartext(_)) => Err(TransportError::MissingEncryption),
 			(SplitRecv::Encrypted(recv_key), WireEnvelope::Encrypted(encrypted_info)) => {
 				let decrypted_bytes = recv_key.decrypt_content(&encrypted_info)?;
-				let envelope = decrypted_bytes.with(|bytes| decode_transport_envelope(bytes))?;
+				let envelope = decrypted_bytes.with(|bytes| TransportEnvelope::from_der(bytes))?;
 				Ok(envelope)
 			}
 		}
@@ -707,15 +721,17 @@ where
 	///
 	/// The fresh counter resets the sequence discipline, because counter
 	/// nonces restart only with a fresh key (NIST SP 800-38D § 8.2.1). The
-	/// configured record limit carries over, so a tightened rekey cadence
-	/// survives every epoch. A cleartext half holds no keys, so it refuses the
-	/// install.
+	/// fresh cipher takes this half's envelope ceiling and keeps the current
+	/// record limit, so a tightened cadence survives every epoch. A cleartext
+	/// half holds no keys, so it refuses the install.
 	fn install_send_cipher(&mut self, cipher: SendCipher) -> TransportResult<()> {
 		let SplitSend::Encrypted(current) = &self.mode else {
 			return Err(TransportError::MissingEncryption);
 		};
 
-		let renewed = cipher.with_rekey_limit(current.rekey_limit());
+		let renewed = cipher
+			.with_envelope_ceiling(self.limits.encrypted_envelope)
+			.with_rekey_limit(current.rekey_limit());
 		self.mode = SplitSend::Encrypted(renewed);
 		Ok(())
 	}
@@ -756,8 +772,8 @@ where
 	///
 	/// # Errors
 	///
-	/// - `InvalidState` when the session is provisioned for encryption and its
-	///   handshake has not completed.
+	/// - [`TransportError::InvalidState`] -- the session is provisioned for
+	///   encryption and its handshake has not completed.
 	pub fn into_split(mut self) -> TransportResult<SplitTransport<S>> {
 		let (recv_mode, send_mode) = match self.state.phase() {
 			SessionPhase::Cleartext => (SplitRecv::Cleartext, SplitSend::Cleartext),
@@ -911,7 +927,6 @@ where
 
 		let wire_envelope = builder.build()?;
 		let wire_bytes = wire_envelope.to_der()?;
-
 		self.write_envelope_bytes(&wire_bytes).await?;
 		Ok(())
 	}
@@ -1026,6 +1041,7 @@ mod tests {
 	#[cfg(all(feature = "x509", feature = "aead"))]
 	mod cipher_install {
 		use super::super::*;
+		use crate::constants::{DEFAULT_MAX_ENCRYPTED_ENVELOPE, DEFAULT_REKEY_RECORD_LIMIT};
 		use crate::crypto::aead::RuntimeAead;
 		use crate::testing::{TestFrame, TestKey};
 		use crate::TightBeamError;
@@ -1057,10 +1073,14 @@ mod tests {
 		}
 
 		fn writer(mode: SplitSend) -> TransportWriter<NullStream> {
+			writer_under(mode, TransportLimits::default())
+		}
+
+		fn writer_under(mode: SplitSend, limits: TransportLimits) -> TransportWriter<NullStream> {
 			TransportWriter {
 				stream: NullStream,
 				mode,
-				limits: TransportLimits::default(),
+				limits,
 				#[cfg(feature = "instrument")]
 				trace: None,
 			}
@@ -1074,6 +1094,13 @@ mod tests {
 				#[cfg(feature = "instrument")]
 				trace: None,
 			}
+		}
+
+		/// Limits at twice the default encrypted-envelope ceiling, where a key
+		/// admits half the default record volume.
+		fn doubled_ceiling() -> TransportLimits {
+			let encrypted_envelope = 2 * DEFAULT_MAX_ENCRYPTED_ENVELOPE;
+			TransportLimits { encrypted_envelope, ..TransportLimits::default() }
 		}
 
 		/// The send cipher of an encrypted half. A cleartext half has none, so
@@ -1133,6 +1160,21 @@ mod tests {
 			assert_eq!(reader.remaining_records(), 2);
 
 			recv_key(&reader).decrypt_content(&record_zero)?;
+			Ok(())
+		}
+
+		/// A renewal bounds the fresh send cipher by this half's
+		/// encrypted-envelope ceiling, so a later override stops at the lower
+		/// volume that ceiling admits (RFC 9846 § 5.5).
+		#[test]
+		fn writer_install_bounds_the_fresh_cipher_by_the_envelope_ceiling() -> Result<(), TightBeamError> {
+			let limits = doubled_ceiling();
+			let current = SendCipher::new(test_runtime()).with_envelope_ceiling(limits.encrypted_envelope);
+			let mut writer = writer_under(SplitSend::Encrypted(current), limits);
+			writer.install_send_cipher(SendCipher::new(test_runtime()))?;
+
+			let raised = writer.with_rekey_limit(u64::MAX);
+			assert_eq!(raised.remaining_records(), DEFAULT_REKEY_RECORD_LIMIT / 2);
 			Ok(())
 		}
 
@@ -1379,6 +1421,42 @@ mod tests {
 		Ok(())
 	}
 
+	/// A CMS client that holds a trust store and the server chain, and no
+	/// identity, refuses before it sends anything.
+	#[cfg(all(feature = "x509", feature = "transport-cms"))]
+	#[tokio::test]
+	async fn cms_client_without_identity_fails_closed() -> TransportResult<()> {
+		let (_listener, client_stream) = bind_and_connect().await?;
+		let server_certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+		let encryption = EncryptionConfig {
+			trust_store: Some(empty_trust_store()),
+			server_certificate_chain: Some(Arc::from(vec![server_certificate])),
+			handshake_protocol: HandshakeProtocolKind::Cms,
+			..EncryptionConfig::unconfigured()
+		};
+
+		let mut transport = client_over(client_stream, encryption);
+		let dial = transport.perform_client_handshake().await;
+		let refused = matches!(dial, Err(TransportError::HandshakeError(HandshakeError::MutualAuthRequired)));
+		assert!(refused);
+		Ok(())
+	}
+
+	/// An ECIES client that holds no trust store has no validator for the
+	/// server the reply names, so it refuses before it sends anything.
+	#[cfg(all(feature = "x509", feature = "transport-ecies"))]
+	#[tokio::test]
+	async fn ecies_client_without_trust_store_fails_closed() -> TransportResult<()> {
+		let (_listener, client_stream) = bind_and_connect().await?;
+		let encryption = EncryptionConfig { allow_cleartext: true, ..EncryptionConfig::unconfigured() };
+		let mut transport = client_over(client_stream, encryption);
+
+		let dial = transport.perform_client_handshake().await;
+		let refused = matches!(dial, Err(TransportError::HandshakeError(HandshakeError::MissingTrustStore)));
+		assert!(refused);
+		Ok(())
+	}
+
 	#[cfg(all(feature = "transport-cms", feature = "transport-policy"))]
 	#[tokio::test]
 	async fn async_cms_round_trip() -> TransportResult<()> {
@@ -1530,10 +1608,10 @@ mod tests {
 		Ok(())
 	}
 
-	// The gossip colony gate reads the peer certificate before any
-	// request is disclosed (CWE-668), so the deferred single-flight
-	// handshake must be drivable on its own. It populates the peer
-	// certificate and sends no application frame, and a repeat does nothing.
+	/// The gossip colony gate reads the peer certificate before any request is
+	/// disclosed (CWE-668), so the deferred single-flight handshake must be
+	/// drivable on its own. It populates the peer certificate and sends no
+	/// application frame, and a repeat does nothing.
 	#[cfg(all(feature = "transport-policy", feature = "transport-ecies"))]
 	#[tokio::test]
 	async fn handshake_completes_alone_and_populates_peer_certificate() -> TransportResult<()> {

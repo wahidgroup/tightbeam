@@ -22,8 +22,7 @@
 //!
 //! # Bindings
 //!
-//! - The epoch receipt's `transcript_hash` pins the exchange: `H(hash_prev ||
-//!   request_der || server_random)`.
+//! - The epoch receipt's `transcript_hash` pins the exchange: `H(hash_prev || request_der || server_random)`.
 //! - The chain root advances over the full exchange: `hash_next = H(hash_prev
 //!   || request_der || response_der || ack_der)`, so every epoch receipt
 //!   transitively commits to the whole session history back to the handshake
@@ -40,9 +39,8 @@ use std::sync::Arc;
 use futures::lock::Mutex as FuturesMutex;
 
 use crate::cms::signed_data::{SignedData, SignerIdentifier, SignerInfo};
-use crate::constants::TIGHTBEAM_EPOCH_KDF_INFO;
 use crate::crypto::aead::{DirectionalCiphers, KeyInit, RecvCipher, SendCipher, SessionKeys};
-use crate::crypto::hash::{ConstantTimeDigest, Digest};
+use crate::crypto::hash::Digest;
 use crate::crypto::key::SigningKeyProvider;
 use crate::crypto::profiles::CryptoProvider;
 use crate::der::asn1::OctetString;
@@ -50,14 +48,13 @@ use crate::der::Encode;
 use crate::random::generate_nonce;
 use crate::transport::envelopes::{MuxRekeyAckPackage, MuxRekeyRequestPackage, MuxRekeyResponsePackage};
 use crate::transport::handshake::negotiation::TransportAuthorizer;
-use crate::transport::handshake::primitives::{kdf_chain, KdfInfo, KdfSalt, KdfStage};
+use crate::transport::handshake::primitives::transcript::Transcript;
+use crate::transport::handshake::primitives::RandomsSalt;
 use crate::transport::handshake::receipt::ReceiptArtifact;
 use crate::transport::handshake::receipt::{
-	approve_or_fail_closed, record_receipt_outcome, sign_receipt, transcript_digest_info, verify_receipt_signer,
 	ReceiptApprover, ReceiptRole, SessionObserver, SessionOutcome, SessionReceipt, SessionVerdict, StoredReceipt,
 };
-use crate::transport::handshake::HandshakeOctets;
-use crate::transport::handshake::{compute_transcript_digest, EpochMaterials, HandshakeError};
+use crate::transport::handshake::{EpochMaterials, HandshakeError, HandshakeOctets};
 use crate::transport::multiplex::MuxRole;
 use crate::utils::marker::{MaybeSend, MaybeSendFuture};
 use crate::x509::Certificate;
@@ -138,16 +135,9 @@ where
 		server_random: &[u8; 32],
 		next_hash: [u8; 32],
 	) -> Result<(SendCipher, RecvCipher), HandshakeError> {
-		let mut salt = [0u8; 64];
-		salt[..32].copy_from_slice(client_random);
-		salt[32..].copy_from_slice(server_random);
-
-		let stage = KdfStage {
-			input: self.epoch.secret.as_slice(),
-			info: KdfInfo::new(TIGHTBEAM_EPOCH_KDF_INFO),
-		};
-		let next_secret = kdf_chain::<P>(&[stage], KdfSalt::new(&salt))?;
-		let directional = DirectionalCiphers::derive::<P>(&next_secret, KdfSalt::new(&salt))?;
+		let salt = RandomsSalt::new(client_random, server_random);
+		let next_secret = self.epoch.secret.next::<P>(salt.as_kdf_salt())?;
+		let directional = DirectionalCiphers::derive::<P, _>(&next_secret, salt.as_kdf_salt())?;
 
 		let next_epoch = self.epoch.epoch.checked_add(1).ok_or(HandshakeError::IntegerOutOfRange)?;
 		self.epoch.secret = next_secret;
@@ -181,7 +171,7 @@ where
 	transcript.extend_from_slice(chain_hash);
 	transcript.extend_from_slice(request_der);
 	transcript.extend_from_slice(server_random);
-	compute_transcript_digest::<D>(&transcript)
+	Transcript::digest::<D>(&transcript)
 }
 
 /// Advance the chain root over the completed exchange:
@@ -204,7 +194,7 @@ where
 	transcript.extend_from_slice(request_der);
 	transcript.extend_from_slice(response_der);
 	transcript.extend_from_slice(ack_der);
-	compute_transcript_digest::<D>(&transcript)
+	Transcript::digest::<D>(&transcript)
 }
 
 /// The client randomness and the request DER, held between the request and
@@ -289,11 +279,9 @@ where
 		let artifact = *epoch_receipt;
 
 		let receipt = artifact.receipt()?;
-		let receipt_der = receipt.to_der()?;
 		let server_role = ReceiptRole::Server;
 		let server_signer = artifact.signer_for_role(server_role)?.ok_or(HandshakeError::ReceiptMissing)?;
-		verify_receipt_signer::<P::Digest, P::Signature, _>(
-			&receipt_der,
+		receipt.verify_signer::<P::Digest, P::Signature, _>(
 			server_signer,
 			server_role,
 			&self.materials.peer_sid,
@@ -302,17 +290,11 @@ where
 
 		let chain_hash = &self.materials.epoch.transcript_hash;
 		let challenge_hash = exchange_challenge_hash::<P::Digest>(chain_hash, &pending.request_der, &server_random)?;
-		let expected_pin = transcript_digest_info::<P::Digest>(challenge_hash)?;
-		let pin_algorithm_matches = receipt.transcript_hash.algorithm == expected_pin.algorithm;
+		let reference_budgets = self.materials.reference.budgets;
+		let reference_unit = self.materials.reference.credit_unit;
+		receipt.verify_terms::<P::Digest>(&challenge_hash, reference_budgets, reference_unit)?;
 
-		let pin_matches = pin_algorithm_matches && receipt.transcript_hash.digest_matches(&expected_pin);
-		let budgets_match = receipt.budgets == self.materials.reference.budgets;
-		let unit_matches = receipt.credit_unit == self.materials.reference.credit_unit;
-		if !pin_matches || !budgets_match || !unit_matches {
-			return Err(HandshakeError::ReceiptMismatch);
-		}
-
-		let answer = approve_or_fail_closed(self.approver.as_deref(), &receipt).await?;
+		let answer = receipt.approve(self.approver.as_deref()).await?;
 		let answer_bytes = answer.as_ref().map(OctetString::as_bytes);
 		let provider = self.materials.signing_provider.as_ref();
 		let countersignature = receipt.countersign::<P::Digest>(answer_bytes, provider).await?;
@@ -424,7 +406,7 @@ where
 			None => None,
 		};
 
-		let (receipt, artifact) = sign_receipt::<P::Digest>(
+		let (receipt, artifact) = SessionReceipt::issue::<P::Digest>(
 			challenge_hash,
 			self.materials.reference.budgets,
 			self.materials.reference.credit_unit,
@@ -507,7 +489,8 @@ where
 			client_certificate,
 			verdict,
 		};
-		let recorded = record_receipt_outcome(self.observer.as_deref(), outcome).await;
+
+		let recorded = outcome.record(self.observer.as_deref()).await;
 		let (stored, rejection) = match (recorded, refused_artifact) {
 			(Ok(stored), _) => (stored, None),
 			(Err(HandshakeError::SettlementRejected { code }), Some(refused)) => {
@@ -522,9 +505,11 @@ where
 			&pending.response_der,
 			&ack_der,
 		)?;
+
 		let (send_cipher, recv_cipher) =
 			self.materials
 				.rotate(MuxRole::Server, &pending.client_random, &pending.server_random, next_hash)?;
+
 		let install = EpochInstall { send_cipher, recv_cipher, receipt: stored, epoch: self.materials.epoch() };
 		Ok(ServerAckOutcome { install, rejection })
 	}
@@ -660,18 +645,25 @@ impl RekeyDriver {
 #[cfg(all(test, feature = "secp256k1", feature = "aes-gcm"))]
 pub(crate) mod tests {
 	use super::*;
+	use crate::asn1::{AlgorithmIdentifier, DigestInfo};
 	use crate::crypto::aead::DecryptContent;
 	use crate::crypto::hash::Sha3_256;
 	use crate::crypto::key::Secp256k1KeyProvider;
 	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::crypto::sign::ecdsa::{Secp256k1SigningKey, Secp256k1VerifyingKey};
 	use crate::crypto::x509::utils::compute_signer_identifier;
+	use crate::oids::HASH_SHA3_256;
 	use crate::random::OsRng;
 	use crate::transport::handshake::negotiation::MuxBudgets;
-	use crate::zeroize::Zeroizing;
+	use crate::transport::handshake::primitives::KdfSalt;
+	use crate::transport::handshake::tests::fixture_handshake_secret;
 
-	const SAMPLE_SECRET: [u8; 32] = [0x42u8; 32];
+	/// The base-secret fill of the handshake every sample epoch derives from.
+	const SAMPLE_BASE: u8 = 0x42;
+	const SAMPLE_SALT: [u8; 32] = [0x99u8; 32];
 	const SAMPLE_CHAIN_ROOT: [u8; 32] = [0x07u8; 32];
+	const SAMPLE_CLIENT_RANDOM: [u8; 32] = [0x01u8; 32];
+	const SAMPLE_SERVER_RANDOM: [u8; 32] = [0x02u8; 32];
 	const SAMPLE_BUDGETS: MuxBudgets = MuxBudgets { client_to_server: 64, server_to_client: 1024 };
 	const SAMPLE_CREDIT_UNIT: u32 = 1024;
 	const PLAINTEXT: &[u8] = b"epoch traffic";
@@ -690,17 +682,41 @@ pub(crate) mod tests {
 		Ok(Identity { provider: Arc::new(provider), verifying_key, sid })
 	}
 
-	fn sample_epoch() -> EpochMaterials {
-		EpochMaterials {
-			secret: Zeroizing::new(SAMPLE_SECRET.to_vec()),
-			epoch: 0,
-			transcript_hash: SAMPLE_CHAIN_ROOT,
-		}
+	/// Epoch 0 of a handshake whose base secret is `fill` bytes, rooted at the
+	/// sample chain root.
+	fn sample_epoch_from(fill: u8) -> Result<EpochMaterials, HandshakeError> {
+		let secret = fixture_handshake_secret(fill);
+		EpochMaterials::derive::<DefaultCryptoProvider>(&secret, KdfSalt::new(&SAMPLE_SALT), SAMPLE_CHAIN_ROOT)
+	}
+
+	fn sample_epoch() -> Result<EpochMaterials, HandshakeError> {
+		sample_epoch_from(SAMPLE_BASE)
+	}
+
+	/// Rekey materials over `epoch` for a fresh identity and a fresh peer.
+	fn materials_with(epoch: EpochMaterials) -> Result<RekeyMaterials<DefaultCryptoProvider>, HandshakeError> {
+		let identity = test_identity()?;
+		let peer = test_identity()?;
+		let reference = sample_reference(SAMPLE_CREDIT_UNIT)?;
+		Ok(RekeyMaterials::new(
+			epoch,
+			reference,
+			identity.provider,
+			peer.verifying_key,
+			peer.sid,
+		))
+	}
+
+	/// The SHA3-256 `DigestInfo` a receipt carries for `hash`.
+	fn sha3_digest_info(hash: [u8; 32]) -> Result<DigestInfo, HandshakeError> {
+		let algorithm = AlgorithmIdentifier { oid: HASH_SHA3_256, parameters: None };
+		let digest = OctetString::new(hash)?;
+		Ok(DigestInfo { algorithm, digest })
 	}
 
 	fn sample_reference(credit_unit: u32) -> Result<SessionReceipt, HandshakeError> {
 		Ok(SessionReceipt {
-			transcript_hash: transcript_digest_info::<Sha3_256>(SAMPLE_CHAIN_ROOT)?,
+			transcript_hash: sha3_digest_info(SAMPLE_CHAIN_ROOT)?,
 			budgets: SAMPLE_BUDGETS,
 			credit_unit,
 			ancillary: None,
@@ -715,14 +731,14 @@ pub(crate) mod tests {
 		let reference = sample_reference(SAMPLE_CREDIT_UNIT)?;
 
 		let client_materials = RekeyMaterials::new(
-			sample_epoch(),
+			sample_epoch()?,
 			reference.to_owned(),
 			client_identity.provider,
 			server_identity.verifying_key,
 			server_identity.sid,
 		);
 		let server_materials = RekeyMaterials::new(
-			sample_epoch(),
+			sample_epoch()?,
 			reference,
 			server_identity.provider,
 			client_identity.verifying_key,
@@ -770,6 +786,41 @@ pub(crate) mod tests {
 		Ok(())
 	}
 
+	/// Two chains that share the public chain root and the exchange randoms
+	/// but hold different epoch secrets derive different traffic keys, so the
+	/// next epoch depends on the previous epoch secret and on nothing public.
+	#[test]
+	fn the_next_epoch_depends_on_the_previous_epoch_secret() -> Result<(), Box<dyn std::error::Error>> {
+		let mut first = materials_with(sample_epoch_from(SAMPLE_BASE)?)?;
+		let mut second = materials_with(sample_epoch_from(SAMPLE_BASE + 1)?)?;
+		let (first_send, _first_recv) =
+			first.rotate(MuxRole::Client, &SAMPLE_CLIENT_RANDOM, &SAMPLE_SERVER_RANDOM, SAMPLE_CHAIN_ROOT)?;
+		let (_second_send, second_recv) =
+			second.rotate(MuxRole::Server, &SAMPLE_CLIENT_RANDOM, &SAMPLE_SERVER_RANDOM, SAMPLE_CHAIN_ROOT)?;
+
+		let frame = first_send.encrypt_next(PLAINTEXT, None)?;
+		assert!(second_recv.decrypt_content(&frame).is_err());
+		Ok(())
+	}
+
+	/// The rotated traffic keys come from the next chain link, so a frame
+	/// sealed under the previous epoch secret's directional key does not open
+	/// under them.
+	#[test]
+	fn rotation_leaves_the_previous_epoch_keys_behind() -> Result<(), Box<dyn std::error::Error>> {
+		let epoch = sample_epoch()?;
+		let salt = RandomsSalt::new(&SAMPLE_CLIENT_RANDOM, &SAMPLE_SERVER_RANDOM);
+		let previous = DirectionalCiphers::derive::<DefaultCryptoProvider, _>(&epoch.secret, salt.as_kdf_salt())?;
+		let (previous_send, _previous_recv) = SessionKeys::for_client(previous).into_parts();
+		let mut materials = materials_with(epoch)?;
+		let (_send, recv) =
+			materials.rotate(MuxRole::Server, &SAMPLE_CLIENT_RANDOM, &SAMPLE_SERVER_RANDOM, SAMPLE_CHAIN_ROOT)?;
+
+		let frame = previous_send.encrypt_next(PLAINTEXT, None)?;
+		assert!(recv.decrypt_content(&frame).is_err());
+		Ok(())
+	}
+
 	#[tokio::test]
 	async fn chained_exchanges_stay_in_step() -> Result<(), Box<dyn std::error::Error>> {
 		let (mut client, mut server) = rekey_pair()?;
@@ -796,7 +847,7 @@ pub(crate) mod tests {
 		assert_eq!(receipt.budgets, SAMPLE_BUDGETS);
 		assert_eq!(receipt.credit_unit, SAMPLE_CREDIT_UNIT);
 
-		let chain_root = transcript_digest_info::<Sha3_256>(SAMPLE_CHAIN_ROOT)?;
+		let chain_root = sha3_digest_info(SAMPLE_CHAIN_ROOT)?;
 		assert_ne!(receipt.transcript_hash, chain_root);
 		Ok(())
 	}

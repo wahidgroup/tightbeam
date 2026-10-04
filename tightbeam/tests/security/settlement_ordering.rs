@@ -12,11 +12,11 @@
 //! side effect already fired.
 //!
 //! ## Attack
-//! A network attacker captures a victim's budget-bearing
-//! `ClientKeyExchange` (certificate, transcript-bound auth signature, and
-//! the receipt countersignature). The countersignature covers only the
-//! receipt body and the settlement answer, so the attacker splices in a
-//! corrupted ECIES ciphertext (`encrypted_data`).
+//! A network attacker captures a victim's budget-bearing `ClientKeyExchange`:
+//! the certificate, the transcript-bound auth signature, and the ECIES
+//! ciphertext (`encrypted_data`). The ciphertext carries the sealed receipt
+//! countersignature, which covers only the receipt body and the settlement
+//! answer. The attacker corrupts the ciphertext and keeps the rest.
 //!
 //! If the server settles before decrypting, the corrupted payload triggers
 //! settlement and only afterwards fails the AEAD check. The attacker has
@@ -25,10 +25,10 @@
 //! ## Expected control
 //! Two layers give defense in depth:
 //!
-//! 1. Primary: the ECIES client auth signature covers `Digest(transcript_hash
-//!    || encrypted_data || cert_der)`, so any corruption of `encrypted_data` is
-//!    rejected at certificate validation before decryption and before
-//!    settlement.
+//! 1. Primary: the ECIES client auth signature covers
+//!    `Digest(transcript_hash || encrypted_data || cert_der)`, so a corrupted
+//!    `encrypted_data` fails the proof of possession when the server admits
+//!    the client, before decryption and before settlement.
 //! 2. Ordering: `settle` runs strictly after decryption and the client random
 //!    replay check, so it is the last gate and no external side effect can be
 //!    provoked by a key exchange the server will reject.
@@ -54,7 +54,6 @@
 use std::sync::Arc;
 
 use tightbeam::asn1::OctetString;
-use tightbeam::crypto::ecies::Secp256k1EciesMessage;
 use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
 use tightbeam::der::{Decode, Encode};
@@ -63,9 +62,7 @@ use tightbeam::tb_assert_spec;
 use tightbeam::tb_scenario;
 use tightbeam::testing::SetupEnv;
 use tightbeam::transport::handshake::negotiation::{MuxBudgets, SecurityOffer, TransportOffer};
-use tightbeam::transport::handshake::{
-	client::EciesHandshakeClient, server::EciesHandshakeServer, ClientKeyExchange, HandshakeError, PeerAuthentication,
-};
+use tightbeam::transport::handshake::{ClientKeyExchange, Handshake, HandshakeError, PeerAuthentication};
 use tightbeam::utils::urn::Urn;
 use tightbeam::TightBeamError;
 
@@ -77,8 +74,9 @@ pub(crate) const SETTLE_NEVER_FIRED: Urn<'static> =
 	tightbeam::urn!("test", "event:settlement-ordering/settle-never-fired");
 
 use crate::common::security::{
-	contains_window, default_security_profile, expectation_failure, pinning_validator, ClientMaterials, PayingApprover,
-	ServerMaterials, SettleSpyAuthorizer,
+	carried_closing, carried_key_exchange, contains_window, default_security_profile, ecies_client_config,
+	ecies_server_config, expectation_failure, pinning_validator, ClientMaterials, PayingApprover, ServerMaterials,
+	SettleSpyAuthorizer,
 };
 
 const CHALLENGE: &[u8] = b"settle-ordering-invoice";
@@ -97,10 +95,9 @@ tb_assert_spec! {
 	}
 }
 
-// A budget-bearing ClientKeyExchange whose ECIES ciphertext is corrupted
-// (countersignature still valid, since it never covered the ciphertext)
-// MUST be rejected before settlement runs: the authorizer's settle hook
-// records zero calls.
+// A budget-bearing ClientKeyExchange whose ECIES ciphertext is corrupted MUST
+// be rejected before settlement runs: the authorizer's settle hook records
+// zero calls.
 tb_scenario! {
 	name: settlement_runs_after_decrypt,
 	spec: SettlementOrderingSpec,
@@ -111,28 +108,24 @@ tb_scenario! {
 			let client_materials = ClientMaterials::deterministic();
 			let client_identity = client_materials.identity();
 
-			let mut client = EciesHandshakeClient::<DefaultCryptoProvider, Secp256k1EciesMessage>::new(None)
-				.with_security_offer(SecurityOffer::new(vec![profile]))
-				.with_certificate_validator(pinning_validator(&materials.certificate))
-				.with_client_identity(client_identity)
-				.with_transport_offer(TransportOffer::mux(4).with_budgets(REQUEST))
-				.with_receipt_approver(Arc::new(PayingApprover::answering(RESPONSE)?));
+			let mut config = ecies_client_config(pinning_validator(&materials.certificate));
+			config.flow.identity = Some(client_identity);
+			config.security_offer = Some(SecurityOffer::new(vec![profile]));
+			config.transport_offer = Some(TransportOffer::mux(4).with_budgets(REQUEST));
+			config.receipt_approver = Some(Arc::new(PayingApprover::answering(RESPONSE)?));
 
+			let mut client = Handshake::client(config);
 			let authorizer = Arc::new(SettleSpyAuthorizer::challenging(CHALLENGE)?);
 			let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator);
-			let mut server = EciesHandshakeServer::<DefaultCryptoProvider>::new(
-				Arc::clone(&materials.key_provider),
-				Arc::clone(&materials.certificate),
-				None,
-				PeerAuthentication::mutual([validator]),
-			)
-			.with_supported_profiles(vec![profile])
-			.with_transport_config(TransportOffer::mux(4))
-			.with_transport_authorizer(Arc::clone(&authorizer) as _);
+			let mut server_config = ecies_server_config::<DefaultCryptoProvider>(&materials, [profile]);
+			server_config.peer_authentication = PeerAuthentication::mutual([validator]);
+			server_config.transport = Some(TransportOffer::mux(4));
+			server_config.transport_authorizer = Some(Arc::clone(&authorizer) as _);
 
-			let client_hello = client.build_client_hello()?.to_der()?;
-			let server_handshake = server.process_client_hello(&client_hello).await?.to_der()?;
-			let client_kex_der = client.process_server_handshake(&server_handshake).await?.to_der()?;
+			let mut server = Handshake::server(server_config);
+			let reply = server.reply(client.start()?).await?;
+			let closing = client.respond(reply).await?;
+			let client_kex_der = carried_key_exchange(closing).to_der()?;
 
 			// Confidentiality: the paying party's settlement answer is
 			// folded into the ECIES payload encrypted to the server, so the
@@ -145,10 +138,10 @@ tb_scenario! {
 				!response_leaked,
 			)?;
 
-			// Corrupt the ECIES ciphertext while preserving the certificate,
-			// auth signature, and receipt countersignature: decrypt must fail,
-			// but the countersignature (which never covered the ciphertext)
-			// stays valid.
+			// Corrupt the ECIES ciphertext and keep the certificate and the
+			// auth signature. The ciphertext carries the sealed receipt
+			// countersignature, so the server must refuse the key exchange
+			// before it opens the payload or settles.
 			let mut kex = ClientKeyExchange::from_der(&client_kex_der)?;
 			let mut ciphertext = kex.encrypted_data.as_bytes().to_vec();
 			let last = ciphertext.len().checked_sub(1).ok_or_else(|| expectation_failure("empty ciphertext"))?;
@@ -159,7 +152,7 @@ tb_scenario! {
 			// The mutual-auth signature commits to the exact ciphertext
 			// (the anti-splice control), so the corruption is caught as a
 			// signature failure before any decrypt or settlement side effect.
-			let kex_result = server.process_client_key_exchange(kex).await;
+			let kex_result = server.finish(carried_closing(&kex)).await;
 			let rejected = matches!(kex_result, Err(HandshakeError::SignatureError(_)));
 
 			trace.event_with(CORRUPTED_KEY_EXCHANGE_REJECTED, &[], rejected)?;

@@ -39,6 +39,12 @@ pub enum HandshakeError {
 	#[from]
 	InvalidPublicKey(crate::crypto::sign::ecdsa::k256::elliptic_curve::Error),
 
+	/// The server sent its static key as its ephemeral. The agreement would
+	/// then collapse into the static one, which the server's key recovers, so
+	/// the client refuses it.
+	#[error("Server ephemeral equals the server static key")]
+	ServerEphemeralIsStatic,
+
 	/// The peer certificate failed validation.
 	#[error("Invalid certificate: {0}")]
 	#[from]
@@ -97,12 +103,16 @@ pub enum HandshakeError {
 	#[error("Missing client certificate")]
 	MissingClientCertificate,
 
-	/// The transcript hash has an invalid length or format.
-	#[error("Invalid transcript hash")]
-	InvalidTranscriptHash,
+	/// The certificate the client Finished embeds differs from the certificate
+	/// the key exchange bound into the transcript. Only the key-exchange
+	/// certificate proved knowledge of the base secret, so only it may sign
+	/// the Finished.
+	#[error("Client Finished certificate does not match the key-exchange certificate")]
+	ClientCertificateMismatch,
 
 	/// The digest output width differs from the required transcript hash
-	/// width.
+	/// width. `expected` is the required width and `received` is the digest
+	/// output width, both in bytes.
 	#[error("Transcript digest length invalid: expected {expected} bytes, got {received}")]
 	TranscriptDigestLength { expected: usize, received: usize },
 
@@ -124,11 +134,13 @@ pub enum HandshakeError {
 	#[error("Receipt countersignature required for budget-bearing session but missing")]
 	CountersignatureMissing,
 
-	/// The client's receipt approver refused the session receipt.
+	/// The client's receipt approver refused the session receipt. `code` is
+	/// the refusal code the approver returned.
 	#[error("Session receipt refused by approver: code {code}")]
 	ApprovalRefused { code: u32 },
 
-	/// The server's authorizer rejected the settlement answer.
+	/// The server's authorizer rejected the settlement answer. `code` is the
+	/// rejection code the authorizer returned.
 	#[error("Settlement rejected: code {code}")]
 	SettlementRejected { code: u32 },
 
@@ -137,30 +149,17 @@ pub enum HandshakeError {
 	#[error("Settlement answer too large for the wire encoding")]
 	AnswerTooLarge,
 
-	/// The leaf of the provisioned certificate chain differs from the pinned
-	/// server certificate.
-	#[error("Provisioned certificate chain leaf does not match pinned server certificate")]
-	PinnedCertificateMismatch,
+	/// The AEAD refused to seal or open the receipt acknowledgement under the
+	/// key the handshake secret derives. On the opening side the
+	/// acknowledgement was sealed under another handshake secret or altered
+	/// in flight.
+	#[error("Receipt acknowledgement AEAD failure: {0}")]
+	ReceiptAckCipher(crate::crypto::aead::Error),
 
-	/// The client random is missing from the ClientHello.
-	#[error("Missing client random from ClientHello")]
-	MissingClientRandom,
-
-	/// The base session key is missing.
-	#[error("Missing base session key")]
-	MissingBaseSessionKey,
-
-	/// The client random is missing from the handshake state.
-	#[error("Missing client random")]
-	MissingClientRandomState,
-
-	/// The server random is missing.
-	#[error("Missing server random")]
-	MissingServerRandom,
-
-	/// The CMS salt (the transcript hash) is below the minimum entropy
-	/// requirement.
-	#[error("CMS salt too short: {actual} bytes (minimum {minimum} required)")]
+	/// The KDF salt of a traffic-key derivation is below the minimum entropy
+	/// requirement. `actual` is the salt length and `minimum` is the required
+	/// length, both in bytes.
+	#[error("KDF salt too short: {actual} bytes (minimum {minimum} required)")]
 	InsufficientSaltEntropy { actual: usize, minimum: usize },
 
 	/// The peer sent an abort alert during the handshake.
@@ -171,8 +170,8 @@ pub enum HandshakeError {
 	#[error("Handshake timeout")]
 	Timeout,
 
-	/// The server selected a profile that the client did not offer.
-	#[error("Server selected profile not in client's offer")]
+	/// The server selected no profile, or one that the client did not offer.
+	#[error("Server selected no profile, or one outside the client's offer")]
 	InvalidProfileSelection,
 
 	/// Profile negotiation failed.
@@ -184,8 +183,8 @@ pub enum HandshakeError {
 	#[error("No mutually supported cryptographic profiles found")]
 	NoMutualProfiles,
 
-	/// Dealer's choice failed because no supported profiles are configured.
-	#[error("Dealer's choice failed: no supported profiles configured")]
+	/// The server has no supported profile configured, so it can select none.
+	#[error("No supported profiles configured on server")]
 	NoSupportedProfiles,
 
 	/// Profile negotiation is required, and the server has no profiles
@@ -202,7 +201,8 @@ pub enum HandshakeError {
 	/// A required attribute is missing.
 	#[error("Required attribute missing")]
 	MissingAttribute,
-	/// The supported-curves list exceeds its cap.
+	/// The supported-curves list exceeds its cap. `count` is the number of
+	/// curves offered and `max` is the cap.
 	#[error("Too many supported curves: {count} exceeds cap of {max}")]
 	TooManySupportedCurves { count: usize, max: usize },
 	/// The nonce value is not a valid OCTET STRING.
@@ -257,10 +257,12 @@ pub enum HandshakeError {
 	#[error("KDF operation failed: {0}")]
 	#[from]
 	KdfError(crate::crypto::kdf::KdfError),
-	/// A key has an invalid size.
+	/// A key has an invalid size. `expected` and `received` are the required
+	/// and the actual key length in bytes.
 	#[error("Invalid key size: expected {expected}, got {received}")]
 	InvalidKeySize { expected: usize, received: usize },
-	/// A ciphertext is shorter than the minimum length.
+	/// A ciphertext is shorter than the minimum length. `minimum` and
+	/// `received` are the required and the actual length in bytes.
 	#[error("Ciphertext too short: {received} bytes (minimum {minimum} required)")]
 	CiphertextTooShort { minimum: usize, received: usize },
 	/// ASN.1 encoding failed during CMS key agreement (KARI).
@@ -294,17 +296,11 @@ pub enum HandshakeError {
 	#[from]
 	AesKeyWrap(crate::crypto::aead::aes_kw::Error),
 
-	/// The integrity check on the combined ECDH and KEM key failed during
-	/// hybrid key agreement.
-	#[cfg(feature = "kem")]
-	#[error("Hybrid key agreement integrity check failed: combined ECDH+KEM key validation error")]
-	HybridKariIntegrityCheckFailed,
-
 	/// Random generation failed.
 	#[error("Random generation failed")]
 	RandomGenerationFailed,
 
-	/// Cryptographic key or nonce material had the wrong length.
+	/// Cryptographic key or nonce material has the wrong length.
 	#[error("Invalid key material length: {0}")]
 	#[from]
 	InvalidKeyMaterialLength(crypto_common::InvalidLength),
@@ -329,7 +325,7 @@ impl HandshakeError {
 			Self::CertificateValidationError(_)
 			| Self::SignatureVerificationFailed
 			| Self::MissingClientCertificate
-			| Self::PinnedCertificateMismatch
+			| Self::ClientCertificateMismatch
 			| Self::CertificateNotYetValid
 			| Self::CertificateExpired
 			| Self::MutualAuthRequired => Some(events::SESSION_CERT_REJECTED),
@@ -394,14 +390,12 @@ mod tests {
 	#[test]
 	fn a_missing_client_certificate_is_a_certificate_rejection() {
 		let event = HandshakeError::MissingClientCertificate.audit_event();
-
 		assert_eq!(event, Some(events::SESSION_CERT_REJECTED));
 	}
 
 	#[test]
 	fn a_refused_approval_is_a_receipt_refusal() {
 		let event = HandshakeError::ApprovalRefused { code: 7 }.audit_event();
-
 		assert_eq!(event, Some(events::SESSION_RECEIPT_REFUSED));
 	}
 

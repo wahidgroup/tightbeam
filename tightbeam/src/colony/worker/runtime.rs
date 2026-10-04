@@ -7,8 +7,9 @@ use core::future::Future;
 use std::sync::Arc;
 
 use crate::colony::worker::{
-	kill_worker, relay_to_worker, worker_runtime, WorkerKillFuture, WorkerPolicies, WorkerRelayFuture, WorkerRequest,
+	worker_runtime, WorkerKillFuture, WorkerPolicies, WorkerRelayError, WorkerRelayFuture, WorkerRequest,
 };
+use crate::error::TightBeamError;
 use crate::trace::TraceCollector;
 use crate::Message;
 
@@ -74,13 +75,47 @@ where
 	}
 
 	/// Enqueue a message and await the handler response.
+	///
+	/// Every `worker!`-generated `Worker::relay` calls this.
 	pub fn relay(&self, message: Arc<I>) -> WorkerRelayFuture<O> {
-		relay_to_worker(self.sender.clone(), Arc::clone(&self.trace), message)
+		let sender = self.sender.clone();
+		let trace = Arc::clone(&self.trace);
+
+		Box::pin(async move {
+			let sender = sender.ok_or(WorkerRelayError::QueueClosed)?;
+			let (tx, rx) = worker_runtime::rt::oneshot();
+
+			let request = WorkerRequest { message, respond_to: tx, trace };
+			worker_runtime::rt::send(&sender, request)
+				.await
+				.map_err(|_| WorkerRelayError::QueueClosed)?;
+
+			match worker_runtime::rt::wait_response(rx).await {
+				Ok(Ok(output)) => Ok(output),
+				Ok(Err(status)) => Err(WorkerRelayError::Rejected(status)),
+				Err(()) => Err(WorkerRelayError::ResponseDropped),
+			}
+		})
 	}
 
 	/// Close the queue and join the run loop.
+	///
+	/// Every `worker!`-generated `Worker::kill` calls this. Dropping the
+	/// sender ends the run loop's `recv` stream, so the join observes a clean
+	/// exit instead of aborting mid-message.
 	pub fn kill(mut self) -> WorkerKillFuture {
-		kill_worker(self.sender.take(), self.join.take())
+		let sender = self.sender.take();
+		let join = self.join.take();
+
+		Box::pin(async move {
+			drop(sender);
+
+			if let Some(handle) = join {
+				worker_runtime::rt::join(handle).await.map_err(|_| TightBeamError::JoinError)?;
+			}
+
+			Ok(())
+		})
 	}
 
 	/// Bound of the request queue (`0` before [`Self::start`]).

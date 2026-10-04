@@ -1,4 +1,5 @@
-//! Mux lifecycle: GoAway, rekey headroom, cancel budget, teardown.
+//! Mux lifecycle scenarios for GoAway, rekey headroom, the cancel budget, and
+//! teardown.
 
 use std::sync::Arc;
 
@@ -11,36 +12,57 @@ use tightbeam::tb_scenario;
 use tightbeam::testing::{ClientEnv, ScenarioConfig, SetupEnv, TestFrame};
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::envelopes::{GoAwayReason, MuxDataPackage, MuxOpenPackage, MuxStreamKind};
+use tightbeam::transport::multiplex::MuxAcceptor;
 use tightbeam::transport::{EnvelopeSink, EnvelopeSource, TransportEnvelope};
 use tightbeam::TightBeamError;
 
 use crate::common::security::expectation_failure;
-use crate::transport::support::{await_ok, join_task, mux_frame};
+use crate::transport::support::{await_ok, join_task, mux_frame, mux_offer};
 
 use super::common::*;
 
 use tightbeam::instrumentation::events;
 use tightbeam::utils::urn::Urn;
 
+/// Records whether an emit fails as a closed connection after the peer drops
+/// mid-emit.
 pub(crate) const EMIT_FAILS_CONNECTION_CLOSED: Urn<'static> =
 	tightbeam::urn!("test", "event:lifecycle/emit-fails-connection-closed");
+/// Records whether an in-flight emit still drains to its echo after a local
+/// shutdown.
 pub(crate) const INFLIGHT_DRAINS_TO_ECHO: Urn<'static> =
 	tightbeam::urn!("test", "event:lifecycle/inflight-drains-to-echo");
+/// Records whether an emit after a peer GoAway is refused as draining.
 pub(crate) const LATE_EMIT_REFUSED_DRAINING: Urn<'static> =
 	tightbeam::urn!("test", "event:lifecycle/late-emit-refused-draining");
+/// Records whether a stream grammar violation draws a `ProtocolError` GoAway.
 pub(crate) const OFFENDER_ANSWERED_WITH_GOAWAY: Urn<'static> =
 	tightbeam::urn!("test", "event:lifecycle/offender-answered-with-goaway");
+/// Records whether a peer GoAway reason surfaces on the handle and drains the
+/// emit.
 pub(crate) const PEER_REASON_SURFACES_ON_HANDLE: Urn<'static> =
 	tightbeam::urn!("test", "event:lifecycle/peer-reason-surfaces-on-handle");
+/// Records whether a pending emit fails as a closed connection after a
+/// protocol violation.
 pub(crate) const PENDING_FAILS_CONNECTION_CLOSED: Urn<'static> =
 	tightbeam::urn!("test", "event:lifecycle/pending-fails-connection-closed");
+/// Records whether one rekey headroom case holds.
 pub(crate) const REKEY_CASE_HOLDS: Urn<'static> = tightbeam::urn!("test", "event:lifecycle/rekey-case-holds");
+/// Records whether cancel abuse ends the responder with a policy rejection.
 pub(crate) const RESPONDER_POLICY_REJECTION: Urn<'static> =
 	tightbeam::urn!("test", "event:lifecycle/responder-policy-rejection");
+/// Records whether cancel abuse ends `MuxAcceptor::serve` with a policy
+/// rejection.
+pub(crate) const SERVE_POLICY_REJECTION: Urn<'static> =
+	tightbeam::urn!("test", "event:lifecycle/serve-policy-rejection");
+/// Records whether `shutdown_with` advertises its reason in the GoAway.
 pub(crate) const SHUTDOWN_WITH_ADVERTISES_REASON: Urn<'static> =
 	tightbeam::urn!("test", "event:lifecycle/shutdown-with-advertises-reason");
+/// Records whether a stream above the peer GoAway watermark fails as
+/// draining.
 pub(crate) const STREAM_ABOVE_WATERMARK_DRAINING: Urn<'static> =
 	tightbeam::urn!("test", "event:lifecycle/stream-above-watermark-draining");
+/// Records whether a stream at the peer GoAway watermark still echoes.
 pub(crate) const STREAM_AT_WATERMARK_ECHOED: Urn<'static> =
 	tightbeam::urn!("test", "event:lifecycle/stream-at-watermark-echoed");
 
@@ -231,7 +253,8 @@ tb_assert_spec! {
 	}
 }
 
-// Headroom: `2 * (local_cap + peer_cap) + 1` vs record limit.
+// Each case sets the drain headroom `2 * (local_cap + peer_cap) + 1`
+// against the record limit.
 tb_scenario! {
 	name: mux_rekey_headroom_table,
 	spec: MuxRekeyHeadroomSpec,
@@ -303,6 +326,44 @@ tb_scenario! {
 			let rejected =
 				run_cancel_abuse(link.client_reader, link.client_writer, link.responder, cancel_budget).await?;
 			trace.event_with(RESPONDER_POLICY_REJECTION, &[], rejected)?;
+
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub MuxServeCancelBudgetSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(events::MUX_CANCEL_BUDGET, exactly!(1)),
+			(events::MUX_GOAWAY_SENT, exactly!(1), equals!(u32::from(GoAwayReason::EnhanceYourCalm))),
+			(SERVE_POLICY_REJECTION, exactly!(1), equals!(true))
+		]
+	}
+}
+
+// The cancel budget must also reach the responder on the
+// `MuxAcceptor::serve` path the servlet macro runs, because
+// `mux_cancel_budget_boundary` covers only the hand-assembled spawn path.
+tb_scenario! {
+	name: mux_serve_applies_cancel_budget,
+	spec: MuxServeCancelBudgetSpec,
+	environment Bare {
+		exec: |SetupEnv { trace, .. }| async move {
+			let cancel_budget = 2;
+			let (client, server) = establish_transports(Some(mux_offer(8)), Some(mux_offer(8))).await?;
+			let server = server.with_trace(trace.share());
+			let settings = server
+				.negotiated_mux()
+				.ok_or_else(|| expectation_failure("handshake must negotiate multiplexing"))?;
+
+			let serve_task = tokio::spawn(server.serve(settings, parked_unary_service(), Some(cancel_budget)));
+			let (client_reader, client_writer) = client.into_split()?;
+
+			let rejected = run_cancel_abuse_against(client_reader, client_writer, serve_task, cancel_budget).await?;
+			trace.event_with(SERVE_POLICY_REJECTION, &[], rejected)?;
 
 			Ok(())
 		}
@@ -416,7 +477,7 @@ tb_scenario! {
 	}
 }
 
-/// V0 frame with V2-only field: mux router must reject.
+/// A V0 frame that carries a V2-only field, which the mux router must reject.
 fn version_incompatible_frame_der() -> Vec<u8> {
 	let frame = TestFrame::prioritized();
 	TestFrame::forge_version(&frame, &frame, Version::V0)
@@ -454,13 +515,13 @@ tb_scenario! {
 		exec: |SetupEnv { trace, .. }| async move {
 			let chunk = mux_frame("mux-violation").to_der()?;
 			let offenders: Vec<TransportEnvelope> = vec![
-				// Continuation chunk for a stream that was never opened
+				// A continuation chunk for a stream that was never opened.
 				MuxDataPackage::new(1, true, chunk)?.into(),
-				// Open whose payload is not a frame
+				// An open whose payload is not a frame.
 				MuxOpenPackage::new(1, true, MuxStreamKind::Unary, vec![0xDE, 0xAD])?.into(),
-				// Open without a message (requests must carry one)
+				// An open without a message, although requests must carry one.
 				MuxOpenPackage::new(1, true, MuxStreamKind::Unary, Vec::new())?.into(),
-				// Open whose frame claims fields its version forbids
+				// An open whose frame claims fields its version forbids.
 				MuxOpenPackage::new(1, true, MuxStreamKind::Unary, version_incompatible_frame_der())?.into(),
 			];
 

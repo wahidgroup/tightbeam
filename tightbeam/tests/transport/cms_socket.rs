@@ -1,11 +1,10 @@
 //! Socket-level CMS handshake integration test.
 //!
-//! Every other wire test negotiates ECIES; the CMS orchestrators are
-//! otherwise only driven through in-memory loopback. This scenario runs
-//! the CMS key-transport handshake over a real TCP socket through public
-//! interfaces only: the `server!` policy list selects the protocol per
-//! accepted connection and [`ClientBuilder`] carries the server chain the
-//! client's first flight encrypts to.
+//! Every other wire test negotiates ECIES. This scenario runs the CMS
+//! handshake over a real TCP socket through public interfaces only:
+//!
+//! - the `server!` policy list selects the protocol per accepted connection, and
+//! - [`ClientBuilder`] carries the server chain the client's first flight encrypts its base secret to.
 
 #![cfg(all(
 	feature = "tcp",
@@ -89,9 +88,9 @@ tb_assert_spec! {
 	}
 }
 
-// The client encrypts its first flight to the pre-known server chain
-// (key transport), the pinning server validates the client certificate,
-// and an application frame round-trips over the derived session keys.
+// The client seals its base secret to the pre-known server chain in its
+// first flight, the pinning server validates the client certificate, and
+// an application frame round-trips over the derived traffic keys.
 tb_scenario! {
 	name: cms_handshake_round_trips_over_tcp,
 	spec: CmsSocketSpec,

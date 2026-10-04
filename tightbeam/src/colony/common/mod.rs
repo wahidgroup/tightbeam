@@ -9,7 +9,7 @@ pub mod urn;
 use core::future::Future;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::builder::TypeBuilder;
 use crate::constants::{SPLITMIX64_GAMMA, SPLITMIX64_MIX_1, SPLITMIX64_MIX_2};
@@ -44,7 +44,7 @@ pub struct InstanceMetrics {
 
 /// Upper bound of the pheromone scale, in basis points.
 ///
-/// Shared by the registry cap and every balancer that reads the signal.
+/// The registry cap and every balancer that reads the signal share this bound.
 pub const MAX_PHEROMONE: u64 = 10_000;
 
 /// Default [`StochasticForager`] exploration floor.
@@ -124,7 +124,7 @@ fn splitmix64_next(state: &AtomicU64) -> u64 {
 /// - [`DEFAULT_REPELLENCY_THRESHOLD`]: the threshold is the pheromone value
 ///   past which additional pheromone stops attracting and begins to repel.
 ///
-/// # Example
+/// # Examples
 ///
 /// ```
 /// # use tightbeam::colony::common::StochasticForager;
@@ -173,8 +173,8 @@ impl StochasticForager {
 	/// Sets the exploration floor, which defaults to
 	/// [`DEFAULT_EXPLORATION_FLOOR`].
 	///
-	/// A higher floor spreads more. A lower floor exploits strong trails
-	/// harder.
+	/// A higher floor spreads selection wider, and a lower floor exploits
+	/// strong trails harder.
 	pub fn with_exploration_floor(mut self, floor: u64) -> Self {
 		self.exploration_floor = floor;
 		self
@@ -314,6 +314,10 @@ pub fn aggregate_utilization(total_utilization: u64, instance_count: usize) -> B
 }
 
 /// Builds a V0 response frame that echoes the request id.
+///
+/// # Errors
+///
+/// - [`TightBeamError`] when the frame builder refuses the frame, such as when `message` fails to encode.
 pub fn reply_frame<M: Message>(id: impl AsRef<[u8]>, message: M) -> Result<Option<Frame>, TightBeamError> {
 	let frame = Version::V0.compose().with_id(id).with_order(0).with_message(message).build()?;
 
@@ -324,6 +328,10 @@ pub fn reply_frame<M: Message>(id: impl AsRef<[u8]>, message: M) -> Result<Optio
 ///
 /// Heartbeat replies use `NetworkControl` so monitoring stays distinct
 /// from work traffic.
+///
+/// # Errors
+///
+/// - [`TightBeamError`] when the frame builder refuses the frame, such as when `message` fails to encode.
 pub fn reply_frame_with_priority<M: Message>(
 	id: impl AsRef<[u8]>,
 	priority: MessagePriority,
@@ -342,10 +350,12 @@ pub fn reply_frame_with_priority<M: Message>(
 
 /// Whether a runtime has entered drain.
 ///
-/// Drain is one fact read from several places: the control plane refuses
-/// new manage work, the scaling loop stops changing the slate, and the
-/// re-announce loop stops advertising a hive that is going away. Every
-/// reader holds the same handle, so those decisions agree.
+/// Drain is one fact that three readers share. Every reader holds the same
+/// handle, so their decisions agree:
+///
+/// - The control plane refuses new manage work.
+/// - The scaling loop stops changing the slate.
+/// - The re-announce loop stops advertising a hive that is going away.
 ///
 /// Drain is terminal. A runtime that has entered it stays in it.
 #[derive(Clone, Default)]
@@ -357,7 +367,7 @@ impl DrainMode {
 		self.0.store(true, Ordering::Release);
 	}
 
-	/// Whether drain has begun.
+	/// Returns `true` once drain has begun.
 	#[must_use]
 	pub fn is_draining(&self) -> bool {
 		self.0.load(Ordering::Acquire)
@@ -393,13 +403,7 @@ impl TaskGroup {
 	/// the group by the tasks actually running, which keeps a runtime that
 	/// spawns per request at the size of its live work.
 	pub fn adopt(&self, handle: rt::JoinHandle) {
-		let Ok(mut state) = self.0.lock() else {
-			// A poisoned group has lost track of what it holds, so the handle
-			// is aborted here.
-			rt::abort(&handle);
-			return;
-		};
-
+		let mut state = self.state();
 		if state.stopped {
 			rt::abort(&handle);
 			return;
@@ -422,14 +426,17 @@ impl TaskGroup {
 	/// Stopping is terminal: a later [`TaskGroup::spawn`] aborts on
 	/// arrival, which keeps the stop reaching every task the group starts.
 	pub fn abort_all(&self) {
-		let Ok(mut state) = self.0.lock() else {
-			return;
-		};
-
+		let mut state = self.state();
 		state.stopped = true;
 		for task in state.running.drain(..) {
 			rt::abort(&task);
 		}
+	}
+
+	/// The group state, recovered from a poisoned lock because every write
+	/// under the guard leaves a whole handle list and a whole flag.
+	fn state(&self) -> MutexGuard<'_, TaskGroupState> {
+		self.0.lock().unwrap_or_else(PoisonError::into_inner)
 	}
 }
 
@@ -439,6 +446,7 @@ mod tests {
 	use core::time::Duration;
 
 	use std::collections::HashSet;
+	use std::panic::{catch_unwind, AssertUnwindSafe};
 
 	use super::{
 		DrainMode, InstanceMetrics, LoadBalancer, PowerOfTwoChoices, RoundRobin, StochasticForager, TaskGroup,
@@ -616,6 +624,18 @@ mod tests {
 		group.0.lock().expect("task group lock").running.len()
 	}
 
+	/// Poisons the group lock, as a task that panics while it holds the
+	/// guard would.
+	fn poison(group: &TaskGroup) {
+		let panicked = catch_unwind(AssertUnwindSafe(|| {
+			let _held = group.0.lock().expect("the lock is live until this panic");
+			panic!("poison the task group lock");
+		}));
+
+		assert!(panicked.is_err());
+		assert!(group.0.is_poisoned());
+	}
+
 	/// A span longer than any test moves its clock. A task that sleeps it out
 	/// and then finishes was never stopped.
 	const LONG_RUN: Duration = Duration::from_secs(30);
@@ -671,6 +691,44 @@ mod tests {
 
 		advance_past(BEAT * 8).await;
 		assert_eq!(BEATS.load(Ordering::SeqCst), settled);
+	}
+
+	/// A poisoned lock still holds every handle the group adopted, so the stop
+	/// reaches them all (CWE-772).
+	#[tokio::test(start_paused = true)]
+	async fn stopping_a_poisoned_group_aborts_the_work_it_owns() {
+		static FINISHED: AtomicBool = AtomicBool::new(false);
+
+		let group = TaskGroup::default();
+		group.spawn(async {
+			tokio::time::sleep(LONG_RUN).await;
+			FINISHED.store(true, Ordering::SeqCst);
+		});
+		tokio::task::yield_now().await;
+		poison(&group);
+
+		group.abort_all();
+		advance_past(LONG_RUN * 2).await;
+		assert!(!FINISHED.load(Ordering::SeqCst));
+	}
+
+	/// A poisoned lock carries no damaged state, so a live group keeps
+	/// running the work it adopts.
+	#[tokio::test(start_paused = true)]
+	async fn a_poisoned_group_runs_the_work_it_adopts() {
+		static FINISHED: AtomicBool = AtomicBool::new(false);
+
+		let group = TaskGroup::default();
+		poison(&group);
+
+		group.spawn(async {
+			tokio::time::sleep(BEAT).await;
+			FINISHED.store(true, Ordering::SeqCst);
+		});
+		tokio::task::yield_now().await;
+
+		advance_past(BEAT * 8).await;
+		assert!(FINISHED.load(Ordering::SeqCst));
 	}
 
 	#[tokio::test(start_paused = true)]

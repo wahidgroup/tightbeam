@@ -10,8 +10,9 @@ use crate::crypto::secret::SecretSlice;
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 use crate::crypto::sign::elliptic_curve::{AffinePoint, FieldBytesSize, PublicKey, SecretKey};
 use crate::transport::handshake::error::HandshakeError;
-use crate::transport::handshake::kari::kari_unwrap;
+use crate::transport::handshake::kari::{HandshakeKek, Kek};
 use crate::transport::handshake::primitives::{KdfInfo, KdfSalt};
+use crate::transport::handshake::schedule::HandshakeAgreement;
 
 /// Recipient-side processor for `KeyAgreeRecipientInfo`.
 ///
@@ -88,17 +89,15 @@ where
 		// 2. Extract the originator's public key.
 		let originator_pub = self.extract_originator_public_key(kari)?;
 
-		// 3-6. Unwrap through `kari_unwrap` (ECDH, HKDF and integrity re-wrap)
+		// 3-6. Unwrap through ECDH, HKDF, and the integrity re-wrap.
 		let ukm = kari.ukm.as_ref().ok_or(HandshakeError::MissingUkm)?;
 		let wrapped_key = kari.recipient_enc_keys[recipient_index].enc_key.as_bytes();
-		kari_unwrap(
-			&self.provider,
-			&self.recipient_priv,
-			&originator_pub,
-			KdfSalt::new(ukm.as_bytes()),
-			KdfInfo::new(self.kdf_info),
-			wrapped_key,
-		)
+		let shared_secret = self.recipient_priv.shared_secret(&originator_pub)?;
+		let ukm_salt = KdfSalt::new(ukm.as_bytes());
+		let kari_label = KdfInfo::new(self.kdf_info);
+
+		let kek = shared_secret.derive_kek::<P>(ukm_salt, kari_label)?;
+		Kek::new(kek.as_slice()).unwrap_verified(&self.provider, wrapped_key)
 	}
 
 	/// Extract the originator's public key from the KARI.
@@ -169,7 +168,7 @@ mod tests {
 
 		#[test]
 		fn test_full_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
-			// Generate sender and recipient key-pairs
+			// Generate the sender and recipient key pairs.
 			let sender_key = K256SecretKey::random(&mut OsRng);
 			let sender_pubkey = sender_key.public_key();
 			let sender_spki = SubjectPublicKeyInfoOwned::from_key(sender_pubkey)?;
@@ -177,14 +176,14 @@ mod tests {
 			let recipient_key = K256SecretKey::random(&mut OsRng);
 			let recipient_pubkey = recipient_key.public_key();
 
-			// Create UKM
+			// Create the UKM from a client nonce and a server nonce.
 			let client_nonce = [0x01u8; 32];
 			let server_nonce = [0x02u8; 32];
 			let mut ukm_bytes = Vec::new();
 			ukm_bytes.extend_from_slice(&client_nonce);
 			ukm_bytes.extend_from_slice(&server_nonce);
-			let ukm = UserKeyingMaterial::new(ukm_bytes)?;
 
+			let ukm = UserKeyingMaterial::new(ukm_bytes)?;
 			// Build the recipient identifier.
 			let rid = KeyAgreeRecipientIdentifier::IssuerAndSerialNumber(cms::cert::IssuerAndSerialNumber {
 				issuer: x509_cert::name::Name::default(),
@@ -193,7 +192,6 @@ mod tests {
 
 			// Choose the key encryption algorithm.
 			let key_enc_alg = AlgorithmIdentifierOwned { oid: AES_256_WRAP, parameters: None };
-
 			// The original CEK.
 			let original_cek = [0x42u8; 32];
 
@@ -213,7 +211,6 @@ mod tests {
 			// Recipient side: process the KARI.
 			let recipient = TightBeamKariRecipient::with_defaults(recipient_key);
 			let extracted_cek = recipient.process_kari(&kari, 0)?;
-
 			// The extracted CEK matches the original.
 			assert_eq!(extracted_cek.to_insecure().as_slice(), original_cek.as_slice());
 			Ok(())
@@ -221,17 +218,16 @@ mod tests {
 
 		#[test]
 		fn test_wrong_key() -> Result<(), Box<dyn std::error::Error>> {
-			// Generate sender and two recipient key-pairs
+			// Generate the sender key pair and two recipient key pairs.
 			let sender_key = K256SecretKey::random(&mut OsRng);
 			let sender_pubkey = sender_key.public_key();
 			let sender_spki = SubjectPublicKeyInfoOwned::from_key(sender_pubkey)?;
 
 			let recipient_key = K256SecretKey::random(&mut OsRng);
 			let recipient_pubkey = recipient_key.public_key();
-
 			let wrong_recipient_key = K256SecretKey::random(&mut OsRng); // Different key
 
-			// Create UKM with random bytes
+			// Create the UKM from random bytes.
 			let ukm_bytes = generate_nonce::<64>(None)?;
 			let ukm = UserKeyingMaterial::new(ukm_bytes.to_vec())?;
 
@@ -243,7 +239,6 @@ mod tests {
 
 			// Choose the key encryption algorithm.
 			let key_enc_alg = AlgorithmIdentifierOwned { oid: AES_256_WRAP, parameters: None };
-
 			// The original CEK.
 			let original_cek = [0x42u8; 32];
 
@@ -262,7 +257,6 @@ mod tests {
 			// Process with the wrong recipient key.
 			let wrong_recipient = TightBeamKariRecipient::with_defaults(wrong_recipient_key);
 			let result = wrong_recipient.process_kari(&kari, 0);
-
 			// The unwrap fails, because the derived KEK differs.
 			assert!(result.is_err());
 			Ok(())

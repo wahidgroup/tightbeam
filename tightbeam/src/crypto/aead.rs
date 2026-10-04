@@ -1,3 +1,13 @@
+//! AEAD ciphers, their algorithm identifiers, and the session ciphers that
+//! own the counter nonces.
+//!
+//! - [`AeadAlgorithm`] binds a cipher type to its OID and its key size.
+//! - [`RuntimeAead`] erases the cipher type so the transport can store it.
+//! - [`Encryptor`], [`Decryptor`], and [`DecryptContent`] move bytes in and out
+//!   of CMS [`EncryptedContentInfo`].
+//! - [`SendCipher`] and [`RecvCipher`] own one direction's counter nonces and its record limit.
+//! - [`SessionKeys`] maps [`DirectionalCiphers`] onto the client or server role.
+
 pub use aead::{Aead, AeadCore, Error, Key, KeyInit, Nonce, Payload};
 #[cfg(feature = "aes-gcm")]
 pub use aes_gcm::{Aes128Gcm, Aes256Gcm, Key as Aes256GcmKey, Nonce as Aes256GcmNonce};
@@ -10,7 +20,7 @@ use aead::KeySizeUser;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::asn1::ObjectIdentifier;
-use crate::constants::DEFAULT_REKEY_RECORD_LIMIT;
+use crate::constants::{rekey_record_limit, AES_GCM_VOLUME_BYTES_PER_KEY, DEFAULT_REKEY_RECORD_LIMIT};
 use crate::crypto::common::typenum::Unsigned;
 use crate::crypto::secret::SecretSlice;
 use crate::der::asn1::{OctetString, OctetStringRef};
@@ -123,7 +133,7 @@ where
 /// type-erased. The stored OID lets encryption produce a correct
 /// [`EncryptedContentInfo`].
 ///
-/// # Example
+/// # Examples
 ///
 /// ```
 /// use tightbeam::crypto::aead::{Aes256Gcm, KeyInit, RuntimeAead, SendCipher};
@@ -227,6 +237,13 @@ where
 {
 	/// Encrypt `data` under `nonce` and wrap the ciphertext in an
 	/// [`EncryptedContentInfo`].
+	///
+	/// # Errors
+	///
+	/// An [`AeadAlgorithm`] cipher returns these errors:
+	///
+	/// - [`TightBeamError::EncryptionError`] when `nonce` has the wrong length or encryption fails.
+	/// - [`TightBeamError::SerializationError`] when the nonce or the ciphertext fails to encode.
 	fn encrypt_content(
 		&self,
 		data: impl AsRef<[u8]>,
@@ -276,6 +293,15 @@ pub trait Decryptor {
 	///
 	/// The nonce is read from the algorithm parameters and validated against
 	/// the cipher's nonce size.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError::MissingEncryptionInfo`] when the ciphertext or the nonce parameter is absent.
+	/// - [`TightBeamError::SerializationError`] when the nonce parameter fails to decode.
+	/// - [`TightBeamError::InvalidNonceLength`] when the nonce length differs from the cipher's.
+	/// - [`TightBeamError::EncryptionError`] when authentication fails.
+	/// - [`TightBeamError::NonceReplayed`] from [`RecvCipher`] when the counter is out of sequence.
+	/// - [`TightBeamError::RekeyRequired`] from [`RecvCipher`] at either AES-GCM volume bound.
 	fn open(&self, content: CheckedContent<'_>) -> TbResult<SecretSlice<u8>>;
 }
 
@@ -349,6 +375,11 @@ impl RuntimeAead {
 	///
 	/// The caller supplies `nonce` and is responsible for its uniqueness. For
 	/// GCM ciphers a `(key, nonce)` pair MUST be unique.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError::EncryptionError`] when `nonce` has the wrong length or encryption fails.
+	/// - [`TightBeamError::SerializationError`] when the nonce or the ciphertext fails to encode.
 	pub fn encrypt_content(
 		&self,
 		data: impl AsRef<[u8]>,
@@ -417,31 +448,53 @@ fn build_counter_nonce(value: u64, nonce_len: usize) -> TbResult<Vec<u8>> {
 /// # Record limit
 ///
 /// The operative bound is the record limit. AES-GCM keeps its
-/// authenticated-encryption safety margin for about 2^24.5 full-size records
-/// per key, and RFC 9846 § 5.5 makes acting before the limit a MUST.
-/// Encryption fails closed with [`TightBeamError::RekeyRequired`] at
-/// [`DEFAULT_REKEY_RECORD_LIMIT`].
+/// authenticated-encryption safety margin for 2^24 full-size TLS records per
+/// key, and RFC 9846 § 5.5 makes acting before that volume a MUST.
 ///
+/// - The record limit is that volume divided by the encrypted-envelope ceiling.
+/// - It is [`DEFAULT_REKEY_RECORD_LIMIT`] at the default ceiling, and lower at a raised one
+///   ([`Self::with_envelope_ceiling`]).
+/// - Encryption fails closed with [`TightBeamError::RekeyRequired`] at the limit.
 /// - A receipt-bearing multiplexed session renews its keys in band before the limit.
 /// - Every other session must be reestablished for fresh directional keys.
 pub struct SendCipher {
 	aead: RuntimeAead,
 	counter: AtomicU64,
 	rekey_limit: u64,
+	/// The record volume the AES-GCM bound admits at this cipher's envelope
+	/// ceiling. A configured limit clamps to it.
+	volume_bound: u64,
 }
 
 impl SendCipher {
 	/// Wrap `aead` with a nonce counter that starts at zero.
 	pub fn new(aead: RuntimeAead) -> Self {
-		Self { aead, counter: AtomicU64::new(0), rekey_limit: DEFAULT_REKEY_RECORD_LIMIT }
+		Self {
+			aead,
+			counter: AtomicU64::new(0),
+			rekey_limit: DEFAULT_REKEY_RECORD_LIMIT,
+			volume_bound: DEFAULT_REKEY_RECORD_LIMIT,
+		}
 	}
 
 	/// Override the record limit at which encryption demands a rekey.
 	///
-	/// The limit clamps to [`DEFAULT_REKEY_RECORD_LIMIT`], because the AES-GCM
-	/// bound of RFC 9846 § 5.5 is a MUST that no configuration may raise.
+	/// The limit clamps to the AES-GCM volume bound at this cipher's envelope
+	/// ceiling, [`DEFAULT_REKEY_RECORD_LIMIT`] by default, because the bound
+	/// of RFC 9846 § 5.5 is a MUST that no configuration may raise.
 	pub fn with_rekey_limit(mut self, limit: u64) -> Self {
-		self.rekey_limit = limit.min(DEFAULT_REKEY_RECORD_LIMIT);
+		self.rekey_limit = limit.min(self.volume_bound);
+		self
+	}
+
+	/// Lower the volume bound, and the record limit with it, to the records
+	/// the AES-GCM analysis admits at an encrypted-envelope ceiling of
+	/// `encrypted_envelope` bytes.
+	///
+	/// A ceiling at or below the default leaves both where they are.
+	pub fn with_envelope_ceiling(mut self, encrypted_envelope: usize) -> Self {
+		self.volume_bound = self.volume_bound.min(rekey_record_limit(encrypted_envelope));
+		self.rekey_limit = self.rekey_limit.min(self.volume_bound);
 		self
 	}
 
@@ -469,8 +522,7 @@ impl SendCipher {
 	/// - [`TightBeamError::RekeyRequired`] when the record limit is reached.
 	///   Reestablish the session for fresh keys.
 	/// - [`TightBeamError::NonceExhausted`] when the 64-bit counter space is spent.
-	/// - [`TightBeamError::InvalidNonceLength`] when the cipher nonce is too
-	///   small to carry the counter.
+	/// - [`TightBeamError::InvalidNonceLength`] when the cipher nonce is too small to carry the counter.
 	pub fn encrypt_next(
 		&self,
 		data: impl AsRef<[u8]>,
@@ -503,7 +555,12 @@ impl SendCipher {
 
 	#[cfg(test)]
 	fn with_counter(aead: RuntimeAead, counter: u64) -> Self {
-		Self { aead, counter: AtomicU64::new(counter), rekey_limit: DEFAULT_REKEY_RECORD_LIMIT }
+		Self {
+			aead,
+			counter: AtomicU64::new(counter),
+			rekey_limit: DEFAULT_REKEY_RECORD_LIMIT,
+			volume_bound: DEFAULT_REKEY_RECORD_LIMIT,
+		}
 	}
 }
 
@@ -522,35 +579,74 @@ impl SendCipher {
 ///
 /// # AES-GCM per-key volume bound
 ///
-/// An honest peer halts or renews its [`SendCipher`] at
-/// [`DEFAULT_REKEY_RECORD_LIMIT`], so a counter at or past that bound means the
-/// peer ignored the record limit (RFC 9846 § 5.5). Decryption then fails
-/// closed with [`TightBeamError::RekeyRequired`]. The configurable rekey limit
-/// is a renewal-trigger threshold, and the receive side refuses at the bound.
+/// Decryption fails closed with [`TightBeamError::RekeyRequired`] at either
+/// bound (RFC 9846 § 5.5):
+///
+/// - A counter at or past [`DEFAULT_REKEY_RECORD_LIMIT`], which an honest [`SendCipher`] stays below.
+/// - A record that takes the bytes opened under this key past the AES-GCM volume (CWE-326).
+///
+/// The configurable rekey limit is a renewal-trigger threshold. Both refusals
+/// stay fixed whatever it is.
+///
+/// # Envelope ceiling
+///
+/// The encrypted-envelope ceiling is not negotiated, so the byte bound counts
+/// what the key opened instead of assuming the peer's record size:
+///
+/// - An honest sender's record limit times its own ceiling is at most the volume, so it is never refused.
+/// - A peer that ignores its send clamp is refused once its records carry the volume.
 pub struct RecvCipher {
 	aead: RuntimeAead,
-	/// The exact counter value that the next message must carry.
-	expected_counter: AtomicU64,
+	/// The packed [`Progress`] of this key. One word holds both facts, so
+	/// one compare-exchange advances them together.
+	progress: AtomicU64,
 	rekey_limit: u64,
 }
+
+/// How far one receive key has read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Progress {
+	/// The exact counter value that the next message must carry.
+	counter: u64,
+	/// Ciphertext bytes the key has opened, which the volume bound caps.
+	opened_bytes: u64,
+}
+
+impl Progress {
+	/// Bits of the packed word that hold the counter. The opened bytes take
+	/// the rest.
+	const COUNTER_BITS: u32 = 24;
+
+	/// Both facts in one word: the opened bytes above the counter.
+	const fn pack(self) -> u64 {
+		(self.opened_bytes << Self::COUNTER_BITS) | self.counter
+	}
+
+	/// The facts a packed word holds.
+	const fn unpack(word: u64) -> Self {
+		let counter = word & ((1 << Self::COUNTER_BITS) - 1);
+		let opened_bytes = word >> Self::COUNTER_BITS;
+		Self { counter, opened_bytes }
+	}
+}
+
+// The largest counter and the largest volume each fit their share of the word.
+const _: () = assert!(DEFAULT_REKEY_RECORD_LIMIT < 1 << Progress::COUNTER_BITS);
+const _: () = assert!(AES_GCM_VOLUME_BYTES_PER_KEY < 1 << (u64::BITS - Progress::COUNTER_BITS));
 
 impl RecvCipher {
 	/// Wrap `aead` with an expected counter that starts at zero.
 	pub fn new(aead: RuntimeAead) -> Self {
-		Self {
-			aead,
-			expected_counter: AtomicU64::new(0),
-			rekey_limit: DEFAULT_REKEY_RECORD_LIMIT,
-		}
+		Self { aead, progress: AtomicU64::new(0), rekey_limit: DEFAULT_REKEY_RECORD_LIMIT }
 	}
 
 	/// Override the threshold that [`Self::remaining_records`] counts down
 	/// from.
 	///
 	/// The threshold drives the receive-direction renewal and drain triggers.
-	/// Decryption refuses records at the AES-GCM volume bound
-	/// ([`DEFAULT_REKEY_RECORD_LIMIT`]) whatever this value is, so a threshold
-	/// below the peer's send limit still admits every legitimate record.
+	/// Decryption refuses records at the AES-GCM volume bounds whatever this
+	/// value is, so a threshold below the peer's send limit still admits every
+	/// legitimate record.
 	pub fn with_rekey_limit(mut self, limit: u64) -> Self {
 		self.rekey_limit = limit;
 		self
@@ -574,8 +670,25 @@ impl RecvCipher {
 	/// rekey initiator watches the receive direction with no new protocol
 	/// field.
 	pub fn remaining_records(&self) -> u64 {
-		let expected = self.expected_counter.load(Ordering::Relaxed);
-		self.rekey_limit.saturating_sub(expected)
+		let progress = Progress::unpack(self.progress.load(Ordering::Relaxed));
+		self.rekey_limit.saturating_sub(progress.counter)
+	}
+
+	#[cfg(test)]
+	fn with_expected_counter(aead: RuntimeAead, counter: u64) -> Self {
+		Self::with_progress(aead, counter, 0)
+	}
+
+	/// A cipher that has already read `counter` records carrying
+	/// `opened_bytes` bytes.
+	#[cfg(test)]
+	fn with_progress(aead: RuntimeAead, counter: u64, opened_bytes: u64) -> Self {
+		let progress = Progress { counter, opened_bytes };
+		Self {
+			aead,
+			progress: AtomicU64::new(progress.pack()),
+			rekey_limit: DEFAULT_REKEY_RECORD_LIMIT,
+		}
 	}
 }
 
@@ -585,29 +698,38 @@ impl Decryptor for RecvCipher {
 	}
 
 	fn open(&self, content: CheckedContent<'_>) -> TbResult<SecretSlice<u8>> {
-		let (nonce_bytes, _) = extract_nonce_and_ciphertext(content.info(), self.aead.nonce_size())?;
+		let (nonce_bytes, ciphertext) = extract_nonce_and_ciphertext(content.info(), self.aead.nonce_size())?;
 		let counter = parse_counter_nonce(nonce_bytes)?;
 
-		// Refuse at the AES-GCM per-key volume bound (RFC 9846 § 5.5).
+		// Refuse at the AES-GCM per-key volume bound (RFC 9846 § 5.5), by
+		// record count and by the bytes this key has opened.
 		if counter >= DEFAULT_REKEY_RECORD_LIMIT {
 			return Err(TightBeamError::RekeyRequired);
 		}
 
 		// This pre-check lets only plausible counters reach the AEAD. The
 		// compare-exchange after authentication is the authoritative check.
-		let expected = self.expected_counter.load(Ordering::Relaxed);
-		if counter != expected {
-			return Err(TightBeamError::NonceReplayed((counter, expected).into()));
+		let word = self.progress.load(Ordering::Relaxed);
+		let progress = Progress::unpack(word);
+		if counter != progress.counter {
+			return Err(TightBeamError::NonceReplayed((counter, progress.counter).into()));
+		}
+
+		let record_bytes = u64::try_from(ciphertext.len()).unwrap_or(u64::MAX);
+		let opened_bytes = progress.opened_bytes.saturating_add(record_bytes);
+		if opened_bytes > AES_GCM_VOLUME_BYTES_PER_KEY {
+			return Err(TightBeamError::RekeyRequired);
 		}
 
 		let plaintext = self.aead.open(content)?;
 
 		// Advance only after successful authentication, otherwise a forged
-		// counter could block all future legitimate messages.
-		let next = counter.checked_add(1).ok_or(TightBeamError::NonceExhausted)?;
-		self.expected_counter
-			.compare_exchange(counter, next, Ordering::Relaxed, Ordering::Relaxed)
-			.map_err(|current| TightBeamError::NonceReplayed((counter, current).into()))?;
+		// counter could block all future legitimate messages. The counter is
+		// below the record limit, so the next one fits its share of the word.
+		let next = Progress { counter: counter + 1, opened_bytes };
+		self.progress
+			.compare_exchange(word, next.pack(), Ordering::Relaxed, Ordering::Relaxed)
+			.map_err(|current| TightBeamError::NonceReplayed((counter, Progress::unpack(current).counter).into()))?;
 
 		Ok(plaintext)
 	}
@@ -660,6 +782,16 @@ impl SessionKeys {
 		}
 	}
 
+	/// Bound the send cipher by the encrypted-envelope ceiling the session
+	/// runs under ([`SendCipher::with_envelope_ceiling`]).
+	///
+	/// The receive cipher needs no ceiling. It counts the bytes it opens, so
+	/// its bound holds for whatever envelopes the peer sends ([`RecvCipher`]).
+	pub fn with_envelope_ceiling(mut self, encrypted_envelope: usize) -> Self {
+		self.send = self.send.with_envelope_ceiling(encrypted_envelope);
+		self
+	}
+
 	/// The send-direction cipher.
 	pub fn send(&self) -> &SendCipher {
 		&self.send
@@ -679,6 +811,7 @@ impl SessionKeys {
 #[cfg(all(test, feature = "aes-gcm"))]
 mod tests {
 	use super::*;
+	use crate::constants::DEFAULT_MAX_ENCRYPTED_ENVELOPE;
 	use crate::der::asn1::OctetString;
 	use crate::der::Any;
 	use crate::error::ReceivedExpectedError;
@@ -902,6 +1035,29 @@ mod tests {
 		assert_eq!(sender.rekey_limit(), DEFAULT_REKEY_RECORD_LIMIT);
 	}
 
+	/// A raised envelope ceiling admits fewer records per key, and a limit
+	/// configured afterwards still clamps to that lower bound.
+	#[test]
+	fn send_cipher_lowers_its_limit_for_a_raised_envelope_ceiling() {
+		let doubled = DEFAULT_MAX_ENCRYPTED_ENVELOPE * 2;
+		let bounded = SendCipher::new(test_runtime()).with_envelope_ceiling(doubled);
+		assert_eq!(bounded.rekey_limit(), DEFAULT_REKEY_RECORD_LIMIT / 2);
+
+		let raised = bounded.with_rekey_limit(u64::MAX);
+		assert_eq!(raised.rekey_limit(), DEFAULT_REKEY_RECORD_LIMIT / 2);
+	}
+
+	/// A ceiling below the default leaves the default limit in place, and a
+	/// zero ceiling counts as one byte instead of dividing by zero.
+	#[test]
+	fn send_cipher_keeps_its_limit_for_a_lowered_or_empty_ceiling() {
+		let halved = SendCipher::new(test_runtime()).with_envelope_ceiling(DEFAULT_MAX_ENCRYPTED_ENVELOPE / 2);
+		assert_eq!(halved.rekey_limit(), DEFAULT_REKEY_RECORD_LIMIT);
+
+		let empty = SendCipher::new(test_runtime()).with_envelope_ceiling(0);
+		assert_eq!(empty.rekey_limit(), DEFAULT_REKEY_RECORD_LIMIT);
+	}
+
 	#[test]
 	fn recv_cipher_threshold_never_refuses_records() -> TbResult<()> {
 		let sender = SendCipher::new(test_runtime());
@@ -926,6 +1082,105 @@ mod tests {
 		let refused = receiver.decrypt_content(&over_bound);
 		assert!(matches!(refused, Err(TightBeamError::RekeyRequired)));
 		Ok(())
+	}
+
+	/// The packed word holds the largest counter and the largest volume
+	/// together, and reads both back.
+	#[test]
+	fn progress_packs_the_largest_counter_and_volume() {
+		let largest = Progress { counter: DEFAULT_REKEY_RECORD_LIMIT, opened_bytes: AES_GCM_VOLUME_BYTES_PER_KEY };
+		assert_eq!(Progress::unpack(largest.pack()), largest);
+	}
+
+	/// A key that has opened the whole AES-GCM volume refuses the next record,
+	/// whatever its counter is (CWE-326).
+	#[test]
+	fn recv_cipher_fails_closed_at_the_byte_volume() -> TbResult<()> {
+		let record = SendCipher::new(test_runtime()).encrypt_next(PLAINTEXT, None)?;
+
+		let receiver = RecvCipher::with_progress(test_runtime(), 0, AES_GCM_VOLUME_BYTES_PER_KEY);
+		let refused = receiver.decrypt_content(&record);
+		assert!(matches!(refused, Err(TightBeamError::RekeyRequired)));
+		Ok(())
+	}
+
+	/// The ciphertext bytes of `record`, as the volume bound counts them.
+	fn ciphertext_len(record: &EncryptedContentInfo) -> u64 {
+		let nonce_size = test_runtime().nonce_size();
+		let (_, ciphertext) = extract_nonce_and_ciphertext(record, nonce_size).expect("a sealed record carries both");
+		u64::try_from(ciphertext.len()).expect("a record length fits in u64")
+	}
+
+	/// The record that brings the opened bytes exactly to the volume is the
+	/// last one the key opens.
+	#[test]
+	fn recv_cipher_opens_the_record_that_reaches_the_byte_volume() -> TbResult<()> {
+		let record = SendCipher::new(test_runtime()).encrypt_next(PLAINTEXT, None)?;
+		let already_opened = AES_GCM_VOLUME_BYTES_PER_KEY - ciphertext_len(&record);
+
+		let receiver = RecvCipher::with_progress(test_runtime(), 0, already_opened);
+		let opened = receiver.decrypt_content(&record)?;
+		assert!(opened.with(|plaintext| plaintext == PLAINTEXT));
+		Ok(())
+	}
+
+	/// Every opened record counts toward the volume, so the second of two
+	/// records is refused when only the first fits.
+	#[test]
+	fn recv_cipher_counts_every_record_it_opens() -> TbResult<()> {
+		let sender = SendCipher::new(test_runtime());
+		let first = sender.encrypt_next(PLAINTEXT, None)?;
+		let second = sender.encrypt_next(PLAINTEXT, None)?;
+		let room_for_one = AES_GCM_VOLUME_BYTES_PER_KEY - ciphertext_len(&first);
+
+		let receiver = RecvCipher::with_progress(test_runtime(), 0, room_for_one);
+		receiver.decrypt_content(&first)?;
+		let refused = receiver.decrypt_content(&second);
+		assert!(matches!(refused, Err(TightBeamError::RekeyRequired)));
+		Ok(())
+	}
+
+	/// The sender's envelopes set the per-key volume, and the ceiling is not
+	/// negotiated. An honest sender at a lowered ceiling keeps the constant
+	/// record limit, and a receiver at the default ceiling and a receiver at a
+	/// raised one both accept the last record under that limit.
+	#[test]
+	fn a_receiver_at_any_ceiling_accepts_an_honest_sender_up_to_the_constant() -> TbResult<()> {
+		let last_counter = DEFAULT_REKEY_RECORD_LIMIT - 1;
+		let halved = DEFAULT_MAX_ENCRYPTED_ENVELOPE / 2;
+		let sender = SendCipher::with_counter(test_runtime(), last_counter).with_envelope_ceiling(halved);
+		assert_eq!(sender.rekey_limit(), DEFAULT_REKEY_RECORD_LIMIT);
+
+		let last = sender.encrypt_next(PLAINTEXT, None)?;
+
+		let default_receiver = RecvCipher::with_expected_counter(test_runtime(), last_counter);
+		default_receiver.decrypt_content(&last)?;
+
+		let doubled = DEFAULT_MAX_ENCRYPTED_ENVELOPE * 2;
+		let raised = SessionKeys {
+			send: SendCipher::new(test_runtime()),
+			recv: RecvCipher::with_expected_counter(test_runtime(), last_counter),
+		}
+		.with_envelope_ceiling(doubled);
+		assert_eq!(raised.recv().rekey_limit(), DEFAULT_REKEY_RECORD_LIMIT);
+		raised.recv().decrypt_content(&last)?;
+		Ok(())
+	}
+
+	/// The session's envelope ceiling lowers the send cipher's record limit
+	/// and leaves the receive cipher at the constant, because the peer's
+	/// envelopes set the receive-direction volume.
+	#[test]
+	fn session_keys_bound_the_send_cipher_by_the_envelope_ceiling() {
+		let ciphers = DirectionalCiphers {
+			client_to_server: Aes256Gcm::new(&[0x11u8; 32].into()),
+			server_to_client: Aes256Gcm::new(&[0x22u8; 32].into()),
+		};
+
+		let doubled = DEFAULT_MAX_ENCRYPTED_ENVELOPE * 2;
+		let keys = SessionKeys::for_client(ciphers).with_envelope_ceiling(doubled);
+		assert_eq!(keys.send().rekey_limit(), DEFAULT_REKEY_RECORD_LIMIT / 2);
+		assert_eq!(keys.recv().rekey_limit(), DEFAULT_REKEY_RECORD_LIMIT);
 	}
 
 	#[test]

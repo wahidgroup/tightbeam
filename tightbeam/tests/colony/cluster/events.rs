@@ -1,8 +1,8 @@
 //! Client-side cluster scenario event markers.
 //!
-//! These URNs record facts the gateway cannot observe, such as a client send
-//! completing or a probe firing. Gateway decisions are asserted through the
-//! built-in `tightbeam` events the cluster fires on the scenario trace.
+//! These URNs record facts that only the client observes, such as a client
+//! send completing or a probe firing. Gateway decisions are asserted through
+//! the built-in `tightbeam` events the cluster fires on the scenario trace.
 //!
 //! # Export boundary
 //!
@@ -86,6 +86,7 @@ pub(crate) const PEER_PROBE_FOREIGN_REFUSED: Urn<'static> =
 pub(crate) const PEER_HINT_LEARNED_ON_REFUSE: Urn<'static> =
 	tightbeam::urn!("test", "event:cluster/peer-hint-learned-on-refuse");
 pub(crate) const WILDCARD_START_REFUSED: Urn<'static> = tightbeam::urn!("test", "event:cluster/wildcard-start-refused");
+pub(crate) const WILDCARD_PORT_RELEASED: Urn<'static> = tightbeam::urn!("test", "event:cluster/wildcard-port-released");
 pub(crate) const PEER_ROUTE_DIALS_ADVERTISED_ADDR: Urn<'static> =
 	tightbeam::urn!("test", "event:cluster/peer-route-dials-advertised-addr");
 pub(crate) const PEER_ABUSE_CANDIDATE_DISCARDED: Urn<'static> =

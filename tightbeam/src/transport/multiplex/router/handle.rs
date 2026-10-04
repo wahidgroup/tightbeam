@@ -4,11 +4,10 @@
 use core::future::Future;
 use std::sync::Arc;
 
-use futures::channel::{mpsc, oneshot};
+use futures::channel::oneshot;
 use futures::SinkExt;
 
-use super::body::{DrainNote, StreamBody};
-use super::flow::{chunk_records, payload_credits};
+use super::body::StreamBody;
 use super::link::MuxLink;
 use super::outbound::Outbound;
 use super::shared::{BudgetStanding, MuxShared, OpenRequest, OpenSlot, StreamOutcome, StreamReservation};
@@ -102,9 +101,6 @@ impl Drop for ForgetPingOnDrop {
 #[derive(Clone)]
 pub struct MuxHandle {
 	link: MuxLink,
-	/// Consumption reports from duplex reply bodies back to the
-	/// reader's credit replenishment
-	drain_feedback: mpsc::UnboundedSender<DrainNote>,
 }
 
 // Audit source for gate verdicts on the mux plane: the responder
@@ -121,8 +117,8 @@ impl GateAudit for MuxHandle {
 impl MuxHandle {
 	/// Assemble a handle over the connection's shared state and
 	/// queues (refcount bumps only, no data copies).
-	pub(crate) fn new(link: MuxLink, drain_feedback: mpsc::UnboundedSender<DrainNote>) -> Self {
-		Self { link, drain_feedback }
+	pub(crate) fn new(link: MuxLink) -> Self {
+		Self { link }
 	}
 
 	/// Send a request on a freshly allocated stream and await its response.
@@ -147,11 +143,7 @@ impl MuxHandle {
 		// Encode before reserving so an encoding failure never burns
 		// a cap slot or queues work for a stream the peer never saw.
 		let payload = frame.to_der()?;
-		let credits = payload_credits(
-			payload.len(),
-			self.link.shared().send_chunk_size,
-			self.link.shared().credit_unit,
-		);
+		let credits = self.link.shared().credits_for(payload.len());
 
 		let (sender, receiver) = oneshot::channel();
 		// The reservation holds the cap slot until the Open goes out
@@ -162,7 +154,7 @@ impl MuxHandle {
 
 		let standing = self.link.shared().admit_debit(credits, false).await?;
 
-		let total = chunk_records(payload.len(), self.link.shared().send_chunk_size);
+		let total = self.link.shared().records_for(payload.len());
 		let mut guard = CancelOnDrop::new(&self.link, Arc::clone(&slot));
 
 		match self.send_request_chunks(&mut reservation, &payload, total).await {
@@ -331,7 +323,7 @@ impl MuxHandle {
 		let (mut body, forwarder) = StreamBody::pair(
 			Arc::clone(&slot),
 			self.link.shared().initial_recv_credit,
-			self.drain_feedback.clone(),
+			self.link.drain_feedback(),
 		);
 
 		// An abandoned reply must reclaim its cap slot: without the
@@ -520,6 +512,8 @@ impl StreamingProtocol for MuxHandle {
 mod tests {
 	use core::task::Poll;
 
+	use futures::channel::mpsc;
+
 	use super::super::body::BodyEvent;
 	use super::super::testing::{client_shared, poll_now};
 	use super::*;
@@ -527,8 +521,8 @@ mod tests {
 
 	fn duplex_handle() -> (MuxHandle, mpsc::Receiver<Outbound>) {
 		let (outbound, sent) = mpsc::channel(8);
-		let (drain_feedback, _) = mpsc::unbounded();
-		let handle = MuxHandle { link: MuxLink::new(client_shared(), outbound), drain_feedback };
+		let (link, _) = MuxLink::new(client_shared(), outbound);
+		let handle = MuxHandle { link };
 		(handle, sent)
 	}
 

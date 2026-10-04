@@ -14,11 +14,9 @@ use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
 use crate::crypto::secret::SecretSlice;
 use crate::transport::handshake::error::HandshakeError;
 
-/// Trait for processing a RecipientInfo to extract the Content Encryption
-/// Key (CEK).
+/// Extracts the Content Encryption Key (CEK) from a RecipientInfo.
 ///
-/// An implementation handles one recipient type, such as KARI or KTRI, and
-/// extracts the CEK from the RecipientInfo structure.
+/// An implementation handles one recipient type, such as KARI or KTRI.
 pub trait RecipientProcessor {
 	/// Process a RecipientInfo to extract the CEK.
 	///
@@ -31,6 +29,11 @@ pub trait RecipientProcessor {
 	///
 	/// The extracted CEK (Content Encryption Key), wrapped so it zeroizes on
 	/// drop.
+	///
+	/// # Errors
+	///
+	/// An implementation returns a [`HandshakeError`] when the RecipientInfo
+	/// is of another type, is malformed, or its key fails to unwrap.
 	fn process_recipient(
 		&self,
 		info: &RecipientInfo,
@@ -41,8 +44,8 @@ pub trait RecipientProcessor {
 /// Processor for CMS `EnvelopedData` structures.
 ///
 /// The processor delegates recipient info processing to a
-/// [`RecipientProcessor`] implementation and uses the standard `Decryptor`
-/// trait from `crypto::aead` for content decryption.
+/// [`RecipientProcessor`] implementation and uses the standard [`Decryptor`]
+/// trait for content decryption.
 pub struct TightBeamEnvelopedDataProcessor<P = DefaultCryptoProvider>
 where
 	P: CryptoProvider,
@@ -120,6 +123,13 @@ where
 	/// # Returns
 	///
 	/// The decrypted plaintext content, wrapped so it zeroizes on drop.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::InvalidRecipientIndex`] -- the index is past the RecipientInfos set.
+	/// - [`HandshakeError::InvalidKeySize`] -- the CEK does not fit the cipher.
+	/// - Any error the recipient processor returns.
+	/// - A decryption failure, including an algorithm other than the cipher's.
 	pub fn process(&self, enveloped_data: &EnvelopedData) -> Result<SecretSlice<u8>, HandshakeError> {
 		// 1. Validate the recipient index.
 		self.validate_recipient_index(enveloped_data)?;
@@ -143,7 +153,7 @@ where
 	}
 }
 
-/// Default implementation for DefaultCryptoProvider.
+/// Default implementation for [`DefaultCryptoProvider`].
 impl TightBeamEnvelopedDataProcessor<DefaultCryptoProvider> {
 	/// Create a processor with default TightBeam settings.
 	pub fn with_defaults<R>(recipient_processor: R) -> Self
@@ -216,15 +226,15 @@ mod tests {
 
 			// 4. Build EnvelopedData (sender side)
 			let builder = TightBeamEnvelopedDataBuilder::with_defaults(kari_builder);
-			let enveloped_data = builder.build(plaintext, None, None)?;
+			let enveloped_data = builder.build(plaintext, None)?;
 
 			// 5. Create recipient processor
 			let kari_recipient = TightBeamKariRecipient::with_defaults(recipient_key);
 
-			// 6. Create processor and decrypt (recipient side)
+			// 6. Create the processor (recipient side)
 			let processor = TightBeamEnvelopedDataProcessor::with_defaults(kari_recipient);
 
-			// 7. Verify roundtrip success
+			// 7. Decrypt and verify the round trip
 			let decrypted = processor.process(&enveloped_data)?;
 			let decrypted = decrypted.to_insecure();
 			assert_eq!(&decrypted[..], &plaintext[..]);
@@ -240,14 +250,13 @@ mod tests {
 			// 2. Create KARI builder and build EnvelopedData
 			let kari_builder = create_test_kari_builder(sender_key, sender_spki, recipient_pubkey);
 			let builder = TightBeamEnvelopedDataBuilder::with_defaults(kari_builder);
-			let enveloped_data = builder.build(b"Test message", None, None)?;
+			let enveloped_data = builder.build(b"Test message", None)?;
 
 			// 3. Create processor with invalid recipient index
 			let processor =
 				TightBeamEnvelopedDataProcessor::with_defaults(DummyRecipientProcessor).with_recipient_index(99);
 
-			// 4. Process with the invalid index. The error MUST be
-			// InvalidRecipientIndex specifically.
+			// 4. Process with the invalid index. The error MUST be InvalidRecipientIndex specifically.
 			let result = processor.process(&enveloped_data);
 			assert!(matches!(result, Err(HandshakeError::InvalidRecipientIndex)));
 
@@ -269,12 +278,12 @@ mod tests {
 			let builder = TightBeamEnvelopedDataBuilder::with_defaults(kari_builder);
 			let attr = test_attr.clone();
 			let builder = builder.with_unprotected_attr(attr);
-			let enveloped_data = builder.build(b"Test with attributes", None, None)?;
+			let enveloped_data = builder.build(b"Test with attributes", None)?;
 
-			// 4. Extract attributes using processor
+			// 4. Create the processor
 			let processor = TightBeamEnvelopedDataProcessor::with_defaults(DummyRecipientProcessor);
 
-			// 5. Verify attributes were extracted correctly
+			// 5. Extract the attributes and verify them
 			let attrs = processor.extract_unprotected_attributes(&enveloped_data);
 			let Some(attrs) = attrs else {
 				return Err(crate::testing::error::TestingError::InvariantViolated.into());

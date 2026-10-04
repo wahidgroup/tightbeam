@@ -2,7 +2,10 @@
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
-#[cfg(all(not(feature = "std"), feature = "transport-ecies"))]
+#[cfg(all(
+	not(feature = "std"),
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
 use alloc::boxed::Box;
 #[cfg(not(feature = "std"))]
 use alloc::sync::Arc;
@@ -45,8 +48,6 @@ mod deadline {
 	pub use core::time::Duration;
 
 	pub use tokio::time::timeout;
-
-	pub use crate::transport::error::TransportFailure;
 }
 
 #[cfg(all(
@@ -68,16 +69,13 @@ mod x509 {
 
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	mod handshake {
-		pub use crate::crypto::aead::KeyInit;
-		pub use crate::crypto::profiles::CryptoProvider;
-		pub use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
-		pub use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
-		pub use crate::crypto::sign::Verifier;
-		pub use crate::spki::EncodePublicKey;
+		pub use crate::transport::error::TransportFailure;
 		pub use crate::transport::handshake::negotiation::RunnableProfile;
+		pub(crate) use crate::transport::handshake::ServerFlow;
 		pub use crate::transport::handshake::{
-			BoxedClientHandshake, BoxedServerHandshake, ClientHandshakeProtocol, HandshakeError, HandshakeMessage,
-			HandshakeProtocolKind, ServerHandshakeProtocol,
+			BoxedClientHandshake, BoxedServerHandshake, ClientConfig, ClientHandshakeProtocol, Handshake,
+			HandshakeError, HandshakeMessage, HandshakeProtocolKind, HandshakeProvider, ServerConfig,
+			ServerHandshakeProtocol, SupportedProfiles,
 		};
 		pub use crate::transport::state::SessionPhase;
 	}
@@ -87,13 +85,8 @@ mod x509 {
 
 	#[cfg(feature = "transport-ecies")]
 	mod ecies {
-		pub use crate::crypto::ecies::{EciesEphemeral, EciesPublicKeyOps};
-		pub use crate::crypto::sign::SignatureEncoding;
-		pub use crate::der::oid::AssociatedOid;
-		pub use crate::transport::handshake::client::{EciesHandshakeClient, ExtractVerifyingKey};
-
-		#[cfg(feature = "std")]
 		pub use crate::crypto::x509::policy::CertificateValidation;
+		pub use crate::transport::handshake::{Ecies, EciesClientSettings, EciesServerSettings, LearnedTrust};
 	}
 
 	#[cfg(feature = "transport-ecies")]
@@ -102,28 +95,11 @@ mod x509 {
 	#[cfg(feature = "transport-cms")]
 	mod cms {
 		pub use crate::transport::handshake::negotiation::SecurityOffer;
-		pub use crate::transport::handshake::CmsClientConfig;
+		pub use crate::transport::handshake::{Cms, CmsClientSettings, CmsServerSettings, ProvisionedTrust};
 	}
 
 	#[cfg(feature = "transport-cms")]
 	pub use cms::*;
-
-	#[cfg(all(
-		feature = "transport-multiplex",
-		any(feature = "transport-cms", feature = "transport-ecies")
-	))]
-	mod rekey {
-		pub(crate) use crate::transport::handshake::receipt::ReceiptSigner;
-		pub(crate) use crate::transport::handshake::HandshakeVerifyingKey;
-		pub use crate::transport::multiplex::{MuxRekeyContext, MuxRole};
-		pub(crate) use crate::transport::rekey::{ClientRekey, RekeyDriver, RekeyMaterials, ServerRekey};
-	}
-
-	#[cfg(all(
-		feature = "transport-multiplex",
-		any(feature = "transport-cms", feature = "transport-ecies")
-	))]
-	pub(crate) use rekey::*;
 }
 
 #[cfg(feature = "x509")]
@@ -155,115 +131,26 @@ fn remaining_handshake_deadline<T: EncryptedProtocolState + MessageIO>(state: &T
 	deadline.saturating_duration_since(now)
 }
 
-/// Harvest the in-band rekey context from a completed receipt-bearing
-/// handshake.
-///
-/// [`MuxTransport::with_rekey`] consumes the result. The function is
-/// crate-internal, so the transport's [`MuxConnector::take_rekey`] or
-/// [`MuxAcceptor::take_rekey`] always fixes the endpoint role.
-///
-/// # Returns
-///
-/// - `Ok(Some(..))` at most once per handshake, because the call detaches the
-///   retained epoch materials.
-/// - `Ok(None)` when the session carries no dual-signed receipt, no retained
-///   peer identity, or no epoch materials.
-///
-/// # Errors
-///
-/// - `EncryptorUnavailable` when no handshake completed.
-/// - An extraction error when the peer key or the signer identifier fails to extract.
-///
-/// [`MuxTransport::with_rekey`]: crate::transport::multiplex::MuxTransport::with_rekey
-/// [`MuxConnector::take_rekey`]: crate::transport::multiplex::MuxConnector::take_rekey
-/// [`MuxAcceptor::take_rekey`]: crate::transport::multiplex::MuxAcceptor::take_rekey
-#[cfg(all(
-	feature = "x509",
-	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-ecies")
-))]
-pub(crate) fn take_rekey_context<T, P>(state: &mut T, role: MuxRole) -> TransportResult<Option<MuxRekeyContext>>
-where
-	T: EncryptedProtocolState<CryptoProvider = P>,
-	P: CryptoProvider + Send + Sync + 'static,
-	P::Curve: Curve + CurveArithmetic,
-	<P::Curve as Curve>::FieldBytesSize: ModulusSize,
-	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
-	P::VerifyingKey: From<PublicKey<P::Curve>>,
-	for<'a> P::Signature: TryFrom<&'a [u8]>,
-	P::AeadCipher: KeyInit + 'static,
-{
-	let Some(stored) = state.session_state().receipt().cloned() else {
-		return Ok(None);
-	};
-	let Some(provider) = state
-		.encryption()
-		.key_manager
-		.as_ref()
-		.map(|manager| manager.signing_provider())
-	else {
-		return Ok(None);
-	};
-
-	let Some(peer_certificate) = state.session_state().peer_certificate_arc() else {
-		return Ok(None);
-	};
-
-	let public_key = peer_certificate.verifying_key::<P::Curve>()?;
-	let peer_verifying_key = P::VerifyingKey::from(public_key);
-	let peer_sid = peer_certificate.signer_identifier::<P::Digest>()?;
-
-	// Detached last so a session refused above keeps its materials
-	let Some(epoch) = state.session_state_mut().take_epoch_materials() else {
-		return Ok(None);
-	};
-
-	let reference_receipt = stored.receipt().clone();
-	let materials = RekeyMaterials::<P>::new(epoch, reference_receipt, provider, peer_verifying_key, peer_sid);
-
-	let driver = match role {
-		MuxRole::Client => {
-			let exchange = ClientRekey::new(materials, state.encryption().receipt_approver.as_ref().map(Arc::clone));
-			RekeyDriver::client(exchange)
-		}
-		MuxRole::Server => {
-			let exchange = ServerRekey::new(
-				materials,
-				state.encryption().transport_authorizer.as_ref().map(Arc::clone),
-				state.encryption().session_observer.as_ref().map(Arc::clone),
-				Some(peer_certificate),
-			);
-			RekeyDriver::server(exchange)
-		}
-	};
-
-	Ok(Some(MuxRekeyContext { driver, receipt: stored }))
-}
-
-/// Decode a `TransportEnvelope` from DER bytes.
-///
-/// This is the single decode path that [`MessageIO::decode_envelope`] and the
-/// split transport halves share. The frame decoder rejects a frame that carries
-/// a field its version forbids.
-pub(crate) fn decode_transport_envelope(buffer: &[u8]) -> TransportResult<TransportEnvelope> {
-	let envelope = TransportEnvelope::from_der(buffer)?;
-	Ok(envelope)
-}
-
 /// Receive side of a split envelope link.
 ///
-/// Decouples the [`MuxTransport`](crate::transport::multiplex::MuxTransport)
-/// router from the link's protection policy: an encrypting implementation
-/// decrypts and enforces AEAD sequencing, a cleartext one enforces neither.
+/// The trait decouples the
+/// [`MuxTransport`](crate::transport::multiplex::MuxTransport) router from the
+/// link's protection policy. An encrypting implementation decrypts and
+/// enforces AEAD sequencing, while a cleartext one enforces neither.
 pub trait EnvelopeSource: MaybeSend {
 	/// Read the next envelope from the link.
+	///
+	/// # Errors
+	///
+	/// - The link's read failure, such as a closed connection, a decode
+	///   failure, or a decrypt failure on an encrypting link.
 	fn read_envelope(&mut self) -> impl Future<Output = TransportResult<TransportEnvelope>> + MaybeSend;
 
 	/// The number of envelopes still readable before the link demands a
 	/// rekey.
 	///
 	/// The count tracks the peer's send counter on the ordered channel, so a
-	/// rekey initiator watches the receive direction with no new protocol
+	/// rekey initiator watches the receive direction with no extra protocol
 	/// field. A link without keys never rekeys and reports `u64::MAX`.
 	fn remaining_records(&self) -> u64 {
 		u64::MAX
@@ -274,6 +161,10 @@ pub trait EnvelopeSource: MaybeSend {
 	///
 	/// A link without keys never rekeys, so the default fails closed and an
 	/// epoch install never lands silently on an unprotected link.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::MissingEncryption`] -- the default, on a link without keys.
 	///
 	/// [rfc9846-4.7.3]: https://datatracker.ietf.org/doc/html/rfc9846#section-4.7.3
 	#[cfg(feature = "aead")]
@@ -289,11 +180,14 @@ pub trait EnvelopeSource: MaybeSend {
 	}
 }
 
-/// Send side of a split envelope link.
-///
-/// Send-direction counterpart of [`EnvelopeSource`].
+/// Send side of a split envelope link, the counterpart of [`EnvelopeSource`].
 pub trait EnvelopeSink: MaybeSend {
 	/// Write `envelope` to the link.
+	///
+	/// # Errors
+	///
+	/// - The link's write failure, such as a closed connection, an encode
+	///   failure, or an encrypt failure on an encrypting link.
 	fn write_envelope(&mut self, envelope: TransportEnvelope) -> impl Future<Output = TransportResult<()>> + MaybeSend;
 
 	/// The number of envelopes still writable before the link demands a
@@ -307,6 +201,10 @@ pub trait EnvelopeSink: MaybeSend {
 	///
 	/// A link without keys never rekeys, so the default fails closed and an
 	/// epoch install never lands silently on an unprotected link.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::MissingEncryption`] -- the default, on a link without keys.
 	///
 	/// [rfc9846-4.7.3]: https://datatracker.ietf.org/doc/html/rfc9846#section-4.7.3
 	#[cfg(feature = "aead")]
@@ -332,17 +230,34 @@ pub trait MessageIO {
 	fn clock(&self) -> &dyn Clock;
 
 	/// Read raw DER-encoded envelope bytes from the transport.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::ConnectionClosed`] -- the peer closed the stream.
+	/// - The transport's own read failure.
 	fn read_envelope_bytes(&mut self) -> impl Future<Output = TransportResult<Vec<u8>>> + MaybeSend;
 
 	/// Write raw DER-encoded envelope bytes to the transport.
+	///
+	/// # Errors
+	///
+	/// - The transport's own write failure.
 	fn write_envelope_bytes(&mut self, buffer: &[u8]) -> impl Future<Output = TransportResult<()>> + MaybeSend;
 
 	/// Decode an envelope from DER bytes.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::DerError`] -- `buffer` is not a valid envelope.
 	fn decode_envelope(buffer: &[u8]) -> TransportResult<TransportEnvelope> {
-		decode_transport_envelope(buffer)
+		Ok(TransportEnvelope::from_der(buffer)?)
 	}
 
 	/// Encode an envelope as DER bytes.
+	///
+	/// # Errors
+	///
+	/// - The encode failure of an envelope that does not serialize.
 	fn encode_envelope(envelope: &TransportEnvelope) -> TransportResult<Vec<u8>> {
 		Ok(encode(envelope)?)
 	}
@@ -351,6 +266,11 @@ pub trait MessageIO {
 	///
 	/// An encrypted transport may override this method to parse a
 	/// [`WireEnvelope`].
+	///
+	/// # Errors
+	///
+	/// - The [`read_envelope_bytes`](Self::read_envelope_bytes) and
+	///   [`decode_envelope`](Self::decode_envelope) sets.
 	fn read_decoded_envelope(&mut self) -> impl Future<Output = TransportResult<TransportEnvelope>> + MaybeSend
 	where
 		Self: MaybeSend,
@@ -376,6 +296,11 @@ pub trait MessageIO {
 	/// protocol-specific implementation detects its own EOF conditions, such as
 	/// `UnexpectedEof` for TCP, and should override this method to map them to
 	/// `Ok(None)`.
+	///
+	/// # Errors
+	///
+	/// - The [`read_decoded_envelope`](Self::read_decoded_envelope) set, apart
+	///   from the close that maps to `Ok(None)`.
 	fn try_read_decoded_envelope(
 		&mut self,
 	) -> impl Future<Output = TransportResult<Option<TransportEnvelope>>> + MaybeSend
@@ -392,29 +317,104 @@ pub trait MessageIO {
 	}
 }
 
+/// Outcome of one protocol-agnostic collector step.
+#[cfg(all(
+	feature = "transport-policy",
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
+pub enum CollectStep {
+	/// Cleartext handshake container to feed the server-side dispatcher,
+	/// decoded once with the bytes it arrived as.
+	Handshake(HandshakeMessage),
+	/// Decrypted (or legitimately cleartext) application envelope.
+	Envelope(TransportEnvelope),
+}
+
 /// Message I/O with session encryption and the handshake drivers.
 #[cfg(feature = "x509")]
 pub trait EncryptedMessageIO: MessageIO {
-	/// Read one envelope in cleartext or in encrypted form.
+	/// Read one wire envelope, enforce size ceilings, and classify it.
+	///
+	/// The step is protocol-agnostic. It surfaces a handshake container as a
+	/// decoded message for the caller's dispatcher, and it decrypts and returns
+	/// everything else.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::OperationFailed`] with
+	///   [`TransportFailure::SizeExceeded`] -- the wire envelope passes the
+	///   ceiling of its kind.
+	/// - [`TransportError::MissingEncryption`] -- cleartext traffic arrived
+	///   where encryption is required, and the session was reset.
+	/// - [`TransportError::OperationFailed`] with
+	///   [`TransportFailure::EncryptionFailed`] -- an encrypted envelope came
+	///   before encryption or did not decrypt, and the session was reset.
+	/// - The read, decode, and handshake-container conversion failures.
+	#[cfg(all(
+		feature = "transport-policy",
+		any(feature = "transport-cms", feature = "transport-ecies")
+	))]
 	#[allow(async_fn_in_trait)]
-	async fn relay_message(&mut self) -> TransportResult<TransportEnvelope>
+	async fn collect_step(&mut self) -> TransportResult<CollectStep>
 	where
-		Self: EncryptedProtocolState,
+		Self: EncryptedProtocolState + Sized,
 	{
 		let wire_bytes = self.read_envelope_bytes().await?;
 		let wire_envelope = WireEnvelope::from_der(&wire_bytes)?;
+		let ceiling = match &wire_envelope {
+			WireEnvelope::Cleartext(_) => self.limits().cleartext_envelope,
+			WireEnvelope::Encrypted(_) => self.limits().encrypted_envelope,
+		};
+		if wire_bytes.len() > ceiling {
+			return Err(TransportError::OperationFailed(TransportFailure::SizeExceeded));
+		}
+
+		// An established session admits only encrypted traffic. Before that, a
+		// provisioned endpoint admits only the handshake containers, and an
+		// unprovisioned one admits traffic.
+		let established = self.session_state().phase().requires_encryption();
+		let expects_encryption = self.session_state().phase().is_handshake_pending();
 		match wire_envelope {
-			WireEnvelope::Cleartext(transport_envelope) => {
-				// A server with a decryptor configured refuses cleartext.
-				if self.session_state().decryptor().is_ok() {
+			WireEnvelope::Cleartext(envelope) => {
+				if established {
+					// Circuit breaker: a cleartext frame on an agreed session
+					// is not the peer this session established (CWE-319).
+					self.session_state_mut().reset();
 					return Err(TransportError::MissingEncryption);
 				}
 
-				Ok(transport_envelope)
+				if expects_encryption {
+					match envelope {
+						TransportEnvelope::EnvelopedData(_) | TransportEnvelope::SignedData(_) => {
+							Ok(CollectStep::Handshake(HandshakeMessage::try_from(envelope)?))
+						}
+						// Circuit breaker: once encryption is configured,
+						// application traffic arrives encrypted.
+						_ => {
+							self.session_state_mut().reset();
+							Err(TransportError::MissingEncryption)
+						}
+					}
+				} else {
+					Ok(CollectStep::Envelope(envelope))
+				}
 			}
 			WireEnvelope::Encrypted(encrypted_info) => {
-				let decrypted_bytes = self.session_state().decryptor()?.decrypt_content(&encrypted_info)?;
-				decrypted_bytes.with(|bytes| Self::decode_envelope(bytes))
+				if !matches!(self.session_state().phase(), SessionPhase::Encrypted(_)) {
+					self.session_state_mut().reset();
+					return Err(TransportError::OperationFailed(TransportFailure::EncryptionFailed));
+				}
+
+				let decrypted_bytes = match self.session_state().decryptor()?.decrypt_content(&encrypted_info) {
+					Ok(bytes) => bytes,
+					Err(_) => {
+						self.session_state_mut().reset();
+						return Err(TransportError::OperationFailed(TransportFailure::EncryptionFailed));
+					}
+				};
+
+				let envelope = decrypted_bytes.with(|bytes| Self::decode_envelope(bytes))?;
+				Ok(CollectStep::Envelope(envelope))
 			}
 		}
 	}
@@ -457,6 +457,12 @@ pub trait EncryptedMessageIO: MessageIO {
 	/// size the envelope, so an oversized request fails locally with a typed
 	/// `SizeExceeded` that returns the frame, before a peer connection reset.
 	///
+	/// # Errors
+	///
+	/// - [`TransportError::MessageNotSent`] -- the envelope did not encode,
+	///   encrypt, or fit its ceiling, and the frame travels with the error.
+	/// - The [`EncryptedProtocolState::apply_wire_mode`] set, while the handshake has not yet installed keys.
+	///
 	/// [`TransportLimits`]: crate::transport::TransportLimits
 	#[allow(async_fn_in_trait)]
 	async fn wrap_and_encrypt_message(&mut self, message: Frame) -> TransportResult<WireEnvelope>
@@ -471,6 +477,13 @@ pub trait EncryptedMessageIO: MessageIO {
 	/// Decrypt a response from its encoded bytes.
 	///
 	/// The default is protocol-agnostic.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::MissingEncryption`] -- a cleartext answer arrived
+	///   on an established session, and the session was reset.
+	/// - [`TransportError::DerError`] -- the bytes are not a wire envelope.
+	/// - The decrypt failure of an encrypted answer.
 	#[allow(async_fn_in_trait)]
 	async fn decrypt_response(&mut self, wire_bytes: impl Into<Vec<u8>>) -> TransportResult<TransportEnvelope>
 	where
@@ -481,9 +494,8 @@ pub trait EncryptedMessageIO: MessageIO {
 		match wire_envelope {
 			WireEnvelope::Cleartext(env) => {
 				// The phase decides the wire mode for both directions, so an
-				// established session refuses a cleartext answer and its
-				// unauthenticated content (CWE-319). The session breaks here,
-				// as it does in the inbound collector.
+				// established session refuses an unauthenticated cleartext
+				// answer (CWE-319) and resets, as the inbound collector does.
 				if self.session_state().phase().requires_encryption() {
 					self.session_state_mut().reset();
 					return Err(TransportError::MissingEncryption);
@@ -500,8 +512,9 @@ pub trait EncryptedMessageIO: MessageIO {
 
 	/// Dual-write the handshake outcome at the transport driver interface.
 	///
-	/// The outcome is a completion, or a receipt approval or settlement
-	/// refusal.
+	/// - A completed handshake records the completion, and the settlement when the session holds a receipt.
+	/// - A refused handshake records the audit event its error names: a receipt
+	///   approval or settlement refusal, or a rejected certificate or proof.
 	#[cfg(all(
 		feature = "instrument",
 		any(feature = "transport-cms", feature = "transport-ecies")
@@ -515,8 +528,8 @@ pub trait EncryptedMessageIO: MessageIO {
 		};
 
 		match outcome {
-			// Multi-round server handshakes report Ok per round.
-			// Only the completed state marks the session as established.
+			// A multi-round server handshake reports `Ok` per round, so only
+			// the encrypted phase marks the session as established.
 			Ok(()) => {
 				if !matches!(self.session_state().phase(), SessionPhase::Encrypted(_)) {
 					return;
@@ -537,53 +550,16 @@ pub trait EncryptedMessageIO: MessageIO {
 	}
 
 	/// Run the client handshake when the session is still provisioned.
-	#[cfg(feature = "transport-ecies")]
-	#[allow(async_fn_in_trait)]
-	async fn ensure_handshake_complete<P>(&mut self) -> TransportResult<()>
-	where
-		Self: Sized + EncryptedProtocolState<CryptoProvider = P>,
-		// Curve and elliptic curve bounds
-		P: CryptoProvider + Default + Send + Sync + 'static,
-		P::Curve: Curve + CurveArithmetic + AssociatedOid,
-		<P::Curve as Curve>::FieldBytesSize: ModulusSize,
-		AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
-		PublicKey<P::Curve>: EciesPublicKeyOps + EncodePublicKey,
-		<PublicKey<P::Curve> as EciesPublicKeyOps>::SecretKey: EciesEphemeral<PublicKey = PublicKey<P::Curve>>,
-		// Signature bounds
-		P::Signature: SignatureEncoding,
-		for<'b> P::Signature: TryFrom<&'b [u8]>,
-		for<'b> <P::Signature as TryFrom<&'b [u8]>>::Error: Into<HandshakeError>,
-		P::VerifyingKey: Verifier<P::Signature> + ExtractVerifyingKey + From<PublicKey<P::Curve>> + EncodePublicKey,
-		// AEAD bound
-		P::AeadCipher: KeyInit,
-	{
-		let should_handshake = matches!(self.session_state().phase(), SessionPhase::Provisioned);
-		if should_handshake {
-			self.perform_client_handshake().await?;
-		}
-
-		Ok(())
-	}
-
-	/// Run the client handshake when the session is still provisioned, in the
-	/// CMS-only build.
 	///
-	/// Trait where-clauses do not elaborate to callers, so each feature
-	/// combination declares the dispatcher with that build's predicate set.
-	#[cfg(all(not(feature = "transport-ecies"), feature = "transport-cms"))]
+	/// # Errors
+	///
+	/// - The [`perform_client_handshake`](Self::perform_client_handshake) set.
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	#[allow(async_fn_in_trait)]
 	async fn ensure_handshake_complete<P>(&mut self) -> TransportResult<()>
 	where
 		Self: Sized + EncryptedProtocolState<CryptoProvider = P>,
-		P: CryptoProvider + Default + Send + Sync + 'static,
-		P::Curve: Curve + CurveArithmetic,
-		<P::Curve as Curve>::FieldBytesSize: ModulusSize,
-		AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
-		PublicKey<P::Curve>: EncodePublicKey,
-		P::VerifyingKey: From<PublicKey<P::Curve>> + EncodePublicKey + Verifier<P::Signature> + 'static,
-		P::Signature: 'static,
-		P::Digest: Send + 'static,
-		P::AeadCipher: KeyInit + Send + Sync,
+		P: HandshakeProvider,
 	{
 		let should_handshake = matches!(self.session_state().phase(), SessionPhase::Provisioned);
 		if should_handshake {
@@ -596,100 +572,71 @@ pub trait EncryptedMessageIO: MessageIO {
 	/// Build the ECIES client orchestrator from transport state.
 	///
 	/// The client proves the configured identity when one is present and dials
-	/// anonymously otherwise, so both cases run the one driver.
+	/// anonymously otherwise, so both cases run the one driver. The trust
+	/// store admits the certificate the server names, so a missing store fails
+	/// closed before the client sends anything (CWE-295).
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::HandshakeError`] with
+	///   [`HandshakeError::MissingTrustStore`] -- no trust store is configured.
 	#[cfg(feature = "transport-ecies")]
 	fn build_ecies_client_orchestrator<P>(&self) -> TransportResult<BoxedClientHandshake>
 	where
 		Self: EncryptedProtocolState<CryptoProvider = P>,
-		P: CryptoProvider + Default + Send + Sync + 'static,
-		P::Curve: Curve + CurveArithmetic,
-		<P::Curve as Curve>::FieldBytesSize: ModulusSize,
-		AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
-		PublicKey<P::Curve>: EciesPublicKeyOps,
-		<PublicKey<P::Curve> as EciesPublicKeyOps>::SecretKey: EciesEphemeral<PublicKey = PublicKey<P::Curve>>,
-		P::Signature: SignatureEncoding + 'static,
-		for<'b> P::Signature: TryFrom<&'b [u8]>,
-		for<'b> <P::Signature as TryFrom<&'b [u8]>>::Error: Into<HandshakeError>,
-		P::VerifyingKey: Verifier<P::Signature> + ExtractVerifyingKey + 'static,
-		P::AeadCipher: KeyInit + Send + Sync,
+		P: HandshakeProvider,
 	{
 		let encryption = self.encryption();
-		let identity = encryption.client_identity.clone();
-		let mut client =
-			EciesHandshakeClient::<P, P::EciesMessage>::new_with_identity(Some(encryption.aad_domain_tag), identity);
+		let store = encryption.trust_store.as_ref().ok_or(HandshakeError::MissingTrustStore)?;
+		let validator = Arc::clone(store) as Arc<dyn CertificateValidation>;
+		let settings = EciesClientSettings {
+			trust: LearnedTrust { validator },
+			aad_domain_tag: encryption.aad_domain_tag,
+			identity: encryption.client_identity.clone(),
+		};
 
-		// The trust store validates the server certificate.
-		#[cfg(all(feature = "x509", feature = "std"))]
-		if let Some(store) = encryption.trust_store.as_ref() {
-			let validator = Arc::clone(store) as Arc<dyn CertificateValidation>;
-			client = client.with_certificate_validator(validator);
-		}
+		let mut config = ClientConfig::<Ecies, P>::new(settings);
+		config.transport_offer = encryption.mux_offer.as_deref().cloned();
+		config.receipt_approver = encryption.receipt_approver.as_ref().map(Arc::clone);
 
-		// The client offers multiplexing when it is locally configured.
-		if let Some(offer) = encryption.mux_offer.as_deref().cloned() {
-			client = client.with_transport_offer(offer);
-		}
-
-		// A budget-bearing session needs the receipt approver.
-		if let Some(approver) = encryption.receipt_approver.as_ref().map(Arc::clone) {
-			client = client.with_receipt_approver(approver);
-		}
-
-		Ok(Box::new(client))
+		Ok(Box::new(Handshake::client(config)))
 	}
 
 	/// Build the CMS client orchestrator from transport state.
 	///
-	/// CMS encrypts the session key to the server's public key up front, so
-	/// the server identity comes from the provisioned chain. A missing trust
-	/// store or chain fails closed.
+	/// CMS encrypts the base secret to the server's public key up front, so
+	/// the server identity comes from the provisioned chain. The client signs
+	/// its Finished under its identity, and the server verifies that
+	/// signature under the certificate, so a client without one fails closed
+	/// before it sends anything.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::HandshakeError`] with
+	///   [`HandshakeError::MissingTrustStore`] -- no trust store is configured.
+	/// - [`TransportError::MissingServerCertificateChain`] -- no server chain is provisioned.
+	/// - [`TransportError::HandshakeError`] with
+	///   [`HandshakeError::MutualAuthRequired`] -- no client identity is configured.
 	#[cfg(feature = "transport-cms")]
 	fn build_cms_client_orchestrator<P>(&self) -> TransportResult<BoxedClientHandshake>
 	where
 		Self: EncryptedProtocolState<CryptoProvider = P>,
-		P: CryptoProvider + Default + Send + Sync + 'static,
-		P::Curve: Curve + CurveArithmetic,
-		<P::Curve as Curve>::FieldBytesSize: ModulusSize,
-		AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
-		PublicKey<P::Curve>: EncodePublicKey,
-		P::VerifyingKey: From<PublicKey<P::Curve>> + EncodePublicKey + Verifier<P::Signature> + 'static,
-		P::Signature: 'static,
-		P::Digest: Send + 'static,
-		P::AeadCipher: KeyInit + Send + Sync,
+		P: HandshakeProvider,
 	{
-		let key = self
-			.encryption()
-			.key_manager
-			.as_ref()
-			.ok_or(TransportError::MissingEncryption)?;
-		let store = self
-			.encryption()
-			.trust_store
-			.as_ref()
-			.ok_or(TransportError::HandshakeError(HandshakeError::MissingTrustStore))?;
-		let chain = self
-			.encryption()
-			.server_certificate_chain
-			.as_ref()
-			.ok_or(TransportError::MissingServerCertificateChain)?;
+		let encryption = self.encryption();
+		let store = encryption.trust_store.as_ref().ok_or(HandshakeError::MissingTrustStore)?;
+		let chain = encryption.server_certificate_chain.as_ref();
+		let chain = chain.ok_or(TransportError::MissingServerCertificateChain)?;
+		let identity = encryption.client_identity.as_ref().ok_or(HandshakeError::MutualAuthRequired)?;
+		let trust = ProvisionedTrust { identity: Arc::clone(chain).into(), store: Arc::clone(store) };
+		let settings = CmsClientSettings { trust, identity: identity.clone() };
 
-		let trust_store = Arc::clone(store);
-		let server_identity = Arc::clone(chain).into();
-		let security_offer = Some(SecurityOffer::new(vec![RunnableProfile::<P>::native().descriptor()]));
-		let client_certificate = self
-			.encryption()
-			.client_identity
-			.as_ref()
-			.map(|identity| identity.certificate_arc());
+		let mut config = ClientConfig::<Cms, P>::new(settings);
+		config.security_offer = Some(SecurityOffer::new(vec![RunnableProfile::<P>::native().descriptor()]));
+		config.transport_offer = encryption.mux_offer.as_deref().cloned();
+		config.receipt_approver = encryption.receipt_approver.as_ref().map(Arc::clone);
 
-		Ok(key.create_cms_client(CmsClientConfig {
-			server_identity,
-			trust_store,
-			security_offer,
-			transport_offer: self.encryption().mux_offer.as_deref().cloned(),
-			client_certificate,
-			receipt_approver: self.encryption().receipt_approver.as_ref().map(Arc::clone),
-		})?)
+		Ok(Box::new(Handshake::client(config)))
 	}
 
 	/// Drive the protocol-agnostic client handshake state machine, with bytes
@@ -697,6 +644,13 @@ pub trait EncryptedMessageIO: MessageIO {
 	///
 	/// Handshake messages cross this interface as containers, so the driver
 	/// moves one with no per-protocol knowledge.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::InvalidMessage`] -- a handshake message passes the
+	///   wire ceiling, or the server response arrived encrypted.
+	/// - [`TransportError::InvalidState`] -- the session refused the move to the handshaking phase.
+	/// - The orchestrator, read, write, and install failures.
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	#[allow(async_fn_in_trait)]
 	async fn drive_client_handshake(&mut self, mut orchestrator: BoxedClientHandshake) -> TransportResult<()>
@@ -754,47 +708,35 @@ pub trait EncryptedMessageIO: MessageIO {
 		// Step 5: Complete the handshake, which hands over everything it
 		// agreed.
 		let session = orchestrator.complete().await?;
-		if !self.session_state_mut().install_session(session) {
-			return Err(TransportError::InvalidState);
-		}
+		self.install_established(session)?;
 
 		Ok(())
 	}
 
 	/// Perform the client-side handshake with the configured protocol.
-	#[cfg(feature = "transport-ecies")]
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::UnsupportedHandshakeProtocol`] -- this build lacks the configured protocol.
+	/// - The orchestrator build failure, and the
+	///   [`drive_client_handshake`](Self::drive_client_handshake) set.
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	#[allow(async_fn_in_trait)]
 	async fn perform_client_handshake<P>(&mut self) -> TransportResult<()>
 	where
 		Self: Sized + MessageIO + EncryptedProtocolState<CryptoProvider = P>,
-		// Curve and elliptic curve bounds
-		P: CryptoProvider + Default + Send + Sync + 'static,
-		P::Curve: Curve + CurveArithmetic + AssociatedOid,
-		<P::Curve as Curve>::FieldBytesSize: ModulusSize,
-		AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
-		PublicKey<P::Curve>: EciesPublicKeyOps + EncodePublicKey,
-		<PublicKey<P::Curve> as EciesPublicKeyOps>::SecretKey: EciesEphemeral<PublicKey = PublicKey<P::Curve>>,
-		// Signature bounds
-		P::Signature: SignatureEncoding + 'static,
-		for<'b> P::Signature: TryFrom<&'b [u8]>,
-		for<'b> <P::Signature as TryFrom<&'b [u8]>>::Error: Into<HandshakeError>,
-		P::VerifyingKey:
-			Verifier<P::Signature> + ExtractVerifyingKey + From<PublicKey<P::Curve>> + EncodePublicKey + 'static,
-		// Digest and AEAD bounds
-		P::Digest: Send + 'static,
-		P::AeadCipher: KeyInit + Send + Sync,
+		P: HandshakeProvider,
 	{
 		let kind = self.encryption().handshake_protocol;
 		let orchestrator = match kind {
+			#[cfg(feature = "transport-ecies")]
 			HandshakeProtocolKind::Ecies => self.build_ecies_client_orchestrator()?,
 
 			#[cfg(feature = "transport-cms")]
 			HandshakeProtocolKind::Cms => self.build_cms_client_orchestrator()?,
 
-			#[cfg(not(feature = "transport-cms"))]
-			HandshakeProtocolKind::Cms => {
-				return Err(TransportError::UnsupportedHandshakeProtocol(HandshakeProtocolKind::Cms));
-			}
+			#[cfg(not(all(feature = "transport-cms", feature = "transport-ecies")))]
+			unsupported => return Err(TransportError::UnsupportedHandshakeProtocol(unsupported)),
 		};
 
 		let outcome = self.drive_client_handshake(orchestrator).await;
@@ -805,116 +747,80 @@ pub trait EncryptedMessageIO: MessageIO {
 		outcome
 	}
 
-	/// Perform the client-side handshake in the CMS-only build.
+	/// The server configuration every protocol shares, around the settings of
+	/// flow `F`.
 	///
-	/// Trait where-clauses do not elaborate to callers, so each feature
-	/// combination declares the dispatcher with that build's predicate set.
-	#[cfg(all(not(feature = "transport-ecies"), feature = "transport-cms"))]
-	#[allow(async_fn_in_trait)]
-	async fn perform_client_handshake<P>(&mut self) -> TransportResult<()>
+	/// The server runs the one profile its provider names, so the profile
+	/// list is never empty.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::MissingEncryption`] -- no key manager is configured.
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	fn server_config<F, P>(&self, flow: F::Settings) -> TransportResult<ServerConfig<F, P>>
 	where
-		Self: Sized + MessageIO + EncryptedProtocolState<CryptoProvider = P>,
-		P: CryptoProvider + Default + Send + Sync + 'static,
-		P::Curve: Curve + CurveArithmetic,
-		<P::Curve as Curve>::FieldBytesSize: ModulusSize,
-		AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
-		PublicKey<P::Curve>: EncodePublicKey,
-		P::VerifyingKey: From<PublicKey<P::Curve>> + EncodePublicKey + Verifier<P::Signature> + 'static,
-		P::Signature: 'static,
-		P::Digest: Send + 'static,
-		P::AeadCipher: KeyInit + Send + Sync,
+		Self: EncryptedProtocolState<CryptoProvider = P>,
+		F: ServerFlow<P>,
+		P: HandshakeProvider,
 	{
-		let kind = self.encryption().handshake_protocol;
-		let orchestrator = match kind {
-			HandshakeProtocolKind::Ecies => {
-				return Err(TransportError::UnsupportedHandshakeProtocol(HandshakeProtocolKind::Ecies));
-			}
-			HandshakeProtocolKind::Cms => self.build_cms_client_orchestrator()?,
-		};
+		let encryption = self.encryption();
+		let key_manager = encryption.key_manager.as_ref().ok_or(TransportError::MissingEncryption)?;
+		let profiles = SupportedProfiles::from(RunnableProfile::<P>::native().descriptor());
 
-		let outcome = self.drive_client_handshake(orchestrator).await;
-
-		#[cfg(feature = "instrument")]
-		self.emit_handshake_outcome(&outcome);
-
-		outcome
+		let mut config = ServerConfig::new(flow, key_manager.signing_provider(), profiles);
+		config.peer_authentication = encryption.peer_authentication.clone();
+		config.transport = encryption.mux_offer.as_deref().cloned();
+		config.transport_authorizer = encryption.transport_authorizer.as_ref().map(Arc::clone);
+		config.session_observer = encryption.session_observer.as_ref().map(Arc::clone);
+		Ok(config)
 	}
 
 	/// Build the ECIES server orchestrator from transport state.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::MissingEncryption`] -- no server certificate or key manager is configured.
 	#[cfg(feature = "transport-ecies")]
 	fn build_ecies_server_orchestrator<P>(&self) -> TransportResult<BoxedServerHandshake>
 	where
 		Self: EncryptedProtocolState<CryptoProvider = P>,
-		P: CryptoProvider + Send + Sync + 'static,
-		P::Curve: Curve + CurveArithmetic,
-		<P::Curve as Curve>::FieldBytesSize: ModulusSize,
-		AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
-		P::Signature: SignatureEncoding,
-		for<'b> P::Signature: TryFrom<&'b [u8]>,
-		P::VerifyingKey: Verifier<P::Signature> + for<'b> From<&'b PublicKey<P::Curve>>,
-		P::AeadCipher: KeyInit + Send + Sync + 'static,
+		P: HandshakeProvider,
 	{
-		let cert_arc = self
-			.encryption()
-			.server_certificate
-			.as_ref()
-			.map(Arc::clone)
-			.ok_or(TransportError::MissingEncryption)?;
-		let key_manager = self
-			.encryption()
-			.key_manager
-			.as_ref()
-			.ok_or(TransportError::MissingEncryption)?;
+		let encryption = self.encryption();
+		let certificate = encryption.server_certificate.as_ref();
+		let certificate = certificate.ok_or(TransportError::MissingEncryption)?;
+		let certificate = Arc::clone(certificate);
+		let settings = EciesServerSettings { certificate, aad_domain_tag: encryption.aad_domain_tag };
 
-		let peer_authentication = self.encryption().peer_authentication.clone();
-		let supported_profiles = vec![RunnableProfile::<P>::native().descriptor()];
-
-		Ok(key_manager.create_ecies_server(
-			cert_arc,
-			Some(self.encryption().aad_domain_tag),
-			supported_profiles,
-			peer_authentication,
-			self.encryption().mux_offer.as_deref().cloned(),
-			self.encryption().transport_authorizer.as_ref().map(Arc::clone),
-			self.encryption().session_observer.as_ref().map(Arc::clone),
-		)?)
+		let config = self.server_config::<Ecies, P>(settings)?;
+		Ok(Box::new(Handshake::server(config)))
 	}
 
 	/// Build the CMS server orchestrator from transport state.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::MissingEncryption`] -- no key manager is configured.
 	#[cfg(feature = "transport-cms")]
 	fn build_cms_server_orchestrator<P>(&self) -> TransportResult<BoxedServerHandshake>
 	where
 		Self: EncryptedProtocolState<CryptoProvider = P>,
-		P: CryptoProvider + Send + Sync + 'static,
-		P::Curve: Curve + CurveArithmetic,
-		<P::Curve as Curve>::FieldBytesSize: ModulusSize,
-		AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
-		P::VerifyingKey: From<PublicKey<P::Curve>> + EncodePublicKey + Verifier<P::Signature> + 'static,
-		P::Signature: 'static,
-		P::Digest: Send + 'static,
-		P::AeadCipher: KeyInit + Send + Sync + 'static,
+		P: HandshakeProvider,
 	{
-		let key_manager = self
-			.encryption()
-			.key_manager
-			.as_ref()
-			.ok_or(TransportError::MissingEncryption)?;
-
-		let peer_authentication = self.encryption().peer_authentication.clone();
-		let supported_profiles = vec![RunnableProfile::<P>::native().descriptor()];
-
-		Ok(key_manager.create_cms_server(
-			peer_authentication,
-			supported_profiles,
-			self.encryption().mux_offer.as_deref().cloned(),
-			self.encryption().transport_authorizer.as_ref().map(Arc::clone),
-			self.encryption().session_observer.as_ref().map(Arc::clone),
-		)?)
+		let config = self.server_config::<Cms, P>(CmsServerSettings)?;
+		Ok(Box::new(Handshake::server(config)))
 	}
 
 	/// Drive the protocol-agnostic server handshake state machine.
 	///
 	/// The persisted orchestrator must already exist.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::InvalidState`] -- no orchestrator is persisted, or
+	///   the session refused the move to the handshaking phase.
+	/// - [`TransportError::InvalidMessage`] -- the response passes the wire ceiling.
+	/// - The orchestrator, write, and install failures.
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	#[allow(async_fn_in_trait)]
 	async fn drive_server_handshake(&mut self, request: HandshakeMessage) -> TransportResult<()>
@@ -922,7 +828,6 @@ pub trait EncryptedMessageIO: MessageIO {
 		Self: Sized + MessageIO + EncryptedProtocolState + ServerHandshakeSlot,
 	{
 		let orchestrator = self.server_handshake_mut().as_mut().ok_or(TransportError::InvalidState)?;
-		// The client message may yield a response to send.
 		let response = orchestrator.handle_request(request).await?;
 
 		// A response means another round follows.
@@ -945,30 +850,35 @@ pub trait EncryptedMessageIO: MessageIO {
 			// No response means the handshake is complete.
 			let orchestrator = self.server_handshake_mut().take().ok_or(TransportError::InvalidState)?;
 			let session = orchestrator.complete().await?;
-			if !self.session_state_mut().install_session(session) {
-				return Err(TransportError::InvalidState);
-			}
+			self.install_established(session)?;
 		}
 
 		Ok(())
 	}
 
 	/// Perform the server-side handshake with the configured protocol.
-	#[cfg(feature = "transport-ecies")]
+	///
+	/// # Deadline
+	///
+	/// The tokio runtime supplies the timer. The handshake deadline bounds all
+	/// processing on the unauthenticated path, including the authorizer and
+	/// observer hooks, as well as the reads. A non-tokio runtime has no
+	/// portable timer here and relies on the embedding application.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::InvalidMessage`] -- the request passes the wire ceiling.
+	/// - [`TransportError::UnsupportedHandshakeProtocol`] -- this build lacks the configured protocol.
+	/// - [`TransportError::OperationFailed`] with
+	///   [`TransportFailure::DeadlineExceeded`] -- the handshake deadline elapsed.
+	/// - The orchestrator build failure, and the
+	///   [`drive_server_handshake`](Self::drive_server_handshake) set.
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	#[allow(async_fn_in_trait)]
 	async fn perform_server_handshake<P>(&mut self, request: HandshakeMessage) -> TransportResult<()>
 	where
 		Self: Sized + MessageIO + EncryptedProtocolState<CryptoProvider = P> + ServerHandshakeSlot,
-		P: CryptoProvider + Send + Sync + 'static,
-		P::Curve: Curve + CurveArithmetic,
-		<P::Curve as Curve>::FieldBytesSize: ModulusSize,
-		AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
-		PublicKey<P::Curve>: EciesPublicKeyOps,
-		P::VerifyingKey: From<PublicKey<P::Curve>> + EncodePublicKey + Verifier<P::Signature> + 'static,
-		for<'b> P::VerifyingKey: From<&'b PublicKey<P::Curve>>,
-		P::Signature: 'static,
-		P::Digest: Send + 'static,
-		P::AeadCipher: KeyInit + Send + Sync + 'static,
+		P: HandshakeProvider,
 	{
 		if request.der().len() > self.limits().handshake_wire {
 			return Err(TransportError::InvalidMessage);
@@ -979,83 +889,19 @@ pub trait EncryptedMessageIO: MessageIO {
 		// The orchestrator persists across messages, so it is created once.
 		if self.server_handshake_mut().is_none() {
 			let orchestrator = match kind {
+				#[cfg(feature = "transport-ecies")]
 				HandshakeProtocolKind::Ecies => self.build_ecies_server_orchestrator()?,
 
 				#[cfg(feature = "transport-cms")]
 				HandshakeProtocolKind::Cms => self.build_cms_server_orchestrator()?,
 
-				#[cfg(not(feature = "transport-cms"))]
-				HandshakeProtocolKind::Cms => {
-					return Err(TransportError::UnsupportedHandshakeProtocol(HandshakeProtocolKind::Cms));
-				}
+				#[cfg(not(all(feature = "transport-cms", feature = "transport-ecies")))]
+				unsupported => return Err(TransportError::UnsupportedHandshakeProtocol(unsupported)),
 			};
 
 			*self.server_handshake_mut() = Some(orchestrator);
 		}
 
-		// The tokio runtime supplies the timer. The handshake deadline bounds
-		// all processing on the unauthenticated path, including the authorizer
-		// and observer hooks, as well as the reads. A non-tokio runtime has no
-		// portable timer here and relies on the embedding application.
-		#[cfg(all(feature = "tokio", feature = "std", not(target_arch = "wasm32")))]
-		let outcome = {
-			let remaining = remaining_handshake_deadline(self);
-			if remaining.is_zero() {
-				return Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded));
-			}
-
-			timeout(remaining, self.drive_server_handshake(request)).await?
-		};
-
-		#[cfg(not(all(feature = "tokio", feature = "std", not(target_arch = "wasm32"))))]
-		let outcome = self.drive_server_handshake(request).await;
-
-		#[cfg(feature = "instrument")]
-		self.emit_handshake_outcome(&outcome);
-
-		outcome
-	}
-
-	/// Perform the server-side handshake in the CMS-only build.
-	///
-	/// Trait where-clauses do not elaborate to callers, so each feature
-	/// combination declares the dispatcher with that build's predicate set.
-	#[cfg(all(not(feature = "transport-ecies"), feature = "transport-cms"))]
-	#[allow(async_fn_in_trait)]
-	async fn perform_server_handshake<P>(&mut self, request: HandshakeMessage) -> TransportResult<()>
-	where
-		Self: Sized + MessageIO + EncryptedProtocolState<CryptoProvider = P> + ServerHandshakeSlot,
-		P: CryptoProvider + Send + Sync + 'static,
-		P::Curve: Curve + CurveArithmetic,
-		<P::Curve as Curve>::FieldBytesSize: ModulusSize,
-		AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
-		P::VerifyingKey: From<PublicKey<P::Curve>> + EncodePublicKey + Verifier<P::Signature> + 'static,
-		P::Signature: 'static,
-		P::Digest: Send + 'static,
-		P::AeadCipher: KeyInit + Send + Sync + 'static,
-	{
-		if request.der().len() > self.limits().handshake_wire {
-			return Err(TransportError::InvalidMessage);
-		}
-
-		let kind = self.encryption().handshake_protocol;
-
-		// The orchestrator persists across messages, so it is created once.
-		if self.server_handshake_mut().is_none() {
-			let orchestrator = match kind {
-				HandshakeProtocolKind::Ecies => {
-					return Err(TransportError::UnsupportedHandshakeProtocol(HandshakeProtocolKind::Ecies));
-				}
-				HandshakeProtocolKind::Cms => self.build_cms_server_orchestrator()?,
-			};
-
-			*self.server_handshake_mut() = Some(orchestrator);
-		}
-
-		// The tokio runtime supplies the timer. The handshake deadline bounds
-		// all processing on the unauthenticated path, including the authorizer
-		// and observer hooks, as well as the reads. A non-tokio runtime has no
-		// portable timer here and relies on the embedding application.
 		#[cfg(all(feature = "tokio", feature = "std", not(target_arch = "wasm32")))]
 		let outcome = {
 			let remaining = remaining_handshake_deadline(self);
@@ -1080,6 +926,13 @@ pub trait EncryptedMessageIO: MessageIO {
 	/// It returns `(status, response, original_message)`. The original message
 	/// is `Some` when `status` is not `Ok` and the request went out in
 	/// cleartext, so the caller can evaluate a retry.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::InvalidMessage`] -- the reply is not a response envelope.
+	/// - The [`wrap_and_encrypt_message`](Self::wrap_and_encrypt_message),
+	///   [`read_session_bytes`](Self::read_session_bytes), and
+	///   [`decrypt_response`](Self::decrypt_response) sets.
 	#[cfg(feature = "x509")]
 	#[allow(async_fn_in_trait)]
 	async fn perform_emit_cycle(
@@ -1091,11 +944,11 @@ pub trait EncryptedMessageIO: MessageIO {
 	{
 		let wire_envelope = self.wrap_and_encrypt_message(message).await?;
 		let wire_bytes = wire_envelope.to_der()?;
+
 		self.write_envelope_bytes(&wire_bytes).await?;
 
 		let response_bytes = self.read_session_bytes().await?;
 		let response_envelope = self.decrypt_response(response_bytes).await?;
-
 		let (status, response) = match response_envelope {
 			TransportEnvelope::Response(pkg) => (pkg.status, pkg.message),
 			TransportEnvelope::Request(_) => return Err(TransportError::InvalidMessage),
@@ -1116,11 +969,8 @@ pub trait EncryptedMessageIO: MessageIO {
 			None
 		};
 
-		// Unwrap each `Arc<Frame>`, and clone the frame when another owner
-		// holds it.
 		let response_frame = response.map(|arc| Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone()));
 		let returned_frame = returned_message.map(|arc| Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone()));
-
 		Ok((status, response_frame, returned_frame))
 	}
 }
@@ -1163,7 +1013,7 @@ mod tests {
 	#[cfg(feature = "aead")]
 	use crate::transport::TransportLimits;
 
-	/// Minimal `MessageIO` probe so ingress goes through `decode_envelope`.
+	/// A minimal `MessageIO` probe, so ingress goes through `decode_envelope`.
 	#[derive(Default)]
 	struct DecodeProbe {
 		clock: ManualClock,
@@ -1263,10 +1113,9 @@ mod tests {
 		SessionPhase::Handshaking { initiated_at: ManualClock::default().monotonic() }
 	}
 
-	// An end of stream reads differently either side of a handshake, and the
-	// session phase is what separates the two. A session that already agreed
-	// its terms reports an ordinary close, so a pool evicts the connection
-	// rather than recording a handshake failure.
+	// The session phase decides how an end of stream reads. A session that
+	// agreed its terms reports an ordinary close, so a pool evicts the
+	// connection instead of recording a handshake failure.
 	#[cfg(feature = "aead")]
 	crate::tb_cases! {
 		fn a_close_is_named_by_the_phase_it_interrupts((phase, expected): (SessionPhase, TransportError))

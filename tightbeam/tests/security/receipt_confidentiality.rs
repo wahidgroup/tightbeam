@@ -11,16 +11,15 @@
 //! the settlement answer.
 //!
 //! ## Expected control
-//! The answer MUST travel in an `EnvelopedData` encrypted to the server
-//! certificate (RFC 5652 s6), which keeps it off the cleartext wire. The
-//! server MUST decrypt it, verify the countersignature over the plaintext,
-//! settle, and retain the identical dual-signed receipt on both endpoints.
+//! The answer MUST travel sealed under the handshake secret's acknowledgement
+//! key, as the `RECEIPT_ACK` attribute of the client Finished, which keeps it
+//! off the cleartext wire. The server MUST open it, verify the countersignature
+//! over the plaintext, settle, and retain the identical dual-signed receipt on
+//! both endpoints.
 //!
 //! ## References
-//! - CWE-311: Missing Encryption of Sensitive Data
-//!   <https://cwe.mitre.org/data/definitions/311.html>
-//! - RFC 5652 s6: EnvelopedData provides data confidentiality
-//!   <https://datatracker.ietf.org/doc/html/rfc5652#section-6>
+//! - CWE-311: Missing Encryption of Sensitive Data <https://cwe.mitre.org/data/definitions/311.html>
+//! - RFC 5116 s3.2: a nonce used once per key <https://datatracker.ietf.org/doc/html/rfc5116#section-3.2>
 
 #![cfg(all(feature = "transport-cms", feature = "transport-multiplex", feature = "testing"))]
 
@@ -28,7 +27,6 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use tightbeam::asn1::OctetString;
-use tightbeam::der::Encode;
 use tightbeam::exactly;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_scenario;
@@ -60,8 +58,8 @@ const CHALLENGE: &[u8] = b"cms-conf-invoice";
 const RESPONSE: &[u8] = b"cms-conf-preimage";
 const REQUEST: MuxBudgets = MuxBudgets { client_to_server: 64, server_to_client: 128 };
 
-/// Grants budgets with a settlement challenge and accepts settlement only
-/// for the expected plaintext answer, counting invocations.
+/// An authorizer that grants budgets with a settlement challenge, settles only
+/// the expected plaintext answer, and counts the `settle` calls.
 struct SettlingAuthorizer {
 	challenge: OctetString,
 	expected_response: OctetString,
@@ -110,10 +108,9 @@ tb_assert_spec! {
 	}
 }
 
-// The settlement answer must survive the CMS EnvelopedData round trip
-// (client encrypts to the server certificate, server decrypts, verifies
-// the countersignature over the plaintext, and settles) while staying
-// out of the cleartext client Finished bytes.
+// The settlement answer must survive the sealed acknowledgement round trip
+// (client seals, server opens, verifies the countersignature, and settles)
+// while staying out of the cleartext client Finished bytes.
 tb_scenario! {
 	name: cms_response_confidential_round_trip,
 	spec: ReceiptConfidentialitySpec,
@@ -130,25 +127,17 @@ tb_scenario! {
 				approver: Some(Arc::new(PayingApprover::answering(RESPONSE)?)),
 				..CmsSessionHooks::default()
 			};
+
 			let pair = cms_mutual_budget_pair(&materials, REQUEST, hooks)?;
 			let (mut client, mut server) = (pair.client, pair.server);
 
-			// Full budget-bearing handshake including the receipt
-			// acknowledgement.
-			let key_exchange = client.build_key_exchange(tightbeam::ZeroizingBytes::new(vec![0xA5; 32]), None)?;
-			server.process_key_exchange(&key_exchange).await?;
+			let reply = server.reply(client.start()?).await?;
+			let client_finished = client.respond(reply).await?;
+			server.finish(client_finished.to_owned()).await?;
 
-			let server_finished = server.build_server_finished().await?;
-			client.process_server_finished(&server_finished)?;
-
-			let client_finished = client.build_client_finished().await?;
-			server.process_client_finished(&client_finished)?;
-			server.process_receipt_ack(&client_finished).await?;
-
-			// The plaintext answer MUST stay out of the cleartext
-			// client Finished bytes: it travels in an EnvelopedData encrypted
-			// to the server certificate.
-			let response_leaked = contains_window(client_finished.to_der()?, RESPONSE);
+			// The plaintext answer MUST stay out of the cleartext client
+			// Finished bytes: it travels sealed under the handshake secret.
+			let response_leaked = contains_window(client_finished.der(), RESPONSE);
 			trace.event_with(
 				RESPONSE_CONFIDENTIAL_ON_WIRE,
 				&[],
@@ -165,12 +154,14 @@ tb_scenario! {
 			)?;
 
 			// Both endpoints retain the identical dual-signed receipt,
-			// including the plaintext answer recovered from the envelope.
+			// including the plaintext answer recovered from the sealed
+			// acknowledgement.
 			let client_receipt = client.session_receipt();
 			let server_receipt = server.session_receipt();
 			let expected_answer = OctetString::new(RESPONSE)?;
 			let answer_recovered =
 				server_receipt.is_some_and(|stored| stored.ancillary_response() == Some(&expected_answer));
+
 			trace.event_with(
 				SERVER_RECOVERS_PLAINTEXT_ANSWER,
 				&[],
@@ -184,7 +175,7 @@ tb_scenario! {
 				receipts_match,
 			)?;
 
-			let activated = server.take_established().is_ok();
+			let activated = server.complete().is_ok();
 			trace.event_with(SETTLED_SESSION_ACTIVATES, &[], activated)?;
 
 			Ok::<(), TightBeamError>(())

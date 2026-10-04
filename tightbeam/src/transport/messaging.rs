@@ -24,27 +24,13 @@ use crate::utils::marker::MaybeSend;
 	feature = "transport-policy",
 	any(feature = "transport-cms", feature = "transport-ecies")
 ))]
-use crate::transport::envelopes::WireEnvelope;
+use crate::transport::io::CollectStep;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 mod x509 {
-	pub use crate::crypto::aead::{DecryptContent, KeyInit};
-	pub use crate::crypto::profiles::CryptoProvider;
-	pub use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
-	pub use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
-	pub use crate::crypto::sign::Verifier;
-	pub use crate::der::Decode;
-	pub use crate::spki::EncodePublicKey;
-	pub use crate::transport::handshake::HandshakeMessage;
+	pub use crate::transport::handshake::HandshakeProvider;
 	pub use crate::transport::io::EncryptedMessageIO;
-	pub use crate::transport::state::EncryptedProtocolState;
-	pub use crate::transport::state::SessionPhase;
-
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-	pub use crate::transport::state::ServerHandshakeSlot;
-
-	#[cfg(feature = "transport-ecies")]
-	pub use crate::crypto::ecies::EciesPublicKeyOps;
+	pub use crate::transport::state::{EncryptedProtocolState, ServerHandshakeSlot};
 }
 
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
@@ -66,8 +52,8 @@ use crate::trace::TraceCollector;
 /// Source of the connection audit trail for access-gate verdicts.
 ///
 /// Every plane that evaluates a collector gate implements this (the TCP
-/// transports, the mux handle) so `gate_inbound` can record the
-/// verdict wherever the gate runs.
+/// transports, the mux handle) so `gate_inbound` can record the verdict
+/// wherever the gate runs.
 #[cfg(feature = "transport-policy")]
 pub trait GateAudit {
 	/// The connection audit trail, when instrumentation is attached.
@@ -75,47 +61,53 @@ pub trait GateAudit {
 	fn audit_trace(&self) -> Option<&TraceCollector>;
 }
 
-/// Gate one inbound request with the session's authenticated context and
-/// record the verdict into the connection audit trail (`GATE_ACCEPT` or
-/// `GATE_REJECT`).
+/// The gate verdict every [`GateAudit`] plane records.
 ///
-/// # Emission point
-///
-/// This is the only gate-verdict emission point. The mux responder and the
-/// cleartext and encrypted single-flight collectors all route through here,
-/// so access decisions are observable evidence on every plane.
-///
-/// # Verdicts
-///
-/// - `frame` is [`None`] for a mux streaming or duplex open that has no request
-///   frame at dispatch. Session-scoped gates still evaluate.
-/// - A gate that returns [`TransitStatus::Unknown`] signals a local bug, so
-///   [`TransitStatus::normalized_verdict`] maps it to
-///   [`TransitStatus::Internal`] and the peer sees a server fault.
+/// The trait is a crate-private extension, so the public [`GateAudit`] keeps
+/// its one method and stays usable as a trait object.
 #[cfg(feature = "transport-policy")]
-pub(crate) fn gate_inbound<G, A>(gate: &G, audit: &A, frame: Option<&Frame>, session: &SessionContext) -> TransitStatus
-where
-	G: GatePolicy + ?Sized,
-	A: GateAudit + ?Sized,
-{
-	let status = gate.evaluate(frame, session).normalized_verdict();
+pub(crate) trait GateInbound: GateAudit {
+	/// Gate one inbound request with the session's authenticated context and
+	/// record the verdict into the connection audit trail (`GATE_ACCEPT` or
+	/// `GATE_REJECT`).
+	///
+	/// # Emission point
+	///
+	/// This is the only gate-verdict emission point. The mux responder and the
+	/// cleartext and encrypted single-flight collectors all route through here,
+	/// so access decisions are observable evidence on every plane.
+	///
+	/// # Verdicts
+	///
+	/// - `frame` is [`None`] for a mux streaming or duplex open that has no
+	///   request frame at dispatch. Session-scoped gates still evaluate.
+	/// - A gate that returns [`TransitStatus::Unknown`] signals a local bug, so
+	///   [`TransitStatus::normalized_verdict`] maps it to
+	///   [`TransitStatus::Internal`] and the peer sees a server fault.
+	fn gate_inbound<G>(&self, gate: &G, frame: Option<&Frame>, session: &SessionContext) -> TransitStatus
+	where
+		G: GatePolicy + ?Sized,
+	{
+		let status = gate.evaluate(frame, session).normalized_verdict();
 
-	#[cfg(feature = "instrument")]
-	if let Some(trace) = audit.audit_trace() {
-		let event = if status == TransitStatus::Ok {
-			events::GATE_ACCEPT
-		} else {
-			events::GATE_REJECT
-		};
+		#[cfg(feature = "instrument")]
+		if let Some(trace) = self.audit_trace() {
+			let event = if status == TransitStatus::Ok {
+				events::GATE_ACCEPT
+			} else {
+				events::GATE_REJECT
+			};
 
-		// Verdict evidence: the status names why, the peer SPKI names who.
-		trace.emit_event_with_evidence(event, status.as_str(), session.peer_public_key());
+			// As evidence, the status names why and the peer SPKI names who.
+			trace.emit_event_with_evidence(event, status.as_str(), session.peer_public_key());
+		}
+
+		status
 	}
-	#[cfg(not(feature = "instrument"))]
-	let _ = audit;
-
-	status
 }
+
+#[cfg(feature = "transport-policy")]
+impl<A: GateAudit + ?Sized> GateInbound for A {}
 
 #[cfg(feature = "transport-policy")]
 #[derive(Debug)]
@@ -191,15 +183,13 @@ pub trait MessageEmitter: MessageIO {
 	type EmitterGate: GatePolicy + ?Sized;
 	type RestartPolicy: RestartPolicy + ?Sized;
 
-	/// Return the restart policy.
+	/// The restart policy that [`Self::emit`] consults after a failed send.
 	fn to_restart_policy_ref(&self) -> &Self::RestartPolicy;
 
-	/// Return the emitter gate policy.
+	/// The gate policy that [`Self::emit`] evaluates before each send.
 	fn to_emitter_gate_policy_ref(&self) -> &Self::EmitterGate;
 
 	/// Run the protocol-specific send and receive operation.
-	///
-	/// The operation sends the message and receives the response.
 	///
 	/// # Returns
 	///
@@ -212,7 +202,8 @@ pub trait MessageEmitter: MessageIO {
 		message: Frame,
 	) -> impl Future<Output = TransportResult<(TransitStatus, Option<Frame>, Option<Frame>)>> + MaybeSend;
 
-	/// Send a TightBeam message.
+	/// Send a TightBeam message through the emitter gate, and retry a failed
+	/// send as the restart policy decides.
 	fn emit(
 		&mut self,
 		message: Frame,
@@ -236,9 +227,8 @@ async fn emit_with_retry<T: MessageEmitter + MaybeSend + ?Sized>(
 	let mut current_attempt = attempt.unwrap_or(0);
 
 	loop {
-		// Evaluate the gate policy before sending. Emitter gates are
-		// client-side and need no connection context, so they get the empty
-		// context.
+		// Emitter gates are client-side and need no connection context, so they
+		// get the empty context.
 		let message = Some(letter.try_peek()?);
 		let session = SessionContext::default();
 		let status = emitter.to_emitter_gate_policy_ref().evaluate(message, &session);
@@ -254,7 +244,6 @@ async fn emit_with_retry<T: MessageEmitter + MaybeSend + ?Sized>(
 				let (frame, delay) = evaluate_retry(emitter.to_restart_policy_ref(), e, current_attempt)?;
 				emitter.clock().sleep(delay).await;
 
-				// Unbox the frame to put it back into the Letter.
 				letter.try_return_to_sender(*frame)?;
 				current_attempt += 1;
 				continue;
@@ -278,12 +267,10 @@ async fn emit_with_retry<T: MessageEmitter + MaybeSend + ?Sized>(
 			}
 		};
 
-		// Evaluate the retry policy only on an error.
 		match result {
 			Err(error) => {
 				let (frame, delay) = evaluate_retry(emitter.to_restart_policy_ref(), error, current_attempt)?;
 				emitter.clock().sleep(delay).await;
-				// Unbox the frame to put it back into the Letter.
 				letter.try_return_to_sender(*frame)?;
 				current_attempt += 1;
 			}
@@ -320,11 +307,11 @@ pub trait MessageCollector: CollectorRequirements {
 	#[cfg(feature = "transport-policy")]
 	type CollectorGate: GatePolicy + ?Sized;
 
-	/// Return the collector gate policy.
+	/// The gate policy that every collected message passes through.
 	#[cfg(feature = "transport-policy")]
 	fn collector_gate(&self) -> &Self::CollectorGate;
 
-	/// Read and validate a message without sending a response.
+	/// Read and validate one message, leaving the response to the caller.
 	///
 	/// The method returns the message and the gate evaluation status.
 	#[cfg(feature = "transport-policy")]
@@ -333,8 +320,7 @@ pub trait MessageCollector: CollectorRequirements {
 		Self: MaybeSend,
 	{
 		async move {
-			// Read and decode the envelope. An encrypted transport overrides
-			// this step.
+			// An encrypted transport overrides this read.
 			let decoded_envelope = self.read_decoded_envelope().await?;
 			// A cleartext connection carries no peer identity, so it gets the
 			// empty context.
@@ -343,7 +329,7 @@ pub trait MessageCollector: CollectorRequirements {
 		}
 	}
 
-	/// Read and validate a message without sending a response.
+	/// Read and validate one message, leaving the response to the caller.
 	///
 	/// The method returns the message. Without policies, the status is always
 	/// `Ok`.
@@ -359,7 +345,7 @@ pub trait MessageCollector: CollectorRequirements {
 		}
 	}
 
-	/// Try to collect the next message without blocking on a closed connection.
+	/// Collect the next message, and tell a graceful close from an error.
 	///
 	/// - `Ok(None)` means that the connection closed gracefully (EOF).
 	/// - `Err` means that the connection failed unexpectedly.
@@ -371,7 +357,6 @@ pub trait MessageCollector: CollectorRequirements {
 		Self: MaybeSend,
 	{
 		async move {
-			// Try to read the envelope, which is `None` on a graceful close.
 			let decoded_envelope = match self.try_read_decoded_envelope().await? {
 				Some(envelope) => envelope,
 				None => return Ok(None), // Connection closed gracefully
@@ -385,7 +370,7 @@ pub trait MessageCollector: CollectorRequirements {
 		}
 	}
 
-	/// Try to collect the next message without blocking on a closed connection.
+	/// Collect the next message, and tell a graceful close from an error.
 	///
 	/// - `Ok(None)` means that the connection closed gracefully (EOF).
 	/// - `Err` means that the connection failed unexpectedly.
@@ -397,7 +382,6 @@ pub trait MessageCollector: CollectorRequirements {
 		Self: MaybeSend,
 	{
 		async move {
-			// Try to read the envelope, which is `None` on a graceful close.
 			let request_envelope = match self.try_read_decoded_envelope().await? {
 				Some(envelope) => envelope,
 				None => return Ok(None), // Connection closed gracefully
@@ -420,149 +404,24 @@ pub trait MessageCollector: CollectorRequirements {
 		Self: MaybeSend;
 
 	/// The X.509 `collect_message` with encryption and handshake support.
-	#[cfg(all(feature = "transport-policy", feature = "transport-ecies"))]
-	#[allow(async_fn_in_trait)]
-	async fn collect_message_with_encryption<P>(&mut self) -> TransportResult<(Arc<Frame>, TransitStatus)>
-	where
-		Self: EncryptedMessageIO + Sized + EncryptedProtocolState<CryptoProvider = P> + ServerHandshakeSlot,
-		P: CryptoProvider + Send + Sync + 'static,
-		P::Curve: Curve + CurveArithmetic,
-		<P::Curve as Curve>::FieldBytesSize: ModulusSize,
-		AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
-		PublicKey<P::Curve>: EciesPublicKeyOps,
-		P::VerifyingKey: From<PublicKey<P::Curve>> + EncodePublicKey + Verifier<P::Signature>,
-		for<'b> P::VerifyingKey: From<&'b PublicKey<P::Curve>>,
-		P::AeadCipher: KeyInit,
-	{
-		loop {
-			match collect_step(self).await? {
-				CollectStep::Handshake(request) => self.perform_server_handshake(request).await?,
-				CollectStep::Envelope(envelope) => {
-					let session = SessionContext::capture(self);
-					return gate_collected_envelope(self, envelope, &session);
-				}
-			}
-		}
-	}
-
-	/// The X.509 `collect_message` with encryption and handshake support, for
-	/// the CMS-only build.
-	///
-	/// A trait where-clause stays with the trait, so the method is
-	/// declared per feature combination with that build's predicate set.
 	#[cfg(all(
 		feature = "transport-policy",
-		not(feature = "transport-ecies"),
-		feature = "transport-cms"
+		any(feature = "transport-cms", feature = "transport-ecies")
 	))]
 	#[allow(async_fn_in_trait)]
 	async fn collect_message_with_encryption<P>(&mut self) -> TransportResult<(Arc<Frame>, TransitStatus)>
 	where
 		Self: EncryptedMessageIO + Sized + EncryptedProtocolState<CryptoProvider = P> + ServerHandshakeSlot,
-		P: CryptoProvider + Send + Sync + 'static,
-		P::Curve: Curve + CurveArithmetic,
-		<P::Curve as Curve>::FieldBytesSize: ModulusSize,
-		AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
-		P::VerifyingKey: From<PublicKey<P::Curve>> + EncodePublicKey + Verifier<P::Signature> + 'static,
-		P::Signature: 'static,
-		P::Digest: Send + 'static,
-		P::AeadCipher: KeyInit + Send + Sync + 'static,
+		P: HandshakeProvider,
 	{
 		loop {
-			match collect_step(self).await? {
+			match self.collect_step().await? {
 				CollectStep::Handshake(request) => self.perform_server_handshake(request).await?,
 				CollectStep::Envelope(envelope) => {
 					let session = SessionContext::capture(self);
 					return gate_collected_envelope(self, envelope, &session);
 				}
 			}
-		}
-	}
-}
-
-/// Outcome of one protocol-agnostic collector step.
-#[cfg(all(
-	feature = "transport-policy",
-	any(feature = "transport-cms", feature = "transport-ecies")
-))]
-pub(crate) enum CollectStep {
-	/// Cleartext handshake container to feed the server-side dispatcher,
-	/// decoded once with the bytes it arrived as.
-	Handshake(HandshakeMessage),
-	/// Decrypted (or legitimately cleartext) application envelope.
-	Envelope(TransportEnvelope),
-}
-
-/// Read one wire envelope, enforce size ceilings, and classify it.
-///
-/// The step is protocol-agnostic. It surfaces a handshake container as a
-/// decoded message for the caller's dispatcher, and it decrypts and returns
-/// everything else.
-#[cfg(all(
-	feature = "transport-policy",
-	any(feature = "transport-cms", feature = "transport-ecies")
-))]
-pub(crate) async fn collect_step<T>(transport: &mut T) -> TransportResult<CollectStep>
-where
-	T: EncryptedMessageIO + EncryptedProtocolState + Sized,
-{
-	// Read the wire envelope, then enforce the size ceiling of its kind.
-	let wire_bytes = transport.read_envelope_bytes().await?;
-	let wire_envelope = WireEnvelope::from_der(&wire_bytes)?;
-	let ceiling = match &wire_envelope {
-		WireEnvelope::Cleartext(_) => transport.limits().cleartext_envelope,
-		WireEnvelope::Encrypted(_) => transport.limits().encrypted_envelope,
-	};
-	if wire_bytes.len() > ceiling {
-		return Err(TransportError::OperationFailed(TransportFailure::SizeExceeded));
-	}
-
-	// An established session reads and writes encrypted, so nothing cleartext
-	// is admitted on it. Before that, a provisioned endpoint admits only the
-	// handshake containers, and an unprovisioned one admits traffic.
-	let established = transport.session_state().phase().requires_encryption();
-	let expects_encryption = transport.session_state().phase().is_handshake_pending();
-	match wire_envelope {
-		WireEnvelope::Cleartext(envelope) => {
-			if established {
-				// Circuit breaker: a cleartext frame on an agreed session is
-				// not the peer this session established (CWE-319).
-				transport.session_state_mut().reset();
-				return Err(TransportError::MissingEncryption);
-			}
-
-			if expects_encryption {
-				match envelope {
-					TransportEnvelope::EnvelopedData(_) | TransportEnvelope::SignedData(_) => {
-						Ok(CollectStep::Handshake(HandshakeMessage::try_from(envelope)?))
-					}
-					// Circuit breaker: once encryption is configured,
-					// application traffic arrives encrypted.
-					_ => {
-						transport.session_state_mut().reset();
-						Err(TransportError::MissingEncryption)
-					}
-				}
-			} else {
-				Ok(CollectStep::Envelope(envelope))
-			}
-		}
-		WireEnvelope::Encrypted(encrypted_info) => {
-			if !matches!(transport.session_state().phase(), SessionPhase::Encrypted(_)) {
-				transport.session_state_mut().reset();
-				return Err(TransportError::OperationFailed(TransportFailure::EncryptionFailed));
-			}
-
-			let decrypted_bytes = match transport.session_state().decryptor()?.decrypt_content(&encrypted_info) {
-				Ok(bytes) => bytes,
-				Err(_) => {
-					transport.session_state_mut().reset();
-					return Err(TransportError::OperationFailed(TransportFailure::EncryptionFailed));
-				}
-			};
-
-			let envelope = decrypted_bytes.with(|bytes| T::decode_envelope(bytes))?;
-			Ok(CollectStep::Envelope(envelope))
 		}
 	}
 }
@@ -580,7 +439,7 @@ where
 	T: MessageCollector + ?Sized,
 {
 	let request = envelope.into_request_frame()?;
-	let status = gate_inbound(transport.collector_gate(), transport, Some(request.as_ref()), session);
+	let status = transport.gate_inbound(transport.collector_gate(), Some(request.as_ref()), session);
 	Ok((request, status))
 }
 
@@ -706,7 +565,7 @@ mod tests {
 		let audit = AuditProbe(TraceCollector::new());
 		let frame = TestFrame::v0(Some("gated"), None);
 
-		let status = gate_inbound(&DenyGate, &audit, Some(&frame), &SessionContext::default());
+		let status = audit.gate_inbound(&DenyGate, Some(&frame), &SessionContext::default());
 		assert_eq!(status, TransitStatus::PermissionDenied);
 
 		let recorded = audit.0.drain_events();

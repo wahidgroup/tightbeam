@@ -38,6 +38,10 @@ use crate::Beamable;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::constants::{MAX_MUX_CHUNK_SIZE, MAX_MUX_SESSION_BUDGET, MAX_MUX_STREAM_CREDIT, MIN_MUX_CHUNK_SIZE};
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::transport::handshake::error::HandshakeError;
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::transport::handshake::HandshakeProvider;
 
 use crate::Errorizable;
 
@@ -142,8 +146,7 @@ impl MuxBudgets {
 ///
 /// # Sources
 ///
-/// - RFC 9113 § 5.1.2, stream concurrency:
-///   <https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.2>
+/// - RFC 9113 § 5.1.2, stream concurrency: <https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.2>
 #[derive(Clone, Debug, Eq, PartialEq, Beamable, Sequence)]
 pub struct TransportOffer {
 	/// `true` when the sender supports stream multiplexing.
@@ -262,8 +265,7 @@ pub struct TransportAccept {
 ///
 /// # Sources
 ///
-/// - RFC 9113 § 5.1.2, stream concurrency:
-///   <https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.2>
+/// - RFC 9113 § 5.1.2, stream concurrency: <https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.2>
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MuxSettings {
 	/// Maximum concurrent streams this endpoint may initiate, as the peer
@@ -494,11 +496,9 @@ impl<'a> TransportNegotiation<'a> {
 		};
 
 		let grant = authorizer.authorize(offer).await?;
-		// The grant takes the bounds of a local-config grant, the minimum with
-		// the request and then the session cap, before it enters the
-		// transcript and the receipt (SSOT, CWE-770). A grant beyond the
-		// request would bind the client's countersignature to figures it
-		// never asked for.
+		// The grant takes the minimum with the request and then the session
+		// cap (SSOT, CWE-770). A grant beyond the request would bind the
+		// client's countersignature to figures it never asked for.
 		let granted_budgets = match (offer.requested_budgets, grant.budgets) {
 			(Some(requested), Some(granted)) => Some(granted.min(requested).clamped()),
 			_ => None,
@@ -523,9 +523,10 @@ impl<'a> TransportNegotiation<'a> {
 ///
 /// # Code space
 ///
-/// - Application codes sit at or above
-///   [`MUX_APPLICATION_CODE_FLOOR`](crate::transport::envelopes::MUX_APPLICATION_CODE_FLOOR).
+/// - Application codes sit at or above [`MUX_APPLICATION_CODE_FLOOR`].
 /// - Codes below the floor are reserved for the protocol, such as [`SETTLEMENT_UNSUPPORTED_CODE`].
+///
+/// [`MUX_APPLICATION_CODE_FLOOR`]: crate::transport::envelopes::MUX_APPLICATION_CODE_FLOOR
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AuthorizationRefusal {
 	/// Application-defined refusal code.
@@ -600,8 +601,8 @@ pub trait TransportAuthorizer: MaybeSend + MaybeSync {
 	///
 	/// The hook inspects [`TransportOffer::requested_budgets`] and the opaque
 	/// [`TransportOffer::authorization`] token, and it returns an
-	/// [`AuthorizationGrant`] or an [`AuthorizationRefusal`]. The server
-	/// Finished signature covers the grant.
+	/// [`AuthorizationGrant`] or an [`AuthorizationRefusal`]. The server's
+	/// signature over its reply covers the grant.
 	///
 	/// # Errors
 	///
@@ -611,7 +612,7 @@ pub trait TransportAuthorizer: MaybeSend + MaybeSync {
 		offer: &'a TransportOffer,
 	) -> MaybeSendFuture<'a, Result<AuthorizationGrant, AuthorizationRefusal>>;
 
-	/// Settle the countersigned receipt at the client's key exchange.
+	/// Settle the countersigned receipt when the client's closing arrives.
 	///
 	/// The handshake calls this hook with the receipt body and the client's
 	/// ancillary response after the countersignature verifies. The session
@@ -931,8 +932,7 @@ impl<P: CryptoProvider> TryFrom<SecurityProfileDesc> for RunnableProfile<P> {
 
 	/// # Errors
 	///
-	/// - [`NegotiationError::UnrunnableProfile`] -- `descriptor` names an
-	///   algorithm other than one of `P`'s.
+	/// - [`NegotiationError::UnrunnableProfile`] -- `descriptor` names an algorithm other than one of `P`'s.
 	fn try_from(descriptor: SecurityProfileDesc) -> Result<Self, Self::Error> {
 		let native = Self::native();
 		if descriptor != native.descriptor {
@@ -1048,6 +1048,173 @@ impl StrengthFloor {
 	}
 }
 
+/// The security profiles a server runs, in preference order.
+///
+/// The list is never empty, so a server always has a profile to choose from.
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam::transport::handshake::{HandshakeError, SupportedProfiles};
+///
+/// let refusal = SupportedProfiles::new([]);
+/// assert!(matches!(refusal, Err(HandshakeError::NoSupportedProfiles)));
+/// ```
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[derive(Clone, Debug)]
+pub struct SupportedProfiles(Vec<SecurityProfileDesc>);
+
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+impl SupportedProfiles {
+	/// The profiles a server runs, in the preference order `profiles` yields
+	/// them.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::NoSupportedProfiles`] -- `profiles` yields nothing.
+	pub fn new(profiles: impl IntoIterator<Item = SecurityProfileDesc>) -> Result<Self, HandshakeError> {
+		let profiles: Vec<SecurityProfileDesc> = profiles.into_iter().collect();
+		if profiles.is_empty() {
+			return Err(HandshakeError::NoSupportedProfiles);
+		}
+
+		Ok(Self(profiles))
+	}
+
+	/// The profiles, in preference order.
+	pub fn as_slice(&self) -> &[SecurityProfileDesc] {
+		&self.0
+	}
+}
+
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+impl TryFrom<Vec<SecurityProfileDesc>> for SupportedProfiles {
+	type Error = HandshakeError;
+
+	/// # Errors
+	///
+	/// - [`HandshakeError::NoSupportedProfiles`] -- `profiles` is empty.
+	fn try_from(profiles: Vec<SecurityProfileDesc>) -> Result<Self, Self::Error> {
+		Self::new(profiles)
+	}
+}
+
+/// One profile is a list that is never empty.
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+impl From<SecurityProfileDesc> for SupportedProfiles {
+	fn from(profile: SecurityProfileDesc) -> Self {
+		Self(Vec::from([profile]))
+	}
+}
+
+/// The two profile decisions of a handshake, under one strength floor.
+///
+/// A server chooses a profile and a client admits the server's selection, both
+/// through this policy. Each decision yields a profile `P` runs that meets the
+/// floor, so no other profile reaches a session.
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[derive(Clone)]
+pub struct ProfilePolicy<P> {
+	floor: StrengthFloor,
+	provider: PhantomData<fn() -> P>,
+}
+
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+impl<P: HandshakeProvider> Default for ProfilePolicy<P> {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+impl<P: HandshakeProvider> ProfilePolicy<P> {
+	/// A policy under [`DefaultStrengthFloor`], which requires a 256-bit AEAD
+	/// key and a digest of 256 bits or more.
+	pub fn new() -> Self {
+		Self { floor: StrengthFloor::default(), provider: PhantomData }
+	}
+
+	/// A policy under `policy` in place of [`DefaultStrengthFloor`].
+	///
+	/// Pass [`NoStrengthFloor`] only where weaker profiles must remain
+	/// negotiable.
+	pub fn with_floor(policy: Arc<dyn ProfileStrengthPolicy + Send + Sync>) -> Self {
+		Self { floor: StrengthFloor::with_policy(policy), provider: PhantomData }
+	}
+
+	/// Choose the profile a server runs a handshake under.
+	///
+	/// Only a profile in `supported` that `P` runs and that meets the floor is
+	/// eligible, so a weak profile left in `supported` for compatibility cannot
+	/// be negotiated (CWE-757).
+	///
+	/// - With an `offer`, the server takes the first eligible profile the
+	///   client also offered, in server preference order.
+	/// - Without one, the server takes its first eligible profile.
+	///
+	/// # Errors
+	///
+	/// Each [`NegotiationError`] arrives wrapped in
+	/// [`HandshakeError::NegotiationError`].
+	///
+	/// - [`NegotiationError::UnrunnableProfile`] -- no supported profile runs on `P`.
+	/// - [`NegotiationError::BelowStrengthFloor`] -- no runnable profile meets the floor.
+	/// - [`NegotiationError::EmptyOffer`] -- the client sent an empty offer.
+	/// - [`NegotiationError::OfferTooLarge`] -- the offer holds too many profiles.
+	/// - [`NegotiationError::NoMutualProfile`] -- the offer shares no eligible profile.
+	pub(crate) fn choose(
+		&self,
+		supported: &SupportedProfiles,
+		offer: Option<&SecurityOffer>,
+	) -> Result<RunnableProfile<P>, HandshakeError> {
+		let runs = |descriptor: &SecurityProfileDesc| RunnableProfile::<P>::try_from(*descriptor).ok();
+		let runnable: Vec<RunnableProfile<P>> = supported.as_slice().iter().filter_map(runs).collect();
+		if runnable.is_empty() {
+			return Err(NegotiationError::UnrunnableProfile.into());
+		}
+
+		let policy = self.floor.policy();
+		let meets_floor = |profile: &&RunnableProfile<P>| policy.meets_floor(&profile.strength());
+		let strong = runnable.iter().filter(meets_floor);
+		let eligible: Vec<SecurityProfileDesc> = strong.map(RunnableProfile::descriptor).collect();
+
+		let dealers_choice = eligible.first().copied().ok_or(NegotiationError::BelowStrengthFloor)?;
+		let selected = match offer {
+			Some(offer) => offer.select_profile(&eligible)?,
+			None => dealers_choice,
+		};
+		Ok(RunnableProfile::try_from(selected)?)
+	}
+
+	/// Admit the profile a server selected, on the client.
+	///
+	/// A selection is mandatory with or without an `offer`. With one, the
+	/// selection must be a member of it. In both cases `P` must run the
+	/// selected profile and it must meet the floor.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::InvalidProfileSelection`] -- the server selected
+	///   nothing, or a profile outside the offer.
+	/// - [`NegotiationError::UnrunnableProfile`] -- `P` does not run the selection.
+	/// - [`NegotiationError::BelowStrengthFloor`] -- the selection is below the floor.
+	pub(crate) fn admit(
+		&self,
+		offer: Option<&SecurityOffer>,
+		accept: Option<&SecurityAccept>,
+	) -> Result<RunnableProfile<P>, HandshakeError> {
+		let accept = accept.ok_or(HandshakeError::InvalidProfileSelection)?;
+		let offered = offer.is_none_or(|offer| offer.profiles.contains(&accept.profile));
+		if !offered {
+			return Err(HandshakeError::InvalidProfileSelection);
+		}
+
+		let profile = RunnableProfile::<P>::try_from(accept.profile)?;
+		self.floor.admit(&profile)?;
+		Ok(profile)
+	}
+}
+
 /// Strength policy that admits every profile.
 ///
 /// This policy is the explicit opt-out of the minimum-strength floor. Prefer
@@ -1075,6 +1242,7 @@ impl SecurityOffer {
 	/// - [`NegotiationError::EmptyOffer`] -- the peer sent an empty offer.
 	/// - [`NegotiationError::OfferTooLarge`] -- the offer exceeds [`MAX_OFFER_PROFILES`].
 	/// - [`NegotiationError::NoMutualProfile`] -- the offer shares no profile with `supported`.
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	pub(crate) fn select_profile(
 		&self,
 		supported: impl AsRef<[SecurityProfileDesc]>,
@@ -1097,7 +1265,6 @@ impl SecurityOffer {
 	}
 }
 
-// Exercises mux negotiation helpers when a transport flavor is enabled.
 #[cfg(all(test, any(feature = "transport-cms", feature = "transport-ecies")))]
 mod tests {
 	use core::error::Error;
@@ -1106,7 +1273,7 @@ mod tests {
 	use crate::asn1::{AlgorithmIdentifier, DigestInfo};
 	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::oids::{
-		AES_128_WRAP, AES_192_WRAP, AES_256_GCM, AES_256_WRAP, CURVE_SECP256K1, HASH_SHA3_256,
+		AES_128_GCM, AES_128_WRAP, AES_192_WRAP, AES_256_GCM, AES_256_WRAP, CURVE_SECP256K1, HASH_SHA3_256,
 		SIGNER_ECDSA_WITH_SHA3_512,
 	};
 
@@ -1135,8 +1302,9 @@ mod tests {
 		assert_eq!(offer.profiles[0], profile);
 	}
 
-	/// Caps 1/1, chunk 1024, unit 1024: the drain reserve is 5 records
-	/// priced at 1 credit each.
+	/// Settings with a cap of 1 in each direction, a 1024-byte chunk, and a
+	/// 1024-byte credit unit, so the drain reserve is 5 records priced at 1
+	/// credit each.
 	fn reserve_settings() -> MuxSettings {
 		let mut settings = MuxSettings::symmetric(1);
 		settings.send_chunk_size = 1024;
@@ -1191,8 +1359,9 @@ mod tests {
 		let p1 = sample_profile(1);
 		let p2 = sample_profile(2);
 
-		// Client prefers p1, server prefers p2. Server preference must win
-		// so a MITM reordering the offer cannot force the weaker profile.
+		// The client prefers p1 and the server prefers p2. The server
+		// preference must win, so a MITM that reorders the offer cannot force
+		// the weaker profile.
 		let offer = SecurityOffer::new(Vec::from([p1, p2]));
 		let supported = [p2, p1];
 
@@ -1792,5 +1961,140 @@ mod tests {
 		let weak = ProfileStrength { aead_key_bytes: 16, ..strength };
 		assert!(DefaultStrengthFloor.meets_floor(&strength));
 		assert!(!DefaultStrengthFloor.meets_floor(&weak));
+	}
+
+	/// A policy that refuses every profile.
+	struct RefuseAll;
+
+	impl ProfileStrengthPolicy for RefuseAll {
+		fn meets_floor(&self, _strength: &ProfileStrength) -> bool {
+			false
+		}
+	}
+
+	type DefaultPolicy = ProfilePolicy<DefaultCryptoProvider>;
+
+	/// The descriptor the default provider runs.
+	fn native_profile() -> SecurityProfileDesc {
+		RunnableProfile::<DefaultCryptoProvider>::native().descriptor()
+	}
+
+	/// A descriptor that names an AEAD the default provider does not run.
+	fn foreign_profile() -> SecurityProfileDesc {
+		SecurityProfileDesc { aead: Some(AES_128_GCM), ..native_profile() }
+	}
+
+	#[test]
+	fn a_server_chooses_the_offered_profile_the_provider_runs() -> Result<(), HandshakeError> {
+		let supported = SupportedProfiles::try_from(vec![foreign_profile(), native_profile()])?;
+		let offer = SecurityOffer::new(vec![foreign_profile(), native_profile()]);
+
+		let chosen = DefaultPolicy::new().choose(&supported, Some(&offer))?;
+		assert_eq!(chosen.descriptor(), native_profile());
+		Ok(())
+	}
+
+	#[test]
+	fn dealers_choice_skips_a_profile_the_provider_does_not_run() -> Result<(), HandshakeError> {
+		let supported = SupportedProfiles::try_from(vec![foreign_profile(), native_profile()])?;
+		let chosen = DefaultPolicy::new().choose(&supported, None)?;
+		assert_eq!(chosen.descriptor(), native_profile());
+		Ok(())
+	}
+
+	#[test]
+	fn a_server_with_no_runnable_profile_refuses_to_choose() {
+		let supported = SupportedProfiles::from(foreign_profile());
+		let refusal = DefaultPolicy::new().choose(&supported, None);
+		let expected = NegotiationError::UnrunnableProfile;
+		assert!(matches!(refusal, Err(HandshakeError::NegotiationError(error)) if error == expected));
+	}
+
+	#[test]
+	fn a_server_refuses_to_choose_a_profile_below_its_floor() {
+		let policy = DefaultPolicy::with_floor(Arc::new(RefuseAll));
+		let supported = SupportedProfiles::from(native_profile());
+
+		let refusal = policy.choose(&supported, None);
+		let expected = NegotiationError::BelowStrengthFloor;
+		assert!(matches!(refusal, Err(HandshakeError::NegotiationError(error)) if error == expected));
+	}
+
+	#[test]
+	fn an_empty_profile_list_is_refused() {
+		let refusal = SupportedProfiles::try_from(Vec::new());
+		assert!(matches!(refusal, Err(HandshakeError::NoSupportedProfiles)));
+	}
+
+	#[test]
+	fn a_profile_list_keeps_its_preference_order() -> Result<(), HandshakeError> {
+		let supported = SupportedProfiles::try_from(vec![foreign_profile(), native_profile()])?;
+		assert_eq!(supported.as_slice(), [foreign_profile(), native_profile()]);
+		Ok(())
+	}
+
+	#[test]
+	fn a_client_admits_an_offered_profile_it_runs() -> Result<(), HandshakeError> {
+		let offer = SecurityOffer::new(vec![foreign_profile(), native_profile()]);
+		let accept = SecurityAccept::new(native_profile());
+
+		let admitted = DefaultPolicy::new().admit(Some(&offer), Some(&accept))?;
+		assert_eq!(admitted.descriptor(), native_profile());
+		Ok(())
+	}
+
+	#[test]
+	fn a_client_refuses_a_profile_it_did_not_offer() {
+		let offer = SecurityOffer::new(vec![foreign_profile()]);
+		let accept = SecurityAccept::new(native_profile());
+
+		let refusal = DefaultPolicy::new().admit(Some(&offer), Some(&accept));
+		assert!(matches!(refusal, Err(HandshakeError::InvalidProfileSelection)));
+	}
+
+	#[test]
+	fn a_client_refuses_an_offer_the_server_did_not_answer() {
+		let offer = SecurityOffer::new(vec![native_profile()]);
+		let refusal = DefaultPolicy::new().admit(Some(&offer), None);
+		assert!(matches!(refusal, Err(HandshakeError::InvalidProfileSelection)));
+	}
+
+	/// Without an offer the server still names the profile it chose, so a
+	/// reply that selects nothing is refused.
+	#[test]
+	fn a_dealers_choice_client_refuses_a_missing_selection() {
+		let refusal = DefaultPolicy::new().admit(None, None);
+		assert!(matches!(refusal, Err(HandshakeError::InvalidProfileSelection)));
+	}
+
+	#[test]
+	fn a_dealers_choice_client_admits_a_profile_it_runs() -> Result<(), HandshakeError> {
+		let accept = SecurityAccept::new(native_profile());
+		let admitted = DefaultPolicy::new().admit(None, Some(&accept))?;
+		assert_eq!(admitted.descriptor(), native_profile());
+		Ok(())
+	}
+
+	/// A selection that names an algorithm the provider does not run is
+	/// refused, so the session never runs under a false identity.
+	#[test]
+	fn a_dealers_choice_client_refuses_a_profile_it_does_not_run() {
+		let accept = SecurityAccept::new(foreign_profile());
+
+		let refusal = DefaultPolicy::new().admit(None, Some(&accept));
+		let expected = NegotiationError::UnrunnableProfile;
+		assert!(matches!(refusal, Err(HandshakeError::NegotiationError(error)) if error == expected));
+	}
+
+	/// Without an offer the server chooses, and the client floor still bounds
+	/// that choice.
+	#[test]
+	fn a_dealers_choice_client_refuses_a_profile_below_its_floor() {
+		let policy = DefaultPolicy::with_floor(Arc::new(RefuseAll));
+		let accept = SecurityAccept::new(native_profile());
+
+		let refusal = policy.admit(None, Some(&accept));
+		let expected = NegotiationError::BelowStrengthFloor;
+		assert!(matches!(refusal, Err(HandshakeError::NegotiationError(error)) if error == expected));
 	}
 }

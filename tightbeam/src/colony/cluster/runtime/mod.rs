@@ -48,7 +48,7 @@ use crate::transport::accept::AcceptPlane;
 use crate::transport::handshake::negotiation::TransportOffer;
 use crate::transport::multiplex::{MuxCapable, ReplySink, StreamBody};
 use crate::transport::policy::PolicyConfig;
-use crate::transport::serve::{unimplemented_error, CallContext, MuxService};
+use crate::transport::serve::{CallContext, MuxService};
 use crate::transport::{AsyncListenerTrait, Protocol, TransportEncryptionConfig, TransportError};
 use crate::utils::time::Clock;
 use crate::utils::urn::Urn;
@@ -178,8 +178,7 @@ fn protocol_error<E: Into<TransportError>>(error: E) -> TightBeamError {
 /// - `E` defaults to `P`, so a gateway without an edge declaration uses a single accept plane.
 /// - When [`ClusterConfig::edge_bind_addr`] is set, the gateway binds a second
 ///   listener over `E` with the same TLS material.
-/// - Edge connections are served by a separate edge mux service, whose one
-///   route is `Work` submission.
+/// - Edge connections are served by a separate edge mux service, whose one route is `Work` submission.
 /// - Hives and peers keep using the colony plane at [`Cluster::addr`].
 pub struct ClusterGateway<P, D = Sha3_256, E = P>
 where
@@ -190,8 +189,11 @@ where
 	servlet_registry: Arc<ServletRegistry>,
 	config: Arc<ClusterConfig>,
 	pool: Arc<ClusterPool<P>>,
-	/// The accept planes, which [`Cluster::join`] awaits.
+	/// The colony accept plane task, which [`Cluster::join`] awaits together
+	/// with the edge task.
 	server_handle: Option<rt::JoinHandle>,
+	/// The edge accept plane task, present when
+	/// [`ClusterConfig::edge_bind_addr`] is set.
 	edge_handle: Option<rt::JoinHandle>,
 	/// Every background task this gateway started.
 	tasks: TaskGroup,
@@ -239,9 +241,10 @@ where
 
 	async fn start(trace: Arc<TraceCollector>, config: ClusterConfig) -> Result<Self, TightBeamError> {
 		// The admission freshness window MUST stay within journal retention
-		// (CWE-294). A rumor older than retention has no digest left, so a
-		// wider window would re-admit a replay as new. The clamp runs before
-		// config is wrapped in Arc, which fixes the window for its lifetime.
+		// (CWE-294):
+		// - A rumor older than retention has no digest left, so a wider window
+		//   would re-admit a replay as new.
+		// - The clamp runs before config is wrapped in `Arc`, which fixes the window for its lifetime.
 		let config = {
 			let mut config = config;
 			let retention = config.gossip.journal.retention();
@@ -292,10 +295,9 @@ where
 			tasks: tasks.clone(),
 		};
 
-		// Bind every configured accept plane before spawning any accept
-		// loop. An edge parse or bind failure returns `Err` while the colony
-		// listener is still local, so a failed start leaves every accept
-		// task unspawned.
+		// Bind every configured accept plane before any accept loop spawns.
+		// An edge parse or bind failure then returns `Err` while the colony
+		// listener is still local, so a failed start spawns no accept task.
 		let (edge_listener, edge_addr) = match config.edge_bind_addr.as_deref() {
 			Some(raw) => {
 				let edge_bind: E::Address = raw.parse().map_err(|_| TransportError::InvalidMessage)?;
@@ -312,6 +314,12 @@ where
 		// path reports it once for all accept planes.
 		config.warn_export_posture(&trace)?;
 
+		// The advertised address is decided before any task spawns, so a
+		// federating gateway on the wildcard address refuses to start and
+		// closes every listener it bound.
+		let gateway_bytes: Vec<u8> = addr.clone().into();
+		let gateway_addr = config.peer.advertised_address(gateway_bytes)?;
+
 		// Every field of the context is an `Arc`, so the clone is cheap.
 		let server_handle = ctx.clone().serve_colony::<P::Listener, D>(listener);
 
@@ -319,17 +327,12 @@ where
 		// submission.
 		let edge_handle = edge_listener.map(|edge_listener| ctx.clone().serve_edge::<E::Listener, D>(edge_listener));
 
-		// The advertised address is decided before any task spawns, so a
-		// federating gateway on the wildcard address refuses to start.
-		let gateway_bytes: Vec<u8> = addr.clone().into();
-		let gateway_addr = config.peer.advertised_address(gateway_bytes)?;
-
 		tasks.adopt(ctx.clone().spawn_heartbeat::<D>());
 
-		// Three refresh intervals of silence retire a relay trail: one missed
-		// refresh is churn, three means the refresh path died. The default
-		// refresh interval floors the TTL, so an aggressive `rumor_refresh`
-		// keeps a healthy fallback in place.
+		// A relay trail retires after three refresh intervals of silence:
+		// - One missed refresh is churn, and three mean the refresh path died.
+		// - The default interval floors the TTL, so an aggressive `rumor_refresh`
+		//   keeps a healthy fallback in place.
 		let relay_trail_ttl = config
 			.rumor_refresh()
 			.saturating_mul(3)
@@ -571,7 +574,7 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 		}
 
 		let Some(target) = cx.target().cloned() else {
-			return Err(unimplemented_error());
+			return Err(TightBeamError::unimplemented());
 		};
 
 		let budget = HopBudget::from_wire(WireHopBudget::new(cx.hops_remaining()), self.config.peer.max_hops);

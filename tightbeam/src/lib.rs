@@ -120,6 +120,12 @@ use alloc::vec::Vec;
 
 mod wire;
 
+// Compiles every README example as a doctest, so a renamed item fails the
+// build instead of leaving the README stale.
+#[cfg(doctest)]
+#[doc = include_str!("../../README.md")]
+mod readme {}
+
 // Before other modules so `compose!` is in crate-wide textual scope.
 #[cfg(feature = "builder")]
 #[macro_use]

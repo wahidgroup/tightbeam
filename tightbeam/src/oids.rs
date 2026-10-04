@@ -188,10 +188,10 @@ pub const HANDSHAKE_TRANSPORT_ACCEPT: ObjectIdentifier = ObjectIdentifier::new_u
 // 1.3.6.1.4.1.64586.1.17 retired: bare receipt signatures were replaced
 // by SignerInfos inside the receipt SignedData artifact.
 
-/// Session receipt acknowledgement OID. The value is an `EnvelopedData`
-/// ([RFC 5652 §6](https://datatracker.ietf.org/doc/html/rfc5652#section-6))
-/// encrypted to the server certificate whose plaintext is the client's
-/// receipt `SignerInfo` (countersignature plus confidential settlement answer).
+/// Session receipt acknowledgement OID. The value is an OCTET STRING holding
+/// the AEAD ciphertext, under a key derived from the handshake secret, of the
+/// client's receipt `SignerInfo` (countersignature plus confidential
+/// settlement answer).
 pub const RECEIPT_ACK: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.18");
 
 /// Session receipt artifact OID (CMS attribute carriage). The value is
@@ -212,6 +212,13 @@ pub const RECEIPT_ROLE: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1
 /// STRING) inside its receipt `SignerInfo`, binding answer to
 /// countersignature the standard CMS way.
 pub const RECEIPT_ANSWER: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.22");
+
+/// Server ephemeral public key OID (CMS attribute carriage). The value is an
+/// `OriginatorPublicKey` ([RFC 5652 §6.2.2][rfc5652-6.2.2]) on the server
+/// Finished, inside the transcript the Finished signs.
+///
+/// [rfc5652-6.2.2]: https://datatracker.ietf.org/doc/html/rfc5652#section-6.2.2
+pub const HANDSHAKE_SERVER_EPHEMERAL: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.23");
 
 /// PKCS #9 content-type signed attribute
 /// ([RFC 5652 §11.1](https://datatracker.ietf.org/doc/html/rfc5652#section-11.1)).
@@ -276,6 +283,7 @@ mod tests {
 			(SESSION_RECEIPT_CONTENT, "1.3.6.1.4.1.64586.1.20"),
 			(RECEIPT_ROLE, "1.3.6.1.4.1.64586.1.21"),
 			(RECEIPT_ANSWER, "1.3.6.1.4.1.64586.1.22"),
+			(HANDSHAKE_SERVER_EPHEMERAL, "1.3.6.1.4.1.64586.1.23"),
 			(ATTR_CONTENT_TYPE, "1.2.840.113549.1.9.3"),
 			(ATTR_MESSAGE_DIGEST, "1.2.840.113549.1.9.4"),
 		];

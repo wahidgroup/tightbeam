@@ -72,8 +72,9 @@ pooled_mux! {
 	use crate::runtime::rt;
 	use crate::utils::marker::MaybeSend;
 	use crate::transport::handshake::receipt::StoredReceipt;
-	use crate::transport::multiplex::{MuxCapable, MuxConnector, MuxHandle, MuxRole, RequestSink, StreamBody};
-	use crate::transport::serve::drive_mux;
+	use crate::transport::multiplex::{
+		MuxCapable, MuxConnector, MuxHandle, MuxRole, MuxTransport, RequestSink, SpawnedMux, StreamBody,
+	};
 
 	#[cfg(feature = "colony")]
 	use crate::transport::multiplex::StreamRoute;
@@ -810,7 +811,8 @@ pooled_mux! {
 
 			let rekey = transport.take_rekey()?;
 			let (reader, writer) = transport.into_envelope_halves()?;
-			let (handle, responder, reader_task) = drive_mux(reader, writer, MuxRole::Client, settings, None, rekey);
+			let mux = MuxTransport::new(reader, writer, MuxRole::Client, settings);
+			let SpawnedMux { handle, responder, reader_task } = mux.spawn_with(None, rekey);
 
 			// Pool endpoints serve no peer-initiated streams, so dropping the
 			// responder refuses them.

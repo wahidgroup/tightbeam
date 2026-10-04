@@ -116,15 +116,19 @@ impl TransitStatus {
 
 /// Authenticated peer context of one established session.
 ///
-/// These are the identity facts a gate or request handler may key on,
-/// namely the validated peer certificate from a mutual-auth handshake and
-/// the dual-signed session receipt when the session is budget-bearing.
+/// These are the identity facts a gate or request handler may key on:
+///
+/// - The validated peer certificate from a mutual-auth handshake.
+/// - The dual-signed session receipt, when the session is budget-bearing.
+///
 /// The empty (default) context means no authenticated facts. Cleartext
 /// connections, client-side emit paths, and in-process evaluation all
 /// answer it.
 ///
-/// On the mux serving path (`serve_mux`) the context is assembled per
-/// invocation with the live receipt, so gates and handlers observe
+/// # Rekey
+///
+/// On the mux serving path (`MuxAcceptor::serve`) the context is assembled
+/// per invocation with the live receipt, so gates and handlers observe
 /// post-rekey rotations. Single-flight sessions cannot rekey, so a
 /// one-shot [`SessionContext::capture`] is exact there.
 #[derive(Clone, Debug, Default)]

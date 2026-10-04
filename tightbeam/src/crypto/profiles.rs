@@ -70,7 +70,7 @@ macro_rules! impl_key_wrapper {
 
 			crate::crypto::aead::aes_kw::Kek::<$cipher>::from(*kek)
 				.wrap_vec(cek)
-				.map_err(|_| <$err>::from(HandshakeError::InvalidKeySize { expected: 16, received: cek.len() }))
+				.map_err(|error| <$err>::from(HandshakeError::AesKeyWrap(error)))
 		})
 	};
 }
@@ -91,7 +91,7 @@ macro_rules! impl_key_unwrapper {
 
 			crate::crypto::aead::aes_kw::Kek::<$cipher>::from(*kek)
 				.unwrap_vec(wrapped_cek)
-				.map_err(|_| <$err>::from(HandshakeError::InvalidKeySize { expected: 24, received: wrapped_cek.len() }))
+				.map_err(|error| <$err>::from(HandshakeError::AesKeyWrap(error)))
 		})
 	};
 }
@@ -160,13 +160,11 @@ impl<P: SecurityProfile> From<&P> for SecurityProfileDesc {
 ///
 /// # Rationale
 ///
-/// - Peers negotiate over a compact descriptor of the hash, AEAD, signature,
-///   key-wrap, KDF, and curve OIDs.
+/// - Peers negotiate over a compact descriptor of the hash, AEAD, signature, key-wrap, KDF, and curve OIDs.
 /// - The trait decouples the compile-time algorithm implementation
 ///   (`CryptoProvider`) from the protocol-visible identifiers
 ///   (`SecurityProfile`).
-/// - A later dynamic dispatch or plugin loader can use the trait without a
-///   change to the wire format.
+/// - A later dynamic dispatch or plugin loader can use the trait without a change to the wire format.
 /// - Peers must negotiate the KDF and the curve to interoperate: - Different
 ///   KDFs produce different keys from the same inputs. - The curve choice
 ///   affects ECDH operations. For example, Ed25519 signatures typically pair
@@ -555,8 +553,8 @@ impl UkmBuilder {
 mod tests {
 	use super::*;
 	use crate::constants::{
-		TIGHTBEAM_CLIENT_FINISHED_DOMAIN, TIGHTBEAM_KARI_KDF_INFO, TIGHTBEAM_SERVER_FINISHED_DOMAIN,
-		TIGHTBEAM_SESSION_KDF_INFO, TIGHTBEAM_UKM_PREFIX,
+		TIGHTBEAM_ACK_AAD_DOMAIN, TIGHTBEAM_CLIENT_FINISHED_DOMAIN, TIGHTBEAM_KARI_KDF_INFO,
+		TIGHTBEAM_SERVER_FINISHED_DOMAIN, TIGHTBEAM_SESSION_KDF_INFO, TIGHTBEAM_UKM_PREFIX,
 	};
 
 	/// Guard the domain constants against accidental change.
@@ -569,6 +567,7 @@ mod tests {
 		assert_eq!(TIGHTBEAM_SESSION_KDF_INFO, b"tb/session/kdf/v1");
 		assert_eq!(TIGHTBEAM_SERVER_FINISHED_DOMAIN, b"tb/handshake/finished/server/v1");
 		assert_eq!(TIGHTBEAM_CLIENT_FINISHED_DOMAIN, b"tb/handshake/finished/client/v1");
+		assert_eq!(TIGHTBEAM_ACK_AAD_DOMAIN, b"tb/handshake/ack/aad/v1");
 		assert_eq!(TIGHTBEAM_UKM_PREFIX, b"tb/kari/ukm/v1|");
 	}
 
