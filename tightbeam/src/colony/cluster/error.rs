@@ -6,18 +6,18 @@ use crate::policy::TransitStatus;
 use crate::transport::error::TransportError;
 use crate::{Errorizable, TightBeamError};
 
-/// Errors specific to clusters
+/// The errors of a cluster gateway.
 ///
-/// Failure modes are distinct variants (not string payloads) so callers
-/// can branch on them, and wrapper variants preserve their cause chain
-/// through [`core::error::Error::source`].
+/// Each failure mode is its own variant, so a caller can branch on it. A
+/// wrapper variant preserves its cause chain through
+/// [`core::error::Error::source`].
 #[derive(Errorizable, Debug)]
 pub enum ClusterError {
-	/// Lock poisoned
+	/// A thread panicked while it held a cluster lock, so the lock is poisoned.
 	#[error("Lock poisoned")]
 	LockPoisoned,
 
-	/// A configured peer or allowlist entry names no socket address
+	/// A configured peer or allowlist entry names no socket address.
 	#[error("Peer address does not parse")]
 	InvalidPeerAddress,
 
@@ -26,77 +26,86 @@ pub enum ClusterError {
 	#[error("A wildcard bind needs an advertise address to federate")]
 	AdvertiseAddressRequired,
 
-	/// Unknown servlet type
+	/// The URN names no servlet type that a route can answer.
 	#[error("Unknown servlet type: {:#?}")]
 	UnknownServletType(Vec<u8>),
 
-	/// No hives available for servlet type
+	/// No hive is available for the servlet type.
 	#[error("No hives available for servlet type: {:#?}")]
 	NoHivesAvailable(Vec<u8>),
 
-	/// Connection to the selected hive/servlet could not be established
+	/// The connection to the selected hive, servlet, or peer gateway could not
+	/// be established.
 	#[error("Connect failed")]
 	ConnectFailed,
 
-	/// Peer accepted the request but returned no response frame
+	/// The peer accepted the request but returned no response frame.
 	#[error("No response")]
 	NoResponse,
 
-	/// Transport-level failure while communicating with a hive/servlet
+	/// The transport failed while the gateway talked to a hive, a servlet, or
+	/// a peer gateway.
 	#[error("Transport error: {0}")]
 	#[from]
 	Transport(TransportError),
 
-	/// Frame encode/decode/build/sign failure
+	/// A frame failed to encode, decode, build, or sign.
 	#[error("Frame error: {0}")]
 	#[from]
 	Frame(TightBeamError),
 
-	/// Response decoded but did not carry the expected field
+	/// The response decoded but did not carry the expected field.
 	#[error("Malformed response")]
 	MalformedResponse,
 
-	/// Registration failed
+	/// A hive registration failed.
 	#[error("Registration failed")]
 	RegistrationFailed,
 
-	/// Invalid servlet address format
+	/// An address is not one the protocol can dial, or a servlet locator names
+	/// another address than the one beside it.
 	#[error("Invalid address: {:#?}")]
 	InvalidAddress(Vec<u8>),
 
-	/// Servlet address update referenced a route owned by a different hive
+	/// A hive's slate or address update claimed a route that another owner
+	/// holds.
 	#[error("Servlet not owned by hive")]
 	ServletNotOwned,
 
-	/// Servlet address update named a remove locator that is not registered
+	/// A servlet address update named a locator to remove that is not
+	/// registered.
 	#[error("Servlet address not found")]
 	ServletNotFound,
 
-	/// Re-registration presented a signer that does not match the bound hive signer
+	/// A re-registration or an address update presented a signer other than
+	/// the one bound to the hive.
 	#[error("Signer does not match hive binding")]
 	SignerMismatch,
 
-	/// Peer slate key or dial address collides with local routes
+	/// A peer slate's key or dial address collides with a route another owner
+	/// holds.
 	#[error("Peer slate conflicts with local routes")]
 	PeerSlateConflict,
 
-	/// Peer slate would exceed gateway or route caps
+	/// A peer slate would exceed the gateway cap or the route cap.
 	#[error("Peer slate exceeds caps")]
 	PeerCapExceeded,
 
-	/// Peer advertisement is older than the newest one applied for its bucket
+	/// The peer advertisement is older than the newest one applied for its
+	/// bucket.
 	#[error("Peer advertisement is stale")]
 	StalePeerAd,
 
-	/// Gossip journal refused a record because a capacity bound was reached
+	/// The gossip journal refused a record because a capacity bound was
+	/// reached.
 	#[error("Gossip journal at capacity")]
 	GossipJournalAtCapacity,
 
-	/// Gossip journal backend could not service the request
+	/// The gossip journal backend could not service the request.
 	#[error("Gossip journal unavailable")]
 	GossipJournalUnavailable,
 
-	/// Reconcile reply exceeded the want-list or peer-exchange cap
+	/// A reconcile reply exceeded the want-list cap or the peer-exchange cap.
 	#[error("Oversized reconcile reply")]
 	OversizedReconcileReply,
 }
@@ -108,6 +117,21 @@ impl From<AddrParseError> for ClusterError {
 }
 
 impl ClusterError {
+	/// The status a refused hive registration or address update answers
+	/// with.
+	///
+	/// A poisoned registry is this gateway's fault, so the hive is told the
+	/// gateway is unavailable rather than that it lacks the right to
+	/// register. Every other refusal is a claim the gateway judged and
+	/// denied.
+	#[must_use]
+	pub(crate) fn transit_status(&self) -> TransitStatus {
+		match self {
+			ClusterError::LockPoisoned => TransitStatus::Unavailable,
+			_ => TransitStatus::PermissionDenied,
+		}
+	}
+
 	/// Transit status a failed forward relays to the caller.
 	///
 	/// A servlet refusal relays unchanged so the caller keeps its
@@ -127,5 +151,26 @@ impl ClusterError {
 impl<T> From<std::sync::PoisonError<T>> for ClusterError {
 	fn from(_: std::sync::PoisonError<T>) -> Self {
 		ClusterError::LockPoisoned
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::tb_cases;
+
+	// A poisoned lock is the gateway's own fault and answers unavailable.
+	// Every other refusal denies the hive's claim.
+	tb_cases! {
+		fn transit_status_of((error, expected): (ClusterError, TransitStatus)) {
+			let status = error.transit_status();
+
+			assert_eq!(status, expected);
+		}
+		cases {
+			a_poisoned_lock_is_unavailable => (ClusterError::LockPoisoned, TransitStatus::Unavailable),
+			a_signer_mismatch_is_denied => (ClusterError::SignerMismatch, TransitStatus::PermissionDenied),
+			an_unowned_servlet_is_denied => (ClusterError::ServletNotOwned, TransitStatus::PermissionDenied),
+		}
 	}
 }

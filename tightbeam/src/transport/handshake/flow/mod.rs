@@ -1,8 +1,8 @@
-//! The wire of one handshake protocol.
+//! The messages of one handshake protocol.
 //!
 //! A flow encodes and decodes the three legs of one protocol, binds them into
-//! the transcript, carries the base secret, and makes the checks its wire
-//! defines. The orchestrator owns the step order and every negotiation and
+//! the transcript, carries the base secret, and makes the checks its messages
+//! define. The orchestrator owns the step order and every negotiation and
 //! admission decision, and it acts on the decoded facts alone.
 //!
 //! A step of the orchestrator works between two kinds of flow call:
@@ -28,7 +28,7 @@ use crate::transport::handshake::negotiation::{
 };
 use crate::transport::handshake::peer::{PossessionProof, ServerTrust};
 use crate::transport::handshake::primitives::KdfSalt;
-use crate::transport::handshake::schedule::{Salt, Terms};
+use crate::transport::handshake::schedule::{KeyConfirmation, PeerPoint, Salt, Terms};
 use crate::transport::handshake::{HandshakeMessage, HandshakeProvider, HandshakeSecret};
 use crate::transport::state::ClientIdentity;
 use crate::utils::marker::{MaybeSend, MaybeSendFuture, MaybeSync};
@@ -92,8 +92,9 @@ pub struct ReplyIntake<F: ClientFlow<P>, P: HandshakeProvider> {
 	pub server_ephemeral: Vec<u8>,
 	/// The server-signed session receipt, when the session carries budgets.
 	pub receipt: Option<SignedData>,
-	/// Whether the server demands a client identity. The CMS reply carries no
-	/// such field and yields `false`, because a CMS client always holds one.
+	/// Whether the server demands a client identity. The ECIES reply carries
+	/// the demand, and the CMS flow yields `false`, because a CMS client always
+	/// holds an identity.
 	pub client_cert_required: bool,
 	/// The hash of the sealed transcript, which the reply signs.
 	pub transcript_hash: [u8; 32],
@@ -111,6 +112,8 @@ pub struct ClosingParts<'a> {
 	pub transcript_hash: &'a [u8; 32],
 	/// The receipt countersignature, sealed under the handshake secret.
 	pub sealed_ack: Option<Vec<u8>>,
+	/// The proof that the client derived the handshake secret.
+	pub confirmation: KeyConfirmation,
 }
 
 /// The possession proof a closing still needs: the bytes to sign, beside the
@@ -190,9 +193,9 @@ pub trait ClientFlow<P: HandshakeProvider>: HandshakeFlow {
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError::SignatureError`] or
-	///   [`HandshakeError::SignatureVerificationFailed`] -- the signature fails
-	///   to verify, or it signs another transcript.
+	/// - [`HandshakeError::SignatureError`] -- the ECIES signature fails to parse or to verify.
+	/// - [`HandshakeError::SignatureVerificationFailed`] -- the CMS Finished
+	///   fails to verify, or it signs another transcript or another role.
 	fn verify_reply(
 		reply: &Self::Reply,
 		key: P::VerifyingKey,
@@ -207,7 +210,7 @@ pub trait ClientFlow<P: HandshakeProvider>: HandshakeFlow {
 	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the handshake secret.
 	fn agree(
 		pending: Self::Pending,
-		server_ephemeral: &PublicKey<P::Curve>,
+		server_ephemeral: &PeerPoint<P::Curve>,
 		salt: KdfSalt<'_>,
 		rng: &mut dyn CryptoRngCore,
 	) -> Result<(HandshakeSecret, Self::Agreed), HandshakeError>;
@@ -285,6 +288,9 @@ pub struct ClosingOpened {
 	pub secret: HandshakeSecret,
 	/// The receipt countersignature, sealed under the handshake secret.
 	pub receipt_ack: Option<Vec<u8>>,
+	/// The key-confirmation tag the closing carried. The orchestrator verifies
+	/// it against the handshake secret.
+	pub confirmation: KeyConfirmation,
 }
 
 /// The server legs of one protocol.
@@ -292,7 +298,8 @@ pub struct ClosingOpened {
 /// Both flows return the same intake shapes and refuse with the same
 /// [`HandshakeError`] set, so the orchestrator runs one step order over
 /// either. The two asynchronous methods are the static-key operations, which
-/// run through the key provider.
+/// run through the key provider, so the private key can stay behind an
+/// external boundary.
 pub trait ServerFlow<P: HandshakeProvider>: HandshakeFlow {
 	/// What a server of this protocol is provisioned with.
 	type Settings: MaybeSend + MaybeSync + 'static;
@@ -382,6 +389,7 @@ pub trait ServerFlow<P: HandshakeProvider>: HandshakeFlow {
 	/// - [`HandshakeError::AbortReceived`] -- the closing carries an abort alert.
 	/// - [`HandshakeError::ClientCertificateMismatch`] -- the closing names
 	///   another certificate than the opening bound.
+	/// - [`HandshakeError::MissingAttribute`] -- the closing carries no key-confirmation tag.
 	/// - [`HandshakeError`] -- the closing fails to decode.
 	fn read_closing(
 		pending: &Self::Pending,
@@ -396,6 +404,9 @@ pub trait ServerFlow<P: HandshakeProvider>: HandshakeFlow {
 	///
 	/// - [`HandshakeError::KeyError`] -- the key provider failed.
 	/// - [`HandshakeError::EciesError`] -- the sealed payload fails to open.
+	/// - [`HandshakeError::InvalidDecryptedPayloadSize`] -- the opened payload fails to decode.
+	/// - [`HandshakeError::InvalidKeySize`] -- the base secret of the payload is not 32 bytes.
+	/// - [`HandshakeError::OctetStringLengthError`] -- the client random of the payload is not 32 bytes.
 	/// - [`HandshakeError::ClientRandomMismatchReplay`] -- the payload echoes another client random.
 	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the handshake secret.
 	fn settle<'a>(

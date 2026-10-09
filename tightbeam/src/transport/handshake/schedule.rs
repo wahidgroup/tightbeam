@@ -22,11 +22,11 @@
 //! k_s2c   = HKDF(hs, S, "tb/session/kdf/s2c/v1")
 //! epoch_0 = HKDF(hs, S, "tb/session/kdf/epoch/v1")
 //! k_ack   = HKDF(hs, S, "tb/session/kdf/ack/v1")
+//! confirm = HKDF(hs, S, "tb/session/kdf/confirm/v1" || transcript_hash)
 //! ```
 //!
-//! What this schedule withholds from a holder of the server's static key is
-//! stated once, under
-//! [forward secrecy](crate::transport::handshake#forward-secrecy).
+//! [Forward secrecy](crate::transport::handshake#forward-secrecy) states what
+//! this schedule withholds from a holder of the server's static key.
 
 use core::fmt;
 
@@ -36,17 +36,25 @@ use core::fmt;
 ))]
 use alloc::vec::Vec;
 
-#[cfg(feature = "transport-ecies")]
+#[cfg(any(
+	feature = "transport-ecies",
+	all(feature = "transport-cms", feature = "transport-multiplex")
+))]
 use crate::constants::EC_PUBKEY_COMPRESSED_SIZE;
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::constants::{
 	MIN_SALT_ENTROPY_BYTES, TIGHTBEAM_ACK_AAD_DOMAIN, TIGHTBEAM_ACK_KDF_INFO, TIGHTBEAM_C2S_KDF_INFO,
-	TIGHTBEAM_EPOCH_KDF_INFO, TIGHTBEAM_S2C_KDF_INFO, TIGHTBEAM_SESSION_KDF_INFO,
+	TIGHTBEAM_CONFIRM_KDF_INFO, TIGHTBEAM_EPOCH_KDF_INFO, TIGHTBEAM_S2C_KDF_INFO, TIGHTBEAM_SESSION_KDF_INFO,
 };
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::crypto::aead::{Aead, DirectionalCiphers, KeyInit, Nonce, Payload, SessionKeys};
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::crypto::common::KeySizeUser;
+#[cfg(all(
+	feature = "transport-multiplex",
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
+use crate::crypto::hash::Digest;
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::crypto::kdf::{EcdhSecret, KdfFunction};
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
@@ -55,25 +63,34 @@ use crate::crypto::profiles::CryptoProvider;
 use crate::crypto::secret::SecretSlice;
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::crypto::sign::elliptic_curve::ecdh::{diffie_hellman, EphemeralSecret};
-#[cfg(feature = "transport-ecies")]
+#[cfg(any(
+	feature = "transport-ecies",
+	all(feature = "transport-cms", feature = "transport-multiplex")
+))]
 use crate::crypto::sign::elliptic_curve::sec1::ToEncodedPoint;
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::crypto::sign::elliptic_curve::{CurveArithmetic, PublicKey, SecretKey};
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::crypto::subtle::ConstantTimeEq;
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::crypto::x509::utils::CertificateExt;
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::der::asn1::OctetStringRef;
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::der::{DecodeValue, EncodeValue, FixedTag, Header, Length, Reader, Result as DerResult, Tag, Writer};
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::random::{generate_nonce, CryptoRngCore};
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::transport::handshake::error::HandshakeError;
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::transport::handshake::negotiation::{MuxSettings, RunnableProfile};
-#[cfg(feature = "transport-ecies")]
-use crate::transport::handshake::primitives::RandomsSalt;
 #[cfg(all(
 	feature = "transport-multiplex",
 	any(feature = "transport-cms", feature = "transport-ecies")
 ))]
-use crate::transport::handshake::primitives::{kdf_chain, KdfStage};
+use crate::transport::handshake::primitives::transcript::Transcript;
+#[cfg(feature = "transport-ecies")]
+use crate::transport::handshake::primitives::RandomsSalt;
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::transport::handshake::primitives::{multi_input_kdf, KdfInfo, KdfSalt};
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
@@ -238,6 +255,55 @@ impl HandshakeSecret {
 		Ok(SecretSlice::from(plaintext))
 	}
 
+	/// Derive the key-confirmation tag of this secret over `transcript_hash`.
+	///
+	/// The tag is `HKDF(hs, salt, info)`, where `info` is
+	/// [`TIGHTBEAM_CONFIRM_KDF_INFO`] followed by `transcript_hash`. It proves
+	/// that its sender derived this secret for this transcript, and it yields
+	/// nothing of either (NIST SP 800-56A Rev. 3 § 5.9).
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the derivation.
+	pub(crate) fn confirmation<P>(
+		&self,
+		salt: KdfSalt<'_>,
+		transcript_hash: &[u8; 32],
+	) -> Result<KeyConfirmation, HandshakeError>
+	where
+		P: CryptoProvider,
+	{
+		let info = [TIGHTBEAM_CONFIRM_KDF_INFO, transcript_hash.as_slice()].concat();
+		let tag = P::Kdf::derive_key::<KEY_CONFIRMATION_SIZE>(&self.0, &info, Some(salt.as_bytes()))?;
+		Ok(KeyConfirmation(*tag))
+	}
+
+	/// Verify that `received` is the key-confirmation tag of this secret over
+	/// `transcript_hash`, and hand the secret back as confirmed.
+	///
+	/// The secret is consumed, so a caller that holds a [`ConfirmedSecret`]
+	/// holds no unconfirmed copy beside it.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the derivation.
+	/// - [`HandshakeError::KeyConfirmationFailed`] -- the tags differ, so the
+	///   peer derived another handshake secret or confirmed another transcript.
+	pub(crate) fn confirmed<P>(
+		self,
+		salt: KdfSalt<'_>,
+		transcript_hash: &[u8; 32],
+		received: &KeyConfirmation,
+	) -> Result<ConfirmedSecret, HandshakeError>
+	where
+		P: CryptoProvider,
+	{
+		let expected = self.confirmation::<P>(salt, transcript_hash)?;
+		expected.verify(received)?;
+
+		Ok(ConfirmedSecret(self))
+	}
+
 	/// The associated data of the acknowledgement seal:
 	/// [`TIGHTBEAM_ACK_AAD_DOMAIN`] followed by the transcript hash.
 	fn ack_aad(transcript_hash: &[u8; 32]) -> Vec<u8> {
@@ -265,6 +331,82 @@ impl HandshakeSecret {
 impl fmt::Debug for HandshakeSecret {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.debug_struct("HandshakeSecret").finish_non_exhaustive()
+	}
+}
+
+/// A handshake secret the peer proved it derived.
+///
+/// [`HandshakeSecret::confirmed`] is its one producer, so a step that takes
+/// a `ConfirmedSecret` runs only after the key-confirmation tag verified.
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+pub struct ConfirmedSecret(HandshakeSecret);
+
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+impl ConfirmedSecret {
+	/// The confirmed secret, for the one seal that opens under it.
+	pub(crate) fn secret(&self) -> &HandshakeSecret {
+		&self.0
+	}
+
+	/// Take the secret out, for the session that derives from it.
+	pub(crate) fn into_secret(self) -> HandshakeSecret {
+		self.0
+	}
+}
+
+/// The proof that an endpoint derived the handshake secret of one transcript.
+///
+/// [`HandshakeSecret::confirmation`] derives the tag an endpoint sends or
+/// expects. A received tag decodes as a 32-byte OCTET STRING, and another
+/// width fails to decode, so every tag has the one width.
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[derive(Clone)]
+pub struct KeyConfirmation([u8; KEY_CONFIRMATION_SIZE]);
+
+/// Key-confirmation tag length in bytes.
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+const KEY_CONFIRMATION_SIZE: usize = 32;
+
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+impl KeyConfirmation {
+	/// Verify in constant time that `received` is this tag.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::KeyConfirmationFailed`] -- the tags differ, so the
+	///   peer derived another handshake secret or confirmed another transcript.
+	pub(crate) fn verify(&self, received: &Self) -> Result<(), HandshakeError> {
+		let is_confirmed: bool = self.0.ct_eq(&received.0).into();
+		if !is_confirmed {
+			return Err(HandshakeError::KeyConfirmationFailed);
+		}
+
+		Ok(())
+	}
+}
+
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+impl FixedTag for KeyConfirmation {
+	const TAG: Tag = Tag::OctetString;
+}
+
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+impl EncodeValue for KeyConfirmation {
+	fn value_len(&self) -> DerResult<Length> {
+		Length::try_from(self.0.len())
+	}
+
+	fn encode_value(&self, writer: &mut impl Writer) -> DerResult<()> {
+		writer.write(&self.0)
+	}
+}
+
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+impl<'a> DecodeValue<'a> for KeyConfirmation {
+	fn decode_value<R: Reader<'a>>(reader: &mut R, header: Header) -> DerResult<Self> {
+		let octets = OctetStringRef::decode_value(reader, header)?;
+		let tag = octets.as_bytes().try_into().map_err(|_| Tag::OctetString.length_error())?;
+		Ok(Self(tag))
 	}
 }
 
@@ -299,7 +441,8 @@ impl TrafficSecret for HandshakeSecret {
 ///
 /// Epoch 0 derives from the [`HandshakeSecret`] through
 /// [`EpochMaterials::derive`], and each rotation derives the next link from
-/// the previous one through [`Self::next`]. Those two are its constructors.
+/// the previous one and a fresh agreement through [`Self::next`]. Those two
+/// are its constructors.
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 pub(crate) struct EpochSecret(ZeroizingBytes);
 
@@ -318,18 +461,59 @@ impl TrafficSecret for EpochSecret {
 	any(feature = "transport-cms", feature = "transport-ecies")
 ))]
 impl EpochSecret {
-	/// The next link of the rekey KDF chain, extracted from this one under
-	/// `salt` and the epoch label.
+	/// The next link of the rekey KDF chain: this link and a fresh agreement
+	/// between `local` and `peer`, extracted under `salt` and the epoch label.
+	///
+	/// ```text
+	/// epoch_next = HKDF(u32be(32) || epoch || u32be(32) || ee, salt, "tb/session/kdf/epoch/v1")
+	/// ```
+	///
+	/// The agreement runs here, so no later link exists without a rekey
+	/// scalar. A holder of this link who records the whole renewal derives
+	/// nothing of the next one.
+	///
+	/// - `local` is a single-use scalar, moved in. It is wiped where this
+	///   function returns, so its holder cannot keep it across a later await.
+	/// - `peer` is a [`PeerPoint`], so the point passed [`PeerEphemeral`].
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the derivation.
-	pub(crate) fn next<P>(&self, salt: KdfSalt<'_>) -> Result<Self, HandshakeError>
+	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the
+	///   derivation, or the curve's shared secret is not 32 bytes.
+	/// - [`HandshakeError::IntegerOutOfRange`] -- an input exceeds the framing prefix.
+	pub(crate) fn next<P>(
+		&self,
+		local: Box<EphemeralSecret<P::Curve>>,
+		peer: &PeerPoint<P::Curve>,
+		salt: KdfSalt<'_>,
+	) -> Result<Self, HandshakeError>
 	where
-		P: CryptoProvider,
+		P: HandshakeProvider,
 	{
-		let stage = KdfStage { input: &self.0, info: KdfInfo::new(TIGHTBEAM_EPOCH_KDF_INFO) };
-		let secret = kdf_chain::<P>(&[stage], salt)?;
+		let shared = local.shared_secret(peer.as_public_key())?;
+
+		// The scalar served its one agreement, so its box drops here and the
+		// scalar is wiped in place before the derivation runs.
+		drop(local);
+
+		self.chained::<P>(&shared, salt)
+	}
+
+	/// The chain step over the agreement output `shared`: the framed pair of
+	/// this link and `shared`, extracted under `salt` and the epoch label.
+	///
+	/// [`Self::next`] is its one caller, and it holds the formula alone, so
+	/// a known-answer test pins the formula with no scalar.
+	fn chained<P>(&self, shared: &EcdhSecret, salt: KdfSalt<'_>) -> Result<Self, HandshakeError>
+	where
+		P: HandshakeProvider,
+	{
+		let label = KdfInfo::new(TIGHTBEAM_EPOCH_KDF_INFO);
+		let secret = shared.with(|shared| {
+			let inputs: [&[u8]; 2] = [&self.0, shared];
+			multi_input_kdf::<P>(&inputs, salt, label, EPOCH_SECRET_SIZE)
+		})?;
+
 		Ok(Self(secret))
 	}
 }
@@ -405,16 +589,70 @@ impl EpochMaterials {
 	}
 }
 
+#[cfg(all(
+	feature = "transport-multiplex",
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
+impl EpochMaterials {
+	/// The pin an epoch receipt commits to:
+	/// `H(hash || request_der || server_random || server_ephemeral)`.
+	///
+	/// The pin is computable before the receipt exists, so the receipt's
+	/// `transcript_hash` commits to the exchange without circularity. It
+	/// covers both rekey ephemerals: the client's inside `request_der`, and
+	/// the server's as its last leg.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::TranscriptDigestLength`] -- `D` produces fewer than 32 bytes.
+	pub(crate) fn exchange_pin<D: Digest>(
+		&self,
+		request_der: impl AsRef<[u8]>,
+		server_random: &[u8; 32],
+		server_ephemeral: &[u8; EC_PUBKEY_COMPRESSED_SIZE],
+	) -> Result<[u8; 32], HandshakeError> {
+		let legs: [&[u8]; 4] = [&self.transcript_hash, request_der.as_ref(), server_random, server_ephemeral];
+		Transcript::digest::<D>(legs.concat())
+	}
+
+	/// The chain hash after a completed exchange:
+	/// `H(hash || request_der || response_der || ack_der)`.
+	///
+	/// Every epoch receipt therefore commits to the whole session history
+	/// back to the handshake transcript.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::TranscriptDigestLength`] -- `D` produces fewer than 32 bytes.
+	pub(crate) fn advanced<D: Digest>(
+		&self,
+		request_der: impl AsRef<[u8]>,
+		response_der: impl AsRef<[u8]>,
+		ack_der: impl AsRef<[u8]>,
+	) -> Result<[u8; 32], HandshakeError> {
+		let legs: [&[u8]; 4] = [
+			&self.transcript_hash,
+			request_der.as_ref(),
+			response_der.as_ref(),
+			ack_der.as_ref(),
+		];
+		Transcript::digest::<D>(legs.concat())
+	}
+}
+
 /// Epoch secret length in bytes: one 256-bit KDF chain link.
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 const EPOCH_SECRET_SIZE: usize = 32;
 
-/// The compressed SEC1 encoding of a handshake ephemeral public key.
+/// The compressed SEC1 encoding of an ephemeral public key.
 ///
-/// The ECIES transcript takes the point at this width, so an ephemeral of any
-/// other length fails before the signature check rather than hashing as a
-/// variable-length leg beside the SPKI.
-#[cfg(feature = "transport-ecies")]
+/// The ECIES transcript and the rekey pin take the point at this width, so an
+/// ephemeral of any other length fails before the signature check rather than
+/// hashing as a variable-length leg.
+#[cfg(any(
+	feature = "transport-ecies",
+	all(feature = "transport-cms", feature = "transport-multiplex")
+))]
 pub(crate) trait CompressedPoint {
 	/// The compressed SEC1 bytes of this point.
 	///
@@ -425,7 +663,10 @@ pub(crate) trait CompressedPoint {
 	fn compressed_point(&self) -> Result<[u8; EC_PUBKEY_COMPRESSED_SIZE], HandshakeError>;
 }
 
-#[cfg(feature = "transport-ecies")]
+#[cfg(any(
+	feature = "transport-ecies",
+	all(feature = "transport-cms", feature = "transport-multiplex")
+))]
 impl<C: HandshakeCurve> CompressedPoint for PublicKey<C> {
 	fn compressed_point(&self) -> Result<[u8; EC_PUBKEY_COMPRESSED_SIZE], HandshakeError> {
 		let point = self.to_encoded_point(true);
@@ -437,37 +678,77 @@ impl<C: HandshakeCurve> CompressedPoint for PublicKey<C> {
 	}
 }
 
+/// A peer's ephemeral point that [`PeerEphemeral`] admitted: it is on the
+/// curve, it is not the identity, and it is not the peer's static key.
+///
+/// [`PeerEphemeral::distinct_ephemeral`] is its one producer, so an agreement
+/// that takes a `PeerPoint` runs on no other point.
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+pub struct PeerPoint<C: CurveArithmetic>(PublicKey<C>);
+
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+impl<C: CurveArithmetic> PeerPoint<C> {
+	/// The admitted point, for the scalar multiplication that reads it.
+	pub(crate) fn as_public_key(&self) -> &PublicKey<C> {
+		&self.0
+	}
+}
+
 /// A peer's ephemeral public key, parsed beside the static key it must differ
 /// from.
+///
+/// The parser refuses a malformed, off-curve, or identity point, so no scalar
+/// multiplication runs on an invalid one. A point equal to the static key
+/// `self` is refused as well, because the agreement would then collapse into
+/// the static one that key recovers.
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-pub(crate) trait ServerEphemeral<C>
+pub(crate) trait PeerEphemeral<C>
 where
 	C: CurveArithmetic,
 {
-	/// Parse `sec1` as the server's ephemeral for an agreement with this
-	/// client's ephemeral.
+	/// Parse `sec1` as an ephemeral of the peer that holds the static key
+	/// `self`, or `None` when the point is that static key.
 	///
-	/// The parser refuses a malformed, off-curve, or identity point, so no
-	/// scalar multiplication runs on an invalid one. A point equal to the
-	/// static key `self` is refused as well, because the agreement would then
-	/// collapse into the static one the server's key recovers.
+	/// # Errors
+	///
+	/// - [`HandshakeError::InvalidPublicKey`] -- `sec1` is not a point on the curve.
+	fn distinct_ephemeral(&self, sec1: &[u8]) -> Result<Option<PeerPoint<C>>, HandshakeError>;
+
+	/// Parse `sec1` as the ephemeral of the server that holds the static key
+	/// `self`.
 	///
 	/// # Errors
 	///
 	/// - [`HandshakeError::InvalidPublicKey`] -- `sec1` is not a point on the curve.
 	/// - [`HandshakeError::ServerEphemeralIsStatic`] -- the point is the server's static key.
-	fn server_ephemeral(&self, sec1: &[u8]) -> Result<PublicKey<C>, HandshakeError>;
+	fn server_ephemeral(&self, sec1: &[u8]) -> Result<PeerPoint<C>, HandshakeError> {
+		let distinct = self.distinct_ephemeral(sec1)?;
+		distinct.ok_or(HandshakeError::ServerEphemeralIsStatic)
+	}
+
+	/// Parse `sec1` as the rekey ephemeral of the client that holds the
+	/// static key `self`.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::InvalidPublicKey`] -- `sec1` is not a point on the curve.
+	/// - [`HandshakeError::ClientEphemeralIsStatic`] -- the point is the client's static key.
+	#[cfg(feature = "transport-multiplex")]
+	fn client_ephemeral(&self, sec1: &[u8]) -> Result<PeerPoint<C>, HandshakeError> {
+		let distinct = self.distinct_ephemeral(sec1)?;
+		distinct.ok_or(HandshakeError::ClientEphemeralIsStatic)
+	}
 }
 
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-impl<C: HandshakeCurve> ServerEphemeral<C> for PublicKey<C> {
-	fn server_ephemeral(&self, sec1: &[u8]) -> Result<PublicKey<C>, HandshakeError> {
+impl<C: HandshakeCurve> PeerEphemeral<C> for PublicKey<C> {
+	fn distinct_ephemeral(&self, sec1: &[u8]) -> Result<Option<PeerPoint<C>>, HandshakeError> {
 		let ephemeral = PublicKey::<C>::from_sec1_bytes(sec1)?;
 		if ephemeral == *self {
-			return Err(HandshakeError::ServerEphemeralIsStatic);
+			return Ok(None);
 		}
 
-		Ok(ephemeral)
+		Ok(Some(PeerPoint(ephemeral)))
 	}
 }
 
@@ -780,6 +1061,8 @@ impl HandshakeVerifyingKey for Certificate {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	#[cfg(feature = "transport-multiplex")]
+	use crate::crypto::hash::Sha3_256;
 	use crate::crypto::profiles::{AeadProvider, DefaultCryptoProvider};
 
 	/// A base secret of `fill` bytes.
@@ -845,6 +1128,82 @@ mod tests {
 
 	/// The transcript hash a fixture acknowledgement is sealed over.
 	const ACK_TRANSCRIPT: [u8; 32] = [0x07u8; 32];
+
+	/// The chain step is HKDF-SHA3-256 over the framed pair of the epoch
+	/// secret and the agreement output, under the salt and the epoch label.
+	///
+	/// Both endpoints derive this value, so the expected one is a literal that
+	/// no code of the crate computes.
+	#[cfg(feature = "transport-multiplex")]
+	#[test]
+	fn the_epoch_chain_step_matches_its_known_answer() -> Result<(), HandshakeError> {
+		let epoch = EpochSecret(ZeroizingBytes::new(vec![0x42u8; 32]));
+		let shared = EcdhSecret::from([0x11u8; 32]);
+		let salt = [0x99u8; 64];
+
+		let next = epoch.chained::<DefaultCryptoProvider>(&shared, KdfSalt::new(&salt))?;
+		let expected = [
+			0xad, 0x8e, 0x99, 0x9c, 0x3c, 0x48, 0x89, 0xe6, 0x28, 0x89, 0xc7, 0x98, 0xf7, 0x91, 0x97, 0x07, 0xdc, 0x45,
+			0x57, 0x59, 0x77, 0xa1, 0x65, 0x31, 0x42, 0x6a, 0xbb, 0x9c, 0x21, 0x01, 0xb4, 0x34,
+		];
+		assert_eq!(next.0.as_slice(), expected);
+		Ok(())
+	}
+
+	/// The rekey pin is SHA3-256 over the chain hash, the request, the server
+	/// random, and the server ephemeral, in that order.
+	///
+	/// The server signs this value and the client recomputes it, so the
+	/// expected one is a literal that no code of the crate computes.
+	#[cfg(feature = "transport-multiplex")]
+	#[test]
+	fn the_exchange_pin_matches_its_known_answer() -> Result<(), HandshakeError> {
+		let secret = EpochSecret(ZeroizingBytes::new(vec![0x42u8; 32]));
+		let materials = EpochMaterials { secret, epoch: 0, transcript_hash: ACK_TRANSCRIPT };
+
+		let pin = materials.exchange_pin::<Sha3_256>(b"request der", &[0x21u8; 32], &[0x02u8; 33])?;
+		let expected = [
+			0x63, 0x36, 0x6b, 0x7a, 0x2d, 0xa7, 0xb4, 0x7b, 0xe9, 0xc3, 0x4c, 0xca, 0x39, 0x08, 0x11, 0x9f, 0x61, 0xc2,
+			0x58, 0x9d, 0xc7, 0x45, 0x84, 0x8b, 0x2a, 0xd8, 0x55, 0xc7, 0xa7, 0xdc, 0x83, 0xde,
+		];
+		assert_eq!(pin, expected);
+		Ok(())
+	}
+
+	/// The key-confirmation tag is HKDF-SHA3-256 of the handshake secret under
+	/// the salt, with the confirmation label followed by the transcript hash as
+	/// its info.
+	///
+	/// Both endpoints derive this tag, so the expected value is a literal that
+	/// no code of the crate computes.
+	#[test]
+	fn the_key_confirmation_matches_its_known_answer() -> Result<(), HandshakeError> {
+		let salt = [0x99u8; 32];
+		let secret = handshake_secret(0x42, 0x11, &salt);
+
+		let tag = secret.confirmation::<DefaultCryptoProvider>(KdfSalt::new(&salt), &ACK_TRANSCRIPT)?;
+		let expected = [
+			0xcf, 0x60, 0x90, 0x89, 0xce, 0xa6, 0x5d, 0xf9, 0xf3, 0xf7, 0xc7, 0x77, 0x5a, 0xdd, 0x63, 0xdf, 0x40, 0x36,
+			0x07, 0x52, 0xf6, 0x95, 0xe7, 0xb2, 0xa8, 0x66, 0x7c, 0xd0, 0xb0, 0x62, 0x40, 0xa6,
+		];
+		assert_eq!(tag.0, expected);
+		Ok(())
+	}
+
+	/// A tag verifies against itself and against no other tag.
+	#[test]
+	fn a_key_confirmation_verifies_against_itself_alone() -> Result<(), HandshakeError> {
+		let salt = [0x99u8; 32];
+		let secret = handshake_secret(0x42, 0x11, &salt);
+		let other = handshake_secret(0x42, 0x12, &salt);
+
+		let tag = secret.confirmation::<DefaultCryptoProvider>(KdfSalt::new(&salt), &ACK_TRANSCRIPT)?;
+		let same = secret.confirmation::<DefaultCryptoProvider>(KdfSalt::new(&salt), &ACK_TRANSCRIPT)?;
+		let foreign = other.confirmation::<DefaultCryptoProvider>(KdfSalt::new(&salt), &ACK_TRANSCRIPT)?;
+		assert!(tag.verify(&same).is_ok());
+		assert!(matches!(tag.verify(&foreign), Err(HandshakeError::KeyConfirmationFailed)));
+		Ok(())
+	}
 
 	/// An acknowledgement sealed under one handshake secret opens under the
 	/// same secret, salt, and transcript.

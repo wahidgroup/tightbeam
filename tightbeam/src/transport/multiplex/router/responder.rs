@@ -56,13 +56,13 @@ enum StreamWork {
 /// Kind-routed handler set for one connection's peer streams.
 ///
 /// The initiating call stamps each stream's kind on its Open record
-/// ([`MuxStreamKind`]) and the responder routes it to the matching
-/// method here. Every default answers [`TransitStatus::Unimplemented`],
-/// so a kind the service does not serve refuses its stream without
-/// touching the connection.
+/// ([`MuxStreamKind`]) and the responder routes it to the matching method here.
+/// Every default answers [`TransitStatus::Unimplemented`], so a kind outside
+/// the service refuses its own stream and the connection keeps serving.
 pub trait MuxDispatch {
 	/// Answer one unary request with its terminal response.
 	fn unary(&self, frame: Arc<Frame>) -> impl Future<Output = ResponsePackage> + MaybeSend {
+		// The default refuses the request, so the frame goes unread.
 		let _ = frame;
 		ready(ResponsePackage::new(TransitStatus::Unimplemented, None))
 	}
@@ -73,6 +73,7 @@ pub trait MuxDispatch {
 	/// handler parks the sender with end-to-end backpressure. `route` carries
 	/// the grpc-style dispatch target stamped on the Open.
 	fn streaming(&self, body: StreamBody, route: StreamRoute) -> impl Future<Output = ResponsePackage> + MaybeSend {
+		// The default refuses the stream, so the body and route go unread.
 		let _ = (body, route);
 		ready(ResponsePackage::new(TransitStatus::Unimplemented, None))
 	}
@@ -88,6 +89,7 @@ pub trait MuxDispatch {
 		reply: ReplySink,
 		route: StreamRoute,
 	) -> impl Future<Output = TransitStatus> + MaybeSend {
+		// The default refuses the stream, so body, reply, and route go unread.
 		let _ = (body, reply, route);
 		ready(TransitStatus::Unimplemented)
 	}
@@ -287,8 +289,9 @@ impl MuxResponder {
 	/// # Errors
 	///
 	/// - [`TransportError::ConnectionClosed`] -- the writer driver is gone.
-	/// - [`TransportError::OperationFailed`] with [`TransportFailure::PolicyRejection`] -- the
-	///   peer exhausted the cancel budget, and a [`GoAwayReason::EnhanceYourCalm`] was sent.
+	/// - [`TransportError::OperationFailed`] with
+	///   [`TransportFailure::PolicyRejection`] -- the peer exhausted the cancel
+	///   budget, and a [`GoAwayReason::EnhanceYourCalm`] was sent.
 	pub async fn serve_with<D>(self, dispatch: D) -> TransportResult<()>
 	where
 		D: MuxDispatch + MaybeSend + MaybeSync + 'static,
@@ -310,7 +313,7 @@ impl MuxResponder {
 	///
 	/// # Errors
 	///
-	/// The [`serve_with`](Self::serve_with) set.
+	/// - The [`serve_with`](Self::serve_with) set.
 	pub async fn serve<H, Fut>(self, handler: H) -> TransportResult<()>
 	where
 		H: Fn(Arc<Frame>) -> Fut + MaybeSend + MaybeSync + 'static,
@@ -328,7 +331,7 @@ impl MuxResponder {
 	///
 	/// # Errors
 	///
-	/// The [`serve_with`](Self::serve_with) set.
+	/// - The [`serve_with`](Self::serve_with) set.
 	pub async fn serve_streaming<H, Fut>(self, handler: H) -> TransportResult<()>
 	where
 		H: Fn(StreamBody) -> Fut + MaybeSend + MaybeSync + 'static,
@@ -357,7 +360,7 @@ impl MuxResponder {
 	///
 	/// # Errors
 	///
-	/// The [`serve_with`](Self::serve_with) set.
+	/// - The [`serve_with`](Self::serve_with) set.
 	///
 	/// [`RequestSink::push`]: crate::transport::multiplex::RequestSink::push
 	pub async fn serve_duplex<H, Fut>(self, handler: H) -> TransportResult<()>

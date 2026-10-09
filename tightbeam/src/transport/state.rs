@@ -38,10 +38,9 @@ use crate::transport::handshake::{EpochMaterials, EstablishedSession};
 
 /// Which wire mode a session is entitled to write, and the state backing it.
 ///
-/// The phase is stored instead of derived, and each arm carries what that
-/// phase needs. Session keys live in [`SessionPhase::Encrypted`], so a
-/// completed handshake without keys, or keys without a completed handshake,
-/// cannot be built.
+/// The phase is stored instead of derived, and each arm carries what that phase
+/// needs. Session keys live in [`SessionPhase::Encrypted`], so a completed
+/// handshake and its keys always exist together.
 ///
 /// # Sources
 ///
@@ -126,6 +125,114 @@ impl SessionPhase {
 			_ => None,
 		}
 	}
+
+	/// How a read in this phase is bounded, decided at `now` under `limits`.
+	///
+	/// The phase owns the instant a handshake began, so it is the one place
+	/// the handshake deadline is derived from:
+	///
+	/// - A read while a handshake is pending faces an unauthenticated peer. It
+	///   admits `handshake_wire` and must finish by the handshake deadline,
+	///   counted from the instant the first round recorded, or from `now` when
+	///   no round has started.
+	/// - Any other read admits the larger envelope ceiling and must finish
+	///   within `operation_timeout` of `now`.
+	/// - A deadline past every reading never arrives, so it is absent.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::transport::state::SessionPhase;
+	/// use tightbeam::transport::TransportLimits;
+	/// use tightbeam::utils::time::{Clock, SystemClock};
+	///
+	/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+	/// let limits = TransportLimits::default();
+	/// let now = SystemClock.monotonic();
+	///
+	/// // A read before the first handshake round faces an unauthenticated
+	/// // peer, so it takes the handshake ceiling and the handshake allowance.
+	/// let policy = SessionPhase::Provisioned.read_policy(&limits, now);
+	///
+	/// assert_eq!(policy.cap(), limits.handshake_wire);
+	/// assert_eq!(policy.remaining(now)?, Some(limits.handshake_timeout));
+	/// # Ok(())
+	/// # }
+	/// ```
+	#[must_use]
+	pub fn read_policy(&self, limits: &TransportLimits, now: MonotonicInstant) -> ReadPolicy {
+		if !self.is_handshake_pending() {
+			return ReadPolicy::established(limits.max_envelope(), limits, now);
+		}
+
+		let started = self.initiated_at().unwrap_or(now);
+		let deadline = started.checked_add(limits.handshake_timeout);
+
+		ReadPolicy { cap: limits.handshake_wire, deadline }
+	}
+}
+
+/// The bounds one read on a session runs under: the largest envelope it
+/// admits and the instant it must finish by.
+///
+/// [`SessionPhase::read_policy`] decides it for a session, and
+/// [`Self::established`] for a half split from an established one, so every
+/// reader runs under the same ceiling and the same deadline.
+#[cfg(feature = "x509")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadPolicy {
+	cap: usize,
+	deadline: Option<MonotonicInstant>,
+}
+
+#[cfg(feature = "x509")]
+impl ReadPolicy {
+	/// The bounds of a read on an established session at `now`: it admits
+	/// `cap` and must finish within `operation_timeout`.
+	///
+	/// [`SessionPhase::read_policy`] yields it for every phase that awaits no
+	/// handshake. A split read half asks for it directly, because that half
+	/// exists only once its session is established.
+	#[must_use]
+	pub fn established(cap: usize, limits: &TransportLimits, now: MonotonicInstant) -> Self {
+		let deadline = now.checked_add(limits.operation_timeout);
+		Self { cap, deadline }
+	}
+
+	/// The largest envelope the read admits, in bytes on the wire.
+	#[must_use]
+	pub const fn cap(&self) -> usize {
+		self.cap
+	}
+
+	/// The instant the read must finish by, or `None` when no deadline bounds
+	/// it.
+	#[must_use]
+	pub const fn deadline(&self) -> Option<MonotonicInstant> {
+		self.deadline
+	}
+
+	/// The budget left at `now`, or `None` when no deadline bounds the read.
+	///
+	/// A read whose deadline has passed is refused here, before any byte is
+	/// awaited, so a reader that re-arms per stage and one that arms once
+	/// both stop at the same instant.
+	///
+	/// # Errors
+	///
+	/// - [`TransportFailure::DeadlineExceeded`] -- `now` is at or past the deadline.
+	pub fn remaining(&self, now: MonotonicInstant) -> TransportResult<Option<Duration>> {
+		let Some(deadline) = self.deadline else {
+			return Ok(None);
+		};
+
+		let remaining = deadline.saturating_duration_since(now);
+		if remaining.is_zero() {
+			return Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded));
+		}
+
+		Ok(Some(remaining))
+	}
 }
 
 /// Restricts [`EncryptedProtocolState`] and [`ServerHandshakeSlot`] to this
@@ -156,9 +263,8 @@ pub(crate) enum SessionEvent {
 ///
 /// Both are private and one constructor sets them together, so the phase an
 /// endpoint starts in, and returns to on a reset, always follows from the
-/// provisioning it holds. Every move afterwards consults the transition
-/// table, so a caller cannot place a session in a phase the table does not
-/// name.
+/// provisioning it holds. Every move afterwards consults the transition table,
+/// so a session only ever sits in a phase that the table names.
 #[cfg(feature = "x509")]
 pub struct SessionState<P: CryptoProvider> {
 	encryption: EncryptionConfig<P>,
@@ -189,17 +295,18 @@ impl<P: CryptoProvider> SessionState<P> {
 		&self.phase
 	}
 
-	/// Apply `event`, reporting whether the table admitted it.
+	/// Apply `event`, handing back the phase it replaced when the table
+	/// admitted it.
 	///
-	/// It is the one writer of the phase, and it is private, so the named moves
-	/// below are the only events a caller can raise. A refused event leaves the
-	/// session where it was.
-	fn apply(&mut self, event: SessionEvent) -> bool {
+	/// - It is the one writer of the phase, and it is private, so the named moves below are the only events.
+	/// - A refused event leaves the session where it was and yields `None`.
+	/// - The replaced phase travels out whole, so a caller that detaches a session takes its keys from here.
+	fn apply(&mut self, event: SessionEvent) -> Option<SessionPhase> {
 		if !self.phase.admits(&event) {
-			return false;
+			return None;
 		}
 
-		self.phase = match event {
+		let next = match event {
 			SessionEvent::BeginHandshake(now) => {
 				let initiated_at = self.phase.initiated_at().unwrap_or(now);
 				SessionPhase::Handshaking { initiated_at }
@@ -207,8 +314,9 @@ impl<P: CryptoProvider> SessionState<P> {
 			SessionEvent::Install(session) => SessionPhase::Encrypted(session),
 			SessionEvent::Reset => SessionPhase::start_for(&self.encryption),
 		};
+		let replaced = core::mem::replace(&mut self.phase, next);
 
-		true
+		Some(replaced)
 	}
 
 	/// Record a handshake round at `now`, and report whether the phase table
@@ -219,7 +327,7 @@ impl<P: CryptoProvider> SessionState<P> {
 	/// one allowance per round.
 	#[must_use]
 	pub fn begin_handshake(&mut self, now: MonotonicInstant) -> bool {
-		self.apply(SessionEvent::BeginHandshake(now))
+		self.apply(SessionEvent::BeginHandshake(now)).is_some()
 	}
 
 	/// Install everything a completed handshake agreed, with both session
@@ -232,7 +340,7 @@ impl<P: CryptoProvider> SessionState<P> {
 	#[must_use]
 	pub fn install_session(&mut self, session: EstablishedSession, encrypted_envelope: usize) -> bool {
 		let bounded = session.with_envelope_ceiling(encrypted_envelope);
-		self.apply(SessionEvent::Install(Box::new(bounded)))
+		self.apply(SessionEvent::Install(Box::new(bounded))).is_some()
 	}
 
 	/// Drop any session and return to the phase this endpoint's provisioning
@@ -241,9 +349,10 @@ impl<P: CryptoProvider> SessionState<P> {
 	/// This is the circuit breaker. It reads the destination from the
 	/// provisioning this state holds, so no caller names it.
 	pub fn reset(&mut self) {
-		// The breaker is admitted from every phase, so its answer carries no
-		// information a caller could act on.
-		let _returned_to_start = self.apply(SessionEvent::Reset);
+		// The breaker is admitted from every phase and the session it drops
+		// is spent, so the replaced phase carries nothing a caller could act
+		// on.
+		let _dropped = self.apply(SessionEvent::Reset);
 	}
 
 	/// Detach the established session, returning this state to its start.
@@ -251,18 +360,19 @@ impl<P: CryptoProvider> SessionState<P> {
 	/// A caller that splits the endpoint into halves uses it. The halves take
 	/// the keys, and the state they leave behind holds none. Only the async
 	/// transport splits, so the method exists where that transport does.
+	///
+	/// A session that holds no keys is left where it is, so a handshake in
+	/// flight keeps the instant its deadline counts from.
 	#[cfg(any(feature = "tokio", feature = "async-transport"))]
 	pub(crate) fn take_established(&mut self) -> Option<Box<EstablishedSession>> {
 		if !self.phase.requires_encryption() {
 			return None;
 		}
 
-		let start = SessionPhase::start_for(&self.encryption);
-		let SessionPhase::Encrypted(session) = core::mem::replace(&mut self.phase, start) else {
-			return None;
-		};
-
-		Some(session)
+		match self.apply(SessionEvent::Reset) {
+			Some(SessionPhase::Encrypted(session)) => Some(session),
+			_ => None,
+		}
 	}
 
 	/// Replace the multiplexing capability this endpoint offers.
@@ -395,8 +505,8 @@ impl<P: CryptoProvider> SessionState<P> {
 
 /// A client certificate bound to the handshake key that proves it.
 ///
-/// The pair travels together, so a caller cannot hand over one without the
-/// other. Both halves are `Arc`, so passing it copies neither.
+/// The pair travels as one value, so a caller always hands over both. Both
+/// halves are `Arc`, so a clone of the pair is two refcount bumps.
 #[cfg(feature = "x509")]
 #[derive(Clone)]
 pub struct ClientIdentity<C: CryptoProvider = DefaultCryptoProvider> {
@@ -777,7 +887,8 @@ pub trait EncryptedProtocolState: sealed::Sealed {
 	/// Every ceiling this endpoint enforces.
 	fn limits(&self) -> &TransportLimits;
 
-	/// Absolute deadline applied to handshake-phase reads.
+	/// Returns the allowance for the whole handshake, which bounds
+	/// handshake-phase reads.
 	fn to_handshake_timeout(&self) -> Duration {
 		self.limits().handshake_timeout
 	}
@@ -910,8 +1021,9 @@ mod tests {
 		));
 	}
 
-	/// A provisioned session that is reset from any phase writes nothing in
-	/// the clear, including a reset that a public reset flag triggers.
+	/// A provisioned session that is reset from any phase writes nothing in the
+	/// clear, including a reset that a caller triggers through the public
+	/// `reset` method.
 	#[test]
 	fn a_reset_provisioned_session_refuses_a_cleartext_write() -> TransportResult<()> {
 		let mut state = SessionState::new(DialableEncryption::new(provisioned_encryption())?);
@@ -934,7 +1046,7 @@ mod tests {
 	crate::tb_cases! {
 		fn the_phase_table((phase, event, admitted, landing): (&str, &str, bool, &str)) {
 			let mut state = SessionState::at(provisioned_encryption(), phase_named(phase));
-			assert_eq!(state.apply(event_named(event)), admitted, "{phase} on {event}");
+			assert_eq!(state.apply(event_named(event)).is_some(), admitted, "{phase} on {event}");
 			assert_eq!(
 				core::mem::discriminant(state.phase()),
 				core::mem::discriminant(&phase_named(landing)),
@@ -988,6 +1100,119 @@ mod tests {
 		clock.advance(Duration::from_secs(5));
 
 		assert!(state.begin_handshake(clock.monotonic()));
+		assert_eq!(state.phase().initiated_at(), Some(started));
+	}
+
+	/// A handshake read admits the handshake ceiling and counts its deadline
+	/// from the instant the first round recorded, so a later reading is left
+	/// the remainder and not a fresh allowance.
+	#[test]
+	fn a_handshake_read_counts_from_the_first_round() -> TransportResult<()> {
+		let clock = ManualClock::default();
+		let started = clock.monotonic();
+		let limits = TransportLimits { handshake_timeout: Duration::from_secs(10), ..TransportLimits::default() };
+		let phase = SessionPhase::Handshaking { initiated_at: started };
+
+		clock.advance(Duration::from_secs(4));
+
+		let policy = phase.read_policy(&limits, clock.monotonic());
+		let remaining = policy.remaining(clock.monotonic())?;
+		assert_eq!(policy.cap(), limits.handshake_wire);
+		assert_eq!(remaining, Some(Duration::from_secs(6)));
+		Ok(())
+	}
+
+	/// A handshake read at or past its deadline is refused before any byte is
+	/// awaited.
+	#[test]
+	fn a_handshake_read_past_its_deadline_is_refused() {
+		let clock = ManualClock::default();
+		let started = clock.monotonic();
+		let limits = TransportLimits { handshake_timeout: Duration::from_secs(10), ..TransportLimits::default() };
+		let phase = SessionPhase::Handshaking { initiated_at: started };
+
+		clock.advance(Duration::from_secs(10));
+
+		let policy = phase.read_policy(&limits, clock.monotonic());
+		let refused = policy.remaining(clock.monotonic());
+		assert!(matches!(
+			refused,
+			Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded))
+		));
+	}
+
+	/// A read before the first handshake round faces an unauthenticated peer
+	/// too, so it takes the handshake ceiling and the full allowance from now.
+	#[test]
+	fn a_provisioned_read_gets_the_full_handshake_allowance() -> TransportResult<()> {
+		let clock = ManualClock::default();
+		let limits = TransportLimits { handshake_timeout: Duration::from_secs(10), ..TransportLimits::default() };
+
+		let policy = SessionPhase::Provisioned.read_policy(&limits, clock.monotonic());
+		let remaining = policy.remaining(clock.monotonic())?;
+
+		assert_eq!(policy.cap(), limits.handshake_wire);
+		assert_eq!(remaining, Some(Duration::from_secs(10)));
+		Ok(())
+	}
+
+	/// A read outside the handshake admits the larger envelope ceiling and runs
+	/// under the operation timeout.
+	#[test]
+	fn a_cleartext_read_admits_the_envelope_ceiling_under_the_operation_timeout() -> TransportResult<()> {
+		let clock = ManualClock::default();
+		let limits = TransportLimits { operation_timeout: Duration::from_secs(3), ..TransportLimits::default() };
+
+		let policy = SessionPhase::Cleartext.read_policy(&limits, clock.monotonic());
+		let remaining = policy.remaining(clock.monotonic())?;
+		assert_eq!(policy.cap(), limits.max_envelope());
+		assert_eq!(remaining, Some(Duration::from_secs(3)));
+		Ok(())
+	}
+
+	/// An admitted event hands back the phase it replaced, whole, so the
+	/// instant a handshake recorded leaves through the table and not through
+	/// a second writer of the phase.
+	#[test]
+	fn an_admitted_event_hands_back_the_phase_it_replaced() {
+		let clock = ManualClock::default();
+		let started = clock.monotonic();
+		let mut state = SessionState::at(provisioned_encryption(), SessionPhase::Handshaking { initiated_at: started });
+
+		let replaced = state.apply(SessionEvent::Reset);
+		assert!(matches!(replaced, Some(SessionPhase::Handshaking { initiated_at }) if initiated_at == started));
+		assert!(matches!(state.phase(), SessionPhase::Provisioned));
+	}
+
+	/// Detaching the established session returns its keys and leaves the
+	/// state at its start, through the same table every other move takes.
+	#[cfg(all(
+		feature = "testing",
+		feature = "secp256k1",
+		any(feature = "tokio", feature = "async-transport")
+	))]
+	#[test]
+	fn detaching_a_session_takes_its_keys_and_returns_to_the_start() -> TransportResult<()> {
+		let mut probe = PhaseProbe::provisioned(handshaking());
+		probe.install_established(established_session())?;
+
+		let detached = probe.session_state_mut().take_established();
+		assert!(detached.is_some_and(|session| session.peer().is_some()));
+		assert!(matches!(probe.session_state().phase(), SessionPhase::Provisioned));
+		Ok(())
+	}
+
+	/// A handshake in flight holds no keys, so detaching leaves it where it is
+	/// and the deadline keeps counting from the instant it recorded.
+	#[cfg(any(feature = "tokio", feature = "async-transport"))]
+	#[test]
+	fn detaching_a_pending_handshake_leaves_its_deadline_in_place() {
+		let clock = ManualClock::default();
+		let started = clock.monotonic();
+		let mut state = SessionState::at(provisioned_encryption(), SessionPhase::Handshaking { initiated_at: started });
+
+		let detached = state.take_established();
+		assert!(detached.is_none());
 		assert_eq!(state.phase().initiated_at(), Some(started));
 	}
 

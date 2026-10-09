@@ -13,9 +13,9 @@ fn main() {
 	// build graph has one definition instead of hand-copied clause lists
 	// that can drift independently.
 	cfg_aliases! {
-		// Pooled multiplexing: the mux engine, the serve module's
-		// connector, an encryption handshake, and a tokio executor for
-		// the driver tasks.
+		// Pooled multiplexing needs the mux engine, the service module's
+		// connector, an encryption handshake, and a tokio executor for the
+		// driver tasks.
 		pooled_mux: {
 			all(
 				feature = "x509",

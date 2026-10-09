@@ -162,10 +162,10 @@ impl Members {
 ///
 /// # Lock order
 ///
-/// This registry takes its one lock inside each method and never yields a
-/// guard or calls a caller-supplied closure while holding it, so no method
-/// here can be part of a nested acquisition. The membership view relies on
-/// that to touch this registry and [`ServletRegistry`] in sequence.
+/// Each method takes this registry's one lock, runs registry code alone under
+/// the guard, and releases the guard before it returns. A call here is
+/// therefore the innermost acquisition of its caller. The membership view
+/// relies on that to touch this registry and [`ServletRegistry`] in sequence.
 ///
 /// # Poisoned lock
 ///
@@ -484,11 +484,17 @@ impl<'a> ColonyMembership<'a> {
 
 #[cfg(test)]
 mod tests {
+	use core::str::from_utf8;
+
 	use super::*;
 	use crate::colony::cluster::servlet_registry::PheromoneConfig;
+	use crate::colony::cluster::{CertificateSpec, ClusterConfig, ClusterTlsConfig};
 	use crate::colony::common::ColonyNamespace;
 	use crate::colony::hive::ServletInfo;
+	use crate::crypto::key::Secp256k1KeyProvider;
+	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 	use crate::tb_cases;
+	use crate::testing::{TestCertificate, TestKey};
 	use crate::utils::time::ManualClock;
 
 	/// A clock that moves only when the test advances it.
@@ -507,8 +513,24 @@ mod tests {
 		Arc::from(b"test-signer".as_slice())
 	}
 
+	/// A config on the default namespace and scoring, which the fixtures
+	/// build their slates through.
+	fn test_config() -> ClusterConfig {
+		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
+		let tls = ClusterTlsConfig::new(
+			CertificateSpec::Built(Box::new(TestCertificate::self_signed(&key))),
+			Arc::new(Secp256k1KeyProvider::from(key)),
+		)
+		.expect("the test certificate must decode");
+
+		ClusterConfig::new(tls)
+	}
+
+	/// A registration of `servlets` at `addr`, each locator naming that same
+	/// address, as a hive advertises its own instances.
 	fn request(addr: impl AsRef<[u8]>, servlets: &[&str]) -> RegisterHiveRequest {
 		let addr = addr.as_ref();
+		let locator = from_utf8(addr).expect("fixture addresses are UTF-8");
 		let namespace = ColonyNamespace::default();
 		RegisterHiveRequest {
 			hive_addr: addr.to_vec(),
@@ -516,7 +538,10 @@ mod tests {
 			servlet_addresses: servlets
 				.iter()
 				.map(|s| ServletInfo {
-					servlet_id: namespace.servlet(s).expect("test names satisfy the mint grammar"),
+					servlet_id: namespace
+						.servlet(s)
+						.and_then(|servlet_type| servlet_type.servlet_instance(locator))
+						.expect("test names satisfy the mint grammar"),
 					address: addr.to_vec(),
 				})
 				.collect(),
@@ -526,7 +551,9 @@ mod tests {
 	/// One local route for `hive_addr`, the shape a registration installs.
 	fn slate(hive_addr: &SharedId, servlet: &str) -> HiveSlate {
 		let servlets = request(hive_addr, &[servlet]).servlet_addresses;
-		PheromoneConfig::default().servlet_slate(&servlets, hive_addr)
+		test_config()
+			.servlet_slate(&servlets, hive_addr)
+			.expect("fixture locators name their own address")
 	}
 
 	/// The pair of registries one gateway serves, with the admission lock
@@ -642,11 +669,10 @@ mod tests {
 		let two = Arc::clone(&registry);
 		let two_signer = Arc::clone(second);
 		let right = std::thread::spawn(move || two.register(request(contested, &["echo"]), two_signer));
-
 		let outcomes = [left.join().expect("thread joins"), right.join().expect("thread joins")];
+
 		let accepted = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
 		let bound = registry.signer_for(contested).expect("the registry lock is live");
-
 		RaceOutcome { accepted, bound }
 	}
 
@@ -671,9 +697,7 @@ mod tests {
 	#[test]
 	fn concurrent_registration_binds_one_signer() {
 		let rounds = 2_000;
-
 		let clean = races_binding_one_signer(rounds);
-
 		assert_eq!(clean, rounds);
 	}
 
@@ -723,11 +747,11 @@ mod tests {
 		let hive_addr: SharedId = Arc::from(b"hive-a".as_slice());
 
 		poison_routes(&colony.servlets);
+
 		let refused =
 			colony
 				.membership()
 				.admit(request(b"hive-a", &["echo"]), test_signer(), slate(&hive_addr, "echo"));
-
 		assert!(refused.is_err());
 		assert_eq!(colony.hives.len()?, 0);
 		Ok(())

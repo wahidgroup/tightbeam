@@ -109,6 +109,19 @@ pub enum KeyError {
 	#[error("Nonce length mismatch: {0}")]
 	NonceLengthError(crate::error::ReceivedExpectedError<usize, usize>),
 
+	/// The key material offered to AES key wrap is shorter than the wrap's
+	/// minimum or not a whole number of 64-bit blocks (RFC 3394 § 2).
+	#[cfg(all(feature = "aead", feature = "transport"))]
+	#[error("Key wrap length mismatch: {0}")]
+	WrapLength(crate::error::ReceivedExpectedError<usize, usize>),
+
+	/// An AES key wrap or unwrap failed. On unwrap this is the integrity check
+	/// of RFC 3394 § 2.2.2, so the wrapped key or the KEK is not the one that
+	/// produced it.
+	#[cfg(all(feature = "aead", feature = "transport"))]
+	#[error("AES key wrap operation failed: {0}")]
+	WrapFailed(crate::crypto::aead::aes_kw::Error),
+
 	/// The signing key material has the wrong length for the curve.
 	#[cfg(feature = "signature")]
 	#[error("Signing key length mismatch: {0}")]

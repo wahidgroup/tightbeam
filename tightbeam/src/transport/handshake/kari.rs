@@ -6,7 +6,7 @@
 //!
 //! # Security properties
 //!
-//! - One derivation path, audited in one place.
+//! - Every caller derives through one path, so one audit covers the derivation.
 //! - The KEK is zeroized after use when the `zeroize` feature is on.
 //! - A recipient confirms each unwrapped CEK by re-wrapping it and comparing
 //!   the result with the original wrapped bytes in constant time
@@ -19,6 +19,7 @@ use core::fmt;
 
 use crate::cms::enveloped_data::OriginatorPublicKey;
 use crate::crypto::kdf::KdfFunction;
+use crate::crypto::key::KeyError;
 use crate::crypto::profiles::{CryptoProvider, SecurityProfile};
 use crate::crypto::secret::{Secret, SecretSlice};
 use crate::crypto::subtle::ConstantTimeEq;
@@ -209,9 +210,9 @@ impl<'a> Kek<'a> {
 
 		let valid: bool = rewrapped.as_slice().ct_eq(wrapped).into();
 		if !valid {
-			return Err(HandshakeError::AesKeyWrap(
+			return Err(HandshakeError::KeyError(KeyError::WrapFailed(
 				crate::crypto::aead::aes_kw::Error::IntegrityCheckFailed,
-			));
+			)));
 		}
 
 		Ok(cek)
@@ -301,7 +302,6 @@ mod tests {
 		let sender_kek = sender_secret.derive_kek::<DefaultCryptoProvider>(ukm_salt, label)?;
 		let wrapped = Kek::new(sender_kek.as_slice()).wrap(&provider, cek)?;
 
-		// An unwrap with the wrong recipient key fails.
 		let wrong_secret = wrong_recipient.shared_secret(&sender_pub)?;
 		let wrong_kek = wrong_secret.derive_kek::<DefaultCryptoProvider>(ukm_salt, label)?;
 		let bad = Kek::new(wrong_kek.as_slice()).unwrap_verified(&provider, &wrapped);
@@ -321,9 +321,41 @@ mod tests {
 		let tampered = Kek::new(&kek).unwrap_verified(&provider, &wrapped);
 		assert!(matches!(
 			tampered,
-			Err(HandshakeError::AesKeyWrap(aes_kw::Error::IntegrityCheckFailed))
+			Err(HandshakeError::KeyError(KeyError::WrapFailed(
+				aes_kw::Error::IntegrityCheckFailed
+			)))
 		));
 		Ok(())
+	}
+
+	/// A content key shorter than the wrap's minimum is refused as a length
+	/// failure of the wrap itself, before any cipher runs.
+	#[test]
+	fn a_short_content_key_reports_the_wrap_length() {
+		let provider = DefaultCryptoProvider::default();
+		let kek = [0x11u8; 32];
+		let short_cek = [0x42u8; 8];
+
+		let refused = Kek::new(&kek).wrap(&provider, short_cek);
+		assert!(matches!(
+			refused,
+			Err(HandshakeError::KeyError(KeyError::WrapLength(ref lengths))) if lengths.received == 8 && lengths.expected == 16
+		));
+	}
+
+	/// Wrapped bytes shorter than the unwrap's minimum are refused as a length
+	/// failure of the wrap itself, before any cipher runs.
+	#[test]
+	fn a_short_wrapped_key_reports_the_wrap_length() {
+		let provider = DefaultCryptoProvider::default();
+		let kek = [0x11u8; 32];
+		let short_wrapped = [0x42u8; 16];
+
+		let refused = Kek::new(&kek).unwrap_verified(&provider, short_wrapped);
+		assert!(matches!(
+			refused,
+			Err(HandshakeError::KeyError(KeyError::WrapLength(ref lengths))) if lengths.received == 16 && lengths.expected == 24
+		));
 	}
 
 	#[test]

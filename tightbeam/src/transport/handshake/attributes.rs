@@ -27,11 +27,13 @@ use crate::oids::CLIENT_CERTIFICATE;
 use crate::oids::HANDSHAKE_ABORT_ALERT;
 #[cfg(feature = "transport-cms")]
 use crate::oids::{
-	HANDSHAKE_SECURITY_ACCEPT, HANDSHAKE_SECURITY_OFFER, HANDSHAKE_SERVER_EPHEMERAL, HANDSHAKE_TRANSPORT_ACCEPT,
-	HANDSHAKE_TRANSPORT_OFFER, RECEIPT_ACK, SESSION_RECEIPT,
+	HANDSHAKE_KEY_CONFIRMATION, HANDSHAKE_SECURITY_ACCEPT, HANDSHAKE_SECURITY_OFFER, HANDSHAKE_SERVER_EPHEMERAL,
+	HANDSHAKE_TRANSPORT_ACCEPT, HANDSHAKE_TRANSPORT_OFFER, RECEIPT_ACK, SESSION_RECEIPT,
 };
 #[cfg(feature = "transport-cms")]
 use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer, TransportAccept, TransportOffer};
+#[cfg(feature = "transport-cms")]
+use crate::transport::handshake::schedule::KeyConfirmation;
 #[cfg(feature = "x509")]
 use crate::x509::Certificate;
 
@@ -153,6 +155,8 @@ impl AttributePayload for TransportAccept {
 	const OID: ObjectIdentifier = HANDSHAKE_TRANSPORT_ACCEPT;
 }
 
+/// The session receipt a server Finished carries, as a server-signed artifact
+/// that a third party can verify.
 #[cfg(feature = "transport-cms")]
 impl AttributePayload for SignedData {
 	const OID: ObjectIdentifier = SESSION_RECEIPT;
@@ -169,6 +173,12 @@ impl AttributePayload for OctetString {
 #[cfg(feature = "transport-cms")]
 impl AttributePayload for OriginatorPublicKey {
 	const OID: ObjectIdentifier = HANDSHAKE_SERVER_EPHEMERAL;
+}
+
+/// The key-confirmation tag a client Finished carries.
+#[cfg(feature = "transport-cms")]
+impl AttributePayload for KeyConfirmation {
+	const OID: ObjectIdentifier = HANDSHAKE_KEY_CONFIRMATION;
 }
 
 #[cfg(feature = "x509")]
@@ -227,8 +237,8 @@ impl HandshakeAttribute {
 	/// Returns the canonical DER bytes of `payload` for transcript binding.
 	///
 	/// The sender calls this and the receiver calls [`Self::received_bytes`].
-	/// These are the bytes about to go on the wire, so both sides hash the
-	/// same encoding and a tampered attribute diverges the two transcript
+	/// These are the bytes the sender is about to transmit, so both sides hash
+	/// the same encoding and a tampered attribute diverges the two transcript
 	/// hashes (CWE-345).
 	///
 	/// # Errors

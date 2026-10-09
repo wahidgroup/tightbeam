@@ -38,7 +38,7 @@ use crate::transport::handshake::peer::{LearnedTrust, PossessionProof};
 use crate::transport::handshake::primitives::transcript::{EciesHandshakeLegs, Transcript};
 use crate::transport::handshake::primitives::KdfSalt;
 use crate::transport::handshake::schedule::{
-	Agreement, BaseSecret, CompressedPoint, HandshakeVerifyingKey, Salt, Terms,
+	Agreement, BaseSecret, CompressedPoint, HandshakeVerifyingKey, KeyConfirmation, PeerPoint, Salt, Terms,
 };
 use crate::transport::handshake::wire::HandshakeOctets;
 use crate::transport::handshake::{
@@ -186,6 +186,7 @@ impl<P: HandshakeProvider> ClientFlow<P> for Ecies {
 			server_ephemeral: &server_ephemeral.to_byte_array::<EC_PUBKEY_COMPRESSED_SIZE>()?,
 			spki: certificate.verifying_key_bytes(),
 			security_accept_der: security_accept.as_ref().map(WireDer::der).unwrap_or_default(),
+			client_cert_required,
 			transport_accept_der: transport_accept.as_ref().map(WireDer::der).unwrap_or_default(),
 		};
 		let mut transcript = Transcript::ecies_handshake(legs);
@@ -222,17 +223,17 @@ impl<P: HandshakeProvider> ClientFlow<P> for Ecies {
 
 	fn agree(
 		_pending: (),
-		server_ephemeral: &PublicKey<P::Curve>,
+		server_ephemeral: &PeerPoint<P::Curve>,
 		salt: KdfSalt<'_>,
 		rng: &mut dyn CryptoRngCore,
 	) -> Result<(HandshakeSecret, Self::Agreed), HandshakeError> {
 		let base = BaseSecret::random(Some(&mut *rng))?;
 		let ephemeral = SecretKey::<P::Curve>::random(&mut RngWrapper(rng));
-		let agreement = Agreement::<P>::new(&base, server_ephemeral);
+		let agreement = Agreement::<P>::new(&base, server_ephemeral.as_public_key());
 		let secret = agreement.settle(&ephemeral, salt)?;
 
-		// The two secrets cross the countersignature await in the orchestrator.
-		// They are boxed, so that move copies a pointer.
+		// The two secrets are boxed, so the move into the closing copies a
+		// pointer and each is wiped where the box drops.
 		Ok((secret, Box::new(EciesAgreed { base, ephemeral })))
 	}
 
@@ -244,13 +245,14 @@ impl<P: HandshakeProvider> ClientFlow<P> for Ecies {
 	) -> Result<ClosingBinding<'a, Self, P>, HandshakeError> {
 		// The secrets are read in place, so each is wiped where the box drops.
 		let EciesAgreed { base, ephemeral } = agreed.as_ref();
-		let ClosingParts { server, transcript_hash, sealed_ack } = parts;
+		let ClosingParts { server, transcript_hash, sealed_ack, confirmation } = parts;
 
 		// 1. Encode the payload. The DER buffer holds the base secret, so it
 		//    wipes when dropped, along with the transient OCTET STRING copy.
 		let payload = EciesSessionPayload {
 			base_key: OctetString::new(base.as_bytes())?,
 			client_random: OctetString::new(reply.client_random.as_slice())?,
+			key_confirmation: confirmation,
 			receipt_ack: sealed_ack.map(OctetString::new).transpose()?,
 		};
 		let plaintext = Zeroizing::new(payload.to_der()?);
@@ -380,6 +382,8 @@ struct SessionPayload {
 	base: BaseSecret,
 	/// The client random the payload echoes against replay.
 	client_random: [u8; 32],
+	/// The key-confirmation tag of the client.
+	confirmation: KeyConfirmation,
 	/// The client receipt `SignerInfo`, sealed under the handshake secret.
 	/// Its signed attributes bind the bearer settlement answer, so it opens
 	/// only after the ephemeral-ephemeral agreement.
@@ -388,18 +392,19 @@ struct SessionPayload {
 
 impl SessionPayload {
 	/// Parse the decrypted DER [`EciesSessionPayload`], and enforce the fixed
-	/// 32-byte geometry of the base secret.
+	/// 32-byte geometry of the base secret. A payload with no key-confirmation
+	/// tag, or with one of another width, fails to decode.
 	fn parse(decrypted: &[u8]) -> Result<Self, HandshakeError> {
 		let payload = EciesSessionPayload::from_der(decrypted);
 		let payload = payload.map_err(|_| HandshakeError::InvalidDecryptedPayloadSize)?;
-		let EciesSessionPayload { base_key, client_random, receipt_ack } = payload;
+		let EciesSessionPayload { base_key, client_random, key_confirmation, receipt_ack } = payload;
 
 		// The decoded buffer moves into its wiping wrapper without a copy, and
 		// the parse copies it into the fixed-width secret, so no plain array of
 		// key material exists on the way (CWE-226).
 		let base = BaseSecret::try_from(SecretSlice::from(base_key.into_bytes()))?;
 		let client_random = client_random.to_32_byte_array()?;
-		Ok(Self { base, client_random, receipt_ack })
+		Ok(Self { base, client_random, confirmation: key_confirmation, receipt_ack })
 	}
 }
 
@@ -457,6 +462,7 @@ impl<P: HandshakeProvider> ServerFlow<P> for Ecies {
 			server_ephemeral: &server_ephemeral,
 			spki: settings.certificate.verifying_key_bytes(),
 			security_accept_der: security_accept.der(),
+			client_cert_required,
 			transport_accept_der: transport_accept.as_ref().map(WireDer::der).unwrap_or_default(),
 		};
 
@@ -558,15 +564,14 @@ impl<P: HandshakeProvider> ServerFlow<P> for Ecies {
 			let EciesClosing { message, aad } = closing;
 
 			// 1. Open the payload under the associated data. The key provider
-			//    runs the static ECDH step, so the private key can stay behind
-			//    an external boundary, and the AEAD open authenticates the
+			//    runs the static ECDH step, and the AEAD open authenticates the
 			//    client ephemeral through the content key.
 			let agreed = key.key_agreement(message.ephemeral_pubkey()).await?;
 			let shared_secret = EcdhSecret::try_from(agreed)?;
 			let open = decrypt_with_shared_secret::<P::EciesMessage, P::Kdf, P::AeadCipher>;
 			let plaintext = open(&message, shared_secret, Some(aad.as_slice()))?;
 			let payload = plaintext.with(|payload| SessionPayload::parse(payload))?;
-			let SessionPayload { base, client_random: echoed, receipt_ack } = payload;
+			let SessionPayload { base, client_random: echoed, confirmation, receipt_ack } = payload;
 
 			// 2. Verify that the payload echoes the client random of the hello, which prevents replay.
 			let is_echo: bool = echoed.ct_eq(&client_random).into();
@@ -582,7 +587,7 @@ impl<P: HandshakeProvider> ServerFlow<P> for Ecies {
 			let secret = agreement.settle(ephemeral.as_ref(), terms.kdf_salt())?;
 
 			let receipt_ack = receipt_ack.map(OctetString::into_bytes);
-			Ok(ClosingOpened { secret, receipt_ack })
+			Ok(ClosingOpened { secret, receipt_ack, confirmation })
 		})
 	}
 }
@@ -593,10 +598,10 @@ mod tests {
 
 	use super::*;
 	use crate::cms::content_info::CmsVersion;
-	use crate::cms::signed_data::{SignerInfo, SignerInfos};
+	use crate::cms::signed_data::{SignerIdentifier, SignerInfo, SignerInfos};
 	use crate::crypto::aead::Aes256Gcm;
 	use crate::crypto::ecies::EciesError::DecryptionFailed;
-	use crate::crypto::ecies::{encrypt, Secp256k1EciesMessage};
+	use crate::crypto::ecies::Secp256k1EciesMessage;
 	use crate::crypto::hash::Sha3_256;
 	use crate::crypto::kdf::HkdfSha3_256;
 	use crate::crypto::profiles::SecurityProfileDesc;
@@ -604,10 +609,10 @@ mod tests {
 	use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1VerifyingKey};
 	use crate::crypto::sign::PrehashSigner;
 	use crate::crypto::x509::policy::ExpiryValidator;
-	use crate::crypto::x509::utils::compute_signer_identifier;
-	use crate::der::Any;
+	use crate::crypto::x509::utils::Skid;
+	use crate::der::{Any, Sequence};
 	use crate::oids::{HANDSHAKE_ABORT_ALERT, HASH_SHA3_256, HASH_SHA3_384, SIGNER_ECDSA_WITH_SHA3_256};
-	use crate::spki::AlgorithmIdentifierOwned;
+	use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey};
 	use crate::transport::handshake::attributes::HandshakeAttribute;
 	use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer, TransportOffer};
 	use crate::transport::handshake::schedule::CompressedPoint;
@@ -662,6 +667,7 @@ mod tests {
 			server_ephemeral,
 			spki: server.certificate.verifying_key_bytes(),
 			security_accept_der: accept_der,
+			client_cert_required: false,
 			transport_accept_der: &[],
 		};
 
@@ -702,7 +708,8 @@ mod tests {
 		let alert = Attribute::try_from(alert).expect("the alert encodes");
 
 		let signer = create_test_certificate();
-		let sid = compute_signer_identifier(signer.signing_key.verifying_key()).expect("a key has an identifier");
+		let signer_der = signer.signing_key.verifying_key().to_public_key_der().expect("a key encodes");
+		let sid = SignerIdentifier::try_from(Skid::of_public_key(signer_der)).expect("a key has an identifier");
 		let aborting = SignerInfo {
 			version: CmsVersion::V1,
 			sid,
@@ -722,11 +729,12 @@ mod tests {
 	const CLIENT_RANDOM: [u8; 32] = [7u8; 32];
 
 	/// A server that holds `identity` under `peer_authentication` and has
-	/// replied to a hand-built hello that carries [`CLIENT_RANDOM`].
+	/// replied to a hand-built hello that carries [`CLIENT_RANDOM`], with what
+	/// a key exchange for it confirms.
 	async fn server_after_hello(
 		identity: &TestCertificate,
 		peer_authentication: PeerAuthentication,
-	) -> TestServer<Ecies> {
+	) -> (TestServer<Ecies>, Confirming) {
 		let mut config = Ecies::server(identity);
 		config.peer_authentication = peer_authentication;
 
@@ -735,42 +743,80 @@ mod tests {
 		let hello = ClientHello::from_der(&hello_der).expect("the hello decodes");
 		let opening = tunneled_opening(&hello);
 
-		server.reply(opening).await.expect("the server admits the hello");
-		server
+		let reply = server.reply(opening).await.expect("the server admits the hello");
+		let reply = tunneled_handshake(&reply);
+		let server_ephemeral = PublicKey::<Secp256k1>::from_sec1_bytes(reply.server_ephemeral.as_bytes());
+		let confirming = Confirming {
+			server_ephemeral: server_ephemeral.expect("the reply carries a point on the curve"),
+			salt: [CLIENT_RANDOM.as_slice(), reply.server_random.as_bytes()].concat(),
+			transcript_hash: server.transcript_hash().expect("the reply sealed the transcript"),
+		};
+		(server, confirming)
 	}
 
 	/// The DER of an `EciesSessionPayload` that carries `base_key`,
-	/// `client_random`, and `receipt_ack` at the widths they come in.
+	/// `client_random`, and `receipt_ack` at the widths they come in, beside
+	/// `confirmation`.
 	fn session_payload_der(
 		base_key: impl AsRef<[u8]>,
 		client_random: impl AsRef<[u8]>,
+		confirmation: &KeyConfirmation,
 		receipt_ack: Option<&[u8]>,
 	) -> Vec<u8> {
 		let octets = |bytes: &[u8]| OctetString::new(bytes).expect("bytes are an OCTET STRING");
 		let payload = EciesSessionPayload {
 			base_key: octets(base_key.as_ref()),
 			client_random: octets(client_random.as_ref()),
+			key_confirmation: confirmation.to_owned(),
 			receipt_ack: receipt_ack.map(octets),
 		};
 		payload.to_der().expect("the payload encodes")
 	}
 
+	/// The payload as an encoder with no rule for the key-confirmation tag
+	/// writes it: the tag is absent, or it has any width.
+	#[derive(Sequence)]
+	struct LoosePayload {
+		base_key: OctetString,
+		client_random: OctetString,
+		#[asn1(optional = "true")]
+		key_confirmation: Option<OctetString>,
+	}
+
+	/// The DER of a payload that carries a well-formed base secret and client
+	/// random beside `key_confirmation`.
+	fn loose_payload_der(key_confirmation: Option<&[u8]>) -> Vec<u8> {
+		let octets = |bytes: &[u8]| OctetString::new(bytes).expect("bytes are an OCTET STRING");
+		let payload = LoosePayload {
+			base_key: octets(&[3u8; 32]),
+			client_random: octets(&[5u8; 32]),
+			key_confirmation: key_confirmation.map(octets),
+		};
+		payload.to_der().expect("the payload encodes")
+	}
+
 	/// The bytes of an ECIES message that seals a payload to the static key of
-	/// `server` under the associated data `aad`. The payload carries a fresh
-	/// base secret, `client_random`, and `receipt_ack`.
+	/// `server` under the associated data `aad`, as an honest client builds it.
+	///
+	/// The payload carries a fresh base secret, `client_random`, and
+	/// `receipt_ack`. Its key-confirmation tag is the one `confirming` yields
+	/// for that base secret and the ephemeral the message leads with.
 	fn sealed_payload(
 		server: &TestCertificate,
+		confirming: &Confirming,
 		client_random: &[u8; 32],
 		receipt_ack: Option<&[u8]>,
 		aad: impl AsRef<[u8]>,
 	) -> Vec<u8> {
 		let static_key = PublicKey::<Secp256k1>::from_sec1_bytes(server.certificate.verifying_key_bytes());
 		let static_key = static_key.expect("the test certificate carries a point on the curve");
-		let base_secret = generate_nonce::<32>(None).expect("the random source draws a base secret");
-		let plaintext = session_payload_der(base_secret, client_random, receipt_ack);
+		let base = BaseSecret::random(None).expect("the random source draws a base secret");
+		let ephemeral = SecretKey::<Secp256k1>::random(&mut OsRng);
+		let confirmation = confirming.tag(&base, &ephemeral);
+		let plaintext = session_payload_der(base.as_bytes(), client_random, &confirmation, receipt_ack);
 
-		let seal = encrypt::<_, _, _, Secp256k1EciesMessage, HkdfSha3_256, Aes256Gcm>;
-		let sealed = seal(&static_key, plaintext, Some(aad.as_ref()), Some(&mut OsRng));
+		let seal = SecretKey::<Secp256k1>::encrypt_to::<Secp256k1EciesMessage, HkdfSha3_256, Aes256Gcm>;
+		let sealed = seal(&ephemeral, &static_key, plaintext.as_slice(), Some(aad.as_ref()), &mut OsRng);
 		sealed.expect("the payload seals").to_bytes()
 	}
 
@@ -782,16 +828,17 @@ mod tests {
 	}
 
 	/// A hand-built `ClientKeyExchange` that offers no identity, for the
-	/// server that holds `server`.
+	/// server that holds `server` and sent what `confirming` holds.
 	///
 	/// The payload echoes `client_random` and carries `receipt_ack`, and it is
 	/// sealed under [`TIGHTBEAM_AAD_DOMAIN_TAG`] alone.
 	fn build_test_client_key_exchange(
 		server: &TestCertificate,
+		confirming: &Confirming,
 		client_random: &[u8; 32],
 		receipt_ack: Option<&[u8]>,
 	) -> ClientKeyExchange {
-		let sealed = sealed_payload(server, client_random, receipt_ack, TIGHTBEAM_AAD_DOMAIN_TAG);
+		let sealed = sealed_payload(server, confirming, client_random, receipt_ack, TIGHTBEAM_AAD_DOMAIN_TAG);
 		anonymous_key_exchange(sealed)
 	}
 
@@ -815,21 +862,21 @@ mod tests {
 	}
 
 	/// A hand-built `ClientKeyExchange` that offers the identity of `client`,
-	/// for the server that holds `server` and sealed `transcript_hash`.
+	/// for the server that holds `server` and sent what `confirming` holds.
 	///
 	/// The payload echoes `client_random`, it is sealed under the associated
 	/// data that binds the certificate of `client`, and `client` signs the
 	/// [`possession_digest`] of the sealed payload.
 	fn build_identified_client_key_exchange(
 		server: &TestCertificate,
+		confirming: &Confirming,
 		client_random: &[u8; 32],
-		transcript_hash: &[u8; 32],
 		client: &TestCertificate,
 	) -> ClientKeyExchange {
 		let aad = ClientKeyExchange::client_bound_aad(TIGHTBEAM_AAD_DOMAIN_TAG, Some(&client.certificate));
 		let aad = aad.expect("the test certificate encodes");
-		let sealed = sealed_payload(server, client_random, None, aad);
-		let digest = possession_digest(transcript_hash, &sealed, &client.certificate);
+		let sealed = sealed_payload(server, confirming, client_random, None, aad);
+		let digest = possession_digest(&confirming.transcript_hash, &sealed, &client.certificate);
 
 		ClientKeyExchange {
 			encrypted_data: OctetString::new(sealed).expect("a sealed payload is an OCTET STRING"),
@@ -853,10 +900,9 @@ mod tests {
 	/// hello, with the key exchange of a fresh identity for it.
 	async fn identified(peer_authentication: PeerAuthentication) -> Identified {
 		let identity = create_test_certificate();
-		let server = server_after_hello(&identity, peer_authentication).await;
-		let transcript_hash = server.transcript_hash().expect("the reply sealed the transcript");
+		let (server, confirming) = server_after_hello(&identity, peer_authentication).await;
 		let client = create_test_certificate();
-		let key_exchange = build_identified_client_key_exchange(&identity, &CLIENT_RANDOM, &transcript_hash, &client);
+		let key_exchange = build_identified_client_key_exchange(&identity, &confirming, &CLIENT_RANDOM, &client);
 
 		Identified { server, client, key_exchange }
 	}
@@ -908,6 +954,27 @@ mod tests {
 		stripped.security_accept = None;
 
 		let result = client.respond(tunneled_reply(&stripped)).await;
+		assert!(matches!(result, Err(HandshakeError::SignatureError(_))));
+		Ok(())
+	}
+
+	/// A certificate demand flipped after the server signed its reply changes
+	/// the transcript, so the signature fails. An on-path party therefore
+	/// cannot talk an anonymous client past a server that demands an identity.
+	#[tokio::test]
+	async fn a_flipped_certificate_demand_fails_the_ecies_signature() -> Result<(), Box<dyn Error>> {
+		let identity = create_test_certificate();
+		let mut config = Ecies::server(&identity);
+		config.peer_authentication = mutual_with(ExpiryValidator);
+
+		let mut server = Handshake::server(config);
+		let mut client = Handshake::client(anonymous_client(&identity));
+
+		let signed = server.reply(client.start()?).await?;
+		let mut flipped = tunneled_handshake(&signed);
+		flipped.client_cert_required = false;
+
+		let result = client.respond(tunneled_reply(&flipped)).await;
 		assert!(matches!(result, Err(HandshakeError::SignatureError(_))));
 		Ok(())
 	}
@@ -994,12 +1061,11 @@ mod tests {
 		Ok(())
 	}
 
-	/// The handshake secret is a local of the closing step until the step
-	/// stores what it agreed. A closing that fails after the agreement drops
-	/// the secret with the step, and the client admits no further step.
+	/// A closing step that began and failed leaves the client spent, so it
+	/// admits no further step and completes nothing.
 	///
-	/// The reply here carries a receipt, which demands a client identity, and
-	/// the client holds none, so the step fails at the countersignature.
+	/// The server here demands a client identity, and the client holds none,
+	/// so the step refuses before it draws a secret.
 	#[tokio::test]
 	async fn a_failed_ecies_closing_leaves_the_client_spent() -> Result<(), Box<dyn Error>> {
 		let identity = create_test_certificate();
@@ -1038,8 +1104,8 @@ mod tests {
 
 	/// The reply to a hand-built hello is signed under the server's static key
 	/// over the transcript of that hello and the legs the reply carries. No
-	/// client reads the reply, so the test holds the reply encoder to the wire
-	/// types alone.
+	/// client reads the reply, so the test holds the reply encoder to the
+	/// message format alone.
 	#[tokio::test]
 	async fn a_hand_built_hello_is_answered_with_a_signed_server_handshake() -> Result<(), Box<dyn Error>> {
 		let identity = create_test_certificate();
@@ -1058,6 +1124,7 @@ mod tests {
 			server_ephemeral: &ephemeral,
 			spki,
 			security_accept_der: handshake.security_accept.as_ref().map(WireDer::der).unwrap_or_default(),
+			client_cert_required: handshake.client_cert_required,
 			transport_accept_der: handshake.transport_accept.as_ref().map(WireDer::der).unwrap_or_default(),
 		};
 
@@ -1076,12 +1143,45 @@ mod tests {
 	#[tokio::test]
 	async fn a_hand_built_key_exchange_is_admitted() -> Result<(), Box<dyn Error>> {
 		let identity = create_test_certificate();
-		let mut server = server_after_hello(&identity, PeerAuthentication::Anonymous).await;
-		let key_exchange = build_test_client_key_exchange(&identity, &CLIENT_RANDOM, None);
+		let (mut server, confirming) = server_after_hello(&identity, PeerAuthentication::Anonymous).await;
+		let key_exchange = build_test_client_key_exchange(&identity, &confirming, &CLIENT_RANDOM, None);
 
 		server.finish(carried_closing(&key_exchange)).await?;
 		assert_eq!(server.phase(), HandshakePhase::Agreed);
 		Ok(())
+	}
+
+	/// A key exchange whose client agreed with another server ephemeral
+	/// confirms another handshake secret. The server refuses it at the closing,
+	/// and it admits no further step.
+	#[tokio::test]
+	async fn a_key_exchange_that_confirms_another_secret_is_refused() -> Result<(), Box<dyn Error>> {
+		let identity = create_test_certificate();
+		let (mut server, confirming) = server_after_hello(&identity, PeerAuthentication::Anonymous).await;
+		let stray = PublicKey::<Secp256k1>::from_sec1_bytes(&create_test_server_ephemeral())?;
+		let diverged = Confirming { server_ephemeral: stray, ..confirming };
+		let closing = carried_closing(&build_test_client_key_exchange(&identity, &diverged, &CLIENT_RANDOM, None));
+
+		let refused = server.finish(closing.to_owned()).await;
+		assert!(matches!(refused, Err(HandshakeError::KeyConfirmationFailed)));
+		assert_eq!(server.phase(), HandshakePhase::Spent);
+
+		let replayed = server.finish(closing).await;
+		assert!(matches!(replayed, Err(HandshakeError::InvalidState)));
+		Ok(())
+	}
+
+	/// A tag over another transcript hash confirms another handshake, so the
+	/// server refuses it although the handshake secret is the one it derived.
+	#[tokio::test]
+	async fn a_key_exchange_that_confirms_another_transcript_is_refused() {
+		let identity = create_test_certificate();
+		let (mut server, confirming) = server_after_hello(&identity, PeerAuthentication::Anonymous).await;
+		let foreign = Confirming { transcript_hash: [0x5au8; 32], ..confirming };
+		let key_exchange = build_test_client_key_exchange(&identity, &foreign, &CLIENT_RANDOM, None);
+
+		let refusal = server.finish(carried_closing(&key_exchange)).await;
+		assert!(matches!(refusal, Err(HandshakeError::KeyConfirmationFailed)));
 	}
 
 	/// A mutual server admits the hand-built key exchange that offers an
@@ -1124,8 +1224,8 @@ mod tests {
 	#[tokio::test]
 	async fn a_mutual_server_refuses_a_key_exchange_with_no_certificate() {
 		let identity = create_test_certificate();
-		let mut server = server_after_hello(&identity, mutual_with(ExpiryValidator)).await;
-		let key_exchange = build_test_client_key_exchange(&identity, &CLIENT_RANDOM, None);
+		let (mut server, confirming) = server_after_hello(&identity, mutual_with(ExpiryValidator)).await;
+		let key_exchange = build_test_client_key_exchange(&identity, &confirming, &CLIENT_RANDOM, None);
 
 		let refusal = server.finish(carried_closing(&key_exchange)).await;
 		assert!(matches!(refusal, Err(HandshakeError::MissingClientCertificate)));
@@ -1136,8 +1236,8 @@ mod tests {
 	#[tokio::test]
 	async fn a_possession_signature_with_no_certificate_is_refused() -> Result<(), Box<dyn Error>> {
 		let identity = create_test_certificate();
-		let mut server = server_after_hello(&identity, PeerAuthentication::Anonymous).await;
-		let mut key_exchange = build_test_client_key_exchange(&identity, &CLIENT_RANDOM, None);
+		let (mut server, confirming) = server_after_hello(&identity, PeerAuthentication::Anonymous).await;
+		let mut key_exchange = build_test_client_key_exchange(&identity, &confirming, &CLIENT_RANDOM, None);
 		key_exchange.client_signature = Some(OctetString::new([0x30u8; 64])?);
 
 		let refusal = server.finish(carried_closing(&key_exchange)).await;
@@ -1186,8 +1286,8 @@ mod tests {
 	#[tokio::test]
 	async fn a_failed_ecies_open_leaves_the_server_spent() -> Result<(), Box<dyn Error>> {
 		let identity = create_test_certificate();
-		let mut server = server_after_hello(&identity, PeerAuthentication::Anonymous).await;
-		let foreign = sealed_payload(&identity, &CLIENT_RANDOM, None, b"another domain tag");
+		let (mut server, confirming) = server_after_hello(&identity, PeerAuthentication::Anonymous).await;
+		let foreign = sealed_payload(&identity, &confirming, &CLIENT_RANDOM, None, b"another domain tag");
 		let closing = carried_closing(&anonymous_key_exchange(foreign));
 
 		let refused = server.finish(closing.to_owned()).await;
@@ -1236,7 +1336,7 @@ mod tests {
 	#[tokio::test]
 	async fn a_key_exchange_with_an_abort_alert_is_refused() -> Result<(), Box<dyn Error>> {
 		let identity = create_test_certificate();
-		let mut server = server_after_hello(&identity, PeerAuthentication::Anonymous).await;
+		let (mut server, _) = server_after_hello(&identity, PeerAuthentication::Anonymous).await;
 		let key_exchange = anonymous_key_exchange([0x41u8; 32]);
 		let alert = HandshakeAttribute::new_single(HANDSHAKE_ABORT_ALERT, Any::encode_from(&4u8)?)?;
 
@@ -1255,9 +1355,9 @@ mod tests {
 	#[tokio::test]
 	async fn a_key_exchange_that_echoes_another_client_random_is_refused() {
 		let identity = create_test_certificate();
-		let mut server = server_after_hello(&identity, PeerAuthentication::Anonymous).await;
+		let (mut server, confirming) = server_after_hello(&identity, PeerAuthentication::Anonymous).await;
 		let other_random = [8u8; 32];
-		let replayed = build_test_client_key_exchange(&identity, &other_random, None);
+		let replayed = build_test_client_key_exchange(&identity, &confirming, &other_random, None);
 
 		let refusal = server.finish(carried_closing(&replayed)).await;
 		assert!(matches!(refusal, Err(HandshakeError::ClientRandomMismatchReplay)));
@@ -1268,9 +1368,9 @@ mod tests {
 	#[tokio::test]
 	async fn an_acknowledgement_with_no_issued_receipt_is_refused() {
 		let identity = create_test_certificate();
-		let mut server = server_after_hello(&identity, PeerAuthentication::Anonymous).await;
+		let (mut server, confirming) = server_after_hello(&identity, PeerAuthentication::Anonymous).await;
 		let stray_ack = Some(b"an acknowledgement of no receipt".as_slice());
-		let key_exchange = build_test_client_key_exchange(&identity, &CLIENT_RANDOM, stray_ack);
+		let key_exchange = build_test_client_key_exchange(&identity, &confirming, &CLIENT_RANDOM, stray_ack);
 
 		let refusal = server.finish(carried_closing(&key_exchange)).await;
 		assert!(matches!(refusal, Err(HandshakeError::ReceiptMismatch)));
@@ -1285,7 +1385,7 @@ mod tests {
 
 	#[test]
 	fn a_payload_with_a_short_base_secret_is_refused() {
-		let short_key = session_payload_der([0u8; 31], [0u8; 32], None);
+		let short_key = session_payload_der([0u8; 31], [0u8; 32], &fixture_confirmation(), None);
 		let parsed = SessionPayload::parse(&short_key);
 		let refused = matches!(parsed, Err(HandshakeError::InvalidKeySize { expected: 32, received: 31 }));
 		assert!(refused);
@@ -1294,16 +1394,42 @@ mod tests {
 	/// The parser fails closed on a client random of another width.
 	#[test]
 	fn a_payload_with_a_short_client_random_is_refused() {
-		let short_random = session_payload_der([0u8; 32], [0u8; 16], None);
+		let short_random = session_payload_der([0u8; 32], [0u8; 16], &fixture_confirmation(), None);
 		let parsed = SessionPayload::parse(&short_random);
 		assert!(matches!(parsed, Err(HandshakeError::OctetStringLengthError(_))));
+	}
+
+	/// The key-confirmation tag is mandatory, so a payload that carries none
+	/// fails to decode and no closing reaches the agreement unconfirmed.
+	#[test]
+	fn a_payload_with_no_key_confirmation_is_refused() {
+		let unconfirmed = loose_payload_der(None);
+		let parsed = SessionPayload::parse(&unconfirmed);
+		assert!(matches!(parsed, Err(HandshakeError::InvalidDecryptedPayloadSize)));
+	}
+
+	/// A key-confirmation tag of another width fails to decode.
+	#[test]
+	fn a_payload_with_a_short_key_confirmation_is_refused() {
+		let short_tag = loose_payload_der(Some(&[7u8; 31]));
+		let parsed = SessionPayload::parse(&short_tag);
+		assert!(matches!(parsed, Err(HandshakeError::InvalidDecryptedPayloadSize)));
+	}
+
+	/// The loose encoding of a 32-byte tag is the payload the parser admits, so
+	/// each refusal above comes from the tag alone.
+	#[test]
+	fn a_payload_with_a_key_confirmation_of_the_one_width_parses() {
+		let confirmed = loose_payload_der(Some(&[7u8; 32]));
+		let parsed = SessionPayload::parse(&confirmed);
+		assert!(parsed.is_ok());
 	}
 
 	/// A well-formed payload parses into its base secret, its client random,
 	/// and an absent acknowledgement.
 	#[test]
 	fn a_well_formed_payload_parses_into_its_session_data() -> Result<(), Box<dyn Error>> {
-		let unanswered = session_payload_der([3u8; 32], [5u8; 32], None);
+		let unanswered = session_payload_der([3u8; 32], [5u8; 32], &fixture_confirmation(), None);
 		let payload = SessionPayload::parse(&unanswered)?;
 		assert_eq!(payload.base.as_bytes(), [3u8; 32]);
 		assert_eq!(payload.client_random, [5u8; 32]);

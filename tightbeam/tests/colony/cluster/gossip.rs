@@ -584,9 +584,8 @@ tb_scenario! {
 			.await?;
 			send_gossip_frame(&trace, &ctx.gateway, &cluster, frame).await?;
 
-			// A rumor past the gossip bound exceeds what one single-flight
-			// envelope carries. It crosses a pooled mux link, the same chunked
-			// path that reflood uses, to reach admission, and the payload bound
+			// The oversized rumor crosses a pooled mux link, the same chunked
+			// path that reflood uses, to reach admission. The payload bound
 			// then refuses it on the correct plane.
 			let pool_config = PoolConfig {
 				mux_offer: Some(Arc::new(TransportOffer::mux(8))),
@@ -901,8 +900,7 @@ tb_assert_spec! {
 //
 // Sources:
 //
-// - CWE-294, authentication bypass by capture-replay:
-//   <https://cwe.mitre.org/data/definitions/294.html>
+// - CWE-294, authentication bypass by capture-replay: <https://cwe.mitre.org/data/definitions/294.html>
 tb_scenario! {
 	name: cluster_gossip_clamps_seen_ttl_to_retention,
 	spec: ClusterGossipRetentionClampSpec,
@@ -1216,11 +1214,9 @@ tb_scenario! {
 			hive.register_with_cluster(gateway.addr()).await?;
 			install_ping_peer(&trace, &certs, &gateway).await?;
 
-			// The loop sends one more relay than the abandonment budget.
-			//
-			// - The last refusal must find the trail already abandoned and weaken nothing.
-			// - Each relay carries a valid origin-signed rumor.
-			// - The refusal is therefore the over-radius hop lifetime, not an unverifiable origin.
+			// The loop sends one more relay than the abandonment budget. Each
+			// relay carries a valid origin-signed rumor, so the refusal is the
+			// over-radius hop lifetime and not an unverifiable origin.
 			for i in 0..=CONTAINMENT_ABANDON_LIMIT {
 				let rumor_id = [b'r', i as u8];
 				let rumor = mint_origin_rumor(
@@ -1313,10 +1309,9 @@ impl GossipJournal for AmnesiacJournal {
 		Ok(())
 	}
 
-	// The grey hole CLAIMS the default retention while retaining nothing.
-	//
-	// - A misbehaving journal lies.
-	// - The start-time seen-ttl clamp only defends against honest misconfiguration.
+	// The grey hole claims the default retention while it retains nothing. A
+	// misbehaving journal lies, and the start-time seen-ttl clamp defends
+	// against honest misconfiguration alone.
 	fn retention(&self) -> Duration {
 		Duration::from_millis(DEFAULT_GOSSIP_RETENTION_MS)
 	}
@@ -1468,8 +1463,7 @@ tb_scenario! {
 ///
 /// - One trusted peer identity carries a different colony URN SAN.
 /// - Another carries no SAN at all.
-/// - Both use random keys so the three identities never share a subject key id
-///   (see [`gossip_plane_ctx`]).
+/// - Both use random keys so the three identities never share a subject key id (see [`gossip_plane_ctx`]).
 struct ForeignColonyCtx {
 	gateway: ClusterTestCerts,
 	foreign_key: Secp256k1SigningKey,
@@ -1559,11 +1553,9 @@ tb_scenario! {
 			)
 			.await?;
 
-			// Same-colony origin, foreign-colony relay.
-			//
-			// - The peer check alone must refuse.
-			// - Without colony equality on the outer frame, this path would admit,
-			//   journal, deliver, and reflood.
+			// The origin is same-colony and the relay is foreign, so the peer
+			// check alone must refuse. Without colony equality on the outer
+			// frame, this path would admit, journal, deliver, and reflood.
 			relay_application_rumor(&trace, &ctx.gateway, &cluster, &ctx.gateway.key, &ctx.foreign_key, "same-colony")
 				.await?;
 
@@ -1586,8 +1578,7 @@ tb_scenario! {
 /// It holds one origin identity and two relay identities, all members of
 /// the gateway's colony.
 ///
-/// - Every identity uses a random key so no two share a subject key id
-///   (see [`gossip_plane_ctx`]).
+/// - Every identity uses a random key so no two share a subject key id (see [`gossip_plane_ctx`]).
 struct RelayFanoutCtx {
 	gateway: ClusterTestCerts,
 	origin_key: Secp256k1SigningKey,
@@ -1860,10 +1851,8 @@ tb_assert_spec! {
 // X anchors only seed S. S anchors publisher P. P anchors nobody.
 //
 // - S's beat verifies its anchor P and shares P over PEX.
-// - X learns P, feeler-probes it through the colony gate, and promotes it
-//   (CLUSTER_PEER_DISCOVERED).
-// - X's advertisement teaches P to dial back, and P promotes X the
-//   same way.
+// - X learns P, feeler-probes it through the colony gate, and promotes it (CLUSTER_PEER_DISCOVERED).
+// - X's advertisement teaches P to dial back, and P promotes X the same way.
 // - A rumor published at P at ttl 0 never floods.
 // - It reaches X's ingress only across those two discovered edges.
 tb_scenario! {
@@ -1969,6 +1958,8 @@ tb_scenario! {
 			trace.event_with(PEER_TABLE_FLOOD_ADMITTED, &[], admitted as u64)?;
 
 			for hint in &flood {
+				// A full bucket answers a promotion with `Ok(false)`, and the
+				// scenario reads the target set that the promotions leave.
 				let _ = table.promote(hint.dial, None, UnixMillis::now());
 			}
 
@@ -2058,13 +2049,11 @@ tb_assert_spec! {
 // - Only the member passes the gate (CLUSTER_PEER_DISCOVERED exactly once).
 // - Only the member joins the beat targets.
 // - The foreign candidate leaves the new table through discard.
-// - A trusted-but-foreign identity can neither clog a prefix bucket nor
-//   become a dial target.
+// - A trusted-but-foreign identity can neither clog a prefix bucket nor become a dial target.
 //
 // Sources:
 //
-// - CWE-668, exposure of resource to wrong sphere:
-//   <https://cwe.mitre.org/data/definitions/668.html>
+// - CWE-668, exposure of resource to wrong sphere: <https://cwe.mitre.org/data/definitions/668.html>
 tb_scenario! {
 	name: cluster_feeler_probe_discards_foreign_colony_peer,
 	spec: ClusterPeerForeignProbeSpec,
@@ -2097,6 +2086,64 @@ tb_scenario! {
 
 			prober.stop();
 			member.stop();
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterPeerExpelSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(PEER_ROUTES_AFTER, exactly!(1), equals!(1u64)),
+			(PEER_EXPEL_ADDRESS_VERIFIED, exactly!(1), equals!(true)),
+			(PEER_EXPEL_TARGET_DROPPED, exactly!(1), equals!(true)),
+			(PEER_EXPEL_ROUTES_WITHDRAWN, exactly!(1), equals!(true))
+		]
+	}
+}
+
+// A verified peer that re-keys outside the colony loses its routes.
+//
+// A slate arrives under the local colony's key from an address, and the table
+// holds that address as verified under the fingerprint that owns the slate.
+// The address answers the next beat with a foreign-colony certificate.
+//
+// - The beat's reconcile expels the address at once (PEER_EXPEL_TARGET_DROPPED).
+// - The routes the old fingerprint owns leave with it (PEER_EXPEL_ROUTES_WITHDRAWN).
+tb_scenario! {
+	name: cluster_expelled_foreign_peer_loses_its_routes,
+	spec: ClusterPeerExpelSpec,
+	environment Cluster {
+		context: foreign_gateway_ctx(),
+		start: |SetupEnv { trace, context: ctx }| async move {
+			start_cluster(&trace, foreign_gateway_conf(&ctx)).await
+		},
+		client: |ClusterEnv { trace, context: ctx, cluster }| async move {
+			let prober_conf = probing_cluster_conf(&ctx);
+			let table = Arc::clone(prober_conf.peer.table());
+			let foreign_addr = dial_admitted_by(&prober_conf, cluster.addr().to_string());
+			let prober = start_cluster(&trace, prober_conf).await?;
+
+			// The slate gives the expulsion routes to withdraw. Its owner is
+			// the fingerprint of the key that signed it.
+			advertise_peer(&trace, &ctx.local, &prober, cluster.addr().to_string(), vec![servlet_urn("ping")]).await?;
+
+			let routes = prober.peer_routes().unwrap_or_default();
+			let owner = routes.first().map(|route| Arc::clone(&route.peer_id));
+
+			let verified = table.promote(foreign_addr, owner.as_deref(), UnixMillis::now()).unwrap_or(false);
+			trace.event_with(PEER_EXPEL_ADDRESS_VERIFIED, &[], verified)?;
+
+			let dropped = wait_for_target_dropped(&table, foreign_addr, 50, Duration::from_millis(100)).await;
+			trace.event_with(PEER_EXPEL_TARGET_DROPPED, &[], dropped)?;
+
+			let withdrawn = wait_for_no_peer_routes(&prober, 50, Duration::from_millis(100)).await;
+			trace.event_with(PEER_EXPEL_ROUTES_WITHDRAWN, &[], withdrawn)?;
+
+			prober.stop();
 			cluster.stop();
 			Ok(())
 		}
@@ -2196,11 +2243,14 @@ tb_scenario! {
 			let rogue_addr = dial_admitted_by(&prober_conf, rogue_addr);
 			let prober = start_cluster(&trace, prober_conf).await?;
 
-			let _ = table.learn(vec![PeerHint { dial: rogue_addr, peer_id: None }]);
+			let admitted = table.learn(vec![PeerHint { dial: rogue_addr, peer_id: None }]).unwrap_or_default();
 
 			let drained = wait_for_new_candidates_drained(&table, 50, Duration::from_millis(100)).await;
 			let targets = table.target_set().unwrap_or_default();
-			trace.event_with(PEER_ABUSE_CANDIDATE_DISCARDED, &[], drained && !targets.contains(&rogue_addr))?;
+			// A refused hint leaves the same empty table as a discarded
+			// candidate, so the outcome also pins the admission.
+			let discarded = admitted == 1 && drained && !targets.contains(&rogue_addr);
+			trace.event_with(PEER_ABUSE_CANDIDATE_DISCARDED, &[], discarded)?;
 
 			rogue.abort();
 			prober.stop();
@@ -2217,8 +2267,10 @@ tb_assert_spec! {
 		assertions: [
 			(events::CLUSTER_PEER_DISCOVERED, exactly!(1)),
 			(PEER_EVICT_MEMBER_PROMOTED, exactly!(1), equals!(true)),
+			(PEER_ROUTES_AFTER, exactly!(1), equals!(1u64)),
 			(events::CLUSTER_PEER_EVICTED, exactly!(1)),
-			(PEER_EVICT_TARGET_DROPPED, exactly!(1), equals!(true))
+			(PEER_EVICT_TARGET_DROPPED, exactly!(1), equals!(true)),
+			(PEER_EVICT_ROUTES_WITHDRAWN, exactly!(1), equals!(true))
 		]
 	}
 }
@@ -2226,12 +2278,17 @@ tb_assert_spec! {
 // A verified tried peer that goes dark is evicted (liveness).
 //
 // The prober learns the member as a hint, feeler-probes it through the
-// colony gate, and promotes it into tried (CLUSTER_PEER_DISCOVERED).
+// colony gate, and promotes it into tried (CLUSTER_PEER_DISCOVERED). The
+// member then advertises one type, so the prober routes to it
+// (PEER_ROUTES_AFTER is 1).
 //
 // - The member then stops.
+// - Idle pool leases expire fast, so every beat makes a fresh dial, which the
+//   dropped listener refuses as a dead remote process would.
 // - Every following beat fails its reconcile.
 // - The failure threshold evicts the entry exactly once (CLUSTER_PEER_EVICTED).
 // - The beat stops dialing the dead address.
+// - The eviction withdraws the member's routes (PEER_EVICT_ROUTES_WITHDRAWN).
 // - A dead peer cannot hold a prefix bucket slot forever.
 tb_scenario! {
 	name: cluster_beat_evicts_dark_tried_peer,
@@ -2244,26 +2301,32 @@ tb_scenario! {
 		client: |ClusterEnv { trace, context: certs, cluster }| async move {
 			let mut prober_conf = fast_probing_conf(&certs, Arc::clone(&certs.trust));
 			// The stopped member's accepted-connection tasks outlive its
-			// listener inside this test process.
-			//
-			// - Expiring idle pool leases forces every beat onto a fresh dial.
-			// - The dropped listener refuses that dial, as a dead remote process would.
+			// listener inside this test process, so idle pool leases expire
+			// fast.
 			prober_conf.pool_config.idle_timeout = Some(Duration::from_millis(50));
 
 			let table = Arc::clone(prober_conf.peer.table());
 			let member_addr = dial_admitted_by(&prober_conf, cluster.addr().to_string());
 			let prober = start_cluster(&trace, prober_conf).await?;
 
+			// The scenario reads what the probe does with the hint. A hint the
+			// table refused shows as the missing outcome below.
 			let _ = table.learn(vec![PeerHint { dial: member_addr, peer_id: None }]);
 
 			let drained = wait_for_new_candidates_drained(&table, 50, Duration::from_millis(100)).await;
 			let targets = table.target_set().unwrap_or_default();
 			trace.event_with(PEER_EVICT_MEMBER_PROMOTED, &[], drained && targets.contains(&member_addr))?;
 
+			// The member's slate gives the eviction routes to withdraw.
+			advertise_peer(&trace, &certs, &prober, cluster.addr().to_string(), vec![servlet_urn("ping")]).await?;
+
 			cluster.stop();
 
 			let dropped = wait_for_target_dropped(&table, member_addr, 50, Duration::from_millis(100)).await;
 			trace.event_with(PEER_EVICT_TARGET_DROPPED, &[], dropped)?;
+
+			let withdrawn = wait_for_no_peer_routes(&prober, 50, Duration::from_millis(100)).await;
+			trace.event_with(PEER_EVICT_ROUTES_WITHDRAWN, &[], withdrawn)?;
 
 			prober.stop();
 			Ok(())
@@ -2384,6 +2447,8 @@ tb_scenario! {
 			let member_addr = dial_admitted_by(&prober_conf, cluster.addr().to_string());
 			let prober = start_cluster(&trace, prober_conf).await?;
 
+			// The scenario reads what the probe does with the hint. A hint the
+			// table refused shows as the missing outcome below.
 			let _ = table.learn(vec![PeerHint { dial: member_addr, peer_id: None }]);
 
 			let drained = wait_for_new_candidates_drained(&table, 50, Duration::from_millis(100)).await;

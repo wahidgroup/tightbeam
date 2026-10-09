@@ -1,6 +1,6 @@
 //! Reader driver that routes inbound envelopes, reassembles chunked payloads
-//! under granted credit, and buffers control-plane replies so a full writer
-//! queue never parks the read loop.
+//! under granted credit, and buffers control-plane replies so the read loop
+//! keeps running while the writer queue is full.
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::collections::{HashMap, VecDeque};
@@ -144,8 +144,8 @@ struct RecvStream {
 	max_bytes: usize,
 	/// Connection-wide ceiling this stream's bytes are charged against.
 	///
-	/// Held rather than passed per call so the [`Drop`] below returns the
-	/// bytes no matter which path discards the stream.
+	/// The stream holds the budget rather than taking it per call, so the
+	/// [`Drop`] below returns the bytes whichever path discards the stream.
 	budget: Arc<ReassemblyBudget>,
 }
 
@@ -194,15 +194,15 @@ impl RecvStream {
 	}
 }
 
-/// Reader driver: routes inbound envelopes off the read half.
+/// The reader driver, which routes inbound envelopes off the read half.
 ///
 /// Spawn [`MuxReaderDriver::drive`] on the caller's executor.
 ///
-/// - Responses resolve their pending stream. Unknown IDs are discarded silently, because cancel and
-///   response races are benign.
+/// - Responses resolve their pending stream. Unknown IDs are discarded
+///   silently, because cancel and response races are benign.
 /// - Requests flow to the [`crate::transport::multiplex::MuxResponder`].
-/// - Chunked payloads reassemble here, bounded by the credit this endpoint granted. The
-///   [`CreditGrantor`] decides when to raise a stream's limit.
+/// - Chunked payloads reassemble here, bounded by the credit this endpoint
+///   granted. The [`CreditGrantor`] decides when to raise a stream's limit.
 /// - Protocol violations answer with a GoAway and fail the driver.
 pub struct MuxReaderDriver<R>
 where
@@ -463,9 +463,9 @@ where
 		self.queue_control(request)
 	}
 
-	/// Drain gracefully on a settlement or approval refusal,
-	/// preserving the connection long enough for owed traffic and
-	/// the recorded evidence to survive the disagreement.
+	/// Drain gracefully on a settlement or approval refusal, preserving the
+	/// connection long enough for owed traffic and the recorded evidence to
+	/// survive the disagreement.
 	///
 	/// # Backpressure
 	///
@@ -628,11 +628,10 @@ where
 		};
 
 		// The new epoch's receive cipher and budget take over before the
-		// renewal closes, so an admission it releases debits the new
-		// epoch. A `RekeyDone` out of order closes nothing and ends the
-		// connection.
+		// renewal closes, so an admission it releases debits the new epoch.
 		self.reader.install_recv_cipher(recv_cipher)?;
 		self.recv_budget = self.initial_recv_budget;
+		// A `RekeyDone` out of order closes nothing and ends the connection.
 		if !self.link.shared().complete_renewal(receipt) {
 			return Err(self.protocol_violation());
 		}
@@ -901,6 +900,8 @@ where
 		};
 
 		let response = ResponsePackage::new(package.status(), message);
+		// The initiator may have dropped its future, a cancel this response
+		// lost the race to.
 		let _ = sender.send(StreamOutcome::Response(response));
 		Ok(())
 	}
@@ -916,6 +917,8 @@ where
 			TransitStatus::Ok => BodyEvent::End,
 			status => BodyEvent::Failed(TransportError::from(status)),
 		};
+		// A reply body already dropped has no reader for the terminal event,
+		// and the stream closes either way.
 		let _ = forwarder.forward(terminal);
 
 		Ok(())
@@ -1000,6 +1003,8 @@ where
 		let route = StreamRoute::from_parts(package.target().cloned(), package.hops_remaining());
 
 		if package.last() {
+			// The body is handed to the handler below, and a handler that
+			// drops it unread has closed the stream either way.
 			let _ = forwarder.forward(BodyEvent::End);
 		} else {
 			self.peer_bodies.insert(stream_id, forwarder);
@@ -1135,9 +1140,10 @@ where
 	/// Forward one streaming request chunk into its body channel.
 	///
 	/// - Overrunning the granted limit is a violation exactly as in reassembly.
-	/// - A dropped body, refused at the cap or abandoned by its handler, evicts the forwarder. The
-	///   stream's remaining flushes then route through the tolerated refused-stream path instead of
-	///   being copied into a dead channel, and consumed credit stays consumed (no refunds).
+	/// - A dropped body, refused at the cap or abandoned by its handler, evicts
+	///   the forwarder. The stream's remaining flushes then route through the
+	///   tolerated refused-stream path instead of being copied into a dead
+	///   channel, and consumed credit stays consumed (no refunds).
 	fn forward_request_chunk(&mut self, package: &MuxDataPackage) -> TransportResult<()> {
 		let stream_id = package.stream_id();
 		let Some(stream) = self.peer_bodies.get_mut(&stream_id) else {
@@ -1156,6 +1162,8 @@ where
 
 		if package.last() {
 			if let Some(mut stream) = self.peer_bodies.remove(&stream_id) {
+				// A handler that dropped the body has no reader for `End`,
+				// and a dropped body is a closed stream either way.
 				let _ = stream.forward(BodyEvent::End);
 			}
 			self.evict_credit(stream_id);
@@ -1226,6 +1234,8 @@ where
 			self.local_reassembly.remove(&stream_id);
 
 			if let Some(mut forwarder) = self.link.shared().take_duplex(stream_id) {
+				// A reply body already dropped has no reader for the failure,
+				// and the stream is cancelled either way.
 				let _ = forwarder.forward(BodyEvent::Failed(package.reason().cancel_error()));
 			}
 
@@ -1245,6 +1255,8 @@ where
 			self.evict_credit(stream_id);
 			self.link.shared().finish_send_stream(stream_id);
 
+			// A responder that has ended has no handler left to abort, so the
+			// cancel has nothing to reach.
 			let _ = self.inbound.send(InboundEvent::Cancel(stream_id)).await;
 			return Ok(());
 		}
@@ -1436,7 +1448,7 @@ mod tests {
 		driver: MuxReaderDriver<ScriptedSource>,
 		/// Receiving end of the full outbound queue.
 		outbound: mpsc::Receiver<Outbound>,
-		/// Held open so the driver never sees a closed inbound channel.
+		/// Held open so the driver's inbound channel stays open.
 		inbound: mpsc::Receiver<InboundEvent>,
 		/// Count of envelopes the source has delivered.
 		delivered: Arc<AtomicUsize>,

@@ -32,9 +32,11 @@ pub enum InsertRefusal {
 
 /// One hive's servlet instances together with the routes that reach them.
 ///
-/// An instance exists in the registry and in the routing context, and the
-/// two MUST agree. Binding them in one view means an insert or a removal
-/// touches both, so neither can be updated on its own.
+/// An instance exists in the registry and in the routing context. Binding
+/// them in one view means an insert or a removal touches both in one fixed
+/// order, so a route only ever names a running instance. The two sit behind
+/// separate locks, so the pair is eventually consistent: each step lands on
+/// its own lock, and nothing compensates a later step.
 pub struct HiveInstances<'a, R: ServletRegistry, P: Protocol> {
 	servlets: &'a R,
 	routes: &'a HiveContextImpl<P>,
@@ -57,10 +59,8 @@ impl<'a, R: ServletRegistry, P: Protocol> HiveInstances<'a, R, P> {
 	///
 	/// # Errors
 	///
-	/// - [`InsertRefusal::Unnameable`] -- the servlet's address is not a
-	///   valid instance locator.
-	/// - [`InsertRefusal::Registry`] -- the registry did not take the
-	///   registration. No route is added.
+	/// - [`InsertRefusal::Unnameable`] -- the servlet's address is not a valid instance locator.
+	/// - [`InsertRefusal::Registry`] -- the registry did not take the registration. No route is added.
 	pub fn insert(&self, registration: ServletRegistration) -> Result<(Urn<'static>, Arc<[u8]>), InsertRefusal> {
 		let addr_bytes = registration.servlet.addr_bytes();
 		let instance = match registration.servlet_type.instance_urn(addr_bytes.as_ref()) {
@@ -87,18 +87,25 @@ impl<'a, R: ServletRegistry, P: Protocol> HiveInstances<'a, R, P> {
 		Ok((instance, addr_bytes))
 	}
 
-	/// Stops one instance and drops the route that reached it.
+	/// Removes one instance: its registry entry, then its route, then the
+	/// servlet itself.
 	///
 	/// Returns the removed type URN and address, which callers notify the
 	/// cluster with. [`None`] means `key` named no instance.
 	pub fn remove(&self, key: impl AsRef<[u8]>) -> Option<(Urn<'static>, Arc<[u8]>)> {
 		let key = key.as_ref();
+
+		// 1. The registry gives the instance up, so no new registration lands on a key that is leaving.
 		let ServletRegistration { servlet, servlet_type, .. } = self.servlets.remove(key)?;
 		let removed_type = servlet_type.canonical_bytes();
 		let removed_addr = servlet.addr_bytes();
 
-		servlet.stop_boxed();
+		// 2. The route leaves before the servlet stops, so a sibling call in
+		//    this window resolves another instance or no route.
 		self.routes.remove_route(key, &servlet_type, &removed_type, &removed_addr);
+
+		// 3. The servlet stops once nothing routes to it.
+		servlet.stop_boxed();
 
 		Some((servlet_type, removed_addr))
 	}
@@ -111,7 +118,7 @@ mod tests {
 
 	use super::*;
 	use crate::colony::common::ColonyNamespace;
-	use crate::colony::hive::{HiveContext, ServletBox, ServletInfo, SpawnerFn};
+	use crate::colony::hive::{HashMapRegistry, HiveContext, ServletBox, ServletInfo, SpawnerFn};
 	use crate::router::RouterError;
 	use crate::testing::TestMessage;
 	use crate::transport::client::pool::{ConnectionBuilder, ConnectionPool};
@@ -134,6 +141,28 @@ mod tests {
 
 		fn stop_boxed(self: Box<Self>) {
 			self.stopped.store(true, Ordering::SeqCst);
+		}
+	}
+
+	/// A [`ServletBox`] that reads the hive's routes for its own type at the
+	/// instant it is stopped.
+	///
+	/// The order of a removal is observable only from inside the stop, so
+	/// this probe records whether a route still named its type then.
+	struct RouteProbe {
+		routes: Arc<HiveContextImpl<TokioListener>>,
+		servlet_type: Urn<'static>,
+		routed_at_stop: Arc<AtomicBool>,
+	}
+
+	impl ServletBox for RouteProbe {
+		fn addr_bytes(&self) -> Arc<[u8]> {
+			Arc::from(b"127.0.0.1:7002".as_slice())
+		}
+
+		fn stop_boxed(self: Box<Self>) {
+			let routed = self.routes.resolves(&self.servlet_type);
+			self.routed_at_stop.store(routed, Ordering::SeqCst);
 		}
 	}
 
@@ -209,6 +238,25 @@ mod tests {
 		ServletRegistration { servlet: Box::new(probe), spawner, servlet_type }
 	}
 
+	/// A registration of one [`RouteProbe`] under `servlet_type`, watching
+	/// `routes` for that type when it stops.
+	fn route_probe_registration(
+		routes: &Arc<HiveContextImpl<TokioListener>>,
+		servlet_type: &Urn<'static>,
+		routed_at_stop: &Arc<AtomicBool>,
+	) -> ServletRegistration {
+		let probe = RouteProbe {
+			routes: Arc::clone(routes),
+			servlet_type: servlet_type.clone(),
+			routed_at_stop: Arc::clone(routed_at_stop),
+		};
+		let spawner: SpawnerFn = Arc::new(|_| {
+			Box::pin(async { Ok(Box::new(StopProbe { stopped: Arc::default() }) as Box<dyn ServletBox>) })
+		});
+
+		ServletRegistration { servlet: Box::new(probe), spawner, servlet_type: servlet_type.clone() }
+	}
+
 	/// Empty routes over a pool nothing dials.
 	fn routes() -> HiveContextImpl<TokioListener> {
 		HiveContextImpl::new(Arc::new(ConnectionPool::<TokioListener>::builder().build()))
@@ -237,6 +285,25 @@ mod tests {
 		let unrouted = routes.call(&servlet_type, call_frame()).await;
 		assert!(matches!(unrouted, Err(TightBeamError::RouterError(RouterError::UnknownRoute))));
 		assert!(stopped.load(Ordering::SeqCst));
+		Ok(())
+	}
+
+	/// A removal drops the route before it stops the servlet, so no call in
+	/// the removal window resolves a stopped instance.
+	#[tokio::test]
+	async fn a_removed_instance_loses_its_route_before_it_stops() -> Result<(), Box<dyn Error>> {
+		let servlet_type = ColonyNamespace::default().servlet("echo")?;
+		let servlets = HashMapRegistry::default();
+		let routes = Arc::new(routes());
+		let routed_at_stop = Arc::new(AtomicBool::new(true));
+		let registration = route_probe_registration(&routes, &servlet_type, &routed_at_stop);
+		let instances = HiveInstances::new(&servlets, &routes);
+		let (instance, _addr) = instances.insert(registration)?;
+
+		let removed = instances.remove(instance.canonical_bytes());
+
+		assert!(removed.is_some());
+		assert!(!routed_at_stop.load(Ordering::SeqCst));
 		Ok(())
 	}
 }

@@ -1,22 +1,25 @@
-//! FDR refinement checking subsystem
+//! The FDR refinement checking subsystem.
 //!
-//! This module contains the RefinementChecker trait implementation.
+//! [`DefaultRefinementChecker`] implements [`RefinementChecker`] for trace,
+//! failures, and divergence refinement.
 
 use std::cell::RefCell;
 use std::collections::{HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::testing::fdr::config::FdrConfig;
 use crate::testing::fdr::explorer::{MemoizationCache, RefinementChecker, RefinementOutcome};
 use crate::testing::fdr::verdict::{Failure, Trace};
 use crate::testing::specs::csp::{Event, Process, State};
+use crate::utils::time::{Clock, MonotonicInstant, SystemClock};
 
-/// Result of searching for a single trace in a specification
+/// The result of a search for a single trace in a specification.
 ///
-/// Distinguishes a definitive absence from a search cut short by timeout or
-/// resource limits, so bounded search is never reported as a counter-example.
+/// It distinguishes a definitive absence from a search cut short by a timeout
+/// or a resource limit, so a bounded search reports `Inconclusive` instead of a
+/// counterexample.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TraceSearch {
 	Found,
@@ -24,32 +27,35 @@ enum TraceSearch {
 	Inconclusive,
 }
 
-/// Timeout checker helper
+/// The time budget of one search, measured from its start instant.
 struct TimeoutChecker {
-	start: Instant,
+	start: MonotonicInstant,
 	timeout: Duration,
 }
 
 impl TimeoutChecker {
 	fn new(timeout_ms: u64) -> Self {
-		Self { start: Instant::now(), timeout: Duration::from_millis(timeout_ms) }
+		Self { start: SystemClock.monotonic(), timeout: Duration::from_millis(timeout_ms) }
 	}
 
 	fn is_expired(&self) -> bool {
-		self.start.elapsed() >= self.timeout
+		let elapsed = SystemClock.monotonic().saturating_duration_since(self.start);
+		elapsed >= self.timeout
 	}
 }
 
-/// Default refinement checker implementation
+/// The default [`RefinementChecker`], which explores a [`Process`]
+/// breadth-first under the configured bounds.
 pub struct DefaultRefinementChecker<'a, M>
 where
 	M: MemoizationCache,
 {
-	/// Configuration
+	/// The search configuration, which sets the depth bound and the timeout.
 	config: Arc<FdrConfig>,
-	/// Process being verified
+	/// The process under verification.
 	process: &'a Process,
-	/// Shared memoization cache
+	/// The shared memoization cache for computed traces, failures, and
+	/// divergences.
 	cache: Rc<RefCell<M>>,
 }
 
@@ -57,22 +63,22 @@ impl<'a, M> DefaultRefinementChecker<'a, M>
 where
 	M: MemoizationCache,
 {
-	/// Create new refinement checker with shared cache
+	/// Create a refinement checker over `process` that shares `cache`.
 	pub fn new(process: &'a Process, config: Arc<FdrConfig>, cache: Rc<RefCell<M>>) -> Self {
 		Self { config, process, cache }
 	}
 
-	/// Get configuration
+	/// Returns the search configuration.
 	pub fn config(&self) -> &FdrConfig {
 		&self.config
 	}
 
-	/// Get process
+	/// Returns the process under verification.
 	pub fn process(&self) -> &Process {
 		self.process
 	}
 
-	/// Helper methods to access trait constants
+	/// Returns [`RefinementChecker::MAX_TRACES`] for this checker type.
 	fn max_traces() -> usize {
 		<Self as RefinementChecker>::MAX_TRACES
 	}
@@ -85,33 +91,36 @@ where
 		<Self as RefinementChecker>::MAX_VISITED
 	}
 
-	/// Check if limits are exceeded before enqueueing
+	/// Returns whether the queue, the visited set, or the trace set has reached
+	/// its bound.
 	fn check_limits(queue_len: usize, visited_len: usize, traces_count: usize) -> bool {
 		queue_len >= Self::max_queue_size() || visited_len >= Self::max_visited() || traces_count >= Self::max_traces()
 	}
 
-	/// Check if a state is stable (no τ-transitions enabled)
+	/// Returns whether `state` is stable, which means that it enables no
+	/// τ-transition.
 	fn is_stable_state(process: &Process, state: State) -> bool {
 		let enabled_actions = process.enabled(state);
 		!enabled_actions.iter().any(|action| process.hidden.contains(&action.event))
 	}
 
-	/// Process a transition, handling τ-transitions vs observable events
-	/// Process a transition, handling τ-transitions vs observable events
+	/// Apply one transition to a trace. A τ-transition leaves the trace and the
+	/// depth as they are, and an observable event extends both.
 	fn process_transition(process: &Process, event: &Event, trace: Trace, depth: usize) -> (Trace, usize) {
 		if process.hidden.contains(event) {
-			// τ-transition: don't extend trace
 			(trace, depth)
 		} else {
-			// Observable event: extend trace
 			let mut new_trace = trace;
 			new_trace.push(*event);
 			(new_trace, depth + 1)
 		}
 	}
 
-	/// Extract trace from a linear process (single deterministic path)
-	/// Returns None if the process is not linear (has branching)
+	/// Extract the trace of a linear process, which has a single deterministic
+	/// path.
+	///
+	/// Returns `None` when the process is not linear: it branches, cycles,
+	/// deadlocks, or runs past `max_depth`.
 	fn extract_linear_trace(process: &Process, max_depth: usize) -> Option<Trace> {
 		let mut trace = Vec::new();
 		let mut current_state = process.initial;
@@ -119,23 +128,22 @@ where
 		visited_states.insert(current_state);
 
 		loop {
-			// Check if we've reached a terminal state
 			if process.terminal.contains(&current_state) {
 				return Some(trace);
 			}
 
-			// Check depth limit
 			if trace.len() >= max_depth {
 				return None; // Not linear if we hit depth limit
 			}
 
-			// Check for cycles
+			// The depth limit counts observable events only, so this bound
+			// stops a long run of τ-transitions.
 			if visited_states.len() > 1000 {
 				return None; // Likely not linear if we've visited many states
 			}
 
-			// First, follow any τ-transitions (hidden events) - they don't extend the trace
-			// Process all τ-transitions in sequence until we reach a state with no τ-transitions
+			// Follow the τ-transitions (hidden events) first, one at a time,
+			// until the state enables none. They leave the trace as it is.
 			let mut has_tau_transitions = true;
 			while has_tau_transitions {
 				has_tau_transitions = false;
@@ -148,7 +156,6 @@ where
 						}
 						current_state = next_states[0];
 
-						// Check for cycles
 						if !visited_states.insert(current_state) {
 							return None; // Cycle detected
 						}
@@ -158,43 +165,39 @@ where
 					}
 				}
 
-				// Check terminal after τ-transitions
 				if process.terminal.contains(&current_state) {
 					return Some(trace);
 				}
 			}
 
-			// Now check for observable actions at the stable state
+			// The state is stable here, so only observable actions remain.
 			let stable_enabled = process.enabled(current_state);
 			let observable_actions: Vec<_> = stable_enabled
 				.iter()
 				.filter(|action| !process.hidden.contains(&action.event))
 				.collect();
 
-			// Linear process: at most one observable action
+			// A linear process enables at most one observable action.
 			if observable_actions.len() > 1 {
 				return None; // Not linear - has branching in observable events
 			}
 
-			// If we have an observable action, follow it
 			if let Some(action) = observable_actions.first() {
 				let next_states = process.step(current_state, &action.event);
 
-				// Linear process must have exactly one next state
+				// A linear process has exactly one next state.
 				if next_states.len() != 1 {
 					return None; // Not linear - has non-determinism
 				}
 
-				// Add event to trace
 				trace.push(action.event);
 				current_state = next_states[0];
 
-				// Check for cycles
 				if !visited_states.insert(current_state) {
 					return None; // Cycle detected - not a simple linear trace
 				}
 			} else {
-				// No enabled actions - deadlock or terminal state
+				// The state enables no action, so it is terminal or a deadlock.
 				if process.terminal.contains(&current_state) {
 					return Some(trace);
 				}
@@ -203,10 +206,12 @@ where
 		}
 	}
 
-	/// Generic BFS helper for trace and failure computation
+	/// A breadth-first traversal with a per-state and a per-transition
+	/// callback, which the failure computation runs on.
 	///
-	/// The returned `bool` is true when the traversal ran to exhaustion;
-	/// false when queue/visited limits truncated it.
+	/// `on_state` returns `true` to skip the transitions of a state. The
+	/// returned `bool` is `true` when the traversal ran to exhaustion and
+	/// `false` when the queue or visited limit truncated it.
 	fn bfs_with_callbacks<T, FState, FTransition>(
 		&self,
 		process: &Process,
@@ -255,14 +260,16 @@ where
 		(data, complete)
 	}
 
-	/// Check if a τ-transition would create a cycle
+	/// Returns whether a τ-transition to `next_state` revisits a state that
+	/// this run of τ-transitions has seen at `trace`.
 	fn has_tau_cycle(&self, tau_states_seen: &HashSet<(State, Trace)>, next_state: State, trace: &Trace) -> bool {
 		let next_key = (next_state, trace.clone());
 		tau_states_seen.contains(&next_key)
 	}
 
-	/// Check if an implementation failure exists in the specification failures.
-	/// Returns true if a matching spec failure is found where impl_refusal ⊆ spec_refusal.
+	/// Returns whether the specification failures hold a failure with the trace
+	/// `impl_trace` whose refusal set contains `impl_refusal` (impl_refusal ⊆
+	/// spec_refusal).
 	fn failure_exists_in_spec(
 		spec_failures: impl AsRef<[Failure]>,
 		impl_trace: &Trace,
@@ -279,13 +286,14 @@ where
 
 	/// Search for a specific trace in a spec without computing all traces.
 	///
-	/// BFS over `(state, matched-prefix-length)` pairs: observable actions
-	/// matching the next target event advance the prefix, hidden (τ)
-	/// actions advance the state silently. τ exploration is bounded by the
-	/// shared visited set only.
+	/// The search is a BFS over `(state, matched-prefix-length)` pairs:
 	///
-	/// Timeout or resource limits yield `Inconclusive`, never `Absent`:
-	/// a bounded search that ran out of budget is not a counterexample.
+	/// - An observable action that matches the next target event advances the prefix.
+	/// - A hidden (τ) action advances the state and leaves the prefix as it is.
+	///
+	/// The shared visited set is the only bound on τ exploration. A timeout or
+	/// a resource limit yields `Inconclusive` instead of `Absent`, because a
+	/// bounded search that ran out of budget is not a counterexample.
 	fn trace_exists_in_spec(
 		spec: &Process,
 		target_trace: &Trace,
@@ -341,17 +349,19 @@ impl<'a, M> RefinementChecker for DefaultRefinementChecker<'a, M>
 where
 	M: MemoizationCache,
 {
+	/// Check trace refinement, where impl ⊑ spec means traces(impl) ⊆
+	/// traces(spec).
+	///
+	/// Every impl trace is checked, because a check of only the longest trace
+	/// misses forbidden events on sibling branches of a branching impl.
+	///
+	/// Reference: Roscoe (1998, 2010)
 	fn check_trace_refinement(&mut self, spec: &Process, impl_process: &Process) -> RefinementOutcome<Trace> {
-		// Trace refinement: impl ⊑ spec means traces(impl) ⊆ traces(spec).
-		// Every impl trace is checked -- checking only the longest trace
-		// misses forbidden events on sibling branches of a branching impl
-		// Reference: Roscoe (1998, 2010)
 		let (impl_traces, impl_complete) = self.compute_traces(impl_process, self.config.max_depth);
 
 		// Each trace is projected onto the spec's observable alphabet, because
-		// a trace is a sequence over that alphabet and an implementation
-		// recorded from a running system carries the steps the spec models
-		// internally as well. See `Process::project`.
+		// an implementation recorded from a running system also carries the
+		// steps that the spec models internally. See `Process::project`.
 		let projected: HashSet<Trace> = impl_traces.iter().map(|trace| spec.project(trace)).collect();
 
 		// Sorted iteration keeps the reported witness deterministic
@@ -388,11 +398,14 @@ where
 		RefinementOutcome::Holds { complete: impl_complete }
 	}
 
+	/// Check failures refinement, where impl ⊑ spec means failures(impl) ⊆
+	/// failures(spec).
+	///
+	/// For each impl failure (trace, impl_refusal), the spec must hold a
+	/// failure (trace, spec_refusal) where impl_refusal ⊆ spec_refusal.
+	///
+	/// Reference: Roscoe (1998, 2010)
 	fn check_failures_refinement(&mut self, spec: &Process, impl_process: &Process) -> RefinementOutcome<Failure> {
-		// Failures refinement: impl ⊑ spec means failures(impl) ⊆ failures(spec)
-		// For each impl failure (trace, impl_refusal), there must exist a spec failure
-		// (trace, spec_refusal) where impl_refusal ⊆ spec_refusal.
-		// Reference: Roscoe (1998, 2010)
 		let (spec_failures, spec_complete) = self.compute_failures(spec, self.config.max_depth);
 		let (impl_failures, impl_complete) = self.compute_failures(impl_process, self.config.max_depth);
 		for (impl_trace, impl_refusal) in &impl_failures {
@@ -410,9 +423,11 @@ where
 		RefinementOutcome::Holds { complete: spec_complete && impl_complete }
 	}
 
+	/// Check divergence refinement, where impl ⊑ spec means divergences(impl) ⊆
+	/// divergences(spec).
+	///
+	/// Reference: Roscoe (1998, 2010)
 	fn check_divergence_refinement(&mut self, spec: &Process, impl_process: &Process) -> RefinementOutcome<Trace> {
-		// Divergence refinement: impl ⊑ spec means divergences(impl) ⊆ divergences(spec)
-		// Reference: Roscoe (1998, 2010)
 		let (spec_divergences, spec_complete) = self.compute_divergences(spec, self.config.max_depth);
 		let (impl_divergences, impl_complete) = self.compute_divergences(impl_process, self.config.max_depth);
 
@@ -438,7 +453,8 @@ where
 			return (cached.into_iter().collect(), complete);
 		}
 
-		// Fast path: For linear trace processes, extract trace directly
+		// A linear process yields its one trace directly, which skips the
+		// search.
 		if let Some(linear_trace) = Self::extract_linear_trace(process, max_depth) {
 			let mut traces = HashSet::new();
 			traces.insert(linear_trace.clone());
@@ -511,7 +527,8 @@ where
 			return (cached, complete);
 		}
 
-		// Failures are only recorded at stable states (no τ-transitions enabled)
+		// Failures are recorded at stable states only, which enable no
+		// τ-transition.
 		// Reference: Roscoe (1998, 2010)
 		let failures = Vec::new();
 		let visited = HashSet::new();
@@ -604,8 +621,9 @@ where
 		(divergences, true)
 	}
 
-	/// Compute refusal set for a stable state.
-	/// Refusal set = all observable events minus enabled events.
+	/// Compute the refusal set of a stable state, which is every observable
+	/// event minus the enabled events.
+	///
 	/// Reference: Roscoe (1998, 2010)
 	fn compute_refusals(&self, process: &Process, state: State) -> HashSet<Event> {
 		let enabled_events: HashSet<Event> = process

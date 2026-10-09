@@ -35,8 +35,6 @@ pub mod r#async;
 #[cfg(feature = "tcp")]
 pub mod sync;
 
-// Canonical definition lives in transport::io so it exists without the TCP features.
-
 /// Abstract TCP listener trait for different networking backends.
 #[cfg(feature = "tcp")]
 pub trait TcpListenerTrait: Protocol + Send {
@@ -166,11 +164,11 @@ impl ops::Deref for TightBeamSocketAddr {
 #[cfg(feature = "std")]
 impl TightBeamAddress for TightBeamSocketAddr {}
 
-/// Macro to generate the common transport implementation for both sync
-/// and async.
+/// Macro to generate the common transport implementation for both sync and
+/// async.
 ///
-/// Defines the transport struct itself plus its one constructor and the
-/// shared trait impls. The struct definition is the single source for the
+/// The macro defines the transport struct itself plus its one constructor and
+/// the shared trait impls. The struct definition is the single source for the
 /// field list.
 #[doc(hidden)]
 #[macro_export]
@@ -203,10 +201,10 @@ macro_rules! impl_tcp_common {
 		{
 			/// Build a transport over `stream` from `config`.
 			///
-			/// The one constructor. The configuration's provisioning already
-			/// answered the dialer rule, so the session starts where that
-			/// provisioning says: `Provisioned` when it names a peer authority,
-			/// `Cleartext` only when cleartext was named.
+			/// This is the one constructor. The configuration's provisioning
+			/// already answered the dialer rule, so the session starts where
+			/// that provisioning says: `Provisioned` when it names a peer
+			/// authority, `Cleartext` only when cleartext was named.
 			pub fn new(stream: S, config: $crate::transport::EndpointConfig<P>) -> Self {
 				let $crate::transport::EndpointConfig {
 					encryption,
@@ -233,8 +231,9 @@ macro_rules! impl_tcp_common {
 				}
 			}
 
-			/// Peer certificate after completed mutual authentication.
-			/// `None` if unused or incomplete.
+			/// Returns the validated peer certificate of the established
+			/// session, or `None` when no session is established or the peer
+			/// presented none.
 			pub fn peer_certificate(&self) -> Option<&$crate::x509::Certificate> {
 				self.state.peer_certificate()
 			}
@@ -262,7 +261,8 @@ macro_rules! impl_tcp_common {
 				self
 			}
 
-			/// Session outcome observer for budget-bearing handshakes this endpoint serves.
+			/// Set the observer of session outcomes for the budget-bearing
+			/// handshakes that this endpoint serves.
 			#[must_use]
 			pub fn with_session_observer(
 				mut self,
@@ -272,8 +272,8 @@ macro_rules! impl_tcp_common {
 				self
 			}
 
-			/// Approver consulted before countersigning a challenge-bearing
-			/// receipt.
+			/// Set the approver consulted before countersigning a
+			/// challenge-bearing receipt.
 			#[must_use]
 			pub fn with_receipt_approver(
 				mut self,
@@ -283,7 +283,8 @@ macro_rules! impl_tcp_common {
 				self
 			}
 
-			/// Handshake protocol this endpoint runs once provisioned.
+			/// Set the handshake protocol that this endpoint runs once
+			/// provisioned.
 			#[must_use]
 			pub fn with_handshake_protocol(mut self, kind: $crate::transport::handshake::HandshakeProtocolKind) -> Self {
 				self.state.select_handshake(kind);
@@ -298,16 +299,8 @@ macro_rules! impl_tcp_common {
 				self
 			}
 
-			/// True while this endpoint expects an encryption handshake that has
-			/// not completed yet. Such reads face an unauthenticated peer, so the
-			/// read layer applies the tight `handshake_wire` ceiling and the
-			/// handshake deadline instead of the general envelope limits.
-			pub(crate) fn is_handshake_pending(&self) -> bool {
-				self.state.phase().is_handshake_pending()
-			}
-
-			/// Share of the connection's instrumentation collector, if
-			/// attached.
+			/// Returns a share of the connection's instrumentation collector,
+			/// if one is attached.
 			#[cfg(feature = "instrument")]
 			pub fn trace(&self) -> Option<$crate::trace::TraceCollector> {
 				self.trace.as_ref().map($crate::trace::TraceCollector::share)

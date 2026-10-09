@@ -19,13 +19,13 @@ use crate::der::Encode;
 use crate::transport::error::TransportFailure;
 use crate::transport::framing::{FrameHeader, HeaderPrefix, LengthForm};
 use crate::transport::handshake::BoxedServerHandshake;
-use crate::transport::state::EncryptedProtocolState;
+use crate::transport::state::{EncryptedProtocolState, ReadPolicy};
 use crate::transport::tcp::{TcpListenerTrait, TightBeamSocketAddr};
 use crate::transport::{
 	EncryptedMessageIO, EncryptedProtocol, EndpointConfig, MessageCollector, MessageEmitter, MessageIO, Protocol,
 	ResponsePackage, TransportEncryptionConfig, TransportResult,
 };
-use crate::utils::time::{Clock, MonotonicInstant};
+use crate::utils::time::Clock;
 use crate::Frame;
 
 #[cfg(feature = "instrument")]
@@ -43,7 +43,7 @@ mod policy {
 #[cfg(feature = "transport-policy")]
 use policy::*;
 
-// Generates the TcpTransport struct definition and common implementations
+// The macro generates the `TcpTransport` struct and its common implementations.
 crate::impl_tcp_common!(TcpTransport, ProtocolStream);
 
 /// Slice sizes for deadline-bounded content reads. The stream timeout is
@@ -60,17 +60,14 @@ impl<S: ProtocolStream, P: CryptoProvider> TcpTransport<S, P>
 where
 	TransportError: From<S::Error>,
 {
-	/// Re-arm the stream's per-recv timeout with the budget remaining until
-	/// `deadline`, failing with `Timeout` once the budget is exhausted.
-	fn arm_read_deadline(&mut self, deadline: Option<MonotonicInstant>) -> TransportResult<()> {
-		let Some(deadline) = deadline else {
+	/// Re-arm the stream's per-recv timeout with the budget `policy` leaves at
+	/// this instant, failing with `DeadlineExceeded` once the budget is
+	/// exhausted.
+	fn arm_read_deadline(&mut self, policy: &ReadPolicy) -> TransportResult<()> {
+		let now = self.clock.monotonic();
+		let Some(remaining) = policy.remaining(now)? else {
 			return Ok(());
 		};
-
-		let remaining = deadline.saturating_duration_since(self.clock.monotonic());
-		if remaining.is_zero() {
-			return Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded));
-		}
 
 		self.stream.set_timeout(Some(remaining))?;
 		Ok(())
@@ -86,27 +83,17 @@ where
 	}
 
 	async fn read_envelope_bytes(&mut self) -> TransportResult<Vec<u8>> {
-		let handshake_pending = self.is_handshake_pending();
+		let handshake_pending = self.state.phase().is_handshake_pending();
 
-		// Absolute deadline for the whole envelope read. Every stage below
-		// re-arms the per-recv timeout with the *remaining* budget. Handshake
-		// reads face an unauthenticated peer, so the handshake deadline
-		// applies from the first byte onward. A deadline past every reading
-		// never arrives, so it is absent.
-		#[cfg(feature = "std")]
-		let deadline = {
-			let (started, allowance) = match self.state.phase().initiated_at() {
-				Some(initiated_at) if handshake_pending => (initiated_at, self.limits.handshake_timeout),
-				_ if handshake_pending => (self.clock.monotonic(), self.limits.handshake_timeout),
-				_ => (self.clock.monotonic(), self.limits.operation_timeout),
-			};
-
-			started.checked_add(allowance)
-		};
+		// Every stage below re-arms the per-recv timeout with the remaining
+		// budget of the phase's read policy, so the handshake deadline applies
+		// from the first byte.
+		let now = self.clock.monotonic();
+		let policy = self.state.phase().read_policy(&self.limits, now);
 
 		let result = (|| -> TransportResult<Vec<u8>> {
 			#[cfg(feature = "std")]
-			self.arm_read_deadline(deadline)?;
+			self.arm_read_deadline(&policy)?;
 
 			// EOF before the tag is the peer closing between frames. EOF
 			// anywhere after it is a truncated frame.
@@ -116,7 +103,7 @@ where
 				.map_err(|e| (e.into()).at_frame_boundary())?;
 
 			#[cfg(feature = "std")]
-			self.arm_read_deadline(deadline)?;
+			self.arm_read_deadline(&policy)?;
 
 			let mut length_first = [0u8; 1];
 			self.stream
@@ -129,7 +116,7 @@ where
 					let mut length_octets = vec![0u8; octet_count];
 
 					#[cfg(feature = "std")]
-					self.arm_read_deadline(deadline)?;
+					self.arm_read_deadline(&policy)?;
 
 					self.stream
 						.read_exact(&mut length_octets)
@@ -139,27 +126,19 @@ where
 				}
 			};
 
-			// Unauthenticated handshake reads get the tight handshake cap, and
-			// established sessions the envelope limits. The admitted header is
-			// the only source of a length to allocate with.
-			let cap = if handshake_pending {
-				self.limits.handshake_wire
-			} else {
-				self.limits.max_envelope()
-			};
-
+			// The admitted header is the only source of a length to allocate
+			// with.
 			let prefix = HeaderPrefix { tag: tag_byte[0], length_first: length_first[0] };
-			let header = FrameHeader::parse(prefix, length_octets)?.admit(cap)?;
+			let header = FrameHeader::parse(prefix, length_octets)?.admit(policy.cap())?;
 			let content_length = header.content_len();
 
-			// Read content. Without a deadline one read suffices. With one,
-			// read in slices and re-check the remaining budget between them
-			// so a byte-dripping peer cannot stretch the read via per-recv
-			// timeout resets inside a single large read_exact.
+			// With a deadline the read runs in slices and re-checks the budget
+			// between them, so a byte-dripping peer cannot stretch it through
+			// per-recv timeout resets. Without one, a single read suffices.
 			let mut content = vec![0u8; content_length];
 			#[cfg(feature = "std")]
 			{
-				if deadline.is_some() {
+				if policy.deadline().is_some() {
 					let slice_len = if handshake_pending {
 						HANDSHAKE_READ_SLICE
 					} else {
@@ -168,7 +147,7 @@ where
 
 					let mut filled = 0;
 					while filled < content_length {
-						self.arm_read_deadline(deadline)?;
+						self.arm_read_deadline(&policy)?;
 
 						let end = usize::min(filled + slice_len, content_length);
 						self.stream
@@ -188,7 +167,9 @@ where
 		})();
 
 		#[cfg(feature = "std")]
-		if deadline.is_some() {
+		if policy.deadline().is_some() {
+			// The reset is cleanup. The result in hand is what the caller acts
+			// on, and a failed reset does not change it.
 			let _ = self.stream.set_timeout(None);
 		}
 
@@ -201,6 +182,8 @@ where
 
 		let result = self.stream.write_all(buffer);
 
+		// The reset is cleanup. The result in hand is what the caller acts on,
+		// and a failed reset does not change it.
 		#[cfg(feature = "std")]
 		let _ = self.stream.set_timeout(None);
 
@@ -264,6 +247,8 @@ where
 			self.stream.set_timeout(Some(self.limits.operation_timeout))?;
 
 			let result = self.perform_emit_cycle(message).await;
+			// The reset is cleanup. The result in hand is what the caller acts
+			// on, and a failed reset does not change it.
 			let _ = self.stream.set_timeout(None);
 			result.map_err(|e| {
 				if let TransportError::IoError(io_err) = &e {
@@ -418,8 +403,9 @@ mod tests {
 			Ok((result, started.elapsed()))
 		});
 
-		// SEQUENCE header declaring 600 content bytes, sent whole. The body
-		// then drips one byte per 10ms (well under any per-recv timeout).
+		// The SEQUENCE header declares 600 content bytes and goes out whole.
+		// The body then drips one byte per 10ms, well under any per-recv
+		// timeout.
 		let mut stream = NetTcpStream::connect(addr)?;
 		Write::write_all(&mut stream, &[0x30, 0x82, 0x02, 0x58])?;
 
@@ -463,7 +449,8 @@ mod tests {
 			Ok(rt.block_on(transport.read_envelope_bytes()))
 		});
 
-		// SEQUENCE header declaring 600 content bytes, with no content sent.
+		// The SEQUENCE header declares 600 content bytes, and no content
+		// follows.
 		let mut stream = NetTcpStream::connect(addr)?;
 		Write::write_all(&mut stream, &[0x30, 0x82, 0x02, 0x58])?;
 

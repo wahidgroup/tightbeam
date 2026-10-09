@@ -77,8 +77,7 @@ impl ClusterWorkRequest {
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError::SerializationError`] -- `work` or the envelope
-	///   does not encode.
+	/// - [`TightBeamError::SerializationError`] -- `work` or the envelope does not encode.
 	pub(crate) fn transport_frame(servlet_type: Urn<'static>, work: &Frame) -> Result<Frame, TightBeamError> {
 		let request = ClusterRequest::Work(Self::new(servlet_type, work)?);
 		let message = encode(&request)?;
@@ -108,8 +107,6 @@ wire_sequence!(ClusterWorkResponse { status: plain, payload: octets_opt });
 impl ClusterWorkResponse {
 	/// Creates a successful response that carries the servlet's encoded
 	/// response frame.
-	///
-	/// `payload` accepts any value convertible into [`Vec<u8>`].
 	#[inline]
 	pub fn ok(payload: impl Into<Vec<u8>>) -> Self {
 		Self { status: TransitStatus::Ok, payload: Some(payload.into()) }
@@ -153,13 +150,14 @@ impl ClusterWorkResponse {
 
 	/// Unwraps a gateway reply down to the servlet's response frame.
 	///
-	/// The inverse of [`ClusterWorkRequest::transport_frame`]: the reply is
-	/// the hop-local wrapper, and the servlet's own frame travels inside it.
+	/// This is the inverse of [`ClusterWorkRequest::transport_frame`]: the
+	/// reply is the hop-local wrapper, and the servlet's own frame travels
+	/// inside it.
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError::MissingResponse`] -- the gateway answered with
-	///   no frame at all.
+	/// - [`TightBeamError::MissingResponse`] -- the gateway answered with no frame at all.
+	/// - [`TightBeamError::SerializationError`] -- the reply does not decode as a work response.
 	/// - Any error that [`Self::served`] reports for the decoded response.
 	pub(crate) fn served_reply(reply: Option<Frame>) -> Result<Frame, TightBeamError> {
 		let reply = reply.ok_or(TightBeamError::MissingResponse)?;
@@ -355,8 +353,6 @@ wire_sequence!(GossipRumor { payload: octets, kind: default(GossipRumorKind::App
 
 impl GossipRumor {
 	/// An application rumor, delivered through the ingress policy.
-	///
-	/// `payload` accepts any value convertible into [`Vec<u8>`].
 	#[must_use]
 	pub fn application(payload: impl Into<Vec<u8>>) -> Self {
 		Self { payload: payload.into(), kind: GossipRumorKind::Application }
@@ -364,8 +360,6 @@ impl GossipRumor {
 
 	/// An advertisement rumor that carries an origin-signed ad frame's DER
 	/// bytes for transitive peer discovery.
-	///
-	/// `ad_frame` accepts any value convertible into [`Vec<u8>`].
 	#[must_use]
 	pub fn peer_advertisement(ad_frame: impl Into<Vec<u8>>) -> Self {
 		Self { payload: ad_frame.into(), kind: GossipRumorKind::PeerAdvertisement }
@@ -401,8 +395,7 @@ wire_sequence!(GossipReconciliation { held: octets_seq });
 /// unverified hint to its receiver:
 ///
 /// - Admission is bounded per address prefix.
-/// - Only a probe dial whose handshake certificate proves the local colony
-///   makes the peer a dial target.
+/// - Only a probe dial whose handshake certificate proves the local colony makes the peer a dial target.
 /// - The fingerprint is advisory identity for deduplication, and trust never
 ///   derives from exchanged bytes (CWE-345).
 #[derive(Debug, Beamable, Clone, PartialEq)]
@@ -457,14 +450,14 @@ pub struct ActivateServletResponse {
 wire_sequence!(ActivateServletResponse { status: plain, servlet_address: octets_opt });
 
 impl ActivateServletResponse {
-	/// Creates a successful activation response.
+	/// Creates an `Ok` response that carries the activated servlet's address.
 	#[inline]
 	pub fn ok(address: impl Into<Vec<u8>>) -> Self {
 		let address: Vec<u8> = address.into();
 		Self { status: TransitStatus::Ok, servlet_address: Some(address) }
 	}
 
-	/// Creates a failed activation response.
+	/// Creates a refusal that carries `status` and no address.
 	#[inline]
 	pub fn err(status: TransitStatus) -> Self {
 		Self { status, servlet_address: None }
@@ -730,7 +723,8 @@ pub struct StopServletResult {
 }
 
 impl HiveManagementResponse {
-	/// Creates a spawn success response.
+	/// Creates an `Ok` spawn result that names the new servlet's address and
+	/// instance URN.
 	#[inline]
 	pub fn spawn_ok(address: impl Into<Vec<u8>>, servlet_id: Urn<'static>) -> Self {
 		let address: Vec<u8> = address.into();
@@ -745,7 +739,7 @@ impl HiveManagementResponse {
 		}
 	}
 
-	/// Creates a list response.
+	/// Creates an `Ok` list result that carries the hive's active `servlets`.
 	#[inline]
 	pub fn list_ok(servlets: impl IntoIterator<Item = ServletInfo>) -> Self {
 		let servlets: Vec<ServletInfo> = servlets.into_iter().collect();
@@ -756,7 +750,7 @@ impl HiveManagementResponse {
 		}
 	}
 
-	/// Creates a stop success response.
+	/// Creates an `Ok` stop result.
 	#[inline]
 	pub fn stop_ok() -> Self {
 		Self {
@@ -922,6 +916,18 @@ impl HiveManagementResponse {
 }
 
 impl ClusterCommand {
+	/// The one command `frame` carries, decoded and proved in one step.
+	///
+	/// [`None`] covers a body that does not decode as a command and a body
+	/// that names no single alternative. Both are the sender's own fault,
+	/// so a refusal reads its reply shape from this answer through
+	/// [`ReplyShape::of`].
+	#[must_use]
+	pub(crate) fn choice_of(frame: &Frame) -> Option<ClusterCommandKind> {
+		let command = decode::<Self>(frame.message()).ok()?;
+		command.into_choice().ok()
+	}
+
 	/// Consumes this product for the one command it names.
 	///
 	/// A management command proves its own alternative here as well, so a
@@ -973,7 +979,8 @@ pub struct HeartbeatResult {
 }
 
 impl ClusterCommandResponse {
-	/// Creates a heartbeat response.
+	/// Answers a heartbeat with the hive's status, utilization, and servlet
+	/// count.
 	#[inline]
 	pub fn heartbeat(status: TransitStatus, utilization: BasisPoints, active_servlets: u32) -> Self {
 		Self {
@@ -982,7 +989,7 @@ impl ClusterCommandResponse {
 		}
 	}
 
-	/// Creates a management response wrapper.
+	/// Wraps a management response in the manage alternative.
 	#[inline]
 	pub fn manage(response: HiveManagementResponse) -> Self {
 		Self { heartbeat: None, manage: Some(response) }
@@ -1057,6 +1064,43 @@ mod tests {
 
 	fn work_frame() -> Frame {
 		Frame::v0(b"work-1", vec![0x02, 0x01, 0x2A])
+	}
+
+	/// A frame whose body is `command` as the wire spells it.
+	fn command_frame(command: &ClusterCommand) -> Frame {
+		let body = encode(command).expect("a cluster command encodes");
+
+		Frame::v0(b"command-1", body)
+	}
+
+	#[test]
+	fn choice_of_reads_the_one_command_a_frame_carries() {
+		let heartbeat = HeartbeatParams { cluster_status: ClusterStatus::Healthy };
+		let frame = command_frame(&ClusterCommand::from(ClusterCommandKind::Heartbeat(heartbeat.clone())));
+
+		let choice = ClusterCommand::choice_of(&frame);
+
+		assert_eq!(choice, Some(ClusterCommandKind::Heartbeat(heartbeat)));
+	}
+
+	#[test]
+	fn choice_of_refuses_a_body_that_names_two_commands() {
+		let heartbeat = HeartbeatParams { cluster_status: ClusterStatus::Healthy };
+		let manage = HiveManagementRequest { spawn: None, list: None, stop: None };
+		let frame = command_frame(&ClusterCommand { heartbeat: Some(heartbeat), manage: Some(manage) });
+
+		let choice = ClusterCommand::choice_of(&frame);
+
+		assert_eq!(choice, None);
+	}
+
+	#[test]
+	fn choice_of_refuses_a_body_that_is_no_command() {
+		let frame = work_frame();
+
+		let choice = ClusterCommand::choice_of(&frame);
+
+		assert_eq!(choice, None);
 	}
 
 	#[test]

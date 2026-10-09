@@ -12,7 +12,6 @@ use std::sync::{Arc, Mutex};
 
 use crate::colony::common::{ClusterCommand, ClusterCommandKind, ClusterCommandResponse, IssuedAt, ReplyShape};
 use crate::crypto::x509::store::{CertificateTrust, TrustVerification};
-use crate::decode;
 use crate::der::Encode;
 use crate::policy::{GatePolicy, ProvenPeer, SessionContext, TransitStatus};
 use crate::utils::time::{Clock, MonotonicInstant, UnixMillis};
@@ -153,11 +152,11 @@ impl ClusterCircuitBreaker {
 
 	/// Whether a request from `signer` would be admitted right now.
 	///
-	/// The check is read-only. A cooldown that has expired reports `true`
-	/// without taking the one probe [`ClusterCircuitBreaker::admit_request`]
-	/// spends, so asking the question never answers it: a verdict that
-	/// consumed the probe would leave the circuit half-open with no
-	/// outcome recorded, and half-open admits every later request.
+	/// The check is read-only. A cooldown that has expired reports `true` and
+	/// leaves the one probe for [`ClusterCircuitBreaker::admit_request`] to
+	/// spend. A verdict that consumed the probe would leave the circuit
+	/// half-open with no outcome recorded, and half-open admits every later
+	/// request.
 	#[must_use]
 	pub fn would_allow(&self, signer: ProvenPeer<'_>) -> bool {
 		let Ok(signers) = self.signers.lock() else {
@@ -409,11 +408,9 @@ impl ReplayGuard {
 			return false;
 		};
 
-		// Replay detection spans all partitions: the same certificate can be
-		// named by either SignerIdentifier CHOICE arm, so a partition-local
-		// check would grant one extra replay per alternate encoding. The
-		// index carries every partition's signatures, so one lookup answers
-		// for all of them.
+		// Replay detection spans all partitions: either `SignerIdentifier`
+		// CHOICE arm can name one certificate, so a partition-local check would
+		// grant one extra replay per alternate encoding.
 		if seen.is_live_replay(signature, now, self.window) {
 			return false;
 		}
@@ -456,19 +453,26 @@ impl ReplayGuard {
 /// 2. Require frame integrity (missing: `Unauthenticated`, not counted).
 /// 3. Require a handshake-proven peer (missing: `Unauthenticated`), and refuse
 ///    while its circuit is open (`PermissionDenied`). Neither is counted.
-/// 4. Look up the signer certificate in the trust store (unknown signer:
-///    `PermissionDenied`, not counted).
-/// 5. Verify the signature with the certificate's public key (invalid:
-///    `PermissionDenied`, **counted**).
+/// 4. Look up the signer certificate in the trust store (unknown signer: `PermissionDenied`, not counted).
+/// 5. Verify the signature with the certificate's public key (invalid: `PermissionDenied`, **counted**).
 /// 6. Check `Frame.metadata.order` freshness (stale: `PermissionDenied`, not counted).
 /// 7. Refuse a signature already seen inside the window (replay: `PermissionDenied`, not counted).
-/// 8. On success, take the breaker's cooldown probe and record the success,
-///    which resets the breaker.
+/// 8. On success, take the breaker's cooldown probe and record the success, which resets the breaker.
 ///
 /// Only step 5 counts toward the circuit breaker, and it counts against
 /// the [`ProvenPeer`] the transport handshake established, so one member's
 /// failures gate that member alone (CWE-645). Steps 6-7 stay uncounted,
 /// because a replayed capture still carries a valid signature.
+///
+/// # Breaker key
+///
+/// - The signature is still unchecked where the breaker is first read, so the
+///   breaker keys on the handshake-proven peer.
+/// - [`ProvenPeer`] is the only key the breaker accepts, so a caller who copies
+///   a trusted `SignerIdentifier` spends its own budget (CWE-345).
+/// - An unauthenticated transport offers no such key. Sharing one row across
+///   every anonymous caller would let a single bad signature deny the rest,
+///   so this plane requires a proven peer (CWE-645).
 pub struct ClusterSecurityGate {
 	/// The breaker that counts authentication failures, on this gate's clock.
 	circuit_breaker: ClusterCircuitBreaker,
@@ -476,8 +480,8 @@ pub struct ClusterSecurityGate {
 	trust_store: Arc<dyn CertificateTrust>,
 	/// Freshness window and replay set for signed commands.
 	///
-	/// Shared with every [`AdmittedCommand`] this gate admits, so a
-	/// refusal the command meets later can release the slot it spent.
+	/// The guard is shared with every [`AdmittedCommand`] this gate admits, so
+	/// a refusal the command meets later can release the slot it spent.
 	replay_guard: Arc<ReplayGuard>,
 	/// The clock a command's freshness is judged against, and the one the
 	/// breaker's cooldown runs on.
@@ -628,9 +632,7 @@ impl AdmitRefusal {
 	/// A body that names no single alternative has no heartbeat shape, so
 	/// the refusal answers in the management shape.
 	pub(crate) fn denied(frame: Frame, status: TransitStatus) -> Box<Self> {
-		let body = decode::<ClusterCommand>(frame.message())
-			.ok()
-			.and_then(|command| command.into_choice().ok());
+		let body = ClusterCommand::choice_of(&frame);
 		let shape = ReplyShape::of(body.as_ref());
 
 		Self::boxed(frame, status, shape)
@@ -657,8 +659,8 @@ impl AdmitRefusal {
 
 /// What the non-spending checks proved about one frame.
 ///
-/// Held between [`ClusterSecurityGate::inspect`] and the steps that spend,
-/// so the spending steps do not re-derive any of it.
+/// The gate holds it between [`ClusterSecurityGate::inspect`] and the steps
+/// that spend, so the spending steps read what the checks already derived.
 struct Authenticated<'a> {
 	signer: SignerInfo,
 	signer_id: Vec<u8>,
@@ -671,7 +673,8 @@ struct Authenticated<'a> {
 /// breaker, so it is a variant rather than a status: the verdict reports
 /// it without recording anything, and the admission records it once.
 enum InspectRefusal {
-	/// Refused before, or independently of, judging the signature.
+	/// The frame was refused before, or independently of, the signature
+	/// check.
 	Plain(TransitStatus),
 	/// The signature did not verify against the trust store.
 	BadSignature,
@@ -704,15 +707,16 @@ impl ClusterSecurityGate {
 
 	/// Judges `frame` without spending anything it judges.
 	///
-	/// Every refusal [`ClusterSecurityGate::admit`] can give is given here,
-	/// replay included: a captured frame is refused because the signature is
-	/// already recorded, not because asking recorded it.
+	/// The verdict covers the signer, the peer's circuit, freshness, and
+	/// replay. A captured frame is therefore refused here, because its
+	/// signature is already recorded, and the question itself records nothing.
 	///
 	/// # Left to the admission
 	///
 	/// - Taking the breaker's cooldown probe.
 	/// - Recording an auth failure.
-	/// - Inserting the signature.
+	/// - Refusing a body that names no single command.
+	/// - Inserting the signature, which refuses a full partition.
 	/// - Recording a success.
 	fn inspect<'a>(
 		&self,
@@ -735,14 +739,8 @@ impl ClusterSecurityGate {
 			return Err(InspectRefusal::Plain(TransitStatus::PermissionDenied));
 		};
 
-		// The breaker keys on the handshake-proven peer, because a failure
-		// reached here before the signature was checked. `ProvenPeer` is
-		// the only key the breaker accepts, so a caller who copies a
-		// trusted `SignerIdentifier` spends its own budget (CWE-345).
-		//
-		// An unauthenticated transport offers no such key. Sharing one row
-		// across every anonymous caller would let a single bad signature
-		// deny the rest, so this plane requires a proven peer (CWE-645).
+		// The breaker keys on the handshake-proven peer, so a transport that
+		// proves none is refused here (CWE-345, CWE-645).
 		let Some(breaker_key) = session.proven_peer() else {
 			return Err(InspectRefusal::Plain(TransitStatus::Unauthenticated));
 		};
@@ -785,9 +783,7 @@ impl ClusterSecurityGate {
 		// The body decodes once, and that decode proves the CHOICE that the
 		// body spells as tagged optional fields. A body that names none or
 		// several is not a command, so the ambiguous form stops here.
-		let body = decode::<ClusterCommand>(frame.message())
-			.ok()
-			.and_then(|command| command.into_choice().ok());
+		let body = ClusterCommand::choice_of(&frame);
 
 		let shape = ReplyShape::of(body.as_ref());
 		let now = self.clock.unix();
@@ -804,10 +800,9 @@ impl ClusterSecurityGate {
 			}
 		};
 
-		// Replay capacity spends on well-formed frames (CWE-770). A body
-		// that does not decode, or that names no single alternative, is
-		// malformed rather than unauthorized: the sender's own request is
-		// wrong whatever this hive's state is.
+		// Replay capacity spends on well-formed frames (CWE-770). A body that
+		// does not decode or names no single alternative is malformed rather
+		// than unauthorized, and stays wrong whatever this hive's state is.
 		let Some(body) = body else {
 			return Err(AdmitRefusal::boxed(frame, TransitStatus::InvalidArgument, shape));
 		};
@@ -817,10 +812,9 @@ impl ClusterSecurityGate {
 			return Err(AdmitRefusal::boxed(frame, TransitStatus::PermissionDenied, shape));
 		}
 
-		// The breaker's cooldown probe is taken last, immediately before
-		// the outcome it is waiting for. A probe spent on a path that then
-		// refuses leaves the circuit half-open with nothing recorded, and
-		// half-open admits every request after it.
+		// The cooldown probe is taken last, immediately before the outcome it
+		// waits for, so no refusing path leaves the circuit half-open with
+		// nothing recorded.
 		if !self.circuit_breaker.admit_request(breaker_key) {
 			// This frame is not admitted, so its signature must not count
 			// as seen: a legitimate retry would be refused as a replay.
@@ -948,10 +942,10 @@ pub enum PeerListMode {
 /// An allow list or a deny list of session identities.
 ///
 /// The gate keys on the DER-encoded `SubjectPublicKeyInfo` of the
-/// connection's mutually authenticated peer certificate. The frame signer is
-/// an application-level concern and plays no part. An empty session context
-/// answers as an absent peer, so an allow list fails closed
-/// (`Unauthenticated`) and a deny list admits.
+/// connection's mutually authenticated peer certificate. It reads the
+/// transport peer alone, so the frame signer stays an application-level
+/// concern. An empty session context answers as an absent peer, so an allow
+/// list fails closed (`Unauthenticated`) and a deny list admits.
 #[derive(Clone)]
 pub struct PeerListGate {
 	keys: HashSet<Vec<u8>>,

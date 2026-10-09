@@ -45,6 +45,12 @@ pub enum HandshakeError {
 	#[error("Server ephemeral equals the server static key")]
 	ServerEphemeralIsStatic,
 
+	/// A client's rekey ephemeral public key is the client's static key. The
+	/// agreement of the renewal would then collapse into the static one, which
+	/// the client's key recovers, so the server refuses it.
+	#[error("Client ephemeral equals the client static key")]
+	ClientEphemeralIsStatic,
+
 	/// The peer certificate failed validation.
 	#[error("Invalid certificate: {0}")]
 	#[from]
@@ -155,6 +161,12 @@ pub enum HandshakeError {
 	/// in flight.
 	#[error("Receipt acknowledgement AEAD failure: {0}")]
 	ReceiptAckCipher(crate::crypto::aead::Error),
+
+	/// The key-confirmation tag of the closing differs from the tag the server
+	/// derived. The client holds another handshake secret, or it confirmed
+	/// another transcript.
+	#[error("Key confirmation failed")]
+	KeyConfirmationFailed,
 
 	/// The KDF salt of a traffic-key derivation is below the minimum entropy
 	/// requirement. `actual` is the salt length and `minimum` is the required
@@ -290,11 +302,6 @@ pub enum HandshakeError {
 	/// key wrap.
 	#[error("Negotiated key wrap algorithm unsupported (expected AES-128/192/256 key wrap)")]
 	UnsupportedKeyWrapAlgorithm,
-	/// An AES key wrap operation failed.
-	#[cfg(all(feature = "builder", feature = "aead"))]
-	#[error("AES key wrap operation failed: {0}")]
-	#[from]
-	AesKeyWrap(crate::crypto::aead::aes_kw::Error),
 
 	/// Random generation failed.
 	#[error("Random generation failed")]

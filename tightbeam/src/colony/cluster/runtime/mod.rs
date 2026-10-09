@@ -46,9 +46,8 @@ use crate::policy::TransitStatus;
 use crate::trace::TraceCollector;
 use crate::transport::accept::AcceptPlane;
 use crate::transport::handshake::negotiation::TransportOffer;
-use crate::transport::multiplex::{MuxCapable, ReplySink, StreamBody};
+use crate::transport::multiplex::{CallContext, MuxCapable, MuxService, ReplySink, StreamBody};
 use crate::transport::policy::PolicyConfig;
-use crate::transport::serve::{CallContext, MuxService};
 use crate::transport::{AsyncListenerTrait, Protocol, TransportEncryptionConfig, TransportError};
 use crate::utils::time::Clock;
 use crate::utils::urn::Urn;
@@ -73,9 +72,11 @@ pub(crate) enum LoopFault {
 }
 
 impl LoopFault {
-	/// Records a registry fault on `trace`, the one observer a detached
-	/// loop has. A runtime fault is the trace's own refusal, so the trace
-	/// already holds it.
+	/// Records a registry fault on `trace`, the one observer a detached loop
+	/// has.
+	///
+	/// A runtime fault ends the loop silently. The trace already holds its own
+	/// refusal, and a task that did not join leaves no record.
 	pub(crate) fn record(self, trace: &TraceCollector) {
 		let Self::Registry(error) = self else {
 			return;
@@ -162,14 +163,10 @@ impl ClusterConfig {
 	}
 }
 
-fn protocol_error<E: Into<TransportError>>(error: E) -> TightBeamError {
-	TightBeamError::from(error.into())
-}
-
 /// Running cluster gateway for protocol `P`, digest `D`, and edge protocol `E`.
 ///
-/// Owns the accept, heartbeat, evaporation, and advertise tasks for the
-/// colony bind address and, when configured, a second edge accept plane.
+/// The gateway owns the accept, heartbeat, evaporation, and advertise tasks for
+/// the colony bind address and, when configured, a second edge accept plane.
 /// Callers reach cluster state only through [`Cluster`] and
 /// [`ClusterHeartbeat`].
 ///
@@ -240,11 +237,9 @@ where
 	type Address = P::Address;
 
 	async fn start(trace: Arc<TraceCollector>, config: ClusterConfig) -> Result<Self, TightBeamError> {
-		// The admission freshness window MUST stay within journal retention
-		// (CWE-294):
-		// - A rumor older than retention has no digest left, so a wider window
-		//   would re-admit a replay as new.
-		// - The clamp runs before config is wrapped in `Arc`, which fixes the window for its lifetime.
+		// The freshness window MUST stay within journal retention (CWE-294).
+		// The clamp runs before `Arc` wraps the config, which fixes the window
+		// for its lifetime.
 		let config = {
 			let mut config = config;
 			let retention = config.gossip.journal.retention();
@@ -264,12 +259,12 @@ where
 		// TLS.
 		let bind_addr = match config.bind_addr.as_deref() {
 			Some(raw) => raw.parse().map_err(|_| TransportError::InvalidMessage)?,
-			None => P::default_bind_address().map_err(protocol_error)?,
+			None => P::default_bind_address().map_err(TightBeamError::transport)?,
 		};
 
 		let (listener, addr) = P::bind_with(bind_addr, config.accept_encryption_config()?)
 			.await
-			.map_err(protocol_error)?;
+			.map_err(TightBeamError::transport)?;
 
 		let control_window = config.control_freshness_window;
 		let registry = Arc::new(HiveRegistry::new(config.heartbeat.timeout, Arc::clone(&config.clock)));
@@ -303,7 +298,7 @@ where
 				let edge_bind: E::Address = raw.parse().map_err(|_| TransportError::InvalidMessage)?;
 				let (edge_listener, edge_addr) = E::bind_with(edge_bind, config.accept_encryption_config()?)
 					.await
-					.map_err(protocol_error)?;
+					.map_err(TightBeamError::transport)?;
 
 				(Some(edge_listener), Some(edge_addr))
 			}
@@ -329,10 +324,9 @@ where
 
 		tasks.adopt(ctx.clone().spawn_heartbeat::<D>());
 
-		// A relay trail retires after three refresh intervals of silence:
-		// - One missed refresh is churn, and three mean the refresh path died.
-		// - The default interval floors the TTL, so an aggressive `rumor_refresh`
-		//   keeps a healthy fallback in place.
+		// Three missed refreshes retire a relay trail: one miss is churn, and
+		// three mean the refresh path died. The default interval floors the
+		// TTL, so an aggressive `rumor_refresh` keeps a healthy fallback.
 		let relay_trail_ttl = config
 			.rumor_refresh()
 			.saturating_mul(3)
@@ -454,12 +448,8 @@ where
 ///
 /// # Export boundary
 ///
-/// Stream and duplex opens share the Work-arm boundary order:
-///
-/// 1. [`ClusterConfig::evaluate_gates`] before routing.
-/// 2. Resolve the servlet target from the call context.
-/// 3. Derive `relayed` from [`HopBudget::is_relayed`].
-/// 4. [`ClusterConfig::evaluate_export_gates`].
+/// Stream and duplex opens pass [`GatewayRuntimeCtx::guard_stream_open`], which
+/// applies the Work-arm boundary order before routing.
 struct GatewayMuxService<P, D>
 where
 	P: Protocol,
@@ -608,8 +598,8 @@ impl<P: GatewayColonyProtocol> GatewayRuntimeCtx<P> {
 
 	/// Serves an edge accept plane through [`EdgeMuxService`].
 	///
-	/// The service type is what restricts the plane to work submission, so
-	/// this path carries no plane flag into dispatch.
+	/// The service type restricts the plane to work submission, so the type
+	/// alone tells dispatch which plane a request arrived on.
 	pub(crate) fn serve_edge<L, D>(self, listener: L) -> rt::JoinHandle
 	where
 		L: AsyncListenerTrait + Sync + 'static,

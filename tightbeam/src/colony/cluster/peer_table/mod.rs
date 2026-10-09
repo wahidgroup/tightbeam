@@ -3,8 +3,7 @@
 //! This module holds discovery state for the peer beat. The design follows
 //! Bitcoin's address manager as analyzed against eclipse attacks.
 //!
-//! - Configured anchors hold their slots for the table's life and are
-//!   always dialed.
+//! - Configured anchors hold their slots for the table's life and are always dialed.
 //! - Learned peers are bucketed by address prefix with per-bucket caps.
 //!   One network position therefore holds at most its own bucket's
 //!   share of the table (CWE-770).
@@ -22,9 +21,9 @@
 //!
 //! - Heilman, Kendler, Zohar & Goldberg (2015), eclipse attacks on
 //!   Bitcoin's peer-to-peer network (new/tried tables, feeler probes,
-//!   and per-group capacity):
-//!   [USENIX Security '15](https://www.usenix.org/conference/usenixsecurity15/technical-sessions/presentation/heilman),
-//!   [ePrint 2015/263](https://eprint.iacr.org/2015/263)
+//!   and per-group capacity), USENIX Security '15 and ePrint 2015/263:
+//!   <https://www.usenix.org/conference/usenixsecurity15/technical-sessions/presentation/heilman>
+//!   <https://eprint.iacr.org/2015/263>
 //! - CWE-770, allocation of resources without limits or throttling:
 //!   <https://cwe.mitre.org/data/definitions/770.html>
 
@@ -401,7 +400,8 @@ where
 	sample
 }
 
-/// Deterministic lane order key: the lane's front address, borrowed.
+/// The key that orders lanes deterministically, which is the lane's front
+/// address.
 fn lane_key<'t>(lane: &[(&'t AdmittedDial, &'t PeerEntry)]) -> Option<&'t AdmittedDial> {
 	lane.first().map(|(addr, _)| *addr)
 }
@@ -435,8 +435,7 @@ impl PeerTable {
 	///
 	/// - Each record passes [`PeerConfig::admit_dial`] first, so a policy the
 	///   operator tightened since the last run drops the peers it refuses.
-	/// - A driver fault degrades to an anchors-only start, which is safe
-	///   because discovery refills the table.
+	/// - A driver fault degrades to an anchors-only start, which is safe because discovery refills the table.
 	///
 	/// The config builder is the caller, because [`PeerConfig::table`] is
 	/// derived from the config it is built from and a table built elsewhere
@@ -573,41 +572,44 @@ impl PeerTable {
 	/// Record a failed beat dial of a tried peer.
 	///
 	/// Residents re-verify on every beat, so consecutive failures measure
-	/// liveness. Returns `true` only on an eviction so the caller can emit
-	/// one event per reclaimed peer.
+	/// liveness. An eviction returns the evicted peer's record, so the caller
+	/// can emit one event per reclaimed peer and withdraw the routes the
+	/// record's fingerprint owns. [`None`] means the peer stays.
 	///
 	/// - Failures reaching [`MAX_PEER_TRIED_FAILURES`] evict the entry.
 	/// - Eviction frees the prefix bucket slot for a live candidate.
 	/// - The threshold tolerates a transient partition.
 	/// - A verified probe resets the count.
-	/// - Eviction fails closed: the table shrinks toward its anchors, and
-	///   discovery refills it.
+	/// - Eviction fails closed: the table shrinks toward its anchors, and discovery refills it.
 	/// - An address outside the tried table leaves the table unchanged.
 	///
 	/// # Sources
 	///
 	/// - Heilman, Kendler, Zohar & Goldberg (2015), eclipse attacks on
-	///   Bitcoin's peer-to-peer network (feeler probes / tried eviction):
-	///   [USENIX Security '15](https://www.usenix.org/conference/usenixsecurity15/technical-sessions/presentation/heilman),
-	///   [ePrint 2015/263](https://eprint.iacr.org/2015/263)
+	///   Bitcoin's peer-to-peer network (feeler probes / tried eviction),
+	///   USENIX Security '15 and ePrint 2015/263:
+	///   <https://www.usenix.org/conference/usenixsecurity15/technical-sessions/presentation/heilman>
+	///   <https://eprint.iacr.org/2015/263>
 	///
 	/// # Errors
 	///
 	/// - [`ClusterError::LockPoisoned`] -- the table lock is poisoned.
-	pub fn record_failure(&self, addr: AdmittedDial) -> Result<bool, ClusterError> {
+	pub fn record_failure(&self, addr: AdmittedDial) -> Result<Option<PeerRecord>, ClusterError> {
 		self.with_table(|state| {
 			let Some(entry) = state.tried.get_mut(&addr) else {
-				return (false, false);
+				return (None, false);
 			};
 
 			entry.failures = entry.failures.saturating_add(1);
+
 			if entry.failures < MAX_PEER_TRIED_FAILURES {
-				return (false, false);
+				return (None, false);
 			}
 
-			state.tried.remove(&addr);
+			let removed = state.tried.remove(&addr);
+			let evicted = removed.map(|entry| entry.into_tried_record(addr));
 
-			(true, true)
+			(evicted, true)
 		})
 	}
 
@@ -618,15 +620,21 @@ impl PeerTable {
 	///
 	/// - The address leaves discovery at once, ahead of the failure threshold.
 	/// - A re-keyed peer therefore stops receiving advertisements.
+	/// - A verified entry that leaves returns its record, so the caller can
+	///   withdraw the routes its fingerprint owns. [`None`] means the address
+	///   held no verified entry.
 	///
 	/// # Errors
 	///
 	/// - [`ClusterError::LockPoisoned`] -- the table lock is poisoned.
-	pub fn expel(&self, addr: AdmittedDial) -> Result<(), ClusterError> {
+	pub fn expel(&self, addr: AdmittedDial) -> Result<Option<PeerRecord>, ClusterError> {
 		self.with_table(|state| {
 			let from_new = state.new.remove(&addr).is_some();
-			let from_tried = state.tried.remove(&addr).is_some();
-			((), from_new || from_tried)
+			let removed = state.tried.remove(&addr);
+
+			let expelled = removed.map(|entry| entry.into_tried_record(addr));
+			let changed = from_new || expelled.is_some();
+			(expelled, changed)
 		})
 	}
 
@@ -646,6 +654,7 @@ impl PeerTable {
 		let mut learned = self
 			.state
 			.read(|state| state.tried.keys().copied().collect::<Vec<AdmittedDial>>())?;
+
 		let mut targets = self.anchors.clone();
 
 		learned.sort();
@@ -1131,10 +1140,25 @@ mod tests {
 	fn evictions_over(table: &PeerTable, peer: AdmittedDial, failures: usize) -> Result<Vec<bool>, ClusterError> {
 		let mut evictions = Vec::with_capacity(failures);
 		for _ in 0..failures {
-			evictions.push(table.record_failure(peer)?);
+			evictions.push(table.record_failure(peer)?.is_some());
 		}
 
 		Ok(evictions)
+	}
+
+	/// The eviction names the peer it removed, so the beat can withdraw the
+	/// routes that peer's fingerprint owns.
+	#[test]
+	fn an_eviction_names_the_evicted_peer() -> Result<(), ClusterError> {
+		let table = PeerTable::default();
+		table.promote(addr("10.0.0.1:9000"), Some(b"fp-a"), UnixMillis::new(1_000))?;
+		table.record_failure(addr("10.0.0.1:9000"))?;
+		table.record_failure(addr("10.0.0.1:9000"))?;
+
+		let evicted = table.record_failure(addr("10.0.0.1:9000"))?;
+		let fingerprint = evicted.and_then(|record| record.peer_id);
+		assert_eq!(fingerprint.as_deref(), Some(b"fp-a".as_slice()));
+		Ok(())
 	}
 
 	#[test]
@@ -1169,8 +1193,8 @@ mod tests {
 		let table = table_with_anchor("127.0.0.1:9000");
 		let anchor_evicted = table.record_failure(addr("127.0.0.1:9000"))?;
 		let unknown_evicted = table.record_failure(addr("10.0.0.1:9000"))?;
-		assert!(!anchor_evicted);
-		assert!(!unknown_evicted);
+		assert!(anchor_evicted.is_none());
+		assert!(unknown_evicted.is_none());
 		Ok(())
 	}
 
@@ -1188,6 +1212,23 @@ mod tests {
 		}
 
 		assert!(table.promote(addr("10.0.9.9:9000"), None, UnixMillis::new(3_000))?);
+		Ok(())
+	}
+
+	/// An expelled verified peer is named, so the feeler can withdraw the
+	/// routes its fingerprint owns. A hint that leaves names no peer.
+	#[test]
+	fn an_expelled_tried_peer_is_named() -> Result<(), ClusterError> {
+		let table = PeerTable::default();
+		table.learn(vec![hint("10.0.0.1:9000")])?;
+		table.promote(addr("10.1.0.1:9000"), Some(b"fp-a"), UnixMillis::new(1_000))?;
+
+		let hint_left = table.expel(addr("10.0.0.1:9000"))?;
+		let verified_left = table.expel(addr("10.1.0.1:9000"))?;
+
+		let fingerprint = verified_left.and_then(|record| record.peer_id);
+		assert!(hint_left.is_none());
+		assert_eq!(fingerprint.as_deref(), Some(b"fp-a".as_slice()));
 		Ok(())
 	}
 
@@ -1219,6 +1260,7 @@ mod tests {
 		let crowded: Vec<PeerHint> = (0..PEER_PROBE_PER_BEAT + 2)
 			.map(|host| hint(format!("10.0.0.{}:9000", host + 1)))
 			.collect();
+
 		table.learn(crowded)?;
 		table.learn(vec![hint("10.1.0.1:9000")])?;
 
@@ -1301,7 +1343,7 @@ mod tests {
 		Ok(())
 	}
 
-	/// Driver that stalls its first write until released, and records the
+	/// A driver that stalls its first write until released, and records the
 	/// row count each snapshot carried.
 	#[derive(Debug, Default)]
 	struct StallingStore {
