@@ -1566,6 +1566,7 @@ Phase 3: Client -> Server
 ┌─────────────────────────────────────────────────────────┐
 │ ClientKeyExchange (ECIES) or ClientFinished (CMS)       │
 │ - Encrypted session key (ECIES)                         │
+│ - Key-confirmation tag (32 bytes)                       │
 │ - Optional client certificate (mutual auth)             │
 │   (CMS: must equal the Phase 1 certificate)             │
 │ - Optional client signature (mutual auth)               │
@@ -1589,11 +1590,12 @@ Init -> KeyExchangeReceived -> ServerFinishedSent -> ClientFinishedReceived -> C
 **Transcript hash:**
 
 ```text
-transcript = ClientHello || ServerHandshake || ClientKeyExchange
+transcript = ClientHello || server_random || server_ephemeral || server_spki
+             || SecurityAccept || client_cert_required || TransportAccept
 transcript_hash = SHA3-256(transcript)
 ```
 
-The transcript hash binds the handshake messages. It blocks reordering, profile downgrade, and undetected man-in-the-middle edits of the transcript.
+The transcript hash binds the handshake messages. It blocks reordering, profile downgrade, and undetected man-in-the-middle edits of the transcript. The `client_cert_required` leg is one byte, so a stripped certificate demand changes the hash.
 
 #### 8.5.3 Implementation: CMS-Based Handshake Protocol
 
@@ -1907,7 +1909,7 @@ let security_accept = SecurityAccept {
 | **Multiplexing Downgrade** | Transport offer/accept in signed transcript | Transcript hash covers TransportOffer/TransportAccept. Unsolicited accept fails closed                                                                                                                            |
 | **MITM**                   | Transcript signatures                       | Both parties sign transcript_hash. Verified against certificates                                                                                                                                                  |
 | **Confidentiality**        | ECDH + HKDF derived AEAD key                | Session key never transmitted. Derived from ECDH shared secret                                                                                                                                                    |
-| **Forward Secrecy**        | Ephemeral client keys                       | New ephemeral key per handshake. Compromise does not affect past sessions                                                                                                                                         |
+| **Forward Secrecy**        | Ephemeral keys on both sides                | A fresh ephemeral pair per handshake and per rekey. A later key compromise does not expose past sessions or past epochs                                                                                           |
 | **DoS**                    | 16 KiB handshake size cap                   | Reject oversized handshake messages before processing                                                                                                                                                             |
 | **Stream Cap Inflation**   | Clamp + ResourceExhausted                   | Caps clamped to `MAX_MUX_STREAM_CAP`. Local exhaustion returns `ResourceExhausted`                                                                                                                                |
 | **Reassembly Exhaustion**  | Chunk + credit + cap clamps                 | Chunk size clamped to `MIN..=MAX_MUX_CHUNK_SIZE`, stream credit to `MAX_MUX_STREAM_CREDIT`. Per-stream reassembly memory bounded by granted credit and concurrent partial streams by the advertised cap (CWE-770) |
@@ -1987,8 +1989,8 @@ Each endpoint MUST enforce the cap it advertised and respect the cap its peer ad
 | `Cancel`        | Abort a single in-flight stream without tearing down the connection                                     |
 | `GoAway`        | Connection-level drain: streams at or below `last_stream_id` complete. Newer streams are rejected       |
 | `Ping`          | Liveness probe and ack (`opaque`, `ack`), answered without touching the handler                         |
-| `RekeyRequest`  | Client opens an epoch renewal: fresh nonce ([RFC 9846 §4.7.3][rfc9846-4.7.3] update-request)            |
-| `RekeyResponse` | Server answers: its nonce plus the server-signed epoch receipt                                          |
+| `RekeyRequest`  | Client opens an epoch renewal: nonce, ephemeral key ([RFC 9846 §4.7.3][rfc9846-4.7.3] update-request)   |
+| `RekeyResponse` | Server answers: nonce and ephemeral key, plus the server-signed epoch receipt that pins both ephemerals |
 | `RekeyAck`      | Client accepts: its countersignature. Marks the client-to-server key switch                             |
 | `RekeyDone`     | Server confirms settlement. Marks the server-to-client key switch                                       |
 
@@ -3037,7 +3039,11 @@ Behavior:
 
 1. Each beat sends peers a signed `AdvertisePeer` that lists the servlet types local hives serve.
 2. The receiver checks the signature, freshness, colony membership, and claimed dial address, then installs peer routes.
-3. Peer routes are soft state. An empty advertisement withdraws them, repeated failures abandon them, and relay trails also expire by age.
+3. Peer routes are soft state, and four things remove them:
+   - An empty advertisement withdraws them.
+   - Repeated failures abandon them.
+   - An eviction or an expulsion from the peer table withdraws the peer's direct routes and the relay trails learned from it.
+   - Relay trails also expire by age.
 4. A hive route and a peer route never share a socket. The gateway refuses whichever claim arrives second with `PermissionDenied`. Sockets compare as parsed addresses, so any spelling of one socket is the same socket.
 5. The load balancer chooses among local and peer routes together.
 6. Each forward spends a hop budget (`PeerConfig::max_hops`, default 1), so work cannot bounce between peers.
@@ -3301,7 +3307,7 @@ The colony URN comes from the gateway certificate. Read it with `ClusterConfig::
 
 Clusters can be tested using `environment Cluster`:
 
-A scenario that depends on elapsed time installs a `ManualClock` (`tightbeam::utils::time`, feature `testing`) and advances it instead of sleeping. Pass the clock to each owner: `ClusterConfig::clock`, `HiveConfig::clock`, `ServletConfigBuilder::with_clock`, or `ConnectionPoolBuilder::new`.
+A scenario that depends on elapsed time installs a `ManualClock` (`tightbeam::utils::time`, feature `testing`) and advances it instead of sleeping. Pass the clock to each owner: `ClusterConfig::clock`, `HiveConfig::clock`, `ServletConfigBuilder::with_clock`, or `ConnectionPoolBuilder::new`. A mux writer adopts the clock of the connection it was split from, and `MuxTransport::with_clock` replaces it on a transport assembled by hand.
 
 An advance wakes sleeping beats, but their work runs on separate tasks. Poll `TraceCollector::recorded` for the expected event, and advance again if it has not landed.
 

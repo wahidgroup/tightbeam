@@ -25,6 +25,19 @@ pub struct PeerEntry {
 	pub failures: usize,
 }
 
+impl PeerEntry {
+	/// The record of this entry as a verified peer at `addr`, for a caller
+	/// that reads it after the table guard is released.
+	pub(super) fn into_tried_record(self, addr: AdmittedDial) -> PeerRecord {
+		PeerRecord {
+			gateway_addr: addr.address(),
+			peer_id: self.peer_id,
+			tried: true,
+			last_probe: self.last_probe,
+		}
+	}
+}
+
 /// The peer table's mutable state, reachable only through [`GuardedTable`].
 #[derive(Debug, Default)]
 pub struct TableState {

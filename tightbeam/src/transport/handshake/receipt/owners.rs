@@ -3,10 +3,11 @@
 //! - [`IssuedReceipt`] is the server's, issued at the
 //!   [reply](crate::transport::handshake#legs) and settled at the closing.
 //! - [`PendingReceipt`] is the client's, verified at the reply and countersigned in the closing.
+//! - [`CountersignedReceipt`] is what the countersignature leaves, until the handshake secret seals it.
 //!
-//! The module is private, so the two owners stay inside the crate. The server
+//! The module is private, so the owners stay inside the crate. The server
 //! holds its [`IssuedReceipt`] in the phase that awaits the closing, and the
-//! client holds its [`PendingReceipt`] inside the step that reads the reply.
+//! client holds the other two inside the step that reads the reply.
 
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
@@ -23,7 +24,7 @@ use crate::transport::handshake::receipt::{
 	ReceiptApprover, ReceiptArtifact, ReceiptRole, ReceiptSigner, SessionObserver, SessionOutcome, SessionReceipt,
 	SessionVerdict, StoredReceipt,
 };
-use crate::transport::handshake::schedule::{HandshakeVerifyingKey, Terms};
+use crate::transport::handshake::schedule::{ConfirmedSecret, HandshakeVerifyingKey, Terms};
 use crate::transport::handshake::{AdmittedPeer, Arc, HandshakeProvider, HandshakeSecret};
 use crate::transport::state::ClientIdentity;
 use crate::x509::Certificate;
@@ -112,7 +113,7 @@ impl IssuedReceipt {
 	async fn settle<P>(
 		self,
 		sealed_ack: Option<impl AsRef<[u8]>>,
-		secret: &HandshakeSecret,
+		secret: &ConfirmedSecret,
 		terms: &Terms<P>,
 		peer: &AdmittedPeer,
 		authorizer: Option<&dyn TransportAuthorizer>,
@@ -128,7 +129,8 @@ impl IssuedReceipt {
 		// settlement answer, so the plaintext wipes on drop.
 		let ack = match sealed_ack {
 			Some(sealed) => {
-				let plaintext = secret.open_ack::<P>(terms.kdf_salt(), terms.transcript_hash(), sealed)?;
+				let key = secret.secret();
+				let plaintext = key.open_ack::<P>(terms.kdf_salt(), terms.transcript_hash(), sealed)?;
 				Some(plaintext.with(|bytes| SignerInfo::from_der(bytes))?)
 			}
 			None => None,
@@ -176,7 +178,9 @@ impl IssuedReceipt {
 	/// Settle the receipt of a session, when the session issued one.
 	///
 	/// A session that issued no receipt owes no acknowledgement, so one that
-	/// arrives is refused instead of being dropped.
+	/// arrives is refused instead of being dropped. The secret is a
+	/// [`ConfirmedSecret`], so no settlement runs for a client that did not
+	/// prove it holds the handshake secret.
 	///
 	/// # Errors
 	///
@@ -185,7 +189,7 @@ impl IssuedReceipt {
 	pub(crate) async fn settle_issued<P>(
 		issued: Option<Self>,
 		sealed_ack: Option<impl AsRef<[u8]>>,
-		secret: &HandshakeSecret,
+		secret: &ConfirmedSecret,
 		terms: &Terms<P>,
 		peer: &AdmittedPeer,
 		authorizer: Option<&dyn TransportAuthorizer>,
@@ -259,18 +263,58 @@ impl PendingReceipt {
 		Ok(Some(Self { receipt, artifact }))
 	}
 
-	/// Approve the receipt, countersign it under `identity`, and seal the
-	/// countersignature under the handshake secret.
+	/// Approve the receipt, and countersign it under `identity`.
 	///
-	/// - It returns the sealed bytes for the closing and the completed receipt both endpoints retain.
 	/// - The approver, or the fail-closed default, answers the settlement challenge.
 	/// - The countersignature binds the receipt body and that answer to the client identity.
+	///
+	/// Both awaits run here, and neither needs a secret of the handshake. The
+	/// caller therefore draws its secrets after this returns, and
+	/// [`CountersignedReceipt::seal`] seals the result with no await.
 	///
 	/// # Fail closed
 	///
 	/// A countersignature needs a client identity the server can verify, so a
 	/// client with none refuses the receipt. The refusal runs before approval,
 	/// because approval can spend an irreversible settlement answer.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::MutualAuthRequired`] -- `identity` is `None`.
+	/// - [`HandshakeError::ApprovalRefused`] -- the approver refused, or a
+	///   challenge arrived with no approver set.
+	/// - [`HandshakeError::KeyError`] -- the identity's key provider failed.
+	pub(crate) async fn countersign<P>(
+		self,
+		approver: Option<&dyn ReceiptApprover>,
+		identity: Option<&ClientIdentity<P>>,
+	) -> Result<CountersignedReceipt, HandshakeError>
+	where
+		P: HandshakeProvider,
+	{
+		let Self { receipt, artifact } = self;
+		let identity = identity.ok_or(HandshakeError::MutualAuthRequired)?;
+
+		let response = receipt.approve(approver).await?;
+		let answer = response.as_ref().map(OctetString::as_bytes);
+		let countersignature = receipt.countersign::<P::Digest>(answer, identity.signing_provider()).await?;
+		Ok(CountersignedReceipt { artifact, countersignature })
+	}
+}
+
+/// The receipt a client approved and countersigned, held until the handshake
+/// secret exists to seal the countersignature.
+pub struct CountersignedReceipt {
+	artifact: SignedData,
+	countersignature: SignerInfo,
+}
+
+impl CountersignedReceipt {
+	/// Seal the countersignature under the handshake secret, and complete the
+	/// receipt.
+	///
+	/// It returns the sealed bytes for the closing and the completed receipt
+	/// both endpoints retain.
 	///
 	/// # Confidentiality
 	///
@@ -281,30 +325,18 @@ impl PendingReceipt {
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError::MutualAuthRequired`] -- `identity` is `None`.
-	/// - [`HandshakeError::ApprovalRefused`] -- the approver refused, or a
-	///   challenge arrived with no approver set.
-	/// - [`HandshakeError::KeyError`] -- the identity's key provider failed.
 	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the acknowledgement key.
 	/// - [`HandshakeError::InvalidKeyMaterialLength`] -- the cipher refused the acknowledgement key.
 	/// - [`HandshakeError::ReceiptAckCipher`] -- the AEAD refused to seal.
-	pub(crate) async fn countersign<P>(
+	pub(crate) fn seal<P>(
 		self,
-		approver: Option<&dyn ReceiptApprover>,
-		identity: Option<&ClientIdentity<P>>,
 		secret: &HandshakeSecret,
 		terms: &Terms<P>,
 	) -> Result<(Vec<u8>, StoredReceipt), HandshakeError>
 	where
 		P: HandshakeProvider,
 	{
-		let Self { receipt, artifact } = self;
-		let identity = identity.ok_or(HandshakeError::MutualAuthRequired)?;
-
-		let response = receipt.approve(approver).await?;
-		let answer = response.as_ref().map(OctetString::as_bytes);
-		let countersignature = receipt.countersign::<P::Digest>(answer, identity.signing_provider()).await?;
-
+		let Self { artifact, countersignature } = self;
 		let ack_der = Zeroizing::new(countersignature.to_der()?);
 		let sealed_ack = secret.seal_ack::<P>(terms.kdf_salt(), terms.transcript_hash(), &ack_der)?;
 

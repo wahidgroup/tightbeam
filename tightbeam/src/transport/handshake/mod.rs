@@ -31,7 +31,7 @@
 //! │  │                           │                                         │
 //! │  │◄─ ServerHandshake ────────│  (server_rand, eph, cert, sig, accept?, │
 //! │  │                           │   ma?)                                  │
-//! │  │── ClientKeyExchange ─────►│  (ecies(base, ack?), [cert, sig]?)      │
+//! │  │── ClientKeyExchange ─────►│  (ecies(base, tag, ack?), [cert, sig]?) │
 //! │  │                           │                                         │
 //! │  │ ◄═ Session Established ═► │  (AEAD keys derived)                    │
 //! │  │                           │                                         │
@@ -40,6 +40,7 @@
 //! **Legend:**
 //! - `[]` = optional fields, only present if mutual authentication is required
 //! - `eph` = the server's per-handshake ephemeral public key, inside the signed transcript
+//! - `tag` = the client's key-confirmation tag, which the server verifies before it settles
 //! - Arrows show message direction and content
 //! - Session establishment occurs after successful key exchange
 //! ```
@@ -63,7 +64,7 @@
 //! One type, [`Handshake`], runs both roles over both protocols:
 //!
 //! - The role, [`Client`] or [`Server`], fixes the step order and every negotiation and admission decision.
-//! - The flow, [`Ecies`] or [`Cms`], contributes the wire of its protocol and the checks that wire defines.
+//! - The flow, [`Ecies`] or [`Cms`], contributes the messages of its protocol and the checks they define.
 //! - The provider, a [`HandshakeProvider`], names the algorithms.
 //!
 //! The [`CryptoProvider`] trait is the abstraction boundary of the layer:
@@ -216,6 +217,11 @@ pub use peer::ProvisionedTrust;
 pub use schedule::EpochMaterials;
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 pub use schedule::HandshakeSecret;
+#[cfg(all(
+	feature = "transport-multiplex",
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
+pub(crate) use schedule::{CompressedPoint, EpochSecret, PeerEphemeral};
 
 #[cfg(feature = "transport-cms")]
 pub use builders::{KariBuilderError, TightBeamKariBuilder};
@@ -231,6 +237,8 @@ pub use processors::{TightBeamEnvelopedDataProcessor, TightBeamKariRecipient};
 	any(feature = "transport-cms", feature = "transport-ecies")
 ))]
 pub(crate) use schedule::HandshakeVerifyingKey;
+#[cfg(feature = "transport-ecies")]
+use schedule::KeyConfirmation;
 #[cfg(all(
 	feature = "transport-multiplex",
 	any(feature = "transport-cms", feature = "transport-ecies")
@@ -320,7 +328,7 @@ impl<C> HandshakeCurve for C where
 /// the supertrait, so `P: HandshakeProvider` gives a caller every one of them:
 ///
 /// - the curve is a [`HandshakeCurve`],
-/// - a signature parses from its wire bytes,
+/// - a signature parses from its encoded bytes,
 /// - the verifying key builds from a public key on that curve, verifies a
 ///   signature, and encodes as an SPKI, and
 /// - the AEAD cipher keys from derived bytes.
@@ -839,7 +847,8 @@ pub struct ServerHandshake {
 /// Confidential plaintext of the ECIES key exchange.
 ///
 /// Only the server decrypts it. It carries the base secret, the anti-replay
-/// client random, and the sealed receipt countersignature.
+/// client random, the key-confirmation tag, and the sealed receipt
+/// countersignature.
 #[cfg(feature = "transport-ecies")]
 #[derive(Clone, Sequence)]
 pub(crate) struct EciesSessionPayload {
@@ -847,6 +856,9 @@ pub(crate) struct EciesSessionPayload {
 	pub base_key: OctetString,
 	/// 32-byte client random echoed back for replay resistance.
 	pub client_random: OctetString,
+	/// The proof that the client derived the handshake secret, which the
+	/// server verifies before it settles.
+	pub key_confirmation: KeyConfirmation,
 	/// The client receipt `SignerInfo` countersigning the server-issued
 	/// receipt, sealed under the handshake secret's acknowledgement key. Its
 	/// signed attributes bind the bearer settlement answer (see
@@ -1025,6 +1037,7 @@ fn octet_string_value(attr: &HandshakeAttribute) -> Result<OctetString> {
 ///
 /// - [`HandshakeError::DuplicateAttribute`] -- an attribute OID repeats.
 /// - [`HandshakeError::InvalidAttributeArity`] -- an attribute carries other than one value.
+/// - [`HandshakeError::DerError`] -- the certificate or the signature fails to decode.
 #[cfg(feature = "x509")]
 fn parse_client_key_exchange_attrs(enveloped_data: &EnvelopedData) -> Result<ClientKeyExchangeAttrs> {
 	let Some(attrs) = &enveloped_data.unprotected_attrs else {

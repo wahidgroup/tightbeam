@@ -10,7 +10,7 @@ use crate::cms::signed_data::SignerIdentifier;
 use crate::crypto::policy::VerificationPolicy;
 use crate::crypto::x509::error::CertificateValidationError;
 use crate::crypto::x509::policy::CertificateValidation;
-use crate::crypto::x509::utils::compute_signer_identifier_from_der;
+use crate::crypto::x509::utils::Skid;
 use crate::crypto::x509::Certificate;
 use crate::der::Encode;
 
@@ -22,7 +22,7 @@ mod std_imports {
 	pub use crate::crypto::hash::{Digest, Sha3_256, U32};
 	pub use crate::crypto::x509::ext::pkix::{BasicConstraints, KeyUsage, KeyUsages, SubjectAltName};
 	pub use crate::crypto::x509::name::Name;
-	pub use crate::crypto::x509::utils::{CertificateExt, Fingerprint, Skid};
+	pub use crate::crypto::x509::utils::{CertificateExt, Fingerprint};
 	pub use crate::der::oid::AssociatedOid;
 }
 
@@ -131,9 +131,9 @@ impl RevocationChecker for StaticRevocationList {
 
 /// Outcome of verifying a frame signature against a trust store.
 ///
-/// Distinguishes "no identity claimed" and "unknown identity claimed"
-/// from "trusted identity claimed with a bad signature" so callers can
-/// apply different consequences.
+/// It distinguishes "no identity claimed" and "unknown identity claimed" from
+/// "trusted identity claimed with a bad signature", so callers can apply
+/// different consequences.
 #[cfg(feature = "signature")]
 #[must_use = "a dropped TrustVerification leaves the frame unauthenticated"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,24 +156,26 @@ pub enum TrustVerification<'a> {
 /// [`CertificateTrustStore`] is the built-in store and needs `std`, so a
 /// no_std consumer supplies its own implementation of this trait.
 pub trait CertificateTrust: CertificateValidation + Debug + Send + Sync {
-	/// Whether the store trusts `cert` by fingerprint.
+	/// Returns whether the store trusts `cert` by fingerprint.
 	///
-	/// This is certificate-object identity. Plane membership that must
-	/// survive key re-issuance uses [`Self::trusts_public_key`].
+	/// This is certificate-object identity. Plane membership that must survive
+	/// the re-issuance of a certificate for the same key uses
+	/// [`Self::trusts_public_key`].
 	fn is_trusted(&self, cert: &Certificate) -> bool;
 
-	/// Whether this store holds any certificate for `cert`'s public key.
+	/// Returns whether this store holds any certificate for `cert`'s public
+	/// key.
 	///
-	/// Membership is the SubjectKeyIdentifier of the SPKI, resolved
-	/// through [`Self::find_by_signer_identifier`]. A rotated certificate
-	/// for an enrolled key still matches. Implementors that answer SID
-	/// lookup correctly get this behavior without an override.
+	/// Membership is the SubjectKeyIdentifier of the SPKI, resolved through
+	/// [`Self::find_by_signer_identifier`]. A rotated certificate for an
+	/// enrolled key still matches. Implementors that answer SID lookup
+	/// correctly get this behavior without an override.
 	#[must_use = "a dropped membership answer leaves the plane gate unenforced"]
 	fn trusts_public_key(&self, cert: &Certificate) -> bool {
 		let Ok(spki_der) = cert.tbs_certificate.subject_public_key_info.to_der() else {
 			return false;
 		};
-		let Ok(sid) = compute_signer_identifier_from_der(spki_der.as_slice()) else {
+		let Ok(sid) = SignerIdentifier::try_from(Skid::of_public_key(spki_der)) else {
 			return false;
 		};
 
@@ -204,7 +206,7 @@ pub trait CertificateTrust: CertificateValidation + Debug + Send + Sync {
 	///
 	/// # Errors
 	///
-	/// - [`CertificateValidationError`] when validation fails.
+	/// - [`CertificateValidationError`] -- the chain fails validation.
 	fn verify_chain(&self, chain: &[Certificate]) -> Result<(), CertificateValidationError>;
 
 	/// Find a certificate by CMS [`SignerIdentifier`].
@@ -222,15 +224,15 @@ pub trait CertificateTrust: CertificateValidation + Debug + Send + Sync {
 		self.find_by_signer_identifier(&signer_info.sid)
 	}
 
-	/// The verification policy for signature operations.
+	/// Returns the verification policy for signature operations.
 	fn to_policy_ref(&self) -> &dyn VerificationPolicy;
 
 	/// Verify `frame`'s nonrepudiation signature against this store.
 	///
-	/// Looks up the signer certificate via the frame's `SignerInfo` and
-	/// verifies the signature over the frame's to-be-signed bytes. The
-	/// verified arm returns that certificate so a later step does not
-	/// resolve the signer again.
+	/// The store looks up the signer certificate through the frame's
+	/// `SignerInfo` and verifies the signature over the frame's to-be-signed
+	/// bytes. The verified arm returns that certificate, so a later step reuses
+	/// it instead of a second signer lookup.
 	#[cfg(feature = "signature")]
 	#[must_use = "a dropped TrustVerification leaves the frame unauthenticated"]
 	fn verify_frame<'a>(&'a self, frame: &crate::Frame) -> TrustVerification<'a> {
@@ -262,21 +264,22 @@ pub trait CertificateTrust: CertificateValidation + Debug + Send + Sync {
 	}
 }
 
-/// Builder trait for constructing trust stores.
+/// A builder of trust stores.
 ///
-/// Validates structural correctness (expiry, issuer/subject chaining) on add.
-/// The built store handles cryptographic verification at runtime.
+/// The builder validates structural correctness, which is expiry and issuer and
+/// subject chaining, on each add. The built store handles cryptographic
+/// verification at run time.
 pub trait TrustBuilder: Sized {
 	/// The trust store type that this builder produces.
 	type Store: CertificateTrust;
 
-	/// Add a certificate chain with structural validation.
+	/// Add a certificate chain after structural validation.
 	///
-	/// Validates expiry and issuer/subject chaining. All certificates
-	/// in the chain are added to the trust store.
+	/// The builder validates expiry and issuer and subject chaining, then adds
+	/// every certificate in the chain to the trust store.
 	fn with_chain(self, chain: impl IntoIterator<Item = Certificate>) -> Result<Self, CertificateValidationError>;
 
-	/// Add a single trusted leaf certificate.
+	/// Add a single trusted certificate after an expiry check.
 	fn with_certificate(self, cert: Certificate) -> Result<Self, CertificateValidationError>;
 
 	/// Build the sealed trust store.
@@ -345,8 +348,7 @@ fn ensure_terminal_is_end_entity(path: &[&Certificate]) -> Result<(), Certificat
 
 /// Enforce that an issuer certificate is permitted to sign certificates.
 ///
-/// - RFC 5280 §6.1.4(k): the issuer's `basicConstraints` extension MUST be
-///   present with `cA` asserted.
+/// - RFC 5280 §6.1.4(k): the issuer's `basicConstraints` extension MUST be present with `cA` asserted.
 /// - RFC 5280 §6.1.4(n): when a `keyUsage` extension is present, it MUST assert `keyCertSign`.
 ///
 /// See <https://datatracker.ietf.org/doc/html/rfc5280#section-6.1.4>.
@@ -393,7 +395,8 @@ fn ensure_path_len(chain: &[&Certificate]) -> Result<(), CertificateValidationEr
 			continue;
 		};
 
-		// Certificates strictly between this CA and the end-entity leaf.
+		// This counts the certificates strictly between this CA and the
+		// end-entity leaf.
 		let intermediates_below = chain.len().saturating_sub(index + 2);
 		if intermediates_below as u64 > u64::from(max_intermediates) {
 			return Err(CertificateValidationError::PathLenExceeded);
@@ -433,17 +436,17 @@ impl CertificateTrustStore {
 		Fingerprint::from_certificate(cert)
 	}
 
-	/// The certificate with `fingerprint`, if the store holds one.
+	/// Returns the certificate with `fingerprint`, if the store holds one.
 	pub fn to_certificate_ref(&self, fingerprint: &Sha3Fingerprint) -> Option<&Certificate> {
 		self.certificates.get(fingerprint)
 	}
 
-	/// The number of trusted certificates.
+	/// Returns the number of trusted certificates.
 	pub fn len(&self) -> usize {
 		self.fingerprints.len()
 	}
 
-	/// Whether the trust store is empty.
+	/// Returns whether the trust store is empty.
 	pub fn is_empty(&self) -> bool {
 		self.fingerprints.is_empty()
 	}
@@ -464,11 +467,9 @@ impl CertificateTrustStore {
 	/// 2. Rejection of unprocessed critical extensions ([RFC 5280 §4.2, §6.1.3(f)][rfc5280-4.2]).
 	/// 3. Algorithm-identifier consistency ([RFC 5280 §4.1.1.2][rfc5280-4.1.1.2]).
 	/// 4. Issuer and subject name chaining ([RFC 5280 §6.1.3(a)(4)][rfc5280-6.1.3]).
-	/// 5. Issuer `basicConstraints.cA` and `keyUsage.keyCertSign` ([RFC 5280
-	///    §6.1.4(k),(n)][rfc5280-6.1.4]).
+	/// 5. Issuer `basicConstraints.cA` and `keyUsage.keyCertSign` ([RFC 5280 §6.1.4(k),(n)][rfc5280-6.1.4]).
 	/// 6. Cryptographic signature verification ([RFC 5280 §6.1.3(a)(1)][rfc5280-6.1.3]).
-	/// 7. Revocation through the configured [`RevocationChecker`] ([RFC 5280
-	///    §6.1.3(a)(3)][rfc5280-6.1.3]).
+	/// 7. Revocation through the configured [`RevocationChecker`] ([RFC 5280 §6.1.3(a)(3)][rfc5280-6.1.3]).
 	/// 8. `pathLenConstraint` ([RFC 5280 §6.1.4(l),(m)][rfc5280-6.1.4]).
 	///
 	/// Trust anchoring is the caller's responsibility. This routine validates
@@ -482,8 +483,8 @@ impl CertificateTrustStore {
 	/// encoding variance) never applies, and rejecting it removes attack
 	/// surface:
 	///
-	/// - §6.1.4(k) applies to every issuer, not just v3, so v1/v2 CA
-	///   certificates are rejected outright. The RFC permits the rejection.
+	/// - §6.1.4(k) applies to every issuer and not only to v3 issuers, so v1/v2
+	///   CA certificates are rejected outright. The RFC permits the rejection.
 	/// - Self-issued intermediates count against `pathLenConstraint`, although
 	///   §6.1.4(l) exempts them, because key rollover here re-issues the trust
 	///   store instead of cross-signing.
@@ -570,15 +571,16 @@ impl Debug for CertificateTrustStore {
 
 #[cfg(feature = "std")]
 impl CertificateValidation for CertificateTrustStore {
+	/// Walk the issuer hierarchy as far as the store material allows, then
+	/// validate the accumulated path with the shared path-validation routine.
+	///
+	/// # Issuer selection
+	///
+	/// Issuer selection assumes at most one stored certificate per subject DN.
+	/// The walk commits to the first DN match and fails closed if that
+	/// candidate cannot verify. Full RFC 4158 path building, with backtracking
+	/// across same-DN candidates, is intentionally out of scope.
 	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
-		// Walk the issuer hierarchy as far as the store material allows, then
-		// validate the accumulated path with the shared routine.
-		//
-		// Issuer selection assumes at most one stored certificate per subject
-		// DN. `find` commits to the first DN match and fails closed if that
-		// candidate cannot verify. Full RFC 4158 path building, with
-		// backtracking across same-DN candidates, is intentionally out of
-		// scope.
 		let mut path: Vec<&Certificate> = Vec::new();
 		let mut visited: HashSet<Sha3Fingerprint> = HashSet::new();
 
@@ -663,8 +665,8 @@ impl CertificateTrust for CertificateTrustStore {
 /// subject chaining, on each add. The resulting store handles cryptographic
 /// verification at run time.
 ///
-/// SKIDs are indexed through [`Skid::of_public_key`], the same home a signer
-/// stamps from, so a store resolves the identifiers its peers actually send.
+/// SKIDs are indexed through [`Skid::of_public_key`], the same function a
+/// signer stamps from, so a store resolves the identifiers that its peers send.
 #[cfg(feature = "std")]
 pub struct CertificateTrustBuilder {
 	fingerprints: HashSet<Sha3Fingerprint>,
@@ -709,6 +711,7 @@ impl CertificateTrustBuilder {
 				return Err(CertificateValidationError::SkidCollision {
 					skid: skid.as_bytes().iter().fold(String::new(), |mut acc, byte| {
 						use core::fmt::Write;
+						// A write into a `String` always returns `Ok`.
 						let _ = write!(acc, "{byte:02x}");
 						acc
 					}),
@@ -830,7 +833,7 @@ mod tests {
 		Ok(builder.build())
 	}
 
-	/// The certificate in `chain` that `target` names.
+	/// Returns the certificate in `chain` that `target` names.
 	fn target_cert(chain: &TestCertificateChain, target: EvalTarget) -> &Certificate {
 		match target {
 			EvalTarget::Root => &chain.root,
@@ -1173,7 +1176,7 @@ mod tests {
 		let mut leaf = chain.leaf.to_owned();
 		leaf.signature_algorithm.oid = crate::oids::SIGNER_ECDSA_WITH_SHA256;
 
-		// Both the recursive `evaluate` walk and `verify_chain` must reject it.
+		// Both the `evaluate` walk and `verify_chain` must reject it.
 		let walk_store = build_store(&chain, StoreCerts::RootAndIntermediate)?;
 		assert!(matches!(
 			walk_store.evaluate(&leaf),
@@ -1195,7 +1198,7 @@ mod tests {
 		let spki_der = cert.tbs_certificate.subject_public_key_info.to_der()?;
 
 		let stamped = key.to_signer_info(b"payload")?.sid;
-		let indexed = compute_signer_identifier_from_der(&spki_der)?;
+		let indexed = SignerIdentifier::try_from(Skid::of_public_key(spki_der))?;
 
 		assert_eq!(stamped, indexed);
 		Ok(())

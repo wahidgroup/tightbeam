@@ -8,8 +8,8 @@ extern crate alloc;
 use alloc::boxed::Box;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
-#[cfg(feature = "std")]
-use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(host_clock)]
+use core::time::Duration;
 
 use crate::builder::{MetadataBuilder, TypeBuilder};
 use crate::der::oid::ObjectIdentifier;
@@ -36,6 +36,8 @@ use crate::crypto::sign::{Signatory, SignatureAlgorithmIdentifier};
 use crate::der::oid::AssociatedOid;
 #[cfg(feature = "digest")]
 use crate::helpers::Digestor;
+#[cfg(host_clock)]
+use crate::utils::time::UnixMillis;
 
 #[cfg(feature = "aead")]
 type EncryptorFn = Box<dyn FnOnce(&[u8]) -> Result<crate::EncryptedContentInfo>>;
@@ -82,11 +84,11 @@ enum ErrorAccumulator {
 	/// The accumulator holds no errors and allocates nothing.
 	#[default]
 	None,
-	/// One error, stored inline without allocation.
+	/// The accumulator holds one error inline.
 	One(TightBeamError),
-	/// Two to five errors, stored inline without allocation.
+	/// The accumulator holds two to five errors inline.
 	Many([Option<TightBeamError>; 5], u8),
-	/// Six or more errors, stored on the heap.
+	/// The accumulator holds six or more errors on the heap.
 	Heap(Vec<TightBeamError>),
 }
 
@@ -216,8 +218,9 @@ impl<T: Message> FrameBuilder<T> {
 	/// Set the order.
 	///
 	/// The value is protocol-opaque: any monotonic scheme works, such as a
-	/// Unix timestamp or a dense per-channel counter. When omitted, the
-	/// build defaults it to the current Unix time in seconds.
+	/// Unix timestamp or a dense per-channel counter. When the caller omits
+	/// it, a build with a host clock defaults it to the current Unix time in
+	/// seconds.
 	pub fn with_order(mut self, order: u64) -> Self {
 		self.metadata_builder = self.metadata_builder.with_order(order);
 		self
@@ -424,8 +427,7 @@ impl<T: Message> FrameBuilder<T> {
 	/// [`FrameBuilder::build`]:
 	///
 	/// - [`TightBeamError::InvalidSaltLength`] when a non-empty salt is too short to hide the body.
-	/// - [`TightBeamError::UnexpectedAlgorithm`] when `D` is not the digest the
-	///   message profile names.
+	/// - [`TightBeamError::UnexpectedAlgorithm`] when `D` is not the digest the message profile names.
 	/// - [`TightBeamError::InvalidBody`] when no message is set.
 	///
 	/// [`MIN_SALT_SIZE`]: crate::constants::MIN_SALT_SIZE
@@ -622,20 +624,22 @@ impl<T: Message> FrameBuilder<T> {
 
 	/// Set the order to the current Unix time in seconds when the caller
 	/// omitted it.
-	#[cfg(feature = "std")]
+	///
+	/// The reading comes from [`UnixMillis::now`], so a frame defaults its
+	/// order from the same clock that every other time decision reads. A build
+	/// without a host clock leaves the order to the caller.
+	#[cfg(host_clock)]
 	fn ensure_order_set(mut metadata_builder: MetadataBuilder) -> Result<MetadataBuilder> {
 		if !metadata_builder.has_order() {
-			match SystemTime::now().duration_since(UNIX_EPOCH) {
-				Ok(duration) => {
-					metadata_builder = metadata_builder.with_order(duration.as_secs());
-				}
-				Err(_) => return Err(TightBeamError::InvalidOrder),
-			}
+			let now = UnixMillis::now();
+			let seconds = Duration::from_millis(now.get()).as_secs();
+			metadata_builder = metadata_builder.with_order(seconds);
 		}
+
 		Ok(metadata_builder)
 	}
 
-	#[cfg(not(feature = "std"))]
+	#[cfg(not(host_clock))]
 	fn ensure_order_set(metadata_builder: MetadataBuilder) -> Result<MetadataBuilder> {
 		Ok(metadata_builder)
 	}
@@ -647,7 +651,7 @@ impl<T: Message> FrameBuilder<T> {
 		#[cfg(feature = "compress")] compressor: Option<Box<dyn Compressor>>,
 		#[cfg(feature = "aead")] encryptor: Option<EncryptorFn>,
 	) -> Result<(Vec<u8>, MetadataBuilder)> {
-		// Reassigned only by the compression/encryption stages below.
+		// Only the compression and encryption stages reassign the builder.
 		#[cfg(any(feature = "compress", feature = "aead"))]
 		let mut metadata_builder = metadata_builder;
 
@@ -697,8 +701,8 @@ impl<T: Message> FrameBuilder<T> {
 
 		let scaffold = crate::frame::FrameIntegrityScaffold { version: &version, metadata };
 		let scaffold_der = crate::encode(&scaffold)?;
-		let witness_info = witness_fn(&scaffold_der)?;
 
+		let witness_info = witness_fn(&scaffold_der)?;
 		Ok(Some(witness_info))
 	}
 
@@ -738,6 +742,22 @@ mod tests {
 	use crate::compress::ZstdCompression;
 	#[cfg(all(feature = "aes-gcm", feature = "sha3"))]
 	use crate::crypto::hash::Sha3_256;
+
+	/// A frame built without an order takes the [`UnixMillis::now`] reading in
+	/// seconds, so its order agrees with every other clock value.
+	#[cfg(host_clock)]
+	#[test]
+	fn an_omitted_order_defaults_to_the_clocks_seconds() -> Result<()> {
+		let before = Duration::from_millis(UnixMillis::now().get()).as_secs();
+		let frame = FrameBuilder::<TestMessage>::from(Version::V0)
+			.with_message(TestMessage::sample(None))
+			.with_id("default-order")
+			.build()?;
+
+		let after = Duration::from_millis(UnixMillis::now().get()).as_secs();
+		assert!((before..=after).contains(&frame.metadata().order()));
+		Ok(())
+	}
 
 	#[cfg(feature = "sha3")]
 	test_builder! {
@@ -786,11 +806,10 @@ mod tests {
 			assert!(tightbeam.metadata().confidentiality().is_some());
 			assert!(tightbeam.nonrepudiation().is_some());
 
-			// Body should be encrypted (not directly decodable)
+			// The body is encrypted, so it does not decode as the message.
 			let decode_result: Result<TestMessage> = crate::decode(tightbeam.message());
 			assert!(decode_result.is_err(), "Body should be encrypted");
 
-			// Decrypt and verify
 			let (_, cipher) = TestKey::insecure_fixed_cipher();
 			let decrypted = tightbeam.decrypt::<TestMessage>(&cipher, None)?;
 			assert_eq!(decrypted, message);
@@ -832,11 +851,12 @@ mod tests {
 			assert!(tightbeam.metadata().compactness().is_some());
 			assert!(tightbeam.metadata().confidentiality().is_some());
 
-			// Body should be encrypted+compressed (not directly decodable)
+			// The body is compressed and encrypted, so it does not decode as
+			// the message.
 			let decode_result: Result<TestMessage> = crate::decode(tightbeam.message());
 			assert!(decode_result.is_err(), "Body should be encrypted/compressed");
 
-			// Decrypt (automatically decompresses) and verify
+			// The decryption also decompresses the body.
 			let (_, cipher) = TestKey::insecure_fixed_cipher();
 			let decrypted = tightbeam.decrypt::<TestMessage>(&cipher, Some(&ZstdCompression::default()))?;
 			assert_eq!(decrypted, message);
@@ -908,12 +928,14 @@ mod tests {
 				version: &tightbeam.version(),
 				metadata: tightbeam.metadata(),
 			};
+
 			let scaffold_der = crate::encode(&scaffold)?;
 			let expected_fi = crate::utils::digest::<Sha3_256>(&scaffold_der)?;
 			let actual_fi = tightbeam.integrity().ok_or(TightBeamError::MissingDigestInfo)?;
 			assert_eq!(actual_fi.digest.as_bytes(), expected_fi.digest.as_bytes());
 
-			// Body should be encrypted+compressed (not directly decodable)
+			// The body is compressed and encrypted, so it does not decode as
+			// the message.
 			let decode_result: Result<TestMessage> = crate::decode(tightbeam.message());
 			assert!(decode_result.is_err());
 
@@ -923,7 +945,7 @@ mod tests {
 			let verifying_key = signing_key.verifying_key();
 			assert!(tightbeam.verify::<Secp256k1Signature, Sha3_256>(verifying_key).is_ok());
 
-			// Decrypt (automatically decompresses) and verify
+			// The decryption also decompresses the body.
 			let (_, cipher) = TestKey::insecure_fixed_cipher();
 			let decrypted = tightbeam.decrypt::<TestMessage>(&cipher, Some(&ZstdCompression::default()))?;
 			assert_eq!(decrypted, message);
@@ -991,8 +1013,8 @@ mod tests {
 		Ok(())
 	}
 
-	/// The refusal a message type draws when built with nothing its markers
-	/// require.
+	/// Returns the refusal that a message type draws when the build gives it
+	/// none of the protections its markers require.
 	#[cfg(all(feature = "aead", feature = "digest", feature = "signature"))]
 	fn unprotected_refusal<T: Message>(message: T) -> TightBeamError {
 		let built = FrameBuilder::from(Version::V2)
@@ -1041,14 +1063,15 @@ mod tests {
 			($name:expr, $confidential:expr, $nonrepudiable:expr, $message_integrity:expr, $frame_integrity:expr, $min_version:expr, $cipher:expr, $signing_key:expr) => {
 				let message = TestMsg { content: format!("test {}", $name) };
 
-				// Test 1: Verify constants match derive macro attributes
+				// Test 1: Verify that the constants match the derive macro
+				// attributes.
 				assert_eq!(TestMsg::MUST_BE_CONFIDENTIAL, $confidential);
 				assert_eq!(TestMsg::MUST_BE_NON_REPUDIABLE, $nonrepudiable);
 				assert_eq!(TestMsg::MUST_HAVE_MESSAGE_INTEGRITY, $message_integrity);
 				assert_eq!(TestMsg::MUST_HAVE_FRAME_INTEGRITY, $frame_integrity);
 				assert_eq!(TestMsg::MIN_VERSION, $min_version);
 
-				// Test 2: Verify frame composition
+				// Test 2: Verify the frame composition.
 				let result = compose_frame(
 					$name,
 					message.clone(),
@@ -1063,6 +1086,7 @@ mod tests {
 
 				// Test 3: Verify the README semantics. Each MUST flag requires
 				// the matching frame field.
+
 				// README line 363: MUST_BE_NON_REPUDIABLE=true requires the
 				// nonrepudiation field.
 				assert_eq!(frame.nonrepudiation().is_some(), $nonrepudiable);
@@ -1076,7 +1100,7 @@ mod tests {
 				// field.
 				assert_eq!(frame.integrity().is_some(), $frame_integrity);
 
-				// Test 4: Verify version enforcement
+				// Test 4: Verify the version enforcement.
 				if $min_version > Version::V0 {
 					let result_v0 = compose! {
 						V0: id: $name, order: 1u64, message: message.clone()

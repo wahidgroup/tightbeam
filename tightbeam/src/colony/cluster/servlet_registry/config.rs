@@ -1,9 +1,10 @@
 use core::time::Duration;
 use std::sync::Arc;
 
+use super::ClusterError;
 use crate::colony::cluster::registry::SharedId;
 use crate::colony::cluster::servlet_registry::entry::{LocalRoute, PeerRoute, ServletEntry};
-use crate::colony::cluster::AdmittedDial;
+use crate::colony::cluster::{AdmittedDial, ClusterConfig};
 use crate::colony::common::ServletInfo;
 use crate::constants::{MAX_PEER_GATEWAYS, MAX_PEER_ROUTES, MAX_RELAY_BUCKETS, MAX_RELAY_ROUTES};
 use crate::utils::urn::Urn;
@@ -41,10 +42,11 @@ pub struct PheromoneConfig {
 
 /// The local routes one hive registered, every one owned by that hive.
 ///
-/// [`PheromoneConfig::servlet_slate`] is the one constructor and stamps
-/// `hive_id` on each entry it builds, so every entry a registry receives
-/// through this type names that hive as its owner by construction
-/// (CWE-639).
+/// [`ClusterConfig::servlet_slate`] is the one constructor. It stamps
+/// `hive_id` on each entry it builds and admits only a locator that names
+/// its own address. Every entry a registry receives through this type
+/// therefore names that hive as its owner and dials the address its identity
+/// claims, by construction (CWE-639).
 pub(crate) struct HiveSlate {
 	hive_id: SharedId,
 	entries: Vec<ServletEntry>,
@@ -71,32 +73,46 @@ impl HiveSlate {
 	}
 }
 
-impl PheromoneConfig {
+impl ClusterConfig {
 	/// Builds the route entries for one hive's advertised servlets.
 	///
-	/// Every entry starts on this colony's pheromone level and abandonment
-	/// limit, so a freshly registered route competes on the same terms as
-	/// the routes already in the registry.
-	pub(crate) fn servlet_slate(&self, servlets: impl AsRef<[ServletInfo]>, hive_addr: &SharedId) -> HiveSlate {
+	/// - Each instance URN locator MUST equal the address advertised beside it (CWE-639).
+	/// - Each entry starts on this colony's pheromone level and abandonment limit.
+	///
+	/// A servlet that advertises one address under the identity of another
+	/// redirects that identity's traffic, so the one constructor of a slate
+	/// checks the locator rule.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::InvalidAddress`] -- a locator names another address than the one beside it.
+	pub(crate) fn servlet_slate(
+		&self,
+		servlets: impl AsRef<[ServletInfo]>,
+		hive_addr: &SharedId,
+	) -> Result<HiveSlate, ClusterError> {
 		let servlets = servlets.as_ref();
-		let entries = servlets
-			.iter()
-			.map(|info| {
-				ServletEntry::local(
-					LocalRoute {
-						address: Arc::from(info.address.as_slice()),
-						servlet_type: Arc::from(info.servlet_id.type_canonical_bytes().as_slice()),
-						hive_id: Arc::clone(hive_addr),
-					},
-					self.initial_pheromone,
-					self.abandonment_limit,
-				)
-			})
-			.collect();
+		let mut entries = Vec::with_capacity(servlets.len());
+		for info in servlets {
+			if !self.namespace.locator_matches(info) {
+				return Err(ClusterError::InvalidAddress(info.address.clone()));
+			}
 
-		HiveSlate { hive_id: Arc::clone(hive_addr), entries }
+			let route = LocalRoute {
+				address: Arc::from(info.address.as_slice()),
+				servlet_type: Arc::from(info.servlet_id.type_canonical_bytes().as_slice()),
+				hive_id: Arc::clone(hive_addr),
+			};
+
+			let entry = ServletEntry::local(route, self.pheromone.initial_pheromone, self.pheromone.abandonment_limit);
+			entries.push(entry);
+		}
+
+		Ok(HiveSlate { hive_id: Arc::clone(hive_addr), entries })
 	}
+}
 
+impl PheromoneConfig {
 	/// Builds the peer-routed slate, with each entry keyed by `peer_hive_id`
 	/// NUL type.
 	///
@@ -142,8 +158,8 @@ impl Default for PheromoneConfig {
 /// Storage caps for peer-learned routes (CWE-770).
 ///
 /// The named fields keep a caller from silently transposing adjacent
-/// limits. Direct slates and relay trails hold separate budgets, so relay
-/// fan-in can never starve direct-gateway admission.
+/// limits. Direct slates and relay trails hold separate budgets, so
+/// direct-gateway admission keeps its headroom under relay fan-in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerCaps {
 	/// Maximum distinct peer gateways holding installed direct slates.

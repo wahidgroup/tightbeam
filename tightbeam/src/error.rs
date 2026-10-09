@@ -83,14 +83,14 @@ pub enum CompressionError {
 	OutputLimitExceeded(usize),
 }
 
-/// Trait for injected faults in testing.
+/// An error that a test injects as a fault.
 #[cfg(feature = "testing-fault")]
 pub trait InjectedError: core::fmt::Debug + core::fmt::Display + Send + Sync {}
 
 #[cfg(feature = "testing-fault")]
 impl<T> InjectedError for T where T: core::fmt::Debug + core::fmt::Display + Send + Sync {}
 
-/// Several errors collected from one operation.
+/// The errors collected from one operation.
 ///
 /// Rendering the list is behavior of the collection, so the chain owns it
 /// through its `Display` impl. Every [`TightBeamError`] message therefore
@@ -99,19 +99,19 @@ impl<T> InjectedError for T where T: core::fmt::Debug + core::fmt::Display + Sen
 pub struct ErrorChain(Vec<TightBeamError>);
 
 impl ErrorChain {
-	/// The collected errors, in the order they were reported.
+	/// Returns the collected errors, in the order they were reported.
 	#[must_use]
 	pub fn as_slice(&self) -> &[TightBeamError] {
 		&self.0
 	}
 
-	/// How many errors the chain holds.
+	/// Returns the number of errors the chain holds.
 	#[must_use]
 	pub fn len(&self) -> usize {
 		self.0.len()
 	}
 
-	/// Whether the chain holds no error.
+	/// Returns whether the chain holds no error.
 	#[must_use]
 	pub fn is_empty(&self) -> bool {
 		self.0.is_empty()
@@ -443,7 +443,7 @@ pub enum TightBeamError {
 	#[error("Task join failed")]
 	JoinError,
 
-	/// Several errors were collected together.
+	/// One operation collected the errors that the chain holds.
 	#[error("Multiple errors occurred: {0}")]
 	Sequence(ErrorChain),
 
@@ -517,7 +517,20 @@ crate::impl_from!(std::sync::mpsc::RecvTimeoutError => TightBeamError::RecvTimeo
 
 #[cfg(feature = "transport")]
 impl TightBeamError {
-	/// Whether this error is a fuzz iteration running out of input.
+	/// Wraps a protocol error as this crate's transport error.
+	///
+	/// A protocol reports its own error type, bound to convert into
+	/// [`TransportError`], so the cluster and servlet bind sites map through
+	/// this one constructor.
+	///
+	/// [`TransportError`]: crate::transport::error::TransportError
+	#[must_use]
+	pub fn transport(error: impl Into<crate::transport::error::TransportError>) -> Self {
+		let transport = error.into();
+		Self::TransportError(transport)
+	}
+
+	/// Returns whether this error is a fuzz iteration running out of input.
 	///
 	/// AFL feeds short inputs constantly. An iteration whose oracle ran out of
 	/// bytes before the process reached a terminal state exercised a prefix of
@@ -539,7 +552,7 @@ impl TightBeamError {
 		}
 	}
 
-	/// Terminal status a service failure answers a peer with.
+	/// Returns the terminal status that a service failure answers a peer with.
 	///
 	/// A failure already carrying a transit status keeps it. Anything else
 	/// answers [`TransitStatus::Internal`], so a peer tells a failure apart
@@ -558,9 +571,9 @@ impl TightBeamError {
 		TransitStatus::Internal
 	}
 
-	/// The refusal behind every [`MuxService`] default.
+	/// Returns the refusal behind every [`MuxService`] default.
 	///
-	/// [`MuxService`]: crate::transport::serve::MuxService
+	/// [`MuxService`]: crate::transport::multiplex::MuxService
 	#[cfg(pooled_mux)]
 	#[must_use]
 	pub(crate) fn unimplemented() -> Self {
@@ -612,5 +625,18 @@ mod tests {
 	fn unit_variants_have_no_source() {
 		let err = TightBeamError::InvalidBody;
 		assert!(core::error::Error::source(&err).is_none());
+	}
+
+	/// A protocol error converts into the transport error it names, and the
+	/// crate error carries that conversion rather than a fixed variant.
+	#[cfg(all(feature = "transport", feature = "policy"))]
+	#[test]
+	fn transport_wraps_the_converted_protocol_error() {
+		use crate::policy::TransitStatus;
+		use crate::transport::error::TransportError;
+
+		let err = TightBeamError::transport(TransitStatus::Unimplemented);
+		let carries_the_failure = matches!(err, TightBeamError::TransportError(TransportError::OperationFailed(_)));
+		assert!(carries_the_failure);
 	}
 }

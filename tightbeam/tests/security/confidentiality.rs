@@ -8,12 +8,16 @@
 //! Captured ECIES ciphertext is examined: decrypted with the correct key,
 //! attempted with a wrong key, and compared across two handshakes.
 //!
+//! CMS carries the base secret inside an EnvelopedData/KARI structure. The
+//! unit test `the_base_secret_crosses_the_wire_only_sealed` in
+//! `transport::handshake::orchestrator` covers that carriage.
+//!
 //! ## Expected control
 //! The base secret MUST NOT be transmitted in the clear. The payload MUST be
 //! sealed via ECDH + HKDF into an AEAD key. Decryption MUST succeed only with
-//! the correct private key, yield the expected DER plaintext (a SEQUENCE of the
-//! 32-byte base secret and 32-byte client random OCTET STRINGs), and produce
-//! fresh ciphertext per handshake.
+//! the correct private key, yield the expected DER plaintext (a SEQUENCE of
+//! three 32-byte OCTET STRINGs: base secret, client random, key-confirmation
+//! tag), and produce fresh ciphertext per handshake.
 //!
 //! ## References
 //! - CWE-311: Missing Encryption of Sensitive Data <https://cwe.mitre.org/data/definitions/311.html>
@@ -107,11 +111,8 @@ job! {
 	name: ConfidentialityScenario,
 	async fn run((trace,): (Arc<TraceCollector>,)) -> Result<(), TightBeamError> {
 		let harness = SecurityThreatHarness::with_trace(Arc::clone(&trace));
-
-		// This test decrypts the ECIES ClientKeyExchange blob directly. CMS
-		// carries the base secret inside an EnvelopedData/KARI structure, and
-		// the unit test `the_base_secret_crosses_the_wire_only_sealed` in
-		// `transport::handshake::orchestrator` covers that wire.
+		// This scenario decrypts the ECIES ClientKeyExchange blob directly, so
+		// it runs over ECIES alone.
 		let kind = HandshakeBackendKind::Ecies;
 
 		// Step 1: Capture a complete handshake.
@@ -130,7 +131,7 @@ job! {
 
 		let ciphertext = extract_ecies_ciphertext(&client_kex.payload)?;
 		// The blob holds a 33-byte public key, a 12-byte nonce, a 16-byte tag,
-		// and the 70-byte plaintext, which is 131 bytes in all. A blob under
+		// and the 104-byte plaintext, which is 165 bytes in all. A blob under
 		// 100 bytes is no ECIES ciphertext.
 		if ciphertext.len() < 100 {
 			return Err(expectation_failure("ciphertext too short to be valid ECIES"));
@@ -142,11 +143,11 @@ job! {
 		let correct_key = harness.materials().secret_key();
 		match try_decrypt_ecies(&ciphertext, correct_key, None) {
 			DecryptionResult::Success { plaintext_len } => {
-				// The plaintext must be the 70-byte DER SEQUENCE of the 32-byte
-				// base secret and the 32-byte client random as OCTET STRINGs.
-				// This unmetered session carries no receipt acknowledgement.
-				if plaintext_len != 70 {
-					return Err(expectation_failure("decrypted plaintext is not the 70-byte DER payload"));
+				// The plaintext is the 104-byte DER SEQUENCE that the module
+				// doc names. This unmetered session carries no receipt
+				// acknowledgement, so the three OCTET STRINGs are all of it.
+				if plaintext_len != 104 {
+					return Err(expectation_failure("decrypted plaintext is not the 104-byte DER payload"));
 				}
 
 				trace.event(CONF_DECRYPT_CORRECT_KEY)?;

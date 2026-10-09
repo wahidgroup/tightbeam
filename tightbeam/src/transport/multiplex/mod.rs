@@ -46,6 +46,8 @@
 
 #[cfg(all(feature = "x509", any(feature = "tokio", feature = "async-transport")))]
 mod router;
+#[cfg(pooled_mux)]
+mod service;
 
 use core::future::Future;
 use std::sync::Arc;
@@ -120,10 +122,10 @@ use crate::transport::handshake::receipt::{ReceiptSigner, StoredReceipt};
 use crate::transport::handshake::{HandshakeProvider, HandshakeVerifyingKey};
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::transport::rekey::{ClientRekey, RekeyDriver, RekeyMaterials, ServerRekey};
-#[cfg(pooled_mux)]
-use crate::transport::serve::{GatedService, MuxService};
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::transport::state::EncryptedProtocolState;
+#[cfg(pooled_mux)]
+use service::GatedService;
 
 #[cfg(all(feature = "x509", feature = "tokio"))]
 pub use router::SpawnedMux;
@@ -132,6 +134,8 @@ pub use router::{
 	BufferedGrantor, CreditGrantor, MuxDispatch, MuxHandle, MuxReaderDriver, MuxResponder, MuxTransport,
 	MuxWriterDriver, ReplySink, RequestSink, StreamBody,
 };
+#[cfg(pooled_mux)]
+pub use service::{CallContext, MuxService};
 
 /// Grpc-style route carried on a stream's Open record.
 ///
@@ -142,8 +146,7 @@ pub use router::{
 /// - Initiators stamp a route through the typed `open_stream_to` and
 ///   `open_duplex_to` entry points, which name a servlet type URN the same way
 ///   a unary routed call names its target.
-/// - A served handler reads the route it received through
-///   [`CallContext`](crate::transport::serve::CallContext).
+/// - A served handler reads the route it received through [`CallContext`].
 #[cfg(all(feature = "x509", any(feature = "tokio", feature = "async-transport")))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamRoute {
@@ -404,8 +407,7 @@ impl MuxRekeyContext {
 			return Ok(None);
 		};
 
-		let public_key = peer_certificate.verifying_key::<P::Curve>()?;
-		let peer_verifying_key = P::VerifyingKey::from(public_key);
+		let peer_static = peer_certificate.verifying_key::<P::Curve>()?;
 		let peer_sid = peer_certificate.signer_identifier::<P::Digest>()?;
 
 		// The materials detach last, so a session refused above keeps them.
@@ -414,7 +416,7 @@ impl MuxRekeyContext {
 		};
 
 		let reference_receipt = stored.receipt().clone();
-		let materials = RekeyMaterials::<P>::new(epoch, reference_receipt, provider, peer_verifying_key, peer_sid);
+		let materials = RekeyMaterials::<P>::new(epoch, reference_receipt, provider, peer_static, peer_sid);
 
 		let driver = match role {
 			MuxRole::Client => {

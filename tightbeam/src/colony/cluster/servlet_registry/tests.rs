@@ -167,7 +167,7 @@ fn install_peer_slate(
 	registry.reconcile_peer_slate(admitted(peer, b"127.0.0.1:9000", slate), PeerCaps::default())
 }
 
-/// Relay trail under the composite `origin NUL relay` bucket.
+/// A relay trail under the composite `origin NUL relay` bucket.
 fn relay_trail(
 	origin: impl AsRef<[u8]>,
 	relay: impl AsRef<[u8]>,
@@ -667,10 +667,9 @@ fn race_ad_orders(registry: &Arc<ServletRegistry>) -> Vec<SharedId> {
 		.collect()
 }
 
-// Two advertisements for one bucket race. The order ledger and the
-// installed slate are one decision, so whichever applies last leaves the
-// ledger naming the slate that is installed. A ledger below the installed
-// order would admit a replay the withdrawal already refused (CWE-294).
+// The order ledger and the installed slate are one decision, so the last ad to
+// apply leaves the ledger naming the installed slate. A ledger below the
+// installed order would admit a replay the withdrawal refused (CWE-294).
 #[test]
 fn racing_ads_leave_the_ledger_naming_the_installed_slate() {
 	let registry = Arc::new(registry());
@@ -694,6 +693,28 @@ fn direct_reconcile_preserves_relay_bucket() -> Result<(), ClusterError> {
 	let entries = registry.peer_entries()?;
 	assert_eq!(entries.len(), 2);
 	assert!(entries.iter().any(|entry| entry.route_kind() == RouteKind::PeerRelay));
+	Ok(())
+}
+
+/// An evicted peer's direct routes and the relay trails learned from it
+/// leave together, and another peer's routes stay.
+#[test]
+fn withdraw_peer_drops_the_peers_direct_routes_and_relay_trails() -> Result<(), ClusterError> {
+	let registry = registry();
+	install_peer_slate(&registry, b"peer-a", vec![peer_entry(b"ping", b"peer-a")])?;
+
+	let trail = relay_trail(b"peer-a", b"peer-b", b"echo", b"127.0.0.1:9001");
+	registry.reconcile_relay_trail(trail, PeerCaps::default())?;
+
+	let other_slate = vec![peer_entry_dial(b"pong", b"peer-b", b"127.0.0.1:9001")];
+	let other = admitted(b"peer-b", b"127.0.0.1:9001", other_slate);
+
+	registry.reconcile_peer_slate(other, PeerCaps::default())?;
+	registry.withdraw_peer(b"peer-a")?;
+
+	let live = registry.peer_entries()?;
+	let owners: Vec<SharedId> = live.iter().map(|entry| Arc::clone(entry.owner_id())).collect();
+	assert_eq!(owners, vec![SharedId::from(b"peer-b".as_slice())]);
 	Ok(())
 }
 
@@ -960,8 +981,7 @@ fn reconcile_peer_slate_refuses_over_gateway_cap() -> Result<(), ClusterError> {
 ///
 /// Both paths take the route write lock, so a round reads one of two ways:
 ///
-/// - One plane routed: the path that landed first kept the bucket, and the
-///   sweep check refused the other.
+/// - One plane routed: the path that landed first kept the bucket, and the sweep check refused the other.
 /// - Both planes routed, or neither: an interleaving slipped past the lock,
 ///   and one slate clobbered or half-installed the other.
 fn rounds_with_one_plane_holding_the_bucket(rounds: usize) -> usize {

@@ -2,8 +2,7 @@ use core::future::Future;
 use std::sync::Arc;
 
 use crate::colony::servlet::{ServletContext, ServletService};
-use crate::transport::multiplex::{ReplySink, StreamBody};
-use crate::transport::serve::{CallContext, MuxService};
+use crate::transport::multiplex::{CallContext, MuxService, ReplySink, StreamBody};
 use crate::{Frame, TightBeamError};
 
 /// [`MuxService`] adapter that binds a [`ServletService`] to its context.

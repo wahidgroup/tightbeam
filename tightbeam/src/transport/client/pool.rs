@@ -53,7 +53,7 @@ use crate::trace::TraceCollector;
 use crate::utils::urn::Urn;
 
 /// Item gate for the pooled-mux path. Multiplexed pooling needs the mux
-/// engine, the serve module's connector, and a tokio executor for the driver
+/// engine, the service module's connector, and a tokio executor for the driver
 /// tasks.
 macro_rules! pooled_mux {
 	($($item:item)*) => {
@@ -86,17 +86,17 @@ pooled_mux! {
 /// both implement this trait, so callers configure timeouts and identity the
 /// same way.
 pub trait ConnectionBuilder<P: Protocol>: Sized {
-	/// Built client or pool produced by [`ConnectionBuilder::build`].
+	/// The client or pool that [`ConnectionBuilder::build`] produces.
 	type Output;
 
 	/// Cap how long a connect or I/O wait may block.
 	fn with_timeout(self, timeout: Duration) -> Self;
 
-	/// Trust anchors used to validate the peer certificate.
+	/// Set the trust anchors that validate the peer certificate.
 	#[cfg(feature = "x509")]
 	fn with_trust_store(self, store: Arc<dyn CertificateTrust>) -> Self;
 
-	/// Client certificate and the key that proves it, for mutual
+	/// Set the client certificate and the key that proves it, for mutual
 	/// authentication.
 	///
 	/// [`ClientIdentity::from_spec`] decodes a certificate specification into
@@ -116,9 +116,10 @@ pub struct PoolConfig {
 	/// `None` keeps idle connections until the pool evicts them for other
 	/// reasons.
 	pub idle_timeout: Option<Duration>,
-	/// Hard cap on live connections across all destinations, 64 by default.
+	/// The pool holds at most this many live connections across all
+	/// destinations. The default is 64.
 	pub max_connections: usize,
-	/// Multiplexing advertisement for pooled dials.
+	/// The multiplexing offer that pooled dials advertise.
 	///
 	/// When set, `connect` reuses one multiplexed connection per destination
 	/// until stream caps fill. The value is shared by refcount across dials.
@@ -136,7 +137,7 @@ impl Default for PoolConfig {
 #[derive(Clone)]
 /// Shared TLS assets reused across pooled connections without reallocations.
 struct PoolTlsConfig<C: CryptoProvider> {
-	/// Provisioning every dial from this pool starts with.
+	/// Every dial from this pool starts with this provisioning.
 	encryption: EncryptionConfig<C>,
 }
 
@@ -167,7 +168,7 @@ impl<C: CryptoProvider> PoolTlsConfig<C> {
 		self.encryption.receipt_approver = Some(approver);
 	}
 
-	/// Everything one dial from this pool is built from.
+	/// Returns everything that one dial from this pool is built from.
 	///
 	/// Every pool dial passes here, so this is where the pool answers the
 	/// dialer rule. Cloning the provisioning bumps refcounts, so a dial copies
@@ -197,8 +198,8 @@ pub struct ConnectionPoolBuilder<P: Protocol> {
 }
 
 impl<P: Protocol> ConnectionPoolBuilder<P> {
-	/// A builder for a pool configured by `config` that measures idle time,
-	/// deadlines, and backoff against `clock`.
+	/// Returns a builder for a pool configured by `config` that measures idle
+	/// time, deadlines, and backoff against `clock`.
 	pub fn new(config: PoolConfig, clock: Arc<dyn Clock>) -> Self {
 		Self {
 			config,
@@ -213,9 +214,9 @@ impl<P: Protocol> ConnectionPoolBuilder<P> {
 	}
 }
 
-/// Available where the standard library's clocks work. A pool on
-/// `wasm32-unknown-unknown`, which has no [`SystemClock`], names the clock it
-/// reads through [`ConnectionPoolBuilder::new`].
+/// The default builder is available where the standard library's clocks work. A
+/// pool on `wasm32-unknown-unknown`, which has no [`SystemClock`], names the
+/// clock it reads through [`ConnectionPoolBuilder::new`].
 #[cfg(host_clock)]
 impl<P: Protocol> Default for ConnectionPoolBuilder<P> {
 	fn default() -> Self {
@@ -240,7 +241,7 @@ impl<P: Protocol> ConnectionPoolBuilder<P> {
 		self
 	}
 
-	/// Replace the clock idle time, deadlines, and backoff are measured
+	/// Replace the clock that idle time, deadlines, and backoff are measured
 	/// against.
 	pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
 		self.clock = clock;
@@ -351,7 +352,7 @@ pooled_mux! {
 	}
 
 	impl ActivityStamp {
-		/// A stamp set to the clock's current instant.
+		/// Returns a stamp set to the clock's current instant.
 		fn new(clock: Arc<dyn Clock>) -> Self {
 			let at = Mutex::new(clock.monotonic());
 
@@ -363,7 +364,7 @@ pooled_mux! {
 			*self.at.lock().unwrap_or_else(PoisonError::into_inner) = self.clock.monotonic();
 		}
 
-		/// The instant of the last recorded activity.
+		/// Returns the instant of the last recorded activity.
 		fn at(&self) -> MonotonicInstant {
 			*self.at.lock().unwrap_or_else(PoisonError::into_inner)
 		}
@@ -384,7 +385,7 @@ pooled_mux! {
 		reader_task: rt::JoinHandle,
 		/// Shared activity stamp used by idle pruning for this mux entry.
 		///
-		/// The mux core reads no clock. Each lease updates this stamp
+		/// The pool owns the clock reading, so each lease updates this stamp
 		/// when emit starts, outside the pool lock. An entry with pending
 		/// streams stays active even if the stamp is old.
 		last_used: Arc<ActivityStamp>,
@@ -402,7 +403,7 @@ pooled_mux! {
 struct DestinationPool<P: Protocol> {
 	/// Available connections ready for reuse.
 	available: VecDeque<AvailableEntry<P>>,
-	/// Shared multiplexed connections, which every caller shares.
+	/// The multiplexed connections, which every caller shares.
 	#[cfg(pooled_mux)]
 	mux: Vec<MuxEntry>,
 }
@@ -459,13 +460,16 @@ impl<P: Protocol> ConnectionPool<P> {
 	/// saturating at zero so an accounting defect can never wrap the counter
 	/// and wedge the pool into permanent refusal.
 	fn release_connection_count(&self) {
+		// An `Err` means the count already stands at zero, which is the floor
+		// the method keeps.
 		let _ = self
 			.total_connections
 			.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| current.checked_sub(1));
 	}
 
-	/// Everything one dial from this pool is built from: the shared
-	/// provisioning, the pool's clock, and its instrumentation collector.
+	/// Returns everything that one dial from this pool is built from: the
+	/// shared provisioning, the pool's clock, and its instrumentation
+	/// collector.
 	///
 	/// The endpoint is built before the dial opens a socket, so a pool that
 	/// answers the dialer rule with a refusal never connects.
@@ -625,12 +629,14 @@ where
 			let last_used = entry.last_used.at();
 			let expired = now.saturating_duration_since(last_used) >= timeout;
 			if expired {
-				// Send GoAway before close (RFC 9113 § 6.8), so the reader
-				// task ends on the resulting EOF. A stream that races this
-				// drain observes `Draining`, which the lease lifecycle maps
-				// to eviction.
+				// GoAway precedes the close (RFC 9113 § 6.8), so the reader
+				// task ends on the resulting EOF. A racing stream observes
+				// `Draining`, which `PooledClient::emit` maps to eviction.
 				let handle = entry.handle.clone();
 				rt::spawn(async move {
+					// The drain runs detached from the prune that spawned it.
+					// Its only failure is `ConnectionClosed`, which names a
+					// connection that is already closed.
 					let _ = handle.shutdown().await;
 				});
 
@@ -1013,7 +1019,8 @@ where
 		self.client.as_mut().ok_or(TransportError::InvalidState)
 	}
 
-	/// Validated TLS peer certificate pinned by this connection's handshake.
+	/// Returns the validated TLS peer certificate that this connection's
+	/// handshake pinned.
 	///
 	/// A mux lease answers from the certificate pinned at its eager dial
 	/// handshake. An exclusive lease reads its transport, so the answer
@@ -1069,7 +1076,8 @@ pooled_mux! {
 			+ Send
 			+ Sync,
 	{
-		/// Current epoch's dual-signed session receipt on a multiplexed lease.
+		/// Returns the current epoch's dual-signed session receipt on a
+		/// multiplexed lease.
 		///
 		/// Every lease on the connection shares it, and each completed in-band
 		/// renewal rotates it in place. It is `None` on an exclusive lease and
@@ -1086,8 +1094,9 @@ pooled_mux! {
 		/// - `StreamsExhausted` (local stream cap full) moves the lease to a
 		///   pooled connection with stream headroom, or an additional one up to
 		///   `max_connections`, and retries there once.
-		/// - `ConnectionClosed` or `Draining` (rekey GoAway) evicts the entry
-		///   so the next connect re-establishes it, then reports the failure.
+		/// - `ConnectionClosed` or `Draining` (a rekey GoAway or an idle-prune
+		///   drain) evicts the entry so the next connect re-establishes it,
+		///   then reports the failure.
 		pub async fn emit(&mut self, frame: Frame, attempt: Option<usize>) -> TransportResult<Option<Frame>> {
 			// The handle clone is a refcount bump that releases the `self.mux`
 			// borrow before the failover arm takes `&mut self`.
@@ -1129,7 +1138,7 @@ pooled_mux! {
 			self.conn()?.complete_handshake().await
 		}
 
-		/// This lease's mux handle, with its activity recorded.
+		/// Returns this lease's mux handle, with its activity recorded.
 		///
 		/// Every streaming entry point below needs the same two steps: refuse
 		/// an exclusive lease, then stamp the entry so the pruner counts the
@@ -1137,8 +1146,7 @@ pooled_mux! {
 		///
 		/// # Errors
 		///
-		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and
-		///   streaming needs the mux plane.
+		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and streaming needs the mux plane.
 		fn stamped_handle(&self) -> TransportResult<&MuxHandle> {
 			let lease = self.mux.as_ref().ok_or(TransportError::InvalidState)?;
 			lease.stamp();
@@ -1153,8 +1161,7 @@ pooled_mux! {
 		///
 		/// # Errors
 		///
-		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and
-		///   streaming needs the mux plane.
+		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and streaming needs the mux plane.
 		pub fn open_stream(
 			&self,
 		) -> TransportResult<(RequestSink, impl Future<Output = TransportResult<Option<Frame>>> + MaybeSend)> {
@@ -1165,12 +1172,11 @@ pooled_mux! {
 		/// the grpc-style route to dispatch locally or to splice the stream to
 		/// a further peer.
 		///
-		/// Otherwise identical to [`open_stream`](Self::open_stream).
+		/// It is otherwise identical to [`open_stream`](Self::open_stream).
 		///
 		/// # Errors
 		///
-		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and
-		///   streaming needs the mux plane.
+		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and streaming needs the mux plane.
 		pub fn open_stream_to(
 			&self,
 			target: impl Into<Urn<'static>>,
@@ -1183,15 +1189,14 @@ pooled_mux! {
 		/// - [`StreamRoute::to`] builds the route for an origin open.
 		/// - [`StreamRoute::relayed_to`] builds the route that re-emits a spent hop budget.
 		///
-		/// Prefer [`open_stream_to`](Self::open_stream_to) when the
-		/// route is a plain origin target. Otherwise identical to
-		/// [`open_stream`](Self::open_stream). Crate-internal callers
-		/// pass a fully formed route when the origin helpers are not enough.
+		/// Prefer [`open_stream_to`](Self::open_stream_to) when the route is a
+		/// plain origin target. This method is otherwise identical to
+		/// [`open_stream`](Self::open_stream). Crate-internal callers pass a
+		/// fully formed route when the origin helpers are not enough.
 		///
 		/// # Errors
 		///
-		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and
-		///   streaming needs the mux plane.
+		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and streaming needs the mux plane.
 		#[cfg(feature = "colony")]
 		pub(crate) fn open_stream_with_route(
 			&self,
@@ -1206,8 +1211,7 @@ pooled_mux! {
 		///
 		/// # Errors
 		///
-		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and
-		///   streaming needs the mux plane.
+		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and streaming needs the mux plane.
 		pub fn open_duplex(&self) -> TransportResult<(RequestSink, StreamBody)> {
 			self.stamped_handle()?.open_duplex()
 		}
@@ -1216,12 +1220,11 @@ pooled_mux! {
 		/// grpc-style route to dispatch locally or to splice both directions to
 		/// a further peer.
 		///
-		/// Otherwise identical to [`open_duplex`](Self::open_duplex).
+		/// It is otherwise identical to [`open_duplex`](Self::open_duplex).
 		///
 		/// # Errors
 		///
-		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and
-		///   streaming needs the mux plane.
+		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and streaming needs the mux plane.
 		pub fn open_duplex_to(&self, target: impl Into<Urn<'static>>) -> TransportResult<(RequestSink, StreamBody)> {
 			self.stamped_handle()?.open_duplex_to(target)
 		}
@@ -1231,15 +1234,14 @@ pooled_mux! {
 		/// - [`StreamRoute::to`] builds the route for an origin open.
 		/// - [`StreamRoute::relayed_to`] builds the route that re-emits a spent hop budget.
 		///
-		/// Prefer [`open_duplex_to`](Self::open_duplex_to) when the
-		/// route is a plain origin target. Otherwise identical to
-		/// [`open_duplex`](Self::open_duplex). Crate-internal callers
-		/// pass a fully formed route when the origin helpers are not enough.
+		/// Prefer [`open_duplex_to`](Self::open_duplex_to) when the route is a
+		/// plain origin target. This method is otherwise identical to
+		/// [`open_duplex`](Self::open_duplex). Crate-internal callers pass a
+		/// fully formed route when the origin helpers are not enough.
 		///
 		/// # Errors
 		///
-		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and
-		///   streaming needs the mux plane.
+		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and streaming needs the mux plane.
 		#[cfg(feature = "colony")]
 		pub(crate) fn open_duplex_with_route(&self, route: StreamRoute) -> TransportResult<(RequestSink, StreamBody)> {
 			self.stamped_handle()?.open_duplex_with_route(route)

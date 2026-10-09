@@ -11,6 +11,7 @@ use alloc::sync::Arc;
 
 use core::time::Duration;
 use std::error::Error;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::asn1::OctetString;
@@ -48,11 +49,13 @@ use crate::transport::handshake::negotiation::{
 	AuthorizationGrant, AuthorizationRefusal, MuxBudgets, RunnableProfile, TransportAuthorizer, TransportOffer,
 };
 use crate::transport::handshake::primitives::KdfSalt;
-use crate::transport::handshake::receipt::{ApprovalRefusal, ReceiptApprover, SessionReceipt};
+use crate::transport::handshake::receipt::{
+	ApprovalRefusal, ReceiptApprover, SessionObserver, SessionOutcome, SessionReceipt,
+};
 #[cfg(feature = "transport-ecies")]
 use crate::transport::handshake::schedule::CompressedPoint;
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-use crate::transport::handshake::schedule::{Agreement, BaseSecret, HandshakeAgreement};
+use crate::transport::handshake::schedule::{Agreement, BaseSecret, HandshakeAgreement, KeyConfirmation};
 #[cfg(feature = "transport-ecies")]
 use crate::transport::handshake::TunneledMessage;
 use crate::transport::handshake::{
@@ -219,6 +222,68 @@ pub fn fixture_handshake_secret(fill: u8) -> HandshakeSecret {
 		.expect("fixture inputs derive a handshake secret")
 }
 
+/// The salt and the transcript hash of [`fixture_confirmation`].
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+const FIXTURE_CONFIRMED: [u8; 32] = [0x99u8; 32];
+
+/// A key-confirmation tag of a fixture handshake secret, which confirms no
+/// handshake a test runs.
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+pub fn fixture_confirmation() -> KeyConfirmation {
+	let secret = fixture_handshake_secret(0x42);
+	let derived = secret.confirmation::<DefaultCryptoProvider>(KdfSalt::new(&FIXTURE_CONFIRMED), &FIXTURE_CONFIRMED);
+	derived.expect("a fixture secret derives a tag")
+}
+
+/// What a hand-built closing confirms, as a client reads it from the reply.
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+pub struct Confirming {
+	/// The server ephemeral the reply carried.
+	pub server_ephemeral: PublicKey<Secp256k1>,
+	/// The KDF salt of the handshake.
+	pub salt: Vec<u8>,
+	/// The hash of the transcript the reply sealed.
+	pub transcript_hash: [u8; 32],
+}
+
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+impl Confirming {
+	/// The key-confirmation tag of a client that drew `base` and `ephemeral`.
+	///
+	/// The handshake secret comes from the production agreement of `ephemeral`
+	/// with the server ephemeral, so an honest hand-built closing confirms the
+	/// secret the server derives.
+	pub fn tag(&self, base: &BaseSecret, ephemeral: &SecretKey) -> KeyConfirmation {
+		let salt = KdfSalt::new(&self.salt);
+		let agreement = Agreement::<DefaultCryptoProvider>::new(base, &self.server_ephemeral);
+		let secret = agreement
+			.settle(ephemeral, salt)
+			.expect("the agreement derives a handshake secret");
+
+		let derived = secret.confirmation::<DefaultCryptoProvider>(salt, &self.transcript_hash);
+		derived.expect("the handshake secret derives a tag")
+	}
+}
+
+/// Counts the receipt outcomes a server reports.
+#[derive(Default)]
+pub struct CountingObserver(AtomicUsize);
+
+impl CountingObserver {
+	/// How many outcomes the server reported.
+	pub fn outcomes(&self) -> usize {
+		self.0.load(Ordering::SeqCst)
+	}
+}
+
+impl SessionObserver for CountingObserver {
+	fn on_outcome<'a>(&'a self, _outcome: &'a SessionOutcome) -> MaybeSendFuture<'a, ()> {
+		Box::pin(async move {
+			self.0.fetch_add(1, Ordering::SeqCst);
+		})
+	}
+}
+
 /// The plaintext of the record a test session seals under the client's send
 /// cipher.
 pub const RECORD_PLAINTEXT: &[u8] = b"application record sealed under the traffic key";
@@ -255,7 +320,7 @@ pub type AckAttempts = Vec<Result<SecretSlice<u8>, HandshakeError>>;
 /// server's static key.
 ///
 /// It holds the base secret that key recovers, the protocol salt, and the two
-/// ephemeral public keys as they crossed the wire.
+/// ephemeral public keys as the handshake carried them.
 ///
 /// # Candidates
 ///
@@ -439,10 +504,8 @@ pub fn create_test_key_enc_alg() -> AlgorithmIdentifierOwned {
 	AlgorithmIdentifierOwned { oid: AES_256_WRAP, parameters: None }
 }
 
-/// Convert a signing key into an `Arc<dyn SigningKeyProvider>`.
-///
-/// Tests and simple use cases use it to wrap a signing key in a provider
-/// trait object.
+/// `signing_key` behind the provider trait object that an endpoint
+/// configuration takes.
 pub fn into_provider(signing_key: Secp256k1SigningKey) -> Arc<dyn SigningKeyProvider> {
 	Arc::new(Secp256k1KeyProvider::from(signing_key))
 }
@@ -714,8 +777,8 @@ pub fn originator_point(key_exchange: &EnvelopedData) -> Vec<u8> {
 	originator.public_key.raw_bytes().to_vec()
 }
 
-/// What crossed the wire in one handshake, with both endpoints after the
-/// closing.
+/// The three messages of one handshake as they were sent, with both endpoints
+/// after the closing.
 pub struct Run<F: TestFlow> {
 	/// The opening, as the client sent it.
 	pub opening: HandshakeMessage,
@@ -732,14 +795,14 @@ pub struct Run<F: TestFlow> {
 }
 
 impl<F: TestFlow> Run<F> {
-	/// Every byte the three legs put on the wire.
+	/// Every byte the three legs sent.
 	pub fn wire_bytes(&self) -> Vec<u8> {
 		[self.opening.der(), self.reply.der(), self.closing.der()].concat()
 	}
 }
 
 /// Drive a client under `client` and a server under `server` through the
-/// three legs, recording each message as the wire carries it.
+/// three legs, recording each message as it is sent.
 pub async fn run<F: TestFlow>(client: TestClientConfig<F>, server: TestServerConfig<F>) -> Run<F> {
 	let mut client = Handshake::client(client);
 	let mut server = Handshake::server(server);

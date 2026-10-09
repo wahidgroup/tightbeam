@@ -38,9 +38,10 @@ use tightbeam::transport::handshake::negotiation::{
 	AuthorizationGrant, AuthorizationRefusal, MuxBudgets, TransportAuthorizer, TransportOffer,
 };
 use tightbeam::transport::handshake::receipt::SessionReceipt;
-use tightbeam::transport::multiplex::{MuxAcceptor, MuxRole, MuxTransport, ReplySink, StreamBody};
+use tightbeam::transport::multiplex::{
+	CallContext, MuxAcceptor, MuxRole, MuxService, MuxTransport, ReplySink, StreamBody,
+};
 use tightbeam::transport::policy::CollectorGateConfig;
-use tightbeam::transport::serve::{CallContext, MuxService};
 use tightbeam::transport::tcp::r#async::{TcpTransport, TokioListener, TokioStream};
 use tightbeam::transport::{
 	ClientBuilder, ConnectionBuilder, ConnectionPool, PoolConfig, PooledClient, ResponsePackage, TransportError,
@@ -546,10 +547,9 @@ tb_assert_spec! {
 	}
 }
 
-// A caller that gates policy on peer identity reads the certificate off
-// the lease before its first emit. A mux connection handshakes eagerly
-// at dial, so its lease must expose the validated peer certificate the
-// same way an exclusive lease does.
+// A caller that gates policy on peer identity reads the certificate off the
+// lease before its first emit. A mux connection handshakes eagerly at dial,
+// so its lease must expose the validated peer certificate too.
 tb_scenario! {
 	name: pooled_mux_lease_exposes_peer_certificate,
 	spec: MuxPeerCertificateSpec,
@@ -890,6 +890,9 @@ impl ManualContext {
 		};
 		for task in drained {
 			task.abort();
+			// The await waits for the task to end, which is all this teardown
+			// needs. Its answer is a cancellation, or the task's own result
+			// when the task ended first.
 			let _ = task.await;
 		}
 	}

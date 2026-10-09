@@ -179,10 +179,8 @@ pub struct ClusterTlsConfig {
 	///
 	/// The store fills three roles:
 	///
-	/// 1. Outbound dials to hives and servlets validate the server
-	///    certificate against it.
-	/// 2. Hive-origin control frames (registration, spawn results)
-	///    verify their signature against it.
+	/// 1. Outbound dials to hives and servlets validate the server certificate against it.
+	/// 2. Hive-origin control frames (registration, spawn results) verify their signature against it.
 	/// 3. The export boundary classifies a caller as first-party when
 	///    the store holds the caller's public key and `peer_trust` does
 	///    not (see [`TrustPlanes`]).
@@ -307,8 +305,7 @@ impl core::fmt::Debug for ClusterTlsConfig {
 pub struct PeerConfig {
 	/// Peer gateway addresses dialed to advertise exported types.
 	///
-	/// - The dial list is not an identity gate, and partial or asymmetric
-	///   federation graphs are expected.
+	/// - The dial list is not an identity gate, and partial or asymmetric federation graphs are expected.
 	/// - An empty list disables outbound advertisement.
 	/// - Each beat snapshots the local servlet registry as the slate, so peers
 	///   learn the types currently served.
@@ -323,10 +320,8 @@ pub struct PeerConfig {
 	/// The socket this gateway advertises as its own, when the operator set
 	/// one.
 	///
-	/// - `None` advertises the bound address, which is what a gateway bound to
-	///   one interface is dialed at.
-	/// - A gateway bound to the wildcard address sets this, because every peer
-	///   refuses a claim of `0.0.0.0`.
+	/// - `None` advertises the bound address, which is what a gateway bound to one interface is dialed at.
+	/// - A gateway bound to the wildcard address sets this, because every peer refuses a claim of `0.0.0.0`.
 	advertise_addr: Option<PeerAddress>,
 	/// Inbound peer ads may only claim dial addresses in this list.
 	///
@@ -335,12 +330,12 @@ pub struct PeerConfig {
 	/// - Peer-exchange hints pass the same gate before the table learns them,
 	///   so discovery dials addresses from the list alone.
 	///
-	/// The field is private because the parse is the point. Set it with
+	/// The field is private so that every entry is a parsed socket. Set it with
 	/// [`ClusterConfigBuilder::with_peer_dial_allowlist`] and read it with
 	/// [`PeerConfig::peer_dial_allowlist`].
 	peer_dial_allowlist: Option<Arc<HashSet<PeerAddress>>>,
-	/// Discovery table: `peers` as un-evictable anchors plus bounded,
-	/// prefix-bucketed learned peers.
+	/// The discovery table, which holds `peers` as un-evictable anchors beside
+	/// the bounded, prefix-bucketed learned peers.
 	///
 	/// - The config builder rebuilds it, so anchors always derive from
 	///   `peers` and the injected [`PeerStore`] rehydrates learned peers
@@ -490,15 +485,21 @@ pub struct ClusterConfig {
 	pub bind_addr: Option<String>,
 	/// Edge accept plane bind address, parsed by the edge address `FromStr`.
 	///
-	/// `None` disables the edge plane. When set, the gateway binds a second
-	/// listener with the same TLS material for external clients (for example
-	/// a browser transport) and admits `Work` frames only: control frames are
-	/// refused with `PermissionDenied`, so an edge client can never join the
-	/// colony control plane. Hives keep registering on `bind_addr`.
+	/// - `None` disables the edge plane.
+	/// - `Some` binds a second listener with the same TLS material for external
+	///   clients, such as a browser transport.
+	/// - The edge listener admits `Work` frames only. It refuses control frames
+	///   with `PermissionDenied`, so an edge client can never join the colony
+	///   control plane.
+	/// - Hives keep registering on `bind_addr`.
 	pub edge_bind_addr: Option<String>,
 	/// Peer-federation dial list, advertise beat and address, and dial policy.
 	pub peer: PeerConfig,
 	/// Gossip freshness, origin TTL, ingress, journal, and admission.
+	///
+	/// Startup clamps [`GossipConfig::seen_ttl`] to the journal's retention. A
+	/// rumor older than retention has no digest left, so a wider window would
+	/// re-admit a replay as new (CWE-294).
 	pub gossip: GossipConfig,
 	/// The clock every freshness, replay, retention and lease decision on
 	/// this gateway reads. Defaults to
@@ -537,19 +538,17 @@ impl ClusterConfig {
 		self.peer.rumor_refresh.min(self.gossip.seen_ttl)
 	}
 
-	/// Parse hive identity, added entries, and removed instance locators.
+	/// Parse the hive identity, the added entries, and the removed instance
+	/// locators.
 	///
 	/// Returns [`None`] when the hive URN, any added locator, or any removed
-	/// URN falls outside this colony's namespace. The delta is parsed whole,
+	/// URN falls outside this colony's namespace, or when an added locator
+	/// names another address than the one beside it. The delta is parsed whole,
 	/// so the registry applies all of it or none of it.
 	pub(crate) fn parse_address_update<'a>(&self, update: &'a ServletAddressUpdate) -> Option<ParsedAddressUpdate<'a>> {
 		let ColonyResource::Hive { addr } = self.namespace.validate(&update.hive_id).ok()? else {
 			return None;
 		};
-
-		if !update.added.iter().all(|info| self.namespace.locator_matches(info)) {
-			return None;
-		}
 
 		let mut removed = Vec::with_capacity(update.removed.len());
 		for urn in &update.removed {
@@ -560,7 +559,7 @@ impl ClusterConfig {
 		}
 
 		let hive_id: Arc<[u8]> = Arc::from(addr.as_bytes());
-		let added = self.pheromone.servlet_slate(&update.added, &hive_id);
+		let added = self.servlet_slate(&update.added, &hive_id).ok()?;
 		Some((added, removed))
 	}
 
@@ -591,7 +590,7 @@ impl ClusterConfig {
 
 	/// Colony URN from the gateway certificate URI SAN.
 	///
-	/// `None` when this gateway is not a colony member.
+	/// It returns `None` when this gateway is not a colony member.
 	#[must_use]
 	pub fn colony_urn(&self) -> Option<&Urn<'static>> {
 		self.colony_urn.as_ref()
@@ -791,6 +790,28 @@ mod tests {
 		}
 	}
 
+	/// The instance URN of servlet type `name` at `addr`.
+	fn instance_urn(name: &(impl AsRef<str> + ?Sized), addr: &(impl AsRef<str> + ?Sized)) -> Urn<'static> {
+		servlet_urn(name)
+			.servlet_instance(addr)
+			.expect("a servlet type URN yields an instance URN")
+	}
+
+	/// A servlet that advertises one address under the locator of another
+	/// gets no slate, so no route can redirect that locator's traffic.
+	#[test]
+	fn a_slate_refuses_a_locator_that_names_another_address() {
+		let config = ClusterConfig::new(test_tls_config());
+		let hive_addr: SharedId = Arc::from(b"127.0.0.1:9000".as_slice());
+		let mismatched = ServletInfo {
+			servlet_id: instance_urn("ping", "127.0.0.1:9001"),
+			address: b"127.0.0.1:9002".to_vec(),
+		};
+
+		let refused = config.servlet_slate(&[mismatched], &hive_addr);
+		assert!(matches!(refused, Err(ClusterError::InvalidAddress(address)) if address == b"127.0.0.1:9002"));
+	}
+
 	fn request_with_meta(addr: impl AsRef<[u8]>, servlets: &[&str], meta: impl AsRef<[u8]>) -> RegisterHiveRequest {
 		let addr = addr.as_ref();
 		let meta = meta.as_ref();
@@ -828,9 +849,8 @@ mod tests {
 	#[test]
 	fn a_refresh_inside_the_window_is_the_one_configured() {
 		let config = config_refreshing(Duration::from_millis(300), Duration::from_millis(400));
-
-		// The clamp is a ceiling, not a replacement: an operator asking to
-		// refresh more often than the window still gets what they asked for.
+		// The clamp is a ceiling, so an operator who asks to refresh more often
+		// than the window gets the interval they asked for.
 		assert_eq!(config.rumor_refresh(), Duration::from_millis(300));
 	}
 

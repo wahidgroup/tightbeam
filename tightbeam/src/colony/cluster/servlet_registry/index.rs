@@ -93,8 +93,7 @@ impl ServletRegistry {
 	/// - The relay dial address comes from this registry's recorded value for
 	///   the relay, which the direct reconcile's ownership check has already
 	///   gated.
-	/// - Each bucket refuses stale advertisements on its own order ledger, as
-	///   direct slates do (CWE-294).
+	/// - Each bucket refuses stale advertisements on its own order ledger, as direct slates do (CWE-294).
 	pub(in crate::colony::cluster) fn reconcile_relay_trail(
 		&self,
 		trail: RelayTrail,
@@ -124,6 +123,28 @@ impl ServletRegistry {
 		let hive_id = hive_id.as_ref();
 		let bucket = Bucket { id: hive_id, owner: Owner::hive(hive_id) };
 		Ok(self.routes.write()?.remove_owned(bucket))
+	}
+
+	/// Withdraws every route an evicted peer holds: its direct slate and the
+	/// relay trails learned from it.
+	///
+	/// A dead gateway's direct routes dial nothing, and a trail learned from
+	/// its advertisement lasts only as long as the claim it came from, so
+	/// both leave under one guard. A route another owner landed under the
+	/// same bucket bytes belongs to that owner and stays (CWE-639).
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::LockPoisoned`] -- the route lock is poisoned.
+	pub(in crate::colony::cluster) fn withdraw_peer(&self, fingerprint: impl AsRef<[u8]>) -> Result<(), ClusterError> {
+		let fingerprint = fingerprint.as_ref();
+		let bucket = Bucket { id: fingerprint, owner: Owner::peer(fingerprint) };
+		let mut routes = self.routes.write()?;
+
+		routes.remove_owned(bucket);
+		routes.remove_relay_trails_for_origin(fingerprint);
+
+		Ok(())
 	}
 
 	/// Applies a batch of servlet address additions and removals for one hive.

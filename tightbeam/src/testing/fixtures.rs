@@ -4,25 +4,25 @@
 //! certificate, a frame, or a key finds one place for it.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::asn1::{
 	AlgorithmIdentifier, AlgorithmIdentifierOwned, DigestInfo, Frame, ObjectIdentifier, OctetString, SignerInfo,
 };
 use crate::der::Sequence;
 use crate::oids::{HASH_SHA256, HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA3_256};
+use crate::Beamable;
 use crate::{decode, Message, Version};
 
-use crate::Beamable;
+#[cfg(host_clock)]
+use crate::utils::time::UnixMillis;
+#[cfg(feature = "aead")]
+use aead::*;
 
 #[cfg(feature = "aead")]
 mod aead {
 	pub use crate::crypto::aead::{Aes256Gcm, KeyInit};
 	pub use crate::crypto::common::Key;
 }
-
-#[cfg(feature = "aead")]
-use aead::*;
 
 #[cfg(any(
 	all(feature = "digest", feature = "sha3"),
@@ -118,7 +118,8 @@ mod cert {
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 use cert::*;
 
-/// Fixed test validity window: epoch through a far-future UtcTime.
+/// Returns the fixed test validity window, which runs from the epoch through a
+/// far-future UtcTime.
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 fn test_validity() -> TbResult<Validity> {
 	let not_before = Time::UtcTime(UtcTime::from_unix_duration(Duration::from_secs(0))?);
@@ -127,14 +128,16 @@ fn test_validity() -> TbResult<Validity> {
 	Ok(validity)
 }
 
-/// ECDSA-with-SHA3-256 algorithm identifier used by the test cert fixtures.
+/// Returns the ECDSA-with-SHA3-256 algorithm identifier that the test
+/// certificate fixtures use.
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 fn test_signature_algorithm() -> AlgorithmIdentifierOwned {
 	AlgorithmIdentifierOwned { oid: SIGNER_ECDSA_WITH_SHA3_256, parameters: None }
 }
 
-/// Shared body of the URI-SAN fixtures. `name` is both the subject and the
-/// issuer (a self-signed shape), and each of `uris` becomes a SAN entry.
+/// Builds the shared body of the URI-SAN fixtures. `name` is both the subject
+/// and the issuer (a self-signed shape), and each of `uris` becomes a SAN
+/// entry.
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 fn test_certificate_named_with_uri_sans(signing_key: &SigningKey, name: RdnSequence, uris: &[&str]) -> Certificate {
 	let names = uris
@@ -149,15 +152,16 @@ fn test_certificate_named_with_uri_sans(signing_key: &SigningKey, name: RdnSeque
 	test_certificate_named(signing_key, name, Some(vec![test_extension(&san)]))
 }
 
-/// Shared body of the placeholder-signed test certificate fixtures, with an
-/// empty subject and issuer, a fixed serial, and caller-chosen extensions.
+/// Builds the shared body of the placeholder-signed test certificate fixtures,
+/// with an empty subject and issuer, a fixed serial, and caller-chosen
+/// extensions.
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 fn test_certificate_with_extensions(signing_key: &SigningKey, extensions: Option<Vec<Extension>>) -> Certificate {
 	test_certificate_named(signing_key, RdnSequence::default(), extensions)
 }
 
-/// Placeholder-signed test certificate with `name` as both the subject and
-/// the issuer, a fixed serial, and caller-chosen extensions.
+/// Builds a placeholder-signed test certificate with `name` as both the subject
+/// and the issuer, a fixed serial, and caller-chosen extensions.
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 fn test_certificate_named(
 	signing_key: &SigningKey,
@@ -224,7 +228,7 @@ impl TestCertificateChain {
 	}
 }
 
-/// Single-AVA `CN=<cn>` distinguished name for test certificates.
+/// Builds the single-AVA `CN=<cn>` distinguished name for test certificates.
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 fn test_cn_name(cn: impl AsRef<str>) -> TbResult<RdnSequence> {
 	let cn = cn.as_ref();
@@ -267,7 +271,7 @@ fn sign_test_certificate(
 /// - A closure: `message: || { TestMessage::sample(None) }`
 #[macro_export]
 macro_rules! test_builder {
-	// Closure form: message: || { ... }
+	// The closure form is `message: || { ... }`.
 	(
 		name: $test_name:ident,
 		builder_type: $builder_type:ty,
@@ -286,7 +290,7 @@ macro_rules! test_builder {
 		);
 	};
 
-	// Direct value form: message: some_value
+	// The direct value form is `message: some_value`.
 	(
 		name: $test_name:ident,
 		builder_type: $builder_type:ty,
@@ -326,9 +330,9 @@ macro_rules! test_builder {
 	};
 }
 
-/// Match a [`Frame`] against one of several expected forms.
+/// Match a [`Frame`] against an expected value in one of these forms:
 ///
-/// - A `Frame` compares `metadata.id`.
+/// - A `Frame` or an `Arc<Frame>` compares `metadata.id`.
 /// - A `Result<Frame, E>` compares `metadata.id` of the `Ok` frame.
 /// - Any `T: Beamable + PartialEq` decodes `T` from `frame.message` and compares.
 pub trait ExpectedMatcher {
@@ -384,18 +388,17 @@ macro_rules! test_worker {
 		async fn $test_name() -> Result<(), Box<dyn std::error::Error>> {
 			use $crate::colony::worker::Worker;
 
-			// Build and start the worker
 			let builder = $setup_body;
 			let trace = std::sync::Arc::new($crate::trace::TraceCollector::new());
 			let mut worker = <_ as $crate::colony::worker::Worker>::start(builder, trace).await?;
 
-			// Run assertions with reference to worker
 			let result = {
 				let $worker = &mut worker;
 				$assertions_body.await
 			};
 
-			// Graceful shutdown: close the queue and await run-loop exit
+			// The shutdown runs before the result returns, so a failed
+			// assertion still stops the worker.
 			worker.kill().await?;
 
 			result
@@ -410,13 +413,10 @@ impl TestFrame {
 	pub fn v0(content: Option<&str>, id: Option<&str>) -> Frame {
 		let message = TestMessage::sample(content);
 
-		#[cfg(feature = "std")]
-		let order = SystemTime::now()
-			.duration_since(UNIX_EPOCH)
-			.expect("Time went backwards")
-			.as_secs();
+		#[cfg(host_clock)]
+		let order = core::time::Duration::from_millis(UnixMillis::now().get()).as_secs();
 
-		#[cfg(not(feature = "std"))]
+		#[cfg(not(host_clock))]
 		let order: u64 = 1_700_000_000;
 
 		#[cfg(all(feature = "std", feature = "digest", feature = "random"))]
@@ -453,7 +453,7 @@ impl TestFrame {
 		.expect("Failed to create frame with frame integrity")
 	}
 
-	/// A V2 frame that carries a priority, a field V0 and V1 forbid.
+	/// Build a V2 frame that carries a priority, a field that V0 and V1 forbid.
 	#[cfg(feature = "builder")]
 	pub fn prioritized() -> Frame {
 		let message = TestMessage::sample(None);
@@ -466,8 +466,8 @@ impl TestFrame {
 		.expect("a V2 frame carries a priority")
 	}
 
-	/// `frame` decoded again after the first copy of `original` in its DER
-	/// becomes `forged`.
+	/// Returns `frame` decoded again after the first copy of `original` in its
+	/// DER becomes `forged`.
 	///
 	/// A test models tampering in transit this way, because no method rewrites
 	/// a digested or signed field in place. The two byte strings MUST have one
@@ -482,12 +482,13 @@ impl TestFrame {
 			.windows(original.len())
 			.position(|window| window == original)
 			.expect("the frame DER holds the original bytes");
+
 		encoded[start..start + forged.len()].copy_from_slice(forged);
 
 		crate::der::Decode::from_der(&encoded).expect("a same-length rewrite still decodes")
 	}
 
-	/// The DER of `container` with the version of its embedded `frame`
+	/// Returns the DER of `container` with the version of its embedded `frame`
 	/// rewritten to `version`.
 	///
 	/// No constructor yields a frame whose version forbids a field it carries.
@@ -507,9 +508,9 @@ impl TestFrame {
 			short if short < 0x80 => 1,
 			long => 1 + usize::from(long & 0x7F),
 		};
+
 		let version_offset = start + 1 + length_octets + 2;
 		encoded[version_offset] = version as u8;
-
 		encoded
 	}
 }
@@ -518,8 +519,8 @@ impl TestFrame {
 pub struct TestKey;
 
 impl TestKey {
-	/// The secp256k1 signing key whose secret scalar is thirty-two `0x01`
-	/// bytes.
+	/// Returns the secp256k1 signing key whose secret scalar is thirty-two
+	/// `0x01` bytes.
 	///
 	/// # Security
 	///
@@ -532,7 +533,8 @@ impl TestKey {
 		SigningKey::from_bytes(&secret_bytes.into()).expect("Failed to create signing key")
 	}
 
-	/// The AES-256-GCM key made of thirty-two `0x33` bytes, with its cipher.
+	/// Returns the AES-256-GCM key made of thirty-two `0x33` bytes, with its
+	/// cipher.
 	///
 	/// # Security
 	///
@@ -541,6 +543,7 @@ impl TestKey {
 	#[cfg(feature = "aead")]
 	pub fn insecure_fixed_cipher() -> (Key<Aes256Gcm>, Aes256Gcm) {
 		let key_bytes = [0x33; 32];
+
 		let key = Key::<Aes256Gcm>::from(key_bytes);
 		let cipher = Aes256Gcm::new(&key);
 		(key, cipher)
@@ -556,24 +559,24 @@ impl TestCertificate {
 		test_certificate_with_extensions(signing_key, None)
 	}
 
-	/// [`Self::self_signed`] variant carrying each of `uris` as a URI
-	/// Subject Alternative Name entry (RFC 5280 §4.2.1.6).
+	/// Builds a [`Self::self_signed`] variant that carries each of `uris` as a
+	/// URI Subject Alternative Name entry (RFC 5280 §4.2.1.6).
 	///
-	/// The subject stays empty: identity claims such as colony membership
-	/// bind to the SAN, never the subject. With an empty subject the SAN
-	/// MUST be critical (RFC 5280 §4.2.1.6), which `test_extension`
-	/// already provides.
+	/// The subject stays empty, because identity claims such as colony
+	/// membership bind to the SAN and not to the subject. With an empty subject
+	/// the SAN MUST be critical (RFC 5280 §4.2.1.6), which `test_extension`
+	/// provides.
 	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 	pub fn with_uri_sans(signing_key: &SigningKey, uris: &[&str]) -> Certificate {
 		test_certificate_named_with_uri_sans(signing_key, RdnSequence::default(), uris)
 	}
 
-	/// [`Self::with_uri_sans`] variant with a `CN=<cn>`
-	/// subject and issuer.
+	/// Builds a [`Self::with_uri_sans`] variant with a `CN=<cn>` subject and
+	/// issuer.
 	///
-	/// Trust-store issuer selection commits to the first subject-DN match
-	/// (see [`CertificateValidation::evaluate`]), so a store anchoring
-	/// several self-signed identities needs each under a distinct DN. The
+	/// Trust-store issuer selection commits to the first subject-DN match (see
+	/// [`CertificateValidation::evaluate`]), so a store that anchors more than
+	/// one self-signed identity needs each under a distinct DN. The
 	/// empty-subject SAN fixtures all share one DN and would collide.
 	///
 	/// [`CertificateValidation::evaluate`]: crate::crypto::x509::policy::CertificateValidation::evaluate
@@ -613,7 +616,7 @@ impl TestCertificate {
 	///
 	/// # Errors
 	///
-	/// Returns an error if key material, DER encoding, or signing fails.
+	/// - [`crate::TightBeamError`] -- the key material, the DER encoding, or the signing fails.
 	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 	pub fn insecure_fixed_chain() -> TbResult<TestCertificateChain> {
 		let root_key = SigningKey::from_bytes(&[1u8; 32].into())?;
@@ -627,7 +630,7 @@ impl TestCertificate {
 		let validity = test_validity()?;
 		let algorithm = test_signature_algorithm();
 
-		// Root certificate (self-signed)
+		// The root certificate is self-signed.
 		let root_pub_der = root_key.verifying_key().to_public_key_der()?;
 		let subject_public_key_info = SubjectPublicKeyInfoOwned::from_der(root_pub_der.as_bytes())?;
 		let root_tbs = TbsCertificate {
@@ -646,7 +649,7 @@ impl TestCertificate {
 		};
 		let root = sign_test_certificate(root_tbs, &algorithm, &root_key)?;
 
-		// Intermediate certificate (signed by root)
+		// The root signs the intermediate certificate.
 		let inter_pub_der = intermediate_key.verifying_key().to_public_key_der()?;
 		let subject_public_key_info = SubjectPublicKeyInfoOwned::from_der(inter_pub_der.as_bytes())?;
 		let inter_tbs = TbsCertificate {
@@ -665,7 +668,7 @@ impl TestCertificate {
 		};
 		let intermediate = sign_test_certificate(inter_tbs, &algorithm, &root_key)?;
 
-		// Leaf certificate (signed by intermediate)
+		// The intermediate signs the leaf certificate.
 		let leaf_pub_der = leaf_key.verifying_key().to_public_key_der()?;
 		let subject_public_key_info = SubjectPublicKeyInfoOwned::from_der(leaf_pub_der.as_bytes())?;
 		let leaf_tbs = TbsCertificate {

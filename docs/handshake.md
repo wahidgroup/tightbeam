@@ -83,7 +83,7 @@ stateDiagram-v2
 
 `SessionPhase::admits` holds this table. `SessionState::apply` is the one writer of the phase, and it consults the table before it writes.
 
-A move the table does not name leaves the session where it was and returns `false`, so an out-of-order install fails with `TransportError::InvalidState`.
+A move the table does not name leaves the session where it was. `begin_handshake` and `install_session` then return `false`, so an out-of-order install fails with `TransportError::InvalidState`.
 
 | Attempted move             | Result  | Reason                                     |
 | -------------------------- | ------- | ------------------------------------------ |
@@ -105,8 +105,9 @@ sequenceDiagram
     Note over S: validates the offer, negotiates a profile, draws an ephemeral
     S->>C: ServerHandshake (SignedData, signed transcript carries the server ephemeral)
     Note over C: validates the certificate, verifies the signature, parses the server ephemeral
-    C->>S: ClientKeyExchange (EnvelopedData, base secret sealed under the client ephemeral)
+    C->>S: ClientKeyExchange (EnvelopedData, base secret and key-confirmation tag sealed under the client ephemeral)
     Note over C,S: both derive the handshake secret from the base secret and the ephemeral-ephemeral ECDH
+    Note over S: verifies the key-confirmation tag, then settles the receipt countersignature
 ```
 
 CMS exchanges three messages as well, but the client leads with the key exchange because the base secret travels encrypted to the server's certificate.
@@ -120,11 +121,15 @@ sequenceDiagram
     S->>C: ServerFinished (SignedData, signed transcript carries the server ephemeral)
     Note over C: verifies the signature over the transcript, parses the server ephemeral
     Note over C,S: both derive the handshake secret from the base secret and the ephemeral-ephemeral ECDH
-    C->>S: ClientFinished (SignedData, receipt countersignature sealed under the handshake secret)
-    Note over S: verifies the Finished, opens and settles the receipt countersignature
+    C->>S: ClientFinished (SignedData, key-confirmation tag, receipt countersignature sealed under the handshake secret)
+    Note over S: verifies the Finished and the key-confirmation tag, then opens and settles the receipt countersignature
 ```
 
-In both protocols the server settles the receipt in the same step that reads the client's last message, so a budget-bearing session activates only after the countersignature verifies. A refused settlement takes the handshake secret with it, so a replay of that message has nothing to complete with.
+In both protocols the server settles the receipt in the same step that reads the client's last message.
+
+- A budget-bearing session activates only after the countersignature verifies.
+- The [key-confirmation tag](#key-confirmation) is verified first.
+- A refused settlement takes the handshake secret with it, so a replay of that message has nothing to complete with.
 
 Both protocols negotiate the security profile through one policy, `ProfilePolicy`:
 
@@ -135,11 +140,11 @@ Both protocols negotiate the security profile through one policy, `ProfilePolicy
 
 One type, `Handshake<R, F, P>`, runs both roles over both protocols.
 
-| Parameter | Values                | What it fixes                                               |
-| --------- | --------------------- | ----------------------------------------------------------- |
-| `R`       | `Client`, `Server`    | The step order and every negotiation and admission decision |
-| `F`       | `Ecies`, `Cms`        | The wire of the protocol and the checks that wire defines   |
-| `P`       | A `HandshakeProvider` | The algorithms                                              |
+| Parameter | Values                | What it fixes                                                     |
+| --------- | --------------------- | ----------------------------------------------------------------- |
+| `R`       | `Client`, `Server`    | The step order and every negotiation and admission decision       |
+| `F`       | `Ecies`, `Cms`        | The messages of the protocol and the checks those messages define |
+| `P`       | A `HandshakeProvider` | The algorithms                                                    |
 
 Each role runs three steps.
 
@@ -224,7 +229,7 @@ Installing that session is one phase write. The write bounds both session cipher
 ```rust
 pub fn install_session(&mut self, session: EstablishedSession, encrypted_envelope: usize) -> bool {
     let bounded = session.with_envelope_ceiling(encrypted_envelope);
-    self.apply(SessionEvent::Install(Box::new(bounded)))
+    self.apply(SessionEvent::Install(Box::new(bounded))).is_some()
 }
 ```
 
@@ -248,7 +253,7 @@ An endpoint must establish something about its peer before it dials. Any one of 
 - A server certificate.
 - A requirement for a client certificate.
 
-A client identity does not count, because it proves who the client is and says nothing about the server. An endpoint that holds none of the three, and did not name cleartext, is refused before any frame reaches the wire (CWE-295).
+A client identity does not count, because it proves who the client is and says nothing about the server. An endpoint that holds none of the three, and did not name cleartext, is refused before any frame is sent (CWE-295).
 
 ```rust
 pub fn check_dial_permitted(&self) -> TransportResult<()> {
@@ -262,7 +267,7 @@ pub fn check_dial_permitted(&self) -> TransportResult<()> {
 
 `DialableEncryption::new` runs this check, and every `SessionState` is built from a `DialableEncryption`. The builder, the connection pool, the colony dialers and the `client!` macro are therefore all covered by one check.
 
-A frame reaches the wire through one of two places, and each carries the decision already made:
+A frame is sent through one of two places, and each carries the decision already made:
 
 | Writer            | What closes it                                                                                                                                                                      |
 | ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -279,13 +284,13 @@ let client = ClientBuilder::<TokioListener>::builder()
     .await?;
 ```
 
-| Configuration                          | Reaches the wire | Reason                                        |
-| -------------------------------------- | ---------------- | --------------------------------------------- |
-| Trust store                            | Yes              | The peer is authenticated                     |
-| Client validators                      | Yes              | A mutual-auth server authenticates its client |
-| Server certificate                     | Yes              | A server presents its own identity            |
-| Client identity alone                  | No               | Nothing establishes who the peer is           |
-| Client identity plus `allow_cleartext` | Yes              | The risk is named                             |
+| Configuration                          | Sends frames | Reason                                        |
+| -------------------------------------- | ------------ | --------------------------------------------- |
+| Trust store                            | Yes          | The peer is authenticated                     |
+| Client validators                      | Yes          | A mutual-auth server authenticates its client |
+| Server certificate                     | Yes          | A server presents its own identity            |
+| Client identity alone                  | No           | Nothing establishes who the peer is           |
+| Client identity plus `allow_cleartext` | Yes          | The risk is named                             |
 
 ### Admit a client
 
@@ -313,6 +318,7 @@ k_c2s   = HKDF(hs, S, "tb/session/kdf/c2s/v1")
 k_s2c   = HKDF(hs, S, "tb/session/kdf/s2c/v1")
 epoch_0 = HKDF(hs, S, "tb/session/kdf/epoch/v1")
 k_ack   = HKDF(hs, S, "tb/session/kdf/ack/v1")
+confirm = HKDF(hs, S, "tb/session/kdf/confirm/v1" || transcript_hash)
 ```
 
 | Input      | What it is                                                                          |
@@ -326,13 +332,17 @@ k_ack   = HKDF(hs, S, "tb/session/kdf/ack/v1")
 
 The client reuses the ephemeral it already sends. The server draws a fresh one, `E`, for each handshake and carries it inside the transcript it signs.
 
-| Step                          | ECIES                                        | CMS                             |
-| ----------------------------- | -------------------------------------------- | ------------------------------- |
-| Client ephemeral              | `R`, at the head of the encrypted payload    | `C`, the KARI originator key    |
-| Client drops its private half | In `respond`, once it sealed the closing     | In `respond`, at the agreement  |
-| Server drops its private half | In `finish`, which takes it on every outcome | In `reply`, where it is a local |
+| Step                          | ECIES                                                                                        | CMS                               |
+| ----------------------------- | -------------------------------------------------------------------------------------------- | --------------------------------- |
+| Client ephemeral              | `R`, at the head of the encrypted payload                                                    | `C`, the KARI originator key      |
+| Client draws its private half | In `respond`, after the receipt is approved and countersigned, in a step that awaits nothing | In `start`, with the key exchange |
+| Client drops its private half | In `respond`, once it sealed the closing                                                     | In `respond`, at the agreement    |
+| Server drops its private half | In `finish`, which takes it on every outcome                                                 | In `reply`, where it is a local   |
 
-Every received ephemeral passes `PublicKey::from_sec1_bytes`, which refuses a malformed, off-curve, or identity point before any scalar multiplication. A client also refuses an `E` equal to the server's static key, because the agreement would then collapse into the static one.
+Every received ephemeral is checked before any scalar multiplication runs on it:
+
+- `PublicKey::from_sec1_bytes` refuses a malformed, off-curve, or identity point.
+- A client also refuses an `E` equal to the server's static key, because the agreement would then collapse into the static one.
 
 ### Forward secrecy
 
@@ -341,20 +351,38 @@ An observer who records a session and later obtains the server's static key reco
 | Value                       | Observer with the static key | Reason                                                             |
 | --------------------------- | ---------------------------- | ------------------------------------------------------------------ |
 | `base`                      | Recovers                     | The static key opens the ECIES payload or unwraps the KARI content |
-| `S`                         | Recovers                     | Public on the wire                                                 |
+| `S`                         | Recovers                     | Public in the handshake messages                                   |
 | `ee`                        | Does not recover             | Needs `r` or `e` (ECIES), `c` or `e` (CMS), none of them kept      |
 | `hs` and every key below it | Does not recover             | One input unknown                                                  |
 
-The traffic keys, the sealed receipt acknowledgement, and every rekey epoch sit below `hs`. Each epoch is a KDF link from `epoch_0`, so the rekey chain inherits the property.
+The traffic keys, the sealed receipt acknowledgement, and every rekey epoch sit below `hs`, so the rekey chain inherits the property.
+
+### Rekey
+
+Each renewal runs a fresh agreement. The client sends an ephemeral `Ce` on the request, and the server an ephemeral `Se` on the response.
+
+```text
+epoch_next = HKDF(u32be(32) || epoch || u32be(32) || ee, salt = client_random || server_random, info = "tb/session/kdf/epoch/v1")
+```
+
+`ee` is the ECDH output of the two rekey ephemerals. A holder of one epoch secret who records the renewal lacks `ee`, so the holder derives nothing of the next epoch.
+
+| Rule                                                                      | Where it is enforced                                                                                                                                  |
+| ------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| The next epoch needs a rekey scalar                                       | `EpochSecret::next` runs the agreement itself                                                                                                         |
+| Both ephemerals are authenticated                                         | The server signs a receipt over `H(hash \|\| request \|\| server_random \|\| Se)`, the request carries `Ce`, and the client countersigns that receipt |
+| A peer ephemeral is a point on the curve, and never the peer's static key | `PeerEphemeral` yields a `PeerPoint`, the one point type `EpochSecret::next` takes                                                                    |
+| The server holds no rekey scalar across an await or between legs          | It agrees and drops its scalar before it awaits its authorizer, and it holds the derived secret until the acknowledgement                             |
+| The client holds its rekey scalar across no await of a step               | The scalar waits boxed between the request and the response. `EpochSecret::next` takes it by value before the client awaits its approver              |
 
 ### Traffic secrets
 
 The directional derivation accepts only a `TrafficSecret`, a sealed trait with two implementors. Every traffic key therefore traces back to a handshake secret.
 
-| Secret            | Constructors                                                                                |
-| ----------------- | ------------------------------------------------------------------------------------------- |
-| `HandshakeSecret` | `HandshakeSecret::derive`                                                                   |
-| `EpochSecret`     | `EpochMaterials::derive`, from a handshake secret. `EpochSecret::next`, from the last epoch |
+| Secret            | Constructors                                                                                                      |
+| ----------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `HandshakeSecret` | `HandshakeSecret::derive`                                                                                         |
+| `EpochSecret`     | `EpochMaterials::derive`, from a handshake secret. `EpochSecret::next`, from the last epoch and a fresh agreement |
 
 ### Receipt acknowledgement
 
@@ -362,6 +390,19 @@ The acknowledgement is sealed under `k_ack`. Its associated data is the label `t
 
 - A sealed answer moved to another session fails to open, even under the right key.
 - The label names this AEAD context alone, so the associated data differs from every signed Finished content.
+
+### Key confirmation
+
+The client proves on the closing that it derived `hs`. It sends `confirm`, and the server derives the same tag and compares the two in constant time before it settles.
+
+| Protocol | Where the tag travels                                                      | A closing with no tag fails with                     |
+| -------- | -------------------------------------------------------------------------- | ---------------------------------------------------- |
+| ECIES    | A field of the sealed payload                                              | `InvalidDecryptedPayloadSize`, at the payload decode |
+| CMS      | An unsigned attribute of the client Finished, OID `1.3.6.1.4.1.64586.1.24` | `MissingAttribute`, where the Finished is read       |
+
+- A tag that differs is refused with `KeyConfirmationFailed`. The refusal runs ahead of settlement, so the authorizer's settlement and the session observer hear nothing of a client that holds another secret.
+- The tag derives from `hs` and the transcript hash, so it reveals neither and confirms no other handshake. The CMS attribute therefore needs no signature over it.
+- The confirmation is one-way. The server learns at the closing that the secrets match, and the client learns at its first record.
 
 ## Transcript binding
 
@@ -378,16 +419,16 @@ The receiver hashes the bytes that arrived, and not a re-encoding of what it dec
 | A container                      | `WireDer::der`                       |
 | An accept or ephemeral attribute | `HandshakeAttribute::received_bytes` |
 
-The ECIES transcript binds the `ClientHello` DER and the accept encodings the same way.
+The ECIES transcript binds the `ClientHello` DER and the accept encodings the same way. It also binds the server's certificate demand as one byte between the two accepts, so a flipped `client_cert_required` fails the server signature.
 
 Both transcripts bind both ephemerals.
 
-| Ephemeral         | Bound by                                                                              | Tampering fails at                                                           |
-| ----------------- | ------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| Server `E`, ECIES | A fixed-width leg of the signed transcript                                            | The server signature. A widened one fails `OctetStringLengthError` before it |
-| Server `E`, CMS   | The last `ServerFinishedLegs` entry before the transcript seals                       | The server signature. A removed one fails `MissingAttribute` before the seal |
-| Client `R`, ECIES | The content key commits to `R`, and the client signature covers the encrypted payload | The payload open (`EciesError`)                                              |
-| Client `C`, CMS   | The key exchange DER, with `C` inside it, is the first transcript leg                 | The key unwrap (`AesKeyWrap`)                                                |
+| Ephemeral         | Bound by                                                                              | Tampering fails at                                                                  |
+| ----------------- | ------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| Server `E`, ECIES | A fixed-width leg of the signed transcript                                            | The server signature. One of another width fails `OctetStringLengthError` before it |
+| Server `E`, CMS   | The last `ServerFinishedLegs` entry before the transcript seals                       | The server signature. A removed one fails `MissingAttribute` before the seal        |
+| Client `R`, ECIES | The content key commits to `R`, and the client signature covers the encrypted payload | The payload open (`EciesError`)                                                     |
+| Client `C`, CMS   | The key exchange DER, with `C` inside it, is the first transcript leg                 | The key unwrap (`KeyError::WrapFailed`)                                             |
 
 A swapped server ephemeral fails the server signature before any key agreement runs.
 
@@ -421,6 +462,7 @@ An end of stream is named by the phase it interrupted.
 - RFC 5280, Internet X.509 Public Key Infrastructure Certificate and CRL Profile: <https://datatracker.ietf.org/doc/html/rfc5280>
 - RFC 5869, HMAC-based Extract-and-Expand Key Derivation Function (HKDF): <https://datatracker.ietf.org/doc/html/rfc5869>
 - RFC 5116, An Interface and Algorithms for Authenticated Encryption, § 3.2 on single-use keys: <https://datatracker.ietf.org/doc/html/rfc5116#section-3.2>
+- NIST SP 800-56A Rev. 3, Pair-Wise Key-Establishment Schemes Using Discrete Logarithm Cryptography, § 5.9 on key confirmation: <https://doi.org/10.6028/NIST.SP.800-56Ar3>
 - CWE-295, Improper Certificate Validation: <https://cwe.mitre.org/data/definitions/295.html>
 - CWE-311, Missing Encryption of Sensitive Data: <https://cwe.mitre.org/data/definitions/311.html>
 - CWE-345, Insufficient Verification of Data Authenticity: <https://cwe.mitre.org/data/definitions/345.html>

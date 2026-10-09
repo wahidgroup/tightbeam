@@ -32,6 +32,7 @@ use tightbeam::transport::{
 	TransportFailure,
 };
 use tightbeam::utils::marker::MaybeSendFuture;
+use tightbeam::utils::time::Clock;
 use tightbeam::{Frame, TightBeamError};
 use tokio::net::TcpStream;
 use tokio::sync::Notify;
@@ -81,7 +82,7 @@ pub fn client_stream_id(index: u32) -> u32 {
 ///
 /// # Errors
 ///
-/// The bind, connect, or handshake failure of either side.
+/// - The bind, connect, or handshake failure of either side.
 pub async fn establish_transports(
 	client_offer: Option<TransportOffer>,
 	server_offer: Option<TransportOffer>,
@@ -133,6 +134,9 @@ pub struct MuxEndpointConfig {
 	pub rekey: bool,
 	/// Time budget override for one renewal exchange.
 	pub renewal_deadline: Option<Duration>,
+	/// The clock the renewal deadline runs on, for a scenario that advances
+	/// it instead of waiting.
+	pub clock: Option<Arc<dyn Clock>>,
 }
 
 /// Shared tail of encrypted and cleartext endpoint constructors.
@@ -156,8 +160,8 @@ where
 ///
 /// # Errors
 ///
-/// An expectation failure when the handshake negotiated no multiplexing, or
-/// the rekey harvest or split failure.
+/// - An expectation failure when the handshake negotiated no multiplexing, or
+///   the rekey harvest or split failure.
 pub fn spawn_mux_endpoint_with(
 	mut transport: TcpTransport<TokioStream>,
 	role: MuxRole,
@@ -190,6 +194,9 @@ pub fn spawn_mux_endpoint_with(
 	if let Some(deadline) = config.renewal_deadline {
 		mux = mux.with_renewal_deadline(deadline);
 	}
+	if let Some(clock) = config.clock {
+		mux = mux.with_clock(clock);
+	}
 
 	let endpoint_pair = spawn_mux_tasks(mux, config.cancel_budget);
 	Ok(endpoint_pair)
@@ -199,7 +206,7 @@ pub fn spawn_mux_endpoint_with(
 ///
 /// # Errors
 ///
-/// The [`spawn_mux_endpoint_with`] set.
+/// - The [`spawn_mux_endpoint_with`] set.
 pub fn spawn_mux_endpoint(
 	transport: TcpTransport<TokioStream>,
 	role: MuxRole,
@@ -212,7 +219,7 @@ pub fn spawn_mux_endpoint(
 ///
 /// # Errors
 ///
-/// The split failure of the transport.
+/// - The split failure of the transport.
 pub fn spawn_cleartext_mux_endpoint(
 	transport: TcpTransport<TokioStream>,
 	role: MuxRole,
@@ -231,7 +238,7 @@ pub fn spawn_cleartext_mux_endpoint(
 ///
 /// # Errors
 ///
-/// The bind, connect, or accept failure.
+/// - The bind, connect, or accept failure.
 pub async fn establish_cleartext_transports(
 ) -> Result<(TcpTransport<TokioStream>, TcpTransport<TokioStream>), TightBeamError> {
 	let listener = TokioListener::<DefaultCryptoProvider>::bind("127.0.0.1:0").await?;
@@ -257,7 +264,7 @@ pub async fn establish_cleartext_transports(
 ///
 /// # Errors
 ///
-/// The accept or handshake failure, or the [`spawn_mux_endpoint`] set.
+/// - The accept or handshake failure, or the [`spawn_mux_endpoint`] set.
 pub async fn accept_mux_server(
 	listener: TokioListener,
 	offer: TransportOffer,
@@ -278,7 +285,7 @@ pub async fn accept_mux_server(
 ///
 /// # Errors
 ///
-/// The bind failure of the listener.
+/// - The bind failure of the listener.
 pub async fn start_mux_server<H, Fut>(
 	materials: &ServerMaterials,
 	cap: u32,
@@ -294,6 +301,8 @@ where
 		let Ok((_endpoint, responder)) = accept_mux_server(listener, mux_offer(cap), trace).await else {
 			return;
 		};
+		// The serve loop ends when the connection does, and a scenario reads
+		// its outcome from the trace.
 		let _ = responder.serve(handler).await;
 	});
 
@@ -324,8 +333,8 @@ impl MuxClient {
 ///
 /// # Errors
 ///
-/// An expectation failure when the client negotiated no multiplexing, or the
-/// connect, handshake, or spawn failure.
+/// - An expectation failure when the client negotiated no multiplexing, or the
+///   connect, handshake, or spawn failure.
 pub async fn connect_mux_client(
 	addr: SocketAddr,
 	materials: &ServerMaterials,
@@ -339,6 +348,7 @@ pub async fn connect_mux_client(
 	let settings = client
 		.negotiated_mux()
 		.ok_or_else(|| expectation_failure("client must negotiate multiplexing"))?;
+
 	let (endpoint, responder) = spawn_mux_endpoint(client, MuxRole::Client)?;
 	Ok(MuxClient { endpoint, responder, settings })
 }
@@ -357,8 +367,7 @@ pub struct ClientMuxServerRaw {
 ///
 /// # Errors
 ///
-/// The [`establish_transports`] and [`spawn_mux_endpoint`] sets, or the split
-/// failure of the server.
+/// - The [`establish_transports`] and [`spawn_mux_endpoint`] sets, or the split failure of the server.
 pub async fn establish_client_mux_server_raw_with(
 	client_offer: TransportOffer,
 	server_offer: TransportOffer,
@@ -375,7 +384,7 @@ pub async fn establish_client_mux_server_raw_with(
 ///
 /// # Errors
 ///
-/// The [`establish_client_mux_server_raw_with`] set.
+/// - The [`establish_client_mux_server_raw_with`] set.
 pub async fn establish_client_mux_server_raw(
 	cap: u32,
 	trace: TraceCollector,
@@ -388,7 +397,7 @@ pub async fn establish_client_mux_server_raw(
 ///
 /// # Errors
 ///
-/// The read or write failure of the raw server, or a panicked emit task.
+/// - The read or write failure of the raw server, or a panicked emit task.
 pub async fn raw_echo_roundtrip(link: &mut ClientMuxServerRaw, frame: &Frame) -> Result<bool, TightBeamError> {
 	let emit_task = spawn_emit(&link.client.handle, frame.to_owned());
 	let (stream_id, message) = read_muxed_request(&mut link.server_reader).await?;
@@ -415,7 +424,7 @@ pub struct ServerMuxClientRaw {
 ///
 /// # Errors
 ///
-/// The [`spawn_mux_endpoint_with`] set, or the split failure of the client.
+/// - The [`spawn_mux_endpoint_with`] set, or the split failure of the client.
 pub fn split_server_mux_client_raw(
 	client: TcpTransport<TokioStream>,
 	server: TcpTransport<TokioStream>,
@@ -431,7 +440,7 @@ pub fn split_server_mux_client_raw(
 ///
 /// # Errors
 ///
-/// The [`establish_transports`] and [`split_server_mux_client_raw`] sets.
+/// - The [`establish_transports`] and [`split_server_mux_client_raw`] sets.
 pub async fn establish_server_mux_client_raw_with(
 	client_offer: TransportOffer,
 	server_offer: TransportOffer,
@@ -446,7 +455,7 @@ pub async fn establish_server_mux_client_raw_with(
 ///
 /// # Errors
 ///
-/// The [`establish_server_mux_client_raw_with`] set.
+/// - The [`establish_server_mux_client_raw_with`] set.
 pub async fn establish_server_mux_client_raw(
 	client_cap: u32,
 	server_cap: u32,
@@ -471,7 +480,7 @@ pub struct MuxPair {
 ///
 /// # Errors
 ///
-/// The [`spawn_mux_endpoint_with`] set of either side.
+/// - The [`spawn_mux_endpoint_with`] set of either side.
 pub fn spawn_echo_pair_with(
 	client: TcpTransport<TokioStream>,
 	server: TcpTransport<TokioStream>,
@@ -495,7 +504,7 @@ pub fn spawn_echo_pair_with(
 ///
 /// # Errors
 ///
-/// The [`spawn_echo_pair_with`] set.
+/// - The [`spawn_echo_pair_with`] set.
 pub fn spawn_echo_pair(
 	client: TcpTransport<TokioStream>,
 	server: TcpTransport<TokioStream>,
@@ -509,7 +518,7 @@ pub fn spawn_echo_pair(
 ///
 /// # Errors
 ///
-/// The [`establish_transports`] and [`spawn_echo_pair`] sets.
+/// - The [`establish_transports`] and [`spawn_echo_pair`] sets.
 pub async fn establish_echo_pair(
 	client_offer: TransportOffer,
 	server_offer: TransportOffer,
@@ -590,13 +599,12 @@ pub fn streaming_echo_handler(chunks_seen: Arc<AtomicUsize>) -> impl Fn(StreamBo
 ///
 /// # Errors
 ///
-/// The push or close failure of the sink.
+/// - The push or close failure of the sink.
 pub async fn push_split(mut sink: RequestSink, payload: impl AsRef<[u8]>) -> Result<(), TransportError> {
 	let payload = payload.as_ref();
 	let middle = payload.len() / 2;
 	sink.push(&payload[..middle]).await?;
 	sink.push(&payload[middle..]).await?;
-
 	sink.close().await
 }
 
@@ -778,8 +786,7 @@ pub async fn abort_emit(task: EmitTask) {
 ///
 /// # Errors
 ///
-/// An expectation failure when the next envelope is not a single-chunk open,
-/// or the read or decode failure.
+/// - An expectation failure when the next envelope is not a single-chunk open, or the read or decode failure.
 pub async fn read_muxed_request<R: EnvelopeSource>(reader: &mut R) -> Result<(u32, Arc<Frame>), TightBeamError> {
 	let envelope = reader.read_envelope().await?;
 	match envelope {
@@ -795,7 +802,7 @@ pub async fn read_muxed_request<R: EnvelopeSource>(reader: &mut R) -> Result<(u3
 ///
 /// # Errors
 ///
-/// The [`read_muxed_request`] set.
+/// - The [`read_muxed_request`] set.
 pub async fn read_muxed_request_id<R: EnvelopeSource>(reader: &mut R) -> Result<u32, TightBeamError> {
 	let (stream_id, _frame) = read_muxed_request(reader).await?;
 	Ok(stream_id)
@@ -805,8 +812,8 @@ pub async fn read_muxed_request_id<R: EnvelopeSource>(reader: &mut R) -> Result<
 ///
 /// # Errors
 ///
-/// An expectation failure that carries `msg` when the open is on another
-/// stream, or the [`read_muxed_request`] set.
+/// - An expectation failure that carries `msg` when the open is on another
+///   stream, or the [`read_muxed_request`] set.
 pub async fn expect_muxed_request(
 	reader: &mut SplitReader,
 	expected_id: u32,
@@ -824,7 +831,7 @@ pub async fn expect_muxed_request(
 ///
 /// # Errors
 ///
-/// The encode failure of the frame or the open package.
+/// - The encode failure of the frame or the open package.
 pub fn muxed_request_envelope(stream_id: u32, frame: Frame) -> Result<TransportEnvelope, TightBeamError> {
 	let payload = frame.to_der()?;
 	Ok(MuxOpenPackage::new(stream_id, true, MuxStreamKind::Unary, payload)?.into())
@@ -834,7 +841,7 @@ pub fn muxed_request_envelope(stream_id: u32, frame: Frame) -> Result<TransportE
 ///
 /// # Errors
 ///
-/// The [`muxed_request_envelope`] set, or the write failure.
+/// - The [`muxed_request_envelope`] set, or the write failure.
 pub async fn write_muxed_request<W: EnvelopeSink>(
 	writer: &mut W,
 	stream_id: u32,
@@ -848,7 +855,7 @@ pub async fn write_muxed_request<W: EnvelopeSink>(
 ///
 /// # Errors
 ///
-/// The encode or write failure.
+/// - The encode or write failure.
 pub async fn write_muxed_end(
 	writer: &mut SplitWriter,
 	stream_id: u32,
@@ -865,7 +872,7 @@ pub async fn write_muxed_end(
 ///
 /// # Errors
 ///
-/// The encode or write failure.
+/// - The encode or write failure.
 pub async fn write_muxed_echo(
 	writer: &mut SplitWriter,
 	stream_id: u32,
@@ -879,7 +886,7 @@ pub async fn write_muxed_echo(
 ///
 /// # Errors
 ///
-/// The write failure.
+/// - The write failure.
 pub async fn write_goaway(
 	writer: &mut SplitWriter,
 	last_stream_id: u32,
@@ -895,7 +902,7 @@ pub async fn write_goaway(
 ///
 /// # Errors
 ///
-/// The [`write_muxed_request`] set, or the write failure of the cancel.
+/// - The [`write_muxed_request`] set, or the write failure of the cancel.
 pub async fn write_open_cancel<W: EnvelopeSink>(
 	writer: &mut W,
 	stream_id: u32,
@@ -922,6 +929,8 @@ pub async fn kick_shutdown(
 ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
 	let mut shutdown_future = Box::pin(handle.shutdown());
 	poll_fn(|cx| {
+		// One poll sends the GoAway and halts the allocator. The caller awaits
+		// the drain on the returned future.
 		let _ = shutdown_future.as_mut().poll(cx);
 		Poll::Ready(())
 	})
@@ -978,8 +987,7 @@ pub fn is_budget_exhausted(result: &Result<Option<Frame>, TransportError>) -> bo
 ///
 /// # Errors
 ///
-/// An expectation failure when a record is not a data chunk on `stream_id`,
-/// or the read failure.
+/// - An expectation failure when a record is not a data chunk on `stream_id`, or the read failure.
 pub async fn read_remaining_chunks(
 	reader: &mut SplitReader,
 	stream_id: u32,
@@ -1008,8 +1016,7 @@ pub async fn read_remaining_chunks(
 ///
 /// # Errors
 ///
-/// An expectation failure when no GoAway arrives within two seconds, or the
-/// read failure.
+/// - An expectation failure when no GoAway arrives within two seconds, or the read failure.
 pub async fn read_until_goaway(reader: &mut SplitReader, reason: GoAwayReason) -> Result<bool, TightBeamError> {
 	timeout(Duration::from_secs(2), async {
 		loop {
@@ -1073,8 +1080,8 @@ impl TransportAuthorizer for RefusingAuthorizer {
 	}
 }
 
-/// Authorizer whose backend never responds, simulating a hung
-/// authorization service on the unauthenticated handshake path.
+/// Authorizer whose backend hangs forever, which simulates a hung authorization
+/// service on the unauthenticated handshake path.
 pub struct HangingAuthorizer;
 
 impl TransportAuthorizer for HangingAuthorizer {
@@ -1154,7 +1161,7 @@ impl RekeyCase {
 ///
 /// # Errors
 ///
-/// The [`run_cancel_abuse_against`] set.
+/// - The [`run_cancel_abuse_against`] set.
 pub async fn run_cancel_abuse<R, W>(
 	client_reader: R,
 	client_writer: W,
@@ -1176,8 +1183,7 @@ where
 ///
 /// # Errors
 ///
-/// An expectation failure when no GoAway arrives within two seconds, or the
-/// write, read, or join failure.
+/// - An expectation failure when no GoAway arrives within two seconds, or the write, read, or join failure.
 ///
 /// # Panics
 ///
@@ -1211,8 +1217,8 @@ where
 	Ok(is_policy_rejection(&refused))
 }
 
-/// Unary `MuxService` closure whose handlers never answer, so every peer
-/// cancel aborts a live handler.
+/// Unary `MuxService` closure whose handlers stay pending, so every peer cancel
+/// aborts a live handler.
 pub fn parked_unary_service() -> impl Fn(Frame, SessionContext) -> Pending<Result<Option<Frame>, TightBeamError>> {
 	|_frame, _session| pending()
 }

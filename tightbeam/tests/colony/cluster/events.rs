@@ -95,6 +95,14 @@ pub(crate) const PEER_EVICT_MEMBER_PROMOTED: Urn<'static> =
 	tightbeam::urn!("test", "event:cluster/peer-evict-member-promoted");
 pub(crate) const PEER_EVICT_TARGET_DROPPED: Urn<'static> =
 	tightbeam::urn!("test", "event:cluster/peer-evict-target-dropped");
+pub(crate) const PEER_EVICT_ROUTES_WITHDRAWN: Urn<'static> =
+	tightbeam::urn!("test", "event:cluster/peer-evict-routes-withdrawn");
+pub(crate) const PEER_EXPEL_ADDRESS_VERIFIED: Urn<'static> =
+	tightbeam::urn!("test", "event:cluster/peer-expel-address-verified");
+pub(crate) const PEER_EXPEL_TARGET_DROPPED: Urn<'static> =
+	tightbeam::urn!("test", "event:cluster/peer-expel-target-dropped");
+pub(crate) const PEER_EXPEL_ROUTES_WITHDRAWN: Urn<'static> =
+	tightbeam::urn!("test", "event:cluster/peer-expel-routes-withdrawn");
 pub(crate) const PEER_LOCAL_FAULT_MEMBER_PROMOTED: Urn<'static> =
 	tightbeam::urn!("test", "event:cluster/peer-local-fault-member-promoted");
 pub(crate) const PEER_LOCAL_FAULT_MEMBER_RETAINED: Urn<'static> =

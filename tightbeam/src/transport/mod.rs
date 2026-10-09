@@ -45,8 +45,6 @@ pub mod policy;
 	any(feature = "transport-cms", feature = "transport-ecies")
 ))]
 pub(crate) mod rekey;
-#[cfg(pooled_mux)]
-pub mod serve;
 #[cfg(any(feature = "tcp", feature = "async-transport"))]
 pub mod tcp;
 
@@ -128,8 +126,8 @@ pub struct TransportLimits {
 }
 
 impl TransportLimits {
-	/// Largest envelope this endpoint will read before parsing decides which
-	/// ceiling actually applies.
+	/// Returns the largest envelope this endpoint reads before parsing decides
+	/// which ceiling applies.
 	///
 	/// A reader cannot know whether the bytes are a cleartext or an encrypted
 	/// envelope until it has them, so it admits the larger ceiling and the
@@ -210,8 +208,8 @@ pub struct EndpointConfig<P: CryptoProvider> {
 
 #[cfg(feature = "x509")]
 impl<P: CryptoProvider> EndpointConfig<P> {
-	/// An endpoint for `encryption` that measures time against `clock`, with
-	/// the default ceilings.
+	/// Returns an endpoint for `encryption` that measures time against `clock`,
+	/// with the default ceilings.
 	pub fn new(encryption: impl Into<DialableEncryption<P>>, clock: Arc<dyn Clock>) -> Self {
 		Self {
 			encryption: encryption.into(),
@@ -222,7 +220,7 @@ impl<P: CryptoProvider> EndpointConfig<P> {
 		}
 	}
 
-	/// A cleartext endpoint on the operating system's clocks.
+	/// Returns a cleartext endpoint on the operating system's clocks.
 	///
 	/// Frames travel with no confidentiality, integrity, or peer
 	/// authentication. See [`DialableEncryption::cleartext`].
@@ -411,6 +409,9 @@ mod tests {
 			handle: move |message: Frame| {
 				let tx = Arc::clone(&tx);
 				async move {
+					// The receiver lives for the whole test, so a refused send
+					// surfaces as the missing message the assertion below
+					// reads.
 					let _ = tx.send(message);
 					Ok(None)
 				}
