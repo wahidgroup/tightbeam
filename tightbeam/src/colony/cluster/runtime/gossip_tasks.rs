@@ -455,7 +455,7 @@ where
 	///
 	/// - A local fault before the emit or inside the post-reply scope skips scoring.
 	/// - An oversized reply or a dial failure returns `Err` for peer scoring.
-	/// - A peer outside the colony leaves the peer table at once.
+	/// - A peer outside the colony leaves the peer table at once, and the routes that dial it leave.
 	async fn reconcile_round<D: ClusterDigest>(
 		&self,
 		peer_addr: P::Address,
@@ -485,13 +485,13 @@ where
 			.peer_certificate()
 			.and_then(|cert| self.config.namespace.cert_colony_urn(cert));
 		if peer_colony.as_ref() != self.config.colony_urn() {
-			// A foreign identity is definitive, so the peer leaves both learned
-			// tables at once. The routes its old fingerprint owns leave with
-			// it, as on an eviction.
-			let expelled = self.config.peer.table.expel(peer)?;
-			if let Some(fingerprint) = expelled.and_then(|record| record.peer_id) {
-				self.servlet_registry.withdraw_peer(fingerprint)?;
-			}
+			// A foreign identity is definitive, so the address leaves both
+			// learned tables at once. Every route that dials it leaves too,
+			// whether a table held the address or not, because a slate
+			// installs before any probe verifies the socket it claims
+			// (CWE-668).
+			self.config.peer.table.expel(peer)?;
+			self.servlet_registry.withdraw_peer_by_dial(peer.address())?;
 
 			return Ok(());
 		}
@@ -599,12 +599,12 @@ where
 	/// `ad_frame` is the single signed advertisement this beat created, so
 	/// one signature serves every dial. A failed round counts toward
 	/// eviction, so a dead tried peer frees its bucket slot at the
-	/// threshold and its routes leave the registry with it.
+	/// threshold and the routes that dial it leave the registry.
 	///
 	/// # Lock order
 	///
 	/// The table guard is released inside `record_failure` before the route
-	/// lock is taken in `withdraw_peer`, so the two locks never nest.
+	/// lock is taken in `withdraw_peer_by_dial`, so the two locks never nest.
 	async fn dial_targets<D: ClusterDigest>(
 		&self,
 		targets: impl AsRef<[AdmittedDial]>,
@@ -640,15 +640,15 @@ where
 				continue;
 			}
 
-			let Some(evicted) = self.config.peer.table.record_failure(*peer)? else {
+			let evicted = self.config.peer.table.record_failure(*peer)?;
+			if !evicted {
 				continue;
-			};
-
-			// The evicted peer's routes leave before the eviction is recorded,
-			// so an observer of the event finds none of them.
-			if let Some(fingerprint) = evicted.peer_id {
-				self.servlet_registry.withdraw_peer(fingerprint)?;
 			}
+
+			// The routes that dial the evicted address leave before the
+			// eviction event is emitted, so an observer of the event finds
+			// none of them.
+			self.servlet_registry.withdraw_peer_by_dial(peer.address())?;
 
 			trace
 				.event(CLUSTER_PEER_EVICTED)?

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use super::entry::Owner;
 use super::{Bucket, ClusterError, HiveSlate, KindCaps, PeerCaps, RouteKind, ServletEntry, ServletRegistry};
 use crate::colony::cluster::peer::{AdmittedPeerAd, RelayTrail};
+use crate::colony::cluster::PeerAddress;
 
 impl ServletRegistry {
 	/// Adds one servlet entry outside any slate, for tests that seed a
@@ -125,24 +126,25 @@ impl ServletRegistry {
 		Ok(self.routes.write()?.remove_owned(bucket))
 	}
 
-	/// Withdraws every route an evicted peer holds: its direct slate and the
-	/// relay trails learned from it.
+	/// Withdraws every peer route that dials `gateway`, relay trails through
+	/// it included, under one guard.
 	///
-	/// A dead gateway's direct routes dial nothing, and a trail learned from
-	/// its advertisement lasts only as long as the claim it came from, so
-	/// both leave under one guard. A route another owner landed under the
-	/// same bucket bytes belongs to that owner and stays (CWE-639).
+	/// An eviction and an expulsion are evidence about a socket: it stopped
+	/// answering, or it answered with a foreign identity. The socket therefore
+	/// selects the routes, whichever peer advertised them.
+	///
+	/// - A hive route stays, because the evidence concerns the peer plane.
+	/// - A fallback trail to the same origin through another relay stays, because it dials that relay.
 	///
 	/// # Errors
 	///
 	/// - [`ClusterError::LockPoisoned`] -- the route lock is poisoned.
-	pub(in crate::colony::cluster) fn withdraw_peer(&self, fingerprint: impl AsRef<[u8]>) -> Result<(), ClusterError> {
-		let fingerprint = fingerprint.as_ref();
-		let bucket = Bucket { id: fingerprint, owner: Owner::peer(fingerprint) };
-		let mut routes = self.routes.write()?;
-
-		routes.remove_owned(bucket);
-		routes.remove_relay_trails_for_origin(fingerprint);
+	pub(in crate::colony::cluster) fn withdraw_peer_by_dial(
+		&self,
+		gateway: impl Into<PeerAddress>,
+	) -> Result<(), ClusterError> {
+		let gateway: PeerAddress = gateway.into();
+		self.routes.write()?.remove_peer_routes_dialing(gateway);
 
 		Ok(())
 	}

@@ -26,15 +26,15 @@ use crate::x509::ext::pkix::SubjectAltName;
 /// The wire carries a raw count, so the budget is parsed once at the
 /// gateway boundary through [`HopBudget::from_wire`], which clamps it to
 /// the operator's [`PeerConfig::max_hops`]. Every downstream rule reads
-/// this value rather than the raw octet, so a peer cannot spend more
-/// forwards than the operator allows (CWE-770).
+/// this value rather than the raw octet, so the operator's cap bounds the
+/// forwards a peer can spend (CWE-770).
 ///
 /// [`PeerConfig::max_hops`]: super::PeerConfig::max_hops
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HopBudget {
 	/// Forwards this gateway may still spend, under the operator's cap.
 	remaining: u8,
-	/// Whether the sender had already spent part of the budget.
+	/// Whether the sender already spent part of the budget.
 	relayed: bool,
 }
 
@@ -105,7 +105,7 @@ impl HopBudget {
 	/// Whether the budget affords the two forwards a relay trail needs.
 	///
 	/// A relay trail spends one hop at the relay before the owner is
-	/// reached, so a shorter budget could never select it.
+	/// reached, so only a budget of two or more can select it.
 	#[must_use]
 	pub fn allows_relay_trail(&self) -> bool {
 		self.remaining >= 2
@@ -120,8 +120,8 @@ impl HopBudget {
 	/// Relayed stream route for one peer hop out of this budget.
 	///
 	/// The route reaches the same `target` with one forward spent. Building
-	/// it through the budget spends the hop, so a relay cannot stamp a route
-	/// it did not pay for (CWE-834).
+	/// it through the budget spends the hop, so a relay pays for every route
+	/// it stamps (CWE-834).
 	#[must_use]
 	pub(crate) fn relayed_route(self, target: &Urn<'static>) -> StreamRoute {
 		StreamRoute::relayed_to(target.clone(), self.spend().wire())
@@ -129,9 +129,9 @@ impl HopBudget {
 
 	/// Relayed work envelope for one peer hop out of this budget.
 	///
-	/// The unary twin of [`Self::relayed_route`]. `payload` is already the
-	/// client's encoded frame and travels opaquely, so a relay hop
-	/// re-encodes nothing.
+	/// Unary work spends its hop here, as a routed stream spends it in
+	/// [`Self::relayed_route`]. `payload` is already the client's encoded frame
+	/// and travels opaquely, so a relay hop forwards the bytes it received.
 	#[must_use]
 	pub(crate) fn relayed_work(self, servlet_type: Urn<'static>, payload: impl Into<Vec<u8>>) -> ClusterWorkRequest {
 		let payload: Vec<u8> = payload.into();
@@ -147,8 +147,8 @@ impl HopBudget {
 
 /// Peer advertisement that passed signer resolution and wire checks.
 ///
-/// The registry receives this type only after those checks, so signer
-/// identity cannot be transposed with the claimed dial address.
+/// The registry receives this type only after those checks, so the signer
+/// identity and the claimed dial address each arrive in their own field.
 pub struct AdmittedPeerAd {
 	/// Fingerprint of the signer certificate, which keys the slate.
 	pub(super) peer_hive_id: SharedId,
@@ -170,8 +170,9 @@ pub struct AdmittedPeerAd {
 ///
 /// The slate reconciles under the composite `origin NUL relay` bucket,
 /// so relay trails live and die independently of the origin's direct
-/// slate. The origin's next direct advertisement cannot evict them.
-/// A dead relay decays away by staleness pruning.
+/// slate. The origin's next direct advertisement leaves them in place.
+/// A trail leaves when the relay it dials is evicted or expelled, and an
+/// idle trail decays away by staleness pruning.
 pub struct RelayTrail {
 	/// The composite `origin NUL relay` bucket this slate reconciles under.
 	pub(super) bucket: SharedId,
@@ -189,11 +190,11 @@ impl AdmittedPeerAd {
 	///
 	/// The checks run in this order:
 	///
-	/// - The signer MUST resolve on the peer plane, and the slate keys by its
-	///   certificate fingerprint rather than the claimed `gateway_addr`.
-	/// - The local and the peer certificate MUST both carry a colony URN SAN.
-	/// - [`PeerConfig::admit_claim`] MUST admit the claimed address, and the
-	///   advertised types MUST be bare servlet types within the type cap.
+	/// 1. The signer MUST resolve on the peer plane, and the slate keys by its
+	///    certificate fingerprint rather than the claimed `gateway_addr`.
+	/// 2. The local and the peer certificate MUST both carry a colony URN SAN.
+	/// 3. [`PeerConfig::admit_claim`] MUST admit the claimed address, and the
+	///    advertised types MUST be bare servlet types within the type cap.
 	///
 	/// Caps and local-route conflicts are registry policy under
 	/// [`super::ServletRegistry::reconcile_peer_slate`].
@@ -252,7 +253,7 @@ impl AdmittedPeerAd {
 	///
 	/// The trails reconcile under their own `origin NUL relay` bucket
 	/// (`ServletRegistry::reconcile_relay_trail`), so the origin's direct
-	/// slate lifecycle never evicts the fallback.
+	/// slate lifecycle leaves the fallback in place.
 	#[must_use]
 	pub fn relay_trail(
 		&self,
@@ -373,8 +374,8 @@ pub(crate) trait ColonyCertificate {
 	/// Stable peer key derived from the certificate itself.
 	///
 	/// Slates and misbehavior scoring key on this fingerprint, so one peer
-	/// keeps one identity across every `gateway_addr` it advertises.
-	/// `None` when the trust store yields no fingerprint, so an
+	/// keeps one identity across every `gateway_addr` it advertises. The
+	/// answer is `None` when the trust store yields no fingerprint, so an
 	/// unidentifiable peer fails closed.
 	fn fingerprint_id(&self) -> Option<SharedId>;
 }
@@ -405,8 +406,8 @@ mod tests {
 		PeerAddress::fixture(spelling)
 	}
 
-	/// One socket spelled two ways is one entry, so a peer cannot pass the
-	/// hint gate and fail the advertisement gate with the same address.
+	/// One socket spelled two ways is one entry, so an address that passes the
+	/// hint gate also passes the advertisement gate.
 	/// An ad spelling its socket verbosely installs routes under the
 	/// canonical key, so a later scoring or eviction lookup by that address
 	/// finds them.

@@ -3042,7 +3042,7 @@ Behavior:
 3. Peer routes are soft state, and four things remove them:
    - An empty advertisement withdraws them.
    - Repeated failures abandon them.
-   - An eviction or an expulsion from the peer table withdraws the peer's direct routes and the relay trails learned from it.
+   - An address the peer table evicts or expels loses every peer route that dials it, relay trails through it included.
    - Relay trails also expire by age.
 4. A hive route and a peer route never share a socket. The gateway refuses whichever claim arrives second with `PermissionDenied`. Sockets compare as parsed addresses, so any spelling of one socket is the same socket.
 5. The load balancer chooses among local and peer routes together.

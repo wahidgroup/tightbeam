@@ -2018,6 +2018,18 @@ fn probing_cluster_conf(ctx: &ForeignGatewayCtx) -> ClusterConfig {
 	fast_probing_conf(&ctx.local, Arc::clone(&ctx.shared_trust))
 }
 
+/// A prober on the trust of [`probing_cluster_conf`] that holds `anchor` as
+/// a configured peer, so its beat dials that address from the first tick.
+fn anchored_probing_conf(ctx: &ForeignGatewayCtx, anchor: impl Into<String>) -> ClusterConfig {
+	let tls = cluster_tls_config(&ctx.local).with_peer_trust(Arc::clone(&ctx.shared_trust));
+
+	ClusterConfig::builder(tls)
+		.with_peers([anchor.into()])
+		.expect("fixture peers name sockets")
+		.with_advertise_interval(Duration::from_millis(100))
+		.build()
+}
+
 /// Polls until the discovery table holds no new-bucket candidates, or the
 /// attempts run out.
 ///
@@ -2048,7 +2060,7 @@ tb_assert_spec! {
 //
 // - Only the member passes the gate (CLUSTER_PEER_DISCOVERED exactly once).
 // - Only the member joins the beat targets.
-// - The foreign candidate leaves the new table through discard.
+// - The foreign candidate leaves the new table through expel.
 // - A trusted-but-foreign identity can neither clog a prefix bucket nor become a dial target.
 //
 // Sources:
@@ -2108,11 +2120,11 @@ tb_assert_spec! {
 // A verified peer that re-keys outside the colony loses its routes.
 //
 // A slate arrives under the local colony's key from an address, and the table
-// holds that address as verified under the fingerprint that owns the slate.
-// The address answers the next beat with a foreign-colony certificate.
+// holds that address as verified. The address answers the next beat with a
+// foreign-colony certificate.
 //
 // - The beat's reconcile expels the address at once (PEER_EXPEL_TARGET_DROPPED).
-// - The routes the old fingerprint owns leave with it (PEER_EXPEL_ROUTES_WITHDRAWN).
+// - The routes that dial the address leave with it (PEER_EXPEL_ROUTES_WITHDRAWN).
 tb_scenario! {
 	name: cluster_expelled_foreign_peer_loses_its_routes,
 	spec: ClusterPeerExpelSpec,
@@ -2127,18 +2139,86 @@ tb_scenario! {
 			let foreign_addr = dial_admitted_by(&prober_conf, cluster.addr().to_string());
 			let prober = start_cluster(&trace, prober_conf).await?;
 
-			// The slate gives the expulsion routes to withdraw. Its owner is
-			// the fingerprint of the key that signed it.
+			// The slate gives the expulsion routes to withdraw.
 			advertise_peer(&trace, &ctx.local, &prober, cluster.addr().to_string(), vec![servlet_urn("ping")]).await?;
 
-			let routes = prober.peer_routes().unwrap_or_default();
-			let owner = routes.first().map(|route| Arc::clone(&route.peer_id));
-
-			let verified = table.promote(foreign_addr, owner.as_deref(), UnixMillis::now()).unwrap_or(false);
+			let verified = table.promote(foreign_addr, None, UnixMillis::now()).unwrap_or(false);
 			trace.event_with(PEER_EXPEL_ADDRESS_VERIFIED, &[], verified)?;
 
 			let dropped = wait_for_target_dropped(&table, foreign_addr, 50, Duration::from_millis(100)).await;
 			trace.event_with(PEER_EXPEL_TARGET_DROPPED, &[], dropped)?;
+
+			let withdrawn = wait_for_no_peer_routes(&prober, 50, Duration::from_millis(100)).await;
+			trace.event_with(PEER_EXPEL_ROUTES_WITHDRAWN, &[], withdrawn)?;
+
+			prober.stop();
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterForeignSocketSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(PEER_ROUTES_AFTER, exactly!(1), equals!(1u64)),
+			(PEER_EXPEL_ROUTES_WITHDRAWN, exactly!(1), equals!(true))
+		]
+	}
+}
+
+// An advertiser whose address no probe has verified loses its routes too.
+//
+// A slate arrives under the local colony's key from an address, so the table
+// holds that address as an unverified candidate while the routes already dial
+// it. The feeler probe finds a foreign-colony certificate there.
+//
+// - The routes that dial the address leave (PEER_EXPEL_ROUTES_WITHDRAWN).
+tb_scenario! {
+	name: cluster_expelled_unverified_peer_loses_its_routes,
+	spec: ClusterForeignSocketSpec,
+	environment Cluster {
+		context: foreign_gateway_ctx(),
+		start: |SetupEnv { trace, context: ctx }| async move {
+			start_cluster(&trace, foreign_gateway_conf(&ctx)).await
+		},
+		client: |ClusterEnv { trace, context: ctx, cluster }| async move {
+			let prober = start_cluster(&trace, probing_cluster_conf(&ctx)).await?;
+
+			advertise_peer(&trace, &ctx.local, &prober, cluster.addr().to_string(), vec![servlet_urn("ping")]).await?;
+
+			let withdrawn = wait_for_no_peer_routes(&prober, 50, Duration::from_millis(100)).await;
+			trace.event_with(PEER_EXPEL_ROUTES_WITHDRAWN, &[], withdrawn)?;
+
+			prober.stop();
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
+// An anchor that answers outside the colony loses the routes that dial it.
+//
+// The anchor is configured, so no learned table holds its address. A slate
+// arrives under the local colony's key and claims that address. The anchor
+// answers each beat with a foreign-colony certificate.
+//
+// - The routes that dial the anchor leave (PEER_EXPEL_ROUTES_WITHDRAWN).
+tb_scenario! {
+	name: cluster_foreign_anchor_loses_the_routes_that_dial_it,
+	spec: ClusterForeignSocketSpec,
+	environment Cluster {
+		context: foreign_gateway_ctx(),
+		start: |SetupEnv { trace, context: ctx }| async move {
+			start_cluster(&trace, foreign_gateway_conf(&ctx)).await
+		},
+		client: |ClusterEnv { trace, context: ctx, cluster }| async move {
+			let prober_conf = anchored_probing_conf(&ctx, cluster.addr().to_string());
+			let prober = start_cluster(&trace, prober_conf).await?;
+
+			advertise_peer(&trace, &ctx.local, &prober, cluster.addr().to_string(), vec![servlet_urn("ping")]).await?;
 
 			let withdrawn = wait_for_no_peer_routes(&prober, 50, Duration::from_millis(100)).await;
 			trace.event_with(PEER_EXPEL_ROUTES_WITHDRAWN, &[], withdrawn)?;

@@ -572,9 +572,9 @@ impl PeerTable {
 	/// Record a failed beat dial of a tried peer.
 	///
 	/// Residents re-verify on every beat, so consecutive failures measure
-	/// liveness. An eviction returns the evicted peer's record, so the caller
-	/// can emit one event per reclaimed peer and withdraw the routes the
-	/// record's fingerprint owns. [`None`] means the peer stays.
+	/// liveness. The call returns whether the peer was evicted, so the caller
+	/// can emit one event per reclaimed peer and withdraw the routes that dial
+	/// the address.
 	///
 	/// - Failures reaching [`MAX_PEER_TRIED_FAILURES`] evict the entry.
 	/// - Eviction frees the prefix bucket slot for a live candidate.
@@ -594,22 +594,21 @@ impl PeerTable {
 	/// # Errors
 	///
 	/// - [`ClusterError::LockPoisoned`] -- the table lock is poisoned.
-	pub fn record_failure(&self, addr: AdmittedDial) -> Result<Option<PeerRecord>, ClusterError> {
+	pub fn record_failure(&self, addr: AdmittedDial) -> Result<bool, ClusterError> {
 		self.with_table(|state| {
 			let Some(entry) = state.tried.get_mut(&addr) else {
-				return (None, false);
+				return (false, false);
 			};
 
 			entry.failures = entry.failures.saturating_add(1);
 
 			if entry.failures < MAX_PEER_TRIED_FAILURES {
-				return (None, false);
+				return (false, false);
 			}
 
-			let removed = state.tried.remove(&addr);
-			let evicted = removed.map(|entry| entry.into_tried_record(addr));
+			state.tried.remove(&addr);
 
-			(evicted, true)
+			(true, true)
 		})
 	}
 
@@ -620,21 +619,17 @@ impl PeerTable {
 	///
 	/// - The address leaves discovery at once, ahead of the failure threshold.
 	/// - A re-keyed peer therefore stops receiving advertisements.
-	/// - A verified entry that leaves returns its record, so the caller can
-	///   withdraw the routes its fingerprint owns. [`None`] means the address
-	///   held no verified entry.
+	/// - The caller withdraws the routes that dial the address, as on an eviction.
 	///
 	/// # Errors
 	///
 	/// - [`ClusterError::LockPoisoned`] -- the table lock is poisoned.
-	pub fn expel(&self, addr: AdmittedDial) -> Result<Option<PeerRecord>, ClusterError> {
+	pub fn expel(&self, addr: AdmittedDial) -> Result<(), ClusterError> {
 		self.with_table(|state| {
 			let from_new = state.new.remove(&addr).is_some();
-			let removed = state.tried.remove(&addr);
-
-			let expelled = removed.map(|entry| entry.into_tried_record(addr));
-			let changed = from_new || expelled.is_some();
-			(expelled, changed)
+			let from_tried = state.tried.remove(&addr).is_some();
+			let changed = from_new || from_tried;
+			((), changed)
 		})
 	}
 
@@ -1140,25 +1135,10 @@ mod tests {
 	fn evictions_over(table: &PeerTable, peer: AdmittedDial, failures: usize) -> Result<Vec<bool>, ClusterError> {
 		let mut evictions = Vec::with_capacity(failures);
 		for _ in 0..failures {
-			evictions.push(table.record_failure(peer)?.is_some());
+			evictions.push(table.record_failure(peer)?);
 		}
 
 		Ok(evictions)
-	}
-
-	/// The eviction names the peer it removed, so the beat can withdraw the
-	/// routes that peer's fingerprint owns.
-	#[test]
-	fn an_eviction_names_the_evicted_peer() -> Result<(), ClusterError> {
-		let table = PeerTable::default();
-		table.promote(addr("10.0.0.1:9000"), Some(b"fp-a"), UnixMillis::new(1_000))?;
-		table.record_failure(addr("10.0.0.1:9000"))?;
-		table.record_failure(addr("10.0.0.1:9000"))?;
-
-		let evicted = table.record_failure(addr("10.0.0.1:9000"))?;
-		let fingerprint = evicted.and_then(|record| record.peer_id);
-		assert_eq!(fingerprint.as_deref(), Some(b"fp-a".as_slice()));
-		Ok(())
 	}
 
 	#[test]
@@ -1193,8 +1173,8 @@ mod tests {
 		let table = table_with_anchor("127.0.0.1:9000");
 		let anchor_evicted = table.record_failure(addr("127.0.0.1:9000"))?;
 		let unknown_evicted = table.record_failure(addr("10.0.0.1:9000"))?;
-		assert!(anchor_evicted.is_none());
-		assert!(unknown_evicted.is_none());
+		assert!(!anchor_evicted);
+		assert!(!unknown_evicted);
 		Ok(())
 	}
 
@@ -1212,23 +1192,6 @@ mod tests {
 		}
 
 		assert!(table.promote(addr("10.0.9.9:9000"), None, UnixMillis::new(3_000))?);
-		Ok(())
-	}
-
-	/// An expelled verified peer is named, so the feeler can withdraw the
-	/// routes its fingerprint owns. A hint that leaves names no peer.
-	#[test]
-	fn an_expelled_tried_peer_is_named() -> Result<(), ClusterError> {
-		let table = PeerTable::default();
-		table.learn(vec![hint("10.0.0.1:9000")])?;
-		table.promote(addr("10.1.0.1:9000"), Some(b"fp-a"), UnixMillis::new(1_000))?;
-
-		let hint_left = table.expel(addr("10.0.0.1:9000"))?;
-		let verified_left = table.expel(addr("10.1.0.1:9000"))?;
-
-		let fingerprint = verified_left.and_then(|record| record.peer_id);
-		assert!(hint_left.is_none());
-		assert_eq!(fingerprint.as_deref(), Some(b"fp-a".as_slice()));
 		Ok(())
 	}
 

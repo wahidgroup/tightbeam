@@ -11,7 +11,7 @@ use crate::utils::BasisPoints;
 /// Two targets are equal when they name one endpoint, so two spellings of
 /// one socket compare equal wherever routes are compared (CWE-706). The
 /// rendering a dial or a gossip entry carries is derived from the endpoint
-/// on demand, so no second field can disagree with it.
+/// on demand, so every rendering agrees with the endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DialTarget {
 	/// A socket, claimed by a peer gateway or registered by a hive.
@@ -52,10 +52,12 @@ impl DialTarget {
 	///
 	/// This is the one place a dial becomes a protocol address:
 	///
-	/// - The protocol's [`FromStr`] is its only constructor, so the rendering is parsed here, once
-	///   per dial, from the same bytes every other reader of this target sees.
-	/// - A protocol may address by something other than a socket, as the laser test protocol does
-	///   by airspace slot, and then a socket target does not parse.
+	/// - The protocol's [`FromStr`] is its only constructor, so the rendering
+	///   is parsed here, once per dial, from the same bytes every other reader
+	///   of this target sees.
+	/// - A protocol may address by something other than a socket, as the laser
+	///   test protocol does by airspace slot, and then a socket target does
+	///   not parse.
 	///
 	/// # Errors
 	///
@@ -195,12 +197,12 @@ impl<'a> Owner<'a> {
 pub struct PeerRouteInfo {
 	/// The registry key, which is also the pheromone trail identity.
 	pub route_key: SharedId,
-	/// Canonical servlet type bytes.
+	/// The canonical bytes of the servlet type this route answers.
 	pub servlet_type: SharedId,
 	/// The gateway socket this route dials, in its canonical spelling: the
 	/// origin's for a direct route and the relay's for a relay trail.
 	pub dial_addr: SharedId,
-	/// Advertising peer identity certificate fingerprint.
+	/// The certificate fingerprint that identifies the advertising peer.
 	pub peer_id: SharedId,
 }
 
@@ -301,8 +303,7 @@ impl ServletEntry {
 	/// The entry buckets under the composite [`Self::relay_bucket`], so the
 	/// key is `origin NUL relay NUL servlet_type`. Three rules follow:
 	///
-	/// - The key is distinct from the direct `origin NUL servlet_type` trail,
-	///   so the two score independently.
+	/// - The key is distinct from the direct `origin NUL servlet_type` trail, so the two score independently.
 	/// - The trail reconciles under its own bucket, so a replacement of the
 	///   origin's direct slate leaves the fallback in place. A withdrawn,
 	///   empty direct slate removes it with the direct routes.
@@ -324,7 +325,7 @@ impl ServletEntry {
 	/// trails.
 	///
 	/// Entry keys and slate reconciliation share this one construction, so
-	/// the two cannot drift apart.
+	/// the two always agree on the bucket.
 	#[must_use]
 	pub fn relay_bucket(origin_id: impl AsRef<[u8]>, relay_id: impl AsRef<[u8]>) -> SharedId {
 		let origin_id = origin_id.as_ref();
@@ -415,6 +416,12 @@ impl ServletEntry {
 	#[must_use]
 	pub fn route_kind(&self) -> RouteKind {
 		self.route_kind
+	}
+
+	/// Whether this entry is a peer route that dials `gateway`, either a
+	/// direct route to it or a relay trail through it.
+	pub(super) fn is_peer_route_to(&self, gateway: PeerAddress) -> bool {
+		self.route_kind.is_peer() && self.dial.socket() == Some(gateway)
 	}
 
 	/// Consecutive failures accumulated toward abandonment.

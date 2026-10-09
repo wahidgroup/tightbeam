@@ -696,25 +696,57 @@ fn direct_reconcile_preserves_relay_bucket() -> Result<(), ClusterError> {
 	Ok(())
 }
 
-/// An evicted peer's direct routes and the relay trails learned from it
-/// leave together, and another peer's routes stay.
+/// A withdrawn socket takes every peer route that dials it: the direct route
+/// of the peer that advertised it and the relay trail through it. Another
+/// peer's direct route stays.
 #[test]
-fn withdraw_peer_drops_the_peers_direct_routes_and_relay_trails() -> Result<(), ClusterError> {
+fn withdraw_peer_by_dial_drops_the_routes_that_dial_the_socket() -> Result<(), ClusterError> {
 	let registry = registry();
 	install_peer_slate(&registry, b"peer-a", vec![peer_entry(b"ping", b"peer-a")])?;
 
-	let trail = relay_trail(b"peer-a", b"peer-b", b"echo", b"127.0.0.1:9001");
-	registry.reconcile_relay_trail(trail, PeerCaps::default())?;
+	let through = relay_trail(b"peer-c", b"peer-a", b"echo", b"127.0.0.1:9000");
+	registry.reconcile_relay_trail(through, PeerCaps::default())?;
 
 	let other_slate = vec![peer_entry_dial(b"pong", b"peer-b", b"127.0.0.1:9001")];
 	let other = admitted(b"peer-b", b"127.0.0.1:9001", other_slate);
-
 	registry.reconcile_peer_slate(other, PeerCaps::default())?;
-	registry.withdraw_peer(b"peer-a")?;
+	registry.withdraw_peer_by_dial(PeerAddress::fixture("127.0.0.1:9000"))?;
 
 	let live = registry.peer_entries()?;
 	let owners: Vec<SharedId> = live.iter().map(|entry| Arc::clone(entry.owner_id())).collect();
+	let kinds: Vec<RouteKind> = live.iter().map(|entry| entry.route_kind()).collect();
 	assert_eq!(owners, vec![SharedId::from(b"peer-b".as_slice())]);
+	assert_eq!(kinds, vec![RouteKind::Peer]);
+	Ok(())
+}
+
+/// The peer whose socket is withdrawn stays reachable through its fallback
+/// trail, because that trail dials the relay.
+#[test]
+fn withdraw_peer_by_dial_keeps_the_fallback_trail_through_another_relay() -> Result<(), ClusterError> {
+	let registry = registry();
+	install_peer_slate(&registry, b"peer-a", vec![peer_entry(b"ping", b"peer-a")])?;
+
+	let fallback = relay_trail(b"peer-a", b"peer-b", b"ping", b"127.0.0.1:9001");
+	registry.reconcile_relay_trail(fallback, PeerCaps::default())?;
+	registry.withdraw_peer_by_dial(PeerAddress::fixture("127.0.0.1:9000"))?;
+
+	let live = registry.peer_entries()?;
+	let relays: Vec<Option<SharedId>> = live.iter().map(|entry| entry.relay_id().cloned()).collect();
+	assert_eq!(relays, vec![Some(SharedId::from(b"peer-b".as_slice()))]);
+	Ok(())
+}
+
+/// A hive route whose address spells the withdrawn socket stays, because the
+/// withdrawal acts on the peer plane alone.
+#[test]
+fn withdraw_peer_by_dial_keeps_a_local_route_at_the_socket() -> Result<(), ClusterError> {
+	let registry = registry();
+	registry.add(named_entry(b"127.0.0.1:9000", b"calc", b"hive1"))?;
+	registry.withdraw_peer_by_dial(PeerAddress::fixture("127.0.0.1:9000"))?;
+
+	let owner = owner_of(&registry, b"127.0.0.1:9000");
+	assert_eq!(owner, Some(SharedId::from(b"hive1".as_slice())));
 	Ok(())
 }
 
