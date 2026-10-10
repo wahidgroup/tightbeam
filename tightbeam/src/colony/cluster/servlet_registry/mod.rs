@@ -12,15 +12,19 @@ mod select;
 #[cfg(test)]
 mod tests;
 
-use crate::constants::DEFAULT_COMMAND_FRESHNESS_WINDOW_MS;
-use crate::utils::time::{Clock, MonotonicInstant, UnixMillis};
 use core::time::Duration;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
+use crate::colony::cluster::PeerAddress;
+use crate::constants::DEFAULT_COMMAND_FRESHNESS_WINDOW_MS;
+use crate::utils::time::{Clock, MonotonicInstant, UnixMillis};
+
+use entry::Owner;
+pub(crate) use entry::RoutePlane;
+
 pub(super) use super::error::ClusterError;
 pub(super) use super::SharedId;
-
 pub(crate) use config::HiveSlate;
 pub use config::{
 	PeerCaps, PheromoneConfig, DEFAULT_ABANDONMENT_LIMIT, DEFAULT_EVAPORATION_INTERVAL_SECS,
@@ -28,13 +32,11 @@ pub use config::{
 };
 pub use entry::{DialTarget, LocalRoute, PeerRoute, PeerRouteInfo, RelayRoute, RouteKind, ServletEntry};
 
-use entry::Owner;
-
 /// One route as the registry holds it: the entry and when it was placed.
 ///
-/// The install instant belongs to the placement, not to the entry, so an
-/// entry outside the map has none and an entry inside always has one. A
-/// replacement is a fresh placement and ages from it.
+/// The install instant belongs to the placement, so an entry has one
+/// exactly while the map holds it. A replacement is a fresh placement and
+/// ages from it.
 struct Installed {
 	entry: Arc<ServletEntry>,
 	at: MonotonicInstant,
@@ -42,10 +44,9 @@ struct Installed {
 
 /// One owner's claim on one route key, for the removal arm.
 ///
-/// Both fields are byte slices, so a positional pair could be transposed
-/// and the decider would look an owner up as a key, find nothing, and
-/// admit the removal. Named fields make the question unmistakable
-/// (CWE-639).
+/// The owner carries its plane and the key is plain bytes, so the named
+/// fields state the question in one direction: does this owner hold this
+/// key (CWE-639).
 struct RouteClaim<'a> {
 	/// The identity that must hold the route.
 	owner: Owner<'a>,
@@ -91,10 +92,8 @@ impl Routes {
 	///
 	/// # Errors
 	///
-	/// - [`ClusterError::ServletNotOwned`] -- a local route's key or socket
-	///   belongs to another owner.
-	/// - [`ClusterError::PeerSlateConflict`] -- a peer route's key or socket
-	///   belongs to another owner.
+	/// - [`ClusterError::ServletNotOwned`] -- a local route's key or socket belongs to another owner.
+	/// - [`ClusterError::PeerSlateConflict`] -- a peer route's key or socket belongs to another owner.
 	fn admits(&self, entry: &ServletEntry) -> Result<(), ClusterError> {
 		let owner = entry.owner();
 		let key_held_by_other = self.owner_of(entry.route_key()).is_some_and(|held| !held.same(owner));
@@ -222,14 +221,13 @@ impl Routes {
 	/// Every entry is admitted and every route the swap would remove is
 	/// checked against `bucket.owner` before any map moves, so a refusal
 	/// leaves the bucket as it was. The new entries land before the
-	/// departed ones leave, so no reader observes the bucket empty mid-swap.
+	/// departed ones leave, so the bucket stays populated through the swap.
 	///
 	/// # Errors
 	///
 	/// - [`ClusterError::ServletNotOwned`] -- another owner holds a key or
 	///   socket a local slate claims, or a route under the bucket.
-	/// - [`ClusterError::PeerSlateConflict`] -- another owner holds a key or
-	///   socket a peer slate claims.
+	/// - [`ClusterError::PeerSlateConflict`] -- another owner holds a key or socket a peer slate claims.
 	fn reconcile(
 		&mut self,
 		bucket: Bucket<'_>,
@@ -269,8 +267,8 @@ impl Routes {
 
 	/// Removes every route in `bucket` that `bucket.owner` holds.
 	///
-	/// A retiring owner takes its own routes with it and nothing else, so a
-	/// route another owner landed under the same bucket bytes stays.
+	/// A retiring owner takes only its own routes with it, so a route another
+	/// owner landed under the same bucket bytes stays.
 	fn remove_owned(&mut self, bucket: Bucket<'_>) -> Vec<Arc<ServletEntry>> {
 		let owned: Vec<SharedId> = self
 			.addresses_in_bucket(bucket.id)
@@ -338,11 +336,11 @@ impl Routes {
 	///
 	/// The checks and writes run in this order:
 	///
-	/// - A slate older than the bucket's last applied order is refused.
-	/// - A slate that would pass the kind's caps is refused.
-	/// - [`Self::reconcile`] asks the one decider about every key, socket, and swept route.
-	/// - An emptied direct slate also withdraws the relay trails learned from it.
-	/// - The ledger records the order the slate applied at.
+	/// 1. A slate older than the bucket's last applied order is refused.
+	/// 2. A slate that would pass the kind's caps is refused.
+	/// 3. [`Self::reconcile`] asks the one decider about every key, socket, and swept route.
+	/// 4. An emptied direct slate also withdraws the relay trails learned from it.
+	/// 5. The ledger records the order the slate applied at.
 	///
 	/// Every step reads and writes under that one guard, so concurrent
 	/// advertisements for one bucket apply in a single order and the ledger
@@ -416,6 +414,19 @@ impl Routes {
 		stale.len()
 	}
 
+	/// Drops every peer route that dials `gateway`.
+	///
+	/// - A relay trail through the socket dials it, so it leaves with the direct routes.
+	/// - A fallback trail to the same origin through another relay dials that relay, so it stays.
+	pub(super) fn remove_peer_routes_dialing(&mut self, gateway: PeerAddress) {
+		let dials_gateway = |entry: &&Arc<ServletEntry>| entry.is_peer_route_to(gateway);
+		let dialing: Vec<Arc<ServletEntry>> = self.values().filter(dials_gateway).map(Arc::clone).collect();
+
+		for entry in &dialing {
+			self.remove(entry.route_key().as_ref());
+		}
+	}
+
 	/// Records the order this bucket last applied at.
 	///
 	/// A row lives as long as its bucket holds entries. Once the bucket
@@ -480,8 +491,8 @@ impl Routes {
 
 /// The peer-routed kind a slate installs and the two storage caps it spends.
 ///
-/// The fields are named so a caller cannot hand the identity cap to the
-/// route slot or the reverse (CWE-770).
+/// The fields are named so the identity cap and the route cap each land in
+/// their own slot (CWE-770).
 #[derive(Clone, Copy, Debug)]
 struct KindCaps {
 	/// The kind whose routes the caps count.
@@ -495,8 +506,8 @@ struct KindCaps {
 /// When an emptied bucket's order row may be dropped: once `window` has
 /// passed since it applied, as of `now`.
 ///
-/// The two travel together so an admission cannot pair a window with an
-/// instant from another clock.
+/// The two travel together so an admission pairs the window with an
+/// instant from the clock the window is measured on.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Tombstone {
 	/// How long the row survives after its bucket empties.
@@ -526,8 +537,8 @@ impl ServletRegistry {
 	/// Creates a registry that scores on `config` and measures tombstones,
 	/// route installs, and relay-trail age on `clock`.
 	///
-	/// The clock is the gateway's own, so a registry cannot age its rows on
-	/// a clock the gateway beside it does not read.
+	/// The clock is the gateway's own, so the registry ages its rows on the
+	/// clock the gateway beside it reads.
 	pub fn new(config: PheromoneConfig, clock: Arc<dyn Clock>) -> Self {
 		Self {
 			routes: RwLock::new(Routes::default()),

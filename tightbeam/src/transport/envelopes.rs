@@ -28,7 +28,7 @@ use crate::transport::error::TransportError;
 #[cfg(feature = "transport-multiplex")]
 mod multiplex {
 	pub use crate::cms::signed_data::SignerInfo;
-	pub use crate::constants::DEFAULT_HOP_BUDGET;
+	pub use crate::constants::{DEFAULT_HOP_BUDGET, EC_PUBKEY_COMPRESSED_SIZE};
 	pub use crate::der::asn1::OctetString;
 	pub use crate::der::Enumerated;
 	pub use crate::der::Sequence;
@@ -102,8 +102,8 @@ pub struct ResponsePackage {
 impl ResponsePackage {
 	/// Terminal response for a unary or streaming service outcome.
 	///
-	/// The inverse of [`Self::resolve`]: a success carries the frame, and a
-	/// failure carries its status alone. The two together are the whole
+	/// It is the inverse of [`Self::resolve`]: a success carries the frame, and
+	/// a failure carries its status alone. The two together are the whole
 	/// round trip of one service call.
 	#[cfg(pooled_mux)]
 	pub(crate) fn from_outcome(outcome: Result<Option<Frame>, crate::TightBeamError>) -> Self {
@@ -348,7 +348,7 @@ macro_rules! mux_chunk_package {
 			///
 			/// # Errors
 			///
-			/// - A DER length error when `payload` is longer than the DER length cap.
+			/// - [`der::Error`] -- `payload` is longer than the DER length cap.
 			pub fn new(stream_id: u32, last: bool, payload: impl Into<Vec<u8>>) -> DerResult<Self> {
 				let payload = OctetString::new(payload)?;
 				Ok(Self { stream_id, last, payload })
@@ -424,8 +424,7 @@ pub struct MuxOpenPackage {
 	/// The relay budget, with the same contract as the unary `hops_remaining`
 	/// field.
 	///
-	/// - The value is the number of gateway forwards the stream may still
-	///   spend, and each hop decrements it.
+	/// - The value is the number of gateway forwards the stream may still spend, and each hop decrements it.
 	/// - The origin stamps the [`DEFAULT_HOP_BUDGET`] sentinel, and every
 	///   gateway clamps to its own `max_hops`.
 	/// - A gateway serves a `0` open locally and never re-forwards it.
@@ -447,7 +446,7 @@ impl MuxOpenPackage {
 	///
 	/// # Errors
 	///
-	/// - A DER length error when `payload` is longer than the DER length cap.
+	/// - [`der::Error`] -- `payload` is longer than the DER length cap.
 	pub fn new(stream_id: u32, last: bool, kind: MuxStreamKind, payload: impl Into<Vec<u8>>) -> DerResult<Self> {
 		let payload = OctetString::new(payload)?;
 		Ok(Self { stream_id, last, kind, payload, target: None, hops_remaining: DEFAULT_HOP_BUDGET })
@@ -527,7 +526,7 @@ impl MuxEndPackage {
 	///
 	/// # Errors
 	///
-	/// - A DER length error when `payload` is longer than the DER length cap.
+	/// - [`der::Error`] -- `payload` is longer than the DER length cap.
 	pub fn new(stream_id: u32, status: TransitStatus, payload: impl Into<Vec<u8>>) -> DerResult<Self> {
 		let payload = OctetString::new(payload)?;
 		Ok(Self { stream_id, status, payload })
@@ -672,38 +671,50 @@ impl GoAwayPackage {
 }
 
 /// The first rekey leg, client to server, which carries the client
-/// randomness that opens an epoch renewal.
+/// randomness and the client's rekey ephemeral public key.
 ///
 /// The renewal follows [RFC 9846 § 4.7.3][rfc9846-4.7.3] with an explicit
-/// three-leg exchange.
+/// three-leg exchange, and each renewal runs a fresh agreement between the
+/// two ephemerals.
 ///
 /// [rfc9846-4.7.3]: https://datatracker.ietf.org/doc/html/rfc9846#section-4.7.3
 #[cfg(feature = "transport-multiplex")]
 #[derive(Sequence, Debug, Clone, PartialEq, Eq)]
 pub struct MuxRekeyRequestPackage {
 	pub(crate) client_random: OctetString,
+	pub(crate) client_ephemeral: OctetString,
 }
 
 #[cfg(feature = "transport-multiplex")]
 impl MuxRekeyRequestPackage {
-	/// Build a request that carries `client_random`.
+	/// Build a request that carries `client_random` and the compressed SEC1
+	/// point `client_ephemeral`.
 	///
 	/// # Errors
 	///
-	/// - A DER length error when `client_random` is longer than the DER length cap.
-	pub fn new(client_random: impl Into<Vec<u8>>) -> DerResult<Self> {
+	/// - [`der::Error`] -- `client_random` is longer than the DER length cap.
+	pub fn new(
+		client_random: impl Into<Vec<u8>>,
+		client_ephemeral: &[u8; EC_PUBKEY_COMPRESSED_SIZE],
+	) -> DerResult<Self> {
 		let client_random = OctetString::new(client_random)?;
-		Ok(Self { client_random })
+		let client_ephemeral = OctetString::new(client_ephemeral.as_slice())?;
+		Ok(Self { client_random, client_ephemeral })
 	}
 
 	/// The client randomness that opens the renewal.
 	pub fn client_random(&self) -> &[u8] {
 		self.client_random.as_bytes()
 	}
+
+	/// The client's rekey ephemeral public key, a compressed SEC1 point.
+	pub fn client_ephemeral(&self) -> &[u8] {
+		self.client_ephemeral.as_bytes()
+	}
 }
 
-/// The second rekey leg, server to client, which carries the server
-/// randomness and the server-signed epoch receipt.
+/// The second rekey leg, server to client. It carries the server randomness,
+/// the server's rekey ephemeral, and the server-signed epoch receipt.
 ///
 /// `epoch_receipt` is DER-optional for a future keys-only renewal in the TLS
 /// KeyUpdate shape ([RFC 9846 § 4.7.3][rfc9846-4.7.3]). On a budget-bearing
@@ -715,25 +726,37 @@ impl MuxRekeyRequestPackage {
 #[derive(Sequence, Debug, Clone, PartialEq)]
 pub struct MuxRekeyResponsePackage {
 	pub(crate) server_random: OctetString,
+	pub(crate) server_ephemeral: OctetString,
 	pub(crate) epoch_receipt: Option<Box<SignedData>>,
 }
 
 #[cfg(feature = "transport-multiplex")]
 impl MuxRekeyResponsePackage {
-	/// Build a response that carries `server_random` and the optional
-	/// `epoch_receipt`.
+	/// Build a response that carries `server_random`, the compressed SEC1
+	/// point `server_ephemeral`, and the optional `epoch_receipt`.
 	///
 	/// # Errors
 	///
-	/// - A DER length error when `server_random` is longer than the DER length cap.
-	pub fn new(server_random: impl Into<Vec<u8>>, epoch_receipt: Option<SignedData>) -> DerResult<Self> {
+	/// - [`der::Error`] -- `server_random` is longer than the DER length cap.
+	pub fn new(
+		server_random: impl Into<Vec<u8>>,
+		server_ephemeral: &[u8; EC_PUBKEY_COMPRESSED_SIZE],
+		epoch_receipt: Option<SignedData>,
+	) -> DerResult<Self> {
 		let server_random = OctetString::new(server_random)?;
-		Ok(Self { server_random, epoch_receipt: epoch_receipt.map(Box::new) })
+		let server_ephemeral = OctetString::new(server_ephemeral.as_slice())?;
+		let epoch_receipt = epoch_receipt.map(Box::new);
+		Ok(Self { server_random, server_ephemeral, epoch_receipt })
 	}
 
 	/// The server randomness for the renewal.
 	pub fn server_random(&self) -> &[u8] {
 		self.server_random.as_bytes()
+	}
+
+	/// The server's rekey ephemeral public key, a compressed SEC1 point.
+	pub fn server_ephemeral(&self) -> &[u8] {
+		self.server_ephemeral.as_bytes()
 	}
 
 	/// The server-signed epoch receipt, which a budget-bearing session
@@ -1048,7 +1071,6 @@ mod tests {
 			let corrupt_pos = 5;
 			encoded[corrupt_pos] = encoded[corrupt_pos].wrapping_add(1);
 
-			// The length mismatch must fail the decode.
 			let result = RequestPackage::from_der(&encoded);
 			assert!(result.is_err(), "Should fail with corrupted length");
 		}
@@ -1067,7 +1089,6 @@ mod tests {
 			let corrupt_pos = 8;
 			encoded[corrupt_pos] = encoded[corrupt_pos].wrapping_add(1);
 
-			// The length mismatch must fail the decode.
 			let result = ResponsePackage::from_der(&encoded);
 			assert!(result.is_err(), "Should fail with corrupted length");
 		}
@@ -1278,19 +1299,21 @@ mod tests {
 	#[cfg(feature = "transport-multiplex")]
 	#[test]
 	fn test_mux_rekey_request_package_encode_decode() -> Result<(), Box<dyn Error>> {
+		let point = [0x02u8; EC_PUBKEY_COMPRESSED_SIZE];
 		assert_round_trip([
-			MuxRekeyRequestPackage::new([0u8; 32])?,
-			MuxRekeyRequestPackage::new([0xFF; 32])?,
-			MuxRekeyRequestPackage::new(Vec::new())?,
+			MuxRekeyRequestPackage::new([0u8; 32], &point)?,
+			MuxRekeyRequestPackage::new([0xFF; 32], &point)?,
+			MuxRekeyRequestPackage::new(Vec::new(), &point)?,
 		])
 	}
 
 	#[cfg(feature = "transport-multiplex")]
 	#[test]
 	fn test_mux_rekey_response_package_encode_decode() -> Result<(), Box<dyn Error>> {
+		let point = [0x03u8; EC_PUBKEY_COMPRESSED_SIZE];
 		assert_round_trip([
-			MuxRekeyResponsePackage::new([7u8; 32], Some(sample_signed_data()?))?,
-			MuxRekeyResponsePackage::new([9u8; 32], None)?,
+			MuxRekeyResponsePackage::new([7u8; 32], &point, Some(sample_signed_data()?))?,
+			MuxRekeyResponsePackage::new([9u8; 32], &point, None)?,
 		])
 	}
 
@@ -1403,12 +1426,13 @@ mod tests {
 			TransportEnvelope::from(GoAwayPackage::new(3, GoAwayReason::Shutdown)),
 			TransportEnvelope::from(MuxPingPackage::new(false, 7)),
 			{
-				let rekey_request = MuxRekeyRequestPackage::new([1u8; 32])?;
+				let rekey_request = MuxRekeyRequestPackage::new([1u8; 32], &[0x02u8; EC_PUBKEY_COMPRESSED_SIZE])?;
 				TransportEnvelope::from(rekey_request)
 			},
 			{
 				let signed = sample_signed_data()?;
-				let rekey_response = MuxRekeyResponsePackage::new([2u8; 32], Some(signed))?;
+				let rekey_response =
+					MuxRekeyResponsePackage::new([2u8; 32], &[0x03u8; EC_PUBKEY_COMPRESSED_SIZE], Some(signed))?;
 				TransportEnvelope::from(rekey_response)
 			},
 			{

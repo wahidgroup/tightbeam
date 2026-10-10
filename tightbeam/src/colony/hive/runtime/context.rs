@@ -136,6 +136,14 @@ impl<P: Protocol> HiveContextImpl<P> {
 		self.routes_mut().remove(key, &type_prefix, type_bytes, removed_addr);
 	}
 
+	/// Whether a route for `servlet_type` is installed, for a test that
+	/// reads the routes at an instant the hive picks.
+	#[cfg(test)]
+	pub(crate) fn resolves(&self, servlet_type: &Urn<'_>) -> bool {
+		let type_key = servlet_type.canonical_bytes();
+		self.routes().resolve(&type_key).is_some()
+	}
+
 	/// Adds a route to every instance already in `servlets`.
 	///
 	/// Registration fills the registry before the hive starts, so the

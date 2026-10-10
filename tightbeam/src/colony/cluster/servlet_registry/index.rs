@@ -3,6 +3,7 @@ use std::sync::Arc;
 use super::entry::Owner;
 use super::{Bucket, ClusterError, HiveSlate, KindCaps, PeerCaps, RouteKind, ServletEntry, ServletRegistry};
 use crate::colony::cluster::peer::{AdmittedPeerAd, RelayTrail};
+use crate::colony::cluster::PeerAddress;
 
 impl ServletRegistry {
 	/// Adds one servlet entry outside any slate, for tests that seed a
@@ -93,8 +94,7 @@ impl ServletRegistry {
 	/// - The relay dial address comes from this registry's recorded value for
 	///   the relay, which the direct reconcile's ownership check has already
 	///   gated.
-	/// - Each bucket refuses stale advertisements on its own order ledger, as
-	///   direct slates do (CWE-294).
+	/// - Each bucket refuses stale advertisements on its own order ledger, as direct slates do (CWE-294).
 	pub(in crate::colony::cluster) fn reconcile_relay_trail(
 		&self,
 		trail: RelayTrail,
@@ -124,6 +124,29 @@ impl ServletRegistry {
 		let hive_id = hive_id.as_ref();
 		let bucket = Bucket { id: hive_id, owner: Owner::hive(hive_id) };
 		Ok(self.routes.write()?.remove_owned(bucket))
+	}
+
+	/// Withdraws every peer route that dials `gateway`, relay trails through
+	/// it included, under one guard.
+	///
+	/// An eviction and an expulsion are evidence about a socket: it stopped
+	/// answering, or it answered with a foreign identity. The socket therefore
+	/// selects the routes, whichever peer advertised them.
+	///
+	/// - A hive route stays, because the evidence concerns the peer plane.
+	/// - A fallback trail to the same origin through another relay stays, because it dials that relay.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::LockPoisoned`] -- the route lock is poisoned.
+	pub(in crate::colony::cluster) fn withdraw_peer_by_dial(
+		&self,
+		gateway: impl Into<PeerAddress>,
+	) -> Result<(), ClusterError> {
+		let gateway: PeerAddress = gateway.into();
+		self.routes.write()?.remove_peer_routes_dialing(gateway);
+
+		Ok(())
 	}
 
 	/// Applies a batch of servlet address additions and removals for one hive.

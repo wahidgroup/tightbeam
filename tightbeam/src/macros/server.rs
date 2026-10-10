@@ -18,9 +18,7 @@ use crate::policy::TransitStatus;
 #[cfg(pooled_mux)]
 use crate::transport::multiplex::MuxAcceptor;
 #[cfg(pooled_mux)]
-use crate::transport::multiplex::{ReplySink, StreamBody, StreamRoute};
-#[cfg(pooled_mux)]
-use crate::transport::serve::{CallContext, MuxService};
+use crate::transport::multiplex::{CallContext, MuxService, ReplySink, StreamBody, StreamRoute};
 #[cfg(all(feature = "tokio", feature = "x509"))]
 use crate::transport::state::EncryptedProtocolState;
 #[cfg(feature = "tokio")]
@@ -129,13 +127,16 @@ impl MuxService for SharedHandlerService {
 	}
 }
 
-/// Report a service failure to the error channel, degrading it to an
-/// opaque `Internal` so the peer-visible status carries the mapped code
-/// once the original error has been recorded locally.
+/// Report a service failure to the error channel and return the opaque
+/// `Internal` failure in its place, so the peer sees `Internal` once the
+/// channel holds the original error. When the server has no error channel, the
+/// original error returns unchanged.
 #[cfg(pooled_mux)]
 async fn report_failure(errors: &mut Option<ErrorSender>, err: TightBeamError) -> TightBeamError {
 	match errors.as_mut() {
 		Some(tx) => {
+			// The error channel belongs to the application, and a receiver that
+			// is gone wants no report.
 			let _ = tx.send(err.into()).await;
 			TightBeamError::TransportError(crate::transport::TransportError::OperationFailed(
 				crate::transport::TransportFailure::Internal,
@@ -145,8 +146,8 @@ async fn report_failure(errors: &mut Option<ErrorSender>, err: TightBeamError) -
 	}
 }
 
-/// [`MuxService`] adapter reporting every handler failure to the
-/// server's error channel before the stream closes with its status.
+/// A [`MuxService`] adapter that reports every handler failure to the server's
+/// error channel before the stream closes with its status.
 #[cfg(pooled_mux)]
 struct ReportedService<S> {
 	service: Arc<S>,
@@ -204,8 +205,7 @@ impl<S: MuxService> MuxService for ReportedService<S> {
 
 /// Serve one accepted connection with a [`MuxService`].
 ///
-/// - When the peer negotiated multiplexing, the mux takes over and the service
-///   routes every stream kind.
+/// - When the peer negotiated multiplexing, the mux takes over and the service routes every stream kind.
 /// - Otherwise a single-flight unary loop serves the connection.
 ///
 /// The function is generic over the accepted transport
@@ -228,11 +228,15 @@ pub async fn serve_connection_service<T, S>(
 			match transport.serve(settings, reported, None).await {
 				Ok(()) => {
 					if let Some(tx) = ok_tx.as_mut() {
+						// The ok channel belongs to the application, and a
+						// receiver that is gone wants no notice.
 						let _ = tx.send(()).await;
 					}
 				}
 				Err(err) => {
 					if let Some(tx) = error_tx.as_mut() {
+						// The error channel belongs to the application, and a
+						// receiver that is gone wants no report.
 						let _ = tx.send(err).await;
 					}
 				}
@@ -242,6 +246,8 @@ pub async fn serve_connection_service<T, S>(
 		Ok(None) => {}
 		Err(err) => {
 			if let Some(tx) = error_tx.as_mut() {
+				// The error channel belongs to the application, and a receiver
+				// that is gone wants no report.
 				let _ = tx.send(err).await;
 			}
 			return;
@@ -310,6 +316,8 @@ async fn serve_single_flight<T, F, Fut>(
 			Ok(result) => result,
 			Err(err) => {
 				if let Some(tx) = error_tx.as_mut() {
+					// The error channel belongs to the application, and a
+					// receiver that is gone wants no report.
 					let _ = tx.send(err).await;
 				}
 				break;
@@ -325,6 +333,8 @@ async fn serve_single_flight<T, F, Fut>(
 				Ok(response) => (status, response),
 				Err(err) => {
 					if let Some(tx) = error_tx.as_mut() {
+						// The error channel belongs to the application, and a
+						// receiver that is gone wants no report.
 						let _ = tx.send(err.into()).await;
 					}
 
@@ -338,11 +348,15 @@ async fn serve_single_flight<T, F, Fut>(
 		match transport.send_response(status, response).await {
 			Ok(()) => {
 				if let Some(tx) = ok_tx.as_mut() {
+					// The ok channel belongs to the application, and a receiver
+					// that is gone wants no notice.
 					let _ = tx.send(()).await;
 				}
 			}
 			Err(err) => {
 				if let Some(tx) = error_tx.as_mut() {
+					// The error channel belongs to the application, and a
+					// receiver that is gone wants no report.
 					let _ = tx.send(err).await;
 				}
 				break;
@@ -561,6 +575,8 @@ macro_rules! __tightbeam_server_protocol_channels_handle {
 macro_rules! __tightbeam_server_protocol_channels_handle {
 	($protocol:path, $listener:expr, $error_tx:expr, $ok_tx:expr, $handler:expr) => {{
 		let __listener = $listener;
+		// Only the tokio loop reports through channels, so the sync expansion
+		// evaluates both inputs and drops them.
 		let _ = ($error_tx, $ok_tx);
 		::std::thread::spawn(move || {
 			$crate::server!(@sync_loop $protocol, __listener, $handler,)
@@ -573,6 +589,8 @@ macro_rules! __tightbeam_server_protocol_channels_handle {
 #[macro_export]
 macro_rules! __tightbeam_server_protocol_channels_handle {
 	($protocol:path, $listener:expr, $error_tx:expr, $ok_tx:expr, $handler:expr) => {
+		// The build stops at the `compile_error!` below, so this line only
+		// expands both inputs.
 		let _ = ($error_tx, $ok_tx);
 		compile_error!(
 			"server!(protocol ..., channels: ...) requires tightbeam to be built with either the `tokio` or `std` feature"
@@ -600,6 +618,8 @@ macro_rules! __tightbeam_server_protocol_channels_policies_handle {
 macro_rules! __tightbeam_server_protocol_channels_policies_handle {
 	($protocol:path, $listener:expr, $error_tx:expr, $ok_tx:expr, [$($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?], $handler:expr) => {{
 		let __listener = $listener;
+		// Only the tokio loop reports through channels, so the sync expansion
+		// evaluates both inputs and drops them.
 		let _ = ($error_tx, $ok_tx);
 		::std::thread::spawn(move || {
 			$crate::server!(@sync_loop $protocol, __listener, $handler, $($policy_name: [ $( $policy_expr ),* ]),*)
@@ -612,6 +632,8 @@ macro_rules! __tightbeam_server_protocol_channels_policies_handle {
 #[macro_export]
 macro_rules! __tightbeam_server_protocol_channels_policies_handle {
 	($protocol:path, $listener:expr, $error_tx:expr, $ok_tx:expr, [$($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?], $handler:expr) => {
+		// The build stops at the `compile_error!` below, so this line only
+		// expands both inputs.
 		let _ = ($error_tx, $ok_tx);
 		compile_error!(
 			"server!(protocol ..., channels: ...) requires tightbeam to be built with either the `tokio` or `std` feature"
@@ -801,9 +823,8 @@ macro_rules! server {
 								match $crate::macros::server::server_runtime::rt::block_on(__handler_clone.call(frame_owned, __session)) {
 									Ok(opt) => (status, opt),
 									// A handler failure answers a distinct
-									// status so the peer can tell it apart
-									// from an accepted empty reply. The sync
-									// loop has no error channel to report to.
+									// status so the peer can tell it apart from
+									// an accepted empty reply.
 									Err(_err) => ($crate::policy::TransitStatus::Internal, ::core::option::Option::None),
 								}
 							} else {
@@ -856,6 +877,8 @@ macro_rules! server {
 				let __channel = __accept_errors.clone();
 				async move {
 					if let Some(tx) = __channel {
+						// The error channel belongs to the application, and a
+						// receiver that is gone wants no report.
 						let _ = tx.send(__reported).await;
 					}
 				}
@@ -1030,7 +1053,7 @@ macro_rules! server {
 
 	// Service forms: `service:` takes a `MuxService` value, so one server
 	// answers unary, streaming, and duplex interactions without separate
-	// declarations. Requires the pooled multiplexing feature set.
+	// declarations. These forms require the pooled multiplexing feature set.
 	(protocol $protocol:path: $listener:expr, service: $service:expr) => {{
 		$crate::__tightbeam_server_protocol_service_handle!(
 			$protocol,

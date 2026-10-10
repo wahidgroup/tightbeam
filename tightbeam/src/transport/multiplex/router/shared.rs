@@ -114,6 +114,8 @@ impl Drop for StreamReservation {
 			return;
 		};
 
+		// The initiator may already have dropped its future, which is what
+		// abandons a reservation in the first place.
 		let _ = sender.send(StreamOutcome::Cancelled(CancelReason::Cancelled));
 		let mut state = self.shared.lock();
 		state.reserved = state.reserved.saturating_sub(1);
@@ -492,6 +494,8 @@ impl MuxShared {
 				return true;
 			}
 
+			// A reply body already dropped has no reader for the failure,
+			// and the GoAway disowned the stream either way.
 			let _ = stream.forward(BodyEvent::Failed(TransportError::Draining));
 			false
 		});
@@ -622,8 +626,8 @@ impl MuxShared {
 	///
 	/// # Errors
 	///
-	/// - [`TransportError::OperationFailed`] with [`TransportFailure::Cancelled`] -- the
-	///   stream's ledger is gone.
+	/// - [`TransportError::OperationFailed`] with
+	///   [`TransportFailure::Cancelled`] -- the stream's ledger is gone.
 	/// - [`TransportError::ConnectionClosed`] -- the envelope slot is empty or the writer queue closed.
 	pub fn poll_send_enqueue(
 		&self,
@@ -748,7 +752,7 @@ impl MuxShared {
 	///
 	/// # Errors
 	///
-	/// The [`poll_admit_debit`](Self::poll_admit_debit) set.
+	/// - The [`poll_admit_debit`](Self::poll_admit_debit) set.
 	pub async fn admit_debit(&self, credits: u64, reserved: bool) -> TransportResult<BudgetStanding> {
 		poll_fn(|cx| self.poll_admit_debit(credits, reserved, cx)).await
 	}
@@ -835,8 +839,8 @@ impl MuxShared {
 		true
 	}
 
-	/// The send cipher is active after the Ack, which lifts the
-	/// hard-floor park.
+	/// Record that the writer wrote the `RekeyAck` (client). The send cipher is
+	/// active after the Ack, which lifts the hard-floor park.
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	pub fn mark_ack_written(&self) {
 		let mut state = self.lock();
@@ -1128,6 +1132,8 @@ impl MuxShared {
 	/// tolerates a cancel racing a response on the connection.
 	pub fn resolve(&self, stream_id: u32, outcome: StreamOutcome) {
 		if let Some(sender) = self.remove_pending(stream_id) {
+			// A dropped receiver is an initiator that cancelled, the same race
+			// an unknown ID is.
 			let _ = sender.send(outcome);
 		}
 	}
@@ -1164,6 +1170,8 @@ impl MuxShared {
 	/// benign.
 	pub fn resolve_ping(&self, opaque: u64) {
 		if let Some(sender) = self.lock().pending_pings.remove(&opaque) {
+			// A dropped receiver is a ping future already gone, and its late
+			// ack is as benign as a stale one.
 			let _ = sender.send(());
 		}
 	}
@@ -1214,6 +1222,8 @@ impl MuxShared {
 
 			if let Some(first_dropped) = last_stream_id.checked_add(1) {
 				for (_, sender) in state.pending.split_off(&first_dropped) {
+					// A dropped receiver is an initiator that gave up before
+					// the GoAway, which leaves nothing to resolve.
 					let _ = sender.send(StreamOutcome::Draining);
 				}
 			}

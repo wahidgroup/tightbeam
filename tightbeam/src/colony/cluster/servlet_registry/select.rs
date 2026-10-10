@@ -7,7 +7,7 @@ use crate::colony::common::ServletTypeKey;
 
 impl ServletRegistry {
 	/// Returns the live routes for a servlet type as shared [`Arc`] handles,
-	/// so the call deep-copies no entry.
+	/// so the call copies the handles and shares each entry.
 	///
 	/// # Errors
 	///
@@ -180,9 +180,8 @@ impl ServletRegistry {
 		let routes = self.routes.read()?;
 		let weakened = routes
 			.values()
-			.filter(|entry| entry.route_kind().is_peer())
+			.filter(|entry| entry.is_peer_route_to(gateway))
 			.filter(|entry| entry.is_live())
-			.filter(|entry| entry.dial_target().socket() == Some(gateway))
 			.map(|entry| entry.weaken())
 			.count();
 

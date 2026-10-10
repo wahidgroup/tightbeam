@@ -25,7 +25,7 @@ pub const TRANSCRIPT_HASH_LEN: usize = 32;
 ///
 /// Digests wider than [`TRANSCRIPT_HASH_LEN`] are *deliberately* truncated to
 /// their leading 32 bytes, following the NIST SHA-512/256 construction: the
-/// wire format carries exactly 32 bytes and the leading bytes of a wider
+/// transport format carries exactly 32 bytes and the leading bytes of a wider
 /// digest retain full 256-bit collision resistance (CWE-1240).
 fn digest_output_to_array(bytes: impl AsRef<[u8]>) -> Result<[u8; TRANSCRIPT_HASH_LEN], HandshakeError> {
 	let bytes = bytes.as_ref();
@@ -95,9 +95,11 @@ impl Transcript {
 			server_ephemeral,
 			spki,
 			security_accept_der,
+			client_cert_required,
 			transport_accept_der,
 		} = legs;
-		let fixed = server_random.len() + server_ephemeral.len();
+		let demand = [u8::from(client_cert_required)];
+		let fixed = server_random.len() + server_ephemeral.len() + demand.len();
 		let len = client_hello.len() + fixed + spki.len() + security_accept_der.len() + transport_accept_der.len();
 
 		let mut buffer = Vec::with_capacity(len);
@@ -106,6 +108,7 @@ impl Transcript {
 		buffer.extend_from_slice(server_ephemeral);
 		buffer.extend_from_slice(spki);
 		buffer.extend_from_slice(security_accept_der);
+		buffer.extend_from_slice(&demand);
 		buffer.extend_from_slice(transport_accept_der);
 		Self(State::Open(buffer))
 	}
@@ -214,6 +217,10 @@ pub(crate) struct EciesHandshakeLegs<'a> {
 	pub(crate) spki: &'a [u8],
 	/// The DER of the security accept, empty when the server sent none.
 	pub(crate) security_accept_der: &'a [u8],
+	/// Whether the server demands a client certificate. It enters as one byte,
+	/// `0x01` for a demand and `0x00` for none. Each accept beside it is a DER
+	/// SEQUENCE that begins with `0x30`, so the byte reads as part of neither.
+	pub(crate) client_cert_required: bool,
 	/// The DER of the transport accept, empty when the server sent none.
 	pub(crate) transport_accept_der: &'a [u8],
 }
@@ -341,6 +348,7 @@ mod tests {
 			server_ephemeral,
 			spki: b"spki",
 			security_accept_der: b"accept",
+			client_cert_required: false,
 			transport_accept_der: b"",
 		};
 
@@ -415,9 +423,9 @@ mod tests {
 		Ok(())
 	}
 
-	/// The ECIES transcript hashes its legs in wire order: the hello, the
+	/// The ECIES transcript hashes its legs in one fixed order: the hello, the
 	/// server random, the server ephemeral, the server key, the security
-	/// accept, and the transport accept.
+	/// accept, the certificate demand, and the transport accept.
 	///
 	/// Both peers sign and verify this digest, so the expected value is a
 	/// literal that no code of the crate computes.
@@ -430,13 +438,14 @@ mod tests {
 			server_ephemeral: &[0x22; EC_PUBKEY_COMPRESSED_SIZE],
 			spki: b"server spki",
 			security_accept_der: b"security accept",
+			client_cert_required: true,
 			transport_accept_der: b"transport accept",
 		};
 
 		let hash = Transcript::ecies_handshake(legs).seal::<Sha3_256>()?;
 		let expected = [
-			0x96, 0x7f, 0xd9, 0x7c, 0xdb, 0x45, 0xd5, 0x1e, 0xca, 0x2a, 0x41, 0x0f, 0xb3, 0xb0, 0x91, 0xdf, 0x1d, 0xde,
-			0x66, 0xa1, 0x69, 0x15, 0xde, 0x9a, 0xf3, 0xb4, 0xfb, 0x40, 0x55, 0x65, 0xf3, 0x89,
+			0x96, 0x45, 0xa4, 0x4b, 0x7b, 0x7e, 0x7d, 0x93, 0xeb, 0x00, 0x1b, 0x25, 0xc1, 0xd7, 0xcc, 0xbc, 0xb7, 0xe5,
+			0x4e, 0x90, 0x29, 0x8e, 0xba, 0x64, 0xc6, 0xb7, 0x3e, 0x4b, 0x90, 0x28, 0x73, 0x03,
 		];
 		assert_eq!(hash, expected);
 		Ok(())

@@ -3,8 +3,7 @@
 //! This module holds discovery state for the peer beat. The design follows
 //! Bitcoin's address manager as analyzed against eclipse attacks.
 //!
-//! - Configured anchors hold their slots for the table's life and are
-//!   always dialed.
+//! - Configured anchors hold their slots for the table's life and are always dialed.
 //! - Learned peers are bucketed by address prefix with per-bucket caps.
 //!   One network position therefore holds at most its own bucket's
 //!   share of the table (CWE-770).
@@ -22,9 +21,9 @@
 //!
 //! - Heilman, Kendler, Zohar & Goldberg (2015), eclipse attacks on
 //!   Bitcoin's peer-to-peer network (new/tried tables, feeler probes,
-//!   and per-group capacity):
-//!   [USENIX Security '15](https://www.usenix.org/conference/usenixsecurity15/technical-sessions/presentation/heilman),
-//!   [ePrint 2015/263](https://eprint.iacr.org/2015/263)
+//!   and per-group capacity), USENIX Security '15 and ePrint 2015/263:
+//!   <https://www.usenix.org/conference/usenixsecurity15/technical-sessions/presentation/heilman>
+//!   <https://eprint.iacr.org/2015/263>
 //! - CWE-770, allocation of resources without limits or throttling:
 //!   <https://cwe.mitre.org/data/definitions/770.html>
 
@@ -401,7 +400,8 @@ where
 	sample
 }
 
-/// Deterministic lane order key: the lane's front address, borrowed.
+/// The key that orders lanes deterministically, which is the lane's front
+/// address.
 fn lane_key<'t>(lane: &[(&'t AdmittedDial, &'t PeerEntry)]) -> Option<&'t AdmittedDial> {
 	lane.first().map(|(addr, _)| *addr)
 }
@@ -435,8 +435,7 @@ impl PeerTable {
 	///
 	/// - Each record passes [`PeerConfig::admit_dial`] first, so a policy the
 	///   operator tightened since the last run drops the peers it refuses.
-	/// - A driver fault degrades to an anchors-only start, which is safe
-	///   because discovery refills the table.
+	/// - A driver fault degrades to an anchors-only start, which is safe because discovery refills the table.
 	///
 	/// The config builder is the caller, because [`PeerConfig::table`] is
 	/// derived from the config it is built from and a table built elsewhere
@@ -573,23 +572,24 @@ impl PeerTable {
 	/// Record a failed beat dial of a tried peer.
 	///
 	/// Residents re-verify on every beat, so consecutive failures measure
-	/// liveness. Returns `true` only on an eviction so the caller can emit
-	/// one event per reclaimed peer.
+	/// liveness. The call returns whether the peer was evicted, so the caller
+	/// can emit one event per reclaimed peer and withdraw the routes that dial
+	/// the address.
 	///
 	/// - Failures reaching [`MAX_PEER_TRIED_FAILURES`] evict the entry.
 	/// - Eviction frees the prefix bucket slot for a live candidate.
 	/// - The threshold tolerates a transient partition.
 	/// - A verified probe resets the count.
-	/// - Eviction fails closed: the table shrinks toward its anchors, and
-	///   discovery refills it.
+	/// - Eviction fails closed: the table shrinks toward its anchors, and discovery refills it.
 	/// - An address outside the tried table leaves the table unchanged.
 	///
 	/// # Sources
 	///
 	/// - Heilman, Kendler, Zohar & Goldberg (2015), eclipse attacks on
-	///   Bitcoin's peer-to-peer network (feeler probes / tried eviction):
-	///   [USENIX Security '15](https://www.usenix.org/conference/usenixsecurity15/technical-sessions/presentation/heilman),
-	///   [ePrint 2015/263](https://eprint.iacr.org/2015/263)
+	///   Bitcoin's peer-to-peer network (feeler probes / tried eviction),
+	///   USENIX Security '15 and ePrint 2015/263:
+	///   <https://www.usenix.org/conference/usenixsecurity15/technical-sessions/presentation/heilman>
+	///   <https://eprint.iacr.org/2015/263>
 	///
 	/// # Errors
 	///
@@ -601,6 +601,7 @@ impl PeerTable {
 			};
 
 			entry.failures = entry.failures.saturating_add(1);
+
 			if entry.failures < MAX_PEER_TRIED_FAILURES {
 				return (false, false);
 			}
@@ -618,6 +619,7 @@ impl PeerTable {
 	///
 	/// - The address leaves discovery at once, ahead of the failure threshold.
 	/// - A re-keyed peer therefore stops receiving advertisements.
+	/// - The caller withdraws the routes that dial the address, as on an eviction.
 	///
 	/// # Errors
 	///
@@ -626,7 +628,8 @@ impl PeerTable {
 		self.with_table(|state| {
 			let from_new = state.new.remove(&addr).is_some();
 			let from_tried = state.tried.remove(&addr).is_some();
-			((), from_new || from_tried)
+			let changed = from_new || from_tried;
+			((), changed)
 		})
 	}
 
@@ -646,6 +649,7 @@ impl PeerTable {
 		let mut learned = self
 			.state
 			.read(|state| state.tried.keys().copied().collect::<Vec<AdmittedDial>>())?;
+
 		let mut targets = self.anchors.clone();
 
 		learned.sort();
@@ -1219,6 +1223,7 @@ mod tests {
 		let crowded: Vec<PeerHint> = (0..PEER_PROBE_PER_BEAT + 2)
 			.map(|host| hint(format!("10.0.0.{}:9000", host + 1)))
 			.collect();
+
 		table.learn(crowded)?;
 		table.learn(vec![hint("10.1.0.1:9000")])?;
 
@@ -1301,7 +1306,7 @@ mod tests {
 		Ok(())
 	}
 
-	/// Driver that stalls its first write until released, and records the
+	/// A driver that stalls its first write until released, and records the
 	/// row count each snapshot carried.
 	#[derive(Debug, Default)]
 	struct StallingStore {

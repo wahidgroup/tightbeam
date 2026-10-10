@@ -7,6 +7,7 @@ use std::sync::Arc;
 use tightbeam::at_least;
 use tightbeam::crypto::hash::Sha3_256;
 use tightbeam::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1VerifyingKey};
+use tightbeam::crypto::sign::elliptic_curve::sec1::ToEncodedPoint;
 use tightbeam::der::asn1::OctetString;
 use tightbeam::der::Encode;
 use tightbeam::exactly;
@@ -87,11 +88,11 @@ const SETTLE_REFUSAL_CODE: u32 = MUX_APPLICATION_CODE_FLOOR + 31;
 /// Application code for a renewal approval refusal.
 const APPROVAL_REFUSAL_CODE: u32 = MUX_APPLICATION_CODE_FLOOR + 32;
 
-/// Fifth single-chunk emit tips budget into drain reserve (caps 1/1, 1 KiB
-/// chunk).
+/// Budgets under which the fifth single-chunk emit tips the budget into the
+/// drain reserve (caps 1/1, 1 KiB chunk).
 const RENEWAL_TRIGGER_BUDGETS: MuxBudgets = MuxBudgets { client_to_server: 10, server_to_client: 4096 };
 
-/// Record watermark drives renewal, not budget.
+/// Budgets large enough that the record watermark drives the renewal.
 const AMPLE_BUDGETS: MuxBudgets = MuxBudgets { client_to_server: 1_000_000, server_to_client: 1_000_000 };
 
 fn rekey_config() -> MuxEndpointConfig {
@@ -117,7 +118,7 @@ async fn emit_series(handle: &MuxHandle, label: impl AsRef<str>, count: usize) -
 	Ok(true)
 }
 
-/// Poll until epoch receipt differs from `previous` (timeout-bounded).
+/// Poll until the epoch receipt differs from `previous`, bounded by a timeout.
 async fn await_rotation(handle: &MuxHandle, previous: Option<&StoredReceipt>) -> Option<Arc<StoredReceipt>> {
 	await_receipt_rotation(|| handle.session_receipt(), previous).await
 }
@@ -137,12 +138,19 @@ fn verifying_key_from(certificate: &Certificate) -> Result<Secp256k1VerifyingKey
 		.map_err(|_| expectation_failure("certificate must carry a valid SEC1 public key"))
 }
 
+/// A hand-built rekey request that carries `seed` as its randomness and a
+/// fresh ephemeral point.
 fn rekey_request_envelope(seed: u8) -> Result<TransportEnvelope, TightBeamError> {
-	let package = MuxRekeyRequestPackage::new(vec![seed; 32])?;
+	let ephemeral = k256::SecretKey::random(&mut rand_core::OsRng).public_key();
+	let encoded = ephemeral.to_encoded_point(true);
+	let point = encoded.as_bytes().try_into();
+	let point = point.map_err(|_| expectation_failure("a secp256k1 point compresses to 33 bytes"))?;
+
+	let package = MuxRekeyRequestPackage::new(vec![seed; 32], &point)?;
 	Ok(MuxEnvelope::RekeyRequest(package).into())
 }
 
-/// Skip stream traffic until `RekeyRequest`.
+/// Skip stream traffic until a `RekeyRequest` arrives.
 async fn read_until_rekey_request(reader: &mut SplitReader) -> Result<(), TightBeamError> {
 	timeout(Duration::from_secs(2), async {
 		loop {
@@ -157,7 +165,7 @@ async fn read_until_rekey_request(reader: &mut SplitReader) -> Result<(), TightB
 	.map_err(|_| expectation_failure("client must open the renewal before the read timeout"))?
 }
 
-/// Skip echo/credit traffic until `RekeyResponse`.
+/// Skip echo and credit traffic until a `RekeyResponse` arrives.
 async fn read_until_rekey_response(reader: &mut SplitReader) -> Result<(), TightBeamError> {
 	timeout(Duration::from_secs(2), async {
 		loop {
@@ -358,10 +366,9 @@ tb_assert_spec! {
 	}
 }
 
-// Same record watermark as the chunked-traffic renewal, but every
-// request travels through open_stream against serve_streaming: the
-// sink's per-push records and the drain-driven grants must both cross
-// the epoch switch intact.
+// The record watermark matches the chunked-traffic renewal, and every request
+// travels through open_stream against serve_streaming. The sink's per-push
+// records and the drain-driven grants must both cross the epoch switch intact.
 tb_scenario! {
 	name: mux_rekey_renewal_survives_streaming_traffic,
 	spec: MuxRekeyStreamingRenewalSpec,
@@ -592,7 +599,7 @@ tb_scenario! {
 				await_goaway_reason(&pair.client.handle, GoAwayReason::Application(SETTLE_REFUSAL_CODE)).await,
 			)?;
 
-			// Stimulus only: the refusal itself emits
+			// The late emit is a stimulus alone. Its refusal emits
 			// `events::MUX_EMIT_DRAINING`.
 			let _late = pair.client.handle.emit_on_stream(&mux_frame("rekey-late")).await;
 
@@ -640,7 +647,7 @@ tb_scenario! {
 				await_goaway_reason(&pair.server.handle, GoAwayReason::Application(APPROVAL_REFUSAL_CODE)).await,
 			)?;
 
-			// Stimulus only: the refusal itself emits
+			// The late emit is a stimulus alone. Its refusal emits
 			// `events::MUX_EMIT_DRAINING`.
 			let _late = pair.client.handle.emit_on_stream(&mux_frame("rekey-late")).await;
 
@@ -714,7 +721,7 @@ tb_scenario! {
 			let mut link = split_server_mux_client_raw(session.client, session.server, rekey_config(), trace.share())?;
 			let _server_serve = spawn_immediate_echo(link.responder);
 
-			// Spend minimum records so first request is accepted
+			// The server answers a first request only after the minimum spend.
 			for index in 0..4u32 {
 				let stream_id = client_stream_id(index);
 				write_muxed_request(&mut link.client_writer, stream_id, mux_frame("rekey-spend")).await?;
@@ -761,8 +768,8 @@ tb_scenario! {
 			let server_offer = chunked_offer(4).with_budgets(AMPLE_BUDGETS);
 			let session = establish_mutual_transports(client_offer, server_offer, MutualSessionHooks::default()).await?;
 
-			// Record limit below renewal floor: first write opens renewal
-			// server never answers
+			// The record limit sits below the renewal floor, so the first write
+			// opens a renewal. The server never answers it.
 			let client_config = MuxEndpointConfig {
 				rekey_limit: Some(80),
 				renewal_deadline: Some(Duration::from_millis(200)),
@@ -849,7 +856,7 @@ tb_scenario! {
 				await_goaway_reason(&pair.client.handle, GoAwayReason::Shutdown).await,
 			)?;
 
-			// Stimulus only: the refusal itself emits
+			// The late emit is a stimulus alone. Its refusal emits
 			// `events::MUX_EMIT_DRAINING`.
 			let _late = pair.client.handle.emit_on_stream(&mux_frame("rekey-inert-late")).await;
 

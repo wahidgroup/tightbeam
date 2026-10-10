@@ -30,6 +30,8 @@ use crate::crypto::hash::Digest;
 use crate::crypto::hash::Sha3_256;
 #[cfg(feature = "kdf")]
 use crate::crypto::kdf::{HkdfSha3_256, KdfFunction};
+#[cfg(all(feature = "aead", feature = "transport"))]
+use crate::crypto::key::KeyError;
 #[cfg(feature = "signature")]
 use crate::crypto::sign::ecdsa::Secp256k1Signature;
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
@@ -46,8 +48,6 @@ use crate::crypto::sign::{LowSEncoding, PrehashVerifier, Signatory, SignatureAlg
 use crate::der::oid::AssociatedOid;
 #[cfg(any(feature = "digest", feature = "aead", feature = "signature"))]
 use crate::spki::AlgorithmIdentifierOwned;
-#[cfg(feature = "transport")]
-use crate::transport::handshake::HandshakeError;
 use crate::Beamable;
 use crate::Errorizable;
 #[cfg(feature = "ecdh")]
@@ -62,15 +62,12 @@ macro_rules! impl_key_wrapper {
 	($err:ty, $cipher:ty, $n:expr) => {
 		Box::new(|cek: &[u8], kek: &[u8; $n]| {
 			if cek.len() < 16 || cek.len() % 8 != 0 {
-				return Err(<$err>::from(HandshakeError::InvalidKeySize {
-					expected: 16,
-					received: cek.len(),
-				}));
+				return Err(<$err>::from(KeyError::WrapLength((cek.len(), 16).into())));
 			}
 
 			crate::crypto::aead::aes_kw::Kek::<$cipher>::from(*kek)
 				.wrap_vec(cek)
-				.map_err(|error| <$err>::from(HandshakeError::AesKeyWrap(error)))
+				.map_err(|error| <$err>::from(KeyError::WrapFailed(error)))
 		})
 	};
 }
@@ -83,25 +80,26 @@ macro_rules! impl_key_unwrapper {
 	($err:ty, $cipher:ty, $n:expr) => {
 		Box::new(|wrapped_cek: &[u8], kek: &[u8; $n]| {
 			if wrapped_cek.len() < 24 || wrapped_cek.len() % 8 != 0 {
-				return Err(<$err>::from(HandshakeError::InvalidKeySize {
-					expected: 24,
-					received: wrapped_cek.len(),
-				}));
+				return Err(<$err>::from(KeyError::WrapLength((wrapped_cek.len(), 24).into())));
 			}
 
 			crate::crypto::aead::aes_kw::Kek::<$cipher>::from(*kek)
 				.unwrap_vec(wrapped_cek)
-				.map_err(|error| <$err>::from(HandshakeError::AesKeyWrap(error)))
+				.map_err(|error| <$err>::from(KeyError::WrapFailed(error)))
 		})
 	};
 }
 
 /// Negotiation descriptor that holds only the OID set of a security profile.
 ///
-/// Every field is an `Option`, and `None` always means that the algorithm is
-/// not part of this profile because the feature is disabled on the producing
-/// side. Each field carries its own context tag, so an absent algorithm
-/// cannot shift the next OID into its place on decode.
+/// Every field is an `Option`, and `None` means that the algorithm is not part
+/// of this profile for one of two reasons:
+///
+/// - The producing side has the feature disabled.
+/// - The profile wraps no keys, which applies to `key_wrap` only.
+///
+/// Each field carries its own context tag, so every OID decodes into its own
+/// field even when an earlier algorithm is absent.
 ///
 /// The AEAD OID names the cipher, and the cipher type fixes the key length.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Sequence, Beamable)]
@@ -165,10 +163,10 @@ impl<P: SecurityProfile> From<&P> for SecurityProfileDesc {
 ///   (`CryptoProvider`) from the protocol-visible identifiers
 ///   (`SecurityProfile`).
 /// - A later dynamic dispatch or plugin loader can use the trait without a change to the wire format.
-/// - Peers must negotiate the KDF and the curve to interoperate: - Different
-///   KDFs produce different keys from the same inputs. - The curve choice
-///   affects ECDH operations. For example, Ed25519 signatures typically pair
-///   with X25519 for ECDH.
+/// - Peers must negotiate the KDF and the curve to interoperate. Different KDFs
+///   produce different keys from the same inputs, and the curve choice affects
+///   ECDH operations. For example, Ed25519 signatures typically pair with
+///   X25519 for ECDH.
 pub trait SecurityProfile {
 	/// Digest algorithm. A [`CryptoProvider`] for this profile MUST use this
 	/// type as its digest.
@@ -237,7 +235,7 @@ pub trait AeadProvider {
 	#[allow(clippy::type_complexity)]
 	fn as_key_wrapper_16<E>(&self) -> Box<dyn Fn(&[u8], &[u8; 16]) -> Result<Vec<u8>, E>>
 	where
-		E: From<HandshakeError>,
+		E: From<KeyError>,
 	{
 		impl_key_wrapper!(E, aes::Aes128, 16)
 	}
@@ -248,7 +246,7 @@ pub trait AeadProvider {
 	#[allow(clippy::type_complexity)]
 	fn as_key_wrapper_24<E>(&self) -> Box<dyn Fn(&[u8], &[u8; 24]) -> Result<Vec<u8>, E>>
 	where
-		E: From<HandshakeError>,
+		E: From<KeyError>,
 	{
 		impl_key_wrapper!(E, aes::Aes192, 24)
 	}
@@ -259,7 +257,7 @@ pub trait AeadProvider {
 	#[allow(clippy::type_complexity)]
 	fn as_key_wrapper_32<E>(&self) -> Box<dyn Fn(&[u8], &[u8; 32]) -> Result<Vec<u8>, E>>
 	where
-		E: From<HandshakeError>,
+		E: From<KeyError>,
 	{
 		impl_key_wrapper!(E, aes::Aes256, 32)
 	}
@@ -273,7 +271,7 @@ pub trait AeadProvider {
 	#[allow(clippy::type_complexity)]
 	fn as_key_unwrapper_16<E>(&self) -> Box<dyn Fn(&[u8], &[u8; 16]) -> Result<Vec<u8>, E>>
 	where
-		E: From<HandshakeError>,
+		E: From<KeyError>,
 	{
 		impl_key_unwrapper!(E, aes::Aes128, 16)
 	}
@@ -287,7 +285,7 @@ pub trait AeadProvider {
 	#[allow(clippy::type_complexity)]
 	fn as_key_unwrapper_24<E>(&self) -> Box<dyn Fn(&[u8], &[u8; 24]) -> Result<Vec<u8>, E>>
 	where
-		E: From<HandshakeError>,
+		E: From<KeyError>,
 	{
 		impl_key_unwrapper!(E, aes::Aes192, 24)
 	}
@@ -301,7 +299,7 @@ pub trait AeadProvider {
 	#[allow(clippy::type_complexity)]
 	fn as_key_unwrapper_32<E>(&self) -> Box<dyn Fn(&[u8], &[u8; 32]) -> Result<Vec<u8>, E>>
 	where
-		E: From<HandshakeError>,
+		E: From<KeyError>,
 	{
 		impl_key_unwrapper!(E, aes::Aes256, 32)
 	}
@@ -706,8 +704,8 @@ mod tests {
 		assert_eq!(desc.aead, Some(crate::crypto::aead::Aes128GcmOid::OID));
 	}
 
-	// The KDF and curve types carry the identifiers peers already negotiate,
-	// so the default descriptor keeps its wire values.
+	// The KDF and curve types carry the identifiers that peers negotiate, so
+	// the default descriptor names `HASH_SHA3_256` and `CURVE_SECP256K1`.
 	#[cfg(all(feature = "kdf", feature = "ecdh"))]
 	#[test]
 	fn the_default_profile_negotiates_its_kdf_and_curve_identifiers() {

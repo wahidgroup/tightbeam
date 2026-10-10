@@ -4,7 +4,7 @@ use core::str::FromStr;
 use std::sync::Arc;
 
 use crate::colony::cluster::runtime::bounds::GatewayRuntimeCtx;
-use crate::colony::cluster::{ClusterError, DialTarget};
+use crate::colony::cluster::DialTarget;
 use crate::colony::common::{reply_frame, RegisterHiveRequest, ServletAddressUpdate};
 use crate::colony::hive::{RegisterHiveResponse, ServletAddressUpdateResponse};
 use crate::instrumentation::events::{
@@ -29,15 +29,6 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 			return self.refuse_register(&frame, status);
 		}
 
-		// Each instance URN locator MUST equal its route address (CWE-639).
-		let locators_ok = request
-			.servlet_addresses
-			.iter()
-			.all(|info| self.config.namespace.locator_matches(info));
-		if !locators_ok {
-			return self.refuse_register(&frame, TransitStatus::PermissionDenied);
-		}
-
 		// Admit only a hive address that yields an exact hive identity URN.
 		let Some(hive_identity) = self.config.namespace.hive_from_bytes(&request.hive_addr) else {
 			return self.refuse_register(&frame, TransitStatus::PermissionDenied);
@@ -58,7 +49,12 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 			return self.refuse_register(&frame, TransitStatus::PermissionDenied);
 		};
 
-		let slate = self.config.pheromone.servlet_slate(&request.servlet_addresses, &hive_addr);
+		// The slate constructor owns the locator rule, so a servlet that
+		// advertises one address under another's identity refuses here.
+		let Ok(slate) = self.config.servlet_slate(&request.servlet_addresses, &hive_addr) else {
+			return self.refuse_register(&frame, TransitStatus::PermissionDenied);
+		};
+
 		// The membership step installs the hive entry and its full slate
 		// atomically, or rolls both back. A re-registration replaces the
 		// prior rows.
@@ -75,7 +71,7 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 			Err(error) => {
 				// Releasing the replay slot lets a legitimate retry of the
 				// same signed frame proceed.
-				self.refuse_register_release(&frame, refusal_status(&error))
+				self.refuse_register_release(&frame, error.transit_status())
 			}
 		}
 	}
@@ -113,7 +109,7 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 			Err(error) => {
 				// Releasing the replay slot lets the hive resend the same
 				// signed update.
-				self.refuse_update_release(&frame, refusal_status(&error))
+				self.refuse_update_release(&frame, error.transit_status())
 			}
 		}
 	}
@@ -158,17 +154,5 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 	fn refuse_update_release(&self, frame: &Frame, status: TransitStatus) -> Result<Option<Frame>, TightBeamError> {
 		self.replay_guard.release(frame);
 		self.refuse_update(frame, status)
-	}
-}
-
-/// The status a refused membership move answers with.
-///
-/// A poisoned registry is this gateway's fault, so the hive is told the
-/// gateway is unavailable rather than that it lacks the right to register.
-/// Every other refusal is a claim the gateway judged and denied.
-fn refusal_status(error: &ClusterError) -> TransitStatus {
-	match error {
-		ClusterError::LockPoisoned => TransitStatus::Unavailable,
-		_ => TransitStatus::PermissionDenied,
 	}
 }

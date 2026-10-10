@@ -24,17 +24,18 @@ use crate::{Frame, TightBeamError};
 
 /// Per-call context handed to every [`MuxService`] method.
 ///
-/// Bundles the connection's live [`SessionContext`] (pre-split peer
-/// identity plus the current receipt, so epoch renewals are observed
-/// rather than a stale handshake snapshot) with the stream's
-/// [`StreamRoute`] (the grpc-style dispatch target the initiator
-/// stamped on the Open). Handlers take only what they need through the
-/// accessors, so the struct grows without churning method signatures.
+/// It bundles two values, and a handler takes what it needs through the
+/// accessors, so the struct grows without a change to any method signature:
 ///
-/// Unary opens are unrouted today ([`CallContext::target`] is `None`):
-/// a unary frame self-describes its addressing in its payload, and no
-/// routed-unary initiator exists. Streaming and duplex opens carry the
-/// route a gateway reads to dispatch locally or splice to a peer.
+/// - The connection's live [`SessionContext`]: the peer identity and the current receipt, renewals included.
+/// - The stream's [`StreamRoute`]: the grpc-style dispatch target the initiator stamped on the Open.
+///
+/// # Routing
+///
+/// A unary open is unrouted, so [`CallContext::target`] is `None`: a unary
+/// frame states its addressing in its payload, and no initiator routes one.
+/// Streaming and duplex opens carry the route a gateway reads to dispatch
+/// locally or splice to a peer.
 pub struct CallContext {
 	session: SessionContext,
 	route: StreamRoute,
@@ -43,9 +44,10 @@ pub struct CallContext {
 impl CallContext {
 	/// Bundle a live session with the stream's route.
 	///
-	/// Public so an external [`MuxService`] implementation can build a
-	/// context in its own tests. The serving path assembles one per
-	/// dispatch. An unrouted call takes `StreamRoute::default()`.
+	/// The constructor is public so that an external [`MuxService`]
+	/// implementation can build a context in its own tests. The serving path
+	/// assembles one per dispatch. An unrouted call takes
+	/// `StreamRoute::default()`.
 	pub fn new(session: SessionContext, route: StreamRoute) -> Self {
 		Self { session, route }
 	}
@@ -99,8 +101,9 @@ pub trait MuxService: Send + Sync + 'static {
 	/// transport's collector gate.
 	///
 	/// # Errors
-	/// The failure closes the stream with a mapped status (see
-	/// [`MuxAcceptor::serve`]).
+	///
+	/// - [`TightBeamError`] -- the failure closes the stream with a mapped
+	///   status (see [`MuxAcceptor::serve`]).
 	///
 	/// [`MuxAcceptor::serve`]: crate::transport::multiplex::MuxAcceptor::serve
 	fn unary(
@@ -108,6 +111,7 @@ pub trait MuxService: Send + Sync + 'static {
 		frame: Frame,
 		cx: CallContext,
 	) -> impl Future<Output = Result<Option<Frame>, TightBeamError>> + Send {
+		// The default refuses this kind, so its inputs are dropped unread.
 		let _ = (frame, cx);
 		async { Err(TightBeamError::unimplemented()) }
 	}
@@ -117,8 +121,9 @@ pub trait MuxService: Send + Sync + 'static {
 	/// dispatch with no request frame (`None`). See [`GatePolicy`].
 	///
 	/// # Errors
-	/// The failure closes the stream with its mapped status (see
-	/// [`MuxAcceptor::serve`]).
+	///
+	/// - [`TightBeamError`] -- the failure closes the stream with its mapped
+	///   status (see [`MuxAcceptor::serve`]).
 	///
 	/// [`MuxAcceptor::serve`]: crate::transport::multiplex::MuxAcceptor::serve
 	fn streaming(
@@ -126,6 +131,7 @@ pub trait MuxService: Send + Sync + 'static {
 		body: StreamBody,
 		cx: CallContext,
 	) -> impl Future<Output = Result<Option<Frame>, TightBeamError>> + Send {
+		// The default refuses this kind, so its inputs are dropped unread.
 		let _ = (body, cx);
 		async { Err(TightBeamError::unimplemented()) }
 	}
@@ -135,8 +141,9 @@ pub trait MuxService: Send + Sync + 'static {
 	/// with no request frame (`None`). See [`GatePolicy`].
 	///
 	/// # Errors
-	/// The failure closes the stream with a mapped status (see
-	/// [`MuxAcceptor::serve`]).
+	///
+	/// - [`TightBeamError`] -- the failure closes the stream with a mapped
+	///   status (see [`MuxAcceptor::serve`]).
 	///
 	/// [`MuxAcceptor::serve`]: crate::transport::multiplex::MuxAcceptor::serve
 	fn duplex(
@@ -145,6 +152,7 @@ pub trait MuxService: Send + Sync + 'static {
 		reply: ReplySink,
 		cx: CallContext,
 	) -> impl Future<Output = Result<(), TightBeamError>> + Send {
+		// The default refuses this kind, so its inputs are dropped unread.
 		let _ = (body, reply, cx);
 		async { Err(TightBeamError::unimplemented()) }
 	}
@@ -168,9 +176,10 @@ where
 	}
 }
 
-/// [`MuxDispatch`] adapter running a [`MuxService`] behind the transport's
-/// collector gate: gated unary frames answer with the gate's status and never
-/// reach the service, and every invocation sees the live session receipt.
+/// A [`MuxDispatch`] adapter that runs a [`MuxService`] behind the transport's
+/// collector gate. A call that the gate refuses answers with the gate's status
+/// and stops short of the service, and every invocation sees the live session
+/// receipt.
 pub(crate) struct GatedService<S> {
 	service: Arc<S>,
 	gate: Box<dyn GatePolicy>,
@@ -185,7 +194,7 @@ impl<S> GatedService<S> {
 		Self { service: Arc::new(service), gate, snapshot, handle }
 	}
 
-	/// Session context with the live receipt, per invocation.
+	/// Returns the session context with the live receipt, built per invocation.
 	fn session(&self) -> SessionContext {
 		self.snapshot.with_live_receipt(self.handle.session_receipt())
 	}

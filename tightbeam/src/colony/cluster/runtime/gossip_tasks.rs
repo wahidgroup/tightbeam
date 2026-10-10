@@ -7,10 +7,8 @@
 //! # Planes
 //!
 //! - **Direct advertisement**: one signed frame goes to every verified target.
-//! - **Rumor flood**: the same signed frame, wrapped in a gossip rumor, reaches
-//!   members beyond direct reach.
-//! - **Pipeline**: an inbound rumor is admitted, rate-limited, journaled,
-//!   delivered locally, and reflooded.
+//! - **Rumor flood**: the same signed frame, wrapped in a gossip rumor, reaches members beyond direct reach.
+//! - **Pipeline**: an inbound rumor is admitted, rate-limited, journaled, delivered locally, and reflooded.
 //! - **Reconcile**: anti-entropy rounds repair missing rumors and learn peer-exchange hints.
 
 use core::hash::Hash;
@@ -25,7 +23,7 @@ use crate::colony::cluster::gossip::LocalClaimGuard;
 use crate::colony::cluster::peer::AdmittedPeerAd;
 use crate::colony::cluster::peer::ColonyCertificate;
 use crate::colony::cluster::runtime::bounds::{ClusterDigest, ClusterPool, GatewayRuntimeCtx};
-use crate::colony::cluster::runtime::hop::Hop;
+use crate::colony::cluster::runtime::hop::{Hop, PeerPlane};
 use crate::colony::cluster::runtime::refuse::Refusal;
 use crate::colony::cluster::runtime::{LoopFault, VerifiedSignerId};
 use crate::colony::cluster::{
@@ -87,15 +85,15 @@ impl GossipOrigin {
 }
 
 impl<P: Protocol> GatewayRuntimeCtx<P> {
-	/// The pool peers are dialed on.
+	/// The plane peers are dialed on.
 	///
 	/// A configured peer plane keeps peer traffic off the hive pool. With
 	/// no peer plane the hive pool serves both.
-	pub(crate) fn peer_dial_pool(&self) -> Arc<ClusterPool<P>> {
-		self.peer_pool
-			.as_ref()
-			.map(Arc::clone)
-			.unwrap_or_else(|| Arc::clone(&self.pool))
+	pub(crate) fn peer_dial_plane(&self) -> PeerPlane<P> {
+		match self.peer_plane.as_ref() {
+			Some(peer_plane) => peer_plane.clone(),
+			None => PeerPlane::new(Arc::clone(&self.pool), Arc::clone(&self.config)),
+		}
 	}
 }
 
@@ -165,8 +163,8 @@ impl ClusterConfig {
 
 	/// Creates, signs, and digests one advertisement rumor for the local slate.
 	///
-	/// Wraps a [`ClusterConfig::mint_ad_frame`] payload in a signed rumor
-	/// and extracts the digest and signer id for witness and reflood.
+	/// The method wraps a [`ClusterConfig::mint_ad_frame`] payload in a signed
+	/// rumor and extracts the digest and signer id for witness and reflood.
 	///
 	/// It returns [`None`] on a local fault (key, codec, or journal input).
 	/// The caller records it, and a later beat re-publishes fresh.
@@ -211,8 +209,7 @@ impl ClusterConfig {
 	///
 	/// - Admission requires an order inside the window, so the ad-order
 	///   tombstone covers every replay that reaches reconcile (CWE-294).
-	/// - A far-future order is refused, so every ledger row stays prunable
-	///   (CWE-770).
+	/// - A far-future order is refused, so every ledger row stays prunable (CWE-770).
 	fn ad_order_fresh(&self, order: UnixMillis, now: UnixMillis) -> bool {
 		now.abs_diff(order) <= self.control_freshness_window
 	}
@@ -242,13 +239,13 @@ impl GossipWant {
 	}
 }
 
-/// The peer pool outbound gossip floods and reconciles on.
+/// The peer plane outbound gossip floods and reconciles on.
 ///
 /// The advertise beat and the inbound reflood both reach peers through
 /// this one owner, so a rumor leaves on the same plane either way.
 struct GossipBeat<P: Protocol> {
 	config: Arc<ClusterConfig>,
-	peer_pool: Arc<ClusterPool<P>>,
+	peer_plane: PeerPlane<P>,
 	servlet_registry: Arc<ServletRegistry>,
 	trace: Arc<TraceCollector>,
 }
@@ -259,7 +256,7 @@ impl<P: Protocol> Clone for GossipBeat<P> {
 	fn clone(&self) -> Self {
 		Self {
 			config: Arc::clone(&self.config),
-			peer_pool: Arc::clone(&self.peer_pool),
+			peer_plane: self.peer_plane.clone(),
 			servlet_registry: Arc::clone(&self.servlet_registry),
 			trace: Arc::clone(&self.trace),
 		}
@@ -284,23 +281,27 @@ where
 		+ Sync
 		+ 'static,
 {
-	/// Refloods a still-live rumor to configured peers with a decremented TTL.
+	/// Refloods a still-live rumor to the dial targets with a decremented TTL.
 	///
 	/// Targets are anchors plus verified tried peers, so rumor bytes reach
 	/// verified identities only. Each target receives an owned clone of the
 	/// signed frame because emit consumes the frame.
+	///
+	/// # Re-encoding
+	///
+	/// Embedding the decoded rumor re-encodes it. DER is canonical (ITU-T X.690
+	/// §10), so the bytes equal the received bytes, and the origin signature
+	/// and the witness digest survive the hop. Splicing pre-encoded bytes would
+	/// need an opaque passthrough field in the codec, a redesign that buys no
+	/// correctness.
 	async fn reflood<D: ClusterDigest>(&self, rumor: Frame, ttl: u64) -> Result<(), LoopFault> {
 		let targets = self.config.peer.table.target_set()?;
 		if targets.is_empty() {
 			return Ok(());
 		}
 
-		// Embedding the decoded rumor re-encodes it, which is byte-identical
-		// to the received bytes because DER is canonical (ITU-T X.690 §10).
-		//
-		// The origin signature and witness digest therefore survive the hop.
-		// Splicing pre-encoded bytes would need an opaque passthrough field
-		// in the codec, a redesign that buys no correctness.
+		// The rumor re-encodes to the bytes that arrived, so the origin
+		// signature still verifies at the next hop.
 		let request = ClusterRequest::Gossip(Box::new(rumor));
 		let mut signed_frame = match FrameBuilder::from(Version::V2)
 			.with_id(b"gossip-reflood")
@@ -335,12 +336,12 @@ where
 				continue;
 			};
 
-			let dial_pool = Arc::clone(&self.peer_pool);
+			let dial_plane = self.peer_plane.clone();
 			// Each emit consumes an owned frame, so a fan-out to N targets
 			// needs N owned frames. The clone is that fan-out cost.
 			let frame = signed_frame.clone();
 			fanout.spawn(async move {
-				let Ok(mut client) = dial_pool.connect(peer_addr).await else {
+				let Ok(mut client) = dial_plane.connect_unbound(peer_addr).await else {
 					return false;
 				};
 
@@ -348,10 +349,9 @@ where
 			});
 		}
 
-		// One peer being down must not stop the flood to the peers that are
-		// up, so a hop that fails is counted rather than returned. A task
-		// that could not be joined did not reach its peer either, which is
-		// why both fold into the same count.
+		// A down peer must not stop the flood to the live ones, so a failed hop
+		// is counted rather than returned. A task that did not join reached no
+		// peer either, so it folds into the same count.
 		while let Some(joined) = fanout.join_next().await {
 			if !joined.unwrap_or(false) {
 				unreached += 1;
@@ -374,7 +374,7 @@ where
 		peer_addr: P::Address,
 		signed_frame: Frame,
 	) -> Result<TransitStatus, ClusterError> {
-		let mut client = self.peer_pool.connect(peer_addr).await?;
+		let mut client = self.peer_plane.connect_unbound(peer_addr).await?;
 		let response = client.emit(signed_frame, None).await?.ok_or(ClusterError::NoResponse)?;
 
 		let decoded: PeerAdvertisementResponse = decode(response.message())?;
@@ -389,9 +389,14 @@ where
 	///
 	/// # Journal
 	///
-	/// The published digest is witnessed for dedup only. Advertisements are
-	/// ephemeral hints that re-publish keeps fresh, and the origin already
-	/// holds the slate it published.
+	/// - The published digest is witnessed for dedup only, so the origin's own echo dedups.
+	/// - Retention serves repair and retry, which advertisements forgo. They
+	///   are ephemeral hints that re-publish keeps fresh, and the origin
+	///   already holds the slate it published.
+	/// - A journal that refuses the witness leaves this gateway able to
+	///   re-admit its own echo. The rumor is already created, so the beat
+	///   traces [`CLUSTER_GOSSIP_WITNESS_REFUSED`] and floods the live rumor
+	///   anyway.
 	///
 	/// # Failures
 	///
@@ -409,12 +414,8 @@ where
 			return Ok(false);
 		};
 
-		// Witness the published digest so the origin's own echo dedups.
-		// Retention serves repair and retry, which advertisements forgo.
-		// A journal that refuses the witness leaves this gateway able to
-		// re-admit its own echo. The rumor is already created, so the beat
-		// records the refusal and floods anyway rather than dropping a rumor
-		// that is live.
+		// The rumor is already live, so a refused witness is recorded and the
+		// flood goes ahead.
 		if self
 			.config
 			.gossip
@@ -454,7 +455,7 @@ where
 	///
 	/// - A local fault before the emit or inside the post-reply scope skips scoring.
 	/// - An oversized reply or a dial failure returns `Err` for peer scoring.
-	/// - A peer outside the colony leaves the peer table at once.
+	/// - A peer outside the colony leaves the peer table at once, and the routes that dial it leave.
 	async fn reconcile_round<D: ClusterDigest>(
 		&self,
 		peer_addr: P::Address,
@@ -471,8 +472,7 @@ where
 		// STRING bytes, so each fixed-size digest copies once here.
 		let held: Vec<Vec<u8>> = held_digests.iter().map(|digest| digest.to_vec()).collect();
 
-		let mut client = self.peer_pool.connect(peer_addr).await?;
-
+		let mut client = self.peer_plane.connect_unbound(peer_addr).await?;
 		// A feeler probe reconciles on a cold connection whose handshake
 		// defers to first emit. Completing it here is the only way to learn
 		// peer identity before the reconcile discloses anything (CWE-668).
@@ -484,10 +484,14 @@ where
 			.peer_certificate()
 			.and_then(|cert| self.config.namespace.cert_colony_urn(cert));
 		if peer_colony.as_ref() != self.config.colony_urn() {
-			// A definitive foreign identity leaves both learned tables at
-			// once. Waiting out the failure threshold would keep advertising
-			// to a peer that re-keyed outside the colony.
+			// A foreign identity is definitive, so the address leaves both
+			// learned tables at once. Every route that dials it leaves too,
+			// whether a table held the address or not, because a slate
+			// installs before any probe verifies the socket it claims
+			// (CWE-668).
 			self.config.peer.table.expel(peer)?;
+			self.servlet_registry.withdraw_peer_by_dial(peer.address())?;
+
 			return Ok(());
 		}
 
@@ -513,13 +517,13 @@ where
 		if signing.is_err() {
 			return Ok(());
 		}
+
 		let response = client.emit(signed_frame, None).await?.ok_or(ClusterError::NoResponse)?;
 		let reply: GossipWant = decode(response.message())?;
 
-		// An oversized want-list or PEX sample is abuse, so the round fails
-		// (CWE-770). The beat then scores the peer like any failed round, so an
-		// abuser is discarded from `new` or counted toward eviction from
-		// `tried`.
+		// An oversized reply fails the round (CWE-770). The beat scores it like
+		// any failed round, so an abuser is discarded from `new` or counted
+		// toward eviction from `tried`.
 		if reply.is_oversized() {
 			return Err(ClusterError::OversizedReconcileReply);
 		}
@@ -527,7 +531,6 @@ where
 		// The decoded, in-bounds reply already proves liveness, so a fault in
 		// the bookkeeping below leaves the peer scored on its answer.
 		let local_round = self.settle_round::<D>(&mut client, reply, acked, peer, now).await;
-
 		// The round already succeeded, so a local fault in the bookkeeping
 		// skips the rest of the round without charging the peer. The next
 		// beat retries the skipped bookkeeping and repair.
@@ -550,10 +553,9 @@ where
 		now: UnixMillis,
 	) -> Result<(), ClusterError> {
 		let round: Result<(), ClusterError> = async {
-			// Promotion waits for the reply because a pooled connection keeps
-			// its handshake certificate after the peer dies. Promoting on the
-			// gate alone would reset the failure count every beat, holding a
-			// dead peer in the table.
+			// A pooled connection keeps its handshake certificate after the
+			// peer dies, so promotion waits for the reply. The gate alone would
+			// reset the failure count every beat and hold a dead peer.
 			let peer_id = client.peer_certificate().and_then(ColonyCertificate::fingerprint_id);
 			if self.config.peer.table.promote(peer, peer_id.as_deref(), now)? {
 				self.trace
@@ -596,7 +598,12 @@ where
 	/// `ad_frame` is the single signed advertisement this beat created, so
 	/// one signature serves every dial. A failed round counts toward
 	/// eviction, so a dead tried peer frees its bucket slot at the
-	/// threshold.
+	/// threshold and the routes that dial it leave the registry.
+	///
+	/// # Lock order
+	///
+	/// The table guard is released inside `record_failure` before the route
+	/// lock is taken in `withdraw_peer_by_dial`, so the two locks never nest.
 	async fn dial_targets<D: ClusterDigest>(
 		&self,
 		targets: impl AsRef<[AdmittedDial]>,
@@ -614,11 +621,9 @@ where
 			};
 
 			if let Some(frame) = ad_frame {
-				// The dial consumes both arguments. The address serves the
-				// reconcile below again, and the frame serves every
-				// remaining target. A dial that fails is the peer's answer,
-				// and the reconcile round below scores it, so the status is
-				// not read here.
+				// Both arguments clone, because the reconcile below reuses the
+				// address and each later target reuses the frame. The reconcile
+				// round scores a failed dial, so the status goes unread.
 				let _advertised = self.send_advertisement(peer_addr.clone(), frame.clone()).await;
 			}
 
@@ -630,12 +635,24 @@ where
 			// address clone costs less than a second lookup.
 			let acked = push_ledger.entry(*peer).or_default();
 			let round = self.reconcile_round::<D>(peer_addr, acked, *peer).await;
-			if round.is_err() && self.config.peer.table.record_failure(*peer)? {
-				trace
-					.event(CLUSTER_PEER_EVICTED)?
-					.with_payload(peer.address().route_bytes().as_ref())
-					.emit();
+			if round.is_ok() {
+				continue;
 			}
+
+			let evicted = self.config.peer.table.record_failure(*peer)?;
+			if !evicted {
+				continue;
+			}
+
+			// The routes that dial the evicted address leave before the
+			// eviction event is emitted, so an observer of the event finds
+			// none of them.
+			self.servlet_registry.withdraw_peer_by_dial(peer.address())?;
+
+			trace
+				.event(CLUSTER_PEER_EVICTED)?
+				.with_payload(peer.address().route_bytes().as_ref())
+				.emit();
 		}
 
 		Ok(())
@@ -752,23 +769,24 @@ pub(crate) struct GossipPipelineCtx<P: Protocol> {
 	pub(crate) config: Arc<ClusterConfig>,
 	/// The connection pool that local ingress delivery dials on.
 	pub(crate) pool: Arc<ClusterPool<P>>,
-	/// The peer dial pool, resolved once from the gateway's planes.
-	pub(crate) peer_pool: Arc<ClusterPool<P>>,
+	/// The peer dial plane, resolved once from the gateway's planes.
+	pub(crate) peer_plane: PeerPlane<P>,
 	/// The trace collector for gossip admission and refusal events.
 	pub(crate) trace: Arc<TraceCollector>,
-	/// The owner of the reflood that this pipeline starts.
+	/// The gateway's task group, which owns the reflood this pipeline starts,
+	/// so stopping the gateway stops a reflood still dialling.
 	pub(crate) tasks: TaskGroup,
 }
 
 impl<P: Protocol> From<GatewayRuntimeCtx<P>> for GossipPipelineCtx<P> {
 	/// Projects the gateway's runtime state onto what a rumor needs.
 	fn from(ctx: GatewayRuntimeCtx<P>) -> Self {
-		let peer_pool = ctx.peer_dial_pool();
+		let peer_plane = ctx.peer_dial_plane();
 
 		Self {
 			servlet_registry: ctx.servlet_registry,
 			config: ctx.config,
-			peer_pool,
+			peer_plane,
 			pool: ctx.pool,
 			trace: ctx.trace,
 			tasks: ctx.tasks,
@@ -797,10 +815,10 @@ where
 	/// Delivers one admitted rumor payload to the configured local ingress
 	/// servlet.
 	///
-	/// The claim is taken before the round trip and owned by a guard, so
-	/// the admission path and the reconcile beat never deliver one rumor
-	/// twice (CWE-362), and a delivery this task never finishes returns
-	/// the rumor to the retry set rather than stranding it.
+	/// The claim is taken before the round trip and owned by a guard, so the
+	/// admission path and the reconcile beat never deliver one rumor twice
+	/// (CWE-362). A delivery this task never finishes returns the rumor to the
+	/// retry set rather than stranding it.
 	async fn deliver_local(&self, payload: impl Into<Vec<u8>>, digest_value: GossipDigest) -> Result<(), LoopFault> {
 		let payload: Vec<u8> = payload.into();
 		let journal = &self.config.gossip.journal;
@@ -976,16 +994,15 @@ where
 
 		let flood = GossipBeat {
 			config: Arc::clone(&self.config),
-			peer_pool: Arc::clone(&self.peer_pool),
+			peer_plane: self.peer_plane.clone(),
 			servlet_registry: Arc::clone(&self.servlet_registry),
 			trace: Arc::clone(&self.trace),
 		};
 		let GossipPipelineCtx { tasks, .. } = self;
 
 		// The reflood runs on its own task so the Ok reply below returns at
-		// this gateway's pace. The gateway's group owns it, so stopping the
-		// gateway stops a reflood still dialling. The rumor moves into the task
-		// unchanged, and the reply only needs the outer frame id.
+		// this gateway's pace. The rumor moves into the task unchanged, and the
+		// reply only needs the outer frame id.
 		if hop_ttl > 0 && has_targets {
 			let next_ttl = hop_ttl - 1;
 			tasks.spawn(async move {
@@ -1014,8 +1031,7 @@ where
 	/// 3. Reject a stale or far-future control order.
 	/// 4. Admit through [`AdmittedPeerAd::admit`].
 	/// 5. Learn the discovery hint and reconcile the direct slate.
-	/// 6. Install a best-effort relay trail when the hop budget and the relay's
-	///    dial address allow.
+	/// 6. Install a best-effort relay trail when the hop budget and the relay's dial address allow.
 	fn try_apply_peer_ad_rumor(
 		&self,
 		relay_id: Option<VerifiedSignerId>,
@@ -1027,8 +1043,8 @@ where
 		};
 
 		let payload = payload.as_ref();
-		// `decode` borrows through `AsRef`, so the extra reference is the
-		// signature's requirement, not an indirection slip.
+		// `decode` borrows through `AsRef`, so its signature requires the extra
+		// reference.
 		let Ok(inner) = decode::<Frame>(&payload) else {
 			return Ok(None);
 		};
@@ -1043,10 +1059,9 @@ where
 			return Ok(None);
 		}
 
-		// The direct path bounds the control order through its replay guard.
-		// The rumor path applies the same bound here, so every admitted order
-		// falls inside the withdrawal tombstone's window (CWE-294) and inside
-		// the ledger's prunable range (CWE-770).
+		// The rumor path applies the direct path's order bound here, so every
+		// admitted order falls inside the withdrawal tombstone's window
+		// (CWE-294) and the ledger's prunable range (CWE-770).
 		if !self.config.ad_order_fresh(inner.issued_at(), self.config.clock.unix()) {
 			return Ok(None);
 		}
@@ -1060,11 +1075,9 @@ where
 
 		let origin = Arc::clone(&admitted.peer_hive_id);
 
-		// The relay hop that delivered this rumor is itself a verified peer.
-		// A trail installs under its own bucket beside the direct trail when
-		// this gateway may spend the two forwards a relay needs and the
-		// relay's dial address is known, which is exactly when pheromone can
-		// fail over to it (CWE-772).
+		// The relay hop that delivered this rumor is itself a verified peer, so
+		// its trail can install under its own bucket beside the direct one
+		// (CWE-772).
 		let relay_trail = relay_id.filter(|_| self.config.peer.max_hops >= 2).and_then(|relay_id| {
 			let relay_socket = self.servlet_registry.relay_dial_addr(relay_id.as_shared())?;
 			let relay_dial = self.config.peer.admit_dial(relay_socket).ok()?;
@@ -1085,10 +1098,9 @@ where
 			Err(_) => return Ok(None),
 		}
 
-		// Fallback install is best-effort. The direct trail already
-		// landed, and a refused relay bucket (caps or a stale order) only
-		// forfeits the fallback path. The refusal still traces, so a
-		// missing fallback is diagnosable (ISO 27001 A.8.15).
+		// The direct trail already landed, so a refused relay bucket (caps or a
+		// stale order) forfeits the fallback path alone. The refusal still
+		// traces, so a missing fallback is diagnosable (ISO 27001 A.8.15).
 		if let Some(trail) = relay_trail {
 			match self.servlet_registry.reconcile_relay_trail(trail, PeerCaps::default()) {
 				Ok(()) => {}
@@ -1120,8 +1132,10 @@ where
 	/// # Reconciliation
 	///
 	/// - Slate reconciliation installs a direct trail that dials the origin.
-	/// - When `max_hops` affords relay forwarding and the relaying peer is
-	///   known, a relay trail installs beside the direct trail as fallback.
+	/// - When `max_hops` affords the two forwards a relay needs and the
+	///   relaying peer's dial address is known, a relay trail installs beside
+	///   the direct trail as fallback. That is exactly when pheromone can fail
+	///   over to it (CWE-772).
 	/// - Registry policy refuses a slate that collides with a local route,
 	///   including this gateway's own echoed slate.
 	///
@@ -1199,12 +1213,10 @@ where
 ///
 /// # Claim lifecycle
 ///
-/// 1. [`Self::take_due`] claims a publish slot and blocks re-entry while
-///    the task runs.
+/// 1. [`Self::take_due`] claims a publish slot and blocks re-entry while the task runs.
 /// 2. The claiming task creates and refloods the rumor.
 /// 3. [`Self::commit`] records the baseline after a rumor went out.
-/// 4. [`Self::abort`] releases a failed claim with the old baseline
-///    intact, so the next beat retries.
+/// 4. [`Self::abort`] releases a failed claim with the old baseline intact, so the next beat retries.
 ///
 /// [`DEFAULT_AD_RUMOR_REFRESH_MS`]:
 /// crate::constants::DEFAULT_AD_RUMOR_REFRESH_MS
@@ -1307,7 +1319,7 @@ where
 		let delivery = GossipPipelineCtx::from(self.clone());
 		let beat = GossipBeat {
 			config: Arc::clone(&self.config),
-			peer_pool: self.peer_dial_pool(),
+			peer_plane: self.peer_dial_plane(),
 			servlet_registry: Arc::clone(&self.servlet_registry),
 			trace: Arc::clone(&self.trace),
 		};
@@ -1350,10 +1362,8 @@ where
 
 					let slate = beat.exported_slate()?;
 
-					// The slate also floods as an origin-signed rumor, so
-					// members beyond direct reach learn it. The publish runs on
-					// its own task so the direct advertisements below dial at
-					// this gateway's pace.
+					// The rumor publish runs on its own task, so the direct
+					// advertisements below dial at this gateway's pace.
 					let now = config.clock.unix();
 					if config.colony_urn().is_some() && ad_publish.take_due(now, &slate, &targets) {
 						let publish_state = Arc::clone(&ad_publish);
@@ -1369,10 +1379,8 @@ where
 							let published =
 								publish_beat.publish_slate_rumor::<D>(publish_addr, publish_slate.clone()).await;
 
-							// A publish that faulted releases its claim, so
-							// the next beat retries it. A poisoned table is
-							// recorded, because this task has no other
-							// observer.
+							// A poisoned table is recorded here, because this
+							// task has no other observer.
 							match published {
 								Ok(true) => {
 									publish_state.commit(
@@ -1390,11 +1398,9 @@ where
 						});
 					}
 
-					// One frame and one signature serve every direct target,
-					// and each dial takes a clone of the signed frame. The
-					// build moves the slate in, because this is its last use in
-					// the beat. A frame that fails to build skips this beat's
-					// direct advertisements, and the next beat builds another.
+					// The build takes the slate, which the beat is done with. A
+					// frame that fails to build skips this beat's direct
+					// advertisements, and the next beat builds another.
 					let mut ad_frame = None;
 					if !targets.is_empty() {
 						ad_frame = config.mint_ad_frame::<D>(gateway_addr.as_ref(), slate).await.ok();

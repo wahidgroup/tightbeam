@@ -29,6 +29,8 @@ use crate::utils::time::Clock;
 
 #[cfg(feature = "aead")]
 use crate::crypto::aead::{RecvCipher, SendCipher};
+#[cfg(host_clock)]
+use crate::utils::time::SystemClock;
 // Named only by `emit_handshake_outcome`, so this carries that method's gate.
 #[cfg(all(
 	feature = "instrument",
@@ -45,8 +47,6 @@ use crate::trace::TraceCollector;
 	any(feature = "transport-cms", feature = "transport-ecies")
 ))]
 mod deadline {
-	pub use core::time::Duration;
-
 	pub use tokio::time::timeout;
 }
 
@@ -105,32 +105,6 @@ mod x509 {
 #[cfg(feature = "x509")]
 use x509::*;
 
-/// Remaining allowance before the handshake deadline elapses.
-///
-/// - A fresh handshake receives the full configured timeout.
-/// - An in-flight handshake receives the unexpired remainder of its deadline.
-#[cfg(all(
-	feature = "tokio",
-	feature = "std",
-	not(target_arch = "wasm32"),
-	any(feature = "transport-cms", feature = "transport-ecies")
-))]
-fn remaining_handshake_deadline<T: EncryptedProtocolState + MessageIO>(state: &T) -> Duration {
-	let allowance = state.to_handshake_timeout();
-	let Some(initiated_at) = state.session_state().phase().initiated_at() else {
-		return allowance;
-	};
-
-	// A deadline past every reading never arrives, so the full allowance
-	// stands.
-	let Some(deadline) = initiated_at.checked_add(allowance) else {
-		return allowance;
-	};
-
-	let now = state.clock().monotonic();
-	deadline.saturating_duration_since(now)
-}
-
 /// Receive side of a split envelope link.
 ///
 /// The trait decouples the
@@ -146,7 +120,7 @@ pub trait EnvelopeSource: MaybeSend {
 	///   failure, or a decrypt failure on an encrypting link.
 	fn read_envelope(&mut self) -> impl Future<Output = TransportResult<TransportEnvelope>> + MaybeSend;
 
-	/// The number of envelopes still readable before the link demands a
+	/// Returns the number of envelopes still readable before the link demands a
 	/// rekey.
 	///
 	/// The count tracks the peer's send counter on the ordered channel, so a
@@ -172,8 +146,8 @@ pub trait EnvelopeSource: MaybeSend {
 		Err(TransportError::MissingEncryption)
 	}
 
-	/// Instrumentation collector inherited from the connection this half
-	/// was split from. Planes assembled over the half (mux) adopt it.
+	/// Returns the instrumentation collector inherited from the connection this
+	/// half was split from. Planes assembled over the half (mux) adopt it.
 	#[cfg(feature = "instrument")]
 	fn trace(&self) -> Option<TraceCollector> {
 		None
@@ -190,7 +164,7 @@ pub trait EnvelopeSink: MaybeSend {
 	///   failure, or an encrypt failure on an encrypting link.
 	fn write_envelope(&mut self, envelope: TransportEnvelope) -> impl Future<Output = TransportResult<()>> + MaybeSend;
 
-	/// The number of envelopes still writable before the link demands a
+	/// Returns the number of envelopes still writable before the link demands a
 	/// rekey.
 	///
 	/// A link without keys never rekeys and reports `u64::MAX`.
@@ -212,11 +186,19 @@ pub trait EnvelopeSink: MaybeSend {
 		Err(TransportError::MissingEncryption)
 	}
 
-	/// Instrumentation collector inherited from the connection this half
-	/// was split from. Planes assembled over the half (mux) adopt it.
+	/// Returns the instrumentation collector inherited from the connection this
+	/// half was split from. Planes assembled over the half (mux) adopt it.
 	#[cfg(feature = "instrument")]
 	fn trace(&self) -> Option<TraceCollector> {
 		None
+	}
+
+	/// Returns the clock inherited from the connection this half was split
+	/// from. Planes assembled over the half (mux) adopt it, so one endpoint
+	/// reads one clock. A link that carries none reads the system clock.
+	#[cfg(host_clock)]
+	fn clock(&self) -> Arc<dyn Clock> {
+		Arc::new(SystemClock)
 	}
 }
 
@@ -226,15 +208,22 @@ pub trait EnvelopeSink: MaybeSend {
 /// code such as accept loops and single-flight serving can hold them across
 /// task spawns. On wasm targets the bound is vacuous.
 pub trait MessageIO {
-	/// The clock this transport measures deadlines and backoff against.
+	/// Returns the clock that this transport measures deadlines and backoff
+	/// against.
 	fn clock(&self) -> &dyn Clock;
 
 	/// Read raw DER-encoded envelope bytes from the transport.
+	///
+	/// A read while a handshake is pending MUST admit at most the cap of
+	/// [`SessionPhase::read_policy`], because the handshake driver relies on
+	/// that bound.
 	///
 	/// # Errors
 	///
 	/// - [`TransportError::ConnectionClosed`] -- the peer closed the stream.
 	/// - The transport's own read failure.
+	///
+	/// [`SessionPhase::read_policy`]: crate::transport::state::SessionPhase::read_policy
 	fn read_envelope_bytes(&mut self) -> impl Future<Output = TransportResult<Vec<u8>>> + MaybeSend;
 
 	/// Write raw DER-encoded envelope bytes to the transport.
@@ -323,10 +312,11 @@ pub trait MessageIO {
 	any(feature = "transport-cms", feature = "transport-ecies")
 ))]
 pub enum CollectStep {
-	/// Cleartext handshake container to feed the server-side dispatcher,
-	/// decoded once with the bytes it arrived as.
+	/// The step read a cleartext handshake container for the server-side
+	/// dispatcher, decoded once with the bytes it arrived as.
 	Handshake(HandshakeMessage),
-	/// Decrypted (or legitimately cleartext) application envelope.
+	/// The step read a decrypted, or legitimately cleartext, application
+	/// envelope.
 	Envelope(TransportEnvelope),
 }
 
@@ -672,12 +662,9 @@ pub trait EncryptedMessageIO: MessageIO {
 			return Err(TransportError::InvalidState);
 		}
 
-		// Step 2: Receive the server response.
+		// Step 2: Receive the server response. The read runs under the
+		// handshake ceiling, because the phase is handshaking.
 		let response_wire_bytes = self.read_session_bytes().await?;
-		if response_wire_bytes.len() > self.limits().handshake_wire {
-			return Err(TransportError::InvalidMessage);
-		}
-
 		let response_wire = WireEnvelope::from_der(&response_wire_bytes)?;
 		let response_envelope = match response_wire {
 			WireEnvelope::Cleartext(env) => env,
@@ -687,12 +674,8 @@ pub trait EncryptedMessageIO: MessageIO {
 			}
 		};
 
-		let response = HandshakeMessage::try_from(response_envelope)?;
-		if response.der().len() > self.limits().handshake_wire {
-			return Err(TransportError::InvalidMessage);
-		}
-
 		// Step 3: Handle the server response, which may yield the next message.
+		let response = HandshakeMessage::try_from(response_envelope)?;
 		let next_message = orchestrator.handle_response(response).await?;
 
 		// Step 4: Send the next message, if any, for a multi-round handshake.
@@ -747,11 +730,11 @@ pub trait EncryptedMessageIO: MessageIO {
 		outcome
 	}
 
-	/// The server configuration every protocol shares, around the settings of
-	/// flow `F`.
+	/// Returns the server configuration that every protocol shares, around the
+	/// settings of flow `F`.
 	///
-	/// The server runs the one profile its provider names, so the profile
-	/// list is never empty.
+	/// The server runs the one profile its provider names, so the profile list
+	/// always holds that profile.
 	///
 	/// # Errors
 	///
@@ -904,12 +887,12 @@ pub trait EncryptedMessageIO: MessageIO {
 
 		#[cfg(all(feature = "tokio", feature = "std", not(target_arch = "wasm32")))]
 		let outcome = {
-			let remaining = remaining_handshake_deadline(self);
-			if remaining.is_zero() {
-				return Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded));
+			let now = self.clock().monotonic();
+			let policy = self.session_state().phase().read_policy(self.limits(), now);
+			match policy.remaining(now)? {
+				Some(remaining) => timeout(remaining, self.drive_server_handshake(request)).await?,
+				None => self.drive_server_handshake(request).await,
 			}
-
-			timeout(remaining, self.drive_server_handshake(request)).await?
 		};
 
 		#[cfg(not(all(feature = "tokio", feature = "std", not(target_arch = "wasm32"))))]
@@ -976,7 +959,7 @@ pub trait EncryptedMessageIO: MessageIO {
 }
 
 impl TransportEnvelope {
-	/// The application request frame inside a single-flight envelope.
+	/// Returns the application request frame inside a single-flight envelope.
 	///
 	/// # Errors
 	///
@@ -1044,7 +1027,7 @@ mod tests {
 
 	#[cfg(feature = "aead")]
 	impl ClosedStreamProbe {
-		/// A provisioned endpoint placed directly in `phase`.
+		/// Returns a provisioned endpoint placed directly in `phase`.
 		fn at(phase: SessionPhase) -> Self {
 			let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator);
 			let peer_authentication = PeerAuthentication::mutual([validator]);

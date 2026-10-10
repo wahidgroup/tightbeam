@@ -44,7 +44,9 @@ use tightbeam::{
 	tb_assert_spec, tb_process_spec, tb_scenario,
 	testing::{ScenarioConfig, SetupEnv},
 	trace::TraceCollector,
-	transport::handshake::{negotiation::SecurityOffer, ClientKeyExchange, Handshake, PeerAuthentication},
+	transport::handshake::{
+		negotiation::SecurityOffer, ClientKeyExchange, Handshake, HandshakeError, PeerAuthentication,
+	},
 	utils::urn::Urn,
 	TightBeamError,
 };
@@ -57,13 +59,14 @@ use crate::common::security::{
 pub(crate) const SPLICED_KEX_REJECTED: Urn<'static> =
 	tightbeam::urn!("test", "event:splice-attack/spliced-kex-rejected");
 
-/// The attacker's view of the DER key-exchange plaintext. The two leading
+/// The attacker's view of the DER key-exchange plaintext. The three leading
 /// OCTET STRINGs are all a splice needs, because this unmetered session
 /// carries no trailing receipt acknowledgement.
 #[derive(Sequence)]
 struct SplicedPayload {
 	base_key: OctetString,
 	client_random: OctetString,
+	key_confirmation: OctetString,
 }
 
 tb_assert_spec! {
@@ -148,12 +151,13 @@ job! {
 		.to_insecure();
 
 		// The attacker forges a payload with its own key under the server's
-		// public key and splices it into the victim's message, preserving
-		// the victim's client_random and the DER framing.
+		// public key and splices it into the victim's message. The splice keeps
+		// the victim's client_random, key-confirmation tag, and DER framing.
 		let victim_payload = SplicedPayload::from_der(&victim_plain)?;
 		let forged_payload = SplicedPayload {
 			base_key: OctetString::new([0x41u8; 32])?, // attacker-chosen key
 			client_random: victim_payload.client_random,
+			key_confirmation: victim_payload.key_confirmation,
 		};
 
 		let forged_plain = forged_payload.to_der()?;
@@ -176,10 +180,14 @@ job! {
 			return Err(expectation_failure("splice produced identical ClientKeyExchange bytes"));
 		}
 
+		// The possession signature is the control, so the refusal must name
+		// it. Any later check, the key confirmation among them, would refuse
+		// this splice as well and prove nothing about the signature.
 		match server.finish(carried_closing(&spliced)).await {
-			Err(_) => {
+			Err(HandshakeError::SignatureError(_)) => {
 				trace.event(SPLICED_KEX_REJECTED)?;
 			}
+			Err(_) => return Err(expectation_failure("the splice was refused by a check after the possession signature")),
 			Ok(_) => return Err(expectation_failure("server accepted a spliced key exchange under victim identity")),
 		}
 

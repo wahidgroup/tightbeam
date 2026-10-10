@@ -85,7 +85,7 @@ mod handshake {
 	pub use crate::crypto::hash::Digest;
 	pub use crate::crypto::key::SigningKeyProvider;
 	pub use crate::crypto::sign::{LowSEncoding, PrehashVerifier};
-	pub use crate::crypto::x509::utils::{compute_signer_identifier, compute_signer_identifier_from_der};
+	pub use crate::crypto::x509::utils::Skid;
 	pub use crate::der::asn1::{ObjectIdentifier, SetOfVec};
 	pub use crate::der::oid::AssociatedOid;
 	pub use crate::der::{Any, Decode, Encode};
@@ -106,7 +106,7 @@ use handshake::*;
 mod owners;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-pub(crate) use owners::{IssuedReceipt, PendingReceipt};
+pub(crate) use owners::{CountersignedReceipt, IssuedReceipt, PendingReceipt};
 
 #[cfg(feature = "x509")]
 mod x509 {
@@ -332,7 +332,7 @@ where
 	let prehash = signed_attrs_prehash::<D>(&signed_attrs)?;
 	let signature_bytes = key_provider.sign_prehash(&prehash).await?;
 	let public_key_der = key_provider.to_public_key_bytes().await?;
-	let sid = compute_signer_identifier_from_der(&public_key_der)?;
+	let sid = SignerIdentifier::try_from(Skid::of_public_key(public_key_der))?;
 
 	// SubjectKeyIdentifier identification demands SignerInfo version 3
 	// (RFC 5652 §5.3).
@@ -374,7 +374,8 @@ where
 		EncapsulatedContentInfo { econtent_type: SESSION_RECEIPT_CONTENT, econtent: Some(econtent) };
 	let signer_infos = SignerInfos(SetOfVec::try_from(vec![server_signer])?);
 
-	// Non-id-data eContentType demands SignedData version 3 (RFC 5652 §5.1).
+	// An eContentType other than id-data demands SignedData version 3
+	// (RFC 5652 §5.1).
 	let artifact = SignedData {
 		version: CmsVersion::V3,
 		digest_algorithms,
@@ -484,7 +485,7 @@ impl StoredReceipt {
 			.signer_for_role(server_role)?
 			.ok_or(HandshakeError::ReceiptMissing)?;
 
-		let server_sid = compute_signer_identifier(server_key)?;
+		let server_sid = SignerIdentifier::try_from(Skid::of_public_key(server_key.to_public_key_der()?))?;
 		receipt.verify_signer::<D, S, V>(server_signer, server_role, &server_sid, server_key)?;
 
 		let client_role = ReceiptRole::Client;
@@ -493,7 +494,7 @@ impl StoredReceipt {
 			.signer_for_role(client_role)?
 			.ok_or(HandshakeError::CountersignatureMissing)?;
 
-		let client_sid = compute_signer_identifier(client_key)?;
+		let client_sid = SignerIdentifier::try_from(Skid::of_public_key(client_key.to_public_key_der()?))?;
 		receipt.verify_signer::<D, S, V>(client_signer, client_role, &client_sid, client_key)?;
 
 		Ok(())
@@ -502,7 +503,8 @@ impl StoredReceipt {
 
 /// Length-only stand-in for settlement-answer bytes in `Debug` output.
 ///
-/// The answer is a bearer secret. Only presence and length may reach logs.
+/// The answer is a bearer secret, so only its presence and its length may
+/// reach logs.
 struct RedactedResponse(usize);
 
 impl fmt::Debug for RedactedResponse {
@@ -655,7 +657,7 @@ impl fmt::Debug for SessionOutcome {
 /// session whose receipt exchange concluded.
 ///
 /// The hook sees every ending: activated, authorizer-refused, and
-/// countersignature missing or invalid. Observation is a record. The hook
+/// countersignature missing or invalid. Observation is a record: the hook
 /// runs after the verdict is final, because [`TransportAuthorizer`] already
 /// decided, so it has no veto.
 ///
@@ -697,8 +699,13 @@ impl SessionOutcome {
 	///
 	/// # Errors
 	///
-	/// - The abort [`HandshakeError`] that matches the verdict, for every
-	///   verdict other than [`SessionVerdict::Activated`].
+	/// Every verdict other than [`SessionVerdict::Activated`] aborts with the
+	/// error that matches it.
+	///
+	/// - [`HandshakeError::SettlementRejected`] -- the authorizer refused settlement.
+	/// - [`HandshakeError::SignatureVerificationFailed`] -- the countersignature failed verification.
+	/// - [`HandshakeError::CountersignatureMissing`] -- the client returned no countersignature.
+	/// - [`HandshakeError`] -- an activated artifact fails to parse as a [`StoredReceipt`].
 	pub(crate) async fn record(self, observer: Option<&dyn SessionObserver>) -> Result<StoredReceipt, HandshakeError> {
 		if let Some(observer) = observer {
 			observer.on_outcome(&self).await;
@@ -1064,7 +1071,7 @@ pub(crate) trait ReceiptSigner {
 impl ReceiptSigner for Certificate {
 	fn signer_identifier<D: Digest>(&self) -> Result<SignerIdentifier, HandshakeError> {
 		let spki_der = self.tbs_certificate.subject_public_key_info.to_der()?;
-		let sid = compute_signer_identifier_from_der(&spki_der)?;
+		let sid = SignerIdentifier::try_from(Skid::of_public_key(spki_der))?;
 		Ok(sid)
 	}
 }
@@ -1271,7 +1278,7 @@ mod tests {
 			let (receipt, artifact, server_key) = server_signed(None).await?;
 			let server_role = ReceiptRole::Server;
 			let server_signer = artifact.signer_for_role(server_role)?.ok_or(HandshakeError::ReceiptMissing)?;
-			let sid = compute_signer_identifier(&server_key)?;
+			let sid = SignerIdentifier::try_from(Skid::of_public_key(server_key.to_public_key_der()?))?;
 			let client_role = ReceiptRole::Client;
 
 			let spliced =
@@ -1344,7 +1351,7 @@ mod tests {
 			forged[0] ^= 0x01;
 			ack.signature = OctetString::new(forged)?;
 
-			let sid = compute_signer_identifier(&client_key)?;
+			let sid = SignerIdentifier::try_from(Skid::of_public_key(client_key.to_public_key_der()?))?;
 			let (verdict, answer) = receipt
 				.settle_ack::<Sha3_256, Secp256k1Signature, _>(Some(&ack), &sid, &client_key, None)
 				.await?;
@@ -1382,7 +1389,7 @@ mod tests {
 			let mut ack = receipt.countersign::<Sha3_256>(Some(b"preimage"), &client_provider).await?;
 			with_two_answer_values(&mut ack);
 
-			let sid = compute_signer_identifier(&client_key)?;
+			let sid = SignerIdentifier::try_from(Skid::of_public_key(client_key.to_public_key_der()?))?;
 			let (verdict, answer) = receipt
 				.settle_ack::<Sha3_256, Secp256k1Signature, _>(Some(&ack), &sid, &client_key, None)
 				.await?;

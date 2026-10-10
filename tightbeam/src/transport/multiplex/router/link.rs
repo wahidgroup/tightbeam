@@ -260,11 +260,17 @@ impl MuxLink {
 	/// own timeout.
 	pub(crate) fn enqueue_stream_cancel(&self, stream_id: u32) {
 		if let Some(mut forwarder) = self.shared.take_duplex(stream_id) {
+			// A reply body already dropped has no reader for the failure, and
+			// the stream is torn down either way.
 			let _ = forwarder.forward(BodyEvent::Failed(CancelReason::Cancelled.cancel_error()));
 		}
 		if let Some(sender) = self.shared.remove_pending(stream_id) {
+			// The initiator may already have dropped its future, which is one
+			// of the ways a stream is abandoned.
 			let _ = sender.send(StreamOutcome::Cancelled(CancelReason::Cancelled));
 			let package = MuxCancelPackage::new(stream_id, CancelReason::Cancelled);
+			// A full or closed queue drops the notice, and the peer then frees
+			// the slot on its own timeout.
 			let _ = self.sender().try_send(Outbound::Envelope(package.into()));
 		}
 	}
@@ -277,8 +283,10 @@ impl MuxLink {
 	///
 	/// # Errors
 	///
-	/// - [`TransportError::ConnectionClosed`] -- the stream's ledger is gone,
+	/// - [`TransportError::OperationFailed`] with
+	///   [`TransportFailure::Cancelled`] -- the stream's ledger is gone,
 	///   whether cancelled, resolved, or lost with the connection.
+	/// - [`TransportError::ConnectionClosed`] -- the writer queue closed.
 	pub(crate) async fn send_data_envelope(&self, stream_id: u32, envelope: TransportEnvelope) -> TransportResult<()> {
 		let mut outbound = self.sender();
 		let ready = poll_fn(|cx| outbound.poll_ready(cx)).await;
@@ -340,6 +348,8 @@ impl MuxLink {
 		self.shared.emit_goaway_event(events::MUX_GOAWAY_SENT, reason);
 
 		let package = GoAwayPackage::new(last_stream_id, reason);
+		// A full or closed queue drops the GoAway, which is the best effort
+		// a fault path promises.
 		let _ = self.sender().try_send(Outbound::Envelope(package.into()));
 	}
 

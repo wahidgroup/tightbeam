@@ -1,8 +1,7 @@
 //! Protocol-generic servlet accept-loop state.
 //!
-//! - `servlet!` builds [`crate::colony::servlet::ServletHandlers`] and
-//!   calls [`ServletRuntime::start`].
-//! - Hand-written [`ServletService`]s use the same entry point.
+//! - `servlet!` builds [`crate::colony::servlet::ServletHandlers`] and calls [`ServletRuntime::start`].
+//! - A [`ServletService`] written without the macro uses the same entry point.
 //! - Address bytes are encoded once at start and shared as [`Arc<[u8]>`].
 //! - Callers borrow [`addr`](ServletRuntime::addr) instead of cloning it.
 
@@ -25,7 +24,6 @@ use crate::transport::multiplex::MuxCapable;
 use crate::transport::policy::{CollectorGateConfig, PolicyConfig};
 use crate::transport::AsyncListenerTrait;
 use crate::transport::Protocol;
-use crate::transport::TransportError;
 use crate::utils::time::Clock;
 use crate::TightBeamError;
 
@@ -57,11 +55,6 @@ pub struct ServletRuntime<P: Protocol> {
 	trace_handle: Arc<Mutex<Arc<TraceCollector>>>,
 }
 
-fn protocol_error<E: Into<TransportError>>(error: E) -> TightBeamError {
-	let transport = error.into();
-	TightBeamError::from(transport)
-}
-
 impl<P> ServletRuntime<P>
 where
 	P: Protocol + 'static,
@@ -86,12 +79,13 @@ where
 		Env: Send + Sync + 'static,
 		P: EncryptedProtocol<CryptoProvider = C>,
 	{
-		let bind_addr = P::default_bind_address().map_err(protocol_error)?;
+		let bind_addr = P::default_bind_address().map_err(TightBeamError::transport)?;
 		let (encryption, parts) = servlet_conf.into_bind_parts();
 		let (listener, addr) = if let Some(encryption_config) = encryption {
-			P::bind_with(bind_addr, encryption_config).await.map_err(protocol_error)?
+			let bound = P::bind_with(bind_addr, encryption_config).await;
+			bound.map_err(TightBeamError::transport)?
 		} else {
-			P::bind(bind_addr).await.map_err(protocol_error)?
+			P::bind(bind_addr).await.map_err(TightBeamError::transport)?
 		};
 
 		let runtime = Self::spawn_loop(trace, parts, service, listener, addr).await?;
@@ -158,8 +152,7 @@ where
 }
 
 impl<P: Protocol> ServletRuntime<P> {
-	/// Returns the bound listen address by reference, so the call clones
-	/// nothing.
+	/// Borrows the bound listen address.
 	pub fn addr(&self) -> &P::Address {
 		&self.addr
 	}

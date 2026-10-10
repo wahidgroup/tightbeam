@@ -6,8 +6,8 @@ use std::sync::{Arc, RwLockReadGuard};
 use std::thread;
 
 use super::{
-	ClusterError, HiveSlate, KindCaps, LocalRoute, PeerCaps, PeerRoute, PheromoneConfig, RelayRoute, RouteKind, Routes,
-	ServletEntry, ServletRegistry, SharedId, DEFAULT_ABANDONMENT_LIMIT, DEFAULT_INITIAL_PHEROMONE,
+	ClusterError, HiveSlate, KindCaps, LocalRoute, PeerCaps, PeerRoute, PheromoneConfig, RelayRoute, RouteKind,
+	RoutePlane, Routes, ServletEntry, ServletRegistry, SharedId, DEFAULT_ABANDONMENT_LIMIT, DEFAULT_INITIAL_PHEROMONE,
 };
 use crate::colony::cluster::peer::{AdmittedPeerAd, RelayTrail};
 use crate::colony::cluster::{AdmittedDial, PeerAddress};
@@ -167,7 +167,7 @@ fn install_peer_slate(
 	registry.reconcile_peer_slate(admitted(peer, b"127.0.0.1:9000", slate), PeerCaps::default())
 }
 
-/// Relay trail under the composite `origin NUL relay` bucket.
+/// A relay trail under the composite `origin NUL relay` bucket.
 fn relay_trail(
 	origin: impl AsRef<[u8]>,
 	relay: impl AsRef<[u8]>,
@@ -194,6 +194,18 @@ fn relay_trail(
 		slate,
 		order: UnixMillis::new(0),
 	}
+}
+
+/// The one entry of a relay trail for `origin` through `relay`, dialing the
+/// relay at the fixture socket.
+fn relay_trail_entry(origin: impl AsRef<[u8]>, relay: impl AsRef<[u8]>) -> ServletEntry {
+	let mut slate = relay_trail(origin, relay, b"ping", b"127.0.0.1:9001").slate;
+	slate.pop().expect("the fixture trail holds one entry")
+}
+
+/// The peer plane bound to the gateway whose slate key is `gateway_id`.
+fn peer_plane(gateway_id: impl AsRef<[u8]>) -> RoutePlane {
+	RoutePlane::Peer { gateway_id: SharedId::from(gateway_id.as_ref()) }
 }
 
 /// Counts `times` failures against the route at `key`.
@@ -288,6 +300,21 @@ fn entry_reinforce_resets_trials() {
 fn entry_route_kind_defaults_local() {
 	let entry = named_entry(b"addr1", b"calculator", b"hive1");
 	assert_eq!(entry.route_kind(), RouteKind::Local);
+}
+
+// A route dials on the hive plane, or on the peer plane bound to one gateway:
+// its advertiser for a direct route and the relay for a relay trail.
+tb_cases! {
+	fn entry_names_the_plane_it_dials_on((entry, plane): (ServletEntry, RoutePlane)) {
+		let named = entry.plane();
+		assert_eq!(named, plane);
+	}
+
+	cases {
+		a_local_route_dials_the_hive_plane => (named_entry(b"addr1", b"calc", b"hive1"), RoutePlane::Hive),
+		a_direct_route_names_its_advertiser => (peer_entry(b"ping", b"peer-a"), peer_plane(b"peer-a")),
+		a_relay_trail_names_its_relay => (relay_trail_entry(b"peer-a", b"peer-b"), peer_plane(b"peer-b")),
+	}
 }
 
 // A local entry dials the endpoint its key names: a name as the hive wrote
@@ -667,10 +694,9 @@ fn race_ad_orders(registry: &Arc<ServletRegistry>) -> Vec<SharedId> {
 		.collect()
 }
 
-// Two advertisements for one bucket race. The order ledger and the
-// installed slate are one decision, so whichever applies last leaves the
-// ledger naming the slate that is installed. A ledger below the installed
-// order would admit a replay the withdrawal already refused (CWE-294).
+// The order ledger and the installed slate are one decision, so the last ad to
+// apply leaves the ledger naming the installed slate. A ledger below the
+// installed order would admit a replay the withdrawal refused (CWE-294).
 #[test]
 fn racing_ads_leave_the_ledger_naming_the_installed_slate() {
 	let registry = Arc::new(registry());
@@ -694,6 +720,60 @@ fn direct_reconcile_preserves_relay_bucket() -> Result<(), ClusterError> {
 	let entries = registry.peer_entries()?;
 	assert_eq!(entries.len(), 2);
 	assert!(entries.iter().any(|entry| entry.route_kind() == RouteKind::PeerRelay));
+	Ok(())
+}
+
+/// A withdrawn socket takes every peer route that dials it: the direct route
+/// of the peer that advertised it and the relay trail through it. Another
+/// peer's direct route stays.
+#[test]
+fn withdraw_peer_by_dial_drops_the_routes_that_dial_the_socket() -> Result<(), ClusterError> {
+	let registry = registry();
+	install_peer_slate(&registry, b"peer-a", vec![peer_entry(b"ping", b"peer-a")])?;
+
+	let through = relay_trail(b"peer-c", b"peer-a", b"echo", b"127.0.0.1:9000");
+	registry.reconcile_relay_trail(through, PeerCaps::default())?;
+
+	let other_slate = vec![peer_entry_dial(b"pong", b"peer-b", b"127.0.0.1:9001")];
+	let other = admitted(b"peer-b", b"127.0.0.1:9001", other_slate);
+	registry.reconcile_peer_slate(other, PeerCaps::default())?;
+	registry.withdraw_peer_by_dial(PeerAddress::fixture("127.0.0.1:9000"))?;
+
+	let live = registry.peer_entries()?;
+	let owners: Vec<SharedId> = live.iter().map(|entry| Arc::clone(entry.owner_id())).collect();
+	let kinds: Vec<RouteKind> = live.iter().map(|entry| entry.route_kind()).collect();
+	assert_eq!(owners, vec![SharedId::from(b"peer-b".as_slice())]);
+	assert_eq!(kinds, vec![RouteKind::Peer]);
+	Ok(())
+}
+
+/// The peer whose socket is withdrawn stays reachable through its fallback
+/// trail, because that trail dials the relay.
+#[test]
+fn withdraw_peer_by_dial_keeps_the_fallback_trail_through_another_relay() -> Result<(), ClusterError> {
+	let registry = registry();
+	install_peer_slate(&registry, b"peer-a", vec![peer_entry(b"ping", b"peer-a")])?;
+
+	let fallback = relay_trail(b"peer-a", b"peer-b", b"ping", b"127.0.0.1:9001");
+	registry.reconcile_relay_trail(fallback, PeerCaps::default())?;
+	registry.withdraw_peer_by_dial(PeerAddress::fixture("127.0.0.1:9000"))?;
+
+	let live = registry.peer_entries()?;
+	let relays: Vec<Option<SharedId>> = live.iter().map(|entry| entry.relay_id().cloned()).collect();
+	assert_eq!(relays, vec![Some(SharedId::from(b"peer-b".as_slice()))]);
+	Ok(())
+}
+
+/// A hive route whose address spells the withdrawn socket stays, because the
+/// withdrawal acts on the peer plane alone.
+#[test]
+fn withdraw_peer_by_dial_keeps_a_local_route_at_the_socket() -> Result<(), ClusterError> {
+	let registry = registry();
+	registry.add(named_entry(b"127.0.0.1:9000", b"calc", b"hive1"))?;
+	registry.withdraw_peer_by_dial(PeerAddress::fixture("127.0.0.1:9000"))?;
+
+	let owner = owner_of(&registry, b"127.0.0.1:9000");
+	assert_eq!(owner, Some(SharedId::from(b"hive1".as_slice())));
 	Ok(())
 }
 
@@ -960,8 +1040,7 @@ fn reconcile_peer_slate_refuses_over_gateway_cap() -> Result<(), ClusterError> {
 ///
 /// Both paths take the route write lock, so a round reads one of two ways:
 ///
-/// - One plane routed: the path that landed first kept the bucket, and the
-///   sweep check refused the other.
+/// - One plane routed: the path that landed first kept the bucket, and the sweep check refused the other.
 /// - Both planes routed, or neither: an interleaving slipped past the lock,
 ///   and one slate clobbered or half-installed the other.
 fn rounds_with_one_plane_holding_the_bucket(rounds: usize) -> usize {

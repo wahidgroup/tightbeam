@@ -34,6 +34,18 @@ pub const TIGHTBEAM_ACK_KDF_INFO: &[u8] = b"tb/session/kdf/ack/v1";
 /// from every signed Finished content and from [`TIGHTBEAM_ACK_KDF_INFO`].
 pub const TIGHTBEAM_ACK_AAD_DOMAIN: &[u8] = b"tb/handshake/ack/aad/v1";
 
+/// KDF info label of the key-confirmation tag (HKDF), which the transcript
+/// hash follows.
+///
+/// The client derives the tag from the handshake secret and sends it on the
+/// closing. The server derives the same tag before it settles, so a client
+/// that holds another secret ends the handshake at the closing.
+///
+/// # Sources
+///
+/// - NIST SP 800-56A Rev. 3 § 5.9, key confirmation: <https://doi.org/10.6028/NIST.SP.800-56Ar3>
+pub const TIGHTBEAM_CONFIRM_KDF_INFO: &[u8] = b"tb/session/kdf/confirm/v1";
+
 /// KDF info string for the client-to-server session key (HKDF).
 ///
 /// Distinct info labels yield independent directional keys from the same

@@ -6,8 +6,6 @@
 use std::sync::Arc;
 
 #[cfg(feature = "tokio")]
-use core::time::Duration;
-#[cfg(feature = "tokio")]
 use std::io::Error as IoError;
 
 #[cfg(feature = "tokio")]
@@ -73,16 +71,9 @@ mod x509 {
 	pub use crate::transport::envelopes::{TransportEnvelope, WireEnvelope};
 	pub use crate::transport::handshake::BoxedServerHandshake;
 	pub use crate::transport::io::{EnvelopeSink, EnvelopeSource};
-	pub use crate::transport::state::{EncryptedProtocolState, SessionPhase};
+	pub use crate::transport::state::{EncryptedProtocolState, ReadPolicy, SessionPhase};
 	pub use crate::transport::EncryptedMessageIO;
-	#[cfg(feature = "tokio")]
-	pub use crate::transport::{EndpointConfig, TransportEncryptionConfig};
 	pub use crate::utils::time::Clock;
-	#[cfg(all(
-		feature = "transport-multiplex",
-		any(feature = "transport-cms", feature = "transport-ecies")
-	))]
-	pub use crate::x509::Certificate;
 
 	#[cfg(all(
 		feature = "transport-policy",
@@ -90,6 +81,13 @@ mod x509 {
 		any(feature = "transport-cms", feature = "transport-ecies")
 	))]
 	pub use crate::policy::SessionContext;
+	#[cfg(feature = "tokio")]
+	pub use crate::transport::{EndpointConfig, TransportEncryptionConfig};
+	#[cfg(all(
+		feature = "transport-multiplex",
+		any(feature = "transport-cms", feature = "transport-ecies")
+	))]
+	pub use crate::x509::Certificate;
 }
 
 #[cfg(feature = "x509")]
@@ -465,8 +463,8 @@ where
 	type EnvelopeReader = TransportReader<S::ReadHalf>;
 	type EnvelopeWriter = TransportWriter<S::WriteHalf>;
 
-	/// A cleartext server, which has no certificate, never handshakes and
-	/// never multiplexes, so it returns `Ok(None)` with no I/O.
+	/// An endpoint without encryption provisioning runs no handshake and
+	/// negotiates no multiplexing, so it returns `Ok(None)` with no I/O.
 	async fn negotiate_mux(&mut self) -> TransportResult<Option<MuxSettings>> {
 		if !self.encryption().is_provisioned() {
 			return Ok(None);
@@ -540,6 +538,9 @@ where
 	stream: R,
 	mode: SplitRecv,
 	limits: TransportLimits,
+	/// The connection clock carried across the split, which the read deadline
+	/// counts from.
+	clock: Arc<dyn Clock>,
 	/// The connection collector carried across the split. See
 	/// [`EnvelopeSource::trace`].
 	#[cfg(feature = "instrument")]
@@ -580,15 +581,23 @@ where
 	/// The operation deadline bounds the read in either mode, so a peer that
 	/// stops mid-frame cannot pin the reader task (CWE-400).
 	async fn read_envelope(&mut self) -> TransportResult<TransportEnvelope> {
-		let max_len = match &self.mode {
+		let cap = match &self.mode {
 			SplitRecv::Cleartext => self.limits.cleartext_envelope,
 			SplitRecv::Encrypted(_) => self.limits.encrypted_envelope,
 		};
 
-		#[cfg(all(feature = "tokio", feature = "std", feature = "transport-policy"))]
-		let wire_bytes = timeout(self.limits.operation_timeout, self.stream.read_frame(max_len)).await??;
-		#[cfg(not(all(feature = "tokio", feature = "std", feature = "transport-policy")))]
-		let wire_bytes = self.stream.read_frame(max_len).await?;
+		// A split half belongs to an established session, so the read runs
+		// under the policy of one.
+		let now = self.clock.monotonic();
+		let policy = ReadPolicy::established(cap, &self.limits, now);
+
+		#[cfg(all(feature = "tokio", feature = "std"))]
+		let wire_bytes = match policy.remaining(now)? {
+			Some(budget) => timeout(budget, self.stream.read_frame(policy.cap())).await??,
+			None => self.stream.read_frame(policy.cap()).await?,
+		};
+		#[cfg(not(all(feature = "tokio", feature = "std")))]
+		let wire_bytes = self.stream.read_frame(policy.cap()).await?;
 
 		let wire_envelope = WireEnvelope::from_der(&wire_bytes)?;
 		match (&self.mode, wire_envelope) {
@@ -654,6 +663,10 @@ where
 	/// that never drains its receive buffer cannot pin the writer task forever
 	/// (CWE-400).
 	limits: TransportLimits,
+	/// The connection clock carried across the split. See
+	/// [`EnvelopeSink::clock`].
+	#[cfg(host_clock)]
+	clock: Arc<dyn Clock>,
 	/// The connection collector carried across the split. See
 	/// [`EnvelopeSink::trace`].
 	#[cfg(feature = "instrument")]
@@ -740,6 +753,11 @@ where
 	fn trace(&self) -> Option<TraceCollector> {
 		self.trace.as_ref().map(TraceCollector::share)
 	}
+
+	#[cfg(host_clock)]
+	fn clock(&self) -> Arc<dyn Clock> {
+		Arc::clone(&self.clock)
+	}
 }
 
 /// The read and write halves that [`TcpTransport::into_split`] produces.
@@ -788,6 +806,7 @@ where
 		};
 
 		let limits = self.limits;
+		let clock = self.clock;
 
 		#[cfg(feature = "instrument")]
 		let trace = self.trace.as_ref().map(TraceCollector::share);
@@ -797,6 +816,7 @@ where
 			stream: read_half,
 			mode: recv_mode,
 			limits,
+			clock: Arc::clone(&clock),
 			#[cfg(feature = "instrument")]
 			trace: trace.as_ref().map(TraceCollector::share),
 		};
@@ -804,6 +824,8 @@ where
 			stream: write_half,
 			mode: send_mode,
 			limits,
+			#[cfg(host_clock)]
+			clock,
 			#[cfg(feature = "instrument")]
 			trace,
 		};
@@ -837,51 +859,18 @@ where
 	}
 
 	async fn read_envelope_bytes(&mut self) -> TransportResult<Vec<u8>> {
-		// An unauthenticated handshake read gets the tight handshake ceiling.
-		// An established session gets the larger of the two envelope ceilings,
-		// because the encoded form is unknown until the bytes are parsed.
+		// The phase decides the ceiling and the deadline of this read, as
+		// `SessionPhase::read_policy` describes.
 		#[cfg(feature = "x509")]
-		let cap = if self.is_handshake_pending() {
-			self.limits.handshake_wire
-		} else {
-			self.limits.max_envelope()
-		};
+		let now = self.clock.monotonic();
+		#[cfg(feature = "x509")]
+		let policy = self.state.phase().read_policy(&self.limits, now);
 
 		#[cfg(feature = "tokio")]
 		{
-			#[cfg(feature = "x509")]
-			let timeout_duration: Option<Duration> = {
-				match self.state.phase().initiated_at() {
-					Some(initiated_at) => match initiated_at.checked_add(self.limits.handshake_timeout) {
-						Some(deadline) => {
-							let now = self.clock.monotonic();
-							if now >= deadline {
-								return Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded));
-							}
-
-							Some(deadline.saturating_duration_since(now))
-						}
-						// A deadline past every reading never arrives.
-						None => None,
-					},
-					_ if self.is_handshake_pending() => Some(self.limits.handshake_timeout),
-					_ => {
-						#[cfg(feature = "transport-policy")]
-						{
-							Some(self.limits.operation_timeout)
-						}
-						#[cfg(not(feature = "transport-policy"))]
-						{
-							None
-						}
-					}
-				}
-			};
-
-			let buffer = if let Some(dur) = timeout_duration {
-				timeout(dur, self.stream.read_frame(cap)).await??
-			} else {
-				self.stream.read_frame(cap).await?
+			let buffer = match policy.remaining(now)? {
+				Some(budget) => timeout(budget, self.stream.read_frame(policy.cap())).await??,
+				None => self.stream.read_frame(policy.cap()).await?,
 			};
 
 			Ok(buffer)
@@ -889,7 +878,7 @@ where
 
 		#[cfg(not(feature = "tokio"))]
 		{
-			let buffer = self.stream.read_frame(cap).await?;
+			let buffer = self.stream.read_frame(policy.cap()).await?;
 			Ok(buffer)
 		}
 	}
@@ -987,6 +976,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> PersistentConnection for TokioLi
 mod tests {
 
 	use core::str::FromStr;
+	use core::time::Duration;
 	use std::sync::Arc;
 
 	#[cfg(all(feature = "transport-policy", feature = "transport-ecies"))]
@@ -1040,15 +1030,18 @@ mod tests {
 
 	#[cfg(all(feature = "x509", feature = "aead"))]
 	mod cipher_install {
+		use core::time::Duration;
+
 		use super::super::*;
 		use crate::constants::{DEFAULT_MAX_ENCRYPTED_ENVELOPE, DEFAULT_REKEY_RECORD_LIMIT};
 		use crate::crypto::aead::RuntimeAead;
 		use crate::testing::{TestFrame, TestKey};
+		use crate::utils::time::{ManualClock, SystemClock};
 		use crate::TightBeamError;
 
 		const PLAINTEXT: &[u8] = b"epoch boundary traffic";
 
-		/// A frame stream that discards writes and yields nothing.
+		/// A frame stream that discards writes and yields empty frames.
 		struct NullStream;
 
 		impl AsyncReadStream for NullStream {
@@ -1076,11 +1069,26 @@ mod tests {
 			writer_under(mode, TransportLimits::default())
 		}
 
+		/// A write half hands out the clock of the connection it was split
+		/// from, so a plane assembled over it reads the endpoint's clock.
+		#[test]
+		fn a_split_writer_hands_out_the_connection_clock() {
+			let clock = Arc::new(ManualClock::default());
+			clock.advance(Duration::from_secs(3600));
+
+			let mut writer = writer(SplitSend::Cleartext);
+			writer.clock = Arc::clone(&clock) as Arc<dyn Clock>;
+
+			let handed = EnvelopeSink::clock(&writer);
+			assert_eq!(handed.monotonic(), clock.monotonic());
+		}
+
 		fn writer_under(mode: SplitSend, limits: TransportLimits) -> TransportWriter<NullStream> {
 			TransportWriter {
 				stream: NullStream,
 				mode,
 				limits,
+				clock: Arc::new(SystemClock),
 				#[cfg(feature = "instrument")]
 				trace: None,
 			}
@@ -1091,6 +1099,7 @@ mod tests {
 				stream: NullStream,
 				mode,
 				limits: TransportLimits::default(),
+				clock: Arc::new(SystemClock),
 				#[cfg(feature = "instrument")]
 				trace: None,
 			}
@@ -1178,7 +1187,8 @@ mod tests {
 			Ok(())
 		}
 
-		/// A frame stream whose peer never sends and never drains.
+		/// A frame stream that stays pending on every read and write, as with a
+		/// peer that has stalled.
 		struct StalledStream;
 
 		impl AsyncReadStream for StalledStream {
@@ -1210,6 +1220,7 @@ mod tests {
 				stream: StalledStream,
 				mode: SplitRecv::Cleartext,
 				limits: one_second_deadline(),
+				clock: Arc::new(SystemClock),
 				#[cfg(feature = "instrument")]
 				trace: None,
 			};
@@ -1228,6 +1239,7 @@ mod tests {
 				stream: StalledStream,
 				mode: SplitSend::Cleartext,
 				limits: one_second_deadline(),
+				clock: Arc::new(SystemClock),
 				#[cfg(feature = "instrument")]
 				trace: None,
 			};
@@ -1266,6 +1278,8 @@ mod tests {
 		let server_handle = tokio::spawn(async move {
 			let (mut transport, _peer) = listener.accept().await?;
 			respond_with(&mut transport, move |msg: Frame| {
+				// The receiver lives for the whole test, so a refused send
+				// shows as the missing message the assertion reads.
 				let _ = received_tx.try_send(msg);
 				Some(response_frame.to_owned())
 			})
@@ -1473,6 +1487,8 @@ mod tests {
 			let mut transport = transport.with_handshake_protocol(HandshakeProtocolKind::Cms);
 
 			respond_with(&mut transport, move |msg: Frame| {
+				// The receiver lives for the whole test, so a refused send
+				// shows as the missing message the assertion reads.
 				let _ = received_tx.try_send(msg);
 				Some(response_frame.to_owned())
 			})
@@ -1495,6 +1511,7 @@ mod tests {
 			handshake_protocol: HandshakeProtocolKind::Cms,
 			..EncryptionConfig::unconfigured()
 		};
+
 		ClientIdentity::new(client_cert, client_keys).install(&mut encryption);
 
 		let mut transport = client_over(client_stream, encryption);
@@ -1578,13 +1595,14 @@ mod tests {
 		let server_handle = tokio::spawn(async move {
 			let (transport, _peer) = listener.accept().await?;
 			let echo = move |msg: Frame| {
+				// The receiver lives for the whole test, so a refused send
+				// shows as the missing message the assertion reads.
 				let _ = received_tx.try_send(msg.to_owned());
 				Some(msg)
 			};
 
 			let gate = BusyFirstGate::new();
 			let mut transport = transport.with_collector_gate(gate);
-
 			respond_with(&mut transport, &echo).await?;
 			respond_with(&mut transport, &echo).await
 		});
@@ -1623,6 +1641,8 @@ mod tests {
 		let server_handle = tokio::spawn(async move {
 			let (mut transport, _peer) = listener.accept().await?;
 			respond_with(&mut transport, move |msg: Frame| {
+				// The receiver lives for the whole test, so a refused send
+				// shows as the missing message the assertion reads.
 				let _ = received_tx.try_send(msg);
 				None
 			})

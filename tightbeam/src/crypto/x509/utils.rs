@@ -14,8 +14,10 @@ use crate::crypto::x509::Certificate;
 use crate::der::asn1::{GeneralizedTime, OctetString};
 use crate::der::oid::AssociatedOid;
 use crate::der::{DecodeOwned, Encode};
-use crate::spki::EncodePublicKey;
 use crate::x509::certificate::{CertificateInner, Profile};
+
+#[cfg(host_clock)]
+use crate::utils::time::UnixMillis;
 
 /// A 32-byte certificate fingerprint bound to the digest that produced it.
 ///
@@ -96,7 +98,7 @@ pub type SkidDigest = Sha3_256;
 pub struct Skid([u8; 20]);
 
 impl Skid {
-	/// The SubjectKeyIdentifier of a DER-encoded public key.
+	/// Returns the SubjectKeyIdentifier of a DER-encoded public key.
 	///
 	/// The digest is the protocol constant [`SkidDigest`]. A signer stamps this
 	/// value into the `SignerInfo` it puts on the wire, and a trust store
@@ -121,6 +123,43 @@ impl Skid {
 	}
 }
 
+/// A SKID names its key as the `SignerIdentifier::SubjectKeyIdentifier` of
+/// CMS SignedData (RFC 5652 § 5.3), the form every signer in this crate
+/// stamps and every trust store indexes under.
+///
+/// # Errors
+///
+/// - [`der::Error`] -- the 20 SKID bytes do not fit an
+///   `OCTET STRING`, which the `der` length rules make unreachable here.
+///
+/// # Examples
+///
+/// ```
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// use tightbeam::cms::signed_data::SignerIdentifier;
+/// use tightbeam::crypto::sign::ecdsa::{Secp256k1SigningKey, Secp256k1VerifyingKey};
+/// use tightbeam::crypto::x509::utils::Skid;
+/// use tightbeam::spki::EncodePublicKey;
+///
+/// let signing_key = Secp256k1SigningKey::from_slice(&[7u8; 32])?;
+/// let verifying_key = Secp256k1VerifyingKey::from(&signing_key);
+/// let skid = Skid::of_public_key(verifying_key.to_public_key_der()?);
+/// let signer_id = SignerIdentifier::try_from(skid)?;
+///
+/// assert!(matches!(signer_id, SignerIdentifier::SubjectKeyIdentifier(_)));
+/// # Ok(())
+/// # }
+/// ```
+impl TryFrom<Skid> for SignerIdentifier {
+	type Error = crate::der::Error;
+
+	fn try_from(skid: Skid) -> Result<Self, Self::Error> {
+		let octets = OctetString::new(skid.as_bytes().as_slice())?;
+		let identifier = SubjectKeyIdentifier::from(octets);
+		Ok(Self::SubjectKeyIdentifier(identifier))
+	}
+}
+
 #[macro_export]
 macro_rules! pem {
 	(
@@ -134,8 +173,8 @@ macro_rules! pem {
 
 /// Certificate checks this crate runs before trusting a peer.
 ///
-/// `Certificate` is defined in `x509-cert`, so the checks are trait methods.
-/// Every check still reaches the certificate through the certificate itself.
+/// `Certificate` is defined in `x509-cert`, so the checks are trait methods,
+/// and a caller still invokes each check on the certificate itself.
 pub trait CertificateExt {
 	/// Validate certificate expiry (`not_before <= now <= not_after`).
 	///
@@ -145,10 +184,11 @@ pub trait CertificateExt {
 	///
 	/// # Errors
 	///
-	/// - [`CertificateValidationError::NotYetValid`] before `not_before`
-	/// - [`CertificateValidationError::Expired`] after `not_after`
-	/// - [`CertificateValidationError::InvalidTimestamp`] when the build
-	///   carries no clock, so a higher layer owns temporal validation
+	/// - [`CertificateValidationError::NotYetValid`] -- the current time is before `not_before`.
+	/// - [`CertificateValidationError::Expired`] -- the current time is after `not_after`.
+	/// - [`CertificateValidationError::InvalidTimestamp`] -- the build carries
+	///   no clock, so a higher layer owns temporal validation, or the clock
+	///   reading does not convert to a certificate time.
 	///
 	/// # Sources
 	///
@@ -158,20 +198,20 @@ pub trait CertificateExt {
 
 	/// Validate expiry against a caller-supplied Unix timestamp.
 	///
-	/// The same comparison [`CertificateExt::validate_expiry`] runs, with
-	/// `now_unix` in place of the local clock. A path that already knows
-	/// the time, such as receipt verification, uses this so the two cannot
-	/// diverge.
+	/// This method runs the same comparison as
+	/// [`CertificateExt::validate_expiry`], with `now_unix` in place of the
+	/// local clock. A path that already knows the time, such as receipt
+	/// verification, uses this so the two cannot diverge.
 	///
 	/// # Errors
 	///
-	/// - [`CertificateValidationError::NotYetValid`] before `not_before`
-	/// - [`CertificateValidationError::Expired`] after `not_after`
-	/// - [`CertificateValidationError::InvalidTimestamp`] when `now_unix` does
-	///   not convert to a certificate time
+	/// - [`CertificateValidationError::NotYetValid`] -- `now_unix` is before `not_before`.
+	/// - [`CertificateValidationError::Expired`] -- `now_unix` is after `not_after`.
+	/// - [`CertificateValidationError::InvalidTimestamp`] -- `now_unix` does
+	///   not convert to a certificate time.
 	fn validate_expiry_at(&self, now_unix: u64) -> Result<(), CertificateValidationError>;
 
-	/// Raw public key bytes from the certificate's SPKI.
+	/// Returns the raw public key bytes from the certificate's SPKI.
 	fn verifying_key_bytes(&self) -> &[u8];
 
 	/// Enforce algorithm-identifier consistency within the certificate.
@@ -182,7 +222,7 @@ pub trait CertificateExt {
 	///
 	/// # Errors
 	///
-	/// - [`CertificateValidationError::AlgorithmMismatch`] on disagreement
+	/// - [`CertificateValidationError::AlgorithmMismatch`] -- the two identifiers disagree.
 	///
 	/// # Sources
 	///
@@ -198,13 +238,11 @@ pub trait CertificateExt {
 	///
 	/// # Errors
 	///
-	/// - [`CertificateValidationError::EncodingError`] -- the extension's
-	///   `extnValue` fails to decode.
+	/// - [`CertificateValidationError::EncodingError`] -- the extension's `extnValue` fails to decode.
 	///
 	/// # Sources
 	///
-	/// - RFC 5280 §4.2, certificate extensions:
-	///   <https://datatracker.ietf.org/doc/html/rfc5280#section-4.2>
+	/// - RFC 5280 §4.2, certificate extensions: <https://datatracker.ietf.org/doc/html/rfc5280#section-4.2>
 	fn extension<T>(&self) -> Result<Option<T>, CertificateValidationError>
 	where
 		T: AssociatedOid + DecodeOwned;
@@ -228,35 +266,39 @@ impl<P: Profile> CertificateExt for CertificateInner<P> {
 		Ok(())
 	}
 
-	#[cfg(feature = "time")]
+	/// Runs the check at the host clock's reading, through [`UnixMillis::now`],
+	/// so certificate validity reads the same clock as every other time
+	/// decision in the crate.
+	#[cfg(host_clock)]
+	fn validate_expiry(&self) -> Result<(), CertificateValidationError> {
+		let now = UnixMillis::now();
+		let now_unix = Duration::from_millis(now.get()).as_secs();
+
+		self.validate_expiry_at(now_unix)
+	}
+
+	/// Runs the check at the reading of the `time` crate, for a build that has
+	/// no host clock and enables `time`. On `wasm32-unknown-unknown` that crate
+	/// reads the JavaScript clock, the one clock such a build has.
+	#[cfg(all(feature = "time", not(host_clock)))]
 	fn validate_expiry(&self) -> Result<(), CertificateValidationError> {
 		use crate::time::OffsetDateTime;
 
 		let now = OffsetDateTime::now_utc().unix_timestamp();
-		if now < 0 {
-			return Err(CertificateValidationError::InvalidTimestamp);
-		}
-
-		self.validate_expiry_at(now as u64)
+		let now_unix = u64::try_from(now).map_err(|_| CertificateValidationError::InvalidTimestamp)?;
+		self.validate_expiry_at(now_unix)
 	}
 
-	#[cfg(all(feature = "std", not(feature = "time")))]
-	fn validate_expiry(&self) -> Result<(), CertificateValidationError> {
-		let now = std::time::SystemTime::now()
-			.duration_since(std::time::UNIX_EPOCH)
-			.map_err(|_| CertificateValidationError::InvalidTimestamp)?;
-
-		self.validate_expiry_at(now.as_secs())
-	}
-
-	#[cfg(all(not(feature = "std"), not(feature = "time")))]
+	/// A build with no clock at all has no current time, so a higher layer
+	/// owns temporal validation.
+	#[cfg(all(not(feature = "time"), not(host_clock)))]
 	fn validate_expiry(&self) -> Result<(), CertificateValidationError> {
 		Err(CertificateValidationError::InvalidTimestamp)
 	}
 
-	/// Raw `subjectPublicKey` bits, borrowed from the certificate.
+	/// Returns the raw `subjectPublicKey` bits, borrowed from the certificate.
 	///
-	/// The bits stay unparsed here. A profile turns them into a key of its
+	/// The bits stay unparsed here, and a profile turns them into a key of its
 	/// own curve in `HandshakeVerifyingKey::verifying_key`.
 	fn verifying_key_bytes(&self) -> &[u8] {
 		self.tbs_certificate.subject_public_key_info.subject_public_key.raw_bytes()
@@ -295,55 +337,26 @@ impl<P: Profile> CertificateExt for CertificateInner<P> {
 	}
 }
 
-/// Compute a SubjectKeyIdentifier-based SignerIdentifier from a verifying key.
-///
-/// The identifier is [`Skid::of_public_key`] of the key's DER encoding, the
-/// one definition every signer and trust store in this crate uses, wrapped
-/// as `SignerIdentifier::SubjectKeyIdentifier` for CMS SignedData.
-///
-/// # Examples
-///
-/// ```
-/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// use tightbeam::cms::signed_data::SignerIdentifier;
-/// use tightbeam::crypto::sign::ecdsa::{Secp256k1SigningKey, Secp256k1VerifyingKey};
-/// use tightbeam::crypto::x509::utils::compute_signer_identifier;
-///
-/// let signing_key = Secp256k1SigningKey::from_slice(&[7u8; 32])?;
-/// let verifying_key = Secp256k1VerifyingKey::from(&signing_key);
-/// let signer_id = compute_signer_identifier(&verifying_key)?;
-///
-/// assert!(matches!(signer_id, SignerIdentifier::SubjectKeyIdentifier(_)));
-/// # Ok(())
-/// # }
-/// ```
-pub fn compute_signer_identifier<V>(verifying_key: &V) -> Result<SignerIdentifier, CertificateValidationError>
-where
-	V: EncodePublicKey,
-{
-	let public_key_der = verifying_key.to_public_key_der()?;
-	compute_signer_identifier_from_der(public_key_der.as_bytes())
-}
-
-/// Compute a SubjectKeyIdentifier-based SignerIdentifier from DER-encoded
-/// public key bytes.
-///
-/// This byte-based variant accepts the output of
-/// `KeyProvider::to_public_key_bytes()`.
-pub fn compute_signer_identifier_from_der(
-	public_key_der: impl AsRef<[u8]>,
-) -> Result<SignerIdentifier, CertificateValidationError> {
-	let skid = Skid::of_public_key(public_key_der);
-	let skid_octets = OctetString::new(skid.as_bytes().as_slice())?;
-	let skid = SubjectKeyIdentifier::from(skid_octets);
-	Ok(SignerIdentifier::SubjectKeyIdentifier(skid))
-}
-
 #[cfg(test)]
 mod tests {
+	use super::Skid;
+	use crate::cms::signed_data::SignerIdentifier;
 	use crate::crypto::x509::error::CertificateValidationError;
 	use crate::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
 	use crate::testing::TestCertificate;
+
+	/// The signer identifier a SKID converts to carries the SKID bytes whole,
+	/// so a signer stamps the same 20 bytes a trust store indexes under.
+	#[test]
+	fn a_skid_converts_to_the_signer_identifier_that_carries_it() -> Result<(), crate::der::Error> {
+		let skid = Skid::of_public_key(b"a public key in DER");
+		let identifier = SignerIdentifier::try_from(skid)?;
+
+		let expected = skid.as_bytes();
+		let carried = matches!(&identifier, SignerIdentifier::SubjectKeyIdentifier(id) if id.0.as_bytes() == expected);
+		assert!(carried);
+		Ok(())
+	}
 
 	#[test]
 	fn test_pem_macro() {
@@ -410,7 +423,7 @@ mod tests {
 		// The rejection is specifically an expiry error.
 		match result {
 			Err(CertificateValidationError::Expired) => {
-				// Expected error
+				// This arm is the expected error.
 			}
 			other => panic!("Expected Expired error, got: {other:?}"),
 		}

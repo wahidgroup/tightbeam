@@ -1,8 +1,9 @@
-//! The colony stack over a non-TCP transport: cluster, hive, and servlet
-//! all bound to the in-memory "laser" protocol, work routed end to end.
+//! The colony stack over a non-TCP transport. The cluster, the hive, and the
+//! servlet all bind to the in-memory "laser" protocol, and work routes end to
+//! end.
 //!
-//! A laser tightbeam arrives at the cluster gateway and is relayed to a
-//! servlet through the hive, every link encrypted and multiplexed.
+//! A laser tightbeam arrives at the cluster gateway and is relayed to a servlet
+//! through the hive, with every link encrypted and multiplexed.
 
 #![cfg(all(
 	feature = "std",
@@ -39,8 +40,7 @@ use tightbeam::{
 	trace::TraceCollector,
 	transport::{
 		handshake::{negotiation::TransportOffer, HandshakeKeyManager},
-		multiplex::StreamBody,
-		serve::{CallContext, MuxService},
+		multiplex::{CallContext, MuxService, StreamBody},
 		ClientBuilder, ConnectionBuilder, ConnectionPool, EncryptedProtocol, PoolConfig, TransportEncryptionConfig,
 	},
 	utils::time::{Clock, ManualClock},
@@ -187,13 +187,11 @@ async fn start_laser_hive(
 }
 
 /// Submits one beam work request through a gateway via
-/// [`SubmitWork::submit_work_to`] and returns the servlet's response
-/// frame.
+/// [`SubmitWork::submit_work_to`] and returns the servlet's response frame.
 ///
-/// The typed request travels as the client's complete signed frame, so
-/// the servlet receives the same envelope over the laser transport as
-/// over any other protocol. A refusal surfaces as
-/// [`TightBeamError::WorkRefused`].
+/// The typed request travels as the client's complete signed frame, so the
+/// servlet receives the same envelope over the laser transport as over any
+/// other protocol. A refusal surfaces as [`TightBeamError::WorkRefused`].
 async fn emit_beam_work(certs: &GatewayCerts, addr: &LaserAddr) -> Result<Frame, TightBeamError> {
 	let mut inner = Version::V1
 		.compose()
@@ -337,10 +335,10 @@ tb_assert_spec! {
 	}
 }
 
-// A laser tightbeam reaches the cluster gateway and routes to a hive
-// servlet. The path runs from the client through the cluster and hive
-// control to the servlet. Every link uses the in-memory laser protocol,
-// encrypted and multiplexed.
+// A laser tightbeam reaches the cluster gateway and routes to a hive servlet.
+//
+// - The path runs from the client through the cluster and hive control to the servlet.
+// - Every link uses the in-memory laser protocol, encrypted and multiplexed.
 tb_scenario! {
 	name: cluster_routes_work_over_laser_protocol,
 	spec: LaserRoutingSpec,
@@ -388,13 +386,14 @@ tb_assert_spec! {
 	}
 }
 
-// The gateway registry is soft state. A replacement gateway starts empty
-// on the same stable address, the hive's anti-entropy beat re-registers
-// within one interval, and work routes again with no operator, no
-// consensus, and no persistence. The hive and both gateways share a clock
-// only this test moves, so the replacement routes only after the test lets
-// one interval pass, and the frames the beat signs stay fresh at the
-// gateway.
+// The gateway registry is soft state.
+//
+// - A replacement gateway starts empty on the same stable address.
+// - The hive's anti-entropy beat re-registers within one interval.
+// - Work routes again with no operator, no consensus, and no persistence.
+// - The hive and both gateways share a clock only this test moves, so the
+//   replacement routes only after the test lets one interval pass, and the
+//   frames the beat signs stay fresh at the gateway.
 tb_scenario! {
 	name: cluster_recovers_hive_after_gateway_restart,
 	spec: LaserGatewayRestartSpec,
