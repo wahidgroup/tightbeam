@@ -126,6 +126,18 @@ impl RouteKind {
 	}
 }
 
+/// The plane a route dials on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RoutePlane {
+	/// The hive plane, for a servlet of this gateway's own hives.
+	Hive,
+	/// The peer plane, for a route that leaves through a peer gateway.
+	Peer {
+		/// The slate key of the gateway the route dials.
+		gateway_id: SharedId,
+	},
+}
+
 /// A servlet instance tracked with pheromone score and trial count.
 ///
 /// The fields are private, so the route-key discipline holds by
@@ -404,6 +416,22 @@ impl ServletEntry {
 	#[must_use]
 	pub fn relay_id(&self) -> Option<&SharedId> {
 		self.relay_id.as_ref()
+	}
+
+	/// The plane this entry dials on, and for a peer route the gateway that
+	/// must answer: the advertising gateway for a direct route, and the relay
+	/// for a relay trail.
+	pub(crate) fn plane(&self) -> RoutePlane {
+		// A relay trail always names its relay. The origin stands in for a
+		// missing one, and the relay's socket cannot answer as the origin, so
+		// that hop fails closed.
+		let gateway_id = match self.route_kind {
+			RouteKind::Local => return RoutePlane::Hive,
+			RouteKind::Peer => &self.owner_id,
+			RouteKind::PeerRelay => self.relay_id.as_ref().unwrap_or(&self.owner_id),
+		};
+
+		RoutePlane::Peer { gateway_id: Arc::clone(gateway_id) }
 	}
 
 	/// Servlet type key bytes used for type-index lookup.

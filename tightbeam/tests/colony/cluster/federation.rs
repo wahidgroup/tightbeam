@@ -1,9 +1,11 @@
 //! Multi-hop federation tests for transitive discovery and relay fallback.
 //!
-//! The scenarios run three member gateways with distinct identities. Rumors
-//! teach a gateway about origins it never dialed, relay trails carry work
-//! around a dead direct address, and the `max_hops` clamp bounds the
-//! origin's sentinel budget.
+//! The scenarios run three member gateways with distinct identities:
+//!
+//! - Rumors teach a gateway about origins it never dialed.
+//! - Relay trails carry work around a dead direct address.
+//! - The `max_hops` clamp bounds the origin's sentinel budget.
+//! - A forward reaches only the gateway that signed the advertisement.
 
 use super::common::*;
 use super::streaming::{pooled_cluster_client, start_stream_hive};
@@ -46,7 +48,7 @@ fn federation_ctx() -> FederationCtx {
 	}
 }
 
-/// Member gateway conf on a fast beat: `peers` as anchors, the given
+/// A member gateway conf on a fast beat: `peers` as anchors, the given
 /// peer-plane store, and a fast rumor refresh so late-promoted flood
 /// targets still learn the slate within the test window.
 pub fn federation_conf(
@@ -101,7 +103,7 @@ fn mux_federation_conf(
 	with_mux_offer(federation_conf(certs, peer_trust, peers, max_hops))
 }
 
-/// Hive hosting the ping servlet under a distinct "beacon" type, so a
+/// A hive that hosts the ping servlet under a distinct "beacon" type, so a
 /// relay gateway owns registry entries (its dial address is learnable)
 /// without serving the type under test.
 async fn start_beacon_hive(
@@ -128,8 +130,7 @@ async fn start_beacon_hive(
 ///   every hop.
 /// - `PublishGossip` cannot serve here, because the publish plane re-creates
 ///   the rumor under the receiving gateway's own key.
-/// - Each call creates a fresh rumor, so every call floods anew. Ads dedup
-///   on digest and are never repaired.
+/// - Each call creates a fresh rumor, so every call floods anew. Ads dedup on digest and are never repaired.
 pub async fn flood_ad_rumor(
 	connect_certs: &ClusterTestCerts,
 	signer: &Secp256k1SigningKey,
@@ -264,10 +265,8 @@ tb_assert_spec! {
 // Transitive discovery routes real work: A learns C's ping type only
 // from B's relayed advertisement rumor, then dials C directly.
 //
-// - C anchors B and floods its slate rumor to it. B applies and
-//   refloods once its own beat promotes A.
-// - C's dial allowlist admits only B, so C never dials A: the trail A
-//   installs can only come from the rumor.
+// - C anchors B and floods its slate rumor to it. B applies and refloods once its own beat promotes A.
+// - C's dial allowlist admits only B, so C never dials A: the trail A installs can only come from the rumor.
 // - The forward is one hop from A to C, not a data hop through B.
 tb_scenario! {
 	name: cluster_transitive_rumor_installs_routable_trail,
@@ -312,6 +311,129 @@ tb_scenario! {
 }
 
 tb_assert_spec! {
+	pub ClusterBoundHopSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
+			(PEER_AD_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
+			(PEER_ROUTES_AFTER, exactly!(1), equals!(1u64)),
+			(WORK_SENT, exactly!(1)),
+			(events::CLUSTER_WORK_ROUTED, exactly!(0)),
+			(events::CLUSTER_WORK_FORWARDED, exactly!(0)),
+			(WORK_STATUS, exactly!(1), equals!(TransitStatus::Unavailable)),
+			(WORK_PAYLOAD, exactly!(1), equals!(0u64))
+		]
+	}
+}
+
+// Client work reaches only the gateway that signed the advertisement.
+//
+// C serves ping. An advertisement under B's key claims C's address at A, and
+// A trusts both on its peer plane. Neither gateway beats, so no probe touches
+// the route.
+//
+// - A ends the hop before the client's frame leaves, so C routes no work (CLUSTER_WORK_ROUTED exactly 0).
+// - The client reads the refusal (WORK_STATUS).
+tb_scenario! {
+	name: cluster_work_reaches_only_the_gateway_that_advertised,
+	spec: ClusterBoundHopSpec,
+	environment Hive {
+		context: federation_ctx(),
+		start: |SetupEnv { trace, context: ctx }| async move {
+			start_ping_hive(trace, Arc::clone(&ctx.c), None).await
+		},
+		client: |HiveEnv { trace, context: ctx, hive }| async move {
+			let mut conf_c = federation_conf(&ctx.c, Arc::clone(&ctx.peers_of_c), vec![], 1);
+			conf_c.peer.advertise_interval = None;
+
+			let gateway_c = start_cluster(&trace, conf_c).await?;
+			hive.register_with_cluster(gateway_c.addr()).await?;
+
+			let mut conf_a = federation_conf(&ctx.a, Arc::clone(&ctx.peers_of_a), vec![], 1);
+			conf_a.peer.advertise_interval = None;
+
+			let gateway_a = start_cluster(&trace, conf_a).await?;
+
+			let claimed = gateway_c.addr().to_string();
+			advertise_peer_signed(&trace, &ctx.a, &ctx.b.key, &gateway_a, claimed.as_bytes(), vec![servlet_urn("ping")]).await?;
+
+			let mut client = connect_cluster(&ctx.a, gateway_a.addr()).await?;
+			trace.event(WORK_SENT)?;
+
+			let refused_work = emit_ping_work(&mut client, &ctx.a.key, b"bound-hop-work").await;
+			record_work_refusal(&trace, refused_work)?;
+
+			gateway_a.stop();
+			gateway_c.stop();
+			hive.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterBoundStreamSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
+			(PEER_AD_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
+			(PEER_ROUTES_AFTER, exactly!(1), equals!(1u64)),
+			(WORK_SENT, exactly!(1)),
+			(STREAM_SERVLET_HANDLED, exactly!(0)),
+			(BOUND_STREAM_REFUSED, exactly!(1), equals!(true))
+		]
+	}
+}
+
+// A routed stream reaches only the gateway that signed the advertisement.
+//
+// The topology is the unary scenario above with stream-echo in place of ping.
+//
+// - A ends the splice at the dial, so C's servlet handles no stream (STREAM_SERVLET_HANDLED exactly 0).
+// - The client reads the refusal (BOUND_STREAM_REFUSED).
+tb_scenario! {
+	name: cluster_stream_reaches_only_the_gateway_that_advertised,
+	spec: ClusterBoundStreamSpec,
+	environment Hive {
+		context: federation_ctx(),
+		start: |SetupEnv { trace, context: ctx }| async move {
+			start_stream_hive(trace, Arc::clone(&ctx.c)).await
+		},
+		client: |HiveEnv { trace, context: ctx, hive }| async move {
+			let mut conf_c = mux_federation_conf(&ctx.c, Arc::clone(&ctx.peers_of_c), vec![], 1);
+			conf_c.peer.advertise_interval = None;
+
+			let gateway_c = start_cluster(&trace, conf_c).await?;
+			hive.register_with_cluster(gateway_c.addr()).await?;
+
+			let mut conf_a = mux_federation_conf(&ctx.a, Arc::clone(&ctx.peers_of_a), vec![], 1);
+			conf_a.peer.advertise_interval = None;
+
+			let gateway_a = start_cluster(&trace, conf_a).await?;
+
+			let claimed = gateway_c.addr().to_string();
+			let types = vec![servlet_urn("stream-echo")];
+			advertise_peer_signed(&trace, &ctx.a, &ctx.b.key, &gateway_a, claimed.as_bytes(), types).await?;
+
+			let client = pooled_cluster_client(&trace, &ctx.a, gateway_a.addr()).await?;
+			trace.event(WORK_SENT)?;
+
+			let (sink, response) = client.open_stream_to(servlet_urn("stream-echo"))?;
+			let closed = sink.close_with(b"bound-hop").await;
+			let answered = response.await;
+			trace.event_with(BOUND_STREAM_REFUSED, &[], closed.is_err() || answered.is_err())?;
+
+			gateway_a.stop();
+			gateway_c.stop();
+			hive.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
 	pub ClusterRelayFallbackSpec,
 	V(1,0,0): {
 		mode: Accept,
@@ -329,14 +451,13 @@ tb_assert_spec! {
 	}
 }
 
-// Relay fallback end-to-end at `max_hops = 2`: the origin's advertised
+// Relay fallback runs end-to-end at `max_hops = 2`: the origin's advertised
 // address is dead for A, yet work succeeds from A through B to C.
 //
 // - A learns C's slate only from a rumor claiming a dead dial address,
 //   relayed by B: A installs the dead direct trail and a relay trail
 //   through B (B's dial address is known from its beacon slate).
-// - B learns C's true address from a direct advertisement, so B's
-//   trail to C is live.
+// - B learns C's true address from a direct advertisement, so B's trail to C is live.
 // - A's work spends its clamped budget of two. A dead direct pick
 //   weakens and the bounded retry crosses the relay trail, while a
 //   relay pick crosses it immediately. Two forwards prove the two-hop path
@@ -366,8 +487,7 @@ tb_scenario! {
 
 			let gateway_a = start_cluster(&trace, federation_conf(&ctx.a, Arc::clone(&ctx.peers_of_a), vec![gateway_b.addr().to_string()], 2)).await?;
 
-			// Flood until A holds both trails: the dead direct and the
-			// relay via B.
+			// A's two routes are the dead direct trail and the relay via B.
 			let installed =
 				flood_until_routes(&ctx.a, &ctx.c.key, &gateway_b, &gateway_a, DEAD_GATEWAY_ADDR, "ping", 2).await?;
 			trace.event_with(RELAY_ROUTES_INSTALLED, &[], installed as u64)?;
@@ -415,12 +535,10 @@ tb_assert_spec! {
 	}
 }
 
-// Relay fallback covers routed streams at `max_hops = 2`: the same
-// topology as the unary scenario above, driven through a spliced
-// stream instead of unary work.
+// Relay fallback covers routed streams at `max_hops = 2`. The topology is the
+// unary scenario above, driven through a spliced stream instead of unary work.
 //
-// - A holds a dead direct trail and a relay trail through B, and B
-//   holds C's true address.
+// - A holds a dead direct trail and a relay trail through B, and B holds C's true address.
 // - A's splice spends its clamped budget of two. A dead direct pick fails
 //   at dial and the bounded retry crosses the relay trail, while a relay
 //   pick crosses it immediately. Two forwards prove the two-hop splice,
@@ -451,8 +569,7 @@ tb_scenario! {
 			let gateway_a =
 				start_cluster(&trace, mux_federation_conf(&ctx.a, Arc::clone(&ctx.peers_of_a), vec![gateway_b.addr().to_string()], 2)).await?;
 
-			// Flood until A holds both trails: the dead direct and the
-			// relay via B.
+			// A's two routes are the dead direct trail and the relay via B.
 			let installed =
 				flood_until_routes(&ctx.a, &ctx.c.key, &gateway_b, &gateway_a, DEAD_GATEWAY_ADDR, "stream-echo", 2)
 					.await?;
@@ -582,7 +699,7 @@ tb_scenario! {
 	}
 }
 
-/// Balancer that pins the first pick to one route key, so a scenario
+/// A balancer that pins the first pick to one route key, so a scenario
 /// deterministically dials a decoy before the bounded failover. An
 /// unset or excluded preference defers to the first candidate.
 struct DecoyFirstBalancer {
@@ -608,7 +725,7 @@ fn pin_preference(cell: &Mutex<Option<Vec<u8>>>, key: impl Into<Vec<u8>>) {
 	*preferred = Some(key);
 }
 
-/// Route key `cluster` holds for `type_name` toward `dial_addr`, read from
+/// The route key `cluster` holds for `type_name` toward `dial_addr`, read from
 /// the operator view so the key discipline stays with the registry.
 fn peer_route_key_for_dial(
 	cluster: &ClusterGateway,
@@ -652,8 +769,7 @@ tb_assert_spec! {
 //   two injected advertisements and the event counts are exact.
 // - The pinned balancer makes A dial B first, deterministically. The
 //   one `CLUSTER_WORK_UNAVAILABLE` fires on B, never on A.
-// - The echo proves the failover: A weakens the decoy trail and
-//   retries C's trail within the same request.
+// - The echo proves the failover: A weakens the decoy trail and retries C's trail within the same request.
 tb_scenario! {
 	name: cluster_live_peer_unavailable_reply_fails_over,
 	spec: ClusterLiveDecoyFailoverSpec,
@@ -698,7 +814,6 @@ tb_scenario! {
 			let installed = wait_for_type_routes(&gateway_a, "ping", 2, 100, Duration::from_millis(100)).await;
 			trace.event_with(PEER_ROUTES_AFTER_INSTALLS, &[], installed as u64)?;
 
-			// Pin the first pick to the decoy trail.
 			let decoy_key = peer_route_key_for_dial(&gateway_a, "ping", decoy_addr.as_bytes())
 				.ok_or(TightBeamError::MissingResponse)?;
 			pin_preference(&preferred, decoy_key);

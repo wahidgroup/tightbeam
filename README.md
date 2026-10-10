@@ -3047,6 +3047,7 @@ Behavior:
 4. A hive route and a peer route never share a socket. The gateway refuses whichever claim arrives second with `PermissionDenied`. Sockets compare as parsed addresses, so any spelling of one socket is the same socket.
 5. The load balancer chooses among local and peer routes together.
 6. Each forward spends a hop budget (`PeerConfig::max_hops`, default 1), so work cannot bounce between peers.
+7. A forward goes out only when the gateway that answers holds the key that signed the advertisement, or the relay's key for a relay trail. Any other answer ends the hop before a frame is sent. The trail counts a failure, and the client reads `Unavailable` unless another trail serves the retry.
 
 A gateway with an advertise beat that binds a wildcard address (`0.0.0.0` or `[::]`) MUST set `with_advertise_addr`, or it refuses to start with `ClusterError::AdvertiseAddressRequired`.
 

@@ -69,6 +69,7 @@ pooled_mux! {
 	use core::sync::atomic::AtomicU64;
 	use std::sync::{Mutex, PoisonError};
 
+	use crate::crypto::x509::error::CertificateValidationError;
 	use crate::runtime::rt;
 	use crate::utils::marker::MaybeSend;
 	use crate::transport::handshake::receipt::StoredReceipt;
@@ -1249,6 +1250,16 @@ pooled_mux! {
 
 		/// Fail over on cap exhaustion. The lease moves through the acquisition
 		/// funnel, pooled headroom before a fresh dial, and retries there once.
+		///
+		/// A caller may have judged the peer this lease pinned, and a fresh
+		/// dial of the same address pins whoever answers it. The failover
+		/// therefore lands on the certificate the lease pinned, or it ends
+		/// before the frame leaves (CWE-367).
+		///
+		/// # Errors
+		///
+		/// - [`TransportFailure::StreamsExhausted`] -- the pool offers no mux plane to move to.
+		/// - [`CertificateValidationError::CertificateNotPinned`] -- another peer answered the failover.
 		async fn emit_failover(&mut self, frame: Frame, attempt: Option<usize>) -> TransportResult<Option<Frame>> {
 			if self.pool.config.mux_offer.is_none() {
 				// A mux lease exists only when an offer is configured.
@@ -1258,10 +1269,18 @@ pooled_mux! {
 			#[cfg(feature = "instrument")]
 			self.pool.emit_event(events::POOL_FAILOVER);
 
-			*self = self
+			let pinned = self.mux.as_ref().and_then(|lease| lease.peer_certificate.clone());
+			let moved = self
 				.pool
 				.acquire_mux(&self.addr, MuxSelection::RequireHeadroom)
 				.await?;
+
+			let landed = moved.mux.as_ref().and_then(|lease| lease.peer_certificate.clone());
+			if pinned.is_some() && landed != pinned {
+				return Err(TransportError::InvalidCertificate(CertificateValidationError::CertificateNotPinned));
+			}
+
+			*self = moved;
 
 			match self.mux.as_ref() {
 				Some(lease) => {

@@ -23,7 +23,7 @@ use crate::colony::cluster::gossip::LocalClaimGuard;
 use crate::colony::cluster::peer::AdmittedPeerAd;
 use crate::colony::cluster::peer::ColonyCertificate;
 use crate::colony::cluster::runtime::bounds::{ClusterDigest, ClusterPool, GatewayRuntimeCtx};
-use crate::colony::cluster::runtime::hop::Hop;
+use crate::colony::cluster::runtime::hop::{Hop, PeerPlane};
 use crate::colony::cluster::runtime::refuse::Refusal;
 use crate::colony::cluster::runtime::{LoopFault, VerifiedSignerId};
 use crate::colony::cluster::{
@@ -85,15 +85,15 @@ impl GossipOrigin {
 }
 
 impl<P: Protocol> GatewayRuntimeCtx<P> {
-	/// The pool peers are dialed on.
+	/// The plane peers are dialed on.
 	///
 	/// A configured peer plane keeps peer traffic off the hive pool. With
 	/// no peer plane the hive pool serves both.
-	pub(crate) fn peer_dial_pool(&self) -> Arc<ClusterPool<P>> {
-		self.peer_pool
-			.as_ref()
-			.map(Arc::clone)
-			.unwrap_or_else(|| Arc::clone(&self.pool))
+	pub(crate) fn peer_dial_plane(&self) -> PeerPlane<P> {
+		match self.peer_plane.as_ref() {
+			Some(peer_plane) => peer_plane.clone(),
+			None => PeerPlane::new(Arc::clone(&self.pool), Arc::clone(&self.config)),
+		}
 	}
 }
 
@@ -239,13 +239,13 @@ impl GossipWant {
 	}
 }
 
-/// The peer pool outbound gossip floods and reconciles on.
+/// The peer plane outbound gossip floods and reconciles on.
 ///
 /// The advertise beat and the inbound reflood both reach peers through
 /// this one owner, so a rumor leaves on the same plane either way.
 struct GossipBeat<P: Protocol> {
 	config: Arc<ClusterConfig>,
-	peer_pool: Arc<ClusterPool<P>>,
+	peer_plane: PeerPlane<P>,
 	servlet_registry: Arc<ServletRegistry>,
 	trace: Arc<TraceCollector>,
 }
@@ -256,7 +256,7 @@ impl<P: Protocol> Clone for GossipBeat<P> {
 	fn clone(&self) -> Self {
 		Self {
 			config: Arc::clone(&self.config),
-			peer_pool: Arc::clone(&self.peer_pool),
+			peer_plane: self.peer_plane.clone(),
 			servlet_registry: Arc::clone(&self.servlet_registry),
 			trace: Arc::clone(&self.trace),
 		}
@@ -336,12 +336,12 @@ where
 				continue;
 			};
 
-			let dial_pool = Arc::clone(&self.peer_pool);
+			let dial_plane = self.peer_plane.clone();
 			// Each emit consumes an owned frame, so a fan-out to N targets
 			// needs N owned frames. The clone is that fan-out cost.
 			let frame = signed_frame.clone();
 			fanout.spawn(async move {
-				let Ok(mut client) = dial_pool.connect(peer_addr).await else {
+				let Ok(mut client) = dial_plane.connect_unbound(peer_addr).await else {
 					return false;
 				};
 
@@ -374,7 +374,7 @@ where
 		peer_addr: P::Address,
 		signed_frame: Frame,
 	) -> Result<TransitStatus, ClusterError> {
-		let mut client = self.peer_pool.connect(peer_addr).await?;
+		let mut client = self.peer_plane.connect_unbound(peer_addr).await?;
 		let response = client.emit(signed_frame, None).await?.ok_or(ClusterError::NoResponse)?;
 
 		let decoded: PeerAdvertisementResponse = decode(response.message())?;
@@ -472,8 +472,7 @@ where
 		// STRING bytes, so each fixed-size digest copies once here.
 		let held: Vec<Vec<u8>> = held_digests.iter().map(|digest| digest.to_vec()).collect();
 
-		let mut client = self.peer_pool.connect(peer_addr).await?;
-
+		let mut client = self.peer_plane.connect_unbound(peer_addr).await?;
 		// A feeler probe reconciles on a cold connection whose handshake
 		// defers to first emit. Completing it here is the only way to learn
 		// peer identity before the reconcile discloses anything (CWE-668).
@@ -518,6 +517,7 @@ where
 		if signing.is_err() {
 			return Ok(());
 		}
+
 		let response = client.emit(signed_frame, None).await?.ok_or(ClusterError::NoResponse)?;
 		let reply: GossipWant = decode(response.message())?;
 
@@ -531,7 +531,6 @@ where
 		// The decoded, in-bounds reply already proves liveness, so a fault in
 		// the bookkeeping below leaves the peer scored on its answer.
 		let local_round = self.settle_round::<D>(&mut client, reply, acked, peer, now).await;
-
 		// The round already succeeded, so a local fault in the bookkeeping
 		// skips the rest of the round without charging the peer. The next
 		// beat retries the skipped bookkeeping and repair.
@@ -770,8 +769,8 @@ pub(crate) struct GossipPipelineCtx<P: Protocol> {
 	pub(crate) config: Arc<ClusterConfig>,
 	/// The connection pool that local ingress delivery dials on.
 	pub(crate) pool: Arc<ClusterPool<P>>,
-	/// The peer dial pool, resolved once from the gateway's planes.
-	pub(crate) peer_pool: Arc<ClusterPool<P>>,
+	/// The peer dial plane, resolved once from the gateway's planes.
+	pub(crate) peer_plane: PeerPlane<P>,
 	/// The trace collector for gossip admission and refusal events.
 	pub(crate) trace: Arc<TraceCollector>,
 	/// The gateway's task group, which owns the reflood this pipeline starts,
@@ -782,12 +781,12 @@ pub(crate) struct GossipPipelineCtx<P: Protocol> {
 impl<P: Protocol> From<GatewayRuntimeCtx<P>> for GossipPipelineCtx<P> {
 	/// Projects the gateway's runtime state onto what a rumor needs.
 	fn from(ctx: GatewayRuntimeCtx<P>) -> Self {
-		let peer_pool = ctx.peer_dial_pool();
+		let peer_plane = ctx.peer_dial_plane();
 
 		Self {
 			servlet_registry: ctx.servlet_registry,
 			config: ctx.config,
-			peer_pool,
+			peer_plane,
 			pool: ctx.pool,
 			trace: ctx.trace,
 			tasks: ctx.tasks,
@@ -995,7 +994,7 @@ where
 
 		let flood = GossipBeat {
 			config: Arc::clone(&self.config),
-			peer_pool: Arc::clone(&self.peer_pool),
+			peer_plane: self.peer_plane.clone(),
 			servlet_registry: Arc::clone(&self.servlet_registry),
 			trace: Arc::clone(&self.trace),
 		};
@@ -1320,7 +1319,7 @@ where
 		let delivery = GossipPipelineCtx::from(self.clone());
 		let beat = GossipBeat {
 			config: Arc::clone(&self.config),
-			peer_pool: self.peer_dial_pool(),
+			peer_plane: self.peer_dial_plane(),
 			servlet_registry: Arc::clone(&self.servlet_registry),
 			trace: Arc::clone(&self.trace),
 		};

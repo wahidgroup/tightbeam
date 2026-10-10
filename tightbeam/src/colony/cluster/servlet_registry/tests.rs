@@ -6,8 +6,8 @@ use std::sync::{Arc, RwLockReadGuard};
 use std::thread;
 
 use super::{
-	ClusterError, HiveSlate, KindCaps, LocalRoute, PeerCaps, PeerRoute, PheromoneConfig, RelayRoute, RouteKind, Routes,
-	ServletEntry, ServletRegistry, SharedId, DEFAULT_ABANDONMENT_LIMIT, DEFAULT_INITIAL_PHEROMONE,
+	ClusterError, HiveSlate, KindCaps, LocalRoute, PeerCaps, PeerRoute, PheromoneConfig, RelayRoute, RouteKind,
+	RoutePlane, Routes, ServletEntry, ServletRegistry, SharedId, DEFAULT_ABANDONMENT_LIMIT, DEFAULT_INITIAL_PHEROMONE,
 };
 use crate::colony::cluster::peer::{AdmittedPeerAd, RelayTrail};
 use crate::colony::cluster::{AdmittedDial, PeerAddress};
@@ -196,6 +196,18 @@ fn relay_trail(
 	}
 }
 
+/// The one entry of a relay trail for `origin` through `relay`, dialing the
+/// relay at the fixture socket.
+fn relay_trail_entry(origin: impl AsRef<[u8]>, relay: impl AsRef<[u8]>) -> ServletEntry {
+	let mut slate = relay_trail(origin, relay, b"ping", b"127.0.0.1:9001").slate;
+	slate.pop().expect("the fixture trail holds one entry")
+}
+
+/// The peer plane bound to the gateway whose slate key is `gateway_id`.
+fn peer_plane(gateway_id: impl AsRef<[u8]>) -> RoutePlane {
+	RoutePlane::Peer { gateway_id: SharedId::from(gateway_id.as_ref()) }
+}
+
 /// Counts `times` failures against the route at `key`.
 fn weaken_times(registry: &ServletRegistry, key: impl AsRef<[u8]>, times: u32) -> Result<(), ClusterError> {
 	let key = key.as_ref();
@@ -288,6 +300,21 @@ fn entry_reinforce_resets_trials() {
 fn entry_route_kind_defaults_local() {
 	let entry = named_entry(b"addr1", b"calculator", b"hive1");
 	assert_eq!(entry.route_kind(), RouteKind::Local);
+}
+
+// A route dials on the hive plane, or on the peer plane bound to one gateway:
+// its advertiser for a direct route and the relay for a relay trail.
+tb_cases! {
+	fn entry_names_the_plane_it_dials_on((entry, plane): (ServletEntry, RoutePlane)) {
+		let named = entry.plane();
+		assert_eq!(named, plane);
+	}
+
+	cases {
+		a_local_route_dials_the_hive_plane => (named_entry(b"addr1", b"calc", b"hive1"), RoutePlane::Hive),
+		a_direct_route_names_its_advertiser => (peer_entry(b"ping", b"peer-a"), peer_plane(b"peer-a")),
+		a_relay_trail_names_its_relay => (relay_trail_entry(b"peer-a", b"peer-b"), peer_plane(b"peer-b")),
+	}
 }
 
 // A local entry dials the endpoint its key names: a name as the hive wrote

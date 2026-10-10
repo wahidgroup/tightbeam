@@ -11,6 +11,7 @@
 	feature = "instrument"
 ))]
 
+use core::future::Future;
 use core::time::Duration;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -19,9 +20,12 @@ use tightbeam::transport::state::ClientIdentity;
 use tightbeam::utils::time::{Clock, ManualClock};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
+use tokio::time::sleep;
 
 use tightbeam::at_least;
 use tightbeam::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
+use tightbeam::crypto::policy::Secp256k1Policy;
+use tightbeam::crypto::x509::store::{CertificateTrustBuilder, TrustBuilder};
 use tightbeam::crypto::x509::CertificateSpec;
 use tightbeam::der::asn1::OctetString;
 use tightbeam::exactly;
@@ -31,21 +35,22 @@ use tightbeam::prelude::TightBeamSocketAddr;
 use tightbeam::server;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_scenario;
-use tightbeam::testing::{ClientEnv, SetupEnv};
+use tightbeam::testing::{ClientEnv, SetupEnv, TestCertificate};
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::envelopes::MUX_APPLICATION_CODE_FLOOR;
 use tightbeam::transport::handshake::negotiation::{
 	AuthorizationGrant, AuthorizationRefusal, MuxBudgets, TransportAuthorizer, TransportOffer,
 };
 use tightbeam::transport::handshake::receipt::SessionReceipt;
+use tightbeam::transport::handshake::HandshakeKeyManager;
 use tightbeam::transport::multiplex::{
 	CallContext, MuxAcceptor, MuxRole, MuxService, MuxTransport, ReplySink, StreamBody,
 };
 use tightbeam::transport::policy::CollectorGateConfig;
 use tightbeam::transport::tcp::r#async::{TcpTransport, TokioListener, TokioStream};
 use tightbeam::transport::{
-	ClientBuilder, ConnectionBuilder, ConnectionPool, PoolConfig, PooledClient, ResponsePackage, TransportError,
-	TransportFailure,
+	ClientBuilder, ConnectionBuilder, ConnectionPool, EncryptedProtocol, PoolConfig, PooledClient, ResponsePackage,
+	TransportEncryptionConfig, TransportError, TransportFailure,
 };
 use tightbeam::utils::marker::MaybeSendFuture;
 use tightbeam::utils::urn::Urn;
@@ -57,6 +62,7 @@ use crate::common::security::{
 };
 use crate::transport::support::{
 	await_ok, await_receipt_rotation, bind_encrypted_listener, bind_mutual_listener, mux_frame, mux_offer,
+	record_spawned_event,
 };
 
 pub(crate) const CAPPED_FAILOVER_REUSES_POOLED_HEADROOM: Urn<'static> =
@@ -128,6 +134,12 @@ pub(crate) const UNSERVED_KIND_ANSWERS_UNIMPLEMENTED: Urn<'static> =
 	tightbeam::urn!("test", "event:pool-mux/unserved-kind-answers-unimplemented");
 pub(crate) const SINGLE_FLIGHT_ECHO_ON_MUX_SERVER: Urn<'static> =
 	tightbeam::urn!("test", "event:pool-mux/single-flight-echo-on-mux-server");
+pub(crate) const FAILOVER_IDENTITY_SERVER_ENTERED: Urn<'static> =
+	tightbeam::urn!("test", "event:pool-mux/failover-identity-server-entered");
+pub(crate) const PINNED_LEASE_REFUSES_OTHER_IDENTITY: Urn<'static> =
+	tightbeam::urn!("test", "event:pool-mux/pinned-lease-refuses-other-identity");
+pub(crate) const PINNED_LEASE_STAYS_REFUSED: Urn<'static> =
+	tightbeam::urn!("test", "event:pool-mux/pinned-lease-stays-refused");
 
 type EmitTask = JoinHandle<Result<Option<Frame>, TransportError>>;
 
@@ -686,6 +698,224 @@ tb_scenario! {
 			trace.event_with(OVERFLOW_EMIT_ECHOES_ON_SECOND_CONNECTION, &[], failed_over)?;
 
 			let held_completed = release_held_emit(&ctx, held_task).await?;
+			trace.event_with(HELD_EMIT_COMPLETES_AFTER_RELEASE, &[], held_completed)?;
+			Ok(())
+		}
+	}
+}
+
+/// Two trusted server identities for one address.
+///
+/// `gate` holds the first identity's materials and the hold on the first
+/// frame it serves. `second_certificate` and `second_provider` are a distinct
+/// identity, which takes the address over once the first listener closes.
+struct IdentityFlipContext {
+	gate: GatedContext,
+	second_certificate: Certificate,
+	second_provider: Arc<dyn SigningKeyProvider>,
+}
+
+impl IdentityFlipContext {
+	fn generate() -> Self {
+		let second_key = random_signing_key();
+		// A distinct CN, so the trust store validates the second certificate
+		// as its own anchor rather than chaining it under the first subject.
+		let second_certificate = TestCertificate::with_cn_and_uri_sans(&second_key, "pool-mux-second-identity", &[]);
+		let second_provider: Arc<dyn SigningKeyProvider> = Arc::new(Secp256k1KeyProvider::from(second_key));
+
+		Self { gate: GatedContext::generate(), second_certificate, second_provider }
+	}
+
+	/// A pool that trusts both identities, as a peer trust store that holds
+	/// two peers' certificates does.
+	fn pool_trusting_both(&self, trace: &TraceCollector) -> Result<Arc<ConnectionPool<TokioListener>>, TightBeamError> {
+		let trust_store = CertificateTrustBuilder::from(Secp256k1Policy)
+			.with_certificate(Certificate::clone(&self.gate.materials.certificate))?
+			.with_certificate(self.second_certificate.clone())?
+			.build();
+		let config = PoolConfig {
+			max_connections: 2,
+			mux_offer: Some(Arc::new(mux_offer(4))),
+			..PoolConfig::default()
+		};
+		let pool = ConnectionPool::<TokioListener>::builder()
+			.with_config(config)
+			.with_trust_store(Arc::new(trust_store))
+			.with_trace(trace.share())
+			.build();
+
+		Ok(Arc::new(pool))
+	}
+
+	/// The listener configuration of the second identity.
+	fn second_encryption(&self) -> TransportEncryptionConfig<tightbeam::crypto::profiles::DefaultCryptoProvider> {
+		let key_manager = HandshakeKeyManager::new(Arc::clone(&self.second_provider));
+		TransportEncryptionConfig::new(self.second_certificate.clone(), key_manager)
+	}
+}
+
+/// Serves one accepted connection as a mux echo server with a stream cap of
+/// `cap`, running `before_echo` ahead of each echo.
+///
+/// The driver tasks run detached, so the connection outlives the listener
+/// that accepted it.
+async fn serve_mux_echo_before<F, Fut>(
+	transport: TcpTransport<TokioStream>,
+	cap: u32,
+	before_echo: F,
+) -> Result<(), TransportError>
+where
+	F: Fn() -> Fut + Send + Sync + 'static,
+	Fut: Future<Output = ()> + Send + 'static,
+{
+	let mut transport = transport.with_mux_offer(Some(mux_offer(cap)));
+	let negotiated = transport.negotiate_mux().await?;
+	let settings = negotiated.ok_or(TransportError::InvalidState)?;
+
+	let (reader, writer) = transport.into_split()?;
+	let mux = MuxTransport::new(reader, writer, MuxRole::Server, settings);
+	let (_handle, reader_driver, writer_driver, responder) = mux.into_parts();
+
+	let echo = move |frame: Arc<Frame>| {
+		let hook = before_echo();
+		async move {
+			hook.await;
+			ResponsePackage::new(TransitStatus::Ok, Some(Frame::clone(&frame)))
+		}
+	};
+
+	tokio::spawn(reader_driver.drive());
+	tokio::spawn(writer_driver.drive());
+	tokio::spawn(responder.serve(echo));
+
+	Ok(())
+}
+
+/// Starts the first identity on a fresh address with a stream cap of 1.
+///
+/// The acceptor serves exactly one connection, whose first frame is held on
+/// the gate, and then ends. Ending drops the listener, so the address is free
+/// for the second identity while the accepted connection stays up.
+async fn start_first_identity_server(
+	ctx: &Arc<IdentityFlipContext>,
+) -> Result<(JoinHandle<()>, TightBeamSocketAddr), TightBeamError> {
+	let (listener, addr) = bind_pool_listener(&ctx.gate.materials).await?;
+	let first = Arc::new(AtomicBool::new(true));
+	let hold_ctx = Arc::clone(ctx);
+	let acceptor = tokio::spawn(async move {
+		let Ok((transport, _)) = listener.accept().await else {
+			return;
+		};
+
+		let hold = move || {
+			let ctx = Arc::clone(&hold_ctx);
+			let first = Arc::clone(&first);
+			async move {
+				if first.swap(false, Ordering::SeqCst) {
+					ctx.gate.started.notify_one();
+					ctx.gate.release.notified().await;
+				}
+			}
+		};
+		// The accepted connection serves on detached tasks. A negotiation
+		// failure ends this one connection, and the scenario reads the outcome
+		// from the trace.
+		let _ = serve_mux_echo_before(transport, 1, hold).await;
+	});
+
+	Ok((acceptor, addr))
+}
+
+/// Binds `addr` under `encryption`, retrying while the listener that held
+/// the port is still closing.
+async fn rebind_under(
+	addr: TightBeamSocketAddr,
+	encryption: impl Fn() -> TransportEncryptionConfig<tightbeam::crypto::profiles::DefaultCryptoProvider>,
+) -> Result<TokioListener, TightBeamError> {
+	let mut bound = TokioListener::bind_with(addr, encryption()).await;
+	let mut retries_left = 100;
+	while bound.is_err() && retries_left > 0 {
+		sleep(Duration::from_millis(20)).await;
+		bound = TokioListener::bind_with(addr, encryption()).await;
+		retries_left -= 1;
+	}
+
+	let (listener, _) = bound?;
+	Ok(listener)
+}
+
+/// Rebinds `addr` under the second identity and serves every accepted
+/// connection as a mux echo server that records
+/// `FAILOVER_IDENTITY_SERVER_ENTERED` ahead of each echo.
+async fn start_second_identity_server(
+	ctx: &IdentityFlipContext,
+	addr: TightBeamSocketAddr,
+	trace: TraceCollector,
+) -> Result<JoinHandle<()>, TightBeamError> {
+	let listener = rebind_under(addr, || ctx.second_encryption()).await?;
+	let acceptor = tokio::spawn(async move {
+		while let Ok((transport, _)) = listener.accept().await {
+			let trace = trace.share();
+			let witness = move || {
+				let trace = trace.share();
+				async move { record_spawned_event(&trace, FAILOVER_IDENTITY_SERVER_ENTERED, true) }
+			};
+			tokio::spawn(serve_mux_echo_before(transport, 1, witness));
+		}
+	});
+
+	Ok(acceptor)
+}
+
+tb_assert_spec! {
+	pub MuxFailoverIdentitySpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(FAILOVER_IDENTITY_SERVER_ENTERED, exactly!(0)),
+			(PINNED_LEASE_REFUSES_OTHER_IDENTITY, exactly!(1), equals!(true)),
+			(PINNED_LEASE_STAYS_REFUSED, exactly!(1), equals!(true)),
+			(MUX_LEASE_PINS_PEER_CERTIFICATE, exactly!(1), equals!(true)),
+			(events::POOL_DIAL, exactly!(2)),
+			(events::POOL_REUSE_MUX, exactly!(2)),
+			(events::POOL_FAILOVER, exactly!(2)),
+			(HELD_EMIT_COMPLETES_AFTER_RELEASE, exactly!(1), equals!(true))
+		]
+	}
+}
+
+// A lease pins the identity its connection handshook with.
+//
+// The cap-full connection makes an emit fail over to a fresh dial, and another
+// trusted identity now answers the address.
+//
+// - The emit returns an error and the frame stays with the caller.
+// - The lease keeps refusing: its second emit fails over onto the pooled
+//   connection of the other identity, which is why two failovers and two
+//   reuses are recorded against two dials.
+// - The second identity records every frame it serves, so the spec reads that it served none.
+tb_scenario! {
+	name: pooled_mux_failover_refuses_another_identity,
+	spec: MuxFailoverIdentitySpec,
+	environment ServiceClient {
+		context: IdentityFlipContext::generate(),
+		server: |env| async move { start_first_identity_server(&env.context).await },
+		client: |ClientEnv { trace, context: ctx, addr }| async move {
+			let pool = ctx.pool_trusting_both(&trace)?;
+			let held_lease = pool.connect(addr).await?;
+			let mut pinned_lease = pool.connect(addr).await?;
+			let pinned_first = pinned_lease.peer_certificate() == Some(&*ctx.gate.materials.certificate);
+			let held_task = spawn_held_emit(&ctx.gate, held_lease).await;
+			let _second_server = start_second_identity_server(&ctx, addr, trace.share()).await?;
+
+			let refused = pinned_lease.emit(mux_frame("mux-after-pin"), None).await;
+			let refused_again = pinned_lease.emit(mux_frame("mux-after-refusal"), None).await;
+
+			trace.event_with(MUX_LEASE_PINS_PEER_CERTIFICATE, &[], pinned_first)?;
+			trace.event_with(PINNED_LEASE_REFUSES_OTHER_IDENTITY, &[], refused.is_err())?;
+			trace.event_with(PINNED_LEASE_STAYS_REFUSED, &[], refused_again.is_err())?;
+
+			let held_completed = release_held_emit(&ctx.gate, held_task).await?;
 			trace.event_with(HELD_EMIT_COMPLETES_AFTER_RELEASE, &[], held_completed)?;
 			Ok(())
 		}

@@ -31,6 +31,7 @@ use std::sync::{Arc, Mutex};
 use self::bounds::{ClusterDigest, ClusterPool, GatewayAcceptProtocol, GatewayColonyProtocol, GatewayRuntimeCtx};
 use self::freshness::GatewayReplayGuard;
 use self::heartbeat::HiveBeat;
+use self::hop::PeerPlane;
 use crate::colony::cluster::peer::WireHopBudget;
 use crate::colony::cluster::{
 	Cluster, ClusterConfig, ClusterError, ClusterHeartbeat, HeartbeatConfig, HiveRegistry, HopBudget, PeerRouteInfo,
@@ -274,7 +275,7 @@ where
 		let servlet_registry = Arc::new(routes);
 		let pools = config.pool_config.build_cluster_pools::<P>(&config.tls, &config.clock)?;
 		let pool = pools.hive;
-		let peer_pool = pools.peer;
+		let peer_plane = pools.peer.map(|peer_pool| PeerPlane::new(peer_pool, Arc::clone(&config)));
 
 		let replay_guard_for_server = GatewayReplayGuard::new(control_window, Arc::clone(&config.clock));
 		let tasks = TaskGroup::default();
@@ -284,7 +285,7 @@ where
 			admission: Arc::new(Mutex::new(())),
 			config: Arc::clone(&config),
 			pool: Arc::clone(&pool),
-			peer_pool: peer_pool.as_ref().map(Arc::clone),
+			peer_plane,
 			trace: Arc::clone(&trace),
 			replay_guard: replay_guard_for_server,
 			tasks: tasks.clone(),

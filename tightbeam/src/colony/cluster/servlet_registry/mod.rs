@@ -21,6 +21,7 @@ use crate::constants::DEFAULT_COMMAND_FRESHNESS_WINDOW_MS;
 use crate::utils::time::{Clock, MonotonicInstant, UnixMillis};
 
 use entry::Owner;
+pub(crate) use entry::RoutePlane;
 
 pub(super) use super::error::ClusterError;
 pub(super) use super::SharedId;

@@ -1,28 +1,29 @@
 //! Origin, freshness, and export-boundary checks for cluster control traffic.
 //!
-//! The gateway runs these predicates before or beside request dispatch.
-//! Gate policies evaluate on every admitted session. The export boundary
-//! evaluates once a servlet target is known. Origin and freshness checks
-//! apply to signed control frames on the hive and peer planes.
+//! The gateway runs these predicates before or beside request dispatch:
+//!
+//! - Gate policies evaluate on every admitted session.
+//! - The export boundary evaluates once a servlet target is known.
+//! - Origin and freshness checks apply to signed control frames on the hive and peer planes.
 //!
 //! # Gate policies
 //!
-//! [`ClusterConfig::evaluate_gates`] runs configured [`GatePolicy`] instances before the
-//! request envelope is decoded. Stream opens carry no request frame, so they
-//! pass `None` for the frame argument.
+//! [`ClusterConfig::evaluate_gates`] runs configured [`GatePolicy`] instances
+//! before the request envelope is decoded. Stream opens carry no request frame,
+//! so they pass `None` for the frame argument.
 //!
 //! # Export boundary
 //!
-//! [`ClusterConfig::evaluate_export_gates`] runs [`ExportPolicy`] where the servlet target
-//! is resolved: allowlist, then grants, then deny gates.
+//! [`ClusterConfig::evaluate_export_gates`] runs [`ExportPolicy`] where the
+//! servlet target is resolved: allowlist, then grants, then deny gates.
 //! [`HopBudget::is_relayed`] supplies the `relayed` flag. Verdict algebra and
 //! posture warnings live in [`crate::colony::cluster::export`].
 //!
 //! # Origin and freshness
 //!
 //! [`ClusterConfig::verify_hive`] and [`ClusterConfig::verify_peer`] verify one
-//! control frame and return [`VerifiedControlFrame`]. [`GatewayReplayGuard`] rejects
-//! stale or replayed signed control frames.
+//! control frame and return [`VerifiedControlFrame`]. [`GatewayReplayGuard`]
+//! rejects stale or replayed signed control frames.
 //!
 //! [`GatewayReplayGuard`]: super::freshness::GatewayReplayGuard
 
@@ -54,7 +55,7 @@ impl ExportAudit<'_> {
 	/// The event value carries the `relayed` flag. Where mutual TLS
 	/// captured a caller certificate, the payload is its fingerprint,
 	/// matching the peer-advertisement refusal convention. An anonymous
-	/// session emits no payload.
+	/// session emits the event alone.
 	fn record(&self, outcome: Urn<'static>) -> Result<(), TightBeamError> {
 		let fingerprint = self.session.peer_certificate().and_then(ColonyCertificate::fingerprint_id);
 		let event = self.trace.event_with(outcome, &[], self.relayed)?;
@@ -67,11 +68,11 @@ impl ExportAudit<'_> {
 	}
 }
 
-/// Owned slate key minted with [`VerifiedControlFrame`].
+/// The owned slate key created with [`VerifiedControlFrame`].
 ///
-/// Only [`ClusterConfig::verify_plane`] constructs this. Gossip may
-/// carry the id across `.await` without the borrowed certificate, and
-/// a bare [`SharedId`] cannot stand in for it.
+/// Only [`ClusterConfig::verify_plane`] constructs this. Gossip may carry the
+/// id across `.await` without the borrowed certificate, and the newtype keeps
+/// it distinct from a bare [`SharedId`].
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct VerifiedSignerId(SharedId);
 
@@ -91,11 +92,10 @@ impl VerifiedSignerId {
 
 /// One verified inbound control frame.
 ///
-/// Minted only by [`ClusterConfig::verify_hive`] or
-/// [`ClusterConfig::verify_peer`]. The signature check runs once.
-/// [`Party`] comes from [`TrustPlanes::classify`] on the certificate
-/// that check resolved, so a later step does not verify or look the
-/// signer up again.
+/// Only [`ClusterConfig::verify_hive`] or [`ClusterConfig::verify_peer`]
+/// creates one. The signature check runs once. [`Party`] comes from
+/// [`TrustPlanes::classify`] on the certificate that check resolved, so a
+/// later step reuses this verification and this signer lookup.
 pub(crate) struct VerifiedControlFrame<'a> {
 	frame: &'a Frame,
 	signer_cert: &'a Certificate,
@@ -110,19 +110,19 @@ impl<'a> VerifiedControlFrame<'a> {
 		self.frame
 	}
 
-	/// Certificate the signature verified against.
+	/// The certificate the signature verified against.
 	#[must_use]
 	pub(crate) fn signer_cert(&self) -> &'a Certificate {
 		self.signer_cert
 	}
 
-	/// Plane membership of [`Self::signer_cert`].
+	/// The plane membership of [`Self::signer_cert`].
 	#[must_use]
 	pub(crate) fn party(&self) -> Party {
 		self.party
 	}
 
-	/// Slate key for [`Self::signer_cert`].
+	/// The slate key for [`Self::signer_cert`].
 	#[must_use]
 	pub(crate) fn fingerprint(&self) -> VerifiedSignerId {
 		self.fingerprint.clone()
@@ -169,7 +169,21 @@ impl ClusterConfig {
 		Ok(VerifiedControlFrame { frame, signer_cert, party, fingerprint })
 	}
 
-	/// Run configured [`GatePolicy`] instances with no audit side effects.
+	/// The slate key of the gateway that presented `cert` in a handshake.
+	///
+	/// A control frame keys its signer by the certificate `peer_trust` holds
+	/// for the signing key. The presented certificate resolves to that enrolled
+	/// one first, so a gateway that rotated its certificate under one key keeps
+	/// the key its advertisements carry. It is `None` with no peer trust, or
+	/// for a key the store does not hold.
+	pub(crate) fn peer_identity(&self, cert: &Certificate) -> Option<SharedId> {
+		let trust = self.tls.peer_trust.as_deref()?;
+		let enrolled = trust.enrolled_certificate(cert)?;
+		enrolled.fingerprint_id()
+	}
+
+	/// Run configured [`GatePolicy`] instances and leave the audit event to
+	/// the caller.
 	pub(crate) fn policies_allow(&self, frame: Option<&Frame>, session: &SessionContext) -> Result<(), TransitStatus> {
 		let config = self;
 		for policy in config.policies.iter() {
@@ -187,7 +201,7 @@ impl ClusterConfig {
 	/// Each configured policy must return [`TransitStatus::Ok`], so the first
 	/// refusal short-circuits dispatch.
 	///
-	/// - `frame`: request envelope when present; `None` for stream opens that carry no unary frame
+	/// - `frame`: request envelope when present, or `None` for stream opens that carry no unary frame
 	/// - `session`: caller identity and transport facts for the admitted connection
 	/// - `trace`: collector that receives [`CLUSTER_GATE_BLOCKED`] on refusal
 	pub(crate) fn evaluate_gates(
@@ -231,10 +245,8 @@ impl ClusterConfig {
 	///
 	/// # Sources
 	///
-	/// - CWE-285, improper authorization:
-	///   <https://cwe.mitre.org/data/definitions/285.html>
-	/// - ISO/IEC 27001:2022 A.8.15, logging:
-	///   <https://www.iso.org/standard/82875.html>
+	/// - CWE-285, improper authorization: <https://cwe.mitre.org/data/definitions/285.html>
+	/// - ISO/IEC 27001:2022 A.8.15, logging: <https://www.iso.org/standard/82875.html>
 	pub(crate) fn evaluate_export_gates(
 		&self,
 		target: &Urn<'_>,
@@ -316,7 +328,7 @@ mod tests {
 			.expect("test names satisfy the mint grammar")
 	}
 
-	/// Config exporting only "ping", so "ledger" needs a grant.
+	/// A config that exports only "ping", so "ledger" needs a grant.
 	fn exporting_config() -> ClusterConfig {
 		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
 		let mut config = ClusterConfig::new(
@@ -328,6 +340,21 @@ mod tests {
 		);
 		config.peer.exported_types = Some(Arc::new(StaticExportList::new(vec![servlet("ping")])));
 
+		config
+	}
+
+	/// A peer gateway key, distinct from the fixed key the config presents.
+	fn peer_key() -> Secp256k1SigningKey {
+		Secp256k1SigningKey::from_bytes(&[2u8; 32].into()).expect("the fixture scalar is a valid key")
+	}
+
+	/// A config whose peer plane enrolls `enrolled` alone.
+	fn config_enrolling(enrolled: &Certificate) -> ClusterConfig {
+		let builder = CertificateTrustBuilder::from(Secp256k1Policy).with_certificate(enrolled.clone());
+		let store = builder.expect("the test certificate satisfies the trust builder").build();
+
+		let mut config = exporting_config();
+		config.tls.peer_trust = Some(Arc::new(store));
 		config
 	}
 
@@ -418,6 +445,32 @@ mod tests {
 			.attach_signature(signature.to_bytes(), sig_alg, digest_alg, sid)
 			.expect("test signature attaches");
 		frame
+	}
+
+	/// A gateway that rotated its certificate under one key keeps the slate
+	/// key of the certificate the peer plane enrolled.
+	#[test]
+	fn peer_identity_names_a_rotated_certificate_by_its_enrolled_one() {
+		let key = peer_key();
+		let enrolled = TestCertificate::with_cn_and_uri_sans(&key, "enrolled", &["urn:tightbeam:colony:test"]);
+		let rotated = TestCertificate::with_cn_and_uri_sans(&key, "rotated", &["urn:tightbeam:colony:test"]);
+		let config = config_enrolling(&enrolled);
+
+		let named = config.peer_identity(&rotated);
+		assert_eq!(named, enrolled.fingerprint_id());
+		assert_ne!(named, rotated.fingerprint_id());
+	}
+
+	/// A certificate whose key the peer plane does not hold names no gateway,
+	/// so a bound hop it answers fails closed.
+	#[test]
+	fn peer_identity_names_no_gateway_for_an_unenrolled_key() {
+		let enrolled = TestCertificate::self_signed(&peer_key());
+		let stranger = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+		let config = config_enrolling(&enrolled);
+
+		let named = config.peer_identity(&stranger);
+		assert_eq!(named, None);
 	}
 
 	#[test]

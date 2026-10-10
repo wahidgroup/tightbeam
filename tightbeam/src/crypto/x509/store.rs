@@ -166,20 +166,25 @@ pub trait CertificateTrust: CertificateValidation + Debug + Send + Sync {
 	/// Returns whether this store holds any certificate for `cert`'s public
 	/// key.
 	///
-	/// Membership is the SubjectKeyIdentifier of the SPKI, resolved through
-	/// [`Self::find_by_signer_identifier`]. A rotated certificate for an
-	/// enrolled key still matches. Implementors that answer SID lookup
-	/// correctly get this behavior without an override.
+	/// Membership is [`Self::enrolled_certificate`] answering for the key, so
+	/// a rotated certificate for an enrolled key still matches. Implementors
+	/// that answer SID lookup correctly get this behavior without an override.
 	#[must_use = "a dropped membership answer leaves the plane gate unenforced"]
 	fn trusts_public_key(&self, cert: &Certificate) -> bool {
-		let Ok(spki_der) = cert.tbs_certificate.subject_public_key_info.to_der() else {
-			return false;
-		};
-		let Ok(sid) = SignerIdentifier::try_from(Skid::of_public_key(spki_der)) else {
-			return false;
-		};
+		self.enrolled_certificate(cert).is_some()
+	}
 
-		self.find_by_signer_identifier(&sid).is_some()
+	/// Returns the certificate this store holds for `cert`'s public key.
+	///
+	/// The lookup is the SubjectKeyIdentifier of the SPKI, resolved through
+	/// [`Self::find_by_signer_identifier`]. A rotated certificate for an
+	/// enrolled key therefore resolves to the enrolled one, which is the
+	/// certificate a signature by that key verifies against.
+	fn enrolled_certificate(&self, cert: &Certificate) -> Option<&Certificate> {
+		let spki_der = cert.tbs_certificate.subject_public_key_info.to_der().ok()?;
+		let sid = SignerIdentifier::try_from(Skid::of_public_key(spki_der)).ok()?;
+
+		self.find_by_signer_identifier(&sid)
 	}
 
 	/// Verify a certificate chain with partial RFC 5280 §6.1 path validation.

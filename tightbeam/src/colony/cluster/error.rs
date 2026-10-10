@@ -39,6 +39,11 @@ pub enum ClusterError {
 	#[error("Connect failed")]
 	ConnectFailed,
 
+	/// The gateway that answered a peer hop is not the gateway the route names,
+	/// so the hop ended before any frame was sent to it.
+	#[error("Peer identity mismatch")]
+	PeerMismatch,
+
 	/// The peer accepted the request but returned no response frame.
 	#[error("No response")]
 	NoResponse,
@@ -167,10 +172,26 @@ mod tests {
 
 			assert_eq!(status, expected);
 		}
+
 		cases {
 			a_poisoned_lock_is_unavailable => (ClusterError::LockPoisoned, TransitStatus::Unavailable),
 			a_signer_mismatch_is_denied => (ClusterError::SignerMismatch, TransitStatus::PermissionDenied),
 			an_unowned_servlet_is_denied => (ClusterError::ServletNotOwned, TransitStatus::PermissionDenied),
+		}
+	}
+
+	// A hop that never reached its gateway answers unavailable, so the trail
+	// weakens and the bounded retry takes the next route.
+	tb_cases! {
+		fn forward_status_of((error, expected): (ClusterError, TransitStatus)) {
+			let status = error.forward_status();
+
+			assert_eq!(status, expected);
+		}
+
+		cases {
+			a_failed_dial_is_unavailable => (ClusterError::ConnectFailed, TransitStatus::Unavailable),
+			another_gateway_at_the_socket_is_unavailable => (ClusterError::PeerMismatch, TransitStatus::Unavailable),
 		}
 	}
 }

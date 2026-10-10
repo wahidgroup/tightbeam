@@ -5,8 +5,10 @@ use core::hash::Hash;
 use core::str::FromStr;
 use std::sync::Arc;
 
+use crate::colony::cluster::runtime::bounds::ClusterPool;
 use crate::colony::cluster::runtime::bounds::GatewayRuntimeCtx;
-use crate::colony::cluster::runtime::hop::Hop;
+use crate::colony::cluster::runtime::hop::{Hop, PeerPlane};
+use crate::colony::cluster::servlet_registry::RoutePlane;
 use crate::colony::cluster::{
 	ClusterConfig, ClusterError, ClusterWorkResponse, DialTarget, HopBudget, RouteKind, ServletRegistry,
 };
@@ -31,11 +33,39 @@ use crate::{Frame, TightBeamError};
 ///
 /// - `route_key` is the pheromone key to reinforce or weaken.
 /// - `dial` is the endpoint to dial.
-/// - `route_kind` picks the dial plane: hive for local, peer otherwise.
+/// - `plane` is the plane the route dials on, with the gateway a peer route names.
 pub(crate) struct RouteChoice {
 	pub(crate) route_key: Arc<[u8]>,
 	pub(crate) dial: DialTarget,
-	pub(crate) route_kind: RouteKind,
+	pub(crate) plane: RoutePlane,
+}
+
+impl RouteChoice {
+	/// Whether the route forwards to a peer gateway.
+	pub(crate) fn is_peer(&self) -> bool {
+		matches!(self.plane, RoutePlane::Peer { .. })
+	}
+
+	/// The hop this route dials: on `hive` for a local route, and on `peers`
+	/// for a peer route, bound to the gateway the route names.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::ConnectFailed`] -- a peer route with no peer plane configured.
+	pub(crate) fn hop<'p, P: Protocol>(
+		&'p self,
+		hive: &'p Arc<ClusterPool<P>>,
+		peers: Option<&'p PeerPlane<P>>,
+	) -> Result<Hop<'p, P>, ClusterError> {
+		let dial = self.dial.clone();
+		match &self.plane {
+			RoutePlane::Hive => Ok(Hop::new(hive, dial)),
+			RoutePlane::Peer { gateway_id } => {
+				let peers = peers.ok_or(ClusterError::ConnectFailed)?;
+				Ok(peers.hop(dial, gateway_id))
+			}
+		}
+	}
 }
 
 /// Decoded outcome of one answered forward.
@@ -53,11 +83,11 @@ enum ForwardOutcome {
 
 impl ForwardOutcome {
 	/// Classify one answered forward by route kind.
-	fn classify(route_kind: RouteKind, response_payload: impl Into<Vec<u8>>) -> Self {
+	fn classify(plane: &RoutePlane, response_payload: impl Into<Vec<u8>>) -> Self {
 		let response_payload: Vec<u8> = response_payload.into();
-		match route_kind {
-			RouteKind::Local => Self::Local(response_payload),
-			RouteKind::Peer | RouteKind::PeerRelay => match decode::<ClusterWorkResponse>(&response_payload) {
+		match plane {
+			RoutePlane::Hive => Self::Local(response_payload),
+			RoutePlane::Peer { .. } => match decode::<ClusterWorkResponse>(&response_payload) {
 				Ok(peer_response) => Self::Peer(peer_response),
 				Err(_) => Self::PeerGarbled,
 			},
@@ -127,27 +157,24 @@ where
 		frame_cache: &mut Option<Frame>,
 	) -> Result<Vec<u8>, ClusterError> {
 		let payload: Vec<u8> = payload.into();
-		let dial = choice.dial.clone();
+		let hop = choice.hop(&self.pool, self.peer_plane.as_ref())?;
 
 		// Local hops deliver the client's frame on the hive
 		// trust plane. Peer hops re-enter the peer gateway as Work with
 		// the budget decremented, on the peer trust plane.
-		match choice.route_kind {
-			RouteKind::Local => {
+		match choice.plane {
+			RoutePlane::Hive => {
 				let frame = match frame_cache.take() {
 					Some(frame) => frame,
 					None => decode(&payload)?,
 				};
-				Hop::new(&self.pool, dial).deliver_frame(frame).await
+				hop.deliver_frame(frame).await
 			}
-			RouteKind::Peer | RouteKind::PeerRelay => match self.peer_pool.as_ref() {
-				Some(peer_pool) => {
-					let work = budget.relayed_work(servlet_type.clone(), payload);
-					let envelope = encode(&ClusterRequest::Work(work))?;
-					Hop::new(peer_pool, dial).deliver_envelope(envelope).await
-				}
-				None => Err(ClusterError::ConnectFailed),
-			},
+			RoutePlane::Peer { .. } => {
+				let work = budget.relayed_work(servlet_type.clone(), payload);
+				let envelope = encode(&ClusterRequest::Work(work))?;
+				hop.deliver_envelope(envelope).await
+			}
 		}
 	}
 
@@ -259,7 +286,7 @@ where
 			// that fail.
 			match forward_result {
 				Ok(response_payload) => {
-					let outcome = ForwardOutcome::classify(choice.route_kind, response_payload);
+					let outcome = ForwardOutcome::classify(&choice.plane, response_payload);
 
 					// A live peer that reports it cannot serve the type
 					// joins the same bounded failover as a transport
@@ -351,7 +378,7 @@ impl ServletRegistry {
 		Some(RouteChoice {
 			route_key: Arc::clone(selected_entry.route_key()),
 			dial: selected_entry.dial_target().clone(),
-			route_kind: selected_entry.route_kind(),
+			plane: selected_entry.plane(),
 		})
 	}
 
@@ -398,7 +425,8 @@ mod tests {
 	use super::*;
 	use crate::colony::cluster::peer::WireHopBudget;
 	use crate::colony::cluster::{
-		AdmittedDial, PeerRoute, RelayRoute, ServletEntry, DEFAULT_ABANDONMENT_LIMIT, DEFAULT_INITIAL_PHEROMONE,
+		AdmittedDial, PeerRoute, RelayRoute, ServletEntry, SharedId, DEFAULT_ABANDONMENT_LIMIT,
+		DEFAULT_INITIAL_PHEROMONE,
 	};
 	use crate::colony::common::{ColonyNamespace, InstanceMetrics, LoadBalancer};
 	use crate::constants::{DEFAULT_HOP_BUDGET, DEFAULT_MAX_HOPS};
@@ -462,9 +490,19 @@ mod tests {
 		encode(response).expect("test responses satisfy the codec")
 	}
 
+	/// The plane of a direct peer route.
+	fn peer_plane() -> RoutePlane {
+		peer_entry(b"first", "192.0.2.1:9001").plane()
+	}
+
+	/// The plane of a relay trail, which names its relay.
+	fn relay_plane() -> RoutePlane {
+		relay_entry(b"origin", b"relay", "192.0.2.3:9001").plane()
+	}
+
 	#[test]
 	fn forward_outcome_local_reply_never_fails_over() {
-		let outcome = ForwardOutcome::classify(RouteKind::Local, b"pong".to_vec());
+		let outcome = ForwardOutcome::classify(&RoutePlane::Hive, b"pong".to_vec());
 		assert!(!outcome.is_unavailable());
 		assert!(matches!(outcome, ForwardOutcome::Local(payload) if payload == b"pong"));
 	}
@@ -472,30 +510,30 @@ mod tests {
 	#[test]
 	fn forward_outcome_peer_unavailable_reply_fails_over() {
 		let bytes = encoded_work_response(&ClusterWorkResponse::err(TransitStatus::Unavailable));
-		assert!(ForwardOutcome::classify(RouteKind::Peer, bytes).is_unavailable());
+		assert!(ForwardOutcome::classify(&peer_plane(), bytes).is_unavailable());
 	}
 
 	#[test]
 	fn forward_outcome_relay_unavailable_reply_fails_over() {
 		let bytes = encoded_work_response(&ClusterWorkResponse::err(TransitStatus::Unavailable));
-		assert!(ForwardOutcome::classify(RouteKind::PeerRelay, bytes).is_unavailable());
+		assert!(ForwardOutcome::classify(&relay_plane(), bytes).is_unavailable());
 	}
 
 	#[test]
 	fn forward_outcome_peer_ok_reply_settles() {
 		let bytes = encoded_work_response(&ClusterWorkResponse::ok(b"pong".to_vec()));
-		assert!(!ForwardOutcome::classify(RouteKind::Peer, bytes).is_unavailable());
+		assert!(!ForwardOutcome::classify(&peer_plane(), bytes).is_unavailable());
 	}
 
 	#[test]
 	fn forward_outcome_peer_refusal_relays_unchanged() {
 		let bytes = encoded_work_response(&ClusterWorkResponse::err(TransitStatus::PermissionDenied));
-		assert!(!ForwardOutcome::classify(RouteKind::Peer, bytes).is_unavailable());
+		assert!(!ForwardOutcome::classify(&peer_plane(), bytes).is_unavailable());
 	}
 
 	#[test]
 	fn forward_outcome_garbled_peer_reply_fails_over() {
-		let outcome = ForwardOutcome::classify(RouteKind::Peer, b"not-a-response".to_vec());
+		let outcome = ForwardOutcome::classify(&peer_plane(), b"not-a-response".to_vec());
 		assert!(matches!(outcome, ForwardOutcome::PeerGarbled));
 		assert!(outcome.is_unavailable());
 	}
@@ -557,7 +595,6 @@ mod tests {
 	fn config_balancing_with(balancer: Arc<dyn LoadBalancer>) -> ClusterConfig {
 		let mut config = test_config();
 		config.load_balancer = balancer;
-
 		config
 	}
 
@@ -627,7 +664,8 @@ mod tests {
 		let below = registry.select_route(&config, &type_key, HopBudget::for_test(1), None);
 		let at_gate = registry.select_route(&config, &type_key, HopBudget::for_test(2), None);
 		assert!(below.is_none());
-		assert!(matches!(at_gate, Some(choice) if choice.route_kind == RouteKind::PeerRelay));
+		let relay = RoutePlane::Peer { gateway_id: SharedId::from(b"relay".as_slice()) };
+		assert_eq!(at_gate.map(|choice| choice.plane), Some(relay));
 		Ok(())
 	}
 

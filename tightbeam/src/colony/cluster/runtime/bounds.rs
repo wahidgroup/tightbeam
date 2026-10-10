@@ -1,4 +1,5 @@
-//! Shared pool, digest, and request-context types for cluster gateway runtime.
+//! Shared pool, digest, and request-context types for the cluster gateway
+//! runtime.
 
 use core::hash::Hash;
 use core::str::FromStr;
@@ -9,6 +10,7 @@ use digest::{Digest, OutputSizeUser};
 
 use crate::colony::cluster::registry::ColonyMembership;
 use crate::colony::cluster::runtime::freshness::GatewayReplayGuard;
+use crate::colony::cluster::runtime::hop::PeerPlane;
 use crate::colony::cluster::{ClusterConfig, HiveRegistry, ServletRegistry};
 use crate::colony::common::TaskGroup;
 use crate::crypto::profiles::DefaultCryptoProvider;
@@ -57,7 +59,7 @@ impl<T> GatewayAcceptProtocol for T where
 {
 }
 
-/// Colony protocol: accept plane plus outbound pool dial stack.
+/// Colony protocol: the accept plane plus the dial stack of the outbound pool.
 ///
 /// Edge protocols need only [`GatewayAcceptProtocol`]. The colony type is
 /// also the pool protocol (`P`) for hive and peer dials.
@@ -107,8 +109,8 @@ pub(crate) struct GatewayRuntimeCtx<P: Protocol> {
 	pub(crate) config: Arc<ClusterConfig>,
 	/// Connection pool this gateway dials hives on.
 	pub(crate) pool: Arc<ClusterPool<P>>,
-	/// Connection pool reserved for peer gateways, when one is configured.
-	pub(crate) peer_pool: Option<Arc<ClusterPool<P>>>,
+	/// The plane peer gateways are dialed on, when one is configured.
+	pub(crate) peer_plane: Option<PeerPlane<P>>,
 	/// Instrumentation collector for gateway control-plane events.
 	pub(crate) trace: Arc<TraceCollector>,
 	/// Freshness ledger that admits each signed control frame once.
@@ -135,7 +137,7 @@ impl<P: Protocol> Clone for GatewayRuntimeCtx<P> {
 			admission: Arc::clone(&self.admission),
 			config: Arc::clone(&self.config),
 			pool: Arc::clone(&self.pool),
-			peer_pool: self.peer_pool.as_ref().map(Arc::clone),
+			peer_plane: self.peer_plane.clone(),
 			trace: Arc::clone(&self.trace),
 			tasks: self.tasks.clone(),
 			replay_guard: self.replay_guard.clone(),
