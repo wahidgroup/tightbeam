@@ -922,7 +922,6 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> ClientHandshakeProtocol for Handsha
 		})
 	}
 
-	#[cfg(feature = "aead")]
 	fn complete(self: Box<Self>) -> MaybeSendFuture<'static, Result<EstablishedSession, Self::Error>> {
 		Box::pin(async move {
 			let mut handshake = self;
@@ -959,7 +958,6 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> ServerHandshakeProtocol for Handsha
 		})
 	}
 
-	#[cfg(feature = "aead")]
 	fn complete(self: Box<Self>) -> MaybeSendFuture<'static, Result<EstablishedSession, Self::Error>> {
 		Box::pin(async move {
 			let mut handshake = self;

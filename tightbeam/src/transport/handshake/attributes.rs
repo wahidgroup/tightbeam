@@ -21,7 +21,6 @@ use crate::cms::signed_data::SignedData;
 use crate::der::asn1::OctetString;
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::der::asn1::UintRef;
-#[cfg(feature = "x509")]
 use crate::oids::CLIENT_CERTIFICATE;
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::oids::HANDSHAKE_ABORT_ALERT;
@@ -34,7 +33,6 @@ use crate::oids::{
 use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer, TransportAccept, TransportOffer};
 #[cfg(feature = "transport-cms")]
 use crate::transport::handshake::schedule::KeyConfirmation;
-#[cfg(feature = "x509")]
 use crate::x509::Certificate;
 
 /// A CMS attribute that carries one value, as the handshake profile requires.
@@ -122,7 +120,6 @@ impl TryFrom<HandshakeAttribute> for Attribute {
 ///
 /// Each implementation is the one home for its type's attribute OID, so
 /// the encode and decode sides agree on which OID names which type.
-#[cfg(feature = "x509")]
 pub trait AttributePayload {
 	/// OID this payload is carried under.
 	const OID: ObjectIdentifier;
@@ -130,7 +127,6 @@ pub trait AttributePayload {
 
 /// The client certificate a key exchange carries under mutual
 /// authentication, on the CMS and the ECIES path alike.
-#[cfg(feature = "x509")]
 impl AttributePayload for Certificate {
 	const OID: ObjectIdentifier = CLIENT_CERTIFICATE;
 }
@@ -181,7 +177,6 @@ impl AttributePayload for KeyConfirmation {
 	const OID: ObjectIdentifier = HANDSHAKE_KEY_CONFIRMATION;
 }
 
-#[cfg(feature = "x509")]
 impl HandshakeAttribute {
 	/// Encodes `payload` under its own OID for transmission.
 	///

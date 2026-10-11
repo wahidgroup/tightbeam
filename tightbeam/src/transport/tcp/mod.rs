@@ -180,11 +180,8 @@ macro_rules! impl_tcp_common {
 			P: $crate::crypto::profiles::CryptoProvider = $crate::crypto::profiles::DefaultCryptoProvider,
 		> {
 			pub(crate) stream: S,
-			#[cfg(feature = "transport-policy")]
 			pub(crate) restart_policy: Box<dyn $crate::transport::policy::RestartPolicy>,
-			#[cfg(feature = "transport-policy")]
 			pub(crate) emitter_gate: $crate::policy::GateChain,
-			#[cfg(feature = "transport-policy")]
 			pub(crate) collector_gate: $crate::policy::GateChain,
 			pub(crate) state: $crate::transport::state::SessionState<P>,
 			pub(crate) limits: $crate::transport::TransportLimits,
@@ -216,11 +213,8 @@ macro_rules! impl_tcp_common {
 
 				Self {
 					stream,
-					#[cfg(feature = "transport-policy")]
 					restart_policy: Box::new($crate::transport::policy::NoRestart),
-					#[cfg(feature = "transport-policy")]
 					emitter_gate: $crate::policy::GateChain::default(),
-					#[cfg(feature = "transport-policy")]
 					collector_gate: $crate::policy::GateChain::default(),
 					state: $crate::transport::state::SessionState::new(encryption),
 					limits,
@@ -286,7 +280,10 @@ macro_rules! impl_tcp_common {
 			/// Set the handshake protocol that this endpoint runs once
 			/// provisioned.
 			#[must_use]
-			pub fn with_handshake_protocol(mut self, kind: $crate::transport::handshake::HandshakeProtocolKind) -> Self {
+			pub fn with_handshake_protocol(
+				mut self,
+				kind: $crate::transport::handshake::HandshakeProtocolKind,
+			) -> Self {
 				self.state.select_handshake(kind);
 				self
 			}
@@ -307,8 +304,8 @@ macro_rules! impl_tcp_common {
 			}
 		}
 
-		#[cfg(feature = "transport-policy")]
-		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> $crate::transport::policy::RestartConfig for $transport<S, P>
+		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> $crate::transport::policy::RestartConfig
+			for $transport<S, P>
 		where
 			TransportError: From<S::Error>,
 		{
@@ -318,8 +315,8 @@ macro_rules! impl_tcp_common {
 			}
 		}
 
-		#[cfg(feature = "transport-policy")]
-		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> $crate::transport::policy::EmitterGateConfig for $transport<S, P>
+		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> $crate::transport::policy::EmitterGateConfig
+			for $transport<S, P>
 		where
 			TransportError: From<S::Error>,
 		{
@@ -329,8 +326,8 @@ macro_rules! impl_tcp_common {
 			}
 		}
 
-		#[cfg(feature = "transport-policy")]
-		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> $crate::transport::policy::CollectorGateConfig for $transport<S, P>
+		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider>
+			$crate::transport::policy::CollectorGateConfig for $transport<S, P>
 		where
 			TransportError: From<S::Error>,
 		{
@@ -340,8 +337,8 @@ macro_rules! impl_tcp_common {
 			}
 		}
 
-		#[cfg(feature = "transport-policy")]
-		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> $crate::transport::policy::TimeoutConfig for $transport<S, P>
+		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> $crate::transport::policy::TimeoutConfig
+			for $transport<S, P>
 		where
 			TransportError: From<S::Error>,
 		{
@@ -351,27 +348,10 @@ macro_rules! impl_tcp_common {
 			}
 		}
 
-		// Without x509 there is no encryption-aware override, so the
-		// default single-flight collector applies. The gate items only
-		// exist under transport-policy.
-		#[cfg(not(all(feature = "x509", feature = "transport-policy")))]
-		impl<S: $stream_trait> $crate::transport::MessageCollector for $transport<S>
-		where
-			TransportError: From<S::Error>,
-		{
-			#[cfg(feature = "transport-policy")]
-			type CollectorGate = dyn GatePolicy;
-
-			#[cfg(feature = "transport-policy")]
-			fn collector_gate(&self) -> &Self::CollectorGate {
-				&self.collector_gate
-			}
-		}
-
 		// Audit source for gate verdicts. One definition feeds every
 		// collector plane this transport serves.
-		#[cfg(feature = "transport-policy")]
-		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> $crate::transport::GateAudit for $transport<S, P>
+		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> $crate::transport::GateAudit
+			for $transport<S, P>
 		where
 			TransportError: From<S::Error>,
 		{
@@ -380,12 +360,6 @@ macro_rules! impl_tcp_common {
 				self.trace.as_ref()
 			}
 		}
-
-		#[cfg(not(feature = "transport-policy"))]
-		impl<S: $stream_trait> $crate::transport::MessageEmitter for $transport<S>
-		where
-			TransportError: From<S::Error>
-		{}
 
 		// Each transport implements the seal by name, with no blanket impl,
 		// so no type outside this crate can reach the traits it guards.

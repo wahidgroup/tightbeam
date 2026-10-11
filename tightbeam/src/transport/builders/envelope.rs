@@ -16,7 +16,6 @@ use crate::transport::error::{TransportError, TransportFailure};
 use crate::transport::{ResponsePackage, TransportEnvelope, TransportLimits, TransportResult, WireEnvelope, WireMode};
 use crate::TightBeamError;
 
-#[cfg(feature = "x509")]
 use crate::crypto::aead::SendCipher;
 
 #[derive(Debug)]
@@ -146,7 +145,6 @@ impl<'a> EnvelopeBuilder<'a> {
 			// Rekey exhaustion stays distinguishable: the caller must
 			// reestablish the session, not retry the write.
 			let failure = match error {
-				#[cfg(feature = "aead")]
 				TightBeamError::RekeyRequired => TransportFailure::RekeyRequired,
 				_ => TransportFailure::EncryptionFailed,
 			};

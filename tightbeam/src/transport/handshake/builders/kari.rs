@@ -13,20 +13,14 @@ use crate::transport::handshake::kari::{HandshakeKek, Kek, OriginatorKey};
 use crate::transport::handshake::primitives::{KdfInfo, KdfSalt};
 use crate::transport::handshake::schedule::HandshakeAgreement;
 
-#[cfg(all(feature = "builder", feature = "aead"))]
 use crate::cms::builder::{Error as CmsBuilderError, RecipientInfoBuilder, RecipientInfoType};
-#[cfg(all(feature = "builder", feature = "aead"))]
 use crate::cms::content_info::CmsVersion;
-#[cfg(all(feature = "builder", feature = "aead"))]
 use crate::cms::enveloped_data::{
 	EncryptedKey, KeyAgreeRecipientIdentifier, KeyAgreeRecipientInfo, OriginatorIdentifierOrKey, RecipientEncryptedKey,
 	RecipientInfo, UserKeyingMaterial,
 };
-#[cfg(all(feature = "builder", feature = "aead"))]
 use crate::crypto::profiles::CryptoProvider;
-#[cfg(all(feature = "builder", feature = "aead"))]
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
-#[cfg(all(feature = "builder", feature = "aead"))]
 use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic};
 
 /// Builder for `KeyAgreeRecipientInfo` with ECDH, HKDF, and key wrapping.
@@ -40,7 +34,6 @@ use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic};
 ///
 /// The type is generic over `P: CryptoProvider`, which supplies the
 /// cryptographic implementations.
-#[cfg(all(feature = "builder", feature = "aead"))]
 pub struct TightBeamKariBuilder<P>
 where
 	P: CryptoProvider,
@@ -63,7 +56,6 @@ where
 	provider: P,
 }
 
-#[cfg(all(feature = "builder", feature = "aead"))]
 impl<P> TightBeamKariBuilder<P>
 where
 	P: CryptoProvider,
@@ -77,7 +69,6 @@ where
 	/// the KEK, and its AES Key Wrap (RFC 3394) wraps the CEK. Use
 	/// [`Self::with_kdf_info`] to set a custom KDF info string for
 	/// interoperability.
-	#[cfg(all(feature = "kdf", feature = "sha3"))]
 	pub fn new(provider: P) -> Self {
 		Self {
 			sender_priv: None,
@@ -179,13 +170,6 @@ where
 
 /// An empty builder on [`DefaultCryptoProvider`], which runs secp256k1,
 /// HKDF-SHA3-256, and AES Key Wrap.
-#[cfg(all(
-	feature = "builder",
-	feature = "aead",
-	feature = "secp256k1",
-	feature = "kdf",
-	feature = "sha3"
-))]
 impl Default for TightBeamKariBuilder<DefaultCryptoProvider> {
 	fn default() -> Self {
 		Self {
@@ -201,7 +185,6 @@ impl Default for TightBeamKariBuilder<DefaultCryptoProvider> {
 	}
 }
 
-#[cfg(all(feature = "builder", feature = "aead"))]
 impl<P> RecipientInfoBuilder for TightBeamKariBuilder<P>
 where
 	P: CryptoProvider,

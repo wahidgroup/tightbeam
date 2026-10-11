@@ -28,20 +28,14 @@ use crate::transport::{
 use crate::utils::time::Clock;
 use crate::Frame;
 
+use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
+use crate::policy::GatePolicy;
+use crate::policy::TransitStatus;
 #[cfg(feature = "instrument")]
 use crate::trace::TraceCollector;
-#[cfg(feature = "transport-policy")]
-mod policy {
-	pub use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
-	pub use crate::policy::GatePolicy;
-	pub use crate::policy::TransitStatus;
-	pub use crate::transport::error::TransportError;
-	pub use crate::transport::policy::RestartPolicy;
-	pub use crate::transport::{EnvelopeBuilder, ProtocolStream};
-}
-
-#[cfg(feature = "transport-policy")]
-use policy::*;
+use crate::transport::error::TransportError;
+use crate::transport::policy::RestartPolicy;
+use crate::transport::{EnvelopeBuilder, ProtocolStream};
 
 // The macro generates the `TcpTransport` struct and its common implementations.
 crate::impl_tcp_common!(TcpTransport, ProtocolStream);
@@ -192,7 +186,6 @@ where
 	}
 }
 
-#[cfg(feature = "transport-policy")]
 impl<S: ProtocolStream> MessageCollector for TcpTransport<S>
 where
 	TransportError: From<S::Error>,
@@ -218,7 +211,6 @@ where
 	}
 }
 
-#[cfg(feature = "transport-policy")]
 impl<S: ProtocolStream> MessageEmitter for TcpTransport<S>
 where
 	TransportError: From<S::Error>,
@@ -385,7 +377,6 @@ mod tests {
 	/// A peer that drips bytes cannot stretch the read. A per-recv timeout
 	/// alone would let this read complete after about 6s of dripping, and the
 	/// absolute deadline aborts it at the first slice boundary past the budget.
-	#[cfg(feature = "x509")]
 	#[tokio::test]
 	async fn handshake_read_deadline_bounds_byte_drip() -> TransportResult<()> {
 		let listener = NetTcpListener::bind("127.0.0.1:0")?;
@@ -434,7 +425,6 @@ mod tests {
 
 	// A header that declares more than the handshake cap is refused on the
 	// header alone, before any content is read or allocated (CWE-770).
-	#[cfg(feature = "x509")]
 	#[tokio::test]
 	async fn a_handshake_header_above_the_cap_is_refused() -> TransportResult<()> {
 		let listener = NetTcpListener::bind("127.0.0.1:0")?;

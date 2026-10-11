@@ -23,27 +23,16 @@ use crate::utils::time::{Clock, MonotonicInstant};
 #[cfg(host_clock)]
 use crate::utils::time::SystemClock;
 
-#[cfg(feature = "x509")]
-mod x509 {
-	pub use crate::crypto::x509::store::CertificateTrust;
-	pub use crate::crypto::x509::Certificate;
-	pub use crate::transport::handshake::receipt::ReceiptApprover;
-	pub use crate::transport::handshake::HandshakeProtocolKind;
-	pub use crate::transport::state::{ClientIdentity, DialableEncryption, EncryptionConfig};
-}
+use crate::crypto::x509::store::CertificateTrust;
+use crate::crypto::x509::Certificate;
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::transport::handshake::receipt::ReceiptApprover;
+use crate::transport::handshake::HandshakeProtocolKind;
+use crate::transport::state::{ClientIdentity, DialableEncryption, EncryptionConfig};
 
-#[cfg(feature = "x509")]
-use x509::*;
-
-#[cfg(feature = "transport-policy")]
-mod policy {
-	pub use crate::transport::policy::{PolicyConfig, TimeoutConfig};
-	pub use crate::transport::MessageEmitter;
-	pub use crate::Frame;
-}
-
-#[cfg(feature = "transport-policy")]
-use policy::*;
+use crate::transport::policy::{PolicyConfig, TimeoutConfig};
+use crate::transport::MessageEmitter;
+use crate::Frame;
 
 #[cfg(feature = "instrument")]
 use crate::instrumentation::events;
@@ -94,7 +83,6 @@ pub trait ConnectionBuilder<P: Protocol>: Sized {
 	fn with_timeout(self, timeout: Duration) -> Self;
 
 	/// Set the trust anchors that validate the peer certificate.
-	#[cfg(feature = "x509")]
 	fn with_trust_store(self, store: Arc<dyn CertificateTrust>) -> Self;
 
 	/// Set the client certificate and the key that proves it, for mutual
@@ -102,7 +90,6 @@ pub trait ConnectionBuilder<P: Protocol>: Sized {
 	///
 	/// [`ClientIdentity::from_spec`] decodes a certificate specification into
 	/// one, so the fallible step happens once, before the builder.
-	#[cfg(feature = "x509")]
 	fn with_client_identity(self, identity: ClientIdentity<P::CryptoProvider>) -> Self;
 
 	/// Finish configuration and produce the client or pool.
@@ -134,7 +121,6 @@ impl Default for PoolConfig {
 	}
 }
 
-#[cfg(feature = "x509")]
 #[derive(Clone)]
 /// Shared TLS assets reused across pooled connections without reallocations.
 struct PoolTlsConfig<C: CryptoProvider> {
@@ -142,7 +128,6 @@ struct PoolTlsConfig<C: CryptoProvider> {
 	encryption: EncryptionConfig<C>,
 }
 
-#[cfg(feature = "x509")]
 impl<C: CryptoProvider> PoolTlsConfig<C> {
 	fn unconfigured() -> Self {
 		Self { encryption: EncryptionConfig::unconfigured() }
@@ -191,7 +176,6 @@ pub struct ConnectionPoolBuilder<P: Protocol> {
 	config: PoolConfig,
 	clock: Arc<dyn Clock>,
 	timeout: Option<Duration>,
-	#[cfg(feature = "x509")]
 	tls: PoolTlsConfig<P::CryptoProvider>,
 	#[cfg(feature = "instrument")]
 	trace: Option<TraceCollector>,
@@ -206,7 +190,6 @@ impl<P: Protocol> ConnectionPoolBuilder<P> {
 			config,
 			clock,
 			timeout: None,
-			#[cfg(feature = "x509")]
 			tls: PoolTlsConfig::unconfigured(),
 			#[cfg(feature = "instrument")]
 			trace: None,
@@ -230,7 +213,6 @@ impl<P: Protocol> ConnectionPoolBuilder<P> {
 	///
 	/// Every dial carries the decision, so a pool with no trust store states it
 	/// once instead of each connection failing at its first write.
-	#[cfg(feature = "x509")]
 	pub fn allow_cleartext(mut self) -> Self {
 		self.tls.encryption.allow_cleartext = true;
 		self
@@ -261,14 +243,12 @@ impl<P: Protocol> ConnectionPoolBuilder<P> {
 
 	/// Provision the expected server certificate chain, ordered root to
 	/// leaf, shared by every pooled connection.
-	#[cfg(feature = "x509")]
 	pub fn with_server_certificate_chain(mut self, chain: impl Into<Arc<[Certificate]>>) -> Self {
 		self.tls.set_server_certificate_chain(chain.into());
 		self
 	}
 
 	/// Select the handshake protocol used by every pooled connection.
-	#[cfg(feature = "x509")]
 	pub fn with_handshake_protocol(mut self, kind: HandshakeProtocolKind) -> Self {
 		self.tls.set_handshake_protocol(kind);
 		self
@@ -287,7 +267,6 @@ impl<P: Protocol> ConnectionPoolBuilder<P> {
 
 	/// Install a pre-shared client identity that every dial shares without
 	/// another certificate copy.
-	#[cfg(feature = "x509")]
 	pub fn with_shared_client_identity(
 		mut self,
 		certificate: Arc<Certificate>,
@@ -307,13 +286,11 @@ impl<P: Protocol> ConnectionBuilder<P> for ConnectionPoolBuilder<P> {
 		self
 	}
 
-	#[cfg(feature = "x509")]
 	fn with_trust_store(mut self, store: Arc<dyn CertificateTrust>) -> Self {
 		self.tls.set_trust_store(store);
 		self
 	}
 
-	#[cfg(feature = "x509")]
 	fn with_client_identity(mut self, identity: ClientIdentity<P::CryptoProvider>) -> Self {
 		identity.install(&mut self.tls.encryption);
 		self
@@ -328,7 +305,6 @@ impl<P: Protocol> ConnectionBuilder<P> for ConnectionPoolBuilder<P> {
 			total_connections: Arc::new(AtomicUsize::new(0)),
 			#[cfg(pooled_mux)]
 			mux_ids: AtomicU64::new(0),
-			#[cfg(feature = "x509")]
 			tls: self.tls,
 			#[cfg(feature = "instrument")]
 			trace: self.trace,
@@ -447,7 +423,6 @@ pub struct ConnectionPool<P: Protocol> {
 	#[cfg(pooled_mux)]
 	mux_ids: AtomicU64,
 	/// Shared TLS assets reused across pooled connections.
-	#[cfg(feature = "x509")]
 	tls: PoolTlsConfig<P::CryptoProvider>,
 	/// Production instrumentation collector, the single client-side entry
 	/// point.
@@ -479,7 +454,6 @@ impl<P: Protocol> ConnectionPool<P> {
 	///
 	/// - [`TransportError::PeerAuthenticationUnconfigured`] -- the pool
 	///   authenticates no peer and did not name cleartext.
-	#[cfg(feature = "x509")]
 	fn dial_endpoint(&self) -> TransportResult<EndpointConfig<P::CryptoProvider>> {
 		let endpoint = self.tls.endpoint(&self.clock)?;
 
@@ -652,7 +626,6 @@ where
 	}
 
 	/// Lease a ready connection or open a fresh one, held exclusively.
-	#[cfg(feature = "x509")]
 	async fn connect_single_flight(self: &Arc<Self>, addr: &P::Address) -> TransportResult<PooledClient<P>>
 	where
 		P: PersistentConnection + Send + Sync,
@@ -682,15 +655,11 @@ where
 	}
 
 	/// Connect to a destination and hold the connection exclusively.
-	#[cfg(all(
-		feature = "x509",
-		not(all(
-			feature = "tokio",
-			feature = "transport-policy",
-			feature = "transport-multiplex",
-			any(feature = "transport-cms", feature = "transport-ecies")
-		))
-	))]
+	#[cfg(not(all(
+		feature = "tokio",
+		feature = "transport-multiplex",
+		any(feature = "transport-cms", feature = "transport-ecies")
+	)))]
 	pub async fn connect(self: &Arc<Self>, addr: impl Into<P::Address>) -> TransportResult<PooledClient<P>>
 	where
 		P: PersistentConnection + Send + Sync,
@@ -1027,7 +996,6 @@ where
 	/// handshake. An exclusive lease reads its transport, so the answer
 	/// is `None` until the handshake completes. A caller that gates
 	/// policy on peer identity MUST fail closed on `None`.
-	#[cfg(feature = "x509")]
 	pub fn peer_certificate(&self) -> Option<&Certificate>
 	where
 		P::Transport: crate::transport::state::EncryptedProtocolState,
@@ -1045,9 +1013,7 @@ where
 
 #[cfg(all(
 	feature = "std",
-	feature = "transport-policy",
 	not(all(
-		feature = "x509",
 		feature = "tokio",
 		feature = "transport-multiplex",
 		any(feature = "transport-cms", feature = "transport-ecies")

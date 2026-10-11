@@ -347,7 +347,7 @@ impl CountersignedReceipt {
 	}
 }
 
-#[cfg(all(test, feature = "transport-ecies", feature = "secp256k1"))]
+#[cfg(all(test, feature = "transport-ecies"))]
 mod tests {
 	use std::error::Error;
 

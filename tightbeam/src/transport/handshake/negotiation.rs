@@ -1891,7 +1891,6 @@ mod tests {
 		Ok(())
 	}
 
-	#[cfg(feature = "aead")]
 	#[test]
 	fn test_select_profile_follows_server_aead_preference() -> Result<(), Box<dyn Error>> {
 		use crate::oids::{

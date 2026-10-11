@@ -3,7 +3,7 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
-#[cfg(all(not(feature = "std"), feature = "x509"))]
+#[cfg(not(feature = "std"))]
 use alloc::boxed::Box;
 #[cfg(not(feature = "std"))]
 use alloc::sync::Arc;
@@ -20,7 +20,6 @@ use crate::Beamable;
 
 #[cfg(all(
 	feature = "transport-multiplex",
-	feature = "x509",
 	any(feature = "tokio", feature = "async-transport")
 ))]
 use crate::transport::error::TransportError;
@@ -39,15 +38,9 @@ mod multiplex {
 #[cfg(feature = "transport-multiplex")]
 use multiplex::*;
 
-#[cfg(feature = "x509")]
-mod x509 {
-	pub use crate::cms::enveloped_data::EnvelopedData;
-	pub use crate::cms::signed_data::SignedData;
-	pub use crate::transport::wire_der::WireDer;
-}
-
-#[cfg(feature = "x509")]
-use x509::*;
+use crate::cms::enveloped_data::EnvelopedData;
+use crate::cms::signed_data::SignedData;
+use crate::transport::wire_der::WireDer;
 
 /// A request package that carries the message frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,7 +119,6 @@ impl ResponsePackage {
 	/// - [`TransportError`] -- for any status other than [`TransitStatus::Ok`].
 	#[cfg(all(
 		feature = "transport-multiplex",
-		feature = "x509",
 		any(feature = "tokio", feature = "async-transport")
 	))]
 	pub(crate) fn resolve(self) -> Result<Option<Frame>, TransportError> {
@@ -876,11 +868,9 @@ pub enum TransportEnvelope {
 	Response(ResponsePackage),
 	/// A key-transport handshake container, kept with the bytes that
 	/// carried it.
-	#[cfg(feature = "x509")]
 	#[asn1(context_specific = "2", constructed = "true")]
 	EnvelopedData(Box<WireDer<EnvelopedData>>),
 	/// A signed handshake container, kept with the bytes that carried it.
-	#[cfg(feature = "x509")]
 	#[asn1(context_specific = "3", constructed = "true")]
 	SignedData(Box<WireDer<SignedData>>),
 	/// A multiplexing message.

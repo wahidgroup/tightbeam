@@ -154,7 +154,6 @@ pub enum TransportError {
 	#[error("Connection draining after GoAway. No new streams")]
 	Draining,
 	/// A certificate failed validation.
-	#[cfg(feature = "x509")]
 	#[error("Invalid certificate: {0}")]
 	#[from]
 	InvalidCertificate(CertificateValidationError),
@@ -170,7 +169,6 @@ pub enum TransportError {
 	#[error("Operation failed: {0:?}")]
 	OperationFailed(TransportFailure),
 	/// The handshake failed.
-	#[cfg(feature = "x509")]
 	#[error("Handshake error: {0}")]
 	#[from]
 	HandshakeError(HandshakeError),
@@ -196,19 +194,15 @@ impl From<TightBeamError> for TransportError {
 			TightBeamError::TransportError(t) => t,
 			TightBeamError::SerializationError(e) => TransportError::DerError(e),
 
-			#[cfg(feature = "x509")]
 			TightBeamError::HandshakeError(h) => TransportError::HandshakeError(h),
-			#[cfg(feature = "x509")]
 			TightBeamError::CertificateValidationError(e) => TransportError::InvalidCertificate(e),
 			#[cfg(feature = "std")]
 			TightBeamError::IoError(e) => TransportError::IoError(e),
 			// Exact-next counter nonces make replay, reorder, and deletion
 			// indistinguishable from tampering. Surface them as such.
-			#[cfg(feature = "aead")]
 			TightBeamError::NonceReplayed(_) => TransportError::OperationFailed(TransportFailure::TamperDetected),
 			// The receive side hits this only when the peer overran the
 			// per-key volume bound. The session is unusable either way.
-			#[cfg(feature = "aead")]
 			TightBeamError::RekeyRequired => TransportError::OperationFailed(TransportFailure::RekeyRequired),
 			_ => TransportError::InvalidMessage,
 		}
@@ -286,7 +280,6 @@ crate::impl_from!(
 	spki::Error => TransportError::DerError extract spki::Error::Asn1(der_err) =>
 		der_err else der::Error::from(der::ErrorKind::Failed)
 );
-#[cfg(feature = "x509")]
 crate::impl_from!(
 	x509_cert::builder::Error => TransportError::DerError extract x509_cert::builder::Error::Asn1(der_err) =>
 		der_err else der::Error::from(der::ErrorKind::Failed)
@@ -323,7 +316,6 @@ impl From<tokio_rt::Elapsed> for TransportError {
 }
 
 /// Report an ECDSA failure as a handshake error.
-#[cfg(all(feature = "x509", feature = "secp256k1"))]
 impl From<k256::ecdsa::Error> for TransportError {
 	fn from(err: k256::ecdsa::Error) -> Self {
 		TransportError::HandshakeError(HandshakeError::from(err))

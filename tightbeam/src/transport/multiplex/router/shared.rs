@@ -1369,8 +1369,6 @@ impl Future for DrainPending {
 	}
 }
 
-impl MuxShared {}
-
 impl CancelReason {
 	/// The transport error a caller observes for this cancel reason.
 	pub fn cancel_error(&self) -> TransportError {
@@ -2015,13 +2013,11 @@ mod tests {
 
 	/// A waker that records whether the epoch receipt had rotated when it
 	/// woke.
-	#[cfg(all(feature = "secp256k1", feature = "aes-gcm"))]
 	struct ReceiptWitness {
 		shared: Arc<MuxShared>,
 		rotated: core::sync::atomic::AtomicBool,
 	}
 
-	#[cfg(all(feature = "secp256k1", feature = "aes-gcm"))]
 	impl futures::task::ArcWake for ReceiptWitness {
 		fn wake_by_ref(arc_self: &Arc<Self>) {
 			let rotated = arc_self.shared.session_receipt().is_some();
@@ -2031,7 +2027,6 @@ mod tests {
 
 	/// An admission released by a completed renewal debits the new epoch, so
 	/// it must find the new epoch's receipt already in place when it wakes.
-	#[cfg(all(feature = "secp256k1", feature = "aes-gcm"))]
 	#[tokio::test]
 	async fn test_a_released_admission_reads_the_new_epoch_receipt(
 	) -> Result<(), crate::transport::handshake::HandshakeError> {

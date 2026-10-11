@@ -352,17 +352,12 @@ impl From<crate::error::TightBeamError> for HandshakeError {
 		match err {
 			TightBeamError::HandshakeError(h) => h,
 			TightBeamError::SerializationError(e) => HandshakeError::DerError(e),
-			#[cfg(feature = "x509")]
 			TightBeamError::SpkiError(e) => HandshakeError::SpkiError(e),
-			#[cfg(feature = "x509")]
 			TightBeamError::CertificateValidationError(e) => HandshakeError::CertificateValidationError(e),
-			#[cfg(feature = "crypto")]
 			TightBeamError::KeyError(e) => HandshakeError::KeyError(e),
-			#[cfg(feature = "signature")]
 			TightBeamError::SignatureError(e) => HandshakeError::SignatureError(e),
 			#[cfg(feature = "ecies")]
 			TightBeamError::EciesError(e) => HandshakeError::EciesError(e),
-			#[cfg(feature = "random")]
 			TightBeamError::OsRngError(_) => HandshakeError::RandomGenerationFailed,
 			_ => HandshakeError::InvalidState,
 		}
@@ -373,7 +368,6 @@ impl From<crate::error::TightBeamError> for HandshakeError {
 ///
 /// A variant without a counterpart collapses into
 /// [`Builder`](crate::cms::builder::Error::Builder) through its `Display`.
-#[cfg(all(feature = "builder", feature = "aead"))]
 impl From<HandshakeError> for crate::cms::builder::Error {
 	fn from(err: HandshakeError) -> Self {
 		match err {

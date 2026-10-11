@@ -27,7 +27,6 @@ use crate::transport::handshake::receipt::StoredReceipt;
 
 #[cfg(feature = "instrument")]
 use crate::trace::TraceCollector;
-#[cfg(feature = "transport-policy")]
 use crate::transport::GateAudit;
 
 /// Cancels the stream if the owning emit future is dropped before its response
@@ -110,7 +109,6 @@ pub struct MuxHandle {
 // The handle is the audit source for gate verdicts on the mux plane. The
 // responder gates requests through `gate_inbound`, which records the verdict
 // into this connection's collector.
-#[cfg(feature = "transport-policy")]
 impl GateAudit for MuxHandle {
 	#[cfg(feature = "instrument")]
 	fn audit_trace(&self) -> Option<&TraceCollector> {
