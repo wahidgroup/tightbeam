@@ -22,7 +22,7 @@ use crate::transport::support::{await_ok, join_task, mux_frame, mux_offer};
 use super::common::*;
 
 use tightbeam::instrumentation::events;
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 
 /// Records whether an emit fails as a closed connection after the peer drops
 /// mid-emit.

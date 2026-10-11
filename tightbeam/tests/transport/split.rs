@@ -24,7 +24,7 @@ use tightbeam::transport::tcp::r#async::{TokioListener, TokioStream};
 use tightbeam::transport::{
 	ClientBuilder, EnvelopeSink, EnvelopeSource, ResponsePackage, TransportEnvelope, TransportError, TransportFailure,
 };
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 use tightbeam::{Frame, TightBeamError};
 
 use super::support::{accept_handshaken_split, await_ok, bind_encrypted_listener, connect_handshaken_split};

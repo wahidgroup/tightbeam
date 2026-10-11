@@ -16,8 +16,8 @@ use crate::crypto::x509::utils::CertificateExt;
 use crate::crypto::x509::Certificate;
 use crate::policy::TransitStatus;
 use crate::transport::multiplex::StreamRoute;
+use crate::urn::Urn;
 use crate::utils::time::UnixMillis;
-use crate::utils::urn::Urn;
 use crate::x509::ext::pkix::name::GeneralName;
 use crate::x509::ext::pkix::SubjectAltName;
 

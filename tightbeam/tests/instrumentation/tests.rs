@@ -8,7 +8,7 @@ use tightbeam::testing::{ClientEnv, ScenarioConfig, SetupEnv, TestMessage};
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::tcp::TightBeamSocketAddr;
 use tightbeam::transport::{EndpointConfig, MessageEmitter, Protocol};
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 use tightbeam::{compose, exactly, server, tb_assert_spec, tb_process_spec, tb_scenario};
 
 pub(crate) const MESSAGE_COLLECT: Urn<'static> = tightbeam::urn!("test", "event:instrumentation-tests/message-collect");
@@ -72,7 +72,7 @@ mod sink {
 		}
 	}
 
-	fn count_urn(drained: impl AsRef<[TbEvent]>, urn: tightbeam::utils::urn::Urn<'static>) -> usize {
+	fn count_urn(drained: impl AsRef<[TbEvent]>, urn: tightbeam::urn::Urn<'static>) -> usize {
 		let drained = drained.as_ref();
 		drained.iter().filter(|e| e.urn == urn).count()
 	}

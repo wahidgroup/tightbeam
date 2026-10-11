@@ -5,10 +5,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::deadline::Deadline;
+use super::jitter::JitterCalculator;
 use super::path::PathWcet;
 use super::wcet::WcetConfig;
 use crate::testing::specs::csp::Event;
-use crate::utils::jitter::JitterCalculator;
 
 #[cfg(feature = "testing-timing")]
 use crate::testing::schedulability::{SchedulabilityError, SchedulerType, Task, TaskSet};

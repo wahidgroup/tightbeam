@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use sha3::Sha3_256;
 use tightbeam::asn1::DigestInfo;
 use tightbeam::trace::TraceCollector;
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 use tightbeam::{utils, Frame, TightBeamError};
 
 use super::messages::TransactionStatus;

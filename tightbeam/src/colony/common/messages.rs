@@ -12,8 +12,8 @@ use crate::asn1::Frame;
 use crate::constants::DEFAULT_HOP_BUDGET;
 use crate::der::{Choice, Enumerated, Sequence};
 use crate::policy::TransitStatus;
+use crate::urn::Urn;
 use crate::utils::time::UnixMillis;
-use crate::utils::urn::Urn;
 use crate::utils::{decode, encode, BasisPoints};
 use crate::wire::wire_sequence;
 use crate::{Beamable, Errorizable, MessagePriority, TightBeamError};
@@ -1062,7 +1062,7 @@ mod tests {
 		Ok(())
 	}
 
-	fn ping_type() -> crate::utils::urn::Urn<'static> {
+	fn ping_type() -> crate::urn::Urn<'static> {
 		ColonyNamespace::default()
 			.servlet("ping")
 			.expect("test names satisfy the mint grammar")
@@ -1074,7 +1074,7 @@ mod tests {
 			.expect("a servlet type URN yields an instance URN")
 	}
 
-	fn hive_id() -> crate::utils::urn::Urn<'static> {
+	fn hive_id() -> crate::urn::Urn<'static> {
 		ColonyNamespace::default()
 			.hive("127.0.0.1:9000")
 			.expect("test locators satisfy the mint grammar")

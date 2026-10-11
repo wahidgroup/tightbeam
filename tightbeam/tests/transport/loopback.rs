@@ -23,7 +23,7 @@ use tightbeam::{
 	transport::handshake::{
 		ClientHandshakeProtocol, EstablishedSession, Handshake, HandshakeMessage, ServerHandshakeProtocol,
 	},
-	utils::urn::Urn,
+	urn::Urn,
 	TightBeamError,
 };
 

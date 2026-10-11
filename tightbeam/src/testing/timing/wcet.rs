@@ -3,9 +3,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::statistics::{Percentile, StatisticalAnalyzer};
 use crate::builder::TypeBuilder;
 use crate::testing::error::TestingError;
-use crate::utils::statistics::{Percentile, StatisticalAnalyzer};
 
 /// WCET configuration with optional percentile and statistical analyzer.
 #[derive(Debug, Clone)]
@@ -58,7 +58,7 @@ impl TypeBuilder<WcetConfig> for WcetConfigBuilder {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::utils::statistics::DefaultStatisticalAnalyzer;
+	use crate::testing::timing::DefaultStatisticalAnalyzer;
 
 	/// Test case for WcetConfigBuilder
 	struct WcetConfigTestCase {

@@ -30,7 +30,7 @@ use tightbeam::{
 	testing::{ScenarioConfig, SetupEnv},
 	trace::TraceCollector,
 	transport::handshake::Handshake,
-	utils::urn::Urn,
+	urn::Urn,
 	TightBeamError,
 };
 

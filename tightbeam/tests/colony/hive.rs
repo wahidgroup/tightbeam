@@ -38,7 +38,8 @@ use tightbeam::{
 		handshake::negotiation::TransportOffer, tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder,
 		GenericClient, Protocol,
 	},
-	utils::{urn::Urn, BasisPoints},
+	urn::Urn,
+	utils::BasisPoints,
 	Beamable, Frame, TightBeamError, Version,
 };
 

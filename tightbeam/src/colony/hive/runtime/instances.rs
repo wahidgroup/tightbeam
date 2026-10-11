@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::colony::hive::runtime::HiveContextImpl;
 use crate::colony::hive::{RefusedRegistration, ServletRegistration, ServletRegistry};
 use crate::transport::Protocol;
-use crate::utils::urn::Urn;
+use crate::urn::Urn;
 use crate::{Errorizable, TightBeamError};
 
 /// Why [`HiveInstances::insert`] registered no servlet.

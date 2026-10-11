@@ -1,6 +1,7 @@
 //! Tightbeam URN specifications
 //!
-//! Defines URN specs for tightbeam namespaces like instrumentation, testing, etc.
+//! Defines URN specs for tightbeam namespaces like instrumentation, testing,
+//! etc.
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
@@ -8,8 +9,8 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::{borrow::Cow, string::String, vec::Vec};
 
-use crate::utils::urn::builders::spec::Pattern;
-use crate::utils::urn::UrnValidationError;
+use crate::urn::builders::spec::Pattern;
+use crate::urn::UrnValidationError;
 
 crate::urn_spec! {
 	/// TightbeamUrnSpec URN specification
@@ -36,7 +37,7 @@ crate::urn_spec! {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::utils::urn::{Urn, UrnBuilder};
+	use crate::urn::{Urn, UrnBuilder};
 
 	#[cfg(feature = "testing")]
 	use crate::{exactly, tb_assert_spec, tb_scenario, testing::SetupEnv};

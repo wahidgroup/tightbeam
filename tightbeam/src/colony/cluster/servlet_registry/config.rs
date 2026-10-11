@@ -7,7 +7,7 @@ use crate::colony::cluster::servlet_registry::entry::{LocalRoute, PeerRoute, Ser
 use crate::colony::cluster::{AdmittedDial, ClusterConfig};
 use crate::colony::common::ServletInfo;
 use crate::constants::{MAX_PEER_GATEWAYS, MAX_PEER_ROUTES, MAX_RELAY_BUCKETS, MAX_RELAY_ROUTES};
-use crate::utils::urn::Urn;
+use crate::urn::Urn;
 use crate::utils::BasisPoints;
 
 /// Default decay per evaporation cycle in basis points (1000 = 10%).

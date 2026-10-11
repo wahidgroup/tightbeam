@@ -18,8 +18,8 @@ use crate::policy::TransitStatus;
 use crate::transport::envelopes::ResponsePackage;
 use crate::transport::messaging::GateInbound;
 use crate::transport::multiplex::{MuxDispatch, MuxHandle, ReplySink, StreamBody, StreamRoute};
+use crate::urn::Urn;
 use crate::utils::marker::MaybeSend;
-use crate::utils::urn::Urn;
 use crate::{Frame, TightBeamError};
 
 /// Per-call context handed to every [`MuxService`] method.

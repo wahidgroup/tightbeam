@@ -8,7 +8,7 @@
 use tightbeam::testing::fdr::FdrConfig;
 use tightbeam::testing::specs::csp::Process;
 use tightbeam::testing::{Expect, Layer, ScenarioConfig, SetupEnv};
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 
 pub(crate) const EATS: Urn<'static> = tightbeam::urn!("test", "event:diners/eats");
 pub(crate) const GETS_UP: Urn<'static> = tightbeam::urn!("test", "event:diners/gets-up");

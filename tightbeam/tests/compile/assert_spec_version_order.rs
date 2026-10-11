@@ -1,4 +1,4 @@
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec};
 
 pub(crate) const NEWER_KEY: Urn<'static> = tightbeam::urn!("test", "event:assert-spec-version-order/newer-key");

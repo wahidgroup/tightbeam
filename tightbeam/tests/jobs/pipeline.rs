@@ -8,8 +8,8 @@
 #![cfg(all(feature = "testing", feature = "std"))]
 
 use tightbeam::der::Sequence;
+use tightbeam::urn::Urn;
 use tightbeam::utils::task::Pipeline;
-use tightbeam::utils::urn::Urn;
 use tightbeam::{compose, exactly, job, tb_assert_spec, tb_scenario, testing::SetupEnv};
 use tightbeam::{Beamable, Frame, TightBeamError};
 

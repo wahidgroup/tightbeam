@@ -265,7 +265,7 @@ mod tests {
 
 	use super::*;
 	use crate::trace::TraceCollector;
-	use crate::utils::urn::Urn;
+	use crate::urn::Urn;
 
 	const TEST1: Urn<'static> = crate::urn!("test", "event:log/test1");
 	const TEST2: Urn<'static> = crate::urn!("test", "event:log/test2");

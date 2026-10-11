@@ -35,7 +35,7 @@ use crate::transport::support::{
 use super::common::*;
 
 use tightbeam::instrumentation::events;
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 
 pub(crate) const CHAINED_RECEIPT_VERIFIES_AGAINST_ORIGINAL_CERTS: Urn<'static> =
 	tightbeam::urn!("test", "event:rekey/chained-receipt-verifies-against-original-certs");

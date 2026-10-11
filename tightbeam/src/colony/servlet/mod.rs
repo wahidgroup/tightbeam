@@ -27,8 +27,3 @@ pub use context::{ServletContext, WorkerBox, WorkerBoxStartFuture};
 pub use runtime::ServletRuntime;
 pub use service::{RuntimeServletConf, Servlet, ServletConf, ServletFuture, ServletHandlers, ServletService};
 pub use tracking::{LatencyTracker, QueueSlot, ServletMetrics, UtilizationReporter, UtilizationWeights};
-
-/// Runtime task primitives used by servlet accept loops.
-pub mod servlet_runtime {
-	pub use crate::runtime::rt;
-}

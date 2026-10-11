@@ -448,7 +448,7 @@ impl TestHooks {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::utils::urn::Urn;
+	use crate::urn::Urn;
 
 	const STEP: Urn<'static> = crate::urn!("test", "event:config/step");
 

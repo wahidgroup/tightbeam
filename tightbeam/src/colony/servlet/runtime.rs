@@ -10,13 +10,13 @@ use std::sync::{Arc, Mutex};
 
 use crate::colony::hive::{HiveContext, ServletBox};
 use crate::colony::servlet::serve::ContextService;
-use crate::colony::servlet::servlet_runtime::rt;
 use crate::colony::servlet::{RuntimeServletConf, Servlet, ServletConfig, ServletContext, ServletService, WorkerBox};
 use crate::constants::DEFAULT_MAX_SERVER_CONNECTIONS;
 use crate::core::{Inflator, Message};
 use crate::crypto::aead::Decryptor;
 use crate::macros::server::{serve_connection_service, AcceptedConnection};
 use crate::policy::GatePolicy;
+use crate::runtime::rt;
 use crate::trace::TraceCollector;
 use crate::transport::accept::AcceptPlane;
 use crate::transport::handshake::negotiation::TransportOffer;

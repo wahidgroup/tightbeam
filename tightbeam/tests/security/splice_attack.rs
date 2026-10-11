@@ -47,7 +47,7 @@ use tightbeam::{
 	transport::handshake::{
 		negotiation::SecurityOffer, ClientKeyExchange, Handshake, HandshakeError, PeerAuthentication,
 	},
-	utils::urn::Urn,
+	urn::Urn,
 	TightBeamError,
 };
 

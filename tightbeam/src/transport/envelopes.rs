@@ -32,7 +32,7 @@ mod multiplex {
 	pub use crate::der::Enumerated;
 	pub use crate::der::Sequence;
 	pub use crate::der::{DecodeValue, FixedTag, Header};
-	pub use crate::utils::urn::Urn;
+	pub use crate::urn::Urn;
 }
 
 #[cfg(feature = "transport-multiplex")]

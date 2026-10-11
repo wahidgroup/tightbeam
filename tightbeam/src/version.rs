@@ -1,5 +1,10 @@
 use crate::asn1::Version;
 
+#[cfg(feature = "builder")]
+use crate::builder::FrameBuilder;
+#[cfg(feature = "builder")]
+use crate::Message;
+
 /// A Frame or Metadata field that only later protocol versions carry.
 ///
 /// This enum is mapping for the version-to-field mapping in §5.6 of the
@@ -62,5 +67,14 @@ impl Version {
 	/// Whether a frame at this version may carry `field`.
 	pub const fn allows(self, field: GatedField) -> bool {
 		self as u8 >= field.since() as u8
+	}
+
+	/// Start a [`FrameBuilder`] for message type `T` at this version.
+	///
+	/// This is the method form of the `compose!` macro, for contexts
+	/// where a macro cannot be used (inside another macro definition).
+	#[cfg(feature = "builder")]
+	pub fn compose<T: Message>(self) -> FrameBuilder<T> {
+		FrameBuilder::from(self)
 	}
 }

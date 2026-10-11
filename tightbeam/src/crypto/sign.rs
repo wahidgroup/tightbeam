@@ -30,6 +30,16 @@ use crate::error::{Result, TightBeamError};
 use crate::oids::SIGNER_ECDSA_WITH_SHA3_256;
 use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey};
 
+/// Create a SignatureInfo by signing data.
+#[macro_export]
+#[cfg(feature = "signature")]
+macro_rules! sign {
+	($signer:expr, $data:expr) => {{
+		let unsigned_bytes = $crate::encode(&$data)?;
+		$signer(&unsigned_bytes)
+	}};
+}
+
 /// A signature type that names its algorithm OID.
 ///
 /// Generic code reads the OID from the type, so one code path serves different

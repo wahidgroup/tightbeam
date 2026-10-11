@@ -19,11 +19,11 @@ use crate::colony::hive::{
 	HashMapRegistry, Hive, HiveConfig, HiveContext, RegisterHiveResponse, ServletBox, ServletRegistration,
 	ServletRegistry, SpawnerFn,
 };
-use crate::colony::servlet::servlet_runtime::rt;
 use crate::constants::DEFAULT_MAX_SERVER_CONNECTIONS;
 use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::macros::server::AcceptedConnection;
 use crate::policy::TransitStatus;
+use crate::runtime::rt;
 use crate::trace::TraceCollector;
 use crate::transport::accept::AcceptPlane;
 use crate::transport::client::pool::{ConnectionBuilder, ConnectionPool};
@@ -32,7 +32,7 @@ use crate::transport::policy::PolicyConfig;
 use crate::transport::{
 	AsyncListenerTrait, EncryptedProtocol, MessageCollector, MessageEmitter, PersistentConnection, Protocol,
 };
-use crate::utils::urn::{Urn, UrnValidationError};
+use crate::urn::{Urn, UrnValidationError};
 use crate::TightBeamError;
 
 use crate::colony::hive::{BackpressureGate, ClusterSecurityGate, GateLimits};

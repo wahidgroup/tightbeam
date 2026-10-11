@@ -1,6 +1,6 @@
 //! URN builder for constructing URNs with validation
 
-use crate::utils::urn::{Urn, UrnComponents, UrnSpec, UrnValidationError};
+use crate::urn::{Urn, UrnComponents, UrnSpec, UrnValidationError};
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
@@ -115,8 +115,8 @@ impl<'a> UrnBuilder<'a> {
 
 	/// Configure the builder to use a spec for validation and NSS construction
 	///
-	/// This method cannot be used together with `with_nss()`. If both are called,
-	/// `build()` will return an error.
+	/// This method cannot be used together with `with_nss()`. If both are
+	/// called, `build()` will return an error.
 	pub fn with_spec<S: UrnSpec>(mut self) -> Self {
 		// Capture the spec's building logic in a closure
 		let spec_builder = move |builder: &mut UrnBuilder<'a>| -> Result<Cow<'static, str>, UrnValidationError> {
@@ -155,8 +155,8 @@ impl<'a> UrnBuilder<'a> {
 	/// - `with_spec()`: Spec-based validation and construction
 	/// - Default: Constructed from components in lexicographic key order
 	///
-	/// `with_nss()` and `with_spec()` are mutually exclusive. If neither is called,
-	/// the NSS is constructed from components.
+	/// `with_nss()` and `with_spec()` are mutually exclusive. If neither is
+	/// called, the NSS is constructed from components.
 	///
 	/// # RFC 8141 Compliance
 	///
@@ -183,7 +183,8 @@ impl<'a> UrnBuilder<'a> {
 			NssMode::Spec(builder_fn) => builder_fn(&mut self)?,
 			NssMode::Direct(nss) => nss,
 			NssMode::Unset => {
-				// Collect and sort keys for deterministic ordering (important for HashMap)
+				// Collect and sort keys for deterministic ordering (important
+				// for HashMap)
 				let mut keys: Vec<&'static str> = self.components.keys().copied().collect();
 				keys.sort();
 
@@ -219,7 +220,7 @@ impl<'a> TypeBuilder<Urn<'a>> for UrnBuilder<'a> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::utils::urn::builders::spec::Pattern;
+	use crate::urn::builders::spec::Pattern;
 
 	crate::urn_spec! {
 		/// Test URN spec for testing URN builder functionality

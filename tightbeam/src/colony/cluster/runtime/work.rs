@@ -26,7 +26,7 @@ use crate::transport::multiplex::MuxConnector;
 use crate::transport::policy::PolicyConfig;
 use crate::transport::state::EncryptedProtocolState;
 use crate::transport::{EncryptedProtocol, PersistentConnection, Protocol};
-use crate::utils::urn::Urn;
+use crate::urn::Urn;
 use crate::{Frame, TightBeamError};
 
 /// A route the load balancer chose for a servlet type.

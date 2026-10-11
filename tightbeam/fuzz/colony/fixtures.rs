@@ -17,7 +17,7 @@ use tightbeam::crypto::x509::{Certificate, CertificateSpec};
 use tightbeam::der::Encode;
 use tightbeam::testing::fixtures::{TestCertificate, TestKey};
 use tightbeam::transport::handshake::negotiation::TransportOffer;
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 
 /// Gateway identity bundle used by the colony fuzz topology.
 ///

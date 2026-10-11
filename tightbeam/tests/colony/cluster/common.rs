@@ -95,8 +95,8 @@ pub use tightbeam::{
 		handshake::negotiation::TransportOffer, tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder,
 		ConnectionPool, GenericClient, PoolConfig,
 	},
+	urn::Urn,
 	utils::time::{Clock, ManualClock, UnixMillis},
-	utils::urn::Urn,
 	Beamable, Frame, TightBeamError, Version,
 };
 use tightbeam::{cluster, compose, hive, servlet};

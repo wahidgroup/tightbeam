@@ -35,8 +35,8 @@ use tightbeam::transport::handshake::negotiation::{
 	AuthorizationGrant, AuthorizationRefusal, MuxBudgets, TransportAuthorizer, TransportOffer,
 };
 use tightbeam::transport::handshake::receipt::SessionReceipt;
+use tightbeam::urn::Urn;
 use tightbeam::utils::marker::MaybeSendFuture;
-use tightbeam::utils::urn::Urn;
 use tightbeam::TightBeamError;
 
 use crate::common::security::{

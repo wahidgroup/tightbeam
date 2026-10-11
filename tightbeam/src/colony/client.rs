@@ -16,7 +16,7 @@ use crate::error::TightBeamError;
 use crate::transport::client::GenericClient;
 use crate::transport::protocols::Protocol;
 use crate::transport::MessageEmitter;
-use crate::utils::urn::Urn;
+use crate::urn::Urn;
 
 use core::hash::Hash;
 

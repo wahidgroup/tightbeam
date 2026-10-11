@@ -16,7 +16,7 @@ use crate::der::oid::AssociatedOid;
 use crate::der::{DecodeOwned, Encode};
 use crate::x509::certificate::{CertificateInner, Profile};
 
-#[cfg(host_clock)]
+#[cfg(any(host_clock, feature = "time"))]
 use crate::utils::time::UnixMillis;
 
 /// A 32-byte certificate fingerprint bound to the digest that produced it.
@@ -266,26 +266,14 @@ impl<P: Profile> CertificateExt for CertificateInner<P> {
 		Ok(())
 	}
 
-	/// Runs the check at the host clock's reading, through [`UnixMillis::now`],
-	/// so certificate validity reads the same clock as every other time
-	/// decision in the crate.
-	#[cfg(host_clock)]
+	/// Runs the check at the reading of [`UnixMillis::now`], so certificate
+	/// validity reads the same clock as every other time decision in the
+	/// crate, on each target that has one.
+	#[cfg(any(host_clock, feature = "time"))]
 	fn validate_expiry(&self) -> Result<(), CertificateValidationError> {
 		let now = UnixMillis::now();
 		let now_unix = Duration::from_millis(now.get()).as_secs();
 
-		self.validate_expiry_at(now_unix)
-	}
-
-	/// Runs the check at the reading of the `time` crate, for a build that has
-	/// no host clock and enables `time`. On `wasm32-unknown-unknown` that crate
-	/// reads the JavaScript clock, the one clock such a build has.
-	#[cfg(all(feature = "time", not(host_clock)))]
-	fn validate_expiry(&self) -> Result<(), CertificateValidationError> {
-		use crate::time::OffsetDateTime;
-
-		let now = OffsetDateTime::now_utc().unix_timestamp();
-		let now_unix = u64::try_from(now).map_err(|_| CertificateValidationError::InvalidTimestamp)?;
 		self.validate_expiry_at(now_unix)
 	}
 

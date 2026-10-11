@@ -34,7 +34,7 @@ use crate::transport::multiplex::{MuxConnector, ReplySink, StreamBody, StreamRou
 use crate::transport::policy::PolicyConfig;
 use crate::transport::state::EncryptedProtocolState;
 use crate::transport::{EncryptedProtocol, PersistentConnection, PooledClient, Protocol};
-use crate::utils::urn::Urn;
+use crate::urn::Urn;
 use crate::{Frame, TightBeamError};
 
 /// The dialing plan a splice follows once a route is chosen.

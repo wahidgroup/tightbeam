@@ -833,7 +833,7 @@ impl FuzzContext {
 /// Tests common patterns across oracle and context components
 mod tests {
 	use super::*;
-	use crate::utils::urn::Urn;
+	use crate::urn::Urn;
 
 	// ===== Test Fixtures =====
 

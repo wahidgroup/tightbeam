@@ -47,7 +47,7 @@ use tightbeam::transport::handshake::{HandshakeAttribute, HandshakeError};
 use tightbeam::x509::name::Name;
 use tightbeam::x509::serial_number::SerialNumber;
 
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 
 pub(crate) const ATTRIBUTE_EXTRACTED: Urn<'static> = tightbeam::urn!("test", "event:cms-toolkit/attribute-extracted");
 pub(crate) const CEK_RECOVERED: Urn<'static> = tightbeam::urn!("test", "event:cms-toolkit/cek-recovered");

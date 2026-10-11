@@ -50,7 +50,7 @@ use crate::colony::cluster::{
 	ClusterError, ExportAllowlist, ExportGate, ExportGrant, GossipAdmission, GossipConfig, MemoryPeerStore,
 	PeerAddress, PeerStore, PeerTable, StaticExportList,
 };
-use crate::utils::urn::Urn;
+use crate::urn::Urn;
 
 /// Builder for [`HeartbeatConfig`].
 pub struct HeartbeatConfigBuilder {

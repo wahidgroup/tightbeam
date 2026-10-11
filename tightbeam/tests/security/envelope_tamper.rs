@@ -49,7 +49,7 @@ use tightbeam::transport::TransportLimits;
 use tightbeam::transport::{
 	EnvelopeSink, EnvelopeSource, TransportEnvelope, TransportError, TransportFailure, TransportWriter,
 };
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 use tightbeam::TightBeamError;
 
 use crate::common::security::{expectation_failure, ServerMaterials};

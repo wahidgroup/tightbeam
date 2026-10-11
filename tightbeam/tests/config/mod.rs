@@ -5,7 +5,7 @@
 //! which is the only shape a caller can hand the builder.
 
 use tightbeam::testing::{Expect, Layer, ScenarioConfig, ScenarioConfigError};
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_process_spec};
 
 const STEP: Urn<'static> = tightbeam::urn!("test", "event:config/step");

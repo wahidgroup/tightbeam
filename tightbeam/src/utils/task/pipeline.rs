@@ -12,7 +12,7 @@ use crate::error::TightBeamError;
 #[cfg(any(test, feature = "testing"))]
 use crate::trace::TraceCollector;
 #[cfg(any(test, feature = "testing"))]
-use crate::utils::urn::Urn;
+use crate::urn::Urn;
 
 /// Pipeline trait - extends Result with trace and retry capabilities
 ///

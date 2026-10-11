@@ -66,7 +66,7 @@ pub use fmea::{FailureMode, FmeaConfig, FmeaReport, SeverityScale};
 mod tests {
 	use crate::exactly;
 	use crate::testing::TBSpec;
-	use crate::utils::urn::Urn;
+	use crate::urn::Urn;
 
 	const MESSAGE_RECEIVED: Urn<'static> = crate::urn!("test", "event:demo/message-received");
 

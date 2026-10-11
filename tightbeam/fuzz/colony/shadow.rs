@@ -35,7 +35,7 @@ use std::sync::Arc;
 use tightbeam::colony::cluster::{DynamicExportList, ExportAllowlist, TrustPlaneStores, TrustPlanes};
 use tightbeam::crypto::x509::store::CertificateTrust;
 use tightbeam::crypto::x509::Certificate;
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 
 use crate::acl::DynamicAclState;
 use crate::policy::DynamicPolicyGate;

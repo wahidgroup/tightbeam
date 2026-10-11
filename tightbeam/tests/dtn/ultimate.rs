@@ -65,7 +65,7 @@ use tightbeam::{
 	transport::{
 		tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder, ConnectionPool, GenericClient, PoolConfig,
 	},
-	utils::urn::Urn,
+	urn::Urn,
 	wcet,
 };
 

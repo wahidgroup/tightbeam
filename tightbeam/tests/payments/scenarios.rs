@@ -44,7 +44,7 @@ use tightbeam::{
 	transport::{
 		handshake::negotiation::TransportOffer, tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder,
 	},
-	utils::urn::Urn,
+	urn::Urn,
 	TightBeamError, Version,
 };
 

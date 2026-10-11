@@ -29,6 +29,7 @@ use core::pin::Pin;
 use crate::Errorizable;
 
 use crate::policy::{ReceptorPolicy, TransitStatus};
+use crate::runtime::rt;
 use crate::trace::TraceCollector;
 use crate::Message;
 
@@ -37,22 +38,9 @@ pub mod runtime;
 
 pub use runtime::WorkerRuntime;
 
-/// Re-export unified runtime primitives with worker-specific type aliases
-pub mod worker_runtime {
-	pub mod rt {
-		pub use crate::runtime::rt::*;
-
-		/// Queue sender type alias (for backwards compatibility)
-		pub type QueueSender<T> = crate::runtime::rt::Sender<T>;
-
-		/// Queue receiver type alias (for backwards compatibility)
-		pub type QueueReceiver<T> = crate::runtime::rt::Receiver<T>;
-	}
-}
-
 pub(crate) struct WorkerRequest<I: Send, O> {
 	pub(crate) message: Arc<I>,
-	pub(crate) respond_to: worker_runtime::rt::OneshotSender<Result<O, TransitStatus>>,
+	pub(crate) respond_to: rt::OneshotSender<Result<O, TransitStatus>>,
 	pub(crate) trace: Arc<TraceCollector>,
 }
 

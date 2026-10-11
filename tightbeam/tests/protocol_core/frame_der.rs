@@ -6,7 +6,7 @@ use tightbeam::crypto::hash::Sha3_256;
 use tightbeam::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
 use tightbeam::prelude::*;
 use tightbeam::testing::{ScenarioConfig, SetupEnv};
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_scenario, TightBeamError};
 
 pub(crate) const DER_NONEMPTY: Urn<'static> = tightbeam::urn!("test", "event:frame-der/der-nonempty");

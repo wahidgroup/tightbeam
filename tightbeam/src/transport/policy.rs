@@ -12,8 +12,18 @@ use crate::Frame;
 
 #[cfg(feature = "std")]
 use crate::random::generate_nonce;
+
+/// Bounds of the decorrelated-jitter window for a base value.
+///
+/// Returns `(min, range)` where the window spans `min..=min + range` with
+/// `min = base / 3`. Shared by the restart backoff strategy
+/// ([`DecorrelatedJitter`]) and the timing framework's
+/// `DecorrelatedJitterCalculator`, so the algorithm is defined once.
 #[cfg(feature = "std")]
-use crate::utils::jitter::decorrelated_bounds;
+pub(crate) const fn decorrelated_bounds(base: u64) -> (u64, u64) {
+	let min = base / 3;
+	(min, base.saturating_sub(min))
+}
 
 /// A transport that honours a restart policy.
 pub trait RestartConfig

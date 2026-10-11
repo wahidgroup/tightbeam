@@ -172,8 +172,7 @@ impl MuxLink {
 	///
 	/// # Errors
 	///
-	/// - [`TransportError::ConnectionClosed`] -- the writer driver is gone, or
-	///   the reader ended before the peer granted the rest of the response.
+	/// - [`TransportError::ConnectionClosed`] -- a driver of the connection ended before the response left.
 	/// - The encode failure of a response frame that does not serialize.
 	pub(crate) async fn send_response(&self, stream_id: u32, response: ResponsePackage) -> TransportResult<()> {
 		let mut status = response.status();
@@ -287,8 +286,7 @@ impl MuxLink {
 	/// - [`TransportError::OperationFailed`] with
 	///   [`TransportFailure::Cancelled`] -- the stream's ledger is gone,
 	///   whether cancelled, resolved, or lost with the connection.
-	/// - [`TransportError::ConnectionClosed`] -- the writer queue closed, or
-	///   the reader ended with the ledger at its limit.
+	/// - [`TransportError::ConnectionClosed`] -- a driver of the connection ended.
 	pub(crate) async fn send_data_envelope(&self, stream_id: u32, envelope: TransportEnvelope) -> TransportResult<()> {
 		let mut outbound = self.sender();
 		let ready = poll_fn(|cx| outbound.poll_ready(cx)).await;
@@ -301,14 +299,14 @@ impl MuxLink {
 	}
 
 	/// Send a stream's Open record through the atomic open of
-	/// [`MuxShared::poll_open_enqueue`], returning the assigned stream ID.
+	/// [`StreamReservation::poll_open`], returning the assigned stream ID.
 	///
 	/// The send reserves a writer-queue slot, then assigns the stream ID and
 	/// enqueues in one critical section, so Opens reach the wire in ID order.
 	///
 	/// # Errors
 	///
-	/// - [`TransportError::ConnectionClosed`] -- the writer queue closed, or the reader has ended.
+	/// - [`TransportError::ConnectionClosed`] -- a driver of the connection ended.
 	/// - [`TransportError::Draining`] -- a GoAway ended admission, or the ID space is exhausted.
 	pub(crate) async fn send_open_envelope(
 		&self,
@@ -321,7 +319,7 @@ impl MuxLink {
 			return Err(TransportError::ConnectionClosed);
 		}
 
-		poll_fn(|cx| self.shared.poll_open_enqueue(reservation, request, &mut outbound, cx)).await
+		poll_fn(|cx| reservation.poll_open(request, &mut outbound, cx)).await
 	}
 
 	/// Queue a GoAway with `reason` and halt the allocator, exactly once per

@@ -19,7 +19,7 @@ use tightbeam::{
 	servlet, tb_assert_spec, tb_scenario,
 	testing::{ClientEnv, ServletEnv, SetupEnv, TestKey},
 	transport::{tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder},
-	utils::urn::Urn,
+	urn::Urn,
 	worker, Beamable, Frame, TightBeamError,
 };
 

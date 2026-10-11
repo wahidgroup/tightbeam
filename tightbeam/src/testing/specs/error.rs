@@ -33,14 +33,14 @@ pub struct AssertionViolationDetail {
 /// Event ordering violation details
 #[derive(Clone, Debug, PartialEq)]
 pub struct EventOrderViolationDetail {
-	pub expected_kind: crate::utils::urn::Urn<'static>,
+	pub expected_kind: crate::urn::Urn<'static>,
 	pub position: usize,
 }
 
 /// Event count mismatch details
 #[derive(Clone, Debug, PartialEq)]
 pub struct EventCountMismatchDetail {
-	pub kind: crate::utils::urn::Urn<'static>,
+	pub kind: crate::urn::Urn<'static>,
 	pub expected: usize,
 	pub actual: usize,
 }

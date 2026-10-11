@@ -11,8 +11,7 @@
 //!
 //! # Sources
 //!
-//! - CWE-294, authentication bypass by capture-replay:
-//!   <https://cwe.mitre.org/data/definitions/294.html>
+//! - CWE-294, authentication bypass by capture-replay: <https://cwe.mitre.org/data/definitions/294.html>
 
 use core::time::Duration;
 
@@ -42,6 +41,29 @@ impl UnixMillis {
 	#[must_use]
 	pub fn now() -> Self {
 		SystemClock.unix()
+	}
+
+	/// The current instant from the `time` crate, for a build that has no
+	/// host clock and enables `time`.
+	///
+	/// On `wasm32-unknown-unknown` that crate reads the JavaScript clock, the
+	/// one clock such a build has. A reading before the unix epoch is the
+	/// epoch itself, as on a host.
+	#[cfg(all(feature = "time", not(host_clock)))]
+	#[must_use]
+	pub fn now() -> Self {
+		let reading = crate::time::OffsetDateTime::now_utc();
+
+		Self::from_unix_nanos(reading.unix_timestamp_nanos())
+	}
+
+	/// The instant `nanos` after the unix epoch, reading a time before the
+	/// epoch as the epoch.
+	#[cfg(any(test, all(feature = "time", not(host_clock))))]
+	fn from_unix_nanos(nanos: i128) -> Self {
+		let millis = nanos / 1_000_000;
+
+		Self(u64::try_from(millis).unwrap_or_default())
 	}
 
 	/// The instant a system time names, reading a time before the epoch as
@@ -144,8 +166,7 @@ impl MonotonicInstant {
 ///
 /// Each member answers a different question:
 ///
-/// - [`Clock::unix`] is the wall clock, which freshness and replay compare
-///   against the time a peer stated.
+/// - [`Clock::unix`] is the wall clock, which freshness and replay compare against the time a peer stated.
 /// - [`Clock::monotonic`] never steps backwards, so leases, idle timeouts and
 ///   handshake deadlines measure from it.
 /// - [`Clock::sleep`] waits on the same clock, so a restart backoff is
@@ -315,6 +336,14 @@ mod tests {
 		let earlier = UnixMillis::new(1_000);
 		let later = UnixMillis::new(400);
 		assert_eq!(later.saturating_since(earlier), Duration::ZERO);
+	}
+
+	// The arm that reads the `time` crate runs on no host, so its one
+	// conversion is pinned here.
+	#[test]
+	fn a_reading_in_nanoseconds_becomes_whole_milliseconds() {
+		assert_eq!(UnixMillis::from_unix_nanos(1_500_000), UnixMillis::new(1));
+		assert_eq!(UnixMillis::from_unix_nanos(-1_500_000), UnixMillis::new(0));
 	}
 
 	#[test]

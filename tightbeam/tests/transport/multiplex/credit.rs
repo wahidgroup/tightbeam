@@ -21,7 +21,7 @@ use tightbeam::transport::handshake::HandshakeError;
 use tightbeam::transport::{
 	EncryptedMessageIO, EnvelopeSink, EnvelopeSource, TransportEnvelope, TransportError, TransportFailure,
 };
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 use tightbeam::{Frame, TightBeamError};
 
 use crate::common::security::{expectation_failure, ServerMaterials};

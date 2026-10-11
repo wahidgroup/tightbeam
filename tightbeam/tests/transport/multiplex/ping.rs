@@ -10,7 +10,7 @@ use tightbeam::tb_scenario;
 use tightbeam::testing::{ClientEnv, SetupEnv};
 use tightbeam::transport::envelopes::{MuxEnvelope, MuxPingPackage};
 use tightbeam::transport::{EnvelopeSink, EnvelopeSource, TransportEnvelope, TransportError};
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 use tightbeam::Frame;
 
 use crate::transport::support::{await_ok, bind_encrypted_listener, mux_frame, mux_offer, record_spawned_event};

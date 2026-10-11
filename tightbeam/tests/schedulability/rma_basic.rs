@@ -6,7 +6,7 @@ use tightbeam::builder::TypeBuilder;
 use tightbeam::testing::fdr::FdrConfig;
 use tightbeam::testing::specs::csp::Event;
 use tightbeam::testing::{ScenarioConfig, SetupEnv, TestHooks};
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 use tightbeam::{exactly, wcet};
 use tightbeam::{tb_assert_spec, tb_process_spec, tb_scenario};
 

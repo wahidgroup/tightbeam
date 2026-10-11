@@ -1,4 +1,4 @@
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 
 // An empty NSS names no resource.
 const REJECTED: Urn<'static> = tightbeam::urn!("test", "");

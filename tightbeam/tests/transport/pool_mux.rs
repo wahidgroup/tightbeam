@@ -52,8 +52,8 @@ use tightbeam::transport::{
 	ClientBuilder, ConnectionBuilder, ConnectionPool, EncryptedProtocol, PoolConfig, PooledClient, ResponsePackage,
 	TransportEncryptionConfig, TransportError, TransportFailure,
 };
+use tightbeam::urn::Urn;
 use tightbeam::utils::marker::MaybeSendFuture;
-use tightbeam::utils::urn::Urn;
 use tightbeam::x509::Certificate;
 use tightbeam::{Frame, TightBeamError};
 

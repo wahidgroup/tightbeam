@@ -3,13 +3,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::jitter::{JitterCalculator, MinMaxJitter};
+use super::statistics::{DefaultStatisticalAnalyzer, Percentile, StatisticalAnalyzer};
 use crate::der::Sequence;
 use crate::instrumentation::{events, TbEvent};
 use crate::testing::error::TestingError;
 use crate::testing::specs::csp::{Event, Process};
 use crate::trace::ConsumedTrace;
-use crate::utils::jitter::{JitterCalculator, MinMaxJitter};
-use crate::utils::statistics::{DefaultStatisticalAnalyzer, Percentile, StatisticalAnalyzer};
 
 use super::constraints::{TimingConstraint, TimingConstraints};
 use super::deadline::Deadline;
@@ -414,9 +414,9 @@ mod tests {
 	use crate::builder::TypeBuilder;
 	use crate::instrumentation::events;
 	use crate::testing::specs::csp::{Process, ProcessBuildError, State};
+	use crate::testing::timing::VarianceJitter;
 	use crate::testing::timing::{DeadlineBuilder, PathWcet, WcetConfig, WcetConfigBuilder};
-	use crate::utils::jitter::VarianceJitter;
-	use crate::utils::urn::Urn;
+	use crate::urn::Urn;
 
 	// ========================================================================
 	// Test Case Data Structures

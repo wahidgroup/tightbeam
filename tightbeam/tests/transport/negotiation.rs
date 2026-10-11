@@ -35,7 +35,7 @@ use tightbeam::testing::{
 };
 use tightbeam::transport::handshake::negotiation::SecurityOffer;
 use tightbeam::transport::handshake::{Ecies, EciesServerSettings, Handshake, ServerConfig, SupportedProfiles};
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 use tightbeam::x509::Certificate;
 
 use crate::common::security::{ecies_client_config, pinning_validator};

@@ -1,4 +1,4 @@
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 use tightbeam::{at_least, tb_assert_spec};
 
 pub(crate) const SOME_KEY: Urn<'static> = tightbeam::urn!("test", "event:at-least-zero/some-key");

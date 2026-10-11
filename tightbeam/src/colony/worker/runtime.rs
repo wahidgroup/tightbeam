@@ -7,10 +7,9 @@ use core::future::Future;
 use core::mem;
 use std::sync::Arc;
 
-use crate::colony::worker::{
-	worker_runtime, WorkerKillFuture, WorkerPolicies, WorkerRelayError, WorkerRelayFuture, WorkerRequest,
-};
+use crate::colony::worker::{WorkerKillFuture, WorkerPolicies, WorkerRelayError, WorkerRelayFuture, WorkerRequest};
 use crate::error::TightBeamError;
+use crate::runtime::rt;
 use crate::trace::TraceCollector;
 use crate::Message;
 
@@ -29,9 +28,9 @@ where
 	/// The queue is open and the run loop is spawned.
 	Started {
 		/// Sender side of the request queue.
-		sender: worker_runtime::rt::QueueSender<WorkerRequest<I, O>>,
+		sender: rt::Sender<WorkerRequest<I, O>>,
 		/// Handle of the spawned run loop.
-		join: worker_runtime::rt::JoinHandle,
+		join: rt::JoinHandle,
 		/// Bound of the request queue.
 		queue: usize,
 	},
@@ -85,10 +84,10 @@ where
 			return self;
 		}
 
-		let (tx, rx) = worker_runtime::rt::channel::<WorkerRequest<I, O>>(queue_capacity);
+		let (tx, rx) = rt::channel::<WorkerRequest<I, O>>(queue_capacity);
 		let config = Arc::clone(&self.config);
 		let policies = Arc::new(policies);
-		let join = worker_runtime::rt::spawn(run_loop(rx, config, policies, handler));
+		let join = rt::spawn(run_loop(rx, config, policies, handler));
 
 		self.phase = Phase::Started { sender: tx, join, queue: queue_capacity };
 		self.trace = trace;
@@ -107,14 +106,12 @@ where
 
 		Box::pin(async move {
 			let sender = sender.ok_or(WorkerRelayError::QueueClosed)?;
-			let (tx, rx) = worker_runtime::rt::oneshot();
+			let (tx, rx) = rt::oneshot();
 
 			let request = WorkerRequest { message, respond_to: tx, trace };
-			worker_runtime::rt::send(&sender, request)
-				.await
-				.map_err(|_| WorkerRelayError::QueueClosed)?;
+			rt::send(&sender, request).await.map_err(|_| WorkerRelayError::QueueClosed)?;
 
-			match worker_runtime::rt::wait_response(rx).await {
+			match rt::wait_response(rx).await {
 				Ok(Ok(output)) => Ok(output),
 				Ok(Err(status)) => Err(WorkerRelayError::Rejected(status)),
 				Err(()) => Err(WorkerRelayError::ResponseDropped),
@@ -138,7 +135,7 @@ where
 			};
 
 			drop(sender);
-			worker_runtime::rt::join(join).await.map_err(|_| TightBeamError::JoinError)?;
+			rt::join(join).await.map_err(|_| TightBeamError::JoinError)?;
 
 			Ok(())
 		})
@@ -165,12 +162,12 @@ where
 		};
 
 		drop(sender);
-		worker_runtime::rt::abort(&join);
+		rt::abort(&join);
 	}
 }
 
 async fn run_loop<I, O, C, F, Fut>(
-	mut receiver: worker_runtime::rt::QueueReceiver<WorkerRequest<I, O>>,
+	mut receiver: rt::Receiver<WorkerRequest<I, O>>,
 	config: Arc<C>,
 	policies: Arc<WorkerPolicies<I>>,
 	handler: F,
@@ -181,7 +178,7 @@ async fn run_loop<I, O, C, F, Fut>(
 	F: Fn(Arc<I>, Arc<TraceCollector>, Arc<C>) -> Fut + Send + Sync + 'static,
 	Fut: Future<Output = O> + Send + 'static,
 {
-	while let Some(request) = worker_runtime::rt::recv(&mut receiver).await {
+	while let Some(request) = rt::recv(&mut receiver).await {
 		let WorkerRequest { message, respond_to, trace } = request;
 		if let Err(status) = policies.admits(message.as_ref()) {
 			// A send fails only when the caller dropped its relay future,

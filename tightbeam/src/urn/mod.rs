@@ -22,7 +22,7 @@
 //! # Examples
 //!
 //! ```rust
-//! use tightbeam::utils::urn::{Urn, UrnBuilder, UrnValidationError};
+//! use tightbeam::urn::{Urn, UrnBuilder, UrnValidationError};
 //!
 //! fn main() -> Result<(), UrnValidationError> {
 //!     // Build a URN with direct NSS
@@ -67,6 +67,7 @@ mod macros;
 pub mod builders;
 pub mod error;
 pub mod spec;
+
 #[cfg(test)]
 pub mod specs;
 
@@ -80,10 +81,12 @@ use crate::der::{DecodeValue, EncodeValue, FixedTag, Tag};
 ///
 /// Uses `Cow<'a, str>` for zero-copy string handling.
 ///
-/// DER serialization: Encoded as a UTF8String containing the full URN representation "urn:nid:nss".
+/// DER serialization: Encoded as a UTF8String containing the full URN
+/// representation "urn:nid:nss".
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Urn<'a> {
-	/// Namespace Identifier (2-32 chars, alphanumeric+hyphen, starts with letter)
+	/// Namespace Identifier (2-32 chars, alphanumeric+hyphen, starts with
+	/// letter)
 	/// See: `<https://datatracker.ietf.org/doc/html/rfc8141#section-2.1>`
 	nid: Cow<'a, str>,
 
@@ -95,7 +98,7 @@ pub struct Urn<'a> {
 impl<'a> Urn<'a> {
 	/// A URN from static parts, with no checks.
 	///
-	/// Exists for [`urn!`](crate::urn), which validates both parts in a
+	/// Exists for [`urn!`](crate::urn!), which validates both parts in a
 	/// `const` block before calling it, and has to be `pub` because the
 	/// macro expands in downstream crates. Write `urn!` instead.
 	#[doc(hidden)]
@@ -105,7 +108,7 @@ impl<'a> Urn<'a> {
 
 	/// Build a URN from parts that are not known until run time.
 	///
-	/// [`urn!`](crate::urn) is the compile-time path for literals. This one
+	/// [`urn!`](crate::urn!) is the compile-time path for literals. This one
 	/// takes the same rules to values a caller assembles.
 	///
 	/// # Errors
@@ -155,8 +158,9 @@ impl<'a> Urn<'a> {
 	/// Validate that the NID conforms to RFC 8141 § 2.3.1
 	/// See: `<https://datatracker.ietf.org/doc/html/rfc8141#section-2.1>`
 	///
-	/// NID must be 2-32 characters, alphanumeric plus hyphens, starting with a letter.
-	/// This implements the formal-namespace-identifier production from RFC 8141.
+	/// NID must be 2-32 characters, alphanumeric plus hyphens, starting with a
+	/// letter. This implements the formal-namespace-identifier production from
+	/// RFC 8141.
 	pub const fn validate_nid(nid: &str) -> Result<(), UrnValidationError> {
 		// Byte-wise because `str::chars` is not available in a `const fn`.
 		// The production is ASCII, so bytes and characters agree here.
@@ -200,7 +204,7 @@ impl<'a> Urn<'a> {
 
 	/// The one runtime path that assembles a `Urn`.
 	///
-	/// [`urn!`](crate::urn) checks literals in const context. Every other
+	/// [`urn!`](crate::urn!) checks literals in const context. Every other
 	/// constructor, the parser and the builder included, comes through here,
 	/// so no path can produce a URN the constructors would refuse.
 	pub(super) fn checked(nid: Cow<'a, str>, nss: Cow<'a, str>) -> Result<Urn<'a>, UrnValidationError> {
@@ -212,8 +216,9 @@ impl<'a> Urn<'a> {
 
 	/// Convert the URN to an owned version with 'static lifetime
 	///
-	/// This converts borrowed strings to owned strings, allowing the URN
-	/// to outlive its original data sources. This is similar to `Cow::into_owned()`.
+	/// This converts borrowed strings to owned strings, allowing the URN to
+	/// outlive its original data sources. This is similar to
+	/// `Cow::into_owned()`.
 	#[inline]
 	pub fn into_owned(self) -> Urn<'static> {
 		Urn { nid: Cow::Owned(self.nid.into_owned()), nss: Cow::Owned(self.nss.into_owned()) }
@@ -251,7 +256,8 @@ impl<'a> EncodeValue for Urn<'a> {
 	}
 
 	fn encode_value(&self, encoder: &mut impl crate::der::Writer) -> crate::der::Result<()> {
-		// Manually write "urn:nid:nss" without format!() for no_std compatibility
+		// Manually write "urn:nid:nss" without format!() for no_std
+		// compatibility
 		encoder.write(b"urn:")?;
 		encoder.write(self.nid.as_bytes())?;
 		encoder.write(b":")?;

@@ -82,7 +82,7 @@ macro_rules! __servlet_define {
 			#[allow(dead_code)]
 			pub async fn join(
 				self,
-			) -> ::core::result::Result<(), $crate::colony::servlet::servlet_runtime::rt::JoinError> {
+			) -> ::core::result::Result<(), $crate::runtime::rt::JoinError> {
 				self.runtime.join().await
 			}
 		}
@@ -122,7 +122,7 @@ macro_rules! __servlet_define {
 				self.runtime.stop();
 			}
 
-			async fn join(self) -> Result<(), $crate::colony::servlet::servlet_runtime::rt::JoinError> {
+			async fn join(self) -> Result<(), $crate::runtime::rt::JoinError> {
 				self.runtime.join().await
 			}
 		}

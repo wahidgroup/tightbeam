@@ -248,7 +248,7 @@ pub enum TightBeamError {
 	/// URN validation failed.
 	#[error("URN validation error: {0}")]
 	#[source]
-	UrnValidationError(crate::utils::urn::UrnValidationError),
+	UrnValidationError(crate::urn::UrnValidationError),
 
 	/// Encryption or decryption failed.
 	#[cfg(feature = "aead")]
@@ -455,7 +455,7 @@ pub enum TightBeamError {
 
 crate::impl_from!(der::Error => TightBeamError::SerializationError);
 crate::impl_from!(crate::matrix::MatrixError => TightBeamError::MatrixError);
-crate::impl_from!(crate::utils::urn::UrnValidationError => TightBeamError::UrnValidationError);
+crate::impl_from!(crate::urn::UrnValidationError => TightBeamError::UrnValidationError);
 
 #[cfg(feature = "std")]
 crate::impl_from!(std::string::FromUtf8Error => TightBeamError::IoError via |err| std::io::Error::new(std::io::ErrorKind::InvalidData, err));

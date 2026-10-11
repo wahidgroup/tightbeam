@@ -36,7 +36,6 @@ use crate::colony::common::{
 	ClusterRequest, GossipReconciliation, GossipResponse, GossipRumor, GossipRumorKind, GossipWant, PeerAdvertisement,
 	PeerAdvertisementResponse, PeerGossip,
 };
-use crate::colony::servlet::servlet_runtime::rt;
 use crate::constants::{MAX_ADVERTISED_TYPES, MAX_GOSSIP_LOG, MAX_GOSSIP_TTL, MAX_PEX_SAMPLE};
 use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::decode;
@@ -50,14 +49,15 @@ use crate::instrumentation::events::{
 	CLUSTER_PEER_AD_DROPPED, CLUSTER_PEER_AD_LEARNED, CLUSTER_PEER_AD_PUBLISH_FAILED, CLUSTER_RELAY_TRAIL_REFUSED,
 };
 use crate::policy::TransitStatus;
+use crate::runtime::rt;
 use crate::trace::TraceCollector;
 use crate::transport::messaging::{MessageCollector, MessageEmitter};
 use crate::transport::multiplex::MuxConnector;
 use crate::transport::policy::PolicyConfig;
 use crate::transport::state::EncryptedProtocolState;
 use crate::transport::{EncryptedProtocol, PersistentConnection, Protocol};
+use crate::urn::Urn;
 use crate::utils::time::UnixMillis;
-use crate::utils::urn::Urn;
 use crate::Frame;
 use crate::TightBeamError;
 use crate::{MessagePriority, Version};

@@ -84,7 +84,7 @@ macro_rules! tb_gen_process_types {
 #[cfg(all(test, feature = "testing-fault"))]
 mod tests {
 	use crate::testing::fault::{ProcessEvent, ProcessState};
-	use crate::utils::urn::Urn;
+	use crate::urn::Urn;
 
 	const CONNECT: Urn<'static> = crate::urn!("test", "event:gen-states/connect");
 	const SEND: Urn<'static> = crate::urn!("test", "event:gen-states/send");
