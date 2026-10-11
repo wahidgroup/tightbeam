@@ -9,6 +9,7 @@
 
 use super::common::*;
 use super::streaming::{pooled_cluster_client, start_stream_hive};
+use tightbeam::utils::time::ManualClock;
 
 /// A dial address nothing listens on, so a dead direct trail fails fast.
 const DEAD_GATEWAY_ADDR: &[u8] = b"127.0.0.1:9";
@@ -67,6 +68,34 @@ pub fn federation_conf(
 		.with_rumor_refresh(Duration::from_millis(200))
 		.with_max_hops(max_hops)
 		.build()
+}
+
+/// One advertise beat of the gateway [`federation_conf`] builds.
+const BEAT: Duration = Duration::from_millis(100);
+
+/// Beats a scenario drives on a manual clock before it gives up.
+///
+/// Twenty beats move that clock two seconds, well inside a gateway's freshness
+/// window, so every frame signed meanwhile stays admissible.
+const DRIVEN_BEATS: u32 = 20;
+
+/// Drives `clock` one beat at a time until `trace` holds `count` peer
+/// advertisements, or the beats run out. The branching lives here, so the
+/// scenario reads as one straight line.
+///
+/// - The beat task may not be sleeping yet when the scenario starts, and a
+///   sleep begun after an advance waits a whole beat from there, so each
+///   round advances again.
+/// - Each round reads the trace once the round's socket work has had a moment to run.
+/// - A round that falls short polls to its end, so a rumor that beat flooded has landed before the next.
+pub async fn drive_until_advertised(clock: &ManualClock, trace: &TraceCollector, count: usize) {
+	let landed = || trace.recorded(events::CLUSTER_PEER_ADVERTISED) >= count;
+	for _ in 0..DRIVEN_BEATS {
+		clock.advance(BEAT);
+		if poll_until(5, Duration::from_millis(20), landed).await {
+			return;
+		}
+	}
 }
 
 /// [`federation_conf`] that also restricts inbound ads to the peers it
@@ -145,8 +174,8 @@ pub async fn flood_ad_rumor(
 	let id = id.as_ref();
 	let advertisement =
 		ClusterRequest::AdvertisePeer(PeerAdvertisement { gateway_addr: gateway_addr.to_vec(), advertised_types });
-	let inner = signed_control_frame_with(signer, id, advertisement).await?;
 
+	let inner = signed_control_frame_with(signer, id, advertisement).await?;
 	let provider = Secp256k1KeyProvider::from(signer.to_owned());
 	let mut rumor = Version::V2
 		.compose()

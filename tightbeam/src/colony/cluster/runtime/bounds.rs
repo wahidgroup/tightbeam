@@ -10,6 +10,7 @@ use digest::{Digest, OutputSizeUser};
 
 use crate::colony::cluster::registry::ColonyMembership;
 use crate::colony::cluster::runtime::freshness::GatewayReplayGuard;
+use crate::colony::cluster::runtime::gossip_tasks::PeerLedgers;
 use crate::colony::cluster::runtime::hop::PeerPlane;
 use crate::colony::cluster::{ClusterConfig, HiveRegistry, ServletRegistry};
 use crate::colony::common::TaskGroup;
@@ -117,6 +118,9 @@ pub(crate) struct GatewayRuntimeCtx<P: Protocol> {
 	pub(crate) replay_guard: GatewayReplayGuard,
 	/// Owner of the background work a request handler starts.
 	pub(crate) tasks: TaskGroup,
+	/// What each gossip target acknowledged and refused, shared by the beat
+	/// and by every inbound reflood.
+	pub(crate) ledgers: Arc<PeerLedgers>,
 }
 
 impl<P: Protocol> GatewayRuntimeCtx<P> {
@@ -140,6 +144,7 @@ impl<P: Protocol> Clone for GatewayRuntimeCtx<P> {
 			peer_plane: self.peer_plane.clone(),
 			trace: Arc::clone(&self.trace),
 			tasks: self.tasks.clone(),
+			ledgers: Arc::clone(&self.ledgers),
 			replay_guard: self.replay_guard.clone(),
 		}
 	}

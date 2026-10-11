@@ -817,6 +817,23 @@ pub const MAX_PEX_SAMPLE: usize = 8;
 /// dials.
 pub const PEER_PROBE_PER_BEAT: usize = 4;
 
+/// Wait before a candidate that failed one feeler probe is probed again.
+///
+/// Each further failed probe doubles the wait, up to
+/// [`PEER_PROBE_BACKOFF_MAX_MS`]. A dead address therefore costs a connect
+/// timeout at a falling rate, and its prefix yields the probe slot meanwhile.
+///
+/// # Sources
+///
+/// - CWE-770, allocation of resources without limits or throttling:
+///   <https://cwe.mitre.org/data/definitions/770.html>
+pub const PEER_PROBE_BACKOFF_MS: u64 = 1_000;
+
+/// Ceiling on the wait between two feeler probes of one failed candidate.
+///
+/// A candidate that came back is therefore probed again within this wait.
+pub const PEER_PROBE_BACKOFF_MAX_MS: u64 = 60_000;
+
 /// Consecutive failed beat dials before a tried peer is evicted.
 ///
 /// Tried residents re-dial on every beat, so consecutive failures are the

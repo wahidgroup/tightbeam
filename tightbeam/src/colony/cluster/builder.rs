@@ -30,8 +30,9 @@
 //! certificate and rebuilds the peer discovery table from the dial list.
 //! The effective rumor refresh interval is derived on every read by
 //! [`ClusterConfig::rumor_refresh`], because the gossip freshness window
-//! it clamps to narrows again at startup.
+//! it clamps to narrows at startup.
 
+use core::num::NonZeroUsize;
 use core::time::Duration;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -216,8 +217,7 @@ impl ClusterConfigBuilder {
 	/// # Defaults
 	///
 	/// - Unset exports every locally served type.
-	/// - An empty list advertises nothing and refuses every target for
-	///   external peers and relayed requests.
+	/// - An empty list advertises nothing and refuses every target for external peers and relayed requests.
 	///
 	/// First-party recognition of unexported origin traffic requires
 	/// mutual TLS (see
@@ -254,7 +254,7 @@ impl ClusterConfigBuilder {
 	///
 	/// Gates do not filter advertisements. Discoverability follows
 	/// [`ClusterConfigBuilder::with_exported_types`] alone, because ads
-	/// are minted per beat, not per session.
+	/// are created per beat, not per session.
 	pub fn with_export_gate(mut self, gate: Arc<dyn ExportGate>) -> Self {
 		self.export_gates.push(gate);
 		self
@@ -262,11 +262,11 @@ impl ClusterConfigBuilder {
 
 	/// Add a positive export grant for selected caller identities.
 	///
-	/// - Grants compose as union with the exported list and the first-party origin rule, so a grant
-	///   only widens access to the granted target.
+	/// - Grants compose as union with the exported list and the first-party
+	///   origin rule, so a grant only widens access to the granted target.
 	/// - Deny gates from [`ClusterConfigBuilder::with_export_gate`] still override.
-	/// - Grants do not advertise. A granted type stays off the slate, and the grantee learns its
-	///   URN out of band.
+	/// - Grants do not advertise. A granted type stays off the slate, and the
+	///   grantee learns its URN out of band.
 	pub fn with_export_grant(mut self, grant: Arc<dyn ExportGrant>) -> Self {
 		self.export_grants.push(grant);
 		self
@@ -302,8 +302,8 @@ impl ClusterConfigBuilder {
 	/// # Edge plane
 	///
 	/// - It serves the same TLS material and gate policies as the colony plane.
-	/// - It admits `Work` frames only. Registration, updates, peer ads, and gossip are refused with
-	///   `PermissionDenied`.
+	/// - It admits `Work` frames only. Registration, updates, peer ads, and
+	///   gossip are refused with `PermissionDenied`.
 	pub fn with_edge_bind_addr(mut self, addr: impl Into<String>) -> Self {
 		self.edge_bind_addr = Some(addr.into());
 		self
@@ -408,6 +408,16 @@ impl ClusterConfigBuilder {
 		self
 	}
 
+	/// Cap the tried entries one signer may hold in the discovery table.
+	///
+	/// A candidate whose signer already holds `cap` tried entries stays in the
+	/// new table, the way a candidate of a full prefix bucket does. A signer
+	/// is one certificate, counted by fingerprint. The default sets no cap.
+	pub fn with_tried_per_signer(mut self, cap: NonZeroUsize) -> Self {
+		self.peer.tried_per_signer = Some(cap);
+		self
+	}
+
 	/// Set the advertisement-rumor refresh interval.
 	///
 	/// The beat floods the slate rumor when the slate or flood target set
@@ -487,11 +497,11 @@ impl ClusterConfigBuilder {
 		peer.table = Arc::new(PeerTable::new(&peer, self.peer_store));
 
 		// Colony membership binds to the certificate's URI SAN, and every
-		// per-frame membership check compares against the cached value. A
-		// cert that fails to decode or carries no valid colony URN leaves
-		// the gateway a non-member, fail closed. The gateway binds it
-		// again at startup, so a later certificate change cannot leave a
-		// stale colony behind.
+		// per-frame membership check reads the cached value to learn whether
+		// this gateway is in a flood. A certificate that yields no single
+		// valid colony URN leaves the gateway a non-member, which fails
+		// closed. The gateway binds it again at startup, so a later
+		// certificate change cannot leave a stale colony behind.
 		let mut config = ClusterConfig {
 			namespace: self.namespace,
 			load_balancer: self.load_balancer,
