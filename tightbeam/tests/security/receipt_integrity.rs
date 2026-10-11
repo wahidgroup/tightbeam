@@ -40,7 +40,7 @@ use tightbeam::tb_assert_spec;
 use tightbeam::tb_scenario;
 use tightbeam::testing::SetupEnv;
 use tightbeam::transport::handshake::negotiation::{MuxBudgets, TransportOffer};
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 use tightbeam::TightBeamError;
 
 use crate::common::security::expectation_failure;

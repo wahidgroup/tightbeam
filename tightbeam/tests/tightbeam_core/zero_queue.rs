@@ -23,7 +23,7 @@ use tightbeam::Beamable;
 use tightbeam::{at_least, between, exactly, present, server, servlet, tb_assert_spec, tb_scenario};
 use tightbeam::{utils, Frame, TightBeamError, Version};
 
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 
 pub(crate) const ADAPTIVE_BEHAVIOR: Urn<'static> = tightbeam::urn!("test", "event:zero-queue/adaptive-behavior");
 pub(crate) const CHAIN_VALID: Urn<'static> = tightbeam::urn!("test", "event:zero-queue/chain-valid");

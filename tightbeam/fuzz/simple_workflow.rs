@@ -11,7 +11,7 @@
 
 use tightbeam::testing::fuzz::OracleAccess;
 use tightbeam::testing::{ScenarioConfig, SetupEnv};
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario};
 
 const START: Urn<'static> = tightbeam::urn!("fuzz", "event:simple/start");

@@ -1,6 +1,6 @@
 //! URN validation error types
 
-use crate::utils::urn::builders::spec::Pattern;
+use crate::urn::builders::spec::Pattern;
 
 use crate::Errorizable;
 

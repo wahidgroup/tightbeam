@@ -22,7 +22,7 @@ use tightbeam::trace::TraceCollector;
 use tightbeam::transport::client::pool::PoolConfig;
 use tightbeam::transport::handshake::negotiation::TransportOffer;
 use tightbeam::transport::tcp::r#async::TokioListener;
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 use tightbeam::TightBeamError;
 
 use crate::acl::{DynamicAclState, DynamicDenyGate, DynamicGrant};

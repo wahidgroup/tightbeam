@@ -18,8 +18,8 @@ use crate::transport::envelopes::{GoAwayReason, MuxDataPackage, MuxPingPackage, 
 use crate::transport::error::TransportFailure;
 use crate::transport::multiplex::{MultiplexedProtocol, StreamRoute, StreamingProtocol};
 use crate::transport::{TransportError, TransportResult};
+use crate::urn::Urn;
 use crate::utils::marker::MaybeSend;
-use crate::utils::urn::Urn;
 use crate::Frame;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
@@ -101,7 +101,7 @@ impl Drop for ForgetPingOnDrop {
 ///
 /// # Ended connection
 ///
-/// - Once the reader has ended, every call that would wait on the peer returns `ConnectionClosed`.
+/// - Once either driver has ended, every call that would wait on the peer returns `ConnectionClosed`.
 /// - That outranks `Draining`, so a connection that took a GoAway and then ended reports the end.
 ///
 /// [`MuxReaderDriver`]: crate::transport::multiplex::MuxReaderDriver
@@ -196,6 +196,8 @@ impl MuxHandle {
 	///   so a streamed request is metered and paid like a unary one.
 	/// - Dropping the sink before [`RequestSink::close`], or the response
 	///   future before it resolves, cancels the stream.
+	/// - A connection that fails or drains before the first push resolves the
+	///   response future with `ConnectionClosed` or `Draining`.
 	///
 	/// # Errors
 	///
@@ -242,15 +244,7 @@ impl MuxHandle {
 		let (sender, receiver) = oneshot::channel();
 		let reservation = self.link.shared().reserve_stream_slot(sender)?;
 		let slot = reservation.slot();
-
-		let sink = RequestSink::new(
-			reservation,
-			MuxStreamKind::Streaming,
-			self.link.clone(),
-			None,
-			target,
-			hops_remaining,
-		);
+		let sink = RequestSink::new(reservation, MuxStreamKind::Streaming, self.link.clone(), target, hops_remaining);
 
 		let link = self.link.clone();
 		let response = async move {
@@ -288,7 +282,8 @@ impl MuxHandle {
 	/// The reply ends with the responder's trailer: `Ok(None)` on an Ok status,
 	/// otherwise the status mapped to its transport error. Dropping the sink
 	/// before [`RequestSink::close`], or the reply body before its terminal
-	/// event, cancels the stream.
+	/// event, cancels the stream. A connection that fails or drains before the
+	/// first push ends the body with `ConnectionClosed` or `Draining`.
 	///
 	/// # Errors
 	///
@@ -324,36 +319,19 @@ impl MuxHandle {
 	/// The route parts stay on the sink until its first chunk emits the Open.
 	pub(crate) fn open_duplex_with_route(&self, route: StreamRoute) -> TransportResult<(RequestSink, StreamBody)> {
 		let (target, hops_remaining) = route.into_parts();
-		let (sender, receiver) = oneshot::channel();
-		let reservation = self.link.shared().reserve_stream_slot(sender)?;
+		// The reply forwarder waits with the reservation in the pending table,
+		// where a failed or draining connection reaches it. It registers under
+		// the assigned ID at first push, before the Open can reach the peer.
+		let drained = self.link.drain_feedback();
+		let (reservation, mut body) = self.link.shared().reserve_duplex_slot(drained)?;
 		let slot = reservation.slot();
-
-		// The reply travels through the body, so the outcome receiver is
-		// dropped and the pending entry holds only the stream's cap slot.
-		drop(receiver);
-
-		// The forwarder follows the reservation into the sink and
-		// registers under the assigned ID at first push, before the
-		// Open can reach the peer.
-		let (mut body, forwarder) = StreamBody::pair(
-			Arc::clone(&slot),
-			self.link.shared().initial_recv_credit,
-			self.link.drain_feedback(),
-		);
 
 		// An abandoned reply must reclaim its cap slot. Without the guard, a
 		// closed-sink duplex stream has no cancel path, and the slot stays
 		// pinned until the peer's trailer.
 		body.arm_guard(CancelOnDrop::new(&self.link, slot));
 
-		let sink = RequestSink::new(
-			reservation,
-			MuxStreamKind::Duplex,
-			self.link.clone(),
-			Some(forwarder),
-			target,
-			hops_remaining,
-		);
+		let sink = RequestSink::new(reservation, MuxStreamKind::Duplex, self.link.clone(), target, hops_remaining);
 		Ok((sink, body))
 	}
 
@@ -379,7 +357,6 @@ impl MuxHandle {
 			last: sent == total,
 			payload: first,
 			records: total,
-			duplex: None,
 			target: None,
 			hops_remaining: DEFAULT_HOP_BUDGET,
 		};
@@ -627,8 +604,8 @@ mod tests {
 		Ok(())
 	}
 
-	// A failed connection forwards no reply, so the body must not wait on a
-	// forwarder that the refused sink still holds.
+	// A failed connection refuses the first push, and the body has ended with
+	// it.
 	#[test]
 	fn test_duplex_body_ends_when_the_open_meets_a_failed_connection() -> TransportResult<()> {
 		let (handle, _sent) = duplex_handle();
@@ -640,6 +617,89 @@ mod tests {
 
 		let ended = body.poll_chunk_now();
 		assert!(matches!(ended, Poll::Ready(Err(TransportError::ConnectionClosed))));
+		Ok(())
+	}
+
+	// The body reports what it drained under its stream ID, and it learns that
+	// ID from the slot it shares with the reservation.
+	#[test]
+	fn test_duplex_body_reports_drains_under_the_opened_id() -> TransportResult<()> {
+		let (outbound, _sent) = mpsc::channel(8);
+		let (link, mut notes) = MuxLink::new(client_shared(), outbound);
+		let handle = MuxHandle { link };
+		let (mut sink, mut body) = handle.open_duplex()?;
+		assert!(matches!(poll_now(sink.push([1u8])), Poll::Ready(Ok(()))));
+
+		let mut forwarder = handle.link.shared().take_duplex(1).expect("the open registered the forwarder");
+		assert!(forwarder.accept_and_forward([7u8]));
+		assert!(matches!(body.poll_chunk_now(), Poll::Ready(Ok(Some(_)))));
+
+		let note = notes.try_recv();
+		assert!(matches!(note, Ok(note) if note.stream_id == 1 && note.consumed == 1));
+		Ok(())
+	}
+
+	// A stream that is reserved and not yet opened has to end with its
+	// connection, even while its sink is alive and has pushed nothing.
+	#[test]
+	fn test_unopened_stream_response_ends_on_connection_failure() -> TransportResult<()> {
+		let (handle, _sent) = duplex_handle();
+		let (_sink, response) = handle.open_stream()?;
+		handle.link.shared().fail_all_pending();
+
+		let ended = poll_now(response);
+		assert!(matches!(ended, Poll::Ready(Err(TransportError::ConnectionClosed))));
+		Ok(())
+	}
+
+	#[test]
+	fn test_unopened_duplex_body_ends_on_connection_failure() -> TransportResult<()> {
+		let (handle, _sent) = duplex_handle();
+		let (_sink, mut body) = handle.open_duplex()?;
+		handle.link.shared().fail_all_pending();
+
+		let ended = body.poll_chunk_now();
+		assert!(matches!(ended, Poll::Ready(Err(TransportError::ConnectionClosed))));
+		Ok(())
+	}
+
+	// A sink dropped before its first push cancels a stream that never opened,
+	// and its body reads that as a cancel on a connection that still runs.
+	#[test]
+	fn test_unopened_duplex_body_ends_cancelled_when_its_sink_drops() -> TransportResult<()> {
+		let (handle, _sent) = duplex_handle();
+		let (sink, mut body) = handle.open_duplex()?;
+		drop(sink);
+
+		let ended = body.poll_chunk_now();
+		assert!(matches!(
+			ended,
+			Poll::Ready(Err(TransportError::OperationFailed(TransportFailure::Cancelled)))
+		));
+		Ok(())
+	}
+
+	// A GoAway in either direction ends admission, so a stream that has not
+	// opened never will.
+	#[test]
+	fn test_unopened_stream_response_ends_on_local_shutdown() -> TransportResult<()> {
+		let (handle, _sent) = duplex_handle();
+		let (_sink, response) = handle.open_stream()?;
+		handle.link.shared().begin_shutdown();
+
+		let ended = poll_now(response);
+		assert!(matches!(ended, Poll::Ready(Err(TransportError::Draining))));
+		Ok(())
+	}
+
+	#[test]
+	fn test_unopened_duplex_body_ends_on_peer_goaway() -> TransportResult<()> {
+		let (handle, _sent) = duplex_handle();
+		let (_sink, mut body) = handle.open_duplex()?;
+		handle.link.shared().fail_pending_above(0, GoAwayReason::Shutdown);
+
+		let ended = body.poll_chunk_now();
+		assert!(matches!(ended, Poll::Ready(Err(TransportError::Draining))));
 		Ok(())
 	}
 

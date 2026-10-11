@@ -16,7 +16,7 @@ use tightbeam::transport::envelopes::{
 use tightbeam::transport::{
 	AsyncByteRead, AsyncReadStream, ResponsePackage, TransportEnvelope, TransportError, TransportFailure,
 };
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 
 use super::any_frame;
 

@@ -33,7 +33,7 @@
 
 #![cfg(all(feature = "transport-multiplex", feature = "testing"))]
 
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 
 pub(crate) const MISSING_COUNTERSIGNATURE_FAILS_CLOSED: Urn<'static> =
 	tightbeam::urn!("test", "event:countersignature-evidence/missing-countersignature-fails-closed");

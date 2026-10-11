@@ -1,6 +1,6 @@
 //! DTN ultimate-scenario event URN inventory.
 
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 
 pub(crate) const COMMS_HALTED: Urn<'static> = tightbeam::urn!("test", "event:ultimate/comms-halted");
 pub(crate) const EARTH_RELAY_CASCADE_FRAME_REQUEST: Urn<'static> =

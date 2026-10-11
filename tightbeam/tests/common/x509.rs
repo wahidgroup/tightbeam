@@ -29,7 +29,7 @@ use tightbeam::{
 	spki::SubjectPublicKeyInfoOwned,
 	testing::{TestCertificate, TestKey},
 	transport::{handshake::HandshakeKeyManager, EncryptedProtocol, TransportEncryptionConfig},
-	utils::urn::Urn,
+	urn::Urn,
 	x509::Certificate,
 	Frame, TightBeamError,
 };

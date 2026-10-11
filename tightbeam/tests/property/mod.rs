@@ -31,7 +31,7 @@ use tightbeam::flags::{Flags, FlagsError};
 use tightbeam::matrix::{Matrix, MatrixError};
 use tightbeam::oids::{AES_256_GCM, CURVE_SECP256K1, HASH_SHA3_256};
 use tightbeam::testing::{TestMessage, TestSigner};
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 
 /// Every wire version, so a field a later version added is exercised under
 /// the version that does not carry it as well as the ones that do.

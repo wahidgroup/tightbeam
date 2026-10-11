@@ -43,8 +43,8 @@ use tightbeam::{
 		multiplex::{CallContext, MuxService, StreamBody},
 		ClientBuilder, ConnectionBuilder, ConnectionPool, EncryptedProtocol, PoolConfig, TransportEncryptionConfig,
 	},
+	urn::Urn,
 	utils::time::{Clock, ManualClock},
-	utils::urn::Urn,
 	Beamable, Frame, TightBeamError, Version,
 };
 

@@ -14,7 +14,7 @@ use crate::instrumentation::events;
 	feature = "instrument",
 	any(feature = "transport-cms", feature = "transport-ecies")
 ))]
-use crate::utils::urn::Urn;
+use crate::urn::Urn;
 
 /// Result type for handshake operations.
 pub type Result<T> = core::result::Result<T, HandshakeError>;

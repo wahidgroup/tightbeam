@@ -18,7 +18,7 @@ use tightbeam::{compose, servlet};
 use super::currency::MonetaryAmount;
 use super::harness::{PaymentHarness, PAYMENT_TAG};
 
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 
 pub(crate) const AUTHORIZATION_APPROVED: Urn<'static> =
 	tightbeam::urn!("test", "event:servlets/authorization-approved");

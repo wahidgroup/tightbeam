@@ -21,7 +21,7 @@ use tightbeam::transport::multiplex::{RequestSink, StreamRoute};
 use tightbeam::transport::state::ClientIdentity;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::{ClientBuilder, ConnectionBuilder, GenericClient, PooledClient, Protocol};
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 use tightbeam::{Frame, TightBeamError};
 
 use crate::control::{advertise_peer_at, advertise_peer_types, CONTROL_ORDER_BASE};

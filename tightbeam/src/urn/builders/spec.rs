@@ -12,7 +12,7 @@ use alloc::{
 #[cfg(feature = "std")]
 use std::borrow::Cow;
 
-use crate::utils::urn::{UrnComponents, UrnValidationError};
+use crate::urn::{UrnComponents, UrnValidationError};
 
 /// Validation pattern for field values
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -221,7 +221,8 @@ impl UrnSpecBuilder {
 					if let Some(value) = components.get_component(field.name) {
 						// Add separator before value (except for first field)
 						if !nss_parts.is_empty() {
-							// Use field-specific separator if set, otherwise default
+							// Use field-specific separator if set, otherwise
+							// default
 							let separator = field.nss_separator.unwrap_or(default_separator);
 							nss_parts.push(separator);
 						}
@@ -256,7 +257,8 @@ impl UrnSpecBuilder {
 					return Err(UrnValidationError::RequiredFieldMissing("nss components"));
 				}
 
-				// Build NSS using format string - replace placeholders one at a time
+				// Build NSS using format string - replace placeholders one at a
+				// time
 				let mut result = format_str.to_string();
 				for value in field_values {
 					if let Some(pos) = result.find("{}") {
@@ -290,7 +292,7 @@ impl From<&'static str> for UrnSpecBuilder {
 
 #[cfg(test)]
 mod tests {
-	use crate::utils::urn::UrnBuilder;
+	use crate::urn::UrnBuilder;
 
 	use super::*;
 

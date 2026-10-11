@@ -9,7 +9,7 @@
 #![cfg(feature = "testing-fdr")]
 
 use tightbeam::testing::{fdr::FdrConfig, specs::csp::Process, ScenarioConfig, SetupEnv};
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario};
 
 pub(crate) const POINTA: Urn<'static> = tightbeam::urn!("test", "event:tennis/pointa");

@@ -63,7 +63,7 @@ use crate::x509::Certificate;
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 use crate::constants::DEFAULT_HOP_BUDGET;
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
-use crate::utils::urn::Urn;
+use crate::urn::Urn;
 
 /// Converts a caller-owned or already-shared mux offer into a shared handle.
 ///

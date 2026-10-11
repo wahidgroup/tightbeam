@@ -14,7 +14,7 @@ use crate::transport::client::pool::ConnectionPool;
 use crate::transport::multiplex::MuxConnector;
 use crate::transport::policy::PolicyConfig;
 use crate::transport::{MessageCollector, MessageEmitter, PersistentConnection, Protocol};
-use crate::utils::urn::Urn;
+use crate::urn::Urn;
 use crate::{Frame, TightBeamError};
 
 /// Maps an instance key or a type key to shared servlet address bytes.

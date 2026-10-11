@@ -26,7 +26,7 @@ use crate::der::{Decode, DecodeValue, EncodeValue, Tag, Tagged};
 use crate::der::{Header, Length, Reader, Writer};
 use crate::testing::assertions::AssertionLabel;
 use crate::trace::ConsumedTrace;
-use crate::utils::urn::Urn;
+use crate::urn::Urn;
 
 #[cfg(feature = "testing-schedulability")]
 use crate::testing::schedulability::{SchedulabilityError, SchedulerType, TaskSet};
@@ -748,7 +748,7 @@ mod tests {
 	use crate::transport::EndpointConfig;
 	use crate::transport::MessageEmitter;
 	use crate::transport::Protocol;
-	use crate::utils::urn::Urn;
+	use crate::urn::Urn;
 
 	#[cfg(all(feature = "tcp", feature = "tokio"))]
 	use crate::{exactly, servlet, tb_assert_spec, tb_process_spec, tb_scenario};

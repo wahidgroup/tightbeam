@@ -9,7 +9,9 @@ mod constraints;
 mod csp;
 mod deadline;
 mod export;
+mod jitter;
 mod path;
+mod statistics;
 mod verification;
 mod violations;
 mod wcet;
@@ -19,7 +21,12 @@ pub use constraints::{TimingConstraint, TimingConstraints};
 pub use csp::{ClockVariable, TimedTransition, TimingGuard};
 pub use deadline::{Deadline, DeadlineBuilder};
 pub use export::TimingVerificationArtifact;
+pub use jitter::{DecorrelatedJitterCalculator, JitterCalculator, MinMaxJitter, StdDevJitter, VarianceJitter};
 pub use path::{ExecutionPath, PathWcet};
+pub use statistics::{
+	ConfidenceIntervals, CustomMetric, DefaultStatisticalAnalyzer, Percentile, PercentileValue, StatisticalAnalyzer,
+	StatisticalMeasures,
+};
 pub use verification::TimingVerificationResult;
 pub use violations::{DeadlineMiss, JitterViolation, PathWcetViolation, TimingSlackViolation, TimingViolation};
 pub use wcet::{WcetConfig, WcetConfigBuilder};

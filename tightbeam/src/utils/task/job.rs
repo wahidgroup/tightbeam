@@ -192,7 +192,7 @@ mod tests {
 	#[cfg(any(feature = "colony", feature = "tokio"))]
 	use crate::error::Result;
 	#[cfg(feature = "colony")]
-	use crate::utils::urn::Urn;
+	use crate::urn::Urn;
 	#[cfg(any(feature = "colony", feature = "tokio"))]
 	use crate::Frame;
 
@@ -261,14 +261,14 @@ mod tests {
 	}
 
 	#[cfg(feature = "colony")]
-	fn worker_type() -> crate::utils::urn::Urn<'static> {
+	fn worker_type() -> crate::urn::Urn<'static> {
 		ColonyNamespace::default()
 			.servlet("worker")
 			.expect("test names satisfy the mint grammar")
 	}
 
 	#[cfg(feature = "colony")]
-	fn worker_instance() -> crate::utils::urn::Urn<'static> {
+	fn worker_instance() -> crate::urn::Urn<'static> {
 		worker_type()
 			.servlet_instance("127.0.0.1:8080")
 			.expect("a servlet type URN yields an instance URN")

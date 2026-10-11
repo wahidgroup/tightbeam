@@ -219,6 +219,30 @@ mod tests {
 	}
 
 	#[test]
+	fn compress_then_decompress_round_trips() -> Result<()> {
+		// Data-driven cases
+		let patterned = (0u32..2048).map(|i| (i % 251) as u8).collect::<Vec<u8>>();
+		let big_repeat = vec![b'a'; 16 * 1024];
+		let cases: Vec<&[u8]> = vec![
+			b"",
+			b"a",
+			b"hello world",
+			b"The quick brown fox jumps over the lazy dog",
+			&patterned,
+			&big_repeat,
+		];
+
+		let compressor = ZstdCompression::default();
+		for &data in &cases {
+			let (compressed, _info) = compressor.compress(data, None)?;
+			let decompressed = compressor.decompress(&compressed)?;
+			assert_eq!(decompressed, data);
+		}
+
+		Ok(())
+	}
+
+	#[test]
 	fn decompress_within_limit_round_trips() -> Result<()> {
 		let compressed = compress_zeros(4096)?;
 		let out = ZstdCompression::with_max_output(4096).decompress(&compressed)?;

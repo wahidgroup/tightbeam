@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use futures::FutureExt;
 use tightbeam::testing::{ClientEnv, HiveEnv, ScenarioConfig, ServletEnv, SetupEnv};
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_scenario, TightBeamError};
 use tokio::time::sleep;
 

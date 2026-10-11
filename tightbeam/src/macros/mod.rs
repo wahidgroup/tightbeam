@@ -3,6 +3,9 @@
 // Feature-delegation helpers are always available
 pub mod cfg;
 
+// The `From` and `TryFrom` generators are always available
+mod from;
+
 // Case-table tests, compiled for test builds and for a consumer that takes
 // the testing surface deliberately.
 #[cfg(any(test, feature = "testing"))]

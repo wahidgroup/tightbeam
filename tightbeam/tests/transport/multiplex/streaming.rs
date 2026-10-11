@@ -17,7 +17,7 @@ use tightbeam::trace::TraceCollector;
 use tightbeam::transport::handshake::negotiation::TransportOffer;
 use tightbeam::transport::multiplex::{MuxResponder, MuxRole, StreamBody};
 use tightbeam::transport::{TransportError, TransportFailure};
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 use tightbeam::Frame;
 use tightbeam::TightBeamError;
 

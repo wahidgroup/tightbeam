@@ -15,7 +15,7 @@ use super::error::EventOrderViolationDetail;
 #[cfg(feature = "policy")]
 use crate::policy::TransitStatus;
 #[cfg(feature = "instrument")]
-use crate::utils::urn::Urn;
+use crate::urn::Urn;
 
 /// Spec trait defining expected test behavior.
 ///

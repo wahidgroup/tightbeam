@@ -19,11 +19,11 @@ use crate::colony::common::{
 	ClusterCommand, ClusterCommandKind, ClusterCommandOutcome, ClusterCommandResponse, ClusterStatus, HeartbeatParams,
 	HeartbeatResult,
 };
-use crate::colony::servlet::servlet_runtime::rt;
 use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::decode;
 use crate::instrumentation::events::{CLUSTER_HIVE_EVICTED, CLUSTER_RELAY_TRAIL_PRUNED};
 use crate::policy::TransitStatus;
+use crate::runtime::rt;
 use crate::transport::messaging::{MessageCollector, MessageEmitter};
 use crate::transport::multiplex::MuxConnector;
 use crate::transport::policy::PolicyConfig;

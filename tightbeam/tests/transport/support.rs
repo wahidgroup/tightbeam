@@ -32,7 +32,7 @@ use tightbeam::transport::{
 	ClientBuilder, ConnectionBuilder, EncryptedMessageIO, EncryptedProtocol, MessageCollector, MessageIO,
 	TransportEncryptionConfig, TransportError, TransportLimits, WireEnvelope,
 };
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 use tightbeam::x509::Certificate;
 use tightbeam::Frame;
 use tightbeam::TightBeamError;

@@ -19,7 +19,7 @@ pub mod events;
 
 #[cfg(not(feature = "instrument"))]
 pub mod stub {
-	use crate::utils::urn::Urn;
+	use crate::urn::Urn;
 	use crate::TightBeamError;
 
 	#[derive(Clone, Debug)]
@@ -82,7 +82,7 @@ pub mod active {
 	use crate::crypto::hash::{Digest, Sha3_256};
 	use crate::der::asn1::{ContextSpecific, ContextSpecificRef, OctetString, OctetStringRef};
 	use crate::der::{Decode, Encode, FixedTag, Sequence, Tag, TagMode, TagNumber};
-	use crate::utils::urn::Urn;
+	use crate::urn::Urn;
 	use crate::Beamable;
 	use crate::TightBeamError;
 

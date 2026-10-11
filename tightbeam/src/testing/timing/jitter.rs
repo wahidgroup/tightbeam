@@ -1,21 +1,11 @@
 //! Jitter calculation utilities
 //!
-//! Provides traits and implementations for calculating jitter from observed durations.
-//! Used by both timing verification and restart policies.
+//! Provides traits and implementations for calculating jitter from observed
+//! durations, for timing verification.
 
+use crate::transport::policy::decorrelated_bounds;
 use crate::utils::math::integer_sqrt;
 use crate::TightBeamError;
-
-/// Bounds of the decorrelated-jitter window for a base value.
-///
-/// Returns `(min, range)` where the window spans `min..=min + range` with
-/// `min = base / 3`. Shared by the restart backoff strategy
-/// (`transport::policy::DecorrelatedJitter`) and
-/// [`DecorrelatedJitterCalculator`] so the algorithm is defined once.
-pub const fn decorrelated_bounds(base: u64) -> (u64, u64) {
-	let min = base / 3;
-	(min, base.saturating_sub(min))
-}
 
 /// Trait for calculating jitter from a collection of observed durations.
 ///
@@ -40,8 +30,8 @@ pub trait JitterCalculator: Send + Sync + core::fmt::Debug {
 
 /// Min-Max jitter calculator (default).
 ///
-/// Calculates jitter as the difference between maximum and minimum observed durations.
-/// This is the simplest and most commonly used jitter metric.
+/// Calculates jitter as the difference between maximum and minimum observed
+/// durations. This is the simplest and most commonly used jitter metric.
 #[derive(Default, Debug, Clone, Copy)]
 pub struct MinMaxJitter;
 
@@ -144,7 +134,7 @@ impl JitterCalculator for StdDevJitter {
 ///
 /// Calculates jitter using the decorrelated jitter algorithm.
 /// Uses max duration as base and returns the width of the
-/// [`decorrelated_bounds`] window (max/3 to max) as the jitter value.
+/// decorrelated window (max/3 to max) as the jitter value.
 #[derive(Default, Debug, Clone, Copy)]
 pub struct DecorrelatedJitterCalculator;
 
@@ -190,7 +180,8 @@ mod tests {
 		assert_eq!(calculator.calculate(&[100])?, 0);
 
 		// Test with known values: [100, 200]
-		// Mean = 150, variance = ((100-150)² + (200-150)²) / 2 = (2500 + 2500) / 2 = 2500
+		// Mean = 150, variance = ((100-150)² + (200-150)²) / 2
+		// = (2500 + 2500) / 2 = 2500
 		let result = calculator.calculate(&[100, 200])?;
 		assert_eq!(result, 2500);
 

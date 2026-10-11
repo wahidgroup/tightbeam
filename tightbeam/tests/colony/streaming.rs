@@ -24,7 +24,7 @@ use tightbeam::{
 		handshake::negotiation::TransportOffer,
 		tcp::r#async::TokioListener,
 	},
-	utils::urn::Urn,
+	urn::Urn,
 	Beamable, Frame, TightBeamError,
 };
 

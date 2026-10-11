@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock};
 
 use tightbeam::colony::cluster::{ExportGate, ExportGrant, TrustPlanes};
 use tightbeam::policy::{SessionContext, TransitStatus};
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 
 /// Shared mutable grant/gate tables for one gateway.
 #[derive(Default)]

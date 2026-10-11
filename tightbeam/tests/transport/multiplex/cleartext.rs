@@ -18,7 +18,7 @@ use super::common::*;
 use crate::transport::support::mux_frame;
 
 use tightbeam::instrumentation::events;
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 
 pub(crate) const CLEARTEXT_BUDGETS_UNMETERED: Urn<'static> =
 	tightbeam::urn!("test", "event:cleartext/cleartext-budgets-unmetered");

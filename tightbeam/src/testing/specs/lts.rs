@@ -31,9 +31,10 @@ impl fmt::Display for State {
 /// timing verification to identify events with timing constraints (WCET,
 /// deadlines, jitter) and in violation reports.
 ///
-/// Event identity is the full URN rendering (`urn:<nid>:<nss>`): spec
-/// surfaces convert from [`Urn`](crate::utils::urn::Urn) so alphabets never
-/// collide across NIDs.
+/// Event identity is the full URN rendering (`urn:<nid>:<nss>`): spec surfaces
+/// convert from [`Urn`] so alphabets never collide across NIDs.
+///
+/// [`Urn`]: crate::urn::Urn
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Event(pub &'static str);
 

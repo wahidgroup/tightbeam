@@ -1,4 +1,4 @@
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 
 use super::events;
 

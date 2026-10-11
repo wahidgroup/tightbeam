@@ -15,8 +15,8 @@ use tightbeam::prelude::*;
 use tightbeam::testing::assertions::Presence;
 use tightbeam::testing::macros::{IsNone, IsSome};
 use tightbeam::testing::{ScenarioConfig, SetupEnv};
+use tightbeam::urn::Urn;
 use tightbeam::utils;
-use tightbeam::utils::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_scenario, TightBeamError};
 
 pub(crate) const CONFIDENTIALITY: Urn<'static> = tightbeam::urn!("test", "event:tightbeam-core-tests/confidentiality");

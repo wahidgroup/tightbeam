@@ -95,6 +95,20 @@ where
 	clock: Arc<dyn Clock>,
 }
 
+/// The connection fails when its writer goes, however it goes.
+///
+/// A writer that is gone sends no request, no credit, and no ack, so nothing
+/// that waits on the peer can finish. The reader records its own end the same
+/// way, and either one ends the connection.
+impl<W> Drop for MuxWriterDriver<W>
+where
+	W: EnvelopeSink,
+{
+	fn drop(&mut self) {
+		self.shared.fail_all_pending();
+	}
+}
+
 impl<W> MuxWriterDriver<W>
 where
 	W: EnvelopeSink,
@@ -402,7 +416,7 @@ mod tests {
 	use core::task::Poll;
 	use std::sync::Arc;
 
-	use futures::channel::mpsc;
+	use futures::channel::{mpsc, oneshot};
 	use futures::lock::Mutex as FuturesMutex;
 
 	use super::super::testing::{client_shared, noop_cx};
@@ -485,6 +499,20 @@ mod tests {
 		driver.set_exchange(Arc::new(FuturesMutex::new(Box::new(StalledExchange))));
 		driver.set_renewal_deadline(deadline);
 		(driver, sender)
+	}
+
+	/// A writer that is gone can send nothing, so the connection it served
+	/// has failed, however the writer went.
+	#[test]
+	fn a_dropped_writer_fails_the_connection() {
+		let (driver, _queue) = stalled_driver(OpenSink, Duration::from_secs(30));
+		let shared = Arc::clone(&driver.shared);
+
+		drop(driver);
+
+		let (sender, _ack) = oneshot::channel();
+		let pinged = shared.allocate_ping(sender);
+		assert!(matches!(pinged, Err(TransportError::ConnectionClosed)));
 	}
 
 	/// A driver assembled over a link adopts the clock that link carries, so

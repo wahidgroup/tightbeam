@@ -26,7 +26,7 @@ use tightbeam::{
 	testing::{ScenarioConfig, SetupEnv},
 	trace::TraceCollector,
 	transport::handshake::HandshakeError,
-	utils::urn::Urn,
+	urn::Urn,
 	TightBeamError,
 };
 

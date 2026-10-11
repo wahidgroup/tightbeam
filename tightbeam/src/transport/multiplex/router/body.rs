@@ -13,11 +13,12 @@ use futures::Stream;
 
 use super::handle::CancelOnDrop;
 use super::shared::OpenSlot;
-#[cfg(feature = "colony")]
-use super::sink::RequestSink;
 use crate::der::Decode;
 use crate::transport::{TransportError, TransportResult};
 use crate::Frame;
+
+#[cfg(feature = "colony")]
+use super::sink::RequestSink;
 
 /// Chunk-level event the reader forwards to a [`StreamBody`].
 pub enum BodyEvent {
@@ -137,6 +138,8 @@ impl StreamBody {
 	/// # Errors
 	///
 	/// - [`TransportError::ConnectionClosed`] -- the stream died before its `last` chunk.
+	/// - [`TransportError::Draining`] -- a GoAway ended the stream before the peer served it.
+	/// - `OperationFailed(Cancelled)` -- the stream was cancelled, by its own sink or by the peer.
 	/// - The trailer's [`TransitStatus`](crate::policy::TransitStatus) mapped
 	///   to its transport error, on a duplex reply that ended non-Ok.
 	pub async fn chunk(&mut self) -> TransportResult<Option<Vec<u8>>> {

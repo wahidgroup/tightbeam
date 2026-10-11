@@ -1,7 +1,7 @@
 #![allow(unexpected_cfgs)]
 
 use tightbeam::matrix::{Matrix, MatrixDyn, MatrixError, MatrixLike};
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 
 use super::constants::MAX_MOVES_TO_FIND;
 use super::piece;

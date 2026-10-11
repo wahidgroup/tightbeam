@@ -4,24 +4,25 @@
 //! transformation, and NSS construction logic based on a declarative
 //! specification.
 
-/// A [`Urn`](crate::utils::urn::Urn) from a static NID and NSS, checked at
-/// compile time.
+/// A [`Urn`] from a static NID and NSS, checked at compile time.
 ///
 /// The check runs in a `const` block, so a malformed literal is a build error
-/// and there is no run-time panic path. In a `const` item `cargo check`
-/// reports it. In a function body the build does. Use
-/// [`Urn::from_parts`](crate::utils::urn::Urn::from_parts) for parts known
-/// only at run time.
+/// and there is no run-time panic path. In a `const` item `cargo check` reports
+/// it. In a function body the build does. Use [`Urn::from_parts`] for parts
+/// known only at run time.
 ///
 /// ## Examples
 ///
 /// ```
-/// const EVENT: tightbeam::utils::urn::Urn<'static> = tightbeam::urn!("example", "test:resource");
+/// const EVENT: tightbeam::urn::Urn<'static> = tightbeam::urn!("example", "test:resource");
 /// ```
 ///
 /// ```compile_fail
-/// const REJECTED: tightbeam::utils::urn::Urn<'static> = tightbeam::urn!("9bad", "resource");
+/// const REJECTED: tightbeam::urn::Urn<'static> = tightbeam::urn!("9bad", "resource");
 /// ```
+///
+/// [`Urn`]: crate::urn::Urn
+/// [`Urn::from_parts`]: crate::urn::Urn::from_parts
 #[macro_export]
 macro_rules! urn {
 	($nid:expr, $nss:expr $(,)?) => {
@@ -29,17 +30,17 @@ macro_rules! urn {
 			let nid: &'static str = $nid;
 			let nss: &'static str = $nss;
 
-			if $crate::utils::urn::Urn::validate_nid(nid).is_err() {
+			if $crate::urn::Urn::validate_nid(nid).is_err() {
 				::core::panic!(
 					"malformed URN literal: the NID must be 2-32 ASCII alphanumerics or hyphens starting with a letter"
 				);
 			}
 
-			if $crate::utils::urn::Urn::validate_nss(nss).is_err() {
+			if $crate::urn::Urn::validate_nss(nss).is_err() {
 				::core::panic!("malformed URN literal: the NSS must not be empty");
 			}
 
-			$crate::utils::urn::Urn::new_unchecked(nid, nss)
+			$crate::urn::Urn::new_unchecked(nid, nss)
 		}
 	};
 }
@@ -73,8 +74,8 @@ macro_rules! urn_spec {
 
 		impl $name {
 			/// Get the UrnSpecBuilder configuration for this spec
-			fn spec_builder() -> $crate::utils::urn::UrnSpecBuilder {
-				let mut builder = $crate::utils::urn::UrnSpecBuilder::from($nid);
+			fn spec_builder() -> $crate::urn::UrnSpecBuilder {
+				let mut builder = $crate::urn::UrnSpecBuilder::from($nid);
 
 				$(
 					builder = $crate::urn_spec!(@apply_field builder, $field, $($config)*);
@@ -88,16 +89,16 @@ macro_rules! urn_spec {
 			}
 		}
 
-		impl $crate::utils::urn::UrnSpec for $name {
+		impl $crate::urn::UrnSpec for $name {
 			const NID: &'static str = $nid;
 
 			$crate::urn_spec!(@generate_transform $($transform_expr)?);
 
-			fn validate<'a>(components: &dyn $crate::utils::urn::UrnComponents<'a>) -> Result<(), $crate::utils::urn::UrnValidationError> {
+			fn validate<'a>(components: &dyn $crate::urn::UrnComponents<'a>) -> Result<(), $crate::urn::UrnValidationError> {
 				Self::spec_builder().validate(components)
 			}
 
-			fn build_nss<'a>(components: &dyn $crate::utils::urn::UrnComponents<'a>) -> Result<::std::borrow::Cow<'static, str>, $crate::utils::urn::UrnValidationError> {
+			fn build_nss<'a>(components: &dyn $crate::urn::UrnComponents<'a>) -> Result<::std::borrow::Cow<'static, str>, $crate::urn::UrnValidationError> {
 				let nss = Self::spec_builder().build_nss(components)?;
 				Ok(nss.into())
 			}
@@ -190,8 +191,8 @@ macro_rules! urn_spec {
 
 	// Generate transform method - with closure provided
 	(@generate_transform $transform_expr:expr) => {
-		fn transform<'a>(components: &mut dyn $crate::utils::urn::UrnComponents<'a>) {
-			let closure: fn(&mut dyn $crate::utils::urn::UrnComponents<'a>) = $transform_expr;
+		fn transform<'a>(components: &mut dyn $crate::urn::UrnComponents<'a>) {
+			let closure: fn(&mut dyn $crate::urn::UrnComponents<'a>) = $transform_expr;
 			closure(components);
 		}
 	};

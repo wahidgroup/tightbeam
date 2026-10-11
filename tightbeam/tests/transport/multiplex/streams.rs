@@ -14,7 +14,7 @@ use tightbeam::tb_scenario;
 use tightbeam::testing::{ClientEnv, ScenarioConfig, SetupEnv};
 use tightbeam::transport::envelopes::MuxEnvelope;
 use tightbeam::transport::{EnvelopeSource, TransportEnvelope};
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 use tightbeam::Frame;
 
 use crate::common::security::ServerMaterials;

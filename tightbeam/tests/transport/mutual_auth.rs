@@ -41,7 +41,7 @@ use tightbeam::{
 	testing::{assertions::Presence, macros::IsSome},
 	trace::TraceCollector,
 	transport::{tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder, MessageEmitter},
-	utils::urn::Urn,
+	urn::Urn,
 	Beamable,
 };
 

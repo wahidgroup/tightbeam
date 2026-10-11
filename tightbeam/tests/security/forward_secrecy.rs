@@ -23,7 +23,7 @@ use tightbeam::{
 	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
 	testing::{ScenarioConfig, SetupEnv},
 	trace::TraceCollector,
-	utils::urn::Urn,
+	urn::Urn,
 	TightBeamError,
 };
 

@@ -42,8 +42,8 @@ use crate::transport::multiplex::{RequestSink, StreamBody};
 use crate::transport::policy::CoreRetryPolicy;
 use crate::transport::state::ClientIdentity;
 use crate::transport::Protocol;
+use crate::urn::Urn;
 use crate::utils::time::{Clock, SystemClock};
-use crate::utils::urn::Urn;
 use crate::utils::BasisPoints;
 use crate::{Frame, TightBeamError};
 
@@ -517,7 +517,7 @@ pub type DuplexOpenFuture<'a> =
 /// # use tightbeam::crypto::key::Secp256k1KeyProvider;
 /// # use tightbeam::crypto::sign::ecdsa::Secp256k1Signature;
 /// # use tightbeam::testing::{TestKey, TestMessage};
-/// # use tightbeam::utils::urn::Urn;
+/// # use tightbeam::urn::Urn;
 /// # use tightbeam::{decode, Frame, TightBeamError, Version};
 /// #
 /// # struct EchoSibling;

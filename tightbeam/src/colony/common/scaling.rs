@@ -4,7 +4,7 @@
 
 use core::time::Duration;
 
-use crate::utils::urn::Urn;
+use crate::urn::Urn;
 use crate::utils::BasisPoints;
 use crate::Errorizable;
 

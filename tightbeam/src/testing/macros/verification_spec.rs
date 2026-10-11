@@ -7,7 +7,7 @@ use core::num::NonZeroU32;
 use crate::testing::assertions::{AssertionContract, AssertionLabel, AssertionValue};
 use crate::testing::specs::{SpecViolation, TBSpec};
 use crate::trace::{ConsumedTrace, ExecutionMode};
-use crate::utils::urn::Urn;
+use crate::urn::Urn;
 
 use std::borrow::Cow;
 
@@ -150,7 +150,7 @@ pub struct AssertSpecBuilder {
 	tag_filter: Option<Vec<&'static str>>,
 	ordering: Vec<Urn<'static>>,
 	#[cfg(feature = "instrument")]
-	required_events: Vec<crate::utils::urn::Urn<'static>>,
+	required_events: Vec<crate::urn::Urn<'static>>,
 	description: Option<&'static str>,
 	#[cfg(feature = "testing-timing")]
 	schedulability: Option<SchedulabilityAssertion>,
@@ -247,7 +247,7 @@ impl AssertSpecBuilder {
 	}
 
 	#[cfg(feature = "instrument")]
-	pub fn required_events(mut self, kinds: impl AsRef<[crate::utils::urn::Urn<'static>]>) -> Self {
+	pub fn required_events(mut self, kinds: impl AsRef<[crate::urn::Urn<'static>]>) -> Self {
 		let kinds = kinds.as_ref();
 		use std::collections::HashSet;
 		let mut seen = HashSet::new();
@@ -341,7 +341,7 @@ impl BuiltAssertSpec {
 		version_patch: u16,
 		contracts: impl AsRef<[AssertionContract]>,
 		tag_filter: Option<&[&'static str]>,
-		#[cfg(feature = "instrument")] events: &[crate::utils::urn::Urn<'static>],
+		#[cfg(feature = "instrument")] events: &[crate::urn::Urn<'static>],
 		#[cfg(feature = "testing-timing")] schedulability: Option<&SchedulabilityAssertion>,
 	) -> [u8; 32] {
 		let contracts = contracts.as_ref();
@@ -465,7 +465,7 @@ impl TBSpec for BuiltAssertSpec {
 		self.inner.schedulability.is_some()
 	}
 	#[cfg(feature = "instrument")]
-	fn required_events(&self) -> &[crate::utils::urn::Urn<'static>] {
+	fn required_events(&self) -> &[crate::urn::Urn<'static>] {
 		&self.inner.required_events
 	}
 	fn validate_trace(&self, _trace: &ConsumedTrace) -> Result<(), SpecViolation> {

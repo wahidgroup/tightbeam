@@ -10,13 +10,13 @@ use crate::colony::common::{
 };
 use crate::colony::hive::runtime::{ClusterLink, HiveContextImpl, HiveInstances};
 use crate::colony::hive::{HashMapRegistry, HiveConfig, ServletRegistration, ServletRegistry, SpawnerFn};
-use crate::colony::servlet::servlet_runtime::rt;
 use crate::constants::UNKNOWN_SERVLET_UTILIZATION_BPS;
 use crate::crypto::profiles::DefaultCryptoProvider;
+use crate::runtime::rt;
 use crate::trace::TraceCollector;
 use crate::transport::{MessageEmitter, Protocol};
+use crate::urn::Urn;
 use crate::utils::time::{Clock, MonotonicInstant};
-use crate::utils::urn::Urn;
 use crate::utils::BasisPoints;
 use crate::TightBeamError;
 

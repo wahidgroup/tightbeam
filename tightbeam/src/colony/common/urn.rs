@@ -32,7 +32,7 @@
 use std::borrow::Cow;
 
 use crate::colony::common::ServletInfo;
-use crate::utils::urn::{Urn, UrnValidationError};
+use crate::urn::{Urn, UrnValidationError};
 use crate::TightBeamError;
 
 /// Default naming authority for colony resources.

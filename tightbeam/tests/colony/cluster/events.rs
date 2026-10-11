@@ -10,7 +10,7 @@
 //! pair with the `CLUSTER_EXPORT_*` events, grants included, in the servlet
 //! export scenarios.
 
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 
 pub(crate) const REGISTRATION_SENT: Urn<'static> = tightbeam::urn!("test", "event:cluster/registration-sent");
 pub(crate) const REJECTED_HEARTBEAT_DECODED: Urn<'static> =

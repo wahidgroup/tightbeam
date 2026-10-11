@@ -55,14 +55,16 @@ pub trait UrnComponents<'a> {
 pub trait UrnSpec {
 	/// Namespace Identifier (NID)
 	///
-	/// Must be 2-32 characters, alphanumeric plus hyphens, starting with a letter.
+	/// Must be 2-32 characters, alphanumeric plus hyphens, starting with a
+	/// letter.
 	/// Examples: "tightbeam", "isbn", "uuid"
 	const NID: &'static str;
 
 	/// Transform components (apply defaults, normalizations)
 	///
 	/// Called before validation to allow specs to apply transformations like
-	/// upper-casing, default values, etc. via the UrnComponents trait interface.
+	/// upper-casing, default values, etc. via the UrnComponents trait
+	/// interface.
 	fn transform<'a>(components: &mut dyn UrnComponents<'a>) {
 		// Default no-op - specs can override to mutate components
 		let _ = components;

@@ -60,7 +60,7 @@ use crate::common::security::{
 use crate::transport::support::{await_receipt_rotation, bind_mutual_listener};
 
 use tightbeam::instrumentation::events;
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 
 pub(crate) const CREDITS_BOUND_THE_DRAWS: Urn<'static> =
 	tightbeam::urn!("test", "event:paywall/credits-bound-the-draws");

@@ -37,7 +37,7 @@ mod tests {
 	use tightbeam::testing::env::SetupEnv;
 	use tightbeam::testing::specs::SpecViolation;
 	use tightbeam::testing::ScenarioConfig;
-	use tightbeam::utils::urn::Urn;
+	use tightbeam::urn::Urn;
 
 	use super::{layer_of, observing_hooks};
 

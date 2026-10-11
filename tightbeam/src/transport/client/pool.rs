@@ -39,7 +39,7 @@ use crate::instrumentation::events;
 #[cfg(feature = "instrument")]
 use crate::trace::TraceCollector;
 #[cfg(any(feature = "instrument", pooled_mux))]
-use crate::utils::urn::Urn;
+use crate::urn::Urn;
 
 /// Item gate for the pooled-mux path. Multiplexed pooling needs the mux
 /// engine, the service module's connector, and a tokio executor for the driver

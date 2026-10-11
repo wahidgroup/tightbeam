@@ -1,48 +1,8 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
-#[cfg(all(
-	not(feature = "std"),
-	any(feature = "signature", feature = "digest", feature = "aead")
-))]
-use alloc::boxed::Box;
-#[cfg(all(not(feature = "std"), feature = "aead"))]
-use alloc::vec::Vec;
-
 #[cfg(feature = "zeroize")]
 pub use zeroize::{Zeroize, ZeroizeOnDrop};
-
-use crate::Frame;
-
-#[cfg(feature = "digest")]
-use crate::error::Result;
-#[cfg(feature = "signature")]
-use crate::SignerInfo;
-#[cfg(any(feature = "signature", feature = "digest", feature = "aead"))]
-use crate::TightBeamError;
-
-#[cfg(feature = "signature")]
-pub type SignatureVerifier<E = TightBeamError> = Box<dyn FnOnce(&[u8], &SignerInfo) -> core::result::Result<(), E>>;
-#[cfg(feature = "digest")]
-pub type Digestor<E = TightBeamError> = Box<dyn FnOnce(&[u8]) -> core::result::Result<crate::DigestInfo, E>>;
-#[cfg(feature = "aead")]
-pub type KeyWrapper<E = TightBeamError> = Box<dyn Fn(&[u8], &[u8]) -> core::result::Result<Vec<u8>, E>>;
-
-impl AsRef<Frame> for Frame {
-	fn as_ref(&self) -> &Frame {
-		self
-	}
-}
-
-/// Create a SignatureInfo by signing data.
-#[macro_export]
-#[cfg(feature = "signature")]
-macro_rules! sign {
-	($signer:expr, $data:expr) => {{
-		let unsigned_bytes = $crate::encode(&$data)?;
-		$signer(&unsigned_bytes)
-	}};
-}
 
 #[cfg(feature = "std")]
 #[macro_export]
@@ -122,26 +82,6 @@ macro_rules! mutex {
 			$crate::mutex!($name: $ty $(= $default)?);
 		)+
 	};
-}
-
-/// Extension trait for `Frame` that adds the `compute_hash` method.
-#[cfg(feature = "digest")]
-pub trait FrameHashExt {
-	/// Compute the hash of the frame with the digest algorithm `D`.
-	fn compute_hash<D>(&self) -> Result<crate::DigestInfo>
-	where
-		D: digest::Digest + crate::der::oid::AssociatedOid;
-}
-
-#[cfg(feature = "digest")]
-impl FrameHashExt for crate::Frame {
-	fn compute_hash<D>(&self) -> Result<crate::DigestInfo>
-	where
-		D: digest::Digest + crate::der::oid::AssociatedOid,
-	{
-		let encoded = crate::encode(self)?;
-		crate::utils::digest::<D>(&encoded)
-	}
 }
 
 #[cfg(test)]

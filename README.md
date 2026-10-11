@@ -2427,7 +2427,7 @@ Workers can be tested using the `tb_scenario!` macro with `environment Worker`:
 
 ```rust,ignore
 use tightbeam::{tb_scenario, tb_assert_spec, exactly, worker};
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 
 const WORKER_CALLED: Urn<'static> = urn!("test", "event:worker/called");
 const RESPONSE_RECEIVED: Urn<'static> = urn!("test", "event:worker/response-received");
@@ -3616,14 +3616,14 @@ The `utils` module family covers cross-cutting concerns.
 
 #### 11.1.1 URNs
 
-**Module**: `tightbeam::utils::urn`
+**Module**: `tightbeam::urn`
 
 The URN subsystem provides:
 
 - `Urn<'a>`: [RFC 8141][rfc8141]-compliant `urn:<nid>:<nss>` representation.
 - `UrnBuilder`: a fluent builder for constructing and validating URNs from either a raw NID/NSS or structured components.
 - `UrnSpec` / `UrnValidationError`: traits and error types for namespace-specific validation logic.
-- `tightbeam::utils::urn::specs::TightbeamUrnSpec`: a built-in spec for application/test instrumentation labels of the form `urn:tightbeam:instrumentation:<resource_type>/<resource_id>`.
+- `tightbeam::urn::specs::TightbeamUrnSpec`: a built-in spec for application/test instrumentation labels of the form `urn:tightbeam:instrumentation:<resource_type>/<resource_id>`.
 - Control-plane event URNs (`urn:tightbeam:event:<domain>/<name>`) live in `tightbeam::instrumentation::events` (see [§10.2](#102-event-kind-taxonomy)).
 
 `TightbeamUrnSpec` constrains:
@@ -3636,7 +3636,7 @@ Applications MAY use these URNs to name resources in a stable, parseable way. Th
 **Example: Building a custom application URN**
 
 ```rust
-use tightbeam::utils::urn::{UrnBuilder, UrnValidationError};
+use tightbeam::urn::{UrnBuilder, UrnValidationError};
 
 fn build_customer_urn() -> Result<(), UrnValidationError> {
 	let urn = UrnBuilder::default()
@@ -4122,7 +4122,7 @@ Assertions can be tagged with arbitrary string labels for flexible categorizatio
 - `trace.recorded(URN)` (feature `testing`) counts the recorded assertions that carry that label, without draining them. A scenario that waits on a background task polls it for the event the task traces.
 
 ```rust,ignore
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 
 const RELAY_START: Urn<'static> = urn!("test", "event:demo/relay-start");
 const RESPONSE_OK: Urn<'static> = urn!("test", "event:demo/response-ok");
@@ -4263,7 +4263,7 @@ When CSP is configured via `.with_csp()` in `tb_scenario!`:
 
 ```rust
 use tightbeam::testing::*;
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 use tightbeam::{tb_process_spec, urn};
 
 const RECEIVED: Urn<'static> = urn!("test", "event:csp/received");
@@ -4335,7 +4335,7 @@ The `tb_compose_spec!` macro generates a type that implements `CompositionSpec` 
 
 ```rust
 use tightbeam::testing::*;
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_compose_spec, tb_process_spec, tb_scenario, urn};
 
 const REQUEST: Urn<'static> = urn!("test", "event:flow/request");
@@ -4883,7 +4883,7 @@ Environment examples also appear in [§9.3](#93-components) (Worker, Servlet, Hi
 
 ```rust
 use tightbeam::testing::*;
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario, urn};
 
 const RECEIVED: Urn<'static> = urn!("test", "event:bare/received");
@@ -5139,7 +5139,7 @@ tb_scenario! {
 
 use tightbeam::testing::fuzz::OracleAccess;
 use tightbeam::testing::{ScenarioConfig, SetupEnv};
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario};
 
 const START: Urn<'static> = tightbeam::urn!("fuzz", "event:simple/start");
@@ -5515,7 +5515,7 @@ End-to-end worker and servlet flows under `tb_scenario!` with AssertSpec + CSP. 
 
 ```rust,ignore
 use tightbeam::testing::*;
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 
 const RELAY_START: Urn<'static> = urn!("test", "event:worker/relay-start");
 const RELAY_SUCCESS: Urn<'static> = urn!("test", "event:worker/relay-success");
@@ -5600,7 +5600,7 @@ tb_scenario! {
 
 ```rust,ignore
 use tightbeam::testing::*;
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 
 const REQUEST_RECEIVED: Urn<'static> = urn!("test", "event:servlet/request-received");
 const PONG_SENT: Urn<'static> = urn!("test", "event:servlet/pong-sent");

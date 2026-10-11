@@ -42,7 +42,7 @@ use tightbeam::x509::Certificate;
 use tightbeam::TightBeamError;
 
 use tightbeam::instrumentation::events;
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 
 pub(crate) const ANSWER_BOUND: Urn<'static> = tightbeam::urn!("test", "event:receipt/answer-bound");
 pub(crate) const BOTH_SIGNATURES_VERIFY_OFFLINE: Urn<'static> =

@@ -296,6 +296,12 @@ pub enum BodyTransform {
 	Inflate,
 }
 
+impl AsRef<Frame> for Frame {
+	fn as_ref(&self) -> &Frame {
+		self
+	}
+}
+
 impl Frame {
 	/// Assemble a frame from parts the builder produced.
 	///

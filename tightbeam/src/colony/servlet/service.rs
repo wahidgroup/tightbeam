@@ -12,7 +12,7 @@ use crate::{Frame, TightBeamError};
 
 use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
 
-use crate::colony::servlet::servlet_runtime::rt;
+use crate::runtime::rt;
 
 /// A servlet configuration, and the application env it carries.
 ///

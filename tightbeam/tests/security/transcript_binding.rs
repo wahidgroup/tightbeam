@@ -46,7 +46,7 @@ use tightbeam::{
 		Client, ClientHello, Ecies, Handshake, Server,
 	},
 	transport::wire_der::WireDer,
-	utils::urn::Urn,
+	urn::Urn,
 	TightBeamError,
 };
 

@@ -15,7 +15,7 @@
 
 use tightbeam::testing::fdr::FdrConfig;
 use tightbeam::testing::{FaultModel, InjectionStrategy, ScenarioConfig, SetupEnv, TestHooks};
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 use tightbeam::TightBeamError;
 use tightbeam::{at_least, exactly, tb_assert_spec, tb_gen_process_types, tb_process_spec, tb_scenario};
 

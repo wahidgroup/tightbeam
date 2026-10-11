@@ -5,7 +5,7 @@ use core::time::Duration;
 use tightbeam::builder::TypeBuilder;
 use tightbeam::testing::fdr::FdrConfig;
 use tightbeam::testing::{Expect, Layer, ScenarioConfig, SetupEnv};
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario, wcet};
 
 pub(crate) const TASK1: Urn<'static> = tightbeam::urn!("test", "event:violations/task1");

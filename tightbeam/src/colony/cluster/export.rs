@@ -67,7 +67,7 @@ use super::ClusterConfig;
 use crate::crypto::x509::store::CertificateTrust;
 use crate::crypto::x509::Certificate;
 use crate::policy::{SessionContext, TransitStatus};
-use crate::utils::urn::Urn;
+use crate::urn::Urn;
 
 /// Live export allowlist shared by discoverability and enforcement.
 ///

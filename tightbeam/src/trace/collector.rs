@@ -15,7 +15,7 @@ use std::sync::Mutex;
 use std::sync::PoisonError;
 
 use crate::trace::{AssertionValue, TraceConfigBuilder};
-use crate::utils::urn::Urn;
+use crate::urn::Urn;
 
 #[cfg(feature = "testing-fault")]
 use crate::constants::DEFAULT_FAULT_SEED;
@@ -132,7 +132,7 @@ impl From<TbInstrumentationConfig> for TraceConfig {
 /// # use core::time::Duration;
 /// # use tightbeam::error::TightBeamError;
 /// # use tightbeam::trace::{TraceCollector, EventValue};
-/// # use tightbeam::utils::urn::Urn;
+/// # use tightbeam::urn::Urn;
 /// # const ROUTE_STEP: Urn<'static> = tightbeam::urn!("tightbeam", "event:route/step");
 /// # fn example() -> Result<(), TightBeamError> {
 /// # let trace = TraceCollector::default();
@@ -655,7 +655,7 @@ impl TraceCollector {
 	/// ```rust
 	/// # use tightbeam::error::TightBeamError;
 	/// # use tightbeam::trace::TraceCollector;
-	/// # use tightbeam::utils::urn::Urn;
+	/// # use tightbeam::urn::Urn;
 	/// # const ROUTE_STEP: Urn<'static> = tightbeam::urn!("tightbeam", "event:route/step");
 	/// # fn main() -> Result<(), TightBeamError> {
 	/// # let trace = TraceCollector::default();
@@ -1075,7 +1075,7 @@ impl ExecutionMode {
 
 #[cfg(test)]
 mod tests {
-	use crate::utils::urn::Urn;
+	use crate::urn::Urn;
 	use crate::{exactly, tb_assert_spec, tb_scenario, testing::SetupEnv};
 
 	const ALPHA: Urn<'static> = crate::urn!("test", "event:collector/alpha");

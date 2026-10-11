@@ -43,7 +43,7 @@ use tightbeam::tb_scenario;
 use tightbeam::testing::SetupEnv;
 use tightbeam::transport::handshake::negotiation::MuxBudgets;
 use tightbeam::transport::handshake::{HandshakeError, HandshakeMessage};
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 use tightbeam::x509::attr::Attribute;
 use tightbeam::TightBeamError;
 

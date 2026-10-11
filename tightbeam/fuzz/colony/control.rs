@@ -17,7 +17,7 @@ use tightbeam::trace::TraceCollector;
 use tightbeam::transport::state::ClientIdentity;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::{ClientBuilder, ConnectionBuilder, GenericClient, Protocol};
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 use tightbeam::{TightBeamError, Version};
 
 use crate::actions::{is_authz_status, AuthzClass};

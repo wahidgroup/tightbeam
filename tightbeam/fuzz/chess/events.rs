@@ -5,7 +5,7 @@
 
 #![allow(dead_code)]
 
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 
 const FUZZ_NID: &str = "fuzz";
 

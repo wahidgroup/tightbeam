@@ -144,6 +144,7 @@ pub mod macros;
 pub mod matrix;
 pub mod oids;
 pub mod prelude;
+pub mod urn;
 pub mod utils;
 
 #[cfg(feature = "builder")]

@@ -22,7 +22,7 @@ use crate::runtime::rt;
 use crate::trace::TraceCollector;
 use crate::transport::state::{DialableEncryption, EncryptionConfig};
 use crate::transport::{EndpointConfig, MessageEmitter, Protocol, TransportResult};
-use crate::utils::urn::Urn;
+use crate::urn::Urn;
 use crate::{Frame, Message, TightBeamError, Version};
 
 /// This hive's link to the gateways it registered with.

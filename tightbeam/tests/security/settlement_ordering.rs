@@ -63,7 +63,7 @@ use tightbeam::tb_scenario;
 use tightbeam::testing::SetupEnv;
 use tightbeam::transport::handshake::negotiation::{MuxBudgets, SecurityOffer, TransportOffer};
 use tightbeam::transport::handshake::{ClientKeyExchange, Handshake, HandshakeError, PeerAuthentication};
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 use tightbeam::TightBeamError;
 
 pub(crate) const CORRUPTED_KEY_EXCHANGE_REJECTED: Urn<'static> =

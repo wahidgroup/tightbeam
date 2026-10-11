@@ -29,7 +29,7 @@ use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::{
 	ConnectionBuilder, ConnectionPool, PoolConfig, PooledClient, TransportError, TransportFailure,
 };
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 use tightbeam::x509::Certificate;
 use tightbeam::{Frame, TightBeamError};
 use tokio::task::JoinHandle;

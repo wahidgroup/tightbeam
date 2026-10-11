@@ -26,6 +26,8 @@ use crate::crypto::aead::{AeadAlgorithm, Encryptor};
 use crate::crypto::commitment::{commit_digest, CommitmentSalt};
 #[cfg(feature = "digest")]
 use crate::crypto::hash::Digest;
+#[cfg(feature = "digest")]
+use crate::crypto::profiles::Digestor;
 #[cfg(any(feature = "aead", feature = "digest", feature = "signature"))]
 use crate::crypto::profiles::SecurityProfile;
 #[cfg(feature = "signature")]
@@ -34,8 +36,6 @@ use crate::crypto::sign::SignatureEncoding;
 use crate::crypto::sign::{Signatory, SignatureAlgorithmIdentifier};
 #[cfg(any(feature = "digest", feature = "aead", feature = "ecdh"))]
 use crate::der::oid::AssociatedOid;
-#[cfg(feature = "digest")]
-use crate::helpers::Digestor;
 #[cfg(host_clock)]
 use crate::utils::time::UnixMillis;
 

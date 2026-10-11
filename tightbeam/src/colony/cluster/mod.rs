@@ -84,8 +84,8 @@ use crate::transport::client::pool::PoolConfig;
 use crate::transport::handshake::PeerAuthentication;
 use crate::transport::state::ClientIdentity;
 use crate::transport::{Protocol, TightBeamAddress};
+use crate::urn::Urn;
 use crate::utils::time::Clock;
-use crate::utils::urn::Urn;
 use crate::TightBeamError;
 
 use super::common::{ColonyNamespace, ColonyResource, InstanceMetrics, LoadBalancer, ServletAddressUpdate};
@@ -723,7 +723,7 @@ pub trait Cluster: Sized + Send + Sync {
 	/// Wait until the accept loops finish.
 	///
 	/// Awaits the colony accept task and, when bound, the edge accept task.
-	fn join(self) -> impl Future<Output = Result<(), crate::colony::servlet::servlet_runtime::rt::JoinError>> + Send;
+	fn join(self) -> impl Future<Output = Result<(), crate::runtime::rt::JoinError>> + Send;
 }
 
 /// Heartbeat surface of a cluster gateway.
@@ -792,7 +792,7 @@ mod tests {
 		HiveRegistry::new(Duration::from_secs(15), Arc::new(ManualClock::default()))
 	}
 
-	fn servlet_urn(name: &(impl AsRef<str> + ?Sized)) -> crate::utils::urn::Urn<'static> {
+	fn servlet_urn(name: &(impl AsRef<str> + ?Sized)) -> crate::urn::Urn<'static> {
 		let name = name.as_ref();
 		ColonyNamespace::default()
 			.servlet(name)

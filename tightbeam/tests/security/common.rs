@@ -375,7 +375,7 @@ fn flip_first_byte(bytes: &[u8]) -> Result<Vec<u8>, TightBeamError> {
 }
 
 use tightbeam::trace::TraceCollector;
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 
 /// A harness that spawns handshake sessions across every enabled backend.
 ///

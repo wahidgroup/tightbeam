@@ -10,7 +10,7 @@
 use tightbeam::testing::fdr::{FdrConfig, FdrTraceExt};
 use tightbeam::testing::specs::csp::Process;
 use tightbeam::testing::{ScenarioConfig, SetupEnv, TestHooks};
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario};
 
 pub(crate) const CONNECT: Urn<'static> = tightbeam::urn!("test", "event:trace-analysis/connect");

@@ -1,14 +1,7 @@
 //! Security profiles and the cryptographic providers that run them, bound
 //! through associated types.
 
-#[cfg(all(
-	not(feature = "std"),
-	any(
-		feature = "digest",
-		feature = "kdf",
-		all(feature = "aead", feature = "transport")
-	)
-))]
+#[cfg(all(not(feature = "std"), any(feature = "digest", feature = "kdf", feature = "aead")))]
 use alloc::boxed::Box;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
@@ -54,6 +47,22 @@ use crate::Errorizable;
 use elliptic_curve::{Curve, CurveArithmetic};
 #[cfg(feature = "kem")]
 use kem::{Decapsulator, EncappedKey, Encapsulator};
+/// A one-shot closure that verifies a signature over the given bytes against
+/// a [`SignerInfo`](crate::SignerInfo).
+#[cfg(feature = "signature")]
+pub type SignatureVerifier<E = crate::TightBeamError> =
+	Box<dyn FnOnce(&[u8], &crate::SignerInfo) -> core::result::Result<(), E>>;
+
+/// A one-shot closure that digests the given bytes into a
+/// [`DigestInfo`](crate::DigestInfo).
+#[cfg(feature = "digest")]
+pub type Digestor<E = crate::TightBeamError> = Box<dyn FnOnce(&[u8]) -> core::result::Result<crate::DigestInfo, E>>;
+
+/// A closure that wraps a content-encryption key, its first argument, under a
+/// key-encryption key, its second.
+#[cfg(feature = "aead")]
+pub type KeyWrapper<E = crate::TightBeamError> = Box<dyn Fn(&[u8], &[u8]) -> core::result::Result<Vec<u8>, E>>;
+
 /// Generate the AES key-wrap closure for one KEK size.
 ///
 /// The AES-128, AES-192, and AES-256 variants share this body.
@@ -206,7 +215,7 @@ pub trait DigestProvider {
 	}
 
 	/// Convert this provider into a Digestor function.
-	fn as_digestor<E>(&self) -> crate::helpers::Digestor<E>
+	fn as_digestor<E>(&self) -> Digestor<E>
 	where
 		E: From<crate::TightBeamError>,
 	{

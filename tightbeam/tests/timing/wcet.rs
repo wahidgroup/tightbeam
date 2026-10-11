@@ -12,7 +12,7 @@ use tightbeam::testing::{ScenarioConfig, SetupEnv, TestHooks};
 use tightbeam::trace::TraceConfig;
 use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario, wcet};
 
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 
 pub(crate) const PROCESS: Urn<'static> = tightbeam::urn!("test", "event:wcet/process");
 

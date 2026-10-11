@@ -40,7 +40,7 @@ use tightbeam::tb_scenario;
 use tightbeam::testing::SetupEnv;
 use tightbeam::transport::handshake::negotiation::MuxBudgets;
 use tightbeam::transport::handshake::HandshakeError;
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 use tightbeam::TightBeamError;
 
 use crate::common::security::{

@@ -40,7 +40,7 @@ use crate::instrumentation::events::{
 use crate::policy::{GatePolicy, SessionContext, TransitStatus};
 use crate::trace::TraceCollector;
 use crate::transport::Protocol;
-use crate::utils::urn::Urn;
+use crate::urn::Urn;
 use crate::Frame;
 use crate::TightBeamError;
 

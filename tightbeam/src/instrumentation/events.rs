@@ -13,7 +13,7 @@
 //! Short section headers group related constants by plane. Each constant
 //! name states its event, so a section header names the plane alone.
 
-use crate::utils::urn::Urn;
+use crate::urn::Urn;
 
 pub const TIGHTBEAM_NID: &str = "tightbeam";
 

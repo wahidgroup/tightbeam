@@ -36,7 +36,7 @@ use tightbeam::{
 	testing::{SetupEnv, TestFrame},
 	trace::TraceCollector,
 	transport::{tcp::r#async::TokioListener, ConnectionBuilder, ConnectionPool, PoolConfig},
-	utils::urn::Urn,
+	urn::Urn,
 	Beamable,
 };
 
