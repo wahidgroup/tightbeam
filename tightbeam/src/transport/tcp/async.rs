@@ -29,17 +29,33 @@ mod tokio_rt {
 use tokio_rt::*;
 
 use crate::builder::TypeBuilder;
+use crate::crypto::aead::{DecryptContent, RecvCipher, SendCipher};
+use crate::crypto::profiles::CryptoProvider;
+use crate::der::Decode;
 use crate::der::Encode;
+use crate::policy::GatePolicy;
 use crate::policy::TransitStatus;
+use crate::transport::envelopes::{TransportEnvelope, WireEnvelope};
 use crate::transport::error::TransportFailure;
+use crate::transport::handshake::BoxedServerHandshake;
+use crate::transport::io::{EnvelopeSink, EnvelopeSource};
+use crate::transport::policy::RestartPolicy;
 use crate::transport::protocols::{AsyncProtocolStream, AsyncReadStream, AsyncWriteStream, SplittableStream};
+use crate::transport::state::{EncryptedProtocolState, ReadPolicy, SessionPhase};
+use crate::transport::EncryptedMessageIO;
 use crate::transport::ResponsePackage;
 use crate::transport::{
 	EnvelopeBuilder, MessageCollector, MessageEmitter, MessageIO, TransportError, TransportLimits, TransportResult,
 	WireMode,
 };
+use crate::utils::time::Clock;
 use crate::Frame;
 
+#[cfg(all(
+	feature = "transport-multiplex",
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
+use crate::policy::SessionContext;
 #[cfg(feature = "instrument")]
 use crate::trace::TraceCollector;
 #[cfg(all(
@@ -54,37 +70,18 @@ use crate::transport::handshake::negotiation::MuxSettings;
 use crate::transport::handshake::negotiation::TransportOffer;
 #[cfg(feature = "tokio")]
 use crate::transport::protocols::{AsyncByteRead, AsyncByteStream, AsyncByteWrite};
-#[cfg(all(
-	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-ecies")
-))]
-use crate::utils::marker::MaybeSend;
-
-use crate::crypto::aead::{DecryptContent, RecvCipher, SendCipher};
-use crate::crypto::profiles::CryptoProvider;
-use crate::der::Decode;
-use crate::transport::envelopes::{TransportEnvelope, WireEnvelope};
-use crate::transport::handshake::BoxedServerHandshake;
-use crate::transport::io::{EnvelopeSink, EnvelopeSource};
-use crate::transport::state::{EncryptedProtocolState, ReadPolicy, SessionPhase};
-use crate::transport::EncryptedMessageIO;
-use crate::utils::time::Clock;
-
-#[cfg(all(
-	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-ecies")
-))]
-use crate::policy::SessionContext;
 #[cfg(feature = "tokio")]
 use crate::transport::{EndpointConfig, TransportEncryptionConfig};
 #[cfg(all(
 	feature = "transport-multiplex",
 	any(feature = "transport-cms", feature = "transport-ecies")
 ))]
+use crate::utils::marker::MaybeSend;
+#[cfg(all(
+	feature = "transport-multiplex",
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
 use crate::x509::Certificate;
-
-use crate::policy::GatePolicy;
-use crate::transport::policy::RestartPolicy;
 
 /// Tokio TCP stream that carries DER-framed envelopes through the byte-level
 /// traits.

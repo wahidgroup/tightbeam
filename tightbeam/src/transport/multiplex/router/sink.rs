@@ -6,7 +6,7 @@ use super::body::ForwardedStream;
 use super::link::MuxLink;
 use super::shared::{BudgetStanding, OpenRequest, StreamReservation};
 use crate::transport::envelopes::{GoAwayReason, MuxDataPackage, MuxStreamKind, TransportEnvelope};
-use crate::transport::TransportResult;
+use crate::transport::{TransportError, TransportResult};
 use crate::utils::urn::Urn;
 
 /// Wire state of a streamed request: a held cap slot until the
@@ -25,8 +25,7 @@ enum SinkStream {
 /// stream, closed by flagging the final chunk `last`.
 ///
 /// - Pushes reach the wire eagerly, so a duplex conversation can await reply chunks between pushes.
-/// - [`close_with`](RequestSink::close_with) carries a known final chunk on the `last` record for
-///   free.
+/// - [`close_with`](RequestSink::close_with) carries a known final chunk on the `last` record for free.
 ///
 /// See [`crate::transport::multiplex::MuxHandle::open_stream`] and
 /// [`crate::transport::multiplex::MuxHandle::open_duplex`].
@@ -75,7 +74,7 @@ impl RequestSink {
 	/// # Errors
 	/// - `OperationFailed(Cancelled)`: the stream resolved underneath the sink
 	/// - `OperationFailed(BudgetExhausted)`: the budget cannot carry the chunk
-	/// - `ConnectionClosed`: writer driver gone
+	/// - `ConnectionClosed`: the writer driver is gone, or the reader ended
 	pub async fn push(&mut self, payload: impl AsRef<[u8]>) -> TransportResult<()> {
 		let payload = payload.as_ref();
 		if payload.is_empty() {
@@ -188,7 +187,12 @@ impl RequestSink {
 						// first chunk then still stamps the route and
 						// registers the reply forwarder.
 						self.target = request.target;
-						*duplex = request.duplex;
+						// A closed connection forwards no reply, so its
+						// forwarder drops here and the body observes the end.
+						if !matches!(err, TransportError::ConnectionClosed) {
+							*duplex = request.duplex;
+						}
+
 						Err(err)
 					}
 				}
@@ -240,9 +244,8 @@ impl ReplySink {
 	///
 	/// # Errors
 	/// - `OperationFailed(Cancelled)`: peer cancelled the stream
-	/// - `ConnectionClosed`: writer driver gone
-	/// - `OperationFailed(BudgetExhausted)`: the session budget
-	///   cannot carry the chunk
+	/// - `ConnectionClosed`: the writer driver is gone, or the reader ended with the stream at its limit
+	/// - `OperationFailed(BudgetExhausted)`: the session budget cannot carry the chunk
 	pub async fn push(&mut self, payload: impl AsRef<[u8]>) -> TransportResult<()> {
 		let payload = payload.as_ref();
 		if payload.is_empty() {
@@ -276,11 +279,10 @@ mod tests {
 	use super::super::outbound::Outbound;
 	use super::super::shared::MuxShared;
 	use super::super::shared::StreamOutcome;
-	use super::super::testing::{client_shared, poll_now};
+	use super::super::testing::{body_fixture, client_shared, poll_now};
 	use super::*;
 	use crate::constants::DEFAULT_HOP_BUDGET;
 	use crate::transport::envelopes::{CancelReason, MuxEnvelope};
-	use crate::transport::TransportError;
 
 	/// Reserved (unopened) request sink on a fresh client with the
 	/// given route, plus the outbound queue's receiving end and the
@@ -452,6 +454,26 @@ mod tests {
 		let pushed = poll_now(sink.push([1u8]));
 		assert!(matches!(pushed, Poll::Ready(Err(TransportError::ConnectionClosed))));
 		assert!(sink.target.is_some());
+	}
+
+	// Only a closed connection forfeits the reply forwarder. A drain refuses
+	// the open and leaves the sink whole.
+	#[test]
+	fn test_request_sink_refused_by_a_drain_keeps_its_forwarder() {
+		let shared = client_shared();
+		let (outbound, _sent) = mpsc::channel(8);
+		let (link, _) = MuxLink::new(Arc::clone(&shared), outbound);
+		let (sender, _outcome) = oneshot::channel();
+		let reservation = shared.reserve_stream_slot(sender).expect("fresh connection has stream slots");
+		let (_body, forwarder, _notes) = body_fixture(1, 4);
+		let duplex = Some(forwarder);
+		let mut sink = RequestSink::new(reservation, MuxStreamKind::Duplex, link, duplex, None, DEFAULT_HOP_BUDGET);
+
+		shared.begin_shutdown();
+
+		let pushed = poll_now(sink.push([1u8]));
+		assert!(matches!(pushed, Poll::Ready(Err(TransportError::Draining))));
+		assert!(matches!(sink.stream, SinkStream::Reserved { duplex: Some(_), .. }));
 	}
 
 	// An empty request body still travels: close without a push

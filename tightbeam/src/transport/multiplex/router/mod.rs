@@ -8,6 +8,7 @@ mod flow;
 mod handle;
 mod link;
 mod outbound;
+mod pending;
 mod reader;
 mod responder;
 mod shared;

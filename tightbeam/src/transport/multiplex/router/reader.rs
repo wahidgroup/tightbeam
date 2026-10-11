@@ -305,6 +305,21 @@ impl ReaderEvent {
 	}
 }
 
+/// The connection fails when its reader goes, however it goes.
+///
+/// A returned [`drive`](MuxReaderDriver::drive), a `drive` future dropped in
+/// the middle of a read, and a driver that never ran all leave nothing to
+/// resolve a stream or a ping. The sweep runs here so that each of them
+/// records the end.
+impl<R> Drop for MuxReaderDriver<R>
+where
+	R: EnvelopeSource,
+{
+	fn drop(&mut self) {
+		self.link.shared().fail_all_pending();
+	}
+}
+
 impl<R> MuxReaderDriver<R>
 where
 	R: EnvelopeSource,
@@ -379,9 +394,7 @@ where
 	/// - [`TransportError::ConnectionClosed`] -- the writer driver is gone.
 	/// - The read or receive-cipher install failure of the [`EnvelopeSource`].
 	pub async fn drive(mut self) -> TransportResult<()> {
-		let result = self.route_envelopes().await;
-		self.link.shared().fail_all_pending();
-		result
+		self.route_envelopes().await
 	}
 
 	/// Route inbound envelopes to their pending streams or handlers,
@@ -1330,6 +1343,8 @@ mod tests {
 	use core::sync::atomic::{AtomicUsize, Ordering};
 	use core::task::Poll;
 
+	use futures::channel::oneshot;
+
 	use super::super::shared::MuxShared;
 	use super::super::testing::{body_fixture, noop_cx, poll_times, FIXTURE_PEER_CAP};
 	use super::*;
@@ -1744,5 +1759,21 @@ mod tests {
 			.count();
 		assert_eq!(buffered_acks, MAX_PENDING_PING_ACKS);
 		Ok(())
+	}
+
+	// A reader future dropped in the middle of a read never returns from
+	// `drive`, and the connection has ended all the same.
+	#[test]
+	fn test_dropped_drive_fails_the_connection() {
+		let fixture = reader_with_full_queue([]);
+		let shared = Arc::clone(fixture.driver.link.shared());
+
+		let mut driving = Box::pin(fixture.driver.drive());
+		poll_times(&mut driving, 1);
+		drop(driving);
+
+		let (sender, _ack) = oneshot::channel();
+		let pinged = shared.allocate_ping(sender);
+		assert!(matches!(pinged, Err(TransportError::ConnectionClosed)));
 	}
 }

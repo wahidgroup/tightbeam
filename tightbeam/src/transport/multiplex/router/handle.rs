@@ -99,6 +99,11 @@ impl Drop for ForgetPingOnDrop {
 /// caller spawns [`MuxReaderDriver`] and [`MuxWriterDriver`] on its executor.
 /// See [`MuxHandle::emit_on_stream`] and [`MuxHandle::ping`].
 ///
+/// # Ended connection
+///
+/// - Once the reader has ended, every call that would wait on the peer returns `ConnectionClosed`.
+/// - That outranks `Draining`, so a connection that took a GoAway and then ended reports the end.
+///
 /// [`MuxReaderDriver`]: crate::transport::multiplex::MuxReaderDriver
 /// [`MuxWriterDriver`]: crate::transport::multiplex::MuxWriterDriver
 #[derive(Clone)]
@@ -141,7 +146,7 @@ impl MuxHandle {
 	/// - `OperationFailed(BudgetExhausted)` -- the outbound budget cannot cover the frame.
 	/// - `OperationFailed(ResourceExhausted)` -- the peer refused the stream.
 	/// - `Draining` -- a GoAway was sent or received, so the connection opens no new streams.
-	/// - `ConnectionClosed` -- the connection failed before the response.
+	/// - `ConnectionClosed` -- the connection failed, before this call or before the response.
 	pub async fn emit_on_stream(&self, frame: &Frame) -> TransportResult<Option<Frame>> {
 		// Encode before reserving so an encoding failure never burns
 		// a cap slot or queues work for a stream the peer never saw.
@@ -196,6 +201,7 @@ impl MuxHandle {
 	///
 	/// - `OperationFailed(StreamsExhausted)` -- the local-initiated cap is exhausted.
 	/// - `Draining` -- a GoAway was sent or received, so the connection opens no new streams.
+	/// - `ConnectionClosed` -- the connection has failed, so nothing would answer the stream.
 	pub fn open_stream(
 		&self,
 	) -> TransportResult<(RequestSink, impl Future<Output = TransportResult<Option<Frame>>> + MaybeSend)> {
@@ -214,6 +220,7 @@ impl MuxHandle {
 	///
 	/// - `OperationFailed(StreamsExhausted)` -- the local-initiated cap is exhausted.
 	/// - `Draining` -- a GoAway was sent or received, so the connection opens no new streams.
+	/// - `ConnectionClosed` -- the connection has failed, so nothing would answer the stream.
 	pub fn open_stream_to(
 		&self,
 		target: impl Into<Urn<'static>>,
@@ -287,6 +294,7 @@ impl MuxHandle {
 	///
 	/// - `OperationFailed(StreamsExhausted)` -- the local-initiated cap is exhausted.
 	/// - `Draining` -- a GoAway was sent or received, so the connection opens no new streams.
+	/// - `ConnectionClosed` -- the connection has failed, so nothing would answer the stream.
 	pub fn open_duplex(&self) -> TransportResult<(RequestSink, StreamBody)> {
 		self.open_duplex_with_route(StreamRoute::local())
 	}
@@ -303,6 +311,7 @@ impl MuxHandle {
 	///
 	/// - `OperationFailed(StreamsExhausted)` -- the local-initiated cap is exhausted.
 	/// - `Draining` -- a GoAway was sent or received, so the connection opens no new streams.
+	/// - `ConnectionClosed` -- the connection has failed, so nothing would answer the stream.
 	pub fn open_duplex_to(&self, target: impl Into<Urn<'static>>) -> TransportResult<(RequestSink, StreamBody)> {
 		self.open_duplex_with_route(StreamRoute::to(target.into()))
 	}
@@ -388,8 +397,8 @@ impl MuxHandle {
 	}
 
 	/// Returns whether a new locally-initiated stream would be admitted now,
-	/// which needs cap headroom, live ID space, and no GoAway in either
-	/// direction.
+	/// which needs cap headroom, live ID space, a connection that has not
+	/// failed, and no GoAway in either direction.
 	///
 	/// The answer is advisory. A concurrent emit can take the last slot after
 	/// this returns, so callers still handle `StreamsExhausted`.
@@ -424,17 +433,18 @@ impl MuxHandle {
 		self.link.shared().session_receipt()
 	}
 
-	/// Resolve once a locally-initiated stream would be admitted, which needs
-	/// cap headroom, live ID space, and no GoAway in either direction.
+	/// Resolve once a locally-initiated stream would be admitted, on the
+	/// conditions [`MuxHandle::has_stream_headroom`] names.
 	///
-	/// A caller awaits this in place of a polling loop over
-	/// [`MuxHandle::has_stream_headroom`]. The answer is advisory like the
-	/// getter, because a concurrent emit can take the slot between wake and
-	/// use, so callers still handle `StreamsExhausted`.
+	/// A caller awaits this in place of a polling loop over that getter. The
+	/// answer is advisory like the getter, because a concurrent emit can take
+	/// the slot between wake and use, so callers still handle
+	/// `StreamsExhausted`.
 	///
 	/// # Errors
 	///
 	/// - `Draining` -- a GoAway was sent or received, or the stream IDs are exhausted.
+	/// - `ConnectionClosed` -- the connection has failed.
 	pub fn wait_for_stream_slot(&self) -> impl Future<Output = TransportResult<()>> + MaybeSend {
 		self.link.shared().stream_slot()
 	}
@@ -449,7 +459,7 @@ impl MuxHandle {
 	/// # Errors
 	///
 	/// - `Draining` -- a GoAway was sent or received, so the connection is ending.
-	/// - `ConnectionClosed` -- the connection failed before the ack.
+	/// - `ConnectionClosed` -- the connection failed, before this call or before the ack.
 	///
 	/// [rfc9113-6.7]: https://datatracker.ietf.org/doc/html/rfc9113#section-6.7
 	pub async fn ping(&self) -> TransportResult<()> {
@@ -614,6 +624,22 @@ mod tests {
 				if package.target().is_none() && package.hops_remaining() == DEFAULT_HOP_BUDGET
 		));
 
+		Ok(())
+	}
+
+	// A failed connection forwards no reply, so the body must not wait on a
+	// forwarder that the refused sink still holds.
+	#[test]
+	fn test_duplex_body_ends_when_the_open_meets_a_failed_connection() -> TransportResult<()> {
+		let (handle, _sent) = duplex_handle();
+		let (mut sink, mut body) = handle.open_duplex()?;
+		handle.link.shared().fail_all_pending();
+
+		let pushed = poll_now(sink.push([1u8]));
+		assert!(matches!(pushed, Poll::Ready(Err(TransportError::ConnectionClosed))));
+
+		let ended = body.poll_chunk_now();
+		assert!(matches!(ended, Poll::Ready(Err(TransportError::ConnectionClosed))));
 		Ok(())
 	}
 

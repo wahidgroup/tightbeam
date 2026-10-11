@@ -606,7 +606,8 @@ where
 			if expired {
 				// GoAway precedes the close (RFC 9113 § 6.8), so the reader
 				// task ends on the resulting EOF. A racing stream observes
-				// `Draining`, which `PooledClient::emit` maps to eviction.
+				// `Draining`, or `ConnectionClosed` once that reader has ended,
+				// and `PooledClient::emit` maps both to eviction.
 				let handle = entry.handle.clone();
 				rt::spawn(async move {
 					// The drain runs detached from the prune that spawned it.
@@ -1129,6 +1130,7 @@ pooled_mux! {
 		/// # Errors
 		///
 		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and streaming needs the mux plane.
+		/// - The [`MuxHandle::open_stream`] set.
 		pub fn open_stream(
 			&self,
 		) -> TransportResult<(RequestSink, impl Future<Output = TransportResult<Option<Frame>>> + MaybeSend)> {
@@ -1144,6 +1146,7 @@ pooled_mux! {
 		/// # Errors
 		///
 		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and streaming needs the mux plane.
+		/// - The [`MuxHandle::open_stream`] set.
 		pub fn open_stream_to(
 			&self,
 			target: impl Into<Urn<'static>>,
@@ -1164,6 +1167,7 @@ pooled_mux! {
 		/// # Errors
 		///
 		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and streaming needs the mux plane.
+		/// - The [`MuxHandle::open_stream`] set.
 		#[cfg(feature = "colony")]
 		pub(crate) fn open_stream_with_route(
 			&self,
@@ -1179,6 +1183,7 @@ pooled_mux! {
 		/// # Errors
 		///
 		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and streaming needs the mux plane.
+		/// - The [`MuxHandle::open_duplex`] set.
 		pub fn open_duplex(&self) -> TransportResult<(RequestSink, StreamBody)> {
 			self.stamped_handle()?.open_duplex()
 		}
@@ -1192,6 +1197,7 @@ pooled_mux! {
 		/// # Errors
 		///
 		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and streaming needs the mux plane.
+		/// - The [`MuxHandle::open_duplex`] set.
 		pub fn open_duplex_to(&self, target: impl Into<Urn<'static>>) -> TransportResult<(RequestSink, StreamBody)> {
 			self.stamped_handle()?.open_duplex_to(target)
 		}
@@ -1209,6 +1215,7 @@ pooled_mux! {
 		/// # Errors
 		///
 		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and streaming needs the mux plane.
+		/// - The [`MuxHandle::open_duplex`] set.
 		#[cfg(feature = "colony")]
 		pub(crate) fn open_duplex_with_route(&self, route: StreamRoute) -> TransportResult<(RequestSink, StreamBody)> {
 			self.stamped_handle()?.open_duplex_with_route(route)
