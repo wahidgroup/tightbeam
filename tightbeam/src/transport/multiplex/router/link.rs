@@ -172,7 +172,8 @@ impl MuxLink {
 	///
 	/// # Errors
 	///
-	/// - [`TransportError::ConnectionClosed`] -- the writer driver is gone.
+	/// - [`TransportError::ConnectionClosed`] -- the writer driver is gone, or
+	///   the reader ended before the peer granted the rest of the response.
 	/// - The encode failure of a response frame that does not serialize.
 	pub(crate) async fn send_response(&self, stream_id: u32, response: ResponsePackage) -> TransportResult<()> {
 		let mut status = response.status();
@@ -286,7 +287,8 @@ impl MuxLink {
 	/// - [`TransportError::OperationFailed`] with
 	///   [`TransportFailure::Cancelled`] -- the stream's ledger is gone,
 	///   whether cancelled, resolved, or lost with the connection.
-	/// - [`TransportError::ConnectionClosed`] -- the writer queue closed.
+	/// - [`TransportError::ConnectionClosed`] -- the writer queue closed, or
+	///   the reader ended with the ledger at its limit.
 	pub(crate) async fn send_data_envelope(&self, stream_id: u32, envelope: TransportEnvelope) -> TransportResult<()> {
 		let mut outbound = self.sender();
 		let ready = poll_fn(|cx| outbound.poll_ready(cx)).await;
@@ -306,7 +308,8 @@ impl MuxLink {
 	///
 	/// # Errors
 	///
-	/// - [`TransportError::ConnectionClosed`] -- the writer queue closed.
+	/// - [`TransportError::ConnectionClosed`] -- the writer queue closed, or the reader has ended.
+	/// - [`TransportError::Draining`] -- a GoAway ended admission, or the ID space is exhausted.
 	pub(crate) async fn send_open_envelope(
 		&self,
 		reservation: &mut StreamReservation,
