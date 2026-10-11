@@ -21,9 +21,7 @@ mod tokio_rt {
 	pub use tokio::net::{TcpListener, TcpStream};
 	pub use tokio::time::timeout;
 
-	#[cfg(feature = "x509")]
 	pub use crate::crypto::profiles::DefaultCryptoProvider;
-	#[cfg(feature = "x509")]
 	pub use crate::transport::EncryptedProtocol;
 }
 
@@ -57,50 +55,36 @@ use crate::transport::handshake::negotiation::TransportOffer;
 #[cfg(feature = "tokio")]
 use crate::transport::protocols::{AsyncByteRead, AsyncByteStream, AsyncByteWrite};
 #[cfg(all(
-	feature = "x509",
 	feature = "transport-multiplex",
 	any(feature = "transport-cms", feature = "transport-ecies")
 ))]
 use crate::utils::marker::MaybeSend;
 
-#[cfg(feature = "x509")]
-mod x509 {
-	pub use crate::crypto::aead::{DecryptContent, RecvCipher, SendCipher};
-	pub use crate::crypto::profiles::CryptoProvider;
-	pub use crate::der::Decode;
-	pub use crate::transport::envelopes::{TransportEnvelope, WireEnvelope};
-	pub use crate::transport::handshake::BoxedServerHandshake;
-	pub use crate::transport::io::{EnvelopeSink, EnvelopeSource};
-	pub use crate::transport::state::{EncryptedProtocolState, ReadPolicy, SessionPhase};
-	pub use crate::transport::EncryptedMessageIO;
-	pub use crate::utils::time::Clock;
+use crate::crypto::aead::{DecryptContent, RecvCipher, SendCipher};
+use crate::crypto::profiles::CryptoProvider;
+use crate::der::Decode;
+use crate::transport::envelopes::{TransportEnvelope, WireEnvelope};
+use crate::transport::handshake::BoxedServerHandshake;
+use crate::transport::io::{EnvelopeSink, EnvelopeSource};
+use crate::transport::state::{EncryptedProtocolState, ReadPolicy, SessionPhase};
+use crate::transport::EncryptedMessageIO;
+use crate::utils::time::Clock;
 
-	#[cfg(all(
-		feature = "transport-policy",
-		feature = "transport-multiplex",
-		any(feature = "transport-cms", feature = "transport-ecies")
-	))]
-	pub use crate::policy::SessionContext;
-	#[cfg(feature = "tokio")]
-	pub use crate::transport::{EndpointConfig, TransportEncryptionConfig};
-	#[cfg(all(
-		feature = "transport-multiplex",
-		any(feature = "transport-cms", feature = "transport-ecies")
-	))]
-	pub use crate::x509::Certificate;
-}
+#[cfg(all(
+	feature = "transport-multiplex",
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
+use crate::policy::SessionContext;
+#[cfg(feature = "tokio")]
+use crate::transport::{EndpointConfig, TransportEncryptionConfig};
+#[cfg(all(
+	feature = "transport-multiplex",
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
+use crate::x509::Certificate;
 
-#[cfg(feature = "x509")]
-use x509::*;
-
-#[cfg(feature = "transport-policy")]
-mod policy {
-	pub use crate::policy::GatePolicy;
-	pub use crate::transport::policy::RestartPolicy;
-}
-
-#[cfg(feature = "transport-policy")]
-use policy::*;
+use crate::policy::GatePolicy;
+use crate::transport::policy::RestartPolicy;
 
 /// Tokio TCP stream that carries DER-framed envelopes through the byte-level
 /// traits.
@@ -281,7 +265,6 @@ impl<P: CryptoProvider + Send + Sync + 'static> EncryptedProtocol for TokioListe
 }
 
 // `TcpTransport` takes the default of every `EncryptedMessageIO` method.
-#[cfg(feature = "x509")]
 impl<S: AsyncProtocolStream> EncryptedMessageIO for TcpTransport<S> where TransportError: From<S::Error> {}
 
 impl<S: AsyncProtocolStream, P: CryptoProvider + Send + Sync> TcpTransport<S, P>
@@ -299,7 +282,6 @@ where
 }
 
 #[cfg(all(
-	feature = "x509",
 	feature = "transport-multiplex",
 	any(feature = "transport-cms", feature = "transport-ecies")
 ))]
@@ -308,14 +290,11 @@ mod mux {
 		IntoMuxOffer, MuxCapable, MuxConnector, MuxRekeyContext, MuxRole, MuxTransport,
 	};
 
-	#[cfg(feature = "transport-policy")]
 	pub(crate) use crate::transport::io::CollectStep;
-	#[cfg(feature = "transport-policy")]
 	pub use crate::transport::multiplex::{GatedHalves, MuxAcceptor};
 }
 
 #[cfg(all(
-	feature = "x509",
 	feature = "transport-multiplex",
 	any(feature = "transport-cms", feature = "transport-ecies")
 ))]
@@ -325,7 +304,6 @@ use mux::*;
 /// halves and spawned drivers, so an advertisement anywhere else would
 /// negotiate a capability that the endpoint cannot honor.
 #[cfg(all(
-	feature = "x509",
 	feature = "transport-multiplex",
 	any(feature = "transport-cms", feature = "transport-ecies")
 ))]
@@ -344,7 +322,6 @@ where
 
 /// The multiplexed plane that [`TcpTransport::into_mux`] assembles.
 #[cfg(all(
-	feature = "x509",
 	feature = "transport-multiplex",
 	any(feature = "transport-cms", feature = "transport-ecies")
 ))]
@@ -354,7 +331,6 @@ pub type SplitMuxTransport<S> = MuxTransport<
 >;
 
 #[cfg(all(
-	feature = "x509",
 	feature = "transport-multiplex",
 	any(feature = "transport-cms", feature = "transport-ecies")
 ))]
@@ -399,7 +375,6 @@ where
 }
 
 #[cfg(all(
-	feature = "x509",
 	feature = "transport-multiplex",
 	any(feature = "transport-cms", feature = "transport-ecies")
 ))]
@@ -417,7 +392,6 @@ where
 }
 
 #[cfg(all(
-	feature = "x509",
 	feature = "transport-multiplex",
 	any(feature = "transport-cms", feature = "transport-ecies")
 ))]
@@ -449,7 +423,6 @@ where
 }
 
 #[cfg(all(
-	feature = "x509",
 	feature = "transport-multiplex",
 	any(feature = "transport-cms", feature = "transport-ecies")
 ))]
@@ -486,12 +459,10 @@ where
 		MuxRekeyContext::detach(self, MuxRole::Server)
 	}
 
-	#[cfg(feature = "transport-policy")]
 	fn session_context(&self) -> SessionContext {
 		SessionContext::capture(self)
 	}
 
-	#[cfg(feature = "transport-policy")]
 	fn into_gated_halves(mut self) -> TransportResult<GatedHalves<Self>> {
 		let gate = Box::new(core::mem::take(&mut self.collector_gate));
 		let halves = self.into_split()?;
@@ -505,7 +476,6 @@ where
 
 /// The wire mode a split receive half reads, with the cipher an encrypted
 /// session needs.
-#[cfg(feature = "x509")]
 enum SplitRecv {
 	/// The transport was named cleartext, so envelopes carry NO
 	/// confidentiality, integrity, replay, or deletion protection.
@@ -516,7 +486,6 @@ enum SplitRecv {
 
 /// The wire mode a split send half writes, with the cipher an encrypted
 /// session needs.
-#[cfg(feature = "x509")]
 enum SplitSend {
 	/// The transport was named cleartext.
 	Cleartext,
@@ -530,7 +499,6 @@ enum SplitSend {
 /// encrypted half owns the receive-direction cipher, so decryption needs no
 /// locks and can run concurrently with a [`TransportWriter`] on the same
 /// connection.
-#[cfg(feature = "x509")]
 pub struct TransportReader<R>
 where
 	R: AsyncReadStream,
@@ -547,7 +515,6 @@ where
 	trace: Option<TraceCollector>,
 }
 
-#[cfg(feature = "x509")]
 impl<R> TransportReader<R>
 where
 	R: AsyncReadStream,
@@ -570,7 +537,6 @@ where
 	}
 }
 
-#[cfg(feature = "x509")]
 impl<R> EnvelopeSource for TransportReader<R>
 where
 	R: AsyncReadStream,
@@ -652,7 +618,6 @@ where
 /// encrypted half owns the send-direction cipher and its counter nonce, so
 /// encryption needs no locks and can run concurrently with a
 /// [`TransportReader`] on the same connection.
-#[cfg(feature = "x509")]
 pub struct TransportWriter<W>
 where
 	W: AsyncWriteStream,
@@ -673,7 +638,6 @@ where
 	trace: Option<TraceCollector>,
 }
 
-#[cfg(feature = "x509")]
 impl<W> TransportWriter<W>
 where
 	W: AsyncWriteStream,
@@ -694,7 +658,6 @@ where
 	}
 }
 
-#[cfg(feature = "x509")]
 impl<W> EnvelopeSink for TransportWriter<W>
 where
 	W: AsyncWriteStream,
@@ -712,10 +675,10 @@ where
 		let wire_envelope = builder.finish()?;
 		let wire_bytes = wire_envelope.to_der()?;
 
-		#[cfg(all(feature = "tokio", feature = "std", feature = "transport-policy"))]
+		#[cfg(all(feature = "tokio", feature = "std"))]
 		timeout(self.limits.operation_timeout, self.stream.write_frame(&wire_bytes)).await??;
 
-		#[cfg(not(all(feature = "tokio", feature = "std", feature = "transport-policy")))]
+		#[cfg(not(all(feature = "tokio", feature = "std")))]
 		self.stream.write_frame(&wire_bytes).await?;
 
 		Ok(())
@@ -761,13 +724,11 @@ where
 }
 
 /// The read and write halves that [`TcpTransport::into_split`] produces.
-#[cfg(feature = "x509")]
 pub type SplitTransport<S> = (
 	TransportReader<<S as SplittableStream>::ReadHalf>,
 	TransportWriter<<S as SplittableStream>::WriteHalf>,
 );
 
-#[cfg(feature = "x509")]
 impl<S, P> TcpTransport<S, P>
 where
 	S: SplittableStream,
@@ -838,7 +799,6 @@ impl<P: CryptoProvider + Send + Sync + 'static> AsyncListenerTrait for TokioList
 	/// This delegates to the inherent accept, so both entry points install
 	/// the full listener state.
 	async fn accept(&self) -> Result<(Self::Transport, Self::Address), Self::Error> {
-		#[cfg(feature = "x509")]
 		{
 			let (transport, peer_addr) = TokioListener::<P>::accept(self).await?;
 			Ok((transport, TightBeamSocketAddr(peer_addr)))
@@ -861,9 +821,7 @@ where
 	async fn read_envelope_bytes(&mut self) -> TransportResult<Vec<u8>> {
 		// The phase decides the ceiling and the deadline of this read, as
 		// `SessionPhase::read_policy` describes.
-		#[cfg(feature = "x509")]
 		let now = self.clock.monotonic();
-		#[cfg(feature = "x509")]
 		let policy = self.state.phase().read_policy(&self.limits, now);
 
 		#[cfg(feature = "tokio")]
@@ -884,17 +842,16 @@ where
 	}
 
 	async fn write_envelope_bytes(&mut self, buffer: &[u8]) -> TransportResult<()> {
-		#[cfg(all(feature = "tokio", feature = "transport-policy"))]
+		#[cfg(feature = "tokio")]
 		timeout(self.limits.operation_timeout, self.stream.write_frame(buffer)).await??;
 
-		#[cfg(not(all(feature = "tokio", feature = "transport-policy")))]
+		#[cfg(not(feature = "tokio"))]
 		self.stream.write_frame(buffer).await?;
 
 		Ok(())
 	}
 }
 
-#[cfg(all(feature = "x509", feature = "transport-policy"))]
 impl<S: AsyncProtocolStream> MessageCollector for TcpTransport<S>
 where
 	TransportError: From<S::Error>,
@@ -921,7 +878,6 @@ where
 	}
 }
 
-#[cfg(all(feature = "x509", feature = "transport-policy"))]
 impl<S: AsyncProtocolStream> MessageEmitter for TcpTransport<S>
 where
 	TransportError: From<S::Error>,
@@ -979,7 +935,7 @@ mod tests {
 	use core::time::Duration;
 	use std::sync::Arc;
 
-	#[cfg(all(feature = "transport-policy", feature = "transport-ecies"))]
+	#[cfg(feature = "transport-ecies")]
 	use std::sync::atomic::{AtomicBool, Ordering};
 
 	use super::*;
@@ -998,14 +954,12 @@ mod tests {
 	use crate::utils::time::SystemClock;
 	use std::time::Instant;
 
-	#[cfg(feature = "x509")]
 	use crate::policy::TransitStatus;
 
 	/// Serve one single-flight request.
 	///
 	/// The helper collects the request, applies `reply` to an accepted frame,
 	/// and answers with the gate's status.
-	#[cfg(feature = "x509")]
 	async fn respond_with<T, F>(transport: &mut T, reply: F) -> TransportResult<()>
 	where
 		T: MessageCollector + Send,
@@ -1021,14 +975,13 @@ mod tests {
 		transport.send_response(status, message).await
 	}
 
-	#[cfg(all(feature = "transport-policy", feature = "transport-ecies"))]
+	#[cfg(feature = "transport-ecies")]
 	use crate::crypto::ecies::EciesError;
-	#[cfg(all(feature = "transport-policy", feature = "transport-ecies"))]
+	#[cfg(feature = "transport-ecies")]
 	use crate::policy::SessionContext;
-	#[cfg(all(feature = "transport-policy", feature = "transport-ecies"))]
+	#[cfg(feature = "transport-ecies")]
 	use crate::transport::policy::CollectorGateConfig;
 
-	#[cfg(all(feature = "x509", feature = "aead"))]
 	mod cipher_install {
 		use core::time::Duration;
 
@@ -1213,7 +1166,6 @@ mod tests {
 
 		/// A cleartext half is bounded by the operation deadline like an
 		/// encrypted one, so a stalled peer cannot pin its task (CWE-400).
-		#[cfg(feature = "transport-policy")]
 		#[tokio::test(start_paused = true)]
 		async fn a_cleartext_reader_gives_up_at_the_operation_deadline() {
 			let mut reader = TransportReader {
@@ -1232,7 +1184,6 @@ mod tests {
 			));
 		}
 
-		#[cfg(feature = "transport-policy")]
 		#[tokio::test(start_paused = true)]
 		async fn a_cleartext_writer_gives_up_at_the_operation_deadline() {
 			let mut writer = TransportWriter {
@@ -1265,7 +1216,6 @@ mod tests {
 		}
 	}
 
-	#[cfg(feature = "x509")]
 	#[tokio::test]
 	async fn async_round_trip() -> TransportResult<()> {
 		let (listener, client_stream) = bind_and_connect().await?;
@@ -1297,13 +1247,11 @@ mod tests {
 		Ok(())
 	}
 
-	#[cfg(all(feature = "x509", feature = "transport-policy"))]
 	struct EncryptedTestServer {
 		cert: Certificate,
 		config: TransportEncryptionConfig<DefaultCryptoProvider>,
 	}
 
-	#[cfg(all(feature = "x509", feature = "transport-policy"))]
 	fn encrypted_test_server() -> TransportResult<EncryptedTestServer> {
 		let signing_key = TestKey::insecure_fixed_signing();
 		let verifying_key = Secp256k1VerifyingKey::from(&signing_key);
@@ -1324,19 +1272,17 @@ mod tests {
 		Ok(EncryptedTestServer { cert, config })
 	}
 
-	#[cfg(all(feature = "x509", feature = "transport-policy"))]
 	fn trust_store_for(cert: Certificate) -> TransportResult<Arc<dyn CertificateTrust>> {
 		let trust = CertificateTrustBuilder::from(Secp256k1Policy).with_certificate(cert)?.build();
 		Ok(Arc::new(trust))
 	}
 
-	#[cfg(all(feature = "x509", feature = "transport-cms"))]
+	#[cfg(feature = "transport-cms")]
 	fn empty_trust_store() -> Arc<dyn CertificateTrust> {
 		let trust = CertificateTrustBuilder::from(Secp256k1Policy).build();
 		Arc::new(trust)
 	}
 
-	#[cfg(all(feature = "x509", feature = "transport-policy"))]
 	async fn bind_encrypted(
 		config: TransportEncryptionConfig<DefaultCryptoProvider>,
 	) -> TransportResult<(TokioListener<DefaultCryptoProvider>, SocketAddr)> {
@@ -1345,7 +1291,6 @@ mod tests {
 		Ok((listener, *socket_addr))
 	}
 
-	#[cfg(all(feature = "x509", feature = "transport-policy"))]
 	fn spawn_accept_handle_request(
 		listener: TokioListener<DefaultCryptoProvider>,
 	) -> tokio::task::JoinHandle<TransportResult<()>> {
@@ -1355,7 +1300,6 @@ mod tests {
 		})
 	}
 
-	#[cfg(feature = "x509")]
 	async fn bind_and_connect() -> TransportResult<(TokioListener, TcpStream)> {
 		let listener = TokioListener::bind("127.0.0.1:0").await?;
 		let listen_addr = listener.local_addr()?;
@@ -1375,7 +1319,6 @@ mod tests {
 	}
 
 	/// A client that validates the server against `trust_store`.
-	#[cfg(feature = "x509")]
 	fn trusting_client(stream: TcpStream, trust_store: Arc<dyn CertificateTrust>) -> TcpTransport<TokioStream> {
 		client_over(
 			stream,
@@ -1388,7 +1331,7 @@ mod tests {
 	}
 
 	/// A CMS client holding a signing key, and `trust_store` if one is given.
-	#[cfg(all(feature = "x509", feature = "transport-cms"))]
+	#[cfg(feature = "transport-cms")]
 	fn cms_test_client(stream: TcpStream, trust_store: Option<Arc<dyn CertificateTrust>>) -> TcpTransport<TokioStream> {
 		let signing_key = Secp256k1SigningKey::from(TestKey::insecure_fixed_signing());
 		let key_provider = Secp256k1KeyProvider::from(signing_key);
@@ -1410,7 +1353,7 @@ mod tests {
 		client_over(stream, encryption)
 	}
 
-	#[cfg(all(feature = "x509", feature = "transport-cms"))]
+	#[cfg(feature = "transport-cms")]
 	#[tokio::test]
 	async fn cms_client_without_trust_store_fails_closed() -> TransportResult<()> {
 		let (_listener, client_stream) = bind_and_connect().await?;
@@ -1423,7 +1366,7 @@ mod tests {
 		Ok(())
 	}
 
-	#[cfg(all(feature = "x509", feature = "transport-cms"))]
+	#[cfg(feature = "transport-cms")]
 	#[tokio::test]
 	async fn cms_client_without_server_chain_fails_closed() -> TransportResult<()> {
 		let (_listener, client_stream) = bind_and_connect().await?;
@@ -1437,7 +1380,7 @@ mod tests {
 
 	/// A CMS client that holds a trust store and the server chain, and no
 	/// identity, refuses before it sends anything.
-	#[cfg(all(feature = "x509", feature = "transport-cms"))]
+	#[cfg(feature = "transport-cms")]
 	#[tokio::test]
 	async fn cms_client_without_identity_fails_closed() -> TransportResult<()> {
 		let (_listener, client_stream) = bind_and_connect().await?;
@@ -1458,7 +1401,7 @@ mod tests {
 
 	/// An ECIES client that holds no trust store has no validator for the
 	/// server the reply names, so it refuses before it sends anything.
-	#[cfg(all(feature = "x509", feature = "transport-ecies"))]
+	#[cfg(feature = "transport-ecies")]
 	#[tokio::test]
 	async fn ecies_client_without_trust_store_fails_closed() -> TransportResult<()> {
 		let (_listener, client_stream) = bind_and_connect().await?;
@@ -1471,7 +1414,7 @@ mod tests {
 		Ok(())
 	}
 
-	#[cfg(all(feature = "transport-cms", feature = "transport-policy"))]
+	#[cfg(feature = "transport-cms")]
 	#[tokio::test]
 	async fn async_cms_round_trip() -> TransportResult<()> {
 		let EncryptedTestServer { cert: server_cert, config } = encrypted_test_server()?;
@@ -1524,7 +1467,6 @@ mod tests {
 		Ok(())
 	}
 
-	#[cfg(all(feature = "x509", feature = "transport-policy"))]
 	#[tokio::test]
 	async fn handshake_read_deadline_bounds_silent_client() -> TransportResult<()> {
 		let EncryptedTestServer { mut config, .. } = encrypted_test_server()?;
@@ -1543,7 +1485,6 @@ mod tests {
 	/// A handshake-phase frame whose declared length exceeds the 16 KiB
 	/// handshake cap must be rejected on the declared length, before the body
 	/// is read.
-	#[cfg(all(feature = "x509", feature = "transport-policy"))]
 	#[tokio::test]
 	async fn handshake_read_rejects_oversize_frame_before_body() -> TransportResult<()> {
 		let EncryptedTestServer { mut config, .. } = encrypted_test_server()?;
@@ -1564,7 +1505,7 @@ mod tests {
 		Ok(())
 	}
 
-	#[cfg(all(feature = "transport-policy", feature = "transport-ecies"))]
+	#[cfg(feature = "transport-ecies")]
 	#[tokio::test]
 	async fn async_with_encrypted_and_gate_policy() -> TransportResult<()> {
 		struct BusyFirstGate {
@@ -1630,7 +1571,7 @@ mod tests {
 	/// request is disclosed (CWE-668), so the deferred single-flight handshake
 	/// must be drivable on its own. It populates the peer certificate and sends
 	/// no application frame, and a repeat does nothing.
-	#[cfg(all(feature = "transport-policy", feature = "transport-ecies"))]
+	#[cfg(feature = "transport-ecies")]
 	#[tokio::test]
 	async fn handshake_completes_alone_and_populates_peer_certificate() -> TransportResult<()> {
 		let EncryptedTestServer { cert, config } = encrypted_test_server()?;
@@ -1671,7 +1612,7 @@ mod tests {
 	// Both endpoints bind the domain tag into the key exchange's associated
 	// data, so a server tag the client does not share fails the session
 	// before the first frame is answered.
-	#[cfg(all(feature = "transport-policy", feature = "transport-ecies"))]
+	#[cfg(feature = "transport-ecies")]
 	#[tokio::test]
 	async fn a_server_domain_tag_the_client_does_not_share_fails_the_session() -> TransportResult<()> {
 		let EncryptedTestServer { cert, config } = encrypted_test_server()?;
@@ -1697,7 +1638,7 @@ mod tests {
 		Ok(())
 	}
 
-	#[cfg(all(feature = "transport-policy", feature = "transport-ecies"))]
+	#[cfg(feature = "transport-ecies")]
 	#[tokio::test]
 	async fn endpoints_that_share_a_domain_tag_complete_the_session() -> TransportResult<()> {
 		const DOMAIN_TAG: &[u8] = b"tightbeam-test-other-domain";

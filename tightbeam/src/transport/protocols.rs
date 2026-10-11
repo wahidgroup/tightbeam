@@ -18,14 +18,8 @@ use crate::transport::framing::{FrameHeader, HeaderPrefix, LengthForm};
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 use crate::transport::TransportResult;
 
-#[cfg(feature = "x509")]
-mod x509 {
-	pub use crate::crypto::profiles::CryptoProvider;
-	pub use crate::transport::{EndpointConfig, TransportEncryptionConfig};
-}
-
-#[cfg(feature = "x509")]
-use x509::*;
+use crate::crypto::profiles::CryptoProvider;
+use crate::transport::{EndpointConfig, TransportEncryptionConfig};
 
 /// Marker trait for a protocol address, which an application may represent
 /// the way it wishes.
@@ -113,7 +107,6 @@ pub trait Protocol {
 }
 
 /// Protocol whose listeners bind with transport encryption.
-#[cfg(feature = "x509")]
 pub trait EncryptedProtocol: Protocol {
 	/// Encryptor the protocol's transports seal outbound envelopes with.
 	type Encryptor: Send;

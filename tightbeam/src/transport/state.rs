@@ -33,7 +33,6 @@ use crate::transport::handshake::negotiation::{TransportAuthorizer, TransportOff
 use crate::transport::handshake::receipt::{ReceiptApprover, SessionObserver};
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::transport::handshake::BoxedServerHandshake;
-#[cfg(feature = "aead")]
 use crate::transport::handshake::{EpochMaterials, EstablishedSession};
 
 /// Which wire mode a session is entitled to write, and the state backing it.
@@ -45,7 +44,6 @@ use crate::transport::handshake::{EpochMaterials, EstablishedSession};
 /// # Sources
 ///
 /// - CWE-311, missing encryption of sensitive data: <https://cwe.mitre.org/data/definitions/311.html>
-#[cfg(feature = "x509")]
 pub enum SessionPhase {
 	/// The endpoint carries no encryption provisioning and named cleartext,
 	/// so frames travel in the clear as a configured choice.
@@ -65,7 +63,6 @@ pub enum SessionPhase {
 	Encrypted(Box<EstablishedSession>),
 }
 
-#[cfg(feature = "x509")]
 impl SessionPhase {
 	/// The phase an endpoint provisioned with `encryption` starts in, and
 	/// returns to when its session breaks.
@@ -178,14 +175,12 @@ impl SessionPhase {
 /// [`SessionPhase::read_policy`] decides it for a session, and
 /// [`Self::established`] for a half split from an established one, so every
 /// reader runs under the same ceiling and the same deadline.
-#[cfg(feature = "x509")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReadPolicy {
 	cap: usize,
 	deadline: Option<MonotonicInstant>,
 }
 
-#[cfg(feature = "x509")]
 impl ReadPolicy {
 	/// The bounds of a read on an established session at `now`: it admits
 	/// `cap` and must finish within `operation_timeout`.
@@ -242,14 +237,12 @@ impl ReadPolicy {
 /// outside implementation could supply from anywhere. Each in-crate transport
 /// implements [`sealed::Sealed`] by name, and no blanket implementation
 /// exists, so those come from a handshake this crate ran.
-#[cfg(feature = "x509")]
 pub(crate) mod sealed {
 	/// Implemented by name for each in-crate transport.
 	pub trait Sealed {}
 }
 
 /// What can happen to a session, which is the alphabet the phase table reads.
-#[cfg(feature = "x509")]
 pub(crate) enum SessionEvent {
 	/// A handshake round starts at the given reading.
 	BeginHandshake(MonotonicInstant),
@@ -265,13 +258,11 @@ pub(crate) enum SessionEvent {
 /// endpoint starts in, and returns to on a reset, always follows from the
 /// provisioning it holds. Every move afterwards consults the transition table,
 /// so a session only ever sits in a phase that the table names.
-#[cfg(feature = "x509")]
 pub struct SessionState<P: CryptoProvider> {
 	encryption: EncryptionConfig<P>,
 	phase: SessionPhase,
 }
 
-#[cfg(feature = "x509")]
 impl<P: CryptoProvider> SessionState<P> {
 	/// A session for `encryption`, at the phase that provisioning starts in.
 	///
@@ -431,7 +422,6 @@ impl<P: CryptoProvider> SessionState<P> {
 	/// It is the only write into an installed session. Handing out the session
 	/// itself would let a caller swap the keys under a phase that already
 	/// reports the terms it agreed.
-	#[cfg(feature = "aead")]
 	pub fn take_epoch_materials(&mut self) -> Option<EpochMaterials> {
 		match &mut self.phase {
 			SessionPhase::Encrypted(session) => session.take_epoch(),
@@ -507,14 +497,12 @@ impl<P: CryptoProvider> SessionState<P> {
 ///
 /// The pair travels as one value, so a caller always hands over both. Both
 /// halves are `Arc`, so a clone of the pair is two refcount bumps.
-#[cfg(feature = "x509")]
 #[derive(Clone)]
 pub struct ClientIdentity<C: CryptoProvider = DefaultCryptoProvider> {
 	certificate: Arc<Certificate>,
 	key: Arc<HandshakeKeyManager<C>>,
 }
 
-#[cfg(feature = "x509")]
 impl<C: CryptoProvider> ClientIdentity<C> {
 	/// Bind a certificate to the handshake key that proves it.
 	pub fn new(certificate: Arc<Certificate>, key: Arc<HandshakeKeyManager<C>>) -> Self {
@@ -584,7 +572,6 @@ impl<C: CryptoProvider> ClientIdentity<C> {
 /// Provisioning is decided once, when the endpoint is built, so it travels as
 /// one value. A transport supplies it through a single accessor, so every
 /// field is present at once instead of each being asked for separately.
-#[cfg(feature = "x509")]
 #[non_exhaustive]
 #[derive(Clone)]
 pub struct EncryptionConfig<P: CryptoProvider> {
@@ -628,7 +615,6 @@ pub struct EncryptionConfig<P: CryptoProvider> {
 	pub(crate) allow_cleartext: bool,
 }
 
-#[cfg(feature = "x509")]
 impl<P: CryptoProvider> EncryptionConfig<P> {
 	/// Trust store that validates the peer's certificate.
 	pub fn trust_store(&self) -> Option<&Arc<dyn CertificateTrust>> {
@@ -741,7 +727,7 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 
 /// An endpoint that accepts handshakes, and so keeps the orchestrator driving
 /// the one in flight.
-#[cfg(all(feature = "x509", any(feature = "transport-cms", feature = "transport-ecies")))]
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 pub trait ServerHandshakeSlot: sealed::Sealed {
 	/// The orchestrator carrying this endpoint's in-flight server handshake.
 	///
@@ -754,11 +740,9 @@ pub trait ServerHandshakeSlot: sealed::Sealed {
 ///
 /// A transport is built only from this form, through [`SessionState::new`],
 /// so every installed provisioning has answered the dialer rule.
-#[cfg(feature = "x509")]
 #[derive(Clone)]
 pub struct DialableEncryption<P: CryptoProvider>(EncryptionConfig<P>);
 
-#[cfg(feature = "x509")]
 impl<P: CryptoProvider> DialableEncryption<P> {
 	/// Check `encryption` against the dialer rule.
 	///
@@ -827,7 +811,6 @@ impl<P: CryptoProvider> DialableEncryption<P> {
 ///     }
 /// }
 /// ```
-#[cfg(feature = "x509")]
 pub trait EncryptedProtocolState: sealed::Sealed {
 	/// Crypto provider bound to this transport.
 	type CryptoProvider: CryptoProvider + Send + Sync + 'static;
@@ -869,7 +852,6 @@ pub trait EncryptedProtocolState: sealed::Sealed {
 	/// # Errors
 	///
 	/// - [`TransportError::InvalidState`] -- the phase refused the install.
-	#[cfg(feature = "aead")]
 	fn install_established(&mut self, session: EstablishedSession) -> TransportResult<()> {
 		let encrypted_envelope = self.limits().encrypted_envelope;
 		if !self.session_state_mut().install_session(session, encrypted_envelope) {
@@ -900,7 +882,7 @@ pub trait EncryptedProtocolState: sealed::Sealed {
 	}
 }
 
-#[cfg(all(test, feature = "x509", feature = "aead"))]
+#[cfg(test)]
 mod tests {
 	use super::*;
 	use crate::constants::{DEFAULT_MAX_ENCRYPTED_ENVELOPE, DEFAULT_REKEY_RECORD_LIMIT};
@@ -910,7 +892,7 @@ mod tests {
 	use crate::testing::TestFrame;
 	use crate::utils::time::{Clock, ManualClock};
 
-	#[cfg(all(feature = "testing", feature = "secp256k1"))]
+	#[cfg(feature = "testing")]
 	use crate::testing::fixtures::{TestCertificate, TestKey};
 
 	/// Holds the phase the trait reads back.
@@ -1042,7 +1024,7 @@ mod tests {
 	// The cases check every event a session can raise from every phase it can
 	// sit in against the table. `SessionState::apply` is the only writer of
 	// the phase, so a pair the table omits is a move no caller can make.
-	#[cfg(all(feature = "testing", feature = "secp256k1"))]
+	#[cfg(feature = "testing")]
 	crate::tb_cases! {
 		fn the_phase_table((phase, event, admitted, landing): (&str, &str, bool, &str)) {
 			let mut state = SessionState::at(provisioned_encryption(), phase_named(phase));
@@ -1069,7 +1051,7 @@ mod tests {
 		}
 	}
 
-	#[cfg(all(feature = "testing", feature = "secp256k1"))]
+	#[cfg(feature = "testing")]
 	fn phase_named(name: &str) -> SessionPhase {
 		match name {
 			"cleartext" => SessionPhase::Cleartext,
@@ -1079,7 +1061,7 @@ mod tests {
 		}
 	}
 
-	#[cfg(all(feature = "testing", feature = "secp256k1"))]
+	#[cfg(feature = "testing")]
 	fn event_named(name: &str) -> SessionEvent {
 		match name {
 			"begin" => SessionEvent::BeginHandshake(ManualClock::default().monotonic()),
@@ -1186,11 +1168,7 @@ mod tests {
 
 	/// Detaching the established session returns its keys and leaves the
 	/// state at its start, through the same table every other move takes.
-	#[cfg(all(
-		feature = "testing",
-		feature = "secp256k1",
-		any(feature = "tokio", feature = "async-transport")
-	))]
+	#[cfg(all(feature = "testing", any(feature = "tokio", feature = "async-transport")))]
 	#[test]
 	fn detaching_a_session_takes_its_keys_and_returns_to_the_start() -> TransportResult<()> {
 		let mut probe = PhaseProbe::provisioned(handshaking());
@@ -1218,7 +1196,7 @@ mod tests {
 
 	/// Restarting a handshake under a live session would drop its keys, so the
 	/// table refuses the move and the session survives it.
-	#[cfg(all(feature = "testing", feature = "secp256k1"))]
+	#[cfg(feature = "testing")]
 	#[test]
 	fn the_phase_table_refuses_restarting_a_handshake_on_a_live_session() -> TransportResult<()> {
 		let mut probe = PhaseProbe::provisioned(handshaking());
@@ -1232,7 +1210,7 @@ mod tests {
 
 	/// An established session admits nothing cleartext, so an injected
 	/// handshake container cannot draw a cleartext reply out of it (CWE-319).
-	#[cfg(all(feature = "testing", feature = "secp256k1"))]
+	#[cfg(feature = "testing")]
 	#[test]
 	fn an_established_session_reads_only_encrypted() -> TransportResult<()> {
 		let mut probe = PhaseProbe::provisioned(handshaking());
@@ -1242,7 +1220,7 @@ mod tests {
 	}
 
 	/// A completed handshake and the terms it agreed enter the phase together.
-	#[cfg(all(feature = "testing", feature = "secp256k1"))]
+	#[cfg(feature = "testing")]
 	#[test]
 	fn installing_a_session_lands_every_term_it_agreed() -> TransportResult<()> {
 		let mut probe = PhaseProbe::provisioned(handshaking());
@@ -1258,7 +1236,7 @@ mod tests {
 	/// encrypted-envelope ceiling, so a doubled ceiling halves the send record
 	/// limit (RFC 9846 § 5.5). The receive cipher keeps its fixed record
 	/// limit, because it bounds the volume by the bytes it opens.
-	#[cfg(all(feature = "testing", feature = "secp256k1"))]
+	#[cfg(feature = "testing")]
 	#[test]
 	fn installing_a_session_bounds_its_send_cipher_by_the_envelope_ceiling() -> TransportResult<()> {
 		let mut probe = PhaseProbe::provisioned(handshaking());
@@ -1274,7 +1252,7 @@ mod tests {
 
 	/// The circuit breaker drops the session whole. A previous session's peer
 	/// identity must not stay readable, because authorization reads it.
-	#[cfg(all(feature = "testing", feature = "secp256k1"))]
+	#[cfg(feature = "testing")]
 	#[test]
 	fn a_reset_drops_the_peer_the_dead_session_established() -> TransportResult<()> {
 		let mut probe = PhaseProbe::provisioned(handshaking());
@@ -1287,11 +1265,7 @@ mod tests {
 	}
 
 	/// Splitting takes the keys out, and the state left behind holds none.
-	#[cfg(all(
-		feature = "testing",
-		feature = "secp256k1",
-		any(feature = "tokio", feature = "async-transport")
-	))]
+	#[cfg(all(feature = "testing", any(feature = "tokio", feature = "async-transport")))]
 	#[test]
 	fn taking_the_established_session_returns_the_state_to_its_start() -> TransportResult<()> {
 		let mut probe = PhaseProbe::provisioned(handshaking());
@@ -1303,7 +1277,7 @@ mod tests {
 	}
 
 	/// A completed session carrying a peer identity, which authorization reads.
-	#[cfg(all(feature = "testing", feature = "secp256k1"))]
+	#[cfg(feature = "testing")]
 	fn established_session() -> EstablishedSession {
 		use crate::crypto::aead::{Aes256Gcm, DirectionalCiphers, KeyInit};
 
@@ -1315,7 +1289,7 @@ mod tests {
 		EstablishedSession::new(keys, None, None, Some(Arc::new(fixture_certificate())), None)
 	}
 
-	#[cfg(all(feature = "testing", feature = "secp256k1"))]
+	#[cfg(feature = "testing")]
 	fn fixture_certificate() -> Certificate {
 		TestCertificate::self_signed(&TestKey::insecure_fixed_signing())
 	}

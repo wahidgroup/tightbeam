@@ -40,7 +40,6 @@ use crate::instrumentation::events;
 use crate::transport::rekey::ClientRekeyExchange;
 
 /// One unit of writer work, resolved by [`MuxWriterDriver::poll_step`].
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 enum WriterStep {
 	/// A command from the outbound queue.
 	Command(Outbound),
@@ -377,6 +376,7 @@ impl MuxShared {
 	/// is held, so concurrent triggers collapse to a single `RekeyRequest`. A
 	/// contended exchange means a renewal is already in progress, so opening
 	/// is moot and the call returns `None`.
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	pub(crate) fn open_renewal(
 		&self,
 		exchange: &FuturesMutex<Box<dyn ClientRekeyExchange>>,

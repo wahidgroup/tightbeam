@@ -44,7 +44,7 @@
 //! [rfc9113-5.1.1]: https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.1
 //! [rfc9113-5.1.2]: https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.2
 
-#[cfg(all(feature = "x509", any(feature = "tokio", feature = "async-transport")))]
+#[cfg(any(feature = "tokio", feature = "async-transport"))]
 mod router;
 #[cfg(pooled_mux)]
 mod service;
@@ -58,12 +58,11 @@ use crate::transport::TransportResult;
 use crate::utils::marker::MaybeSend;
 use crate::Frame;
 
-#[cfg(feature = "x509")]
 use crate::x509::Certificate;
 
-#[cfg(all(feature = "x509", any(feature = "tokio", feature = "async-transport")))]
+#[cfg(any(feature = "tokio", feature = "async-transport"))]
 use crate::constants::DEFAULT_HOP_BUDGET;
-#[cfg(all(feature = "x509", any(feature = "tokio", feature = "async-transport")))]
+#[cfg(any(feature = "tokio", feature = "async-transport"))]
 use crate::utils::urn::Urn;
 
 /// Converts a caller-owned or already-shared mux offer into a shared handle.
@@ -112,9 +111,7 @@ impl IntoMuxOffer for Option<&Arc<TransportOffer>> {
 	}
 }
 
-#[cfg(feature = "transport-policy")]
 use crate::policy::GatePolicy;
-#[cfg(feature = "transport-policy")]
 use crate::policy::SessionContext;
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::transport::handshake::receipt::{ReceiptSigner, StoredReceipt};
@@ -127,9 +124,9 @@ use crate::transport::state::EncryptedProtocolState;
 #[cfg(pooled_mux)]
 use service::GatedService;
 
-#[cfg(all(feature = "x509", feature = "tokio"))]
+#[cfg(feature = "tokio")]
 pub use router::SpawnedMux;
-#[cfg(all(feature = "x509", any(feature = "tokio", feature = "async-transport")))]
+#[cfg(any(feature = "tokio", feature = "async-transport"))]
 pub use router::{
 	BufferedGrantor, CreditGrantor, MuxDispatch, MuxHandle, MuxReaderDriver, MuxResponder, MuxTransport,
 	MuxWriterDriver, ReplySink, RequestSink, StreamBody,
@@ -147,7 +144,7 @@ pub use service::{CallContext, MuxService};
 ///   `open_duplex_to` entry points, which name a servlet type URN the same way
 ///   a unary routed call names its target.
 /// - A served handler reads the route it received through [`CallContext`].
-#[cfg(all(feature = "x509", any(feature = "tokio", feature = "async-transport")))]
+#[cfg(any(feature = "tokio", feature = "async-transport"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamRoute {
 	target: Option<Urn<'static>>,
@@ -157,14 +154,14 @@ pub struct StreamRoute {
 /// The default route is unrouted and carries the origin relay budget, so DER
 /// omits both fields. An open stamped with it encodes the same as an unrouted
 /// local open, so the routed and unrouted open paths share one wire shape.
-#[cfg(all(feature = "x509", any(feature = "tokio", feature = "async-transport")))]
+#[cfg(any(feature = "tokio", feature = "async-transport"))]
 impl Default for StreamRoute {
 	fn default() -> Self {
 		Self { target: None, hops_remaining: DEFAULT_HOP_BUDGET }
 	}
 }
 
-#[cfg(all(feature = "x509", any(feature = "tokio", feature = "async-transport")))]
+#[cfg(any(feature = "tokio", feature = "async-transport"))]
 impl StreamRoute {
 	/// The route of an unrouted local stream, which the responder dispatches by
 	/// its own resolved address. DER omits both route fields from the Open.
@@ -286,7 +283,7 @@ pub enum MuxRole {
 	Server,
 }
 
-#[cfg(all(feature = "x509", any(feature = "tokio", feature = "async-transport")))]
+#[cfg(any(feature = "tokio", feature = "async-transport"))]
 impl MuxRole {
 	const fn first_local_stream_id(self) -> u32 {
 		match self {
@@ -385,7 +382,6 @@ impl MuxRekeyContext {
 	/// [`MuxTransport::with_rekey`]: crate::transport::multiplex::MuxTransport::with_rekey
 	/// [`MuxConnector::take_rekey`]: crate::transport::multiplex::MuxConnector::take_rekey
 	/// [`MuxAcceptor::take_rekey`]: crate::transport::multiplex::MuxAcceptor::take_rekey
-	#[cfg(feature = "x509")]
 	pub(crate) fn detach<T, P>(state: &mut T, role: MuxRole) -> TransportResult<Option<Self>>
 	where
 		T: EncryptedProtocolState<CryptoProvider = P>,
@@ -469,7 +465,6 @@ pub trait MuxConnector: MuxCapable {
 	/// the connection pool reads peer identity here first and shares it
 	/// with every lease. A transport without encryption material answers
 	/// `None`, and identity-gating callers MUST fail closed on `None`.
-	#[cfg(feature = "x509")]
 	fn handshake_peer_certificate(&self) -> Option<Arc<Certificate>>;
 
 	/// Split into envelope halves for the mux drivers.
@@ -477,7 +472,6 @@ pub trait MuxConnector: MuxCapable {
 }
 
 /// Collector gate plus envelope halves of a consumed [`MuxAcceptor`].
-#[cfg(feature = "transport-policy")]
 pub type GatedHalves<T> = (
 	Box<dyn GatePolicy>,
 	(<T as MuxAcceptor>::EnvelopeReader, <T as MuxAcceptor>::EnvelopeWriter),
@@ -506,7 +500,6 @@ pub trait MuxAcceptor: MuxCapable {
 
 	/// Authenticated peer context of the completed handshake, snapshotted
 	/// before the transport splits. The default is empty.
-	#[cfg(feature = "transport-policy")]
 	fn session_context(&self) -> SessionContext {
 		SessionContext::default()
 	}
@@ -515,7 +508,6 @@ pub trait MuxAcceptor: MuxCapable {
 	///
 	/// The gate moves to the mux responder and the transport ceases to exist,
 	/// so a live collector holds its real gate and never a placeholder.
-	#[cfg(feature = "transport-policy")]
 	fn into_gated_halves(self) -> TransportResult<GatedHalves<Self>>;
 
 	/// Consume the transport into its raw envelope halves alone, for the mux
@@ -567,7 +559,7 @@ pub trait MuxAcceptor: MuxCapable {
 /// The extension is a separate trait because the concrete sink and body types
 /// live in the router plane, and so that a unary caller depends on the base
 /// trait alone.
-#[cfg(all(feature = "x509", any(feature = "tokio", feature = "async-transport")))]
+#[cfg(any(feature = "tokio", feature = "async-transport"))]
 pub trait StreamingProtocol: MultiplexedProtocol {
 	/// Open a streamed request. The caller pushes chunks through the sink and
 	/// then awaits the unary response. Dropping either side cancels the stream.

@@ -18,12 +18,10 @@ use crate::transport::handshake::error::HandshakeError;
 ///
 /// The processor is algorithm-agnostic and works with any verifier that
 /// implements the `SignatureVerifier` trait.
-#[cfg(feature = "signature")]
 pub struct TightBeamSignedDataProcessor {
 	verifier: Box<dyn SignatureVerifier>,
 }
 
-#[cfg(feature = "signature")]
 impl TightBeamSignedDataProcessor {
 	/// Create a new SignedData processor.
 	///
@@ -94,7 +92,6 @@ impl TightBeamSignedDataProcessor {
 mod tests {
 	use super::*;
 
-	#[cfg(all(feature = "signature", feature = "secp256k1", feature = "sha3"))]
 	mod signed_data {
 		use super::*;
 		use crate::crypto::hash::Sha3_256;

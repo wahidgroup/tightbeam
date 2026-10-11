@@ -14,9 +14,8 @@ compile_error!(
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
-#[cfg(all(feature = "x509", not(feature = "std")))]
+#[cfg(not(feature = "std"))]
 use alloc::sync::Arc;
-#[cfg(feature = "x509")]
 use core::time::Duration;
 #[cfg(feature = "std")]
 use std::sync::Arc;
@@ -38,7 +37,6 @@ pub mod accept;
 pub(crate) mod framing;
 #[cfg(feature = "transport-multiplex")]
 pub mod multiplex;
-#[cfg(feature = "transport-policy")]
 pub mod policy;
 #[cfg(all(
 	feature = "transport-multiplex",
@@ -58,13 +56,10 @@ pub use protocols::{
 	AsyncListenerTrait, EncryptedProtocol, PersistentConnection, Protocol, ProtocolStream, TightBeamAddress,
 };
 
-#[cfg(feature = "builder")]
 pub use client::{ClientBuilder, ClientPolicies};
 #[cfg(feature = "std")]
 pub use client::{ConnectionBuilder, ConnectionPool, PoolConfig, PooledClient};
-#[cfg(feature = "transport-policy")]
 pub use messaging::GateAudit;
-#[cfg(feature = "transport-policy")]
 pub use messaging::MessageEmitter;
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 pub use protocols::{
@@ -75,29 +70,23 @@ pub use protocols::{
 pub use tcp::r#async::TcpTransport;
 #[cfg(all(feature = "tcp", feature = "tokio"))]
 pub use tcp::r#async::TokioListener;
-#[cfg(all(any(feature = "tokio", feature = "async-transport"), feature = "x509"))]
+#[cfg(any(feature = "tokio", feature = "async-transport"))]
 pub use tcp::r#async::{TransportReader, TransportWriter};
 
 /// Transport-agnostic result type.
 pub type TransportResult<T> = Result<T, TransportError>;
 
-#[cfg(feature = "x509")]
-mod x509 {
-	pub use crate::crypto::profiles::CryptoProvider;
-	pub use crate::crypto::x509::policy::CertificateValidation;
-	pub use crate::transport::handshake::PeerAuthentication;
-	pub use crate::transport::state::{DialableEncryption, EncryptionConfig};
-	pub use crate::utils::time::Clock;
-	pub use crate::x509::Certificate;
+use crate::crypto::profiles::CryptoProvider;
+use crate::crypto::x509::policy::CertificateValidation;
+use crate::transport::handshake::PeerAuthentication;
+use crate::transport::state::{DialableEncryption, EncryptionConfig};
+use crate::utils::time::Clock;
+use crate::x509::Certificate;
 
-	#[cfg(feature = "instrument")]
-	pub use crate::trace::TraceCollector;
-	#[cfg(host_clock)]
-	pub use crate::utils::time::SystemClock;
-}
-
-#[cfg(feature = "x509")]
-use x509::*;
+#[cfg(feature = "instrument")]
+use crate::trace::TraceCollector;
+#[cfg(host_clock)]
+use crate::utils::time::SystemClock;
 
 use crate::constants::{
 	DEFAULT_HANDSHAKE_MAX_WIRE, DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_MAX_CLEARTEXT_ENVELOPE,
@@ -154,7 +143,6 @@ impl Default for TransportLimits {
 	}
 }
 
-#[cfg(feature = "x509")]
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct TransportEncryptionConfig<P: CryptoProvider> {
@@ -170,7 +158,6 @@ pub struct TransportEncryptionConfig<P: CryptoProvider> {
 	pub(crate) limits: TransportLimits,
 }
 
-#[cfg(feature = "x509")]
 impl<P: CryptoProvider> From<TransportEncryptionConfig<P>> for DialableEncryption<P> {
 	/// The one place a server's configuration becomes provisioning.
 	///
@@ -197,7 +184,6 @@ impl<P: CryptoProvider> From<TransportEncryptionConfig<P>> for DialableEncryptio
 /// Listeners, clients, and pools each build one of these, and every transport
 /// constructor takes it whole, so no transport exists without all three. A
 /// clone bumps refcounts and copies no certificate.
-#[cfg(feature = "x509")]
 pub struct EndpointConfig<P: CryptoProvider> {
 	pub(crate) encryption: DialableEncryption<P>,
 	pub(crate) limits: TransportLimits,
@@ -206,7 +192,6 @@ pub struct EndpointConfig<P: CryptoProvider> {
 	pub(crate) trace: Option<TraceCollector>,
 }
 
-#[cfg(feature = "x509")]
 impl<P: CryptoProvider> EndpointConfig<P> {
 	/// Returns an endpoint for `encryption` that measures time against `clock`,
 	/// with the default ceilings.
@@ -263,7 +248,6 @@ impl<P: CryptoProvider> EndpointConfig<P> {
 	}
 }
 
-#[cfg(feature = "x509")]
 impl<P: CryptoProvider> Clone for EndpointConfig<P> {
 	fn clone(&self) -> Self {
 		Self {
@@ -278,7 +262,7 @@ impl<P: CryptoProvider> Clone for EndpointConfig<P> {
 
 /// A server endpoint on the operating system's clocks, enforcing the
 /// ceilings `config` names.
-#[cfg(all(feature = "x509", host_clock))]
+#[cfg(host_clock)]
 impl<P: CryptoProvider> From<TransportEncryptionConfig<P>> for EndpointConfig<P> {
 	fn from(config: TransportEncryptionConfig<P>) -> Self {
 		let limits = config.limits;
@@ -287,7 +271,6 @@ impl<P: CryptoProvider> From<TransportEncryptionConfig<P>> for EndpointConfig<P>
 	}
 }
 
-#[cfg(feature = "x509")]
 impl<P: CryptoProvider> TransportEncryptionConfig<P> {
 	/// Create a server configuration from its certificate and key manager.
 	///
@@ -370,7 +353,7 @@ mod tests {
 
 	/// An empty validator set demands nothing, so it leaves an endpoint that
 	/// already demands mutual authentication where it was.
-	#[cfg(all(feature = "testing", feature = "secp256k1"))]
+	#[cfg(feature = "testing")]
 	#[test]
 	fn an_empty_validator_set_keeps_the_configured_authentication() {
 		use crate::crypto::profiles::DefaultCryptoProvider;
@@ -469,7 +452,6 @@ mod tests {
 	/// still be refused. The AEAD tag, the nonce, and the `WireEnvelope`
 	/// wrapper are all added after encoding, so a measurement before them would
 	/// let an oversized envelope reach the peer as a connection reset.
-	#[cfg(feature = "aes-gcm")]
 	#[test]
 	fn encrypted_ceiling_measures_the_sealed_wire_form() -> Result<(), Box<dyn Error>> {
 		use crate::crypto::aead::{Aes256Gcm, KeyInit, RuntimeAead, SendCipher};
@@ -494,7 +476,6 @@ mod tests {
 		Ok(())
 	}
 
-	#[cfg(feature = "aes-gcm")]
 	#[test]
 	fn test_envelope_builder_encrypted_limit_returns_message() -> Result<(), Box<dyn Error>> {
 		use crate::crypto::aead::{Aes256Gcm, KeyInit, RuntimeAead, SendCipher};

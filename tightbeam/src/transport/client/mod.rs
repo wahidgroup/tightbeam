@@ -5,12 +5,10 @@ use crate::transport::{MessageEmitter, Protocol, TransportResult};
 
 pub mod macros;
 
-#[cfg(feature = "builder")]
 pub mod builder;
 #[cfg(feature = "std")]
 pub mod pool;
 
-#[cfg(feature = "builder")]
 pub use builder::{ClientBuilder, ClientPolicies};
 #[cfg(feature = "std")]
 pub use pool::{ConnectionBuilder, ConnectionPool, PoolConfig, PooledClient};

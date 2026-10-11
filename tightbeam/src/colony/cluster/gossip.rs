@@ -186,14 +186,6 @@ impl AdmittedGossip {
 		&self.payload
 	}
 
-	/// Consume the admission and yield the owned payload.
-	///
-	/// The admission owns the bytes, so the handoff is a move.
-	#[must_use]
-	pub fn into_payload(self) -> Vec<u8> {
-		self.payload
-	}
-
 	/// How the origin intends this rumor to be consumed.
 	#[must_use]
 	pub fn kind(&self) -> GossipRumorKind {
@@ -900,14 +892,6 @@ mod tests {
 		let admitted = AdmittedGossip::admit::<Sha3_256>(&frame, 4, WINDOW, T0)?;
 		assert_eq!(admitted.digest(), digest(&frame));
 		assert_eq!(admitted.payload(), &[1, 2, 3]);
-		Ok(())
-	}
-
-	#[test]
-	fn into_payload_yields_the_admitted_body() -> Result<(), TransitStatus> {
-		let frame = rumor(1_000, vec![1, 2, 3]);
-		let admitted = AdmittedGossip::admit::<Sha3_256>(&frame, 4, WINDOW, T0)?;
-		assert_eq!(admitted.into_payload(), vec![1, 2, 3]);
 		Ok(())
 	}
 

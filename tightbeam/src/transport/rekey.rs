@@ -649,7 +649,7 @@ impl RekeyDriver {
 	}
 }
 
-#[cfg(all(test, feature = "secp256k1", feature = "aes-gcm"))]
+#[cfg(test)]
 pub(crate) mod tests {
 	use super::*;
 	use crate::asn1::{AlgorithmIdentifier, DigestInfo};

@@ -4,7 +4,7 @@
 
 use super::body::ForwardedStream;
 use super::link::MuxLink;
-use super::shared::{BudgetStanding, MuxShared, OpenRequest, StreamReservation};
+use super::shared::{BudgetStanding, OpenRequest, StreamReservation};
 use crate::transport::envelopes::{GoAwayReason, MuxDataPackage, MuxStreamKind, TransportEnvelope};
 use crate::transport::TransportResult;
 use crate::utils::urn::Urn;
@@ -266,8 +266,6 @@ impl ReplySink {
 	}
 }
 
-impl MuxShared {}
-
 #[cfg(test)]
 mod tests {
 	use core::task::Poll;
@@ -276,6 +274,7 @@ mod tests {
 	use futures::channel::{mpsc, oneshot};
 
 	use super::super::outbound::Outbound;
+	use super::super::shared::MuxShared;
 	use super::super::shared::StreamOutcome;
 	use super::super::testing::{client_shared, poll_now};
 	use super::*;

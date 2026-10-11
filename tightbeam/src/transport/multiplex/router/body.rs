@@ -13,6 +13,7 @@ use futures::Stream;
 
 use super::handle::CancelOnDrop;
 use super::shared::OpenSlot;
+#[cfg(feature = "colony")]
 use super::sink::RequestSink;
 use crate::der::Decode;
 use crate::transport::{TransportError, TransportResult};
@@ -112,6 +113,7 @@ impl StreamBody {
 	/// # Errors
 	///
 	/// Returns the first read or push failure and leaves the sink unclosed.
+	#[cfg(feature = "colony")]
 	pub(crate) async fn drain_into(mut self, mut sink: RequestSink) -> TransportResult<()> {
 		while let Some(chunk) = self.chunk().await? {
 			sink.push(&chunk).await?;

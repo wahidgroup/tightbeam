@@ -108,17 +108,11 @@ mod owners;
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 pub(crate) use owners::{CountersignedReceipt, IssuedReceipt, PendingReceipt};
 
-#[cfg(feature = "x509")]
-mod x509 {
-	pub(crate) use crate::transport::handshake::Arc;
-	pub use crate::x509::Certificate;
+use crate::transport::handshake::Arc;
+use crate::x509::Certificate;
 
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-	pub use crate::transport::handshake::negotiation::TransportAuthorizer;
-}
-
-#[cfg(feature = "x509")]
-use x509::*;
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::transport::handshake::negotiation::TransportAuthorizer;
 
 /// Session agreement body the server issues for every budget-bearing
 /// session.
@@ -209,7 +203,7 @@ where
 }
 
 /// An attribute under `oid` whose value SET holds `value` alone.
-#[cfg(all(feature = "x509", any(feature = "transport-cms", feature = "transport-ecies")))]
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 fn single_valued(oid: ObjectIdentifier, value: Any) -> Result<Attribute, HandshakeError> {
 	let values = SetOfVec::try_from(vec![value])?;
 	let attribute = Attribute { oid, values };
@@ -579,7 +573,6 @@ pub trait ReceiptApprover: MaybeSend + MaybeSync {
 
 /// Terminal verdict of a budget-bearing session's receipt lifecycle,
 /// as the server observed it.
-#[cfg(feature = "x509")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionVerdict {
 	/// The countersignature verified and settlement succeeded, so the
@@ -612,7 +605,6 @@ pub enum SessionVerdict {
 /// The receipt body pins the transcript hash, and through it the identities
 /// and the negotiation. With the peer certificates, a third party can verify
 /// the record without replaying the handshake.
-#[cfg(feature = "x509")]
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct SessionOutcome {
@@ -640,7 +632,6 @@ pub struct SessionOutcome {
 	pub verdict: SessionVerdict,
 }
 
-#[cfg(feature = "x509")]
 impl fmt::Debug for SessionOutcome {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.debug_struct("SessionOutcome")
@@ -667,7 +658,6 @@ impl fmt::Debug for SessionOutcome {
 ///   library deadline**. Keep the hook fast or bound it.
 /// - The outcome is borrowed, so call `to_owned` on what you retain.
 /// - Stamp your own clock, and persist to your own ledger for your dispute window.
-#[cfg(feature = "x509")]
 pub trait SessionObserver: MaybeSend + MaybeSync {
 	/// Observe a terminal receipt outcome.
 	fn on_outcome<'a>(&'a self, outcome: &'a SessionOutcome) -> MaybeSendFuture<'a, ()>;
@@ -688,7 +678,7 @@ where
 	answer.filter(|bytes| !bytes.as_ref().is_empty())
 }
 
-#[cfg(all(feature = "x509", any(feature = "transport-cms", feature = "transport-ecies")))]
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 impl SessionOutcome {
 	/// Report this outcome to `observer`, then resolve its verdict.
 	///
@@ -1084,9 +1074,9 @@ mod tests {
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	use crate::crypto::hash::Sha3_256;
 
-	#[cfg(all(not(feature = "std"), feature = "transport-ecies", feature = "secp256k1"))]
+	#[cfg(all(not(feature = "std"), feature = "transport-ecies"))]
 	use alloc::format;
-	#[cfg(all(feature = "std", feature = "transport-ecies", feature = "secp256k1"))]
+	#[cfg(all(feature = "std", feature = "transport-ecies"))]
 	use std::format;
 
 	const SAMPLE_TRANSCRIPT: [u8; 32] = [7u8; 32];
@@ -1199,7 +1189,7 @@ mod tests {
 		}
 	}
 
-	#[cfg(all(feature = "transport-ecies", feature = "secp256k1"))]
+	#[cfg(feature = "transport-ecies")]
 	mod artifact {
 		use super::*;
 		use crate::crypto::key::Secp256k1KeyProvider;
@@ -1340,7 +1330,6 @@ mod tests {
 
 		// A tampered acknowledgement is a verdict instead of an early error,
 		// so the invalid attempt must surface as settleable evidence.
-		#[cfg(feature = "x509")]
 		#[tokio::test]
 		async fn tampered_ack_settles_as_invalid_verdict() -> Result<(), HandshakeError> {
 			let (receipt, _, _) = server_signed(None).await?;
@@ -1362,7 +1351,6 @@ mod tests {
 
 		/// `ack` with a second value on its answer attribute, a shape only the
 		/// peer can produce.
-		#[cfg(feature = "x509")]
 		fn with_two_answer_values(ack: &mut SignerInfo) {
 			let attributes = ack.signed_attrs.take().expect("a countersignature carries signed attributes");
 			let other = OctetString::new(b"other".as_slice()).expect("short octets encode");
@@ -1381,7 +1369,6 @@ mod tests {
 			ack.signed_attrs = Some(SetOfVec::try_from(rebuilt).expect("the attribute set stays distinct"));
 		}
 
-		#[cfg(feature = "x509")]
 		#[tokio::test]
 		async fn a_malformed_answer_settles_as_invalid_verdict() -> Result<(), HandshakeError> {
 			let (receipt, _, _) = server_signed(None).await?;

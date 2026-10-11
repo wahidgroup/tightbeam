@@ -27,7 +27,6 @@ use crate::transport::TransportResult;
 use crate::utils::marker::MaybeSend;
 use crate::utils::time::Clock;
 
-#[cfg(feature = "aead")]
 use crate::crypto::aead::{RecvCipher, SendCipher};
 #[cfg(host_clock)]
 use crate::utils::time::SystemClock;
@@ -58,52 +57,46 @@ mod deadline {
 ))]
 use deadline::*;
 
-#[cfg(feature = "x509")]
-mod x509 {
-	pub use crate::crypto::aead::DecryptContent;
-	pub use crate::transport::builders::EnvelopeBuilder;
-	pub use crate::transport::state::EncryptedProtocolState;
+use crate::crypto::aead::DecryptContent;
+use crate::transport::builders::EnvelopeBuilder;
+use crate::transport::state::EncryptedProtocolState;
 
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-	pub use crate::transport::state::ServerHandshakeSlot;
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::transport::state::ServerHandshakeSlot;
 
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-	mod handshake {
-		pub use crate::transport::error::TransportFailure;
-		pub use crate::transport::handshake::negotiation::RunnableProfile;
-		pub(crate) use crate::transport::handshake::ServerFlow;
-		pub use crate::transport::handshake::{
-			BoxedClientHandshake, BoxedServerHandshake, ClientConfig, ClientHandshakeProtocol, Handshake,
-			HandshakeError, HandshakeMessage, HandshakeProtocolKind, HandshakeProvider, ServerConfig,
-			ServerHandshakeProtocol, SupportedProfiles,
-		};
-		pub use crate::transport::state::SessionPhase;
-	}
-
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-	pub use handshake::*;
-
-	#[cfg(feature = "transport-ecies")]
-	mod ecies {
-		pub use crate::crypto::x509::policy::CertificateValidation;
-		pub use crate::transport::handshake::{Ecies, EciesClientSettings, EciesServerSettings, LearnedTrust};
-	}
-
-	#[cfg(feature = "transport-ecies")]
-	pub use ecies::*;
-
-	#[cfg(feature = "transport-cms")]
-	mod cms {
-		pub use crate::transport::handshake::negotiation::SecurityOffer;
-		pub use crate::transport::handshake::{Cms, CmsClientSettings, CmsServerSettings, ProvisionedTrust};
-	}
-
-	#[cfg(feature = "transport-cms")]
-	pub use cms::*;
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+mod handshake {
+	pub use crate::transport::error::TransportFailure;
+	pub use crate::transport::handshake::negotiation::RunnableProfile;
+	pub(crate) use crate::transport::handshake::ServerFlow;
+	pub use crate::transport::handshake::{
+		BoxedClientHandshake, BoxedServerHandshake, ClientConfig, ClientHandshakeProtocol, Handshake, HandshakeError,
+		HandshakeMessage, HandshakeProtocolKind, HandshakeProvider, ServerConfig, ServerHandshakeProtocol,
+		SupportedProfiles,
+	};
+	pub use crate::transport::state::SessionPhase;
 }
 
-#[cfg(feature = "x509")]
-use x509::*;
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use handshake::*;
+
+#[cfg(feature = "transport-ecies")]
+mod ecies {
+	pub use crate::crypto::x509::policy::CertificateValidation;
+	pub use crate::transport::handshake::{Ecies, EciesClientSettings, EciesServerSettings, LearnedTrust};
+}
+
+#[cfg(feature = "transport-ecies")]
+use ecies::*;
+
+#[cfg(feature = "transport-cms")]
+mod cms {
+	pub use crate::transport::handshake::negotiation::SecurityOffer;
+	pub use crate::transport::handshake::{Cms, CmsClientSettings, CmsServerSettings, ProvisionedTrust};
+}
+
+#[cfg(feature = "transport-cms")]
+use cms::*;
 
 /// Receive side of a split envelope link.
 ///
@@ -141,7 +134,6 @@ pub trait EnvelopeSource: MaybeSend {
 	/// - [`TransportError::MissingEncryption`] -- the default, on a link without keys.
 	///
 	/// [rfc9846-4.7.3]: https://datatracker.ietf.org/doc/html/rfc9846#section-4.7.3
-	#[cfg(feature = "aead")]
 	fn install_recv_cipher(&mut self, _cipher: RecvCipher) -> TransportResult<()> {
 		Err(TransportError::MissingEncryption)
 	}
@@ -181,7 +173,6 @@ pub trait EnvelopeSink: MaybeSend {
 	/// - [`TransportError::MissingEncryption`] -- the default, on a link without keys.
 	///
 	/// [rfc9846-4.7.3]: https://datatracker.ietf.org/doc/html/rfc9846#section-4.7.3
-	#[cfg(feature = "aead")]
 	fn install_send_cipher(&mut self, _cipher: SendCipher) -> TransportResult<()> {
 		Err(TransportError::MissingEncryption)
 	}
@@ -307,10 +298,7 @@ pub trait MessageIO {
 }
 
 /// Outcome of one protocol-agnostic collector step.
-#[cfg(all(
-	feature = "transport-policy",
-	any(feature = "transport-cms", feature = "transport-ecies")
-))]
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 pub enum CollectStep {
 	/// The step read a cleartext handshake container for the server-side
 	/// dispatcher, decoded once with the bytes it arrived as.
@@ -321,7 +309,6 @@ pub enum CollectStep {
 }
 
 /// Message I/O with session encryption and the handshake drivers.
-#[cfg(feature = "x509")]
 pub trait EncryptedMessageIO: MessageIO {
 	/// Read one wire envelope, enforce size ceilings, and classify it.
 	///
@@ -340,10 +327,7 @@ pub trait EncryptedMessageIO: MessageIO {
 	///   [`TransportFailure::EncryptionFailed`] -- an encrypted envelope came
 	///   before encryption or did not decrypt, and the session was reset.
 	/// - The read, decode, and handshake-container conversion failures.
-	#[cfg(all(
-		feature = "transport-policy",
-		any(feature = "transport-cms", feature = "transport-ecies")
-	))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	#[allow(async_fn_in_trait)]
 	async fn collect_step(&mut self) -> TransportResult<CollectStep>
 	where
@@ -916,7 +900,6 @@ pub trait EncryptedMessageIO: MessageIO {
 	/// - The [`wrap_and_encrypt_message`](Self::wrap_and_encrypt_message),
 	///   [`read_session_bytes`](Self::read_session_bytes), and
 	///   [`decrypt_response`](Self::decrypt_response) sets.
-	#[cfg(feature = "x509")]
 	#[allow(async_fn_in_trait)]
 	async fn perform_emit_cycle(
 		&mut self,
@@ -968,8 +951,9 @@ impl TransportEnvelope {
 		match self {
 			TransportEnvelope::Request(msg) => Ok(msg.message),
 			TransportEnvelope::Response(_) => Err(TransportError::InvalidMessage),
-			#[cfg(feature = "x509")]
-			TransportEnvelope::EnvelopedData(_) | TransportEnvelope::SignedData(_) => Err(TransportError::InvalidMessage),
+			TransportEnvelope::EnvelopedData(_) | TransportEnvelope::SignedData(_) => {
+				Err(TransportError::InvalidMessage)
+			}
 			#[cfg(feature = "transport-multiplex")]
 			TransportEnvelope::Mux(_) => Err(TransportError::InvalidMessage),
 		}
@@ -987,13 +971,9 @@ mod tests {
 	use crate::utils::time::ManualClock;
 	use crate::Version;
 
-	#[cfg(feature = "aead")]
 	use crate::crypto::aead::SessionKeys;
-	#[cfg(feature = "aead")]
 	use crate::crypto::x509::policy::ExpiryValidator;
-	#[cfg(feature = "aead")]
 	use crate::transport::handshake::PeerAuthentication;
-	#[cfg(feature = "aead")]
 	use crate::transport::TransportLimits;
 
 	/// A minimal `MessageIO` probe, so ingress goes through `decode_envelope`.
@@ -1018,14 +998,12 @@ mod tests {
 
 	/// A probe that reads EOF on every call, in the session phase that the case
 	/// under test sets.
-	#[cfg(feature = "aead")]
 	struct ClosedStreamProbe {
 		state: SessionState<DefaultCryptoProvider>,
 		limits: TransportLimits,
 		clock: ManualClock,
 	}
 
-	#[cfg(feature = "aead")]
 	impl ClosedStreamProbe {
 		/// Returns a provisioned endpoint placed directly in `phase`.
 		fn at(phase: SessionPhase) -> Self {
@@ -1041,7 +1019,6 @@ mod tests {
 		}
 	}
 
-	#[cfg(feature = "aead")]
 	impl MessageIO for ClosedStreamProbe {
 		fn clock(&self) -> &dyn Clock {
 			&self.clock
@@ -1056,13 +1033,10 @@ mod tests {
 		}
 	}
 
-	#[cfg(feature = "aead")]
 	impl EncryptedMessageIO for ClosedStreamProbe {}
 
-	#[cfg(feature = "aead")]
 	impl crate::transport::state::sealed::Sealed for ClosedStreamProbe {}
 
-	#[cfg(feature = "aead")]
 	impl EncryptedProtocolState for ClosedStreamProbe {
 		type CryptoProvider = DefaultCryptoProvider;
 
@@ -1079,7 +1053,6 @@ mod tests {
 		}
 	}
 
-	#[cfg(feature = "aead")]
 	fn encrypted_phase() -> SessionPhase {
 		use crate::crypto::aead::{Aes256Gcm, DirectionalCiphers, KeyInit};
 
@@ -1091,7 +1064,6 @@ mod tests {
 		SessionPhase::Encrypted(Box::new(EstablishedSession::new(keys, None, None, None, None)))
 	}
 
-	#[cfg(feature = "aead")]
 	fn handshaking_phase() -> SessionPhase {
 		SessionPhase::Handshaking { initiated_at: ManualClock::default().monotonic() }
 	}
@@ -1099,7 +1071,6 @@ mod tests {
 	// The session phase decides how an end of stream reads. A session that
 	// agreed its terms reports an ordinary close, so a pool evicts the
 	// connection instead of recording a handshake failure.
-	#[cfg(feature = "aead")]
 	crate::tb_cases! {
 		fn a_close_is_named_by_the_phase_it_interrupts((phase, expected): (SessionPhase, TransportError))
 			-> TransportResult<()>

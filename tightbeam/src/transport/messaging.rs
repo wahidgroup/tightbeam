@@ -3,7 +3,7 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
-#[cfg(all(not(feature = "std"), feature = "transport-policy"))]
+#[cfg(not(feature = "std"))]
 use alloc::boxed::Box;
 #[cfg(not(feature = "std"))]
 use alloc::sync::Arc;
@@ -20,10 +20,7 @@ use crate::transport::io::MessageIO;
 use crate::transport::TransportResult;
 use crate::utils::marker::MaybeSend;
 
-#[cfg(all(
-	feature = "transport-policy",
-	any(feature = "transport-cms", feature = "transport-ecies")
-))]
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::transport::io::CollectStep;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
@@ -36,17 +33,11 @@ mod x509 {
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use x509::*;
 
-#[cfg(feature = "transport-policy")]
-mod policy {
-	pub use crate::transport::policy::{RestartPolicy, RetryAction};
-}
+use crate::transport::policy::{RestartPolicy, RetryAction};
 
-#[cfg(feature = "transport-policy")]
-use policy::*;
-
-#[cfg(all(feature = "transport-policy", feature = "instrument"))]
+#[cfg(feature = "instrument")]
 use crate::instrumentation::events;
-#[cfg(all(feature = "transport-policy", feature = "instrument"))]
+#[cfg(feature = "instrument")]
 use crate::trace::TraceCollector;
 
 /// Source of the connection audit trail for access-gate verdicts.
@@ -54,7 +45,6 @@ use crate::trace::TraceCollector;
 /// Every plane that evaluates a collector gate implements this (the TCP
 /// transports, the mux handle) so `gate_inbound` can record the verdict
 /// wherever the gate runs.
-#[cfg(feature = "transport-policy")]
 pub trait GateAudit {
 	/// The connection audit trail, when instrumentation is attached.
 	#[cfg(feature = "instrument")]
@@ -65,7 +55,6 @@ pub trait GateAudit {
 ///
 /// The trait is a crate-private extension, so the public [`GateAudit`] keeps
 /// its one method and stays usable as a trait object.
-#[cfg(feature = "transport-policy")]
 pub(crate) trait GateInbound: GateAudit {
 	/// Gate one inbound request with the session's authenticated context and
 	/// record the verdict into the connection audit trail (`GATE_ACCEPT` or
@@ -106,10 +95,8 @@ pub(crate) trait GateInbound: GateAudit {
 	}
 }
 
-#[cfg(feature = "transport-policy")]
 impl<A: GateAudit + ?Sized> GateInbound for A {}
 
-#[cfg(feature = "transport-policy")]
 #[derive(Debug)]
 /// A frame routed through retries, modeled on a physical letter that can
 /// return to its sender.
@@ -117,7 +104,6 @@ pub(crate) struct Letter {
 	frame: Option<Frame>,
 }
 
-#[cfg(feature = "transport-policy")]
 impl Letter {
 	pub fn new(frame: Frame) -> Self {
 		Self { frame: Some(frame) }
@@ -140,7 +126,6 @@ impl Letter {
 	}
 }
 
-#[cfg(feature = "transport-policy")]
 impl From<Frame> for Letter {
 	fn from(frame: Frame) -> Self {
 		Self::new(frame)
@@ -153,7 +138,6 @@ impl From<Frame> for Letter {
 /// - `Err` carries the terminal error.
 ///
 /// An error that carries no frame passes through unchanged.
-#[cfg(feature = "transport-policy")]
 fn evaluate_retry<P>(
 	policy: &P,
 	error: TransportError,
@@ -178,7 +162,6 @@ where
 
 /// Base emitter trait, which sends TightBeam messages with gate and restart
 /// policies.
-#[cfg(feature = "transport-policy")]
 pub trait MessageEmitter: MessageIO {
 	type EmitterGate: GatePolicy + ?Sized;
 	type RestartPolicy: RestartPolicy + ?Sized;
@@ -283,38 +266,24 @@ async fn emit_with_retry<T: MessageEmitter + MaybeSend + ?Sized>(
 
 /// Every capability a message collector must already have.
 ///
-/// The trait exists because a supertrait takes no inline feature gate. With
-/// `transport-policy`, every collector must also expose an audit trail
-/// ([`GateAudit`]) for gate-verdict recording. The blanket impl satisfies
-/// the requirement, so implementers reach it through [`MessageCollector`]
-/// alone.
+/// Every collector exposes an audit trail ([`GateAudit`]) for gate-verdict
+/// recording. The blanket impl satisfies the requirement, so implementers
+/// reach it through [`MessageCollector`] alone.
 pub trait CollectorRequirements: MessageIO + GateAudit {}
 
-#[cfg(feature = "transport-policy")]
 impl<T: MessageIO + GateAudit> CollectorRequirements for T {}
-
-/// Every capability a message collector must already have. Without
-/// `transport-policy`, the trait requires no audit trail.
-#[cfg(not(feature = "transport-policy"))]
-pub trait CollectorRequirements: MessageIO {}
-
-#[cfg(not(feature = "transport-policy"))]
-impl<T: MessageIO> CollectorRequirements for T {}
 
 /// Message collector trait, which receives TightBeam messages.
 pub trait MessageCollector: CollectorRequirements {
 	/// Gate policy consulted for every collected message.
-	#[cfg(feature = "transport-policy")]
 	type CollectorGate: GatePolicy + ?Sized;
 
 	/// The gate policy that every collected message passes through.
-	#[cfg(feature = "transport-policy")]
 	fn collector_gate(&self) -> &Self::CollectorGate;
 
 	/// Read and validate one message, leaving the response to the caller.
 	///
 	/// The method returns the message and the gate evaluation status.
-	#[cfg(feature = "transport-policy")]
 	fn collect_message(&mut self) -> impl Future<Output = TransportResult<(Arc<Frame>, TransitStatus)>> + MaybeSend
 	where
 		Self: MaybeSend,
@@ -329,27 +298,10 @@ pub trait MessageCollector: CollectorRequirements {
 		}
 	}
 
-	/// Read and validate one message, leaving the response to the caller.
-	///
-	/// The method returns the message. Without policies, the status is always
-	/// `Ok`.
-	#[cfg(not(feature = "transport-policy"))]
-	fn collect_message(&mut self) -> impl Future<Output = TransportResult<(Arc<Frame>, TransitStatus)>> + MaybeSend
-	where
-		Self: MaybeSend,
-	{
-		async move {
-			let request_envelope = self.read_decoded_envelope().await?;
-			let request = request_envelope.into_request_frame()?;
-			Ok((request, TransitStatus::Ok))
-		}
-	}
-
 	/// Collect the next message, and tell a graceful close from an error.
 	///
 	/// - `Ok(None)` means that the connection closed gracefully (EOF).
 	/// - `Err` means that the connection failed unexpectedly.
-	#[cfg(feature = "transport-policy")]
 	fn try_collect_message(
 		&mut self,
 	) -> impl Future<Output = TransportResult<Option<(Arc<Frame>, TransitStatus)>>> + MaybeSend
@@ -370,31 +322,8 @@ pub trait MessageCollector: CollectorRequirements {
 		}
 	}
 
-	/// Collect the next message, and tell a graceful close from an error.
-	///
-	/// - `Ok(None)` means that the connection closed gracefully (EOF).
-	/// - `Err` means that the connection failed unexpectedly.
-	#[cfg(not(feature = "transport-policy"))]
-	fn try_collect_message(
-		&mut self,
-	) -> impl Future<Output = TransportResult<Option<(Arc<Frame>, TransitStatus)>>> + MaybeSend
-	where
-		Self: MaybeSend,
-	{
-		async move {
-			let request_envelope = match self.try_read_decoded_envelope().await? {
-				Some(envelope) => envelope,
-				None => return Ok(None), // Connection closed gracefully
-			};
-
-			let request = request_envelope.into_request_frame()?;
-			Ok(Some((request, TransitStatus::Ok)))
-		}
-	}
-
 	/// Send a response for one collected message, in the wire mode the session
 	/// phase decides.
-	#[cfg(feature = "x509")]
 	fn send_response(
 		&mut self,
 		status: TransitStatus,
@@ -404,10 +333,7 @@ pub trait MessageCollector: CollectorRequirements {
 		Self: MaybeSend;
 
 	/// The X.509 `collect_message` with encryption and handshake support.
-	#[cfg(all(
-		feature = "transport-policy",
-		any(feature = "transport-cms", feature = "transport-ecies")
-	))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	#[allow(async_fn_in_trait)]
 	async fn collect_message_with_encryption<P>(&mut self) -> TransportResult<(Arc<Frame>, TransitStatus)>
 	where
@@ -429,7 +355,6 @@ pub trait MessageCollector: CollectorRequirements {
 /// Extract the application request from a collected envelope and gate it
 /// with the session's peer context, recording the verdict through
 /// `gate_inbound`.
-#[cfg(feature = "transport-policy")]
 fn gate_collected_envelope<T>(
 	transport: &T,
 	envelope: TransportEnvelope,
@@ -448,7 +373,7 @@ pub trait Transport: MessageEmitter + MessageCollector {}
 
 impl<T> Transport for T where T: MessageEmitter + MessageCollector {}
 
-#[cfg(all(test, feature = "transport-policy", feature = "instrument", feature = "testing"))]
+#[cfg(all(test, feature = "instrument", feature = "testing"))]
 mod tests {
 	use super::*;
 	use crate::instrumentation::events;

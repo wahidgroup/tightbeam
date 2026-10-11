@@ -198,7 +198,6 @@ pub mod processors;
 
 pub use crate::crypto::aead::DirectionalCiphers;
 pub use attributes::HandshakeAttribute;
-#[cfg(feature = "x509")]
 use attributes::HandshakeAttributes;
 pub use error::HandshakeError;
 #[cfg(feature = "transport-cms")]
@@ -232,7 +231,6 @@ pub(crate) use peer::AdmittedPeer;
 #[cfg(feature = "transport-cms")]
 pub use processors::{TightBeamEnvelopedDataProcessor, TightBeamKariRecipient};
 #[cfg(all(
-	feature = "x509",
 	feature = "transport-multiplex",
 	any(feature = "transport-cms", feature = "transport-ecies")
 ))]
@@ -283,17 +281,10 @@ mod transport {
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use transport::*;
 
-#[cfg(feature = "x509")]
-mod x509 {
-	pub use crate::crypto::x509::attr::{Attribute, AttributeValue, Attributes};
-	pub use crate::x509::Certificate;
+use crate::crypto::x509::attr::{Attribute, AttributeValue, Attributes};
+use crate::x509::Certificate;
 
-	#[cfg(feature = "secp256k1")]
-	pub use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
-}
-
-#[cfg(feature = "x509")]
-use x509::*;
+use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 
 /// A curve both handshake protocols run on.
 ///
@@ -407,20 +398,17 @@ impl From<Arc<[Certificate]>> for CmsServerIdentity {
 /// The manager holds the provider that a handshake signs and agrees with, so
 /// the key can sit on an HSM or a KMS. The key material stays behind the
 /// provider, and each handshake shares it through an `Arc` clone.
-#[cfg(feature = "x509")]
 pub struct HandshakeKeyManager<P: CryptoProvider> {
 	provider: Arc<dyn SigningKeyProvider>,
 	_phantom: PhantomData<P>,
 }
 
-#[cfg(feature = "x509")]
 impl<P: CryptoProvider> Clone for HandshakeKeyManager<P> {
 	fn clone(&self) -> Self {
 		Self { provider: Arc::clone(&self.provider), _phantom: PhantomData }
 	}
 }
 
-#[cfg(feature = "x509")]
 impl From<Secp256k1SigningKey> for HandshakeKeyManager<DefaultCryptoProvider> {
 	fn from(signing_key: Secp256k1SigningKey) -> Self {
 		let provider = Secp256k1KeyProvider::from(signing_key);
@@ -428,21 +416,18 @@ impl From<Secp256k1SigningKey> for HandshakeKeyManager<DefaultCryptoProvider> {
 	}
 }
 
-#[cfg(feature = "x509")]
 impl From<Secp256k1KeyProvider> for HandshakeKeyManager<DefaultCryptoProvider> {
 	fn from(provider: Secp256k1KeyProvider) -> Self {
 		Self { provider: Arc::new(provider), _phantom: PhantomData }
 	}
 }
 
-#[cfg(feature = "x509")]
 impl From<Arc<dyn SigningKeyProvider>> for HandshakeKeyManager<DefaultCryptoProvider> {
 	fn from(provider: Arc<dyn SigningKeyProvider>) -> Self {
 		Self { provider, _phantom: PhantomData }
 	}
 }
 
-#[cfg(feature = "x509")]
 impl<P: CryptoProvider> HandshakeKeyManager<P> {
 	/// The signing key provider this manager was built from.
 	///
@@ -453,7 +438,6 @@ impl<P: CryptoProvider> HandshakeKeyManager<P> {
 	}
 }
 
-#[cfg(feature = "x509")]
 impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 	/// Creates a manager around `provider`, which holds the signing key of the
 	/// endpoint.
@@ -566,7 +550,6 @@ impl TryFrom<EnvelopedData> for HandshakeMessage {
 /// A handshake settles the keys and the terms that go with them at the same
 /// moment, so they travel together and a transport that installs the keys
 /// installs the rest with them.
-#[cfg(feature = "aead")]
 #[non_exhaustive]
 pub struct EstablishedSession {
 	/// Role-mapped directional keys. Each side sends on one key and receives
@@ -578,13 +561,11 @@ pub struct EstablishedSession {
 	/// Dual-signed receipt from a budget-bearing handshake.
 	receipt: Option<Arc<StoredReceipt>>,
 	/// Peer certificate validated during mutual authentication.
-	#[cfg(feature = "x509")]
 	peer: Option<Arc<Certificate>>,
 	/// Epoch-0 rekey materials, present exactly while a rekey could use them.
 	epoch: Option<EpochMaterials>,
 }
 
-#[cfg(feature = "aead")]
 impl EstablishedSession {
 	/// Assemble what one handshake agreed.
 	///
@@ -597,22 +578,14 @@ impl EstablishedSession {
 		keys: SessionKeys,
 		mux: Option<MuxSettings>,
 		receipt: Option<Arc<StoredReceipt>>,
-		#[cfg(feature = "x509")] peer: Option<Arc<Certificate>>,
+		peer: Option<Arc<Certificate>>,
 		epoch: Option<EpochMaterials>,
 	) -> Self {
-		#[cfg(feature = "x509")]
 		let renewable = receipt.is_some() && peer.is_some();
 
 		let epoch = epoch.filter(|_| renewable);
 
-		Self {
-			keys,
-			mux,
-			receipt,
-			#[cfg(feature = "x509")]
-			peer,
-			epoch,
-		}
+		Self { keys, mux, receipt, peer, epoch }
 	}
 
 	/// Detach the epoch rekey materials, once.
@@ -648,13 +621,11 @@ impl EstablishedSession {
 	}
 
 	/// Peer certificate validated during mutual authentication.
-	#[cfg(feature = "x509")]
 	pub fn peer(&self) -> Option<&Certificate> {
 		self.peer.as_deref()
 	}
 
 	/// Shared handle to the validated peer certificate.
-	#[cfg(feature = "x509")]
 	pub fn peer_arc(&self) -> Option<Arc<Certificate>> {
 		self.peer.as_ref().map(Arc::clone)
 	}
@@ -696,7 +667,6 @@ pub trait ClientHandshakeProtocol: MaybeSend {
 	/// the client-to-server key and receives on the server-to-client key. The
 	/// cipher comes from the [`CryptoProvider`] associated type and the OID
 	/// from the negotiated security profile.
-	#[cfg(feature = "aead")]
 	fn complete(self: Box<Self>) -> MaybeSendFuture<'static, CoreResult<EstablishedSession, Self::Error>>;
 
 	/// Whether the handshake reached the terminal state that completion enters.
@@ -734,7 +704,6 @@ pub trait ServerHandshakeProtocol: MaybeSend {
 	/// sends on the server-to-client key and receives on the client-to-server
 	/// key. The cipher comes from the [`CryptoProvider`] associated type and
 	/// the OID from the negotiated security profile.
-	#[cfg(feature = "aead")]
 	fn complete(self: Box<Self>) -> MaybeSendFuture<'static, CoreResult<EstablishedSession, Self::Error>>;
 
 	/// Whether the handshake reached the terminal state that completion enters.
@@ -806,7 +775,6 @@ pub struct ClientHello {
 pub struct ServerHandshake {
 	/// Server identity certificate the client validates against its
 	/// trust store.
-	#[cfg(feature = "x509")]
 	pub certificate: Certificate,
 	/// 32-byte anti-replay nonce mixed into the key derivation.
 	pub server_random: OctetString,
@@ -878,7 +846,6 @@ pub struct ClientKeyExchange {
 	/// Client certificate for mutual authentication. A client that holds an
 	/// identity includes it, and the [`ServerHandshake`] demands it by setting
 	/// `client_cert_required`.
-	#[cfg(feature = "x509")]
 	#[asn1(optional = "true")]
 	pub client_certificate: Option<Certificate>,
 	/// Signature over the handshake transcript, which proves possession of
@@ -886,7 +853,6 @@ pub struct ClientKeyExchange {
 	///
 	/// The signed digest covers `transcript_hash || encrypted_data ||
 	/// cert_der`, so the signature binds this key exchange to this identity.
-	#[cfg(feature = "x509")]
 	#[asn1(optional = "true")]
 	pub client_signature: Option<OctetString>,
 }
@@ -999,7 +965,6 @@ impl TryFrom<&SignedData> for ServerHandshake {
 	}
 }
 
-#[cfg(feature = "x509")]
 fn build_client_key_exchange_attrs(kex: &ClientKeyExchange) -> Result<Option<x509_cert::attr::Attributes>> {
 	let mut attrs = Vec::new();
 
@@ -1024,7 +989,6 @@ fn build_client_key_exchange_attrs(kex: &ClientKeyExchange) -> Result<Option<x50
 }
 
 /// The single value of `attr` decoded as an OCTET STRING.
-#[cfg(feature = "x509")]
 fn octet_string_value(attr: &HandshakeAttribute) -> Result<OctetString> {
 	let value = attr.value()?;
 	Ok(OctetString::from_der(value.value())?)
@@ -1038,7 +1002,6 @@ fn octet_string_value(attr: &HandshakeAttribute) -> Result<OctetString> {
 /// - [`HandshakeError::DuplicateAttribute`] -- an attribute OID repeats.
 /// - [`HandshakeError::InvalidAttributeArity`] -- an attribute carries other than one value.
 /// - [`HandshakeError::DerError`] -- the certificate or the signature fails to decode.
-#[cfg(feature = "x509")]
 fn parse_client_key_exchange_attrs(enveloped_data: &EnvelopedData) -> Result<ClientKeyExchangeAttrs> {
 	let Some(attrs) = &enveloped_data.unprotected_attrs else {
 		return Ok(ClientKeyExchangeAttrs::default());
@@ -1057,7 +1020,6 @@ fn parse_client_key_exchange_attrs(enveloped_data: &EnvelopedData) -> Result<Cli
 }
 
 /// Parsed unprotected attributes of a [`ClientKeyExchange`] envelope.
-#[cfg(feature = "x509")]
 #[derive(Default)]
 struct ClientKeyExchangeAttrs {
 	certificate: Option<Certificate>,
@@ -1077,7 +1039,6 @@ impl TryFrom<&ClientKeyExchange> for EnvelopedData {
 	type Error = HandshakeError;
 
 	fn try_from(kex: &ClientKeyExchange) -> CoreResult<Self, Self::Error> {
-		#[cfg(feature = "x509")]
 		let unprotected_attrs = build_client_key_exchange_attrs(kex)?;
 
 		Ok(EnvelopedData {
@@ -1106,14 +1067,11 @@ impl TryFrom<&EnvelopedData> for ClientKeyExchange {
 			.ok_or(HandshakeError::InvalidClientKeyExchange)?
 			.as_bytes();
 
-		#[cfg(feature = "x509")]
 		let attrs = parse_client_key_exchange_attrs(enveloped_data)?;
 
 		Ok(ClientKeyExchange {
 			encrypted_data: OctetString::new(encrypted_bytes)?,
-			#[cfg(feature = "x509")]
 			client_certificate: attrs.certificate,
-			#[cfg(feature = "x509")]
 			client_signature: attrs.signature,
 		})
 	}
