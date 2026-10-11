@@ -27,22 +27,17 @@
 //! - CWE-770, allocation of resources without limits or throttling:
 //!   <https://cwe.mitre.org/data/definitions/770.html>
 
-use core::cmp::Reverse;
 use core::fmt;
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
-use core::num::NonZeroUsize;
 use core::str::{from_utf8, FromStr};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex, PoisonError};
 
 mod guard;
 
-use guard::{GuardedTable, PeerEntry, TableState};
+use guard::{Bounds, Candidate, GuardedTable, PeerEntry, TableState};
 
 use super::{AdmittedDial, ClusterError, PeerConfig, SharedId};
-use crate::constants::{
-	MAX_PEER_BUCKET, MAX_PEER_TABLE_NEW, MAX_PEER_TABLE_TRIED, MAX_PEER_TRIED_FAILURES, PEER_PROBE_PER_BEAT,
-};
 use crate::utils::time::UnixMillis;
 
 /// A gateway socket address, parsed once where it enters.
@@ -322,12 +317,8 @@ impl PeerStore for MemoryPeerStore {
 /// reflood tasks share one instance through configuration.
 pub struct PeerTable {
 	anchors: Vec<AdmittedDial>,
-	anchor_keys: HashSet<AdmittedDial>,
 	state: GuardedTable,
 	store: Arc<dyn PeerStore>,
-	/// Cap on the tried entries one signer holds, from
-	/// [`PeerConfig`], where `None` sets no cap.
-	tried_per_signer: Option<NonZeroUsize>,
 	/// Newest generation written, and the gate that orders driver writes.
 	///
 	/// This is separate from `state`, so a slow driver delays the next
@@ -338,13 +329,7 @@ pub struct PeerTable {
 
 impl Default for PeerTable {
 	fn default() -> Self {
-		Self::assemble(
-			Vec::new(),
-			HashSet::new(),
-			TableState::default(),
-			Arc::new(MemoryPeerStore),
-			None,
-		)
+		Self::assemble(Vec::new(), GuardedTable::new(Bounds::default(), []), Arc::new(MemoryPeerStore))
 	}
 }
 
@@ -356,125 +341,6 @@ impl core::fmt::Debug for PeerTable {
 			.field("store", &"<dyn PeerStore>")
 			.finish()
 	}
-}
-
-/// Count entries in `map` that share the prefix bucket of `group`.
-fn bucket_len(map: &HashMap<AdmittedDial, PeerEntry>, group: AddressGroup) -> usize {
-	map.keys().filter(|addr| addr.address().group() == group).count()
-}
-
-/// Whether the signer `peer_id` already holds as many entries of `tried` as
-/// `cap` allows. A table with no cap, or an entry with no signer to count, is
-/// never at one.
-fn signer_at_cap(tried: &HashMap<AdmittedDial, PeerEntry>, cap: Option<NonZeroUsize>, peer_id: Option<&[u8]>) -> bool {
-	let (Some(cap), Some(peer_id)) = (cap, peer_id) else {
-		return false;
-	};
-
-	let held = tried.values().filter(|entry| entry.peer_id.as_deref() == Some(peer_id));
-	held.count() >= cap.get()
-}
-
-/// The entry of `map` that owes its slot to a newcomer: the one with the most
-/// failed probes, and among equals the one probed longest ago.
-///
-/// `group` narrows the search to one prefix bucket. It returns `None` when no
-/// entry in reach has failed a probe, so a candidate that never failed keeps
-/// its slot.
-fn most_failed(map: &HashMap<AdmittedDial, PeerEntry>, group: Option<AddressGroup>) -> Option<AdmittedDial> {
-	map.iter()
-		.filter(|(addr, _)| group.is_none_or(|group| addr.address().group() == group))
-		.filter(|(_, entry)| entry.failures > 0)
-		.max_by_key(|(addr, entry)| (entry.failures, Reverse(entry.last_probe), **addr))
-		.map(|(addr, _)| *addr)
-}
-
-/// One round-robin draw across prefix buckets.
-struct Draw {
-	/// The drawn addresses, at most the cap of the draw.
-	sample: Vec<AdmittedDial>,
-	/// The prefix the first pass ended on, or `None` for an empty draw.
-	served_last: Option<AddressGroup>,
-}
-
-/// Round-robin sample across prefix buckets.
-///
-/// - Buckets are visited in prefix order from the prefix after `after`, so the draw is deterministic.
-/// - Each bucket prefers the peer with the fewest failed probes, then its least recently probed one.
-/// - One prefix therefore draws at most its own share of a bounded sample.
-/// - A peer that failed a probe is drawn after every fresher one in its bucket.
-///
-/// # Starting prefix
-///
-/// A walk that started at the lowest prefix every time would serve the same
-/// `cap` prefixes for as long as each held one entry, and starve every
-/// other prefix (CWE-770). The caller therefore passes the prefix its last
-/// draw ended on as `after`, and keeps [`Draw::served_last`] for the next.
-///
-/// The walk holds borrowed pairs only. The drawn addresses, at most `cap`
-/// of them, are copied out because they outlive the table lock.
-fn diversity_sample<'t, I>(entries: I, cap: usize, after: Option<AddressGroup>) -> Draw
-where
-	I: Iterator<Item = (&'t AdmittedDial, &'t PeerEntry)>,
-{
-	let mut buckets: HashMap<AddressGroup, Vec<(&AdmittedDial, &PeerEntry)>> = HashMap::new();
-	for (addr, entry) in entries {
-		buckets.entry(addr.address().group()).or_default().push((addr, entry));
-	}
-
-	let mut lanes: Vec<(AddressGroup, Vec<(&AdmittedDial, &PeerEntry)>)> = buckets.into_iter().collect();
-	for (_, lane) in &mut lanes {
-		lane.sort_by_key(|(_, entry)| (entry.failures, entry.last_probe));
-	}
-
-	lanes.sort_by_key(|(group, _)| *group);
-
-	let start = after.map_or(0, |served| lanes.partition_point(|(group, _)| *group <= served));
-	lanes.rotate_left(start);
-
-	// Every lane holds an entry, so the first pass serves the leading lanes
-	// one each, up to the cap.
-	let first_pass = cap.min(lanes.len());
-	let last_lane = first_pass.checked_sub(1).and_then(|last| lanes.get(last));
-	let served_last = last_lane.map(|(group, _)| *group);
-
-	let mut sample = Vec::new();
-	let mut depth = 0;
-	while sample.len() < cap {
-		let mut drew = false;
-		for (_, lane) in &lanes {
-			if sample.len() == cap {
-				break;
-			}
-			if let Some((addr, _)) = lane.get(depth) {
-				sample.push(**addr);
-				drew = true;
-			}
-		}
-
-		if !drew {
-			break;
-		}
-
-		depth += 1;
-	}
-
-	Draw { sample, served_last }
-}
-
-/// One peer on its way into a table, with the proof its address was
-/// admitted.
-///
-/// Learned hints, verified probes, and hydrated records all enter through
-/// this one shape, so every path applies the anchor exclusion and the
-/// prefix bounds to an address the dial policy already admitted.
-struct Candidate {
-	/// The admitted gateway address, which keys the table.
-	dial: AdmittedDial,
-	/// Whether a probe has verified the peer, which picks the table.
-	tried: bool,
-	/// What the table records about the peer.
-	entry: PeerEntry,
 }
 
 impl PeerTable {
@@ -500,42 +366,23 @@ impl PeerTable {
 	#[must_use]
 	pub(in crate::colony::cluster) fn new(peer: &PeerConfig, store: Arc<dyn PeerStore>) -> Self {
 		let anchors: Vec<AdmittedDial> = peer.peers().to_vec();
-		let anchor_keys: HashSet<AdmittedDial> = anchors.iter().copied().collect();
+		let anchor_set: HashSet<AdmittedDial> = anchors.iter().copied().collect();
+		let bounds = Bounds { anchors: anchor_set, tried_per_signer: peer.tried_per_signer };
 
 		let records = store.hydrate().unwrap_or_default();
-		let mut state = TableState::default();
-		for record in records {
-			let Ok(dial) = peer.admit_dial(record.gateway_addr) else {
-				continue;
-			};
-
+		let persisted = records.into_iter().filter_map(|record| {
+			let dial = peer.admit_dial(record.gateway_addr).ok()?;
 			let entry = PeerEntry { peer_id: record.peer_id, last_probe: record.last_probe, failures: 0 };
-			let candidate = Candidate { dial, tried: record.tried, entry };
-			Self::admit_into(&anchor_keys, peer.tried_per_signer, &mut state, candidate);
-		}
 
-		Self::assemble(anchors, anchor_keys, state, store, peer.tried_per_signer)
+			Some(Candidate { dial, tried: record.tried, entry })
+		});
+
+		Self::assemble(anchors, GuardedTable::new(bounds, persisted), store)
 	}
 
 	/// A table over `state`, built before any caller could reach it.
-	///
-	/// `anchor_keys` is the set over `anchors`, built once by the caller that
-	/// already needed it for hydration.
-	fn assemble(
-		anchors: Vec<AdmittedDial>,
-		anchor_keys: HashSet<AdmittedDial>,
-		state: TableState,
-		store: Arc<dyn PeerStore>,
-		tried_per_signer: Option<NonZeroUsize>,
-	) -> Self {
-		Self {
-			anchors,
-			anchor_keys,
-			state: GuardedTable::new(state),
-			store,
-			tried_per_signer,
-			persisted: Mutex::new(0),
-		}
+	fn assemble(anchors: Vec<AdmittedDial>, state: GuardedTable, store: Arc<dyn PeerStore>) -> Self {
+		Self { anchors, state, store, persisted: Mutex::new(0) }
 	}
 
 	/// Admit unverified peer hints into the new table.
@@ -558,15 +405,7 @@ impl PeerTable {
 		I: IntoIterator<Item = PeerHint>,
 	{
 		self.with_table(|state| {
-			let mut admitted = 0;
-			for hint in hints {
-				let entry = PeerEntry { peer_id: hint.peer_id, last_probe: UnixMillis::default(), failures: 0 };
-				let candidate = Candidate { dial: hint.dial, tried: false, entry };
-				if self.admit_record(state, candidate) {
-					admitted += 1;
-				}
-			}
-
+			let admitted = state.learn(hints);
 			(admitted, admitted > 0)
 		})
 	}
@@ -594,38 +433,7 @@ impl PeerTable {
 	///
 	/// - [`ClusterError::LockPoisoned`] -- the table lock is poisoned.
 	pub fn promote(&self, addr: AdmittedDial, peer_id: Option<&[u8]>, now: UnixMillis) -> Result<bool, ClusterError> {
-		// Anchors are configured rather than learned, so a verified anchor
-		// lands in its own map and leaves both learned tables as they are.
-		if self.anchor_keys.contains(&addr) {
-			return self.with_table(|state| {
-				let entry = PeerEntry { peer_id: peer_id.map(<[u8]>::to_vec), last_probe: now, failures: 0 };
-				state.anchors_verified.insert(addr, entry);
-
-				(false, false)
-			});
-		}
-
-		self.with_table(|state| {
-			// A resident leaves its slot for the length of this call, so the
-			// one admission path decides whether the signer that answered may
-			// hold it. A resident that keeps its signer always wins the slot
-			// back.
-			let resident = state.tried.remove(&addr);
-			let recorded = resident.as_ref().and_then(|held| held.peer_id.clone());
-			let signer = peer_id.map(<[u8]>::to_vec).or(recorded);
-			let entry = PeerEntry { peer_id: signer, last_probe: now, failures: 0 };
-
-			let admitted = self.admit_record(state, Candidate { dial: addr, tried: true, entry: entry.clone() });
-			let was_resident = resident.is_some();
-			if was_resident && !admitted {
-				// The signer that answered is at its cap, so the address
-				// waits in `new` the way a capped candidate does. A full
-				// `new` table drops it, which leaves it to be learned again.
-				self.admit_record(state, Candidate { dial: addr, tried: false, entry });
-			}
-
-			(admitted && !was_resident, admitted || was_resident)
-		})
+		self.with_table(|state| state.promote(addr, peer_id, now))
 	}
 
 	/// Record a failed probe on its candidate, which stays in the new table.
@@ -648,11 +456,7 @@ impl PeerTable {
 		// The count and the stamp order the backlog within a run, so the
 		// change spends no driver write.
 		self.with_table(|state| {
-			if let Some(entry) = state.new.get_mut(&addr) {
-				entry.failures = entry.failures.saturating_add(1);
-				entry.last_probe = now;
-			}
-
+			state.record_probe_failure(addr, now);
 			((), false)
 		})
 	}
@@ -670,7 +474,7 @@ impl PeerTable {
 	/// - [`ClusterError::LockPoisoned`] -- the table lock is poisoned.
 	pub fn discard(&self, addr: AdmittedDial) -> Result<(), ClusterError> {
 		self.with_table(|state| {
-			let removed = state.new.remove(&addr).is_some();
+			let removed = state.discard(addr);
 			((), removed)
 		})
 	}
@@ -700,21 +504,12 @@ impl PeerTable {
 	/// # Errors
 	///
 	/// - [`ClusterError::LockPoisoned`] -- the table lock is poisoned.
+	///
+	/// [`MAX_PEER_TRIED_FAILURES`]: crate::constants::MAX_PEER_TRIED_FAILURES
 	pub fn record_failure(&self, addr: AdmittedDial) -> Result<bool, ClusterError> {
 		self.with_table(|state| {
-			let Some(entry) = state.tried.get_mut(&addr) else {
-				return (false, false);
-			};
-
-			entry.failures = entry.failures.saturating_add(1);
-
-			if entry.failures < MAX_PEER_TRIED_FAILURES {
-				return (false, false);
-			}
-
-			state.tried.remove(&addr);
-
-			(true, true)
+			let evicted = state.record_failure(addr);
+			(evicted, evicted)
 		})
 	}
 
@@ -733,15 +528,11 @@ impl PeerTable {
 	///
 	/// - [`ClusterError::LockPoisoned`] -- the table lock is poisoned.
 	pub fn expel(&self, addr: AdmittedDial) -> Result<(), ClusterError> {
+		// The driver stores learned records alone, so an anchor's removal is
+		// no durable change.
 		self.with_table(|state| {
-			let from_new = state.new.remove(&addr).is_some();
-			let from_tried = state.tried.remove(&addr).is_some();
-			state.anchors_verified.remove(&addr);
-
-			// The driver stores learned records alone, so an anchor's removal
-			// is no durable change.
-			let changed = from_new || from_tried;
-			((), changed)
+			let learned_moved = state.expel(addr);
+			((), learned_moved)
 		})
 	}
 
@@ -759,10 +550,7 @@ impl PeerTable {
 	///
 	/// - [`ClusterError::LockPoisoned`] -- the table lock is poisoned.
 	pub fn target_set(&self) -> Result<Vec<AdmittedDial>, ClusterError> {
-		let mut learned = self
-			.state
-			.read(|state| state.tried.keys().copied().collect::<Vec<AdmittedDial>>())?;
-
+		let mut learned = self.state.read(TableState::tried_dials)?;
 		let mut targets = self.anchors.clone();
 
 		learned.sort();
@@ -793,19 +581,7 @@ impl PeerTable {
 		// A probe stamp rotates the backlog within a run. The next durable
 		// change carries whatever stamp is current, so the beat spends no
 		// driver write of its own.
-		self.with_table(|state| {
-			let due = state.new.iter().filter(|(_, entry)| entry.probe_due(now));
-			let draw = diversity_sample(due, PEER_PROBE_PER_BEAT, state.probe_cursor);
-			state.probe_cursor = draw.served_last.or(state.probe_cursor);
-
-			for addr in &draw.sample {
-				if let Some(entry) = state.new.get_mut(addr) {
-					entry.last_probe = now;
-				}
-			}
-
-			(draw.sample, false)
-		})
+		self.with_table(|state| (state.probe_sample(now), false))
 	}
 
 	/// Diversity-bucketed sample of verified peers to share over PEX.
@@ -825,30 +601,7 @@ impl PeerTable {
 	pub fn sample_for_pex(&self, cap: usize) -> Result<Vec<PeerRecord>, ClusterError> {
 		// The cursor orders successive replies within a run, so the draw
 		// spends no driver write.
-		self.with_table(|state| {
-			// Anchors and tried are disjoint maps, so chaining them borrows a
-			// disjoint shareable view without building a merged copy. Only the
-			// sampled records own their data, because they outlive the guard.
-			let shareable = state.tried.iter().chain(state.anchors_verified.iter());
-			let draw = diversity_sample(shareable, cap, state.pex_cursor);
-			state.pex_cursor = draw.served_last.or(state.pex_cursor);
-
-			let records = draw
-				.sample
-				.into_iter()
-				.filter_map(|addr| {
-					let entry = state.tried.get(&addr).or_else(|| state.anchors_verified.get(&addr))?;
-					Some(PeerRecord {
-						gateway_addr: addr.address(),
-						peer_id: entry.peer_id.clone(),
-						tried: true,
-						last_probe: entry.last_probe,
-					})
-				})
-				.collect();
-
-			(records, false)
-		})
+		self.with_table(|state| (state.pex_sample(cap), false))
 	}
 
 	/// The sockets among `advertised` that this table still holds.
@@ -866,12 +619,7 @@ impl PeerTable {
 		&self,
 		advertised: impl IntoIterator<Item = PeerAddress>,
 	) -> Result<HashSet<PeerAddress>, ClusterError> {
-		self.state.read(|state| {
-			let entries = state.new.keys().chain(state.tried.keys()).chain(state.anchors_verified.keys());
-			let held: HashSet<PeerAddress> = entries.map(AdmittedDial::address).collect();
-
-			advertised.into_iter().filter(|socket| held.contains(socket)).collect()
-		})
+		self.state.read(|state| state.held_among(advertised))
 	}
 
 	/// Current learned sizes as `(new, tried)` for operators and tests.
@@ -880,7 +628,7 @@ impl PeerTable {
 	///
 	/// - [`ClusterError::LockPoisoned`] -- the table lock is poisoned.
 	pub fn learned(&self) -> Result<(usize, usize), ClusterError> {
-		self.state.read(|state| (state.new.len(), state.tried.len()))
+		self.state.read(TableState::learned)
 	}
 
 	/// Record this gateway's own advertised address.
@@ -896,10 +644,7 @@ impl PeerTable {
 		// The advertise beat re-excludes on every start, so the local
 		// address needs no driver write to stay out of admission.
 		self.with_table(|state| {
-			state.new.retain(|dial, _| dial.address() != addr);
-			state.tried.retain(|dial, _| dial.address() != addr);
-			state.local = Some(addr);
-
+			state.exclude(addr);
 			((), false)
 		})
 	}
@@ -916,69 +661,7 @@ impl PeerTable {
 			return Ok(true);
 		}
 
-		self.state.read(|state| !state.tried.is_empty())
-	}
-
-	/// Admit one candidate into its table under the capped admission path.
-	///
-	/// `learn` and `promote` admit through here, and hydration admits through
-	/// [`Self::admit_into`], so every path applies anchor exclusion, the prefix
-	/// bounds, and the signer cap.
-	fn admit_record(&self, state: &mut TableState, candidate: Candidate) -> bool {
-		Self::admit_into(&self.anchor_keys, self.tried_per_signer, state, candidate)
-	}
-
-	/// [`Self::admit_record`] for a table still being built, before its
-	/// state is behind the guard.
-	fn admit_into(
-		anchor_keys: &HashSet<AdmittedDial>,
-		tried_per_signer: Option<NonZeroUsize>,
-		state: &mut TableState,
-		candidate: Candidate,
-	) -> bool {
-		let Candidate { dial: key, tried, entry } = candidate;
-		let group = key.address().group();
-		if anchor_keys.contains(&key) || state.tried.contains_key(&key) {
-			return false;
-		}
-		if state.local == Some(key.address()) {
-			return false;
-		}
-
-		if tried {
-			let within_table = state.tried.len() < MAX_PEER_TABLE_TRIED;
-			let within_bucket = bucket_len(&state.tried, group) < MAX_PEER_BUCKET;
-			let within_signer = !signer_at_cap(&state.tried, tried_per_signer, entry.peer_id.as_deref());
-			if !(within_table && within_bucket && within_signer) {
-				return false;
-			}
-
-			state.new.remove(&key);
-			state.tried.insert(key, entry);
-
-			return true;
-		}
-
-		if state.new.contains_key(&key) {
-			return false;
-		}
-
-		let within_table = state.new.len() < MAX_PEER_TABLE_NEW;
-		let within_bucket = bucket_len(&state.new, group) < MAX_PEER_BUCKET;
-		if !(within_table && within_bucket) {
-			// A full bucket yields the slot of a candidate that failed a probe
-			// and of no other, so a dead address never blocks a newcomer and a
-			// flood of hints never displaces an untested one (CWE-770).
-			let reach = (!within_bucket).then_some(group);
-			let Some(failed) = most_failed(&state.new, reach) else {
-				return false;
-			};
-
-			state.new.remove(&failed);
-		}
-
-		state.new.insert(key, entry);
-		true
+		self.state.read(TableState::has_tried)
 	}
 
 	/// Applies `change` under the table guard, then writes the snapshot it
@@ -1032,8 +715,11 @@ impl PeerTable {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::constants::{PEER_PROBE_BACKOFF_MAX_MS, PEER_PROBE_BACKOFF_MS};
+	use crate::constants::{
+		MAX_PEER_BUCKET, MAX_PEER_TRIED_FAILURES, PEER_PROBE_BACKOFF_MAX_MS, PEER_PROBE_BACKOFF_MS, PEER_PROBE_PER_BEAT,
+	};
 	use crate::tb_cases;
+	use core::num::NonZeroUsize;
 	use core::time::Duration;
 	use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
