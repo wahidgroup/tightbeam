@@ -363,6 +363,18 @@ fn bucket_len(map: &HashMap<AdmittedDial, PeerEntry>, group: AddressGroup) -> us
 	map.keys().filter(|addr| addr.address().group() == group).count()
 }
 
+/// Whether the signer `peer_id` already holds as many entries of `tried` as
+/// `cap` allows. A table with no cap, or an entry with no signer to count, is
+/// never at one.
+fn signer_at_cap(tried: &HashMap<AdmittedDial, PeerEntry>, cap: Option<NonZeroUsize>, peer_id: Option<&[u8]>) -> bool {
+	let (Some(cap), Some(peer_id)) = (cap, peer_id) else {
+		return false;
+	};
+
+	let held = tried.values().filter(|entry| entry.peer_id.as_deref() == Some(peer_id));
+	held.count() >= cap.get()
+}
+
 /// The entry of `map` that owes its slot to a newcomer: the one with the most
 /// failed probes, and among equals the one probed longest ago.
 ///
@@ -479,6 +491,7 @@ impl PeerTable {
 	///
 	/// - Each record passes [`PeerConfig::admit_dial`] first, so a policy the
 	///   operator tightened since the last run drops the peers it refuses.
+	/// - A signer cap the operator set since the last run binds the persisted peers the same way.
 	/// - A driver fault degrades to an anchors-only start, which is safe because discovery refills the table.
 	///
 	/// The config builder is the caller, because [`PeerConfig::table`] is
@@ -497,7 +510,8 @@ impl PeerTable {
 			};
 
 			let entry = PeerEntry { peer_id: record.peer_id, last_probe: record.last_probe, failures: 0 };
-			Self::admit_into(&anchor_keys, &mut state, Candidate { dial, tried: record.tried, entry });
+			let candidate = Candidate { dial, tried: record.tried, entry };
+			Self::admit_into(&anchor_keys, peer.tried_per_signer, &mut state, candidate);
 		}
 
 		Self::assemble(anchors, anchor_keys, state, store, peer.tried_per_signer)
@@ -569,6 +583,13 @@ impl PeerTable {
 	/// in new. Residents re-verify on every beat, so a candidate waits for a
 	/// freed slot. A signer at its configured cap waits the same way.
 	///
+	/// # Signer change
+	///
+	/// A resident that answers as another signer is admitted again under that
+	/// signer, so the cap counts the slot. A signer at its cap sends the
+	/// address back to new, and one below its cap keeps the slot with no new
+	/// discovery.
+	///
 	/// # Errors
 	///
 	/// - [`ClusterError::LockPoisoned`] -- the table lock is poisoned.
@@ -585,23 +606,25 @@ impl PeerTable {
 		}
 
 		self.with_table(|state| {
-			if let Some(entry) = state.tried.get_mut(&addr) {
-				entry.last_probe = now;
-				entry.failures = 0;
+			// A resident leaves its slot for the length of this call, so the
+			// one admission path decides whether the signer that answered may
+			// hold it. A resident that keeps its signer always wins the slot
+			// back.
+			let resident = state.tried.remove(&addr);
+			let recorded = resident.as_ref().and_then(|held| held.peer_id.clone());
+			let signer = peer_id.map(<[u8]>::to_vec).or(recorded);
+			let entry = PeerEntry { peer_id: signer, last_probe: now, failures: 0 };
 
-				if let Some(peer_id) = peer_id {
-					entry.peer_id = Some(peer_id.to_vec());
-				}
-
-				return (false, true);
+			let admitted = self.admit_record(state, Candidate { dial: addr, tried: true, entry: entry.clone() });
+			let was_resident = resident.is_some();
+			if was_resident && !admitted {
+				// The signer that answered is at its cap, so the address
+				// waits in `new` the way a capped candidate does. A full
+				// `new` table drops it, which leaves it to be learned again.
+				self.admit_record(state, Candidate { dial: addr, tried: false, entry });
 			}
-			if self.signer_is_at_cap(state, peer_id) {
-				return (false, false);
-			}
 
-			let entry = PeerEntry { peer_id: peer_id.map(<[u8]>::to_vec), last_probe: now, failures: 0 };
-			let promoted = self.admit_record(state, Candidate { dial: addr, tried: true, entry });
-			(promoted, promoted)
+			(admitted && !was_resident, admitted || was_resident)
 		})
 	}
 
@@ -896,30 +919,23 @@ impl PeerTable {
 		self.state.read(|state| !state.tried.is_empty())
 	}
 
-	/// Whether the signer `peer_id` already holds as many tried entries as the
-	/// configured cap allows. A table with no cap, or a candidate with no
-	/// signer to count, is never at one.
-	fn signer_is_at_cap(&self, state: &TableState, peer_id: Option<&[u8]>) -> bool {
-		let (Some(cap), Some(peer_id)) = (self.tried_per_signer, peer_id) else {
-			return false;
-		};
-
-		let held = state.tried.values().filter(|entry| entry.peer_id.as_deref() == Some(peer_id));
-		held.count() >= cap.get()
-	}
-
 	/// Admit one candidate into its table under the capped admission path.
 	///
 	/// `learn` and `promote` admit through here, and hydration admits through
-	/// [`Self::admit_into`], so every path applies anchor exclusion and the
-	/// prefix bounds.
+	/// [`Self::admit_into`], so every path applies anchor exclusion, the prefix
+	/// bounds, and the signer cap.
 	fn admit_record(&self, state: &mut TableState, candidate: Candidate) -> bool {
-		Self::admit_into(&self.anchor_keys, state, candidate)
+		Self::admit_into(&self.anchor_keys, self.tried_per_signer, state, candidate)
 	}
 
 	/// [`Self::admit_record`] for a table still being built, before its
 	/// state is behind the guard.
-	fn admit_into(anchor_keys: &HashSet<AdmittedDial>, state: &mut TableState, candidate: Candidate) -> bool {
+	fn admit_into(
+		anchor_keys: &HashSet<AdmittedDial>,
+		tried_per_signer: Option<NonZeroUsize>,
+		state: &mut TableState,
+		candidate: Candidate,
+	) -> bool {
 		let Candidate { dial: key, tried, entry } = candidate;
 		let group = key.address().group();
 		if anchor_keys.contains(&key) || state.tried.contains_key(&key) {
@@ -932,7 +948,8 @@ impl PeerTable {
 		if tried {
 			let within_table = state.tried.len() < MAX_PEER_TABLE_TRIED;
 			let within_bucket = bucket_len(&state.tried, group) < MAX_PEER_BUCKET;
-			if !(within_table && within_bucket) {
+			let within_signer = !signer_at_cap(&state.tried, tried_per_signer, entry.peer_id.as_deref());
+			if !(within_table && within_bucket && within_signer) {
 				return false;
 			}
 
@@ -1248,8 +1265,18 @@ mod tests {
 
 	/// A table that lets one signer hold `cap` tried entries.
 	fn table_capping_signers(cap: usize) -> PeerTable {
+		table_capping_signers_over(cap, Arc::new(MemoryPeerStore))
+	}
+
+	/// [`table_capping_signers`] hydrated from `store`.
+	fn table_capping_signers_over(cap: usize, store: Arc<dyn PeerStore>) -> PeerTable {
 		let peer = PeerConfig { tried_per_signer: NonZeroUsize::new(cap), ..Default::default() };
-		PeerTable::new(&peer, Arc::new(MemoryPeerStore))
+		PeerTable::new(&peer, store)
+	}
+
+	/// A persisted tried record of `text` under `signer`.
+	fn tried_record_of(text: impl AsRef<str>, signer: &[u8]) -> PeerRecord {
+		PeerRecord { peer_id: Some(signer.to_vec()), ..record(text, true) }
 	}
 
 	/// Promotes three addresses, the first two under one signer, and answers
@@ -1270,6 +1297,63 @@ mod tests {
 	fn promote_holds_a_signer_at_its_cap_back() {
 		let table = table_capping_signers(1);
 		assert_eq!(promotions_of_two_signers(&table), [true, false, true]);
+	}
+
+	// The store holds two tried peers of one signer, as a run with no cap
+	// leaves it. The operator then sets a cap of one.
+	#[test]
+	fn hydration_holds_a_signer_to_its_cap() -> Result<(), ClusterError> {
+		let seed = [
+			tried_record_of("10.0.0.1:9000", b"signer-a"),
+			tried_record_of("10.1.0.1:9000", b"signer-a"),
+		];
+		let table = table_capping_signers_over(1, Arc::new(CountingStore::seeded(seed)));
+		assert_eq!(table.learned()?, (0, 1));
+		Ok(())
+	}
+
+	// Two signers hold one slot each, which is the cap. The second address
+	// then answers as the first signer.
+	#[test]
+	fn a_resident_that_answers_as_a_signer_at_its_cap_gives_up_its_slot() -> Result<(), ClusterError> {
+		let table = table_capping_signers(1);
+		let now = UnixMillis::new(1_000);
+		table.promote(addr("10.0.0.1:9000"), Some(b"signer-a"), now)?;
+		table.promote(addr("10.1.0.1:9000"), Some(b"signer-b"), now)?;
+
+		let promoted = table.promote(addr("10.1.0.1:9000"), Some(b"signer-a"), now)?;
+		assert!(!promoted);
+		assert_eq!(table.target_set()?, vec![addr("10.0.0.1:9000")]);
+		assert_eq!(table.learned()?, (1, 1));
+		Ok(())
+	}
+
+	// A resident whose certificate was reissued answers as a signer the table
+	// has not counted. It keeps its slot, and it is no new discovery.
+	#[test]
+	fn a_resident_keeps_its_slot_under_a_signer_below_its_cap() -> Result<(), ClusterError> {
+		let table = table_capping_signers(1);
+		let now = UnixMillis::new(1_000);
+
+		table.promote(addr("10.0.0.1:9000"), Some(b"signer-a"), now)?;
+
+		let promoted = table.promote(addr("10.0.0.1:9000"), Some(b"signer-b"), now)?;
+		assert!(!promoted);
+		assert_eq!(table.learned()?, (0, 1));
+		Ok(())
+	}
+
+	// The resident holds the one slot its signer may have, and its next
+	// verified probe must not count that slot against it.
+	#[test]
+	fn a_resident_at_its_cap_keeps_its_slot_when_it_answers_again() -> Result<(), ClusterError> {
+		let table = table_capping_signers(1);
+		table.promote(addr("10.0.0.1:9000"), Some(b"signer-a"), UnixMillis::new(1_000))?;
+
+		let promoted = table.promote(addr("10.0.0.1:9000"), Some(b"signer-a"), UnixMillis::new(2_000))?;
+		assert!(!promoted);
+		assert_eq!(table.learned()?, (0, 1));
+		Ok(())
 	}
 
 	#[test]

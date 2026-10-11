@@ -3022,10 +3022,11 @@ A gateway belongs to the colony named by the URN in its certificate's URI Subjec
 
 Colonies of one namespace federate. A gateway shares work and gossip with every gateway that its peer trust store admits and that carries a colony URN of the namespace, whichever colony that is. The peer trust store is therefore the one list of the parties a gateway deals with.
 
-Three rules follow from that list:
+Four rules follow from that list:
 
 - Enroll the certificate of each peer gateway. A signed frame verifies against the certificate the store holds for the signing key, so a certificate authority in the store admits no peer.
-- A gateway sends gossip only to a peer whose signed frames it would admit, so the two directions always agree.
+- A gateway with a peer trust store sends gossip only to a peer whose signed frames it would admit, so the two directions agree.
+- A gateway with no peer trust store publishes only. It sends advertisements and gossip to the configured peers its hive trust store holds, and it admits nothing from a peer.
 - The gateway reads the store on every frame and every send. A store that changes while the gateway runs takes effect at once, and a peer removed from it receives nothing further.
 
 ##### Peer Federation

@@ -377,10 +377,13 @@ impl<'a> Flood<'a> {
 
 	/// Decides whether the gateway that holds `cert` belongs to this flood.
 	///
-	/// The rule reads the certificate the peer trust store holds for the key
-	/// of `cert`. A frame signature verifies against that same certificate,
-	/// so the gateways that are sent a rumor are the gateways whose signed
-	/// frames are admitted (CWE-668).
+	/// The rule reads the certificate the store holds for the key of `cert`.
+	///
+	/// - With a peer plane, a frame signature verifies against that same
+	///   certificate, so a rumor is sent only where signed frames are admitted
+	///   (CWE-668).
+	/// - With no peer plane the gateway publishes only: it sends on its hive
+	///   trust store and admits no peer frame.
 	///
 	/// # Errors
 	///
