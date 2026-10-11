@@ -324,13 +324,13 @@ pub enum GossipRumorKind {
 ///
 /// # Scope
 ///
-/// Flood scope is colony membership, which the origin certificate's colony
-/// URN SAN carries. The rumor names no destination and its bytes carry no
-/// scope, because unsigned scope bytes would be weaker than the certificate
-/// binding (CWE-345).
+/// Flood scope is the namespace: a rumor travels between the gateways that
+/// peer trust admits and whose certificates carry a colony URN of it. The
+/// rumor names no destination and its bytes carry no scope, because unsigned
+/// scope bytes would be weaker than the certificate binding (CWE-345).
 ///
-/// Local delivery follows the receiving gateway's policy, which is the
-/// optional gossip ingress servlet type.
+/// Local delivery follows the receiving gateway's policy: the optional
+/// ingress servlet receives the origin-signed frame that carries this body.
 ///
 /// # Frame fields
 ///
@@ -371,7 +371,25 @@ impl GossipRumor {
 pub struct GossipResponse {
 	/// The status of the rumor, where `Ok` means the rumor was accepted,
 	/// delivered, and considered for a reflood.
+	///
+	/// On a relayed rumor, `Unauthenticated` means the receiver's trust does
+	/// not hold the rumor's origin, and it tells the sender to stop offering
+	/// that origin to this receiver. A frame with no signature answers the
+	/// same status.
 	pub status: TransitStatus,
+}
+
+impl GossipResponse {
+	/// Whether the receiver refused the rumor because its trust does not hold
+	/// the rumor's origin.
+	///
+	/// A gateway signs every frame it relays, so on the reply to its own relay
+	/// `Unauthenticated` names the origin. This method is the one reading of
+	/// that status, which the reflood and the repair push both ask.
+	#[must_use]
+	pub(crate) fn refuses_origin(&self) -> bool {
+		self.status == TransitStatus::Unauthenticated
+	}
 }
 
 /// A summary of the rumors a gateway retains, sent so a peer can pull the
@@ -395,7 +413,7 @@ wire_sequence!(GossipReconciliation { held: octets_seq });
 /// unverified hint to its receiver:
 ///
 /// - Admission is bounded per address prefix.
-/// - Only a probe dial whose handshake certificate proves the local colony makes the peer a dial target.
+/// - Only a probe dial whose handshake certificate proves flood membership makes the peer a dial target.
 /// - The fingerprint is advisory identity for deduplication, and trust never
 ///   derives from exchanged bytes (CWE-345).
 #[derive(Debug, Beamable, Clone, PartialEq)]
@@ -415,8 +433,8 @@ pub struct GossipWant {
 	/// The content digests that the replier lacks and requests.
 	pub want: Vec<Vec<u8>>,
 	/// A peer-exchange sample of verified peers, which the replier shares so
-	/// a seed-bootstrapped requester can discover the colony graph. It holds
-	/// at most [`MAX_PEX_SAMPLE`] peers in both directions.
+	/// a seed-bootstrapped requester can discover the flood's gateways. It
+	/// holds at most [`MAX_PEX_SAMPLE`] peers in both directions.
 	///
 	/// [`MAX_PEX_SAMPLE`]: crate::constants::MAX_PEX_SAMPLE
 	pub pex: Vec<PeerGossip>,

@@ -45,10 +45,9 @@ impl<P: Protocol> GenericClient<P> {
 	/// application frame.
 	///
 	/// The single-flight dial defers its handshake to the first
-	/// [`emit`](Self::emit), so a caller that must read peer identity
-	/// (for example a colony gate) before disclosing any request warms
-	/// the connection here first. A transport without encryption
-	/// material completes as a no-op.
+	/// [`emit`](Self::emit). A caller that must read peer identity before it
+	/// discloses any request, as a membership proof does, warms the connection
+	/// here first. Without encryption material the call does nothing.
 	#[cfg(all(feature = "transport-multiplex", feature = "colony"))]
 	pub(crate) async fn complete_handshake(&mut self) -> TransportResult<()>
 	where

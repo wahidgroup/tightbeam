@@ -2961,7 +2961,7 @@ A cluster gateway has five jobs:
 2. **Work Routing**: Forwards each `ClusterWorkRequest` to a local or peer route chosen by the load balancer.
 3. **Health Monitoring**: Sends heartbeats to every hive and evicts hives that stop answering.
 4. **Peer Federation** (optional): Shares servlet types with peer gateways, so work can hop one step to another colony.
-5. **Colony Gossip** (optional): Floods signed rumors across the colony's gateways.
+5. **Colony Gossip** (optional): Floods signed rumors across the gateways of every colony it trusts.
 
 A poisoned internal lock surfaces as `ClusterError::LockPoisoned`. The affected background loop stops and traces `CLUSTER_LOOP_POISONED`, and it stays stopped until the gateway restarts.
 
@@ -3020,6 +3020,15 @@ Hives must also trust the cluster's certificate to accept its heartbeats. See [T
 
 A gateway belongs to the colony named by the URN in its certificate's URI Subject Alternative Name, checked against `ClusterConfig::namespace`. A non-member still registers hives and routes work, but it refuses federation and gossip.
 
+Colonies of one namespace federate. A gateway shares work and gossip with every gateway that its peer trust store admits and that carries a colony URN of the namespace, whichever colony that is. The peer trust store is therefore the one list of the parties a gateway deals with.
+
+Four rules follow from that list:
+
+- Enroll the certificate of each peer gateway. A signed frame verifies against the certificate the store holds for the signing key, so a certificate authority in the store admits no peer.
+- A gateway with a peer trust store sends gossip only to a peer whose signed frames it would admit, so the two directions agree.
+- A gateway with no peer trust store publishes only. It sends advertisements and gossip to the configured peers its hive trust store holds, and it admits nothing from a peer.
+- The gateway reads the store on every frame and every send. A store that changes while the gateway runs takes effect at once, and a peer removed from it receives nothing further.
+
 ##### Peer Federation
 
 Peer federation lets gateways learn which servlet types neighboring colonies export and forward work one hop. Think of it as trail-sharing between nests: each gateway re-advertises what its local hives currently serve.
@@ -3038,16 +3047,17 @@ let conf = ClusterConfig::builder(tls)
 Behavior:
 
 1. Each beat sends peers a signed `AdvertisePeer` that lists the servlet types local hives serve.
-2. The receiver checks the signature, freshness, colony membership, and claimed dial address, then installs peer routes.
+2. The receiver checks the signature, freshness, and claimed dial address, and that both gateways carry a colony URN, then installs peer routes.
 3. Peer routes are soft state, and four things remove them:
    - An empty advertisement withdraws them.
    - Repeated failures abandon them.
-   - An address the peer table evicts or expels loses every peer route that dials it, relay trails through it included.
+   - An address the peer table evicts loses every peer route that dials it, relay trails through it included.
    - Relay trails also expire by age.
 4. A hive route and a peer route never share a socket. The gateway refuses whichever claim arrives second with `PermissionDenied`. Sockets compare as parsed addresses, so any spelling of one socket is the same socket.
 5. The load balancer chooses among local and peer routes together.
 6. Each forward spends a hop budget (`PeerConfig::max_hops`, default 1), so work cannot bounce between peers.
 7. A forward goes out only when the gateway that answers holds the key that signed the advertisement, or the relay's key for a relay trail. Any other answer ends the hop before a frame is sent. The trail counts a failure, and the client reads `Unavailable` unless another trail serves the retry.
+8. A gateway of another colony is a peer like any other: it advertises, serves work, gossips, and is discovered. A learned address that answers with no colony URN of the namespace leaves the peer table and keeps its routes. A configured peer keeps its place in the dial list.
 
 A gateway with an advertise beat that binds a wildcard address (`0.0.0.0` or `[::]`) MUST set `with_advertise_addr`, or it refuses to start with `ClusterError::AdvertiseAddressRequired`.
 
@@ -3208,6 +3218,13 @@ When several instances serve one type, a `LoadBalancer` picks one across local a
 
 Colony gossip floods origin-signed rumors across member gateways: the pheromone broadcast of the swarm. A publisher asks the local gateway to create a rumor. Peers relay and repair until hop budget or freshness expires.
 
+The flood is the namespace. A rumor travels between the gateways that federate under [Colony Membership](#colony-membership), so many parties can share state while each keeps its own colony.
+
+- Every rumor a hive publishes reaches every party the gateway trusts. A party that wants private gossip runs it on a gateway whose peer trust holds its own colony alone.
+- Trust stores need not agree. A gateway accepts a rumor only when it trusts the origin, and it relays only what it accepted. The gateways that trust one origin therefore form that origin's subnet.
+- A subnet must be connected through its own members. A gateway in two subnets receives both and carries nothing between them.
+- A rumor from an origin the receiver does not trust is dropped. The relay pays one token of its rate budget and keeps its routes. It then stops offering that origin to that receiver for one freshness window (`GossipConfig::seen_ttl`).
+
 ```rust,ignore
 let conf = ClusterConfig::builder(tls)
 	.with_peers([peer_addr.to_string()])?
@@ -3223,9 +3240,9 @@ let conf = ClusterConfig::builder(tls)
 Flow:
 
 1. **Publish**: A hive sends a signed `PublishGossip`. The origin gateway signs the rumor and starts the flood.
-2. **Relay**: Peers forward the rumor unchanged under the origin's signature. A gateway accepts only rumors from its own colony.
+2. **Relay**: Peers forward the rumor unchanged under the origin's signature. A gateway sends rumors only to a flood member, and accepts one only from a member and under an origin it trusts.
 3. **Admit**: Each gateway checks size, freshness, hop limit, and sender rate, and drops duplicates.
-4. **Deliver**: `GossipConfig.ingress` names the local servlet type that receives rumors. `None` only relays.
+4. **Deliver**: `GossipConfig.ingress` names the local servlet type that receives rumors. The servlet receives the origin-signed rumor frame: its message decodes as `GossipRumor`, and its signature names the gateway that published it. `None` only relays.
 5. **Reflood**: The rumor continues to peers while hops remain.
 6. **Repair**: `ReconcileGossip` compares held digests, so peers fill gaps.
 
@@ -3299,6 +3316,7 @@ Build a `ClusterConfig` with `ClusterConfig::builder(tls)`. Each setting has one
 | Hop budget                               | `with_max_hops`                                                      | 1                            |
 | Advertisement rumor refresh              | `with_rumor_refresh`                                                 | 30 s                         |
 | Learned-peer store                       | `with_peer_store`                                                    | `MemoryPeerStore`            |
+| Tried entries per signer certificate     | `with_tried_per_signer`                                              | No cap                       |
 | Gossip                                   | `with_gossip_config`, `with_gossip_admission`, `with_gossip_ingress` | `GossipConfig::default()`    |
 | Clock                                    | `with_clock`                                                         | `SystemClock`                |
 

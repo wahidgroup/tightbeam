@@ -28,7 +28,7 @@
 //!
 //! # Gossip
 //!
-//! Colony-scoped rumor floods use the gossip subsystem ([`GossipConfig`],
+//! Rumor floods across the colonies use the gossip subsystem ([`GossipConfig`],
 //! [`GossipJournal`]) for deduplication, retention, and anti-entropy repair.
 
 pub mod builder;
@@ -70,6 +70,7 @@ pub use servlet_registry::{
 };
 
 use core::future::Future;
+use core::num::NonZeroUsize;
 use core::time::Duration;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -262,6 +263,17 @@ impl ClusterTlsConfig {
 		self
 	}
 
+	/// The store a dial to a peer gateway is verified against.
+	///
+	/// A configured peer plane keeps peer dials on `peer_trust`. A gateway with
+	/// no peer plane dials its peers on the hive pool, so `hive_trust` answers
+	/// for it. `PoolConfig::build_cluster_pools` builds the pools in the same
+	/// order.
+	#[must_use]
+	pub(crate) fn peer_dial_trust(&self) -> Option<&dyn crate::crypto::x509::store::CertificateTrust> {
+		self.peer_trust.as_deref().or(self.hive_trust.as_deref())
+	}
+
 	/// The certificate and handshake key this gateway presents.
 	///
 	/// One identity serves the colony listener, the edge listener, and every
@@ -353,6 +365,19 @@ pub struct PeerConfig {
 	/// - `0` disables forwarding entirely.
 	/// - `2` enables relay-trail fallback.
 	pub max_hops: u8,
+	/// Cap on the tried entries one signer may hold in the discovery table,
+	/// where `None` sets no cap.
+	///
+	/// - The prefix buckets bound a network position, and this bounds an identity (CWE-770).
+	/// - One enrolled certificate that answers at many addresses takes at most this many beat-target slots.
+	/// - It is off by default, so an implementor whose trust store admits
+	///   parties it does not control turns it on.
+	/// - A signer is one certificate, counted by fingerprint. A party that
+	///   enrolls several certificates holds this many entries under each.
+	/// - The field is private because the builder copies it into the table at
+	///   build, so a later write changes nothing. Set it with
+	///   [`ClusterConfigBuilder::with_tried_per_signer`].
+	tried_per_signer: Option<NonZeroUsize>,
 	/// Advertisement-rumor refresh interval, as configured.
 	///
 	/// The beat floods the slate rumor when the slate or flood target set
@@ -415,6 +440,7 @@ impl Default for PeerConfig {
 			peer_dial_allowlist: None,
 			table: Arc::default(),
 			max_hops: DEFAULT_MAX_HOPS,
+			tried_per_signer: None,
 			rumor_refresh: Duration::from_millis(DEFAULT_AD_RUMOR_REFRESH_MS),
 			exported_types: None,
 		}
@@ -429,12 +455,12 @@ impl core::fmt::Debug for PeerConfig {
 			.field("advertise_interval", &self.advertise_interval)
 			.field("advertise_addr", &self.advertise_addr)
 			.field("peer_dial_allowlist", &self.peer_dial_allowlist)
+			.field("tried_per_signer", &self.tried_per_signer)
 			.field("table", &self.table)
 			.field("max_hops", &self.max_hops)
 			.field("rumor_refresh", &self.rumor_refresh);
 
 		debug.field("exported_types", &self.exported_types.as_ref().map(|_| "<ExportAllowlist>"));
-
 		debug.finish()
 	}
 }
@@ -507,7 +533,8 @@ pub struct ClusterConfig {
 	pub clock: Arc<dyn Clock>,
 	/// Colony URN from the gateway certificate URI SAN.
 	///
-	/// `None` means the gateway is not a colony member:
+	/// `None` means the gateway is not a colony member, so it is in no flood
+	/// ([`ClusterConfig::flood`]):
 	///
 	/// - Gossip publish, relay and reconcile are refused, and so are peer ads.
 	/// - The advertise beat skips gossip reconciliation.

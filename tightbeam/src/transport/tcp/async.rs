@@ -1626,10 +1626,10 @@ mod tests {
 		Ok(())
 	}
 
-	/// The gossip colony gate reads the peer certificate before any request is
-	/// disclosed (CWE-668), so the deferred single-flight handshake must be
-	/// drivable on its own. It populates the peer certificate and sends no
-	/// application frame, and a repeat does nothing.
+	/// The gossip membership proof reads the peer certificate before any
+	/// request is disclosed (CWE-668), so the deferred single-flight handshake
+	/// must be drivable on its own. It populates the peer certificate and sends
+	/// no application frame, and a repeat does nothing.
 	#[cfg(all(feature = "transport-policy", feature = "transport-ecies"))]
 	#[tokio::test]
 	async fn handshake_completes_alone_and_populates_peer_certificate() -> TransportResult<()> {

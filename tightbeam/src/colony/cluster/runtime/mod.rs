@@ -289,6 +289,7 @@ where
 			trace: Arc::clone(&trace),
 			replay_guard: replay_guard_for_server,
 			tasks: tasks.clone(),
+			ledgers: Arc::default(),
 		};
 
 		// Bind every configured accept plane before any accept loop spawns.

@@ -6,19 +6,23 @@
 //!
 //! - A hive hop dials on the hive pool.
 //! - A peer hop dials through [`PeerPlane::hop`], which binds the hop to the gateway its route names.
-//! - A gossip dial goes through [`PeerPlane::connect_unbound`], which holds an address only.
+//! - A gossip dial goes through [`PeerPlane::connect_member`], which proves the answer is a flood member.
+//! - A direct advertisement goes through [`PeerPlane::connect_unbound`], which holds an address only.
 
 use core::hash::Hash;
 use core::str::FromStr;
 use std::sync::Arc;
 
+use crate::colony::cluster::peer::FloodMember;
 use crate::colony::cluster::runtime::bounds::ClusterPool;
 use crate::colony::cluster::{ClusterConfig, ClusterError, DialTarget};
 use crate::crypto::profiles::DefaultCryptoProvider;
+use crate::crypto::x509::Certificate;
 use crate::transport::messaging::{MessageCollector, MessageEmitter};
 use crate::transport::multiplex::MuxConnector;
 use crate::transport::policy::PolicyConfig;
 use crate::transport::state::EncryptedProtocolState;
+use crate::transport::TransportResult;
 use crate::transport::{EncryptedProtocol, PersistentConnection, PooledClient, Protocol};
 use crate::{encode, Frame};
 
@@ -26,13 +30,16 @@ use crate::{encode, Frame};
 /// pool when no peer trust is configured.
 ///
 /// An advertisement binds its signer to the socket it claims. The pool is
-/// private, and the plane offers two ways to it:
+/// private, and the plane offers three ways to it:
 ///
-/// - [`Self::hop`] carries a route and holds the gateway that answers to it before any frame leaves.
-/// - [`Self::connect_unbound`] holds an address only, so its client talks to whichever gateway answers.
-///
-/// A forward dials through [`Self::hop`], so it reaches only the gateway its
-/// route names (CWE-668).
+/// - [`Self::hop`] carries a route and holds the gateway that answers to it
+///   before any frame leaves. A forward dials this way, so it reaches only
+///   the gateway its route names (CWE-668).
+/// - [`Self::connect_member`] holds an address and proves the answer is a
+///   flood member before any frame leaves. A reconcile round and a rumor
+///   flood dial this way, so gossip stays inside the flood (CWE-668).
+/// - [`Self::connect_unbound`] holds an address only, so its client talks to
+///   whichever gateway answers. A direct advertisement dials this way.
 pub(crate) struct PeerPlane<P: Protocol> {
 	pool: Arc<ClusterPool<P>>,
 	config: Arc<ClusterConfig>,
@@ -57,6 +64,58 @@ impl<P: Protocol> PeerPlane<P> {
 	/// `gateway_id`.
 	pub(crate) fn hop<'p>(&'p self, dial: DialTarget, gateway_id: &'p (impl AsRef<[u8]> + ?Sized)) -> Hop<'p, P> {
 		Hop { plane: Plane::Peer { peers: self, gateway_id: gateway_id.as_ref() }, dial }
+	}
+}
+
+/// A dialed connection whose far end proved it belongs to this gateway's
+/// flood.
+///
+/// [`PeerPlane::connect_member`] is the only constructor, and a gossip frame
+/// leaves through [`Self::emit`] alone, so gossip reaches a flood member and
+/// no other gateway (CWE-668).
+pub(crate) struct FloodClient<P>
+where
+	P: Protocol + PersistentConnection,
+	P::Address: Hash + Eq + Send + Sync,
+{
+	client: PooledClient<P>,
+}
+
+impl<P> FloodClient<P>
+where
+	P: Protocol
+		+ PersistentConnection
+		+ EncryptedProtocol<CryptoProvider = DefaultCryptoProvider>
+		+ Send
+		+ Sync
+		+ 'static,
+	P::Address: Hash + Eq + Clone + Send + Sync + FromStr + 'static,
+	P::Transport: MessageEmitter
+		+ MessageCollector
+		+ PolicyConfig
+		+ MuxConnector
+		+ EncryptedProtocolState
+		+ Send
+		+ Sync
+		+ 'static,
+{
+	/// Wraps `client`, whose far end `_proof` names as a flood member.
+	fn new(client: PooledClient<P>, _proof: FloodMember) -> Self {
+		Self { client }
+	}
+
+	/// Emits `frame` to the member and returns its reply, when it sends one.
+	///
+	/// # Errors
+	///
+	/// - [`crate::transport::TransportError`] -- the emit failed on the pooled connection.
+	pub(crate) async fn emit(&mut self, frame: Frame, attempt: Option<usize>) -> TransportResult<Option<Frame>> {
+		self.client.emit(frame, attempt).await
+	}
+
+	/// The certificate the member presented in the handshake.
+	pub(crate) fn peer_certificate(&self) -> Option<&Certificate> {
+		self.client.peer_certificate()
 	}
 }
 
@@ -106,9 +165,8 @@ where
 {
 	/// Connects to `address` and returns a client to the gateway that answers.
 	///
-	/// Gossip holds each target by address. A reconcile round checks the colony
-	/// of the answer. An advertisement and a reflood go to the gateway that
-	/// answers.
+	/// A direct advertisement dials this way. It is owed to every beat target,
+	/// and the receiver decides whether to admit it.
 	///
 	/// # Errors
 	///
@@ -119,6 +177,42 @@ where
 	) -> Result<PooledClient<P>, ClusterError> {
 		let client = self.pool.connect(address).await?;
 		Ok(client)
+	}
+
+	/// Connects to `address` and returns the client once the gateway that
+	/// answered proved it belongs to this gateway's flood.
+	///
+	/// A reconcile round and a rumor flood dial this way, so gossip bytes
+	/// leave only toward a flood member (CWE-668).
+	///
+	/// - A cold connection defers its handshake to the first emit, so the
+	///   handshake completes here, before the caller can send anything.
+	/// - `None` means a gateway outside the flood answered. That is an answer
+	///   about the address, where an `Err` is a failed dial.
+	/// - The proof is asked on every call, so a pooled connection to a gateway
+	///   the trust store has since dropped yields `None`.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::Transport`] -- the dial or the handshake failed.
+	pub(crate) async fn connect_member(
+		&self,
+		address: impl Into<P::Address>,
+	) -> Result<Option<FloodClient<P>>, ClusterError> {
+		let mut client = self.pool.connect(address).await?;
+		client.complete_handshake().await?;
+
+		let Some(flood) = self.config.flood() else {
+			return Ok(None);
+		};
+		let Some(certificate) = client.peer_certificate() else {
+			return Ok(None);
+		};
+		let Ok(member) = flood.member(certificate) else {
+			return Ok(None);
+		};
+
+		Ok(Some(FloodClient::new(client, member)))
 	}
 
 	/// Connects to `address` and returns the client once the gateway that
@@ -175,6 +269,7 @@ where
 	///   re-emitted as-is. DER is canonical, so the emitted bytes match what
 	///   the client signed and the servlet can verify the envelope end to end.
 	/// - The reply frame returns encoded whole so the client can verify the servlet's envelope the same way.
+	/// - An origin-signed gossip rumor reaches an ingress servlet through this path too, for the same reason.
 	///
 	/// [`ClusterWorkRequest::payload`]: crate::colony::common::ClusterWorkRequest::payload
 	pub(crate) async fn deliver_frame(self, frame: Frame) -> Result<Vec<u8>, ClusterError> {
@@ -185,9 +280,8 @@ where
 	/// Delivers hop-local bytes under a fresh transport wrapper and
 	/// returns the reply body.
 	///
-	/// This path carries the messages that are not end-to-end frames:
-	/// a re-encoded [`ClusterRequest::Work`] envelope toward a peer gateway,
-	/// or a gossip application payload toward an ingress servlet.
+	/// This path carries the one message that is not an end-to-end frame: a
+	/// re-encoded [`ClusterRequest::Work`] envelope toward a peer gateway.
 	///
 	/// [`ClusterRequest::Work`]: crate::colony::common::ClusterRequest::Work
 	pub(crate) async fn deliver_envelope(self, message: impl Into<Vec<u8>>) -> Result<Vec<u8>, ClusterError> {

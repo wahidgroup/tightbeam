@@ -49,6 +49,20 @@ impl<'f> Refusal<'f> {
 		}
 	}
 
+	/// Answers a gossip rumor with the status its settling returned.
+	///
+	/// A settling that faulted is this gateway's fault, so it answers as
+	/// [`Self::gossip_fault`] does.
+	pub(crate) fn gossip_settled(
+		self,
+		settled: Result<TransitStatus, LoopFault>,
+	) -> Result<Option<Frame>, TightBeamError> {
+		match settled {
+			Ok(status) => self.gossip(status),
+			Err(fault) => self.gossip_fault(fault),
+		}
+	}
+
 	/// Answers a gossip rumor whose handling hit a fault of this gateway's.
 	///
 	/// A poisoned registry, table, or journal is this gateway's fault, so it

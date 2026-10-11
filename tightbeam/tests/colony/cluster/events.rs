@@ -57,14 +57,17 @@ pub(crate) const JOURNAL_RECORDS: Urn<'static> = tightbeam::urn!("test", "event:
 pub(crate) const JOURNAL_ACKS: Urn<'static> = tightbeam::urn!("test", "event:cluster/journal-acks");
 pub(crate) const GOSSIP_LIMITED_STATUS: Urn<'static> = tightbeam::urn!("test", "event:cluster/gossip-limited-status");
 pub(crate) const GOSSIP_RELAY_STATUS: Urn<'static> = tightbeam::urn!("test", "event:cluster/gossip-relay-status");
+pub(crate) const GOSSIP_STRANGER_STATUS: Urn<'static> = tightbeam::urn!("test", "event:cluster/gossip-stranger-status");
+pub(crate) const GOSSIP_INGRESS_SIGNED_BY_GATEWAY: Urn<'static> =
+	tightbeam::urn!("test", "event:cluster/gossip-ingress-signed-by-gateway");
 pub(crate) const GOSSIP_ROUTES_AFTER_SCORING: Urn<'static> =
 	tightbeam::urn!("test", "event:cluster/gossip-routes-after-scoring");
 pub(crate) const GOSSIP_GREY_HOLE_CONTAINED: Urn<'static> =
 	tightbeam::urn!("test", "event:cluster/gossip-grey-hole-contained");
 pub(crate) const GOSSIP_RECONCILE_MEMBER_WANT: Urn<'static> =
 	tightbeam::urn!("test", "event:cluster/gossip-reconcile-member-want");
-pub(crate) const GOSSIP_RECONCILE_FOREIGN_WANT: Urn<'static> =
-	tightbeam::urn!("test", "event:cluster/gossip-reconcile-foreign-want");
+pub(crate) const GOSSIP_RECONCILE_NEIGHBOR_WANT: Urn<'static> =
+	tightbeam::urn!("test", "event:cluster/gossip-reconcile-neighbor-want");
 pub(crate) const GOSSIP_RECONCILE_STRANGER_WANT: Urn<'static> =
 	tightbeam::urn!("test", "event:cluster/gossip-reconcile-stranger-want");
 pub(crate) const GOSSIP_REPLAY_STATUS: Urn<'static> = tightbeam::urn!("test", "event:cluster/gossip-replay-status");
@@ -81,16 +84,27 @@ pub(crate) const PEER_PROBE_HINTS_ADMITTED: Urn<'static> =
 	tightbeam::urn!("test", "event:cluster/peer-probe-hints-admitted");
 pub(crate) const PEER_PROBE_MEMBER_PROMOTED: Urn<'static> =
 	tightbeam::urn!("test", "event:cluster/peer-probe-member-promoted");
-pub(crate) const PEER_PROBE_FOREIGN_REFUSED: Urn<'static> =
-	tightbeam::urn!("test", "event:cluster/peer-probe-foreign-refused");
+pub(crate) const PEER_PROBE_NEIGHBOR_PROMOTED: Urn<'static> =
+	tightbeam::urn!("test", "event:cluster/peer-probe-neighbor-promoted");
+pub(crate) const PEER_PROBE_STRANGER_REFUSED: Urn<'static> =
+	tightbeam::urn!("test", "event:cluster/peer-probe-stranger-refused");
 pub(crate) const PEER_HINT_LEARNED_ON_REFUSE: Urn<'static> =
 	tightbeam::urn!("test", "event:cluster/peer-hint-learned-on-refuse");
 pub(crate) const WILDCARD_START_REFUSED: Urn<'static> = tightbeam::urn!("test", "event:cluster/wildcard-start-refused");
 pub(crate) const WILDCARD_PORT_RELEASED: Urn<'static> = tightbeam::urn!("test", "event:cluster/wildcard-port-released");
 pub(crate) const PEER_ROUTE_DIALS_ADVERTISED_ADDR: Urn<'static> =
 	tightbeam::urn!("test", "event:cluster/peer-route-dials-advertised-addr");
-pub(crate) const PEER_ABUSE_CANDIDATE_DISCARDED: Urn<'static> =
-	tightbeam::urn!("test", "event:cluster/peer-abuse-candidate-discarded");
+pub(crate) const PEER_ABUSE_CANDIDATE_HELD_BACK: Urn<'static> =
+	tightbeam::urn!("test", "event:cluster/peer-abuse-candidate-held-back");
+pub(crate) const PEER_ROUTES_AFTER_UNKNOWN_ORIGIN: Urn<'static> =
+	tightbeam::urn!("test", "event:cluster/peer-routes-after-unknown-origin");
+pub(crate) const GOSSIP_ORIGIN_SETTLED: Urn<'static> = tightbeam::urn!("test", "event:cluster/gossip-origin-settled");
+pub(crate) const FLOOD_THIRD_COLONY_PROMOTED: Urn<'static> =
+	tightbeam::urn!("test", "event:cluster/flood-third-colony-promoted");
+pub(crate) const FLOOD_BRIDGE_JOINED: Urn<'static> = tightbeam::urn!("test", "event:cluster/flood-bridge-joined");
+pub(crate) const FLOOD_HELD_BY_MAIN: Urn<'static> = tightbeam::urn!("test", "event:cluster/flood-held-by-main");
+pub(crate) const FLOOD_HELD_BY_OTHER: Urn<'static> = tightbeam::urn!("test", "event:cluster/flood-held-by-other");
+pub(crate) const FLOOD_HELD_BY_THIRD: Urn<'static> = tightbeam::urn!("test", "event:cluster/flood-held-by-third");
 pub(crate) const PEER_EVICT_MEMBER_PROMOTED: Urn<'static> =
 	tightbeam::urn!("test", "event:cluster/peer-evict-member-promoted");
 pub(crate) const PEER_EVICT_TARGET_DROPPED: Urn<'static> =
@@ -101,8 +115,27 @@ pub(crate) const PEER_EXPEL_ADDRESS_VERIFIED: Urn<'static> =
 	tightbeam::urn!("test", "event:cluster/peer-expel-address-verified");
 pub(crate) const PEER_EXPEL_TARGET_DROPPED: Urn<'static> =
 	tightbeam::urn!("test", "event:cluster/peer-expel-target-dropped");
-pub(crate) const PEER_EXPEL_ROUTES_WITHDRAWN: Urn<'static> =
-	tightbeam::urn!("test", "event:cluster/peer-expel-routes-withdrawn");
+pub(crate) const PEER_ROUTES_AFTER_EXPEL: Urn<'static> =
+	tightbeam::urn!("test", "event:cluster/peer-routes-after-expel");
+pub(crate) const GOSSIP_STATUS_BEFORE_SWITCH: Urn<'static> =
+	tightbeam::urn!("test", "event:cluster/gossip-status-before-switch");
+pub(crate) const GOSSIP_STATUS_AFTER_SWITCH: Urn<'static> =
+	tightbeam::urn!("test", "event:cluster/gossip-status-after-switch");
+pub(crate) const GOSSIP_HELD_AFTER_REMOVAL: Urn<'static> =
+	tightbeam::urn!("test", "event:cluster/gossip-held-after-removal");
+pub(crate) const GOSSIP_HELD_BY_AUTHORITY_LEAF: Urn<'static> =
+	tightbeam::urn!("test", "event:cluster/gossip-held-by-authority-leaf");
+pub(crate) const PEX_SHARED_BEFORE_EXPEL: Urn<'static> =
+	tightbeam::urn!("test", "event:cluster/pex-shared-before-expel");
+pub(crate) const PEX_SHARED_AFTER_EXPEL: Urn<'static> = tightbeam::urn!("test", "event:cluster/pex-shared-after-expel");
+pub(crate) const PEER_NEIGHBOR_CANDIDATES: Urn<'static> =
+	tightbeam::urn!("test", "event:cluster/peer-neighbor-candidates");
+pub(crate) const PEER_ROUTES_AFTER_BEATS: Urn<'static> =
+	tightbeam::urn!("test", "event:cluster/peer-routes-after-beats");
+pub(crate) const PEER_ANCHOR_BEATS_ANSWERED: Urn<'static> =
+	tightbeam::urn!("test", "event:cluster/peer-anchor-beats-answered");
+pub(crate) const PEER_ANCHOR_STILL_TARGET: Urn<'static> =
+	tightbeam::urn!("test", "event:cluster/peer-anchor-still-target");
 pub(crate) const PEER_LOCAL_FAULT_MEMBER_PROMOTED: Urn<'static> =
 	tightbeam::urn!("test", "event:cluster/peer-local-fault-member-promoted");
 pub(crate) const PEER_LOCAL_FAULT_MEMBER_RETAINED: Urn<'static> =

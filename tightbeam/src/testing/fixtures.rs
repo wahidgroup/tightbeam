@@ -140,6 +140,13 @@ fn test_signature_algorithm() -> AlgorithmIdentifierOwned {
 /// entry.
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 fn test_certificate_named_with_uri_sans(signing_key: &SigningKey, name: RdnSequence, uris: &[&str]) -> Certificate {
+	test_certificate_named(signing_key, name, Some(vec![test_uri_san_extension(uris)]))
+}
+
+/// Builds the Subject Alternative Name extension that carries each of `uris`
+/// as a URI entry (RFC 5280 §4.2.1.6).
+#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+fn test_uri_san_extension(uris: &[&str]) -> Extension {
 	let names = uris
 		.iter()
 		.map(|uri| {
@@ -148,8 +155,37 @@ fn test_certificate_named_with_uri_sans(signing_key: &SigningKey, name: RdnSeque
 		})
 		.collect();
 
-	let san = SubjectAltName(names);
-	test_certificate_named(signing_key, name, Some(vec![test_extension(&san)]))
+	test_extension(&SubjectAltName(names))
+}
+
+/// Builds a certificate for `subject_key` under `subject`, signed by
+/// `issuer_key` under `issuer`, with a real signature.
+#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+fn issue_test_certificate(
+	issuer_key: &SigningKey,
+	issuer: RdnSequence,
+	subject_key: &SigningKey,
+	subject: RdnSequence,
+	extensions: Vec<Extension>,
+) -> TbResult<Certificate> {
+	let public_key_der = subject_key.verifying_key().to_public_key_der()?;
+	let subject_public_key_info = SubjectPublicKeyInfoOwned::from_der(public_key_der.as_bytes())?;
+	let algorithm = test_signature_algorithm();
+
+	let tbs = TbsCertificate {
+		version: X509Version::V3,
+		serial_number: SerialNumber::new(&[1])?,
+		signature: algorithm.to_owned(),
+		issuer,
+		validity: test_validity()?,
+		subject,
+		subject_public_key_info,
+		issuer_unique_id: None,
+		subject_unique_id: None,
+		extensions: Some(extensions),
+	};
+
+	sign_test_certificate(tbs, &algorithm, issuer_key)
 }
 
 /// Builds the shared body of the placeholder-signed test certificate fixtures,
@@ -600,6 +636,42 @@ impl TestCertificate {
 
 		let key_usage = KeyUsage(usage.into());
 		vec![test_extension(&basic_constraints), test_extension(&key_usage)]
+	}
+
+	/// Builds a certificate authority `CN=<cn>` that signs its own certificate
+	/// and may sign others (RFC 5280 §4.2.1.9 and §4.2.1.3).
+	///
+	/// # Errors
+	///
+	/// - [`crate::TightBeamError`] -- the name, the DER encoding, or the signing fails.
+	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+	pub fn authority(signing_key: &SigningKey, cn: impl AsRef<str>) -> TbResult<Certificate> {
+		let name = test_cn_name(cn)?;
+		let extensions = TestCertificate::ca_extensions(true, true, None);
+		issue_test_certificate(signing_key, name.to_owned(), signing_key, name, extensions)
+	}
+
+	/// Builds a leaf `CN=<cn>` that the authority `CN=<issuer_cn>` signs with
+	/// `issuer_key`, carrying each of `uris` as a URI Subject Alternative Name.
+	///
+	/// A store that holds the authority validates this leaf by its chain. It
+	/// does not hold the leaf, so it resolves no signer for the leaf's key.
+	///
+	/// # Errors
+	///
+	/// - [`crate::TightBeamError`] -- a name, the DER encoding, or the signing fails.
+	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+	pub fn issued_with_uri_sans(
+		issuer_key: &SigningKey,
+		issuer_cn: impl AsRef<str>,
+		signing_key: &SigningKey,
+		cn: impl AsRef<str>,
+		uris: &[&str],
+	) -> TbResult<Certificate> {
+		let issuer = test_cn_name(issuer_cn)?;
+		let subject = test_cn_name(cn)?;
+		let extensions = vec![test_uri_san_extension(uris)];
+		issue_test_certificate(issuer_key, issuer, signing_key, subject, extensions)
 	}
 
 	/// Create a valid certificate chain in which a root signs an intermediate

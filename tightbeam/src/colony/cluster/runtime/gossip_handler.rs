@@ -39,8 +39,8 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 	) -> Result<Option<Frame>, TightBeamError> {
 		let verified = match self.config.verify_peer(&frame) {
 			Ok(verified) => verified,
-			Err(status) => {
-				return Refusal::to(&frame, &self.trace).peer_ad(status);
+			Err(refusal) => {
+				return Refusal::to(&frame, &self.trace).peer_ad(refusal.into());
 			}
 		};
 
@@ -61,7 +61,7 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 		// A verified advertiser is also a discovery hint, so the beat graph
 		// runs in both directions and this gateway's own probe dials a
 		// seed-bootstrapped node. The hint sits in the capped new table until
-		// that probe passes the colony gate.
+		// that probe proves the address answers as a flood member.
 		let hint = admitted.discovery_hint();
 		if self.config.peer.table.learn([hint]).is_err() {
 			return Refusal::to(&frame, &self.trace).peer_ad_release(&self.replay_guard, TransitStatus::Unavailable);
@@ -108,24 +108,23 @@ where
 		rumor: Box<Frame>,
 	) -> Result<Option<Frame>, TightBeamError> {
 		let rumor = *rumor;
-		// The flood is scoped to one colony (CWE-668), so the relaying peer
-		// MUST share this gateway's colony URN. A mismatch is a policy
-		// refusal, so the relay's score stays as it is.
-		let Some(local_colony) = self.config.colony_urn() else {
+		// The flood is scoped (CWE-668), so the relaying peer MUST be a member
+		// of it. A peer outside it is a policy refusal, so the relay's score
+		// stays as it is.
+		let Some(flood) = self.config.flood() else {
 			return Refusal::to(&frame, &self.trace).gossip(TransitStatus::PermissionDenied);
 		};
 
 		let relay_id = match self.config.verify_peer(&frame) {
 			Ok(verified) => {
-				let peer_colony = self.config.namespace.cert_colony_urn(verified.signer_cert());
-				if peer_colony.as_ref() != Some(local_colony) {
-					return Refusal::to(&frame, &self.trace).gossip(TransitStatus::PermissionDenied);
+				if let Err(status) = flood.member(verified.signer_cert()) {
+					return Refusal::to(&frame, &self.trace).gossip(status);
 				}
 
 				verified.fingerprint()
 			}
-			Err(status) => {
-				return Refusal::to(&frame, &self.trace).gossip(status);
+			Err(refusal) => {
+				return Refusal::to(&frame, &self.trace).gossip(refusal.into());
 			}
 		};
 
@@ -139,22 +138,22 @@ where
 			}
 		};
 
-		// The origin signature verifies on the peer trust plane, and an
-		// unverifiable rumor scores the relay.
-		let (origin_colony, rumor_signer) = match self.config.verify_peer(&rumor) {
+		// The origin signature verifies on the peer trust plane, and the
+		// refusal settles what an unverifiable rumor costs the relay. An
+		// origin outside the flood is a policy refusal, as for the relay.
+		let rumor_signer = match self.config.verify_peer(&rumor) {
 			Ok(verified) => {
-				let colony = self.config.namespace.cert_colony_urn(verified.signer_cert());
-				let signer = verified.fingerprint();
-				(colony, signer)
+				if let Err(status) = flood.member(verified.signer_cert()) {
+					return Refusal::to(&frame, &self.trace).gossip(status);
+				}
+
+				verified.fingerprint()
 			}
-			Err(status) => {
-				let scored = self.weaken_invalid_relay(GossipOrigin::Relay, Some(&relay_id));
-				return Refusal::to(&frame, &self.trace).gossip_scored(scored, status);
+			Err(refusal) => {
+				let settled = refusal.settle_origin(&self, &frame, &relay_id);
+				return Refusal::to(&frame, &self.trace).gossip_settled(settled);
 			}
 		};
-		if origin_colony.as_ref() != Some(local_colony) {
-			return Refusal::to(&frame, &self.trace).gossip(TransitStatus::PermissionDenied);
-		}
 
 		// Freshness for a relayed rumor is its issue time, which `admit`
 		// checks against the seen TTL (seen-ttl) rather than the control
@@ -169,13 +168,13 @@ where
 		frame: Frame,
 		body: GossipRumor,
 	) -> Result<Option<Frame>, TightBeamError> {
-		if let Err(status) = self.config.verify_hive(&frame) {
-			return Refusal::to(&frame, &self.trace).gossip(status);
+		if let Err(refusal) = self.config.verify_hive(&frame) {
+			return Refusal::to(&frame, &self.trace).gossip(refusal.into());
 		}
 
-		// An origin rumor is scoped by this gateway's colony SAN, which the
-		// gateway MUST hold to publish.
-		if self.config.colony_urn().is_none() {
+		// An origin rumor travels in this gateway's flood, so a gateway in no
+		// flood has nowhere to publish.
+		if self.config.flood().is_none() {
 			return Refusal::to(&frame, &self.trace).gossip(TransitStatus::PermissionDenied);
 		}
 
@@ -228,9 +227,10 @@ impl ClusterConfig {
 	///
 	/// - Entries are deduped by dial address.
 	/// - The sample is capped at [`MAX_PEX_SAMPLE`].
-	/// - This gateway verified both sources.
-	/// - The receiver still treats every entry as an unverified hint until
-	///   its own probe passes the colony gate.
+	/// - Both sources name flood members: a probe proved each table entry, and
+	///   a member's signed advertisement installed each route.
+	/// - A route outlives an expel, so a route's address is shared only while the peer table still holds it.
+	/// - The receiver still treats every entry as an unverified hint until its own probe proves membership.
 	///
 	/// # Sources
 	///
@@ -252,9 +252,14 @@ impl ClusterConfig {
 		// identity with the relay's dial address, and that pair names no
 		// dialable peer.
 		let peer_entries = servlet_registry.peer_entries()?;
-		let routes = peer_entries
-			.into_iter()
-			.filter(|entry| entry.route_kind() == RouteKind::Peer)
+		let direct = peer_entries.iter().filter(|entry| entry.route_kind() == RouteKind::Peer);
+
+		// A route outlives an expel, so the table says which advertised sockets
+		// it still holds, and the sample shares those alone.
+		let advertised = direct.clone().filter_map(|entry| entry.dial_target().socket());
+		let held = self.peer.table.held_among(advertised)?;
+		let routes = direct
+			.filter(|entry| entry.dial_target().socket().is_some_and(|socket| held.contains(&socket)))
 			.map(|entry| PeerGossip {
 				peer_id: entry.owner_id().to_vec(),
 				gateway_addr: entry.dial_target().route_bytes().to_vec(),
@@ -276,21 +281,23 @@ impl ClusterConfig {
 	}
 }
 
-/// Compare peer digests and reply with digests this gateway still needs.
 impl<P: Protocol> GatewayRuntimeCtx<P> {
-	/// Answer one anti-entropy reconcile round from a colony member.
+	/// Answer one anti-entropy reconcile round from a flood member.
+	///
+	/// The reply names the digests this gateway still needs, beside a
+	/// peer-exchange sample.
 	pub(crate) async fn handle_reconcile(
 		&self,
 		frame: Frame,
 		reconciliation: GossipReconciliation,
 	) -> Result<Option<Frame>, TightBeamError> {
-		let requester_colony = match self.config.verify_peer(&frame) {
-			Ok(verified) => self.config.namespace.cert_colony_urn(verified.signer_cert()),
-			Err(_) => {
-				return Refusal::to(&frame, &self.trace).reconcile();
-			}
+		let Some(flood) = self.config.flood() else {
+			return Refusal::to(&frame, &self.trace).reconcile();
 		};
-		if self.config.colony_urn().is_none() || requester_colony.as_ref() != self.config.colony_urn() {
+		let Ok(verified) = self.config.verify_peer(&frame) else {
+			return Refusal::to(&frame, &self.trace).reconcile();
+		};
+		if flood.member(verified.signer_cert()).is_err() {
 			return Refusal::to(&frame, &self.trace).reconcile();
 		}
 

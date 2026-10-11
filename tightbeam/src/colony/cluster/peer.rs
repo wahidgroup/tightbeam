@@ -11,7 +11,7 @@ use crate::colony::common::IssuedAt;
 use crate::colony::common::{ClusterWorkRequest, ColonyNamespace, PeerAdvertisement};
 use crate::constants::{DEFAULT_HOP_BUDGET, MAX_ADVERTISED_TYPES};
 use crate::crypto::hash::Sha3_256;
-use crate::crypto::x509::store::CertificateTrustStore;
+use crate::crypto::x509::store::{CertificateTrust, CertificateTrustStore};
 use crate::crypto::x509::utils::CertificateExt;
 use crate::crypto::x509::Certificate;
 use crate::policy::TransitStatus;
@@ -169,10 +169,10 @@ pub struct AdmittedPeerAd {
 /// Fallback trails for one admitted advertisement through one relay.
 ///
 /// The slate reconciles under the composite `origin NUL relay` bucket,
-/// so relay trails live and die independently of the origin's direct
-/// slate. The origin's next direct advertisement leaves them in place.
-/// A trail leaves when the relay it dials is evicted or expelled, and an
-/// idle trail decays away by staleness pruning.
+/// so a relay trail outlives a replacement of the origin's direct slate. An
+/// empty direct advertisement removes it with the direct routes. A trail also
+/// leaves when the relay it dials is evicted, and an idle trail decays away by
+/// staleness pruning.
 pub struct RelayTrail {
 	/// The composite `origin NUL relay` bucket this slate reconciles under.
 	pub(super) bucket: SharedId,
@@ -192,7 +192,7 @@ impl AdmittedPeerAd {
 	///
 	/// 1. The signer MUST resolve on the peer plane, and the slate keys by its
 	///    certificate fingerprint rather than the claimed `gateway_addr`.
-	/// 2. The local and the peer certificate MUST both carry a colony URN SAN.
+	/// 2. This gateway MUST be in a flood, and the signer MUST be a member of it.
 	/// 3. [`PeerConfig::admit_claim`] MUST admit the claimed address, and the
 	///    advertised types MUST be bare servlet types within the type cap.
 	///
@@ -218,13 +218,10 @@ impl AdmittedPeerAd {
 		// advertising peer must carry a valid colony URN SAN. A certificate
 		// without one still serves general transport and work, but it grants
 		// no membership.
-		{
-			let local_member = conf.colony_urn().is_some();
-			let peer_member = conf.namespace.cert_colony_urn(signer_cert).is_some();
-			if !(local_member && peer_member) {
-				return Err(TransitStatus::PermissionDenied);
-			}
-		}
+		let Some(flood) = conf.flood() else {
+			return Err(TransitStatus::PermissionDenied);
+		};
+		flood.member(signer_cert)?;
 
 		let dial = peer_advertisement_wire_ok(&ad.gateway_addr, &ad.advertised_types, &conf.namespace, &conf.peer)?;
 
@@ -252,8 +249,9 @@ impl AdmittedPeerAd {
 	/// # Bucket
 	///
 	/// The trails reconcile under their own `origin NUL relay` bucket
-	/// (`ServletRegistry::reconcile_relay_trail`), so the origin's direct
-	/// slate lifecycle leaves the fallback in place.
+	/// (`ServletRegistry::reconcile_relay_trail`), so a replacement of the
+	/// origin's direct slate leaves the fallback in place. An empty direct
+	/// advertisement removes both.
 	#[must_use]
 	pub fn relay_trail(
 		&self,
@@ -293,13 +291,14 @@ impl AdmittedPeerAd {
 	/// signer's admitted dial address plus its certificate fingerprint.
 	///
 	/// The hint owns its fields because it outlives this borrowed
-	/// advertisement inside the peer table.
+	/// advertisement inside the peer table. Every admitted advertiser is a
+	/// flood member, so every one yields a hint.
 	///
 	/// # Unproven address
 	///
 	/// The advertiser dialed this gateway, so nothing proves the claimed
 	/// address dials back yet. The peer table holds the hint in `new` until
-	/// this gateway's own probe passes the colony gate, the way the Bitcoin
+	/// this gateway's own probe proves membership, the way the Bitcoin
 	/// address manager holds a self-announced address.
 	#[must_use]
 	pub fn discovery_hint(&self) -> PeerHint {
@@ -326,6 +325,91 @@ fn peer_advertisement_wire_ok(
 		Ok(dial)
 	} else {
 		Err(TransitStatus::PermissionDenied)
+	}
+}
+
+/// The flood this gateway gossips in: the scope a rumor, a reconcile round,
+/// a repair, and a peer exchange travel inside.
+///
+/// [`ClusterConfig::flood`] builds one, and only for a gateway whose own
+/// certificate carries a colony URN.
+///
+/// # Scope
+///
+/// The flood is the namespace. A member is a gateway whose key the peer trust
+/// store holds, and whose certificate in that store carries a colony URN of
+/// this namespace, whichever colony it names. This type is the one home for
+/// that rule. Every inbound gossip frame and every outbound gossip dial asks
+/// [`Self::member`], so the rule is written once.
+///
+/// - Colonies are the parties, and the flood is the state they share. Work
+///   federation admits the same set, so one rule decides both planes.
+/// - The peer trust store is the share set. A gateway receives the rumors of
+///   the origins it trusts and of no other, so trust stores that differ
+///   divide one namespace into subnets.
+/// - A trusted certificate with no colony URN of the namespace is outside every flood.
+/// - Each question reads the store, so a change to it while the gateway runs takes effect at once.
+/// - A certificate authority in the store admits no gateway, because the
+///   store must hold the certificate of each key that signs a frame.
+/// - A gateway with no peer plane dials its peers on the hive pool, so its
+///   hive trust store is the list (`ClusterTlsConfig::peer_dial_trust`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Flood<'a> {
+	namespace: &'a ColonyNamespace,
+	/// The store this gateway dials its peers under, which is the list of
+	/// parties. With no store the flood has no member.
+	peer_trust: Option<&'a dyn CertificateTrust>,
+}
+
+/// Proof that a certificate belongs to a [`Flood`].
+///
+/// [`Flood::member`] is the only constructor, so a value of this type means
+/// the membership rule ran on a certificate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FloodMember(());
+
+impl<'a> Flood<'a> {
+	/// The flood of a member gateway under `namespace`, with `peer_trust` as
+	/// its list of parties.
+	fn new(namespace: &'a ColonyNamespace, peer_trust: Option<&'a dyn CertificateTrust>) -> Self {
+		Self { namespace, peer_trust }
+	}
+
+	/// Decides whether the gateway that holds `cert` belongs to this flood.
+	///
+	/// The rule reads the certificate the store holds for the key of `cert`.
+	///
+	/// - With a peer plane, a frame signature verifies against that same
+	///   certificate, so a rumor is sent only where signed frames are admitted
+	///   (CWE-668).
+	/// - With no peer plane the gateway publishes only: it sends on its hive
+	///   trust store and admits no peer frame.
+	///
+	/// # Errors
+	///
+	/// - [`TransitStatus::PermissionDenied`] -- the certificate is outside the flood.
+	pub(crate) fn member(&self, cert: &Certificate) -> Result<FloodMember, TransitStatus> {
+		let enrolled = self.peer_trust.and_then(|trust| trust.enrolled_certificate(cert));
+		let colony = enrolled.and_then(|enrolled| self.namespace.cert_colony_urn(enrolled));
+		if colony.is_none() {
+			return Err(TransitStatus::PermissionDenied);
+		}
+
+		Ok(FloodMember(()))
+	}
+}
+
+impl ClusterConfig {
+	/// The flood this gateway gossips in.
+	///
+	/// It returns `None` for a gateway whose certificate carries no colony
+	/// URN, which gossips nothing. The constructor of [`Flood`] is private to
+	/// this file, so a flood exists only for a gateway this method takes.
+	#[must_use]
+	pub(crate) fn flood(&self) -> Option<Flood<'_>> {
+		self.colony_urn.as_ref()?;
+
+		Some(Flood::new(&self.namespace, self.tls.peer_dial_trust()))
 	}
 }
 
@@ -393,6 +477,12 @@ mod tests {
 	use super::*;
 	use crate::colony::cluster::PeerAddress;
 
+	/// A colony URN under another naming authority.
+	fn foreign_colony() -> Urn<'static> {
+		let foreign = ColonyNamespace::new("acme", "").unwrap_or_default();
+		foreign.colony("main").expect("static colony name")
+	}
+
 	fn nestmate_ns() -> ColonyNamespace {
 		ColonyNamespace::default()
 	}
@@ -454,6 +544,16 @@ mod tests {
 		let types = types.as_ref();
 		let slate = test_pheromone().peer_slate(origin, dial, types);
 		AdmittedPeerAd { peer_hive_id: Arc::clone(origin), dial, slate, order: UnixMillis::new(0) }
+	}
+
+	#[test]
+	fn discovery_hint_names_the_advertiser() {
+		let origin: SharedId = Arc::from([1u8; 32].as_slice());
+		let ad = admitted_ad(&origin, "127.0.0.1:9000", &[ping_type()]);
+
+		let hint = ad.discovery_hint();
+		assert_eq!(hint.dial, AdmittedDial::fixture("127.0.0.1:9000"));
+		assert_eq!(hint.peer_id.as_deref(), Some(origin.as_ref()));
 	}
 
 	/// The fixture socket a relaying gateway is dialed at.
@@ -527,11 +627,6 @@ mod tests {
 			nestmate_ns().colony("other").expect("static colony name")
 		}
 
-		fn foreign_colony() -> Urn<'static> {
-			let foreign = ColonyNamespace::new("acme", "").unwrap_or_default();
-			foreign.colony("main").expect("static colony name")
-		}
-
 		#[test]
 		fn cert_colony_urn_extracts_a_valid_san() {
 			let key = TestKey::insecure_fixed_signing();
@@ -575,6 +670,86 @@ mod tests {
 			let key = TestKey::insecure_fixed_signing();
 			let cert = TestCertificate::with_uri_sans(&key, &[&foreign_colony().to_string()]);
 			assert_eq!(nestmate_ns().cert_colony_urn(&cert), None);
+		}
+	}
+
+	mod flood {
+		use super::*;
+		use crate::crypto::policy::Secp256k1Policy;
+		use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
+		use crate::crypto::x509::store::{CertificateTrustBuilder, TrustBuilder};
+		use crate::tb_cases;
+		use crate::testing::fixtures::{TestCertificate, TestKey};
+
+		/// The colony URN of `name` in the test namespace.
+		fn colony(name: &str) -> String {
+			let urn = nestmate_ns().colony(name).expect("static colony name");
+			urn.to_string()
+		}
+
+		/// What [`Flood::member`] answers.
+		type Answer = Result<FloodMember, TransitStatus>;
+
+		/// The answer the flood of the test namespace gives a certificate that
+		/// carries `sans`.
+		fn membership(sans: &[String]) -> Answer {
+			let sans: Vec<&str> = sans.iter().map(String::as_str).collect();
+			let key = TestKey::insecure_fixed_signing();
+			let cert = TestCertificate::with_uri_sans(&key, &sans);
+
+			let ns = nestmate_ns();
+			let store = store_holding(&cert);
+			let flood = Flood::new(&ns, Some(&store));
+
+			flood.member(&cert)
+		}
+
+		/// A peer trust store that holds `cert` alone.
+		fn store_holding(cert: &Certificate) -> CertificateTrustStore {
+			let builder = CertificateTrustBuilder::from(Secp256k1Policy).with_certificate(cert.clone());
+			builder.expect("the test certificate satisfies the trust builder").build()
+		}
+
+		/// A certificate of colony "main" under a key no fixture store holds.
+		fn unenrolled_member_cert() -> Certificate {
+			let key = Secp256k1SigningKey::from_bytes(&[2u8; 32].into()).expect("the fixture scalar is a valid key");
+			TestCertificate::with_cn_and_uri_sans(&key, "Unenrolled", &[&colony("main")])
+		}
+
+		// The certificate names a colony of the namespace, and the store holds
+		// another key.
+		#[test]
+		fn a_key_the_store_does_not_hold_is_outside_the_flood() {
+			let key = TestKey::insecure_fixed_signing();
+			let enrolled = TestCertificate::with_uri_sans(&key, &[&colony("main")]);
+
+			let ns = nestmate_ns();
+			let store = store_holding(&enrolled);
+			let flood = Flood::new(&ns, Some(&store));
+			assert_eq!(flood.member(&unenrolled_member_cert()), OUTSIDE);
+		}
+
+		#[test]
+		fn a_flood_with_no_peer_trust_has_no_member() {
+			let ns = nestmate_ns();
+			let flood = Flood::new(&ns, None);
+			assert_eq!(flood.member(&unenrolled_member_cert()), OUTSIDE);
+		}
+
+		const MEMBER: Answer = Ok(FloodMember(()));
+		const OUTSIDE: Answer = Err(TransitStatus::PermissionDenied);
+
+		tb_cases! {
+			fn the_flood_decides_membership_from_the_certificate((sans, answer): (Vec<String>, Answer)) {
+				assert_eq!(membership(&sans), answer);
+			}
+			cases {
+				one_colony => (vec![colony("main")], MEMBER),
+				another_colony => (vec![colony("other")], MEMBER),
+				no_colony => (vec![], OUTSIDE),
+				another_namespace => (vec![foreign_colony().to_string()], OUTSIDE),
+				two_colonies => (vec![colony("main"), colony("other")], OUTSIDE),
+			}
 		}
 	}
 }

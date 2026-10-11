@@ -129,9 +129,8 @@ impl ServletRegistry {
 	/// Withdraws every peer route that dials `gateway`, relay trails through
 	/// it included, under one guard.
 	///
-	/// An eviction and an expulsion are evidence about a socket: it stopped
-	/// answering, or it answered with a foreign identity. The socket therefore
-	/// selects the routes, whichever peer advertised them.
+	/// An eviction is evidence about a socket: its rounds kept failing. The
+	/// socket therefore selects the routes, whichever peer advertised them.
 	///
 	/// - A hive route stays, because the evidence concerns the peer plane.
 	/// - A fallback trail to the same origin through another relay stays, because it dials that relay.
@@ -145,7 +144,6 @@ impl ServletRegistry {
 	) -> Result<(), ClusterError> {
 		let gateway: PeerAddress = gateway.into();
 		self.routes.write()?.remove_peer_routes_dialing(gateway);
-
 		Ok(())
 	}
 

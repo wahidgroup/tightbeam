@@ -6,7 +6,7 @@
 //!
 //! # Planes
 //!
-//! - **Direct advertisement**: one signed frame goes to every verified target.
+//! - **Direct advertisement**: one signed frame goes to every beat target.
 //! - **Rumor flood**: the same signed frame, wrapped in a gossip rumor, reaches members beyond direct reach.
 //! - **Pipeline**: an inbound rumor is admitted, rate-limited, journaled, delivered locally, and reflooded.
 //! - **Reconcile**: anti-entropy rounds repair missing rumors and learn peer-exchange hints.
@@ -23,7 +23,7 @@ use crate::colony::cluster::gossip::LocalClaimGuard;
 use crate::colony::cluster::peer::AdmittedPeerAd;
 use crate::colony::cluster::peer::ColonyCertificate;
 use crate::colony::cluster::runtime::bounds::{ClusterDigest, ClusterPool, GatewayRuntimeCtx};
-use crate::colony::cluster::runtime::hop::{Hop, PeerPlane};
+use crate::colony::cluster::runtime::hop::{FloodClient, Hop, PeerPlane};
 use crate::colony::cluster::runtime::refuse::Refusal;
 use crate::colony::cluster::runtime::{LoopFault, VerifiedSignerId};
 use crate::colony::cluster::{
@@ -43,8 +43,8 @@ use crate::decode;
 use crate::encode;
 use crate::instrumentation::events::{
 	CLUSTER_GOSSIP_ACCEPTED, CLUSTER_GOSSIP_DROP_SIGNAL, CLUSTER_GOSSIP_DUPLICATE, CLUSTER_GOSSIP_FANOUT_UNREACHED,
-	CLUSTER_GOSSIP_REFLOOD_FAILED, CLUSTER_GOSSIP_RELAY_WEAKENED, CLUSTER_GOSSIP_WITNESS_REFUSED,
-	CLUSTER_PEER_DISCOVERED, CLUSTER_PEER_EVICTED,
+	CLUSTER_GOSSIP_ORIGIN_REFUSED_BY_PEER, CLUSTER_GOSSIP_REFLOOD_FAILED, CLUSTER_GOSSIP_RELAY_WEAKENED,
+	CLUSTER_GOSSIP_WITNESS_REFUSED, CLUSTER_PEER_DISCOVERED, CLUSTER_PEER_EVICTED,
 };
 use crate::instrumentation::events::{
 	CLUSTER_PEER_AD_DROPPED, CLUSTER_PEER_AD_LEARNED, CLUSTER_PEER_AD_PUBLISH_FAILED, CLUSTER_RELAY_TRAIL_REFUSED,
@@ -131,7 +131,7 @@ impl ClusterConfig {
 	///
 	/// # Delivery paths
 	///
-	/// - A direct dial through [`GossipBeat::send_advertisement`].
+	/// - A direct dial through [`AdvertiseBeat::send_advertisement`].
 	/// - An advertisement rumor through [`ClusterConfig::mint_slate_rumor`].
 	async fn mint_ad_frame<D: ClusterDigest>(
 		&self,
@@ -239,31 +239,297 @@ impl GossipWant {
 	}
 }
 
-/// The peer plane outbound gossip floods and reconciles on.
+/// How one hop of a reflood ended.
+enum FloodHop {
+	/// The target answered, and the answer changes nothing this gateway
+	/// offers it.
+	Settled,
+	/// A gateway outside the flood answered at the target, which is owed no
+	/// rumor.
+	OutsideFlood(AdmittedDial),
+	/// The target answered that the rumor's origin is outside its trust.
+	OriginRefused(AdmittedDial),
+	/// The dial or the emit failed.
+	Unreached,
+}
+
+/// The ledger of every gossip target, behind one lock.
 ///
-/// The advertise beat and the inbound reflood both reach peers through
-/// this one owner, so a rumor leaves on the same plane either way.
-struct GossipBeat<P: Protocol> {
+/// The beat's repair and each inbound reflood both record what a target
+/// answered, so the gateway holds one map and shares it. [`Self::with`] takes
+/// the lock and releases it before it returns, so no guard crosses an await.
+///
+/// # Poison recovery
+///
+/// Each write is one insert or one removal on a set or a map, so a panic
+/// cannot leave a ledger half-written and every method recovers a poisoned
+/// guard instead of stopping the flood.
+#[derive(Default)]
+pub(crate) struct PeerLedgers {
+	by_target: Mutex<HashMap<AdmittedDial, PeerLedger>>,
+}
+
+impl PeerLedgers {
+	/// Runs `read` on the ledger of `target`, which starts empty.
+	fn with<T>(&self, target: AdmittedDial, read: impl FnOnce(&mut PeerLedger) -> T) -> T {
+		let mut by_target = self.by_target.lock().unwrap_or_else(PoisonError::into_inner);
+		read(by_target.entry(target).or_default())
+	}
+
+	/// Keeps the ledgers of the targets `live` names, and forgets every
+	/// refusal older than `window`.
+	///
+	/// The table's caps bound the live set, so they bound this map (CWE-770).
+	fn prune(&self, live: impl Fn(&AdmittedDial) -> bool, now: UnixMillis, window: Duration) {
+		let mut by_target = self.by_target.lock().unwrap_or_else(PoisonError::into_inner);
+		by_target.retain(|target, _| live(target));
+
+		for ledger in by_target.values_mut() {
+			ledger.expire(now, window);
+		}
+	}
+}
+
+/// What this gateway knows about one target's reception of its gossip.
+#[derive(Default)]
+struct PeerLedger {
+	/// The digests the target acknowledged with an explicit `Ok`.
+	acked: HashSet<GossipDigest>,
+	/// The origins the target answered as outside its trust, each with the
+	/// time of that answer.
+	refused_origins: HashMap<Vec<u8>, UnixMillis>,
+}
+
+impl PeerLedger {
+	/// Records that the target acknowledged `digest`.
+	fn ack(&mut self, digest: GossipDigest) {
+		self.acked.insert(digest);
+	}
+
+	/// Decides whether the target drops rumors it acknowledged, and forgets
+	/// the acknowledgement of every digest in `wanted`.
+	///
+	/// A digest this gateway saw acknowledged, wanted again while retained,
+	/// is a drop.
+	fn drop_signal(&mut self, wanted: impl AsRef<[GossipDigest]>) -> bool {
+		let wanted = wanted.as_ref();
+		let dropped = wanted.iter().any(|digest| self.acked.contains(digest));
+		for digest in wanted {
+			self.acked.remove(digest);
+		}
+
+		dropped
+	}
+
+	/// Records that the target answered `origin` as outside its trust.
+	fn refuse_origin(&mut self, origin: impl Into<Vec<u8>>, now: UnixMillis) {
+		self.refused_origins.insert(origin.into(), now);
+	}
+
+	/// Decides whether a rumor of `origin` is offered to the target.
+	///
+	/// A refusal stands for `window`. The origin is then offered once more,
+	/// so a target that enrolled it since catches up.
+	fn offers(&self, origin: impl AsRef<[u8]>, now: UnixMillis, window: Duration) -> bool {
+		match self.refused_origins.get(origin.as_ref()) {
+			Some(refused_at) => now.saturating_since(*refused_at) >= window,
+			None => true,
+		}
+	}
+
+	/// Forgets every refusal older than `window`.
+	fn expire(&mut self, now: UnixMillis, window: Duration) {
+		let stands = |refused_at: UnixMillis| now.saturating_since(refused_at) < window;
+		self.refused_origins.retain(|_, refused_at| stands(*refused_at));
+	}
+}
+
+/// The direct-advertisement arm of the advertise beat.
+///
+/// Every gateway with a dial list runs it, in a flood or in none.
+struct AdvertiseBeat<P: Protocol> {
+	config: Arc<ClusterConfig>,
+	peer_plane: PeerPlane<P>,
+	servlet_registry: Arc<ServletRegistry>,
+}
+
+/// The gossip arm of the advertise beat and of the inbound pipeline:
+/// reconcile rounds, feeler probes, the slate rumor, refloods, and repairs.
+///
+/// The beat and the inbound reflood both reach peers through this one
+/// owner, so a rumor leaves on the same plane either way. [`Self::new`]
+/// returns a beat only for a gateway that is in a flood, so every method
+/// here runs on a flood member.
+struct FloodBeat<P: Protocol> {
 	config: Arc<ClusterConfig>,
 	peer_plane: PeerPlane<P>,
 	servlet_registry: Arc<ServletRegistry>,
 	trace: Arc<TraceCollector>,
+	ledgers: Arc<PeerLedgers>,
+}
+
+impl<P: Protocol> FloodBeat<P> {
+	/// The gossip arm of a gateway that is in a flood, or `None` for a
+	/// gateway that is in none.
+	fn new(
+		config: Arc<ClusterConfig>,
+		peer_plane: PeerPlane<P>,
+		servlet_registry: Arc<ServletRegistry>,
+		trace: Arc<TraceCollector>,
+		ledgers: Arc<PeerLedgers>,
+	) -> Option<Self> {
+		config.flood()?;
+
+		Some(Self { config, peer_plane, servlet_registry, trace, ledgers })
+	}
+
+	/// Records that `target` answered `origin` as outside its trust, so this
+	/// gateway offers it no further rumor of that origin for one window.
+	fn settle_refused_origin(
+		&self,
+		target: AdmittedDial,
+		origin: impl AsRef<[u8]>,
+		now: UnixMillis,
+	) -> Result<(), TightBeamError> {
+		let origin = origin.as_ref();
+		self.ledgers.with(target, |ledger| ledger.refuse_origin(origin, now));
+
+		let event = self.trace.event(CLUSTER_GOSSIP_ORIGIN_REFUSED_BY_PEER)?;
+		event.with_payload(target.address().route_bytes().as_ref()).emit();
+
+		Ok(())
+	}
+
+	/// Whether a rumor of `origin` is offered to `target`. A rumor with no
+	/// signer names no origin a target could have refused, so it is offered.
+	fn offers(&self, target: AdmittedDial, origin: Option<&[u8]>, now: UnixMillis) -> bool {
+		let Some(origin) = origin else {
+			return true;
+		};
+
+		let window = self.config.gossip.seen_ttl;
+		self.ledgers.with(target, |ledger| ledger.offers(origin, now, window))
+	}
+
+	/// Keeps the ledgers of this beat's targets and probes, and expires the
+	/// refusals that have stood for a whole seen window.
+	fn prune_ledgers(&self, targets: impl AsRef<[AdmittedDial]>, probes: impl AsRef<[AdmittedDial]>) {
+		let targets = targets.as_ref();
+		let probes = probes.as_ref();
+		let live = |peer: &AdmittedDial| targets.contains(peer) || probes.contains(peer);
+
+		self.ledgers.prune(live, self.config.clock.unix(), self.config.gossip.seen_ttl);
+	}
 }
 
 // The impl is manual because a derive would demand `P: Clone`, and the
 // fields are reference-counted regardless of `P`.
-impl<P: Protocol> Clone for GossipBeat<P> {
+impl<P: Protocol> Clone for FloodBeat<P> {
 	fn clone(&self) -> Self {
 		Self {
 			config: Arc::clone(&self.config),
 			peer_plane: self.peer_plane.clone(),
 			servlet_registry: Arc::clone(&self.servlet_registry),
 			trace: Arc::clone(&self.trace),
+			ledgers: Arc::clone(&self.ledgers),
 		}
 	}
 }
 
-impl<P> GossipBeat<P>
+impl<P> AdvertiseBeat<P>
+where
+	P: Protocol
+		+ PersistentConnection
+		+ EncryptedProtocol<CryptoProvider = DefaultCryptoProvider>
+		+ Send
+		+ Sync
+		+ 'static,
+	P::Address: Hash + Eq + Clone + Send + Sync + FromStr + 'static,
+	P::Transport: MessageEmitter
+		+ MessageCollector
+		+ PolicyConfig
+		+ MuxConnector
+		+ EncryptedProtocolState
+		+ Send
+		+ Sync
+		+ 'static,
+{
+	/// Sends one pre-signed peer advertisement to a dialed peer gateway.
+	///
+	/// The caller creates and signs one frame per beat and fans it out, so
+	/// one signature serves every dial.
+	async fn send_advertisement(
+		&self,
+		peer_addr: P::Address,
+		signed_frame: Frame,
+	) -> Result<TransitStatus, ClusterError> {
+		let mut client = self.peer_plane.connect_unbound(peer_addr).await?;
+		let response = client.emit(signed_frame, None).await?.ok_or(ClusterError::NoResponse)?;
+
+		let decoded: PeerAdvertisementResponse = decode(response.message())?;
+		Ok(decoded.status)
+	}
+
+	/// The advertised types that this gateway exports, capped at
+	/// [`MAX_ADVERTISED_TYPES`].
+	///
+	/// This is the single place advertised types are gathered, so one
+	/// export filter covers the direct ads and the rumor flood.
+	/// Membership is asked per key each beat, so a live `ExportAllowlist`
+	/// stays aligned with enforcement.
+	fn exported_slate(&self) -> Result<Vec<Urn<'static>>, ClusterError> {
+		let exports = self.config.peer.exported_types.as_deref();
+		let local = self.servlet_registry.local_servlets()?;
+		let slate = local
+			.iter()
+			.filter(|bytes| exports.is_none_or(|list| list.allows_canonical(bytes)))
+			.filter_map(|bytes| from_utf8(bytes).ok())
+			.filter_map(|canonical| canonical.parse().ok())
+			.take(MAX_ADVERTISED_TYPES)
+			.collect();
+
+		Ok(slate)
+	}
+
+	/// Advertises to every beat target, and hands each one to the flood arm
+	/// when this gateway has one.
+	///
+	/// `ad_frame` is the single signed advertisement this beat created, so
+	/// one signature serves every dial.
+	async fn dial_targets<D: ClusterDigest>(
+		&self,
+		flood: Option<&FloodBeat<P>>,
+		targets: impl AsRef<[AdmittedDial]>,
+		ad_frame: Option<&Frame>,
+		trace: &TraceCollector,
+	) -> Result<(), LoopFault> {
+		let targets = targets.as_ref();
+		for peer in targets {
+			// A protocol that cannot address this peer is this gateway's
+			// choice, so the peer is skipped rather than scored.
+			let Ok(peer_addr) = peer.protocol_address::<P::Address>() else {
+				continue;
+			};
+
+			if let Some(frame) = ad_frame {
+				// Both arguments clone, because the reconcile below reuses the
+				// address and each later target reuses the frame. The reconcile
+				// round scores a failed dial, so the status goes unread.
+				let _advertised = self.send_advertisement(peer_addr.clone(), frame.clone()).await;
+			}
+
+			let Some(flood) = flood else {
+				continue;
+			};
+
+			flood.reconcile_target::<D>(peer_addr, *peer, trace).await?;
+		}
+
+		Ok(())
+	}
+}
+
+impl<P> FloodBeat<P>
 where
 	P: Protocol
 		+ PersistentConnection
@@ -283,9 +549,11 @@ where
 {
 	/// Refloods a still-live rumor to the dial targets with a decremented TTL.
 	///
-	/// Targets are anchors plus verified tried peers, so rumor bytes reach
-	/// verified identities only. Each target receives an owned clone of the
-	/// signed frame because emit consumes the frame.
+	/// Targets are anchors plus verified tried peers. Each dial proves the
+	/// answer is a flood member in [`PeerPlane::connect_member`] before the
+	/// rumor leaves, so a configured peer outside the flood receives none
+	/// (CWE-668). Each target receives an owned clone of the signed frame
+	/// because emit consumes the frame.
 	///
 	/// # Re-encoding
 	///
@@ -299,6 +567,11 @@ where
 		if targets.is_empty() {
 			return Ok(());
 		}
+
+		// A target that answered this origin as outside its trust is offered
+		// none of its rumors until that answer expires.
+		let origin = rumor.signer_id();
+		let now = self.config.clock.unix();
 
 		// The rumor re-encodes to the bytes that arrived, so the origin
 		// signature still verifies at the next hop.
@@ -331,21 +604,39 @@ where
 		let mut fanout = tokio::task::JoinSet::new();
 		let mut unreached: u64 = 0;
 		for peer in targets.iter() {
+			if !self.offers(*peer, origin.as_deref(), now) {
+				continue;
+			}
 			let Ok(peer_addr) = peer.protocol_address::<P::Address>() else {
 				unreached += 1;
 				continue;
 			};
 
+			let target = *peer;
 			let dial_plane = self.peer_plane.clone();
 			// Each emit consumes an owned frame, so a fan-out to N targets
 			// needs N owned frames. The clone is that fan-out cost.
 			let frame = signed_frame.clone();
 			fanout.spawn(async move {
-				let Ok(mut client) = dial_plane.connect_unbound(peer_addr).await else {
-					return false;
+				let Ok(answered) = dial_plane.connect_member(peer_addr).await else {
+					return FloodHop::Unreached;
+				};
+				// A gateway outside the flood is owed no rumor, so the hop ends
+				// without an emit.
+				let Some(mut client) = answered else {
+					return FloodHop::OutsideFlood(target);
+				};
+				let Ok(reply) = client.emit(frame, None).await else {
+					return FloodHop::Unreached;
 				};
 
-				client.emit(frame, None).await.is_ok()
+				// Only a reply that names the origin as outside the target's
+				// trust changes what this gateway offers it next.
+				let response = reply.and_then(|reply| decode::<GossipResponse>(reply.message()).ok());
+				match response {
+					Some(response) if response.refuses_origin() => FloodHop::OriginRefused(target),
+					_ => FloodHop::Settled,
+				}
 			});
 		}
 
@@ -353,8 +644,17 @@ where
 		// is counted rather than returned. A task that did not join reached no
 		// peer either, so it folds into the same count.
 		while let Some(joined) = fanout.join_next().await {
-			if !joined.unwrap_or(false) {
-				unreached += 1;
+			match joined {
+				Ok(FloodHop::Settled) => {}
+				// The answer is definitive on either path, so the reflood drops
+				// the address the way the beat's reconcile round does.
+				Ok(FloodHop::OutsideFlood(target)) => self.config.peer.table.expel(target)?,
+				Ok(FloodHop::OriginRefused(target)) => {
+					if let Some(origin) = origin.as_deref() {
+						self.settle_refused_origin(target, origin, now)?;
+					}
+				}
+				Ok(FloodHop::Unreached) | Err(_) => unreached += 1,
 			}
 		}
 
@@ -363,22 +663,6 @@ where
 		}
 
 		Ok(())
-	}
-
-	/// Sends one pre-signed peer advertisement to a dialed peer gateway.
-	///
-	/// The caller creates and signs one frame per beat and fans it out, so
-	/// one signature serves every dial.
-	async fn send_advertisement(
-		&self,
-		peer_addr: P::Address,
-		signed_frame: Frame,
-	) -> Result<TransitStatus, ClusterError> {
-		let mut client = self.peer_plane.connect_unbound(peer_addr).await?;
-		let response = client.emit(signed_frame, None).await?.ok_or(ClusterError::NoResponse)?;
-
-		let decoded: PeerAdvertisementResponse = decode(response.message())?;
-		Ok(decoded.status)
 	}
 
 	/// Publishes the local slate as an origin-signed advertisement rumor.
@@ -445,7 +729,7 @@ where
 	/// # Round order
 	///
 	/// 1. Collect the held digests from the journal.
-	/// 2. Complete the handshake and verify the colony scope.
+	/// 2. Complete the handshake and prove flood membership.
 	/// 3. Emit a signed reconcile request and decode the reply.
 	/// 4. Reject an oversized want-list or PEX sample.
 	/// 5. Promote the peer, learn PEX hints, and score grey-hole drops.
@@ -455,11 +739,10 @@ where
 	///
 	/// - A local fault before the emit or inside the post-reply scope skips scoring.
 	/// - An oversized reply or a dial failure returns `Err` for peer scoring.
-	/// - A peer outside the colony leaves the peer table at once, and the routes that dial it leave.
+	/// - A learned peer outside the flood leaves the peer table at once and keeps its routes.
 	async fn reconcile_round<D: ClusterDigest>(
 		&self,
 		peer_addr: P::Address,
-		acked: &mut HashSet<GossipDigest>,
 		peer: AdmittedDial,
 	) -> Result<(), ClusterError> {
 		let now = self.config.clock.unix();
@@ -472,28 +755,18 @@ where
 		// STRING bytes, so each fixed-size digest copies once here.
 		let held: Vec<Vec<u8>> = held_digests.iter().map(|digest| digest.to_vec()).collect();
 
-		let mut client = self.peer_plane.connect_unbound(peer_addr).await?;
-		// A feeler probe reconciles on a cold connection whose handshake
-		// defers to first emit. Completing it here is the only way to learn
-		// peer identity before the reconcile discloses anything (CWE-668).
-		client.complete_handshake().await?;
-
-		// The colony scope gate requires the peer's handshake certificate to
-		// match the local colony.
-		let peer_colony = client
-			.peer_certificate()
-			.and_then(|cert| self.config.namespace.cert_colony_urn(cert));
-		if peer_colony.as_ref() != self.config.colony_urn() {
-			// A foreign identity is definitive, so the address leaves both
-			// learned tables at once. Every route that dials it leaves too,
-			// whether a table held the address or not, because a slate
-			// installs before any probe verifies the socket it claims
-			// (CWE-668).
+		// Membership is proved on the completed handshake, before the
+		// reconcile discloses anything (CWE-668).
+		let Some(mut client) = self.peer_plane.connect_member(peer_addr).await? else {
+			// An answer from outside the flood is definitive, so a learned
+			// address leaves both learned tables at once. A configured anchor
+			// keeps its slot, so each beat still advertises to it. The routes
+			// stay, because that gateway may serve work by direct peering and
+			// each forward is bound to the gateway its route names.
 			self.config.peer.table.expel(peer)?;
-			self.servlet_registry.withdraw_peer_by_dial(peer.address())?;
 
 			return Ok(());
-		}
+		};
 
 		let request = ClusterRequest::ReconcileGossip(GossipReconciliation { held });
 
@@ -522,15 +795,15 @@ where
 		let reply: GossipWant = decode(response.message())?;
 
 		// An oversized reply fails the round (CWE-770). The beat scores it like
-		// any failed round, so an abuser is discarded from `new` or counted
-		// toward eviction from `tried`.
+		// any failed round, so an abuser keeps its `new` entry with one more
+		// failure, or counts toward eviction from `tried`.
 		if reply.is_oversized() {
 			return Err(ClusterError::OversizedReconcileReply);
 		}
 
 		// The decoded, in-bounds reply already proves liveness, so a fault in
 		// the bookkeeping below leaves the peer scored on its answer.
-		let local_round = self.settle_round::<D>(&mut client, reply, acked, peer, now).await;
+		let local_round = self.settle_round::<D>(&mut client, reply, peer, now).await;
 		// The round already succeeded, so a local fault in the bookkeeping
 		// skips the rest of the round without charging the peer. The next
 		// beat retries the skipped bookkeeping and repair.
@@ -546,16 +819,16 @@ where
 	/// and leaves the peer scored on the answer it already gave.
 	async fn settle_round<D: ClusterDigest>(
 		&self,
-		client: &mut crate::transport::PooledClient<P>,
+		client: &mut FloodClient<P>,
 		reply: GossipWant,
-		acked: &mut HashSet<GossipDigest>,
 		peer: AdmittedDial,
 		now: UnixMillis,
 	) -> Result<(), ClusterError> {
 		let round: Result<(), ClusterError> = async {
 			// A pooled connection keeps its handshake certificate after the
-			// peer dies, so promotion waits for the reply. The gate alone would
-			// reset the failure count every beat and hold a dead peer.
+			// peer dies, so promotion waits for the reply. The membership
+			// proof alone would reset the failure count every beat and hold a
+			// dead peer.
 			let peer_id = client.peer_certificate().and_then(ColonyCertificate::fingerprint_id);
 			if self.config.peer.table.promote(peer, peer_id.as_deref(), now)? {
 				self.trace
@@ -567,158 +840,104 @@ where
 			let GossipWant { want, pex } = reply;
 
 			// PEX entries are unverified hints: the allowlist gates them, the
-			// capped new table holds them, and a later feeler probe under the
-			// colony gate is the only path to dial target (CWE-345).
+			// capped new table holds them, and a later feeler probe that proves
+			// membership is the only path to dial target (CWE-345).
 			let hints = self.config.admissible_pex_hints(pex);
 			self.config.peer.table.learn(hints)?;
 
 			let wanted: Vec<[u8; 32]> = wanted_digests(&want);
 
-			// Grey-hole containment: a digest this gateway acked, wanted again
-			// while retained, is a drop. One weaken per round scores it.
-			let dropped = wanted.iter().any(|digest| acked.contains(digest));
-			if dropped {
+			// Grey-hole containment: one weaken per round scores a target the
+			// ledger reads as dropping what it acknowledged.
+			let dropping = self.ledgers.with(peer, |ledger| ledger.drop_signal(&wanted));
+			if dropping {
 				self.servlet_registry.weaken_peer_by_dial(peer.address())?;
 				self.trace.event(CLUSTER_GOSSIP_DROP_SIGNAL)?;
 			}
 
-			for digest in &wanted {
-				acked.remove(digest);
-			}
-
-			self.push_repairs::<D>(client, &wanted, acked).await
+			self.push_repairs::<D>(client, &wanted, peer).await
 		}
 		.await;
 
 		round
 	}
 
-	/// Advertises to and reconciles with every verified target.
+	/// Reconciles with one beat target, and counts a failed round toward its
+	/// eviction.
 	///
-	/// `ad_frame` is the single signed advertisement this beat created, so
-	/// one signature serves every dial. A failed round counts toward
-	/// eviction, so a dead tried peer frees its bucket slot at the
-	/// threshold and the routes that dial it leave the registry.
+	/// A dead tried peer frees its bucket slot at the threshold, and the
+	/// routes that dial it leave the registry.
 	///
 	/// # Lock order
 	///
 	/// The table guard is released inside `record_failure` before the route
 	/// lock is taken in `withdraw_peer_by_dial`, so the two locks never nest.
-	async fn dial_targets<D: ClusterDigest>(
+	async fn reconcile_target<D: ClusterDigest>(
 		&self,
-		targets: impl AsRef<[AdmittedDial]>,
-		ad_frame: Option<&Frame>,
-		push_ledger: &mut HashMap<AdmittedDial, HashSet<GossipDigest>>,
+		peer_addr: P::Address,
+		peer: AdmittedDial,
 		trace: &TraceCollector,
 	) -> Result<(), LoopFault> {
-		let targets = targets.as_ref();
-		let reconciling = self.config.colony_urn().is_some();
-		for peer in targets {
-			// A protocol that cannot address this peer is this gateway's
-			// choice, so the peer is skipped rather than scored.
-			let Ok(peer_addr) = peer.protocol_address::<P::Address>() else {
-				continue;
-			};
-
-			if let Some(frame) = ad_frame {
-				// Both arguments clone, because the reconcile below reuses the
-				// address and each later target reuses the frame. The reconcile
-				// round scores a failed dial, so the status goes unread.
-				let _advertised = self.send_advertisement(peer_addr.clone(), frame.clone()).await;
-			}
-
-			if !reconciling {
-				continue;
-			}
-
-			// The entry API takes an owned key even on a hit, and the short
-			// address clone costs less than a second lookup.
-			let acked = push_ledger.entry(*peer).or_default();
-			let round = self.reconcile_round::<D>(peer_addr, acked, *peer).await;
-			if round.is_ok() {
-				continue;
-			}
-
-			let evicted = self.config.peer.table.record_failure(*peer)?;
-			if !evicted {
-				continue;
-			}
-
-			// The routes that dial the evicted address leave before the
-			// eviction event is emitted, so an observer of the event finds
-			// none of them.
-			self.servlet_registry.withdraw_peer_by_dial(peer.address())?;
-
-			trace
-				.event(CLUSTER_PEER_EVICTED)?
-				.with_payload(peer.address().route_bytes().as_ref())
-				.emit();
+		let round = self.reconcile_round::<D>(peer_addr, peer).await;
+		if round.is_ok() {
+			return Ok(());
 		}
+
+		let evicted = self.config.peer.table.record_failure(peer)?;
+		if !evicted {
+			return Ok(());
+		}
+
+		// The routes that dial the evicted address leave before the
+		// eviction event is emitted, so an observer of the event finds
+		// none of them.
+		self.servlet_registry.withdraw_peer_by_dial(peer.address())?;
+
+		trace
+			.event(CLUSTER_PEER_EVICTED)?
+			.with_payload(peer.address().route_bytes().as_ref())
+			.emit();
 
 		Ok(())
 	}
 
-	/// Reconciles with unverified candidates and discards the ones that fail.
+	/// Reconciles with unverified candidates and records the ones that fail.
 	///
-	/// Feeler probes run reconcile only: the colony gate inside the round
-	/// promotes a verified candidate, and a failed dial discards it, so a
-	/// prefix bucket keeps holding live addresses.
-	async fn probe_candidates<D: ClusterDigest>(
-		&self,
-		probes: impl AsRef<[AdmittedDial]>,
-		push_ledger: &mut HashMap<AdmittedDial, HashSet<GossipDigest>>,
-	) -> Result<(), LoopFault> {
+	/// Feeler probes run reconcile only. The membership proof inside the round
+	/// promotes a verified candidate. A failed round stays on its candidate,
+	/// which then waits out its backoff behind every fresher one in its prefix
+	/// bucket.
+	async fn probe_candidates<D: ClusterDigest>(&self, probes: impl AsRef<[AdmittedDial]>) -> Result<(), LoopFault> {
 		let probes = probes.as_ref();
-		if self.config.colony_urn().is_none() {
-			return Ok(());
-		}
-
 		for peer in probes {
 			let Ok(peer_addr) = peer.protocol_address::<P::Address>() else {
 				self.config.peer.table.discard(*peer)?;
 				continue;
 			};
 
-			let acked = push_ledger.entry(*peer).or_default();
-			if self.reconcile_round::<D>(peer_addr, acked, *peer).await.is_err() {
-				self.config.peer.table.discard(*peer)?;
+			if self.reconcile_round::<D>(peer_addr, *peer).await.is_err() {
+				let now = self.config.clock.unix();
+				self.config.peer.table.record_probe_failure(*peer, now)?;
 			}
 		}
 
 		Ok(())
 	}
 
-	/// The advertised types that this gateway exports, capped at
-	/// [`MAX_ADVERTISED_TYPES`].
-	///
-	/// This is the single place advertised types are gathered, so one
-	/// export filter covers the direct ads and the rumor flood.
-	/// Membership is asked per key each beat, so a live `ExportAllowlist`
-	/// stays aligned with enforcement.
-	fn exported_slate(&self) -> Result<Vec<Urn<'static>>, ClusterError> {
-		let exports = self.config.peer.exported_types.as_deref();
-		let local = self.servlet_registry.local_servlets()?;
-		let slate = local
-			.iter()
-			.filter(|bytes| exports.is_none_or(|list| list.allows_canonical(bytes)))
-			.filter_map(|bytes| from_utf8(bytes).ok())
-			.filter_map(|canonical| canonical.parse().ok())
-			.take(MAX_ADVERTISED_TYPES)
-			.collect();
-
-		Ok(slate)
-	}
-
 	/// Resends the journaled rumors that this peer still wants.
 	///
-	/// Each push carries an outer lifetime of 0, so a repair never
-	/// refloods. Only a rumor still inside the seen window is admissible,
-	/// and only an explicit `Ok` reply arms the grey-hole ledger.
+	/// - Each push carries an outer lifetime of 0, so a repair never refloods.
+	/// - Only a rumor still inside the seen window is admissible.
+	/// - Only an explicit `Ok` reply arms the grey-hole ledger.
+	/// - The peer names every digest it lacks, and it lacks for good the
+	///   rumors of an origin its trust does not hold. Its first refusal of
+	///   such an origin settles that origin for the window, so the push is
+	///   offered once.
 	async fn push_repairs<D: ClusterDigest>(
 		&self,
-		client: &mut crate::transport::PooledClient<P>,
+		client: &mut FloodClient<P>,
 		wanted: impl AsRef<[GossipDigest]>,
-		acked: &mut HashSet<GossipDigest>,
+		peer: AdmittedDial,
 	) -> Result<(), ClusterError> {
 		let wanted = wanted.as_ref();
 		let now = self.config.clock.unix();
@@ -729,6 +948,10 @@ where
 			.filter(|rumor| gossip_fresh(rumor.issued_at(), seen_ttl, now));
 
 		for rumor in admissible {
+			let origin = rumor.signer_id();
+			if !self.offers(peer, origin.as_deref(), now) {
+				continue;
+			}
 			let Ok(pushed_digest) = rumor.gossip_digest::<D>() else {
 				continue;
 			};
@@ -745,14 +968,21 @@ where
 			signed
 				.sign_with_provider::<D, _>(self.config.tls.identity().signing_provider())
 				.await?;
+
 			let Some(push_reply) = client.emit(signed, None).await? else {
 				continue;
 			};
 			let Ok(gossip_reply) = decode::<GossipResponse>(push_reply.message()) else {
 				continue;
 			};
-			if matches!(gossip_reply.status, TransitStatus::Ok) {
-				acked.insert(pushed_digest);
+
+			let acknowledged = gossip_reply.status == TransitStatus::Ok;
+			let refused_origin = origin.filter(|_| gossip_reply.refuses_origin());
+			if acknowledged {
+				self.ledgers.with(peer, |ledger| ledger.ack(pushed_digest));
+			}
+			if let Some(origin) = refused_origin {
+				self.settle_refused_origin(peer, origin, now)?;
 			}
 		}
 
@@ -776,6 +1006,8 @@ pub(crate) struct GossipPipelineCtx<P: Protocol> {
 	/// The gateway's task group, which owns the reflood this pipeline starts,
 	/// so stopping the gateway stops a reflood still dialling.
 	pub(crate) tasks: TaskGroup,
+	/// What each gossip target acknowledged and refused, shared with the beat.
+	pub(crate) ledgers: Arc<PeerLedgers>,
 }
 
 impl<P: Protocol> From<GatewayRuntimeCtx<P>> for GossipPipelineCtx<P> {
@@ -790,6 +1022,7 @@ impl<P: Protocol> From<GatewayRuntimeCtx<P>> for GossipPipelineCtx<P> {
 			pool: ctx.pool,
 			trace: ctx.trace,
 			tasks: ctx.tasks,
+			ledgers: ctx.ledgers,
 		}
 	}
 }
@@ -812,15 +1045,17 @@ where
 		+ Sync
 		+ 'static,
 {
-	/// Delivers one admitted rumor payload to the configured local ingress
-	/// servlet.
+	/// Delivers one admitted rumor to the configured local ingress servlet.
 	///
-	/// The claim is taken before the round trip and owned by a guard, so the
-	/// admission path and the reconcile beat never deliver one rumor twice
-	/// (CWE-362). A delivery this task never finishes returns the rumor to the
-	/// retry set rather than stranding it.
-	async fn deliver_local(&self, payload: impl Into<Vec<u8>>, digest_value: GossipDigest) -> Result<(), LoopFault> {
-		let payload: Vec<u8> = payload.into();
+	/// - The servlet receives the origin-signed rumor frame unchanged, as it receives a work frame.
+	/// - The frame's message decodes as a [`GossipRumor`], and its signature
+	///   names the gateway that published the rumor, so a servlet that serves
+	///   many parties can tell them apart and verify each one.
+	/// - The claim is taken before the round trip and owned by a guard, so the
+	///   admission path and the reconcile beat never deliver one rumor twice
+	///   (CWE-362).
+	/// - A delivery this task never finishes returns the rumor to the retry set.
+	async fn deliver_local(&self, rumor: Frame, digest_value: GossipDigest) -> Result<(), LoopFault> {
 		let journal = &self.config.gossip.journal;
 		let Some(type_key) = self.config.gossip.ingress.as_ref() else {
 			// With no ingress servlet configured, the rumor has no local
@@ -844,7 +1079,7 @@ where
 		};
 
 		let dial = entry.dial_target().clone();
-		let Ok(_response) = Hop::new(&self.pool, dial).deliver_envelope(payload).await else {
+		let Ok(_response) = Hop::new(&self.pool, dial).deliver_frame(rumor).await else {
 			return Ok(());
 		};
 
@@ -861,7 +1096,6 @@ where
 	/// retained kind, so delivery accepts that kind alone.
 	async fn retry_pending_local<D: ClusterDigest>(&self) -> Result<(), LoopFault> {
 		let pending = self.config.gossip.journal.pending_local(self.config.clock.unix())?;
-
 		for rumor in pending {
 			let Ok(body) = decode::<GossipRumor>(rumor.message()) else {
 				continue;
@@ -873,7 +1107,7 @@ where
 				continue;
 			};
 
-			self.deliver_local(body.payload, digest).await?;
+			self.deliver_local(rumor, digest).await?;
 		}
 
 		Ok(())
@@ -972,8 +1206,9 @@ where
 		// gateway routing control that applies to the registry instead.
 		let applied = match admitted.kind() {
 			GossipRumorKind::Application => {
-				let digest_value = admitted.digest();
-				self.deliver_local(admitted.into_payload(), digest_value).await
+				// The ingress servlet receives the rumor itself, and the
+				// reflood below still needs it, so the delivery takes a copy.
+				self.deliver_local(rumor.clone(), admitted.digest()).await
 			}
 			GossipRumorKind::PeerAdvertisement => {
 				// Only a relayed rumor names a relay hop to fall back on, and
@@ -992,27 +1227,31 @@ where
 			}
 		};
 
-		let flood = GossipBeat {
-			config: Arc::clone(&self.config),
-			peer_plane: self.peer_plane.clone(),
-			servlet_registry: Arc::clone(&self.servlet_registry),
-			trace: Arc::clone(&self.trace),
-		};
+		let flood = FloodBeat::new(
+			Arc::clone(&self.config),
+			self.peer_plane.clone(),
+			Arc::clone(&self.servlet_registry),
+			Arc::clone(&self.trace),
+			Arc::clone(&self.ledgers),
+		);
 		let GossipPipelineCtx { tasks, .. } = self;
 
 		// The reflood runs on its own task so the Ok reply below returns at
 		// this gateway's pace. The rumor moves into the task unchanged, and the
 		// reply only needs the outer frame id.
-		if hop_ttl > 0 && has_targets {
-			let next_ttl = hop_ttl - 1;
-			tasks.spawn(async move {
-				// Detached, so nothing above can act on the outcome. A
-				// delivery fault is already on the trace, and a poisoned
-				// table is recorded here, which is where a reader looks.
-				if let Err(fault) = flood.reflood::<D>(rumor, next_ttl).await {
-					fault.record(&flood.trace);
-				}
-			});
+		match flood {
+			Some(flood) if hop_ttl > 0 && has_targets => {
+				let next_ttl = hop_ttl - 1;
+				tasks.spawn(async move {
+					// Detached, so nothing above can act on the outcome. A
+					// delivery fault is already on the trace, and a poisoned
+					// table is recorded here, which is where a reader looks.
+					if let Err(fault) = flood.reflood::<D>(rumor, next_ttl).await {
+						fault.record(&flood.trace);
+					}
+				});
+			}
+			_ => {}
 		}
 
 		reply_frame(frame.metadata().id(), GossipResponse { status: TransitStatus::Ok })
@@ -1086,7 +1325,7 @@ where
 
 		// The learned origin is also a discovery hint, exactly like a
 		// direct advertiser. It waits in the capped new table until this
-		// gateway's own probe passes the colony gate.
+		// gateway's own probe proves it a flood member.
 		let hint = admitted.discovery_hint();
 		self.config.peer.table.learn([hint])?;
 
@@ -1126,7 +1365,7 @@ where
 	/// # Admission
 	///
 	/// A rumor follows the identical direct-ad path
-	/// ([`AdmittedPeerAd::admit`]): order freshness, the colony gate, the dial
+	/// ([`AdmittedPeerAd::admit`]): order freshness, flood membership, the dial
 	/// allowlist, the message checks, and the discovery hint.
 	///
 	/// # Reconciliation
@@ -1169,7 +1408,11 @@ where
 
 		Ok(())
 	}
+}
 
+// Scoring reads the registry and the trace alone, so it needs none of the
+// dial bounds the pipeline's own impl carries.
+impl<P: Protocol> GossipPipelineCtx<P> {
 	/// Scores a misbehaving relay peer.
 	///
 	/// An origin publish has no relay to score, so it returns without
@@ -1285,7 +1528,6 @@ impl AdPublishState {
 	/// Releases a failed claim and keeps the baseline.
 	fn abort(&self) {
 		let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-
 		inner.in_flight = false;
 	}
 }
@@ -1311,18 +1553,25 @@ where
 	/// Spawns the beat that re-announces local types to peers.
 	///
 	/// Each beat retries pending local delivery, publishes due advertisement
-	/// rumors, dials verified targets with one shared signed frame, and runs
-	/// reconcile rounds for colony members and feeler probes.
+	/// rumors, dials beat targets with one shared signed frame, and runs
+	/// reconcile rounds for flood members and feeler probes.
 	pub(crate) fn spawn_advertise<D: ClusterDigest>(self, gateway_addr: Arc<[u8]>) -> rt::JoinHandle {
 		// Repair delivery is a gossip pipeline invocation, so it reuses the
 		// inbound context rather than re-pairing the same four handles.
 		let delivery = GossipPipelineCtx::from(self.clone());
-		let beat = GossipBeat {
+		let peer_plane = self.peer_dial_plane();
+		let beat = AdvertiseBeat {
 			config: Arc::clone(&self.config),
-			peer_plane: self.peer_dial_plane(),
+			peer_plane: peer_plane.clone(),
 			servlet_registry: Arc::clone(&self.servlet_registry),
-			trace: Arc::clone(&self.trace),
 		};
+		let flood = FloodBeat::new(
+			Arc::clone(&self.config),
+			peer_plane,
+			Arc::clone(&self.servlet_registry),
+			Arc::clone(&self.trace),
+			Arc::clone(&self.ledgers),
+		);
 
 		let GatewayRuntimeCtx { config, trace, tasks, .. } = self;
 
@@ -1339,10 +1588,6 @@ where
 					config.peer.table.exclude_self(local)?;
 				}
 
-				// The per-peer ledger of `Ok` replies feeds grey-hole
-				// detection. Each beat keeps only the live target and probe
-				// addresses, so the table's own caps bound the map (CWE-770).
-				let mut push_ledger: HashMap<AdmittedDial, HashSet<GossipDigest>> = HashMap::new();
 				let ad_publish = Arc::new(AdPublishState::new(config.rumor_refresh()));
 				loop {
 					config.clock.sleep(interval).await;
@@ -1354,7 +1599,12 @@ where
 					let targets = config.peer.table.target_set()?;
 					let probes = config.peer.table.probe_sample(config.clock.unix())?;
 
-					push_ledger.retain(|peer, _| targets.contains(peer) || probes.contains(peer));
+					// The per-peer ledgers feed grey-hole detection and hold
+					// each target's refusals. Each beat keeps the live target
+					// and probe addresses alone.
+					if let Some(flood) = flood.as_ref() {
+						flood.prune_ledgers(&targets, &probes);
+					}
 
 					if targets.is_empty() && probes.is_empty() {
 						continue;
@@ -1365,9 +1615,12 @@ where
 					// The rumor publish runs on its own task, so the direct
 					// advertisements below dial at this gateway's pace.
 					let now = config.clock.unix();
-					if config.colony_urn().is_some() && ad_publish.take_due(now, &slate, &targets) {
+					let publishing = match flood.as_ref() {
+						Some(flood) if ad_publish.take_due(now, &slate, &targets) => Some(flood.clone()),
+						_ => None,
+					};
+					if let Some(publish_beat) = publishing {
 						let publish_state = Arc::clone(&ad_publish);
-						let publish_beat = beat.clone();
 						let publish_addr = Arc::clone(&gateway_addr);
 
 						// The captured vectors become the commit baseline,
@@ -1406,9 +1659,11 @@ where
 						ad_frame = config.mint_ad_frame::<D>(gateway_addr.as_ref(), slate).await.ok();
 					}
 
-					beat.dial_targets::<D>(&targets, ad_frame.as_ref(), &mut push_ledger, &trace)
-						.await?;
-					beat.probe_candidates::<D>(&probes, &mut push_ledger).await?;
+					let ad_frame = ad_frame.as_ref();
+					beat.dial_targets::<D>(flood.as_ref(), &targets, ad_frame, &trace).await?;
+					if let Some(flood) = flood.as_ref() {
+						flood.probe_candidates::<D>(&probes).await?;
+					}
 				}
 			}
 			.await;
@@ -1431,6 +1686,66 @@ mod tests {
 	use crate::crypto::key::Secp256k1KeyProvider;
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 	use crate::testing::{TestCertificate, TestKey};
+
+	/// The window a refusal stands for in these tests.
+	const WINDOW: Duration = Duration::from_secs(120);
+
+	#[test]
+	fn ledger_holds_a_refused_origin_for_one_window() {
+		let mut ledger = PeerLedger::default();
+		ledger.refuse_origin(b"origin-a", UnixMillis::new(1_000));
+
+		let offers = [
+			ledger.offers(b"origin-a", UnixMillis::new(1_000), WINDOW),
+			ledger.offers(b"origin-a", UnixMillis::new(120_999), WINDOW),
+			ledger.offers(b"origin-a", UnixMillis::new(121_000), WINDOW),
+			ledger.offers(b"origin-b", UnixMillis::new(1_000), WINDOW),
+		];
+
+		assert_eq!(offers, [false, false, true, true]);
+	}
+
+	#[test]
+	fn ledger_expires_a_refusal_once_its_window_has_passed() {
+		let mut ledger = PeerLedger::default();
+		ledger.refuse_origin(b"origin-a", UnixMillis::new(1_000));
+		ledger.refuse_origin(b"origin-b", UnixMillis::new(60_000));
+
+		ledger.expire(UnixMillis::new(121_000), WINDOW);
+
+		let held: Vec<&[u8]> = ledger.refused_origins.keys().map(Vec::as_slice).collect();
+		assert_eq!(held, vec![b"origin-b".as_slice()]);
+	}
+
+	#[test]
+	fn ledger_reads_an_acknowledged_digest_wanted_again_as_a_drop() {
+		let mut ledger = PeerLedger::default();
+		ledger.ack([1u8; 32]);
+
+		let signals = [
+			ledger.drop_signal([[2u8; 32]]),
+			ledger.drop_signal([[1u8; 32]]),
+			ledger.drop_signal([[1u8; 32]]),
+		];
+
+		assert_eq!(signals, [false, true, false]);
+	}
+
+	#[test]
+	fn ledgers_keep_the_live_targets_alone() {
+		let ledgers = PeerLedgers::default();
+		let live = dial("10.0.0.1:9000");
+		let gone = dial("10.0.0.2:9000");
+		ledgers.with(live, |ledger| ledger.refuse_origin(b"origin-a", UnixMillis::new(1_000)));
+		ledgers.with(gone, |ledger| ledger.refuse_origin(b"origin-a", UnixMillis::new(1_000)));
+		ledgers.prune(|target| *target == live, UnixMillis::new(2_000), WINDOW);
+
+		let offers = [
+			ledgers.with(live, |ledger| ledger.offers(b"origin-a", UnixMillis::new(2_000), WINDOW)),
+			ledgers.with(gone, |ledger| ledger.offers(b"origin-a", UnixMillis::new(2_000), WINDOW)),
+		];
+		assert_eq!(offers, [false, true]);
+	}
 
 	/// A config that holds the fields these tests read.
 	fn test_config() -> ClusterConfig {

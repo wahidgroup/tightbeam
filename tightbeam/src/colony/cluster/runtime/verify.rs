@@ -29,12 +29,17 @@
 
 use crate::colony::cluster::export::{ExportDecision, ExportPolicy, Party, TrustPlanes};
 use crate::colony::cluster::peer::ColonyCertificate;
+use crate::colony::cluster::runtime::gossip_tasks::{GossipOrigin, GossipPipelineCtx};
+use crate::colony::cluster::runtime::LoopFault;
 use crate::colony::cluster::{ClusterConfig, SharedId};
 use crate::crypto::x509::store::TrustVerification;
 use crate::crypto::x509::Certificate;
-use crate::instrumentation::events::{CLUSTER_EXPORT_GRANTED, CLUSTER_EXPORT_REFUSED, CLUSTER_GATE_BLOCKED};
+use crate::instrumentation::events::{
+	CLUSTER_EXPORT_GRANTED, CLUSTER_EXPORT_REFUSED, CLUSTER_GATE_BLOCKED, CLUSTER_GOSSIP_ORIGIN_UNKNOWN,
+};
 use crate::policy::{GatePolicy, SessionContext, TransitStatus};
 use crate::trace::TraceCollector;
+use crate::transport::Protocol;
 use crate::utils::urn::Urn;
 use crate::Frame;
 use crate::TightBeamError;
@@ -90,6 +95,96 @@ impl VerifiedSignerId {
 	}
 }
 
+/// Why a control frame failed verification on its plane.
+///
+/// The trust store tells an unknown signer from a forged signature. This type
+/// carries that verdict past the parse, so a caller that settles a refusal
+/// reads what the store said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VerifyRefusal {
+	/// The frame carries no signature.
+	Unsigned,
+	/// The plane's trust store holds no certificate for the signer.
+	UnknownSigner,
+	/// The signer is trusted, and the signature fails verification.
+	Forged,
+	/// The signer belongs to another plane than the one the frame arrived on.
+	WrongPlane,
+	/// The plane has no trust store to verify against.
+	NoStore,
+	/// The signer certificate yields no fingerprint to key its slate by.
+	Unidentifiable,
+}
+
+impl From<VerifyRefusal> for TransitStatus {
+	/// The status a refused frame is answered with.
+	///
+	/// A frame with no signature is unauthenticated. Every other refusal
+	/// names a signer this plane does not admit.
+	fn from(refusal: VerifyRefusal) -> Self {
+		match refusal {
+			VerifyRefusal::Unsigned => Self::Unauthenticated,
+			VerifyRefusal::UnknownSigner
+			| VerifyRefusal::Forged
+			| VerifyRefusal::WrongPlane
+			| VerifyRefusal::NoStore
+			| VerifyRefusal::Unidentifiable => Self::PermissionDenied,
+		}
+	}
+}
+
+impl VerifyRefusal {
+	/// Settles a refused rumor origin for the relay that carried the rumor,
+	/// and returns the status the relay is answered with.
+	///
+	/// Trust stores need not agree, so an origin this gateway does not hold
+	/// is the edge of a subnet and no fault of the relay.
+	///
+	/// - [`Self::UnknownSigner`] drops the rumor and spends one token of the
+	///   relay's own rate bucket, so a relay that sends rumors under made-up
+	///   origins is bounded by the budget its own rumors draw on (CWE-770).
+	/// - With a token it answers [`TransitStatus::Unauthenticated`], which
+	///   tells the relay to stop offering that origin here. With the bucket
+	///   empty it answers [`TransitStatus::ResourceExhausted`].
+	/// - Every other refusal is a rumor the relay should have refused itself, so the relay is scored.
+	/// - `frame` is the relay's own signed frame, whose signer keys that
+	///   bucket. A frame that names no signer has no bucket to spend, so it is
+	///   scored too.
+	///
+	/// # Errors
+	///
+	/// - [`LoopFault::Registry`] -- the route registry is poisoned.
+	/// - [`LoopFault::Runtime`] -- the trace refused the event.
+	pub(crate) fn settle_origin<P: Protocol>(
+		self,
+		pipeline: &GossipPipelineCtx<P>,
+		frame: &Frame,
+		relay: &VerifiedSignerId,
+	) -> Result<TransitStatus, LoopFault> {
+		match (self, frame.signer_id()) {
+			(Self::UnknownSigner, Some(relay_key)) => {
+				let now = pipeline.config.clock.unix();
+				match pipeline.config.gossip.admission.allow(&relay_key, now) {
+					Ok(true) => {
+						let event = pipeline.trace.event(CLUSTER_GOSSIP_ORIGIN_UNKNOWN)?;
+						event.with_payload(relay.as_shared().as_ref()).emit();
+
+						Ok(TransitStatus::Unauthenticated)
+					}
+					Ok(false) => Ok(TransitStatus::ResourceExhausted),
+					Err(_) => Ok(TransitStatus::Unavailable),
+				}
+			}
+			(Self::UnknownSigner, None)
+			| (Self::Unsigned | Self::Forged | Self::WrongPlane | Self::NoStore | Self::Unidentifiable, _) => {
+				pipeline.weaken_invalid_relay(GossipOrigin::Relay, Some(relay))?;
+
+				Ok(self.into())
+			}
+		}
+	}
+}
+
 /// One verified inbound control frame.
 ///
 /// Only [`ClusterConfig::verify_hive`] or [`ClusterConfig::verify_peer`]
@@ -141,30 +236,31 @@ impl ClusterConfig {
 		&'a self,
 		frame: &'a Frame,
 		required: Party,
-	) -> Result<VerifiedControlFrame<'a>, TransitStatus> {
+	) -> Result<VerifiedControlFrame<'a>, VerifyRefusal> {
 		let store = match required {
 			Party::FirstParty => self.tls.hive_trust.as_deref(),
 			Party::Peer => self.tls.peer_trust.as_deref(),
-			Party::Untrusted => return Err(TransitStatus::PermissionDenied),
+			Party::Untrusted => return Err(VerifyRefusal::NoStore),
 		};
 		let Some(trust) = store else {
-			return Err(TransitStatus::PermissionDenied);
+			return Err(VerifyRefusal::NoStore);
 		};
 		let signer_cert = match trust.verify_frame(frame) {
 			TrustVerification::Verified(cert) => cert,
-			TrustVerification::MissingSignature => return Err(TransitStatus::Unauthenticated),
-			TrustVerification::UnknownSigner | TrustVerification::Invalid => {
-				return Err(TransitStatus::PermissionDenied);
-			}
+			TrustVerification::MissingSignature => return Err(VerifyRefusal::Unsigned),
+			TrustVerification::UnknownSigner => return Err(VerifyRefusal::UnknownSigner),
+			TrustVerification::Invalid => return Err(VerifyRefusal::Forged),
 		};
+
 		let party = TrustPlanes::from(&self.tls).classify(Some(signer_cert));
 		if party != required {
-			return Err(TransitStatus::PermissionDenied);
+			return Err(VerifyRefusal::WrongPlane);
 		}
+
 		let fingerprint = signer_cert
 			.fingerprint_id()
 			.map(VerifiedSignerId)
-			.ok_or(TransitStatus::PermissionDenied)?;
+			.ok_or(VerifyRefusal::Unidentifiable)?;
 
 		Ok(VerifiedControlFrame { frame, signer_cert, party, fingerprint })
 	}
@@ -281,7 +377,7 @@ impl ClusterConfig {
 	///
 	/// - CWE-306, missing authentication for critical function:
 	///   <https://cwe.mitre.org/data/definitions/306.html>
-	pub(crate) fn verify_hive<'a>(&'a self, frame: &'a Frame) -> Result<VerifiedControlFrame<'a>, TransitStatus> {
+	pub(crate) fn verify_hive<'a>(&'a self, frame: &'a Frame) -> Result<VerifiedControlFrame<'a>, VerifyRefusal> {
 		self.verify_plane(frame, Party::FirstParty)
 	}
 
@@ -293,7 +389,7 @@ impl ClusterConfig {
 	///
 	/// - CWE-306, missing authentication for critical function:
 	///   <https://cwe.mitre.org/data/definitions/306.html>
-	pub(crate) fn verify_peer<'a>(&'a self, frame: &'a Frame) -> Result<VerifiedControlFrame<'a>, TransitStatus> {
+	pub(crate) fn verify_peer<'a>(&'a self, frame: &'a Frame) -> Result<VerifiedControlFrame<'a>, VerifyRefusal> {
 		self.verify_plane(frame, Party::Peer)
 	}
 }
@@ -318,6 +414,7 @@ mod tests {
 	use crate::crypto::x509::Certificate;
 	use crate::der::oid::AssociatedOid;
 	use crate::spki::AlgorithmIdentifierOwned;
+	use crate::tb_cases;
 	use crate::testing::{TestCertificate, TestKey, TestMessage};
 	use crate::Version;
 
@@ -428,6 +525,11 @@ mod tests {
 
 	/// A control frame signed by `key` under the canonical convention.
 	fn signed_control_frame(key: &Secp256k1SigningKey) -> Frame {
+		control_frame_claiming(key, key)
+	}
+
+	/// A control frame signed with `signer` that names `claimed` as its signer.
+	fn control_frame_claiming(signer: &Secp256k1SigningKey, claimed: &Secp256k1SigningKey) -> Frame {
 		let mut frame = FrameBuilder::from(Version::V1)
 			.with_id("verify-origin")
 			.with_order(1)
@@ -436,10 +538,10 @@ mod tests {
 			.expect("test frame builds");
 
 		let tbs = frame.to_tbs().expect("test frame encodes");
-		let signature: Secp256k1Signature = sign_canonical::<Sha3_256, _>(key, &tbs).expect("test key signs");
+		let signature: Secp256k1Signature = sign_canonical::<Sha3_256, _>(signer, &tbs).expect("test key signs");
 		let sig_alg = AlgorithmIdentifierOwned { oid: Secp256k1Signature::ALGORITHM_OID, parameters: None };
 		let digest_alg = AlgorithmIdentifierOwned { oid: Sha3_256::OID, parameters: None };
-		let sid = secp256k1_signer_identifier(key.verifying_key()).expect("test key yields a signer id");
+		let sid = secp256k1_signer_identifier(claimed.verifying_key()).expect("test key yields a signer id");
 
 		frame
 			.attach_signature(signature.to_bytes(), sig_alg, digest_alg, sid)
@@ -575,6 +677,66 @@ mod tests {
 		Ok(())
 	}
 
+	tb_cases! {
+		fn a_refusal_maps_to_the_status_its_frame_is_answered_with((refusal, status): (VerifyRefusal, TransitStatus)) {
+			assert_eq!(TransitStatus::from(refusal), status);
+		}
+		cases {
+			unsigned => (VerifyRefusal::Unsigned, TransitStatus::Unauthenticated),
+			unknown_signer => (VerifyRefusal::UnknownSigner, TransitStatus::PermissionDenied),
+			forged => (VerifyRefusal::Forged, TransitStatus::PermissionDenied),
+			wrong_plane => (VerifyRefusal::WrongPlane, TransitStatus::PermissionDenied),
+			no_store => (VerifyRefusal::NoStore, TransitStatus::PermissionDenied),
+			unidentifiable => (VerifyRefusal::Unidentifiable, TransitStatus::PermissionDenied),
+		}
+	}
+
+	/// A frame of the control shape that carries no signature.
+	fn unsigned_control_frame() -> Frame {
+		let frame = FrameBuilder::from(Version::V1)
+			.with_id("verify-origin")
+			.with_order(1)
+			.with_message(TestMessage::sample(None))
+			.build();
+		frame.expect("test frame builds")
+	}
+
+	#[test]
+	fn peer_origin_names_a_signer_the_store_does_not_hold() {
+		let frame = signed_control_frame(&peer_key());
+		let enrolled_key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
+
+		let config = config_enrolling(&TestCertificate::self_signed(&enrolled_key));
+		assert!(matches!(config.verify_peer(&frame), Err(VerifyRefusal::UnknownSigner)));
+	}
+
+	#[test]
+	fn peer_origin_names_a_forged_signature_under_a_held_signer() {
+		let forger: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
+		let frame = control_frame_claiming(&forger, &peer_key());
+
+		let config = config_enrolling(&TestCertificate::self_signed(&peer_key()));
+		assert!(matches!(config.verify_peer(&frame), Err(VerifyRefusal::Forged)));
+	}
+
+	#[test]
+	fn peer_origin_names_a_frame_with_no_signature() {
+		let frame = unsigned_control_frame();
+		let config = config_enrolling(&TestCertificate::self_signed(&peer_key()));
+		assert!(matches!(config.verify_peer(&frame), Err(VerifyRefusal::Unsigned)));
+	}
+
+	#[test]
+	fn peer_origin_names_a_plane_with_no_store() {
+		let frame = signed_control_frame(&peer_key());
+		assert!(matches!(exporting_config().verify_peer(&frame), Err(VerifyRefusal::NoStore)));
+	}
+
+	#[test]
+	fn a_gateway_with_no_colony_is_in_no_flood() {
+		assert!(exporting_config().flood().is_none());
+	}
+
 	#[test]
 	fn hive_origin_passes_hive_only_signer() {
 		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
@@ -604,7 +766,7 @@ mod tests {
 		let mut config = exporting_config();
 		config.tls.hive_trust = Some(trust_of(&cert));
 		config.tls.peer_trust = Some(trust_of(&cert));
-		assert!(matches!(config.verify_hive(&frame), Err(TransitStatus::PermissionDenied)));
+		assert!(matches!(config.verify_hive(&frame), Err(VerifyRefusal::WrongPlane)));
 	}
 
 	#[test]
@@ -617,7 +779,7 @@ mod tests {
 		let mut config = exporting_config();
 		config.tls.hive_trust = Some(trust_of(&hive_cert));
 		config.tls.peer_trust = Some(trust_of(&peer_cert));
-		assert!(matches!(config.verify_hive(&frame), Err(TransitStatus::PermissionDenied)));
+		assert!(matches!(config.verify_hive(&frame), Err(VerifyRefusal::WrongPlane)));
 	}
 
 	#[test]

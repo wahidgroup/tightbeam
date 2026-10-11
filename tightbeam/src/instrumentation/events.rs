@@ -172,13 +172,22 @@ pub const CLUSTER_GOSSIP_REFUSED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "eve
 pub const CLUSTER_GOSSIP_RELAY_WEAKENED: Urn<'static> =
 	crate::urn!(TIGHTBEAM_NID, "event:cluster/gossip-relay-weakened");
 pub const CLUSTER_GOSSIP_DROP_SIGNAL: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:cluster/gossip-drop-signal");
-/// Marks a rumor this gateway could not build or sign, so no peer received
-/// it.
+/// Marks a reflood whose outer relay frame this gateway could not build or
+/// sign, so no peer received the rumor.
 pub const CLUSTER_GOSSIP_REFLOOD_FAILED: Urn<'static> =
 	crate::urn!(TIGHTBEAM_NID, "event:cluster/gossip-reflood-failed");
 /// Carries the count of flood targets one reflood round failed to reach.
 pub const CLUSTER_GOSSIP_FANOUT_UNREACHED: Urn<'static> =
 	crate::urn!(TIGHTBEAM_NID, "event:cluster/gossip-fanout-unreached");
+/// Marks a relayed rumor whose origin this gateway's peer trust does not
+/// hold. The rumor is dropped, and the relay pays one rate token and no
+/// score.
+pub const CLUSTER_GOSSIP_ORIGIN_UNKNOWN: Urn<'static> =
+	crate::urn!(TIGHTBEAM_NID, "event:cluster/gossip-origin-unknown");
+/// Marks a peer that answered a rumor's origin as outside its trust, so this
+/// gateway offers that peer no further rumor of that origin for one window.
+pub const CLUSTER_GOSSIP_ORIGIN_REFUSED_BY_PEER: Urn<'static> =
+	crate::urn!(TIGHTBEAM_NID, "event:cluster/gossip-origin-refused-by-peer");
 /// Marks a journal that refused to witness a digest this gateway published.
 pub const CLUSTER_GOSSIP_WITNESS_REFUSED: Urn<'static> =
 	crate::urn!(TIGHTBEAM_NID, "event:cluster/gossip-witness-refused");

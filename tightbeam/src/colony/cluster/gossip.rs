@@ -1,14 +1,15 @@
 //! Gossip admission, content digest, and retention journal.
 //!
-//! Colony gateways flood origin-signed rumors within one colony and
-//! deliver admitted rumors locally according to operator ingress policy.
+//! Gateways flood origin-signed rumors across the colonies of one namespace
+//! and deliver admitted rumors locally according to operator ingress policy.
 //! Forwarding continues while hop time-to-live remains on the outer
 //! relay frame.
 //!
-//! # Colony scope
+//! # Flood scope
 //!
-//! Flood scope is colony membership: the origin certificate URI SAN
-//! colony URN MUST equal the local gateway colony URN.
+//! The `Flood` type in `peer.rs` owns the scope. A rumor travels between the
+//! gateways that the peer trust store admits and whose certificates carry a
+//! colony URN of the local namespace.
 //!
 //! # Rumor model
 //!
@@ -123,8 +124,9 @@ pub fn wanted_digests(want: impl AsRef<[Vec<u8>]>) -> Vec<GossipDigest> {
 
 /// Whether rumor issue time falls inside the freshness window.
 ///
-/// Shared by admission and anti-entropy repair. Journals retain by record
-/// time, so a relayed rumor may still be fetchable after the issue window.
+/// Admission and anti-entropy repair share this check. Journals retain by
+/// record time, so a relayed rumor may still be fetchable after the issue
+/// window.
 #[must_use]
 pub fn gossip_fresh(order: UnixMillis, seen_ttl: Duration, now: UnixMillis) -> bool {
 	now.abs_diff(order) <= seen_ttl
@@ -133,7 +135,7 @@ pub fn gossip_fresh(order: UnixMillis, seen_ttl: Duration, now: UnixMillis) -> b
 /// Rumor that passed payload, hop-radius, and freshness checks.
 ///
 /// Construct only through [`AdmittedGossip::admit`]. Signature and
-/// colony-membership checks run in the gateway handler first.
+/// flood-membership checks run in the gateway handler first.
 pub struct AdmittedGossip {
 	digest: GossipDigest,
 	payload: Vec<u8>,
@@ -152,8 +154,7 @@ impl AdmittedGossip {
 	///
 	/// - The rumor body does not decode.
 	/// - The payload exceeds [`MAX_GOSSIP_PAYLOAD_BYTES`].
-	/// - `ttl` exceeds [`MAX_GOSSIP_TTL`], which caps the hop radius here at
-	///   the trust boundary (CWE-770).
+	/// - `ttl` exceeds [`MAX_GOSSIP_TTL`], which caps the hop radius here at the trust boundary (CWE-770).
 	/// - The issue time is stale.
 	pub fn admit<D>(rumor: &Frame, ttl: u64, seen_ttl: Duration, now: UnixMillis) -> Result<Self, TransitStatus>
 	where
@@ -187,8 +188,7 @@ impl AdmittedGossip {
 
 	/// Consume the admission and yield the owned payload.
 	///
-	/// Local delivery takes the bytes this admission already owns, so
-	/// the handoff never copies them.
+	/// The admission owns the bytes, so the handoff is a move.
 	#[must_use]
 	pub fn into_payload(self) -> Vec<u8> {
 		self.payload
@@ -203,9 +203,9 @@ impl AdmittedGossip {
 
 /// Per-signer rate admission gating the gossip pipeline.
 ///
-/// Consulted after signature verification and before journal record or
-/// reflood. An over-limit signer cannot grow retained state or amplify
-/// traffic (CWE-770).
+/// The gateway consults it after signature verification and before journal
+/// record or reflood. An over-limit signer cannot grow retained state or
+/// amplify traffic (CWE-770).
 ///
 /// # Default
 ///
@@ -363,8 +363,8 @@ pub trait GossipJournal: Send + Sync {
 
 	/// Whether a digest is already retained or witnessed, without recording it.
 	///
-	/// Probed before rate admission so a duplicate does not spend a signer's
-	/// token: relay echoes are normal and MUST NOT drain the bucket.
+	/// The gateway probes before rate admission so a duplicate does not spend
+	/// a signer's token: relay echoes are normal and MUST NOT drain the bucket.
 	///
 	/// The probe is advisory. [`GossipJournal::record`] and
 	/// [`GossipJournal::witness`] remain the atomic dedup steps for races
@@ -395,7 +395,7 @@ pub trait GossipJournal: Send + Sync {
 	/// Mark local delivery complete so the rumor stops being retried.
 	fn ack_local(&self, digest: &GossipDigest) -> Result<(), ClusterError>;
 
-	/// Retention horizon in milliseconds.
+	/// Retention horizon of this journal.
 	///
 	/// The gateway clamps admission freshness (`seen_ttl`) to this horizon
 	/// at start, because a rumor older than retention has no digest left
@@ -444,8 +444,7 @@ pub enum LocalClaim {
 /// # Exits
 ///
 /// - Dropping the guard releases the claim, so the rumor returns to the retry set.
-/// - [`Self::ack`] retires the entry instead, and is the only exit that
-///   stops the rumor being retried.
+/// - [`Self::ack`] retires the entry instead, and is the only exit that stops the rumor being retried.
 pub struct LocalClaimGuard<'a> {
 	journal: &'a dyn GossipJournal,
 	digest: &'a GossipDigest,
@@ -511,11 +510,11 @@ impl Drop for LocalClaimGuard<'_> {
 /// delivering is not offered to a second one (CWE-362).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LocalDelivery {
-	/// Awaiting delivery, with no task holding it.
+	/// The rumor awaits delivery, with no task holding it.
 	Pending,
 	/// One task is delivering it now.
 	Claimed,
-	/// Delivered, so the retry set drops it for good.
+	/// The rumor is delivered, so the retry set drops it for good.
 	Delivered,
 }
 
@@ -528,14 +527,14 @@ enum LocalDelivery {
 /// # Capacity
 ///
 /// Per-signer capacity bounds retained and witnessed entries separately,
-/// so one signer's flood on either plane cannot starve its own other
-/// plane. The global cap is shared across signers and kinds: a memory
-/// ceiling, not a fairness partition.
+/// so a signer that fills one kind cannot starve its own other kind. The
+/// global cap is shared across signers and kinds: a memory ceiling, not a
+/// fairness partition.
 ///
 /// # Retention
 ///
-/// Retention prunes on every read and write in both clock directions so
-/// an aged-out rumor is never returned.
+/// Retention prunes on every record, witness, and read in both clock
+/// directions so an aged-out rumor is never returned.
 pub struct MemoryGossipJournal {
 	entries: Mutex<HashMap<GossipDigest, JournalEntry>>,
 	retention: Duration,
@@ -545,14 +544,15 @@ pub struct MemoryGossipJournal {
 
 /// The two capacity bounds a journal holds.
 ///
-/// Both are counts of retained rumors, so a positional pair lets a caller
+/// Both are counts of journal entries, so a positional pair lets a caller
 /// exchange them and give every signer the whole log. The named fields are
 /// what the call site binds (CWE-770).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct JournalLimits {
-	/// Rumors the journal retains across every signer.
+	/// Retained rumors and witnessed digests the journal holds in total.
 	pub total: usize,
-	/// Rumors the journal retains for any one signer.
+	/// Retained rumors the journal holds for any one signer. The same count
+	/// bounds that signer's witnessed digests separately.
 	pub per_signer: usize,
 }
 
@@ -635,6 +635,9 @@ pub struct GossipConfig {
 	/// - [`ColonyNamespace::servlet_type_key`] creates the key, so a
 	///   configured ingress always names a servlet type this colony can route.
 	/// - Local delivery is receiving-gateway policy rather than rumor content.
+	/// - The servlet receives the origin-signed rumor frame. Its message
+	///   decodes as a [`GossipRumor`], and its signature names the publishing
+	///   gateway.
 	/// - `None` journals and refloods only, and marks the record delivered so
 	///   it stays out of the pending retry set.
 	///
@@ -643,13 +646,13 @@ pub struct GossipConfig {
 	///
 	/// # Export boundary
 	///
-	/// The ingress sink sits outside the export boundary. Colony scope and the
-	/// origin signature already gate which peers may flood a rumor, and the
-	/// operator chooses the delivery type, so the export allowlist does not
-	/// apply here.
+	/// The ingress sink sits outside the export boundary. Peer trust and the
+	/// origin signature already gate which gateways may flood a rumor, and
+	/// the operator chooses the delivery type, so the export allowlist does
+	/// not apply here.
 	///
-	/// An operator who restricts exports should treat the ingress type as an
-	/// intentional local delivery channel for admitted colony gossip.
+	/// Every trusted colony delivers through this type, so an operator who
+	/// restricts exports should treat it as a channel for the whole flood.
 	pub ingress: Option<ServletTypeKey>,
 	/// Dedup and retention store, which owns its own retention window.
 	pub journal: Arc<dyn GossipJournal>,

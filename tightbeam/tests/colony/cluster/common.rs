@@ -18,13 +18,15 @@
 //!   [`split_hive_trust`], because peer membership wins on the hive plane.
 //! - Distinct [`member_identity`] federation or org topologies: put the full
 //!   combined store on `hive_trust` and exclude self from `peer_trust`.
+//! - Distinct [`colony_identity`] flood topologies: put each gateway's own
+//!   certificate in its `peer_trust`, so an echo of its own rumor verifies,
+//!   and sign publishes with [`hive_plane_certs`] under [`split_hive_trust`].
 //! - Export-boundary scenarios: use the per-org split planes in `exports.rs`,
 //!   where `hive_trust` holds the own org and `peer_trust` the external peer.
 //!
 //! # Work probes
 //!
-//! - [`record_ping_echo`] drives the public `SubmitWork` client surface
-//!   end to end.
+//! - [`record_ping_echo`] drives the public `SubmitWork` client surface end to end.
 //! - [`emit_typed_work`] submits the same signed ping frame
 //!   ([`signed_work_frame`]) under a caller-chosen type URN. Export
 //!   scenarios reuse it for private types that still run the ping
@@ -34,20 +36,19 @@
 //! - [`emit_relayed_ping_work`] alone composes the wire envelope itself,
 //!   because its pre-spent hop budget is the wire shape under test.
 
-pub use crate::common::poll::poll_until;
-use crate::common::security::expectation_failure;
-use tightbeam::{cluster, compose, hive, servlet};
-
 // Sibling scenario modules consume these re-exports through
 // `use super::common::*`.
-pub(crate) use super::events::*;
-pub use crate::common::x509::{combined_trust, combined_validator, GatewayCerts};
 pub use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 pub use core::time::Duration;
-pub use sha3::Sha3_256;
 pub use std::collections::HashSet;
 pub use std::sync::{Arc, Mutex};
-pub use tightbeam::der::Sequence;
+
+pub use sha3::Sha3_256;
+
+use tightbeam::cms::signed_data::SignerIdentifier;
+use tightbeam::crypto::policy::VerificationPolicy;
+use tightbeam::crypto::x509::error::CertificateValidationError;
+use tightbeam::crypto::x509::policy::CertificateValidation;
 pub use tightbeam::{
 	at_least, at_most,
 	builder::TypeBuilder,
@@ -82,7 +83,9 @@ pub use tightbeam::{
 			Certificate, CertificateSpec,
 		},
 	},
-	decode, encode, exactly,
+	decode,
+	der::Sequence,
+	encode, exactly,
 	instrumentation::events,
 	policy::{GatePolicy, SessionContext, TransitStatus},
 	tb_assert_spec, tb_process_spec, tb_scenario,
@@ -96,6 +99,12 @@ pub use tightbeam::{
 	utils::urn::Urn,
 	Beamable, Frame, TightBeamError, Version,
 };
+use tightbeam::{cluster, compose, hive, servlet};
+
+pub(crate) use super::events::*;
+pub use crate::common::poll::poll_until;
+use crate::common::security::expectation_failure;
+pub use crate::common::x509::{combined_trust, combined_validator, GatewayCerts};
 
 /// Address the simulated peer gateway advertises itself at.
 pub(crate) const PEER_GATEWAY_ADDR: &[u8] = b"127.0.0.1:9000";
@@ -108,8 +117,9 @@ pub const CONTAINMENT_ABANDON_LIMIT: u32 = 3;
 
 pub type ClusterTestCerts = GatewayCerts;
 
-/// The colony every member gateway in these tests belongs to. Membership
-/// travels as a URI SAN on the gateway certificate, never as the subject.
+/// The colony the shared gateway identity and every [`member_identity`] belong
+/// to. Membership travels as a URI SAN on the gateway certificate, never as
+/// the subject.
 pub fn test_colony_urn() -> Urn<'static> {
 	colony_ns().colony("main").expect("static colony name")
 }
@@ -135,7 +145,78 @@ pub fn colony_identity(cn: impl AsRef<str>, colony: &Urn<'_>) -> (Certificate, S
 	(cert, Secp256k1SigningKey::from(raw))
 }
 
-/// A [`colony_identity`] in the colony every member gateway joins.
+/// A fresh gateway identity whose certificate carries no colony URN.
+///
+/// Transport trusts it where a store enrolls it, and it is outside every
+/// flood. Its own `CN` keeps issuer resolution unambiguous in a store that
+/// also anchors the shared gateway identity.
+pub fn stranger_gateway_certs() -> ClusterTestCerts {
+	use tightbeam::random::OsRng;
+	use tightbeam::testing::fixtures::TestCertificate;
+
+	let raw = k256::ecdsa::SigningKey::random(&mut OsRng);
+	let cert = TestCertificate::with_cn_and_uri_sans(&raw, "Stranger Gateway", &[]);
+	let key = Secp256k1SigningKey::from(raw);
+	let trust = combined_trust(&[&cert]);
+
+	GatewayCerts { cert, key, trust }
+}
+
+/// A peer trust store an operator replaces while the gateway runs.
+///
+/// It answers from `before` until [`Self::switch`], and from `after` from
+/// then on. Each answer borrows from the store that gave it.
+#[derive(Debug)]
+pub struct SwitchTrust {
+	before: Arc<dyn CertificateTrust>,
+	after: Arc<dyn CertificateTrust>,
+	switched: AtomicBool,
+}
+
+impl SwitchTrust {
+	pub fn new(before: Arc<dyn CertificateTrust>, after: Arc<dyn CertificateTrust>) -> Arc<Self> {
+		Arc::new(Self { before, after, switched: AtomicBool::new(false) })
+	}
+
+	/// Replaces the store the gateway reads.
+	pub fn switch(&self) {
+		self.switched.store(true, Ordering::SeqCst);
+	}
+
+	fn current(&self) -> &dyn CertificateTrust {
+		if self.switched.load(Ordering::SeqCst) {
+			self.after.as_ref()
+		} else {
+			self.before.as_ref()
+		}
+	}
+}
+
+impl CertificateValidation for SwitchTrust {
+	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
+		self.current().evaluate(cert)
+	}
+}
+
+impl CertificateTrust for SwitchTrust {
+	fn is_trusted(&self, cert: &Certificate) -> bool {
+		self.current().is_trusted(cert)
+	}
+
+	fn verify_chain(&self, chain: &[Certificate]) -> Result<(), CertificateValidationError> {
+		self.current().verify_chain(chain)
+	}
+
+	fn find_by_signer_identifier(&self, sid: &SignerIdentifier) -> Option<&Certificate> {
+		self.current().find_by_signer_identifier(sid)
+	}
+
+	fn to_policy_ref(&self) -> &dyn VerificationPolicy {
+		self.current().to_policy_ref()
+	}
+}
+
+/// A [`colony_identity`] in the colony that [`test_colony_urn`] names.
 pub fn member_identity(cn: impl AsRef<str>) -> (Certificate, Secp256k1SigningKey) {
 	let cn = cn.as_ref();
 	colony_identity(cn, &test_colony_urn())
@@ -163,13 +244,12 @@ pub fn hive_plane_certs() -> Arc<ClusterTestCerts> {
 	Arc::new(GatewayCerts { cert, key, trust })
 }
 
-/// Gateway hive trust for shared [`cluster_certs`] fixtures.
+/// Gateway hive trust for a fixture whose `peer_trust` holds the gateway's own
+/// certificate.
 ///
-/// The trust combines the gateway identity, which hive-pool dials between
-/// gateways use, with the hive-plane identity, which registration, address
-/// updates, and origin publishes use. Do not pass a [`member_identity`]
-/// gateway here. Federation and organization scenarios exclude self from
-/// `peer_trust` instead.
+/// - The gateway identity serves the hive-pool dials between gateways.
+/// - The hive-plane identity serves registration, address updates, and origin publishes.
+/// - Federation and organization scenarios leave the gateway out of its own `peer_trust` and need no split.
 pub fn split_hive_trust(gateway: &ClusterTestCerts) -> Arc<dyn CertificateTrust> {
 	combined_trust(&[&gateway.cert, &hive_plane_certs().cert])
 }
@@ -199,6 +279,7 @@ pub fn hive_tls_config_no_trust(certs: &ClusterTestCerts) -> HiveConfig {
 		)
 		.expect("the hive TLS material must decode"),
 	);
+
 	let mut conf = HiveConfig { hive_tls: Some(hive_tls), ..Default::default() };
 	conf.pool.mux_offer = Some(Arc::new(TransportOffer::mux(8)));
 	conf
@@ -208,10 +289,12 @@ pub fn hive_tls_config(certs: &ClusterTestCerts) -> HiveConfig {
 	HiveConfig { trust_store: Some(Arc::clone(&certs.trust)), ..hive_tls_config_no_trust(certs) }
 }
 
-pub fn servlet_tls_config(
+/// A servlet config on the fixture identity, for a servlet of any message
+/// type `M`.
+pub fn servlet_tls_config<M: tightbeam::Message>(
 	certs: &ClusterTestCerts,
-) -> Result<ServletConfig<TokioListener, PingRequest, DefaultCryptoProvider>, TightBeamError> {
-	Ok(ServletConfig::<TokioListener, PingRequest, DefaultCryptoProvider>::builder()
+) -> Result<ServletConfig<TokioListener, M, DefaultCryptoProvider>, TightBeamError> {
+	Ok(ServletConfig::<TokioListener, M, DefaultCryptoProvider>::builder()
 		.with_certificate(
 			CertificateSpec::Built(Box::new(certs.cert.to_owned())),
 			Arc::new(Secp256k1KeyProvider::from(certs.key.to_owned())),
@@ -502,6 +585,24 @@ servlet! {
 	}
 }
 
+servlet! {
+	/// The gossip ingress servlet. It receives the origin-signed rumor frame,
+	/// records whether the shared gateway identity signed it, and answers the
+	/// ping the rumor carries.
+	pub ClusterRumorServlet<GossipRumor, EnvConfig = ()>,
+	protocol: TokioListener,
+	handle: |rumor, frame, ctx| async move {
+		let ping: PingRequest = decode(&rumor.payload)?;
+		let signed_by_gateway = frame_signature_verifies(&frame, &cluster_certs().key);
+		ctx.trace().event_with(GOSSIP_INGRESS_SIGNED_BY_GATEWAY, &[], signed_by_gateway)?;
+
+		Ok(Some(compose! {
+			V0: id: frame.metadata().id(),
+				message: PingResponse { doubled: ping.value * 2 }
+		}?))
+	}
+}
+
 hive! {
 	pub ClusterTestHive,
 	protocol: TokioListener
@@ -528,6 +629,23 @@ pub async fn start_ping_hive(
 	let mut hive = ClusterTestHive::new(Some(conf))?;
 	hive.register(servlet_urn("ping"), servlet, |t| {
 		ClusterTestServlet::start(t, ServletConfig::default())
+	})?;
+	hive.establish(Arc::new(trace.share())).await?;
+	Ok(hive)
+}
+
+/// Starts a hive whose one servlet is the gossip ingress, registered as the
+/// type `rumor`.
+pub async fn start_rumor_hive(
+	trace: TraceCollector,
+	certs: Arc<ClusterTestCerts>,
+) -> Result<ClusterTestHive, TightBeamError> {
+	let servlet_conf = servlet_tls_config(&certs)?;
+	let servlet = ClusterRumorServlet::start(Arc::new(trace.share()), servlet_conf).await?;
+
+	let mut hive = ClusterTestHive::new(Some(hive_tls_config(&certs)))?;
+	hive.register(servlet_urn("rumor"), servlet, |t| {
+		ClusterRumorServlet::start(t, ServletConfig::default())
 	})?;
 	hive.establish(Arc::new(trace.share())).await?;
 	Ok(hive)
@@ -561,7 +679,6 @@ pub async fn record_ping_echo(
 	trace.event(WORK_SENT)?;
 
 	let inner = signed_work_frame(&certs.key, b"test-work").await?;
-
 	let mut client = connect_cluster(certs, cluster.addr()).await?;
 	let servlet_frame = client.submit_work_to(servlet_urn("ping"), &inner).await?;
 
