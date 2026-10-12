@@ -7,12 +7,12 @@ use crate::Errorizable;
 
 #[cfg(all(
 	feature = "instrument",
-	any(feature = "transport-cms", feature = "transport-ecies")
+	any(feature = "transport-cms", feature = "transport-hpke")
 ))]
 use crate::instrumentation::events;
 #[cfg(all(
 	feature = "instrument",
-	any(feature = "transport-cms", feature = "transport-ecies")
+	any(feature = "transport-cms", feature = "transport-hpke")
 ))]
 use crate::urn::Urn;
 
@@ -246,15 +246,15 @@ pub enum HandshakeError {
 	#[error("Invalid timestamp")]
 	InvalidTimestamp,
 
-	/// An ECIES operation failed.
-	#[cfg(feature = "ecies")]
-	#[error("ECIES operation failed: {0}")]
+	/// An HPKE operation failed.
+	#[cfg(feature = "hpke")]
+	#[error("HPKE operation failed: {0}")]
 	#[from]
-	EciesError(crate::crypto::ecies::EciesError),
-	/// The ECIES message carries no encrypted content.
-	#[error("Missing encrypted content in ECIES message")]
+	HpkeError(crate::crypto::hpke::HpkeError),
+	/// The HPKE message carries no encrypted content.
+	#[error("Missing encrypted content in HPKE message")]
 	MissingEncryptedContent,
-	/// The decrypted ECIES payload has an invalid size.
+	/// The decrypted HPKE payload has an invalid size.
 	#[error("Invalid decrypted payload size")]
 	InvalidDecryptedPayloadSize,
 	/// The client random differs from the expected value, which indicates a
@@ -315,7 +315,7 @@ pub enum HandshakeError {
 
 #[cfg(all(
 	feature = "instrument",
-	any(feature = "transport-cms", feature = "transport-ecies")
+	any(feature = "transport-cms", feature = "transport-hpke")
 ))]
 impl HandshakeError {
 	/// Returns the audit event a failed handshake records for this error, when
@@ -356,8 +356,8 @@ impl From<crate::error::TightBeamError> for HandshakeError {
 			TightBeamError::CertificateValidationError(e) => HandshakeError::CertificateValidationError(e),
 			TightBeamError::KeyError(e) => HandshakeError::KeyError(e),
 			TightBeamError::SignatureError(e) => HandshakeError::SignatureError(e),
-			#[cfg(feature = "ecies")]
-			TightBeamError::EciesError(e) => HandshakeError::EciesError(e),
+			#[cfg(feature = "hpke")]
+			TightBeamError::HpkeError(e) => HandshakeError::HpkeError(e),
 			TightBeamError::OsRngError(_) => HandshakeError::RandomGenerationFailed,
 			_ => HandshakeError::InvalidState,
 		}
@@ -383,7 +383,7 @@ impl From<HandshakeError> for crate::cms::builder::Error {
 #[cfg(all(
 	test,
 	feature = "instrument",
-	any(feature = "transport-cms", feature = "transport-ecies")
+	any(feature = "transport-cms", feature = "transport-hpke")
 ))]
 mod tests {
 	use super::*;

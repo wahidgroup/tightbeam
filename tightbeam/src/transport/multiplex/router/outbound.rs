@@ -6,7 +6,7 @@
 
 use crate::transport::envelopes::{CancelReason, MuxEnvelope, TransportEnvelope};
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::aead::SendCipher;
 
 /// One command a producer queues for the writer driver.
@@ -21,11 +21,11 @@ pub enum Outbound {
 	///
 	/// - RFC 9846 § 4.7.3, the TLS KeyUpdate message:
 	///   <https://datatracker.ietf.org/doc/html/rfc9846#section-4.7.3>
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	EnvelopeThenInstall(TransportEnvelope, Box<SendCipher>),
 	/// Budget-watermark renewal trigger from a handle, on which the writer
 	/// opens the exchange.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	StartRenewal,
 	/// Stop the writer driver, which ends its run with `Ok(())`.
 	Close,

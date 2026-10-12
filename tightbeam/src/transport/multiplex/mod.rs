@@ -52,18 +52,39 @@ mod service;
 use core::future::Future;
 use std::sync::Arc;
 
+#[cfg(feature = "tokio")]
+pub use router::SpawnedMux;
+#[cfg(any(feature = "tokio", feature = "async-transport"))]
+pub use router::{
+	BufferedGrantor, CreditGrantor, MuxDispatch, MuxHandle, MuxReaderDriver, MuxResponder, MuxTransport,
+	MuxWriterDriver, ReplySink, RequestSink, StreamBody,
+};
+#[cfg(pooled_mux)]
+pub use service::{CallContext, MuxService};
+
+use crate::policy::GatePolicy;
+use crate::policy::SessionContext;
 use crate::transport::handshake::negotiation::{MuxSettings, TransportOffer};
 use crate::transport::io::{EnvelopeSink, EnvelopeSource};
 use crate::transport::TransportResult;
 use crate::utils::marker::MaybeSend;
-use crate::Frame;
-
 use crate::x509::Certificate;
+use crate::Frame;
 
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 use crate::constants::DEFAULT_HOP_BUDGET;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::transport::handshake::receipt::{ReceiptSigner, StoredReceipt};
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::transport::handshake::{HandshakeProvider, HandshakeVerifyingKey};
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::transport::rekey::{ClientRekey, RekeyDriver, RekeyMaterials, ServerRekey};
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::transport::state::EncryptedProtocolState;
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 use crate::urn::Urn;
+#[cfg(pooled_mux)]
+use service::GatedService;
 
 /// Converts a caller-owned or already-shared mux offer into a shared handle.
 ///
@@ -110,29 +131,6 @@ impl IntoMuxOffer for Option<&Arc<TransportOffer>> {
 		self.map(Arc::clone)
 	}
 }
-
-use crate::policy::GatePolicy;
-use crate::policy::SessionContext;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-use crate::transport::handshake::receipt::{ReceiptSigner, StoredReceipt};
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-use crate::transport::handshake::{HandshakeProvider, HandshakeVerifyingKey};
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-use crate::transport::rekey::{ClientRekey, RekeyDriver, RekeyMaterials, ServerRekey};
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-use crate::transport::state::EncryptedProtocolState;
-#[cfg(pooled_mux)]
-use service::GatedService;
-
-#[cfg(feature = "tokio")]
-pub use router::SpawnedMux;
-#[cfg(any(feature = "tokio", feature = "async-transport"))]
-pub use router::{
-	BufferedGrantor, CreditGrantor, MuxDispatch, MuxHandle, MuxReaderDriver, MuxResponder, MuxTransport,
-	MuxWriterDriver, ReplySink, RequestSink, StreamBody,
-};
-#[cfg(pooled_mux)]
-pub use service::{CallContext, MuxService};
 
 /// Grpc-style route carried on a stream's Open record.
 ///
@@ -352,13 +350,13 @@ pub trait MuxCapable: Sized {
 /// that the exchange rotates. An unmetered session carries no receipt, so it
 /// has no context and keeps the GoAway drain. The type is opaque, so the
 /// transport builds it and [`MuxTransport::with_rekey`] consumes it.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub struct MuxRekeyContext {
 	pub(crate) driver: RekeyDriver,
 	pub(crate) receipt: StoredReceipt,
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl MuxRekeyContext {
 	/// Harvest the in-band rekey context from a completed receipt-bearing
 	/// handshake.
@@ -454,7 +452,7 @@ pub trait MuxConnector: MuxCapable {
 	/// Detach the client half of the in-band rekey context from a completed
 	/// handshake. The result is `Ok(None)` for a session without a
 	/// receipt-bearing epoch.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	fn take_rekey(&mut self) -> TransportResult<Option<MuxRekeyContext>> {
 		Ok(None)
 	}
@@ -493,7 +491,7 @@ pub trait MuxAcceptor: MuxCapable {
 	/// Detach the server half of the in-band rekey context from a completed
 	/// handshake. The result is `Ok(None)` for a session without a
 	/// receipt-bearing epoch.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	fn take_rekey(&mut self) -> TransportResult<Option<MuxRekeyContext>> {
 		Ok(None)
 	}

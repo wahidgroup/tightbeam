@@ -5,10 +5,10 @@
 // early with a clear message.
 #[cfg(all(
 	any(feature = "tcp", feature = "async-transport"),
-	not(any(feature = "transport-cms", feature = "transport-ecies"))
+	not(any(feature = "transport-cms", feature = "transport-hpke"))
 ))]
 compile_error!(
-	"the `tcp` and `async-transport` features require a handshake protocol: enable `transport-ecies` and/or `transport-cms`"
+	"the `tcp` and `async-transport` features require a handshake protocol: enable `transport-hpke` and/or `transport-cms`"
 );
 
 #[cfg(not(feature = "std"))]
@@ -27,6 +27,7 @@ pub mod error;
 pub mod handshake;
 pub mod io;
 pub mod messaging;
+pub mod policy;
 pub mod protocols;
 pub mod state;
 pub mod wire_der;
@@ -37,10 +38,9 @@ pub mod accept;
 pub(crate) mod framing;
 #[cfg(feature = "transport-multiplex")]
 pub mod multiplex;
-pub mod policy;
 #[cfg(all(
 	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-ecies")
+	any(feature = "transport-cms", feature = "transport-hpke")
 ))]
 pub(crate) mod rekey;
 #[cfg(any(feature = "tcp", feature = "async-transport"))]
@@ -48,19 +48,19 @@ pub mod tcp;
 
 pub use builders::EnvelopeBuilder;
 pub use client::GenericClient;
+pub use client::{ClientBuilder, ClientPolicies};
 pub use envelopes::{RequestPackage, ResponsePackage, TransportEnvelope, WireEnvelope, WireMode};
 pub use error::{TransportError, TransportFailure};
 pub use io::{EncryptedMessageIO, EnvelopeSink, EnvelopeSource, MessageIO};
+pub use messaging::GateAudit;
+pub use messaging::MessageEmitter;
 pub use messaging::{MessageCollector, Transport};
 pub use protocols::{
 	AsyncListenerTrait, EncryptedProtocol, PersistentConnection, Protocol, ProtocolStream, TightBeamAddress,
 };
 
-pub use client::{ClientBuilder, ClientPolicies};
 #[cfg(feature = "std")]
 pub use client::{ConnectionBuilder, ConnectionPool, PoolConfig, PooledClient};
-pub use messaging::GateAudit;
-pub use messaging::MessageEmitter;
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 pub use protocols::{
 	AsyncByteRead, AsyncByteStream, AsyncByteWrite, AsyncProtocolStream, AsyncReadStream, AsyncWriteStream,
@@ -76,8 +76,13 @@ pub use tcp::r#async::{TransportReader, TransportWriter};
 /// Transport-agnostic result type.
 pub type TransportResult<T> = Result<T, TransportError>;
 
+use crate::constants::{
+	DEFAULT_HANDSHAKE_MAX_WIRE, DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_MAX_CLEARTEXT_ENVELOPE,
+	DEFAULT_MAX_ENCRYPTED_ENVELOPE, DEFAULT_OPERATION_TIMEOUT, TIGHTBEAM_AAD_DOMAIN_TAG,
+};
 use crate::crypto::profiles::CryptoProvider;
 use crate::crypto::x509::policy::CertificateValidation;
+use crate::transport::handshake::HandshakeKeyManager;
 use crate::transport::handshake::PeerAuthentication;
 use crate::transport::state::{DialableEncryption, EncryptionConfig};
 use crate::utils::time::Clock;
@@ -87,12 +92,6 @@ use crate::x509::Certificate;
 use crate::trace::TraceCollector;
 #[cfg(host_clock)]
 use crate::utils::time::SystemClock;
-
-use crate::constants::{
-	DEFAULT_HANDSHAKE_MAX_WIRE, DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_MAX_CLEARTEXT_ENVELOPE,
-	DEFAULT_MAX_ENCRYPTED_ENVELOPE, DEFAULT_OPERATION_TIMEOUT, TIGHTBEAM_AAD_DOMAIN_TAG,
-};
-use crate::transport::handshake::HandshakeKeyManager;
 
 /// Every ceiling a transport enforces, in one value.
 ///
@@ -320,10 +319,10 @@ impl<P: CryptoProvider> TransportEncryptionConfig<P> {
 		self
 	}
 
-	/// Replace the domain-separation tag of the ECIES key exchange.
+	/// Replace the domain-separation tag of the HPKE key exchange.
 	///
-	/// The ECIES handshake binds this tag into the associated data of the
-	/// encrypted key exchange, so an ECIES session completes only when both
+	/// The HPKE handshake binds this tag into the associated data of the
+	/// encrypted key exchange, so an HPKE session completes only when both
 	/// endpoints hold the same tag. The CMS handshake and session records do
 	/// not read it.
 	#[must_use]

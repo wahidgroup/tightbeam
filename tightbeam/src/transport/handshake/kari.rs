@@ -18,10 +18,10 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use crate::cms::enveloped_data::OriginatorPublicKey;
-use crate::crypto::kdf::KdfFunction;
+use crate::crypto::kdf::{EcdhSecret, KdfFunction};
 use crate::crypto::key::KeyError;
 use crate::crypto::profiles::{CryptoProvider, SecurityProfile};
-use crate::crypto::secret::{Secret, SecretSlice};
+use crate::crypto::secret::SecretSlice;
 use crate::crypto::subtle::ConstantTimeEq;
 use crate::der::asn1::{BitString, ObjectIdentifier};
 use crate::der::{Decode, Error as DerError};
@@ -29,7 +29,6 @@ use crate::oids::{AES_128_WRAP, AES_192_WRAP, AES_256_WRAP};
 use crate::spki::{EncodePublicKey, Error as SpkiError, SubjectPublicKeyInfoOwned};
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::primitives::{KdfInfo, KdfSalt};
-use crate::zeroize::Zeroize;
 use crate::ZeroizingBytes;
 
 /// Carriage of a public key as a CMS `OriginatorPublicKey`
@@ -220,21 +219,18 @@ impl<'a> Kek<'a> {
 }
 
 /// KEK derivation over a shared secret on the handshake plane.
-pub(crate) trait HandshakeKek {
+///
+/// A KEK comes from a sized secret alone. [`HandshakeAgreement`] answers
+/// sized, and a key provider's answer passes the length check of its
+/// conversion first.
+impl EcdhSecret {
 	/// Derive a KEK sized to the negotiated key-wrap algorithm using the
 	/// provider's HKDF (shared_secret as IKM, UKM as salt, info as context).
-	fn derive_kek<P>(&self, ukm: KdfSalt<'_>, kdf_info: KdfInfo<'_>) -> Result<ZeroizingBytes, HandshakeError>
-	where
-		P: CryptoProvider;
-}
-
-/// The key provider answers the static agreement as a [`SecretSlice`], and
-/// [`HandshakeAgreement`] answers it sized, so both shapes derive a KEK.
-impl<S> HandshakeKek for Secret<S>
-where
-	S: Zeroize + AsRef<[u8]>,
-{
-	fn derive_kek<P>(&self, ukm: KdfSalt<'_>, kdf_info: KdfInfo<'_>) -> Result<ZeroizingBytes, HandshakeError>
+	pub(crate) fn derive_kek<P>(
+		&self,
+		ukm: KdfSalt<'_>,
+		kdf_info: KdfInfo<'_>,
+	) -> Result<ZeroizingBytes, HandshakeError>
 	where
 		P: CryptoProvider,
 	{
@@ -244,7 +240,7 @@ where
 
 		let key_size = key_wrap_key_size::<P>()?;
 		let kek = self.with(|shared| {
-			P::Kdf::derive_dynamic_key(shared.as_ref(), kdf_info.as_bytes(), Some(ukm.as_bytes()), key_size)
+			P::Kdf::derive_dynamic_key(shared.as_slice(), kdf_info.as_bytes(), Some(ukm.as_bytes()), key_size)
 		})?;
 		Ok(kek)
 	}
@@ -274,12 +270,12 @@ mod tests {
 		let ukm_salt = KdfSalt::new(&ukm);
 		let label = KdfInfo::new(TIGHTBEAM_KARI_KDF_INFO);
 
-		let sender_secret = sender.shared_secret(&recipient_pub)?;
+		let sender_secret = sender.shared_secret(&recipient_pub);
 		let sender_kek = sender_secret.derive_kek::<DefaultCryptoProvider>(ukm_salt, label)?;
 		let wrapped = Kek::new(sender_kek.as_slice()).wrap(&provider, cek)?;
 		assert!(wrapped.len() > cek.len());
 
-		let recipient_secret = recipient.shared_secret(&sender_pub)?;
+		let recipient_secret = recipient.shared_secret(&sender_pub);
 		let recipient_kek = recipient_secret.derive_kek::<DefaultCryptoProvider>(ukm_salt, label)?;
 		let unwrapped = Kek::new(recipient_kek.as_slice()).unwrap_verified(&provider, &wrapped)?;
 		assert_eq!(unwrapped.to_insecure().as_slice(), cek.as_slice());
@@ -298,11 +294,11 @@ mod tests {
 		let cek = [0xABu8; 32];
 		let ukm_salt = KdfSalt::new(&ukm);
 		let label = KdfInfo::new(TIGHTBEAM_KARI_KDF_INFO);
-		let sender_secret = sender.shared_secret(&recipient_pub)?;
+		let sender_secret = sender.shared_secret(&recipient_pub);
 		let sender_kek = sender_secret.derive_kek::<DefaultCryptoProvider>(ukm_salt, label)?;
 		let wrapped = Kek::new(sender_kek.as_slice()).wrap(&provider, cek)?;
 
-		let wrong_secret = wrong_recipient.shared_secret(&sender_pub)?;
+		let wrong_secret = wrong_recipient.shared_secret(&sender_pub);
 		let wrong_kek = wrong_secret.derive_kek::<DefaultCryptoProvider>(ukm_salt, label)?;
 		let bad = Kek::new(wrong_kek.as_slice()).unwrap_verified(&provider, &wrapped);
 		assert!(bad.is_err());
@@ -360,13 +356,24 @@ mod tests {
 
 	#[test]
 	fn the_kek_matches_the_profile_key_wrap_length() -> Result<(), HandshakeError> {
-		let shared_secret = SecretSlice::from(vec![0x33u8; 48]);
+		let shared_secret = EcdhSecret::from([0x33u8; 32]);
 		let ukm = [0x44u8; 64];
 		let label = KdfInfo::new(TIGHTBEAM_KARI_KDF_INFO);
 
 		let kek = shared_secret.derive_kek::<DefaultCryptoProvider>(KdfSalt::new(&ukm), label)?;
 		assert_eq!(kek.as_slice().len(), 32);
 		Ok(())
+	}
+
+	/// An empty UKM is refused, so every KEK derives under a salt the sender
+	/// drew.
+	#[test]
+	fn an_empty_ukm_is_refused() {
+		let shared_secret = EcdhSecret::from([0x33u8; 32]);
+		let label = KdfInfo::new(TIGHTBEAM_KARI_KDF_INFO);
+
+		let refused = shared_secret.derive_kek::<DefaultCryptoProvider>(KdfSalt::new(b""), label);
+		assert!(matches!(refused, Err(HandshakeError::MissingUkm)));
 	}
 
 	#[test]

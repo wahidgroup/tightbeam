@@ -241,16 +241,17 @@ pub trait SigningKeyProvider: MaybeSend + MaybeSync + Debug {
 	/// Signs a precomputed digest (prehash) with this provider's private key.
 	///
 	/// The canonical tightbeam convention hashes content exactly once (see
-	/// [`sign_canonical`](crate::crypto::sign::sign_canonical)). Providers
-	/// MUST sign the given prehash directly, so the produced signature matches
-	/// the advertised signature-algorithm OID whatever the backend. The result
-	/// is the DER-encoded signature.
+	/// [`sign_canonical`]). Providers MUST sign the given prehash directly, so
+	/// the produced signature matches the advertised signature-algorithm OID
+	/// whatever the backend. The result is the DER-encoded signature.
 	///
 	/// - `prehash`: the digest of the content to sign.
 	///
 	/// # Errors
 	///
 	/// - [`KeyError`] -- the backend fails to sign `prehash`.
+	///
+	/// [`sign_canonical`]: crate::crypto::sign::CanonicalSigner::sign_canonical
 	fn sign_prehash(&self, prehash: &[u8]) -> MaybeSendFuture<'_, Result<Vec<u8>, KeyError>>;
 
 	/// Performs key agreement, such as ECDH or X25519.

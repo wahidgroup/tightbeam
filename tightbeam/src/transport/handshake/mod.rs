@@ -2,7 +2,7 @@
 //!
 //! This module implements two handshake protocols:
 //!
-//! - **ECIES-based**: lightweight elliptic curve integrated encryption.
+//! - **HPKE-based**: the client seals the base secret to the server's static key (RFC 9180).
 //! - **CMS-based**: full X.509 PKI with signed and enveloped data.
 //!
 //! Both protocols establish authenticated, encrypted sessions and negotiate
@@ -31,8 +31,8 @@
 //! │  │                           │                                         │
 //! │  │◄─ ServerHandshake ────────│  (server_rand, eph, cert, sig, accept?, │
 //! │  │                           │   ma?)                                  │
-//! │  │── ClientKeyExchange ─────►│  (ecies(base, tag, ack?), [cert, sig]?) │
-//! │  │                           │                                         │
+//! │  │── ClientKeyExchange ─────►│  (hpke(base, R, tag, ack?),             │
+//! │  │                           │   [cert, sig]?)                         │
 //! │  │ ◄═ Session Established ═► │  (AEAD keys derived)                    │
 //! │  │                           │                                         │
 //! │  └───────────────────────────┘                                         │
@@ -64,7 +64,7 @@
 //! One type, [`Handshake`], runs both roles over both protocols:
 //!
 //! - The role, [`Client`] or [`Server`], fixes the step order and every negotiation and admission decision.
-//! - The flow, [`Ecies`] or [`Cms`], contributes the messages of its protocol and the checks they define.
+//! - The flow, [`Hpke`] or [`Cms`], contributes the messages of its protocol and the checks they define.
 //! - The provider, a [`HandshakeProvider`], names the algorithms.
 //!
 //! The [`CryptoProvider`] trait is the abstraction boundary of the layer:
@@ -81,7 +81,7 @@
 //! │  │  ┌────────────────────────┐ │    │  ┌─────────────┐  │              │
 //! │  │  │ Handshake<R, F, P>     │ │    │  │  Curve      │  │              │
 //! │  │  │   R: Client | Server   │ │    │  │  Digest     │  │              │
-//! │  │  │   F: Ecies | Cms       │ │    │  │  KDF        │  │              │
+//! │  │  │   F: Hpke | Cms        │ │    │  │  KDF        │  │              │
 //! │  │  └────────────────────────┘ │    │  │  AEAD       │  │              │
 //! │  │                             │    │  │  Signature  │  │              │
 //! │  │         (Generic)           │    │  │  SigningKey │  │              │
@@ -131,14 +131,14 @@
 //!
 //! | Protocol | Offer travels in | Accept travels in |
 //! | --- | --- | --- |
-//! | ECIES | `ClientHello` | `ServerHandshake` |
+//! | HPKE | `ClientHello` | `ServerHandshake` |
 //! | CMS | Key exchange, unprotected attribute | Server Finished, unsigned attribute |
 //!
 //! ## Legs
 //!
 //! Both protocols run three legs, and the layer names each by its position:
 //!
-//! | Leg | Sender | ECIES message | CMS message |
+//! | Leg | Sender | HPKE message | CMS message |
 //! | --- | --- | --- | --- |
 //! | Opening | Client | `ClientHello` | Key exchange |
 //! | Reply | Server | `ServerHandshake` | Server Finished |
@@ -173,16 +173,16 @@ pub(crate) use std::sync::Arc;
 
 mod attributes;
 mod error;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 mod flow;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 mod orchestrator;
 mod peer;
 mod schedule;
 
 #[cfg(test)]
 pub(crate) mod tests;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 mod wire;
 
 pub mod negotiation;
@@ -202,44 +202,44 @@ use attributes::HandshakeAttributes;
 pub use error::HandshakeError;
 #[cfg(feature = "transport-cms")]
 pub use flow::{Cms, CmsClientSettings, CmsServerSettings};
-#[cfg(feature = "transport-ecies")]
-pub use flow::{Ecies, EciesClientSettings, EciesServerSettings};
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(feature = "transport-hpke")]
+pub use flow::{Hpke, HpkeClientSettings, HpkeServerSettings};
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub use negotiation::{ProfilePolicy, SupportedProfiles};
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub use orchestrator::{Client, ClientConfig, Handshake, HandshakePhase, Server, ServerConfig};
-#[cfg(feature = "transport-ecies")]
+#[cfg(feature = "transport-hpke")]
 pub use peer::LearnedTrust;
 pub use peer::PeerAuthentication;
 #[cfg(feature = "transport-cms")]
 pub use peer::ProvisionedTrust;
 pub use schedule::EpochMaterials;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub use schedule::HandshakeSecret;
 #[cfg(all(
 	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-ecies")
+	any(feature = "transport-cms", feature = "transport-hpke")
 ))]
 pub(crate) use schedule::{CompressedPoint, EpochSecret, PeerEphemeral};
 
 #[cfg(feature = "transport-cms")]
 pub use builders::{KariBuilderError, TightBeamKariBuilder};
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub(crate) use flow::ServerFlow;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub(crate) use peer::AdmittedPeer;
 #[cfg(feature = "transport-cms")]
 pub use processors::{TightBeamEnvelopedDataProcessor, TightBeamKariRecipient};
 #[cfg(all(
 	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-ecies")
+	any(feature = "transport-cms", feature = "transport-hpke")
 ))]
 pub(crate) use schedule::HandshakeVerifyingKey;
-#[cfg(feature = "transport-ecies")]
+#[cfg(feature = "transport-hpke")]
 use schedule::KeyConfirmation;
 #[cfg(all(
 	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-ecies")
+	any(feature = "transport-cms", feature = "transport-hpke")
 ))]
 pub(crate) use wire::HandshakeOctets;
 
@@ -250,6 +250,8 @@ use crate::cms::signed_data::{EncapsulatedContentInfo, SignedData, SignerInfos};
 use crate::crypto::aead::SessionKeys;
 use crate::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
 use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider, SecurityProfileDesc};
+use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
+use crate::crypto::x509::attr::{Attribute, AttributeValue, Attributes};
 use crate::der::asn1::SetOfVec;
 use crate::der::{Any, Decode, Encode, Enumerated, Sequence, Tag};
 use crate::oids::{AES_256_GCM, CLIENT_CERTIFICATE, CLIENT_SIGNATURE, DATA};
@@ -262,12 +264,13 @@ use crate::transport::handshake::negotiation::{
 use crate::transport::handshake::receipt::StoredReceipt;
 use crate::transport::wire_der::WireDer;
 use crate::utils::marker::{MaybeSend, MaybeSendFuture};
+use crate::x509::Certificate;
 use crate::Beamable;
 
-#[cfg(feature = "transport-ecies")]
+#[cfg(feature = "transport-hpke")]
 use crate::der::asn1::OctetStringRef;
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 mod transport {
 	pub use crate::crypto::aead::KeyInit;
 	pub use crate::crypto::common::typenum::U32;
@@ -278,20 +281,15 @@ mod transport {
 	pub use crate::spki::EncodePublicKey;
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use transport::*;
-
-use crate::crypto::x509::attr::{Attribute, AttributeValue, Attributes};
-use crate::x509::Certificate;
-
-use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 
 /// A curve both handshake protocols run on.
 ///
 /// The field is 32 bytes wide, so a shared secret is 32 bytes and a compressed
 /// point 33 bytes by type. Every curve that meets the bounds is a handshake
 /// curve.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub trait HandshakeCurve:
 	Curve<FieldBytesSize = U32>
 	+ CurveArithmetic<AffinePoint: FromEncodedPoint<Self> + ToEncodedPoint<Self>>
@@ -302,7 +300,7 @@ pub trait HandshakeCurve:
 {
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl<C> HandshakeCurve for C where
 	C: Curve<FieldBytesSize = U32>
 		+ CurveArithmetic<AffinePoint: FromEncodedPoint<C> + ToEncodedPoint<C>>
@@ -336,7 +334,7 @@ impl<C> HandshakeCurve for C where
 ///
 /// runs_a_handshake::<DefaultCryptoProvider>();
 /// ```
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub trait HandshakeProvider:
 	CryptoProvider<
 		Curve: HandshakeCurve,
@@ -350,7 +348,7 @@ pub trait HandshakeProvider:
 {
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl<P> HandshakeProvider for P where
 	P: CryptoProvider<
 			Curve: HandshakeCurve,
@@ -448,7 +446,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 	/// Shared handle to the encapsulated signing provider, for the server
 	/// handshake and for post-handshake signers such as in-band epoch
 	/// renewals. The key material stays behind the provider abstraction.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub(crate) fn signing_provider(&self) -> Arc<dyn SigningKeyProvider> {
 		Arc::clone(&self.provider)
 	}
@@ -465,7 +463,7 @@ pub enum HandshakeAlert {
 	VersionMismatch = 2,
 	/// The algorithms (profile OIDs) of the two endpoints differ.
 	AlgorithmMismatch = 3,
-	/// Decryption failed (ECIES or AEAD).
+	/// Decryption failed (HPKE or AEAD).
 	DecryptFail = 4,
 	/// The MAC or signature over the Finished transcript hash failed
 	/// verification.
@@ -477,14 +475,14 @@ pub enum HandshakeAlert {
 
 /// A handshake message travels in one of two CMS containers.
 ///
-/// ECIES carries its own message types inside a container, so its messages
+/// HPKE carries its own message types inside a container, so its messages
 /// are decoded from one. The CMS handshake exchanges the containers
 /// themselves.
 #[derive(Debug, Clone, PartialEq)]
 pub enum HandshakeMessage {
-	/// Carries an ECIES `ClientHello` or `ServerHandshake`, or a CMS Finished.
+	/// Carries an HPKE `ClientHello` or `ServerHandshake`, or a CMS Finished.
 	SignedData(Box<WireDer<SignedData>>),
-	/// Carries an ECIES `ClientKeyExchange`, or a CMS key exchange.
+	/// Carries an HPKE `ClientKeyExchange`, or a CMS key exchange.
 	EnvelopedData(Box<WireDer<EnvelopedData>>),
 }
 
@@ -573,7 +571,7 @@ impl EstablishedSession {
 	/// session receipt and the peer identity. A session missing either can
 	/// never renew, so this constructor releases its epoch secret instead of
 	/// holding it, unreachable, for the life of the session.
-	#[cfg(any(test, feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(test, feature = "transport-cms", feature = "transport-hpke"))]
 	pub(crate) fn new(
 		keys: SessionKeys,
 		mux: Option<MuxSettings>,
@@ -741,12 +739,12 @@ pub type BoxedServerHandshake = Box<dyn ServerHandshakeProtocol<Error = Handshak
 #[cfg(target_arch = "wasm32")]
 pub type BoxedServerHandshake = Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + 'static>;
 
-/// Specifies which handshake protocol to use (ECIES or CMS).
+/// Specifies which handshake protocol to use (HPKE or CMS).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HandshakeProtocolKind {
-	/// ECIES-based handshake, the default and the lighter option.
+	/// HPKE-based handshake, the default and the lighter option.
 	#[default]
-	Ecies,
+	Hpke,
 	/// CMS-based handshake (X.509 signed/enveloped data).
 	///
 	/// The client encrypts to the server certificate in its first message and
@@ -780,7 +778,7 @@ pub struct ServerHandshake {
 	pub server_random: OctetString,
 	/// The server's per-handshake ephemeral public key, as a compressed SEC1
 	/// point on the negotiated curve. The signed transcript binds it, and its
-	/// ECDH with the client's ECIES ephemeral feeds the handshake secret (see
+	/// ECDH with the client ephemeral feeds the handshake secret (see
 	/// [forward secrecy](crate::transport::handshake#forward-secrecy)).
 	pub server_ephemeral: OctetString,
 	/// Server signature over the transcript so far, proving possession
@@ -812,18 +810,23 @@ pub struct ServerHandshake {
 	pub session_receipt: Option<SignedData>,
 }
 
-/// Confidential plaintext of the ECIES key exchange.
+/// Confidential plaintext of the HPKE key exchange.
 ///
 /// Only the server decrypts it. It carries the base secret, the anti-replay
-/// client random, the key-confirmation tag, and the sealed receipt
-/// countersignature.
-#[cfg(feature = "transport-ecies")]
+/// client random, the client ephemeral, the key-confirmation tag, and the
+/// sealed receipt countersignature.
+#[cfg(feature = "transport-hpke")]
 #[derive(Clone, Sequence)]
-pub(crate) struct EciesSessionPayload {
+pub(crate) struct HpkeSessionPayload {
 	/// 32-byte base secret, one of the two inputs of the handshake secret.
 	pub base_key: OctetString,
 	/// 32-byte client random echoed back for replay resistance.
 	pub client_random: OctetString,
+	/// The client's ephemeral public key, as a compressed SEC1 point, which
+	/// the server pairs with its own ephemeral for the handshake secret. It
+	/// serves that agreement alone, and HPKE draws the key it seals under
+	/// itself (RFC 9180 § 9.2.3).
+	pub client_ephemeral: OctetString,
 	/// The proof that the client derived the handshake secret, which the
 	/// server verifies before it settles.
 	pub key_confirmation: KeyConfirmation,
@@ -839,9 +842,9 @@ pub(crate) struct EciesSessionPayload {
 /// Final client handshake message carrying the encrypted key material.
 #[derive(Beamable, Sequence, Debug, Clone, PartialEq)]
 pub struct ClientKeyExchange {
-	/// The ECIES message that seals the session payload to the server. It
-	/// leads with the client's ephemeral public key, which the server pairs
-	/// with its own ephemeral for the handshake secret.
+	/// The HPKE message that seals the session payload to the server's static
+	/// key. Its encapsulated key serves that one seal, and the payload inside
+	/// carries the client ephemeral of the handshake secret.
 	pub encrypted_data: OctetString,
 	/// Client certificate for mutual authentication. A client that holds an
 	/// identity includes it, and the [`ServerHandshake`] demands it by setting
@@ -857,9 +860,9 @@ pub struct ClientKeyExchange {
 	pub client_signature: Option<OctetString>,
 }
 
-#[cfg(feature = "transport-ecies")]
+#[cfg(feature = "transport-hpke")]
 impl ClientKeyExchange {
-	/// The AEAD associated data the ECIES key-exchange payload is sealed
+	/// The AEAD associated data the HPKE key-exchange payload is sealed
 	/// under: `domain_tag`, followed by the DER of `client_certificate` when
 	/// the client presents one.
 	///
@@ -897,12 +900,12 @@ fn encodable_to_signed_data<T: Encode>(message: &T) -> Result<SignedData> {
 	})
 }
 
-/// Access to the ECIES message a `SignedData` tunnels.
+/// Access to the HPKE message a `SignedData` tunnels.
 ///
 /// The step that reads the message decodes it from these bytes and binds the
 /// same bytes into its transcript, so the message is parsed once and hashed as
 /// it arrived.
-#[cfg(feature = "transport-ecies")]
+#[cfg(feature = "transport-hpke")]
 pub(crate) trait TunneledMessage {
 	/// The DER of the tunneled message, as it arrived.
 	///
@@ -913,7 +916,7 @@ pub(crate) trait TunneledMessage {
 	fn tunneled_der(&self) -> Result<&[u8]>;
 }
 
-#[cfg(feature = "transport-ecies")]
+#[cfg(feature = "transport-hpke")]
 impl TunneledMessage for SignedData {
 	fn tunneled_der(&self) -> Result<&[u8]> {
 		let econtent = self
@@ -946,7 +949,7 @@ impl TryFrom<&ServerHandshake> for SignedData {
 }
 
 /// Reads the [`ClientHello`] that an opaque `SignedData` tunnels.
-#[cfg(feature = "transport-ecies")]
+#[cfg(feature = "transport-hpke")]
 impl TryFrom<&SignedData> for ClientHello {
 	type Error = HandshakeError;
 
@@ -956,7 +959,7 @@ impl TryFrom<&SignedData> for ClientHello {
 }
 
 /// Reads the [`ServerHandshake`] that an opaque `SignedData` tunnels.
-#[cfg(feature = "transport-ecies")]
+#[cfg(feature = "transport-hpke")]
 impl TryFrom<&SignedData> for ServerHandshake {
 	type Error = HandshakeError;
 
@@ -1034,7 +1037,7 @@ fn aes_256_gcm_algorithm() -> AlgorithmIdentifierOwned {
 }
 
 /// Wraps a [`ClientKeyExchange`] in an opaque `EnvelopedData` that carries
-/// the ECIES ciphertext.
+/// the HPKE ciphertext.
 impl TryFrom<&ClientKeyExchange> for EnvelopedData {
 	type Error = HandshakeError;
 

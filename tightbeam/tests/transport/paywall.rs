@@ -13,7 +13,7 @@
 //! into observable lottery outcomes.
 
 #![cfg(all(
-	feature = "transport-ecies",
+	feature = "transport-hpke",
 	feature = "transport-policy",
 	feature = "transport-multiplex",
 	feature = "tcp",

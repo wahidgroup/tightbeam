@@ -48,16 +48,16 @@ impl<'a> KdfSalt<'a> {
 /// The salt of a key derivation over the handshake randoms,
 /// `client_random || server_random`.
 ///
-/// The ECIES handshake derives under it, and every rekey epoch derives under
+/// The HPKE handshake derives under it, and every rekey epoch derives under
 /// the fresh pair its exchange drew, so the layout has one home.
 #[cfg(any(
-	feature = "transport-ecies",
+	feature = "transport-hpke",
 	all(feature = "transport-multiplex", feature = "transport-cms")
 ))]
 pub(crate) struct RandomsSalt(Zeroizing<[u8; 64]>);
 
 #[cfg(any(
-	feature = "transport-ecies",
+	feature = "transport-hpke",
 	all(feature = "transport-multiplex", feature = "transport-cms")
 ))]
 impl RandomsSalt {

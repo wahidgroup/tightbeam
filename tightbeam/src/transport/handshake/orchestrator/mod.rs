@@ -376,7 +376,7 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> PhaseView<P> for ServerPhase<F, P> 
 /// use tightbeam::testing::fixtures::{TestCertificate, TestKey};
 /// use tightbeam::transport::handshake::negotiation::RunnableProfile;
 /// use tightbeam::transport::handshake::{
-///     ClientConfig, Ecies, EciesClientSettings, EciesServerSettings, Handshake, HandshakeError, LearnedTrust,
+///     ClientConfig, Hpke, HpkeClientSettings, HpkeServerSettings, Handshake, HandshakeError, LearnedTrust,
 ///     ServerConfig, SupportedProfiles,
 /// };
 ///
@@ -390,15 +390,15 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> PhaseView<P> for ServerPhase<F, P> 
 ///
 /// // The client admits the one server certificate it pins.
 /// let pinned = DirectTrustValidator::default().with_trust_chain([certificate.clone()]);
-/// let settings = EciesClientSettings::new(LearnedTrust::new(pinned));
-/// let config = ClientConfig::<Ecies, DefaultCryptoProvider>::new(settings);
+/// let settings = HpkeClientSettings::new(LearnedTrust::new(pinned));
+/// let config = ClientConfig::<Hpke, DefaultCryptoProvider>::new(settings);
 /// let mut client = Handshake::client(config);
 ///
 /// // The server runs the native profile of its provider.
 /// let native = RunnableProfile::<DefaultCryptoProvider>::native().descriptor();
-/// let settings = EciesServerSettings::new(certificate);
+/// let settings = HpkeServerSettings::new(certificate);
 /// let key = Arc::new(Secp256k1KeyProvider::from(server_key));
-/// let config = ServerConfig::<Ecies, DefaultCryptoProvider>::new(settings, key, SupportedProfiles::from(native));
+/// let config = ServerConfig::<Hpke, DefaultCryptoProvider>::new(settings, key, SupportedProfiles::from(native));
 /// let mut server = Handshake::server(config);
 ///
 /// let opening = client.start()?;
@@ -573,7 +573,7 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> Handshake<Client, F, P> {
 	/// - [`HandshakeError::MissingAttribute`] -- the reply carries no server ephemeral.
 	/// - [`HandshakeError::OctetStringLengthError`] -- a fixed-width field of the reply has another width.
 	/// - [`HandshakeError::CertificateValidationError`] -- the trust refused the server the reply names.
-	/// - [`HandshakeError::SignatureError`] -- the ECIES reply signature fails to parse or to verify.
+	/// - [`HandshakeError::SignatureError`] -- the HPKE reply signature fails to parse or to verify.
 	/// - [`HandshakeError::SignatureVerificationFailed`] -- the CMS Finished
 	///   fails to verify, or the receipt fails the server signature check.
 	/// - [`HandshakeError::InvalidProfileSelection`] -- the server selected
@@ -847,12 +847,12 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> Handshake<Server, F, P> {
 	/// - [`HandshakeError::CertificateValidationError`] -- a validator refused the client certificate.
 	/// - [`HandshakeError::InvalidPublicKey`] -- the key of the offered
 	///   certificate is not a point on the curve.
-	/// - [`HandshakeError::SignatureError`] -- the ECIES possession signature fails to verify.
+	/// - [`HandshakeError::SignatureError`] -- the HPKE possession signature fails to verify.
 	/// - [`HandshakeError::SignatureVerificationFailed`] -- the possession
 	///   proof is missing or malformed, the CMS Finished fails to verify, or
 	///   the countersignature fails to verify.
 	/// - [`HandshakeError::KeyError`] -- the key provider failed.
-	/// - [`HandshakeError::EciesError`] -- the sealed payload fails to open, as
+	/// - [`HandshakeError::HpkeError`] -- the sealed payload fails to open, as
 	///   it does under a swapped client certificate.
 	/// - [`HandshakeError::InvalidDecryptedPayloadSize`] -- the opened payload fails to decode.
 	/// - [`HandshakeError::InvalidKeySize`] -- the base secret of the payload is not 32 bytes.

@@ -1,7 +1,7 @@
 //! Dual-signed session receipt integration tests.
 
 #![cfg(all(
-	feature = "transport-ecies",
+	feature = "transport-hpke",
 	feature = "transport-policy",
 	feature = "transport-multiplex",
 	feature = "tcp",
@@ -525,7 +525,7 @@ tb_assert_spec! {
 	}
 }
 
-// ECIES completes client-side on key exchange send; rejection surfaces on first read.
+// HPKE completes client-side on key exchange send; rejection surfaces on first read.
 tb_scenario! {
 	name: receipt_settle_rejection_fails_closed,
 	spec: ReceiptSettleRejectionSpec,

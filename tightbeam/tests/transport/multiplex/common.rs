@@ -77,7 +77,7 @@ pub fn client_stream_id(index: u32) -> u32 {
 	index * 2 + 1
 }
 
-/// Complete an ECIES handshake between a pinned client and an encrypted
+/// Complete an HPKE handshake between a pinned client and an encrypted
 /// server, with each side's optional mux offer.
 ///
 /// # Errors
@@ -96,7 +96,7 @@ pub async fn establish_transports(
 			transport = transport.with_mux_offer(Some(offer));
 		}
 
-		// ECIES is exactly two client messages: ClientHello, ClientKeyExchange.
+		// HPKE is exactly two client messages: ClientHello, ClientKeyExchange.
 		serve_one_handshake_message(&mut transport).await?;
 		serve_one_handshake_message(&mut transport).await?;
 		Ok::<_, TightBeamError>(transport)
@@ -273,7 +273,7 @@ pub async fn accept_mux_server(
 	let (transport, _) = listener.accept().await?;
 	let mut transport = transport.with_mux_offer(Some(offer)).with_trace(trace);
 
-	// ECIES is exactly two client messages: ClientHello, ClientKeyExchange.
+	// HPKE is exactly two client messages: ClientHello, ClientKeyExchange.
 	serve_one_handshake_message(&mut transport).await?;
 	serve_one_handshake_message(&mut transport).await?;
 

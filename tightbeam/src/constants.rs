@@ -88,15 +88,21 @@ pub const TIGHTBEAM_AAD_DOMAIN_TAG: &[u8] = b"tb/aead/v1";
 
 /// Minimum salt entropy in bytes for secure key derivation (HKDF).
 ///
-/// CMS and ECIES both read it when they derive session keys through HKDF, and
+/// CMS and HPKE both read it when they derive session keys through HKDF, and
 /// the salt must carry at least this many bytes of randomness.
 pub const MIN_SALT_ENTROPY_BYTES: usize = 16;
 
 /// UKM (User Keying Material) prefix for KARI operations.
 pub const TIGHTBEAM_UKM_PREFIX: &[u8] = b"tb/kari/ukm/v1|";
 
-/// ECIES KDF info parameter for domain separation and protocol versioning.
-pub const TIGHTBEAM_ECIES_KDF_INFO: &[u8] = b"tb/ecies/v1";
+/// The HPKE `info` of a handshake key exchange (RFC 9180 § 5.1).
+///
+/// It separates the key schedule of a handshake from that of a frame sealed to
+/// the same key, and it versions the protocol.
+pub const TIGHTBEAM_HPKE_HANDSHAKE_INFO: &[u8] = b"tb/hpke/handshake/v1";
+
+/// The HPKE `info` of a frame sealed to a recipient key (RFC 9180 § 5.1).
+pub const TIGHTBEAM_HPKE_FRAME_INFO: &[u8] = b"tb/hpke/frame/v1";
 
 /// Maximum HKDF output size in bytes for one dual-key expansion.
 pub const MAX_HKDF_OUTPUT_SIZE: usize = 128;

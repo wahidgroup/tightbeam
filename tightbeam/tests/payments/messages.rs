@@ -244,7 +244,7 @@ impl TransactionStatus {
 }
 
 // ============================================================================
-// KeyManager Messages (for intra-hive ECIES key management)
+// KeyManager Messages (for intra-hive HPKE key management)
 // ============================================================================
 
 /// Request to get the KeyManager's public key for encryption
@@ -258,14 +258,14 @@ pub struct GetPublicKeyRequest {
 /// Response containing the KeyManager's public key
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq, Eq)]
 pub struct GetPublicKeyResponse {
-	/// The ECIES public key in SEC1 compressed format (33 bytes for secp256k1)
+	/// The HPKE public key in SEC1 compressed format (33 bytes for secp256k1)
 	pub public_key: Vec<u8>,
 }
 
 /// Request to decrypt ciphertext using the KeyManager's private key
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq, Eq)]
 pub struct DecryptRequest {
-	/// ECIES ciphertext to decrypt
+	/// HPKE ciphertext to decrypt
 	pub ciphertext: Vec<u8>,
 }
 

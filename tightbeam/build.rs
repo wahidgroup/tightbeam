@@ -22,7 +22,7 @@ fn main() {
 				feature = "tokio",
 				feature = "transport-policy",
 				feature = "transport-multiplex",
-				any(feature = "transport-cms", feature = "transport-ecies")
+				any(feature = "transport-cms", feature = "transport-hpke")
 			)
 		},
 		// The standard library's clocks work: `std` is linked and the

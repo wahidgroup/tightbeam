@@ -98,7 +98,7 @@ use signing::*;
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 mod cert {
 	pub use crate::crypto::sign::ecdsa::{Secp256k1, Signature};
-	pub use crate::crypto::sign::sign_canonical;
+	pub use crate::crypto::sign::CanonicalSigner;
 	pub use crate::der::asn1::{BitString, Ia5String, PrintableString, SetOfVec, UtcTime};
 	pub use crate::der::oid::AssociatedOid;
 	pub use crate::der::{Any, Decode, Encode};
@@ -285,7 +285,7 @@ fn sign_test_certificate(
 	key: &SigningKey,
 ) -> TbResult<Certificate> {
 	let tbs_der = tbs.to_der()?;
-	let signature: Signature<Secp256k1> = sign_canonical::<Sha3_256, _>(key, &tbs_der)?;
+	let signature: Signature<Secp256k1> = key.sign_canonical::<Sha3_256>(&tbs_der)?;
 
 	let certificate = Certificate {
 		tbs_certificate: tbs,

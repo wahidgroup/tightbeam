@@ -23,6 +23,7 @@ use crate::constants::TIGHTBEAM_KARI_KDF_INFO;
 use crate::crypto::aead::{DecryptContent, KeyInit};
 use crate::crypto::common::{typenum::Unsigned, KeySizeUser};
 use crate::crypto::hash::Digest;
+use crate::crypto::kdf::EcdhSecret;
 use crate::crypto::key::SigningKeyProvider;
 use crate::crypto::profiles::{DigestProvider, SecurityProfile, SigningProvider};
 use crate::crypto::sign::elliptic_curve::ecdh::EphemeralSecret;
@@ -43,7 +44,7 @@ use crate::transport::handshake::flow::{
 	sealed, ClientFlow, ClosingBinding, ClosingIntake, ClosingOpened, ClosingParts, HandshakeFlow, Opened,
 	OpeningIntake, OpeningParts, ProofRequest, ReplyBinding, ReplyIntake, ReplyParts, ServerFlow, Signed,
 };
-use crate::transport::handshake::kari::{HandshakeKek, Kek, OriginatorKey};
+use crate::transport::handshake::kari::{Kek, OriginatorKey};
 use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer, TransportAccept, TransportOffer};
 use crate::transport::handshake::peer::{AdmittedServer, PossessionProof, ProvisionedTrust};
 use crate::transport::handshake::primitives::transcript::{FinishedRole, ServerFinishedLegs, Transcript};
@@ -629,7 +630,8 @@ impl<P: HandshakeProvider> ServerFlow<P> for Cms {
 
 			// 3. Run the static ECDH through the key provider, and derive the
 			//    key-encryption key under the UKM.
-			let shared_secret = key.key_agreement(originator_bytes).await?;
+			let agreed = key.key_agreement(originator_bytes).await?;
+			let shared_secret = EcdhSecret::try_from(agreed)?;
 			let ukm = kari.ukm.as_ref().ok_or(HandshakeError::MissingUkm)?;
 			let ukm_salt = KdfSalt::new(ukm.as_bytes());
 			let kek = shared_secret.derive_kek::<P>(ukm_salt, KdfInfo::new(TIGHTBEAM_KARI_KDF_INFO))?;

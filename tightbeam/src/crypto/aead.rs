@@ -15,9 +15,9 @@ pub use aes_gcm::{Aes128Gcm, Aes256Gcm, Key as Aes256GcmKey, Nonce as Aes256GcmN
 pub use aes_kw;
 
 use core::result::Result as CoreResult;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use aead::KeySizeUser;
-use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::asn1::ObjectIdentifier;
 use crate::constants::{rekey_record_limit, AES_GCM_VOLUME_BYTES_PER_KEY, DEFAULT_REKEY_RECORD_LIMIT};
@@ -229,7 +229,7 @@ fn extract_nonce_and_ciphertext(info: &EncryptedContentInfo, expected_nonce_len:
 ///
 /// An impl binds an encryptor type to the algorithm OID stamped on its
 /// ciphertext. Every [`AeadAlgorithm`] cipher implements it for its own OID and
-/// no other. The trait stays unsealed so custom encryptors such as ECIES remain
+/// no other. The trait stays unsealed so custom encryptors such as HPKE remain
 /// possible.
 pub trait Encryptor<C>
 where

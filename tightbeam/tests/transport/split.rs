@@ -1,7 +1,7 @@
 //! Split transport integration tests.
 
 #![cfg(all(
-	feature = "transport-ecies",
+	feature = "transport-hpke",
 	feature = "transport-policy",
 	feature = "tcp",
 	feature = "tokio",

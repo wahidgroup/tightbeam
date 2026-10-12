@@ -7,9 +7,6 @@ use std::sync::Arc;
 use futures::channel::mpsc;
 use futures::SinkExt;
 
-#[cfg(feature = "instrument")]
-use crate::instrumentation::events;
-
 use super::body::{BodyEvent, DrainNote};
 use super::outbound::Outbound;
 use super::shared::{BudgetStanding, MuxShared, OpenRequest, StreamOutcome, StreamReservation};
@@ -21,6 +18,9 @@ use crate::transport::envelopes::{
 };
 use crate::transport::error::{TransportError, TransportFailure};
 use crate::transport::TransportResult;
+
+#[cfg(feature = "instrument")]
+use crate::instrumentation::events;
 
 /// A connection's shared state and the outbound queue that serves it.
 ///
@@ -361,7 +361,7 @@ impl MuxLink {
 	///
 	/// - [`TransportError::ConnectionClosed`] -- the writer queue closed.
 	pub(crate) async fn renew_or_drain(&self) -> TransportResult<()> {
-		#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+		#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 		if self.shared.renewal_ready() {
 			// A full queue drops the trigger. The budget stays at the reserve,
 			// so the next debit fires it again.

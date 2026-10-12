@@ -27,24 +27,24 @@ use crate::transport::multiplex::{StreamId, StreamRoute};
 use crate::transport::{TransportError, TransportResult};
 use crate::Frame;
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use super::flow::renewal_floor;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::constants::DEFAULT_REKEY_MIN_SPEND_RECORDS;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::aead::RecvCipher;
 #[cfg(feature = "instrument")]
 use crate::instrumentation::events;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::envelopes::{
 	MuxRekeyAckPackage, MuxRekeyDonePackage, MuxRekeyRequestPackage, MuxRekeyResponsePackage,
 	MUX_APPLICATION_CODE_FLOOR,
 };
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::receipt::StoredReceipt;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::HandshakeError;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::rekey::{EpochInstall, RekeyDriver, ServerAckOutcome};
 
 /// Cap on the ping acks the reader buffers while the writer queue is full.
@@ -76,7 +76,7 @@ pub enum InboundEvent {
 ///
 /// Application codes at or above [`MUX_APPLICATION_CODE_FLOOR`] pass through,
 /// and every other code is a settlement failure.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 fn refusal_reason(code: u32) -> GoAwayReason {
 	if code >= MUX_APPLICATION_CODE_FLOOR {
 		return GoAwayReason::Application(code);
@@ -254,28 +254,28 @@ where
 	pending_control: VecDeque<Outbound>,
 	/// Role-fixed rekey exchange. `None` keeps every rekey leg an
 	/// unsolicited protocol violation.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	rekey: Option<RekeyDriver>,
 	/// Client epoch state held between the `RekeyAck` and the server's
 	/// `RekeyDone`. The receive cipher installs and the receipt rotates only at
 	/// the `RekeyDone` boundary.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pending_install: Option<PendingDone>,
 	/// Negotiated inbound budget, restored at each epoch boundary.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	initial_recv_budget: Option<u64>,
 	/// Receive-direction records left at which the client opens a renewal. The
 	/// figure tracks the peer's send counter.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	renewal_floor: u64,
 	/// Receive-direction records left at the last epoch install, for the
 	/// server's minimum-spend flood bound.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	epoch_recv_baseline: u64,
 }
 
 /// Client epoch state parked between `RekeyAck` and `RekeyDone`.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 struct PendingDone {
 	recv_cipher: RecvCipher,
 	receipt: StoredReceipt,
@@ -350,15 +350,15 @@ where
 			local_reassembly: HashMap::new(),
 			drained,
 			pending_control: VecDeque::new(),
-			#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 			rekey: None,
-			#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 			pending_install: None,
-			#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 			initial_recv_budget: settings.recv_budget,
-			#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 			renewal_floor: renewal_floor(settings.drain_reserve_records()),
-			#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 			epoch_recv_baseline: 0,
 		}
 	}
@@ -373,7 +373,7 @@ where
 	/// 1. Seed the receipt accessor from the handshake artifact.
 	/// 2. Stamp the epoch baseline from the remaining records of the receive cipher.
 	/// 3. In the client role, open admissions gating for renewals.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub(crate) fn attach_rekey(&mut self, driver: RekeyDriver, receipt: StoredReceipt) {
 		self.link.shared().rotate_receipt(receipt);
 		self.epoch_recv_baseline = self.reader.remaining_records();
@@ -412,7 +412,7 @@ where
 				ReaderEvent::Flushed => {}
 			}
 
-			#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 			self.watch_recv_records()?;
 		}
 	}
@@ -438,17 +438,17 @@ where
 				self.local_reassembly.retain(|id, _| shared.is_pending(*id));
 				Ok(())
 			}
-			#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 			MuxEnvelope::RekeyRequest(package) => self.route_rekey_request(package).await,
-			#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 			MuxEnvelope::RekeyResponse(package) => self.route_rekey_response(package).await,
-			#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 			MuxEnvelope::RekeyAck(package) => self.route_rekey_ack(package).await,
-			#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 			MuxEnvelope::RekeyDone(package) => self.route_rekey_done(package),
 			// This build drives no rekey exchange, so any rekey leg is
 			// unsolicited and fails closed.
-			#[cfg(not(any(feature = "transport-cms", feature = "transport-ecies")))]
+			#[cfg(not(any(feature = "transport-cms", feature = "transport-hpke")))]
 			MuxEnvelope::RekeyRequest(_)
 			| MuxEnvelope::RekeyResponse(_)
 			| MuxEnvelope::RekeyAck(_)
@@ -461,7 +461,7 @@ where
 	/// The client's receive counter tracks the server's send counter on the
 	/// ordered channel, so approaching the record limit here opens a renewal
 	/// without any wire addition.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	fn watch_recv_records(&mut self) -> TransportResult<()> {
 		if self.reader.remaining_records() > self.renewal_floor {
 			return Ok(());
@@ -486,7 +486,7 @@ where
 	/// [`Self::queue_command`] rather than awaiting a full outbound queue.
 	/// Reads must continue under write backpressure, or mutually saturated
 	/// peers deadlock (RFC 9113 §5.2).
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	fn drain_refused(&mut self, code: u32) -> TransportResult<()> {
 		#[cfg(feature = "instrument")]
 		self.link.shared().emit_event(events::MUX_REKEY_REFUSED);
@@ -503,7 +503,7 @@ where
 	/// The rekey-flood bound (CWE-400) makes a request a protocol violation
 	/// when an exchange is in flight, or when the peer has spent fewer than
 	/// [`DEFAULT_REKEY_MIN_SPEND_RECORDS`] records since the last install.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	async fn route_rekey_request(&mut self, package: MuxRekeyRequestPackage) -> TransportResult<()> {
 		let spent = self.epoch_recv_baseline.saturating_sub(self.reader.remaining_records());
 		let issued = {
@@ -544,7 +544,7 @@ where
 	///    holds them until owed chunks quiesce.
 	///
 	/// The receive-side install waits for `RekeyDone`.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	async fn route_rekey_response(&mut self, package: MuxRekeyResponsePackage) -> TransportResult<()> {
 		// Admitting the response parks new c2s admissions before it is
 		// verified, so no admission can debit the old epoch once the ack
@@ -594,7 +594,7 @@ where
 	/// client switched its send direction at the `RekeyAck` boundary and the
 	/// GoAway drain of the refusal must stay decryptable. A rejected
 	/// settlement drains instead of resetting budgets.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	async fn route_rekey_ack(&mut self, package: MuxRekeyAckPackage) -> TransportResult<()> {
 		let settled = {
 			let Some(RekeyDriver::Server(exchange)) = self.rekey.as_mut() else {
@@ -634,7 +634,7 @@ where
 	///
 	/// The receive cipher installs, budgets reset, the receipt rotates, and
 	/// parked admissions resume.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	fn route_rekey_done(&mut self, _package: MuxRekeyDonePackage) -> TransportResult<()> {
 		let Some(PendingDone { recv_cipher, receipt }) = self.pending_install.take() else {
 			return Err(self.protocol_violation());
@@ -660,7 +660,7 @@ where
 	/// Both budgets reset to the negotiated figures, and the dual-signed
 	/// receipt rotates. The credit-match invariant keeps epoch terms equal to
 	/// the initial ones.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	fn renew_epoch_terms(&mut self, receipt: StoredReceipt) {
 		self.recv_budget = self.initial_recv_budget;
 		self.link.shared().reset_send_budget();

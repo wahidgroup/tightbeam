@@ -6,7 +6,7 @@
 
 #![cfg(all(
 	feature = "transport",
-	feature = "transport-ecies",
+	feature = "transport-hpke",
 	feature = "x509",
 	feature = "aead",
 	feature = "tokio"
@@ -15,8 +15,8 @@
 use std::sync::Arc;
 
 use tightbeam::crypto::aead::{Aes128GcmOid, Aes256Gcm, Aes256GcmOid};
-use tightbeam::crypto::ecies::Secp256k1EciesMessage;
 use tightbeam::crypto::hash::{Sha3_256, Sha3_512};
+use tightbeam::crypto::hpke::HpkeSecp256k1Sha3Aes256Gcm;
 use tightbeam::crypto::kdf::HkdfSha3_256;
 use tightbeam::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
 use tightbeam::crypto::profiles::{
@@ -34,11 +34,11 @@ use tightbeam::testing::{
 	SetupEnv,
 };
 use tightbeam::transport::handshake::negotiation::SecurityOffer;
-use tightbeam::transport::handshake::{Ecies, EciesServerSettings, Handshake, ServerConfig, SupportedProfiles};
+use tightbeam::transport::handshake::{Handshake, Hpke, HpkeServerSettings, ServerConfig, SupportedProfiles};
 use tightbeam::urn::Urn;
 use tightbeam::x509::Certificate;
 
-use crate::common::security::{ecies_client_config, pinning_validator};
+use crate::common::security::{hpke_client_config, pinning_validator};
 
 pub(crate) const CLIENT_HELLO_SENT: Urn<'static> = tightbeam::urn!("test", "event:negotiation/client-hello-sent");
 pub(crate) const CLIENT_KEX_SENT: Urn<'static> = tightbeam::urn!("test", "event:negotiation/client-kex-sent");
@@ -89,11 +89,11 @@ impl KdfProvider for Aes256Sha3_512Provider {
 
 impl CurveProvider for Aes256Sha3_512Provider {
 	type Curve = k256::Secp256k1;
-	type EciesMessage = Secp256k1EciesMessage;
 }
 
 impl CryptoProvider for Aes256Sha3_512Provider {
 	type Profile = Aes256Sha3_512Profile;
+	type HpkeSuite = HpkeSecp256k1Sha3Aes256Gcm;
 
 	fn profile(&self) -> &Self::Profile {
 		&self.profile
@@ -164,14 +164,14 @@ tb_scenario! {
 			let server_profiles = SupportedProfiles::new([fallback, preferred])?;
 			let validator = pinning_validator(&server_cert);
 
-			let mut config = ecies_client_config::<Aes256Sha3_512Provider>(validator);
+			let mut config = hpke_client_config::<Aes256Sha3_512Provider>(validator);
 			config.security_offer = Some(client_offer);
 
 			let mut client = Handshake::client(config);
 
-			let settings = EciesServerSettings::new(server_cert.to_owned());
+			let settings = HpkeServerSettings::new(server_cert.to_owned());
 			let key = Arc::clone(&server_key_provider);
-			let server_config = ServerConfig::<Ecies, Aes256Sha3_512Provider>::new(settings, key, server_profiles);
+			let server_config = ServerConfig::<Hpke, Aes256Sha3_512Provider>::new(settings, key, server_profiles);
 			let mut server = Handshake::server(server_config);
 
 			let opening = client.start()?;

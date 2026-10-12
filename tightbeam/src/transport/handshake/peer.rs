@@ -20,17 +20,17 @@ use std::sync::Arc;
 
 use crate::crypto::x509::policy::CertificateValidation;
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::x509::utils::CertificateExt;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::error::HandshakeError;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::schedule::{HandshakeVerifyingKey, PeerIdentity, Terms};
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::HandshakeProvider;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::utils::marker::{MaybeSend, MaybeSync};
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::x509::Certificate;
 
 #[cfg(feature = "transport-cms")]
@@ -57,13 +57,13 @@ pub enum PeerAuthentication {
 /// only the decision that mutual authentication was demanded.
 #[derive(Clone)]
 pub struct ValidatorChain(
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))] Arc<[Arc<dyn CertificateValidation>]>,
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))] Arc<[Arc<dyn CertificateValidation>]>,
 );
 
 impl ValidatorChain {
 	/// Run every validator against `certificate`, stopping at the first
 	/// refusal.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	fn evaluate(&self, certificate: &Certificate) -> Result<(), HandshakeError> {
 		for validator in self.0.iter() {
 			validator.evaluate(certificate)?;
@@ -78,7 +78,7 @@ impl ValidatorChain {
 /// Each protocol carries the proof in its own form, and
 /// [`PeerAuthentication::admit`] verifies it under the offered certificate's
 /// key.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub trait PossessionProof<P: HandshakeProvider> {
 	/// Verify this proof under `key`, against the transcript that `terms`
 	/// sealed.
@@ -104,9 +104,9 @@ impl PeerAuthentication {
 			return Self::Anonymous;
 		}
 
-		#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+		#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 		let chain = ValidatorChain(validators.into());
-		#[cfg(not(any(feature = "transport-cms", feature = "transport-ecies")))]
+		#[cfg(not(any(feature = "transport-cms", feature = "transport-hpke")))]
 		let chain = ValidatorChain();
 
 		Self::Mutual(chain)
@@ -138,7 +138,7 @@ impl PeerAuthentication {
 	/// - [`HandshakeError::SignatureVerificationFailed`] -- the certificate arrived with no proof.
 	/// - [`HandshakeError::InvalidPublicKey`] -- the certificate key is not a point on the curve.
 	/// - The [`PossessionProof::verify`] set.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub(crate) fn admit<P, Proof>(
 		&self,
 		offered: Option<Certificate>,
@@ -175,10 +175,10 @@ impl PeerAuthentication {
 ///
 /// The variant stays private, so a proven peer exists only where `admit`
 /// ran every validator and verified the proof.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub struct AdmittedPeer(Admission);
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 enum Admission {
 	/// Under server-only authentication, the client offered no certificate.
 	Unidentified,
@@ -190,7 +190,7 @@ enum Admission {
 	Proven(Arc<Certificate>),
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl AdmittedPeer {
 	/// The certificate the session records as its peer, present only under
 	/// mutual authentication after every validator accepted it.
@@ -202,7 +202,7 @@ impl AdmittedPeer {
 	}
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl PeerIdentity for AdmittedPeer {
 	fn certificate(&self) -> Option<&Arc<Certificate>> {
 		self.proven()
@@ -213,11 +213,11 @@ impl PeerIdentity for AdmittedPeer {
 ///
 /// The field stays private, so one exists only where [`ProvisionedTrust`] or
 /// [`LearnedTrust`] validated the certificate.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 #[derive(Clone)]
 pub struct AdmittedServer(Arc<Certificate>);
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl AdmittedServer {
 	/// The certificate that identifies the server.
 	pub(crate) fn certificate(&self) -> &Arc<Certificate> {
@@ -225,7 +225,7 @@ impl AdmittedServer {
 	}
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl PeerIdentity for AdmittedServer {
 	fn certificate(&self) -> Option<&Arc<Certificate>> {
 		Some(&self.0)
@@ -236,7 +236,7 @@ impl PeerIdentity for AdmittedServer {
 ///
 /// A flow names one implementation, so the leg that admits the server and
 /// what the reply must name are fixed by type.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub trait ServerTrust: MaybeSend + MaybeSync + 'static {
 	/// What the trust admits before the opening.
 	type Provisioned: MaybeSend;
@@ -315,13 +315,13 @@ impl ServerTrust for ProvisionedTrust {
 }
 
 /// Trust in a server whose identity the client learns from the reply.
-#[cfg(feature = "transport-ecies")]
+#[cfg(feature = "transport-hpke")]
 pub struct LearnedTrust {
 	/// The validator that authenticates the certificate the reply names.
 	pub validator: Arc<dyn CertificateValidation>,
 }
 
-#[cfg(feature = "transport-ecies")]
+#[cfg(feature = "transport-hpke")]
 impl LearnedTrust {
 	/// Trust in the servers whose certificate `validator` accepts.
 	pub fn new(validator: impl CertificateValidation + 'static) -> Self {
@@ -330,14 +330,14 @@ impl LearnedTrust {
 }
 
 /// A shared validator is the whole trust.
-#[cfg(feature = "transport-ecies")]
+#[cfg(feature = "transport-hpke")]
 impl From<Arc<dyn CertificateValidation>> for LearnedTrust {
 	fn from(validator: Arc<dyn CertificateValidation>) -> Self {
 		Self { validator }
 	}
 }
 
-#[cfg(feature = "transport-ecies")]
+#[cfg(feature = "transport-hpke")]
 impl ServerTrust for LearnedTrust {
 	type Provisioned = ();
 	type Named = Certificate;
@@ -363,7 +363,7 @@ impl ServerTrust for LearnedTrust {
 	}
 }
 
-#[cfg(all(test, any(feature = "transport-cms", feature = "transport-ecies")))]
+#[cfg(all(test, any(feature = "transport-cms", feature = "transport-hpke")))]
 mod tests {
 	use std::error::Error;
 
@@ -496,7 +496,7 @@ mod tests {
 		}
 	}
 
-	#[cfg(feature = "transport-ecies")]
+	#[cfg(feature = "transport-hpke")]
 	mod learned {
 		use super::*;
 		use crate::crypto::hash::Sha3_256;

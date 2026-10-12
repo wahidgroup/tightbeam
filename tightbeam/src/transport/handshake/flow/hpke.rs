@@ -1,13 +1,15 @@
-//! The ECIES flow.
+//! The HPKE flow.
 //!
-//! ECIES tunnels its own messages inside the two containers. The client
+//! HPKE tunnels its own messages inside the two containers. The client
 //! learns the server from the reply, and it seals the base secret to the
 //! server's static key on the closing.
 //!
-//! One client ephemeral `r` serves both key agreements:
+//! The client holds two ephemeral keys, and each serves one agreement
+//! (RFC 9180 § 9.2.3):
 //!
-//! - `r·E` with the server ephemeral feeds the handshake secret.
-//! - `r·S` with the server's static key seals the closing payload.
+//! - `r` agrees with the server ephemeral `E`, and `r·E` feeds the handshake
+//!   secret. Its public half travels inside the sealed payload.
+//! - HPKE draws its own ephemeral to seal the closing payload to the server's static key.
 
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, vec::Vec};
@@ -15,18 +17,19 @@ use alloc::{boxed::Box, vec::Vec};
 use crate::asn1::OctetString;
 use crate::cms::enveloped_data::EnvelopedData;
 use crate::cms::signed_data::SignedData;
-use crate::constants::{EC_PUBKEY_COMPRESSED_SIZE, TIGHTBEAM_AAD_DOMAIN_TAG};
-use crate::crypto::ecies::{decrypt_with_shared_secret, EciesMessageOps, EciesSecretKeyOps};
+use crate::constants::{EC_PUBKEY_COMPRESSED_SIZE, TIGHTBEAM_AAD_DOMAIN_TAG, TIGHTBEAM_HPKE_HANDSHAKE_INFO};
+use crate::crypto::hpke::{HpkeMessage, HpkePublicKeyOps, HpkeSuite};
 use crate::crypto::kdf::EcdhSecret;
 use crate::crypto::key::SigningKeyProvider;
 use crate::crypto::secret::SecretSlice;
 use crate::crypto::sign::elliptic_curve::ecdh::EphemeralSecret;
+use crate::crypto::sign::elliptic_curve::sec1::ToEncodedPoint;
 use crate::crypto::sign::elliptic_curve::{PublicKey, SecretKey};
 use crate::crypto::sign::LowSEncoding;
 use crate::crypto::subtle::ConstantTimeEq;
 use crate::crypto::x509::utils::CertificateExt;
 use crate::der::{Decode, Encode};
-use crate::random::{generate_nonce, CryptoRngCore, OsRng, RngWrapper};
+use crate::random::{generate_nonce, CryptoRngCore, RngWrapper};
 use crate::transport::handshake::attributes::HandshakeAttributes;
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::flow::{
@@ -35,15 +38,15 @@ use crate::transport::handshake::flow::{
 };
 use crate::transport::handshake::negotiation::{SecurityAccept, TransportAccept};
 use crate::transport::handshake::peer::{LearnedTrust, PossessionProof};
-use crate::transport::handshake::primitives::transcript::{EciesHandshakeLegs, Transcript};
+use crate::transport::handshake::primitives::transcript::{HpkeHandshakeLegs, Transcript};
 use crate::transport::handshake::primitives::KdfSalt;
 use crate::transport::handshake::schedule::{
 	Agreement, BaseSecret, CompressedPoint, HandshakeVerifyingKey, KeyConfirmation, PeerPoint, Salt, Terms,
 };
 use crate::transport::handshake::wire::HandshakeOctets;
 use crate::transport::handshake::{
-	Arc, ClientHello, ClientKeyExchange, EciesSessionPayload, HandshakeCurve, HandshakeMessage, HandshakeProvider,
-	HandshakeSecret, ServerHandshake, TunneledMessage,
+	Arc, ClientHello, ClientKeyExchange, HandshakeCurve, HandshakeMessage, HandshakeProvider, HandshakeSecret,
+	HpkeSessionPayload, ServerHandshake, TunneledMessage,
 };
 use crate::transport::state::ClientIdentity;
 use crate::transport::wire_der::WireDer;
@@ -51,19 +54,19 @@ use crate::utils::marker::MaybeSendFuture;
 use crate::x509::Certificate;
 use crate::zeroize::{Zeroize, Zeroizing};
 
-/// The ECIES handshake protocol.
+/// The HPKE handshake protocol.
 ///
-/// A client is provisioned with [`EciesClientSettings`], and a server with
-/// [`EciesServerSettings`].
+/// A client is provisioned with [`HpkeClientSettings`], and a server with
+/// [`HpkeServerSettings`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Ecies;
+pub struct Hpke;
 
-impl sealed::Sealed for Ecies {}
+impl sealed::Sealed for Hpke {}
 
-impl HandshakeFlow for Ecies {}
+impl HandshakeFlow for Hpke {}
 
-/// What an ECIES client is provisioned with.
-pub struct EciesClientSettings<P: HandshakeProvider> {
+/// What an HPKE client is provisioned with.
+pub struct HpkeClientSettings<P: HandshakeProvider> {
 	/// The trust that admits the certificate the reply names.
 	pub trust: LearnedTrust,
 	/// The domain tag the closing payload is sealed under. Both endpoints
@@ -73,15 +76,15 @@ pub struct EciesClientSettings<P: HandshakeProvider> {
 	pub identity: Option<ClientIdentity<P>>,
 }
 
-impl<P: HandshakeProvider> EciesClientSettings<P> {
+impl<P: HandshakeProvider> HpkeClientSettings<P> {
 	/// Settings for an anonymous client under [`TIGHTBEAM_AAD_DOMAIN_TAG`].
 	pub fn new(trust: LearnedTrust) -> Self {
 		Self { trust, aad_domain_tag: TIGHTBEAM_AAD_DOMAIN_TAG, identity: None }
 	}
 }
 
-/// What an ECIES client keeps from its hello to read the reply against.
-pub struct EciesOpening {
+/// What an HPKE client keeps from its hello to read the reply against.
+pub struct HpkeOpening {
 	/// The DER of the sent `ClientHello`. The transcript binds these bytes, so
 	/// a rewritten offer changes the transcript hash (CWE-757).
 	hello_der: Vec<u8>,
@@ -90,37 +93,38 @@ pub struct EciesOpening {
 }
 
 /// A decoded `ServerHandshake`, kept for verification and for the closing.
-pub struct EciesReply {
+pub struct HpkeReply {
 	/// The server signature over the transcript hash.
 	signature: OctetString,
 	/// The client random, which the closing payload echoes.
 	client_random: [u8; 32],
 }
 
-/// The client half of an ECIES agreement, kept to seal the closing.
-pub struct EciesAgreed<C: HandshakeCurve> {
+/// The client half of an HPKE agreement, kept to seal the closing.
+pub struct HpkeAgreed {
 	/// The base secret the closing carries to the server.
 	base: BaseSecret,
-	/// The client ephemeral `r`.
-	ephemeral: SecretKey<C>,
+	/// The public half of the client ephemeral `r`, which the closing carries
+	/// to the server. The private half is wiped at the agreement.
+	client_ephemeral: [u8; EC_PUBKEY_COMPRESSED_SIZE],
 }
 
 /// A `ClientKeyExchange` that awaits its possession signature.
-pub struct EciesClosingDraft {
+pub struct HpkeClosingDraft {
 	/// The payload, sealed to the server's static key.
 	encrypted_data: Vec<u8>,
 	/// The certificate the client presents, when it holds an identity.
 	certificate: Option<Certificate>,
 }
 
-impl<P: HandshakeProvider> ClientFlow<P> for Ecies {
-	type Settings = EciesClientSettings<P>;
+impl<P: HandshakeProvider> ClientFlow<P> for Hpke {
+	type Settings = HpkeClientSettings<P>;
 	type Trust = LearnedTrust;
-	type Opening = EciesOpening;
+	type Opening = HpkeOpening;
 	type Pending = ();
-	type Reply = EciesReply;
-	type Agreed = Box<EciesAgreed<P::Curve>>;
-	type Draft = EciesClosingDraft;
+	type Reply = HpkeReply;
+	type Agreed = Box<HpkeAgreed>;
+	type Draft = HpkeClosingDraft;
 
 	fn identity(settings: &Self::Settings) -> Option<&ClientIdentity<P>> {
 		settings.identity.as_ref()
@@ -149,7 +153,7 @@ impl<P: HandshakeProvider> ClientFlow<P> for Ecies {
 		let hello_der = tunnel.tunneled_der()?.to_vec();
 
 		let message = HandshakeMessage::try_from(tunnel)?;
-		let opening = EciesOpening { hello_der, client_random };
+		let opening = HpkeOpening { hello_der, client_random };
 		Ok(Opened { message, opening, pending: () })
 	}
 
@@ -158,7 +162,7 @@ impl<P: HandshakeProvider> ClientFlow<P> for Ecies {
 		_settings: &Self::Settings,
 		reply: HandshakeMessage,
 	) -> Result<ReplyIntake<Self, P>, HandshakeError> {
-		let EciesOpening { hello_der, client_random } = opening;
+		let HpkeOpening { hello_der, client_random } = opening;
 
 		// 1. Take the tunnel, refuse one that carries an abort alert, and
 		//    decode the ServerHandshake from the bytes it arrived as.
@@ -180,7 +184,7 @@ impl<P: HandshakeProvider> ClientFlow<P> for Ecies {
 		//    tampered leg changes the hash and fails the signature. The server
 		//    ephemeral enters at its fixed width, so another length fails here.
 		let server_random = server_random.to_32_byte_array()?;
-		let legs = EciesHandshakeLegs {
+		let legs = HpkeHandshakeLegs {
 			client_hello: &hello_der,
 			server_random: &server_random,
 			server_ephemeral: &server_ephemeral.to_byte_array::<EC_PUBKEY_COMPRESSED_SIZE>()?,
@@ -189,7 +193,7 @@ impl<P: HandshakeProvider> ClientFlow<P> for Ecies {
 			client_cert_required,
 			transport_accept_der: transport_accept.as_ref().map(WireDer::der).unwrap_or_default(),
 		};
-		let mut transcript = Transcript::ecies_handshake(legs);
+		let mut transcript = Transcript::hpke_handshake(legs);
 		let transcript_hash = transcript.seal::<P::Digest>()?;
 
 		// 3. Return the facts of the reply.
@@ -197,7 +201,7 @@ impl<P: HandshakeProvider> ClientFlow<P> for Ecies {
 		let security_accept = security_accept.as_ref().map(WireDer::value).cloned();
 		let transport_accept = transport_accept.as_ref().map(WireDer::value).cloned();
 		let server_ephemeral = server_ephemeral.into_bytes();
-		let reply = EciesReply { signature, client_random };
+		let reply = HpkeReply { signature, client_random };
 		Ok(ReplyIntake {
 			server: certificate,
 			security_accept,
@@ -231,10 +235,12 @@ impl<P: HandshakeProvider> ClientFlow<P> for Ecies {
 		let ephemeral = SecretKey::<P::Curve>::random(&mut RngWrapper(rng));
 		let agreement = Agreement::<P>::new(&base, server_ephemeral.as_public_key());
 		let secret = agreement.settle(&ephemeral, salt)?;
+		let client_ephemeral = ephemeral.public_key().compressed_point()?;
 
-		// The two secrets are boxed, so the move into the closing copies a
-		// pointer and each is wiped where the box drops.
-		Ok((secret, Box::new(EciesAgreed { base, ephemeral })))
+		// The ephemeral served its one agreement, so it is wiped where this
+		// function returns. The base secret is boxed, so the move into the
+		// closing copies a pointer and it is wiped where the box drops.
+		Ok((secret, Box::new(HpkeAgreed { base, client_ephemeral })))
 	}
 
 	fn bind_closing<'a>(
@@ -243,15 +249,16 @@ impl<P: HandshakeProvider> ClientFlow<P> for Ecies {
 		settings: &'a Self::Settings,
 		parts: ClosingParts<'_>,
 	) -> Result<ClosingBinding<'a, Self, P>, HandshakeError> {
-		// The secrets are read in place, so each is wiped where the box drops.
-		let EciesAgreed { base, ephemeral } = agreed.as_ref();
+		// The base secret is read in place, so it is wiped where the box drops.
+		let HpkeAgreed { base, client_ephemeral } = agreed.as_ref();
 		let ClosingParts { server, transcript_hash, sealed_ack, confirmation } = parts;
 
 		// 1. Encode the payload. The DER buffer holds the base secret, so it
 		//    wipes when dropped, along with the transient OCTET STRING copy.
-		let payload = EciesSessionPayload {
+		let payload = HpkeSessionPayload {
 			base_key: OctetString::new(base.as_bytes())?,
 			client_random: OctetString::new(reply.client_random.as_slice())?,
+			client_ephemeral: OctetString::new(client_ephemeral.as_slice())?,
 			key_confirmation: confirmation,
 			receipt_ack: sealed_ack.map(OctetString::new).transpose()?,
 		};
@@ -265,8 +272,7 @@ impl<P: HandshakeProvider> ClientFlow<P> for Ecies {
 		let certificate = identity.map(ClientIdentity::certificate);
 		let aad = ClientKeyExchange::client_bound_aad(settings.aad_domain_tag, certificate)?;
 		let static_key = server.verifying_key::<P::Curve>()?;
-		let seal = SecretKey::<P::Curve>::encrypt_to::<P::EciesMessage, P::Kdf, P::AeadCipher>;
-		let sealed = seal(ephemeral, &static_key, plaintext.as_slice(), Some(aad.as_slice()), &mut OsRng)?;
+		let sealed = static_key.seal::<P::HpkeSuite>(TIGHTBEAM_HPKE_HANDSHAKE_INFO, &aad, &plaintext, None)?;
 		let encrypted_data = sealed.to_bytes();
 
 		// 3. Name the bytes the identity signs. The digest covers the
@@ -275,18 +281,18 @@ impl<P: HandshakeProvider> ClientFlow<P> for Ecies {
 		let proof = match identity {
 			Some(identity) => {
 				let certificate_der = identity.certificate().to_der()?;
-				let mut signed = Transcript::ecies_client_auth(transcript_hash, &encrypted_data, &certificate_der);
+				let mut signed = Transcript::hpke_client_auth(transcript_hash, &encrypted_data, &certificate_der);
 				let prehash = signed.seal::<P::Digest>()?.to_vec();
 				Some(ProofRequest { prehash, signer: identity.signing_provider() })
 			}
 			None => None,
 		};
-		let draft = EciesClosingDraft { encrypted_data, certificate: certificate.cloned() };
+		let draft = HpkeClosingDraft { encrypted_data, certificate: certificate.cloned() };
 		Ok(ClosingBinding { proof, draft })
 	}
 
 	fn encode_closing(draft: Self::Draft, proof: Option<Signed>) -> Result<HandshakeMessage, HandshakeError> {
-		let EciesClosingDraft { encrypted_data, certificate } = draft;
+		let HpkeClosingDraft { encrypted_data, certificate } = draft;
 		let signature = proof.map(|signed| OctetString::new(signed.signature)).transpose()?;
 		let key_exchange = ClientKeyExchange {
 			encrypted_data: OctetString::new(encrypted_data)?,
@@ -299,8 +305,8 @@ impl<P: HandshakeProvider> ClientFlow<P> for Ecies {
 	}
 }
 
-/// What an ECIES server is provisioned with.
-pub struct EciesServerSettings {
+/// What an HPKE server is provisioned with.
+pub struct HpkeServerSettings {
 	/// The certificate the server presents in its reply.
 	pub certificate: Arc<Certificate>,
 	/// The domain tag the closing payload is sealed under. Both endpoints
@@ -308,7 +314,7 @@ pub struct EciesServerSettings {
 	pub aad_domain_tag: &'static [u8],
 }
 
-impl EciesServerSettings {
+impl HpkeServerSettings {
 	/// Settings for a server that presents `certificate` under
 	/// [`TIGHTBEAM_AAD_DOMAIN_TAG`].
 	pub fn new(certificate: impl Into<Arc<Certificate>>) -> Self {
@@ -316,8 +322,8 @@ impl EciesServerSettings {
 	}
 }
 
-/// What an ECIES server keeps of the hello to bind the reply over.
-pub struct EciesHello {
+/// What an HPKE server keeps of the hello to bind the reply over.
+pub struct HpkeHello {
 	/// The DER of the received `ClientHello`, as the transcript binds it.
 	hello_der: Vec<u8>,
 	/// The client random the hello carried.
@@ -325,7 +331,7 @@ pub struct EciesHello {
 }
 
 /// A `ServerHandshake` that awaits its signature and its receipt.
-pub struct EciesReplyDraft {
+pub struct HpkeReplyDraft {
 	server_random: [u8; 32],
 	server_ephemeral: [u8; EC_PUBKEY_COMPRESSED_SIZE],
 	security_accept: WireDer<SecurityAccept>,
@@ -334,8 +340,8 @@ pub struct EciesReplyDraft {
 	client_cert_required: bool,
 }
 
-/// What an ECIES server holds from its reply to the key exchange.
-pub struct EciesServerPending<C: HandshakeCurve> {
+/// What an HPKE server holds from its reply to the key exchange.
+pub struct HpkeServerPending<C: HandshakeCurve> {
 	/// The server ephemeral `e`, which serves one agreement. It is boxed, so
 	/// a move of the pending state copies a pointer.
 	ephemeral: Box<EphemeralSecret<C>>,
@@ -344,29 +350,31 @@ pub struct EciesServerPending<C: HandshakeCurve> {
 }
 
 /// A decoded key exchange that awaits the static open.
-pub struct EciesClosing<M> {
-	/// The ECIES message, which leads with the client ephemeral.
-	message: M,
+pub struct HpkeClosing<S: HpkeSuite> {
+	/// The HPKE message, whose encapsulated key the parse validated.
+	message: HpkeMessage<S>,
+	/// The server's static key, which the message was sealed to.
+	recipient: PublicKey<S::Curve>,
 	/// The associated data the payload was sealed under.
 	aad: Vec<u8>,
 }
 
-/// The proof of an ECIES key exchange that the key of the offered
+/// The proof of an HPKE key exchange that the key of the offered
 /// certificate signed it.
 ///
 /// The signed digest covers the transcript hash, the encrypted payload, and
 /// the offered certificate, so the signature binds to one exchange and one
 /// identity.
-pub struct EciesPossession {
+pub struct HpkePossession {
 	signature: Vec<u8>,
 	encrypted_data: Vec<u8>,
 	certificate_der: Vec<u8>,
 }
 
-impl<P: HandshakeProvider> PossessionProof<P> for EciesPossession {
+impl<P: HandshakeProvider> PossessionProof<P> for HpkePossession {
 	fn verify(self, key: P::VerifyingKey, terms: &Terms<P>) -> Result<(), HandshakeError> {
 		let transcript_hash = terms.transcript_hash();
-		let mut signed = Transcript::ecies_client_auth(transcript_hash, &self.encrypted_data, &self.certificate_der);
+		let mut signed = Transcript::hpke_client_auth(transcript_hash, &self.encrypted_data, &self.certificate_der);
 		let digest = signed.seal::<P::Digest>()?;
 
 		let parsed = P::Signature::try_from(self.signature.as_slice());
@@ -377,11 +385,13 @@ impl<P: HandshakeProvider> PossessionProof<P> for EciesPossession {
 }
 
 /// The parts of the decrypted key-exchange payload.
-struct SessionPayload {
+struct SessionPayload<C: HandshakeCurve> {
 	/// The base secret the client drew.
 	base: BaseSecret,
 	/// The client random the payload echoes against replay.
 	client_random: [u8; 32],
+	/// The client ephemeral, parsed as a point on the curve.
+	client_ephemeral: PublicKey<C>,
 	/// The key-confirmation tag of the client.
 	confirmation: KeyConfirmation,
 	/// The client receipt `SignerInfo`, sealed under the handshake secret.
@@ -390,32 +400,43 @@ struct SessionPayload {
 	receipt_ack: Option<OctetString>,
 }
 
-impl SessionPayload {
-	/// Parse the decrypted DER [`EciesSessionPayload`], and enforce the fixed
+impl<C: HandshakeCurve> SessionPayload<C> {
+	/// Parse the decrypted DER [`HpkeSessionPayload`], and enforce the fixed
 	/// 32-byte geometry of the base secret. A payload with no key-confirmation
 	/// tag, or with one of another width, fails to decode.
+	///
+	/// The client ephemeral is parsed as a compressed point of the curve, so
+	/// the ephemeral-ephemeral agreement runs on a validated key.
 	fn parse(decrypted: &[u8]) -> Result<Self, HandshakeError> {
-		let payload = EciesSessionPayload::from_der(decrypted);
+		let payload = HpkeSessionPayload::from_der(decrypted);
 		let payload = payload.map_err(|_| HandshakeError::InvalidDecryptedPayloadSize)?;
-		let EciesSessionPayload { base_key, client_random, key_confirmation, receipt_ack } = payload;
+		let HpkeSessionPayload { base_key, client_random, client_ephemeral, key_confirmation, receipt_ack } = payload;
 
 		// The decoded buffer moves into its wiping wrapper without a copy, and
 		// the parse copies it into the fixed-width secret, so no plain array of
 		// key material exists on the way (CWE-226).
 		let base = BaseSecret::try_from(SecretSlice::from(base_key.into_bytes()))?;
 		let client_random = client_random.to_32_byte_array()?;
-		Ok(Self { base, client_random, confirmation: key_confirmation, receipt_ack })
+		let point = client_ephemeral.to_byte_array::<EC_PUBKEY_COMPRESSED_SIZE>()?;
+		let client_ephemeral = PublicKey::<C>::from_sec1_bytes(&point)?;
+		Ok(Self {
+			base,
+			client_random,
+			client_ephemeral,
+			confirmation: key_confirmation,
+			receipt_ack,
+		})
 	}
 }
 
-impl<P: HandshakeProvider> ServerFlow<P> for Ecies {
-	type Settings = EciesServerSettings;
-	type Sealed = EciesHello;
-	type Opened = EciesHello;
-	type Draft = EciesReplyDraft;
-	type Pending = EciesServerPending<P::Curve>;
-	type Closing = EciesClosing<P::EciesMessage>;
-	type Proof = EciesPossession;
+impl<P: HandshakeProvider> ServerFlow<P> for Hpke {
+	type Settings = HpkeServerSettings;
+	type Sealed = HpkeHello;
+	type Opened = HpkeHello;
+	type Draft = HpkeReplyDraft;
+	type Pending = HpkeServerPending<P::Curve>;
+	type Closing = HpkeClosing<P::HpkeSuite>;
+	type Proof = HpkePossession;
 
 	fn read_opening(
 		_settings: &Self::Settings,
@@ -429,7 +450,7 @@ impl<P: HandshakeProvider> ServerFlow<P> for Ecies {
 		let hello_der = tunnel.value().tunneled_der()?.to_vec();
 		let ClientHello { client_random, security_offer, transport_offer } = ClientHello::try_from(tunnel.value())?;
 		let client_random = client_random.to_32_byte_array()?;
-		let sealed = EciesHello { hello_der, client_random };
+		let sealed = HpkeHello { hello_der, client_random };
 
 		Ok(OpeningIntake { security_offer, transport_offer, sealed })
 	}
@@ -456,7 +477,7 @@ impl<P: HandshakeProvider> ServerFlow<P> for Ecies {
 
 		// The transcript binds every leg as the bytes the client receives, so
 		// tampering with one invalidates the signature.
-		let legs = EciesHandshakeLegs {
+		let legs = HpkeHandshakeLegs {
 			client_hello: &opened.hello_der,
 			server_random: &server_random,
 			server_ephemeral: &server_ephemeral,
@@ -466,11 +487,11 @@ impl<P: HandshakeProvider> ServerFlow<P> for Ecies {
 			transport_accept_der: transport_accept.as_ref().map(WireDer::der).unwrap_or_default(),
 		};
 
-		let mut transcript = Transcript::ecies_handshake(legs);
+		let mut transcript = Transcript::hpke_handshake(legs);
 		let transcript_hash = transcript.seal::<P::Digest>()?;
 
 		let salt = Salt::randoms(&opened.client_random, &server_random);
-		let draft = EciesReplyDraft {
+		let draft = HpkeReplyDraft {
 			server_random,
 			server_ephemeral,
 			security_accept,
@@ -486,7 +507,7 @@ impl<P: HandshakeProvider> ServerFlow<P> for Ecies {
 		signed: Signed,
 		artifact: Option<&SignedData>,
 	) -> Result<HandshakeMessage, HandshakeError> {
-		let EciesReplyDraft {
+		let HpkeReplyDraft {
 			server_random,
 			server_ephemeral,
 			security_accept,
@@ -518,7 +539,7 @@ impl<P: HandshakeProvider> ServerFlow<P> for Ecies {
 		ephemeral: Box<EphemeralSecret<P::Curve>>,
 		_terms: &Terms<P>,
 	) -> Result<Self::Pending, HandshakeError> {
-		Ok(EciesServerPending { ephemeral, client_random: opened.client_random })
+		Ok(HpkeServerPending { ephemeral, client_random: opened.client_random })
 	}
 
 	fn read_closing(
@@ -532,10 +553,13 @@ impl<P: HandshakeProvider> ServerFlow<P> for Ecies {
 			attrs.refuse_alert()?;
 		}
 
-		// 2. Decode the key exchange. The ECIES message leads with the client ephemeral public key.
+		// 2. Decode the key exchange. The parse validates the encapsulated key
+		//    and the ciphertext length, so the static ECDH runs on a point of
+		//    the curve and on a message that carries a tag.
 		let key_exchange = ClientKeyExchange::try_from(carrier.value())?;
 		let ClientKeyExchange { encrypted_data, client_certificate, client_signature } = key_exchange;
-		let message = <P::EciesMessage as EciesMessageOps>::from_bytes(encrypted_data.as_bytes())?;
+		let message = HpkeMessage::<P::HpkeSuite>::from_bytes(encrypted_data.as_bytes())?;
+		let recipient = settings.certificate.verifying_key::<P::Curve>()?;
 
 		// 3. Build the associated data and the possession proof over the
 		//    offered certificate. A signature with no certificate binds no
@@ -543,13 +567,13 @@ impl<P: HandshakeProvider> ServerFlow<P> for Ecies {
 		let offered = client_certificate.as_ref();
 		let aad = ClientKeyExchange::client_bound_aad(settings.aad_domain_tag, offered)?;
 		let certificate_der = offered.map(Encode::to_der).transpose()?.unwrap_or_default();
-		let proof = client_signature.map(|signature| EciesPossession {
+		let proof = client_signature.map(|signature| HpkePossession {
 			signature: signature.into_bytes(),
 			encrypted_data: encrypted_data.into_bytes(),
 			certificate_der,
 		});
 
-		let closing = EciesClosing { message, aad };
+		let closing = HpkeClosing { message, recipient, aad };
 		Ok(ClosingIntake { offered: client_certificate, proof, closing })
 	}
 
@@ -560,18 +584,18 @@ impl<P: HandshakeProvider> ServerFlow<P> for Ecies {
 		key: &'a dyn SigningKeyProvider,
 	) -> MaybeSendFuture<'a, Result<ClosingOpened, HandshakeError>> {
 		Box::pin(async move {
-			let EciesServerPending { ephemeral, client_random } = pending;
-			let EciesClosing { message, aad } = closing;
+			let HpkeServerPending { ephemeral, client_random } = pending;
+			let HpkeClosing { message, recipient, aad } = closing;
 
 			// 1. Open the payload under the associated data. The key provider
-			//    runs the static ECDH step, and the AEAD open authenticates the
-			//    client ephemeral through the content key.
-			let agreed = key.key_agreement(message.ephemeral_pubkey()).await?;
+			//    runs the static ECDH step on the encapsulated key the parse
+			//    validated.
+			let enc = message.encapsulated_key().to_encoded_point(false);
+			let agreed = key.key_agreement(enc.as_bytes()).await?;
 			let shared_secret = EcdhSecret::try_from(agreed)?;
-			let open = decrypt_with_shared_secret::<P::EciesMessage, P::Kdf, P::AeadCipher>;
-			let plaintext = open(&message, shared_secret, Some(aad.as_slice()))?;
-			let payload = plaintext.with(|payload| SessionPayload::parse(payload))?;
-			let SessionPayload { base, client_random: echoed, confirmation, receipt_ack } = payload;
+			let plaintext = shared_secret.open(&recipient, &message, TIGHTBEAM_HPKE_HANDSHAKE_INFO, &aad)?;
+			let payload = plaintext.with(|payload| SessionPayload::<P::Curve>::parse(payload))?;
+			let SessionPayload { base, client_random: echoed, client_ephemeral, confirmation, receipt_ack } = payload;
 
 			// 2. Verify that the payload echoes the client random of the hello, which prevents replay.
 			let is_echo: bool = echoed.ct_eq(&client_random).into();
@@ -579,10 +603,10 @@ impl<P: HandshakeProvider> ServerFlow<P> for Ecies {
 				return Err(HandshakeError::ClientRandomMismatchReplay);
 			}
 
-			// 3. Run the ephemeral-ephemeral agreement and derive the
-			//    handshake secret. The server ephemeral serves this one
-			//    exchange and drops when this step returns.
-			let client_ephemeral = PublicKey::<P::Curve>::from_sec1_bytes(message.ephemeral_pubkey())?;
+			// 3. Run the ephemeral-ephemeral agreement with the client
+			//    ephemeral the payload carried, and derive the handshake
+			//    secret. The server ephemeral serves this one exchange and
+			//    drops when this step returns.
 			let agreement = Agreement::<P>::new(&base, &client_ephemeral);
 			let secret = agreement.settle(ephemeral.as_ref(), terms.kdf_salt())?;
 
@@ -599,11 +623,9 @@ mod tests {
 	use super::*;
 	use crate::cms::content_info::CmsVersion;
 	use crate::cms::signed_data::{SignerIdentifier, SignerInfo, SignerInfos};
-	use crate::crypto::aead::Aes256Gcm;
-	use crate::crypto::ecies::EciesError::DecryptionFailed;
-	use crate::crypto::ecies::Secp256k1EciesMessage;
 	use crate::crypto::hash::Sha3_256;
-	use crate::crypto::kdf::HkdfSha3_256;
+	use crate::crypto::hpke::HpkeError::DecryptionFailed;
+	use crate::crypto::hpke::HpkeSecp256k1Sha3Aes256Gcm;
 	use crate::crypto::profiles::SecurityProfileDesc;
 	use crate::crypto::sign::ecdsa::k256::Secp256k1;
 	use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1VerifyingKey};
@@ -612,6 +634,7 @@ mod tests {
 	use crate::crypto::x509::utils::Skid;
 	use crate::der::{Any, Sequence};
 	use crate::oids::{HANDSHAKE_ABORT_ALERT, HASH_SHA3_256, HASH_SHA3_384, SIGNER_ECDSA_WITH_SHA3_256};
+	use crate::random::OsRng;
 	use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey};
 	use crate::transport::handshake::attributes::HandshakeAttribute;
 	use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer, TransportOffer};
@@ -621,15 +644,15 @@ mod tests {
 	use crate::x509::attr::{Attribute, Attributes};
 
 	/// The configuration of an anonymous client that trusts `server`.
-	fn anonymous_client(server: &TestCertificate) -> TestClientConfig<Ecies> {
-		let mut config = Ecies::client(&server.certificate, &create_test_certificate());
+	fn anonymous_client(server: &TestCertificate) -> TestClientConfig<Hpke> {
+		let mut config = Hpke::client(&server.certificate, &create_test_certificate());
 		config.flow.identity = None;
 		config
 	}
 
 	/// An anonymous client that trusts `server` and has sent its hello under
 	/// `offer`, with the DER of that hello.
-	fn client_after_hello(server: &TestCertificate, offer: Option<SecurityOffer>) -> (TestClient<Ecies>, Vec<u8>) {
+	fn client_after_hello(server: &TestCertificate, offer: Option<SecurityOffer>) -> (TestClient<Hpke>, Vec<u8>) {
 		let mut config = anonymous_client(server);
 		config.security_offer = offer;
 
@@ -661,7 +684,7 @@ mod tests {
 		let server_random = [2u8; 32];
 		let accept = profile.map(|profile| WireDer::new(SecurityAccept::new(profile)).expect("an accept encodes"));
 		let accept_der = accept.as_ref().map(WireDer::der).unwrap_or_default();
-		let legs = EciesHandshakeLegs {
+		let legs = HpkeHandshakeLegs {
 			client_hello,
 			server_random: &server_random,
 			server_ephemeral,
@@ -671,7 +694,7 @@ mod tests {
 			transport_accept_der: &[],
 		};
 
-		let mut transcript = Transcript::ecies_handshake(legs);
+		let mut transcript = Transcript::hpke_handshake(legs);
 		let transcript_hash = transcript.seal::<Sha3_256>().expect("the transcript seals");
 		let signed = server.signing_key.sign_prehash(&transcript_hash);
 		let signature: Secp256k1Signature = signed.expect("the test key signs");
@@ -699,10 +722,10 @@ mod tests {
 	/// `tunnel` with one signer added, whose unsigned attribute is an abort
 	/// alert of `code`.
 	///
-	/// An ECIES tunnel is sent with no signer. A `SignedData` still has room
+	/// An HPKE tunnel is sent with no signer. A `SignedData` still has room
 	/// for one, and that is where a peer that aborts would put its alert.
 	fn with_abort_alert(tunnel: HandshakeMessage, code: u8) -> HandshakeMessage {
-		let tunnel = tunnel.signed().expect("an ECIES tunnel is a SignedData");
+		let tunnel = tunnel.signed().expect("an HPKE tunnel is a SignedData");
 		let code = Any::encode_from(&code).expect("an alert code encodes");
 		let alert = HandshakeAttribute::new_single(HANDSHAKE_ABORT_ALERT, code).expect("one value is an attribute");
 		let alert = Attribute::try_from(alert).expect("the alert encodes");
@@ -734,8 +757,8 @@ mod tests {
 	async fn server_after_hello(
 		identity: &TestCertificate,
 		peer_authentication: PeerAuthentication,
-	) -> (TestServer<Ecies>, Confirming) {
-		let mut config = Ecies::server(identity);
+	) -> (TestServer<Hpke>, Confirming) {
+		let mut config = Hpke::server(identity);
 		config.peer_authentication = peer_authentication;
 
 		let mut server = Handshake::server(config);
@@ -754,19 +777,21 @@ mod tests {
 		(server, confirming)
 	}
 
-	/// The DER of an `EciesSessionPayload` that carries `base_key`,
-	/// `client_random`, and `receipt_ack` at the widths they come in, beside
-	/// `confirmation`.
+	/// The DER of an `HpkeSessionPayload` that carries `base_key`,
+	/// `client_random`, `client_ephemeral`, and `receipt_ack` at the widths
+	/// they come in, beside `confirmation`.
 	fn session_payload_der(
 		base_key: impl AsRef<[u8]>,
 		client_random: impl AsRef<[u8]>,
+		client_ephemeral: impl AsRef<[u8]>,
 		confirmation: &KeyConfirmation,
 		receipt_ack: Option<&[u8]>,
 	) -> Vec<u8> {
 		let octets = |bytes: &[u8]| OctetString::new(bytes).expect("bytes are an OCTET STRING");
-		let payload = EciesSessionPayload {
+		let payload = HpkeSessionPayload {
 			base_key: octets(base_key.as_ref()),
 			client_random: octets(client_random.as_ref()),
+			client_ephemeral: octets(client_ephemeral.as_ref()),
 			key_confirmation: confirmation.to_owned(),
 			receipt_ack: receipt_ack.map(octets),
 		};
@@ -779,28 +804,30 @@ mod tests {
 	struct LoosePayload {
 		base_key: OctetString,
 		client_random: OctetString,
+		client_ephemeral: OctetString,
 		#[asn1(optional = "true")]
 		key_confirmation: Option<OctetString>,
 	}
 
-	/// The DER of a payload that carries a well-formed base secret and client
-	/// random beside `key_confirmation`.
+	/// The DER of a payload that carries a well-formed base secret, client
+	/// random, and client ephemeral beside `key_confirmation`.
 	fn loose_payload_der(key_confirmation: Option<&[u8]>) -> Vec<u8> {
 		let octets = |bytes: &[u8]| OctetString::new(bytes).expect("bytes are an OCTET STRING");
 		let payload = LoosePayload {
 			base_key: octets(&[3u8; 32]),
 			client_random: octets(&[5u8; 32]),
+			client_ephemeral: octets(&create_test_server_ephemeral()),
 			key_confirmation: key_confirmation.map(octets),
 		};
 		payload.to_der().expect("the payload encodes")
 	}
 
-	/// The bytes of an ECIES message that seals a payload to the static key of
+	/// The bytes of an HPKE message that seals a payload to the static key of
 	/// `server` under the associated data `aad`, as an honest client builds it.
 	///
-	/// The payload carries a fresh base secret, `client_random`, and
-	/// `receipt_ack`. Its key-confirmation tag is the one `confirming` yields
-	/// for that base secret and the ephemeral the message leads with.
+	/// The payload carries a fresh base secret, `client_random`, a fresh
+	/// client ephemeral, and `receipt_ack`. Its key-confirmation tag is the
+	/// one `confirming` yields for that base secret and that ephemeral.
 	fn sealed_payload(
 		server: &TestCertificate,
 		confirming: &Confirming,
@@ -813,10 +840,11 @@ mod tests {
 		let base = BaseSecret::random(None).expect("the random source draws a base secret");
 		let ephemeral = SecretKey::<Secp256k1>::random(&mut OsRng);
 		let confirmation = confirming.tag(&base, &ephemeral);
-		let plaintext = session_payload_der(base.as_bytes(), client_random, &confirmation, receipt_ack);
+		let client_ephemeral = ephemeral.public_key().compressed_point().expect("a point compresses");
+		let base_key = base.as_bytes();
+		let plaintext = session_payload_der(base_key, client_random, client_ephemeral, &confirmation, receipt_ack);
 
-		let seal = SecretKey::<Secp256k1>::encrypt_to::<Secp256k1EciesMessage, HkdfSha3_256, Aes256Gcm>;
-		let sealed = seal(&ephemeral, &static_key, plaintext.as_slice(), Some(aad.as_ref()), &mut OsRng);
+		let sealed = static_key.seal::<HpkeSecp256k1Sha3Aes256Gcm>(TIGHTBEAM_HPKE_HANDSHAKE_INFO, aad, plaintext, None);
 		sealed.expect("the payload seals").to_bytes()
 	}
 
@@ -850,7 +878,7 @@ mod tests {
 		certificate: &Certificate,
 	) -> [u8; 32] {
 		let certificate_der = certificate.to_der().expect("the test certificate encodes");
-		let mut signed = Transcript::ecies_client_auth(transcript_hash, encrypted_data, certificate_der);
+		let mut signed = Transcript::hpke_client_auth(transcript_hash, encrypted_data, certificate_der);
 		signed.seal::<Sha3_256>().expect("the possession transcript seals")
 	}
 
@@ -889,7 +917,7 @@ mod tests {
 	/// exchange that offers an identity to it.
 	struct Identified {
 		/// The server, with its reply sent.
-		server: TestServer<Ecies>,
+		server: TestServer<Hpke>,
 		/// The identity the key exchange offers.
 		client: TestCertificate,
 		/// The key exchange, with the possession proof of `client`.
@@ -927,9 +955,9 @@ mod tests {
 	/// signed its reply changes the transcript, so the signature fails before
 	/// any agreement.
 	#[tokio::test]
-	async fn a_tampered_server_ephemeral_fails_the_ecies_signature() -> Result<(), Box<dyn Error>> {
+	async fn a_tampered_server_ephemeral_fails_the_hpke_signature() -> Result<(), Box<dyn Error>> {
 		let identity = create_test_certificate();
-		let mut server = Handshake::server(Ecies::server(&identity));
+		let mut server = Handshake::server(Hpke::server(&identity));
 		let mut client = Handshake::client(anonymous_client(&identity));
 
 		let signed = server.reply(client.start()?).await?;
@@ -944,9 +972,9 @@ mod tests {
 	/// signature. The client verifies the signature before it reads the
 	/// selection, so the refusal names the signature and not the selection.
 	#[tokio::test]
-	async fn a_stripped_accept_fails_the_ecies_signature() -> Result<(), Box<dyn Error>> {
+	async fn a_stripped_accept_fails_the_hpke_signature() -> Result<(), Box<dyn Error>> {
 		let identity = create_test_certificate();
-		let mut server = Handshake::server(Ecies::server(&identity));
+		let mut server = Handshake::server(Hpke::server(&identity));
 		let mut client = Handshake::client(anonymous_client(&identity));
 
 		let signed = server.reply(client.start()?).await?;
@@ -962,9 +990,9 @@ mod tests {
 	/// the transcript, so the signature fails. An on-path party therefore
 	/// cannot talk an anonymous client past a server that demands an identity.
 	#[tokio::test]
-	async fn a_flipped_certificate_demand_fails_the_ecies_signature() -> Result<(), Box<dyn Error>> {
+	async fn a_flipped_certificate_demand_fails_the_hpke_signature() -> Result<(), Box<dyn Error>> {
 		let identity = create_test_certificate();
-		let mut config = Ecies::server(&identity);
+		let mut config = Hpke::server(&identity);
 		config.peer_authentication = mutual_with(ExpiryValidator);
 
 		let mut server = Handshake::server(config);
@@ -1049,7 +1077,7 @@ mod tests {
 	#[tokio::test]
 	async fn an_anonymous_client_refuses_a_server_that_demands_an_identity() -> Result<(), Box<dyn Error>> {
 		let identity = create_test_certificate();
-		let mut config = Ecies::server(&identity);
+		let mut config = Hpke::server(&identity);
 		config.peer_authentication = mutual_with(ExpiryValidator);
 
 		let mut server = Handshake::server(config);
@@ -1067,9 +1095,9 @@ mod tests {
 	/// The server here demands a client identity, and the client holds none,
 	/// so the step refuses before it draws a secret.
 	#[tokio::test]
-	async fn a_failed_ecies_closing_leaves_the_client_spent() -> Result<(), Box<dyn Error>> {
+	async fn a_failed_hpke_closing_leaves_the_client_spent() -> Result<(), Box<dyn Error>> {
 		let identity = create_test_certificate();
-		let mut config = Ecies::server(&identity);
+		let mut config = Hpke::server(&identity);
 		config.peer_authentication = mutual_with(ExpiryValidator);
 		config.transport = Some(budget_offer());
 
@@ -1095,7 +1123,7 @@ mod tests {
 	#[tokio::test]
 	async fn an_anonymous_dial_captures_no_identity() -> Result<(), Box<dyn Error>> {
 		let identity = create_test_certificate();
-		let mut run = run(anonymous_client(&identity), Ecies::server(&identity)).await;
+		let mut run = run(anonymous_client(&identity), Hpke::server(&identity)).await;
 
 		let session = run.server.complete()?;
 		assert!(session.peer().is_none());
@@ -1109,7 +1137,7 @@ mod tests {
 	#[tokio::test]
 	async fn a_hand_built_hello_is_answered_with_a_signed_server_handshake() -> Result<(), Box<dyn Error>> {
 		let identity = create_test_certificate();
-		let mut server = Handshake::server(Ecies::server(&identity));
+		let mut server = Handshake::server(Hpke::server(&identity));
 		let hello_der = create_test_client_hello(&CLIENT_RANDOM)?;
 		let hello = ClientHello::from_der(&hello_der)?;
 
@@ -1118,7 +1146,7 @@ mod tests {
 		let random = handshake.server_random.to_32_byte_array()?;
 		let ephemeral = handshake.server_ephemeral.to_byte_array::<EC_PUBKEY_COMPRESSED_SIZE>()?;
 		let spki = identity.certificate.verifying_key_bytes();
-		let legs = EciesHandshakeLegs {
+		let legs = HpkeHandshakeLegs {
 			client_hello: &hello_der,
 			server_random: &random,
 			server_ephemeral: &ephemeral,
@@ -1128,7 +1156,7 @@ mod tests {
 			transport_accept_der: handshake.transport_accept.as_ref().map(WireDer::der).unwrap_or_default(),
 		};
 
-		let transcript_hash = Transcript::ecies_handshake(legs).seal::<Sha3_256>()?;
+		let transcript_hash = Transcript::hpke_handshake(legs).seal::<Sha3_256>()?;
 		let static_key = Secp256k1VerifyingKey::from_sec1_bytes(spki)?;
 		let signature = Secp256k1Signature::try_from(handshake.signature.as_bytes())?;
 
@@ -1254,7 +1282,7 @@ mod tests {
 		// The server runs mutual authentication and accepts any unexpired
 		// certificate, so admission passes the swapped certificate and the
 		// AEAD open is the gate that catches the swap.
-		let (mut client, mut server) = pair::<Ecies>(mutual_with(ExpiryValidator));
+		let (mut client, mut server) = pair::<Hpke>(mutual_with(ExpiryValidator));
 
 		// The honest client presents its own certificate and seals the payload
 		// under it.
@@ -1272,7 +1300,7 @@ mod tests {
 		key_exchange.client_signature = Some(possession_signature(&mitm, &digest));
 
 		let result = server.finish(carried_closing(&key_exchange)).await;
-		assert!(matches!(result, Err(HandshakeError::EciesError(DecryptionFailed(_)))));
+		assert!(matches!(result, Err(HandshakeError::HpkeError(DecryptionFailed(_)))));
 		Ok(())
 	}
 
@@ -1284,14 +1312,14 @@ mod tests {
 	/// The payload here is sealed under another domain tag, so the open fails
 	/// on the associated data.
 	#[tokio::test]
-	async fn a_failed_ecies_open_leaves_the_server_spent() -> Result<(), Box<dyn Error>> {
+	async fn a_failed_hpke_open_leaves_the_server_spent() -> Result<(), Box<dyn Error>> {
 		let identity = create_test_certificate();
 		let (mut server, confirming) = server_after_hello(&identity, PeerAuthentication::Anonymous).await;
 		let foreign = sealed_payload(&identity, &confirming, &CLIENT_RANDOM, None, b"another domain tag");
 		let closing = carried_closing(&anonymous_key_exchange(foreign));
 
 		let refused = server.finish(closing.to_owned()).await;
-		assert!(matches!(refused, Err(HandshakeError::EciesError(DecryptionFailed(_)))));
+		assert!(matches!(refused, Err(HandshakeError::HpkeError(DecryptionFailed(_)))));
 		assert_eq!(server.phase(), HandshakePhase::Spent);
 
 		let replayed = server.finish(closing).await;
@@ -1303,7 +1331,7 @@ mod tests {
 	#[tokio::test]
 	async fn a_hello_with_an_abort_alert_is_refused() -> Result<(), Box<dyn Error>> {
 		let identity = create_test_certificate();
-		let mut server = Handshake::server(Ecies::server(&identity));
+		let mut server = Handshake::server(Hpke::server(&identity));
 		let mut client = Handshake::client(anonymous_client(&identity));
 		let alerted = with_abort_alert(client.start()?, 3);
 
@@ -1317,7 +1345,7 @@ mod tests {
 	#[tokio::test]
 	async fn a_server_handshake_with_an_abort_alert_is_refused() -> Result<(), Box<dyn Error>> {
 		let identity = create_test_certificate();
-		let mut server = Handshake::server(Ecies::server(&identity));
+		let mut server = Handshake::server(Hpke::server(&identity));
 		let mut client = Handshake::client(anonymous_client(&identity));
 		let reply = server.reply(client.start()?).await?;
 		let alerted = with_abort_alert(reply, 4);
@@ -1331,7 +1359,7 @@ mod tests {
 	/// A key exchange whose envelope carries an abort alert is refused before
 	/// the key exchange is read.
 	///
-	/// The sealed bytes here are too short for an ECIES message, so a server
+	/// The sealed bytes here are too short for an HPKE message, so a server
 	/// that decoded the key exchange first would refuse with another error.
 	#[tokio::test]
 	async fn a_key_exchange_with_an_abort_alert_is_refused() -> Result<(), Box<dyn Error>> {
@@ -1379,14 +1407,15 @@ mod tests {
 	#[test]
 	fn a_payload_that_is_not_der_is_refused() {
 		let garbage = [0u8; 68];
-		let parsed = SessionPayload::parse(&garbage);
+		let parsed = SessionPayload::<Secp256k1>::parse(&garbage);
 		assert!(matches!(parsed, Err(HandshakeError::InvalidDecryptedPayloadSize)));
 	}
 
 	#[test]
 	fn a_payload_with_a_short_base_secret_is_refused() {
-		let short_key = session_payload_der([0u8; 31], [0u8; 32], &fixture_confirmation(), None);
-		let parsed = SessionPayload::parse(&short_key);
+		let client_ephemeral = create_test_server_ephemeral();
+		let short_key = session_payload_der([0u8; 31], [0u8; 32], client_ephemeral, &fixture_confirmation(), None);
+		let parsed = SessionPayload::<Secp256k1>::parse(&short_key);
 		let refused = matches!(parsed, Err(HandshakeError::InvalidKeySize { expected: 32, received: 31 }));
 		assert!(refused);
 	}
@@ -1394,9 +1423,26 @@ mod tests {
 	/// The parser fails closed on a client random of another width.
 	#[test]
 	fn a_payload_with_a_short_client_random_is_refused() {
-		let short_random = session_payload_der([0u8; 32], [0u8; 16], &fixture_confirmation(), None);
-		let parsed = SessionPayload::parse(&short_random);
+		let client_ephemeral = create_test_server_ephemeral();
+		let short_random = session_payload_der([0u8; 32], [0u8; 16], client_ephemeral, &fixture_confirmation(), None);
+		let parsed = SessionPayload::<Secp256k1>::parse(&short_random);
 		assert!(matches!(parsed, Err(HandshakeError::OctetStringLengthError(_))));
+	}
+
+	/// The parser admits a client ephemeral that is a compressed point of the
+	/// curve and no other, so the ephemeral-ephemeral agreement runs on a
+	/// validated key.
+	#[test]
+	fn a_payload_with_a_client_ephemeral_that_is_no_point_is_refused() {
+		let confirmation = fixture_confirmation();
+		let uncompressed = [0x04u8; 65];
+		let off_curve = session_payload_der([0u8; 32], [0u8; 32], off_curve_point(), &confirmation, None);
+		let another_width = session_payload_der([0u8; 32], [0u8; 32], uncompressed, &confirmation, None);
+
+		let off_curve = SessionPayload::<Secp256k1>::parse(&off_curve);
+		let another_width = SessionPayload::<Secp256k1>::parse(&another_width);
+		assert!(matches!(off_curve, Err(HandshakeError::InvalidPublicKey(_))));
+		assert!(matches!(another_width, Err(HandshakeError::OctetStringLengthError(_))));
 	}
 
 	/// The key-confirmation tag is mandatory, so a payload that carries none
@@ -1404,7 +1450,7 @@ mod tests {
 	#[test]
 	fn a_payload_with_no_key_confirmation_is_refused() {
 		let unconfirmed = loose_payload_der(None);
-		let parsed = SessionPayload::parse(&unconfirmed);
+		let parsed = SessionPayload::<Secp256k1>::parse(&unconfirmed);
 		assert!(matches!(parsed, Err(HandshakeError::InvalidDecryptedPayloadSize)));
 	}
 
@@ -1412,7 +1458,7 @@ mod tests {
 	#[test]
 	fn a_payload_with_a_short_key_confirmation_is_refused() {
 		let short_tag = loose_payload_der(Some(&[7u8; 31]));
-		let parsed = SessionPayload::parse(&short_tag);
+		let parsed = SessionPayload::<Secp256k1>::parse(&short_tag);
 		assert!(matches!(parsed, Err(HandshakeError::InvalidDecryptedPayloadSize)));
 	}
 
@@ -1421,18 +1467,20 @@ mod tests {
 	#[test]
 	fn a_payload_with_a_key_confirmation_of_the_one_width_parses() {
 		let confirmed = loose_payload_der(Some(&[7u8; 32]));
-		let parsed = SessionPayload::parse(&confirmed);
+		let parsed = SessionPayload::<Secp256k1>::parse(&confirmed);
 		assert!(parsed.is_ok());
 	}
 
 	/// A well-formed payload parses into its base secret, its client random,
-	/// and an absent acknowledgement.
+	/// its client ephemeral, and an absent acknowledgement.
 	#[test]
 	fn a_well_formed_payload_parses_into_its_session_data() -> Result<(), Box<dyn Error>> {
-		let unanswered = session_payload_der([3u8; 32], [5u8; 32], &fixture_confirmation(), None);
-		let payload = SessionPayload::parse(&unanswered)?;
+		let client_ephemeral = create_test_server_ephemeral();
+		let unanswered = session_payload_der([3u8; 32], [5u8; 32], client_ephemeral, &fixture_confirmation(), None);
+		let payload = SessionPayload::<Secp256k1>::parse(&unanswered)?;
 		assert_eq!(payload.base.as_bytes(), [3u8; 32]);
 		assert_eq!(payload.client_random, [5u8; 32]);
+		assert_eq!(payload.client_ephemeral.compressed_point()?, client_ephemeral);
 		assert!(payload.receipt_ack.is_none());
 		Ok(())
 	}

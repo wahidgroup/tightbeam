@@ -34,7 +34,7 @@ use tightbeam::{
 	TightBeamError,
 };
 
-use crate::common::security::{ecies_client_config, ecies_server_config};
+use crate::common::security::{hpke_client_config, hpke_server_config};
 use crate::security::common::{default_security_profile, expectation_failure, ServerMaterials};
 
 pub(crate) const CERT_REJECT_ALL_REJECTED: Urn<'static> =
@@ -147,10 +147,10 @@ job! {
 		{
 			let valid_pinning = SingleKeyPinning::new(&materials.certificate);
 
-			let server_config = ecies_server_config::<DefaultCryptoProvider>(&materials, [profile]);
+			let server_config = hpke_server_config::<DefaultCryptoProvider>(&materials, [profile]);
 			let mut server = Handshake::server(server_config);
 
-			let config = ecies_client_config::<DefaultCryptoProvider>(Arc::new(valid_pinning));
+			let config = hpke_client_config::<DefaultCryptoProvider>(Arc::new(valid_pinning));
 			let mut client = Handshake::client(config);
 
 			let reply = server.reply(client.start()?).await?;
@@ -166,10 +166,10 @@ job! {
 		{
 			let wrong_pinning = SingleKeyPinning::wrong_key();
 
-			let server_config = ecies_server_config::<DefaultCryptoProvider>(&materials, [profile]);
+			let server_config = hpke_server_config::<DefaultCryptoProvider>(&materials, [profile]);
 			let mut server = Handshake::server(server_config);
 
-			let config = ecies_client_config::<DefaultCryptoProvider>(Arc::new(wrong_pinning));
+			let config = hpke_client_config::<DefaultCryptoProvider>(Arc::new(wrong_pinning));
 			let mut client = Handshake::client(config);
 
 			// Run the handshake, which fails when the client reads the reply.
@@ -188,10 +188,10 @@ job! {
 		{
 			let reject_all = RejectAllValidator;
 
-			let server_config = ecies_server_config::<DefaultCryptoProvider>(&materials, [profile]);
+			let server_config = hpke_server_config::<DefaultCryptoProvider>(&materials, [profile]);
 			let mut server = Handshake::server(server_config);
 
-			let config = ecies_client_config::<DefaultCryptoProvider>(Arc::new(reject_all));
+			let config = hpke_client_config::<DefaultCryptoProvider>(Arc::new(reject_all));
 			let mut client = Handshake::client(config);
 
 			// Run the handshake, which fails when the client reads the reply.

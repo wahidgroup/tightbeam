@@ -5,7 +5,7 @@
 //! applied, an observer can recover it.
 //!
 //! ## Attack
-//! Captured ECIES ciphertext is examined: decrypted with the correct key,
+//! Captured HPKE ciphertext is examined: decrypted with the correct key,
 //! attempted with a wrong key, and compared across two handshakes.
 //!
 //! CMS carries the base secret inside an EnvelopedData/KARI structure. The
@@ -16,8 +16,8 @@
 //! The base secret MUST NOT be transmitted in the clear. The payload MUST be
 //! sealed via ECDH + HKDF into an AEAD key. Decryption MUST succeed only with
 //! the correct private key, yield the expected DER plaintext (a SEQUENCE of
-//! three 32-byte OCTET STRINGs: base secret, client random, key-confirmation
-//! tag), and produce fresh ciphertext per handshake.
+//! four OCTET STRINGs: base secret, client random, client ephemeral,
+//! key-confirmation tag), and produce fresh ciphertext per handshake.
 //!
 //! ## References
 //! - CWE-311: Missing Encryption of Sensitive Data <https://cwe.mitre.org/data/definitions/311.html>
@@ -35,7 +35,7 @@ use tightbeam::{
 };
 
 use crate::security::common::{
-	expectation_failure, extract_ecies_ciphertext, generate_wrong_secret_key, try_decrypt_ecies, DecryptionResult,
+	expectation_failure, extract_hpke_ciphertext, generate_wrong_secret_key, try_decrypt_hpke, DecryptionResult,
 	Direction, HandshakeBackendKind, SecurityThreatHarness,
 };
 
@@ -74,13 +74,13 @@ tb_process_spec! {
 			CONF_DECRYPT_WRONG_KEY_FAILS,
 			CONF_CIPHERTEXTS_DIFFER,
 			SecurityThreatHarness::HARNESS_SPAWN_SESSION,
-			SecurityThreatHarness::HARNESS_SPAWN_ECIES
+			SecurityThreatHarness::HARNESS_SPAWN_HPKE
 		}
 		hidden { }
 	}
 	states {
 		Idle => { SecurityThreatHarness::HARNESS_SPAWN_SESSION => Spawning },
-		Spawning => { SecurityThreatHarness::HARNESS_SPAWN_ECIES => SessionReady },
+		Spawning => { SecurityThreatHarness::HARNESS_SPAWN_HPKE => SessionReady },
 		SessionReady => {
 			CONF_CAPTURE_HANDSHAKE => Captured,
 			CONF_CIPHERTEXTS_DIFFER => Idle
@@ -91,7 +91,7 @@ tb_process_spec! {
 		WrongKeyVerified => { SecurityThreatHarness::HARNESS_SPAWN_SESSION => Spawning }
 	}
 	terminal { Idle }
-	annotations { description: "Confidentiality: ECIES encryption verification via manual decryption" }
+	annotations { description: "Confidentiality: HPKE encryption verification via manual decryption" }
 }
 
 tb_scenario! {
@@ -111,9 +111,9 @@ job! {
 	name: ConfidentialityScenario,
 	async fn run((trace,): (Arc<TraceCollector>,)) -> Result<(), TightBeamError> {
 		let harness = SecurityThreatHarness::with_trace(Arc::clone(&trace));
-		// This scenario decrypts the ECIES ClientKeyExchange blob directly, so
-		// it runs over ECIES alone.
-		let kind = HandshakeBackendKind::Ecies;
+		// This scenario decrypts the HPKE ClientKeyExchange blob directly, so
+		// it runs over HPKE alone.
+		let kind = HandshakeBackendKind::Hpke;
 
 		// Step 1: Capture a complete handshake.
 		let mut session = harness.spawn(kind);
@@ -121,7 +121,7 @@ job! {
 
 		trace.event(CONF_CAPTURE_HANDSHAKE)?;
 
-		// Step 2: Extract the ECIES ciphertext from the ClientKeyExchange, at
+		// Step 2: Extract the HPKE ciphertext from the ClientKeyExchange, at
 		// flow step 2.
 		let client_kex = captured
 			.messages
@@ -129,25 +129,25 @@ job! {
 			.find(|m| m.step == 2 && m.direction == Direction::ClientToServer)
 			.ok_or_else(|| expectation_failure("no ClientKeyExchange message captured"))?;
 
-		let ciphertext = extract_ecies_ciphertext(&client_kex.payload)?;
-		// The blob holds a 33-byte public key, a 12-byte nonce, a 16-byte tag,
-		// and the 104-byte plaintext, which is 165 bytes in all. A blob under
-		// 100 bytes is no ECIES ciphertext.
+		let ciphertext = extract_hpke_ciphertext(&client_kex.payload)?;
+		// The blob holds a 65-byte encapsulated key, the 140-byte plaintext,
+		// and a 16-byte tag, which is 221 bytes in all. A blob under 100 bytes
+		// is no HPKE ciphertext.
 		if ciphertext.len() < 100 {
-			return Err(expectation_failure("ciphertext too short to be valid ECIES"));
+			return Err(expectation_failure("ciphertext too short to be valid HPKE"));
 		}
 
 		trace.event(CONF_EXTRACT_CIPHERTEXT)?;
 
 		// Step 3: Decrypt with the correct key, to prove the encryption works.
 		let correct_key = harness.materials().secret_key();
-		match try_decrypt_ecies(&ciphertext, correct_key, None) {
+		match try_decrypt_hpke(&ciphertext, correct_key, None) {
 			DecryptionResult::Success { plaintext_len } => {
-				// The plaintext is the 104-byte DER SEQUENCE that the module
+				// The plaintext is the 140-byte DER SEQUENCE that the module
 				// doc names. This unmetered session carries no receipt
-				// acknowledgement, so the three OCTET STRINGs are all of it.
-				if plaintext_len != 104 {
-					return Err(expectation_failure("decrypted plaintext is not the 104-byte DER payload"));
+				// acknowledgement, so the four OCTET STRINGs are all of it.
+				if plaintext_len != 140 {
+					return Err(expectation_failure("decrypted plaintext is not the 140-byte DER payload"));
 				}
 
 				trace.event(CONF_DECRYPT_CORRECT_KEY)?;
@@ -159,7 +159,7 @@ job! {
 
 		// Step 4: Decrypt with a wrong key, to prove the encryption is real.
 		let wrong_key = generate_wrong_secret_key();
-		match try_decrypt_ecies(&ciphertext, &wrong_key, None) {
+		match try_decrypt_hpke(&ciphertext, &wrong_key, None) {
 			DecryptionResult::Failed => {
 				trace.event(CONF_DECRYPT_WRONG_KEY_FAILS)?;
 			}
@@ -169,7 +169,7 @@ job! {
 		}
 
 		// Step 5: Two handshakes MUST produce different ciphertexts, because
-		// each one draws a fresh ephemeral key and a fresh nonce.
+		// each one seals under a fresh ephemeral key.
 		let mut session2 = harness.spawn(kind);
 		let captured2 = session2.capture_full().await?;
 		let client_kex2 = captured2
@@ -178,7 +178,7 @@ job! {
 			.find(|m| m.step == 2 && m.direction == Direction::ClientToServer)
 			.ok_or_else(|| expectation_failure("no ClientKeyExchange in second handshake"))?;
 
-		let ciphertext2 = extract_ecies_ciphertext(&client_kex2.payload)?;
+		let ciphertext2 = extract_hpke_ciphertext(&client_kex2.payload)?;
 		if ciphertext == ciphertext2 {
 			return Err(expectation_failure("ciphertexts are identical across handshakes"));
 		}

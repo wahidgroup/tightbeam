@@ -11,35 +11,32 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
 
 use crate::crypto::profiles::CryptoProvider;
+use crate::crypto::x509::store::CertificateTrust;
+use crate::crypto::x509::Certificate;
 use crate::transport::client::GenericClient;
 use crate::transport::error::{TransportError, TransportFailure};
 use crate::transport::handshake::negotiation::TransportOffer;
 use crate::transport::handshake::HandshakeKeyManager;
+use crate::transport::handshake::HandshakeProtocolKind;
+use crate::transport::policy::{PolicyConfig, TimeoutConfig};
 use crate::transport::protocols::{PersistentConnection, Protocol};
+use crate::transport::state::{ClientIdentity, DialableEncryption, EncryptionConfig};
 use crate::transport::MessageCollector;
+use crate::transport::MessageEmitter;
 use crate::transport::{EndpointConfig, TransportResult};
 use crate::utils::time::{Clock, MonotonicInstant};
-
-#[cfg(host_clock)]
-use crate::utils::time::SystemClock;
-
-use crate::crypto::x509::store::CertificateTrust;
-use crate::crypto::x509::Certificate;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-use crate::transport::handshake::receipt::ReceiptApprover;
-use crate::transport::handshake::HandshakeProtocolKind;
-use crate::transport::state::{ClientIdentity, DialableEncryption, EncryptionConfig};
-
-use crate::transport::policy::{PolicyConfig, TimeoutConfig};
-use crate::transport::MessageEmitter;
 use crate::Frame;
 
 #[cfg(feature = "instrument")]
 use crate::instrumentation::events;
 #[cfg(feature = "instrument")]
 use crate::trace::TraceCollector;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::transport::handshake::receipt::ReceiptApprover;
 #[cfg(any(feature = "instrument", pooled_mux))]
 use crate::urn::Urn;
+#[cfg(host_clock)]
+use crate::utils::time::SystemClock;
 
 /// Item gate for the pooled-mux path. Multiplexed pooling needs the mux
 /// engine, the service module's connector, and a tokio executor for the driver
@@ -149,7 +146,7 @@ impl<C: CryptoProvider> PoolTlsConfig<C> {
 		self.encryption.handshake_protocol = kind;
 	}
 
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	fn set_receipt_approver(&mut self, approver: Arc<dyn ReceiptApprover>) {
 		self.encryption.receipt_approver = Some(approver);
 	}
@@ -259,7 +256,7 @@ impl<P: Protocol> ConnectionPoolBuilder<P> {
 	/// A transport consults it before it countersigns at the handshake and at
 	/// each in-band epoch renewal. Without one, pooled clients fail closed on
 	/// challenge-bearing receipts.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub fn with_receipt_approver(mut self, approver: Arc<dyn ReceiptApprover>) -> Self {
 		self.tls.set_receipt_approver(approver);
 		self
@@ -659,7 +656,7 @@ where
 	#[cfg(not(all(
 		feature = "tokio",
 		feature = "transport-multiplex",
-		any(feature = "transport-cms", feature = "transport-ecies")
+		any(feature = "transport-cms", feature = "transport-hpke")
 	)))]
 	pub async fn connect(self: &Arc<Self>, addr: impl Into<P::Address>) -> TransportResult<PooledClient<P>>
 	where
@@ -1017,7 +1014,7 @@ where
 	not(all(
 		feature = "tokio",
 		feature = "transport-multiplex",
-		any(feature = "transport-cms", feature = "transport-ecies")
+		any(feature = "transport-cms", feature = "transport-hpke")
 	))
 ))]
 impl<P: Protocol + PersistentConnection> PooledClient<P>

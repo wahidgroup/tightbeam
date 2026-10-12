@@ -52,15 +52,9 @@ use crate::transport::handshake::primitives::KdfSalt;
 use crate::transport::handshake::receipt::{
 	ApprovalRefusal, ReceiptApprover, SessionObserver, SessionOutcome, SessionReceipt,
 };
-#[cfg(feature = "transport-ecies")]
-use crate::transport::handshake::schedule::CompressedPoint;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-use crate::transport::handshake::schedule::{Agreement, BaseSecret, HandshakeAgreement, KeyConfirmation};
-#[cfg(feature = "transport-ecies")]
-use crate::transport::handshake::TunneledMessage;
 use crate::transport::handshake::{
-	Client, ClientConfig, ClientHello, ClientKeyExchange, EciesSessionPayload, EstablishedSession, Handshake,
-	HandshakeAttribute, HandshakeError, HandshakeKeyManager, HandshakeMessage, HandshakeSecret, PeerAuthentication,
+	Client, ClientConfig, ClientHello, ClientKeyExchange, EstablishedSession, Handshake, HandshakeAttribute,
+	HandshakeError, HandshakeKeyManager, HandshakeMessage, HandshakeSecret, HpkeSessionPayload, PeerAuthentication,
 	Server, ServerConfig, ServerFlow, ServerHandshake, SupportedProfiles,
 };
 use crate::transport::state::ClientIdentity;
@@ -72,18 +66,23 @@ use crate::x509::Certificate;
 use crate::x509::{name::RdnSequence, TbsCertificate, Version};
 use crate::TightBeamError;
 
-#[cfg(feature = "transport-ecies")]
-mod ecies {
-	pub use crate::constants::TIGHTBEAM_AAD_DOMAIN_TAG;
-	pub use crate::crypto::aead::Aes256Gcm;
-	pub use crate::crypto::ecies::{decrypt, EciesMessageOps, Secp256k1EciesMessage};
-	pub use crate::crypto::kdf::HkdfSha3_256;
+#[cfg(feature = "transport-hpke")]
+use crate::transport::handshake::schedule::CompressedPoint;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::transport::handshake::schedule::{Agreement, BaseSecret, HandshakeAgreement, KeyConfirmation};
+#[cfg(feature = "transport-hpke")]
+use crate::transport::handshake::TunneledMessage;
+
+#[cfg(feature = "transport-hpke")]
+mod hpke {
+	pub use crate::constants::{TIGHTBEAM_AAD_DOMAIN_TAG, TIGHTBEAM_HPKE_HANDSHAKE_INFO};
+	pub use crate::crypto::hpke::{HpkeMessage, HpkeSecp256k1Sha3Aes256Gcm, HpkeSecretKeyOps};
 	pub use crate::crypto::x509::policy::DirectTrustValidator;
-	pub use crate::transport::handshake::{Ecies, EciesClientSettings, EciesServerSettings, LearnedTrust};
+	pub use crate::transport::handshake::{Hpke, HpkeClientSettings, HpkeServerSettings, LearnedTrust};
 }
 
-#[cfg(feature = "transport-ecies")]
-use ecies::*;
+#[cfg(feature = "transport-hpke")]
+use hpke::*;
 
 #[cfg(feature = "transport-cms")]
 mod cms {
@@ -155,7 +154,7 @@ fn create_test_certificate_inner(signing_key: &Secp256k1SigningKey) -> Result<Ce
 /// A fresh server ephemeral public key as the compressed SEC1 point the
 /// `ServerHandshake` carries. The private half is discarded, so a client that
 /// completes against it derives keys nobody else holds.
-#[cfg(feature = "transport-ecies")]
+#[cfg(feature = "transport-hpke")]
 pub fn create_test_server_ephemeral() -> [u8; EC_PUBKEY_COMPRESSED_SIZE] {
 	let public_key = SecretKey::random(&mut OsRng).public_key();
 	public_key.compressed_point().expect("a compressed secp256k1 point is 33 bytes")
@@ -188,19 +187,19 @@ pub fn contains_window(haystack: impl AsRef<[u8]>, needle: impl AsRef<[u8]>) -> 
 /// An agreement that yields a chosen secret in place of an ECDH output, so a
 /// fixture or an observer runs the production derivation over the value it
 /// picked.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 struct FixedAgreement<'a>(&'a EcdhSecret);
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl HandshakeAgreement<Secp256k1> for FixedAgreement<'_> {
-	fn shared_secret(&self, _peer: &PublicKey<Secp256k1>) -> Result<EcdhSecret, HandshakeError> {
-		Ok(self.0.with(|bytes| EcdhSecret::from(*bytes)))
+	fn shared_secret(&self, _peer: &PublicKey<Secp256k1>) -> EcdhSecret {
+		self.0.duplicate()
 	}
 }
 
 /// The handshake secret of `base` and `shared` under `salt`, through the
 /// production derivation.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub fn derive_handshake_secret(
 	base: &BaseSecret,
 	shared: &EcdhSecret,
@@ -214,7 +213,7 @@ pub fn derive_handshake_secret(
 
 /// A handshake secret derived from a fixture base secret of `fill` bytes, a
 /// fixture ephemeral-ephemeral secret, and a fixture salt.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub fn fixture_handshake_secret(fill: u8) -> HandshakeSecret {
 	let base = BaseSecret::try_from(SecretSlice::from(vec![fill; 32])).expect("32 bytes make a base secret");
 	let shared = EcdhSecret::from([0x11u8; 32]);
@@ -223,12 +222,12 @@ pub fn fixture_handshake_secret(fill: u8) -> HandshakeSecret {
 }
 
 /// The salt and the transcript hash of [`fixture_confirmation`].
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 const FIXTURE_CONFIRMED: [u8; 32] = [0x99u8; 32];
 
 /// A key-confirmation tag of a fixture handshake secret, which confirms no
 /// handshake a test runs.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub fn fixture_confirmation() -> KeyConfirmation {
 	let secret = fixture_handshake_secret(0x42);
 	let derived = secret.confirmation::<DefaultCryptoProvider>(KdfSalt::new(&FIXTURE_CONFIRMED), &FIXTURE_CONFIRMED);
@@ -236,7 +235,7 @@ pub fn fixture_confirmation() -> KeyConfirmation {
 }
 
 /// What a hand-built closing confirms, as a client reads it from the reply.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub struct Confirming {
 	/// The server ephemeral the reply carried.
 	pub server_ephemeral: PublicKey<Secp256k1>,
@@ -246,7 +245,7 @@ pub struct Confirming {
 	pub transcript_hash: [u8; 32],
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl Confirming {
 	/// The key-confirmation tag of a client that drew `base` and `ephemeral`.
 	///
@@ -334,14 +333,14 @@ pub type AckAttempts = Vec<Result<SecretSlice<u8>, HandshakeError>>;
 ///
 /// The observer also tries the key that the base secret alone derives, which
 /// takes no ephemeral-ephemeral input.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub struct StaticKeyObserver {
 	base: BaseSecret,
 	salt: Vec<u8>,
 	candidates: Vec<EcdhSecret>,
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl StaticKeyObserver {
 	/// Give the observer `static_key`, the `base` it recovered with it, the
 	/// two ephemeral public keys as SEC1 bytes, and the protocol `salt`.
@@ -356,8 +355,8 @@ impl StaticKeyObserver {
 		let server_ephemeral = PublicKey::<Secp256k1>::from_sec1_bytes(server_ephemeral)?;
 		let candidates = vec![
 			EcdhSecret::from([0u8; 32]),
-			static_key.shared_secret(&client_ephemeral)?,
-			static_key.shared_secret(&server_ephemeral)?,
+			static_key.shared_secret(&client_ephemeral),
+			static_key.shared_secret(&server_ephemeral),
 			x_coordinate(&client_ephemeral)?,
 			x_coordinate(&server_ephemeral)?,
 		];
@@ -590,46 +589,46 @@ pub fn client_identity(identity: &TestCertificate) -> ClientIdentity<DefaultCryp
 }
 
 /// The DER of the `ClientHello` that `opening` tunnels.
-#[cfg(feature = "transport-ecies")]
+#[cfg(feature = "transport-hpke")]
 pub fn tunneled_hello(opening: &HandshakeMessage) -> Vec<u8> {
-	let tunnel = opening.to_owned().signed().expect("an ECIES opening travels in a SignedData");
+	let tunnel = opening.to_owned().signed().expect("an HPKE opening travels in a SignedData");
 	let hello = tunnel.value().tunneled_der().expect("the opening tunnels a ClientHello");
 	hello.to_vec()
 }
 
-/// `hello` as the opening an ECIES server reads.
-#[cfg(feature = "transport-ecies")]
+/// `hello` as the opening an HPKE server reads.
+#[cfg(feature = "transport-hpke")]
 pub fn tunneled_opening(hello: &ClientHello) -> HandshakeMessage {
 	let tunnel = SignedData::try_from(hello).expect("a ClientHello tunnels in a SignedData");
 	HandshakeMessage::try_from(tunnel).expect("the tunnel encodes")
 }
 
 /// The `ServerHandshake` that `reply` tunnels.
-#[cfg(feature = "transport-ecies")]
+#[cfg(feature = "transport-hpke")]
 pub fn tunneled_handshake(reply: &HandshakeMessage) -> ServerHandshake {
-	let tunnel = reply.to_owned().signed().expect("an ECIES reply travels in a SignedData");
+	let tunnel = reply.to_owned().signed().expect("an HPKE reply travels in a SignedData");
 	ServerHandshake::try_from(tunnel.value()).expect("the reply tunnels a ServerHandshake")
 }
 
-/// `handshake` as the reply an ECIES client reads.
-#[cfg(feature = "transport-ecies")]
+/// `handshake` as the reply an HPKE client reads.
+#[cfg(feature = "transport-hpke")]
 pub fn tunneled_reply(handshake: &ServerHandshake) -> HandshakeMessage {
 	let tunnel = SignedData::try_from(handshake).expect("a ServerHandshake tunnels in a SignedData");
 	HandshakeMessage::try_from(tunnel).expect("the tunnel encodes")
 }
 
 /// The `ClientKeyExchange` that `closing` carries.
-#[cfg(feature = "transport-ecies")]
+#[cfg(feature = "transport-hpke")]
 pub fn carried_key_exchange(closing: &HandshakeMessage) -> ClientKeyExchange {
 	let carrier = closing
 		.to_owned()
 		.enveloped()
-		.expect("an ECIES closing travels in an EnvelopedData");
+		.expect("an HPKE closing travels in an EnvelopedData");
 	ClientKeyExchange::try_from(carrier.value()).expect("the closing carries a ClientKeyExchange")
 }
 
-/// `key_exchange` as the closing an ECIES server reads.
-#[cfg(feature = "transport-ecies")]
+/// `key_exchange` as the closing an HPKE server reads.
+#[cfg(feature = "transport-hpke")]
 pub fn carried_closing(key_exchange: &ClientKeyExchange) -> HandshakeMessage {
 	let carrier = EnvelopedData::try_from(key_exchange).expect("a ClientKeyExchange travels in an EnvelopedData");
 	HandshakeMessage::try_from(carrier).expect("the carrier encodes")
@@ -674,17 +673,17 @@ pub type TestClient<F> = Handshake<Client, F, DefaultCryptoProvider>;
 /// A server handshake under the default provider.
 pub type TestServer<F> = Handshake<Server, F, DefaultCryptoProvider>;
 
-#[cfg(feature = "transport-ecies")]
-impl TestFlow for Ecies {
+#[cfg(feature = "transport-hpke")]
+impl TestFlow for Hpke {
 	fn client(server: &Certificate, identity: &TestCertificate) -> TestClientConfig<Self> {
 		let validator = DirectTrustValidator::default().with_trust_chain(vec![server.to_owned()]);
-		let mut settings = EciesClientSettings::new(LearnedTrust::new(validator));
+		let mut settings = HpkeClientSettings::new(LearnedTrust::new(validator));
 		settings.identity = Some(client_identity(identity));
 		ClientConfig::new(settings)
 	}
 
 	fn server(identity: &TestCertificate) -> TestServerConfig<Self> {
-		let settings = EciesServerSettings::new(Arc::new(identity.certificate.to_owned()));
+		let settings = HpkeServerSettings::new(Arc::new(identity.certificate.to_owned()));
 		let key = into_provider(identity.signing_key.to_owned());
 		ServerConfig::new(settings, key, SupportedProfiles::from(create_default_test_profile()))
 	}
@@ -692,21 +691,22 @@ impl TestFlow for Ecies {
 	fn recover(run: &Run<Self>, server_identity: &TestCertificate) -> Recovered {
 		let key_exchange = carried_key_exchange(&run.closing);
 		let static_key = SecretKey::from(server_identity.signing_key.to_owned());
-		let message = Secp256k1EciesMessage::from_bytes(key_exchange.encrypted_data.as_bytes());
-		let message = message.expect("the closing carries an ECIES message");
+		let message = HpkeMessage::<HpkeSecp256k1Sha3Aes256Gcm>::from_bytes(key_exchange.encrypted_data.as_bytes());
+		let message = message.expect("the closing carries an HPKE message");
 		let certificate = key_exchange.client_certificate.as_ref();
 		let aad = ClientKeyExchange::client_bound_aad(TIGHTBEAM_AAD_DOMAIN_TAG, certificate);
 		let aad = aad.expect("the offered certificate encodes");
-		let opened = decrypt::<_, _, HkdfSha3_256, Aes256Gcm>(&static_key, &message, Some(&aad));
+		let opened = static_key.open(&message, TIGHTBEAM_HPKE_HANDSHAKE_INFO, &aad);
 		let plaintext = opened.expect("the static key opens the payload").to_insecure();
-		let payload = EciesSessionPayload::from_der(&plaintext).expect("the payload decodes");
+		let payload = HpkeSessionPayload::from_der(&plaintext).expect("the payload decodes");
 
 		let hello = ClientHello::from_der(&tunneled_hello(&run.opening)).expect("the hello decodes");
 		let handshake = tunneled_handshake(&run.reply);
 		let salt = [hello.client_random.as_bytes(), handshake.server_random.as_bytes()].concat();
 		let base = payload.base_key.as_bytes();
 		let server_ephemeral = handshake.server_ephemeral.as_bytes();
-		let observer = StaticKeyObserver::new(&static_key, base, message.ephemeral_pubkey(), server_ephemeral, salt);
+		let client_ephemeral = payload.client_ephemeral.as_bytes();
+		let observer = StaticKeyObserver::new(&static_key, base, client_ephemeral, server_ephemeral, salt);
 
 		Recovered {
 			observer: observer.expect("both ephemerals are points on the curve"),
@@ -874,7 +874,7 @@ pub async fn established<F: TestFlow>(peer_authentication: PeerAuthentication) -
 /// A key exchange whose envelope carries two `CLIENT_CERTIFICATE` attributes
 /// fails closed instead of admitting the last one, so an injected certificate
 /// cannot travel beside the one the client sealed the payload under.
-#[cfg(feature = "transport-ecies")]
+#[cfg(feature = "transport-hpke")]
 #[test]
 fn a_duplicate_client_certificate_attribute_fails_closed() -> Result<(), Box<dyn Error>> {
 	let sealed = create_test_certificate();

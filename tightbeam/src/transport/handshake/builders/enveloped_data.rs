@@ -12,16 +12,15 @@ use crate::cms::content_info::{CmsVersion, ContentInfo};
 use crate::cms::enveloped_data::{EncryptedContentInfo, EnvelopedData, RecipientInfo, RecipientInfos};
 use crate::crypto::aead::{AeadCore, Encryptor, KeyInit};
 use crate::crypto::common::{typenum::Unsigned, KeySizeUser};
-use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
+use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::crypto::secret::SecretSlice;
-use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
-use crate::crypto::sign::elliptic_curve::{AffinePoint, FieldBytesSize};
 use crate::crypto::x509::attr::{Attribute, Attributes};
 use crate::der::asn1::{Any, SetOfVec};
 use crate::oids::{DATA, ENVELOPED_DATA};
 use crate::random::{generate_random_bytes, CryptoRngCore, OsRng};
 use crate::transport::handshake::attributes::HandshakeAttribute;
 use crate::transport::handshake::error::HandshakeError;
+use crate::transport::handshake::HandshakeProvider;
 
 /// Builder for constructing CMS EnvelopedData messages.
 ///
@@ -39,7 +38,7 @@ use crate::transport::handshake::error::HandshakeError;
 /// 4. Wrap everything into an EnvelopedData structure.
 pub struct TightBeamEnvelopedDataBuilder<P>
 where
-	P: CryptoProvider,
+	P: HandshakeProvider,
 {
 	kari_builder: Option<TightBeamKariBuilder<P>>,
 	unprotected_attrs: Vec<HandshakeAttribute>,
@@ -47,10 +46,7 @@ where
 
 impl<P> TightBeamEnvelopedDataBuilder<P>
 where
-	P: CryptoProvider,
-	P::AeadCipher: KeyInit,
-	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
-	FieldBytesSize<P::Curve>: ModulusSize,
+	P: HandshakeProvider,
 {
 	/// Creates an EnvelopedData builder around `kari_builder`.
 	///

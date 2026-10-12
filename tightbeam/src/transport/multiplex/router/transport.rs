@@ -3,6 +3,9 @@
 
 use std::sync::Arc;
 
+#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
+use core::time::Duration;
+
 use futures::channel::mpsc;
 
 use super::flow::{cap_as_usize, CreditGrantor};
@@ -16,17 +19,14 @@ use crate::transport::handshake::negotiation::MuxSettings;
 use crate::transport::io::{EnvelopeSink, EnvelopeSource};
 use crate::transport::multiplex::MuxRole;
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-use crate::transport::multiplex::MuxRekeyContext;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-use crate::transport::rekey::RekeyDriver;
-#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
-use crate::utils::time::Clock;
-#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
-use core::time::Duration;
-
 #[cfg(feature = "tokio")]
 use crate::runtime::rt;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::transport::multiplex::MuxRekeyContext;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::transport::rekey::RekeyDriver;
+#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
+use crate::utils::time::Clock;
 
 /// Multiplexed transport assembled from split envelope halves and
 /// [`MuxSettings`].
@@ -106,7 +106,7 @@ where
 	/// at the hard floor. A build without tokio has no timer here, so the
 	/// embedding application MUST bound parked emits itself by wrapping emit
 	/// futures in its own timeout. A cancelled emit frees its stream slot.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[must_use]
 	pub fn with_rekey(mut self, context: MuxRekeyContext) -> Self {
 		let MuxRekeyContext { driver, receipt } = context;
@@ -123,7 +123,7 @@ where
 	/// connection on the GoAway path.
 	///
 	/// [`DEFAULT_REKEY_DEADLINE_SECS`]: crate::constants::DEFAULT_REKEY_DEADLINE_SECS
-	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
+	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
 	#[must_use]
 	pub fn with_renewal_deadline(mut self, deadline: Duration) -> Self {
 		self.writer.set_renewal_deadline(deadline);
@@ -136,7 +136,7 @@ where
 	/// ([`EnvelopeSink::clock`]), so an endpoint needs no call here. A test
 	/// installs a [`ManualClock`](crate::utils::time::ManualClock) and
 	/// advances it to the deadline instead of waiting it out.
-	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
+	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
 	#[must_use]
 	pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
 		self.writer.set_clock(clock);

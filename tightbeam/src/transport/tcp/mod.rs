@@ -368,7 +368,7 @@ macro_rules! impl_tcp_common {
 		{
 		}
 
-		#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+		#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider>
 			$crate::transport::state::ServerHandshakeSlot for $transport<S, P>
 		where

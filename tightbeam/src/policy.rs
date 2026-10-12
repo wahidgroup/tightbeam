@@ -164,7 +164,7 @@ impl SessionContext {
 	#[cfg(all(
 		feature = "tokio",
 		feature = "transport-multiplex",
-		any(feature = "transport-cms", feature = "transport-ecies")
+		any(feature = "transport-cms", feature = "transport-hpke")
 	))]
 	pub(crate) fn with_live_receipt(&self, receipt: Option<Arc<StoredReceipt>>) -> Self {
 		Self {
@@ -258,8 +258,7 @@ impl<'a> ProvenPeer<'a> {
 /// (mux streaming / duplex). Choose the `None` verdict by gate class:
 /// - Session / capacity gates (peer lists, backpressure): ignore the
 ///   frame and key on `session` or shared state.
-/// - Optional integrity (e.g. [`FrameIntegrityGate`]): return
-///   [`TransitStatus::Ok`] when no frame exists.
+/// - Optional integrity (e.g. [`FrameIntegrityGate`]): return [`TransitStatus::Ok`] when no frame exists.
 /// - Auth that requires a signed or intact frame: fail closed with
 ///   [`TransitStatus::Unauthenticated`] or [`TransitStatus::PermissionDenied`].
 ///

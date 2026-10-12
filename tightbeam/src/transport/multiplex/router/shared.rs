@@ -24,7 +24,7 @@ use crate::transport::{TransportError, TransportResult};
 use crate::urn::Urn;
 use crate::Frame;
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::receipt::StoredReceipt;
 
 #[cfg(feature = "instrument")]
@@ -374,10 +374,10 @@ pub struct MuxShared {
 	/// Negotiated outbound budget, restored at each epoch boundary. The
 	/// credit-match invariant keeps the epoch receipt budgets equal to the
 	/// initial terms.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	initial_send_budget: Option<u64>,
 	/// Current epoch's dual-signed receipt. Renewal rotates it.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	session_receipt: Mutex<Option<Arc<StoredReceipt>>>,
 }
 
@@ -394,9 +394,9 @@ impl MuxShared {
 			initial_recv_credit: settings.initial_recv_credit.max(1),
 			duplex_recv: Mutex::new(HashMap::new()),
 			budget_drain_headroom: settings.send_budget_reserve(),
-			#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 			initial_send_budget: settings.send_budget,
-			#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 			session_receipt: Mutex::new(None),
 			#[cfg(feature = "instrument")]
 			trace: None,
@@ -537,7 +537,7 @@ impl MuxShared {
 	///
 	/// The precondition and the write live together, so the phase advances
 	/// only from `from` to `to` and the rekey sequence stays ordered.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	fn advance_rekey(state: &mut MuxState, from: RekeyPhase, to: RekeyPhase) -> bool {
 		if state.rekey != from {
 			return false;
@@ -783,7 +783,7 @@ impl MuxShared {
 	}
 
 	/// The current renewal phase, read by the writer's renewal deadline.
-	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
+	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
 	pub fn rekey_phase(&self) -> RekeyPhase {
 		self.lock().rekey
 	}
@@ -791,7 +791,7 @@ impl MuxShared {
 	/// Whether this endpoint may open a renewal now. That takes the client
 	/// role with rekey materials, an `Idle` phase, and a connection that still
 	/// admits work.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub fn renewal_ready(&self) -> bool {
 		let state = self.lock();
 		let admits = state.pending.refusal().is_none();
@@ -800,7 +800,7 @@ impl MuxShared {
 
 	/// Mark this endpoint as the client half of a rekey exchange, which
 	/// activates renewal triggers and admission gating.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub fn mark_rekey_client(&self) {
 		self.lock().rekey_client = true;
 	}
@@ -811,7 +811,7 @@ impl MuxShared {
 	/// single opened renewal, and an `open` failure leaves the phase
 	/// untouched. It returns `None` when a renewal is already in flight, the
 	/// connection admits no work, or `open` declined.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub fn enter_renewal<T>(&self, open: impl FnOnce() -> Option<T>) -> Option<T> {
 		let mut state = self.lock();
 		if state.rekey != RekeyPhase::Idle || state.pending.refusal().is_some() {
@@ -827,7 +827,7 @@ impl MuxShared {
 	/// count and the flushed count agree. Otherwise it parks `cx` on the
 	/// rekey waker set, so the caller re-polls when the last owed chunk
 	/// flushes.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub fn poll_chunks_quiesced(&self, cx: &Context<'_>) -> bool {
 		let mut state = self.lock();
 		if state.unsent_chunks == 0 {
@@ -844,7 +844,7 @@ impl MuxShared {
 	/// The phase check and the move are one step under the lock, so a
 	/// response that arrives out of order moves nothing and admits nothing.
 	/// It returns whether the response was admitted.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub fn admit_rekey_response(&self) -> bool {
 		let mut state = self.lock();
 		if !Self::advance_rekey(&mut state, RekeyPhase::AwaitingResponse, RekeyPhase::FlushingAck) {
@@ -859,7 +859,7 @@ impl MuxShared {
 
 	/// Record that the writer wrote the `RekeyAck` (client). The send cipher is
 	/// active after the Ack, which lifts the hard-floor park.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub fn mark_ack_written(&self) {
 		let mut state = self.lock();
 		if !Self::advance_rekey(&mut state, RekeyPhase::FlushingAck, RekeyPhase::AwaitingDone) {
@@ -877,7 +877,7 @@ impl MuxShared {
 	///   happen under the lock, before any parked admission wakes, so an
 	///   admission that debits the new epoch also reads its receipt.
 	/// - A `RekeyDone` that arrives before the `RekeyAck` was written closes nothing.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub fn complete_renewal(&self, receipt: StoredReceipt) -> bool {
 		let mut state = self.lock();
 		if !Self::advance_rekey(&mut state, RekeyPhase::AwaitingDone, RekeyPhase::Idle) {
@@ -895,7 +895,7 @@ impl MuxShared {
 
 	/// Abandon the renewal from any phase after the attempt died or was
 	/// refused. Admissions resume, the hard floor lifts, and parked tasks wake.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub fn finish_renewal(&self) {
 		let mut state = self.lock();
 		Self::abandon_renewal(&mut state);
@@ -925,7 +925,7 @@ impl MuxShared {
 	/// closed the renewal would park data until the connection died. With the
 	/// phase `Idle` this writes nothing and returns `false`, and the caller
 	/// falls through to the drain decision.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub fn park_hard_floor(&self) -> bool {
 		let mut state = self.lock();
 		if state.rekey == RekeyPhase::Idle {
@@ -939,13 +939,13 @@ impl MuxShared {
 	/// Restore the outbound budget to the negotiated terms at the `RekeyDone`
 	/// boundary. The credit-match invariant keeps the epoch receipt's terms
 	/// equal to the initial ones.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub fn reset_send_budget(&self) {
 		self.lock().send_budget = self.initial_send_budget;
 	}
 
 	/// Publish the completed epoch receipt to handle accessors.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub fn rotate_receipt(&self, receipt: StoredReceipt) {
 		let mut slot = self.session_receipt.lock().unwrap_or_else(PoisonError::into_inner);
 		*slot = Some(Arc::new(receipt));
@@ -953,7 +953,7 @@ impl MuxShared {
 
 	/// The current epoch's dual-signed receipt, once a handshake or a renewal
 	/// published one.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub fn session_receipt(&self) -> Option<Arc<StoredReceipt>> {
 		let slot = self.session_receipt.lock().unwrap_or_else(PoisonError::into_inner);
 		slot.as_ref().map(Arc::clone)
@@ -1490,7 +1490,7 @@ mod tests {
 	use crate::constants::DEFAULT_HOP_BUDGET;
 	use crate::transport::envelopes::MuxEnvelope;
 
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	use crate::transport::envelopes::MuxPingPackage;
 
 	fn shared(role: MuxRole, local_cap: u32) -> Arc<MuxShared> {
@@ -1925,7 +1925,7 @@ mod tests {
 		assert!(!shared.has_stream_headroom());
 	}
 
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[test]
 	fn test_no_renewal_after_connection_failure() {
 		let shared = shared(MuxRole::Client, 8);
@@ -1936,7 +1936,7 @@ mod tests {
 
 	// The sweep returns the phase to `Idle`, so the phase alone would let a
 	// renewal open on a connection that cannot answer it.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[test]
 	fn test_renewal_not_entered_after_connection_failure() {
 		let shared = shared(MuxRole::Client, 8);
@@ -2320,14 +2320,14 @@ mod tests {
 	}
 
 	/// Put a client-side shared state into an in-flight renewal.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	fn begin_client_renewal(shared: &MuxShared) {
 		let mut state = shared.lock();
 		state.rekey_client = true;
 		state.rekey = RekeyPhase::AwaitingResponse;
 	}
 
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[test]
 	fn test_admissions_park_across_renewal_and_resume() {
 		let shared = shared_with_settings(MuxRole::Client, budget_settings(10));
@@ -2386,7 +2386,7 @@ mod tests {
 		Ok(())
 	}
 
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[test]
 	fn test_hard_floor_parks_chunks_until_ack_writes() {
 		let shared = shared_with_settings(MuxRole::Client, metered_settings(2, None));
@@ -2417,7 +2417,7 @@ mod tests {
 	/// reader can close that renewal between the two steps. Only a phase
 	/// change lifts a parked floor, so the park decides under the phase lock:
 	/// with the renewal gone it writes nothing and chunks keep flowing.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[test]
 	fn test_park_hard_floor_refuses_once_the_renewal_closed() {
 		let shared = shared_with_settings(MuxRole::Client, metered_settings(2, None));

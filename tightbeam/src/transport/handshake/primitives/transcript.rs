@@ -3,20 +3,17 @@
 //! The module computes cryptographic hashes over handshake message
 //! sequences, which protects transcript integrity.
 
-#[cfg(all(
-	not(feature = "std"),
-	any(feature = "transport-cms", feature = "transport-ecies")
-))]
+#[cfg(all(not(feature = "std"), any(feature = "transport-cms", feature = "transport-hpke")))]
 use alloc::vec::Vec;
-
-#[cfg(feature = "transport-ecies")]
-use crate::constants::EC_PUBKEY_COMPRESSED_SIZE;
-#[cfg(feature = "transport-cms")]
-use crate::constants::{TIGHTBEAM_CLIENT_FINISHED_DOMAIN, TIGHTBEAM_SERVER_FINISHED_DOMAIN};
 
 use crate::crypto::hash::Digest;
 use crate::crypto::profiles::CryptoProvider;
 use crate::transport::handshake::error::HandshakeError;
+
+#[cfg(feature = "transport-hpke")]
+use crate::constants::EC_PUBKEY_COMPRESSED_SIZE;
+#[cfg(feature = "transport-cms")]
+use crate::constants::{TIGHTBEAM_CLIENT_FINISHED_DOMAIN, TIGHTBEAM_SERVER_FINISHED_DOMAIN};
 
 /// Width of a transcript hash in bytes.
 pub const TRANSCRIPT_HASH_LEN: usize = 32;
@@ -60,10 +57,10 @@ pub fn transcript_hash<P: CryptoProvider>(messages: &[&[u8]]) -> Result<[u8; TRA
 /// Only an open transcript accepts bytes, so nothing reaches the transcript
 /// after its hash is fixed. The state stays private, so a hash exists only
 /// where [`Transcript::seal`] computed it.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub(crate) struct Transcript(State);
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 enum State {
 	/// The messages exchanged so far, in the order both endpoints hash them.
 	Open(Vec<u8>),
@@ -71,7 +68,7 @@ enum State {
 	Sealed,
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl Transcript {
 	/// Compute the 32-byte transcript digest under digest algorithm `D`.
 	///
@@ -81,15 +78,15 @@ impl Transcript {
 		digest_output_to_array(D::digest(bytes))
 	}
 
-	/// Open the ECIES handshake transcript over its ordered legs.
+	/// Open the HPKE handshake transcript over its ordered legs.
 	///
 	/// Both roles derive this identically. A divergence here is a protocol
 	/// break, so the concatenation order lives in one place. The hash binds
 	/// every leg (CWE-347), and the fixed-width ephemeral leg keeps the
 	/// variable-length legs beside it in their positions.
-	#[cfg(feature = "transport-ecies")]
-	pub(crate) fn ecies_handshake(legs: EciesHandshakeLegs<'_>) -> Self {
-		let EciesHandshakeLegs {
+	#[cfg(feature = "transport-hpke")]
+	pub(crate) fn hpke_handshake(legs: HpkeHandshakeLegs<'_>) -> Self {
+		let HpkeHandshakeLegs {
 			client_hello,
 			server_random,
 			server_ephemeral,
@@ -113,9 +110,9 @@ impl Transcript {
 		Self(State::Open(buffer))
 	}
 
-	/// Open the ECIES client mutual-auth transcript.
+	/// Open the HPKE client mutual-auth transcript.
 	///
-	/// The digest binds the transcript hash, the ECIES-encrypted key exchange
+	/// The digest binds the transcript hash, the HPKE-encrypted key exchange
 	/// payload, and the client certificate into a single value that the client
 	/// signs. A valid client signature therefore cannot be spliced onto a
 	/// different key exchange or a different identity (CWE-347).
@@ -123,10 +120,10 @@ impl Transcript {
 	/// # Parameters
 	///
 	/// - `transcript_hash`: the 32-byte handshake transcript hash.
-	/// - `encrypted_data`: the ECIES-encrypted key exchange bytes.
+	/// - `encrypted_data`: the HPKE-encrypted key exchange bytes.
 	/// - `client_cert_der`: the DER encoding of the client certificate.
-	#[cfg(feature = "transport-ecies")]
-	pub(crate) fn ecies_client_auth(
+	#[cfg(feature = "transport-hpke")]
+	pub(crate) fn hpke_client_auth(
 		transcript_hash: &[u8; 32],
 		encrypted_data: impl AsRef<[u8]>,
 		client_cert_der: impl AsRef<[u8]>,
@@ -203,10 +200,10 @@ impl Transcript {
 	}
 }
 
-/// The ECIES handshake legs the transcript binds, in the order both roles
-/// hash them. [`Transcript::ecies_handshake`] fixes that order.
-#[cfg(feature = "transport-ecies")]
-pub(crate) struct EciesHandshakeLegs<'a> {
+/// The HPKE handshake legs the transcript binds, in the order both roles
+/// hash them. [`Transcript::hpke_handshake`] fixes that order.
+#[cfg(feature = "transport-hpke")]
+pub(crate) struct HpkeHandshakeLegs<'a> {
 	/// The DER of the ClientHello as it was sent and received.
 	pub(crate) client_hello: &'a [u8],
 	/// The 32-byte server random.
@@ -287,7 +284,7 @@ mod tests {
 	use super::*;
 	use crate::crypto::profiles::DefaultCryptoProvider;
 
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	use crate::crypto::hash::Sha3_256;
 
 	#[cfg(feature = "transport-cms")]
@@ -339,10 +336,10 @@ mod tests {
 		Ok(())
 	}
 
-	/// The ECIES transcript hash of fixed legs around `server_ephemeral`.
-	#[cfg(feature = "transport-ecies")]
-	fn ecies_hash_with_ephemeral(server_ephemeral: &[u8; 33]) -> Result<[u8; 32], HandshakeError> {
-		let legs = EciesHandshakeLegs {
+	/// The HPKE transcript hash of fixed legs around `server_ephemeral`.
+	#[cfg(feature = "transport-hpke")]
+	fn hpke_hash_with_ephemeral(server_ephemeral: &[u8; 33]) -> Result<[u8; 32], HandshakeError> {
+		let legs = HpkeHandshakeLegs {
 			client_hello: b"client hello",
 			server_random: &[0x01u8; 32],
 			server_ephemeral,
@@ -352,17 +349,17 @@ mod tests {
 			transport_accept_der: b"",
 		};
 
-		let mut transcript = Transcript::ecies_handshake(legs);
+		let mut transcript = Transcript::hpke_handshake(legs);
 		transcript.seal::<Sha3_256>()
 	}
 
-	/// Two ECIES transcripts that differ only in the server ephemeral hash
+	/// Two HPKE transcripts that differ only in the server ephemeral hash
 	/// differently, so the server signature binds the ephemeral.
-	#[cfg(feature = "transport-ecies")]
+	#[cfg(feature = "transport-hpke")]
 	#[test]
-	fn the_ecies_transcript_binds_the_server_ephemeral() -> Result<(), HandshakeError> {
-		let first = ecies_hash_with_ephemeral(&[0x02u8; 33])?;
-		let second = ecies_hash_with_ephemeral(&[0x03u8; 33])?;
+	fn the_hpke_transcript_binds_the_server_ephemeral() -> Result<(), HandshakeError> {
+		let first = hpke_hash_with_ephemeral(&[0x02u8; 33])?;
+		let second = hpke_hash_with_ephemeral(&[0x03u8; 33])?;
 		assert_ne!(first, second);
 		Ok(())
 	}
@@ -408,7 +405,7 @@ mod tests {
 		Ok(())
 	}
 
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[test]
 	fn test_transcript_digest_widths() -> Result<(), HandshakeError> {
 		use crate::crypto::hash::{Sha3_256, Sha3_512};
@@ -423,16 +420,16 @@ mod tests {
 		Ok(())
 	}
 
-	/// The ECIES transcript hashes its legs in one fixed order: the hello, the
+	/// The HPKE transcript hashes its legs in one fixed order: the hello, the
 	/// server random, the server ephemeral, the server key, the security
 	/// accept, the certificate demand, and the transport accept.
 	///
 	/// Both peers sign and verify this digest, so the expected value is a
 	/// literal that no code of the crate computes.
-	#[cfg(feature = "transport-ecies")]
+	#[cfg(feature = "transport-hpke")]
 	#[test]
-	fn the_ecies_transcript_hashes_its_legs_in_wire_order() -> Result<(), HandshakeError> {
-		let legs = EciesHandshakeLegs {
+	fn the_hpke_transcript_hashes_its_legs_in_wire_order() -> Result<(), HandshakeError> {
+		let legs = HpkeHandshakeLegs {
 			client_hello: b"client hello",
 			server_random: &[0x11; 32],
 			server_ephemeral: &[0x22; EC_PUBKEY_COMPRESSED_SIZE],
@@ -442,7 +439,7 @@ mod tests {
 			transport_accept_der: b"transport accept",
 		};
 
-		let hash = Transcript::ecies_handshake(legs).seal::<Sha3_256>()?;
+		let hash = Transcript::hpke_handshake(legs).seal::<Sha3_256>()?;
 		let expected = [
 			0x96, 0x45, 0xa4, 0x4b, 0x7b, 0x7e, 0x7d, 0x93, 0xeb, 0x00, 0x1b, 0x25, 0xc1, 0xd7, 0xcc, 0xbc, 0xb7, 0xe5,
 			0x4e, 0x90, 0x29, 0x8e, 0xba, 0x64, 0xc6, 0xb7, 0x3e, 0x4b, 0x90, 0x28, 0x73, 0x03,

@@ -1,19 +1,19 @@
 //! Common helpers and fixtures for security threat integration tests.
 //!
 //! The module gives one protocol-agnostic interface for testing security
-//! threats across the handshake backends (ECIES, CMS), so each threat test
+//! threats across the handshake backends (HPKE, CMS), so each threat test
 //! runs against every backend from one body.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use tightbeam::der::asn1::OctetString;
 use tightbeam::{
+	constants::TIGHTBEAM_HPKE_HANDSHAKE_INFO,
 	crypto::{
-		aead::{Aes128Gcm, Aes128GcmOid, Aes256Gcm},
-		ecies::{self, Secp256k1EciesMessage},
+		aead::{Aes128Gcm, Aes128GcmOid},
 		hash::Sha3_256,
+		hpke::{DhKemSuite, HpkeMessage, HpkeSecp256k1Sha3Aes256Gcm, HpkeSecretKeyOps},
 		kdf::HkdfSha3_256,
 		profiles::{
 			AeadProvider, CryptoProvider, CurveProvider, DefaultCryptoProvider, DigestProvider, KdfProvider,
@@ -22,23 +22,35 @@ use tightbeam::{
 		secret::ToInsecure,
 		sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey, Secp256k1VerifyingKey},
 	},
+	der::{asn1::OctetString, Any, Decode, Encode, Sequence},
 	oids::AES_128_WRAP,
 	testing::error::{FdrConfigError, TestingError},
 	transport::handshake::{
 		negotiation::{NoStrengthFloor, ProfilePolicy, ProfileStrengthPolicy, SecurityOffer},
-		Client, ClientHandshakeProtocol, Ecies, Handshake, HandshakeError, HandshakeMessage, HandshakeProvider, Server,
+		Client, ClientHandshakeProtocol, Handshake, HandshakeError, HandshakeMessage, HandshakeProvider, Hpke, Server,
 		ServerHandshakeProtocol,
 	},
 	transport::wire_der::WireDer,
 	TightBeamError,
 };
 
+// Shared fixtures live in the crate-wide `common` module so threat suites do
+// not depend on one another's helpers.
+pub use crate::common::security::{
+	carried_key_exchange, default_security_profile, expectation_failure, hpke_client_config, hpke_server_config,
+	pinning_validator, tunneled_handshake, tunneled_reply, weak_security_profile, ServerMaterials,
+};
+
+#[cfg(feature = "transport-cms")]
+use crate::common::security::{cms_client_config, cms_server_config, pinning_trust_store, ClientMaterials};
 #[cfg(feature = "transport-cms")]
 use tightbeam::cms::signed_data::SignedData;
 #[cfg(feature = "transport-cms")]
-use tightbeam::der::{Any, Decode, Encode};
+use tightbeam::crypto::k256::elliptic_curve::sec1::ToEncodedPoint;
 #[cfg(feature = "transport-cms")]
 use tightbeam::transport::handshake::Cms;
+#[cfg(feature = "transport-cms")]
+use tightbeam::transport::{handshake::HandshakeKeyManager, state::ClientIdentity};
 
 /// A security profile on AES-128-GCM, which is weaker than the default
 /// AES-256-GCM.
@@ -81,11 +93,11 @@ impl KdfProvider for Aes128CryptoProvider {
 
 impl CurveProvider for Aes128CryptoProvider {
 	type Curve = k256::Secp256k1;
-	type EciesMessage = Secp256k1EciesMessage;
 }
 
 impl CryptoProvider for Aes128CryptoProvider {
 	type Profile = Aes128Profile;
+	type HpkeSuite = DhKemSuite<k256::Secp256k1, HkdfSha3_256, Aes128Gcm>;
 
 	fn profile(&self) -> &Self::Profile {
 		&self.profile
@@ -278,20 +290,6 @@ impl<F: HandshakeFlow> HandshakeProtocol for F {
 	}
 }
 
-// Shared fixtures live in the crate-wide `common` module so threat suites do
-// not depend on one another's helpers.
-pub use crate::common::security::{
-	default_security_profile, expectation_failure, pinning_validator, weak_security_profile, ServerMaterials,
-};
-
-use crate::common::security::{
-	carried_key_exchange, ecies_client_config, ecies_server_config, tunneled_handshake, tunneled_reply,
-};
-#[cfg(feature = "transport-cms")]
-use crate::common::security::{cms_client_config, cms_server_config, pinning_trust_store, ClientMaterials};
-#[cfg(feature = "transport-cms")]
-use tightbeam::transport::{handshake::HandshakeKeyManager, state::ClientIdentity};
-
 /// The total number of handshake backends the security harness exercises.
 pub const BACKEND_COUNT: usize = 1 + cfg!(feature = "transport-cms") as usize;
 /// [`BACKEND_COUNT`] as a `u32`, for the spec macros.
@@ -300,7 +298,7 @@ pub const BACKEND_COUNT_U32: u32 = BACKEND_COUNT as u32;
 /// The handshake backends the harness can run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HandshakeBackendKind {
-	Ecies,
+	Hpke,
 	#[cfg(feature = "transport-cms")]
 	Cms,
 }
@@ -310,7 +308,7 @@ impl HandshakeBackendKind {
 	#[allow(dead_code)]
 	pub fn label(self) -> &'static str {
 		match self {
-			Self::Ecies => "ecies",
+			Self::Hpke => "hpke",
 			#[cfg(feature = "transport-cms")]
 			Self::Cms => "cms",
 		}
@@ -318,7 +316,7 @@ impl HandshakeBackendKind {
 
 	/// Return every enabled backend.
 	pub fn all() -> Vec<Self> {
-		let mut kinds = vec![Self::Ecies];
+		let mut kinds = vec![Self::Hpke];
 		#[cfg(feature = "transport-cms")]
 		{
 			kinds.push(Self::Cms);
@@ -332,13 +330,13 @@ impl HandshakeBackendKind {
 	/// edit goes through the decoded message and re-encodes it, so the result
 	/// is well-formed DER that only a transcript or signature check can refuse.
 	///
-	/// - ECIES tampers the `ServerHandshake` server random.
+	/// - HPKE tampers the `ServerHandshake` server random.
 	/// - CMS tampers the first byte of the content the `ServerFinished` signs,
 	///   which sits in the domain label ahead of the transcript hash.
 	pub fn tamper_server_message(self, payload: impl AsRef<[u8]>) -> Result<Vec<u8>, TightBeamError> {
 		let payload = payload.as_ref();
 		match self {
-			Self::Ecies => {
+			Self::Hpke => {
 				let mut message = tunneled_handshake(Container::Signed.message(payload)?);
 				let server_random = flip_first_byte(message.server_random.as_bytes())?;
 				message.server_random = OctetString::new(server_random)?;
@@ -397,15 +395,14 @@ impl Default for SecurityThreatHarness {
 impl SecurityThreatHarness {
 	/// Hidden CSP event: a handshake session is about to be constructed.
 	pub const HARNESS_SPAWN_SESSION: Urn<'static> = tightbeam::urn!("test", "event:security-harness/spawn-session");
-	/// Hidden CSP event: the ECIES backend is selected for the session.
-	pub const HARNESS_SPAWN_ECIES: Urn<'static> = tightbeam::urn!("test", "event:security-harness/spawn-ecies");
+	/// Hidden CSP event: the HPKE backend is selected for the session.
+	pub const HARNESS_SPAWN_HPKE: Urn<'static> = tightbeam::urn!("test", "event:security-harness/spawn-hpke");
 	/// Hidden CSP event: the CMS backend is selected for the session.
 	pub const HARNESS_SPAWN_CMS: Urn<'static> = tightbeam::urn!("test", "event:security-harness/spawn-cms");
 	/// Hidden CSP event: the weak-cipher spawn path is entered.
 	pub const HARNESS_SPAWN_WEAK: Urn<'static> = tightbeam::urn!("test", "event:security-harness/spawn-weak");
-	/// Hidden CSP event: the weak ECIES backend is selected.
-	pub const HARNESS_SPAWN_ECIES_WEAK: Urn<'static> =
-		tightbeam::urn!("test", "event:security-harness/spawn-ecies-weak");
+	/// Hidden CSP event: the weak HPKE backend is selected.
+	pub const HARNESS_SPAWN_HPKE_WEAK: Urn<'static> = tightbeam::urn!("test", "event:security-harness/spawn-hpke-weak");
 	/// Hidden CSP event: the weak CMS backend is selected.
 	pub const HARNESS_SPAWN_CMS_WEAK: Urn<'static> = tightbeam::urn!("test", "event:security-harness/spawn-cms-weak");
 
@@ -453,9 +450,9 @@ impl SecurityThreatHarness {
 		self.emit(Self::HARNESS_SPAWN_SESSION).ok();
 
 		match kind {
-			HandshakeBackendKind::Ecies => {
-				self.emit(Self::HARNESS_SPAWN_ECIES).ok();
-				Box::new(Session::<Ecies, DefaultCryptoProvider>::with_profiles(
+			HandshakeBackendKind::Hpke => {
+				self.emit(Self::HARNESS_SPAWN_HPKE).ok();
+				Box::new(Session::<Hpke, DefaultCryptoProvider>::with_profiles(
 					&self.materials,
 					client_profiles,
 					server_profiles,
@@ -483,12 +480,12 @@ impl SecurityThreatHarness {
 	pub fn spawn_weak(&self, kind: HandshakeBackendKind) -> Box<dyn HandshakeProtocol> {
 		self.emit(Self::HARNESS_SPAWN_WEAK).ok();
 		match kind {
-			HandshakeBackendKind::Ecies => {
-				self.emit(Self::HARNESS_SPAWN_ECIES_WEAK).ok();
+			HandshakeBackendKind::Hpke => {
+				self.emit(Self::HARNESS_SPAWN_HPKE_WEAK).ok();
 				// The session is deliberately weak. It opts out of the default
 				// strength floor, so the downgrade harness can capture AES-128
 				// wire bytes.
-				Box::new(Session::<Ecies, Aes128CryptoProvider>::with_profiles(
+				Box::new(Session::<Hpke, Aes128CryptoProvider>::with_profiles(
 					&self.materials,
 					vec![weak_security_profile()],
 					vec![weak_security_profile()],
@@ -541,7 +538,7 @@ pub fn tamper_payload_truncate(payload: impl AsRef<[u8]>, keep_bytes: usize) -> 
 	payload.iter().take(keep_bytes).copied().collect()
 }
 
-/// The result of an attempt to decrypt an ECIES payload.
+/// The result of an attempt to decrypt an HPKE payload.
 #[derive(Debug)]
 pub enum DecryptionResult {
 	/// Decryption succeeded. `plaintext_len` is the length of the recovered
@@ -551,39 +548,55 @@ pub enum DecryptionResult {
 	Failed,
 }
 
-/// Return the encrypted ECIES blob from the DER of a captured ECIES closing,
+/// Return the encrypted HPKE blob from the DER of a captured HPKE closing,
 /// which carries the `ClientKeyExchange`.
-pub fn extract_ecies_ciphertext(closing_der: impl AsRef<[u8]>) -> Result<Vec<u8>, TightBeamError> {
+pub fn extract_hpke_ciphertext(closing_der: impl AsRef<[u8]>) -> Result<Vec<u8>, TightBeamError> {
 	let closing = Container::Enveloped.message(closing_der.as_ref())?;
 	let client_kex = carried_key_exchange(closing);
 	Ok(client_kex.encrypted_data.as_bytes().to_vec())
 }
 
-/// Extract the ephemeral public key from an ECIES ciphertext.
+/// The HPKE suite of the default provider, which seals the key exchange.
+type Suite = HpkeSecp256k1Sha3Aes256Gcm;
+
+/// Extract the encapsulated key from a sealed HPKE message.
 ///
-/// The ephemeral public key is the first 33 bytes (compressed secp256k1
-/// point) of the raw ECIES blob, so the function returns those 33 bytes.
-pub fn extract_ephemeral_pubkey(ecies_ciphertext: impl AsRef<[u8]>) -> Result<Vec<u8>, TightBeamError> {
-	let ecies_ciphertext = ecies_ciphertext.as_ref();
-	// The ECIES message format is
-	// [ephemeral_pubkey (33 bytes) || nonce+ciphertext+tag].
-	const EPHEMERAL_PUBKEY_SIZE: usize = 33;
-
-	if ecies_ciphertext.len() < EPHEMERAL_PUBKEY_SIZE {
-		return Err(TightBeamError::TestingError(TestingError::InvalidFdrConfig(FdrConfigError {
-			field: "ephemeral_pubkey",
-			reason: "ECIES ciphertext too short",
-		})));
-	}
-
-	Ok(ecies_ciphertext[..EPHEMERAL_PUBKEY_SIZE].to_vec())
+/// The message leads with the encapsulated key, which is the ephemeral public
+/// key HPKE drew for this one message, as an uncompressed secp256k1 point.
+pub fn extract_ephemeral_pubkey(sealed: impl AsRef<[u8]>) -> Result<Vec<u8>, TightBeamError> {
+	let message = HpkeMessage::<Suite>::from_bytes(sealed)?;
+	let encapsulated = message.encapsulated_key().to_encoded_point(false);
+	Ok(encapsulated.as_bytes().to_vec())
 }
 
-/// The default domain tag an ECIES closing payload is sealed under. It is the
+/// The key-exchange payload as its DER carries it in a session with no
+/// receipt: the base secret, the client random, the client ephemeral, and the
+/// key-confirmation tag.
+#[derive(Sequence)]
+pub struct KeyExchangePayload {
+	pub base_key: OctetString,
+	pub client_random: OctetString,
+	pub client_ephemeral: OctetString,
+	pub key_confirmation: OctetString,
+}
+
+/// Open a sealed key exchange with the server's static key under `aad`, and
+/// decode the payload it carries.
+pub fn open_key_exchange(
+	sealed: impl AsRef<[u8]>,
+	secret_key: &k256::SecretKey,
+	aad: impl AsRef<[u8]>,
+) -> Result<KeyExchangePayload, TightBeamError> {
+	let message = HpkeMessage::<Suite>::from_bytes(sealed)?;
+	let opened = secret_key.open(&message, TIGHTBEAM_HPKE_HANDSHAKE_INFO, aad)?;
+	Ok(KeyExchangePayload::from_der(&opened.to_insecure())?)
+}
+
+/// The default domain tag an HPKE closing payload is sealed under. It is the
 /// whole associated data when the client presents no certificate.
 pub const HANDSHAKE_AAD: &[u8] = b"tb/aead/v1";
 
-/// Attempt to decrypt an ECIES ciphertext with the recipient's secret key.
+/// Attempt to open an HPKE message with the recipient's secret key.
 ///
 /// `aad` defaults to [`HANDSHAKE_AAD`] when it is `None`.
 ///
@@ -591,20 +604,19 @@ pub const HANDSHAKE_AAD: &[u8] = b"tb/aead/v1";
 ///
 /// - `DecryptionResult::Success` with the plaintext length when decryption worked.
 /// - `DecryptionResult::Failed` when decryption failed, for example on a wrong key or invalid data.
-pub fn try_decrypt_ecies(
+pub fn try_decrypt_hpke(
 	ciphertext: impl AsRef<[u8]>,
 	secret_key: &k256::SecretKey,
 	aad: Option<&[u8]>,
 ) -> DecryptionResult {
 	let ciphertext = ciphertext.as_ref();
-	let message = match Secp256k1EciesMessage::from_bytes(ciphertext) {
+	let message = match HpkeMessage::<Suite>::from_bytes(ciphertext) {
 		Ok(m) => m,
 		Err(_) => return DecryptionResult::Failed,
 	};
 
-	let aad = aad.or(Some(HANDSHAKE_AAD));
-
-	match ecies::decrypt::<_, _, HkdfSha3_256, Aes256Gcm>(secret_key, &message, aad) {
+	let aad = aad.unwrap_or(HANDSHAKE_AAD);
+	match secret_key.open(&message, TIGHTBEAM_HPKE_HANDSHAKE_INFO, aad) {
 		Ok(plaintext) => {
 			let plaintext_bytes = plaintext.to_insecure();
 			DecryptionResult::Success { plaintext_len: plaintext_bytes.len() }
@@ -618,8 +630,8 @@ pub fn generate_wrong_secret_key() -> k256::SecretKey {
 	k256::SecretKey::random(&mut rand_core::OsRng)
 }
 
-/// The three messages an ECIES handshake exchanges.
-const ECIES_FLOW: &[FlowStep] = &[
+/// The three messages an HPKE handshake exchanges.
+const HPKE_FLOW: &[FlowStep] = &[
 	FlowStep { index: 0, direction: Direction::ClientToServer, container: Container::Signed },
 	FlowStep { index: 1, direction: Direction::ServerToClient, container: Container::Signed },
 	FlowStep { index: 2, direction: Direction::ClientToServer, container: Container::Enveloped },
@@ -665,15 +677,15 @@ pub trait SessionFlow<P: HandshakeProvider> {
 	) -> Self::Server;
 }
 
-impl<P: HandshakeProvider> SessionFlow<P> for Ecies {
-	type Client = Handshake<Client, Ecies, P>;
-	type Server = Handshake<Server, Ecies, P>;
+impl<P: HandshakeProvider> SessionFlow<P> for Hpke {
+	type Client = Handshake<Client, Hpke, P>;
+	type Server = Handshake<Server, Hpke, P>;
 
-	const BACKEND: HandshakeBackendKind = HandshakeBackendKind::Ecies;
-	const STEPS: &'static [FlowStep] = ECIES_FLOW;
+	const BACKEND: HandshakeBackendKind = HandshakeBackendKind::Hpke;
+	const STEPS: &'static [FlowStep] = HPKE_FLOW;
 
 	fn client(materials: &ServerMaterials, offer: SecurityOffer, policy: ProfilePolicy<P>) -> Self::Client {
-		let mut config = ecies_client_config(pinning_validator(&materials.certificate));
+		let mut config = hpke_client_config(pinning_validator(&materials.certificate));
 		config.security_offer = Some(offer);
 		config.profiles = policy;
 		Handshake::client(config)
@@ -684,7 +696,7 @@ impl<P: HandshakeProvider> SessionFlow<P> for Ecies {
 		profiles: Vec<SecurityProfileDesc>,
 		policy: ProfilePolicy<P>,
 	) -> Self::Server {
-		let mut config = ecies_server_config(materials, profiles);
+		let mut config = hpke_server_config(materials, profiles);
 		config.policy = policy;
 		Handshake::server(config)
 	}

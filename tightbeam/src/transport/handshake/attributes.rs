@@ -10,19 +10,20 @@ use super::HandshakeError;
 use crate::crypto::x509::attr::{Attribute, Attributes};
 use crate::der::asn1::{Any, ObjectIdentifier, SetOfVec};
 use crate::der::{Sequence, Tagged};
+use crate::oids::CLIENT_CERTIFICATE;
+use crate::x509::Certificate;
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use super::HandshakeAlert;
 #[cfg(feature = "transport-cms")]
 use crate::cms::enveloped_data::OriginatorPublicKey;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::cms::signed_data::SignedData;
 #[cfg(feature = "transport-cms")]
 use crate::der::asn1::OctetString;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::der::asn1::UintRef;
-use crate::oids::CLIENT_CERTIFICATE;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::oids::HANDSHAKE_ABORT_ALERT;
 #[cfg(feature = "transport-cms")]
 use crate::oids::{
@@ -33,7 +34,6 @@ use crate::oids::{
 use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer, TransportAccept, TransportOffer};
 #[cfg(feature = "transport-cms")]
 use crate::transport::handshake::schedule::KeyConfirmation;
-use crate::x509::Certificate;
 
 /// A CMS attribute that carries one value, as the handshake profile requires.
 ///
@@ -126,7 +126,7 @@ pub trait AttributePayload {
 }
 
 /// The client certificate a key exchange carries under mutual
-/// authentication, on the CMS and the ECIES path alike.
+/// authentication, on the CMS and the HPKE path alike.
 impl AttributePayload for Certificate {
 	const OID: ObjectIdentifier = CLIENT_CERTIFICATE;
 }
@@ -250,7 +250,7 @@ impl HandshakeAttribute {
 }
 
 /// Decode a one- or two-byte unsigned INTEGER from an `Any`.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 fn u16_from_any(any: &Any) -> Result<u16, HandshakeError> {
 	let uint_ref: UintRef = any.decode_as().map_err(|_| HandshakeError::InvalidIntegerEncoding)?;
 	let b = uint_ref.as_bytes();
@@ -268,7 +268,7 @@ fn u16_from_any(any: &Any) -> Result<u16, HandshakeError> {
 ///
 /// Alert codes occupy the u8 domain. A wider value is refused, so a two-byte
 /// code can never alias a valid alert through truncation.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 fn alert_from_any(any: &Any) -> Result<HandshakeAlert, HandshakeError> {
 	let code = u16_from_any(any)?;
 	if code > u8::MAX as u16 {
@@ -290,7 +290,7 @@ pub trait HandshakeAttributes {
 	/// Finds at most one unsigned attribute with `oid`, rejecting duplicates.
 	///
 	/// On a `SignedData` the search spans the SignerInfos of a parsed
-	/// Finished message or of an ECIES tunnel.
+	/// Finished message or of an HPKE tunnel.
 	///
 	/// # Duplicates
 	///
@@ -321,7 +321,7 @@ pub trait HandshakeAttributes {
 	/// - [`HandshakeError::InvalidIntegerEncoding`] -- the alert code is not an INTEGER.
 	/// - [`HandshakeError::IntegerOutOfRange`] -- the alert code is above `u8::MAX`.
 	/// - [`HandshakeError::UnknownAlertCode`] -- the code names no alert.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	fn refuse_alert(&self) -> Result<(), HandshakeError> {
 		let Some(alert) = self.find_unsigned_attr(HANDSHAKE_ABORT_ALERT)? else {
 			return Ok(());
@@ -347,7 +347,7 @@ impl HandshakeAttributes for Attributes {
 	}
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl HandshakeAttributes for SignedData {
 	fn find_unsigned_attr(&self, oid: ObjectIdentifier) -> Result<Option<HandshakeAttribute>, HandshakeError> {
 		let mut found = None;
@@ -373,7 +373,7 @@ impl HandshakeAttributes for SignedData {
 }
 
 /// Handshake alert decoding on a [`HandshakeAttribute`].
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub trait HandshakeAlertAttribute {
 	/// Returns the alert code this attribute carries.
 	///
@@ -388,7 +388,7 @@ pub trait HandshakeAlertAttribute {
 	fn handshake_alert(&self) -> Result<HandshakeAlert, HandshakeError>;
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl HandshakeAlertAttribute for HandshakeAttribute {
 	fn handshake_alert(&self) -> Result<HandshakeAlert, HandshakeError> {
 		alert_from_any(self.value()?)

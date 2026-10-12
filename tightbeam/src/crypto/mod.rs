@@ -34,10 +34,10 @@ pub mod secret;
 pub mod aead;
 #[cfg(feature = "digest")]
 pub mod commitment;
-#[cfg(feature = "ecies")]
-pub mod ecies;
 #[cfg(any(feature = "digest", feature = "sha3"))]
 pub mod hash;
+#[cfg(feature = "hpke")]
+pub mod hpke;
 #[cfg(feature = "kdf")]
 pub mod kdf;
 #[cfg(feature = "signature")]

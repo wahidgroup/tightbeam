@@ -1,6 +1,6 @@
 //! Loopback end-to-end tests for handshake orchestrators.
 //!
-//! The tests drive the ECIES and CMS client and server orchestrators against
+//! The tests drive the HPKE and CMS client and server orchestrators against
 //! each other entirely through the `ClientHandshakeProtocol` and
 //! `ServerHandshakeProtocol` trait surface (the same surface `io.rs`
 //! consumes) and verify:
@@ -27,7 +27,7 @@ use tightbeam::{
 	TightBeamError,
 };
 
-#[cfg(feature = "transport-ecies")]
+#[cfg(feature = "transport-hpke")]
 use tightbeam::transport::handshake::negotiation::SecurityOffer;
 #[cfg(feature = "transport-cms")]
 use tightbeam::transport::handshake::{Client, Cms, PeerAuthentication, Server};
@@ -36,8 +36,8 @@ use crate::common::security::{default_security_profile, expectation_failure, Ser
 
 #[cfg(feature = "transport-cms")]
 use crate::common::security::cms_handshake_pair;
-#[cfg(feature = "transport-ecies")]
-use crate::common::security::{ecies_client_config, ecies_server_config, pinning_validator};
+#[cfg(feature = "transport-hpke")]
+use crate::common::security::{hpke_client_config, hpke_server_config, pinning_validator};
 
 pub(crate) const LOOPBACK_CMS_COMPLETE: Urn<'static> = tightbeam::urn!("test", "event:loopback/loopback-cms-complete");
 pub(crate) const LOOPBACK_CMS_PROFILE_AGREED: Urn<'static> =
@@ -46,27 +46,27 @@ pub(crate) const LOOPBACK_CMS_ROUNDTRIP: Urn<'static> =
 	tightbeam::urn!("test", "event:loopback/loopback-cms-roundtrip");
 pub(crate) const LOOPBACK_CMS_UNIQUE_KEYS: Urn<'static> =
 	tightbeam::urn!("test", "event:loopback/loopback-cms-unique-keys");
-pub(crate) const LOOPBACK_ECIES_COMPLETE: Urn<'static> =
-	tightbeam::urn!("test", "event:loopback/loopback-ecies-complete");
-pub(crate) const LOOPBACK_ECIES_PROFILE_AGREED: Urn<'static> =
-	tightbeam::urn!("test", "event:loopback/loopback-ecies-profile-agreed");
-pub(crate) const LOOPBACK_ECIES_ROUNDTRIP: Urn<'static> =
-	tightbeam::urn!("test", "event:loopback/loopback-ecies-roundtrip");
+pub(crate) const LOOPBACK_HPKE_COMPLETE: Urn<'static> =
+	tightbeam::urn!("test", "event:loopback/loopback-hpke-complete");
+pub(crate) const LOOPBACK_HPKE_PROFILE_AGREED: Urn<'static> =
+	tightbeam::urn!("test", "event:loopback/loopback-hpke-profile-agreed");
+pub(crate) const LOOPBACK_HPKE_ROUNDTRIP: Urn<'static> =
+	tightbeam::urn!("test", "event:loopback/loopback-hpke-roundtrip");
 
 /// The number of CMS loopback passes, which is 0 with the feature disabled.
 const CMS_RUNS: u32 = cfg!(feature = "transport-cms") as u32;
 
-/// The number of ECIES loopback passes, which is 0 with the feature disabled.
-const ECIES_RUNS: u32 = cfg!(feature = "transport-ecies") as u32;
+/// The number of HPKE loopback passes, which is 0 with the feature disabled.
+const HPKE_RUNS: u32 = cfg!(feature = "transport-hpke") as u32;
 
 tb_assert_spec! {
 	pub HandshakeLoopbackSpec,
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(LOOPBACK_ECIES_COMPLETE, exactly!(ECIES_RUNS), equals!(true)),
-			(LOOPBACK_ECIES_ROUNDTRIP, exactly!(ECIES_RUNS), equals!(true)),
-			(LOOPBACK_ECIES_PROFILE_AGREED, exactly!(ECIES_RUNS), equals!(true)),
+			(LOOPBACK_HPKE_COMPLETE, exactly!(HPKE_RUNS), equals!(true)),
+			(LOOPBACK_HPKE_ROUNDTRIP, exactly!(HPKE_RUNS), equals!(true)),
+			(LOOPBACK_HPKE_PROFILE_AGREED, exactly!(HPKE_RUNS), equals!(true)),
 			(LOOPBACK_CMS_COMPLETE, exactly!(CMS_RUNS), equals!(true)),
 			(LOOPBACK_CMS_ROUNDTRIP, exactly!(CMS_RUNS), equals!(true)),
 			(LOOPBACK_CMS_PROFILE_AGREED, exactly!(CMS_RUNS), equals!(true)),
@@ -82,8 +82,8 @@ tb_scenario! {
 		exec: |SetupEnv { trace, .. }| async move {
 			let materials = ServerMaterials::generate();
 
-			#[cfg(feature = "transport-ecies")]
-			ecies_loopback(&trace, &materials).await?;
+			#[cfg(feature = "transport-hpke")]
+			hpke_loopback(&trace, &materials).await?;
 
 			#[cfg(feature = "transport-cms")]
 			{
@@ -96,7 +96,7 @@ tb_scenario! {
 	}
 }
 
-#[cfg(feature = "transport-ecies")]
+#[cfg(feature = "transport-hpke")]
 fn security_offer(profile: SecurityProfileDesc) -> SecurityOffer {
 	SecurityOffer::new(vec![profile])
 }
@@ -177,33 +177,33 @@ fn require_terminal(reply: Option<HandshakeMessage>, msg: &'static str) -> Resul
 	Ok(())
 }
 
-/// ECIES loopback through the orchestrator trait surface.
-#[cfg(feature = "transport-ecies")]
-async fn ecies_loopback(trace: &TraceCollector, materials: &ServerMaterials) -> Result<(), TightBeamError> {
+/// HPKE loopback through the orchestrator trait surface.
+#[cfg(feature = "transport-hpke")]
+async fn hpke_loopback(trace: &TraceCollector, materials: &ServerMaterials) -> Result<(), TightBeamError> {
 	let profile = default_security_profile();
 	let offer = security_offer(profile);
 	let validator = pinning_validator(&materials.certificate);
 
-	let mut config = ecies_client_config::<DefaultCryptoProvider>(validator);
+	let mut config = hpke_client_config::<DefaultCryptoProvider>(validator);
 	config.security_offer = Some(offer);
 
 	let mut client = Handshake::client(config);
-	let server_config = ecies_server_config::<DefaultCryptoProvider>(materials, [profile]);
+	let server_config = hpke_server_config::<DefaultCryptoProvider>(materials, [profile]);
 	let mut server = Handshake::server(server_config);
 
 	// The flow is ClientHello, then ServerHandshake, then ClientKeyExchange,
 	// which draws no reply.
 	let client_hello = ClientHandshakeProtocol::start(&mut client).await?;
 	let server_reply = server.handle_request(client_hello).await?;
-	let server_handshake = require_reply(server_reply, "ECIES server must answer ClientHello")?;
+	let server_handshake = require_reply(server_reply, "HPKE server must answer ClientHello")?;
 
 	let client_reply = client.handle_response(server_handshake).await?;
-	let client_kex = require_reply(client_reply, "ECIES client must answer ServerHandshake")?;
+	let client_kex = require_reply(client_reply, "HPKE client must answer ServerHandshake")?;
 
 	let no_reply = server.handle_request(client_kex).await?;
-	require_terminal(no_reply, "ECIES server must not reply to ClientKeyExchange")?;
+	require_terminal(no_reply, "HPKE server must not reply to ClientKeyExchange")?;
 
-	let events = (LOOPBACK_ECIES_COMPLETE, LOOPBACK_ECIES_ROUNDTRIP, LOOPBACK_ECIES_PROFILE_AGREED);
+	let events = (LOOPBACK_HPKE_COMPLETE, LOOPBACK_HPKE_ROUNDTRIP, LOOPBACK_HPKE_PROFILE_AGREED);
 	emit_session_ready(Box::new(client), Box::new(server), profile, trace, events).await
 }
 

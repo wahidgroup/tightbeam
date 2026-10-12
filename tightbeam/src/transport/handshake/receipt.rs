@@ -32,7 +32,7 @@
 //! - The client's answer is a bearer secret, such as a payment preimage or a
 //!   signed instrument. It goes inside the client's `SignerInfo`, which travels
 //!   to the server only sealed under the session's handshake secret, inside
-//!   the ECIES key-exchange payload or as the `RECEIPT_ACK` attribute of the
+//!   the HPKE key-exchange payload or as the `RECEIPT_ACK` attribute of the
 //!   CMS client Finished (see
 //!   [forward secrecy](crate::transport::handshake#forward-secrecy)). `Debug`
 //!   output redacts its bytes, so they cannot leak through logs.
@@ -55,25 +55,25 @@ use core::fmt;
 
 use crate::asn1::DigestInfo;
 use crate::cms::signed_data::SignedData;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-use crate::crypto::hash::ConstantTimeDigest;
 use crate::der::asn1::OctetString;
 use crate::der::Sequence;
 use crate::transport::handshake::negotiation::MuxBudgets;
 use crate::utils::marker::{MaybeSend, MaybeSendFuture, MaybeSync};
 use crate::Beamable;
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::crypto::hash::ConstantTimeDigest;
+
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 mod handshake {
+	#[cfg(not(feature = "std"))]
+	pub use alloc::vec;
 	#[cfg(not(feature = "std"))]
 	pub use alloc::vec::Vec;
 	#[cfg(feature = "std")]
-	pub use std::vec::Vec;
-
-	#[cfg(not(feature = "std"))]
-	pub use alloc::vec;
-	#[cfg(feature = "std")]
 	pub use std::vec;
+	#[cfg(feature = "std")]
+	pub use std::vec::Vec;
 
 	#[cfg(not(feature = "std"))]
 	pub use alloc::borrow::ToOwned;
@@ -99,19 +99,19 @@ mod handshake {
 	pub use x509_cert::attr::Attribute;
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use handshake::*;
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 mod owners;
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub(crate) use owners::{CountersignedReceipt, IssuedReceipt, PendingReceipt};
 
 use crate::transport::handshake::Arc;
 use crate::x509::Certificate;
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::negotiation::TransportAuthorizer;
 
 /// Session agreement body the server issues for every budget-bearing
@@ -147,7 +147,7 @@ pub struct SessionReceipt {
 /// Role a receipt `SignerInfo` holds, bound by the [`RECEIPT_ROLE`]
 /// signed attribute so one party's signature cannot be spliced into the
 /// other role (CWE-347).
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReceiptRole {
 	/// The issuing server, which signs the receipt body alone.
@@ -157,7 +157,7 @@ pub enum ReceiptRole {
 	Client,
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl ReceiptRole {
 	fn code(self) -> u8 {
 		match self {
@@ -167,7 +167,7 @@ impl ReceiptRole {
 	}
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl TryFrom<u8> for ReceiptRole {
 	type Error = HandshakeError;
 
@@ -181,7 +181,7 @@ impl TryFrom<u8> for ReceiptRole {
 }
 
 /// Digest algorithm identifier of `D` with absent parameters.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 fn digest_algorithm<D>() -> AlgorithmIdentifierOwned
 where
 	D: AssociatedOid,
@@ -191,7 +191,7 @@ where
 
 /// Wrap a computed transcript hash into the self-describing
 /// [`DigestInfo`] carried by [`SessionReceipt::transcript_hash`].
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 fn transcript_digest_info<D>(hash: [u8; 32]) -> Result<DigestInfo, HandshakeError>
 where
 	D: AssociatedOid,
@@ -203,7 +203,7 @@ where
 }
 
 /// An attribute under `oid` whose value SET holds `value` alone.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 fn single_valued(oid: ObjectIdentifier, value: Any) -> Result<Attribute, HandshakeError> {
 	let values = SetOfVec::try_from(vec![value])?;
 	let attribute = Attribute { oid, values };
@@ -216,7 +216,7 @@ fn single_valued(oid: ObjectIdentifier, value: Any) -> Result<Attribute, Handsha
 ///   §11](https://datatracker.ietf.org/doc/html/rfc5652#section-11).
 /// - The role tag.
 /// - The client's settlement answer, when present.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 fn receipt_signed_attrs<D>(
 	receipt_der: impl AsRef<[u8]>,
 	role: ReceiptRole,
@@ -249,7 +249,7 @@ where
 /// Prehash that a `SignerInfo` signature covers, which is the digest of the
 /// DER `SET OF` signed attributes per
 /// [RFC 5652 §5.4](https://datatracker.ietf.org/doc/html/rfc5652#section-5.4).
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 fn signed_attrs_prehash<D>(signed_attrs: &SignedAttributes) -> Result<[u8; 32], HandshakeError>
 where
 	D: Digest,
@@ -261,7 +261,7 @@ where
 
 /// Find at most one single-valued signed attribute, failing closed on
 /// duplicates or multi-valued attributes.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 fn find_signed_attr(attrs: &SignedAttributes, oid: ObjectIdentifier) -> Result<Option<&Any>, HandshakeError> {
 	let mut found = None;
 	for attribute in attrs.iter() {
@@ -280,7 +280,7 @@ fn find_signed_attr(attrs: &SignedAttributes, oid: ObjectIdentifier) -> Result<O
 
 /// Role declared by a `SignerInfo`'s signed attributes, `None` when the
 /// signer carries no role tag.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 fn signer_role(signer: &SignerInfo) -> Result<Option<ReceiptRole>, HandshakeError> {
 	let Some(attrs) = signer.signed_attrs.as_ref() else {
 		return Ok(None);
@@ -296,7 +296,7 @@ fn signer_role(signer: &SignerInfo) -> Result<Option<ReceiptRole>, HandshakeErro
 
 /// Settlement answer declared by a client `SignerInfo`, before
 /// normalization.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 fn signer_answer(signer: &SignerInfo) -> Result<Option<OctetString>, HandshakeError> {
 	let Some(attrs) = signer.signed_attrs.as_ref() else {
 		return Ok(None);
@@ -311,7 +311,7 @@ fn signer_answer(signer: &SignerInfo) -> Result<Option<OctetString>, HandshakeEr
 
 /// Sign the receipt body into a role-tagged `SignerInfo` with the
 /// standard signed attributes.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 async fn signer_info_over_receipt<D>(
 	receipt_der: impl AsRef<[u8]>,
 	role: ReceiptRole,
@@ -350,7 +350,7 @@ where
 /// carries each signer's digest algorithm twice, in the `digestAlgorithms`
 /// SET and inside the `SignerInfo`. The SET entry is built fresh from the
 /// compile-time OID.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 fn new_receipt_artifact<D>(
 	receipt_der: impl AsRef<[u8]>,
 	server_signer: SignerInfo,
@@ -399,7 +399,7 @@ pub struct StoredReceipt {
 	ancillary_response: Option<OctetString>,
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl TryFrom<SignedData> for StoredReceipt {
 	type Error = HandshakeError;
 
@@ -447,7 +447,7 @@ impl StoredReceipt {
 	}
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl StoredReceipt {
 	/// DER encoding of the artifact for persistence.
 	pub fn to_der(&self) -> Result<Vec<u8>, HandshakeError> {
@@ -670,7 +670,7 @@ pub trait SessionObserver: MaybeSend + MaybeSync {
 /// through this function, at approval and at recovery from a received
 /// `SignerInfo`. Without it, the two endpoints of one exchange could retain
 /// diverging receipts for the same signature.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 fn normalize_answer<T>(answer: Option<T>) -> Option<T>
 where
 	T: AsRef<[u8]>,
@@ -678,7 +678,7 @@ where
 	answer.filter(|bytes| !bytes.as_ref().is_empty())
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl SessionOutcome {
 	/// Report this outcome to `observer`, then resolve its verdict.
 	///
@@ -711,7 +711,7 @@ impl SessionOutcome {
 	}
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl SessionReceipt {
 	/// Build the [`SessionReceipt`] body and the server-signed `SignedData`
 	/// artifact around it.
@@ -922,7 +922,7 @@ impl SessionReceipt {
 }
 
 /// Reads and edits on a CMS receipt artifact.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub(crate) trait ReceiptArtifact: Sized {
 	/// Complete a server-signed artifact with the client's `SignerInfo`.
 	///
@@ -947,7 +947,7 @@ pub(crate) trait ReceiptArtifact: Sized {
 	fn signer_for_role(&self, role: ReceiptRole) -> Result<Option<&SignerInfo>, HandshakeError>;
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl ReceiptArtifact for SignedData {
 	fn complete(mut self, countersignature: SignerInfo) -> Result<Self, HandshakeError> {
 		let digest_present = self.digest_algorithms.as_ref().contains(&countersignature.digest_alg);
@@ -998,7 +998,7 @@ impl ReceiptArtifact for SignedData {
 	}
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl SessionReceipt {
 	/// Verify the client's countersignature and settle into a terminal verdict.
 	///
@@ -1047,7 +1047,7 @@ impl SessionReceipt {
 }
 
 /// Signer identity derived from a certificate.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub(crate) trait ReceiptSigner {
 	/// SubjectKeyIdentifier-based [`SignerIdentifier`] for this certificate.
 	///
@@ -1057,7 +1057,7 @@ pub(crate) trait ReceiptSigner {
 	fn signer_identifier<D: Digest>(&self) -> Result<SignerIdentifier, HandshakeError>;
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl ReceiptSigner for Certificate {
 	fn signer_identifier<D: Digest>(&self) -> Result<SignerIdentifier, HandshakeError> {
 		let spki_der = self.tbs_certificate.subject_public_key_info.to_der()?;
@@ -1071,12 +1071,12 @@ mod tests {
 	use super::*;
 	use crate::der::{Decode, Encode, Error as DerError};
 
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	use crate::crypto::hash::Sha3_256;
 
-	#[cfg(all(not(feature = "std"), feature = "transport-ecies"))]
+	#[cfg(all(not(feature = "std"), feature = "transport-hpke"))]
 	use alloc::format;
-	#[cfg(all(feature = "std", feature = "transport-ecies"))]
+	#[cfg(all(feature = "std", feature = "transport-hpke"))]
 	use std::format;
 
 	const SAMPLE_TRANSCRIPT: [u8; 32] = [7u8; 32];
@@ -1129,7 +1129,7 @@ mod tests {
 		Ok(())
 	}
 
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	mod matching {
 		use super::*;
 
@@ -1189,7 +1189,7 @@ mod tests {
 		}
 	}
 
-	#[cfg(feature = "transport-ecies")]
+	#[cfg(feature = "transport-hpke")]
 	mod artifact {
 		use super::*;
 		use crate::crypto::key::Secp256k1KeyProvider;
@@ -1386,7 +1386,7 @@ mod tests {
 		}
 	}
 
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[test]
 	fn test_normalize_answer_maps_empty_to_absent() {
 		assert_eq!(normalize_answer(Some(b"".as_slice())), None);

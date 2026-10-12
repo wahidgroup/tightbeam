@@ -19,7 +19,7 @@ pub use kdf::{kdf_chain, multi_input_kdf, KdfInfo, KdfSalt, KdfStage};
 pub use transcript::transcript_hash;
 
 #[cfg(any(
-	feature = "transport-ecies",
+	feature = "transport-hpke",
 	all(feature = "transport-multiplex", feature = "transport-cms")
 ))]
 pub(crate) use kdf::RandomsSalt;

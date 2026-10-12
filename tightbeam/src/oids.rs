@@ -10,7 +10,8 @@
 //!
 //! - `.1` holds the handshake and session attributes, which are the transport
 //!   handshake attribute OIDs of the FULL_CMS profile.
-//! - `.2` holds the algorithms, such as zstd.
+//! - `.1.100` is reserved, because published releases gave it to another key exchange profile.
+//! - `.2` holds the algorithms, such as zstd and the HPKE suite.
 
 use crate::der::asn1::ObjectIdentifier;
 
@@ -70,6 +71,18 @@ pub const COMPRESSION_ZLIB: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2
 /// - RFC 8878, Zstandard Compression and the `application/zstd` Media Type:
 ///   <https://datatracker.ietf.org/doc/html/rfc8878>
 pub const COMPRESSION_ZSTD: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.2.1");
+
+/// HPKE in base mode under DHKEM(secp256k1, HKDF-SHA3-256), HKDF-SHA3-256, and
+/// AES-256-GCM.
+///
+/// RFC 9180 names a suite by three registry numbers and assigns no OID, and no
+/// CMS profile of HPKE assigns one. This OID is therefore assigned under Wahid
+/// Group, LLC IANA PEN 64586, in the algorithms arc `.2`.
+///
+/// # Sources
+///
+/// - RFC 9180, Hybrid Public Key Encryption: <https://datatracker.ietf.org/doc/html/rfc9180>
+pub const HPKE_SECP256K1_SHA3_256_AES_256_GCM: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.2.2");
 
 /// The SHA-256 hash algorithm (`sha-256`).
 ///
@@ -252,9 +265,9 @@ pub const HANDSHAKE_SECURITY_OFFER: ObjectIdentifier = ObjectIdentifier::new_unw
 /// The handshake attribute that carries the security accept.
 pub const HANDSHAKE_SECURITY_ACCEPT: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.12");
 
-/// The composite profile of ECIES over secp256k1, HKDF with SHA3-256, and
+/// The composite profile of HPKE over secp256k1, HKDF with SHA3-256, and
 /// AES-256-GCM.
-pub const HANDSHAKE_PROFILE_ECIES_GCM: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.100");
+pub const HANDSHAKE_PROFILE_HPKE_GCM: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.101");
 
 /// The handshake attribute that carries the client certificate.
 pub const CLIENT_CERTIFICATE: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.13");
@@ -336,6 +349,7 @@ mod tests {
 			(COMPRESSION_CONTENT, "1.2.840.113549.1.9.16.1.9"),
 			(COMPRESSION_ZLIB, "1.2.840.113549.1.9.16.3.8"),
 			(COMPRESSION_ZSTD, "1.3.6.1.4.1.64586.2.1"),
+			(HPKE_SECP256K1_SHA3_256_AES_256_GCM, "1.3.6.1.4.1.64586.2.2"),
 			(HASH_SHA256, "2.16.840.1.101.3.4.2.1"),
 			(HASH_SHA3_256, "2.16.840.1.101.3.4.2.8"),
 			(HASH_SHA3_384, "2.16.840.1.101.3.4.2.9"),
@@ -366,7 +380,7 @@ mod tests {
 			(HANDSHAKE_SELECTED_CURVE, "1.3.6.1.4.1.64586.1.10"),
 			(HANDSHAKE_SECURITY_OFFER, "1.3.6.1.4.1.64586.1.11"),
 			(HANDSHAKE_SECURITY_ACCEPT, "1.3.6.1.4.1.64586.1.12"),
-			(HANDSHAKE_PROFILE_ECIES_GCM, "1.3.6.1.4.1.64586.1.100"),
+			(HANDSHAKE_PROFILE_HPKE_GCM, "1.3.6.1.4.1.64586.1.101"),
 			(CLIENT_CERTIFICATE, "1.3.6.1.4.1.64586.1.13"),
 			(CLIENT_SIGNATURE, "1.3.6.1.4.1.64586.1.14"),
 			(HANDSHAKE_TRANSPORT_OFFER, "1.3.6.1.4.1.64586.1.15"),
