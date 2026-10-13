@@ -20,7 +20,7 @@ TightBeam ships two handshake backends.
 
 | Backend | Messages                                              | The client's first message                                                   |
 | ------- | ----------------------------------------------------- | ---------------------------------------------------------------------------- |
-| ECIES   | Its own message types, tunneled inside CMS containers | `ClientHello`                                                                |
+| HPKE    | Its own message types, tunneled inside CMS containers | `ClientHello`                                                                |
 | CMS     | CMS containers, exchanged directly                    | The key exchange, with the base secret encrypted to the server's certificate |
 
 In both, the session keys derive from the base secret and an ephemeral-ephemeral ECDH. See [Key schedule](#key-schedule).
@@ -29,9 +29,9 @@ Both backends meet the transport at one interface, so the driver moves a handsha
 
 ```rust
 pub enum HandshakeMessage {
-    /// Carries an ECIES `ClientHello` or `ServerHandshake`, or a CMS Finished.
+    /// Carries an HPKE `ClientHello` or `ServerHandshake`, or a CMS Finished.
     SignedData(Box<WireDer<SignedData>>),
-    /// Carries an ECIES `ClientKeyExchange`, or a CMS key exchange.
+    /// Carries an HPKE `ClientKeyExchange`, or a CMS key exchange.
     EnvelopedData(Box<WireDer<EnvelopedData>>),
 }
 ```
@@ -95,7 +95,7 @@ A move the table does not name leaves the session where it was. `begin_handshake
 
 ## Message flow
 
-ECIES exchanges three messages. The last one seals the base secret to the server's certificate.
+HPKE exchanges three messages. The last one seals the base secret to the server's certificate.
 
 ```mermaid
 sequenceDiagram
@@ -105,7 +105,7 @@ sequenceDiagram
     Note over S: validates the offer, negotiates a profile, draws an ephemeral
     S->>C: ServerHandshake (SignedData, signed transcript carries the server ephemeral)
     Note over C: validates the certificate, verifies the signature, parses the server ephemeral
-    C->>S: ClientKeyExchange (EnvelopedData, base secret and key-confirmation tag sealed under the client ephemeral)
+    C->>S: ClientKeyExchange (EnvelopedData, base secret, client ephemeral and key-confirmation tag sealed to the server's static key with HPKE)
     Note over C,S: both derive the handshake secret from the base secret and the ephemeral-ephemeral ECDH
     Note over S: verifies the key-confirmation tag, then settles the receipt countersignature
 ```
@@ -143,7 +143,7 @@ One type, `Handshake<R, F, P>`, runs both roles over both protocols.
 | Parameter | Values                | What it fixes                                                     |
 | --------- | --------------------- | ----------------------------------------------------------------- |
 | `R`       | `Client`, `Server`    | The step order and every negotiation and admission decision       |
-| `F`       | `Ecies`, `Cms`        | The messages of the protocol and the checks those messages define |
+| `F`       | `Hpke`, `Cms`         | The messages of the protocol and the checks those messages define |
 | `P`       | A `HandshakeProvider` | The algorithms                                                    |
 
 Each role runs three steps.
@@ -165,11 +165,11 @@ server.finish(closing).await?;
 
 The type of each configuration requires what its role cannot run without.
 
-| Configuration            | What its type requires                                                                             |
-| ------------------------ | -------------------------------------------------------------------------------------------------- |
-| `ClientConfig<Ecies, P>` | A validator for the certificate the server names (`LearnedTrust`)                                  |
-| `ClientConfig<Cms, P>`   | The provisioned server identity beside its trust store (`ProvisionedTrust`), and a client identity |
-| `ServerConfig<F, P>`     | A key provider, and a profile list that is never empty (`SupportedProfiles`)                       |
+| Configuration           | What its type requires                                                                             |
+| ----------------------- | -------------------------------------------------------------------------------------------------- |
+| `ClientConfig<Hpke, P>` | A validator for the certificate the server names (`LearnedTrust`)                                  |
+| `ClientConfig<Cms, P>`  | The provisioned server identity beside its trust store (`ProvisionedTrust`), and a client identity |
+| `ServerConfig<F, P>`    | A key provider, and a profile list that is never empty (`SupportedProfiles`)                       |
 
 ### Phases
 
@@ -296,7 +296,7 @@ let client = ClientBuilder::<TokioListener>::builder()
 
 A server admits its client through one rule in both protocols, and `PeerAuthentication::admit` is its one home. A certificate travels with the proof that the client holds its key:
 
-- ECIES carries the proof as the possession signature of the key exchange.
+- HPKE carries the proof as the possession signature of the key exchange.
 - CMS carries it as the signature of the client Finished.
 
 | Client offers             | Anonymous server                       | Mutual server                                            |
@@ -321,22 +321,22 @@ k_ack   = HKDF(hs, S, "tb/session/kdf/ack/v1")
 confirm = HKDF(hs, S, "tb/session/kdf/confirm/v1" || transcript_hash)
 ```
 
-| Input      | What it is                                                                          |
-| ---------- | ----------------------------------------------------------------------------------- |
-| `base`     | The 32-byte base secret the client seals to the server's static key                 |
-| `ee`       | The ECDH output of the client's ephemeral and the server's ephemeral                |
-| `S`        | The salt: `client_random \|\| server_random` for ECIES, the transcript hash for CMS |
-| `u32be(n)` | The 4-byte big-endian length of the input that follows it                           |
+| Input      | What it is                                                                         |
+| ---------- | ---------------------------------------------------------------------------------- |
+| `base`     | The 32-byte base secret the client seals to the server's static key                |
+| `ee`       | The ECDH output of the client's ephemeral and the server's ephemeral               |
+| `S`        | The salt: `client_random \|\| server_random` for HPKE, the transcript hash for CMS |
+| `u32be(n)` | The 4-byte big-endian length of the input that follows it                          |
 
 ### Ephemeral keys
 
-The client reuses the ephemeral it already sends. The server draws a fresh one, `E`, for each handshake and carries it inside the transcript it signs.
+The server draws a fresh ephemeral, `E`, for each handshake and carries it inside the transcript it signs. An HPKE client draws `R` for this agreement alone, because RFC 9180 § 9.2.3 keeps the key HPKE seals under out of every other use. A CMS client reuses the ephemeral it already sends.
 
-| Step                          | ECIES                                                                                        | CMS                               |
+| Step                          | HPKE                                                                                         | CMS                               |
 | ----------------------------- | -------------------------------------------------------------------------------------------- | --------------------------------- |
-| Client ephemeral              | `R`, at the head of the encrypted payload                                                    | `C`, the KARI originator key      |
+| Client ephemeral              | `R`, a field of the sealed payload                                                           | `C`, the KARI originator key      |
 | Client draws its private half | In `respond`, after the receipt is approved and countersigned, in a step that awaits nothing | In `start`, with the key exchange |
-| Client drops its private half | In `respond`, once it sealed the closing                                                     | In `respond`, at the agreement    |
+| Client drops its private half | In `respond`, at the agreement                                                               | In `respond`, at the agreement    |
 | Server drops its private half | In `finish`, which takes it on every outcome                                                 | In `reply`, where it is a local   |
 
 Every received ephemeral is checked before any scalar multiplication runs on it:
@@ -348,12 +348,12 @@ Every received ephemeral is checked before any scalar multiplication runs on it:
 
 An observer who records a session and later obtains the server's static key recovers the base secret and nothing below it.
 
-| Value                       | Observer with the static key | Reason                                                             |
-| --------------------------- | ---------------------------- | ------------------------------------------------------------------ |
-| `base`                      | Recovers                     | The static key opens the ECIES payload or unwraps the KARI content |
-| `S`                         | Recovers                     | Public in the handshake messages                                   |
-| `ee`                        | Does not recover             | Needs `r` or `e` (ECIES), `c` or `e` (CMS), none of them kept      |
-| `hs` and every key below it | Does not recover             | One input unknown                                                  |
+| Value                       | Observer with the static key | Reason                                                            |
+| --------------------------- | ---------------------------- | ----------------------------------------------------------------- |
+| `base`                      | Recovers                     | The static key opens the HPKE payload or unwraps the KARI content |
+| `S`                         | Recovers                     | Public in the handshake messages                                  |
+| `ee`                        | Does not recover             | Needs `r` or `e` (HPKE), `c` or `e` (CMS), none of them kept      |
+| `hs` and every key below it | Does not recover             | One input unknown                                                 |
 
 The traffic keys, the sealed receipt acknowledgement, and every rekey epoch sit below `hs`, so the rekey chain inherits the property.
 
@@ -397,7 +397,7 @@ The client proves on the closing that it derived `hs`. It sends `confirm`, and t
 
 | Protocol | Where the tag travels                                                      | A closing with no tag fails with                     |
 | -------- | -------------------------------------------------------------------------- | ---------------------------------------------------- |
-| ECIES    | A field of the sealed payload                                              | `InvalidDecryptedPayloadSize`, at the payload decode |
+| HPKE     | A field of the sealed payload                                              | `InvalidDecryptedPayloadSize`, at the payload decode |
 | CMS      | An unsigned attribute of the client Finished, OID `1.3.6.1.4.1.64586.1.24` | `MissingAttribute`, where the Finished is read       |
 
 - A tag that differs is refused with `KeyConfirmationFailed`. The refusal runs ahead of settlement, so the authorizer's settlement and the session observer hear nothing of a client that holds another secret.
@@ -419,16 +419,16 @@ The receiver hashes the bytes that arrived, and not a re-encoding of what it dec
 | A container                      | `WireDer::der`                       |
 | An accept or ephemeral attribute | `HandshakeAttribute::received_bytes` |
 
-The ECIES transcript binds the `ClientHello` DER and the accept encodings the same way. It also binds the server's certificate demand as one byte between the two accepts, so a flipped `client_cert_required` fails the server signature.
+The HPKE transcript binds the `ClientHello` DER and the accept encodings the same way. It also binds the server's certificate demand as one byte between the two accepts, so a flipped `client_cert_required` fails the server signature.
 
 Both transcripts bind both ephemerals.
 
-| Ephemeral         | Bound by                                                                              | Tampering fails at                                                                  |
-| ----------------- | ------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
-| Server `E`, ECIES | A fixed-width leg of the signed transcript                                            | The server signature. One of another width fails `OctetStringLengthError` before it |
-| Server `E`, CMS   | The last `ServerFinishedLegs` entry before the transcript seals                       | The server signature. A removed one fails `MissingAttribute` before the seal        |
-| Client `R`, ECIES | The content key commits to `R`, and the client signature covers the encrypted payload | The payload open (`EciesError`)                                                     |
-| Client `C`, CMS   | The key exchange DER, with `C` inside it, is the first transcript leg                 | The key unwrap (`KeyError::WrapFailed`)                                             |
+| Ephemeral        | Bound by                                                                                                         | Tampering fails at                                                                                  |
+| ---------------- | ---------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| Server `E`, HPKE | A fixed-width leg of the signed transcript                                                                       | The server signature. One of another width fails `OctetStringLengthError` before it                 |
+| Server `E`, CMS  | The last `ServerFinishedLegs` entry before the transcript seals                                                  | The server signature. A removed one fails `MissingAttribute` before the seal                        |
+| Client `R`, HPKE | The sealed payload carries `R`, so the AEAD authenticates it, and the client signature covers the sealed payload | The payload open (`HpkeError`). A point off the curve fails `InvalidPublicKey` at the payload parse |
+| Client `C`, CMS  | The key exchange DER, with `C` inside it, is the first transcript leg                                            | The key unwrap (`KeyError::WrapFailed`)                                                             |
 
 A swapped server ephemeral fails the server signature before any key agreement runs.
 
@@ -461,6 +461,7 @@ An end of stream is named by the phase it interrupted.
 - RFC 5652, Cryptographic Message Syntax: <https://datatracker.ietf.org/doc/html/rfc5652>
 - RFC 5280, Internet X.509 Public Key Infrastructure Certificate and CRL Profile: <https://datatracker.ietf.org/doc/html/rfc5280>
 - RFC 5869, HMAC-based Extract-and-Expand Key Derivation Function (HKDF): <https://datatracker.ietf.org/doc/html/rfc5869>
+- RFC 9180, Hybrid Public Key Encryption, § 9.2.3 on reuse of the KEM randomness: <https://datatracker.ietf.org/doc/html/rfc9180#section-9.2.3>
 - RFC 5116, An Interface and Algorithms for Authenticated Encryption, § 3.2 on single-use keys: <https://datatracker.ietf.org/doc/html/rfc5116#section-3.2>
 - NIST SP 800-56A Rev. 3, Pair-Wise Key-Establishment Schemes Using Discrete Logarithm Cryptography, § 5.9 on key confirmation: <https://doi.org/10.6028/NIST.SP.800-56Ar3>
 - CWE-295, Improper Certificate Validation: <https://cwe.mitre.org/data/definitions/295.html>

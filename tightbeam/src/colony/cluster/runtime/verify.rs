@@ -409,7 +409,7 @@ mod tests {
 	use crate::crypto::key::Secp256k1KeyProvider;
 	use crate::crypto::policy::Secp256k1Policy;
 	use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
-	use crate::crypto::sign::{secp256k1_signer_identifier, sign_canonical, SignatureAlgorithmIdentifier};
+	use crate::crypto::sign::{CanonicalSigner, Signatory, SignatureAlgorithmIdentifier};
 	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, CertificateTrustStore, TrustBuilder};
 	use crate::crypto::x509::Certificate;
 	use crate::der::oid::AssociatedOid;
@@ -538,10 +538,10 @@ mod tests {
 			.expect("test frame builds");
 
 		let tbs = frame.to_tbs().expect("test frame encodes");
-		let signature: Secp256k1Signature = sign_canonical::<Sha3_256, _>(signer, &tbs).expect("test key signs");
+		let signature: Secp256k1Signature = signer.sign_canonical::<Sha3_256>(&tbs).expect("test key signs");
 		let sig_alg = AlgorithmIdentifierOwned { oid: Secp256k1Signature::ALGORITHM_OID, parameters: None };
 		let digest_alg = AlgorithmIdentifierOwned { oid: Sha3_256::OID, parameters: None };
-		let sid = secp256k1_signer_identifier(claimed.verifying_key()).expect("test key yields a signer id");
+		let sid = claimed.signer_identifier().expect("test key yields a signer id");
 
 		frame
 			.attach_signature(signature.to_bytes(), sig_alg, digest_alg, sid)

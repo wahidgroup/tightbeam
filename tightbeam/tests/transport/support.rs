@@ -1,7 +1,7 @@
 //! Shared helpers for the transport integration tests.
 
 #![cfg(all(
-	feature = "transport-ecies",
+	feature = "transport-hpke",
 	feature = "transport-policy",
 	feature = "tcp",
 	feature = "tokio",
@@ -231,7 +231,7 @@ pub async fn establish_mutual_transports(
 			transport = transport.with_trace(trace);
 		}
 
-		// ECIES is exactly two client messages: ClientHello, ClientKeyExchange.
+		// HPKE is exactly two client messages: ClientHello, ClientKeyExchange.
 		serve_one_handshake_message(&mut transport).await?;
 		serve_one_handshake_message(&mut transport).await?;
 		Ok::<_, TightBeamError>(transport)
@@ -276,9 +276,10 @@ pub async fn serve_one_handshake_message(transport: &mut TcpTransport<TokioStrea
 pub async fn accept_handshaken_split(listener: TokioListener) -> Result<SplitTransport<TokioStream>, TightBeamError> {
 	let (mut transport, _) = listener.accept().await?;
 
-	// ECIES is exactly two client messages: ClientHello, ClientKeyExchange.
+	// HPKE is exactly two client messages: ClientHello, ClientKeyExchange.
 	serve_one_handshake_message(&mut transport).await?;
 	serve_one_handshake_message(&mut transport).await?;
+
 	assert!(
 		matches!(transport.session_state().phase(), SessionPhase::Encrypted(_)),
 		"server handshake must complete after ClientKeyExchange"

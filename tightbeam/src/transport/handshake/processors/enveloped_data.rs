@@ -10,9 +10,10 @@ use alloc::boxed::Box;
 use crate::cms::enveloped_data::{EncryptedContentInfo, EnvelopedData, RecipientInfo};
 use crate::crypto::aead::{DecryptContent, Decryptor, KeyInit};
 use crate::crypto::common::{typenum::Unsigned, KeySizeUser};
-use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
+use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::crypto::secret::SecretSlice;
 use crate::transport::handshake::error::HandshakeError;
+use crate::transport::handshake::HandshakeProvider;
 
 /// Extracts the Content Encryption Key (CEK) from a RecipientInfo.
 ///
@@ -48,7 +49,7 @@ pub trait RecipientProcessor {
 /// trait for content decryption.
 pub struct TightBeamEnvelopedDataProcessor<P = DefaultCryptoProvider>
 where
-	P: CryptoProvider,
+	P: HandshakeProvider,
 {
 	/// Processor that extracts the CEK from a RecipientInfo.
 	recipient_processor: Box<dyn RecipientProcessor>,
@@ -62,8 +63,7 @@ where
 
 impl<P> TightBeamEnvelopedDataProcessor<P>
 where
-	P: CryptoProvider,
-	P::AeadCipher: KeyInit,
+	P: HandshakeProvider,
 {
 	/// Create a new EnvelopedData processor.
 	pub fn new<R>(recipient_processor: R) -> Self

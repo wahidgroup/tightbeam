@@ -11,23 +11,21 @@ use std::sync::Arc;
 
 use super::GenericClient;
 use crate::asn1::Frame;
-use crate::transport::error::TransportFailure;
-use crate::transport::{MessageCollector, Protocol, TransportResult};
-
-use crate::policy::{GatePolicy, SessionContext, TransitStatus};
-#[cfg(feature = "std")]
-use crate::transport::ConnectionBuilder;
-use crate::transport::MessageEmitter;
-
 use crate::crypto::x509::store::CertificateTrust;
+use crate::policy::{GatePolicy, SessionContext, TransitStatus};
+use crate::transport::error::TransportFailure;
 use crate::transport::handshake::HandshakeProtocolKind;
 use crate::transport::state::{DialableEncryption, EncryptionConfig};
 use crate::transport::EndpointConfig;
+use crate::transport::MessageEmitter;
+use crate::transport::{MessageCollector, Protocol, TransportResult};
 use crate::utils::time::Clock;
 use crate::x509::Certificate;
 
 #[cfg(feature = "std")]
 use crate::transport::state::ClientIdentity;
+#[cfg(feature = "std")]
+use crate::transport::ConnectionBuilder;
 #[cfg(host_clock)]
 use crate::utils::time::SystemClock;
 
@@ -196,10 +194,10 @@ impl<P: Protocol> ClientBuilder<P> {
 		self
 	}
 
-	/// Replace the domain-separation tag of the ECIES key exchange.
+	/// Replace the domain-separation tag of the HPKE key exchange.
 	///
-	/// The ECIES handshake binds this tag into the associated data of the
-	/// encrypted key exchange, so an ECIES session completes only when both
+	/// The HPKE handshake binds this tag into the associated data of the
+	/// encrypted key exchange, so an HPKE session completes only when both
 	/// endpoints hold the same tag. The CMS handshake and session records do
 	/// not read it.
 	pub fn with_aad_domain_tag(mut self, tag: &'static [u8]) -> Self {

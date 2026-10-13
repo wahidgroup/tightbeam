@@ -42,7 +42,7 @@ pub struct ServerMaterials {
 	pub certificate: Arc<Certificate>,
 	/// The provider of the server's static signing key.
 	pub key_provider: Arc<dyn SigningKeyProvider>,
-	/// The secret key a test decrypts an ECIES payload with. It sits in an
+	/// The secret key a test decrypts an HPKE payload with. It sits in an
 	/// `Arc`, so the bundle is `Clone` without copying secret material.
 	secret_key: Arc<k256::SecretKey>,
 }
@@ -60,7 +60,7 @@ impl ServerMaterials {
 		Self { certificate, key_provider: provider, secret_key: Arc::new(secret_key) }
 	}
 
-	/// The secret key, which a test uses to decrypt an ECIES payload.
+	/// The secret key, which a test uses to decrypt an HPKE payload.
 	pub fn secret_key(&self) -> &k256::SecretKey {
 		&self.secret_key
 	}
@@ -163,7 +163,7 @@ pub fn weak_security_profile() -> SecurityProfileDesc {
 /// The hooks and test doubles that the receipt and settlement threat scenarios
 /// share.
 #[cfg(all(
-	any(feature = "transport-cms", feature = "transport-ecies"),
+	any(feature = "transport-cms", feature = "transport-hpke"),
 	feature = "transport-multiplex"
 ))]
 mod receipt_fixtures {
@@ -311,16 +311,16 @@ mod receipt_fixtures {
 }
 
 #[cfg(all(
-	any(feature = "transport-cms", feature = "transport-ecies"),
+	any(feature = "transport-cms", feature = "transport-hpke"),
 	feature = "transport-multiplex"
 ))]
 pub use receipt_fixtures::*;
 
-/// Endpoint configurations and message conversions for a hand-driven ECIES
-/// handshake. Every step takes and returns the container that tunnels an ECIES
+/// Endpoint configurations and message conversions for a hand-driven HPKE
+/// handshake. Every step takes and returns the container that tunnels an HPKE
 /// message, so a scenario converts where it inspects or tampers with one.
-#[cfg(feature = "transport-ecies")]
-mod ecies_handshake {
+#[cfg(feature = "transport-hpke")]
+mod hpke_handshake {
 	use std::sync::Arc;
 
 	use tightbeam::cms::enveloped_data::EnvelopedData;
@@ -329,29 +329,29 @@ mod ecies_handshake {
 	use tightbeam::crypto::x509::policy::CertificateValidation;
 	use tightbeam::der::Encode;
 	use tightbeam::transport::handshake::{
-		ClientConfig, ClientHello, ClientKeyExchange, Ecies, EciesClientSettings, EciesServerSettings,
-		HandshakeMessage, HandshakeProvider, LearnedTrust, ServerConfig, ServerHandshake, SupportedProfiles,
+		ClientConfig, ClientHello, ClientKeyExchange, HandshakeMessage, HandshakeProvider, Hpke, HpkeClientSettings,
+		HpkeServerSettings, LearnedTrust, ServerConfig, ServerHandshake, SupportedProfiles,
 	};
 
 	use super::ServerMaterials;
 
-	/// The configuration of an anonymous ECIES client that admits its server
+	/// The configuration of an anonymous HPKE client that admits its server
 	/// through `validator`.
-	pub fn ecies_client_config<P: HandshakeProvider>(
+	pub fn hpke_client_config<P: HandshakeProvider>(
 		validator: Arc<dyn CertificateValidation>,
-	) -> ClientConfig<Ecies, P> {
+	) -> ClientConfig<Hpke, P> {
 		let trust = LearnedTrust::from(validator);
-		ClientConfig::new(EciesClientSettings::new(trust))
+		ClientConfig::new(HpkeClientSettings::new(trust))
 	}
 
-	/// The configuration of an ECIES server that presents the certificate of
+	/// The configuration of an HPKE server that presents the certificate of
 	/// `materials`, runs `profiles` in preference order, and demands no client
 	/// certificate.
-	pub fn ecies_server_config<P: HandshakeProvider>(
+	pub fn hpke_server_config<P: HandshakeProvider>(
 		materials: &ServerMaterials,
 		profiles: impl IntoIterator<Item = SecurityProfileDesc>,
-	) -> ServerConfig<Ecies, P> {
-		let settings = EciesServerSettings::new(Arc::clone(&materials.certificate));
+	) -> ServerConfig<Hpke, P> {
+		let settings = HpkeServerSettings::new(Arc::clone(&materials.certificate));
 		let key = Arc::clone(&materials.key_provider);
 		let profiles = SupportedProfiles::new(profiles).expect("a server fixture runs at least one profile");
 		ServerConfig::new(settings, key, profiles)
@@ -359,12 +359,12 @@ mod ecies_handshake {
 
 	/// The DER of the `ClientHello` that `opening` tunnels.
 	pub fn tunneled_hello(opening: HandshakeMessage) -> Vec<u8> {
-		let tunnel = opening.signed().expect("an ECIES opening travels in a SignedData");
+		let tunnel = opening.signed().expect("an HPKE opening travels in a SignedData");
 		let hello = ClientHello::try_from(tunnel.value()).expect("the opening tunnels a ClientHello");
 		hello.to_der().expect("a decoded ClientHello encodes")
 	}
 
-	/// `hello` as the opening an ECIES server reads.
+	/// `hello` as the opening an HPKE server reads.
 	pub fn tunneled_opening(hello: &ClientHello) -> HandshakeMessage {
 		let tunnel = SignedData::try_from(hello).expect("a ClientHello tunnels in a SignedData");
 		HandshakeMessage::try_from(tunnel).expect("the tunnel encodes")
@@ -372,11 +372,11 @@ mod ecies_handshake {
 
 	/// The `ServerHandshake` that `reply` tunnels.
 	pub fn tunneled_handshake(reply: HandshakeMessage) -> ServerHandshake {
-		let tunnel = reply.signed().expect("an ECIES reply travels in a SignedData");
+		let tunnel = reply.signed().expect("an HPKE reply travels in a SignedData");
 		ServerHandshake::try_from(tunnel.value()).expect("the reply tunnels a ServerHandshake")
 	}
 
-	/// `handshake` as the reply an ECIES client reads.
+	/// `handshake` as the reply an HPKE client reads.
 	pub fn tunneled_reply(handshake: &ServerHandshake) -> HandshakeMessage {
 		let tunnel = SignedData::try_from(handshake).expect("a ServerHandshake tunnels in a SignedData");
 		HandshakeMessage::try_from(tunnel).expect("the tunnel encodes")
@@ -384,11 +384,11 @@ mod ecies_handshake {
 
 	/// The `ClientKeyExchange` that `closing` carries.
 	pub fn carried_key_exchange(closing: HandshakeMessage) -> ClientKeyExchange {
-		let carrier = closing.enveloped().expect("an ECIES closing travels in an EnvelopedData");
+		let carrier = closing.enveloped().expect("an HPKE closing travels in an EnvelopedData");
 		ClientKeyExchange::try_from(carrier.value()).expect("the closing carries a ClientKeyExchange")
 	}
 
-	/// `key_exchange` as the closing an ECIES server reads.
+	/// `key_exchange` as the closing an HPKE server reads.
 	pub fn carried_closing(key_exchange: &ClientKeyExchange) -> HandshakeMessage {
 		let carrier = EnvelopedData::try_from(key_exchange).expect("a ClientKeyExchange travels in an EnvelopedData");
 		HandshakeMessage::try_from(carrier).expect("the carrier encodes")
@@ -398,8 +398,8 @@ mod ecies_handshake {
 // Consumers sit behind wider feature gates, so a narrow feature combination
 // compiles the helpers unused.
 #[allow(unused_imports)]
-#[cfg(feature = "transport-ecies")]
-pub use ecies_handshake::*;
+#[cfg(feature = "transport-hpke")]
+pub use hpke_handshake::*;
 
 /// The baseline CMS pair that the loopback, receipt, and security threat
 /// suites share. Each suite sets its own offers, hooks, or policies on the pair

@@ -2,10 +2,7 @@
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
-#[cfg(all(
-	not(feature = "std"),
-	any(feature = "transport-cms", feature = "transport-ecies")
-))]
+#[cfg(all(not(feature = "std"), any(feature = "transport-cms", feature = "transport-hpke")))]
 use alloc::boxed::Box;
 #[cfg(not(feature = "std"))]
 use alloc::sync::Arc;
@@ -18,22 +15,25 @@ use core::future::Future;
 use std::sync::Arc;
 
 use crate::asn1::Frame;
+use crate::crypto::aead::DecryptContent;
+use crate::crypto::aead::{RecvCipher, SendCipher};
 use crate::der::{Decode, Encode};
 use crate::encode;
 use crate::policy::TransitStatus;
+use crate::transport::builders::EnvelopeBuilder;
 use crate::transport::envelopes::{TransportEnvelope, WireEnvelope};
 use crate::transport::error::TransportError;
+use crate::transport::state::EncryptedProtocolState;
 use crate::transport::TransportResult;
 use crate::utils::marker::MaybeSend;
 use crate::utils::time::Clock;
 
-use crate::crypto::aead::{RecvCipher, SendCipher};
 #[cfg(host_clock)]
 use crate::utils::time::SystemClock;
 // Named only by `emit_handshake_outcome`, so this carries that method's gate.
 #[cfg(all(
 	feature = "instrument",
-	any(feature = "transport-cms", feature = "transport-ecies")
+	any(feature = "transport-cms", feature = "transport-hpke")
 ))]
 use crate::instrumentation::events;
 #[cfg(feature = "instrument")]
@@ -43,7 +43,7 @@ use crate::trace::TraceCollector;
 	feature = "tokio",
 	feature = "std",
 	not(target_arch = "wasm32"),
-	any(feature = "transport-cms", feature = "transport-ecies")
+	any(feature = "transport-cms", feature = "transport-hpke")
 ))]
 mod deadline {
 	pub use tokio::time::timeout;
@@ -53,18 +53,14 @@ mod deadline {
 	feature = "tokio",
 	feature = "std",
 	not(target_arch = "wasm32"),
-	any(feature = "transport-cms", feature = "transport-ecies")
+	any(feature = "transport-cms", feature = "transport-hpke")
 ))]
 use deadline::*;
 
-use crate::crypto::aead::DecryptContent;
-use crate::transport::builders::EnvelopeBuilder;
-use crate::transport::state::EncryptedProtocolState;
-
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::state::ServerHandshakeSlot;
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 mod handshake {
 	pub use crate::transport::error::TransportFailure;
 	pub use crate::transport::handshake::negotiation::RunnableProfile;
@@ -77,17 +73,17 @@ mod handshake {
 	pub use crate::transport::state::SessionPhase;
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use handshake::*;
 
-#[cfg(feature = "transport-ecies")]
-mod ecies {
+#[cfg(feature = "transport-hpke")]
+mod hpke {
 	pub use crate::crypto::x509::policy::CertificateValidation;
-	pub use crate::transport::handshake::{Ecies, EciesClientSettings, EciesServerSettings, LearnedTrust};
+	pub use crate::transport::handshake::{Hpke, HpkeClientSettings, HpkeServerSettings, LearnedTrust};
 }
 
-#[cfg(feature = "transport-ecies")]
-use ecies::*;
+#[cfg(feature = "transport-hpke")]
+use hpke::*;
 
 #[cfg(feature = "transport-cms")]
 mod cms {
@@ -298,7 +294,7 @@ pub trait MessageIO {
 }
 
 /// Outcome of one protocol-agnostic collector step.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub enum CollectStep {
 	/// The step read a cleartext handshake container for the server-side
 	/// dispatcher, decoded once with the bytes it arrived as.
@@ -327,7 +323,7 @@ pub trait EncryptedMessageIO: MessageIO {
 	///   [`TransportFailure::EncryptionFailed`] -- an encrypted envelope came
 	///   before encryption or did not decrypt, and the session was reset.
 	/// - The read, decode, and handshake-container conversion failures.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[allow(async_fn_in_trait)]
 	async fn collect_step(&mut self) -> TransportResult<CollectStep>
 	where
@@ -491,7 +487,7 @@ pub trait EncryptedMessageIO: MessageIO {
 	///   approval or settlement refusal, or a rejected certificate or proof.
 	#[cfg(all(
 		feature = "instrument",
-		any(feature = "transport-cms", feature = "transport-ecies")
+		any(feature = "transport-cms", feature = "transport-hpke")
 	))]
 	fn emit_handshake_outcome(&self, outcome: &TransportResult<()>)
 	where
@@ -528,7 +524,7 @@ pub trait EncryptedMessageIO: MessageIO {
 	/// # Errors
 	///
 	/// - The [`perform_client_handshake`](Self::perform_client_handshake) set.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[allow(async_fn_in_trait)]
 	async fn ensure_handshake_complete<P>(&mut self) -> TransportResult<()>
 	where
@@ -543,7 +539,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		Ok(())
 	}
 
-	/// Build the ECIES client orchestrator from transport state.
+	/// Build the HPKE client orchestrator from transport state.
 	///
 	/// The client proves the configured identity when one is present and dials
 	/// anonymously otherwise, so both cases run the one driver. The trust
@@ -554,8 +550,8 @@ pub trait EncryptedMessageIO: MessageIO {
 	///
 	/// - [`TransportError::HandshakeError`] with
 	///   [`HandshakeError::MissingTrustStore`] -- no trust store is configured.
-	#[cfg(feature = "transport-ecies")]
-	fn build_ecies_client_orchestrator<P>(&self) -> TransportResult<BoxedClientHandshake>
+	#[cfg(feature = "transport-hpke")]
+	fn build_hpke_client_orchestrator<P>(&self) -> TransportResult<BoxedClientHandshake>
 	where
 		Self: EncryptedProtocolState<CryptoProvider = P>,
 		P: HandshakeProvider,
@@ -563,13 +559,13 @@ pub trait EncryptedMessageIO: MessageIO {
 		let encryption = self.encryption();
 		let store = encryption.trust_store.as_ref().ok_or(HandshakeError::MissingTrustStore)?;
 		let validator = Arc::clone(store) as Arc<dyn CertificateValidation>;
-		let settings = EciesClientSettings {
+		let settings = HpkeClientSettings {
 			trust: LearnedTrust { validator },
 			aad_domain_tag: encryption.aad_domain_tag,
 			identity: encryption.client_identity.clone(),
 		};
 
-		let mut config = ClientConfig::<Ecies, P>::new(settings);
+		let mut config = ClientConfig::<Hpke, P>::new(settings);
 		config.transport_offer = encryption.mux_offer.as_deref().cloned();
 		config.receipt_approver = encryption.receipt_approver.as_ref().map(Arc::clone);
 
@@ -625,7 +621,7 @@ pub trait EncryptedMessageIO: MessageIO {
 	///   wire ceiling, or the server response arrived encrypted.
 	/// - [`TransportError::InvalidState`] -- the session refused the move to the handshaking phase.
 	/// - The orchestrator, read, write, and install failures.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[allow(async_fn_in_trait)]
 	async fn drive_client_handshake(&mut self, mut orchestrator: BoxedClientHandshake) -> TransportResult<()>
 	where
@@ -687,7 +683,7 @@ pub trait EncryptedMessageIO: MessageIO {
 	/// - [`TransportError::UnsupportedHandshakeProtocol`] -- this build lacks the configured protocol.
 	/// - The orchestrator build failure, and the
 	///   [`drive_client_handshake`](Self::drive_client_handshake) set.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[allow(async_fn_in_trait)]
 	async fn perform_client_handshake<P>(&mut self) -> TransportResult<()>
 	where
@@ -696,13 +692,13 @@ pub trait EncryptedMessageIO: MessageIO {
 	{
 		let kind = self.encryption().handshake_protocol;
 		let orchestrator = match kind {
-			#[cfg(feature = "transport-ecies")]
-			HandshakeProtocolKind::Ecies => self.build_ecies_client_orchestrator()?,
+			#[cfg(feature = "transport-hpke")]
+			HandshakeProtocolKind::Hpke => self.build_hpke_client_orchestrator()?,
 
 			#[cfg(feature = "transport-cms")]
 			HandshakeProtocolKind::Cms => self.build_cms_client_orchestrator()?,
 
-			#[cfg(not(all(feature = "transport-cms", feature = "transport-ecies")))]
+			#[cfg(not(all(feature = "transport-cms", feature = "transport-hpke")))]
 			unsupported => return Err(TransportError::UnsupportedHandshakeProtocol(unsupported)),
 		};
 
@@ -723,7 +719,7 @@ pub trait EncryptedMessageIO: MessageIO {
 	/// # Errors
 	///
 	/// - [`TransportError::MissingEncryption`] -- no key manager is configured.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	fn server_config<F, P>(&self, flow: F::Settings) -> TransportResult<ServerConfig<F, P>>
 	where
 		Self: EncryptedProtocolState<CryptoProvider = P>,
@@ -742,13 +738,13 @@ pub trait EncryptedMessageIO: MessageIO {
 		Ok(config)
 	}
 
-	/// Build the ECIES server orchestrator from transport state.
+	/// Build the HPKE server orchestrator from transport state.
 	///
 	/// # Errors
 	///
 	/// - [`TransportError::MissingEncryption`] -- no server certificate or key manager is configured.
-	#[cfg(feature = "transport-ecies")]
-	fn build_ecies_server_orchestrator<P>(&self) -> TransportResult<BoxedServerHandshake>
+	#[cfg(feature = "transport-hpke")]
+	fn build_hpke_server_orchestrator<P>(&self) -> TransportResult<BoxedServerHandshake>
 	where
 		Self: EncryptedProtocolState<CryptoProvider = P>,
 		P: HandshakeProvider,
@@ -757,9 +753,9 @@ pub trait EncryptedMessageIO: MessageIO {
 		let certificate = encryption.server_certificate.as_ref();
 		let certificate = certificate.ok_or(TransportError::MissingEncryption)?;
 		let certificate = Arc::clone(certificate);
-		let settings = EciesServerSettings { certificate, aad_domain_tag: encryption.aad_domain_tag };
+		let settings = HpkeServerSettings { certificate, aad_domain_tag: encryption.aad_domain_tag };
 
-		let config = self.server_config::<Ecies, P>(settings)?;
+		let config = self.server_config::<Hpke, P>(settings)?;
 		Ok(Box::new(Handshake::server(config)))
 	}
 
@@ -788,7 +784,7 @@ pub trait EncryptedMessageIO: MessageIO {
 	///   the session refused the move to the handshaking phase.
 	/// - [`TransportError::InvalidMessage`] -- the response passes the wire ceiling.
 	/// - The orchestrator, write, and install failures.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[allow(async_fn_in_trait)]
 	async fn drive_server_handshake(&mut self, request: HandshakeMessage) -> TransportResult<()>
 	where
@@ -840,7 +836,7 @@ pub trait EncryptedMessageIO: MessageIO {
 	///   [`TransportFailure::DeadlineExceeded`] -- the handshake deadline elapsed.
 	/// - The orchestrator build failure, and the
 	///   [`drive_server_handshake`](Self::drive_server_handshake) set.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[allow(async_fn_in_trait)]
 	async fn perform_server_handshake<P>(&mut self, request: HandshakeMessage) -> TransportResult<()>
 	where
@@ -856,13 +852,13 @@ pub trait EncryptedMessageIO: MessageIO {
 		// The orchestrator persists across messages, so it is created once.
 		if self.server_handshake_mut().is_none() {
 			let orchestrator = match kind {
-				#[cfg(feature = "transport-ecies")]
-				HandshakeProtocolKind::Ecies => self.build_ecies_server_orchestrator()?,
+				#[cfg(feature = "transport-hpke")]
+				HandshakeProtocolKind::Hpke => self.build_hpke_server_orchestrator()?,
 
 				#[cfg(feature = "transport-cms")]
 				HandshakeProtocolKind::Cms => self.build_cms_server_orchestrator()?,
 
-				#[cfg(not(all(feature = "transport-cms", feature = "transport-ecies")))]
+				#[cfg(not(all(feature = "transport-cms", feature = "transport-hpke")))]
 				unsupported => return Err(TransportError::UnsupportedHandshakeProtocol(unsupported)),
 			};
 

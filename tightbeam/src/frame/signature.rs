@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use crate::cms::signed_data::SignerIdentifier;
 use crate::crypto::hash::Digest;
 use crate::crypto::key::SigningKeyProvider;
-use crate::crypto::sign::{verify_canonical, LowSEncoding, PrehashVerifier, SignatureEncoding, SignerInfoExt};
+use crate::crypto::sign::{LowSEncoding, PrehashVerifier, SignatureEncoding, SignerInfoExt};
 use crate::crypto::x509::utils::Skid;
 use crate::der::oid::AssociatedOid;
 use crate::der::Encode;
@@ -72,7 +72,7 @@ impl Frame {
 		let signature_bytes: &[u8] = signature_info.signature.as_bytes();
 		let signature = S::try_from(signature_bytes).map_err(|_| TightBeamError::SignatureEncodingError)?;
 		let tbs_der = self.to_tbs()?;
-		verify_canonical::<D, S>(verifier, &tbs_der, &signature)?;
+		signature.verify_canonical::<D, _>(verifier, &tbs_der)?;
 		Ok(())
 	}
 
@@ -271,9 +271,7 @@ mod tests {
 	mod detached_sign {
 		use super::*;
 		use crate::crypto::sign::ecdsa::Secp256k1Signature;
-		use crate::crypto::sign::{
-			secp256k1_signer_identifier, sign_canonical, SignatureAlgorithmIdentifier, SignerInfoExt,
-		};
+		use crate::crypto::sign::{CanonicalSigner, Signatory, SignatureAlgorithmIdentifier, SignerInfoExt};
 		use crate::der::oid::AssociatedOid;
 		use crate::spki::AlgorithmIdentifierOwned;
 		use crate::SignerInfo;
@@ -287,11 +285,11 @@ mod tests {
 			// SHA3-256 runs over the TBS bytes, and ECDSA signs that
 			// prehash.
 			let tbs = frame.to_tbs()?;
-			let signature: Secp256k1Signature = sign_canonical::<Sha3_256, _>(&signing_key, &tbs)?;
+			let signature: Secp256k1Signature = signing_key.sign_canonical::<Sha3_256>(&tbs)?;
 
 			let sig_alg = AlgorithmIdentifierOwned { oid: Secp256k1Signature::ALGORITHM_OID, parameters: None };
 			let digest_alg = AlgorithmIdentifierOwned { oid: Sha3_256::OID, parameters: None };
-			let sid = secp256k1_signer_identifier(signing_key.verifying_key())?;
+			let sid = signing_key.signer_identifier()?;
 
 			frame.attach_signature(signature.to_bytes(), sig_alg, digest_alg, sid)?;
 			assert!(frame.nonrepudiation.is_some());
@@ -306,11 +304,11 @@ mod tests {
 			let signing_key = TestKey::insecure_fixed_signing();
 
 			let tbs = frame.to_tbs()?;
-			let signature: Secp256k1Signature = sign_canonical::<Sha3_256, _>(&signing_key, &tbs)?;
+			let signature: Secp256k1Signature = signing_key.sign_canonical::<Sha3_256>(&tbs)?;
 
 			let sig_alg = AlgorithmIdentifierOwned { oid: Secp256k1Signature::ALGORITHM_OID, parameters: None };
 			let digest_alg = AlgorithmIdentifierOwned { oid: Sha3_256::OID, parameters: None };
-			let sid = secp256k1_signer_identifier(signing_key.verifying_key())?;
+			let sid = signing_key.signer_identifier()?;
 
 			let signer_info = SignerInfo::from_parts(signature.to_bytes(), sig_alg, digest_alg, sid)?;
 			assert_eq!(signer_info.version, CmsVersion::V1);

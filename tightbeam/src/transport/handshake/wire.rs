@@ -1,7 +1,7 @@
 //! Wire envelope mapping for the handshake drivers.
 //!
 //! Both handshake protocols share the CMS container grammar on the wire
-//! ([`TransportEnvelope`]): ECIES tunnels its own message types inside
+//! ([`TransportEnvelope`]): HPKE tunnels its own message types inside
 //! `SignedData`/`EnvelopedData`, while the CMS handshake exchanges the
 //! containers themselves.
 
@@ -10,12 +10,12 @@ use crate::transport::error::TransportError;
 use crate::transport::handshake::HandshakeMessage;
 
 #[cfg(any(
-	feature = "transport-ecies",
+	feature = "transport-hpke",
 	all(feature = "transport-multiplex", feature = "transport-cms")
 ))]
 use crate::asn1::OctetString;
 #[cfg(any(
-	feature = "transport-ecies",
+	feature = "transport-hpke",
 	all(feature = "transport-multiplex", feature = "transport-cms")
 ))]
 use crate::transport::handshake::error::HandshakeError;
@@ -45,7 +45,7 @@ impl TryFrom<TransportEnvelope> for HandshakeMessage {
 
 /// Fixed-width views of a DER `OctetString`.
 #[cfg(any(
-	feature = "transport-ecies",
+	feature = "transport-hpke",
 	all(feature = "transport-multiplex", feature = "transport-cms")
 ))]
 pub trait HandshakeOctets {
@@ -58,7 +58,7 @@ pub trait HandshakeOctets {
 	///   short or long value fails closed
 	fn to_byte_array<const N: usize>(&self) -> Result<[u8; N], HandshakeError>;
 
-	/// Fixed 32-byte view of an ECIES wire nonce or other public value.
+	/// Fixed 32-byte view of an HPKE wire nonce or other public value.
 	///
 	/// # Errors
 	///
@@ -70,7 +70,7 @@ pub trait HandshakeOctets {
 }
 
 #[cfg(any(
-	feature = "transport-ecies",
+	feature = "transport-hpke",
 	all(feature = "transport-multiplex", feature = "transport-cms")
 ))]
 impl HandshakeOctets for OctetString {

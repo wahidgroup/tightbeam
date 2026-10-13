@@ -1,7 +1,7 @@
 //! # Transcript-binding downgrade threat
 //!
 //! ## Weakness
-//! Suppose the ECIES handshake transcript omits the negotiated
+//! Suppose the HPKE handshake transcript omits the negotiated
 //! `security_accept` and covers only
 //! `client_random || server_random || server_spki`. The signed transcript
 //! then leaves the chosen profile unauthenticated, so negotiation is unbound.
@@ -43,7 +43,7 @@ use tightbeam::{
 	trace::TraceCollector,
 	transport::handshake::{
 		negotiation::{SecurityAccept, SecurityOffer},
-		Client, ClientHello, Ecies, Handshake, Server,
+		Client, ClientHello, Handshake, Hpke, Server,
 	},
 	transport::wire_der::WireDer,
 	urn::Urn,
@@ -51,7 +51,7 @@ use tightbeam::{
 };
 
 use crate::common::security::{
-	ecies_client_config, ecies_server_config, expectation_failure, pinning_validator, strong_security_profile,
+	expectation_failure, hpke_client_config, hpke_server_config, pinning_validator, strong_security_profile,
 	tunneled_handshake, tunneled_hello, tunneled_opening, tunneled_reply, weak_security_profile, ServerMaterials,
 };
 
@@ -60,8 +60,8 @@ pub(crate) const STRIPPED_OFFER_REJECTED: Urn<'static> =
 pub(crate) const TAMPERED_ACCEPT_REJECTED: Urn<'static> =
 	tightbeam::urn!("test", "event:transcript-binding/tampered-accept-rejected");
 
-type EciesClient = Handshake<Client, Ecies, DefaultCryptoProvider>;
-type EciesServer = Handshake<Server, Ecies, DefaultCryptoProvider>;
+type HpkeClient = Handshake<Client, Hpke, DefaultCryptoProvider>;
+type HpkeServer = Handshake<Server, Hpke, DefaultCryptoProvider>;
 
 tb_assert_spec! {
 	pub TranscriptBindingSpec,
@@ -102,18 +102,16 @@ tb_scenario! {
 	}
 }
 
-fn strong_weak_pair(
-	materials: &ServerMaterials,
-) -> (EciesClient, EciesServer, SecurityProfileDesc, SecurityProfileDesc) {
+fn strong_weak_pair(materials: &ServerMaterials) -> (HpkeClient, HpkeServer, SecurityProfileDesc, SecurityProfileDesc) {
 	let strong = strong_security_profile();
 	let weak = weak_security_profile();
 	let validator = pinning_validator(&materials.certificate);
 
-	let mut config = ecies_client_config(validator);
+	let mut config = hpke_client_config(validator);
 	config.security_offer = Some(SecurityOffer::new(vec![strong, weak]));
 
 	let client = Handshake::client(config);
-	let server = Handshake::server(ecies_server_config(materials, [strong, weak]));
+	let server = Handshake::server(hpke_server_config(materials, [strong, weak]));
 
 	(client, server, strong, weak)
 }

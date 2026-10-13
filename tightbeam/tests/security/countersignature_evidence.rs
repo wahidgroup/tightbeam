@@ -50,8 +50,8 @@ pub(crate) const SETTLE_NEVER_FIRED: Urn<'static> =
 pub(crate) const TAMPERED_CIPHERTEXT_REJECTED: Urn<'static> =
 	tightbeam::urn!("test", "event:countersignature-evidence/tampered-ciphertext-rejected");
 
-#[cfg(feature = "transport-ecies")]
-mod ecies {
+#[cfg(feature = "transport-hpke")]
+mod hpke {
 	use std::sync::Arc;
 
 	use super::{NO_OUTCOME_BEFORE_CONCLUSION, SETTLE_NEVER_FIRED, TAMPERED_CIPHERTEXT_REJECTED};
@@ -69,7 +69,7 @@ mod ecies {
 	use tightbeam::TightBeamError;
 
 	use crate::common::security::{
-		carried_closing, carried_key_exchange, default_security_profile, ecies_client_config, ecies_server_config,
+		carried_closing, carried_key_exchange, default_security_profile, hpke_client_config, hpke_server_config,
 		pinning_validator, ClientMaterials, PayingApprover, RecordingObserver, ServerMaterials, SettleSpyAuthorizer,
 	};
 
@@ -90,7 +90,7 @@ mod ecies {
 	}
 
 	tb_scenario! {
-		name: ecies_tampered_countersignature_carriage_rejected,
+		name: hpke_tampered_countersignature_carriage_rejected,
 		spec: CountersignatureTamperSpec,
 		environment Bare {
 			exec: |SetupEnv { trace, .. }| async move {
@@ -99,7 +99,7 @@ mod ecies {
 				let client_materials = ClientMaterials::deterministic();
 				let client_identity = client_materials.identity();
 
-				let mut config = ecies_client_config(pinning_validator(&materials.certificate));
+				let mut config = hpke_client_config(pinning_validator(&materials.certificate));
 				config.flow.identity = Some(client_identity);
 				config.security_offer = Some(SecurityOffer::new(vec![profile]));
 				config.transport_offer = Some(TransportOffer::mux(4).with_budgets(REQUEST));
@@ -110,7 +110,7 @@ mod ecies {
 				let authorizer = Arc::new(SettleSpyAuthorizer::challenging(CHALLENGE)?);
 				let observer = Arc::new(RecordingObserver::default());
 				let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator);
-				let mut server_config = ecies_server_config::<DefaultCryptoProvider>(&materials, [profile]);
+				let mut server_config = hpke_server_config::<DefaultCryptoProvider>(&materials, [profile]);
 				server_config.peer_authentication = PeerAuthentication::mutual([validator]);
 				server_config.transport = Some(TransportOffer::mux(4));
 				server_config.transport_authorizer = Some(Arc::clone(&authorizer) as _);

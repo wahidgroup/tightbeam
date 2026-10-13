@@ -6,26 +6,24 @@
 
 use crate::cms::content_info::CmsVersion;
 use crate::cms::signed_data::{EncapsulatedContentInfo, SignedData, SignerIdentifier, SignerInfo};
-use crate::crypto::hash::Digest;
-use crate::crypto::profiles::CryptoProvider;
-use crate::crypto::sign::{sign_canonical, Keypair, PrehashSigner, SignatureEncoding};
+use crate::crypto::sign::{CanonicalSigner, Keypair, PrehashSigner, SignatureEncoding};
 use crate::crypto::x509::utils::Skid;
 use crate::der::asn1::{ObjectIdentifier, OctetString};
-use crate::der::oid::AssociatedOid;
 use crate::der::{Decode, Encode};
 use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey};
 use crate::transport::handshake::error::HandshakeError;
+use crate::transport::handshake::HandshakeProvider;
 
 /// Builder for CMS `SignedData` structures in the TightBeam handshake.
 ///
 /// The builder signs content, typically a transcript hash, with the sender's
 /// private key, which gives authentication and non-repudiation.
 ///
-/// - `P` is the [`CryptoProvider`] that names the signature and digest algorithms.
+/// - `P` is the [`HandshakeProvider`] that names the signature and digest algorithms.
 /// - `K` is the concrete signing key type.
 pub struct TightBeamSignedDataBuilder<'a, P, K>
 where
-	P: CryptoProvider,
+	P: HandshakeProvider,
 {
 	/// The signing key, borrowed as its concrete type.
 	signer: &'a K,
@@ -43,9 +41,7 @@ where
 
 impl<'a, P, K> TightBeamSignedDataBuilder<'a, P, K>
 where
-	P: CryptoProvider,
-	P::Signature: SignatureEncoding,
-	P::Digest: Digest + AssociatedOid,
+	P: HandshakeProvider,
 	K: PrehashSigner<P::Signature> + Keypair,
 	K::VerifyingKey: EncodePublicKey,
 {
@@ -86,7 +82,7 @@ where
 		// 1. Sign under the canonical convention: the provider digest once,
 		//    and ECDSA over the prehash, matching the advertised
 		//    signature-algorithm OID.
-		let signature = sign_canonical::<P::Digest, P::Signature>(self.signer, content)?;
+		let signature: P::Signature = self.signer.sign_canonical::<P::Digest>(content)?;
 		let signature_bytes = signature.to_bytes();
 
 		// 2. Create the SignerInfo. The digest algorithm is cloned, because the SignedData names it as well.

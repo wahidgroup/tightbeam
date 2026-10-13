@@ -6,8 +6,7 @@
 //! replay whole encrypted envelopes without detection.
 //!
 //! ## Attack
-//! 1. A pinned client and encrypted server complete a real ECIES handshake
-//!    through a frame-aware TCP relay.
+//! 1. A pinned client and encrypted server complete a real HPKE handshake through a frame-aware TCP relay.
 //! 2. The relay tampers with the client-to-server direction after the
 //!    handshake: either drops or duplicates the first encrypted envelope.
 //! 3. The server decrypts subsequent envelopes under the exact-next counter discipline.
@@ -24,7 +23,7 @@
 //! - RFC 9846 (TLS 1.3) §5.3: per-record nonce construction / sequencing
 
 #![cfg(all(
-	feature = "transport-ecies",
+	feature = "transport-hpke",
 	feature = "transport-policy",
 	feature = "tcp",
 	feature = "tokio"
@@ -60,7 +59,7 @@ pub(crate) const DELETED_ENVELOPE_DETECTED: Urn<'static> =
 pub(crate) const REPLAYED_ENVELOPE_DETECTED: Urn<'static> =
 	tightbeam::urn!("test", "event:envelope-tamper/replayed-envelope-detected");
 
-/// ECIES sends exactly two cleartext client frames (ClientHello,
+/// HPKE sends exactly two cleartext client frames (ClientHello,
 /// ClientKeyExchange), so the first encrypted envelope is frame 3.
 const FIRST_ENCRYPTED_FRAME: usize = 3;
 

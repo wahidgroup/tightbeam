@@ -50,17 +50,29 @@ pub trait SignatureAlgorithmIdentifier {
 	const ALGORITHM_OID: ObjectIdentifier;
 }
 
-/// Sign `content` under the canonical bytes-to-sign derivation, which hashes
-/// `content` exactly once with `D` and signs the resulting digest as an ECDSA
-/// prehash.
-pub fn sign_canonical<D, S>(signer: &impl PrehashSigner<S>, content: impl AsRef<[u8]>) -> core::result::Result<S, Error>
-where
-	D: Digest,
-{
-	let mut hasher = D::new();
-	hasher.update(content.as_ref());
-	signer.sign_prehash(&hasher.finalize())
+/// A signer that signs under the canonical bytes-to-sign derivation.
+///
+/// Every [`PrehashSigner`] is one. [`LowSEncoding::verify_canonical`] is the
+/// counterpart, so producers and verifiers agree on the bytes-to-sign formula.
+pub trait CanonicalSigner<S>: PrehashSigner<S> {
+	/// Sign `content` under the canonical derivation, which hashes `content`
+	/// exactly once with `D` and signs the resulting digest as an ECDSA
+	/// prehash.
+	///
+	/// # Errors
+	///
+	/// - [`Error`] -- the signer refused the prehash.
+	fn sign_canonical<D>(&self, content: impl AsRef<[u8]>) -> core::result::Result<S, Error>
+	where
+		D: Digest,
+	{
+		let mut hasher = D::new();
+		hasher.update(content.as_ref());
+		self.sign_prehash(&hasher.finalize())
+	}
 }
+
+impl<S, T> CanonicalSigner<S> for T where T: PrehashSigner<S> + ?Sized {}
 
 /// A signature encoding that has one valid scalar form.
 ///
@@ -73,8 +85,9 @@ pub trait LowSEncoding {
 
 	/// Refuse a high-s encoding, then verify `prehash` under `verifier`.
 	///
-	/// Paths that already hold a digest (receipt attributes, ECIES auth)
-	/// use this so they share the same low-s gate as [`verify_canonical`].
+	/// Paths that already hold a digest (receipt attributes, the possession
+	/// proof of the HPKE handshake) use this so they share the same low-s gate
+	/// as [`Self::verify_canonical`].
 	fn verify_prehash<V>(&self, verifier: &V, prehash: impl AsRef<[u8]>) -> core::result::Result<(), Error>
 	where
 		Self: Sized,
@@ -86,6 +99,32 @@ pub trait LowSEncoding {
 
 		verifier.verify_prehash(prehash.as_ref(), self)
 	}
+
+	/// Verify this signature over `content` under the canonical convention,
+	/// which hashes `content` once with `D` and verifies against that prehash.
+	///
+	/// This method is the counterpart of [`CanonicalSigner::sign_canonical`].
+	/// Every tightbeam verifier must route through it, so producers and
+	/// verifiers agree on the bytes-to-sign formula.
+	///
+	/// # Low-s
+	///
+	/// The signature MUST be low-s. [`Self::verify_prehash`] is the check, and
+	/// the `k256` verifier also refuses a high-s encoding.
+	///
+	/// # Errors
+	///
+	/// - [`Error`] -- the encoding is high-s, or the signature does not verify.
+	fn verify_canonical<D, V>(&self, verifier: &V, content: impl AsRef<[u8]>) -> core::result::Result<(), Error>
+	where
+		Self: Sized,
+		D: Digest,
+		V: PrehashVerifier<Self>,
+	{
+		let mut hasher = D::new();
+		hasher.update(content.as_ref());
+		self.verify_prehash(verifier, hasher.finalize())
+	}
 }
 
 #[cfg(feature = "secp256k1")]
@@ -93,31 +132,6 @@ impl LowSEncoding for ecdsa::Signature<ecdsa::Secp256k1> {
 	fn is_low_s(&self) -> bool {
 		self.normalize_s().is_none()
 	}
-}
-
-/// Verify a signature produced under the canonical convention, which hashes
-/// `content` once with `D` and verifies the signature against that prehash.
-///
-/// This function is the counterpart of [`sign_canonical`]. Every tightbeam
-/// verifier must route through it, so producers and verifiers agree on the
-/// bytes-to-sign formula.
-///
-/// # Low-s
-///
-/// The signature MUST be low-s. [`LowSEncoding`] is the check, and the `k256`
-/// verifier also refuses a high-s encoding.
-pub fn verify_canonical<D, S>(
-	verifier: &impl PrehashVerifier<S>,
-	content: impl AsRef<[u8]>,
-	signature: &S,
-) -> core::result::Result<(), Error>
-where
-	D: Digest,
-	S: LowSEncoding,
-{
-	let mut hasher = D::new();
-	hasher.update(content.as_ref());
-	signature.verify_prehash(verifier, hasher.finalize())
 }
 
 /// Signing key that can emit a CMS [`SignerInfo`] over content.
@@ -134,7 +148,7 @@ where
 	where
 		Self: Sized,
 	{
-		let signature: S = sign_canonical::<Self::DigestAlgorithm, S>(self, data)?;
+		let signature: S = self.sign_canonical::<Self::DigestAlgorithm>(data)?;
 		let digest_alg = AlgorithmIdentifierOwned { oid: Self::DigestAlgorithm::OID, parameters: None };
 		let signature_algorithm = self.signature_algorithm();
 		let sid = self.signer_identifier()?;
@@ -196,7 +210,11 @@ impl Signatory<ecdsa::Signature<ecdsa::Secp256k1>> for ecdsa::SigningKey<ecdsa::
 	}
 
 	fn signer_identifier(&self) -> Result<SignerIdentifier> {
-		secp256k1_signer_identifier(self.verifying_key())
+		let encoded = self.verifying_key().to_public_key_der();
+		let public_key_der = encoded.map_err(|_| TightBeamError::SignatureEncodingError)?;
+		let skid = Skid::of_public_key(public_key_der);
+
+		SignerIdentifier::try_from(skid).map_err(|_| TightBeamError::SignatureEncodingError)
 	}
 }
 
@@ -229,7 +247,7 @@ where
 	S: PrehashSigner<Sig>,
 {
 	fn try_sign(&self, msg: &[u8]) -> core::result::Result<Sig, signature::Error> {
-		sign_canonical::<sha3::Sha3_256, Sig>(self.0, msg)
+		self.0.sign_canonical::<sha3::Sha3_256>(msg)
 	}
 }
 
@@ -237,17 +255,6 @@ impl<'a, S> From<&'a S> for Sha3Signer<'a, S> {
 	fn from(s: &'a S) -> Self {
 		Sha3Signer(s)
 	}
-}
-
-/// Compute the SubjectKeyIdentifier-based SignerIdentifier for a Secp256k1
-/// verifying key.
-#[cfg(feature = "secp256k1")]
-pub fn secp256k1_signer_identifier(verifying_key: &ecdsa::VerifyingKey<ecdsa::Secp256k1>) -> Result<SignerIdentifier> {
-	let encoded = verifying_key.to_public_key_der();
-	let public_key_der = encoded.map_err(|_| TightBeamError::SignatureEncodingError)?;
-	let skid = Skid::of_public_key(public_key_der);
-
-	SignerIdentifier::try_from(skid).map_err(|_| TightBeamError::SignatureEncodingError)
 }
 
 /// A verifier for the signatures in SignedData structures.
@@ -325,8 +332,8 @@ where
 		}
 
 		let signature = S::try_from(signature_bytes).map_err(|_| TightBeamError::SignatureEncodingError)?;
-		verify_canonical::<D, S>(&self.verifying_key, content, &signature)
-			.map_err(|_| TightBeamError::SignatureEncodingError)?;
+		let verified = signature.verify_canonical::<D, _>(&self.verifying_key, content);
+		verified.map_err(|_| TightBeamError::SignatureEncodingError)?;
 
 		Ok(())
 	}
@@ -390,13 +397,41 @@ mod tests {
 	#[test]
 	fn a_high_s_signature_is_refused() -> crate::error::Result<()> {
 		let signing_key = SigningKey::random(&mut OsRng);
-		let low: Signature = sign_canonical::<Sha3_256, _>(&signing_key, CONTENT)?;
+		let low: Signature = signing_key.sign_canonical::<Sha3_256>(CONTENT)?;
 		let (r, s) = low.split_scalars();
 		let high = Signature::from_scalars(r, -s)?;
 		assert!(low.normalize_s().is_none());
 		assert!(high.normalize_s().is_some());
-		assert!(verify_canonical::<Sha3_256, _>(signing_key.verifying_key(), CONTENT, &low).is_ok());
-		assert!(verify_canonical::<Sha3_256, _>(signing_key.verifying_key(), CONTENT, &high).is_err());
+
+		let verifier = signing_key.verifying_key();
+		assert!(low.verify_canonical::<Sha3_256, _>(verifier, CONTENT).is_ok());
+		assert!(high.verify_canonical::<Sha3_256, _>(verifier, CONTENT).is_err());
+
+		Ok(())
+	}
+
+	/// A verifier that accepts every signature. The `k256` verifier refuses a
+	/// high-s encoding itself, so a test of the gate in `verify_prehash` needs
+	/// a verifier that leaves the decision to that gate.
+	struct AcceptAll;
+
+	impl PrehashVerifier<Signature> for AcceptAll {
+		fn verify_prehash(&self, _prehash: &[u8], _signature: &Signature) -> core::result::Result<(), Error> {
+			Ok(())
+		}
+	}
+
+	// The low-s gate belongs to the encoding, so it holds under a verifier
+	// that runs no check of its own.
+	#[test]
+	fn the_low_s_gate_holds_under_a_verifier_that_accepts_everything() -> crate::error::Result<()> {
+		let signing_key = SigningKey::random(&mut OsRng);
+		let low: Signature = signing_key.sign_canonical::<Sha3_256>(CONTENT)?;
+		let (r, s) = low.split_scalars();
+		let high = Signature::from_scalars(r, -s)?;
+		assert!(low.verify_canonical::<Sha3_256, _>(&AcceptAll, CONTENT).is_ok());
+		assert!(high.verify_canonical::<Sha3_256, _>(&AcceptAll, CONTENT).is_err());
+		assert!(high.verify_prehash(&AcceptAll, [0u8; 32]).is_err());
 
 		Ok(())
 	}

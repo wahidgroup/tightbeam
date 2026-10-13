@@ -5,18 +5,17 @@
 //! and client helpers derive clamped [`MuxSettings`] and consult the optional
 //! [`TransportAuthorizer`] and [`ProfileStrengthPolicy`] hooks.
 
+use core::marker::PhantomData;
+
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::boxed::Box;
-#[cfg(all(
-	not(feature = "std"),
-	any(feature = "transport-cms", feature = "transport-ecies")
-))]
+#[cfg(all(not(feature = "std"), any(feature = "transport-cms", feature = "transport-hpke")))]
 use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
-#[cfg(all(feature = "std", any(feature = "transport-cms", feature = "transport-ecies")))]
+#[cfg(all(feature = "std", any(feature = "transport-cms", feature = "transport-hpke")))]
 use std::sync::Arc;
 #[cfg(feature = "std")]
 use std::vec::Vec;
@@ -24,8 +23,6 @@ use std::vec::Vec;
 use crate::constants::{
 	DEFAULT_MUX_CHUNK_SIZE, DEFAULT_MUX_CREDIT_UNIT, DEFAULT_MUX_STREAM_CREDIT, MAX_MUX_STREAM_CAP,
 };
-use core::marker::PhantomData;
-
 use crate::crypto::common::KeySizeUser;
 use crate::crypto::hash::Digest;
 use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
@@ -35,15 +32,14 @@ use crate::der::Sequence;
 use crate::transport::handshake::receipt::SessionReceipt;
 use crate::utils::marker::{MaybeSend, MaybeSendFuture, MaybeSync};
 use crate::Beamable;
-
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-use crate::constants::{MAX_MUX_CHUNK_SIZE, MAX_MUX_SESSION_BUDGET, MAX_MUX_STREAM_CREDIT, MIN_MUX_CHUNK_SIZE};
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-use crate::transport::handshake::error::HandshakeError;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-use crate::transport::handshake::HandshakeProvider;
-
 use crate::Errorizable;
+
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::constants::{MAX_MUX_CHUNK_SIZE, MAX_MUX_SESSION_BUDGET, MAX_MUX_STREAM_CREDIT, MIN_MUX_CHUNK_SIZE};
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::transport::handshake::error::HandshakeError;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::transport::handshake::HandshakeProvider;
 
 /// Maximum number of profiles accepted in a [`SecurityOffer`].
 ///
@@ -122,7 +118,7 @@ impl MuxBudgets {
 	}
 
 	/// Clamp both directions to [`MAX_MUX_SESSION_BUDGET`] (CWE-770).
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	fn clamped(self) -> MuxBudgets {
 		MuxBudgets {
 			client_to_server: self.client_to_server.min(MAX_MUX_SESSION_BUDGET),
@@ -387,14 +383,14 @@ fn clamp_stream_cap(cap: u32) -> u32 {
 ///
 /// The floor stops tiny advertisements from amplifying record consumption
 /// (CWE-770). Chunking is the only send path, so no value opts out.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 fn clamp_chunk_size(size: u32) -> u32 {
 	size.clamp(MIN_MUX_CHUNK_SIZE, MAX_MUX_CHUNK_SIZE)
 }
 
 /// Clamp an advertised credit unit to at least one byte so debit arithmetic
 /// never divides by zero.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 fn clamp_credit_unit(unit: u32) -> u32 {
 	unit.max(1)
 }
@@ -405,7 +401,7 @@ fn clamp_credit_unit(unit: u32) -> u32 {
 /// The ceiling bounds receive memory (CWE-770). The floor of one chunk keeps
 /// every stream startable, because credit grants flow only after a first
 /// chunk arrives.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 fn clamp_stream_credit(credit: u64) -> u64 {
 	credit.clamp(1, MAX_MUX_STREAM_CREDIT)
 }
@@ -423,7 +419,7 @@ fn clamp_stream_credit(credit: u64) -> u64 {
 /// - Its receive-side values are advertised back to the client.
 /// - Its `requested_budgets` is the grant ceiling, combined with the client's
 ///   request by componentwise minimum.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub(crate) struct TransportNegotiation<'a> {
 	/// Client transport offer, when the handshake carried one.
 	pub(crate) offer: Option<&'a TransportOffer>,
@@ -431,7 +427,7 @@ pub(crate) struct TransportNegotiation<'a> {
 	pub(crate) local: Option<&'a TransportOffer>,
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl<'a> TransportNegotiation<'a> {
 	/// Applies the accept rule that runs before any authorizer.
 	///
@@ -686,14 +682,14 @@ pub struct AuthorizedTransport {
 
 /// The end of the negotiation this endpoint holds. The role decides the
 /// direction each local and peer figure maps to.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 #[derive(Clone, Copy)]
 enum LocalRole {
 	Client,
 	Server,
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl LocalRole {
 	/// Returns `(send_budget, recv_budget)` for this role from the granted
 	/// budgets.
@@ -755,7 +751,7 @@ impl LocalRole {
 	}
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl MuxSettings {
 	/// Client-side settings derived from the offer and the accept.
 	///
@@ -1015,11 +1011,11 @@ impl ProfileStrengthPolicy for DefaultStrengthFloor {
 /// A server selects only a profile that meets its floor, and a client accepts
 /// only such a profile, whether or not it sent an offer. Without an explicit
 /// policy the floor is [`DefaultStrengthFloor`].
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 #[derive(Clone, Default)]
 pub(crate) struct StrengthFloor(Option<Arc<dyn ProfileStrengthPolicy + Send + Sync>>);
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl StrengthFloor {
 	/// A floor that applies `policy` in place of [`DefaultStrengthFloor`].
 	pub(crate) fn with_policy(policy: Arc<dyn ProfileStrengthPolicy + Send + Sync>) -> Self {
@@ -1060,11 +1056,11 @@ impl StrengthFloor {
 /// let refusal = SupportedProfiles::new([]);
 /// assert!(matches!(refusal, Err(HandshakeError::NoSupportedProfiles)));
 /// ```
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 #[derive(Clone, Debug)]
 pub struct SupportedProfiles(Vec<SecurityProfileDesc>);
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl SupportedProfiles {
 	/// The profiles a server runs, in the preference order `profiles` yields
 	/// them.
@@ -1087,7 +1083,7 @@ impl SupportedProfiles {
 	}
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl TryFrom<Vec<SecurityProfileDesc>> for SupportedProfiles {
 	type Error = HandshakeError;
 
@@ -1100,7 +1096,7 @@ impl TryFrom<Vec<SecurityProfileDesc>> for SupportedProfiles {
 }
 
 /// One profile is a list that is never empty.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl From<SecurityProfileDesc> for SupportedProfiles {
 	fn from(profile: SecurityProfileDesc) -> Self {
 		Self(Vec::from([profile]))
@@ -1112,21 +1108,21 @@ impl From<SecurityProfileDesc> for SupportedProfiles {
 /// A server chooses a profile and a client admits the server's selection, both
 /// through this policy. Each decision yields a profile `P` runs that meets the
 /// floor, so no other profile reaches a session.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 #[derive(Clone)]
 pub struct ProfilePolicy<P> {
 	floor: StrengthFloor,
 	provider: PhantomData<fn() -> P>,
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl<P: HandshakeProvider> Default for ProfilePolicy<P> {
 	fn default() -> Self {
 		Self::new()
 	}
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl<P: HandshakeProvider> ProfilePolicy<P> {
 	/// A policy under [`DefaultStrengthFloor`], which requires a 256-bit AEAD
 	/// key and a digest of 256 bits or more.
@@ -1242,7 +1238,7 @@ impl SecurityOffer {
 	/// - [`NegotiationError::EmptyOffer`] -- the peer sent an empty offer.
 	/// - [`NegotiationError::OfferTooLarge`] -- the offer exceeds [`MAX_OFFER_PROFILES`].
 	/// - [`NegotiationError::NoMutualProfile`] -- the offer shares no profile with `supported`.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub(crate) fn select_profile(
 		&self,
 		supported: impl AsRef<[SecurityProfileDesc]>,
@@ -1265,7 +1261,7 @@ impl SecurityOffer {
 	}
 }
 
-#[cfg(all(test, any(feature = "transport-cms", feature = "transport-ecies")))]
+#[cfg(all(test, any(feature = "transport-cms", feature = "transport-hpke")))]
 mod tests {
 	use core::error::Error;
 
@@ -1274,7 +1270,7 @@ mod tests {
 	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::oids::{
 		AES_128_GCM, AES_128_WRAP, AES_192_WRAP, AES_256_GCM, AES_256_WRAP, CURVE_SECP256K1, HASH_SHA3_256,
-		SIGNER_ECDSA_WITH_SHA3_512,
+		HKDF_SHA3_256, SIGNER_ECDSA_WITH_SHA3_512,
 	};
 
 	fn sample_profile(id: u8) -> SecurityProfileDesc {
@@ -1288,7 +1284,7 @@ mod tests {
 			digest: Some(HASH_SHA3_256),
 			aead: Some(AES_256_GCM),
 			signature: Some(SIGNER_ECDSA_WITH_SHA3_512),
-			kdf: Some(HASH_SHA3_256),
+			kdf: Some(HKDF_SHA3_256),
 			curve: Some(CURVE_SECP256K1),
 			key_wrap,
 		}
@@ -1943,6 +1939,18 @@ mod tests {
 		let foreign = SecurityProfileDesc { digest: Some(crate::oids::HASH_SHA3_512), ..native };
 
 		let result = RunnableProfile::<DefaultCryptoProvider>::try_from(foreign);
+
+		assert!(matches!(result, Err(NegotiationError::UnrunnableProfile)));
+	}
+
+	/// The KDF has an OID of its own, so a descriptor that names it by the OID
+	/// of its digest names another algorithm.
+	#[test]
+	fn a_descriptor_that_names_its_kdf_by_the_digest_oid_is_not_runnable() {
+		let native = RunnableProfile::<DefaultCryptoProvider>::native().descriptor();
+		let by_digest = SecurityProfileDesc { kdf: Some(crate::oids::HASH_SHA3_256), ..native };
+
+		let result = RunnableProfile::<DefaultCryptoProvider>::try_from(by_digest);
 
 		assert!(matches!(result, Err(NegotiationError::UnrunnableProfile)));
 	}

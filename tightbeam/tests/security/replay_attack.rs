@@ -6,16 +6,14 @@
 //!
 //! ## Attack
 //! A valid client handshake message is captured and re-sent to the server (all
-//! enabled backends: ECIES, CMS).
+//! enabled backends: HPKE, CMS).
 //!
 //! ## Expected control
 //! Replayed handshake messages MUST be rejected.
 //!
 //! ## References
-//! - CWE-294: Authentication Bypass by Capture-replay
-//!   <https://cwe.mitre.org/data/definitions/294.html>
-//! - CAPEC-60: Reusing Session IDs (aka Session Replay)
-//!   <https://capec.mitre.org/data/definitions/60.html>
+//! - CWE-294: Authentication Bypass by Capture-replay <https://cwe.mitre.org/data/definitions/294.html>
+//! - CAPEC-60: Reusing Session IDs (aka Session Replay) <https://capec.mitre.org/data/definitions/60.html>
 
 use std::sync::Arc;
 
@@ -60,7 +58,7 @@ tb_process_spec! {
 			REPLAY_DETECTED,
 			REPLAY_REJECTED,
 			SecurityThreatHarness::HARNESS_SPAWN_SESSION,
-			SecurityThreatHarness::HARNESS_SPAWN_ECIES,
+			SecurityThreatHarness::HARNESS_SPAWN_HPKE,
 			SecurityThreatHarness::HARNESS_SPAWN_CMS
 		}
 		hidden { }
@@ -68,13 +66,13 @@ tb_process_spec! {
 	states {
 		Idle => { SecurityThreatHarness::HARNESS_SPAWN_SESSION => Spawning },
 		Spawning => {
-			SecurityThreatHarness::HARNESS_SPAWN_ECIES => SessionReady,
+			SecurityThreatHarness::HARNESS_SPAWN_HPKE => SessionReady,
 			SecurityThreatHarness::HARNESS_SPAWN_CMS => SessionReady
 		},
 		SessionReady => { REPLAY_INIT_HANDSHAKE => Established },
 		Established => { SecurityThreatHarness::HARNESS_SPAWN_SESSION => SpawningAttack },
 		SpawningAttack => {
-			SecurityThreatHarness::HARNESS_SPAWN_ECIES => AttackSessionReady,
+			SecurityThreatHarness::HARNESS_SPAWN_HPKE => AttackSessionReady,
 			SecurityThreatHarness::HARNESS_SPAWN_CMS => AttackSessionReady
 		},
 		AttackSessionReady => { REPLAY_ATTEMPT => AttackObserved },

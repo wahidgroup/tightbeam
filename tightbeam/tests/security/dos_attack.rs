@@ -6,7 +6,7 @@
 //!
 //! ## Attack
 //! An oversized handshake message (>16 KiB) is sent to the peer (all enabled
-//! backends: ECIES, CMS).
+//! backends: HPKE, CMS).
 //!
 //! ## Expected control
 //! A 16 KiB handshake size cap (`HANDSHAKE_MAX_WIRE`) MUST reject oversized
@@ -62,7 +62,7 @@ tb_process_spec! {
 			DOS_INJECT_OVERSIZED,
 			DOS_OVERSIZED_REJECTED,
 			SecurityThreatHarness::HARNESS_SPAWN_SESSION,
-			SecurityThreatHarness::HARNESS_SPAWN_ECIES,
+			SecurityThreatHarness::HARNESS_SPAWN_HPKE,
 			SecurityThreatHarness::HARNESS_SPAWN_CMS
 		}
 		hidden { }
@@ -71,7 +71,7 @@ tb_process_spec! {
 		Idle => { DOS_GENERATE_OVERSIZED => OversizedReady },
 		OversizedReady => { SecurityThreatHarness::HARNESS_SPAWN_SESSION => Spawning },
 		Spawning => {
-			SecurityThreatHarness::HARNESS_SPAWN_ECIES => SessionReady,
+			SecurityThreatHarness::HARNESS_SPAWN_HPKE => SessionReady,
 			SecurityThreatHarness::HARNESS_SPAWN_CMS => SessionReady
 		},
 		SessionReady => { DOS_INJECT_OVERSIZED => Injected },
@@ -115,7 +115,7 @@ job! {
 
 			trace.event(DOS_INJECT_OVERSIZED)?;
 
-			// Inject at step 0 (ClientHello for ECIES, KeyExchange for CMS)
+			// Inject at step 0 (ClientHello for HPKE, KeyExchange for CMS)
 			// The oversized message should be rejected
 			match session.inject_at_step(0, &oversized_payload).await? {
 				InjectionOutcome::Rejected(_) => {

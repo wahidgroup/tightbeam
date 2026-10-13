@@ -3,7 +3,7 @@
 use crate::constants::DEFAULT_MUX_STREAM_CREDIT;
 use crate::transport::multiplex::StreamId;
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::constants::DEFAULT_REKEY_RENEWAL_ALLOWANCE;
 
 pub fn cap_as_usize(cap: u32) -> usize {
@@ -65,7 +65,7 @@ impl ChunkSize {
 /// Send records at which a renewal opens: the dynamic drain floor
 /// plus fixed slack so the exchange legs land before the drain
 /// threshold would trip ([`DEFAULT_REKEY_RENEWAL_ALLOWANCE`]).
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub fn renewal_floor(drain_floor: u64) -> u64 {
 	drain_floor.saturating_add(DEFAULT_REKEY_RENEWAL_ALLOWANCE)
 }
@@ -140,7 +140,7 @@ impl CreditGrantor for BufferedGrantor {
 mod tests {
 	use super::*;
 
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	use crate::transport::handshake::negotiation::MuxSettings;
 
 	#[test]
@@ -172,7 +172,7 @@ mod tests {
 		}
 	}
 
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[test]
 	fn test_renewal_floor_adds_exchange_allowance() {
 		use crate::constants::DEFAULT_REKEY_RENEWAL_ALLOWANCE;

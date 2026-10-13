@@ -11,8 +11,8 @@
 //! # Wire format
 //!
 //! The commitment value goes in the existing message integrity field, so the
-//! wire format is unchanged. `commit_digest` owns the preimage layout and its
-//! mode byte.
+//! wire format is unchanged. `CommitmentSalt::commit` owns the preimage layout
+//! and its mode byte.
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
@@ -85,37 +85,37 @@ impl CommitmentSalt {
 
 		Ok(Self::Hiding(HidingSalt(SecretSlice::from(salt.to_vec()))))
 	}
-}
 
-/// Compute the commitment digest over `salt` and `data`.
-///
-/// # Preimage
-///
-/// - [`CommitmentSalt::Plain`]: `H(mode || data)`.
-/// - Hiding salt: `H(mode || len(salt) || salt || data)`, where `len(salt)` is
-///   an 8-byte big-endian length.
-///
-/// The mode byte separates the two forms, so a hiding commitment and a plain
-/// digest of the same body are different values and neither verifies as the
-/// other. The length frame keeps distinct `(salt, data)` pairs from sharing a
-/// preimage. The preimage streams into the hasher, so prepending the prefix
-/// costs no copy of the body.
-pub(crate) fn commit_digest<D>(salt: &CommitmentSalt, data: impl AsRef<[u8]>) -> Result<DigestInfo>
-where
-	D: Digest + AssociatedOid,
-{
-	let mut hasher = D::new();
-	match salt {
-		CommitmentSalt::Plain => hasher.update([PLAIN_MODE]),
-		CommitmentSalt::Hiding(salt) => salt.with(|salt| {
-			hasher.update([HIDING_MODE]);
-			hasher.update((salt.len() as u64).to_be_bytes());
-			hasher.update(salt);
-		}),
+	/// Compute the commitment digest of `data` under this salt.
+	///
+	/// # Preimage
+	///
+	/// - [`CommitmentSalt::Plain`]: `H(mode || data)`.
+	/// - Hiding salt: `H(mode || len(salt) || salt || data)`, where `len(salt)`
+	///   is an 8-byte big-endian length.
+	///
+	/// The mode byte separates the two forms, so a hiding commitment and a
+	/// plain digest of the same body are different values and neither verifies
+	/// as the other. The length frame keeps distinct `(salt, data)` pairs from
+	/// sharing a preimage. The preimage streams into the hasher, so prepending
+	/// the prefix costs no copy of the body.
+	pub(crate) fn commit<D>(&self, data: impl AsRef<[u8]>) -> Result<DigestInfo>
+	where
+		D: Digest + AssociatedOid,
+	{
+		let mut hasher = D::new();
+		match self {
+			CommitmentSalt::Plain => hasher.update([PLAIN_MODE]),
+			CommitmentSalt::Hiding(salt) => salt.with(|salt| {
+				hasher.update([HIDING_MODE]);
+				hasher.update((salt.len() as u64).to_be_bytes());
+				hasher.update(salt);
+			}),
+		}
+
+		hasher.update(data.as_ref());
+		crate::utils::digest_info::<D>(hasher)
 	}
-
-	hasher.update(data.as_ref());
-	crate::utils::digest_info::<D>(hasher)
 }
 
 /// The opening of a message commitment: the secret blinding salt and the
@@ -148,7 +148,7 @@ impl Opening {
 	{
 		let message = crate::encode(message)?;
 		let salt = CommitmentSalt::parse(salt)?;
-		let commitment = commit_digest::<D>(&salt, &message)?;
+		let commitment = salt.commit::<D>(&message)?;
 		Ok((commitment, Self { salt, message }))
 	}
 
@@ -164,7 +164,7 @@ impl Opening {
 			return Ok(false);
 		}
 
-		let recomputed = commit_digest::<D>(&self.salt, &self.message)?;
+		let recomputed = self.salt.commit::<D>(&self.message)?;
 		Ok(recomputed.digest_matches(commitment))
 	}
 
@@ -259,11 +259,11 @@ mod tests {
 	fn salt_framing_prevents_prefix_collision() -> Result<()> {
 		// Raw concatenation collides into one preimage, and length framing
 		// must not.
-		let split_salt = commit_digest::<Sha3_256>(&CommitmentSalt::parse([1u8; MIN_SALT_SIZE])?, [2, 3])?;
+		let split_salt = CommitmentSalt::parse([1u8; MIN_SALT_SIZE])?.commit::<Sha3_256>([2, 3])?;
 		let mut longer_salt = [1u8; MIN_SALT_SIZE + 1];
 		longer_salt[MIN_SALT_SIZE] = 2;
 
-		let split_data = commit_digest::<Sha3_256>(&CommitmentSalt::parse(longer_salt)?, [3])?;
+		let split_data = CommitmentSalt::parse(longer_salt)?.commit::<Sha3_256>([3])?;
 		assert_ne!(split_salt.digest.as_bytes(), split_data.digest.as_bytes());
 		Ok(())
 	}

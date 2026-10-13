@@ -1,6 +1,6 @@
 use tightbeam::crypto::aead::{Aes128GcmOid, Aes256Gcm};
-use tightbeam::crypto::ecies::Secp256k1EciesMessage;
 use tightbeam::crypto::hash::Sha3_256;
+use tightbeam::crypto::hpke::HpkeSecp256k1Sha3Aes256Gcm;
 use tightbeam::crypto::k256::Secp256k1;
 use tightbeam::crypto::kdf::HkdfSha3_256;
 use tightbeam::crypto::profiles::{
@@ -46,12 +46,12 @@ impl KdfProvider for MismatchedProvider {
 
 impl CurveProvider for MismatchedProvider {
 	type Curve = Secp256k1;
-	type EciesMessage = Secp256k1EciesMessage;
 }
 
 // ERROR: the profile negotiates AES-128-GCM, and the cipher is AES-256-GCM
 impl CryptoProvider for MismatchedProvider {
 	type Profile = Aes128Profile;
+	type HpkeSuite = HpkeSecp256k1Sha3Aes256Gcm;
 
 	fn profile(&self) -> &Self::Profile {
 		&self.profile

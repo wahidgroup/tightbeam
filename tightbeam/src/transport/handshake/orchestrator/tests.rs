@@ -25,8 +25,8 @@ use crate::TightBeamError;
 
 #[cfg(feature = "transport-cms")]
 use crate::transport::handshake::Cms;
-#[cfg(feature = "transport-ecies")]
-use crate::transport::handshake::Ecies;
+#[cfg(feature = "transport-hpke")]
+use crate::transport::handshake::Hpke;
 
 /// The reply a fresh handshake of flow `F` produces, which no other handshake
 /// admits.
@@ -199,7 +199,7 @@ async fn a_refused_reply_leaves_the_client_spent<F: TestFlow>() -> Result<(), Bo
 }
 
 /// A closing from another handshake is refused, and the server admits no
-/// step after the refusal. ECIES refuses the possession proof, which signs
+/// step after the refusal. HPKE refuses the possession proof, which signs
 /// another transcript. CMS refuses the certificate, which the opening did not
 /// bind.
 async fn a_refused_closing_leaves_the_server_spent<F: TestFlow>() -> Result<(), Box<dyn Error>> {
@@ -444,14 +444,14 @@ async fn a_local_advertisement_alone_stays_single_flight<F: TestFlow>() -> Resul
 /// Run each named test body once per protocol.
 macro_rules! over_each_flow {
 	($($test:ident),* $(,)?) => {
-		#[cfg(feature = "transport-ecies")]
-		mod ecies {
+		#[cfg(feature = "transport-hpke")]
+		mod hpke {
 			use super::*;
 
 			$(
 				#[tokio::test]
 				async fn $test() -> Result<(), Box<dyn Error>> {
-					super::$test::<Ecies>().await
+					super::$test::<Hpke>().await
 				}
 			)*
 		}

@@ -21,8 +21,7 @@
 //! ## References
 //! - CWE-757: Selection of Less-Secure Algorithm During Negotiation ('Algorithm
 //!   Downgrade') <https://cwe.mitre.org/data/definitions/757.html>
-//! - CAPEC-220: Client-Server Protocol Manipulation
-//!   <https://capec.mitre.org/data/definitions/220.html>
+//! - CAPEC-220: Client-Server Protocol Manipulation <https://capec.mitre.org/data/definitions/220.html>
 //! - CAPEC-620: Drop Encryption Level <https://capec.mitre.org/data/definitions/620.html>
 //! - RFC 9846 (TLS 1.3) §4.1.3: downgrade protection
 
@@ -72,10 +71,10 @@ tb_process_spec! {
 			DOWNGRADE_PROFILES_DIFFER,
 			DOWNGRADE_SUBSTITUTION_REJECTED,
 			SecurityThreatHarness::HARNESS_SPAWN_SESSION,
-			SecurityThreatHarness::HARNESS_SPAWN_ECIES,
+			SecurityThreatHarness::HARNESS_SPAWN_HPKE,
 			SecurityThreatHarness::HARNESS_SPAWN_CMS,
 			SecurityThreatHarness::HARNESS_SPAWN_WEAK,
-			SecurityThreatHarness::HARNESS_SPAWN_ECIES_WEAK,
+			SecurityThreatHarness::HARNESS_SPAWN_HPKE_WEAK,
 			SecurityThreatHarness::HARNESS_SPAWN_CMS_WEAK
 		}
 		hidden { }
@@ -86,20 +85,20 @@ tb_process_spec! {
 			SecurityThreatHarness::HARNESS_SPAWN_WEAK => SpawningWeak
 		},
 		SpawningStrong => {
-			SecurityThreatHarness::HARNESS_SPAWN_ECIES => StrongReady,
+			SecurityThreatHarness::HARNESS_SPAWN_HPKE => StrongReady,
 			SecurityThreatHarness::HARNESS_SPAWN_CMS => StrongReady
 		},
 		StrongReady => { DOWNGRADE_CAPTURE_STRONG => StrongCaptured },
 		StrongCaptured => { SecurityThreatHarness::HARNESS_SPAWN_WEAK => SpawningWeak },
 		SpawningWeak => {
-			SecurityThreatHarness::HARNESS_SPAWN_ECIES_WEAK => WeakReady,
+			SecurityThreatHarness::HARNESS_SPAWN_HPKE_WEAK => WeakReady,
 			SecurityThreatHarness::HARNESS_SPAWN_CMS_WEAK => WeakReady
 		},
 		WeakReady => { DOWNGRADE_CAPTURE_WEAK => WeakCaptured },
 		WeakCaptured => { DOWNGRADE_PROFILES_DIFFER => ProfilesDiffer },
 		ProfilesDiffer => { SecurityThreatHarness::HARNESS_SPAWN_SESSION => SpawningAttack },
 		SpawningAttack => {
-			SecurityThreatHarness::HARNESS_SPAWN_ECIES => AttackReady,
+			SecurityThreatHarness::HARNESS_SPAWN_HPKE => AttackReady,
 			SecurityThreatHarness::HARNESS_SPAWN_CMS => AttackReady
 		},
 		AttackReady => { DOWNGRADE_SUBSTITUTION_REJECTED => Idle }

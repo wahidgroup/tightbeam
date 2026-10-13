@@ -262,11 +262,11 @@ pub enum TightBeamError {
 	#[source]
 	InvalidKeyLength(crypto_common::InvalidLength),
 
-	/// An ECIES operation failed.
-	#[cfg(feature = "ecies")]
-	#[error("ECIES error: {0}")]
+	/// An HPKE operation failed.
+	#[cfg(feature = "hpke")]
+	#[error("HPKE error: {0}")]
 	#[source]
-	EciesError(crate::crypto::ecies::EciesError),
+	HpkeError(crate::crypto::hpke::HpkeError),
 
 	/// Certificate validation failed.
 	#[cfg(feature = "x509")]
@@ -504,8 +504,8 @@ crate::impl_from!(std::io::Error => CompressionError::IO);
 crate::impl_from!(aead::Error => TightBeamError::EncryptionError);
 #[cfg(feature = "aead")]
 crate::impl_from!(crypto_common::InvalidLength => TightBeamError::InvalidKeyLength);
-#[cfg(feature = "ecies")]
-crate::impl_from!(crate::crypto::ecies::EciesError => TightBeamError::EciesError);
+#[cfg(feature = "hpke")]
+crate::impl_from!(crate::crypto::hpke::HpkeError => TightBeamError::HpkeError);
 #[cfg(feature = "signature")]
 crate::impl_from!(signature::Error => TightBeamError::SignatureError);
 #[cfg(feature = "signature")]

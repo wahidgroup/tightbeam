@@ -71,7 +71,7 @@ impl VerificationPolicy for Secp256k1Policy {
 	) -> Result<(), CertificateValidationError> {
 		use crate::crypto::hash::Sha3_256;
 		use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1VerifyingKey};
-		use crate::crypto::sign::verify_canonical;
+		use crate::crypto::sign::LowSEncoding;
 		use crate::oids::SIGNER_ECDSA_WITH_SHA3_256;
 		use crate::spki::DecodePublicKey;
 
@@ -85,7 +85,7 @@ impl VerificationPolicy for Secp256k1Policy {
 		let verifier = Secp256k1VerifyingKey::from_public_key_der(bytes)?;
 		let signature = Secp256k1Signature::try_from(signature)?;
 
-		verify_canonical::<Sha3_256, _>(&verifier, content, &signature)?;
+		signature.verify_canonical::<Sha3_256, _>(&verifier, content)?;
 		Ok(())
 	}
 }

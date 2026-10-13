@@ -1,7 +1,7 @@
 //! Pooled multiplexing integration tests.
 
 #![cfg(all(
-	feature = "transport-ecies",
+	feature = "transport-hpke",
 	feature = "transport-policy",
 	feature = "transport-multiplex",
 	feature = "tcp",

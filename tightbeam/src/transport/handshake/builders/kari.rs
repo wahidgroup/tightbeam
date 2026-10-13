@@ -9,9 +9,10 @@ use crate::constants::TIGHTBEAM_KARI_KDF_INFO;
 use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::crypto::sign::elliptic_curve::{PublicKey, SecretKey};
 use crate::spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoOwned};
-use crate::transport::handshake::kari::{HandshakeKek, Kek, OriginatorKey};
+use crate::transport::handshake::kari::{Kek, OriginatorKey};
 use crate::transport::handshake::primitives::{KdfInfo, KdfSalt};
 use crate::transport::handshake::schedule::HandshakeAgreement;
+use crate::transport::handshake::HandshakeProvider;
 
 use crate::cms::builder::{Error as CmsBuilderError, RecipientInfoBuilder, RecipientInfoType};
 use crate::cms::content_info::CmsVersion;
@@ -19,9 +20,6 @@ use crate::cms::enveloped_data::{
 	EncryptedKey, KeyAgreeRecipientIdentifier, KeyAgreeRecipientInfo, OriginatorIdentifierOrKey, RecipientEncryptedKey,
 	RecipientInfo, UserKeyingMaterial,
 };
-use crate::crypto::profiles::CryptoProvider;
-use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
-use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic};
 
 /// Builder for `KeyAgreeRecipientInfo` with ECDH, HKDF, and key wrapping.
 ///
@@ -32,11 +30,11 @@ use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic};
 /// 3. Wrap the CEK under the KEK with AES Key Wrap (RFC 3394).
 /// 4. Construct the CMS `KeyAgreeRecipientInfo` structure.
 ///
-/// The type is generic over `P: CryptoProvider`, which supplies the
+/// The type is generic over `P: HandshakeProvider`, which supplies the
 /// cryptographic implementations.
 pub struct TightBeamKariBuilder<P>
 where
-	P: CryptoProvider,
+	P: HandshakeProvider,
 {
 	/// The sender's ephemeral private key for ECDH.
 	sender_priv: Option<SecretKey<P::Curve>>,
@@ -58,10 +56,7 @@ where
 
 impl<P> TightBeamKariBuilder<P>
 where
-	P: CryptoProvider,
-	P::Curve: Curve + CurveArithmetic,
-	<P::Curve as Curve>::FieldBytesSize: ModulusSize,
-	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
+	P: HandshakeProvider,
 {
 	/// Create a KARI builder on `provider`, with any curve the provider names.
 	///
@@ -187,10 +182,7 @@ impl Default for TightBeamKariBuilder<DefaultCryptoProvider> {
 
 impl<P> RecipientInfoBuilder for TightBeamKariBuilder<P>
 where
-	P: CryptoProvider,
-	P::Curve: Curve + CurveArithmetic,
-	<P::Curve as Curve>::FieldBytesSize: ModulusSize,
-	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
+	P: HandshakeProvider,
 {
 	fn recipient_info_type(&self) -> RecipientInfoType {
 		RecipientInfoType::Kari
@@ -208,7 +200,7 @@ where
 		let sender_priv = self.sender_priv.as_ref().ok_or(KariBuilderError::MissingSenderPrivateKey)?;
 		let recipient_pub = self.recipient_pub.as_ref().ok_or(KariBuilderError::MissingRecipientPublicKey)?;
 		let ukm = self.ukm.as_ref().ok_or(KariBuilderError::MissingUkm)?;
-		let shared_secret = sender_priv.shared_secret(recipient_pub)?;
+		let shared_secret = sender_priv.shared_secret(recipient_pub);
 		let ukm_salt = KdfSalt::new(ukm.as_bytes());
 		let kari_label = KdfInfo::new(self.kdf_info);
 		let kek = shared_secret.derive_kek::<P>(ukm_salt, kari_label)?;

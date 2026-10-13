@@ -1,9 +1,9 @@
 //! # Key-exchange splice threat (mutual authentication)
 //!
 //! ## Weakness
-//! If the ECIES mutual-auth client signature covers only the transcript hash,
-//! it does not commit to the ECIES `encrypted_data` carrying the base secret.
-//! ECIES encryption is a public-key operation, and `client_random` is public
+//! If the HPKE mutual-auth client signature covers only the transcript hash,
+//! it does not commit to the HPKE `encrypted_data` carrying the base secret.
+//! HPKE encryption is a public-key operation, and `client_random` is public
 //! (sent in `ClientHello`), so anyone can produce a decryptable payload with
 //! the victim's random.
 //!
@@ -30,18 +30,14 @@ use std::sync::Arc;
 
 use tightbeam::{
 	asn1::OctetString,
+	constants::TIGHTBEAM_HPKE_HANDSHAKE_INFO,
 	crypto::{
-		aead::Aes256Gcm,
-		ecies::{encrypt, Secp256k1EciesMessage},
-		kdf::HkdfSha3_256,
+		hpke::{HpkePublicKeyOps, HpkeSecp256k1Sha3Aes256Gcm},
 		profiles::DefaultCryptoProvider,
-		secret::ToInsecure,
 		x509::policy::{CertificateValidation, ExpiryValidator},
 	},
-	der::{Decode, Encode, Sequence},
-	exactly, job,
-	random::OsRng,
-	tb_assert_spec, tb_process_spec, tb_scenario,
+	der::{Decode, Encode},
+	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
 	testing::{ScenarioConfig, SetupEnv},
 	trace::TraceCollector,
 	transport::handshake::{
@@ -52,22 +48,16 @@ use tightbeam::{
 };
 
 use crate::common::security::{
-	carried_closing, carried_key_exchange, default_security_profile, ecies_client_config, ecies_server_config,
-	expectation_failure, pinning_validator, ClientMaterials, ServerMaterials,
+	carried_closing, carried_key_exchange, default_security_profile, expectation_failure, hpke_client_config,
+	hpke_server_config, pinning_validator, ClientMaterials, ServerMaterials,
 };
+use crate::security::common::{open_key_exchange, KeyExchangePayload};
 
 pub(crate) const SPLICED_KEX_REJECTED: Urn<'static> =
 	tightbeam::urn!("test", "event:splice-attack/spliced-kex-rejected");
 
-/// The attacker's view of the DER key-exchange plaintext. The three leading
-/// OCTET STRINGs are all a splice needs, because this unmetered session
-/// carries no trailing receipt acknowledgement.
-#[derive(Sequence)]
-struct SplicedPayload {
-	base_key: OctetString,
-	client_random: OctetString,
-	key_confirmation: OctetString,
-}
+/// The HPKE suite of the default provider, which seals the key exchange.
+type Suite = HpkeSecp256k1Sha3Aes256Gcm;
 
 tb_assert_spec! {
 	pub SpliceAttackSpec,
@@ -117,7 +107,7 @@ job! {
 		let client_identity = client_materials.identity();
 		let validator = pinning_validator(&materials.certificate);
 
-		let mut config = ecies_client_config(validator);
+		let mut config = hpke_client_config(validator);
 		config.flow.identity = Some(client_identity);
 		config.security_offer = Some(SecurityOffer::new(vec![profile]));
 
@@ -125,7 +115,7 @@ job! {
 
 		// The server holds a validator, so it requires client authentication.
 		let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator);
-		let mut server_config = ecies_server_config::<DefaultCryptoProvider>(&materials, [profile]);
+		let mut server_config = hpke_server_config::<DefaultCryptoProvider>(&materials, [profile]);
 		server_config.peer_authentication = PeerAuthentication::mutual([validator]);
 
 		let mut server = Handshake::server(server_config);
@@ -142,32 +132,24 @@ job! {
 		// Recover the victim's client_random from the legitimate payload so the
 		// spliced ciphertext still passes the server's replay check.
 		let victim_kex = ClientKeyExchange::from_der(&client_kex_der)?;
-		let victim_message = Secp256k1EciesMessage::from_bytes(victim_kex.encrypted_data.as_bytes())?;
-		let victim_plain = tightbeam::crypto::ecies::decrypt::<_, _, HkdfSha3_256, Aes256Gcm>(
-			materials.secret_key(),
-			&victim_message,
-			Some(spliced_aad.as_slice()),
-		)?
-		.to_insecure();
+		let victim_sealed = victim_kex.encrypted_data.as_bytes();
+		let victim_payload = open_key_exchange(victim_sealed, materials.secret_key(), &spliced_aad)?;
 
 		// The attacker forges a payload with its own key under the server's
 		// public key and splices it into the victim's message. The splice keeps
-		// the victim's client_random, key-confirmation tag, and DER framing.
-		let victim_payload = SplicedPayload::from_der(&victim_plain)?;
-		let forged_payload = SplicedPayload {
+		// the victim's client_random, client ephemeral, key-confirmation tag,
+		// and DER framing.
+		let forged_payload = KeyExchangePayload {
 			base_key: OctetString::new([0x41u8; 32])?, // attacker-chosen key
 			client_random: victim_payload.client_random,
+			client_ephemeral: victim_payload.client_ephemeral,
 			key_confirmation: victim_payload.key_confirmation,
 		};
 
 		let forged_plain = forged_payload.to_der()?;
 		let recipient_pub = materials.secret_key().public_key();
-		let forged_message = encrypt::<_, _, _, Secp256k1EciesMessage, HkdfSha3_256, Aes256Gcm>(
-			&recipient_pub,
-			&forged_plain,
-			Some(spliced_aad.as_slice()),
-			Some(&mut OsRng),
-		)?;
+		let info = TIGHTBEAM_HPKE_HANDSHAKE_INFO;
+		let forged_message = recipient_pub.seal::<Suite>(info, &spliced_aad, &forged_plain, None)?;
 
 		let spliced = ClientKeyExchange {
 			encrypted_data: OctetString::new(forged_message.to_bytes())?,

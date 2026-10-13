@@ -17,23 +17,22 @@ use crate::policy::{GatePolicy, SessionContext, TransitStatus};
 use crate::transport::envelopes::TransportEnvelope;
 use crate::transport::error::{TransportError, TransportFailure};
 use crate::transport::io::MessageIO;
+use crate::transport::policy::{RestartPolicy, RetryAction};
 use crate::transport::TransportResult;
 use crate::utils::marker::MaybeSend;
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::io::CollectStep;
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 mod x509 {
 	pub use crate::transport::handshake::HandshakeProvider;
 	pub use crate::transport::io::EncryptedMessageIO;
 	pub use crate::transport::state::{EncryptedProtocolState, ServerHandshakeSlot};
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use x509::*;
-
-use crate::transport::policy::{RestartPolicy, RetryAction};
 
 #[cfg(feature = "instrument")]
 use crate::instrumentation::events;
@@ -333,7 +332,7 @@ pub trait MessageCollector: CollectorRequirements {
 		Self: MaybeSend;
 
 	/// The X.509 `collect_message` with encryption and handshake support.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[allow(async_fn_in_trait)]
 	async fn collect_message_with_encryption<P>(&mut self) -> TransportResult<(Arc<Frame>, TransitStatus)>
 	where

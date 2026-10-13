@@ -21,6 +21,7 @@ dependencies = [
  "cfg-if",
  "cipher",
  "cpufeatures",
+ "zeroize",
 ]
 
 [[package]]
@@ -489,6 +490,7 @@ checksum = "f0d8a4362ccb29cb0b265253fb0a2728f592895ee6854fd9bc13f2ffda266ff1"
 dependencies = [
  "opaque-debug",
  "polyval",
+ "zeroize",
 ]
 
 [[package]]
@@ -807,6 +809,7 @@ dependencies = [
  "cpufeatures",
  "opaque-debug",
  "universal-hash",
+ "zeroize",
 ]
 
 [[package]]
@@ -1243,6 +1246,7 @@ dependencies = [
  "elliptic-curve",
  "futures",
  "getrandom 0.2.17",
+ "ghash",
  "hex-literal",
  "hkdf",
  "husky-rs",
@@ -1250,6 +1254,7 @@ dependencies = [
  "kem",
  "paste",
  "pkcs12",
+ "polyval",
  "proptest",
  "rand_core 0.6.4",
  "rayon",

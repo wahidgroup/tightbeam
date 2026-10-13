@@ -36,13 +36,13 @@ use crate::x509::Certificate;
 
 #[cfg(feature = "transport-cms")]
 mod cms;
-#[cfg(feature = "transport-ecies")]
-mod ecies;
+#[cfg(feature = "transport-hpke")]
+mod hpke;
 
 #[cfg(feature = "transport-cms")]
 pub use cms::{Cms, CmsClientSettings, CmsServerSettings};
-#[cfg(feature = "transport-ecies")]
-pub use ecies::{Ecies, EciesClientSettings, EciesServerSettings};
+#[cfg(feature = "transport-hpke")]
+pub use hpke::{Hpke, HpkeClientSettings, HpkeServerSettings};
 
 mod sealed {
 	pub trait Sealed {}
@@ -50,7 +50,7 @@ mod sealed {
 
 /// A handshake protocol, named by its marker type.
 ///
-/// The trait is sealed, so [`Ecies`] and [`Cms`] are the only flows.
+/// The trait is sealed, so [`Hpke`] and [`Cms`] are the only flows.
 pub trait HandshakeFlow: sealed::Sealed + Sized + MaybeSend + MaybeSync + 'static {}
 
 /// A signature and the public key of its signer, from one key provider.
@@ -92,7 +92,7 @@ pub struct ReplyIntake<F: ClientFlow<P>, P: HandshakeProvider> {
 	pub server_ephemeral: Vec<u8>,
 	/// The server-signed session receipt, when the session carries budgets.
 	pub receipt: Option<SignedData>,
-	/// Whether the server demands a client identity. The ECIES reply carries
+	/// Whether the server demands a client identity. The HPKE reply carries
 	/// the demand, and the CMS flow yields `false`, because a CMS client always
 	/// holds an identity.
 	pub client_cert_required: bool,
@@ -193,7 +193,7 @@ pub trait ClientFlow<P: HandshakeProvider>: HandshakeFlow {
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError::SignatureError`] -- the ECIES signature fails to parse or to verify.
+	/// - [`HandshakeError::SignatureError`] -- the HPKE signature fails to parse or to verify.
 	/// - [`HandshakeError::SignatureVerificationFailed`] -- the CMS Finished
 	///   fails to verify, or it signs another transcript or another role.
 	fn verify_reply(
@@ -403,7 +403,7 @@ pub trait ServerFlow<P: HandshakeProvider>: HandshakeFlow {
 	/// # Errors
 	///
 	/// - [`HandshakeError::KeyError`] -- the key provider failed.
-	/// - [`HandshakeError::EciesError`] -- the sealed payload fails to open.
+	/// - [`HandshakeError::HpkeError`] -- the sealed payload fails to open.
 	/// - [`HandshakeError::InvalidDecryptedPayloadSize`] -- the opened payload fails to decode.
 	/// - [`HandshakeError::InvalidKeySize`] -- the base secret of the payload is not 32 bytes.
 	/// - [`HandshakeError::OctetStringLengthError`] -- the client random of the payload is not 32 bytes.

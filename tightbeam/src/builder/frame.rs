@@ -23,7 +23,7 @@ use crate::compress::Compressor;
 #[cfg(feature = "aead")]
 use crate::crypto::aead::{AeadAlgorithm, Encryptor};
 #[cfg(feature = "digest")]
-use crate::crypto::commitment::{commit_digest, CommitmentSalt};
+use crate::crypto::commitment::CommitmentSalt;
 #[cfg(feature = "digest")]
 use crate::crypto::hash::Digest;
 #[cfg(feature = "digest")]
@@ -381,7 +381,7 @@ impl<T: Message> FrameBuilder<T> {
 		self
 	}
 
-	/// Use a custom encryptor for asymmetric encryption, such as ECIES.
+	/// Use a custom encryptor for asymmetric encryption, such as HPKE.
 	pub fn with_encryptor<C, E>(mut self, encryptor: E) -> Self
 	where
 		C: AssociatedOid,
@@ -407,7 +407,7 @@ impl<T: Message> FrameBuilder<T> {
 
 		let message_oid = self.message_oid;
 		self.encryptor = Some(Box::new(move |plaintext: &[u8]| {
-			// The encryptor generates its own nonce, as ECIES does.
+			// The encryptor derives its own nonce, as HPKE does.
 			encryptor.encrypt_content(plaintext, [], message_oid)
 		}));
 
@@ -471,7 +471,7 @@ impl<T: Message> FrameBuilder<T> {
 			}
 		};
 
-		match commit_digest::<D>(&salt, &encoded) {
+		match salt.commit::<D>(&encoded) {
 			Ok(hash_info) => {
 				self.metadata_builder = self.metadata_builder.with_integrity_info(hash_info);
 			}

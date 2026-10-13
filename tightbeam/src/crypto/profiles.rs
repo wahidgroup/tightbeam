@@ -354,10 +354,6 @@ pub trait CurveProvider {
 	/// Elliptic curve for key agreement, which names the algorithm identifier
 	/// the profile negotiates.
 	type Curve: Curve + CurveArithmetic + AssociatedOid;
-	/// ECIES wire message for this curve. A handshake holds one across an
-	/// await, so it crosses threads.
-	#[cfg(feature = "ecies")]
-	type EciesMessage: crate::crypto::ecies::EciesMessageOps + Send + Sync + 'static;
 }
 
 /// Provider role for Key Encapsulation Mechanism (KEM) operations.
@@ -401,6 +397,17 @@ pub trait CryptoProvider:
 			Kdf = Self::Kdf,
 			Curve = Self::Curve,
 		> + Default;
+
+	/// The HPKE suite this provider seals a key exchange under. Its curve, its
+	/// KDFs, and its AEAD are the types the roles above use, so the suite
+	/// runs the algorithms the profile negotiates.
+	#[cfg(feature = "hpke")]
+	type HpkeSuite: crate::crypto::hpke::HpkeSuite<
+		Curve = Self::Curve,
+		KemKdf = Self::Kdf,
+		Kdf = Self::Kdf,
+		Aead = Self::AeadCipher,
+	>;
 
 	/// Return the profile this provider runs.
 	fn profile(&self) -> &Self::Profile;
@@ -457,13 +464,13 @@ impl KdfProvider for DefaultCryptoProvider {
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 impl CurveProvider for DefaultCryptoProvider {
 	type Curve = k256::Secp256k1;
-	#[cfg(feature = "ecies")]
-	type EciesMessage = crate::crypto::ecies::Secp256k1EciesMessage;
 }
 
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 impl CryptoProvider for DefaultCryptoProvider {
 	type Profile = TightbeamProfile;
+	#[cfg(feature = "hpke")]
+	type HpkeSuite = crate::crypto::hpke::HpkeSecp256k1Sha3Aes256Gcm;
 
 	fn profile(&self) -> &Self::Profile {
 		&self.profile
@@ -560,8 +567,9 @@ impl UkmBuilder {
 mod tests {
 	use super::*;
 	use crate::constants::{
-		TIGHTBEAM_ACK_AAD_DOMAIN, TIGHTBEAM_CLIENT_FINISHED_DOMAIN, TIGHTBEAM_KARI_KDF_INFO,
-		TIGHTBEAM_SERVER_FINISHED_DOMAIN, TIGHTBEAM_SESSION_KDF_INFO, TIGHTBEAM_UKM_PREFIX,
+		TIGHTBEAM_ACK_AAD_DOMAIN, TIGHTBEAM_CLIENT_FINISHED_DOMAIN, TIGHTBEAM_HPKE_FRAME_INFO,
+		TIGHTBEAM_HPKE_HANDSHAKE_INFO, TIGHTBEAM_KARI_KDF_INFO, TIGHTBEAM_SERVER_FINISHED_DOMAIN,
+		TIGHTBEAM_SESSION_KDF_INFO, TIGHTBEAM_UKM_PREFIX,
 	};
 
 	/// Guard the domain constants against accidental change.
@@ -576,6 +584,8 @@ mod tests {
 		assert_eq!(TIGHTBEAM_CLIENT_FINISHED_DOMAIN, b"tb/handshake/finished/client/v1");
 		assert_eq!(TIGHTBEAM_ACK_AAD_DOMAIN, b"tb/handshake/ack/aad/v1");
 		assert_eq!(TIGHTBEAM_UKM_PREFIX, b"tb/kari/ukm/v1|");
+		assert_eq!(TIGHTBEAM_HPKE_HANDSHAKE_INFO, b"tb/hpke/handshake/v1");
+		assert_eq!(TIGHTBEAM_HPKE_FRAME_INFO, b"tb/hpke/frame/v1");
 	}
 
 	fn nonce(val: u8) -> [u8; 32] {
@@ -714,12 +724,12 @@ mod tests {
 	}
 
 	// The KDF and curve types carry the identifiers that peers negotiate, so
-	// the default descriptor names `HASH_SHA3_256` and `CURVE_SECP256K1`.
+	// the default descriptor names `HKDF_SHA3_256` and `CURVE_SECP256K1`.
 	#[cfg(all(feature = "kdf", feature = "ecdh"))]
 	#[test]
 	fn the_default_profile_negotiates_its_kdf_and_curve_identifiers() {
 		let desc = SecurityProfileDesc::from(&TightbeamProfile);
-		assert_eq!(desc.kdf, Some(crate::oids::HASH_SHA3_256));
+		assert_eq!(desc.kdf, Some(crate::oids::HKDF_SHA3_256));
 		assert_eq!(desc.curve, Some(crate::oids::CURVE_SECP256K1));
 	}
 }

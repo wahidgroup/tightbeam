@@ -26,7 +26,7 @@
 //!   <https://cwe.mitre.org/data/definitions/347.html>
 
 #![cfg(all(
-	feature = "transport-ecies",
+	feature = "transport-hpke",
 	feature = "transport-policy",
 	feature = "transport-multiplex",
 	feature = "tcp",

@@ -1,7 +1,7 @@
 error[E0271]: type mismatch resolving `<Aes128Profile as SecurityProfile>::AeadOid == Aes256GcmOid`
-  --> tests/compile/provider_profile_mismatch.rs:54:17
+  --> tests/compile/provider_profile_mismatch.rs:53:17
    |
-54 |     type Profile = Aes128Profile;
+53 |     type Profile = Aes128Profile;
    |                    ^^^^^^^^^^^^^ type mismatch resolving `<Aes128Profile as SecurityProfile>::AeadOid == Aes256GcmOid`
    |
 note: expected this to be `Aes256GcmOid`

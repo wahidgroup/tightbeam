@@ -1,4 +1,4 @@
-//! # Settlement-ordering threat (ECIES)
+//! # Settlement-ordering threat (HPKE)
 //!
 //! ## Weakness
 //! `TransportAuthorizer::settle` is the hook where an application performs
@@ -13,7 +13,7 @@
 //!
 //! ## Attack
 //! A network attacker captures a victim's budget-bearing `ClientKeyExchange`:
-//! the certificate, the transcript-bound auth signature, and the ECIES
+//! the certificate, the transcript-bound auth signature, and the HPKE
 //! ciphertext (`encrypted_data`). The ciphertext carries the sealed receipt
 //! countersignature, which covers only the receipt body and the settlement
 //! answer. The attacker corrupts the ciphertext and keeps the rest.
@@ -25,7 +25,7 @@
 //! ## Expected control
 //! Two layers give defense in depth:
 //!
-//! 1. Primary: the ECIES client auth signature covers
+//! 1. Primary: the HPKE client auth signature covers
 //!    `Digest(transcript_hash || encrypted_data || cert_der)`, so a corrupted
 //!    `encrypted_data` fails the proof of possession when the server admits
 //!    the client, before decryption and before settlement.
@@ -45,11 +45,7 @@
 //!   <https://cwe.mitre.org/data/definitions/347.html>
 //! - CAPEC-94: Adversary in the Middle (AiTM) <https://capec.mitre.org/data/definitions/94.html>
 
-#![cfg(all(
-	feature = "transport-ecies",
-	feature = "transport-multiplex",
-	feature = "testing"
-))]
+#![cfg(all(feature = "transport-hpke", feature = "transport-multiplex", feature = "testing"))]
 
 use std::sync::Arc;
 
@@ -74,8 +70,8 @@ pub(crate) const SETTLE_NEVER_FIRED: Urn<'static> =
 	tightbeam::urn!("test", "event:settlement-ordering/settle-never-fired");
 
 use crate::common::security::{
-	carried_closing, carried_key_exchange, contains_window, default_security_profile, ecies_client_config,
-	ecies_server_config, expectation_failure, pinning_validator, ClientMaterials, PayingApprover, ServerMaterials,
+	carried_closing, carried_key_exchange, contains_window, default_security_profile, expectation_failure,
+	hpke_client_config, hpke_server_config, pinning_validator, ClientMaterials, PayingApprover, ServerMaterials,
 	SettleSpyAuthorizer,
 };
 
@@ -95,7 +91,7 @@ tb_assert_spec! {
 	}
 }
 
-// A budget-bearing ClientKeyExchange whose ECIES ciphertext is corrupted MUST
+// A budget-bearing ClientKeyExchange whose HPKE ciphertext is corrupted MUST
 // be rejected before settlement runs: the authorizer's settle hook records
 // zero calls.
 tb_scenario! {
@@ -108,7 +104,7 @@ tb_scenario! {
 			let client_materials = ClientMaterials::deterministic();
 			let client_identity = client_materials.identity();
 
-			let mut config = ecies_client_config(pinning_validator(&materials.certificate));
+			let mut config = hpke_client_config(pinning_validator(&materials.certificate));
 			config.flow.identity = Some(client_identity);
 			config.security_offer = Some(SecurityOffer::new(vec![profile]));
 			config.transport_offer = Some(TransportOffer::mux(4).with_budgets(REQUEST));
@@ -117,7 +113,7 @@ tb_scenario! {
 			let mut client = Handshake::client(config);
 			let authorizer = Arc::new(SettleSpyAuthorizer::challenging(CHALLENGE)?);
 			let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator);
-			let mut server_config = ecies_server_config::<DefaultCryptoProvider>(&materials, [profile]);
+			let mut server_config = hpke_server_config::<DefaultCryptoProvider>(&materials, [profile]);
 			server_config.peer_authentication = PeerAuthentication::mutual([validator]);
 			server_config.transport = Some(TransportOffer::mux(4));
 			server_config.transport_authorizer = Some(Arc::clone(&authorizer) as _);
@@ -128,7 +124,7 @@ tb_scenario! {
 			let client_kex_der = carried_key_exchange(closing).to_der()?;
 
 			// Confidentiality: the paying party's settlement answer is
-			// folded into the ECIES payload encrypted to the server, so the
+			// folded into the HPKE payload encrypted to the server, so the
 			// plaintext RESPONSE must never appear in the cleartext key
 			// exchange wire bytes.
 			let response_leaked = contains_window(&client_kex_der, RESPONSE);
@@ -138,7 +134,7 @@ tb_scenario! {
 				!response_leaked,
 			)?;
 
-			// Corrupt the ECIES ciphertext and keep the certificate and the
+			// Corrupt the HPKE ciphertext and keep the certificate and the
 			// auth signature. The ciphertext carries the sealed receipt
 			// countersignature, so the server must refuse the key exchange
 			// before it opens the payload or settles.

@@ -6,7 +6,7 @@
 //!
 //! ## Attack
 //! A valid handshake message carrying a nonce is captured and replayed
-//! (same nonce) to the server (all enabled backends: ECIES, CMS).
+//! (same nonce) to the server (all enabled backends: HPKE, CMS).
 //!
 //! ## Expected control
 //! Per-message nonces MUST be unique (monotonic counter + XOR derivation).
@@ -16,10 +16,8 @@
 //! randomness the attacker cannot influence).
 //!
 //! ## References
-//! - CWE-323: Reusing a Nonce, Key Pair in Encryption
-//!   <https://cwe.mitre.org/data/definitions/323.html>
-//! - CWE-294: Authentication Bypass by Capture-replay
-//!   <https://cwe.mitre.org/data/definitions/294.html>
+//! - CWE-323: Reusing a Nonce, Key Pair in Encryption <https://cwe.mitre.org/data/definitions/323.html>
+//! - CWE-294: Authentication Bypass by Capture-replay <https://cwe.mitre.org/data/definitions/294.html>
 //! - NIST SP 800-38D §8: IV/nonce uniqueness requirements for GCM
 
 use std::sync::Arc;
@@ -65,7 +63,7 @@ tb_process_spec! {
 			NONCE_REPLAY_ATTEMPT,
 			NONCE_REPLAY_REJECTED,
 			SecurityThreatHarness::HARNESS_SPAWN_SESSION,
-			SecurityThreatHarness::HARNESS_SPAWN_ECIES,
+			SecurityThreatHarness::HARNESS_SPAWN_HPKE,
 			SecurityThreatHarness::HARNESS_SPAWN_CMS
 		}
 		hidden { }
@@ -73,19 +71,19 @@ tb_process_spec! {
 	states {
 		Idle => { SecurityThreatHarness::HARNESS_SPAWN_SESSION => SpawningCapture },
 		SpawningCapture => {
-			SecurityThreatHarness::HARNESS_SPAWN_ECIES => CaptureReady,
+			SecurityThreatHarness::HARNESS_SPAWN_HPKE => CaptureReady,
 			SecurityThreatHarness::HARNESS_SPAWN_CMS => CaptureReady
 		},
 		CaptureReady => { NONCE_CAPTURE_VALID => Captured },
 		Captured => { SecurityThreatHarness::HARNESS_SPAWN_SESSION => SpawningFirst },
 		SpawningFirst => {
-			SecurityThreatHarness::HARNESS_SPAWN_ECIES => FirstUseReady,
+			SecurityThreatHarness::HARNESS_SPAWN_HPKE => FirstUseReady,
 			SecurityThreatHarness::HARNESS_SPAWN_CMS => FirstUseReady
 		},
 		FirstUseReady => { NONCE_FIRST_USE => FirstUsed },
 		FirstUsed => { SecurityThreatHarness::HARNESS_SPAWN_SESSION => SpawningReplay },
 		SpawningReplay => {
-			SecurityThreatHarness::HARNESS_SPAWN_ECIES => ReplayReady,
+			SecurityThreatHarness::HARNESS_SPAWN_HPKE => ReplayReady,
 			SecurityThreatHarness::HARNESS_SPAWN_CMS => ReplayReady
 		},
 		ReplayReady => { NONCE_REPLAY_ATTEMPT => ReplayAttempted },

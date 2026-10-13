@@ -30,94 +30,91 @@
 
 use core::fmt;
 
-#[cfg(all(
-	not(feature = "std"),
-	any(feature = "transport-cms", feature = "transport-ecies")
-))]
+#[cfg(all(not(feature = "std"), any(feature = "transport-cms", feature = "transport-hpke")))]
 use alloc::vec::Vec;
 
 #[cfg(any(
-	feature = "transport-ecies",
+	feature = "transport-hpke",
 	all(feature = "transport-cms", feature = "transport-multiplex")
 ))]
 use crate::constants::EC_PUBKEY_COMPRESSED_SIZE;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::constants::{
 	MIN_SALT_ENTROPY_BYTES, TIGHTBEAM_ACK_AAD_DOMAIN, TIGHTBEAM_ACK_KDF_INFO, TIGHTBEAM_C2S_KDF_INFO,
 	TIGHTBEAM_CONFIRM_KDF_INFO, TIGHTBEAM_EPOCH_KDF_INFO, TIGHTBEAM_S2C_KDF_INFO, TIGHTBEAM_SESSION_KDF_INFO,
 };
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::aead::{Aead, DirectionalCiphers, KeyInit, Nonce, Payload, SessionKeys};
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::common::KeySizeUser;
 #[cfg(all(
 	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-ecies")
+	any(feature = "transport-cms", feature = "transport-hpke")
 ))]
 use crate::crypto::hash::Digest;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::kdf::{EcdhSecret, KdfFunction};
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::profiles::CryptoProvider;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::secret::SecretSlice;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-use crate::crypto::sign::elliptic_curve::ecdh::{diffie_hellman, EphemeralSecret};
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::crypto::sign::elliptic_curve::ecdh::EphemeralSecret;
 #[cfg(any(
-	feature = "transport-ecies",
+	feature = "transport-hpke",
 	all(feature = "transport-cms", feature = "transport-multiplex")
 ))]
 use crate::crypto::sign::elliptic_curve::sec1::ToEncodedPoint;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::sign::elliptic_curve::{CurveArithmetic, PublicKey, SecretKey};
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::subtle::ConstantTimeEq;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::x509::utils::CertificateExt;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::der::asn1::OctetStringRef;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::der::{DecodeValue, EncodeValue, FixedTag, Header, Length, Reader, Result as DerResult, Tag, Writer};
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::random::{generate_nonce, CryptoRngCore};
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::error::HandshakeError;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::negotiation::{MuxSettings, RunnableProfile};
 #[cfg(all(
 	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-ecies")
+	any(feature = "transport-cms", feature = "transport-hpke")
 ))]
 use crate::transport::handshake::primitives::transcript::Transcript;
-#[cfg(feature = "transport-ecies")]
+#[cfg(feature = "transport-hpke")]
 use crate::transport::handshake::primitives::RandomsSalt;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::primitives::{multi_input_kdf, KdfInfo, KdfSalt};
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::receipt::StoredReceipt;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::{Arc, EstablishedSession, HandshakeCurve, HandshakeProvider};
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::utils::marker::{MaybeSend, MaybeSync};
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::x509::Certificate;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::{ZeroizingArray, ZeroizingBytes};
 
 /// The 32-byte random secret the client seals to the server's static key.
 ///
-/// It is one of the two inputs of [`HandshakeSecret::derive`]. ECIES carries
+/// It is one of the two inputs of [`HandshakeSecret::derive`]. HPKE carries
 /// it inside the key-exchange payload, and CMS as the content of the
 /// key-exchange envelope. The length is part of the type, so a parse that
 /// lands here has already refused every other length.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub(crate) struct BaseSecret(ZeroizingArray<BASE_SECRET_SIZE>);
 
 /// Base secret length in bytes.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 const BASE_SECRET_SIZE: usize = 32;
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl BaseSecret {
 	/// Draw a fresh base secret from `rng`, or from the OS random source when
 	/// `rng` is `None`.
@@ -138,7 +135,7 @@ impl BaseSecret {
 }
 
 /// Parse the opened key-exchange content as the base secret.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl TryFrom<SecretSlice<u8>> for BaseSecret {
 	type Error = HandshakeError;
 
@@ -164,14 +161,14 @@ impl TryFrom<SecretSlice<u8>> for BaseSecret {
 ///
 /// Every session key derives from this one value, and the crate's one
 /// constructor for it takes the two inputs named above.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub struct HandshakeSecret(ZeroizingBytes);
 
 /// Handshake secret length in bytes.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 const HANDSHAKE_SECRET_SIZE: usize = 32;
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl HandshakeSecret {
 	/// Derive the handshake secret from `base` and the ephemeral-ephemeral
 	/// ECDH output `shared`, extracted under `salt`.
@@ -327,7 +324,7 @@ impl HandshakeSecret {
 }
 
 /// Debug output redacts the handshake secret.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl fmt::Debug for HandshakeSecret {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.debug_struct("HandshakeSecret").finish_non_exhaustive()
@@ -338,10 +335,10 @@ impl fmt::Debug for HandshakeSecret {
 ///
 /// [`HandshakeSecret::confirmed`] is its one producer, so a step that takes
 /// a `ConfirmedSecret` runs only after the key-confirmation tag verified.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub struct ConfirmedSecret(HandshakeSecret);
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl ConfirmedSecret {
 	/// The confirmed secret, for the one seal that opens under it.
 	pub(crate) fn secret(&self) -> &HandshakeSecret {
@@ -359,15 +356,15 @@ impl ConfirmedSecret {
 /// [`HandshakeSecret::confirmation`] derives the tag an endpoint sends or
 /// expects. A received tag decodes as a 32-byte OCTET STRING, and another
 /// width fails to decode, so every tag has the one width.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 #[derive(Clone)]
 pub struct KeyConfirmation([u8; KEY_CONFIRMATION_SIZE]);
 
 /// Key-confirmation tag length in bytes.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 const KEY_CONFIRMATION_SIZE: usize = 32;
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl KeyConfirmation {
 	/// Verify in constant time that `received` is this tag.
 	///
@@ -385,12 +382,12 @@ impl KeyConfirmation {
 	}
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl FixedTag for KeyConfirmation {
 	const TAG: Tag = Tag::OctetString;
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl EncodeValue for KeyConfirmation {
 	fn value_len(&self) -> DerResult<Length> {
 		Length::try_from(self.0.len())
@@ -401,7 +398,7 @@ impl EncodeValue for KeyConfirmation {
 	}
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl<'a> DecodeValue<'a> for KeyConfirmation {
 	fn decode_value<R: Reader<'a>>(reader: &mut R, header: Header) -> DerResult<Self> {
 		let octets = OctetStringRef::decode_value(reader, header)?;
@@ -410,7 +407,7 @@ impl<'a> DecodeValue<'a> for KeyConfirmation {
 	}
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 mod sealed {
 	/// Closes [`TrafficSecret`](super::TrafficSecret) to this module.
 	pub trait Sealed {}
@@ -421,16 +418,16 @@ mod sealed {
 /// The directional derivation takes an implementor, and the implementors are
 /// the handshake secret and the epoch secret that rotates from it. The trait
 /// is sealed, so those two are the only inputs the derivation has.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub(crate) trait TrafficSecret: sealed::Sealed {
 	/// The secret bytes, for the provider KDF that extracts from them.
 	fn as_bytes(&self) -> &[u8];
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl sealed::Sealed for HandshakeSecret {}
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl TrafficSecret for HandshakeSecret {
 	fn as_bytes(&self) -> &[u8] {
 		&self.0
@@ -443,13 +440,13 @@ impl TrafficSecret for HandshakeSecret {
 /// [`EpochMaterials::derive`], and each rotation derives the next link from
 /// the previous one and a fresh agreement through [`Self::next`]. Those two
 /// are its constructors.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub(crate) struct EpochSecret(ZeroizingBytes);
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl sealed::Sealed for EpochSecret {}
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl TrafficSecret for EpochSecret {
 	fn as_bytes(&self) -> &[u8] {
 		&self.0
@@ -458,7 +455,7 @@ impl TrafficSecret for EpochSecret {
 
 #[cfg(all(
 	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-ecies")
+	any(feature = "transport-cms", feature = "transport-hpke")
 ))]
 impl EpochSecret {
 	/// The next link of the rekey KDF chain: this link and a fresh agreement
@@ -478,8 +475,7 @@ impl EpochSecret {
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the
-	///   derivation, or the curve's shared secret is not 32 bytes.
+	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the derivation.
 	/// - [`HandshakeError::IntegerOutOfRange`] -- an input exceeds the framing prefix.
 	pub(crate) fn next<P>(
 		&self,
@@ -490,7 +486,7 @@ impl EpochSecret {
 	where
 		P: HandshakeProvider,
 	{
-		let shared = local.shared_secret(peer.as_public_key())?;
+		let shared = local.shared_secret(peer.as_public_key());
 
 		// The scalar served its one agreement, so its box drops here and the
 		// scalar is wiped in place before the derivation runs.
@@ -528,7 +524,7 @@ pub struct EpochMaterials {
 	/// Current epoch secret, zeroized on drop and on rotation
 	/// (RFC 9846, 7.2). Only `transport::rekey` reads it, and a build can
 	/// include the handshake without the `transport-multiplex` consumers.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[allow(dead_code)]
 	pub(crate) secret: EpochSecret,
 	/// Epoch counter. It is 0 at handshake and increments on each rekey
@@ -560,7 +556,7 @@ impl fmt::Debug for EpochMaterials {
 	}
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl EpochMaterials {
 	/// Derive the epoch-0 secret from the handshake secret under the
 	/// dedicated epoch info label.
@@ -591,7 +587,7 @@ impl EpochMaterials {
 
 #[cfg(all(
 	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-ecies")
+	any(feature = "transport-cms", feature = "transport-hpke")
 ))]
 impl EpochMaterials {
 	/// The pin an epoch receipt commits to:
@@ -641,16 +637,16 @@ impl EpochMaterials {
 }
 
 /// Epoch secret length in bytes: one 256-bit KDF chain link.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 const EPOCH_SECRET_SIZE: usize = 32;
 
 /// The compressed SEC1 encoding of an ephemeral public key.
 ///
-/// The ECIES transcript and the rekey pin take the point at this width, so an
+/// The HPKE transcript and the rekey pin take the point at this width, so an
 /// ephemeral of any other length fails before the signature check rather than
 /// hashing as a variable-length leg.
 #[cfg(any(
-	feature = "transport-ecies",
+	feature = "transport-hpke",
 	all(feature = "transport-cms", feature = "transport-multiplex")
 ))]
 pub(crate) trait CompressedPoint {
@@ -664,7 +660,7 @@ pub(crate) trait CompressedPoint {
 }
 
 #[cfg(any(
-	feature = "transport-ecies",
+	feature = "transport-hpke",
 	all(feature = "transport-cms", feature = "transport-multiplex")
 ))]
 impl<C: HandshakeCurve> CompressedPoint for PublicKey<C> {
@@ -683,10 +679,10 @@ impl<C: HandshakeCurve> CompressedPoint for PublicKey<C> {
 ///
 /// [`PeerEphemeral::distinct_ephemeral`] is its one producer, so an agreement
 /// that takes a `PeerPoint` runs on no other point.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub struct PeerPoint<C: CurveArithmetic>(PublicKey<C>);
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl<C: CurveArithmetic> PeerPoint<C> {
 	/// The admitted point, for the scalar multiplication that reads it.
 	pub(crate) fn as_public_key(&self) -> &PublicKey<C> {
@@ -701,7 +697,7 @@ impl<C: CurveArithmetic> PeerPoint<C> {
 /// multiplication runs on an invalid one. A point equal to the static key
 /// `self` is refused as well, because the agreement would then collapse into
 /// the static one that key recovers.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub(crate) trait PeerEphemeral<C>
 where
 	C: CurveArithmetic,
@@ -740,7 +736,7 @@ where
 	}
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl<C: HandshakeCurve> PeerEphemeral<C> for PublicKey<C> {
 	fn distinct_ephemeral(&self, sec1: &[u8]) -> Result<Option<PeerPoint<C>>, HandshakeError> {
 		let ephemeral = PublicKey::<C>::from_sec1_bytes(sec1)?;
@@ -760,37 +756,34 @@ impl<C: HandshakeCurve> PeerEphemeral<C> for PublicKey<C> {
 ///
 /// Every peer arrives as a parsed [`PublicKey`], so each point has passed
 /// `from_sec1_bytes` before it reaches a scalar multiplication.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub(crate) trait HandshakeAgreement<C>
 where
-	C: CurveArithmetic,
+	C: HandshakeCurve,
 {
-	/// ECDH with `peer`, sized to the shared secret the key schedule takes.
-	///
-	/// # Errors
-	///
-	/// - [`HandshakeError::KdfError`] -- the curve's shared secret is not 32 bytes.
-	fn shared_secret(&self, peer: &PublicKey<C>) -> Result<EcdhSecret, HandshakeError>;
+	/// ECDH with `peer`, as the shared secret the key schedule takes. A
+	/// handshake curve fixes that secret at 32 bytes, which is the width of
+	/// [`EcdhSecret`].
+	fn shared_secret(&self, peer: &PublicKey<C>) -> EcdhSecret;
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl<C> HandshakeAgreement<C> for EphemeralSecret<C>
 where
-	C: CurveArithmetic,
+	C: HandshakeCurve,
 {
-	fn shared_secret(&self, peer: &PublicKey<C>) -> Result<EcdhSecret, HandshakeError> {
-		Ok(EcdhSecret::try_from(self.diffie_hellman(peer))?)
+	fn shared_secret(&self, peer: &PublicKey<C>) -> EcdhSecret {
+		EcdhSecret::from(self.diffie_hellman(peer))
 	}
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl<C> HandshakeAgreement<C> for SecretKey<C>
 where
-	C: CurveArithmetic,
+	C: HandshakeCurve,
 {
-	fn shared_secret(&self, peer: &PublicKey<C>) -> Result<EcdhSecret, HandshakeError> {
-		let shared = diffie_hellman(self.to_nonzero_scalar(), peer.as_affine());
-		Ok(EcdhSecret::try_from(shared)?)
+	fn shared_secret(&self, peer: &PublicKey<C>) -> EcdhSecret {
+		EcdhSecret::agree(self, peer)
 	}
 }
 
@@ -799,13 +792,13 @@ where
 ///
 /// Each protocol builds one where both halves exist, and [`Self::settle`] is
 /// the one derivation of the [`HandshakeSecret`].
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub(crate) struct Agreement<'a, P: HandshakeProvider> {
 	base: &'a BaseSecret,
 	peer: &'a PublicKey<P::Curve>,
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl<'a, P: HandshakeProvider> Agreement<'a, P> {
 	/// Pair `base` with the point `peer` it is agreed with.
 	pub(crate) fn new(base: &'a BaseSecret, peer: &'a PublicKey<P::Curve>) -> Self {
@@ -817,20 +810,19 @@ impl<'a, P: HandshakeProvider> Agreement<'a, P> {
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError::KdfError`] -- the shared secret is not 32 bytes, or
-	///   the provider KDF refused the derivation.
+	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the derivation.
 	/// - [`HandshakeError::IntegerOutOfRange`] -- an input exceeds the framing prefix.
 	pub(crate) fn settle(
 		self,
 		local: &impl HandshakeAgreement<P::Curve>,
 		salt: KdfSalt<'_>,
 	) -> Result<HandshakeSecret, HandshakeError> {
-		let shared = local.shared_secret(self.peer)?;
+		let shared = local.shared_secret(self.peer);
 		HandshakeSecret::derive::<P>(self.base, &shared, salt)
 	}
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl<C> DirectionalCiphers<C>
 where
 	C: KeyInit,
@@ -864,7 +856,7 @@ where
 }
 
 /// Derive one direction's cipher under the given KDF info label.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 fn derive_labeled_cipher<P>(
 	input_key: &[u8],
 	salt: KdfSalt<'_>,
@@ -884,24 +876,24 @@ where
 ///
 /// Each protocol salts every derivation of one handshake with one value, and
 /// [`Terms::kdf_salt`] yields it.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub struct Salt(SaltSource);
 
 /// Where the salt of a flow comes from.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 enum SaltSource {
 	/// The concatenation `client_random || server_random`.
-	#[cfg(feature = "transport-ecies")]
+	#[cfg(feature = "transport-hpke")]
 	Randoms(RandomsSalt),
 	/// The transcript hash that the [`Terms`] hold.
 	#[cfg(feature = "transport-cms")]
 	TranscriptHash,
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl Salt {
-	/// The ECIES salt, `client_random || server_random`.
-	#[cfg(feature = "transport-ecies")]
+	/// The HPKE salt, `client_random || server_random`.
+	#[cfg(feature = "transport-hpke")]
 	pub(crate) fn randoms(client_random: &[u8; 32], server_random: &[u8; 32]) -> Self {
 		Self(SaltSource::Randoms(RandomsSalt::new(client_random, server_random)))
 	}
@@ -917,7 +909,7 @@ impl Salt {
 ///
 /// The fields are fixed together at the leg that seals the transcript, so a
 /// handshake that holds terms holds all of them.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub struct Terms<P: HandshakeProvider> {
 	profile: RunnableProfile<P>,
 	mux: Option<MuxSettings>,
@@ -925,7 +917,7 @@ pub struct Terms<P: HandshakeProvider> {
 	salt: Salt,
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl<P: HandshakeProvider> Terms<P> {
 	/// Fix the terms of one handshake.
 	///
@@ -958,7 +950,7 @@ impl<P: HandshakeProvider> Terms<P> {
 	/// The salt every derivation of this handshake runs under.
 	pub(crate) fn kdf_salt(&self) -> KdfSalt<'_> {
 		match &self.salt.0 {
-			#[cfg(feature = "transport-ecies")]
+			#[cfg(feature = "transport-hpke")]
 			SaltSource::Randoms(randoms) => randoms.as_kdf_salt(),
 			#[cfg(feature = "transport-cms")]
 			SaltSource::TranscriptHash => KdfSalt::new(&self.transcript_hash),
@@ -967,7 +959,7 @@ impl<P: HandshakeProvider> Terms<P> {
 }
 
 /// The certificate a role records as its peer.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub trait PeerIdentity: MaybeSend + MaybeSync + 'static {
 	/// The certificate the session records, or `None` when the peer proved no
 	/// identity.
@@ -977,7 +969,7 @@ pub trait PeerIdentity: MaybeSend + MaybeSync + 'static {
 /// What both sides hold once the handshake secret exists.
 ///
 /// [`Self::complete`] consumes it, so one handshake derives one session.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub struct Agreed<P: HandshakeProvider, Peer: PeerIdentity> {
 	terms: Terms<P>,
 	secret: HandshakeSecret,
@@ -985,7 +977,7 @@ pub struct Agreed<P: HandshakeProvider, Peer: PeerIdentity> {
 	peer: Peer,
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl<P: HandshakeProvider, Peer: PeerIdentity> Agreed<P, Peer> {
 	/// Gather what one handshake agreed.
 	///
@@ -1040,7 +1032,7 @@ impl<P: HandshakeProvider, Peer: PeerIdentity> Agreed<P, Peer> {
 }
 
 /// Public-key extraction from a certificate.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub trait HandshakeVerifyingKey {
 	/// Public key parsed from this certificate's SPKI, on curve `C`.
 	///
@@ -1050,7 +1042,7 @@ pub trait HandshakeVerifyingKey {
 	fn verifying_key<C: HandshakeCurve>(&self) -> Result<PublicKey<C>, HandshakeError>;
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl HandshakeVerifyingKey for Certificate {
 	fn verifying_key<C: HandshakeCurve>(&self) -> Result<PublicKey<C>, HandshakeError> {
 		let pubkey_bytes = self.verifying_key_bytes();
@@ -1064,6 +1056,9 @@ mod tests {
 	#[cfg(feature = "transport-multiplex")]
 	use crate::crypto::hash::Sha3_256;
 	use crate::crypto::profiles::{AeadProvider, DefaultCryptoProvider};
+	use crate::crypto::secret::ToInsecure;
+	use crate::crypto::sign::ecdsa::k256::Secp256k1;
+	use crate::random::OsRng;
 
 	/// A base secret of `fill` bytes.
 	fn base_secret(fill: u8) -> BaseSecret {
@@ -1314,7 +1309,7 @@ mod tests {
 		assert_eq!(terms.kdf_salt().as_bytes(), [0x07u8; 32]);
 	}
 
-	/// An ECIES handshake salts every derivation with the client random
+	/// An HPKE handshake salts every derivation with the client random
 	/// followed by the server random.
 	#[test]
 	fn a_randoms_salt_is_the_client_random_then_the_server_random() {
@@ -1366,5 +1361,20 @@ mod tests {
 		assert_ne!(base.secret.as_bytes(), salted.secret.as_bytes());
 
 		Ok(())
+	}
+
+	/// The ephemeral holder converts the curve's own output, and the static
+	/// holder multiplies in [`EcdhSecret::agree`], which HPKE also runs. Both
+	/// reach one secret for one pair of keys.
+	#[test]
+	fn every_agreement_path_reaches_one_secret() {
+		let ephemeral = EphemeralSecret::<Secp256k1>::random(&mut OsRng);
+		let fixed = SecretKey::<Secp256k1>::random(&mut OsRng);
+		let ephemeral_public = ephemeral.public_key();
+		let fixed_public = fixed.public_key();
+
+		let from_ephemeral = ephemeral.shared_secret(&fixed_public).to_insecure();
+		let from_static = fixed.shared_secret(&ephemeral_public).to_insecure();
+		assert_eq!(from_ephemeral, from_static);
 	}
 }

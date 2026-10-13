@@ -5,13 +5,13 @@
 //! be modified in transit without detection.
 //!
 //! ## Attack
-//! 1. Client and server begin a handshake (all enabled backends: ECIES, CMS).
+//! 1. Client and server begin a handshake (all enabled backends: HPKE, CMS).
 //! 2. A MITM intercepts and modifies a message in transit.
 //! 3. The recipient processes the tampered message.
 //!
 //! ## Expected control
 //! Both parties MUST sign `transcript_hash`, verified against certificates. Any
-//! modification MUST cause signature-verification failure (ECIES: tampered
+//! modification MUST cause signature-verification failure (HPKE: tampered
 //! `ServerHandshake`; CMS: tampered `Finished` `SignedData`).
 //!
 //! ## References
@@ -64,7 +64,7 @@ tb_process_spec! {
 			MITM_INJECT_TAMPERED,
 			MITM_TAMPERING_DETECTED,
 			SecurityThreatHarness::HARNESS_SPAWN_SESSION,
-			SecurityThreatHarness::HARNESS_SPAWN_ECIES,
+			SecurityThreatHarness::HARNESS_SPAWN_HPKE,
 			SecurityThreatHarness::HARNESS_SPAWN_CMS
 		}
 		hidden { }
@@ -72,14 +72,14 @@ tb_process_spec! {
 	states {
 		Idle => { SecurityThreatHarness::HARNESS_SPAWN_SESSION => SpawningCapture },
 		SpawningCapture => {
-			SecurityThreatHarness::HARNESS_SPAWN_ECIES => CaptureReady,
+			SecurityThreatHarness::HARNESS_SPAWN_HPKE => CaptureReady,
 			SecurityThreatHarness::HARNESS_SPAWN_CMS => CaptureReady
 		},
 		CaptureReady => { MITM_CAPTURE_HANDSHAKE => Captured },
 		Captured => { MITM_TAMPER_MESSAGE => Tampered },
 		Tampered => { SecurityThreatHarness::HARNESS_SPAWN_SESSION => SpawningAttack },
 		SpawningAttack => {
-			SecurityThreatHarness::HARNESS_SPAWN_ECIES => AttackReady,
+			SecurityThreatHarness::HARNESS_SPAWN_HPKE => AttackReady,
 			SecurityThreatHarness::HARNESS_SPAWN_CMS => AttackReady
 		},
 		AttackReady => { MITM_INJECT_TAMPERED => Injected },
@@ -117,7 +117,7 @@ job! {
 
 			// ========================================
 			// Step 2: Find a server-to-client message to tamper
-			// ECIES: ServerHandshake (step 1)
+			// HPKE: ServerHandshake (step 1)
 			// CMS: ServerFinished (step 2)
 			// ========================================
 			let target = captured

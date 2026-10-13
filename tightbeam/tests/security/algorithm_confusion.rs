@@ -17,8 +17,7 @@
 //! ## References
 //! - CWE-347: Improper Verification of Cryptographic Signature
 //!   <https://cwe.mitre.org/data/definitions/347.html>
-//! - CAPEC-475: Signature Spoofing by Improper Validation
-//!   <https://capec.mitre.org/data/definitions/475.html>
+//! - CAPEC-475: Signature Spoofing by Improper Validation <https://capec.mitre.org/data/definitions/475.html>
 //! - RFC 5280 §4.1.1.2: signatureAlgorithm identifier binding
 
 use std::sync::Arc;
@@ -27,7 +26,7 @@ use tightbeam::{
 	crypto::{
 		hash::Sha3_256,
 		policy::{Secp256k1Policy, VerificationPolicy},
-		sign::{ecdsa::Secp256k1Signature, sign_canonical},
+		sign::{ecdsa::Secp256k1Signature, CanonicalSigner},
 	},
 	der::Encode,
 	exactly, job,
@@ -89,7 +88,7 @@ job! {
 		let spki_der = cert.tbs_certificate.subject_public_key_info.to_der()?;
 
 		let message: &[u8] = b"tbs-certificate-bytes";
-		let signature: Secp256k1Signature = sign_canonical::<Sha3_256, _>(&signing_key, message).map_err(|_| expectation_failure("signing failed"))?;
+		let signature: Secp256k1Signature = signing_key.sign_canonical::<Sha3_256>(message).map_err(|_| expectation_failure("signing failed"))?;
 		let signature_bytes = signature.to_bytes();
 
 		// The signature genuinely verifies under the real secp256k1 ECDSA OID.

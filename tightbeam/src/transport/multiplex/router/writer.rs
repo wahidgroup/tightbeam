@@ -8,19 +8,13 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 use std::sync::Arc;
 
-#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
-use super::shared::RekeyPhase;
-#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
-use crate::constants::DEFAULT_REKEY_DEADLINE_SECS;
-#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
-use crate::utils::time::{Clock, MonotonicInstant};
-#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
+#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
 use core::time::Duration;
 
 use futures::channel::mpsc;
 use futures::Stream;
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use futures::lock::Mutex as FuturesMutex;
 
 use super::outbound::Outbound;
@@ -30,24 +24,30 @@ use crate::transport::io::EnvelopeSink;
 use crate::transport::multiplex::MuxRole;
 use crate::transport::TransportResult;
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use super::flow::renewal_floor;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
+use super::shared::RekeyPhase;
+#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
+use crate::constants::DEFAULT_REKEY_DEADLINE_SECS;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::aead::SendCipher;
 #[cfg(feature = "instrument")]
 use crate::instrumentation::events;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::rekey::ClientRekeyExchange;
+#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
+use crate::utils::time::{Clock, MonotonicInstant};
 
 /// One unit of writer work, resolved by [`MuxWriterDriver::poll_step`].
 enum WriterStep {
 	/// A command from the outbound queue.
 	Command(Outbound),
 	/// Owed c2s chunks have quiesced, so the held `RekeyAck` may go out.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	WriteAck,
 	/// The renewal deadline elapsed, so the connection drains.
-	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
+	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
 	RenewalExpired,
 	/// Every sender is gone and the outbound queue has ended.
 	Closed,
@@ -71,27 +71,27 @@ where
 	/// Client half of the rekey exchange, shared with the reader driver. The
 	/// writer only calls `try_lock` on it, for the synchronous
 	/// [`ClientRekeyExchange::start_renewal`].
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	exchange: Option<Arc<FuturesMutex<Box<dyn ClientRekeyExchange>>>>,
 	/// `RekeyAck` held back until owed c2s chunks quiesce, with the fresh send
 	/// cipher it switches to. The ack must trail every old-epoch data chunk on
 	/// the wire.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pending_ack: Option<(TransportEnvelope, Box<SendCipher>)>,
 	/// The instant the in-flight renewal was first observed, which starts the
 	/// deadline that bounds a stalled exchange.
-	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
+	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
 	renewal_started: Option<MonotonicInstant>,
 	/// Time budget for one renewal exchange before the connection drains. The
 	/// default is [`DEFAULT_REKEY_DEADLINE_SECS`].
-	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
+	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
 	renewal_deadline: Duration,
 	/// The clock the renewal deadline is stamped on and waited out on. It is
 	/// the clock of the link the driver writes to, unless
 	/// [`MuxTransport::with_clock`] replaced it.
 	///
 	/// [`MuxTransport::with_clock`]: super::transport::MuxTransport::with_clock
-	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
+	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
 	clock: Arc<dyn Clock>,
 }
 
@@ -121,7 +121,7 @@ where
 	///
 	/// - `drain_headroom`: the records reserved for draining before the send cipher halts.
 	pub fn new(writer: W, commands: mpsc::Receiver<Outbound>, shared: Arc<MuxShared>, drain_headroom: u64) -> Self {
-		#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
+		#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
 		let clock = writer.clock();
 
 		Self {
@@ -129,33 +129,33 @@ where
 			commands,
 			shared,
 			drain_headroom,
-			#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 			exchange: None,
-			#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 			pending_ack: None,
-			#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
+			#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
 			renewal_started: None,
-			#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
+			#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
 			renewal_deadline: Duration::from_secs(DEFAULT_REKEY_DEADLINE_SECS),
-			#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
+			#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
 			clock,
 		}
 	}
 
 	/// Attach a shared handle to the client half of the rekey exchange.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub(crate) fn set_exchange(&mut self, exchange: Arc<FuturesMutex<Box<dyn ClientRekeyExchange>>>) {
 		self.exchange = Some(exchange);
 	}
 
 	/// Override the time budget for one renewal exchange.
-	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
+	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
 	pub fn set_renewal_deadline(&mut self, deadline: Duration) {
 		self.renewal_deadline = deadline;
 	}
 
 	/// Replace the clock the renewal deadline runs on.
-	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
+	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
 	pub fn set_clock(&mut self, clock: Arc<dyn Clock>) {
 		self.clock = clock;
 	}
@@ -172,15 +172,15 @@ where
 					self.writer.write_envelope(envelope).await?;
 					self.enforce_rekey_limit().await?;
 				}
-				#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+				#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 				WriterStep::Command(Outbound::EnvelopeThenInstall(envelope, cipher)) => {
 					self.handle_install(envelope, cipher).await?;
 				}
-				#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+				#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 				WriterStep::Command(Outbound::StartRenewal) => self.try_open_renewal().await?,
-				#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+				#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 				WriterStep::WriteAck => self.write_pending_ack().await?,
-				#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
+				#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
 				WriterStep::RenewalExpired => self.fail_renewal().await?,
 				WriterStep::Command(Outbound::Close) | WriterStep::Closed => break,
 			}
@@ -196,7 +196,7 @@ where
 	/// connection forever. The wait runs on the driver's clock, so a test
 	/// that installed a manual clock reaches the deadline by advancing it.
 	async fn next_step(&mut self) -> WriterStep {
-		#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
+		#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
 		if let Some(deadline) = self.renewal_deadline() {
 			let clock = Arc::clone(&self.clock);
 			let budget = deadline.saturating_duration_since(clock.monotonic());
@@ -232,7 +232,7 @@ where
 			Poll::Pending => {}
 		}
 
-		#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+		#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 		if self.pending_ack.is_some() && self.shared.poll_chunks_quiesced(cx) {
 			return Poll::Ready(WriterStep::WriteAck);
 		}
@@ -243,7 +243,7 @@ where
 	/// Deadline of the in-flight renewal, stamped on first observation from
 	/// the driver's clock and cleared when the exchange concludes. A deadline
 	/// past every reading never arrives, so it is absent.
-	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
+	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
 	fn renewal_deadline(&mut self) -> Option<MonotonicInstant> {
 		if self.exchange.is_none() || self.shared.rekey_phase() == RekeyPhase::Idle {
 			self.renewal_started = None;
@@ -259,7 +259,7 @@ where
 	///
 	/// The server's `RekeyDone` writes immediately, while the client's
 	/// `RekeyAck` waits out owed c2s chunks first.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	async fn handle_install(&mut self, envelope: TransportEnvelope, cipher: Box<SendCipher>) -> TransportResult<()> {
 		if self.shared.role == MuxRole::Client {
 			self.pending_ack = Some((envelope, cipher));
@@ -279,7 +279,7 @@ where
 	///
 	/// - NIST SP 800-38D § 8.2.1, deterministic IV construction:
 	///   <https://csrc.nist.gov/publications/detail/sp/800-38d/final>
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	async fn write_pending_ack(&mut self) -> TransportResult<()> {
 		let Some((envelope, cipher)) = self.pending_ack.take() else {
 			return Ok(());
@@ -294,7 +294,7 @@ where
 
 	/// Open a renewal on the handle-side budget trigger when none is in flight.
 	/// The phase check deduplicates concurrent triggers.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	async fn try_open_renewal(&mut self) -> TransportResult<()> {
 		let Some(exchange) = self.exchange.as_ref() else {
 			return Ok(());
@@ -308,7 +308,7 @@ where
 
 	/// Drain with a GoAway after the renewal deadline elapses, and wake parked
 	/// admissions and chunks so owed traffic can flush.
-	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
+	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
 	async fn fail_renewal(&mut self) -> TransportResult<()> {
 		self.pending_ack = None;
 		self.renewal_started = None;
@@ -340,7 +340,7 @@ where
 		let drain_floor = self.drain_headroom.saturating_add(self.shared.unsent_chunks());
 		let remaining = self.writer.remaining_records();
 
-		#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+		#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 		if let Some(exchange) = self.exchange.as_ref() {
 			if remaining > renewal_floor(drain_floor) {
 				return Ok(());
@@ -390,7 +390,7 @@ impl MuxShared {
 	/// is held, so concurrent triggers collapse to a single `RekeyRequest`. A
 	/// contended exchange means a renewal is already in progress, so opening
 	/// is moot and the call returns `None`.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub(crate) fn open_renewal(
 		&self,
 		exchange: &FuturesMutex<Box<dyn ClientRekeyExchange>>,
@@ -409,7 +409,7 @@ impl MuxShared {
 #[cfg(all(
 	test,
 	feature = "tokio",
-	any(feature = "transport-cms", feature = "transport-ecies")
+	any(feature = "transport-cms", feature = "transport-hpke")
 ))]
 mod tests {
 	use core::future::Future;

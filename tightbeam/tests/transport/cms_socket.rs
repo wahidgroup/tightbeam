@@ -1,6 +1,6 @@
 //! Socket-level CMS handshake integration test.
 //!
-//! Every other wire test negotiates ECIES. This scenario runs the CMS
+//! Every other wire test negotiates HPKE. This scenario runs the CMS
 //! handshake over a real TCP socket through public interfaces only:
 //!
 //! - the `server!` policy list selects the protocol per accepted connection, and
@@ -56,7 +56,7 @@ impl CmsWireContext {
 	}
 }
 
-/// Echo server that answers CMS handshakes instead of the ECIES default;
+/// Echo server that answers CMS handshakes instead of the HPKE default;
 /// gate verdicts audit into `trace`.
 async fn start_cms_echo_server(
 	ctx: &Arc<CmsWireContext>,

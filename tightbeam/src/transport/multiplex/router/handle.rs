@@ -22,7 +22,7 @@ use crate::urn::Urn;
 use crate::utils::marker::MaybeSend;
 use crate::Frame;
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::receipt::StoredReceipt;
 
 #[cfg(feature = "instrument")]
@@ -405,7 +405,7 @@ impl MuxHandle {
 	/// Returns the current epoch's dual-signed session receipt, which each
 	/// completed in-band renewal rotates in place. The answer is `None` on a
 	/// session without receipt-bearing rekey materials.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub fn session_receipt(&self) -> Option<Arc<StoredReceipt>> {
 		self.link.shared().session_receipt()
 	}

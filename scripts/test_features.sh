@@ -73,10 +73,10 @@ for feature in tcp async-transport tokio; do
 done
 
 echo "[3/16] Check: the protocol-requiring features with a protocol"
-cargo check --package tightbeam-rs --no-default-features --features "std,tcp,async-transport,tokio,transport-ecies"
+cargo check --package tightbeam-rs --no-default-features --features "std,tcp,async-transport,tokio,transport-hpke"
 
 echo "[4/16] Check: Transport Full + TCP + Async"
-cargo check --package tightbeam-rs --no-default-features --features "std,transport-cms,transport-ecies,tcp,tokio,testing"
+cargo check --package tightbeam-rs --no-default-features --features "std,transport-cms,transport-hpke,tcp,tokio,testing"
 
 echo "[5/16] Check: Transport CMS + Derive"
 cargo check --package tightbeam-rs --no-default-features --features "std,transport-cms,testing"
@@ -104,13 +104,13 @@ cargo test --manifest-path "$ROOT/consumers/default/Cargo.toml" \
 echo "[11/16] Check: Transport CMS"
 cargo check --package tightbeam-rs --no-default-features --features "std,transport-cms,testing"
 
-echo "[12/16] Check: Transport ECIES"
-cargo check --package tightbeam-rs --no-default-features --features "std,transport-ecies,testing"
+echo "[12/16] Check: Transport HPKE"
+cargo check --package tightbeam-rs --no-default-features --features "std,transport-hpke,testing"
 
 echo "[13/16] Check: Transport CMS-only + TCP + Async"
 cargo check --package tightbeam-rs --no-default-features --features "std,transport-cms,tcp,tokio,testing"
 
-echo "[14/16] Test: Sync server stack (std + tcp + ECIES, no tokio)"
+echo "[14/16] Test: Sync server stack (std + tcp + HPKE, no tokio)"
 cargo test --manifest-path "$ROOT/consumers/sync/Cargo.toml" \
 	--target-dir "$ROOT/target/probe-sync"
 
@@ -122,9 +122,9 @@ cargo test --workspace --all-features
 
 # wasm32 browser transport core: async-transport compiles the generic
 # AsyncProtocolStream + TcpTransport without tokio.
-echo "[wasm] Check: wasm32 transport-ecies + async-transport (no tokio)"
+echo "[wasm] Check: wasm32 transport-hpke + async-transport (no tokio)"
 if rustup target list --installed | grep -q '^wasm32-unknown-unknown$'; then
-	cargo check --target wasm32-unknown-unknown --package tightbeam-rs --no-default-features --features "std,transport-ecies,async-transport,wasm"
+	cargo check --target wasm32-unknown-unknown --package tightbeam-rs --no-default-features --features "std,transport-hpke,async-transport,wasm"
 else
 	echo "  FAIL: wasm32-unknown-unknown target missing (run: make setup)" >&2
 	exit 1

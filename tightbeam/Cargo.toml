@@ -48,6 +48,8 @@ kem = { workspace = true, optional = true }
 aes = { workspace = true, optional = true }
 aes-gcm = { workspace = true, optional = true }
 aes-kw = { workspace = true, optional = true }
+ghash = { workspace = true, optional = true }
+polyval = { workspace = true, optional = true }
 sha3 = { workspace = true, optional = true }
 ecdsa = { workspace = true, optional = true }
 k256 = { workspace = true, optional = true }
@@ -100,7 +102,7 @@ full = [
 	"transport",
 	"transport-policy",
 	"transport-cms",
-	"transport-ecies",
+	"transport-hpke",
 	"transport-multiplex",
 	"tcp",
 	"aead",
@@ -111,7 +113,7 @@ full = [
 	"sha3",
 	"secp256k1",
 	"kdf",
-	"ecies",
+	"hpke",
 	"ecdh",
 	"tokio",
 	"futures",
@@ -153,7 +155,7 @@ colony = [
 	"policy",
 	"router",
 	"transport",
-	"transport-ecies",
+	"transport-hpke",
 	"transport-multiplex",
 	"transport-policy",
 	"x509",
@@ -206,15 +208,23 @@ signature = [
 digest = ["crypto", "dep:digest", "sha3"]
 x509 = ["crypto", "dep:x509-cert", "ecdsa/pem", "digest"]
 kdf = ["crypto", "random", "zeroize", "digest", "dep:hkdf"]
-ecies = ["crypto", "kdf", "aead", "k256/ecdh", "secp256k1", "sha3"]
+hpke = ["crypto", "kdf", "aead", "k256/ecdh", "secp256k1", "sha3"]
 ecdh = ["elliptic-curve/ecdh", "secp256k1"]
 kem = ["crypto", "dep:kem"]
 
 ## Security features
 random = ["dep:rand_core"]
-zeroize = ["dep:zeroize", "der/zeroize", "cms/zeroize", "aes-gcm?/zeroize"]
+zeroize = [
+	"dep:zeroize",
+	"der/zeroize",
+	"cms/zeroize",
+	"aes-gcm?/zeroize",
+	"aes?/zeroize",
+	"ghash?/zeroize",
+	"polyval?/zeroize",
+]
 
-aes-gcm = ["crypto", "dep:aes-gcm", "cms/aes"]
+aes-gcm = ["crypto", "dep:aes-gcm", "dep:aes", "dep:ghash", "dep:polyval", "cms/aes"]
 sha3 = ["crypto", "dep:sha3", "dep:digest"]
 secp256k1 = ["crypto", "dep:k256"]
 
@@ -234,11 +244,11 @@ transport-cms = [
 	"x509",
 	"ecdh",
 ]
-transport-ecies = [
+transport-hpke = [
 	"transport",
 	"transport-policy",
 	"builder",
-	"ecies",
+	"hpke",
 	"aead",
 	"aes-gcm",
 	"signature",

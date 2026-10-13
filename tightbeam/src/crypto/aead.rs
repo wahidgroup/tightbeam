@@ -15,9 +15,9 @@ pub use aes_gcm::{Aes128Gcm, Aes256Gcm, Key as Aes256GcmKey, Nonce as Aes256GcmN
 pub use aes_kw;
 
 use core::result::Result as CoreResult;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use aead::KeySizeUser;
-use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::asn1::ObjectIdentifier;
 use crate::constants::{rekey_record_limit, AES_GCM_VOLUME_BYTES_PER_KEY, DEFAULT_REKEY_RECORD_LIMIT};
@@ -229,7 +229,7 @@ fn extract_nonce_and_ciphertext(info: &EncryptedContentInfo, expected_nonce_len:
 ///
 /// An impl binds an encryptor type to the algorithm OID stamped on its
 /// ciphertext. Every [`AeadAlgorithm`] cipher implements it for its own OID and
-/// no other. The trait stays unsealed so custom encryptors such as ECIES remain
+/// no other. The trait stays unsealed so custom encryptors such as HPKE remain
 /// possible.
 pub trait Encryptor<C>
 where
@@ -633,6 +633,16 @@ impl Progress {
 // The largest counter and the largest volume each fit their share of the word.
 const _: () = assert!(DEFAULT_REKEY_RECORD_LIMIT < 1 << Progress::COUNTER_BITS);
 const _: () = assert!(AES_GCM_VOLUME_BYTES_PER_KEY < 1 << (u64::BITS - Progress::COUNTER_BITS));
+
+// AES wipes its round keys on drop under the `zeroize` feature of the `aes`
+// crate alone (CWE-226), so a feature graph that leaves it off fails here.
+#[cfg(feature = "aes-gcm")]
+const _: () = {
+	const fn wipes_on_drop<T: crate::zeroize::ZeroizeOnDrop>() {}
+
+	wipes_on_drop::<::aes::Aes128>();
+	wipes_on_drop::<::aes::Aes256>();
+};
 
 impl RecvCipher {
 	/// Wrap `aead` with an expected counter that starts at zero.

@@ -5,14 +5,14 @@
 
 use crate::cms::enveloped_data::{KeyAgreeRecipientInfo, OriginatorIdentifierOrKey, RecipientInfo};
 use crate::constants::TIGHTBEAM_KARI_KDF_INFO;
-use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
+use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::crypto::secret::SecretSlice;
-use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
-use crate::crypto::sign::elliptic_curve::{AffinePoint, FieldBytesSize, PublicKey, SecretKey};
+use crate::crypto::sign::elliptic_curve::{PublicKey, SecretKey};
 use crate::transport::handshake::error::HandshakeError;
-use crate::transport::handshake::kari::{HandshakeKek, Kek};
+use crate::transport::handshake::kari::Kek;
 use crate::transport::handshake::primitives::{KdfInfo, KdfSalt};
 use crate::transport::handshake::schedule::HandshakeAgreement;
+use crate::transport::handshake::HandshakeProvider;
 
 /// Recipient-side processor for `KeyAgreeRecipientInfo`.
 ///
@@ -24,11 +24,11 @@ use crate::transport::handshake::schedule::HandshakeAgreement;
 /// 3. Derive the KEK with the same KDF and UKM as the sender.
 /// 4. Unwrap the encrypted key to get the CEK.
 ///
-/// The type is generic over `P: CryptoProvider`, which defines the complete
+/// The type is generic over `P: HandshakeProvider`, which defines the complete
 /// cryptographic suite.
 pub struct TightBeamKariRecipient<P>
 where
-	P: CryptoProvider,
+	P: HandshakeProvider,
 {
 	/// The recipient's private key for ECDH.
 	recipient_priv: SecretKey<P::Curve>,
@@ -40,9 +40,7 @@ where
 
 impl<P> TightBeamKariRecipient<P>
 where
-	P: CryptoProvider,
-	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
-	FieldBytesSize<P::Curve>: ModulusSize,
+	P: HandshakeProvider,
 {
 	/// Create a KARI recipient processor that uses `recipient_priv` for the
 	/// ECDH and the default `TIGHTBEAM_KARI_KDF_INFO` label.
@@ -76,6 +74,17 @@ where
 	/// content-encryption key (CEK).
 	///
 	/// `recipient_index` selects the entry in `recipient_enc_keys`, usually 0.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::InvalidRecipientIndex`] -- the index is past `recipient_enc_keys`.
+	/// - [`HandshakeError::UnsupportedOriginatorIdentifier`] -- the originator is not a public key.
+	/// - [`HandshakeError::InvalidPublicKey`] -- the originator key is not a point on the curve.
+	/// - [`HandshakeError::MissingUkm`] -- the KARI carries no UKM, or an empty one.
+	/// - [`HandshakeError::MissingKeyWrapAlgorithm`] -- the profile names no key-wrap algorithm.
+	/// - [`HandshakeError::UnsupportedKeyWrapAlgorithm`] -- the profile's key wrap is not an AES key wrap.
+	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the KEK derivation.
+	/// - [`HandshakeError::KeyError`] -- the key fails to unwrap, or its re-wrap differs from the input.
 	pub fn process_kari(
 		&self,
 		kari: &KeyAgreeRecipientInfo,
@@ -92,7 +101,7 @@ where
 		// 3-6. Unwrap through ECDH, HKDF, and the integrity re-wrap.
 		let ukm = kari.ukm.as_ref().ok_or(HandshakeError::MissingUkm)?;
 		let wrapped_key = kari.recipient_enc_keys[recipient_index].enc_key.as_bytes();
-		let shared_secret = self.recipient_priv.shared_secret(&originator_pub)?;
+		let shared_secret = self.recipient_priv.shared_secret(&originator_pub);
 		let ukm_salt = KdfSalt::new(ukm.as_bytes());
 		let kari_label = KdfInfo::new(self.kdf_info);
 
@@ -127,9 +136,7 @@ impl TightBeamKariRecipient<DefaultCryptoProvider> {
 /// A KARI recipient extracts the CEK for an EnvelopedData processor.
 impl<P> super::enveloped_data::RecipientProcessor for TightBeamKariRecipient<P>
 where
-	P: CryptoProvider,
-	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
-	FieldBytesSize<P::Curve>: ModulusSize,
+	P: HandshakeProvider,
 {
 	fn process_recipient(
 		&self,

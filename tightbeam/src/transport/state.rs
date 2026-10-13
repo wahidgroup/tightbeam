@@ -19,6 +19,7 @@ use crate::transport::builders::EnvelopeBuilder;
 use crate::transport::envelopes::WireMode;
 use crate::transport::error::{TransportError, TransportFailure};
 use crate::transport::handshake::receipt::StoredReceipt;
+use crate::transport::handshake::{EpochMaterials, EstablishedSession};
 use crate::transport::handshake::{HandshakeKeyManager, HandshakeProtocolKind, PeerAuthentication};
 use crate::transport::TransportLimits;
 use crate::transport::TransportResult;
@@ -27,13 +28,12 @@ use crate::x509::Certificate;
 
 #[cfg(feature = "instrument")]
 use crate::trace::TraceCollector;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::negotiation::{TransportAuthorizer, TransportOffer};
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::receipt::{ReceiptApprover, SessionObserver};
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::BoxedServerHandshake;
-use crate::transport::handshake::{EpochMaterials, EstablishedSession};
 
 /// Which wire mode a session is entitled to write, and the state backing it.
 ///
@@ -373,7 +373,7 @@ impl<P: CryptoProvider> SessionState<P> {
 	/// of them.
 	#[cfg(all(
 		feature = "transport-multiplex",
-		any(feature = "transport-cms", feature = "transport-ecies")
+		any(feature = "transport-cms", feature = "transport-hpke")
 	))]
 	pub(crate) fn offer_mux(&mut self, offer: Option<Arc<TransportOffer>>) {
 		self.encryption.mux_offer = offer;
@@ -382,7 +382,7 @@ impl<P: CryptoProvider> SessionState<P> {
 	/// Replace the budget-grant policy a server consults.
 	#[cfg(all(
 		any(feature = "tcp", feature = "async-transport"),
-		any(feature = "transport-cms", feature = "transport-ecies")
+		any(feature = "transport-cms", feature = "transport-hpke")
 	))]
 	pub(crate) fn authorize_transport(&mut self, authorizer: Arc<dyn TransportAuthorizer>) {
 		self.encryption.transport_authorizer = Some(authorizer);
@@ -391,7 +391,7 @@ impl<P: CryptoProvider> SessionState<P> {
 	/// Replace the observer of budget-bearing handshake outcomes.
 	#[cfg(all(
 		any(feature = "tcp", feature = "async-transport"),
-		any(feature = "transport-cms", feature = "transport-ecies")
+		any(feature = "transport-cms", feature = "transport-hpke")
 	))]
 	pub(crate) fn observe_sessions(&mut self, observer: Arc<dyn SessionObserver>) {
 		self.encryption.session_observer = Some(observer);
@@ -401,7 +401,7 @@ impl<P: CryptoProvider> SessionState<P> {
 	/// challenge-bearing receipt.
 	#[cfg(all(
 		any(feature = "tcp", feature = "async-transport"),
-		any(feature = "transport-cms", feature = "transport-ecies")
+		any(feature = "transport-cms", feature = "transport-hpke")
 	))]
 	pub(crate) fn approve_receipts(&mut self, approver: Arc<dyn ReceiptApprover>) {
 		self.encryption.receipt_approver = Some(approver);
@@ -592,22 +592,22 @@ pub struct EncryptionConfig<P: CryptoProvider> {
 	/// Signing key manager backing this endpoint's identity and
 	/// countersignatures.
 	pub(crate) key_manager: Option<Arc<HandshakeKeyManager<P>>>,
-	/// Domain-separation tag of the ECIES key exchange. Both ECIES endpoints
+	/// Domain-separation tag of the HPKE key exchange. Both HPKE endpoints
 	/// MUST hold the same tag for a session to complete.
 	pub(crate) aad_domain_tag: &'static [u8],
 	/// Local multiplexing capability advertised in the handshake.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub(crate) mux_offer: Option<Arc<TransportOffer>>,
 	/// Budget-grant policy between the client's offer and the server's accept.
 	/// `None` grants the local configuration ceiling.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub(crate) transport_authorizer: Option<Arc<dyn TransportAuthorizer>>,
 	/// Approver consulted for a challenge-bearing session receipt. `None`
 	/// fails closed when a challenge is present.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub(crate) receipt_approver: Option<Arc<dyn ReceiptApprover>>,
 	/// Observer recording budget-bearing handshake outcomes.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub(crate) session_observer: Option<Arc<dyn SessionObserver>>,
 	/// Handshake protocol used once encryption is provisioned.
 	pub(crate) handshake_protocol: HandshakeProtocolKind,
@@ -659,13 +659,13 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 			client_identity: _,
 			key_manager: _,
 			aad_domain_tag: _,
-			#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 				mux_offer: _,
-			#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 				transport_authorizer: _,
-			#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 				receipt_approver: _,
-			#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 				session_observer: _,
 			handshake_protocol: _,
 			allow_cleartext: _,
@@ -711,13 +711,13 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 			peer_authentication: PeerAuthentication::Anonymous,
 			key_manager: None,
 			aad_domain_tag: TIGHTBEAM_AAD_DOMAIN_TAG,
-			#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 			mux_offer: None,
-			#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 			transport_authorizer: None,
-			#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 			receipt_approver: None,
-			#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 			session_observer: None,
 			handshake_protocol: HandshakeProtocolKind::default(),
 			allow_cleartext: false,
@@ -727,7 +727,7 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 
 /// An endpoint that accepts handshakes, and so keeps the orchestrator driving
 /// the one in flight.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub trait ServerHandshakeSlot: sealed::Sealed {
 	/// The orchestrator carrying this endpoint's in-flight server handshake.
 	///

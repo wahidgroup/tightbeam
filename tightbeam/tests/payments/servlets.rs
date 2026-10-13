@@ -7,9 +7,8 @@ use std::sync::Arc;
 
 use sha3::Sha3_256;
 use tightbeam::asn1::MessagePriority;
-use tightbeam::crypto::aead::Aes256Gcm;
-use tightbeam::crypto::ecies::{decrypt as ecies_decrypt, EciesPublicKeyOps, Secp256k1EciesMessage};
-use tightbeam::crypto::kdf::HkdfSha3_256;
+use tightbeam::constants::TIGHTBEAM_HPKE_FRAME_INFO;
+use tightbeam::crypto::hpke::{HpkeMessage, HpkeSecp256k1Sha3Aes256Gcm, HpkeSecretKeyOps};
 use tightbeam::crypto::secret::ToInsecure;
 use tightbeam::crypto::sign::ecdsa::k256::SecretKey;
 use tightbeam::transport::tcp::r#async::TokioListener;
@@ -175,7 +174,7 @@ servlet! {
 		match req {
 			KeyManagerRequest::GetPublicKey(_) => {
 				let response = GetPublicKeyResponse {
-					public_key: secret_key.public_key().to_bytes(),
+					public_key: secret_key.public_key().to_sec1_bytes().to_vec(),
 				};
 				trace.event_with(KEYMANAGER_PUBKEY_SERVED, &[PAYMENT_TAG], true)?;
 				Ok(Some(compose! {
@@ -184,8 +183,8 @@ servlet! {
 				}?))
 			}
 			KeyManagerRequest::Decrypt(decrypt_req) => {
-				let ecies_msg = Secp256k1EciesMessage::from_bytes(&decrypt_req.ciphertext)?;
-				let plaintext_secret = ecies_decrypt::<_, _, HkdfSha3_256, Aes256Gcm>(secret_key.as_ref(), &ecies_msg, None)?;
+				let sealed = HpkeMessage::<HpkeSecp256k1Sha3Aes256Gcm>::from_bytes(&decrypt_req.ciphertext)?;
+				let plaintext_secret = secret_key.as_ref().open(&sealed, TIGHTBEAM_HPKE_FRAME_INFO, b"")?;
 				let plaintext = plaintext_secret.to_insecure().to_vec();
 				let response = DecryptResponse { plaintext };
 

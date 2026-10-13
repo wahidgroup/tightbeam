@@ -53,19 +53,19 @@ use crate::Frame;
 
 #[cfg(all(
 	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-ecies")
+	any(feature = "transport-cms", feature = "transport-hpke")
 ))]
 use crate::policy::SessionContext;
 #[cfg(feature = "instrument")]
 use crate::trace::TraceCollector;
 #[cfg(all(
 	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-ecies")
+	any(feature = "transport-cms", feature = "transport-hpke")
 ))]
 use crate::transport::handshake::negotiation::MuxSettings;
 #[cfg(all(
 	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-ecies")
+	any(feature = "transport-cms", feature = "transport-hpke")
 ))]
 use crate::transport::handshake::negotiation::TransportOffer;
 #[cfg(feature = "tokio")]
@@ -74,12 +74,12 @@ use crate::transport::protocols::{AsyncByteRead, AsyncByteStream, AsyncByteWrite
 use crate::transport::{EndpointConfig, TransportEncryptionConfig};
 #[cfg(all(
 	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-ecies")
+	any(feature = "transport-cms", feature = "transport-hpke")
 ))]
 use crate::utils::marker::MaybeSend;
 #[cfg(all(
 	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-ecies")
+	any(feature = "transport-cms", feature = "transport-hpke")
 ))]
 use crate::x509::Certificate;
 
@@ -280,7 +280,7 @@ where
 
 #[cfg(all(
 	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-ecies")
+	any(feature = "transport-cms", feature = "transport-hpke")
 ))]
 mod mux {
 	pub use crate::transport::multiplex::{
@@ -293,7 +293,7 @@ mod mux {
 
 #[cfg(all(
 	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-ecies")
+	any(feature = "transport-cms", feature = "transport-hpke")
 ))]
 use mux::*;
 
@@ -302,7 +302,7 @@ use mux::*;
 /// negotiate a capability that the endpoint cannot honor.
 #[cfg(all(
 	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-ecies")
+	any(feature = "transport-cms", feature = "transport-hpke")
 ))]
 impl<S: AsyncProtocolStream, P: CryptoProvider + Send + Sync> TcpTransport<S, P>
 where
@@ -320,7 +320,7 @@ where
 /// The multiplexed plane that [`TcpTransport::into_mux`] assembles.
 #[cfg(all(
 	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-ecies")
+	any(feature = "transport-cms", feature = "transport-hpke")
 ))]
 pub type SplitMuxTransport<S> = MuxTransport<
 	TransportReader<<S as SplittableStream>::ReadHalf>,
@@ -329,7 +329,7 @@ pub type SplitMuxTransport<S> = MuxTransport<
 
 #[cfg(all(
 	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-ecies")
+	any(feature = "transport-cms", feature = "transport-hpke")
 ))]
 impl<S> TcpTransport<S>
 where
@@ -373,7 +373,7 @@ where
 
 #[cfg(all(
 	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-ecies")
+	any(feature = "transport-cms", feature = "transport-hpke")
 ))]
 impl<S: AsyncProtocolStream, P: CryptoProvider + Send + Sync> MuxCapable for TcpTransport<S, P>
 where
@@ -390,7 +390,7 @@ where
 
 #[cfg(all(
 	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-ecies")
+	any(feature = "transport-cms", feature = "transport-hpke")
 ))]
 impl<S> MuxConnector for TcpTransport<S>
 where
@@ -421,7 +421,7 @@ where
 
 #[cfg(all(
 	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-ecies")
+	any(feature = "transport-cms", feature = "transport-hpke")
 ))]
 impl<S> MuxAcceptor for TcpTransport<S>
 where
@@ -931,8 +931,9 @@ mod tests {
 	use core::str::FromStr;
 	use core::time::Duration;
 	use std::sync::Arc;
+	use std::time::Instant;
 
-	#[cfg(feature = "transport-ecies")]
+	#[cfg(feature = "transport-hpke")]
 	use std::sync::atomic::{AtomicBool, Ordering};
 
 	use super::*;
@@ -941,6 +942,7 @@ mod tests {
 	use crate::crypto::sign::ecdsa::{Secp256k1SigningKey, Secp256k1VerifyingKey, SigningKey};
 	use crate::crypto::sign::Sha3Signer;
 	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
+	use crate::policy::TransitStatus;
 	use crate::prelude::TightBeamSocketAddr;
 	use crate::spki::SubjectPublicKeyInfoOwned;
 	use crate::testing::*;
@@ -949,9 +951,6 @@ mod tests {
 	use crate::transport::state::{ClientIdentity, DialableEncryption, EncryptionConfig};
 	use crate::transport::{MessageCollector, MessageEmitter, TransportEncryptionConfig};
 	use crate::utils::time::SystemClock;
-	use std::time::Instant;
-
-	use crate::policy::TransitStatus;
 
 	/// Serve one single-flight request.
 	///
@@ -972,11 +971,11 @@ mod tests {
 		transport.send_response(status, message).await
 	}
 
-	#[cfg(feature = "transport-ecies")]
-	use crate::crypto::ecies::EciesError;
-	#[cfg(feature = "transport-ecies")]
+	#[cfg(feature = "transport-hpke")]
+	use crate::crypto::hpke::HpkeError;
+	#[cfg(feature = "transport-hpke")]
 	use crate::policy::SessionContext;
-	#[cfg(feature = "transport-ecies")]
+	#[cfg(feature = "transport-hpke")]
 	use crate::transport::policy::CollectorGateConfig;
 
 	mod cipher_install {
@@ -1396,11 +1395,11 @@ mod tests {
 		Ok(())
 	}
 
-	/// An ECIES client that holds no trust store has no validator for the
+	/// An HPKE client that holds no trust store has no validator for the
 	/// server the reply names, so it refuses before it sends anything.
-	#[cfg(feature = "transport-ecies")]
+	#[cfg(feature = "transport-hpke")]
 	#[tokio::test]
-	async fn ecies_client_without_trust_store_fails_closed() -> TransportResult<()> {
+	async fn hpke_client_without_trust_store_fails_closed() -> TransportResult<()> {
 		let (_listener, client_stream) = bind_and_connect().await?;
 		let encryption = EncryptionConfig { allow_cleartext: true, ..EncryptionConfig::unconfigured() };
 		let mut transport = client_over(client_stream, encryption);
@@ -1502,7 +1501,7 @@ mod tests {
 		Ok(())
 	}
 
-	#[cfg(feature = "transport-ecies")]
+	#[cfg(feature = "transport-hpke")]
 	#[tokio::test]
 	async fn async_with_encrypted_and_gate_policy() -> TransportResult<()> {
 		struct BusyFirstGate {
@@ -1568,7 +1567,7 @@ mod tests {
 	/// request is disclosed (CWE-668), so the deferred single-flight handshake
 	/// must be drivable on its own. It populates the peer certificate and sends
 	/// no application frame, and a repeat does nothing.
-	#[cfg(feature = "transport-ecies")]
+	#[cfg(feature = "transport-hpke")]
 	#[tokio::test]
 	async fn handshake_completes_alone_and_populates_peer_certificate() -> TransportResult<()> {
 		let EncryptedTestServer { cert, config } = encrypted_test_server()?;
@@ -1609,7 +1608,7 @@ mod tests {
 	// Both endpoints bind the domain tag into the key exchange's associated
 	// data, so a server tag the client does not share fails the session
 	// before the first frame is answered.
-	#[cfg(feature = "transport-ecies")]
+	#[cfg(feature = "transport-hpke")]
 	#[tokio::test]
 	async fn a_server_domain_tag_the_client_does_not_share_fails_the_session() -> TransportResult<()> {
 		let EncryptedTestServer { cert, config } = encrypted_test_server()?;
@@ -1628,14 +1627,14 @@ mod tests {
 		assert!(matches!(emitted, Err(TransportError::ConnectionClosed)));
 		assert!(matches!(
 			served,
-			Err(TransportError::HandshakeError(HandshakeError::EciesError(
-				EciesError::DecryptionFailed(_)
+			Err(TransportError::HandshakeError(HandshakeError::HpkeError(
+				HpkeError::DecryptionFailed(_)
 			)))
 		));
 		Ok(())
 	}
 
-	#[cfg(feature = "transport-ecies")]
+	#[cfg(feature = "transport-hpke")]
 	#[tokio::test]
 	async fn endpoints_that_share_a_domain_tag_complete_the_session() -> TransportResult<()> {
 		const DOMAIN_TAG: &[u8] = b"tightbeam-test-other-domain";

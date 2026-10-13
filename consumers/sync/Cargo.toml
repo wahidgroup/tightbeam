@@ -10,7 +10,7 @@ publish = false
 tightbeam = { package = "tightbeam-rs", path = "../../tightbeam", default-features = false, features = [
 	"std",
 	"tcp",
-	"transport-ecies",
+	"transport-hpke",
 	"transport-policy",
 	"x509",
 	"testing",

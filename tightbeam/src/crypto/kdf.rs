@@ -10,9 +10,8 @@
 //! - Derivation is deterministic and domain-separated by the `info` parameter ([RFC 5869 §3.2][rfc5869-3.2]).
 //! - Key material stays in `Zeroizing` and `ZeroizingArray` buffers.
 //! - Input validation covers the shared secret, which [`EcdhSecret`] fixes at
-//!   32 bytes, and the salt, which is 16 bytes or more. The ephemeral public
-//!   key is length-framed into SharedInfo, and the ECIES message parser checks
-//!   its length before it reaches the KDF.
+//!   32 bytes, and the salt of [`EciesKdf`], which is 16 bytes or more. That
+//!   trait length-frames `info` and the ephemeral public key into SharedInfo.
 //!
 //! # Providers
 //!
@@ -29,15 +28,17 @@
 //!   [`DualKeyKdf::derive_dual_keys`] enforces that key separation with one
 //!   expansion split into two disjoint keys ([SECG SEC 1 v2.0
 //!   §5.1.3][sec1-5.1.3]).
-//! - The KDF is a parameter of ECIES ([SECG SEC 1 v2.0 §5.1][sec1-5.1], [IEEE
-//!   Std 1363a-2004][ieee1363a]). This library instantiates ECIES with
-//!   HKDF-SHA3-256 per [RFC 5869][rfc5869], with key separation and context
-//!   binding through `info`. A profile that mandates the ANSI X9.63 KDF
-//!   supplies a [`KdfFunction`] that implements that KDF.
+//! - Those standards derive with a counter-mode hash KDF. [`X963Sha3_256`] is
+//!   the ANSI X9.63 construction ([SECG SEC 1 v2.0 §3.6][sec1-3.6]) over
+//!   SHA3-256, and [`EciesKdf`] runs it or any other [`KdfFunction`].
+//! - The public-key encryption of this crate is HPKE ([RFC 9180][rfc9180]), in
+//!   `crypto::hpke`. It keys one AEAD, and it derives through the labeled
+//!   schedule of that RFC.
 //!
 //! # Sources
 //!
 //! - [RFC 5869][rfc5869]: HMAC-based Extract-and-Expand Key Derivation Function (HKDF).
+//! - [RFC 9180][rfc9180]: Hybrid Public Key Encryption.
 //! - [NIST SP 800-56A Rev. 3 §5.8][sp800-56a]: Key-Derivation Methods for Key-Agreement Schemes.
 //! - [NIST SP 800-56C Rev. 2 §5][sp800-56c]: Two-Step Key Derivation (Extraction-then-Expansion).
 //! - [SECG SEC 1 v2.0 §5.1][sec1-5.1]: Elliptic Curve Integrated Encryption Scheme (ECIES).
@@ -45,6 +46,7 @@
 //! - [ISO/IEC 18033-2:2006][iso18033]: Encryption algorithms, Part 2: Asymmetric ciphers.
 //!
 //! [rfc5869]: https://datatracker.ietf.org/doc/html/rfc5869
+//! [rfc9180]: https://datatracker.ietf.org/doc/html/rfc9180
 //! [rfc5869-2.2]: https://datatracker.ietf.org/doc/html/rfc5869#section-2.2
 //! [rfc5869-3.2]: https://datatracker.ietf.org/doc/html/rfc5869#section-3.2
 //! [sp800-56a]: https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-56Ar3.pdf#page=64
@@ -68,15 +70,17 @@ use crate::crypto::hkdf::InvalidLength;
 use crate::crypto::secret::{Secret, SecretSlice};
 use crate::der::asn1::ObjectIdentifier;
 use crate::der::oid::AssociatedOid;
-use crate::oids::HASH_SHA3_256;
+use crate::oids::HKDF_SHA3_256;
 use crate::zeroize::Zeroizing;
 use crate::Errorizable;
 use crate::{ZeroizingArray, ZeroizingBytes};
 
-#[cfg(feature = "ecdh")]
-use elliptic_curve::ecdh::SharedSecret;
-#[cfg(feature = "ecdh")]
-use elliptic_curve::Curve;
+#[cfg(any(feature = "ecdh", feature = "hpke"))]
+use crate::crypto::common::typenum::U32;
+#[cfg(any(feature = "ecdh", feature = "hpke"))]
+use elliptic_curve::ecdh::{diffie_hellman, SharedSecret};
+#[cfg(any(feature = "ecdh", feature = "hpke"))]
+use elliptic_curve::{Curve, CurveArithmetic, PublicKey, SecretKey};
 
 /// The result of a KDF operation.
 pub type Result<T> = ::core::result::Result<T, KdfError>;
@@ -171,10 +175,13 @@ impl<K: KdfFunction> DualKeyKdf for K {
 /// The default KDF provider, which is HKDF over SHA3-256.
 pub struct HkdfSha3_256;
 
-/// No standard OID exists for HKDF-SHA3-256, so the profile negotiates it
-/// under the NIST SHA3-256 digest OID.
+/// HKDF with SHA3-256 has an OID of its own, `id-alg-hkdf-with-sha3-256`
+/// ([RFC 9688 §5.1][rfc9688-5.1]), and a security profile negotiates the KDF
+/// under it.
+///
+/// [rfc9688-5.1]: https://datatracker.ietf.org/doc/html/rfc9688#section-5.1
 impl AssociatedOid for HkdfSha3_256 {
-	const OID: ObjectIdentifier = HASH_SHA3_256;
+	const OID: ObjectIdentifier = HKDF_SHA3_256;
 }
 
 /// Reject a key size below [`MIN_KEY_SIZE`], which is too weak for
@@ -316,33 +323,63 @@ impl TryFrom<SecretSlice<u8>> for EcdhSecret {
 }
 
 /// Move a curve shared secret into the fixed-width type the key schedule
-/// takes. The curve secret wipes when it drops.
-#[cfg(feature = "ecdh")]
-impl<C> TryFrom<SharedSecret<C>> for EcdhSecret
+/// takes. The curve's field is exactly as wide as that type. The curve secret
+/// wipes when it drops.
+#[cfg(any(feature = "ecdh", feature = "hpke"))]
+impl<C> From<SharedSecret<C>> for EcdhSecret
 where
-	C: Curve,
+	C: Curve<FieldBytesSize = U32>,
 {
-	type Error = KdfError;
-
-	/// # Errors
-	///
-	/// - [`KdfError::InvalidSharedSecretLength`] when the curve's field is not
-	///   [`ECDH_SHARED_SECRET_SIZE`] bytes wide.
-	fn try_from(shared: SharedSecret<C>) -> Result<Self> {
-		sized_shared_secret(shared.raw_secret_bytes())
+	fn from(shared: SharedSecret<C>) -> Self {
+		// The bound fixes the field at 32 bytes, which is the one width whose
+		// bytes borrow as this array.
+		let x_coordinate: &[u8; ECDH_SHARED_SECRET_SIZE] = shared.raw_secret_bytes().as_ref();
+		Self::copy_of(x_coordinate)
 	}
 }
 
-/// Copy `bytes` into the fixed-width secret through its wiping buffer, so no
-/// plain array of the shared secret exists on the way (CWE-226).
-fn sized_shared_secret(bytes: &[u8]) -> Result<EcdhSecret> {
-	if bytes.len() != ECDH_SHARED_SECRET_SIZE {
-		return Err(KdfError::InvalidSharedSecretLength(bytes.len()));
+impl EcdhSecret {
+	/// A secret that holds a copy of `bytes`.
+	///
+	/// The bytes land in the wiping buffer directly, so no plain array of the
+	/// shared secret exists on the way (CWE-226). Every conversion into this
+	/// type copies here.
+	fn copy_of(bytes: &[u8; ECDH_SHARED_SECRET_SIZE]) -> Self {
+		let mut sized = ZeroizingArray::new([0u8; ECDH_SHARED_SECRET_SIZE]);
+		sized.copy_from_slice(bytes);
+		Secret::from(sized)
 	}
 
-	let mut sized = ZeroizingArray::new([0u8; ECDH_SHARED_SECRET_SIZE]);
-	sized.copy_from_slice(bytes);
-	Ok(Secret::from(sized))
+	/// A second owner of this secret, for a holder that derives from it more
+	/// than once.
+	#[cfg(any(test, all(feature = "hpke", feature = "x509")))]
+	pub(crate) fn duplicate(&self) -> Self {
+		self.with(Self::copy_of)
+	}
+
+	/// Run ECDH between `secret` and the peer's point `peer`.
+	///
+	/// HPKE and the handshake agreement of a held key both multiply here. Two
+	/// other holders of a scalar multiply on their own: an `EphemeralSecret`,
+	/// which keeps its scalar private, and a `SigningKeyProvider`, whose key
+	/// may live outside the process. Each of them converts its output into
+	/// this type.
+	#[cfg(any(feature = "ecdh", feature = "hpke"))]
+	pub fn agree<C>(secret: &SecretKey<C>, peer: &PublicKey<C>) -> Self
+	where
+		C: CurveArithmetic + Curve<FieldBytesSize = U32>,
+	{
+		let shared = diffie_hellman(secret.to_nonzero_scalar(), peer.as_affine());
+		Self::from(shared)
+	}
+}
+
+/// Check the length of `bytes`, then copy them into the fixed-width secret.
+fn sized_shared_secret(bytes: &[u8]) -> Result<EcdhSecret> {
+	let sized = <&[u8; ECDH_SHARED_SECRET_SIZE]>::try_from(bytes);
+	let sized = sized.map_err(|_| KdfError::InvalidSharedSecretLength(bytes.len()))?;
+
+	Ok(EcdhSecret::copy_of(sized))
 }
 
 /// Bind `info` and `ephemeral_pubkey` into one unambiguous ECIES SharedInfo.

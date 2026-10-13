@@ -81,7 +81,7 @@ tightbeam is a Layer-5 messaging framework. Frames use Abstract Syntax Notation 
      - 8.5.1. [Concept: Security Goals and Protocol Selection](#851-concept-security-goals-and-protocol-selection)
      - 8.5.2. [Specification: Handshake Flow and State Management](#852-specification-handshake-flow-and-state-management)
      - 8.5.3. [Implementation: CMS-Based Handshake Protocol](#853-implementation-cms-based-handshake-protocol)
-     - 8.5.4. [Implementation: ECIES-Based Handshake Protocol](#854-implementation-ecies-based-handshake-protocol)
+     - 8.5.4. [Implementation: HPKE-Based Handshake Protocol](#854-implementation-hpke-based-handshake-protocol)
      - 8.5.5. [Security Profile Negotiation](#855-security-profile-negotiation)
      - 8.5.6. [Negotiation and Failure Modes](#856-negotiation-and-failure-modes)
      - 8.5.7. [Threat-to-Control Mapping](#857-threat-to-control-mapping)
@@ -1207,7 +1207,7 @@ tightbeam MUST be usable over any transport that can carry opaque byte frames. T
 tightbeam accepts standard key material and delegates key lifecycle management to the application ([NIST SP 800-57][nist-800-57]).
 
 - **Accepted formats**: X.509 certificates, raw key material, and CMS structures.
-- **Session establishment**: CMS-based and ECIES-based handshakes ([§8.5](#85-handshake-protocols)).
+- **Session establishment**: CMS-based and HPKE-based handshakes ([§8.5](#85-handshake-protocols)).
 - **Application duties**: key generation, storage, rotation, certificate validation, and revocation checking ([RFC 6960][rfc6960]).
 
 #### Trust Stores
@@ -1529,7 +1529,7 @@ let mut client = builder.connect(addr).await?;
 Two handshake protocols establish mutual authentication and a session key:
 
 - **CMS-based**: Full PKI with X.509 certificates and [RFC 5652][rfc5652] CMS structures
-- **ECIES-based**: Lighter wire form with less CMS nesting
+- **HPKE-based**: Lighter wire form with less CMS nesting
 
 Security goals for both:
 
@@ -1546,7 +1546,7 @@ Security goals for both:
 ```text
 Phase 1: Client -> Server
 ┌─────────────────────────────────────────────────────────┐
-│ ClientHello (ECIES) or KeyExchange (CMS)                │
+│ ClientHello (HPKE) or KeyExchange (CMS)                 │
 │ - Client nonce (32 bytes)                               │
 │ - Optional SecurityOffer (supported profiles)           │
 │ - Ephemeral public key (CMS: in KARI structure)         │
@@ -1555,7 +1555,7 @@ Phase 1: Client -> Server
 
 Phase 2: Server -> Client
 ┌─────────────────────────────────────────────────────────┐
-│ ServerHandshake (ECIES) or ServerFinished (CMS)         │
+│ ServerHandshake (HPKE) or ServerFinished (CMS)          │
 │ - Server certificate                                    │
 │ - Server nonce (32 bytes)                               │
 │ - Selected SecurityProfile (if negotiation occurred)    │
@@ -1564,8 +1564,8 @@ Phase 2: Server -> Client
 
 Phase 3: Client -> Server
 ┌─────────────────────────────────────────────────────────┐
-│ ClientKeyExchange (ECIES) or ClientFinished (CMS)       │
-│ - Encrypted session key (ECIES)                         │
+│ ClientKeyExchange (HPKE) or ClientFinished (CMS)        │
+│ - Sealed base secret (HPKE)                             │
 │ - Key-confirmation tag (32 bytes)                       │
 │ - Optional client certificate (mutual auth)             │
 │   (CMS: must equal the Phase 1 certificate)             │
@@ -1601,7 +1601,7 @@ The transcript hash binds the handshake messages. It blocks reordering, profile 
 
 CMS handshake uses [RFC 5652][rfc5652] Cryptographic Message Syntax:
 
-- **`EnvelopedData`**: ECDH, HKDF, and AES key wrap for the session key
+- **`EnvelopedData`**: ECDH, HKDF, and AES key wrap for the base secret
 - **`SignedData`**: Transcript signatures for authentication
 - **`KeyAgreeRecipientInfo` (KARI)**: Ephemeral-static ECDH key agreement
 
@@ -1653,51 +1653,53 @@ Server Side - Verifying Client Authentication:
 └─────────────────────────────────────────────────────────────┘
 ```
 
-#### 8.5.4 Implementation: ECIES-Based Handshake Protocol
+#### 8.5.4 Implementation: HPKE-Based Handshake Protocol
 
-ECIES (Elliptic Curve Integrated Encryption Scheme) is the lighter handshake path. It encapsulates the session key without nested CMS `EnvelopedData` / `SignedData` containers.
+HPKE (Hybrid Public Key Encryption, [RFC 9180][rfc9180]) is the lighter handshake path. It seals the base secret to the server's static key without nested CMS `EnvelopedData` / `SignedData` containers.
 
 Differences from CMS:
 
-- Raw ECIES encryption instead of nested CMS `EnvelopedData`
+- HPKE sealing instead of nested CMS `EnvelopedData`
 - Flatter ASN.1 structures instead of multi-level CMS nesting
 - Same security goals: mutual authentication, forward secrecy, replay protection
-- Both paths use ASN.1 DER. ECIES avoids [RFC 5652][rfc5652] container complexity
+- Both paths use ASN.1 DER. HPKE avoids [RFC 5652][rfc5652] container complexity
 
 **Mutual authentication flow:**
 
-For mutual authentication, the client includes a certificate and signs the transcript in `ClientKeyExchange`:
+For mutual authentication, the client includes a certificate and signs the key exchange in `ClientKeyExchange`:
 
 ```text
 Client Side - Building ClientKeyExchange:
 ┌─────────────────────────────────────────────────────────────────────┐
-│ 1. Perform ECDH with Server's Public Key                            │
-│    shared_secret = ECDH(client_ephemeral_priv, server_pub_key)      │
+│ 1. Agree with the Server Ephemeral                                  │
+│    (r, R) = GenerateKeyPair()                                       │
+│    ee = ECDH(r, server_ephemeral)                                   │
 ├─────────────────────────────────────────────────────────────────────┤
-│ 2. Derive Session Key via HKDF                                      │
-│    session_key = HKDF-SHA3-256(                                     │
-│        ikm: shared_secret,                                          │
-│        salt: client_nonce || server_nonce,                          │
-│        info: "tightbeam-ecies-session-v1"                           │
+│ 2. Derive the Handshake Secret via HKDF                             │
+│    hs = HKDF-SHA3-256(                                              │
+│        ikm: len || base || len || ee,                               │
+│        salt: client_random || server_random,                        │
+│        info: "tb/session/kdf/v1"                                    │
 │    )                                                                │
 ├─────────────────────────────────────────────────────────────────────┤
-│ 3. Encrypt Session Key with ECIES                                   │
-│    encrypted_key = ECIES-Encrypt(                                   │
-│        plaintext: session_key,                                      │
-│        recipient_pub_key: server_pub_key                            │
+│ 3. Seal the Payload with HPKE                                       │
+│    encrypted_data = HPKE-Seal(                                      │
+│        recipient_pub_key: server_pub_key,                           │
+│        info: "tb/hpke/handshake/v1",                                │
+│        aad: domain_tag || client_certificate,                       │
+│        plaintext: base, client_random, R, confirm                   │
 │    )                                                                │
 ├─────────────────────────────────────────────────────────────────────┤
-│ 4. Sign Extended Transcript                                         │
-│    transcript = ClientHello || ServerHandshake || ClientKeyExchange │
-│    final_hash = SHA3-256(transcript)                                │
-│    client_signature = Sign(final_hash, client_priv_key)             │
+│ 4. Sign the Key Exchange                                            │
+│    signed = transcript_hash || encrypted_data || client_certificate │
+│    client_signature = Sign(SHA3-256(signed), client_priv_key)       │
 ├─────────────────────────────────────────────────────────────────────┤
 │ 5. Build ClientKeyExchange                                          │
 │    ┌──────────────────────────────────────────────────────────┐     │
 │    │ ClientKeyExchange {                                      │     │
-│    │     encrypted_session_key: encrypted_key,                │     │
+│    │     encrypted_data: encrypted_data,  // HPKE message     │     │
 │    │     client_certificate: Some(cert),  // Client cert      │     │
-│    │     client_signature: Some(sig),     // Transcript sig   │     │
+│    │     client_signature: Some(sig),     // Possession sig   │     │
 │    │ }                                                        │     │
 │    └──────────────────────────────────────────────────────────┘     │
 └─────────────────────────────────────────────────────────────────────┘
@@ -1715,73 +1717,76 @@ Server Side - Verifying Client Authentication:
 │ 2. Extract Client Public Key                                │
 │    client_pub_key = cert.subject_public_key_info            │
 ├─────────────────────────────────────────────────────────────┤
-│ 3. Verify Transcript Signature                              │
-│    verified_hash = Verify(client_signature, client_pub_key) │
+│ 3. Verify the Possession Signature                          │
+│    signed = transcript_hash || encrypted_data || cert       │
+│    Verify(client_signature, SHA3-256(signed), client_pub)   │
+│    ✓ Client holds the key of the certificate it offers      │
 ├─────────────────────────────────────────────────────────────┤
-│ 4. Verify Transcript Match                                  │
-│    expected_hash = SHA3-256(transcript)                     │
-│    if verified_hash ≠ expected_hash:                        │
-│       return TranscriptMismatch error                       │
-│    ✓ Client witnessed same transcript                       │
-├─────────────────────────────────────────────────────────────┤
-│ 5. Decrypt Session Key                                      │
-│    session_key = ECIES-Decrypt(                             │
-│        ciphertext: encrypted_session_key,                   │
-│        server_priv_key: server_private_key                  │
+│ 4. Open the Payload                                         │
+│    payload = HPKE-Open(                                     │
+│        ciphertext: encrypted_data,                          │
+│        server_priv_key: server_private_key,                 │
+│        aad: domain_tag || client_certificate                │
 │    )                                                        │
+│    ✓ client_random echoes the hello                         │
+├─────────────────────────────────────────────────────────────┤
+│ 5. Derive and Confirm the Handshake Secret                  │
+│    ee = ECDH(server_ephemeral_priv, R)                      │
+│    hs = HKDF-SHA3-256(base, ee)                             │
+│    ✓ Key-confirmation tag matches                           │
 │    ✓ Session established with forward secrecy               │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**ECIES encryption details:**
+**HPKE sealing details:**
 
-ECIES combines:
+The suite is DHKEM(secp256k1, HKDF-SHA3-256), HKDF-SHA3-256, and AES-256-GCM, in the base mode of [RFC 9180][rfc9180]:
 
-- **ECDH**: Ephemeral-static key agreement for the shared secret
-- **KDF**: HKDF-SHA3-256 for encryption and MAC keys from that secret
-- **AEAD**: AES-256-GCM for authenticated encryption of the session key
-- **Ephemeral keys**: A fresh ephemeral key pair per encryption
+- **KEM**: Ephemeral-static ECDH, then a labeled HKDF over the encapsulated key and the recipient key
+- **KDF**: HKDF-SHA3-256 for the key schedule, which binds `info`
+- **AEAD**: AES-256-GCM under the derived key and nonce
+- **Ephemeral keys**: A fresh ephemeral key pair per message
 
 ```text
-ECIES-Encrypt(plaintext, recipient_pub_key):
+HPKE-Seal(recipient_pub_key, info, aad, plaintext):
 ┌─────────────────────────────────────────────────────────┐
 │ 1. Generate ephemeral key pair                          │
-│    (ephemeral_priv, ephemeral_pub) = GenerateKeyPair()  │
+│    (ephemeral_priv, enc) = GenerateKeyPair()            │
 ├─────────────────────────────────────────────────────────┤
 │ 2. Perform ECDH                                         │
-│    shared_secret = ECDH(ephemeral_priv, recipient_pub)  │
+│    dh = ECDH(ephemeral_priv, recipient_pub)             │
 ├─────────────────────────────────────────────────────────┤
-│ 3. Derive encryption keys                               │
-│    (enc_key, mac_key) = HKDF-SHA3-256(                  │
-│        ikm: shared_secret,                              │
-│        info: ephemeral_pub || "ecies-kdf"               │
-│    )                                                    │
+│ 3. Derive the KEM shared secret                         │
+│    shared_secret = ExtractAndExpand(                    │
+│        dh, enc || recipient_pub)                        │
 ├─────────────────────────────────────────────────────────┤
-│ 4. Encrypt with AEAD                                    │
-│    ciphertext = AES-256-GCM.encrypt(                    │
-│        key: enc_key,                                    │
-│        plaintext: plaintext,                            │
-│        aad: caller-supplied associated data             │
-│    )                                                    │
+│ 4. Run the key schedule                                 │
+│    (key, base_nonce) = KeySchedule(shared_secret, info) │
 ├─────────────────────────────────────────────────────────┤
-│ 5. Return ECIES message                                 │
-│    return (ephemeral_pub || ciphertext)                 │
+│ 5. Seal with AEAD                                       │
+│    ciphertext = AES-256-GCM.seal(                       │
+│        key, base_nonce, aad, plaintext)                 │
+├─────────────────────────────────────────────────────────┤
+│ 6. Return HPKE message                                  │
+│    return (enc || ciphertext)                           │
 └─────────────────────────────────────────────────────────┘
 ```
 
-The handshake seals the session key under the domain tag followed by the client certificate DER when the client presents one (`ClientKeyExchange::client_bound_aad`), so a swapped certificate fails the AEAD open.
+The IANA HPKE registry holds no value for HKDF-SHA3-256, so the KEM and KDF identifiers of this suite are tightbeam's own. `crypto::hpke` states both values.
+
+The handshake seals the base secret under the domain tag followed by the client certificate DER when the client presents one (`ClientKeyExchange::client_bound_aad`), so a swapped certificate fails the AEAD open.
 
 **Wire format comparison:**
 
-| Feature                | CMS-based                      | ECIES-based                            |
-| ---------------------- | ------------------------------ | -------------------------------------- |
-| Envelope structure     | RFC 5652 nested structures     | Simplified ASN.1 structures            |
-| Key agreement          | KARI (`KeyAgreeRecipientInfo`) | Raw ECIES with DER encoding            |
-| Session key encryption | `EnvelopedData` + AES-KW       | ECIES + AES-GCM                        |
-| Signatures             | `SignedData` structure         | Raw signatures in ASN.1                |
-| Size overhead          | about 400-600 bytes            | about 200-300 bytes                    |
-| Parsing complexity     | Multi-level ASN.1 nesting      | Flat ASN.1 structures                  |
-| Standards              | RFC 5652, [RFC 5753][rfc5753]  | [SECG SEC 1][secg-sec1] + custom ASN.1 |
+| Feature                | CMS-based                      | HPKE-based                         |
+| ---------------------- | ------------------------------ | ---------------------------------- |
+| Envelope structure     | RFC 5652 nested structures     | Simplified ASN.1 structures        |
+| Key agreement          | KARI (`KeyAgreeRecipientInfo`) | DHKEM ([RFC 9180][rfc9180])        |
+| Session key encryption | `EnvelopedData` + AES-KW       | HPKE base mode + AES-256-GCM       |
+| Signatures             | `SignedData` structure         | Raw signatures in ASN.1            |
+| Size overhead          | about 400-600 bytes            | about 200-300 bytes                |
+| Parsing complexity     | Multi-level ASN.1 nesting      | Flat ASN.1 structures              |
+| Standards              | RFC 5652, [RFC 5753][rfc5753]  | [RFC 9180][rfc9180] + custom ASN.1 |
 
 **Performance characteristics** (relative to CMS on the same curves and algorithms):
 
@@ -1796,7 +1801,7 @@ Both protocols target the same properties: mutual authentication, forward secrec
 
 #### 8.5.5 Security Profile Negotiation
 
-CMS and ECIES handshakes both negotiate algorithms through `SecurityProfile` descriptors.
+CMS and HPKE handshakes both negotiate algorithms through `SecurityProfile` descriptors.
 
 **Negotiation process:**
 
@@ -1835,7 +1840,7 @@ Client                              Server
 
 **Transport capability negotiation:**
 
-CMS and ECIES handshakes MAY also negotiate multiplexing with `TransportOffer` / `TransportAccept`. Those structures travel in the opening handshake messages. They bind into the same transcript as security-profile negotiation. A peer cannot silently enable or disable multiplexing after authentication.
+CMS and HPKE handshakes MAY also negotiate multiplexing with `TransportOffer` / `TransportAccept`. Those structures travel in the opening handshake messages. They bind into the same transcript as security-profile negotiation. A peer cannot silently enable or disable multiplexing after authentication.
 
 **Transport negotiation process:**
 
@@ -1944,7 +1949,7 @@ Mux is an application-layer stream router over the envelope transport. It does n
 
 | Mode      | Session                                                     | Settings source                                                 | Split API      | Security properties                                                 |
 | --------- | ----------------------------------------------------------- | --------------------------------------------------------------- | -------------- | ------------------------------------------------------------------- |
-| Encrypted | CMS or ECIES handshake with matching `TransportOffer`s      | `negotiated_mux()`                                              | `into_split()` | Handshake authentication + AEAD as configured for the session       |
+| Encrypted | CMS or HPKE handshake with matching `TransportOffer`s       | `negotiated_mux()`                                              | `into_split()` | Handshake authentication + AEAD as configured for the session       |
 | Cleartext | None: the transport was built as a named cleartext endpoint | Out-of-band `MuxSettings::symmetric(cap)`. Both ends MUST agree | `into_split()` | NONE: no confidentiality, integrity, replay, or deletion protection |
 
 Cleartext mux is for controlled environments and tests. It MUST NOT replace an encrypted session on a hostile network.
@@ -2120,7 +2125,7 @@ Client Side - Offering Mux:
 │ 1. transport = transport.with_mux_offer(Some(            │
 │        TransportOffer::mux(max_peer_initiated_streams)   │
 │    ))                                                    │
-│ 2. Perform CMS or ECIES handshake                        │
+│ 2. Perform CMS or HPKE handshake                         │
 │ 3. settings = transport.negotiated_mux()  // Some(...)   │
 │ 4. (reader, writer) = transport.into_split()             │
 │ 5. MuxTransport::new(reader, writer, MuxRole::Client,    │
@@ -2136,7 +2141,7 @@ use tightbeam::transport::ResponsePackage;
 use tightbeam::Frame;
 
 transport = transport.with_mux_offer(Some(TransportOffer::mux(32)));
-// ... perform CMS or ECIES handshake ...
+// ... perform CMS or HPKE handshake ...
 
 let settings = transport.negotiated_mux().expect("mux negotiated");
 let (reader, writer) = transport.into_split()?;
@@ -5740,6 +5745,7 @@ tb_scenario! {
 - [RFC 7748][rfc7748]: Elliptic Curves for Security
 - [RFC 8622][rfc8622]: A Lower-Effort Per-Hop Behavior (LE PHB) for Differentiated Services
 - [RFC 9113][rfc9113]: HTTP/2
+- [RFC 9180][rfc9180]: Hybrid Public Key Encryption
 - [RFC 9846][rfc9846]: The Transport Layer Security (TLS) Protocol Version 1.3 (obsoletes RFC 8446)
 - [RFC 9901][rfc9901]: Selective Disclosure for JSON Web Tokens (SD-JWT)
 - [RFC Editor Style Guide][rfc-style-guide]: Web Portion of the Style Guide
@@ -5821,6 +5827,7 @@ Unless you explicitly state otherwise, any contribution intentionally submitted 
 [rfc9113-5.1.2]: https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.2
 [rfc9113-7]: https://datatracker.ietf.org/doc/html/rfc9113#section-7
 [rfc9113-8.1]: https://datatracker.ietf.org/doc/html/rfc9113#section-8.1
+[rfc9180]: https://datatracker.ietf.org/doc/html/rfc9180
 [rfc9846]: https://datatracker.ietf.org/doc/html/rfc9846
 [rfc9846-4.1.3]: https://datatracker.ietf.org/doc/html/rfc9846#section-4.1.3
 [rfc9846-4.7.3]: https://datatracker.ietf.org/doc/html/rfc9846#section-4.7.3
