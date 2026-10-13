@@ -634,6 +634,16 @@ impl Progress {
 const _: () = assert!(DEFAULT_REKEY_RECORD_LIMIT < 1 << Progress::COUNTER_BITS);
 const _: () = assert!(AES_GCM_VOLUME_BYTES_PER_KEY < 1 << (u64::BITS - Progress::COUNTER_BITS));
 
+// AES wipes its round keys on drop under the `zeroize` feature of the `aes`
+// crate alone (CWE-226), so a feature graph that leaves it off fails here.
+#[cfg(feature = "aes-gcm")]
+const _: () = {
+	const fn wipes_on_drop<T: crate::zeroize::ZeroizeOnDrop>() {}
+
+	wipes_on_drop::<::aes::Aes128>();
+	wipes_on_drop::<::aes::Aes256>();
+};
+
 impl RecvCipher {
 	/// Wrap `aead` with an expected counter that starts at zero.
 	pub fn new(aead: RuntimeAead) -> Self {

@@ -21,6 +21,7 @@ dependencies = [
  "cfg-if",
  "cipher",
  "cpufeatures",
+ "zeroize",
 ]
 
 [[package]]
@@ -315,6 +316,7 @@ checksum = "f0d8a4362ccb29cb0b265253fb0a2728f592895ee6854fd9bc13f2ffda266ff1"
 dependencies = [
  "opaque-debug",
  "polyval",
+ "zeroize",
 ]
 
 [[package]]
@@ -503,6 +505,7 @@ dependencies = [
  "cpufeatures",
  "opaque-debug",
  "universal-hash",
+ "zeroize",
 ]
 
 [[package]]
@@ -742,6 +745,7 @@ name = "tightbeam-rs"
 version = "0.14.0"
 dependencies = [
  "aead",
+ "aes",
  "aes-gcm",
  "aes-kw",
  "cfg_aliases",
@@ -750,10 +754,12 @@ dependencies = [
  "der",
  "digest",
  "elliptic-curve",
+ "ghash",
  "k256",
  "kem",
  "paste",
  "pkcs12",
+ "polyval",
  "rand_core",
  "sha3",
  "signature",

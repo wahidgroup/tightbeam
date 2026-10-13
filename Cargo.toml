@@ -76,6 +76,10 @@ aes-gcm = { version = "=0.10.3", default-features = false, features = [
 	"alloc",
 ] }
 aes-kw = { version = "=0.2.1", default-features = false, features = ["alloc"] }
+# Named so the `zeroize` feature of each is reachable: `aes-gcm` 0.10 passes
+# its own `zeroize` feature to neither.
+ghash = { version = "=0.5.1", default-features = false }
+polyval = { version = "=0.6.2", default-features = false }
 sha3 = { version = "=0.10.9", default-features = false, features = ["oid"] }
 ecdsa = { version = "=0.16.9", default-features = false, features = [
 	"signing",

@@ -84,6 +84,16 @@ pub const COMPRESSION_ZSTD: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3
 /// - RFC 9180, Hybrid Public Key Encryption: <https://datatracker.ietf.org/doc/html/rfc9180>
 pub const HPKE_SECP256K1_SHA3_256_AES_256_GCM: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.2.2");
 
+/// HKDF with SHA3-256 (`id-alg-hkdf-with-sha3-256`), in the S/MIME algorithms
+/// arc. A security profile names its key derivation function by this OID.
+///
+/// # Sources
+///
+/// - RFC 9688 §5.1, HKDF with SHA3: <https://datatracker.ietf.org/doc/html/rfc9688#section-5.1>
+/// - IANA, SMI Security for S/MIME Algorithms:
+///   <https://www.iana.org/assignments/smi-numbers/smi-numbers.xhtml>
+pub const HKDF_SHA3_256: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.3.33");
+
 /// The SHA-256 hash algorithm (`sha-256`).
 ///
 /// # Sources
@@ -348,6 +358,7 @@ mod tests {
 			(ENVELOPED_DATA, "1.2.840.113549.1.7.3"),
 			(COMPRESSION_CONTENT, "1.2.840.113549.1.9.16.1.9"),
 			(COMPRESSION_ZLIB, "1.2.840.113549.1.9.16.3.8"),
+			(HKDF_SHA3_256, "1.2.840.113549.1.9.16.3.33"),
 			(COMPRESSION_ZSTD, "1.3.6.1.4.1.64586.2.1"),
 			(HPKE_SECP256K1_SHA3_256_AES_256_GCM, "1.3.6.1.4.1.64586.2.2"),
 			(HASH_SHA256, "2.16.840.1.101.3.4.2.1"),

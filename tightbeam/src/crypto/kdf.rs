@@ -70,7 +70,7 @@ use crate::crypto::hkdf::InvalidLength;
 use crate::crypto::secret::{Secret, SecretSlice};
 use crate::der::asn1::ObjectIdentifier;
 use crate::der::oid::AssociatedOid;
-use crate::oids::HASH_SHA3_256;
+use crate::oids::HKDF_SHA3_256;
 use crate::zeroize::Zeroizing;
 use crate::Errorizable;
 use crate::{ZeroizingArray, ZeroizingBytes};
@@ -175,10 +175,13 @@ impl<K: KdfFunction> DualKeyKdf for K {
 /// The default KDF provider, which is HKDF over SHA3-256.
 pub struct HkdfSha3_256;
 
-/// No standard OID exists for HKDF-SHA3-256, so the profile negotiates it
-/// under the NIST SHA3-256 digest OID.
+/// HKDF with SHA3-256 has an OID of its own, `id-alg-hkdf-with-sha3-256`
+/// ([RFC 9688 §5.1][rfc9688-5.1]), and a security profile negotiates the KDF
+/// under it.
+///
+/// [rfc9688-5.1]: https://datatracker.ietf.org/doc/html/rfc9688#section-5.1
 impl AssociatedOid for HkdfSha3_256 {
-	const OID: ObjectIdentifier = HASH_SHA3_256;
+	const OID: ObjectIdentifier = HKDF_SHA3_256;
 }
 
 /// Reject a key size below [`MIN_KEY_SIZE`], which is too weak for

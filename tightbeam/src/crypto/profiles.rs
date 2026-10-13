@@ -724,12 +724,12 @@ mod tests {
 	}
 
 	// The KDF and curve types carry the identifiers that peers negotiate, so
-	// the default descriptor names `HASH_SHA3_256` and `CURVE_SECP256K1`.
+	// the default descriptor names `HKDF_SHA3_256` and `CURVE_SECP256K1`.
 	#[cfg(all(feature = "kdf", feature = "ecdh"))]
 	#[test]
 	fn the_default_profile_negotiates_its_kdf_and_curve_identifiers() {
 		let desc = SecurityProfileDesc::from(&TightbeamProfile);
-		assert_eq!(desc.kdf, Some(crate::oids::HASH_SHA3_256));
+		assert_eq!(desc.kdf, Some(crate::oids::HKDF_SHA3_256));
 		assert_eq!(desc.curve, Some(crate::oids::CURVE_SECP256K1));
 	}
 }

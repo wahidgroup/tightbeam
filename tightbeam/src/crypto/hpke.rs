@@ -40,10 +40,10 @@
 //! from an [IANA registry][iana-hpke].
 //!
 //! - The two AEAD values are registered.
-//! - [`KEM_DHKEM_SECP256K1_HKDF_SHA3_256`] and [`KDF_HKDF_SHA3_256`] are
-//!   provisional, because the registry holds no value for HKDF-SHA3-256 or for
+//! - [`KEM_DHKEM_SECP256K1_HKDF_SHA3_256`] and [`KDF_HKDF_SHA3_256`] are this
+//!   crate's own, because the registry holds no value for HKDF-SHA3-256 or for
 //!   a DHKEM that derives with it.
-//! - A registered value replaces each provisional one, and that changes every key this suite derives.
+//! - Both enter the labels of every derivation, so another value derives other keys.
 //! - The KEM takes its sizes from DHKEM(secp256k1, HKDF-SHA256), the registered
 //!   KEM `0x0016` ([draft-wahby-cfrg-hpke-kem-secp256k1-01][wahby]): `Nsecret`
 //!   is 32, and `Nenc`, `Npk`, and `Nsk` are 65, 65, and 32.
@@ -113,16 +113,16 @@ pub const AEAD_AES_128_GCM: u16 = 0x0001;
 /// [rfc9180-7.3]: https://datatracker.ietf.org/doc/html/rfc9180#section-7.3
 pub const AEAD_AES_256_GCM: u16 = 0x0002;
 
-/// DHKEM(secp256k1, HKDF-SHA3-256), as a provisional KEM identifier.
+/// DHKEM(secp256k1, HKDF-SHA3-256), under this crate's own KEM identifier.
 ///
-/// The IANA registry holds no value for this KEM. This one sits in the
-/// unassigned range, and a registered value replaces it.
+/// The IANA registry holds no value for this KEM, and it has no range for
+/// private use. This value sits in the unassigned range.
 pub const KEM_DHKEM_SECP256K1_HKDF_SHA3_256: u16 = 0xFF16;
 
-/// HKDF-SHA3-256, as a provisional KDF identifier.
+/// HKDF-SHA3-256, under this crate's own KDF identifier.
 ///
-/// The IANA registry holds no value for this KDF. This one sits in the
-/// unassigned range, and a registered value replaces it.
+/// The IANA registry holds no value for this KDF, and it has no range for
+/// private use. This value sits in the unassigned range.
 pub const KDF_HKDF_SHA3_256: u16 = 0xFF01;
 
 /// A two-stage key derivation function of an HPKE suite
@@ -247,7 +247,7 @@ where
 
 /// DHKEM(secp256k1, HKDF-SHA3-256), HKDF-SHA3-256, and AES-256-GCM.
 ///
-/// The KEM and KDF identifiers of this suite are provisional. See
+/// The KEM and KDF identifiers of this suite are this crate's own. See
 /// [`KEM_DHKEM_SECP256K1_HKDF_SHA3_256`] and [`KDF_HKDF_SHA3_256`].
 pub type HpkeSecp256k1Sha3Aes256Gcm = DhKemSuite<Secp256k1, HkdfSha3_256, Aes256Gcm>;
 
@@ -1149,7 +1149,7 @@ mod tests {
 	}
 
 	/// The SHA3-256 suite derives what an independent implementation derives
-	/// under the same identifiers, so the hash and the two provisional
+	/// under the same identifiers, so the hash and the crate's two
 	/// identifiers are the whole difference from the registered suite.
 	#[test]
 	fn the_sha3_suite_matches_its_known_answer() -> Result<()> {

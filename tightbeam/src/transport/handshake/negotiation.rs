@@ -1270,7 +1270,7 @@ mod tests {
 	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::oids::{
 		AES_128_GCM, AES_128_WRAP, AES_192_WRAP, AES_256_GCM, AES_256_WRAP, CURVE_SECP256K1, HASH_SHA3_256,
-		SIGNER_ECDSA_WITH_SHA3_512,
+		HKDF_SHA3_256, SIGNER_ECDSA_WITH_SHA3_512,
 	};
 
 	fn sample_profile(id: u8) -> SecurityProfileDesc {
@@ -1284,7 +1284,7 @@ mod tests {
 			digest: Some(HASH_SHA3_256),
 			aead: Some(AES_256_GCM),
 			signature: Some(SIGNER_ECDSA_WITH_SHA3_512),
-			kdf: Some(HASH_SHA3_256),
+			kdf: Some(HKDF_SHA3_256),
 			curve: Some(CURVE_SECP256K1),
 			key_wrap,
 		}
@@ -1939,6 +1939,18 @@ mod tests {
 		let foreign = SecurityProfileDesc { digest: Some(crate::oids::HASH_SHA3_512), ..native };
 
 		let result = RunnableProfile::<DefaultCryptoProvider>::try_from(foreign);
+
+		assert!(matches!(result, Err(NegotiationError::UnrunnableProfile)));
+	}
+
+	/// The KDF has an OID of its own, so a descriptor that names it by the OID
+	/// of its digest names another algorithm.
+	#[test]
+	fn a_descriptor_that_names_its_kdf_by_the_digest_oid_is_not_runnable() {
+		let native = RunnableProfile::<DefaultCryptoProvider>::native().descriptor();
+		let by_digest = SecurityProfileDesc { kdf: Some(crate::oids::HASH_SHA3_256), ..native };
+
+		let result = RunnableProfile::<DefaultCryptoProvider>::try_from(by_digest);
 
 		assert!(matches!(result, Err(NegotiationError::UnrunnableProfile)));
 	}

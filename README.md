@@ -1772,7 +1772,7 @@ HPKE-Seal(recipient_pub_key, info, aad, plaintext):
 └─────────────────────────────────────────────────────────┘
 ```
 
-The IANA HPKE registry holds no value for HKDF-SHA3-256, so the KEM and KDF identifiers of this suite are provisional. `crypto::hpke` states both values.
+The IANA HPKE registry holds no value for HKDF-SHA3-256, so the KEM and KDF identifiers of this suite are tightbeam's own. `crypto::hpke` states both values.
 
 The handshake seals the base secret under the domain tag followed by the client certificate DER when the client presents one (`ClientKeyExchange::client_bound_aad`), so a swapped certificate fails the AEAD open.
 
