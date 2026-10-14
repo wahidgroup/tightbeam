@@ -171,7 +171,7 @@ tb_scenario! {
 				}
 			}
 
-			let servlet_task = EchoServlet::start(Arc::new(trace.share()), ServletConfig::default()).await?;
+			let servlet_task = EchoServlet::start(Arc::new(trace.share()), ServletConfig::cleartext()).await?;
 			let addr = servlet_task.addr().to_owned();
 
 			trace.event(CLIENT_CONNECT)?;

@@ -34,7 +34,7 @@ use crate::random::OsRng;
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::flow::{
 	ClientFlow, ClosingBinding, ClosingIntake, ClosingOpened, ClosingParts, HandshakeFlow, Opened, OpeningIntake,
-	OpeningParts, ProofRequest, ReplyBinding, ReplyIntake, ReplyParts, ServerFlow, Signed,
+	OpeningParts, ProofRequest, ReplyBinding, ReplyIntake, ReplyParts, ServerFlow,
 };
 use crate::transport::handshake::negotiation::{
 	AuthorizedTransport, MuxSettings, ProfilePolicy, SecurityOffer, SupportedProfiles, TransportAuthorizer,
@@ -448,13 +448,6 @@ impl<R: Role<F, P>, F: HandshakeFlow, P: HandshakeProvider> Handshake<R, F, P> {
 		}
 	}
 
-	/// Sign `prehash` under `key`, and fetch the public key that verifies it.
-	async fn sign_with(key: &dyn SigningKeyProvider, prehash: &[u8]) -> Result<Signed, HandshakeError> {
-		let signature = key.sign_prehash(prehash).await?;
-		let signer_spki = key.to_public_key_bytes().await?;
-		Ok(Signed { signature, signer_spki })
-	}
-
 	/// Complete the handshake and take everything it agreed.
 	///
 	/// The handshake secret moves out, so one handshake derives one session.
@@ -667,7 +660,7 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> Handshake<Client, F, P> {
 
 		// 12. Sign the proof under the client identity.
 		let proof = match proof {
-			Some(ProofRequest { prehash, signer }) => Some(Self::sign_with(signer, &prehash).await?),
+			Some(ProofRequest { prehash, signer }) => Some(F::sign(signer, &prehash).await?),
 			None => None,
 		};
 
@@ -744,6 +737,8 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> Handshake<Server, F, P> {
 	/// - [`HandshakeError::InvalidClientKeyExchange`] -- the opening carries no usable key agreement.
 	/// - [`HandshakeError::MissingUkm`] -- the key agreement carries no user keying material.
 	/// - [`HandshakeError::InvalidPublicKey`] -- the client's key is not a point on the curve.
+	/// - [`HandshakeError::ClientEphemeralIsStatic`] -- the CMS originator key
+	///   collapses into the key of the certificate the opening carries.
 	/// - [`HandshakeError::InvalidKeySize`] -- the opened content is not a 32-byte base secret.
 	/// - [`HandshakeError::MutualAuthRequired`] -- the accept grants budgets,
 	///   and the server demands no client certificate.
@@ -773,12 +768,10 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> Handshake<Server, F, P> {
 		let offer = transport_offer.as_ref();
 		let negotiation = TransportNegotiation { offer, local: config.transport.as_ref() };
 		let authorized = negotiation.authorize(config.transport_authorizer.as_deref()).await?;
-		let (transport_accept, challenge) = match authorized {
-			Some(AuthorizedTransport { accept, challenge }) => (Some(accept), challenge),
-			None => (None, None),
+		let (transport_accept, challenge, mux) = match authorized.map(AuthorizedTransport::into_parts) {
+			Some((accept, challenge, mux)) => (Some(accept), challenge, Some(mux)),
+			None => (None, None, None),
 		};
-		let negotiated = offer.zip(transport_accept.as_ref());
-		let mux = negotiated.map(|(offer, accept)| MuxSettings::for_server(offer, accept));
 
 		// 5. Open what the opening sealed to the static key.
 		let mut opened = F::open_opening(sealed, key).await?;
@@ -798,7 +791,7 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> Handshake<Server, F, P> {
 		let terms = Terms::new(profile, mux, transcript_hash, salt);
 
 		// 8. Sign the sealed transcript under the static key.
-		let signed = Self::sign_with(key, &prehash).await?;
+		let signed = F::sign(key, &prehash).await?;
 
 		// 9. Issue the session receipt. The transcript hash pins it to this
 		//    session, and the server signature lets a third party verify it.
@@ -846,7 +839,7 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> Handshake<Server, F, P> {
 	///   certificate and none came, or a proof came without one.
 	/// - [`HandshakeError::CertificateValidationError`] -- a validator refused the client certificate.
 	/// - [`HandshakeError::InvalidPublicKey`] -- the key of the offered
-	///   certificate is not a point on the curve.
+	///   certificate, or the HPKE client ephemeral, is not a point on the curve.
 	/// - [`HandshakeError::SignatureError`] -- the HPKE possession signature fails to verify.
 	/// - [`HandshakeError::SignatureVerificationFailed`] -- the possession
 	///   proof is missing or malformed, the CMS Finished fails to verify, or
@@ -858,6 +851,9 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> Handshake<Server, F, P> {
 	/// - [`HandshakeError::InvalidKeySize`] -- the base secret of the payload is not 32 bytes.
 	/// - [`HandshakeError::OctetStringLengthError`] -- the client random of the payload is not 32 bytes.
 	/// - [`HandshakeError::ClientRandomMismatchReplay`] -- the payload echoes another client random.
+	/// - [`HandshakeError::ClientEphemeralIsStatic`] -- an HPKE client
+	///   ephemeral, in the payload or as the encapsulated key, collapses into
+	///   the key of the certificate the closing offers.
 	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the handshake
 	///   secret, the key-confirmation tag, or the acknowledgement key.
 	/// - [`HandshakeError::KeyConfirmationFailed`] -- the client derived another handshake secret.

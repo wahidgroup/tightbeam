@@ -215,7 +215,8 @@ tb_scenario! {
 			hive_conf.pool.mux_offer = Some(Arc::new(TransportOffer::mux(8)));
 
 			let mut hive = PaymentProcessorHive::new(Some(hive_conf))?;
-			hive.register(authorization_urn(), servlet, |t| AuthorizationServlet::start(t, ServletConfig::default()))?;
+			let spawner = |t| AuthorizationServlet::start(t, ServletConfig::cleartext());
+			hive.register(authorization_urn(), servlet, spawner)?;
 			hive.establish(Arc::new(trace.share())).await?;
 
 			let _reg_response = hive.register_with_cluster(cluster_addr).await?;

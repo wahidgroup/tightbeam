@@ -241,7 +241,7 @@ pub fn spawn_cleartext_mux_endpoint(
 /// - The bind, connect, or accept failure.
 pub async fn establish_cleartext_transports(
 ) -> Result<(TcpTransport<TokioStream>, TcpTransport<TokioStream>), TightBeamError> {
-	let listener = TokioListener::<DefaultCryptoProvider>::bind("127.0.0.1:0").await?;
+	let listener = TokioListener::<DefaultCryptoProvider>::bind_cleartext("127.0.0.1:0").await?;
 	let addr = listener.local_addr()?;
 
 	let accept_task = tokio::spawn(async move {

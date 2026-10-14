@@ -388,6 +388,7 @@ tb_scenario! {
 			let servlet_conf = ServletConfig::<TokioListener, WorkOrder>::builder()
 				.with_config(Arc::clone(&stats))
 				.with_collector_gate(adaptive_gate)
+				.allow_cleartext()
 				.build();
 
 			QueueServlet::start(Arc::clone(&trace), servlet_conf).await

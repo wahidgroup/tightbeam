@@ -41,7 +41,7 @@ fn sync_server_echoes_over_std_tcp() -> TransportResult<()> {
 	let addr = listener.local_addr()?;
 
 	thread::spawn(move || {
-		let server = TcpListener::from_listener(listener);
+		let server = TcpListener::from_listener_cleartext(listener);
 		server! {
 			TcpListener: server,
 			handle: |frame: Frame| async move { Ok(Some(frame)) }
@@ -63,7 +63,7 @@ fn sync_server_audits_gate_verdicts() -> TransportResult<()> {
 	let audit = trace.share();
 
 	thread::spawn(move || {
-		let server = TcpListener::from_listener(listener);
+		let server = TcpListener::from_listener_cleartext(listener);
 		server! {
 			TcpListener: server,
 			policies: { with_trace: [ audit.share() ] },
@@ -77,8 +77,8 @@ fn sync_server_audits_gate_verdicts() -> TransportResult<()> {
 	Ok(())
 }
 
-/// Connects to a `bind` arm's listener, which comes up on the server thread
-/// after the test has reserved its port.
+/// Connects to a `bind_cleartext` arm's listener, which comes up on the server
+/// thread after the test has reserved its port.
 fn connect_with_retry(addr: SocketAddr) -> NetTcpStream {
 	for _ in 0..50 {
 		if let Ok(stream) = NetTcpStream::connect(addr) {
@@ -89,14 +89,15 @@ fn connect_with_retry(addr: SocketAddr) -> NetTcpStream {
 	NetTcpStream::connect(addr).expect("the bind arm's listener comes up within a second")
 }
 
-/// The `bind` arm binds the address itself and serves the same echo loop.
+/// The `bind_cleartext` arm binds the address itself and serves the same echo
+/// loop.
 #[test]
 fn sync_server_bind_echoes() -> TransportResult<()> {
 	let addr = NetTcpListener::bind("127.0.0.1:0")?.local_addr()?;
 
 	thread::spawn(move || -> TransportResult<()> {
 		server! {
-			TcpListener<NetTcpListener>: bind TightBeamSocketAddr(addr),
+			TcpListener<NetTcpListener>: bind_cleartext TightBeamSocketAddr(addr),
 			handle: |frame: Frame| async move { Ok(Some(frame)) }
 		}
 		Ok(())
@@ -107,7 +108,8 @@ fn sync_server_bind_echoes() -> TransportResult<()> {
 	Ok(())
 }
 
-/// The `bind` arm with policies applies them to every accepted transport.
+/// The `bind_cleartext` arm with policies applies them to every accepted
+/// transport.
 #[test]
 fn sync_server_bind_applies_policies() -> TransportResult<()> {
 	let addr = NetTcpListener::bind("127.0.0.1:0")?.local_addr()?;
@@ -116,7 +118,7 @@ fn sync_server_bind_applies_policies() -> TransportResult<()> {
 
 	thread::spawn(move || -> TransportResult<()> {
 		server! {
-			TcpListener<NetTcpListener>: bind TightBeamSocketAddr(addr),
+			TcpListener<NetTcpListener>: bind_cleartext TightBeamSocketAddr(addr),
 			policies: { with_trace: [ audit.share() ] },
 			handle: |frame: Frame| async move { Ok(Some(frame)) }
 		}
@@ -129,14 +131,14 @@ fn sync_server_bind_applies_policies() -> TransportResult<()> {
 	Ok(())
 }
 
-/// The `protocol .. bind` arm binds before it returns and serves the echo
-/// loop on a thread of its own.
+/// The `protocol .. bind_cleartext` arm binds before it returns and serves the
+/// echo loop on a thread of its own.
 #[test]
 fn sync_server_protocol_bind_echoes() -> TransportResult<()> {
 	let addr = NetTcpListener::bind("127.0.0.1:0")?.local_addr()?;
 
 	server! {
-		protocol TcpListener<NetTcpListener>: bind TightBeamSocketAddr(addr),
+		protocol TcpListener<NetTcpListener>: bind_cleartext TightBeamSocketAddr(addr),
 		handle: |frame: Frame| async move { Ok(Some(frame)) }
 	};
 
@@ -145,8 +147,8 @@ fn sync_server_protocol_bind_echoes() -> TransportResult<()> {
 	Ok(())
 }
 
-/// The `protocol .. bind` arm with policies applies them to every accepted
-/// transport.
+/// The `protocol .. bind_cleartext` arm with policies applies them to every
+/// accepted transport.
 #[test]
 fn sync_server_protocol_bind_applies_policies() -> TransportResult<()> {
 	let addr = NetTcpListener::bind("127.0.0.1:0")?.local_addr()?;
@@ -154,7 +156,7 @@ fn sync_server_protocol_bind_applies_policies() -> TransportResult<()> {
 	let audit = trace.share();
 
 	server! {
-		protocol TcpListener<NetTcpListener>: bind TightBeamSocketAddr(addr),
+		protocol TcpListener<NetTcpListener>: bind_cleartext TightBeamSocketAddr(addr),
 		policies: { with_trace: [ audit.share() ] },
 		handle: |frame: Frame| async move { Ok(Some(frame)) }
 	};

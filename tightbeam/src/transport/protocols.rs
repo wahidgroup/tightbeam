@@ -83,13 +83,20 @@ pub trait Protocol {
 	/// The protocol's error when it cannot form a default address.
 	fn default_bind_address() -> Result<Self::Address, Self::Error>;
 
-	/// Bind to `addr`, returning the listener and the address it actually
-	/// bound.
+	/// Bind a cleartext listener to `addr`, returning the listener and the
+	/// address it actually bound.
+	///
+	/// Accepted transports carry no confidentiality, integrity, or peer
+	/// authentication (CWE-319), so the name says it. A protocol that binds
+	/// with transport encryption does it through
+	/// [`EncryptedProtocol::bind_with`].
 	///
 	/// # Errors
 	///
 	/// The protocol's error when the bind fails.
-	fn bind(addr: Self::Address) -> impl Future<Output = Result<(Self::Listener, Self::Address), Self::Error>> + Send;
+	fn bind_cleartext(
+		addr: Self::Address,
+	) -> impl Future<Output = Result<(Self::Listener, Self::Address), Self::Error>> + Send;
 
 	/// Connect to `addr`.
 	///

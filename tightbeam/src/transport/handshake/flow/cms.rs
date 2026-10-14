@@ -27,7 +27,7 @@ use crate::crypto::kdf::EcdhSecret;
 use crate::crypto::key::SigningKeyProvider;
 use crate::crypto::profiles::{DigestProvider, SecurityProfile, SigningProvider};
 use crate::crypto::sign::elliptic_curve::ecdh::EphemeralSecret;
-use crate::crypto::sign::elliptic_curve::{PublicKey, SecretKey};
+use crate::crypto::sign::elliptic_curve::SecretKey;
 use crate::crypto::sign::{EcdsaSignatureVerifier, SignatureAlgorithmIdentifier};
 use crate::crypto::subtle::ConstantTimeEq;
 use crate::crypto::x509::utils::Skid;
@@ -42,7 +42,7 @@ use crate::transport::handshake::builders::{TightBeamEnvelopedDataBuilder, Tight
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::flow::{
 	sealed, ClientFlow, ClosingBinding, ClosingIntake, ClosingOpened, ClosingParts, HandshakeFlow, Opened,
-	OpeningIntake, OpeningParts, ProofRequest, ReplyBinding, ReplyIntake, ReplyParts, ServerFlow, Signed,
+	OpeningIntake, OpeningParts, ProofRequest, ReplyBinding, ReplyIntake, ReplyParts, ServerFlow,
 };
 use crate::transport::handshake::kari::{Kek, OriginatorKey};
 use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer, TransportAccept, TransportOffer};
@@ -51,7 +51,7 @@ use crate::transport::handshake::primitives::transcript::{FinishedRole, ServerFi
 use crate::transport::handshake::primitives::{KdfInfo, KdfSalt};
 use crate::transport::handshake::processors::TightBeamSignedDataProcessor;
 use crate::transport::handshake::schedule::{
-	Agreement, BaseSecret, HandshakeVerifyingKey, KeyConfirmation, PeerPoint, Salt, Terms,
+	Agreement, BaseSecret, ClientStatic, HandshakeVerifyingKey, KeyConfirmation, PeerEphemeral, PeerPoint, Salt, Terms,
 };
 use crate::transport::handshake::{HandshakeCurve, HandshakeMessage, HandshakeProvider, HandshakeSecret};
 use crate::transport::state::ClientIdentity;
@@ -69,7 +69,29 @@ pub struct Cms;
 
 impl sealed::Sealed for Cms {}
 
-impl HandshakeFlow for Cms {}
+/// A signature and the public key of its signer, from one key provider. A
+/// CMS Finished names its signer by the key identifier of that public key.
+pub struct CmsSigned {
+	/// The signature bytes, as the provider encodes them.
+	signature: Vec<u8>,
+	/// The DER SubjectPublicKeyInfo of the key that signed.
+	signer_spki: Vec<u8>,
+}
+
+impl HandshakeFlow for Cms {
+	type Signed = CmsSigned;
+
+	fn sign<'a>(
+		key: &'a dyn SigningKeyProvider,
+		prehash: &'a [u8],
+	) -> MaybeSendFuture<'a, Result<Self::Signed, HandshakeError>> {
+		Box::pin(async move {
+			let signature = key.sign_prehash(prehash).await?;
+			let signer_spki = key.to_public_key_bytes().await?;
+			Ok(CmsSigned { signature, signer_spki })
+		})
+	}
+}
 
 /// What a CMS client is provisioned with.
 ///
@@ -192,11 +214,11 @@ impl Cms {
 	fn finished<P: HandshakeProvider>(
 		role: FinishedRole,
 		transcript_hash: &[u8; 32],
-		signed: Signed,
+		signed: CmsSigned,
 		unsigned_attrs: Option<Attributes>,
 		certificate: Option<Certificate>,
 	) -> Result<SignedData, HandshakeError> {
-		let Signed { signature, signer_spki } = signed;
+		let CmsSigned { signature, signer_spki } = signed;
 		let digest_alg = AlgorithmIdentifierOwned { oid: P::Digest::OID, parameters: None };
 		let signature_alg = AlgorithmIdentifierOwned { oid: P::Signature::ALGORITHM_OID, parameters: None };
 		let signer_info = SignerInfo {
@@ -416,7 +438,7 @@ impl<P: HandshakeProvider> ClientFlow<P> for Cms {
 	) -> Result<(HandshakeSecret, Self::Agreed), HandshakeError> {
 		// The secrets are read in place, so each is wiped where the box drops.
 		let CmsPending { base, ephemeral } = pending.as_ref();
-		let agreement = Agreement::<P>::new(base, server_ephemeral.as_public_key());
+		let agreement = Agreement::<P>::new(base, server_ephemeral);
 		let secret = agreement.settle(ephemeral, salt)?;
 
 		Ok((secret, ()))
@@ -438,7 +460,7 @@ impl<P: HandshakeProvider> ClientFlow<P> for Cms {
 		Ok(ClosingBinding { proof: Some(proof), draft })
 	}
 
-	fn encode_closing(draft: Self::Draft, proof: Option<Signed>) -> Result<HandshakeMessage, HandshakeError> {
+	fn encode_closing(draft: Self::Draft, proof: Option<CmsSigned>) -> Result<HandshakeMessage, HandshakeError> {
 		let CmsClosingDraft { transcript_hash, sealed_ack, confirmation, certificate } = draft;
 		let signed = proof.ok_or(HandshakeError::MutualAuthRequired)?;
 
@@ -481,8 +503,9 @@ pub struct CmsSealed {
 pub struct CmsOpened<C: HandshakeCurve> {
 	/// The base secret the key exchange carried.
 	base: BaseSecret,
-	/// The client's KARI originator key, parsed once at the open.
-	originator: PublicKey<C>,
+	/// The client's KARI originator key, admitted once at the open as a point
+	/// that differs from the client's static key.
+	originator: PeerPoint<C>,
 	/// The transcript, open over the key exchange.
 	transcript: Transcript,
 	/// The client certificate the key exchange carried.
@@ -625,8 +648,10 @@ impl<P: HandshakeProvider> ServerFlow<P> for Cms {
 			};
 
 			// 2. Parse the originator key. A malformed, off-curve, or identity
-			//    point is refused here, ahead of the agreement.
-			let originator = PublicKey::<P::Curve>::from_sec1_bytes(originator_bytes)?;
+			//    point is refused here, ahead of the agreement, and so is the
+			//    static key of the certificate the key exchange carries.
+			let client_static = ClientStatic::<P::Curve>::of(bound.as_ref())?;
+			let originator = client_static.client_ephemeral(originator_bytes)?;
 
 			// 3. Run the static ECDH through the key provider, and derive the
 			//    key-encryption key under the UKM.
@@ -693,7 +718,7 @@ impl<P: HandshakeProvider> ServerFlow<P> for Cms {
 
 	fn encode_reply(
 		draft: Self::Draft,
-		signed: Signed,
+		signed: CmsSigned,
 		artifact: Option<&SignedData>,
 	) -> Result<HandshakeMessage, HandshakeError> {
 		let CmsReplyDraft { transcript_hash, security_accept, transport_accept, server_ephemeral } = draft;
@@ -782,7 +807,9 @@ mod tests {
 	use crate::crypto::profiles::{DefaultCryptoProvider, SecurityProfileDesc};
 	use crate::crypto::secret::{SecretSlice, ToInsecure};
 	use crate::crypto::sign::ecdsa::k256::Secp256k1;
-	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
+	use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
+	use crate::crypto::sign::elliptic_curve::PublicKey;
+	use crate::crypto::sign::LowSEncoding;
 	use crate::crypto::x509::policy::ExpiryValidator;
 	use crate::der::asn1::{BitString, ObjectIdentifier};
 	use crate::der::{EncodeValue, Tagged};
@@ -1372,6 +1399,42 @@ mod tests {
 
 		let refusal = server.reply(opening(rewritten)).await;
 		assert!(matches!(refusal, Err(HandshakeError::InvalidPublicKey(_))));
+	}
+
+	/// A CMS Finished names its signer by the identifier of its public key, so
+	/// a signature is the provider's signature over the prehash beside that
+	/// key, fetched once.
+	#[tokio::test]
+	async fn a_cms_signature_fetches_the_signer_public_key_once() -> Result<(), Box<dyn Error>> {
+		let identity = create_test_certificate();
+		let verifying_key = *identity.signing_key.verifying_key();
+		let signer_spki = verifying_key.to_public_key_der()?;
+		let provider = CountingProvider::new(identity.signing_key);
+		let prehash = [0x42u8; 32];
+
+		let signed = <Cms as HandshakeFlow>::sign(&provider, &prehash).await?;
+
+		let signature = Secp256k1Signature::try_from(signed.signature.as_slice())?;
+		signature.verify_prehash(&verifying_key, prehash)?;
+		assert_eq!(signed.signer_spki, signer_spki.as_bytes());
+		assert_eq!(provider.public_keys(), 1);
+		Ok(())
+	}
+
+	/// A client that names its static key as the KARI originator leaves the
+	/// session to the secrecy of that one key, so the server refuses the key
+	/// exchange that carries the client's certificate.
+	#[tokio::test]
+	async fn an_originator_key_equal_to_the_client_static_key_is_refused() {
+		let (mut server, server_public_key) = anonymous_server();
+		let client = create_test_certificate();
+		let static_key = SecretKey::<Secp256k1>::from(&client.signing_key);
+		let certificate = [attribute(&client.certificate)];
+		let key_exchange = build_test_key_exchange_from(static_key, &server_public_key, &TEST_BASE_SECRET, certificate);
+
+		let refusal = server.reply(opening(key_exchange)).await;
+
+		assert!(matches!(refusal, Err(HandshakeError::ClientEphemeralIsStatic)));
 	}
 
 	/// A key exchange that carries an abort alert is refused before any

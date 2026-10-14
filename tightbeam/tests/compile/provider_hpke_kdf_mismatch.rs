@@ -9,7 +9,7 @@ use tightbeam::crypto::profiles::{
 use tightbeam::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey, Secp256k1VerifyingKey};
 use tightbeam::ZeroizingBytes;
 
-// A second KDF, which the provider below does not run.
+// A second KDF, distinct from the KDF that the provider below runs.
 struct OtherKdf;
 
 impl HpkeKdf for OtherKdf {

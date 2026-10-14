@@ -1278,18 +1278,22 @@ DER tag-length-value encoding supplies framing. Default size limits:
 The TCP transport maps a byte stream to the Frame API with DER length-prefixed envelopes. It supports `std::net` (synchronous) and `tokio` (asynchronous).
 
 ```rust,ignore
-use std::net::TcpListener;
-use tightbeam::{server, compose, Frame};
+use std::net::TcpListener as NetTcpListener;
+use tightbeam::transport::tcp::sync::TcpListener;
+use tightbeam::transport::tcp::TightBeamSocketAddr;
+use tightbeam::{server, Frame};
 
-let listener = TcpListener::bind("127.0.0.1:8080")?;
+let addr = "127.0.0.1:8080".parse()?;
 server! {
-	protocol std::net::TcpListener: listener,
+	protocol TcpListener<NetTcpListener>: bind_cleartext TightBeamSocketAddr(addr),
 	handle: |message: Frame| async move {
 		// Echo the frame back
 		Ok(Some(message))
 	}
 }
 ```
+
+The listener serves in the clear here, and the call says so. `EncryptedProtocol::bind_with` binds one with transport encryption.
 
 ### 8.4 Transport Policies
 
@@ -2600,11 +2604,19 @@ let servlet_conf = ServletConfig::<TokioListener, RequestMessage>::builder()
 	.with_config(Arc::new(PingPongServletConfig { service_name: "ping-pong".to_string() }))
 	.with_worker(ping_pong_worker)
 	.with_worker(lucky_number_worker)
+	.allow_cleartext()
 	.build();
 
 // Start the servlet (workers are auto-started with servlet's trace)
 PingPongServletWithWorker::start(trace, servlet_conf).await?
 ```
+
+A servlet serves in the clear only where its configuration says so (CWE-319):
+
+- `.allow_cleartext()` on the builder names cleartext. `ServletConfig::cleartext()` is that choice over the default env.
+- `.with_certificate(..)` turns the handshake on.
+
+`build` exists after one of the two builder calls alone, so the compiler refuses a configuration that names neither.
 
 **Macro-free path**
 
@@ -2688,6 +2700,7 @@ tb_scenario! {
 			let servlet_conf = ServletConfig::<TokioListener, CalcRequest>::builder()
 				.with_config(env.context)
 				.with_worker(worker)
+				.allow_cleartext()
 				.build();
 
 			CalcServlet::start(Arc::new(env.trace), servlet_conf).await
@@ -2767,8 +2780,8 @@ A typical hive lifecycle with cluster integration:
 let mut hive = MyHive::new(Some(HiveConfig::default()))?;
 
 // 2. Register servlet types with spawners for auto-scale
-hive.register(ping_urn(), ping_servlet, |t| PingServlet::start(t, ServletConfig::default()))?;
-hive.register(calc_urn(), calc_servlet, |t| CalculatorServlet::start(t, ServletConfig::default()))?;
+hive.register(ping_urn(), ping_servlet, |t| PingServlet::start(t, ServletConfig::cleartext()))?;
+hive.register(calc_urn(), calc_servlet, |t| CalculatorServlet::start(t, ServletConfig::cleartext()))?;
 
 // 3. Establish: bind control plane and spawn registered servlets
 hive.establish(trace).await?;
@@ -3368,10 +3381,10 @@ tb_scenario! {
 		// Optional: awaited and registered with the cluster.
 		// Omit when driving registration from the client.
 		hives: |SetupEnv { context: certs, .. }| vec![async move {
-			let servlet = PingServlet::start(Arc::new(TraceCollector::new()), ServletConfig::default()).await?;
+			let servlet = PingServlet::start(Arc::new(TraceCollector::new()), ServletConfig::cleartext()).await?;
 			// hive_tls_config sets pool.mux_offer for multiplexed hive <-> servlet
 			let mut hive = TestHive::new(Some(hive_tls_config(&certs)))?;
-			hive.register(ping_type(), servlet, |t| PingServlet::start(t, ServletConfig::default()))?;
+			hive.register(ping_type(), servlet, |t| PingServlet::start(t, ServletConfig::cleartext()))?;
 			hive.establish(Arc::new(TraceCollector::new())).await?;
 			Ok(hive)
 		}],
@@ -5020,7 +5033,7 @@ tb_scenario! {
 		worker_threads: 2,
 		server: |SetupEnv { trace, .. }| async move {
 			let bind_addr = "127.0.0.1:0".parse().expect("invalid bind address");
-			let (listener, addr) = <TokioListener as Protocol>::bind(bind_addr).await?;
+			let (listener, addr) = <TokioListener as Protocol>::bind_cleartext(bind_addr).await?;
 			let handle = server! {
 				protocol TokioListener: listener,
 				assertions: trace.share(),
@@ -5652,7 +5665,7 @@ tb_scenario! {
 		.build(),
 	environment Servlet {
 		start: |env| async move {
-			PingPongServletWithWorker::start(Arc::new(env.trace), ServletConfig::default()).await
+			PingPongServletWithWorker::start(Arc::new(env.trace), ServletConfig::cleartext()).await
 		},
 		client: |env| async move {
 			let (trace, mut client) = (env.trace, env.client);

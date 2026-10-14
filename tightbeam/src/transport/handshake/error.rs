@@ -39,15 +39,16 @@ pub enum HandshakeError {
 	#[from]
 	InvalidPublicKey(crate::crypto::sign::ecdsa::k256::elliptic_curve::Error),
 
-	/// The server sent its static key as its ephemeral. The agreement would
-	/// then collapse into the static one, which the server's key recovers, so
-	/// the client refuses it.
+	/// The server sent its static key, or the negation of it, as its
+	/// ephemeral. The agreement would then collapse into the static one, which
+	/// the server's key recovers, so the client refuses it.
 	#[error("Server ephemeral equals the server static key")]
 	ServerEphemeralIsStatic,
 
-	/// A client's rekey ephemeral public key is the client's static key. The
-	/// agreement of the renewal would then collapse into the static one, which
-	/// the client's key recovers, so the server refuses it.
+	/// The client sent its static key, or the negation of it, as an ephemeral
+	/// of the handshake or of a rekey. The agreement would then collapse into
+	/// the static one, which the client's key recovers, so the server refuses
+	/// it.
 	#[error("Client ephemeral equals the client static key")]
 	ClientEphemeralIsStatic,
 

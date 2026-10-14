@@ -144,7 +144,7 @@ async fn start_beacon_hive(
 
 	let mut hive = ClusterTestHive::new(Some(hive_tls_config(&certs)))?;
 	hive.register(servlet_urn("beacon"), servlet, |t| {
-		ClusterTestServlet::start(t, ServletConfig::default())
+		ClusterTestServlet::start(t, ServletConfig::cleartext())
 	})?;
 	hive.establish(Arc::new(trace.share())).await?;
 	Ok(hive)

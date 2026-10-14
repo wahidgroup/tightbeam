@@ -181,7 +181,7 @@ async fn start_laser_hive(
 	let servlet = LaserServlet::start(Arc::clone(&trace), config).await?;
 
 	let mut hive = LaserHive::new(Some(conf))?;
-	hive.register(beam_urn(), servlet, |t| LaserServlet::start(t, ServletConfig::default()))?;
+	hive.register(beam_urn(), servlet, |t| LaserServlet::start(t, ServletConfig::cleartext()))?;
 	hive.establish(trace).await?;
 	Ok(hive)
 }

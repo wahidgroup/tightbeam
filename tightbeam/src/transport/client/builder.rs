@@ -354,7 +354,7 @@ mod tests {
 	/// path reaches the wire without it.
 	#[tokio::test]
 	async fn an_adopted_stream_without_a_peer_authority_is_refused() -> TransportResult<()> {
-		let listener = TokioListener::<DefaultCryptoProvider>::bind("127.0.0.1:0").await?;
+		let listener = TokioListener::<DefaultCryptoProvider>::bind_cleartext("127.0.0.1:0").await?;
 		let stream = tokio::net::TcpStream::connect(listener.local_addr()?).await?;
 
 		let refused = ClientBuilder::<TokioListener>::builder().adopt(TokioStream::from(stream));

@@ -370,6 +370,33 @@ mod tests {
 		assert!(config.peer_authentication.requires_certificate());
 	}
 
+	/// Both `bind_cleartext` arms of `server!` expand and bind on the tokio
+	/// runtime, with policies and with none.
+	#[cfg(feature = "tokio")]
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn the_bind_cleartext_arms_of_the_server_macro_bind() -> TransportResult<()> {
+		use crate::asn1::Frame;
+		use crate::trace::TraceCollector;
+		use crate::transport::tcp::r#async::TokioListener;
+
+		let addr = <TokioListener as Protocol>::default_bind_address()?;
+		let trace = TraceCollector::new();
+
+		let plain = crate::server! {
+			protocol TokioListener: bind_cleartext addr,
+			handle: |frame: Frame| async move { Ok(Some(frame)) }
+		};
+		let traced = crate::server! {
+			protocol TokioListener: bind_cleartext addr,
+			policies: { with_trace: [ trace.share() ] },
+			handle: |frame: Frame| async move { Ok(Some(frame)) }
+		};
+
+		plain.abort();
+		traced.abort();
+		Ok(())
+	}
+
 	#[cfg(feature = "tokio")]
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 	async fn test_server_and_client_macros() -> TransportResult<()> {
@@ -380,7 +407,7 @@ mod tests {
 		use crate::transport::tcp::r#async::TokioListener;
 		use crate::transport::tcp::TightBeamSocketAddr;
 
-		let listener = TokioListener::bind("127.0.0.1:0").await?;
+		let listener = TokioListener::bind_cleartext("127.0.0.1:0").await?;
 		let addr = TightBeamSocketAddr(listener.local_addr()?);
 
 		let (tx, rx) = mpsc::channel();

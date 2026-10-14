@@ -1,0 +1,30 @@
+# The workspace pins every dependency to an exact version, so a pin moves only
+# when an update lands. Each ecosystem gets one grouped pull request a week.
+# Three consumer crates sit outside the workspace with a lock file of their
+# own, so each is listed beside the root.
+version: 2
+
+updates:
+  - package-ecosystem: cargo
+    directories:
+      - /
+      - /consumers/default
+      - /consumers/expansion
+      - /consumers/sync
+    schedule:
+      interval: weekly
+    groups:
+      cargo:
+        patterns:
+          - "*"
+
+  # `actions/*` float on their major tag, and every other action is pinned to
+  # a commit, which this keeps current.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns:
+          - "*"

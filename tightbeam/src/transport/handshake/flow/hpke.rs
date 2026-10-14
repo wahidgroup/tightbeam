@@ -34,14 +34,15 @@ use crate::transport::handshake::attributes::HandshakeAttributes;
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::flow::{
 	sealed, ClientFlow, ClosingBinding, ClosingIntake, ClosingOpened, ClosingParts, HandshakeFlow, Opened,
-	OpeningIntake, OpeningParts, ProofRequest, ReplyBinding, ReplyIntake, ReplyParts, ServerFlow, Signed,
+	OpeningIntake, OpeningParts, ProofRequest, ReplyBinding, ReplyIntake, ReplyParts, ServerFlow,
 };
 use crate::transport::handshake::negotiation::{SecurityAccept, TransportAccept};
 use crate::transport::handshake::peer::{LearnedTrust, PossessionProof};
 use crate::transport::handshake::primitives::transcript::{HpkeHandshakeLegs, Transcript};
 use crate::transport::handshake::primitives::KdfSalt;
 use crate::transport::handshake::schedule::{
-	Agreement, BaseSecret, CompressedPoint, HandshakeVerifyingKey, KeyConfirmation, PeerPoint, Salt, Terms,
+	Agreement, BaseSecret, ClientStatic, CompressedPoint, HandshakeVerifyingKey, KeyConfirmation, PeerEphemeral,
+	PeerPoint, Salt, Terms,
 };
 use crate::transport::handshake::wire::HandshakeOctets;
 use crate::transport::handshake::{
@@ -63,7 +64,21 @@ pub struct Hpke;
 
 impl sealed::Sealed for Hpke {}
 
-impl HandshakeFlow for Hpke {}
+impl HandshakeFlow for Hpke {
+	/// The signature bytes, as the provider encodes them. An HPKE message
+	/// names its signer by the certificate beside it.
+	type Signed = Vec<u8>;
+
+	fn sign<'a>(
+		key: &'a dyn SigningKeyProvider,
+		prehash: &'a [u8],
+	) -> MaybeSendFuture<'a, Result<Self::Signed, HandshakeError>> {
+		Box::pin(async move {
+			let signature = key.sign_prehash(prehash).await?;
+			Ok(signature)
+		})
+	}
+}
 
 /// What an HPKE client is provisioned with.
 pub struct HpkeClientSettings<P: HandshakeProvider> {
@@ -233,7 +248,7 @@ impl<P: HandshakeProvider> ClientFlow<P> for Hpke {
 	) -> Result<(HandshakeSecret, Self::Agreed), HandshakeError> {
 		let base = BaseSecret::random(Some(&mut *rng))?;
 		let ephemeral = SecretKey::<P::Curve>::random(&mut RngWrapper(rng));
-		let agreement = Agreement::<P>::new(&base, server_ephemeral.as_public_key());
+		let agreement = Agreement::<P>::new(&base, server_ephemeral);
 		let secret = agreement.settle(&ephemeral, salt)?;
 		let client_ephemeral = ephemeral.public_key().compressed_point()?;
 
@@ -291,9 +306,9 @@ impl<P: HandshakeProvider> ClientFlow<P> for Hpke {
 		Ok(ClosingBinding { proof, draft })
 	}
 
-	fn encode_closing(draft: Self::Draft, proof: Option<Signed>) -> Result<HandshakeMessage, HandshakeError> {
+	fn encode_closing(draft: Self::Draft, proof: Option<Vec<u8>>) -> Result<HandshakeMessage, HandshakeError> {
 		let HpkeClosingDraft { encrypted_data, certificate } = draft;
-		let signature = proof.map(|signed| OctetString::new(signed.signature)).transpose()?;
+		let signature = proof.map(OctetString::new).transpose()?;
 		let key_exchange = ClientKeyExchange {
 			encrypted_data: OctetString::new(encrypted_data)?,
 			client_certificate: certificate,
@@ -357,6 +372,9 @@ pub struct HpkeClosing<S: HpkeSuite> {
 	recipient: PublicKey<S::Curve>,
 	/// The associated data the payload was sealed under.
 	aad: Vec<u8>,
+	/// The static key of the certificate the client offers, which the client
+	/// ephemeral must differ from.
+	client_static: ClientStatic<S::Curve>,
 }
 
 /// The proof of an HPKE key exchange that the key of the offered
@@ -390,8 +408,9 @@ struct SessionPayload<C: HandshakeCurve> {
 	base: BaseSecret,
 	/// The client random the payload echoes against replay.
 	client_random: [u8; 32],
-	/// The client ephemeral, parsed as a point on the curve.
-	client_ephemeral: PublicKey<C>,
+	/// The client ephemeral, admitted as a point of the curve that differs
+	/// from the client's static key.
+	client_ephemeral: PeerPoint<C>,
 	/// The key-confirmation tag of the client.
 	confirmation: KeyConfirmation,
 	/// The client receipt `SignerInfo`, sealed under the handshake secret.
@@ -405,9 +424,9 @@ impl<C: HandshakeCurve> SessionPayload<C> {
 	/// 32-byte geometry of the base secret. A payload with no key-confirmation
 	/// tag, or with one of another width, fails to decode.
 	///
-	/// The client ephemeral is parsed as a compressed point of the curve, so
-	/// the ephemeral-ephemeral agreement runs on a validated key.
-	fn parse(decrypted: &[u8]) -> Result<Self, HandshakeError> {
+	/// The client ephemeral is admitted through [`PeerEphemeral`] as a point of
+	/// the curve that differs from `client_static`.
+	fn parse(decrypted: &[u8], client_static: &ClientStatic<C>) -> Result<Self, HandshakeError> {
 		let payload = HpkeSessionPayload::from_der(decrypted);
 		let payload = payload.map_err(|_| HandshakeError::InvalidDecryptedPayloadSize)?;
 		let HpkeSessionPayload { base_key, client_random, client_ephemeral, key_confirmation, receipt_ack } = payload;
@@ -418,7 +437,7 @@ impl<C: HandshakeCurve> SessionPayload<C> {
 		let base = BaseSecret::try_from(SecretSlice::from(base_key.into_bytes()))?;
 		let client_random = client_random.to_32_byte_array()?;
 		let point = client_ephemeral.to_byte_array::<EC_PUBKEY_COMPRESSED_SIZE>()?;
-		let client_ephemeral = PublicKey::<C>::from_sec1_bytes(&point)?;
+		let client_ephemeral = client_static.client_ephemeral(&point)?;
 		Ok(Self {
 			base,
 			client_random,
@@ -504,7 +523,7 @@ impl<P: HandshakeProvider> ServerFlow<P> for Hpke {
 
 	fn encode_reply(
 		draft: Self::Draft,
-		signed: Signed,
+		signature: Vec<u8>,
 		artifact: Option<&SignedData>,
 	) -> Result<HandshakeMessage, HandshakeError> {
 		let HpkeReplyDraft {
@@ -523,7 +542,7 @@ impl<P: HandshakeProvider> ServerFlow<P> for Hpke {
 			certificate,
 			server_random: OctetString::new(server_random)?,
 			server_ephemeral: OctetString::new(server_ephemeral)?,
-			signature: OctetString::new(signed.signature)?,
+			signature: OctetString::new(signature)?,
 			security_accept: Some(security_accept),
 			client_cert_required,
 			transport_accept,
@@ -561,10 +580,17 @@ impl<P: HandshakeProvider> ServerFlow<P> for Hpke {
 		let message = HpkeMessage::<P::HpkeSuite>::from_bytes(encrypted_data.as_bytes())?;
 		let recipient = settings.certificate.verifying_key::<P::Curve>()?;
 
-		// 3. Build the associated data and the possession proof over the
+		// 3. Read the static key of the offered certificate, and refuse an
+		//    encapsulated key that collapses into it. The encapsulated key is a
+		//    client ephemeral as well: a client that seals under its static key
+		//    leaves the payload to the secrecy of that key.
+		let offered = client_certificate.as_ref();
+		let client_static = ClientStatic::of(offered)?;
+		client_static.client_ephemeral_point(*message.encapsulated_key())?;
+
+		// 4. Build the associated data and the possession proof over the
 		//    offered certificate. A signature with no certificate binds no
 		//    certificate bytes, and admission refuses it unverified.
-		let offered = client_certificate.as_ref();
 		let aad = ClientKeyExchange::client_bound_aad(settings.aad_domain_tag, offered)?;
 		let certificate_der = offered.map(Encode::to_der).transpose()?.unwrap_or_default();
 		let proof = client_signature.map(|signature| HpkePossession {
@@ -573,7 +599,7 @@ impl<P: HandshakeProvider> ServerFlow<P> for Hpke {
 			certificate_der,
 		});
 
-		let closing = HpkeClosing { message, recipient, aad };
+		let closing = HpkeClosing { message, recipient, aad, client_static };
 		Ok(ClosingIntake { offered: client_certificate, proof, closing })
 	}
 
@@ -585,7 +611,7 @@ impl<P: HandshakeProvider> ServerFlow<P> for Hpke {
 	) -> MaybeSendFuture<'a, Result<ClosingOpened, HandshakeError>> {
 		Box::pin(async move {
 			let HpkeServerPending { ephemeral, client_random } = pending;
-			let HpkeClosing { message, recipient, aad } = closing;
+			let HpkeClosing { message, recipient, aad, client_static } = closing;
 
 			// 1. Open the payload under the associated data. The key provider
 			//    runs the static ECDH step on the encapsulated key the parse
@@ -594,7 +620,7 @@ impl<P: HandshakeProvider> ServerFlow<P> for Hpke {
 			let agreed = key.key_agreement(enc.as_bytes()).await?;
 			let shared_secret = EcdhSecret::try_from(agreed)?;
 			let plaintext = shared_secret.open(&recipient, &message, TIGHTBEAM_HPKE_HANDSHAKE_INFO, &aad)?;
-			let payload = plaintext.with(|payload| SessionPayload::<P::Curve>::parse(payload))?;
+			let payload = plaintext.with(|payload| SessionPayload::<P::Curve>::parse(payload, &client_static))?;
 			let SessionPayload { base, client_random: echoed, client_ephemeral, confirmation, receipt_ack } = payload;
 
 			// 2. Verify that the payload echoes the client random of the hello, which prevents replay.
@@ -777,6 +803,11 @@ mod tests {
 		(server, confirming)
 	}
 
+	/// A client that offers no certificate, as the payload parse takes it.
+	fn anonymous() -> ClientStatic<Secp256k1> {
+		ClientStatic::of(None).expect("an absent certificate holds no key")
+	}
+
 	/// The DER of an `HpkeSessionPayload` that carries `base_key`,
 	/// `client_random`, `client_ephemeral`, and `receipt_ack` at the widths
 	/// they come in, beside `confirmation`.
@@ -835,11 +866,24 @@ mod tests {
 		receipt_ack: Option<&[u8]>,
 		aad: impl AsRef<[u8]>,
 	) -> Vec<u8> {
+		let ephemeral = SecretKey::<Secp256k1>::random(&mut OsRng);
+		sealed_payload_from(&ephemeral, server, confirming, client_random, receipt_ack, aad)
+	}
+
+	/// The payload of [`sealed_payload`] under the client ephemeral
+	/// `ephemeral`, for a fixture that chooses that key.
+	fn sealed_payload_from(
+		ephemeral: &SecretKey<Secp256k1>,
+		server: &TestCertificate,
+		confirming: &Confirming,
+		client_random: &[u8; 32],
+		receipt_ack: Option<&[u8]>,
+		aad: impl AsRef<[u8]>,
+	) -> Vec<u8> {
 		let static_key = PublicKey::<Secp256k1>::from_sec1_bytes(server.certificate.verifying_key_bytes());
 		let static_key = static_key.expect("the test certificate carries a point on the curve");
 		let base = BaseSecret::random(None).expect("the random source draws a base secret");
-		let ephemeral = SecretKey::<Secp256k1>::random(&mut OsRng);
-		let confirmation = confirming.tag(&base, &ephemeral);
+		let confirmation = confirming.tag(&base, ephemeral);
 		let client_ephemeral = ephemeral.public_key().compressed_point().expect("a point compresses");
 		let base_key = base.as_bytes();
 		let plaintext = session_payload_der(base_key, client_random, client_ephemeral, &confirmation, receipt_ack);
@@ -901,9 +945,22 @@ mod tests {
 		client_random: &[u8; 32],
 		client: &TestCertificate,
 	) -> ClientKeyExchange {
+		let ephemeral = SecretKey::<Secp256k1>::random(&mut OsRng);
+		build_identified_client_key_exchange_from(&ephemeral, server, confirming, client_random, client)
+	}
+
+	/// The key exchange of [`build_identified_client_key_exchange`] under the
+	/// client ephemeral `ephemeral`.
+	fn build_identified_client_key_exchange_from(
+		ephemeral: &SecretKey<Secp256k1>,
+		server: &TestCertificate,
+		confirming: &Confirming,
+		client_random: &[u8; 32],
+		client: &TestCertificate,
+	) -> ClientKeyExchange {
 		let aad = ClientKeyExchange::client_bound_aad(TIGHTBEAM_AAD_DOMAIN_TAG, Some(&client.certificate));
 		let aad = aad.expect("the test certificate encodes");
-		let sealed = sealed_payload(server, confirming, client_random, None, aad);
+		let sealed = sealed_payload_from(ephemeral, server, confirming, client_random, None, aad);
 		let digest = possession_digest(&confirming.transcript_hash, &sealed, &client.certificate);
 
 		ClientKeyExchange {
@@ -1225,6 +1282,90 @@ mod tests {
 		Ok(())
 	}
 
+	/// What a server under `peer_authentication` answers to the key exchange
+	/// of an identity that sends its static key as its ephemeral.
+	async fn finish_with_a_static_ephemeral(peer_authentication: PeerAuthentication) -> Result<(), HandshakeError> {
+		let identity = create_test_certificate();
+		let (mut server, confirming) = server_after_hello(&identity, peer_authentication).await;
+		let client = create_test_certificate();
+		let reused = SecretKey::<Secp256k1>::from(&client.signing_key);
+		let sent = build_identified_client_key_exchange_from(&reused, &identity, &confirming, &CLIENT_RANDOM, &client);
+
+		server.finish(carried_closing(&sent)).await
+	}
+
+	/// An HPKE message names its signer by the certificate beside it, so a
+	/// signature is the provider's signature over the prehash and costs it
+	/// that one call.
+	#[tokio::test]
+	async fn an_hpke_signature_fetches_no_public_key() -> Result<(), Box<dyn Error>> {
+		let identity = create_test_certificate();
+		let verifying_key = *identity.signing_key.verifying_key();
+		let provider = CountingProvider::new(identity.signing_key);
+		let prehash = [0x42u8; 32];
+
+		let signed = <Hpke as HandshakeFlow>::sign(&provider, &prehash).await?;
+
+		let signature = Secp256k1Signature::try_from(signed.as_slice())?;
+		signature.verify_prehash(&verifying_key, prehash)?;
+		assert_eq!(provider.public_keys(), 0);
+		Ok(())
+	}
+
+	/// A server reply names its signer by the certificate it carries, so the
+	/// whole step costs the key provider its signature alone.
+	#[tokio::test]
+	async fn an_hpke_reply_fetches_no_public_key() -> Result<(), Box<dyn Error>> {
+		let identity = create_test_certificate();
+		let provider = Arc::new(CountingProvider::new(identity.signing_key.to_owned()));
+		let shared = Arc::clone(&provider);
+		let mut config = Hpke::server(&identity);
+		config.key = shared;
+		let mut server = Handshake::server(config);
+		let hello_der = create_test_client_hello(&CLIENT_RANDOM)?;
+		let hello = ClientHello::from_der(&hello_der)?;
+
+		server.reply(tunneled_opening(&hello)).await?;
+
+		assert_eq!(provider.public_keys(), 0);
+		Ok(())
+	}
+
+	/// A client that sends its static key as its ephemeral leaves the session
+	/// to the secrecy of the two static keys, so a server that demands an
+	/// identity refuses the key exchange of the one it admitted.
+	#[tokio::test]
+	async fn a_demanded_identity_that_sends_its_static_key_as_its_ephemeral_is_refused() {
+		let refusal = finish_with_a_static_ephemeral(mutual_with(ExpiryValidator)).await;
+
+		assert!(matches!(refusal, Err(HandshakeError::ClientEphemeralIsStatic)));
+	}
+
+	/// A server that demands no identity still holds the key of a certificate
+	/// the client offers, and refuses that key as the client ephemeral.
+	#[tokio::test]
+	async fn an_offered_identity_that_sends_its_static_key_as_its_ephemeral_is_refused() {
+		let refusal = finish_with_a_static_ephemeral(PeerAuthentication::Anonymous).await;
+
+		assert!(matches!(refusal, Err(HandshakeError::ClientEphemeralIsStatic)));
+	}
+
+	/// The encapsulated key is a client ephemeral as well, so an identity that
+	/// seals under its static key is refused where the closing is read.
+	#[tokio::test]
+	async fn an_encapsulated_key_equal_to_the_client_static_key_is_refused() -> Result<(), Box<dyn Error>> {
+		let Identified { mut server, client, mut key_exchange } = identified(PeerAuthentication::Anonymous).await;
+		let static_key = client.certificate.verifying_key::<Secp256k1>()?;
+		let encapsulated_key = static_key.to_encoded_point(false);
+		let sealed_under_static = [encapsulated_key.as_bytes(), &[0u8; 16]].concat();
+		key_exchange.encrypted_data = OctetString::new(sealed_under_static)?;
+
+		let refusal = server.finish(carried_closing(&key_exchange)).await;
+
+		assert!(matches!(refusal, Err(HandshakeError::ClientEphemeralIsStatic)));
+		Ok(())
+	}
+
 	/// An anonymous server still verifies the possession proof of an offered
 	/// identity, so a signature over other material ends the handshake.
 	#[tokio::test]
@@ -1407,7 +1548,7 @@ mod tests {
 	#[test]
 	fn a_payload_that_is_not_der_is_refused() {
 		let garbage = [0u8; 68];
-		let parsed = SessionPayload::<Secp256k1>::parse(&garbage);
+		let parsed = SessionPayload::<Secp256k1>::parse(&garbage, &anonymous());
 		assert!(matches!(parsed, Err(HandshakeError::InvalidDecryptedPayloadSize)));
 	}
 
@@ -1415,7 +1556,7 @@ mod tests {
 	fn a_payload_with_a_short_base_secret_is_refused() {
 		let client_ephemeral = create_test_server_ephemeral();
 		let short_key = session_payload_der([0u8; 31], [0u8; 32], client_ephemeral, &fixture_confirmation(), None);
-		let parsed = SessionPayload::<Secp256k1>::parse(&short_key);
+		let parsed = SessionPayload::<Secp256k1>::parse(&short_key, &anonymous());
 		let refused = matches!(parsed, Err(HandshakeError::InvalidKeySize { expected: 32, received: 31 }));
 		assert!(refused);
 	}
@@ -1425,7 +1566,7 @@ mod tests {
 	fn a_payload_with_a_short_client_random_is_refused() {
 		let client_ephemeral = create_test_server_ephemeral();
 		let short_random = session_payload_der([0u8; 32], [0u8; 16], client_ephemeral, &fixture_confirmation(), None);
-		let parsed = SessionPayload::<Secp256k1>::parse(&short_random);
+		let parsed = SessionPayload::<Secp256k1>::parse(&short_random, &anonymous());
 		assert!(matches!(parsed, Err(HandshakeError::OctetStringLengthError(_))));
 	}
 
@@ -1439,8 +1580,8 @@ mod tests {
 		let off_curve = session_payload_der([0u8; 32], [0u8; 32], off_curve_point(), &confirmation, None);
 		let another_width = session_payload_der([0u8; 32], [0u8; 32], uncompressed, &confirmation, None);
 
-		let off_curve = SessionPayload::<Secp256k1>::parse(&off_curve);
-		let another_width = SessionPayload::<Secp256k1>::parse(&another_width);
+		let off_curve = SessionPayload::<Secp256k1>::parse(&off_curve, &anonymous());
+		let another_width = SessionPayload::<Secp256k1>::parse(&another_width, &anonymous());
 		assert!(matches!(off_curve, Err(HandshakeError::InvalidPublicKey(_))));
 		assert!(matches!(another_width, Err(HandshakeError::OctetStringLengthError(_))));
 	}
@@ -1450,7 +1591,7 @@ mod tests {
 	#[test]
 	fn a_payload_with_no_key_confirmation_is_refused() {
 		let unconfirmed = loose_payload_der(None);
-		let parsed = SessionPayload::<Secp256k1>::parse(&unconfirmed);
+		let parsed = SessionPayload::<Secp256k1>::parse(&unconfirmed, &anonymous());
 		assert!(matches!(parsed, Err(HandshakeError::InvalidDecryptedPayloadSize)));
 	}
 
@@ -1458,7 +1599,7 @@ mod tests {
 	#[test]
 	fn a_payload_with_a_short_key_confirmation_is_refused() {
 		let short_tag = loose_payload_der(Some(&[7u8; 31]));
-		let parsed = SessionPayload::<Secp256k1>::parse(&short_tag);
+		let parsed = SessionPayload::<Secp256k1>::parse(&short_tag, &anonymous());
 		assert!(matches!(parsed, Err(HandshakeError::InvalidDecryptedPayloadSize)));
 	}
 
@@ -1467,7 +1608,7 @@ mod tests {
 	#[test]
 	fn a_payload_with_a_key_confirmation_of_the_one_width_parses() {
 		let confirmed = loose_payload_der(Some(&[7u8; 32]));
-		let parsed = SessionPayload::<Secp256k1>::parse(&confirmed);
+		let parsed = SessionPayload::<Secp256k1>::parse(&confirmed, &anonymous());
 		assert!(parsed.is_ok());
 	}
 
@@ -1477,10 +1618,10 @@ mod tests {
 	fn a_well_formed_payload_parses_into_its_session_data() -> Result<(), Box<dyn Error>> {
 		let client_ephemeral = create_test_server_ephemeral();
 		let unanswered = session_payload_der([3u8; 32], [5u8; 32], client_ephemeral, &fixture_confirmation(), None);
-		let payload = SessionPayload::<Secp256k1>::parse(&unanswered)?;
+		let payload = SessionPayload::<Secp256k1>::parse(&unanswered, &anonymous())?;
 		assert_eq!(payload.base.as_bytes(), [3u8; 32]);
 		assert_eq!(payload.client_random, [5u8; 32]);
-		assert_eq!(payload.client_ephemeral.compressed_point()?, client_ephemeral);
+		assert_eq!(payload.client_ephemeral.as_public_key().compressed_point()?, client_ephemeral);
 		assert!(payload.receipt_ack.is_none());
 		Ok(())
 	}

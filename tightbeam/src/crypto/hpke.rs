@@ -471,9 +471,9 @@ impl<S: HpkeSuite> HpkeMessage<S> {
 	/// `Seal` at sequence number zero).
 	///
 	/// The ephemeral is taken by value and dropped here, so it serves this one
-	/// message and nothing else ([RFC 9180 §9.2.3][rfc9180-9.2.3]). The nonce
-	/// of a single-shot context is fixed by the key schedule, so a second
-	/// message under one ephemeral would repeat it.
+	/// message ([RFC 9180 §9.2.3][rfc9180-9.2.3]). The nonce of a single-shot
+	/// context is fixed by the key schedule, so a second message under one
+	/// ephemeral would repeat it.
 	///
 	/// [rfc9180-9.2.3]: https://datatracker.ietf.org/doc/html/rfc9180#section-9.2.3
 	fn sealed(
@@ -503,7 +503,7 @@ pub trait HpkePublicKeyOps {
 	///
 	/// - `info`: application context that the key schedule binds.
 	/// - `aad`: associated data that the AEAD authenticates and leaves in the clear.
-	/// - `rng`: the cryptographically secure RNG that draws the ephemeral. `None` uses `OsRng`.
+	/// - `rng`: the cryptographically secure RNG that draws the ephemeral. `None` uses [`OsRng`].
 	///
 	/// The ephemeral fixes the key and the nonce, so an RNG that repeats its
 	/// stream repeats both.
@@ -798,7 +798,7 @@ impl crate::crypto::aead::Decryptor for HpkeDecryptor {
 	}
 }
 
-/// HPKE decryptor driven by a precomputed `DH(skR, pkE)` output.
+/// An HPKE decryptor driven by a precomputed `DH(skR, pkE)` output.
 ///
 /// It pairs with [`HpkeMessage::encapsulated_key`] and an async key-agreement
 /// backend (`SigningKeyProvider::key_agreement`) so the recipient private key

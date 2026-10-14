@@ -194,7 +194,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> Protocol for LaserListener<P> {
 		Ok(LaserAddr::ANY)
 	}
 
-	async fn bind(addr: Self::Address) -> Result<(Self::Listener, Self::Address), Self::Error> {
+	async fn bind_cleartext(addr: Self::Address) -> Result<(Self::Listener, Self::Address), Self::Error> {
 		let (incoming, bound) = Self::bind_airspace(addr)?;
 		let incoming = AsyncMutex::new(incoming);
 		Ok((Self { incoming, config: EndpointConfig::cleartext() }, bound))

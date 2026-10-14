@@ -165,6 +165,7 @@ tb_scenario! {
 		start: |SetupEnv { trace, context }| async move {
 			let servlet_conf = ServletConfig::<TokioListener, ChessMoveRequest>::builder()
 				.with_config(context)
+				.allow_cleartext()
 				.build();
 
 			ChessEngineServlet::start(Arc::new(trace), servlet_conf).await

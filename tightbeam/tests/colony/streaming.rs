@@ -296,7 +296,7 @@ async fn start_streaming_hive(
 
 	let mut hive = StreamingHive::new(Some(conf))?;
 	hive.register(stream_echo_urn(), servlet, |t| {
-		StreamingEchoServlet::start(t, ServletConfig::default())
+		StreamingEchoServlet::start(t, ServletConfig::cleartext())
 	})?;
 	hive.establish(trace).await?;
 	Ok(hive)

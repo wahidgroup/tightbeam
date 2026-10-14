@@ -628,7 +628,7 @@ pub async fn start_ping_hive(
 
 	let mut hive = ClusterTestHive::new(Some(conf))?;
 	hive.register(servlet_urn("ping"), servlet, |t| {
-		ClusterTestServlet::start(t, ServletConfig::default())
+		ClusterTestServlet::start(t, ServletConfig::cleartext())
 	})?;
 	hive.establish(Arc::new(trace.share())).await?;
 	Ok(hive)
@@ -645,7 +645,7 @@ pub async fn start_rumor_hive(
 
 	let mut hive = ClusterTestHive::new(Some(hive_tls_config(&certs)))?;
 	hive.register(servlet_urn("rumor"), servlet, |t| {
-		ClusterRumorServlet::start(t, ServletConfig::default())
+		ClusterRumorServlet::start(t, ServletConfig::cleartext())
 	})?;
 	hive.establish(Arc::new(trace.share())).await?;
 	Ok(hive)
