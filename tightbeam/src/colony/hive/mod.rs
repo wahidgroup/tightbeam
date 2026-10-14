@@ -297,7 +297,7 @@ impl ServletRegistry for HashMapRegistry {
 /// let trace = Arc::new(TraceCollector::new());
 /// let auth_conf = auth_conf.clone();
 /// let auth = AuthServlet::start(Arc::clone(&trace), auth_conf.clone()).await?;
-/// let capture = CaptureServlet::start(Arc::clone(&trace), ServletConfig::default()).await?;
+/// let capture = CaptureServlet::start(Arc::clone(&trace), ServletConfig::cleartext()).await?;
 ///
 /// // 2. Create hive
 /// let mut hive = PaymentHive::new(Some(hive_conf))?;
@@ -305,7 +305,7 @@ impl ServletRegistry for HashMapRegistry {
 /// // 3. Register with spawners for auto-scaling (types named by URN)
 /// let ns = ColonyNamespace::default();
 /// hive.register(ns.servlet("auth")?, auth, |t| AuthServlet::start(t, auth_conf.clone()))?;
-/// hive.register(ns.servlet("capture")?, capture, |t| CaptureServlet::start(t, ServletConfig::default()))?;
+/// hive.register(ns.servlet("capture")?, capture, |t| CaptureServlet::start(t, ServletConfig::cleartext()))?;
 ///
 /// // 4. Establish (starts control server + scaling task)
 /// hive.establish(trace).await?;

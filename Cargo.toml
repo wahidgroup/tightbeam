@@ -42,7 +42,7 @@ unused_imports = "deny"
 clone_on_ref_ptr = "deny"
 
 [workspace.dependencies]
-tightbeam-derive = { version = "0.1.7", path = "tightbeam-derive" }
+tightbeam-derive = { version = "=0.1.7", path = "tightbeam-derive" }
 
 # RustCrypto dependencies
 spki = { version = "=0.7.3", default-features = false }
@@ -131,4 +131,4 @@ syn = { version = "=2.0.119", features = ["full", "derive"] }
 
 ## Fuzzing dependencies
 afl = { version = "=0.17.1" }
-proptest = { version = "1.8.0", default-features = false, features = ["std"] }
+proptest = { version = "=1.11.0", default-features = false, features = ["std"] }

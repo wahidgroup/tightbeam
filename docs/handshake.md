@@ -342,7 +342,16 @@ The server draws a fresh ephemeral, `E`, for each handshake and carries it insid
 Every received ephemeral is checked before any scalar multiplication runs on it:
 
 - `PublicKey::from_sec1_bytes` refuses a malformed, off-curve, or identity point.
-- A client also refuses an `E` equal to the server's static key, because the agreement would then collapse into the static one.
+- A client also refuses an `E` with the x-coordinate of the server's static key, because the agreement would then collapse into the static one.
+- A server refuses a client ephemeral with the x-coordinate of the client's static key, for the same reason.
+
+Three facts fix what a server compares:
+
+- The comparison is on the x-coordinate. ECDH keeps that coordinate alone, so a key and its negation agree to one secret.
+- The client's static key is the key of the certificate it offers. An anonymous client holds none.
+- An HPKE client sends two ephemerals, `R` and the encapsulated key of the seal, and the server checks both.
+
+Both refusals sit on `PeerEphemeral`. It yields a `PeerPoint`, and the agreement of the handshake secret takes no other point type.
 
 ### Forward secrecy
 

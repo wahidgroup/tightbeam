@@ -219,10 +219,10 @@ async fn start_split_hive(
 
 	let mut hive = ClusterTestHive::new(Some(hive_tls_config(&certs)))?;
 	hive.register(servlet_urn("ping"), exported, |t| {
-		ClusterTestServlet::start(t, ServletConfig::default())
+		ClusterTestServlet::start(t, ServletConfig::cleartext())
 	})?;
 	hive.register(servlet_urn("ledger"), hidden, |t| {
-		ClusterTestServlet::start(t, ServletConfig::default())
+		ClusterTestServlet::start(t, ServletConfig::cleartext())
 	})?;
 	hive.establish(Arc::new(trace.share())).await?;
 	Ok(hive)
@@ -241,10 +241,10 @@ async fn start_split_stream_hive(
 
 	let mut hive = ClusterTestHive::new(Some(hive_tls_config(&certs)))?;
 	hive.register(servlet_urn("stream-echo"), exported, |t| {
-		StreamEchoServlet::start(t, ServletConfig::default())
+		StreamEchoServlet::start(t, ServletConfig::cleartext())
 	})?;
 	hive.register(servlet_urn("vault"), hidden, |t| {
-		StreamEchoServlet::start(t, ServletConfig::default())
+		StreamEchoServlet::start(t, ServletConfig::cleartext())
 	})?;
 	hive.establish(Arc::new(trace.share())).await?;
 	Ok(hive)

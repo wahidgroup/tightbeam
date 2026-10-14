@@ -143,10 +143,10 @@ async fn establish_registered_hive(
 ) -> Result<HiveX509Test, TightBeamError> {
 	trace.event(HIVE_STARTED)?;
 
-	let servlet = HiveTestServlet::start(Arc::new(trace.share()), ServletConfig::default()).await?;
+	let servlet = HiveTestServlet::start(Arc::new(trace.share()), ServletConfig::cleartext()).await?;
 	let mut hive = HiveX509Test::new(conf)?;
 	hive.register(servlet_urn("test_servlet"), servlet, |t| {
-		HiveTestServlet::start(t, ServletConfig::default())
+		HiveTestServlet::start(t, ServletConfig::cleartext())
 	})?;
 	hive.establish(Arc::new(trace.share())).await?;
 
@@ -680,7 +680,7 @@ tb_scenario! {
 			use core::sync::atomic::{AtomicBool, Ordering};
 
 			let fail_once = Arc::new(AtomicBool::new(true));
-			let seed = HiveTestServlet::start(Arc::new(trace.share()), ServletConfig::default()).await?;
+			let seed = HiveTestServlet::start(Arc::new(trace.share()), ServletConfig::cleartext()).await?;
 			let trust_store = pinning_trust_store(&signer.certificate)?;
 			let conf = HiveConfig {
 				trust_store: Some(trust_store),
@@ -696,7 +696,7 @@ tb_scenario! {
 						return Err(TightBeamError::MissingResponse);
 					}
 
-					HiveTestServlet::start(t, ServletConfig::default()).await
+					HiveTestServlet::start(t, ServletConfig::cleartext()).await
 				}
 			})?;
 
@@ -980,7 +980,7 @@ async fn start_contract_hive(
 
 	let mut hive = HiveX509Test::new(Some(conf))?;
 	hive.register(servlet_urn("contract"), servlet, |t| {
-		FrameContractServlet::start(t, ServletConfig::default())
+		FrameContractServlet::start(t, ServletConfig::cleartext())
 	})?;
 	hive.establish(trace).await?;
 	Ok(hive)

@@ -1371,7 +1371,7 @@ mod tests {
 			worker_threads: 2,
 			server: |SetupEnv { trace, .. }| async move {
 				let bind_addr = TightBeamSocketAddr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
-				let (listener, addr) = <TokioListener as Protocol>::bind(bind_addr).await?;
+				let (listener, addr) = <TokioListener as Protocol>::bind_cleartext(bind_addr).await?;
 
 				let handle = crate::server! {
 					protocol TokioListener: listener,
@@ -1433,7 +1433,7 @@ mod tests {
 		environment ServiceClient {
 			worker_threads: 1,
 			server: |SetupEnv { trace, .. }| async move {
-				let servlet = TestServletForScenario::start(Arc::new(trace), crate::colony::servlet::ServletConfig::default()).await?;
+				let servlet = TestServletForScenario::start(Arc::new(trace), crate::colony::servlet::ServletConfig::cleartext()).await?;
 				let addr = servlet.addr().to_owned();
 				let server_handle = tokio::spawn(async move {
 					let _ = servlet.join().await;

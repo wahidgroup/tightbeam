@@ -64,7 +64,7 @@ impl Protocol for TcpListener {
 			.map_err(|_| IoError::new(ErrorKind::InvalidInput, "Invalid default address"))
 	}
 
-	async fn bind(addr: Self::Address) -> Result<(Self::Listener, Self::Address), Self::Error> {
+	async fn bind_cleartext(addr: Self::Address) -> Result<(Self::Listener, Self::Address), Self::Error> {
 		let listener = TcpListener::bind(addr.0)?;
 		let bound_addr = listener.local_addr()?;
 		Ok((listener, TightBeamSocketAddr(bound_addr)))

@@ -160,6 +160,7 @@ tb_scenario! {
 				.with_config(config)
 				.with_worker(doubler)
 				.with_worker(squarer)
+				.allow_cleartext()
 				.build();
 
 			CalcServlet::start(trace, servlet_conf).await
@@ -268,6 +269,7 @@ tb_scenario! {
 				.with_collector_gate(SignatureGate { verifying_key })
 				.with_message_decryptor(shared_cipher())
 				.with_message_inflator(ZstdCompression::default())
+				.allow_cleartext()
 				.build();
 
 			SecureCalcServlet::start(trace, servlet_conf).await

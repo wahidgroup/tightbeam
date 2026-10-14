@@ -191,7 +191,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> TokioListener<P> {
 	/// # Errors
 	///
 	/// - The I/O error of a bind that fails.
-	pub async fn bind(addr: impl AsRef<str>) -> Result<Self, IoError> {
+	pub async fn bind_cleartext(addr: impl AsRef<str>) -> Result<Self, IoError> {
 		let listener = TcpListener::bind(addr.as_ref()).await?;
 		let config = EndpointConfig::cleartext();
 
@@ -226,7 +226,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> Protocol for TokioListener<P> {
 		"127.0.0.1:0".parse().map_err(|e| IoError::new(ErrorKind::InvalidInput, e))
 	}
 
-	async fn bind(addr: Self::Address) -> Result<(Self::Listener, Self::Address), Self::Error> {
+	async fn bind_cleartext(addr: Self::Address) -> Result<(Self::Listener, Self::Address), Self::Error> {
 		let listener = TcpListener::bind(addr.0).await?;
 		let bound_addr = listener.local_addr()?;
 		let config = EndpointConfig::cleartext();
@@ -1297,7 +1297,7 @@ mod tests {
 	}
 
 	async fn bind_and_connect() -> TransportResult<(TokioListener, TcpStream)> {
-		let listener = TokioListener::bind("127.0.0.1:0").await?;
+		let listener = TokioListener::bind_cleartext("127.0.0.1:0").await?;
 		let listen_addr = listener.local_addr()?;
 		let client_stream = TcpStream::connect(listen_addr).await?;
 		Ok((listener, client_stream))

@@ -126,7 +126,7 @@ tb_scenario! {
 		worker_threads: 1,
 		server: |SetupEnv { trace, .. }| async move {
 			let bind_addr = TightBeamSocketAddr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
-			let (listener, addr) = <TokioListener as Protocol>::bind(bind_addr).await?;
+			let (listener, addr) = <TokioListener as Protocol>::bind_cleartext(bind_addr).await?;
 			let handle = server! {
 				protocol TokioListener: listener,
 				assertions: trace.share(),

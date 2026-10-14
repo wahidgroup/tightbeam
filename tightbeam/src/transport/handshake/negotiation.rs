@@ -431,12 +431,15 @@ pub(crate) struct TransportNegotiation<'a> {
 impl<'a> TransportNegotiation<'a> {
 	/// Applies the accept rule that runs before any authorizer.
 	///
+	/// The answer holds the client offer beside its accept, so one read of
+	/// the offer serves this rule and the authorizer that follows it.
+	///
 	/// # Budgets
 	///
 	/// Budgets are opt-in, because a grant is a signed receipt attestation.
 	/// The server grants budgets only under a local ceiling or an authorizer
 	/// verdict that overrides this rule, whatever the client requested.
-	pub(crate) fn accept(&self) -> Option<TransportAccept> {
+	fn offered_accept(&self) -> Option<(&'a TransportOffer, TransportAccept)> {
 		let offer = self.offer?;
 		let local = self.local?;
 		if !offer.mux || !local.mux {
@@ -451,19 +454,20 @@ impl<'a> TransportNegotiation<'a> {
 			_ => None,
 		};
 
-		Some(TransportAccept {
+		let accept = TransportAccept {
 			mux: true,
 			max_peer_initiated_streams: local.max_peer_initiated_streams,
 			chunk_payload_size: local.chunk_payload_size,
 			credit_unit: clamp_credit_unit(local.credit_unit),
 			initial_stream_credit: local.initial_stream_credit,
 			granted_budgets,
-		})
+		};
+		Some((offer, accept))
 	}
 
 	/// Runs the accept path with an optional [`TransportAuthorizer`].
 	///
-	/// The path starts from [`TransportNegotiation::accept`], and
+	/// The path starts from [`TransportNegotiation::offered_accept`], and
 	/// [`MuxSettings::for_client`] enforces client consistency for an
 	/// unsolicited or over-request grant.
 	///
@@ -482,12 +486,11 @@ impl<'a> TransportNegotiation<'a> {
 		self,
 		authorizer: Option<&dyn TransportAuthorizer>,
 	) -> Result<Option<AuthorizedTransport>, NegotiationError> {
-		let mut accept = match self.accept() {
-			Some(accept) => accept,
-			None => return Ok(None),
+		let Some((offer, mut accept)) = self.offered_accept() else {
+			return Ok(None);
 		};
-		let (Some(authorizer), Some(offer)) = (authorizer, self.offer) else {
-			let authorized = AuthorizedTransport { accept, challenge: None };
+		let Some(authorizer) = authorizer else {
+			let authorized = AuthorizedTransport::new(offer, accept, None);
 			return Ok(Some(authorized));
 		};
 
@@ -507,7 +510,7 @@ impl<'a> TransportNegotiation<'a> {
 			return Err(NegotiationError::ChallengeWithoutBudgets);
 		}
 
-		let authorized = AuthorizedTransport { accept, challenge };
+		let authorized = AuthorizedTransport::new(offer, accept, challenge);
 		Ok(Some(authorized))
 	}
 }
@@ -671,13 +674,34 @@ pub trait TransportAuthorizer: MaybeSend + MaybeSync {
 pub const SETTLEMENT_UNSUPPORTED_CODE: u32 = 1;
 
 /// Transport verdict after the authorizer ran on the offer and the accept.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub struct AuthorizedTransport {
 	/// The transport accept sent to the client and bound into the
 	/// transcript.
-	pub accept: TransportAccept,
+	accept: TransportAccept,
 	/// Settlement challenge from the authorizer, carried in the session
 	/// receipt body.
-	pub challenge: Option<OctetString>,
+	challenge: Option<OctetString>,
+	/// The multiplexing settings the server runs under, which the offer and
+	/// this accept fix.
+	mux: MuxSettings,
+}
+
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+impl AuthorizedTransport {
+	/// The verdict on `offer`: the accept, the challenge, and the settings
+	/// the pair fixes for the server.
+	fn new(offer: &TransportOffer, accept: TransportAccept, challenge: Option<OctetString>) -> Self {
+		let mux = MuxSettings::for_server(offer, &accept);
+		Self { accept, challenge, mux }
+	}
+
+	/// The accept, the challenge, and the settings, for the reply that sends
+	/// the first, the receipt that carries the second, and the session that
+	/// runs under the third.
+	pub(crate) fn into_parts(self) -> (TransportAccept, Option<OctetString>, MuxSettings) {
+		(self.accept, self.challenge, self.mux)
+	}
 }
 
 /// The end of the negotiation this endpoint holds. The role decides the
@@ -1430,7 +1454,7 @@ mod tests {
 		let offer = TransportOffer::mux(8);
 		let local = TransportOffer::mux(4);
 
-		let accept = transport_negotiation(Some(&offer), Some(&local)).accept();
+		let accept = rule_accept(&transport_negotiation(Some(&offer), Some(&local)));
 		assert!(matches!(
 			accept,
 			Some(TransportAccept { mux: true, max_peer_initiated_streams: 4, .. })
@@ -1440,13 +1464,13 @@ mod tests {
 	#[test]
 	fn test_accept_transport_absent_offer_declines() {
 		let local = TransportOffer::mux(4);
-		assert!(transport_negotiation(None, Some(&local)).accept().is_none());
+		assert!(rule_accept(&transport_negotiation(None, Some(&local))).is_none());
 	}
 
 	#[test]
 	fn test_accept_transport_absent_local_declines() {
 		let offer = TransportOffer::mux(8);
-		assert!(transport_negotiation(Some(&offer), None).accept().is_none());
+		assert!(rule_accept(&transport_negotiation(Some(&offer), None)).is_none());
 	}
 
 	#[test]
@@ -1455,7 +1479,7 @@ mod tests {
 		let local = TransportOffer::mux(4);
 		let negotiation = transport_negotiation(Some(&disabled), Some(&local));
 
-		let accepted = negotiation.accept();
+		let accepted = rule_accept(&negotiation);
 		assert!(accepted.is_none());
 	}
 
@@ -1465,7 +1489,7 @@ mod tests {
 		let disabled = disabled_offer(4);
 		let negotiation = transport_negotiation(Some(&offer), Some(&disabled));
 
-		let accepted = negotiation.accept();
+		let accepted = rule_accept(&negotiation);
 		assert!(accepted.is_none());
 	}
 
@@ -1476,7 +1500,7 @@ mod tests {
 		let offer = TransportOffer::mux(8).with_budgets(request);
 		let local = TransportOffer::mux(4).with_budgets(ceiling);
 
-		let accept = transport_negotiation(Some(&offer), Some(&local)).accept();
+		let accept = rule_accept(&transport_negotiation(Some(&offer), Some(&local)));
 		let granted = accept.and_then(|accept| accept.granted_budgets);
 		assert_eq!(granted, Some(MuxBudgets { client_to_server: 100, server_to_client: 300 }));
 	}
@@ -1487,7 +1511,7 @@ mod tests {
 		let offer = TransportOffer::mux(8);
 		let local = TransportOffer::mux(4).with_budgets(ceiling);
 
-		let accept = transport_negotiation(Some(&offer), Some(&local)).accept();
+		let accept = rule_accept(&transport_negotiation(Some(&offer), Some(&local)));
 		let granted = accept.and_then(|accept| accept.granted_budgets);
 		assert_eq!(granted, None);
 	}
@@ -1498,9 +1522,15 @@ mod tests {
 		let offer = TransportOffer::mux(8).with_budgets(request);
 		let local = TransportOffer::mux(4);
 
-		let accept = transport_negotiation(Some(&offer), Some(&local)).accept();
+		let accept = rule_accept(&transport_negotiation(Some(&offer), Some(&local)));
 		let granted = accept.and_then(|accept| accept.granted_budgets);
 		assert_eq!(granted, None);
+	}
+
+	/// The accept of the pre-authorizer rule alone.
+	fn rule_accept(negotiation: &TransportNegotiation<'_>) -> Option<TransportAccept> {
+		let (_, accept) = negotiation.offered_accept()?;
+		Some(accept)
 	}
 
 	struct FixedAuthorizer {
@@ -1538,6 +1568,41 @@ mod tests {
 		let granted = accept.and_then(|authorized| authorized.accept.granted_budgets);
 		assert_eq!(granted, Some(MuxBudgets { client_to_server: 100, server_to_client: 300 }));
 
+		Ok(())
+	}
+
+	/// The verdict carries the server's settings: it initiates up to the cap
+	/// the client offered, and admits up to the cap it advertised.
+	#[tokio::test]
+	async fn an_authorized_transport_carries_the_stream_caps_of_its_accept() -> Result<(), Box<dyn Error>> {
+		let offer = TransportOffer::mux(8);
+		let local = TransportOffer::mux(4);
+		let negotiation = transport_negotiation(Some(&offer), Some(&local));
+
+		let outcome = negotiation.authorize(None).await?;
+		let authorized = outcome.ok_or("both sides offer multiplexing")?;
+
+		assert_eq!(authorized.mux.local_initiated_cap, 8);
+		assert_eq!(authorized.mux.peer_initiated_cap, 4);
+		Ok(())
+	}
+
+	/// The settings follow the grant the authorizer settled, which lands on
+	/// the accept after the pre-authorizer rule ran.
+	#[tokio::test]
+	async fn an_authorized_transport_carries_the_budgets_of_the_grant() -> Result<(), Box<dyn Error>> {
+		let request = MuxBudgets { client_to_server: 100, server_to_client: 900 };
+		let verdict = MuxBudgets { client_to_server: 40, server_to_client: 60 };
+		let offer = TransportOffer::mux(8).with_budgets(request);
+		let local = TransportOffer::mux(4);
+		let authorizer = FixedAuthorizer::budgets(Ok(Some(verdict)));
+		let negotiation = transport_negotiation(Some(&offer), Some(&local));
+
+		let outcome = negotiation.authorize(Some(&authorizer)).await?;
+		let authorized = outcome.ok_or("both sides offer multiplexing")?;
+
+		assert_eq!(authorized.mux.send_budget, Some(60));
+		assert_eq!(authorized.mux.recv_budget, Some(40));
 		Ok(())
 	}
 

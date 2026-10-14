@@ -5,10 +5,11 @@
 //! define. The orchestrator owns the step order and every negotiation and
 //! admission decision, and it acts on the decoded facts alone.
 //!
-//! A step of the orchestrator works between two kinds of flow call:
+//! A step of the orchestrator works between three kinds of flow call:
 //!
 //! 1. A `read_*` or `bind_*` call returns the facts of the leg and the bytes to sign.
-//! 2. The orchestrator admits, negotiates, signs, and countersigns.
+//! 2. The orchestrator admits, negotiates, and countersigns. `sign` signs each
+//!    prehash with the provider calls of its protocol.
 //! 3. An `encode_*` call takes the result and builds the message.
 //!
 //! The [legs](crate::transport::handshake#legs) table names the message each
@@ -51,14 +52,23 @@ mod sealed {
 /// A handshake protocol, named by its marker type.
 ///
 /// The trait is sealed, so [`Hpke`] and [`Cms`] are the only flows.
-pub trait HandshakeFlow: sealed::Sealed + Sized + MaybeSend + MaybeSync + 'static {}
+pub trait HandshakeFlow: sealed::Sealed + Sized + MaybeSend + MaybeSync + 'static {
+	/// What a signed leg of this protocol carries of its signer.
+	type Signed: MaybeSend;
 
-/// A signature and the public key of its signer, from one key provider.
-pub struct Signed {
-	/// The signature bytes, as the provider encodes them.
-	pub signature: Vec<u8>,
-	/// The DER SubjectPublicKeyInfo of the key that signed.
-	pub signer_spki: Vec<u8>,
+	/// Sign `prehash` under `key`, and fetch what else of the signer the
+	/// messages of this protocol carry.
+	///
+	/// The protocol makes the calls, so a key provider answers the ones its
+	/// messages need and no other.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::KeyError`] -- the key provider failed.
+	fn sign<'a>(
+		key: &'a dyn SigningKeyProvider,
+		prehash: &'a [u8],
+	) -> MaybeSendFuture<'a, Result<Self::Signed, HandshakeError>>;
 }
 
 /// What the client configuration contributes to the opening.
@@ -235,7 +245,7 @@ pub trait ClientFlow<P: HandshakeProvider>: HandshakeFlow {
 	///
 	/// - [`HandshakeError::MutualAuthRequired`] -- the protocol requires a proof, and none came.
 	/// - [`HandshakeError`] -- the closing fails to encode.
-	fn encode_closing(draft: Self::Draft, proof: Option<Signed>) -> Result<HandshakeMessage, HandshakeError>;
+	fn encode_closing(draft: Self::Draft, proof: Option<Self::Signed>) -> Result<HandshakeMessage, HandshakeError>;
 }
 
 /// The facts of a decoded opening, with what it sealed to the static key.
@@ -335,6 +345,8 @@ pub trait ServerFlow<P: HandshakeProvider>: HandshakeFlow {
 	///
 	/// - [`HandshakeError::InvalidClientKeyExchange`] -- the opening carries no usable key agreement.
 	/// - [`HandshakeError::InvalidPublicKey`] -- the client's key is not a point on the curve.
+	/// - [`HandshakeError::ClientEphemeralIsStatic`] -- the client ephemeral
+	///   collapses into the client's static key.
 	/// - [`HandshakeError::KeyError`] -- the key provider failed.
 	/// - [`HandshakeError`] -- the sealed content fails to open.
 	fn open_opening<'a>(
@@ -363,7 +375,7 @@ pub trait ServerFlow<P: HandshakeProvider>: HandshakeFlow {
 	/// - [`HandshakeError`] -- the reply fails to encode.
 	fn encode_reply(
 		draft: Self::Draft,
-		signed: Signed,
+		signed: Self::Signed,
 		artifact: Option<&SignedData>,
 	) -> Result<HandshakeMessage, HandshakeError>;
 
@@ -390,6 +402,10 @@ pub trait ServerFlow<P: HandshakeProvider>: HandshakeFlow {
 	/// - [`HandshakeError::ClientCertificateMismatch`] -- the closing names
 	///   another certificate than the opening bound.
 	/// - [`HandshakeError::MissingAttribute`] -- the closing carries no key-confirmation tag.
+	/// - [`HandshakeError::InvalidPublicKey`] -- the key of the offered
+	///   certificate is not a point on the curve.
+	/// - [`HandshakeError::ClientEphemeralIsStatic`] -- the encapsulated key
+	///   collapses into the client's static key.
 	/// - [`HandshakeError`] -- the closing fails to decode.
 	fn read_closing(
 		pending: &Self::Pending,
@@ -408,6 +424,9 @@ pub trait ServerFlow<P: HandshakeProvider>: HandshakeFlow {
 	/// - [`HandshakeError::InvalidKeySize`] -- the base secret of the payload is not 32 bytes.
 	/// - [`HandshakeError::OctetStringLengthError`] -- the client random of the payload is not 32 bytes.
 	/// - [`HandshakeError::ClientRandomMismatchReplay`] -- the payload echoes another client random.
+	/// - [`HandshakeError::InvalidPublicKey`] -- the client ephemeral is not a point on the curve.
+	/// - [`HandshakeError::ClientEphemeralIsStatic`] -- the client ephemeral
+	///   collapses into the client's static key.
 	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the handshake secret.
 	fn settle<'a>(
 		pending: Self::Pending,

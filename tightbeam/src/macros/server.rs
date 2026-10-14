@@ -423,7 +423,7 @@ macro_rules! __tightbeam_server_protocol_handle {
 #[macro_export]
 macro_rules! __tightbeam_server_protocol_bind_handle {
 	($protocol:path, $addr:expr, $handler:expr) => {{
-		let (listener, _) = <$protocol as $crate::transport::Protocol>::bind($addr).await?;
+		let (listener, _) = <$protocol as $crate::transport::Protocol>::bind_cleartext($addr).await?;
 		let __server = <$protocol>::from(listener);
 		$crate::macros::server::server_runtime::rt::spawn(async move {
 			let __error_tx = $crate::macros::server::server_runtime::rt::empty_error_channel();
@@ -438,7 +438,7 @@ macro_rules! __tightbeam_server_protocol_bind_handle {
 #[macro_export]
 macro_rules! __tightbeam_server_protocol_bind_handle {
 	($protocol:path, $addr:expr, $handler:expr) => {{
-		let (listener, _) = $crate::macros::server::server_runtime::rt::block_on(<$protocol as $crate::transport::Protocol>::bind($addr))?;
+		let (listener, _) = $crate::macros::server::server_runtime::rt::block_on(<$protocol as $crate::transport::Protocol>::bind_cleartext($addr))?;
 		let __server = <$protocol>::from(listener);
 		::std::thread::spawn(move || {
 			$crate::server!(@sync_loop $protocol, __server, $handler,)
@@ -452,7 +452,7 @@ macro_rules! __tightbeam_server_protocol_bind_handle {
 macro_rules! __tightbeam_server_protocol_bind_handle {
 	($protocol:path, $addr:expr, $handler:expr) => {
 		compile_error!(
-			"server!(protocol ...) with `bind` requires tightbeam to be built with either the `tokio` or `std` feature"
+			"server!(protocol ...) with `bind_cleartext` requires tightbeam to be built with either the `tokio` or `std` feature"
 		);
 	};
 }
@@ -646,7 +646,7 @@ macro_rules! __tightbeam_server_protocol_channels_policies_handle {
 #[macro_export]
 macro_rules! __tightbeam_server_protocol_bind_policies_handle {
 	($protocol:path, $addr:expr, [$($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?], $handler:expr) => {{
-		let (listener, _) = <$protocol as $crate::transport::Protocol>::bind($addr).await?;
+		let (listener, _) = <$protocol as $crate::transport::Protocol>::bind_cleartext($addr).await?;
 		let __server = <$protocol>::from(listener);
 		$crate::macros::server::server_runtime::rt::spawn(async move {
 			let __error_tx = $crate::macros::server::server_runtime::rt::empty_error_channel();
@@ -661,7 +661,7 @@ macro_rules! __tightbeam_server_protocol_bind_policies_handle {
 #[macro_export]
 macro_rules! __tightbeam_server_protocol_bind_policies_handle {
 	($protocol:path, $addr:expr, [$($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?], $handler:expr) => {{
-		let (listener, _) = $crate::macros::server::server_runtime::rt::block_on(<$protocol as $crate::transport::Protocol>::bind($addr))?;
+		let (listener, _) = $crate::macros::server::server_runtime::rt::block_on(<$protocol as $crate::transport::Protocol>::bind_cleartext($addr))?;
 		let __server = <$protocol>::from(listener);
 		::std::thread::spawn(move || {
 			$crate::server!(@sync_loop $protocol, __server, $handler, $($policy_name: [ $( $policy_expr ),* ]),*)
@@ -674,7 +674,7 @@ macro_rules! __tightbeam_server_protocol_bind_policies_handle {
 #[macro_export]
 macro_rules! __tightbeam_server_protocol_bind_policies_handle {
 	($protocol:path, $addr:expr, [$($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?], $handler:expr) => {
-		compile_error!("server!(protocol ..., policies: ...) with `bind` requires tightbeam to be built with either the `tokio` or `std` feature");
+		compile_error!("server!(protocol ..., policies: ...) with `bind_cleartext` requires tightbeam to be built with either the `tokio` or `std` feature");
 	};
 }
 
@@ -946,9 +946,9 @@ macro_rules! server {
 		})
 	}};
 
-	($protocol:path: bind $addr:expr, handle: $handler:expr) => {{
+	($protocol:path: bind_cleartext $addr:expr, handle: $handler:expr) => {{
 		$crate::__tb_require_std!({
-			let (listener, _) = $crate::macros::server::server_runtime::rt::block_on(<$protocol as $crate::transport::Protocol>::bind($addr))?;
+			let (listener, _) = $crate::macros::server::server_runtime::rt::block_on(<$protocol as $crate::transport::Protocol>::bind_cleartext($addr))?;
 			let __server = <$protocol>::from(listener);
 			$crate::server!(@sync_loop $protocol, __server, $handler,)
 		})
@@ -961,9 +961,9 @@ macro_rules! server {
 		})
 	}};
 
-	($protocol:path: bind $addr:expr, policies: { $($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)? }, handle: $handler:expr) => {{
+	($protocol:path: bind_cleartext $addr:expr, policies: { $($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)? }, handle: $handler:expr) => {{
 		$crate::__tb_require_std!({
-			let (listener, _) = $crate::macros::server::server_runtime::rt::block_on(<$protocol as $crate::transport::Protocol>::bind($addr))?;
+			let (listener, _) = $crate::macros::server::server_runtime::rt::block_on(<$protocol as $crate::transport::Protocol>::bind_cleartext($addr))?;
 			let __server = <$protocol>::from(listener);
 			$crate::server!(@sync_loop $protocol, __server, $handler, $($policy_name: [ $( $policy_expr ),* ]),*);
 		})
@@ -992,7 +992,7 @@ macro_rules! server {
 		$crate::__tightbeam_server_protocol_handle!($protocol, $listener, assertions: $assertions, ($param1, $param2, $handler_body))
 	}};
 
-	(protocol $protocol:path: bind $addr:expr, handle: $handler:expr) => {{
+	(protocol $protocol:path: bind_cleartext $addr:expr, handle: $handler:expr) => {{
 		$crate::__tightbeam_server_protocol_bind_handle!($protocol, $addr, $handler)
 	}};
 
@@ -1106,7 +1106,7 @@ macro_rules! server {
 		$crate::__tightbeam_server_protocol_channels_policies_handle!($protocol, $listener, $error_tx, $ok_tx, [ $($policy_name: [ $( $policy_expr ),* ]),* ], $handler)
 	}};
 
-	(protocol $protocol:path: bind $addr:expr, policies: { $($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)? }, handle: $handler:expr) => {{
+	(protocol $protocol:path: bind_cleartext $addr:expr, policies: { $($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)? }, handle: $handler:expr) => {{
 		$crate::__tightbeam_server_protocol_bind_policies_handle!($protocol, $addr, [ $($policy_name: [ $( $policy_expr ),* ]),* ], $handler)
 	}};
 

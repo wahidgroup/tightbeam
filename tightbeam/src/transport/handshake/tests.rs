@@ -26,7 +26,7 @@ use crate::constants::{
 use crate::crypto::aead::{Aead, DecryptContent, DirectionalCiphers, KeyInit, Nonce, Payload};
 use crate::crypto::common::KeySizeUser;
 use crate::crypto::kdf::{EcdhSecret, KdfFunction};
-use crate::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
+use crate::crypto::key::{KeyError, Secp256k1KeyProvider, SigningKeyProvider};
 use crate::crypto::policy::Secp256k1Policy;
 use crate::crypto::profiles::{AeadProvider, DefaultCryptoProvider, KdfProvider, SecurityProfileDesc};
 use crate::crypto::secret::SecretSlice;
@@ -69,7 +69,9 @@ use crate::TightBeamError;
 #[cfg(feature = "transport-hpke")]
 use crate::transport::handshake::schedule::CompressedPoint;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::transport::handshake::schedule::{Agreement, BaseSecret, HandshakeAgreement, KeyConfirmation};
+use crate::transport::handshake::schedule::{
+	Agreement, BaseSecret, ClientStatic, HandshakeAgreement, KeyConfirmation, PeerEphemeral, PeerPoint,
+};
 #[cfg(feature = "transport-hpke")]
 use crate::transport::handshake::TunneledMessage;
 
@@ -197,6 +199,17 @@ impl HandshakeAgreement<Secp256k1> for FixedAgreement<'_> {
 	}
 }
 
+/// `point` as an admitted peer ephemeral, for a fixture that holds no static
+/// key to tell it from.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+fn admitted(point: &PublicKey<Secp256k1>) -> PeerPoint<Secp256k1> {
+	let sec1 = point.to_encoded_point(true);
+	let anonymous = ClientStatic::<Secp256k1>::of(None).expect("an absent certificate holds no key");
+	let parsed = anonymous.distinct_ephemeral(sec1.as_bytes());
+	let distinct = parsed.expect("a public key encodes a point");
+	distinct.expect("no static key equals it")
+}
+
 /// The handshake secret of `base` and `shared` under `salt`, through the
 /// production derivation.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -206,7 +219,7 @@ pub fn derive_handshake_secret(
 	salt: KdfSalt<'_>,
 ) -> Result<HandshakeSecret, HandshakeError> {
 	// The fixed agreement ignores its peer, so any point serves.
-	let peer = SecretKey::random(&mut OsRng).public_key();
+	let peer = admitted(&SecretKey::random(&mut OsRng).public_key());
 	let agreement = Agreement::<DefaultCryptoProvider>::new(base, &peer);
 	agreement.settle(&FixedAgreement(shared), salt)
 }
@@ -254,10 +267,10 @@ impl Confirming {
 	/// secret the server derives.
 	pub fn tag(&self, base: &BaseSecret, ephemeral: &SecretKey) -> KeyConfirmation {
 		let salt = KdfSalt::new(&self.salt);
-		let agreement = Agreement::<DefaultCryptoProvider>::new(base, &self.server_ephemeral);
-		let secret = agreement
-			.settle(ephemeral, salt)
-			.expect("the agreement derives a handshake secret");
+		let server_ephemeral = admitted(&self.server_ephemeral);
+		let agreement = Agreement::<DefaultCryptoProvider>::new(base, &server_ephemeral);
+		let settled = agreement.settle(ephemeral, salt);
+		let secret = settled.expect("the agreement derives a handshake secret");
 
 		let derived = secret.confirmation::<DefaultCryptoProvider>(salt, &self.transcript_hash);
 		derived.expect("the handshake secret derives a tag")
@@ -507,6 +520,46 @@ pub fn create_test_key_enc_alg() -> AlgorithmIdentifierOwned {
 /// configuration takes.
 pub fn into_provider(signing_key: Secp256k1SigningKey) -> Arc<dyn SigningKeyProvider> {
 	Arc::new(Secp256k1KeyProvider::from(signing_key))
+}
+
+/// A key provider that counts the public keys it hands out, over the provider
+/// of a test signing key. An HSM or a KMS answers each such call with a round
+/// trip, so the count is what a handshake costs it.
+#[derive(Debug)]
+pub struct CountingProvider {
+	inner: Arc<dyn SigningKeyProvider>,
+	public_keys: AtomicUsize,
+}
+
+impl CountingProvider {
+	/// A counter at zero over the provider of `signing_key`.
+	pub fn new(signing_key: Secp256k1SigningKey) -> Self {
+		Self { inner: into_provider(signing_key), public_keys: AtomicUsize::new(0) }
+	}
+
+	/// How many public keys this provider handed out.
+	pub fn public_keys(&self) -> usize {
+		self.public_keys.load(Ordering::SeqCst)
+	}
+}
+
+impl SigningKeyProvider for CountingProvider {
+	fn algorithm(&self) -> AlgorithmIdentifierOwned {
+		self.inner.algorithm()
+	}
+
+	fn to_public_key_bytes(&self) -> MaybeSendFuture<'_, Result<Vec<u8>, KeyError>> {
+		self.public_keys.fetch_add(1, Ordering::SeqCst);
+		self.inner.to_public_key_bytes()
+	}
+
+	fn sign_prehash(&self, prehash: &[u8]) -> MaybeSendFuture<'_, Result<Vec<u8>, KeyError>> {
+		self.inner.sign_prehash(prehash)
+	}
+
+	fn key_agreement(&self, peer_public_key: &[u8]) -> MaybeSendFuture<'_, Result<SecretSlice<u8>, KeyError>> {
+		self.inner.key_agreement(peer_public_key)
+	}
 }
 
 /// Mutual authentication against `validator` alone.

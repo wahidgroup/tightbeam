@@ -80,13 +80,9 @@ where
 		P: EncryptedProtocol<CryptoProvider = C>,
 	{
 		let bind_addr = P::default_bind_address().map_err(TightBeamError::transport)?;
-		let (encryption, parts) = servlet_conf.into_bind_parts();
-		let (listener, addr) = if let Some(encryption_config) = encryption {
-			let bound = P::bind_with(bind_addr, encryption_config).await;
-			bound.map_err(TightBeamError::transport)?
-		} else {
-			P::bind(bind_addr).await.map_err(TightBeamError::transport)?
-		};
+		let (accept, parts) = servlet_conf.into_bind_parts();
+		let bound = accept.bind::<P>(bind_addr).await;
+		let (listener, addr) = bound.map_err(TightBeamError::transport)?;
 
 		let runtime = Self::spawn_loop(trace, parts, service, listener, addr).await?;
 		Ok(runtime)

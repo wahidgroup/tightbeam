@@ -286,7 +286,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> Protocol for TcpListener<NetTcpL
 			.map_err(|e| IoError::new(ErrorKind::InvalidInput, e))
 	}
 
-	async fn bind(addr: Self::Address) -> Result<(Self::Listener, Self::Address), Self::Error> {
+	async fn bind_cleartext(addr: Self::Address) -> Result<(Self::Listener, Self::Address), Self::Error> {
 		let listener = NetTcpListener::bind(addr.0)?;
 		let bound_addr = listener.local_addr()?;
 		let config = EndpointConfig::cleartext();
@@ -314,7 +314,7 @@ where
 	/// Accepted transports carry no confidentiality, integrity, or peer
 	/// authentication. See [`EndpointConfig::cleartext`].
 	#[cfg(feature = "std")]
-	pub fn from_listener(listener: L) -> Self {
+	pub fn from_listener_cleartext(listener: L) -> Self {
 		let config = EndpointConfig::cleartext();
 		Self { listener, config }
 	}

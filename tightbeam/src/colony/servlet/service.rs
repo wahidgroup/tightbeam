@@ -267,15 +267,3 @@ where
 {
 	type Env = Env;
 }
-
-impl<P, M, C, Env> Default for RuntimeServletConf<P, M, C, Env>
-where
-	P: Protocol,
-	M: Message,
-	C: CryptoProvider + Send + Sync + 'static,
-	Env: Default,
-{
-	fn default() -> Self {
-		Self { config: ServletConfig::default(), service: ServletHandlers::default() }
-	}
-}

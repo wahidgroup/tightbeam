@@ -60,10 +60,7 @@ use crate::crypto::profiles::CryptoProvider;
 use crate::crypto::secret::SecretSlice;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::sign::elliptic_curve::ecdh::EphemeralSecret;
-#[cfg(any(
-	feature = "transport-hpke",
-	all(feature = "transport-cms", feature = "transport-multiplex")
-))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::sign::elliptic_curve::sec1::ToEncodedPoint;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::sign::elliptic_curve::{CurveArithmetic, PublicKey, SecretKey};
@@ -674,11 +671,13 @@ impl<C: HandshakeCurve> CompressedPoint for PublicKey<C> {
 	}
 }
 
-/// A peer's ephemeral point that [`PeerEphemeral`] admitted: it is on the
-/// curve, it is not the identity, and it is not the peer's static key.
+/// A peer's ephemeral point that [`PeerEphemeral`] admitted: a point of the
+/// curve other than the identity, whose x-coordinate differs from that of the
+/// peer's static key when the peer holds one.
 ///
-/// [`PeerEphemeral::distinct_ephemeral`] is its one producer, so an agreement
-/// that takes a `PeerPoint` runs on no other point.
+/// [`PeerEphemeral::distinct`] is its one producer, and [`Agreement`] takes a
+/// `PeerPoint` alone, so the ephemeral-ephemeral agreement runs on no other
+/// point.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub struct PeerPoint<C: CurveArithmetic>(PublicKey<C>);
 
@@ -690,61 +689,112 @@ impl<C: CurveArithmetic> PeerPoint<C> {
 	}
 }
 
-/// A peer's ephemeral public key, parsed beside the static key it must differ
-/// from.
+/// The static key a peer's ephemeral is admitted against, when the peer holds
+/// one.
 ///
-/// The parser refuses a malformed, off-curve, or identity point, so no scalar
-/// multiplication runs on an invalid one. A point equal to the static key
-/// `self` is refused as well, because the agreement would then collapse into
-/// the static one that key recovers.
+/// The parse refuses a malformed, off-curve, or identity point, so no scalar
+/// multiplication runs on an invalid one. A point with the x-coordinate of the
+/// static key is refused as well. ECDH keeps the x-coordinate alone, so that
+/// point and its negation both collapse the agreement into the static one.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub(crate) trait PeerEphemeral<C>
 where
-	C: CurveArithmetic,
+	C: HandshakeCurve,
 {
-	/// Parse `sec1` as an ephemeral of the peer that holds the static key
-	/// `self`, or `None` when the point is that static key.
-	///
-	/// # Errors
-	///
-	/// - [`HandshakeError::InvalidPublicKey`] -- `sec1` is not a point on the curve.
-	fn distinct_ephemeral(&self, sec1: &[u8]) -> Result<Option<PeerPoint<C>>, HandshakeError>;
+	/// Admit `point` as an ephemeral of this peer, or `None` when it collapses
+	/// into the peer's static key.
+	fn distinct(&self, point: PublicKey<C>) -> Option<PeerPoint<C>>;
 
-	/// Parse `sec1` as the ephemeral of the server that holds the static key
-	/// `self`.
+	/// Parse `sec1` as an ephemeral of this peer, or `None` when the point
+	/// collapses into the peer's static key.
 	///
 	/// # Errors
 	///
 	/// - [`HandshakeError::InvalidPublicKey`] -- `sec1` is not a point on the curve.
-	/// - [`HandshakeError::ServerEphemeralIsStatic`] -- the point is the server's static key.
+	fn distinct_ephemeral(&self, sec1: &[u8]) -> Result<Option<PeerPoint<C>>, HandshakeError> {
+		let point = PublicKey::<C>::from_sec1_bytes(sec1)?;
+		Ok(self.distinct(point))
+	}
+
+	/// Parse `sec1` as the ephemeral of this server.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::InvalidPublicKey`] -- `sec1` is not a point on the curve.
+	/// - [`HandshakeError::ServerEphemeralIsStatic`] -- the point collapses into the server's static key.
 	fn server_ephemeral(&self, sec1: &[u8]) -> Result<PeerPoint<C>, HandshakeError> {
 		let distinct = self.distinct_ephemeral(sec1)?;
 		distinct.ok_or(HandshakeError::ServerEphemeralIsStatic)
 	}
 
-	/// Parse `sec1` as the rekey ephemeral of the client that holds the
-	/// static key `self`.
+	/// Parse `sec1` as the ephemeral of this client, at the handshake or at a
+	/// rekey.
 	///
 	/// # Errors
 	///
 	/// - [`HandshakeError::InvalidPublicKey`] -- `sec1` is not a point on the curve.
-	/// - [`HandshakeError::ClientEphemeralIsStatic`] -- the point is the client's static key.
-	#[cfg(feature = "transport-multiplex")]
+	/// - [`HandshakeError::ClientEphemeralIsStatic`] -- the point collapses into the client's static key.
 	fn client_ephemeral(&self, sec1: &[u8]) -> Result<PeerPoint<C>, HandshakeError> {
 		let distinct = self.distinct_ephemeral(sec1)?;
+		distinct.ok_or(HandshakeError::ClientEphemeralIsStatic)
+	}
+
+	/// Admit `point`, which a parse validated, as an ephemeral of this client.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::ClientEphemeralIsStatic`] -- the point collapses into the client's static key.
+	#[cfg(feature = "transport-hpke")]
+	fn client_ephemeral_point(&self, point: PublicKey<C>) -> Result<PeerPoint<C>, HandshakeError> {
+		let distinct = self.distinct(point);
 		distinct.ok_or(HandshakeError::ClientEphemeralIsStatic)
 	}
 }
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl<C: HandshakeCurve> PeerEphemeral<C> for PublicKey<C> {
-	fn distinct_ephemeral(&self, sec1: &[u8]) -> Result<Option<PeerPoint<C>>, HandshakeError> {
-		let ephemeral = PublicKey::<C>::from_sec1_bytes(sec1)?;
-		if ephemeral == *self {
-			return Ok(None);
+	fn distinct(&self, point: PublicKey<C>) -> Option<PeerPoint<C>> {
+		let ephemeral = point.to_encoded_point(false);
+		let static_key = self.to_encoded_point(false);
+		if ephemeral.x() == static_key.x() {
+			return None;
 		}
 
-		Ok(Some(PeerPoint(ephemeral)))
+		Some(PeerPoint(point))
+	}
+}
+
+/// The static key of the certificate a client offers, as the key the client
+/// ephemeral must differ from.
+///
+/// [`Self::of`] is its one constructor and reads the offered certificate, so
+/// the question of whether the client holds a static key is answered where
+/// the certificate is. An anonymous client holds none, and every point of the
+/// curve is distinct for it.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+pub(crate) struct ClientStatic<C: CurveArithmetic>(Option<PublicKey<C>>);
+
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+impl<C: HandshakeCurve> ClientStatic<C> {
+	/// The static key of `offered`, the certificate a client presents.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::InvalidPublicKey`] -- the certificate key bytes fail SEC1 decoding.
+	pub(crate) fn of(offered: Option<&Certificate>) -> Result<Self, HandshakeError> {
+		let parsed = offered.map(|certificate| certificate.verifying_key::<C>());
+		let static_key = parsed.transpose()?;
+		Ok(Self(static_key))
+	}
+}
+
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+impl<C: HandshakeCurve> PeerEphemeral<C> for ClientStatic<C> {
+	fn distinct(&self, point: PublicKey<C>) -> Option<PeerPoint<C>> {
+		match &self.0 {
+			Some(static_key) => static_key.distinct(point),
+			None => Some(PeerPoint(point)),
+		}
 	}
 }
 
@@ -795,13 +845,13 @@ where
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub(crate) struct Agreement<'a, P: HandshakeProvider> {
 	base: &'a BaseSecret,
-	peer: &'a PublicKey<P::Curve>,
+	peer: &'a PeerPoint<P::Curve>,
 }
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl<'a, P: HandshakeProvider> Agreement<'a, P> {
-	/// Pair `base` with the point `peer` it is agreed with.
-	pub(crate) fn new(base: &'a BaseSecret, peer: &'a PublicKey<P::Curve>) -> Self {
+	/// Pair `base` with the ephemeral `peer` it is agreed with.
+	pub(crate) fn new(base: &'a BaseSecret, peer: &'a PeerPoint<P::Curve>) -> Self {
 		Self { base, peer }
 	}
 
@@ -817,7 +867,7 @@ impl<'a, P: HandshakeProvider> Agreement<'a, P> {
 		local: &impl HandshakeAgreement<P::Curve>,
 		salt: KdfSalt<'_>,
 	) -> Result<HandshakeSecret, HandshakeError> {
-		let shared = local.shared_secret(self.peer);
+		let shared = local.shared_secret(self.peer.as_public_key());
 		HandshakeSecret::derive::<P>(self.base, &shared, salt)
 	}
 }
@@ -1052,13 +1102,17 @@ impl HandshakeVerifyingKey for Certificate {
 
 #[cfg(test)]
 mod tests {
+	use std::error::Error;
+
 	use super::*;
 	#[cfg(feature = "transport-multiplex")]
 	use crate::crypto::hash::Sha3_256;
 	use crate::crypto::profiles::{AeadProvider, DefaultCryptoProvider};
 	use crate::crypto::secret::ToInsecure;
 	use crate::crypto::sign::ecdsa::k256::Secp256k1;
+	use crate::der::asn1::BitString;
 	use crate::random::OsRng;
+	use crate::transport::handshake::tests::{create_test_certificate, off_curve_point};
 
 	/// A base secret of `fill` bytes.
 	fn base_secret(fill: u8) -> BaseSecret {
@@ -1089,6 +1143,89 @@ mod tests {
 		let secret = handshake_secret(0x42, 0x11, &salt);
 		let result = derive_directional(&secret, &salt);
 		assert!(result.is_ok());
+	}
+
+	/// The static key of a fresh test certificate, beside the admission state
+	/// built from that certificate.
+	fn holder() -> (PublicKey<Secp256k1>, ClientStatic<Secp256k1>) {
+		let client = create_test_certificate();
+		let static_key = client.certificate.verifying_key::<Secp256k1>();
+		let client_static = ClientStatic::of(Some(&client.certificate));
+		let static_key = static_key.expect("the test certificate holds a point");
+		(static_key, client_static.expect("the test certificate holds a point"))
+	}
+
+	/// The negation of `key`, which shares its x-coordinate.
+	fn negated(key: &PublicKey<Secp256k1>) -> PublicKey<Secp256k1> {
+		let negated = PublicKey::<Secp256k1>::from_affine(-*key.as_affine());
+		negated.expect("the negation of a public key is a public key")
+	}
+
+	/// An anonymous client holds no static key, so any point of the curve is
+	/// its ephemeral.
+	#[test]
+	fn an_anonymous_client_ephemeral_is_admitted() -> Result<(), HandshakeError> {
+		let (key, _) = holder();
+		let point = key.to_encoded_point(true);
+		let anonymous = ClientStatic::<Secp256k1>::of(None)?;
+
+		let admitted = anonymous.client_ephemeral(point.as_bytes())?;
+		assert_eq!(admitted.as_public_key(), &key);
+		Ok(())
+	}
+
+	#[test]
+	fn a_client_ephemeral_equal_to_the_client_static_key_is_refused() {
+		let (static_key, client_static) = holder();
+		let point = static_key.to_encoded_point(true);
+
+		let refused = client_static.client_ephemeral(point.as_bytes());
+
+		assert!(matches!(refused, Err(HandshakeError::ClientEphemeralIsStatic)));
+	}
+
+	#[test]
+	fn a_client_ephemeral_other_than_the_static_key_is_admitted() -> Result<(), HandshakeError> {
+		let (_, client_static) = holder();
+		let other_key = SecretKey::<Secp256k1>::random(&mut OsRng).public_key();
+		let point = other_key.to_encoded_point(true);
+
+		let admitted = client_static.client_ephemeral(point.as_bytes())?;
+		assert_eq!(admitted.as_public_key(), &other_key);
+		Ok(())
+	}
+
+	/// ECDH keeps the x-coordinate alone, so the negation of a static key
+	/// agrees to the secret the key itself agrees to.
+	#[test]
+	fn the_negation_of_the_client_static_key_is_refused_as_its_ephemeral() {
+		let (static_key, client_static) = holder();
+		let point = negated(&static_key).to_encoded_point(true);
+
+		let refused = client_static.client_ephemeral(point.as_bytes());
+		assert!(matches!(refused, Err(HandshakeError::ClientEphemeralIsStatic)));
+	}
+
+	#[test]
+	fn the_negation_of_the_server_static_key_is_refused_as_its_ephemeral() {
+		let (static_key, _) = holder();
+		let point = negated(&static_key).to_encoded_point(true);
+
+		let refused = static_key.server_ephemeral(point.as_bytes());
+		assert!(matches!(refused, Err(HandshakeError::ServerEphemeralIsStatic)));
+	}
+
+	/// The admission state reads the key of the offered certificate, so a
+	/// certificate whose key is off the curve yields none.
+	#[test]
+	fn a_certificate_whose_key_is_off_the_curve_yields_no_client_static() -> Result<(), Box<dyn Error>> {
+		let mut client = create_test_certificate();
+		let off_curve = BitString::from_bytes(&off_curve_point())?;
+		client.certificate.tbs_certificate.subject_public_key_info.subject_public_key = off_curve;
+
+		let refused = ClientStatic::<Secp256k1>::of(Some(&client.certificate));
+		assert!(matches!(refused, Err(HandshakeError::InvalidPublicKey(_))));
+		Ok(())
 	}
 
 	/// The handshake secret changes with the ephemeral-ephemeral output, so a

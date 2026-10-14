@@ -94,7 +94,7 @@ pub async fn start_stream_hive(
 	let conf = hive_tls_config(&certs);
 	let mut hive = ClusterTestHive::new(Some(conf))?;
 	hive.register(servlet_urn("stream-echo"), servlet, |t| {
-		StreamEchoServlet::start(t, ServletConfig::default())
+		StreamEchoServlet::start(t, ServletConfig::cleartext())
 	})?;
 	hive.establish(Arc::new(trace.share())).await?;
 	Ok(hive)
