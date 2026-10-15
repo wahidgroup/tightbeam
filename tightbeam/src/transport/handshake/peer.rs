@@ -21,13 +21,15 @@ use std::sync::Arc;
 use crate::crypto::x509::policy::CertificateValidation;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::crypto::sign::elliptic_curve::{CurveArithmetic, PublicKey};
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::x509::utils::CertificateExt;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::error::HandshakeError;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::schedule::{HandshakeVerifyingKey, PeerIdentity, Terms};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::transport::handshake::HandshakeProvider;
+use crate::transport::handshake::{HandshakeCurve, HandshakeProvider};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::utils::marker::{MaybeSend, MaybeSync};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -70,6 +72,42 @@ impl ValidatorChain {
 		}
 
 		Ok(())
+	}
+}
+
+/// The certificate of a peer, with its key parsed once.
+///
+/// [`Self::parse`] is the one constructor. A server holds the certificate its
+/// client offers in one, and a client holds the certificate of the server it
+/// admitted, so each check of a handshake reads the key parsed here.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+#[derive(Clone)]
+pub struct PeerCertificate<C: CurveArithmetic> {
+	certificate: Arc<Certificate>,
+	key: PublicKey<C>,
+}
+
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+impl<C: HandshakeCurve> PeerCertificate<C> {
+	/// Parse the key of `certificate`.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::InvalidPublicKey`] -- the certificate key is not a point on the curve.
+	pub(crate) fn parse(certificate: impl Into<Arc<Certificate>>) -> Result<Self, HandshakeError> {
+		let certificate = certificate.into();
+		let key = certificate.verifying_key::<C>()?;
+		Ok(Self { certificate, key })
+	}
+
+	/// The certificate the peer presented.
+	pub(crate) fn certificate(&self) -> &Arc<Certificate> {
+		&self.certificate
+	}
+
+	/// The key of the certificate.
+	pub(crate) fn key(&self) -> &PublicKey<C> {
+		&self.key
 	}
 }
 
@@ -136,36 +174,34 @@ impl PeerAuthentication {
 	///   arrived with no certificate.
 	/// - [`HandshakeError::CertificateValidationError`] -- a validator refused the offered certificate.
 	/// - [`HandshakeError::SignatureVerificationFailed`] -- the certificate arrived with no proof.
-	/// - [`HandshakeError::InvalidPublicKey`] -- the certificate key is not a point on the curve.
 	/// - The [`PossessionProof::verify`] set.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub(crate) fn admit<P, Proof>(
 		&self,
-		offered: Option<Certificate>,
+		offered: Option<PeerCertificate<P::Curve>>,
 		proof: Option<Proof>,
 		terms: &Terms<P>,
-	) -> Result<AdmittedPeer, HandshakeError>
+	) -> Result<AdmittedPeer<P::Curve>, HandshakeError>
 	where
 		P: HandshakeProvider,
 		Proof: PossessionProof<P>,
 	{
-		let Some(certificate) = offered else {
+		let Some(identity) = offered else {
 			return match (self, proof) {
 				(Self::Anonymous, None) => Ok(AdmittedPeer(Admission::Unidentified)),
 				(Self::Anonymous, Some(_)) | (Self::Mutual(_), _) => Err(HandshakeError::MissingClientCertificate),
 			};
 		};
 		if let Self::Mutual(chain) = self {
-			chain.evaluate(&certificate)?;
+			chain.evaluate(identity.certificate())?;
 		}
 
 		let proof = proof.ok_or(HandshakeError::SignatureVerificationFailed)?;
-		let public_key = certificate.verifying_key::<P::Curve>()?;
-		proof.verify(P::VerifyingKey::from(public_key), terms)?;
+		proof.verify(P::VerifyingKey::from(*identity.key()), terms)?;
 
 		let admission = match self {
 			Self::Anonymous => Admission::Offered,
-			Self::Mutual(_) => Admission::Proven(Arc::new(certificate)),
+			Self::Mutual(_) => Admission::Proven(identity),
 		};
 		Ok(AdmittedPeer(admission))
 	}
@@ -176,10 +212,10 @@ impl PeerAuthentication {
 /// The variant stays private, so a proven peer exists only where `admit`
 /// ran every validator and verified the proof.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-pub struct AdmittedPeer(Admission);
+pub struct AdmittedPeer<C: CurveArithmetic>(Admission<C>);
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-enum Admission {
+enum Admission<C: CurveArithmetic> {
 	/// Under server-only authentication, the client offered no certificate.
 	Unidentified,
 	/// Under server-only authentication, the client proved the key of the
@@ -187,57 +223,58 @@ enum Admission {
 	Offered,
 	/// Every configured validator accepted the certificate, and the client
 	/// proved its key.
-	Proven(Arc<Certificate>),
+	Proven(PeerCertificate<C>),
 }
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-impl AdmittedPeer {
-	/// The certificate the session records as its peer, present only under
+impl<C: HandshakeCurve> AdmittedPeer<C> {
+	/// The identity the session records as its peer, present only under
 	/// mutual authentication after every validator accepted it.
-	pub(crate) fn proven(&self) -> Option<&Arc<Certificate>> {
+	pub(crate) fn proven(&self) -> Option<&PeerCertificate<C>> {
 		match &self.0 {
-			Admission::Proven(certificate) => Some(certificate),
+			Admission::Proven(identity) => Some(identity),
 			Admission::Unidentified | Admission::Offered => None,
 		}
 	}
 }
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-impl PeerIdentity for AdmittedPeer {
+impl<C: HandshakeCurve> PeerIdentity for AdmittedPeer<C> {
 	fn certificate(&self) -> Option<&Arc<Certificate>> {
-		self.proven()
+		let proven = self.proven();
+		proven.map(PeerCertificate::certificate)
 	}
 }
 
-/// The server certificate a client admitted.
+/// The server certificate a client admitted, with its key.
 ///
 /// The field stays private, so one exists only where [`ProvisionedTrust`] or
 /// [`LearnedTrust`] validated the certificate.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 #[derive(Clone)]
-pub struct AdmittedServer(Arc<Certificate>);
+pub struct AdmittedServer<C: CurveArithmetic>(PeerCertificate<C>);
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-impl AdmittedServer {
-	/// The certificate that identifies the server.
-	pub(crate) fn certificate(&self) -> &Arc<Certificate> {
+impl<C: HandshakeCurve> AdmittedServer<C> {
+	/// The certificate that identifies the server, with its key.
+	pub(crate) fn identity(&self) -> &PeerCertificate<C> {
 		&self.0
 	}
 }
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-impl PeerIdentity for AdmittedServer {
+impl<C: HandshakeCurve> PeerIdentity for AdmittedServer<C> {
 	fn certificate(&self) -> Option<&Arc<Certificate>> {
-		Some(&self.0)
+		Some(self.0.certificate())
 	}
 }
 
-/// Where a client learns the identity of its server.
+/// Where a client learns the identity of its server, whose key is on `C`.
 ///
 /// A flow names one implementation, so the leg that admits the server and
 /// what the reply must name are fixed by type.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-pub trait ServerTrust: MaybeSend + MaybeSync + 'static {
+pub trait ServerTrust<C: HandshakeCurve>: MaybeSend + MaybeSync + 'static {
 	/// What the trust admits before the opening.
 	type Provisioned: MaybeSend;
 	/// What the reply names for the trust to admit.
@@ -250,6 +287,7 @@ pub trait ServerTrust: MaybeSend + MaybeSync + 'static {
 	/// - [`HandshakeError::MissingServerCertificate`] -- the provisioned chain is empty.
 	/// - [`HandshakeError::CertificateValidationError`] -- the certificate is
 	///   outside its validity period, or the store refused it or its chain.
+	/// - [`HandshakeError::InvalidPublicKey`] -- the certificate key is not a point on the curve.
 	fn admit_provisioned(&self) -> Result<Self::Provisioned, HandshakeError>;
 
 	/// Admit the server the reply names.
@@ -258,7 +296,8 @@ pub trait ServerTrust: MaybeSend + MaybeSync + 'static {
 	///
 	/// - [`HandshakeError::CertificateValidationError`] -- the certificate is
 	///   outside its validity period, or the validator refused it.
-	fn admit_named(&self, named: Self::Named) -> Result<AdmittedServer, HandshakeError>;
+	/// - [`HandshakeError::InvalidPublicKey`] -- the certificate key is not a point on the curve.
+	fn admit_named(&self, named: Self::Named) -> Result<AdmittedServer<C>, HandshakeError>;
 }
 
 /// Trust in a server whose identity is known before the opening, which
@@ -272,9 +311,9 @@ pub struct ProvisionedTrust {
 }
 
 #[cfg(feature = "transport-cms")]
-impl ServerTrust for ProvisionedTrust {
-	type Provisioned = AdmittedServer;
-	type Named = AdmittedServer;
+impl<C: HandshakeCurve> ServerTrust<C> for ProvisionedTrust {
+	type Provisioned = AdmittedServer<C>;
+	type Named = AdmittedServer<C>;
 
 	/// Admit the provisioned server before the opening.
 	///
@@ -291,25 +330,29 @@ impl ServerTrust for ProvisionedTrust {
 	/// - [`HandshakeError::MissingServerCertificate`] -- the provisioned chain is empty.
 	/// - [`HandshakeError::CertificateValidationError`] -- the certificate is
 	///   outside its validity period, or the store refused it or its chain.
+	/// - [`HandshakeError::InvalidPublicKey`] -- the certificate key is not a point on the curve.
 	///
 	/// [rfc5280-6.1]: https://datatracker.ietf.org/doc/html/rfc5280#section-6.1
-	fn admit_provisioned(&self) -> Result<AdmittedServer, HandshakeError> {
-		match &self.identity {
+	fn admit_provisioned(&self) -> Result<AdmittedServer<C>, HandshakeError> {
+		let leaf = match &self.identity {
 			CmsServerIdentity::Certificate(certificate) => {
 				certificate.validate_expiry()?;
 				self.store.evaluate(certificate)?;
-				Ok(AdmittedServer(Arc::clone(certificate)))
+				Arc::clone(certificate)
 			}
 			CmsServerIdentity::Chain(chain) => {
 				let leaf = chain.last().ok_or(HandshakeError::MissingServerCertificate)?;
 				self.store.verify_chain(chain)?;
-				Ok(AdmittedServer(Arc::new(leaf.clone())))
+				Arc::new(leaf.clone())
 			}
-		}
+		};
+
+		let server = PeerCertificate::parse(leaf)?;
+		Ok(AdmittedServer(server))
 	}
 
 	/// The reply names the server that was admitted before the opening.
-	fn admit_named(&self, named: AdmittedServer) -> Result<AdmittedServer, HandshakeError> {
+	fn admit_named(&self, named: AdmittedServer<C>) -> Result<AdmittedServer<C>, HandshakeError> {
 		Ok(named)
 	}
 }
@@ -338,7 +381,7 @@ impl From<Arc<dyn CertificateValidation>> for LearnedTrust {
 }
 
 #[cfg(feature = "transport-hpke")]
-impl ServerTrust for LearnedTrust {
+impl<C: HandshakeCurve> ServerTrust<C> for LearnedTrust {
 	type Provisioned = ();
 	type Named = Certificate;
 
@@ -356,10 +399,12 @@ impl ServerTrust for LearnedTrust {
 	///
 	/// - [`HandshakeError::CertificateValidationError`] -- the certificate is
 	///   outside its validity period, or the validator refused it.
-	fn admit_named(&self, named: Certificate) -> Result<AdmittedServer, HandshakeError> {
+	/// - [`HandshakeError::InvalidPublicKey`] -- the certificate key is not a point on the curve.
+	fn admit_named(&self, named: Certificate) -> Result<AdmittedServer<C>, HandshakeError> {
 		named.validate_expiry()?;
 		self.validator.evaluate(&named)?;
-		Ok(AdmittedServer(Arc::new(named)))
+		let server = PeerCertificate::parse(named)?;
+		Ok(AdmittedServer(server))
 	}
 }
 
@@ -368,13 +413,28 @@ mod tests {
 	use std::error::Error;
 
 	use super::*;
-	use crate::transport::handshake::tests::create_test_certificate;
+	use crate::crypto::sign::ecdsa::k256::Secp256k1;
+	use crate::der::asn1::BitString;
+	use crate::transport::handshake::tests::{create_test_certificate, off_curve_point};
 
 	#[test]
 	fn an_empty_validator_set_demands_nothing() {
 		let authentication = PeerAuthentication::mutual([]);
 		assert!(matches!(authentication, PeerAuthentication::Anonymous));
 		assert!(!authentication.requires_certificate());
+	}
+
+	/// A peer certificate holds its parsed key, so a certificate whose key is
+	/// off the curve yields none.
+	#[test]
+	fn a_certificate_whose_key_is_off_the_curve_yields_no_peer_certificate() -> Result<(), Box<dyn Error>> {
+		let mut client = create_test_certificate();
+		let off_curve = BitString::from_bytes(&off_curve_point())?;
+		client.certificate.tbs_certificate.subject_public_key_info.subject_public_key = off_curve;
+
+		let refused = PeerCertificate::<Secp256k1>::parse(client.certificate);
+		assert!(matches!(refused, Err(HandshakeError::InvalidPublicKey(_))));
+		Ok(())
 	}
 
 	#[cfg(feature = "transport-cms")]
@@ -436,8 +496,9 @@ mod tests {
 			let server = create_test_certificate().certificate;
 			let store = store_holding(server.to_owned());
 
-			let admitted = trust(server.to_owned(), store).admit_provisioned()?;
-			assert_eq!(admitted.certificate().as_ref(), &server);
+			let admitted: AdmittedServer<Secp256k1> = trust(server.to_owned(), store).admit_provisioned()?;
+			let certificate = admitted.identity().certificate();
+			assert_eq!(certificate.as_ref(), &server);
 			Ok(())
 		}
 
@@ -446,7 +507,7 @@ mod tests {
 			let server = create_test_certificate().certificate;
 			let store = store_holding(create_test_certificate().certificate);
 
-			let refusal = trust(server, store).admit_provisioned();
+			let refusal: Result<AdmittedServer<Secp256k1>, _> = trust(server, store).admit_provisioned();
 			assert!(matches!(refusal, Err(HandshakeError::CertificateValidationError(_))));
 		}
 
@@ -454,7 +515,8 @@ mod tests {
 		/// period, so the trust refuses an expired one itself.
 		#[test]
 		fn a_provisioned_certificate_past_its_validity_is_refused() {
-			let refusal = trust(TestCertificate::expired(), ExpiryBlindStore).admit_provisioned();
+			let expired = trust(TestCertificate::expired(), ExpiryBlindStore);
+			let refusal: Result<AdmittedServer<Secp256k1>, _> = expired.admit_provisioned();
 			assert!(matches!(refusal, Err(HandshakeError::CertificateValidationError(Expired))));
 		}
 
@@ -470,8 +532,9 @@ mod tests {
 			let chain = TestCertificate::insecure_fixed_chain()?;
 			let store = store_holding(chain.root.to_owned());
 
-			let admitted = chain_trust(chain.to_arc(), store).admit_provisioned()?;
-			assert_eq!(admitted.certificate().as_ref(), &chain.leaf);
+			let admitted: AdmittedServer<Secp256k1> = chain_trust(chain.to_arc(), store).admit_provisioned()?;
+			let certificate = admitted.identity().certificate();
+			assert_eq!(certificate.as_ref(), &chain.leaf);
 			Ok(())
 		}
 
@@ -480,7 +543,7 @@ mod tests {
 			let chain = TestCertificate::insecure_fixed_chain()?;
 			let store = store_holding(create_test_certificate().certificate);
 
-			let refusal = chain_trust(chain.to_arc(), store).admit_provisioned();
+			let refusal: Result<AdmittedServer<Secp256k1>, _> = chain_trust(chain.to_arc(), store).admit_provisioned();
 			assert!(matches!(refusal, Err(HandshakeError::CertificateValidationError(_))));
 			Ok(())
 		}
@@ -490,7 +553,8 @@ mod tests {
 			let chain = TestCertificate::insecure_fixed_chain()?;
 			let store = store_holding(chain.root);
 
-			let refusal = chain_trust(Arc::from(Vec::new()), store).admit_provisioned();
+			let empty = chain_trust(Arc::from(Vec::new()), store);
+			let refusal: Result<AdmittedServer<Secp256k1>, _> = empty.admit_provisioned();
 			assert!(matches!(refusal, Err(HandshakeError::MissingServerCertificate)));
 			Ok(())
 		}
@@ -515,8 +579,9 @@ mod tests {
 		#[test]
 		fn a_learned_certificate_the_validator_accepts_is_admitted() -> Result<(), Box<dyn Error>> {
 			let server = create_test_certificate().certificate;
-			let admitted = pinned(&server).admit_named(server.to_owned())?;
-			assert_eq!(admitted.certificate().as_ref(), &server);
+			let admitted: AdmittedServer<Secp256k1> = pinned(&server).admit_named(server.to_owned())?;
+			let certificate = admitted.identity().certificate();
+			assert_eq!(certificate.as_ref(), &server);
 			Ok(())
 		}
 
@@ -524,7 +589,8 @@ mod tests {
 		#[test]
 		fn a_learned_certificate_the_validator_refuses_is_refused() {
 			let trust = LearnedTrust { validator: Arc::new(DirectTrustValidator::default()) };
-			let refusal = trust.admit_named(create_test_certificate().certificate);
+			let unknown = create_test_certificate().certificate;
+			let refusal: Result<AdmittedServer<Secp256k1>, _> = trust.admit_named(unknown);
 			assert!(matches!(refusal, Err(HandshakeError::CertificateValidationError(_))));
 		}
 
@@ -533,7 +599,7 @@ mod tests {
 		#[test]
 		fn a_learned_certificate_past_its_validity_is_refused() {
 			let expired = TestCertificate::expired();
-			let refusal = pinned(&expired).admit_named(expired);
+			let refusal: Result<AdmittedServer<Secp256k1>, _> = pinned(&expired).admit_named(expired);
 			assert!(matches!(refusal, Err(HandshakeError::CertificateValidationError(Expired))));
 		}
 	}

@@ -20,15 +20,30 @@ use crate::der::oid::AssociatedOid;
 use crate::der::{Decode, Encode};
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::negotiation::{TransportAccept, TransportAuthorizer};
+use crate::transport::handshake::peer::PeerCertificate;
 use crate::transport::handshake::receipt::{
 	ReceiptApprover, ReceiptArtifact, ReceiptRole, ReceiptSigner, SessionObserver, SessionOutcome, SessionReceipt,
 	SessionVerdict, StoredReceipt,
 };
-use crate::transport::handshake::schedule::{ConfirmedSecret, HandshakeVerifyingKey, Terms};
+use crate::transport::handshake::schedule::{ConfirmedSecret, Terms};
 use crate::transport::handshake::{AdmittedPeer, Arc, HandshakeProvider, HandshakeSecret};
 use crate::transport::state::ClientIdentity;
-use crate::x509::Certificate;
 use crate::zeroize::Zeroizing;
+
+/// What a server settles a receipt against: the secret and the terms of the
+/// handshake, the peer the closing admitted, and the two hooks of the server.
+pub(crate) struct Settlement<'a, P: HandshakeProvider> {
+	/// The handshake secret the client proved it holds.
+	pub(crate) secret: &'a ConfirmedSecret,
+	/// The terms the handshake agreed.
+	pub(crate) terms: &'a Terms<P>,
+	/// The peer the closing admitted.
+	pub(crate) peer: &'a AdmittedPeer<P::Curve>,
+	/// The authorizer that settles the countersigned receipt.
+	pub(crate) authorizer: Option<&'a dyn TransportAuthorizer>,
+	/// The observer every concluded exchange reaches.
+	pub(crate) observer: Option<&'a dyn SessionObserver>,
+}
 
 /// The receipt a server issued and the artifact it signed, held from the
 /// [reply](crate::transport::handshake#legs) to the settlement.
@@ -91,7 +106,7 @@ impl IssuedReceipt {
 	///
 	/// The step runs in that order, and it fails closed. A missing or invalid
 	/// countersignature aborts the handshake, and so does a settle refusal.
-	/// Every concluded exchange reaches `observer` first.
+	/// Every concluded exchange reaches the observer first.
 	///
 	/// # Ordering
 	///
@@ -106,23 +121,20 @@ impl IssuedReceipt {
 	/// - [`HandshakeError::InvalidKeyMaterialLength`] -- the cipher refused the acknowledgement key.
 	/// - [`HandshakeError::ReceiptAckCipher`] -- the sealed countersignature fails to open.
 	/// - [`HandshakeError::DerError`] -- the opened countersignature is not a `SignerInfo`.
-	/// - [`HandshakeError::MutualAuthRequired`] -- `peer` proved no certificate.
+	/// - [`HandshakeError::MutualAuthRequired`] -- the peer proved no certificate.
 	/// - [`HandshakeError::CountersignatureMissing`] -- `sealed_ack` is `None`.
 	/// - [`HandshakeError::SignatureVerificationFailed`] -- the countersignature fails to verify.
 	/// - [`HandshakeError::SettlementRejected`] -- the authorizer refused the settlement answer.
 	async fn settle<P>(
 		self,
 		sealed_ack: Option<impl AsRef<[u8]>>,
-		secret: &ConfirmedSecret,
-		terms: &Terms<P>,
-		peer: &AdmittedPeer,
-		authorizer: Option<&dyn TransportAuthorizer>,
-		observer: Option<&dyn SessionObserver>,
+		settlement: Settlement<'_, P>,
 	) -> Result<StoredReceipt, HandshakeError>
 	where
 		P: HandshakeProvider,
 	{
 		let Self { receipt, artifact } = self;
+		let Settlement { secret, terms, peer, authorizer, observer } = settlement;
 
 		// The acknowledgement is the client's receipt SignerInfo sealed under
 		// the handshake secret. Its signed attributes bind the bearer
@@ -140,9 +152,8 @@ impl IssuedReceipt {
 			None => (SessionVerdict::CountersignatureMissing, None),
 			Some(ack) => {
 				let client = peer.proven().ok_or(HandshakeError::MutualAuthRequired)?;
-				let sid = client.signer_identifier::<P::Digest>()?;
-				let public_key = client.verifying_key::<P::Curve>()?;
-				let key = P::VerifyingKey::from(public_key);
+				let sid = client.certificate().signer_identifier::<P::Digest>()?;
+				let key = P::VerifyingKey::from(*client.key());
 
 				let settling = receipt.settle_ack::<P::Digest, P::Signature, _>(Some(ack), &sid, &key, authorizer);
 				settling.await?
@@ -163,7 +174,8 @@ impl IssuedReceipt {
 		};
 
 		let countersignature = countersignature.map(OctetString::new).transpose()?;
-		let client_certificate = peer.proven().map(Arc::clone);
+		let proven = peer.proven();
+		let client_certificate = proven.map(|identity| Arc::clone(identity.certificate()));
 		let outcome = SessionOutcome {
 			receipt,
 			artifact,
@@ -189,18 +201,14 @@ impl IssuedReceipt {
 	pub(crate) async fn settle_issued<P>(
 		issued: Option<Self>,
 		sealed_ack: Option<impl AsRef<[u8]>>,
-		secret: &ConfirmedSecret,
-		terms: &Terms<P>,
-		peer: &AdmittedPeer,
-		authorizer: Option<&dyn TransportAuthorizer>,
-		observer: Option<&dyn SessionObserver>,
+		settlement: Settlement<'_, P>,
 	) -> Result<Option<StoredReceipt>, HandshakeError>
 	where
 		P: HandshakeProvider,
 	{
 		match (issued, sealed_ack) {
 			(Some(issued), sealed_ack) => {
-				let settling = issued.settle(sealed_ack, secret, terms, peer, authorizer, observer);
+				let settling = issued.settle(sealed_ack, settlement);
 				Ok(Some(settling.await?))
 			}
 			(None, Some(_)) => Err(HandshakeError::ReceiptMismatch),
@@ -230,12 +238,11 @@ impl PendingReceipt {
 	/// - [`HandshakeError::ReceiptMismatch`] -- a receipt came for an unmetered
 	///   session, or it disagrees with the accept or the transcript.
 	/// - [`HandshakeError::SignatureVerificationFailed`] -- the server signature fails to verify.
-	/// - [`HandshakeError::InvalidPublicKey`] -- the server key is not a point on the curve.
 	pub(crate) fn verify<P>(
 		artifact: Option<SignedData>,
 		accept: Option<&TransportAccept>,
 		transcript_hash: &[u8; 32],
-		server: &Certificate,
+		server: &PeerCertificate<P::Curve>,
 	) -> Result<Option<Self>, HandshakeError>
 	where
 		P: HandshakeProvider,
@@ -255,9 +262,8 @@ impl PendingReceipt {
 		let signed = artifact.signer_for_role(role)?;
 		let signer = signed.ok_or(HandshakeError::ReceiptMissing)?;
 
-		let sid = server.signer_identifier::<P::Digest>()?;
-		let public_key = server.verifying_key::<P::Curve>()?;
-		let key = P::VerifyingKey::from(public_key);
+		let sid = server.certificate().signer_identifier::<P::Digest>()?;
+		let key = P::VerifyingKey::from(*server.key());
 		receipt.verify_signer::<P::Digest, P::Signature, _>(signer, role, &sid, &key)?;
 
 		Ok(Some(Self { receipt, artifact }))
@@ -392,8 +398,8 @@ mod tests {
 		server: &TestCertificate,
 	) -> Result<Option<PendingReceipt>, HandshakeError> {
 		let accept = budget_accept();
-		let certificate = &server.certificate;
-		PendingReceipt::verify::<DefaultCryptoProvider>(Some(artifact), Some(&accept), &TRANSCRIPT, certificate)
+		let identity = PeerCertificate::parse(server.certificate.clone())?;
+		PendingReceipt::verify::<DefaultCryptoProvider>(Some(artifact), Some(&accept), &TRANSCRIPT, &identity)
 	}
 
 	#[tokio::test]

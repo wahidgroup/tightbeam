@@ -21,19 +21,18 @@ use alloc::{boxed::Box, vec::Vec};
 use crate::cms::signed_data::SignedData;
 use crate::crypto::key::SigningKeyProvider;
 use crate::crypto::sign::elliptic_curve::ecdh::EphemeralSecret;
-use crate::crypto::sign::elliptic_curve::PublicKey;
+use crate::crypto::sign::elliptic_curve::{CurveArithmetic, PublicKey};
 use crate::random::CryptoRngCore;
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::negotiation::{
 	RunnableProfile, SecurityAccept, SecurityOffer, TransportAccept, TransportOffer,
 };
-use crate::transport::handshake::peer::{PossessionProof, ServerTrust};
+use crate::transport::handshake::peer::{PeerCertificate, PossessionProof, ServerTrust};
 use crate::transport::handshake::primitives::KdfSalt;
 use crate::transport::handshake::schedule::{KeyConfirmation, PeerPoint, Salt, Terms};
 use crate::transport::handshake::{HandshakeMessage, HandshakeProvider, HandshakeSecret};
 use crate::transport::state::ClientIdentity;
 use crate::utils::marker::{MaybeSend, MaybeSendFuture, MaybeSync};
-use crate::x509::Certificate;
 
 #[cfg(feature = "transport-cms")]
 mod cms;
@@ -92,7 +91,7 @@ pub struct Opened<F: ClientFlow<P>, P: HandshakeProvider> {
 /// The facts of a decoded reply, bound into the sealed transcript.
 pub struct ReplyIntake<F: ClientFlow<P>, P: HandshakeProvider> {
 	/// What the reply names as the server, for the trust to admit.
-	pub server: <F::Trust as ServerTrust>::Named,
+	pub server: <F::Trust as ServerTrust<P::Curve>>::Named,
 	/// The security profile the server selected.
 	pub security_accept: Option<SecurityAccept>,
 	/// The transport capabilities the server accepted.
@@ -115,9 +114,9 @@ pub struct ReplyIntake<F: ClientFlow<P>, P: HandshakeProvider> {
 }
 
 /// What the orchestrator contributes to the closing.
-pub struct ClosingParts<'a> {
-	/// The admitted server certificate.
-	pub server: &'a Certificate,
+pub struct ClosingParts<'a, C: CurveArithmetic> {
+	/// The admitted server certificate, with its key.
+	pub server: &'a PeerCertificate<C>,
 	/// The hash of the sealed transcript.
 	pub transcript_hash: &'a [u8; 32],
 	/// The receipt countersignature, sealed under the handshake secret.
@@ -152,7 +151,7 @@ pub trait ClientFlow<P: HandshakeProvider>: HandshakeFlow {
 	/// What a client of this protocol is provisioned with.
 	type Settings: MaybeSend + MaybeSync + 'static;
 	/// Where the client learns the server identity.
-	type Trust: ServerTrust;
+	type Trust: ServerTrust<P::Curve>;
 	/// What the flow keeps from the opening to read the reply against.
 	type Opening: MaybeSend + MaybeSync + 'static;
 	/// The secrets the flow holds from the opening to the agreement.
@@ -181,7 +180,7 @@ pub trait ClientFlow<P: HandshakeProvider>: HandshakeFlow {
 	/// - [`HandshakeError`] -- the opening fails to build or encode.
 	fn open(
 		settings: &Self::Settings,
-		server: <Self::Trust as ServerTrust>::Provisioned,
+		server: <Self::Trust as ServerTrust<P::Curve>>::Provisioned,
 		parts: OpeningParts<'_>,
 		rng: &mut dyn CryptoRngCore,
 	) -> Result<Opened<Self, P>, HandshakeError>;
@@ -235,7 +234,7 @@ pub trait ClientFlow<P: HandshakeProvider>: HandshakeFlow {
 		agreed: Self::Agreed,
 		reply: Self::Reply,
 		settings: &'a Self::Settings,
-		parts: ClosingParts<'_>,
+		parts: ClosingParts<'_, P::Curve>,
 	) -> Result<ClosingBinding<'a, Self, P>, HandshakeError>;
 
 	/// Encode the closing with the possession proof, when the client signed
@@ -284,8 +283,8 @@ pub struct ReplyBinding<F: ServerFlow<P>, P: HandshakeProvider> {
 
 /// The facts of a decoded closing, with what it sealed to the static key.
 pub struct ClosingIntake<F: ServerFlow<P>, P: HandshakeProvider> {
-	/// The certificate the client offers as its identity.
-	pub offered: Option<Certificate>,
+	/// The certificate the client offers as its identity, with its key.
+	pub offered: Option<PeerCertificate<P::Curve>>,
 	/// The proof that the key of the offered certificate signed the closing.
 	pub proof: Option<F::Proof>,
 	/// What the closing still holds for the agreement.

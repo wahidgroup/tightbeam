@@ -106,7 +106,7 @@ use handshake::*;
 mod owners;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-pub(crate) use owners::{CountersignedReceipt, IssuedReceipt, PendingReceipt};
+pub(crate) use owners::{CountersignedReceipt, IssuedReceipt, PendingReceipt, Settlement};
 
 use crate::transport::handshake::Arc;
 use crate::x509::Certificate;

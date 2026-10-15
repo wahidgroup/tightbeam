@@ -46,12 +46,12 @@ use crate::transport::handshake::flow::{
 };
 use crate::transport::handshake::kari::{Kek, OriginatorKey};
 use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer, TransportAccept, TransportOffer};
-use crate::transport::handshake::peer::{AdmittedServer, PossessionProof, ProvisionedTrust};
+use crate::transport::handshake::peer::{AdmittedServer, PeerCertificate, PossessionProof, ProvisionedTrust};
 use crate::transport::handshake::primitives::transcript::{FinishedRole, ServerFinishedLegs, Transcript};
 use crate::transport::handshake::primitives::{KdfInfo, KdfSalt};
 use crate::transport::handshake::processors::TightBeamSignedDataProcessor;
 use crate::transport::handshake::schedule::{
-	Agreement, BaseSecret, ClientStatic, HandshakeVerifyingKey, KeyConfirmation, PeerEphemeral, PeerPoint, Salt, Terms,
+	Agreement, BaseSecret, ClientStatic, KeyConfirmation, PeerEphemeral, PeerPoint, Salt, Terms,
 };
 use crate::transport::handshake::{HandshakeCurve, HandshakeMessage, HandshakeProvider, HandshakeSecret};
 use crate::transport::state::ClientIdentity;
@@ -105,11 +105,11 @@ pub struct CmsClientSettings<P: HandshakeProvider> {
 }
 
 /// What a CMS client keeps from its key exchange to read the reply against.
-pub struct CmsOpening {
+pub struct CmsOpening<C: HandshakeCurve> {
 	/// The transcript, open over the key exchange as it was sent.
 	transcript: Transcript,
 	/// The server the key exchange encrypted to.
-	server: AdmittedServer,
+	server: AdmittedServer<C>,
 }
 
 /// The secrets a CMS client holds from its key exchange to the agreement.
@@ -296,7 +296,7 @@ impl<T> ReceivedAttribute<T> {
 impl<P: HandshakeProvider> ClientFlow<P> for Cms {
 	type Settings = CmsClientSettings<P>;
 	type Trust = ProvisionedTrust;
-	type Opening = CmsOpening;
+	type Opening = CmsOpening<P::Curve>;
 	type Pending = Box<CmsPending<P::Curve>>;
 	type Reply = WireDer<SignedData>;
 	type Agreed = ();
@@ -312,7 +312,7 @@ impl<P: HandshakeProvider> ClientFlow<P> for Cms {
 
 	fn open(
 		settings: &Self::Settings,
-		server: AdmittedServer,
+		server: AdmittedServer<P::Curve>,
 		parts: OpeningParts<'_>,
 		rng: &mut dyn CryptoRngCore,
 	) -> Result<Opened<Self, P>, HandshakeError> {
@@ -326,11 +326,11 @@ impl<P: HandshakeProvider> ClientFlow<P> for Cms {
 		let ephemeral_spki = SubjectPublicKeyInfoOwned::from_key(ephemeral.public_key())?;
 
 		// 3. Build the KARI to the admitted server, under the profile's key wrap.
-		let certificate = server.certificate();
+		let certificate = server.identity().certificate();
 		let ukm_bytes = generate_nonce::<64>(Some(&mut *rng))?;
 		let key_wrap = <P::Profile as SecurityProfile>::KEY_WRAP_OID;
 		let key_wrap_oid = key_wrap.ok_or(HandshakeError::MissingKeyWrapAlgorithm)?;
-		let recipient_key = certificate.verifying_key::<P::Curve>()?;
+		let recipient_key = *server.identity().key();
 		let recipient = Self::recipient_identifier(certificate);
 		let ukm = UserKeyingMaterial::new(ukm_bytes.to_vec())?;
 		let key_enc_alg = AlgorithmIdentifierOwned { oid: key_wrap_oid, parameters: None };
@@ -448,7 +448,7 @@ impl<P: HandshakeProvider> ClientFlow<P> for Cms {
 		_agreed: (),
 		_reply: Self::Reply,
 		settings: &'a Self::Settings,
-		parts: ClosingParts<'_>,
+		parts: ClosingParts<'_, P::Curve>,
 	) -> Result<ClosingBinding<'a, Self, P>, HandshakeError> {
 		let ClosingParts { transcript_hash, sealed_ack, confirmation, .. } = parts;
 		let identity = &settings.identity;
@@ -508,8 +508,8 @@ pub struct CmsOpened<C: HandshakeCurve> {
 	originator: PeerPoint<C>,
 	/// The transcript, open over the key exchange.
 	transcript: Transcript,
-	/// The client certificate the key exchange carried.
-	bound: Option<Certificate>,
+	/// The client identity the key exchange carried, with its key.
+	bound: Option<PeerCertificate<C>>,
 }
 
 /// A server Finished that awaits its signature and its receipt.
@@ -521,12 +521,12 @@ pub struct CmsReplyDraft {
 }
 
 /// What a CMS server holds from its Finished to the client Finished.
-pub struct CmsServerPending {
+pub struct CmsServerPending<C: HandshakeCurve> {
 	/// The handshake secret, derived when the server Finished was built.
 	secret: HandshakeSecret,
-	/// The client certificate the key exchange bound into the transcript,
-	/// which the client Finished must embed unchanged.
-	bound: Option<Certificate>,
+	/// The client identity the key exchange bound into the transcript, whose
+	/// certificate the client Finished must embed unchanged.
+	bound: Option<PeerCertificate<C>>,
 }
 
 /// What a client Finished carries beyond its signature.
@@ -600,7 +600,7 @@ impl<P: HandshakeProvider> ServerFlow<P> for Cms {
 	type Sealed = CmsSealed;
 	type Opened = Box<CmsOpened<P::Curve>>;
 	type Draft = CmsReplyDraft;
-	type Pending = CmsServerPending;
+	type Pending = CmsServerPending<P::Curve>;
 	type Closing = CmsClosing;
 	type Proof = CmsFinished;
 
@@ -647,10 +647,12 @@ impl<P: HandshakeProvider> ServerFlow<P> for Cms {
 				_ => return Err(HandshakeError::InvalidClientKeyExchange),
 			};
 
-			// 2. Parse the originator key. A malformed, off-curve, or identity
-			//    point is refused here, ahead of the agreement, and so is the
-			//    static key of the certificate the key exchange carries.
-			let client_static = ClientStatic::<P::Curve>::of(bound.as_ref())?;
+			// 2. Parse the offered identity once, then the originator key. A
+			//    malformed, off-curve, or identity point is refused here, ahead
+			//    of the agreement, and so is the static key of the identity.
+			let parsed = bound.map(PeerCertificate::<P::Curve>::parse);
+			let bound = parsed.transpose()?;
+			let client_static = ClientStatic::of(bound.as_ref());
 			let originator = client_static.client_ephemeral(originator_bytes)?;
 
 			// 3. Run the static ECDH through the key provider, and derive the
@@ -771,8 +773,9 @@ impl<P: HandshakeProvider> ServerFlow<P> for Cms {
 		// 2. Refuse a Finished whose embedded certificate differs from the
 		//    one the key exchange bound into the transcript, before admission
 		//    (CWE-287, CWE-345).
-		let offered = finished.value().embedded_certificate();
-		if offered.as_ref() != pending.bound.as_ref() {
+		let embedded = finished.value().embedded_certificate();
+		let bound = pending.bound.as_ref().map(|identity| identity.certificate().as_ref());
+		if embedded.as_ref() != bound {
 			return Err(HandshakeError::ClientCertificateMismatch);
 		}
 
@@ -780,6 +783,7 @@ impl<P: HandshakeProvider> ServerFlow<P> for Cms {
 		let confirmation = finished.value().key_confirmation()?;
 		let sealed_ack = finished.value().sealed_receipt_ack()?;
 		let closing = CmsClosing { sealed_ack: sealed_ack.map(OctetString::into_bytes), confirmation };
+		let offered = pending.bound.clone();
 		Ok(ClosingIntake { offered, proof: Some(CmsFinished(finished)), closing })
 	}
 
