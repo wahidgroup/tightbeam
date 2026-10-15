@@ -40,13 +40,13 @@ use crate::transport::handshake::negotiation::{
 	AuthorizedTransport, MuxSettings, ProfilePolicy, SecurityOffer, SupportedProfiles, TransportAuthorizer,
 	TransportNegotiation, TransportOffer,
 };
-use crate::transport::handshake::peer::{AdmittedPeer, AdmittedServer, PeerAuthentication, ServerTrust};
+use crate::transport::handshake::peer::{
+	AdmittedPeer, AdmittedServer, PeerAuthentication, PeerCertificate, ServerTrust,
+};
 use crate::transport::handshake::receipt::{
-	CountersignedReceipt, IssuedReceipt, PendingReceipt, ReceiptApprover, SessionObserver, StoredReceipt,
+	CountersignedReceipt, IssuedReceipt, PendingReceipt, ReceiptApprover, SessionObserver, Settlement, StoredReceipt,
 };
-use crate::transport::handshake::schedule::{
-	Agreed, HandshakeVerifyingKey, PeerEphemeral, PeerIdentity, PeerPoint, Terms,
-};
+use crate::transport::handshake::schedule::{Agreed, PeerEphemeral, PeerIdentity, PeerPoint, Terms};
 use crate::transport::handshake::{
 	Arc, ClientHandshakeProtocol, EstablishedSession, HandshakeMessage, HandshakeProvider, HandshakeSecret,
 	ServerHandshakeProtocol,
@@ -170,7 +170,7 @@ pub enum ClientPhase<F: ClientFlow<P>, P: HandshakeProvider> {
 	ClosingSent {
 		/// What the handshake agreed. It is boxed, so a phase move copies a
 		/// pointer.
-		agreed: Box<Agreed<P, AdmittedServer>>,
+		agreed: Box<Agreed<P, AdmittedServer<P::Curve>>>,
 	},
 	/// Completion took everything the handshake agreed.
 	Completed,
@@ -181,7 +181,7 @@ pub enum ClientPhase<F: ClientFlow<P>, P: HandshakeProvider> {
 impl<F: ClientFlow<P>, P: HandshakeProvider> sealed::Sealed for ClientPhase<F, P> {}
 
 impl<F: ClientFlow<P>, P: HandshakeProvider> PhaseView<P> for ClientPhase<F, P> {
-	type Peer = AdmittedServer;
+	type Peer = AdmittedServer<P::Curve>;
 
 	fn spent() -> Self {
 		Self::Spent
@@ -301,7 +301,7 @@ pub enum ServerPhase<F: ServerFlow<P>, P: HandshakeProvider> {
 	ClosingReceived {
 		/// What the handshake agreed. It is boxed, so a phase move copies a
 		/// pointer.
-		agreed: Box<Agreed<P, AdmittedPeer>>,
+		agreed: Box<Agreed<P, AdmittedPeer<P::Curve>>>,
 	},
 	/// Completion took everything the handshake agreed.
 	Completed,
@@ -312,7 +312,7 @@ pub enum ServerPhase<F: ServerFlow<P>, P: HandshakeProvider> {
 impl<F: ServerFlow<P>, P: HandshakeProvider> sealed::Sealed for ServerPhase<F, P> {}
 
 impl<F: ServerFlow<P>, P: HandshakeProvider> PhaseView<P> for ServerPhase<F, P> {
-	type Peer = AdmittedPeer;
+	type Peer = AdmittedPeer<P::Curve>;
 
 	fn spent() -> Self {
 		Self::Spent
@@ -612,7 +612,7 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> Handshake<Client, F, P> {
 		let server = F::server_trust(settings).admit_named(server)?;
 
 		// 4. Verify the reply signature over the transcript hash, under the admitted server's key.
-		let static_key = server.certificate().verifying_key::<P::Curve>()?;
+		let static_key = *server.identity().key();
 		F::verify_reply(&reply, P::VerifyingKey::from(static_key), &transcript_hash)?;
 
 		// 5. Admit the profile selection against the offer.
@@ -630,7 +630,7 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> Handshake<Client, F, P> {
 
 		// 8. Verify the session receipt against the accept, which fails closed on a mismatch.
 		let accept = transport_accept.as_ref();
-		let pending_receipt = PendingReceipt::verify::<P>(receipt, accept, &transcript_hash, server.certificate())?;
+		let pending_receipt = PendingReceipt::verify::<P>(receipt, accept, &transcript_hash, server.identity())?;
 
 		// 9. Refuse a server that demands an identity this client does not
 		//    hold. The refusal runs before the approver is asked and before
@@ -653,8 +653,8 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> Handshake<Client, F, P> {
 
 		// 11. Derive the handshake secret, seal the countersignature, and build
 		//     the closing up to its possession proof. The step awaits nothing.
-		let certificate = server.certificate();
-		let bound = Self::close(settings, pending, reply, &server_ephemeral, countersigned, &terms, certificate)?;
+		let identity = server.identity();
+		let bound = Self::close(settings, pending, reply, &server_ephemeral, countersigned, &terms, identity)?;
 		let BoundClosing { secret, receipt, binding } = bound;
 		let ClosingBinding { proof, draft } = binding;
 
@@ -695,7 +695,7 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> Handshake<Client, F, P> {
 		server_ephemeral: &PeerPoint<P::Curve>,
 		countersigned: Option<CountersignedReceipt>,
 		terms: &Terms<P>,
-		server: &Certificate,
+		server: &PeerCertificate<P::Curve>,
 	) -> Result<BoundClosing<'a, F, P>, HandshakeError> {
 		// 1. Derive the handshake secret from the base secret and the ephemeral-ephemeral agreement.
 		let (secret, agreed) = F::agree(pending, server_ephemeral, terms.kdf_salt(), &mut OsRng)?;
@@ -891,7 +891,8 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> Handshake<Server, F, P> {
 		// 6. Open and verify the receipt countersignature, and settle.
 		let authorizer = config.transport_authorizer.as_deref();
 		let observer = config.session_observer.as_deref();
-		let settling = IssuedReceipt::settle_issued(issued, receipt_ack, &secret, &terms, &peer, authorizer, observer);
+		let settlement = Settlement { secret: &secret, terms: &terms, peer: &peer, authorizer, observer };
+		let settling = IssuedReceipt::settle_issued(issued, receipt_ack, settlement);
 		let receipt = settling.await?;
 
 		// 7. Keep what the handshake agreed.

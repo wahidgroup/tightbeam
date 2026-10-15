@@ -204,7 +204,7 @@ impl HandshakeAgreement<Secp256k1> for FixedAgreement<'_> {
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 fn admitted(point: &PublicKey<Secp256k1>) -> PeerPoint<Secp256k1> {
 	let sec1 = point.to_encoded_point(true);
-	let anonymous = ClientStatic::<Secp256k1>::of(None).expect("an absent certificate holds no key");
+	let anonymous = ClientStatic::<Secp256k1>::of(None);
 	let parsed = anonymous.distinct_ephemeral(sec1.as_bytes());
 	let distinct = parsed.expect("a public key encodes a point");
 	distinct.expect("no static key equals it")

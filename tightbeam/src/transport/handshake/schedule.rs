@@ -78,6 +78,8 @@ use crate::random::{generate_nonce, CryptoRngCore};
 use crate::transport::handshake::error::HandshakeError;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::negotiation::{MuxSettings, RunnableProfile};
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::transport::handshake::peer::PeerCertificate;
 #[cfg(all(
 	feature = "transport-multiplex",
 	any(feature = "transport-cms", feature = "transport-hpke")
@@ -767,7 +769,7 @@ impl<C: HandshakeCurve> PeerEphemeral<C> for PublicKey<C> {
 /// The static key of the certificate a client offers, as the key the client
 /// ephemeral must differ from.
 ///
-/// [`Self::of`] is its one constructor and reads the offered certificate, so
+/// [`Self::of`] is its one constructor and reads the offered identity, so
 /// the question of whether the client holds a static key is answered where
 /// the certificate is. An anonymous client holds none, and every point of the
 /// curve is distinct for it.
@@ -776,15 +778,10 @@ pub(crate) struct ClientStatic<C: CurveArithmetic>(Option<PublicKey<C>>);
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl<C: HandshakeCurve> ClientStatic<C> {
-	/// The static key of `offered`, the certificate a client presents.
-	///
-	/// # Errors
-	///
-	/// - [`HandshakeError::InvalidPublicKey`] -- the certificate key bytes fail SEC1 decoding.
-	pub(crate) fn of(offered: Option<&Certificate>) -> Result<Self, HandshakeError> {
-		let parsed = offered.map(|certificate| certificate.verifying_key::<C>());
-		let static_key = parsed.transpose()?;
-		Ok(Self(static_key))
+	/// The static key of `offered`, the identity a client presents.
+	pub(crate) fn of(offered: Option<&PeerCertificate<C>>) -> Self {
+		let static_key = offered.map(|identity| *identity.key());
+		Self(static_key)
 	}
 }
 
@@ -1102,17 +1099,14 @@ impl HandshakeVerifyingKey for Certificate {
 
 #[cfg(test)]
 mod tests {
-	use std::error::Error;
-
 	use super::*;
 	#[cfg(feature = "transport-multiplex")]
 	use crate::crypto::hash::Sha3_256;
 	use crate::crypto::profiles::{AeadProvider, DefaultCryptoProvider};
 	use crate::crypto::secret::ToInsecure;
 	use crate::crypto::sign::ecdsa::k256::Secp256k1;
-	use crate::der::asn1::BitString;
 	use crate::random::OsRng;
-	use crate::transport::handshake::tests::{create_test_certificate, off_curve_point};
+	use crate::transport::handshake::tests::create_test_certificate;
 
 	/// A base secret of `fill` bytes.
 	fn base_secret(fill: u8) -> BaseSecret {
@@ -1149,10 +1143,10 @@ mod tests {
 	/// built from that certificate.
 	fn holder() -> (PublicKey<Secp256k1>, ClientStatic<Secp256k1>) {
 		let client = create_test_certificate();
-		let static_key = client.certificate.verifying_key::<Secp256k1>();
-		let client_static = ClientStatic::of(Some(&client.certificate));
-		let static_key = static_key.expect("the test certificate holds a point");
-		(static_key, client_static.expect("the test certificate holds a point"))
+		let static_key = PublicKey::from(client.signing_key.verifying_key());
+		let identity = PeerCertificate::parse(client.certificate);
+		let identity = identity.expect("the test certificate holds a point");
+		(static_key, ClientStatic::of(Some(&identity)))
 	}
 
 	/// The negation of `key`, which shares its x-coordinate.
@@ -1167,7 +1161,7 @@ mod tests {
 	fn an_anonymous_client_ephemeral_is_admitted() -> Result<(), HandshakeError> {
 		let (key, _) = holder();
 		let point = key.to_encoded_point(true);
-		let anonymous = ClientStatic::<Secp256k1>::of(None)?;
+		let anonymous = ClientStatic::<Secp256k1>::of(None);
 
 		let admitted = anonymous.client_ephemeral(point.as_bytes())?;
 		assert_eq!(admitted.as_public_key(), &key);
@@ -1213,19 +1207,6 @@ mod tests {
 
 		let refused = static_key.server_ephemeral(point.as_bytes());
 		assert!(matches!(refused, Err(HandshakeError::ServerEphemeralIsStatic)));
-	}
-
-	/// The admission state reads the key of the offered certificate, so a
-	/// certificate whose key is off the curve yields none.
-	#[test]
-	fn a_certificate_whose_key_is_off_the_curve_yields_no_client_static() -> Result<(), Box<dyn Error>> {
-		let mut client = create_test_certificate();
-		let off_curve = BitString::from_bytes(&off_curve_point())?;
-		client.certificate.tbs_certificate.subject_public_key_info.subject_public_key = off_curve;
-
-		let refused = ClientStatic::<Secp256k1>::of(Some(&client.certificate));
-		assert!(matches!(refused, Err(HandshakeError::InvalidPublicKey(_))));
-		Ok(())
 	}
 
 	/// The handshake secret changes with the ephemeral-ephemeral output, so a

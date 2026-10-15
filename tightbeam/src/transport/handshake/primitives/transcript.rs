@@ -90,20 +90,21 @@ impl Transcript {
 			client_hello,
 			server_random,
 			server_ephemeral,
-			spki,
+			server_public_key,
 			security_accept_der,
 			client_cert_required,
 			transport_accept_der,
 		} = legs;
 		let demand = [u8::from(client_cert_required)];
 		let fixed = server_random.len() + server_ephemeral.len() + demand.len();
-		let len = client_hello.len() + fixed + spki.len() + security_accept_der.len() + transport_accept_der.len();
+		let accepts = security_accept_der.len() + transport_accept_der.len();
+		let len = client_hello.len() + fixed + server_public_key.len() + accepts;
 
 		let mut buffer = Vec::with_capacity(len);
 		buffer.extend_from_slice(client_hello);
 		buffer.extend_from_slice(server_random);
 		buffer.extend_from_slice(server_ephemeral);
-		buffer.extend_from_slice(spki);
+		buffer.extend_from_slice(server_public_key);
 		buffer.extend_from_slice(security_accept_der);
 		buffer.extend_from_slice(&demand);
 		buffer.extend_from_slice(transport_accept_der);
@@ -211,7 +212,7 @@ pub(crate) struct HpkeHandshakeLegs<'a> {
 	/// The compressed SEC1 server ephemeral public key.
 	pub(crate) server_ephemeral: &'a [u8; EC_PUBKEY_COMPRESSED_SIZE],
 	/// The raw `subjectPublicKey` bits of the server certificate.
-	pub(crate) spki: &'a [u8],
+	pub(crate) server_public_key: &'a [u8],
 	/// The DER of the security accept, empty when the server sent none.
 	pub(crate) security_accept_der: &'a [u8],
 	/// Whether the server demands a client certificate. It enters as one byte,
@@ -343,7 +344,7 @@ mod tests {
 			client_hello: b"client hello",
 			server_random: &[0x01u8; 32],
 			server_ephemeral,
-			spki: b"spki",
+			server_public_key: b"spki",
 			security_accept_der: b"accept",
 			client_cert_required: false,
 			transport_accept_der: b"",
@@ -433,7 +434,7 @@ mod tests {
 			client_hello: b"client hello",
 			server_random: &[0x11; 32],
 			server_ephemeral: &[0x22; EC_PUBKEY_COMPRESSED_SIZE],
-			spki: b"server spki",
+			server_public_key: b"server spki",
 			security_accept_der: b"security accept",
 			client_cert_required: true,
 			transport_accept_der: b"transport accept",

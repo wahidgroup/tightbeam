@@ -37,7 +37,7 @@ use crate::transport::handshake::flow::{
 	OpeningIntake, OpeningParts, ProofRequest, ReplyBinding, ReplyIntake, ReplyParts, ServerFlow,
 };
 use crate::transport::handshake::negotiation::{SecurityAccept, TransportAccept};
-use crate::transport::handshake::peer::{LearnedTrust, PossessionProof};
+use crate::transport::handshake::peer::{LearnedTrust, PeerCertificate, PossessionProof};
 use crate::transport::handshake::primitives::transcript::{HpkeHandshakeLegs, Transcript};
 use crate::transport::handshake::primitives::KdfSalt;
 use crate::transport::handshake::schedule::{
@@ -203,7 +203,7 @@ impl<P: HandshakeProvider> ClientFlow<P> for Hpke {
 			client_hello: &hello_der,
 			server_random: &server_random,
 			server_ephemeral: &server_ephemeral.to_byte_array::<EC_PUBKEY_COMPRESSED_SIZE>()?,
-			spki: certificate.verifying_key_bytes(),
+			server_public_key: certificate.verifying_key_bytes(),
 			security_accept_der: security_accept.as_ref().map(WireDer::der).unwrap_or_default(),
 			client_cert_required,
 			transport_accept_der: transport_accept.as_ref().map(WireDer::der).unwrap_or_default(),
@@ -262,7 +262,7 @@ impl<P: HandshakeProvider> ClientFlow<P> for Hpke {
 		agreed: Self::Agreed,
 		reply: Self::Reply,
 		settings: &'a Self::Settings,
-		parts: ClosingParts<'_>,
+		parts: ClosingParts<'_, P::Curve>,
 	) -> Result<ClosingBinding<'a, Self, P>, HandshakeError> {
 		// The base secret is read in place, so it is wiped where the box drops.
 		let HpkeAgreed { base, client_ephemeral } = agreed.as_ref();
@@ -286,7 +286,7 @@ impl<P: HandshakeProvider> ClientFlow<P> for Hpke {
 		let identity = settings.identity.as_ref();
 		let certificate = identity.map(ClientIdentity::certificate);
 		let aad = ClientKeyExchange::client_bound_aad(settings.aad_domain_tag, certificate)?;
-		let static_key = server.verifying_key::<P::Curve>()?;
+		let static_key = server.key();
 		let sealed = static_key.seal::<P::HpkeSuite>(TIGHTBEAM_HPKE_HANDSHAKE_INFO, &aad, &plaintext, None)?;
 		let encrypted_data = sealed.to_bytes();
 
@@ -500,7 +500,7 @@ impl<P: HandshakeProvider> ServerFlow<P> for Hpke {
 			client_hello: &opened.hello_der,
 			server_random: &server_random,
 			server_ephemeral: &server_ephemeral,
-			spki: settings.certificate.verifying_key_bytes(),
+			server_public_key: settings.certificate.verifying_key_bytes(),
 			security_accept_der: security_accept.der(),
 			client_cert_required,
 			transport_accept_der: transport_accept.as_ref().map(WireDer::der).unwrap_or_default(),
@@ -580,17 +580,19 @@ impl<P: HandshakeProvider> ServerFlow<P> for Hpke {
 		let message = HpkeMessage::<P::HpkeSuite>::from_bytes(encrypted_data.as_bytes())?;
 		let recipient = settings.certificate.verifying_key::<P::Curve>()?;
 
-		// 3. Read the static key of the offered certificate, and refuse an
-		//    encapsulated key that collapses into it. The encapsulated key is a
+		// 3. Parse the offered identity once, and refuse an encapsulated key
+		//    that collapses into its static key. The encapsulated key is a
 		//    client ephemeral as well: a client that seals under its static key
 		//    leaves the payload to the secrecy of that key.
-		let offered = client_certificate.as_ref();
-		let client_static = ClientStatic::of(offered)?;
+		let parsed = client_certificate.map(PeerCertificate::<P::Curve>::parse);
+		let identity = parsed.transpose()?;
+		let client_static = ClientStatic::of(identity.as_ref());
 		client_static.client_ephemeral_point(*message.encapsulated_key())?;
 
 		// 4. Build the associated data and the possession proof over the
 		//    offered certificate. A signature with no certificate binds no
 		//    certificate bytes, and admission refuses it unverified.
+		let offered = identity.as_ref().map(|identity| identity.certificate().as_ref());
 		let aad = ClientKeyExchange::client_bound_aad(settings.aad_domain_tag, offered)?;
 		let certificate_der = offered.map(Encode::to_der).transpose()?.unwrap_or_default();
 		let proof = client_signature.map(|signature| HpkePossession {
@@ -600,7 +602,7 @@ impl<P: HandshakeProvider> ServerFlow<P> for Hpke {
 		});
 
 		let closing = HpkeClosing { message, recipient, aad, client_static };
-		Ok(ClosingIntake { offered: client_certificate, proof, closing })
+		Ok(ClosingIntake { offered: identity, proof, closing })
 	}
 
 	fn settle<'a>(
@@ -714,7 +716,7 @@ mod tests {
 			client_hello,
 			server_random: &server_random,
 			server_ephemeral,
-			spki: server.certificate.verifying_key_bytes(),
+			server_public_key: server.certificate.verifying_key_bytes(),
 			security_accept_der: accept_der,
 			client_cert_required: false,
 			transport_accept_der: &[],
@@ -805,7 +807,7 @@ mod tests {
 
 	/// A client that offers no certificate, as the payload parse takes it.
 	fn anonymous() -> ClientStatic<Secp256k1> {
-		ClientStatic::of(None).expect("an absent certificate holds no key")
+		ClientStatic::of(None)
 	}
 
 	/// The DER of an `HpkeSessionPayload` that carries `base_key`,
@@ -1202,19 +1204,19 @@ mod tests {
 		let handshake = tunneled_handshake(&reply);
 		let random = handshake.server_random.to_32_byte_array()?;
 		let ephemeral = handshake.server_ephemeral.to_byte_array::<EC_PUBKEY_COMPRESSED_SIZE>()?;
-		let spki = identity.certificate.verifying_key_bytes();
+		let server_public_key = identity.certificate.verifying_key_bytes();
 		let legs = HpkeHandshakeLegs {
 			client_hello: &hello_der,
 			server_random: &random,
 			server_ephemeral: &ephemeral,
-			spki,
+			server_public_key,
 			security_accept_der: handshake.security_accept.as_ref().map(WireDer::der).unwrap_or_default(),
 			client_cert_required: handshake.client_cert_required,
 			transport_accept_der: handshake.transport_accept.as_ref().map(WireDer::der).unwrap_or_default(),
 		};
 
 		let transcript_hash = Transcript::hpke_handshake(legs).seal::<Sha3_256>()?;
-		let static_key = Secp256k1VerifyingKey::from_sec1_bytes(spki)?;
+		let static_key = Secp256k1VerifyingKey::from_sec1_bytes(server_public_key)?;
 		let signature = Secp256k1Signature::try_from(handshake.signature.as_bytes())?;
 
 		let verified = signature.verify_prehash(&static_key, transcript_hash);
