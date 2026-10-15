@@ -80,7 +80,7 @@ use crate::crypto::key::SigningKeyProvider;
 use crate::crypto::x509::{policy::CertificateValidation, CertificateSpec};
 use crate::policy::GatePolicy;
 use crate::trace::TraceCollector;
-use crate::transport::client::pool::PoolConfig;
+use crate::transport::client::PoolConfig;
 use crate::transport::handshake::PeerAuthentication;
 use crate::transport::state::ClientIdentity;
 use crate::transport::{Protocol, TightBeamAddress};

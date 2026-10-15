@@ -93,10 +93,6 @@ pub enum HandshakeError {
 	#[error("Unexpected handshake container for this step")]
 	UnexpectedContainer,
 
-	/// The server key is missing.
-	#[error("Missing server key")]
-	MissingServerKey,
-
 	/// No trust store or certificate validator is configured, so the handshake
 	/// refuses expiry-only peer certificate validation.
 	#[error("Trust store required: refusing expiry-only peer certificate validation")]
@@ -151,11 +147,6 @@ pub enum HandshakeError {
 	#[error("Settlement rejected: code {code}")]
 	SettlementRejected { code: u32 },
 
-	/// The approver's settlement answer exceeds the length prefix of its
-	/// encoding.
-	#[error("Settlement answer too large for the wire encoding")]
-	AnswerTooLarge,
-
 	/// The AEAD refused to seal or open the receipt acknowledgement under the
 	/// key the handshake secret derives. On the opening side the
 	/// acknowledgement was sealed under another handshake secret or altered
@@ -179,10 +170,6 @@ pub enum HandshakeError {
 	#[error("Handshake aborted by peer: {0:?}")]
 	AbortReceived(crate::transport::handshake::HandshakeAlert),
 
-	/// The handshake timed out.
-	#[error("Handshake timeout")]
-	Timeout,
-
 	/// The server selected no profile, or one that the client did not offer.
 	#[error("Server selected no profile, or one outside the client's offer")]
 	InvalidProfileSelection,
@@ -192,18 +179,9 @@ pub enum HandshakeError {
 	#[from]
 	NegotiationError(crate::transport::handshake::negotiation::NegotiationError),
 
-	/// Negotiation found no mutually supported profiles.
-	#[error("No mutually supported cryptographic profiles found")]
-	NoMutualProfiles,
-
 	/// The server has no supported profile configured, so it can select none.
 	#[error("No supported profiles configured on server")]
 	NoSupportedProfiles,
-
-	/// Profile negotiation is required, and the server has no profiles
-	/// configured.
-	#[error("Profile negotiation required but no profiles configured on server")]
-	NegotiationRequired,
 
 	/// An attribute holds more or fewer than one value.
 	#[error("Attribute must contain exactly one value")]
@@ -214,16 +192,6 @@ pub enum HandshakeError {
 	/// A required attribute is missing.
 	#[error("Required attribute missing")]
 	MissingAttribute,
-	/// The supported-curves list exceeds its cap. `count` is the number of
-	/// curves offered and `max` is the cap.
-	#[error("Too many supported curves: {count} exceeds cap of {max}")]
-	TooManySupportedCurves { count: usize, max: usize },
-	/// The nonce value is not a valid OCTET STRING.
-	#[error("Nonce value not valid OCTET STRING")]
-	InvalidNonceEncoding,
-	/// The nonce has the wrong length.
-	#[error("Nonce length mismatch: {0}")]
-	NonceLengthError(crate::error::ReceivedExpectedError<usize, usize>),
 	/// An OCTET STRING has the wrong length.
 	#[error("OCTET STRING length mismatch: {0}")]
 	OctetStringLengthError(crate::error::ReceivedExpectedError<usize, usize>),
@@ -237,24 +205,11 @@ pub enum HandshakeError {
 	#[error("Unknown alert code: {0:?}")]
 	UnknownAlertCode(u8),
 
-	/// The certificate is not yet valid.
-	#[error("Certificate not yet valid")]
-	CertificateNotYetValid,
-	/// The certificate has expired.
-	#[error("Certificate expired")]
-	CertificateExpired,
-	/// A certificate timestamp is invalid.
-	#[error("Invalid timestamp")]
-	InvalidTimestamp,
-
 	/// An HPKE operation failed.
 	#[cfg(feature = "hpke")]
 	#[error("HPKE operation failed: {0}")]
 	#[from]
 	HpkeError(crate::crypto::hpke::HpkeError),
-	/// The HPKE message carries no encrypted content.
-	#[error("Missing encrypted content in HPKE message")]
-	MissingEncryptedContent,
 	/// The decrypted HPKE payload has an invalid size.
 	#[error("Invalid decrypted payload size")]
 	InvalidDecryptedPayloadSize,
@@ -263,9 +218,6 @@ pub enum HandshakeError {
 	#[error("client_random mismatch - possible replay attack")]
 	ClientRandomMismatchReplay,
 
-	/// An ECDH operation failed during key agreement.
-	#[error("ECDH operation failed")]
-	EcdhFailed,
 	/// A KDF operation failed.
 	#[error("KDF operation failed: {0}")]
 	#[from]
@@ -274,22 +226,12 @@ pub enum HandshakeError {
 	/// and the actual key length in bytes.
 	#[error("Invalid key size: expected {expected}, got {received}")]
 	InvalidKeySize { expected: usize, received: usize },
-	/// A ciphertext is shorter than the minimum length. `minimum` and
-	/// `received` are the required and the actual length in bytes.
-	#[error("Ciphertext too short: {received} bytes (minimum {minimum} required)")]
-	CiphertextTooShort { minimum: usize, received: usize },
-	/// ASN.1 encoding failed during CMS key agreement (KARI).
-	#[error("ASN.1 encoding error: {0}")]
-	Asn1Error(der::Error),
 	/// The recipient index is invalid.
 	#[error("Invalid recipient index")]
 	InvalidRecipientIndex,
 	/// The KeyAgreeRecipientInfo carries no user keying material (UKM).
 	#[error("Missing UKM in KeyAgreeRecipientInfo")]
 	MissingUkm,
-	/// The originator public key failed to parse.
-	#[error("Failed to parse originator public key")]
-	InvalidOriginatorPublicKey,
 	/// The originator identifier type is unsupported.
 	#[error("Unsupported originator identifier type")]
 	UnsupportedOriginatorIdentifier,
@@ -334,8 +276,6 @@ impl HandshakeError {
 			| Self::SignatureVerificationFailed
 			| Self::MissingClientCertificate
 			| Self::ClientCertificateMismatch
-			| Self::CertificateNotYetValid
-			| Self::CertificateExpired
 			| Self::MutualAuthRequired => Some(events::SESSION_CERT_REJECTED),
 			_ => None,
 		}
@@ -374,7 +314,6 @@ impl From<HandshakeError> for crate::cms::builder::Error {
 		match err {
 			HandshakeError::CmsBuilderError(e) => e,
 			HandshakeError::DerError(e) => crate::cms::builder::Error::Asn1(e),
-			HandshakeError::Asn1Error(e) => crate::cms::builder::Error::Asn1(e),
 			HandshakeError::SpkiError(e) => crate::cms::builder::Error::PublicKey(e),
 			other => crate::cms::builder::Error::Builder(other.to_string()),
 		}

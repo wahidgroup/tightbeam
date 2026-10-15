@@ -766,22 +766,26 @@ impl<C: HandshakeCurve> PeerEphemeral<C> for PublicKey<C> {
 	}
 }
 
-/// The static key of the certificate a client offers, as the key the client
-/// ephemeral must differ from.
+/// The identity a client offers, whose static key every client ephemeral
+/// must differ from.
 ///
-/// [`Self::of`] is its one constructor and reads the offered identity, so
-/// the question of whether the client holds a static key is answered where
-/// the certificate is. An anonymous client holds none, and every point of the
-/// curve is distinct for it.
+/// One value carries the identity from the leg that reads it to admission,
+/// so admission reads the certificate the ephemeral check read.
+/// An anonymous client holds none, and every point of the curve is distinct
+/// for it.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-pub(crate) struct ClientStatic<C: CurveArithmetic>(Option<PublicKey<C>>);
+pub struct ClientStatic<C: CurveArithmetic>(Option<PeerCertificate<C>>);
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl<C: HandshakeCurve> ClientStatic<C> {
-	/// The static key of `offered`, the identity a client presents.
-	pub(crate) fn of(offered: Option<&PeerCertificate<C>>) -> Self {
-		let static_key = offered.map(|identity| *identity.key());
-		Self(static_key)
+	/// The identity `offered`, which a client presents, or none.
+	pub(crate) fn of(offered: Option<PeerCertificate<C>>) -> Self {
+		Self(offered)
+	}
+
+	/// The identity the client offered, when it offered one.
+	pub(crate) fn identity(&self) -> Option<&PeerCertificate<C>> {
+		self.0.as_ref()
 	}
 }
 
@@ -789,7 +793,7 @@ impl<C: HandshakeCurve> ClientStatic<C> {
 impl<C: HandshakeCurve> PeerEphemeral<C> for ClientStatic<C> {
 	fn distinct(&self, point: PublicKey<C>) -> Option<PeerPoint<C>> {
 		match &self.0 {
-			Some(static_key) => static_key.distinct(point),
+			Some(identity) => identity.key().distinct(point),
 			None => Some(PeerPoint(point)),
 		}
 	}
@@ -1146,7 +1150,7 @@ mod tests {
 		let static_key = PublicKey::from(client.signing_key.verifying_key());
 		let identity = PeerCertificate::parse(client.certificate);
 		let identity = identity.expect("the test certificate holds a point");
-		(static_key, ClientStatic::of(Some(&identity)))
+		(static_key, ClientStatic::of(Some(identity)))
 	}
 
 	/// The negation of `key`, which shares its x-coordinate.

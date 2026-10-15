@@ -5,13 +5,15 @@ use crate::transport::{MessageEmitter, Protocol, TransportResult};
 
 pub mod macros;
 
-pub mod builder;
-#[cfg(feature = "std")]
-pub mod pool;
+mod builder;
 
-pub use builder::{ClientBuilder, ClientPolicies};
 #[cfg(feature = "std")]
-pub use pool::{ConnectionBuilder, ConnectionPool, PoolConfig, PooledClient};
+mod pool;
+
+pub use builder::{ClientBuilder, ClientPolicies, DynGate, DynRestart};
+
+#[cfg(feature = "std")]
+pub use pool::{ConnectionBuilder, ConnectionPool, ConnectionPoolBuilder, PoolConfig, PooledClient};
 
 pub struct GenericClient<P: Protocol> {
 	transport: P::Transport,

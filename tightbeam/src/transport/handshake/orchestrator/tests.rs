@@ -11,9 +11,11 @@ use crate::asn1::OctetString;
 use crate::cms::enveloped_data::EnvelopedData;
 use crate::cms::signed_data::SignerInfo;
 use crate::crypto::aead::DecryptContent;
+use crate::crypto::hash::Sha3_256;
 use crate::crypto::profiles::SecurityProfileDesc;
 use crate::crypto::secret::ToInsecure;
-use crate::crypto::x509::policy::{DirectTrustValidator, ExpiryValidator};
+use crate::crypto::x509::error::CertificateValidationError::Expired;
+use crate::crypto::x509::policy::{DirectTrustValidator, ExpiryValidator, RuntimeCertificatePinning};
 use crate::der::Decode;
 use crate::oids::AES_128_GCM;
 use crate::transport::handshake::error::HandshakeError;
@@ -370,6 +372,46 @@ async fn a_mutual_server_refuses_a_refused_certificate<F: TestFlow>() -> Result<
 	Ok(())
 }
 
+/// A pin reads no validity period, so a mutual server reads it itself and
+/// refuses an expired certificate that its pin accepts.
+async fn a_mutual_server_refuses_an_expired_certificate_its_pin_accepts<F: TestFlow>() -> Result<(), Box<dyn Error>> {
+	let server_identity = create_test_certificate();
+	let client_identity = create_expired_test_certificate();
+	let pinned = [client_identity.certificate.to_owned()];
+	let pin = RuntimeCertificatePinning::<Sha3_256>::from_certificates(pinned)?;
+	let mut server_config = F::server(&server_identity);
+	server_config.peer_authentication = mutual_with(pin);
+
+	let mut client = Handshake::client(F::client(&server_identity.certificate, &client_identity));
+	let mut server = Handshake::server(server_config);
+
+	let reply = server.reply(client.start()?).await?;
+	let closing = client.respond(reply).await?;
+	let refusal = server.finish(closing).await;
+	assert!(matches!(refusal, Err(HandshakeError::CertificateValidationError(Expired))));
+	Ok(())
+}
+
+/// A mutual server reads the validity period before its validators, so an
+/// expired certificate that its pin also refuses is refused as expired.
+async fn a_mutual_server_reads_the_validity_period_before_its_validators<F: TestFlow>() -> Result<(), Box<dyn Error>> {
+	let server_identity = create_test_certificate();
+	let client_identity = create_expired_test_certificate();
+	let pinned = [create_test_certificate().certificate];
+	let pin = RuntimeCertificatePinning::<Sha3_256>::from_certificates(pinned)?;
+	let mut server_config = F::server(&server_identity);
+	server_config.peer_authentication = mutual_with(pin);
+
+	let mut client = Handshake::client(F::client(&server_identity.certificate, &client_identity));
+	let mut server = Handshake::server(server_config);
+
+	let reply = server.reply(client.start()?).await?;
+	let closing = client.respond(reply).await?;
+	let refusal = server.finish(closing).await;
+	assert!(matches!(refusal, Err(HandshakeError::CertificateValidationError(Expired))));
+	Ok(())
+}
+
 /// A server takes the first profile it runs that the client also offered,
 /// and both sides fix that profile.
 async fn both_sides_fix_the_offered_profile_the_server_runs<F: TestFlow>() -> Result<(), Box<dyn Error>> {
@@ -489,6 +531,8 @@ over_each_flow! {
 	an_anonymous_server_records_no_peer,
 	a_mutual_server_records_the_accepted_peer,
 	a_mutual_server_refuses_a_refused_certificate,
+	a_mutual_server_refuses_an_expired_certificate_its_pin_accepts,
+	a_mutual_server_reads_the_validity_period_before_its_validators,
 	both_sides_fix_the_offered_profile_the_server_runs,
 	a_server_refuses_an_offer_that_names_no_profile_it_runs,
 	multiplexing_negotiates_when_offered_and_enabled,

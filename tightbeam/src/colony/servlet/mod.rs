@@ -23,7 +23,7 @@ pub mod runtime;
 pub mod tracking;
 
 pub use config::{
-	AcceptState, Cleartext, NoCertificate, ServletAccept, ServletConfig, ServletConfigBuilder, WithCertificate,
+	AcceptState, Cleartext, NoAcceptState, ServletAccept, ServletConfig, ServletConfigBuilder, WithCertificate,
 };
 pub use context::{ServletContext, WorkerBox, WorkerBoxStartFuture};
 pub use runtime::ServletRuntime;

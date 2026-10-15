@@ -1,8 +1,8 @@
-error[E0277]: the trait bound `NoCertificate: AcceptState<DefaultCryptoProvider>` is not satisfied
-  --> tests/compile/servlet_config_unnamed_accept.rs:13:64
+error[E0277]: the trait bound `NoAcceptState: AcceptState<DefaultCryptoProvider>` is not satisfied
+  --> tests/compile/servlet_config_no_accept_state.rs:13:64
    |
 13 |     let _config = ServletConfig::<TokioListener, Ping>::builder().build();
-   |                                                                   ^^^^^ the trait `AcceptState<DefaultCryptoProvider>` is not implemented for `NoCertificate`
+   |                                                                   ^^^^^ the trait `AcceptState<DefaultCryptoProvider>` is not implemented for `NoAcceptState`
    |
 help: the following other types implement trait `AcceptState<C>`
   --> src/colony/servlet/config.rs
@@ -21,7 +21,7 @@ note: required by a bound in `ServletConfigBuilder::<P, M, C, Env, A>::build`
    |            ^^^^^^^^^^^^^^ required by this bound in `ServletConfigBuilder::<P, M, C, Env, A>::build`
 
 error[E0599]: no function or associated item named `default` found for struct `ServletConfig<P, M, C, Env>` in the current scope
-  --> tests/compile/servlet_config_unnamed_accept.rs:16:68
+  --> tests/compile/servlet_config_no_accept_state.rs:16:68
    |
 16 |     let _unnamed: ServletConfig<TokioListener, Ping> = ServletConfig::default();
    |                                                                       ^^^^^^^ function or associated item not found in `ServletConfig<_, _, _, _>`

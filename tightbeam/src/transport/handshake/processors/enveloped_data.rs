@@ -175,9 +175,8 @@ mod tests {
 		use crate::der::asn1::{ObjectIdentifier, OctetStringRef};
 		use crate::spki::SubjectPublicKeyInfoOwned;
 		use crate::transport::handshake::attributes::HandshakeAttribute;
-		use crate::transport::handshake::builders::enveloped_data::TightBeamEnvelopedDataBuilder;
-		use crate::transport::handshake::builders::kari::TightBeamKariBuilder;
-		use crate::transport::handshake::processors::kari::TightBeamKariRecipient;
+		use crate::transport::handshake::builders::{TightBeamEnvelopedDataBuilder, TightBeamKariBuilder};
+		use crate::transport::handshake::processors::TightBeamKariRecipient;
 		use crate::transport::handshake::tests::{
 			create_test_key_enc_alg, create_test_keypair, create_test_recipient_id, create_test_ukm,
 		};

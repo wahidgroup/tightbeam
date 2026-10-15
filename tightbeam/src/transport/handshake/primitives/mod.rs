@@ -6,17 +6,16 @@
 //! - Transcript hashing utilities
 //! - Prekey bundle ASN.1 structures
 
-pub mod kdf;
-pub mod transcript;
+mod kdf;
+pub(crate) mod transcript;
 
-/// UNSTABLE: PQXDH prekey structures. No orchestrator consumes them yet.
-/// Gated behind `unstable-pqxdh` until an end-to-end protocol exists.
+// The prekey structures stay UNSTABLE while no handshake protocol consumes
+// them.
 #[cfg(feature = "unstable-pqxdh")]
-#[doc(hidden)]
-pub mod prekeys;
+mod prekeys;
 
 pub use kdf::{kdf_chain, multi_input_kdf, KdfInfo, KdfSalt, KdfStage};
-pub use transcript::transcript_hash;
+pub use transcript::{transcript_hash, TRANSCRIPT_HASH_LEN};
 
 #[cfg(any(
 	feature = "transport-hpke",

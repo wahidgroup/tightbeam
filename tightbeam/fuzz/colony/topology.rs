@@ -19,7 +19,7 @@ use tightbeam::crypto::x509::Certificate;
 use tightbeam::hive;
 use tightbeam::policy::GatePolicy;
 use tightbeam::trace::TraceCollector;
-use tightbeam::transport::client::pool::PoolConfig;
+use tightbeam::transport::client::PoolConfig;
 use tightbeam::transport::handshake::negotiation::TransportOffer;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::urn::Urn;

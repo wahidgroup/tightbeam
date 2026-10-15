@@ -1594,10 +1594,12 @@ Init -> KeyExchangeReceived -> ServerFinishedSent -> ClientFinishedReceived -> C
 **Transcript hash:**
 
 ```text
-transcript = ClientHello || server_random || server_ephemeral || server_spki
+transcript = ClientHello || server_random || server_ephemeral || server_public_key
              || SecurityAccept || client_cert_required || TransportAccept
 transcript_hash = SHA3-256(transcript)
 ```
+
+The `server_public_key` leg is the raw `subjectPublicKey` bits of the server certificate.
 
 The transcript hash binds the handshake messages. It blocks reordering, profile downgrade, and undetected man-in-the-middle edits of the transcript. The `client_cert_required` leg is one byte, so a stripped certificate demand changes the hash.
 

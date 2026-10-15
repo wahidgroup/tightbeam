@@ -398,7 +398,8 @@ mod tests {
 		server: &TestCertificate,
 	) -> Result<Option<PendingReceipt>, HandshakeError> {
 		let accept = budget_accept();
-		let identity = PeerCertificate::parse(server.certificate.clone())?;
+		let identity = PeerCertificate::parse(server.certificate.clone());
+		let identity = identity.expect("the test certificate holds a point");
 		PendingReceipt::verify::<DefaultCryptoProvider>(Some(artifact), Some(&accept), &TRANSCRIPT, &identity)
 	}
 

@@ -42,7 +42,11 @@ pub struct ClientPolicies {
 	timeout: Option<Duration>,
 }
 
-pub struct DynRestart(pub Box<dyn RestartPolicy + Send + Sync>);
+/// A restart policy the client policies hold behind one box.
+pub struct DynRestart(
+	/// The policy every restart decision delegates to.
+	pub Box<dyn RestartPolicy + Send + Sync>,
+);
 
 impl CoreRetryPolicy for DynRestart {
 	fn max_attempts(&self) -> usize {
@@ -60,7 +64,11 @@ impl RestartPolicy for DynRestart {
 	}
 }
 
-pub struct DynGate(pub Arc<dyn GatePolicy + Send + Sync>);
+/// A gate policy the client policies hold behind one shared pointer.
+pub struct DynGate(
+	/// The policy every gate decision delegates to.
+	pub Arc<dyn GatePolicy + Send + Sync>,
+);
 impl GatePolicy for DynGate {
 	fn evaluate(&self, message: Option<&Frame>, session: &SessionContext) -> TransitStatus {
 		self.0.evaluate(message, session)

@@ -37,7 +37,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::constants::DEFAULT_BACKPRESSURE_THRESHOLD_BPS;
 use crate::trace::TraceCollector;
-use crate::transport::client::pool::PoolConfig;
+use crate::transport::client::PoolConfig;
 use crate::transport::multiplex::{RequestSink, StreamBody};
 use crate::transport::policy::CoreRetryPolicy;
 use crate::transport::state::ClientIdentity;

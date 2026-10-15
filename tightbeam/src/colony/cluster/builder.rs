@@ -43,7 +43,7 @@ use super::{
 };
 use crate::colony::common::{ColonyNamespace, LoadBalancer, StochasticForager};
 use crate::policy::GatePolicy;
-use crate::transport::client::pool::PoolConfig;
+use crate::transport::client::PoolConfig;
 use crate::utils::time::{Clock, SystemClock};
 
 use crate::colony::cluster::{

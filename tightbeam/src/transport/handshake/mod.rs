@@ -173,13 +173,13 @@ pub(crate) use std::sync::Arc;
 
 mod attributes;
 mod error;
+mod peer;
+mod schedule;
+
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 mod flow;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 mod orchestrator;
-mod peer;
-mod schedule;
-
 #[cfg(test)]
 pub(crate) mod tests;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -198,8 +198,14 @@ pub mod processors;
 
 pub use crate::crypto::aead::DirectionalCiphers;
 pub use attributes::HandshakeAttribute;
-use attributes::HandshakeAttributes;
 pub use error::HandshakeError;
+pub use peer::PeerAuthentication;
+pub use schedule::EpochMaterials;
+
+#[cfg(feature = "transport-cms")]
+pub use builders::{KariBuilderError, TightBeamKariBuilder};
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+pub use flow::{ClientFlow, ServerFlow};
 #[cfg(feature = "transport-cms")]
 pub use flow::{Cms, CmsClientSettings, CmsServerSettings};
 #[cfg(feature = "transport-hpke")]
@@ -208,35 +214,26 @@ pub use flow::{Hpke, HpkeClientSettings, HpkeServerSettings};
 pub use negotiation::{ProfilePolicy, SupportedProfiles};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub use orchestrator::{Client, ClientConfig, Handshake, HandshakePhase, Server, ServerConfig};
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+pub(crate) use peer::AdmittedPeer;
 #[cfg(feature = "transport-hpke")]
 pub use peer::LearnedTrust;
-pub use peer::PeerAuthentication;
 #[cfg(feature = "transport-cms")]
 pub use peer::ProvisionedTrust;
-pub use schedule::EpochMaterials;
+#[cfg(feature = "transport-cms")]
+pub use processors::{TightBeamEnvelopedDataProcessor, TightBeamKariRecipient};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub use schedule::HandshakeSecret;
 #[cfg(all(
 	feature = "transport-multiplex",
 	any(feature = "transport-cms", feature = "transport-hpke")
 ))]
-pub(crate) use schedule::{CompressedPoint, EpochSecret, PeerEphemeral};
-
-#[cfg(feature = "transport-cms")]
-pub use builders::{KariBuilderError, TightBeamKariBuilder};
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-pub(crate) use flow::ServerFlow;
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-pub(crate) use peer::AdmittedPeer;
-#[cfg(feature = "transport-cms")]
-pub use processors::{TightBeamEnvelopedDataProcessor, TightBeamKariRecipient};
+pub(crate) use schedule::HandshakeVerifyingKey;
 #[cfg(all(
 	feature = "transport-multiplex",
 	any(feature = "transport-cms", feature = "transport-hpke")
 ))]
-pub(crate) use schedule::HandshakeVerifyingKey;
-#[cfg(feature = "transport-hpke")]
-use schedule::KeyConfirmation;
+pub(crate) use schedule::{CompressedPoint, EpochSecret, PeerEphemeral};
 #[cfg(all(
 	feature = "transport-multiplex",
 	any(feature = "transport-cms", feature = "transport-hpke")
@@ -266,9 +263,12 @@ use crate::transport::wire_der::WireDer;
 use crate::utils::marker::{MaybeSend, MaybeSendFuture};
 use crate::x509::Certificate;
 use crate::Beamable;
+use attributes::HandshakeAttributes;
 
 #[cfg(feature = "transport-hpke")]
 use crate::der::asn1::OctetStringRef;
+#[cfg(feature = "transport-hpke")]
+use schedule::KeyConfirmation;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 mod transport {

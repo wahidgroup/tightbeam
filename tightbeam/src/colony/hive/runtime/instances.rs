@@ -121,7 +121,7 @@ mod tests {
 	use crate::colony::hive::{HashMapRegistry, HiveContext, ServletBox, ServletInfo, SpawnerFn};
 	use crate::router::RouterError;
 	use crate::testing::TestMessage;
-	use crate::transport::client::pool::{ConnectionBuilder, ConnectionPool};
+	use crate::transport::client::{ConnectionBuilder, ConnectionPool};
 	use crate::transport::TokioListener;
 	use crate::{encode, Frame};
 
