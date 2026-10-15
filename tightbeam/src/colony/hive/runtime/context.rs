@@ -10,7 +10,7 @@ use crate::colony::hive::{
 };
 use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::router::RouterError;
-use crate::transport::client::pool::ConnectionPool;
+use crate::transport::client::ConnectionPool;
 use crate::transport::multiplex::MuxConnector;
 use crate::transport::policy::PolicyConfig;
 use crate::transport::{MessageCollector, MessageEmitter, PersistentConnection, Protocol};

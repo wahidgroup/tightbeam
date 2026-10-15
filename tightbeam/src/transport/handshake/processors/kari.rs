@@ -163,7 +163,7 @@ mod tests {
 		use crate::oids::AES_256_WRAP;
 		use crate::random::{generate_nonce, OsRng};
 		use crate::spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoOwned};
-		use crate::transport::handshake::builders::kari::TightBeamKariBuilder;
+		use crate::transport::handshake::builders::TightBeamKariBuilder;
 
 		/// Unwrap the KARI variant a [`TightBeamKariBuilder`] must produce.
 		fn open_kari(recipient_info: RecipientInfo) -> KeyAgreeRecipientInfo {

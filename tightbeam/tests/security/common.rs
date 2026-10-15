@@ -27,8 +27,8 @@ use tightbeam::{
 	testing::error::{FdrConfigError, TestingError},
 	transport::handshake::{
 		negotiation::{NoStrengthFloor, ProfilePolicy, ProfileStrengthPolicy, SecurityOffer},
-		Client, ClientHandshakeProtocol, Handshake, HandshakeError, HandshakeMessage, HandshakeProvider, Hpke, Server,
-		ServerHandshakeProtocol,
+		Client, ClientFlow, ClientHandshakeProtocol, Handshake, HandshakeMessage, HandshakeProvider, Hpke, Server,
+		ServerFlow, ServerHandshakeProtocol,
 	},
 	transport::wire_der::WireDer,
 	TightBeamError,
@@ -648,17 +648,9 @@ const CMS_FLOW: &[FlowStep] = &[
 
 /// A handshake protocol the harness runs sessions of, under provider `P`.
 ///
-/// The library's flow markers implement it. The library keeps the traits that
-/// bound [`Handshake`] over a flow private, so a test cannot name
-/// `Handshake<Client, F, P>` for a generic `F`. A flow names its two handshakes
-/// here, and [`Session`] drives them through the protocol traits that both
-/// implement.
-pub trait SessionFlow<P: HandshakeProvider> {
-	/// The client handshake, `Handshake<Client, Self, P>`.
-	type Client: ClientHandshakeProtocol<Error = HandshakeError>;
-	/// The server handshake, `Handshake<Server, Self, P>`.
-	type Server: ServerHandshakeProtocol<Error = HandshakeError>;
-
+/// The library's flow markers implement it, and [`Session`] drives the two
+/// handshakes it builds.
+pub trait SessionFlow<P: HandshakeProvider>: ClientFlow<P> + ServerFlow<P> {
 	/// The backend this flow belongs to.
 	const BACKEND: HandshakeBackendKind;
 	/// The ordered steps this flow exchanges.
@@ -666,7 +658,11 @@ pub trait SessionFlow<P: HandshakeProvider> {
 
 	/// A client that admits the server of `materials`, sends `offer`, and
 	/// admits the selection under `policy`.
-	fn client(materials: &ServerMaterials, offer: SecurityOffer, policy: ProfilePolicy<P>) -> Self::Client;
+	fn client(
+		materials: &ServerMaterials,
+		offer: SecurityOffer,
+		policy: ProfilePolicy<P>,
+	) -> Handshake<Client, Self, P>;
 
 	/// An anonymous-client server over `materials` that runs `profiles` and
 	/// chooses among them under `policy`.
@@ -674,17 +670,18 @@ pub trait SessionFlow<P: HandshakeProvider> {
 		materials: &ServerMaterials,
 		profiles: Vec<SecurityProfileDesc>,
 		policy: ProfilePolicy<P>,
-	) -> Self::Server;
+	) -> Handshake<Server, Self, P>;
 }
 
 impl<P: HandshakeProvider> SessionFlow<P> for Hpke {
-	type Client = Handshake<Client, Hpke, P>;
-	type Server = Handshake<Server, Hpke, P>;
-
 	const BACKEND: HandshakeBackendKind = HandshakeBackendKind::Hpke;
 	const STEPS: &'static [FlowStep] = HPKE_FLOW;
 
-	fn client(materials: &ServerMaterials, offer: SecurityOffer, policy: ProfilePolicy<P>) -> Self::Client {
+	fn client(
+		materials: &ServerMaterials,
+		offer: SecurityOffer,
+		policy: ProfilePolicy<P>,
+	) -> Handshake<Client, Self, P> {
 		let mut config = hpke_client_config(pinning_validator(&materials.certificate));
 		config.security_offer = Some(offer);
 		config.profiles = policy;
@@ -695,7 +692,7 @@ impl<P: HandshakeProvider> SessionFlow<P> for Hpke {
 		materials: &ServerMaterials,
 		profiles: Vec<SecurityProfileDesc>,
 		policy: ProfilePolicy<P>,
-	) -> Self::Server {
+	) -> Handshake<Server, Self, P> {
 		let mut config = hpke_server_config(materials, profiles);
 		config.policy = policy;
 		Handshake::server(config)
@@ -704,14 +701,15 @@ impl<P: HandshakeProvider> SessionFlow<P> for Hpke {
 
 #[cfg(feature = "transport-cms")]
 impl<P: HandshakeProvider> SessionFlow<P> for Cms {
-	type Client = Handshake<Client, Cms, P>;
-	type Server = Handshake<Server, Cms, P>;
-
 	const BACKEND: HandshakeBackendKind = HandshakeBackendKind::Cms;
 	const STEPS: &'static [FlowStep] = CMS_FLOW;
 
 	/// The client pins the server certificate and presents a fresh identity.
-	fn client(materials: &ServerMaterials, offer: SecurityOffer, policy: ProfilePolicy<P>) -> Self::Client {
+	fn client(
+		materials: &ServerMaterials,
+		offer: SecurityOffer,
+		policy: ProfilePolicy<P>,
+	) -> Handshake<Client, Self, P> {
 		let client_materials = ClientMaterials::generate();
 		let trust_store = pinning_trust_store(&materials.certificate)
 			.expect("a trust store builds from the generated server certificate");
@@ -730,7 +728,7 @@ impl<P: HandshakeProvider> SessionFlow<P> for Cms {
 		materials: &ServerMaterials,
 		profiles: Vec<SecurityProfileDesc>,
 		policy: ProfilePolicy<P>,
-	) -> Self::Server {
+	) -> Handshake<Server, Self, P> {
 		let mut config = cms_server_config(materials, profiles);
 		config.policy = policy;
 		Handshake::server(config)
@@ -739,8 +737,8 @@ impl<P: HandshakeProvider> SessionFlow<P> for Cms {
 
 /// One handshake of flow `F` under provider `P`, with both of its endpoints.
 pub struct Session<F: SessionFlow<P>, P: HandshakeProvider> {
-	client: F::Client,
-	server: F::Server,
+	client: Handshake<Client, F, P>,
+	server: Handshake<Server, F, P>,
 }
 
 impl<F: SessionFlow<P>, P: HandshakeProvider> Session<F, P> {
@@ -775,7 +773,10 @@ impl<F: SessionFlow<P>, P: HandshakeProvider> HandshakeFlow for Session<F, P> {
 	}
 
 	fn open(&mut self) -> FlowFuture<'_, Vec<u8>> {
-		Box::pin(async move { Ok(self.client.start().await?.der().to_vec()) })
+		Box::pin(async move {
+			let opening = ClientHandshakeProtocol::start(&mut self.client).await?;
+			Ok(opening.der().to_vec())
+		})
 	}
 
 	fn advance<'a>(

@@ -41,8 +41,8 @@ use crate::transport::handshake::attributes::{AttributePayload, HandshakeAttribu
 use crate::transport::handshake::builders::{TightBeamEnvelopedDataBuilder, TightBeamKariBuilder};
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::flow::{
-	sealed, ClientFlow, ClosingBinding, ClosingIntake, ClosingOpened, ClosingParts, HandshakeFlow, Opened,
-	OpeningIntake, OpeningParts, ProofRequest, ReplyBinding, ReplyIntake, ReplyParts, ServerFlow,
+	sealed, ClientLegs, ClosingBinding, ClosingIntake, ClosingOpened, ClosingParts, HandshakeFlow, Opened,
+	OpeningIntake, OpeningParts, ProofRequest, ReplyBinding, ReplyIntake, ReplyParts, ServerLegs,
 };
 use crate::transport::handshake::kari::{Kek, OriginatorKey};
 use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer, TransportAccept, TransportOffer};
@@ -293,7 +293,7 @@ impl<T> ReceivedAttribute<T> {
 	}
 }
 
-impl<P: HandshakeProvider> ClientFlow<P> for Cms {
+impl<P: HandshakeProvider> ClientLegs<P> for Cms {
 	type Settings = CmsClientSettings<P>;
 	type Trust = ProvisionedTrust;
 	type Opening = CmsOpening<P::Curve>;
@@ -509,7 +509,7 @@ pub struct CmsOpened<C: HandshakeCurve> {
 	/// The transcript, open over the key exchange.
 	transcript: Transcript,
 	/// The client identity the key exchange carried, with its key.
-	bound: Option<PeerCertificate<C>>,
+	client_static: ClientStatic<C>,
 }
 
 /// A server Finished that awaits its signature and its receipt.
@@ -526,7 +526,7 @@ pub struct CmsServerPending<C: HandshakeCurve> {
 	secret: HandshakeSecret,
 	/// The client identity the key exchange bound into the transcript, whose
 	/// certificate the client Finished must embed unchanged.
-	bound: Option<PeerCertificate<C>>,
+	client_static: ClientStatic<C>,
 }
 
 /// What a client Finished carries beyond its signature.
@@ -535,6 +535,8 @@ pub struct CmsClosing {
 	sealed_ack: Option<Vec<u8>>,
 	/// The key-confirmation tag of the client.
 	confirmation: KeyConfirmation,
+	/// The handshake secret, derived when the server Finished was built.
+	secret: HandshakeSecret,
 }
 
 /// The CMS client Finished as the proof that the key of its embedded
@@ -595,7 +597,7 @@ impl ClientFinished for SignedData {
 	}
 }
 
-impl<P: HandshakeProvider> ServerFlow<P> for Cms {
+impl<P: HandshakeProvider> ServerLegs<P> for Cms {
 	type Settings = CmsServerSettings;
 	type Sealed = CmsSealed;
 	type Opened = Box<CmsOpened<P::Curve>>;
@@ -649,10 +651,10 @@ impl<P: HandshakeProvider> ServerFlow<P> for Cms {
 
 			// 2. Parse the offered identity once, then the originator key. A
 			//    malformed, off-curve, or identity point is refused here, ahead
-			//    of the agreement, and so is the static key of the identity.
+			//    of the agreement, and so is the offered static key.
 			let parsed = bound.map(PeerCertificate::<P::Curve>::parse);
-			let bound = parsed.transpose()?;
-			let client_static = ClientStatic::of(bound.as_ref());
+			let identity = parsed.transpose()?;
+			let client_static = ClientStatic::of(identity);
 			let originator = client_static.client_ephemeral(originator_bytes)?;
 
 			// 3. Run the static ECDH through the key provider, and derive the
@@ -682,7 +684,7 @@ impl<P: HandshakeProvider> ServerFlow<P> for Cms {
 
 			// The base secret crosses the signature and receipt awaits in the
 			// orchestrator. It is boxed, so that move copies a pointer.
-			Ok(Box::new(CmsOpened { base, originator, transcript, bound }))
+			Ok(Box::new(CmsOpened { base, originator, transcript, client_static }))
 		})
 	}
 
@@ -747,7 +749,7 @@ impl<P: HandshakeProvider> ServerFlow<P> for Cms {
 	}
 
 	fn pend(
-		mut opened: Self::Opened,
+		opened: Self::Opened,
 		ephemeral: Box<EphemeralSecret<P::Curve>>,
 		terms: &Terms<P>,
 	) -> Result<Self::Pending, HandshakeError> {
@@ -757,12 +759,12 @@ impl<P: HandshakeProvider> ServerFlow<P> for Cms {
 		let agreement = Agreement::<P>::new(&opened.base, &opened.originator);
 
 		let secret = agreement.settle(ephemeral.as_ref(), terms.kdf_salt())?;
-		let bound = opened.bound.take();
-		Ok(CmsServerPending { secret, bound })
+		let client_static = opened.client_static;
+		Ok(CmsServerPending { secret, client_static })
 	}
 
 	fn read_closing(
-		pending: &Self::Pending,
+		pending: Self::Pending,
 		_settings: &Self::Settings,
 		closing: HandshakeMessage,
 	) -> Result<ClosingIntake<Self, P>, HandshakeError> {
@@ -774,7 +776,8 @@ impl<P: HandshakeProvider> ServerFlow<P> for Cms {
 		//    one the key exchange bound into the transcript, before admission
 		//    (CWE-287, CWE-345).
 		let embedded = finished.value().embedded_certificate();
-		let bound = pending.bound.as_ref().map(|identity| identity.certificate().as_ref());
+		let CmsServerPending { secret, client_static } = pending;
+		let bound = client_static.identity().map(|identity| identity.certificate().as_ref());
 		if embedded.as_ref() != bound {
 			return Err(HandshakeError::ClientCertificateMismatch);
 		}
@@ -782,20 +785,20 @@ impl<P: HandshakeProvider> ServerFlow<P> for Cms {
 		// 3. Read the key-confirmation tag, which is mandatory, and the sealed receipt acknowledgement.
 		let confirmation = finished.value().key_confirmation()?;
 		let sealed_ack = finished.value().sealed_receipt_ack()?;
-		let closing = CmsClosing { sealed_ack: sealed_ack.map(OctetString::into_bytes), confirmation };
-		let offered = pending.bound.clone();
-		Ok(ClosingIntake { offered, proof: Some(CmsFinished(finished)), closing })
+		let sealed_ack = sealed_ack.map(OctetString::into_bytes);
+		let closing = CmsClosing { sealed_ack, confirmation, secret };
+		Ok(ClosingIntake { client_static, proof: Some(CmsFinished(finished)), closing })
 	}
 
 	fn settle<'a>(
-		pending: Self::Pending,
 		closing: Self::Closing,
+		_client_static: &'a ClientStatic<P::Curve>,
 		_terms: &'a Terms<P>,
 		_key: &'a dyn SigningKeyProvider,
 	) -> MaybeSendFuture<'a, Result<ClosingOpened, HandshakeError>> {
 		// The handshake secret was derived when the server Finished was built.
-		let CmsClosing { sealed_ack, confirmation } = closing;
-		let opened = ClosingOpened { secret: pending.secret, receipt_ack: sealed_ack, confirmation };
+		let CmsClosing { sealed_ack, confirmation, secret } = closing;
+		let opened = ClosingOpened { secret, receipt_ack: sealed_ack, confirmation };
 		Box::pin(async move { Ok(opened) })
 	}
 }
@@ -1439,6 +1442,21 @@ mod tests {
 		let refusal = server.reply(opening(key_exchange)).await;
 
 		assert!(matches!(refusal, Err(HandshakeError::ClientEphemeralIsStatic)));
+	}
+
+	/// An offered certificate whose key is off the curve is refused where the
+	/// key exchange is opened, before the static agreement runs.
+	#[tokio::test]
+	async fn an_offered_certificate_whose_key_is_off_the_curve_is_refused() {
+		let (mut server, server_public_key) = anonymous_server();
+		let mut client = create_test_certificate();
+		put_off_curve_key(&mut client.certificate);
+		let certificate = [attribute(&client.certificate)];
+		let key_exchange = build_test_key_exchange(&server_public_key, &TEST_BASE_SECRET, certificate);
+
+		let refusal = server.reply(opening(key_exchange)).await;
+
+		assert!(matches!(refusal, Err(HandshakeError::InvalidPublicKey(_))));
 	}
 
 	/// A key exchange that carries an abort alert is refused before any

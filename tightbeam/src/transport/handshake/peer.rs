@@ -12,6 +12,8 @@
 //! - A client admits its server through [`ProvisionedTrust`] when the identity
 //!   is known before the opening, and through [`LearnedTrust`] when the reply
 //!   names it. Those two build every [`AdmittedServer`].
+//! - [`PeerCertificate`] parses the key of a peer certificate once, and every
+//!   check of a handshake reads that key.
 
 #[cfg(not(feature = "std"))]
 use alloc::{sync::Arc, vec::Vec};
@@ -48,6 +50,8 @@ pub enum PeerAuthentication {
 	Anonymous,
 	/// Mutual authentication. The client MUST offer a certificate, and every
 	/// validator in the chain MUST accept it before the session records it.
+	/// The certificate MUST be within its validity period, so a build with no
+	/// clock refuses every client.
 	Mutual(ValidatorChain),
 }
 
@@ -163,7 +167,7 @@ impl PeerAuthentication {
 	/// is the same for both protocols:
 	///
 	/// - A certificate and its proof travel together. Either one alone is refused.
-	/// - Under mutual authentication every validator runs before the proof.
+	/// - Under mutual authentication the validity period and then every validator run before the proof.
 	/// - The proof is verified whenever a certificate is offered, so an
 	///   anonymous server also refuses a certificate the client cannot prove.
 	///
@@ -172,7 +176,8 @@ impl PeerAuthentication {
 	/// - [`HandshakeError::MissingClientCertificate`] -- mutual authentication
 	///   is configured and the client offered no certificate, or a proof
 	///   arrived with no certificate.
-	/// - [`HandshakeError::CertificateValidationError`] -- a validator refused the offered certificate.
+	/// - [`HandshakeError::CertificateValidationError`] -- the certificate is
+	///   outside its validity period, or a validator refused it.
 	/// - [`HandshakeError::SignatureVerificationFailed`] -- the certificate arrived with no proof.
 	/// - The [`PossessionProof::verify`] set.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -192,8 +197,12 @@ impl PeerAuthentication {
 				(Self::Anonymous, Some(_)) | (Self::Mutual(_), _) => Err(HandshakeError::MissingClientCertificate),
 			};
 		};
+		// A validator may accept a certificate without reading its validity
+		// period, as a pin does, so the server reads it before the chain.
 		if let Self::Mutual(chain) = self {
-			chain.evaluate(identity.certificate())?;
+			let certificate = identity.certificate();
+			certificate.validate_expiry()?;
+			chain.evaluate(certificate)?;
 		}
 
 		let proof = proof.ok_or(HandshakeError::SignatureVerificationFailed)?;
@@ -414,8 +423,7 @@ mod tests {
 
 	use super::*;
 	use crate::crypto::sign::ecdsa::k256::Secp256k1;
-	use crate::der::asn1::BitString;
-	use crate::transport::handshake::tests::{create_test_certificate, off_curve_point};
+	use crate::transport::handshake::tests::{create_test_certificate, put_off_curve_key};
 
 	#[test]
 	fn an_empty_validator_set_demands_nothing() {
@@ -427,14 +435,12 @@ mod tests {
 	/// A peer certificate holds its parsed key, so a certificate whose key is
 	/// off the curve yields none.
 	#[test]
-	fn a_certificate_whose_key_is_off_the_curve_yields_no_peer_certificate() -> Result<(), Box<dyn Error>> {
+	fn a_certificate_whose_key_is_off_the_curve_yields_no_peer_certificate() {
 		let mut client = create_test_certificate();
-		let off_curve = BitString::from_bytes(&off_curve_point())?;
-		client.certificate.tbs_certificate.subject_public_key_info.subject_public_key = off_curve;
+		put_off_curve_key(&mut client.certificate);
 
 		let refused = PeerCertificate::<Secp256k1>::parse(client.certificate);
 		assert!(matches!(refused, Err(HandshakeError::InvalidPublicKey(_))));
-		Ok(())
 	}
 
 	#[cfg(feature = "transport-cms")]
@@ -515,9 +521,22 @@ mod tests {
 		/// period, so the trust refuses an expired one itself.
 		#[test]
 		fn a_provisioned_certificate_past_its_validity_is_refused() {
-			let expired = trust(TestCertificate::expired(), ExpiryBlindStore);
-			let refusal: Result<AdmittedServer<Secp256k1>, _> = expired.admit_provisioned();
+			let provisioned = trust(TestCertificate::expired(), ExpiryBlindStore);
+			let refusal: Result<AdmittedServer<Secp256k1>, _> = provisioned.admit_provisioned();
 			assert!(matches!(refusal, Err(HandshakeError::CertificateValidationError(Expired))));
+		}
+
+		/// The trust parses the key of the certificate it admits, so a
+		/// certificate whose key is off the curve is refused at admission.
+		#[test]
+		fn a_provisioned_certificate_whose_key_is_off_the_curve_is_refused() {
+			let mut server = create_test_certificate().certificate;
+			put_off_curve_key(&mut server);
+			let provisioned = trust(server, ExpiryBlindStore);
+
+			let refusal: Result<AdmittedServer<Secp256k1>, _> = provisioned.admit_provisioned();
+
+			assert!(matches!(refusal, Err(HandshakeError::InvalidPublicKey(_))));
 		}
 
 		/// Trust in the provisioned `chain` against `store`.
@@ -553,8 +572,8 @@ mod tests {
 			let chain = TestCertificate::insecure_fixed_chain()?;
 			let store = store_holding(chain.root);
 
-			let empty = chain_trust(Arc::from(Vec::new()), store);
-			let refusal: Result<AdmittedServer<Secp256k1>, _> = empty.admit_provisioned();
+			let provisioned = chain_trust(Arc::from(Vec::new()), store);
+			let refusal: Result<AdmittedServer<Secp256k1>, _> = provisioned.admit_provisioned();
 			assert!(matches!(refusal, Err(HandshakeError::MissingServerCertificate)));
 			Ok(())
 		}
@@ -601,6 +620,19 @@ mod tests {
 			let expired = TestCertificate::expired();
 			let refusal: Result<AdmittedServer<Secp256k1>, _> = pinned(&expired).admit_named(expired);
 			assert!(matches!(refusal, Err(HandshakeError::CertificateValidationError(Expired))));
+		}
+
+		/// The trust parses the key of the certificate the reply names, so a
+		/// certificate whose key is off the curve is refused at admission.
+		#[test]
+		fn a_learned_certificate_whose_key_is_off_the_curve_is_refused() {
+			let mut server = create_test_certificate().certificate;
+			put_off_curve_key(&mut server);
+			let learned = pinned(&server);
+
+			let refusal: Result<AdmittedServer<Secp256k1>, _> = learned.admit_named(server);
+
+			assert!(matches!(refusal, Err(HandshakeError::InvalidPublicKey(_))));
 		}
 	}
 }

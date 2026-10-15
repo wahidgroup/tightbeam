@@ -14,7 +14,7 @@ use tightbeam::policy::TransitStatus;
 use tightbeam::testing::fuzz::OracleAccess;
 use tightbeam::testing::routes::RoutedOpens;
 use tightbeam::trace::TraceCollector;
-use tightbeam::transport::client::pool::{ConnectionPool, PoolConfig};
+use tightbeam::transport::client::{ConnectionPool, PoolConfig};
 use tightbeam::transport::error::{TransportError, TransportFailure};
 use tightbeam::transport::handshake::negotiation::TransportOffer;
 use tightbeam::transport::multiplex::{RequestSink, StreamRoute};

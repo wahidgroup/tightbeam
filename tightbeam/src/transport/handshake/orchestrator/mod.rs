@@ -530,6 +530,8 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> Handshake<Client, F, P> {
 	/// - [`HandshakeError::InvalidState`] -- the client is past [`HandshakePhase::Idle`].
 	/// - [`HandshakeError::MissingServerCertificate`] -- the provisioned chain is empty.
 	/// - [`HandshakeError::CertificateValidationError`] -- the trust refused the provisioned server.
+	/// - [`HandshakeError::InvalidPublicKey`] -- the provisioned server
+	///   certificate key is not a point on the curve.
 	/// - [`HandshakeError::RandomGenerationFailed`] -- the random source failed.
 	/// - [`HandshakeError::MissingKeyWrapAlgorithm`] -- the profile names no key wrap.
 	pub fn start(&mut self) -> Result<HandshakeMessage, HandshakeError> {
@@ -573,7 +575,8 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> Handshake<Client, F, P> {
 	///   nothing, or a profile outside the offer.
 	/// - [`HandshakeError::NegotiationError`] -- the selected profile is below
 	///   the strength floor or unrunnable, or the transport accept is invalid.
-	/// - [`HandshakeError::InvalidPublicKey`] -- the signed server ephemeral is not a point on the curve.
+	/// - [`HandshakeError::InvalidPublicKey`] -- the named server certificate
+	///   key or the signed server ephemeral is not a point on the curve.
 	/// - [`HandshakeError::ServerEphemeralIsStatic`] -- the signed server
 	///   ephemeral is the server's static key.
 	/// - [`HandshakeError::ReceiptMissing`] -- a budget-bearing accept has no signed receipt.
@@ -837,7 +840,8 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> Handshake<Server, F, P> {
 	/// - [`HandshakeError::DerError`] -- the key-confirmation tag of a CMS closing has another width.
 	/// - [`HandshakeError::MissingClientCertificate`] -- the server demands a
 	///   certificate and none came, or a proof came without one.
-	/// - [`HandshakeError::CertificateValidationError`] -- a validator refused the client certificate.
+	/// - [`HandshakeError::CertificateValidationError`] -- the certificate is
+	///   outside its validity period, or a validator refused it.
 	/// - [`HandshakeError::InvalidPublicKey`] -- the key of the offered
 	///   certificate, or the HPKE client ephemeral, is not a point on the curve.
 	/// - [`HandshakeError::SignatureError`] -- the HPKE possession signature fails to verify.
@@ -871,16 +875,17 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> Handshake<Server, F, P> {
 		let config = &self.config;
 
 		// 2. Decode the closing.
-		let ClosingIntake { offered, proof, closing } = F::read_closing(&pending, &config.flow, closing)?;
+		let ClosingIntake { client_static, proof, closing } = F::read_closing(pending, &config.flow, closing)?;
 
 		// 3. Admit the offered identity. Every validator runs when the server
 		//    demands a certificate, and an offered certificate's proof is
 		//    verified in either mode.
+		let offered = client_static.identity().cloned();
 		let peer = config.peer_authentication.admit(offered, proof, &terms)?;
 
 		// 4. Open what the closing sealed, and derive the handshake secret.
 		//    The static key serves an admitted client alone.
-		let opening = F::settle(pending, closing, &terms, config.key.as_ref());
+		let opening = F::settle(closing, &client_static, &terms, config.key.as_ref());
 		let ClosingOpened { secret, receipt_ack, confirmation } = opening.await?;
 
 		// 5. Verify that the client derived the same handshake secret.

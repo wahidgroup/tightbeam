@@ -18,7 +18,7 @@ use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::der::oid::AssociatedOid;
 use crate::macros::server::AcceptedConnection;
 use crate::trace::TraceCollector;
-use crate::transport::client::pool::ConnectionPool;
+use crate::transport::client::ConnectionPool;
 use crate::transport::messaging::{MessageCollector, MessageEmitter};
 use crate::transport::multiplex::{MuxCapable, MuxConnector};
 use crate::transport::policy::PolicyConfig;

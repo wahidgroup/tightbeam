@@ -3,7 +3,7 @@
 //! ## Weakness
 //! Suppose the HPKE handshake transcript omits the negotiated
 //! `security_accept` and covers only
-//! `client_random || server_random || server_spki`. The signed transcript
+//! `client_random || server_random || server_public_key`. The signed transcript
 //! then leaves the chosen profile unauthenticated, so negotiation is unbound.
 //!
 //! Likewise, if the transcript binds only the client *random* and omits the

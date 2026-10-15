@@ -20,7 +20,7 @@ use tightbeam::{
 	testing::{ClientEnv, HiveEnv, ServletEnv, SetupEnv},
 	trace::TraceCollector,
 	transport::{
-		client::pool::{ConnectionBuilder, ConnectionPool, PoolConfig},
+		client::{ConnectionBuilder, ConnectionPool, PoolConfig},
 		handshake::negotiation::TransportOffer,
 		tcp::r#async::TokioListener,
 	},

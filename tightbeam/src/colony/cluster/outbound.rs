@@ -13,7 +13,7 @@ use crate::crypto::x509::error::CertificateValidationError;
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::crypto::x509::store::CertificateTrust;
 use crate::crypto::x509::Certificate;
-use crate::transport::client::pool::{ConnectionBuilder, ConnectionPool, PoolConfig};
+use crate::transport::client::{ConnectionBuilder, ConnectionPool, PoolConfig};
 use crate::transport::handshake::HandshakeKeyManager;
 use crate::transport::Protocol;
 use crate::utils::time::Clock;
@@ -49,8 +49,7 @@ pub struct ClusterPools<P: Protocol> {
 /// # Evaluation order
 ///
 /// 1. The underlying trust store evaluates the certificate or chain.
-/// 2. Each configured operator validator evaluates the dialed leaf in
-///    registration order.
+/// 2. Each configured operator validator evaluates the dialed leaf in registration order.
 ///
 /// [`CertificateTrust::is_trusted`] still delegates to the store alone.
 struct ValidatedTrust {

@@ -106,7 +106,7 @@ pub trait AcceptState<C: CryptoProvider>: sealed::Sealed<C> {}
 /// cleartext. `build` exists on the two [`AcceptState`] types alone, so the
 /// compiler refuses a configuration that names neither.
 #[derive(Default)]
-pub struct NoCertificate;
+pub struct NoAcceptState;
 
 /// The builder state of a servlet that serves in the clear, which
 /// [`ServletConfigBuilder::allow_cleartext`] names.
@@ -139,7 +139,7 @@ impl<C: CryptoProvider> AcceptState<C> for WithCertificate<C> {}
 /// Builder for [`ServletConfig`].
 ///
 /// `A` is the accept state, and it holds the accept material. A fresh builder
-/// is in [`NoCertificate`], and one of two calls moves it to a state that
+/// is in [`NoAcceptState`], and one of two calls moves it to a state that
 /// builds:
 ///
 /// - [`ServletConfigBuilder::with_certificate`] moves it to
@@ -150,7 +150,7 @@ impl<C: CryptoProvider> AcceptState<C> for WithCertificate<C> {}
 ///
 /// A servlet therefore serves in the clear only where its configuration says
 /// so (CWE-319).
-pub struct ServletConfigBuilder<P, M, C: CryptoProvider = DefaultCryptoProvider, Env = (), A = NoCertificate>
+pub struct ServletConfigBuilder<P, M, C: CryptoProvider = DefaultCryptoProvider, Env = (), A = NoAcceptState>
 where
 	P: Protocol,
 	M: Message,
@@ -182,7 +182,7 @@ where
 	C: CryptoProvider + Send + Sync + 'static,
 {
 	/// Starts a [`ServletConfigBuilder`].
-	pub fn builder() -> ServletConfigBuilder<P, M, C, (), NoCertificate> {
+	pub fn builder() -> ServletConfigBuilder<P, M, C, (), NoAcceptState> {
 		ServletConfigBuilder::default()
 	}
 
@@ -286,12 +286,12 @@ where
 	}
 }
 
-/// A fresh builder serves the unit env and is in [`NoCertificate`]. These are
+/// A fresh builder serves the unit env and is in [`NoAcceptState`]. These are
 /// the states the builder supplies on its own. Three calls leave them:
 /// [`ServletConfigBuilder::with_config`] for the env, and
 /// [`ServletConfigBuilder::with_certificate`] or
 /// [`ServletConfigBuilder::allow_cleartext`] for the accept state.
-impl<P, M, C> Default for ServletConfigBuilder<P, M, C, (), NoCertificate>
+impl<P, M, C> Default for ServletConfigBuilder<P, M, C, (), NoAcceptState>
 where
 	P: Protocol,
 	M: Message,
@@ -299,7 +299,7 @@ where
 {
 	fn default() -> Self {
 		Self {
-			accept: NoCertificate,
+			accept: NoAcceptState,
 			servlet_config: Arc::new(()),
 			hive_context: None,
 			workers: HashMap::new(),
@@ -430,7 +430,7 @@ where
 	}
 }
 
-impl<P, M, C, Env> ServletConfigBuilder<P, M, C, Env, NoCertificate>
+impl<P, M, C, Env> ServletConfigBuilder<P, M, C, Env, NoAcceptState>
 where
 	P: Protocol,
 	M: Message,

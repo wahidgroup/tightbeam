@@ -26,7 +26,7 @@ use crate::policy::TransitStatus;
 use crate::runtime::rt;
 use crate::trace::TraceCollector;
 use crate::transport::accept::AcceptPlane;
-use crate::transport::client::pool::{ConnectionBuilder, ConnectionPool};
+use crate::transport::client::{ConnectionBuilder, ConnectionPool};
 use crate::transport::multiplex::{MuxCapable, MuxConnector};
 use crate::transport::policy::PolicyConfig;
 use crate::transport::{

@@ -273,12 +273,11 @@ impl<P: Profile> CertificateExt for CertificateInner<P> {
 	fn validate_expiry(&self) -> Result<(), CertificateValidationError> {
 		let now = UnixMillis::now();
 		let now_unix = Duration::from_millis(now.get()).as_secs();
-
 		self.validate_expiry_at(now_unix)
 	}
 
-	/// A build with no clock at all has no current time, so a higher layer
-	/// owns temporal validation.
+	/// A build with no clock has no current time, so every certificate fails
+	/// closed with [`CertificateValidationError::InvalidTimestamp`].
 	#[cfg(all(not(feature = "time"), not(host_clock)))]
 	fn validate_expiry(&self) -> Result<(), CertificateValidationError> {
 		Err(CertificateValidationError::InvalidTimestamp)

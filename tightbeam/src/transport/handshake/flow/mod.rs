@@ -29,7 +29,7 @@ use crate::transport::handshake::negotiation::{
 };
 use crate::transport::handshake::peer::{PeerCertificate, PossessionProof, ServerTrust};
 use crate::transport::handshake::primitives::KdfSalt;
-use crate::transport::handshake::schedule::{KeyConfirmation, PeerPoint, Salt, Terms};
+use crate::transport::handshake::schedule::{ClientStatic, KeyConfirmation, PeerPoint, Salt, Terms};
 use crate::transport::handshake::{HandshakeMessage, HandshakeProvider, HandshakeSecret};
 use crate::transport::state::ClientIdentity;
 use crate::utils::marker::{MaybeSend, MaybeSendFuture, MaybeSync};
@@ -79,7 +79,7 @@ pub struct OpeningParts<'a> {
 }
 
 /// An encoded opening, with what the client keeps for the reply.
-pub struct Opened<F: ClientFlow<P>, P: HandshakeProvider> {
+pub struct Opened<F: ClientLegs<P>, P: HandshakeProvider> {
 	/// The opening, encoded once for sending.
 	pub message: HandshakeMessage,
 	/// What the flow reads the reply against.
@@ -89,7 +89,7 @@ pub struct Opened<F: ClientFlow<P>, P: HandshakeProvider> {
 }
 
 /// The facts of a decoded reply, bound into the sealed transcript.
-pub struct ReplyIntake<F: ClientFlow<P>, P: HandshakeProvider> {
+pub struct ReplyIntake<F: ClientLegs<P>, P: HandshakeProvider> {
 	/// What the reply names as the server, for the trust to admit.
 	pub server: <F::Trust as ServerTrust<P::Curve>>::Named,
 	/// The security profile the server selected.
@@ -135,19 +135,28 @@ pub struct ProofRequest<'a> {
 }
 
 /// A closing that awaits its possession proof.
-pub struct ClosingBinding<'a, F: ClientFlow<P>, P: HandshakeProvider> {
+pub struct ClosingBinding<'a, F: ClientLegs<P>, P: HandshakeProvider> {
 	/// The proof to sign, when an identity presents itself in the closing.
 	pub proof: Option<ProofRequest<'a>>,
 	/// The closing, complete except for that proof.
 	pub draft: F::Draft,
 }
 
-/// The client legs of one protocol.
+/// The client side of one protocol. It is sealed, so the flow markers of this
+/// crate alone implement it.
+///
+/// Code over either protocol names it as the bound of a client
+/// [`Handshake`](crate::transport::handshake::Handshake).
+pub trait ClientFlow<P: HandshakeProvider>: ClientLegs<P> {}
+
+impl<P: HandshakeProvider, F: ClientLegs<P>> ClientFlow<P> for F {}
+
+/// The client legs of one protocol, which the orchestrator drives.
 ///
 /// Both flows return the same intake shapes and refuse with the same
 /// [`HandshakeError`] set, so the orchestrator runs one step order over
 /// either.
-pub trait ClientFlow<P: HandshakeProvider>: HandshakeFlow {
+pub trait ClientLegs<P: HandshakeProvider>: HandshakeFlow {
 	/// What a client of this protocol is provisioned with.
 	type Settings: MaybeSend + MaybeSync + 'static;
 	/// Where the client learns the server identity.
@@ -248,7 +257,7 @@ pub trait ClientFlow<P: HandshakeProvider>: HandshakeFlow {
 }
 
 /// The facts of a decoded opening, with what it sealed to the static key.
-pub struct OpeningIntake<F: ServerFlow<P>, P: HandshakeProvider> {
+pub struct OpeningIntake<F: ServerLegs<P>, P: HandshakeProvider> {
 	/// The security profiles the client offers.
 	pub security_offer: Option<SecurityOffer>,
 	/// The transport capabilities the client offers.
@@ -270,7 +279,7 @@ pub struct ReplyParts<'a, P: HandshakeProvider> {
 }
 
 /// A reply that awaits its signature and its receipt.
-pub struct ReplyBinding<F: ServerFlow<P>, P: HandshakeProvider> {
+pub struct ReplyBinding<F: ServerLegs<P>, P: HandshakeProvider> {
 	/// The hash of the sealed transcript.
 	pub transcript_hash: [u8; 32],
 	/// The KDF salt of the flow.
@@ -282,9 +291,9 @@ pub struct ReplyBinding<F: ServerFlow<P>, P: HandshakeProvider> {
 }
 
 /// The facts of a decoded closing, with what it sealed to the static key.
-pub struct ClosingIntake<F: ServerFlow<P>, P: HandshakeProvider> {
-	/// The certificate the client offers as its identity, with its key.
-	pub offered: Option<PeerCertificate<P::Curve>>,
+pub struct ClosingIntake<F: ServerLegs<P>, P: HandshakeProvider> {
+	/// The identity the client offers, which the ephemeral checks read.
+	pub client_static: ClientStatic<P::Curve>,
 	/// The proof that the key of the offered certificate signed the closing.
 	pub proof: Option<F::Proof>,
 	/// What the closing still holds for the agreement.
@@ -302,14 +311,23 @@ pub struct ClosingOpened {
 	pub confirmation: KeyConfirmation,
 }
 
-/// The server legs of one protocol.
+/// The server side of one protocol. It is sealed, so the flow markers of this
+/// crate alone implement it.
+///
+/// Code over either protocol names it as the bound of a server
+/// [`Handshake`](crate::transport::handshake::Handshake).
+pub trait ServerFlow<P: HandshakeProvider>: ServerLegs<P> {}
+
+impl<P: HandshakeProvider, F: ServerLegs<P>> ServerFlow<P> for F {}
+
+/// The server legs of one protocol, which the orchestrator drives.
 ///
 /// Both flows return the same intake shapes and refuse with the same
 /// [`HandshakeError`] set, so the orchestrator runs one step order over
 /// either. The two asynchronous methods are the static-key operations, which
 /// run through the key provider, so the private key can stay behind an
 /// external boundary.
-pub trait ServerFlow<P: HandshakeProvider>: HandshakeFlow {
+pub trait ServerLegs<P: HandshakeProvider>: HandshakeFlow {
 	/// What a server of this protocol is provisioned with.
 	type Settings: MaybeSend + MaybeSync + 'static;
 	/// What the opening sealed to the static key.
@@ -394,6 +412,9 @@ pub trait ServerFlow<P: HandshakeProvider>: HandshakeFlow {
 
 	/// Decode the closing, and return the offered identity beside its proof.
 	///
+	/// It takes the pending state of the reply, and the closing it returns
+	/// holds what [`Self::settle`] reads of that state.
+	///
 	/// # Errors
 	///
 	/// - [`HandshakeError::UnexpectedContainer`] -- the closing travels in the other container.
@@ -407,7 +428,7 @@ pub trait ServerFlow<P: HandshakeProvider>: HandshakeFlow {
 	///   collapses into the client's static key.
 	/// - [`HandshakeError`] -- the closing fails to decode.
 	fn read_closing(
-		pending: &Self::Pending,
+		pending: Self::Pending,
 		settings: &Self::Settings,
 		closing: HandshakeMessage,
 	) -> Result<ClosingIntake<Self, P>, HandshakeError>;
@@ -428,8 +449,8 @@ pub trait ServerFlow<P: HandshakeProvider>: HandshakeFlow {
 	///   collapses into the client's static key.
 	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the handshake secret.
 	fn settle<'a>(
-		pending: Self::Pending,
 		closing: Self::Closing,
+		client_static: &'a ClientStatic<P::Curve>,
 		terms: &'a Terms<P>,
 		key: &'a dyn SigningKeyProvider,
 	) -> MaybeSendFuture<'a, Result<ClosingOpened, HandshakeError>>;

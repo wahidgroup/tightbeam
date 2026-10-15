@@ -33,8 +33,8 @@ use crate::random::{generate_nonce, CryptoRngCore, RngWrapper};
 use crate::transport::handshake::attributes::HandshakeAttributes;
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::flow::{
-	sealed, ClientFlow, ClosingBinding, ClosingIntake, ClosingOpened, ClosingParts, HandshakeFlow, Opened,
-	OpeningIntake, OpeningParts, ProofRequest, ReplyBinding, ReplyIntake, ReplyParts, ServerFlow,
+	sealed, ClientLegs, ClosingBinding, ClosingIntake, ClosingOpened, ClosingParts, HandshakeFlow, Opened,
+	OpeningIntake, OpeningParts, ProofRequest, ReplyBinding, ReplyIntake, ReplyParts, ServerLegs,
 };
 use crate::transport::handshake::negotiation::{SecurityAccept, TransportAccept};
 use crate::transport::handshake::peer::{LearnedTrust, PeerCertificate, PossessionProof};
@@ -132,7 +132,7 @@ pub struct HpkeClosingDraft {
 	certificate: Option<Certificate>,
 }
 
-impl<P: HandshakeProvider> ClientFlow<P> for Hpke {
+impl<P: HandshakeProvider> ClientLegs<P> for Hpke {
 	type Settings = HpkeClientSettings<P>;
 	type Trust = LearnedTrust;
 	type Opening = HpkeOpening;
@@ -372,9 +372,11 @@ pub struct HpkeClosing<S: HpkeSuite> {
 	recipient: PublicKey<S::Curve>,
 	/// The associated data the payload was sealed under.
 	aad: Vec<u8>,
-	/// The static key of the certificate the client offers, which the client
-	/// ephemeral must differ from.
-	client_static: ClientStatic<S::Curve>,
+	/// The server ephemeral `e`, which serves one agreement. It is boxed, so
+	/// a move of the closing copies a pointer.
+	ephemeral: Box<EphemeralSecret<S::Curve>>,
+	/// The client random the key exchange must echo.
+	client_random: [u8; 32],
 }
 
 /// The proof of an HPKE key exchange that the key of the offered
@@ -448,7 +450,7 @@ impl<C: HandshakeCurve> SessionPayload<C> {
 	}
 }
 
-impl<P: HandshakeProvider> ServerFlow<P> for Hpke {
+impl<P: HandshakeProvider> ServerLegs<P> for Hpke {
 	type Settings = HpkeServerSettings;
 	type Sealed = HpkeHello;
 	type Opened = HpkeHello;
@@ -562,7 +564,7 @@ impl<P: HandshakeProvider> ServerFlow<P> for Hpke {
 	}
 
 	fn read_closing(
-		_pending: &Self::Pending,
+		pending: Self::Pending,
 		settings: &Self::Settings,
 		closing: HandshakeMessage,
 	) -> Result<ClosingIntake<Self, P>, HandshakeError> {
@@ -586,13 +588,13 @@ impl<P: HandshakeProvider> ServerFlow<P> for Hpke {
 		//    leaves the payload to the secrecy of that key.
 		let parsed = client_certificate.map(PeerCertificate::<P::Curve>::parse);
 		let identity = parsed.transpose()?;
-		let client_static = ClientStatic::of(identity.as_ref());
+		let client_static = ClientStatic::of(identity);
 		client_static.client_ephemeral_point(*message.encapsulated_key())?;
 
 		// 4. Build the associated data and the possession proof over the
 		//    offered certificate. A signature with no certificate binds no
 		//    certificate bytes, and admission refuses it unverified.
-		let offered = identity.as_ref().map(|identity| identity.certificate().as_ref());
+		let offered = client_static.identity().map(|identity| identity.certificate().as_ref());
 		let aad = ClientKeyExchange::client_bound_aad(settings.aad_domain_tag, offered)?;
 		let certificate_der = offered.map(Encode::to_der).transpose()?.unwrap_or_default();
 		let proof = client_signature.map(|signature| HpkePossession {
@@ -601,19 +603,19 @@ impl<P: HandshakeProvider> ServerFlow<P> for Hpke {
 			certificate_der,
 		});
 
-		let closing = HpkeClosing { message, recipient, aad, client_static };
-		Ok(ClosingIntake { offered: identity, proof, closing })
+		let HpkeServerPending { ephemeral, client_random } = pending;
+		let closing = HpkeClosing { message, recipient, aad, ephemeral, client_random };
+		Ok(ClosingIntake { client_static, proof, closing })
 	}
 
 	fn settle<'a>(
-		pending: Self::Pending,
 		closing: Self::Closing,
+		client_static: &'a ClientStatic<P::Curve>,
 		terms: &'a Terms<P>,
 		key: &'a dyn SigningKeyProvider,
 	) -> MaybeSendFuture<'a, Result<ClosingOpened, HandshakeError>> {
 		Box::pin(async move {
-			let HpkeServerPending { ephemeral, client_random } = pending;
-			let HpkeClosing { message, recipient, aad, client_static } = closing;
+			let HpkeClosing { message, recipient, aad, ephemeral, client_random } = closing;
 
 			// 1. Open the payload under the associated data. The key provider
 			//    runs the static ECDH step on the encapsulated key the parse
@@ -622,7 +624,7 @@ impl<P: HandshakeProvider> ServerFlow<P> for Hpke {
 			let agreed = key.key_agreement(enc.as_bytes()).await?;
 			let shared_secret = EcdhSecret::try_from(agreed)?;
 			let plaintext = shared_secret.open(&recipient, &message, TIGHTBEAM_HPKE_HANDSHAKE_INFO, &aad)?;
-			let payload = plaintext.with(|payload| SessionPayload::<P::Curve>::parse(payload, &client_static))?;
+			let payload = plaintext.with(|payload| SessionPayload::<P::Curve>::parse(payload, client_static))?;
 			let SessionPayload { base, client_random: echoed, client_ephemeral, confirmation, receipt_ack } = payload;
 
 			// 2. Verify that the payload echoes the client random of the hello, which prevents replay.
@@ -1365,6 +1367,21 @@ mod tests {
 		let refusal = server.finish(carried_closing(&key_exchange)).await;
 
 		assert!(matches!(refusal, Err(HandshakeError::ClientEphemeralIsStatic)));
+		Ok(())
+	}
+
+	/// An offered certificate whose key is off the curve is refused where the
+	/// closing is read, before the static key opens anything.
+	#[tokio::test]
+	async fn an_offered_certificate_whose_key_is_off_the_curve_is_refused() -> Result<(), Box<dyn Error>> {
+		let Identified { mut server, mut key_exchange, .. } = identified(PeerAuthentication::Anonymous).await;
+		let certificate = key_exchange.client_certificate.as_mut();
+		let offered = certificate.ok_or("the key exchange offers a certificate")?;
+		put_off_curve_key(offered);
+
+		let refusal = server.finish(carried_closing(&key_exchange)).await;
+
+		assert!(matches!(refusal, Err(HandshakeError::InvalidPublicKey(_))));
 		Ok(())
 	}
 

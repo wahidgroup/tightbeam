@@ -125,6 +125,15 @@ pub fn create_test_certificate() -> TestCertificate {
 	TestCertificate { signing_key, certificate }
 }
 
+/// A test certificate whose validity period ended one second after the epoch.
+pub fn create_expired_test_certificate() -> TestCertificate {
+	let mut expired = create_test_certificate();
+	let not_after = GeneralizedTime::from_unix_duration(Duration::from_secs(1));
+	let not_after = not_after.expect("one second after the epoch is a time");
+	expired.certificate.tbs_certificate.validity.not_after = Time::GeneralTime(not_after);
+	expired
+}
+
 /// Create a self-signed certificate whose public key matches `signing_key`.
 fn create_test_certificate_inner(signing_key: &Secp256k1SigningKey) -> Result<Certificate, Box<dyn Error>> {
 	let verifying_key = *signing_key.verifying_key();
@@ -178,6 +187,14 @@ pub fn off_curve_point() -> [u8; EC_PUBKEY_COMPRESSED_SIZE] {
 	}
 
 	panic!("no off-curve x-coordinate among 255 small candidates")
+}
+
+/// Replace the key of `certificate` with [`off_curve_point`], so the key
+/// parses as no point of the curve.
+pub fn put_off_curve_key(certificate: &mut Certificate) {
+	let off_curve = BitString::from_bytes(&off_curve_point());
+	let off_curve = off_curve.expect("33 bytes are a BIT STRING");
+	certificate.tbs_certificate.subject_public_key_info.subject_public_key = off_curve;
 }
 
 /// Whether `needle` appears anywhere inside `haystack`.
