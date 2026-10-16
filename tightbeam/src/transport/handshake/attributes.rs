@@ -7,11 +7,9 @@ use alloc::vec::Vec;
 use core::cmp::{Ord, Ordering, PartialOrd};
 
 use super::HandshakeError;
-use crate::crypto::x509::attr::{Attribute, Attributes};
+use crate::crypto::x509::attr::Attribute;
 use crate::der::asn1::{Any, ObjectIdentifier, SetOfVec};
 use crate::der::{Sequence, Tagged};
-use crate::oids::CLIENT_CERTIFICATE;
-use crate::x509::Certificate;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use super::HandshakeAlert;
@@ -19,6 +17,8 @@ use super::HandshakeAlert;
 use crate::cms::enveloped_data::OriginatorPublicKey;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::cms::signed_data::SignedData;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::crypto::x509::attr::Attributes;
 #[cfg(feature = "transport-cms")]
 use crate::der::asn1::OctetString;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -123,12 +123,6 @@ impl TryFrom<HandshakeAttribute> for Attribute {
 pub trait AttributePayload {
 	/// OID this payload is carried under.
 	const OID: ObjectIdentifier;
-}
-
-/// The client certificate a key exchange carries under mutual
-/// authentication, on the CMS and the HPKE path alike.
-impl AttributePayload for Certificate {
-	const OID: ObjectIdentifier = CLIENT_CERTIFICATE;
 }
 
 #[cfg(feature = "transport-cms")]
@@ -286,6 +280,7 @@ fn alert_from_any(any: &Any) -> Result<HandshakeAlert, HandshakeError> {
 }
 
 /// Handshake attribute lookups on a CMS `SignedData` or an attribute set.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub trait HandshakeAttributes {
 	/// Finds at most one unsigned attribute with `oid`, rejecting duplicates.
 	///
@@ -331,6 +326,7 @@ pub trait HandshakeAttributes {
 	}
 }
 
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl HandshakeAttributes for Attributes {
 	fn find_unsigned_attr(&self, oid: ObjectIdentifier) -> Result<Option<HandshakeAttribute>, HandshakeError> {
 		let mut found = None;
@@ -369,6 +365,16 @@ impl HandshakeAttributes for SignedData {
 		}
 
 		Ok(found)
+	}
+}
+
+/// An attribute set that may be absent, as the unprotected attributes of a CMS
+/// container are.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+impl HandshakeAttributes for Option<Attributes> {
+	fn find_unsigned_attr(&self, oid: ObjectIdentifier) -> Result<Option<HandshakeAttribute>, HandshakeError> {
+		let found = self.as_ref().map(|attrs| attrs.find_unsigned_attr(oid));
+		Ok(found.transpose()?.flatten())
 	}
 }
 
@@ -475,6 +481,19 @@ mod tests {
 		let first = mk_attr(HANDSHAKE_ABORT_ALERT, mk_integer([0x03])?)?;
 		let second = mk_attr(HANDSHAKE_ABORT_ALERT, mk_integer([0x04])?)?;
 		let attrs = Attributes::try_from(vec![first, second])?;
+
+		let refused = attrs.refuse_alert();
+		assert!(matches!(refused, Err(HandshakeError::DuplicateAttribute)));
+		Ok(())
+	}
+
+	/// The unprotected attributes of a CMS container are an optional set, and
+	/// a present set that repeats the abort alert fails closed as the set does.
+	#[test]
+	fn a_duplicate_abort_alert_in_an_optional_set_fails_closed() -> Result<(), HandshakeError> {
+		let first = mk_attr(HANDSHAKE_ABORT_ALERT, mk_integer([0x03])?)?;
+		let second = mk_attr(HANDSHAKE_ABORT_ALERT, mk_integer([0x04])?)?;
+		let attrs = Some(Attributes::try_from(vec![first, second])?);
 
 		let refused = attrs.refuse_alert();
 		assert!(matches!(refused, Err(HandshakeError::DuplicateAttribute)));

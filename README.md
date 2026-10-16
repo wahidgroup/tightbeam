@@ -1554,7 +1554,6 @@ Phase 1: Client -> Server
 │ - Client nonce (32 bytes)                               │
 │ - Optional SecurityOffer (supported profiles)           │
 │ - Ephemeral public key (CMS: in KARI structure)         │
-│ - Client certificate (CMS, mutual auth, in transcript)  │
 └─────────────────────────────────────────────────────────┘
 
 Phase 2: Server -> Client
@@ -1571,9 +1570,9 @@ Phase 3: Client -> Server
 │ ClientKeyExchange (HPKE) or ClientFinished (CMS)        │
 │ - Sealed base secret (HPKE)                             │
 │ - Key-confirmation tag (32 bytes)                       │
-│ - Optional client certificate (mutual auth)             │
-│   (CMS: must equal the Phase 1 certificate)             │
-│ - Optional client signature (mutual auth)               │
+│ - Client certificate and signature, sealed under a key  │
+│   of the handshake secret (optional for HPKE)           │
+│   (CMS: the whole client Finished travels sealed)       │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -1609,30 +1608,42 @@ CMS handshake uses [RFC 5652][rfc5652] Cryptographic Message Syntax:
 
 - **`EnvelopedData`**: ECDH, HKDF, and AES key wrap for the base secret
 - **`SignedData`**: Transcript signatures for authentication
+- **`EncryptedData`**: The client Finished, sealed with its certificate under a key of the handshake secret
 - **`KeyAgreeRecipientInfo` (KARI)**: Ephemeral-static ECDH key agreement
 
 **Mutual authentication flow:**
 
-For mutual authentication, the client includes a certificate and signs the transcript in `ClientKeyExchange`:
+For mutual authentication, the client signs its Finished over the transcript and seals the whole Finished, with the certificate it embeds, under a key of the handshake secret:
 
 ```text
-Client Side - Building ClientKeyExchange:
+Client Side - Building the Client Finished:
 ┌─────────────────────────────────────────────────────────────────────┐
-│ 1. Extend Transcript                                                │
-│    transcript = ClientHello || ServerHandshake || ClientKeyExchange │
+│ 1. Seal the Transcript                                              │
+│    transcript = KeyExchange || accepts || server_ephemeral          │
+│    transcript_hash = SHA3-256(transcript)                           │
 ├─────────────────────────────────────────────────────────────────────┤
-│ 2. Sign Extended Transcript                                         │
-│    final_hash = SHA3-256(transcript)                                │
-│    client_signed_data = Sign(final_hash, client_priv_key)           │
+│ 2. Sign the Client Finished                                         │
+│    signed = client_finished_domain || transcript_hash               │
+│    signature = Sign(SHA3-256(signed), client_priv_key)              │
 ├─────────────────────────────────────────────────────────────────────┤
-│ 3. Build ClientKeyExchange                                          │
-│    ┌──────────────────────────────────────────────────────────┐     │
-│    │ ClientKeyExchange {                                      │     │
-│    │     enveloped_data: EnvelopedData,  // Encrypted CEK     │     │
-│    │     client_certificate: Some(cert), // Client cert       │     │
-│    │     client_signature: Some(sig),    // Transcript sig    │     │
-│    │ }                                                        │     │
-│    └──────────────────────────────────────────────────────────┘     │
+│ 3. Build the Client Finished                                        │
+│    SignedData {                                                     │
+│        content: signed,                                             │
+│        certificates: [client_certificate],                          │
+│        unsigned_attrs: [confirm, sealed_ack?],                      │
+│    }                                                                │
+├─────────────────────────────────────────────────────────────────────┤
+│ 4. Seal the Finished under the Handshake Secret                     │
+│    k_id = HKDF(hs, transcript_hash, "tb/session/kdf/identity/v1")   │
+│    EncryptedData {                                                  │
+│        content_type: signedData,                                    │
+│        algorithm: AES-256-GCM, nonce 0,                             │
+│        content: AES-256-GCM.seal(                                   │
+│            key: k_id,                                               │
+│            aad: "tb/handshake/identity/aad/v1" || transcript_hash,  │
+│            plaintext: pad(Finished DER)                             │
+│        )                                                            │
+│    }                                                                │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -1641,20 +1652,23 @@ Server verification flow:
 ```text
 Server Side - Verifying Client Authentication:
 ┌─────────────────────────────────────────────────────────────┐
-│ 1. Validate Client Certificate                              │
-│    ✓ Check certificate chain against trust anchors          │
+│ 1. Open the Sealed Finished                                 │
+│    finished = AES-256-GCM.open(k_id, content)               │
+│    ✓ The Finished embeds a certificate                      │
+├─────────────────────────────────────────────────────────────┤
+│ 2. Compare the Originator with the Certificate Key          │
+│    ✓ The KARI originator differs from the certificate key   │
+├─────────────────────────────────────────────────────────────┤
+│ 3. Confirm the Handshake Secret                             │
+│    ✓ Key-confirmation tag matches                           │
+├─────────────────────────────────────────────────────────────┤
+│ 4. Validate Client Certificate                              │
 │    ✓ Verify certificate is within validity period           │
+│    ✓ Check certificate chain against trust anchors          │
 ├─────────────────────────────────────────────────────────────┤
-│ 2. Extract Client Public Key                                │
-│    client_pub_key = cert.subject_public_key_info            │
-├─────────────────────────────────────────────────────────────┤
-│ 3. Verify Transcript Signature                              │
-│    verified_hash = Verify(client_signature, client_pub_key) │
-├─────────────────────────────────────────────────────────────┤
-│ 4. Verify Transcript Match                                  │
-│    expected_hash = SHA3-256(transcript)                     │
-│    if verified_hash ≠ expected_hash:                        │
-│       return TranscriptMismatch error                       │
+│ 5. Verify the Client Finished                               │
+│    signed = client_finished_domain || transcript_hash       │
+│    Verify(signature, SHA3-256(signed), client_pub_key)      │
 │    ✓ Client witnessed same transcript                       │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -1672,7 +1686,7 @@ Differences from CMS:
 
 **Mutual authentication flow:**
 
-For mutual authentication, the client includes a certificate and signs the key exchange in `ClientKeyExchange`:
+For mutual authentication, the client signs a possession proof over its ephemeral and seals the certificate beside the proof under a key of the handshake secret:
 
 ```text
 Client Side - Building ClientKeyExchange:
@@ -1688,24 +1702,30 @@ Client Side - Building ClientKeyExchange:
 │        info: "tb/session/kdf/v1"                                    │
 │    )                                                                │
 ├─────────────────────────────────────────────────────────────────────┤
-│ 3. Seal the Payload with HPKE                                       │
-│    encrypted_data = HPKE-Seal(                                      │
-│        recipient_pub_key: server_pub_key,                           │
-│        info: "tb/hpke/handshake/v1",                                │
-│        aad: domain_tag || client_certificate,                       │
-│        plaintext: base, client_random, R, confirm                   │
-│    )                                                                │
-├─────────────────────────────────────────────────────────────────────┤
-│ 4. Sign the Key Exchange                                            │
-│    signed = transcript_hash || encrypted_data || client_certificate │
+│ 3. Sign the Possession Proof                                        │
+│    signed = domain || transcript_hash || R || client_certificate    │
 │    client_signature = Sign(SHA3-256(signed), client_priv_key)       │
 ├─────────────────────────────────────────────────────────────────────┤
-│ 5. Build ClientKeyExchange                                          │
+│ 4. Seal the Identity under the Handshake Secret                     │
+│    k_id = HKDF(hs, salt, "tb/session/kdf/identity/v1")              │
+│    sealed_identity = AES-256-GCM.seal(                              │
+│        key: k_id, nonce: 0,                                         │
+│        aad: "tb/handshake/identity/aad/v1" || transcript_hash,      │
+│        plaintext: pad(client_certificate, client_signature)         │
+│    )                                                                │
+├─────────────────────────────────────────────────────────────────────┤
+│ 5. Seal the Payload with HPKE                                       │
+│    encrypted_data = HPKE-Seal(                                      │
+│        recipient_pub_key: server_pub_key,                           │
+│        info: "tb/hpke/handshake/v2",                                │
+│        aad: domain_tag,                                             │
+│        plaintext: base, client_random, R, confirm, sealed_identity  │
+│    )                                                                │
+├─────────────────────────────────────────────────────────────────────┤
+│ 6. Build ClientKeyExchange                                          │
 │    ┌──────────────────────────────────────────────────────────┐     │
 │    │ ClientKeyExchange {                                      │     │
 │    │     encrypted_data: encrypted_data,  // HPKE message     │     │
-│    │     client_certificate: Some(cert),  // Client cert      │     │
-│    │     client_signature: Some(sig),     // Possession sig   │     │
 │    │ }                                                        │     │
 │    └──────────────────────────────────────────────────────────┘     │
 └─────────────────────────────────────────────────────────────────────┘
@@ -1716,30 +1736,31 @@ Server verification flow:
 ```text
 Server Side - Verifying Client Authentication:
 ┌─────────────────────────────────────────────────────────────┐
-│ 1. Validate Client Certificate                              │
-│    ✓ Check certificate chain against trust anchors          │
-│    ✓ Verify certificate is within validity period           │
-├─────────────────────────────────────────────────────────────┤
-│ 2. Extract Client Public Key                                │
-│    client_pub_key = cert.subject_public_key_info            │
-├─────────────────────────────────────────────────────────────┤
-│ 3. Verify the Possession Signature                          │
-│    signed = transcript_hash || encrypted_data || cert       │
-│    Verify(client_signature, SHA3-256(signed), client_pub)   │
-│    ✓ Client holds the key of the certificate it offers      │
-├─────────────────────────────────────────────────────────────┤
-│ 4. Open the Payload                                         │
+│ 1. Open the Payload                                         │
 │    payload = HPKE-Open(                                     │
 │        ciphertext: encrypted_data,                          │
 │        server_priv_key: server_private_key,                 │
-│        aad: domain_tag || client_certificate                │
+│        aad: domain_tag                                      │
 │    )                                                        │
 │    ✓ client_random echoes the hello                         │
 ├─────────────────────────────────────────────────────────────┤
-│ 5. Derive and Confirm the Handshake Secret                  │
+│ 2. Derive the Handshake Secret and Open the Identity        │
 │    ee = ECDH(server_ephemeral_priv, R)                      │
 │    hs = HKDF-SHA3-256(base, ee)                             │
+│    identity = AES-256-GCM.open(k_id, sealed_identity)       │
+│    ✓ R and enc differ from the certificate key              │
+├─────────────────────────────────────────────────────────────┤
+│ 3. Confirm the Handshake Secret                             │
 │    ✓ Key-confirmation tag matches                           │
+├─────────────────────────────────────────────────────────────┤
+│ 4. Validate Client Certificate                              │
+│    ✓ Verify certificate is within validity period           │
+│    ✓ Check certificate chain against trust anchors          │
+├─────────────────────────────────────────────────────────────┤
+│ 5. Verify the Possession Signature                          │
+│    signed = domain || transcript_hash || R || cert          │
+│    Verify(client_signature, SHA3-256(signed), client_pub)   │
+│    ✓ Client holds the key of the certificate it offers      │
 │    ✓ Session established with forward secrecy               │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -1780,7 +1801,7 @@ HPKE-Seal(recipient_pub_key, info, aad, plaintext):
 
 The IANA HPKE registry holds no value for HKDF-SHA3-256, so the KEM and KDF identifiers of this suite are tightbeam's own. `crypto::hpke` states both values.
 
-The handshake seals the base secret under the domain tag followed by the client certificate DER when the client presents one (`ClientKeyExchange::client_bound_aad`), so a swapped certificate fails the AEAD open.
+The handshake seals the payload under the domain tag alone. The client certificate and its signature ride inside the payload, sealed a second time under `k_id`, so an observer that later obtains the server's static key still reads no byte of them. [docs/handshake.md](docs/handshake.md#client-identity) states the padding and the associated data.
 
 **Wire format comparison:**
 

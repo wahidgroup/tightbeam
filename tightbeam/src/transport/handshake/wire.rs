@@ -1,9 +1,9 @@
 //! Wire envelope mapping for the handshake drivers.
 //!
-//! Both handshake protocols share the CMS container grammar on the wire
-//! ([`TransportEnvelope`]): HPKE tunnels its own message types inside
-//! `SignedData`/`EnvelopedData`, while the CMS handshake exchanges the
-//! containers themselves.
+//! Both handshake protocols share the CMS container grammar of
+//! [`TransportEnvelope`] on the wire. HPKE tunnels its own message types
+//! inside `SignedData` and `EnvelopedData`, and the CMS handshake exchanges
+//! the containers themselves.
 
 use crate::transport::envelopes::TransportEnvelope;
 use crate::transport::error::TransportError;
@@ -25,6 +25,7 @@ impl From<HandshakeMessage> for TransportEnvelope {
 		match message {
 			HandshakeMessage::SignedData(signed) => Self::SignedData(signed),
 			HandshakeMessage::EnvelopedData(enveloped) => Self::EnvelopedData(enveloped),
+			HandshakeMessage::EncryptedData(encrypted) => Self::EncryptedData(encrypted),
 		}
 	}
 }
@@ -32,12 +33,13 @@ impl From<HandshakeMessage> for TransportEnvelope {
 impl TryFrom<TransportEnvelope> for HandshakeMessage {
 	type Error = TransportError;
 
-	/// Handshake messages travel in one of the two CMS containers. Any other
-	/// envelope on the handshake path is refused.
+	/// Handshake messages travel in one of the three CMS containers. Any
+	/// other envelope on the handshake path is refused.
 	fn try_from(envelope: TransportEnvelope) -> Result<Self, Self::Error> {
 		match envelope {
 			TransportEnvelope::SignedData(signed) => Ok(Self::SignedData(signed)),
 			TransportEnvelope::EnvelopedData(enveloped) => Ok(Self::EnvelopedData(enveloped)),
+			TransportEnvelope::EncryptedData(encrypted) => Ok(Self::EncryptedData(encrypted)),
 			_ => Err(TransportError::InvalidMessage),
 		}
 	}
@@ -54,16 +56,16 @@ pub trait HandshakeOctets {
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError::OctetStringLengthError`] on any other length, so a
-	///   short or long value fails closed
+	/// - [`HandshakeError::OctetStringLengthError`] -- the length differs from
+	///   `N`, so a short or long value fails closed.
 	fn to_byte_array<const N: usize>(&self) -> Result<[u8; N], HandshakeError>;
 
 	/// Fixed 32-byte view of an HPKE wire nonce or other public value.
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError::OctetStringLengthError`] on any other length, so a
-	///   short or long nonce fails closed
+	/// - [`HandshakeError::OctetStringLengthError`] -- the length differs from
+	///   32, so a short or long nonce fails closed.
 	fn to_32_byte_array(&self) -> Result<[u8; 32], HandshakeError> {
 		self.to_byte_array::<32>()
 	}

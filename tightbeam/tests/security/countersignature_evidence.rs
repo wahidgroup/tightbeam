@@ -6,14 +6,14 @@
 //!
 //! A countersignature can fail verification or be withheld. If either case
 //! aborts the handshake before the observer fires, the most suspicious
-//! terminal states, forged-countersignature probes and withheld
-//! countersignatures, are invisible to the application ledger.
+//! terminal states are invisible to the application ledger. Those states are
+//! forged-countersignature probes and withheld countersignatures.
 //!
 //! ## Attack
 //! An attacker tampers with the carriage of a budget-bearing receipt
-//! acknowledgement, or strips the acknowledgement attribute from the
-//! client Finished. The handshake correctly aborts, but the operator's
-//! ledger stays silent: repeated probes leave no evidence.
+//! acknowledgement, which travels sealed in both protocols, or a client
+//! withholds its acknowledgement. The handshake correctly aborts, but the
+//! operator's ledger stays silent: repeated probes leave no evidence.
 //!
 //! ## Expected control
 //! Every concluded receipt exchange MUST reach the observer before the
@@ -26,6 +26,10 @@
 //! The observer records a concluded exchange, so a tamper rejected before the
 //! exchange concludes leaves the ledger unchanged.
 //!
+//! These scenarios tamper with the sealed closing of each protocol. A client
+//! withholds its acknowledgement inside its own sealed closing, so the CMS flow
+//! tests cover that case.
+//!
 //! ## References
 //! - CWE-778: Insufficient Logging <https://cwe.mitre.org/data/definitions/778.html>
 //! - CWE-347: Improper Verification of Cryptographic Signature
@@ -35,14 +39,8 @@
 
 use tightbeam::urn::Urn;
 
-pub(crate) const MISSING_COUNTERSIGNATURE_FAILS_CLOSED: Urn<'static> =
-	tightbeam::urn!("test", "event:countersignature-evidence/missing-countersignature-fails-closed");
 pub(crate) const NO_OUTCOME_BEFORE_CONCLUSION: Urn<'static> =
 	tightbeam::urn!("test", "event:countersignature-evidence/no-outcome-before-conclusion");
-pub(crate) const OUTCOME_RECORDS_MISSING_COUNTERSIGNATURE: Urn<'static> = tightbeam::urn!(
-	"test",
-	"event:countersignature-evidence/outcome-records-missing-countersignature",
-);
 pub(crate) const SESSION_NEVER_ACTIVATES: Urn<'static> =
 	tightbeam::urn!("test", "event:countersignature-evidence/session-never-activates");
 pub(crate) const SETTLE_NEVER_FIRED: Urn<'static> =
@@ -54,7 +52,9 @@ pub(crate) const TAMPERED_CIPHERTEXT_REJECTED: Urn<'static> =
 mod hpke {
 	use std::sync::Arc;
 
-	use super::{NO_OUTCOME_BEFORE_CONCLUSION, SETTLE_NEVER_FIRED, TAMPERED_CIPHERTEXT_REJECTED};
+	use super::{
+		NO_OUTCOME_BEFORE_CONCLUSION, SESSION_NEVER_ACTIVATES, SETTLE_NEVER_FIRED, TAMPERED_CIPHERTEXT_REJECTED,
+	};
 
 	use tightbeam::asn1::OctetString;
 	use tightbeam::crypto::profiles::DefaultCryptoProvider;
@@ -65,7 +65,7 @@ mod hpke {
 	use tightbeam::testing::SetupEnv;
 	use tightbeam::transport::handshake::negotiation::{MuxBudgets, SecurityOffer, TransportOffer};
 	use tightbeam::transport::handshake::receipt::SessionObserver;
-	use tightbeam::transport::handshake::{Handshake, PeerAuthentication};
+	use tightbeam::transport::handshake::{Handshake, HandshakeError, PeerAuthentication};
 	use tightbeam::TightBeamError;
 
 	use crate::common::security::{
@@ -84,7 +84,8 @@ mod hpke {
 			assertions: [
 				(TAMPERED_CIPHERTEXT_REJECTED, exactly!(1), equals!(true)),
 				(SETTLE_NEVER_FIRED, exactly!(1), equals!(true)),
-				(NO_OUTCOME_BEFORE_CONCLUSION, exactly!(1), equals!(true))
+				(NO_OUTCOME_BEFORE_CONCLUSION, exactly!(1), equals!(true)),
+				(SESSION_NEVER_ACTIVATES, exactly!(1), equals!(true))
 			]
 		}
 	}
@@ -120,9 +121,9 @@ mod hpke {
 				let reply = server.reply(client.start()?).await?;
 				let closing = client.respond(reply).await?;
 
-				// The auth signature covers `encrypted_data`, and a flipped
+				// The payload is authenticated encryption, and a flipped
 				// ciphertext byte is the only wire handle a MITM has on the
-				// sealed ack.
+				// sealed acknowledgement.
 				let mut kex = carried_key_exchange(closing);
 				let mut forged = kex.encrypted_data.as_bytes().to_vec();
 				let middle = forged.len() / 2;
@@ -130,25 +131,18 @@ mod hpke {
 				kex.encrypted_data = OctetString::new(forged)?;
 
 				let kex_result = server.finish(carried_closing(&kex)).await;
-				trace.event_with(
-					TAMPERED_CIPHERTEXT_REJECTED,
-					&[],
-					kex_result.is_err(),
-				)?;
-				trace.event_with(
-					SETTLE_NEVER_FIRED,
-					&[],
-					authorizer.settle_calls() == 0,
-				)?;
+				let rejected = matches!(kex_result, Err(HandshakeError::HpkeError(_)));
+				trace.event_with(TAMPERED_CIPHERTEXT_REJECTED, &[], rejected)?;
+				let unsettled = authorizer.settle_calls() == 0;
+				trace.event_with(SETTLE_NEVER_FIRED, &[], unsettled)?;
 
 				// The receipt exchange reached no verdict, so the observer
 				// ledger stays empty.
 				let outcomes = observer.recorded();
-				trace.event_with(
-					NO_OUTCOME_BEFORE_CONCLUSION,
-					&[],
-					outcomes.is_empty(),
-				)?;
+				trace.event_with(NO_OUTCOME_BEFORE_CONCLUSION, &[], outcomes.is_empty())?;
+
+				let inactive = matches!(server.complete(), Err(HandshakeError::InvalidState));
+				trace.event_with(SESSION_NEVER_ACTIVATES, &[], inactive)?;
 
 				Ok::<(), TightBeamError>(())
 			}
@@ -161,111 +155,92 @@ mod cms {
 	use std::sync::Arc;
 
 	use super::{
-		MISSING_COUNTERSIGNATURE_FAILS_CLOSED, OUTCOME_RECORDS_MISSING_COUNTERSIGNATURE, SESSION_NEVER_ACTIVATES,
+		NO_OUTCOME_BEFORE_CONCLUSION, SESSION_NEVER_ACTIVATES, SETTLE_NEVER_FIRED, TAMPERED_CIPHERTEXT_REJECTED,
 	};
 
-	use tightbeam::cms::signed_data::SignedData;
+	use tightbeam::asn1::OctetString;
+	use tightbeam::cms::encrypted_data::EncryptedData;
 	use tightbeam::exactly;
-	use tightbeam::oids::RECEIPT_ACK;
 	use tightbeam::tb_assert_spec;
 	use tightbeam::tb_scenario;
 	use tightbeam::testing::SetupEnv;
 	use tightbeam::transport::handshake::negotiation::MuxBudgets;
-	use tightbeam::transport::handshake::receipt::{SessionObserver, SessionVerdict};
+	use tightbeam::transport::handshake::receipt::SessionObserver;
 	use tightbeam::transport::handshake::{HandshakeError, HandshakeMessage};
 	use tightbeam::TightBeamError;
 
 	use crate::common::security::{
-		cms_mutual_budget_pair, expectation_failure, CmsSessionHooks, GrantingAuthorizer, PayingApprover,
-		RecordingObserver, ServerMaterials,
+		cms_mutual_budget_pair, expectation_failure, CmsSessionHooks, PayingApprover, RecordingObserver,
+		ServerMaterials, SettleSpyAuthorizer,
 	};
 
 	const CHALLENGE: &[u8] = b"evidence-cms-invoice";
 	const RESPONSE: &[u8] = b"evidence-cms-preimage";
 	const REQUEST: MuxBudgets = MuxBudgets { client_to_server: 64, server_to_client: 128 };
 
-	/// The client Finished without its `RECEIPT_ACK` unsigned attribute. No
-	/// signature covers unsigned attributes, so the stripped message stays
-	/// signature-valid.
-	fn strip_receipt_ack(client_finished: &SignedData) -> Result<SignedData, TightBeamError> {
-		let mut signed_data = client_finished.to_owned();
-		let mut signer_info = signed_data
-			.signer_infos
-			.0
-			.iter()
-			.next()
-			.cloned()
-			.ok_or_else(|| expectation_failure("client Finished must carry a SignerInfo"))?;
+	/// The sealed client Finished with the middle byte of its encrypted content
+	/// flipped. A flipped content byte is the one wire handle a MITM has on the
+	/// sealed acknowledgement inside it.
+	fn flip_sealed_content(sealed_finished: &EncryptedData) -> Result<EncryptedData, TightBeamError> {
+		let mut tampered = sealed_finished.to_owned();
+		let content = tampered.enc_content_info.encrypted_content.as_ref();
+		let content = content.ok_or_else(|| expectation_failure("a sealed Finished carries content"))?;
+		let mut forged = content.as_bytes().to_vec();
+		let middle = forged.len() / 2;
 
-		let attrs = signer_info
-			.unsigned_attrs
-			.take()
-			.ok_or_else(|| expectation_failure("client Finished must carry unsigned attributes"))?;
-
-		let retained: Vec<_> = attrs.iter().filter(|attribute| attribute.oid != RECEIPT_ACK).cloned().collect();
-		signer_info.unsigned_attrs = Some(retained.try_into()?);
-		signed_data.signer_infos = vec![signer_info].try_into()?;
-		Ok(signed_data)
+		forged[middle] ^= 0xFF;
+		tampered.enc_content_info.encrypted_content = Some(OctetString::new(forged)?);
+		Ok(tampered)
 	}
 
 	tb_assert_spec! {
-		pub CountersignatureMissingSpec,
+		pub CmsCountersignatureTamperSpec,
 		V(1,0,0): {
 			mode: Accept,
 			assertions: [
-				(MISSING_COUNTERSIGNATURE_FAILS_CLOSED, exactly!(1), equals!(true)),
-				(OUTCOME_RECORDS_MISSING_COUNTERSIGNATURE, exactly!(1), equals!(true)),
+				(TAMPERED_CIPHERTEXT_REJECTED, exactly!(1), equals!(true)),
+				(SETTLE_NEVER_FIRED, exactly!(1), equals!(true)),
+				(NO_OUTCOME_BEFORE_CONCLUSION, exactly!(1), equals!(true)),
 				(SESSION_NEVER_ACTIVATES, exactly!(1), equals!(true))
 			]
 		}
 	}
 
 	tb_scenario! {
-		name: cms_missing_countersignature_recorded,
-		spec: CountersignatureMissingSpec,
+		name: cms_tampered_countersignature_carriage_rejected,
+		spec: CmsCountersignatureTamperSpec,
 		environment Bare {
 			exec: |SetupEnv { trace, .. }| async move {
 				let materials = ServerMaterials::generate();
+				let authorizer = Arc::new(SettleSpyAuthorizer::challenging(CHALLENGE)?);
 				let observer = Arc::new(RecordingObserver::default());
 				let hooks = CmsSessionHooks {
-					authorizer: Some(Arc::new(GrantingAuthorizer::challenging(CHALLENGE)?)),
+					authorizer: Some(Arc::clone(&authorizer) as _),
 					approver: Some(Arc::new(PayingApprover::answering(RESPONSE)?)),
 					observer: Some(Arc::clone(&observer) as Arc<dyn SessionObserver>),
 				};
+
 				let pair = cms_mutual_budget_pair(&materials, REQUEST, hooks)?;
 				let (mut client, mut server) = (pair.client, pair.server);
 
 				let reply = server.reply(client.start()?).await?;
+				let sealed_finished = client.respond(reply).await?.encrypted()?;
+				let tampered = flip_sealed_content(sealed_finished.value())?;
 
-				let client_finished = client.respond(reply).await?.signed()?;
-				// The MITM strips the acknowledgement on the wire.
-				let stripped = strip_receipt_ack(client_finished.value())?;
+				let closing = server.finish(HandshakeMessage::try_from(tampered)?).await;
+				let rejected = matches!(closing, Err(HandshakeError::SealedIdentity));
+				trace.event_with(TAMPERED_CIPHERTEXT_REJECTED, &[], rejected)?;
 
-				// The Finished signature covers no unsigned attribute, so the
-				// stripped Finished passes it, and the missing
-				// countersignature is what refuses the step.
-				let closing = server.finish(HandshakeMessage::try_from(stripped)?).await;
-				let ack_refused = matches!(closing, Err(HandshakeError::CountersignatureMissing));
-				trace.event_with(
-					MISSING_COUNTERSIGNATURE_FAILS_CLOSED,
-					&[],
-					ack_refused,
-				)?;
+				let unsettled = authorizer.settle_calls() == 0;
+				trace.event_with(SETTLE_NEVER_FIRED, &[], unsettled)?;
 
+				// The receipt exchange reached no verdict, so the observer
+				// ledger stays empty.
 				let outcomes = observer.recorded();
-				let missing_recorded = outcomes.len() == 1
-					&& outcomes[0].verdict == SessionVerdict::CountersignatureMissing
-					&& outcomes[0].countersignature.is_none()
-					&& outcomes[0].ancillary_response.is_none();
-				trace.event_with(
-					OUTCOME_RECORDS_MISSING_COUNTERSIGNATURE,
-					&[],
-					missing_recorded,
-				)?;
+				trace.event_with(NO_OUTCOME_BEFORE_CONCLUSION, &[], outcomes.is_empty())?;
 
-				let activation = server.complete();
-				let activation_refused = matches!(activation, Err(HandshakeError::InvalidState));
-				trace.event_with(SESSION_NEVER_ACTIVATES, &[], activation_refused)?;
+				let inactive = matches!(server.complete(), Err(HandshakeError::InvalidState));
+				trace.event_with(SESSION_NEVER_ACTIVATES, &[], inactive)?;
 
 				Ok::<(), TightBeamError>(())
 			}

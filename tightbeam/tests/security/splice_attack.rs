@@ -1,24 +1,25 @@
-//! # Key-exchange splice threat (mutual authentication)
+//! # Identity splice threat (mutual authentication)
 //!
 //! ## Weakness
-//! If the HPKE mutual-auth client signature covers only the transcript hash,
-//! it does not commit to the HPKE `encrypted_data` carrying the base secret.
-//! HPKE encryption is a public-key operation, and `client_random` is public
-//! (sent in `ClientHello`), so anyone can produce a decryptable payload with
-//! the victim's random.
+//! A client certificate is public. If a server admitted an offered certificate
+//! without a signature by its key over this session, an attacker could splice
+//! the certificate of a victim into a closing of its own. The server would then
+//! attribute a session key the attacker holds to the identity of the victim.
 //!
 //! ## Attack
-//! 1. A MITM captures a victim's `ClientKeyExchange` (certificate and signature).
-//! 2. The MITM encrypts a payload of `attacker_key` and `victim_client_random` to the server's public key.
-//! 3. The MITM splices its `encrypted_data` into the victim's message, keeping
-//!    the victim's certificate and signature intact.
-//! 4. A transcript-only signature still verifies: the server would attribute an
-//!    attacker-controlled session key to the victim's authenticated identity.
+//! 1. The attacker holds the certificate of a victim, but not its signing key.
+//! 2. The attacker runs a handshake of its own and offers the certificate of the victim as its identity.
+//! 3. The attacker signs the possession proof under its own key.
+//!
+//! The closing seals the certificate and its proof under a key of the
+//! handshake secret, so an attacker cannot lift the proof of a victim from a
+//! recorded closing and splice it into its own.
 //!
 //! ## Expected control
-//! The client signature MUST commit to the exact `encrypted_data` and client
-//! certificate (`Digest(transcript_hash || encrypted_data || cert_der)`), so a
-//! spliced payload MUST fail signature verification.
+//! The possession signature MUST verify under the key of the offered
+//! certificate, over the digest of the domain, the transcript hash, the client
+//! ephemeral, and the certificate DER. The closing of the attacker MUST fail
+//! signature verification.
 //!
 //! ## References
 //! - CWE-347: Improper Verification of Cryptographic Signature
@@ -29,35 +30,26 @@
 use std::sync::Arc;
 
 use tightbeam::{
-	asn1::OctetString,
-	constants::TIGHTBEAM_HPKE_HANDSHAKE_INFO,
 	crypto::{
-		hpke::{HpkePublicKeyOps, HpkeSecp256k1Sha3Aes256Gcm},
 		profiles::DefaultCryptoProvider,
 		x509::policy::{CertificateValidation, ExpiryValidator},
 	},
-	der::{Decode, Encode},
 	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
 	testing::{ScenarioConfig, SetupEnv},
 	trace::TraceCollector,
-	transport::handshake::{
-		negotiation::SecurityOffer, ClientKeyExchange, Handshake, HandshakeError, PeerAuthentication,
-	},
+	transport::handshake::{negotiation::SecurityOffer, Handshake, HandshakeError, PeerAuthentication},
+	transport::state::ClientIdentity,
 	urn::Urn,
 	TightBeamError,
 };
 
 use crate::common::security::{
-	carried_closing, carried_key_exchange, default_security_profile, expectation_failure, hpke_client_config,
-	hpke_server_config, pinning_validator, ClientMaterials, ServerMaterials,
+	default_security_profile, expectation_failure, hpke_client_config, hpke_server_config, pinning_validator,
+	ClientMaterials, ServerMaterials,
 };
-use crate::security::common::{open_key_exchange, KeyExchangePayload};
 
 pub(crate) const SPLICED_KEX_REJECTED: Urn<'static> =
 	tightbeam::urn!("test", "event:splice-attack/spliced-kex-rejected");
-
-/// The HPKE suite of the default provider, which seals the key exchange.
-type Suite = HpkeSecp256k1Sha3Aes256Gcm;
 
 tb_assert_spec! {
 	pub SpliceAttackSpec,
@@ -80,7 +72,7 @@ tb_process_spec! {
 		Done => { }
 	}
 	terminal { Done }
-	annotations { description: "Splice attack: client signature must bind encrypted_data + certificate" }
+	annotations { description: "Splice attack: the possession signature must verify under the offered certificate" }
 }
 
 tb_scenario! {
@@ -102,13 +94,16 @@ job! {
 		let materials = ServerMaterials::generate();
 		let profile = default_security_profile();
 
-		// The victim is a client with an authenticated identity.
-		let client_materials = ClientMaterials::deterministic();
-		let client_identity = client_materials.identity();
+		// The victim holds an authenticated identity whose certificate is
+		// public. The attacker offers that certificate and proves it with its
+		// own key.
+		let victim = ClientMaterials::deterministic();
+		let attacker = ClientMaterials::generate();
+		let spliced = ClientIdentity::new(Arc::clone(&victim.certificate), Arc::clone(&attacker.key_manager));
 		let validator = pinning_validator(&materials.certificate);
 
 		let mut config = hpke_client_config(validator);
-		config.flow.identity = Some(client_identity);
+		config.flow.identity = Some(spliced);
 		config.security_offer = Some(SecurityOffer::new(vec![profile]));
 
 		let mut client = Handshake::client(config);
@@ -120,57 +115,18 @@ job! {
 
 		let mut server = Handshake::server(server_config);
 
-		// The victim's certificate is public, so the attacker can seal its
-		// splice under the same associated data the victim used.
-		let victim_certificate = Some(client_materials.certificate.as_ref());
-		let spliced_aad = ClientKeyExchange::client_bound_aad(crate::security::common::HANDSHAKE_AAD, victim_certificate)?;
-
 		let reply = server.reply(client.start()?).await?;
 		let closing = client.respond(reply).await?;
-		let client_kex_der = carried_key_exchange(closing).to_der()?;
-
-		// Recover the victim's client_random from the legitimate payload so the
-		// spliced ciphertext still passes the server's replay check.
-		let victim_kex = ClientKeyExchange::from_der(&client_kex_der)?;
-		let victim_sealed = victim_kex.encrypted_data.as_bytes();
-		let victim_payload = open_key_exchange(victim_sealed, materials.secret_key(), &spliced_aad)?;
-
-		// The attacker forges a payload with its own key under the server's
-		// public key and splices it into the victim's message. The splice keeps
-		// the victim's client_random, client ephemeral, key-confirmation tag,
-		// and DER framing.
-		let forged_payload = KeyExchangePayload {
-			base_key: OctetString::new([0x41u8; 32])?, // attacker-chosen key
-			client_random: victim_payload.client_random,
-			client_ephemeral: victim_payload.client_ephemeral,
-			key_confirmation: victim_payload.key_confirmation,
-		};
-
-		let forged_plain = forged_payload.to_der()?;
-		let recipient_pub = materials.secret_key().public_key();
-		let info = TIGHTBEAM_HPKE_HANDSHAKE_INFO;
-		let forged_message = recipient_pub.seal::<Suite>(info, &spliced_aad, &forged_plain, None)?;
-
-		let spliced = ClientKeyExchange {
-			encrypted_data: OctetString::new(forged_message.to_bytes())?,
-			client_certificate: victim_kex.client_certificate.to_owned(),
-			client_signature: victim_kex.client_signature.to_owned(),
-		};
-
-		let spliced_der = spliced.to_der()?;
-		if spliced_der == client_kex_der {
-			return Err(expectation_failure("splice produced identical ClientKeyExchange bytes"));
-		}
 
 		// The possession signature is the control, so the refusal must name
-		// it. Any later check, the key confirmation among them, would refuse
-		// this splice as well and prove nothing about the signature.
-		match server.finish(carried_closing(&spliced)).await {
+		// it. The key confirmation and the validator both admit the closing of
+		// the attacker, so no other check refuses it first.
+		match server.finish(closing).await {
 			Err(HandshakeError::SignatureError(_)) => {
 				trace.event(SPLICED_KEX_REJECTED)?;
 			}
-			Err(_) => return Err(expectation_failure("the splice was refused by a check after the possession signature")),
-			Ok(_) => return Err(expectation_failure("server accepted a spliced key exchange under victim identity")),
+			Err(_) => return Err(expectation_failure("the splice was refused by a check other than the possession signature")),
+			Ok(_) => return Err(expectation_failure("server accepted a spliced identity")),
 		}
 
 		Ok(())

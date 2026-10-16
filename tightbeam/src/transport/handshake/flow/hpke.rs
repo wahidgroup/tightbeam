@@ -1,8 +1,8 @@
 //! The HPKE flow.
 //!
-//! HPKE tunnels its own messages inside the two containers. The client
-//! learns the server from the reply, and it seals the base secret to the
-//! server's static key on the closing.
+//! HPKE tunnels its own messages inside the signed and the enveloped
+//! container. The client learns the server from the reply, and it seals the
+//! base secret to the server's static key on the closing.
 //!
 //! The client holds two ephemeral keys, and each serves one agreement
 //! (RFC 9180 § 9.2.3):
@@ -10,6 +10,17 @@
 //! - `r` agrees with the server ephemeral `E`, and `r·E` feeds the handshake
 //!   secret. Its public half travels inside the sealed payload.
 //! - HPKE draws its own ephemeral to seal the closing payload to the server's static key.
+//!
+//! ## Client identity
+//!
+//! A client with an identity seals its certificate and its possession
+//! signature under a key of the handshake secret, inside the payload. The
+//! server's static key opens the payload alone, so a recording plus that key
+//! reads no byte of the identity. The server's closing runs in this order:
+//!
+//! 1. It opens the payload, runs the agreement, and opens the identity.
+//! 2. `Offer::new` compares `R` and the encapsulated key with the key of the certificate.
+//! 3. The key-confirmation tag is verified, and then the validity, validator, and possession checks run.
 
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, vec::Vec};
@@ -33,21 +44,21 @@ use crate::random::{generate_nonce, CryptoRngCore, RngWrapper};
 use crate::transport::handshake::attributes::HandshakeAttributes;
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::flow::{
-	sealed, ClientLegs, ClosingBinding, ClosingIntake, ClosingOpened, ClosingParts, HandshakeFlow, Opened,
-	OpeningIntake, OpeningParts, ProofRequest, ReplyBinding, ReplyIntake, ReplyParts, ServerLegs,
+	sealed, ClientLegs, ClosingBinding, ClosingOpened, ClosingParts, HandshakeFlow, Offer, Opened, OpeningIntake,
+	OpeningParts, ProofRequest, ReplyBinding, ReplyIntake, ReplyParts, ServerLegs,
 };
 use crate::transport::handshake::negotiation::{SecurityAccept, TransportAccept};
 use crate::transport::handshake::peer::{LearnedTrust, PeerCertificate, PossessionProof};
 use crate::transport::handshake::primitives::transcript::{HpkeHandshakeLegs, Transcript};
 use crate::transport::handshake::primitives::KdfSalt;
 use crate::transport::handshake::schedule::{
-	Agreement, BaseSecret, ClientStatic, CompressedPoint, HandshakeVerifyingKey, KeyConfirmation, PeerEphemeral,
-	PeerPoint, Salt, Terms,
+	Agreement, BaseSecret, CompressedPoint, HandshakeVerifyingKey, KeyConfirmation, PeerPoint, Salt, Sealer,
+	SecretSeal, Terms,
 };
 use crate::transport::handshake::wire::HandshakeOctets;
 use crate::transport::handshake::{
 	Arc, ClientHello, ClientKeyExchange, HandshakeCurve, HandshakeMessage, HandshakeProvider, HandshakeSecret,
-	HpkeSessionPayload, ServerHandshake, TunneledMessage,
+	HpkeIdentity, HpkeSessionPayload, ServerHandshake, TunneledMessage,
 };
 use crate::transport::state::ClientIdentity;
 use crate::transport::wire_der::WireDer;
@@ -124,12 +135,26 @@ pub struct HpkeAgreed {
 	client_ephemeral: [u8; EC_PUBKEY_COMPRESSED_SIZE],
 }
 
-/// A `ClientKeyExchange` that awaits its possession signature.
-pub struct HpkeClosingDraft {
-	/// The payload, sealed to the server's static key.
-	encrypted_data: Vec<u8>,
+/// A `ClientKeyExchange` that awaits its possession signature, with what its
+/// two seals need once the signature exists.
+pub struct HpkeClosingDraft<P: HandshakeProvider> {
+	/// The base secret and the client ephemeral. It is boxed, so a move copies
+	/// a pointer, and the base secret is wiped where the box drops.
+	agreed: Box<HpkeAgreed>,
+	/// The client random the payload echoes.
+	client_random: [u8; 32],
+	/// The proof that the client derived the handshake secret.
+	confirmation: KeyConfirmation,
+	/// The receipt countersignature, sealed under the handshake secret.
+	sealed_ack: Option<Vec<u8>>,
 	/// The certificate the client presents, when it holds an identity.
 	certificate: Option<Certificate>,
+	/// The single-use AEAD the identity is sealed under.
+	identity_sealer: Sealer<P>,
+	/// The server's static key, which the payload is sealed to.
+	server_key: PublicKey<P::Curve>,
+	/// The domain tag the payload is sealed under.
+	aad_domain_tag: &'static [u8],
 }
 
 impl<P: HandshakeProvider> ClientLegs<P> for Hpke {
@@ -139,7 +164,7 @@ impl<P: HandshakeProvider> ClientLegs<P> for Hpke {
 	type Pending = ();
 	type Reply = HpkeReply;
 	type Agreed = Box<HpkeAgreed>;
-	type Draft = HpkeClosingDraft;
+	type Draft = HpkeClosingDraft<P>;
 
 	fn identity(settings: &Self::Settings) -> Option<&ClientIdentity<P>> {
 		settings.identity.as_ref()
@@ -262,58 +287,87 @@ impl<P: HandshakeProvider> ClientLegs<P> for Hpke {
 		agreed: Self::Agreed,
 		reply: Self::Reply,
 		settings: &'a Self::Settings,
-		parts: ClosingParts<'_, P::Curve>,
+		parts: ClosingParts<'_, P>,
 	) -> Result<ClosingBinding<'a, Self, P>, HandshakeError> {
-		// The base secret is read in place, so it is wiped where the box drops.
-		let HpkeAgreed { base, client_ephemeral } = agreed.as_ref();
-		let ClosingParts { server, transcript_hash, sealed_ack, confirmation } = parts;
-
-		// 1. Encode the payload. The DER buffer holds the base secret, so it
-		//    wipes when dropped, along with the transient OCTET STRING copy.
-		let payload = HpkeSessionPayload {
-			base_key: OctetString::new(base.as_bytes())?,
-			client_random: OctetString::new(reply.client_random.as_slice())?,
-			client_ephemeral: OctetString::new(client_ephemeral.as_slice())?,
-			key_confirmation: confirmation,
-			receipt_ack: sealed_ack.map(OctetString::new).transpose()?,
-		};
-		let plaintext = Zeroizing::new(payload.to_der()?);
-		payload.base_key.into_bytes().zeroize();
-
-		// 2. Seal the payload to the server's static key. The associated data
-		//    binds it to the certificate this client presents, so it opens
-		//    only under that certificate.
+		let ClosingParts { server, transcript_hash, sealed_ack, confirmation, identity_sealer } = parts;
 		let identity = settings.identity.as_ref();
-		let certificate = identity.map(ClientIdentity::certificate);
-		let aad = ClientKeyExchange::client_bound_aad(settings.aad_domain_tag, certificate)?;
-		let static_key = server.key();
-		let sealed = static_key.seal::<P::HpkeSuite>(TIGHTBEAM_HPKE_HANDSHAKE_INFO, &aad, &plaintext, None)?;
-		let encrypted_data = sealed.to_bytes();
 
-		// 3. Name the bytes the identity signs. The digest covers the
-		//    transcript hash, the sealed payload, and the certificate, so the
-		//    signature binds to this key exchange and this identity alone.
+		// 1. Name the bytes the identity signs. The digest covers a domain
+		//    label, the transcript hash, the client ephemeral, and the
+		//    certificate, so the signature binds to this handshake, this
+		//    agreement, and this identity alone.
 		let proof = match identity {
 			Some(identity) => {
 				let certificate_der = identity.certificate().to_der()?;
-				let mut signed = Transcript::hpke_client_auth(transcript_hash, &encrypted_data, &certificate_der);
+				let client_ephemeral = &agreed.client_ephemeral;
+				let mut signed = Transcript::hpke_client_auth(transcript_hash, client_ephemeral, &certificate_der);
 				let prehash = signed.seal::<P::Digest>()?.to_vec();
 				Some(ProofRequest { prehash, signer: identity.signing_provider() })
 			}
 			None => None,
 		};
-		let draft = HpkeClosingDraft { encrypted_data, certificate: certificate.cloned() };
+
+		// 2. Keep what the two seals need until the signature exists. The
+		//    signature travels inside the seals, so it cannot cover them.
+		let certificate = identity.map(ClientIdentity::certificate).cloned();
+		let draft = HpkeClosingDraft {
+			agreed,
+			client_random: reply.client_random,
+			confirmation,
+			sealed_ack,
+			certificate,
+			identity_sealer,
+			server_key: *server.key(),
+			aad_domain_tag: settings.aad_domain_tag,
+		};
 		Ok(ClosingBinding { proof, draft })
 	}
 
 	fn encode_closing(draft: Self::Draft, proof: Option<Vec<u8>>) -> Result<HandshakeMessage, HandshakeError> {
-		let HpkeClosingDraft { encrypted_data, certificate } = draft;
-		let signature = proof.map(OctetString::new).transpose()?;
-		let key_exchange = ClientKeyExchange {
-			encrypted_data: OctetString::new(encrypted_data)?,
-			client_certificate: certificate,
-			client_signature: signature,
+		let HpkeClosingDraft {
+			agreed,
+			client_random,
+			confirmation,
+			sealed_ack,
+			certificate,
+			identity_sealer,
+			server_key,
+			aad_domain_tag,
+		} = draft;
+
+		// 1. Seal the certificate and its signature under the identity key of
+		//    the handshake secret. The orchestrator signs the proof this flow
+		//    asked for, so a certificate or a signature that comes alone fails
+		//    closed.
+		let sealed_identity = match (certificate, proof) {
+			(Some(certificate), Some(signature)) => {
+				let encoded = HpkeIdentity { certificate, signature: OctetString::new(signature)? };
+				let plaintext = Zeroizing::new(encoded.to_der()?);
+				let sealed = identity_sealer.seal(plaintext.as_slice())?;
+				Some(OctetString::new(sealed)?)
+			}
+			(None, None) => None,
+			_ => return Err(HandshakeError::MutualAuthRequired),
 		};
+
+		// 2. Encode the payload. The DER buffer holds the base secret, so it
+		//    wipes when dropped, along with the transient OCTET STRING copy.
+		let payload = HpkeSessionPayload {
+			base_key: OctetString::new(agreed.base.as_bytes())?,
+			client_random: OctetString::new(client_random.as_slice())?,
+			client_ephemeral: OctetString::new(agreed.client_ephemeral.as_slice())?,
+			key_confirmation: confirmation,
+			receipt_ack: sealed_ack.map(OctetString::new).transpose()?,
+			sealed_identity,
+		};
+		let plaintext = Zeroizing::new(payload.to_der()?);
+		payload.base_key.into_bytes().zeroize();
+
+		// 3. Seal the payload to the server's static key, under the domain tag.
+		let info = TIGHTBEAM_HPKE_HANDSHAKE_INFO;
+		let sealed = server_key.seal::<P::HpkeSuite>(info, aad_domain_tag, &plaintext, None)?;
+		let encrypted_data = OctetString::new(sealed.to_bytes())?;
+		let key_exchange = ClientKeyExchange { encrypted_data };
 
 		let carrier = EnvelopedData::try_from(&key_exchange)?;
 		HandshakeMessage::try_from(carrier)
@@ -370,8 +424,8 @@ pub struct HpkeClosing<S: HpkeSuite> {
 	message: HpkeMessage<S>,
 	/// The server's static key, which the message was sealed to.
 	recipient: PublicKey<S::Curve>,
-	/// The associated data the payload was sealed under.
-	aad: Vec<u8>,
+	/// The domain tag the payload was sealed under.
+	aad_domain_tag: &'static [u8],
 	/// The server ephemeral `e`, which serves one agreement. It is boxed, so
 	/// a move of the closing copies a pointer.
 	ephemeral: Box<EphemeralSecret<S::Curve>>,
@@ -382,23 +436,24 @@ pub struct HpkeClosing<S: HpkeSuite> {
 /// The proof of an HPKE key exchange that the key of the offered
 /// certificate signed it.
 ///
-/// The signed digest covers the transcript hash, the encrypted payload, and
-/// the offered certificate, so the signature binds to one exchange and one
-/// identity.
+/// The signed digest covers a domain label, the transcript hash, the client
+/// ephemeral, and the offered certificate, so the signature binds to one
+/// purpose, one handshake, one agreement, and one identity.
 pub struct HpkePossession {
 	signature: Vec<u8>,
-	encrypted_data: Vec<u8>,
-	certificate_der: Vec<u8>,
+	client_ephemeral: [u8; EC_PUBKEY_COMPRESSED_SIZE],
 }
 
 impl<P: HandshakeProvider> PossessionProof<P> for HpkePossession {
-	fn verify(self, key: P::VerifyingKey, terms: &Terms<P>) -> Result<(), HandshakeError> {
+	fn verify(self, identity: &PeerCertificate<P::Curve>, terms: &Terms<P>) -> Result<(), HandshakeError> {
 		let transcript_hash = terms.transcript_hash();
-		let mut signed = Transcript::hpke_client_auth(transcript_hash, &self.encrypted_data, &self.certificate_der);
+		let certificate_der = identity.certificate().to_der()?;
+		let mut signed = Transcript::hpke_client_auth(transcript_hash, &self.client_ephemeral, certificate_der);
 		let digest = signed.seal::<P::Digest>()?;
 
 		let parsed = P::Signature::try_from(self.signature.as_slice());
 		let signature = parsed.map_err(|_| HandshakeError::SignatureVerificationFailed)?;
+		let key = P::VerifyingKey::from(*identity.key());
 		signature.verify_prehash(&key, digest)?;
 		Ok(())
 	}
@@ -410,8 +465,8 @@ struct SessionPayload<C: HandshakeCurve> {
 	base: BaseSecret,
 	/// The client random the payload echoes against replay.
 	client_random: [u8; 32],
-	/// The client ephemeral, admitted as a point of the curve that differs
-	/// from the client's static key.
+	/// The client ephemeral as a point of the curve. The identity that tells
+	/// whether it collapses into a static key opens only after the agreement.
 	client_ephemeral: PeerPoint<C>,
 	/// The key-confirmation tag of the client.
 	confirmation: KeyConfirmation,
@@ -419,6 +474,9 @@ struct SessionPayload<C: HandshakeCurve> {
 	/// Its signed attributes bind the bearer settlement answer, so it opens
 	/// only after the ephemeral-ephemeral agreement.
 	receipt_ack: Option<OctetString>,
+	/// The client identity, sealed under the identity key of the handshake
+	/// secret, when the client presents one.
+	sealed_identity: Option<OctetString>,
 }
 
 impl<C: HandshakeCurve> SessionPayload<C> {
@@ -426,26 +484,35 @@ impl<C: HandshakeCurve> SessionPayload<C> {
 	/// 32-byte geometry of the base secret. A payload with no key-confirmation
 	/// tag, or with one of another width, fails to decode.
 	///
-	/// The client ephemeral is admitted through [`PeerEphemeral`] as a point of
-	/// the curve that differs from `client_static`.
-	fn parse(decrypted: &[u8], client_static: &ClientStatic<C>) -> Result<Self, HandshakeError> {
+	/// The client ephemeral is parsed as a point of the curve. The comparison
+	/// with the client's static key waits for the identity, which opens only
+	/// after the agreement.
+	fn parse(decrypted: &[u8]) -> Result<Self, HandshakeError> {
 		let payload = HpkeSessionPayload::from_der(decrypted);
 		let payload = payload.map_err(|_| HandshakeError::InvalidDecryptedPayloadSize)?;
-		let HpkeSessionPayload { base_key, client_random, client_ephemeral, key_confirmation, receipt_ack } = payload;
+		let HpkeSessionPayload {
+			base_key,
+			client_random,
+			client_ephemeral,
+			key_confirmation,
+			receipt_ack,
+			sealed_identity,
+		} = payload;
 
 		// The decoded buffer moves into its wiping wrapper without a copy, and
 		// the parse copies it into the fixed-width secret, so no plain array of
 		// key material exists on the way (CWE-226).
 		let base = BaseSecret::try_from(SecretSlice::from(base_key.into_bytes()))?;
 		let client_random = client_random.to_32_byte_array()?;
-		let point = client_ephemeral.to_byte_array::<EC_PUBKEY_COMPRESSED_SIZE>()?;
-		let client_ephemeral = client_static.client_ephemeral(&point)?;
+		let client_ephemeral = client_ephemeral.to_byte_array::<EC_PUBKEY_COMPRESSED_SIZE>()?;
+		let client_ephemeral = PeerPoint::parse(client_ephemeral)?;
 		Ok(Self {
 			base,
 			client_random,
 			client_ephemeral,
 			confirmation: key_confirmation,
 			receipt_ack,
+			sealed_identity,
 		})
 	}
 }
@@ -567,65 +634,48 @@ impl<P: HandshakeProvider> ServerLegs<P> for Hpke {
 		pending: Self::Pending,
 		settings: &Self::Settings,
 		closing: HandshakeMessage,
-	) -> Result<ClosingIntake<Self, P>, HandshakeError> {
+	) -> Result<Self::Closing, HandshakeError> {
 		// 1. Take the carrier, and refuse one that carries an abort alert.
 		let carrier = closing.enveloped()?;
-		if let Some(attrs) = carrier.value().unprotected_attrs.as_ref() {
-			attrs.refuse_alert()?;
-		}
+		carrier.value().unprotected_attrs.refuse_alert()?;
 
 		// 2. Decode the key exchange. The parse validates the encapsulated key
 		//    and the ciphertext length, so the static ECDH runs on a point of
 		//    the curve and on a message that carries a tag.
-		let key_exchange = ClientKeyExchange::try_from(carrier.value())?;
-		let ClientKeyExchange { encrypted_data, client_certificate, client_signature } = key_exchange;
+		let ClientKeyExchange { encrypted_data } = ClientKeyExchange::try_from(carrier.value())?;
 		let message = HpkeMessage::<P::HpkeSuite>::from_bytes(encrypted_data.as_bytes())?;
 		let recipient = settings.certificate.verifying_key::<P::Curve>()?;
 
-		// 3. Parse the offered identity once, and refuse an encapsulated key
-		//    that collapses into its static key. The encapsulated key is a
-		//    client ephemeral as well: a client that seals under its static key
-		//    leaves the payload to the secrecy of that key.
-		let parsed = client_certificate.map(PeerCertificate::<P::Curve>::parse);
-		let identity = parsed.transpose()?;
-		let client_static = ClientStatic::of(identity);
-		client_static.client_ephemeral_point(*message.encapsulated_key())?;
-
-		// 4. Build the associated data and the possession proof over the
-		//    offered certificate. A signature with no certificate binds no
-		//    certificate bytes, and admission refuses it unverified.
-		let offered = client_static.identity().map(|identity| identity.certificate().as_ref());
-		let aad = ClientKeyExchange::client_bound_aad(settings.aad_domain_tag, offered)?;
-		let certificate_der = offered.map(Encode::to_der).transpose()?.unwrap_or_default();
-		let proof = client_signature.map(|signature| HpkePossession {
-			signature: signature.into_bytes(),
-			encrypted_data: encrypted_data.into_bytes(),
-			certificate_der,
-		});
-
 		let HpkeServerPending { ephemeral, client_random } = pending;
-		let closing = HpkeClosing { message, recipient, aad, ephemeral, client_random };
-		Ok(ClosingIntake { client_static, proof, closing })
+		let aad_domain_tag = settings.aad_domain_tag;
+		Ok(HpkeClosing { message, recipient, aad_domain_tag, ephemeral, client_random })
 	}
 
 	fn settle<'a>(
 		closing: Self::Closing,
-		client_static: &'a ClientStatic<P::Curve>,
 		terms: &'a Terms<P>,
 		key: &'a dyn SigningKeyProvider,
-	) -> MaybeSendFuture<'a, Result<ClosingOpened, HandshakeError>> {
+	) -> MaybeSendFuture<'a, Result<ClosingOpened<Self, P>, HandshakeError>> {
 		Box::pin(async move {
-			let HpkeClosing { message, recipient, aad, ephemeral, client_random } = closing;
+			let HpkeClosing { message, recipient, aad_domain_tag, ephemeral, client_random } = closing;
 
-			// 1. Open the payload under the associated data. The key provider
-			//    runs the static ECDH step on the encapsulated key the parse
+			// 1. Open the payload under the domain tag. The key provider runs
+			//    the static ECDH step on the encapsulated key the parse
 			//    validated.
-			let enc = message.encapsulated_key().to_encoded_point(false);
+			let encapsulated_key = *message.encapsulated_key();
+			let enc = encapsulated_key.to_encoded_point(false);
 			let agreed = key.key_agreement(enc.as_bytes()).await?;
 			let shared_secret = EcdhSecret::try_from(agreed)?;
-			let plaintext = shared_secret.open(&recipient, &message, TIGHTBEAM_HPKE_HANDSHAKE_INFO, &aad)?;
-			let payload = plaintext.with(|payload| SessionPayload::<P::Curve>::parse(payload, client_static))?;
-			let SessionPayload { base, client_random: echoed, client_ephemeral, confirmation, receipt_ack } = payload;
+			let plaintext = shared_secret.open(&recipient, &message, TIGHTBEAM_HPKE_HANDSHAKE_INFO, aad_domain_tag)?;
+			let payload = plaintext.with(|payload| SessionPayload::<P::Curve>::parse(payload))?;
+			let SessionPayload {
+				base,
+				client_random: echoed,
+				client_ephemeral,
+				confirmation,
+				receipt_ack,
+				sealed_identity,
+			} = payload;
 
 			// 2. Verify that the payload echoes the client random of the hello, which prevents replay.
 			let is_echo: bool = echoed.ct_eq(&client_random).into();
@@ -640,8 +690,28 @@ impl<P: HandshakeProvider> ServerLegs<P> for Hpke {
 			let agreement = Agreement::<P>::new(&base, &client_ephemeral);
 			let secret = agreement.settle(ephemeral.as_ref(), terms.kdf_salt())?;
 
+			// 4. Open the client identity under the identity key of the secret
+			//    and parse its certificate once. The encapsulated key is also a
+			//    client ephemeral, so a client whose payload ephemeral or
+			//    encapsulated key collapses into the key of that certificate is
+			//    refused.
+			let offer = match sealed_identity {
+				Some(sealed) => {
+					let sealer = terms.sealer(&secret, SecretSeal::Identity)?;
+					let opened = sealer.open(sealed.as_bytes())?;
+					let HpkeIdentity { certificate, signature } = opened.with(|der| HpkeIdentity::from_der(der))?;
+					let identity = PeerCertificate::<P::Curve>::parse(certificate)?;
+					let signature = signature.into_bytes();
+					let signed_ephemeral = client_ephemeral.as_public_key().compressed_point()?;
+					let proof = HpkePossession { signature, client_ephemeral: signed_ephemeral };
+					let ephemerals = [client_ephemeral.as_public_key(), &encapsulated_key];
+					Offer::new(identity, proof, ephemerals)?
+				}
+				None => Offer::anonymous(),
+			};
+
 			let receipt_ack = receipt_ack.map(OctetString::into_bytes);
-			Ok(ClosingOpened { secret, receipt_ack, confirmation })
+			Ok(ClosingOpened { secret, confirmation, receipt_ack, offer })
 		})
 	}
 }
@@ -656,7 +726,7 @@ mod tests {
 	use crate::crypto::hash::Sha3_256;
 	use crate::crypto::hpke::HpkeError::DecryptionFailed;
 	use crate::crypto::hpke::HpkeSecp256k1Sha3Aes256Gcm;
-	use crate::crypto::profiles::SecurityProfileDesc;
+	use crate::crypto::profiles::{DefaultCryptoProvider, SecurityProfileDesc};
 	use crate::crypto::sign::ecdsa::k256::Secp256k1;
 	use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1VerifyingKey};
 	use crate::crypto::sign::PrehashSigner;
@@ -668,6 +738,7 @@ mod tests {
 	use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey};
 	use crate::transport::handshake::attributes::HandshakeAttribute;
 	use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer, TransportOffer};
+	use crate::transport::handshake::receipt::StoredReceipt;
 	use crate::transport::handshake::schedule::CompressedPoint;
 	use crate::transport::handshake::tests::*;
 	use crate::transport::handshake::{Handshake, HandshakeAlert, HandshakePhase, PeerAuthentication};
@@ -675,9 +746,7 @@ mod tests {
 
 	/// The configuration of an anonymous client that trusts `server`.
 	fn anonymous_client(server: &TestCertificate) -> TestClientConfig<Hpke> {
-		let mut config = Hpke::client(&server.certificate, &create_test_certificate());
-		config.flow.identity = None;
-		config
+		hpke_client(&server.certificate, None)
 	}
 
 	/// An anonymous client that trusts `server` and has sent its hello under
@@ -807,11 +876,6 @@ mod tests {
 		(server, confirming)
 	}
 
-	/// A client that offers no certificate, as the payload parse takes it.
-	fn anonymous() -> ClientStatic<Secp256k1> {
-		ClientStatic::of(None)
-	}
-
 	/// The DER of an `HpkeSessionPayload` that carries `base_key`,
 	/// `client_random`, `client_ephemeral`, and `receipt_ack` at the widths
 	/// they come in, beside `confirmation`.
@@ -829,6 +893,7 @@ mod tests {
 			client_ephemeral: octets(client_ephemeral.as_ref()),
 			key_confirmation: confirmation.to_owned(),
 			receipt_ack: receipt_ack.map(octets),
+			sealed_identity: None,
 		};
 		payload.to_der().expect("the payload encodes")
 	}
@@ -871,23 +936,10 @@ mod tests {
 		aad: impl AsRef<[u8]>,
 	) -> Vec<u8> {
 		let ephemeral = SecretKey::<Secp256k1>::random(&mut OsRng);
-		sealed_payload_from(&ephemeral, server, confirming, client_random, receipt_ack, aad)
-	}
-
-	/// The payload of [`sealed_payload`] under the client ephemeral
-	/// `ephemeral`, for a fixture that chooses that key.
-	fn sealed_payload_from(
-		ephemeral: &SecretKey<Secp256k1>,
-		server: &TestCertificate,
-		confirming: &Confirming,
-		client_random: &[u8; 32],
-		receipt_ack: Option<&[u8]>,
-		aad: impl AsRef<[u8]>,
-	) -> Vec<u8> {
 		let static_key = PublicKey::<Secp256k1>::from_sec1_bytes(server.certificate.verifying_key_bytes());
 		let static_key = static_key.expect("the test certificate carries a point on the curve");
 		let base = BaseSecret::random(None).expect("the random source draws a base secret");
-		let confirmation = confirming.tag(&base, ephemeral);
+		let confirmation = confirming.tag(&base, &ephemeral);
 		let client_ephemeral = ephemeral.public_key().compressed_point().expect("a point compresses");
 		let base_key = base.as_bytes();
 		let plaintext = session_payload_der(base_key, client_random, client_ephemeral, &confirmation, receipt_ack);
@@ -896,11 +948,10 @@ mod tests {
 		sealed.expect("the payload seals").to_bytes()
 	}
 
-	/// A `ClientKeyExchange` that carries `encrypted_data` and offers no
-	/// identity.
-	fn anonymous_key_exchange(encrypted_data: impl AsRef<[u8]>) -> ClientKeyExchange {
+	/// A `ClientKeyExchange` whose one field carries `encrypted_data`.
+	fn key_exchange_of(encrypted_data: impl AsRef<[u8]>) -> ClientKeyExchange {
 		let encrypted_data = OctetString::new(encrypted_data.as_ref()).expect("sealed bytes are an OCTET STRING");
-		ClientKeyExchange { encrypted_data, client_certificate: None, client_signature: None }
+		ClientKeyExchange { encrypted_data }
 	}
 
 	/// A hand-built `ClientKeyExchange` that offers no identity, for the
@@ -915,18 +966,18 @@ mod tests {
 		receipt_ack: Option<&[u8]>,
 	) -> ClientKeyExchange {
 		let sealed = sealed_payload(server, confirming, client_random, receipt_ack, TIGHTBEAM_AAD_DOMAIN_TAG);
-		anonymous_key_exchange(sealed)
+		key_exchange_of(sealed)
 	}
 
 	/// The digest the identity behind `certificate` signs as its possession
-	/// proof over `encrypted_data` in the handshake of `transcript_hash`.
+	/// proof over `client_ephemeral` in the handshake of `transcript_hash`.
 	fn possession_digest(
 		transcript_hash: &[u8; 32],
-		encrypted_data: impl AsRef<[u8]>,
+		client_ephemeral: &[u8; EC_PUBKEY_COMPRESSED_SIZE],
 		certificate: &Certificate,
 	) -> [u8; 32] {
 		let certificate_der = certificate.to_der().expect("the test certificate encodes");
-		let mut signed = Transcript::hpke_client_auth(transcript_hash, encrypted_data, certificate_der);
+		let mut signed = Transcript::hpke_client_auth(transcript_hash, client_ephemeral, certificate_der);
 		signed.seal::<Sha3_256>().expect("the possession transcript seals")
 	}
 
@@ -937,63 +988,90 @@ mod tests {
 		OctetString::new(signature.to_bytes().to_vec()).expect("a signature is an OCTET STRING")
 	}
 
-	/// A hand-built `ClientKeyExchange` that offers the identity of `client`,
-	/// for the server that holds `server` and sent what `confirming` holds.
+	/// A server that has replied to a hand-built hello, beside a client that
+	/// offers an identity to it.
 	///
-	/// The payload echoes `client_random`, it is sealed under the associated
-	/// data that binds the certificate of `client`, and `client` signs the
-	/// [`possession_digest`] of the sealed payload.
-	fn build_identified_client_key_exchange(
-		server: &TestCertificate,
-		confirming: &Confirming,
-		client_random: &[u8; 32],
-		client: &TestCertificate,
-	) -> ClientKeyExchange {
-		let ephemeral = SecretKey::<Secp256k1>::random(&mut OsRng);
-		build_identified_client_key_exchange_from(&ephemeral, server, confirming, client_random, client)
-	}
-
-	/// The key exchange of [`build_identified_client_key_exchange`] under the
-	/// client ephemeral `ephemeral`.
-	fn build_identified_client_key_exchange_from(
-		ephemeral: &SecretKey<Secp256k1>,
-		server: &TestCertificate,
-		confirming: &Confirming,
-		client_random: &[u8; 32],
-		client: &TestCertificate,
-	) -> ClientKeyExchange {
-		let aad = ClientKeyExchange::client_bound_aad(TIGHTBEAM_AAD_DOMAIN_TAG, Some(&client.certificate));
-		let aad = aad.expect("the test certificate encodes");
-		let sealed = sealed_payload_from(ephemeral, server, confirming, client_random, None, aad);
-		let digest = possession_digest(&confirming.transcript_hash, &sealed, &client.certificate);
-
-		ClientKeyExchange {
-			encrypted_data: OctetString::new(sealed).expect("a sealed payload is an OCTET STRING"),
-			client_certificate: Some(client.certificate.to_owned()),
-			client_signature: Some(possession_signature(client, &digest)),
-		}
-	}
-
-	/// A server that has replied to a hand-built hello, with a hand-built key
-	/// exchange that offers an identity to it.
-	struct Identified {
+	/// A test changes one part of the honest closing: the identity, the key
+	/// its seal derives under, the client ephemeral, or the encapsulated key.
+	struct Offering {
 		/// The server, with its reply sent.
 		server: TestServer<Hpke>,
-		/// The identity the key exchange offers.
+		/// The identity the server holds, whose static key the payload is
+		/// sealed to.
+		server_identity: TestCertificate,
+		/// What the reply of the server confirms.
+		confirming: Confirming,
+		/// The identity the client offers.
 		client: TestCertificate,
-		/// The key exchange, with the possession proof of `client`.
-		key_exchange: ClientKeyExchange,
+		/// The client ephemeral, which the payload carries and the proof signs.
+		ephemeral: SecretKey<Secp256k1>,
 	}
 
-	/// A server under `peer_authentication` that has replied to a hand-built
-	/// hello, with the key exchange of a fresh identity for it.
-	async fn identified(peer_authentication: PeerAuthentication) -> Identified {
-		let identity = create_test_certificate();
-		let (server, confirming) = server_after_hello(&identity, peer_authentication).await;
-		let client = create_test_certificate();
-		let key_exchange = build_identified_client_key_exchange(&identity, &confirming, &CLIENT_RANDOM, &client);
+	impl Offering {
+		/// A server under `peer_authentication` that has replied to a
+		/// hand-built hello, beside a fresh client with a fresh ephemeral.
+		async fn new(peer_authentication: PeerAuthentication) -> Self {
+			let server_identity = create_test_certificate();
+			let (server, confirming) = server_after_hello(&server_identity, peer_authentication).await;
+			let client = create_test_certificate();
+			let ephemeral = SecretKey::<Secp256k1>::random(&mut OsRng);
+			Self { server, server_identity, confirming, client, ephemeral }
+		}
 
-		Identified { server, client, key_exchange }
+		/// The identity of the client, with its signature over the
+		/// [`possession_digest`] of the client ephemeral.
+		fn signed_identity(&self) -> HpkeIdentity {
+			let client_ephemeral = self.ephemeral.public_key().compressed_point().expect("a point compresses");
+			let transcript_hash = &self.confirming.transcript_hash;
+			let digest = possession_digest(transcript_hash, &client_ephemeral, &self.client.certificate);
+			let signature = possession_signature(&self.client, &digest);
+			HpkeIdentity { certificate: self.client.certificate.to_owned(), signature }
+		}
+
+		/// The closing that carries `identity`, sealed as an honest client
+		/// seals it, under a fresh encapsulated key.
+		fn closing_of(&self, identity: &HpkeIdentity) -> HandshakeMessage {
+			let encapsulation = SecretKey::<Secp256k1>::random(&mut OsRng);
+			let key_exchange = self.key_exchange(identity, &self.confirming, &encapsulation);
+			carried_closing(&key_exchange)
+		}
+
+		/// The key exchange whose payload carries `identity` sealed under the
+		/// identity key `sealing` yields, with the HPKE seal drawn under
+		/// `encapsulation`.
+		///
+		/// The payload echoes [`CLIENT_RANDOM`], and its key-confirmation tag
+		/// confirms what the reply sealed.
+		fn key_exchange(
+			&self,
+			identity: &HpkeIdentity,
+			sealing: &Confirming,
+			encapsulation: &SecretKey<Secp256k1>,
+		) -> ClientKeyExchange {
+			let static_key_bytes = self.server_identity.certificate.verifying_key_bytes();
+			let static_key = PublicKey::<Secp256k1>::from_sec1_bytes(static_key_bytes);
+			let static_key = static_key.expect("the test certificate carries a point on the curve");
+			let base = BaseSecret::random(None).expect("the random source draws a base secret");
+			let identity_der = identity.to_der().expect("the identity encodes");
+			let sealed_identity = sealing.sealed_identity(&base, &self.ephemeral, identity_der);
+			let client_ephemeral = self.ephemeral.public_key().compressed_point().expect("a point compresses");
+			let octets = |bytes: &[u8]| OctetString::new(bytes).expect("bytes are an OCTET STRING");
+			let payload = HpkeSessionPayload {
+				base_key: octets(base.as_bytes()),
+				client_random: octets(&CLIENT_RANDOM),
+				client_ephemeral: octets(&client_ephemeral),
+				key_confirmation: self.confirming.tag(&base, &self.ephemeral),
+				receipt_ack: None,
+				sealed_identity: Some(octets(&sealed_identity)),
+			};
+			let plaintext = payload.to_der().expect("the payload encodes");
+
+			let info = TIGHTBEAM_HPKE_HANDSHAKE_INFO;
+			let aad = TIGHTBEAM_AAD_DOMAIN_TAG;
+			let mut drawing = ScalarStream::of(encapsulation);
+			let sealed = static_key.seal::<HpkeSecp256k1Sha3Aes256Gcm>(info, aad, plaintext, Some(&mut drawing));
+			key_exchange_of(sealed.expect("the payload seals").to_bytes())
+		}
 	}
 
 	/// A reply signed over the hello the client sent is admitted, and the
@@ -1007,8 +1085,6 @@ mod tests {
 
 		let key_exchange = carried_key_exchange(&closing);
 		assert!(!key_exchange.encrypted_data.as_bytes().is_empty());
-		assert!(key_exchange.client_certificate.is_none());
-		assert!(key_exchange.client_signature.is_none());
 		Ok(())
 	}
 
@@ -1279,23 +1355,24 @@ mod tests {
 	/// changes.
 	#[tokio::test]
 	async fn a_hand_built_identified_key_exchange_is_admitted() -> Result<(), Box<dyn Error>> {
-		let Identified { mut server, client, key_exchange } = identified(mutual_with(ExpiryValidator)).await;
+		let mut offering = Offering::new(mutual_with(ExpiryValidator)).await;
+		let identity = offering.signed_identity();
+		let closing = offering.closing_of(&identity);
 
-		server.finish(carried_closing(&key_exchange)).await?;
-		assert_eq!(server.peer_certificate(), Some(&client.certificate));
+		offering.server.finish(closing).await?;
+		assert_eq!(offering.server.peer_certificate(), Some(&offering.client.certificate));
 		Ok(())
 	}
 
 	/// What a server under `peer_authentication` answers to the key exchange
 	/// of an identity that sends its static key as its ephemeral.
 	async fn finish_with_a_static_ephemeral(peer_authentication: PeerAuthentication) -> Result<(), HandshakeError> {
-		let identity = create_test_certificate();
-		let (mut server, confirming) = server_after_hello(&identity, peer_authentication).await;
-		let client = create_test_certificate();
-		let reused = SecretKey::<Secp256k1>::from(&client.signing_key);
-		let sent = build_identified_client_key_exchange_from(&reused, &identity, &confirming, &CLIENT_RANDOM, &client);
+		let mut offering = Offering::new(peer_authentication).await;
+		offering.ephemeral = SecretKey::<Secp256k1>::from(&offering.client.signing_key);
+		let identity = offering.signed_identity();
+		let closing = offering.closing_of(&identity);
 
-		server.finish(carried_closing(&sent)).await
+		offering.server.finish(closing).await
 	}
 
 	/// An HPKE message names its signer by the certificate beside it, so a
@@ -1355,58 +1432,62 @@ mod tests {
 	}
 
 	/// The encapsulated key is a client ephemeral as well, so an identity that
-	/// seals under its static key is refused where the closing is read.
+	/// seals under its static key is refused once its certificate opens.
 	#[tokio::test]
-	async fn an_encapsulated_key_equal_to_the_client_static_key_is_refused() -> Result<(), Box<dyn Error>> {
-		let Identified { mut server, client, mut key_exchange } = identified(PeerAuthentication::Anonymous).await;
-		let static_key = client.certificate.verifying_key::<Secp256k1>()?;
-		let encapsulated_key = static_key.to_encoded_point(false);
-		let sealed_under_static = [encapsulated_key.as_bytes(), &[0u8; 16]].concat();
-		key_exchange.encrypted_data = OctetString::new(sealed_under_static)?;
+	async fn an_encapsulated_key_equal_to_the_client_static_key_is_refused() {
+		let mut offering = Offering::new(PeerAuthentication::Anonymous).await;
+		let identity = offering.signed_identity();
+		let reused = SecretKey::<Secp256k1>::from(&offering.client.signing_key);
+		let sent = offering.key_exchange(&identity, &offering.confirming, &reused);
 
-		let refusal = server.finish(carried_closing(&key_exchange)).await;
+		let refusal = offering.server.finish(carried_closing(&sent)).await;
 
 		assert!(matches!(refusal, Err(HandshakeError::ClientEphemeralIsStatic)));
-		Ok(())
 	}
 
 	/// An offered certificate whose key is off the curve is refused where the
-	/// closing is read, before the static key opens anything.
+	/// opened identity is parsed, before any key comparison or signature check.
 	#[tokio::test]
-	async fn an_offered_certificate_whose_key_is_off_the_curve_is_refused() -> Result<(), Box<dyn Error>> {
-		let Identified { mut server, mut key_exchange, .. } = identified(PeerAuthentication::Anonymous).await;
-		let certificate = key_exchange.client_certificate.as_mut();
-		let offered = certificate.ok_or("the key exchange offers a certificate")?;
-		put_off_curve_key(offered);
+	async fn an_offered_certificate_whose_key_is_off_the_curve_is_refused() {
+		let mut offering = Offering::new(PeerAuthentication::Anonymous).await;
+		let mut identity = offering.signed_identity();
+		put_off_curve_key(&mut identity.certificate);
+		let closing = offering.closing_of(&identity);
 
-		let refusal = server.finish(carried_closing(&key_exchange)).await;
+		let refusal = offering.server.finish(closing).await;
 
 		assert!(matches!(refusal, Err(HandshakeError::InvalidPublicKey(_))));
-		Ok(())
+	}
+
+	/// The identity seal binds the transcript, so an identity sealed under the
+	/// identity key of another transcript fails to open. The tag beside it
+	/// confirms the real transcript.
+	#[tokio::test]
+	async fn an_identity_sealed_under_another_transcript_is_refused() {
+		let mut offering = Offering::new(PeerAuthentication::Anonymous).await;
+		let identity = offering.signed_identity();
+		let foreign = Confirming { transcript_hash: [0x5a; 32], ..offering.confirming.to_owned() };
+		let encapsulation = SecretKey::<Secp256k1>::random(&mut OsRng);
+		let sent = offering.key_exchange(&identity, &foreign, &encapsulation);
+
+		let refusal = offering.server.finish(carried_closing(&sent)).await;
+
+		assert!(matches!(refusal, Err(HandshakeError::SealedIdentity)));
 	}
 
 	/// An anonymous server still verifies the possession proof of an offered
 	/// identity, so a signature over other material ends the handshake.
 	#[tokio::test]
 	async fn an_anonymous_server_refuses_a_forged_offered_identity() {
-		let Identified { mut server, client, mut key_exchange } = identified(PeerAuthentication::Anonymous).await;
+		let mut offering = Offering::new(PeerAuthentication::Anonymous).await;
 		let forged_digest = [0u8; 32];
+		let signature = possession_signature(&offering.client, &forged_digest);
+		let forged = HpkeIdentity { certificate: offering.client.certificate.to_owned(), signature };
+		let closing = offering.closing_of(&forged);
 
-		key_exchange.client_signature = Some(possession_signature(&client, &forged_digest));
+		let refusal = offering.server.finish(closing).await;
 
-		let refusal = server.finish(carried_closing(&key_exchange)).await;
 		assert!(matches!(refusal, Err(HandshakeError::SignatureError(_))));
-	}
-
-	/// An offered certificate with no possession signature proves no key, so
-	/// the server refuses it rather than treating the client as anonymous.
-	#[tokio::test]
-	async fn an_offered_certificate_with_no_possession_signature_is_refused() {
-		let Identified { mut server, mut key_exchange, .. } = identified(PeerAuthentication::Anonymous).await;
-		key_exchange.client_signature = None;
-
-		let refusal = server.finish(carried_closing(&key_exchange)).await;
-		assert!(matches!(refusal, Err(HandshakeError::SignatureVerificationFailed)));
 	}
 
 	#[tokio::test]
@@ -1419,48 +1500,81 @@ mod tests {
 		assert!(matches!(refusal, Err(HandshakeError::MissingClientCertificate)));
 	}
 
-	/// A possession signature with no certificate names no key to verify it
-	/// under, so the server refuses it rather than ignoring it.
-	#[tokio::test]
-	async fn a_possession_signature_with_no_certificate_is_refused() -> Result<(), Box<dyn Error>> {
-		let identity = create_test_certificate();
-		let (mut server, confirming) = server_after_hello(&identity, PeerAuthentication::Anonymous).await;
-		let mut key_exchange = build_test_client_key_exchange(&identity, &confirming, &CLIENT_RANDOM, None);
-		key_exchange.client_signature = Some(OctetString::new([0x30u8; 64])?);
-
-		let refusal = server.finish(carried_closing(&key_exchange)).await;
-		assert!(matches!(refusal, Err(HandshakeError::MissingClientCertificate)));
-		Ok(())
+	/// The closing draft of a client that presents a fresh identity to a fresh
+	/// server, as `bind_closing` leaves it for the signature.
+	fn identified_draft() -> HpkeClosingDraft<DefaultCryptoProvider> {
+		let server = create_test_certificate();
+		let client = create_test_certificate();
+		let base = BaseSecret::random(None).expect("the random source draws a base secret");
+		let ephemeral = SecretKey::<Secp256k1>::random(&mut OsRng).public_key();
+		let client_ephemeral = ephemeral.compressed_point().expect("a point compresses");
+		let secret = fixture_handshake_secret(0x42);
+		let salt = KdfSalt::new(&[0x99; 32]);
+		let sealer = secret.sealer::<DefaultCryptoProvider>(SecretSeal::Identity, salt, &[0x99; 32]);
+		let server_key = PublicKey::<Secp256k1>::from_sec1_bytes(server.certificate.verifying_key_bytes());
+		HpkeClosingDraft {
+			agreed: Box::new(HpkeAgreed { base, client_ephemeral }),
+			client_random: CLIENT_RANDOM,
+			confirmation: fixture_confirmation(),
+			sealed_ack: None,
+			certificate: Some(client.certificate),
+			identity_sealer: sealer.expect("a fixture secret derives an identity key"),
+			server_key: server_key.expect("the test certificate carries a point on the curve"),
+			aad_domain_tag: TIGHTBEAM_AAD_DOMAIN_TAG,
+		}
 	}
 
-	/// An on-path party that swaps the client certificate and re-signs the
-	/// possession proof under its own key breaks the AEAD binding, so the key
-	/// exchange fails to decrypt rather than misbinding the session to that
-	/// certificate (CWE-287, CWE-345).
+	/// The orchestrator signs the proof the flow asks for, so a certificate
+	/// that comes without its signature fails closed rather than closing as an
+	/// anonymous client.
+	#[test]
+	fn a_certificate_without_its_signature_fails_closed() {
+		let draft = identified_draft();
+
+		let closing = <Hpke as ClientLegs<DefaultCryptoProvider>>::encode_closing(draft, None);
+
+		assert!(matches!(closing, Err(HandshakeError::MutualAuthRequired)));
+	}
+
+	/// A signature that comes without its certificate fails closed as well.
+	#[test]
+	fn a_signature_without_its_certificate_fails_closed() {
+		let mut draft = identified_draft();
+		draft.certificate = None;
+
+		let closing = <Hpke as ClientLegs<DefaultCryptoProvider>>::encode_closing(draft, Some(vec![0x30; 64]));
+
+		assert!(matches!(closing, Err(HandshakeError::MutualAuthRequired)));
+	}
+
+	/// A [`StaticKeyObserver`] of a budget-bearing session finds the receipt
+	/// acknowledgement sealed. It is neither a plaintext [`SignerInfo`] nor an
+	/// [`EnvelopedData`] to the static key, and no acknowledgement key the
+	/// observer derives opens it, so the bearer settlement answer stays
+	/// confidential.
 	#[tokio::test]
-	async fn a_swapped_client_certificate_breaks_the_aead_binding() -> Result<(), Box<dyn Error>> {
-		// The server runs mutual authentication and accepts any unexpired
-		// certificate, so admission passes the swapped certificate and the
-		// AEAD open is the gate that catches the swap.
-		let (mut client, mut server) = pair::<Hpke>(mutual_with(ExpiryValidator));
+	async fn the_settlement_answer_is_sealed_from_the_server_static_key() -> Result<(), Box<dyn Error>> {
+		let Parties { server_identity, mut client, mut server, .. } = parties::<Hpke>(mutual_with(ExpiryValidator));
+		client.transport_offer = Some(budget_offer());
+		client.receipt_approver = Some(Arc::new(PayingApprover));
+		server.transport = Some(budget_offer());
+		server.transport_authorizer = Some(Arc::new(ChallengingAuthorizer));
 
-		// The honest client presents its own certificate and seals the payload
-		// under it.
-		let reply = server.reply(client.start()?).await?;
-		let closing = client.respond(reply).await?;
-		let mut key_exchange = carried_key_exchange(&closing);
+		let run = run(client, server).await;
 
-		// The on-path party swaps in its certificate and signs the possession
-		// proof under its own key, over the same transcript and sealed payload.
-		let mitm = create_test_certificate();
-		let transcript_hash = server.transcript_hash().ok_or("the reply sealed the transcript")?;
-		let digest = possession_digest(&transcript_hash, key_exchange.encrypted_data.as_bytes(), &mitm.certificate);
+		// Positive control: the real server settled the real answer.
+		let settled = run.server.session_receipt().and_then(StoredReceipt::ancillary_response);
+		assert_eq!(settled.map(OctetString::as_bytes), Some(TEST_ANSWER));
 
-		key_exchange.client_certificate = Some(mitm.certificate.to_owned());
-		key_exchange.client_signature = Some(possession_signature(&mitm, &digest));
+		let Recovered { observer, sealed_ack, .. } = Hpke::recover(&run, &server_identity);
+		let sealed = sealed_ack.ok_or("a budget-bearing closing carries the acknowledgement")?;
+		assert!(SignerInfo::from_der(&sealed).is_err());
+		assert!(EnvelopedData::from_der(&sealed).is_err());
 
-		let result = server.finish(carried_closing(&key_exchange)).await;
-		assert!(matches!(result, Err(HandshakeError::HpkeError(DecryptionFailed(_)))));
+		let attempts = observer.ack_attempts(&run.transcript_hash, &sealed)?;
+		let mut outcomes = attempts.iter();
+		assert_eq!(attempts.len(), SEAL_ATTEMPTS);
+		assert!(outcomes.all(|attempt| matches!(attempt, Err(HandshakeError::ReceiptAckCipher(_)))));
 		Ok(())
 	}
 
@@ -1476,7 +1590,7 @@ mod tests {
 		let identity = create_test_certificate();
 		let (mut server, confirming) = server_after_hello(&identity, PeerAuthentication::Anonymous).await;
 		let foreign = sealed_payload(&identity, &confirming, &CLIENT_RANDOM, None, b"another domain tag");
-		let closing = carried_closing(&anonymous_key_exchange(foreign));
+		let closing = carried_closing(&key_exchange_of(foreign));
 
 		let refused = server.finish(closing.to_owned()).await;
 		assert!(matches!(refused, Err(HandshakeError::HpkeError(DecryptionFailed(_)))));
@@ -1525,7 +1639,7 @@ mod tests {
 	async fn a_key_exchange_with_an_abort_alert_is_refused() -> Result<(), Box<dyn Error>> {
 		let identity = create_test_certificate();
 		let (mut server, _) = server_after_hello(&identity, PeerAuthentication::Anonymous).await;
-		let key_exchange = anonymous_key_exchange([0x41u8; 32]);
+		let key_exchange = key_exchange_of([0x41u8; 32]);
 		let alert = HandshakeAttribute::new_single(HANDSHAKE_ABORT_ALERT, Any::encode_from(&4u8)?)?;
 
 		let mut alerted = EnvelopedData::try_from(&key_exchange)?;
@@ -1567,7 +1681,7 @@ mod tests {
 	#[test]
 	fn a_payload_that_is_not_der_is_refused() {
 		let garbage = [0u8; 68];
-		let parsed = SessionPayload::<Secp256k1>::parse(&garbage, &anonymous());
+		let parsed = SessionPayload::<Secp256k1>::parse(&garbage);
 		assert!(matches!(parsed, Err(HandshakeError::InvalidDecryptedPayloadSize)));
 	}
 
@@ -1575,7 +1689,7 @@ mod tests {
 	fn a_payload_with_a_short_base_secret_is_refused() {
 		let client_ephemeral = create_test_server_ephemeral();
 		let short_key = session_payload_der([0u8; 31], [0u8; 32], client_ephemeral, &fixture_confirmation(), None);
-		let parsed = SessionPayload::<Secp256k1>::parse(&short_key, &anonymous());
+		let parsed = SessionPayload::<Secp256k1>::parse(&short_key);
 		let refused = matches!(parsed, Err(HandshakeError::InvalidKeySize { expected: 32, received: 31 }));
 		assert!(refused);
 	}
@@ -1585,7 +1699,7 @@ mod tests {
 	fn a_payload_with_a_short_client_random_is_refused() {
 		let client_ephemeral = create_test_server_ephemeral();
 		let short_random = session_payload_der([0u8; 32], [0u8; 16], client_ephemeral, &fixture_confirmation(), None);
-		let parsed = SessionPayload::<Secp256k1>::parse(&short_random, &anonymous());
+		let parsed = SessionPayload::<Secp256k1>::parse(&short_random);
 		assert!(matches!(parsed, Err(HandshakeError::OctetStringLengthError(_))));
 	}
 
@@ -1599,8 +1713,8 @@ mod tests {
 		let off_curve = session_payload_der([0u8; 32], [0u8; 32], off_curve_point(), &confirmation, None);
 		let another_width = session_payload_der([0u8; 32], [0u8; 32], uncompressed, &confirmation, None);
 
-		let off_curve = SessionPayload::<Secp256k1>::parse(&off_curve, &anonymous());
-		let another_width = SessionPayload::<Secp256k1>::parse(&another_width, &anonymous());
+		let off_curve = SessionPayload::<Secp256k1>::parse(&off_curve);
+		let another_width = SessionPayload::<Secp256k1>::parse(&another_width);
 		assert!(matches!(off_curve, Err(HandshakeError::InvalidPublicKey(_))));
 		assert!(matches!(another_width, Err(HandshakeError::OctetStringLengthError(_))));
 	}
@@ -1610,7 +1724,7 @@ mod tests {
 	#[test]
 	fn a_payload_with_no_key_confirmation_is_refused() {
 		let unconfirmed = loose_payload_der(None);
-		let parsed = SessionPayload::<Secp256k1>::parse(&unconfirmed, &anonymous());
+		let parsed = SessionPayload::<Secp256k1>::parse(&unconfirmed);
 		assert!(matches!(parsed, Err(HandshakeError::InvalidDecryptedPayloadSize)));
 	}
 
@@ -1618,7 +1732,7 @@ mod tests {
 	#[test]
 	fn a_payload_with_a_short_key_confirmation_is_refused() {
 		let short_tag = loose_payload_der(Some(&[7u8; 31]));
-		let parsed = SessionPayload::<Secp256k1>::parse(&short_tag, &anonymous());
+		let parsed = SessionPayload::<Secp256k1>::parse(&short_tag);
 		assert!(matches!(parsed, Err(HandshakeError::InvalidDecryptedPayloadSize)));
 	}
 
@@ -1627,7 +1741,7 @@ mod tests {
 	#[test]
 	fn a_payload_with_a_key_confirmation_of_the_one_width_parses() {
 		let confirmed = loose_payload_der(Some(&[7u8; 32]));
-		let parsed = SessionPayload::<Secp256k1>::parse(&confirmed, &anonymous());
+		let parsed = SessionPayload::<Secp256k1>::parse(&confirmed);
 		assert!(parsed.is_ok());
 	}
 
@@ -1637,7 +1751,7 @@ mod tests {
 	fn a_well_formed_payload_parses_into_its_session_data() -> Result<(), Box<dyn Error>> {
 		let client_ephemeral = create_test_server_ephemeral();
 		let unanswered = session_payload_der([3u8; 32], [5u8; 32], client_ephemeral, &fixture_confirmation(), None);
-		let payload = SessionPayload::<Secp256k1>::parse(&unanswered, &anonymous())?;
+		let payload = SessionPayload::<Secp256k1>::parse(&unanswered)?;
 		assert_eq!(payload.base.as_bytes(), [3u8; 32]);
 		assert_eq!(payload.client_random, [5u8; 32]);
 		assert_eq!(payload.client_ephemeral.as_public_key().compressed_point()?, client_ephemeral);

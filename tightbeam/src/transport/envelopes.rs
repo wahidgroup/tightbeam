@@ -38,6 +38,7 @@ mod multiplex {
 #[cfg(feature = "transport-multiplex")]
 use multiplex::*;
 
+use crate::cms::encrypted_data::EncryptedData;
 use crate::cms::enveloped_data::EnvelopedData;
 use crate::cms::signed_data::SignedData;
 use crate::transport::wire_der::WireDer;
@@ -873,6 +874,10 @@ pub enum TransportEnvelope {
 	/// A signed handshake container, kept with the bytes that carried it.
 	#[asn1(context_specific = "3", constructed = "true")]
 	SignedData(Box<WireDer<SignedData>>),
+	/// A handshake container sealed under a key the handshake derived, kept
+	/// with the bytes that carried it.
+	#[asn1(context_specific = "5", constructed = "true")]
+	EncryptedData(Box<WireDer<EncryptedData>>),
 	/// A multiplexing message.
 	#[cfg(feature = "transport-multiplex")]
 	#[asn1(context_specific = "4", constructed = "true")]
@@ -1431,5 +1436,26 @@ mod tests {
 			},
 			TransportEnvelope::from(MuxRekeyDonePackage::default()),
 		])
+	}
+
+	/// A sealed handshake container travels under context tag 5 of the
+	/// transport envelope.
+	#[test]
+	fn a_sealed_handshake_container_travels_under_tag_5() -> Result<(), Box<dyn Error>> {
+		use crate::asn1::OctetString;
+		use crate::cms::content_info::CmsVersion;
+		use crate::cms::enveloped_data::EncryptedContentInfo;
+		use crate::oids::{AES_256_GCM, SIGNED_DATA};
+		use crate::spki::AlgorithmIdentifierOwned;
+
+		let algorithm = AlgorithmIdentifierOwned { oid: AES_256_GCM, parameters: None };
+		let encrypted_content = Some(OctetString::new([0u8; 16])?);
+		let info = EncryptedContentInfo { content_type: SIGNED_DATA, content_enc_alg: algorithm, encrypted_content };
+		let sealed = EncryptedData { version: CmsVersion::V0, enc_content_info: info, unprotected_attrs: None };
+		let envelope = TransportEnvelope::EncryptedData(Box::new(WireDer::new(sealed)?));
+
+		let encoded = envelope.to_der()?;
+		assert_eq!(encoded.first(), Some(&0xA5));
+		Ok(())
 	}
 }

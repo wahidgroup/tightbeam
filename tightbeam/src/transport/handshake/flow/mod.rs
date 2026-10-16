@@ -29,8 +29,10 @@ use crate::transport::handshake::negotiation::{
 };
 use crate::transport::handshake::peer::{PeerCertificate, PossessionProof, ServerTrust};
 use crate::transport::handshake::primitives::KdfSalt;
-use crate::transport::handshake::schedule::{ClientStatic, KeyConfirmation, PeerPoint, Salt, Terms};
-use crate::transport::handshake::{HandshakeMessage, HandshakeProvider, HandshakeSecret};
+use crate::transport::handshake::schedule::{
+	ConfirmedSecret, KeyConfirmation, PeerEphemeral, PeerPoint, Salt, Sealer, Terms,
+};
+use crate::transport::handshake::{HandshakeCurve, HandshakeMessage, HandshakeProvider, HandshakeSecret};
 use crate::transport::state::ClientIdentity;
 use crate::utils::marker::{MaybeSend, MaybeSendFuture, MaybeSync};
 
@@ -114,15 +116,18 @@ pub struct ReplyIntake<F: ClientLegs<P>, P: HandshakeProvider> {
 }
 
 /// What the orchestrator contributes to the closing.
-pub struct ClosingParts<'a, C: CurveArithmetic> {
+pub struct ClosingParts<'a, P: HandshakeProvider> {
 	/// The admitted server certificate, with its key.
-	pub server: &'a PeerCertificate<C>,
+	pub server: &'a PeerCertificate<P::Curve>,
 	/// The hash of the sealed transcript.
 	pub transcript_hash: &'a [u8; 32],
 	/// The receipt countersignature, sealed under the handshake secret.
 	pub sealed_ack: Option<Vec<u8>>,
 	/// The proof that the client derived the handshake secret.
 	pub confirmation: KeyConfirmation,
+	/// The single-use AEAD the client identity is sealed under, keyed by the
+	/// handshake secret.
+	pub identity_sealer: Sealer<P>,
 }
 
 /// The possession proof a closing still needs: the bytes to sign, beside the
@@ -198,7 +203,7 @@ pub trait ClientLegs<P: HandshakeProvider>: HandshakeFlow {
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError::UnexpectedContainer`] -- the reply travels in the other container.
+	/// - [`HandshakeError::UnexpectedContainer`] -- the reply travels in another container.
 	/// - [`HandshakeError::AbortReceived`] -- the reply carries an abort alert.
 	/// - [`HandshakeError`] -- the reply fails to decode, or a leg fails to bind.
 	fn read_reply(
@@ -238,12 +243,12 @@ pub trait ClientLegs<P: HandshakeProvider>: HandshakeFlow {
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError`] -- the closing fails to seal or encode.
+	/// - [`HandshakeError`] -- the bytes the proof signs fail to encode or to hash.
 	fn bind_closing<'a>(
 		agreed: Self::Agreed,
 		reply: Self::Reply,
 		settings: &'a Self::Settings,
-		parts: ClosingParts<'_, P::Curve>,
+		parts: ClosingParts<'_, P>,
 	) -> Result<ClosingBinding<'a, Self, P>, HandshakeError>;
 
 	/// Encode the closing with the possession proof, when the client signed
@@ -251,7 +256,11 @@ pub trait ClientLegs<P: HandshakeProvider>: HandshakeFlow {
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError::MutualAuthRequired`] -- the protocol requires a proof, and none came.
+	/// - [`HandshakeError::MutualAuthRequired`] -- the protocol requires a
+	///   proof and none came, or a certificate and its proof come apart.
+	/// - [`HandshakeError::SealedIdentity`] -- the identity exceeds the frame,
+	///   or the AEAD refused to seal it.
+	/// - [`HandshakeError::HpkeError`] -- the payload fails to seal to the server's static key.
 	/// - [`HandshakeError`] -- the closing fails to encode.
 	fn encode_closing(draft: Self::Draft, proof: Option<Self::Signed>) -> Result<HandshakeMessage, HandshakeError>;
 }
@@ -290,25 +299,99 @@ pub struct ReplyBinding<F: ServerLegs<P>, P: HandshakeProvider> {
 	pub draft: F::Draft,
 }
 
-/// The facts of a decoded closing, with what it sealed to the static key.
-pub struct ClosingIntake<F: ServerLegs<P>, P: HandshakeProvider> {
-	/// The identity the client offers, which the ephemeral checks read.
-	pub client_static: ClientStatic<P::Curve>,
-	/// The proof that the key of the offered certificate signed the closing.
-	pub proof: Option<F::Proof>,
-	/// What the closing still holds for the agreement.
-	pub closing: F::Closing,
+/// The identity a client offers, with the proof that it holds the key, or
+/// none.
+///
+/// Its constructors are private to the flows, so an offer exists only where a
+/// flow opened the closing. [`Self::new`] refuses an identity whose key
+/// collapses an ephemeral of the client, so no offer exists for that client.
+pub struct Offer<C: CurveArithmetic, Proof>(Option<(PeerCertificate<C>, Proof)>);
+
+impl<C: HandshakeCurve, Proof> Offer<C, Proof> {
+	/// The offer of a client that presents no identity. A CMS Finished is
+	/// itself a proof, so only an HPKE closing yields this offer.
+	#[cfg(feature = "transport-hpke")]
+	fn anonymous() -> Self {
+		Self(None)
+	}
+
+	/// The offer of `identity`, proven by `proof`.
+	///
+	/// A server learns its client's static key only after the agreement, so
+	/// the comparison lives here: each of `ephemerals` MUST have an
+	/// x-coordinate other than that of the identity's key. ECDH keeps the
+	/// x-coordinate alone, so a match would collapse the agreement into the
+	/// static one.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::ClientEphemeralIsStatic`] -- an ephemeral collapses into the key of `identity`.
+	fn new<'k>(
+		identity: PeerCertificate<C>,
+		proof: Proof,
+		ephemerals: impl IntoIterator<Item = &'k PublicKey<C>>,
+	) -> Result<Self, HandshakeError>
+	where
+		C: 'k,
+	{
+		let key = identity.key();
+		let collapsed = ephemerals.into_iter().any(|ephemeral| key.distinct(*ephemeral).is_none());
+		if collapsed {
+			return Err(HandshakeError::ClientEphemeralIsStatic);
+		}
+
+		Ok(Self(Some((identity, proof))))
+	}
+
+	/// The identity and its proof, for the admission that verifies them.
+	pub(crate) fn into_identity(self) -> Option<(PeerCertificate<C>, Proof)> {
+		self.0
+	}
 }
 
 /// What the server holds once the closing is opened.
-pub struct ClosingOpened {
+///
+/// The fields stay private to the flows, and [`Self::confirm`] is the one way
+/// out, so the offer reaches admission only after the key-confirmation tag
+/// verified.
+pub struct ClosingOpened<F: ServerLegs<P>, P: HandshakeProvider> {
 	/// The handshake secret both sides derived.
-	pub secret: HandshakeSecret,
+	secret: HandshakeSecret,
+	/// The key-confirmation tag the closing carried.
+	confirmation: KeyConfirmation,
 	/// The receipt countersignature, sealed under the handshake secret.
-	pub receipt_ack: Option<Vec<u8>>,
-	/// The key-confirmation tag the closing carried. The orchestrator verifies
-	/// it against the handshake secret.
-	pub confirmation: KeyConfirmation,
+	receipt_ack: Option<Vec<u8>>,
+	/// The identity the client offers.
+	offer: Offer<P::Curve, F::Proof>,
+}
+
+impl<F: ServerLegs<P>, P: HandshakeProvider> ClosingOpened<F, P> {
+	/// Verify the key-confirmation tag against the secret, and release the
+	/// offer.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the derivation.
+	/// - [`HandshakeError::KeyConfirmationFailed`] -- the client derived
+	///   another secret or confirmed another transcript.
+	pub(crate) fn confirm(self, terms: &Terms<P>) -> Result<ConfirmedClosing<F, P>, HandshakeError> {
+		let Self { secret, confirmation, receipt_ack, offer } = self;
+		let secret = terms.confirm(secret, &confirmation)?;
+		Ok(ConfirmedClosing { secret, receipt_ack, offer })
+	}
+}
+
+/// A closing whose key-confirmation tag verified.
+///
+/// Its secret is a [`ConfirmedSecret`], which only the check of the tag
+/// yields, so the offer it holds passed that check.
+pub struct ConfirmedClosing<F: ServerLegs<P>, P: HandshakeProvider> {
+	/// The handshake secret the tag confirmed.
+	pub(crate) secret: ConfirmedSecret,
+	/// The receipt countersignature, sealed under the handshake secret.
+	pub(crate) receipt_ack: Option<Vec<u8>>,
+	/// The identity the client offers.
+	pub(crate) offer: Offer<P::Curve, F::Proof>,
 }
 
 /// The server side of one protocol. It is sealed, so the flow markers of this
@@ -347,9 +430,9 @@ pub trait ServerLegs<P: HandshakeProvider>: HandshakeFlow {
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError::UnexpectedContainer`] -- the opening travels in the other container.
+	/// - [`HandshakeError::UnexpectedContainer`] -- the opening travels in another container.
 	/// - [`HandshakeError::AbortReceived`] -- the opening carries an abort alert.
-	/// - [`HandshakeError::DuplicateAttribute`] -- an offer or the certificate attribute repeats.
+	/// - [`HandshakeError::DuplicateAttribute`] -- an offer or the abort alert repeats.
 	/// - [`HandshakeError`] -- the opening fails to decode.
 	fn read_opening(
 		settings: &Self::Settings,
@@ -362,8 +445,6 @@ pub trait ServerLegs<P: HandshakeProvider>: HandshakeFlow {
 	///
 	/// - [`HandshakeError::InvalidClientKeyExchange`] -- the opening carries no usable key agreement.
 	/// - [`HandshakeError::InvalidPublicKey`] -- the client's key is not a point on the curve.
-	/// - [`HandshakeError::ClientEphemeralIsStatic`] -- the client ephemeral
-	///   collapses into the client's static key.
 	/// - [`HandshakeError::KeyError`] -- the key provider failed.
 	/// - [`HandshakeError`] -- the sealed content fails to open.
 	fn open_opening<'a>(
@@ -410,31 +491,25 @@ pub trait ServerLegs<P: HandshakeProvider>: HandshakeFlow {
 		terms: &Terms<P>,
 	) -> Result<Self::Pending, HandshakeError>;
 
-	/// Decode the closing, and return the offered identity beside its proof.
+	/// Decode the closing without opening it.
 	///
 	/// It takes the pending state of the reply, and the closing it returns
 	/// holds what [`Self::settle`] reads of that state.
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError::UnexpectedContainer`] -- the closing travels in the other container.
+	/// - [`HandshakeError::UnexpectedContainer`] -- the closing travels in another container.
 	/// - [`HandshakeError::AbortReceived`] -- the closing carries an abort alert.
-	/// - [`HandshakeError::ClientCertificateMismatch`] -- the closing names
-	///   another certificate than the opening bound.
-	/// - [`HandshakeError::MissingAttribute`] -- the closing carries no key-confirmation tag.
-	/// - [`HandshakeError::InvalidPublicKey`] -- the key of the offered
-	///   certificate is not a point on the curve.
-	/// - [`HandshakeError::ClientEphemeralIsStatic`] -- the encapsulated key
-	///   collapses into the client's static key.
 	/// - [`HandshakeError`] -- the closing fails to decode.
 	fn read_closing(
 		pending: Self::Pending,
 		settings: &Self::Settings,
 		closing: HandshakeMessage,
-	) -> Result<ClosingIntake<Self, P>, HandshakeError>;
+	) -> Result<Self::Closing, HandshakeError>;
 
-	/// Open what the closing sealed to the static key, and derive the
-	/// handshake secret from the server half of the agreement.
+	/// Open the closing under the handshake secret, which HPKE derives here
+	/// and CMS derived at the reply, open the client identity under it, parse
+	/// the identity once, and build the [`Offer`].
 	///
 	/// # Errors
 	///
@@ -444,14 +519,92 @@ pub trait ServerLegs<P: HandshakeProvider>: HandshakeFlow {
 	/// - [`HandshakeError::InvalidKeySize`] -- the base secret of the payload is not 32 bytes.
 	/// - [`HandshakeError::OctetStringLengthError`] -- the client random of the payload is not 32 bytes.
 	/// - [`HandshakeError::ClientRandomMismatchReplay`] -- the payload echoes another client random.
-	/// - [`HandshakeError::InvalidPublicKey`] -- the client ephemeral is not a point on the curve.
-	/// - [`HandshakeError::ClientEphemeralIsStatic`] -- the client ephemeral
-	///   collapses into the client's static key.
-	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the handshake secret.
+	/// - [`HandshakeError::InvalidPublicKey`] -- the client ephemeral or the
+	///   key of the offered certificate is not a point on the curve.
+	/// - [`HandshakeError::SealedIdentity`] -- the sealed identity fails to
+	///   open, or a CMS closing names another content type or algorithm, or
+	///   carries no content.
+	/// - [`HandshakeError::DerError`] -- the opened identity fails to decode,
+	///   or the key-confirmation tag of a CMS Finished has another width.
+	/// - [`HandshakeError::MissingAttribute`] -- a CMS Finished carries no key-confirmation tag.
+	/// - [`HandshakeError::DuplicateAttribute`] -- an attribute of a CMS Finished repeats.
+	/// - [`HandshakeError::MissingClientCertificate`] -- a CMS Finished names no certificate.
+	/// - [`HandshakeError::ClientEphemeralIsStatic`] -- a client ephemeral
+	///   collapses into the key of the offered certificate.
+	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the handshake secret or the identity key.
+	/// - [`HandshakeError::InvalidKeyMaterialLength`] -- the cipher refused the identity key.
 	fn settle<'a>(
 		closing: Self::Closing,
-		client_static: &'a ClientStatic<P::Curve>,
 		terms: &'a Terms<P>,
 		key: &'a dyn SigningKeyProvider,
-	) -> MaybeSendFuture<'a, Result<ClosingOpened, HandshakeError>>;
+	) -> MaybeSendFuture<'a, Result<ClosingOpened<Self, P>, HandshakeError>>;
+}
+
+#[cfg(all(test, any(feature = "transport-cms", feature = "transport-hpke")))]
+mod tests {
+	use std::sync::Arc;
+
+	use super::*;
+	use crate::crypto::sign::ecdsa::k256::{Secp256k1, SecretKey};
+	use crate::random::OsRng;
+	use crate::transport::handshake::tests::{create_test_certificate, negated};
+
+	/// A fresh client identity, beside its static key.
+	fn identity() -> (PeerCertificate<Secp256k1>, PublicKey<Secp256k1>) {
+		let client = create_test_certificate();
+		let static_key = PublicKey::from(client.signing_key.verifying_key());
+		let identity = PeerCertificate::parse(client.certificate);
+		(identity.expect("the test certificate holds a point"), static_key)
+	}
+
+	/// The public key of a fresh ephemeral.
+	fn ephemeral() -> PublicKey<Secp256k1> {
+		SecretKey::random(&mut OsRng).public_key()
+	}
+
+	/// An offer whose ephemerals all differ from the key of its identity holds
+	/// that identity.
+	#[test]
+	fn an_offer_of_distinct_ephemerals_holds_its_identity() -> Result<(), HandshakeError> {
+		let (identity, _) = identity();
+		let expected = Arc::clone(identity.certificate());
+
+		let offer = Offer::new(identity, (), [&ephemeral(), &ephemeral()])?;
+
+		let held = offer.into_identity().map(|(identity, ())| Arc::clone(identity.certificate()));
+		assert_eq!(held, Some(expected));
+		Ok(())
+	}
+
+	#[test]
+	fn an_offer_refuses_an_ephemeral_equal_to_the_identity_key() {
+		let (identity, static_key) = identity();
+
+		let refused = Offer::new(identity, (), [&static_key]);
+
+		assert!(matches!(refused, Err(HandshakeError::ClientEphemeralIsStatic)));
+	}
+
+	/// ECDH keeps the x-coordinate alone, so the negation of the identity key
+	/// collapses the agreement as the key itself does.
+	#[test]
+	fn an_offer_refuses_the_negation_of_the_identity_key() {
+		let (identity, static_key) = identity();
+		let negation = negated(&static_key);
+
+		let refused = Offer::new(identity, (), [&negation]);
+
+		assert!(matches!(refused, Err(HandshakeError::ClientEphemeralIsStatic)));
+	}
+
+	/// The offer compares every ephemeral of the client, so the identity key
+	/// after a distinct ephemeral is refused as it is in the first place.
+	#[test]
+	fn an_offer_refuses_the_identity_key_after_a_distinct_ephemeral() {
+		let (identity, static_key) = identity();
+
+		let refused = Offer::new(identity, (), [&ephemeral(), &static_key]);
+
+		assert!(matches!(refused, Err(HandshakeError::ClientEphemeralIsStatic)));
+	}
 }

@@ -11,7 +11,7 @@ use crate::crypto::profiles::CryptoProvider;
 use crate::transport::handshake::error::HandshakeError;
 
 #[cfg(feature = "transport-hpke")]
-use crate::constants::EC_PUBKEY_COMPRESSED_SIZE;
+use crate::constants::{EC_PUBKEY_COMPRESSED_SIZE, TIGHTBEAM_HPKE_CLIENT_AUTH_DOMAIN};
 #[cfg(feature = "transport-cms")]
 use crate::constants::{TIGHTBEAM_CLIENT_FINISHED_DOMAIN, TIGHTBEAM_SERVER_FINISHED_DOMAIN};
 
@@ -113,28 +113,29 @@ impl Transcript {
 
 	/// Open the HPKE client mutual-auth transcript.
 	///
-	/// The digest binds the transcript hash, the HPKE-encrypted key exchange
-	/// payload, and the client certificate into a single value that the client
-	/// signs. A valid client signature therefore cannot be spliced onto a
-	/// different key exchange or a different identity (CWE-347).
+	/// The digest binds a domain label, the transcript hash, the client
+	/// ephemeral, and the client certificate into the one value the client
+	/// signs. The signature therefore binds to this handshake, this agreement,
+	/// and this identity, and replays to no other server (CWE-347).
 	///
 	/// # Parameters
 	///
 	/// - `transcript_hash`: the 32-byte handshake transcript hash.
-	/// - `encrypted_data`: the HPKE-encrypted key exchange bytes.
+	/// - `client_ephemeral`: the compressed SEC1 client ephemeral `R`.
 	/// - `client_cert_der`: the DER encoding of the client certificate.
 	#[cfg(feature = "transport-hpke")]
 	pub(crate) fn hpke_client_auth(
 		transcript_hash: &[u8; 32],
-		encrypted_data: impl AsRef<[u8]>,
+		client_ephemeral: &[u8; EC_PUBKEY_COMPRESSED_SIZE],
 		client_cert_der: impl AsRef<[u8]>,
 	) -> Self {
-		let encrypted_data = encrypted_data.as_ref();
 		let client_cert_der = client_cert_der.as_ref();
+		let fixed = TIGHTBEAM_HPKE_CLIENT_AUTH_DOMAIN.len() + transcript_hash.len() + client_ephemeral.len();
 
-		let mut buffer = Vec::with_capacity(32 + encrypted_data.len() + client_cert_der.len());
+		let mut buffer = Vec::with_capacity(fixed + client_cert_der.len());
+		buffer.extend_from_slice(TIGHTBEAM_HPKE_CLIENT_AUTH_DOMAIN);
 		buffer.extend_from_slice(transcript_hash);
-		buffer.extend_from_slice(encrypted_data);
+		buffer.extend_from_slice(client_ephemeral);
 		buffer.extend_from_slice(client_cert_der);
 		Self(State::Open(buffer))
 	}
@@ -446,6 +447,27 @@ mod tests {
 			0x4e, 0x90, 0x29, 0x8e, 0xba, 0x64, 0xc6, 0xb7, 0x3e, 0x4b, 0x90, 0x28, 0x73, 0x03,
 		];
 		assert_eq!(hash, expected);
+		Ok(())
+	}
+
+	/// The HPKE possession digest is SHA3-256 over its domain, the transcript
+	/// hash, the client ephemeral, and the certificate DER, in that order.
+	///
+	/// The expected bytes come from an independent SHA3-256, so a leg dropped
+	/// or moved on both sides of the signature fails here.
+	#[cfg(feature = "transport-hpke")]
+	#[test]
+	fn the_hpke_possession_digest_matches_its_known_answer() -> Result<(), HandshakeError> {
+		let client_ephemeral = [0x02u8; EC_PUBKEY_COMPRESSED_SIZE];
+		let mut signed = Transcript::hpke_client_auth(&[0x07u8; 32], &client_ephemeral, b"client certificate");
+
+		let digest = signed.seal::<Sha3_256>()?;
+
+		let expected = [
+			0xe9, 0x68, 0xba, 0xd7, 0x78, 0xf6, 0x05, 0xea, 0xe8, 0x45, 0xc1, 0x28, 0xee, 0xad, 0xbf, 0x47, 0xc5, 0xc7,
+			0x62, 0x80, 0x72, 0x02, 0x99, 0x7a, 0x0f, 0x93, 0x6b, 0xc9, 0xe8, 0x80, 0xcb, 0x42,
+		];
+		assert_eq!(digest, expected);
 		Ok(())
 	}
 

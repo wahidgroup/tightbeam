@@ -1,26 +1,29 @@
-//! Tests of the step order, the phases, and the decisions, run over both
-//! flows.
+//! These tests run over both flows and cover the step order, the phases, the
+//! key schedule, and the decisions on admission, negotiation, and settlement.
 //!
 //! Each test body is generic over [`TestFlow`], and [`over_each_flow`] runs
-//! it once per protocol. A test of one protocol's wire sits beside that flow.
+//! it once per protocol. A test of the messages of one protocol sits beside
+//! that flow.
 
 use std::error::Error;
 use std::sync::Arc;
 
-use crate::asn1::OctetString;
-use crate::cms::enveloped_data::EnvelopedData;
-use crate::cms::signed_data::SignerInfo;
+use crate::cms::cert::IssuerAndSerialNumber;
 use crate::crypto::aead::DecryptContent;
 use crate::crypto::hash::Sha3_256;
+use crate::crypto::key::SigningKeyProvider;
 use crate::crypto::profiles::SecurityProfileDesc;
 use crate::crypto::secret::ToInsecure;
+use crate::crypto::sign::ecdsa::k256::Secp256k1;
+use crate::crypto::sign::elliptic_curve::sec1::ToEncodedPoint;
+use crate::crypto::sign::elliptic_curve::PublicKey;
 use crate::crypto::x509::error::CertificateValidationError::Expired;
 use crate::crypto::x509::policy::{DirectTrustValidator, ExpiryValidator, RuntimeCertificatePinning};
-use crate::der::Decode;
+use crate::crypto::x509::utils::Skid;
+use crate::der::Encode;
 use crate::oids::AES_128_GCM;
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::negotiation::{MuxSettings, NegotiationError, SecurityOffer, TransportOffer};
-use crate::transport::handshake::receipt::StoredReceipt;
 use crate::transport::handshake::tests::*;
 use crate::transport::handshake::{Handshake, HandshakeMessage, HandshakePhase, PeerAuthentication};
 use crate::TightBeamError;
@@ -70,7 +73,7 @@ async fn the_phase_follows_the_steps<F: TestFlow>() -> Result<(), Box<dyn Error>
 async fn an_illegal_client_step_leaves_the_phase_unchanged<F: TestFlow>() -> Result<(), Box<dyn Error>> {
 	let (mut client, mut server) = pair::<F>(PeerAuthentication::Anonymous);
 
-	// Nothing but the opening runs on an idle client.
+	// Only the opening runs on an idle client.
 	let early = client.respond(stray_reply::<F>().await).await;
 	assert!(matches!(early, Err(HandshakeError::InvalidState)));
 	assert!(matches!(client.complete(), Err(HandshakeError::InvalidState)));
@@ -93,7 +96,7 @@ async fn an_illegal_server_step_leaves_the_phase_unchanged<F: TestFlow>() -> Res
 	let (mut client, mut server) = pair::<F>(PeerAuthentication::Anonymous);
 	let opening = client.start()?;
 
-	// Nothing but the opening runs on an idle server.
+	// Only the opening runs on an idle server.
 	let early = server.finish(opening.to_owned()).await;
 	assert!(matches!(early, Err(HandshakeError::InvalidState)));
 	assert!(matches!(server.complete(), Err(HandshakeError::InvalidState)));
@@ -113,8 +116,8 @@ async fn an_illegal_server_step_leaves_the_phase_unchanged<F: TestFlow>() -> Res
 	Ok(())
 }
 
-/// A handshake that agreed admits no wire step again, and each refusal leaves
-/// what it agreed in place.
+/// A handshake that agreed refuses every further step that reads or builds a
+/// leg, and each refusal leaves what it agreed in place.
 async fn a_step_after_the_agreement_is_refused<F: TestFlow>() -> Result<(), Box<dyn Error>> {
 	let Parties { client, server, .. } = parties::<F>(PeerAuthentication::Anonymous);
 	let Run { opening, reply, closing, mut client, mut server, .. } = run(client, server).await;
@@ -136,8 +139,8 @@ async fn a_step_after_the_agreement_is_refused<F: TestFlow>() -> Result<(), Box<
 	Ok(())
 }
 
-/// A completed handshake is terminal: it admits no wire step, and each
-/// refusal leaves it completed.
+/// A completed handshake is terminal: it refuses every step that reads or
+/// builds a leg, and each refusal leaves it completed.
 async fn a_step_after_completion_is_refused<F: TestFlow>() -> Result<(), Box<dyn Error>> {
 	let Established { run, .. } = established::<F>(PeerAuthentication::Anonymous).await;
 	let Run { opening, reply, closing, mut client, mut server, .. } = run;
@@ -201,9 +204,9 @@ async fn a_refused_reply_leaves_the_client_spent<F: TestFlow>() -> Result<(), Bo
 }
 
 /// A closing from another handshake is refused, and the server admits no
-/// step after the refusal. HPKE refuses the possession proof, which signs
-/// another transcript. CMS refuses the certificate, which the opening did not
-/// bind.
+/// step after the refusal. HPKE refuses the payload, which another client
+/// sealed to the static key of another server. CMS refuses the sealed
+/// Finished, which another handshake secret sealed.
 async fn a_refused_closing_leaves_the_server_spent<F: TestFlow>() -> Result<(), Box<dyn Error>> {
 	let (mut client, mut server) = pair::<F>(PeerAuthentication::Anonymous);
 	let other = established::<F>(PeerAuthentication::Anonymous).await;
@@ -211,9 +214,9 @@ async fn a_refused_closing_leaves_the_server_spent<F: TestFlow>() -> Result<(), 
 	server.reply(client.start()?).await?;
 
 	let refused = server.finish(other.run.closing.to_owned()).await;
-	let forged = matches!(refused, Err(HandshakeError::SignatureError(_)));
-	let unbound = matches!(refused, Err(HandshakeError::ClientCertificateMismatch));
-	assert!(forged || unbound);
+	let sealed_to_another_server = matches!(refused, Err(HandshakeError::HpkeError(_)));
+	let sealed_under_another_secret = matches!(refused, Err(HandshakeError::SealedIdentity));
+	assert!(sealed_to_another_server || sealed_under_another_secret);
 	assert_eq!(server.phase(), HandshakePhase::Spent);
 
 	let replayed = server.finish(other.run.closing).await;
@@ -253,42 +256,13 @@ async fn a_recorded_session_does_not_open_under_the_server_static_key<F: TestFlo
 
 	let frame = sealed_record(&client_session)?;
 
-	// The static key still recovers the base secret, which `recover` requires.
+	// `recover` expects the static key to recover the base secret.
 	let Recovered { observer, .. } = F::recover(&run, &server_identity);
 
 	let attempts = observer.record_attempts(&frame)?;
 	let mut outcomes = attempts.iter();
 	assert_eq!(attempts.len(), RECORD_ATTEMPTS);
 	assert!(outcomes.all(|attempt| matches!(attempt, Err(TightBeamError::EncryptionError(_)))));
-	Ok(())
-}
-
-/// The same observer, on a budget-bearing session, finds the receipt
-/// acknowledgement sealed. It is neither a plaintext `SignerInfo` nor an
-/// `EnvelopedData` to the static key, and no acknowledgement key the observer
-/// derives opens it, so the bearer settlement answer stays confidential.
-async fn the_settlement_answer_is_sealed_from_the_server_static_key<F: TestFlow>() -> Result<(), Box<dyn Error>> {
-	let Parties { server_identity, mut client, mut server, .. } = parties::<F>(mutual_with(ExpiryValidator));
-	client.transport_offer = Some(budget_offer());
-	client.receipt_approver = Some(Arc::new(PayingApprover));
-	server.transport = Some(budget_offer());
-	server.transport_authorizer = Some(Arc::new(ChallengingAuthorizer));
-
-	let run = run(client, server).await;
-
-	// Positive control: the real server settled the real answer.
-	let settled = run.server.session_receipt().and_then(StoredReceipt::ancillary_response);
-	assert_eq!(settled.map(OctetString::as_bytes), Some(TEST_ANSWER));
-
-	let Recovered { observer, sealed_ack, .. } = F::recover(&run, &server_identity);
-	let sealed = sealed_ack.ok_or("a budget-bearing closing carries the acknowledgement")?;
-	assert!(SignerInfo::from_der(&sealed).is_err());
-	assert!(EnvelopedData::from_der(&sealed).is_err());
-
-	let attempts = observer.ack_attempts(&run.transcript_hash, &sealed)?;
-	let mut outcomes = attempts.iter();
-	assert_eq!(attempts.len(), ACK_ATTEMPTS);
-	assert!(outcomes.all(|attempt| matches!(attempt, Err(HandshakeError::ReceiptAckCipher(_)))));
 	Ok(())
 }
 
@@ -312,6 +286,78 @@ async fn two_handshakes_draw_different_base_secrets<F: TestFlow>() -> Result<(),
 	let first = F::recover(&first.run, &first.server_identity);
 	let second = F::recover(&second.run, &second.server_identity);
 	assert_ne!(first.base, second.base);
+	Ok(())
+}
+
+/// A mutual handshake carries no byte of the client identity in clear: not
+/// its certificate, its key identifier, its issuer and serial number, its key,
+/// or its possession signature.
+async fn a_mutual_handshake_carries_no_byte_of_the_client_identity<F: TestFlow>() -> Result<(), Box<dyn Error>> {
+	let client_identity = create_issued_test_certificate([0x5a; 16]);
+	let recorder = Arc::new(RecordingProvider::new(client_identity.signing_key.to_owned()));
+	let run = mutual_run::<F>(&client_identity, Arc::clone(&recorder) as Arc<dyn SigningKeyProvider>).await;
+	let certificate = &client_identity.certificate;
+	let tbs = &certificate.tbs_certificate;
+	let certificate_der = certificate.to_der()?;
+	let key_identifier = Skid::of_public_key(tbs.subject_public_key_info.to_der()?);
+	let issuer = tbs.issuer.to_owned();
+	let serial_number = tbs.serial_number.to_owned();
+	let issuer_and_serial = IssuerAndSerialNumber { issuer, serial_number }.to_der()?;
+	let key = tbs.subject_public_key_info.subject_public_key.raw_bytes();
+	let parsed_key = PublicKey::<Secp256k1>::from_sec1_bytes(key)?;
+	let compressed_key = parsed_key.to_encoded_point(true);
+	let signature = recorder.last_signature().ok_or("the client signs its possession proof")?;
+	let wire = run.wire_bytes();
+
+	// Positive control: the server read the identity from the closing.
+	assert_eq!(run.server.peer_certificate(), Some(certificate));
+	assert!(!contains_window(&wire, &certificate_der));
+	assert!(!contains_window(&wire, key_identifier.as_bytes()));
+	assert!(!contains_window(&wire, &issuer_and_serial));
+	assert!(!contains_window(&wire, key));
+	assert!(!contains_window(&wire, compressed_key.as_bytes()));
+	assert!(!contains_window(&wire, &signature));
+	Ok(())
+}
+
+/// The identity seals padded, so two certificates whose lengths differ within
+/// one padding block close with one length.
+async fn two_identities_of_different_lengths_close_with_one_length<F: TestFlow>() -> Result<(), Box<dyn Error>> {
+	let short = create_issued_test_certificate([0x5a]);
+	let long = create_issued_test_certificate([0x5a; 20]);
+	let short_run = mutual_run::<F>(&short, into_provider(short.signing_key.to_owned())).await;
+	let long_run = mutual_run::<F>(&long, into_provider(long.signing_key.to_owned())).await;
+
+	let short_closing = short_run.closing.der();
+	let long_closing = long_run.closing.der();
+	assert_ne!(short.certificate.to_der()?.len(), long.certificate.to_der()?.len());
+	assert_eq!(short_closing.len(), long_closing.len());
+	Ok(())
+}
+
+/// A recorder that later obtains the server's static key opens what the
+/// client seals to that key, but the sealed identity holds no byte of the
+/// certificate, and no identity key the recorder derives opens it. The session
+/// is budget-bearing, so a CMS Finished carries the countersignature inside
+/// that seal.
+async fn the_client_identity_is_sealed_from_the_server_static_key<F: TestFlow>() -> Result<(), Box<dyn Error>> {
+	let mutual = mutual_with(ExpiryValidator);
+	let Parties { server_identity, client_identity, mut client, mut server } = parties::<F>(mutual);
+	client.transport_offer = Some(budget_offer());
+	client.receipt_approver = Some(Arc::new(PayingApprover));
+	server.transport = Some(budget_offer());
+	server.transport_authorizer = Some(Arc::new(ChallengingAuthorizer));
+
+	let run = run(client, server).await;
+	let Recovered { observer, sealed_identity, .. } = F::recover(&run, &server_identity);
+	let sealed = sealed_identity.ok_or("a mutual closing carries the sealed identity")?;
+	let certificate_der = client_identity.certificate.to_der()?;
+
+	let attempts = observer.identity_attempts(&run.transcript_hash, &sealed)?;
+	let mut outcomes = attempts.iter();
+	assert!(!contains_window(&sealed, &certificate_der));
+	assert_eq!(attempts.len(), SEAL_ATTEMPTS);
+	assert!(outcomes.all(|attempt| matches!(attempt, Err(HandshakeError::SealedIdentity))));
 	Ok(())
 }
 
@@ -524,8 +570,10 @@ over_each_flow! {
 	both_sides_derive_the_same_keys_anonymously,
 	both_sides_derive_the_same_keys_under_mutual_authentication,
 	a_recorded_session_does_not_open_under_the_server_static_key,
-	the_settlement_answer_is_sealed_from_the_server_static_key,
 	the_base_secret_crosses_the_wire_only_sealed,
+	a_mutual_handshake_carries_no_byte_of_the_client_identity,
+	two_identities_of_different_lengths_close_with_one_length,
+	the_client_identity_is_sealed_from_the_server_static_key,
 	two_handshakes_draw_different_base_secrets,
 	a_refused_settlement_leaves_the_server_spent,
 	an_anonymous_server_records_no_peer,

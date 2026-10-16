@@ -106,13 +106,6 @@ pub enum HandshakeError {
 	#[error("Missing client certificate")]
 	MissingClientCertificate,
 
-	/// The certificate the client Finished embeds differs from the certificate
-	/// the key exchange bound into the transcript. Only the key-exchange
-	/// certificate proved knowledge of the base secret, so only it may sign
-	/// the Finished.
-	#[error("Client Finished certificate does not match the key-exchange certificate")]
-	ClientCertificateMismatch,
-
 	/// The digest output width differs from the required transcript hash
 	/// width. `expected` is the required width and `received` is the digest
 	/// output width, both in bytes.
@@ -153,6 +146,14 @@ pub enum HandshakeError {
 	/// in flight.
 	#[error("Receipt acknowledgement AEAD failure: {0}")]
 	ReceiptAckCipher(crate::crypto::aead::Error),
+
+	/// The sealed client identity of the closing fails to open under the key
+	/// the handshake secret derives, or its frame is malformed. It was sealed
+	/// under another handshake secret or another transcript, or altered in
+	/// flight. A sealed CMS Finished is refused the same way when it names
+	/// another content type or algorithm, or carries no content.
+	#[error("Sealed client identity failed to open")]
+	SealedIdentity,
 
 	/// The key-confirmation tag of the closing differs from the tag the server
 	/// derived. The client holds another handshake secret, or it confirmed
@@ -267,7 +268,8 @@ impl HandshakeError {
 	/// - A receipt approval or settlement refusal records
 	///   [`SESSION_RECEIPT_REFUSED`](events::SESSION_RECEIPT_REFUSED).
 	/// - A refused peer certificate or proof of possession, including a
-	///   certificate the peer did not present, records
+	///   certificate the peer did not present and a sealed identity that fails
+	///   to open, records
 	///   [`SESSION_CERT_REJECTED`](events::SESSION_CERT_REJECTED).
 	pub(crate) fn audit_event(&self) -> Option<Urn<'static>> {
 		match self {
@@ -275,7 +277,7 @@ impl HandshakeError {
 			Self::CertificateValidationError(_)
 			| Self::SignatureVerificationFailed
 			| Self::MissingClientCertificate
-			| Self::ClientCertificateMismatch
+			| Self::SealedIdentity
 			| Self::MutualAuthRequired => Some(events::SESSION_CERT_REJECTED),
 			_ => None,
 		}
@@ -331,6 +333,14 @@ mod tests {
 	#[test]
 	fn a_missing_client_certificate_is_a_certificate_rejection() {
 		let event = HandshakeError::MissingClientCertificate.audit_event();
+		assert_eq!(event, Some(events::SESSION_CERT_REJECTED));
+	}
+
+	/// A sealed identity that fails to open names no certificate the server
+	/// could check, so it records the refusal of an unproven identity.
+	#[test]
+	fn a_sealed_identity_that_fails_to_open_is_a_certificate_rejection() {
+		let event = HandshakeError::SealedIdentity.audit_event();
 		assert_eq!(event, Some(events::SESSION_CERT_REJECTED));
 	}
 

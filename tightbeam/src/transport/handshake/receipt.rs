@@ -33,7 +33,7 @@
 //!   signed instrument. It goes inside the client's `SignerInfo`, which travels
 //!   to the server only sealed under the session's handshake secret, inside
 //!   the HPKE key-exchange payload or as the `RECEIPT_ACK` attribute of the
-//!   CMS client Finished (see
+//!   sealed CMS client Finished (see
 //!   [forward secrecy](crate::transport::handshake#forward-secrecy)). `Debug`
 //!   output redacts its bytes, so they cannot leak through logs.
 //!

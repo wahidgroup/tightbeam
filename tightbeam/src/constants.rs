@@ -24,7 +24,7 @@ pub const TIGHTBEAM_SESSION_KDF_INFO: &[u8] = b"tb/session/kdf/v1";
 ///
 /// # Sources
 ///
-/// - RFC 5116 § 3.2, a nonce used once per key: <https://datatracker.ietf.org/doc/html/rfc5116#section-3.2>
+/// - RFC 5116 § 3.1, a nonce used once per key: <https://datatracker.ietf.org/doc/html/rfc5116#section-3.1>
 pub const TIGHTBEAM_ACK_KDF_INFO: &[u8] = b"tb/session/kdf/ack/v1";
 
 /// Domain label the receipt acknowledgement seal binds as associated data,
@@ -33,6 +33,28 @@ pub const TIGHTBEAM_ACK_KDF_INFO: &[u8] = b"tb/session/kdf/ack/v1";
 /// The label names the AEAD context alone, so the associated data differs
 /// from every signed Finished content and from [`TIGHTBEAM_ACK_KDF_INFO`].
 pub const TIGHTBEAM_ACK_AAD_DOMAIN: &[u8] = b"tb/handshake/ack/aad/v1";
+
+/// KDF info label of the key that seals the client identity of a handshake
+/// (HKDF).
+///
+/// The key derives from the handshake secret, which mixes the
+/// ephemeral-ephemeral agreement, so a later theft of the server's static key
+/// does not recover it. One identity travels per handshake, so the key is
+/// single-use.
+///
+/// # Sources
+///
+/// - RFC 8446 § 4.4.2 and Appendix E.1, the client identity under handshake
+///   keys: <https://datatracker.ietf.org/doc/html/rfc8446#appendix-E.1>
+pub const TIGHTBEAM_IDENTITY_KDF_INFO: &[u8] = b"tb/session/kdf/identity/v1";
+
+/// Domain label the identity seal binds as associated data, ahead of the
+/// transcript hash.
+pub const TIGHTBEAM_IDENTITY_AAD_DOMAIN: &[u8] = b"tb/handshake/identity/aad/v1";
+
+/// Domain label that leads the bytes an HPKE client identity signs, ahead of
+/// the transcript hash, the client ephemeral, and the certificate.
+pub const TIGHTBEAM_HPKE_CLIENT_AUTH_DOMAIN: &[u8] = b"tb/handshake/client-auth/hpke/v1";
 
 /// KDF info label of the key-confirmation tag (HKDF), which the transcript
 /// hash follows.
@@ -99,7 +121,7 @@ pub const TIGHTBEAM_UKM_PREFIX: &[u8] = b"tb/kari/ukm/v1|";
 ///
 /// It separates the key schedule of a handshake from that of a frame sealed to
 /// the same key, and it versions the protocol.
-pub const TIGHTBEAM_HPKE_HANDSHAKE_INFO: &[u8] = b"tb/hpke/handshake/v1";
+pub const TIGHTBEAM_HPKE_HANDSHAKE_INFO: &[u8] = b"tb/hpke/handshake/v2";
 
 /// The HPKE `info` of a frame sealed to a recipient key (RFC 9180 § 5.1).
 pub const TIGHTBEAM_HPKE_FRAME_INFO: &[u8] = b"tb/hpke/frame/v1";

@@ -355,8 +355,11 @@ pub trait EncryptedMessageIO: MessageIO {
 
 				if expects_encryption {
 					match envelope {
-						TransportEnvelope::EnvelopedData(_) | TransportEnvelope::SignedData(_) => {
-							Ok(CollectStep::Handshake(HandshakeMessage::try_from(envelope)?))
+						TransportEnvelope::EnvelopedData(_)
+						| TransportEnvelope::SignedData(_)
+						| TransportEnvelope::EncryptedData(_) => {
+							let message = HandshakeMessage::try_from(envelope)?;
+							Ok(CollectStep::Handshake(message))
 						}
 						// Circuit breaker: once encryption is configured,
 						// application traffic arrives encrypted.
@@ -914,9 +917,9 @@ pub trait EncryptedMessageIO: MessageIO {
 		let (status, response) = match response_envelope {
 			TransportEnvelope::Response(pkg) => (pkg.status, pkg.message),
 			TransportEnvelope::Request(_) => return Err(TransportError::InvalidMessage),
-			TransportEnvelope::EnvelopedData(_) | TransportEnvelope::SignedData(_) => {
-				return Err(TransportError::InvalidMessage)
-			}
+			TransportEnvelope::EnvelopedData(_)
+			| TransportEnvelope::SignedData(_)
+			| TransportEnvelope::EncryptedData(_) => return Err(TransportError::InvalidMessage),
 			#[cfg(feature = "transport-multiplex")]
 			TransportEnvelope::Mux(_) => return Err(TransportError::InvalidMessage),
 		};
@@ -947,9 +950,9 @@ impl TransportEnvelope {
 		match self {
 			TransportEnvelope::Request(msg) => Ok(msg.message),
 			TransportEnvelope::Response(_) => Err(TransportError::InvalidMessage),
-			TransportEnvelope::EnvelopedData(_) | TransportEnvelope::SignedData(_) => {
-				Err(TransportError::InvalidMessage)
-			}
+			TransportEnvelope::EnvelopedData(_)
+			| TransportEnvelope::SignedData(_)
+			| TransportEnvelope::EncryptedData(_) => Err(TransportError::InvalidMessage),
 			#[cfg(feature = "transport-multiplex")]
 			TransportEnvelope::Mux(_) => Err(TransportError::InvalidMessage),
 		}

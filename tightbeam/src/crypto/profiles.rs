@@ -567,8 +567,9 @@ impl UkmBuilder {
 mod tests {
 	use super::*;
 	use crate::constants::{
-		TIGHTBEAM_ACK_AAD_DOMAIN, TIGHTBEAM_CLIENT_FINISHED_DOMAIN, TIGHTBEAM_HPKE_FRAME_INFO,
-		TIGHTBEAM_HPKE_HANDSHAKE_INFO, TIGHTBEAM_KARI_KDF_INFO, TIGHTBEAM_SERVER_FINISHED_DOMAIN,
+		TIGHTBEAM_ACK_AAD_DOMAIN, TIGHTBEAM_CLIENT_FINISHED_DOMAIN, TIGHTBEAM_HPKE_CLIENT_AUTH_DOMAIN,
+		TIGHTBEAM_HPKE_FRAME_INFO, TIGHTBEAM_HPKE_HANDSHAKE_INFO, TIGHTBEAM_IDENTITY_AAD_DOMAIN,
+		TIGHTBEAM_IDENTITY_KDF_INFO, TIGHTBEAM_KARI_KDF_INFO, TIGHTBEAM_SERVER_FINISHED_DOMAIN,
 		TIGHTBEAM_SESSION_KDF_INFO, TIGHTBEAM_UKM_PREFIX,
 	};
 
@@ -584,8 +585,11 @@ mod tests {
 		assert_eq!(TIGHTBEAM_CLIENT_FINISHED_DOMAIN, b"tb/handshake/finished/client/v1");
 		assert_eq!(TIGHTBEAM_ACK_AAD_DOMAIN, b"tb/handshake/ack/aad/v1");
 		assert_eq!(TIGHTBEAM_UKM_PREFIX, b"tb/kari/ukm/v1|");
-		assert_eq!(TIGHTBEAM_HPKE_HANDSHAKE_INFO, b"tb/hpke/handshake/v1");
+		assert_eq!(TIGHTBEAM_HPKE_HANDSHAKE_INFO, b"tb/hpke/handshake/v2");
 		assert_eq!(TIGHTBEAM_HPKE_FRAME_INFO, b"tb/hpke/frame/v1");
+		assert_eq!(TIGHTBEAM_IDENTITY_KDF_INFO, b"tb/session/kdf/identity/v1");
+		assert_eq!(TIGHTBEAM_IDENTITY_AAD_DOMAIN, b"tb/handshake/identity/aad/v1");
+		assert_eq!(TIGHTBEAM_HPKE_CLIENT_AUTH_DOMAIN, b"tb/handshake/client-auth/hpke/v1");
 	}
 
 	fn nonce(val: u8) -> [u8; 32] {

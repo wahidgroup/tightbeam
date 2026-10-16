@@ -4,22 +4,22 @@
 //! The settlement answer a client attaches to its receipt
 //! countersignature is a bearer secret (for example a payment preimage):
 //! whoever observes it can claim the settlement. If the answer travels in
-//! the cleartext client Finished, a passive network observer steals it.
+//! the client Finished in clear, a passive network observer steals it.
 //!
 //! ## Attack
-//! An observer captures the client Finished `SignedData` and scans it for
-//! the settlement answer.
+//! An observer captures the sealed client Finished and scans it for the
+//! settlement answer.
 //!
 //! ## Expected control
 //! The answer MUST travel sealed under the handshake secret's acknowledgement
-//! key, as the `RECEIPT_ACK` attribute of the client Finished, which keeps it
-//! off the cleartext wire. The server MUST open it, verify the countersignature
-//! over the plaintext, settle, and retain the identical dual-signed receipt on
-//! both endpoints.
+//! key, as the `RECEIPT_ACK` attribute of the client Finished, which itself
+//! travels sealed under the identity key of the same secret. The server MUST
+//! open both seals, verify the countersignature over the plaintext, and
+//! settle. Both endpoints MUST retain the identical dual-signed receipt.
 //!
 //! ## References
 //! - CWE-311: Missing Encryption of Sensitive Data <https://cwe.mitre.org/data/definitions/311.html>
-//! - RFC 5116 s3.2: a nonce used once per key <https://datatracker.ietf.org/doc/html/rfc5116#section-3.2>
+//! - RFC 5116 § 3.1: a nonce used once per key <https://datatracker.ietf.org/doc/html/rfc5116#section-3.1>
 
 #![cfg(all(feature = "transport-cms", feature = "transport-multiplex", feature = "testing"))]
 
@@ -110,7 +110,7 @@ tb_assert_spec! {
 
 // The settlement answer must survive the sealed acknowledgement round trip
 // (client seals, server opens, verifies the countersignature, and settles)
-// while staying out of the cleartext client Finished bytes.
+// while staying out of the client Finished bytes on the wire.
 tb_scenario! {
 	name: cms_response_confidential_round_trip,
 	spec: ReceiptConfidentialitySpec,
@@ -135,8 +135,9 @@ tb_scenario! {
 			let client_finished = client.respond(reply).await?;
 			server.finish(client_finished.to_owned()).await?;
 
-			// The plaintext answer MUST stay out of the cleartext client
-			// Finished bytes: it travels sealed under the handshake secret.
+			// The plaintext answer MUST stay out of the client Finished bytes
+			// on the wire, because it travels sealed under the handshake
+			// secret.
 			let response_leaked = contains_window(client_finished.der(), RESPONSE);
 			trace.event_with(
 				RESPONSE_CONFIDENTIAL_ON_WIRE,

@@ -29,18 +29,23 @@ Both backends meet the transport at one interface, so the driver moves a handsha
 
 ```rust
 pub enum HandshakeMessage {
-    /// Carries an HPKE `ClientHello` or `ServerHandshake`, or a CMS Finished.
+    /// Carries an HPKE `ClientHello` or `ServerHandshake`, or a CMS server
+    /// Finished.
     SignedData(Box<WireDer<SignedData>>),
     /// Carries an HPKE `ClientKeyExchange`, or a CMS key exchange.
     EnvelopedData(Box<WireDer<EnvelopedData>>),
+    /// Carries a CMS client Finished, sealed under the identity key of the
+    /// handshake secret (RFC 5652 § 8).
+    EncryptedData(Box<WireDer<EncryptedData>>),
 }
 ```
 
-Each step accepts one container and refuses the other. A step asks for the one it expects, and the other one fails the step with `HandshakeError::UnexpectedContainer`.
+Each step accepts one container and refuses the others. A step asks for the one it expects, and any other fails the step with `HandshakeError::UnexpectedContainer`.
 
 ```rust
-let key_exchange = msg.enveloped()?;   // refuses a SignedData
-let finished = msg.signed()?;          // refuses an EnvelopedData
+let key_exchange = msg.enveloped()?;   // refuses a SignedData or an EncryptedData
+let finished = msg.signed()?;          // refuses an EnvelopedData or an EncryptedData
+let sealed = msg.encrypted()?;         // refuses a SignedData or an EnvelopedData
 ```
 
 Because each protocol names its own container, the driver carries no per-protocol mapping. `ClientBuilder`, the connection pool and the `client!` macro all reach the same code.
@@ -105,10 +110,12 @@ sequenceDiagram
     Note over S: validates the offer, negotiates a profile, draws an ephemeral
     S->>C: ServerHandshake (SignedData, signed transcript carries the server ephemeral)
     Note over C: validates the certificate, verifies the signature, parses the server ephemeral
-    C->>S: ClientKeyExchange (EnvelopedData, base secret, client ephemeral and key-confirmation tag sealed to the server's static key with HPKE)
+    C->>S: ClientKeyExchange (EnvelopedData, base secret, client ephemeral, key-confirmation tag and sealed identity, sealed to the server's static key with HPKE)
     Note over C,S: both derive the handshake secret from the base secret and the ephemeral-ephemeral ECDH
-    Note over S: verifies the key-confirmation tag, then settles the receipt countersignature
+    Note over S: opens the identity, verifies the key-confirmation tag, admits the client, then settles the receipt countersignature
 ```
+
+The client certificate and its possession signature travel inside the payload, sealed a second time under a key of the handshake secret. See [Client identity](#client-identity).
 
 CMS exchanges three messages as well, but the client leads with the key exchange because the base secret travels encrypted to the server's certificate.
 
@@ -121,14 +128,22 @@ sequenceDiagram
     S->>C: ServerFinished (SignedData, signed transcript carries the server ephemeral)
     Note over C: verifies the signature over the transcript, parses the server ephemeral
     Note over C,S: both derive the handshake secret from the base secret and the ephemeral-ephemeral ECDH
-    C->>S: ClientFinished (SignedData, key-confirmation tag, receipt countersignature sealed under the handshake secret)
-    Note over S: verifies the Finished and the key-confirmation tag, then opens and settles the receipt countersignature
+    C->>S: ClientFinished (EncryptedData: the Finished with its certificate, key-confirmation tag, and receipt countersignature, sealed under the handshake secret)
+    Note over S: opens the Finished, verifies the key-confirmation tag, then the Finished, then opens and settles the receipt countersignature
 ```
 
-In both protocols the server settles the receipt in the same step that reads the client's last message.
+The client Finished embeds the certificate and signs under its key, so the whole Finished travels sealed under a key of the handshake secret. See [Client identity](#client-identity).
 
+In both protocols the server reads the client's last message in one step, in this order:
+
+1. It opens the closing. HPKE opens the payload with the static key, derives the handshake secret, and opens the identity under it. CMS opens the sealed Finished under the handshake secret it derived at the reply.
+2. It compares the client ephemerals with the key of the offered certificate.
+3. It verifies the [key-confirmation tag](#key-confirmation).
+4. It admits the client: the validity period, the validators, and then the proof of possession.
+5. It settles the receipt countersignature.
+
+- The certificate checks and the proof run after the tag, so a client that derived another secret reaches no validator.
 - A budget-bearing session activates only after the countersignature verifies.
-- The [key-confirmation tag](#key-confirmation) is verified first.
 - A refused settlement takes the handshake secret with it, so a replay of that message has nothing to complete with.
 
 Both protocols negotiate the security profile through one policy, `ProfilePolicy`:
@@ -294,19 +309,17 @@ let client = ClientBuilder::<TokioListener>::builder()
 
 ### Admit a client
 
-A server admits its client through one rule in both protocols, and `PeerAuthentication::admit` is its one home. A certificate travels with the proof that the client holds its key:
+A server admits its client through one rule in both protocols, and `PeerAuthentication::admit` is its one home. It takes an `Offer`, which holds a certificate beside the proof that the client holds its key, or holds nothing:
 
-- HPKE carries the proof as the possession signature of the key exchange.
-- CMS carries it as the signature of the client Finished.
+- HPKE carries the proof as a signature over the domain `tb/handshake/client-auth/hpke/v1`, the transcript hash, the client ephemeral `R`, and the certificate DER. The certificate and the signature travel as one sealed `HpkeIdentity`.
+- CMS carries it as the signature of the client Finished, which travels sealed with the certificate it embeds.
 
-| Client offers             | Anonymous server                       | Mutual server                                            |
-| ------------------------- | -------------------------------------- | -------------------------------------------------------- |
-| Nothing                   | Admitted, no peer recorded             | Refused, `MissingClientCertificate`                      |
-| A certificate and a proof | Proof verified, no peer recorded       | Every validator runs, proof verified, peer recorded      |
-| A certificate alone       | Refused, `SignatureVerificationFailed` | Refused, by a validator or `SignatureVerificationFailed` |
-| A proof alone             | Refused, `MissingClientCertificate`    | Refused, `MissingClientCertificate`                      |
+| Client offers             | Anonymous server                 | Mutual server                                                             |
+| ------------------------- | -------------------------------- | ------------------------------------------------------------------------- |
+| Nothing                   | Admitted, no peer recorded       | Refused, `MissingClientCertificate`                                       |
+| A certificate and a proof | Proof verified, no peer recorded | Validity period read, every validator runs, proof verified, peer recorded |
 
-A CMS client always signs its Finished, so a CMS server always requires the certificate that verifies it.
+A certificate without its proof, or a proof without its certificate, has no `Offer`, so it never reaches admission. A CMS Finished is itself a proof, so a CMS server refuses one that names no certificate with `MissingClientCertificate`, under either policy.
 
 ## Key schedule
 
@@ -318,6 +331,7 @@ k_c2s   = HKDF(hs, S, "tb/session/kdf/c2s/v1")
 k_s2c   = HKDF(hs, S, "tb/session/kdf/s2c/v1")
 epoch_0 = HKDF(hs, S, "tb/session/kdf/epoch/v1")
 k_ack   = HKDF(hs, S, "tb/session/kdf/ack/v1")
+k_id    = HKDF(hs, S, "tb/session/kdf/identity/v1")
 confirm = HKDF(hs, S, "tb/session/kdf/confirm/v1" || transcript_hash)
 ```
 
@@ -339,19 +353,22 @@ The server draws a fresh ephemeral, `E`, for each handshake and carries it insid
 | Client drops its private half | In `respond`, at the agreement                                                               | In `respond`, at the agreement    |
 | Server drops its private half | In `finish`, which takes it on every outcome                                                 | In `reply`, where it is a local   |
 
-Every received ephemeral is checked before any scalar multiplication runs on it:
+Every received ephemeral is parsed before any scalar multiplication runs on it. `PeerPoint::parse` is the one parse of an ephemeral that the handshake secret agrees with, and `PeerEphemeral` runs it before its comparison. It refuses a malformed, off-curve, or identity point, and the agreement of the handshake secret takes no other point type.
 
-- `PublicKey::from_sec1_bytes` refuses a malformed, off-curve, or identity point.
-- A client also refuses an `E` with the x-coordinate of the server's static key, because the agreement would then collapse into the static one.
-- A server refuses a client ephemeral with the x-coordinate of the client's static key, for the same reason.
+An ephemeral with the x-coordinate of its sender's static key would collapse the agreement into the static one, so each side refuses it. The two sides learn that static key at different times, so the comparison has two homes:
+
+| Comparison                                                                                                   | Home            | When                                                    |
+| ------------------------------------------------------------------------------------------------------------ | --------------- | ------------------------------------------------------- |
+| A client compares `E` with the server's static key                                                           | `PeerEphemeral` | At the reply, before the agreement                      |
+| A server compares `R` and the encapsulated key (HPKE), or `C` (CMS), with the key of the offered certificate | `Offer::new`    | At the closing, once the identity opens, before the tag |
+| A rekey server compares `Ce` with the client's static key                                                    | `PeerEphemeral` | At the request, where the client's key is already known |
+| A rekey client compares `Se` with the server's static key                                                    | `PeerEphemeral` | At the response                                         |
 
 Three facts fix what a server compares:
 
 - The comparison is on the x-coordinate. ECDH keeps that coordinate alone, so a key and its negation agree to one secret.
-- The client's static key is the key of the certificate it offers. An anonymous client holds none.
+- The client's static key is the key of the certificate it offers, which a server reads only once the identity opens. An anonymous client holds none.
 - An HPKE client sends two ephemerals, `R` and the encapsulated key of the seal, and the server checks both.
-
-Both refusals sit on `PeerEphemeral`. It yields a `PeerPoint`, and the agreement of the handshake secret takes no other point type.
 
 ### Forward secrecy
 
@@ -363,8 +380,9 @@ An observer who records a session and later obtains the server's static key reco
 | `S`                         | Recovers                     | Public in the handshake messages                                  |
 | `ee`                        | Does not recover             | Needs `r` or `e` (HPKE), `c` or `e` (CMS), none of them kept      |
 | `hs` and every key below it | Does not recover             | One input unknown                                                 |
+| Client identity             | Does not recover             | Sealed under `k_id`, below `hs`                                   |
 
-The traffic keys, the sealed receipt acknowledgement, and every rekey epoch sit below `hs`, so the rekey chain inherits the property.
+The traffic keys, the sealed receipt acknowledgement, the sealed client identity, and every rekey epoch sit below `hs`, so the rekey chain inherits the property.
 
 ### Rekey
 
@@ -400,14 +418,29 @@ The acknowledgement is sealed under `k_ack`. Its associated data is the label `t
 - A sealed answer moved to another session fails to open, even under the right key.
 - The label names this AEAD context alone, so the associated data differs from every signed Finished content.
 
+### Client identity
+
+A client seals its certificate and its proof of possession under `k_id`. The associated data is the label `tb/handshake/identity/aad/v1` followed by the transcript hash.
+
+| Protocol | What is sealed                                                                       | Where it travels                                                                                                   |
+| -------- | ------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------ |
+| HPKE     | One `HpkeIdentity`: the certificate and the possession signature                     | `sealed_identity`, a field of the HPKE payload                                                                     |
+| CMS      | The client Finished, which embeds the certificate, the tag, and the countersignature | An `EncryptedData` (RFC 5652 § 8) of content type `signedData`, whose algorithm names the AEAD with its zero nonce |
+
+- The sealed plaintext is a big-endian `u16` length, the sealed DER, and zero bytes up to the next multiple of 512 bytes, at least 1024. Certificates whose lengths differ within one block give closings of one length. A CMS Finished adds about 280 bytes to its certificate, and about 590 when it carries a receipt countersignature, so a CMS fleet reaches the first block boundary at certificates of about 740 bytes, or about 430 on a budget-bearing session.
+- Two length signals remain by decision. A fleet whose identities straddle a block boundary splits into two lengths. Under an anonymous HPKE server, a closing that offers an identity is longer than one that offers none, as a TLS 1.3 client certificate shows its presence too.
+- A passive observer reads no byte of the certificate, its key identifier, its issuer and serial number, its key, or the signature.
+- An observer that later obtains the server's static key opens the HPKE payload or unwraps the CMS key exchange, but lacks `ee` and therefore `k_id`.
+- `k_ack` and `k_id` derive under two labels from one `hs`, and each seals one message, so each AEAD nonce is zero.
+
 ### Key confirmation
 
 The client proves on the closing that it derived `hs`. It sends `confirm`, and the server derives the same tag and compares the two in constant time before it settles.
 
-| Protocol | Where the tag travels                                                      | A closing with no tag fails with                     |
-| -------- | -------------------------------------------------------------------------- | ---------------------------------------------------- |
-| HPKE     | A field of the sealed payload                                              | `InvalidDecryptedPayloadSize`, at the payload decode |
-| CMS      | An unsigned attribute of the client Finished, OID `1.3.6.1.4.1.64586.1.24` | `MissingAttribute`, where the Finished is read       |
+| Protocol | Where the tag travels                                                             | A closing with no tag fails with                     |
+| -------- | --------------------------------------------------------------------------------- | ---------------------------------------------------- |
+| HPKE     | A field of the sealed payload                                                     | `InvalidDecryptedPayloadSize`, at the payload decode |
+| CMS      | An unsigned attribute of the sealed client Finished, OID `1.3.6.1.4.1.64586.1.24` | `MissingAttribute`, where the Finished opens         |
 
 - A tag that differs is refused with `KeyConfirmationFailed`. The refusal runs ahead of settlement, so the authorizer's settlement and the session observer hear nothing of a client that holds another secret.
 - The tag derives from `hs` and the transcript hash, so it reveals neither and confirms no other handshake. The CMS attribute therefore needs no signature over it.
@@ -432,12 +465,12 @@ The HPKE transcript binds the `ClientHello` DER and the accept encodings the sam
 
 Both transcripts bind both ephemerals.
 
-| Ephemeral        | Bound by                                                                                                         | Tampering fails at                                                                                  |
-| ---------------- | ---------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
-| Server `E`, HPKE | A fixed-width leg of the signed transcript                                                                       | The server signature. One of another width fails `OctetStringLengthError` before it                 |
-| Server `E`, CMS  | The last `ServerFinishedLegs` entry before the transcript seals                                                  | The server signature. A removed one fails `MissingAttribute` before the seal                        |
-| Client `R`, HPKE | The sealed payload carries `R`, so the AEAD authenticates it, and the client signature covers the sealed payload | The payload open (`HpkeError`). A point off the curve fails `InvalidPublicKey` at the payload parse |
-| Client `C`, CMS  | The key exchange DER, with `C` inside it, is the first transcript leg                                            | The key unwrap (`KeyError::WrapFailed`)                                                             |
+| Ephemeral        | Bound by                                                                                                                      | Tampering fails at                                                                                  |
+| ---------------- | ----------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| Server `E`, HPKE | A fixed-width leg of the signed transcript                                                                                    | The server signature. One of another width fails `OctetStringLengthError` before it                 |
+| Server `E`, CMS  | The last `ServerFinishedLegs` entry before the transcript seals                                                               | The server signature. A removed one fails `MissingAttribute` before the seal                        |
+| Client `R`, HPKE | The sealed payload carries `R`, so the AEAD authenticates it, and the possession signature of an identified client covers `R` | The payload open (`HpkeError`). A point off the curve fails `InvalidPublicKey` at the payload parse |
+| Client `C`, CMS  | The key exchange DER, with `C` inside it, is the first transcript leg                                                         | The key unwrap (`KeyError::WrapFailed`)                                                             |
 
 A swapped server ephemeral fails the server signature before any key agreement runs.
 
@@ -471,7 +504,7 @@ An end of stream is named by the phase it interrupted.
 - RFC 5280, Internet X.509 Public Key Infrastructure Certificate and CRL Profile: <https://datatracker.ietf.org/doc/html/rfc5280>
 - RFC 5869, HMAC-based Extract-and-Expand Key Derivation Function (HKDF): <https://datatracker.ietf.org/doc/html/rfc5869>
 - RFC 9180, Hybrid Public Key Encryption, § 9.2.3 on reuse of the KEM randomness: <https://datatracker.ietf.org/doc/html/rfc9180#section-9.2.3>
-- RFC 5116, An Interface and Algorithms for Authenticated Encryption, § 3.2 on single-use keys: <https://datatracker.ietf.org/doc/html/rfc5116#section-3.2>
+- RFC 5116, An Interface and Algorithms for Authenticated Encryption, § 3.1 on nonce generation: <https://datatracker.ietf.org/doc/html/rfc5116#section-3.1>
 - NIST SP 800-56A Rev. 3, Pair-Wise Key-Establishment Schemes Using Discrete Logarithm Cryptography, § 5.9 on key confirmation: <https://doi.org/10.6028/NIST.SP.800-56Ar3>
 - CWE-295, Improper Certificate Validation: <https://cwe.mitre.org/data/definitions/295.html>
 - CWE-311, Missing Encryption of Sensitive Data: <https://cwe.mitre.org/data/definitions/311.html>
