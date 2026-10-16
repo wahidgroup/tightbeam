@@ -1,8 +1,9 @@
-//! Common helpers and fixtures for security threat integration tests.
+//! The helpers and fixtures that the integration tests for security threats
+//! share.
 //!
-//! The module gives one protocol-agnostic interface for testing security
-//! threats across the handshake backends (HPKE, CMS), so each threat test
-//! runs against every backend from one body.
+//! The module gives one protocol-agnostic interface over the handshake
+//! backends (HPKE, CMS), so each threat test runs against every backend from
+//! one body.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -34,8 +35,8 @@ use tightbeam::{
 	TightBeamError,
 };
 
-// Shared fixtures live in the crate-wide `common` module so threat suites do
-// not depend on one another's helpers.
+// The shared fixtures live in the crate-wide `common` module, so each threat
+// suite depends only on that module.
 pub use crate::common::security::{
 	carried_key_exchange, default_security_profile, expectation_failure, hpke_client_config, hpke_server_config,
 	pinning_validator, tunneled_handshake, tunneled_reply, weak_security_profile, ServerMaterials,
@@ -117,18 +118,19 @@ pub struct CapturedMessage {
 	/// The step number the protocol assigns this message, which is its
 	/// [`FlowStep::index`].
 	pub step: usize,
-	/// Which endpoint sent the message.
+	/// The endpoint that sent the message.
 	pub direction: Direction,
-	/// Exact DER bytes as they crossed the wire.
+	/// The DER bytes of the message, exactly as its sender encoded them.
 	pub payload: Vec<u8>,
 }
 
-/// The result of running a full handshake with capture.
+/// The record of one complete handshake, as
+/// [`HandshakeProtocol::capture_full`] returns it.
 #[derive(Debug, Clone)]
 pub struct CapturedHandshake {
 	/// Every message the flow produced, in send order.
 	pub messages: Vec<CapturedMessage>,
-	/// Handshake backend that produced the capture.
+	/// The handshake backend that produced the capture.
 	pub kind: HandshakeBackendKind,
 }
 
@@ -143,21 +145,22 @@ impl CapturedHandshake {
 		self.messages.iter().filter(|m| m.direction == Direction::ClientToServer)
 	}
 
-	/// Return the message at a specific step.
+	/// Return the message captured at `step`.
 	#[allow(dead_code)]
 	pub fn message_at(&self, step: usize) -> Option<&CapturedMessage> {
 		self.messages.iter().find(|m| m.step == step)
 	}
 }
 
-/// The outcome of injecting a message during a handshake.
+/// The outcome of a message injected into a handshake.
 #[derive(Debug)]
 #[allow(dead_code)]
 pub enum InjectionOutcome {
-	/// The handshake continued or completed, which fails a replay attack test.
+	/// The handshake continued or completed, so the control under test let the
+	/// injected message through.
 	Accepted,
-	/// The handshake rejected the message with an error, which passes a replay
-	/// attack test.
+	/// The handshake rejected the message with this error, so the control
+	/// under test refused the injection.
 	Rejected(TightBeamError),
 }
 
@@ -171,14 +174,18 @@ pub enum Container {
 	Signed,
 	/// An `EnvelopedData`.
 	Enveloped,
+	/// An `EncryptedData`.
+	Encrypted,
 }
 
 impl Container {
-	/// Read `der` as a message in this container, with the bytes it arrived as.
+	/// Read `der` as a message in this container, and keep the bytes it
+	/// arrived as.
 	fn message(self, der: &[u8]) -> Result<HandshakeMessage, TightBeamError> {
 		let message = match self {
 			Self::Signed => HandshakeMessage::SignedData(Box::new(WireDer::try_from(der)?)),
 			Self::Enveloped => HandshakeMessage::EnvelopedData(Box::new(WireDer::try_from(der)?)),
+			Self::Encrypted => HandshakeMessage::EncryptedData(Box::new(WireDer::try_from(der)?)),
 		};
 
 		Ok(message)
@@ -198,9 +205,9 @@ pub struct FlowStep {
 
 /// A handshake flow described as its ordered steps.
 ///
-/// A backend states its step table and how one step advances to the next. The
-/// sequence is then written once here, so capture and injection drive the same
-/// machine rather than each transcribing the protocol again.
+/// A backend states its step table and how one step advances to the next.
+/// [`HandshakeProtocol`] walks that table for both capture and injection, so
+/// the two drive the same sequence.
 pub trait HandshakeFlow: Send {
 	/// The backend this flow belongs to.
 	fn backend(&self) -> HandshakeBackendKind;
@@ -208,11 +215,11 @@ pub trait HandshakeFlow: Send {
 	/// The ordered steps this protocol exchanges.
 	fn steps(&self) -> &'static [FlowStep];
 
-	/// Build the opening message, which no earlier step produces.
+	/// Build the opening message, which the first step delivers.
 	fn open(&mut self) -> FlowFuture<'_, Vec<u8>>;
 
-	/// Hand `msg` to the endpoint that receives step `index`, returning that
-	/// endpoint's reply when the flow continues.
+	/// Hand `msg` to the endpoint that receives step `index`, and return that
+	/// endpoint's answer, which is `None` when that endpoint ends the flow.
 	fn advance<'a>(
 		&'a mut self,
 		index: usize,
@@ -220,20 +227,20 @@ pub trait HandshakeFlow: Send {
 	) -> FlowFuture<'a, Option<Vec<u8>>>;
 }
 
-/// Protocol-agnostic handshake operations for security testing.
+/// The protocol-agnostic handshake operations that a threat test drives.
 ///
-/// Both operations are derived from the flow's step table, so a backend states
-/// its sequence once and gets capture and injection from it.
+/// Every [`HandshakeFlow`] implements this trait from its step table, so a
+/// backend states its sequence once and gets capture and injection from it.
 #[allow(dead_code)]
 pub trait HandshakeProtocol: Send {
 	/// Return the backend kind for this session.
 	fn kind(&self) -> HandshakeBackendKind;
 
-	/// Run a complete handshake, capturing all exchanged messages.
+	/// Run a complete handshake, and capture every message it exchanges.
 	fn capture_full(&mut self) -> FlowFuture<'_, CapturedHandshake>;
 
-	/// Run the handshake up to step N, then inject a different message at
-	/// step N.
+	/// Run the handshake up to `step`, then hand `msg` to the endpoint that
+	/// receives that step in place of the real message.
 	fn inject_at_step(&mut self, step: usize, msg: &[u8]) -> FlowFuture<'_, InjectionOutcome>;
 }
 
@@ -270,8 +277,9 @@ impl<F: HandshakeFlow> HandshakeProtocol for F {
 				return Err(invalid_step_error("step is not part of this handshake flow"));
 			}
 
-			// The opening message is built only once a step before the target
-			// needs it, so injecting at step 0 leaves the client untouched.
+			// The client builds the opening message only when a step before the
+			// target needs it, so an injection at step 0 leaves the client
+			// untouched.
 			let mut pending = None;
 			for candidate in steps.iter().take_while(|candidate| candidate.index != step) {
 				let payload = match pending {
@@ -292,7 +300,7 @@ impl<F: HandshakeFlow> HandshakeProtocol for F {
 
 /// The total number of handshake backends the security harness exercises.
 pub const BACKEND_COUNT: usize = 1 + cfg!(feature = "transport-cms") as usize;
-/// [`BACKEND_COUNT`] as a `u32`, for the spec macros.
+/// The value of [`BACKEND_COUNT`] as a `u32`, for the spec macros.
 pub const BACKEND_COUNT_U32: u32 = BACKEND_COUNT as u32;
 
 /// The handshake backends the harness can run.
@@ -326,9 +334,9 @@ impl HandshakeBackendKind {
 
 	/// Flip one byte of the signed content in this backend's server message.
 	///
-	/// This simulates a MITM attacker modifying the message in transit. The
-	/// edit goes through the decoded message and re-encodes it, so the result
-	/// is well-formed DER that only a transcript or signature check can refuse.
+	/// The edit models a MITM attacker that changes the message in transit. It
+	/// goes through the decoded message and re-encodes it, so the result is
+	/// well-formed DER that only a transcript or signature check can refuse.
 	///
 	/// - HPKE tampers the `ServerHandshake` server random.
 	/// - CMS tampers the first byte of the content the `ServerFinished` signs,
@@ -377,9 +385,9 @@ use tightbeam::urn::Urn;
 
 /// A harness that spawns handshake sessions across every enabled backend.
 ///
-/// The harness can hold a `TraceCollector` that emits internal (hidden)
-/// events during handshake operations, so a process spec can validate
-/// internal state.
+/// The harness can hold a [`TraceCollector`]. When it does, each spawn records
+/// the internal (hidden) events of the path it takes, so a process spec can
+/// validate internal state.
 #[derive(Clone)]
 pub struct SecurityThreatHarness {
 	materials: ServerMaterials,
@@ -406,7 +414,7 @@ impl SecurityThreatHarness {
 	/// Hidden CSP event: the weak CMS backend is selected.
 	pub const HARNESS_SPAWN_CMS_WEAK: Urn<'static> = tightbeam::urn!("test", "event:security-harness/spawn-cms-weak");
 
-	/// Create a harness with a trace collector for internal event emission.
+	/// Create a harness that records its hidden events into `trace`.
 	pub fn with_trace(trace: Arc<TraceCollector>) -> Self {
 		Self { materials: ServerMaterials::generate(), trace: Some(trace) }
 	}
@@ -424,17 +432,16 @@ impl SecurityThreatHarness {
 		Ok(())
 	}
 
-	/// Spawn a protocol session for the given backend kind with default
-	/// profiles.
+	/// Spawn a protocol session of `kind`, where both endpoints run the default
+	/// security profile.
 	pub fn spawn(&self, kind: HandshakeBackendKind) -> Box<dyn HandshakeProtocol> {
 		let client_profiles = vec![default_security_profile()];
 		let server_profiles = vec![default_security_profile()];
 		self.spawn_with_profiles(kind, client_profiles, server_profiles)
 	}
 
-	/// Spawn a protocol session with specific client and server profiles.
-	///
-	/// The method supports cross-session downgrade attack tests:
+	/// Spawn a protocol session of `kind` with separate client and server
+	/// profiles, which a cross-session downgrade test needs.
 	///
 	/// - The client offers `client_profiles`.
 	/// - The server accepts `server_profiles`.
@@ -472,19 +479,19 @@ impl SecurityThreatHarness {
 		}
 	}
 
-	/// Spawn a session with the WEAK cipher (AES-128-GCM) for downgrade
-	/// testing.
+	/// Spawn a session of `kind` on the weak AES-128-GCM cipher, for a
+	/// downgrade test.
 	///
-	/// `Aes128CryptoProvider` runs AES-128 at the cipher level as well as
-	/// naming it in the profile descriptor OIDs.
+	/// - [`Aes128CryptoProvider`] runs AES-128 at the cipher level as well as
+	///   naming it in the profile descriptor OIDs.
+	/// - The session is deliberately weak. It opts out of the default strength
+	///   floor with [`NoStrengthFloor`], so the downgrade harness can capture
+	///   the messages of an AES-128 session.
 	pub fn spawn_weak(&self, kind: HandshakeBackendKind) -> Box<dyn HandshakeProtocol> {
 		self.emit(Self::HARNESS_SPAWN_WEAK).ok();
 		match kind {
 			HandshakeBackendKind::Hpke => {
 				self.emit(Self::HARNESS_SPAWN_HPKE_WEAK).ok();
-				// The session is deliberately weak. It opts out of the default
-				// strength floor, so the downgrade harness can capture AES-128
-				// wire bytes.
 				Box::new(Session::<Hpke, Aes128CryptoProvider>::with_profiles(
 					&self.materials,
 					vec![weak_security_profile()],
@@ -495,9 +502,6 @@ impl SecurityThreatHarness {
 			#[cfg(feature = "transport-cms")]
 			HandshakeBackendKind::Cms => {
 				self.emit(Self::HARNESS_SPAWN_CMS_WEAK).ok();
-				// The session is deliberately weak. It opts out of the default
-				// strength floor, so the downgrade harness can capture AES-128
-				// wire bytes.
 				Box::new(Session::<Cms, Aes128CryptoProvider>::with_profiles(
 					&self.materials,
 					vec![weak_security_profile()],
@@ -517,9 +521,8 @@ fn invalid_step_error(msg: &'static str) -> TightBeamError {
 	}))
 }
 
-/// Tamper with a message by appending extra bytes.
-///
-/// The function simulates a MITM attacker that adds data to a message.
+/// Return `payload` with `extra` appended, as a MITM attacker that adds data
+/// to a message sends it.
 #[allow(dead_code)]
 pub fn tamper_payload_append(payload: impl AsRef<[u8]>, extra: impl AsRef<[u8]>) -> Vec<u8> {
 	let payload = payload.as_ref();
@@ -529,9 +532,8 @@ pub fn tamper_payload_append(payload: impl AsRef<[u8]>, extra: impl AsRef<[u8]>)
 	tampered
 }
 
-/// Tamper with a message by truncating bytes.
-///
-/// The function simulates a MITM attacker that truncates a message.
+/// Return the first `keep_bytes` bytes of `payload`, as a MITM attacker that
+/// truncates a message sends it.
 #[allow(dead_code)]
 pub fn tamper_payload_truncate(payload: impl AsRef<[u8]>, keep_bytes: usize) -> Vec<u8> {
 	let payload = payload.as_ref();
@@ -548,8 +550,8 @@ pub enum DecryptionResult {
 	Failed,
 }
 
-/// Return the encrypted HPKE blob from the DER of a captured HPKE closing,
-/// which carries the `ClientKeyExchange`.
+/// Return the sealed HPKE message (`encrypted_data`) of the
+/// `ClientKeyExchange` that the DER of a captured HPKE closing carries.
 pub fn extract_hpke_ciphertext(closing_der: impl AsRef<[u8]>) -> Result<Vec<u8>, TightBeamError> {
 	let closing = Container::Enveloped.message(closing_der.as_ref())?;
 	let client_kex = carried_key_exchange(closing);
@@ -562,21 +564,26 @@ type Suite = HpkeSecp256k1Sha3Aes256Gcm;
 /// Extract the encapsulated key from a sealed HPKE message.
 ///
 /// The message leads with the encapsulated key, which is the ephemeral public
-/// key HPKE drew for this one message, as an uncompressed secp256k1 point.
+/// key HPKE drew for this one message. The function returns it as an
+/// uncompressed secp256k1 point.
 pub fn extract_ephemeral_pubkey(sealed: impl AsRef<[u8]>) -> Result<Vec<u8>, TightBeamError> {
 	let message = HpkeMessage::<Suite>::from_bytes(sealed)?;
 	let encapsulated = message.encapsulated_key().to_encoded_point(false);
 	Ok(encapsulated.as_bytes().to_vec())
 }
 
-/// The key-exchange payload as its DER carries it in a session with no
-/// receipt: the base secret, the client random, the client ephemeral, and the
-/// key-confirmation tag.
+/// The key-exchange payload as its DER carries it in an unmetered session of
+/// an anonymous client.
 #[derive(Sequence)]
 pub struct KeyExchangePayload {
+	/// The base secret of the key exchange.
 	pub base_key: OctetString,
+	/// The client random, which echoes the random of the client hello.
 	pub client_random: OctetString,
+	/// The public key of the client ephemeral.
 	pub client_ephemeral: OctetString,
+	/// The key-confirmation tag, which proves that the client derived the same
+	/// handshake secret.
 	pub key_confirmation: OctetString,
 }
 
@@ -592,18 +599,18 @@ pub fn open_key_exchange(
 	Ok(KeyExchangePayload::from_der(&opened.to_insecure())?)
 }
 
-/// The default domain tag an HPKE closing payload is sealed under. It is the
-/// whole associated data when the client presents no certificate.
+/// The default domain tag an HPKE closing payload is sealed under, which is the
+/// whole associated data of the seal.
 pub const HANDSHAKE_AAD: &[u8] = b"tb/aead/v1";
 
-/// Attempt to open an HPKE message with the recipient's secret key.
+/// Try to open an HPKE message with the recipient's secret key.
 ///
 /// `aad` defaults to [`HANDSHAKE_AAD`] when it is `None`.
 ///
 /// # Returns
 ///
-/// - `DecryptionResult::Success` with the plaintext length when decryption worked.
-/// - `DecryptionResult::Failed` when decryption failed, for example on a wrong key or invalid data.
+/// - [`DecryptionResult::Success`] with the plaintext length when decryption worked.
+/// - [`DecryptionResult::Failed`] when decryption failed, for example on a wrong key or invalid data.
 pub fn try_decrypt_hpke(
 	ciphertext: impl AsRef<[u8]>,
 	secret_key: &k256::SecretKey,
@@ -637,19 +644,20 @@ const HPKE_FLOW: &[FlowStep] = &[
 	FlowStep { index: 2, direction: Direction::ClientToServer, container: Container::Enveloped },
 ];
 
-/// The three messages a CMS handshake exchanges. The intervening odd steps are
-/// the receiving half of each, so they carry no message of their own.
+/// The three messages a CMS handshake exchanges. The odd steps between them
+/// are the receiving half of each message, so the table lists only the even
+/// steps.
 #[cfg(feature = "transport-cms")]
 const CMS_FLOW: &[FlowStep] = &[
 	FlowStep { index: 0, direction: Direction::ClientToServer, container: Container::Enveloped },
 	FlowStep { index: 2, direction: Direction::ServerToClient, container: Container::Signed },
-	FlowStep { index: 4, direction: Direction::ClientToServer, container: Container::Signed },
+	FlowStep { index: 4, direction: Direction::ClientToServer, container: Container::Encrypted },
 ];
 
 /// A handshake protocol the harness runs sessions of, under provider `P`.
 ///
-/// The library's flow markers implement it, and [`Session`] drives the two
-/// handshakes it builds.
+/// The library's flow markers implement it, and [`Session`] drives the client
+/// and the server handshake that the flow builds.
 pub trait SessionFlow<P: HandshakeProvider>: ClientFlow<P> + ServerFlow<P> {
 	/// The backend this flow belongs to.
 	const BACKEND: HandshakeBackendKind;
@@ -742,7 +750,8 @@ pub struct Session<F: SessionFlow<P>, P: HandshakeProvider> {
 }
 
 impl<F: SessionFlow<P>, P: HandshakeProvider> Session<F, P> {
-	/// Create a session with specific client and server profiles.
+	/// Create a session where the client offers `client_profiles` and the
+	/// server runs `server_profiles`.
 	///
 	/// `strength_policy` overrides both endpoints' default strength floor,
 	/// which a deliberately weak downgrade session needs.

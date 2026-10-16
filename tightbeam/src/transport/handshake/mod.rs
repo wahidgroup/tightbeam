@@ -3,7 +3,7 @@
 //! This module implements two handshake protocols:
 //!
 //! - **HPKE-based**: the client seals the base secret to the server's static key (RFC 9180).
-//! - **CMS-based**: full X.509 PKI with signed and enveloped data.
+//! - **CMS-based**: full X.509 PKI with signed, enveloped, and encrypted data.
 //!
 //! Both protocols establish authenticated, encrypted sessions and negotiate
 //! the cryptographic algorithms between client and server.
@@ -31,14 +31,14 @@
 //! │  │                           │                                         │
 //! │  │◄─ ServerHandshake ────────│  (server_rand, eph, cert, sig, accept?, │
 //! │  │                           │   ma?)                                  │
-//! │  │── ClientKeyExchange ─────►│  (hpke(base, R, tag, ack?),             │
-//! │  │                           │   [cert, sig]?)                         │
+//! │  │── ClientKeyExchange ─────►│  (hpke(base, R, tag, ack?,              │
+//! │  │                           │   seal(cert, sig)?))                    │
 //! │  │ ◄═ Session Established ═► │  (AEAD keys derived)                    │
 //! │  │                           │                                         │
 //! │  └───────────────────────────┘                                         │
 //! └────────────────────────────────────────────────────────────────────────┘
 //! **Legend:**
-//! - `[]` = optional fields, only present if mutual authentication is required
+//! - `seal(cert, sig)` = the client certificate and its signature, sealed under a key of the handshake secret
 //! - `eph` = the server's per-handshake ephemeral public key, inside the signed transcript
 //! - `tag` = the client's key-confirmation tag, which the server verifies before it settles
 //! - Arrows show message direction and content
@@ -55,9 +55,12 @@
 //!
 //! The server signs its ephemeral inside the transcript, and both ephemeral
 //! private keys drop at the step that consumes them. A recording plus a later
-//! copy of the server's static key therefore recovers the base secret alone:
-//! the traffic keys, the rekey epochs, and the sealed receipt acknowledgement
-//! all need the ECDH output, and that needs a private key neither side kept.
+//! copy of the server's static key therefore recovers the base secret alone.
+//! These need the ECDH output, which needs a private key neither side kept:
+//!
+//! - the traffic keys and the rekey epochs,
+//! - the sealed receipt acknowledgement, and
+//! - the sealed client identity.
 //!
 //! # Architecture
 //!
@@ -142,7 +145,13 @@
 //! | --- | --- | --- | --- |
 //! | Opening | Client | `ClientHello` | Key exchange |
 //! | Reply | Server | `ServerHandshake` | Server Finished |
-//! | Closing | Client | `ClientKeyExchange` | Client Finished |
+//! | Closing | Client | `ClientKeyExchange` | Client Finished, sealed |
+//!
+//! A server reads the closing in one order in both protocols: it opens the
+//! closing, confirms the handshake secret, admits the client, and settles the
+//! receipt. The client identity opens only under the handshake secret, so the
+//! comparison of the client ephemerals with the client's static key waits for
+//! the open. [`Handshake::finish`] states each step.
 //!
 //! ## State machine
 //!
@@ -242,16 +251,15 @@ pub(crate) use wire::HandshakeOctets;
 
 use crate::asn1::OctetString;
 use crate::cms::content_info::CmsVersion;
+use crate::cms::encrypted_data::EncryptedData;
 use crate::cms::enveloped_data::{EncryptedContentInfo, EnvelopedData, RecipientInfos};
 use crate::cms::signed_data::{EncapsulatedContentInfo, SignedData, SignerInfos};
 use crate::crypto::aead::SessionKeys;
 use crate::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
 use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider, SecurityProfileDesc};
 use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
-use crate::crypto::x509::attr::{Attribute, AttributeValue, Attributes};
-use crate::der::asn1::SetOfVec;
-use crate::der::{Any, Decode, Encode, Enumerated, Sequence, Tag};
-use crate::oids::{AES_256_GCM, CLIENT_CERTIFICATE, CLIENT_SIGNATURE, DATA};
+use crate::der::{Any, Encode, Enumerated, Sequence, Tag};
+use crate::oids::{AES_256_GCM, DATA};
 use crate::spki::AlgorithmIdentifierOwned;
 use crate::transport::error::TransportError;
 use crate::transport::handshake::error::Result;
@@ -263,10 +271,11 @@ use crate::transport::wire_der::WireDer;
 use crate::utils::marker::{MaybeSend, MaybeSendFuture};
 use crate::x509::Certificate;
 use crate::Beamable;
-use attributes::HandshakeAttributes;
 
 #[cfg(feature = "transport-hpke")]
 use crate::der::asn1::OctetStringRef;
+#[cfg(feature = "transport-hpke")]
+use crate::der::Decode;
 #[cfg(feature = "transport-hpke")]
 use schedule::KeyConfirmation;
 
@@ -473,17 +482,21 @@ pub enum HandshakeAlert {
 	// decode a stale meaning.
 }
 
-/// A handshake message travels in one of two CMS containers.
+/// A handshake message travels in one of three CMS containers.
 ///
 /// HPKE carries its own message types inside a container, so its messages
 /// are decoded from one. The CMS handshake exchanges the containers
 /// themselves.
 #[derive(Debug, Clone, PartialEq)]
 pub enum HandshakeMessage {
-	/// Carries an HPKE `ClientHello` or `ServerHandshake`, or a CMS Finished.
+	/// Carries an HPKE `ClientHello` or `ServerHandshake`, or a CMS server
+	/// Finished.
 	SignedData(Box<WireDer<SignedData>>),
 	/// Carries an HPKE `ClientKeyExchange`, or a CMS key exchange.
 	EnvelopedData(Box<WireDer<EnvelopedData>>),
+	/// Carries a CMS client Finished, sealed under the identity key of the
+	/// handshake secret (RFC 5652 § 8).
+	EncryptedData(Box<WireDer<EncryptedData>>),
 }
 
 impl HandshakeMessage {
@@ -491,12 +504,12 @@ impl HandshakeMessage {
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError::UnexpectedContainer`] -- the message holds the
-	///   key-transport container, which this step refuses.
+	/// - [`HandshakeError::UnexpectedContainer`] -- the message holds another
+	///   container, which this step refuses.
 	pub fn signed(self) -> CoreResult<WireDer<SignedData>, HandshakeError> {
 		match self {
 			Self::SignedData(signed) => Ok(*signed),
-			Self::EnvelopedData(_) => Err(HandshakeError::UnexpectedContainer),
+			Self::EnvelopedData(_) | Self::EncryptedData(_) => Err(HandshakeError::UnexpectedContainer),
 		}
 	}
 
@@ -504,12 +517,25 @@ impl HandshakeMessage {
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError::UnexpectedContainer`] -- the message holds the
-	///   signed container, which this step refuses.
+	/// - [`HandshakeError::UnexpectedContainer`] -- the message holds another
+	///   container, which this step refuses.
 	pub fn enveloped(self) -> CoreResult<WireDer<EnvelopedData>, HandshakeError> {
 		match self {
 			Self::EnvelopedData(enveloped) => Ok(*enveloped),
-			Self::SignedData(_) => Err(HandshakeError::UnexpectedContainer),
+			Self::SignedData(_) | Self::EncryptedData(_) => Err(HandshakeError::UnexpectedContainer),
+		}
+	}
+
+	/// Returns the sealed container.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::UnexpectedContainer`] -- the message holds another
+	///   container, which this step refuses.
+	pub fn encrypted(self) -> CoreResult<WireDer<EncryptedData>, HandshakeError> {
+		match self {
+			Self::EncryptedData(encrypted) => Ok(*encrypted),
+			Self::SignedData(_) | Self::EnvelopedData(_) => Err(HandshakeError::UnexpectedContainer),
 		}
 	}
 
@@ -518,6 +544,7 @@ impl HandshakeMessage {
 		match self {
 			Self::SignedData(signed) => signed.der(),
 			Self::EnvelopedData(enveloped) => enveloped.der(),
+			Self::EncryptedData(encrypted) => encrypted.der(),
 		}
 	}
 }
@@ -540,6 +567,16 @@ impl TryFrom<EnvelopedData> for HandshakeMessage {
 	fn try_from(enveloped: EnvelopedData) -> CoreResult<Self, Self::Error> {
 		let enveloped = WireDer::new(enveloped)?;
 		Ok(Self::EnvelopedData(Box::new(enveloped)))
+	}
+}
+
+/// Wraps a sealed container this endpoint built, encoded once for sending.
+impl TryFrom<EncryptedData> for HandshakeMessage {
+	type Error = HandshakeError;
+
+	fn try_from(encrypted: EncryptedData) -> CoreResult<Self, Self::Error> {
+		let encrypted = WireDer::new(encrypted)?;
+		Ok(Self::EncryptedData(Box::new(encrypted)))
 	}
 }
 
@@ -813,8 +850,8 @@ pub struct ServerHandshake {
 /// Confidential plaintext of the HPKE key exchange.
 ///
 /// Only the server decrypts it. It carries the base secret, the anti-replay
-/// client random, the client ephemeral, the key-confirmation tag, and the
-/// sealed receipt countersignature.
+/// client random, the client ephemeral, the key-confirmation tag, the sealed
+/// receipt countersignature, and the sealed client identity.
 #[cfg(feature = "transport-hpke")]
 #[derive(Clone, Sequence)]
 pub(crate) struct HpkeSessionPayload {
@@ -837,51 +874,36 @@ pub(crate) struct HpkeSessionPayload {
 	/// It is required exactly when the server issued a receipt.
 	#[asn1(context_specific = "0", optional = "true")]
 	pub receipt_ack: Option<OctetString>,
+	/// The client's [`HpkeIdentity`], sealed under the identity key of the
+	/// handshake secret, when the client presents an identity. The key needs
+	/// the ephemeral-ephemeral agreement, so a later theft of the server's
+	/// static key does not open it.
+	#[asn1(context_specific = "1", optional = "true")]
+	pub sealed_identity: Option<OctetString>,
+}
+
+/// The identity an HPKE client presents: its certificate and the signature
+/// that proves it holds the certificate's key.
+///
+/// It travels only sealed, inside [`HpkeSessionPayload::sealed_identity`], so
+/// the pair crosses the wire as one value or not at all.
+#[cfg(feature = "transport-hpke")]
+#[derive(Sequence)]
+pub(crate) struct HpkeIdentity {
+	/// The client certificate.
+	pub certificate: Certificate,
+	/// The signature of the certificate's key over the possession digest.
+	pub signature: OctetString,
 }
 
 /// Final client handshake message carrying the encrypted key material.
 #[derive(Beamable, Sequence, Debug, Clone, PartialEq)]
 pub struct ClientKeyExchange {
 	/// The HPKE message that seals the session payload to the server's static
-	/// key. Its encapsulated key serves that one seal, and the payload inside
-	/// carries the client ephemeral of the handshake secret.
+	/// key. Its encapsulated key serves that one seal. The payload inside
+	/// carries the client ephemeral of the handshake secret, and the client
+	/// identity sealed under a key of that secret.
 	pub encrypted_data: OctetString,
-	/// Client certificate for mutual authentication. A client that holds an
-	/// identity includes it, and the [`ServerHandshake`] demands it by setting
-	/// `client_cert_required`.
-	#[asn1(optional = "true")]
-	pub client_certificate: Option<Certificate>,
-	/// Signature over the handshake transcript, which proves possession of
-	/// the client certificate's private key.
-	///
-	/// The signed digest covers `transcript_hash || encrypted_data ||
-	/// cert_der`, so the signature binds this key exchange to this identity.
-	#[asn1(optional = "true")]
-	pub client_signature: Option<OctetString>,
-}
-
-#[cfg(feature = "transport-hpke")]
-impl ClientKeyExchange {
-	/// The AEAD associated data the HPKE key-exchange payload is sealed
-	/// under: `domain_tag`, followed by the DER of `client_certificate` when
-	/// the client presents one.
-	///
-	/// Both sides build the associated data here, so the payload opens only
-	/// under the certificate that sealed it, and a swapped certificate fails
-	/// the AEAD open (CWE-287, CWE-345).
-	///
-	/// # Errors
-	///
-	/// - [`HandshakeError::DerError`] -- `client_certificate` fails to encode.
-	pub fn client_bound_aad(domain_tag: impl AsRef<[u8]>, client_certificate: Option<&Certificate>) -> Result<Vec<u8>> {
-		let domain_tag = domain_tag.as_ref();
-		let Some(certificate) = client_certificate else {
-			return Ok(domain_tag.to_vec());
-		};
-
-		let cert_der = certificate.to_der()?;
-		Ok([domain_tag, cert_der.as_slice()].concat())
-	}
 }
 
 fn encodable_to_signed_data<T: Encode>(message: &T) -> Result<SignedData> {
@@ -968,67 +990,6 @@ impl TryFrom<&SignedData> for ServerHandshake {
 	}
 }
 
-fn build_client_key_exchange_attrs(kex: &ClientKeyExchange) -> Result<Option<x509_cert::attr::Attributes>> {
-	let mut attrs = Vec::new();
-
-	if let Some(cert) = &kex.client_certificate {
-		let cert_attr = HandshakeAttribute::encode(cert)?;
-		attrs.push(Attribute::try_from(cert_attr)?);
-	}
-
-	if let Some(sig) = &kex.client_signature {
-		let sig_der = sig.to_der()?;
-		let sig_any = Any::new(Tag::OctetString, sig_der)?;
-		let sig_values = SetOfVec::try_from(vec![AttributeValue::from(sig_any)])?;
-
-		attrs.push(Attribute { oid: CLIENT_SIGNATURE, values: sig_values });
-	}
-
-	if attrs.is_empty() {
-		Ok(None)
-	} else {
-		Ok(Some(Attributes::try_from(attrs)?))
-	}
-}
-
-/// The single value of `attr` decoded as an OCTET STRING.
-fn octet_string_value(attr: &HandshakeAttribute) -> Result<OctetString> {
-	let value = attr.value()?;
-	Ok(OctetString::from_der(value.value())?)
-}
-
-/// Parse the certificate and the possession signature out of a key
-/// exchange's unprotected attributes.
-///
-/// # Errors
-///
-/// - [`HandshakeError::DuplicateAttribute`] -- an attribute OID repeats.
-/// - [`HandshakeError::InvalidAttributeArity`] -- an attribute carries other than one value.
-/// - [`HandshakeError::DerError`] -- the certificate or the signature fails to decode.
-fn parse_client_key_exchange_attrs(enveloped_data: &EnvelopedData) -> Result<ClientKeyExchangeAttrs> {
-	let Some(attrs) = &enveloped_data.unprotected_attrs else {
-		return Ok(ClientKeyExchangeAttrs::default());
-	};
-
-	let certificate = attrs
-		.find_unsigned_attr(CLIENT_CERTIFICATE)?
-		.map(|attr| attr.decode::<Certificate>())
-		.transpose()?;
-	let signature = attrs
-		.find_unsigned_attr(CLIENT_SIGNATURE)?
-		.map(|attr| octet_string_value(&attr))
-		.transpose()?;
-
-	Ok(ClientKeyExchangeAttrs { certificate, signature })
-}
-
-/// Parsed unprotected attributes of a [`ClientKeyExchange`] envelope.
-#[derive(Default)]
-struct ClientKeyExchangeAttrs {
-	certificate: Option<Certificate>,
-	signature: Option<OctetString>,
-}
-
 /// AES-256-GCM algorithm identifier.
 ///
 /// The OID is 2.16.840.1.101.3.4.1.46 (aes256-GCM).
@@ -1042,8 +1003,6 @@ impl TryFrom<&ClientKeyExchange> for EnvelopedData {
 	type Error = HandshakeError;
 
 	fn try_from(kex: &ClientKeyExchange) -> CoreResult<Self, Self::Error> {
-		let unprotected_attrs = build_client_key_exchange_attrs(kex)?;
-
 		Ok(EnvelopedData {
 			version: CmsVersion::V0,
 			originator_info: None,
@@ -1053,7 +1012,7 @@ impl TryFrom<&ClientKeyExchange> for EnvelopedData {
 				content_enc_alg: aes_256_gcm_algorithm(),
 				encrypted_content: Some(OctetString::new(kex.encrypted_data.as_bytes())?),
 			},
-			unprotected_attrs,
+			unprotected_attrs: None,
 		})
 	}
 }
@@ -1070,12 +1029,6 @@ impl TryFrom<&EnvelopedData> for ClientKeyExchange {
 			.ok_or(HandshakeError::InvalidClientKeyExchange)?
 			.as_bytes();
 
-		let attrs = parse_client_key_exchange_attrs(enveloped_data)?;
-
-		Ok(ClientKeyExchange {
-			encrypted_data: OctetString::new(encrypted_bytes)?,
-			client_certificate: attrs.certificate,
-			client_signature: attrs.signature,
-		})
+		Ok(ClientKeyExchange { encrypted_data: OctetString::new(encrypted_bytes)? })
 	}
 }

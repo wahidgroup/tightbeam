@@ -5,44 +5,54 @@
 //! an irreversible external side effect (crediting an account, releasing a
 //! good, marking an invoice paid).
 //!
-//! Suppose the server verifies the client's receipt countersignature and
-//! settles *before* it has decrypted the key exchange and confirmed the
-//! client random. An attacker can then drive settlement with a key exchange
-//! the server will reject. The payload never establishes a session, but the
-//! side effect already fired.
+//! A server that settles before it finishes checking the closing spends that
+//! side effect on a closing it then refuses, and the session never activates.
 //!
 //! ## Attack
-//! A network attacker captures a victim's budget-bearing `ClientKeyExchange`:
-//! the certificate, the transcript-bound auth signature, and the HPKE
-//! ciphertext (`encrypted_data`). The ciphertext carries the sealed receipt
-//! countersignature, which covers only the receipt body and the settlement
-//! answer. The attacker corrupts the ciphertext and keeps the rest.
+//! A network attacker captures a victim's budget-bearing [`ClientKeyExchange`],
+//! whose HPKE ciphertext (`encrypted_data`) carries the sealed receipt
+//! countersignature. The countersignature covers only the receipt body and the
+//! settlement answer. The attacker corrupts the ciphertext and sends the key
+//! exchange on.
 //!
-//! If the server settles before decrypting, the corrupted payload triggers
-//! settlement and only afterwards fails the AEAD check. The attacker has
-//! forced a settlement against a session that never activates.
+//! The attack succeeds when the server settles on the corrupted closing
+//! before it refuses that closing.
 //!
 //! ## Expected control
 //! Two layers give defense in depth:
 //!
-//! 1. Primary: the HPKE client auth signature covers
-//!    `Digest(transcript_hash || encrypted_data || cert_der)`, so a corrupted
-//!    `encrypted_data` fails the proof of possession when the server admits
-//!    the client, before decryption and before settlement.
-//! 2. Ordering: `settle` runs strictly after decryption and the client random
-//!    replay check, so it is the last gate and no external side effect can be
-//!    provoked by a key exchange the server will reject.
+//! 1. Primary: the HPKE payload is authenticated encryption, so a corrupted
+//!    `encrypted_data` fails to open under the static key. The sealed
+//!    countersignature that settlement verifies is inside that payload, so
+//!    the server reaches the countersignature only through a successful open.
+//! 2. Ordering: settlement is the last step of the server's closing, after
+//!    every cheaper refusal, so `settle` fires only for a closing that passed
+//!    every earlier check.
 //!
-//! This test proves the observable end-to-end property: a corrupted
-//! budget-bearing key exchange is rejected and the authorizer's `settle`
-//! hook never fires. Layer 1 catches the corruption, so the property holds
-//! independent of the ordering. The ordering stays as hygiene, because
-//! settlement is irreversible and so is the final validation step.
+//! [`Handshake::finish`] runs the server's closing in this order:
+//!
+//! 1. Refuse an abort alert, and decode the [`ClientKeyExchange`] and the HPKE message it carries.
+//! 2. Open the HPKE payload under the static key and the domain tag.
+//! 3. Check that the payload echoes the client random of the hello, which refuses a replay.
+//! 4. Derive the handshake secret, and open the sealed client identity under it.
+//! 5. Verify the key-confirmation tag.
+//! 6. Admit the client identity.
+//! 7. Open the countersignature under the handshake secret, verify it, and call `settle`.
+//!
+//! The scenario proves the observable end-to-end property with three events:
+//!
+//! - The plaintext settlement answer is absent from the cleartext DER of the key exchange.
+//! - The server refuses the corrupted closing at step 2 with [`HandshakeError::HpkeError`].
+//! - The authorizer's `settle` hook records zero calls.
+//!
+//! Layer 1 catches the corruption, so the property holds independent of the
+//! ordering. The ordering stays as hygiene, because settlement is
+//! irreversible and so runs as the final validation step.
 //!
 //! ## References
 //! - CWE-696: Incorrect Behavior Order <https://cwe.mitre.org/data/definitions/696.html>
-//! - CWE-347: Improper Verification of Cryptographic Signature
-//!   <https://cwe.mitre.org/data/definitions/347.html>
+//! - CWE-345: Insufficient Verification of Data Authenticity
+//!   <https://cwe.mitre.org/data/definitions/345.html>
 //! - CAPEC-94: Adversary in the Middle (AiTM) <https://capec.mitre.org/data/definitions/94.html>
 
 #![cfg(all(feature = "transport-hpke", feature = "transport-multiplex", feature = "testing"))]
@@ -91,9 +101,9 @@ tb_assert_spec! {
 	}
 }
 
-// A budget-bearing ClientKeyExchange whose HPKE ciphertext is corrupted MUST
-// be rejected before settlement runs: the authorizer's settle hook records
-// zero calls.
+// Before settlement runs, the server MUST reject a budget-bearing
+// ClientKeyExchange whose HPKE ciphertext is corrupted, so the authorizer's
+// settle hook records zero calls.
 tb_scenario! {
 	name: settlement_runs_after_decrypt,
 	spec: SettlementOrderingSpec,
@@ -123,10 +133,10 @@ tb_scenario! {
 			let closing = client.respond(reply).await?;
 			let client_kex_der = carried_key_exchange(closing).to_der()?;
 
-			// Confidentiality: the paying party's settlement answer is
-			// folded into the HPKE payload encrypted to the server, so the
-			// plaintext RESPONSE must never appear in the cleartext key
-			// exchange wire bytes.
+			// The paying party's settlement answer travels inside the HPKE
+			// payload sealed to the server, so for confidentiality the
+			// plaintext RESPONSE must never appear in the cleartext DER of the
+			// key exchange.
 			let response_leaked = contains_window(&client_kex_der, RESPONSE);
 			trace.event_with(
 				RESPONSE_CONFIDENTIAL_ON_WIRE,
@@ -134,10 +144,10 @@ tb_scenario! {
 				!response_leaked,
 			)?;
 
-			// Corrupt the HPKE ciphertext and keep the certificate and the
-			// auth signature. The ciphertext carries the sealed receipt
-			// countersignature, so the server must refuse the key exchange
-			// before it opens the payload or settles.
+			// Corrupt the last byte of the HPKE ciphertext, which sits in the
+			// AEAD tag. The ciphertext carries the sealed receipt
+			// countersignature, so the server must open it before it can
+			// settle, and that open must fail.
 			let mut kex = ClientKeyExchange::from_der(&client_kex_der)?;
 			let mut ciphertext = kex.encrypted_data.as_bytes().to_vec();
 			let last = ciphertext.len().checked_sub(1).ok_or_else(|| expectation_failure("empty ciphertext"))?;
@@ -145,11 +155,11 @@ tb_scenario! {
 			ciphertext[last] ^= 0xFF;
 			kex.encrypted_data = OctetString::new(ciphertext)?;
 
-			// The mutual-auth signature commits to the exact ciphertext
-			// (the anti-splice control), so the corruption is caught as a
-			// signature failure before any decrypt or settlement side effect.
+			// The payload is authenticated encryption, so the static key fails
+			// to open it, and `finish` refuses the closing before the key
+			// confirmation, the admission, and the settlement side effect.
 			let kex_result = server.finish(carried_closing(&kex)).await;
-			let rejected = matches!(kex_result, Err(HandshakeError::SignatureError(_)));
+			let rejected = matches!(kex_result, Err(HandshakeError::HpkeError(_)));
 
 			trace.event_with(CORRUPTED_KEY_EXCHANGE_REJECTED, &[], rejected)?;
 			trace.event_with(SETTLE_NEVER_FIRED, &[], authorizer.settle_calls() == 0)?;

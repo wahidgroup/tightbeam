@@ -1,8 +1,8 @@
 //! What a handshake endpoint demands of its peer, and what it may record.
 //!
 //! Each direction of admission has one decider. The opening, the reply, and
-//! the closing below are the three [legs](crate::transport::handshake#legs) of
-//! a handshake.
+//! the closing named below are the three
+//! [legs](crate::transport::handshake#legs) of a handshake.
 //!
 //! - A server admits its client through [`PeerAuthentication::admit`], the one
 //!   constructor of [`AdmittedPeer`]. An offered certificate's proof of
@@ -11,7 +11,8 @@
 //!   validator chain accepted and whose key signed the closing.
 //! - A client admits its server through [`ProvisionedTrust`] when the identity
 //!   is known before the opening, and through [`LearnedTrust`] when the reply
-//!   names it. Those two build every [`AdmittedServer`].
+//!   names it. Those two implement [`ServerTrust`] and build every
+//!   [`AdmittedServer`].
 //! - [`PeerCertificate`] parses the key of a peer certificate once, and every
 //!   check of a handshake reads that key.
 
@@ -29,6 +30,8 @@ use crate::crypto::x509::utils::CertificateExt;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::error::HandshakeError;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::transport::handshake::flow::Offer;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::schedule::{HandshakeVerifyingKey, PeerIdentity, Terms};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::{HandshakeCurve, HandshakeProvider};
@@ -45,10 +48,10 @@ use crate::transport::handshake::CmsServerIdentity;
 /// How a handshake server authenticates its client.
 #[derive(Clone)]
 pub enum PeerAuthentication {
-	/// Server authentication only. The session records no peer, and it
-	/// treats an offered client certificate as naming nobody.
+	/// Only the server authenticates. The session peer stays empty, and an
+	/// offered client certificate names nobody.
 	Anonymous,
-	/// Mutual authentication. The client MUST offer a certificate, and every
+	/// Both sides authenticate. The client MUST offer a certificate, and every
 	/// validator in the chain MUST accept it before the session records it.
 	/// The certificate MUST be within its validity period, so a build with no
 	/// clock refuses every client.
@@ -59,8 +62,8 @@ pub enum PeerAuthentication {
 ///
 /// The field stays private and only [`PeerAuthentication::mutual`] builds a
 /// chain, so every mutual server runs at least one check. A build without a
-/// handshake protocol has no server to evaluate the chain, so the chain keeps
-/// only the decision that mutual authentication was demanded.
+/// handshake protocol has no server to evaluate the chain, so the chain
+/// records only that the configuration demands mutual authentication.
 #[derive(Clone)]
 pub struct ValidatorChain(
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))] Arc<[Arc<dyn CertificateValidation>]>,
@@ -109,7 +112,7 @@ impl<C: HandshakeCurve> PeerCertificate<C> {
 		&self.certificate
 	}
 
-	/// The key of the certificate.
+	/// The public key that [`Self::parse`] read from the certificate.
 	pub(crate) fn key(&self) -> &PublicKey<C> {
 		&self.key
 	}
@@ -118,28 +121,31 @@ impl<C: HandshakeCurve> PeerCertificate<C> {
 /// A closing's proof that the key of the offered certificate signed it.
 ///
 /// Each protocol carries the proof in its own form, and
-/// [`PeerAuthentication::admit`] verifies it under the offered certificate's
-/// key.
+/// [`PeerAuthentication::admit`] verifies it against the certificate that the
+/// [`Offer`] holds beside it.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub trait PossessionProof<P: HandshakeProvider> {
-	/// Verify this proof under `key`, against the transcript that `terms`
-	/// sealed.
+	/// Verify this proof under the key of `identity`, against the transcript
+	/// that `terms` sealed.
 	///
 	/// # Errors
 	///
 	/// - [`HandshakeError::SignatureVerificationFailed`] -- the proof is
 	///   malformed, or it signs another transcript or another role.
 	/// - [`HandshakeError::SignatureError`] -- the signature fails to verify.
-	fn verify(self, key: P::VerifyingKey, terms: &Terms<P>) -> Result<(), HandshakeError>;
+	/// - [`HandshakeError::DerError`] -- the certificate fails to encode for
+	///   the digest, or the content a CMS proof signs is not an OCTET STRING.
+	/// - [`HandshakeError::SpkiError`] -- the key fails to encode as the SPKI that names a CMS signer.
+	fn verify(self, identity: &PeerCertificate<P::Curve>, terms: &Terms<P>) -> Result<(), HandshakeError>;
 }
 
 impl PeerAuthentication {
-	/// Builds mutual authentication against `validators`.
+	/// Build mutual authentication against `validators`.
 	///
 	/// An empty set names no check to run, so it demands nothing and yields
 	/// [`Self::Anonymous`]. This is the one definition of that rule, so a
-	/// caller holding a possibly empty collection hands it over rather than
-	/// deciding for itself.
+	/// caller that holds a possibly empty collection passes it here and lets
+	/// this method decide.
 	pub fn mutual(validators: impl IntoIterator<Item = Arc<dyn CertificateValidation>>) -> Self {
 		let validators = validators.into_iter().collect::<Vec<_>>();
 		if validators.is_empty() {
@@ -159,42 +165,39 @@ impl PeerAuthentication {
 		matches!(self, Self::Mutual(_))
 	}
 
-	/// Decide what the handshake may do with the certificate the client
-	/// offered, and verify the proof that the client holds its key.
+	/// Decide what the handshake may do with the identity the client offered,
+	/// and verify the proof that the client holds its key.
 	///
 	/// [`Handshake::finish`](crate::transport::handshake::Handshake::finish)
 	/// calls this, and it is the one constructor of [`AdmittedPeer`]. The rule
 	/// is the same for both protocols:
 	///
-	/// - A certificate and its proof travel together. Either one alone is refused.
-	/// - Under mutual authentication the validity period and then every validator run before the proof.
+	/// - An [`Offer`] holds a certificate with its proof, or neither.
+	/// - Under mutual authentication, the validity check and then every validator run before the proof.
 	/// - The proof is verified whenever a certificate is offered, so an
 	///   anonymous server also refuses a certificate the client cannot prove.
 	///
 	/// # Errors
 	///
 	/// - [`HandshakeError::MissingClientCertificate`] -- mutual authentication
-	///   is configured and the client offered no certificate, or a proof
-	///   arrived with no certificate.
+	///   is configured and the client offered no certificate.
 	/// - [`HandshakeError::CertificateValidationError`] -- the certificate is
 	///   outside its validity period, or a validator refused it.
-	/// - [`HandshakeError::SignatureVerificationFailed`] -- the certificate arrived with no proof.
-	/// - The [`PossessionProof::verify`] set.
+	/// - Any error of [`PossessionProof::verify`] -- the proof fails to verify.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub(crate) fn admit<P, Proof>(
 		&self,
-		offered: Option<PeerCertificate<P::Curve>>,
-		proof: Option<Proof>,
+		offer: Offer<P::Curve, Proof>,
 		terms: &Terms<P>,
 	) -> Result<AdmittedPeer<P::Curve>, HandshakeError>
 	where
 		P: HandshakeProvider,
 		Proof: PossessionProof<P>,
 	{
-		let Some(identity) = offered else {
-			return match (self, proof) {
-				(Self::Anonymous, None) => Ok(AdmittedPeer(Admission::Unidentified)),
-				(Self::Anonymous, Some(_)) | (Self::Mutual(_), _) => Err(HandshakeError::MissingClientCertificate),
+		let Some((identity, proof)) = offer.into_identity() else {
+			return match self {
+				Self::Anonymous => Ok(AdmittedPeer(Admission::Unidentified)),
+				Self::Mutual(_) => Err(HandshakeError::MissingClientCertificate),
 			};
 		};
 		// A validator may accept a certificate without reading its validity
@@ -205,8 +208,7 @@ impl PeerAuthentication {
 			chain.evaluate(certificate)?;
 		}
 
-		let proof = proof.ok_or(HandshakeError::SignatureVerificationFailed)?;
-		proof.verify(P::VerifyingKey::from(*identity.key()), terms)?;
+		proof.verify(&identity, terms)?;
 
 		let admission = match self {
 			Self::Anonymous => Admission::Offered,
@@ -218,8 +220,9 @@ impl PeerAuthentication {
 
 /// The outcome of [`PeerAuthentication::admit`].
 ///
-/// The variant stays private, so a proven peer exists only where `admit`
-/// ran every validator and verified the proof.
+/// The variant stays private, so a proven peer exists only where
+/// [`admit`](PeerAuthentication::admit) ran every validator and verified the
+/// proof.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub struct AdmittedPeer<C: CurveArithmetic>(Admission<C>);
 
@@ -309,11 +312,12 @@ pub trait ServerTrust<C: HandshakeCurve>: MaybeSend + MaybeSync + 'static {
 	fn admit_named(&self, named: Self::Named) -> Result<AdmittedServer<C>, HandshakeError>;
 }
 
-/// Trust in a server whose identity is known before the opening, which
-/// encrypts to it.
+/// Trust in a server whose identity is known before the opening, so the
+/// opening encrypts to it.
 #[cfg(feature = "transport-cms")]
 pub struct ProvisionedTrust {
-	/// The provisioned server identity.
+	/// The certificate of the server, or a chain whose leaf identifies the
+	/// server.
 	pub identity: CmsServerIdentity,
 	/// The store that authenticates the identity.
 	pub store: Arc<dyn CertificateTrust>,
@@ -331,8 +335,9 @@ impl<C: HandshakeCurve> ServerTrust<C> for ProvisionedTrust {
 	///   ([RFC 5280 §6.1][rfc5280-6.1]), and its leaf identifies the server.
 	///
 	/// A bare certificate must also be within its validity period, because a
-	/// store's `evaluate` may accept one without reading it. Path validation
-	/// owns the validity period of every certificate in a chain.
+	/// store's [`evaluate`](CertificateValidation::evaluate) may accept one
+	/// without reading it. Path validation owns the validity period of every
+	/// certificate in a chain.
 	///
 	/// # Errors
 	///
@@ -360,7 +365,8 @@ impl<C: HandshakeCurve> ServerTrust<C> for ProvisionedTrust {
 		Ok(AdmittedServer(server))
 	}
 
-	/// The reply names the server that was admitted before the opening.
+	/// The reply names the server admitted before the opening, so the
+	/// admission passes through unchanged.
 	fn admit_named(&self, named: AdmittedServer<C>) -> Result<AdmittedServer<C>, HandshakeError> {
 		Ok(named)
 	}
@@ -402,7 +408,7 @@ impl<C: HandshakeCurve> ServerTrust<C> for LearnedTrust {
 	/// Admit the certificate `named` by the reply.
 	///
 	/// The certificate must be within its validity period, and the validator
-	/// must accept it. Expiry alone authenticates nobody (CWE-295).
+	/// must accept it. A validity check alone authenticates nobody (CWE-295).
 	///
 	/// # Errors
 	///
@@ -587,8 +593,7 @@ mod tests {
 		use crate::crypto::x509::policy::{DirectTrustValidator, RuntimeCertificatePinning};
 		use crate::testing::fixtures::TestCertificate;
 
-		/// Trust that pins `certificate` by fingerprint and checks nothing
-		/// else about it.
+		/// Trust that pins `certificate` by its fingerprint alone.
 		fn pinned(certificate: &Certificate) -> LearnedTrust {
 			let pinning = RuntimeCertificatePinning::<Sha3_256>::from_certificates([certificate.to_owned()]);
 			let pinning = pinning.expect("the test certificate has a fingerprint");
@@ -613,8 +618,8 @@ mod tests {
 			assert!(matches!(refusal, Err(HandshakeError::CertificateValidationError(_))));
 		}
 
-		/// A validator that pins a certificate says nothing about its validity
-		/// period, so the trust refuses an expired certificate itself.
+		/// A validator that pins a certificate reads no validity period, so the
+		/// trust refuses an expired certificate itself.
 		#[test]
 		fn a_learned_certificate_past_its_validity_is_refused() {
 			let expired = TestCertificate::expired();

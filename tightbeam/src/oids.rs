@@ -23,6 +23,14 @@ use crate::der::asn1::ObjectIdentifier;
 /// - OID repository entry: <https://oid-base.com/get/1.2.840.113549.1.7.1>
 pub const DATA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.1");
 
+/// The CMS `id-signedData` content type.
+///
+/// # Sources
+///
+/// - RFC 5652, Cryptographic Message Syntax: <https://datatracker.ietf.org/doc/html/rfc5652>
+/// - OID repository entry: <https://oid-base.com/get/1.2.840.113549.1.7.2>
+pub const SIGNED_DATA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.2");
+
 /// The CMS `id-envelopedData` content type.
 ///
 /// # Sources
@@ -279,12 +287,6 @@ pub const HANDSHAKE_SECURITY_ACCEPT: ObjectIdentifier = ObjectIdentifier::new_un
 /// AES-256-GCM.
 pub const HANDSHAKE_PROFILE_HPKE_GCM: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.101");
 
-/// The handshake attribute that carries the client certificate.
-pub const CLIENT_CERTIFICATE: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.13");
-
-/// The handshake attribute that carries the client signature.
-pub const CLIENT_SIGNATURE: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.14");
-
 /// The handshake attribute that carries the transport capability offer for
 /// multiplexing.
 pub const HANDSHAKE_TRANSPORT_OFFER: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.15");
@@ -292,6 +294,11 @@ pub const HANDSHAKE_TRANSPORT_OFFER: ObjectIdentifier = ObjectIdentifier::new_un
 /// The handshake attribute that carries the transport capability accept for
 /// multiplexing.
 pub const HANDSHAKE_TRANSPORT_ACCEPT: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.16");
+
+// 1.3.6.1.4.1.64586.1.13 is reserved for the retired client certificate
+// attribute, and 1.3.6.1.4.1.64586.1.14 for the retired client signature
+// attribute. The client identity travels sealed under the handshake secret in
+// both protocols.
 
 // 1.3.6.1.4.1.64586.1.17 is reserved for the retired bare receipt signature.
 // Receipt signatures travel as SignerInfos inside the receipt SignedData
@@ -355,6 +362,7 @@ mod tests {
 	fn oid_values_are_pinned() {
 		let pinned: &[(ObjectIdentifier, &str)] = &[
 			(DATA, "1.2.840.113549.1.7.1"),
+			(SIGNED_DATA, "1.2.840.113549.1.7.2"),
 			(ENVELOPED_DATA, "1.2.840.113549.1.7.3"),
 			(COMPRESSION_CONTENT, "1.2.840.113549.1.9.16.1.9"),
 			(COMPRESSION_ZLIB, "1.2.840.113549.1.9.16.3.8"),
@@ -392,8 +400,6 @@ mod tests {
 			(HANDSHAKE_SECURITY_OFFER, "1.3.6.1.4.1.64586.1.11"),
 			(HANDSHAKE_SECURITY_ACCEPT, "1.3.6.1.4.1.64586.1.12"),
 			(HANDSHAKE_PROFILE_HPKE_GCM, "1.3.6.1.4.1.64586.1.101"),
-			(CLIENT_CERTIFICATE, "1.3.6.1.4.1.64586.1.13"),
-			(CLIENT_SIGNATURE, "1.3.6.1.4.1.64586.1.14"),
 			(HANDSHAKE_TRANSPORT_OFFER, "1.3.6.1.4.1.64586.1.15"),
 			(HANDSHAKE_TRANSPORT_ACCEPT, "1.3.6.1.4.1.64586.1.16"),
 			(RECEIPT_ACK, "1.3.6.1.4.1.64586.1.18"),

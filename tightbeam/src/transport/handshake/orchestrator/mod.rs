@@ -33,8 +33,8 @@ use crate::crypto::sign::elliptic_curve::ecdh::EphemeralSecret;
 use crate::random::OsRng;
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::flow::{
-	ClientFlow, ClosingBinding, ClosingIntake, ClosingOpened, ClosingParts, HandshakeFlow, Opened, OpeningIntake,
-	OpeningParts, ProofRequest, ReplyBinding, ReplyIntake, ReplyParts, ServerFlow,
+	ClientFlow, ClosingBinding, ClosingParts, ConfirmedClosing, HandshakeFlow, Opened, OpeningIntake, OpeningParts,
+	ProofRequest, ReplyBinding, ReplyIntake, ReplyParts, ServerFlow,
 };
 use crate::transport::handshake::negotiation::{
 	AuthorizedTransport, MuxSettings, ProfilePolicy, SecurityOffer, SupportedProfiles, TransportAuthorizer,
@@ -46,7 +46,7 @@ use crate::transport::handshake::peer::{
 use crate::transport::handshake::receipt::{
 	CountersignedReceipt, IssuedReceipt, PendingReceipt, ReceiptApprover, SessionObserver, Settlement, StoredReceipt,
 };
-use crate::transport::handshake::schedule::{Agreed, PeerEphemeral, PeerIdentity, PeerPoint, Terms};
+use crate::transport::handshake::schedule::{Agreed, PeerEphemeral, PeerIdentity, PeerPoint, SecretSeal, Terms};
 use crate::transport::handshake::{
 	Arc, ClientHandshakeProtocol, EstablishedSession, HandshakeMessage, HandshakeProvider, HandshakeSecret,
 	ServerHandshakeProtocol,
@@ -563,7 +563,7 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> Handshake<Client, F, P> {
 	/// # Errors
 	///
 	/// - [`HandshakeError::InvalidState`] -- no opening was sent.
-	/// - [`HandshakeError::UnexpectedContainer`] -- the reply travels in the other container.
+	/// - [`HandshakeError::UnexpectedContainer`] -- the reply travels in another container.
 	/// - [`HandshakeError::AbortReceived`] -- the reply carries an abort alert.
 	/// - [`HandshakeError::MissingAttribute`] -- the reply carries no server ephemeral.
 	/// - [`HandshakeError::OctetStringLengthError`] -- a fixed-width field of the reply has another width.
@@ -586,9 +586,14 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> Handshake<Client, F, P> {
 	/// - [`HandshakeError::ApprovalRefused`] -- the receipt approver refused.
 	/// - [`HandshakeError::KeyError`] -- the signing key provider failed.
 	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the handshake
-	///   secret, the acknowledgement key, or the key-confirmation tag.
-	/// - [`HandshakeError::InvalidKeyMaterialLength`] -- the cipher refused the acknowledgement key.
+	///   secret, the acknowledgement key, the identity key, or the
+	///   key-confirmation tag.
+	/// - [`HandshakeError::InvalidKeyMaterialLength`] -- the cipher refused the
+	///   acknowledgement key or the identity key.
 	/// - [`HandshakeError::ReceiptAckCipher`] -- the AEAD refused to seal the countersignature.
+	/// - [`HandshakeError::SealedIdentity`] -- the client identity exceeds the
+	///   frame, or the AEAD refused to seal it.
+	/// - [`HandshakeError::HpkeError`] -- the HPKE payload fails to seal to the server's static key.
 	pub async fn respond(&mut self, reply: HandshakeMessage) -> Result<HandshakeMessage, HandshakeError> {
 		// 1. Take the phase, which must hold the sent opening.
 		let (opening, pending) = self.step(|phase| match phase {
@@ -687,10 +692,12 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> Handshake<Client, F, P> {
 	///
 	/// - [`HandshakeError::RandomGenerationFailed`] -- the random source failed.
 	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the handshake
-	///   secret, the acknowledgement key, or the key-confirmation tag.
-	/// - [`HandshakeError::InvalidKeyMaterialLength`] -- the cipher refused the acknowledgement key.
+	///   secret, the acknowledgement key, the identity key, or the
+	///   key-confirmation tag.
+	/// - [`HandshakeError::InvalidKeyMaterialLength`] -- the cipher refused the
+	///   acknowledgement key or the identity key.
 	/// - [`HandshakeError::ReceiptAckCipher`] -- the AEAD refused to seal the countersignature.
-	/// - [`HandshakeError`] -- the closing fails to seal or encode.
+	/// - [`HandshakeError`] -- the bytes the proof signs fail to encode or to hash.
 	fn close<'a>(
 		settings: &'a F::Settings,
 		pending: F::Pending,
@@ -707,12 +714,14 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> Handshake<Client, F, P> {
 		let sealed = countersigned.map(|countersigned| countersigned.seal(&secret, terms));
 		let (sealed_ack, receipt) = sealed.transpose()?.unzip();
 
-		// 3. Derive the key-confirmation tag, which proves this secret to the server.
+		// 3. Derive the key-confirmation tag, which proves this secret to the
+		//    server, and the sealer of the client identity.
 		let transcript_hash = terms.transcript_hash();
-		let confirmation = secret.confirmation::<P>(terms.kdf_salt(), transcript_hash)?;
+		let confirmation = terms.confirmation(&secret)?;
+		let identity_sealer = terms.sealer(&secret, SecretSeal::Identity)?;
 
 		// 4. Build the closing up to its possession proof.
-		let parts = ClosingParts { server, transcript_hash, sealed_ack, confirmation };
+		let parts = ClosingParts { server, transcript_hash, sealed_ack, confirmation, identity_sealer };
 		let binding = F::bind_closing(agreed, reply, settings, parts)?;
 		Ok(BoundClosing { secret, receipt, binding })
 	}
@@ -733,15 +742,13 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> Handshake<Server, F, P> {
 	/// # Errors
 	///
 	/// - [`HandshakeError::InvalidState`] -- the server is past [`HandshakePhase::Idle`].
-	/// - [`HandshakeError::UnexpectedContainer`] -- the opening travels in the other container.
+	/// - [`HandshakeError::UnexpectedContainer`] -- the opening travels in another container.
 	/// - [`HandshakeError::AbortReceived`] -- the opening carries an abort alert.
-	/// - [`HandshakeError::DuplicateAttribute`] -- an offer or the certificate attribute repeats.
+	/// - [`HandshakeError::DuplicateAttribute`] -- an offer or the abort alert repeats.
 	/// - [`HandshakeError::NegotiationError`] -- profile or transport negotiation failed.
 	/// - [`HandshakeError::InvalidClientKeyExchange`] -- the opening carries no usable key agreement.
 	/// - [`HandshakeError::MissingUkm`] -- the key agreement carries no user keying material.
 	/// - [`HandshakeError::InvalidPublicKey`] -- the client's key is not a point on the curve.
-	/// - [`HandshakeError::ClientEphemeralIsStatic`] -- the CMS originator key
-	///   collapses into the key of the certificate the opening carries.
 	/// - [`HandshakeError::InvalidKeySize`] -- the opened content is not a 32-byte base secret.
 	/// - [`HandshakeError::MutualAuthRequired`] -- the accept grants budgets,
 	///   and the server demands no client certificate.
@@ -815,8 +822,8 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> Handshake<Server, F, P> {
 		Ok(reply)
 	}
 
-	/// Process the closing of the client: admit the client, derive the
-	/// handshake secret, and settle the session receipt.
+	/// Process the closing of the client: open it, confirm the handshake
+	/// secret, admit the client, and settle the session receipt.
 	///
 	/// The phase leaves the handshake before any byte of the closing is read,
 	/// so a refused closing drops the server ephemeral and the handshake
@@ -831,35 +838,40 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> Handshake<Server, F, P> {
 	/// # Errors
 	///
 	/// - [`HandshakeError::InvalidState`] -- no reply was sent.
-	/// - [`HandshakeError::UnexpectedContainer`] -- the closing travels in the other container.
+	/// - [`HandshakeError::UnexpectedContainer`] -- the closing travels in another container.
 	/// - [`HandshakeError::AbortReceived`] -- the closing carries an abort alert.
 	/// - [`HandshakeError::DuplicateAttribute`] -- an attribute of the closing repeats.
-	/// - [`HandshakeError::ClientCertificateMismatch`] -- the closing names
-	///   another certificate than the opening bound.
 	/// - [`HandshakeError::MissingAttribute`] -- the closing carries no key-confirmation tag.
-	/// - [`HandshakeError::DerError`] -- the key-confirmation tag of a CMS closing has another width.
+	/// - [`HandshakeError::DerError`] -- the key-confirmation tag of a CMS
+	///   closing has another width, or the opened identity or Finished fails
+	///   to decode.
 	/// - [`HandshakeError::MissingClientCertificate`] -- the server demands a
-	///   certificate and none came, or a proof came without one.
+	///   certificate and none came, or a CMS Finished came without one.
 	/// - [`HandshakeError::CertificateValidationError`] -- the certificate is
 	///   outside its validity period, or a validator refused it.
 	/// - [`HandshakeError::InvalidPublicKey`] -- the key of the offered
 	///   certificate, or the HPKE client ephemeral, is not a point on the curve.
 	/// - [`HandshakeError::SignatureError`] -- the HPKE possession signature fails to verify.
 	/// - [`HandshakeError::SignatureVerificationFailed`] -- the possession
-	///   proof is missing or malformed, the CMS Finished fails to verify, or
-	///   the countersignature fails to verify.
+	///   proof is malformed, the CMS Finished fails to verify, or the
+	///   countersignature fails to verify.
 	/// - [`HandshakeError::KeyError`] -- the key provider failed.
-	/// - [`HandshakeError::HpkeError`] -- the sealed payload fails to open, as
-	///   it does under a swapped client certificate.
+	/// - [`HandshakeError::HpkeError`] -- the sealed payload fails to open.
+	/// - [`HandshakeError::SealedIdentity`] -- the sealed client identity fails
+	///   to open, or a CMS closing names another content type or algorithm,
+	///   or carries no content.
 	/// - [`HandshakeError::InvalidDecryptedPayloadSize`] -- the opened payload fails to decode.
 	/// - [`HandshakeError::InvalidKeySize`] -- the base secret of the payload is not 32 bytes.
 	/// - [`HandshakeError::OctetStringLengthError`] -- the client random of the payload is not 32 bytes.
 	/// - [`HandshakeError::ClientRandomMismatchReplay`] -- the payload echoes another client random.
-	/// - [`HandshakeError::ClientEphemeralIsStatic`] -- an HPKE client
-	///   ephemeral, in the payload or as the encapsulated key, collapses into
-	///   the key of the certificate the closing offers.
+	/// - [`HandshakeError::ClientEphemeralIsStatic`] -- a client ephemeral (the
+	///   HPKE payload ephemeral, the encapsulated key, or the CMS originator)
+	///   collapses into the key of the certificate the closing offers.
 	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the handshake
-	///   secret, the key-confirmation tag, or the acknowledgement key.
+	///   secret, the identity key, the key-confirmation tag, or the
+	///   acknowledgement key.
+	/// - [`HandshakeError::InvalidKeyMaterialLength`] -- the cipher refused the
+	///   identity key or the acknowledgement key.
 	/// - [`HandshakeError::KeyConfirmationFailed`] -- the client derived another handshake secret.
 	/// - [`HandshakeError::ReceiptAckCipher`] -- the sealed countersignature fails to open.
 	/// - [`HandshakeError::ReceiptMismatch`] -- an acknowledgement came, and no receipt was issued.
@@ -875,23 +887,24 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> Handshake<Server, F, P> {
 		let config = &self.config;
 
 		// 2. Decode the closing.
-		let ClosingIntake { client_static, proof, closing } = F::read_closing(pending, &config.flow, closing)?;
+		let closing = F::read_closing(pending, &config.flow, closing)?;
 
-		// 3. Admit the offered identity. Every validator runs when the server
+		// 3. Open the closing: derive the handshake secret, and open the
+		//    client identity under it. The identity sits behind the agreement,
+		//    so the static key runs before the server knows its client.
+		let opening = F::settle(closing, &terms, config.key.as_ref());
+		let opened = opening.await?;
+
+		// 4. Verify that the client derived the same handshake secret. The
+		//    offer leaves the closing only through this check, so a client
+		//    that holds another secret never reaches a validator.
+		let confirmed = opened.confirm(&terms)?;
+		let ConfirmedClosing { secret, receipt_ack, offer } = confirmed;
+
+		// 5. Admit the offered identity. Every validator runs when the server
 		//    demands a certificate, and an offered certificate's proof is
 		//    verified in either mode.
-		let offered = client_static.identity().cloned();
-		let peer = config.peer_authentication.admit(offered, proof, &terms)?;
-
-		// 4. Open what the closing sealed, and derive the handshake secret.
-		//    The static key serves an admitted client alone.
-		let opening = F::settle(closing, &client_static, &terms, config.key.as_ref());
-		let ClosingOpened { secret, receipt_ack, confirmation } = opening.await?;
-
-		// 5. Verify that the client derived the same handshake secret.
-		//    Settlement is irreversible and takes a confirmed secret alone,
-		//    so a client that holds another secret is refused ahead of it.
-		let secret = secret.confirmed::<P>(terms.kdf_salt(), terms.transcript_hash(), &confirmation)?;
+		let peer = config.peer_authentication.admit(offer, &terms)?;
 
 		// 6. Open and verify the receipt countersignature, and settle.
 		let authorizer = config.transport_authorizer.as_deref();

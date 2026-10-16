@@ -51,6 +51,11 @@ impl<T> WireDer<T> {
 		&self.value
 	}
 
+	/// Take the decoded value, and drop the bytes that carried it.
+	pub fn into_value(self) -> T {
+		self.value
+	}
+
 	/// Return the contents octets, after the tag and length.
 	///
 	/// Every constructor reads `contents_at` from the header of these same

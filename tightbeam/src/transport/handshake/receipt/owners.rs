@@ -25,7 +25,7 @@ use crate::transport::handshake::receipt::{
 	ReceiptApprover, ReceiptArtifact, ReceiptRole, ReceiptSigner, SessionObserver, SessionOutcome, SessionReceipt,
 	SessionVerdict, StoredReceipt,
 };
-use crate::transport::handshake::schedule::{ConfirmedSecret, Terms};
+use crate::transport::handshake::schedule::{ConfirmedSecret, SecretSeal, Terms};
 use crate::transport::handshake::{AdmittedPeer, Arc, HandshakeProvider, HandshakeSecret};
 use crate::transport::state::ClientIdentity;
 use crate::zeroize::Zeroizing;
@@ -142,7 +142,8 @@ impl IssuedReceipt {
 		let ack = match sealed_ack {
 			Some(sealed) => {
 				let key = secret.secret();
-				let plaintext = key.open_ack::<P>(terms.kdf_salt(), terms.transcript_hash(), sealed)?;
+				let sealer = terms.sealer(key, SecretSeal::Ack)?;
+				let plaintext = sealer.open(sealed)?;
 				Some(plaintext.with(|bytes| SignerInfo::from_der(bytes))?)
 			}
 			None => None,
@@ -344,7 +345,8 @@ impl CountersignedReceipt {
 	{
 		let Self { artifact, countersignature } = self;
 		let ack_der = Zeroizing::new(countersignature.to_der()?);
-		let sealed_ack = secret.seal_ack::<P>(terms.kdf_salt(), terms.transcript_hash(), &ack_der)?;
+		let sealer = terms.sealer(secret, SecretSeal::Ack)?;
+		let sealed_ack = sealer.seal(&ack_der)?;
 
 		// Both endpoints retain the identical completed artifact.
 		let completed = artifact.complete(countersignature)?;
