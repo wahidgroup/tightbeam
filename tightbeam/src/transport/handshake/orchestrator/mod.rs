@@ -619,7 +619,8 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> Handshake<Client, F, P> {
 		// 3. Admit the server the reply names.
 		let server = F::server_trust(settings).admit_named(server)?;
 
-		// 4. Verify the reply signature over the transcript hash, under the admitted server's key.
+		// 4. Verify the reply signature over the bytes the flow derives from
+		//    the transcript hash, under the admitted server's key.
 		let static_key = *server.identity().key();
 		F::verify_reply(&reply, P::VerifyingKey::from(static_key), &transcript_hash)?;
 

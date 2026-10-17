@@ -317,13 +317,12 @@ mod receipt_fixtures {
 pub use receipt_fixtures::*;
 
 /// Endpoint configurations and message conversions for a hand-driven HPKE
-/// handshake. Every step takes and returns the container that tunnels an HPKE
+/// handshake. Every step takes and returns the container that carries an HPKE
 /// message, so a scenario converts where it inspects or tampers with one.
 #[cfg(feature = "transport-hpke")]
 mod hpke_handshake {
 	use std::sync::Arc;
 
-	use tightbeam::cms::enveloped_data::EnvelopedData;
 	use tightbeam::cms::signed_data::SignedData;
 	use tightbeam::crypto::profiles::SecurityProfileDesc;
 	use tightbeam::crypto::x509::policy::CertificateValidation;
@@ -384,14 +383,14 @@ mod hpke_handshake {
 
 	/// The `ClientKeyExchange` that `closing` carries.
 	pub fn carried_key_exchange(closing: HandshakeMessage) -> ClientKeyExchange {
-		let carrier = closing.enveloped().expect("an HPKE closing travels in an EnvelopedData");
-		ClientKeyExchange::try_from(carrier.value()).expect("the closing carries a ClientKeyExchange")
+		let key_exchange = closing.key_exchange().expect("an HPKE closing is a ClientKeyExchange");
+		key_exchange.into_value()
 	}
 
 	/// `key_exchange` as the closing an HPKE server reads.
 	pub fn carried_closing(key_exchange: &ClientKeyExchange) -> HandshakeMessage {
-		let carrier = EnvelopedData::try_from(key_exchange).expect("a ClientKeyExchange travels in an EnvelopedData");
-		HandshakeMessage::try_from(carrier).expect("the carrier encodes")
+		let closing = HandshakeMessage::try_from(key_exchange.to_owned());
+		closing.expect("the key exchange encodes")
 	}
 }
 

@@ -1,8 +1,18 @@
 //! The HPKE flow.
 //!
-//! HPKE tunnels its own messages inside the signed and the enveloped
-//! container. The client learns the server from the reply, and it seals the
-//! base secret to the server's static key on the closing.
+//! The client learns the server from the reply, and it seals the base secret
+//! to the server's static key on the closing.
+//!
+//! ## Messages
+//!
+//! - The hello and the reply travel inside a `SignedData` tunnel.
+//! - The closing travels as a [`ClientKeyExchange`], a container of its own,
+//!   because HPKE specifies no wire format (RFC 9180 § 10).
+//! - The server signs its reply over a labelled digest of the transcript
+//!   hash, with `TIGHTBEAM_HPKE_SERVER_AUTH_DOMAIN` ahead of the hash, so the
+//!   signature reads as no other signed message of the crate.
+//!
+//! ## Ephemeral keys
 //!
 //! The client holds two ephemeral keys, and each serves one agreement
 //! (RFC 9180 § 9.2.3):
@@ -26,7 +36,6 @@
 use alloc::{boxed::Box, vec::Vec};
 
 use crate::asn1::OctetString;
-use crate::cms::enveloped_data::EnvelopedData;
 use crate::cms::signed_data::SignedData;
 use crate::constants::{EC_PUBKEY_COMPRESSED_SIZE, TIGHTBEAM_AAD_DOMAIN_TAG, TIGHTBEAM_HPKE_HANDSHAKE_INFO};
 use crate::crypto::hpke::{HpkeMessage, HpkePublicKeyOps, HpkeSuite};
@@ -120,7 +129,7 @@ pub struct HpkeOpening {
 
 /// A decoded `ServerHandshake`, kept for verification and for the closing.
 pub struct HpkeReply {
-	/// The server signature over the transcript hash.
+	/// The server signature over the labelled digest of the transcript hash.
 	signature: OctetString,
 	/// The client random, which the closing payload echoes.
 	client_random: [u8; 32],
@@ -260,8 +269,11 @@ impl<P: HandshakeProvider> ClientLegs<P> for Hpke {
 		key: P::VerifyingKey,
 		transcript_hash: &[u8; 32],
 	) -> Result<(), HandshakeError> {
+		let mut signed = Transcript::hpke_server_auth(transcript_hash);
+		let digest = signed.seal::<P::Digest>()?;
+
 		let signature = P::Signature::try_from(reply.signature.as_bytes()).map_err(Into::into)?;
-		signature.verify_prehash(&key, transcript_hash)?;
+		signature.verify_prehash(&key, digest)?;
 		Ok(())
 	}
 
@@ -366,11 +378,9 @@ impl<P: HandshakeProvider> ClientLegs<P> for Hpke {
 		// 3. Seal the payload to the server's static key, under the domain tag.
 		let info = TIGHTBEAM_HPKE_HANDSHAKE_INFO;
 		let sealed = server_key.seal::<P::HpkeSuite>(info, aad_domain_tag, &plaintext, None)?;
-		let encrypted_data = OctetString::new(sealed.to_bytes())?;
-		let key_exchange = ClientKeyExchange { encrypted_data };
-
-		let carrier = EnvelopedData::try_from(&key_exchange)?;
-		HandshakeMessage::try_from(carrier)
+		let sealed_payload = OctetString::new(sealed.to_bytes())?;
+		let key_exchange = ClientKeyExchange { sealed_payload, unprotected_attrs: None };
+		HandshakeMessage::try_from(key_exchange)
 	}
 }
 
@@ -578,6 +588,11 @@ impl<P: HandshakeProvider> ServerLegs<P> for Hpke {
 		let mut transcript = Transcript::hpke_handshake(legs);
 		let transcript_hash = transcript.seal::<P::Digest>()?;
 
+		// The server signs a labelled digest of the transcript hash, which the
+		// client derives the same way to verify.
+		let mut signed = Transcript::hpke_server_auth(&transcript_hash);
+		let prehash = signed.seal::<P::Digest>()?.to_vec();
+
 		let salt = Salt::randoms(&opened.client_random, &server_random);
 		let draft = HpkeReplyDraft {
 			server_random,
@@ -587,7 +602,7 @@ impl<P: HandshakeProvider> ServerLegs<P> for Hpke {
 			certificate: Certificate::clone(&settings.certificate),
 			client_cert_required,
 		};
-		Ok(ReplyBinding { transcript_hash, salt, prehash: transcript_hash.to_vec(), draft })
+		Ok(ReplyBinding { transcript_hash, salt, prehash, draft })
 	}
 
 	fn encode_reply(
@@ -635,15 +650,15 @@ impl<P: HandshakeProvider> ServerLegs<P> for Hpke {
 		settings: &Self::Settings,
 		closing: HandshakeMessage,
 	) -> Result<Self::Closing, HandshakeError> {
-		// 1. Take the carrier, and refuse one that carries an abort alert.
-		let carrier = closing.enveloped()?;
-		carrier.value().unprotected_attrs.refuse_alert()?;
+		// 1. Take the key exchange, and refuse one that carries an abort alert.
+		let key_exchange = closing.key_exchange()?;
+		key_exchange.value().unprotected_attrs.refuse_alert()?;
 
-		// 2. Decode the key exchange. The parse validates the encapsulated key
+		// 2. Parse the HPKE message. The parse validates the encapsulated key
 		//    and the ciphertext length, so the static ECDH runs on a point of
 		//    the curve and on a message that carries a tag.
-		let ClientKeyExchange { encrypted_data } = ClientKeyExchange::try_from(carrier.value())?;
-		let message = HpkeMessage::<P::HpkeSuite>::from_bytes(encrypted_data.as_bytes())?;
+		let ClientKeyExchange { sealed_payload, .. } = key_exchange.into_value();
+		let message = HpkeMessage::<P::HpkeSuite>::from_bytes(sealed_payload.as_bytes())?;
 		let recipient = settings.certificate.verifying_key::<P::Curve>()?;
 
 		let HpkeServerPending { ephemeral, client_random } = pending;
@@ -722,6 +737,7 @@ mod tests {
 
 	use super::*;
 	use crate::cms::content_info::CmsVersion;
+	use crate::cms::enveloped_data::{EncryptedContentInfo, EnvelopedData, RecipientInfos};
 	use crate::cms::signed_data::{SignerIdentifier, SignerInfo, SignerInfos};
 	use crate::crypto::hash::Sha3_256;
 	use crate::crypto::hpke::HpkeError::DecryptionFailed;
@@ -732,10 +748,13 @@ mod tests {
 	use crate::crypto::sign::PrehashSigner;
 	use crate::crypto::x509::policy::ExpiryValidator;
 	use crate::crypto::x509::utils::Skid;
-	use crate::der::{Any, Sequence};
-	use crate::oids::{HANDSHAKE_ABORT_ALERT, HASH_SHA3_256, HASH_SHA3_384, SIGNER_ECDSA_WITH_SHA3_256};
+	use crate::der::{Any, Sequence, Tag, TagNumber};
+	use crate::oids::{
+		AES_256_GCM, DATA, HANDSHAKE_ABORT_ALERT, HASH_SHA3_256, HASH_SHA3_384, SIGNER_ECDSA_WITH_SHA3_256,
+	};
 	use crate::random::OsRng;
 	use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey};
+	use crate::transport::envelopes::TransportEnvelope;
 	use crate::transport::handshake::attributes::HandshakeAttribute;
 	use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer, TransportOffer};
 	use crate::transport::handshake::receipt::StoredReceipt;
@@ -743,6 +762,9 @@ mod tests {
 	use crate::transport::handshake::tests::*;
 	use crate::transport::handshake::{Handshake, HandshakeAlert, HandshakePhase, PeerAuthentication};
 	use crate::x509::attr::{Attribute, Attributes};
+
+	#[cfg(feature = "transport-cms")]
+	use crate::transport::handshake::primitives::transcript::FinishedRole;
 
 	/// The configuration of an anonymous client that trusts `server`.
 	fn anonymous_client(server: &TestCertificate) -> TestClientConfig<Hpke> {
@@ -780,6 +802,37 @@ mod tests {
 		profile: Option<SecurityProfileDesc>,
 		server_ephemeral: &[u8; EC_PUBKEY_COMPRESSED_SIZE],
 	) -> ServerHandshake {
+		let (response, transcript_hash) = unsigned_server_response(server, client_hello, profile, server_ephemeral);
+		let digest = reply_digest(&transcript_hash);
+		signed_over(response, server, &digest)
+	}
+
+	/// The digest an HPKE server signs over its reply in the handshake of
+	/// `transcript_hash`.
+	fn reply_digest(transcript_hash: &[u8; 32]) -> [u8; 32] {
+		let mut signed = Transcript::hpke_server_auth(transcript_hash);
+		signed.seal::<Sha3_256>().expect("the server digest seals")
+	}
+
+	/// `response` with its signature replaced by one of `server` over `digest`.
+	fn signed_over(mut response: ServerHandshake, server: &TestCertificate, digest: &[u8; 32]) -> ServerHandshake {
+		let signature: Secp256k1Signature = server.signing_key.sign_prehash(digest).expect("the test key signs");
+		let signature = OctetString::new(signature.to_bytes().to_vec()).expect("a signature is an OCTET STRING");
+		response.signature = signature;
+		response
+	}
+
+	/// A `ServerHandshake` of `server` over the transcript of `client_hello`,
+	/// with a placeholder signature, beside the transcript hash it binds.
+	///
+	/// It carries `server_ephemeral` inside its transcript and accepts
+	/// `profile`, when one is given.
+	fn unsigned_server_response(
+		server: &TestCertificate,
+		client_hello: &[u8],
+		profile: Option<SecurityProfileDesc>,
+		server_ephemeral: &[u8; EC_PUBKEY_COMPRESSED_SIZE],
+	) -> (ServerHandshake, [u8; 32]) {
 		let server_random = [2u8; 32];
 		let accept = profile.map(|profile| WireDer::new(SecurityAccept::new(profile)).expect("an accept encodes"));
 		let accept_der = accept.as_ref().map(WireDer::der).unwrap_or_default();
@@ -795,19 +848,18 @@ mod tests {
 
 		let mut transcript = Transcript::hpke_handshake(legs);
 		let transcript_hash = transcript.seal::<Sha3_256>().expect("the transcript seals");
-		let signed = server.signing_key.sign_prehash(&transcript_hash);
-		let signature: Secp256k1Signature = signed.expect("the test key signs");
 
-		ServerHandshake {
+		let response = ServerHandshake {
 			certificate: server.certificate.to_owned(),
 			server_random: OctetString::new(server_random).expect("a random is an OCTET STRING"),
 			server_ephemeral: OctetString::new(*server_ephemeral).expect("a point is an OCTET STRING"),
-			signature: OctetString::new(signature.to_bytes().to_vec()).expect("a signature is an OCTET STRING"),
+			signature: OctetString::new([0x30u8; 64]).expect("a signature is an OCTET STRING"),
 			security_accept: accept,
 			client_cert_required: false,
 			transport_accept: None,
 			session_receipt: None,
-		}
+		};
+		(response, transcript_hash)
 	}
 
 	/// `response` with its server ephemeral replaced by `server_ephemeral`
@@ -948,10 +1000,10 @@ mod tests {
 		sealed.expect("the payload seals").to_bytes()
 	}
 
-	/// A `ClientKeyExchange` whose one field carries `encrypted_data`.
-	fn key_exchange_of(encrypted_data: impl AsRef<[u8]>) -> ClientKeyExchange {
-		let encrypted_data = OctetString::new(encrypted_data.as_ref()).expect("sealed bytes are an OCTET STRING");
-		ClientKeyExchange { encrypted_data }
+	/// A `ClientKeyExchange` that carries `sealed` and no attribute.
+	fn key_exchange_of(sealed: impl AsRef<[u8]>) -> ClientKeyExchange {
+		let sealed_payload = OctetString::new(sealed.as_ref()).expect("sealed bytes are an OCTET STRING");
+		ClientKeyExchange { sealed_payload, unprotected_attrs: None }
 	}
 
 	/// A hand-built `ClientKeyExchange` that offers no identity, for the
@@ -1084,7 +1136,82 @@ mod tests {
 		let closing = client.respond(tunneled_reply(&signed)).await?;
 
 		let key_exchange = carried_key_exchange(&closing);
-		assert!(!key_exchange.encrypted_data.as_bytes().is_empty());
+		assert!(!key_exchange.sealed_payload.as_bytes().is_empty());
+		Ok(())
+	}
+
+	/// The closing of a real handshake travels under context tag 6 of the
+	/// transport envelope, the tag of the HPKE key exchange.
+	#[tokio::test]
+	async fn an_hpke_closing_travels_under_tag_6() -> Result<(), Box<dyn Error>> {
+		let identity = create_test_certificate();
+		let mut server = Handshake::server(Hpke::server(&identity));
+		let mut client = Handshake::client(anonymous_client(&identity));
+		let reply = server.reply(client.start()?).await?;
+		let closing = client.respond(reply).await?;
+
+		let encoded = TransportEnvelope::from(closing).to_der()?;
+		assert_eq!(encoded.first(), Some(&0xA6));
+		Ok(())
+	}
+
+	/// A closing that arrives as an `EnvelopedData`, a CMS container, is
+	/// refused before its content is read. The content is an honest sealed
+	/// payload, so the container is the one cause.
+	#[tokio::test]
+	async fn an_hpke_server_refuses_a_closing_in_an_enveloped_data() -> Result<(), Box<dyn Error>> {
+		let identity = create_test_certificate();
+		let (mut server, confirming) = server_after_hello(&identity, PeerAuthentication::Anonymous).await;
+		let key_exchange = build_test_client_key_exchange(&identity, &confirming, &CLIENT_RANDOM, None);
+		let algorithm = AlgorithmIdentifierOwned { oid: AES_256_GCM, parameters: None };
+		let encrypted_content = Some(key_exchange.sealed_payload);
+		let content = EncryptedContentInfo { content_type: DATA, content_enc_alg: algorithm, encrypted_content };
+		let enveloped = EnvelopedData {
+			version: CmsVersion::V0,
+			originator_info: None,
+			recip_infos: RecipientInfos::try_from(Vec::new())?,
+			encrypted_content: content,
+			unprotected_attrs: None,
+		};
+
+		let refusal = server.finish(HandshakeMessage::try_from(enveloped)?).await;
+		assert!(matches!(refusal, Err(HandshakeError::UnexpectedContainer)));
+		Ok(())
+	}
+
+	/// A reply signed over the bare transcript hash is refused. The server
+	/// signs a labelled digest, so a signature over the hash alone is one that
+	/// no HPKE server sends.
+	#[tokio::test]
+	async fn a_reply_signed_over_the_bare_transcript_hash_is_refused() {
+		let server = create_test_certificate();
+		let (mut client, hello) = client_after_hello(&server, None);
+		let ephemeral = create_test_server_ephemeral();
+		let profile = Some(create_default_test_profile());
+		let (response, transcript_hash) = unsigned_server_response(&server, &hello, profile, &ephemeral);
+		let signed = signed_over(response, &server, &transcript_hash);
+
+		let refusal = client.respond(tunneled_reply(&signed)).await;
+		assert!(matches!(refusal, Err(HandshakeError::SignatureError(_))));
+	}
+
+	/// A reply signed over the digest that a CMS server Finished signs is
+	/// refused, so a signature the server key made for the other flow verifies
+	/// as no HPKE reply.
+	#[cfg(feature = "transport-cms")]
+	#[tokio::test]
+	async fn a_reply_signed_under_the_cms_server_label_is_refused() -> Result<(), Box<dyn Error>> {
+		let server = create_test_certificate();
+		let (mut client, hello) = client_after_hello(&server, None);
+		let ephemeral = create_test_server_ephemeral();
+		let profile = Some(create_default_test_profile());
+		let (response, transcript_hash) = unsigned_server_response(&server, &hello, profile, &ephemeral);
+		let content = FinishedRole::Server.content(&transcript_hash);
+		let digest = Transcript::digest::<Sha3_256>(content)?;
+		let signed = signed_over(response, &server, &digest);
+
+		let refusal = client.respond(tunneled_reply(&signed)).await;
+		assert!(matches!(refusal, Err(HandshakeError::SignatureError(_))));
 		Ok(())
 	}
 
@@ -1113,7 +1240,6 @@ mod tests {
 		let identity = create_test_certificate();
 		let mut server = Handshake::server(Hpke::server(&identity));
 		let mut client = Handshake::client(anonymous_client(&identity));
-
 		let signed = server.reply(client.start()?).await?;
 		let mut stripped = tunneled_handshake(&signed);
 		stripped.security_accept = None;
@@ -1267,39 +1393,74 @@ mod tests {
 		Ok(())
 	}
 
+	/// The signature of the reply a server sends to a hand-built hello, beside
+	/// the server's static key and the transcript hash of that hello and the
+	/// legs the reply carries. No client reads the reply, so a test of it holds
+	/// the reply encoder to the message format alone.
+	struct SignedReply {
+		/// The signature the reply carries.
+		signature: Secp256k1Signature,
+		/// The key of the server certificate.
+		static_key: Secp256k1VerifyingKey,
+		/// The transcript hash, computed from the bytes the reply carries.
+		transcript_hash: [u8; 32],
+	}
+
+	impl SignedReply {
+		/// The reply of a fresh server that holds `identity` to a hand-built
+		/// hello that carries [`CLIENT_RANDOM`].
+		async fn of(identity: &TestCertificate) -> Self {
+			let mut server = Handshake::server(Hpke::server(identity));
+			let hello_der = create_test_client_hello(&CLIENT_RANDOM).expect("a hello encodes");
+			let hello = ClientHello::from_der(&hello_der).expect("the hello decodes");
+
+			let replying = server.reply(tunneled_opening(&hello)).await;
+			let reply = replying.expect("the server admits the hello");
+			let handshake = tunneled_handshake(&reply);
+			let random = handshake.server_random.to_32_byte_array().expect("a random has 32 bytes");
+			let ephemeral = handshake.server_ephemeral.to_byte_array::<EC_PUBKEY_COMPRESSED_SIZE>();
+			let ephemeral = ephemeral.expect("an ephemeral is compressed");
+			let server_public_key = identity.certificate.verifying_key_bytes();
+			let legs = HpkeHandshakeLegs {
+				client_hello: &hello_der,
+				server_random: &random,
+				server_ephemeral: &ephemeral,
+				server_public_key,
+				security_accept_der: handshake.security_accept.as_ref().map(WireDer::der).unwrap_or_default(),
+				client_cert_required: handshake.client_cert_required,
+				transport_accept_der: handshake.transport_accept.as_ref().map(WireDer::der).unwrap_or_default(),
+			};
+
+			let sealed = Transcript::hpke_handshake(legs).seal::<Sha3_256>();
+			let transcript_hash = sealed.expect("the transcript seals");
+			let static_key = Secp256k1VerifyingKey::from_sec1_bytes(server_public_key).expect("the key is a point");
+			let signature = Secp256k1Signature::try_from(handshake.signature.as_bytes());
+			let signature = signature.expect("the reply carries a signature");
+			Self { signature, static_key, transcript_hash }
+		}
+	}
+
 	/// The reply to a hand-built hello is signed under the server's static key
-	/// over the transcript of that hello and the legs the reply carries. No
-	/// client reads the reply, so the test holds the reply encoder to the
-	/// message format alone.
+	/// over the labelled digest of its transcript hash.
 	#[tokio::test]
-	async fn a_hand_built_hello_is_answered_with_a_signed_server_handshake() -> Result<(), Box<dyn Error>> {
+	async fn a_hand_built_hello_is_answered_with_a_reply_signed_over_the_labelled_digest() {
 		let identity = create_test_certificate();
-		let mut server = Handshake::server(Hpke::server(&identity));
-		let hello_der = create_test_client_hello(&CLIENT_RANDOM)?;
-		let hello = ClientHello::from_der(&hello_der)?;
+		let reply = SignedReply::of(&identity).await;
+		let digest = reply_digest(&reply.transcript_hash);
 
-		let reply = server.reply(tunneled_opening(&hello)).await?;
-		let handshake = tunneled_handshake(&reply);
-		let random = handshake.server_random.to_32_byte_array()?;
-		let ephemeral = handshake.server_ephemeral.to_byte_array::<EC_PUBKEY_COMPRESSED_SIZE>()?;
-		let server_public_key = identity.certificate.verifying_key_bytes();
-		let legs = HpkeHandshakeLegs {
-			client_hello: &hello_der,
-			server_random: &random,
-			server_ephemeral: &ephemeral,
-			server_public_key,
-			security_accept_der: handshake.security_accept.as_ref().map(WireDer::der).unwrap_or_default(),
-			client_cert_required: handshake.client_cert_required,
-			transport_accept_der: handshake.transport_accept.as_ref().map(WireDer::der).unwrap_or_default(),
-		};
-
-		let transcript_hash = Transcript::hpke_handshake(legs).seal::<Sha3_256>()?;
-		let static_key = Secp256k1VerifyingKey::from_sec1_bytes(server_public_key)?;
-		let signature = Secp256k1Signature::try_from(handshake.signature.as_bytes())?;
-
-		let verified = signature.verify_prehash(&static_key, transcript_hash);
+		let verified = reply.signature.verify_prehash(&reply.static_key, digest);
 		assert!(verified.is_ok());
-		Ok(())
+	}
+
+	/// The reply signature does not verify over the bare transcript hash, so
+	/// the label is part of what the server signs.
+	#[tokio::test]
+	async fn the_reply_signature_does_not_verify_over_the_bare_transcript_hash() {
+		let identity = create_test_certificate();
+		let reply = SignedReply::of(&identity).await;
+
+		let verified = reply.signature.verify_prehash(&reply.static_key, reply.transcript_hash);
+		assert!(verified.is_err());
 	}
 
 	/// The server admits the hand-built key exchange that offers no identity.
@@ -1630,19 +1791,36 @@ mod tests {
 		Ok(())
 	}
 
-	/// A key exchange whose envelope carries an abort alert is refused before
-	/// the key exchange is read.
+	/// The alert slot of a key exchange travels as `[1] IMPLICIT`, the tag
+	/// `EnvelopedData` and `EncryptedData` give their unprotected attributes:
+	/// context tag 1 over the contents of the attribute SET.
+	#[test]
+	fn the_alert_slot_of_a_key_exchange_travels_under_implicit_tag_1() -> Result<(), Box<dyn Error>> {
+		let alert = HandshakeAttribute::new_single(HANDSHAKE_ABORT_ALERT, Any::encode_from(&4u8)?)?;
+		let attrs = Attributes::try_from(vec![Attribute::try_from(alert)?])?;
+		let set = Any::encode_from(&attrs)?;
+		let slot_tag = Tag::ContextSpecific { constructed: true, number: TagNumber::N1 };
+		let expected = Any::new(slot_tag, set.value())?;
+		let mut alerted = key_exchange_of([0x41u8; 32]);
+		alerted.unprotected_attrs = Some(attrs);
+
+		let encoded = alerted.to_der()?;
+		let fields = Vec::<Any>::from_der(&encoded)?;
+		assert_eq!(fields.last(), Some(&expected));
+		Ok(())
+	}
+
+	/// A key exchange whose alert slot carries an abort alert is refused
+	/// before the HPKE message is read.
 	///
 	/// The sealed bytes here are too short for an HPKE message, so a server
-	/// that decoded the key exchange first would refuse with another error.
+	/// that parsed the message first would refuse with another error.
 	#[tokio::test]
 	async fn a_key_exchange_with_an_abort_alert_is_refused() -> Result<(), Box<dyn Error>> {
 		let identity = create_test_certificate();
 		let (mut server, _) = server_after_hello(&identity, PeerAuthentication::Anonymous).await;
-		let key_exchange = key_exchange_of([0x41u8; 32]);
+		let mut alerted = key_exchange_of([0x41u8; 32]);
 		let alert = HandshakeAttribute::new_single(HANDSHAKE_ABORT_ALERT, Any::encode_from(&4u8)?)?;
-
-		let mut alerted = EnvelopedData::try_from(&key_exchange)?;
 		alerted.unprotected_attrs = Some(Attributes::try_from(vec![Attribute::try_from(alert)?])?);
 
 		let refusal = server.finish(HandshakeMessage::try_from(alerted)?).await;

@@ -501,7 +501,9 @@ impl StaticKeyObserver {
 		let aad = [purpose.aad_domain(), transcript_hash.as_slice()].concat();
 		let nonce = Nonce::<ObserverCipher>::default();
 		let opened = cipher.decrypt(&nonce, Payload { msg: sealed, aad: &aad });
+
 		attempts.push(opened.map(SecretSlice::from).map_err(|error| purpose.refusal(error)));
+
 		Ok(attempts)
 	}
 
@@ -865,18 +867,15 @@ pub fn tunneled_reply(handshake: &ServerHandshake) -> HandshakeMessage {
 /// The `ClientKeyExchange` that `closing` carries.
 #[cfg(feature = "transport-hpke")]
 pub fn carried_key_exchange(closing: &HandshakeMessage) -> ClientKeyExchange {
-	let carrier = closing
-		.to_owned()
-		.enveloped()
-		.expect("an HPKE closing travels in an EnvelopedData");
-	ClientKeyExchange::try_from(carrier.value()).expect("the closing carries a ClientKeyExchange")
+	let key_exchange = closing.to_owned().key_exchange();
+	key_exchange.expect("an HPKE closing is a ClientKeyExchange").into_value()
 }
 
 /// `key_exchange` as the closing an HPKE server reads.
 #[cfg(feature = "transport-hpke")]
 pub fn carried_closing(key_exchange: &ClientKeyExchange) -> HandshakeMessage {
-	let carrier = EnvelopedData::try_from(key_exchange).expect("a ClientKeyExchange travels in an EnvelopedData");
-	HandshakeMessage::try_from(carrier).expect("the carrier encodes")
+	let closing = HandshakeMessage::try_from(key_exchange.to_owned());
+	closing.expect("the key exchange encodes")
 }
 
 /// What an observer who holds the server's static key recovers from a
@@ -949,7 +948,7 @@ impl TestFlow for Hpke {
 	fn recover(run: &Run<Self>, server_identity: &TestCertificate) -> Recovered {
 		let key_exchange = carried_key_exchange(&run.closing);
 		let static_key = SecretKey::from(server_identity.signing_key.to_owned());
-		let message = HpkeMessage::<HpkeSecp256k1Sha3Aes256Gcm>::from_bytes(key_exchange.encrypted_data.as_bytes());
+		let message = HpkeMessage::<HpkeSecp256k1Sha3Aes256Gcm>::from_bytes(key_exchange.sealed_payload.as_bytes());
 		let message = message.expect("the closing carries an HPKE message");
 		let opened = static_key.open(&message, TIGHTBEAM_HPKE_HANDSHAKE_INFO, TIGHTBEAM_AAD_DOMAIN_TAG);
 		let plaintext = opened.expect("the static key opens the payload").to_insecure();

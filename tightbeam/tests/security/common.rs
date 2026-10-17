@@ -167,7 +167,7 @@ pub enum InjectionOutcome {
 /// The boxed future a flow step returns, which borrows the session it runs on.
 type FlowFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, TightBeamError>> + Send + 'a>>;
 
-/// The CMS container a handshake message travels in.
+/// The container a handshake message travels in.
 #[derive(Debug, Clone, Copy)]
 pub enum Container {
 	/// A `SignedData`.
@@ -176,6 +176,8 @@ pub enum Container {
 	Enveloped,
 	/// An `EncryptedData`.
 	Encrypted,
+	/// The `ClientKeyExchange` of an HPKE closing.
+	KeyExchange,
 }
 
 impl Container {
@@ -186,6 +188,7 @@ impl Container {
 			Self::Signed => HandshakeMessage::SignedData(Box::new(WireDer::try_from(der)?)),
 			Self::Enveloped => HandshakeMessage::EnvelopedData(Box::new(WireDer::try_from(der)?)),
 			Self::Encrypted => HandshakeMessage::EncryptedData(Box::new(WireDer::try_from(der)?)),
+			Self::KeyExchange => HandshakeMessage::ClientKeyExchange(Box::new(WireDer::try_from(der)?)),
 		};
 
 		Ok(message)
@@ -550,12 +553,12 @@ pub enum DecryptionResult {
 	Failed,
 }
 
-/// Return the sealed HPKE message (`encrypted_data`) of the
+/// Return the sealed HPKE message (`sealed_payload`) of the
 /// `ClientKeyExchange` that the DER of a captured HPKE closing carries.
 pub fn extract_hpke_ciphertext(closing_der: impl AsRef<[u8]>) -> Result<Vec<u8>, TightBeamError> {
-	let closing = Container::Enveloped.message(closing_der.as_ref())?;
+	let closing = Container::KeyExchange.message(closing_der.as_ref())?;
 	let client_kex = carried_key_exchange(closing);
-	Ok(client_kex.encrypted_data.as_bytes().to_vec())
+	Ok(client_kex.sealed_payload.as_bytes().to_vec())
 }
 
 /// The HPKE suite of the default provider, which seals the key exchange.
@@ -641,7 +644,11 @@ pub fn generate_wrong_secret_key() -> k256::SecretKey {
 const HPKE_FLOW: &[FlowStep] = &[
 	FlowStep { index: 0, direction: Direction::ClientToServer, container: Container::Signed },
 	FlowStep { index: 1, direction: Direction::ServerToClient, container: Container::Signed },
-	FlowStep { index: 2, direction: Direction::ClientToServer, container: Container::Enveloped },
+	FlowStep {
+		index: 2,
+		direction: Direction::ClientToServer,
+		container: Container::KeyExchange,
+	},
 ];
 
 /// The three messages a CMS handshake exchanges. The odd steps between them

@@ -43,7 +43,7 @@ use crate::cms::enveloped_data::EncryptedContentInfo;
 use crate::constants::EC_PUBKEY_COMPRESSED_SIZE;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::constants::{
-	MIN_SALT_ENTROPY_BYTES, TIGHTBEAM_ACK_AAD_DOMAIN, TIGHTBEAM_ACK_KDF_INFO, TIGHTBEAM_C2S_KDF_INFO,
+	prefix_free, MIN_SALT_ENTROPY_BYTES, TIGHTBEAM_ACK_AAD_DOMAIN, TIGHTBEAM_ACK_KDF_INFO, TIGHTBEAM_C2S_KDF_INFO,
 	TIGHTBEAM_CONFIRM_KDF_INFO, TIGHTBEAM_EPOCH_KDF_INFO, TIGHTBEAM_IDENTITY_AAD_DOMAIN, TIGHTBEAM_IDENTITY_KDF_INFO,
 	TIGHTBEAM_S2C_KDF_INFO, TIGHTBEAM_SESSION_KDF_INFO,
 };
@@ -405,29 +405,10 @@ impl Padding {
 	}
 }
 
-/// Whether two byte strings differ, in a `const` context, where slice
-/// equality is unavailable.
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-const fn bytes_differ(a: &[u8], b: &[u8]) -> bool {
-	if a.len() != b.len() {
-		return true;
-	}
-
-	let mut index = 0;
-	while index < a.len() {
-		if a[index] != b[index] {
-			return true;
-		}
-		index += 1;
-	}
-
-	false
-}
-
 // The acknowledgement and the identity derive two keys from one secret, so
-// their labels must differ (RFC 5869 § 3.2).
+// their labels must differ (RFC 5869 § 3.2), which `prefix_free` implies.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-const _: () = assert!(bytes_differ(SecretSeal::Ack.label(), SecretSeal::Identity.label()));
+const _: () = assert!(prefix_free(SecretSeal::Ack.label(), SecretSeal::Identity.label()));
 
 /// The single-use AEAD of one [`SecretSeal`] purpose.
 ///

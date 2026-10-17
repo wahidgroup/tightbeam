@@ -10,7 +10,7 @@
 //!
 //! ## Attack
 //! A network attacker captures a victim's budget-bearing [`ClientKeyExchange`],
-//! whose HPKE ciphertext (`encrypted_data`) carries the sealed receipt
+//! whose HPKE ciphertext (`sealed_payload`) carries the sealed receipt
 //! countersignature. The countersignature covers only the receipt body and the
 //! settlement answer. The attacker corrupts the ciphertext and sends the key
 //! exchange on.
@@ -22,7 +22,7 @@
 //! Two layers give defense in depth:
 //!
 //! 1. Primary: the HPKE payload is authenticated encryption, so a corrupted
-//!    `encrypted_data` fails to open under the static key. The sealed
+//!    `sealed_payload` fails to open under the static key. The sealed
 //!    countersignature that settlement verifies is inside that payload, so
 //!    the server reaches the countersignature only through a successful open.
 //! 2. Ordering: settlement is the last step of the server's closing, after
@@ -149,11 +149,11 @@ tb_scenario! {
 			// countersignature, so the server must open it before it can
 			// settle, and that open must fail.
 			let mut kex = ClientKeyExchange::from_der(&client_kex_der)?;
-			let mut ciphertext = kex.encrypted_data.as_bytes().to_vec();
+			let mut ciphertext = kex.sealed_payload.as_bytes().to_vec();
 			let last = ciphertext.len().checked_sub(1).ok_or_else(|| expectation_failure("empty ciphertext"))?;
 
 			ciphertext[last] ^= 0xFF;
-			kex.encrypted_data = OctetString::new(ciphertext)?;
+			kex.sealed_payload = OctetString::new(ciphertext)?;
 
 			// The payload is authenticated encryption, so the static key fails
 			// to open it, and `finish` refuses the closing before the key

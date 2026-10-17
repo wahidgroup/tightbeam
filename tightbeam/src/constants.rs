@@ -56,6 +56,10 @@ pub const TIGHTBEAM_IDENTITY_AAD_DOMAIN: &[u8] = b"tb/handshake/identity/aad/v1"
 /// the transcript hash, the client ephemeral, and the certificate.
 pub const TIGHTBEAM_HPKE_CLIENT_AUTH_DOMAIN: &[u8] = b"tb/handshake/client-auth/hpke/v1";
 
+/// Domain label that leads the bytes an HPKE server signs over its reply,
+/// ahead of the transcript hash.
+pub const TIGHTBEAM_HPKE_SERVER_AUTH_DOMAIN: &[u8] = b"tb/handshake/server-auth/hpke/v1";
+
 /// KDF info label of the key-confirmation tag (HKDF), which the transcript
 /// hash follows.
 ///
@@ -105,6 +109,60 @@ pub const TIGHTBEAM_SERVER_FINISHED_DOMAIN: &[u8] = b"tb/handshake/finished/serv
 /// Domain label a client CMS Finished signs ahead of the transcript hash.
 pub const TIGHTBEAM_CLIENT_FINISHED_DOMAIN: &[u8] = b"tb/handshake/finished/client/v1";
 
+/// Whether neither byte string is a prefix of the other, in a `const` context,
+/// where slice comparison is unavailable. Two equal strings are each a prefix
+/// of the other.
+pub(crate) const fn prefix_free(a: &[u8], b: &[u8]) -> bool {
+	let shorter = if a.len() < b.len() {
+		a.len()
+	} else {
+		b.len()
+	};
+
+	let mut index = 0;
+	while index < shorter {
+		if a[index] != b[index] {
+			return true;
+		}
+		index += 1;
+	}
+
+	false
+}
+
+/// The domain labels that lead the bytes of each handshake signature. An
+/// associated-data domain enters an AEAD, so the set holds the signing labels
+/// alone. A new signing label joins this set, and the assertion below holds it
+/// apart from the others.
+const SIGNING_LABELS: [&[u8]; 4] = [
+	TIGHTBEAM_HPKE_SERVER_AUTH_DOMAIN,
+	TIGHTBEAM_HPKE_CLIENT_AUTH_DOMAIN,
+	TIGHTBEAM_SERVER_FINISHED_DOMAIN,
+	TIGHTBEAM_CLIENT_FINISHED_DOMAIN,
+];
+
+/// Whether no member of `labels` is a prefix of another member.
+const fn pairwise_prefix_free(labels: &[&[u8]]) -> bool {
+	let mut first = 0;
+	while first < labels.len() {
+		let mut second = first + 1;
+		while second < labels.len() {
+			if !prefix_free(labels[first], labels[second]) {
+				return false;
+			}
+			second += 1;
+		}
+		first += 1;
+	}
+
+	true
+}
+
+// Each handshake signature signs its own label ahead of the bytes it covers.
+// When no label is a prefix of another, the signed bytes of one purpose never
+// read as those of another.
+const _: () = assert!(pairwise_prefix_free(&SIGNING_LABELS));
+
 /// AAD (Additional Authenticated Data) domain tag prefix.
 pub const TIGHTBEAM_AAD_DOMAIN_TAG: &[u8] = b"tb/aead/v1";
 
@@ -120,7 +178,7 @@ pub const TIGHTBEAM_UKM_PREFIX: &[u8] = b"tb/kari/ukm/v1|";
 /// The HPKE `info` of a handshake key exchange (RFC 9180 § 5.1).
 ///
 /// It separates the key schedule of a handshake from that of a frame sealed to
-/// the same key, and it versions the protocol.
+/// the same key, and it versions the grammar of the sealed payload.
 pub const TIGHTBEAM_HPKE_HANDSHAKE_INFO: &[u8] = b"tb/hpke/handshake/v2";
 
 /// The HPKE `info` of a frame sealed to a recipient key (RFC 9180 § 5.1).
@@ -872,3 +930,17 @@ pub const PEER_PROBE_BACKOFF_MAX_MS: u64 = 60_000;
 /// - Discovery refills the table.
 /// - Eviction is the fail-closed direction.
 pub const MAX_PEER_TRIED_FAILURES: usize = 3;
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// A prefix pair at the two ends of a set fails the check, so the check
+	/// reaches every pair of the set.
+	#[test]
+	fn a_prefix_pair_at_the_ends_of_a_set_is_found() {
+		let labels: [&[u8]; 3] = [b"tb/a", b"tb/b", b"tb/a/v1"];
+		let free = pairwise_prefix_free(&labels);
+		assert!(!free);
+	}
+}

@@ -125,10 +125,10 @@ mod hpke {
 				// ciphertext byte is the only wire handle a MITM has on the
 				// sealed acknowledgement.
 				let mut kex = carried_key_exchange(closing);
-				let mut forged = kex.encrypted_data.as_bytes().to_vec();
+				let mut forged = kex.sealed_payload.as_bytes().to_vec();
 				let middle = forged.len() / 2;
 				forged[middle] ^= 0xFF;
-				kex.encrypted_data = OctetString::new(forged)?;
+				kex.sealed_payload = OctetString::new(forged)?;
 
 				let kex_result = server.finish(carried_closing(&kex)).await;
 				let rejected = matches!(kex_result, Err(HandshakeError::HpkeError(_)));

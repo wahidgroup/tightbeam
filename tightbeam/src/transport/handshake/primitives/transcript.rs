@@ -11,7 +11,9 @@ use crate::crypto::profiles::CryptoProvider;
 use crate::transport::handshake::error::HandshakeError;
 
 #[cfg(feature = "transport-hpke")]
-use crate::constants::{EC_PUBKEY_COMPRESSED_SIZE, TIGHTBEAM_HPKE_CLIENT_AUTH_DOMAIN};
+use crate::constants::{
+	EC_PUBKEY_COMPRESSED_SIZE, TIGHTBEAM_HPKE_CLIENT_AUTH_DOMAIN, TIGHTBEAM_HPKE_SERVER_AUTH_DOMAIN,
+};
 #[cfg(feature = "transport-cms")]
 use crate::constants::{TIGHTBEAM_CLIENT_FINISHED_DOMAIN, TIGHTBEAM_SERVER_FINISHED_DOMAIN};
 
@@ -137,6 +139,21 @@ impl Transcript {
 		buffer.extend_from_slice(transcript_hash);
 		buffer.extend_from_slice(client_ephemeral);
 		buffer.extend_from_slice(client_cert_der);
+		Self(State::Open(buffer))
+	}
+
+	/// Open the bytes an HPKE server signs over its reply.
+	///
+	/// The digest binds a domain label and the transcript hash, so the reply
+	/// signature reads as no other signed message of the crate. Both roles
+	/// derive it here, the server to sign and the client to verify.
+	#[cfg(feature = "transport-hpke")]
+	pub(crate) fn hpke_server_auth(transcript_hash: &[u8; TRANSCRIPT_HASH_LEN]) -> Self {
+		let len = TIGHTBEAM_HPKE_SERVER_AUTH_DOMAIN.len() + transcript_hash.len();
+
+		let mut buffer = Vec::with_capacity(len);
+		buffer.extend_from_slice(TIGHTBEAM_HPKE_SERVER_AUTH_DOMAIN);
+		buffer.extend_from_slice(transcript_hash);
 		Self(State::Open(buffer))
 	}
 
@@ -466,6 +483,25 @@ mod tests {
 		let expected = [
 			0xe9, 0x68, 0xba, 0xd7, 0x78, 0xf6, 0x05, 0xea, 0xe8, 0x45, 0xc1, 0x28, 0xee, 0xad, 0xbf, 0x47, 0xc5, 0xc7,
 			0x62, 0x80, 0x72, 0x02, 0x99, 0x7a, 0x0f, 0x93, 0x6b, 0xc9, 0xe8, 0x80, 0xcb, 0x42,
+		];
+		assert_eq!(digest, expected);
+		Ok(())
+	}
+
+	/// The HPKE server digest is SHA3-256 over its domain and the transcript
+	/// hash, in that order.
+	///
+	/// The expected bytes come from an independent SHA3-256, so a label or a
+	/// hash dropped on both sides of the reply signature fails here.
+	#[cfg(feature = "transport-hpke")]
+	#[test]
+	fn the_hpke_server_digest_matches_its_known_answer() -> Result<(), HandshakeError> {
+		let mut signed = Transcript::hpke_server_auth(&[0x07u8; 32]);
+
+		let digest = signed.seal::<Sha3_256>()?;
+		let expected = [
+			0x97, 0x0a, 0x31, 0x56, 0x9b, 0x68, 0xef, 0x0b, 0xbc, 0x13, 0xf1, 0x8a, 0x03, 0x76, 0x20, 0xd6, 0x72, 0x8b,
+			0xac, 0x17, 0x3f, 0x67, 0xcd, 0xde, 0xcc, 0xd2, 0xfc, 0x4c, 0x64, 0x1c, 0x08, 0x1c,
 		];
 		assert_eq!(digest, expected);
 		Ok(())
