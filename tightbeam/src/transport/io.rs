@@ -322,7 +322,7 @@ pub trait EncryptedMessageIO: MessageIO {
 	/// - [`TransportError::OperationFailed`] with
 	///   [`TransportFailure::EncryptionFailed`] -- an encrypted envelope came
 	///   before encryption or did not decrypt, and the session was reset.
-	/// - The read, decode, and handshake-container conversion failures.
+	/// - The read and decode failures.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[allow(async_fn_in_trait)]
 	async fn collect_step(&mut self) -> TransportResult<CollectStep>
@@ -354,20 +354,16 @@ pub trait EncryptedMessageIO: MessageIO {
 				}
 
 				if expects_encryption {
-					match envelope {
-						TransportEnvelope::EnvelopedData(_)
-						| TransportEnvelope::SignedData(_)
-						| TransportEnvelope::EncryptedData(_) => {
-							let message = HandshakeMessage::try_from(envelope)?;
-							Ok(CollectStep::Handshake(message))
-						}
-						// Circuit breaker: once encryption is configured,
-						// application traffic arrives encrypted.
-						_ => {
-							self.session_state_mut().reset();
-							Err(TransportError::MissingEncryption)
-						}
-					}
+					// Circuit breaker: once encryption is configured, only a
+					// handshake container arrives in cleartext, and any other
+					// envelope is application traffic that arrived unsealed.
+					// The refusal names that cause, `MissingEncryption`, and
+					// not the `InvalidMessage` of the conversion.
+					let Ok(message) = HandshakeMessage::try_from(envelope) else {
+						self.session_state_mut().reset();
+						return Err(TransportError::MissingEncryption);
+					};
+					Ok(CollectStep::Handshake(message))
 				} else {
 					Ok(CollectStep::Envelope(envelope))
 				}
@@ -571,7 +567,6 @@ pub trait EncryptedMessageIO: MessageIO {
 		let mut config = ClientConfig::<Hpke, P>::new(settings);
 		config.transport_offer = encryption.mux_offer.as_deref().cloned();
 		config.receipt_approver = encryption.receipt_approver.as_ref().map(Arc::clone);
-
 		Ok(Box::new(Handshake::client(config)))
 	}
 
@@ -608,7 +603,6 @@ pub trait EncryptedMessageIO: MessageIO {
 		config.security_offer = Some(SecurityOffer::new(vec![RunnableProfile::<P>::native().descriptor()]));
 		config.transport_offer = encryption.mux_offer.as_deref().cloned();
 		config.receipt_approver = encryption.receipt_approver.as_ref().map(Arc::clone);
-
 		Ok(Box::new(Handshake::client(config)))
 	}
 
@@ -919,7 +913,8 @@ pub trait EncryptedMessageIO: MessageIO {
 			TransportEnvelope::Request(_) => return Err(TransportError::InvalidMessage),
 			TransportEnvelope::EnvelopedData(_)
 			| TransportEnvelope::SignedData(_)
-			| TransportEnvelope::EncryptedData(_) => return Err(TransportError::InvalidMessage),
+			| TransportEnvelope::EncryptedData(_)
+			| TransportEnvelope::ClientKeyExchange(_) => return Err(TransportError::InvalidMessage),
 			#[cfg(feature = "transport-multiplex")]
 			TransportEnvelope::Mux(_) => return Err(TransportError::InvalidMessage),
 		};
@@ -952,7 +947,8 @@ impl TransportEnvelope {
 			TransportEnvelope::Response(_) => Err(TransportError::InvalidMessage),
 			TransportEnvelope::EnvelopedData(_)
 			| TransportEnvelope::SignedData(_)
-			| TransportEnvelope::EncryptedData(_) => Err(TransportError::InvalidMessage),
+			| TransportEnvelope::EncryptedData(_)
+			| TransportEnvelope::ClientKeyExchange(_) => Err(TransportError::InvalidMessage),
 			#[cfg(feature = "transport-multiplex")]
 			TransportEnvelope::Mux(_) => Err(TransportError::InvalidMessage),
 		}
@@ -995,16 +991,18 @@ mod tests {
 		}
 	}
 
-	/// A probe that reads EOF on every call, in the session phase that the case
-	/// under test sets.
-	struct ClosedStreamProbe {
+	/// A probe whose stream yields at most one envelope and then reads EOF, in
+	/// the session phase that the case under test sets.
+	struct StreamProbe {
 		state: SessionState<DefaultCryptoProvider>,
 		limits: TransportLimits,
 		clock: ManualClock,
+		inbound: Option<Vec<u8>>,
 	}
 
-	impl ClosedStreamProbe {
-		/// Returns a provisioned endpoint placed directly in `phase`.
+	impl StreamProbe {
+		/// Returns a provisioned endpoint placed directly in `phase`, whose
+		/// stream is closed.
 		fn at(phase: SessionPhase) -> Self {
 			let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator);
 			let peer_authentication = PeerAuthentication::mutual([validator]);
@@ -1014,17 +1012,26 @@ mod tests {
 				state: SessionState::at(encryption, phase),
 				limits: TransportLimits::default(),
 				clock: ManualClock::default(),
+				inbound: None,
 			}
+		}
+
+		/// Returns the endpoint of [`Self::at`], whose stream yields `envelope`
+		/// once before it closes.
+		fn reading(phase: SessionPhase, envelope: WireEnvelope) -> Self {
+			let mut probe = Self::at(phase);
+			probe.inbound = Some(envelope.to_der().expect("a wire envelope encodes"));
+			probe
 		}
 	}
 
-	impl MessageIO for ClosedStreamProbe {
+	impl MessageIO for StreamProbe {
 		fn clock(&self) -> &dyn Clock {
 			&self.clock
 		}
 
 		async fn read_envelope_bytes(&mut self) -> TransportResult<Vec<u8>> {
-			Err(TransportError::ConnectionClosed)
+			self.inbound.take().ok_or(TransportError::ConnectionClosed)
 		}
 
 		async fn write_envelope_bytes(&mut self, _buffer: &[u8]) -> TransportResult<()> {
@@ -1032,11 +1039,11 @@ mod tests {
 		}
 	}
 
-	impl EncryptedMessageIO for ClosedStreamProbe {}
+	impl EncryptedMessageIO for StreamProbe {}
 
-	impl crate::transport::state::sealed::Sealed for ClosedStreamProbe {}
+	impl crate::transport::state::sealed::Sealed for StreamProbe {}
 
-	impl EncryptedProtocolState for ClosedStreamProbe {
+	impl EncryptedProtocolState for StreamProbe {
 		type CryptoProvider = DefaultCryptoProvider;
 
 		fn limits(&self) -> &TransportLimits {
@@ -1074,7 +1081,7 @@ mod tests {
 		fn a_close_is_named_by_the_phase_it_interrupts((phase, expected): (SessionPhase, TransportError))
 			-> TransportResult<()>
 		{
-			let mut probe = ClosedStreamProbe::at(phase);
+			let mut probe = StreamProbe::at(phase);
 			let runtime = tokio::runtime::Builder::new_current_thread().build()?;
 			let outcome = runtime.block_on(probe.read_session_bytes());
 			assert!(
@@ -1089,6 +1096,21 @@ mod tests {
 			handshake_in_flight => (handshaking_phase(), TransportError::PeerClosedBeforeHandshake),
 			established_session => (encrypted_phase(), TransportError::ConnectionClosed),
 		}
+	}
+
+	/// A cleartext envelope that is no handshake container, read while a
+	/// handshake is in flight, trips the circuit breaker. The step refuses it,
+	/// and the session drops the handshake and returns to its provisioned
+	/// start.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	#[tokio::test]
+	async fn a_cleartext_request_during_the_handshake_trips_the_breaker() {
+		let request = TransportEnvelope::Request(RequestPackage::new(TestFrame::prioritized()));
+		let mut probe = StreamProbe::reading(handshaking_phase(), WireEnvelope::Cleartext(request));
+
+		let refusal = probe.collect_step().await;
+		assert!(matches!(refusal, Err(TransportError::MissingEncryption)));
+		assert!(matches!(probe.session_state().phase(), SessionPhase::Provisioned));
 	}
 
 	/// Cases of `(label, envelope bytes, whether ingress accepts them)`.

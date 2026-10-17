@@ -41,6 +41,7 @@ use multiplex::*;
 use crate::cms::encrypted_data::EncryptedData;
 use crate::cms::enveloped_data::EnvelopedData;
 use crate::cms::signed_data::SignedData;
+use crate::transport::handshake::ClientKeyExchange;
 use crate::transport::wire_der::WireDer;
 
 /// A request package that carries the message frame.
@@ -878,6 +879,9 @@ pub enum TransportEnvelope {
 	/// with the bytes that carried it.
 	#[asn1(context_specific = "5", constructed = "true")]
 	EncryptedData(Box<WireDer<EncryptedData>>),
+	/// The closing of an HPKE handshake, kept with the bytes that carried it.
+	#[asn1(context_specific = "6", constructed = "true")]
+	ClientKeyExchange(Box<WireDer<ClientKeyExchange>>),
 	/// A multiplexing message.
 	#[cfg(feature = "transport-multiplex")]
 	#[asn1(context_specific = "4", constructed = "true")]
@@ -1456,6 +1460,21 @@ mod tests {
 
 		let encoded = envelope.to_der()?;
 		assert_eq!(encoded.first(), Some(&0xA5));
+		Ok(())
+	}
+
+	/// The closing of an HPKE handshake travels under context tag 6 of the
+	/// transport envelope.
+	#[test]
+	fn an_hpke_key_exchange_travels_under_tag_6() -> Result<(), Box<dyn Error>> {
+		use crate::asn1::OctetString;
+
+		let sealed_payload = OctetString::new([0u8; 16])?;
+		let key_exchange = ClientKeyExchange { sealed_payload, unprotected_attrs: None };
+		let envelope = TransportEnvelope::ClientKeyExchange(Box::new(WireDer::new(key_exchange)?));
+
+		let encoded = envelope.to_der()?;
+		assert_eq!(encoded.first(), Some(&0xA6));
 		Ok(())
 	}
 }

@@ -18,34 +18,37 @@ This document describes how a TightBeam session is established, which types carr
 
 TightBeam ships two handshake backends.
 
-| Backend | Messages                                              | The client's first message                                                   |
-| ------- | ----------------------------------------------------- | ---------------------------------------------------------------------------- |
-| HPKE    | Its own message types, tunneled inside CMS containers | `ClientHello`                                                                |
-| CMS     | CMS containers, exchanged directly                    | The key exchange, with the base secret encrypted to the server's certificate |
+| Backend | Messages                                                                                                                     | The client's first message                                                   |
+| ------- | ---------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| HPKE    | Its own message types: the hello and the reply tunneled inside `SignedData`, the closing in a `ClientKeyExchange` of its own | `ClientHello`                                                                |
+| CMS     | CMS containers, exchanged directly                                                                                           | The key exchange, with the base secret encrypted to the server's certificate |
 
 In both, the session keys derive from the base secret and an ephemeral-ephemeral ECDH. See [Key schedule](#key-schedule).
 
-Both backends meet the transport at one interface, so the driver moves a handshake message without knowing which protocol produced it. Each container travels as a `WireDer`, which keeps the decoded value together with the bytes it was encoded or received as.
+Both backends meet the transport at one interface, so the driver moves a handshake message without knowing which protocol produced it. Each container travels as a `WireDer`, which keeps the decoded value together with the bytes it was encoded or received as. HPKE specifies no wire format (RFC 9180 § 10), so its closing travels in a container of its own that holds the HPKE message and the alert slot alone.
 
 ```rust
 pub enum HandshakeMessage {
     /// Carries an HPKE `ClientHello` or `ServerHandshake`, or a CMS server
     /// Finished.
     SignedData(Box<WireDer<SignedData>>),
-    /// Carries an HPKE `ClientKeyExchange`, or a CMS key exchange.
+    /// Carries a CMS key exchange.
     EnvelopedData(Box<WireDer<EnvelopedData>>),
     /// Carries a CMS client Finished, sealed under the identity key of the
     /// handshake secret (RFC 5652 § 8).
     EncryptedData(Box<WireDer<EncryptedData>>),
+    /// Carries the closing of an HPKE handshake.
+    ClientKeyExchange(Box<WireDer<ClientKeyExchange>>),
 }
 ```
 
 Each step accepts one container and refuses the others. A step asks for the one it expects, and any other fails the step with `HandshakeError::UnexpectedContainer`.
 
 ```rust
-let key_exchange = msg.enveloped()?;   // refuses a SignedData or an EncryptedData
-let finished = msg.signed()?;          // refuses an EnvelopedData or an EncryptedData
-let sealed = msg.encrypted()?;         // refuses a SignedData or an EnvelopedData
+let key_exchange = msg.enveloped()?;   // refuses every other container
+let finished = msg.signed()?;          // refuses every other container
+let sealed = msg.encrypted()?;         // refuses every other container
+let closing = msg.key_exchange()?;     // refuses every CMS container
 ```
 
 Because each protocol names its own container, the driver carries no per-protocol mapping. `ClientBuilder`, the connection pool and the `client!` macro all reach the same code.
@@ -108,9 +111,9 @@ sequenceDiagram
     participant S as Server
     C->>S: ClientHello (SignedData)
     Note over S: validates the offer, negotiates a profile, draws an ephemeral
-    S->>C: ServerHandshake (SignedData, signed transcript carries the server ephemeral)
+    S->>C: ServerHandshake (SignedData, signed over a labelled digest of the transcript, which carries the server ephemeral)
     Note over C: validates the certificate, verifies the signature, parses the server ephemeral
-    C->>S: ClientKeyExchange (EnvelopedData, base secret, client ephemeral, key-confirmation tag and sealed identity, sealed to the server's static key with HPKE)
+    C->>S: ClientKeyExchange (its own container: base secret, client ephemeral, key-confirmation tag and sealed identity, sealed to the server's static key with HPKE)
     Note over C,S: both derive the handshake secret from the base secret and the ephemeral-ephemeral ECDH
     Note over S: opens the identity, verifies the key-confirmation tag, admits the client, then settles the receipt countersignature
 ```
@@ -463,6 +466,15 @@ The receiver hashes the bytes that arrived, and not a re-encoding of what it dec
 
 The HPKE transcript binds the `ClientHello` DER and the accept encodings the same way. It also binds the server's certificate demand as one byte between the two accepts, so a flipped `client_cert_required` fails the server signature.
 
+Each handshake signature covers a label of its own ahead of the bytes it binds, and no label is a prefix of another, so a signature made for one purpose verifies as no other.
+
+| Signature              | What it signs                                                                                                |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------ |
+| HPKE server reply      | The provider digest of `tb/handshake/server-auth/hpke/v1` and the transcript hash                            |
+| HPKE client possession | The provider digest of `tb/handshake/client-auth/hpke/v1`, the transcript hash, `R`, and the certificate DER |
+| CMS server Finished    | The provider digest of its content, `tb/handshake/finished/server/v1` and the transcript hash                |
+| CMS client Finished    | The provider digest of its content, `tb/handshake/finished/client/v1` and the transcript hash                |
+
 Both transcripts bind both ephemerals.
 
 | Ephemeral        | Bound by                                                                                                                      | Tampering fails at                                                                                  |
@@ -504,6 +516,7 @@ An end of stream is named by the phase it interrupted.
 - RFC 5280, Internet X.509 Public Key Infrastructure Certificate and CRL Profile: <https://datatracker.ietf.org/doc/html/rfc5280>
 - RFC 5869, HMAC-based Extract-and-Expand Key Derivation Function (HKDF): <https://datatracker.ietf.org/doc/html/rfc5869>
 - RFC 9180, Hybrid Public Key Encryption, § 9.2.3 on reuse of the KEM randomness: <https://datatracker.ietf.org/doc/html/rfc9180#section-9.2.3>
+- RFC 9180, Hybrid Public Key Encryption, § 10 on the message encoding an application defines: <https://datatracker.ietf.org/doc/html/rfc9180#section-10>
 - RFC 5116, An Interface and Algorithms for Authenticated Encryption, § 3.1 on nonce generation: <https://datatracker.ietf.org/doc/html/rfc5116#section-3.1>
 - NIST SP 800-56A Rev. 3, Pair-Wise Key-Establishment Schemes Using Discrete Logarithm Cryptography, § 5.9 on key confirmation: <https://doi.org/10.6028/NIST.SP.800-56Ar3>
 - CWE-295, Improper Certificate Validation: <https://cwe.mitre.org/data/definitions/295.html>

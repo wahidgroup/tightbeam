@@ -1562,7 +1562,7 @@ Phase 2: Server -> Client
 │ - Server certificate                                    │
 │ - Server nonce (32 bytes)                               │
 │ - Selected SecurityProfile (if negotiation occurred)    │
-│ - Signature over transcript hash                        │
+│ - Signature over a labelled digest of the transcript    │
 └─────────────────────────────────────────────────────────┘
 
 Phase 3: Client -> Server
@@ -1675,7 +1675,7 @@ Server Side - Verifying Client Authentication:
 
 #### 8.5.4 Implementation: HPKE-Based Handshake Protocol
 
-HPKE (Hybrid Public Key Encryption, [RFC 9180][rfc9180]) is the lighter handshake path. It seals the base secret to the server's static key without nested CMS `EnvelopedData` / `SignedData` containers.
+HPKE (Hybrid Public Key Encryption, [RFC 9180][rfc9180]) is the lighter handshake path. It seals the base secret to the server's static key without nested CMS `EnvelopedData` containers. Its hello and reply ride in `SignedData` tunnels, and its closing travels as a `ClientKeyExchange` of its own, because HPKE specifies no wire format (RFC 9180 §10).
 
 Differences from CMS:
 
@@ -1715,7 +1715,7 @@ Client Side - Building ClientKeyExchange:
 │    )                                                                │
 ├─────────────────────────────────────────────────────────────────────┤
 │ 5. Seal the Payload with HPKE                                       │
-│    encrypted_data = HPKE-Seal(                                      │
+│    sealed_payload = HPKE-Seal(                                      │
 │        recipient_pub_key: server_pub_key,                           │
 │        info: "tb/hpke/handshake/v2",                                │
 │        aad: domain_tag,                                             │
@@ -1725,7 +1725,8 @@ Client Side - Building ClientKeyExchange:
 │ 6. Build ClientKeyExchange                                          │
 │    ┌──────────────────────────────────────────────────────────┐     │
 │    │ ClientKeyExchange {                                      │     │
-│    │     encrypted_data: encrypted_data,  // HPKE message     │     │
+│    │     sealed_payload: sealed_payload,  // enc || ct        │     │
+│    │     unprotected_attrs: None,         // the alert slot   │     │
 │    │ }                                                        │     │
 │    └──────────────────────────────────────────────────────────┘     │
 └─────────────────────────────────────────────────────────────────────┘
@@ -1738,7 +1739,7 @@ Server Side - Verifying Client Authentication:
 ┌─────────────────────────────────────────────────────────────┐
 │ 1. Open the Payload                                         │
 │    payload = HPKE-Open(                                     │
-│        ciphertext: encrypted_data,                          │
+│        ciphertext: sealed_payload,                          │
 │        server_priv_key: server_private_key,                 │
 │        aad: domain_tag                                      │
 │    )                                                        │
@@ -1939,7 +1940,7 @@ let security_accept = SecurityAccept {
 | **Replay Attack**          | 32-byte nonce + replay set                  | Server maintains set of seen nonces. Rejects duplicates                                                                                                                                                           |
 | **Downgrade Attack**       | Profile list in signed transcript           | Transcript hash covers SecurityOffer/SecurityAccept                                                                                                                                                               |
 | **Multiplexing Downgrade** | Transport offer/accept in signed transcript | Transcript hash covers TransportOffer/TransportAccept. Unsolicited accept fails closed                                                                                                                            |
-| **MITM**                   | Transcript signatures                       | Both parties sign transcript_hash. Verified against certificates                                                                                                                                                  |
+| **MITM**                   | Transcript signatures                       | Each signature covers a labelled digest of transcript_hash. Verified against certificates                                                                                                                         |
 | **Confidentiality**        | ECDH + HKDF derived AEAD key                | Session key never transmitted. Derived from ECDH shared secret                                                                                                                                                    |
 | **Forward Secrecy**        | Ephemeral keys on both sides                | A fresh ephemeral pair per handshake and per rekey. A later key compromise does not expose past sessions or past epochs                                                                                           |
 | **DoS**                    | 16 KiB handshake size cap                   | Reject oversized handshake messages before processing                                                                                                                                                             |

@@ -886,7 +886,7 @@ mod tests {
 	use crate::transport::handshake::processors::{TightBeamEnvelopedDataProcessor, TightBeamKariRecipient};
 	use crate::transport::handshake::tests::*;
 	use crate::transport::handshake::{
-		CmsServerIdentity, Handshake, HandshakeAlert, HandshakePhase, PeerAuthentication,
+		ClientKeyExchange, CmsServerIdentity, Handshake, HandshakeAlert, HandshakePhase, PeerAuthentication,
 	};
 
 	/// The base secret a hand-built key exchange carries.
@@ -1583,7 +1583,6 @@ mod tests {
 		let signer_spki = verifying_key.to_public_key_der()?;
 		let provider = CountingProvider::new(identity.signing_key);
 		let prehash = [0x42u8; 32];
-
 		let signed = <Cms as HandshakeFlow>::sign(&provider, &prehash).await?;
 
 		let signature = Secp256k1Signature::try_from(signed.signature.as_slice())?;
@@ -1606,7 +1605,6 @@ mod tests {
 		let closing = awaiting.sealed(&finished);
 
 		let refusal = awaiting.server.finish(closing).await;
-
 		assert!(matches!(refusal, Err(HandshakeError::ClientEphemeralIsStatic)));
 	}
 
@@ -1616,13 +1614,40 @@ mod tests {
 	async fn an_offered_certificate_whose_key_is_off_the_curve_is_refused() {
 		let mut awaiting = server_awaiting_finished().await;
 		let mut client = create_test_certificate();
+
 		put_off_curve_key(&mut client.certificate);
+
 		let finished = build_test_client_finished(&client, awaiting.transcript_hash(), &awaiting.confirmation);
 		let closing = awaiting.sealed(&finished);
 
 		let refusal = awaiting.server.finish(closing).await;
-
 		assert!(matches!(refusal, Err(HandshakeError::InvalidPublicKey(_))));
+	}
+
+	/// The container an HPKE closing travels in, as an on-path party would
+	/// send it to a CMS server.
+	fn hpke_key_exchange() -> HandshakeMessage {
+		let sealed_payload = OctetString::new([0x41u8; 32]).expect("bytes are an OCTET STRING");
+		let key_exchange = ClientKeyExchange { sealed_payload, unprotected_attrs: None };
+		HandshakeMessage::try_from(key_exchange).expect("the key exchange encodes")
+	}
+
+	/// An HPKE key exchange sent to a CMS server as its opening is refused
+	/// before any key is read.
+	#[tokio::test]
+	async fn a_cms_server_refuses_an_hpke_key_exchange_as_its_opening() {
+		let (mut server, _) = anonymous_server();
+		let refusal = server.reply(hpke_key_exchange()).await;
+		assert!(matches!(refusal, Err(HandshakeError::UnexpectedContainer)));
+	}
+
+	/// An HPKE key exchange sent to a CMS server as its closing is refused
+	/// before the server opens anything.
+	#[tokio::test]
+	async fn a_cms_server_refuses_an_hpke_key_exchange_as_its_closing() {
+		let mut awaiting = server_awaiting_finished().await;
+		let refusal = awaiting.server.finish(hpke_key_exchange()).await;
+		assert!(matches!(refusal, Err(HandshakeError::UnexpectedContainer)));
 	}
 
 	/// A key exchange that carries an abort alert is refused before any
@@ -1698,7 +1723,6 @@ mod tests {
 		let closing = awaiting.sealed(&unidentified);
 
 		let refusal = awaiting.server.finish(closing).await;
-
 		assert!(matches!(refusal, Err(HandshakeError::MissingClientCertificate)));
 	}
 

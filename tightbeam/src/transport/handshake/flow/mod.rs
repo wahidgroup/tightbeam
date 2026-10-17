@@ -212,11 +212,13 @@ pub trait ClientLegs<P: HandshakeProvider>: HandshakeFlow {
 		reply: HandshakeMessage,
 	) -> Result<ReplyIntake<Self, P>, HandshakeError>;
 
-	/// Verify the signature of the reply over `transcript_hash` under `key`.
+	/// Verify the signature of the reply under `key`, over the bytes this flow
+	/// derives from `transcript_hash`.
 	///
 	/// # Errors
 	///
 	/// - [`HandshakeError::SignatureError`] -- the HPKE signature fails to parse or to verify.
+	/// - [`HandshakeError::TranscriptDigestLength`] -- the HPKE digest gives fewer than 32 bytes.
 	/// - [`HandshakeError::SignatureVerificationFailed`] -- the CMS Finished
 	///   fails to verify, or it signs another transcript or another role.
 	fn verify_reply(
