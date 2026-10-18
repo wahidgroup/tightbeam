@@ -148,6 +148,8 @@ mod cert {
 	pub use crate::x509::time::{Time, Validity};
 	pub use crate::x509::{TbsCertificate, Version as X509Version};
 	pub use core::time::Duration;
+	pub use k256::elliptic_curve::sec1::ToEncodedPoint;
+	pub use k256::PublicKey;
 }
 
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
@@ -698,6 +700,14 @@ impl TestKey {
 		SigningKey::from_bytes(&secret_bytes.into()).expect("Failed to create signing key")
 	}
 
+	/// The signing key whose public point is the negation of the point of
+	/// `key`, so the two points share an x-coordinate and differ in y.
+	#[cfg(all(feature = "secp256k1", feature = "signature"))]
+	pub fn negation_of(key: &SigningKey) -> SigningKey {
+		let negated = -*key.as_nonzero_scalar();
+		SigningKey::from(negated)
+	}
+
 	/// The RFC 7093 §2 method 1 key identifier of the public key of
 	/// [`Self::insecure_fixed_signing`]: the leftmost 160 bits of SHA-256 of
 	/// the uncompressed point `04 1b84c556..dd078f 70beaf8f..69a8e8d1`. An
@@ -852,6 +862,18 @@ impl TestCertificate {
 	pub fn with_key_usage(certificate: Certificate, key_usage: KeyUsage) -> Certificate {
 		let replaced = TestCertificate::without_extension(certificate, KeyUsage::OID);
 		TestCertificate::with_extension(replaced, test_extension(&key_usage))
+	}
+
+	/// `certificate` with its secp256k1 key in the compressed SEC 1 form,
+	/// which names the same point (RFC 5480 §2.2).
+	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+	pub fn with_compressed_key(mut certificate: Certificate) -> Certificate {
+		let spki = &mut certificate.tbs_certificate.subject_public_key_info;
+		let point = spki.subject_public_key.as_bytes().expect("the key is whole octets");
+		let key = PublicKey::from_sec1_bytes(point).expect("the key is a secp256k1 point");
+		let compressed = key.to_encoded_point(true);
+		spki.subject_public_key = BitString::from_bytes(compressed.as_bytes()).expect("a point is a BIT STRING");
+		certificate
 	}
 
 	/// `certificate` with one non-critical `extendedKeyUsage` that names

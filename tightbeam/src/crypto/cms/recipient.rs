@@ -30,7 +30,7 @@ use crate::crypto::x509::utils::CertificateExt;
 use crate::crypto::x509::{KeyAgreement, PeerCertificate};
 use crate::der::asn1::{ObjectIdentifier, OctetString};
 use crate::der::oid::AssociatedOid;
-use crate::der::{Any, Encode};
+use crate::der::{Any, Decode, Encode};
 use crate::oids::ORI_KEM;
 use crate::random::CryptoRngCore;
 use crate::spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoRef};
@@ -73,7 +73,9 @@ pub trait RecipientKem {
 	const USAGE: KeyUsages;
 
 	/// The recipient's public key, parsed once from a SubjectPublicKeyInfo.
-	type PublicKey: Clone + Send + Sync + 'static;
+	/// [`KeyAgreementIdentity::new`] compares it with the public half of a
+	/// backend.
+	type PublicKey: Clone + PartialEq + Send + Sync + 'static;
 
 	/// The private-key operation `Decap` runs through, as a trait object a
 	/// key backend implements.
@@ -172,17 +174,18 @@ impl<K: RecipientKem> KeyAgreementIdentity<K> {
 	///
 	/// # Errors
 	///
-	/// - [`EnvelopeError::Certificate`] -- the certificate is refused for key agreement under `K`.
+	/// - [`EnvelopeError::Certificate`] -- the certificate is refused for key
+	///   agreement under `K`, or the backend's key is no key of `K`.
 	/// - [`EnvelopeError::Key`] -- the backend fails to return its public key.
-	/// - [`EnvelopeError::Encoding`] -- the certificate's SubjectPublicKeyInfo fails to encode.
-	/// - [`EnvelopeError::KeyMismatch`] -- the backend's public half differs from the certificate's key.
+	/// - [`EnvelopeError::Encoding`] -- the backend's key is no DER SubjectPublicKeyInfo.
+	/// - [`EnvelopeError::KeyMismatch`] -- the backend's key differs from the certificate's key.
 	pub fn new(certificate: impl Into<Arc<Certificate>>, key: Arc<K::PrivateKey>) -> Result<Self, EnvelopeError> {
 		let certificate = certificate.into();
 		let admitted = PeerCertificate::<KeyAgreement<K>>::own(Arc::clone(&certificate))?;
 
-		let backend = key.to_public_key_bytes()?;
-		let certified = certificate.tbs_certificate.subject_public_key_info.to_der()?;
-		if backend != certified {
+		let spki = key.to_public_key_bytes()?;
+		let backend = K::public_key(SubjectPublicKeyInfoRef::from_der(&spki)?)?;
+		if backend != admitted.key {
 			return Err(EnvelopeError::KeyMismatch);
 		}
 

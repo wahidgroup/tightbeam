@@ -17,7 +17,7 @@ use crate::crypto::x509::utils::CertificateExt;
 use crate::crypto::x509::{CertificateUse, ErasedSigning, PeerCertificate};
 use crate::der::Encode;
 use crate::frame::Signed;
-use crate::spki::{DecodePublicKey, EncodePublicKey};
+use crate::spki::DecodePublicKey;
 use crate::x509::Certificate;
 
 #[cfg(all(feature = "aead", feature = "kdf", feature = "ecdh"))]
@@ -65,7 +65,7 @@ impl SigningIdentity {
 	/// An implementor brings its own algorithm as a [`SigningProvider`] whose
 	/// signature type implements `CanonicalForm`, `SignatureEncoding`, and
 	/// `SignatureAlgorithmIdentifier`, and whose verifying key implements
-	/// `PrehashVerifier` and `DecodePublicKey`.
+	/// `PrehashVerifier`, `DecodePublicKey`, and `PartialEq`.
 	///
 	/// # Errors
 	///
@@ -75,6 +75,7 @@ impl SigningIdentity {
 	///   algorithm than `P`, or its public half is no key of `P`.
 	/// - [`SignerError::Key`] -- the provider fails to return its public key.
 	/// - [`SignerError::Encoding`] -- the certificate's SubjectPublicKeyInfo fails to encode.
+	/// - [`SignerError::PublicKey`] -- the certificate's key is no key of `P`.
 	/// - [`SignerError::KeyMismatch`] -- the key's public half differs from the certificate's.
 	pub fn with_provider<P>(
 		certificate: impl Into<Arc<Certificate>>,
@@ -82,7 +83,7 @@ impl SigningIdentity {
 	) -> Result<Self, SignerError>
 	where
 		P: SigningProvider + 'static,
-		P::VerifyingKey: DecodePublicKey,
+		P::VerifyingKey: DecodePublicKey + PartialEq,
 	{
 		let certificate = PeerCertificate::<ErasedSigning>::own(certificate)?;
 		let scheme = Scheme::of::<P>();
@@ -95,9 +96,9 @@ impl SigningIdentity {
 		// verifies, so its decode error is the refusal of the algorithm.
 		let public_key_der = key.to_public_key_bytes()?;
 		let scheme_key = P::VerifyingKey::from_public_key_der(&public_key_der);
-		scheme_key.map_err(|_| SignerError::UnsupportedAlgorithm(algorithm))?;
+		let scheme_key = scheme_key.map_err(|_| SignerError::UnsupportedAlgorithm(algorithm))?;
 
-		let sid = signer_identifier_of(certificate.certificate(), &public_key_der)?;
+		let sid = signer_identifier_of(certificate.certificate(), &scheme_key)?;
 
 		Ok(Self { certificate, key, sid, scheme })
 	}
@@ -230,17 +231,16 @@ impl<K> CertifiedKey<K> {
 	///
 	/// - [`SignerError::Certificate`] -- the certificate is refused for
 	///   signing, or its key identifier extension fails to decode.
-	/// - [`SignerError::PublicKey`] -- the key's public half fails to encode.
 	/// - [`SignerError::Encoding`] -- the certificate's SubjectPublicKeyInfo fails to encode.
+	/// - [`SignerError::PublicKey`] -- the certificate's key is no key of the verifying key's type.
 	/// - [`SignerError::KeyMismatch`] -- the key's public half differs from the certificate's.
 	pub fn new(certificate: &Certificate, key: K) -> Result<Self, SignerError>
 	where
 		K: Keypair,
-		K::VerifyingKey: EncodePublicKey,
+		K::VerifyingKey: DecodePublicKey + PartialEq,
 	{
 		ErasedSigning::parse_key(certificate)?;
-		let public_key = key.verifying_key().to_public_key_der()?;
-		let sid = signer_identifier_of(certificate, public_key.as_bytes())?;
+		let sid = signer_identifier_of(certificate, &key.verifying_key())?;
 		Ok(Self { key, sid })
 	}
 
@@ -256,19 +256,26 @@ impl<K> CertifiedKey<K> {
 	}
 }
 
-/// The `sid` of `certificate`, once `public_key_der` proves the certificate:
-/// the key's public half is the DER of its SubjectPublicKeyInfo.
+/// The `sid` of `certificate`, once `public_key` proves the certificate: the
+/// certificate's SubjectPublicKeyInfo decodes as the key `public_key` is.
 ///
 /// Both identity constructors call it, so the check and the read are one.
+/// The check compares decoded keys, so one point in either SEC 1 form (RFC
+/// 5480 §2.2) is one key.
 ///
 /// # Errors
 ///
 /// - [`SignerError::Encoding`] -- the certificate's SubjectPublicKeyInfo fails to encode.
+/// - [`SignerError::PublicKey`] -- the certificate's key is no key of the type of `public_key`.
 /// - [`SignerError::KeyMismatch`] -- the key's public half differs from the certificate's.
 /// - [`SignerError::Certificate`] -- the key identifier extension fails to decode.
-fn signer_identifier_of(certificate: &Certificate, public_key_der: &[u8]) -> Result<SignerIdentifier, SignerError> {
-	let certified = certificate.tbs_certificate.subject_public_key_info.to_der()?;
-	if public_key_der != certified.as_slice() {
+fn signer_identifier_of<V>(certificate: &Certificate, public_key: &V) -> Result<SignerIdentifier, SignerError>
+where
+	V: DecodePublicKey + PartialEq,
+{
+	let certified_der = certificate.tbs_certificate.subject_public_key_info.to_der()?;
+	let certified = V::from_public_key_der(&certified_der)?;
+	if *public_key != certified {
 		return Err(SignerError::KeyMismatch);
 	}
 

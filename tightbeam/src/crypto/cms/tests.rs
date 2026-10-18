@@ -29,7 +29,7 @@ use crate::oids::{
 };
 use crate::random::OsRng;
 use crate::spki::AlgorithmIdentifierOwned;
-use crate::testing::{unhex, EnvelopeRecipient, SeededStream, TestCertificate};
+use crate::testing::{unhex, EnvelopeRecipient, SeededStream, TestCertificate, TestKey};
 use crate::utils::marker::MaybeSendFuture;
 use crate::x509::attr::{Attribute, Attributes};
 use crate::x509::ext::pkix::{KeyUsage, KeyUsages, SubjectKeyIdentifier};
@@ -1157,6 +1157,29 @@ fn a_key_agreement_identity_refuses_a_backend_of_another_key() {
 	let other = Secp256k1SigningKey::random(&mut OsRng);
 
 	let refused = HouseIdentity::new(TestCertificate::self_signed(&key), backend_of(&other));
+	assert!(matches!(refused, Err(EnvelopeError::KeyMismatch)));
+}
+
+/// A key-agreement identity pairs a backend with a certificate that holds
+/// the backend's point in the compressed SEC 1 form, since both forms name
+/// one key (RFC 5480 §2.2).
+#[test]
+fn a_key_agreement_identity_admits_its_key_in_the_compressed_form() -> Result<(), EnvelopeError> {
+	let key = Secp256k1SigningKey::random(&mut OsRng);
+	let certificate = TestCertificate::with_compressed_key(TestCertificate::self_signed(&key));
+
+	HouseIdentity::new(certificate, backend_of(&key))?;
+	Ok(())
+}
+
+/// A key-agreement identity refuses a backend whose point is the negation of
+/// the certificate's, though the two points share an x-coordinate.
+#[test]
+fn a_key_agreement_identity_refuses_the_negation_of_its_key() {
+	let key = Secp256k1SigningKey::random(&mut OsRng);
+	let negation = TestKey::negation_of(&key);
+
+	let refused = HouseIdentity::new(TestCertificate::self_signed(&key), backend_of(&negation));
 	assert!(matches!(refused, Err(EnvelopeError::KeyMismatch)));
 }
 

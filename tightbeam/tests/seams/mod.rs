@@ -145,7 +145,7 @@ impl CanonicalForm for OutsideSignature {
 }
 
 /// The secp256k1 key that verifies a [`OutsideSignature`].
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct OutsideVerifyingKey(VerifyingKey);
 
 impl PrehashVerifier<OutsideSignature> for OutsideVerifyingKey {

@@ -249,6 +249,28 @@ fn a_certified_key_refuses_a_key_other_than_its_certificate_names() -> TestResul
 	Ok(())
 }
 
+/// A key that signs in place pairs with a certificate that holds its point
+/// in the compressed SEC 1 form, since both forms name one key (RFC 5480
+/// §2.2).
+#[test]
+fn a_certified_key_admits_its_key_in_the_compressed_form() -> TestResult {
+	let key = TestKey::insecure_fixed_signing();
+	let certificate = TestCertificate::with_compressed_key(TestCertificate::self_signed(&key));
+	CertifiedKey::new(&certificate, key)?;
+	Ok(())
+}
+
+/// A key whose point is the negation of the certificate's pairs with no
+/// certificate, though the two points share an x-coordinate.
+#[test]
+fn a_certified_key_refuses_the_negation_of_its_key() {
+	let key = TestKey::insecure_fixed_signing();
+	let certificate = TestCertificate::self_signed(&key);
+
+	let refused = CertifiedKey::new(&certificate, TestKey::negation_of(&key));
+	assert!(matches!(refused, Err(SignerError::KeyMismatch)));
+}
+
 /// Every `SignerInfo` carries the content type, the message digest, and the
 /// algorithm protection as signed attributes.
 #[test]
@@ -273,7 +295,6 @@ fn a_key_identifier_signer_is_version_3() {
 #[test]
 fn an_issuer_and_serial_signer_is_version_1() {
 	let key = issuer_and_serial_key();
-
 	let signer_info = signed_by(&key, SignedContent::data(CONTENT));
 	assert_eq!(signer_info.version, CmsVersion::V1);
 }
@@ -829,6 +850,31 @@ fn a_signing_identity_refuses_a_key_other_than_its_certificate_names() -> TestRe
 	let refused = SigningIdentity::new(certificate, provider);
 	assert!(matches!(refused, Err(SignerError::KeyMismatch)));
 	Ok(())
+}
+
+/// A signing identity pairs a key with a certificate that holds the key's
+/// point in the compressed SEC 1 form, since both forms name one key (RFC
+/// 5480 §2.2).
+#[test]
+fn a_signing_identity_admits_its_key_in_the_compressed_form() -> TestResult {
+	let key = TestKey::insecure_fixed_signing();
+	let certificate = TestCertificate::with_compressed_key(TestCertificate::self_signed(&key));
+	let provider = Arc::new(Secp256k1KeyProvider::from(key));
+
+	SigningIdentity::new(certificate, provider)?;
+	Ok(())
+}
+
+/// A key whose point is the negation of the certificate's pairs with no
+/// identity, though the two points share an x-coordinate.
+#[test]
+fn a_signing_identity_refuses_the_negation_of_its_key() {
+	let key = TestKey::insecure_fixed_signing();
+	let certificate = TestCertificate::self_signed(&key);
+	let provider = Arc::new(Secp256k1KeyProvider::from(TestKey::negation_of(&key)));
+
+	let refused = SigningIdentity::new(certificate, provider);
+	assert!(matches!(refused, Err(SignerError::KeyMismatch)));
 }
 
 /// A `SignerInfo` an identity signs names the identity's certificate.
