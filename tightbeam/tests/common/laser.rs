@@ -228,7 +228,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> EncryptedProtocol for LaserListe
 	) -> Result<(Self::Listener, Self::Address), Self::Error> {
 		let (incoming, bound) = Self::bind_airspace(addr)?;
 		let incoming = AsyncMutex::new(incoming);
-		Ok((Self { incoming, config: EndpointConfig::from(config) }, bound))
+		Ok((Self { incoming, config: EndpointConfig::try_from(config)? }, bound))
 	}
 }
 

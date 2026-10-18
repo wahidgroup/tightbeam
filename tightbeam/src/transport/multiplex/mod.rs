@@ -74,9 +74,13 @@ use crate::Frame;
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 use crate::constants::DEFAULT_HOP_BUDGET;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::crypto::x509::{KeyPurposes, PeerCertificate, Signing};
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::der::asn1::ObjectIdentifier;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::receipt::StoredReceipt;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::transport::handshake::{HandshakeProvider, HandshakeVerifyingKey};
+use crate::transport::handshake::HandshakeProvider;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::rekey::{ClientRekey, RekeyDriver, RekeyMaterials, ServerRekey};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -307,6 +311,18 @@ impl MuxRole {
 	}
 }
 
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+impl MuxRole {
+	/// The key purpose of the peer's role in `purposes`: a client's peer is a
+	/// server, and a server's peer is a client.
+	const fn peer_purpose(self, purposes: &KeyPurposes) -> ObjectIdentifier {
+		match self {
+			MuxRole::Client => purposes.server,
+			MuxRole::Server => purposes.client,
+		}
+	}
+}
+
 /// Concurrent request/response streams over one connection.
 ///
 /// Cap and cancel contracts match [`MuxHandle`]. This trait exists so the pool
@@ -393,7 +409,7 @@ impl MuxRekeyContext {
 		let encryption = state.encryption();
 		let identity = match role {
 			MuxRole::Client => encryption.client_identity.as_ref(),
-			MuxRole::Server => encryption.server_identity.as_ref(),
+			MuxRole::Server => encryption.server_identity.as_ref().map(|identity| identity.signing()),
 		};
 		let Some(identity) = identity.cloned() else {
 			return Ok(None);
@@ -403,7 +419,10 @@ impl MuxRekeyContext {
 			return Ok(None);
 		};
 
-		let peer_static = peer_certificate.verifying_key::<P::Curve>()?;
+		// The peer serves the other role, under the key purpose the handshake
+		// admitted it for.
+		let purpose = role.peer_purpose(&state.encryption().key_purposes);
+		let peer = PeerCertificate::<Signing<P>>::parse(Arc::clone(&peer_certificate), purpose)?;
 
 		// The materials detach last, so a session refused above keeps them.
 		let Some(epoch) = state.session_state_mut().take_epoch_materials() else {
@@ -411,8 +430,7 @@ impl MuxRekeyContext {
 		};
 
 		let reference_receipt = stored.receipt().clone();
-		let peer = Arc::clone(&peer_certificate);
-		let materials = RekeyMaterials::<P>::new(epoch, reference_receipt, identity, peer_static, peer);
+		let materials = RekeyMaterials::<P>::new(epoch, reference_receipt, identity, peer);
 
 		let driver = match role {
 			MuxRole::Client => {

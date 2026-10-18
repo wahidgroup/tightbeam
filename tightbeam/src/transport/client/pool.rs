@@ -27,12 +27,16 @@ use crate::transport::{EndpointConfig, TransportResult};
 use crate::utils::time::{Clock, MonotonicInstant};
 use crate::Frame;
 
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::crypto::x509::KeyPurposes;
 #[cfg(feature = "instrument")]
 use crate::instrumentation::events;
 #[cfg(feature = "instrument")]
 use crate::trace::TraceCollector;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::receipt::ReceiptApprover;
+#[cfg(feature = "transport-cms")]
+use crate::transport::handshake::ProvisionedTrust;
 #[cfg(any(feature = "instrument", pooled_mux))]
 use crate::urn::Urn;
 #[cfg(host_clock)]
@@ -138,8 +142,14 @@ impl<C: CryptoProvider> PoolTlsConfig<C> {
 		self.encryption.trust_store = Some(store);
 	}
 
-	fn set_server_certificate_chain(&mut self, chain: Arc<[Certificate]>) {
-		self.encryption.server_certificate_chain = Some(chain);
+	#[cfg(feature = "transport-cms")]
+	fn set_cms_server(&mut self, trust: ProvisionedTrust) {
+		self.encryption.cms_server = Some(trust);
+	}
+
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	fn set_key_purposes(&mut self, key_purposes: KeyPurposes) {
+		self.encryption.key_purposes = key_purposes;
 	}
 
 	fn set_handshake_protocol(&mut self, kind: HandshakeProtocolKind) {
@@ -151,18 +161,43 @@ impl<C: CryptoProvider> PoolTlsConfig<C> {
 		self.encryption.receipt_approver = Some(approver);
 	}
 
+	/// Answer this provisioning once, when the pool is built: the dialer rule,
+	/// and the key purpose of the client identity's role.
+	fn answer(self) -> PoolProvisioning<C> {
+		// A refused provisioning keeps its configuration, and each dial
+		// answers it again to return the refusal, so the error drops here.
+		match DialableEncryption::new(self.encryption.clone()) {
+			Ok(answered) => PoolProvisioning::Answered(answered),
+			Err(_) => PoolProvisioning::Refused(self.encryption),
+		}
+	}
+}
+
+/// The provisioning of a built pool, answered once.
+#[derive(Clone)]
+enum PoolProvisioning<C: CryptoProvider> {
+	/// Provisioning that answered, which every dial clones.
+	Answered(DialableEncryption<C>),
+	/// Provisioning that was refused, which each dial answers again.
+	Refused(EncryptionConfig<C>),
+}
+
+impl<C: CryptoProvider> PoolProvisioning<C> {
 	/// Returns everything that one dial from this pool is built from.
 	///
-	/// Every pool dial passes here, so this is where the pool answers the
-	/// dialer rule. Cloning the provisioning bumps refcounts, so a dial copies
-	/// no certificate.
+	/// Cloning the answered provisioning bumps refcounts.
 	///
 	/// # Errors
 	///
 	/// - [`TransportError::PeerAuthenticationUnconfigured`] -- the pool
 	///   authenticates no peer and did not name cleartext.
+	/// - [`TransportError::HandshakeError`] -- the client identity names
+	///   another key purpose than the client's.
 	fn endpoint(&self, clock: &Arc<dyn Clock>) -> TransportResult<EndpointConfig<C>> {
-		let encryption = DialableEncryption::new(self.encryption.clone())?;
+		let encryption = match self {
+			Self::Answered(answered) => answered.clone(),
+			Self::Refused(encryption) => DialableEncryption::new(encryption.clone())?,
+		};
 
 		Ok(EndpointConfig::new(encryption, Arc::clone(clock)))
 	}
@@ -238,10 +273,22 @@ impl<P: Protocol> ConnectionPoolBuilder<P> {
 		self
 	}
 
-	/// Provision the expected server certificate chain, ordered root to
-	/// leaf, shared by every pooled connection.
-	pub fn with_server_certificate_chain(mut self, chain: impl Into<Arc<[Certificate]>>) -> Self {
-		self.tls.set_server_certificate_chain(chain.into());
+	/// Provision the trust in the CMS server, built once over its two
+	/// certificates and shared by every pooled connection: the opening seals
+	/// to its key-agreement certificate, and its signing certificate verifies
+	/// the reply.
+	#[cfg(feature = "transport-cms")]
+	pub fn with_cms_server(mut self, trust: ProvisionedTrust) -> Self {
+		self.tls.set_cms_server(trust);
+		self
+	}
+
+	/// Set the key purpose of each role for every pooled connection: the
+	/// purpose the server's certificates carry, and the purpose the client
+	/// identity carries. The default is [`KeyPurposes::HOUSE`].
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	pub fn with_key_purposes(mut self, key_purposes: KeyPurposes) -> Self {
+		self.tls.set_key_purposes(key_purposes);
 		self
 	}
 
@@ -291,7 +338,7 @@ impl<P: Protocol> ConnectionBuilder<P> for ConnectionPoolBuilder<P> {
 			total_connections: Arc::new(AtomicUsize::new(0)),
 			#[cfg(pooled_mux)]
 			mux_ids: AtomicU64::new(0),
-			tls: self.tls,
+			tls: self.tls.answer(),
 			#[cfg(feature = "instrument")]
 			trace: self.trace,
 		}
@@ -408,8 +455,8 @@ pub struct ConnectionPool<P: Protocol> {
 	/// Monotonic IDs that correlate mux pool entries with their leases.
 	#[cfg(pooled_mux)]
 	mux_ids: AtomicU64,
-	/// Shared TLS assets reused across pooled connections.
-	tls: PoolTlsConfig<P::CryptoProvider>,
+	/// Shared TLS assets reused across pooled connections, answered once.
+	tls: PoolProvisioning<P::CryptoProvider>,
 	/// Production instrumentation collector, the single client-side entry
 	/// point.
 	#[cfg(feature = "instrument")]

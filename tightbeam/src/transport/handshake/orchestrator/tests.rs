@@ -185,7 +185,7 @@ async fn a_refused_reply_leaves_the_client_spent<F: TestFlow>() -> Result<(), Bo
 	let Parties { server_identity, client, server, .. } = parties::<F>(PeerAuthentication::Anonymous);
 	let mut client = Handshake::client(client);
 	let mut server = Handshake::server(server);
-	let mut other = Handshake::client(F::client(&server_identity.certificate, &create_test_certificate()));
+	let mut other = Handshake::client(F::client(&server_identity, &create_test_certificate()));
 	let stray = server.reply(other.start()?).await?;
 
 	client.start()?;
@@ -422,14 +422,14 @@ async fn a_mutual_server_refuses_a_refused_certificate<F: TestFlow>() -> Result<
 /// A pin reads no validity period, so a mutual server reads it itself and
 /// refuses an expired certificate that its pin accepts.
 async fn a_mutual_server_refuses_an_expired_certificate_its_pin_accepts<F: TestFlow>() -> Result<(), Box<dyn Error>> {
-	let server_identity = create_test_certificate();
+	let server_identity = create_test_server();
 	let client_identity = create_expired_test_certificate();
 	let pinned = [client_identity.certificate.to_owned()];
 	let pin = RuntimeCertificatePinning::<Sha3_256>::from_certificates(pinned)?;
 	let mut server_config = F::server(&server_identity);
 	server_config.peer_authentication = mutual_with(pin);
 
-	let mut client = Handshake::client(F::client(&server_identity.certificate, &client_identity));
+	let mut client = Handshake::client(F::client(&server_identity, &client_identity));
 	let mut server = Handshake::server(server_config);
 
 	let reply = server.reply(client.start()?).await?;
@@ -442,14 +442,14 @@ async fn a_mutual_server_refuses_an_expired_certificate_its_pin_accepts<F: TestF
 /// A mutual server reads the validity period before its validators, so an
 /// expired certificate that its pin also refuses is refused as expired.
 async fn a_mutual_server_reads_the_validity_period_before_its_validators<F: TestFlow>() -> Result<(), Box<dyn Error>> {
-	let server_identity = create_test_certificate();
+	let server_identity = create_test_server();
 	let client_identity = create_expired_test_certificate();
 	let pinned = [create_test_certificate().certificate];
 	let pin = RuntimeCertificatePinning::<Sha3_256>::from_certificates(pinned)?;
 	let mut server_config = F::server(&server_identity);
 	server_config.peer_authentication = mutual_with(pin);
 
-	let mut client = Handshake::client(F::client(&server_identity.certificate, &client_identity));
+	let mut client = Handshake::client(F::client(&server_identity, &client_identity));
 	let mut server = Handshake::server(server_config);
 
 	let reply = server.reply(client.start()?).await?;

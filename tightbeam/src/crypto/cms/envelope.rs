@@ -123,7 +123,7 @@ impl AuthEnvelopedData {
 	/// - [`EnvelopeError::Encryption`] -- the cipher refused the content.
 	/// - [`EnvelopeError::Encoding`] -- an attribute or a parameter fails to encode.
 	pub fn seal<P>(
-		recipient: Recipient<'_>,
+		recipient: Recipient<'_, P::Kem>,
 		content_type: ObjectIdentifier,
 		content: impl Into<Vec<u8>>,
 		auth_attrs: impl IntoIterator<Item = Attribute>,
@@ -198,7 +198,7 @@ impl AuthEnvelopedData {
 	pub async fn open<P>(
 		mut self,
 		arrived: impl AsRef<[u8]>,
-		opener: &Opener<'_>,
+		opener: &Opener<'_, P::Kem>,
 		content_type: ObjectIdentifier,
 	) -> Result<SecretSlice<u8>, EnvelopeError>
 	where

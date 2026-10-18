@@ -1003,7 +1003,7 @@ mod tests {
 	use crate::crypto::x509::error::CertificateValidationError;
 	use crate::crypto::x509::policy::CertificateValidation;
 	use crate::crypto::x509::store::{CertificateTrustBuilder, TrustBuilder};
-	use crate::crypto::x509::Certificate;
+	use crate::crypto::x509::{Certificate, ErasedSigning, PeerCertificate};
 	use crate::der::asn1::ObjectIdentifier;
 	use crate::spki::SubjectPublicKeyInfoOwned;
 	use crate::tb_cases;
@@ -1354,7 +1354,7 @@ mod tests {
 	/// which drives [`TrustVerification::Invalid`] deterministically.
 	#[derive(Debug)]
 	struct AlwaysInvalid {
-		certificate: Certificate,
+		signer: PeerCertificate<ErasedSigning>,
 	}
 
 	impl CertificateValidation for AlwaysInvalid {
@@ -1393,12 +1393,12 @@ mod tests {
 			Ok(())
 		}
 
-		fn find_by_signer_identifier(&self, _sid: &SignerIdentifier) -> Option<&Certificate> {
-			Some(&self.certificate)
+		fn find_by_signer_identifier(&self, _sid: &SignerIdentifier) -> Option<&PeerCertificate<ErasedSigning>> {
+			Some(&self.signer)
 		}
 
 		fn find_by_public_key(&self, _spki: &SubjectPublicKeyInfoOwned) -> Option<&Certificate> {
-			Some(&self.certificate)
+			Some(self.signer.certificate())
 		}
 
 		fn to_policy_ref(&self) -> &dyn VerificationPolicy {
@@ -1410,7 +1410,7 @@ mod tests {
 	/// which drives [`TrustVerification::Verified`] deterministically.
 	#[derive(Debug)]
 	struct AlwaysVerified {
-		certificate: Certificate,
+		signer: PeerCertificate<ErasedSigning>,
 	}
 
 	impl CertificateValidation for AlwaysVerified {
@@ -1451,12 +1451,12 @@ mod tests {
 			Ok(())
 		}
 
-		fn find_by_signer_identifier(&self, _sid: &SignerIdentifier) -> Option<&Certificate> {
-			Some(&self.certificate)
+		fn find_by_signer_identifier(&self, _sid: &SignerIdentifier) -> Option<&PeerCertificate<ErasedSigning>> {
+			Some(&self.signer)
 		}
 
 		fn find_by_public_key(&self, _spki: &SubjectPublicKeyInfoOwned) -> Option<&Certificate> {
-			Some(&self.certificate)
+			Some(self.signer.certificate())
 		}
 
 		fn to_policy_ref(&self) -> &dyn VerificationPolicy {
@@ -1496,7 +1496,8 @@ mod tests {
 		let identity = TestIdentity::insecure_fixed();
 		let certificate = identity.certificate().clone();
 		let signed = signed_heartbeat(&clock, &identity).await?;
-		let trust_store = Arc::new(AlwaysVerified { certificate: certificate.clone() });
+		let signer = identity.signing_certificate().clone();
+		let trust_store = Arc::new(AlwaysVerified { signer });
 		let gate = ClusterSecurityGate::new(trust_store, limits, erased(&clock));
 		let sender = SessionContext::for_peer(Arc::new(certificate));
 
@@ -1653,7 +1654,8 @@ mod tests {
 		signed.sign_with_provider(&identity).await?;
 
 		let signer_id = signer_id(&signed);
-		let trust_store = Arc::new(AlwaysInvalid { certificate: certificate.clone() });
+		let signer = identity.signing_certificate().clone();
+		let trust_store = Arc::new(AlwaysInvalid { signer });
 		let gate = ClusterSecurityGate::new(trust_store, limits(), erased(&clock));
 
 		let sender = SessionContext::for_peer(Arc::new(certificate));

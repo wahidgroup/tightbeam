@@ -14,12 +14,12 @@ use alloc::vec::Vec;
 
 use crate::cms::signed_data::{SignedData, SignerInfo};
 use crate::crypto::sign::{Signed, SigningIdentity};
+use crate::crypto::x509::{PeerCertificate, Signing};
 use crate::der::asn1::OctetString;
 use crate::der::{Decode, Encode};
 use crate::oids::DATA;
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::negotiation::{TransportAccept, TransportAuthorizer};
-use crate::transport::handshake::peer::PeerCertificate;
 use crate::transport::handshake::primitives::TranscriptHash;
 use crate::transport::handshake::receipt::{
 	ReceiptApprover, ReceiptArtifact, ReceiptRole, SessionObserver, SessionOutcome, SessionReceipt, SessionVerdict,
@@ -37,7 +37,7 @@ pub(crate) struct Settlement<'a, P: HandshakeProvider> {
 	/// The terms the handshake agreed.
 	pub(crate) terms: &'a Terms<P>,
 	/// The peer the closing admitted.
-	pub(crate) peer: &'a AdmittedPeer<P::Curve>,
+	pub(crate) peer: &'a AdmittedPeer<P>,
 	/// The authorizer that settles the countersigned receipt.
 	pub(crate) authorizer: Option<&'a dyn TransportAuthorizer>,
 	/// The observer every concluded exchange reaches.
@@ -149,10 +149,7 @@ impl IssuedReceipt {
 			None => (SessionVerdict::CountersignatureMissing, None),
 			Some(ack) => {
 				let client = peer.proven().ok_or(HandshakeError::MutualAuthRequired)?;
-				let certificate = client.certificate();
-				let key = P::VerifyingKey::from(*client.key());
-
-				let settling = receipt.settle_ack::<P::Signature, _>(Some(ack), certificate, &key, authorizer);
+				let settling = receipt.settle_ack::<P>(Some(ack), client, authorizer);
 				settling.await?
 			}
 		};
@@ -239,7 +236,7 @@ impl PendingReceipt {
 		artifact: Option<Signed<SignedData>>,
 		accept: Option<&TransportAccept>,
 		transcript_hash: &TranscriptHash,
-		server: &PeerCertificate<P::Curve>,
+		server: &PeerCertificate<Signing<P>>,
 	) -> Result<Option<Self>, HandshakeError>
 	where
 		P: HandshakeProvider,
@@ -259,8 +256,7 @@ impl PendingReceipt {
 		let signed = artifact.signer_for_role(role)?;
 		let signer = signed.ok_or(HandshakeError::ReceiptMissing)?;
 
-		let key = P::VerifyingKey::from(*server.key());
-		receipt.verify_signer::<P::Signature, _>(signer, role, server.certificate(), &key)?;
+		receipt.verify_signer::<P>(signer, role, server)?;
 
 		Ok(Some(Self { receipt, artifact }))
 	}
@@ -356,6 +352,7 @@ mod tests {
 	use super::*;
 	use crate::crypto::hash::Sha3_256;
 	use crate::crypto::profiles::DefaultCryptoProvider;
+	use crate::crypto::x509::KeyPurposes;
 	use crate::transport::handshake::tests::{
 		budget_offer, create_test_certificate, fixture_transcript, signing_identity, TestCertificate, TEST_BUDGETS,
 	};
@@ -396,7 +393,7 @@ mod tests {
 		server: &TestCertificate,
 	) -> Result<Option<PendingReceipt>, HandshakeError> {
 		let accept = budget_accept();
-		let identity = PeerCertificate::parse(server.certificate.clone());
+		let identity = PeerCertificate::parse(server.certificate.clone(), KeyPurposes::HOUSE.server);
 		let identity = identity.expect("the test certificate holds a point");
 		PendingReceipt::verify::<DefaultCryptoProvider>(Some(artifact), Some(&accept), &transcript(), &identity)
 	}

@@ -741,6 +741,7 @@ impl<T: Message> FrameBuilder<T> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::crypto::x509::KeyPurposes;
 	use crate::test_builder;
 	use crate::testing::{TestIdentity, TestKey, TestMessage};
 
@@ -911,7 +912,9 @@ mod tests {
 				.build()
 		},
 		assertions: |message, result| {
-			use crate::crypto::sign::ecdsa::Secp256k1Signature;
+			use crate::crypto::profiles::DefaultCryptoProvider;
+			use crate::crypto::x509::{PeerCertificate, Signing};
+			use crate::testing::TestCertificate;
 
 			let tightbeam = result?;
 			assert_eq!(tightbeam.version(), Version::V2);
@@ -947,9 +950,9 @@ mod tests {
 
 			// Verify the signature first, because decryption consumes the
 			// frame.
-			let signing_key = TestKey::insecure_fixed_signing();
-			let verifying_key = signing_key.verifying_key();
-			assert!(tightbeam.verify::<Secp256k1Signature>(verifying_key).is_ok());
+			let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+			let signer = PeerCertificate::<Signing<DefaultCryptoProvider>>::parse(certificate, KeyPurposes::HOUSE.signer)?;
+			assert!(tightbeam.verify(&signer).is_ok());
 
 			// The decryption also decompresses the body.
 			let (_, cipher) = TestKey::insecure_fixed_cipher();

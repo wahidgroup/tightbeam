@@ -77,14 +77,13 @@ mod handshake {
 
 	pub use crate::cms::signed_data::{SignedAttributes, SignerInfo};
 	pub use crate::crypto::hash::Digest;
-	pub use crate::crypto::sign::{
-		CanonicalForm, CmsSigner, PrehashVerifier, SignatureAlgorithmIdentifier, SignatureEncoding, SignedContent,
-		SigningIdentity,
-	};
+	pub use crate::crypto::profiles::SigningProvider;
+	pub use crate::crypto::sign::{CmsSigner, SignedContent, SigningIdentity};
+	pub use crate::crypto::x509::{PeerCertificate, Signing};
 	pub use crate::der::asn1::ObjectIdentifier;
 	pub use crate::der::{Any, Decode, Encode};
 	pub use crate::oids::{RECEIPT_ANSWER, RECEIPT_ROLE, SESSION_RECEIPT_CONTENT};
-	pub use crate::spki::DecodePublicKey;
+	pub use crate::spki::{Error as SpkiError, SubjectPublicKeyInfoRef};
 	pub use crate::transport::handshake::error::HandshakeError;
 	pub use crate::transport::handshake::negotiation::SETTLEMENT_UNSUPPORTED_CODE;
 	pub use crate::transport::handshake::primitives::TranscriptHash;
@@ -349,7 +348,7 @@ impl StoredReceipt {
 	}
 
 	/// Verify both signatures from the artifact and the two certificates
-	/// alone.
+	/// alone, each admitted for signing under the provider `P`.
 	///
 	/// This is the canonical third-party check. A holder of the server and
 	/// client certificates can confirm the agreement from the stored artifact
@@ -360,15 +359,18 @@ impl StoredReceipt {
 	///
 	/// - [`HandshakeError::ReceiptMissing`] -- the artifact holds no server signer.
 	/// - [`HandshakeError::CountersignatureMissing`] -- the artifact holds no client signer.
-	/// - [`HandshakeError::DerError`] -- a certificate's key or the receipt body fails to encode.
-	/// - [`HandshakeError::SpkiError`] -- a certificate's key does not decode as `V`.
+	/// - [`HandshakeError::DerError`] -- the receipt body fails to encode.
 	/// - [`HandshakeError::SignatureVerificationFailed`] -- a signer names
 	///   another certificate, or its signature fails to verify.
 	/// - [`HandshakeError::ReceiptMismatch`] -- the role or the answer attribute is malformed.
-	pub fn verify<S, V>(&self, server: &Certificate, client: &Certificate) -> Result<(), HandshakeError>
+	pub fn verify<P>(
+		&self,
+		server: &PeerCertificate<Signing<P>>,
+		client: &PeerCertificate<Signing<P>>,
+	) -> Result<(), HandshakeError>
 	where
-		S: CanonicalForm + SignatureEncoding + SignatureAlgorithmIdentifier,
-		V: PrehashVerifier<S> + DecodePublicKey,
+		P: SigningProvider,
+		P::VerifyingKey: for<'a> TryFrom<SubjectPublicKeyInfoRef<'a>, Error = SpkiError>,
 	{
 		let receipt = &self.receipt;
 		let server_role = ReceiptRole::Server;
@@ -377,8 +379,7 @@ impl StoredReceipt {
 			.signer_for_role(server_role)?
 			.ok_or(HandshakeError::ReceiptMissing)?;
 
-		let server_key = V::from_public_key_der(&server.tbs_certificate.subject_public_key_info.to_der()?)?;
-		receipt.verify_signer::<S, V>(server_signer, server_role, server, &server_key)?;
+		receipt.verify_signer::<P>(server_signer, server_role, server)?;
 
 		let client_role = ReceiptRole::Client;
 		let client_signer = self
@@ -386,8 +387,7 @@ impl StoredReceipt {
 			.signer_for_role(client_role)?
 			.ok_or(HandshakeError::CountersignatureMissing)?;
 
-		let client_key = V::from_public_key_der(&client.tbs_certificate.subject_public_key_info.to_der()?)?;
-		receipt.verify_signer::<S, V>(client_signer, client_role, client, &client_key)?;
+		receipt.verify_signer::<P>(client_signer, client_role, client)?;
 
 		Ok(())
 	}
@@ -646,7 +646,7 @@ impl SessionReceipt {
 	///   the role byte for byte: content type, message digest, algorithm
 	///   protection, the role, and for the client its answer.
 	/// - The `sid` must name `certificate`, and the signature must verify
-	///   under `key`, the certificate's key, over the attributes DER.
+	///   under the certificate's key, over the attributes DER.
 	///
 	/// It returns the normalized settlement answer for the client role.
 	///
@@ -657,16 +657,15 @@ impl SessionReceipt {
 	///   carriages report the same error.
 	/// - [`HandshakeError::ReceiptMismatch`] -- the answer attribute repeats,
 	///   does not carry exactly one value, or does not decode.
-	pub(crate) fn verify_signer<S, V>(
+	pub(crate) fn verify_signer<P>(
 		&self,
 		signer: &SignerInfo,
 		role: ReceiptRole,
-		certificate: &Certificate,
-		key: &V,
+		certificate: &PeerCertificate<Signing<P>>,
 	) -> Result<Option<OctetString>, HandshakeError>
 	where
-		S: CanonicalForm + SignatureEncoding + SignatureAlgorithmIdentifier,
-		V: PrehashVerifier<S>,
+		P: SigningProvider,
+		P::VerifyingKey: for<'a> TryFrom<SubjectPublicKeyInfoRef<'a>, Error = SpkiError>,
 	{
 		let receipt_der = self.to_der()?;
 		let answer = match role {
@@ -679,7 +678,7 @@ impl SessionReceipt {
 
 		// The receipt pins this session's transcript hash, so its verified
 		// signature is the key of no ledger and drops here.
-		let verified = CmsSigner::verify_signer::<S, V>(signer, certificate, key, content);
+		let verified = CmsSigner::verify_signer::<P>(signer, certificate, content);
 		verified.map(drop).map_err(|_| HandshakeError::SignatureVerificationFailed)?;
 
 		Ok(normalize_answer(answer))
@@ -850,23 +849,22 @@ impl SessionReceipt {
 	/// - A failing countersignature is still a verdict instead of an early
 	///   error, so the attempt reaches the observer as evidence.
 	/// - With no authorizer installed, the session activates once the signature verifies.
-	pub(crate) async fn settle_ack<S, V>(
+	pub(crate) async fn settle_ack<P>(
 		&self,
 		ack: Option<&SignerInfo>,
-		certificate: &Certificate,
-		verifying_key: &V,
+		certificate: &PeerCertificate<Signing<P>>,
 		authorizer: Option<&dyn TransportAuthorizer>,
 	) -> Result<(SessionVerdict, Option<OctetString>), HandshakeError>
 	where
-		S: CanonicalForm + SignatureEncoding + SignatureAlgorithmIdentifier,
-		V: PrehashVerifier<S>,
+		P: SigningProvider,
+		P::VerifyingKey: for<'a> TryFrom<SubjectPublicKeyInfoRef<'a>, Error = SpkiError>,
 	{
 		let Some(ack) = ack else {
 			return Ok((SessionVerdict::CountersignatureMissing, None));
 		};
 
 		let client_role = ReceiptRole::Client;
-		let verified = self.verify_signer::<S, V>(ack, client_role, certificate, verifying_key);
+		let verified = self.verify_signer::<P>(ack, client_role, certificate);
 		// A bad signature and a malformed answer attribute are peer faults, so
 		// they settle into a verdict. Any other error is local and propagates.
 		let answer = match verified {
@@ -1026,9 +1024,11 @@ mod tests {
 		use super::*;
 		use crate::cms::content_info::CmsVersion;
 		use crate::cms::signed_data::SignerInfo;
-		use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey, Secp256k1VerifyingKey};
+		use crate::crypto::profiles::DefaultCryptoProvider;
+		use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 		use crate::crypto::sign::{Signed, SigningIdentity};
 		use crate::crypto::x509::utils::CertificateExt;
+		use crate::crypto::x509::KeyPurposes;
 		use crate::der::asn1::SetOfVec;
 		use crate::oids::{ATTR_CMS_ALGORITHM_PROTECTION, ATTR_CONTENT_TYPE, ATTR_MESSAGE_DIGEST};
 		use crate::random::OsRng;
@@ -1036,18 +1036,20 @@ mod tests {
 		use crate::x509::attr::Attribute;
 		use crate::x509::Certificate;
 
-		/// One party to a receipt: its signing identity and its verifying key.
+		/// One party to a receipt: its signing identity, and its certificate
+		/// as a verifier admits it for signing.
 		struct Party {
 			identity: SigningIdentity,
-			key: Secp256k1VerifyingKey,
+			signer: PeerCertificate<Signing<DefaultCryptoProvider>>,
 		}
 
 		impl Party {
 			/// A party of a fresh key, under the test certificate of that key.
 			fn fresh() -> Self {
-				let signing_key = Secp256k1SigningKey::random(&mut OsRng);
-				let key = *signing_key.verifying_key();
-				Self { identity: TestIdentity::of(&signing_key), key }
+				let identity = TestIdentity::of(&Secp256k1SigningKey::random(&mut OsRng));
+				let signer = PeerCertificate::parse(identity.certificate_arc(), KeyPurposes::HOUSE.signer);
+				let signer = signer.expect("the test certificate is admitted for signing");
+				Self { identity, signer }
 			}
 
 			fn certificate(&self) -> &Certificate {
@@ -1088,7 +1090,7 @@ mod tests {
 		#[tokio::test]
 		async fn dual_signed_artifact_verifies() -> Result<(), HandshakeError> {
 			let (stored, server, client) = dual_signed(Some(b"preimage")).await?;
-			stored.verify::<Secp256k1Signature, Secp256k1VerifyingKey>(server.certificate(), client.certificate())?;
+			stored.verify(&server.signer, &client.signer)?;
 
 			let answer = stored.ancillary_response().map(OctetString::as_bytes);
 			assert_eq!(answer, Some(b"preimage".as_slice()));
@@ -1117,7 +1119,6 @@ mod tests {
 		#[tokio::test]
 		async fn a_receipt_signer_is_version_3_under_its_key_identifier() -> Result<(), HandshakeError> {
 			let (_, artifact, server) = server_signed(None).await?;
-
 			let signer = artifact
 				.signer_for_role(ReceiptRole::Server)?
 				.ok_or(HandshakeError::ReceiptMissing)?;
@@ -1138,13 +1139,7 @@ mod tests {
 				.ok_or(HandshakeError::ReceiptMissing)?;
 
 			let downgraded = SignerInfo { version: CmsVersion::V1, ..signer.clone() };
-			let refused = receipt.verify_signer::<Secp256k1Signature, _>(
-				&downgraded,
-				ReceiptRole::Server,
-				server.certificate(),
-				&server.key,
-			);
-
+			let refused = receipt.verify_signer(&downgraded, ReceiptRole::Server, &server.signer);
 			assert!(matches!(refused, Err(HandshakeError::SignatureVerificationFailed)));
 			Ok(())
 		}
@@ -1163,8 +1158,7 @@ mod tests {
 		#[tokio::test]
 		async fn swapped_certificates_fail_verification() -> Result<(), HandshakeError> {
 			let (stored, server, client) = dual_signed(None).await?;
-			let verifying = StoredReceipt::verify::<Secp256k1Signature, Secp256k1VerifyingKey>;
-			let swapped = verifying(&stored, client.certificate(), server.certificate());
+			let swapped = stored.verify(&client.signer, &server.signer);
 			assert!(matches!(swapped, Err(HandshakeError::SignatureVerificationFailed)));
 			Ok(())
 		}
@@ -1176,12 +1170,7 @@ mod tests {
 			let server_signer = artifact.signer_for_role(server_role)?.ok_or(HandshakeError::ReceiptMissing)?;
 			let client_role = ReceiptRole::Client;
 
-			let spliced = receipt.verify_signer::<Secp256k1Signature, _>(
-				server_signer,
-				client_role,
-				server.certificate(),
-				&server.key,
-			);
+			let spliced = receipt.verify_signer(server_signer, client_role, &server.signer);
 			assert!(matches!(spliced, Err(HandshakeError::SignatureVerificationFailed)));
 			Ok(())
 		}
@@ -1232,7 +1221,7 @@ mod tests {
 		#[tokio::test]
 		async fn empty_answer_countersigns_as_absent() -> Result<(), HandshakeError> {
 			let (stored, server, client) = dual_signed(Some(b"")).await?;
-			stored.verify::<Secp256k1Signature, Secp256k1VerifyingKey>(server.certificate(), client.certificate())?;
+			stored.verify(&server.signer, &client.signer)?;
 			assert_eq!(stored.ancillary_response(), None);
 			Ok(())
 		}
@@ -1251,9 +1240,7 @@ mod tests {
 			forged[last] ^= 0x01;
 			ack.signature = OctetString::new(forged)?;
 
-			let (verdict, answer) = receipt
-				.settle_ack::<Secp256k1Signature, _>(Some(&ack), client.certificate(), &client.key, None)
-				.await?;
+			let (verdict, answer) = receipt.settle_ack(Some(&ack), &client.signer, None).await?;
 			assert!(matches!(verdict, SessionVerdict::CountersignatureInvalid));
 			assert!(answer.is_none());
 			Ok(())
@@ -1288,9 +1275,7 @@ mod tests {
 
 			with_two_answer_values(&mut ack);
 
-			let (verdict, answer) = receipt
-				.settle_ack::<Secp256k1Signature, _>(Some(&ack), client.certificate(), &client.key, None)
-				.await?;
+			let (verdict, answer) = receipt.settle_ack(Some(&ack), &client.signer, None).await?;
 			assert!(matches!(verdict, SessionVerdict::CountersignatureInvalid));
 			assert!(answer.is_none());
 			Ok(())

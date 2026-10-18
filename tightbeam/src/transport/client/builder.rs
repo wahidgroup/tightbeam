@@ -20,10 +20,13 @@ use crate::transport::EndpointConfig;
 use crate::transport::MessageEmitter;
 use crate::transport::{MessageCollector, Protocol, TransportResult};
 use crate::utils::time::Clock;
-use crate::x509::Certificate;
 
 #[cfg(feature = "std")]
 use crate::crypto::sign::SigningIdentity;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::crypto::x509::KeyPurposes;
+#[cfg(feature = "transport-cms")]
+use crate::transport::handshake::ProvisionedTrust;
 #[cfg(feature = "std")]
 use crate::transport::ConnectionBuilder;
 #[cfg(host_clock)]
@@ -189,10 +192,21 @@ impl<P: Protocol> ClientBuilder<P> {
 		self
 	}
 
-	/// Provision the expected server certificate chain, ordered root to
-	/// leaf, for key-transport handshakes (CMS).
-	pub fn with_server_certificate_chain(mut self, chain: impl Into<Arc<[Certificate]>>) -> Self {
-		self.encryption.server_certificate_chain = Some(chain.into());
+	/// Provision the trust in the CMS server, built once over its two
+	/// certificates: the opening seals to its key-agreement certificate, and
+	/// its signing certificate verifies the reply.
+	#[cfg(feature = "transport-cms")]
+	pub fn with_cms_server(mut self, trust: ProvisionedTrust) -> Self {
+		self.encryption.cms_server = Some(trust);
+		self
+	}
+
+	/// Set the key purpose of each role: the purpose the server's
+	/// certificates carry, and the purpose the client identity carries. The
+	/// default is [`KeyPurposes::HOUSE`].
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	pub fn with_key_purposes(mut self, key_purposes: KeyPurposes) -> Self {
+		self.encryption.key_purposes = key_purposes;
 		self
 	}
 

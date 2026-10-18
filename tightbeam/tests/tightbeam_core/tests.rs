@@ -9,12 +9,14 @@
 use tightbeam::builder::{FrameBuilder, TypeBuilder};
 use tightbeam::crypto::aead::{Aes256Gcm, Key, KeyInit};
 use tightbeam::crypto::hash::Sha3_256;
-use tightbeam::crypto::sign::ecdsa::{Secp256k1, Secp256k1Signature, Secp256k1SigningKey, VerifyingKey};
+use tightbeam::crypto::profiles::DefaultCryptoProvider;
+use tightbeam::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
+use tightbeam::crypto::x509::{KeyPurposes, PeerCertificate, Signing};
 use tightbeam::der::ValueOrd;
 use tightbeam::prelude::*;
 use tightbeam::testing::assertions::Presence;
 use tightbeam::testing::macros::{IsNone, IsSome};
-use tightbeam::testing::{ScenarioConfig, SetupEnv, TestIdentity};
+use tightbeam::testing::{ScenarioConfig, SetupEnv, TestCertificate, TestIdentity};
 use tightbeam::urn::Urn;
 use tightbeam::utils;
 use tightbeam::{exactly, tb_assert_spec, tb_scenario, TightBeamError};
@@ -69,15 +71,15 @@ tightbeam::flagset!(TestFlagSet: FlagTestDevelopmentMode, FlagTestDebugLevel);
 struct TestCrypto {
 	cipher: Aes256Gcm,
 	signing_key: Secp256k1SigningKey,
-	verifying_key: VerifyingKey<Secp256k1>,
+	signer: PeerCertificate<Signing<DefaultCryptoProvider>>,
 }
 
 fn build_crypto(seed: u8) -> Result<TestCrypto, TightBeamError> {
 	let key_bytes = [seed; 32];
 	let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key_bytes));
 	let signing_key = Secp256k1SigningKey::from_bytes(&key_bytes.into())?;
-	let verifying_key = *signing_key.verifying_key();
-	Ok(TestCrypto { cipher, signing_key, verifying_key })
+	let signer = PeerCertificate::parse(TestCertificate::self_signed(&signing_key), KeyPurposes::HOUSE.signer)?;
+	Ok(TestCrypto { cipher, signing_key, signer })
 }
 
 /// Build a test frame for the given version with appropriate capabilities
@@ -206,9 +208,9 @@ tb_scenario! {
 			trace.event_with(ROUNDTRIP_OK, &["v0"], v0_roundtrip == message)?;
 
 			// V1+ signature checks (before decrypt, which consumes the frame)
-			trace.event_with(SIG_VALID, &["v1"], v1_frame.verify::<Secp256k1Signature>(&crypto.verifying_key).is_ok())?;
-			trace.event_with(SIG_VALID, &["v2"], v2_frame.verify::<Secp256k1Signature>(&crypto.verifying_key).is_ok())?;
-			trace.event_with(SIG_VALID, &["v3"], v3_frame.verify::<Secp256k1Signature>(&crypto.verifying_key).is_ok())?;
+			trace.event_with(SIG_VALID, &["v1"], v1_frame.verify(&crypto.signer).is_ok())?;
+			trace.event_with(SIG_VALID, &["v2"], v2_frame.verify(&crypto.signer).is_ok())?;
+			trace.event_with(SIG_VALID, &["v3"], v3_frame.verify(&crypto.signer).is_ok())?;
 
 			// V1+ integrity checks (before decrypt)
 			let v1_integrity = v1_frame.metadata().integrity().ok_or(TightBeamError::MissingDigestInfo)?;

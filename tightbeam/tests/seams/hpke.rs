@@ -11,6 +11,7 @@ use tightbeam::crypto::aead::DecryptContent;
 use tightbeam::crypto::secret::ToInsecure;
 use tightbeam::crypto::sign::SigningIdentity;
 use tightbeam::crypto::x509::policy::{DirectTrustValidator, ExpiryValidator};
+use tightbeam::crypto::x509::KeyPurposes;
 use tightbeam::oids::{HASH_SHA3_512, SIGNER_ECDSA_WITH_SHA3_512};
 use tightbeam::transport::handshake::negotiation::RunnableProfile;
 use tightbeam::transport::handshake::{
@@ -37,12 +38,16 @@ fn outside_pair(
 	let pinned = DirectTrustValidator::default().with_trust_chain([server.certificate().to_owned()]);
 	let mut settings = HpkeClientSettings::new(LearnedTrust::new(pinned));
 	settings.identity = identity;
-	let mut client = ClientConfig::<Hpke, OutsideProvider>::new(settings);
+	let client = ClientConfig::<Hpke, OutsideProvider>::new(settings, KeyPurposes::HOUSE);
+	let mut client = client.expect("an outside client identity serves the client role");
 	client.profiles = outside_policy();
 
 	let native = RunnableProfile::<OutsideProvider>::native().descriptor();
 	let profiles = SupportedProfiles::from(native);
-	let mut server_config = ServerConfig::<Hpke, OutsideProvider>::new(HpkeServerSettings::new(), server, profiles);
+	let server_settings = HpkeServerSettings::new();
+	let purposes = KeyPurposes::HOUSE;
+	let server_config = ServerConfig::<Hpke, OutsideProvider>::new(server_settings, server, profiles, purposes);
+	let mut server_config = server_config.expect("an outside server identity serves the server role");
 	server_config.policy = outside_policy();
 	server_config.peer_authentication = peer_authentication;
 	(Handshake::client(client), Handshake::server(server_config))

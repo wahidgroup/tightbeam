@@ -86,6 +86,22 @@ pub enum HandshakeError {
 	#[error("Missing client certificate")]
 	MissingClientCertificate,
 
+	/// The signing and the key-agreement certificate of a CMS server name
+	/// two subjects.
+	#[error("The two server certificates name two subjects")]
+	SubjectMismatch,
+
+	/// The two provisioned certificates of a CMS server chain to two trust
+	/// anchors.
+	#[error("The two server certificates chain to two trust anchors")]
+	AnchorMismatch,
+
+	/// The signing and the key-agreement certificate of a CMS server hold one
+	/// key, which would serve two purposes (NIST SP 800-57 Part 1 Rev. 5
+	/// §5.2).
+	#[error("The two server certificates hold one key")]
+	KeyReuse,
+
 	/// A digest output lies outside the widths the handshake admits for a
 	/// transcript hash and a key-confirmation tag, `min` to `max` bytes.
 	/// `received` is the width of the output, in bytes.

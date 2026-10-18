@@ -77,7 +77,7 @@ pub(crate) const SETTLE_NEVER_FIRED: Urn<'static> =
 	tightbeam::urn!("test", "event:settlement-ordering/settle-never-fired");
 
 use crate::common::security::{
-	contains_window, default_security_profile, flip_sealed_content, hpke_client_config, hpke_server_config,
+	contains_window, default_security_profile, flip_sealed_content, hpke_client_config_presenting, hpke_server_config,
 	pinning_validator, ClientMaterials, PayingApprover, ServerMaterials, SettleSpyAuthorizer,
 };
 
@@ -110,8 +110,8 @@ tb_scenario! {
 			let client_materials = ClientMaterials::deterministic();
 			let client_identity = client_materials.identity();
 
-			let mut config = hpke_client_config::<DefaultCryptoProvider>(pinning_validator(&materials.certificate));
-			config.flow.identity = Some(client_identity);
+			let validator = pinning_validator(&materials.certificate);
+			let mut config = hpke_client_config_presenting::<DefaultCryptoProvider>(validator, client_identity);
 			config.security_offer = Some(SecurityOffer::new(vec![profile]));
 			config.transport_offer = Some(TransportOffer::mux(4).with_budgets(REQUEST));
 			config.receipt_approver = Some(Arc::new(PayingApprover::answering(RESPONSE)?));

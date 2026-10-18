@@ -261,6 +261,9 @@ where
 /// - [`SignatureVerification::verify_with_policy`]: single-certificate validity,
 ///   algorithm-identifier consistency (RFC 5280 §4.1.1.2), and signature
 ///   verification against a caller-supplied issuer key (RFC 5280 §6.1.3(a)(1)).
+/// - Both refuse a certificate that repeats an extension or bears a critical
+///   extension the crate does not process (RFC 5280 §4.2), as path validation
+///   does.
 ///
 /// See <https://datatracker.ietf.org/doc/html/rfc5280#section-6.1>.
 #[derive(Default, Clone)]
@@ -283,6 +286,11 @@ impl CertificateValidation for DirectTrustValidator {
 	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
 		// RFC 5280 §6.1.3(a)(2): the certificate must be within its validity period.
 		cert.validate_expiry()?;
+
+		// RFC 5280 §4.2: a repeated extension, or an unprocessed critical one,
+		// fails closed.
+		cert.ensure_unique_extensions()?;
+		cert.ensure_critical_extensions_processed()?;
 
 		// RFC 5280 §6.1.1: direct trust - the presented certificate must itself
 		// be a configured trust anchor (no path building is performed here).
@@ -309,6 +317,8 @@ impl SignatureVerification for DirectTrustValidator {
 		policy: &dyn VerificationPolicy,
 	) -> Result<(), CertificateValidationError> {
 		cert.validate_expiry_at(curr_time)?;
+		cert.ensure_unique_extensions()?;
+		cert.ensure_critical_extensions_processed()?;
 
 		// RFC 5280 §4.1.2.7: the subjectPublicKeyInfo must carry a key.
 		let subject_public_key = cert.tbs_certificate.subject_public_key_info.subject_public_key.raw_bytes();
@@ -466,6 +476,60 @@ mod tests {
 			assert!(matches!(
 				verify(&key, &cert),
 				Err(CertificateValidationError::UnsupportedAlgorithm(_))
+			));
+		}
+
+		/// [`test_cert`] carrying the extension `oid` twice.
+		fn with_repeated(oid: &str) -> Certificate {
+			let extension = TestCertificate::opaque_extension(oid, false);
+			let cert = TestCertificate::with_extension(test_cert(), extension.clone());
+			TestCertificate::with_extension(cert, extension)
+		}
+
+		/// [`test_cert`] carrying `nameConstraints`, which the crate does not
+		/// process, as a critical extension.
+		fn with_unknown_critical() -> Certificate {
+			let extension = TestCertificate::opaque_extension("2.5.29.30", true);
+			TestCertificate::with_extension(test_cert(), extension)
+		}
+
+		/// An anchor that repeats an extension is refused, so the anchor
+		/// match does not stand in for the extension rules (RFC 5280 §4.2).
+		#[test]
+		fn evaluate_refuses_an_anchor_that_repeats_an_extension() {
+			let cert = with_repeated("2.5.29.30");
+			let validator = DirectTrustValidator::default().with_trust_chain([cert.clone()]);
+
+			let refused = validator.evaluate(&cert);
+			assert!(matches!(refused, Err(CertificateValidationError::DuplicateExtension(_))));
+		}
+
+		#[test]
+		fn evaluate_refuses_an_anchor_with_an_unknown_critical_extension() {
+			let cert = with_unknown_critical();
+			let validator = DirectTrustValidator::default().with_trust_chain([cert.clone()]);
+
+			let refused = validator.evaluate(&cert);
+			assert!(matches!(
+				refused,
+				Err(CertificateValidationError::UnprocessedCriticalExtension(_))
+			));
+		}
+
+		#[test]
+		fn verify_refuses_a_certificate_that_repeats_an_extension() {
+			let key = TestKey::insecure_fixed_signing();
+			let refused = verify(&key, &with_repeated("2.5.29.30"));
+			assert!(matches!(refused, Err(CertificateValidationError::DuplicateExtension(_))));
+		}
+
+		#[test]
+		fn verify_refuses_a_certificate_with_an_unknown_critical_extension() {
+			let key = TestKey::insecure_fixed_signing();
+			let refused = verify(&key, &with_unknown_critical());
+			assert!(matches!(
+				refused,
+				Err(CertificateValidationError::UnprocessedCriticalExtension(_))
 			));
 		}
 	}

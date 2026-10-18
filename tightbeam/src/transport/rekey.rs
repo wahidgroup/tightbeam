@@ -58,8 +58,8 @@ use crate::cms::signed_data::SignedData;
 use crate::constants::EC_PUBKEY_COMPRESSED_SIZE;
 use crate::crypto::aead::{DirectionalCiphers, RecvCipher, SendCipher, SessionKeys};
 use crate::crypto::sign::elliptic_curve::ecdh::EphemeralSecret;
-use crate::crypto::sign::elliptic_curve::PublicKey;
 use crate::crypto::sign::{Signed, SigningIdentity};
+use crate::crypto::x509::{PeerCertificate, Signing};
 use crate::der::asn1::OctetString;
 use crate::der::Encode;
 use crate::random::{generate_nonce, OsRng};
@@ -84,9 +84,10 @@ use crate::x509::Certificate;
 ///
 /// - the epoch secret chain,
 /// - the initial receipt terms, which are the credit-match reference,
-/// - the local signing identity,
-/// - the peer's static key, which each rekey ephemeral is parsed beside, and
-/// - the peer's verified receipt identity.
+/// - the local signing identity, and
+/// - the peer's certificate, admitted for signing, whose key verifies the
+///   peer's receipt signatures and which each rekey ephemeral is parsed
+///   beside.
 ///
 /// The provider's cipher type names the AEAD, and its curve the agreement.
 pub(crate) struct RekeyMaterials<P>
@@ -96,9 +97,7 @@ where
 	epoch: EpochMaterials,
 	reference: SessionReceipt,
 	identity: SigningIdentity,
-	peer_static: PublicKey<P::Curve>,
-	peer_verifying_key: P::VerifyingKey,
-	peer_certificate: Arc<Certificate>,
+	peer: PeerCertificate<Signing<P>>,
 }
 
 /// Fresh per-direction state produced by a completed exchange.
@@ -124,20 +123,18 @@ impl<P> RekeyMaterials<P>
 where
 	P: HandshakeProvider,
 {
-	/// Materials for a session whose peer presented `peer_certificate`, which
-	/// holds the static key `peer_static`.
+	/// Materials for a session whose peer presented `peer`.
 	///
-	/// The key that verifies the peer's receipt signatures comes from the
-	/// same point, so the two cannot name different peers.
+	/// The key that verifies the peer's receipt signatures and the key each
+	/// rekey ephemeral is compared with are the one key of `peer`, so the two
+	/// cannot name different peers.
 	pub(crate) fn new(
 		epoch: EpochMaterials,
 		reference: SessionReceipt,
 		identity: SigningIdentity,
-		peer_static: PublicKey<P::Curve>,
-		peer_certificate: Arc<Certificate>,
+		peer: PeerCertificate<Signing<P>>,
 	) -> Self {
-		let peer_verifying_key = P::VerifyingKey::from(peer_static);
-		Self { epoch, reference, identity, peer_static, peer_verifying_key, peer_certificate }
+		Self { epoch, reference, identity, peer }
 	}
 
 	/// The current epoch number.
@@ -270,12 +267,7 @@ where
 		let receipt = artifact.receipt()?;
 		let server_role = ReceiptRole::Server;
 		let server_signer = artifact.signer_for_role(server_role)?.ok_or(HandshakeError::ReceiptMissing)?;
-		receipt.verify_signer::<P::Signature, _>(
-			server_signer,
-			server_role,
-			&self.materials.peer_certificate,
-			&self.materials.peer_verifying_key,
-		)?;
+		receipt.verify_signer::<P>(server_signer, server_role, &self.materials.peer)?;
 
 		let epoch = &self.materials.epoch;
 		let challenge_hash = epoch.exchange_pin::<P::Digest>(&request_der, &server_random, &server_point)?;
@@ -287,7 +279,7 @@ where
 		// The receipt the server signed pins its ephemeral, so the point is
 		// authenticated here. The agreement takes the scalar by value and runs
 		// before the approver is awaited, so no await of this step holds it.
-		let server_ephemeral = self.materials.peer_static.server_ephemeral(&server_point)?;
+		let server_ephemeral = self.materials.peer.server_ephemeral(&server_point)?;
 		let salt = RandomsSalt::new(&client_random, &server_random);
 		let next_secret = epoch.secret.next::<P>(ephemeral, &server_ephemeral, salt.as_kdf_salt())?;
 
@@ -398,7 +390,7 @@ where
 		let request_der = request.to_der()?;
 		let client_random = request.client_random.to_32_byte_array()?;
 		let client_point = request.client_ephemeral.to_byte_array::<EC_PUBKEY_COMPRESSED_SIZE>()?;
-		let client_ephemeral = self.materials.peer_static.client_ephemeral(&client_point)?;
+		let client_ephemeral = self.materials.peer.client_ephemeral(&client_point)?;
 		let server_random = generate_nonce::<32>(None)?;
 
 		// The agreement takes the scalar by value and runs before the first
@@ -476,12 +468,7 @@ where
 
 		let (verdict, ancillary_response) = pending
 			.receipt
-			.settle_ack::<P::Signature, _>(
-				countersignature.as_deref(),
-				&self.materials.peer_certificate,
-				&self.materials.peer_verifying_key,
-				self.authorizer.as_deref(),
-			)
+			.settle_ack::<P>(countersignature.as_deref(), &self.materials.peer, self.authorizer.as_deref())
 			.await?;
 
 		let countersignature_der = countersignature.as_ref().map(Encode::to_der).transpose()?;
@@ -661,9 +648,11 @@ pub(crate) mod tests {
 	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::crypto::sign::ecdsa::k256::Secp256k1;
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
+	use crate::crypto::sign::elliptic_curve::PublicKey;
+	use crate::crypto::x509::KeyPurposes;
 	use crate::oids::HASH_SHA3_256;
 	use crate::random::OsRng;
-	use crate::testing::TestIdentity;
+	use crate::testing::{TestCertificate, TestIdentity};
 	use crate::transport::handshake::negotiation::MuxBudgets;
 	use crate::transport::handshake::primitives::KdfSalt;
 	use crate::transport::handshake::tests::{fixture_handshake_secret, fixture_transcript, off_curve_point};
@@ -688,9 +677,12 @@ pub(crate) mod tests {
 	}
 
 	impl Identity {
-		/// A shared handle to the certificate the party presents.
-		fn certificate(&self) -> Arc<Certificate> {
-			self.signing.certificate_arc()
+		/// The certificate the party presents, admitted for signing as its
+		/// peer holds it.
+		fn peer(&self) -> PeerCertificate<Signing<Provider>> {
+			let certificate = self.signing.certificate_arc();
+			let peer = PeerCertificate::parse(certificate, KeyPurposes::HOUSE.server);
+			peer.expect("a test identity's certificate is admitted for signing")
 		}
 	}
 
@@ -716,10 +708,12 @@ pub(crate) mod tests {
 		point_of(&fresh_ephemeral().public_key())
 	}
 
-	/// A static key that no point of a test equals, for the parse that admits
-	/// a peer point to an agreement.
-	fn peer_static() -> PublicKey<Secp256k1> {
-		fresh_ephemeral().public_key()
+	/// A peer certificate whose key no point of a test equals, for the parse
+	/// that admits a peer point to an agreement.
+	fn peer_static() -> PeerCertificate<Signing<Provider>> {
+		let certificate = TestCertificate::self_signed(&Secp256k1SigningKey::random(&mut OsRng));
+		let peer = PeerCertificate::parse(certificate, KeyPurposes::HOUSE.server);
+		peer.expect("a fresh certificate is admitted for signing")
 	}
 
 	/// [`SAMPLE_CHAIN_ROOT`] as the chain hash an epoch holds.
@@ -756,13 +750,7 @@ pub(crate) mod tests {
 		let identity = test_identity()?;
 		let peer = test_identity()?;
 		let reference = sample_reference(SAMPLE_CREDIT_UNIT)?;
-		Ok(RekeyMaterials::new(
-			epoch,
-			reference,
-			identity.signing,
-			peer.public_key,
-			peer.certificate(),
-		))
+		Ok(RekeyMaterials::new(epoch, reference, identity.signing, peer.peer()))
 	}
 
 	/// The SHA3-256 `DigestInfo` a receipt carries for `hash`.
@@ -799,15 +787,13 @@ pub(crate) mod tests {
 			sample_epoch()?,
 			reference.to_owned(),
 			client_identity.signing.clone(),
-			server_identity.public_key,
-			server_identity.certificate(),
+			server_identity.peer(),
 		);
 		let server_materials = RekeyMaterials::new(
 			sample_epoch()?,
 			reference,
 			server_identity.signing.clone(),
-			client_identity.public_key,
-			client_identity.certificate(),
+			client_identity.peer(),
 		);
 
 		let client = ClientRekey::new(client_materials, None);

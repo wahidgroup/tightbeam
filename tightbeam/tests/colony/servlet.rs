@@ -10,14 +10,16 @@ use tightbeam::{
 		aead::{Aes256Gcm, KeyInit},
 		common::Key,
 		hash::Sha3_256,
-		sign::ecdsa::{Secp256k1Signature, Secp256k1VerifyingKey},
+		profiles::DefaultCryptoProvider,
+		sign::ecdsa::Secp256k1Signature,
+		x509::{KeyPurposes, PeerCertificate, Signing},
 	},
 	decode,
 	der::Sequence,
 	exactly,
 	policy::{GatePolicy, SessionContext, TransitStatus},
 	servlet, tb_assert_spec, tb_scenario,
-	testing::{ClientEnv, ServletEnv, SetupEnv, TestIdentity, TestKey},
+	testing::{ClientEnv, ServletEnv, SetupEnv, TestCertificate, TestIdentity, TestKey},
 	transport::{tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder},
 	urn::Urn,
 	worker, Beamable, Frame, TightBeamError,
@@ -200,7 +202,7 @@ fn shared_cipher() -> Aes256Gcm {
 /// Verifies nonrepudiation over the wire frame -- still ciphertext -- before
 /// the typed prologue decrypts it in place.
 struct SignatureGate {
-	verifying_key: Secp256k1VerifyingKey,
+	signer: PeerCertificate<Signing<DefaultCryptoProvider>>,
 }
 
 impl GatePolicy for SignatureGate {
@@ -209,7 +211,7 @@ impl GatePolicy for SignatureGate {
 			return TransitStatus::PermissionDenied;
 		};
 
-		if frame.verify::<Secp256k1Signature>(&self.verifying_key).is_ok() {
+		if frame.verify(&self.signer).is_ok() {
 			TransitStatus::Ok
 		} else {
 			TransitStatus::PermissionDenied
@@ -263,10 +265,10 @@ tb_scenario! {
 		},
 		start: |SetupEnv { trace, context: config }| async move {
 			let trace = Arc::new(trace);
-			let verifying_key = *TestKey::insecure_fixed_signing().verifying_key();
+			let signer = PeerCertificate::parse(TestCertificate::self_signed(&TestKey::insecure_fixed_signing()), KeyPurposes::HOUSE.signer)?;
 			let servlet_conf = ServletConfig::<TokioListener, CalcRequest>::builder()
 				.with_config(config)
-				.with_collector_gate(SignatureGate { verifying_key })
+				.with_collector_gate(SignatureGate { signer })
 				.with_message_decryptor(shared_cipher())
 				.with_message_inflator(ZstdCompression::default())
 				.allow_cleartext()

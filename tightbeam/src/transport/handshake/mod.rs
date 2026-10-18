@@ -57,13 +57,13 @@
 //! inputs are:
 //!
 //! - the ECDH output of the client's ephemeral and the server's ephemeral, and
-//! - in the CMS flow, the base secret the client seals to the server's certificate key.
+//! - in the CMS flow, the base secret the client seals to the server's key-agreement certificate.
 //!
 //! The server signs its ephemeral inside the transcript, and both ephemeral
 //! private keys drop at the step that consumes them. A recording plus a later
-//! copy of a server's static key therefore recovers the CMS base secret alone,
-//! and nothing of an HPKE session, whose server key only signs. These need the
-//! ECDH output, which needs a private key neither side kept:
+//! copy of the server's static keys recovers the CMS base secret alone, which
+//! the key-agreement key opens, and no HPKE secret. These need the ECDH
+//! output, which needs a private key neither side kept:
 //!
 //! - the traffic keys and the rekey epochs,
 //! - the sealed receipt acknowledgement, and
@@ -189,6 +189,7 @@ pub(crate) use std::sync::Arc;
 
 mod attributes;
 mod error;
+mod identity;
 mod peer;
 mod schedule;
 
@@ -208,6 +209,7 @@ pub mod receipt;
 pub use crate::crypto::aead::DirectionalCiphers;
 pub use attributes::HandshakeAttribute;
 pub use error::HandshakeError;
+pub use identity::ServerIdentity;
 pub use peer::PeerAuthentication;
 pub use schedule::EpochMaterials;
 
@@ -217,6 +219,8 @@ pub use flow::{ClientFlow, ServerFlow};
 pub use flow::{Cms, CmsClientSettings, CmsServerSettings};
 #[cfg(feature = "transport-hpke")]
 pub use flow::{Hpke, HpkeClientSettings, HpkeServerSettings};
+#[cfg(feature = "transport-cms")]
+pub use identity::CmsIdentityPair;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub use negotiation::{ProfilePolicy, SupportedProfiles};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -229,11 +233,6 @@ pub use peer::LearnedTrust;
 pub use peer::ProvisionedTrust;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub use schedule::HandshakeSecret;
-#[cfg(all(
-	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-hpke")
-))]
-pub(crate) use schedule::HandshakeVerifyingKey;
 #[cfg(all(
 	feature = "transport-multiplex",
 	any(feature = "transport-cms", feature = "transport-hpke")
@@ -270,12 +269,13 @@ use crate::crypto::profiles::CryptoProvider;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 mod transport {
 	pub use crate::crypto::aead::KeyInit;
+	pub use crate::crypto::cms::RecipientKem;
 	pub use crate::crypto::common::typenum::U32;
 	pub use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
-	pub use crate::crypto::sign::elliptic_curve::{Curve, CurveArithmetic, PublicKey};
+	pub use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
 	pub use crate::crypto::sign::Verifier;
 	pub use crate::der::oid::AssociatedOid;
-	pub use crate::spki::EncodePublicKey;
+	pub use crate::spki::{EncodePublicKey, Error as SpkiError, SubjectPublicKeyInfoRef};
 }
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -315,8 +315,10 @@ impl<C> HandshakeCurve for C where
 ///
 /// - the curve is a [`HandshakeCurve`],
 /// - a signature parses from its encoded bytes,
-/// - the verifying key builds from a public key on that curve, verifies a
-///   signature, and encodes as an SPKI, and
+/// - the verifying key parses from an SPKI, converts from a point on that
+///   curve, lends its point by reference, verifies a signature, and encodes as
+///   an SPKI,
+/// - the KEM and the backend of its private key outlive the handshake, and
 /// - the AEAD cipher keys from derived bytes and seals an envelope.
 ///
 /// Every provider that meets the bounds is a handshake provider, so a
@@ -337,9 +339,15 @@ pub trait HandshakeProvider:
 	CryptoProvider<
 		Curve: HandshakeCurve,
 		Signature: for<'a> TryFrom<&'a [u8], Error: Into<HandshakeError>> + 'static,
-		VerifyingKey: Verifier<Self::Signature> + From<PublicKey<Self::Curve>> + EncodePublicKey + 'static,
+		VerifyingKey: Verifier<Self::Signature>
+		                  + for<'a> TryFrom<SubjectPublicKeyInfoRef<'a>, Error = SpkiError>
+		                  + From<PublicKey<Self::Curve>>
+		                  + AsRef<AffinePoint<Self::Curve>>
+		                  + EncodePublicKey
+		                  + 'static,
 		Digest: 'static,
 		AeadCipher: KeyInit + ContentEncryption + 'static,
+		Kem: RecipientKem<PrivateKey: 'static> + 'static,
 	> + Send
 	+ Sync
 	+ 'static
@@ -351,28 +359,94 @@ impl<P> HandshakeProvider for P where
 	P: CryptoProvider<
 			Curve: HandshakeCurve,
 			Signature: for<'a> TryFrom<&'a [u8], Error: Into<HandshakeError>> + 'static,
-			VerifyingKey: Verifier<P::Signature> + From<PublicKey<P::Curve>> + EncodePublicKey + 'static,
+			VerifyingKey: Verifier<P::Signature>
+			                  + for<'a> TryFrom<SubjectPublicKeyInfoRef<'a>, Error = SpkiError>
+			                  + From<PublicKey<P::Curve>>
+			                  + AsRef<AffinePoint<P::Curve>>
+			                  + EncodePublicKey
+			                  + 'static,
 			Digest: 'static,
 			AeadCipher: KeyInit + ContentEncryption + 'static,
+			Kem: RecipientKem<PrivateKey: 'static> + 'static,
 		> + Send
 		+ Sync
 		+ 'static
 {
 }
 
-/// Provisioned server identity for a CMS client handshake.
-///
-/// The client encrypts the base secret to the identity's leaf certificate.
+/// One provisioned certificate of a CMS server, for a CMS client handshake:
+/// a leaf, or a chain that ends at the leaf.
 #[cfg(feature = "transport-cms")]
+#[derive(Clone)]
 pub enum CmsServerIdentity {
 	/// A bare server certificate, evaluated directly against the trust store.
 	Certificate(Arc<Certificate>),
 	/// Full server chain, ordered root to leaf. Path validation runs over the
-	/// chain per [RFC 5280 §6.1][rfc5280-6.1], and the leaf becomes the
-	/// encryption target.
+	/// chain per [RFC 5280 §6.1][rfc5280-6.1], and the leaf identifies the
+	/// server.
 	///
 	/// [rfc5280-6.1]: https://datatracker.ietf.org/doc/html/rfc5280#section-6.1
-	Chain(Arc<[Certificate]>),
+	Chain(CmsServerChain),
+}
+
+/// A CMS server's chain, ordered root to leaf, with its leaf held apart, so
+/// each admission lends the leaf without a copy.
+///
+/// [`Self::new`] is the one constructor, so every chain holds a leaf.
+#[cfg(feature = "transport-cms")]
+#[derive(Clone)]
+pub struct CmsServerChain {
+	/// The whole chain, ordered root to leaf.
+	path: Arc<[Certificate]>,
+	/// The last certificate of the chain.
+	leaf: Arc<Certificate>,
+}
+
+#[cfg(feature = "transport-cms")]
+impl CmsServerChain {
+	/// The chain `path`, ordered root to leaf. Its leaf is copied once, here.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::MissingServerCertificate`] -- `path` is empty.
+	pub fn new(path: impl Into<Arc<[Certificate]>>) -> Result<Self, HandshakeError> {
+		let path = path.into();
+		let leaf = path.last().ok_or(HandshakeError::MissingServerCertificate)?;
+		let leaf = Arc::new(leaf.clone());
+		Ok(Self { path, leaf })
+	}
+
+	/// The whole chain, ordered root to leaf, which path validation reads.
+	pub fn path(&self) -> &[Certificate] {
+		&self.path
+	}
+
+	/// The certificate the chain starts at, the trust anchor of its path.
+	pub fn root(&self) -> &Certificate {
+		self.path.first().unwrap_or(&self.leaf)
+	}
+
+	/// The leaf, which identifies the server.
+	pub fn leaf(&self) -> &Arc<Certificate> {
+		&self.leaf
+	}
+}
+
+/// The two provisioned certificates of a CMS server: the one whose key signs
+/// the reply, and the one whose key the opening seals the base secret to.
+///
+/// The fields carry their roles by name, so the two cannot be swapped by
+/// position. [`ProvisionedTrust::new`] admits the pair against a store.
+#[cfg(feature = "transport-cms")]
+#[derive(Clone)]
+pub struct CmsServerCertificates {
+	/// The server's signing certificate, with `digitalSignature` in its
+	/// `keyUsage`.
+	pub signing: CmsServerIdentity,
+	/// The server's key-agreement certificate, whose `keyUsage` asserts the
+	/// bit of the provider's KEM, [`RecipientKem::USAGE`]: `keyAgreement` for
+	/// the house DHKEM.
+	pub key_agreement: CmsServerIdentity,
 }
 
 #[cfg(feature = "transport-cms")]
@@ -383,8 +457,8 @@ impl From<Arc<Certificate>> for CmsServerIdentity {
 }
 
 #[cfg(feature = "transport-cms")]
-impl From<Arc<[Certificate]>> for CmsServerIdentity {
-	fn from(chain: Arc<[Certificate]>) -> Self {
+impl From<CmsServerChain> for CmsServerIdentity {
+	fn from(chain: CmsServerChain) -> Self {
 		Self::Chain(chain)
 	}
 }
@@ -714,10 +788,10 @@ pub enum HandshakeProtocolKind {
 	Hpke,
 	/// CMS-based handshake (X.509 signed and authenticated-enveloped data).
 	///
-	/// The client encrypts to the server certificate in its first message and
-	/// signs its Finished, so it MUST provision a trust store, the server
-	/// certificate chain, and a client identity. A missing one fails closed,
-	/// and so does this kind without the `transport-cms` feature.
+	/// The client seals its first message to the server's key-agreement
+	/// certificate and signs its Finished, so it MUST provision a trust store,
+	/// the server's two certificates, and a client identity. A missing one
+	/// fails closed, and so does this kind without the `transport-cms` feature.
 	Cms,
 }
 

@@ -259,12 +259,14 @@ impl ClusterConfig {
 		let Some(trust) = store else {
 			return Err(VerifyRefusal::NoStore);
 		};
-		let (signer_cert, signature) = match trust.verify_frame(frame) {
-			TrustVerification::Verified(cert, signature) => (cert, signature),
+		let (signer, signature) = match trust.verify_frame(frame) {
+			TrustVerification::Verified(signer, signature) => (signer, signature),
 			TrustVerification::MissingSignature => return Err(VerifyRefusal::Unsigned),
 			TrustVerification::UnknownSigner => return Err(VerifyRefusal::UnknownSigner),
 			TrustVerification::Invalid => return Err(VerifyRefusal::Forged),
 		};
+
+		let signer_cert = signer.certificate().as_ref();
 
 		let party = TrustPlanes::from(&self.tls).classify(Some(signer_cert));
 		if party != required {

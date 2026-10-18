@@ -29,8 +29,11 @@
 //! - `Kem` writes a `KEMRecipientInfo` (RFC 9629 §3) in an `ori` of type `id-ori-kem`.
 //! - `Kek` writes a `KEKRecipientInfo` (RFC 5652 §6.2.3) under a key both ends hold.
 //!
-//! A `Kem` recipient runs the provider's [`RecipientKem`]. Its shared secret
-//! derives the KEK alone, under the provider's KDF (RFC 9629 §7):
+//! A `Kem` recipient runs the provider's [`RecipientKem`]:
+//!
+//! - A sender seals to a [`KemRecipient`].
+//! - An opener holds a [`KeyAgreementIdentity`], whose backend runs the KEM's private-key operation.
+//! - The shared secret derives the KEK alone, under the provider's KDF (RFC 9629 §7):
 //!
 //! ```text
 //! KEK = KDF(IKM = shared secret, salt = "", info = DER(CMSORIforKEMOtherInfo), L = kekLength)
@@ -59,11 +62,11 @@
 mod attributes;
 mod syntax;
 
-#[cfg(all(feature = "hpke", feature = "signature", feature = "ecdh"))]
+#[cfg(all(feature = "hpke", feature = "signature"))]
 mod envelope;
 #[cfg(all(feature = "hpke", feature = "signature"))]
 mod error;
-#[cfg(all(feature = "hpke", feature = "signature", feature = "ecdh"))]
+#[cfg(all(feature = "hpke", feature = "signature"))]
 mod recipient;
 #[cfg(all(test, feature = "hpke", feature = "signature", feature = "ecdh"))]
 mod tests;
@@ -71,9 +74,9 @@ mod tests;
 pub use attributes::AttributesExt;
 pub use syntax::{AuthEnvelopedData, CmsOriForKemOtherInfo, GcmParameters, KemRecipientInfo};
 
-#[cfg(all(feature = "hpke", feature = "signature", feature = "ecdh"))]
+#[cfg(all(feature = "hpke", feature = "signature"))]
 pub use envelope::ContentEncryption;
 #[cfg(all(feature = "hpke", feature = "signature"))]
 pub use error::EnvelopeError;
-#[cfg(all(feature = "hpke", feature = "signature", feature = "ecdh"))]
-pub use recipient::{Encapsulation, Opener, Recipient, RecipientKem};
+#[cfg(all(feature = "hpke", feature = "signature"))]
+pub use recipient::{Encapsulation, KemRecipient, KeyAgreementIdentity, Opener, Recipient, RecipientKem};

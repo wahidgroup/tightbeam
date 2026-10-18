@@ -105,6 +105,18 @@ pub enum CertificateValidationError {
 	#[error("Certificate keyUsage does not assert {0:?}")]
 	MissingKeyUsage(crate::crypto::x509::ext::pkix::KeyUsages),
 
+	/// The `keyUsage` extension asserts a bit that restricts the use away
+	/// from what the certificate is read for, as `decipherOnly` restricts
+	/// `keyAgreement` (RFC 5280 §4.2.1.3).
+	#[error("Certificate keyUsage restricts the use with {0:?}")]
+	ExcludedKeyUsage(crate::crypto::x509::ext::pkix::KeyUsages),
+
+	/// The `extendedKeyUsage` extension names neither the purpose of the role
+	/// the certificate is read for nor `anyExtendedKeyUsage` (RFC 5280
+	/// §4.2.1.12).
+	#[error("Certificate extendedKeyUsage excludes the role")]
+	ExcludedKeyPurpose,
+
 	/// The certificate carries more than one instance of an extension (RFC 5280
 	/// §4.2).
 	#[error("Duplicate extension: {0}")]

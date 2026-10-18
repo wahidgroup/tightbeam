@@ -12,7 +12,7 @@ use alloc::sync::Arc;
 use core::str::FromStr;
 use core::time::Duration;
 use std::error::Error;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rand_core::{CryptoRng, RngCore};
@@ -21,6 +21,7 @@ use crate::asn1::OctetString;
 use crate::cms::content_info::ContentInfo as ContentInfoValue;
 use crate::cms::enveloped_data::EncryptedContentInfo;
 use crate::cms::signed_data::SignedData;
+use crate::cms::signed_data::SignerIdentifier;
 use crate::constants::{
 	EC_PUBKEY_COMPRESSED_SIZE, TIGHTBEAM_ACK_KDF_INFO, TIGHTBEAM_ACK_KEY_ID_DOMAIN, TIGHTBEAM_C2S_KDF_INFO,
 	TIGHTBEAM_S2C_KDF_INFO,
@@ -30,8 +31,9 @@ use crate::crypto::cms::{AuthEnvelopedData, Opener};
 use crate::crypto::common::KeySizeUser;
 use crate::crypto::hash::{Digest, Sha3_256};
 use crate::crypto::kdf::{EcdhSecret, KdfFunction};
-use crate::crypto::key::{KeyError, Secp256k1KeyProvider, SigningKeyProvider};
+use crate::crypto::key::{KeyBackend, KeyError, Secp256k1KeyProvider, SigningKeyProvider};
 use crate::crypto::policy::Secp256k1Policy;
+use crate::crypto::policy::VerificationPolicy;
 use crate::crypto::profiles::{AeadProvider, DefaultCryptoProvider, KdfProvider, SecurityProfileDesc};
 use crate::crypto::secret::SecretSlice;
 use crate::crypto::secret::ToInsecure;
@@ -41,9 +43,13 @@ use crate::crypto::sign::elliptic_curve::sec1::ToEncodedPoint;
 use crate::crypto::sign::elliptic_curve::PublicKey;
 use crate::crypto::sign::{CmsSigner, Signed, SignedContent, SigningIdentity};
 use crate::crypto::x509::attr::{Attribute, Attributes};
+use crate::crypto::x509::error::CertificateValidationError;
 use crate::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
-use crate::crypto::x509::store::{CertificateTrustBuilder, TrustBuilder};
+use crate::crypto::x509::store::{
+	CertificateTrust, CertificateTrustBuilder, CertificateTrustStore, RevocationChecker, TrustBuilder,
+};
 use crate::crypto::x509::utils::Skid;
+use crate::crypto::x509::{ErasedSigning, KeyPurposes, PeerCertificate};
 use crate::der::asn1::BitString;
 use crate::der::asn1::GeneralizedTime;
 use crate::der::asn1::{Any as AnyValue, ObjectIdentifier};
@@ -52,7 +58,7 @@ use crate::der::{Decode, Encode, EncodeValue, Tagged};
 use crate::oids::{AES_256_WRAP, DATA, HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA256, SIGNER_ECDSA_WITH_SHA3_256};
 use crate::random::{generate_nonce, OsRng};
 use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey, SubjectPublicKeyInfoOwned};
-use crate::testing::TestIdentity;
+use crate::testing::{TestCmsServer, TestIdentity};
 use crate::transport::handshake::flow::ClientFlow;
 use crate::transport::handshake::negotiation::{
 	AuthorizationGrant, AuthorizationRefusal, MuxBudgets, RunnableProfile, TransportAuthorizer, TransportOffer,
@@ -101,10 +107,13 @@ use hpke::*;
 mod cms {
 	pub use crate::cms::enveloped_data::OriginatorPublicKey;
 	pub use crate::constants::TIGHTBEAM_OPENING_UKM_LABEL;
+	pub use crate::crypto::cms::KeyAgreementIdentity;
+	pub use crate::crypto::hpke::DhKemSecp256k1;
 	pub use crate::oids::{HANDSHAKE_OPENING_CONTENT, HANDSHAKE_SERVER_EPHEMERAL, RECEIPT_ACK};
 	pub use crate::transport::handshake::attributes::HandshakeAttributes;
 	pub use crate::transport::handshake::{
-		Cms, CmsClientSettings, CmsServerIdentity, CmsServerSettings, ProvisionedTrust,
+		Cms, CmsClientSettings, CmsIdentityPair, CmsServerCertificates, CmsServerIdentity, CmsServerSettings,
+		ProvisionedTrust,
 	};
 }
 
@@ -135,6 +144,110 @@ pub fn create_test_certificate() -> TestCertificate {
 	let signing_key = Secp256k1SigningKey::random(&mut OsRng);
 	let certificate = create_test_certificate_inner(&signing_key).expect("Test certificate creation should succeed");
 	TestCertificate { signing_key, certificate }
+}
+
+/// The identity a test server holds: a signing certificate and a
+/// key-agreement certificate of one subject, both issued by one test
+/// authority, each beside its key.
+///
+/// An HPKE server signs with the signing certificate alone, and a CMS server
+/// holds both as its pair.
+#[derive(Debug, Clone)]
+pub struct TestServerIdentity {
+	/// The certificate whose key signs the reply, beside that key.
+	pub signing: TestCertificate,
+	/// The certificate whose key the CMS opening seals to, beside that key.
+	pub key_agreement: TestCertificate,
+	/// The authority that issued both certificates.
+	pub authority: Certificate,
+}
+
+impl TestServerIdentity {
+	/// The certificates and keys as the shared test fixture holds them.
+	fn fixture(&self) -> TestCmsServer {
+		TestCmsServer {
+			authority: self.authority.to_owned(),
+			signing: self.signing.certificate.to_owned(),
+			signing_key: self.signing.signing_key.to_owned(),
+			key_agreement: self.key_agreement.certificate.to_owned(),
+			key_agreement_key: self.key_agreement.signing_key.to_owned(),
+		}
+	}
+
+	/// The key-agreement identity of the server.
+	#[cfg(feature = "transport-cms")]
+	pub fn key_agreement_identity(&self) -> KeyAgreementIdentity<DhKemSecp256k1> {
+		self.fixture().key_agreement_identity()
+	}
+
+	/// The pair a CMS server of this identity holds.
+	#[cfg(feature = "transport-cms")]
+	pub fn pair(&self) -> CmsIdentityPair<DhKemSecp256k1> {
+		self.fixture().pair()
+	}
+
+	/// The trust of a CMS client that provisions this server.
+	#[cfg(feature = "transport-cms")]
+	pub fn trust(&self) -> ProvisionedTrust {
+		self.fixture().trust()
+	}
+
+	/// The two certificates a CMS client provisions, each a bare
+	/// certificate.
+	#[cfg(feature = "transport-cms")]
+	pub fn certificates(&self) -> CmsServerCertificates {
+		self.fixture().certificates()
+	}
+
+	/// A store that holds the authority of both certificates.
+	pub fn store(&self) -> CertificateTrustStore {
+		self.fixture().store()
+	}
+
+	/// A store that holds the authority of both certificates and consults
+	/// `checker` on revocation.
+	pub fn store_with(&self, checker: impl RevocationChecker + 'static) -> CertificateTrustStore {
+		self.fixture().store_with(checker)
+	}
+}
+
+/// A revocation checker that revokes one certificate once [`Self::revoke`]
+/// runs, as a store whose verdict on a certificate changes after a trust was
+/// built. Each clone shares the one switch.
+#[derive(Debug, Clone)]
+pub struct LaterRevocation {
+	certificate: Arc<Certificate>,
+	revoked: Arc<AtomicBool>,
+}
+
+impl LaterRevocation {
+	/// A checker that will revoke `certificate`.
+	pub fn of(certificate: Certificate) -> Self {
+		Self { certificate: Arc::new(certificate), revoked: Arc::new(AtomicBool::new(false)) }
+	}
+
+	/// Revoke the certificate from here on.
+	pub fn revoke(&self) {
+		self.revoked.store(true, Ordering::SeqCst);
+	}
+}
+
+impl RevocationChecker for LaterRevocation {
+	fn check(&self, _issuer: &Certificate, cert: &Certificate) -> Result<(), CertificateValidationError> {
+		let revoked = self.revoked.load(Ordering::SeqCst) && *cert == *self.certificate;
+		match revoked {
+			true => Err(CertificateValidationError::CertificateRevoked),
+			false => Ok(()),
+		}
+	}
+}
+
+/// Create a test server identity with fresh keys under a fresh authority.
+pub fn create_test_server() -> TestServerIdentity {
+	let fixture = TestCmsServer::generate("tightbeam test server");
+	let signing = TestCertificate { signing_key: fixture.signing_key, certificate: fixture.signing };
+	let key_agreement = TestCertificate { signing_key: fixture.key_agreement_key, certificate: fixture.key_agreement };
+	TestServerIdentity { signing, key_agreement, authority: fixture.authority }
 }
 
 /// A test certificate whose validity period ended one second after the epoch.
@@ -187,9 +300,9 @@ fn create_test_certificate_inner(signing_key: &Secp256k1SigningKey) -> Result<Ce
 		extn_value: OctetString::new(key_identifier.to_der()?)?,
 	};
 
-	// The certificate signs the server Finished and receives the KEM's
-	// encapsulation of the opening (RFC 5480 §3, RFC 9629 §3).
-	let key_usage = KeyUsage(KeyUsages::DigitalSignature | KeyUsages::KeyAgreement);
+	// The certificate signs a client Finished or an HPKE reply, so its
+	// `keyUsage` asserts the signing use alone (RFC 5280 §4.2.1.3).
+	let key_usage = KeyUsage(KeyUsages::DigitalSignature.into());
 	let extn_value = OctetString::new(key_usage.to_der()?)?;
 	let key_usage = Extension { extn_id: KeyUsage::OID, critical: true, extn_value };
 
@@ -680,7 +793,7 @@ impl CountingProvider {
 	}
 }
 
-impl SigningKeyProvider for CountingProvider {
+impl KeyBackend for CountingProvider {
 	fn algorithm(&self) -> AlgorithmIdentifierOwned {
 		self.inner.algorithm()
 	}
@@ -689,13 +802,11 @@ impl SigningKeyProvider for CountingProvider {
 		self.public_keys.fetch_add(1, Ordering::SeqCst);
 		self.inner.to_public_key_bytes()
 	}
+}
 
+impl SigningKeyProvider for CountingProvider {
 	fn sign_prehash(&self, prehash: &[u8]) -> MaybeSendFuture<'_, Result<Vec<u8>, KeyError>> {
 		self.inner.sign_prehash(prehash)
-	}
-
-	fn key_agreement(&self, peer_public_key: &[u8]) -> MaybeSendFuture<'_, Result<SecretSlice<u8>, KeyError>> {
-		self.inner.key_agreement(peer_public_key)
 	}
 }
 
@@ -720,7 +831,7 @@ impl RecordingProvider {
 	}
 }
 
-impl SigningKeyProvider for RecordingProvider {
+impl KeyBackend for RecordingProvider {
 	fn algorithm(&self) -> AlgorithmIdentifierOwned {
 		self.inner.algorithm()
 	}
@@ -728,7 +839,9 @@ impl SigningKeyProvider for RecordingProvider {
 	fn to_public_key_bytes(&self) -> Result<Vec<u8>, KeyError> {
 		self.inner.to_public_key_bytes()
 	}
+}
 
+impl SigningKeyProvider for RecordingProvider {
 	fn sign_prehash(&self, prehash: &[u8]) -> MaybeSendFuture<'_, Result<Vec<u8>, KeyError>> {
 		let signing = self.inner.sign_prehash(prehash);
 		Box::pin(async move {
@@ -737,10 +850,6 @@ impl SigningKeyProvider for RecordingProvider {
 			signatures.push(signature.to_owned());
 			Ok(signature)
 		})
-	}
-
-	fn key_agreement(&self, peer_public_key: &[u8]) -> MaybeSendFuture<'_, Result<SecretSlice<u8>, KeyError>> {
-		self.inner.key_agreement(peer_public_key)
 	}
 }
 
@@ -859,14 +968,32 @@ pub fn client_identity(identity: &TestCertificate) -> SigningIdentity {
 	signing_identity(identity)
 }
 
+/// The settings of an HPKE client that admits `server` and presents
+/// `identity`, when it holds one.
+#[cfg(feature = "transport-hpke")]
+pub fn hpke_client_settings(server: &Certificate, identity: Option<SigningIdentity>) -> HpkeClientSettings {
+	let validator = DirectTrustValidator::default().with_trust_chain(vec![server.to_owned()]);
+	let mut settings = HpkeClientSettings::new(LearnedTrust::new(validator));
+	settings.identity = identity;
+	settings
+}
+
 /// The configuration of an HPKE client that admits `server` and presents
 /// `identity`, when it holds one.
 #[cfg(feature = "transport-hpke")]
 pub fn hpke_client(server: &Certificate, identity: Option<SigningIdentity>) -> TestClientConfig<Hpke> {
-	let validator = DirectTrustValidator::default().with_trust_chain(vec![server.to_owned()]);
-	let mut settings = HpkeClientSettings::new(LearnedTrust::new(validator));
-	settings.identity = identity;
-	ClientConfig::new(settings)
+	let config = ClientConfig::new(hpke_client_settings(server, identity), KeyPurposes::HOUSE);
+	config.expect("a test client identity serves the client role")
+}
+
+/// The configuration of an HPKE server that signs with `identity`, demands
+/// no client certificate, and runs the default test profile.
+#[cfg(feature = "transport-hpke")]
+pub fn hpke_server(identity: &TestCertificate) -> TestServerConfig<Hpke> {
+	let profiles = SupportedProfiles::from(create_default_test_profile());
+	let identity = signing_identity(identity);
+	let config = ServerConfig::new(HpkeServerSettings::new(), identity, profiles, KeyPurposes::HOUSE);
+	config.expect("a test server identity serves the server role")
 }
 
 /// The `ClientHello` that `opening` carries in its `ContentInfo` of type
@@ -931,21 +1058,21 @@ pub trait TestFlow: ClientFlow<DefaultCryptoProvider> + ServerFlow<DefaultCrypto
 
 	/// The configuration of a client that admits `server` and presents
 	/// `identity`.
-	fn client(server: &Certificate, identity: &TestCertificate) -> TestClientConfig<Self> {
+	fn client(server: &TestServerIdentity, identity: &TestCertificate) -> TestClientConfig<Self> {
 		Self::client_presenting(server, client_identity(identity))
 	}
 
 	/// The configuration of a client that admits `server` and presents
 	/// `identity`, whose key may sit behind any provider.
-	fn client_presenting(server: &Certificate, identity: SigningIdentity) -> TestClientConfig<Self>;
+	fn client_presenting(server: &TestServerIdentity, identity: SigningIdentity) -> TestClientConfig<Self>;
 
 	/// The configuration of a server that holds `identity`, demands no client
 	/// certificate, and runs the default test profile.
-	fn server(identity: &TestCertificate) -> TestServerConfig<Self>;
+	fn server(identity: &TestServerIdentity) -> TestServerConfig<Self>;
 
-	/// Open the recorded legs of `run` with the static key of
+	/// Open the recorded legs of `run` with the static keys of
 	/// `server_identity`, through the same path the server runs.
-	async fn recover(run: &Run<Self>, server_identity: &TestCertificate) -> Recovered;
+	async fn recover(run: &Run<Self>, server_identity: &TestServerIdentity) -> Recovered;
 }
 
 /// A client configuration under the default provider.
@@ -965,27 +1092,26 @@ impl TestFlow for Hpke {
 	const RECORD_ATTEMPTS: usize = 10;
 	const CLOSING_ATTEMPTS: usize = 5;
 
-	fn client_presenting(server: &Certificate, identity: SigningIdentity) -> TestClientConfig<Self> {
-		hpke_client(server, Some(identity))
+	fn client_presenting(server: &TestServerIdentity, identity: SigningIdentity) -> TestClientConfig<Self> {
+		hpke_client(&server.signing.certificate, Some(identity))
 	}
 
-	fn server(identity: &TestCertificate) -> TestServerConfig<Self> {
-		let profiles = SupportedProfiles::from(create_default_test_profile());
-		ServerConfig::new(HpkeServerSettings::new(), signing_identity(identity), profiles)
+	fn server(identity: &TestServerIdentity) -> TestServerConfig<Self> {
+		hpke_server(&identity.signing)
 	}
 
 	/// The HPKE flow seals nothing to the server, so the static key opens no
 	/// leg. The observer holds the two ephemerals as the hello and the reply
 	/// carried them in clear.
-	async fn recover(run: &Run<Self>, server_identity: &TestCertificate) -> Recovered {
-		let static_key = SecretKey::from(server_identity.signing_key.to_owned());
+	async fn recover(run: &Run<Self>, server_identity: &TestServerIdentity) -> Recovered {
+		let static_key = SecretKey::from(server_identity.signing.signing_key.to_owned());
 		let hello = carried_hello(&run.opening);
 		let handshake = signed_handshake(&run.reply);
 		let salt = [hello.client_random.as_bytes(), handshake.server_random.as_bytes()].concat();
 		let server_ephemeral = handshake.server_ephemeral.as_bytes();
 		let client_ephemeral = hello.client_ephemeral.as_bytes();
-		let observer = StaticKeyObserver::new(&static_key, None, client_ephemeral, server_ephemeral, salt);
 
+		let observer = StaticKeyObserver::new(&static_key, None, client_ephemeral, server_ephemeral, salt);
 		Recovered { observer: observer.expect("both ephemerals are points on the curve"), base: None }
 	}
 }
@@ -995,26 +1121,25 @@ impl TestFlow for Cms {
 	const RECORD_ATTEMPTS: usize = 12;
 	const CLOSING_ATTEMPTS: usize = 6;
 
-	fn client_presenting(server: &Certificate, identity: SigningIdentity) -> TestClientConfig<Self> {
-		let store = CertificateTrustBuilder::from(Secp256k1Policy::default())
-			.with_certificate(server.to_owned())
-			.expect("the store takes a valid test certificate")
-			.build();
-		let pinned = CmsServerIdentity::Certificate(Arc::new(server.to_owned()));
-		let trust = ProvisionedTrust { identity: pinned, store: Arc::new(store) };
-		ClientConfig::new(CmsClientSettings { trust, identity })
+	fn client_presenting(server: &TestServerIdentity, identity: SigningIdentity) -> TestClientConfig<Self> {
+		let settings = CmsClientSettings { trust: server.trust(), identity };
+		let config = ClientConfig::new(settings, KeyPurposes::HOUSE);
+		config.expect("a test client identity serves the client role")
 	}
 
-	fn server(identity: &TestCertificate) -> TestServerConfig<Self> {
+	fn server(identity: &TestServerIdentity) -> TestServerConfig<Self> {
 		let profiles = SupportedProfiles::from(create_default_test_profile());
-		ServerConfig::new(CmsServerSettings, signing_identity(identity), profiles)
+		let config = ServerConfig::new(CmsServerSettings, identity.pair(), profiles, KeyPurposes::HOUSE);
+		config.expect("a test server pair serves the server role")
 	}
 
-	async fn recover(run: &Run<Self>, server_identity: &TestCertificate) -> Recovered {
+	/// The key-agreement key opens the opening, and the observer holds it as
+	/// the static key a recording meets later.
+	async fn recover(run: &Run<Self>, server_identity: &TestServerIdentity) -> Recovered {
 		let opening = run.opening.to_owned().auth_enveloped();
 		let opening = opening.expect("a CMS opening is an AuthEnvelopedData");
-		let static_key = SecretKey::from(server_identity.signing_key.to_owned());
-		let identity = signing_identity(server_identity);
+		let static_key = SecretKey::from(server_identity.key_agreement.signing_key.to_owned());
+		let identity = server_identity.key_agreement_identity();
 		let opener = Opener::Kem { identity: &identity, ukm_label: TIGHTBEAM_OPENING_UKM_LABEL };
 		let (arrived, opening) = opening.into_parts();
 		let opened = opening.open::<DefaultCryptoProvider>(arrived, &opener, HANDSHAKE_OPENING_CONTENT);
@@ -1066,9 +1191,9 @@ impl<F: TestFlow> Run<F> {
 /// The recorded legs of a mutual handshake of flow `F` whose client presents
 /// `client_identity` and signs through `key`.
 pub async fn mutual_run<F: TestFlow>(client_identity: &TestCertificate, key: Arc<dyn SigningKeyProvider>) -> Run<F> {
-	let server_identity = create_test_certificate();
+	let server_identity = create_test_server();
 	let presented = presenting(client_identity, key);
-	let client = F::client_presenting(&server_identity.certificate, presented);
+	let client = F::client_presenting(&server_identity, presented);
 
 	let mut server = F::server(&server_identity);
 	server.peer_authentication = mutual_with(ExpiryValidator);
@@ -1080,10 +1205,10 @@ pub async fn mutual_run<F: TestFlow>(client_identity: &TestCertificate, key: Arc
 pub async fn run<F: TestFlow>(client: TestClientConfig<F>, server: TestServerConfig<F>) -> Run<F> {
 	let mut client = Handshake::client(client);
 	let mut server = Handshake::server(server);
-
 	let opening = client.start().expect("the client builds its opening");
 	let reply = server.reply(opening.to_owned()).await.expect("the server admits the opening");
 	let closing = client.respond(reply.to_owned()).await.expect("the client admits the reply");
+
 	server.finish(closing.to_owned()).await.expect("the server admits the closing");
 
 	let transcript_hash = client.transcript_hash().expect("the client sealed its transcript");
@@ -1094,7 +1219,7 @@ pub async fn run<F: TestFlow>(client: TestClientConfig<F>, server: TestServerCon
 /// handshake.
 pub struct Parties<F: TestFlow> {
 	/// The identity the server holds.
-	pub server_identity: TestCertificate,
+	pub server_identity: TestServerIdentity,
 	/// The identity the client presents.
 	pub client_identity: TestCertificate,
 	/// The client configuration, which admits the server.
@@ -1106,9 +1231,9 @@ pub struct Parties<F: TestFlow> {
 /// Two endpoints of flow `F` under `peer_authentication`, where the client
 /// admits the server and presents a fresh identity.
 pub fn parties<F: TestFlow>(peer_authentication: PeerAuthentication) -> Parties<F> {
-	let server_identity = create_test_certificate();
+	let server_identity = create_test_server();
 	let client_identity = create_test_certificate();
-	let client = F::client(&server_identity.certificate, &client_identity);
+	let client = F::client(&server_identity, &client_identity);
 
 	let mut server = F::server(&server_identity);
 	server.peer_authentication = peer_authentication;
@@ -1126,7 +1251,7 @@ pub fn pair<F: TestFlow>(peer_authentication: PeerAuthentication) -> (TestClient
 /// A recorded handshake with both sessions established.
 pub struct Established<F: TestFlow> {
 	/// The identity the server holds.
-	pub server_identity: TestCertificate,
+	pub server_identity: TestServerIdentity,
 	/// The recorded legs, with both endpoints completed.
 	pub run: Run<F>,
 	/// The session the client established.

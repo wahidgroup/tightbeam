@@ -34,7 +34,8 @@ use crate::crypto::sign::elliptic_curve::ecdh::EphemeralSecret;
 use crate::crypto::sign::elliptic_curve::{CurveArithmetic, PublicKey, SecretKey};
 use crate::crypto::sign::{CmsSigner, Signed, SignedContent, SignerInfoDraft, SigningIdentity};
 use crate::crypto::subtle::ConstantTimeEq;
-use crate::der::asn1::OctetString;
+use crate::crypto::x509::{PeerCertificate, Signing};
+use crate::der::asn1::{ObjectIdentifier, OctetString};
 use crate::der::{Decode, Encode};
 use crate::oids::{DATA, RECEIPT_ACK, SIGNED_DATA};
 use crate::random::CryptoRngCore;
@@ -43,13 +44,14 @@ use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::negotiation::{
 	RunnableProfile, SecurityAccept, SecurityOffer, TransportAccept, TransportOffer,
 };
-use crate::transport::handshake::peer::{PeerCertificate, ServerTrust};
+use crate::transport::handshake::peer::ServerTrust;
 use crate::transport::handshake::primitives::{KdfSalt, TranscriptHash};
 use crate::transport::handshake::schedule::{
-	Agreement, ConfirmedSecret, FinishedRole, KeyConfirmation, PeerEphemeral, PeerPoint, Salt, Sealer, SecretSeal,
-	Terms,
+	Agreement, ConfirmedSecret, FinishedRole, KeyConfirmation, PeerPoint, Salt, Sealer, SecretSeal, Terms,
 };
-use crate::transport::handshake::{HandshakeCurve, HandshakeMessage, HandshakeProvider, HandshakeSecret};
+use crate::transport::handshake::{
+	HandshakeCurve, HandshakeMessage, HandshakeProvider, HandshakeSecret, ServerIdentity,
+};
 use crate::transport::wire_der::WireDer;
 use crate::utils::marker::{MaybeSend, MaybeSendFuture, MaybeSync};
 use crate::x509::attr::{Attribute, Attributes};
@@ -98,7 +100,7 @@ pub struct Opened<F: ClientLegs<P>, P: HandshakeProvider> {
 /// The facts of a decoded reply, bound into the sealed transcript.
 pub struct ReplyIntake<F: ClientLegs<P>, P: HandshakeProvider> {
 	/// What the reply names as the server, for the trust to admit.
-	pub server: <F::Trust as ServerTrust<P::Curve>>::Named,
+	pub server: <F::Trust as ServerTrust<P>>::Named,
 	/// The security profile the server selected.
 	pub security_accept: Option<SecurityAccept>,
 	/// The transport capabilities the server accepted.
@@ -236,7 +238,7 @@ pub trait ClientLegs<P: HandshakeProvider>: HandshakeFlow {
 	/// What a client of this protocol is provisioned with.
 	type Settings: MaybeSend + MaybeSync + 'static;
 	/// Where the client learns the server identity.
-	type Trust: ServerTrust<P::Curve>;
+	type Trust: ServerTrust<P>;
 	/// What the flow keeps from the opening to read the reply against.
 	type Opening: MaybeSend + MaybeSync + 'static;
 	/// The secrets the flow holds from the opening to the agreement.
@@ -259,7 +261,7 @@ pub trait ClientLegs<P: HandshakeProvider>: HandshakeFlow {
 	/// - [`HandshakeError`] -- the opening fails to build or encode.
 	fn open(
 		settings: &Self::Settings,
-		server: <Self::Trust as ServerTrust<P::Curve>>::Provisioned,
+		server: <Self::Trust as ServerTrust<P>>::Provisioned,
 		parts: OpeningParts<'_>,
 		rng: &mut dyn CryptoRngCore,
 	) -> Result<Opened<Self, P>, HandshakeError>;
@@ -290,7 +292,7 @@ pub trait ClientLegs<P: HandshakeProvider>: HandshakeFlow {
 	/// - [`HandshakeError::DerError`] -- a signed attribute fails to encode.
 	fn verify_reply(
 		reply: &SignedData,
-		server: &PeerCertificate<P::Curve>,
+		server: &PeerCertificate<Signing<P>>,
 		transcript_hash: &TranscriptHash,
 	) -> Result<ReplyVerified, HandshakeError>;
 }
@@ -401,11 +403,14 @@ impl<P: HandshakeProvider, F: ServerLegs<P>> ServerFlow<P> for F {}
 /// Both flows return the same intake shapes and refuse with the same
 /// [`HandshakeError`] set, so the orchestrator runs one step order over
 /// either. The asynchronous open of the opening runs a static-key step
-/// through the signing identity's key provider, so the private key can stay
-/// behind an external boundary.
+/// through the backend of the server's key-agreement identity, so the private
+/// key can stay behind an external boundary.
 pub trait ServerLegs<P: HandshakeProvider>: HandshakeFlow {
 	/// What a server of this protocol is provisioned with.
 	type Settings: MaybeSend + MaybeSync + 'static;
+	/// What the server signs and agrees with: one signing identity for the
+	/// HPKE flow, and the signing and key-agreement pair for the CMS flow.
+	type Identity: ServerIdentity;
 	/// What the opening sealed to the static key.
 	type Sealed: MaybeSend + 'static;
 	/// What the flow holds from the static open to the reply.
@@ -427,7 +432,7 @@ pub trait ServerLegs<P: HandshakeProvider>: HandshakeFlow {
 		opening: HandshakeMessage,
 	) -> Result<OpeningIntake<Self, P>, HandshakeError>;
 
-	/// Open what the opening sealed to the static key of `identity`.
+	/// Open what the opening sealed to a static key of `identity`.
 	///
 	/// # Errors
 	///
@@ -438,7 +443,7 @@ pub trait ServerLegs<P: HandshakeProvider>: HandshakeFlow {
 	/// - [`HandshakeError::DerError`] -- the opened content fails to decode.
 	fn open_opening<'a>(
 		sealed: Self::Sealed,
-		identity: &'a SigningIdentity,
+		identity: &'a Self::Identity,
 	) -> MaybeSendFuture<'a, Result<Self::Opened, HandshakeError>>;
 
 	/// Bind the reply legs into the transcript, seal it, and name the bytes
@@ -506,11 +511,14 @@ impl FinishedRole {
 	pub(crate) fn verify<P: HandshakeProvider>(
 		self,
 		finished: &SignedData,
-		certificate: &PeerCertificate<P::Curve>,
+		certificate: &PeerCertificate<Signing<P>>,
 		transcript_hash: &TranscriptHash,
 	) -> Result<(), HandshakeError> {
+		// The Finished covers a transcript hash, which is fresh for each
+		// handshake, so its verified signature is the key of no ledger and
+		// drops here.
 		let content = CmsSigner::content(finished, DATA)?;
-		certificate.verify_signed::<P>(finished, SignedContent::data(content))?;
+		CmsSigner::verify_sole_signer::<P>(finished, certificate, SignedContent::data(content)).map(drop)?;
 
 		let expected = self.content::<P::Digest>(transcript_hash, certificate.certificate())?;
 		let content_matches: bool = content.ct_eq(expected.as_slice()).into();
@@ -584,7 +592,7 @@ impl ClientFinished {
 	/// - The [`FinishedRole::verify`] set.
 	pub(crate) fn verify<P: HandshakeProvider>(
 		self,
-		identity: &PeerCertificate<P::Curve>,
+		identity: &PeerCertificate<Signing<P>>,
 		terms: &Terms<P>,
 	) -> Result<(), HandshakeError> {
 		FinishedRole::Client.verify::<P>(&self.0, identity, terms.transcript_hash())
@@ -597,9 +605,9 @@ impl ClientFinished {
 /// Its constructors are private to the closing, so an offer exists only where
 /// a closing opened. [`Self::new`] refuses an identity whose key collapses the
 /// client ephemeral, so no offer exists for that client.
-pub struct Offer<C: CurveArithmetic>(Option<(PeerCertificate<C>, ClientFinished)>);
+pub struct Offer<P: HandshakeProvider>(Option<(PeerCertificate<Signing<P>>, ClientFinished)>);
 
-impl<C: HandshakeCurve> Offer<C> {
+impl<P: HandshakeProvider> Offer<P> {
 	/// The offer of a client that presents no identity.
 	fn anonymous() -> Self {
 		Self(None)
@@ -608,20 +616,18 @@ impl<C: HandshakeCurve> Offer<C> {
 	/// The offer of `identity`, proven by `finished`.
 	///
 	/// A server learns its client's static key only after the agreement, so
-	/// the comparison lives here: `ephemeral` MUST have an x-coordinate other
-	/// than that of the identity's key. ECDH keeps the x-coordinate alone, so
-	/// a match would collapse the agreement into the static one.
+	/// the comparison lives here: `ephemeral` MUST be distinct from the key
+	/// of `identity`, or the agreement collapses into the static one.
 	///
 	/// # Errors
 	///
 	/// - [`HandshakeError::ClientEphemeralIsStatic`] -- the ephemeral collapses into the key of `identity`.
 	fn new(
-		identity: PeerCertificate<C>,
+		identity: PeerCertificate<Signing<P>>,
 		finished: ClientFinished,
-		ephemeral: &PublicKey<C>,
+		ephemeral: &PublicKey<P::Curve>,
 	) -> Result<Self, HandshakeError> {
-		let collapsed = identity.key().distinct(*ephemeral).is_none();
-		if collapsed {
+		if !identity.distinct(ephemeral) {
 			return Err(HandshakeError::ClientEphemeralIsStatic);
 		}
 
@@ -629,7 +635,7 @@ impl<C: HandshakeCurve> Offer<C> {
 	}
 
 	/// The identity and its proof, for the admission that verifies them.
-	pub(crate) fn into_identity(self) -> Option<(PeerCertificate<C>, ClientFinished)> {
+	pub(crate) fn into_identity(self) -> Option<(PeerCertificate<Signing<P>>, ClientFinished)> {
 		self.0
 	}
 }
@@ -757,7 +763,8 @@ impl Closing {
 	}
 
 	/// Open the closing under the closing key of the secret `pending` holds,
-	/// read its tag and its acknowledgement, and build the [`Offer`].
+	/// read its tag and its acknowledgement, and build the [`Offer`] of a
+	/// certificate admitted for the client's key purpose, `purpose`.
 	///
 	/// # Errors
 	///
@@ -769,6 +776,7 @@ impl Closing {
 		self,
 		pending: ServerPending<P::Curve>,
 		terms: &Terms<P>,
+		purpose: ObjectIdentifier,
 	) -> Result<ClosingOpened<P>, HandshakeError> {
 		let ServerPending { secret, client_ephemeral } = pending;
 
@@ -781,7 +789,7 @@ impl Closing {
 		let (confirmation, receipt_ack) = content.confirmation()?;
 
 		// 3. Build the offer, which compares `R` with the key of the certificate the Finished names.
-		let offer = content.into_offer(&client_ephemeral)?;
+		let offer = content.into_offer(&client_ephemeral, purpose)?;
 		Ok(ClosingOpened { secret, confirmation, receipt_ack, offer })
 	}
 }
@@ -851,16 +859,21 @@ impl ClosingContent {
 	}
 
 	/// The offer this closing makes: none for an anonymous closing, and for a
-	/// client Finished the certificate its signer names, compared with
-	/// `client_ephemeral`.
+	/// client Finished the certificate its signer names, admitted for signing
+	/// under `purpose` and compared with `client_ephemeral`.
 	///
 	/// # Errors
 	///
 	/// - [`HandshakeError::MissingClientCertificate`] -- the Finished has no certificate its signer names.
 	/// - [`HandshakeError::SignatureVerificationFailed`] -- the Finished does not have exactly one signer.
-	/// - [`HandshakeError::InvalidPublicKey`] -- the certificate key is not a point on the curve.
+	/// - [`HandshakeError::CertificateValidationError`] -- the signing use or
+	///   `purpose` refuses the certificate.
 	/// - [`HandshakeError::ClientEphemeralIsStatic`] -- `client_ephemeral` equals the certificate key.
-	fn into_offer<C: HandshakeCurve>(self, client_ephemeral: &PublicKey<C>) -> Result<Offer<C>, HandshakeError> {
+	fn into_offer<P: HandshakeProvider>(
+		self,
+		client_ephemeral: &PublicKey<P::Curve>,
+		purpose: ObjectIdentifier,
+	) -> Result<Offer<P>, HandshakeError> {
 		let Self::Finished(mut finished) = self else {
 			return Ok(Offer::anonymous());
 		};
@@ -869,7 +882,7 @@ impl ClosingContent {
 		// session keeps it past the decoded Finished without a copy.
 		let certificate = CmsSigner::take_signer_certificate(&mut finished)?;
 		let certificate = certificate.ok_or(HandshakeError::MissingClientCertificate)?;
-		let identity = PeerCertificate::<C>::parse(certificate)?;
+		let identity = PeerCertificate::parse(certificate, purpose)?;
 		Offer::new(identity, ClientFinished(finished), client_ephemeral)
 	}
 }
@@ -888,7 +901,7 @@ pub(crate) struct ClosingOpened<P: HandshakeProvider> {
 	/// the handshake secret.
 	receipt_ack: Option<Vec<u8>>,
 	/// The identity the client offers.
-	offer: Offer<P::Curve>,
+	offer: Offer<P>,
 }
 
 impl<P: HandshakeProvider> ClosingOpened<P> {
@@ -918,7 +931,7 @@ pub(crate) struct ConfirmedClosing<P: HandshakeProvider> {
 	/// the handshake secret.
 	pub(crate) receipt_ack: Option<Vec<u8>>,
 	/// The identity the client offers.
-	pub(crate) offer: Offer<P::Curve>,
+	pub(crate) offer: Offer<P>,
 }
 
 #[cfg(all(test, any(feature = "transport-cms", feature = "transport-hpke")))]
@@ -930,17 +943,21 @@ mod tests {
 	use crate::crypto::hash::Sha3_256;
 	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::crypto::sign::ecdsa::k256::{Secp256k1, SecretKey};
+	use crate::crypto::x509::KeyPurposes;
 	use crate::random::OsRng;
 	use crate::transport::handshake::tests::{
 		create_test_certificate, create_test_signed_data, fixture_confirmation, fixture_transcript, negated,
 		same_key_twin, signing_identity,
 	};
 
+	/// A client certificate admitted for signing under the house provider.
+	type HouseSigner = PeerCertificate<Signing<DefaultCryptoProvider>>;
+
 	/// A fresh client identity, beside its static key.
-	fn identity() -> (PeerCertificate<Secp256k1>, PublicKey<Secp256k1>) {
+	fn identity() -> (HouseSigner, PublicKey<Secp256k1>) {
 		let client = create_test_certificate();
 		let static_key = PublicKey::from(client.signing_key.verifying_key());
-		let identity = PeerCertificate::parse(client.certificate);
+		let identity = PeerCertificate::parse(client.certificate, KeyPurposes::HOUSE.client);
 		(identity.expect("the test certificate holds a point"), static_key)
 	}
 
@@ -1007,7 +1024,7 @@ mod tests {
 		let client = create_test_certificate();
 		let transcript_hash = fixture_transcript::<Sha3_256>([0x07u8; 32]);
 		let finished = client_finished(&signing_identity(&client), &transcript_hash).await;
-		let carried = PeerCertificate::<Secp256k1>::parse(client.certificate)?;
+		let carried = HouseSigner::parse(client.certificate, KeyPurposes::HOUSE.client)?;
 
 		let verified = FinishedRole::Client.verify::<DefaultCryptoProvider>(&finished, &carried, &transcript_hash);
 		assert!(verified.is_ok());
@@ -1022,7 +1039,7 @@ mod tests {
 		let client = create_test_certificate();
 		let transcript_hash = fixture_transcript::<Sha3_256>([0x07u8; 32]);
 		let finished = client_finished(&signing_identity(&client), &transcript_hash).await;
-		let twin = PeerCertificate::<Secp256k1>::parse(same_key_twin(&client))?;
+		let twin = HouseSigner::parse(same_key_twin(&client), KeyPurposes::HOUSE.client)?;
 
 		let refused = FinishedRole::Client.verify::<DefaultCryptoProvider>(&finished, &twin, &transcript_hash);
 		assert!(matches!(refused, Err(HandshakeError::SignatureVerificationFailed)));

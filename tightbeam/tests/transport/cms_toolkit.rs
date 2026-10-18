@@ -30,7 +30,7 @@ use tightbeam::oids::DATA;
 use tightbeam::random::OsRng;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_scenario;
-use tightbeam::testing::{EnvelopeRecipient, SetupEnv, TestIdentity};
+use tightbeam::testing::{EnvelopeRecipient, SetupEnv, TestCmsServer, TestIdentity};
 use tightbeam::transport::handshake::{HandshakeAttribute, HandshakeError};
 use tightbeam::x509::attr::Attribute;
 
@@ -92,11 +92,11 @@ tb_scenario! {
 	spec: KemRecipientSpec,
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
-			let recipient = TestIdentity::of(&Secp256k1SigningKey::random(&mut OsRng));
-			let intruder = TestIdentity::of(&Secp256k1SigningKey::random(&mut OsRng));
+			let recipient = TestCmsServer::generate("toolkit recipient").key_agreement_identity();
+			let intruder = TestCmsServer::generate("toolkit intruder").key_agreement_identity();
 			let plaintext = b"cms toolkit sealed payload";
 
-			let sealed_to = Recipient::Kem { certificate: recipient.certificate(), ukm_label: TOOLKIT_UKM };
+			let sealed_to = Recipient::Kem { recipient: recipient.recipient(), ukm_label: TOOLKIT_UKM };
 			let sealed = AuthEnvelopedData::seal::<House>(sealed_to, DATA, plaintext, [], None)?;
 			let wrapped = sealed.kem_recipient().encrypted_key;
 			assert_eq!(wrapped.as_bytes().len(), 40, "AES-256 key wrap adds one 8-octet block to the 32-octet CEK");

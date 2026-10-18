@@ -25,6 +25,14 @@ use crate::transport::TransportResult;
 use crate::utils::time::MonotonicInstant;
 use crate::x509::Certificate;
 
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::crypto::x509::error::CertificateValidationError;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::crypto::x509::utils::CertificateExt;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::crypto::x509::KeyPurposes;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::der::asn1::ObjectIdentifier;
 #[cfg(feature = "instrument")]
 use crate::trace::TraceCollector;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -32,7 +40,9 @@ use crate::transport::handshake::negotiation::{TransportAuthorizer, TransportOff
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::receipt::{ReceiptApprover, SessionObserver};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::transport::handshake::BoxedServerHandshake;
+use crate::transport::handshake::{BoxedServerHandshake, HandshakeError, ServerIdentity};
+#[cfg(feature = "transport-cms")]
+use crate::transport::handshake::{CmsIdentityPair, ProvisionedTrust};
 
 /// Which wire mode a session is entitled to write, and the state backing it.
 ///
@@ -492,6 +502,84 @@ impl<P: CryptoProvider> SessionState<P> {
 	}
 }
 
+/// The identity a server endpoint presents: a signing identity alone, or the
+/// CMS server's pair, which [`with_key_agreement`] builds once.
+///
+/// [`with_key_agreement`]: crate::transport::TransportEncryptionConfig::with_key_agreement
+pub(crate) enum ServerIdentities<P: CryptoProvider> {
+	/// A signing identity alone, which serves the HPKE flow under the
+	/// provider `P`.
+	Signing(SigningIdentity, PhantomData<fn() -> P>),
+	/// The CMS server's signing and key-agreement identities, which serve
+	/// both flows.
+	#[cfg(feature = "transport-cms")]
+	Cms(CmsIdentityPair<P::Kem>),
+}
+
+impl<P: CryptoProvider> Clone for ServerIdentities<P> {
+	fn clone(&self) -> Self {
+		match self {
+			Self::Signing(identity, provider) => Self::Signing(identity.clone(), *provider),
+			#[cfg(feature = "transport-cms")]
+			Self::Cms(pair) => Self::Cms(pair.clone()),
+		}
+	}
+}
+
+impl<P: CryptoProvider> From<SigningIdentity> for ServerIdentities<P> {
+	fn from(identity: SigningIdentity) -> Self {
+		Self::Signing(identity, PhantomData)
+	}
+}
+
+impl<P: CryptoProvider> ServerIdentities<P> {
+	/// The identity that signs the endpoint's replies and receipts.
+	pub(crate) fn signing(&self) -> &SigningIdentity {
+		match self {
+			Self::Signing(identity, _) => identity,
+			#[cfg(feature = "transport-cms")]
+			Self::Cms(pair) => pair.signing(),
+		}
+	}
+
+	/// The identity that signs, moved out of the endpoint's identities.
+	#[cfg(feature = "transport-cms")]
+	pub(crate) fn into_signing(self) -> SigningIdentity {
+		match self {
+			Self::Signing(identity, _) => identity,
+			Self::Cms(pair) => pair.into_signing(),
+		}
+	}
+
+	/// Refuse these identities for the server role unless each certificate
+	/// admits the key purpose `purpose` (RFC 5280 §4.2.1.12).
+	///
+	/// # Errors
+	///
+	/// - The [`CertificateExt::require_purpose`] set.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	pub(crate) fn require_purpose(&self, purpose: ObjectIdentifier) -> Result<(), CertificateValidationError> {
+		match self {
+			Self::Signing(identity, _) => identity.require_purpose(purpose),
+			#[cfg(feature = "transport-cms")]
+			Self::Cms(pair) => pair.require_purpose(purpose),
+		}
+	}
+
+	/// The pair of a CMS server, which the CMS flow opens and signs with.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::MissingKeyAgreementIdentity`] -- the server holds a signing identity alone.
+	#[cfg(feature = "transport-cms")]
+	pub(crate) fn cms_pair(&self) -> TransportResult<&CmsIdentityPair<P::Kem>> {
+		match self {
+			Self::Cms(pair) => Ok(pair),
+			Self::Signing(..) => Err(TransportError::MissingKeyAgreementIdentity),
+		}
+	}
+}
+
 /// Everything an endpoint was provisioned with before any handshake runs.
 ///
 /// Provisioning is decided once, when the endpoint is built, so it travels as
@@ -505,16 +593,21 @@ pub struct EncryptionConfig<P: CryptoProvider> {
 	/// requires the endpoint to have named.
 	pub(crate) trust_store: Option<Arc<dyn CertificateTrust>>,
 	/// The identity this endpoint presents as a server: the certificate and
-	/// the key that signs its replies and its receipts.
-	pub(crate) server_identity: Option<SigningIdentity>,
-	/// Provisioned server chain, ordered root to leaf, required by the CMS
-	/// key-transport handshake before the server speaks.
-	pub(crate) server_certificate_chain: Option<Arc<[Certificate]>>,
+	/// the key that signs its replies and its receipts, and for a CMS server
+	/// the key-agreement identity its opening seals to.
+	pub(crate) server_identity: Option<ServerIdentities<P>>,
+	/// The trust in the CMS server, built once over its two provisioned
+	/// certificates, which the CMS handshake needs before the server speaks.
+	#[cfg(feature = "transport-cms")]
+	pub(crate) cms_server: Option<ProvisionedTrust>,
 	/// The identity this endpoint presents as a client for mutual
 	/// authentication: the certificate and the key that proves it.
 	pub(crate) client_identity: Option<SigningIdentity>,
 	/// How a server endpoint authenticates its client.
 	pub(crate) peer_authentication: PeerAuthentication,
+	/// The key purpose of each role the endpoint's handshakes admit.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	pub(crate) key_purposes: KeyPurposes,
 	/// Local multiplexing capability advertised in the handshake.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub(crate) mux_offer: Option<Arc<TransportOffer>>,
@@ -543,9 +636,11 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 		self.trust_store.as_ref()
 	}
 
-	/// Local server certificate this endpoint presents.
+	/// Local server certificate this endpoint presents, the one whose key
+	/// signs its replies.
 	pub fn server_certificate(&self) -> Option<&Certificate> {
-		self.server_identity.as_ref().map(SigningIdentity::certificate)
+		let identity = self.server_identity.as_ref();
+		identity.map(|identity| identity.signing().certificate())
 	}
 
 	/// Client certificate presented for mutual authentication.
@@ -566,6 +661,7 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 	/// - A server certificate this endpoint presents.
 	/// - Mutual authentication a server demands of its client.
 	/// - A trust store a client checks the server certificate against.
+	/// - The trust in a CMS server a client provisioned, which holds its store.
 	///
 	/// A client certificate proves who this endpoint is, so it answers a
 	/// different question and is absent here.
@@ -577,8 +673,11 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 			server_identity,
 			trust_store,
 			peer_authentication,
-			server_certificate_chain: _,
+			#[cfg(feature = "transport-cms")]
+			cms_server,
 			client_identity: _,
+			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+				key_purposes: _,
 			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 				mux_offer: _,
 			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -591,8 +690,12 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 			allow_cleartext: _,
 			provider: _,
 		} = self;
+		#[cfg(feature = "transport-cms")]
+		let server_trust = cms_server.is_some();
+		#[cfg(not(feature = "transport-cms"))]
+		let server_trust = false;
 
-		server_identity.is_some() || trust_store.is_some() || peer_authentication.requires_certificate()
+		server_identity.is_some() || trust_store.is_some() || server_trust || peer_authentication.requires_certificate()
 	}
 
 	/// Whether this endpoint carries a client identity.
@@ -619,6 +722,26 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 		Ok(())
 	}
 
+	/// Refuse this provisioning when an identity it presents names another
+	/// key purpose than its role's (RFC 5280 §4.2.1.12). It runs once, where
+	/// the provisioning is answered.
+	///
+	/// # Errors
+	///
+	/// - The [`CertificateExt::require_purpose`] set, for the server identity
+	///   under the server purpose or the client identity under the client's.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	pub(crate) fn admit_own_identities(&self) -> Result<(), CertificateValidationError> {
+		if let Some(identity) = &self.server_identity {
+			identity.require_purpose(self.key_purposes.server)?;
+		}
+		if let Some(identity) = &self.client_identity {
+			identity.certificate().require_purpose(self.key_purposes.client)?;
+		}
+
+		Ok(())
+	}
+
 	/// Provisioning with nothing installed, which a builder accumulates into.
 	///
 	/// It authenticates no peer and names no cleartext, so it becomes a
@@ -627,9 +750,12 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 		Self {
 			trust_store: None,
 			server_identity: None,
-			server_certificate_chain: None,
+			#[cfg(feature = "transport-cms")]
+			cms_server: None,
 			client_identity: None,
 			peer_authentication: PeerAuthentication::Anonymous,
+			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+			key_purposes: KeyPurposes::default(),
 			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 			mux_offer: None,
 			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -664,14 +790,19 @@ pub trait ServerHandshakeSlot: sealed::Sealed {
 pub struct DialableEncryption<P: CryptoProvider>(EncryptionConfig<P>);
 
 impl<P: CryptoProvider> DialableEncryption<P> {
-	/// Check `encryption` against the dialer rule.
+	/// Check `encryption` against the dialer rule, and each identity it
+	/// presents against the key purpose of its role.
 	///
 	/// # Errors
 	///
 	/// - [`TransportError::PeerAuthenticationUnconfigured`] -- the endpoint
 	///   authenticates no peer and did not name cleartext.
+	/// - [`TransportError::HandshakeError`] -- an identity names another key
+	///   purpose than its role's.
 	pub fn new(encryption: EncryptionConfig<P>) -> TransportResult<Self> {
 		encryption.check_dial_permitted()?;
+		#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+		encryption.admit_own_identities().map_err(HandshakeError::from)?;
 		Ok(Self(encryption))
 	}
 
@@ -682,18 +813,6 @@ impl<P: CryptoProvider> DialableEncryption<P> {
 	/// already secures.
 	pub fn cleartext() -> Self {
 		let encryption = EncryptionConfig { allow_cleartext: true, ..EncryptionConfig::unconfigured() };
-		Self(encryption)
-	}
-
-	/// Accept provisioning that carries a peer authority by construction.
-	///
-	/// [`TransportEncryptionConfig`] holds a server certificate instead of an
-	/// `Option` of one, so [`EncryptionConfig::is_provisioned`] holds for every
-	/// value it converts to and the rule has no work to do. That conversion is
-	/// the only caller, and every other path goes through [`Self::new`].
-	///
-	/// [`TransportEncryptionConfig`]: crate::transport::TransportEncryptionConfig
-	pub(crate) fn from_peer_authority(encryption: EncryptionConfig<P>) -> Self {
 		Self(encryption)
 	}
 
@@ -812,6 +931,8 @@ mod tests {
 	use crate::testing::TestFrame;
 	use crate::utils::time::{Clock, ManualClock};
 
+	#[cfg(all(feature = "transport-cms", feature = "testing"))]
+	use crate::testing::fixtures::TestCmsServer;
 	#[cfg(feature = "testing")]
 	use crate::testing::fixtures::{TestCertificate, TestKey};
 
@@ -873,6 +994,25 @@ mod tests {
 
 		let cleartext = SessionState::<DefaultCryptoProvider>::new(DialableEncryption::cleartext());
 		assert!(matches!(cleartext.phase(), SessionPhase::Cleartext));
+		Ok(())
+	}
+
+	/// A CMS client whose server trust is provisioned holds a peer authority,
+	/// so it starts where a handshake is expected even when it names
+	/// cleartext (CWE-311).
+	#[cfg(all(feature = "transport-cms", feature = "testing"))]
+	#[test]
+	fn a_cms_client_of_a_provisioned_server_starts_provisioned() -> TransportResult<()> {
+		let server = TestCmsServer::generate("tightbeam provisioned client");
+		let encryption = EncryptionConfig::<DefaultCryptoProvider> {
+			cms_server: Some(server.trust()),
+			handshake_protocol: HandshakeProtocolKind::Cms,
+			allow_cleartext: true,
+			..EncryptionConfig::unconfigured()
+		};
+
+		let session = SessionState::new(DialableEncryption::new(encryption)?);
+		assert!(matches!(session.phase(), SessionPhase::Provisioned));
 		Ok(())
 	}
 

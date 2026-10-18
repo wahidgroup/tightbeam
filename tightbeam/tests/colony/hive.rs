@@ -23,15 +23,16 @@ use tightbeam::{
 	compose,
 	crypto::{
 		key::Secp256k1KeyProvider,
-		sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey},
-		x509::{Certificate, CertificateSpec},
+		profiles::DefaultCryptoProvider,
+		sign::ecdsa::Secp256k1SigningKey,
+		x509::{Certificate, CertificateSpec, KeyPurposes, PeerCertificate, Signing},
 	},
 	decode,
 	der::Sequence,
 	exactly, hive,
 	policy::TransitStatus,
 	servlet, tb_assert_spec, tb_scenario,
-	testing::{HiveEnv, SetupEnv, TestDigest, TestIdentity, TestKey},
+	testing::{HiveEnv, SetupEnv, TestCertificate, TestDigest, TestIdentity, TestKey},
 	trace::TraceCollector,
 	transport::{
 		handshake::negotiation::TransportOffer, tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder,
@@ -900,12 +901,14 @@ async fn sign_contract_frame(mut frame: Frame) -> Result<Frame, TightBeamError> 
 	Ok(frame)
 }
 
-/// Returns true when the signature on `frame` verifies against the shared
-/// contract key. A verified signature proves byte fidelity end to end.
+/// Returns true when the signature on `frame` verifies against the
+/// certificate of the shared contract key. A verified signature proves byte
+/// fidelity end to end.
 fn contract_signature_verifies(frame: &Frame) -> bool {
-	frame
-		.verify::<Secp256k1Signature>(contract_signing_key().verifying_key())
-		.is_ok()
+	let certificate = TestCertificate::self_signed(&contract_signing_key());
+	let signer = PeerCertificate::<Signing<DefaultCryptoProvider>>::parse(certificate, KeyPurposes::HOUSE.signer);
+	let signer = signer.expect("the contract certificate asserts digitalSignature");
+	frame.verify(&signer).is_ok()
 }
 
 servlet! {

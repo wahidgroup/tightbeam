@@ -522,8 +522,9 @@ pub type DuplexOpenFuture<'a> =
 /// ```
 /// # use tightbeam::builder::{frame::FrameBuilder, TypeBuilder};
 /// # use tightbeam::colony::hive::{CallFuture, HiveContext};
-/// # use tightbeam::crypto::sign::ecdsa::Secp256k1Signature;
-/// # use tightbeam::testing::{TestIdentity, TestKey, TestMessage};
+/// # use tightbeam::crypto::profiles::DefaultCryptoProvider;
+/// # use tightbeam::crypto::x509::{KeyPurposes, PeerCertificate, Signing};
+/// # use tightbeam::testing::{TestCertificate, TestIdentity, TestKey, TestMessage};
 /// # use tightbeam::urn::Urn;
 /// # use tightbeam::{decode, Frame, TightBeamError, Version};
 /// #
@@ -546,7 +547,9 @@ pub type DuplexOpenFuture<'a> =
 /// # runtime.block_on(async {
 /// # let ctx = EchoSibling;
 /// # let keymanager_urn = tightbeam::urn!("tightbeam", "servlet:keymanager");
-/// # let sibling_key = TestKey::insecure_fixed_signing();
+/// # let sibling_certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+/// # let purpose = KeyPurposes::HOUSE.signer;
+/// # let sibling = PeerCertificate::<Signing<DefaultCryptoProvider>>::parse(sibling_certificate, purpose)?;
 /// let caller = TestIdentity::insecure_fixed();
 ///
 /// let mut request = FrameBuilder::from(Version::V1)
@@ -558,7 +561,7 @@ pub type DuplexOpenFuture<'a> =
 /// let reply = ctx.call(&keymanager_urn, request).await?;
 ///
 /// // The reply is the sibling's complete envelope: verify, then decode.
-/// reply.verify::<Secp256k1Signature>(sibling_key.verifying_key())?;
+/// reply.verify(&sibling)?;
 /// let response: TestMessage = decode(reply.message())?;
 /// assert_eq!(response.content, "unwrap key 7");
 /// # Ok::<(), TightBeamError>(())

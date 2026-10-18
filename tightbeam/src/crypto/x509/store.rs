@@ -10,7 +10,7 @@ use crate::cms::signed_data::SignerIdentifier;
 use crate::crypto::policy::VerificationPolicy;
 use crate::crypto::x509::error::CertificateValidationError;
 use crate::crypto::x509::policy::CertificateValidation;
-use crate::crypto::x509::Certificate;
+use crate::crypto::x509::{Certificate, ErasedSigning, PeerCertificate};
 use crate::spki::SubjectPublicKeyInfoOwned;
 
 #[cfg(feature = "signature")]
@@ -22,12 +22,10 @@ mod std_imports {
 	pub use std::sync::Arc;
 
 	pub use crate::crypto::hash::{Digest, Sha3_256, U32};
-	pub use crate::crypto::x509::ext::pkix::{
-		BasicConstraints, KeyUsage, KeyUsages, SubjectAltName, SubjectKeyIdentifier,
-	};
+	pub use crate::crypto::x509::ext::pkix::{BasicConstraints, KeyUsage, KeyUsages, SubjectKeyIdentifier};
 	pub use crate::crypto::x509::name::Name;
 	pub use crate::crypto::x509::utils::{CertificateExt, Fingerprint};
-	pub use crate::der::oid::AssociatedOid;
+	pub use crate::crypto::x509::KeyPurposes;
 	pub use crate::der::Encode;
 }
 
@@ -150,8 +148,9 @@ pub enum TrustVerification<'a> {
 	/// The signer is trusted, and the signature fails verification.
 	Invalid,
 	/// The signature verified against the certificate that this store
-	/// resolved. The verified signature is the replay key of the frame.
-	Verified(&'a Certificate, VerifiedSignature),
+	/// resolved, which it admitted for signing at enrolment. The verified
+	/// signature is the replay key of the frame.
+	Verified(&'a PeerCertificate<ErasedSigning>, VerifiedSignature),
 }
 
 /// Certificate trust verification.
@@ -223,19 +222,22 @@ pub trait CertificateTrust: CertificateValidation + Debug + Send + Sync {
 	/// - [`CertificateValidationError`] -- the chain fails validation.
 	fn verify_chain(&self, chain: &[Certificate]) -> Result<(), CertificateValidationError>;
 
-	/// Find a certificate by CMS [`SignerIdentifier`].
+	/// Find a certificate admitted for signing by CMS [`SignerIdentifier`].
 	///
-	/// Frame verification resolves its signer here. The subject-key-identifier
-	/// form matches a certificate's `subjectKeyIdentifier` extension value
-	/// (RFC 5652 §5.3), and the issuer-and-serial form matches its issuer and
-	/// serial number.
-	fn find_by_signer_identifier(&self, sid: &SignerIdentifier) -> Option<&Certificate>;
+	/// Frame verification resolves its signer here (RFC 5652 §5.3):
+	///
+	/// - The subject-key-identifier form matches a certificate's `subjectKeyIdentifier` extension value.
+	/// - The issuer-and-serial form matches its issuer and serial number.
+	///
+	/// A store admits each certificate for signing once, at enrolment, so a
+	/// certificate that only certifies others resolves no signer.
+	fn find_by_signer_identifier(&self, sid: &SignerIdentifier) -> Option<&PeerCertificate<ErasedSigning>>;
 
-	/// Find a certificate by `SignerInfo`.
+	/// Find a certificate admitted for signing by `SignerInfo`.
 	///
 	/// Frame signature verification uses it. It resolves through
 	/// [`Self::find_by_signer_identifier`] on the info's `sid`.
-	fn find_by_signer_info(&self, signer_info: &crate::SignerInfo) -> Option<&Certificate> {
+	fn find_by_signer_info(&self, signer_info: &crate::SignerInfo) -> Option<&PeerCertificate<ErasedSigning>> {
 		self.find_by_signer_identifier(&signer_info.sid)
 	}
 
@@ -258,12 +260,12 @@ pub trait CertificateTrust: CertificateValidation + Debug + Send + Sync {
 			return TrustVerification::MissingSignature;
 		};
 
-		let Some(cert) = self.find_by_signer_info(signer_info) else {
+		let Some(signer) = self.find_by_signer_info(signer_info) else {
 			return TrustVerification::UnknownSigner;
 		};
 
-		match frame.verify_under(cert, self.to_policy_ref()) {
-			Ok(signature) => TrustVerification::Verified(cert, signature),
+		match frame.verify_under(signer, self.to_policy_ref()) {
+			Ok(signature) => TrustVerification::Verified(signer, signature),
 			Err(_) => TrustVerification::Invalid,
 		}
 	}
@@ -289,67 +291,6 @@ pub trait TrustBuilder: Sized {
 
 	/// Build the sealed trust store.
 	fn build(self) -> Self::Store;
-}
-
-/// Reject a certificate that bears a critical extension this validator does
-/// not process.
-///
-/// RFC 5280 §4.2 says a certificate-using system MUST reject a certificate
-/// when it encounters a critical extension it cannot process, and §6.1.3(f)
-/// applies the same rule during path validation
-/// (<https://datatracker.ietf.org/doc/html/rfc5280#section-4.2>).
-///
-/// # Processed extensions
-///
-/// - `basicConstraints` (§4.2.1.9).
-/// - `keyUsage` (§4.2.1.3).
-/// - `subjectAltName` (§4.2.1.6). Colony membership consumes it as the URI SAN
-///   colony URN, and it MUST be critical when the subject DN is empty
-///   (§4.1.2.6).
-///
-/// Any other critical extension fails closed. That includes `nameConstraints`
-/// and `policyConstraints`, which are not implemented.
-///
-/// # Name-based verification
-///
-/// This validator performs no name-based endpoint verification. If one is
-/// ever added, it MUST match against the SAN contents, because a SAN accepted
-/// here is otherwise only consumed for colony membership.
-#[cfg(feature = "std")]
-fn ensure_critical_extensions_processed(cert: &Certificate) -> Result<(), CertificateValidationError> {
-	let Some(extensions) = cert.tbs_certificate.extensions.as_ref() else {
-		return Ok(());
-	};
-
-	for extension in extensions {
-		let processed = extension.extn_id == BasicConstraints::OID
-			|| extension.extn_id == KeyUsage::OID
-			|| extension.extn_id == SubjectAltName::OID;
-		if extension.critical && !processed {
-			return Err(CertificateValidationError::UnprocessedCriticalExtension(extension.extn_id));
-		}
-	}
-
-	Ok(())
-}
-
-/// Reject a certificate that carries more than one instance of an extension.
-///
-/// RFC 5280 §4.2 says a certificate MUST NOT include more than one instance
-/// of a particular extension, and the extension readers of the crate take
-/// the first instance they find.
-#[cfg(feature = "std")]
-fn ensure_unique_extensions(cert: &Certificate) -> Result<(), CertificateValidationError> {
-	let Some(extensions) = cert.tbs_certificate.extensions.as_ref() else {
-		return Ok(());
-	};
-
-	let mut seen = std::collections::HashSet::with_capacity(extensions.len());
-	let repeated = extensions.iter().find(|extension| !seen.insert(extension.extn_id));
-	match repeated {
-		Some(extension) => Err(CertificateValidationError::DuplicateExtension(extension.extn_id)),
-		None => Ok(()),
-	}
 }
 
 /// Reject a presented identity certificate that asserts the CA bit.
@@ -440,7 +381,10 @@ pub struct CertificateTrustStore {
 	/// The trusted certificate fingerprints.
 	fingerprints: HashSet<Sha3Fingerprint>,
 	/// The full certificates, indexed by fingerprint.
-	certificates: HashMap<Sha3Fingerprint, Certificate>,
+	certificates: HashMap<Sha3Fingerprint, Arc<Certificate>>,
+	/// The certificates admitted for signing at enrolment, indexed by
+	/// fingerprint, each sharing its certificate with [`Self::certificates`].
+	signers: HashMap<Sha3Fingerprint, PeerCertificate<ErasedSigning>>,
 	/// The `subjectKeyIdentifier` extension values, each to its certificate
 	/// fingerprint.
 	skid_index: HashMap<Vec<u8>, Sha3Fingerprint>,
@@ -464,7 +408,7 @@ impl CertificateTrustStore {
 
 	/// Returns the certificate with `fingerprint`, if the store holds one.
 	pub fn to_certificate_ref(&self, fingerprint: &Sha3Fingerprint) -> Option<&Certificate> {
-		self.certificates.get(fingerprint)
+		self.certificates.get(fingerprint).map(Arc::as_ref)
 	}
 
 	/// Returns the number of trusted certificates.
@@ -537,8 +481,8 @@ impl CertificateTrustStore {
 
 		// RFC 5280 §4.2, §6.1.3(f): an unprocessed critical extension, or a
 		// repeated extension, fails closed.
-		path.iter().try_for_each(|cert| ensure_critical_extensions_processed(cert))?;
-		path.iter().try_for_each(|cert| ensure_unique_extensions(cert))?;
+		path.iter().try_for_each(|cert| cert.ensure_critical_extensions_processed())?;
+		path.iter().try_for_each(|cert| cert.ensure_unique_extensions())?;
 
 		// Defense in depth: the terminal identity must not assert the CA bit.
 		ensure_terminal_is_end_entity(path)?;
@@ -622,11 +566,8 @@ impl CertificateValidation for CertificateTrustStore {
 		loop {
 			// RFC 5280 §6.1.3(a)(4): locate an issuer whose subject DN matches
 			// the current certificate's issuer DN.
-			let Some(issuer) = self
-				.certificates
-				.values()
-				.find(|c| c.tbs_certificate.subject == current.tbs_certificate.issuer)
-			else {
+			let mut held = self.certificates.values().map(Arc::as_ref);
+			let Some(issuer) = held.find(|c| c.tbs_certificate.subject == current.tbs_certificate.issuer) else {
 				break;
 			};
 
@@ -673,15 +614,15 @@ impl CertificateTrust for CertificateTrustStore {
 		self.validate_path(&path)
 	}
 
-	fn find_by_signer_identifier(&self, sid: &SignerIdentifier) -> Option<&Certificate> {
+	fn find_by_signer_identifier(&self, sid: &SignerIdentifier) -> Option<&PeerCertificate<ErasedSigning>> {
 		match sid {
 			SignerIdentifier::IssuerAndSerialNumber(_) => {
-				let mut certificates = self.certificates.values();
-				certificates.find(|cert| cert.is_named_by(sid).is_ok_and(|named| named))
+				let mut signers = self.signers.values();
+				signers.find(|signer| signer.certificate().is_named_by(sid).is_ok_and(|named| named))
 			}
 			SignerIdentifier::SubjectKeyIdentifier(skid) => {
 				let fingerprint = self.skid_index.get(skid.0.as_bytes())?;
-				self.certificates.get(fingerprint)
+				self.signers.get(fingerprint)
 			}
 		}
 	}
@@ -689,7 +630,7 @@ impl CertificateTrust for CertificateTrustStore {
 	fn find_by_public_key(&self, spki: &SubjectPublicKeyInfoOwned) -> Option<&Certificate> {
 		let spki_der = spki.to_der().ok()?;
 		let fingerprint = self.key_index.get(&spki_der)?;
-		self.certificates.get(fingerprint)
+		self.certificates.get(fingerprint).map(Arc::as_ref)
 	}
 
 	fn to_policy_ref(&self) -> &dyn VerificationPolicy {
@@ -705,10 +646,14 @@ impl CertificateTrust for CertificateTrustStore {
 ///
 /// - By its `subjectKeyIdentifier` value, which a `sid` resolves through (RFC 5652 §5.3).
 /// - By its SubjectPublicKeyInfo, which plane membership reads.
+///
+/// [`TrustBuilder::build`] admits the signers among them under the signer
+/// purpose of its [`KeyPurposes`].
 #[cfg(feature = "std")]
 pub struct CertificateTrustBuilder {
 	fingerprints: HashSet<Sha3Fingerprint>,
-	certificates: HashMap<Sha3Fingerprint, Certificate>,
+	certificates: HashMap<Sha3Fingerprint, Arc<Certificate>>,
+	purposes: KeyPurposes,
 	skid_index: HashMap<Vec<u8>, Sha3Fingerprint>,
 	key_index: HashMap<Vec<u8>, Sha3Fingerprint>,
 	policy: Arc<dyn VerificationPolicy>,
@@ -721,6 +666,7 @@ impl<P: VerificationPolicy + 'static> From<P> for CertificateTrustBuilder {
 		Self {
 			fingerprints: HashSet::new(),
 			certificates: HashMap::new(),
+			purposes: KeyPurposes::default(),
 			skid_index: HashMap::new(),
 			key_index: HashMap::new(),
 			policy: Arc::new(policy),
@@ -748,6 +694,15 @@ impl CertificateTrustBuilder {
 	/// The default is [`NoRevocation`], the documented closed-PKI waiver.
 	pub fn with_revocation_checker(mut self, checker: impl RevocationChecker + 'static) -> Self {
 		self.revocation = Arc::new(checker);
+		self
+	}
+
+	/// Set the key purposes the store admits its signers under, the
+	/// [`KeyPurposes::signer`] purpose for a frame and colony signer.
+	///
+	/// The default is [`KeyPurposes::HOUSE`].
+	pub fn with_key_purposes(mut self, purposes: KeyPurposes) -> Self {
+		self.purposes = purposes;
 		self
 	}
 
@@ -781,7 +736,7 @@ impl CertificateTrustBuilder {
 		}
 
 		self.key_index.insert(spki_der, fp);
-		self.certificates.insert(fp, cert);
+		self.certificates.insert(fp, Arc::new(cert));
 
 		Ok(())
 	}
@@ -823,7 +778,17 @@ impl TrustBuilder for CertificateTrustBuilder {
 	}
 
 	fn build(self) -> Self::Store {
+		// A certificate that the signer role refuses, such as an issuer that
+		// asserts `keyCertSign` alone, stays a path certificate and resolves
+		// no signer, so its refusal is the answer and drops here.
+		let purpose = self.purposes.signer;
+		let signers = self.certificates.iter().filter_map(|(fp, cert)| {
+			let signer = PeerCertificate::<ErasedSigning>::parse(Arc::clone(cert), purpose);
+			signer.ok().map(|signer| (*fp, signer))
+		});
+
 		CertificateTrustStore {
+			signers: signers.collect(),
 			fingerprints: self.fingerprints,
 			certificates: self.certificates,
 			skid_index: self.skid_index,
@@ -851,7 +816,8 @@ mod tests {
 	use crate::crypto::policy::Secp256k1Policy;
 	use crate::crypto::sign::ecdsa::{Secp256k1Signature, SigningKey};
 	use crate::crypto::sign::{CmsSigner, SignedContent};
-	use crate::der::asn1::OctetString;
+	use crate::der::asn1::{ObjectIdentifier, OctetString};
+	use crate::der::oid::AssociatedOid;
 	use crate::testing::fixtures::{TestCertificate, TestCertificateChain, TestIdentity};
 	use crate::testing::{TestFrame, TestKey};
 
@@ -1071,75 +1037,11 @@ mod tests {
 		Ok(())
 	}
 
-	/// Wrap an empty payload in an extension with the given OID and
-	/// criticality, for the RFC 5280 §4.2 critical-extension tests.
-	fn opaque_extension(oid: impl AsRef<str>, critical: bool) -> crate::x509::ext::Extension {
-		let oid = oid.as_ref();
-		crate::x509::ext::Extension {
-			extn_id: crate::der::oid::ObjectIdentifier::new_unwrap(oid),
-			critical,
-			extn_value: crate::der::asn1::OctetString::new(Vec::new()).expect("empty payload fits an OCTET STRING"),
-		}
-	}
-
-	#[test]
-	fn rejects_unknown_critical_extension() {
-		// nameConstraints (2.5.29.30) is not processed by this validator.
-		let mut cert = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
-		cert.tbs_certificate.extensions = Some(vec![opaque_extension("2.5.29.30", true)]);
-		assert!(matches!(
-			ensure_critical_extensions_processed(&cert),
-			Err(CertificateValidationError::UnprocessedCriticalExtension(_))
-		));
-	}
-
-	#[test]
-	fn accepts_unknown_noncritical_extension() {
-		let mut cert = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
-		cert.tbs_certificate.extensions = Some(vec![opaque_extension("2.5.29.30", false)]);
-		assert!(ensure_critical_extensions_processed(&cert).is_ok());
-	}
-
-	#[test]
-	fn accepts_processed_critical_extensions() {
-		let mut cert = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
-		cert.tbs_certificate.extensions = Some(TestCertificate::ca_extensions(true, true, None));
-		assert!(ensure_critical_extensions_processed(&cert).is_ok());
-	}
-
-	/// A certificate with two `keyUsage` extensions is refused (RFC 5280
-	/// §4.2).
-	#[test]
-	fn rejects_a_repeated_extension() {
-		let mut cert = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
-		let repeated = vec![opaque_extension("2.5.29.15", true), opaque_extension("2.5.29.15", true)];
-
-		cert.tbs_certificate.extensions = Some(repeated);
-
-		let refused = ensure_unique_extensions(&cert);
-		assert!(matches!(refused, Err(CertificateValidationError::DuplicateExtension(_))));
-	}
-
-	#[test]
-	fn accepts_one_instance_of_each_extension() {
-		let cert = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
-		assert!(ensure_unique_extensions(&cert).is_ok());
-	}
-
-	#[test]
-	fn accepts_critical_subject_alt_name() {
-		// subjectAltName (2.5.29.17) is processed for colony membership and
-		// MUST be critical when the subject DN is empty (RFC 5280 §4.1.2.6).
-		let mut cert = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
-		cert.tbs_certificate.extensions = Some(vec![opaque_extension("2.5.29.17", true)]);
-		assert!(ensure_critical_extensions_processed(&cert).is_ok());
-	}
-
 	#[test]
 	fn verify_chain_rejects_unknown_critical_extension() -> TestResult {
 		let chain = TestCertificate::insecure_fixed_chain()?;
 		let mut leaf = chain.leaf.to_owned();
-		leaf.tbs_certificate.extensions = Some(vec![opaque_extension("2.5.29.30", true)]);
+		leaf.tbs_certificate.extensions = Some(vec![TestCertificate::opaque_extension("2.5.29.30", true)]);
 
 		let store = build_store(&chain, StoreCerts::Root)?;
 		let result = store.verify_chain(&[chain.root, chain.intermediate, leaf]);
@@ -1155,13 +1057,46 @@ mod tests {
 	fn verify_chain_rejects_a_repeated_extension() -> TestResult {
 		let chain = TestCertificate::insecure_fixed_chain()?;
 		let mut leaf = chain.leaf.to_owned();
-		let repeated = vec![opaque_extension("2.5.29.15", true), opaque_extension("2.5.29.15", true)];
+		let key_usage = TestCertificate::opaque_extension("2.5.29.15", true);
+		let repeated = vec![key_usage.clone(), key_usage];
 
 		leaf.tbs_certificate.extensions = Some(repeated);
 
 		let store = build_store(&chain, StoreCerts::Root)?;
 		let result = store.verify_chain(&[chain.root, chain.intermediate, leaf]);
 		assert!(matches!(result, Err(CertificateValidationError::DuplicateExtension(_))));
+		Ok(())
+	}
+
+	/// The issuer walk refuses a leaf that repeats an extension, as the chain
+	/// path does (RFC 5280 §4.2).
+	#[test]
+	fn evaluate_rejects_a_repeated_extension() -> TestResult {
+		let chain = TestCertificate::insecure_fixed_chain()?;
+		let key_identifier = TestCertificate::opaque_extension("2.5.29.14", false);
+		let leaf = TestCertificate::with_extension(chain.leaf.to_owned(), key_identifier.clone());
+		let leaf = TestCertificate::with_extension(leaf, key_identifier);
+
+		let store = build_store(&chain, StoreCerts::RootAndIntermediate)?;
+		let refused = store.evaluate(&leaf);
+		assert!(matches!(refused, Err(CertificateValidationError::DuplicateExtension(_))));
+		Ok(())
+	}
+
+	/// The issuer walk refuses a leaf that bears a critical extension the
+	/// crate does not process, as the chain path does (RFC 5280 §4.2).
+	#[test]
+	fn evaluate_rejects_an_unknown_critical_extension() -> TestResult {
+		let chain = TestCertificate::insecure_fixed_chain()?;
+		let name_constraints = TestCertificate::opaque_extension("2.5.29.30", true);
+		let leaf = TestCertificate::with_extension(chain.leaf.to_owned(), name_constraints);
+
+		let store = build_store(&chain, StoreCerts::RootAndIntermediate)?;
+		let refused = store.evaluate(&leaf);
+		assert!(matches!(
+			refused,
+			Err(CertificateValidationError::UnprocessedCriticalExtension(_))
+		));
 		Ok(())
 	}
 
@@ -1300,7 +1235,7 @@ mod tests {
 		let signer_info = CmsSigner::sign_with::<Secp256k1Signature, _>(&signer, SignedContent::data(b"test"))?;
 
 		let found = store.find_by_signer_info(&signer_info);
-		let fingerprint = found.map(CertificateTrustStore::to_fingerprint::<Sha3_256>);
+		let fingerprint = found.map(|signer| CertificateTrustStore::to_fingerprint::<Sha3_256>(signer.certificate()));
 		assert_eq!(
 			fingerprint.transpose()?,
 			Some(CertificateTrustStore::to_fingerprint::<Sha3_256>(&cert)?)
@@ -1312,8 +1247,8 @@ mod tests {
 	/// and serial number.
 	#[test]
 	fn an_issuer_and_serial_sid_resolves_through_the_certificate() -> TestResult {
-		let mut cert = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
-		cert.tbs_certificate.extensions = None;
+		let cert = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+		let cert = TestCertificate::without_extension(cert, SubjectKeyIdentifier::OID);
 
 		let store = CertificateTrustBuilder::from(Secp256k1Policy::default())
 			.with_certificate(cert.to_owned())?
@@ -1322,11 +1257,59 @@ mod tests {
 		let sid = cert.signer_identifier()?;
 		let found = store.find_by_signer_identifier(&sid);
 
-		let fingerprint = found.map(CertificateTrustStore::to_fingerprint::<Sha3_256>);
+		let fingerprint = found.map(|signer| CertificateTrustStore::to_fingerprint::<Sha3_256>(signer.certificate()));
 		assert_eq!(
 			fingerprint.transpose()?,
 			Some(CertificateTrustStore::to_fingerprint::<Sha3_256>(&cert)?)
 		);
+		Ok(())
+	}
+
+	/// An authority whose `keyUsage` asserts `keyCertSign` alone stays a path
+	/// certificate of the store, and resolves no signer.
+	#[test]
+	fn a_certificate_that_only_certifies_resolves_no_signer() -> TestResult {
+		let key = TestKey::insecure_fixed_signing();
+		let authority = TestCertificate::authority(&key, "Authority")?;
+		let builder = CertificateTrustBuilder::from(Secp256k1Policy::default());
+		let builder = builder.with_certificate(authority.to_owned())?;
+		let store = builder.build();
+
+		let sid = authority.signer_identifier()?;
+		let found = store.find_by_signer_identifier(&sid);
+		assert!(found.is_none());
+		Ok(())
+	}
+
+	/// A certificate whose `extendedKeyUsage` names the server's purpose alone
+	/// is no frame signer, so it resolves no signer (RFC 5280 §4.2.1.12).
+	#[test]
+	fn a_certificate_of_the_server_purpose_resolves_no_signer() -> TestResult {
+		let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+		let certificate = TestCertificate::with_key_purposes(certificate, [KeyPurposes::HOUSE.server]);
+		let builder = CertificateTrustBuilder::from(Secp256k1Policy::default());
+		let store = builder.with_certificate(certificate.to_owned())?.build();
+
+		let sid = certificate.signer_identifier()?;
+		let found = store.find_by_signer_identifier(&sid);
+		assert!(found.is_none());
+		Ok(())
+	}
+
+	/// A store configured with an implementor's own signer purpose resolves
+	/// a certificate that names it.
+	#[test]
+	fn a_certificate_of_a_configured_signer_purpose_resolves_its_signer() -> TestResult {
+		let own = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.3.2");
+		let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+		let certificate = TestCertificate::with_key_purposes(certificate, [own]);
+		let builder = CertificateTrustBuilder::from(Secp256k1Policy::default());
+		let builder = builder.with_key_purposes(KeyPurposes { signer: own, ..KeyPurposes::HOUSE });
+		let store = builder.with_certificate(certificate.to_owned())?.build();
+
+		let sid = certificate.signer_identifier()?;
+		let found = store.find_by_signer_identifier(&sid);
+		assert!(found.is_some());
 		Ok(())
 	}
 
@@ -1378,6 +1361,25 @@ mod tests {
 
 		let verification = store.verify_frame(&frame);
 		assert!(matches!(verification, TrustVerification::Verified(_, _)));
+		Ok(())
+	}
+
+	/// A trust store refuses a frame whose signer it holds only as a
+	/// certificate the signing use refuses, so the key of an authority signs
+	/// no frame the store accepts.
+	#[tokio::test]
+	async fn a_trust_store_resolves_no_signer_for_a_certifying_key() -> TestResult {
+		let key = TestKey::insecure_fixed_signing();
+		let authority = TestCertificate::authority(&key, "Authority")?;
+		let builder = CertificateTrustBuilder::from(Secp256k1Policy::default());
+		let builder = builder.with_certificate(authority)?;
+		let store = builder.build();
+
+		let mut frame = TestFrame::with_integrity();
+		frame.sign_with_provider(&TestIdentity::insecure_fixed()).await?;
+
+		let verification = store.verify_frame(&frame);
+		assert!(matches!(verification, TrustVerification::UnknownSigner));
 		Ok(())
 	}
 

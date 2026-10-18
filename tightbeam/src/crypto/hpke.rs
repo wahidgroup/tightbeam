@@ -97,19 +97,21 @@ use crate::constants::TIGHTBEAM_HPKE_FRAME_INFO;
 #[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
 use crate::crypto::cms::{Encapsulation, EnvelopeError, RecipientKem};
 #[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
-use crate::crypto::sign::SigningIdentity;
+use crate::crypto::key::DiffieHellman;
 #[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
 use crate::crypto::x509::error::CertificateValidationError;
 #[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
-use crate::crypto::x509::utils::CertificateExt;
+use crate::crypto::x509::ext::pkix::KeyUsages;
+#[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
+use crate::crypto::x509::EllipticCurvePoint;
 #[cfg(feature = "x509")]
 use crate::der::oid::AssociatedOid;
 #[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
 use crate::oids::DHKEM_SECP256K1;
 #[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
-use crate::utils::marker::MaybeSendFuture;
+use crate::spki::SubjectPublicKeyInfoRef;
 #[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
-use crate::x509::Certificate;
+use crate::utils::marker::MaybeSendFuture;
 
 /// The label every HPKE derivation leads with ([RFC 9180 §4][rfc9180-4]).
 ///
@@ -677,7 +679,7 @@ impl EcdhSecret {
 	///
 	/// 1. Parse the message with [`HpkeMessage::from_bytes`], which validates `pkE`.
 	/// 2. Obtain the DH output of [`HpkeMessage::encapsulated_key`] out of band,
-	///    for example from `SigningKeyProvider::key_agreement`.
+	///    for example from `DiffieHellman::agree` of a key backend.
 	/// 3. Open the message here.
 	///
 	/// - `recipient`: the public key the message was sealed to, which the KEM context binds.
@@ -771,9 +773,10 @@ where
 	}
 }
 
-/// The DHKEM on the curve `C` under the KDF `K` and `KEM_ID`, to the key of a
-/// certificate and through the key provider of an identity. The house
-/// [`RecipientKem`] runs on these, and a KEM under another identifier can too.
+/// The DHKEM on the curve `C` under the KDF `K` and `KEM_ID`, to a parsed
+/// recipient key and through the backend that holds its private half. The
+/// house [`RecipientKem`] runs on these, and a KEM under another identifier
+/// can too.
 #[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
 impl<C, K, const KEM_ID: u16> DhKem<C, K, KEM_ID>
 where
@@ -781,8 +784,8 @@ where
 	AffinePoint<C>: FromEncodedPoint<C> + ToEncodedPoint<C>,
 	K: HpkeKdf,
 {
-	/// `Encap(pkR)` to the key of `certificate` on `C`, with `enc` in
-	/// uncompressed SEC1 form as the `kemct`.
+	/// `Encap(pkR)` to `recipient`, with `enc` in uncompressed SEC1 form as
+	/// the `kemct`.
 	///
 	/// `C`, `K`, and `KEM_ID` together name one KEM, so an implementor pairs a
 	/// `KEM_ID` with the KDF its registration names, as `0x0016` names
@@ -790,21 +793,19 @@ where
 	///
 	/// # Errors
 	///
-	/// - [`EnvelopeError::Certificate`] -- the certificate holds no point on `C`.
 	/// - [`EnvelopeError::Kem`] -- the KEM failed a derivation.
 	pub fn encap_to(
-		certificate: &Certificate,
+		recipient: &PublicKey<C>,
 		rng: &mut dyn CryptoRngCore,
 	) -> core::result::Result<Encapsulation, EnvelopeError> {
-		let recipient_key = Self::certificate_key(certificate)?;
-		let (shared_secret, encapsulated_key) = Self::encap(&recipient_key, Some(rng))?;
+		let (shared_secret, encapsulated_key) = Self::encap(recipient, Some(rng))?;
 		let kemct = encapsulated_key.to_encoded_point(false).as_bytes().to_vec();
 		Ok(Encapsulation { shared_secret, kemct })
 	}
 
-	/// `Decap(kemct, skR)` through the key provider of `identity`, whose
-	/// certificate the sender encapsulated to. The point is parsed first, then
-	/// the provider runs `DH(skR, pkE)`.
+	/// `Decap(kemct, skR)` through `key`, the backend that holds the private
+	/// half of `recipient`. The point is parsed first, then the backend runs
+	/// `DH(skR, pkE)`.
 	///
 	/// `C`, `K`, and `KEM_ID` together name one KEM, so an implementor pairs a
 	/// `KEM_ID` with the KDF its registration names, as `0x0016` names
@@ -813,32 +814,20 @@ where
 	/// # Errors
 	///
 	/// - [`EnvelopeError::KemPoint`] -- `kemct` is no uncompressed point on `C`.
-	/// - [`EnvelopeError::Certificate`] -- the certificate holds no point on `C`.
-	/// - [`EnvelopeError::Key`] -- the key provider failed the agreement.
+	/// - [`EnvelopeError::Key`] -- the backend failed the agreement.
 	/// - [`EnvelopeError::Kdf`] -- the agreement is not 32 octets.
 	/// - [`EnvelopeError::Kem`] -- the KEM failed a derivation.
 	pub fn decap_through<'a>(
-		identity: &'a SigningIdentity,
+		key: &'a (impl DiffieHellman<C> + ?Sized),
+		recipient: &'a PublicKey<C>,
 		kemct: &'a [u8],
 	) -> MaybeSendFuture<'a, core::result::Result<ZeroizingBytes, EnvelopeError>> {
 		Box::pin(async move {
 			let encapsulated_key = Self::encapsulated_key(kemct)?;
-			let recipient_key = Self::certificate_key(identity.certificate())?;
-			let agreed = identity.provider().key_agreement(kemct).await?;
+			let agreed = key.agree(&encapsulated_key).await?;
 			let dh = EcdhSecret::try_from(agreed)?;
-			Ok(Self::decap(dh, &encapsulated_key, &recipient_key)?)
+			Ok(Self::decap(dh, &encapsulated_key, recipient)?)
 		})
-	}
-
-	/// The key of the SubjectPublicKeyInfo of `certificate` as a point on
-	/// `C`, the key the KEM encapsulates to.
-	///
-	/// # Errors
-	///
-	/// - [`EnvelopeError::Certificate`] -- the key is no point on `C`.
-	fn certificate_key(certificate: &Certificate) -> core::result::Result<PublicKey<C>, EnvelopeError> {
-		let key = PublicKey::from_sec1_bytes(certificate.verifying_key_bytes());
-		Ok(key.map_err(CertificateValidationError::from)?)
 	}
 
 	/// `kemct` as DHKEM's `enc`: the uncompressed SEC1 form of a point on `C`,
@@ -859,29 +848,49 @@ where
 }
 
 /// DHKEM(secp256k1, HKDF-SHA256), the KEM `0x0016` that
-/// [`DHKEM_SECP256K1`] names: the house KEM.
+/// [`DHKEM_SECP256K1`] names: the house KEM. Its recipient key is a point on
+/// secp256k1, and its backend runs the Diffie-Hellman agreement.
 #[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
 impl RecipientKem for DhKemSecp256k1 {
 	const OID: ObjectIdentifier = DHKEM_SECP256K1;
+	const USAGE: KeyUsages = KeyUsages::KeyAgreement;
+	type PublicKey = PublicKey<Secp256k1>;
+	type PrivateKey = dyn DiffieHellman<Secp256k1>;
+
+	/// The `id-ecPublicKey` SPKI on secp256k1 (RFC 5480 §2.1.1), whose point
+	/// is compressed or uncompressed (§2.2) and on the curve.
+	///
+	/// # Errors
+	///
+	/// - [`CertificateValidationError::SpkiError`] -- the SPKI names another
+	///   algorithm or curve, its point is in another form, or it holds no
+	///   point.
+	fn public_key(
+		spki: SubjectPublicKeyInfoRef<'_>,
+	) -> core::result::Result<PublicKey<Secp256k1>, CertificateValidationError> {
+		spki.require_point_form()?;
+		Ok(PublicKey::<Secp256k1>::try_from(spki)?)
+	}
 
 	/// # Errors
 	///
 	/// - The [`DhKem::encap_to`] set.
 	fn encapsulate(
-		certificate: &Certificate,
+		recipient: &PublicKey<Secp256k1>,
 		rng: &mut dyn CryptoRngCore,
 	) -> core::result::Result<Encapsulation, EnvelopeError> {
-		Self::encap_to(certificate, rng)
+		Self::encap_to(recipient, rng)
 	}
 
 	/// # Errors
 	///
 	/// - The [`DhKem::decap_through`] set.
 	fn decapsulate<'a>(
-		identity: &'a SigningIdentity,
+		key: &'a dyn DiffieHellman<Secp256k1>,
+		recipient: &'a PublicKey<Secp256k1>,
 		kemct: &'a [u8],
 	) -> MaybeSendFuture<'a, core::result::Result<ZeroizingBytes, EnvelopeError>> {
-		Self::decap_through(identity, kemct)
+		Self::decap_through(key, recipient, kemct)
 	}
 }
 
@@ -1032,7 +1041,7 @@ impl crate::crypto::aead::Decryptor for HpkeDecryptor {
 /// An HPKE decryptor driven by a precomputed `DH(skR, pkE)` output.
 ///
 /// It pairs with [`HpkeMessage::encapsulated_key`] and an async key-agreement
-/// backend (`SigningKeyProvider::key_agreement`) so the recipient private key
+/// backend (`DiffieHellman::agree`) so the recipient private key
 /// can stay inside an HSM, a KMS, or a secure enclave. It opens the suite that
 /// [`HpkeSecp256k1Sha3Aes256GcmOid`] names.
 #[cfg(feature = "x509")]
@@ -2002,15 +2011,14 @@ mod tests {
 		Ok(())
 	}
 
-	/// Open an HPKE payload with the recipient private key held behind a
-	/// `SigningKeyProvider`: the `DH(skR, pkE)` step runs via `key_agreement`,
-	/// then the shared-secret decryptor opens it through the standard
-	/// `Decryptor`.
+	/// Open an HPKE payload with the recipient private key held behind a key
+	/// backend: the `DH(skR, pkE)` step runs via `DiffieHellman::agree`, then
+	/// the shared-secret decryptor opens it through the standard `Decryptor`.
 	#[cfg(all(feature = "x509", feature = "signature", feature = "ecdh", feature = "tokio"))]
 	#[tokio::test]
 	async fn shared_secret_decryptor_via_provider() -> crate::error::Result<()> {
 		use crate::crypto::aead::{DecryptContent, Encryptor};
-		use crate::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
+		use crate::crypto::key::{DiffieHellman, Secp256k1KeyProvider};
 		use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 
 		let plaintext = b"hsm-backed hpke decryption";
@@ -2019,9 +2027,8 @@ mod tests {
 		let wire = info.encrypted_content.as_ref().ok_or(HpkeError::InvalidCiphertext)?.as_bytes();
 
 		let message = HpkeMessage::<Suite>::from_bytes(wire)?;
-		let enc = message.encapsulated_key().to_encoded_point(false);
 		let provider = Secp256k1KeyProvider::from(Secp256k1SigningKey::from(secret));
-		let shared = provider.key_agreement(enc.as_bytes()).await?;
+		let shared = provider.agree(message.encapsulated_key()).await?;
 
 		let decryptor = HpkeSharedSecretDecryptor::new(EcdhSecret::try_from(shared)?, public);
 		let opened = decryptor.decrypt_content(&info)?.to_insecure();

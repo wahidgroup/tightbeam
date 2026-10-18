@@ -4,7 +4,9 @@
 //! handshake over a real TCP socket through public interfaces only:
 //!
 //! - the `server!` policy list selects the protocol per accepted connection, and
-//! - [`ClientBuilder`] carries the server chain the client's first flight encrypts its base secret to.
+//! - [`ClientBuilder`] carries the server's two certificates: the client's
+//!   first flight seals its base secret to the key-agreement certificate, and
+//!   the signing certificate verifies the reply.
 
 #![cfg(all(
 	feature = "tcp",
@@ -34,8 +36,8 @@ use tightbeam::x509::Certificate;
 use tightbeam::{Frame, TightBeamError};
 use tokio::task::JoinHandle;
 
-use crate::common::security::{pinning_trust_store, random_signing_key, test_certificate, ServerMaterials};
-use crate::transport::support::bind_mutual_listener;
+use crate::common::security::{random_signing_key, test_certificate, ServerMaterials};
+use crate::transport::support::bind_cms_mutual_listener;
 
 pub(crate) const CMS_WIRE_ECHOED: Urn<'static> = tightbeam::urn!("test", "event:cms-socket/cms-wire-echoed");
 
@@ -62,7 +64,7 @@ async fn start_cms_echo_server(
 	ctx: &Arc<CmsWireContext>,
 	trace: &TraceCollector,
 ) -> Result<(JoinHandle<()>, TightBeamSocketAddr), TightBeamError> {
-	let (listener, addr) = bind_mutual_listener(&ctx.materials, &ctx.client_certificate).await?;
+	let (listener, addr) = bind_cms_mutual_listener(&ctx.materials, &ctx.client_certificate).await?;
 	let addr = TightBeamSocketAddr(addr);
 	let trace = trace.share();
 	let handle = server! {
@@ -88,9 +90,10 @@ tb_assert_spec! {
 	}
 }
 
-// The client seals its base secret to the pre-known server chain in its
-// first flight, the pinning server validates the client certificate, and
-// an application frame round-trips over the derived traffic keys.
+// The client seals its base secret to the pre-known key-agreement
+// certificate in its first flight, the pinning server validates the client
+// certificate, and an application frame round-trips over the derived traffic
+// keys.
 tb_scenario! {
 	name: cms_handshake_round_trips_over_tcp,
 	spec: CmsSocketSpec,
@@ -100,21 +103,19 @@ tb_scenario! {
 			start_cms_echo_server(&ctx, &trace).await
 		},
 		client: |ClientEnv { trace, context: ctx, addr }| async move {
-			let trust_store = pinning_trust_store(&ctx.materials.certificate)?;
 			let client_certificate = ctx.client_certificate.as_ref().to_owned();
 			let identity = CertificateSpec::Built(Box::new(client_certificate));
-			let server_chain = vec![Certificate::clone(&ctx.materials.certificate)];
-
+			let server_trust = ctx.materials.cms.trust();
 			let builder = ClientBuilder::<TokioListener>::builder()
-				.with_trust_store(trust_store)
 				.with_client_identity(SigningIdentity::from_spec(identity, Arc::clone(&ctx.client_provider))?)
-				.with_server_certificate_chain(server_chain)
+				.with_cms_server(server_trust)
 				.with_handshake_protocol(HandshakeProtocolKind::Cms)
 				.build();
 
 			let mut client = builder.connect(addr).await?;
 			let frame = TestFrame::v0(Some("cms-wire"), None);
 			let reply = client.emit(frame.to_owned(), None).await?;
+
 			trace.event_with(CMS_WIRE_ECHOED, &[], reply == Some(frame))?;
 			Ok(())
 		}

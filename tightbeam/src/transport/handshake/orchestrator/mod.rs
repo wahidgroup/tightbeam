@@ -30,6 +30,8 @@ use crate::crypto::aead::{DirectionalCiphers, SessionKeys};
 use crate::crypto::profiles::SecurityProfileDesc;
 use crate::crypto::sign::elliptic_curve::ecdh::EphemeralSecret;
 use crate::crypto::sign::SigningIdentity;
+use crate::crypto::x509::utils::CertificateExt;
+use crate::crypto::x509::KeyPurposes;
 use crate::random::OsRng;
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::flow::{
@@ -48,7 +50,7 @@ use crate::transport::handshake::receipt::{
 use crate::transport::handshake::schedule::{Agreed, PeerEphemeral, PeerIdentity, SecretSeal, Terms};
 use crate::transport::handshake::{
 	Arc, ClientHandshakeProtocol, EstablishedSession, HandshakeMessage, HandshakeProvider, HandshakeSecret,
-	ServerHandshakeProtocol,
+	ServerHandshakeProtocol, ServerIdentity,
 };
 use crate::utils::marker::{MaybeSend, MaybeSendFuture, MaybeSync};
 use crate::x509::Certificate;
@@ -124,9 +126,12 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> Role<F, P> for Client {
 }
 
 /// What a client is provisioned with before any leg runs.
+///
+/// [`Self::new`] admits the client's own identity for the client purpose, so
+/// a configuration holds an identity of its role.
 pub struct ClientConfig<F: ClientFlow<P>, P: HandshakeProvider> {
 	/// What the protocol itself needs: the server trust and the identity.
-	pub flow: F::Settings,
+	flow: F::Settings,
 	/// The security profiles offered to the server. Without an offer the
 	/// server picks its default profile (dealer's choice).
 	pub security_offer: Option<SecurityOffer>,
@@ -135,22 +140,51 @@ pub struct ClientConfig<F: ClientFlow<P>, P: HandshakeProvider> {
 	pub transport_offer: Option<TransportOffer>,
 	/// The policy that admits the server's profile selection.
 	pub profiles: ProfilePolicy<P>,
+	/// The key purpose of each role: the server's certificates carry the
+	/// server's, and the client's own identity the client's.
+	key_purposes: KeyPurposes,
 	/// The approver consulted before a session receipt is countersigned.
 	/// Without one a challenge-bearing receipt fails closed.
 	pub receipt_approver: Option<Arc<dyn ReceiptApprover>>,
 }
 
 impl<F: ClientFlow<P>, P: HandshakeProvider> ClientConfig<F, P> {
-	/// A configuration that offers nothing and applies the default strength
-	/// floor.
-	pub fn new(flow: F::Settings) -> Self {
+	/// A configuration that offers nothing, applies the default strength
+	/// floor, and admits each role under `key_purposes`.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::CertificateValidationError`] -- the certificate of
+	///   the client's identity names another key purpose.
+	pub fn new(flow: F::Settings, key_purposes: KeyPurposes) -> Result<Self, HandshakeError> {
+		if let Some(identity) = F::identity(&flow) {
+			identity.certificate().require_purpose(key_purposes.client)?;
+		}
+		Ok(Self::admitted(flow, key_purposes))
+	}
+
+	/// A configuration whose client identity was admitted for the client
+	/// purpose of `key_purposes` where the transport's provisioning was
+	/// answered, once.
+	pub(crate) fn admitted(flow: F::Settings, key_purposes: KeyPurposes) -> Self {
 		Self {
 			flow,
 			security_offer: None,
 			transport_offer: None,
 			profiles: ProfilePolicy::new(),
+			key_purposes,
 			receipt_approver: None,
 		}
+	}
+
+	/// What the protocol itself needs: the server trust and the identity.
+	pub fn flow(&self) -> &F::Settings {
+		&self.flow
+	}
+
+	/// The key purpose of each role.
+	pub fn key_purposes(&self) -> &KeyPurposes {
+		&self.key_purposes
 	}
 }
 
@@ -169,7 +203,7 @@ pub enum ClientPhase<F: ClientFlow<P>, P: HandshakeProvider> {
 	ClosingSent {
 		/// What the handshake agreed. It is boxed, so a phase move copies a
 		/// pointer.
-		agreed: Box<Agreed<P, AdmittedServer<P::Curve>>>,
+		agreed: Box<Agreed<P, AdmittedServer<P>>>,
 	},
 	/// Completion took everything the handshake agreed.
 	Completed,
@@ -180,7 +214,7 @@ pub enum ClientPhase<F: ClientFlow<P>, P: HandshakeProvider> {
 impl<F: ClientFlow<P>, P: HandshakeProvider> sealed::Sealed for ClientPhase<F, P> {}
 
 impl<F: ClientFlow<P>, P: HandshakeProvider> PhaseView<P> for ClientPhase<F, P> {
-	type Peer = AdmittedServer<P::Curve>;
+	type Peer = AdmittedServer<P>;
 
 	fn spent() -> Self {
 		Self::Spent
@@ -235,18 +269,25 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> Role<F, P> for Server {
 }
 
 /// What a server is provisioned with before any leg runs.
+///
+/// [`Self::new`] admits the server's own identity for the server purpose, so
+/// a configuration holds an identity of its role.
 pub struct ServerConfig<F: ServerFlow<P>, P: HandshakeProvider> {
 	/// What the protocol itself needs.
 	pub flow: F::Settings,
-	/// The server's certificate and the key that signs the reply and its
-	/// receipt. The key also opens what the client seals to the server.
-	pub identity: SigningIdentity,
+	/// What the server signs and agrees with: the identity whose key signs
+	/// the reply and its receipt, and for the CMS flow the key-agreement
+	/// identity that opens what the client seals to the server.
+	identity: F::Identity,
 	/// The security profiles the server runs, in preference order.
 	pub profiles: SupportedProfiles,
 	/// The policy that chooses among those profiles.
 	pub policy: ProfilePolicy<P>,
 	/// How the server authenticates its client.
 	pub peer_authentication: PeerAuthentication,
+	/// The key purpose of each role: the server's own identity carries the
+	/// server's, and an offered client certificate the client's.
+	key_purposes: KeyPurposes,
 	/// The local transport advertisement. Multiplexing activates only when
 	/// the client also offers it.
 	pub transport: Option<TransportOffer>,
@@ -261,18 +302,52 @@ pub struct ServerConfig<F: ServerFlow<P>, P: HandshakeProvider> {
 
 impl<F: ServerFlow<P>, P: HandshakeProvider> ServerConfig<F, P> {
 	/// A configuration for an anonymous-client server that advertises no
-	/// transport capability and applies the default strength floor.
-	pub fn new(flow: F::Settings, identity: SigningIdentity, profiles: SupportedProfiles) -> Self {
+	/// transport capability, applies the default strength floor, and admits
+	/// each role under `key_purposes`.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::CertificateValidationError`] -- a certificate of
+	///   `identity` names another key purpose.
+	pub fn new(
+		flow: F::Settings,
+		identity: F::Identity,
+		profiles: SupportedProfiles,
+		key_purposes: KeyPurposes,
+	) -> Result<Self, HandshakeError> {
+		identity.require_purpose(key_purposes.server)?;
+		Ok(Self::admitted(flow, identity, profiles, key_purposes))
+	}
+
+	/// A configuration whose identity was admitted for the server purpose of
+	/// `key_purposes` where the transport's provisioning was answered, once.
+	pub(crate) fn admitted(
+		flow: F::Settings,
+		identity: F::Identity,
+		profiles: SupportedProfiles,
+		key_purposes: KeyPurposes,
+	) -> Self {
 		Self {
 			flow,
 			identity,
 			profiles,
 			policy: ProfilePolicy::new(),
 			peer_authentication: PeerAuthentication::Anonymous,
+			key_purposes,
 			transport: None,
 			transport_authorizer: None,
 			session_observer: None,
 		}
+	}
+
+	/// What the server signs and agrees with.
+	pub fn identity(&self) -> &F::Identity {
+		&self.identity
+	}
+
+	/// The key purpose of each role.
+	pub fn key_purposes(&self) -> &KeyPurposes {
+		&self.key_purposes
 	}
 }
 
@@ -302,7 +377,7 @@ pub enum ServerPhase<F: ServerFlow<P>, P: HandshakeProvider> {
 	ClosingReceived {
 		/// What the handshake agreed. It is boxed, so a phase move copies a
 		/// pointer.
-		agreed: Box<Agreed<P, AdmittedPeer<P::Curve>>>,
+		agreed: Box<Agreed<P, AdmittedPeer<P>>>,
 	},
 	/// Completion took everything the handshake agreed.
 	Completed,
@@ -313,7 +388,7 @@ pub enum ServerPhase<F: ServerFlow<P>, P: HandshakeProvider> {
 impl<F: ServerFlow<P>, P: HandshakeProvider> sealed::Sealed for ServerPhase<F, P> {}
 
 impl<F: ServerFlow<P>, P: HandshakeProvider> PhaseView<P> for ServerPhase<F, P> {
-	type Peer = AdmittedPeer<P::Curve>;
+	type Peer = AdmittedPeer<P>;
 
 	fn spent() -> Self {
 		Self::Spent
@@ -375,6 +450,7 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> PhaseView<P> for ServerPhase<F, P> 
 /// use tightbeam::crypto::profiles::DefaultCryptoProvider;
 /// use tightbeam::crypto::sign::SigningIdentity;
 /// use tightbeam::crypto::x509::policy::DirectTrustValidator;
+/// use tightbeam::crypto::x509::KeyPurposes;
 /// use tightbeam::testing::fixtures::{TestCertificate, TestKey};
 /// use tightbeam::transport::handshake::negotiation::RunnableProfile;
 /// use tightbeam::transport::handshake::{
@@ -393,7 +469,7 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> PhaseView<P> for ServerPhase<F, P> 
 /// // The client admits the one server certificate it pins.
 /// let pinned = DirectTrustValidator::default().with_trust_chain([certificate.clone()]);
 /// let settings = HpkeClientSettings::new(LearnedTrust::new(pinned));
-/// let config = ClientConfig::<Hpke, DefaultCryptoProvider>::new(settings);
+/// let config = ClientConfig::<Hpke, DefaultCryptoProvider>::new(settings, KeyPurposes::HOUSE)?;
 /// let mut client = Handshake::client(config);
 ///
 /// // The server runs the native profile of its provider, and signs under the
@@ -402,7 +478,8 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> PhaseView<P> for ServerPhase<F, P> 
 /// let key = Arc::new(Secp256k1KeyProvider::from(server_key));
 /// let identity = SigningIdentity::new(certificate, key)?;
 /// let profiles = SupportedProfiles::from(native);
-/// let config = ServerConfig::<Hpke, DefaultCryptoProvider>::new(HpkeServerSettings::new(), identity, profiles);
+/// let settings = HpkeServerSettings::new();
+/// let config = ServerConfig::<Hpke, DefaultCryptoProvider>::new(settings, identity, profiles, KeyPurposes::HOUSE)?;
 /// let mut server = Handshake::server(config);
 ///
 /// let opening = client.start()?;
@@ -548,7 +625,8 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> Handshake<Client, F, P> {
 
 		// 2. Admit the server when its identity is provisioned.
 		let config = &self.config;
-		let server = F::server_trust(&config.flow).admit_provisioned()?;
+		let trust = F::server_trust(&config.flow);
+		let server = trust.admit_provisioned(config.key_purposes.server)?;
 
 		// 3. Build the opening.
 		let parts = OpeningParts {
@@ -625,12 +703,11 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> Handshake<Client, F, P> {
 		} = F::read_reply(opening, settings, reply)?;
 
 		// 3. Admit the server the reply names.
-		let server = F::server_trust(settings).admit_named(server)?;
+		let server = F::server_trust(settings).admit_named(server, config.key_purposes.server)?;
 
 		// 4. Verify the reply signature, which covers the transcript hash,
-		//    under the admitted server's certificate.
-		let static_key = *server.identity().key();
-		let verified = F::verify_reply(&reply, server.identity(), &transcript_hash)?;
+		//    under the admitted server's signing certificate.
+		let verified = F::verify_reply(&reply, server.signing(), &transcript_hash)?;
 
 		// 5. Admit the profile selection against the offer.
 		let offer = config.security_offer.as_ref();
@@ -642,12 +719,12 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> Handshake<Client, F, P> {
 		let terms = Terms::new(profile, mux, transcript_hash, salt);
 
 		// 7. Parse the server ephemeral that the reply signature authenticated,
-		//    beside the static key it must differ from.
-		let server_ephemeral = static_key.server_ephemeral(&server_ephemeral)?;
+		//    beside every static key of the server it must differ from.
+		let server_ephemeral = server.server_ephemeral(&server_ephemeral)?;
 
 		// 8. Verify the session receipt against the accept, which fails closed on a mismatch.
 		let accept = transport_accept.as_ref();
-		let pending_receipt = PendingReceipt::verify::<P>(receipt, accept, &transcript_hash, server.identity())?;
+		let pending_receipt = PendingReceipt::verify::<P>(receipt, accept, &transcript_hash, server.signing())?;
 
 		// 9. Refuse a server that demands an identity this client does not
 		//    hold. The refusal runs before the approver is asked and before
@@ -763,15 +840,15 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> Handshake<Server, F, P> {
 		})?;
 		let config = &self.config;
 		let settings = &config.flow;
-		let identity = &config.identity;
+		let identity = config.identity.signing();
 
 		// 2. Decode the opening, and open the transcript over it.
 		let OpeningIntake { security_offer, transport_offer, sealed } = F::read_opening(settings, opening)?;
 
-		// 3. Open what the opening sealed to the static key, before any offer
+		// 3. Open what the opening sealed to a static key, before any offer
 		//    reaches the policy or the authorizer. The CMS opening's tag
 		//    covers its offers.
-		let mut opened = F::open_opening(sealed, identity).await?;
+		let mut opened = F::open_opening(sealed, &config.identity).await?;
 
 		// 4. Choose the security profile for the offer, or by dealer's choice without one.
 		let profile = config.policy.choose(&config.profiles, security_offer.as_ref())?;
@@ -853,7 +930,8 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> Handshake<Server, F, P> {
 	/// - [`HandshakeError::MissingClientCertificate`] -- the server demands a
 	///   certificate and none came, or a client Finished came without one.
 	/// - [`HandshakeError::CertificateValidationError`] -- the certificate is
-	///   outside its validity period, or a validator refused it.
+	///   outside its validity period, a validator refused it, or the signing
+	///   use or the client's key purpose refused it.
 	/// - [`HandshakeError::InvalidPublicKey`] -- the offered certificate key is not a point on the curve.
 	/// - [`HandshakeError::SignatureVerificationFailed`] -- the client Finished
 	///   fails to verify, or the countersignature fails to verify.
@@ -885,7 +963,7 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> Handshake<Server, F, P> {
 		// 3. Open the closing under the closing key of the handshake secret,
 		//    which the reply derived. The client identity sits behind that
 		//    key, so no static key runs before the server knows its client.
-		let opening = closing.open(pending, &terms);
+		let opening = closing.open(pending, &terms, config.key_purposes.client);
 		let opened = opening.await?;
 
 		// 4. Verify that the client derived the same handshake secret. The
