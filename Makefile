@@ -1,4 +1,4 @@
-.PHONY: all help help-body help-ref version setup check build clean test lint doc-lint spellcheck doc test-all fuzz-build fuzz-test analyze-fuzz clean-fuzz release release-derive check-yanked check-semver audit ci
+.PHONY: all help help-body help-ref version setup check build clean test lint doc-lint spellcheck doc test-all fuzz-build fuzz-test analyze-fuzz clean-fuzz release release-derive check-yanked check-semver audit interop ci
 
 .NOTPARALLEL: ci
 
@@ -58,7 +58,8 @@ help-body:
 	@printf '    lint            Lint + spellcheck + rustdoc (fix=1 to auto-fix; extra clippy args via ARGS)\n'
 	@printf '    spellcheck      Spellcheck the repository with typos\n'
 	@printf '    audit           Run dependency audit (cargo-deny: advisories, licences, bans)\n'
-	@printf '    ci              Full pipeline: lint + audit + build + test-all\n'
+	@printf '    interop         Write the CMS samples and check each with OpenSSL\n'
+	@printf '    ci              Full pipeline: lint + audit + build + test-all + interop\n'
 	@printf '    doc             Build documentation (all features; -D warnings)\n'
 	@printf '    release         Release workflow (see OPTIONS)\n'
 	@printf '    release-derive  Derive-only release: tag tightbeam-derive (see OPTIONS)\n'
@@ -175,11 +176,17 @@ audit: setup
 	@chmod +x scripts/audit.sh
 	@./scripts/audit.sh
 
+interop: setup
+	@echo "Writing the CMS samples and checking them with OpenSSL..."
+	TIGHTBEAM_CMS_SAMPLES=1 cargo test -p tightbeam-rs --all-features --lib the_emitted_structures_write_their_interop_samples
+	./scripts/cms-interop.sh
+
 ci:
 	$(MAKE) lint
 	$(MAKE) audit
 	$(MAKE) build
 	$(MAKE) test-all
+	$(MAKE) interop
 
 release: setup
 	@chmod +x scripts/release.sh

@@ -7,7 +7,7 @@ error[E0308]: mismatched types
    |                          arguments to this enum variant are incorrect
    |
    = note: expected struct `HidingSalt`
-              found struct `Secret<Vec<u8>>`
+              found struct `tightbeam::crypto::secret::Secret<Vec<u8>>`
 note: tuple variant defined here
   --> src/crypto/commitment.rs
    |

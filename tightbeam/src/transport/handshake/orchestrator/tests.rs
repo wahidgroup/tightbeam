@@ -215,7 +215,7 @@ async fn a_refused_closing_leaves_the_server_spent<F: TestFlow>() -> Result<(), 
 
 	let refused = server.finish(other.run.closing.to_owned()).await;
 	let sealed_to_another_server = matches!(refused, Err(HandshakeError::HpkeError(_)));
-	let sealed_under_another_secret = matches!(refused, Err(HandshakeError::SealedIdentity));
+	let sealed_under_another_secret = matches!(refused, Err(HandshakeError::SealedIdentity(_)));
 	assert!(sealed_to_another_server || sealed_under_another_secret);
 	assert_eq!(server.phase(), HandshakePhase::Spent);
 
@@ -257,7 +257,7 @@ async fn a_recorded_session_does_not_open_under_the_server_static_key<F: TestFlo
 	let frame = sealed_record(&client_session)?;
 
 	// `recover` expects the static key to recover the base secret.
-	let Recovered { observer, .. } = F::recover(&run, &server_identity);
+	let Recovered { observer, .. } = F::recover(&run, &server_identity).await;
 
 	let attempts = observer.record_attempts(&frame)?;
 	let mut outcomes = attempts.iter();
@@ -272,7 +272,7 @@ async fn the_base_secret_crosses_the_wire_only_sealed<F: TestFlow>() -> Result<(
 	let Parties { server_identity, client, server, .. } = parties::<F>(PeerAuthentication::Anonymous);
 	let run = run(client, server).await;
 
-	let Recovered { base, .. } = F::recover(&run, &server_identity);
+	let Recovered { base, .. } = F::recover(&run, &server_identity).await;
 	assert!(!contains_window(run.wire_bytes(), &base));
 	Ok(())
 }
@@ -283,8 +283,8 @@ async fn two_handshakes_draw_different_base_secrets<F: TestFlow>() -> Result<(),
 	let first = established::<F>(PeerAuthentication::Anonymous).await;
 	let second = established::<F>(PeerAuthentication::Anonymous).await;
 
-	let first = F::recover(&first.run, &first.server_identity);
-	let second = F::recover(&second.run, &second.server_identity);
+	let first = F::recover(&first.run, &first.server_identity).await;
+	let second = F::recover(&second.run, &second.server_identity).await;
 	assert_ne!(first.base, second.base);
 	Ok(())
 }
@@ -299,7 +299,7 @@ async fn a_mutual_handshake_carries_no_byte_of_the_client_identity<F: TestFlow>(
 	let certificate = &client_identity.certificate;
 	let tbs = &certificate.tbs_certificate;
 	let certificate_der = certificate.to_der()?;
-	let key_identifier = Skid::of_public_key(tbs.subject_public_key_info.to_der()?);
+	let key_identifier = Skid::of_public_key(&tbs.subject_public_key_info);
 	let issuer = tbs.issuer.to_owned();
 	let serial_number = tbs.serial_number.to_owned();
 	let issuer_and_serial = IssuerAndSerialNumber { issuer, serial_number }.to_der()?;
@@ -349,15 +349,15 @@ async fn the_client_identity_is_sealed_from_the_server_static_key<F: TestFlow>()
 	server.transport_authorizer = Some(Arc::new(ChallengingAuthorizer));
 
 	let run = run(client, server).await;
-	let Recovered { observer, sealed_identity, .. } = F::recover(&run, &server_identity);
+	let Recovered { observer, sealed_identity, .. } = F::recover(&run, &server_identity).await;
 	let sealed = sealed_identity.ok_or("a mutual closing carries the sealed identity")?;
 	let certificate_der = client_identity.certificate.to_der()?;
 
-	let attempts = observer.identity_attempts(&run.transcript_hash, &sealed)?;
+	let attempts = observer.identity_attempts(&run.transcript_hash, &sealed).await?;
 	let mut outcomes = attempts.iter();
 	assert!(!contains_window(&sealed, &certificate_der));
 	assert_eq!(attempts.len(), SEAL_ATTEMPTS);
-	assert!(outcomes.all(|attempt| matches!(attempt, Err(HandshakeError::SealedIdentity))));
+	assert!(outcomes.all(|attempt| matches!(attempt, Err(HandshakeError::SealedIdentity(_)))));
 	Ok(())
 }
 

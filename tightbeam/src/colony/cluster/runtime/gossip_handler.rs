@@ -10,7 +10,7 @@ use crate::colony::cluster::runtime::bounds::{ClusterDigest, GatewayRuntimeCtx};
 use crate::colony::cluster::runtime::gossip_tasks::{GossipOrigin, GossipPipelineCtx};
 use crate::colony::cluster::runtime::refuse::Refusal;
 use crate::colony::cluster::{gossip_want, RouteKind};
-use crate::colony::cluster::{ClusterConfig, ClusterError, PeerCaps, ServletRegistry};
+use crate::colony::cluster::{ClusterConfig, ClusterError, PeerCaps, ServletRegistry, VerifiedRumor};
 use crate::colony::common::PeerGossip;
 use crate::colony::common::{
 	reply_frame, GossipReconciliation, GossipRumor, GossipRumorKind, GossipWant, PeerAdvertisement,
@@ -44,7 +44,8 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 			}
 		};
 
-		let freshness_status = self.replay_guard.admits(&frame);
+		let signature = verified.signature();
+		let freshness_status = self.replay_guard.admits(&frame, signature);
 		if freshness_status != TransitStatus::Ok {
 			return Refusal::to(&frame, &self.trace).peer_ad(freshness_status);
 		}
@@ -54,7 +55,7 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 		let admitted = match AdmittedPeerAd::admit(&verified, &advertisement, &self.config) {
 			Ok(admitted) => admitted,
 			Err(status) => {
-				return Refusal::to(&frame, &self.trace).peer_ad_release(&self.replay_guard, status);
+				return Refusal::to(&frame, &self.trace).peer_ad_release(&self.replay_guard, signature, status);
 			}
 		};
 
@@ -64,7 +65,8 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 		// that probe proves the address answers as a flood member.
 		let hint = admitted.discovery_hint();
 		if self.config.peer.table.learn([hint]).is_err() {
-			return Refusal::to(&frame, &self.trace).peer_ad_release(&self.replay_guard, TransitStatus::Unavailable);
+			let unavailable = TransitStatus::Unavailable;
+			return Refusal::to(&frame, &self.trace).peer_ad_release(&self.replay_guard, signature, unavailable);
 		}
 
 		if let Err(error) = self.servlet_registry.reconcile_peer_slate(admitted, PeerCaps::default()) {
@@ -74,7 +76,7 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 				}
 				_ => TransitStatus::Unavailable,
 			};
-			return Refusal::to(&frame, &self.trace).peer_ad_release(&self.replay_guard, status);
+			return Refusal::to(&frame, &self.trace).peer_ad_release(&self.replay_guard, signature, status);
 		}
 
 		self.trace.event(CLUSTER_PEER_ADVERTISED)?;
@@ -141,19 +143,20 @@ where
 		// The origin signature verifies on the peer trust plane, and the
 		// refusal settles what an unverifiable rumor costs the relay. An
 		// origin outside the flood is a policy refusal, as for the relay.
-		let rumor_signer = match self.config.verify_peer(&rumor) {
+		let (rumor_signer, signature) = match self.config.verify_peer(&rumor) {
 			Ok(verified) => {
 				if let Err(status) = flood.member(verified.signer_cert()) {
 					return Refusal::to(&frame, &self.trace).gossip(status);
 				}
 
-				verified.fingerprint()
+				(verified.fingerprint(), verified.into_signature())
 			}
 			Err(refusal) => {
 				let settled = refusal.settle_origin(&self, &frame, &relay_id);
 				return Refusal::to(&frame, &self.trace).gossip_settled(settled);
 			}
 		};
+		let rumor = VerifiedRumor::new(rumor, signature);
 
 		// Freshness for a relayed rumor is its issue time, which `admit`
 		// checks against the seen TTL (seen-ttl) rather than the control
@@ -198,18 +201,23 @@ where
 				return Refusal::to(&frame, &self.trace).gossip(TransitStatus::Unavailable);
 			}
 		};
-		let signing = rumor
-			.sign_with_provider::<D, _>(self.config.tls.identity().signing_provider())
-			.await;
+
+		let signing = rumor.sign_with_provider(self.config.tls.identity()).await;
 		if signing.is_err() {
 			return Refusal::to(&frame, &self.trace).gossip(TransitStatus::Unavailable);
 		}
+
+		// The rumor's digest is taken under its own verified signature.
+		let Ok(rumor) = self.config.tls.verify_own(rumor) else {
+			return Refusal::to(&frame, &self.trace).gossip(TransitStatus::Unavailable);
+		};
 
 		// A local peer-ad apply names the signer that this signing step
 		// proved. A hive-plane publish floods even when peer trust holds no
 		// anchor for this gateway, and the signer is then `None`.
 		let rumor_signer = if peer_ad {
-			self.config.verify_peer(&rumor).map(|verified| verified.fingerprint()).ok()
+			let verified = self.config.verify_peer(rumor.frame());
+			verified.map(|verified| verified.fingerprint()).ok()
 		} else {
 			None
 		};
@@ -301,7 +309,7 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 			return Refusal::to(&frame, &self.trace).reconcile();
 		}
 
-		let freshness_status = self.replay_guard.admits(&frame);
+		let freshness_status = self.replay_guard.admits(&frame, verified.signature());
 		if freshness_status != TransitStatus::Ok {
 			return Refusal::to(&frame, &self.trace).reconcile();
 		}

@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use tightbeam::colony::hive::PeerListGate;
 use tightbeam::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
+use tightbeam::crypto::sign::SigningIdentity;
 use tightbeam::crypto::x509::CertificateSpec;
 use tightbeam::der::Encode;
 use tightbeam::exactly;
@@ -24,7 +25,6 @@ use tightbeam::testing::{ClientEnv, SetupEnv, TestFrame};
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::handshake::negotiation::TransportOffer;
 use tightbeam::transport::policy::CollectorGateConfig;
-use tightbeam::transport::state::ClientIdentity;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::{
 	ConnectionBuilder, ConnectionPool, PoolConfig, PooledClient, TransportError, TransportFailure,
@@ -122,7 +122,7 @@ fn doorman_pool(
 		ConnectionPool::<TokioListener>::builder()
 			.with_config(config)
 			.with_trust_store(trust_store)
-			.with_client_identity(ClientIdentity::from_spec(identity, client_provider)?)
+			.with_client_identity(SigningIdentity::from_spec(identity, client_provider)?)
 			.with_trace(trace.share())
 			.build(),
 	);

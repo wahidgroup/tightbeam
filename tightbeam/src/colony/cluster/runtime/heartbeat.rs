@@ -91,9 +91,7 @@ where
 			.with_witness_hasher::<D>()
 			.build()?;
 
-		signed_frame
-			.sign_with_provider::<D, _>(self.config.tls.identity().signing_provider())
-			.await?;
+		signed_frame.sign_with_provider(self.config.tls.identity()).await?;
 
 		let mut client = self.pool.connect(addr).await?;
 		let response = client.emit(signed_frame, None).await?.ok_or(ClusterError::NoResponse)?;

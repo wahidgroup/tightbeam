@@ -17,7 +17,7 @@ use tightbeam::{
 	exactly,
 	policy::{GatePolicy, SessionContext, TransitStatus},
 	servlet, tb_assert_spec, tb_scenario,
-	testing::{ClientEnv, ServletEnv, SetupEnv, TestKey},
+	testing::{ClientEnv, ServletEnv, SetupEnv, TestIdentity, TestKey},
 	transport::{tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder},
 	urn::Urn,
 	worker, Beamable, Frame, TightBeamError,
@@ -209,7 +209,7 @@ impl GatePolicy for SignatureGate {
 			return TransitStatus::PermissionDenied;
 		};
 
-		if frame.verify::<Secp256k1Signature, Sha3_256>(&self.verifying_key).is_ok() {
+		if frame.verify::<Secp256k1Signature>(&self.verifying_key).is_ok() {
 			TransitStatus::Ok
 		} else {
 			TransitStatus::PermissionDenied
@@ -286,7 +286,7 @@ tb_scenario! {
 					message: CalcRequest { value: config.value },
 					compactness: ZstdCompression::default(),
 					confidentiality: shared_cipher(),
-					nonrepudiation<Secp256k1Signature, _>: TestKey::insecure_fixed_signing(),
+					nonrepudiation<Secp256k1Signature, _>: TestIdentity::certified(TestKey::insecure_fixed_signing()),
 					message_integrity<Sha3_256>: [],
 					frame_integrity: type Sha3_256
 			}?;

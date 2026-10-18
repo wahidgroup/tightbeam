@@ -3,7 +3,7 @@
 //! Both handshake protocols carry their messages in the handshake containers
 //! of [`TransportEnvelope`]. HPKE tunnels its hello and its reply inside
 //! `SignedData` and sends its closing as a `ClientKeyExchange`, and the CMS
-//! handshake exchanges the CMS containers themselves.
+//! handshake exchanges `AuthEnvelopedData` and `SignedData` themselves.
 
 use crate::transport::envelopes::TransportEnvelope;
 use crate::transport::error::TransportError;
@@ -24,8 +24,7 @@ impl From<HandshakeMessage> for TransportEnvelope {
 	fn from(message: HandshakeMessage) -> Self {
 		match message {
 			HandshakeMessage::SignedData(signed) => Self::SignedData(signed),
-			HandshakeMessage::EnvelopedData(enveloped) => Self::EnvelopedData(enveloped),
-			HandshakeMessage::EncryptedData(encrypted) => Self::EncryptedData(encrypted),
+			HandshakeMessage::AuthEnvelopedData(enveloped) => Self::AuthEnvelopedData(enveloped),
 			HandshakeMessage::ClientKeyExchange(key_exchange) => Self::ClientKeyExchange(key_exchange),
 		}
 	}
@@ -34,13 +33,12 @@ impl From<HandshakeMessage> for TransportEnvelope {
 impl TryFrom<TransportEnvelope> for HandshakeMessage {
 	type Error = TransportError;
 
-	/// Handshake messages travel in one of the four handshake containers. Any
+	/// Handshake messages travel in one of the three handshake containers. Any
 	/// other envelope on the handshake path is refused.
 	fn try_from(envelope: TransportEnvelope) -> Result<Self, Self::Error> {
 		match envelope {
 			TransportEnvelope::SignedData(signed) => Ok(Self::SignedData(signed)),
-			TransportEnvelope::EnvelopedData(enveloped) => Ok(Self::EnvelopedData(enveloped)),
-			TransportEnvelope::EncryptedData(encrypted) => Ok(Self::EncryptedData(encrypted)),
+			TransportEnvelope::AuthEnvelopedData(enveloped) => Ok(Self::AuthEnvelopedData(enveloped)),
 			TransportEnvelope::ClientKeyExchange(key_exchange) => Ok(Self::ClientKeyExchange(key_exchange)),
 			_ => Err(TransportError::InvalidMessage),
 		}

@@ -88,3 +88,7 @@ mod teardown;
 // Properties over the wire types
 #[cfg(feature = "testing-property")]
 mod property;
+
+// Seams an outside crate fills with parts of its own
+#[cfg(all(feature = "transport", feature = "testing", feature = "hpke"))]
+mod seams;

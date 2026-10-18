@@ -27,9 +27,9 @@ use core::marker::PhantomData;
 use core::mem;
 
 use crate::crypto::aead::{DirectionalCiphers, SessionKeys};
-use crate::crypto::key::SigningKeyProvider;
 use crate::crypto::profiles::SecurityProfileDesc;
 use crate::crypto::sign::elliptic_curve::ecdh::EphemeralSecret;
+use crate::crypto::sign::SigningIdentity;
 use crate::random::OsRng;
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::flow::{
@@ -43,6 +43,7 @@ use crate::transport::handshake::negotiation::{
 use crate::transport::handshake::peer::{
 	AdmittedPeer, AdmittedServer, PeerAuthentication, PeerCertificate, ServerTrust,
 };
+use crate::transport::handshake::primitives::TranscriptHash;
 use crate::transport::handshake::receipt::{
 	CountersignedReceipt, IssuedReceipt, PendingReceipt, ReceiptApprover, SessionObserver, Settlement, StoredReceipt,
 };
@@ -239,9 +240,9 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> Role<F, P> for Server {
 pub struct ServerConfig<F: ServerFlow<P>, P: HandshakeProvider> {
 	/// What the protocol itself needs.
 	pub flow: F::Settings,
-	/// The provider of the server's static key, which signs the reply and
-	/// opens what the client seals to the server.
-	pub key: Arc<dyn SigningKeyProvider>,
+	/// The server's certificate and the key that signs the reply and its
+	/// receipt. The key also opens what the client seals to the server.
+	pub identity: SigningIdentity,
 	/// The security profiles the server runs, in preference order.
 	pub profiles: SupportedProfiles,
 	/// The policy that chooses among those profiles.
@@ -263,10 +264,10 @@ pub struct ServerConfig<F: ServerFlow<P>, P: HandshakeProvider> {
 impl<F: ServerFlow<P>, P: HandshakeProvider> ServerConfig<F, P> {
 	/// A configuration for an anonymous-client server that advertises no
 	/// transport capability and applies the default strength floor.
-	pub fn new(flow: F::Settings, key: Arc<dyn SigningKeyProvider>, profiles: SupportedProfiles) -> Self {
+	pub fn new(flow: F::Settings, identity: SigningIdentity, profiles: SupportedProfiles) -> Self {
 		Self {
 			flow,
-			key,
+			identity,
 			profiles,
 			policy: ProfilePolicy::new(),
 			peer_authentication: PeerAuthentication::Anonymous,
@@ -372,6 +373,7 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> PhaseView<P> for ServerPhase<F, P> 
 ///
 /// use tightbeam::crypto::key::Secp256k1KeyProvider;
 /// use tightbeam::crypto::profiles::DefaultCryptoProvider;
+/// use tightbeam::crypto::sign::SigningIdentity;
 /// use tightbeam::crypto::x509::policy::DirectTrustValidator;
 /// use tightbeam::testing::fixtures::{TestCertificate, TestKey};
 /// use tightbeam::transport::handshake::negotiation::RunnableProfile;
@@ -394,11 +396,13 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> PhaseView<P> for ServerPhase<F, P> 
 /// let config = ClientConfig::<Hpke, DefaultCryptoProvider>::new(settings);
 /// let mut client = Handshake::client(config);
 ///
-/// // The server runs the native profile of its provider.
+/// // The server runs the native profile of its provider, and signs under the
+/// // identity that pairs its certificate with its key.
 /// let native = RunnableProfile::<DefaultCryptoProvider>::native().descriptor();
-/// let settings = HpkeServerSettings::new(certificate);
 /// let key = Arc::new(Secp256k1KeyProvider::from(server_key));
-/// let config = ServerConfig::<Hpke, DefaultCryptoProvider>::new(settings, key, SupportedProfiles::from(native));
+/// let identity = SigningIdentity::new(certificate, key)?;
+/// let profiles = SupportedProfiles::from(native);
+/// let config = ServerConfig::<Hpke, DefaultCryptoProvider>::new(HpkeServerSettings::new(), identity, profiles);
 /// let mut server = Handshake::server(config);
 ///
 /// let opening = client.start()?;
@@ -485,7 +489,7 @@ impl<R: Role<F, P>, F: HandshakeFlow, P: HandshakeProvider> Handshake<R, F, P> {
 	}
 
 	/// The hash of the sealed transcript, until completion.
-	pub fn transcript_hash(&self) -> Option<[u8; 32]> {
+	pub fn transcript_hash(&self) -> Option<TranscriptHash> {
 		self.phase.terms().map(|terms| *terms.transcript_hash())
 	}
 
@@ -533,7 +537,8 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> Handshake<Client, F, P> {
 	/// - [`HandshakeError::InvalidPublicKey`] -- the provisioned server
 	///   certificate key is not a point on the curve.
 	/// - [`HandshakeError::RandomGenerationFailed`] -- the random source failed.
-	/// - [`HandshakeError::MissingKeyWrapAlgorithm`] -- the profile names no key wrap.
+	/// - [`HandshakeError::Envelope`] -- the CMS opening fails to seal to the
+	///   provisioned server's certificate.
 	pub fn start(&mut self) -> Result<HandshakeMessage, HandshakeError> {
 		// 1. Take the phase, which must be Idle.
 		self.step(|phase| match phase {
@@ -588,11 +593,9 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> Handshake<Client, F, P> {
 	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the handshake
 	///   secret, the acknowledgement key, the identity key, or the
 	///   key-confirmation tag.
-	/// - [`HandshakeError::InvalidKeyMaterialLength`] -- the cipher refused the
-	///   acknowledgement key or the identity key.
-	/// - [`HandshakeError::ReceiptAckCipher`] -- the AEAD refused to seal the countersignature.
-	/// - [`HandshakeError::SealedIdentity`] -- the client identity exceeds the
-	///   frame, or the AEAD refused to seal it.
+	/// - [`HandshakeError::ReceiptAckCipher`] -- the envelope refused to seal the countersignature.
+	/// - [`HandshakeError::SealedIdentity`] -- the envelope refused to seal the client identity.
+	/// - [`HandshakeError::SealedFrame`] -- the client identity exceeds the frame.
 	/// - [`HandshakeError::HpkeError`] -- the HPKE payload fails to seal to the server's static key.
 	pub async fn respond(&mut self, reply: HandshakeMessage) -> Result<HandshakeMessage, HandshakeError> {
 		// 1. Take the phase, which must hold the sent opening.
@@ -620,9 +623,9 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> Handshake<Client, F, P> {
 		let server = F::server_trust(settings).admit_named(server)?;
 
 		// 4. Verify the reply signature over the bytes the flow derives from
-		//    the transcript hash, under the admitted server's key.
+		//    the transcript hash, under the admitted server's certificate.
 		let static_key = *server.identity().key();
-		F::verify_reply(&reply, P::VerifyingKey::from(static_key), &transcript_hash)?;
+		F::verify_reply(&reply, server.identity(), &transcript_hash)?;
 
 		// 5. Admit the profile selection against the offer.
 		let offer = config.security_offer.as_ref();
@@ -695,9 +698,7 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> Handshake<Client, F, P> {
 	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the handshake
 	///   secret, the acknowledgement key, the identity key, or the
 	///   key-confirmation tag.
-	/// - [`HandshakeError::InvalidKeyMaterialLength`] -- the cipher refused the
-	///   acknowledgement key or the identity key.
-	/// - [`HandshakeError::ReceiptAckCipher`] -- the AEAD refused to seal the countersignature.
+	/// - [`HandshakeError::ReceiptAckCipher`] -- the envelope refused to seal the countersignature.
 	/// - [`HandshakeError`] -- the bytes the proof signs fail to encode or to hash.
 	fn close<'a>(
 		settings: &'a F::Settings,
@@ -708,7 +709,7 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> Handshake<Client, F, P> {
 		terms: &Terms<P>,
 		server: &PeerCertificate<P::Curve>,
 	) -> Result<BoundClosing<'a, F, P>, HandshakeError> {
-		// 1. Derive the handshake secret from the base secret and the ephemeral-ephemeral agreement.
+		// 1. Derive the handshake secret from the ephemeral-ephemeral output and the base secret.
 		let (secret, agreed) = F::agree(pending, server_ephemeral, terms.kdf_salt(), &mut OsRng)?;
 
 		// 2. Seal the countersignature under the handshake secret.
@@ -746,16 +747,16 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> Handshake<Server, F, P> {
 	/// - [`HandshakeError::UnexpectedContainer`] -- the opening travels in another container.
 	/// - [`HandshakeError::AbortReceived`] -- the opening carries an abort alert.
 	/// - [`HandshakeError::DuplicateAttribute`] -- an offer or the abort alert repeats.
+	/// - [`HandshakeError::Envelope`] -- the CMS opening fails to open: its
+	///   recipient, its `ukm`, its key, or its tag is refused, or the key
+	///   provider failed the agreement.
+	/// - [`HandshakeError::InvalidPublicKey`] -- the client's agreement key is not a point on the curve.
+	/// - [`HandshakeError::InvalidKeySize`] -- the opened base secret is not 32 bytes.
+	/// - [`HandshakeError::DerError`] -- the opened content fails to decode.
 	/// - [`HandshakeError::NegotiationError`] -- profile or transport negotiation failed.
-	/// - [`HandshakeError::InvalidClientKeyExchange`] -- the opening carries no usable key agreement.
-	/// - [`HandshakeError::MissingUkm`] -- the key agreement carries no user keying material.
-	/// - [`HandshakeError::InvalidPublicKey`] -- the client's key is not a point on the curve.
-	/// - [`HandshakeError::InvalidKeySize`] -- the opened content is not a 32-byte base secret.
 	/// - [`HandshakeError::MutualAuthRequired`] -- the accept grants budgets,
 	///   and the server demands no client certificate.
-	/// - [`HandshakeError::KeyError`] -- the key provider failed, or the wrapped
-	///   content key fails to unwrap
-	///   ([`KeyError::WrapFailed`](crate::crypto::key::KeyError::WrapFailed)).
+	/// - [`HandshakeError::KeyError`] -- the key provider failed to sign.
 	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the handshake secret.
 	pub async fn reply(&mut self, opening: HandshakeMessage) -> Result<HandshakeMessage, HandshakeError> {
 		// 1. Take the phase, which must be Idle.
@@ -765,15 +766,20 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> Handshake<Server, F, P> {
 		})?;
 		let config = &self.config;
 		let settings = &config.flow;
-		let key = config.key.as_ref();
+		let identity = &config.identity;
 
 		// 2. Decode the opening, and open the transcript over it.
 		let OpeningIntake { security_offer, transport_offer, sealed } = F::read_opening(settings, opening)?;
 
-		// 3. Choose the security profile for the offer, or by dealer's choice without one.
+		// 3. Open what the opening sealed to the static key, before any offer
+		//    reaches the policy or the authorizer. The CMS opening's tag
+		//    covers its offers.
+		let mut opened = F::open_opening(sealed, identity).await?;
+
+		// 4. Choose the security profile for the offer, or by dealer's choice without one.
 		let profile = config.policy.choose(&config.profiles, security_offer.as_ref())?;
 
-		// 4. Negotiate the transport terms. A configured authorizer decides
+		// 5. Negotiate the transport terms. A configured authorizer decides
 		//    the budget grant and the settlement challenge before the accept
 		//    enters the transcript.
 		let offer = transport_offer.as_ref();
@@ -784,9 +790,6 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> Handshake<Server, F, P> {
 			None => (None, None, None),
 		};
 
-		// 5. Open what the opening sealed to the static key.
-		let mut opened = F::open_opening(sealed, key).await?;
-
 		// 6. Draw the per-handshake ephemeral. It is boxed before the first
 		//    await that it crosses, so every later move copies a pointer and
 		//    the scalar is wiped where the box drops.
@@ -796,18 +799,18 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> Handshake<Server, F, P> {
 		let client_cert_required = config.peer_authentication.requires_certificate();
 		let transport_accept = transport_accept.as_ref();
 		let server_ephemeral = ephemeral.public_key();
-		let parts = ReplyParts { profile, transport_accept, server_ephemeral, client_cert_required };
+		let parts = ReplyParts { identity, profile, transport_accept, server_ephemeral, client_cert_required };
 		let bound = F::bind_reply(&mut opened, settings, parts, &mut OsRng)?;
 		let ReplyBinding { transcript_hash, salt, prehash, draft } = bound;
 		let terms = Terms::new(profile, mux, transcript_hash, salt);
 
-		// 8. Sign the sealed transcript under the static key.
-		let signed = F::sign(key, &prehash).await?;
+		// 8. Sign the sealed transcript under the server identity.
+		let signed = F::sign(identity, &prehash).await?;
 
 		// 9. Issue the session receipt. The transcript hash pins it to this
 		//    session, and the server signature lets a third party verify it.
-		let issue = IssuedReceipt::issue::<P::Digest>;
-		let issuing = issue(transcript_hash, transport_accept, challenge, client_cert_required, key);
+		let issue = IssuedReceipt::issue;
+		let issuing = issue(transcript_hash, transport_accept, challenge, client_cert_required, identity);
 		let issued = issuing.await?;
 
 		// 10. Encode the reply.
@@ -844,8 +847,8 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> Handshake<Server, F, P> {
 	/// - [`HandshakeError::DuplicateAttribute`] -- an attribute of the closing repeats.
 	/// - [`HandshakeError::MissingAttribute`] -- the closing carries no key-confirmation tag.
 	/// - [`HandshakeError::DerError`] -- the key-confirmation tag of a CMS
-	///   closing has another width, or the opened identity or Finished fails
-	///   to decode.
+	///   closing is narrower than 32 bytes or wider than 64, or the opened
+	///   identity or Finished fails to decode.
 	/// - [`HandshakeError::MissingClientCertificate`] -- the server demands a
 	///   certificate and none came, or a CMS Finished came without one.
 	/// - [`HandshakeError::CertificateValidationError`] -- the certificate is
@@ -859,20 +862,18 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> Handshake<Server, F, P> {
 	/// - [`HandshakeError::KeyError`] -- the key provider failed.
 	/// - [`HandshakeError::HpkeError`] -- the sealed payload fails to open.
 	/// - [`HandshakeError::SealedIdentity`] -- the sealed client identity fails
-	///   to open, or a CMS closing names another content type or algorithm,
-	///   or carries no content.
+	///   to open: its envelope, its key, its tag, or its transcript is refused.
+	/// - [`HandshakeError::SealedFrame`] -- the opened identity's frame is malformed.
 	/// - [`HandshakeError::InvalidDecryptedPayloadSize`] -- the opened payload fails to decode.
 	/// - [`HandshakeError::InvalidKeySize`] -- the base secret of the payload is not 32 bytes.
 	/// - [`HandshakeError::OctetStringLengthError`] -- the client random of the payload is not 32 bytes.
 	/// - [`HandshakeError::ClientRandomMismatchReplay`] -- the payload echoes another client random.
 	/// - [`HandshakeError::ClientEphemeralIsStatic`] -- a client ephemeral (the
-	///   HPKE payload ephemeral, the encapsulated key, or the CMS originator)
-	///   collapses into the key of the certificate the closing offers.
+	///   HPKE payload ephemeral, the encapsulated key, or the CMS agreement key
+	///   `R`) collapses into the key of the certificate the closing offers.
 	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the handshake
 	///   secret, the identity key, the key-confirmation tag, or the
 	///   acknowledgement key.
-	/// - [`HandshakeError::InvalidKeyMaterialLength`] -- the cipher refused the
-	///   identity key or the acknowledgement key.
 	/// - [`HandshakeError::KeyConfirmationFailed`] -- the client derived another handshake secret.
 	/// - [`HandshakeError::ReceiptAckCipher`] -- the sealed countersignature fails to open.
 	/// - [`HandshakeError::ReceiptMismatch`] -- an acknowledgement came, and no receipt was issued.
@@ -893,7 +894,7 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> Handshake<Server, F, P> {
 		// 3. Open the closing: derive the handshake secret, and open the
 		//    client identity under it. The identity sits behind the agreement,
 		//    so the static key runs before the server knows its client.
-		let opening = F::settle(closing, &terms, config.key.as_ref());
+		let opening = F::settle(closing, &terms, &config.identity);
 		let opened = opening.await?;
 
 		// 4. Verify that the client derived the same handshake secret. The

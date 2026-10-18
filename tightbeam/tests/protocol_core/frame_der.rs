@@ -5,7 +5,7 @@ use tightbeam::crypto::aead::{Aes256Gcm, Key, KeyInit};
 use tightbeam::crypto::hash::Sha3_256;
 use tightbeam::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
 use tightbeam::prelude::*;
-use tightbeam::testing::{ScenarioConfig, SetupEnv};
+use tightbeam::testing::{ScenarioConfig, SetupEnv, TestIdentity};
 use tightbeam::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_scenario, TightBeamError};
 
@@ -57,7 +57,7 @@ fn build_v3_frame(message: &TestMessage) -> Result<tightbeam::Frame, TightBeamEr
 		.with_message(message.to_owned())
 		.with_message_hasher::<Sha3_256>([])
 		.with_aead(cipher)
-		.with_signer::<Secp256k1Signature, _>(signing_key)
+		.with_signer::<Secp256k1Signature, _>(TestIdentity::certified(signing_key))
 		.with_priority(asn1::MessagePriority::Expedited)
 		.with_lifetime(3_600)
 		.with_previous_hash(previous_hash)

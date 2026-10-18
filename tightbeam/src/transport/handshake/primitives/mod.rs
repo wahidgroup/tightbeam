@@ -15,7 +15,7 @@ pub(crate) mod transcript;
 mod prekeys;
 
 pub use kdf::{kdf_chain, multi_input_kdf, KdfInfo, KdfSalt, KdfStage};
-pub use transcript::{transcript_hash, TRANSCRIPT_HASH_LEN};
+pub use transcript::{transcript_hash, TranscriptHash};
 
 #[cfg(any(
 	feature = "transport-hpke",

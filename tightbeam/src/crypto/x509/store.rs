@@ -10,9 +10,11 @@ use crate::cms::signed_data::SignerIdentifier;
 use crate::crypto::policy::VerificationPolicy;
 use crate::crypto::x509::error::CertificateValidationError;
 use crate::crypto::x509::policy::CertificateValidation;
-use crate::crypto::x509::utils::Skid;
 use crate::crypto::x509::Certificate;
-use crate::der::Encode;
+use crate::spki::SubjectPublicKeyInfoOwned;
+
+#[cfg(feature = "signature")]
+use crate::crypto::policy::VerifiedSignature;
 
 #[cfg(feature = "std")]
 mod std_imports {
@@ -20,10 +22,13 @@ mod std_imports {
 	pub use std::sync::Arc;
 
 	pub use crate::crypto::hash::{Digest, Sha3_256, U32};
-	pub use crate::crypto::x509::ext::pkix::{BasicConstraints, KeyUsage, KeyUsages, SubjectAltName};
+	pub use crate::crypto::x509::ext::pkix::{
+		BasicConstraints, KeyUsage, KeyUsages, SubjectAltName, SubjectKeyIdentifier,
+	};
 	pub use crate::crypto::x509::name::Name;
 	pub use crate::crypto::x509::utils::{CertificateExt, Fingerprint};
 	pub use crate::der::oid::AssociatedOid;
+	pub use crate::der::Encode;
 }
 
 #[cfg(feature = "std")]
@@ -136,7 +141,7 @@ impl RevocationChecker for StaticRevocationList {
 /// different consequences.
 #[cfg(feature = "signature")]
 #[must_use = "a dropped TrustVerification leaves the frame unauthenticated"]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrustVerification<'a> {
 	/// The frame carries no nonrepudiation signature.
 	MissingSignature,
@@ -145,8 +150,8 @@ pub enum TrustVerification<'a> {
 	/// The signer is trusted, and the signature fails verification.
 	Invalid,
 	/// The signature verified against the certificate that this store
-	/// resolved.
-	Verified(&'a Certificate),
+	/// resolved. The verified signature is the replay key of the frame.
+	Verified(&'a Certificate, VerifiedSignature),
 }
 
 /// Certificate trust verification.
@@ -168,7 +173,8 @@ pub trait CertificateTrust: CertificateValidation + Debug + Send + Sync {
 	///
 	/// Membership is [`Self::enrolled_certificate`] answering for the key, so
 	/// a rotated certificate for an enrolled key still matches. Implementors
-	/// that answer SID lookup correctly get this behavior without an override.
+	/// that answer [`Self::find_by_public_key`] correctly get this behavior
+	/// without an override.
 	#[must_use = "a dropped membership answer leaves the plane gate unenforced"]
 	fn trusts_public_key(&self, cert: &Certificate) -> bool {
 		self.enrolled_certificate(cert).is_some()
@@ -176,16 +182,19 @@ pub trait CertificateTrust: CertificateValidation + Debug + Send + Sync {
 
 	/// Returns the certificate this store holds for `cert`'s public key.
 	///
-	/// The lookup is the SubjectKeyIdentifier of the SPKI, resolved through
-	/// [`Self::find_by_signer_identifier`]. A rotated certificate for an
-	/// enrolled key therefore resolves to the enrolled one, which is the
-	/// certificate a signature by that key verifies against.
+	/// The lookup is the SubjectPublicKeyInfo, resolved through
+	/// [`Self::find_by_public_key`]. A rotated certificate for an enrolled key
+	/// therefore resolves to the enrolled one, which is the certificate a
+	/// signature by that key verifies against.
 	fn enrolled_certificate(&self, cert: &Certificate) -> Option<&Certificate> {
-		let spki_der = cert.tbs_certificate.subject_public_key_info.to_der().ok()?;
-		let sid = SignerIdentifier::try_from(Skid::of_public_key(spki_der)).ok()?;
-
-		self.find_by_signer_identifier(&sid)
+		self.find_by_public_key(&cert.tbs_certificate.subject_public_key_info)
 	}
+
+	/// Find a certificate by its SubjectPublicKeyInfo.
+	///
+	/// This is the key-identity lookup that plane membership uses. It matches
+	/// the key whatever certificate carries it.
+	fn find_by_public_key(&self, spki: &SubjectPublicKeyInfoOwned) -> Option<&Certificate>;
 
 	/// Verify a certificate chain with partial RFC 5280 §6.1 path validation.
 	///
@@ -216,9 +225,10 @@ pub trait CertificateTrust: CertificateValidation + Debug + Send + Sync {
 
 	/// Find a certificate by CMS [`SignerIdentifier`].
 	///
-	/// This is the key-identity lookup frame verification and plane
-	/// classification share. Issuer-and-serial and subject-key-identifier
-	/// forms both resolve here.
+	/// Frame verification resolves its signer here. The subject-key-identifier
+	/// form matches a certificate's `subjectKeyIdentifier` extension value
+	/// (RFC 5652 §5.3), and the issuer-and-serial form matches its issuer and
+	/// serial number.
 	fn find_by_signer_identifier(&self, sid: &SignerIdentifier) -> Option<&Certificate>;
 
 	/// Find a certificate by `SignerInfo`.
@@ -235,9 +245,12 @@ pub trait CertificateTrust: CertificateValidation + Debug + Send + Sync {
 	/// Verify `frame`'s nonrepudiation signature against this store.
 	///
 	/// The store looks up the signer certificate through the frame's
-	/// `SignerInfo` and verifies the signature over the frame's to-be-signed
-	/// bytes. The verified arm returns that certificate, so a later step reuses
-	/// it instead of a second signer lookup.
+	/// `SignerInfo`, and the CMS signer verifies the signed attributes and the
+	/// signature over the frame's to-be-signed bytes under this store's
+	/// policy. The verified arm returns:
+	///
+	/// - The certificate, so a later step reuses it instead of a second lookup.
+	/// - The verified signature, so a replay guard keys on its canonical form.
 	#[cfg(feature = "signature")]
 	#[must_use = "a dropped TrustVerification leaves the frame unauthenticated"]
 	fn verify_frame<'a>(&'a self, frame: &crate::Frame) -> TrustVerification<'a> {
@@ -249,21 +262,8 @@ pub trait CertificateTrust: CertificateValidation + Debug + Send + Sync {
 			return TrustVerification::UnknownSigner;
 		};
 
-		let algorithm_oid = signer_info.signature_algorithm.oid;
-		let signature = signer_info.signature.as_bytes();
-		let Ok(public_key_der) = cert.tbs_certificate.subject_public_key_info.to_der() else {
-			return TrustVerification::Invalid;
-		};
-
-		let Ok(message) = frame.to_tbs() else {
-			return TrustVerification::Invalid;
-		};
-
-		match self
-			.to_policy_ref()
-			.verify_signature(&algorithm_oid, &public_key_der, &message, signature)
-		{
-			Ok(()) => TrustVerification::Verified(cert),
+		match frame.verify_under(cert, self.to_policy_ref()) {
+			Ok(signature) => TrustVerification::Verified(cert, signature),
 			Err(_) => TrustVerification::Invalid,
 		}
 	}
@@ -422,9 +422,11 @@ pub struct CertificateTrustStore {
 	fingerprints: HashSet<Sha3Fingerprint>,
 	/// The full certificates, indexed by fingerprint.
 	certificates: HashMap<Sha3Fingerprint, Certificate>,
-	/// The precomputed SKID index, from each SKID to its certificate
+	/// The `subjectKeyIdentifier` extension values, each to its certificate
 	/// fingerprint.
-	skid_index: HashMap<Skid, Sha3Fingerprint>,
+	skid_index: HashMap<Vec<u8>, Sha3Fingerprint>,
+	/// The DER SubjectPublicKeyInfo of each certificate, to its fingerprint.
+	key_index: HashMap<Vec<u8>, Sha3Fingerprint>,
 	/// The verification policy that checks signatures.
 	policy: Arc<dyn VerificationPolicy>,
 	/// The revocation checker that path validation consults.
@@ -549,6 +551,9 @@ impl CertificateTrustStore {
 
 			self.policy
 				.verify_signature(&algorithm_oid, &public_key_der, &message, signature_bytes)
+				// A certificate signature is the key of no ledger, so its
+				// canonical form drops here.
+				.map(drop)
 		})?;
 
 		// RFC 5280 §6.1.3(a)(3): the configured checker runs revocation. The
@@ -653,10 +658,16 @@ impl CertificateTrust for CertificateTrustStore {
 				cert.tbs_certificate.issuer == ias.issuer && cert.tbs_certificate.serial_number == ias.serial_number
 			}),
 			SignerIdentifier::SubjectKeyIdentifier(skid) => {
-				let key = Skid::parse(skid.0.as_bytes())?;
-				self.skid_index.get(&key).and_then(|fp| self.certificates.get(fp))
+				let fingerprint = self.skid_index.get(skid.0.as_bytes())?;
+				self.certificates.get(fingerprint)
 			}
 		}
+	}
+
+	fn find_by_public_key(&self, spki: &SubjectPublicKeyInfoOwned) -> Option<&Certificate> {
+		let spki_der = spki.to_der().ok()?;
+		let fingerprint = self.key_index.get(&spki_der)?;
+		self.certificates.get(fingerprint)
 	}
 
 	fn to_policy_ref(&self) -> &dyn VerificationPolicy {
@@ -668,15 +679,16 @@ impl CertificateTrust for CertificateTrustStore {
 ///
 /// It validates structural correctness, which is expiry and issuer and
 /// subject chaining, on each add. The resulting store handles cryptographic
-/// verification at run time.
+/// verification at run time. It indexes each certificate twice:
 ///
-/// SKIDs are indexed through [`Skid::of_public_key`], the same function a
-/// signer stamps from, so a store resolves the identifiers that its peers send.
+/// - By its `subjectKeyIdentifier` value, which a `sid` resolves through (RFC 5652 §5.3).
+/// - By its SubjectPublicKeyInfo, which plane membership reads.
 #[cfg(feature = "std")]
 pub struct CertificateTrustBuilder {
 	fingerprints: HashSet<Sha3Fingerprint>,
 	certificates: HashMap<Sha3Fingerprint, Certificate>,
-	skid_index: HashMap<Skid, Sha3Fingerprint>,
+	skid_index: HashMap<Vec<u8>, Sha3Fingerprint>,
+	key_index: HashMap<Vec<u8>, Sha3Fingerprint>,
 	policy: Arc<dyn VerificationPolicy>,
 	revocation: Arc<dyn RevocationChecker>,
 }
@@ -688,10 +700,23 @@ impl<P: VerificationPolicy + 'static> From<P> for CertificateTrustBuilder {
 			fingerprints: HashSet::new(),
 			certificates: HashMap::new(),
 			skid_index: HashMap::new(),
+			key_index: HashMap::new(),
 			policy: Arc::new(policy),
 			revocation: Arc::new(NoRevocation),
 		}
 	}
+}
+
+/// `bytes` as lowercase hexadecimal, the form a collision error names its
+/// index entry in.
+#[cfg(feature = "std")]
+fn to_hex(bytes: &[u8]) -> String {
+	bytes.iter().fold(String::new(), |mut acc, byte| {
+		use core::fmt::Write;
+		// A write into a `String` always returns `Ok`.
+		let _ = write!(acc, "{byte:02x}");
+		acc
+	})
 }
 
 #[cfg(feature = "std")]
@@ -704,28 +729,36 @@ impl CertificateTrustBuilder {
 		self
 	}
 
-	/// Index one certificate by fingerprint and by SKID.
+	/// Index one certificate by fingerprint, by its `subjectKeyIdentifier`
+	/// extension value when it carries one, and by its SubjectPublicKeyInfo.
+	///
+	/// One key under two fingerprints is a collision, and so is one extension
+	/// value, because a lookup by either would name two certificates. Each
+	/// collision names the index it hit.
 	fn add_certificate(&mut self, cert: Certificate) -> Result<(), CertificateValidationError> {
 		let fp = CertificateTrustStore::to_fingerprint::<Sha3_256>(&cert)?;
 
 		let spki_der = cert.tbs_certificate.subject_public_key_info.to_der()?;
-		let skid = Skid::of_public_key(&spki_der);
-		if let Some(existing_fp) = self.skid_index.get(&skid) {
-			// One SKID under two fingerprints is a collision.
-			if *existing_fp != fp {
-				return Err(CertificateValidationError::SkidCollision {
-					skid: skid.as_bytes().iter().fold(String::new(), |mut acc, byte| {
-						use core::fmt::Write;
-						// A write into a `String` always returns `Ok`.
-						let _ = write!(acc, "{byte:02x}");
-						acc
-					}),
-				});
+		let skid = cert.extension::<SubjectKeyIdentifier>()?.map(|skid| skid.0.into_bytes());
+		let skid_holder = skid.as_ref().and_then(|skid| self.skid_index.get(skid));
+		if let (Some(skid), Some(holder)) = (skid.as_deref(), skid_holder) {
+			if *holder != fp {
+				return Err(CertificateValidationError::SkidCollision { skid: to_hex(skid) });
 			}
 		}
 
+		let key_holder = self.key_index.get(&spki_der);
+		if key_holder.is_some_and(|holder| *holder != fp) {
+			return Err(CertificateValidationError::PublicKeyCollision { public_key: to_hex(&spki_der) });
+		}
+
 		self.fingerprints.insert(fp);
-		self.skid_index.insert(skid, fp);
+
+		if let Some(skid) = skid {
+			self.skid_index.insert(skid, fp);
+		}
+
+		self.key_index.insert(spki_der, fp);
 		self.certificates.insert(fp, cert);
 
 		Ok(())
@@ -772,6 +805,7 @@ impl TrustBuilder for CertificateTrustBuilder {
 			fingerprints: self.fingerprints,
 			certificates: self.certificates,
 			skid_index: self.skid_index,
+			key_index: self.key_index,
 			policy: self.policy,
 			revocation: self.revocation,
 		}
@@ -793,10 +827,11 @@ impl Debug for CertificateTrustBuilder {
 mod tests {
 	use super::*;
 	use crate::crypto::policy::Secp256k1Policy;
-	use crate::crypto::sign::ecdsa::SigningKey;
-	use crate::crypto::sign::Signatory;
-	use crate::testing::fixtures::{TestCertificate, TestCertificateChain};
-	use crate::testing::TestKey;
+	use crate::crypto::sign::ecdsa::{Secp256k1Signature, SigningKey};
+	use crate::crypto::sign::{CmsSigner, SignedContent};
+	use crate::der::asn1::OctetString;
+	use crate::testing::fixtures::{TestCertificate, TestCertificateChain, TestIdentity};
+	use crate::testing::{TestFrame, TestKey};
 
 	type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -821,7 +856,7 @@ mod tests {
 		chain: &TestCertificateChain,
 		certs: StoreCerts,
 	) -> Result<CertificateTrustStore, CertificateValidationError> {
-		let builder: CertificateTrustBuilder = Secp256k1Policy.into();
+		let builder: CertificateTrustBuilder = Secp256k1Policy::default().into();
 		let builder = match certs {
 			StoreCerts::None => builder,
 			StoreCerts::Root => {
@@ -858,7 +893,7 @@ mod tests {
 	fn is_trusted_matches_fingerprint() -> TestResult {
 		let cert = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
 		let certificate = cert.to_owned();
-		let store = CertificateTrustBuilder::from(Secp256k1Policy)
+		let store = CertificateTrustBuilder::from(Secp256k1Policy::default())
 			.with_certificate(certificate)?
 			.build();
 		assert!(store.is_trusted(&cert));
@@ -871,7 +906,7 @@ mod tests {
 		let key = TestKey::insecure_fixed_signing();
 		let enrolled = TestCertificate::with_cn_and_uri_sans(&key, "enrolled", &["urn:tightbeam:colony:test"]);
 		let rotated = TestCertificate::with_cn_and_uri_sans(&key, "rotated", &["urn:tightbeam:colony:test"]);
-		let store = CertificateTrustBuilder::from(Secp256k1Policy)
+		let store = CertificateTrustBuilder::from(Secp256k1Policy::default())
 			.with_certificate(enrolled.clone())?
 			.build();
 		assert!(store.is_trusted(&enrolled));
@@ -885,7 +920,8 @@ mod tests {
 	fn builder_validates_chain_structure() -> TestResult {
 		let chain = TestCertificate::insecure_fixed_chain()?;
 		let chain = vec![chain.root, chain.intermediate, chain.leaf];
-		assert!(CertificateTrustBuilder::from(Secp256k1Policy).with_chain(chain).is_ok());
+		let builder = CertificateTrustBuilder::from(Secp256k1Policy::default());
+		assert!(builder.with_chain(chain).is_ok());
 		Ok(())
 	}
 
@@ -926,7 +962,7 @@ mod tests {
 	fn evaluate_rejects_cross_chain_cert() -> TestResult {
 		// The store holds one chain's root, and the leaf comes from another
 		// chain.
-		let store = CertificateTrustBuilder::from(Secp256k1Policy)
+		let store = CertificateTrustBuilder::from(Secp256k1Policy::default())
 			.with_certificate(TestCertificate::self_signed(&TestKey::insecure_fixed_signing()))?
 			.build();
 
@@ -984,9 +1020,10 @@ mod tests {
 			root.tbs_certificate.extensions = Some(TestCertificate::ca_extensions(*ca, *key_cert_sign, *path_len));
 
 			let certificate = root.to_owned();
-			let store = CertificateTrustBuilder::from(Secp256k1Policy)
+			let store = CertificateTrustBuilder::from(Secp256k1Policy::default())
 				.with_certificate(certificate)?
 				.build();
+
 			let result = store.verify_chain(&[root, chain.intermediate, chain.leaf]);
 			assert!(matches!(result, Err(ref e) if core::mem::discriminant(e) == core::mem::discriminant(expected)));
 		}
@@ -1001,7 +1038,7 @@ mod tests {
 		let mut root = chain.root.to_owned();
 		root.tbs_certificate.extensions = Some(TestCertificate::ca_extensions(true, true, Some(0)));
 
-		let store = CertificateTrustBuilder::from(Secp256k1Policy)
+		let store = CertificateTrustBuilder::from(Secp256k1Policy::default())
 			.with_certificate(root)?
 			.with_certificate(chain.intermediate)?
 			.build();
@@ -1111,7 +1148,7 @@ mod tests {
 		revocation: StaticRevocationList,
 	) -> Result<CertificateTrustStore, CertificateValidationError> {
 		let root = chain.root.to_owned();
-		Ok(CertificateTrustBuilder::from(Secp256k1Policy)
+		Ok(CertificateTrustBuilder::from(Secp256k1Policy::default())
 			.with_revocation_checker(revocation)
 			.with_certificate(root)?
 			.build())
@@ -1194,55 +1231,129 @@ mod tests {
 		Ok(())
 	}
 
-	// A signer stamps its SubjectKeyIdentifier into the `SignerInfo`, and a
-	// store indexes by the same value, so the two must come from one digest.
+	/// A `SignerInfo` that names a certificate by its `subjectKeyIdentifier`
+	/// extension value resolves to that certificate (RFC 5652 §5.3).
 	#[test]
-	fn a_signer_stamps_the_identifier_its_certificate_indexes_under() -> TestResult {
+	fn a_key_identifier_sid_resolves_through_the_extension() -> TestResult {
 		let key = TestKey::insecure_fixed_signing();
 		let cert = TestCertificate::self_signed(&key);
-		let spki_der = cert.tbs_certificate.subject_public_key_info.to_der()?;
-
-		let stamped = key.to_signer_info(b"payload")?.sid;
-		let indexed = SignerIdentifier::try_from(Skid::of_public_key(spki_der))?;
-
-		assert_eq!(stamped, indexed);
-		Ok(())
-	}
-
-	#[test]
-	fn find_by_signer_info_skid() -> TestResult {
-		let key = TestKey::insecure_fixed_signing();
-		let cert = TestCertificate::self_signed(&key);
-		let certificate = cert.to_owned();
-		let store = CertificateTrustBuilder::from(Secp256k1Policy)
-			.with_certificate(certificate)?
+		let store = CertificateTrustBuilder::from(Secp256k1Policy::default())
+			.with_certificate(cert.to_owned())?
 			.build();
 
-		// The `Signatory` trait builds the signer info with a SHA3-256 SKID.
-		let signer_info = key.to_signer_info(b"test")?;
-		// The store must find the certificate.
-		let Some(found) = store.find_by_signer_info(&signer_info) else {
-			return Err(crate::testing::error::TestingError::InvariantViolated.into());
-		};
-		assert_eq!(
-			CertificateTrustStore::to_fingerprint::<Sha3_256>(found)?,
-			CertificateTrustStore::to_fingerprint::<Sha3_256>(&cert)?
-		);
+		let signer = TestIdentity::certified(key);
+		let signer_info = CmsSigner::sign_with::<Secp256k1Signature, _>(&signer, SignedContent::data(b"test"))?;
 
+		let found = store.find_by_signer_info(&signer_info);
+		let fingerprint = found.map(CertificateTrustStore::to_fingerprint::<Sha3_256>);
+		assert_eq!(
+			fingerprint.transpose()?,
+			Some(CertificateTrustStore::to_fingerprint::<Sha3_256>(&cert)?)
+		);
 		Ok(())
 	}
 
+	/// An issuer-and-serial `sid` resolves to the certificate of that issuer
+	/// and serial number.
 	#[test]
-	fn find_by_signer_info_not_found() -> TestResult {
-		let store = CertificateTrustBuilder::from(Secp256k1Policy)
+	fn an_issuer_and_serial_sid_resolves_through_the_certificate() -> TestResult {
+		let mut cert = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+		cert.tbs_certificate.extensions = None;
+
+		let store = CertificateTrustBuilder::from(Secp256k1Policy::default())
+			.with_certificate(cert.to_owned())?
+			.build();
+
+		let sid = cert.signer_identifier()?;
+		let found = store.find_by_signer_identifier(&sid);
+
+		let fingerprint = found.map(CertificateTrustStore::to_fingerprint::<Sha3_256>);
+		assert_eq!(
+			fingerprint.transpose()?,
+			Some(CertificateTrustStore::to_fingerprint::<Sha3_256>(&cert)?)
+		);
+		Ok(())
+	}
+
+	/// A key identifier the store holds no certificate for resolves to none.
+	#[test]
+	fn an_unknown_key_identifier_resolves_to_no_certificate() -> TestResult {
+		let store = CertificateTrustBuilder::from(Secp256k1Policy::default())
 			.with_certificate(TestCertificate::self_signed(&TestKey::insecure_fixed_signing()))?
 			.build();
 
-		// A different key signs.
-		let other_key = SigningKey::from_bytes(&[99u8; 32].into())?;
-		let signer_info = other_key.to_signer_info(b"test")?;
-		assert!(store.find_by_signer_info(&signer_info).is_none());
+		let other_key = crate::crypto::sign::ecdsa::Secp256k1SigningKey::from_bytes(&[99u8; 32].into())?;
+		let signer = TestIdentity::certified(other_key);
+		let signer_info = CmsSigner::sign_with::<Secp256k1Signature, _>(&signer, SignedContent::data(b"test"))?;
 
+		let found = store.find_by_signer_info(&signer_info);
+		assert!(found.is_none());
+		Ok(())
+	}
+
+	/// The store resolves a `sid` by the certificate's extension value, which
+	/// another method may have derived, and not by a key identifier it
+	/// computes.
+	#[test]
+	fn a_sid_resolves_by_the_extension_value_as_written() -> TestResult {
+		let key = TestKey::insecure_fixed_signing();
+		let written = SubjectKeyIdentifier::from(OctetString::new([0x42u8; 20])?);
+		let cert = TestCertificate::with_key_identifier(TestCertificate::self_signed(&key), written.clone());
+		let store = CertificateTrustBuilder::from(Secp256k1Policy::default())
+			.with_certificate(cert.to_owned())?
+			.build();
+
+		let sid = SignerIdentifier::SubjectKeyIdentifier(written);
+		let found = store.find_by_signer_identifier(&sid);
+		assert!(found.is_some());
+		Ok(())
+	}
+
+	/// A trust store verifies a frame under the certificate its `sid` names,
+	/// and returns the verified signature.
+	#[tokio::test]
+	async fn a_trust_store_verifies_a_frame_of_a_certificate_it_holds() -> TestResult {
+		let identity = TestIdentity::insecure_fixed();
+		let store = CertificateTrustBuilder::from(Secp256k1Policy::default())
+			.with_certificate(identity.certificate().clone())?
+			.build();
+
+		let mut frame = TestFrame::with_integrity();
+		frame.sign_with_provider(&identity).await?;
+
+		let verification = store.verify_frame(&frame);
+		assert!(matches!(verification, TrustVerification::Verified(_, _)));
+		Ok(())
+	}
+
+	/// Two certificates of two keys under one `subjectKeyIdentifier` value
+	/// collide in the extension index, because a `sid` would name both.
+	#[test]
+	fn two_certificates_under_one_key_identifier_collide() -> TestResult {
+		let first = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+		let other_key = SigningKey::from_bytes(&[3u8; 32].into())?;
+		let identifier = first.extension::<SubjectKeyIdentifier>()?;
+		let identifier = identifier.ok_or("the fixture carries a key identifier")?;
+		let second = TestCertificate::with_key_identifier(TestCertificate::self_signed(&other_key), identifier);
+		let builder = CertificateTrustBuilder::from(Secp256k1Policy::default()).with_certificate(first)?;
+
+		let refused = builder.with_certificate(second);
+		assert!(matches!(refused, Err(CertificateValidationError::SkidCollision { .. })));
+		Ok(())
+	}
+
+	/// Two certificates of one key, the second with no key identifier,
+	/// collide in the key index, because a key lookup would name both.
+	#[test]
+	fn two_certificates_of_one_key_collide() -> TestResult {
+		let key = TestKey::insecure_fixed_signing();
+		let first = TestCertificate::self_signed(&key);
+		let mut second = TestCertificate::self_signed(&key);
+		second.tbs_certificate.extensions = None;
+
+		let builder = CertificateTrustBuilder::from(Secp256k1Policy::default()).with_certificate(first)?;
+		let refused = builder.with_certificate(second);
+		assert!(matches!(refused, Err(CertificateValidationError::PublicKeyCollision { .. })));
 		Ok(())
 	}
 }

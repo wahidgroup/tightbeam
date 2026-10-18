@@ -17,7 +17,6 @@
 use core::time::Duration;
 use std::sync::Arc;
 
-use sha3::Sha3_256;
 use tightbeam::der::Sequence;
 use tightbeam::{
 	at_least,
@@ -39,7 +38,7 @@ use tightbeam::{
 	testing::{ClientEnv, ClusterEnv, SetupEnv},
 	trace::TraceCollector,
 	transport::{
-		handshake::{negotiation::TransportOffer, HandshakeKeyManager},
+		handshake::negotiation::TransportOffer,
 		multiplex::{CallContext, MuxService, StreamBody},
 		ClientBuilder, ConnectionBuilder, ConnectionPool, EncryptedProtocol, PoolConfig, TransportEncryptionConfig,
 	},
@@ -50,7 +49,7 @@ use tightbeam::{
 
 use crate::common::laser::{LaserAddr, LaserListener};
 use crate::common::security::expectation_failure;
-use crate::common::x509::GatewayCerts;
+use crate::common::x509::{signing_identity, GatewayCerts};
 
 pub(crate) const LASER_WORK_SENT: Urn<'static> = tightbeam::urn!("test", "event:laser/work-sent");
 pub(crate) const LASER_WORK_STATUS: Urn<'static> = tightbeam::urn!("test", "event:laser/work-status");
@@ -200,8 +199,8 @@ async fn emit_beam_work(certs: &GatewayCerts, addr: &LaserAddr) -> Result<Frame,
 		.with_message(BeamRequest { value: 21 })
 		.build()?;
 
-	let provider = Secp256k1KeyProvider::from(certs.key.to_owned());
-	inner.sign_with_provider::<Sha3_256, _>(&provider).await?;
+	let identity = signing_identity(certs.cert.to_owned(), certs.key.to_owned());
+	inner.sign_with_provider(&identity).await?;
 
 	let mut client = ClientBuilder::<LaserListener>::builder()
 		.with_trust_store(Arc::clone(&certs.trust))
@@ -281,8 +280,8 @@ tb_scenario! {
 	environment ServiceClient {
 		context: laser_certs(),
 		server: |SetupEnv { context: certs, .. }| async move {
-			let key_manager = HandshakeKeyManager::new(Arc::new(Secp256k1KeyProvider::from(certs.key.to_owned())));
-			let config = TransportEncryptionConfig::new(certs.cert.to_owned(), key_manager);
+			let identity = signing_identity(certs.cert.to_owned(), certs.key.to_owned());
+			let config = TransportEncryptionConfig::new(identity);
 			let (listener, addr) = <LaserListener as EncryptedProtocol>::bind_with(LaserAddr::ANY, config).await?;
 
 			let handle = server! {

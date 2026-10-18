@@ -6,7 +6,7 @@ use tightbeam::crypto::kdf::HkdfSha3_256;
 use tightbeam::crypto::profiles::{
 	AeadProvider, CryptoProvider, CurveProvider, DigestProvider, KdfProvider, SecurityProfile, SigningProvider,
 };
-use tightbeam::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey, Secp256k1VerifyingKey};
+use tightbeam::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1VerifyingKey};
 
 // A profile that negotiates AES-256-GCM.
 #[derive(Debug, Default, Clone, Copy)]
@@ -18,6 +18,7 @@ impl SecurityProfile for Aes256Profile {
 	type SignatureAlg = Secp256k1Signature;
 	type Kdf = HkdfSha3_256;
 	type Curve = Secp256k1;
+	type KeyWrapOid = tightbeam::crypto::profiles::Aes256Wrap;
 }
 
 // A provider that runs that profile.
@@ -36,7 +37,6 @@ impl AeadProvider for MismatchedProvider {
 
 impl SigningProvider for MismatchedProvider {
 	type Signature = Secp256k1Signature;
-	type SigningKey = Secp256k1SigningKey;
 	type VerifyingKey = Secp256k1VerifyingKey;
 }
 
@@ -49,9 +49,17 @@ impl CurveProvider for MismatchedProvider {
 }
 
 // ERROR: the cipher is AES-256-GCM, and the HPKE suite seals with AES-128-GCM.
+impl tightbeam::crypto::profiles::KeyWrapProvider for MismatchedProvider {
+	type KeyWrap = tightbeam::crypto::profiles::Aes256Wrap;
+}
+
+impl tightbeam::crypto::profiles::HpkeProvider for MismatchedProvider {
+	type HpkeSuite = DhKemSuite<Secp256k1, HkdfSha3_256, Aes128Gcm, 0xFF16>;
+}
+
 impl CryptoProvider for MismatchedProvider {
 	type Profile = Aes256Profile;
-	type HpkeSuite = DhKemSuite<Secp256k1, HkdfSha3_256, Aes128Gcm>;
+	type Kem = tightbeam::crypto::hpke::DhKemSecp256k1;
 
 	fn profile(&self) -> &Self::Profile {
 		&self.profile

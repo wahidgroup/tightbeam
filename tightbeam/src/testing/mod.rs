@@ -25,7 +25,10 @@ pub mod result;
 pub mod schedulability;
 pub mod specs;
 pub mod teardown;
+pub mod vectors;
 
+#[cfg(all(feature = "hpke", feature = "signature"))]
+pub mod envelope;
 #[cfg(feature = "testing-fault")]
 pub mod fault;
 #[cfg(feature = "testing-fmea")]
@@ -45,20 +48,34 @@ pub use config::{
 pub use env::{ClientEnv, ClusterEnv, HiveEnv, ServletEnv, SetupEnv, WorkerEnv};
 pub use fixtures::{
 	ConfidentialNonrepudiableNote, ConfidentialNote, ExpectedMatcher, IntegralNote, TestCertificate, TestDigest,
-	TestFrame, TestKey, TestMessage, TestSigner,
+	TestFrame, TestKey, TestMessage,
 };
 pub use result::{ScenarioResult, ScenarioVerdict};
 pub use specs::{Layer, SpecViolation, TBSpec, Violations};
 pub use teardown::Teardown;
+pub use vectors::unhex;
 
+#[cfg(feature = "random")]
+pub use vectors::SeededStream;
+
+#[cfg(all(feature = "hpke", feature = "signature"))]
+pub use envelope::EnvelopeRecipient;
 #[cfg(feature = "testing-fault")]
 pub use fault::{ProcessEvent, ProcessState};
 #[cfg(feature = "testing-fdr")]
 pub use fdr::{Decision, FdrConfig, FdrTraceExt, FdrVerdict, SchedulerModel, TraceProcessMode};
 #[cfg(feature = "testing-fault")]
 pub use fdr::{FaultInjection, FaultModel, InjectedFaultRecord, InjectionStrategy};
+#[cfg(feature = "signature")]
+pub use fixtures::TestAttributes;
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 pub use fixtures::TestCertificateChain;
+#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+pub use fixtures::TestIdentity;
+#[cfg(all(feature = "secp256k1", feature = "signature"))]
+pub use fixtures::TestSigner;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+pub use fixtures::{Aes256Sha3_512Profile, Aes256Sha3_512Provider};
 #[cfg(feature = "testing-fmea")]
 pub use fmea::{FailureMode, FmeaConfig, FmeaReport, SeverityScale};
 

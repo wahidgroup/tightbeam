@@ -32,8 +32,9 @@ use std::sync::Arc;
 
 #[cfg(feature = "signature")]
 mod signing {
+	pub use crate::crypto::sign::ecdsa::der::{MaxOverhead, MaxSize, Signature as DerSignature};
 	pub use crate::crypto::sign::ecdsa::{
-		DigestPrimitive, Secp256k1, SignPrimitive, Signature, SignatureSize, SigningKey, VerifyPrimitive,
+		DigestPrimitive, Secp256k1, SignPrimitive, SignatureSize, SigningKey, VerifyPrimitive,
 	};
 	pub use crate::crypto::sign::elliptic_curve::generic_array::{ArrayLength, GenericArray};
 	pub use crate::crypto::sign::elliptic_curve::ops::{Invert, Reduce};
@@ -111,14 +112,14 @@ pub enum KeyError {
 
 	/// The key material offered to AES key wrap is shorter than the wrap's
 	/// minimum or not a whole number of 64-bit blocks (RFC 3394 § 2).
-	#[cfg(all(feature = "aead", feature = "transport"))]
+	#[cfg(feature = "aead")]
 	#[error("Key wrap length mismatch: {0}")]
 	WrapLength(crate::error::ReceivedExpectedError<usize, usize>),
 
 	/// An AES key wrap or unwrap failed. On unwrap this is the integrity check
 	/// of RFC 3394 § 2.2.2, so the wrapped key or the KEK is not the one that
 	/// produced it.
-	#[cfg(all(feature = "aead", feature = "transport"))]
+	#[cfg(feature = "aead")]
 	#[error("AES key wrap operation failed: {0}")]
 	WrapFailed(crate::crypto::aead::aes_kw::Error),
 
@@ -185,11 +186,13 @@ impl SigningKeySpec {
 		C: PrimeCurve + CurveArithmetic + DigestPrimitive + PointCompression + AssociatedOid + Send + Sync + 'static,
 		Scalar<C>: Invert<Output = CtOption<Scalar<C>>> + SignPrimitive<C> + Reduce<C::Uint>,
 		SignatureSize<C>: ArrayLength<u8>,
+		MaxSize<C>: ArrayLength<u8>,
+		<FieldBytesSize<C> as core::ops::Add>::Output: core::ops::Add<MaxOverhead> + ArrayLength<u8>,
 		FieldBytesSize<C>: ModulusSize,
 		AffinePoint<C>: VerifyPrimitive<C> + FromEncodedPoint<C> + ToEncodedPoint<C>,
-		SigningKey<C>: PrehashSigner<Signature<C>> + Keypair + Send + Sync + Debug + 'static,
+		SigningKey<C>: PrehashSigner<DerSignature<C>> + Keypair + Send + Sync + Debug + 'static,
 		<SigningKey<C> as Keypair>::VerifyingKey: EncodePublicKey,
-		Signature<C>: SignatureEncoding + SignatureAlgorithmIdentifier + Send + Sync + 'static,
+		DerSignature<C>: SignatureEncoding + SignatureAlgorithmIdentifier + Send + Sync + 'static,
 	{
 		match self {
 			SigningKeySpec::Bytes(bytes) => {
@@ -218,8 +221,13 @@ impl SigningKeySpec {
 ///
 /// - **Key encapsulation**: private keys stay inside the provider boundary.
 /// - **Uniform interface**: in-memory and remote backends use identical APIs.
-/// - **Async by default**: every operation is async, so a remote backend fits the same API.
+/// - **Async private-key operations**: signing and key agreement are async, so
+///   a remote backend fits the same API. The public key is read in place, so
+///   a [`SigningIdentity`] checks it against its certificate when it is built,
+///   and a remote backend fetches it once when the provider is built.
 /// - **Algorithm agnostic**: the byte encoding admits any signature or key algorithm.
+///
+/// [`SigningIdentity`]: crate::crypto::sign::SigningIdentity
 ///
 /// # Threading
 ///
@@ -231,21 +239,23 @@ pub trait SigningKeyProvider: MaybeSend + MaybeSync + Debug {
 	/// Returns the algorithm identifier for this key.
 	fn algorithm(&self) -> AlgorithmIdentifierOwned;
 
-	/// Returns the public key as DER-encoded bytes.
+	/// Returns the public key as a DER SubjectPublicKeyInfo.
 	///
 	/// # Errors
 	///
-	/// - [`KeyError`] -- the backend fails to retrieve the public key.
-	fn to_public_key_bytes(&self) -> MaybeSendFuture<'_, Result<Vec<u8>, KeyError>>;
+	/// - [`KeyError`] -- the backend fails to encode the public key.
+	fn to_public_key_bytes(&self) -> Result<Vec<u8>, KeyError>;
 
 	/// Signs a precomputed digest (prehash) with this provider's private key.
 	///
 	/// The canonical tightbeam convention hashes content exactly once (see
 	/// [`sign_canonical`]). Providers MUST sign the given prehash directly, so
 	/// the produced signature matches the advertised signature-algorithm OID
-	/// whatever the backend. The result is the DER-encoded signature.
+	/// whatever the backend.
 	///
 	/// - `prehash`: the digest of the content to sign.
+	/// - An ECDSA result MUST be the DER `ECDSA-Sig-Value` (RFC 3279 §2.2.3).
+	/// - Its `s` MUST lie in the low half of the curve order.
 	///
 	/// # Errors
 	///
@@ -284,7 +294,7 @@ impl<T: SigningKeyProvider + ?Sized> SigningKeyProvider for Arc<T> {
 		T::algorithm(self)
 	}
 
-	fn to_public_key_bytes(&self) -> MaybeSendFuture<'_, Result<Vec<u8>, KeyError>> {
+	fn to_public_key_bytes(&self) -> Result<Vec<u8>, KeyError> {
 		T::to_public_key_bytes(self)
 	}
 
@@ -347,32 +357,30 @@ where
 	C: PrimeCurve + CurveArithmetic + DigestPrimitive + PointCompression + AssociatedOid + Send + Sync + 'static,
 	Scalar<C>: Invert<Output = CtOption<Scalar<C>>> + SignPrimitive<C> + Reduce<C::Uint>,
 	SignatureSize<C>: ArrayLength<u8>,
+	MaxSize<C>: ArrayLength<u8>,
+	<FieldBytesSize<C> as core::ops::Add>::Output: core::ops::Add<MaxOverhead> + ArrayLength<u8>,
 	FieldBytesSize<C>: ModulusSize,
 	AffinePoint<C>: VerifyPrimitive<C> + FromEncodedPoint<C> + ToEncodedPoint<C>,
-	SigningKey<C>: PrehashSigner<Signature<C>> + Keypair + Send + Sync + Debug,
+	SigningKey<C>: PrehashSigner<DerSignature<C>> + Keypair + Send + Sync + Debug,
 	<SigningKey<C> as Keypair>::VerifyingKey: EncodePublicKey,
-	Signature<C>: SignatureEncoding + SignatureAlgorithmIdentifier + Send + Sync,
+	DerSignature<C>: SignatureEncoding + SignatureAlgorithmIdentifier + Send + Sync,
 {
 	fn algorithm(&self) -> AlgorithmIdentifierOwned {
-		AlgorithmIdentifierOwned { oid: Signature::<C>::ALGORITHM_OID, parameters: None }
+		AlgorithmIdentifierOwned { oid: DerSignature::<C>::ALGORITHM_OID, parameters: None }
 	}
 
-	fn to_public_key_bytes(&self) -> MaybeSendFuture<'_, Result<Vec<u8>, KeyError>> {
-		let result = self
-			.signing_key
-			.verifying_key()
-			.to_public_key_der()
-			.map(|der| der.into_vec())
-			.map_err(KeyError::from);
-
-		Box::pin(async move { result })
+	fn to_public_key_bytes(&self) -> Result<Vec<u8>, KeyError> {
+		let encoded = self.signing_key.verifying_key().to_public_key_der()?;
+		Ok(encoded.into_vec())
 	}
 
+	/// The ECDSA signer of the curve returns `s` in the low half of the order,
+	/// and the result is its DER encoding.
 	fn sign_prehash(&self, prehash: &[u8]) -> MaybeSendFuture<'_, Result<Vec<u8>, KeyError>> {
 		let result = self
 			.signing_key
 			.sign_prehash(prehash)
-			.map(|signature: Signature<C>| signature.to_bytes().as_ref().to_vec())
+			.map(|signature: DerSignature<C>| signature.to_vec())
 			.map_err(KeyError::from);
 
 		Box::pin(async move { result })
@@ -603,12 +611,12 @@ mod tests {
 		hasher.finalize().to_vec()
 	}
 
-	#[tokio::test]
-	async fn test_secp256k1_provider_public_key() -> Result<(), Box<dyn std::error::Error>> {
+	#[test]
+	fn test_secp256k1_provider_public_key() -> Result<(), Box<dyn std::error::Error>> {
 		let signing_key = SigningKey::random(&mut OsRng);
 		let provider = Secp256k1KeyProvider::from(signing_key);
 
-		let public_key_bytes = provider.to_public_key_bytes().await?;
+		let public_key_bytes = provider.to_public_key_bytes()?;
 		// A DER-encoded secp256k1 SPKI is 88 bytes.
 		assert_eq!(public_key_bytes.len(), 88);
 		Ok(())
@@ -622,9 +630,26 @@ mod tests {
 		let digest = prehash(b"test data to sign");
 		let signature_bytes = provider.sign_prehash(&digest).await?;
 
-		let signature = Secp256k1Signature::from_slice(&signature_bytes)?;
+		let signature = Secp256k1Signature::from_bytes(&signature_bytes)?;
 		signing_key.verifying_key().verify_prehash(&digest, &signature)?;
 
+		Ok(())
+	}
+
+	/// The provider signs with `s` in the low half of the curve order, so its
+	/// DER value is the canonical form a verifier keys on. The raw `s` of this
+	/// key over this content lies in the high half, by an independent RFC
+	/// 6979 computation, so the test fails for a provider that skips the rule.
+	#[tokio::test]
+	async fn the_provider_signs_low_s() -> Result<(), Box<dyn std::error::Error>> {
+		let signing_key = crate::testing::TestKey::insecure_fixed_signing();
+		let provider = Secp256k1KeyProvider::from(signing_key);
+		let digest = prehash(b"cms signer content");
+		let signature_bytes = provider.sign_prehash(&digest).await?;
+
+		let parsed = Secp256k1Signature::from_bytes(&signature_bytes)?;
+		let scalars = crate::crypto::sign::ecdsa::Signature::<Secp256k1>::try_from(parsed)?;
+		assert!(scalars.normalize_s().is_none());
 		Ok(())
 	}
 
@@ -644,7 +669,6 @@ mod tests {
 		// Both sides must compute the same shared secret.
 		let shared1 = provider1.key_agreement(&public2).await?.to_insecure();
 		let shared2 = provider2.key_agreement(&public1).await?.to_insecure();
-
 		assert_eq!(shared1, shared2);
 		assert_eq!(shared1.len(), 32); // secp256k1 shared secret is 32 bytes
 		Ok(())
@@ -656,19 +680,19 @@ mod tests {
 		let provider = Arc::new(Secp256k1KeyProvider::from(signing_key.clone()));
 
 		// `Arc<Secp256k1KeyProvider>` implements `SigningKeyProvider`.
-		let public_key_bytes = provider.to_public_key_bytes().await?;
+		let public_key_bytes = provider.to_public_key_bytes()?;
 		// A DER-encoded secp256k1 SPKI is 88 bytes.
 		assert_eq!(public_key_bytes.len(), 88);
 
 		let digest = prehash(b"test");
 		let signature_bytes = provider.sign_prehash(&digest).await?;
 
-		let signature = Secp256k1Signature::from_slice(&signature_bytes)?;
+		let signature = Secp256k1Signature::from_bytes(&signature_bytes)?;
 		signing_key.verifying_key().verify_prehash(&digest, &signature)?;
 
 		// The one blanket impl serves a shared trait object as well.
 		let shared: Arc<dyn SigningKeyProvider> = provider;
-		assert_eq!(shared.to_public_key_bytes().await?, public_key_bytes);
+		assert_eq!(shared.to_public_key_bytes()?, public_key_bytes);
 
 		Ok(())
 	}

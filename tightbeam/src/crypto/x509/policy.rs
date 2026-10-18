@@ -326,8 +326,12 @@ impl SignatureVerification for DirectTrustValidator {
 		cert.ensure_signature_algorithm_consistency()?;
 
 		// RFC 5280 §6.1.3(a)(1): verify the signature using the issuer's key.
+		// A certificate signature is the key of no ledger, so its canonical
+		// form drops here.
 		let message = cert.tbs_certificate.to_der()?;
-		policy.verify_signature(&cert.signature_algorithm.oid, public_key_der, &message, signature_bytes)
+		let verified =
+			policy.verify_signature(&cert.signature_algorithm.oid, public_key_der, &message, signature_bytes);
+		verified.map(drop)
 	}
 }
 
@@ -405,7 +409,8 @@ mod tests {
 		/// that matches `signing_key`.
 		fn verify(signing_key: &SigningKey, cert: &Certificate) -> Result<(), CertificateValidationError> {
 			let issuer_pub = signing_key.verifying_key().to_public_key_der()?;
-			DirectTrustValidator::default().verify_with_policy(cert, 1_000, issuer_pub.as_bytes(), &Secp256k1Policy)
+			let policy = Secp256k1Policy::default();
+			DirectTrustValidator::default().verify_with_policy(cert, 1_000, issuer_pub.as_bytes(), &policy)
 		}
 
 		#[test]

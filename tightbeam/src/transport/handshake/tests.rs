@@ -18,16 +18,16 @@ use std::sync::{Arc, Mutex};
 use rand_core::{CryptoRng, RngCore};
 
 use crate::asn1::OctetString;
-use crate::cms::cert::IssuerAndSerialNumber;
-use crate::cms::enveloped_data::{EncryptedContentInfo, EnvelopedData};
-use crate::cms::enveloped_data::{KeyAgreeRecipientIdentifier, UserKeyingMaterial};
+use crate::cms::enveloped_data::EncryptedContentInfo;
 use crate::cms::signed_data::SignedData;
 use crate::constants::{
-	EC_PUBKEY_COMPRESSED_SIZE, TIGHTBEAM_ACK_AAD_DOMAIN, TIGHTBEAM_ACK_KDF_INFO, TIGHTBEAM_C2S_KDF_INFO,
+	EC_PUBKEY_COMPRESSED_SIZE, TIGHTBEAM_ACK_KDF_INFO, TIGHTBEAM_ACK_KEY_ID_DOMAIN, TIGHTBEAM_C2S_KDF_INFO,
 	TIGHTBEAM_S2C_KDF_INFO,
 };
-use crate::crypto::aead::{Aead, DecryptContent, DirectionalCiphers, KeyInit, Nonce, Payload};
+use crate::crypto::aead::{DecryptContent, DirectionalCiphers, KeyInit};
+use crate::crypto::cms::{AuthEnvelopedData, Opener};
 use crate::crypto::common::KeySizeUser;
+use crate::crypto::hash::{Digest, Sha3_256};
 use crate::crypto::kdf::{EcdhSecret, KdfFunction};
 use crate::crypto::key::{KeyError, Secp256k1KeyProvider, SigningKeyProvider};
 use crate::crypto::policy::Secp256k1Policy;
@@ -35,39 +35,45 @@ use crate::crypto::profiles::{AeadProvider, DefaultCryptoProvider, KdfProvider, 
 use crate::crypto::secret::SecretSlice;
 use crate::crypto::secret::ToInsecure;
 use crate::crypto::sign::ecdsa::k256::{Secp256k1, SecretKey};
-use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
+use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
 use crate::crypto::sign::elliptic_curve::sec1::ToEncodedPoint;
 use crate::crypto::sign::elliptic_curve::PublicKey;
+use crate::crypto::sign::{CmsSigner, Signed, SignedContent, SigningIdentity};
 use crate::crypto::x509::attr::{Attribute, Attributes};
 use crate::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
 use crate::crypto::x509::store::{CertificateTrustBuilder, TrustBuilder};
+use crate::crypto::x509::utils::Skid;
 use crate::der::asn1::BitString;
 use crate::der::asn1::GeneralizedTime;
+use crate::der::oid::AssociatedOid;
 use crate::der::{Decode, Encode};
-use crate::oids::{AES_256_WRAP, HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA256, SIGNER_ECDSA_WITH_SHA3_256};
+use crate::oids::{AES_256_WRAP, DATA, HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA256, SIGNER_ECDSA_WITH_SHA3_256};
 use crate::random::{generate_nonce, OsRng};
 use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey, SubjectPublicKeyInfoOwned};
+use crate::testing::TestIdentity;
 use crate::transport::handshake::flow::ClientFlow;
 use crate::transport::handshake::negotiation::{
 	AuthorizationGrant, AuthorizationRefusal, MuxBudgets, RunnableProfile, TransportAuthorizer, TransportOffer,
 };
-use crate::transport::handshake::primitives::KdfSalt;
+use crate::transport::handshake::primitives::{KdfSalt, TranscriptHash};
 use crate::transport::handshake::receipt::{
 	ApprovalRefusal, ReceiptApprover, SessionObserver, SessionOutcome, SessionReceipt,
 };
 use crate::transport::handshake::{
 	Client, ClientConfig, ClientHello, ClientKeyExchange, EstablishedSession, Handshake, HandshakeAttribute,
-	HandshakeError, HandshakeKeyManager, HandshakeMessage, HandshakeSecret, HpkeSessionPayload, PeerAuthentication,
-	Server, ServerConfig, ServerFlow, ServerHandshake, SupportedProfiles,
+	HandshakeError, HandshakeMessage, HandshakeSecret, HpkeSessionPayload, PeerAuthentication, Server, ServerConfig,
+	ServerFlow, ServerHandshake, SupportedProfiles,
 };
-use crate::transport::state::ClientIdentity;
 use crate::utils::marker::MaybeSendFuture;
+use crate::x509::ext::pkix::SubjectKeyIdentifier;
+use crate::x509::ext::Extension;
 use crate::x509::serial_number::SerialNumber;
 use crate::x509::time::Time;
 use crate::x509::time::Validity;
 use crate::x509::Certificate;
 use crate::x509::{name::RdnSequence, TbsCertificate, Version};
 use crate::TightBeamError;
+use crate::ZeroizingBytes;
 
 #[cfg(feature = "transport-hpke")]
 use crate::transport::handshake::schedule::CompressedPoint;
@@ -91,16 +97,17 @@ use hpke::*;
 
 #[cfg(feature = "transport-cms")]
 mod cms {
-	pub use crate::cms::enveloped_data::{OriginatorIdentifierOrKey, OriginatorPublicKey, RecipientInfo};
-	pub use crate::oids::{HANDSHAKE_SERVER_EPHEMERAL, RECEIPT_ACK};
+	pub use crate::cms::enveloped_data::OriginatorPublicKey;
+	pub use crate::constants::TIGHTBEAM_OPENING_UKM_LABEL;
+	pub use crate::oids::{HANDSHAKE_OPENING_CONTENT, HANDSHAKE_SERVER_EPHEMERAL, RECEIPT_ACK};
 	pub use crate::transport::handshake::attributes::HandshakeAttributes;
-	pub use crate::transport::handshake::builders::TightBeamSignedDataBuilder;
-	pub use crate::transport::handshake::processors::{TightBeamEnvelopedDataProcessor, TightBeamKariRecipient};
 	pub use crate::transport::handshake::{
 		Cms, CmsClientSettings, CmsServerIdentity, CmsServerSettings, ProvisionedTrust,
 	};
 }
 
+#[cfg(feature = "transport-cms")]
+use crate::transport::handshake::flow::OpeningContent;
 #[cfg(feature = "transport-cms")]
 use cms::*;
 
@@ -154,9 +161,19 @@ pub fn create_issued_test_certificate(serial: impl AsRef<[u8]>) -> TestCertifica
 }
 
 /// Create a self-signed certificate whose public key matches `signing_key`.
+///
+/// It carries the `subjectKeyIdentifier` of RFC 7093 §2 method 1, as every
+/// certificate the crate mints does, so a CMS signer names it by that value.
 fn create_test_certificate_inner(signing_key: &Secp256k1SigningKey) -> Result<Certificate, Box<dyn Error>> {
 	let verifying_key = *signing_key.verifying_key();
 	let public_key_der = verifying_key.to_public_key_der()?;
+	let subject_public_key_info = SubjectPublicKeyInfoOwned::from_der(public_key_der.as_bytes())?;
+	let key_identifier = SubjectKeyIdentifier::try_from(Skid::of_public_key(&subject_public_key_info))?;
+	let key_identifier = Extension {
+		extn_id: SubjectKeyIdentifier::OID,
+		critical: false,
+		extn_value: OctetString::new(key_identifier.to_der()?)?,
+	};
 
 	let tbs_cert = TbsCertificate {
 		version: Version::V3,
@@ -168,10 +185,10 @@ fn create_test_certificate_inner(signing_key: &Secp256k1SigningKey) -> Result<Ce
 			not_after: Time::GeneralTime(GeneralizedTime::from_unix_duration(Duration::from_secs(u32::MAX as u64))?),
 		},
 		subject: RdnSequence::default(),
-		subject_public_key_info: SubjectPublicKeyInfoOwned::from_der(public_key_der.as_bytes())?,
+		subject_public_key_info,
 		issuer_unique_id: None,
 		subject_unique_id: None,
-		extensions: None,
+		extensions: Some(vec![key_identifier]),
 	};
 
 	Ok(Certificate {
@@ -251,27 +268,27 @@ fn admitted(point: &PublicKey<Secp256k1>) -> PeerPoint<Secp256k1> {
 	parsed.expect("a public key encodes a point")
 }
 
-/// The handshake secret of `base` and `shared` under `salt`, through the
+/// The handshake secret of `shared` and `base` under `salt`, through the
 /// production derivation.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub fn derive_handshake_secret(
-	base: &BaseSecret,
 	shared: &EcdhSecret,
+	base: &BaseSecret,
 	salt: KdfSalt<'_>,
 ) -> Result<HandshakeSecret, HandshakeError> {
 	// The fixed agreement ignores its peer, so any point serves.
 	let peer = admitted(&SecretKey::random(&mut OsRng).public_key());
-	let agreement = Agreement::<DefaultCryptoProvider>::new(base, &peer);
+	let agreement = Agreement::<DefaultCryptoProvider>::new(&peer, base);
 	agreement.settle(&FixedAgreement(shared), salt)
 }
 
-/// A handshake secret derived from a fixture base secret of `fill` bytes, a
-/// fixture ephemeral-ephemeral secret, and a fixture salt.
+/// A handshake secret derived from a fixture ephemeral-ephemeral secret, a
+/// fixture base secret of `fill` bytes, and a fixture salt.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub fn fixture_handshake_secret(fill: u8) -> HandshakeSecret {
 	let base = BaseSecret::try_from(SecretSlice::from(vec![fill; 32])).expect("32 bytes make a base secret");
 	let shared = EcdhSecret::from([0x11u8; 32]);
-	derive_handshake_secret(&base, &shared, KdfSalt::new(&[0x99u8; 32]))
+	derive_handshake_secret(&shared, &base, KdfSalt::new(&[0x99u8; 32]))
 		.expect("fixture inputs derive a handshake secret")
 }
 
@@ -279,12 +296,21 @@ pub fn fixture_handshake_secret(fill: u8) -> HandshakeSecret {
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 const FIXTURE_CONFIRMED: [u8; 32] = [0x99u8; 32];
 
+/// `output` as the transcript hash digest `D` gave.
+pub fn fixture_transcript<D: Digest + AssociatedOid>(output: impl AsRef<[u8]>) -> TranscriptHash {
+	let output = digest::Output::<D>::from_exact_iter(output.as_ref().iter().copied());
+	let output = output.expect("the output is as wide as the output of `D`");
+	let transcript = TranscriptHash::from_output::<D>(output);
+	transcript.expect("the output is as wide as a digest output")
+}
+
 /// A key-confirmation tag of a fixture handshake secret, which confirms no
 /// handshake a test runs.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub fn fixture_confirmation() -> KeyConfirmation {
 	let secret = fixture_handshake_secret(0x42);
-	let derived = secret.confirmation::<DefaultCryptoProvider>(KdfSalt::new(&FIXTURE_CONFIRMED), &FIXTURE_CONFIRMED);
+	let transcript = fixture_transcript::<Sha3_256>(FIXTURE_CONFIRMED);
+	let derived = secret.confirmation::<DefaultCryptoProvider>(KdfSalt::new(&FIXTURE_CONFIRMED), &transcript);
 	derived.expect("a fixture secret derives a tag")
 }
 
@@ -297,7 +323,7 @@ pub struct Confirming {
 	/// The KDF salt of the handshake.
 	pub salt: Vec<u8>,
 	/// The hash of the transcript the reply sealed.
-	pub transcript_hash: [u8; 32],
+	pub transcript_hash: TranscriptHash,
 }
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -315,12 +341,13 @@ impl Confirming {
 		derived.expect("the handshake secret derives a tag")
 	}
 
-	/// `identity` sealed under the identity key of a client that drew `base`
-	/// and `ephemeral`, as the client seals its identity into its closing.
+	/// The DER of the envelope that seals `identity` under the identity key
+	/// of a client that drew `base` and `ephemeral`, as the client seals its
+	/// identity into its closing.
 	pub fn sealed_identity(&self, base: &BaseSecret, ephemeral: &SecretKey, identity: impl AsRef<[u8]>) -> Vec<u8> {
 		let sealer = self.identity_sealer(base, ephemeral);
-		let sealed = sealer.seal(identity);
-		sealed.expect("the identity seals")
+		let sealed = sealer.seal(identity).expect("the identity seals");
+		sealed.to_der().expect("the envelope encodes")
 	}
 
 	/// The identity sealer of a client that drew `base` and `ephemeral`.
@@ -336,7 +363,7 @@ impl Confirming {
 	fn secret(&self, base: &BaseSecret, ephemeral: &SecretKey) -> HandshakeSecret {
 		let salt = KdfSalt::new(&self.salt);
 		let server_ephemeral = admitted(&self.server_ephemeral);
-		let agreement = Agreement::<DefaultCryptoProvider>::new(base, &server_ephemeral);
+		let agreement = Agreement::<DefaultCryptoProvider>::new(&server_ephemeral, base);
 		let settled = agreement.settle(ephemeral, salt);
 		settled.expect("the agreement derives a handshake secret")
 	}
@@ -361,6 +388,27 @@ impl SessionObserver for CountingObserver {
 	}
 }
 
+/// Records the receipt artifact of each outcome a server reports.
+#[derive(Default)]
+pub struct ArtifactObserver(Mutex<Vec<Signed<SignedData>>>);
+
+impl ArtifactObserver {
+	/// The artifacts the server reported, in order.
+	pub fn artifacts(&self) -> Vec<Signed<SignedData>> {
+		let artifacts = self.0.lock().expect("no observer panicked while holding the record");
+		artifacts.to_owned()
+	}
+}
+
+impl SessionObserver for ArtifactObserver {
+	fn on_outcome<'a>(&'a self, outcome: &'a SessionOutcome) -> MaybeSendFuture<'a, ()> {
+		Box::pin(async move {
+			let mut artifacts = self.0.lock().expect("no observer panicked while holding the record");
+			artifacts.push(outcome.artifact.to_owned());
+		})
+	}
+}
+
 /// The plaintext of the record a test session seals under the client's send
 /// cipher.
 pub const RECORD_PLAINTEXT: &[u8] = b"application record sealed under the traffic key";
@@ -373,6 +421,9 @@ pub fn sealed_record(client: &EstablishedSession) -> Result<EncryptedContentInfo
 /// The AEAD of the default provider, which the observer keys with what it
 /// derives.
 type ObserverCipher = <DefaultCryptoProvider as AeadProvider>::AeadCipher;
+
+/// The length of the key-encryption key of a handshake seal.
+const OBSERVER_KEK_SIZE: usize = 32;
 
 /// The KDF of the default provider, which the observer runs the base-only
 /// derivation through.
@@ -460,49 +511,50 @@ impl StaticKeyObserver {
 		Ok(attempts)
 	}
 
-	/// Open the sealed acknowledgement `sealed` of the transcript
-	/// `transcript_hash` under every acknowledgement key the observer derives,
-	/// and report each outcome.
-	pub fn ack_attempts(
+	/// Open the envelope whose DER is `sealed`, the acknowledgement of the
+	/// transcript `transcript_hash`, under every acknowledgement key the
+	/// observer derives, and report each outcome.
+	pub async fn ack_attempts(
 		&self,
-		transcript_hash: &[u8; 32],
+		transcript_hash: &TranscriptHash,
 		sealed: impl AsRef<[u8]>,
 	) -> Result<SealAttempts, Box<dyn Error>> {
-		self.seal_attempts(SecretSeal::Ack, transcript_hash, sealed.as_ref())
+		self.seal_attempts(SecretSeal::Ack, transcript_hash, sealed.as_ref()).await
 	}
 
-	/// Open the sealed client identity `sealed` of the transcript
-	/// `transcript_hash` under every identity key the observer derives, and
-	/// report each outcome.
-	pub fn identity_attempts(
+	/// Open the envelope whose DER is `sealed`, the client identity of the
+	/// transcript `transcript_hash`, under every identity key the observer
+	/// derives, and report each outcome.
+	pub async fn identity_attempts(
 		&self,
-		transcript_hash: &[u8; 32],
+		transcript_hash: &TranscriptHash,
 		sealed: impl AsRef<[u8]>,
 	) -> Result<SealAttempts, Box<dyn Error>> {
-		self.seal_attempts(SecretSeal::Identity, transcript_hash, sealed.as_ref())
+		self.seal_attempts(SecretSeal::Identity, transcript_hash, sealed.as_ref()).await
 	}
 
 	/// Open `sealed` under the key of `purpose` that each handshake secret
 	/// derives, then under the key that the base secret alone derives.
-	fn seal_attempts(
+	async fn seal_attempts(
 		&self,
 		purpose: SecretSeal,
-		transcript_hash: &[u8; 32],
+		transcript_hash: &TranscriptHash,
 		sealed: &[u8],
 	) -> Result<SealAttempts, Box<dyn Error>> {
 		let salt = KdfSalt::new(&self.salt);
 		let mut attempts = Vec::with_capacity(SEAL_ATTEMPTS);
 		for secret in self.handshake_secrets()? {
 			let sealer = secret.sealer::<DefaultCryptoProvider>(purpose, salt, transcript_hash)?;
-			attempts.push(sealer.open(sealed));
+			attempts.push(sealer.open(sealed).await);
 		}
 
-		let cipher = self.pre_change_cipher(purpose.label())?;
-		let aad = [purpose.aad_domain(), transcript_hash.as_slice()].concat();
-		let nonce = Nonce::<ObserverCipher>::default();
-		let opened = cipher.decrypt(&nonce, Payload { msg: sealed, aad: &aad });
+		let kek = self.pre_change_kek(purpose.label())?;
+		let key_identifier = [purpose.domain(), transcript_hash.as_bytes()].concat();
+		let opener = Opener::Kek { kek: kek.as_slice(), key_identifier: &key_identifier };
+		let envelope = AuthEnvelopedData::from_der(sealed)?;
+		let opened = envelope.open::<DefaultCryptoProvider>(sealed, &opener, DATA).await;
 
-		attempts.push(opened.map(SecretSlice::from).map_err(|error| purpose.refusal(error)));
+		attempts.push(opened.map_err(|error| purpose.refusal(error)));
 
 		Ok(attempts)
 	}
@@ -511,7 +563,7 @@ impl StaticKeyObserver {
 	/// derivation.
 	fn handshake_secrets(&self) -> Result<Vec<HandshakeSecret>, HandshakeError> {
 		let salt = KdfSalt::new(&self.salt);
-		let derive = |shared| derive_handshake_secret(&self.base, shared, salt);
+		let derive = |shared| derive_handshake_secret(shared, &self.base, salt);
 		self.candidates.iter().map(derive).collect()
 	}
 
@@ -521,6 +573,13 @@ impl StaticKeyObserver {
 		let key_size = <ObserverCipher as KeySizeUser>::key_size();
 		let key = ObserverKdf::derive_dynamic_key(self.base.as_bytes(), label, Some(&self.salt), key_size)?;
 		Ok(ObserverCipher::new_from_slice(&key)?)
+	}
+
+	/// The key-encryption key that the base secret alone derives under
+	/// `label`, with no ephemeral-ephemeral input.
+	fn pre_change_kek(&self, label: &[u8]) -> Result<ZeroizingBytes, HandshakeError> {
+		let kek = ObserverKdf::derive_dynamic_key(self.base.as_bytes(), label, Some(&self.salt), OBSERVER_KEK_SIZE)?;
+		Ok(kek)
 	}
 }
 
@@ -557,16 +616,17 @@ pub fn create_ecdsa_sha3_256_signature_alg() -> AlgorithmIdentifierOwned {
 	AlgorithmIdentifierOwned { oid: SIGNER_ECDSA_WITH_SHA3_256, parameters: None }
 }
 
-/// A SignedData over `content` by a fresh test key.
+/// A SignedData over `content` of type `id-data` by a fresh test key.
 #[cfg(feature = "transport-cms")]
 pub fn create_test_signed_data(content: impl AsRef<[u8]>) -> SignedData {
-	let signing_key = create_test_signing_key();
-	let digest_alg = create_sha3_256_digest_alg();
-	let signature_alg = create_ecdsa_sha3_256_signature_alg();
-	let builder = TightBeamSignedDataBuilder::<DefaultCryptoProvider, _>::new(&signing_key, digest_alg, signature_alg)
-		.expect("the builder accepts a test key");
+	let signing_key = TestIdentity::certified(create_test_signing_key());
+	let content = content.as_ref();
+	let signer = CmsSigner::sign_with::<Secp256k1Signature, _>(&signing_key, SignedContent::data(content));
+	let signer = signer.expect("the test key signs");
 
-	builder.build(content).expect("the SignedData signs")
+	let signed_data = CmsSigner::signed_data(SignedContent::data(content), signer, None);
+	let signed_data = signed_data.expect("the SignedData assembles");
+	signed_data.into_inner()
 }
 
 /// Create test key pairs for cryptographic operations.
@@ -586,23 +646,6 @@ pub fn create_test_keypair() -> (SecretKey, SubjectPublicKeyInfoOwned, SecretKey
 	let recipient_pubkey = recipient_key.public_key();
 
 	(sender_key, sender_spki, recipient_key, recipient_pubkey)
-}
-
-/// Create test User Keying Material (UKM) for key agreement.
-pub fn create_test_ukm() -> UserKeyingMaterial {
-	let ukm_bytes = generate_nonce::<64>(None).expect("UKM generation should succeed");
-	UserKeyingMaterial::new(ukm_bytes.to_vec()).expect("UKM creation should succeed")
-}
-
-/// Create a test recipient identifier for CMS operations.
-pub fn create_test_recipient_id() -> KeyAgreeRecipientIdentifier {
-	use x509_cert::name::Name;
-	use x509_cert::serial_number::SerialNumber;
-
-	KeyAgreeRecipientIdentifier::IssuerAndSerialNumber(IssuerAndSerialNumber {
-		issuer: Name::default(),
-		serial_number: SerialNumber::new(&[0x01]).expect("Serial number creation should succeed"),
-	})
 }
 
 /// Create the test key encryption algorithm identifier (AES-256 key wrap).
@@ -642,7 +685,7 @@ impl SigningKeyProvider for CountingProvider {
 		self.inner.algorithm()
 	}
 
-	fn to_public_key_bytes(&self) -> MaybeSendFuture<'_, Result<Vec<u8>, KeyError>> {
+	fn to_public_key_bytes(&self) -> Result<Vec<u8>, KeyError> {
 		self.public_keys.fetch_add(1, Ordering::SeqCst);
 		self.inner.to_public_key_bytes()
 	}
@@ -682,7 +725,7 @@ impl SigningKeyProvider for RecordingProvider {
 		self.inner.algorithm()
 	}
 
-	fn to_public_key_bytes(&self) -> MaybeSendFuture<'_, Result<Vec<u8>, KeyError>> {
+	fn to_public_key_bytes(&self) -> Result<Vec<u8>, KeyError> {
 		self.inner.to_public_key_bytes()
 	}
 
@@ -745,6 +788,30 @@ impl TransportAuthorizer for ChallengingAuthorizer {
 	}
 }
 
+/// Records the offers it is asked to grant, and grants each as
+/// [`ChallengingAuthorizer`] does.
+#[derive(Default)]
+pub struct RecordingAuthorizer(Mutex<Vec<TransportOffer>>);
+
+impl RecordingAuthorizer {
+	/// The offers the server asked this authorizer to grant, in order.
+	pub fn offers(&self) -> Vec<TransportOffer> {
+		let offers = self.0.lock().expect("no grant panicked while holding the record");
+		offers.to_owned()
+	}
+}
+
+impl TransportAuthorizer for RecordingAuthorizer {
+	fn authorize<'a>(
+		&'a self,
+		offer: &'a TransportOffer,
+	) -> MaybeSendFuture<'a, Result<AuthorizationGrant, AuthorizationRefusal>> {
+		let mut offers = self.0.lock().expect("no grant panicked while holding the record");
+		offers.push(offer.to_owned());
+		ChallengingAuthorizer.authorize(offer)
+	}
+}
+
 /// Grants the requested budgets with the test challenge and leaves settlement
 /// to the trait default, which refuses a challenged receipt.
 pub struct RefusingAuthorizer;
@@ -773,20 +840,29 @@ impl ReceiptApprover for PayingApprover {
 	}
 }
 
+/// The signing identity of `identity`: its certificate beside the key that
+/// proves it.
+pub fn signing_identity(identity: &TestCertificate) -> SigningIdentity {
+	presenting(identity, into_provider(identity.signing_key.to_owned()))
+}
+
+/// The signing identity of `identity`'s certificate, whose key sits behind
+/// `key`.
+pub fn presenting(identity: &TestCertificate, key: Arc<dyn SigningKeyProvider>) -> SigningIdentity {
+	let certificate = identity.certificate.to_owned();
+	SigningIdentity::new(certificate, key).expect("the test key matches its certificate")
+}
+
 /// The identity of a test client: the certificate of `identity` beside the
 /// key that proves it.
-pub fn client_identity(identity: &TestCertificate) -> ClientIdentity<DefaultCryptoProvider> {
-	let manager = HandshakeKeyManager::from(identity.signing_key.to_owned());
-	ClientIdentity::new(Arc::new(identity.certificate.to_owned()), Arc::new(manager))
+pub fn client_identity(identity: &TestCertificate) -> SigningIdentity {
+	signing_identity(identity)
 }
 
 /// The configuration of an HPKE client that admits `server` and presents
 /// `identity`, when it holds one.
 #[cfg(feature = "transport-hpke")]
-pub fn hpke_client(
-	server: &Certificate,
-	identity: Option<ClientIdentity<DefaultCryptoProvider>>,
-) -> TestClientConfig<Hpke> {
+pub fn hpke_client(server: &Certificate, identity: Option<SigningIdentity>) -> TestClientConfig<Hpke> {
 	let validator = DirectTrustValidator::default().with_trust_chain(vec![server.to_owned()]);
 	let mut settings = HpkeClientSettings::new(LearnedTrust::new(validator));
 	settings.identity = identity;
@@ -885,11 +961,12 @@ pub struct Recovered {
 	pub observer: StaticKeyObserver,
 	/// The base secret the static key opened.
 	pub base: Vec<u8>,
-	/// The sealed receipt acknowledgement, when the closing carries one beside
-	/// the identity. A CMS closing carries it inside the sealed Finished, so
-	/// for CMS it is `None`.
+	/// The DER of the envelope that seals the receipt acknowledgement, when
+	/// the closing carries one beside the identity. A CMS closing carries it
+	/// inside the sealed Finished, so for CMS it is `None`.
 	pub sealed_ack: Option<Vec<u8>>,
-	/// The sealed client identity, when the closing carried one.
+	/// The DER of the envelope that seals the client identity, when the
+	/// closing carried one.
 	pub sealed_identity: Option<Vec<u8>>,
 }
 
@@ -904,10 +981,7 @@ pub trait TestFlow: ClientFlow<DefaultCryptoProvider> + ServerFlow<DefaultCrypto
 
 	/// The configuration of a client that admits `server` and presents
 	/// `identity`, whose key may sit behind any provider.
-	fn client_presenting(
-		server: &Certificate,
-		identity: ClientIdentity<DefaultCryptoProvider>,
-	) -> TestClientConfig<Self>;
+	fn client_presenting(server: &Certificate, identity: SigningIdentity) -> TestClientConfig<Self>;
 
 	/// The configuration of a server that holds `identity`, demands no client
 	/// certificate, and runs the default test profile.
@@ -915,7 +989,7 @@ pub trait TestFlow: ClientFlow<DefaultCryptoProvider> + ServerFlow<DefaultCrypto
 
 	/// Open the recorded legs of `run` with the static key of
 	/// `server_identity`, through the same path the server runs.
-	fn recover(run: &Run<Self>, server_identity: &TestCertificate) -> Recovered;
+	async fn recover(run: &Run<Self>, server_identity: &TestCertificate) -> Recovered;
 }
 
 /// A client configuration under the default provider.
@@ -932,20 +1006,16 @@ pub type TestServer<F> = Handshake<Server, F, DefaultCryptoProvider>;
 
 #[cfg(feature = "transport-hpke")]
 impl TestFlow for Hpke {
-	fn client_presenting(
-		server: &Certificate,
-		identity: ClientIdentity<DefaultCryptoProvider>,
-	) -> TestClientConfig<Self> {
+	fn client_presenting(server: &Certificate, identity: SigningIdentity) -> TestClientConfig<Self> {
 		hpke_client(server, Some(identity))
 	}
 
 	fn server(identity: &TestCertificate) -> TestServerConfig<Self> {
-		let settings = HpkeServerSettings::new(Arc::new(identity.certificate.to_owned()));
-		let key = into_provider(identity.signing_key.to_owned());
-		ServerConfig::new(settings, key, SupportedProfiles::from(create_default_test_profile()))
+		let profiles = SupportedProfiles::from(create_default_test_profile());
+		ServerConfig::new(HpkeServerSettings::new(), signing_identity(identity), profiles)
 	}
 
-	fn recover(run: &Run<Self>, server_identity: &TestCertificate) -> Recovered {
+	async fn recover(run: &Run<Self>, server_identity: &TestCertificate) -> Recovered {
 		let key_exchange = carried_key_exchange(&run.closing);
 		let static_key = SecretKey::from(server_identity.signing_key.to_owned());
 		let message = HpkeMessage::<HpkeSecp256k1Sha3Aes256Gcm>::from_bytes(key_exchange.sealed_payload.as_bytes());
@@ -973,11 +1043,8 @@ impl TestFlow for Hpke {
 
 #[cfg(feature = "transport-cms")]
 impl TestFlow for Cms {
-	fn client_presenting(
-		server: &Certificate,
-		identity: ClientIdentity<DefaultCryptoProvider>,
-	) -> TestClientConfig<Self> {
-		let store = CertificateTrustBuilder::from(Secp256k1Policy)
+	fn client_presenting(server: &Certificate, identity: SigningIdentity) -> TestClientConfig<Self> {
+		let store = CertificateTrustBuilder::from(Secp256k1Policy::default())
 			.with_certificate(server.to_owned())
 			.expect("the store takes a valid test certificate")
 			.build();
@@ -987,17 +1054,23 @@ impl TestFlow for Cms {
 	}
 
 	fn server(identity: &TestCertificate) -> TestServerConfig<Self> {
-		let key = into_provider(identity.signing_key.to_owned());
-		ServerConfig::new(CmsServerSettings, key, SupportedProfiles::from(create_default_test_profile()))
+		let profiles = SupportedProfiles::from(create_default_test_profile());
+		ServerConfig::new(CmsServerSettings, signing_identity(identity), profiles)
 	}
 
-	fn recover(run: &Run<Self>, server_identity: &TestCertificate) -> Recovered {
-		let key_exchange = run.opening.to_owned().enveloped().expect("a CMS opening is an EnvelopedData");
+	async fn recover(run: &Run<Self>, server_identity: &TestCertificate) -> Recovered {
+		let opening = run.opening.to_owned().auth_enveloped();
+		let opening = opening.expect("a CMS opening is an AuthEnvelopedData");
 		let static_key = SecretKey::from(server_identity.signing_key.to_owned());
-		let recipient = TightBeamKariRecipient::new(DefaultCryptoProvider::default(), static_key.to_owned());
-		let processor = TightBeamEnvelopedDataProcessor::<DefaultCryptoProvider>::new(recipient);
-		let opened = processor.process(key_exchange.value());
-		let base = opened.expect("the static key unwraps the base secret").to_insecure().to_vec();
+		let identity = signing_identity(server_identity);
+		let opener = Opener::Kem { identity: &identity, ukm_label: TIGHTBEAM_OPENING_UKM_LABEL };
+		let (arrived, opening) = opening.into_parts();
+		let opened = opening.open::<DefaultCryptoProvider>(arrived, &opener, HANDSHAKE_OPENING_CONTENT);
+
+		let opened = opened.await;
+		let content = opened.expect("the static key opens the opening").to_insecure();
+		let content = OpeningContent::from_der(&content).expect("the opening content decodes");
+		let base = content.base_secret.as_bytes().to_vec();
 
 		let server_finished = run.reply.to_owned().signed().expect("a CMS reply is a SignedData");
 		let server_ephemeral = server_finished.value().find_unsigned_attr(HANDSHAKE_SERVER_EPHEMERAL);
@@ -1005,14 +1078,12 @@ impl TestFlow for Cms {
 		let server_ephemeral = server_ephemeral.expect("the server Finished carries its ephemeral");
 		let server_ephemeral = server_ephemeral.decode::<OriginatorPublicKey>().expect("the ephemeral decodes");
 		let server_point = server_ephemeral.public_key.raw_bytes();
-		let client_point = originator_point(key_exchange.value());
-		let observer = StaticKeyObserver::new(&static_key, &base, &client_point, server_point, run.transcript_hash);
+		let client_point = content.agreement_key.public_key.raw_bytes();
+		let observer = StaticKeyObserver::new(&static_key, &base, client_point, server_point, run.transcript_hash);
 
 		// The acknowledgement rides inside the sealed Finished, which is all of
 		// the closing the observer holds.
-		let sealed_finished = run.closing.to_owned().encrypted().expect("a CMS closing is an EncryptedData");
-		let sealed = sealed_finished.value().enc_content_info.encrypted_content.as_ref();
-		let sealed = sealed.expect("the sealed Finished carries content").as_bytes().to_vec();
+		let sealed = run.closing.der().to_vec();
 
 		Recovered {
 			observer: observer.expect("both ephemerals are points on the curve"),
@@ -1021,20 +1092,6 @@ impl TestFlow for Cms {
 			sealed_identity: Some(sealed),
 		}
 	}
-}
-
-/// The SEC1 bytes of the client's KARI originator key in `key_exchange`.
-#[cfg(feature = "transport-cms")]
-pub fn originator_point(key_exchange: &EnvelopedData) -> Vec<u8> {
-	let recipient = key_exchange.recip_infos.0.iter().next();
-	let Some(RecipientInfo::Kari(kari)) = recipient else {
-		panic!("the key exchange carries a KARI");
-	};
-	let OriginatorIdentifierOrKey::OriginatorKey(originator) = &kari.originator else {
-		panic!("the KARI carries an originator key");
-	};
-
-	originator.public_key.raw_bytes().to_vec()
 }
 
 /// The three messages of one handshake as they were sent, with both endpoints
@@ -1047,7 +1104,7 @@ pub struct Run<F: TestFlow> {
 	/// The closing, as the client sent it.
 	pub closing: HandshakeMessage,
 	/// The transcript hash both sides sealed.
-	pub transcript_hash: [u8; 32],
+	pub transcript_hash: TranscriptHash,
 	/// The client, with its closing sent.
 	pub client: TestClient<F>,
 	/// The server, with the closing received.
@@ -1065,9 +1122,7 @@ impl<F: TestFlow> Run<F> {
 /// `client_identity` and signs through `key`.
 pub async fn mutual_run<F: TestFlow>(client_identity: &TestCertificate, key: Arc<dyn SigningKeyProvider>) -> Run<F> {
 	let server_identity = create_test_certificate();
-	let certificate = Arc::new(client_identity.certificate.to_owned());
-	let manager = Arc::new(HandshakeKeyManager::new(key));
-	let presented = ClientIdentity::new(certificate, manager);
+	let presented = presenting(client_identity, key);
 	let client = F::client_presenting(&server_identity.certificate, presented);
 
 	let mut server = F::server(&server_identity);

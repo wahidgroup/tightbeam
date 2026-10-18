@@ -268,6 +268,12 @@ pub enum TightBeamError {
 	#[source]
 	HpkeError(crate::crypto::hpke::HpkeError),
 
+	/// An authenticated envelope failed to seal, or refused to open.
+	#[cfg(all(feature = "hpke", feature = "signature"))]
+	#[error("Authenticated envelope error: {0}")]
+	#[source]
+	EnvelopeError(crate::crypto::cms::EnvelopeError),
+
 	/// Certificate validation failed.
 	#[cfg(feature = "x509")]
 	#[error("Certificate validation error: {0}")]
@@ -313,6 +319,14 @@ pub enum TightBeamError {
 	#[cfg(feature = "signature")]
 	#[error("Signature encoding error")]
 	SignatureEncodingError,
+
+	/// A CMS signature or `SignedData` breaks a rule of the CMS signer: its
+	/// signer, version, signed attributes, `digestAlgorithms`, or content, or
+	/// a key that differs from its certificate or has no supported algorithm.
+	#[cfg(feature = "signature")]
+	#[error("CMS signer error: {0}")]
+	#[source]
+	Signer(crate::crypto::sign::SignerError),
 
 	/// The metadata is invalid.
 	#[error("Invalid metadata")]
@@ -506,6 +520,8 @@ crate::impl_from!(aead::Error => TightBeamError::EncryptionError);
 crate::impl_from!(crypto_common::InvalidLength => TightBeamError::InvalidKeyLength);
 #[cfg(feature = "hpke")]
 crate::impl_from!(crate::crypto::hpke::HpkeError => TightBeamError::HpkeError);
+#[cfg(all(feature = "hpke", feature = "signature"))]
+crate::impl_from!(crate::crypto::cms::EnvelopeError => TightBeamError::EnvelopeError);
 #[cfg(feature = "signature")]
 crate::impl_from!(signature::Error => TightBeamError::SignatureError);
 #[cfg(feature = "signature")]
@@ -581,6 +597,26 @@ impl TightBeamError {
 		use crate::transport::TransportError;
 
 		TransportError::from(TransitStatus::Unimplemented).into()
+	}
+}
+
+/// The signer's encoding, key, certificate, signature, and algorithm failures
+/// map to the variants this enum names for them, so a caller matches one
+/// variant per cause whichever path it took.
+#[cfg(feature = "signature")]
+impl From<crate::crypto::sign::SignerError> for TightBeamError {
+	fn from(err: crate::crypto::sign::SignerError) -> Self {
+		use crate::crypto::sign::SignerError;
+
+		match err {
+			SignerError::Encoding(err) => TightBeamError::SerializationError(err),
+			SignerError::PublicKey(err) => TightBeamError::SpkiError(err),
+			SignerError::Key(err) => TightBeamError::KeyError(err),
+			SignerError::Certificate(err) => TightBeamError::CertificateValidationError(err),
+			SignerError::Signature(err) => TightBeamError::SignatureError(err),
+			SignerError::UnexpectedAlgorithm(algorithms) => TightBeamError::UnexpectedAlgorithm(algorithms),
+			other => TightBeamError::Signer(other),
+		}
 	}
 }
 

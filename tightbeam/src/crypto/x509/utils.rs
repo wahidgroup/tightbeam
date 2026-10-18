@@ -6,8 +6,10 @@ use core::hash::{Hash, Hasher};
 use core::marker::PhantomData;
 use core::time::Duration;
 
+use crate::cms::cert::IssuerAndSerialNumber;
+use crate::cms::enveloped_data::RecipientIdentifier;
 use crate::cms::signed_data::SignerIdentifier;
-use crate::crypto::hash::{Digest, Sha3_256, U32};
+use crate::crypto::hash::{Digest, U32};
 use crate::crypto::x509::error::CertificateValidationError;
 use crate::crypto::x509::ext::pkix::SubjectKeyIdentifier;
 use crate::crypto::x509::Certificate;
@@ -15,7 +17,10 @@ use crate::der::asn1::{GeneralizedTime, OctetString};
 use crate::der::oid::AssociatedOid;
 use crate::der::{DecodeOwned, Encode};
 use crate::x509::certificate::{CertificateInner, Profile};
+use crate::x509::serial_number::SerialNumber;
 
+#[cfg(feature = "secp256k1")]
+use crate::spki::SubjectPublicKeyInfoOwned;
 #[cfg(any(host_clock, feature = "time"))]
 use crate::utils::time::UnixMillis;
 
@@ -82,29 +87,25 @@ where
 	}
 }
 
-/// The digest a tightbeam SubjectKeyIdentifier is taken from.
+/// A 20-octet key identifier by RFC 7093 §2 method 1: the leftmost 160 bits
+/// of the SHA-256 hash of the `subjectPublicKey` BIT STRING value.
 ///
-/// RFC 5280 leaves the derivation to the issuer, so the protocol fixes one:
-/// every SKID this crate computes, indexes, or resolves is
-/// `SHA3-256(SPKI)[..20]`. A signer and a trust store that chose their own
-/// digests would never resolve each other.
-pub type SkidDigest = Sha3_256;
-
-/// The 20-byte SubjectKeyIdentifier truncation of a digest (RFC 5280).
-///
-/// [`Skid::of_public_key`] takes the window from a public key's digest.
-/// [`Skid::parse`] reads an exact 20-byte window already on the wire.
+/// Every certificate the crate mints carries its key's identifier as its
+/// `subjectKeyIdentifier`, and an issued one carries its issuer's as its
+/// `authorityKeyIdentifier`.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct Skid([u8; 20]);
 
 impl Skid {
-	/// Returns the SubjectKeyIdentifier of a DER-encoded public key.
+	/// Returns the RFC 7093 §2 method 1 identifier of `spki`'s public key.
 	///
-	/// The digest is the protocol constant [`SkidDigest`]. A signer stamps this
-	/// value into the `SignerInfo` it puts on the wire, and a trust store
-	/// indexes by it.
-	pub fn of_public_key(public_key_der: impl AsRef<[u8]>) -> Self {
-		let digest: [u8; 32] = <SkidDigest as Digest>::digest(public_key_der.as_ref()).into();
+	/// The hash input is the BIT STRING value alone, without the tag, the
+	/// length, and the unused-bits octet.
+	#[cfg(feature = "secp256k1")]
+	pub fn of_public_key(spki: &SubjectPublicKeyInfoOwned) -> Self {
+		use k256::sha2::Sha256;
+
+		let digest: [u8; 32] = Sha256::digest(spki.subject_public_key.raw_bytes()).into();
 		let mut bytes = [0u8; 20];
 		bytes.copy_from_slice(&digest[..20]);
 
@@ -123,40 +124,18 @@ impl Skid {
 	}
 }
 
-/// A SKID names its key as the `SignerIdentifier::SubjectKeyIdentifier` of
-/// CMS SignedData (RFC 5652 § 5.3), the form every signer in this crate
-/// stamps and every trust store indexes under.
+/// A SKID as the `subjectKeyIdentifier` extension value (RFC 5280 §4.2.1.2).
 ///
 /// # Errors
 ///
-/// - [`der::Error`] -- the 20 SKID bytes do not fit an
-///   `OCTET STRING`, which the `der` length rules make unreachable here.
-///
-/// # Examples
-///
-/// ```
-/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// use tightbeam::cms::signed_data::SignerIdentifier;
-/// use tightbeam::crypto::sign::ecdsa::{Secp256k1SigningKey, Secp256k1VerifyingKey};
-/// use tightbeam::crypto::x509::utils::Skid;
-/// use tightbeam::spki::EncodePublicKey;
-///
-/// let signing_key = Secp256k1SigningKey::from_slice(&[7u8; 32])?;
-/// let verifying_key = Secp256k1VerifyingKey::from(&signing_key);
-/// let skid = Skid::of_public_key(verifying_key.to_public_key_der()?);
-/// let signer_id = SignerIdentifier::try_from(skid)?;
-///
-/// assert!(matches!(signer_id, SignerIdentifier::SubjectKeyIdentifier(_)));
-/// # Ok(())
-/// # }
-/// ```
-impl TryFrom<Skid> for SignerIdentifier {
+/// - [`der::Error`] -- the 20 SKID bytes do not fit an `OCTET STRING`, which
+///   the `der` length rules make unreachable here.
+impl TryFrom<Skid> for SubjectKeyIdentifier {
 	type Error = crate::der::Error;
 
 	fn try_from(skid: Skid) -> Result<Self, Self::Error> {
 		let octets = OctetString::new(skid.as_bytes().as_slice())?;
-		let identifier = SubjectKeyIdentifier::from(octets);
-		Ok(Self::SubjectKeyIdentifier(identifier))
+		Ok(SubjectKeyIdentifier::from(octets))
 	}
 }
 
@@ -246,6 +225,27 @@ pub trait CertificateExt {
 	fn extension<T>(&self) -> Result<Option<T>, CertificateValidationError>
 	where
 		T: AssociatedOid + DecodeOwned;
+
+	/// The CMS `SignerIdentifier` that names this certificate (RFC 5652
+	/// §5.3).
+	///
+	/// It is the `subjectKeyIdentifier` extension value when the certificate
+	/// carries one, and the issuer and serial number when it carries none.
+	///
+	/// # Errors
+	///
+	/// - [`CertificateValidationError::EncodingError`] -- the extension value
+	///   or the serial number fails to decode.
+	fn signer_identifier(&self) -> Result<SignerIdentifier, CertificateValidationError>;
+
+	/// The CMS `RecipientIdentifier` that names this certificate (RFC 9629
+	/// §3), under the rule of [`Self::signer_identifier`].
+	///
+	/// # Errors
+	///
+	/// - [`CertificateValidationError::EncodingError`] -- the extension value
+	///   or the serial number fails to decode.
+	fn recipient_identifier(&self) -> Result<RecipientIdentifier, CertificateValidationError>;
 }
 
 impl<P: Profile> CertificateExt for CertificateInner<P> {
@@ -322,26 +322,58 @@ impl<P: Profile> CertificateExt for CertificateInner<P> {
 
 		Ok(None)
 	}
+
+	/// Name this certificate as a CMS signer.
+	///
+	/// [`CertificateExt::signer_identifier`] owns the RFC 5652 §5.3 contract.
+	fn signer_identifier(&self) -> Result<SignerIdentifier, CertificateValidationError> {
+		if let Some(key_identifier) = self.extension::<SubjectKeyIdentifier>()? {
+			return Ok(SignerIdentifier::SubjectKeyIdentifier(key_identifier));
+		}
+
+		let issuer = self.tbs_certificate.issuer.clone();
+		let serial_number = SerialNumber::new(self.tbs_certificate.serial_number.as_bytes())?;
+		let named = IssuerAndSerialNumber { issuer, serial_number };
+		Ok(SignerIdentifier::IssuerAndSerialNumber(named))
+	}
+
+	/// Name this certificate as a CMS recipient.
+	///
+	/// [`CertificateExt::recipient_identifier`] owns the RFC 9629 §3 contract.
+	fn recipient_identifier(&self) -> Result<RecipientIdentifier, CertificateValidationError> {
+		let sid = self.signer_identifier()?;
+		Ok(recipient_identifier_of(&sid))
+	}
+}
+
+/// The CMS `RecipientIdentifier` that names the certificate `sid` names.
+///
+/// A `rid` and a `sid` share their two arms (RFC 9629 §3, RFC 5652 §5.3), so
+/// one rule names a certificate as a signer and as a recipient.
+pub(crate) fn recipient_identifier_of(sid: &SignerIdentifier) -> RecipientIdentifier {
+	match sid {
+		SignerIdentifier::SubjectKeyIdentifier(skid) => RecipientIdentifier::SubjectKeyIdentifier(skid.clone()),
+		SignerIdentifier::IssuerAndSerialNumber(issuer) => RecipientIdentifier::IssuerAndSerialNumber(issuer.clone()),
+	}
 }
 
 #[cfg(test)]
 mod tests {
 	use super::Skid;
-	use crate::cms::signed_data::SignerIdentifier;
 	use crate::crypto::x509::error::CertificateValidationError;
 	use crate::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
 	use crate::testing::TestCertificate;
+	use crate::x509::ext::pkix::SubjectKeyIdentifier;
 
-	/// The signer identifier a SKID converts to carries the SKID bytes whole,
-	/// so a signer stamps the same 20 bytes a trust store indexes under.
+	/// The extension value a SKID converts to carries the SKID bytes whole,
+	/// so a minted certificate holds the 20 bytes its key names.
 	#[test]
-	fn a_skid_converts_to_the_signer_identifier_that_carries_it() -> Result<(), crate::der::Error> {
-		let skid = Skid::of_public_key(b"a public key in DER");
-		let identifier = SignerIdentifier::try_from(skid)?;
+	fn a_skid_converts_to_the_extension_value_that_carries_it() -> Result<(), crate::der::Error> {
+		let skid = Skid::parse([0x5au8; 20]).ok_or(crate::der::Tag::OctetString.value_error())?;
 
-		let expected = skid.as_bytes();
-		let carried = matches!(&identifier, SignerIdentifier::SubjectKeyIdentifier(id) if id.0.as_bytes() == expected);
-		assert!(carried);
+		let identifier = SubjectKeyIdentifier::try_from(skid)?;
+
+		assert_eq!(identifier.0.as_bytes(), skid.as_bytes());
 		Ok(())
 	}
 

@@ -12,8 +12,8 @@
 //! - **Configuration.** Backpressure, mux, envelope, timeout, colony, gossip, and peer discovery bounds.
 
 /// KDF info string for the handshake secret (HKDF), which both protocols
-/// extract from the client's base secret and the ephemeral-ephemeral ECDH
-/// output under the protocol salt.
+/// extract under the protocol salt from the ephemeral-ephemeral ECDH output
+/// followed by the client's base secret.
 pub const TIGHTBEAM_SESSION_KDF_INFO: &[u8] = b"tb/session/kdf/v1";
 
 /// KDF info string for the key that seals the receipt acknowledgement (HKDF).
@@ -27,12 +27,12 @@ pub const TIGHTBEAM_SESSION_KDF_INFO: &[u8] = b"tb/session/kdf/v1";
 /// - RFC 5116 § 3.1, a nonce used once per key: <https://datatracker.ietf.org/doc/html/rfc5116#section-3.1>
 pub const TIGHTBEAM_ACK_KDF_INFO: &[u8] = b"tb/session/kdf/ack/v1";
 
-/// Domain label the receipt acknowledgement seal binds as associated data,
+/// Domain label that leads the `kekid` of the receipt acknowledgement seal,
 /// ahead of the transcript hash.
 ///
-/// The label names the AEAD context alone, so the associated data differs
-/// from every signed Finished content and from [`TIGHTBEAM_ACK_KDF_INFO`].
-pub const TIGHTBEAM_ACK_AAD_DOMAIN: &[u8] = b"tb/handshake/ack/aad/v1";
+/// The label names the acknowledgement's key-encryption key in the `kekid`,
+/// so an opener of another purpose refuses the seal by its key identifier.
+pub const TIGHTBEAM_ACK_KEY_ID_DOMAIN: &[u8] = b"tb/handshake/ack/kekid/v1";
 
 /// KDF info label of the key that seals the client identity of a handshake
 /// (HKDF).
@@ -44,13 +44,13 @@ pub const TIGHTBEAM_ACK_AAD_DOMAIN: &[u8] = b"tb/handshake/ack/aad/v1";
 ///
 /// # Sources
 ///
-/// - RFC 8446 § 4.4.2 and Appendix E.1, the client identity under handshake
-///   keys: <https://datatracker.ietf.org/doc/html/rfc8446#appendix-E.1>
+/// - RFC 9846 § 4.5 and Appendix F.1, the client identity under handshake
+///   keys: <https://datatracker.ietf.org/doc/html/rfc9846#appendix-F.1>
 pub const TIGHTBEAM_IDENTITY_KDF_INFO: &[u8] = b"tb/session/kdf/identity/v1";
 
-/// Domain label the identity seal binds as associated data, ahead of the
+/// Domain label that leads the `kekid` of the identity seal, ahead of the
 /// transcript hash.
-pub const TIGHTBEAM_IDENTITY_AAD_DOMAIN: &[u8] = b"tb/handshake/identity/aad/v1";
+pub const TIGHTBEAM_IDENTITY_KEY_ID_DOMAIN: &[u8] = b"tb/handshake/identity/kekid/v1";
 
 /// Domain label that leads the bytes an HPKE client identity signs, ahead of
 /// the transcript hash, the client ephemeral, and the certificate.
@@ -60,17 +60,18 @@ pub const TIGHTBEAM_HPKE_CLIENT_AUTH_DOMAIN: &[u8] = b"tb/handshake/client-auth/
 /// ahead of the transcript hash.
 pub const TIGHTBEAM_HPKE_SERVER_AUTH_DOMAIN: &[u8] = b"tb/handshake/server-auth/hpke/v1";
 
-/// KDF info label of the key-confirmation tag (HKDF), which the transcript
-/// hash follows.
+/// HKDF-Expand label of `mac_key`, the key of the key-confirmation tag.
 ///
-/// The client derives the tag from the handshake secret and sends it on the
-/// closing. The server derives the same tag before it settles, so a client
-/// that holds another secret ends the handshake at the closing.
+/// `mac_key` expands from the PRK of the handshake secret to the output length
+/// of the negotiated digest, and it keys the one HMAC over the transcript hash
+/// that forms the tag. The server derives the same tag before it settles, so a
+/// client that holds another secret ends the handshake at the closing.
 ///
 /// # Sources
 ///
-/// - NIST SP 800-56A Rev. 3 § 5.9, key confirmation: <https://doi.org/10.6028/NIST.SP.800-56Ar3>
-pub const TIGHTBEAM_CONFIRM_KDF_INFO: &[u8] = b"tb/session/kdf/confirm/v1";
+/// - RFC 9846 § 4.5.3, the Finished construction:
+///   <https://datatracker.ietf.org/doc/html/rfc9846#section-4.5.3>
+pub const TIGHTBEAM_FINISHED_KEY_INFO: &[u8] = b"tb/handshake/finished/v1";
 
 /// KDF info string for the client-to-server session key (HKDF).
 ///
@@ -100,8 +101,19 @@ pub const TIGHTBEAM_S2C_KDF_INFO: &[u8] = b"tb/session/kdf/s2c/v1";
 ///   <https://datatracker.ietf.org/doc/html/rfc9846#section-7.2>
 pub const TIGHTBEAM_EPOCH_KDF_INFO: &[u8] = b"tb/session/kdf/epoch/v1";
 
-/// KDF info string for CMS KARI (Key Agreement Recipient Info) KEK derivation.
-pub const TIGHTBEAM_KARI_KDF_INFO: &[u8] = b"tb/kari/kdf/v1";
+/// The purpose label that leads the `ukm` of the CMS opening's
+/// `KEMRecipientInfo`, ahead of the 32 random octets the seal draws for
+/// itself.
+///
+/// The `ukm` enters the KDF input of the key that wraps the content key, and
+/// the server admits this label alone, so a KEM seal of another purpose does
+/// not open as an opening.
+///
+/// # Sources
+///
+/// - RFC 9629 § 3 and § 5, the `ukm` and the KDF input:
+///   <https://datatracker.ietf.org/doc/html/rfc9629#section-5>
+pub const TIGHTBEAM_OPENING_UKM_LABEL: &[u8] = b"tb/handshake/opening/ukm/v1";
 
 /// Domain label a server CMS Finished signs ahead of the transcript hash.
 pub const TIGHTBEAM_SERVER_FINISHED_DOMAIN: &[u8] = b"tb/handshake/finished/server/v1";
@@ -172,9 +184,6 @@ pub const TIGHTBEAM_AAD_DOMAIN_TAG: &[u8] = b"tb/aead/v1";
 /// the salt must carry at least this many bytes of randomness.
 pub const MIN_SALT_ENTROPY_BYTES: usize = 16;
 
-/// UKM (User Keying Material) prefix for KARI operations.
-pub const TIGHTBEAM_UKM_PREFIX: &[u8] = b"tb/kari/ukm/v1|";
-
 /// The HPKE `info` of a handshake key exchange (RFC 9180 § 5.1).
 ///
 /// It separates the key schedule of a handshake from that of a frame sealed to
@@ -219,7 +228,7 @@ pub const AES_GCM_NONCE_SIZE: usize = 12;
 pub const AES_GCM_TAG_SIZE: usize = 16;
 
 /// Bytes in the full-size TLS record that the AES-GCM record analysis
-/// counts in (2^14, RFC 8446 § 5.1).
+/// counts in (2^14, RFC 9846 § 5.1).
 const TLS_FULL_SIZE_RECORD_BYTES: u64 = 1 << 14;
 
 /// Full-size TLS records AES-GCM admits per key with its safety margin

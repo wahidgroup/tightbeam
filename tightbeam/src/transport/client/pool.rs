@@ -11,16 +11,16 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
 
 use crate::crypto::profiles::CryptoProvider;
+use crate::crypto::sign::SigningIdentity;
 use crate::crypto::x509::store::CertificateTrust;
 use crate::crypto::x509::Certificate;
 use crate::transport::client::GenericClient;
 use crate::transport::error::{TransportError, TransportFailure};
 use crate::transport::handshake::negotiation::TransportOffer;
-use crate::transport::handshake::HandshakeKeyManager;
 use crate::transport::handshake::HandshakeProtocolKind;
 use crate::transport::policy::{PolicyConfig, TimeoutConfig};
 use crate::transport::protocols::{PersistentConnection, Protocol};
-use crate::transport::state::{ClientIdentity, DialableEncryption, EncryptionConfig};
+use crate::transport::state::{DialableEncryption, EncryptionConfig};
 use crate::transport::MessageCollector;
 use crate::transport::MessageEmitter;
 use crate::transport::{EndpointConfig, TransportResult};
@@ -85,9 +85,13 @@ pub trait ConnectionBuilder<P: Protocol>: Sized {
 	/// Set the client certificate and the key that proves it, for mutual
 	/// authentication.
 	///
-	/// [`ClientIdentity::from_spec`] decodes a certificate specification into
-	/// one, so the fallible step happens once, before the builder.
-	fn with_client_identity(self, identity: ClientIdentity<P::CryptoProvider>) -> Self;
+	/// [`SigningIdentity::from_spec`] decodes a certificate specification
+	/// into one and checks the key against it, so the fallible step happens
+	/// once, before the builder. A clone of the identity bumps two refcounts
+	/// and copies the `sid`, so every dial shares one certificate.
+	///
+	/// [`SigningIdentity::from_spec`]: crate::crypto::sign::SigningIdentity::from_spec
+	fn with_client_identity(self, identity: SigningIdentity) -> Self;
 
 	/// Finish configuration and produce the client or pool.
 	fn build(self) -> Self::Output;
@@ -132,10 +136,6 @@ impl<C: CryptoProvider> PoolTlsConfig<C> {
 
 	fn set_trust_store(&mut self, store: Arc<dyn CertificateTrust>) {
 		self.encryption.trust_store = Some(store);
-	}
-
-	fn set_shared_client_identity(&mut self, certificate: Arc<Certificate>, key: Arc<HandshakeKeyManager<C>>) {
-		ClientIdentity::new(certificate, key).install(&mut self.encryption);
 	}
 
 	fn set_server_certificate_chain(&mut self, chain: Arc<[Certificate]>) {
@@ -261,17 +261,6 @@ impl<P: Protocol> ConnectionPoolBuilder<P> {
 		self.tls.set_receipt_approver(approver);
 		self
 	}
-
-	/// Install a pre-shared client identity that every dial shares without
-	/// another certificate copy.
-	pub fn with_shared_client_identity(
-		mut self,
-		certificate: Arc<Certificate>,
-		key: Arc<HandshakeKeyManager<P::CryptoProvider>>,
-	) -> Self {
-		self.tls.set_shared_client_identity(certificate, key);
-		self
-	}
 }
 
 #[cfg(feature = "std")]
@@ -288,8 +277,8 @@ impl<P: Protocol> ConnectionBuilder<P> for ConnectionPoolBuilder<P> {
 		self
 	}
 
-	fn with_client_identity(mut self, identity: ClientIdentity<P::CryptoProvider>) -> Self {
-		identity.install(&mut self.tls.encryption);
+	fn with_client_identity(mut self, identity: SigningIdentity) -> Self {
+		self.tls.encryption.client_identity = Some(identity);
 		self
 	}
 

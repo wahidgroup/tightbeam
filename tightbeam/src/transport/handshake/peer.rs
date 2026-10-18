@@ -456,6 +456,7 @@ mod tests {
 		use crate::crypto::policy::{Secp256k1Policy, VerificationPolicy};
 		use crate::crypto::x509::error::CertificateValidationError::{self, Expired};
 		use crate::crypto::x509::store::{CertificateTrustBuilder, TrustBuilder};
+		use crate::spki::SubjectPublicKeyInfoOwned;
 		use crate::testing::fixtures::TestCertificate;
 
 		/// A consumer's store that accepts every certificate and reads no
@@ -483,14 +484,18 @@ mod tests {
 				None
 			}
 
+			fn find_by_public_key(&self, _spki: &SubjectPublicKeyInfoOwned) -> Option<&Certificate> {
+				None
+			}
+
 			fn to_policy_ref(&self) -> &dyn VerificationPolicy {
-				&Secp256k1Policy
+				&const { Secp256k1Policy::new() }
 			}
 		}
 
 		/// The built-in store, holding `trusted` alone.
 		fn store_holding(trusted: Certificate) -> impl CertificateTrust {
-			let builder = CertificateTrustBuilder::from(Secp256k1Policy);
+			let builder = CertificateTrustBuilder::from(Secp256k1Policy::default());
 			let builder = builder
 				.with_certificate(trusted)
 				.expect("the store takes a valid test certificate");

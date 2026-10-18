@@ -43,12 +43,11 @@ pub use core::time::Duration;
 pub use std::collections::HashSet;
 pub use std::sync::{Arc, Mutex};
 
-pub use sha3::Sha3_256;
-
 use tightbeam::cms::signed_data::SignerIdentifier;
 use tightbeam::crypto::policy::VerificationPolicy;
 use tightbeam::crypto::x509::error::CertificateValidationError;
 use tightbeam::crypto::x509::policy::CertificateValidation;
+use tightbeam::spki::SubjectPublicKeyInfoOwned;
 pub use tightbeam::{
 	at_least, at_most,
 	builder::TypeBuilder,
@@ -89,7 +88,7 @@ pub use tightbeam::{
 	instrumentation::events,
 	policy::{GatePolicy, SessionContext, TransitStatus},
 	tb_assert_spec, tb_process_spec, tb_scenario,
-	testing::{ClusterEnv, HiveEnv, ScenarioConfig, ScenarioConfigError, SetupEnv, TestKey},
+	testing::{ClusterEnv, HiveEnv, ScenarioConfig, ScenarioConfigError, SetupEnv, TestIdentity, TestKey},
 	trace::TraceCollector,
 	transport::{
 		handshake::negotiation::TransportOffer, tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder,
@@ -104,7 +103,7 @@ use tightbeam::{cluster, compose, hive, servlet};
 pub(crate) use super::events::*;
 pub use crate::common::poll::poll_until;
 use crate::common::security::expectation_failure;
-pub use crate::common::x509::{combined_trust, combined_validator, GatewayCerts};
+pub use crate::common::x509::{combined_trust, combined_validator, signing_identity, GatewayCerts};
 
 /// Address the simulated peer gateway advertises itself at.
 pub(crate) const PEER_GATEWAY_ADDR: &[u8] = b"127.0.0.1:9000";
@@ -209,6 +208,10 @@ impl CertificateTrust for SwitchTrust {
 
 	fn find_by_signer_identifier(&self, sid: &SignerIdentifier) -> Option<&Certificate> {
 		self.current().find_by_signer_identifier(sid)
+	}
+
+	fn find_by_public_key(&self, spki: &SubjectPublicKeyInfoOwned) -> Option<&Certificate> {
+		self.current().find_by_public_key(spki)
 	}
 
 	fn to_policy_ref(&self) -> &dyn VerificationPolicy {
@@ -368,10 +371,11 @@ pub fn record_work_status(trace: &TraceCollector, response: &ClusterWorkResponse
 /// Signs `frame` with `key` under the canonical SHA3-256 convention.
 ///
 /// One shared signer keeps every test frame on the same bytes-to-sign
-/// formula the gateways verify.
+/// formula the gateways verify. The signer identifier is the key identifier
+/// of `key`, which every fixture certificate over `key` carries.
 pub async fn sign_frame(mut frame: Frame, key: &Secp256k1SigningKey) -> Result<Frame, TightBeamError> {
-	let provider = Secp256k1KeyProvider::from(key.to_owned());
-	frame.sign_with_provider::<Sha3_256, _>(&provider).await?;
+	let identity = TestIdentity::of(key);
+	frame.sign_with_provider(&identity).await?;
 	Ok(frame)
 }
 
@@ -391,7 +395,7 @@ pub fn probe_signing_key() -> Secp256k1SigningKey {
 /// metadata, message, and integrity fields arrived exactly as signed.
 /// It adapts [`Frame::verify`] to a boolean for trace events.
 pub fn frame_signature_verifies(frame: &Frame, key: &Secp256k1SigningKey) -> bool {
-	frame.verify::<Secp256k1Signature, Sha3_256>(key.verifying_key()).is_ok()
+	frame.verify::<Secp256k1Signature>(key.verifying_key()).is_ok()
 }
 
 /// Signs a [`ClusterRequest::PublishGossip`] control frame with an

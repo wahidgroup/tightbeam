@@ -47,6 +47,8 @@
 //! - The KEM takes its sizes from DHKEM(secp256k1, HKDF-SHA256), the registered
 //!   KEM `0x0016` ([draft-wahby-cfrg-hpke-kem-secp256k1-01][wahby]): `Nsecret`
 //!   is 32, and `Nenc`, `Npk`, and `Nsk` are 65, 65, and 32.
+//! - [`DhKemSecp256k1`] is that registered KEM under [`HkdfSha256`], as a KEM
+//!   alone. A CMS `KEMRecipientInfo` derives its key from its shared secret.
 //!
 //! # Sources
 //!
@@ -66,6 +68,8 @@
 
 use core::marker::PhantomData;
 
+#[cfg(all(not(feature = "std"), feature = "x509", feature = "signature", feature = "ecdh"))]
+use alloc::boxed::Box;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
@@ -77,6 +81,7 @@ use crate::crypto::hash::Sha3_256;
 use crate::crypto::hkdf::{Hkdf, InvalidLength};
 use crate::crypto::k256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
 use crate::crypto::k256::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey, SecretKey};
+use crate::crypto::k256::sha2::Sha256;
 use crate::crypto::k256::Secp256k1;
 use crate::crypto::kdf::{EcdhSecret, HkdfSha3_256, KdfError};
 use crate::crypto::secret::{Secret, SecretSlice};
@@ -89,8 +94,22 @@ use crate::ZeroizingBytes;
 use crate::asn1::ObjectIdentifier;
 #[cfg(feature = "x509")]
 use crate::constants::TIGHTBEAM_HPKE_FRAME_INFO;
+#[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
+use crate::crypto::cms::{Encapsulation, EnvelopeError, RecipientKem};
+#[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
+use crate::crypto::sign::SigningIdentity;
+#[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
+use crate::crypto::x509::error::CertificateValidationError;
+#[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
+use crate::crypto::x509::utils::CertificateExt;
 #[cfg(feature = "x509")]
 use crate::der::oid::AssociatedOid;
+#[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
+use crate::oids::DHKEM_SECP256K1;
+#[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
+use crate::utils::marker::MaybeSendFuture;
+#[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
+use crate::x509::Certificate;
 
 /// The label every HPKE derivation leads with ([RFC 9180 §4][rfc9180-4]).
 ///
@@ -124,6 +143,17 @@ pub const KEM_DHKEM_SECP256K1_HKDF_SHA3_256: u16 = 0xFF16;
 /// The IANA registry holds no value for this KDF, and it has no range for
 /// private use. This value sits in the unassigned range.
 pub const KDF_HKDF_SHA3_256: u16 = 0xFF01;
+
+/// DHKEM(secp256k1, HKDF-SHA256) in the HPKE KEM registry
+/// ([draft-wahby-cfrg-hpke-kem-secp256k1-01][wahby]).
+///
+/// [wahby]: https://datatracker.ietf.org/doc/html/draft-wahby-cfrg-hpke-kem-secp256k1-01
+pub const KEM_DHKEM_SECP256K1_HKDF_SHA256: u16 = 0x0016;
+
+/// HKDF-SHA256 in the HPKE KDF registry ([RFC 9180 §7.2][rfc9180-7.2]).
+///
+/// [rfc9180-7.2]: https://datatracker.ietf.org/doc/html/rfc9180#section-7.2
+pub const KDF_HKDF_SHA256: u16 = 0x0001;
 
 /// A two-stage key derivation function of an HPKE suite
 /// ([RFC 9180 §4][rfc9180-4]).
@@ -167,6 +197,32 @@ impl HpkeKdf for HkdfSha3_256 {
 	}
 }
 
+/// HKDF-SHA256 ([RFC 5869][rfc5869]), the KDF of the registered DHKEM on
+/// secp256k1.
+///
+/// [rfc5869]: https://datatracker.ietf.org/doc/html/rfc5869
+pub struct HkdfSha256;
+
+impl HpkeKdf for HkdfSha256 {
+	const KDF_ID: u16 = KDF_HKDF_SHA256;
+
+	const EXTRACT_SIZE: usize = 32;
+
+	fn extract(salt: &[u8], ikm: &[u8]) -> ZeroizingBytes {
+		let (mut extracted, _) = Hkdf::<Sha256>::extract(Some(salt), ikm);
+		let prk = Zeroizing::new(extracted.to_vec());
+		extracted.as_mut_slice().zeroize();
+		prk
+	}
+
+	fn expand(prk: &[u8], info: &[u8], len: usize) -> core::result::Result<ZeroizingBytes, KdfError> {
+		let keyed = Hkdf::<Sha256>::from_prk(prk).map_err(|_| KdfError::DerivationFailed(InvalidLength))?;
+		let mut okm = Zeroizing::new(vec![0u8; len]);
+		keyed.expand(info, &mut okm).map_err(KdfError::DerivationFailed)?;
+		Ok(okm)
+	}
+}
+
 /// An AEAD of an HPKE suite and its identifier
 /// ([RFC 9180 §7.3][rfc9180-7.3]).
 ///
@@ -187,22 +243,6 @@ impl HpkeAead for Aes256Gcm {
 	const AEAD_ID: u16 = AEAD_AES_256_GCM;
 }
 
-/// A KDF that a DHKEM on curve `C` derives with, and the identifier of that
-/// DHKEM ([RFC 9180 §7.1][rfc9180-7.1]).
-///
-/// A DHKEM is named by its curve and its KDF, so the pair is the one home of
-/// the KEM identifier.
-///
-/// [rfc9180-7.1]: https://datatracker.ietf.org/doc/html/rfc9180#section-7.1
-pub trait DhKemKdf<C>: HpkeKdf {
-	/// The identifier of the DHKEM in the HPKE KEM registry.
-	const KEM_ID: u16;
-}
-
-impl DhKemKdf<Secp256k1> for HkdfSha3_256 {
-	const KEM_ID: u16 = KEM_DHKEM_SECP256K1_HKDF_SHA3_256;
-}
-
 /// An HPKE ciphersuite: a DHKEM, a KDF, and an AEAD
 /// ([RFC 9180 §7][rfc9180-7]).
 ///
@@ -219,7 +259,13 @@ pub trait HpkeSuite {
 
 	/// The KDF of the DHKEM, which derives the KEM shared secret. `Nsecret`
 	/// is its `Nh`.
-	type KemKdf: DhKemKdf<Self::Curve>;
+	type KemKdf: HpkeKdf;
+
+	/// The identifier of the DHKEM in the HPKE KEM registry
+	/// ([RFC 9180 §7.1][rfc9180-7.1]).
+	///
+	/// [rfc9180-7.1]: https://datatracker.ietf.org/doc/html/rfc9180#section-7.1
+	const KEM_ID: u16;
 
 	/// The KDF of the key schedule.
 	type Kdf: HpkeKdf;
@@ -228,28 +274,30 @@ pub trait HpkeSuite {
 	type Aead: HpkeAead;
 }
 
-/// The suite of a DHKEM on curve `C` under KDF `K`, the same KDF for the key
-/// schedule, and AEAD `A`.
-pub struct DhKemSuite<C, K, A>(PhantomData<(C, K, A)>);
+/// The suite of the DHKEM `KEM_ID` on curve `C` under KDF `K`, the same KDF
+/// for the key schedule, and AEAD `A`.
+pub struct DhKemSuite<C, K, A, const KEM_ID: u16>(PhantomData<(C, K, A)>);
 
-impl<C, K, A> HpkeSuite for DhKemSuite<C, K, A>
+impl<C, K, A, const KEM_ID: u16> HpkeSuite for DhKemSuite<C, K, A, KEM_ID>
 where
 	C: Curve<FieldBytesSize = U32> + CurveArithmetic,
 	AffinePoint<C>: FromEncodedPoint<C> + ToEncodedPoint<C>,
-	K: DhKemKdf<C>,
+	K: HpkeKdf,
 	A: HpkeAead,
 {
 	type Curve = C;
 	type KemKdf = K;
 	type Kdf = K;
 	type Aead = A;
+
+	const KEM_ID: u16 = KEM_ID;
 }
 
 /// DHKEM(secp256k1, HKDF-SHA3-256), HKDF-SHA3-256, and AES-256-GCM.
 ///
 /// The KEM and KDF identifiers of this suite are this crate's own. See
 /// [`KEM_DHKEM_SECP256K1_HKDF_SHA3_256`] and [`KDF_HKDF_SHA3_256`].
-pub type HpkeSecp256k1Sha3Aes256Gcm = DhKemSuite<Secp256k1, HkdfSha3_256, Aes256Gcm>;
+pub type HpkeSecp256k1Sha3Aes256Gcm = DhKemSuite<Secp256k1, HkdfSha3_256, Aes256Gcm, KEM_DHKEM_SECP256K1_HKDF_SHA3_256>;
 
 /// An error from an HPKE operation.
 #[derive(Errorizable, Debug, Clone)]
@@ -297,16 +345,13 @@ struct Labeled<K> {
 }
 
 impl<K: HpkeKdf> Labeled<K> {
-	/// The scope of the DHKEM of suite `S`, whose `suite_id` is
-	/// `"KEM" || I2OSP(kem_id, 2)` ([RFC 9180 §4.1][rfc9180-4.1]).
+	/// The scope of the DHKEM `kem_id` that derives with `K`, whose
+	/// `suite_id` is `"KEM" || I2OSP(kem_id, 2)`
+	/// ([RFC 9180 §4.1][rfc9180-4.1]).
 	///
 	/// [rfc9180-4.1]: https://datatracker.ietf.org/doc/html/rfc9180#section-4.1
-	fn kem<S>() -> Self
-	where
-		S: HpkeSuite<KemKdf = K>,
-		K: DhKemKdf<S::Curve>,
-	{
-		let kem_id = K::KEM_ID.to_be_bytes();
+	fn kem(kem_id: u16) -> Self {
+		let kem_id = kem_id.to_be_bytes();
 		let suite_id = [b"KEM".as_slice(), &kem_id].concat();
 		Self { suite_id, kdf: PhantomData }
 	}
@@ -320,7 +365,7 @@ impl<K: HpkeKdf> Labeled<K> {
 	where
 		S: HpkeSuite<Kdf = K>,
 	{
-		let kem_id = <S::KemKdf as DhKemKdf<S::Curve>>::KEM_ID.to_be_bytes();
+		let kem_id = S::KEM_ID.to_be_bytes();
 		let kdf_id = K::KDF_ID.to_be_bytes();
 		let aead_id = <S::Aead as HpkeAead>::AEAD_ID.to_be_bytes();
 		let suite_id = [b"HPKE".as_slice(), &kem_id, &kdf_id, &aead_id].concat();
@@ -485,7 +530,7 @@ impl<S: HpkeSuite> HpkeMessage<S> {
 	) -> Result<Self> {
 		let encapsulated_key = ephemeral.public_key();
 		let dh = EcdhSecret::agree(&ephemeral, recipient);
-		let shared_secret = dh.kem_shared_secret::<S>(&encapsulated_key, recipient)?;
+		let shared_secret = dh.kem_shared_secret::<S::Curve, S::KemKdf>(S::KEM_ID, &encapsulated_key, recipient)?;
 
 		let schedule = KeySchedule::<S>::derive(&shared_secret, info)?;
 		let ciphertext = schedule.seal(aad, plaintext)?;
@@ -604,21 +649,24 @@ impl EcdhSecret {
 	/// message opens under the one recipient key it was sealed to.
 	///
 	/// [rfc9180-4.1]: https://datatracker.ietf.org/doc/html/rfc9180#section-4.1
-	fn kem_shared_secret<S>(
+	fn kem_shared_secret<C, K>(
 		self,
-		encapsulated_key: &PublicKey<S::Curve>,
-		recipient: &PublicKey<S::Curve>,
+		kem_id: u16,
+		encapsulated_key: &PublicKey<C>,
+		recipient: &PublicKey<C>,
 	) -> Result<ZeroizingBytes>
 	where
-		S: HpkeSuite,
+		C: Curve<FieldBytesSize = U32> + CurveArithmetic,
+		AffinePoint<C>: FromEncodedPoint<C> + ToEncodedPoint<C>,
+		K: HpkeKdf,
 	{
-		let labeled = Labeled::<S::KemKdf>::kem::<S>();
+		let labeled = Labeled::<K>::kem(kem_id);
 		let enc = encapsulated_key.to_encoded_point(false);
 		let recipient = recipient.to_encoded_point(false);
 		let kem_context = [enc.as_bytes(), recipient.as_bytes()].concat();
 
 		let eae_prk = self.with(|dh| labeled.extract(b"", b"eae_prk", dh));
-		labeled.expand(&eae_prk, b"shared_secret", &kem_context, S::KemKdf::EXTRACT_SIZE)
+		labeled.expand(&eae_prk, b"shared_secret", &kem_context, K::EXTRACT_SIZE)
 	}
 
 	/// Open an HPKE `message` with this precomputed `DH(skR, pkE)` output.
@@ -648,9 +696,192 @@ impl EcdhSecret {
 	where
 		S: HpkeSuite,
 	{
-		let shared_secret = self.kem_shared_secret::<S>(message.encapsulated_key(), recipient)?;
+		let encapsulated_key = message.encapsulated_key();
+		let shared_secret = self.kem_shared_secret::<S::Curve, S::KemKdf>(S::KEM_ID, encapsulated_key, recipient)?;
 		let schedule = KeySchedule::<S>::derive(&shared_secret, info.as_ref())?;
 		schedule.open(aad.as_ref(), message.ciphertext())
+	}
+}
+
+/// The DHKEM of [RFC 9180 §4.1][rfc9180-4.1] on curve `C` under the KDF `K`
+/// and the HPKE KEM identifier `KEM_ID`, which its `suite_id` carries, as a
+/// KEM alone: `Encap` and `Decap`.
+///
+/// A CMS `KEMRecipientInfo` names its KEM by itself and derives its own key
+/// from the shared secret ([RFC 9629 §5][rfc9629-5]), so it takes the shared
+/// secret this type yields.
+///
+/// [rfc9180-4.1]: https://datatracker.ietf.org/doc/html/rfc9180#section-4.1
+/// [rfc9629-5]: https://datatracker.ietf.org/doc/html/rfc9629#section-5
+pub struct DhKem<C, K, const KEM_ID: u16>(PhantomData<(C, K)>);
+
+/// DHKEM(secp256k1, HKDF-SHA256), the registered KEM `0x0016`.
+pub type DhKemSecp256k1 = DhKem<Secp256k1, HkdfSha256, KEM_DHKEM_SECP256K1_HKDF_SHA256>;
+
+impl<C, K, const KEM_ID: u16> DhKem<C, K, KEM_ID>
+where
+	C: Curve<FieldBytesSize = U32> + CurveArithmetic,
+	AffinePoint<C>: FromEncodedPoint<C> + ToEncodedPoint<C>,
+	K: HpkeKdf,
+{
+	/// The identifier of the DHKEM in the HPKE KEM registry, which its
+	/// labeled derivations bind ([RFC 9180 §4.1][rfc9180-4.1]).
+	///
+	/// [rfc9180-4.1]: https://datatracker.ietf.org/doc/html/rfc9180#section-4.1
+	pub const KEM_ID: u16 = KEM_ID;
+
+	/// `Encap(pkR)`: draw a fresh ephemeral, and return the shared secret
+	/// beside `enc`, the public half of that ephemeral.
+	///
+	/// `rng` draws the ephemeral, and `None` draws it from the OS source. The
+	/// ephemeral drops here, so it serves one encapsulation.
+	///
+	/// # Errors
+	///
+	/// - [`HpkeError::Kdf`] -- the KDF refused a derivation.
+	pub fn encap(
+		recipient: &PublicKey<C>,
+		rng: Option<&mut dyn CryptoRngCore>,
+	) -> Result<(ZeroizingBytes, PublicKey<C>)> {
+		let mut os_rng = OsRng;
+		let source = rng.unwrap_or(&mut os_rng);
+		let ephemeral = SecretKey::<C>::random(&mut RngWrapper(source));
+		Self::encap_with(ephemeral, recipient)
+	}
+
+	/// `Encap(pkR)` under `ephemeral`, which serves this one encapsulation.
+	fn encap_with(ephemeral: SecretKey<C>, recipient: &PublicKey<C>) -> Result<(ZeroizingBytes, PublicKey<C>)> {
+		let encapsulated_key = ephemeral.public_key();
+		let dh = EcdhSecret::agree(&ephemeral, recipient);
+		let shared_secret = dh.kem_shared_secret::<C, K>(KEM_ID, &encapsulated_key, recipient)?;
+		Ok((shared_secret, encapsulated_key))
+	}
+
+	/// `Decap(enc, skR)` from `dh`, the `DH(skR, pkE)` output that the holder
+	/// of the recipient key computed, so the key can stay behind a provider.
+	///
+	/// `recipient` is the public key `encapsulated_key` was sealed to, which
+	/// the KEM context binds.
+	///
+	/// # Errors
+	///
+	/// - [`HpkeError::Kdf`] -- the KDF refused a derivation.
+	pub fn decap(dh: EcdhSecret, encapsulated_key: &PublicKey<C>, recipient: &PublicKey<C>) -> Result<ZeroizingBytes> {
+		dh.kem_shared_secret::<C, K>(KEM_ID, encapsulated_key, recipient)
+	}
+}
+
+/// The DHKEM on the curve `C` under the KDF `K` and `KEM_ID`, to the key of a
+/// certificate and through the key provider of an identity. The house
+/// [`RecipientKem`] runs on these, and a KEM under another identifier can too.
+#[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
+impl<C, K, const KEM_ID: u16> DhKem<C, K, KEM_ID>
+where
+	C: Curve<FieldBytesSize = U32> + CurveArithmetic,
+	AffinePoint<C>: FromEncodedPoint<C> + ToEncodedPoint<C>,
+	K: HpkeKdf,
+{
+	/// `Encap(pkR)` to the key of `certificate` on `C`, with `enc` in
+	/// uncompressed SEC1 form as the `kemct`.
+	///
+	/// `C`, `K`, and `KEM_ID` together name one KEM, so an implementor pairs a
+	/// `KEM_ID` with the KDF its registration names, as `0x0016` names
+	/// HKDF-SHA256.
+	///
+	/// # Errors
+	///
+	/// - [`EnvelopeError::Certificate`] -- the certificate holds no point on `C`.
+	/// - [`EnvelopeError::Kem`] -- the KEM failed a derivation.
+	pub fn encap_to(
+		certificate: &Certificate,
+		rng: &mut dyn CryptoRngCore,
+	) -> core::result::Result<Encapsulation, EnvelopeError> {
+		let recipient_key = Self::certificate_key(certificate)?;
+		let (shared_secret, encapsulated_key) = Self::encap(&recipient_key, Some(rng))?;
+		let kemct = encapsulated_key.to_encoded_point(false).as_bytes().to_vec();
+		Ok(Encapsulation { shared_secret, kemct })
+	}
+
+	/// `Decap(kemct, skR)` through the key provider of `identity`, whose
+	/// certificate the sender encapsulated to. The point is parsed first, then
+	/// the provider runs `DH(skR, pkE)`.
+	///
+	/// `C`, `K`, and `KEM_ID` together name one KEM, so an implementor pairs a
+	/// `KEM_ID` with the KDF its registration names, as `0x0016` names
+	/// HKDF-SHA256.
+	///
+	/// # Errors
+	///
+	/// - [`EnvelopeError::KemPoint`] -- `kemct` is no uncompressed point on `C`.
+	/// - [`EnvelopeError::Certificate`] -- the certificate holds no point on `C`.
+	/// - [`EnvelopeError::Key`] -- the key provider failed the agreement.
+	/// - [`EnvelopeError::Kdf`] -- the agreement is not 32 octets.
+	/// - [`EnvelopeError::Kem`] -- the KEM failed a derivation.
+	pub fn decap_through<'a>(
+		identity: &'a SigningIdentity,
+		kemct: &'a [u8],
+	) -> MaybeSendFuture<'a, core::result::Result<ZeroizingBytes, EnvelopeError>> {
+		Box::pin(async move {
+			let encapsulated_key = Self::encapsulated_key(kemct)?;
+			let recipient_key = Self::certificate_key(identity.certificate())?;
+			let agreed = identity.provider().key_agreement(kemct).await?;
+			let dh = EcdhSecret::try_from(agreed)?;
+			Ok(Self::decap(dh, &encapsulated_key, &recipient_key)?)
+		})
+	}
+
+	/// The key of the SubjectPublicKeyInfo of `certificate` as a point on
+	/// `C`, the key the KEM encapsulates to.
+	///
+	/// # Errors
+	///
+	/// - [`EnvelopeError::Certificate`] -- the key is no point on `C`.
+	fn certificate_key(certificate: &Certificate) -> core::result::Result<PublicKey<C>, EnvelopeError> {
+		let key = PublicKey::from_sec1_bytes(certificate.verifying_key_bytes());
+		Ok(key.map_err(CertificateValidationError::from)?)
+	}
+
+	/// `kemct` as DHKEM's `enc`: the uncompressed SEC1 form of a point on `C`,
+	/// 65 octets (RFC 9180 §7.1.1, draft-wahby-cfrg-hpke-kem-secp256k1 §3.1).
+	///
+	/// # Errors
+	///
+	/// - [`EnvelopeError::KemPoint`] -- `kemct` is another form or no point on `C`.
+	fn encapsulated_key(kemct: &[u8]) -> core::result::Result<PublicKey<C>, EnvelopeError> {
+		let uncompressed = kemct.len() == EC_PUBKEY_UNCOMPRESSED_SIZE && kemct.first() == Some(&0x04);
+		if !uncompressed {
+			return Err(EnvelopeError::KemPoint);
+		}
+
+		let point = PublicKey::from_sec1_bytes(kemct);
+		point.map_err(|_| EnvelopeError::KemPoint)
+	}
+}
+
+/// DHKEM(secp256k1, HKDF-SHA256), the KEM `0x0016` that
+/// [`DHKEM_SECP256K1`] names: the house KEM.
+#[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
+impl RecipientKem for DhKemSecp256k1 {
+	const OID: ObjectIdentifier = DHKEM_SECP256K1;
+
+	/// # Errors
+	///
+	/// - The [`DhKem::encap_to`] set.
+	fn encapsulate(
+		certificate: &Certificate,
+		rng: &mut dyn CryptoRngCore,
+	) -> core::result::Result<Encapsulation, EnvelopeError> {
+		Self::encap_to(certificate, rng)
+	}
+
+	/// # Errors
+	///
+	/// - The [`DhKem::decap_through`] set.
+	fn decapsulate<'a>(
+		identity: &'a SigningIdentity,
+		kemct: &'a [u8],
+	) -> MaybeSendFuture<'a, core::result::Result<ZeroizingBytes, EnvelopeError>> {
+		Self::decap_through(identity, kemct)
 	}
 }
 
@@ -845,41 +1076,15 @@ mod tests {
 	use super::*;
 	use crate::crypto::aead::Key;
 	use crate::crypto::common::typenum::U48;
-	use crate::crypto::k256::sha2::{Sha256, Sha512};
+	use crate::crypto::k256::sha2::Sha512;
 	use crate::crypto::secret::ToInsecure;
+	use crate::testing::{unhex, SeededStream};
 	use aead::{AeadInPlace, Tag};
-	use rand_core::{CryptoRng, RngCore};
 
 	/// The suite of the default provider.
 	type Suite = HpkeSecp256k1Sha3Aes256Gcm;
 
 	const INFO: &[u8] = b"tb/hpke/test";
-
-	/// HKDF-SHA256, the KDF of the registered DHKEM on secp256k1. The
-	/// published vectors of that KEM check the construction, and the SHA3-256
-	/// suite runs the same code under another hash.
-	struct HkdfSha256;
-
-	impl HpkeKdf for HkdfSha256 {
-		const KDF_ID: u16 = 0x0001;
-		const EXTRACT_SIZE: usize = 32;
-
-		fn extract(salt: &[u8], ikm: &[u8]) -> ZeroizingBytes {
-			let (prk, _) = Hkdf::<Sha256>::extract(Some(salt), ikm);
-			Zeroizing::new(prk.to_vec())
-		}
-
-		fn expand(prk: &[u8], info: &[u8], len: usize) -> core::result::Result<ZeroizingBytes, KdfError> {
-			let keyed = Hkdf::<Sha256>::from_prk(prk).map_err(|_| KdfError::DerivationFailed(InvalidLength))?;
-			let mut okm = Zeroizing::new(vec![0u8; len]);
-			keyed.expand(info, &mut okm).map_err(KdfError::DerivationFailed)?;
-			Ok(okm)
-		}
-	}
-
-	impl DhKemKdf<Secp256k1> for HkdfSha256 {
-		const KEM_ID: u16 = 0x0016;
-	}
 
 	/// HKDF-SHA512, the KDF `0x0003` of RFC 9180 Table 3, which two of the
 	/// Appendix A suites derive with.
@@ -903,10 +1108,10 @@ mod tests {
 	}
 
 	/// DHKEM(secp256k1, HKDF-SHA256), HKDF-SHA256, AES-128-GCM.
-	type RegisteredAes128 = DhKemSuite<Secp256k1, HkdfSha256, Aes128Gcm>;
+	type RegisteredAes128 = DhKemSuite<Secp256k1, HkdfSha256, Aes128Gcm, KEM_DHKEM_SECP256K1_HKDF_SHA256>;
 
 	/// DHKEM(secp256k1, HKDF-SHA256), HKDF-SHA256, AES-256-GCM.
-	type RegisteredAes256 = DhKemSuite<Secp256k1, HkdfSha256, Aes256Gcm>;
+	type RegisteredAes256 = DhKemSuite<Secp256k1, HkdfSha256, Aes256Gcm, KEM_DHKEM_SECP256K1_HKDF_SHA256>;
 
 	/// HKDF-SHA3-256 under another KEM identifier, and `LEN_SHIFT` bytes away
 	/// from a 12-byte request, as a relabeled or a faulty provider KDF is.
@@ -926,12 +1131,8 @@ mod tests {
 		}
 	}
 
-	impl<const KEM_SHIFT: u16, const LEN_SHIFT: i8> DhKemKdf<Secp256k1> for AlteredKdf<KEM_SHIFT, LEN_SHIFT> {
-		const KEM_ID: u16 = KEM_DHKEM_SECP256K1_HKDF_SHA3_256 + KEM_SHIFT;
-	}
-
 	/// The algorithms of [`Suite`] under another KEM identifier.
-	type Relabeled = DhKemSuite<Secp256k1, AlteredKdf<1, 0>, Aes256Gcm>;
+	type Relabeled = DhKemSuite<Secp256k1, HkdfSha3_256, Aes256Gcm, { KEM_DHKEM_SECP256K1_HKDF_SHA3_256 + 1 }>;
 
 	/// A KDF with no bound on its output, so the two-byte length frame of
 	/// `LabeledExpand` is the one refusal a long request meets.
@@ -948,10 +1149,6 @@ mod tests {
 		fn expand(_prk: &[u8], _info: &[u8], len: usize) -> core::result::Result<ZeroizingBytes, KdfError> {
 			Ok(Zeroizing::new(vec![0u8; len]))
 		}
-	}
-
-	impl DhKemKdf<Secp256k1> for UnboundedKdf {
-		const KEM_ID: u16 = 0xFFFD;
 	}
 
 	/// One base-mode vector: the keys of both sides, the `info`, and what the
@@ -1018,16 +1215,6 @@ mod tests {
 	/// [`KNOWN_AAD`], from the same source.
 	const SHA3_SUITE_CIPHERTEXT: &str = "f742fee844fad9743f6d2fece69bb3e0ed60cc352d4dc544216993f6";
 
-	/// The bytes a hex string names.
-	fn unhex(hex: &str) -> Vec<u8> {
-		let digits = hex.as_bytes().chunks(2);
-		let bytes = digits.map(|pair| {
-			let pair = core::str::from_utf8(pair).expect("a vector is ASCII");
-			u8::from_str_radix(pair, 16).expect("a vector is hex")
-		});
-		bytes.collect()
-	}
-
 	impl Vector {
 		/// The ephemeral secret key of the sender.
 		fn ephemeral(&self) -> SecretKey<Secp256k1> {
@@ -1061,6 +1248,29 @@ mod tests {
 		{
 			let info = unhex(self.info);
 			HpkeMessage::sealed(self.ephemeral(), &self.recipient_public(), &info, KNOWN_AAD, KNOWN_PLAINTEXT)
+		}
+
+		/// What the registered DHKEM yields to the sender of this vector under
+		/// its ephemeral: the shared secret and the encapsulated key.
+		fn encapsulated(&self) -> Result<(Vec<u8>, PublicKey<Secp256k1>)> {
+			let encapsulated = DhKemSecp256k1::encap_with(self.ephemeral(), &self.recipient_public());
+			let (shared_secret, encapsulated_key) = encapsulated?;
+			Ok((shared_secret.to_vec(), encapsulated_key))
+		}
+
+		/// What the registered DHKEM yields to the recipient of this vector,
+		/// from the DH output of its secret key and the encapsulated key.
+		fn decapsulated(&self) -> Result<Vec<u8>> {
+			let recipient = self.recipient();
+			let encapsulated_key = self.encapsulated_key();
+			let dh = EcdhSecret::agree(&recipient, &encapsulated_key);
+			let shared_secret = DhKemSecp256k1::decap(dh, &encapsulated_key, &recipient.public_key())?;
+			Ok(shared_secret.to_vec())
+		}
+
+		/// The shared secret and the encapsulated key this vector publishes.
+		fn published_encapsulation(&self) -> (Vec<u8>, PublicKey<Secp256k1>) {
+			(unhex(self.shared_secret), self.encapsulated_key())
 		}
 	}
 
@@ -1115,7 +1325,7 @@ mod tests {
 		where
 			S: HpkeSuite<Curve = Secp256k1>,
 		{
-			let shared_secret = dh.kem_shared_secret::<S>(encapsulated_key, recipient)?;
+			let shared_secret = dh.kem_shared_secret::<Secp256k1, S::KemKdf>(S::KEM_ID, encapsulated_key, recipient)?;
 			let schedule = KeySchedule::<S>::derive(&shared_secret, &unhex(vector.info))?;
 			Ok(Self {
 				shared_secret: shared_secret.to_vec(),
@@ -1146,6 +1356,49 @@ mod tests {
 		assert_eq!(with_aes_128, Derived::published(&AES_128_GCM_VECTOR));
 		assert_eq!(with_aes_256, Derived::published(&AES_256_GCM_VECTOR));
 		Ok(())
+	}
+
+	/// The KEM alone, under the ephemeral of the B.1.1 vector, yields the
+	/// shared secret and the encapsulated key that vector publishes.
+	#[test]
+	fn the_dhkem_encapsulates_to_the_published_b_1_1_vector() -> Result<()> {
+		let encapsulated = AES_128_GCM_VECTOR.encapsulated()?;
+		assert_eq!(encapsulated, AES_128_GCM_VECTOR.published_encapsulation());
+		Ok(())
+	}
+
+	/// The KEM alone, under the ephemeral of the B.2.1 vector, yields the
+	/// shared secret and the encapsulated key that vector publishes.
+	#[test]
+	fn the_dhkem_encapsulates_to_the_published_b_2_1_vector() -> Result<()> {
+		let encapsulated = AES_256_GCM_VECTOR.encapsulated()?;
+		assert_eq!(encapsulated, AES_256_GCM_VECTOR.published_encapsulation());
+		Ok(())
+	}
+
+	/// The KEM alone, from the DH output of the recipient key and the
+	/// encapsulated key of the B.1.1 vector, yields its shared secret.
+	#[test]
+	fn the_dhkem_decapsulates_the_published_b_1_1_vector() -> Result<()> {
+		let decapsulated = AES_128_GCM_VECTOR.decapsulated()?;
+		assert_eq!(decapsulated, unhex(AES_128_GCM_VECTOR.shared_secret));
+		Ok(())
+	}
+
+	/// The KEM alone, from the DH output of the recipient key and the
+	/// encapsulated key of the B.2.1 vector, yields its shared secret.
+	#[test]
+	fn the_dhkem_decapsulates_the_published_b_2_1_vector() -> Result<()> {
+		let decapsulated = AES_256_GCM_VECTOR.decapsulated()?;
+		assert_eq!(decapsulated, unhex(AES_256_GCM_VECTOR.shared_secret));
+		Ok(())
+	}
+
+	/// The KEM carries the identifier the registry assigns it.
+	#[test]
+	fn the_registered_dhkem_carries_its_registry_identifiers() {
+		assert_eq!(DhKemSecp256k1::KEM_ID, 0x0016);
+		assert_eq!(<HkdfSha256 as HpkeKdf>::KDF_ID, 0x0001);
 	}
 
 	/// The SHA3-256 suite derives what an independent implementation derives
@@ -1207,10 +1460,6 @@ mod tests {
 		}
 	}
 
-	impl<const ID: u16, K: HpkeKdf> DhKemKdf<Secp256k1> for KemOf<ID, K> {
-		const KEM_ID: u16 = ID;
-	}
-
 	/// The suite of an Appendix A vector: the KEM `ID` over `KemK`, the KDF
 	/// `K`, and the AEAD `A`.
 	struct RfcSuite<const ID: u16, KemK, K, A>(PhantomData<(KemK, K, A)>);
@@ -1220,6 +1469,8 @@ mod tests {
 		type KemKdf = KemOf<ID, KemK>;
 		type Kdf = K;
 		type Aead = A;
+
+		const KEM_ID: u16 = ID;
 	}
 
 	/// RFC 9180 A.1: DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM.
@@ -1354,6 +1605,85 @@ mod tests {
 	fn the_key_schedule_and_the_seal_match_rfc_9180_a_6() -> Result<()> {
 		let scheduled = Scheduled::by_suite::<RfcA6>(&RFC_A_6_1)?;
 		assert_eq!(scheduled, Scheduled::published(&RFC_A_6_1));
+		Ok(())
+	}
+
+	/// One HKDF-SHA256 vector of RFC 5869 Appendix A.
+	struct HkdfVector {
+		ikm: &'static str,
+		salt: &'static str,
+		info: &'static str,
+		length: usize,
+		prk: &'static str,
+		okm: &'static str,
+	}
+
+	/// RFC 5869 A.1, the basic test case.
+	const RFC_5869_A_1: HkdfVector = HkdfVector {
+		ikm: "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+		salt: "000102030405060708090a0b0c",
+		info: "f0f1f2f3f4f5f6f7f8f9",
+		length: 42,
+		prk: "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5",
+		okm: "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865",
+	};
+
+	/// RFC 5869 A.2, longer inputs and outputs.
+	const RFC_5869_A_2: HkdfVector = HkdfVector {
+		ikm: "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\
+			202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f",
+		salt: "606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f\
+			808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
+		info: "b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecf\
+			d0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff",
+		length: 82,
+		prk: "06a6b88c5853361a06104c9ceb35b45cef760014904671014a193f40c15fc244",
+		okm: "b11e398dc80327a1c8e7f78c596a49344f012eda2d4efad8a050cc4c19afa97c\
+			59045a99cac7827271cb41c65e590e09da3275600c2f09b8367793a9aca3db71cc30c58179ec3e87c14c01d5c1f3434f1d87",
+	};
+
+	/// RFC 5869 A.3, a zero-length salt and info.
+	const RFC_5869_A_3: HkdfVector = HkdfVector {
+		ikm: "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+		salt: "",
+		info: "",
+		length: 42,
+		prk: "19ef24a32c717b167f33a91d6f648bdf96596776afdb6377ac434c1c293ccb04",
+		okm: "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8",
+	};
+
+	impl HkdfVector {
+		/// What [`HkdfSha256`] derives from this vector: the PRK and the OKM.
+		fn derived(&self) -> core::result::Result<(Vec<u8>, Vec<u8>), KdfError> {
+			let prk = HkdfSha256::extract(&unhex(self.salt), &unhex(self.ikm));
+			let okm = HkdfSha256::expand(&prk, &unhex(self.info), self.length)?;
+			Ok((prk.to_vec(), okm.to_vec()))
+		}
+
+		/// The PRK and the OKM this vector publishes.
+		fn published(&self) -> (Vec<u8>, Vec<u8>) {
+			(unhex(self.prk), unhex(self.okm))
+		}
+	}
+
+	#[test]
+	fn hkdf_sha256_matches_rfc_5869_a_1() -> core::result::Result<(), KdfError> {
+		let derived = RFC_5869_A_1.derived()?;
+		assert_eq!(derived, RFC_5869_A_1.published());
+		Ok(())
+	}
+
+	#[test]
+	fn hkdf_sha256_matches_rfc_5869_a_2() -> core::result::Result<(), KdfError> {
+		let derived = RFC_5869_A_2.derived()?;
+		assert_eq!(derived, RFC_5869_A_2.published());
+		Ok(())
+	}
+
+	#[test]
+	fn hkdf_sha256_matches_rfc_5869_a_3() -> core::result::Result<(), KdfError> {
+		let derived = RFC_5869_A_3.derived()?;
+		assert_eq!(derived, RFC_5869_A_3.published());
 		Ok(())
 	}
 
@@ -1585,7 +1915,7 @@ mod tests {
 	/// because the key is derived at the cipher's own size.
 	#[test]
 	fn a_key_wider_than_32_bytes_round_trips() -> Result<()> {
-		type Wide = DhKemSuite<Secp256k1, HkdfSha3_256, WideKeyCipher>;
+		type Wide = DhKemSuite<Secp256k1, HkdfSha3_256, WideKeyCipher, KEM_DHKEM_SECP256K1_HKDF_SHA3_256>;
 		let (secret, public) = keypair();
 		let sealed = public.seal::<Wide>(INFO, b"", b"wide", None)?;
 
@@ -1599,8 +1929,8 @@ mod tests {
 	/// alone.
 	#[test]
 	fn a_kdf_output_of_another_length_is_refused() {
-		type Overlong = DhKemSuite<Secp256k1, AlteredKdf<0, 1>, Aes256Gcm>;
-		type Short = DhKemSuite<Secp256k1, AlteredKdf<0, -1>, Aes256Gcm>;
+		type Overlong = DhKemSuite<Secp256k1, AlteredKdf<0, 1>, Aes256Gcm, KEM_DHKEM_SECP256K1_HKDF_SHA3_256>;
+		type Short = DhKemSuite<Secp256k1, AlteredKdf<0, -1>, Aes256Gcm, KEM_DHKEM_SECP256K1_HKDF_SHA3_256>;
 		let (_, public) = keypair();
 
 		let overlong = public.seal::<Overlong>(INFO, b"", b"plaintext", None);
@@ -1615,7 +1945,7 @@ mod tests {
 	/// frame.
 	#[test]
 	fn a_labeled_expand_past_two_length_bytes_is_refused() {
-		type Unbounded = DhKemSuite<Secp256k1, UnboundedKdf, Aes256Gcm>;
+		type Unbounded = DhKemSuite<Secp256k1, UnboundedKdf, Aes256Gcm, 0xFFFD>;
 		let labeled = Labeled::<UnboundedKdf>::schedule::<Unbounded>();
 		let prk = [0x11u8; 32];
 
@@ -1624,33 +1954,6 @@ mod tests {
 		assert!(widest.is_ok());
 		assert!(matches!(past_the_frame, Err(HpkeError::Kdf(_))));
 	}
-
-	/// A byte stream that repeats from its seed. The OS source answers fresh
-	/// bytes on every draw, so a test of whose RNG `seal` reads needs this
-	/// double.
-	struct SeededStream(u8);
-
-	impl RngCore for SeededStream {
-		fn next_u32(&mut self) -> u32 {
-			rand_core::impls::next_u32_via_fill(self)
-		}
-
-		fn next_u64(&mut self) -> u64 {
-			rand_core::impls::next_u64_via_fill(self)
-		}
-
-		fn fill_bytes(&mut self, dest: &mut [u8]) {
-			self.0 = self.0.wrapping_add(1);
-			dest.fill(self.0);
-		}
-
-		fn try_fill_bytes(&mut self, dest: &mut [u8]) -> core::result::Result<(), rand_core::Error> {
-			self.fill_bytes(dest);
-			Ok(())
-		}
-	}
-
-	impl CryptoRng for SeededStream {}
 
 	/// Seal a fixed plaintext to `public` with the ephemeral drawn from
 	/// `stream`.

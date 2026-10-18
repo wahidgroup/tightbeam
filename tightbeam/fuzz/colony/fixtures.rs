@@ -103,7 +103,7 @@ pub(crate) fn colony_identity(
 }
 
 fn combined_trust_builder(certs: &[&Certificate]) -> CertificateTrustBuilder {
-	let mut builder = CertificateTrustBuilder::from(Secp256k1Policy);
+	let mut builder = CertificateTrustBuilder::from(Secp256k1Policy::default());
 	for cert in certs {
 		builder = builder
 			.with_certificate((*cert).to_owned())

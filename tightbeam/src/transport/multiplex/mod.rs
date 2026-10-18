@@ -74,7 +74,7 @@ use crate::Frame;
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 use crate::constants::DEFAULT_HOP_BUDGET;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::transport::handshake::receipt::{ReceiptSigner, StoredReceipt};
+use crate::transport::handshake::receipt::StoredReceipt;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::{HandshakeProvider, HandshakeVerifyingKey};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -368,13 +368,13 @@ impl MuxRekeyContext {
 	/// # Returns
 	///
 	/// - `Ok(Some(..))` at most once per handshake, because the call detaches the retained epoch materials.
-	/// - `Ok(None)` when no handshake completed, when the endpoint has no key
-	///   manager, or when the session carries no dual-signed receipt, no
-	///   retained peer identity, or no epoch materials.
+	/// - `Ok(None)` when no handshake completed, when the endpoint holds no
+	///   signing identity for its role, or when the session carries no
+	///   dual-signed receipt, no retained peer identity, or no epoch materials.
 	///
 	/// # Errors
 	///
-	/// - [`TransportError::HandshakeError`] -- the peer key or the signer identifier fails to extract.
+	/// - [`TransportError::HandshakeError`] -- the peer key fails to extract.
 	///
 	/// [`TransportError::HandshakeError`]: crate::transport::error::TransportError::HandshakeError
 	/// [`MuxTransport::with_rekey`]: crate::transport::multiplex::MuxTransport::with_rekey
@@ -388,12 +388,14 @@ impl MuxRekeyContext {
 		let Some(stored) = state.session_state().receipt().cloned() else {
 			return Ok(None);
 		};
-		let Some(provider) = state
-			.encryption()
-			.key_manager
-			.as_ref()
-			.map(|manager| manager.signing_provider())
-		else {
+
+		// Each role renews under the identity it presented in the handshake.
+		let encryption = state.encryption();
+		let identity = match role {
+			MuxRole::Client => encryption.client_identity.as_ref(),
+			MuxRole::Server => encryption.server_identity.as_ref(),
+		};
+		let Some(identity) = identity.cloned() else {
 			return Ok(None);
 		};
 
@@ -402,7 +404,6 @@ impl MuxRekeyContext {
 		};
 
 		let peer_static = peer_certificate.verifying_key::<P::Curve>()?;
-		let peer_sid = peer_certificate.signer_identifier::<P::Digest>()?;
 
 		// The materials detach last, so a session refused above keeps them.
 		let Some(epoch) = state.session_state_mut().take_epoch_materials() else {
@@ -410,7 +411,8 @@ impl MuxRekeyContext {
 		};
 
 		let reference_receipt = stored.receipt().clone();
-		let materials = RekeyMaterials::<P>::new(epoch, reference_receipt, provider, peer_static, peer_sid);
+		let peer = Arc::clone(&peer_certificate);
+		let materials = RekeyMaterials::<P>::new(epoch, reference_receipt, identity, peer_static, peer);
 
 		let driver = match role {
 			MuxRole::Client => {

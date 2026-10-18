@@ -7,6 +7,7 @@ use std::time::Duration;
 use tightbeam::colony::cluster::{Cluster, ClusterRequest, ClusterWorkRequest, ClusterWorkResponse};
 use tightbeam::compose;
 use tightbeam::crypto::key::Secp256k1KeyProvider;
+use tightbeam::crypto::sign::SigningIdentity;
 use tightbeam::crypto::x509::store::CertificateTrust;
 use tightbeam::crypto::x509::CertificateSpec;
 use tightbeam::decode;
@@ -18,7 +19,6 @@ use tightbeam::transport::client::{ConnectionPool, PoolConfig};
 use tightbeam::transport::error::{TransportError, TransportFailure};
 use tightbeam::transport::handshake::negotiation::TransportOffer;
 use tightbeam::transport::multiplex::{RequestSink, StreamRoute};
-use tightbeam::transport::state::ClientIdentity;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::{ClientBuilder, ConnectionBuilder, GenericClient, PooledClient, Protocol};
 use tightbeam::urn::Urn;
@@ -219,7 +219,7 @@ async fn connect_with_identity(
 	Ok(ClientBuilder::<TokioListener>::builder()
 		.with_timeout(CLIENT_IO_TIMEOUT)
 		.with_trust_store(server_trust)
-		.with_client_identity(ClientIdentity::from_spec(cert, key)?)
+		.with_client_identity(SigningIdentity::from_spec(cert, key)?)
 		.build()
 		.connect(addr.to_owned())
 		.await?)
@@ -252,7 +252,7 @@ async fn pooled_client(
 			.with_config(config)
 			.with_timeout(CLIENT_IO_TIMEOUT)
 			.with_trust_store(Arc::clone(&identity.trust))
-			.with_client_identity(ClientIdentity::from_spec(cert, key)?)
+			.with_client_identity(SigningIdentity::from_spec(cert, key)?)
 			.with_trace(trace.share())
 			.build(),
 	);

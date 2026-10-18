@@ -176,14 +176,14 @@ pub async fn flood_ad_rumor(
 		ClusterRequest::AdvertisePeer(PeerAdvertisement { gateway_addr: gateway_addr.to_vec(), advertised_types });
 
 	let inner = signed_control_frame_with(signer, id, advertisement).await?;
-	let provider = Secp256k1KeyProvider::from(signer.to_owned());
+	let identity = TestIdentity::of(signer);
 	let mut rumor = Version::V2
 		.compose()
 		.with_id(id)
 		.with_order(UnixMillis::now().get())
 		.with_message(GossipRumor::peer_advertisement(encode(&inner)?))
 		.build()?;
-	rumor.sign_with_provider::<Sha3_256, _>(&provider).await?;
+	rumor.sign_with_provider(&identity).await?;
 
 	let mut frame = Version::V2
 		.compose()
@@ -192,7 +192,7 @@ pub async fn flood_ad_rumor(
 		.with_lifetime(hop_ttl)
 		.with_message(ClusterRequest::Gossip(Box::new(rumor)))
 		.build()?;
-	frame.sign_with_provider::<Sha3_256, _>(&provider).await?;
+	frame.sign_with_provider(&identity).await?;
 
 	let mut client = connect_cluster(connect_certs, cluster.addr()).await?;
 	let response: GossipResponse = decode(&emit_frame(&mut client, frame).await?.message())?;

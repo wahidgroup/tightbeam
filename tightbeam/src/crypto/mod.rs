@@ -32,6 +32,8 @@ pub mod secret;
 
 #[cfg(feature = "aead")]
 pub mod aead;
+#[cfg(feature = "x509")]
+pub mod cms;
 #[cfg(feature = "digest")]
 pub mod commitment;
 #[cfg(any(feature = "digest", feature = "sha3"))]

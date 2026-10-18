@@ -132,7 +132,6 @@ builder = ["x509-cert/builder", "crypto"]
 policy = []
 router = []
 transport = [
-	"cms/builder",
 	"builder",
 	"transport-policy",
 	"aead",
@@ -206,7 +205,7 @@ signature = [
 	"x509-cert/signature",
 ]
 digest = ["crypto", "dep:digest", "sha3"]
-x509 = ["crypto", "dep:x509-cert", "ecdsa/pem", "digest"]
+x509 = ["crypto", "dep:x509-cert", "ecdsa/pem", "ecdsa/alloc", "digest"]
 kdf = ["crypto", "random", "zeroize", "digest", "dep:hkdf"]
 hpke = ["crypto", "kdf", "aead", "k256/ecdh", "secp256k1", "sha3"]
 ecdh = ["elliptic-curve/ecdh", "secp256k1"]
@@ -233,6 +232,7 @@ transport-cms = [
 	"transport",
 	"transport-policy",
 	"builder",
+	"hpke",
 	"aead",
 	"aes-gcm",
 	"signature",

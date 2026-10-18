@@ -310,6 +310,8 @@ pub struct Metadata {
 
 The fields are private, and each has a read accessor of the same name. A `Frame` enters memory only through `FrameBuilder` or the DER decoder. Both reject a field that the Frame version forbids ([§5.6](#56-version-specific-constraints)), so no in-memory Frame carries one. The methods that change a Frame in place, such as `attach_signer_info` and `encrypt_with_provider`, apply the same rule.
 
+The `nonrepudiation` field holds a `Signed<SignerInfo>`. The CMS signer of `crypto::sign` builds every value the crate emits, and the DER decoder yields every value it reads. A value read from the wire decodes from any DER, so it is trusted only after `Frame::verify` checks it through `CmsSigner::verify`, or `Frame::verify_under` checks it through `CmsSigner::verify_with_policy`, as a trust store does ([§5.7.5](#575-nonrepudiation-coverage-and-binding)).
+
 ```rust,ignore
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "zeroize", derive(zeroize::ZeroizeOnDrop))]
@@ -318,7 +320,7 @@ pub struct Frame {
 	metadata: Metadata,
 	message: Vec<u8>,
 	integrity: Option<DigestInfo>,
-	nonrepudiation: Option<SignerInfo>,
+	nonrepudiation: Option<Signed<SignerInfo>>,
 }
 ```
 
@@ -659,6 +661,22 @@ When `nonrepudiation` is present, the signature MUST cover the canonical DER enc
 
 Any change to those fields invalidates the signature. The resulting binding is transitive: the signature binds the frame envelope (including FI when present), FI binds the metadata envelope (including MI when present), and MI binds the message body.
 
+The `SignerInfo` signs those bytes as CMS content of type `id-data` ([RFC 5652][rfc5652] §5.4). Every field has one value:
+
+| Field             | Value                                                                                                                            |
+| ----------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `version`         | 3 when `sid` is a `subjectKeyIdentifier`, 1 when it is an `issuerAndSerialNumber` (RFC 5652 §5.3)                                |
+| `sid`             | The subjectKeyIdentifier extension of the signer certificate, or its issuer and serial number when it carries none               |
+| `digestAlgorithm` | The digest the signature algorithm names ([RFC 5753][rfc5753] §2.1.1), so the signature type fixes both                          |
+| `signedAttrs`     | Exactly three: content type `id-data`, the message digest of the bytes above, and `CMSAlgorithmProtection` ([RFC 6211][rfc6211]) |
+| `signature`       | The DER `ECDSA-Sig-Value` ([RFC 3279][rfc3279] §2.2.3) over the digest of the DER signed attributes, with `s` in the low half    |
+
+- A signer brings every value a key or a key provider returns to that DER low-`s` form before it attaches it, and refuses a value that is not DER.
+- A verifier MUST refuse a raw `r‖s` signature, a digest the signature algorithm does not name, a missing or extra signed attribute, an algorithm protection that names other algorithms, and a version that breaks the `sid` rule.
+- A verifier MUST accept a DER signature whose `s` is in the high half, because ECDSA verifies both values ([SEC 1][secg-sec1] v2.0 §4.1.4). It normalizes `s` to the low half before it verifies.
+- The signature in that low-`s` form (`VerifiedSignature`) is the replay key of every ledger: the hive command guard, the gateway registration guard, and the gossip digest and journal. A capture with `s` flipped to `n - s` therefore finds the slot its original spent.
+- A key that signs in place, as `FrameBuilder::with_signer` and `compose!` take it, travels in a `CertifiedKey` beside its certificate. The constructor checks the key against the certificate and reads the `sid` from it ([§7.3](#73-cryptographic-key-management)).
+
 **Figure: nonrepudiation binding**
 
 ```text
@@ -914,7 +932,7 @@ A `SecurityProfile` is a compile-time metadata type. It declares which algorithm
 
 #### Design Principles
 
-The `SecurityProfile` trait names the digest, AEAD, signature, KDF, and curve algorithms. Each associated type carries its own OID. An optional key-wrap OID MAY be set as a constant:
+The `SecurityProfile` trait names the digest, AEAD, signature, KDF, curve, and key-wrap algorithms. Each associated type carries its own OID:
 
 ```rust,ignore
 pub trait SecurityProfile {
@@ -923,8 +941,7 @@ pub trait SecurityProfile {
 	type SignatureAlg: SignatureAlgorithmIdentifier;
 	type Kdf: AssociatedOid;
 	type Curve: AssociatedOid;
-
-	const KEY_WRAP_OID: Option<ObjectIdentifier> = None;
+	type KeyWrapOid: AssociatedOid;
 }
 ```
 
@@ -936,6 +953,7 @@ tightbeam splits cryptographic work across specialized provider traits. A compon
 
 - **`DigestProvider`**: Hash and digest operations. Examples include SHA-256 ([FIPS 180-4][fips180-4]) and SHA3-256 ([FIPS 202][fips202]).
 - **`AeadProvider`**: Authenticated encryption. Examples include AES-GCM variants.
+- **`KeyWrapProvider`**: The wrap of a content key. Examples include AES key wrap ([RFC 3394][rfc3394]).
 - **`SigningProvider`**: Signature generation and verification. Examples include ECDSA ([FIPS 186-5][fips186-5]) and Ed25519 ([RFC 8032][rfc8032]).
 - **`KdfProvider`**: Key derivation. Examples include HKDF ([RFC 5869][rfc5869]).
 - **`CurveProvider`**: Elliptic-curve operations. Examples include secp256k1, P-384 ([RFC 5480][rfc5480]), and X25519 ([RFC 7748][rfc7748]).
@@ -958,8 +976,7 @@ impl SecurityProfile for MyAppProfile {
 	type SignatureAlg = Secp256k1Signature;
 	type Kdf = HkdfSha3_256;
 	type Curve = k256::Secp256k1;
-
-	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(AES_256_WRAP);
+	type KeyWrapOid = Aes256Wrap;
 }
 ```
 
@@ -976,8 +993,7 @@ impl SecurityProfile for TightbeamProfile {
 	type SignatureAlg = Secp256k1Signature;
 	type Kdf = HkdfSha3_256;
 	type Curve = k256::Secp256k1;
-
-	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(AES_256_WRAP);
+	type KeyWrapOid = Aes256Wrap;
 }
 ```
 
@@ -1047,7 +1063,7 @@ let frame = compose! {
 		order: 1696521900,
 		message_integrity<Sha3_256>: salt,
 		confidentiality: cipher,
-		nonrepudiation<Secp256k1Signature, _>: &signing_key,
+		nonrepudiation<Secp256k1Signature, _>: CertifiedKey::new(&certificate, signing_key)?,
 		message: message
 }?;
 ```
@@ -1056,13 +1072,14 @@ let frame = compose! {
 
 ```rust,ignore
 // FrameBuilder validates algorithm OIDs match MyAppProfile
+let signer = CertifiedKey::new(&certificate, signing_key)?;
 let frame = compose::<SecureMessage>(Version::V1)
 	.with_message(msg)
 	.with_id(b"msg-001")
 	.with_order(timestamp)
 	.with_message_hasher::<Sha3_256>(salt)          // ✓ Matches MyAppProfile::Digest
 	.with_aead(cipher)                              // ✓ Matches MyAppProfile::AeadOid
-	.with_signer::<Secp256k1Signature, _>(&signer)  // ✓ Matches MyAppProfile::SignatureAlg
+	.with_signer::<Secp256k1Signature, _>(signer)   // ✓ Matches MyAppProfile::SignatureAlg
 	.build()?;
 ```
 
@@ -1114,6 +1131,8 @@ pub trait CryptoProvider:
 	Copy + // zero-sized type (ZST),
 	DigestProvider +
 	AeadProvider +
+	// The KEK is at least as long as the AEAD key (RFC 3565 § 2.3.2).
+	KeyWrapProvider<KeyWrap: KeyWrapAlgorithm<KekSize: IsGreaterOrEqual<AeadKeySize<Self>, Output = B1>>> +
 	SigningProvider +
 	KdfProvider +
 	CurveProvider
@@ -1124,12 +1143,14 @@ pub trait CryptoProvider:
 			SignatureAlg = Self::Signature,
 			Kdf = Self::Kdf,
 			Curve = Self::Curve,
+			KeyWrapOid = <Self::KeyWrap as KeyWrapAlgorithm>::Oid,
 		> + Default;
+	type Kem: RecipientKem;
 	fn profile(&self) -> &Self::Profile;
 }
 ```
 
-Each provider role MUST use the algorithm its profile names. The `Profile` bound enforces this, so a provider that runs AES-256-GCM under a profile that negotiates AES-128-GCM does not compile.
+Each provider role MUST use the algorithm its profile names. The `Profile` bound enforces this, so a provider that runs AES-256-GCM under a profile that negotiates AES-128-GCM does not compile. The `KeyWrapProvider` bound holds the KEK at least as long as the AEAD key, so a provider that pairs AES-128 key wrap with AES-256-GCM does not compile either.
 
 `DefaultCryptoProvider` is the reference provider. It uses:
 
@@ -1138,8 +1159,12 @@ Each provider role MUST use the algorithm its profile names. The `Profile` bound
 - **Signature**: secp256k1 ECDSA
 - **KDF**: HKDF-SHA3-256
 - **Curve**: secp256k1
+- **Key wrap**: AES-256 key wrap
+- **KEM**: DHKEM(secp256k1, HKDF-SHA256)
 
 Its associated profile is `TightbeamProfile` ([§6.2](#62-security-profile-types)).
+
+Every part is replaceable. An implementor brings its own algorithm as a type that implements the role's trait: a signature type for `SigningProvider`, a `ContentEncryption` cipher for `AeadProvider`, a `KeyWrapAlgorithm` for `KeyWrapProvider`, a `KdfFunction` for `KdfProvider`, and a `RecipientKem` for `CryptoProvider::Kem`. The envelope, the recipients, and the handshake then run that provider's algorithms and refuse any other. A provider that seals with HPKE also implements `HpkeProvider`.
 
 ### 6.6 Cryptographic Requirements
 
@@ -1218,11 +1243,13 @@ The `CertificateTrust` trait verifies certificate chains and manages trust ancho
 - Validate a chain from trust anchor through intermediates to the leaf
 - Look up signer certificates when verifying Frame Nonrepudiation
 
+A store resolves a `SignerInfo` by its `sid`: a `subjectKeyIdentifier` through the extension of each certificate it holds, an `issuerAndSerialNumber` through the issuer and serial number. Every certificate the crate mints (`cert!` and the test fixtures) carries a subjectKeyIdentifier by [RFC 7093][rfc7093] §2 method 1: the leftmost 160 bits of the SHA-256 of the subjectPublicKey BIT STRING value. A certificate it issues also carries the authorityKeyIdentifier of its issuer.
+
 **Building a trust store:**
 
 ```rust,ignore
 let cert = Certificate::try_from(CERT_PEM)?;
-let trust_store = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
+let trust_store = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy::default())
     .with_certificate(cert)?
     .build();
 ```
@@ -1230,10 +1257,32 @@ let trust_store = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
 **Adding a certificate chain:**
 
 ```rust,ignore
-let trust_store = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
+let trust_store = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy::default())
     .with_chain(vec![root_cert, intermediate_cert, leaf_cert])?
     .build();
 ```
+
+#### Signing Identities
+
+`SigningIdentity` pairs a certificate with the `SigningKeyProvider` that holds its private key. Its constructor refuses a key whose public half differs from the certificate's SubjectPublicKeyInfo (`SignerError::KeyMismatch`), so every signature it makes verifies under the certificate its `sid` names. It also refuses a key whose algorithm is not the provider's, and it brings every value the provider returns to its canonical form, the DER low-`s` form for ECDSA. `SigningIdentity::new` signs under `DefaultCryptoProvider`. An implementor brings its own signature algorithm with `SigningIdentity::with_provider::<P>`, where `P` is a `SigningProvider` whose signature type implements `CanonicalForm`, `SignatureEncoding`, and `SignatureAlgorithmIdentifier`, and whose verifying key implements `PrehashVerifier` and `DecodePublicKey`. `ProviderPolicy::<P>` verifies its signatures. It is the one home of an endpoint's signing material:
+
+| Consumer                                                                                                 | What the identity signs                                                              |
+| -------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| `TransportEncryptionConfig::new`, `ServerConfig.identity`                                                | The server reply or Finished, and the server receipt                                 |
+| `with_client_identity`, `CmsClientSettings.identity`                                                     | The client Finished, and the receipt countersignature                                |
+| `HpkeClientSettings.identity`                                                                            | The possession proof, and the receipt countersignature                               |
+| `Frame::sign_with_provider`                                                                              | The frame                                                                            |
+| `ClusterTlsConfig::from_identity`, `HiveTlsConfig::from_identity`, `ServletConfigBuilder::with_identity` | The colony endpoint's handshakes and frames, such as the rumors a gateway originates |
+
+```rust,ignore
+let server = SigningIdentity::from_spec(SERVER_CERT, SERVER_KEY.to_provider::<Secp256k1>()?)?;
+let config = TransportEncryptionConfig::new(server.clone());
+frame.sign_with_provider(&server).await?;
+```
+
+A builder that signs synchronously, such as `FrameBuilder::with_signer`, takes a `CertifiedKey`: a key that signs in place beside its certificate, under the same key check.
+
+`SigningIdentity::sign`, `SigningIdentity::draft`, and the `CmsSigner` functions take the `SignedContent` by value. Each attribute of the caller's profile moves into the signed set, so a signature clones none of them.
 
 ## 8. Transport Layer
 
@@ -1540,7 +1589,7 @@ Security goals for both:
 - **Mutual authentication**: Each party proves identity with certificates
 - **Perfect forward secrecy**: Ephemeral ECDH ([NIST SP 800-56A][nist-800-56a]) protects past sessions if long-term keys leak later
 - **Replay protection**: Nonces block replayed handshake messages
-- **Downgrade prevention**: The transcript hash covers handshake messages, including profile negotiation ([RFC 9846 §4.1.3][rfc9846-4.1.3])
+- **Downgrade prevention**: The transcript hash covers handshake messages, including profile negotiation ([RFC 9846 §4.2.3][rfc9846-4.2.3])
 - **Confidentiality**: HKDF-derived session keys protect later messages
 
 #### 8.5.2 Specification: Handshake Flow and State Management
@@ -1550,10 +1599,10 @@ Security goals for both:
 ```text
 Phase 1: Client -> Server
 ┌─────────────────────────────────────────────────────────┐
-│ ClientHello (HPKE) or KeyExchange (CMS)                 │
+│ ClientHello (HPKE) or Opening (CMS)                     │
 │ - Client nonce (32 bytes)                               │
 │ - Optional SecurityOffer (supported profiles)           │
-│ - Ephemeral public key (CMS: in KARI structure)         │
+│ - Ephemeral public key (CMS: sealed in the opening)     │
 └─────────────────────────────────────────────────────────┘
 
 Phase 2: Server -> Client
@@ -1569,7 +1618,7 @@ Phase 3: Client -> Server
 ┌─────────────────────────────────────────────────────────┐
 │ ClientKeyExchange (HPKE) or ClientFinished (CMS)        │
 │ - Sealed base secret (HPKE)                             │
-│ - Key-confirmation tag (32 bytes)                       │
+│ - Key-confirmation tag (one digest output wide)         │
 │ - Client certificate and signature, sealed under a key  │
 │   of the handshake secret (optional for HPKE)           │
 │   (CMS: the whole client Finished travels sealed)       │
@@ -1581,13 +1630,13 @@ Phase 3: Client -> Server
 Client:
 
 ```text
-Init -> HelloSent -> KeyExchangeSent -> ServerFinishedReceived -> ClientFinishedSent -> Completed
+Init -> HelloSent -> OpeningSent -> ServerFinishedReceived -> ClientFinishedSent -> Completed
 ```
 
 Server:
 
 ```text
-Init -> KeyExchangeReceived -> ServerFinishedSent -> ClientFinishedReceived -> Completed
+Init -> OpeningReceived -> ServerFinishedSent -> ClientFinishedReceived -> Completed
 ```
 
 **Transcript hash:**
@@ -1595,21 +1644,40 @@ Init -> KeyExchangeReceived -> ServerFinishedSent -> ClientFinishedReceived -> C
 ```text
 transcript = ClientHello || server_random || server_ephemeral || server_public_key
              || SecurityAccept || client_cert_required || TransportAccept
-transcript_hash = SHA3-256(transcript)
+transcript_hash = H(transcript)
 ```
 
 The `server_public_key` leg is the raw `subjectPublicKey` bits of the server certificate.
 
+`H` is the negotiated digest, SHA3-256 in the default profile. The transcript hash is its whole output: 32 bytes under SHA3-256, 64 under SHA3-512.
+
 The transcript hash binds the handshake messages. It blocks reordering, profile downgrade, and undetected man-in-the-middle edits of the transcript. The `client_cert_required` leg is one byte, so a stripped certificate demand changes the hash.
+
+**Handshake secret:**
+
+The handshake secret `hs` derives from `ee || base`, the hybrid shared secret `Z′ = Z || T` of [NIST SP 800-56C Rev. 2][nist-800-56c] §2: the ephemeral-ephemeral ECDH output, followed by the client's base secret.
+
+**Key confirmation:**
+
+The client's key-confirmation tag follows the Finished construction of TLS 1.3 ([RFC 9846 §4.5.3][rfc9846-4.5.3]) under `H`, with the crate's label as the HKDF-Expand info in place of `HkdfLabel`. `hs` is the 32-byte output of the profile's KDF, too short a PRK for a 64-byte `H` ([RFC 5869][rfc5869] §2.3), so `H` extracts one first:
+
+```text
+mac_key = HKDF-Expand-H(HKDF-Extract-H(S, hs), "tb/handshake/finished/v1", Hash.length)
+confirm = HMAC-H(mac_key, transcript_hash)
+```
+
+`S` is the handshake's salt, and `mac_key` keys this one tag. [NIST SP 800-56A Rev. 3][nist-800-56a] §5.9 is not claimed: its confirming party owns a static key-establishment key, and the client owns none.
 
 #### 8.5.3 Implementation: CMS-Based Handshake Protocol
 
 CMS handshake uses [RFC 5652][rfc5652] Cryptographic Message Syntax:
 
-- **`EnvelopedData`**: ECDH, HKDF, and AES key wrap for the base secret
+- **`AuthEnvelopedData`** ([RFC 5083][rfc5083]): Every seal, under AES-256-GCM with `GCMParameters` ([RFC 5084][rfc5084]), the tag in `mac`, and the content type among the authenticated attributes
+- **`KEMRecipientInfo`** ([RFC 9629][rfc9629]): The opening's recipient. DHKEM(secp256k1, HKDF-SHA256) encapsulates to the server's certificate key, and HKDF-SHA3-256 derives the key that wraps the content key. [docs/dhkem-secp256k1.md](docs/dhkem-secp256k1.md) specifies the KEM
+- **`KEKRecipientInfo`**: The recipient of the sealed client Finished, under a key of the handshake secret
 - **`SignedData`**: Transcript signatures for authentication
-- **`EncryptedData`**: The client Finished, sealed with its certificate under a key of the handshake secret
-- **`KeyAgreeRecipientInfo` (KARI)**: Ephemeral-static ECDH key agreement
+
+The opening seals the base secret and the client's agreement ephemeral `R` to the server's certificate key, and it carries the security and transport offers as authenticated attributes.
 
 **Mutual authentication flow:**
 
@@ -1619,30 +1687,36 @@ For mutual authentication, the client signs its Finished over the transcript and
 Client Side - Building the Client Finished:
 ┌─────────────────────────────────────────────────────────────────────┐
 │ 1. Seal the Transcript                                              │
-│    transcript = KeyExchange || accepts || server_ephemeral          │
+│    transcript = Opening || accepts || server_ephemeral              │
 │    transcript_hash = SHA3-256(transcript)                           │
 ├─────────────────────────────────────────────────────────────────────┤
 │ 2. Sign the Client Finished                                         │
 │    signed = client_finished_domain || transcript_hash               │
-│    signature = Sign(SHA3-256(signed), client_priv_key)              │
+│    attrs = [content_type: id-data,                                  │
+│             message_digest: SHA3-256(signed),                       │
+│             algorithm_protection: SHA3-256, ecdsa-with-SHA3-256]    │
+│    signature = DER(Sign(SHA3-256(DER(attrs)), client_priv_key))     │
 ├─────────────────────────────────────────────────────────────────────┤
 │ 3. Build the Client Finished                                        │
 │    SignedData {                                                     │
 │        content: signed,                                             │
+│        signer: SignerInfo { sid: client key identifier, attrs },    │
 │        certificates: [client_certificate],                          │
 │        unsigned_attrs: [confirm, sealed_ack?],                      │
 │    }                                                                │
 ├─────────────────────────────────────────────────────────────────────┤
 │ 4. Seal the Finished under the Handshake Secret                     │
 │    k_id = HKDF(hs, transcript_hash, "tb/session/kdf/identity/v1")   │
-│    EncryptedData {                                                  │
-│        content_type: signedData,                                    │
-│        algorithm: AES-256-GCM, nonce 0,                             │
-│        content: AES-256-GCM.seal(                                   │
-│            key: k_id,                                               │
-│            aad: "tb/handshake/identity/aad/v1" || transcript_hash,  │
-│            plaintext: pad(Finished DER)                             │
-│        )                                                            │
+│    cek = random(32), nonce = random(12)                             │
+│    AuthEnvelopedData {                                              │
+│        recipient: KEKRecipientInfo {                                │
+│            kekid: "tb/handshake/identity/kekid/v1" || hash,         │
+│            encrypted_key: AES-256-KW(k_id, cek),                    │
+│        },                                                           │
+│        algorithm: AES-256-GCM, GCMParameters { nonce, 16 },         │
+│        auth_attrs: [content_type: id-data, transcript_hash],        │
+│        content, mac: AES-256-GCM.seal(cek, nonce,                   │
+│            aad: DER(auth_attrs), plaintext: pad(Finished DER)),     │
 │    }                                                                │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -1653,11 +1727,12 @@ Server verification flow:
 Server Side - Verifying Client Authentication:
 ┌─────────────────────────────────────────────────────────────┐
 │ 1. Open the Sealed Finished                                 │
-│    finished = AES-256-GCM.open(k_id, content)               │
+│    cek = AES-256-KW.unwrap(k_id, encrypted_key)             │
+│    finished = AES-256-GCM.open(cek, nonce, content, mac)    │
 │    ✓ The Finished embeds a certificate                      │
 ├─────────────────────────────────────────────────────────────┤
-│ 2. Compare the Originator with the Certificate Key          │
-│    ✓ The KARI originator differs from the certificate key   │
+│ 2. Compare R with the Certificate Key                       │
+│    ✓ The agreement key R differs from the certificate key   │
 ├─────────────────────────────────────────────────────────────┤
 │ 3. Confirm the Handshake Secret                             │
 │    ✓ Key-confirmation tag matches                           │
@@ -1668,18 +1743,19 @@ Server Side - Verifying Client Authentication:
 ├─────────────────────────────────────────────────────────────┤
 │ 5. Verify the Client Finished                               │
 │    signed = client_finished_domain || transcript_hash       │
-│    Verify(signature, SHA3-256(signed), client_pub_key)      │
+│    ✓ attrs are the three, message_digest = SHA3-256(signed) │
+│    Verify(signature, SHA3-256(DER(attrs)), client_pub_key)  │
 │    ✓ Client witnessed same transcript                       │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 #### 8.5.4 Implementation: HPKE-Based Handshake Protocol
 
-HPKE (Hybrid Public Key Encryption, [RFC 9180][rfc9180]) is the lighter handshake path. It seals the base secret to the server's static key without nested CMS `EnvelopedData` containers. Its hello and reply ride in `SignedData` tunnels, and its closing travels as a `ClientKeyExchange` of its own, because HPKE specifies no wire format (RFC 9180 §10).
+HPKE (Hybrid Public Key Encryption, [RFC 9180][rfc9180]) is the lighter handshake path. It seals the base secret to the server's static key without a CMS `AuthEnvelopedData` around it. Its hello and reply ride in `SignedData` tunnels, and its closing travels as a `ClientKeyExchange` of its own, because HPKE specifies no wire format (RFC 9180 §10).
 
 Differences from CMS:
 
-- HPKE sealing instead of nested CMS `EnvelopedData`
+- HPKE sealing instead of a CMS `AuthEnvelopedData` with a `KEMRecipientInfo`
 - Flatter ASN.1 structures instead of multi-level CMS nesting
 - Same security goals: mutual authentication, forward secrecy, replay protection
 - Both paths use ASN.1 DER. HPKE avoids [RFC 5652][rfc5652] container complexity
@@ -1697,22 +1773,25 @@ Client Side - Building ClientKeyExchange:
 ├─────────────────────────────────────────────────────────────────────┤
 │ 2. Derive the Handshake Secret via HKDF                             │
 │    hs = HKDF-SHA3-256(                                              │
-│        ikm: len || base || len || ee,                               │
+│        ikm: ee || base,                                             │
 │        salt: client_random || server_random,                        │
 │        info: "tb/session/kdf/v1"                                    │
 │    )                                                                │
 ├─────────────────────────────────────────────────────────────────────┤
 │ 3. Sign the Possession Proof                                        │
 │    signed = domain || transcript_hash || R || client_certificate    │
-│    client_signature = Sign(SHA3-256(signed), client_priv_key)       │
+│    client_signature = DER(Sign(SHA3-256(signed), client_priv_key))  │
 ├─────────────────────────────────────────────────────────────────────┤
 │ 4. Seal the Identity under the Handshake Secret                     │
 │    k_id = HKDF(hs, salt, "tb/session/kdf/identity/v1")              │
-│    sealed_identity = AES-256-GCM.seal(                              │
-│        key: k_id, nonce: 0,                                         │
-│        aad: "tb/handshake/identity/aad/v1" || transcript_hash,      │
-│        plaintext: pad(client_certificate, client_signature)         │
-│    )                                                                │
+│    sealed_identity = DER(AuthEnvelopedData {                        │
+│        recipient: KEKRecipientInfo {                                │
+│            kekid: "tb/handshake/identity/kekid/v1" || hash,         │
+│            encrypted_key: AES-256-KW(k_id, random cek),             │
+│        },                                                           │
+│        AES-256-GCM(cek, random nonce, aad: DER(auth_attrs)),        │
+│        plaintext: pad(client_certificate, client_signature),        │
+│    })                                                               │
 ├─────────────────────────────────────────────────────────────────────┤
 │ 5. Seal the Payload with HPKE                                       │
 │    sealed_payload = HPKE-Seal(                                      │
@@ -1747,7 +1826,7 @@ Server Side - Verifying Client Authentication:
 ├─────────────────────────────────────────────────────────────┤
 │ 2. Derive the Handshake Secret and Open the Identity        │
 │    ee = ECDH(server_ephemeral_priv, R)                      │
-│    hs = HKDF-SHA3-256(base, ee)                             │
+│    hs = HKDF-SHA3-256(ee || base)                           │
 │    identity = AES-256-GCM.open(k_id, sealed_identity)       │
 │    ✓ R and enc differ from the certificate key              │
 ├─────────────────────────────────────────────────────────────┤
@@ -1760,6 +1839,7 @@ Server Side - Verifying Client Authentication:
 ├─────────────────────────────────────────────────────────────┤
 │ 5. Verify the Possession Signature                          │
 │    signed = domain || transcript_hash || R || cert          │
+│    ✓ client_signature parses as DER ECDSA-Sig-Value         │
 │    Verify(client_signature, SHA3-256(signed), client_pub)   │
 │    ✓ Client holds the key of the certificate it offers      │
 │    ✓ Session established with forward secrecy               │
@@ -1806,15 +1886,15 @@ The handshake seals the payload under the domain tag alone. The client certifica
 
 **Wire format comparison:**
 
-| Feature                | CMS-based                      | HPKE-based                         |
-| ---------------------- | ------------------------------ | ---------------------------------- |
-| Envelope structure     | RFC 5652 nested structures     | Simplified ASN.1 structures        |
-| Key agreement          | KARI (`KeyAgreeRecipientInfo`) | DHKEM ([RFC 9180][rfc9180])        |
-| Session key encryption | `EnvelopedData` + AES-KW       | HPKE base mode + AES-256-GCM       |
-| Signatures             | `SignedData` structure         | Raw signatures in ASN.1            |
-| Size overhead          | about 400-600 bytes            | about 200-300 bytes                |
-| Parsing complexity     | Multi-level ASN.1 nesting      | Flat ASN.1 structures              |
-| Standards              | RFC 5652, [RFC 5753][rfc5753]  | [RFC 9180][rfc9180] + custom ASN.1 |
+| Feature                | CMS-based                                           | HPKE-based                         |
+| ---------------------- | --------------------------------------------------- | ---------------------------------- |
+| Envelope structure     | RFC 5652 nested structures                          | Simplified ASN.1 structures        |
+| Key agreement          | DHKEM in a `KEMRecipientInfo` ([RFC 9629][rfc9629]) | DHKEM ([RFC 9180][rfc9180])        |
+| Session key encryption | `AuthEnvelopedData` + AES-KW + AES-256-GCM          | HPKE base mode + AES-256-GCM       |
+| Signatures             | `SignedData` structure                              | DER `ECDSA-Sig-Value` in ASN.1     |
+| Size overhead          | about 400-600 bytes                                 | about 200-300 bytes                |
+| Parsing complexity     | Multi-level ASN.1 nesting                           | Flat ASN.1 structures              |
+| Standards              | RFC 5652, [RFC 5083][rfc5083], [RFC 9629][rfc9629]  | [RFC 9180][rfc9180] + custom ASN.1 |
 
 **Performance characteristics** (relative to CMS on the same curves and algorithms):
 
@@ -2311,7 +2391,7 @@ With an offer configured, `connect` shares one multiplexed connection per destin
 let pool = Arc::new(ConnectionPool::<TokioListener>::builder()
 	.with_config(PoolConfig { mux_offer: Some(offer.with_budgets(budgets)), ..Default::default() })
 	.with_trust_store(trust_store)
-	.with_client_identity(ClientIdentity::from_spec(client_cert, client_key)?)  // budgets REQUIRE mutual auth
+	.with_client_identity(SigningIdentity::from_spec(client_cert, client_key)?)  // budgets REQUIRE mutual auth
 	.with_receipt_approver(approver)                 // answers settlement challenges
 	.build());
 
@@ -2349,7 +2429,7 @@ let receipt = lease.session_receipt();  // Option<Arc<StoredReceipt>>
 let pool = Arc::new(ConnectionPool::<TokioListener>::builder()
 	.with_config(PoolConfig { max_connections: 3, ..Default::default() })
 	.with_trust_store(trust_store)
-	.with_client_identity(ClientIdentity::from_spec(CLIENT_CERT, CLIENT_KEY.to_provider::<Secp256k1>()?)?)
+	.with_client_identity(SigningIdentity::from_spec(CLIENT_CERT, CLIENT_KEY.to_provider::<Secp256k1>()?)?)
 	.with_timeout(Duration::from_millis(5000))
 	.build());
 
@@ -2638,9 +2718,9 @@ PingPongServletWithWorker::start(trace, servlet_conf).await?
 A servlet serves in the clear only where its configuration says so (CWE-319):
 
 - `.allow_cleartext()` on the builder names cleartext. `ServletConfig::cleartext()` is that choice over the default env.
-- `.with_certificate(..)` turns the handshake on.
+- `.with_certificate(..)` turns the handshake on under the house provider, and `.with_identity(..)` turns it on under a `SigningIdentity` of any `SigningProvider`.
 
-`build` exists after one of the two builder calls alone, so the compiler refuses a configuration that names neither.
+`build` exists after one of these builder calls alone, so the compiler refuses a configuration that names none.
 
 **Macro-free path**
 
@@ -2969,7 +3049,7 @@ tb_scenario! {
 		client: |HiveEnv { trace, context: signer, hive }| async move {
 			let mut client = connect_hive(&hive, &signer).await?;
 
-			let signed_stop = signed_stop_frame(&signer.provider, b"manage-bp").await?;
+			let signed_stop = signed_stop_frame(&signer.identity, b"manage-bp").await?;
 			let response = emit_command(&mut client, signed_stop).await?;
 
 			// The status is read from the stop alternative, so a reply in
@@ -3308,7 +3388,7 @@ let mut work = compose(Version::V2)
 	.with_order(UnixMillis::now().get())
 	.with_message(CalcRequest { value: 42 })
 	.build()?;
-work.sign_with_provider::<Sha3_256, _>(&provider).await?;
+work.sign_with_provider(&identity).await?;
 
 // One method call on a connected client: wraps the work frame in the
 // hop-local transport envelope and resolves the gateway's reply down
@@ -3316,7 +3396,7 @@ work.sign_with_provider::<Sha3_256, _>(&provider).await?;
 let response = client.submit_work_to(calculator_urn, &work).await?;
 
 // The servlet's envelope is verifiable end to end.
-response.verify::<Secp256k1Signature, Sha3_256>(&servlet_public_key)?;
+response.verify::<Secp256k1Signature>(&servlet_public_key)?;
 let result: CalcResponse = decode(&response.message)?;
 ```
 
@@ -5747,19 +5827,31 @@ tb_scenario! {
 - [ITU-T X.680][itu-x680]: ASN.1 Specification of basic notation
 - [ITU-T X.690][itu-x690]: ASN.1 Distinguished Encoding Rules (DER)
 - [NIST SP 800-56A][nist-800-56a]: Recommendation for Pair-Wise Key Establishment Schemes Using Discrete Logarithm Cryptography
+- [NIST SP 800-56C][nist-800-56c]: Recommendation for Key-Derivation Methods in Key-Establishment Schemes
 - [RFC 2119][rfc2119]: Key words for use in RFCs to Indicate Requirement Levels
 - [RFC 3274][rfc3274]: Compressed Data Content Type for Cryptographic Message Syntax (CMS)
+- [RFC 3279][rfc3279]: Algorithms and Identifiers for the Internet X.509 Public Key Infrastructure Certificate and CRL Profile
+- [RFC 3394][rfc3394]: Advanced Encryption Standard (AES) Key Wrap Algorithm
 - [RFC 3447][rfc3447]: Public-Key Cryptography Standards (PKCS) #1: RSA Cryptography Specifications Version 2.1
+- [RFC 3565][rfc3565]: Use of the Advanced Encryption Standard (AES) Encryption Algorithm in Cryptographic Message Syntax (CMS)
+- [RFC 5083][rfc5083]: Cryptographic Message Syntax (CMS) Authenticated-Enveloped-Data Content Type
+- [RFC 5084][rfc5084]: Using AES-CCM and AES-GCM Authenticated Encryption in the Cryptographic Message Syntax (CMS)
 - [RFC 5246][rfc5246]: The Transport Layer Security (TLS) Protocol Version 1.2
 - [RFC 5280][rfc5280]: Internet X.509 Public Key Infrastructure Certificate and CRL Profile
 - [RFC 5480][rfc5480]: Elliptic Curve Cryptography Subject Public Key Information
 - [RFC 5652][rfc5652]: Cryptographic Message Syntax (CMS)
 - [RFC 5753][rfc5753]: Use of Elliptic Curve Cryptography (ECC) Algorithms in Cryptographic Message Syntax (CMS)
 - [RFC 5869][rfc5869]: HMAC-based Extract-and-Expand Key Derivation Function (HKDF)
+- [RFC 6211][rfc6211]: Cryptographic Message Syntax (CMS) Algorithm Identifier Protection Attribute
+- [RFC 7093][rfc7093]: Additional Methods for Generating Key Identifiers Values
 - [RFC 8032][rfc8032]: Edwards-Curve Digital Signature Algorithm (EdDSA)
 - [RFC 8141][rfc8141]: Uniform Resource Names (URNs)
 - [RFC 8174][rfc8174]: Ambiguity of Uppercase vs Lowercase in RFC 2119 Key Words
 - [RFC 8439][rfc8439]: ChaCha20 and Poly1305 for IETF Protocols
+- [RFC 9180][rfc9180]: Hybrid Public Key Encryption
+- [RFC 9629][rfc9629]: Using Key Encapsulation Mechanism (KEM) Algorithms in the Cryptographic Message Syntax (CMS)
+- [RFC 9688][rfc9688]: Use of the SHA3 One-Way Hash Functions in the Cryptographic Message Syntax (CMS)
+- [RFC 9846][rfc9846]: The Transport Layer Security (TLS) Protocol Version 1.3 (obsoletes RFC 8446)
 - [SECG SEC 1][secg-sec1]: Elliptic Curve Cryptography (Standards for Efficient Cryptography)
 
 ### 14.2 Informative References
@@ -5782,8 +5874,6 @@ tb_scenario! {
 - [RFC 7748][rfc7748]: Elliptic Curves for Security
 - [RFC 8622][rfc8622]: A Lower-Effort Per-Hop Behavior (LE PHB) for Differentiated Services
 - [RFC 9113][rfc9113]: HTTP/2
-- [RFC 9180][rfc9180]: Hybrid Public Key Encryption
-- [RFC 9846][rfc9846]: The Transport Layer Security (TLS) Protocol Version 1.3 (obsoletes RFC 8446)
 - [RFC 9901][rfc9901]: Selective Disclosure for JSON Web Tokens (SD-JWT)
 - [RFC Editor Style Guide][rfc-style-guide]: Web Portion of the Style Guide
 
@@ -5838,8 +5928,13 @@ Unless you explicitly state otherwise, any contribution intentionally submitted 
 [rfc2474]: https://datatracker.ietf.org/doc/html/rfc2474
 [rfc3246]: https://datatracker.ietf.org/doc/html/rfc3246
 [rfc3274]: https://datatracker.ietf.org/doc/html/rfc3274
+[rfc3279]: https://datatracker.ietf.org/doc/html/rfc3279
+[rfc3394]: https://datatracker.ietf.org/doc/html/rfc3394
 [rfc3447]: https://datatracker.ietf.org/doc/html/rfc3447
+[rfc3565]: https://datatracker.ietf.org/doc/html/rfc3565
 [rfc4594]: https://datatracker.ietf.org/doc/html/rfc4594
+[rfc5083]: https://datatracker.ietf.org/doc/html/rfc5083
+[rfc5084]: https://datatracker.ietf.org/doc/html/rfc5084
 [rfc5246]: https://datatracker.ietf.org/doc/html/rfc5246
 [rfc5280]: https://datatracker.ietf.org/doc/html/rfc5280
 [rfc5424]: https://datatracker.ietf.org/doc/html/rfc5424
@@ -5848,7 +5943,9 @@ Unless you explicitly state otherwise, any contribution intentionally submitted 
 [rfc5652-5]: https://datatracker.ietf.org/doc/html/rfc5652#section-5
 [rfc5753]: https://datatracker.ietf.org/doc/html/rfc5753
 [rfc5869]: https://datatracker.ietf.org/doc/html/rfc5869
+[rfc6211]: https://datatracker.ietf.org/doc/html/rfc6211
 [rfc6960]: https://datatracker.ietf.org/doc/html/rfc6960
+[rfc7093]: https://datatracker.ietf.org/doc/html/rfc7093
 [rfc7322]: https://datatracker.ietf.org/doc/html/rfc7322
 [rfc7748]: https://datatracker.ietf.org/doc/html/rfc7748
 [rfc8032]: https://datatracker.ietf.org/doc/html/rfc8032
@@ -5865,8 +5962,11 @@ Unless you explicitly state otherwise, any contribution intentionally submitted 
 [rfc9113-7]: https://datatracker.ietf.org/doc/html/rfc9113#section-7
 [rfc9113-8.1]: https://datatracker.ietf.org/doc/html/rfc9113#section-8.1
 [rfc9180]: https://datatracker.ietf.org/doc/html/rfc9180
+[rfc9629]: https://datatracker.ietf.org/doc/html/rfc9629
+[rfc9688]: https://datatracker.ietf.org/doc/html/rfc9688
 [rfc9846]: https://datatracker.ietf.org/doc/html/rfc9846
-[rfc9846-4.1.3]: https://datatracker.ietf.org/doc/html/rfc9846#section-4.1.3
+[rfc9846-4.2.3]: https://datatracker.ietf.org/doc/html/rfc9846#section-4.2.3
+[rfc9846-4.5.3]: https://datatracker.ietf.org/doc/html/rfc9846#section-4.5.3
 [rfc9846-4.7.3]: https://datatracker.ietf.org/doc/html/rfc9846#section-4.7.3
 [rfc9846-5.5]: https://datatracker.ietf.org/doc/html/rfc9846#section-5.5
 [rfc9901]: https://datatracker.ietf.org/doc/html/rfc9901
@@ -5880,6 +5980,7 @@ Unless you explicitly state otherwise, any contribution intentionally submitted 
 [fips197]: https://csrc.nist.gov/publications/detail/fips/197/final
 [fips202]: https://csrc.nist.gov/publications/detail/fips/202/final
 [nist-800-56a]: https://csrc.nist.gov/publications/detail/sp/800-56a/rev-3/final
+[nist-800-56c]: https://csrc.nist.gov/publications/detail/sp/800-56c/rev-2/final
 [nist-800-57]: https://csrc.nist.gov/publications/detail/sp/800-57-part-1/rev-5/final
 [iso-18013-5]: https://www.iso.org/standard/69084.html
 [iso-26262]: https://www.iso.org/standard/68383.html

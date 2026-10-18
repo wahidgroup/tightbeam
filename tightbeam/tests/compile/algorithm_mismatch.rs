@@ -1,7 +1,7 @@
 use tightbeam::builder::FrameBuilder;
 use tightbeam::crypto::aead::Aes128GcmOid;
 use tightbeam::crypto::hash::Sha3_256;
-use tightbeam::crypto::profiles::SecurityProfile;
+use tightbeam::crypto::profiles::{Aes256Wrap, SecurityProfile};
 use tightbeam::crypto::sign::ecdsa::Secp256k1Signature;
 use tightbeam::der::Sequence;
 use tightbeam::{Beamable, Version};
@@ -14,6 +14,8 @@ impl SecurityProfile for Aes128Profile {
 	type Digest = Sha3_256;
 	type AeadOid = Aes128GcmOid; // Profile expects AES-128-GCM
 	type SignatureAlg = Secp256k1Signature;
+	type KeyWrapOid = Aes256Wrap;
+
 	#[cfg(feature = "kdf")]
 	type Kdf = tightbeam::crypto::kdf::HkdfSha3_256;
 	#[cfg(feature = "ecdh")]

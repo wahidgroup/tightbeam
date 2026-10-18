@@ -183,10 +183,8 @@ where
 		};
 
 		let bind_addr = P::default_bind_address()?;
-		let (certificate, key_manager) = hive_tls.identity().parts();
-		let encryption_config = TransportEncryptionConfig::new(certificate, key_manager);
+		let encryption_config = TransportEncryptionConfig::new(hive_tls.identity().clone());
 		let encryption_config = encryption_config.with_client_validators(hive_tls.validators.iter().map(Arc::clone));
-
 		Ok(Some(P::bind_with(bind_addr, encryption_config).await?))
 	}
 }

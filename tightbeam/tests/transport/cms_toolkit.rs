@@ -3,8 +3,8 @@
 //! The tests exercise the toolkit end to end through public interfaces
 //! only, including the failure paths a consumer relies on:
 //!
-//! - KARI CEK wrap and unwrap,
-//! - `EnvelopedData` sealing and decryption through the builder and processor pair, and
+//! - the content key wrapped to a `KEMRecipientInfo` and unwrapped by its holder,
+//! - `AuthEnvelopedData` sealing and opening under a `KEKRecipientInfo`, and
 //! - `SignedData` signing and verification.
 
 #![cfg(all(
@@ -17,35 +17,22 @@
 ))]
 
 use tightbeam::asn1::Any;
-use tightbeam::cms::builder::RecipientInfoBuilder;
-use tightbeam::cms::cert::IssuerAndSerialNumber;
-use tightbeam::cms::enveloped_data::{
-	EncryptedKey, EnvelopedData, KeyAgreeRecipientIdentifier, KeyAgreeRecipientInfo, RecipientInfo, UserKeyingMaterial,
-};
-use tightbeam::crypto::hash::Sha3_256;
+use tightbeam::cms::signed_data::SignedData;
+use tightbeam::crypto::cms::{AuthEnvelopedData, KemRecipientInfo, Opener, Recipient};
 use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::crypto::secret::ToInsecure;
-use tightbeam::crypto::sign::ecdsa::k256::SecretKey;
-use tightbeam::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey, Secp256k1VerifyingKey};
-use tightbeam::crypto::sign::EcdsaSignatureVerifier;
-use tightbeam::der::asn1::{ObjectIdentifier, OctetStringRef};
+use tightbeam::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
+use tightbeam::crypto::sign::{CmsSigner, Signed, SignedContent};
+use tightbeam::der::asn1::{ObjectIdentifier, OctetString, OctetStringRef};
 use tightbeam::der::{Decode, Encode};
 use tightbeam::exactly;
-use tightbeam::oids::{AES_256_WRAP, HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA3_256};
-use tightbeam::random::{generate_nonce, OsRng};
-use tightbeam::spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoOwned};
+use tightbeam::oids::DATA;
+use tightbeam::random::OsRng;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_scenario;
-use tightbeam::testing::SetupEnv;
-use tightbeam::transport::handshake::builders::{
-	TightBeamEnvelopedDataBuilder, TightBeamKariBuilder, TightBeamSignedDataBuilder,
-};
-use tightbeam::transport::handshake::processors::{
-	TightBeamEnvelopedDataProcessor, TightBeamKariRecipient, TightBeamSignedDataProcessor,
-};
+use tightbeam::testing::{EnvelopeRecipient, SetupEnv, TestIdentity};
 use tightbeam::transport::handshake::{HandshakeAttribute, HandshakeError};
-use tightbeam::x509::name::Name;
-use tightbeam::x509::serial_number::SerialNumber;
+use tightbeam::x509::attr::Attribute;
 
 use tightbeam::urn::Urn;
 
@@ -61,28 +48,34 @@ pub(crate) const TAMPER_REJECTED: Urn<'static> = tightbeam::urn!("test", "event:
 pub(crate) const WIRE_ROUNDTRIP: Urn<'static> = tightbeam::urn!("test", "event:cms-toolkit/wire-roundtrip");
 pub(crate) const WRONG_KEY_REJECTED: Urn<'static> = tightbeam::urn!("test", "event:cms-toolkit/wrong-key-rejected");
 
-/// OID for the test-only unprotected attribute carried through the envelope.
+/// The house provider, whose algorithms the envelope scenarios run.
+type House = DefaultCryptoProvider;
+
+/// OID for the test-only authenticated attribute carried through the envelope.
 const TOOLKIT_ATTR: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.1");
 
-/// Recipient identifier fixture shared by the envelope scenarios.
-fn recipient_identifier() -> Result<KeyAgreeRecipientIdentifier, HandshakeError> {
-	Ok(KeyAgreeRecipientIdentifier::IssuerAndSerialNumber(IssuerAndSerialNumber {
-		issuer: Name::default(),
-		serial_number: SerialNumber::new(&[0x01])?,
-	}))
-}
+/// The purpose label that leads the `ukm` of the KEM scenario.
+const TOOLKIT_UKM: &[u8] = b"tb/test/cms-toolkit/ukm/v1";
 
-/// Open the KARI variant a [`TightBeamKariBuilder`] produces.
-fn open_kari(recipient_info: RecipientInfo) -> KeyAgreeRecipientInfo {
-	let RecipientInfo::Kari(kari) = recipient_info else {
-		panic!("the KARI builder produces a KeyAgreeRecipientInfo");
-	};
+/// The key-encryption key of the envelope scenario.
+static TOOLKIT_KEK: [u8; 32] = [0x42u8; 32];
 
-	kari
+/// The identifier that names [`TOOLKIT_KEK`].
+const TOOLKIT_KEK_ID: &[u8] = b"tb/test/cms-toolkit/kek/v1";
+
+/// `sealed` with the wrapped content key of its `KEMRecipientInfo` altered.
+fn with_tampered_key(sealed: &AuthEnvelopedData) -> AuthEnvelopedData {
+	let kem = sealed.kem_recipient();
+	let mut tampered_bytes = kem.encrypted_key.as_bytes().to_vec();
+	tampered_bytes[0] ^= 0x01;
+
+	let encrypted_key = OctetString::new(tampered_bytes).expect("bytes are an OCTET STRING");
+	let kem = KemRecipientInfo { encrypted_key, ..kem };
+	sealed.to_owned().with_kem_recipient(&kem)
 }
 
 tb_assert_spec! {
-	pub KariCekSpec,
+	pub KemRecipientSpec,
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
@@ -95,53 +88,39 @@ tb_assert_spec! {
 }
 
 tb_scenario! {
-	name: kari_cek_roundtrip,
-	spec: KariCekSpec,
+	name: kem_recipient_roundtrip,
+	spec: KemRecipientSpec,
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
-			let sender = SecretKey::random(&mut OsRng);
-			let recipient = SecretKey::random(&mut OsRng);
-			let intruder = SecretKey::random(&mut OsRng);
-			let sender_spki = SubjectPublicKeyInfoOwned::from_key(sender.public_key())?;
-			let ukm = UserKeyingMaterial::new(generate_nonce::<64>(None)?.to_vec())?;
-			let cek = [0x42u8; 32];
+			let recipient = TestIdentity::of(&Secp256k1SigningKey::random(&mut OsRng));
+			let intruder = TestIdentity::of(&Secp256k1SigningKey::random(&mut OsRng));
+			let plaintext = b"cms toolkit sealed payload";
 
-			let mut builder = TightBeamKariBuilder::default()
-				.with_sender_priv(sender)
-				.with_sender_pub_spki(sender_spki)
-				.with_recipient_pub(recipient.public_key())
-				.with_recipient_rid(recipient_identifier()?)
-				.with_ukm(ukm)
-				.with_key_enc_alg(AlgorithmIdentifierOwned { oid: AES_256_WRAP, parameters: None });
-
-			let recipient_info = builder.build(&cek).map_err(HandshakeError::CmsBuilderError)?;
-			let kari = open_kari(recipient_info);
-			let wrapped_entry = kari.recipient_enc_keys.first().ok_or(HandshakeError::InvalidRecipientIndex)?;
-			let wrapped = wrapped_entry.enc_key.as_bytes();
-			assert_ne!(wrapped, cek.as_slice(), "wrapped CEK must not expose the plaintext CEK");
+			let sealed_to = Recipient::Kem { certificate: recipient.certificate(), ukm_label: TOOLKIT_UKM };
+			let sealed = AuthEnvelopedData::seal::<House>(sealed_to, DATA, plaintext, [], None)?;
+			let wrapped = sealed.kem_recipient().encrypted_key;
+			assert_eq!(wrapped.as_bytes().len(), 40, "AES-256 key wrap adds one 8-octet block to the 32-octet CEK");
 
 			trace.event(CEK_WRAPPED)?;
 
-			let recipient_processor = TightBeamKariRecipient::with_defaults(recipient);
-			let unwrapped = recipient_processor.process_kari(&kari, 0)?;
-			assert_eq!(unwrapped.to_insecure().as_slice(), cek.as_slice(), "recipient must recover the exact CEK");
+			let arrived = sealed.to_der()?;
+			let opener = Opener::Kem { identity: &recipient, ukm_label: TOOLKIT_UKM };
+			let received = AuthEnvelopedData::from_der(&arrived)?;
+			let opened = received.open::<House>(&arrived, &opener, DATA).await?.to_insecure();
+			assert_eq!(opened.as_slice(), plaintext.as_slice(), "the recipient must recover the exact content");
 
 			trace.event(CEK_RECOVERED)?;
 
-			let intruder_processor = TightBeamKariRecipient::with_defaults(intruder);
-			let wrong = intruder_processor.process_kari(&kari, 0);
-			assert!(wrong.is_err(), "a foreign recipient key must fail the unwrap integrity check");
+			let intruder_opener = Opener::Kem { identity: &intruder, ukm_label: TOOLKIT_UKM };
+			let received = AuthEnvelopedData::from_der(&arrived)?;
+			let wrong = received.open::<House>(&arrived, &intruder_opener, DATA).await;
+			assert!(wrong.is_err(), "a foreign recipient must be refused");
 
 			trace.event(WRONG_KEY_REJECTED)?;
 
-			let mut tampered_bytes = wrapped.to_vec();
-			tampered_bytes[0] ^= 0x01;
-
-			let mut tampered = kari.clone();
-			let tampered_entry = tampered.recipient_enc_keys.first_mut().ok_or(HandshakeError::InvalidRecipientIndex)?;
-			tampered_entry.enc_key = EncryptedKey::new(tampered_bytes)?;
-
-			let forged = recipient_processor.process_kari(&tampered, 0);
+			let forged = with_tampered_key(&sealed);
+			let forged_der = forged.to_der()?;
+			let forged = forged.open::<House>(forged_der, &opener, DATA).await;
 			assert!(forged.is_err(), "a tampered wrapped CEK must fail the unwrap integrity check");
 
 			trace.event(TAMPER_REJECTED)?;
@@ -165,49 +144,36 @@ tb_assert_spec! {
 }
 
 tb_scenario! {
-	name: enveloped_data_roundtrip,
+	name: auth_enveloped_data_roundtrip,
 	spec: EnvelopeRoundTripSpec,
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
-			let sender = SecretKey::random(&mut OsRng);
-			let recipient = SecretKey::random(&mut OsRng);
-			let sender_spki = SubjectPublicKeyInfoOwned::from_key(sender.public_key())?;
-			let ukm = UserKeyingMaterial::new(generate_nonce::<64>(None)?.to_vec())?;
-
-			let kari = TightBeamKariBuilder::default()
-				.with_sender_priv(sender)
-				.with_sender_pub_spki(sender_spki)
-				.with_recipient_pub(recipient.public_key())
-				.with_recipient_rid(recipient_identifier()?)
-				.with_ukm(ukm)
-				.with_key_enc_alg(AlgorithmIdentifierOwned { oid: AES_256_WRAP, parameters: None });
-
 			let attr_value = Any::encode_from(&OctetStringRef::new(b"toolkit-attr")?)?;
-			let attr = HandshakeAttribute::new_single(TOOLKIT_ATTR, attr_value)?;
+			let attr = Attribute::try_from(HandshakeAttribute::new_single(TOOLKIT_ATTR, attr_value)?)?;
 
 			let plaintext = b"cms toolkit sealed payload";
-			let envelope = TightBeamEnvelopedDataBuilder::with_defaults(kari)
-				.with_unprotected_attr(attr)
-				.build(plaintext, None)?;
+			let recipient = Recipient::Kek { kek: &TOOLKIT_KEK, key_identifier: TOOLKIT_KEK_ID };
+			let envelope = AuthEnvelopedData::seal::<House>(recipient, DATA, plaintext, [attr], None)?;
 
 			trace.event(ENVELOPE_SEALED)?;
 
 			// Wire fidelity: the recipient works from re-decoded DER only.
-			let envelope = EnvelopedData::from_der(&envelope.to_der()?)?;
+			let arrived = envelope.to_der()?;
+			let envelope = AuthEnvelopedData::from_der(&arrived)?;
 
 			trace.event(WIRE_ROUNDTRIP)?;
 
-			let kari = TightBeamKariRecipient::with_defaults(recipient);
-			let processor = TightBeamEnvelopedDataProcessor::with_defaults(kari);
-			let recovered = processor.process(&envelope)?.to_insecure();
+			let opener = Opener::Kek { kek: &TOOLKIT_KEK, key_identifier: TOOLKIT_KEK_ID };
+			let received = AuthEnvelopedData::from_der(&arrived)?;
+			let recovered = received.open::<House>(&arrived, &opener, DATA).await?.to_insecure();
 			assert_eq!(&recovered[..], plaintext.as_slice(), "recipient must recover the sealed plaintext");
 
 			trace.event(CONTENT_RECOVERED)?;
 
-			let attrs = processor.extract_unprotected_attributes(&envelope);
+			let attrs = envelope.auth_attrs.as_ref().ok_or(HandshakeError::MissingAttribute)?;
 			assert!(
-				matches!(attrs, Some([attr]) if attr.oid == TOOLKIT_ATTR),
-				"the unprotected attribute must survive the wire roundtrip"
+				attrs.iter().any(|attr| attr.oid == TOOLKIT_ATTR),
+				"the authenticated attribute must survive the wire roundtrip"
 			);
 
 			trace.event(ATTRIBUTE_EXTRACTED)?;
@@ -235,33 +201,36 @@ tb_scenario! {
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
 			let signing_key = Secp256k1SigningKey::random(&mut OsRng);
-			let builder = TightBeamSignedDataBuilder::<DefaultCryptoProvider, _>::new(
-				&signing_key,
-				AlgorithmIdentifierOwned { oid: HASH_SHA3_256, parameters: None },
-				AlgorithmIdentifierOwned { oid: SIGNER_ECDSA_WITH_SHA3_256, parameters: None },
-			)?;
-
 			let content = b"cms toolkit transcript commitment";
-			let signed = builder.build(content)?;
+			let signed_content = SignedContent::data(content);
+			let certified = TestIdentity::certified(signing_key.clone());
+			let signer = CmsSigner::sign_with::<Secp256k1Signature, _>(&certified, signed_content)?;
+			let signed = CmsSigner::signed_data(SignedContent::data(content), signer, None)?;
+			let wire = signed.to_der()?;
 
 			trace.event(CONTENT_SIGNED)?;
 
-			let verifier = EcdsaSignatureVerifier::<Secp256k1VerifyingKey, Secp256k1Signature, Sha3_256>::from_signing_key(
-				&signing_key,
-			)?;
-			let verified = TightBeamSignedDataProcessor::new(verifier).process(&signed, &HASH_SHA3_256)?;
-			assert_eq!(verified.as_slice(), content.as_slice(), "verifier must return the exact signed content");
+			let received = Signed::<SignedData>::from_der(&wire)?;
+			let recovered = CmsSigner::content(&received, DATA)?;
+			let signer_info = received.signer_infos.0.get(0).ok_or(HandshakeError::SignatureVerificationFailed)?;
+			let recovered_content = SignedContent::data(recovered);
+			let verified = CmsSigner::verify::<Secp256k1Signature, _>(
+				signer_info,
+				signing_key.verifying_key(),
+				recovered_content,
+			);
+			assert!(verified.is_ok(), "the signer's key must verify the signature");
+			assert_eq!(recovered, content.as_slice(), "the reader must return the exact signed content");
 
 			trace.event(SIGNATURE_VERIFIED)?;
 
 			let foreign_key = Secp256k1SigningKey::random(&mut OsRng);
-			let foreign_verifier =
-				EcdsaSignatureVerifier::<Secp256k1VerifyingKey, Secp256k1Signature, Sha3_256>::from_signing_key(
-					&foreign_key,
-				)?;
-
-			let rejected = TightBeamSignedDataProcessor::new(foreign_verifier).process(&signed, &HASH_SHA3_256);
-			assert!(rejected.is_err(), "a verifier bound to a different key must reject the signature");
+			let rejected = CmsSigner::verify::<Secp256k1Signature, _>(
+				signer_info,
+				foreign_key.verifying_key(),
+				SignedContent::data(recovered),
+			);
+			assert!(rejected.is_err(), "a different key must reject the signature");
 
 			trace.event(FOREIGN_KEY_REJECTED)?;
 

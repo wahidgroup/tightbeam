@@ -16,6 +16,7 @@
 use std::sync::Arc;
 
 use tightbeam::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
+use tightbeam::crypto::sign::SigningIdentity;
 use tightbeam::crypto::x509::CertificateSpec;
 use tightbeam::exactly;
 use tightbeam::instrumentation::events;
@@ -26,7 +27,6 @@ use tightbeam::tb_scenario;
 use tightbeam::testing::{ClientEnv, SetupEnv, TestFrame};
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::handshake::HandshakeProtocolKind;
-use tightbeam::transport::state::ClientIdentity;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::{ClientBuilder, ConnectionBuilder};
 use tightbeam::urn::Urn;
@@ -107,7 +107,7 @@ tb_scenario! {
 
 			let builder = ClientBuilder::<TokioListener>::builder()
 				.with_trust_store(trust_store)
-				.with_client_identity(ClientIdentity::from_spec(identity, Arc::clone(&ctx.client_provider))?)
+				.with_client_identity(SigningIdentity::from_spec(identity, Arc::clone(&ctx.client_provider))?)
 				.with_server_certificate_chain(server_chain)
 				.with_handshake_protocol(HandshakeProtocolKind::Cms)
 				.build();

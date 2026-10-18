@@ -29,6 +29,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use tightbeam::at_least;
 use tightbeam::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
+use tightbeam::crypto::sign::SigningIdentity;
 use tightbeam::crypto::x509::CertificateSpec;
 use tightbeam::decode;
 use tightbeam::der::asn1::OctetString;
@@ -46,7 +47,6 @@ use tightbeam::transport::handshake::negotiation::{
 	AuthorizationGrant, AuthorizationRefusal, MuxBudgets, MuxSettings, TransportAuthorizer, TransportOffer,
 };
 use tightbeam::transport::handshake::receipt::{ApprovalRefusal, ReceiptApprover, SessionReceipt};
-use tightbeam::transport::state::ClientIdentity;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::{ConnectionBuilder, ConnectionPool, PoolConfig, PooledClient};
 use tightbeam::utils::marker::MaybeSendFuture;
@@ -381,7 +381,7 @@ fn pool_with_offer(
 	let mut builder = ConnectionPool::<TokioListener>::builder()
 		.with_config(config)
 		.with_trust_store(trust_store)
-		.with_client_identity(ClientIdentity::from_spec(identity, client_provider)?)
+		.with_client_identity(SigningIdentity::from_spec(identity, client_provider)?)
 		.with_trace(trace.share());
 
 	if let Some(wallet) = wallet {
