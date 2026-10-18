@@ -2,6 +2,8 @@
 
 use super::common::*;
 use tightbeam::colony::cluster::ClusterHeartbeat;
+use tightbeam::crypto::x509::store::TrustVerification;
+use tightbeam::testing::TestFrame;
 use tightbeam::utils::time::MonotonicInstant;
 
 tb_assert_spec! {
@@ -181,7 +183,7 @@ tb_assert_spec! {
 fn untrusted_hive_identity() -> (Arc<HiveTlsConfig>, Arc<dyn CertificateTrust>) {
 	let (hive_cert, hive_key) = colony_identity("CN=Untrusted Hive", &test_colony_urn());
 	let admits_hive: Arc<dyn CertificateTrust> = Arc::new(
-		CertificateTrustBuilder::from(Secp256k1Policy)
+		CertificateTrustBuilder::from(Secp256k1Policy::default())
 			.with_certificate(hive_cert.to_owned())
 			.expect("the hive certificate builds a trust store")
 			.build(),
@@ -524,6 +526,62 @@ tb_scenario! {
 }
 
 tb_assert_spec! {
+	pub ClusterFlippedReplaySpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(FLIPPED_CAPTURE_VERIFIES, exactly!(1), equals!(true)),
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
+			(events::CLUSTER_REGISTER_REFUSED, exactly!(1)),
+			(REGISTER_STATUS, exactly!(1), equals!(TransitStatus::PermissionDenied)),
+			(REGISTRY_HIVES, exactly!(1), equals!(1u64)),
+			(REGISTER_ASSIGNED_ID, exactly!(1), equals!(0u64))
+		]
+	}
+}
+
+// A capture with `s` flipped to `n - s` still verifies under the hive key
+// (SEC 1 v2.0 §4.1.4). The replay ledger keys on the canonical signature, so
+// the rewritten capture finds the slot its original spent (CWE-294). The
+// capture verifies under the hive trust the gateway holds, to the value of
+// its original, so the gateway refuses it as a replay and not as a forgery.
+tb_scenario! {
+	name: cluster_refuses_registration_replayed_with_its_s_flipped,
+	spec: ClusterFlippedReplaySpec,
+	environment Cluster {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| async move {
+			start_cluster(&trace, ClusterConfig::new(cluster_tls_config(&certs))).await
+		},
+		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+			let mut client = connect_cluster(&certs, cluster.addr()).await?;
+			let request = registration_request(b"127.0.0.1:65000");
+			let fresh = signed_control_frame(&certs, b"flipped-reg", request).await?;
+			let flipped = TestFrame::with_flipped_s(&fresh);
+			let original = certs.trust.verify_frame(&fresh);
+			let twin = certs.trust.verify_frame(&flipped);
+			let verified = (original, twin);
+			let twin_verifies =
+				matches!(verified, (TrustVerification::Verified(_, a), TrustVerification::Verified(_, b)) if a == b);
+			trace.event_with(FLIPPED_CAPTURE_VERIFIES, &[], twin_verifies)?;
+
+			// The gateway counts the accepted registration as
+			// CLUSTER_HIVE_REGISTERED, so its reply needs no record here.
+			let accepted_frame = emit_frame(&mut client, fresh).await?;
+			decode::<RegisterHiveResponse>(accepted_frame.message())?;
+
+			let response_frame = emit_frame(&mut client, flipped).await?;
+			let response: RegisterHiveResponse = decode(response_frame.message())?;
+			record_register_response(&trace, &response, &cluster)?;
+
+			cluster.stop();
+
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
 	pub ClusterHeartbeatRejectionSpec,
 	V(1,0,0): {
 		mode: Accept,
@@ -664,7 +722,7 @@ fn dual_hive_certs() -> DualHiveCerts {
 	let key_a = Secp256k1SigningKey::from(raw_a);
 	let key_b = Secp256k1SigningKey::from(raw_b);
 	let hive_trust: Arc<dyn CertificateTrust> = Arc::new(
-		CertificateTrustBuilder::from(Secp256k1Policy)
+		CertificateTrustBuilder::from(Secp256k1Policy::default())
 			.with_certificate(cert_a.to_owned())
 			.expect("hive A trust")
 			.with_certificate(cert_b.to_owned())

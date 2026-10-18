@@ -24,7 +24,7 @@ use tightbeam::testing::TestFrame;
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::handshake::negotiation::{TransportAuthorizer, TransportOffer};
 use tightbeam::transport::handshake::receipt::{ReceiptApprover, SessionObserver};
-use tightbeam::transport::handshake::{HandshakeKeyManager, HandshakeMessage};
+use tightbeam::transport::handshake::HandshakeMessage;
 use tightbeam::transport::state::EncryptedProtocolState;
 use tightbeam::transport::state::SessionPhase;
 use tightbeam::transport::tcp::r#async::{SplitTransport, TcpTransport, TokioListener, TokioStream};
@@ -123,10 +123,7 @@ pub async fn join_task<T>(task: JoinHandle<T>, panic_msg: &'static str) -> Resul
 pub async fn bind_encrypted_listener(
 	materials: &ServerMaterials,
 ) -> Result<(TokioListener, SocketAddr), TightBeamError> {
-	let certificate = Certificate::clone(&materials.certificate);
-	let key_manager = HandshakeKeyManager::new(Arc::clone(&materials.key_provider));
-
-	let config = TransportEncryptionConfig::new(certificate, key_manager);
+	let config = TransportEncryptionConfig::new(materials.identity());
 	bind_with_config(config).await
 }
 
@@ -134,11 +131,8 @@ pub async fn bind_encrypted_listener_with_timeout(
 	materials: &ServerMaterials,
 	handshake_timeout: Duration,
 ) -> Result<(TokioListener, SocketAddr), TightBeamError> {
-	let certificate = Certificate::clone(&materials.certificate);
-	let key_manager = HandshakeKeyManager::new(Arc::clone(&materials.key_provider));
 	let limits = TransportLimits { handshake_timeout, ..TransportLimits::default() };
-
-	let config = TransportEncryptionConfig::new(certificate, key_manager).with_limits(limits);
+	let config = TransportEncryptionConfig::new(materials.identity()).with_limits(limits);
 	bind_with_config(config).await
 }
 
@@ -154,11 +148,8 @@ pub async fn bind_mutual_listener(
 	materials: &ServerMaterials,
 	client_certificate: &Certificate,
 ) -> Result<(TokioListener, SocketAddr), TightBeamError> {
-	let certificate = Certificate::clone(&materials.certificate);
-	let key_manager = HandshakeKeyManager::new(Arc::clone(&materials.key_provider));
 	let validators = vec![pinning_validator(client_certificate)];
-
-	let config = TransportEncryptionConfig::new(certificate, key_manager).with_client_validators(validators);
+	let config = TransportEncryptionConfig::new(materials.identity()).with_client_validators(validators);
 	bind_with_config(config).await
 }
 
@@ -169,8 +160,8 @@ pub async fn connect_mutual_client(
 ) -> Result<TcpTransport<TokioStream>, TightBeamError> {
 	let builder = pinned_client(server_certificate)?.with_client_identity(client.identity());
 	let stream = TcpStream::connect(addr).await?;
-	let adopted = builder.adopt(TokioStream::from(stream))?;
 
+	let adopted = builder.adopt(TokioStream::from(stream))?;
 	Ok(adopted.into_transport())
 }
 
@@ -318,7 +309,7 @@ pub async fn connect_pinned_client(
 /// A client builder that trusts exactly `server_certificate`.
 fn pinned_client(server_certificate: &Certificate) -> Result<ClientBuilder<TokioListener>, TightBeamError> {
 	let trust_store: Arc<dyn CertificateTrust> = Arc::new(
-		CertificateTrustBuilder::from(Secp256k1Policy)
+		CertificateTrustBuilder::from(Secp256k1Policy::default())
 			.with_certificate(server_certificate.to_owned())?
 			.build(),
 	);

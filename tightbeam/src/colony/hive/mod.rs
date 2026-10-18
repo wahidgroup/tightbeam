@@ -36,11 +36,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::constants::DEFAULT_BACKPRESSURE_THRESHOLD_BPS;
+use crate::crypto::sign::SigningIdentity;
 use crate::trace::TraceCollector;
 use crate::transport::client::PoolConfig;
 use crate::transport::multiplex::{RequestSink, StreamBody};
 use crate::transport::policy::CoreRetryPolicy;
-use crate::transport::state::ClientIdentity;
 use crate::transport::Protocol;
 use crate::urn::Urn;
 use crate::utils::time::{Clock, SystemClock};
@@ -120,7 +120,6 @@ impl RefusedRegistration {
 	/// way [`ServletBox::stop_boxed`] names rather than through its drop.
 	pub fn stop_servlet(self) -> TightBeamError {
 		self.registration.servlet.stop_boxed();
-
 		self.error
 	}
 }
@@ -415,15 +414,16 @@ pub trait Hive: Sized + Send + Sync {
 /// [`HiveConfig`] holds it in an `Arc`, since its validators are trait objects.
 #[non_exhaustive]
 pub struct HiveTlsConfig {
-	/// The certificate and handshake key this hive presents, decoded once by
-	/// [`Self::new`].
-	identity: ClientIdentity,
+	/// The certificate and handshake key this hive presents, from
+	/// [`Self::new`] or [`Self::from_identity`].
+	identity: SigningIdentity,
 	/// The client certificate validators, such as public-key pinning.
 	pub validators: Vec<Arc<dyn crate::crypto::x509::policy::CertificateValidation>>,
 }
 
 impl HiveTlsConfig {
-	/// Decodes `certificate` and binds it to the key that proves it.
+	/// Decodes `certificate` and binds it to the key that proves it, under the
+	/// house provider.
 	///
 	/// A hive presents one identity everywhere: dialing a gateway, dialing a
 	/// sibling servlet, and accepting on its own control plane. One decode
@@ -439,16 +439,25 @@ impl HiveTlsConfig {
 		key: Arc<dyn crate::crypto::key::SigningKeyProvider>,
 		validators: Vec<Arc<dyn crate::crypto::x509::policy::CertificateValidation>>,
 	) -> Result<Self, TightBeamError> {
-		let identity = ClientIdentity::from_spec(certificate, key)?;
+		let identity = SigningIdentity::from_spec(certificate, key)?;
+		Ok(Self::from_identity(identity, validators))
+	}
 
-		Ok(Self { identity, validators })
+	/// Presents `identity`, whose key signs under the
+	/// [`SigningProvider`](crate::crypto::profiles::SigningProvider) it was
+	/// paired under, and holds the client certificate `validators`.
+	pub fn from_identity(
+		identity: SigningIdentity,
+		validators: Vec<Arc<dyn crate::crypto::x509::policy::CertificateValidation>>,
+	) -> Self {
+		Self { identity, validators }
 	}
 
 	/// The certificate and handshake key this hive presents.
 	///
 	/// One identity serves the control plane, sibling dials, and gateway
 	/// dials, so all three read it here and cannot disagree.
-	pub fn identity(&self) -> &ClientIdentity {
+	pub fn identity(&self) -> &SigningIdentity {
 		&self.identity
 	}
 }
@@ -456,7 +465,7 @@ impl HiveTlsConfig {
 impl core::fmt::Debug for HiveTlsConfig {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 		f.debug_struct("HiveTlsConfig")
-			.field("identity", &"<ClientIdentity>")
+			.field("identity", &self.identity)
 			.field("validators", &format!("[{} validators]", self.validators.len()))
 			.finish()
 	}
@@ -511,12 +520,10 @@ pub type DuplexOpenFuture<'a> =
 /// echo, so the example runs without a live hive.
 ///
 /// ```
-/// # use sha3::Sha3_256;
 /// # use tightbeam::builder::{frame::FrameBuilder, TypeBuilder};
 /// # use tightbeam::colony::hive::{CallFuture, HiveContext};
-/// # use tightbeam::crypto::key::Secp256k1KeyProvider;
 /// # use tightbeam::crypto::sign::ecdsa::Secp256k1Signature;
-/// # use tightbeam::testing::{TestKey, TestMessage};
+/// # use tightbeam::testing::{TestIdentity, TestKey, TestMessage};
 /// # use tightbeam::urn::Urn;
 /// # use tightbeam::{decode, Frame, TightBeamError, Version};
 /// #
@@ -527,8 +534,8 @@ pub type DuplexOpenFuture<'a> =
 /// #         Box::pin(async move {
 /// #             let echoed: TestMessage = decode(frame.message())?;
 /// #             let mut reply = FrameBuilder::from(Version::V1).with_id(b"km-reply").with_message(echoed).build()?;
-/// #             let provider = Secp256k1KeyProvider::from(TestKey::insecure_fixed_signing());
-/// #             reply.sign_with_provider::<Sha3_256, _>(&provider).await?;
+/// #             let sibling = TestIdentity::insecure_fixed();
+/// #             reply.sign_with_provider(&sibling).await?;
 /// #             Ok(reply)
 /// #         })
 /// #     }
@@ -540,18 +547,18 @@ pub type DuplexOpenFuture<'a> =
 /// # let ctx = EchoSibling;
 /// # let keymanager_urn = tightbeam::urn!("tightbeam", "servlet:keymanager");
 /// # let sibling_key = TestKey::insecure_fixed_signing();
-/// let caller_provider = Secp256k1KeyProvider::from(TestKey::insecure_fixed_signing());
+/// let caller = TestIdentity::insecure_fixed();
 ///
 /// let mut request = FrameBuilder::from(Version::V1)
 ///     .with_id(b"km-decrypt")
 ///     .with_message(TestMessage { content: "unwrap key 7".into() })
 ///     .build()?;
-/// request.sign_with_provider::<Sha3_256, _>(&caller_provider).await?;
+/// request.sign_with_provider(&caller).await?;
 ///
 /// let reply = ctx.call(&keymanager_urn, request).await?;
 ///
 /// // The reply is the sibling's complete envelope: verify, then decode.
-/// reply.verify::<Secp256k1Signature, Sha3_256>(sibling_key.verifying_key())?;
+/// reply.verify::<Secp256k1Signature>(sibling_key.verifying_key())?;
 /// let response: TestMessage = decode(reply.message())?;
 /// assert_eq!(response.content, "unwrap key 7");
 /// # Ok::<(), TightBeamError>(())

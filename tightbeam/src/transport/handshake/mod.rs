@@ -4,7 +4,7 @@
 //!
 //! - **HPKE-based**: the client seals the base secret to the server's static
 //!   key (RFC 9180), and the closing travels as a [`ClientKeyExchange`].
-//! - **CMS-based**: full X.509 PKI with signed, enveloped, and encrypted data.
+//! - **CMS-based**: full X.509 PKI with signed and authenticated-enveloped data.
 //!
 //! Both protocols establish authenticated, encrypted sessions and negotiate
 //! the cryptographic algorithms between client and server.
@@ -51,8 +51,8 @@
 //! Both protocols derive every traffic key from one [`HandshakeSecret`],
 //! which takes two inputs:
 //!
-//! - the base secret the client seals to the server's static key, and
-//! - the ECDH output of the client's ephemeral and the server's ephemeral.
+//! - the ECDH output of the client's ephemeral and the server's ephemeral, and
+//! - the base secret the client seals to the server's static key.
 //!
 //! The server signs its ephemeral inside the transcript, and both ephemeral
 //! private keys drop at the step that consumes them. A recording plus a later
@@ -92,15 +92,13 @@
 //! │  └─────────────────────────────┘    │  └─────────────┘  │              │
 //! │                                     │    (Associated)   │              │
 //! │  ┌─────────────────────────────┐    └───────────────────┘              │
-//! │  │        Builders &           │                                       │
-//! │  │       Processors            │                                       │
+//! │  │   Authenticated Envelope    │                                       │
+//! │  │       (crypto::cms)         │                                       │
 //! │  │  ┌───────────────────────┐  │                                       │
-//! │  │  │ KariBuilder<P>        │  │                                       │
-//! │  │  │ EnvDataBuilder<P>     │  │                                       │
-//! │  │  │ KariRecipient         │  │                                       │
-//! │  │  │ EnvDataProcessor      │  │                                       │
+//! │  │  │ AuthEnvelopedData     │  │                                       │
+//! │  │  │ Recipient             │  │                                       │
+//! │  │  │ Opener                │  │                                       │
 //! │  │  └───────────────────────┘  │                                       │
-//! │  │   (Compile-time Generic)    │                                       │
 //! │  └─────────────────────────────┘                                       │
 //! └────────────────────────────────────────────────────────────────────────┘
 //!
@@ -136,7 +134,7 @@
 //! | Protocol | Offer travels in | Accept travels in |
 //! | --- | --- | --- |
 //! | HPKE | `ClientHello` | `ServerHandshake` |
-//! | CMS | Key exchange, unprotected attribute | Server Finished, unsigned attribute |
+//! | CMS | Opening, authenticated attribute | Server Finished, unsigned attribute |
 //!
 //! ## Legs
 //!
@@ -144,9 +142,9 @@
 //!
 //! | Leg | Sender | HPKE message | CMS message |
 //! | --- | --- | --- | --- |
-//! | Opening | Client | `ClientHello` | Key exchange |
+//! | Opening | Client | `ClientHello` | `AuthEnvelopedData` to the server's certificate |
 //! | Reply | Server | `ServerHandshake` | Server Finished |
-//! | Closing | Client | `ClientKeyExchange` | Client Finished, sealed |
+//! | Closing | Client | `ClientKeyExchange` | Client Finished, sealed in `AuthEnvelopedData` |
 //!
 //! A server reads the closing in one order in both protocols: it opens the
 //! closing, confirms the handshake secret, admits the client, and settles the
@@ -171,13 +169,12 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
-use core::marker::PhantomData;
 use core::result::Result as CoreResult;
 
 #[cfg(not(feature = "std"))]
-pub(crate) use alloc::sync::Arc;
+use alloc::boxed::Box;
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, vec::Vec};
+pub(crate) use alloc::sync::Arc;
 #[cfg(feature = "std")]
 pub(crate) use std::sync::Arc;
 
@@ -199,21 +196,12 @@ pub mod negotiation;
 pub mod primitives;
 pub mod receipt;
 
-#[cfg(feature = "transport-cms")]
-pub mod builders;
-#[cfg(feature = "transport-cms")]
-pub mod kari;
-#[cfg(feature = "transport-cms")]
-pub mod processors;
-
 pub use crate::crypto::aead::DirectionalCiphers;
 pub use attributes::HandshakeAttribute;
 pub use error::HandshakeError;
 pub use peer::PeerAuthentication;
 pub use schedule::EpochMaterials;
 
-#[cfg(feature = "transport-cms")]
-pub use builders::{KariBuilderError, TightBeamKariBuilder};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub use flow::{ClientFlow, ServerFlow};
 #[cfg(feature = "transport-cms")]
@@ -230,8 +218,6 @@ pub(crate) use peer::AdmittedPeer;
 pub use peer::LearnedTrust;
 #[cfg(feature = "transport-cms")]
 pub use peer::ProvisionedTrust;
-#[cfg(feature = "transport-cms")]
-pub use processors::{TightBeamEnvelopedDataProcessor, TightBeamKariRecipient};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub use schedule::HandshakeSecret;
 #[cfg(all(
@@ -252,13 +238,14 @@ pub(crate) use wire::HandshakeOctets;
 
 use crate::asn1::OctetString;
 use crate::cms::content_info::CmsVersion;
-use crate::cms::encrypted_data::EncryptedData;
-use crate::cms::enveloped_data::EnvelopedData;
 use crate::cms::signed_data::{EncapsulatedContentInfo, SignedData, SignerInfos};
 use crate::crypto::aead::SessionKeys;
-use crate::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
-use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider, SecurityProfileDesc};
-use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
+use crate::crypto::cms::AuthEnvelopedData;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::crypto::cms::ContentEncryption;
+use crate::crypto::profiles::SecurityProfileDesc;
+use crate::crypto::sign::Signed;
+use crate::der::asn1::SetOfVec;
 use crate::der::{Any, Encode, Enumerated, Sequence, Tag};
 use crate::oids::DATA;
 use crate::transport::error::TransportError;
@@ -273,6 +260,8 @@ use crate::x509::attr::Attributes;
 use crate::x509::Certificate;
 use crate::Beamable;
 
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::crypto::profiles::CryptoProvider;
 #[cfg(feature = "transport-hpke")]
 use crate::der::asn1::OctetStringRef;
 #[cfg(feature = "transport-hpke")]
@@ -330,7 +319,8 @@ impl<C> HandshakeCurve for C where
 /// - a signature parses from its encoded bytes,
 /// - the verifying key builds from a public key on that curve, verifies a
 ///   signature, and encodes as an SPKI, and
-/// - the AEAD cipher keys from derived bytes.
+/// - the AEAD cipher keys from derived bytes and seals an envelope, and
+/// - the provider holds an HPKE suite when the build runs the HPKE flow.
 ///
 /// Every provider that meets the bounds is a handshake provider.
 ///
@@ -351,8 +341,9 @@ pub trait HandshakeProvider:
 		Signature: for<'a> TryFrom<&'a [u8], Error: Into<HandshakeError>> + 'static,
 		VerifyingKey: Verifier<Self::Signature> + From<PublicKey<Self::Curve>> + EncodePublicKey + 'static,
 		Digest: 'static,
-		AeadCipher: KeyInit + 'static,
-	> + Send
+		AeadCipher: KeyInit + ContentEncryption + 'static,
+	> + HandshakeHpke
+	+ Send
 	+ Sync
 	+ 'static
 {
@@ -365,12 +356,31 @@ impl<P> HandshakeProvider for P where
 			Signature: for<'a> TryFrom<&'a [u8], Error: Into<HandshakeError>> + 'static,
 			VerifyingKey: Verifier<P::Signature> + From<PublicKey<P::Curve>> + EncodePublicKey + 'static,
 			Digest: 'static,
-			AeadCipher: KeyInit + 'static,
-		> + Send
+			AeadCipher: KeyInit + ContentEncryption + 'static,
+		> + HandshakeHpke
+		+ Send
 		+ Sync
 		+ 'static
 {
 }
+
+/// The HPKE role a handshake provider holds: [`HpkeProvider`] when the build
+/// runs the HPKE flow.
+///
+/// [`HpkeProvider`]: crate::crypto::profiles::HpkeProvider
+#[cfg(feature = "transport-hpke")]
+pub trait HandshakeHpke: crate::crypto::profiles::HpkeProvider {}
+
+#[cfg(feature = "transport-hpke")]
+impl<P: crate::crypto::profiles::HpkeProvider> HandshakeHpke for P {}
+
+/// The HPKE role of a build that runs the CMS flow alone, which every provider
+/// holds.
+#[cfg(all(feature = "transport-cms", not(feature = "transport-hpke")))]
+pub trait HandshakeHpke {}
+
+#[cfg(all(feature = "transport-cms", not(feature = "transport-hpke")))]
+impl<P> HandshakeHpke for P {}
 
 /// Provisioned server identity for a CMS client handshake.
 ///
@@ -401,67 +411,6 @@ impl From<Arc<[Certificate]>> for CmsServerIdentity {
 	}
 }
 
-/// The signing key of an endpoint, behind a key provider.
-///
-/// The manager holds the provider that a handshake signs and agrees with, so
-/// the key can sit on an HSM or a KMS. The key material stays behind the
-/// provider, and each handshake shares it through an `Arc` clone.
-pub struct HandshakeKeyManager<P: CryptoProvider> {
-	provider: Arc<dyn SigningKeyProvider>,
-	_phantom: PhantomData<P>,
-}
-
-impl<P: CryptoProvider> Clone for HandshakeKeyManager<P> {
-	fn clone(&self) -> Self {
-		Self { provider: Arc::clone(&self.provider), _phantom: PhantomData }
-	}
-}
-
-impl From<Secp256k1SigningKey> for HandshakeKeyManager<DefaultCryptoProvider> {
-	fn from(signing_key: Secp256k1SigningKey) -> Self {
-		let provider = Secp256k1KeyProvider::from(signing_key);
-		Self { provider: Arc::new(provider), _phantom: PhantomData }
-	}
-}
-
-impl From<Secp256k1KeyProvider> for HandshakeKeyManager<DefaultCryptoProvider> {
-	fn from(provider: Secp256k1KeyProvider) -> Self {
-		Self { provider: Arc::new(provider), _phantom: PhantomData }
-	}
-}
-
-impl From<Arc<dyn SigningKeyProvider>> for HandshakeKeyManager<DefaultCryptoProvider> {
-	fn from(provider: Arc<dyn SigningKeyProvider>) -> Self {
-		Self { provider, _phantom: PhantomData }
-	}
-}
-
-impl<P: CryptoProvider> HandshakeKeyManager<P> {
-	/// The signing key provider this manager was built from.
-	///
-	/// An endpoint that signs control frames reads the provider from the
-	/// manager that already holds it, instead of keeping a second handle.
-	pub fn provider(&self) -> &dyn SigningKeyProvider {
-		self.provider.as_ref()
-	}
-}
-
-impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
-	/// Creates a manager around `provider`, which holds the signing key of the
-	/// endpoint.
-	pub fn new(provider: Arc<dyn SigningKeyProvider>) -> Self {
-		Self { provider, _phantom: PhantomData }
-	}
-
-	/// Shared handle to the encapsulated signing provider, for the server
-	/// handshake and for post-handshake signers such as in-band epoch
-	/// renewals. The key material stays behind the provider abstraction.
-	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-	pub(crate) fn signing_provider(&self) -> Arc<dyn SigningKeyProvider> {
-		Arc::clone(&self.provider)
-	}
-}
-
 /// Alert code an endpoint sends to abort a handshake.
 #[derive(Enumerated, Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -483,7 +432,7 @@ pub enum HandshakeAlert {
 	// decode a stale meaning.
 }
 
-/// A handshake message travels in one of four containers, three of them CMS.
+/// A handshake message travels in one of three containers, two of them CMS.
 ///
 /// HPKE carries its hello and its reply inside a `SignedData`, and its
 /// closing in a [`ClientKeyExchange`] of its own, because HPKE specifies no
@@ -494,11 +443,9 @@ pub enum HandshakeMessage {
 	/// Carries an HPKE `ClientHello` or `ServerHandshake`, or a CMS server
 	/// Finished.
 	SignedData(Box<WireDer<SignedData>>),
-	/// Carries a CMS key exchange.
-	EnvelopedData(Box<WireDer<EnvelopedData>>),
-	/// Carries a CMS client Finished, sealed under the identity key of the
-	/// handshake secret (RFC 5652 § 8).
-	EncryptedData(Box<WireDer<EncryptedData>>),
+	/// Carries a CMS opening, or a CMS client Finished sealed under the
+	/// identity key of the handshake secret (RFC 5083).
+	AuthEnvelopedData(Box<WireDer<AuthEnvelopedData>>),
 	/// Carries the closing of an HPKE handshake.
 	ClientKeyExchange(Box<WireDer<ClientKeyExchange>>),
 }
@@ -513,39 +460,20 @@ impl HandshakeMessage {
 	pub fn signed(self) -> CoreResult<WireDer<SignedData>, HandshakeError> {
 		match self {
 			Self::SignedData(signed) => Ok(*signed),
-			Self::EnvelopedData(_) | Self::EncryptedData(_) | Self::ClientKeyExchange(_) => {
-				Err(HandshakeError::UnexpectedContainer)
-			}
+			Self::AuthEnvelopedData(_) | Self::ClientKeyExchange(_) => Err(HandshakeError::UnexpectedContainer),
 		}
 	}
 
-	/// Returns the key-transport container.
+	/// Returns the authenticated-enveloped container.
 	///
 	/// # Errors
 	///
 	/// - [`HandshakeError::UnexpectedContainer`] -- the message holds another
 	///   container, which this step refuses.
-	pub fn enveloped(self) -> CoreResult<WireDer<EnvelopedData>, HandshakeError> {
+	pub fn auth_enveloped(self) -> CoreResult<WireDer<AuthEnvelopedData>, HandshakeError> {
 		match self {
-			Self::EnvelopedData(enveloped) => Ok(*enveloped),
-			Self::SignedData(_) | Self::EncryptedData(_) | Self::ClientKeyExchange(_) => {
-				Err(HandshakeError::UnexpectedContainer)
-			}
-		}
-	}
-
-	/// Returns the sealed container.
-	///
-	/// # Errors
-	///
-	/// - [`HandshakeError::UnexpectedContainer`] -- the message holds another
-	///   container, which this step refuses.
-	pub fn encrypted(self) -> CoreResult<WireDer<EncryptedData>, HandshakeError> {
-		match self {
-			Self::EncryptedData(encrypted) => Ok(*encrypted),
-			Self::SignedData(_) | Self::EnvelopedData(_) | Self::ClientKeyExchange(_) => {
-				Err(HandshakeError::UnexpectedContainer)
-			}
+			Self::AuthEnvelopedData(enveloped) => Ok(*enveloped),
+			Self::SignedData(_) | Self::ClientKeyExchange(_) => Err(HandshakeError::UnexpectedContainer),
 		}
 	}
 
@@ -558,9 +486,7 @@ impl HandshakeMessage {
 	pub fn key_exchange(self) -> CoreResult<WireDer<ClientKeyExchange>, HandshakeError> {
 		match self {
 			Self::ClientKeyExchange(key_exchange) => Ok(*key_exchange),
-			Self::SignedData(_) | Self::EnvelopedData(_) | Self::EncryptedData(_) => {
-				Err(HandshakeError::UnexpectedContainer)
-			}
+			Self::SignedData(_) | Self::AuthEnvelopedData(_) => Err(HandshakeError::UnexpectedContainer),
 		}
 	}
 
@@ -568,8 +494,7 @@ impl HandshakeMessage {
 	pub fn der(&self) -> &[u8] {
 		match self {
 			Self::SignedData(signed) => signed.der(),
-			Self::EnvelopedData(enveloped) => enveloped.der(),
-			Self::EncryptedData(encrypted) => encrypted.der(),
+			Self::AuthEnvelopedData(enveloped) => enveloped.der(),
 			Self::ClientKeyExchange(key_exchange) => key_exchange.der(),
 		}
 	}
@@ -585,24 +510,14 @@ impl TryFrom<SignedData> for HandshakeMessage {
 	}
 }
 
-/// Wraps a key-transport container this endpoint built, encoded once for
-/// sending.
-impl TryFrom<EnvelopedData> for HandshakeMessage {
+/// Wraps an authenticated-enveloped container this endpoint built, encoded
+/// once for sending.
+impl TryFrom<AuthEnvelopedData> for HandshakeMessage {
 	type Error = HandshakeError;
 
-	fn try_from(enveloped: EnvelopedData) -> CoreResult<Self, Self::Error> {
+	fn try_from(enveloped: AuthEnvelopedData) -> CoreResult<Self, Self::Error> {
 		let enveloped = WireDer::new(enveloped)?;
-		Ok(Self::EnvelopedData(Box::new(enveloped)))
-	}
-}
-
-/// Wraps a sealed container this endpoint built, encoded once for sending.
-impl TryFrom<EncryptedData> for HandshakeMessage {
-	type Error = HandshakeError;
-
-	fn try_from(encrypted: EncryptedData) -> CoreResult<Self, Self::Error> {
-		let encrypted = WireDer::new(encrypted)?;
-		Ok(Self::EncryptedData(Box::new(encrypted)))
+		Ok(Self::AuthEnvelopedData(Box::new(enveloped)))
 	}
 }
 
@@ -818,7 +733,7 @@ pub enum HandshakeProtocolKind {
 	/// HPKE-based handshake, the default and the lighter option.
 	#[default]
 	Hpke,
-	/// CMS-based handshake (X.509 signed/enveloped data).
+	/// CMS-based handshake (X.509 signed and authenticated-enveloped data).
 	///
 	/// The client encrypts to the server certificate in its first message and
 	/// signs its Finished, so it MUST provision a trust store, the server
@@ -880,7 +795,7 @@ pub struct ServerHandshake {
 	///
 	/// [rfc5652-5]: https://datatracker.ietf.org/doc/html/rfc5652#section-5
 	#[asn1(context_specific = "1", optional = "true")]
-	pub session_receipt: Option<SignedData>,
+	pub session_receipt: Option<Signed<SignedData>>,
 }
 
 /// Confidential plaintext of the HPKE key exchange.
@@ -903,17 +818,17 @@ pub(crate) struct HpkeSessionPayload {
 	/// The proof that the client derived the handshake secret, which the
 	/// server verifies before it settles.
 	pub key_confirmation: KeyConfirmation,
-	/// The client receipt `SignerInfo` countersigning the server-issued
-	/// receipt, sealed under the handshake secret's acknowledgement key. Its
-	/// signed attributes bind the bearer settlement answer (see
+	/// The DER of the envelope that seals the client receipt `SignerInfo`
+	/// under the acknowledgement key. Its signed attributes bind the bearer
+	/// settlement answer (see
 	/// [forward secrecy](crate::transport::handshake#forward-secrecy)).
 	/// It is required exactly when the server issued a receipt.
 	#[asn1(context_specific = "0", optional = "true")]
 	pub receipt_ack: Option<OctetString>,
-	/// The client's [`HpkeIdentity`], sealed under the identity key of the
-	/// handshake secret, when the client presents an identity. The key needs
-	/// the ephemeral-ephemeral agreement, so a later theft of the server's
-	/// static key does not open it.
+	/// The DER of the `AuthEnvelopedData` that seals the client's
+	/// [`HpkeIdentity`] under the identity key of the handshake secret, when
+	/// the client presents an identity. The key needs the ephemeral-ephemeral
+	/// agreement, so a later theft of the server's static key does not open it.
 	#[asn1(context_specific = "1", optional = "true")]
 	pub sealed_identity: Option<OctetString>,
 }
@@ -968,7 +883,7 @@ fn encodable_to_signed_data<T: Encode>(message: &T) -> Result<SignedData> {
 		encap_content_info,
 		certificates: None,
 		crls: None,
-		signer_infos: SignerInfos::try_from(Vec::new())?,
+		signer_infos: SignerInfos::from(SetOfVec::new()),
 	})
 }
 

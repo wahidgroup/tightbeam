@@ -70,7 +70,6 @@ impl HopBudget {
 	#[must_use]
 	pub fn from_wire(wire: WireHopBudget, max_hops: u8) -> Self {
 		let hops = wire.get();
-
 		Self { remaining: hops.min(max_hops), relayed: hops != DEFAULT_HOP_BUDGET }
 	}
 
@@ -706,7 +705,7 @@ mod tests {
 
 		/// A peer trust store that holds `cert` alone.
 		fn store_holding(cert: &Certificate) -> CertificateTrustStore {
-			let builder = CertificateTrustBuilder::from(Secp256k1Policy).with_certificate(cert.clone());
+			let builder = CertificateTrustBuilder::from(Secp256k1Policy::default()).with_certificate(cert.clone());
 			builder.expect("the test certificate satisfies the trust builder").build()
 		}
 

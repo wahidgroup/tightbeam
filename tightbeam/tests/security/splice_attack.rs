@@ -9,7 +9,7 @@
 //! ## Attack
 //! 1. The attacker holds the certificate of a victim, but not its signing key.
 //! 2. The attacker runs a handshake of its own and offers the certificate of the victim as its identity.
-//! 3. The attacker signs the possession proof under its own key.
+//! 3. The attacker's key provider claims the victim's key and signs the proof under its own key.
 //!
 //! The closing seals the certificate and its proof under a key of the
 //! handshake secret, so an attacker cannot lift the proof of a victim from a
@@ -31,15 +31,19 @@ use std::sync::Arc;
 
 use tightbeam::{
 	crypto::{
+		key::{KeyError, SigningKeyProvider},
 		profiles::DefaultCryptoProvider,
+		sign::SigningIdentity,
 		x509::policy::{CertificateValidation, ExpiryValidator},
 	},
-	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
+	exactly, job,
+	spki::AlgorithmIdentifierOwned,
+	tb_assert_spec, tb_process_spec, tb_scenario,
 	testing::{ScenarioConfig, SetupEnv},
 	trace::TraceCollector,
 	transport::handshake::{negotiation::SecurityOffer, Handshake, HandshakeError, PeerAuthentication},
-	transport::state::ClientIdentity,
 	urn::Urn,
+	utils::marker::MaybeSendFuture,
 	TightBeamError,
 };
 
@@ -47,6 +51,28 @@ use crate::common::security::{
 	default_security_profile, expectation_failure, hpke_client_config, hpke_server_config, pinning_validator,
 	ClientMaterials, ServerMaterials,
 };
+
+/// A key provider that claims the public key of `claimed` and signs under
+/// the key of `signer`, as software the attacker runs may.
+#[derive(Debug)]
+struct SplicedKeyProvider {
+	claimed: Arc<dyn SigningKeyProvider>,
+	signer: Arc<dyn SigningKeyProvider>,
+}
+
+impl SigningKeyProvider for SplicedKeyProvider {
+	fn algorithm(&self) -> AlgorithmIdentifierOwned {
+		self.signer.algorithm()
+	}
+
+	fn to_public_key_bytes(&self) -> Result<Vec<u8>, KeyError> {
+		self.claimed.to_public_key_bytes()
+	}
+
+	fn sign_prehash(&self, prehash: &[u8]) -> MaybeSendFuture<'_, Result<Vec<u8>, KeyError>> {
+		self.signer.sign_prehash(prehash)
+	}
+}
 
 pub(crate) const SPLICED_KEX_REJECTED: Urn<'static> =
 	tightbeam::urn!("test", "event:splice-attack/spliced-kex-rejected");
@@ -96,13 +122,16 @@ job! {
 
 		// The victim holds an authenticated identity whose certificate is
 		// public. The attacker offers that certificate and proves it with its
-		// own key.
+		// own key, behind a provider that claims the key of the victim.
 		let victim = ClientMaterials::deterministic();
 		let attacker = ClientMaterials::generate();
-		let spliced = ClientIdentity::new(Arc::clone(&victim.certificate), Arc::clone(&attacker.key_manager));
+		let claimed = Arc::clone(&victim.key_provider);
+		let signer = Arc::clone(&attacker.key_provider);
+		let provider = Arc::new(SplicedKeyProvider { claimed, signer });
+		let spliced = SigningIdentity::new(Arc::clone(&victim.certificate), provider)?;
 		let validator = pinning_validator(&materials.certificate);
 
-		let mut config = hpke_client_config(validator);
+		let mut config = hpke_client_config::<DefaultCryptoProvider>(validator);
 		config.flow.identity = Some(spliced);
 		config.security_offer = Some(SecurityOffer::new(vec![profile]));
 

@@ -56,6 +56,12 @@ impl<T> WireDer<T> {
 		self.value
 	}
 
+	/// Take the DER bytes and the decoded value apart, so a step that consumes
+	/// the value still reads the bytes it arrived as.
+	pub fn into_parts(self) -> (Vec<u8>, T) {
+		(self.der, self.value)
+	}
+
 	/// Return the contents octets, after the tag and length.
 	///
 	/// Every constructor reads `contents_at` from the header of these same

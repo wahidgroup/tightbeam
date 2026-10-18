@@ -100,7 +100,7 @@ mod hpke {
 				let client_materials = ClientMaterials::deterministic();
 				let client_identity = client_materials.identity();
 
-				let mut config = hpke_client_config(pinning_validator(&materials.certificate));
+				let mut config = hpke_client_config::<DefaultCryptoProvider>(pinning_validator(&materials.certificate));
 				config.flow.identity = Some(client_identity);
 				config.security_offer = Some(SecurityOffer::new(vec![profile]));
 				config.transport_offer = Some(TransportOffer::mux(4).with_budgets(REQUEST));
@@ -159,7 +159,7 @@ mod cms {
 	};
 
 	use tightbeam::asn1::OctetString;
-	use tightbeam::cms::encrypted_data::EncryptedData;
+	use tightbeam::crypto::cms::AuthEnvelopedData;
 	use tightbeam::exactly;
 	use tightbeam::tb_assert_spec;
 	use tightbeam::tb_scenario;
@@ -181,15 +181,15 @@ mod cms {
 	/// The sealed client Finished with the middle byte of its encrypted content
 	/// flipped. A flipped content byte is the one wire handle a MITM has on the
 	/// sealed acknowledgement inside it.
-	fn flip_sealed_content(sealed_finished: &EncryptedData) -> Result<EncryptedData, TightBeamError> {
+	fn flip_sealed_content(sealed_finished: &AuthEnvelopedData) -> Result<AuthEnvelopedData, TightBeamError> {
 		let mut tampered = sealed_finished.to_owned();
-		let content = tampered.enc_content_info.encrypted_content.as_ref();
+		let content = tampered.auth_encrypted_content_info.encrypted_content.as_ref();
 		let content = content.ok_or_else(|| expectation_failure("a sealed Finished carries content"))?;
 		let mut forged = content.as_bytes().to_vec();
 		let middle = forged.len() / 2;
 
 		forged[middle] ^= 0xFF;
-		tampered.enc_content_info.encrypted_content = Some(OctetString::new(forged)?);
+		tampered.auth_encrypted_content_info.encrypted_content = Some(OctetString::new(forged)?);
 		Ok(tampered)
 	}
 
@@ -224,11 +224,11 @@ mod cms {
 				let (mut client, mut server) = (pair.client, pair.server);
 
 				let reply = server.reply(client.start()?).await?;
-				let sealed_finished = client.respond(reply).await?.encrypted()?;
+				let sealed_finished = client.respond(reply).await?.auth_enveloped()?;
 				let tampered = flip_sealed_content(sealed_finished.value())?;
 
 				let closing = server.finish(HandshakeMessage::try_from(tampered)?).await;
-				let rejected = matches!(closing, Err(HandshakeError::SealedIdentity));
+				let rejected = matches!(closing, Err(HandshakeError::SealedIdentity(_)));
 				trace.event_with(TAMPERED_CIPHERTEXT_REJECTED, &[], rejected)?;
 
 				let unsettled = authorizer.settle_calls() == 0;

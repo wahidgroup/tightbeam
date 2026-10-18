@@ -155,11 +155,10 @@ impl ClusterConfig {
 	///
 	/// [`ClusterTlsConfig::peer_authentication`]: crate::colony::cluster::ClusterTlsConfig::peer_authentication
 	fn accept_encryption_config(&self) -> Result<TransportEncryptionConfig<DefaultCryptoProvider>, TightBeamError> {
-		let (certificate, key_manager) = self.tls.identity().parts();
-		let encryption_config = TransportEncryptionConfig::new(certificate, key_manager);
-		let encryption_config =
-			encryption_config.with_client_validators(self.tls.client_validators.iter().map(Arc::clone));
+		let encryption_config = TransportEncryptionConfig::new(self.tls.identity().clone());
+		let validators = self.tls.client_validators.iter().map(Arc::clone);
 
+		let encryption_config = encryption_config.with_client_validators(validators);
 		Ok(encryption_config)
 	}
 }

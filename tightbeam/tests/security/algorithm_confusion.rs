@@ -92,7 +92,7 @@ job! {
 		let signature_bytes = signature.to_bytes();
 
 		// The signature genuinely verifies under the real secp256k1 ECDSA OID.
-		let policy = Secp256k1Policy;
+		let policy = Secp256k1Policy::default();
 		policy
 			.verify_signature(&SIGNER_ECDSA_WITH_SHA3_256, &spki_der, message, signature_bytes.as_ref())
 			.map_err(|_| expectation_failure("baseline verification under the genuine OID failed"))?;

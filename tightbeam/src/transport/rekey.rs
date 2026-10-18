@@ -54,18 +54,18 @@ use std::sync::Arc;
 
 use futures::lock::Mutex as FuturesMutex;
 
-use crate::cms::signed_data::{SignedData, SignerIdentifier, SignerInfo};
+use crate::cms::signed_data::SignedData;
 use crate::constants::EC_PUBKEY_COMPRESSED_SIZE;
 use crate::crypto::aead::{DirectionalCiphers, RecvCipher, SendCipher, SessionKeys};
-use crate::crypto::key::SigningKeyProvider;
 use crate::crypto::sign::elliptic_curve::ecdh::EphemeralSecret;
 use crate::crypto::sign::elliptic_curve::PublicKey;
+use crate::crypto::sign::{Signed, SigningIdentity};
 use crate::der::asn1::OctetString;
 use crate::der::Encode;
 use crate::random::{generate_nonce, OsRng};
 use crate::transport::envelopes::{MuxRekeyAckPackage, MuxRekeyRequestPackage, MuxRekeyResponsePackage};
 use crate::transport::handshake::negotiation::TransportAuthorizer;
-use crate::transport::handshake::primitives::RandomsSalt;
+use crate::transport::handshake::primitives::{RandomsSalt, TranscriptHash};
 use crate::transport::handshake::receipt::ReceiptArtifact;
 use crate::transport::handshake::receipt::{
 	ReceiptApprover, ReceiptRole, SessionObserver, SessionOutcome, SessionReceipt, SessionVerdict, StoredReceipt,
@@ -95,10 +95,10 @@ where
 {
 	epoch: EpochMaterials,
 	reference: SessionReceipt,
-	signing_provider: Arc<dyn SigningKeyProvider>,
+	identity: SigningIdentity,
 	peer_static: PublicKey<P::Curve>,
 	peer_verifying_key: P::VerifyingKey,
-	peer_sid: SignerIdentifier,
+	peer_certificate: Arc<Certificate>,
 }
 
 /// Fresh per-direction state produced by a completed exchange.
@@ -124,19 +124,20 @@ impl<P> RekeyMaterials<P>
 where
 	P: HandshakeProvider,
 {
-	/// Materials for a session whose peer holds the static key `peer_static`.
+	/// Materials for a session whose peer presented `peer_certificate`, which
+	/// holds the static key `peer_static`.
 	///
 	/// The key that verifies the peer's receipt signatures comes from the
 	/// same point, so the two cannot name different peers.
 	pub(crate) fn new(
 		epoch: EpochMaterials,
 		reference: SessionReceipt,
-		signing_provider: Arc<dyn SigningKeyProvider>,
+		identity: SigningIdentity,
 		peer_static: PublicKey<P::Curve>,
-		peer_sid: SignerIdentifier,
+		peer_certificate: Arc<Certificate>,
 	) -> Self {
 		let peer_verifying_key = P::VerifyingKey::from(peer_static);
-		Self { epoch, reference, signing_provider, peer_static, peer_verifying_key, peer_sid }
+		Self { epoch, reference, identity, peer_static, peer_verifying_key, peer_certificate }
 	}
 
 	/// The current epoch number.
@@ -155,7 +156,7 @@ where
 		role: MuxRole,
 		next_secret: EpochSecret,
 		salt: &RandomsSalt,
-		next_hash: [u8; 32],
+		next_hash: TranscriptHash,
 	) -> Result<(SendCipher, RecvCipher), HandshakeError> {
 		let directional = DirectionalCiphers::derive::<P, _>(&next_secret, salt.as_kdf_salt())?;
 
@@ -269,10 +270,10 @@ where
 		let receipt = artifact.receipt()?;
 		let server_role = ReceiptRole::Server;
 		let server_signer = artifact.signer_for_role(server_role)?.ok_or(HandshakeError::ReceiptMissing)?;
-		receipt.verify_signer::<P::Digest, P::Signature, _>(
+		receipt.verify_signer::<P::Signature, _>(
 			server_signer,
 			server_role,
-			&self.materials.peer_sid,
+			&self.materials.peer_certificate,
 			&self.materials.peer_verifying_key,
 		)?;
 
@@ -280,7 +281,8 @@ where
 		let challenge_hash = epoch.exchange_pin::<P::Digest>(&request_der, &server_random, &server_point)?;
 		let reference_budgets = self.materials.reference.budgets;
 		let reference_unit = self.materials.reference.credit_unit;
-		receipt.verify_terms::<P::Digest>(&challenge_hash, reference_budgets, reference_unit)?;
+
+		receipt.verify_terms(&challenge_hash, reference_budgets, reference_unit)?;
 
 		// The receipt the server signed pins its ephemeral, so the point is
 		// authenticated here. The agreement takes the scalar by value and runs
@@ -291,12 +293,12 @@ where
 
 		let answer = receipt.approve(self.approver.as_deref()).await?;
 		let answer_bytes = answer.as_ref().map(OctetString::as_bytes);
-		let provider = self.materials.signing_provider.as_ref();
-		let countersignature = receipt.countersign::<P::Digest>(answer_bytes, provider).await?;
+		let identity = &self.materials.identity;
+		let countersignature = receipt.countersign(answer_bytes, identity).await?;
 
 		// The countersignature has two owners by design. One copy folds into
 		// the retained artifact, and the other is DER-encoded into the ack.
-		let completed = artifact.complete(countersignature.clone())?;
+		let completed = artifact.with_signer(countersignature.clone())?;
 		let stored = StoredReceipt::try_from(completed)?;
 
 		let ack = MuxRekeyAckPackage::new(Some(countersignature));
@@ -305,6 +307,7 @@ where
 			.materials
 			.epoch
 			.advanced::<P::Digest>(&request_der, &response_der, &ack_der)?;
+
 		let rotated = self.materials.rotate(MuxRole::Client, next_secret, &salt, next_hash)?;
 		let (send_cipher, recv_cipher) = rotated;
 
@@ -320,7 +323,7 @@ where
 /// what waits here.
 struct PendingSettlement {
 	receipt: SessionReceipt,
-	artifact: SignedData,
+	artifact: Signed<SignedData>,
 	request_der: Vec<u8>,
 	response_der: Vec<u8>,
 	client_random: [u8; 32],
@@ -417,12 +420,12 @@ where
 			None => None,
 		};
 
-		let (receipt, artifact) = SessionReceipt::issue::<P::Digest>(
+		let (receipt, artifact) = SessionReceipt::issue(
 			challenge_hash,
 			self.materials.reference.budgets,
 			self.materials.reference.credit_unit,
 			challenge,
-			self.materials.signing_provider.as_ref(),
+			&self.materials.identity,
 		)
 		.await?;
 
@@ -473,21 +476,21 @@ where
 
 		let (verdict, ancillary_response) = pending
 			.receipt
-			.settle_ack::<P::Digest, P::Signature, _>(
-				countersignature.as_ref(),
-				&self.materials.peer_sid,
+			.settle_ack::<P::Signature, _>(
+				countersignature.as_deref(),
+				&self.materials.peer_certificate,
 				&self.materials.peer_verifying_key,
 				self.authorizer.as_deref(),
 			)
 			.await?;
 
-		let countersignature_der = countersignature.as_ref().map(SignerInfo::to_der).transpose()?;
+		let countersignature_der = countersignature.as_ref().map(Encode::to_der).transpose()?;
 
 		// A verified countersignature completes the artifact. A failed one
 		// stays out of it, but its DER remains in the outcome as evidence.
 		let artifact = match (verdict, countersignature) {
 			(SessionVerdict::Activated | SessionVerdict::SettlementRejected { .. }, Some(signer)) => {
-				pending.artifact.complete(signer)?
+				pending.artifact.with_signer(signer)?
 			}
 			(_, _) => pending.artifact,
 		};
@@ -655,17 +658,15 @@ pub(crate) mod tests {
 	use crate::asn1::{AlgorithmIdentifier, DigestInfo};
 	use crate::crypto::aead::DecryptContent;
 	use crate::crypto::hash::Sha3_256;
-	use crate::crypto::key::Secp256k1KeyProvider;
 	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::crypto::sign::ecdsa::k256::Secp256k1;
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
-	use crate::crypto::x509::utils::Skid;
 	use crate::oids::HASH_SHA3_256;
 	use crate::random::OsRng;
-	use crate::spki::EncodePublicKey;
+	use crate::testing::TestIdentity;
 	use crate::transport::handshake::negotiation::MuxBudgets;
 	use crate::transport::handshake::primitives::KdfSalt;
-	use crate::transport::handshake::tests::{fixture_handshake_secret, off_curve_point};
+	use crate::transport::handshake::tests::{fixture_handshake_secret, fixture_transcript, off_curve_point};
 
 	/// The provider every rekey test runs under.
 	type Provider = DefaultCryptoProvider;
@@ -680,18 +681,24 @@ pub(crate) mod tests {
 	const SAMPLE_CREDIT_UNIT: u32 = 1024;
 	const PLAINTEXT: &[u8] = b"epoch traffic";
 
+	/// One party of a rekey: its signing identity and its static key.
 	struct Identity {
-		provider: Arc<dyn SigningKeyProvider>,
+		signing: SigningIdentity,
 		public_key: PublicKey<Secp256k1>,
-		sid: SignerIdentifier,
+	}
+
+	impl Identity {
+		/// A shared handle to the certificate the party presents.
+		fn certificate(&self) -> Arc<Certificate> {
+			self.signing.certificate_arc()
+		}
 	}
 
 	fn test_identity() -> Result<Identity, HandshakeError> {
 		let signing_key = Secp256k1SigningKey::random(&mut OsRng);
 		let verifying_key = *signing_key.verifying_key();
-		let sid = SignerIdentifier::try_from(Skid::of_public_key(verifying_key.to_public_key_der()?))?;
-		let provider = Secp256k1KeyProvider::from(signing_key);
-		Ok(Identity { provider: Arc::new(provider), public_key: PublicKey::from(verifying_key), sid })
+		let signing = TestIdentity::of(&signing_key);
+		Ok(Identity { signing, public_key: PublicKey::from(verifying_key) })
 	}
 
 	/// A rekey scalar drawn for one test.
@@ -715,6 +722,11 @@ pub(crate) mod tests {
 		fresh_ephemeral().public_key()
 	}
 
+	/// [`SAMPLE_CHAIN_ROOT`] as the chain hash an epoch holds.
+	fn sample_chain_root() -> TranscriptHash {
+		fixture_transcript::<Sha3_256>(SAMPLE_CHAIN_ROOT)
+	}
+
 	/// The salt of the sample randoms.
 	fn sample_salt() -> RandomsSalt {
 		RandomsSalt::new(&SAMPLE_CLIENT_RANDOM, &SAMPLE_SERVER_RANDOM)
@@ -732,7 +744,7 @@ pub(crate) mod tests {
 	/// sample chain root.
 	fn sample_epoch_from(fill: u8) -> Result<EpochMaterials, HandshakeError> {
 		let secret = fixture_handshake_secret(fill);
-		EpochMaterials::derive::<DefaultCryptoProvider>(&secret, KdfSalt::new(&SAMPLE_SALT), SAMPLE_CHAIN_ROOT)
+		EpochMaterials::derive::<DefaultCryptoProvider>(&secret, KdfSalt::new(&SAMPLE_SALT), sample_chain_root())
 	}
 
 	fn sample_epoch() -> Result<EpochMaterials, HandshakeError> {
@@ -747,9 +759,9 @@ pub(crate) mod tests {
 		Ok(RekeyMaterials::new(
 			epoch,
 			reference,
-			identity.provider,
+			identity.signing,
 			peer.public_key,
-			peer.sid,
+			peer.certificate(),
 		))
 	}
 
@@ -786,16 +798,16 @@ pub(crate) mod tests {
 		let client_materials = RekeyMaterials::new(
 			sample_epoch()?,
 			reference.to_owned(),
-			Arc::clone(&client_identity.provider),
+			client_identity.signing.clone(),
 			server_identity.public_key,
-			server_identity.sid.to_owned(),
+			server_identity.certificate(),
 		);
 		let server_materials = RekeyMaterials::new(
 			sample_epoch()?,
 			reference,
-			Arc::clone(&server_identity.provider),
+			server_identity.signing.clone(),
 			client_identity.public_key,
-			client_identity.sid.to_owned(),
+			client_identity.certificate(),
 		);
 
 		let client = ClientRekey::new(client_materials, None);
@@ -862,8 +874,8 @@ pub(crate) mod tests {
 		let first_next = first.epoch.secret.next::<Provider>(client_scalar, &server_point, kdf_salt)?;
 		let second_next = second.epoch.secret.next::<Provider>(server_scalar, &client_point, kdf_salt)?;
 
-		let (first_send, _first_recv) = first.rotate(MuxRole::Client, first_next, &salt, SAMPLE_CHAIN_ROOT)?;
-		let (_second_send, second_recv) = second.rotate(MuxRole::Server, second_next, &salt, SAMPLE_CHAIN_ROOT)?;
+		let (first_send, _first_recv) = first.rotate(MuxRole::Client, first_next, &salt, sample_chain_root())?;
+		let (_second_send, second_recv) = second.rotate(MuxRole::Server, second_next, &salt, sample_chain_root())?;
 
 		let frame = first_send.encrypt_next(PLAINTEXT, None)?;
 		assert!(second_recv.decrypt_content(&frame).is_err());
@@ -884,7 +896,7 @@ pub(crate) mod tests {
 		let next = epoch.secret.next::<Provider>(scalar, &peer, salt.as_kdf_salt())?;
 		let mut materials = materials_with(epoch)?;
 
-		let (_send, recv) = materials.rotate(MuxRole::Server, next, &salt, SAMPLE_CHAIN_ROOT)?;
+		let (_send, recv) = materials.rotate(MuxRole::Server, next, &salt, sample_chain_root())?;
 
 		let frame = previous_send.encrypt_next(PLAINTEXT, None)?;
 		assert!(recv.decrypt_content(&frame).is_err());
@@ -1016,7 +1028,7 @@ pub(crate) mod tests {
 		client.process_response(response).await.map(|_| ())?;
 
 		let intruder = test_identity()?;
-		let forged = receipt.countersign::<Sha3_256>(None, intruder.provider.as_ref()).await?;
+		let forged = receipt.countersign(None, &intruder.signing).await?;
 		let foreign_ack = MuxRekeyAckPackage::new(Some(forged));
 		let foreign = server.process_ack(foreign_ack).await;
 		assert!(matches!(foreign, Err(HandshakeError::SignatureVerificationFailed)));
@@ -1137,8 +1149,8 @@ pub(crate) mod tests {
 		let static_point = point_of(&server_identity.public_key);
 		let epoch = sample_epoch()?;
 		let pin = epoch.exchange_pin::<Sha3_256>(request.to_der()?, &SAMPLE_SERVER_RANDOM, &static_point)?;
-		let signer = server_identity.provider.as_ref();
-		let issuing = SessionReceipt::issue::<Sha3_256>(pin, SAMPLE_BUDGETS, SAMPLE_CREDIT_UNIT, None, signer);
+		let signer = &server_identity.signing;
+		let issuing = SessionReceipt::issue(pin, SAMPLE_BUDGETS, SAMPLE_CREDIT_UNIT, None, signer);
 		let (_receipt, artifact) = issuing.await?;
 		let response = MuxRekeyResponsePackage::new(SAMPLE_SERVER_RANDOM, &static_point, Some(artifact))?;
 

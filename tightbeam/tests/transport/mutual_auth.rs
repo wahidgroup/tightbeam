@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use tightbeam::transport::state::ClientIdentity;
+use tightbeam::crypto::sign::SigningIdentity;
 use tightbeam::{
 	at_least,
 	colony::servlet::ServletConfig,
@@ -102,7 +102,7 @@ const CLIENT_PINNING: PublicKeyPinning<1> = PublicKeyPinning::new([CLIENT_PUB_KE
 fn make_server_trust_store() -> Result<Arc<dyn CertificateTrust>, TightBeamError> {
 	let server_cert = Certificate::try_from(SERVER_CERT)?;
 	Ok(Arc::new(
-		CertificateTrustBuilder::from(Secp256k1Policy)
+		CertificateTrustBuilder::from(Secp256k1Policy::default())
 			.with_certificate(server_cert)?
 			.build(),
 	))
@@ -181,7 +181,7 @@ tb_scenario! {
 			let key = CLIENT_KEY.to_provider::<Secp256k1>()?;
 			let builder = ClientBuilder::<TokioListener>::builder()
 				.with_trust_store(make_server_trust_store()?)
-				.with_client_identity(ClientIdentity::from_spec(CLIENT_CERT, key)?)
+				.with_client_identity(SigningIdentity::from_spec(CLIENT_CERT, key)?)
 				.build();
 
 			let client = builder.connect(env.addr).await?;
@@ -279,7 +279,7 @@ tb_scenario! {
 			let provider = Arc::new(Secp256k1KeyProvider::from(invalid_key));
 			let builder = ClientBuilder::<TokioListener>::builder()
 				.with_trust_store(make_server_trust_store()?)
-				.with_client_identity(ClientIdentity::from_spec(certificate, provider)?)
+				.with_client_identity(SigningIdentity::from_spec(certificate, provider)?)
 				.build();
 
 			// The pinning server must refuse this identity during the
@@ -341,7 +341,7 @@ tb_scenario! {
 			let key = CLIENT_KEY.to_provider::<Secp256k1>()?;
 			let builder = ClientBuilder::<TokioListener>::builder()
 				.with_trust_store(make_server_trust_store()?)
-				.with_client_identity(ClientIdentity::from_spec(CLIENT_CERT, key)?)
+				.with_client_identity(SigningIdentity::from_spec(CLIENT_CERT, key)?)
 				.build();
 
 			// A successful exchange records `false` and fails the spec,

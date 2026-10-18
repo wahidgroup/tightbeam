@@ -8,16 +8,18 @@
 //! - [`SendCipher`] and [`RecvCipher`] own one direction's counter nonces and its record limit.
 //! - [`SessionKeys`] maps [`DirectionalCiphers`] onto the client or server role.
 
-pub use aead::{Aead, AeadCore, Error, Key, KeyInit, Nonce, Payload};
+pub use aead::{Aead, AeadCore, Error, Key, KeyInit, KeySizeUser, Nonce, Payload};
+
 #[cfg(feature = "aes-gcm")]
 pub use aes_gcm::{Aes128Gcm, Aes256Gcm, Key as Aes256GcmKey, Nonce as Aes256GcmNonce};
-#[cfg(feature = "transport")]
+#[cfg(feature = "aead")]
 pub use aes_kw;
 
 use core::result::Result as CoreResult;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use aead::KeySizeUser;
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, vec::Vec};
 
 use crate::asn1::ObjectIdentifier;
 use crate::constants::{rekey_record_limit, AES_GCM_VOLUME_BYTES_PER_KEY, DEFAULT_REKEY_RECORD_LIMIT};
@@ -29,9 +31,6 @@ use crate::der::Any;
 use crate::error::Result as TbResult;
 use crate::oids::DATA;
 use crate::{AlgorithmIdentifier, EncryptedContentInfo, TightBeamError};
-
-#[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, vec::Vec};
 
 #[cfg(feature = "aes-gcm")]
 mod oid_wrappers {

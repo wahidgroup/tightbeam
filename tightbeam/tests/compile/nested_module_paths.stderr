@@ -34,115 +34,26 @@ note: the module `pool` is defined here
   | mod pool;
   | ^^^^^^^^
 
-error[E0603]: module `enveloped_data` is private
- --> tests/compile/nested_module_paths.rs:8:48
-  |
-8 | use tightbeam::transport::handshake::builders::enveloped_data::TightBeamEnvelopedDataBuilder;
-  |                                                ^^^^^^^^^^^^^^ private module
-  |
-note: the module `enveloped_data` is defined here
- --> src/transport/handshake/builders/mod.rs
-  |
-  | mod enveloped_data;
-  | ^^^^^^^^^^^^^^^^^^
-
-error[E0603]: module `error` is private
- --> tests/compile/nested_module_paths.rs:9:48
-  |
-9 | use tightbeam::transport::handshake::builders::error::KariBuilderError;
-  |                                                ^^^^^ private module
-  |
-note: the module `error` is defined here
- --> src/transport/handshake/builders/mod.rs
-  |
-  | mod error;
-  | ^^^^^^^^^
-help: consider importing this enum instead
-  |
-9 - use tightbeam::transport::handshake::builders::error::KariBuilderError;
-9 + use tightbeam::transport::handshake::KariBuilderError;
-  |
-
-error[E0603]: module `kari` is private
-  --> tests/compile/nested_module_paths.rs:10:48
-   |
-10 | use tightbeam::transport::handshake::builders::kari::TightBeamKariBuilder;
-   |                                                ^^^^ private module
-   |
-note: the module `kari` is defined here
-  --> src/transport/handshake/builders/mod.rs
-   |
-   | mod kari;
-   | ^^^^^^^^
-
-error[E0603]: module `signed_data` is private
-  --> tests/compile/nested_module_paths.rs:11:48
-   |
-11 | use tightbeam::transport::handshake::builders::signed_data::TightBeamSignedDataBuilder;
-   |                                                ^^^^^^^^^^^ private module
-   |
-note: the module `signed_data` is defined here
-  --> src/transport/handshake/builders/mod.rs
-   |
-   | mod signed_data;
-   | ^^^^^^^^^^^^^^^
-
 error[E0603]: module `kdf` is private
-  --> tests/compile/nested_module_paths.rs:12:50
-   |
-12 | use tightbeam::transport::handshake::primitives::kdf::KdfSalt;
-   |                                                  ^^^ private module
-   |
+ --> tests/compile/nested_module_paths.rs:8:50
+  |
+8 | use tightbeam::transport::handshake::primitives::kdf::KdfSalt;
+  |                                                  ^^^ private module
+  |
 note: the module `kdf` is defined here
-  --> src/transport/handshake/primitives/mod.rs
-   |
-   | mod kdf;
-   | ^^^^^^^
+ --> src/transport/handshake/primitives/mod.rs
+  |
+  | mod kdf;
+  | ^^^^^^^
 
 error[E0603]: module `transcript` is private
-  --> tests/compile/nested_module_paths.rs:13:50
-   |
-13 | use tightbeam::transport::handshake::primitives::transcript::transcript_hash;
-   |                                                  ^^^^^^^^^^ private module
-   |
+ --> tests/compile/nested_module_paths.rs:9:50
+  |
+9 | use tightbeam::transport::handshake::primitives::transcript::transcript_hash;
+  |                                                  ^^^^^^^^^^ private module
+  |
 note: the module `transcript` is defined here
-  --> src/transport/handshake/primitives/mod.rs
-   |
-   | pub(crate) mod transcript;
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^
-
-error[E0603]: module `enveloped_data` is private
-  --> tests/compile/nested_module_paths.rs:14:50
-   |
-14 | use tightbeam::transport::handshake::processors::enveloped_data::TightBeamEnvelopedDataProcessor;
-   |                                                  ^^^^^^^^^^^^^^ private module
-   |
-note: the module `enveloped_data` is defined here
-  --> src/transport/handshake/processors/mod.rs
-   |
-   | mod enveloped_data;
-   | ^^^^^^^^^^^^^^^^^^
-
-error[E0603]: module `kari` is private
-  --> tests/compile/nested_module_paths.rs:15:50
-   |
-15 | use tightbeam::transport::handshake::processors::kari::TightBeamKariRecipient;
-   |                                                  ^^^^ private module
-   |
-note: the module `kari` is defined here
-  --> src/transport/handshake/processors/mod.rs
-   |
-   | mod kari;
-   | ^^^^^^^^
-
-error[E0603]: module `signed_data` is private
-  --> tests/compile/nested_module_paths.rs:16:50
-   |
-16 | use tightbeam::transport::handshake::processors::signed_data::TightBeamSignedDataProcessor;
-   |                                                  ^^^^^^^^^^^ private module
-   |
-note: the module `signed_data` is defined here
-  --> src/transport/handshake/processors/mod.rs
-   |
-   | mod signed_data;
-   | ^^^^^^^^^^^^^^^
+ --> src/transport/handshake/primitives/mod.rs
+  |
+  | pub(crate) mod transcript;
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^

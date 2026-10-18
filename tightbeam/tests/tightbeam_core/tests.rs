@@ -14,7 +14,7 @@ use tightbeam::der::ValueOrd;
 use tightbeam::prelude::*;
 use tightbeam::testing::assertions::Presence;
 use tightbeam::testing::macros::{IsNone, IsSome};
-use tightbeam::testing::{ScenarioConfig, SetupEnv};
+use tightbeam::testing::{ScenarioConfig, SetupEnv, TestIdentity};
 use tightbeam::urn::Urn;
 use tightbeam::utils;
 use tightbeam::{exactly, tb_assert_spec, tb_scenario, TightBeamError};
@@ -96,7 +96,7 @@ fn build_version_frame(
 		builder = builder
 			.with_message_hasher::<Sha3_256>([])
 			.with_aead(crypto.cipher.to_owned())
-			.with_signer::<Secp256k1Signature, _>(crypto.signing_key.to_owned());
+			.with_signer::<Secp256k1Signature, _>(TestIdentity::certified(crypto.signing_key.to_owned()));
 	}
 	if version >= asn1::Version::V2 {
 		builder = builder
@@ -206,9 +206,9 @@ tb_scenario! {
 			trace.event_with(ROUNDTRIP_OK, &["v0"], v0_roundtrip == message)?;
 
 			// V1+ signature checks (before decrypt, which consumes the frame)
-			trace.event_with(SIG_VALID, &["v1"], v1_frame.verify::<Secp256k1Signature, Sha3_256>(&crypto.verifying_key).is_ok())?;
-			trace.event_with(SIG_VALID, &["v2"], v2_frame.verify::<Secp256k1Signature, Sha3_256>(&crypto.verifying_key).is_ok())?;
-			trace.event_with(SIG_VALID, &["v3"], v3_frame.verify::<Secp256k1Signature, Sha3_256>(&crypto.verifying_key).is_ok())?;
+			trace.event_with(SIG_VALID, &["v1"], v1_frame.verify::<Secp256k1Signature>(&crypto.verifying_key).is_ok())?;
+			trace.event_with(SIG_VALID, &["v2"], v2_frame.verify::<Secp256k1Signature>(&crypto.verifying_key).is_ok())?;
+			trace.event_with(SIG_VALID, &["v3"], v3_frame.verify::<Secp256k1Signature>(&crypto.verifying_key).is_ok())?;
 
 			// V1+ integrity checks (before decrypt)
 			let v1_integrity = v1_frame.metadata().integrity().ok_or(TightBeamError::MissingDigestInfo)?;

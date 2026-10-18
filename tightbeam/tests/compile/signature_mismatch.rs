@@ -15,6 +15,10 @@ struct OtherSignature;
 impl SignatureAlgorithmIdentifier for OtherSignature {
 	// ecdsa-with-SHA256; differs from tightbeam's SHA3-based secp256k1 OID
 	const ALGORITHM_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
+
+	// The crate exports no SHA-256 that names its OID, so the fixture names
+	// SHA3-256. Only the signature OID is under test.
+	type Digest = Sha3_256;
 }
 
 // Define a profile that expects OtherSignature
@@ -29,6 +33,7 @@ impl SecurityProfile for OtherSignatureProfile {
 	type Kdf = tightbeam::crypto::kdf::HkdfSha3_256;
 	#[cfg(feature = "ecdh")]
 	type Curve = tightbeam::crypto::k256::Secp256k1;
+	type KeyWrapOid = tightbeam::crypto::profiles::Aes256Wrap;
 }
 
 // Create a message with a profile that expects OtherSignature
@@ -41,6 +46,7 @@ struct SignatureMessage {
 fn main() {
 	let message = SignatureMessage { content: "test".to_string() };
 	let signing_key = tightbeam::testing::TestKey::insecure_fixed_signing();
+	let signer = tightbeam::testing::TestIdentity::certified(signing_key);
 
 	// Try to sign with secp256k1 when the profile pins OtherSignature
 	// This should fail to compile with compile-time enforcement
@@ -50,5 +56,5 @@ fn main() {
 		.with_id("test_signature_mismatch")
 		.with_order(1696521600)
 		// ERROR: signature OID mismatch! Should fail to compile
-		.with_signer::<Secp256k1Signature, _>(signing_key);
+		.with_signer::<Secp256k1Signature, _>(signer);
 }

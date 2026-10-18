@@ -84,6 +84,13 @@ pub enum CertificateValidationError {
 	#[error("SKID collision: two certificates share key identifier {skid}")]
 	SkidCollision { skid: String },
 
+	/// Two certificates with different fingerprints hold the same public key.
+	///
+	/// The error carries the colliding SubjectPublicKeyInfo DER in hex, so the
+	/// store entry can be found.
+	#[error("Public key collision: two certificates share SubjectPublicKeyInfo {public_key}")]
+	PublicKeyCollision { public_key: String },
+
 	/// The issuer certificate is not a CA (RFC 5280 §6.1.4(k)).
 	#[error("Issuer certificate is not a CA")]
 	IssuerNotCa,

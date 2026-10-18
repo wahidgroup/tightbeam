@@ -11,12 +11,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use crate::colony::common::{ClusterCommand, ClusterCommandKind, ClusterCommandResponse, IssuedAt, ReplyShape};
+use crate::crypto::sign::VerifiedSignature;
 use crate::crypto::x509::store::{CertificateTrust, TrustVerification};
 use crate::der::Encode;
 use crate::policy::{GatePolicy, ProvenPeer, SessionContext, TransitStatus};
 use crate::utils::time::{Clock, MonotonicInstant, UnixMillis};
 use crate::utils::BasisPoints;
-use crate::{Frame, SignerInfo, TightBeamError};
+use crate::{Frame, TightBeamError};
 
 /// The states of one signer's circuit in a [`ClusterCircuitBreaker`].
 ///
@@ -162,7 +163,6 @@ impl ClusterCircuitBreaker {
 		let Ok(signers) = self.signers.lock() else {
 			return false;
 		};
-
 		let Some(circuit) = signers.get(signer.as_key()) else {
 			return true;
 		};
@@ -195,7 +195,6 @@ impl ClusterCircuitBreaker {
 		let circuit = signers.entry(signer.as_key().to_vec()).or_insert(SignerCircuit::CLOSED);
 		if matches!(circuit.position, Position::HalfOpen) {
 			circuit.position = Position::Open(self.clock.monotonic());
-
 			return;
 		}
 
@@ -246,17 +245,19 @@ impl ClusterCircuitBreaker {
 pub const REPLAY_GUARD_CAPACITY: usize = 1024;
 
 /// Recorded signatures per signer, each with the instant it was recorded.
-type SignerPartitions = HashMap<Vec<u8>, HashMap<Vec<u8>, UnixMillis>>;
+type SignerPartitions = HashMap<Vec<u8>, HashMap<VerifiedSignature, UnixMillis>>;
 
 /// Recorded signatures, partitioned by signer and indexed by signature.
 ///
 /// The partitions hold the per-signer capacity. The index answers "have I
 /// seen this signature" in one lookup, so admission costs the same whether
-/// the colony has one trusted signer or a thousand.
+/// the colony has one trusted signer or a thousand. Each key is a
+/// [`VerifiedSignature`], so a signature and its `(r, n - s)` twin are one
+/// key.
 #[derive(Default)]
 struct SeenSignatures {
 	partitions: SignerPartitions,
-	owner: HashMap<Vec<u8>, Vec<u8>>,
+	owner: HashMap<VerifiedSignature, Vec<u8>>,
 }
 
 impl SeenSignatures {
@@ -265,8 +266,7 @@ impl SeenSignatures {
 	/// The check is read-only, so a verdict can ask without changing what a
 	/// later admission sees. The signer is read through the index without
 	/// copying it.
-	fn is_live(&self, signature: impl AsRef<[u8]>, now: UnixMillis, window: Duration) -> bool {
-		let signature = signature.as_ref();
+	fn is_live(&self, signature: &VerifiedSignature, now: UnixMillis, window: Duration) -> bool {
 		self.owner
 			.get(signature)
 			.and_then(|signer| self.partitions.get(signer.as_slice()))
@@ -280,8 +280,7 @@ impl SeenSignatures {
 	/// A record found past the window is dropped here, so an expired
 	/// signature returns its capacity on the next admission. The signer is
 	/// read through the index without copying it.
-	fn is_live_replay(&mut self, signature: impl AsRef<[u8]>, now: UnixMillis, window: Duration) -> bool {
-		let signature = signature.as_ref();
+	fn is_live_replay(&mut self, signature: &VerifiedSignature, now: UnixMillis, window: Duration) -> bool {
 		if !self.owner.contains_key(signature) {
 			return false;
 		}
@@ -316,18 +315,16 @@ impl SeenSignatures {
 		}
 	}
 
-	fn record(&mut self, signer: impl AsRef<[u8]>, signature: impl AsRef<[u8]>, now: UnixMillis) {
+	fn record(&mut self, signer: impl AsRef<[u8]>, signature: &VerifiedSignature, now: UnixMillis) {
 		let signer = signer.as_ref();
-		let signature = signature.as_ref();
 		self.partitions
 			.entry(signer.to_vec())
 			.or_default()
-			.insert(signature.to_vec(), now);
-		self.owner.insert(signature.to_vec(), signer.to_vec());
+			.insert(signature.clone(), now);
+		self.owner.insert(signature.clone(), signer.to_vec());
 	}
 
-	fn forget(&mut self, signature: impl AsRef<[u8]>) {
-		let signature = signature.as_ref();
+	fn forget(&mut self, signature: &VerifiedSignature) {
 		let Some(signer) = self.owner.remove(signature) else {
 			return;
 		};
@@ -387,8 +384,7 @@ impl ReplayGuard {
 	/// poisoned lock answers `true`, so a verdict fails closed the way an
 	/// admission does.
 	#[must_use]
-	pub fn is_replay(&self, signature: impl AsRef<[u8]>, now: UnixMillis) -> bool {
-		let signature = signature.as_ref();
+	pub fn is_replay(&self, signature: &VerifiedSignature, now: UnixMillis) -> bool {
 		let Ok(seen) = self.seen.lock() else {
 			return true;
 		};
@@ -401,9 +397,8 @@ impl ReplayGuard {
 	/// It returns `true` for a new signature, which it records. It returns
 	/// `false` for a replay, and it fails closed when the signer's partition
 	/// is at capacity or the lock is poisoned.
-	pub fn check_and_insert(&self, signer: impl AsRef<[u8]>, signature: impl AsRef<[u8]>, now: UnixMillis) -> bool {
+	pub fn check_and_insert(&self, signer: impl AsRef<[u8]>, signature: &VerifiedSignature, now: UnixMillis) -> bool {
 		let signer = signer.as_ref();
-		let signature = signature.as_ref();
 		let Ok(mut seen) = self.seen.lock() else {
 			return false;
 		};
@@ -432,8 +427,7 @@ impl ReplayGuard {
 	/// retry of the same signed frame is rejected as a replay until the
 	/// window expires. A poisoned guard admits nothing, so it holds no slot
 	/// to release.
-	pub fn forget(&self, signature: impl AsRef<[u8]>) {
-		let signature = signature.as_ref();
+	pub fn forget(&self, signature: &VerifiedSignature) {
 		let Ok(mut seen) = self.seen.lock() else {
 			return;
 		};
@@ -511,7 +505,7 @@ pub struct GateLimits {
 pub(crate) struct AdmittedCommand {
 	body: ClusterCommandKind,
 	frame: Frame,
-	signer: SignerInfo,
+	signature: VerifiedSignature,
 	replay_guard: Arc<ReplayGuard>,
 }
 
@@ -562,7 +556,7 @@ impl AdmittedCommand {
 	/// Releases the replay slot this command's signature spent, so a signed
 	/// retry of the same frame is admitted again.
 	fn forget_replay(&self) {
-		self.replay_guard.forget(self.signer.signature.as_bytes());
+		self.replay_guard.forget(&self.signature);
 	}
 }
 
@@ -662,7 +656,7 @@ impl AdmitRefusal {
 /// The gate holds it between [`ClusterSecurityGate::inspect`] and the steps
 /// that spend, so the spending steps read what the checks already derived.
 struct Authenticated<'a> {
-	signer: SignerInfo,
+	signature: VerifiedSignature,
 	signer_id: Vec<u8>,
 	breaker_key: ProvenPeer<'a>,
 }
@@ -724,7 +718,7 @@ impl ClusterSecurityGate {
 		session: &'a SessionContext,
 		now: UnixMillis,
 	) -> Result<Authenticated<'a>, InspectRefusal> {
-		let Some(signer) = frame.nonrepudiation().cloned() else {
+		let Some(signer) = frame.nonrepudiation() else {
 			return Err(InspectRefusal::Plain(TransitStatus::Unauthenticated));
 		};
 
@@ -749,7 +743,9 @@ impl ClusterSecurityGate {
 			return Err(InspectRefusal::Plain(TransitStatus::PermissionDenied));
 		}
 
-		match self.trust_store.verify_frame(frame) {
+		// The verified signature is the replay key, in its canonical form, so
+		// a capture with `s` flipped to `n - s` keys the slot it already spent.
+		let signature = match self.trust_store.verify_frame(frame) {
 			TrustVerification::MissingSignature => {
 				return Err(InspectRefusal::Plain(TransitStatus::Unauthenticated));
 			}
@@ -757,19 +753,19 @@ impl ClusterSecurityGate {
 				return Err(InspectRefusal::Plain(TransitStatus::PermissionDenied));
 			}
 			TrustVerification::Invalid => return Err(InspectRefusal::BadSignature),
-			TrustVerification::Verified(_) => {}
-		}
+			TrustVerification::Verified(_, signature) => signature,
+		};
 
 		// Freshness and replay are checked here so a verdict refuses a
 		// captured frame (CWE-294). The slot itself is spent in `admit`.
 		if !self.replay_guard.is_fresh(frame.issued_at(), now) {
 			return Err(InspectRefusal::Plain(TransitStatus::PermissionDenied));
 		}
-		if self.replay_guard.is_replay(signer.signature.as_bytes(), now) {
+		if self.replay_guard.is_replay(&signature, now) {
 			return Err(InspectRefusal::Plain(TransitStatus::PermissionDenied));
 		}
 
-		Ok(Authenticated { signer, signer_id, breaker_key })
+		Ok(Authenticated { signature, signer_id, breaker_key })
 	}
 
 	/// Authenticates `frame`, decodes its cluster command once, and spends
@@ -807,8 +803,8 @@ impl ClusterSecurityGate {
 			return Err(AdmitRefusal::boxed(frame, TransitStatus::InvalidArgument, shape));
 		};
 
-		let Authenticated { signer, signer_id, breaker_key } = authenticated;
-		if !self.replay_guard.check_and_insert(&signer_id, signer.signature.as_bytes(), now) {
+		let Authenticated { signature, signer_id, breaker_key } = authenticated;
+		if !self.replay_guard.check_and_insert(&signer_id, &signature, now) {
 			return Err(AdmitRefusal::boxed(frame, TransitStatus::PermissionDenied, shape));
 		}
 
@@ -818,14 +814,14 @@ impl ClusterSecurityGate {
 		if !self.circuit_breaker.admit_request(breaker_key) {
 			// This frame is not admitted, so its signature must not count
 			// as seen: a legitimate retry would be refused as a replay.
-			self.replay_guard.forget(signer.signature.as_bytes());
+			self.replay_guard.forget(&signature);
 			return Err(AdmitRefusal::boxed(frame, TransitStatus::PermissionDenied, shape));
 		}
 
 		self.circuit_breaker.record_success(breaker_key);
 
 		let replay_guard = Arc::clone(&self.replay_guard);
-		Ok(AdmittedCommand { body, frame, signer, replay_guard })
+		Ok(AdmittedCommand { body, frame, signature, replay_guard })
 	}
 }
 
@@ -1001,14 +997,18 @@ mod tests {
 	use crate::cms::signed_data::SignerIdentifier;
 	use crate::colony::common::{ClusterStatus, HeartbeatParams};
 	use crate::crypto::hash::Sha3_256;
-	use crate::crypto::key::{EcdsaKeyProvider, Secp256k1KeyProvider};
-	use crate::crypto::policy::VerificationPolicy;
+	use crate::crypto::policy::{Secp256k1Policy, VerificationPolicy};
+	use crate::crypto::sign::ecdsa::{Secp256k1, Secp256k1Signature, Signature};
+	use crate::crypto::sign::{PrehashVerifier, SigningIdentity};
 	use crate::crypto::x509::error::CertificateValidationError;
 	use crate::crypto::x509::policy::CertificateValidation;
+	use crate::crypto::x509::store::{CertificateTrustBuilder, TrustBuilder};
 	use crate::crypto::x509::Certificate;
 	use crate::der::asn1::ObjectIdentifier;
+	use crate::spki::SubjectPublicKeyInfoOwned;
 	use crate::tb_cases;
-	use crate::testing::fixtures::{TestCertificate, TestKey};
+	use crate::testing::fixtures::TestIdentity;
+	use crate::testing::TestFrame;
 	use crate::testing::TestMessage;
 	use crate::utils::time::ManualClock;
 	use crate::{MessagePriority, Version};
@@ -1088,11 +1088,35 @@ mod tests {
 		frame.signer_id().expect("the signed frame carries a signer id")
 	}
 
+	/// A verifier that accepts every signature, so a test reaches a
+	/// [`VerifiedSignature`] of any canonical value through the one producer.
+	struct AcceptAll;
+
+	impl PrehashVerifier<Secp256k1Signature> for AcceptAll {
+		fn verify_prehash(&self, _prehash: &[u8], _signature: &Secp256k1Signature) -> Result<(), signature::Error> {
+			Ok(())
+		}
+	}
+
+	/// A low-s signature value distinct for each `index`, as [`AcceptAll`]
+	/// verifies it.
+	fn accepted(index: usize) -> VerifiedSignature {
+		let mut r = [0u8; 32];
+		r[24..].copy_from_slice(&(index as u64 + 1).to_be_bytes());
+		let mut s = [0u8; 32];
+		s[31] = 1;
+
+		let scalars = Signature::<Secp256k1>::from_scalars(r, s).expect("small scalars are in range");
+		let encoded = scalars.to_der();
+		let verifying = VerifiedSignature::verify::<Secp256k1Signature, _>(&AcceptAll, [0u8; 32], encoded.as_bytes());
+		verifying.expect("the test verifier accepts every canonical value")
+	}
+
 	/// Fills `signer`'s replay partition to capacity at `now`.
 	fn fill_replay_partition(gate: &ClusterSecurityGate, signer: impl AsRef<[u8]>, now: UnixMillis) {
 		let signer = signer.as_ref();
-		let filled = (0..REPLAY_GUARD_CAPACITY)
-			.all(|index| gate.replay_guard.check_and_insert(signer, index.to_be_bytes(), now));
+		let filled =
+			(0..REPLAY_GUARD_CAPACITY).all(|index| gate.replay_guard.check_and_insert(signer, &accepted(index), now));
 
 		assert!(filled, "the partition takes every filler up to capacity");
 	}
@@ -1184,48 +1208,48 @@ mod tests {
 	#[test]
 	fn replay_guard_accepts_first_rejects_second() {
 		let guard = ReplayGuard::new(Duration::from_millis(30_000));
-		assert!(guard.check_and_insert(b"signer-1", b"sig-a", UnixMillis::new(1_000)));
-		assert!(!guard.check_and_insert(b"signer-1", b"sig-a", UnixMillis::new(2_000)));
-		assert!(guard.check_and_insert(b"signer-1", b"sig-b", UnixMillis::new(2_000)));
+		assert!(guard.check_and_insert(b"signer-1", &accepted(1), UnixMillis::new(1_000)));
+		assert!(!guard.check_and_insert(b"signer-1", &accepted(1), UnixMillis::new(2_000)));
+		assert!(guard.check_and_insert(b"signer-1", &accepted(2), UnixMillis::new(2_000)));
 	}
 
 	#[test]
 	fn replay_guard_prunes_expired_entries() {
 		let guard = ReplayGuard::new(Duration::from_millis(1_000));
-		assert!(guard.check_and_insert(b"signer-1", b"sig-a", UnixMillis::new(1_000)));
-		assert!(guard.check_and_insert(b"signer-1", b"sig-a", UnixMillis::new(3_000)));
+		assert!(guard.check_and_insert(b"signer-1", &accepted(1), UnixMillis::new(1_000)));
+		assert!(guard.check_and_insert(b"signer-1", &accepted(1), UnixMillis::new(3_000)));
 	}
 
 	#[test]
 	fn replay_guard_prunes_future_dated_entries_after_clock_regression() {
 		let guard = ReplayGuard::new(Duration::from_millis(1_000));
-		assert!(guard.check_and_insert(b"signer-1", b"sig-a", UnixMillis::new(10_000)));
-		assert!(guard.check_and_insert(b"signer-1", b"sig-a", UnixMillis::new(5_000)));
+		assert!(guard.check_and_insert(b"signer-1", &accepted(1), UnixMillis::new(10_000)));
+		assert!(guard.check_and_insert(b"signer-1", &accepted(1), UnixMillis::new(5_000)));
 	}
 
 	#[test]
 	fn replay_guard_saturated_signer_does_not_block_others() {
 		let guard = ReplayGuard::new(Duration::from_millis(30_000));
 		let seeded = (0..REPLAY_GUARD_CAPACITY)
-			.all(|i| guard.check_and_insert(b"signer-1", i.to_be_bytes(), UnixMillis::new(1_000)));
+			.all(|i| guard.check_and_insert(b"signer-1", &accepted(i + 10), UnixMillis::new(1_000)));
 		assert!(seeded);
-		assert!(!guard.check_and_insert(b"signer-1", b"sig-overflow", UnixMillis::new(1_000)));
-		assert!(guard.check_and_insert(b"signer-2", b"sig-a", UnixMillis::new(1_000)));
+		assert!(!guard.check_and_insert(b"signer-1", &accepted(REPLAY_GUARD_CAPACITY + 1), UnixMillis::new(1_000)));
+		assert!(guard.check_and_insert(b"signer-2", &accepted(1), UnixMillis::new(1_000)));
 	}
 
 	#[test]
 	fn replay_guard_rejects_replay_across_signer_partitions() {
 		let guard = ReplayGuard::new(Duration::from_millis(30_000));
-		assert!(guard.check_and_insert(b"signer-1", b"sig-a", UnixMillis::new(1_000)));
-		assert!(!guard.check_and_insert(b"signer-2", b"sig-a", UnixMillis::new(1_000)));
+		assert!(guard.check_and_insert(b"signer-1", &accepted(1), UnixMillis::new(1_000)));
+		assert!(!guard.check_and_insert(b"signer-2", &accepted(1), UnixMillis::new(1_000)));
 	}
 
 	#[test]
 	fn replay_guard_forget_permits_retry() {
 		let guard = ReplayGuard::new(Duration::from_millis(30_000));
-		assert!(guard.check_and_insert(b"signer-1", b"sig-a", UnixMillis::new(1_000)));
-		guard.forget(b"sig-a");
-		assert!(guard.check_and_insert(b"signer-1", b"sig-a", UnixMillis::new(2_000)));
+		assert!(guard.check_and_insert(b"signer-1", &accepted(1), UnixMillis::new(1_000)));
+		guard.forget(&accepted(1));
+		assert!(guard.check_and_insert(b"signer-1", &accepted(1), UnixMillis::new(2_000)));
 	}
 
 	#[test]
@@ -1346,8 +1370,17 @@ mod tests {
 			_public_key_der: &[u8],
 			_message: &[u8],
 			_signature: &[u8],
-		) -> Result<(), CertificateValidationError> {
+		) -> Result<VerifiedSignature, CertificateValidationError> {
 			Err(CertificateValidationError::SignatureVerificationFailed(signature::Error::new()))
+		}
+
+		fn digest(
+			&self,
+			signature: &ObjectIdentifier,
+			digest: &ObjectIdentifier,
+			content: &[u8],
+		) -> Result<Vec<u8>, CertificateValidationError> {
+			Secp256k1Policy::default().digest(signature, digest, content)
 		}
 	}
 
@@ -1361,6 +1394,10 @@ mod tests {
 		}
 
 		fn find_by_signer_identifier(&self, _sid: &SignerIdentifier) -> Option<&Certificate> {
+			Some(&self.certificate)
+		}
+
+		fn find_by_public_key(&self, _spki: &SubjectPublicKeyInfoOwned) -> Option<&Certificate> {
 			Some(&self.certificate)
 		}
 
@@ -1388,9 +1425,20 @@ mod tests {
 			_algorithm: &ObjectIdentifier,
 			_public_key_der: &[u8],
 			_message: &[u8],
-			_signature: &[u8],
-		) -> Result<(), CertificateValidationError> {
-			Ok(())
+			signature: &[u8],
+		) -> Result<VerifiedSignature, CertificateValidationError> {
+			Ok(VerifiedSignature::verify::<Secp256k1Signature, _>(
+				&AcceptAll, [0u8; 32], signature,
+			)?)
+		}
+
+		fn digest(
+			&self,
+			signature: &ObjectIdentifier,
+			digest: &ObjectIdentifier,
+			content: &[u8],
+		) -> Result<Vec<u8>, CertificateValidationError> {
+			Secp256k1Policy::default().digest(signature, digest, content)
 		}
 	}
 
@@ -1407,13 +1455,17 @@ mod tests {
 			Some(&self.certificate)
 		}
 
+		fn find_by_public_key(&self, _spki: &SubjectPublicKeyInfoOwned) -> Option<&Certificate> {
+			Some(&self.certificate)
+		}
+
 		fn to_policy_ref(&self) -> &dyn VerificationPolicy {
 			self
 		}
 	}
 
 	/// A signed heartbeat issued at `clock`'s current instant.
-	async fn signed_heartbeat(clock: &ManualClock, provider: &Secp256k1KeyProvider) -> Result<Frame, TightBeamError> {
+	async fn signed_heartbeat(clock: &ManualClock, identity: &SigningIdentity) -> Result<Frame, TightBeamError> {
 		let probe = ClusterCommandKind::Heartbeat(HeartbeatParams { cluster_status: ClusterStatus::Healthy });
 		let mut signed = Version::V2
 			.compose()
@@ -1422,8 +1474,7 @@ mod tests {
 			.with_message(ClusterCommand::from(probe))
 			.with_witness_hasher::<Sha3_256>()
 			.build()?;
-		signed.sign_with_provider::<Sha3_256, _>(provider).await?;
-
+		signed.sign_with_provider(identity).await?;
 		Ok(signed)
 	}
 
@@ -1442,10 +1493,9 @@ mod tests {
 	/// [`VerifiedGate`] under `limits`.
 	async fn verified_gate_with(limits: GateLimits) -> Result<VerifiedGate, TightBeamError> {
 		let clock = manual_clock();
-		let signing_key = TestKey::insecure_fixed_signing();
-		let certificate = TestCertificate::self_signed(&signing_key);
-		let provider = Secp256k1KeyProvider::from(signing_key);
-		let signed = signed_heartbeat(&clock, &provider).await?;
+		let identity = TestIdentity::insecure_fixed();
+		let certificate = identity.certificate().clone();
+		let signed = signed_heartbeat(&clock, &identity).await?;
 		let trust_store = Arc::new(AlwaysVerified { certificate: certificate.clone() });
 		let gate = ClusterSecurityGate::new(trust_store, limits, erased(&clock));
 		let sender = SessionContext::for_peer(Arc::new(certificate));
@@ -1479,6 +1529,41 @@ mod tests {
 		Ok(())
 	}
 
+	/// A captured command replayed with its signature's `s` flipped to
+	/// `n - s` verifies under a real trust store (SEC 1 v2.0 §4.1.4), to the
+	/// value its original verifies to. The gate refuses it as a replay, not as
+	/// a forgery, because both forms key one replay slot.
+	#[tokio::test]
+	async fn a_command_replayed_with_its_s_flipped_is_refused() -> Result<(), TightBeamError> {
+		let clock = manual_clock();
+		let identity = TestIdentity::insecure_fixed();
+		let certificate = identity.certificate().clone();
+		let store = CertificateTrustBuilder::from(Secp256k1Policy::default())
+			.with_certificate(certificate.clone())?
+			.build();
+
+		let store = Arc::new(store);
+		let gate = ClusterSecurityGate::new(Arc::clone(&store) as Arc<dyn CertificateTrust>, limits(), erased(&clock));
+		let sender = SessionContext::for_peer(Arc::new(certificate));
+		let signed = signed_heartbeat(&clock, &identity).await?;
+		let flipped = TestFrame::with_flipped_s(&signed);
+		let original = store.verify_frame(&signed);
+		let twin = store.verify_frame(&flipped);
+		let admitted = gate.admit(signed, &sender).is_ok();
+		let inspected = gate.inspect(&flipped, &sender, clock.unix()).err();
+		let replayed = gate.admit(flipped, &sender).err().map(|refusal| refusal.status());
+
+		let verified = (original, twin);
+		assert!(matches!(verified, (TrustVerification::Verified(_, a), TrustVerification::Verified(_, b)) if a == b));
+		assert!(admitted);
+		assert!(matches!(
+			inspected,
+			Some(InspectRefusal::Plain(TransitStatus::PermissionDenied))
+		));
+		assert_eq!(replayed, Some(TransitStatus::PermissionDenied));
+		Ok(())
+	}
+
 	/// A verdict leaves a tripped breaker's one cooldown probe for the
 	/// admission to take. Spending it on a question parks the circuit
 	/// half-open with no outcome recorded, and half-open admits every
@@ -1490,13 +1575,12 @@ mod tests {
 		let breaker_key = || ProvenPeer::for_test(&peer_key);
 
 		gate.circuit_breaker.record_auth_failure(breaker_key());
-		assert!(gate.circuit_breaker.is_open(breaker_key()));
 
+		assert!(gate.circuit_breaker.is_open(breaker_key()));
 		// The cooldown has expired, so the verdict admits. It must not be
 		// the one that spends the probe.
 		assert_eq!(gate.evaluate(Some(&signed), &sender), TransitStatus::Ok);
 		assert!(gate.circuit_breaker.is_open(breaker_key()));
-
 		assert!(gate.admit(signed, &sender).is_ok());
 		assert!(!gate.circuit_breaker.is_open(breaker_key()));
 
@@ -1515,6 +1599,7 @@ mod tests {
 		let breaker_key = || ProvenPeer::for_test(&peer_key);
 
 		gate.circuit_breaker.record_auth_failure(breaker_key());
+
 		assert!(gate.circuit_breaker.is_open(breaker_key()));
 
 		// Fill this signer's replay partition, so the admission refuses
@@ -1522,7 +1607,6 @@ mod tests {
 		fill_replay_partition(&gate, signer_id(&signed), clock.unix());
 
 		let refusal = gate.admit(signed, &sender).err().map(|refusal| refusal.status());
-
 		assert_eq!(refusal, Some(TransitStatus::PermissionDenied));
 		assert!(gate.circuit_breaker.is_open(breaker_key()));
 		Ok(())
@@ -1556,9 +1640,8 @@ mod tests {
 	#[tokio::test]
 	async fn a_forged_signer_id_gates_the_sender_not_the_signer() -> Result<(), TightBeamError> {
 		let clock = manual_clock();
-		let signing_key = TestKey::insecure_fixed_signing();
-		let certificate = TestCertificate::self_signed(&signing_key);
-		let provider = EcdsaKeyProvider::from(signing_key.clone());
+		let identity = TestIdentity::insecure_fixed();
+		let certificate = identity.certificate().clone();
 
 		let mut signed = Version::V2
 			.compose()
@@ -1567,7 +1650,7 @@ mod tests {
 			.with_message(TestMessage { content: "payload".into() })
 			.with_witness_hasher::<Sha3_256>()
 			.build()?;
-		signed.sign_with_provider::<Sha3_256, _>(&provider).await?;
+		signed.sign_with_provider(&identity).await?;
 
 		let signer_id = signer_id(&signed);
 		let trust_store = Arc::new(AlwaysInvalid { certificate: certificate.clone() });
@@ -1593,7 +1676,6 @@ mod tests {
 	#[test]
 	fn a_tripped_signer_does_not_gate_another() {
 		let breaker = tripped_breaker();
-
 		assert!(breaker.is_open(signer()));
 		assert!(!breaker.admit_request(signer()));
 		assert!(breaker.admit_request(other()));
@@ -1606,8 +1688,8 @@ mod tests {
 		const OTHER: &[u8] = b"other-signer";
 
 		let guard = ReplayGuard::new(Duration::from_millis(60_000));
-		assert!(guard.check_and_insert(SIGNER, b"signature", UnixMillis::new(1_000)));
-		assert!(!guard.check_and_insert(OTHER, b"signature", UnixMillis::new(1_000)));
+		assert!(guard.check_and_insert(SIGNER, &accepted(1), UnixMillis::new(1_000)));
+		assert!(!guard.check_and_insert(OTHER, &accepted(1), UnixMillis::new(1_000)));
 	}
 
 	/// An expired record frees its capacity and admits the same signature
@@ -1615,8 +1697,8 @@ mod tests {
 	#[test]
 	fn an_expired_record_is_admitted_again() {
 		let guard = ReplayGuard::new(Duration::from_millis(1_000));
-		assert!(guard.check_and_insert(SIGNER, b"signature", UnixMillis::new(1_000)));
-		assert!(guard.check_and_insert(SIGNER, b"signature", UnixMillis::new(5_000)));
+		assert!(guard.check_and_insert(SIGNER, &accepted(1), UnixMillis::new(1_000)));
+		assert!(guard.check_and_insert(SIGNER, &accepted(1), UnixMillis::new(5_000)));
 	}
 
 	// A refusal releases the replay slot only where a retry of the same

@@ -28,6 +28,7 @@ use crate::transport::error::TransportError;
 mod multiplex {
 	pub use crate::cms::signed_data::SignerInfo;
 	pub use crate::constants::{DEFAULT_HOP_BUDGET, EC_PUBKEY_COMPRESSED_SIZE};
+	pub use crate::crypto::sign::Signed;
 	pub use crate::der::asn1::OctetString;
 	pub use crate::der::Enumerated;
 	pub use crate::der::Sequence;
@@ -38,9 +39,8 @@ mod multiplex {
 #[cfg(feature = "transport-multiplex")]
 use multiplex::*;
 
-use crate::cms::encrypted_data::EncryptedData;
-use crate::cms::enveloped_data::EnvelopedData;
 use crate::cms::signed_data::SignedData;
+use crate::crypto::cms::AuthEnvelopedData;
 use crate::transport::handshake::ClientKeyExchange;
 use crate::transport::wire_der::WireDer;
 
@@ -721,7 +721,7 @@ impl MuxRekeyRequestPackage {
 pub struct MuxRekeyResponsePackage {
 	pub(crate) server_random: OctetString,
 	pub(crate) server_ephemeral: OctetString,
-	pub(crate) epoch_receipt: Option<Box<SignedData>>,
+	pub(crate) epoch_receipt: Option<Box<Signed<SignedData>>>,
 }
 
 #[cfg(feature = "transport-multiplex")]
@@ -735,7 +735,7 @@ impl MuxRekeyResponsePackage {
 	pub fn new(
 		server_random: impl Into<Vec<u8>>,
 		server_ephemeral: &[u8; EC_PUBKEY_COMPRESSED_SIZE],
-		epoch_receipt: Option<SignedData>,
+		epoch_receipt: Option<Signed<SignedData>>,
 	) -> DerResult<Self> {
 		let server_random = OctetString::new(server_random)?;
 		let server_ephemeral = OctetString::new(server_ephemeral.as_slice())?;
@@ -755,7 +755,7 @@ impl MuxRekeyResponsePackage {
 
 	/// The server-signed epoch receipt, which a budget-bearing session
 	/// requires.
-	pub fn epoch_receipt(&self) -> Option<&SignedData> {
+	pub fn epoch_receipt(&self) -> Option<&Signed<SignedData>> {
 		self.epoch_receipt.as_deref()
 	}
 }
@@ -766,19 +766,19 @@ impl MuxRekeyResponsePackage {
 #[cfg(feature = "transport-multiplex")]
 #[derive(Sequence, Debug, Clone, PartialEq)]
 pub struct MuxRekeyAckPackage {
-	pub(crate) countersignature: Option<Box<SignerInfo>>,
+	pub(crate) countersignature: Option<Box<Signed<SignerInfo>>>,
 }
 
 #[cfg(feature = "transport-multiplex")]
 impl MuxRekeyAckPackage {
 	/// An acknowledgement that carries the client countersignature, if any.
-	pub fn new(countersignature: Option<SignerInfo>) -> Self {
+	pub fn new(countersignature: Option<Signed<SignerInfo>>) -> Self {
 		Self { countersignature: countersignature.map(Box::new) }
 	}
 
 	/// The client `SignerInfo` that completes the dual-signed epoch receipt,
 	/// present when the response carried a receipt.
-	pub fn countersignature(&self) -> Option<&SignerInfo> {
+	pub fn countersignature(&self) -> Option<&Signed<SignerInfo>> {
 		self.countersignature.as_deref()
 	}
 }
@@ -868,20 +868,19 @@ pub enum TransportEnvelope {
 	/// The response to a single-flight request.
 	#[asn1(context_specific = "1", constructed = "true")]
 	Response(ResponsePackage),
-	/// A key-transport handshake container, kept with the bytes that
-	/// carried it.
-	#[asn1(context_specific = "2", constructed = "true")]
-	EnvelopedData(Box<WireDer<EnvelopedData>>),
+	// Tag 2 is reserved for the retired `EnvelopedData` container, and tag 5
+	// for the retired `EncryptedData` container. Neither is reused, so an
+	// archived capture never decodes a stale meaning.
 	/// A signed handshake container, kept with the bytes that carried it.
 	#[asn1(context_specific = "3", constructed = "true")]
 	SignedData(Box<WireDer<SignedData>>),
-	/// A handshake container sealed under a key the handshake derived, kept
-	/// with the bytes that carried it.
-	#[asn1(context_specific = "5", constructed = "true")]
-	EncryptedData(Box<WireDer<EncryptedData>>),
 	/// The closing of an HPKE handshake, kept with the bytes that carried it.
 	#[asn1(context_specific = "6", constructed = "true")]
 	ClientKeyExchange(Box<WireDer<ClientKeyExchange>>),
+	/// An authenticated-enveloped handshake container, kept with the bytes
+	/// that carried it.
+	#[asn1(context_specific = "7", constructed = "true")]
+	AuthEnvelopedData(Box<WireDer<AuthEnvelopedData>>),
 	/// A multiplexing message.
 	#[cfg(feature = "transport-multiplex")]
 	#[asn1(context_specific = "4", constructed = "true")]
@@ -1242,57 +1241,29 @@ mod tests {
 		])
 	}
 
-	/// A structurally valid `SignerInfo` for encoding round trips. The
-	/// signature bytes are arbitrary, because envelope tests exercise encoding
-	/// and skip verification.
+	/// A `SignerInfo` the CMS signer made over an epoch receipt body, for
+	/// encoding round trips.
 	#[cfg(feature = "transport-multiplex")]
-	fn sample_signer_info() -> Result<SignerInfo, Box<dyn Error>> {
-		use crate::cms::cert::x509::ext::pkix::SubjectKeyIdentifier;
-		use crate::cms::signed_data::SignerIdentifier;
-		use crate::crypto::sign::SignerInfoExt;
-		use crate::oids::{HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA3_256};
-		use crate::spki::AlgorithmIdentifierOwned;
+	fn sample_signer_info() -> Result<Signed<SignerInfo>, Box<dyn Error>> {
+		use crate::crypto::sign::ecdsa::Secp256k1Signature;
+		use crate::crypto::sign::{CmsSigner, SignedContent};
+		use crate::oids::SESSION_RECEIPT_CONTENT;
+		use crate::testing::{TestIdentity, TestKey};
 
-		let skid_octet = OctetString::new([0xAB; 20])?;
-		let skid = SubjectKeyIdentifier::from(skid_octet);
-		let signer = SignerInfo::from_parts(
-			[0xCD; 64],
-			AlgorithmIdentifierOwned { oid: SIGNER_ECDSA_WITH_SHA3_256, parameters: None },
-			AlgorithmIdentifierOwned { oid: HASH_SHA3_256, parameters: None },
-			SignerIdentifier::SubjectKeyIdentifier(skid),
-		)?;
-		Ok(signer)
+		let key = TestIdentity::certified(TestKey::insecure_fixed_signing());
+		let content = SignedContent::new(SESSION_RECEIPT_CONTENT, b"epoch-receipt-body");
+		Ok(CmsSigner::sign_with::<Secp256k1Signature, _>(&key, content)?)
 	}
 
-	/// A structurally valid single-signer `SignedData` for encoding round
-	/// trips.
+	/// A single-signer `SignedData` the CMS signer assembled, for encoding
+	/// round trips.
 	#[cfg(feature = "transport-multiplex")]
-	fn sample_signed_data() -> Result<SignedData, Box<dyn Error>> {
-		use crate::cms::content_info::CmsVersion;
-		use crate::cms::signed_data::{EncapsulatedContentInfo, SignerInfos};
-		use crate::der::asn1::SetOfVec;
-		use crate::der::Any;
-		use crate::oids::{HASH_SHA3_256, SESSION_RECEIPT_CONTENT};
-		use crate::spki::AlgorithmIdentifierOwned;
+	fn sample_signed_data() -> Result<Signed<SignedData>, Box<dyn Error>> {
+		use crate::crypto::sign::{CmsSigner, SignedContent};
+		use crate::oids::SESSION_RECEIPT_CONTENT;
 
-		let body_der = OctetString::new(b"epoch-receipt-body".as_slice())?.to_der()?;
-		let econtent = Any::from_der(&body_der)?;
-		let algorithm_identifier = AlgorithmIdentifierOwned { oid: HASH_SHA3_256, parameters: None };
-		let digest_algorithms = SetOfVec::try_from(vec![algorithm_identifier])?;
-		let signer_infos = SignerInfos(SetOfVec::try_from(vec![sample_signer_info()?])?);
-
-		let artifact = SignedData {
-			version: CmsVersion::V3,
-			digest_algorithms,
-			encap_content_info: EncapsulatedContentInfo {
-				econtent_type: SESSION_RECEIPT_CONTENT,
-				econtent: Some(econtent),
-			},
-			certificates: None,
-			crls: None,
-			signer_infos,
-		};
-		Ok(artifact)
+		let content = SignedContent::new(SESSION_RECEIPT_CONTENT, b"epoch-receipt-body");
+		Ok(CmsSigner::signed_data(content, sample_signer_info()?, None)?)
 	}
 
 	#[cfg(feature = "transport-multiplex")]
@@ -1442,24 +1413,31 @@ mod tests {
 		])
 	}
 
-	/// A sealed handshake container travels under context tag 5 of the
-	/// transport envelope.
+	/// An authenticated-enveloped handshake container travels under context
+	/// tag 7 of the transport envelope.
 	#[test]
-	fn a_sealed_handshake_container_travels_under_tag_5() -> Result<(), Box<dyn Error>> {
+	fn an_authenticated_envelope_travels_under_tag_7() -> Result<(), Box<dyn Error>> {
 		use crate::asn1::OctetString;
 		use crate::cms::content_info::CmsVersion;
-		use crate::cms::enveloped_data::EncryptedContentInfo;
-		use crate::oids::{AES_256_GCM, SIGNED_DATA};
+		use crate::cms::enveloped_data::{EncryptedContentInfo, RecipientInfos};
+		use crate::oids::{AES_256_GCM, DATA};
 		use crate::spki::AlgorithmIdentifierOwned;
 
 		let algorithm = AlgorithmIdentifierOwned { oid: AES_256_GCM, parameters: None };
-		let encrypted_content = Some(OctetString::new([0u8; 16])?);
-		let info = EncryptedContentInfo { content_type: SIGNED_DATA, content_enc_alg: algorithm, encrypted_content };
-		let sealed = EncryptedData { version: CmsVersion::V0, enc_content_info: info, unprotected_attrs: None };
-		let envelope = TransportEnvelope::EncryptedData(Box::new(WireDer::new(sealed)?));
+		let info = EncryptedContentInfo { content_type: DATA, content_enc_alg: algorithm, encrypted_content: None };
+		let sealed = AuthEnvelopedData {
+			version: CmsVersion::V0,
+			originator_info: None,
+			recipient_infos: RecipientInfos::default(),
+			auth_encrypted_content_info: info,
+			auth_attrs: None,
+			mac: OctetString::new([0u8; 16])?,
+			unauth_attrs: None,
+		};
 
+		let envelope = TransportEnvelope::AuthEnvelopedData(Box::new(WireDer::new(sealed)?));
 		let encoded = envelope.to_der()?;
-		assert_eq!(encoded.first(), Some(&0xA5));
+		assert_eq!(encoded.first(), Some(&0xA7));
 		Ok(())
 	}
 

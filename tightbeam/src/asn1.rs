@@ -5,10 +5,9 @@ pub use crate::cms::enveloped_data::EncryptedContentInfo;
 pub use crate::cms::signed_data::{EncapsulatedContentInfo, SignerInfo};
 pub use crate::der::asn1::{Any, BitString, ObjectIdentifier, OctetString};
 pub use crate::der::{Choice, Enumerated, Sequence};
-pub use crate::spki::{AlgorithmIdentifier, AlgorithmIdentifierOwned};
-pub use pkcs12::digest_info::DigestInfo;
-
 pub use crate::frame::{BodyTransform, Frame, Metadata};
+pub use crate::pkcs12::digest_info::DigestInfo;
+pub use crate::spki::{AlgorithmIdentifier, AlgorithmIdentifierOwned};
 pub use crate::version::GatedField;
 
 /// Protocol version determines metadata structure and features

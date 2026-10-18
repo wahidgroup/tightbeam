@@ -1,20 +1,20 @@
-error[E0277]: the trait bound `SignatureMessage: CheckSignatureOid<tightbeam::crypto::sign::ecdsa::Signature<Secp256k1>>` is not satisfied
-  --> tests/compile/signature_mismatch.rs:53:4
+error[E0277]: the trait bound `SignatureMessage: CheckSignatureOid<tightbeam::crypto::sign::ecdsa::der::Signature<Secp256k1>>` is not satisfied
+  --> tests/compile/signature_mismatch.rs:59:4
    |
-53 |         .with_signer::<Secp256k1Signature, _>(signing_key);
+59 |         .with_signer::<Secp256k1Signature, _>(signer);
    |          ^^^^^^^^^^^ unsatisfied trait bound
    |
-help: the trait `CheckSignatureOid<tightbeam::crypto::sign::ecdsa::Signature<Secp256k1>>` is not implemented for `SignatureMessage`
+help: the trait `CheckSignatureOid<tightbeam::crypto::sign::ecdsa::der::Signature<Secp256k1>>` is not implemented for `SignatureMessage`
       but trait `CheckSignatureOid<OtherSignature>` is implemented for it
-  --> tests/compile/signature_mismatch.rs:35:10
+  --> tests/compile/signature_mismatch.rs:40:10
    |
-35 | #[derive(Beamable, Clone, Debug, PartialEq, Sequence)]
+40 | #[derive(Beamable, Clone, Debug, PartialEq, Sequence)]
    |          ^^^^^^^^
-   = help: for that trait implementation, expected `OtherSignature`, found `tightbeam::crypto::sign::ecdsa::Signature<Secp256k1>`
+   = help: for that trait implementation, expected `OtherSignature`, found `tightbeam::crypto::sign::ecdsa::der::Signature<Secp256k1>`
 note: required by a bound in `FrameBuilder::<T>::with_signer`
   --> src/builder/frame.rs
    |
-   |     pub fn with_signer<S, X>(mut self, signer: X) -> Self
+   |     pub fn with_signer<S, X>(mut self, signer: CertifiedKey<X>) -> Self
    |            ----------- required by a bound in this associated function
 ...
    |         T: CheckSignatureOid<S>,

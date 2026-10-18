@@ -13,6 +13,8 @@
 use tightbeam::urn::Urn;
 
 pub(crate) const REGISTRATION_SENT: Urn<'static> = tightbeam::urn!("test", "event:cluster/registration-sent");
+pub(crate) const FLIPPED_CAPTURE_VERIFIES: Urn<'static> =
+	tightbeam::urn!("test", "event:cluster/flipped-capture-verifies");
 pub(crate) const REJECTED_HEARTBEAT_DECODED: Urn<'static> =
 	tightbeam::urn!("test", "event:cluster/rejected-heartbeat-decoded");
 pub(crate) const SERVLET_STOPPED: Urn<'static> = tightbeam::urn!("test", "event:cluster/servlet-stopped");
@@ -179,3 +181,5 @@ pub(crate) const CLIENT_GOT_SERVLET_SIGNED: Urn<'static> =
 pub(crate) const PROBE_FRAME_SIG_VALID: Urn<'static> = tightbeam::urn!("test", "event:cluster/probe-frame-sig-valid");
 pub(crate) const CLIENT_GOT_SERVLET_SIG_VALID: Urn<'static> =
 	tightbeam::urn!("test", "event:cluster/client-got-servlet-sig-valid");
+pub(crate) const OUTSIDE_RUMOR_FANNED_OUT: Urn<'static> =
+	tightbeam::urn!("test", "event:cluster/outside-rumor-fanned-out");

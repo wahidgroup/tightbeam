@@ -56,6 +56,9 @@ pkcs12 = { version = "=0.1.0", default-features = false }
 hkdf = { version = "=0.12.4", default-features = false }
 x509-cert = { version = "=0.2.5", default-features = false, features = [
 	"pem",
+	# `Profile::Manual`, so `cert!` writes the key identifiers of RFC 7093 §2
+	# method 1 in place of the builder's SHA-1 ones.
+	"hazmat",
 ] }
 hex-literal = { version = "=1.1.0", default-features = false }
 elliptic-curve = { version = "=0.13.8", default-features = false }

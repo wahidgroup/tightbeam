@@ -29,7 +29,7 @@ use core::time::Duration;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use super::ClusterError;
+use super::{ClusterError, ClusterTlsConfig};
 use crate::asn1::Frame;
 use crate::colony::common::IssuedAt;
 use crate::colony::common::{GossipRumor, GossipRumorKind, ServletTypeKey};
@@ -39,9 +39,11 @@ use crate::constants::{
 	MAX_GOSSIP_TTL,
 };
 use crate::crypto::hash::{Digest, OutputSizeUser, U32};
+use crate::crypto::sign::VerifiedSignature;
+use crate::decode;
 use crate::policy::TransitStatus;
 use crate::utils::time::UnixMillis;
-use crate::{decode, encode};
+use crate::TightBeamError;
 
 /// Fixed 32-byte content digest of a gossip rumor.
 ///
@@ -60,29 +62,80 @@ pub enum Admission {
 	Duplicate,
 }
 
-impl Frame {
-	/// Digest over the canonical DER encoding of a rumor.
+/// A rumor frame beside the origin signature that verified over it.
+///
+/// Only a verification makes one: the parse that verified the rumor on a
+/// trust plane, or the gateway's check of a rumor it signed itself. The
+/// digest of a rumor is therefore taken under the signature of that same
+/// rumor.
+pub struct VerifiedRumor {
+	frame: Frame,
+	signature: VerifiedSignature,
+}
+
+impl VerifiedRumor {
+	/// The rumor `frame` beside the `signature` that verified over it.
+	pub(crate) fn new(frame: Frame, signature: VerifiedSignature) -> Self {
+		Self { frame, signature }
+	}
+
+	/// The origin-signed rumor frame.
+	#[must_use]
+	pub fn frame(&self) -> &Frame {
+		&self.frame
+	}
+
+	/// Take the rumor frame out of the pairing.
+	#[must_use]
+	pub fn into_frame(self) -> Frame {
+		self.frame
+	}
+
+	/// Digest over the rumor's to-be-signed encoding and its origin signature
+	/// in canonical form.
 	///
-	/// Coverage includes identity, issue time, payload, and origin
-	/// signature. Hop radius lives on the OUTER relay frame and MUST NOT
-	/// enter the digest.
+	/// - Coverage includes identity, issue time, payload, and origin signature.
+	/// - Hop radius lives on the OUTER relay frame and MUST NOT enter the digest.
+	/// - A rumor relayed with `s` flipped to `n - s` digests as its original.
 	///
 	/// # Algorithm
 	///
 	/// Algorithm `D` MUST be the cluster crypto-profile digest (CWE-694).
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError`] -- the to-be-signed encoding fails.
 	pub fn gossip_digest<D>(&self) -> Result<GossipDigest, ClusterError>
 	where
 		D: Digest + OutputSizeUser<OutputSize = U32>,
 	{
-		let bytes = encode(self)?;
+		let tbs = self.frame.to_tbs()?;
 		let mut hasher = D::new();
-		hasher.update(&bytes);
+		hasher.update(&tbs);
+		hasher.update(self.signature.as_bytes());
 
 		let output = hasher.finalize();
 		let mut digest = [0u8; 32];
 		digest.copy_from_slice(&output);
 
 		Ok(digest)
+	}
+}
+
+impl ClusterTlsConfig {
+	/// Verify `frame`, which this gateway signed, against its own
+	/// certificate, and pair it with its signature.
+	///
+	/// A rumor this gateway originates needs its own verified signature,
+	/// the key its digest is taken under, whether or not a trust plane holds
+	/// this gateway's certificate.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError`] -- the frame carries no signature, or the signature fails to verify.
+	pub(crate) fn verify_own(&self, frame: Frame) -> Result<VerifiedRumor, TightBeamError> {
+		let signature = frame.verify_under(self.identity.certificate(), self.identity.policy())?;
+		Ok(VerifiedRumor::new(frame, signature))
 	}
 }
 
@@ -143,7 +196,7 @@ pub struct AdmittedGossip {
 }
 
 impl AdmittedGossip {
-	/// Admits one rumor frame, failing closed with a refusal status.
+	/// Admits one verified rumor, failing closed with a refusal status.
 	///
 	/// `ttl` is the remaining hop radius from the OUTER `metadata.lifetime`.
 	/// Freshness uses the rumor's `metadata.order` as the signed issue time.
@@ -156,15 +209,16 @@ impl AdmittedGossip {
 	/// - The payload exceeds [`MAX_GOSSIP_PAYLOAD_BYTES`].
 	/// - `ttl` exceeds [`MAX_GOSSIP_TTL`], which caps the hop radius here at the trust boundary (CWE-770).
 	/// - The issue time is stale.
-	pub fn admit<D>(rumor: &Frame, ttl: u64, seen_ttl: Duration, now: UnixMillis) -> Result<Self, TransitStatus>
+	pub fn admit<D>(rumor: &VerifiedRumor, ttl: u64, seen_ttl: Duration, now: UnixMillis) -> Result<Self, TransitStatus>
 	where
 		D: Digest + OutputSizeUser<OutputSize = U32>,
 	{
-		let body: GossipRumor = decode(rumor.message()).map_err(|_| TransitStatus::PermissionDenied)?;
+		let frame = rumor.frame();
+		let body: GossipRumor = decode(frame.message()).map_err(|_| TransitStatus::PermissionDenied)?;
 
 		let within_payload = body.payload.len() <= MAX_GOSSIP_PAYLOAD_BYTES;
 		let within_ttl = ttl <= u64::from(MAX_GOSSIP_TTL);
-		let fresh = gossip_fresh(rumor.issued_at(), seen_ttl, now);
+		let fresh = gossip_fresh(frame.issued_at(), seen_ttl, now);
 		if within_payload && within_ttl && fresh {
 			let digest = rumor.gossip_digest::<D>().map_err(|_| TransitStatus::PermissionDenied)?;
 			let admitted = Self { digest, payload: body.payload, kind: body.kind };
@@ -366,12 +420,14 @@ pub trait GossipJournal: Send + Sync {
 	/// Digests still inside the retention window, for reconciliation summaries.
 	fn held_digests(&self, now: UnixMillis) -> Result<Vec<GossipDigest>, ClusterError>;
 
-	/// Retained rumor frames for digests a peer reported missing.
-	fn fetch(&self, wanted: &[GossipDigest], now: UnixMillis) -> Result<Vec<Frame>, ClusterError>;
+	/// Retained rumor frames for digests a peer reported missing, each beside
+	/// the digest it was recorded under.
+	fn fetch(&self, wanted: &[GossipDigest], now: UnixMillis) -> Result<Vec<(GossipDigest, Frame)>, ClusterError>;
 
-	/// Retained rumors awaiting local delivery, excluding those a task
-	/// already claimed through [`GossipJournal::claim_local`].
-	fn pending_local(&self, now: UnixMillis) -> Result<Vec<Frame>, ClusterError>;
+	/// Retained rumors awaiting local delivery, each beside the digest it was
+	/// recorded under, excluding those a task already claimed through
+	/// [`GossipJournal::claim_local`].
+	fn pending_local(&self, now: UnixMillis) -> Result<Vec<(GossipDigest, Frame)>, ClusterError>;
 
 	/// Take one rumor's local delivery, so no second task delivers it.
 	///
@@ -762,16 +818,16 @@ impl GossipJournal for MemoryGossipJournal {
 		Ok(digests)
 	}
 
-	fn fetch(&self, wanted: &[GossipDigest], now: UnixMillis) -> Result<Vec<Frame>, ClusterError> {
+	fn fetch(&self, wanted: &[GossipDigest], now: UnixMillis) -> Result<Vec<(GossipDigest, Frame)>, ClusterError> {
 		let mut entries = self.entries.lock()?;
 
 		Self::prune(&mut entries, self.retention, now);
 
 		let found = wanted
 			.iter()
-			.filter_map(|digest| entries.get(digest))
-			.filter_map(|entry| match &entry.body {
-				JournalBody::Retained { rumor, .. } => Some(rumor.as_ref().clone()),
+			.filter_map(|digest| entries.get(digest).map(|entry| (digest, entry)))
+			.filter_map(|(digest, entry)| match &entry.body {
+				JournalBody::Retained { rumor, .. } => Some((*digest, rumor.as_ref().clone())),
 				JournalBody::Witnessed => None,
 			})
 			.collect();
@@ -779,15 +835,17 @@ impl GossipJournal for MemoryGossipJournal {
 		Ok(found)
 	}
 
-	fn pending_local(&self, now: UnixMillis) -> Result<Vec<Frame>, ClusterError> {
+	fn pending_local(&self, now: UnixMillis) -> Result<Vec<(GossipDigest, Frame)>, ClusterError> {
 		let mut entries = self.entries.lock()?;
 
 		Self::prune(&mut entries, self.retention, now);
 
 		let pending = entries
-			.values()
-			.filter_map(|entry| match &entry.body {
-				JournalBody::Retained { rumor, local: LocalDelivery::Pending } => Some(rumor.as_ref().clone()),
+			.iter()
+			.filter_map(|(digest, entry)| match &entry.body {
+				JournalBody::Retained { rumor, local: LocalDelivery::Pending } => {
+					Some((*digest, rumor.as_ref().clone()))
+				}
 				_ => None,
 			})
 			.collect();
@@ -841,6 +899,9 @@ mod tests {
 	use crate::asn1::Version;
 	use crate::builder::{FrameBuilder, TypeBuilder};
 	use crate::crypto::hash::Sha3_256;
+	use crate::crypto::sign::ecdsa::Secp256k1Signature;
+	use crate::encode;
+	use crate::testing::{TestFrame, TestIdentity, TestKey, TestMessage};
 
 	/// The reference instant the fixture rumors are issued at.
 	const T0: UnixMillis = UnixMillis::new(1_000);
@@ -848,17 +909,29 @@ mod tests {
 	/// The freshness and retention window the fixtures run under.
 	const WINDOW: Duration = Duration::from_millis(30_000);
 
-	fn digest(rumor: &Frame) -> GossipDigest {
-		rumor.gossip_digest::<Sha3_256>().expect("test rumor frames encode")
+	/// `rumor` beside its signature, as its verification under the fixed test
+	/// key returns it.
+	fn verified(rumor: Frame) -> VerifiedRumor {
+		let key = TestKey::insecure_fixed_signing();
+		let verifying = rumor.verify::<Secp256k1Signature>(key.verifying_key());
+		let signature = verifying.expect("the fixed test key signed the rumor");
+		VerifiedRumor::new(rumor, signature)
 	}
 
+	fn digest(rumor: &Frame) -> GossipDigest {
+		let verified = verified(rumor.clone());
+		verified.gossip_digest::<Sha3_256>().expect("test rumor frames encode")
+	}
+
+	/// A rumor of `payload` at `order`, signed by the fixed test key.
 	fn rumor(order: u64, payload: impl Into<Vec<u8>>) -> Frame {
 		let payload: Vec<u8> = payload.into();
 		let body = GossipRumor::application(payload);
-		FrameBuilder::from(Version::V0)
+		FrameBuilder::from(Version::V1)
 			.with_id("rumor")
 			.with_order(order)
 			.with_message(body)
+			.with_signer::<Secp256k1Signature, _>(TestIdentity::certified(TestKey::insecure_fixed_signing()))
 			.build()
 			.expect("test rumor frames build")
 	}
@@ -889,7 +962,7 @@ mod tests {
 	#[test]
 	fn admit_accepts_valid_rumor() -> Result<(), TransitStatus> {
 		let frame = rumor(1_000, vec![1, 2, 3]);
-		let admitted = AdmittedGossip::admit::<Sha3_256>(&frame, 4, WINDOW, T0)?;
+		let admitted = AdmittedGossip::admit::<Sha3_256>(&verified(frame.clone()), 4, WINDOW, T0)?;
 		assert_eq!(admitted.digest(), digest(&frame));
 		assert_eq!(admitted.payload(), &[1, 2, 3]);
 		Ok(())
@@ -898,7 +971,7 @@ mod tests {
 	#[test]
 	fn admit_refuses_oversized_payload() {
 		let frame = rumor(1_000, vec![0u8; MAX_GOSSIP_PAYLOAD_BYTES + 1]);
-		let status = AdmittedGossip::admit::<Sha3_256>(&frame, 4, WINDOW, T0);
+		let status = AdmittedGossip::admit::<Sha3_256>(&verified(frame), 4, WINDOW, T0);
 		assert_eq!(status.err(), Some(TransitStatus::PermissionDenied));
 	}
 
@@ -906,22 +979,48 @@ mod tests {
 	fn admit_refuses_excessive_ttl() {
 		let frame = rumor(1_000, vec![1, 2, 3]);
 		let over = u64::from(MAX_GOSSIP_TTL) + 1;
-		let status = AdmittedGossip::admit::<Sha3_256>(&frame, over, WINDOW, T0);
+		let status = AdmittedGossip::admit::<Sha3_256>(&verified(frame), over, WINDOW, T0);
 		assert_eq!(status.err(), Some(TransitStatus::PermissionDenied));
 	}
 
 	#[test]
 	fn admit_refuses_stale_rumor() {
 		let frame = rumor(1_000, vec![1, 2, 3]);
-		let status = AdmittedGossip::admit::<Sha3_256>(&frame, 4, WINDOW, UnixMillis::new(100_000));
+		let status = AdmittedGossip::admit::<Sha3_256>(&verified(frame), 4, WINDOW, UnixMillis::new(100_000));
 		assert_eq!(status.err(), Some(TransitStatus::PermissionDenied));
 	}
 
+	/// A rumor whose own signature verifies, but whose body is no
+	/// `GossipRumor`, is refused.
 	#[test]
-	fn admit_refuses_undecodable_body() {
-		let frame = Frame::v0(b"rumor", vec![0xFF, 0x00, 0xFF]);
-		let status = AdmittedGossip::admit::<Sha3_256>(&frame, 4, WINDOW, T0);
+	fn admit_refuses_undecodable_body() -> Result<(), TightBeamError> {
+		let signer = TestIdentity::certified(TestKey::insecure_fixed_signing());
+		let frame = FrameBuilder::from(Version::V1)
+			.with_id("rumor")
+			.with_order(1_000)
+			.with_message(TestMessage::sample(None))
+			.with_signer::<Secp256k1Signature, _>(signer)
+			.build()?;
+
+		let status = AdmittedGossip::admit::<Sha3_256>(&verified(frame), 4, WINDOW, T0);
 		assert_eq!(status.err(), Some(TransitStatus::PermissionDenied));
+		Ok(())
+	}
+
+	/// A rumor relayed with its signature's `s` flipped to `n - s` verifies,
+	/// and its digest is its original's, so the journal refuses it as a
+	/// duplicate (SEC 1 v2.0 §4.1.4).
+	#[test]
+	fn a_rumor_replayed_with_its_s_flipped_is_a_duplicate() -> Result<(), ClusterError> {
+		let journal = MemoryGossipJournal::default();
+		let frame = rumor(1_000, vec![1, 2, 3]);
+		let flipped = TestFrame::with_flipped_s(&frame);
+
+		journal.record(b"signer-a", digest(&frame), &frame, T0)?;
+
+		let replayed = journal.record(b"signer-a", digest(&flipped), &flipped, T0)?;
+		assert_eq!(replayed, Admission::Duplicate);
+		Ok(())
 	}
 
 	#[test]
@@ -1163,7 +1262,7 @@ mod tests {
 		journal.record(b"signer-a", digest(&second), &second, T0)?;
 
 		let fetched = journal.fetch(&[first_digest], T0)?;
-		assert_eq!(fetched, vec![first]);
+		assert_eq!(fetched, vec![(first_digest, first)]);
 		Ok(())
 	}
 

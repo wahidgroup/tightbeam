@@ -17,14 +17,13 @@ use tightbeam::{
 		hpke::{DhKemSuite, HpkeMessage, HpkeSecp256k1Sha3Aes256Gcm, HpkeSecretKeyOps},
 		kdf::HkdfSha3_256,
 		profiles::{
-			AeadProvider, CryptoProvider, CurveProvider, DefaultCryptoProvider, DigestProvider, KdfProvider,
-			SecurityProfile, SecurityProfileDesc, SigningProvider,
+			AeadProvider, Aes128Wrap, CryptoProvider, CurveProvider, DefaultCryptoProvider, DigestProvider,
+			HpkeProvider, KdfProvider, KeyWrapProvider, SecurityProfile, SecurityProfileDesc, SigningProvider,
 		},
 		secret::ToInsecure,
-		sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey, Secp256k1VerifyingKey},
+		sign::ecdsa::{Secp256k1Signature, Secp256k1VerifyingKey},
 	},
 	der::{asn1::OctetString, Any, Decode, Encode, Sequence},
-	oids::AES_128_WRAP,
 	testing::error::{FdrConfigError, TestingError},
 	transport::handshake::{
 		negotiation::{NoStrengthFloor, ProfilePolicy, ProfileStrengthPolicy, SecurityOffer},
@@ -50,8 +49,6 @@ use tightbeam::cms::signed_data::SignedData;
 use tightbeam::crypto::k256::elliptic_curve::sec1::ToEncodedPoint;
 #[cfg(feature = "transport-cms")]
 use tightbeam::transport::handshake::Cms;
-#[cfg(feature = "transport-cms")]
-use tightbeam::transport::{handshake::HandshakeKeyManager, state::ClientIdentity};
 
 /// A security profile on AES-128-GCM, which is weaker than the default
 /// AES-256-GCM.
@@ -65,7 +62,7 @@ impl SecurityProfile for Aes128Profile {
 	type Kdf = HkdfSha3_256;
 	type Curve = k256::Secp256k1;
 
-	const KEY_WRAP_OID: Option<tightbeam::der::asn1::ObjectIdentifier> = Some(AES_128_WRAP);
+	type KeyWrapOid = Aes128Wrap;
 }
 
 /// A crypto provider on AES-128-GCM, for a downgrade attack test.
@@ -84,7 +81,6 @@ impl AeadProvider for Aes128CryptoProvider {
 
 impl SigningProvider for Aes128CryptoProvider {
 	type Signature = Secp256k1Signature;
-	type SigningKey = Secp256k1SigningKey;
 	type VerifyingKey = Secp256k1VerifyingKey;
 }
 
@@ -96,13 +92,21 @@ impl CurveProvider for Aes128CryptoProvider {
 	type Curve = k256::Secp256k1;
 }
 
+impl KeyWrapProvider for Aes128CryptoProvider {
+	type KeyWrap = Aes128Wrap;
+}
+
 impl CryptoProvider for Aes128CryptoProvider {
 	type Profile = Aes128Profile;
-	type HpkeSuite = DhKemSuite<k256::Secp256k1, HkdfSha3_256, Aes128Gcm>;
+	type Kem = tightbeam::crypto::hpke::DhKemSecp256k1;
 
 	fn profile(&self) -> &Self::Profile {
 		&self.profile
 	}
+}
+
+impl HpkeProvider for Aes128CryptoProvider {
+	type HpkeSuite = DhKemSuite<k256::Secp256k1, HkdfSha3_256, Aes128Gcm, 0xFF16>;
 }
 
 /// The direction a handshake message travels in.
@@ -172,10 +176,8 @@ type FlowFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, TightBeamError>> 
 pub enum Container {
 	/// A `SignedData`.
 	Signed,
-	/// An `EnvelopedData`.
-	Enveloped,
-	/// An `EncryptedData`.
-	Encrypted,
+	/// An `AuthEnvelopedData`.
+	AuthEnveloped,
 	/// The `ClientKeyExchange` of an HPKE closing.
 	KeyExchange,
 }
@@ -186,8 +188,7 @@ impl Container {
 	fn message(self, der: &[u8]) -> Result<HandshakeMessage, TightBeamError> {
 		let message = match self {
 			Self::Signed => HandshakeMessage::SignedData(Box::new(WireDer::try_from(der)?)),
-			Self::Enveloped => HandshakeMessage::EnvelopedData(Box::new(WireDer::try_from(der)?)),
-			Self::Encrypted => HandshakeMessage::EncryptedData(Box::new(WireDer::try_from(der)?)),
+			Self::AuthEnveloped => HandshakeMessage::AuthEnvelopedData(Box::new(WireDer::try_from(der)?)),
 			Self::KeyExchange => HandshakeMessage::ClientKeyExchange(Box::new(WireDer::try_from(der)?)),
 		};
 
@@ -656,9 +657,17 @@ const HPKE_FLOW: &[FlowStep] = &[
 /// steps.
 #[cfg(feature = "transport-cms")]
 const CMS_FLOW: &[FlowStep] = &[
-	FlowStep { index: 0, direction: Direction::ClientToServer, container: Container::Enveloped },
+	FlowStep {
+		index: 0,
+		direction: Direction::ClientToServer,
+		container: Container::AuthEnveloped,
+	},
 	FlowStep { index: 2, direction: Direction::ServerToClient, container: Container::Signed },
-	FlowStep { index: 4, direction: Direction::ClientToServer, container: Container::Encrypted },
+	FlowStep {
+		index: 4,
+		direction: Direction::ClientToServer,
+		container: Container::AuthEnveloped,
+	},
 ];
 
 /// A handshake protocol the harness runs sessions of, under provider `P`.
@@ -729,9 +738,7 @@ impl<P: HandshakeProvider> SessionFlow<P> for Cms {
 		let trust_store = pinning_trust_store(&materials.certificate)
 			.expect("a trust store builds from the generated server certificate");
 
-		let key_provider = Arc::clone(&client_materials.key_provider);
-		let key_manager = Arc::new(HandshakeKeyManager::<P>::new(key_provider));
-		let identity = ClientIdentity::new(Arc::clone(&client_materials.certificate), key_manager);
+		let identity = client_materials.identity();
 
 		let mut config = cms_client_config(&materials.certificate, trust_store, identity);
 		config.security_offer = Some(offer);

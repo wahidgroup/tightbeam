@@ -7,6 +7,7 @@
 use crate::colony::cluster::runtime::freshness::GatewayReplayGuard;
 use crate::colony::cluster::runtime::LoopFault;
 use crate::colony::common::{reply_frame, GossipResponse, GossipWant, PeerAdvertisementResponse};
+use crate::crypto::sign::VerifiedSignature;
 use crate::instrumentation::events::{CLUSTER_GOSSIP_REFUSED, CLUSTER_PEER_ADVERTISE_REFUSED};
 use crate::policy::TransitStatus;
 use crate::trace::TraceCollector;
@@ -88,7 +89,8 @@ impl<'f> Refusal<'f> {
 		reply_frame(self.frame.metadata().id(), PeerAdvertisementResponse { status })
 	}
 
-	/// Answers a peer advertisement and returns its freshness slot.
+	/// Answers a peer advertisement and returns the freshness slot its
+	/// verified `signature` spent.
 	///
 	/// A refused advertisement did not apply. Releasing its signature keeps
 	/// the peer's one admission for a frame this gateway accepts, where
@@ -96,9 +98,10 @@ impl<'f> Refusal<'f> {
 	pub(crate) fn peer_ad_release(
 		self,
 		replay_guard: &GatewayReplayGuard,
+		signature: &VerifiedSignature,
 		status: TransitStatus,
 	) -> Result<Option<Frame>, TightBeamError> {
-		replay_guard.release(self.frame);
+		replay_guard.release(signature);
 		self.peer_ad(status)
 	}
 

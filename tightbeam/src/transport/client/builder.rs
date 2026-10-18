@@ -23,7 +23,7 @@ use crate::utils::time::Clock;
 use crate::x509::Certificate;
 
 #[cfg(feature = "std")]
-use crate::transport::state::ClientIdentity;
+use crate::crypto::sign::SigningIdentity;
 #[cfg(feature = "std")]
 use crate::transport::ConnectionBuilder;
 #[cfg(host_clock)]
@@ -304,8 +304,8 @@ where
 		self
 	}
 
-	fn with_client_identity(mut self, identity: ClientIdentity<P::CryptoProvider>) -> Self {
-		identity.install(&mut self.encryption);
+	fn with_client_identity(mut self, identity: SigningIdentity) -> Self {
+		self.encryption.client_identity = Some(identity);
 		self
 	}
 

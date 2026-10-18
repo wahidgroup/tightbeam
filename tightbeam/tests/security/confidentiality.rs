@@ -8,8 +8,9 @@
 //! Captured HPKE ciphertext is examined: decrypted with the correct key,
 //! attempted with a wrong key, and compared across two handshakes.
 //!
-//! CMS carries the base secret inside an EnvelopedData/KARI structure. The
-//! unit test `the_base_secret_crosses_the_wire_only_sealed` in
+//! CMS carries the base secret inside an `AuthEnvelopedData` with a
+//! `KEMRecipientInfo`. The unit test
+//! `the_base_secret_crosses_the_wire_only_sealed` in
 //! `transport::handshake::orchestrator` covers that carriage.
 //!
 //! ## Expected control

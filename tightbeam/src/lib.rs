@@ -181,6 +181,7 @@ pub use asn1::{
 };
 pub use cms;
 pub use der;
+pub use pkcs12;
 pub use spki;
 pub use utils::{decode, encode};
 

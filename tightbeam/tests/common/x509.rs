@@ -12,11 +12,12 @@ use std::sync::Arc;
 use tightbeam::{
 	cert,
 	crypto::{
+		key::Secp256k1KeyProvider,
 		policy::Secp256k1Policy,
 		profiles::DefaultCryptoProvider,
 		sign::{
 			ecdsa::{Secp256k1SigningKey, Secp256k1VerifyingKey},
-			Sha3Signer,
+			Sha3Signer, SigningIdentity,
 		},
 		x509::{
 			policy::CertificateValidation,
@@ -28,7 +29,7 @@ use tightbeam::{
 	server,
 	spki::SubjectPublicKeyInfoOwned,
 	testing::{TestCertificate, TestKey},
-	transport::{handshake::HandshakeKeyManager, EncryptedProtocol, TransportEncryptionConfig},
+	transport::{EncryptedProtocol, TransportEncryptionConfig},
 	urn::Urn,
 	x509::Certificate,
 	Frame, TightBeamError,
@@ -61,11 +62,17 @@ pub fn create_test_cert_with_key(
 /// Create server encryption config with certificate, key, and validators
 pub fn create_server_config(
 	cert: Certificate,
-	key_provider: impl Into<HandshakeKeyManager<DefaultCryptoProvider>>,
+	key: Secp256k1SigningKey,
 	validators: Vec<Arc<dyn CertificateValidation>>,
 ) -> TransportEncryptionConfig<DefaultCryptoProvider> {
-	let key_manager = key_provider.into();
-	TransportEncryptionConfig::new(cert, key_manager).with_client_validators(validators)
+	let identity = signing_identity(cert, key);
+	TransportEncryptionConfig::new(identity).with_client_validators(validators)
+}
+
+/// The signing identity of `cert`, whose private key is `key`.
+pub fn signing_identity(cert: impl Into<Arc<Certificate>>, key: Secp256k1SigningKey) -> SigningIdentity {
+	let provider = Arc::new(Secp256k1KeyProvider::from(key));
+	SigningIdentity::new(cert, provider).expect("the key must match its certificate")
 }
 
 /// Self-signed gateway materials shared by colony transport tests.
@@ -84,7 +91,7 @@ impl GatewayCerts {
 		let subject = subject.as_ref();
 		let (cert, key) = create_test_cert_with_key(subject, 365).expect("Failed to create gateway cert");
 		let trust: Arc<dyn CertificateTrust> = Arc::new(
-			CertificateTrustBuilder::from(Secp256k1Policy)
+			CertificateTrustBuilder::from(Secp256k1Policy::default())
 				.with_chain(vec![cert.to_owned()])
 				.expect("Failed to build trust")
 				.build(),
@@ -109,7 +116,7 @@ impl GatewayCerts {
 
 /// Trust builder anchoring several independent identities at once.
 fn combined_trust_builder(certs: &[&Certificate]) -> CertificateTrustBuilder {
-	let mut builder = CertificateTrustBuilder::from(Secp256k1Policy);
+	let mut builder = CertificateTrustBuilder::from(Secp256k1Policy::default());
 	for cert in certs {
 		builder = builder
 			.with_certificate((*cert).to_owned())

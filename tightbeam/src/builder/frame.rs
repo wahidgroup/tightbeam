@@ -33,7 +33,9 @@ use crate::crypto::profiles::SecurityProfile;
 #[cfg(feature = "signature")]
 use crate::crypto::sign::SignatureEncoding;
 #[cfg(feature = "signature")]
-use crate::crypto::sign::{Signatory, SignatureAlgorithmIdentifier};
+use crate::crypto::sign::{
+	CanonicalForm, CertifiedKey, CmsSigner, PrehashSigner, SignatureAlgorithmIdentifier, Signed, SignedContent,
+};
 #[cfg(any(feature = "digest", feature = "aead", feature = "ecdh"))]
 use crate::der::oid::AssociatedOid;
 #[cfg(host_clock)]
@@ -43,7 +45,7 @@ use crate::utils::time::UnixMillis;
 type EncryptorFn = Box<dyn FnOnce(&[u8]) -> Result<crate::EncryptedContentInfo>>;
 
 #[cfg(feature = "signature")]
-type SignerFn = Box<dyn FnOnce(&[u8]) -> Result<crate::SignerInfo>>;
+type SignerFn = Box<dyn FnOnce(&[u8]) -> Result<Signed<crate::SignerInfo>>>;
 
 /// A message type that admits digest `D`.
 ///
@@ -177,8 +179,7 @@ pub struct FrameBuilder<T: Message> {
 	#[cfg(feature = "digest")]
 	witness: Option<Digestor>,
 	#[cfg(feature = "signature")]
-	#[allow(clippy::type_complexity)]
-	signer: Option<Box<dyn FnOnce(&[u8]) -> Result<crate::SignerInfo>>>,
+	signer: Option<SignerFn>,
 }
 
 impl<T: Message> From<Version> for FrameBuilder<T> {
@@ -505,15 +506,17 @@ impl<T: Message> FrameBuilder<T> {
 
 #[cfg(feature = "signature")]
 impl<T: Message> FrameBuilder<T> {
-	/// Set the signer that signs the frame.
+	/// Set the signer that signs the frame: a key beside the certificate
+	/// that names it.
 	///
-	/// This method captures the signer and its signing algorithm.
+	/// This method captures the signer and its signing algorithm `S`.
 	/// [`FrameBuilder::build`] computes the signature over the complete message
-	/// structure.
-	pub fn with_signer<S, X>(mut self, signer: X) -> Self
+	/// structure, through the CMS signer, so the `SignerInfo` carries the
+	/// signed attributes and names the certificate (RFC 5652 §5.3).
+	pub fn with_signer<S, X>(mut self, signer: CertifiedKey<X>) -> Self
 	where
-		S: SignatureEncoding + SignatureAlgorithmIdentifier,
-		X: Signatory<S> + 'static,
+		S: CanonicalForm + SignatureEncoding + SignatureAlgorithmIdentifier,
+		X: PrehashSigner<S> + 'static,
 		T: CheckSignatureOid<S>,
 	{
 		// A checker impl can admit any algorithm, so this comparison
@@ -527,7 +530,10 @@ impl<T: Message> FrameBuilder<T> {
 			return self;
 		}
 
-		self.signer = Some(Box::new(move |data: &[u8]| signer.to_signer_info(data)));
+		self.signer = Some(Box::new(move |tbs: &[u8]| {
+			let content = SignedContent::data(tbs);
+			Ok(CmsSigner::sign_with::<S, X>(&signer, content)?)
+		}));
 		self
 	}
 }
@@ -736,7 +742,7 @@ impl<T: Message> FrameBuilder<T> {
 mod tests {
 	use super::*;
 	use crate::test_builder;
-	use crate::testing::{TestKey, TestMessage};
+	use crate::testing::{TestIdentity, TestKey, TestMessage};
 
 	#[cfg(feature = "compress")]
 	use crate::compress::ZstdCompression;
@@ -797,7 +803,7 @@ mod tests {
 			.with_id("test_v1_with_encryption")
 			.with_order(1696521600)
 			.with_aead(cipher)
-			.with_signer::<Secp256k1Signature, _>(signing_key)
+			.with_signer::<Secp256k1Signature, _>(TestIdentity::certified(signing_key))
 			.build()
 		},
 		assertions: |message, result| {
@@ -842,7 +848,7 @@ mod tests {
 			.with_order(1696521600)
 			.with_compression(ZstdCompression::default())
 			.with_aead(cipher)
-			.with_signer::<Secp256k1Signature, _>(signing_key)
+			.with_signer::<Secp256k1Signature, _>(TestIdentity::certified(signing_key))
 			.build()
 		},
 		assertions: |message, result| {
@@ -897,7 +903,7 @@ mod tests {
 				.with_compression(ZstdCompression::default())
 				.with_rng(rng)
 				.with_aead(cipher)
-				.with_signer::<Secp256k1Signature, _>(signing_key)
+				.with_signer::<Secp256k1Signature, _>(TestIdentity::certified(signing_key))
 				.with_priority(crate::MessagePriority::LowLatency)
 				.with_lifetime(3600)
 				.with_previous_hash(previous_hash)
@@ -943,7 +949,7 @@ mod tests {
 			// frame.
 			let signing_key = TestKey::insecure_fixed_signing();
 			let verifying_key = signing_key.verifying_key();
-			assert!(tightbeam.verify::<Secp256k1Signature, Sha3_256>(verifying_key).is_ok());
+			assert!(tightbeam.verify::<Secp256k1Signature>(verifying_key).is_ok());
 
 			// The decryption also decompresses the body.
 			let (_, cipher) = TestKey::insecure_fixed_cipher();
@@ -1055,7 +1061,7 @@ mod tests {
 		use crate::crypto::aead::{Aes256Gcm, Aes256GcmOid};
 		use crate::crypto::hash::Sha3_256;
 		use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
-		use crate::testing::TestKey;
+		use crate::testing::{TestIdentity, TestKey};
 		use crate::Version;
 
 		// Run the shared assertions after the struct definition.
@@ -1178,7 +1184,7 @@ mod tests {
 				(true, true, true, true) => compose! {
 					V2: id: test_name, order: 1u64, message: message.clone(),
 					confidentiality: cipher,
-					nonrepudiation<Secp256k1Signature, _>: signing_key,
+					nonrepudiation<Secp256k1Signature, _>: TestIdentity::certified(signing_key),
 					message_integrity<Sha3_256>: [],
 					frame_integrity: type Sha3_256
 				},
@@ -1193,12 +1199,12 @@ mod tests {
 				},
 				(false, true, true, _) => compose! {
 					V1: id: test_name, order: 1u64, message: message.clone(),
-					nonrepudiation<Secp256k1Signature, _>: signing_key,
+					nonrepudiation<Secp256k1Signature, _>: TestIdentity::certified(signing_key),
 					message_integrity<Sha3_256>: []
 				},
 				(false, true, false, _) => compose! {
 					V1: id: test_name, order: 1u64, message: message.clone(),
-					nonrepudiation<Secp256k1Signature, _>: signing_key
+					nonrepudiation<Secp256k1Signature, _>: TestIdentity::certified(signing_key)
 				},
 				(false, false, true, true) => compose! {
 					V1: id: test_name, order: 1u64, message: message.clone(),
@@ -1219,19 +1225,19 @@ mod tests {
 				(true, true, true, false) => compose! {
 					V2: id: test_name, order: 1u64, message: message.clone(),
 					confidentiality: cipher,
-					nonrepudiation<Secp256k1Signature, _>: signing_key,
+					nonrepudiation<Secp256k1Signature, _>: TestIdentity::certified(signing_key),
 					message_integrity<Sha3_256>: []
 				},
 				(true, true, false, true) => compose! {
 					V2: id: test_name, order: 1u64, message: message.clone(),
 					confidentiality: cipher,
-					nonrepudiation<Secp256k1Signature, _>: signing_key,
+					nonrepudiation<Secp256k1Signature, _>: TestIdentity::certified(signing_key),
 					frame_integrity: type Sha3_256
 				},
 				(true, true, false, false) => compose! {
 					V1: id: test_name, order: 1u64, message: message.clone(),
 					confidentiality: cipher,
-					nonrepudiation<Secp256k1Signature, _>: signing_key
+					nonrepudiation<Secp256k1Signature, _>: TestIdentity::certified(signing_key)
 				},
 			}
 		}

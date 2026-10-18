@@ -13,7 +13,6 @@ use crate::colony::hive::{
 	HashMapRegistry, HiveConfig, RegisterHiveRequest, RegisterHiveResponse, ServletAddressUpdateResponse,
 	ServletRegistry,
 };
-use crate::crypto::hash::Sha3_256;
 use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::decode;
 use crate::instrumentation::events::HIVE_REREGISTERED;
@@ -222,7 +221,7 @@ where
 			encryption.trust_store = Some(Arc::clone(store));
 		}
 		if let Some(hive_tls) = &self.config.hive_tls {
-			hive_tls.identity().install(&mut encryption);
+			encryption.client_identity = Some(hive_tls.identity().clone());
 		}
 
 		let encryption = DialableEncryption::new(encryption)?;
@@ -241,7 +240,6 @@ where
 		let id = id.as_ref();
 		// `metadata.order` is the control freshness binding (CWE-294).
 		let order = self.config.clock.unix();
-
 		match self.config.hive_tls.as_ref() {
 			Some(hive_tls) => {
 				// Signatures are a V1 field (§5.6), so a signed frame is V1.
@@ -251,9 +249,7 @@ where
 					.with_order(order.get())
 					.with_message(message)
 					.build()?;
-				signed
-					.sign_with_provider::<Sha3_256, _>(hive_tls.identity().signing_provider())
-					.await?;
+				signed.sign_with_provider(hive_tls.identity()).await?;
 				Ok(signed)
 			}
 			None => {
@@ -270,9 +266,9 @@ where
 
 	/// Sends `frame` to every gateway, returning whether any refused it.
 	async fn fanout_scaling_update(&self, gateways: impl AsRef<[P::Address]>, frame: &Frame) -> bool {
-		let gateways = gateways.as_ref();
 		let mut any_failed = false;
 
+		let gateways = gateways.as_ref();
 		for gateway in gateways.iter().copied() {
 			let accepted = self.emit_scaling_update_with_retry(gateway, frame).await;
 			if !accepted {

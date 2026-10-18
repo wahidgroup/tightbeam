@@ -7,6 +7,7 @@ use crate::colony::cluster::runtime::bounds::GatewayRuntimeCtx;
 use crate::colony::cluster::DialTarget;
 use crate::colony::common::{reply_frame, RegisterHiveRequest, ServletAddressUpdate};
 use crate::colony::hive::{RegisterHiveResponse, ServletAddressUpdateResponse};
+use crate::crypto::sign::VerifiedSignature;
 use crate::instrumentation::events::{
 	CLUSTER_HIVE_REGISTERED, CLUSTER_REGISTER_REFUSED, CLUSTER_UPDATE_ACCEPTED, CLUSTER_UPDATE_REFUSED,
 };
@@ -25,9 +26,10 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 	where
 		P::Address: FromStr,
 	{
-		if let Err(status) = self.admit_hive_control(&frame) {
-			return self.refuse_register(&frame, status);
-		}
+		let signature = match self.admit_hive_control(&frame) {
+			Ok(signature) => signature,
+			Err(status) => return self.refuse_register(&frame, status),
+		};
 
 		// Admit only a hive address that yields an exact hive identity URN.
 		let Some(hive_identity) = self.config.namespace.hive_from_bytes(&request.hive_addr) else {
@@ -71,7 +73,7 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 			Err(error) => {
 				// Releasing the replay slot lets a legitimate retry of the
 				// same signed frame proceed.
-				self.refuse_register_release(&frame, error.transit_status())
+				self.refuse_register_release(&frame, &signature, error.transit_status())
 			}
 		}
 	}
@@ -82,9 +84,10 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 		frame: Frame,
 		update: ServletAddressUpdate,
 	) -> Result<Option<Frame>, TightBeamError> {
-		if let Err(status) = self.admit_hive_control(&frame) {
-			return self.refuse_update(&frame, status);
-		}
+		let signature = match self.admit_hive_control(&frame) {
+			Ok(signature) => signature,
+			Err(status) => return self.refuse_update(&frame, status),
+		};
 
 		let Some((added, removed)) = self.config.parse_address_update(&update) else {
 			return self.refuse_update(&frame, TransitStatus::PermissionDenied);
@@ -94,7 +97,7 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 		// that names it, so an unsigned update refuses here rather than
 		// reaching the bind check (CWE-639).
 		let Some(signer_id) = frame.signer_id().map(Arc::from) else {
-			return self.refuse_update_release(&frame, TransitStatus::PermissionDenied);
+			return self.refuse_update_release(&frame, &signature, TransitStatus::PermissionDenied);
 		};
 
 		// The signer bind and the route write are one membership step, so
@@ -109,21 +112,24 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 			Err(error) => {
 				// Releasing the replay slot lets the hive resend the same
 				// signed update.
-				self.refuse_update_release(&frame, error.transit_status())
+				self.refuse_update_release(&frame, &signature, error.transit_status())
 			}
 		}
 	}
 
 	/// Origin and freshness gate shared by register and address-update.
-	fn admit_hive_control(&self, frame: &Frame) -> Result<(), TransitStatus> {
-		self.config.verify_hive(frame)?;
+	///
+	/// It returns the verified signature, the replay key a refusal releases.
+	fn admit_hive_control(&self, frame: &Frame) -> Result<VerifiedSignature, TransitStatus> {
+		let verified = self.config.verify_hive(frame)?;
+		let signature = verified.into_signature();
 
-		let freshness_status = self.replay_guard.admits(frame);
+		let freshness_status = self.replay_guard.admits(frame, &signature);
 		if freshness_status != TransitStatus::Ok {
 			return Err(freshness_status);
 		}
 
-		Ok(())
+		Ok(signature)
 	}
 
 	/// Answer a registration with `status` and no hive identity.
@@ -134,10 +140,15 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 		reply_frame(frame.metadata().id(), response)
 	}
 
-	/// Refuse a registration and return the replay slot the frame spent, so
-	/// the hive can retry the same signed frame.
-	fn refuse_register_release(&self, frame: &Frame, status: TransitStatus) -> Result<Option<Frame>, TightBeamError> {
-		self.replay_guard.release(frame);
+	/// Refuse a registration and return the replay slot its `signature`
+	/// spent, so the hive can retry the same signed frame.
+	fn refuse_register_release(
+		&self,
+		frame: &Frame,
+		signature: &VerifiedSignature,
+		status: TransitStatus,
+	) -> Result<Option<Frame>, TightBeamError> {
+		self.replay_guard.release(signature);
 		self.refuse_register(frame, status)
 	}
 
@@ -149,10 +160,15 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 		reply_frame(frame.metadata().id(), response)
 	}
 
-	/// Refuse an address update and return the replay slot the frame spent,
-	/// so the hive can resend the same signed update.
-	fn refuse_update_release(&self, frame: &Frame, status: TransitStatus) -> Result<Option<Frame>, TightBeamError> {
-		self.replay_guard.release(frame);
+	/// Refuse an address update and return the replay slot its `signature`
+	/// spent, so the hive can resend the same signed update.
+	fn refuse_update_release(
+		&self,
+		frame: &Frame,
+		signature: &VerifiedSignature,
+		status: TransitStatus,
+	) -> Result<Option<Frame>, TightBeamError> {
+		self.replay_guard.release(signature);
 		self.refuse_update(frame, status)
 	}
 }

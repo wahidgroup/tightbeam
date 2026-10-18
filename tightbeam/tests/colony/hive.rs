@@ -4,10 +4,9 @@
 
 use core::time::Duration;
 use std::sync::Arc;
-use tightbeam::transport::state::ClientIdentity;
+use tightbeam::crypto::sign::SigningIdentity;
 use tightbeam::utils::time::UnixMillis;
 
-use tightbeam::crypto::key::SigningKeyProvider;
 use tightbeam::crypto::x509::policy::DirectTrustValidator;
 
 use sha3::Sha3_256;
@@ -32,7 +31,7 @@ use tightbeam::{
 	exactly, hive,
 	policy::TransitStatus,
 	servlet, tb_assert_spec, tb_scenario,
-	testing::{HiveEnv, SetupEnv, TestDigest, TestKey},
+	testing::{HiveEnv, SetupEnv, TestDigest, TestIdentity, TestKey},
 	trace::TraceCollector,
 	transport::{
 		handshake::negotiation::TransportOffer, tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder,
@@ -44,7 +43,7 @@ use tightbeam::{
 };
 
 use crate::common::security::{expectation_failure, pinning_trust_store, ServerMaterials};
-use crate::common::x509::create_test_cert_with_key;
+use crate::common::x509::{create_test_cert_with_key, signing_identity};
 
 fn colony_ns() -> ColonyNamespace {
 	ColonyNamespace::default()
@@ -239,10 +238,10 @@ fn spawn_command_frame(id: impl AsRef<[u8]>, servlet_type: impl AsRef<str>) -> R
 }
 
 /// A signer that the hive trust store pins. `start` builds the trust store
-/// from the certificate. The client signs command frames with the provider.
+/// from the certificate. The client signs command frames under the identity.
 struct TrustedSignerContext {
 	certificate: Certificate,
-	provider: Arc<Secp256k1KeyProvider>,
+	identity: SigningIdentity,
 }
 
 impl TrustedSignerContext {
@@ -257,7 +256,7 @@ impl TrustedSignerContext {
 
 		HiveTlsConfig::new(
 			CertificateSpec::Built(Box::new(self.certificate.to_owned())),
-			Arc::clone(&self.provider) as Arc<dyn SigningKeyProvider>,
+			self.identity.provider_arc(),
 			vec![Arc::new(anchor)],
 		)
 		.expect("the hive TLS material must decode")
@@ -267,7 +266,8 @@ impl TrustedSignerContext {
 fn trusted_signer(subject: impl AsRef<str>) -> TrustedSignerContext {
 	let subject = subject.as_ref();
 	let (certificate, signing_key) = create_test_cert_with_key(subject, 365).expect("signer material");
-	TrustedSignerContext { certificate, provider: Arc::new(Secp256k1KeyProvider::from(signing_key)) }
+	let identity = signing_identity(certificate.to_owned(), signing_key);
+	TrustedSignerContext { certificate, identity }
 }
 
 /// Starts an established hive with the context signer pinned in its trust
@@ -293,13 +293,9 @@ async fn connect_hive(
 	hive: &HiveX509Test,
 	ctx: &TrustedSignerContext,
 ) -> Result<GenericClient<TokioListener>, TightBeamError> {
-	let identity = CertificateSpec::Built(Box::new(ctx.certificate.to_owned()));
 	let client = ClientBuilder::<TokioListener>::builder()
 		.with_trust_store(pinning_trust_store(&ctx.certificate)?)
-		.with_client_identity(ClientIdentity::from_spec(
-			identity,
-			Arc::clone(&ctx.provider) as Arc<dyn SigningKeyProvider>,
-		)?)
+		.with_client_identity(ctx.identity.clone())
 		.build();
 
 	let addr = hive.addr().ok_or(TightBeamError::NotEstablished)?;
@@ -361,27 +357,24 @@ fn manage_spawn_shape_status(response: ClusterCommandResponse) -> Result<Transit
 	}
 }
 
-async fn signed_heartbeat_frame(
-	provider: &Secp256k1KeyProvider,
-	id: impl AsRef<[u8]>,
-) -> Result<Frame, TightBeamError> {
+async fn signed_heartbeat_frame(identity: &SigningIdentity, id: impl AsRef<[u8]>) -> Result<Frame, TightBeamError> {
 	let id = id.as_ref();
 	let mut frame = command_frame(id, heartbeat_command())?;
-	frame.sign_with_provider::<Sha3_256, _>(provider).await?;
+	frame.sign_with_provider(identity).await?;
 	Ok(frame)
 }
 
-async fn signed_stop_frame(provider: &Secp256k1KeyProvider, id: impl AsRef<[u8]>) -> Result<Frame, TightBeamError> {
+async fn signed_stop_frame(identity: &SigningIdentity, id: impl AsRef<[u8]>) -> Result<Frame, TightBeamError> {
 	let id = id.as_ref();
 	let mut frame = stop_command_frame(id)?;
-	frame.sign_with_provider::<Sha3_256, _>(provider).await?;
+	frame.sign_with_provider(identity).await?;
 	Ok(frame)
 }
 
 /// Signs a command body the CHOICE cannot read: `alternatives` chooses
 /// whether the body names none of its alternatives or both of them.
 async fn signed_unreadable_command_frame(
-	provider: &Secp256k1KeyProvider,
+	identity: &SigningIdentity,
 	id: impl AsRef<[u8]>,
 	both: bool,
 ) -> Result<Frame, TightBeamError> {
@@ -398,19 +391,19 @@ async fn signed_unreadable_command_frame(
 
 	let heartbeat = both.then_some(HeartbeatParams { cluster_status: ClusterStatus::Healthy });
 	let mut frame = command_frame(id, ClusterCommand { heartbeat, manage })?;
-	frame.sign_with_provider::<Sha3_256, _>(provider).await?;
+	frame.sign_with_provider(identity).await?;
 	Ok(frame)
 }
 
 async fn signed_spawn_frame(
-	provider: &Secp256k1KeyProvider,
+	identity: &SigningIdentity,
 	id: impl AsRef<[u8]>,
 	servlet_type: impl AsRef<str>,
 ) -> Result<Frame, TightBeamError> {
 	let id = id.as_ref();
 	let servlet_type = servlet_type.as_ref();
 	let mut frame = spawn_command_frame(id, servlet_type)?;
-	frame.sign_with_provider::<Sha3_256, _>(provider).await?;
+	frame.sign_with_provider(identity).await?;
 	Ok(frame)
 }
 
@@ -470,7 +463,7 @@ tb_scenario! {
 			trace.event_with(UNSIGNED_MANAGE_MANAGE_SHAPE, &[], manage_stop_shape_status(response)?)?;
 
 			// A signed heartbeat must be accepted end to end.
-			let signed_heartbeat = signed_heartbeat_frame(&signer.provider, b"hb-signed").await?;
+			let signed_heartbeat = signed_heartbeat_frame(&signer.identity, b"hb-signed").await?;
 			let response = emit_command(&mut client, signed_heartbeat).await?;
 			trace.event_with(SIGNED_HEARTBEAT_ACCEPTED, &[], heartbeat_shape_status(response, false)?)?;
 
@@ -478,13 +471,13 @@ tb_scenario! {
 			// Unavailable in the manage CHOICE.
 			hive.drain().await?;
 
-			let signed_stop = signed_stop_frame(&signer.provider, b"manage-draining").await?;
+			let signed_stop = signed_stop_frame(&signer.identity, b"manage-draining").await?;
 			let response = emit_command(&mut client, signed_stop).await?;
 			trace.event_with(DRAINING_MANAGE_MANAGE_SHAPE, &[], manage_stop_shape_status(response)?)?;
 
 			// A spawn refused by the drain answers in the spawn alternative,
 			// which is the one its sender decodes.
-			let signed_spawn = signed_spawn_frame(&signer.provider, b"spawn-draining", "orphan").await?;
+			let signed_spawn = signed_spawn_frame(&signer.identity, b"spawn-draining", "orphan").await?;
 			let response = emit_command(&mut client, signed_spawn).await?;
 			trace.event_with(DRAINING_SPAWN_SPAWN_SHAPE, &[], manage_spawn_shape_status(response)?)?;
 
@@ -493,7 +486,7 @@ tb_scenario! {
 			// class the breaker counts.
 			let now = UnixMillis::now();
 			let mut donor = command_frame_with_order(b"hb-donor", heartbeat_command(), now.get())?;
-			donor.sign_with_provider::<Sha3_256, _>(&signer.provider).await?;
+			donor.sign_with_provider(&signer.identity).await?;
 
 			let transplanted = donor.nonrepudiation().cloned().ok_or(TightBeamError::MissingSignature)?;
 			let forged_order = now.saturating_add(Duration::from_millis(1)).get();
@@ -506,7 +499,7 @@ tb_scenario! {
 			// With the breaker open, a valid heartbeat is rejected during
 			// cooldown but keeps the heartbeat CHOICE, so the cluster records
 			// a reply instead of MalformedResponse eviction pressure.
-			let signed_heartbeat = signed_heartbeat_frame(&signer.provider, b"hb-open").await?;
+			let signed_heartbeat = signed_heartbeat_frame(&signer.identity, b"hb-open").await?;
 			let response = emit_command(&mut client, signed_heartbeat).await?;
 			trace.event_with(OPEN_BREAKER_HEARTBEAT_SHAPE, &[], heartbeat_shape_status(response, true)?)?;
 
@@ -548,18 +541,18 @@ tb_scenario! {
 		client: |HiveEnv { trace, context: signer, hive }| async move {
 			let mut client = connect_hive(&hive, &signer).await?;
 
-			let signed_stop = signed_stop_frame(&signer.provider, b"manage-bp").await?;
+			let signed_stop = signed_stop_frame(&signer.identity, b"manage-bp").await?;
 			let response = emit_command(&mut client, signed_stop).await?;
 			trace.event_with(BACKPRESSURE_MANAGE_MANAGE_SHAPE, &[], manage_stop_shape_status(response)?)?;
 
-			let signed_spawn = signed_spawn_frame(&signer.provider, b"spawn-bp", "orphan").await?;
+			let signed_spawn = signed_spawn_frame(&signer.identity, b"spawn-bp", "orphan").await?;
 			let response = emit_command(&mut client, signed_spawn).await?;
 			trace.event_with(BACKPRESSURE_SPAWN_SPAWN_SHAPE, &[], manage_spawn_shape_status(response)?)?;
 
 			// A signed heartbeat is exempt from the gate. It replies in the
 			// heartbeat CHOICE with real capacity data, and the
 			// ResourceExhausted status reflects saturation.
-			let signed_heartbeat = signed_heartbeat_frame(&signer.provider, b"hb-bp").await?;
+			let signed_heartbeat = signed_heartbeat_frame(&signer.identity, b"hb-bp").await?;
 			let response = emit_command(&mut client, signed_heartbeat).await?;
 			trace.event_with(BACKPRESSURE_HEARTBEAT_HEARTBEAT_SHAPE, &[], heartbeat_shape_status(response, false)?)?;
 
@@ -641,12 +634,12 @@ tb_scenario! {
 		},
 		client: |HiveEnv { trace, context: signer, hive }| async move {
 			let mut client = connect_hive(&hive, &signer).await?;
-			let empty = signed_unreadable_command_frame(&signer.provider, b"cmd-empty", false).await?;
+			let empty = signed_unreadable_command_frame(&signer.identity, b"cmd-empty", false).await?;
 			let response = emit_command(&mut client, empty).await?;
 
 			trace.event_with(EMPTY_COMMAND_REFUSED, &[], manage_stop_shape_status(response)?)?;
 
-			let ambiguous = signed_unreadable_command_frame(&signer.provider, b"cmd-both", true).await?;
+			let ambiguous = signed_unreadable_command_frame(&signer.identity, b"cmd-both", true).await?;
 			let response = emit_command(&mut client, ambiguous).await?;
 
 			trace.event_with(AMBIGUOUS_COMMAND_REFUSED, &[], manage_stop_shape_status(response)?)?;
@@ -705,7 +698,7 @@ tb_scenario! {
 		},
 		client: |HiveEnv { trace, context: signer, hive }| async move {
 			let mut client = connect_hive(&hive, &signer).await?;
-			let signed = signed_spawn_frame(&signer.provider, b"spawn-retry", "flaky").await?;
+			let signed = signed_spawn_frame(&signer.identity, b"spawn-retry", "flaky").await?;
 			let replay = signed.to_owned();
 
 			let first = emit_command(&mut client, signed).await?;
@@ -747,7 +740,7 @@ tb_scenario! {
 			let mut client = connect_hive(&hive, &signer).await?;
 			hive.drain().await?;
 
-			let signed = signed_stop_frame(&signer.provider, b"stop-draining").await?;
+			let signed = signed_stop_frame(&signer.identity, b"stop-draining").await?;
 			let replay = signed.to_owned();
 
 			let first = emit_command(&mut client, signed).await?;
@@ -831,7 +824,7 @@ tb_scenario! {
 		},
 		client: |HiveEnv { trace, context: signer, hive }| async move {
 			let mut client = connect_hive(&hive, &signer).await?;
-			let signed = signed_spawn_frame(&signer.provider, b"spawn-orphan", "orphan").await?;
+			let signed = signed_spawn_frame(&signer.identity, b"spawn-orphan", "orphan").await?;
 			let response = emit_command(&mut client, signed).await?;
 			trace.event_with(SPAWN_NON_UTF8_FORBIDDEN, &[], manage_spawn_shape_status(response)?)?;
 
@@ -902,8 +895,8 @@ fn contract_signing_key() -> Secp256k1SigningKey {
 /// Signs `frame` with the shared contract key under the canonical
 /// SHA3-256 convention.
 async fn sign_contract_frame(mut frame: Frame) -> Result<Frame, TightBeamError> {
-	let provider = Secp256k1KeyProvider::from(contract_signing_key());
-	frame.sign_with_provider::<Sha3_256, _>(&provider).await?;
+	let identity = TestIdentity::of(&contract_signing_key());
+	frame.sign_with_provider(&identity).await?;
 	Ok(frame)
 }
 
@@ -911,7 +904,7 @@ async fn sign_contract_frame(mut frame: Frame) -> Result<Frame, TightBeamError> 
 /// contract key. A verified signature proves byte fidelity end to end.
 fn contract_signature_verifies(frame: &Frame) -> bool {
 	frame
-		.verify::<Secp256k1Signature, Sha3_256>(contract_signing_key().verifying_key())
+		.verify::<Secp256k1Signature>(contract_signing_key().verifying_key())
 		.is_ok()
 }
 

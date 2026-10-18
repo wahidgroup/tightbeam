@@ -1,11 +1,15 @@
 /// Construct an X.509 certificate for a given profile.
 ///
-/// Certificates are valid from the moment of construction for the given
-/// `duration:`; the macro does not support back-dating or scheduling a
-/// future `notBefore`. Build a
-/// [`Validity`](crate::crypto::x509::time::Validity) explicitly and use
-/// [`CertificateBuilder`](crate::crypto::x509::builder::CertificateBuilder)
-/// directly when explicit validity bounds are required.
+/// The validity of a certificate starts at its construction and lasts for
+/// `duration:`. Explicit validity bounds take a
+/// [`Validity`](crate::crypto::x509::time::Validity) built by hand and
+/// [`CertificateBuilder`](crate::crypto::x509::builder::CertificateBuilder).
+///
+/// # Key identifiers
+///
+/// - Each certificate carries a subjectKeyIdentifier by RFC 7093 §2 method 1 (RFC 5280 §4.2.1.2).
+/// - The method takes the leftmost 160 bits of the SHA-256 of the `subjectPublicKey` BIT STRING.
+/// - An issued certificate also carries the issuer's `authorityKeyIdentifier` by the same method.
 ///
 /// # Examples
 ///
@@ -42,46 +46,62 @@ macro_rules! cert {
 		<$crate::crypto::x509::name::Name as core::str::FromStr>::from_str($value)?
 	};
 
-	// Resolve an optional pathLenConstraint: absent yields an unbounded path.
-	(@path_len) => {
-		None
-	};
-	(@path_len $path_len:expr) => {
-		Some($path_len)
+	// The `authorityKeyIdentifier` of the key that `$signer` holds, by RFC 7093
+	// §2 method 1 (RFC 5280 §4.2.1.1).
+	(@authority $signer:expr) => {{
+		use $crate::crypto::sign::Keypair;
+
+		let issuer_public_key = $crate::spki::SubjectPublicKeyInfoOwned::from_key($signer.verifying_key())?;
+		let issuer_key_identifier = $crate::crypto::x509::utils::Skid::of_public_key(&issuer_public_key);
+		$crate::crypto::x509::ext::pkix::AuthorityKeyIdentifier {
+			key_identifier: Some($crate::der::asn1::OctetString::new(issuer_key_identifier.as_bytes().as_slice())?),
+			authority_cert_issuer: None,
+			authority_cert_serial_number: None,
+		}
+	}};
+
+	// The `keyUsage` of a CA: certificate and CRL signing (RFC 5280 §4.2.1.3).
+	(@ca_usage) => {
+		$crate::crypto::x509::ext::pkix::KeyUsage(
+			$crate::crypto::x509::ext::pkix::KeyUsages::KeyCertSign
+				| $crate::crypto::x509::ext::pkix::KeyUsages::CRLSign,
+		)
 	};
 
-	// Drive `CertificateBuilder` once for every profile: same argument order,
-	// optional extensions, caller-selected signature algorithm.
+	// Drive `CertificateBuilder` once for every profile, under the manual
+	// profile, so the macro writes every extension: the subject key identifier
+	// of RFC 7093 §2 method 1, then the extensions of the arm.
 	(@build
-		profile: $profile:expr,
+		issuer: $issuer:expr,
 		subject: $subject:expr,
 		serial: $serial:expr,
 		duration: $duration:expr,
 		subject_public_key: $spki:expr,
 		signer: $signer:expr,
-		signature: $signature:ty
-		$(, extensions: [$($ext:expr),* $(,)?])?
+		extensions: [$($ext:expr),* $(,)?]
 	) => {{
 		use $crate::crypto::x509::builder::Builder;
 
-		#[allow(unused_mut)]
+		let subject_public_key_info: $crate::spki::SubjectPublicKeyInfoOwned = $spki;
+		let key_identifier = $crate::crypto::x509::utils::Skid::of_public_key(&subject_public_key_info);
+		let key_identifier = $crate::crypto::x509::ext::pkix::SubjectKeyIdentifier::try_from(key_identifier)?;
+
 		let mut builder = $crate::crypto::x509::builder::CertificateBuilder::new(
-			$profile,
+			$crate::crypto::x509::builder::Profile::Manual { issuer: $issuer },
 			$crate::crypto::x509::serial_number::SerialNumber::from($serial),
 			$crate::crypto::x509::time::Validity::from_now($duration)?,
 			$subject,
-			$spki,
+			subject_public_key_info,
 			$signer,
 		)?;
 
-		$( $( builder.add_extension(&$ext)?; )* )?
+		builder.add_extension(&key_identifier)?;
+		$( builder.add_extension(&$ext)?; )*
 
-		builder.build::<$signature>()
+		builder.build::<$crate::crypto::sign::ecdsa::der::Signature<$crate::crypto::sign::ecdsa::Secp256k1>>()
 	}};
 
 	// Root CA certificate with an explicit pathLenConstraint (RFC 5280 §4.2.1.9).
-	// `x509_cert`'s `Profile::Root` emits no pathLenConstraint, so a bounded root is
-	// modelled as a self-issued sub-CA (issuer == subject) carrying the constraint.
 	(
 		profile: Root,
 		subject: $subject:expr,
@@ -91,19 +111,17 @@ macro_rules! cert {
 		subject_public_key: $spki:expr,
 		path_len: $path_len:expr
 	) => {{
-		let subject = $crate::cert!(@name $subject);
-
 		$crate::cert!(@build
-			profile: $crate::crypto::x509::builder::Profile::SubCA {
-				issuer: subject.clone(),
-				path_len_constraint: Some($path_len),
-			},
-			subject: subject,
+			issuer: None,
+			subject: $crate::cert!(@name $subject),
 			serial: $serial,
 			duration: $duration,
 			subject_public_key: $spki,
 			signer: $signer,
-			signature: $crate::crypto::sign::ecdsa::der::Signature<$crate::crypto::sign::ecdsa::Secp256k1>
+			extensions: [
+				$crate::crypto::x509::ext::pkix::BasicConstraints { ca: true, path_len_constraint: Some($path_len) },
+				$crate::cert!(@ca_usage),
+			]
 		)
 	}};
 
@@ -117,13 +135,16 @@ macro_rules! cert {
 		subject_public_key: $spki:expr
 	) => {{
 		$crate::cert!(@build
-			profile: $crate::crypto::x509::builder::Profile::Root,
+			issuer: None,
 			subject: $crate::cert!(@name $subject),
 			serial: $serial,
 			duration: $duration,
 			subject_public_key: $spki,
 			signer: $signer,
-			signature: $crate::crypto::sign::ecdsa::der::Signature<$crate::crypto::sign::ecdsa::Secp256k1>
+			extensions: [
+				$crate::crypto::x509::ext::pkix::BasicConstraints { ca: true, path_len_constraint: None },
+				$crate::cert!(@ca_usage),
+			]
 		)
 	}};
 
@@ -154,17 +175,21 @@ macro_rules! cert {
 		$(, extensions: [$($ext:expr),* $(,)?])?
 	) => {{
 		$crate::cert!(@build
-			profile: $crate::crypto::x509::builder::Profile::Leaf {
-				issuer: $crate::cert!(@name $issuer),
-				enable_key_agreement: false,
-			},
+			issuer: Some($crate::cert!(@name $issuer)),
 			subject: $crate::cert!(@name $subject),
 			serial: $serial,
 			duration: $duration,
 			subject_public_key: $spki,
 			signer: $signer,
-			signature: $crate::crypto::sign::Signer
-			$(, extensions: [$($ext),*])?
+			extensions: [
+				$crate::cert!(@authority $signer),
+				$crate::crypto::x509::ext::pkix::BasicConstraints { ca: false, path_len_constraint: None },
+				$crate::crypto::x509::ext::pkix::KeyUsage(
+					$crate::crypto::x509::ext::pkix::KeyUsages::DigitalSignature
+						| $crate::crypto::x509::ext::pkix::KeyUsages::NonRepudiation,
+				),
+				$($($ext),*)?
+			]
 		)
 	}};
 
@@ -180,18 +205,30 @@ macro_rules! cert {
 		$(, path_len: $path_len:expr)?
 	) => {{
 		$crate::cert!(@build
-			profile: $crate::crypto::x509::builder::Profile::SubCA {
-				issuer: $crate::cert!(@name $issuer),
-				path_len_constraint: $crate::cert!(@path_len $( $path_len )?),
-			},
+			issuer: Some($crate::cert!(@name $issuer)),
 			subject: $crate::cert!(@name $subject),
 			serial: $serial,
 			duration: $duration,
 			subject_public_key: $spki,
 			signer: $signer,
-			signature: $crate::crypto::sign::Signer
+			extensions: [
+				$crate::cert!(@authority $signer),
+				$crate::crypto::x509::ext::pkix::BasicConstraints {
+					ca: true,
+					path_len_constraint: $crate::cert!(@path_len $( $path_len )?),
+				},
+				$crate::cert!(@ca_usage),
+			]
 		)
 	}};
+
+	// Resolve an optional pathLenConstraint: absent yields an unbounded path.
+	(@path_len) => {
+		None
+	};
+	(@path_len $path_len:expr) => {
+		Some($path_len)
+	};
 }
 
 /// Create an X.509 Certificate Signing Request using the builder pattern
@@ -235,11 +272,17 @@ macro_rules! csr {
 
 #[cfg(test)]
 mod tests {
+	use crate::crypto::policy::{Secp256k1Policy, VerificationPolicy};
 	use crate::crypto::sign::ecdsa::{Secp256k1SigningKey, Secp256k1VerifyingKey};
 	use crate::crypto::sign::Sha3Signer;
-	use crate::crypto::x509::ext::pkix::BasicConstraints;
+	use crate::crypto::x509::ext::pkix::{AuthorityKeyIdentifier, BasicConstraints, SubjectKeyIdentifier};
+	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
 	use crate::crypto::x509::utils::CertificateExt;
+	use crate::der::asn1::OctetString;
+	use crate::der::Encode;
 	use crate::spki::SubjectPublicKeyInfoOwned;
+	use crate::testing::TestKey;
+	use crate::x509::Certificate;
 
 	const SUBJECT: &str = "CN=Test Root CA,O=Test Org,C=US";
 
@@ -298,6 +341,98 @@ mod tests {
 			basic_constraints,
 			Some(BasicConstraints { ca: true, path_len_constraint: Some(2) })
 		));
+
+		Ok(())
+	}
+
+	/// A self-signed `cert!` root under the fixed scalar `fill`.
+	fn root(fill: u8) -> Result<(Secp256k1SigningKey, Certificate), Box<dyn core::error::Error>> {
+		let signing_key = Secp256k1SigningKey::from_bytes(&[fill; 32].into())?;
+		let spki = SubjectPublicKeyInfoOwned::from_key(*signing_key.verifying_key())?;
+		let signer = Sha3Signer::from(&signing_key);
+		let certificate = cert!(
+			profile: Root,
+			subject: SUBJECT,
+			serial: 1u32,
+			duration: one_year(),
+			signer: &signer,
+			subject_public_key: spki
+		)?;
+		Ok((signing_key, certificate))
+	}
+
+	/// A `cert!` leaf of a fresh key that the root of `root_key` issues.
+	fn leaf_of(root_key: &Secp256k1SigningKey) -> Result<Certificate, Box<dyn core::error::Error>> {
+		let (_, spki) = signing_material()?;
+		let signer = Sha3Signer::from(root_key);
+		let certificate = cert!(
+			profile: Leaf,
+			subject: "CN=Test Leaf,O=Test Org,C=US",
+			issuer: SUBJECT,
+			serial: 2u32,
+			duration: one_year(),
+			subject_public_key: spki,
+			signer: &signer
+		)?;
+		Ok(certificate)
+	}
+
+	/// The signature of a `cert!` root is a DER `ECDSA-Sig-Value`, so it
+	/// verifies under the crate's own policy (RFC 3279 §2.2.3).
+	#[test]
+	fn a_cert_macro_root_verifies_under_the_secp256k1_policy() -> TestResult {
+		let (_, certificate) = root(1)?;
+		let public_key_der = certificate.tbs_certificate.subject_public_key_info.to_der()?;
+		let message = certificate.tbs_certificate.to_der()?;
+		let algorithm = certificate.signature_algorithm.oid;
+
+		let policy = Secp256k1Policy::default();
+		policy.verify_signature(&algorithm, &public_key_der, &message, certificate.signature.raw_bytes())?;
+
+		Ok(())
+	}
+
+	/// A `cert!` root carries the `subjectKeyIdentifier` of RFC 7093 §2
+	/// method 1, which RFC 5280 §4.2.1.2 requires of a CA certificate. The
+	/// root's key is the `0x01` key, whose identifier comes from Python's
+	/// `hashlib` over the independently computed point, not from the crate.
+	#[test]
+	fn a_cert_macro_root_carries_its_rfc_7093_key_identifier() -> TestResult {
+		let (_, certificate) = root(1)?;
+		let expected = SubjectKeyIdentifier::from(OctetString::new(TestKey::INSECURE_FIXED_KEY_IDENTIFIER)?);
+
+		let carried = certificate.extension::<SubjectKeyIdentifier>()?;
+		assert_eq!(carried, Some(expected));
+		Ok(())
+	}
+
+	/// A `cert!` leaf names its issuer's key by the issuer's own key
+	/// identifier (RFC 5280 §4.2.1.1).
+	#[test]
+	fn a_cert_macro_leaf_names_its_issuer_by_its_key_identifier() -> TestResult {
+		let (root_key, root_certificate) = root(1)?;
+		let leaf = leaf_of(&root_key)?;
+
+		let issuer = root_certificate.extension::<SubjectKeyIdentifier>()?;
+		let authority = leaf.extension::<AuthorityKeyIdentifier>()?;
+		assert_eq!(
+			authority.and_then(|authority| authority.key_identifier),
+			issuer.map(|issuer| issuer.0)
+		);
+		Ok(())
+	}
+
+	/// A `cert!` leaf validates under a store that anchors its `cert!` root,
+	/// signature and key identifiers included.
+	#[test]
+	fn a_cert_macro_chain_validates_under_the_secp256k1_policy() -> TestResult {
+		let (root_key, root_certificate) = root(1)?;
+		let leaf = leaf_of(&root_key)?;
+		let store = CertificateTrustBuilder::from(Secp256k1Policy::default())
+			.with_certificate(root_certificate.clone())?
+			.build();
+
+		store.verify_chain(&[root_certificate, leaf])?;
 
 		Ok(())
 	}
