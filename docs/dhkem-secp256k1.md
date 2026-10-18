@@ -1,6 +1,6 @@
 # DHKEM over secp256k1 in CMS
 
-This document specifies DHKEM(secp256k1, HKDF-SHA256) as the KEM of a CMS `KEMRecipientInfo` ([RFC 9629][rfc9629]). It takes the shape of [RFC 9629][rfc9629] § 6.1, and [RFC 9936][rfc9936], which does the same for ML-KEM, is its model. tightbeam seals its CMS opening with this KEM.
+This document specifies DHKEM(secp256k1, HKDF-SHA256) as the KEM of a CMS `KEMRecipientInfo` ([RFC 9629][rfc9629]). It takes the shape of [RFC 9629][rfc9629] § 6.1, and [RFC 9936][rfc9936], which does the same for ML-KEM, is its model. tightbeam seals its CMS opening, and each frame sealed to a recipient key, with this KEM.
 
 ## Contents
 
@@ -58,20 +58,20 @@ kema-dhkem-secp256k1 KEM-ALGORITHM ::= {
 
 A `KEMRecipientInfo` ([RFC 9629][rfc9629] § 3) under this KEM sets its fields as follows.
 
-| Field       | Value                                                                                        |
-| ----------- | -------------------------------------------------------------------------------------------- |
-| `version`   | 0                                                                                            |
-| `rid`       | The recipient certificate's `subjectKeyIdentifier`, else its issuer and serial number        |
-| `kem`       | `id-alg-dhkem-secp256k1`, parameters absent                                                  |
-| `kemct`     | `enc`, the 65-octet uncompressed point of the ephemeral that `Encap` drew                    |
-| `kdf`       | `id-alg-hkdf-with-sha3-256` ([RFC 9688][rfc9688] § 5.1), parameters absent                   |
-| `kekLength` | The key size of `wrap`: 32 for `id-aes256-wrap`                                              |
-| `ukm`       | Optional. A sender MAY carry one, and a recipient that expects a purpose MUST refuse another |
-| `wrap`      | `id-aes256-wrap` ([RFC 3565][rfc3565])                                                       |
+| Field       | Value                                                                                                                                                  |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `version`   | 0                                                                                                                                                      |
+| `rid`       | The recipient certificate's `subjectKeyIdentifier`, else its issuer and serial number. A bare key's is its [RFC 7093][rfc7093] § 2 method 1 identifier |
+| `kem`       | `id-alg-dhkem-secp256k1`, parameters absent                                                                                                            |
+| `kemct`     | `enc`, the 65-octet uncompressed point of the ephemeral that `Encap` drew                                                                              |
+| `kdf`       | `id-alg-hkdf-with-sha3-256` ([RFC 9688][rfc9688] § 5.1), parameters absent                                                                             |
+| `kekLength` | The key size of `wrap`: 32 for `id-aes256-wrap`                                                                                                        |
+| `ukm`       | Optional. A sender MAY carry one, and a recipient that expects a purpose MUST refuse another                                                           |
+| `wrap`      | `id-aes256-wrap` ([RFC 3565][rfc3565])                                                                                                                 |
 
 A recipient MUST confirm that `kekLength` is the key size of `wrap` ([RFC 9629][rfc9629] § 3), and it MUST refuse a `kemct` of another length or form before it runs `Decap`.
 
-In tightbeam's CMS opening, the `ukm` is the purpose label `tb/handshake/opening/ukm/v1` followed by 32 random octets that each seal draws for itself, and the server refuses a `ukm` of another label or length.
+In tightbeam's CMS opening, the `ukm` is the purpose label `tb/handshake/opening/ukm/v1` followed by 32 random octets that each seal draws for itself, and the server refuses a `ukm` of another label or length. A frame sealed to a recipient key carries the label `tb/frame/ukm/v1` in the same form, and a frame decryptor refuses a `ukm` of another label or length.
 
 ## Key derivation
 
@@ -120,6 +120,7 @@ The KEM layer has published vectors in [draft-wahby-cfrg-hpke-kem-secp256k1-01][
 - [RFC 5912][rfc5912]: New ASN.1 Modules for the Public Key Infrastructure Using X.509 (PKIX)
 - [RFC 5280][rfc5280]: Internet X.509 Public Key Infrastructure Certificate and CRL Profile
 - [RFC 3565][rfc3565]: Use of the Advanced Encryption Standard (AES) Encryption Algorithm in Cryptographic Message Syntax (CMS)
+- [RFC 7093][rfc7093]: Additional Methods for Generating Key Identifiers Values
 - [NIST SP 800-57 Part 1 Rev. 5][sp800-57]: Recommendation for Key Management
 
 [rfc9629]: https://datatracker.ietf.org/doc/html/rfc9629
@@ -133,4 +134,5 @@ The KEM layer has published vectors in [draft-wahby-cfrg-hpke-kem-secp256k1-01][
 [rfc5912]: https://datatracker.ietf.org/doc/html/rfc5912#section-6
 [rfc5280]: https://datatracker.ietf.org/doc/html/rfc5280
 [rfc3565]: https://datatracker.ietf.org/doc/html/rfc3565
+[rfc7093]: https://datatracker.ietf.org/doc/html/rfc7093#section-2
 [sp800-57]: https://doi.org/10.6028/NIST.SP.800-57pt1r5

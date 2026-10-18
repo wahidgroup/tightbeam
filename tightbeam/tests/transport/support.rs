@@ -18,7 +18,6 @@ use tokio::task::JoinHandle;
 use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
 use tightbeam::crypto::x509::KeyPurposes;
-use tightbeam::der::Decode;
 use tightbeam::policy::TransitStatus;
 use tightbeam::prelude::TightBeamSocketAddr;
 use tightbeam::testing::TestFrame;
@@ -30,7 +29,7 @@ use tightbeam::transport::state::EncryptedProtocolState;
 use tightbeam::transport::state::SessionPhase;
 use tightbeam::transport::tcp::r#async::{SplitTransport, TcpTransport, TokioListener, TokioStream};
 use tightbeam::transport::{
-	ClientBuilder, ConnectionBuilder, EncryptedMessageIO, EncryptedProtocol, MessageCollector, MessageIO,
+	Arrived, ClientBuilder, ConnectionBuilder, EncryptedMessageIO, EncryptedProtocol, MessageCollector, MessageIO,
 	TransportEncryptionConfig, TransportError, TransportLimits, WireEnvelope,
 };
 use tightbeam::urn::Urn;
@@ -304,11 +303,11 @@ pub async fn establish_mutual_transports_of(
 }
 
 pub async fn serve_one_handshake_message(transport: &mut TcpTransport<TokioStream>) -> Result<(), TightBeamError> {
-	let wire_bytes = transport.read_envelope_bytes().await?;
-	let wire_envelope = WireEnvelope::from_der(&wire_bytes)?;
+	let mut wire_bytes = transport.read_envelope_bytes().await?;
+	let wire_envelope = WireEnvelope::arrive(&mut wire_bytes)?;
 	let envelope = match wire_envelope {
-		WireEnvelope::Cleartext(envelope) => envelope,
-		WireEnvelope::Encrypted(_) => return Err(expectation_failure("handshake containers must be cleartext")),
+		Arrived::Cleartext(envelope) => envelope,
+		Arrived::Encrypted(_) => return Err(expectation_failure("handshake containers must be cleartext")),
 	};
 
 	let request = HandshakeMessage::try_from(envelope)?;

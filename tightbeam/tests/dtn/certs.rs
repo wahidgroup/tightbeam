@@ -183,14 +183,20 @@ pub fn rover_signer() -> FrameSigner {
 // Shared Encryption Key (Mission Control ↔ Rover)
 // ============================================================================
 
-/// Generate a shared AES-256-GCM cipher for end-to-end encryption between Mission Control and Rover
-/// The relay satellites cannot decrypt messages as they do not possess this key
-pub fn generate_shared_cipher() -> tightbeam::crypto::aead::Aes256Gcm {
-	use tightbeam::crypto::aead::{Aes256Gcm, Key, KeyInit};
+/// The key-encryption key Mission Control and the Rover share, which every
+/// node of the path holds by reference.
+pub type SharedCipher = std::sync::Arc<tightbeam::crypto::key::Aes256GcmKeyProvider>;
+
+/// Generate a shared key-encryption key for end-to-end encryption between
+/// Mission Control and the Rover. The relay satellites cannot decrypt
+/// messages, because they do not hold this key.
+pub fn generate_shared_cipher() -> SharedCipher {
+	use tightbeam::crypto::key::Aes256GcmKeyProvider;
 	// For testing: use a deterministic key
 	// In production, this would be securely exchanged or derived
 	let key_bytes = hex!("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
-	Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key_bytes))
+	let cipher = Aes256GcmKeyProvider::new(key_bytes.to_vec(), b"tb/test/dtn/kek/v1".to_vec());
+	std::sync::Arc::new(cipher.expect("32 octets is the key of AES-256 key wrap"))
 }
 
 // ============================================================================

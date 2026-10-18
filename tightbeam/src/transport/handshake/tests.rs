@@ -19,14 +19,13 @@ use rand_core::{CryptoRng, RngCore};
 
 use crate::asn1::OctetString;
 use crate::cms::content_info::ContentInfo as ContentInfoValue;
-use crate::cms::enveloped_data::EncryptedContentInfo;
 use crate::cms::signed_data::SignedData;
 use crate::cms::signed_data::SignerIdentifier;
 use crate::constants::{
 	EC_PUBKEY_COMPRESSED_SIZE, TIGHTBEAM_ACK_KDF_INFO, TIGHTBEAM_ACK_KEY_ID_DOMAIN, TIGHTBEAM_C2S_KDF_INFO,
 	TIGHTBEAM_S2C_KDF_INFO,
 };
-use crate::crypto::aead::{DecryptContent, DirectionalCiphers, KeyInit};
+use crate::crypto::aead::{DirectionalCiphers, KeyInit, RecordDirection, RecvCipher, RuntimeAead};
 use crate::crypto::cms::{AuthEnvelopedData, Opener};
 use crate::crypto::common::KeySizeUser;
 use crate::crypto::hash::{Digest, Sha3_256};
@@ -550,14 +549,19 @@ impl SessionObserver for ArtifactObserver {
 /// cipher.
 pub const RECORD_PLAINTEXT: &[u8] = b"application record sealed under the traffic key";
 
-/// Seal one record under the client's send cipher.
-pub fn sealed_record(client: &EstablishedSession) -> Result<EncryptedContentInfo, TightBeamError> {
-	client.keys().send().encrypt_next(RECORD_PLAINTEXT, None)
+/// Seal one record under the client's send cipher, as the DER it travels as.
+pub fn sealed_record(client: &EstablishedSession) -> Result<Vec<u8>, TightBeamError> {
+	let record = client.keys().send().encrypt_next(RECORD_PLAINTEXT)?;
+	Ok(record.to_der()?)
 }
 
-/// The AEAD of the default provider, which the observer keys with what it
-/// derives.
-type ObserverCipher = <DefaultCryptoProvider as AeadProvider>::AeadCipher;
+/// Open `record`, the DER of one record, as the first client-to-server record
+/// of epoch 0 under `key`.
+pub fn opened_record(key: RuntimeAead, record: &[u8]) -> Result<SecretSlice<u8>, TightBeamError> {
+	let mut arrived = record.to_vec();
+	let opened = RecvCipher::new(key, 0, RecordDirection::ClientToServer).open(&mut arrived)?;
+	Ok(SecretSlice::from(opened.to_vec()))
+}
 
 /// The length of the key-encryption key of a handshake seal.
 const OBSERVER_KEK_SIZE: usize = 32;
@@ -625,14 +629,16 @@ impl StaticKeyObserver {
 		Ok(Self { base, salt: salt.as_ref().to_vec(), candidates })
 	}
 
-	/// Open `frame` under every traffic key the observer derives, in both
-	/// directions, and report each outcome.
-	pub fn record_attempts(&self, frame: &EncryptedContentInfo) -> Result<RecordAttempts, Box<dyn Error>> {
+	/// Open `record`, the DER of a recorded client record, under every record
+	/// key the observer derives, in both directions, and report each outcome.
+	/// Each attempt opens it as a client record, so each reaches the key.
+	pub fn record_attempts(&self, record: &[u8]) -> Result<RecordAttempts, Box<dyn Error>> {
 		let mut attempts = Vec::new();
 		for secret in self.handshake_secrets()? {
-			let ciphers = DirectionalCiphers::derive::<DefaultCryptoProvider, _>(&secret, KdfSalt::new(&self.salt))?;
-			attempts.push(ciphers.client_to_server.decrypt_content(frame));
-			attempts.push(ciphers.server_to_client.decrypt_content(frame));
+			let salt = KdfSalt::new(&self.salt);
+			let ciphers = DirectionalCiphers::derive::<DefaultCryptoProvider, _>(&secret, salt, 0)?;
+			attempts.push(opened_record(ciphers.client_to_server, record));
+			attempts.push(opened_record(ciphers.server_to_client, record));
 		}
 
 		let Some(base) = &self.base else {
@@ -640,7 +646,7 @@ impl StaticKeyObserver {
 		};
 
 		for label in [TIGHTBEAM_C2S_KDF_INFO, TIGHTBEAM_S2C_KDF_INFO] {
-			attempts.push(self.pre_change_cipher(base, label)?.decrypt_content(frame));
+			attempts.push(opened_record(self.pre_change_key(base, label)?, record));
 		}
 
 		Ok(attempts)
@@ -690,12 +696,11 @@ impl StaticKeyObserver {
 		self.candidates.iter().map(derive).collect()
 	}
 
-	/// The cipher that `base` alone keys under `label`, with no
+	/// The record key that `base` alone derives under `label`, with no
 	/// ephemeral-ephemeral input.
-	fn pre_change_cipher(&self, base: &BaseSecret, label: &[u8]) -> Result<ObserverCipher, HandshakeError> {
-		let key_size = <ObserverCipher as KeySizeUser>::key_size();
-		let key = ObserverKdf::derive_dynamic_key(base.as_bytes(), label, Some(&self.salt), key_size)?;
-		Ok(ObserverCipher::new_from_slice(&key)?)
+	fn pre_change_key(&self, base: &BaseSecret, label: &[u8]) -> Result<RuntimeAead, Box<dyn Error>> {
+		let kek = self.pre_change_kek(base, label)?;
+		Ok(RuntimeAead::new::<DefaultCryptoProvider>(kek)?)
 	}
 
 	/// The key-encryption key that `base` alone derives under `label`, with
@@ -1301,6 +1306,16 @@ impl KekOpening {
 		let (kek, key_identifier) = sealer.kek_opening();
 		let framed = purpose.frame(plaintext).expect("the plaintext fits its frame");
 		Self { kek, key_identifier, plaintext: framed.to_vec() }
+	}
+
+	/// What opens a seal under `kek`, which `key_identifier` names, over
+	/// `plaintext`.
+	pub fn new(kek: impl Into<Vec<u8>>, key_identifier: impl Into<Vec<u8>>, plaintext: impl Into<Vec<u8>>) -> Self {
+		Self {
+			kek: kek.into(),
+			key_identifier: key_identifier.into(),
+			plaintext: plaintext.into(),
+		}
 	}
 }
 

@@ -1,9 +1,8 @@
-//! The CMS types the crate defines itself, and the authenticated envelope
-//! that seals a content to one recipient.
+//! The authenticated envelope that seals a content to one recipient.
 //!
 //! The `cms` crate holds every other CMS type. It lacks `AuthEnvelopedData`
 //! (RFC 5083), `KEMRecipientInfo` and `CMSORIforKEMOtherInfo` (RFC 9629), and
-//! `GCMParameters` (RFC 5084), so the crate defines each once with `der`
+//! `GCMParameters` (RFC 5084), so [`crate::asn1`] defines each once with `der`
 //! derives, field by field against the ASN.1 module of its RFC.
 //!
 //! ## The envelope
@@ -29,10 +28,14 @@
 //! - `Kem` writes a `KEMRecipientInfo` (RFC 9629 §3) in an `ori` of type `id-ori-kem`.
 //! - `Kek` writes a `KEKRecipientInfo` (RFC 5652 §6.2.3) under a key both ends hold.
 //!
+//! A session's records take the `Kek` kind, which builds under `aead`,
+//! `signature`, `kdf`, and `ecdh`, and the `Kem` kind also needs `hpke`.
+//!
 //! A `Kem` recipient runs the provider's [`RecipientKem`]:
 //!
-//! - A sender seals to a [`KemRecipient`].
-//! - An opener holds a [`KeyAgreementIdentity`], whose backend runs the KEM's private-key operation.
+//! - A sender seals to a [`KemRecipient`], of a certificate or of a bare key ([`KemRecipient::bare`]).
+//! - An opener holds a [`KemKeyHolder`], whose backend runs the KEM's private-key operation.
+//! - [`KeyAgreementIdentity`] holds the key of a certificate, and [`BareKemKey`] a bare key.
 //! - The shared secret derives the KEK alone, under the provider's KDF (RFC 9629 §7):
 //!
 //! ```text
@@ -60,23 +63,30 @@
 //! [rfc3565]: https://datatracker.ietf.org/doc/html/rfc3565
 
 mod attributes;
-mod syntax;
 
-#[cfg(all(feature = "hpke", feature = "signature"))]
+#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 mod envelope;
-#[cfg(all(feature = "hpke", feature = "signature"))]
+#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 mod error;
+#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
+mod kek;
 #[cfg(all(feature = "hpke", feature = "signature"))]
 mod recipient;
 #[cfg(all(test, feature = "hpke", feature = "signature", feature = "ecdh"))]
 mod tests;
 
+pub use crate::asn1::{AuthEnvelopedData, CmsOriForKemOtherInfo, GcmParameters, KemRecipientInfo};
 pub use attributes::AttributesExt;
-pub use syntax::{AuthEnvelopedData, CmsOriForKemOtherInfo, GcmParameters, KemRecipientInfo};
 
-#[cfg(all(feature = "hpke", feature = "signature"))]
+#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 pub use envelope::ContentEncryption;
-#[cfg(all(feature = "hpke", feature = "signature"))]
+#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
+pub(in crate::crypto) use envelope::Detached;
+#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 pub use error::EnvelopeError;
+#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
+pub(crate) use kek::Kek;
 #[cfg(all(feature = "hpke", feature = "signature"))]
-pub use recipient::{Encapsulation, KemRecipient, KeyAgreementIdentity, Opener, Recipient, RecipientKem};
+pub use recipient::{
+	BareKemKey, Encapsulation, KemKeyHolder, KemRecipient, KeyAgreementIdentity, Opener, Recipient, RecipientKem,
+};

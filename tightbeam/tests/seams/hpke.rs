@@ -7,11 +7,10 @@
 
 use std::sync::Arc;
 
-use tightbeam::crypto::aead::DecryptContent;
-use tightbeam::crypto::secret::ToInsecure;
 use tightbeam::crypto::sign::SigningIdentity;
 use tightbeam::crypto::x509::policy::{DirectTrustValidator, ExpiryValidator};
 use tightbeam::crypto::x509::KeyPurposes;
+use tightbeam::der::Encode;
 use tightbeam::oids::{HASH_SHA3_512, SIGNER_ECDSA_WITH_SHA3_512};
 use tightbeam::transport::handshake::negotiation::RunnableProfile;
 use tightbeam::transport::handshake::{
@@ -59,12 +58,13 @@ fn outside_pair(
 async fn an_outside_provider_runs_the_hpke_flow() -> Result<(), Box<dyn std::error::Error>> {
 	let (mut client, mut server) = outside_pair(outside_identity(), None, PeerAuthentication::Anonymous);
 	run_legs(&mut client, &mut server).await;
+
 	let client_session = client.complete()?;
 	let server_session = server.complete()?;
 
-	let record = client_session.keys().send().encrypt_next(CONTENT, None)?;
-	let opened = server_session.keys().recv().decrypt_content(&record)?;
-	assert_eq!(opened.to_insecure().as_slice(), CONTENT);
+	let mut record = client_session.keys().send().encrypt_next(CONTENT)?.to_der()?;
+	let opened = server_session.keys().recv().open(&mut record)?;
+	assert_eq!(opened, CONTENT);
 	Ok(())
 }
 

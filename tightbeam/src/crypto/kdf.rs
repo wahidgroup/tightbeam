@@ -324,7 +324,7 @@ impl EcdhSecret {
 
 	/// A second owner of this secret, for a holder that derives from it more
 	/// than once.
-	#[cfg(any(test, all(feature = "hpke", feature = "x509")))]
+	#[cfg(test)]
 	pub(crate) fn duplicate(&self) -> Self {
 		self.with(Self::copy_of)
 	}

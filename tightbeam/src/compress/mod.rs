@@ -11,8 +11,8 @@ use crate::{cms::signed_data::EncapsulatedContentInfo, error::CompressionResult,
 
 #[cfg(feature = "zstd")]
 use crate::{
-	cms::content_info::CmsVersion, constants::DEFAULT_MAX_DECOMPRESSED_LEN, error::CompressionError,
-	oids::COMPRESSION_CONTENT, spki::AlgorithmIdentifierOwned,
+	cms::content_info::CmsVersion, constants::DEFAULT_MAX_DECOMPRESSED_LEN, error::CompressionError, oids::DATA,
+	spki::AlgorithmIdentifierOwned,
 };
 
 pub use crate::core::Inflator;
@@ -55,8 +55,9 @@ pub trait Compressor {
 	/// [`CompressedData`] metadata.
 	///
 	/// `content_info` names the encapsulated content. When it is `None`, the
-	/// implementation picks its own default, which is [`COMPRESSION_CONTENT`]
-	/// for [`ZstdCompression`].
+	/// implementation picks its own default, which is `id-data` for
+	/// [`ZstdCompression`], the type of the frame body it compresses (RFC 3274
+	/// §1.1).
 	///
 	/// # Errors
 	///
@@ -126,7 +127,7 @@ impl Compressor for ZstdCompression {
 
 		let compression_alg = AlgorithmIdentifierOwned::from(self);
 		let encap_content_info =
-			content_info.unwrap_or(EncapsulatedContentInfo { econtent_type: COMPRESSION_CONTENT, econtent: None });
+			content_info.unwrap_or(EncapsulatedContentInfo { econtent_type: DATA, econtent: None });
 		let compressed_data = CompressedData { version: CmsVersion::V0, compression_alg, encap_content_info };
 
 		Ok((output, compressed_data))
@@ -216,6 +217,17 @@ mod tests {
 		let data = vec![0u8; len];
 		let (compressed, _) = ZstdCompression::default().compress(&data, None)?;
 		Ok(compressed)
+	}
+
+	/// The frame body is opaque data, so its `CompressedData` names `id-data`,
+	/// `1.2.840.113549.1.7.1` (RFC 5652 §4), as the type of the content it
+	/// compresses (RFC 3274 §1.1).
+	#[test]
+	fn a_compressed_body_declares_id_data() -> Result<()> {
+		let (_, compressed_data) = ZstdCompression::default().compress(b"frame body", None)?;
+		let declared = compressed_data.encap_content_info.econtent_type;
+		assert_eq!(declared, crate::der::asn1::ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.1"));
+		Ok(())
 	}
 
 	#[test]

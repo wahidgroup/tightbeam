@@ -7,8 +7,7 @@ use std::sync::Arc;
 
 use sha3::Sha3_256;
 use tightbeam::asn1::MessagePriority;
-use tightbeam::constants::TIGHTBEAM_HPKE_FRAME_INFO;
-use tightbeam::crypto::hpke::{HpkeMessage, HpkeSecp256k1Sha3Aes256Gcm, HpkeSecretKeyOps};
+use tightbeam::crypto::hpke::{HpkeMessage, HpkeSecp256k1Sha256Aes256Gcm, HpkeSecretKeyOps};
 use tightbeam::crypto::secret::ToInsecure;
 use tightbeam::crypto::sign::ecdsa::k256::SecretKey;
 use tightbeam::transport::tcp::r#async::TokioListener;
@@ -18,6 +17,9 @@ use super::currency::MonetaryAmount;
 use super::harness::{PaymentHarness, PAYMENT_TAG};
 
 use tightbeam::urn::Urn;
+
+/// The HPKE `info` the key manager opens a sealed secret under.
+const KEY_MANAGER_HPKE_INFO: &[u8] = b"tb/test/payments/hpke/v1";
 
 pub(crate) const AUTHORIZATION_APPROVED: Urn<'static> =
 	tightbeam::urn!("test", "event:servlets/authorization-approved");
@@ -183,8 +185,8 @@ servlet! {
 				}?))
 			}
 			KeyManagerRequest::Decrypt(decrypt_req) => {
-				let sealed = HpkeMessage::<HpkeSecp256k1Sha3Aes256Gcm>::from_bytes(&decrypt_req.ciphertext)?;
-				let plaintext_secret = secret_key.as_ref().open(&sealed, TIGHTBEAM_HPKE_FRAME_INFO, b"")?;
+				let sealed = HpkeMessage::<HpkeSecp256k1Sha256Aes256Gcm>::from_bytes(&decrypt_req.ciphertext)?;
+				let plaintext_secret = secret_key.as_ref().open(&sealed, KEY_MANAGER_HPKE_INFO, b"")?;
 				let plaintext = plaintext_secret.to_insecure().to_vec();
 				let response = DecryptResponse { plaintext };
 

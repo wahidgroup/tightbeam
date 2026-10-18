@@ -1,8 +1,8 @@
 //! V3 frame DER encode/decode roundtrip via the public builder API.
 
 use tightbeam::builder::{FrameBuilder, TypeBuilder};
-use tightbeam::crypto::aead::{Aes256Gcm, Key, KeyInit};
 use tightbeam::crypto::hash::Sha3_256;
+use tightbeam::crypto::key::Aes256GcmKeyProvider;
 use tightbeam::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
 use tightbeam::prelude::*;
 use tightbeam::testing::{ScenarioConfig, SetupEnv, TestIdentity};
@@ -47,7 +47,7 @@ tightbeam::flagset!(TestFlagSet: FlagTestDevelopmentMode, FlagTestDebugLevel);
 
 fn build_v3_frame(message: &TestMessage) -> Result<tightbeam::Frame, TightBeamError> {
 	let key_bytes = [0x44u8; 32];
-	let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key_bytes));
+	let cipher = Aes256GcmKeyProvider::new(key_bytes.to_vec(), b"tb/test/frame-der/kek/v1".to_vec())?;
 	let signing_key = Secp256k1SigningKey::from_bytes(&key_bytes.into())?;
 	let previous_hash = tightbeam::utils::digest::<Sha3_256>(message)?;
 
@@ -56,7 +56,7 @@ fn build_v3_frame(message: &TestMessage) -> Result<tightbeam::Frame, TightBeamEr
 		.with_order(1_696_521_700)
 		.with_message(message.to_owned())
 		.with_message_hasher::<Sha3_256>([])
-		.with_aead(cipher)
+		.with_encryptor(cipher)
 		.with_signer::<Secp256k1Signature, _>(TestIdentity::certified(signing_key))
 		.with_priority(asn1::MessagePriority::Expedited)
 		.with_lifetime(3_600)

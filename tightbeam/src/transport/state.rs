@@ -1339,13 +1339,7 @@ mod tests {
 	/// A completed session carrying a peer identity, which authorization reads.
 	#[cfg(feature = "testing")]
 	fn established_session() -> EstablishedSession {
-		use crate::crypto::aead::{Aes256Gcm, DirectionalCiphers, KeyInit};
-
-		let keys = SessionKeys::for_client(DirectionalCiphers {
-			client_to_server: Aes256Gcm::new(&[0u8; 32].into()),
-			server_to_client: Aes256Gcm::new(&[1u8; 32].into()),
-		});
-
+		let keys = SessionKeys::for_client(crate::testing::TestKey::insecure_directional_keys());
 		EstablishedSession::new(keys, None, None, Some(Arc::new(fixture_certificate())), None)
 	}
 

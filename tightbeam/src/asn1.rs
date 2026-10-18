@@ -1,3 +1,6 @@
+mod syntax;
+pub mod wire_der;
+
 // Re-exports
 pub use crate::cms::compressed_data::CompressedData;
 pub use crate::cms::content_info::ContentInfo;
@@ -9,6 +12,10 @@ pub use crate::frame::{BodyTransform, Frame, Metadata};
 pub use crate::pkcs12::digest_info::DigestInfo;
 pub use crate::spki::{AlgorithmIdentifier, AlgorithmIdentifierOwned};
 pub use crate::version::GatedField;
+#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
+pub(crate) use syntax::GcmParametersRef;
+pub use syntax::{AuthEnvelopedData, CmsOriForKemOtherInfo, GcmParameters, KemRecipientInfo};
+pub use wire_der::WireDer;
 
 /// Protocol version determines metadata structure and features
 ///

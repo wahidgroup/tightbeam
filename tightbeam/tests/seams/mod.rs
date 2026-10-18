@@ -7,13 +7,13 @@
 //!   canonical form refuses a high `s`, as a [`SigningProvider`],
 //! - a KDF, HKDF over SHA3-512 under an identifier of its own arc, as a [`KdfProvider`],
 //! - a KEM, the DHKEM over secp256k1 under a KEM identifier of its own, through [`RecipientKem`],
-//! - a signing backend, as a [`SigningKeyProvider`], and
-//! - a key-agreement backend that runs its own scalar product, as a [`DiffieHellman`] backend.
+//! - a signing backend, as a [`SigningKeyProvider`],
+//! - a key-agreement backend that runs its own scalar product, as a [`DiffieHellman`] backend,
+//! - an AEAD, AES-128-GCM under a cipher type of its own, as a [`ContentEncryption`], and
+//! - a key wrap that brings `wrap` and `unwrap` alone, as a [`KeyWrapAlgorithm`].
 //!
-//! The house types the outside provider selects:
-//!
-//! - the key wrap, AES-128 key wrap, through [`KeyWrapProvider`], and
-//! - the AEAD, AES-128-GCM, through [`ContentEncryption`].
+//! The outside provider selects one house type, the key wrap, AES-128 key
+//! wrap, through [`KeyWrapProvider`].
 //!
 //! The provider names no HPKE suite, and [`hpke`] and [`cms`] run both
 //! handshakes under it. [`kem`] brings a KEM whose private-key operation is
@@ -21,6 +21,7 @@
 
 #[cfg(feature = "transport-cms")]
 mod cms;
+mod frames;
 #[cfg(feature = "transport-hpke")]
 mod hpke;
 mod kem;
@@ -28,13 +29,18 @@ mod trust;
 
 use std::sync::Arc;
 
+use tightbeam::asn1::GcmParameters;
 use tightbeam::builder::frame::FrameBuilder;
 use tightbeam::builder::TypeBuilder;
-use tightbeam::crypto::aead::{Aes128Gcm, Aes128GcmOid};
-use tightbeam::crypto::cms::{
-	AuthEnvelopedData, Encapsulation, EnvelopeError, KemRecipient, KeyAgreementIdentity, Opener, Recipient,
-	RecipientKem,
+use tightbeam::crypto::aead::{
+	AeadAlgorithm, AeadCore, AeadInPlace, Aes128Gcm, Aes128GcmOid, Error as AeadError, Key, KeyInit, KeySizeUser,
+	Nonce, Tag,
 };
+use tightbeam::crypto::cms::{
+	AuthEnvelopedData, ContentEncryption, Encapsulation, EnvelopeError, KemRecipient, KeyAgreementIdentity, Opener,
+	Recipient, RecipientKem,
+};
+use tightbeam::crypto::common::typenum::U32;
 use tightbeam::crypto::hash::{Digest, Sha3_512};
 use tightbeam::crypto::hpke::{DhKem, HkdfSha256};
 use tightbeam::crypto::k256::ecdsa::{DerSignature, Signature, SigningKey, VerifyingKey};
@@ -44,8 +50,8 @@ use tightbeam::crypto::kdf::{Hkdf, KdfError, KdfFunction};
 use tightbeam::crypto::key::{DiffieHellman, KeyBackend, KeyError, Secp256k1KeyProvider, SigningKeyProvider};
 use tightbeam::crypto::policy::ProviderPolicy;
 use tightbeam::crypto::profiles::{
-	AeadProvider, Aes128Wrap, CryptoProvider, CurveProvider, DefaultCryptoProvider, DigestProvider, KdfProvider,
-	KeyWrapProvider, SecurityProfile, SigningProvider,
+	AeadProvider, Aes128Wrap, Aes256Wrap, CryptoProvider, CurveProvider, DefaultCryptoProvider, DigestProvider,
+	KdfProvider, KeyWrapAlgorithm, KeyWrapProvider, SecurityProfile, SigningProvider,
 };
 use tightbeam::crypto::secret::{SecretSlice, ToInsecure};
 use tightbeam::crypto::sign::{
@@ -54,9 +60,10 @@ use tightbeam::crypto::sign::{
 };
 use tightbeam::crypto::x509::error::CertificateValidationError;
 use tightbeam::crypto::x509::{KeyAgreement, KeyPurposes, PeerCertificate};
-use tightbeam::der::asn1::ObjectIdentifier;
+use tightbeam::der::asn1::{ObjectIdentifier, OctetString};
 use tightbeam::der::oid::AssociatedOid;
 use tightbeam::der::{Any, Encode};
+use tightbeam::error::ReceivedExpectedError;
 use tightbeam::oids::{
 	AES_128_GCM, AES_128_WRAP, CURVE_SECP256K1, DATA, SIGNER_ECDSA_WITH_SHA3_256, SIGNER_ECDSA_WITH_SHA3_512,
 };
@@ -258,8 +265,120 @@ impl SecurityProfile for OutsideProfile {
 	type KeyWrapOid = Aes128Wrap;
 }
 
-/// A provider an outside crate defines: its own signature, KDF, and KEM,
-/// beside the house AES-128-GCM and AES-128 key wrap.
+/// AES-128-GCM as an outside crate brings it: a cipher type of its own over
+/// the house cipher, with its own [`ContentEncryption`] under
+/// `GCMParameters`. It seals and opens in place through the house cipher, so
+/// a refused buffer stays as it was.
+struct OutsideGcm(Aes128Gcm);
+
+impl KeySizeUser for OutsideGcm {
+	type KeySize = <Aes128Gcm as KeySizeUser>::KeySize;
+}
+
+impl KeyInit for OutsideGcm {
+	fn new(key: &Key<Self>) -> Self {
+		Self(Aes128Gcm::new(key))
+	}
+}
+
+impl AeadCore for OutsideGcm {
+	type NonceSize = <Aes128Gcm as AeadCore>::NonceSize;
+	type TagSize = <Aes128Gcm as AeadCore>::TagSize;
+	type CiphertextOverhead = <Aes128Gcm as AeadCore>::CiphertextOverhead;
+}
+
+impl AeadInPlace for OutsideGcm {
+	fn encrypt_in_place_detached(
+		&self,
+		nonce: &Nonce<Self>,
+		associated_data: &[u8],
+		buffer: &mut [u8],
+	) -> Result<Tag<Self>, AeadError> {
+		self.0.encrypt_in_place_detached(nonce, associated_data, buffer)
+	}
+
+	fn decrypt_in_place_detached(
+		&self,
+		nonce: &Nonce<Self>,
+		associated_data: &[u8],
+		buffer: &mut [u8],
+		tag: &Tag<Self>,
+	) -> Result<(), AeadError> {
+		self.0.decrypt_in_place_detached(nonce, associated_data, buffer, tag)
+	}
+}
+
+impl AeadAlgorithm for OutsideGcm {
+	type Oid = Aes128GcmOid;
+}
+
+/// The `GCMParameters` of RFC 5084 §3.2, with the 16-octet tag of the cipher.
+impl ContentEncryption for OutsideGcm {
+	fn parameters(nonce: &Nonce<Self>) -> Result<Any, EnvelopeError> {
+		let parameters = GcmParameters { aes_nonce: OctetString::new(nonce.as_slice())?, aes_icv_len: 16 };
+		Ok(Any::encode_from(&parameters)?)
+	}
+
+	fn nonce(parameters: Option<&Any>) -> Result<Nonce<Self>, EnvelopeError> {
+		let parameters = parameters.ok_or(EnvelopeError::ContentEncryptionAlgorithm)?;
+		let parameters = parameters.decode_as::<GcmParameters>();
+		let parameters = parameters.map_err(|_| EnvelopeError::ContentEncryptionAlgorithm)?;
+		if parameters.aes_icv_len != 16 {
+			return Err(EnvelopeError::TagLength((usize::from(parameters.aes_icv_len), 16).into()));
+		}
+
+		let nonce = parameters.aes_nonce.as_bytes().iter().copied();
+		Nonce::<Self>::from_exact_iter(nonce).ok_or(EnvelopeError::ContentEncryptionAlgorithm)
+	}
+}
+
+/// A key wrap an outside crate brings with `wrap` and `unwrap` alone, over
+/// the house AES-256 key wrap, so the provided `unwrap_into` serves it.
+struct OutsideWrap;
+
+impl KeyWrapAlgorithm for OutsideWrap {
+	type Oid = Aes256Wrap;
+	type KekSize = U32;
+
+	fn wrap(kek: &[u8], key: &[u8]) -> Result<Vec<u8>, KeyError> {
+		Aes256Wrap::wrap(kek, key)
+	}
+
+	fn unwrap(kek: &[u8], wrapped: &[u8]) -> Result<ZeroizingBytes, KeyError> {
+		Aes256Wrap::unwrap(kek, wrapped)
+	}
+}
+
+/// The RFC 3394 §4.3 key-encryption key, `000102...1f`.
+const RFC_3394_KEK: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+
+/// The RFC 3394 §4.3 key data, `00112233...ff`.
+const RFC_3394_KEY_DATA: &str = "00112233445566778899aabbccddeeff";
+
+/// The RFC 3394 §4.3 ciphertext: the key data under the KEK.
+const RFC_3394_4_3: &str = "64e8c3f9ce0f5ba263e9777905818a2a93c8191e7d6e8ae7";
+
+/// The provided `unwrap_into` of an outside wrap copies the key its
+/// `unwrap` returns into the caller's buffer.
+#[test]
+fn an_outside_wrap_unwraps_into_a_buffer_of_its_key_size() -> Result<(), KeyError> {
+	let mut key = [0u8; 16];
+	OutsideWrap::unwrap_into(&unhex(RFC_3394_KEK), &unhex(RFC_3394_4_3), &mut key)?;
+	assert_eq!(key.as_slice(), unhex(RFC_3394_KEY_DATA).as_slice());
+	Ok(())
+}
+
+/// The provided `unwrap_into` refuses a buffer of another size than the key.
+#[test]
+fn an_outside_wrap_refuses_a_buffer_of_another_size() {
+	let mut key = [0u8; 32];
+	let refused = OutsideWrap::unwrap_into(&unhex(RFC_3394_KEK), &unhex(RFC_3394_4_3), &mut key);
+	let expected = ReceivedExpectedError { received: 32, expected: 16 };
+	assert!(matches!(refused, Err(KeyError::WrapLength(found)) if found == expected));
+}
+
+/// A provider an outside crate defines: its own signature, KDF, KEM, and
+/// AEAD cipher, beside the house AES-128 key wrap.
 #[derive(Debug, Default, Clone, Copy)]
 struct OutsideProvider {
 	profile: OutsideProfile,
@@ -270,7 +389,7 @@ impl DigestProvider for OutsideProvider {
 }
 
 impl AeadProvider for OutsideProvider {
-	type AeadCipher = Aes128Gcm;
+	type AeadCipher = OutsideGcm;
 }
 
 impl KeyWrapProvider for OutsideProvider {

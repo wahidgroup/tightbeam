@@ -29,19 +29,6 @@ impl<S: Zeroize> Secret<S> {
 	pub fn with<R>(&self, f: impl FnOnce(&S) -> R) -> R {
 		f(&self.0)
 	}
-
-	/// Move the value into a frame body, which wipes it when the frame drops.
-	///
-	/// The allocation moves without a copy. The exit is crate-private, so
-	/// every owner that receives a secret this way wipes it. A frame body is
-	/// the only such owner, so the exit exists where frame encryption does.
-	#[cfg(feature = "aead")]
-	pub(crate) fn release(mut self) -> S
-	where
-		S: Default,
-	{
-		core::mem::take(&mut *self.0)
-	}
 }
 
 impl<S: Zeroize> ZeroizeOnDrop for Secret<S> {}
@@ -150,17 +137,6 @@ mod tests {
 		let secret = SecretSlice::from(plaintext);
 		assert_eq!(secret.with(|bytes| bytes.as_ptr()), address);
 		assert_eq!(secret.with(Vec::capacity), 64);
-	}
-
-	/// Releasing moves the allocation out without a copy.
-	#[cfg(feature = "aead")]
-	#[test]
-	fn releasing_a_buffer_moves_its_allocation() {
-		let plaintext = vec![0x5Au8; 32];
-		let address = plaintext.as_ptr();
-
-		let released = SecretSlice::from(plaintext).release();
-		assert_eq!(released.as_ptr(), address);
 	}
 
 	/// Compiles only for a type whose values wipe when they drop.

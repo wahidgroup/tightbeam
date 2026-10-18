@@ -33,7 +33,7 @@ fn main() {
 	let message = Aes128Message { content: "test".to_string() };
 	let (_, cipher) = tightbeam::testing::TestKey::insecure_fixed_cipher();
 
-	// Try to use AES-256-GCM cipher with a message that expects AES-128-GCM
+	// An AES-256-GCM encryptor with a message that expects AES-128-GCM
 	// This should fail to compile with compile-time enforcement
 	let builder: FrameBuilder<Aes128Message> = Version::V1.into();
 	builder
@@ -41,5 +41,5 @@ fn main() {
 		.with_id("test_algorithm_mismatch")
 		.with_order(1696521600)
 		// ERROR: OID mismatch! Should fail to compile
-		.with_aead(cipher);
+		.with_encryptor(cipher);
 }

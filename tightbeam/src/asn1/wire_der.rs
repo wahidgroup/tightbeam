@@ -1,10 +1,11 @@
 //! A decoded value that keeps the exact bytes it crossed the wire as.
 //!
-//! A handshake transcript binds the messages both endpoints exchanged, so it
-//! MUST hash the bytes that crossed the wire rather than a re-encoding of
-//! what a decoder produced. [`WireDer`] is created once where a message is
-//! decoded or built, and every later step reads the value and the bytes from
-//! it, so no step parses or encodes the message a second time.
+//! [`WireDer`] is created once where a message is decoded or built, and every
+//! later step reads the value and the bytes from it, so no step parses or
+//! encodes the message a second time. Two readers need those bytes:
+//!
+//! - A handshake transcript MUST hash the bytes that crossed the wire, not a re-encoding of them.
+//! - A frame's envelope opens against its authenticated attributes as they arrived (RFC 5083 §2.1).
 
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
@@ -17,8 +18,8 @@ use crate::der::{
 /// A `SEQUENCE` value together with the DER bytes that carry it.
 ///
 /// Encoding a `WireDer` writes the stored bytes, so the bytes a sender hashed
-/// are the bytes the receiver reads. Every handshake container is a
-/// `SEQUENCE`, so the type carries that tag.
+/// are the bytes the receiver reads. Every handshake container and the frame
+/// envelope is a `SEQUENCE`, so the type carries that tag.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WireDer<T> {
 	der: Vec<u8>,
@@ -99,13 +100,13 @@ where
 	/// field puts a context tag on the wire, which these bytes replace with
 	/// the `SEQUENCE` tag.
 	fn decode_value<R: Reader<'a>>(reader: &mut R, header: Header) -> DerResult<Self> {
-		let contents = reader.read_vec(header.length)?;
+		let contents = reader.read_slice(header.length)?;
 		let own_header = Header::new(Tag::Sequence, header.length)?;
 		let contents_at = usize::try_from(own_header.encoded_len()?)?;
 		let mut der = Vec::with_capacity(contents_at.saturating_add(contents.len()));
 
 		own_header.encode_to_vec(&mut der)?;
-		der.extend_from_slice(&contents);
+		der.extend_from_slice(contents);
 
 		let value = T::from_der(&der)?;
 		Ok(Self { der, contents_at, value })
@@ -129,8 +130,8 @@ where
 fn contents_offset(der: &[u8]) -> DerResult<usize> {
 	let mut reader = SliceReader::new(der)?;
 	let header = Header::decode(&mut reader)?;
-	let offset = usize::try_from(header.encoded_len()?)?;
 
+	let offset = usize::try_from(header.encoded_len()?)?;
 	Ok(offset)
 }
 

@@ -8,9 +8,8 @@ use alloc::{boxed::Box, sync::Arc};
 #[cfg(feature = "std")]
 use std::sync::Arc;
 
-use crate::asn1::Frame;
+use crate::asn1::{AuthEnvelopedData, Frame};
 use crate::builder::TypeBuilder;
-use crate::cms::enveloped_data::EncryptedContentInfo;
 use crate::der::Encode;
 use crate::transport::error::{TransportError, TransportFailure};
 use crate::transport::{ResponsePackage, TransportEnvelope, TransportLimits, TransportResult, WireEnvelope, WireMode};
@@ -132,16 +131,19 @@ impl<'a> EnvelopeBuilder<'a> {
 	}
 
 	/// Encode and seal one envelope with the session's send cipher.
+	///
+	/// The encoded envelope moves into the record, which encrypts it in place.
 	fn encrypt(
 		envelope: TransportEnvelope,
 		encryptor: Option<&'a SendCipher>,
 		with_frame: &impl Fn(TransportFailure) -> TransportError,
-	) -> TransportResult<EncryptedContentInfo> {
+	) -> TransportResult<AuthEnvelopedData> {
 		let encoded = envelope.to_der().map_err(|_| with_frame(TransportFailure::EncodingFailed))?;
 
-		// The send cipher owns the counter nonce. No random nonce is drawn.
+		// The send cipher owns the record sequence and draws each record's
+		// content key.
 		let encryptor = encryptor.ok_or_else(|| with_frame(TransportFailure::EncryptorUnavailable))?;
-		encryptor.encrypt_next(&encoded, None).map_err(|error| {
+		encryptor.encrypt_next(encoded).map_err(|error| {
 			// Rekey exhaustion stays distinguishable: the caller must
 			// reestablish the session, not retry the write.
 			let failure = match error {

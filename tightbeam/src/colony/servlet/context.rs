@@ -83,14 +83,16 @@ impl<Env> ServletContext<Env> {
 		self
 	}
 
-	/// Frame-body decryptor, when configured.
-	pub fn message_decryptor(&self) -> Option<&dyn Decryptor> {
-		self.message_decryptor.as_deref().map(|decryptor| decryptor as &dyn Decryptor)
+	/// Frame-body decryptor, when configured. It is `Sync`, so a dispatch
+	/// that awaits its open stays `Send`.
+	pub fn message_decryptor(&self) -> Option<&(dyn Decryptor + Send + Sync)> {
+		self.message_decryptor.as_deref()
 	}
 
-	/// Frame-body inflator, when configured.
-	pub fn message_inflator(&self) -> Option<&dyn Inflator> {
-		self.message_inflator.as_deref().map(|inflator| inflator as &dyn Inflator)
+	/// Frame-body inflator, when configured. It is `Sync`, so a dispatch
+	/// that awaits a decryption stays `Send`.
+	pub fn message_inflator(&self) -> Option<&(dyn Inflator + Send + Sync)> {
+		self.message_inflator.as_deref()
 	}
 
 	/// Trace collector for this servlet.
@@ -132,11 +134,12 @@ impl Frame {
 	/// - [`RouterError::ConfidentialFrame`]: encrypted body, no decryptor.
 	/// - [`RouterError::CompressedFrame`]: compressed body, no inflator.
 	/// - Decryption or decompression errors from the configured implementations.
-	pub fn prepare_typed<Env>(&mut self, ctx: &ServletContext<Env>) -> Result<(), TightBeamError> {
+	pub async fn prepare_typed<Env>(&mut self, ctx: &ServletContext<Env>) -> Result<(), TightBeamError> {
 		match self.body_transform() {
 			Some(BodyTransform::Decrypt) => {
 				let decryptor = ctx.message_decryptor().ok_or(RouterError::ConfidentialFrame)?;
-				self.decrypt_in_place(decryptor, ctx.message_inflator())?;
+				let inflator = ctx.message_inflator().map(|inflator| inflator as &(dyn Inflator + Sync));
+				self.decrypt_in_place(decryptor, inflator).await?;
 			}
 			Some(BodyTransform::Inflate) => {
 				let inflator = ctx.message_inflator().ok_or(RouterError::CompressedFrame)?;
@@ -162,7 +165,7 @@ impl Frame {
 		F: FnOnce(I, Frame, &ServletContext<Env>) -> Fut,
 		Fut: Future<Output = Result<Option<Frame>, TightBeamError>>,
 	{
-		self.prepare_typed(ctx)?;
+		self.prepare_typed(ctx).await?;
 
 		let message: I = crate::decode(self.message())?;
 		handler(message, self, ctx).await

@@ -18,8 +18,14 @@ use aead::*;
 
 #[cfg(feature = "aead")]
 mod aead {
-	pub use crate::crypto::aead::{Aes256Gcm, KeyInit};
-	pub use crate::crypto::common::Key;
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	pub use crate::crypto::aead::Aes256Gcm;
+	#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
+	pub use crate::crypto::aead::{DirectionalCiphers, RuntimeAead};
+	#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
+	pub use crate::crypto::key::Aes256GcmKeyProvider;
+	#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
+	pub use crate::crypto::profiles::DefaultCryptoProvider;
 }
 
 #[cfg(any(
@@ -546,6 +552,24 @@ macro_rules! test_worker {
 pub struct TestFrame;
 
 impl TestFrame {
+	/// The message of `frame`, decrypted with `decryptor`, inflated by
+	/// `inflator` when the body is compressed, and decoded as `T`. The open
+	/// runs on a current-thread runtime, so a synchronous test reads it.
+	///
+	/// # Errors
+	///
+	/// - The errors of [`Frame::decrypt`].
+	#[cfg(all(feature = "aead", feature = "tokio"))]
+	pub fn decrypted<T: Message>(
+		frame: Frame,
+		decryptor: &(impl crate::crypto::aead::Decryptor + ?Sized),
+		inflator: Option<&(dyn crate::core::Inflator + Sync)>,
+	) -> crate::error::Result<T> {
+		let runtime = tokio::runtime::Builder::new_current_thread().build();
+		let runtime = runtime.expect("a current-thread runtime builds");
+		runtime.block_on(frame.decrypt::<T>(decryptor, inflator))
+	}
+
 	pub fn v0(content: Option<&str>, id: Option<&str>) -> Frame {
 		let message = TestMessage::sample(content);
 
@@ -717,20 +741,37 @@ impl TestKey {
 		0xa2, 0x96,
 	];
 
-	/// Returns the AES-256-GCM key made of thirty-two `0x33` bytes, with its
-	/// cipher.
+	/// Returns record keys of epoch 0 under the house provider, from the
+	/// key-encryption keys made of thirty-two `0x00` bytes (client to server)
+	/// and thirty-two `0x01` bytes (server to client).
+	///
+	/// # Security
+	///
+	/// The keys are public, so no record sealed under them is confidential.
+	#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
+	pub fn insecure_directional_keys() -> DirectionalCiphers<RuntimeAead> {
+		let key = |fill: u8| RuntimeAead::new::<DefaultCryptoProvider>(vec![fill; 32]);
+		let client_to_server = key(0x00).expect("32 octets is the key of AES-256 key wrap");
+		let server_to_client = key(0x01).expect("32 octets is the key of AES-256 key wrap");
+		DirectionalCiphers { client_to_server, server_to_client, epoch: 0 }
+	}
+
+	/// Returns the key-encryption key made of thirty-two `0x33` bytes, with
+	/// the in-memory key that holds it under the house provider and names it
+	/// `tb/test/kek/v1`. A frame sealed to it carries AES-256-GCM content with
+	/// its content key wrapped under AES-256 key wrap.
 	///
 	/// # Security
 	///
 	/// The key is public, so nothing sealed under it is confidential.
 	/// Production code draws its key from a CSPRNG.
-	#[cfg(feature = "aead")]
-	pub fn insecure_fixed_cipher() -> (Key<Aes256Gcm>, Aes256Gcm) {
+	#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
+	pub fn insecure_fixed_cipher() -> ([u8; 32], Aes256GcmKeyProvider) {
 		let key_bytes = [0x33; 32];
 
-		let key = Key::<Aes256Gcm>::from(key_bytes);
-		let cipher = Aes256Gcm::new(&key);
-		(key, cipher)
+		let cipher = Aes256GcmKeyProvider::new(key_bytes.to_vec(), b"tb/test/kek/v1".to_vec());
+		let cipher = cipher.expect("32 octets is the key of AES-256 key wrap");
+		(key_bytes, cipher)
 	}
 }
 
@@ -1112,6 +1153,21 @@ impl TestAttributes {
 		let attribute = matching.next().expect("the signer writes the attribute");
 		let value = attribute.values.iter().next().expect("the attribute holds a value");
 		value.clone()
+	}
+
+	/// The two content types `envelope` declares: the type of its encrypted
+	/// content, and the one value of its content-type attribute.
+	#[cfg(all(feature = "aead", feature = "kdf", feature = "ecdh"))]
+	pub fn declared_content_types(
+		envelope: &crate::asn1::AuthEnvelopedData,
+	) -> (crate::der::asn1::ObjectIdentifier, crate::der::asn1::ObjectIdentifier) {
+		let attributes = envelope.auth_attrs.as_ref().expect("the envelope authenticates its attributes");
+		let content_type = crate::oids::ATTR_CONTENT_TYPE;
+		let mut matching = attributes.iter().filter(|attribute| attribute.oid == content_type);
+		let attribute = matching.next().expect("the envelope carries a content-type attribute");
+		let value = attribute.values.iter().next().expect("the attribute holds a value");
+		let named = value.decode_as().expect("the value is an OBJECT IDENTIFIER");
+		(envelope.auth_encrypted_content_info.content_type, named)
 	}
 }
 

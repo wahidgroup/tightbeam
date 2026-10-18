@@ -146,8 +146,9 @@ where
 	/// ciphers under `salt`, the salt that derived it.
 	///
 	/// The traffic keys come from `next_secret` under the directional labels
-	/// that the handshake finalization uses. Assigning the next secret drops
-	/// the prior one, which zeroizes on drop (RFC 9846 § 7.2).
+	/// that the handshake finalization uses, and both ciphers take the next
+	/// epoch. Assigning the next secret drops the prior one, which zeroizes on
+	/// drop (RFC 9846 § 7.2).
 	fn rotate(
 		&mut self,
 		role: MuxRole,
@@ -155,9 +156,9 @@ where
 		salt: &RandomsSalt,
 		next_hash: TranscriptHash,
 	) -> Result<(SendCipher, RecvCipher), HandshakeError> {
-		let directional = DirectionalCiphers::derive::<P, _>(&next_secret, salt.as_kdf_salt())?;
-
 		let next_epoch = self.epoch.epoch.checked_add(1).ok_or(HandshakeError::IntegerOutOfRange)?;
+		let directional = DirectionalCiphers::derive::<P, _>(&next_secret, salt.as_kdf_salt(), next_epoch)?;
+
 		self.epoch.secret = next_secret;
 		self.epoch.epoch = next_epoch;
 		self.epoch.transcript_hash = next_hash;
@@ -642,20 +643,23 @@ impl RekeyDriver {
 #[cfg(test)]
 pub(crate) mod tests {
 	use super::*;
-	use crate::asn1::{AlgorithmIdentifier, DigestInfo};
-	use crate::crypto::aead::DecryptContent;
+	use crate::asn1::{AlgorithmIdentifier, AuthEnvelopedData, DigestInfo};
+	use crate::cms::enveloped_data::RecipientInfo;
+	use crate::crypto::cms::EnvelopeError;
 	use crate::crypto::hash::Sha3_256;
 	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::crypto::sign::ecdsa::k256::Secp256k1;
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 	use crate::crypto::sign::elliptic_curve::PublicKey;
 	use crate::crypto::x509::KeyPurposes;
+	use crate::der::Encode;
 	use crate::oids::HASH_SHA3_256;
 	use crate::random::OsRng;
 	use crate::testing::{TestCertificate, TestIdentity};
 	use crate::transport::handshake::negotiation::MuxBudgets;
 	use crate::transport::handshake::primitives::KdfSalt;
 	use crate::transport::handshake::tests::{fixture_handshake_secret, fixture_transcript, off_curve_point};
+	use crate::TightBeamError;
 
 	/// The provider every rekey test runs under.
 	type Provider = DefaultCryptoProvider;
@@ -726,9 +730,10 @@ pub(crate) mod tests {
 		RandomsSalt::new(&SAMPLE_CLIENT_RANDOM, &SAMPLE_SERVER_RANDOM)
 	}
 
-	/// The cipher a server would receive on under `secret` and `salt`.
+	/// The cipher a server would receive on under `secret` and `salt`, the
+	/// secret of epoch 1.
 	fn server_recv(secret: &EpochSecret, salt: &RandomsSalt) -> RecvCipher {
-		let directional = DirectionalCiphers::derive::<Provider, _>(secret, salt.as_kdf_salt());
+		let directional = DirectionalCiphers::derive::<Provider, _>(secret, salt.as_kdf_salt(), 1);
 		let directional = directional.expect("an epoch secret derives its directional ciphers");
 		let (_send, recv) = SessionKeys::for_server(directional).into_parts();
 		recv
@@ -834,13 +839,13 @@ pub(crate) mod tests {
 		assert!(!client.renewal_in_flight());
 		assert!(!server.exchange_in_flight());
 
-		let uplink = client_install.send_cipher.encrypt_next(PLAINTEXT, None)?;
-		let received = server_install.recv_cipher.decrypt_content(&uplink)?;
-		assert!(received.with(|plain| plain == PLAINTEXT));
+		let mut uplink = client_install.send_cipher.encrypt_next(PLAINTEXT)?.to_der()?;
+		let received = server_install.recv_cipher.open(&mut uplink)?;
+		assert_eq!(received, PLAINTEXT);
 
-		let downlink = server_install.send_cipher.encrypt_next(PLAINTEXT, None)?;
-		let received = client_install.recv_cipher.decrypt_content(&downlink)?;
-		assert!(received.with(|plain| plain == PLAINTEXT));
+		let mut downlink = server_install.send_cipher.encrypt_next(PLAINTEXT)?.to_der()?;
+		let received = client_install.recv_cipher.open(&mut downlink)?;
+		assert_eq!(received, PLAINTEXT);
 		Ok(())
 	}
 
@@ -863,29 +868,84 @@ pub(crate) mod tests {
 		let (first_send, _first_recv) = first.rotate(MuxRole::Client, first_next, &salt, sample_chain_root())?;
 		let (_second_send, second_recv) = second.rotate(MuxRole::Server, second_next, &salt, sample_chain_root())?;
 
-		let frame = first_send.encrypt_next(PLAINTEXT, None)?;
-		assert!(second_recv.decrypt_content(&frame).is_err());
+		let mut record = first_send.encrypt_next(PLAINTEXT)?.to_der()?;
+		assert!(second_recv.open(&mut record).is_err());
 		Ok(())
 	}
 
-	/// The rotated traffic keys come from the next chain link, so a frame
+	/// The rotated traffic keys come from the next chain link, so a record
 	/// sealed under the previous epoch secret's directional key does not open
-	/// under them.
+	/// under them. The record carries the rotated epoch, so the key alone
+	/// decides.
 	#[test]
 	fn rotation_leaves_the_previous_epoch_keys_behind() -> Result<(), Box<dyn std::error::Error>> {
 		let epoch = sample_epoch()?;
 		let salt = sample_salt();
-		let previous = DirectionalCiphers::derive::<Provider, _>(&epoch.secret, salt.as_kdf_salt())?;
+		let rotated_epoch = epoch.epoch + 1;
+		let previous = DirectionalCiphers::derive::<Provider, _>(&epoch.secret, salt.as_kdf_salt(), rotated_epoch)?;
 		let (previous_send, _previous_recv) = SessionKeys::for_client(previous).into_parts();
 		let peer = peer_static().server_ephemeral(&stray_point())?;
 		let scalar = Box::new(fresh_ephemeral());
 		let next = epoch.secret.next::<Provider>(scalar, &peer, salt.as_kdf_salt())?;
 		let mut materials = materials_with(epoch)?;
-
 		let (_send, recv) = materials.rotate(MuxRole::Server, next, &salt, sample_chain_root())?;
 
-		let frame = previous_send.encrypt_next(PLAINTEXT, None)?;
-		assert!(recv.decrypt_content(&frame).is_err());
+		let mut record = previous_send.encrypt_next(PLAINTEXT)?.to_der()?;
+		let refused = recv.open(&mut record);
+		assert!(matches!(refused, Err(TightBeamError::EnvelopeError(EnvelopeError::KeyUnwrap))));
+		Ok(())
+	}
+
+	/// The rotation carries the next epoch into both ciphers, so the first
+	/// rotated record opens on a receive cipher of the next epoch that the
+	/// next secret derives.
+	#[test]
+	fn rotation_carries_the_next_epoch() -> Result<(), Box<dyn std::error::Error>> {
+		let epoch = sample_epoch()?;
+		let salt = sample_salt();
+		let next_epoch = epoch.epoch + 1;
+		let peer = peer_static().server_ephemeral(&stray_point())?;
+		let scalar = Box::new(fresh_ephemeral());
+		let next = epoch.secret.next::<Provider>(scalar, &peer, salt.as_kdf_salt())?;
+		let expected = DirectionalCiphers::derive::<Provider, _>(&next, salt.as_kdf_salt(), next_epoch)?;
+		let (_peer_send, peer_recv) = SessionKeys::for_server(expected).into_parts();
+		let mut materials = materials_with(epoch)?;
+		let (send, _recv) = materials.rotate(MuxRole::Client, next, &salt, sample_chain_root())?;
+
+		let mut record = send.encrypt_next(PLAINTEXT)?.to_der()?;
+		let opened = peer_recv.open(&mut record)?;
+		assert_eq!(opened, PLAINTEXT);
+		Ok(())
+	}
+
+	/// The `kekid` of the one `KEKRecipientInfo` of `record`.
+	fn key_identifier_of(record: &AuthEnvelopedData) -> Vec<u8> {
+		let recipient = match record.recipient_infos.0.as_slice().first() {
+			Some(RecipientInfo::Kekri(kek)) => Some(kek),
+			_ => None,
+		};
+
+		let recipient = recipient.expect("a record carries one KEKRecipientInfo");
+		recipient.kek_id.kek_identifier.as_bytes().to_vec()
+	}
+
+	/// The first record of the rotated client names the client-to-server key
+	/// of the next epoch in its `kekid`: the record domain, the direction
+	/// octet `00`, and the next epoch in four octets.
+	#[test]
+	fn a_rotated_record_names_the_next_epoch() -> Result<(), Box<dyn std::error::Error>> {
+		let epoch = sample_epoch()?;
+		let salt = sample_salt();
+		let next_epoch = epoch.epoch + 1;
+		let expected = [b"tb/session/record/kekid/v1".as_slice(), &[0x00], &next_epoch.to_be_bytes()].concat();
+		let peer = peer_static().server_ephemeral(&stray_point())?;
+		let scalar = Box::new(fresh_ephemeral());
+		let next = epoch.secret.next::<Provider>(scalar, &peer, salt.as_kdf_salt())?;
+		let mut materials = materials_with(epoch)?;
+
+		let (send, _recv) = materials.rotate(MuxRole::Client, next, &salt, sample_chain_root())?;
+		let record = send.encrypt_next(PLAINTEXT)?;
+		assert_eq!(key_identifier_of(&record), expected);
 		Ok(())
 	}
 
@@ -898,9 +958,9 @@ pub(crate) mod tests {
 		assert_eq!(client_install.epoch, 2);
 		assert_eq!(server_install.epoch, 2);
 
-		let uplink = client_install.send_cipher.encrypt_next(PLAINTEXT, None)?;
-		let received = server_install.recv_cipher.decrypt_content(&uplink)?;
-		assert!(received.with(|plain| plain == PLAINTEXT));
+		let mut uplink = client_install.send_cipher.encrypt_next(PLAINTEXT)?.to_der()?;
+		let received = server_install.recv_cipher.open(&mut uplink)?;
+		assert_eq!(received, PLAINTEXT);
 		Ok(())
 	}
 
@@ -981,9 +1041,11 @@ pub(crate) mod tests {
 		let replay = response.to_owned();
 
 		client.process_response(response).await.map(|_| ())?;
+
 		// A replay targets the advanced chain, where the pin fails to match.
 		let request_der = request.to_der()?;
 		let ephemeral = Box::new(fresh_ephemeral());
+
 		client.pending = Some(PendingRenewal { client_random: [3u8; 32], request_der, ephemeral });
 
 		let replayed = client.process_response(replay).await;
@@ -1040,11 +1102,12 @@ pub(crate) mod tests {
 
 		let (ack, client_install) = client.process_response(response).await?;
 		let server_install = server.process_ack(ack).await?.install;
-		let frame = client_install.send_cipher.encrypt_next(PLAINTEXT, None)?;
+		let record = client_install.send_cipher.encrypt_next(PLAINTEXT)?.to_der()?;
 
 		// Positive control: the server held a rekey scalar and opens the frame.
-		let received = server_install.recv_cipher.decrypt_content(&frame)?;
-		assert!(received.with(|plain| plain == PLAINTEXT));
+		let mut control = record.clone();
+		let received = server_install.recv_cipher.open(&mut control)?;
+		assert_eq!(received, PLAINTEXT);
 
 		// The observer starts from the epoch secret both endpoints held, and
 		// draws a scalar of its own for each attempt.
@@ -1052,8 +1115,8 @@ pub(crate) mod tests {
 		let (first, second) = (Box::new(fresh_ephemeral()), Box::new(fresh_ephemeral()));
 		let against_client = observed.secret.next::<Provider>(first, &wire_client, salt.as_kdf_salt())?;
 		let against_server = observed.secret.next::<Provider>(second, &wire_server, salt.as_kdf_salt())?;
-		assert!(server_recv(&against_client, &salt).decrypt_content(&frame).is_err());
-		assert!(server_recv(&against_server, &salt).decrypt_content(&frame).is_err());
+		assert!(server_recv(&against_client, &salt).open(&mut record.clone()).is_err());
+		assert!(server_recv(&against_server, &salt).open(&mut record.clone()).is_err());
 		Ok(())
 	}
 
@@ -1138,8 +1201,8 @@ pub(crate) mod tests {
 		let signer = &server_identity.signing;
 		let issuing = SessionReceipt::issue(pin, SAMPLE_BUDGETS, SAMPLE_CREDIT_UNIT, None, signer);
 		let (_receipt, artifact) = issuing.await?;
-		let response = MuxRekeyResponsePackage::new(SAMPLE_SERVER_RANDOM, &static_point, Some(artifact))?;
 
+		let response = MuxRekeyResponsePackage::new(SAMPLE_SERVER_RANDOM, &static_point, Some(artifact))?;
 		let refused = client.process_response(response).await;
 		assert!(matches!(refused, Err(HandshakeError::ServerEphemeralIsStatic)));
 		Ok(())

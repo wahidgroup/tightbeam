@@ -6,9 +6,11 @@
 
 #![allow(unexpected_cfgs)]
 
+use std::sync::Arc;
+
 use tightbeam::builder::{FrameBuilder, TypeBuilder};
-use tightbeam::crypto::aead::{Aes256Gcm, Key, KeyInit};
 use tightbeam::crypto::hash::Sha3_256;
+use tightbeam::crypto::key::Aes256GcmKeyProvider;
 use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
 use tightbeam::crypto::x509::{KeyPurposes, PeerCertificate, Signing};
@@ -16,7 +18,7 @@ use tightbeam::der::ValueOrd;
 use tightbeam::prelude::*;
 use tightbeam::testing::assertions::Presence;
 use tightbeam::testing::macros::{IsNone, IsSome};
-use tightbeam::testing::{ScenarioConfig, SetupEnv, TestCertificate, TestIdentity};
+use tightbeam::testing::{ScenarioConfig, SetupEnv, TestCertificate, TestFrame, TestIdentity};
 use tightbeam::urn::Urn;
 use tightbeam::utils;
 use tightbeam::{exactly, tb_assert_spec, tb_scenario, TightBeamError};
@@ -69,14 +71,14 @@ enum FlagTestDebugLevel {
 tightbeam::flagset!(TestFlagSet: FlagTestDevelopmentMode, FlagTestDebugLevel);
 
 struct TestCrypto {
-	cipher: Aes256Gcm,
+	cipher: Arc<Aes256GcmKeyProvider>,
 	signing_key: Secp256k1SigningKey,
 	signer: PeerCertificate<Signing<DefaultCryptoProvider>>,
 }
 
 fn build_crypto(seed: u8) -> Result<TestCrypto, TightBeamError> {
 	let key_bytes = [seed; 32];
-	let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key_bytes));
+	let cipher = Arc::new(Aes256GcmKeyProvider::new(key_bytes.to_vec(), b"tb/test/core/kek/v1".to_vec())?);
 	let signing_key = Secp256k1SigningKey::from_bytes(&key_bytes.into())?;
 	let signer = PeerCertificate::parse(TestCertificate::self_signed(&signing_key), KeyPurposes::HOUSE.signer)?;
 	Ok(TestCrypto { cipher, signing_key, signer })
@@ -97,7 +99,7 @@ fn build_version_frame(
 	if version >= asn1::Version::V1 {
 		builder = builder
 			.with_message_hasher::<Sha3_256>([])
-			.with_aead(crypto.cipher.to_owned())
+			.with_encryptor(crypto.cipher.to_owned())
 			.with_signer::<Secp256k1Signature, _>(TestIdentity::certified(crypto.signing_key.to_owned()));
 	}
 	if version >= asn1::Version::V2 {
@@ -247,9 +249,9 @@ tb_scenario! {
 			trace.event_with(VERSION, &["v3"], v3_frame.version())?;
 
 			// Decrypt (consumes frames, so must be last)
-			let v1_roundtrip = v1_frame.decrypt::<TestMessage>(&crypto.cipher, None)?;
-			let v2_roundtrip = v2_frame.decrypt::<TestMessage>(&crypto.cipher, None)?;
-			let v3_roundtrip = v3_frame.decrypt::<TestMessage>(&crypto.cipher, None)?;
+			let v1_roundtrip = TestFrame::decrypted::<TestMessage>(v1_frame, &crypto.cipher, None)?;
+			let v2_roundtrip = TestFrame::decrypted::<TestMessage>(v2_frame, &crypto.cipher, None)?;
+			let v3_roundtrip = TestFrame::decrypted::<TestMessage>(v3_frame, &crypto.cipher, None)?;
 			trace.event_with(ROUNDTRIP_OK, &["v1"], v1_roundtrip == message)?;
 			trace.event_with(ROUNDTRIP_OK, &["v2"], v2_roundtrip == message)?;
 			trace.event_with(ROUNDTRIP_OK, &["v3"], v3_roundtrip == message)?;

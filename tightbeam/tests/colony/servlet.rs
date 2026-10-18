@@ -7,9 +7,8 @@ use tightbeam::{
 	compose,
 	compress::ZstdCompression,
 	crypto::{
-		aead::{Aes256Gcm, KeyInit},
-		common::Key,
 		hash::Sha3_256,
+		key::Aes256GcmKeyProvider,
 		profiles::DefaultCryptoProvider,
 		sign::ecdsa::Secp256k1Signature,
 		x509::{KeyPurposes, PeerCertificate, Signing},
@@ -195,8 +194,9 @@ tb_scenario! {
 // + digested wire frames, normalized in place before the handler runs
 // ============================================================================
 
-fn shared_cipher() -> Aes256Gcm {
-	Aes256Gcm::new(&Key::<Aes256Gcm>::from([0x5A; 32]))
+fn shared_cipher() -> Aes256GcmKeyProvider {
+	let cipher = Aes256GcmKeyProvider::new(vec![0x5A; 32], b"tb/test/servlet/kek/v1".to_vec());
+	cipher.expect("32 octets is the key of AES-256 key wrap")
 }
 
 /// Verifies nonrepudiation over the wire frame -- still ciphertext -- before

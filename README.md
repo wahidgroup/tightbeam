@@ -290,7 +290,7 @@ pub struct Metadata {
 
 	// V1+ fields
 	integrity: Option<DigestInfo>,
-	confidentiality: Option<EncryptedContentInfo>,
+	confidentiality: Option<WireDer<AuthEnvelopedData>>,
 
 	// V2+ fields
 	priority: Option<MessagePriority>,
@@ -379,19 +379,23 @@ DigestInfo ::= SEQUENCE {
 
 > Note: `DigestInfo` is reused in three roles: Message Integrity (`Metadata.integrity`), Frame Integrity (`Frame.integrity`), and Previous Frame chaining (`previous_frame`). The type is the same. The covered bytes differ. The `previous_frame` digest is not FI.
 
-#### Encrypted Content Information ([RFC 5652][rfc5652] CMS)
+#### Authenticated-Enveloped Data ([RFC 5083][rfc5083] CMS)
 
-From RFC 5652 Section 6.1:
+From RFC 5083 Section 2.1:
 
 ```asn1
-EncryptedContentInfo ::= SEQUENCE {
-	contentType                 ContentType,
-	contentEncryptionAlgorithm  ContentEncryptionAlgorithmIdentifier,
-	encryptedContent            [0] IMPLICIT OCTET STRING OPTIONAL
+AuthEnvelopedData ::= SEQUENCE {
+	version                    CMSVersion,
+	originatorInfo             [0] IMPLICIT OriginatorInfo OPTIONAL,
+	recipientInfos             RecipientInfos,
+	authEncryptedContentInfo   EncryptedContentInfo,
+	authAttrs                  [1] IMPLICIT AuthAttributes OPTIONAL,
+	mac                        MessageAuthenticationCode,
+	unauthAttrs                [2] IMPLICIT UnauthAttributes OPTIONAL
 }
 ```
 
-> Note: Used in `Metadata.confidentiality` for body encryption.
+> Note: Used in `Metadata.confidentiality` for body encryption. The envelope carries no `encryptedContent`: the ciphertext is `Frame.message`, detached as [RFC 5652][rfc5652] §6.1 permits. The content cipher is the provider's AEAD, AES-256-GCM with `GCMParameters` ([RFC 5084][rfc5084]) in the house provider, under a fresh content key for each frame. The content type is among the `authAttrs`, and a receiver refuses `authAttrs` that did not arrive as DER ([RFC 5083][rfc5083] §2.1). The one recipient is a `KEKRecipientInfo` named by the key identifier of its key-encryption key, or a `KEMRecipientInfo` ([RFC 9629][rfc9629]) to the recipient's public key.
 
 #### Signer Information ([RFC 5652][rfc5652] CMS)
 
@@ -451,7 +455,7 @@ Metadata ::= SEQUENCE {
 
 	-- V1+ fields (context-specific tags)
 	integrity        [0] DigestInfo OPTIONAL,           -- Message Integrity (MI)
-	confidentiality  [1] EncryptedContentInfo OPTIONAL,
+	confidentiality  [1] AuthEnvelopedData OPTIONAL,
 
 	-- V2+ fields (context-specific tags)
 	priority         [2] MessagePriority OPTIONAL,
@@ -630,14 +634,15 @@ A recipient decrypts the body and recovers the opening `(salt, DER(value))`. The
 When confidentiality is enabled, implementations MUST use Authenticated Encryption with Associated Data (AEAD). The type system enforces this requirement through trait bounds:
 
 ```rust,ignore
-pub fn with_aead<Cipher>(mut self, cipher: Cipher) -> Self
+pub fn with_encryptor<C, E>(mut self, encryptor: E) -> Self
 where
-	Cipher: AeadAlgorithm + 'static, // AEAD cipher that names its own OID
-	T: CheckAeadOid<Cipher::Oid>;
+	C: AssociatedOid,          // the content-encryption algorithm the envelope names
+	E: Encryptor<C> + 'static, // seals the body as an AuthEnvelopedData under C
+	T: CheckAeadOid<C>;
 ```
 
-- Non-AEAD ciphers cannot be selected. The compiler rejects them.
-- The cipher type names the algorithm identifier stamped on the wire, so the identifier cannot diverge from the cipher, even when the message type has no security profile.
+- An encryptor names its content-encryption algorithm in its type, so the identifier on the wire cannot diverge from the encryptor, even when the message type has no security profile.
+- The envelope is `AuthEnvelopedData` ([RFC 5083][rfc5083]), whose content cipher is an AEAD.
 - AEAD tags prove that ciphertext was not modified. Examples include AES-GCM ([FIPS 197][fips197]) and ChaCha20-Poly1305 ([RFC 8439][rfc8439]).
 - MI proves that decrypted plaintext matches the original message content.
 
@@ -700,7 +705,7 @@ When MI, FI, AEAD encryption, and signatures are all enabled, senders and receiv
 
 1. Compute MI over the plaintext message. Store `DigestInfo` in `Metadata`.
 2. Optionally compress the plaintext message. Store `CompressedData` in `Metadata`.
-3. Encrypt with an AEAD cipher to produce authenticated ciphertext. Store `EncryptedContentInfo` in `Metadata` and the ciphertext in `Frame.message`.
+3. Encrypt with an AEAD cipher to produce authenticated ciphertext. Store the `AuthEnvelopedData` in `Metadata` and the ciphertext in `Frame.message`.
 4. Compute FI over the envelope (`Version` + `Metadata` that contains MI). Store `DigestInfo` in `Frame`.
 5. Sign the complete frame (`Version` + `Metadata` + ciphertext + FI). Store `SignerInfo` in `Frame`.
 
@@ -871,8 +876,10 @@ IMPORTS
 		{ iso(1) member-body(2) us(840) rsadsi(113549) pkcs(1) pkcs-1(1) },
 	CompressedData FROM CMS-2004
 		{ iso(1) member-body(2) us(840) rsadsi(113549) pkcs(1) pkcs-9(9) smime(16) modules(0) cms-2004(24) },
-	EncryptedContentInfo, SignerInfo FROM CMS-2004
-		{ iso(1) member-body(2) us(840) rsadsi(113549) pkcs(1) pkcs-9(9) smime(16) modules(0) cms-2004(24) };
+	SignerInfo FROM CMS-2004
+		{ iso(1) member-body(2) us(840) rsadsi(113549) pkcs(1) pkcs-9(9) smime(16) modules(0) cms-2004(24) },
+	AuthEnvelopedData FROM CMS-AuthEnvelopedData-2007
+		{ iso(1) member-body(2) us(840) rsadsi(113549) pkcs(1) pkcs-9(9) smime(16) modules(0) cms-authEnvelopedData(31) };
 
 -- Core protocol version
 Version ::= ENUMERATED {
@@ -904,7 +911,7 @@ Metadata ::= SEQUENCE {
 	order            INTEGER,
 	compactness      CompressedData OPTIONAL,
 	integrity        [0] DigestInfo OPTIONAL,           -- Message Integrity (MI)
-	confidentiality  [1] EncryptedContentInfo OPTIONAL,
+	confidentiality  [1] AuthEnvelopedData OPTIONAL,
 	priority         [2] MessagePriority OPTIONAL,
 	lifetime         [3] INTEGER OPTIONAL,
 	previous_frame   [4] DigestInfo OPTIONAL,           -- prior Frame digest; not FI
@@ -1078,7 +1085,7 @@ let frame = compose::<SecureMessage>(Version::V1)
 	.with_id(b"msg-001")
 	.with_order(timestamp)
 	.with_message_hasher::<Sha3_256>(salt)          // ✓ Matches MyAppProfile::Digest
-	.with_aead(cipher)                              // ✓ Matches MyAppProfile::AeadOid
+	.with_encryptor(cipher)                         // ✓ Matches MyAppProfile::AeadOid
 	.with_signer::<Secp256k1Signature, _>(signer)   // ✓ Matches MyAppProfile::SignatureAlg
 	.build()?;
 ```
@@ -1164,7 +1171,7 @@ Each provider role MUST use the algorithm its profile names. The `Profile` bound
 
 Its associated profile is `TightbeamProfile` ([§6.2](#62-security-profile-types)).
 
-Every part is replaceable. An implementor brings its own algorithm as a type that implements the role's trait: a signature type for `SigningProvider`, a `ContentEncryption` cipher for `AeadProvider`, a `KeyWrapAlgorithm` for `KeyWrapProvider`, a `KdfFunction` for `KdfProvider`, and a `RecipientKem` for `CryptoProvider::Kem`. The envelope, the recipients, and the handshake then run that provider's algorithms and refuse any other. The handshake reads no HPKE suite, so a provider with these roles alone runs both handshake flows.
+Every part is replaceable. An implementor brings its own algorithm as a type that implements the role's trait: a signature type for `SigningProvider`, a `ContentEncryption` cipher for `AeadProvider`, a `KeyWrapAlgorithm` for `KeyWrapProvider`, a `KdfFunction` for `KdfProvider`, and a `RecipientKem` for `CryptoProvider::Kem`. A `ContentEncryption` cipher MUST leave the buffer of a refused seal or open as it was, because a frame seals and opens its body in its own buffer. The envelope, the recipients, and the handshake then run that provider's algorithms and refuse any other. The handshake reads no HPKE suite, so a provider with these roles alone runs both handshake flows.
 
 ### 6.6 Cryptographic Requirements
 
@@ -1362,6 +1369,17 @@ Frames use ASN.1 DER with two envelope layers:
 - **`TransportEnvelope`**: Inner request, response, CMS, or mux payload
 
 With the `transport-multiplex` feature, `TransportEnvelope` also carries mux stream envelopes. Stream metadata travels inside that envelope, so encryption hides it.
+
+An encrypted `WireEnvelope` carries one record, the DER `TransportEnvelope` sealed as an `AuthEnvelopedData` ([RFC 5083][rfc5083]):
+
+| Field | Value |
+| --- | --- |
+| `recipientInfos` | One `KEKRecipientInfo` ([RFC 5652][rfc5652] §6.2.3), version 4, under the session key of the record's direction and epoch |
+| `kekid.keyIdentifier` | `tb/session/record/kekid/v1`, then the direction octet (`0x00` client to server, `0x01` server to client), then the epoch as four big-endian octets |
+| Content key and nonce | Fresh for each record, the content key wrapped under the session key |
+| `authAttrs` | The content type `id-data`, and a `RecordSequence ::= SEQUENCE { epoch INTEGER, sequence INTEGER }` under `1.3.6.1.4.1.64586.1.27` |
+
+A receiver opens a record in the buffer it arrived in. Before the content key unwraps, it refuses a record of another epoch, a record whose sequence is another than the next one it expects, a record at the record limit, and a record whose `kekid` names another direction or epoch. The tag covers the sequence, so a record moved to another position fails its tag. [RFC 9846 §5.5][rfc9846-5.5] sets the record limit on the sender, and the receiver's refusal at the limit is the crate's own renewal policy.
 
 DER tag-length-value encoding supplies framing. Default size limits:
 
@@ -2025,6 +2043,7 @@ let security_accept = SecurityAccept {
 | Threat                     | Control                                     | Implementation                                                                                                                                                                                                    |
 | -------------------------- | ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Replay Attack**          | 32-byte nonce + replay set                  | Server maintains set of seen nonces. Rejects duplicates                                                                                                                                                           |
+| **Record Replay**          | Authenticated record sequence               | Each record carries its epoch and sequence in `authAttrs`. A receiver refuses another epoch and another sequence than the next                                                                                    |
 | **Downgrade Attack**       | Profile list in signed transcript           | Transcript hash covers SecurityOffer/SecurityAccept                                                                                                                                                               |
 | **Multiplexing Downgrade** | Transport offer/accept in signed transcript | Transcript hash covers TransportOffer/TransportAccept. Unsolicited accept fails closed                                                                                                                            |
 | **MITM**                   | Transcript signatures                       | Each signature covers a labelled digest of transcript_hash. Verified against certificates                                                                                                                         |
@@ -2036,7 +2055,7 @@ let security_accept = SecurityAccept {
 | **Flow-Control Overrun**   | Receiver-side duplicate accounting          | Oversize chunks, credit overruns, and session-budget overspends each answered with GoAway(`ProtocolError`)                                                                                                        |
 | **Rapid Reset**            | Cancel budget + GoAway                      | Peer cancels that abort in-flight handlers draw on `DEFAULT_MUX_CANCEL_BUDGET`. Exhaustion sends GoAway(`EnhanceYourCalm`) (CVE-2023-44487 / [RFC 9113 §7][rfc9113-7])                                            |
 | **Certificate Forgery**    | X.509 chain validation                      | Verify against a configured root of trust (application responsibility)                                                                                                                                            |
-| **Nonce Reuse**            | Monotonic counter + XOR                     | Per-message nonce derived from seed XOR counter                                                                                                                                                                   |
+| **Nonce Reuse**            | Fresh content key per record                | Each record draws a fresh content key and nonce, and wraps the content key under the session key (RFC 5084 §3.2)                                                                                                  |
 
 ### 8.6 Multiplexing
 

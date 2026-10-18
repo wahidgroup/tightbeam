@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use tightbeam::{
 	compress::{Inflator, ZstdCompression},
-	crypto::{aead::Aes256Gcm, sign::ecdsa::Secp256k1SigningKey},
+	crypto::sign::ecdsa::Secp256k1SigningKey,
 	decode,
 	prelude::*,
 	servlet,
@@ -25,7 +25,7 @@ use tightbeam::{
 use crate::common::poll::poll_until;
 use crate::common::security::expectation_failure;
 use crate::dtn::{
-	certs::FrameSigner,
+	certs::{FrameSigner, SharedCipher},
 	chain_processor::{ChainProcessor, ProcessResult},
 	clock::mission_time_ms,
 	events::{
@@ -58,7 +58,7 @@ trait DtnNode {
 	fn node_name(&self) -> &str;
 	fn signing_key(&self) -> &Secp256k1SigningKey;
 	fn signers(&self) -> Vec<&FrameSigner>;
-	fn cipher(&self) -> &Aes256Gcm;
+	fn cipher(&self) -> &SharedCipher;
 	fn chain_processor(&self) -> &Arc<ChainProcessor>;
 	fn frame_builder(&self) -> &Arc<FrameBuilderHelper>;
 
@@ -78,16 +78,16 @@ trait DtnNode {
 	}
 
 	/// Helper: Decrypt relay message
-	fn decrypt_relay_message(&self, frame: Frame) -> Result<RelayMessage, TightBeamError> {
+	async fn decrypt_relay_message(&self, frame: Frame) -> Result<RelayMessage, TightBeamError> {
 		if frame.metadata().confidentiality().is_some() {
 			let zstd = ZstdCompression::default();
-			let inflator: Option<&dyn Inflator> = if frame.metadata().compactness().is_some() {
+			let inflator: Option<&(dyn Inflator + Sync)> = if frame.metadata().compactness().is_some() {
 				Some(&zstd)
 			} else {
 				None
 			};
 
-			frame.decrypt::<RelayMessage>(self.cipher(), inflator)
+			frame.decrypt::<RelayMessage>(self.cipher(), inflator).await
 		} else {
 			decode(frame.message())
 		}
@@ -157,7 +157,7 @@ pub struct MissionControlServletConfig {
 	pub mission_control_signing_key: Secp256k1SigningKey,
 	pub rover_signer: FrameSigner,
 	pub earth_relay_signer: FrameSigner,
-	pub shared_cipher: Aes256Gcm,
+	pub shared_cipher: SharedCipher,
 	pub chain_processor: Arc<ChainProcessor>,
 	pub frame_builder: Arc<FrameBuilderHelper>,
 	pub earth_relay_addr: TightBeamSocketAddr,
@@ -184,7 +184,7 @@ servlet! {
 			ProcessResult::Processed(ordered_frames) => {
 				for ordered_frame in ordered_frames {
 					// Decrypt and decode using trait method
-					let relay_message = config.decrypt_relay_message(ordered_frame)?;
+					let relay_message = config.decrypt_relay_message(ordered_frame).await?;
 					match relay_message {
 						RelayMessage::Telemetry(telemetry) => {
 							// WORKER: Handle telemetry analysis and command
@@ -298,7 +298,7 @@ impl DtnNode for MissionControlServletConfig {
 		vec![&self.rover_signer, &self.earth_relay_signer]
 	}
 
-	fn cipher(&self) -> &Aes256Gcm {
+	fn cipher(&self) -> &SharedCipher {
 		&self.shared_cipher
 	}
 
@@ -317,7 +317,7 @@ pub struct EarthRelaySatelliteServletConfig {
 	pub mission_control_signer: FrameSigner,
 	pub mars_relay_signer: FrameSigner,
 	pub rover_signer: FrameSigner,
-	pub shared_cipher: Aes256Gcm,
+	pub shared_cipher: SharedCipher,
 	pub mars_relay_addr: TightBeamSocketAddr,
 	pub mission_control_addr: Arc<RwLock<Option<TightBeamSocketAddr>>>,
 	pub mission_control_pool: Arc<ConnectionPool<TokioListener>>,
@@ -363,7 +363,7 @@ servlet! {
 				// Check if any processed frames are gap recovery messages
 				if let Some(ordered_frame) = ordered_frames.into_iter().next() {
 					// Decrypt and decode to check message type
-					let relay_message = config.decrypt_relay_message(ordered_frame)?;
+					let relay_message = config.decrypt_relay_message(ordered_frame).await?;
 					match relay_message {
 						RelayMessage::FrameRequest(request) => {
 							// WORKER: Decide what to do with frame request
@@ -507,7 +507,7 @@ impl DtnNode for EarthRelaySatelliteServletConfig {
 		vec![&self.mission_control_signer, &self.mars_relay_signer, &self.rover_signer]
 	}
 
-	fn cipher(&self) -> &Aes256Gcm {
+	fn cipher(&self) -> &SharedCipher {
 		&self.shared_cipher
 	}
 
@@ -526,7 +526,7 @@ pub struct MarsRelaySatelliteServletConfig {
 	pub mission_control_signer: FrameSigner,
 	pub earth_relay_signer: FrameSigner,
 	pub rover_signer: FrameSigner,
-	pub shared_cipher: Aes256Gcm,
+	pub shared_cipher: SharedCipher,
 	pub rover_addr: TightBeamSocketAddr,
 	pub earth_relay_addr: Arc<RwLock<Option<TightBeamSocketAddr>>>,
 	pub earth_relay_pool: Arc<ConnectionPool<TokioListener>>,
@@ -564,7 +564,7 @@ servlet! {
 				// Check if any processed frames are gap recovery messages
 				for ordered_frame in ordered_frames {
 					// Decrypt and decode to check message type
-					let relay_message = config.decrypt_relay_message(ordered_frame)?;
+					let relay_message = config.decrypt_relay_message(ordered_frame).await?;
 					match relay_message {
 						RelayMessage::FrameRequest(request) => {
 							// WORKER: Decide what to do with frame request
@@ -729,7 +729,7 @@ impl DtnNode for MarsRelaySatelliteServletConfig {
 		vec![&self.mission_control_signer, &self.earth_relay_signer, &self.rover_signer]
 	}
 
-	fn cipher(&self) -> &Aes256Gcm {
+	fn cipher(&self) -> &SharedCipher {
 		&self.shared_cipher
 	}
 
@@ -749,7 +749,7 @@ pub struct RoverServletConfig {
 	pub rover_signing_key: Secp256k1SigningKey,
 	pub mission_control_signer: FrameSigner,
 	pub mars_relay_signer: FrameSigner,
-	pub shared_cipher: Aes256Gcm,
+	pub shared_cipher: SharedCipher,
 	pub chain_processor: Arc<ChainProcessor>,
 	// TODO
 	pub _fault_manager: Arc<FaultManager>,
@@ -797,7 +797,7 @@ servlet! {
 		}
 
 		// Decrypt and decode RelayMessage
-		let relay_message = config.decrypt_relay_message(frame)?;
+		let relay_message = config.decrypt_relay_message(frame).await?;
 		match relay_message {
 			RelayMessage::Command(command) => {
 				let request = RoverCommandHandlerRequest {
@@ -878,7 +878,7 @@ impl DtnNode for RoverServletConfig {
 		vec![&self.mission_control_signer, &self.mars_relay_signer]
 	}
 
-	fn cipher(&self) -> &Aes256Gcm {
+	fn cipher(&self) -> &SharedCipher {
 		&self.shared_cipher
 	}
 

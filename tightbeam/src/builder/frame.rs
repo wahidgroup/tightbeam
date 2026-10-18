@@ -18,10 +18,12 @@ use crate::error::{ReceivedExpectedError, TightBeamError};
 use crate::matrix::{IntoMatrixDyn, MatrixDyn};
 use crate::{DigestInfo, Frame, Message, Metadata, Version};
 
+#[cfg(feature = "aead")]
+use crate::asn1::{AuthEnvelopedData, WireDer};
 #[cfg(feature = "compress")]
 use crate::compress::Compressor;
 #[cfg(feature = "aead")]
-use crate::crypto::aead::{AeadAlgorithm, Encryptor};
+use crate::crypto::aead::Encryptor;
 #[cfg(feature = "digest")]
 use crate::crypto::commitment::CommitmentSalt;
 #[cfg(feature = "digest")]
@@ -36,13 +38,24 @@ use crate::crypto::sign::SignatureEncoding;
 use crate::crypto::sign::{
 	CanonicalForm, CertifiedKey, CmsSigner, PrehashSigner, SignatureAlgorithmIdentifier, Signed, SignedContent,
 };
-#[cfg(any(feature = "digest", feature = "aead", feature = "ecdh"))]
+#[cfg(any(feature = "digest", feature = "aead"))]
 use crate::der::oid::AssociatedOid;
 #[cfg(host_clock)]
 use crate::utils::time::UnixMillis;
 
 #[cfg(feature = "aead")]
-type EncryptorFn = Box<dyn FnOnce(&[u8]) -> Result<crate::EncryptedContentInfo>>;
+type EncryptorFn = Box<dyn FnOnce(Vec<u8>) -> Result<AuthEnvelopedData>>;
+
+/// The seal of an encryptor, which takes the content type and the random
+/// source the build hands it.
+#[cfg(feature = "aead")]
+type SealFn = Box<
+	dyn FnOnce(
+		Vec<u8>,
+		Option<ObjectIdentifier>,
+		Option<&mut dyn rand_core::CryptoRngCore>,
+	) -> Result<AuthEnvelopedData>,
+>;
 
 #[cfg(feature = "signature")]
 type SignerFn = Box<dyn FnOnce(&[u8]) -> Result<Signed<crate::SignerInfo>>>;
@@ -172,8 +185,7 @@ pub struct FrameBuilder<T: Message> {
 	#[cfg(feature = "compress")]
 	compressor: Option<Box<dyn Compressor>>,
 	#[cfg(feature = "aead")]
-	#[allow(clippy::type_complexity)]
-	encryptor: Option<Box<dyn FnOnce(&[u8]) -> Result<crate::EncryptedContentInfo>>>,
+	encryptor: Option<SealFn>,
 	#[cfg(feature = "aead")]
 	rng: Option<Box<dyn rand_core::CryptoRngCore>>,
 	#[cfg(feature = "digest")]
@@ -211,6 +223,9 @@ impl<T: Message> FrameBuilder<T> {
 		self
 	}
 
+	/// Set the content type the encryptor seals the message body as, which
+	/// the envelope names in its content type and its content-type attribute.
+	/// The encryptor seals as `id-data` when it is unset.
 	pub fn with_content_oid(mut self, oid: ObjectIdentifier) -> Self {
 		self.message_oid = Some(oid);
 		self
@@ -290,7 +305,7 @@ impl<T: Message> FrameBuilder<T> {
 		// tells the caller what to add.
 		#[cfg(feature = "aead")]
 		if T::MUST_BE_CONFIDENTIAL && self.encryptor.is_none() {
-			return Err(TightBeamError::MissingProtection { marker: "MUST_BE_CONFIDENTIAL", call: "with_aead" });
+			return Err(TightBeamError::MissingProtection { marker: "MUST_BE_CONFIDENTIAL", call: "with_encryptor" });
 		}
 
 		#[cfg(feature = "signature")]
@@ -338,79 +353,44 @@ impl<T: Message> FrameBuilder<T> {
 
 #[cfg(feature = "aead")]
 impl<T: Message> FrameBuilder<T> {
+	/// Set the random source the encryptor draws from: the content key, the
+	/// nonce, and every value its recipient draws. It applies in either order
+	/// against [`Self::with_encryptor`], and the OS source draws when it is
+	/// unset.
 	pub fn with_rng(mut self, rng: impl rand_core::CryptoRngCore + 'static) -> Self {
 		self.rng = Some(Box::new(rng));
 		self
 	}
 
-	/// Set the AEAD cipher for symmetric encryption.
+	/// Set the encryptor that seals the message body as an
+	/// `AuthEnvelopedData`, such as an in-memory key-encryption key or a KEM
+	/// recipient.
 	///
-	/// The cipher type names the algorithm identifier stamped on the frame.
-	pub fn with_aead<Cipher>(mut self, cipher: Cipher) -> Self
-	where
-		Cipher: AeadAlgorithm + 'static,
-		T: CheckAeadOid<Cipher::Oid>,
-	{
-		// A checker impl can admit any algorithm, so this comparison
-		// enforces the profile.
-		let received = <Cipher::Oid as AssociatedOid>::OID;
-		let expected = <T::Profile as SecurityProfile>::AeadOid::OID;
-		if T::HAS_PROFILE && received != expected {
-			let mismatch = ReceivedExpectedError::from((received, expected));
-			self.errors.push(TightBeamError::UnexpectedAlgorithm(mismatch));
-			return self;
-		}
-
-		// The closure generates the nonce, so each nonce binds to one
-		// encryption call. A builder that becomes reusable MUST NOT reuse a
-		// captured nonce.
-		let rng = self.rng.take();
-		let message_oid = self.message_oid;
-		self.encryptor = Some(Box::new(move |plaintext: &[u8]| {
-			let mut rng = rng;
-			let rng: &mut dyn rand_core::CryptoRngCore = match rng.as_mut() {
-				Some(boxed_rng) => &mut **boxed_rng,
-				None => &mut rand_core::OsRng,
-			};
-
-			let nonce = Cipher::generate_nonce(rng);
-			let encrypted_content =
-				<Cipher as Encryptor<Cipher::Oid>>::encrypt_content(&cipher, plaintext, &nonce, message_oid)?;
-			Ok(encrypted_content)
-		}));
-
-		self
-	}
-
-	/// Use a custom encryptor for asymmetric encryption, such as HPKE.
+	/// - The encryptor names the content-encryption algorithm `C` its envelopes carry.
+	/// - A message with a profile admits the profile's AEAD alone, at compile time when derived.
+	/// - The rng of [`Self::with_rng`] draws the content key, the nonce, and the recipient's values.
 	pub fn with_encryptor<C, E>(mut self, encryptor: E) -> Self
 	where
 		C: AssociatedOid,
 		E: Encryptor<C> + 'static,
+		T: CheckAeadOid<C>,
 	{
-		// The profile admits an encryptor that names its AEAD or its curve.
-		if T::HAS_PROFILE {
-			let aead_match = C::OID == <T::Profile as SecurityProfile>::AeadOid::OID;
-			#[cfg(feature = "ecdh")]
-			let curve_match = C::OID == <T::Profile as SecurityProfile>::Curve::OID;
-			#[cfg(not(feature = "ecdh"))]
-			let curve_match = false;
-
-			if !aead_match && !curve_match {
-				self.errors
-					.push(TightBeamError::UnexpectedAlgorithm(ReceivedExpectedError::from((
-						C::OID,
-						<T::Profile as SecurityProfile>::AeadOid::OID,
-					))));
-				return self;
-			}
+		// A checker impl can admit any algorithm, so this comparison
+		// enforces the profile.
+		let expected = <T::Profile as SecurityProfile>::AeadOid::OID;
+		if T::HAS_PROFILE && C::OID != expected {
+			let mismatch = ReceivedExpectedError::from((C::OID, expected));
+			self.errors.push(TightBeamError::UnexpectedAlgorithm(mismatch));
+			return self;
 		}
 
-		let message_oid = self.message_oid;
-		self.encryptor = Some(Box::new(move |plaintext: &[u8]| {
-			// The encryptor derives its own nonce, as HPKE does.
-			encryptor.encrypt_content(plaintext, [], message_oid)
-		}));
+		self.encryptor = Some(Box::new(
+			move |content: Vec<u8>,
+			      content_type: Option<ObjectIdentifier>,
+			      rng: Option<&mut dyn rand_core::CryptoRngCore>| {
+				encryptor.encrypt_content(content, content_type, rng)
+			},
+		));
 
 		self
 	}
@@ -568,6 +548,20 @@ impl<T: Message> TypeBuilder<Frame> for FrameBuilder<T> {
 		let message = self.message.ok_or(TightBeamError::InvalidBody)?;
 		let metadata_builder = self.metadata_builder;
 
+		// The content type and the random source bind at the build, so each
+		// applies whatever its order against the encryptor.
+		#[cfg(feature = "aead")]
+		let message_oid = self.message_oid;
+		#[cfg(feature = "aead")]
+		let mut rng = self.rng;
+		#[cfg(feature = "aead")]
+		let encryptor = self.encryptor.map(|seal| -> EncryptorFn {
+			Box::new(move |content: Vec<u8>| {
+				let rng = rng.as_deref_mut().map(|rng| rng as &mut dyn rand_core::CryptoRngCore);
+				seal(content, message_oid, rng)
+			})
+		});
+
 		FrameBuilder::build_impl(
 			version,
 			message,
@@ -575,7 +569,7 @@ impl<T: Message> TypeBuilder<Frame> for FrameBuilder<T> {
 			#[cfg(feature = "compress")]
 			self.compressor,
 			#[cfg(feature = "aead")]
-			self.encryptor,
+			encryptor,
 			#[cfg(feature = "digest")]
 			self.witness,
 			#[cfg(feature = "signature")]
@@ -674,15 +668,18 @@ impl<T: Message> FrameBuilder<T> {
 			bytes
 		};
 
-		// 3. Encrypt the bytes when an encryptor is set.
+		// 3. Encrypt the bytes in place when an encryptor is set. The
+		// ciphertext moves into the message, detached from the envelope that
+		// stays in the metadata (RFC 5652 §6.1).
 		#[cfg(feature = "aead")]
 		let message_bytes = if let Some(enc) = encryptor {
-			let mut encrypted_content = enc(&bytes)?;
-			let encrypted_bytes = encrypted_content
+			let mut envelope = enc(bytes)?;
+			let encrypted_bytes = envelope
+				.auth_encrypted_content_info
 				.encrypted_content
 				.take()
 				.ok_or(TightBeamError::MissingEncryptionInfo)?;
-			metadata_builder = metadata_builder.with_confidentiality_info(encrypted_content);
+			metadata_builder = metadata_builder.with_confidentiality_info(WireDer::new(envelope)?);
 			encrypted_bytes.into_bytes()
 		} else {
 			bytes
@@ -743,7 +740,7 @@ mod tests {
 	use super::*;
 	use crate::crypto::x509::KeyPurposes;
 	use crate::test_builder;
-	use crate::testing::{TestIdentity, TestKey, TestMessage};
+	use crate::testing::{TestFrame, TestIdentity, TestKey, TestMessage};
 
 	#[cfg(feature = "compress")]
 	use crate::compress::ZstdCompression;
@@ -803,7 +800,7 @@ mod tests {
 			.with_message(msg)
 			.with_id("test_v1_with_encryption")
 			.with_order(1696521600)
-			.with_aead(cipher)
+			.with_encryptor(cipher)
 			.with_signer::<Secp256k1Signature, _>(TestIdentity::certified(signing_key))
 			.build()
 		},
@@ -818,7 +815,7 @@ mod tests {
 			assert!(decode_result.is_err(), "Body should be encrypted");
 
 			let (_, cipher) = TestKey::insecure_fixed_cipher();
-			let decrypted = tightbeam.decrypt::<TestMessage>(&cipher, None)?;
+			let decrypted = TestFrame::decrypted::<TestMessage>(tightbeam, &cipher, None)?;
 			assert_eq!(decrypted, message);
 
 			Ok(())
@@ -848,7 +845,7 @@ mod tests {
 			.with_id("test_v1_with_compression")
 			.with_order(1696521600)
 			.with_compression(ZstdCompression::default())
-			.with_aead(cipher)
+			.with_encryptor(cipher)
 			.with_signer::<Secp256k1Signature, _>(TestIdentity::certified(signing_key))
 			.build()
 		},
@@ -865,7 +862,7 @@ mod tests {
 
 			// The decryption also decompresses the body.
 			let (_, cipher) = TestKey::insecure_fixed_cipher();
-			let decrypted = tightbeam.decrypt::<TestMessage>(&cipher, Some(&ZstdCompression::default()))?;
+			let decrypted = TestFrame::decrypted::<TestMessage>(tightbeam, &cipher, Some(&ZstdCompression::default()))?;
 			assert_eq!(decrypted, message);
 
 			Ok(())
@@ -903,7 +900,7 @@ mod tests {
 				.with_witness_hasher::<Sha3_256>()
 				.with_compression(ZstdCompression::default())
 				.with_rng(rng)
-				.with_aead(cipher)
+				.with_encryptor(cipher)
 				.with_signer::<Secp256k1Signature, _>(TestIdentity::certified(signing_key))
 				.with_priority(crate::MessagePriority::LowLatency)
 				.with_lifetime(3600)
@@ -956,7 +953,7 @@ mod tests {
 
 			// The decryption also decompresses the body.
 			let (_, cipher) = TestKey::insecure_fixed_cipher();
-			let decrypted = tightbeam.decrypt::<TestMessage>(&cipher, Some(&ZstdCompression::default()))?;
+			let decrypted = TestFrame::decrypted::<TestMessage>(tightbeam, &cipher, Some(&ZstdCompression::default()))?;
 			assert_eq!(decrypted, message);
 
 			Ok(())
@@ -1049,7 +1046,7 @@ mod tests {
 			confidential => (
 				unprotected_refusal(crate::testing::fixtures::ConfidentialNote { content: "x".into() }),
 				"MUST_BE_CONFIDENTIAL",
-				"with_aead"
+				"with_encryptor"
 			),
 			message_integrity => (
 				unprotected_refusal(crate::testing::fixtures::IntegralNote { content: "x".into() }),
@@ -1059,17 +1056,193 @@ mod tests {
 		}
 	}
 
+	#[cfg(all(feature = "aes-gcm", feature = "signature", feature = "kdf", feature = "ecdh"))]
+	mod seals {
+		use super::*;
+		use crate::asn1::GcmParameters;
+		use crate::crypto::aead::Aes128GcmOid;
+		use crate::crypto::profiles::TightbeamProfile;
+		use crate::random::CryptoRngCore;
+		use crate::testing::{SeededStream, TestAttributes};
+
+		/// The `id-signedData` content type, `1.2.840.113549.1.7.2` (RFC 5652
+		/// §5.1), a type other than the default.
+		const ID_SIGNED_DATA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.2");
+
+		/// The AES-128-GCM algorithm, `2.16.840.1.101.3.4.1.6` (RFC 5084).
+		const AES_128_GCM: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.6");
+
+		/// The AES-256-GCM algorithm, `2.16.840.1.101.3.4.1.46` (RFC 5084).
+		const AES_256_GCM: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.46");
+
+		/// A V1 builder of a sample message, ready for its seal.
+		fn builder() -> FrameBuilder<TestMessage> {
+			FrameBuilder::<TestMessage>::from(Version::V1)
+				.with_message(TestMessage::sample(None))
+				.with_id("seal")
+				.with_order(1)
+		}
+
+		/// The nonce the `GCMParameters` of the seal of `frame` name.
+		fn sealed_nonce(frame: &Frame) -> Vec<u8> {
+			let envelope = frame.metadata().confidentiality().expect("the frame is sealed");
+			let parameters = envelope.auth_encrypted_content_info.content_enc_alg.parameters.as_ref();
+			let parameters = parameters.expect("the seal names its nonce");
+			let parameters: GcmParameters = parameters.decode_as().expect("the parameters are GCMParameters");
+			parameters.aes_nonce.as_bytes().to_vec()
+		}
+
+		/// `SeededStream(0)` draws the content key `0x01` repeated 32 times,
+		/// then the nonce `0x02` repeated 12 times, so the seal's nonce shows
+		/// the builder's rng drew it.
+		#[test]
+		fn the_builders_rng_draws_the_seal() -> Result<()> {
+			let (_, cipher) = TestKey::insecure_fixed_cipher();
+			let frame = builder().with_rng(SeededStream(0)).with_encryptor(cipher).build()?;
+
+			assert_eq!(sealed_nonce(&frame), [0x02; 12]);
+			Ok(())
+		}
+
+		/// The rng binds at the build, so it draws the seal when it follows
+		/// the encryptor.
+		#[test]
+		fn an_rng_set_after_the_encryptor_draws_the_seal() -> Result<()> {
+			let (_, cipher) = TestKey::insecure_fixed_cipher();
+			let frame = builder().with_encryptor(cipher).with_rng(SeededStream(0)).build()?;
+
+			assert_eq!(sealed_nonce(&frame), [0x02; 12]);
+			Ok(())
+		}
+
+		/// The content type the builder names is the type the frame's envelope
+		/// declares, in its content type and in its content-type attribute.
+		#[test]
+		fn a_frame_declares_the_content_type_its_builder_names() -> Result<()> {
+			let (_, cipher) = TestKey::insecure_fixed_cipher();
+			let frame = builder().with_content_oid(ID_SIGNED_DATA).with_encryptor(cipher).build()?;
+
+			let metadata = frame.metadata();
+			let envelope = metadata.confidentiality().ok_or(TightBeamError::MissingEncryptionInfo)?;
+			let declared = TestAttributes::declared_content_types(envelope);
+			assert_eq!(declared, (ID_SIGNED_DATA, ID_SIGNED_DATA));
+			Ok(())
+		}
+
+		/// A frame of the content type the builder names opens as that type
+		/// under the key that sealed it.
+		#[test]
+		fn a_frame_of_another_content_type_opens_under_its_key() -> Result<()> {
+			let (_, cipher) = TestKey::insecure_fixed_cipher();
+			let frame = builder().with_content_oid(ID_SIGNED_DATA).with_encryptor(cipher).build()?;
+
+			let (_, key) = TestKey::insecure_fixed_cipher();
+			let opened = TestFrame::decrypted::<TestMessage>(frame, &key, None)?;
+			assert_eq!(opened, TestMessage::sample(None));
+			Ok(())
+		}
+
+		/// A message of the house profile whose hand-written checker admits
+		/// every AEAD, so the builder's run-time comparison is its one guard.
+		#[derive(Clone, Debug, PartialEq, crate::der::Sequence)]
+		struct LaxMessage {
+			content: crate::der::asn1::OctetString,
+		}
+
+		impl Message for LaxMessage {
+			const HAS_PROFILE: bool = true;
+			type Profile = TightbeamProfile;
+		}
+
+		impl<C: AssociatedOid> CheckAeadOid<C> for LaxMessage {}
+
+		/// An encryptor that names AES-128-GCM, outside the house profile.
+		struct Aes128Encryptor;
+
+		impl Encryptor<Aes128GcmOid> for Aes128Encryptor {
+			fn encrypt_content(
+				&self,
+				_content: impl Into<Vec<u8>>,
+				_content_type: Option<ObjectIdentifier>,
+				_rng: Option<&mut dyn CryptoRngCore>,
+			) -> Result<AuthEnvelopedData> {
+				Err(TightBeamError::MissingEncryptionInfo)
+			}
+		}
+
+		/// A checker that admits any algorithm leaves the profile to the
+		/// builder, which refuses an encryptor outside it.
+		#[test]
+		fn an_encryptor_outside_the_profile_is_refused() -> Result<()> {
+			let message = LaxMessage { content: crate::der::asn1::OctetString::new(b"lax".as_slice())? };
+			let built = FrameBuilder::<LaxMessage>::from(Version::V1)
+				.with_message(message)
+				.with_id("lax")
+				.with_order(1)
+				.with_encryptor(Aes128Encryptor)
+				.build();
+
+			let expected = ReceivedExpectedError { received: AES_128_GCM, expected: AES_256_GCM };
+			assert!(matches!(built, Err(TightBeamError::UnexpectedAlgorithm(found)) if found == expected));
+			Ok(())
+		}
+	}
+
+	#[cfg(all(feature = "compress", any(feature = "transport-cms", feature = "transport-hpke")))]
+	mod interop {
+		use super::*;
+		use crate::crypto::cms::KemRecipient;
+		use crate::crypto::hpke::HpkeEncryptor;
+		use crate::crypto::key::{KeyBackend, Secp256k1KeyProvider};
+		use crate::crypto::profiles::DefaultCryptoProvider;
+		use crate::oids::{AUTH_ENVELOPED_DATA, COMPRESSION_CONTENT};
+		use crate::transport::handshake::tests::{content_info, write_interop_samples};
+
+		/// The `ContentInfo` of the envelope of `frame`, a compressed and
+		/// sealed frame, and of its `CompressedData`.
+		fn samples_of(frame: &Frame) -> [(&'static str, Vec<u8>); 2] {
+			let envelope = frame.metadata().confidentiality().expect("the frame is sealed");
+			let compressed = frame.metadata().compactness().expect("the frame is compressed");
+			[
+				("frame-kem", content_info(AUTH_ENVELOPED_DATA, envelope)),
+				("compressed-data", content_info(COMPRESSION_CONTENT, compressed)),
+			]
+		}
+
+		/// Write the envelope of a frame sealed to a bare KEM recipient, and
+		/// the `CompressedData` of its body. `scripts/cms-interop.sh` parses
+		/// both with OpenSSL, and checks that the `CompressedData` declares
+		/// `id-data`, when the run sets `TIGHTBEAM_CMS_SAMPLES`.
+		#[test]
+		fn the_emitted_structures_write_their_interop_samples() -> Result<()> {
+			let backend = Secp256k1KeyProvider::from(TestKey::insecure_fixed_signing());
+			let recipient = KemRecipient::bare(backend.to_public_key_bytes()?)?;
+			let encryptor = HpkeEncryptor::<DefaultCryptoProvider>::new(recipient);
+			let frame = FrameBuilder::<TestMessage>::from(Version::V1)
+				.with_message(TestMessage::sample(None))
+				.with_id("interop")
+				.with_order(1696521600)
+				.with_compression(ZstdCompression::default())
+				.with_encryptor(encryptor)
+				.build()?;
+
+			write_interop_samples(&samples_of(&frame), &[], &[])?;
+			Ok(())
+		}
+	}
+
 	mod validation {
 		use super::*;
-		use crate::crypto::aead::{Aes256Gcm, Aes256GcmOid};
+		use crate::crypto::aead::Aes256GcmOid;
 		use crate::crypto::hash::Sha3_256;
+		use crate::crypto::key::Aes256GcmKeyProvider;
 		use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
 		use crate::testing::{TestIdentity, TestKey};
 		use crate::Version;
 
 		// Run the shared assertions after the struct definition.
 		macro_rules! run_tests {
-			($name:expr, $confidential:expr, $nonrepudiable:expr, $message_integrity:expr, $frame_integrity:expr, $min_version:expr, $cipher:expr, $signing_key:expr) => {
+			($name:expr, $confidential:expr, $nonrepudiable:expr, $message_integrity:expr, $frame_integrity:expr, $min_version:expr, $signing_key:expr) => {
 				let message = TestMsg { content: format!("test {}", $name) };
 
 				// Test 1: Verify that the constants match the derive macro
@@ -1084,7 +1257,7 @@ mod tests {
 				let result = compose_frame(
 					$name,
 					message.clone(),
-					$cipher.clone(),
+					TestKey::insecure_fixed_cipher().1,
 					$signing_key.clone(),
 					$confidential,
 					$nonrepudiable,
@@ -1168,7 +1341,7 @@ mod tests {
 		fn compose_frame<T>(
 			test_name: impl AsRef<str>,
 			message: T,
-			cipher: Aes256Gcm,
+			cipher: Aes256GcmKeyProvider,
 			signing_key: Secp256k1SigningKey,
 			confidential: bool,
 			nonrepudiable: bool,
@@ -1252,7 +1425,6 @@ mod tests {
 			($test:ident, $name:expr, $confidential:tt, $nonrepudiable:tt, $message_integrity:tt, $frame_integrity:tt, $version:ident) => {
 				#[test]
 				fn $test() -> Result<()> {
-					let (_, cipher) = TestKey::insecure_fixed_cipher();
 					let signing_key = TestKey::insecure_fixed_signing();
 
 					test_msg_struct!($confidential, $nonrepudiable, $message_integrity, $frame_integrity, $version);
@@ -1263,7 +1435,6 @@ mod tests {
 						$message_integrity,
 						$frame_integrity,
 						Version::$version,
-						&cipher,
 						&signing_key
 					);
 

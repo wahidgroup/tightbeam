@@ -1,8 +1,9 @@
-use tightbeam::crypto::aead::{Aes128Gcm, Aes256GcmOid, Encryptor, KeyInit};
+use tightbeam::crypto::aead::{Aes128GcmOid, Encryptor};
+use tightbeam::testing::TestKey;
 
 fn main() {
-	// AES-128-GCM cipher paired with an AES-256-GCM OID marker.
-	// Must fail to compile: Encryptor binds cipher type to its canonical OID.
-	let cipher = Aes128Gcm::new(&[0u8; 16].into());
-	let _ = Encryptor::<Aes256GcmOid>::encrypt_content(&cipher, b"x", &[0u8; 12], None);
+	// The in-memory key of the house provider seals under AES-256-GCM.
+	// Must fail to compile: Encryptor binds an encryptor to its canonical OID.
+	let (_, cipher) = TestKey::insecure_fixed_cipher();
+	let _ = Encryptor::<Aes128GcmOid>::encrypt_content(&cipher, b"x".to_vec(), None, None);
 }

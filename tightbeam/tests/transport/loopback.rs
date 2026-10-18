@@ -13,10 +13,10 @@
 
 use tightbeam::{
 	crypto::{
-		aead::{DecryptContent, SessionKeys},
+		aead::SessionKeys,
 		profiles::{DefaultCryptoProvider, SecurityProfileDesc},
-		secret::ToInsecure,
 	},
+	der::Encode,
 	exactly, tb_assert_spec, tb_scenario,
 	testing::SetupEnv,
 	trace::TraceCollector,
@@ -104,18 +104,18 @@ fn security_offer(profile: SecurityProfileDesc) -> SecurityOffer {
 /// Probe both directions and return whether the plaintexts match the
 /// probes.
 ///
-/// Each direction has its own key and counter nonce, so no `(key, nonce)`
-/// pair can repeat across the two probes.
+/// Each direction has its own key and record sequence, and each record its
+/// own content key.
 fn bidirectional_roundtrip_ok(client_keys: &SessionKeys, server_keys: &SessionKeys) -> Result<bool, TightBeamError> {
 	let c2s_probe = b"client->server probe";
-	let c2s_ciphertext = client_keys.send().encrypt_next(c2s_probe, None)?;
-	let c2s_plaintext = server_keys.recv().decrypt_content(&c2s_ciphertext)?.to_insecure();
-	let c2s_ok = &c2s_plaintext[..] == c2s_probe;
+	let mut c2s_record = client_keys.send().encrypt_next(c2s_probe)?.to_der()?;
+	let c2s_plaintext = server_keys.recv().open(&mut c2s_record)?;
+	let c2s_ok = c2s_plaintext == c2s_probe;
 
 	let s2c_probe = b"server->client probe";
-	let s2c_ciphertext = server_keys.send().encrypt_next(s2c_probe, None)?;
-	let s2c_plaintext = client_keys.recv().decrypt_content(&s2c_ciphertext)?.to_insecure();
-	let s2c_ok = &s2c_plaintext[..] == s2c_probe;
+	let mut s2c_record = server_keys.send().encrypt_next(s2c_probe)?.to_der()?;
+	let s2c_plaintext = client_keys.recv().open(&mut s2c_record)?;
+	let s2c_ok = s2c_plaintext == s2c_probe;
 
 	Ok(c2s_ok && s2c_ok)
 }
@@ -272,21 +272,19 @@ async fn established_cms_pair(
 	Ok((client_session, server_session))
 }
 
-/// CMS traffic keys must be fresh per handshake (CWE-321): two sessions
-/// against one server seal the same probe differently, and a frame from one
-/// session does not open on the other.
+/// CMS traffic keys must be fresh per handshake (CWE-321): a record of one
+/// session does not open on another session against the same server.
 #[cfg(feature = "transport-cms")]
 async fn cms_unique_traffic_keys(trace: &TraceCollector, materials: &ServerMaterials) -> Result<(), TightBeamError> {
 	let (client_a, _server_a) = established_cms_pair(materials).await?;
-	let (client_b, server_b) = established_cms_pair(materials).await?;
+	let (_client_b, server_b) = established_cms_pair(materials).await?;
 
 	let probe = b"same probe under two sessions";
-	let frame_a = client_a.keys().send().encrypt_next(probe, None)?;
-	let frame_b = client_b.keys().send().encrypt_next(probe, None)?;
+	let record_a = client_a.keys().send().encrypt_next(probe)?;
 
-	let distinct = frame_a.encrypted_content != frame_b.encrypted_content;
-	let isolated = server_b.keys().recv().decrypt_content(&frame_a).is_err();
-	trace.event_with(LOOPBACK_CMS_UNIQUE_KEYS, &[], distinct && isolated)?;
+	let mut arrived_a = record_a.to_der()?;
+	let isolated = server_b.keys().recv().open(&mut arrived_a).is_err();
+	trace.event_with(LOOPBACK_CMS_UNIQUE_KEYS, &[], isolated)?;
 
 	Ok(())
 }
