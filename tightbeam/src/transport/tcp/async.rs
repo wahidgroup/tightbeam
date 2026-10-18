@@ -942,6 +942,7 @@ mod tests {
 	use crate::crypto::sign::ecdsa::{Secp256k1VerifyingKey, SigningKey};
 	use crate::crypto::sign::Sha3Signer;
 	use crate::crypto::sign::SigningIdentity;
+	use crate::crypto::x509::ext::pkix::KeyUsages;
 	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
 	use crate::policy::TransitStatus;
 	use crate::prelude::TightBeamSocketAddr;
@@ -1255,13 +1256,17 @@ mod tests {
 		let sha3_signer = Sha3Signer::from(&signing_key);
 		let spki = SubjectPublicKeyInfoOwned::from_key(verifying_key)?;
 
+		// The server certificate signs its Finished and receives the KEM's
+		// encapsulation of the opening (RFC 5480 §3, RFC 9629 §3).
 		let cert = crate::cert!(
-			profile: Root,
-			subject: "CN=Test Root CA,O=Test Org,C=US",
+			profile: Leaf,
+			subject: "CN=Test Server,O=Test Org,C=US",
+			issuer: "CN=Test Server,O=Test Org,C=US",
 			serial: 1u32,
 			duration: Duration::from_secs(365 * 24 * 60 * 60),
+			subject_public_key: spki,
 			signer: &sha3_signer,
-			subject_public_key: spki
+			key_usage: KeyUsages::DigitalSignature | KeyUsages::KeyAgreement
 		)?;
 
 		let provider = Arc::new(Secp256k1KeyProvider::from(signing_key));

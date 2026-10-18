@@ -632,12 +632,6 @@ trait ClientFinished {
 	/// - [`HandshakeError::DuplicateAttribute`] -- the tag repeats.
 	/// - [`HandshakeError::DerError`] -- the tag is not an OCTET STRING of 32 to 64 bytes.
 	fn key_confirmation(&self) -> Result<KeyConfirmation, HandshakeError>;
-
-	/// The first X.509 certificate embedded in the `certificates` field, if
-	/// any. It is the offered certificate, and the Finished signature must
-	/// verify under its key. The set may also carry the chain of that
-	/// certificate.
-	fn embedded_certificate(&self) -> Option<Certificate>;
 }
 
 impl ClientFinished for SignedData {
@@ -650,16 +644,6 @@ impl ClientFinished for SignedData {
 		let attribute = self.find_unsigned_attr(KeyConfirmation::OID)?;
 		let attribute = attribute.ok_or(HandshakeError::MissingAttribute)?;
 		attribute.decode::<KeyConfirmation>()
-	}
-
-	fn embedded_certificate(&self) -> Option<Certificate> {
-		let set = self.certificates.as_ref()?;
-		set.0.iter().find_map(|choice| match choice {
-			// The caller needs an owned certificate, and the parsed SignedData
-			// keeps its copy.
-			CertificateChoices::Certificate(certificate) => Some(certificate.clone()),
-			CertificateChoices::Other(_) => None,
-		})
 	}
 }
 
@@ -858,10 +842,10 @@ impl<C: HandshakeCurve> CmsClosing<C> {
 		let sealed_ack = finished.sealed_receipt_ack()?;
 		let receipt_ack = sealed_ack.map(OctetString::into_bytes);
 
-		// 3. Parse the certificate once, and build the offer, which compares `R` with its key.
-		let certificate = finished.embedded_certificate();
+		// 3. Parse the certificate the signer names, and build the offer, which compares `R` with its key.
+		let certificate = CmsSigner::signer_certificate(&finished)?;
 		let certificate = certificate.ok_or(HandshakeError::MissingClientCertificate)?;
-		let identity = PeerCertificate::<C>::parse(certificate)?;
+		let identity = PeerCertificate::<C>::parse(certificate.clone())?;
 		let offer = Offer::new(identity, CmsFinished(finished), [&client_ephemeral])?;
 		Ok(ClosingOpened { secret, confirmation, receipt_ack, offer })
 	}
@@ -1098,6 +1082,15 @@ mod tests {
 	fn with_certificate(mut finished: SignedData, certificate: &Certificate) -> SignedData {
 		let embedded = CertificateChoices::Certificate(certificate.to_owned());
 		let certificates = vec![embedded].try_into().expect("one certificate fits a set");
+		finished.certificates = Some(CertificateSet(certificates));
+		finished
+	}
+
+	/// `finished` with its `certificates` set to `certificates`, which DER
+	/// sorts.
+	fn with_certificates(mut finished: SignedData, certificates: impl IntoIterator<Item = Certificate>) -> SignedData {
+		let embedded: Vec<CertificateChoices> = certificates.into_iter().map(CertificateChoices::Certificate).collect();
+		let certificates = embedded.try_into().expect("distinct certificates fit a set");
 		finished.certificates = Some(CertificateSet(certificates));
 		finished
 	}
@@ -2041,6 +2034,39 @@ mod tests {
 		Ok(())
 	}
 
+	/// The server takes the certificate the client Finished's `sid` names, so
+	/// a Finished that carries its chain closes the handshake. The fixed
+	/// chain's leaf sorts second of the three in the DER SET.
+	#[tokio::test]
+	async fn a_finished_carrying_its_chain_closes_under_its_leaf() -> Result<(), Box<dyn Error>> {
+		let chain = crate::testing::fixtures::TestCertificate::insecure_fixed_chain()?;
+		let mut awaiting = server_awaiting_finished().await;
+		let signed = signed_finished(FinishedRole::Client, &chain.leaf_key, awaiting.transcript_hash());
+		let confirmed = with_unsigned_attrs(signed, Some(unsigned_attrs(vec![attribute(&awaiting.confirmation)])));
+		let finished = with_certificates(confirmed, [chain.leaf, chain.intermediate, chain.root]);
+		let closing = awaiting.sealed(&finished);
+
+		awaiting.server.finish(closing).await?;
+		assert_eq!(awaiting.server.phase(), HandshakePhase::Agreed);
+		Ok(())
+	}
+
+	/// A client Finished whose `certificates` hold no certificate its `sid`
+	/// names is refused, though the set carries the signer's chain.
+	#[tokio::test]
+	async fn a_finished_whose_certificates_omit_its_signer_is_refused() -> Result<(), Box<dyn Error>> {
+		let chain = crate::testing::fixtures::TestCertificate::insecure_fixed_chain()?;
+		let mut awaiting = server_awaiting_finished().await;
+		let signed = signed_finished(FinishedRole::Client, &chain.leaf_key, awaiting.transcript_hash());
+		let confirmed = with_unsigned_attrs(signed, Some(unsigned_attrs(vec![attribute(&awaiting.confirmation)])));
+		let finished = with_certificates(confirmed, [chain.intermediate, chain.root]);
+		let closing = awaiting.sealed(&finished);
+
+		let refusal = awaiting.server.finish(closing).await;
+		assert!(matches!(refusal, Err(HandshakeError::MissingClientCertificate)));
+		Ok(())
+	}
+
 	/// A client Finished is a proof, so a closing that names no certificate to
 	/// verify it under is refused, even by a server that demands no identity.
 	#[tokio::test]
@@ -2486,9 +2512,9 @@ mod tests {
 		info.content_type == content_type && decoded == *content
 	}
 
-	/// Write each sample of `emitted` to [`SAMPLE_DIR`] under its name, and
-	/// the DER of both certificates beside them, when the environment holds
-	/// [`SAMPLE_VARIABLE`].
+	/// Write each sample of `emitted` to [`SAMPLE_DIR`] under its name, what
+	/// opens each `KEKRecipientInfo` sample, and the DER of both certificates,
+	/// when the environment holds [`SAMPLE_VARIABLE`].
 	fn write_samples(emitted: &Emitted) -> std::io::Result<()> {
 		if std::env::var_os(SAMPLE_VARIABLE).is_none() {
 			return Ok(());
@@ -2497,6 +2523,11 @@ mod tests {
 		std::fs::create_dir_all(SAMPLE_DIR)?;
 		for (name, der) in emitted.samples() {
 			std::fs::write(format!("{SAMPLE_DIR}/{name}.der"), der)?;
+		}
+		for (name, opening) in emitted.kek_openings() {
+			std::fs::write(format!("{SAMPLE_DIR}/{name}.kek"), hex(&opening.kek))?;
+			std::fs::write(format!("{SAMPLE_DIR}/{name}.kekid"), hex(&opening.key_identifier))?;
+			std::fs::write(format!("{SAMPLE_DIR}/{name}.plain"), &opening.plaintext)?;
 		}
 
 		let server = emitted.server_certificate.to_der().map_err(std::io::Error::other)?;
@@ -2551,6 +2582,34 @@ mod tests {
 		server_certificate: Certificate,
 		/// The certificate of the client.
 		client_certificate: Certificate,
+		/// What OpenSSL opens [`Self::sealed_finished`] with.
+		sealed_finished_opening: KekOpening,
+		/// What OpenSSL opens [`Self::kek_seal`] with.
+		kek_seal_opening: KekOpening,
+	}
+
+	/// The key, the `kekid`, and the plaintext an outside CMS reader recovers
+	/// from one `KEKRecipientInfo` sample, all from fixed test keys.
+	struct KekOpening {
+		kek: Vec<u8>,
+		key_identifier: Vec<u8>,
+		plaintext: Vec<u8>,
+	}
+
+	impl KekOpening {
+		/// What opens the seal `sealer` makes for `purpose` over `plaintext`,
+		/// whose frame is the plaintext a reader recovers.
+		fn of(sealer: &Sealer<DefaultCryptoProvider>, purpose: SecretSeal, plaintext: &[u8]) -> Self {
+			let (kek, key_identifier) = sealer.kek_opening();
+			let framed = purpose.frame(plaintext).expect("the plaintext fits its frame");
+			Self { kek, key_identifier, plaintext: framed.to_vec() }
+		}
+	}
+
+	/// `bytes` as lowercase hexadecimal, the form `openssl cms -secretkey`
+	/// reads.
+	fn hex(bytes: &[u8]) -> String {
+		bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 	}
 
 	impl Emitted {
@@ -2566,6 +2625,12 @@ mod tests {
 				("frame-signature", content_info(SIGNED_DATA, &self.frame_signature)),
 				("joined-receipt", content_info(SIGNED_DATA, &self.joined_receipt)),
 			]
+		}
+
+		/// Each `KEKRecipientInfo` sample's file name beside what opens it.
+		fn kek_openings(&self) -> [(&'static str, &KekOpening); 2] {
+			let sealed_finished = ("sealed-finished", &self.sealed_finished_opening);
+			[sealed_finished, ("kek-seal", &self.kek_seal_opening)]
 		}
 	}
 
@@ -2585,14 +2650,24 @@ mod tests {
 		let opening = client.start().expect("the client opens");
 		let reply = server.reply(opening.to_owned()).await.expect("the server replies");
 		let closing = client.respond(reply.to_owned()).await.expect("the client closes");
-		server.finish(closing.to_owned()).await.expect("the server finishes");
+		server.finish(closing).await.expect("the server finishes");
 
 		let transcript_hash = fixture_transcript::<Sha3_256>([0x07u8; 32]);
 		let salt = KdfSalt::new(&[0x99u8; 32]);
 		let secret = fixture_handshake_secret(0x42);
 		let sealer = secret.sealer::<DefaultCryptoProvider>(SecretSeal::Ack, salt, &transcript_hash);
 		let sealer = sealer.expect("the acknowledgement key derives");
+		let kek_seal_opening = KekOpening::of(&sealer, SecretSeal::Ack, b"countersignature");
 		let kek_seal = sealer.seal(b"countersignature").expect("the acknowledgement seals");
+
+		// The client Finished seals under the identity key of the same fixed
+		// secret, so a reader holds its key.
+		let finished = build_test_client_finished(&client_identity, &transcript_hash, &fixture_confirmation());
+		let finished_der = finished.to_der().expect("the Finished encodes");
+		let sealer = secret.sealer::<DefaultCryptoProvider>(SecretSeal::Identity, salt, &transcript_hash);
+		let sealer = sealer.expect("the identity key derives");
+		let sealed_finished_opening = KekOpening::of(&sealer, SecretSeal::Identity, &finished_der);
+		let sealed_finished = Cms::seal_finished(sealer, &finished).expect("the Finished seals");
 
 		let reply = reply.signed().expect("the reply is a SignedData");
 		let receipt = reply.value().find_unsigned_attr(SESSION_RECEIPT);
@@ -2601,17 +2676,18 @@ mod tests {
 		let session_receipt = receipt.decode::<Signed<SignedData>>().expect("the receipt is a SignedData");
 		let joined_receipt = observer.artifacts().pop().expect("the server reports its outcome");
 		let opening = opening.auth_enveloped().expect("the opening is an AuthEnvelopedData");
-		let closing = closing.auth_enveloped().expect("the closing is an AuthEnvelopedData");
 		Emitted {
 			opening: opening.value().to_owned(),
 			server_finished: reply.value().to_owned(),
 			session_receipt: session_receipt.into_inner(),
-			sealed_finished: closing.value().to_owned(),
+			sealed_finished,
 			kek_seal,
 			frame_signature: frame_signature().await,
 			joined_receipt: joined_receipt.into_inner(),
 			server_certificate: server_identity.certificate,
 			client_certificate: client_identity.certificate,
+			sealed_finished_opening,
+			kek_seal_opening,
 		}
 	}
 

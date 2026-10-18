@@ -211,6 +211,13 @@ fn test_key_identifiers(subject_key: &SigningKey, issuer_key: &SigningKey) -> Ve
 	extensions
 }
 
+/// The `keyUsage` of an end-entity test certificate, which signs and opens a
+/// KEM's encapsulation as a CMS server does (RFC 5480 §3, RFC 9629 §3).
+#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+fn test_end_entity_key_usage() -> Extension {
+	test_extension(&KeyUsage(KeyUsages::DigitalSignature | KeyUsages::KeyAgreement))
+}
+
 /// Builds a certificate for `subject_key` under `subject`, signed by
 /// `issuer_key` under `issuer`, with a real signature.
 ///
@@ -263,6 +270,7 @@ fn test_certificate_named(
 ) -> Certificate {
 	let subject_public_key_info = test_public_key(signing_key);
 	let mut all_extensions = test_key_identifiers(signing_key, signing_key);
+	all_extensions.push(test_end_entity_key_usage());
 	all_extensions.extend(extensions.into_iter().flatten());
 
 	let algorithm = test_signature_algorithm();
@@ -791,7 +799,7 @@ impl TestCertificate {
 	) -> TbResult<Certificate> {
 		let issuer = test_cn_name(issuer_cn)?;
 		let subject = test_cn_name(cn)?;
-		let extensions = vec![test_uri_san_extension(uris)];
+		let extensions = vec![test_end_entity_key_usage(), test_uri_san_extension(uris)];
 		issue_test_certificate(issuer_key, issuer, signing_key, subject, extensions)
 	}
 
@@ -868,7 +876,9 @@ impl TestCertificate {
 
 		// The intermediate signs the leaf certificate.
 		let subject_public_key_info = test_public_key(&leaf_key);
-		let leaf_extensions = test_key_identifiers(&leaf_key, &intermediate_key);
+		let mut leaf_extensions = test_key_identifiers(&leaf_key, &intermediate_key);
+		leaf_extensions.push(test_end_entity_key_usage());
+
 		let leaf_tbs = TbsCertificate {
 			version: X509Version::V3,
 			serial_number: SerialNumber::new(&[3])?,

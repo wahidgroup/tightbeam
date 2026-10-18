@@ -333,6 +333,25 @@ fn ensure_critical_extensions_processed(cert: &Certificate) -> Result<(), Certif
 	Ok(())
 }
 
+/// Reject a certificate that carries more than one instance of an extension.
+///
+/// RFC 5280 §4.2 says a certificate MUST NOT include more than one instance
+/// of a particular extension, and the extension readers of the crate take
+/// the first instance they find.
+#[cfg(feature = "std")]
+fn ensure_unique_extensions(cert: &Certificate) -> Result<(), CertificateValidationError> {
+	let Some(extensions) = cert.tbs_certificate.extensions.as_ref() else {
+		return Ok(());
+	};
+
+	let mut seen = std::collections::HashSet::with_capacity(extensions.len());
+	let repeated = extensions.iter().find(|extension| !seen.insert(extension.extn_id));
+	match repeated {
+		Some(extension) => Err(CertificateValidationError::DuplicateExtension(extension.extn_id)),
+		None => Ok(()),
+	}
+}
+
 /// Reject a presented identity certificate that asserts the CA bit.
 ///
 /// This check goes beyond RFC 5280. The terminal certificate of a
@@ -471,7 +490,8 @@ impl CertificateTrustStore {
 	/// The routine performs these checks over the whole path:
 	///
 	/// 1. Validity period ([RFC 5280 §6.1.3(a)(2)][rfc5280-6.1.3]).
-	/// 2. Rejection of unprocessed critical extensions ([RFC 5280 §4.2, §6.1.3(f)][rfc5280-4.2]).
+	/// 2. Rejection of unprocessed critical extensions and of a repeated
+	///    extension ([RFC 5280 §4.2, §6.1.3(f)][rfc5280-4.2]).
 	/// 3. Algorithm-identifier consistency ([RFC 5280 §4.1.1.2][rfc5280-4.1.1.2]).
 	/// 4. Issuer and subject name chaining ([RFC 5280 §6.1.3(a)(4)][rfc5280-6.1.3]).
 	/// 5. Issuer `basicConstraints.cA` and `keyUsage.keyCertSign` ([RFC 5280 §6.1.4(k),(n)][rfc5280-6.1.4]).
@@ -515,9 +535,10 @@ impl CertificateTrustStore {
 		// period.
 		path.iter().try_for_each(|cert| cert.validate_expiry())?;
 
-		// RFC 5280 §4.2, §6.1.3(f): an unprocessed critical extension fails
-		// closed.
+		// RFC 5280 §4.2, §6.1.3(f): an unprocessed critical extension, or a
+		// repeated extension, fails closed.
 		path.iter().try_for_each(|cert| ensure_critical_extensions_processed(cert))?;
+		path.iter().try_for_each(|cert| ensure_unique_extensions(cert))?;
 
 		// Defense in depth: the terminal identity must not assert the CA bit.
 		ensure_terminal_is_end_entity(path)?;
@@ -654,9 +675,10 @@ impl CertificateTrust for CertificateTrustStore {
 
 	fn find_by_signer_identifier(&self, sid: &SignerIdentifier) -> Option<&Certificate> {
 		match sid {
-			SignerIdentifier::IssuerAndSerialNumber(ias) => self.certificates.values().find(|cert| {
-				cert.tbs_certificate.issuer == ias.issuer && cert.tbs_certificate.serial_number == ias.serial_number
-			}),
+			SignerIdentifier::IssuerAndSerialNumber(_) => {
+				let mut certificates = self.certificates.values();
+				certificates.find(|cert| cert.is_named_by(sid).is_ok_and(|named| named))
+			}
 			SignerIdentifier::SubjectKeyIdentifier(skid) => {
 				let fingerprint = self.skid_index.get(skid.0.as_bytes())?;
 				self.certificates.get(fingerprint)
@@ -1085,6 +1107,25 @@ mod tests {
 		assert!(ensure_critical_extensions_processed(&cert).is_ok());
 	}
 
+	/// A certificate with two `keyUsage` extensions is refused (RFC 5280
+	/// §4.2).
+	#[test]
+	fn rejects_a_repeated_extension() {
+		let mut cert = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+		let repeated = vec![opaque_extension("2.5.29.15", true), opaque_extension("2.5.29.15", true)];
+
+		cert.tbs_certificate.extensions = Some(repeated);
+
+		let refused = ensure_unique_extensions(&cert);
+		assert!(matches!(refused, Err(CertificateValidationError::DuplicateExtension(_))));
+	}
+
+	#[test]
+	fn accepts_one_instance_of_each_extension() {
+		let cert = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+		assert!(ensure_unique_extensions(&cert).is_ok());
+	}
+
 	#[test]
 	fn accepts_critical_subject_alt_name() {
 		// subjectAltName (2.5.29.17) is processed for colony membership and
@@ -1097,7 +1138,6 @@ mod tests {
 	#[test]
 	fn verify_chain_rejects_unknown_critical_extension() -> TestResult {
 		let chain = TestCertificate::insecure_fixed_chain()?;
-
 		let mut leaf = chain.leaf.to_owned();
 		leaf.tbs_certificate.extensions = Some(vec![opaque_extension("2.5.29.30", true)]);
 
@@ -1107,6 +1147,21 @@ mod tests {
 			result,
 			Err(CertificateValidationError::UnprocessedCriticalExtension(_))
 		));
+		Ok(())
+	}
+
+	/// A chain whose leaf repeats its `keyUsage` is refused (RFC 5280 §4.2).
+	#[test]
+	fn verify_chain_rejects_a_repeated_extension() -> TestResult {
+		let chain = TestCertificate::insecure_fixed_chain()?;
+		let mut leaf = chain.leaf.to_owned();
+		let repeated = vec![opaque_extension("2.5.29.15", true), opaque_extension("2.5.29.15", true)];
+
+		leaf.tbs_certificate.extensions = Some(repeated);
+
+		let store = build_store(&chain, StoreCerts::Root)?;
+		let result = store.verify_chain(&[chain.root, chain.intermediate, leaf]);
+		assert!(matches!(result, Err(CertificateValidationError::DuplicateExtension(_))));
 		Ok(())
 	}
 

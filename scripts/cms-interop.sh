@@ -20,6 +20,22 @@
 # anchor, so the check covers the signature, the signed attributes, and the
 # content digest. It prints one result line per sample.
 #
+# For each AuthEnvelopedData sample under a KEKRecipientInfo, the test also
+# writes the KEK, the kekid, and the expected plaintext, from fixed test keys,
+# as <name>.kek, <name>.kekid, and <name>.plain. The script runs
+# `openssl cms -decrypt -secretkey -secretkeyid` on the copy under OpenSSL's
+# tags, and compares the output with the expected plaintext. OpenSSL has no
+# DHKEM over secp256k1 under the crate's KEM identifier, so it parses the
+# KEMRecipientInfo sample and cannot open it.
+#
+# OpenSSL feeds no authAttrs to the cipher as associated data
+# (crypto/cms/cms_env.c and cms_enc.c set none), where RFC 5083 section 2.2
+# makes their DER the AAD. It writes the content before it checks the tag, so
+# it recovers the plaintext of a sample that carries authAttrs and then
+# refuses its tag. A content equal to the expected plaintext still shows the
+# kekid, the key wrap, the GCM parameters, and the keystream, and the line
+# names the refused tag apart from a failure.
+#
 # OpenSSL's template of AuthEnvelopedData (crypto/cms/cms_asn1.c) reads
 # authAttrs under [2] and unauthAttrs under [3], the tags of AuthenticatedData
 # (RFC 5652 section 9.1). RFC 5083 section 2.1 writes [1] and [2], and the crate
@@ -28,7 +44,8 @@
 # deviation apart from a structure OpenSSL cannot read at all.
 #
 # The script exits non-zero when a sample fails `asn1parse`, fails the CMS
-# parse under either tagging, fails to verify, or when no sample is present.
+# parse under either tagging, fails to verify, fails to decrypt to its
+# expected plaintext, or when no sample is present.
 # It has no dependency on the crate.
 #
 # References:
@@ -88,6 +105,23 @@ verify() {
 	fi
 }
 
+# Decrypt a retagged AuthEnvelopedData sample under the KEK its test wrote,
+# and compare the content with the expected plaintext.
+decrypt() {
+	local copy="$1" name="$2" status=0
+	local opened="$scratch/$name.opened" log="$scratch/$name.decrypt.log"
+	"$OPENSSL" cms -decrypt -inform DER -in "$copy" -binary \
+		-secretkey "$(cat "$SAMPLE_DIR/$name.kek")" -secretkeyid "$(cat "$SAMPLE_DIR/$name.kekid")" \
+		-out "$opened" > "$log" 2>&1 || status=$?
+	if ! cmp -s "$opened" "$SAMPLE_DIR/$name.plain"; then
+		echo "cms -decrypt FAILED: $(grep -m 1 -i 'error' "$log" || echo 'the content differs from the expected plaintext')"
+	elif [ "$status" -eq 0 ]; then
+		echo "cms -decrypt ok"
+	else
+		echo "cms -decrypt recovers the expected plaintext, refuses the tag it checks without the authAttrs AAD"
+	fi
+}
+
 # Write a copy of an AuthEnvelopedData sample with authAttrs moved from [1]
 # to [2] and unauthAttrs from [2] to [3], the tags OpenSSL's template reads.
 # The fields sit at depth 3 of the ContentInfo, and each retag rewrites one
@@ -106,6 +140,7 @@ echo "cms-interop: $("$OPENSSL" version)"
 
 failures=0
 deviations=0
+unauthenticated=0
 for sample in "${samples[@]}"; do
 	name="$(basename "$sample" .der)"
 
@@ -131,6 +166,13 @@ for sample in "${samples[@]}"; do
 		if printed="$("$OPENSSL" cms -cmsout -print -inform DER -in "$retagged" 2>&1)"; then
 			cms="cms -cmsout -print refuses the RFC 5083 tags [1]/[2], parses under OpenSSL's [2]/[3] ($(summary "$printed"))"
 			deviations=$((deviations + 1))
+			if [ -f "$SAMPLE_DIR/$name.kek" ]; then
+				verified="$(decrypt "$retagged" "$name")"
+				case "$verified" in
+					*FAILED*) failures=$((failures + 1)) ;;
+					*"refuses the tag"*) unauthenticated=$((unauthenticated + 1)) ;;
+				esac
+			fi
 		else
 			cms="cms -cmsout -print FAILED under both taggings: $(printf '%s\n' "$printed" | head -n 1)"
 			failures=$((failures + 1))
@@ -143,7 +185,7 @@ for sample in "${samples[@]}"; do
 	printf '%-16s %s, %s%s\n' "$name" "$asn1" "$cms" "${verified:+, $verified}"
 done
 
-echo "cms-interop: ${#samples[@]} samples, $failures failed, $deviations parse only under OpenSSL's AuthEnvelopedData tags"
+echo "cms-interop: ${#samples[@]} samples, $failures failed, $deviations parse only under OpenSSL's AuthEnvelopedData tags, $unauthenticated decrypt with no AAD check"
 if [ "$failures" -ne 0 ]; then
 	exit 1
 fi

@@ -100,6 +100,16 @@ pub enum CertificateValidationError {
 	#[error("Issuer keyUsage does not permit certificate signing")]
 	MissingKeyCertSign,
 
+	/// The `keyUsage` extension is absent, or it does not assert the usage the
+	/// certificate's role needs (RFC 5280 §4.2.1.3).
+	#[error("Certificate keyUsage does not assert {0:?}")]
+	MissingKeyUsage(crate::crypto::x509::ext::pkix::KeyUsages),
+
+	/// The certificate carries more than one instance of an extension (RFC 5280
+	/// §4.2).
+	#[error("Duplicate extension: {0}")]
+	DuplicateExtension(der::asn1::ObjectIdentifier),
+
 	/// The certification path exceeds the pathLenConstraint of an issuer
 	/// (RFC 5280 §6.1.4(m)).
 	#[error("Certification path length constraint exceeded")]

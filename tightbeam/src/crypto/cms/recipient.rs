@@ -12,6 +12,7 @@ use crate::crypto::common::typenum::Unsigned;
 use crate::crypto::kdf::KdfFunction;
 use crate::crypto::profiles::{CryptoProvider, KeyWrapAlgorithm};
 use crate::crypto::sign::SigningIdentity;
+use crate::crypto::x509::ext::pkix::KeyUsages;
 use crate::crypto::x509::utils::{recipient_identifier_of, CertificateExt};
 use crate::der::asn1::{ObjectIdentifier, OctetString};
 use crate::der::oid::AssociatedOid;
@@ -162,7 +163,8 @@ impl Recipient<'_> {
 	///
 	/// # Errors
 	///
-	/// - [`EnvelopeError::Certificate`] -- the certificate fails to name its key.
+	/// - [`EnvelopeError::Certificate`] -- the certificate does not permit key
+	///   agreement, or fails to name its key.
 	/// - The [`RecipientKem::encapsulate`] set of the provider's KEM.
 	/// - [`EnvelopeError::Random`] -- the random source failed.
 	/// - [`EnvelopeError::Kdf`] -- the KDF refused the key-encryption key.
@@ -174,7 +176,8 @@ impl Recipient<'_> {
 		content_key: &ContentKey,
 		rng: &mut dyn CryptoRngCore,
 	) -> Result<RecipientInfo, EnvelopeError> {
-		// 1. Name the recipient by its certificate.
+		// 1. Name the recipient by its certificate, whose `keyUsage` must permit key agreement.
+		certificate.require_key_usage(KeyUsages::KeyAgreement)?;
 		let rid = certificate.recipient_identifier()?;
 
 		// 2. Encapsulate to the key under the provider's KEM, and draw the random octets of the ukm.
@@ -271,6 +274,7 @@ impl Opener<'_> {
 	///
 	/// - [`EnvelopeError::RecipientVersion`] -- the version is not 0.
 	/// - [`EnvelopeError::RecipientIdentifier`] -- the `rid` names another certificate.
+	/// - [`EnvelopeError::Certificate`] -- the identity's certificate does not permit key agreement.
 	/// - [`EnvelopeError::RecipientAlgorithm`] -- the KEM, the KDF, or the wrap
 	///   is another than the provider's.
 	/// - [`EnvelopeError::KekLength`] -- `kekLength` is another than the wrap's.
@@ -290,6 +294,7 @@ impl Opener<'_> {
 		if kem.rid != recipient_identifier_of(identity.signer_identifier()) {
 			return Err(EnvelopeError::RecipientIdentifier);
 		}
+		identity.certificate().require_key_usage(KeyUsages::KeyAgreement)?;
 
 		let named = kem.kem == kem_algorithm::<P>() && kem.kdf == kdf_algorithm::<P>();
 		if !named || kem.wrap != wrap_algorithm::<P>() {

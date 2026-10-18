@@ -94,7 +94,7 @@ The certificate MUST carry a `keyUsage` extension, and it MUST assert `keyAgreem
 - [RFC 9629][rfc9629] § 3 says that "a recipient X.509 version 3 certificate that contains a key usage extension MUST assert the keyEncipherment bit".
 - [RFC 5480][rfc5480] § 3 limits the `keyUsage` of an `id-ecPublicKey` end-entity certificate to `digitalSignature`, `nonRepudiation`, and `keyAgreement`, so no conforming certificate of this key type carries `keyEncipherment`. [RFC 5280][rfc5280] § 4.2.1.3 names `keyAgreement` for a key used in key agreement, which DHKEM is.
 
-A certificate with no `keyUsage` extension would leave its use unchecked, so a recipient refuses it.
+A certificate with no `keyUsage` extension would leave its use unchecked. The sender refuses to encapsulate to a certificate whose `keyUsage` is absent or lacks `keyAgreement`, and the recipient refuses to open under one. tightbeam makes both checks in one place, `CertificateExt::require_key_usage`, so an outside KEM gets them without writing them. A CMS server certificate signs its Finished and receives the opening, so it asserts `digitalSignature` and `keyAgreement`, which RFC 5480 § 3 allows on one `id-ecPublicKey` end-entity certificate.
 
 ## Security considerations
 

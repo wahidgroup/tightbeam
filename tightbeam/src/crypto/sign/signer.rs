@@ -600,6 +600,31 @@ impl CmsSigner {
 		Ok(econtent.value())
 	}
 
+	/// The certificate of `certificates` that the one signer of `signed_data`
+	/// names by its `sid`, wherever it sorts in the SET (RFC 5652 §5.3), or
+	/// `None` when the set holds no such certificate.
+	///
+	/// # Errors
+	///
+	/// - [`SignerError::SignerIdentifier`] -- `signed_data` carries another number of signers than one.
+	/// - [`SignerError::Certificate`] -- a certificate's key identifier fails to decode.
+	pub fn signer_certificate(signed_data: &SignedData) -> Result<Option<&Certificate>, SignerError> {
+		let [signer_info] = signed_data.signer_infos.0.as_ref() else {
+			return Err(SignerError::SignerIdentifier);
+		};
+
+		let choices = signed_data.certificates.iter().flat_map(|set| set.0.iter());
+		for choice in choices {
+			if let CertificateChoices::Certificate(certificate) = choice {
+				if certificate.is_named_by(&signer_info.sid)? {
+					return Ok(Some(certificate));
+				}
+			}
+		}
+
+		Ok(None)
+	}
+
 	/// Refuse `signer_info` unless its `sid` names `certificate`.
 	///
 	/// # Errors
@@ -607,8 +632,7 @@ impl CmsSigner {
 	/// - [`SignerError::Certificate`] -- the certificate's key identifier fails to decode.
 	/// - [`SignerError::SignerIdentifier`] -- the `sid` names another certificate.
 	fn expect_signer(signer_info: &SignerInfo, certificate: &Certificate) -> Result<(), SignerError> {
-		let expected = certificate.signer_identifier()?;
-		if signer_info.sid != expected {
+		if !certificate.is_named_by(&signer_info.sid)? {
 			return Err(SignerError::SignerIdentifier);
 		}
 

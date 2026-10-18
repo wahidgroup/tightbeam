@@ -163,7 +163,9 @@ macro_rules! cert {
 		);
 	}};
 
-	// Leaf certificate
+	// Leaf certificate. `key_usage:` replaces the default `keyUsage` of
+	// `digitalSignature | nonRepudiation`, such as with `digitalSignature |
+	// keyAgreement` for a certificate a KEM encapsulates to.
 	(
 		profile: Leaf,
 		subject: $subject:expr,
@@ -172,6 +174,7 @@ macro_rules! cert {
 		duration: $duration:expr,
 		subject_public_key: $spki:expr,
 		signer: $signer:expr
+		$(, key_usage: $key_usage:expr)?
 		$(, extensions: [$($ext:expr),* $(,)?])?
 	) => {{
 		$crate::cert!(@build
@@ -184,10 +187,7 @@ macro_rules! cert {
 			extensions: [
 				$crate::cert!(@authority $signer),
 				$crate::crypto::x509::ext::pkix::BasicConstraints { ca: false, path_len_constraint: None },
-				$crate::crypto::x509::ext::pkix::KeyUsage(
-					$crate::crypto::x509::ext::pkix::KeyUsages::DigitalSignature
-						| $crate::crypto::x509::ext::pkix::KeyUsages::NonRepudiation,
-				),
+				$crate::crypto::x509::ext::pkix::KeyUsage($crate::cert!(@leaf_usage $( $key_usage )?)),
 				$($($ext),*)?
 			]
 		)
@@ -228,6 +228,16 @@ macro_rules! cert {
 	};
 	(@path_len $path_len:expr) => {
 		Some($path_len)
+	};
+
+	// Resolve an optional leaf `keyUsage`: absent yields `digitalSignature |
+	// nonRepudiation` (RFC 5280 §4.2.1.3).
+	(@leaf_usage) => {
+		$crate::crypto::x509::ext::pkix::KeyUsages::DigitalSignature
+			| $crate::crypto::x509::ext::pkix::KeyUsages::NonRepudiation
+	};
+	(@leaf_usage $key_usage:expr) => {
+		($key_usage).into()
 	};
 }
 
@@ -275,7 +285,9 @@ mod tests {
 	use crate::crypto::policy::{Secp256k1Policy, VerificationPolicy};
 	use crate::crypto::sign::ecdsa::{Secp256k1SigningKey, Secp256k1VerifyingKey};
 	use crate::crypto::sign::Sha3Signer;
-	use crate::crypto::x509::ext::pkix::{AuthorityKeyIdentifier, BasicConstraints, SubjectKeyIdentifier};
+	use crate::crypto::x509::ext::pkix::{
+		AuthorityKeyIdentifier, BasicConstraints, KeyUsage, KeyUsages, SubjectKeyIdentifier,
+	};
 	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
 	use crate::crypto::x509::utils::CertificateExt;
 	use crate::der::asn1::OctetString;
@@ -434,6 +446,43 @@ mod tests {
 
 		store.verify_chain(&[root_certificate, leaf])?;
 
+		Ok(())
+	}
+
+	/// A `cert!` leaf with no `key_usage:` asserts `digitalSignature |
+	/// nonRepudiation` (RFC 5280 §4.2.1.3).
+	#[test]
+	fn a_cert_macro_leaf_signs_by_default() -> TestResult {
+		let (root_key, _) = root(1)?;
+		let leaf = leaf_of(&root_key)?;
+
+		let key_usage = leaf.extension::<KeyUsage>()?;
+		let expected = KeyUsages::DigitalSignature | KeyUsages::NonRepudiation;
+		assert_eq!(key_usage.map(|key_usage| key_usage.0), Some(expected));
+		Ok(())
+	}
+
+	/// A `cert!` leaf with `key_usage:` asserts the usage it names in place
+	/// of the default, so a CMS server certificate permits key agreement.
+	#[test]
+	fn a_cert_macro_leaf_carries_the_key_usage_it_names() -> TestResult {
+		let (root_key, _) = root(1)?;
+		let (_, spki) = signing_material()?;
+		let signer = Sha3Signer::from(&root_key);
+		let usage = KeyUsages::DigitalSignature | KeyUsages::KeyAgreement;
+		let leaf = cert!(
+			profile: Leaf,
+			subject: "CN=Test Server,O=Test Org,C=US",
+			issuer: SUBJECT,
+			serial: 2u32,
+			duration: one_year(),
+			subject_public_key: spki,
+			signer: &signer,
+			key_usage: usage
+		)?;
+
+		let key_usage = leaf.extension::<KeyUsage>()?;
+		assert_eq!(key_usage.map(|key_usage| key_usage.0), Some(usage));
 		Ok(())
 	}
 }

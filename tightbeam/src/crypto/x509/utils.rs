@@ -11,7 +11,7 @@ use crate::cms::enveloped_data::RecipientIdentifier;
 use crate::cms::signed_data::SignerIdentifier;
 use crate::crypto::hash::{Digest, U32};
 use crate::crypto::x509::error::CertificateValidationError;
-use crate::crypto::x509::ext::pkix::SubjectKeyIdentifier;
+use crate::crypto::x509::ext::pkix::{KeyUsage, KeyUsages, SubjectKeyIdentifier};
 use crate::crypto::x509::Certificate;
 use crate::der::asn1::{GeneralizedTime, OctetString};
 use crate::der::oid::AssociatedOid;
@@ -246,6 +246,24 @@ pub trait CertificateExt {
 	/// - [`CertificateValidationError::EncodingError`] -- the extension value
 	///   or the serial number fails to decode.
 	fn recipient_identifier(&self) -> Result<RecipientIdentifier, CertificateValidationError>;
+
+	/// Whether `sid` names this certificate: a `subjectKeyIdentifier` form by
+	/// the value of this certificate's extension, an issuer-and-serial form
+	/// by its issuer and serial number (RFC 5652 §5.3).
+	///
+	/// # Errors
+	///
+	/// - [`CertificateValidationError::EncodingError`] -- the extension value fails to decode.
+	fn is_named_by(&self, sid: &SignerIdentifier) -> Result<bool, CertificateValidationError>;
+
+	/// Refuse this certificate unless its `keyUsage` extension is present and
+	/// asserts `usage` (RFC 5280 §4.2.1.3).
+	///
+	/// # Errors
+	///
+	/// - [`CertificateValidationError::MissingKeyUsage`] -- the extension is absent, or it lacks `usage`.
+	/// - [`CertificateValidationError::EncodingError`] -- the extension value fails to decode.
+	fn require_key_usage(&self, usage: KeyUsages) -> Result<(), CertificateValidationError>;
 }
 
 impl<P: Profile> CertificateExt for CertificateInner<P> {
@@ -343,6 +361,36 @@ impl<P: Profile> CertificateExt for CertificateInner<P> {
 	fn recipient_identifier(&self) -> Result<RecipientIdentifier, CertificateValidationError> {
 		let sid = self.signer_identifier()?;
 		Ok(recipient_identifier_of(&sid))
+	}
+
+	/// Match `sid` against this certificate.
+	///
+	/// [`CertificateExt::is_named_by`] owns the RFC 5652 §5.3 contract.
+	fn is_named_by(&self, sid: &SignerIdentifier) -> Result<bool, CertificateValidationError> {
+		match sid {
+			SignerIdentifier::IssuerAndSerialNumber(named) => {
+				let tbs = &self.tbs_certificate;
+				Ok(tbs.issuer == named.issuer && tbs.serial_number.as_bytes() == named.serial_number.as_bytes())
+			}
+			SignerIdentifier::SubjectKeyIdentifier(named) => {
+				let own = self.extension::<SubjectKeyIdentifier>()?;
+				Ok(own.is_some_and(|own| own == *named))
+			}
+		}
+	}
+
+	/// Read the `keyUsage` this certificate asserts.
+	///
+	/// [`CertificateExt::require_key_usage`] owns the RFC 5280 §4.2.1.3
+	/// contract.
+	fn require_key_usage(&self, usage: KeyUsages) -> Result<(), CertificateValidationError> {
+		let key_usage = self.extension::<KeyUsage>()?;
+		let asserted = key_usage.is_some_and(|key_usage| key_usage.0.contains(usage));
+		if !asserted {
+			return Err(CertificateValidationError::MissingKeyUsage(usage));
+		}
+
+		Ok(())
 	}
 }
 

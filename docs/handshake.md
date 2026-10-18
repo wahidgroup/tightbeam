@@ -456,7 +456,7 @@ The opening's `KEMRecipientInfo` holds these fields.
 - The authenticated attributes carry the security and transport offers beside the content type. The unauthenticated attributes carry the abort alert alone.
 - The server opens the opening, and so checks its tag, before it chooses a profile or asks its transport authorizer, so neither reads an offer the tag has not covered.
 - The server's key provider runs `DH(skS, enc)`, so the static key can stay behind an external boundary. The DHKEM shared secret derives the key-encryption key alone (RFC 9629 § 7).
-- Until the server holds a key-agreement certificate apart from its signing certificate, its one certificate both signs the Finished and receives the opening.
+- Until the server holds a key-agreement certificate apart from its signing certificate, its one certificate both signs the Finished and receives the opening, so its `keyUsage` asserts `digitalSignature` and `keyAgreement` (RFC 5480 § 3). The client refuses to seal to a certificate whose `keyUsage` lacks `keyAgreement`, and the server refuses to open under one.
 
 #### Seals under the handshake secret
 
@@ -483,6 +483,7 @@ A client seals its certificate and its proof of possession under `k_id`, as [Sea
 | HPKE     | One `HpkeIdentity`: the certificate and the possession signature                     | `sealed_identity`, a field of the HPKE payload, as the DER of its envelope         |
 | CMS      | The client Finished, which embeds the certificate, the tag, and the countersignature | The whole closing: an `AuthEnvelopedData` with one `KEKRecipientInfo` under `k_id` |
 
+- The CMS server verifies the certificate of `certificates` that the Finished's one `sid` names (RFC 5652 § 5.3), so the set may also carry the chain of that certificate in any order.
 - The sealed plaintext is a big-endian `u16` length, the sealed DER, and zero bytes up to the next multiple of 512 bytes, at least 1024. Certificates whose lengths differ within one block give closings of one length. A CMS Finished adds about 280 bytes to its certificate, and about 590 when it carries a receipt countersignature, so a CMS fleet reaches the first block boundary at certificates of about 740 bytes, or about 430 on a budget-bearing session.
 - Two length signals remain by decision. A fleet whose identities straddle a block boundary splits into two lengths. Under an anonymous HPKE server, a closing that offers an identity is longer than one that offers none, as a TLS 1.3 client certificate shows its presence too.
 - A passive observer reads no byte of the certificate, its key identifier, its issuer and serial number, its key, or the signature.
@@ -621,6 +622,7 @@ An end of stream is named by the phase it interrupted.
 - RFC 9688, Use of the SHA3 One-Way Hash Functions in CMS, § 5.1 on HKDF with SHA3-256: <https://datatracker.ietf.org/doc/html/rfc9688#section-5.1>
 - RFC 3394, AES Key Wrap Algorithm, and RFC 3565, AES in CMS: <https://datatracker.ietf.org/doc/html/rfc3394>, <https://datatracker.ietf.org/doc/html/rfc3565>
 - RFC 5280, Internet X.509 Public Key Infrastructure Certificate and CRL Profile: <https://datatracker.ietf.org/doc/html/rfc5280>
+- RFC 5480, Elliptic Curve Cryptography Subject Public Key Information, § 3 on `keyUsage`: <https://datatracker.ietf.org/doc/html/rfc5480#section-3>
 - RFC 5869, HMAC-based Extract-and-Expand Key Derivation Function (HKDF): <https://datatracker.ietf.org/doc/html/rfc5869>
 - RFC 9180, Hybrid Public Key Encryption, § 9.2.3 on reuse of the KEM randomness: <https://datatracker.ietf.org/doc/html/rfc9180#section-9.2.3>
 - RFC 9180, Hybrid Public Key Encryption, § 10 on the message encoding an application defines: <https://datatracker.ietf.org/doc/html/rfc9180#section-10>

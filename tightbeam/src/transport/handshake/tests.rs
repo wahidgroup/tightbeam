@@ -65,7 +65,7 @@ use crate::transport::handshake::{
 	ServerFlow, ServerHandshake, SupportedProfiles,
 };
 use crate::utils::marker::MaybeSendFuture;
-use crate::x509::ext::pkix::SubjectKeyIdentifier;
+use crate::x509::ext::pkix::{KeyUsage, KeyUsages, SubjectKeyIdentifier};
 use crate::x509::ext::Extension;
 use crate::x509::serial_number::SerialNumber;
 use crate::x509::time::Time;
@@ -175,6 +175,12 @@ fn create_test_certificate_inner(signing_key: &Secp256k1SigningKey) -> Result<Ce
 		extn_value: OctetString::new(key_identifier.to_der()?)?,
 	};
 
+	// The certificate signs the server Finished and receives the KEM's
+	// encapsulation of the opening (RFC 5480 §3, RFC 9629 §3).
+	let key_usage = KeyUsage(KeyUsages::DigitalSignature | KeyUsages::KeyAgreement);
+	let extn_value = OctetString::new(key_usage.to_der()?)?;
+	let key_usage = Extension { extn_id: KeyUsage::OID, critical: true, extn_value };
+
 	let tbs_cert = TbsCertificate {
 		version: Version::V3,
 		serial_number: SerialNumber::new(&[1])?,
@@ -188,7 +194,7 @@ fn create_test_certificate_inner(signing_key: &Secp256k1SigningKey) -> Result<Ce
 		subject_public_key_info,
 		issuer_unique_id: None,
 		subject_unique_id: None,
-		extensions: Some(vec![key_identifier]),
+		extensions: Some(vec![key_identifier, key_usage]),
 	};
 
 	Ok(Certificate {

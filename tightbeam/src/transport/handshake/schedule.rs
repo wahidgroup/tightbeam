@@ -391,7 +391,7 @@ impl SecretSeal {
 	/// A purpose with no padding seals the plaintext bare. A padded purpose
 	/// seals a big-endian `u16` length, the plaintext, and zero bytes up to its
 	/// padded length, so the opener finds the plaintext without reading it.
-	fn frame(self, plaintext: &[u8]) -> Result<ZeroizingBytes, HandshakeError> {
+	pub(crate) fn frame(self, plaintext: &[u8]) -> Result<ZeroizingBytes, HandshakeError> {
 		let Some(padding) = self.padding() else {
 			return Ok(ZeroizingBytes::new(plaintext.to_vec()));
 		};
@@ -536,6 +536,13 @@ impl<P: HandshakeProvider> Sealer<P> {
 		let opened = envelope.open::<P>(der, &opener, DATA).await;
 		let opened = opened.map_err(|error| self.purpose.refusal(error))?;
 		opened.with(|framed| self.purpose.unframe(framed))
+	}
+
+	/// The key-encryption key and the `kekid` an outside CMS reader opens
+	/// this seal with.
+	#[cfg(test)]
+	pub(crate) fn kek_opening(&self) -> (Vec<u8>, Vec<u8>) {
+		(self.kek.to_vec(), self.key_identifier())
 	}
 
 	/// The `kekid` of this seal: the purpose's domain, then the transcript
