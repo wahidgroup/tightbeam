@@ -97,10 +97,11 @@ mod tests {
 		vec::Vec,
 	};
 
+	use crate::asn1::AuthEnvelopedData;
 	use crate::testing::{TestIdentity, TestKey, TestMessage};
 	use crate::Beamable;
 	use crate::MessagePriority;
-	use crate::{EncryptedContentInfo, SignerInfo};
+	use crate::SignerInfo;
 
 	use super::*;
 
@@ -399,7 +400,7 @@ mod tests {
 					priority: MessagePriority::LowLatency,
 					lifetime: 120
 			}?
-		} => EncryptedContentInfo,
+		} => AuthEnvelopedData,
 	}
 
 	test_tightbeam_try_conversions! {
@@ -421,7 +422,7 @@ mod tests {
 					order: 6000,
 					message: message
 			}?
-		} => EncryptedContentInfo,
+		} => AuthEnvelopedData,
 	}
 
 	#[derive(Beamable, Clone, Debug, PartialEq, der::Sequence)]

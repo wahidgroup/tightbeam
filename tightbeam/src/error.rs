@@ -269,7 +269,7 @@ pub enum TightBeamError {
 	HpkeError(crate::crypto::hpke::HpkeError),
 
 	/// An authenticated envelope failed to seal, or refused to open.
-	#[cfg(all(feature = "hpke", feature = "signature"))]
+	#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 	#[error("Authenticated envelope error: {0}")]
 	#[source]
 	EnvelopeError(crate::crypto::cms::EnvelopeError),
@@ -394,31 +394,31 @@ pub enum TightBeamError {
 	#[error("Missing encryption info")]
 	MissingEncryptionInfo,
 
-	/// The AEAD nonce length does not match the nonce size of the cipher.
-	#[cfg(feature = "aead")]
-	#[error("Invalid AEAD nonce length: {0}")]
-	InvalidNonceLength(ReceivedExpectedError<usize, usize>),
-
 	/// The commitment salt is shorter than the hiding floor.
 	#[cfg(feature = "digest")]
 	#[error("Invalid commitment salt length: {0}")]
 	InvalidSaltLength(ReceivedExpectedError<usize, usize>),
 
-	/// The send-direction AEAD counter nonce space is exhausted.
+	/// The send-direction record sequence space is exhausted.
 	#[cfg(feature = "aead")]
-	#[error("AEAD counter nonce space exhausted")]
+	#[error("Record sequence space exhausted")]
 	NonceExhausted,
 
-	/// The send-direction AEAD record limit is reached (RFC 9846 § 5.5).
+	/// The record limit of one directional key is reached (RFC 9846 § 5.5).
 	#[cfg(feature = "aead")]
-	#[error("AEAD record limit reached: reestablish the session to rekey")]
+	#[error("Record limit reached: reestablish the session to rekey")]
 	RekeyRequired,
 
-	/// The received AEAD counter nonce is not the exact next in sequence, which
-	/// signals a replay, a reorder, or a deletion.
+	/// A received record carries another sequence number than the exact
+	/// next, which signals a replay, a reorder, or a deletion.
 	#[cfg(feature = "aead")]
-	#[error("Out-of-sequence AEAD nonce: {0}")]
+	#[error("Out-of-sequence record: {0}")]
 	NonceReplayed(ReceivedExpectedError<u64, u64>),
+
+	/// A received record carries another epoch than the key that opens it.
+	#[cfg(feature = "aead")]
+	#[error("Record of another epoch: {0}")]
+	RecordEpoch(ReceivedExpectedError<u32, u32>),
 
 	/// The integrity info is missing.
 	#[cfg(feature = "digest")]
@@ -520,7 +520,7 @@ crate::impl_from!(aead::Error => TightBeamError::EncryptionError);
 crate::impl_from!(crypto_common::InvalidLength => TightBeamError::InvalidKeyLength);
 #[cfg(feature = "hpke")]
 crate::impl_from!(crate::crypto::hpke::HpkeError => TightBeamError::HpkeError);
-#[cfg(all(feature = "hpke", feature = "signature"))]
+#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 crate::impl_from!(crate::crypto::cms::EnvelopeError => TightBeamError::EnvelopeError);
 #[cfg(feature = "signature")]
 crate::impl_from!(signature::Error => TightBeamError::SignatureError);

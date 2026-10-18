@@ -12,7 +12,7 @@ use core::fmt;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
-use crate::asn1::{CompressedData, DigestInfo, EncryptedContentInfo, MessagePriority, SignerInfo, Version};
+use crate::asn1::{AuthEnvelopedData, CompressedData, DigestInfo, MessagePriority, SignerInfo, Version, WireDer};
 use crate::der::{Tag, TagNumber};
 use crate::matrix::MatrixDyn;
 use crate::version::GatedField;
@@ -50,7 +50,7 @@ pub use signed::Signed;
 ///     order            INTEGER,
 ///     compactness      CompressedData OPTIONAL,
 ///     integrity        [0] DigestInfo OPTIONAL,
-///     confidentiality  [1] EncryptedContentInfo OPTIONAL,
+///     confidentiality  [1] AuthEnvelopedData OPTIONAL,
 ///     priority         [2] MessagePriority OPTIONAL,
 ///     lifetime         [3] INTEGER OPTIONAL,
 ///     previousFrame    [4] DigestInfo OPTIONAL,
@@ -67,7 +67,7 @@ pub struct Metadata {
 	#[cfg_attr(feature = "zeroize", zeroize(skip))]
 	integrity: Option<DigestInfo>,
 	#[cfg_attr(feature = "zeroize", zeroize(skip))]
-	confidentiality: Option<EncryptedContentInfo>,
+	confidentiality: Option<WireDer<AuthEnvelopedData>>,
 	#[cfg_attr(feature = "zeroize", zeroize(skip))]
 	priority: Option<MessagePriority>,
 	lifetime: Option<u64>,
@@ -132,11 +132,12 @@ impl Metadata {
 		self.integrity.as_ref()
 	}
 
-	/// The encryption parameters when the message body is encrypted (V1+).
+	/// The envelope of the message body when the body is encrypted (V1+).
 	///
-	/// The ciphertext itself travels in [`Frame::message`].
-	pub fn confidentiality(&self) -> Option<&EncryptedContentInfo> {
-		self.confidentiality.as_ref()
+	/// The ciphertext travels in [`Frame::message`], detached from the
+	/// envelope (RFC 5652 §6.1).
+	pub fn confidentiality(&self) -> Option<&AuthEnvelopedData> {
+		self.confidentiality.as_ref().map(WireDer::value)
 	}
 
 	/// The delivery priority (V2+).
@@ -421,7 +422,7 @@ impl Frame {
 	///
 	/// - [`crate::TightBeamError::UnsupportedVersion`] naming the frame
 	///   version and the version that introduced the field.
-	#[cfg(any(feature = "aead", feature = "signature"))]
+	#[cfg(feature = "signature")]
 	fn ensure_allows(&self, field: GatedField) -> crate::error::Result<()> {
 		let forbidden = (!self.version.allows(field)).then_some(field);
 		self.refuse(forbidden)
@@ -434,7 +435,7 @@ impl Frame {
 	///
 	/// - [`crate::TightBeamError::UnsupportedVersion`] naming the frame
 	///   version and the version that introduced the field.
-	#[cfg(any(feature = "builder", feature = "aead", feature = "signature"))]
+	#[cfg(any(feature = "builder", feature = "signature"))]
 	fn refuse(&self, forbidden: Option<GatedField>) -> crate::error::Result<()> {
 		let Some(field) = forbidden else {
 			return Ok(());
@@ -501,9 +502,23 @@ mod tests {
 		frame
 	}
 
-	fn sealed_content() -> EncryptedContentInfo {
+	fn sealed_content() -> WireDer<AuthEnvelopedData> {
+		use crate::cms::content_info::CmsVersion;
+		use crate::cms::enveloped_data::{EncryptedContentInfo, RecipientInfos};
+
 		let content_enc_alg = crate::spki::AlgorithmIdentifierOwned { oid: crate::oids::DATA, parameters: None };
-		EncryptedContentInfo { content_type: crate::oids::DATA, content_enc_alg, encrypted_content: None }
+		let info = EncryptedContentInfo { content_type: crate::oids::DATA, content_enc_alg, encrypted_content: None };
+		let mac = crate::der::asn1::OctetString::new([0u8; 16]).expect("16 octets fit an OCTET STRING");
+		let envelope = AuthEnvelopedData {
+			version: CmsVersion::V0,
+			originator_info: None,
+			recipient_infos: RecipientInfos::default(),
+			auth_encrypted_content_info: info,
+			auth_attrs: None,
+			mac,
+			unauth_attrs: None,
+		};
+		WireDer::new(envelope).expect("the envelope encodes")
 	}
 
 	macro_rules! gate_tests {

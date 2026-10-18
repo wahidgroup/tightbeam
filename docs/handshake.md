@@ -491,6 +491,33 @@ The directional derivation accepts only a `TrafficSecret`, a sealed trait with t
 | `HandshakeSecret` | `HandshakeSecret::hybrid` for the CMS flow, `HandshakeSecret::ephemeral` for the HPKE flow                        |
 | `EpochSecret`     | `EpochMaterials::derive`, from a handshake secret. `EpochSecret::next`, from the last epoch and a fresh agreement |
 
+### Records
+
+Each record after the handshake is an `AuthEnvelopedData` (RFC 5083) under the directional key of its epoch, `k_c2s` or `k_s2c`, which is the key-encryption key of its records at the key size of the provider's wrap. `SendCipher::encrypt_next` takes the payload by value and encrypts it in place, and `RecvCipher::open` decrypts the content in the buffer it arrived in.
+
+| Field                 | Value                                                                                                                                               |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `recipientInfos`      | One `KEKRecipientInfo` (RFC 5652 § 6.2.3), version 4, with the provider's key wrap                                                                  |
+| `kekid.keyIdentifier` | `tb/session/record/kekid/v1`, then the direction octet (`0x00` client to server, `0x01` server to client), then the epoch as four big-endian octets |
+| Content key and nonce | Fresh for each record (RFC 5084 § 3.2)                                                                                                              |
+| Content type          | `id-data`                                                                                                                                           |
+| `authAttrs`           | The content type, and one `RecordSequence ::= SEQUENCE { epoch INTEGER, sequence INTEGER }` under `1.3.6.1.4.1.64586.1.27`                          |
+
+`RecvCipher::open` reads the epoch and the sequence before the content key unwraps, and refuses these records:
+
+| Record                                                                                                                            | Refusal          |
+| --------------------------------------------------------------------------------------------------------------------------------- | ---------------- |
+| Another epoch than the cipher's                                                                                                   | `RecordEpoch`    |
+| Another sequence than the next one, so a replayed, reordered, or deleted record                                                   | `NonceReplayed`  |
+| A sequence at the record limit, or bytes past the renewal volume                                                                  | `RekeyRequired`  |
+| A record relabelled to this cipher's epoch, or reflected from the other direction, whose `kekid` names another key                | `KeyIdentifier`  |
+| A record relabelled to this cipher's epoch with its `kekid` rewritten too, whose content key is wrapped under another epoch's key | `KeyUnwrap`      |
+| A record whose sequence changed in transit, which the tag covers                                                                  | `Authentication` |
+
+RFC 9846 § 5.5 sets the record limit on the sender, and `SendCipher` holds it. The two `RekeyRequired` refusals of the receiver are the crate's own renewal policy, which holds a peer that ignores its send limit to the bounds an honest sender keeps.
+
+The sequence advances once the tag passes, so a refused record leaves it where it was. A renewal derives the keys of the next epoch, and each cipher carries its epoch from `SessionKeys`.
+
 ### Seals
 
 Every seal of the handshake is an `AuthEnvelopedData` (RFC 5083) under the provider's AEAD, AES-256-GCM for the house provider. Each envelope holds to these rules:

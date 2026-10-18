@@ -207,7 +207,7 @@ signature = [
 digest = ["crypto", "dep:digest", "sha3"]
 x509 = ["crypto", "dep:x509-cert", "ecdsa/pem", "ecdsa/alloc", "digest"]
 kdf = ["crypto", "random", "zeroize", "digest", "dep:hkdf"]
-hpke = ["crypto", "kdf", "aead", "k256/ecdh", "secp256k1", "sha3"]
+hpke = ["crypto", "kdf", "aead", "ecdh", "k256/ecdh", "secp256k1", "sha3"]
 ecdh = ["elliptic-curve/ecdh", "secp256k1"]
 kem = ["crypto", "dep:kem"]
 

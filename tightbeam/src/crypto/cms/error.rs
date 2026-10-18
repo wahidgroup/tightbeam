@@ -116,6 +116,7 @@ pub enum EnvelopeError {
 	Key(crate::crypto::key::KeyError),
 
 	/// The KEM failed a derivation.
+	#[cfg(feature = "hpke")]
 	#[error("KEM error: {0}")]
 	Kem(crate::crypto::hpke::HpkeError),
 
@@ -140,6 +141,7 @@ pub enum EnvelopeError {
 }
 
 crate::impl_from!(crate::crypto::key::KeyError => EnvelopeError::Key);
+#[cfg(feature = "hpke")]
 crate::impl_from!(crate::crypto::hpke::HpkeError => EnvelopeError::Kem);
 crate::impl_from!(crate::crypto::kdf::KdfError => EnvelopeError::Kdf);
 crate::impl_from!(crate::crypto::x509::error::CertificateValidationError => EnvelopeError::Certificate);

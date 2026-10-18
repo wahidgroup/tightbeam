@@ -26,8 +26,7 @@ use tightbeam::{
 		SubmitWork,
 	},
 	crypto::{
-		aead::{Aes256Gcm, Key, KeyInit},
-		key::Secp256k1KeyProvider,
+		key::{Aes256GcmKeyProvider, Secp256k1KeyProvider},
 		policy::Secp256k1Policy,
 		profiles::DefaultCryptoProvider,
 		sign::{
@@ -148,13 +147,14 @@ fn servlet_tls_config(
 	)
 }
 
-/// Shared AES-256-GCM cipher for the client-to-servlet confidential body.
+/// Shared key-encryption key for the client-to-servlet confidential body.
 ///
 /// `CreditTransferTransaction` declares `confidential`, so the client
 /// frame carries an encrypted message and the servlet decrypts it before
 /// typed dispatch. A fixed key stands in for a real exchange in tests.
-fn shared_payment_cipher() -> Aes256Gcm {
-	Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&[0x42u8; 32]))
+fn shared_payment_cipher() -> Aes256GcmKeyProvider {
+	let cipher = Aes256GcmKeyProvider::new(vec![0x42u8; 32], b"tb/test/payments/kek/v1".to_vec());
+	cipher.expect("32 octets is the key of AES-256 key wrap")
 }
 
 fn create_auth_transaction(end_to_end_id: impl AsRef<[u8]>, amount: MonetaryAmount) -> CreditTransferTransaction {
@@ -231,7 +231,7 @@ tb_scenario! {
 				.with_message(transaction)
 				.with_message_hasher::<Sha3_256>([])
 				.with_witness_hasher::<Sha3_256>()
-				.with_aead(shared_payment_cipher())
+				.with_encryptor(shared_payment_cipher())
 				.with_signer::<Secp256k1Signature, _>(CertifiedKey::new(&certs.cluster_cert, certs.cluster_key.to_owned())?)
 				.build()?;
 

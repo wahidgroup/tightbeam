@@ -4,10 +4,10 @@ use crate::cms::content_info::CmsVersion;
 use crate::cms::enveloped_data::{
 	KekIdentifier, KekRecipientInfo, OtherRecipientInfo, RecipientIdentifier, RecipientInfo,
 };
-use crate::crypto::cms::recipient::ContentKey;
+use crate::crypto::aead::aes_kw::Error as AesKwError;
 use crate::crypto::cms::{
-	AuthEnvelopedData, CmsOriForKemOtherInfo, EnvelopeError, GcmParameters, KemRecipient, KemRecipientInfo,
-	KeyAgreementIdentity, Opener, Recipient,
+	AuthEnvelopedData, BareKemKey, CmsOriForKemOtherInfo, EnvelopeError, GcmParameters, KemKeyHolder, KemRecipient,
+	KemRecipientInfo, KeyAgreementIdentity, Opener, Recipient,
 };
 use crate::crypto::hpke::DhKemSecp256k1;
 use crate::crypto::k256::elliptic_curve::sec1::ToEncodedPoint;
@@ -36,6 +36,7 @@ use crate::x509::ext::pkix::{KeyUsage, KeyUsages, SubjectKeyIdentifier};
 use crate::x509::ext::Extension;
 use crate::x509::Certificate;
 use crate::zeroize::Zeroizing;
+use crate::ZeroizingBytes;
 
 /// The house provider, whose algorithms every seal here runs: AES-256-GCM,
 /// HKDF-SHA3-256, AES-256 key wrap, and DHKEM(secp256k1, HKDF-SHA256).
@@ -400,7 +401,9 @@ fn two_seals_draw_two_nonces() {
 /// The expected bytes come from an independent DER encoder in Python.
 #[test]
 fn the_associated_data_is_the_attributes_under_the_set_of_tag() -> Result<(), EnvelopeError> {
-	let associated_data = kek_sealed().associated_data(DATA)?;
+	let sealed = kek_sealed();
+	let arrived = sealed.to_der()?;
+	let associated_data = sealed.associated_data(&arrived, DATA)?;
 	let expected = unhex("311a301806092a864886f70d010903310b06092a864886f70d010701");
 	assert_eq!(associated_data, expected);
 	Ok(())
@@ -568,7 +571,7 @@ fn rfc_3394_kek(size: usize) -> Vec<u8> {
 }
 
 /// The first `size` octets of the RFC 3394 §4 key data, `00112233...0f`.
-fn rfc_3394_key_data(size: usize) -> ContentKey {
+fn rfc_3394_key_data(size: usize) -> ZeroizingBytes {
 	let mut key_data = unhex("00112233445566778899aabbccddeeff000102030405060708090a0b0c0d0e0f");
 	key_data.truncate(size);
 	Zeroizing::new(key_data)
@@ -632,6 +635,28 @@ fn aes_256_key_unwrap_matches_rfc_3394_4_3() -> Result<(), KeyError> {
 	let unwrapped = Aes256Wrap::unwrap(&rfc_3394_kek(32), &unhex(RFC_3394_4_3))?;
 	assert_eq!(unwrapped, rfc_3394_key_data(16));
 	Ok(())
+}
+
+/// The house wrap unwraps onto a caller's buffer of the key's size: RFC 3394
+/// §4.3, 128 bits of key data under a 256-bit KEK.
+#[test]
+fn aes_256_key_unwrap_into_matches_rfc_3394_4_3() -> Result<(), KeyError> {
+	let mut key = Zeroizing::new([0u8; 16]);
+	Aes256Wrap::unwrap_into(&rfc_3394_kek(32), &unhex(RFC_3394_4_3), &mut *key)?;
+	assert_eq!(key.as_slice(), rfc_3394_key_data(16).as_slice());
+	Ok(())
+}
+
+/// `aes-kw` refuses a buffer of another size than the wrapped key, and names
+/// the 16 octets the key takes.
+#[test]
+fn the_house_unwrap_into_refuses_a_buffer_of_another_size() {
+	let mut key = [0u8; 32];
+	let refused = Aes256Wrap::unwrap_into(&rfc_3394_kek(32), &unhex(RFC_3394_4_3), &mut key);
+	assert!(matches!(
+		refused,
+		Err(KeyError::WrapFailed(AesKwError::InvalidOutputSize { expected: 16 }))
+	));
 }
 
 #[test]
@@ -1167,7 +1192,6 @@ fn a_key_agreement_identity_refuses_a_backend_of_another_key() {
 fn a_key_agreement_identity_admits_its_key_in_the_compressed_form() -> Result<(), EnvelopeError> {
 	let key = Secp256k1SigningKey::random(&mut OsRng);
 	let certificate = TestCertificate::with_compressed_key(TestCertificate::self_signed(&key));
-
 	HouseIdentity::new(certificate, backend_of(&key))?;
 	Ok(())
 }
@@ -1193,5 +1217,111 @@ async fn an_opener_whose_certificate_permits_key_agreement_opens() -> Result<(),
 
 	let opened = opened(envelope, &kem_opener(&identity), DATA).await?;
 	assert_eq!(opened.to_insecure().as_slice(), CONTENT);
+	Ok(())
+}
+
+/// The DER SubjectPublicKeyInfo of the published recipient key of
+/// draft-wahby-cfrg-hpke-kem-secp256k1-01 B.1.1: `id-ecPublicKey` on
+/// secp256k1 (RFC 5480 §2.1.1) over its uncompressed point.
+const PUBLISHED_RECIPIENT_SPKI: &str = "3056301006072a8648ce3d020106052b8104000a034200\
+	043ee7314407753d1ba296de29f07b2cd5505ca94b614f127e71f3c19fc7845d\
+	af49c9bb4bf4d00d3b5411c8eb86d59a2dcadc5a13115fa9fef44d1e0b7ef11cab";
+
+/// The RFC 7093 §2 method 1 identifier of the published recipient key: the
+/// leftmost 160 bits of the SHA-256 of its uncompressed point, from Python's
+/// `hashlib`.
+const PUBLISHED_RECIPIENT_KEY_IDENTIFIER: &str = "ec9cf0de6fadd0acb971ccd7332d7e310cb91b9d";
+
+/// The bare key of a fresh secp256k1 key, beside the DER of its public key.
+fn bare_key() -> (BareKemKey<HouseKem>, Vec<u8>) {
+	let key = Secp256k1SigningKey::random(&mut OsRng);
+	let backend = backend_of(&key);
+	let spki = backend.to_public_key_bytes().expect("the house backend encodes its key");
+	let bare = BareKemKey::new(PublicKey::from(key.verifying_key()), backend);
+	(bare.expect("the backend holds the key"), spki)
+}
+
+/// [`CONTENT`] sealed as `id-data` to `recipient`, with a `ukm` led by
+/// [`UKM_LABEL`].
+fn sealed_to(recipient: &KemRecipient<HouseKem>) -> AuthEnvelopedData {
+	let recipient = Recipient::Kem { recipient, ukm_label: UKM_LABEL };
+	let sealed = AuthEnvelopedData::seal::<House>(recipient, DATA, CONTENT, [], None);
+	sealed.expect("the content seals")
+}
+
+/// A bare recipient is named by the RFC 7093 §2 method 1 identifier of its
+/// key, in the `subjectKeyIdentifier` form of the `rid`.
+#[test]
+fn a_bare_recipient_is_named_by_the_rfc_7093_identifier_of_its_key() -> Result<(), Box<dyn core::error::Error>> {
+	let recipient = KemRecipient::<HouseKem>::bare(unhex(PUBLISHED_RECIPIENT_SPKI))?;
+	let sealed = sealed_to(&recipient);
+
+	let expected = SubjectKeyIdentifier(OctetString::new(unhex(PUBLISHED_RECIPIENT_KEY_IDENTIFIER))?);
+	assert_eq!(sealed.kem_recipient().rid, RecipientIdentifier::SubjectKeyIdentifier(expected));
+	Ok(())
+}
+
+/// A bare recipient of a key that is no secp256k1 point is refused: the
+/// SubjectPublicKeyInfo names P-256 (`1.2.840.10045.3.1.7`, RFC 5480
+/// §2.1.1.1).
+#[test]
+fn a_bare_recipient_of_another_curve_is_refused() {
+	let p256 = "3059301306072a8648ce3d020106082a8648ce3d030107034200\
+		043ee7314407753d1ba296de29f07b2cd5505ca94b614f127e71f3c19fc7845d\
+		af49c9bb4bf4d00d3b5411c8eb86d59a2dcadc5a13115fa9fef44d1e0b7ef11cab";
+
+	let refused = KemRecipient::<HouseKem>::bare(unhex(p256));
+	assert!(matches!(refused, Err(EnvelopeError::Certificate(_))));
+}
+
+/// A bare key whose backend holds another key than its public key is
+/// refused at construction, so the key that decapsulates is the key the
+/// `rid` names.
+#[test]
+fn a_bare_kem_key_refuses_a_backend_of_another_key() {
+	let key = Secp256k1SigningKey::random(&mut OsRng);
+	let other = Secp256k1SigningKey::random(&mut OsRng);
+
+	let refused = BareKemKey::<HouseKem>::new(PublicKey::from(key.verifying_key()), backend_of(&other));
+	assert!(matches!(refused, Err(EnvelopeError::KeyMismatch)));
+}
+
+/// A bare key lends the recipient of its own key, so it names the `rid` the
+/// bare recipient of its public key names.
+#[test]
+fn a_bare_kem_key_lends_the_recipient_of_its_key() -> Result<(), EnvelopeError> {
+	let (bare, spki) = bare_key();
+	let recipient = KemRecipient::<HouseKem>::bare(&spki)?;
+
+	let lent = sealed_to(bare.recipient()).kem_recipient();
+	let named = sealed_to(&recipient).kem_recipient();
+	assert_eq!(lent.rid, named.rid);
+	Ok(())
+}
+
+/// A seal to the bare recipient of a key opens through the bare key that
+/// holds it.
+#[tokio::test]
+async fn a_seal_to_a_bare_recipient_opens_through_its_bare_kem_key() -> Result<(), EnvelopeError> {
+	let (bare, spki) = bare_key();
+	let sealed = sealed_to(&KemRecipient::<HouseKem>::bare(&spki)?);
+
+	let opener = Opener::Kem { identity: &bare, ukm_label: UKM_LABEL };
+	let opened = opened(sealed, &opener, DATA).await?;
+	assert_eq!(opened.to_insecure().as_slice(), CONTENT);
+	Ok(())
+}
+
+/// A seal to another bare recipient is refused by its `rid` before the
+/// backend runs.
+#[tokio::test]
+async fn a_seal_to_another_bare_recipient_is_refused() -> Result<(), EnvelopeError> {
+	let (_, other_spki) = bare_key();
+	let (bare, _) = bare_key();
+	let sealed = sealed_to(&KemRecipient::<HouseKem>::bare(&other_spki)?);
+
+	let opener = Opener::Kem { identity: &bare, ukm_label: UKM_LABEL };
+	let refused = opened(sealed, &opener, DATA).await;
+	assert!(matches!(refused, Err(EnvelopeError::RecipientIdentifier)));
 	Ok(())
 }

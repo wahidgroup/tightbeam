@@ -45,7 +45,6 @@ use tightbeam::{
 	at_most,
 	builder::TypeBuilder,
 	crypto::{
-		aead::Aes256Gcm,
 		key::SigningKeySpec,
 		policy::Secp256k1Policy,
 		sign::ecdsa::{Secp256k1, Secp256k1SigningKey},
@@ -145,8 +144,8 @@ use crate::dtn::{
 	bms::BatteryManagementSystem,
 	certs::{
 		earth_relay_signer, generate_shared_cipher, mars_relay_signer, mission_control_signer, rover_signer,
-		EARTH_RELAY_CERT, EARTH_RELAY_KEY, MARS_RELAY_CERT, MARS_RELAY_KEY, MISSION_CONTROL_CERT, MISSION_CONTROL_KEY,
-		ROVER_CERT, ROVER_KEY,
+		SharedCipher, EARTH_RELAY_CERT, EARTH_RELAY_KEY, MARS_RELAY_CERT, MARS_RELAY_KEY, MISSION_CONTROL_CERT,
+		MISSION_CONTROL_KEY, ROVER_CERT, ROVER_KEY,
 	},
 	chain_processor::ChainProcessor,
 	clock::{advance_clock, delays, init_mission_clock, mission_time_ms},
@@ -184,7 +183,7 @@ pub struct DtnScenarioConfig {
 	pub rover_signing_key: Secp256k1SigningKey,
 	/// Shared AES-256-GCM cipher (Mission Control ↔ Rover end-to-end
 	/// encryption)
-	pub shared_cipher: Aes256Gcm,
+	pub shared_cipher: SharedCipher,
 
 	/// Battery Management System (mission loop monitors battery)
 	pub bms: RwLock<BatteryManagementSystem>,
@@ -572,7 +571,7 @@ async fn send_telemetry_to_mars_relay(
 	rover_frame_builder: &Arc<FrameBuilderHelper>,
 	fault_manager: &Arc<FaultManager>,
 	rover_signing_key: &Secp256k1SigningKey,
-	shared_cipher: &Aes256Gcm,
+	shared_cipher: &SharedCipher,
 ) -> Result<(), TightBeamError> {
 	// Gather telemetry data (default instrument for periodic telemetry)
 	let instrument = RoverInstrument::Apxs;
@@ -615,7 +614,7 @@ async fn run_mission_loop(
 	rover_frame_builder: &Arc<FrameBuilderHelper>,
 	fault_manager: &Arc<FaultManager>,
 	rover_signing_key: &Secp256k1SigningKey,
-	shared_cipher: &Aes256Gcm,
+	shared_cipher: &SharedCipher,
 	shared_mission_state: &Arc<RwLock<MissionState>>,
 ) -> Result<(), TightBeamError> {
 	if !await_completed_rounds(shared_mission_state, 1).await {

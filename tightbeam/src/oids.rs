@@ -11,7 +11,8 @@
 //! - `.1` holds the handshake and session attributes, which are the transport
 //!   handshake attribute OIDs of the FULL_CMS profile.
 //! - `.1.100` is reserved, because published releases gave it to another key exchange profile.
-//! - `.2` holds the algorithms, such as zstd, the HPKE suite, and DHKEM over secp256k1.
+//! - `.2` holds the algorithms, such as zstd and DHKEM over secp256k1.
+//! - `.2.2` is reserved, because published releases gave it to an HPKE suite.
 //! - `.3` holds the key purposes of `extendedKeyUsage` (RFC 5280 §4.2.1.12).
 
 use crate::der::asn1::ObjectIdentifier;
@@ -71,6 +72,10 @@ pub const ORI_KEM: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.1135
 
 /// The CMS `id-ct-compressedData` content type.
 ///
+/// It names a `ContentInfo` that carries a `CompressedData`. The
+/// `eContentType` inside names the compressed content, which is `id-data` for
+/// a frame body (RFC 3274 §1.1).
+///
 /// ```text
 /// id-ct-compressedData OBJECT IDENTIFIER ::= {
 ///     iso(1)   member-body(2)  us(840)    rsadsi(113549)
@@ -109,18 +114,6 @@ pub const COMPRESSION_ZLIB: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2
 /// - RFC 8878, Zstandard Compression and the `application/zstd` Media Type:
 ///   <https://datatracker.ietf.org/doc/html/rfc8878>
 pub const COMPRESSION_ZSTD: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.2.1");
-
-/// HPKE in base mode under DHKEM(secp256k1, HKDF-SHA3-256), HKDF-SHA3-256, and
-/// AES-256-GCM.
-///
-/// RFC 9180 names a suite by three registry numbers and assigns no OID, and no
-/// CMS profile of HPKE assigns one. This OID is therefore assigned under Wahid
-/// Group, LLC IANA PEN 64586, in the algorithms arc `.2`.
-///
-/// # Sources
-///
-/// - RFC 9180, Hybrid Public Key Encryption: <https://datatracker.ietf.org/doc/html/rfc9180>
-pub const HPKE_SECP256K1_SHA3_256_AES_256_GCM: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.2.2");
 
 /// DHKEM(secp256k1, HKDF-SHA256), HPKE KEM `0x0016`, as the `kem` of a CMS
 /// `KEMRecipientInfo`. Its parameters are absent.
@@ -409,6 +402,11 @@ pub const HANDSHAKE_OPENING_CONTENT: ObjectIdentifier = ObjectIdentifier::new_un
 /// the negotiated terms.
 pub const HANDSHAKE_REPLY_CONTENT: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.26");
 
+/// The record attribute that carries the epoch and the sequence number of
+/// one record, an authenticated attribute of its `AuthEnvelopedData`. The
+/// value is `RecordSequence ::= SEQUENCE { epoch INTEGER, sequence INTEGER }`.
+pub const RECORD_SEQUENCE: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.27");
+
 /// PKCS #9 content-type signed attribute ([RFC 5652 §11.1][rfc5652-11.1]).
 ///
 /// [rfc5652-11.1]: https://datatracker.ietf.org/doc/html/rfc5652#section-11.1
@@ -444,7 +442,6 @@ mod tests {
 			(COMPRESSION_ZLIB, "1.2.840.113549.1.9.16.3.8"),
 			(HKDF_SHA3_256, "1.2.840.113549.1.9.16.3.33"),
 			(COMPRESSION_ZSTD, "1.3.6.1.4.1.64586.2.1"),
-			(HPKE_SECP256K1_SHA3_256_AES_256_GCM, "1.3.6.1.4.1.64586.2.2"),
 			(DHKEM_SECP256K1, "1.3.6.1.4.1.64586.2.3"),
 			(KEY_PURPOSE_SIGNER, "1.3.6.1.4.1.64586.3.1"),
 			(HASH_SHA256, "2.16.840.1.101.3.4.2.1"),
@@ -489,6 +486,7 @@ mod tests {
 			(HANDSHAKE_KEY_CONFIRMATION, "1.3.6.1.4.1.64586.1.24"),
 			(HANDSHAKE_OPENING_CONTENT, "1.3.6.1.4.1.64586.1.25"),
 			(HANDSHAKE_REPLY_CONTENT, "1.3.6.1.4.1.64586.1.26"),
+			(RECORD_SEQUENCE, "1.3.6.1.4.1.64586.1.27"),
 			(ATTR_CONTENT_TYPE, "1.2.840.113549.1.9.3"),
 			(ATTR_MESSAGE_DIGEST, "1.2.840.113549.1.9.4"),
 			(ATTR_CMS_ALGORITHM_PROTECTION, "1.2.840.113549.1.9.52"),

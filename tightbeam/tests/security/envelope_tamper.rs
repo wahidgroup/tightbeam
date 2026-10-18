@@ -1,26 +1,26 @@
 //! # Post-handshake envelope tamper threat
 //!
 //! ## Weakness
-//! If the receive-direction AEAD nonce is not bound to an exact-next
-//! invocation counter, an active attacker on the connection can delete or
-//! replay whole encrypted envelopes without detection.
+//! If the receive direction does not bind each record to an exact-next
+//! authenticated sequence number, an active attacker on the connection can
+//! delete or replay whole encrypted envelopes without detection.
 //!
 //! ## Attack
 //! 1. A pinned client and encrypted server complete a real HPKE handshake through a frame-aware TCP relay.
 //! 2. The relay tampers with the client-to-server direction after the
 //!    handshake: either drops or duplicates the first encrypted envelope.
-//! 3. The server decrypts subsequent envelopes under the exact-next counter discipline.
+//! 3. The server opens subsequent envelopes under the exact-next sequence discipline.
 //!
 //! ## Expected control
-//! Exact-next counter nonces (RFC 9846 § 5.3) MUST fail closed:
-//! deleting an envelope desynchronizes the counter and surfaces
-//! `TamperDetected` on the very next message. Replaying an envelope is
-//! rejected after the original consumes its counter.
+//! An exact-next record sequence in the authenticated attributes (RFC 9846
+//! § 5.3) MUST fail closed: deleting an envelope desynchronizes the sequence
+//! and surfaces `TamperDetected` on the very next message. Replaying an
+//! envelope is rejected after the original consumes its sequence number.
 //!
 //! ## References
 //! - CWE-345: Insufficient Verification of Data Authenticity
 //!   <https://cwe.mitre.org/data/definitions/345.html>
-//! - RFC 9846 (TLS 1.3) §5.3: per-record nonce construction / sequencing
+//! - RFC 9846 (TLS 1.3) §5.3: the per-record sequence number
 
 #![cfg(all(
 	feature = "transport-hpke",
@@ -64,7 +64,7 @@ pub(crate) const REPLAYED_ENVELOPE_DETECTED: Urn<'static> =
 const FIRST_ENCRYPTED_FRAME: usize = 3;
 
 // ---------------------------------------------------------------------------
-// Delete: dropping an encrypted envelope desynchronizes the AEAD counter
+// Delete: dropping an encrypted envelope desynchronizes the record sequence
 // ---------------------------------------------------------------------------
 
 tb_assert_spec! {
@@ -88,7 +88,7 @@ tb_process_spec! {
 		Done => { }
 	}
 	terminal { Done }
-	annotations { description: "Exact-next AEAD counter rejects a deleted encrypted envelope" }
+	annotations { description: "Exact-next record sequence rejects a deleted encrypted envelope" }
 }
 
 tb_scenario! {
@@ -108,7 +108,7 @@ job! {
 	name: EnvelopeDeleteScenario,
 	async fn run((trace,): (Arc<TraceCollector>,)) -> Result<(), TightBeamError> {
 		let detected = with_tampered_link(TamperRule::Drop(FIRST_ENCRYPTED_FRAME), 2, |mut reader| async move {
-			// First envelope deleted: second arrives with counter 1 while 0 expected.
+			// First envelope deleted: sequence 1 arrives while 0 is expected.
 			let tampered = reader.read_envelope().await;
 			Ok(is_tamper_detected(&tampered))
 		})
@@ -151,7 +151,7 @@ tb_process_spec! {
 		Done => { }
 	}
 	terminal { Done }
-	annotations { description: "Exact-next AEAD counter rejects a replayed encrypted envelope" }
+	annotations { description: "Exact-next record sequence rejects a replayed encrypted envelope" }
 }
 
 tb_scenario! {
@@ -174,7 +174,7 @@ job! {
 			let original = reader.read_envelope().await?;
 			let original_ok = matches!(original, TransportEnvelope::Request(_));
 
-			// Replay re-presents counter 0 while 1 is expected.
+			// Replay re-presents sequence 0 while 1 is expected.
 			let replayed = reader.read_envelope().await;
 			Ok(original_ok && is_tamper_detected(&replayed))
 		})

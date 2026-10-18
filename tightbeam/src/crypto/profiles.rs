@@ -15,6 +15,8 @@ use crate::crypto::aead::AeadAlgorithm;
 use crate::crypto::aead::Aes256Gcm;
 #[cfg(all(feature = "aead", feature = "aes-gcm"))]
 use crate::crypto::aead::Aes256GcmOid;
+#[cfg(feature = "aead")]
+use crate::crypto::common::generic_array::{ArrayLength, GenericArray};
 #[cfg(all(
 	feature = "aead",
 	feature = "signature",
@@ -61,6 +63,8 @@ use crate::der::oid::AssociatedOid;
 use crate::oids::{AES_128_WRAP, AES_192_WRAP, AES_256_WRAP};
 #[cfg(any(feature = "digest", feature = "aead", feature = "signature"))]
 use crate::spki::AlgorithmIdentifierOwned;
+#[cfg(feature = "aead")]
+use crate::zeroize::Zeroizing;
 use crate::Beamable;
 #[cfg(feature = "ecdh")]
 use elliptic_curve::{Curve, CurveArithmetic};
@@ -91,28 +95,50 @@ macro_rules! impl_aes_key_wrap {
 			type KekSize = $size;
 
 			fn wrap(kek: &[u8], key: &[u8]) -> Result<Vec<u8>, KeyError> {
-				const SIZE: usize = <$size as Unsigned>::USIZE;
-				let kek = <[u8; SIZE]>::try_from(kek).map_err(|_| KeyError::WrapLength((kek.len(), SIZE).into()))?;
+				let kek = stack_kek::<$size>(kek)?;
 				if key.len() < 16 || key.len() % 8 != 0 {
 					return Err(KeyError::WrapLength((key.len(), 16).into()));
 				}
 
-				let wrapped = crate::crypto::aead::aes_kw::Kek::<$cipher>::from(kek).wrap_vec(key);
+				let wrapped = crate::crypto::aead::aes_kw::Kek::<$cipher>::new(&kek).wrap_vec(key);
 				wrapped.map_err(KeyError::WrapFailed)
 			}
 
 			fn unwrap(kek: &[u8], wrapped: &[u8]) -> Result<crate::ZeroizingBytes, KeyError> {
-				const SIZE: usize = <$size as Unsigned>::USIZE;
-				let kek = <[u8; SIZE]>::try_from(kek).map_err(|_| KeyError::WrapLength((kek.len(), SIZE).into()))?;
+				let mut key = crate::ZeroizingBytes::default();
+				key.resize(wrapped.len().saturating_sub(8), 0);
+				Self::unwrap_into(kek, wrapped, &mut key)?;
+				Ok(key)
+			}
+
+			fn unwrap_into(kek: &[u8], wrapped: &[u8], out: &mut [u8]) -> Result<(), KeyError> {
+				let kek = stack_kek::<$size>(kek)?;
 				if wrapped.len() < 24 || wrapped.len() % 8 != 0 {
 					return Err(KeyError::WrapLength((wrapped.len(), 24).into()));
 				}
 
-				let key = crate::crypto::aead::aes_kw::Kek::<$cipher>::from(kek).unwrap_vec(wrapped);
-				key.map(crate::ZeroizingBytes::new).map_err(KeyError::WrapFailed)
+				let unwrapped = crate::crypto::aead::aes_kw::Kek::<$cipher>::new(&kek).unwrap(wrapped, out);
+				unwrapped.map_err(KeyError::WrapFailed)
 			}
 		}
 	};
+}
+
+/// `kek` on the stack, in a buffer that wipes where it drops, once it is `N`
+/// octets: the key a house wrap expands its key schedule from.
+///
+/// # Errors
+///
+/// - [`KeyError::WrapLength`] -- `kek` is another size than `N`.
+#[cfg(feature = "aead")]
+fn stack_kek<N: ArrayLength<u8>>(kek: &[u8]) -> Result<Zeroizing<GenericArray<u8, N>>, KeyError> {
+	let mut copy = Zeroizing::new(GenericArray::<u8, N>::default());
+	if kek.len() != copy.len() {
+		return Err(KeyError::WrapLength((kek.len(), copy.len()).into()));
+	}
+
+	copy.iter_mut().zip(kek).for_each(|(slot, octet)| *slot = *octet);
+	Ok(copy)
 }
 
 /// Negotiation descriptor that holds only the OID set of a security profile.
@@ -288,6 +314,26 @@ pub trait KeyWrapAlgorithm {
 	/// - [`KeyError::WrapLength`] -- `kek` or `wrapped` is another size.
 	/// - [`KeyError::WrapFailed`] -- `wrapped` fails the integrity check.
 	fn unwrap(kek: &[u8], wrapped: &[u8]) -> Result<crate::ZeroizingBytes, KeyError>;
+
+	/// Unwrap `wrapped` under `kek` into `out`, which takes the unwrapped key
+	/// whole, so a caller unwraps a content key onto its own stack.
+	///
+	/// The default unwraps through [`Self::unwrap`] and copies the key into
+	/// `out`. The house AES wraps unwrap into `out` itself.
+	///
+	/// # Errors
+	///
+	/// - The [`Self::unwrap`] set.
+	/// - [`KeyError::WrapLength`] -- `out` is another size than the unwrapped key.
+	fn unwrap_into(kek: &[u8], wrapped: &[u8], out: &mut [u8]) -> Result<(), KeyError> {
+		let key = Self::unwrap(kek, wrapped)?;
+		if key.len() != out.len() {
+			return Err(KeyError::WrapLength((out.len(), key.len()).into()));
+		}
+
+		out.iter_mut().zip(key.iter()).for_each(|(slot, octet)| *slot = *octet);
+		Ok(())
+	}
 }
 
 /// Provider role for the key wrap of a content key.
@@ -520,9 +566,9 @@ mod tests {
 	use super::*;
 	use crate::constants::{
 		TIGHTBEAM_ACK_KEY_ID_DOMAIN, TIGHTBEAM_CLIENT_FINISHED_DOMAIN, TIGHTBEAM_CLIENT_FINISHED_KEY_INFO,
-		TIGHTBEAM_CLOSING_KDF_INFO, TIGHTBEAM_CLOSING_KEY_ID_DOMAIN, TIGHTBEAM_HPKE_FRAME_INFO,
-		TIGHTBEAM_OPENING_UKM_LABEL, TIGHTBEAM_SERVER_FINISHED_DOMAIN, TIGHTBEAM_SERVER_FINISHED_KEY_INFO,
-		TIGHTBEAM_SESSION_KDF_INFO,
+		TIGHTBEAM_CLOSING_KDF_INFO, TIGHTBEAM_CLOSING_KEY_ID_DOMAIN, TIGHTBEAM_FRAME_UKM_LABEL,
+		TIGHTBEAM_OPENING_UKM_LABEL, TIGHTBEAM_RECORD_KEY_ID_DOMAIN, TIGHTBEAM_SERVER_FINISHED_DOMAIN,
+		TIGHTBEAM_SERVER_FINISHED_KEY_INFO, TIGHTBEAM_SESSION_KDF_INFO,
 	};
 
 	/// Guard the domain constants against accidental change.
@@ -536,7 +582,8 @@ mod tests {
 		assert_eq!(TIGHTBEAM_SERVER_FINISHED_DOMAIN, b"tb/handshake/finished/server/v1");
 		assert_eq!(TIGHTBEAM_CLIENT_FINISHED_DOMAIN, b"tb/handshake/finished/client/v1");
 		assert_eq!(TIGHTBEAM_ACK_KEY_ID_DOMAIN, b"tb/handshake/ack/kekid/v1");
-		assert_eq!(TIGHTBEAM_HPKE_FRAME_INFO, b"tb/hpke/frame/v1");
+		assert_eq!(TIGHTBEAM_FRAME_UKM_LABEL, b"tb/frame/ukm/v1");
+		assert_eq!(TIGHTBEAM_RECORD_KEY_ID_DOMAIN, b"tb/session/record/kekid/v1");
 		assert_eq!(TIGHTBEAM_CLOSING_KDF_INFO, b"tb/session/kdf/closing/v1");
 		assert_eq!(TIGHTBEAM_CLOSING_KEY_ID_DOMAIN, b"tb/handshake/closing/kekid/v1");
 		assert_eq!(TIGHTBEAM_CLIENT_FINISHED_KEY_INFO, b"tb/handshake/finished/client/mac/v1");

@@ -26,7 +26,7 @@ use alloc::boxed::Box;
 use core::marker::PhantomData;
 use core::mem;
 
-use crate::crypto::aead::{DirectionalCiphers, SessionKeys};
+use crate::crypto::aead::{DirectionalCiphers, RuntimeAead, SessionKeys};
 use crate::crypto::profiles::SecurityProfileDesc;
 use crate::crypto::sign::elliptic_curve::ecdh::EphemeralSecret;
 use crate::crypto::sign::SigningIdentity;
@@ -107,7 +107,7 @@ pub trait Role<F: HandshakeFlow, P: HandshakeProvider>: sealed::Sealed + MaybeSe
 	type Config: MaybeSend + MaybeSync;
 
 	/// Map the directional ciphers to the keys this role sends and receives on.
-	fn session_keys(ciphers: DirectionalCiphers<P::AeadCipher>) -> SessionKeys;
+	fn session_keys(ciphers: DirectionalCiphers<RuntimeAead>) -> SessionKeys;
 }
 
 /// The client role, which sends the opening and the closing.
@@ -120,7 +120,7 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> Role<F, P> for Client {
 	type Phase = ClientPhase<F, P>;
 	type Config = ClientConfig<F, P>;
 
-	fn session_keys(ciphers: DirectionalCiphers<P::AeadCipher>) -> SessionKeys {
+	fn session_keys(ciphers: DirectionalCiphers<RuntimeAead>) -> SessionKeys {
 		SessionKeys::for_client(ciphers)
 	}
 }
@@ -263,7 +263,7 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> Role<F, P> for Server {
 	type Phase = ServerPhase<F, P>;
 	type Config = ServerConfig<F, P>;
 
-	fn session_keys(ciphers: DirectionalCiphers<P::AeadCipher>) -> SessionKeys {
+	fn session_keys(ciphers: DirectionalCiphers<RuntimeAead>) -> SessionKeys {
 		SessionKeys::for_server(ciphers)
 	}
 }

@@ -1,14 +1,18 @@
-//! The ASN.1 syntax of the four types, each checked field by field against
-//! the ASN.1 module of its RFC.
+//! The ASN.1 syntax of the four CMS types the `cms` crate lacks, each checked
+//! field by field against the ASN.1 module of its RFC. A frame carries an
+//! [`AuthEnvelopedData`] in every build, so the syntax compiles in every
+//! build.
 
+use crate::cms::cert::x509::attr::Attributes;
 use crate::cms::content_info::CmsVersion;
 use crate::cms::enveloped_data::{
 	EncryptedContentInfo, EncryptedKey, OriginatorInfo, RecipientIdentifier, RecipientInfos, UserKeyingMaterial,
 };
 use crate::der::asn1::OctetString;
+#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
+use crate::der::asn1::OctetStringRef;
 use crate::der::Sequence;
 use crate::spki::AlgorithmIdentifierOwned;
-use crate::x509::attr::Attributes;
 
 /// `AuthEnvelopedData` ([RFC 5083 §2.1][rfc5083-2.1]): a content encrypted
 /// under an authenticated cipher for one or more recipients.
@@ -146,6 +150,18 @@ pub struct GcmParameters {
 	/// The length of the authentication tag in octets.
 	#[asn1(default = "default_icv_len")]
 	pub aes_icv_len: u8,
+}
+
+/// [`GcmParameters`] with the nonce borrowed, which a seal encodes from the
+/// nonce it drew and an open reads in place, with no copy of the nonce.
+#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Sequence)]
+pub(crate) struct GcmParametersRef<'a> {
+	/// The nonce of the one encryption.
+	pub(crate) aes_nonce: OctetStringRef<'a>,
+	/// The length of the authentication tag in octets.
+	#[asn1(default = "default_icv_len")]
+	pub(crate) aes_icv_len: u8,
 }
 
 /// The default `aes-ICVlen` of RFC 5084 §3.2.

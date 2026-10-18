@@ -1,8 +1,8 @@
 #!/bin/bash
 # CMS interop check: parse each DER sample the crate emits with OpenSSL.
 #
-# The samples come from the test
-# `the_emitted_structures_write_their_interop_samples`, which writes one
+# The samples come from the tests named
+# `the_emitted_structures_write_their_interop_samples`, which write one
 # `ContentInfo` per structure to target/cms-samples/, and the DER of three
 # certificates, when the environment holds TIGHTBEAM_CMS_SAMPLES. `make
 # interop` runs both steps:
@@ -46,6 +46,13 @@
 # It decrypts hpke-closing, the anonymous closing under a KEKRecipientInfo,
 # under its fixed test KEK.
 #
+# Frames and records write three samples. OpenSSL decrypts record, one
+# session record under a KEKRecipientInfo, under its fixed test KEK. It
+# parses frame-kem, the envelope of a frame sealed to a bare KEM recipient,
+# and cannot open it, as with cms-opening. It parses compressed-data, the
+# CompressedData of a compressed frame body, and the script checks that its
+# encapContentInfo declares id-data (RFC 3274 section 1.1).
+#
 # OpenSSL feeds no authAttrs to the cipher as associated data
 # (crypto/cms/cms_env.c and cms_enc.c set none), where RFC 5083 section 2.2
 # makes their DER the AAD. It writes the content before it checks the tag, so
@@ -63,7 +70,8 @@
 #
 # The script exits non-zero when a sample fails `asn1parse`, fails the CMS
 # parse under either tagging, fails to verify, fails to decrypt to its
-# expected plaintext, when a certificate lacks the bit of its use, when the
+# expected plaintext, when a CompressedData sample declares another content
+# type than id-data, when a certificate lacks the bit of its use, when the
 # opening's rid names another certificate, or when a sample of `required` is
 # absent.
 # It has no dependency on the crate.
@@ -75,6 +83,8 @@
 #     https://datatracker.ietf.org/doc/html/rfc5083#section-2.1
 #   RFC 9629, KEM Algorithms in CMS:
 #     https://datatracker.ietf.org/doc/html/rfc9629
+#   RFC 3274, Compressed Data Content Type for CMS:
+#     https://datatracker.ietf.org/doc/html/rfc3274#section-1.1
 
 set -euo pipefail
 
@@ -90,11 +100,12 @@ if [ "${#samples[@]}" -eq 0 ]; then
 	exit 1
 fi
 
-# Each structure the handshake emits, so a writer that stops emitting one
-# fails the run.
+# Each structure the handshake, the session, and a frame emit, so a writer
+# that stops emitting one fails the run.
 required=(
 	cms-opening server-finished session-receipt sealed-finished kek-seal frame-signature joined-receipt
 	hpke-hello hpke-reply hpke-closing
+	record frame-kem compressed-data
 )
 
 # Each certificate the samples name, beside the keyUsage bit of its use as
@@ -185,6 +196,16 @@ verify() {
 	fi
 }
 
+# Check that a parsed CompressedData sample declares id-data as the type of
+# the content it compresses (RFC 3274 section 1.1).
+declared() {
+	if printf '%s\n' "$1" | grep -qE 'eContentType:[[:space:]]*(pkcs7-data|1\.2\.840\.113549\.1\.7\.1)'; then
+		echo "eContentType id-data"
+	else
+		echo "eContentType is not id-data FAILED"
+	fi
+}
+
 # Decrypt a retagged AuthEnvelopedData sample under the KEK its test wrote,
 # and compare the content with the expected plaintext.
 decrypt() {
@@ -264,6 +285,11 @@ for sample in "${samples[@]}"; do
 		cms="cms -cmsout -print ok ($(summary "$printed"))"
 		if printf '%s\n' "$printed" | grep -q 'contentType: pkcs7-signedData'; then
 			verified="$(verify "$sample")"
+			case "$verified" in
+				*FAILED) failures=$((failures + 1)) ;;
+			esac
+		elif printf '%s\n' "$printed" | grep -q 'contentType: id-smime-ct-compressedData'; then
+			verified="$(declared "$printed")"
 			case "$verified" in
 				*FAILED) failures=$((failures + 1)) ;;
 			esac

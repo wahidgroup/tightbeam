@@ -195,7 +195,7 @@ macro_rules! servlet {
 			protocol: $protocol,
 			handle: raw |$frame, $ctx| async move {
 				let mut $frame = $frame;
-				$frame.prepare_typed($ctx)?;
+				$frame.prepare_typed($ctx).await?;
 
 				let $msg: $input = $crate::decode($frame.message())?;
 				$handler_body

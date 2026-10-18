@@ -30,7 +30,6 @@ pub mod messaging;
 pub mod policy;
 pub mod protocols;
 pub mod state;
-pub mod wire_der;
 
 #[cfg(feature = "tokio")]
 pub mod accept;
@@ -46,10 +45,11 @@ pub(crate) mod rekey;
 #[cfg(any(feature = "tcp", feature = "async-transport"))]
 pub mod tcp;
 
+pub use crate::asn1::wire_der;
 pub use builders::EnvelopeBuilder;
 pub use client::GenericClient;
 pub use client::{ClientBuilder, ClientPolicies};
-pub use envelopes::{RequestPackage, ResponsePackage, TransportEnvelope, WireEnvelope, WireMode};
+pub use envelopes::{Arrived, RequestPackage, ResponsePackage, TransportEnvelope, WireEnvelope, WireMode};
 pub use error::{TransportError, TransportFailure};
 pub use io::{EncryptedMessageIO, EnvelopeSink, EnvelopeSource, MessageIO};
 pub use messaging::GateAudit;
@@ -516,15 +516,15 @@ mod tests {
 	/// let an oversized envelope reach the peer as a connection reset.
 	#[test]
 	fn encrypted_ceiling_measures_the_sealed_wire_form() -> Result<(), Box<dyn Error>> {
-		use crate::crypto::aead::{Aes256Gcm, KeyInit, RuntimeAead, SendCipher};
+		use crate::crypto::aead::{RecordDirection, RuntimeAead, SendCipher};
+		use crate::crypto::profiles::DefaultCryptoProvider;
 		use crate::der::Encode;
 
 		let frame = TestFrame::v0(None, None);
 		let plaintext_len = TransportEnvelope::from(frame.clone()).to_der()?.len();
-		let cipher = Aes256Gcm::new_from_slice(&[0u8; 32])
-			.map_err(|_| TransportError::OperationFailed(TransportFailure::Internal))?;
+		let cipher = RuntimeAead::new::<DefaultCryptoProvider>(vec![0u8; 32])?;
 
-		let encryptor = SendCipher::new(RuntimeAead::new(cipher));
+		let encryptor = SendCipher::new(cipher, 0, RecordDirection::ClientToServer);
 		let result = builders::EnvelopeBuilder::request(frame)
 			.with_wire_mode(WireMode::Encrypted)
 			.with_encryptor(&encryptor)
@@ -540,13 +540,13 @@ mod tests {
 
 	#[test]
 	fn test_envelope_builder_encrypted_limit_returns_message() -> Result<(), Box<dyn Error>> {
-		use crate::crypto::aead::{Aes256Gcm, KeyInit, RuntimeAead, SendCipher};
+		use crate::crypto::aead::{RecordDirection, RuntimeAead, SendCipher};
+		use crate::crypto::profiles::DefaultCryptoProvider;
 
 		let frame = TestFrame::v0(None, None);
-		let cipher = Aes256Gcm::new_from_slice(&[0u8; 32])
-			.map_err(|_| TransportError::OperationFailed(TransportFailure::Internal))?;
+		let cipher = RuntimeAead::new::<DefaultCryptoProvider>(vec![0u8; 32])?;
 
-		let encryptor = SendCipher::new(RuntimeAead::new(cipher));
+		let encryptor = SendCipher::new(cipher, 0, RecordDirection::ClientToServer);
 		let result = builders::EnvelopeBuilder::request(frame.clone())
 			.with_wire_mode(WireMode::Encrypted)
 			.with_encryptor(&encryptor)

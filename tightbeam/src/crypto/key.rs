@@ -61,12 +61,19 @@ mod signing {
 #[cfg(feature = "signature")]
 use signing::*;
 
-#[cfg(feature = "aead")]
+#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 mod encryption {
-	pub use crate::crypto::aead::{Aead, AeadAlgorithm, AeadCore, Aes128Gcm, Aes256Gcm, Error as AeadError, Nonce};
+	pub use crate::asn1::{AuthEnvelopedData, ObjectIdentifier};
+	pub use crate::crypto::aead::{AeadAlgorithm, CheckedContent, Decryptor, Encryptor};
+	pub use crate::crypto::cms::ContentEncryption;
+	pub(crate) use crate::crypto::cms::Kek;
+	pub use crate::crypto::profiles::{CryptoProvider, KeyWrapAlgorithm};
+	pub use crate::oids::DATA;
+	pub use crate::random::CryptoRngCore;
+	pub use crate::TightBeamError;
 }
 
-#[cfg(feature = "aead")]
+#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 use encryption::*;
 
 #[cfg(any(feature = "signature", feature = "aead"))]
@@ -102,16 +109,6 @@ pub enum KeyError {
 	#[error("Signature error: {0}")]
 	SignatureError(SignatureError),
 
-	/// AEAD encryption or decryption failed.
-	#[cfg(feature = "aead")]
-	#[error("AEAD error: {0}")]
-	AeadError(AeadError),
-
-	/// The nonce length differs from the cipher's nonce size.
-	#[cfg(feature = "aead")]
-	#[error("Nonce length mismatch: {0}")]
-	NonceLengthError(crate::error::ReceivedExpectedError<usize, usize>),
-
 	/// The key material offered to AES key wrap is shorter than the wrap's
 	/// minimum or not a whole number of 64-bit blocks (RFC 3394 § 2).
 	#[cfg(feature = "aead")]
@@ -134,7 +131,6 @@ pub enum KeyError {
 crate::impl_from!(crate::spki::Error => KeyError::SpkiError);
 crate::impl_from!(#[cfg(feature = "signature")] EllipticCurveError => KeyError::EllipticCurveError);
 crate::impl_from!(#[cfg(feature = "signature")] SignatureError => KeyError::SignatureError);
-crate::impl_from!(#[cfg(feature = "aead")] AeadError => KeyError::AeadError);
 
 /// A signing key given as raw bytes or as a key provider.
 ///
@@ -436,58 +432,51 @@ where
 #[cfg(feature = "signature")]
 pub type Secp256k1KeyProvider = EcdsaKeyProvider<Secp256k1>;
 
-/// A pluggable backend for symmetric encryption keys.
+/// A pluggable backend for a key-encryption key (KEK), the key a
+/// `KEKRecipientInfo` names (RFC 5652 §6.2.3).
 ///
-/// An implementation provides symmetric encryption and decryption without
-/// exposing the raw key material. Hardware Security Modules (HSMs), Key
-/// Management Services (KMS), and secure enclaves can therefore hold
-/// encryption keys inside their secure boundary.
+/// An implementation encrypts and decrypts a content-encryption key under its
+/// KEK without exposing the KEK, so a Hardware Security Module (HSM), a Key
+/// Management Service (KMS), or a secure enclave can hold it.
 ///
 /// # Security Properties
 ///
-/// - **Key encapsulation**: encryption keys stay inside the provider boundary.
+/// - **Key encapsulation**: the KEK stays inside the provider boundary.
 /// - **Uniform interface**: in-memory and remote backends use identical APIs.
 /// - **Async by default**: every operation is async, so a remote backend fits the same API.
-/// - **Algorithm agnostic**: the byte encoding admits any AEAD cipher.
+/// - **Algorithm agnostic**: the backend names its own key-encryption algorithm.
 #[cfg(feature = "aead")]
 pub trait EncryptingKeyProvider: Send + Sync + Debug {
-	/// Returns the algorithm identifier for this encryption key.
+	/// Returns the key-encryption algorithm of this key, which the
+	/// `keyEncryptionAlgorithm` of a `KEKRecipientInfo` names.
 	fn algorithm(&self) -> AlgorithmIdentifierOwned;
 
-	/// Encrypts `plaintext` under `nonce`.
-	///
-	/// The result is the ciphertext, which includes the authentication tag for
-	/// AEAD ciphers.
-	///
-	/// - `nonce`: the nonce or IV for this operation. The caller MUST ensure
-	///   each `(key, nonce)` pair is unique for AEAD ciphers.
-	/// - `plaintext`: the data to encrypt.
-	///
-	/// # Errors
-	///
-	/// - [`KeyError::NonceLengthError`] -- `nonce` differs from the cipher's nonce size.
-	/// - [`KeyError::AeadError`] -- the cipher fails to encrypt.
-	fn encrypt(
-		&self,
-		nonce: &[u8],
-		plaintext: &[u8],
-	) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, KeyError>> + Send + '_>>;
+	/// Returns the identifier that names this key, the
+	/// `kekid.keyIdentifier` of every `KEKRecipientInfo` under it.
+	fn key_identifier(&self) -> &[u8];
 
-	/// Decrypts `ciphertext` under `nonce`.
+	/// Encrypts the content-encryption key `content_key` under this key.
 	///
-	/// The result is the plaintext, which wipes when it drops.
-	///
-	/// - `nonce`: the nonce or IV used for encryption.
-	/// - `ciphertext`: the encrypted data.
+	/// The result is the `encryptedKey` of a `KEKRecipientInfo`.
 	///
 	/// # Errors
 	///
-	/// - [`KeyError::NonceLengthError`] -- `nonce` differs from the cipher's nonce size.
-	/// - [`KeyError::AeadError`] -- the ciphertext fails authentication.
+	/// - [`KeyError::WrapLength`] -- `content_key` is no length the algorithm wraps.
+	/// - [`KeyError::WrapFailed`] -- the algorithm refused the key.
+	fn encrypt(&self, content_key: &[u8]) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, KeyError>> + Send + '_>>;
+
+	/// Decrypts `encrypted_key`, the `encryptedKey` of a `KEKRecipientInfo`
+	/// under this key.
+	///
+	/// The result is the content-encryption key, which wipes when it drops.
+	///
+	/// # Errors
+	///
+	/// - [`KeyError::WrapLength`] -- `encrypted_key` is no length the algorithm unwraps.
+	/// - [`KeyError::WrapFailed`] -- `encrypted_key` fails the integrity check of the algorithm.
 	fn decrypt(
 		&self,
-		nonce: &[u8],
-		ciphertext: &[u8],
+		encrypted_key: &[u8],
 	) -> Pin<Box<dyn Future<Output = Result<SecretSlice<u8>, KeyError>> + Send + '_>>;
 }
 
@@ -498,130 +487,137 @@ impl<T: EncryptingKeyProvider + ?Sized> EncryptingKeyProvider for Arc<T> {
 		T::algorithm(self)
 	}
 
-	fn encrypt(
-		&self,
-		nonce: &[u8],
-		plaintext: &[u8],
-	) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, KeyError>> + Send + '_>> {
-		T::encrypt(self, nonce, plaintext)
+	fn key_identifier(&self) -> &[u8] {
+		T::key_identifier(self)
+	}
+
+	fn encrypt(&self, content_key: &[u8]) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, KeyError>> + Send + '_>> {
+		T::encrypt(self, content_key)
 	}
 
 	fn decrypt(
 		&self,
-		nonce: &[u8],
-		ciphertext: &[u8],
+		encrypted_key: &[u8],
 	) -> Pin<Box<dyn Future<Output = Result<SecretSlice<u8>, KeyError>> + Send + '_>> {
-		T::decrypt(self, nonce, ciphertext)
+		T::decrypt(self, encrypted_key)
 	}
 }
 
-/// An in-memory encryption key provider over any RustCrypto AEAD cipher.
+/// An in-memory key-encryption key under the key wrap of the provider `P`,
+/// named by its key identifier.
 ///
-/// This is the reference implementation of [`EncryptingKeyProvider`], and it
-/// stores the encryption key in memory. It suits development, testing, and
-/// applications that need no HSM or KMS integration.
-///
-/// # Type Parameters
-///
-/// - `A`: the AEAD cipher type, such as `Aes256Gcm` or `Aes128Gcm`. The cipher
-///   type names the algorithm identifier that the provider reports.
-///
-/// # Security
-///
-/// For zeroization on drop, use keys that implement `ZeroizeOnDrop`.
-#[cfg(feature = "aead")]
-pub struct InMemoryEncryptingKeyProvider<A>
-where
-	A: AeadAlgorithm + Send + Sync + 'static,
-{
-	cipher: A,
+/// - It is the reference [`EncryptingKeyProvider`], for an application that holds its KEK in memory.
+/// - It stores the KEK in memory, in a buffer that wipes when it drops.
+/// - It seals and opens a frame as an [`Encryptor`] and a [`Decryptor`], under one `KEKRecipientInfo`.
+#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
+pub struct InMemoryEncryptingKeyProvider<P: CryptoProvider> {
+	kek: Kek<P::KeyWrap>,
+	key_identifier: Vec<u8>,
 }
 
-#[cfg(feature = "aead")]
-impl<A> From<A> for InMemoryEncryptingKeyProvider<A>
-where
-	A: AeadAlgorithm + Send + Sync + 'static,
-{
-	fn from(cipher: A) -> Self {
-		InMemoryEncryptingKeyProvider { cipher }
+#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
+impl<P: CryptoProvider> InMemoryEncryptingKeyProvider<P> {
+	/// Hold `kek`, a key of the size of the key wrap of `P`, named by
+	/// `key_identifier`.
+	///
+	/// # Errors
+	///
+	/// - [`KeyError::WrapLength`] -- `kek` is another size than the wrap's key.
+	pub fn new(kek: impl Into<crate::ZeroizingBytes>, key_identifier: impl Into<Vec<u8>>) -> Result<Self, KeyError> {
+		let kek = Kek::new(kek)?;
+		let key_identifier = key_identifier.into();
+		Ok(Self { kek, key_identifier })
 	}
 }
 
-#[cfg(feature = "aead")]
-impl<A> Debug for InMemoryEncryptingKeyProvider<A>
-where
-	A: AeadAlgorithm + Send + Sync + 'static,
-{
+/// The key identifier and the algorithm name the key, and the KEK stays out
+/// of the output.
+#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
+impl<P: CryptoProvider> Debug for InMemoryEncryptingKeyProvider<P> {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 		f.debug_struct("InMemoryEncryptingKeyProvider")
-			.field("algorithm", &<A::Oid as AssociatedOid>::OID)
+			.field("algorithm", &<<P::KeyWrap as KeyWrapAlgorithm>::Oid as AssociatedOid>::OID)
+			.field("key_identifier", &self.key_identifier)
 			.finish_non_exhaustive()
 	}
 }
 
-#[cfg(feature = "aead")]
-impl<A> EncryptingKeyProvider for InMemoryEncryptingKeyProvider<A>
-where
-	A: AeadAlgorithm + Send + Sync + 'static,
-{
+#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
+impl<P: CryptoProvider> EncryptingKeyProvider for InMemoryEncryptingKeyProvider<P> {
+	/// The key wrap of `P`, with parameters absent (RFC 3565 §2.3.2).
 	fn algorithm(&self) -> AlgorithmIdentifierOwned {
-		AlgorithmIdentifierOwned { oid: <A::Oid as AssociatedOid>::OID, parameters: None }
+		let oid = <<P::KeyWrap as KeyWrapAlgorithm>::Oid as AssociatedOid>::OID;
+		AlgorithmIdentifierOwned { oid, parameters: None }
 	}
 
-	fn encrypt(
-		&self,
-		nonce: &[u8],
-		plaintext: &[u8],
-	) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, KeyError>> + Send + '_>> {
-		let nonce_size = <<A as AeadCore>::NonceSize as Unsigned>::USIZE;
-		let received_len = nonce.len();
-		if received_len != nonce_size {
-			return Box::pin(async move {
-				Err(KeyError::NonceLengthError(crate::error::ReceivedExpectedError::from((
-					received_len,
-					nonce_size,
-				))))
-			});
-		}
+	fn key_identifier(&self) -> &[u8] {
+		&self.key_identifier
+	}
 
-		let nonce_ref = Nonce::<A>::from_slice(nonce);
-		let result = self.cipher.encrypt(nonce_ref, plaintext).map_err(KeyError::from);
-		Box::pin(async move { result })
+	fn encrypt(&self, content_key: &[u8]) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, KeyError>> + Send + '_>> {
+		let wrapped = P::KeyWrap::wrap(&self.kek, content_key);
+		Box::pin(async move { wrapped })
 	}
 
 	fn decrypt(
 		&self,
-		nonce: &[u8],
-		ciphertext: &[u8],
+		encrypted_key: &[u8],
 	) -> Pin<Box<dyn Future<Output = Result<SecretSlice<u8>, KeyError>> + Send + '_>> {
-		let nonce_size = <<A as AeadCore>::NonceSize as Unsigned>::USIZE;
-		let received_len = nonce.len();
-		if received_len != nonce_size {
-			return Box::pin(async move {
-				Err(KeyError::NonceLengthError(crate::error::ReceivedExpectedError::from((
-					received_len,
-					nonce_size,
-				))))
-			});
-		}
-
-		let nonce_ref = Nonce::<A>::from_slice(nonce);
-		let result = self
-			.cipher
-			.decrypt(nonce_ref, ciphertext)
-			.map(SecretSlice::from)
-			.map_err(KeyError::from);
-		Box::pin(async move { result })
+		let unwrapped = P::KeyWrap::unwrap(&self.kek, encrypted_key);
+		let content_key = unwrapped.map(|mut key| SecretSlice::from(core::mem::take(&mut *key)));
+		Box::pin(async move { content_key })
 	}
 }
 
-#[cfg(all(feature = "aead", feature = "aes-gcm"))]
-/// The in-memory AES-256-GCM encryption key provider.
-pub type Aes256GcmKeyProvider = InMemoryEncryptingKeyProvider<Aes256Gcm>;
+/// A frame seals to this key as an `AuthEnvelopedData` with one
+/// `KEKRecipientInfo`, under every algorithm of `P`.
+#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
+impl<P> Encryptor<<P::AeadCipher as AeadAlgorithm>::Oid> for InMemoryEncryptingKeyProvider<P>
+where
+	P: CryptoProvider<AeadCipher: ContentEncryption>,
+{
+	fn encrypt_content(
+		&self,
+		content: impl Into<Vec<u8>>,
+		content_type: Option<ObjectIdentifier>,
+		rng: Option<&mut dyn CryptoRngCore>,
+	) -> Result<AuthEnvelopedData, TightBeamError> {
+		let content_type = content_type.unwrap_or(DATA);
+		let sealed = AuthEnvelopedData::seal_kek::<P>(&self.kek, &self.key_identifier, content_type, content, [], rng);
+		Ok(sealed?)
+	}
+}
 
-#[cfg(all(feature = "aead", feature = "aes-gcm"))]
-/// The in-memory AES-128-GCM encryption key provider.
-pub type Aes128GcmKeyProvider = InMemoryEncryptingKeyProvider<Aes128Gcm>;
+/// A frame opens under this key when its `kekid` names it, and the content
+/// type is the one the envelope's attributes authenticate.
+#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
+impl<P> Decryptor for InMemoryEncryptingKeyProvider<P>
+where
+	P: CryptoProvider<AeadCipher: ContentEncryption>,
+{
+	fn algorithm_oid(&self) -> ObjectIdentifier {
+		<<P::AeadCipher as AeadAlgorithm>::Oid as AssociatedOid>::OID
+	}
+
+	fn open<'a>(&'a self, content: CheckedContent<'a>) -> MaybeSendFuture<'a, Result<(), TightBeamError>> {
+		let opened = content.open_kek::<P>(&self.kek, &self.key_identifier);
+		Box::pin(core::future::ready(opened))
+	}
+}
+
+/// The in-memory key-encryption key of [`DefaultCryptoProvider`], whose
+/// frames seal under AES-256-GCM with the content key wrapped under AES-256
+/// key wrap.
+///
+/// [`DefaultCryptoProvider`]: crate::crypto::profiles::DefaultCryptoProvider
+#[cfg(all(
+	feature = "aead",
+	feature = "signature",
+	feature = "kdf",
+	feature = "ecdh",
+	feature = "aes-gcm"
+))]
+pub type Aes256GcmKeyProvider = InMemoryEncryptingKeyProvider<crate::crypto::profiles::DefaultCryptoProvider>;
 
 #[cfg(test)]
 mod tests {

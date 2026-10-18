@@ -34,6 +34,8 @@
 //! ```
 //!
 //! - `ee || base` is the hybrid shared secret `Z′ = Z || T` of NIST SP 800-56C Rev. 2 § 2.
+//! - `k_c2s` and `k_s2c` are the key-encryption keys of each direction's
+//!   records, at the key size of the provider's wrap.
 //! - `confirm` and `server` follow the Finished construction of RFC 9846 §
 //!   4.5.3, one `MacKey` per role, with the crate's label as the HKDF-Expand
 //!   info in place of `HkdfLabel`. `server` covers the transcript through the
@@ -66,13 +68,11 @@ use crate::constants::{
 	TIGHTBEAM_SERVER_FINISHED_DOMAIN, TIGHTBEAM_SERVER_FINISHED_KEY_INFO, TIGHTBEAM_SESSION_KDF_INFO,
 };
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::crypto::aead::{DirectionalCiphers, KeyInit, SessionKeys};
+use crate::crypto::aead::{DirectionalCiphers, KeyInit, RuntimeAead, SessionKeys};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::crypto::cms::{AttributesExt, AuthEnvelopedData, EnvelopeError, Opener, Recipient};
+use crate::crypto::cms::{AttributesExt, AuthEnvelopedData, ContentEncryption, EnvelopeError, Opener, Recipient};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::common::typenum::Unsigned;
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::crypto::common::KeySizeUser;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::hash::Digest;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -1311,23 +1311,20 @@ impl<'a, P: HandshakeProvider> Agreement<'a, P> {
 }
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-impl<C> DirectionalCiphers<C>
-where
-	C: KeyInit,
-{
-	/// Derive the directional AEAD ciphers of provider `P` from a traffic
-	/// secret.
+impl DirectionalCiphers<RuntimeAead> {
+	/// Derive the directional record keys of provider `P` from a traffic
+	/// secret, for `epoch`.
 	///
 	/// This is the single derivation path that handshake finalization and epoch
-	/// rotation share. The provider's cipher type fixes the key length, the
-	/// salt floor applies at every derivation, and the [`TrafficSecret`] bound
-	/// admits only the handshake secret and the epoch chain it seeds.
-	pub(crate) fn derive<P, S>(secret: &S, salt: KdfSalt<'_>) -> Result<Self, HandshakeError>
+	/// rotation share. Each key is a key-encryption key of the size of the
+	/// provider's key wrap, the salt floor applies at every derivation, and the
+	/// [`TrafficSecret`] bound admits the handshake secret and its epoch chain.
+	pub(crate) fn derive<P, S>(secret: &S, salt: KdfSalt<'_>, epoch: u32) -> Result<Self, HandshakeError>
 	where
-		P: CryptoProvider<AeadCipher = C>,
+		P: CryptoProvider<AeadCipher: ContentEncryption> + 'static,
 		S: TrafficSecret,
 	{
-		let key_size = <C as KeySizeUser>::key_size();
+		let key_size = <<P::KeyWrap as KeyWrapAlgorithm>::KekSize as Unsigned>::USIZE;
 		let salt_len = salt.as_bytes().len();
 		if salt_len < MIN_SALT_ENTROPY_BYTES {
 			return Err(HandshakeError::InsufficientSaltEntropy { actual: salt_len, minimum: MIN_SALT_ENTROPY_BYTES });
@@ -1337,27 +1334,26 @@ where
 		let c2s_label = KdfInfo::new(TIGHTBEAM_C2S_KDF_INFO);
 		let s2c_label = KdfInfo::new(TIGHTBEAM_S2C_KDF_INFO);
 
-		let client_to_server = derive_labeled_cipher::<P>(input_key, salt, c2s_label, key_size)?;
-		let server_to_client = derive_labeled_cipher::<P>(input_key, salt, s2c_label, key_size)?;
-		Ok(Self { client_to_server, server_to_client })
+		let client_to_server = derive_labeled_key::<P>(input_key, salt, c2s_label, key_size)?;
+		let server_to_client = derive_labeled_key::<P>(input_key, salt, s2c_label, key_size)?;
+		Ok(Self { client_to_server, server_to_client, epoch })
 	}
 }
 
-/// Derive one direction's cipher under the given KDF info label.
+/// Derive one direction's record key under the given KDF info label.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-fn derive_labeled_cipher<P>(
+fn derive_labeled_key<P>(
 	input_key: &[u8],
 	salt: KdfSalt<'_>,
 	info: KdfInfo<'_>,
 	key_size: usize,
-) -> Result<P::AeadCipher, HandshakeError>
+) -> Result<RuntimeAead, HandshakeError>
 where
-	P: CryptoProvider,
-	P::AeadCipher: KeyInit,
+	P: CryptoProvider<AeadCipher: ContentEncryption> + 'static,
 {
 	let key_bytes = P::Kdf::derive_dynamic_key(input_key, info.as_bytes(), Some(salt.as_bytes()), key_size)?;
-	let cipher = P::AeadCipher::new_from_slice(&key_bytes[..])?;
-	Ok(cipher)
+	let key = RuntimeAead::new::<P>(key_bytes)?;
+	Ok(key)
 }
 
 /// The KDF salt of a flow.
@@ -1570,12 +1566,12 @@ impl<P: HandshakeProvider, Peer: PeerIdentity> Agreed<P, Peer> {
 	/// - [`HandshakeError::InvalidKeyMaterialLength`] -- the cipher refused the derived key.
 	pub(crate) fn complete(
 		self,
-		keys: fn(DirectionalCiphers<P::AeadCipher>) -> SessionKeys,
+		keys: fn(DirectionalCiphers<RuntimeAead>) -> SessionKeys,
 	) -> Result<EstablishedSession, HandshakeError> {
 		let Self { terms, secret, receipt, peer } = self;
 		let salt = terms.kdf_salt();
-		let ciphers = DirectionalCiphers::derive::<P, _>(&secret, salt)?;
 		let epoch = EpochMaterials::derive::<P>(&secret, salt, terms.transcript_hash)?;
+		let ciphers = DirectionalCiphers::derive::<P, _>(&secret, salt, epoch.epoch)?;
 
 		let receipt = receipt.map(Arc::new);
 		let peer = peer.certificate().map(Arc::clone);
@@ -1589,8 +1585,9 @@ mod tests {
 	use super::*;
 	use crate::cms::signed_data::{SignerInfo, SignerInfos};
 	use crate::constants::TIGHTBEAM_ACK_KEY_ID_DOMAIN;
+	use crate::crypto::aead::{RecordDirection, RecvCipher, SendCipher};
 	use crate::crypto::hash::{Sha3_256, Sha3_512};
-	use crate::crypto::profiles::{AeadProvider, DefaultCryptoProvider};
+	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::crypto::secret::ToInsecure;
 	use crate::crypto::sign::ecdsa::k256::Secp256k1;
 	use crate::crypto::x509::KeyPurposes;
@@ -1617,13 +1614,13 @@ mod tests {
 		secret.expect("fixture inputs derive a handshake secret")
 	}
 
-	/// The directional ciphers of the default provider from `secret` under
-	/// `salt`.
+	/// The directional record keys of the default provider from `secret`
+	/// under `salt`, at epoch 0.
 	fn derive_directional(
 		secret: &HandshakeSecret,
 		salt: &[u8],
-	) -> Result<DirectionalCiphers<<DefaultCryptoProvider as AeadProvider>::AeadCipher>, HandshakeError> {
-		DirectionalCiphers::derive::<DefaultCryptoProvider, _>(secret, KdfSalt::new(salt))
+	) -> Result<DirectionalCiphers<RuntimeAead>, HandshakeError> {
+		DirectionalCiphers::derive::<DefaultCryptoProvider, _>(secret, KdfSalt::new(salt), 0)
 	}
 
 	#[test]
@@ -2458,15 +2455,20 @@ mod tests {
 		assert!(matches!(refused, Err(HandshakeError::SealedFrame)));
 	}
 
-	/// Seal a fixture plaintext under a zero nonce with the given cipher.
-	fn seal(cipher: &<DefaultCryptoProvider as AeadProvider>::AeadCipher, plaintext: impl AsRef<[u8]>) -> Vec<u8> {
-		let plaintext = plaintext.as_ref();
-		use crate::crypto::aead::Aead;
+	/// The first client-to-server record of epoch 0 that `key` seals over
+	/// `plaintext`, as its DER.
+	fn sealed_under(key: RuntimeAead, plaintext: &[u8]) -> Vec<u8> {
+		let sender = SendCipher::new(key, 0, RecordDirection::ClientToServer);
+		let record = sender.encrypt_next(plaintext).expect("a derived key seals a record");
+		record.to_der().expect("the record encodes")
+	}
 
-		let nonce = [0u8; 12];
-		cipher
-			.encrypt((&nonce).into(), plaintext)
-			.expect("fixture encryption with a freshly derived cipher")
+	/// What `key` opens of `record`, as the first client-to-server record of
+	/// epoch 0.
+	fn opened_under(key: RuntimeAead, record: &[u8]) -> Result<Vec<u8>, crate::TightBeamError> {
+		let mut arrived = record.to_vec();
+		let opened = RecvCipher::new(key, 0, RecordDirection::ClientToServer).open(&mut arrived)?;
+		Ok(opened.to_vec())
 	}
 
 	#[test]
@@ -2475,17 +2477,19 @@ mod tests {
 		let secret = handshake_secret(0x11, 0x42, &salt);
 		let ciphers = derive_directional(&secret, &salt)?;
 
-		// The info labels separate the keys, so the same nonce and plaintext
-		// must produce different ciphertexts under the two directions.
-		let plaintext = b"directional key separation";
-		let c2s_ciphertext = seal(&ciphers.client_to_server, plaintext.as_slice());
-		let s2c_ciphertext = seal(&ciphers.server_to_client, plaintext.as_slice());
-		assert_ne!(c2s_ciphertext, s2c_ciphertext);
+		// The info labels separate the keys, so a record of one direction
+		// does not open under the other, even named as the first.
+		let record = sealed_under(ciphers.client_to_server, b"directional key separation");
+		let crossed = opened_under(ciphers.server_to_client, &record);
+		assert!(matches!(
+			crossed,
+			Err(crate::TightBeamError::EnvelopeError(EnvelopeError::KeyUnwrap))
+		));
 		Ok(())
 	}
 
 	#[test]
-	fn test_derive_directional_aead_is_deterministic() -> Result<(), HandshakeError> {
+	fn test_derive_directional_aead_is_deterministic() -> Result<(), crate::TightBeamError> {
 		let salt = [0x99u8; 32];
 		let secret = handshake_secret(0x11, 0x42, &salt);
 		let first = derive_directional(&secret, &salt)?;
@@ -2493,10 +2497,9 @@ mod tests {
 
 		// Both derivations agree, so two independent endpoints derive the
 		// same directional keys from shared input material.
-		let plaintext = b"deterministic derivation";
-		let first_ciphertext = seal(&first.client_to_server, plaintext.as_slice());
-		let second_ciphertext = seal(&second.client_to_server, plaintext.as_slice());
-		assert_eq!(first_ciphertext, second_ciphertext);
+		let record = sealed_under(first.client_to_server, b"deterministic derivation");
+		let opened = opened_under(second.client_to_server, &record)?;
+		assert_eq!(opened, b"deterministic derivation");
 		Ok(())
 	}
 

@@ -9,11 +9,10 @@ use std::error::Error;
 use std::sync::Arc;
 
 use crate::cms::cert::IssuerAndSerialNumber;
-use crate::crypto::aead::DecryptContent;
+use crate::crypto::cms::EnvelopeError;
 use crate::crypto::hash::Sha3_256;
 use crate::crypto::key::SigningKeyProvider;
 use crate::crypto::profiles::SecurityProfileDesc;
-use crate::crypto::secret::ToInsecure;
 use crate::crypto::sign::ecdsa::k256::Secp256k1;
 use crate::crypto::sign::elliptic_curve::sec1::ToEncodedPoint;
 use crate::crypto::sign::elliptic_curve::PublicKey;
@@ -224,9 +223,10 @@ async fn a_refused_closing_leaves_the_server_spent<F: TestFlow>() -> Result<(), 
 async fn both_sides_derive_the_same_keys_anonymously<F: TestFlow>() -> Result<(), Box<dyn Error>> {
 	let Established { client_session, server_session, .. } = established::<F>(PeerAuthentication::Anonymous).await;
 
-	let to_client = server_session.keys().send().encrypt_next(b"server to client", None)?;
-	let opened = client_session.keys().recv().decrypt_content(&to_client)?.to_insecure();
-	assert_eq!(opened.as_slice(), b"server to client");
+	let record = server_session.keys().send().encrypt_next(b"server to client".to_vec())?;
+	let mut to_client = record.to_der()?;
+	let opened = client_session.keys().recv().open(&mut to_client)?;
+	assert_eq!(opened, b"server to client");
 	Ok(())
 }
 
@@ -235,9 +235,9 @@ async fn both_sides_derive_the_same_keys_anonymously<F: TestFlow>() -> Result<()
 async fn both_sides_derive_the_same_keys_under_mutual_authentication<F: TestFlow>() -> Result<(), Box<dyn Error>> {
 	let Established { client_session, server_session, .. } = established::<F>(mutual_with(ExpiryValidator)).await;
 
-	let frame = sealed_record(&client_session)?;
-	let opened = server_session.keys().recv().decrypt_content(&frame)?.to_insecure();
-	assert_eq!(opened.as_slice(), RECORD_PLAINTEXT);
+	let mut record = sealed_record(&client_session)?;
+	let opened = server_session.keys().recv().open(&mut record)?;
+	assert_eq!(opened, RECORD_PLAINTEXT);
 	Ok(())
 }
 
@@ -249,13 +249,13 @@ async fn a_recorded_session_does_not_open_under_the_server_static_key<F: TestFlo
 	let established = established::<F>(PeerAuthentication::Anonymous).await;
 	let Established { server_identity, run, client_session, .. } = established;
 
-	let frame = sealed_record(&client_session)?;
+	let record = sealed_record(&client_session)?;
 	let Recovered { observer, .. } = F::recover(&run, &server_identity).await;
 
-	let attempts = observer.record_attempts(&frame)?;
+	let attempts = observer.record_attempts(&record)?;
 	let mut outcomes = attempts.iter();
 	assert_eq!(attempts.len(), F::RECORD_ATTEMPTS);
-	assert!(outcomes.all(|attempt| matches!(attempt, Err(TightBeamError::EncryptionError(_)))));
+	assert!(outcomes.all(|attempt| matches!(attempt, Err(TightBeamError::EnvelopeError(EnvelopeError::KeyUnwrap)))));
 	Ok(())
 }
 

@@ -202,8 +202,8 @@ impl From<TightBeamError> for TransportError {
 			TightBeamError::CertificateValidationError(e) => TransportError::InvalidCertificate(e),
 			#[cfg(feature = "std")]
 			TightBeamError::IoError(e) => TransportError::IoError(e),
-			// Exact-next counter nonces make replay, reorder, and deletion
-			// indistinguishable from tampering. Surface them as such.
+			// An exact-next record sequence makes replay, reorder, and
+			// deletion indistinguishable from tampering. Surface them as such.
 			TightBeamError::NonceReplayed(_) => TransportError::OperationFailed(TransportFailure::TamperDetected),
 			// The receive side hits this only when the peer overran the
 			// per-key volume bound. The session is unusable either way.

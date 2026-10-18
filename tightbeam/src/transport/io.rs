@@ -15,18 +15,18 @@ use core::future::Future;
 use std::sync::Arc;
 
 use crate::asn1::Frame;
-use crate::crypto::aead::DecryptContent;
 use crate::crypto::aead::{RecvCipher, SendCipher};
 use crate::der::{Decode, Encode};
 use crate::encode;
 use crate::policy::TransitStatus;
 use crate::transport::builders::EnvelopeBuilder;
-use crate::transport::envelopes::{TransportEnvelope, WireEnvelope};
+use crate::transport::envelopes::{Arrived, TransportEnvelope, WireEnvelope};
 use crate::transport::error::TransportError;
 use crate::transport::state::EncryptedProtocolState;
 use crate::transport::TransportResult;
 use crate::utils::marker::MaybeSend;
 use crate::utils::time::Clock;
+use crate::zeroize::Zeroizing;
 
 #[cfg(host_clock)]
 use crate::utils::time::SystemClock;
@@ -329,13 +329,16 @@ pub trait EncryptedMessageIO: MessageIO {
 	where
 		Self: EncryptedProtocolState + Sized,
 	{
-		let wire_bytes = self.read_envelope_bytes().await?;
-		let wire_envelope = WireEnvelope::from_der(&wire_bytes)?;
+		// A record opens in the buffer it arrived in, so the buffer wipes when
+		// it drops.
+		let mut wire_bytes = Zeroizing::new(self.read_envelope_bytes().await?);
+		let wire_len = wire_bytes.len();
+		let wire_envelope = WireEnvelope::arrive(&mut wire_bytes)?;
 		let ceiling = match &wire_envelope {
-			WireEnvelope::Cleartext(_) => self.limits().cleartext_envelope,
-			WireEnvelope::Encrypted(_) => self.limits().encrypted_envelope,
+			Arrived::Cleartext(_) => self.limits().cleartext_envelope,
+			Arrived::Encrypted(_) => self.limits().encrypted_envelope,
 		};
-		if wire_bytes.len() > ceiling {
+		if wire_len > ceiling {
 			return Err(TransportError::OperationFailed(TransportFailure::SizeExceeded));
 		}
 
@@ -345,7 +348,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		let established = self.session_state().phase().requires_encryption();
 		let expects_encryption = self.session_state().phase().is_handshake_pending();
 		match wire_envelope {
-			WireEnvelope::Cleartext(envelope) => {
+			Arrived::Cleartext(envelope) => {
 				if established {
 					// Circuit breaker: a cleartext frame on an agreed session
 					// is not the peer this session established (CWE-319).
@@ -368,21 +371,21 @@ pub trait EncryptedMessageIO: MessageIO {
 					Ok(CollectStep::Envelope(envelope))
 				}
 			}
-			WireEnvelope::Encrypted(encrypted_info) => {
+			Arrived::Encrypted(record) => {
 				if !matches!(self.session_state().phase(), SessionPhase::Encrypted(_)) {
 					self.session_state_mut().reset();
 					return Err(TransportError::OperationFailed(TransportFailure::EncryptionFailed));
 				}
 
-				let decrypted_bytes = match self.session_state().decryptor()?.decrypt_content(&encrypted_info) {
-					Ok(bytes) => bytes,
+				let opened = match self.session_state().decryptor()?.open(record) {
+					Ok(content) => content,
 					Err(_) => {
 						self.session_state_mut().reset();
 						return Err(TransportError::OperationFailed(TransportFailure::EncryptionFailed));
 					}
 				};
 
-				let envelope = decrypted_bytes.with(|bytes| Self::decode_envelope(bytes))?;
+				let envelope = Self::decode_envelope(opened)?;
 				Ok(CollectStep::Envelope(envelope))
 			}
 		}
@@ -458,10 +461,12 @@ pub trait EncryptedMessageIO: MessageIO {
 	where
 		Self: EncryptedProtocolState,
 	{
-		let wire_bytes: Vec<u8> = wire_bytes.into();
-		let wire_envelope = WireEnvelope::from_der(&wire_bytes)?;
+		// A record opens in the buffer it arrived in, so the buffer wipes when
+		// it drops.
+		let mut wire_bytes = Zeroizing::new(wire_bytes.into());
+		let wire_envelope = WireEnvelope::arrive(&mut wire_bytes)?;
 		match wire_envelope {
-			WireEnvelope::Cleartext(env) => {
+			Arrived::Cleartext(env) => {
 				// The phase decides the wire mode for both directions, so an
 				// established session refuses an unauthenticated cleartext
 				// answer (CWE-319) and resets, as the inbound collector does.
@@ -472,9 +477,9 @@ pub trait EncryptedMessageIO: MessageIO {
 
 				Ok(env)
 			}
-			WireEnvelope::Encrypted(encrypted_info) => {
-				let decrypted_bytes = self.session_state().decryptor()?.decrypt_content(&encrypted_info)?;
-				decrypted_bytes.with(|bytes| Self::decode_envelope(bytes))
+			Arrived::Encrypted(record) => {
+				let opened = self.session_state().decryptor()?.open(record)?;
+				Self::decode_envelope(opened)
 			}
 		}
 	}
@@ -634,11 +639,11 @@ pub trait EncryptedMessageIO: MessageIO {
 
 		// Step 2: Receive the server response. The read runs under the
 		// handshake ceiling, because the phase is handshaking.
-		let response_wire_bytes = self.read_session_bytes().await?;
-		let response_wire = WireEnvelope::from_der(&response_wire_bytes)?;
+		let mut response_wire_bytes = self.read_session_bytes().await?;
+		let response_wire = WireEnvelope::arrive(&mut response_wire_bytes)?;
 		let response_envelope = match response_wire {
-			WireEnvelope::Cleartext(env) => env,
-			WireEnvelope::Encrypted(_) => {
+			Arrived::Cleartext(env) => env,
+			Arrived::Encrypted(_) => {
 				// A handshake message must travel in cleartext.
 				return Err(TransportError::InvalidMessage);
 			}
@@ -1050,13 +1055,7 @@ mod tests {
 	}
 
 	fn encrypted_phase() -> SessionPhase {
-		use crate::crypto::aead::{Aes256Gcm, DirectionalCiphers, KeyInit};
-
-		let keys = SessionKeys::for_client(DirectionalCiphers {
-			client_to_server: Aes256Gcm::new(&[0u8; 32].into()),
-			server_to_client: Aes256Gcm::new(&[1u8; 32].into()),
-		});
-
+		let keys = SessionKeys::for_client(crate::testing::TestKey::insecure_directional_keys());
 		SessionPhase::Encrypted(Box::new(EstablishedSession::new(keys, None, None, None, None)))
 	}
 

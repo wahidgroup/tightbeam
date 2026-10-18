@@ -13,8 +13,10 @@ use alloc::vec::Vec;
 use std::sync::Arc;
 
 use crate::asn1::Frame;
-use crate::cms::enveloped_data::EncryptedContentInfo;
-use crate::der::{Choice, Decode, Encode, EncodeValue, Length, Reader, Result as DerResult, Tag, Tagged, Writer};
+use crate::der::{
+	Choice, Decode, Encode, EncodeValue, ErrorKind, Header, Length, Reader, Result as DerResult, SliceReader, Tag,
+	TagNumber, Tagged, Writer,
+};
 use crate::policy::TransitStatus;
 use crate::Beamable;
 
@@ -32,7 +34,7 @@ mod multiplex {
 	pub use crate::der::asn1::OctetString;
 	pub use crate::der::Enumerated;
 	pub use crate::der::Sequence;
-	pub use crate::der::{DecodeValue, FixedTag, Header};
+	pub use crate::der::{DecodeValue, FixedTag};
 	pub use crate::urn::Urn;
 }
 
@@ -889,16 +891,95 @@ pub enum TransportEnvelope {
 	Mux(MuxEnvelope),
 }
 
-/// The outermost envelope, in cleartext or in encrypted form.
-#[derive(Choice, Clone, Debug, PartialEq)]
+/// The `[0]` tag of a cleartext wire envelope, which tags its transport
+/// envelope explicitly.
+const CLEARTEXT_TAG: Tag = Tag::ContextSpecific { constructed: true, number: TagNumber::N0 };
+
+/// The `[1]` tag of an encrypted wire envelope, which tags its record
+/// explicitly.
+const RECORD_TAG: Tag = Tag::ContextSpecific { constructed: true, number: TagNumber::N1 };
+
+/// The outermost envelope, in cleartext or in encrypted form: a `CHOICE` of
+/// a transport envelope under `[0]` and a record under `[1]`, each tagged
+/// explicitly. [`WireEnvelope::arrive`] reads it.
+// A wire envelope lives for one encode, so its record stays inline, off the
+// heap, on the hot path.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum WireEnvelope {
 	/// A transport envelope sent without encryption, as handshake containers
 	/// and cleartext endpoints send it.
-	#[asn1(context_specific = "0", constructed = "true")]
 	Cleartext(TransportEnvelope),
-	/// A transport envelope sealed under the session's send cipher.
-	#[asn1(context_specific = "1", constructed = "true")]
-	Encrypted(EncryptedContentInfo),
+	/// A transport envelope sealed under the session's send cipher, as one
+	/// record: an `AuthEnvelopedData` with one `KEKRecipientInfo` under the
+	/// direction's key, whose authenticated attributes carry the record's
+	/// epoch and sequence number.
+	Encrypted(AuthEnvelopedData),
+}
+
+/// The explicit tag wraps the arm's own encoding, so the value is that
+/// encoding whole.
+impl EncodeValue for WireEnvelope {
+	fn value_len(&self) -> DerResult<Length> {
+		match self {
+			Self::Cleartext(envelope) => envelope.encoded_len(),
+			Self::Encrypted(record) => record.encoded_len(),
+		}
+	}
+
+	fn encode_value(&self, writer: &mut impl Writer) -> DerResult<()> {
+		match self {
+			Self::Cleartext(envelope) => envelope.encode(writer),
+			Self::Encrypted(record) => record.encode(writer),
+		}
+	}
+}
+
+/// Each arm names its tag.
+impl Tagged for WireEnvelope {
+	fn tag(&self) -> Tag {
+		match self {
+			Self::Cleartext(_) => CLEARTEXT_TAG,
+			Self::Encrypted(_) => RECORD_TAG,
+		}
+	}
+}
+
+/// A wire envelope as it arrived: a cleartext envelope decoded, or the record
+/// of an encrypted one left in the buffer it arrived in.
+pub enum Arrived<'a> {
+	/// A transport envelope sent without encryption.
+	Cleartext(TransportEnvelope),
+	/// The DER of the record's `AuthEnvelopedData`, a slice of the arrived
+	/// buffer that the session's receive cipher opens in place.
+	Encrypted(&'a mut [u8]),
+}
+
+impl WireEnvelope {
+	/// Read `wire`, the DER of one wire envelope. A cleartext envelope
+	/// decodes, and the record of an encrypted one stays in `wire`, so its
+	/// content opens in the buffer it arrived in.
+	///
+	/// # Errors
+	///
+	/// - The decode error -- `wire` is no wire envelope, or carries bytes past it.
+	pub fn arrive(wire: &mut [u8]) -> DerResult<Arrived<'_>> {
+		let mut reader = SliceReader::new(wire)?;
+		let header = Header::decode(&mut reader)?;
+		reader.read_slice(header.length)?;
+		reader.finish(())?;
+
+		// Both arms tag their value explicitly, so the contents are the
+		// envelope or the record, whole.
+		let start = usize::try_from(header.encoded_len()?)?;
+		let end = start.checked_add(usize::try_from(header.length)?).ok_or(ErrorKind::Overflow)?;
+		let contents = wire.get_mut(start..end).ok_or(ErrorKind::Overflow)?;
+		match header.tag {
+			tag if tag == CLEARTEXT_TAG => Ok(Arrived::Cleartext(TransportEnvelope::from_der(contents)?)),
+			tag if tag == RECORD_TAG => Ok(Arrived::Encrypted(contents)),
+			tag => Err(tag.value_error()),
+		}
+	}
 }
 
 /// Whether an envelope goes out as cleartext or as encrypted bytes.
@@ -1452,5 +1533,50 @@ mod tests {
 		let reserved = [0xA6, 0x04, 0x30, 0x02, 0x04, 0x00];
 		let decoded = TransportEnvelope::from_der(&reserved);
 		assert!(decoded.is_err());
+	}
+
+	/// A cleartext wire envelope is its transport envelope under the
+	/// constructed context tag `[0]`, `0xA0`, tagged explicitly.
+	#[test]
+	fn a_cleartext_wire_envelope_tags_its_envelope_explicitly() -> Result<(), Box<dyn Error>> {
+		let envelope = TransportEnvelope::from(TestFrame::v0(None, None));
+		let inner = envelope.to_der()?;
+		let wire = WireEnvelope::Cleartext(envelope).to_der()?;
+
+		let tag = Tag::ContextSpecific { constructed: true, number: TagNumber::N0 };
+		let header = Header::new(tag, Length::try_from(inner.len())?)?.to_der()?;
+		assert_eq!(wire, [header, inner].concat());
+		Ok(())
+	}
+
+	/// A wire envelope under a tag of neither arm is refused for its tag: a
+	/// transport envelope under the constructed context tag `[2]`, `0xA2`.
+	#[test]
+	fn a_wire_envelope_under_the_unknown_tag_2_is_refused() -> Result<(), Box<dyn Error>> {
+		let inner = TransportEnvelope::from(TestFrame::v0(None, None)).to_der()?;
+		let tag = Tag::ContextSpecific { constructed: true, number: TagNumber::N2 };
+		let header = Header::new(tag, Length::try_from(inner.len())?)?.to_der()?;
+		let mut wire = [header, inner].concat();
+
+		let refused = WireEnvelope::arrive(&mut wire);
+		assert!(matches!(refused, Err(error) if error.kind() == ErrorKind::Value { tag }));
+		Ok(())
+	}
+
+	/// The wire envelope is the whole read, so an octet past an encrypted
+	/// one refuses it before the record reaches a key.
+	#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
+	#[test]
+	fn an_encrypted_wire_envelope_with_a_trailing_octet_is_refused() -> Result<(), Box<dyn Error>> {
+		use crate::crypto::aead::SessionKeys;
+		use crate::testing::TestKey;
+
+		let keys = SessionKeys::for_client(TestKey::insecure_directional_keys());
+		let record = keys.send().encrypt_next(b"record".to_vec())?;
+		let mut wire = [WireEnvelope::Encrypted(record).to_der()?, vec![0x00]].concat();
+
+		let refused = WireEnvelope::arrive(&mut wire);
+		assert!(matches!(refused, Err(error) if matches!(error.kind(), ErrorKind::TrailingData { .. })));
+		Ok(())
 	}
 }

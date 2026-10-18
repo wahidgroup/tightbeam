@@ -29,13 +29,13 @@ mod tokio_rt {
 use tokio_rt::*;
 
 use crate::builder::TypeBuilder;
-use crate::crypto::aead::{DecryptContent, RecvCipher, SendCipher};
+use crate::crypto::aead::{RecvCipher, SendCipher};
 use crate::crypto::profiles::CryptoProvider;
 use crate::der::Decode;
 use crate::der::Encode;
 use crate::policy::GatePolicy;
 use crate::policy::TransitStatus;
-use crate::transport::envelopes::{TransportEnvelope, WireEnvelope};
+use crate::transport::envelopes::{Arrived, TransportEnvelope, WireEnvelope};
 use crate::transport::error::TransportFailure;
 use crate::transport::handshake::BoxedServerHandshake;
 use crate::transport::io::{EnvelopeSink, EnvelopeSource};
@@ -49,6 +49,7 @@ use crate::transport::{
 	WireMode,
 };
 use crate::utils::time::Clock;
+use crate::zeroize::Zeroizing;
 use crate::Frame;
 
 #[cfg(all(
@@ -562,16 +563,19 @@ where
 		#[cfg(not(all(feature = "tokio", feature = "std")))]
 		let wire_bytes = self.stream.read_frame(policy.cap()).await?;
 
-		let wire_envelope = WireEnvelope::from_der(&wire_bytes)?;
+		// A record opens in the buffer it arrived in, so the buffer wipes when
+		// it drops.
+		let mut wire_bytes = Zeroizing::new(wire_bytes);
+		let wire_envelope = WireEnvelope::arrive(&mut wire_bytes)?;
 		match (&self.mode, wire_envelope) {
-			(SplitRecv::Cleartext, WireEnvelope::Cleartext(envelope)) => Ok(envelope),
-			(SplitRecv::Cleartext, WireEnvelope::Encrypted(_)) => {
+			(SplitRecv::Cleartext, Arrived::Cleartext(envelope)) => Ok(envelope),
+			(SplitRecv::Cleartext, Arrived::Encrypted(_)) => {
 				Err(TransportError::OperationFailed(TransportFailure::EncryptionFailed))
 			}
-			(SplitRecv::Encrypted(_), WireEnvelope::Cleartext(_)) => Err(TransportError::MissingEncryption),
-			(SplitRecv::Encrypted(recv_key), WireEnvelope::Encrypted(encrypted_info)) => {
-				let decrypted_bytes = recv_key.decrypt_content(&encrypted_info)?;
-				let envelope = decrypted_bytes.with(|bytes| TransportEnvelope::from_der(bytes))?;
+			(SplitRecv::Encrypted(_), Arrived::Cleartext(_)) => Err(TransportError::MissingEncryption),
+			(SplitRecv::Encrypted(recv_key), Arrived::Encrypted(record)) => {
+				let opened = recv_key.open(record)?;
+				let envelope = TransportEnvelope::from_der(opened)?;
 				Ok(envelope)
 			}
 		}
@@ -612,8 +616,8 @@ where
 /// The exclusive send half of a split transport.
 ///
 /// It carries the wire mode that its session held when it split. An
-/// encrypted half owns the send-direction cipher and its counter nonce, so
-/// encryption needs no locks and can run concurrently with a
+/// encrypted half owns the send-direction cipher and its record sequence,
+/// so encryption needs no locks and can run concurrently with a
 /// [`TransportReader`] on the same connection.
 pub struct TransportWriter<W>
 where
@@ -983,7 +987,7 @@ mod tests {
 
 		use super::super::*;
 		use crate::constants::{DEFAULT_MAX_ENCRYPTED_ENVELOPE, DEFAULT_REKEY_RECORD_LIMIT};
-		use crate::crypto::aead::RuntimeAead;
+		use crate::crypto::aead::{RecordDirection, RuntimeAead};
 		use crate::testing::{TestFrame, TestKey};
 		use crate::utils::time::{ManualClock, SystemClock};
 		use crate::TightBeamError;
@@ -1010,8 +1014,17 @@ mod tests {
 		}
 
 		fn test_runtime() -> RuntimeAead {
-			let (_key, cipher) = TestKey::insecure_fixed_cipher();
-			RuntimeAead::new(cipher)
+			TestKey::insecure_directional_keys().client_to_server
+		}
+
+		/// A client-to-server send cipher of epoch 0.
+		fn test_sender() -> SendCipher {
+			SendCipher::new(test_runtime(), 0, RecordDirection::ClientToServer)
+		}
+
+		/// A client-to-server receive cipher of epoch 0.
+		fn test_receiver() -> RecvCipher {
+			RecvCipher::new(test_runtime(), 0, RecordDirection::ClientToServer)
 		}
 
 		fn writer(mode: SplitSend) -> TransportWriter<NullStream> {
@@ -1080,44 +1093,46 @@ mod tests {
 
 		#[test]
 		fn writer_install_swaps_cipher_and_preserves_limit() -> Result<(), TightBeamError> {
-			let send_cipher = SendCipher::new(test_runtime()).with_rekey_limit(1);
+			let send_cipher = test_sender().with_rekey_limit(1);
 			let mut writer = writer(SplitSend::Encrypted(send_cipher));
 
-			send_key(&writer).encrypt_next(PLAINTEXT, None)?;
+			send_key(&writer).encrypt_next(PLAINTEXT)?;
 			assert_eq!(writer.remaining_records(), 0);
 
 			// The install brings a fresh key and a reset counter, and the
 			// configured record limit survives it.
-			let fresh_send = SendCipher::new(test_runtime());
+			let fresh_send = test_sender();
 			writer.install_send_cipher(fresh_send)?;
 			assert_eq!(writer.remaining_records(), 1);
 
-			send_key(&writer).encrypt_next(PLAINTEXT, None)?;
+			send_key(&writer).encrypt_next(PLAINTEXT)?;
 			Ok(())
 		}
 
 		#[test]
 		fn reader_install_swaps_cipher_and_preserves_threshold() -> Result<(), TightBeamError> {
-			let sender = SendCipher::new(test_runtime());
-			let record_zero = sender.encrypt_next(PLAINTEXT, None)?;
-			let recv_cipher = RecvCipher::new(test_runtime()).with_rekey_limit(2);
+			let sender = test_sender();
+			let record_zero = sender.encrypt_next(PLAINTEXT)?.to_der()?;
+			let recv_cipher = test_receiver().with_rekey_limit(2);
 			let mut reader = reader(SplitRecv::Encrypted(recv_cipher));
 
-			recv_key(&reader).decrypt_content(&record_zero)?;
+			let mut first = record_zero.clone();
+			recv_key(&reader).open(&mut first)?;
 
-			let replay = recv_key(&reader).decrypt_content(&record_zero);
+			let mut replayed = record_zero.clone();
+			let replay = recv_key(&reader).open(&mut replayed);
 			assert!(replay.is_err());
 			assert_eq!(reader.remaining_records(), 1);
 
-			// Only a fresh key restarts the exact-next counter
-			// (NIST SP 800-38D § 8.2.1). The renewal threshold survives the
-			// install.
-			let fresh_recv = RecvCipher::new(test_runtime());
+			// Only a fresh key restarts the exact-next sequence. The renewal
+			// threshold survives the install.
+			let fresh_recv = test_receiver();
 			reader.install_recv_cipher(fresh_recv)?;
 
 			assert_eq!(reader.remaining_records(), 2);
 
-			recv_key(&reader).decrypt_content(&record_zero)?;
+			let mut reopened = record_zero;
+			recv_key(&reader).open(&mut reopened)?;
 			Ok(())
 		}
 
@@ -1127,9 +1142,9 @@ mod tests {
 		#[test]
 		fn writer_install_bounds_the_fresh_cipher_by_the_envelope_ceiling() -> Result<(), TightBeamError> {
 			let limits = doubled_ceiling();
-			let current = SendCipher::new(test_runtime()).with_envelope_ceiling(limits.encrypted_envelope);
+			let current = test_sender().with_envelope_ceiling(limits.encrypted_envelope);
 			let mut writer = writer_under(SplitSend::Encrypted(current), limits);
-			writer.install_send_cipher(SendCipher::new(test_runtime()))?;
+			writer.install_send_cipher(test_sender())?;
 
 			let raised = writer.with_rekey_limit(u64::MAX);
 			assert_eq!(raised.remaining_records(), DEFAULT_REKEY_RECORD_LIMIT / 2);
@@ -1201,8 +1216,8 @@ mod tests {
 
 		#[test]
 		fn cleartext_halves_fail_closed() {
-			let send_cipher = SendCipher::new(test_runtime());
-			let recv_cipher = RecvCipher::new(test_runtime());
+			let send_cipher = test_sender();
+			let recv_cipher = test_receiver();
 
 			let writer_install = writer(SplitSend::Cleartext).install_send_cipher(send_cipher);
 			assert!(matches!(writer_install, Err(TransportError::MissingEncryption)));

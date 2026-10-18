@@ -4,9 +4,9 @@
 //!
 //! A KEM recipient is one [`KemRecipient`]: the recipient key beside the
 //! `rid` that names it. A sender builds one from a certificate admitted for
-//! key agreement, and an opener holds one inside the
-//! [`KeyAgreementIdentity`] that pairs it with the backend of its private
-//! key.
+//! key agreement, or from a bare key with [`KemRecipient::bare`]. An opener
+//! holds one inside a [`KemKeyHolder`], a [`KeyAgreementIdentity`] or a
+//! [`BareKemKey`], which pairs it with the backend of its private key.
 
 #[cfg(not(feature = "std"))]
 use alloc::{sync::Arc, vec::Vec};
@@ -16,9 +16,8 @@ use std::sync::Arc;
 use core::fmt;
 
 use crate::cms::content_info::CmsVersion;
-use crate::cms::enveloped_data::{
-	KekIdentifier, KekRecipientInfo, OtherRecipientInfo, RecipientIdentifier, RecipientInfo, RecipientInfos,
-};
+use crate::cms::enveloped_data::{OtherRecipientInfo, RecipientIdentifier, RecipientInfo, RecipientInfos};
+use crate::crypto::cms::kek;
 use crate::crypto::cms::{CmsOriForKemOtherInfo, EnvelopeError, KemRecipientInfo};
 use crate::crypto::common::typenum::Unsigned;
 use crate::crypto::kdf::KdfFunction;
@@ -26,24 +25,22 @@ use crate::crypto::key::KeyBackend;
 use crate::crypto::profiles::{CryptoProvider, KeyWrapAlgorithm};
 use crate::crypto::x509::error::CertificateValidationError;
 use crate::crypto::x509::ext::pkix::KeyUsages;
-use crate::crypto::x509::utils::CertificateExt;
+use crate::crypto::x509::ext::pkix::SubjectKeyIdentifier;
+use crate::crypto::x509::utils::{CertificateExt, Skid};
 use crate::crypto::x509::{KeyAgreement, PeerCertificate};
 use crate::der::asn1::{ObjectIdentifier, OctetString};
 use crate::der::oid::AssociatedOid;
 use crate::der::{Any, Decode, Encode};
 use crate::oids::ORI_KEM;
 use crate::random::CryptoRngCore;
-use crate::spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoRef};
-use crate::utils::marker::MaybeSendFuture;
+use crate::spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoOwned, SubjectPublicKeyInfoRef};
+use crate::utils::marker::{MaybeSend, MaybeSendFuture, MaybeSync};
 use crate::x509::Certificate;
 use crate::ZeroizingBytes;
 
 /// The length in octets of the random octets that follow the purpose label
 /// in a `ukm`.
 pub(super) const UKM_RANDOM_SIZE: usize = 32;
-
-/// A content key, wiped where it drops.
-pub(super) type ContentKey = ZeroizingBytes;
 
 /// The output of `Encap(pkR)` (RFC 9180 §4): the shared secret, and the
 /// `kemct` that carries it to the holder of the private key.
@@ -73,8 +70,8 @@ pub trait RecipientKem {
 	const USAGE: KeyUsages;
 
 	/// The recipient's public key, parsed once from a SubjectPublicKeyInfo.
-	/// [`KeyAgreementIdentity::new`] compares it with the public half of a
-	/// backend.
+	/// [`KeyAgreementIdentity::new`] and [`BareKemKey::new`] compare it with
+	/// the public half of a backend.
 	type PublicKey: Clone + PartialEq + Send + Sync + 'static;
 
 	/// The private-key operation `Decap` runs through, as a trait object a
@@ -129,6 +126,37 @@ impl<K: RecipientKem> KemRecipient<K> {
 		let rid = certificate.certificate().recipient_identifier()?;
 		Ok(Self { key: certificate.key, rid })
 	}
+
+	/// The recipient of a bare key, from the DER of its SubjectPublicKeyInfo,
+	/// named by the RFC 7093 §2 method 1 identifier of the key as the
+	/// `subjectKeyIdentifier` form of the `rid`.
+	///
+	/// The identifier hashes the key as `spki` encodes it, so a recipient
+	/// publishes the SubjectPublicKeyInfo its backend emits, and the
+	/// [`BareKemKey`] of its decryptor then names the same `rid`.
+	///
+	/// # Errors
+	///
+	/// - [`EnvelopeError::Encoding`] -- `spki` is no DER SubjectPublicKeyInfo.
+	/// - [`EnvelopeError::Certificate`] -- the key is no key of `K`.
+	pub fn bare(spki: impl AsRef<[u8]>) -> Result<Self, EnvelopeError> {
+		let spki = spki.as_ref();
+		let key = K::public_key(SubjectPublicKeyInfoRef::from_der(spki)?)?;
+		Self::named(key, spki)
+	}
+
+	/// `key`, named by the RFC 7093 §2 method 1 identifier of the key `spki`,
+	/// its SubjectPublicKeyInfo, encodes.
+	///
+	/// # Errors
+	///
+	/// - [`EnvelopeError::Encoding`] -- `spki` is no DER SubjectPublicKeyInfo.
+	fn named(key: K::PublicKey, spki: &[u8]) -> Result<Self, EnvelopeError> {
+		let owned = SubjectPublicKeyInfoOwned::from_der(spki)?;
+		let identifier = SubjectKeyIdentifier::try_from(Skid::of_public_key(&owned))?;
+		let rid = RecipientIdentifier::SubjectKeyIdentifier(identifier);
+		Ok(Self { key, rid })
+	}
 }
 
 impl<K: RecipientKem> Clone for KemRecipient<K> {
@@ -147,10 +175,9 @@ impl<K: RecipientKem> fmt::Debug for KemRecipient<K> {
 /// A key-agreement certificate beside the backend that holds its private
 /// key, under the KEM `K`.
 ///
-/// [`Self::new`] is the one place the certificate, its key, and the backend
-/// are checked against each other, and it reads the `rid` once. An
-/// [`Opener::Kem`] holds one, so the key that decapsulates is the key the
-/// `rid` names. Every clone shares the one checked value.
+/// [`Self::new`] checks the certificate, its key, and the backend against
+/// each other once, so the key that decapsulates is the key the `rid` names.
+/// Every clone shares the one checked value.
 pub struct KeyAgreementIdentity<K: RecipientKem> {
 	parts: Arc<IdentityParts<K>>,
 }
@@ -182,14 +209,9 @@ impl<K: RecipientKem> KeyAgreementIdentity<K> {
 	pub fn new(certificate: impl Into<Arc<Certificate>>, key: Arc<K::PrivateKey>) -> Result<Self, EnvelopeError> {
 		let certificate = certificate.into();
 		let admitted = PeerCertificate::<KeyAgreement<K>>::own(Arc::clone(&certificate))?;
-
-		let spki = key.to_public_key_bytes()?;
-		let backend = K::public_key(SubjectPublicKeyInfoRef::from_der(&spki)?)?;
-		if backend != admitted.key {
-			return Err(EnvelopeError::KeyMismatch);
-		}
-
 		let recipient = KemRecipient::from_certificate(admitted)?;
+		checked_pair::<K>(&recipient.key, &key)?;
+
 		Ok(Self { parts: Arc::new(IdentityParts { certificate, key, recipient }) })
 	}
 
@@ -202,11 +224,6 @@ impl<K: RecipientKem> KeyAgreementIdentity<K> {
 	/// its `rid`.
 	pub fn recipient(&self) -> &KemRecipient<K> {
 		&self.parts.recipient
-	}
-
-	/// The backend of the certificate's private key.
-	fn key(&self) -> &K::PrivateKey {
-		&self.parts.key
 	}
 }
 
@@ -228,31 +245,113 @@ impl<K: RecipientKem> fmt::Debug for KeyAgreementIdentity<K> {
 	}
 }
 
-/// The wrap of every recipient under `P`, the provider's key wrap, with
-/// parameters absent (RFC 3565 §2.3.2).
-fn wrap_algorithm<P: CryptoProvider>() -> AlgorithmIdentifierOwned {
-	let oid = <<P::KeyWrap as KeyWrapAlgorithm>::Oid as AssociatedOid>::OID;
-	AlgorithmIdentifierOwned { oid, parameters: None }
+/// The recipient key and the private key that answers for it, lent to an
+/// opener as the one pair a constructor checked.
+///
+/// [`KeyAgreementIdentity::new`] and [`BareKemKey::new`] are the two
+/// constructors, and each compares the backend's public half with the
+/// recipient key, so the trait is sealed.
+pub trait KemKeyHolder<K: RecipientKem>: sealed::Sealed + MaybeSend + MaybeSync {
+	/// The recipient key and the `rid` that names it.
+	fn recipient(&self) -> &KemRecipient<K>;
+
+	/// The backend that runs the KEM's private-key operation for the
+	/// recipient key.
+	fn key(&self) -> &K::PrivateKey;
 }
 
-/// Wrap `content_key` under `kek` with the provider's key wrap.
+mod sealed {
+	/// The seal of [`KemKeyHolder`](super::KemKeyHolder), implemented by its
+	/// two holders alone.
+	pub trait Sealed {}
+}
+
+impl<K: RecipientKem> sealed::Sealed for KeyAgreementIdentity<K> {}
+
+impl<K: RecipientKem> KemKeyHolder<K> for KeyAgreementIdentity<K> {
+	fn recipient(&self) -> &KemRecipient<K> {
+		&self.parts.recipient
+	}
+
+	fn key(&self) -> &K::PrivateKey {
+		&self.parts.key
+	}
+}
+
+/// A bare recipient key beside the backend of its private key, for a frame
+/// decryptor that names its recipient by the key alone. The `rid` is the RFC
+/// 7093 §2 method 1 identifier of the key, as [`KemRecipient::bare`] names
+/// it.
+pub struct BareKemKey<K: RecipientKem> {
+	/// The backend of the private key.
+	key: Arc<K::PrivateKey>,
+	/// The public key and its `rid`.
+	recipient: KemRecipient<K>,
+}
+
+impl<K: RecipientKem> BareKemKey<K> {
+	/// Pair `public` with `key`, the backend of its private half.
+	///
+	/// # Errors
+	///
+	/// - [`EnvelopeError::Key`] -- the backend fails to return its public key.
+	/// - [`EnvelopeError::Encoding`] -- the backend's key is no DER SubjectPublicKeyInfo.
+	/// - [`EnvelopeError::Certificate`] -- the backend's key is no key of `K`.
+	/// - [`EnvelopeError::KeyMismatch`] -- the backend's key differs from `public`.
+	pub fn new(public: K::PublicKey, key: Arc<K::PrivateKey>) -> Result<Self, EnvelopeError> {
+		let spki = checked_pair::<K>(&public, &key)?;
+		let recipient = KemRecipient::named(public, &spki)?;
+
+		Ok(Self { key, recipient })
+	}
+}
+
+impl<K: RecipientKem> sealed::Sealed for BareKemKey<K> {}
+
+impl<K: RecipientKem> KemKeyHolder<K> for BareKemKey<K> {
+	fn recipient(&self) -> &KemRecipient<K> {
+		&self.recipient
+	}
+
+	fn key(&self) -> &K::PrivateKey {
+		&self.key
+	}
+}
+
+/// The SubjectPublicKeyInfo the backend `key` emits, once the key it holds
+/// is `public`, compared as keys of `K`. Both holders of a pair run this one
+/// check.
 ///
 /// # Errors
 ///
-/// - [`EnvelopeError::Key`] -- the wrap refused `kek` or the content key.
-pub(super) fn wrap_key<P: CryptoProvider>(kek: &[u8], content_key: &[u8]) -> Result<Vec<u8>, EnvelopeError> {
-	Ok(P::KeyWrap::wrap(kek, content_key)?)
+/// - [`EnvelopeError::Key`] -- the backend fails to return its public key.
+/// - [`EnvelopeError::Encoding`] -- the backend's key is no DER SubjectPublicKeyInfo.
+/// - [`EnvelopeError::Certificate`] -- the backend's key is no key of `K`.
+/// - [`EnvelopeError::KeyMismatch`] -- the backend's key differs from `public`.
+fn checked_pair<K: RecipientKem>(public: &K::PublicKey, key: &K::PrivateKey) -> Result<Vec<u8>, EnvelopeError> {
+	let spki = key.to_public_key_bytes()?;
+	let backend = K::public_key(SubjectPublicKeyInfoRef::from_der(&spki)?)?;
+	if backend != *public {
+		return Err(EnvelopeError::KeyMismatch);
+	}
+
+	Ok(spki)
 }
 
-/// Unwrap `wrapped` under `kek` with the provider's key wrap.
-///
-/// # Errors
-///
-/// - [`EnvelopeError::KeyUnwrap`] -- `wrapped` fails the integrity check, or a length.
-pub(super) fn unwrap_key<P: CryptoProvider>(kek: &[u8], wrapped: &[u8]) -> Result<ContentKey, EnvelopeError> {
-	// A length or an integrity failure both leave the key wrapped, which is
-	// the one refusal of RFC 3394 §2.2.3.
-	P::KeyWrap::unwrap(kek, wrapped).map_err(|_| EnvelopeError::KeyUnwrap)
+/// A clone shares the backend.
+impl<K: RecipientKem> Clone for BareKemKey<K> {
+	fn clone(&self) -> Self {
+		Self { key: Arc::clone(&self.key), recipient: self.recipient.clone() }
+	}
+}
+
+/// The `rid` names the key, and the backend stays out of the output.
+impl<K: RecipientKem> fmt::Debug for BareKemKey<K> {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.debug_struct("BareKemKey")
+			.field("rid", &self.recipient.rid)
+			.finish_non_exhaustive()
+	}
 }
 
 /// The KEM of every `KEMRecipientInfo` under `P`, with parameters absent.
@@ -300,21 +399,12 @@ impl<K: RecipientKem> Recipient<'_, K> {
 	/// - [`EnvelopeError::Encoding`] -- the identifier fails to encode.
 	pub(super) fn wrap<P: CryptoProvider<Kem = K>>(
 		&self,
-		content_key: &ContentKey,
+		content_key: &[u8],
 		rng: &mut dyn CryptoRngCore,
 	) -> Result<RecipientInfo, EnvelopeError> {
 		match self {
 			Self::Kem { recipient, ukm_label } => Self::wrap_kem::<P>(recipient, ukm_label, content_key, rng),
-			Self::Kek { kek, key_identifier } => {
-				let kek_identifier = OctetString::new(*key_identifier)?;
-				let kek_id = KekIdentifier { kek_identifier, date: None, other: None };
-				let encrypted_key = OctetString::new(wrap_key::<P>(kek, content_key)?)?;
-				let version = CmsVersion::V4;
-				let key_enc_alg = wrap_algorithm::<P>();
-
-				let kek = KekRecipientInfo { version, kek_id, key_enc_alg, encrypted_key };
-				Ok(RecipientInfo::Kekri(kek))
-			}
+			Self::Kek { kek, key_identifier } => kek::wrap_kek::<P::KeyWrap>(kek, key_identifier, content_key),
 		}
 	}
 
@@ -331,7 +421,7 @@ impl<K: RecipientKem> Recipient<'_, K> {
 	fn wrap_kem<P: CryptoProvider<Kem = K>>(
 		recipient: &KemRecipient<K>,
 		ukm_label: &[u8],
-		content_key: &ContentKey,
+		content_key: &[u8],
 		rng: &mut dyn CryptoRngCore,
 	) -> Result<RecipientInfo, EnvelopeError> {
 		// 1. Encapsulate to the recipient key under the provider's KEM, and
@@ -344,9 +434,10 @@ impl<K: RecipientKem> Recipient<'_, K> {
 		// 2. Derive the key-encryption key from the shared secret alone, and
 		//    wrap the content key under it (RFC 9629 §5, §7).
 		let kek_length = <<P::KeyWrap as KeyWrapAlgorithm>::KekSize as Unsigned>::U16;
-		let other_info = CmsOriForKemOtherInfo { wrap: wrap_algorithm::<P>(), kek_length, ukm: Some(ukm.clone()) };
+		let wrap = kek::wrap_algorithm::<P::KeyWrap>();
+		let other_info = CmsOriForKemOtherInfo { wrap: wrap.clone(), kek_length, ukm: Some(ukm.clone()) };
 		let kek = other_info.derive_kek::<P::Kdf>(&shared_secret)?;
-		let encrypted_key = OctetString::new(wrap_key::<P>(&kek, content_key)?)?;
+		let encrypted_key = OctetString::new(P::KeyWrap::wrap(&kek, content_key)?)?;
 
 		// 3. Carry the KEM ciphertext, under the `rid` that names the recipient.
 		let kem = KemRecipientInfo {
@@ -357,7 +448,7 @@ impl<K: RecipientKem> Recipient<'_, K> {
 			kdf: kdf_algorithm::<P>(),
 			kek_length,
 			ukm: Some(ukm),
-			wrap: wrap_algorithm::<P>(),
+			wrap,
 			encrypted_key,
 		};
 
@@ -372,9 +463,9 @@ pub enum Opener<'a, K: RecipientKem> {
 	/// The holder of the key of a `KEMRecipientInfo`, which admits a `ukm` of
 	/// `ukm_label` followed by 32 octets alone.
 	Kem {
-		/// The identity whose certificate the sender encapsulated to. Its
-		/// backend runs the decapsulation.
-		identity: &'a KeyAgreementIdentity<K>,
+		/// The identity or bare key whose recipient key the sender
+		/// encapsulated to. Its backend runs the decapsulation.
+		identity: &'a dyn KemKeyHolder<K>,
 		/// The purpose label the `ukm` must lead with.
 		ukm_label: &'a [u8],
 	},
@@ -389,8 +480,9 @@ pub enum Opener<'a, K: RecipientKem> {
 }
 
 impl<K: RecipientKem> Opener<'_, K> {
-	/// Unwrap the content key from `recipient_infos` under the algorithms of
-	/// `P`. They must hold one recipient of this opener's kind.
+	/// Unwrap the content key from `recipient_infos` into `content_key`, which
+	/// takes it whole, under the algorithms of `P`. They must hold one
+	/// recipient of this opener's kind.
 	///
 	/// This is the one decision on the kind of a `RecipientInfo`.
 	///
@@ -403,25 +495,28 @@ impl<K: RecipientKem> Opener<'_, K> {
 	pub(super) async fn unwrap<P: CryptoProvider<Kem = K>>(
 		&self,
 		recipient_infos: &RecipientInfos,
-	) -> Result<ContentKey, EnvelopeError> {
-		let [recipient] = recipient_infos.0.as_slice() else {
-			return Err(EnvelopeError::RecipientKind);
-		};
+		content_key: &mut [u8],
+	) -> Result<(), EnvelopeError> {
+		match self {
+			Self::Kem { identity, ukm_label } => {
+				let RecipientInfo::Ori(other) = kek::sole(recipient_infos)? else {
+					return Err(EnvelopeError::RecipientKind);
+				};
+				if other.ori_type != ORI_KEM {
+					return Err(EnvelopeError::RecipientKind);
+				}
 
-		match (self, recipient) {
-			(Self::Kem { identity, ukm_label }, RecipientInfo::Ori(other)) if other.ori_type == ORI_KEM => {
 				let kem = other.ori_value.decode_as::<KemRecipientInfo>()?;
-				Self::unwrap_kem::<P>(identity, ukm_label, &kem).await
+				Self::unwrap_kem::<P>(*identity, ukm_label, &kem, content_key).await
 			}
-			(Self::Kek { kek, key_identifier }, RecipientInfo::Kekri(kek_info)) => {
-				Self::unwrap_kek::<P>(kek, key_identifier, kek_info)
+			Self::Kek { kek, key_identifier } => {
+				kek::unwrap_kek::<P::KeyWrap>(kek, key_identifier, recipient_infos, content_key)
 			}
-			_ => Err(EnvelopeError::RecipientKind),
 		}
 	}
 
-	/// Unwrap the content key of `kem` through the backend of `identity`
-	/// under the KEM, the KDF, and the wrap of `P`.
+	/// Unwrap the content key of `kem` into `content_key` through the backend
+	/// of `identity` under the KEM, the KDF, and the wrap of `P`.
 	///
 	/// Every field is checked before the backend runs, so a refused recipient
 	/// costs the backend no operation.
@@ -438,10 +533,11 @@ impl<K: RecipientKem> Opener<'_, K> {
 	/// - [`EnvelopeError::Kdf`] -- the KDF refused the key-encryption key.
 	/// - [`EnvelopeError::KeyUnwrap`] -- the wrapped content key fails its integrity check.
 	async fn unwrap_kem<P: CryptoProvider<Kem = K>>(
-		identity: &KeyAgreementIdentity<K>,
+		identity: &dyn KemKeyHolder<K>,
 		ukm_label: &[u8],
 		kem: &KemRecipientInfo,
-	) -> Result<ContentKey, EnvelopeError> {
+		content_key: &mut [u8],
+	) -> Result<(), EnvelopeError> {
 		// 1. Hold every field to the provider's algorithms before the backend runs.
 		let recipient = identity.recipient();
 		if kem.version != CmsVersion::V0 {
@@ -451,8 +547,9 @@ impl<K: RecipientKem> Opener<'_, K> {
 			return Err(EnvelopeError::RecipientIdentifier);
 		}
 
+		let wrap = kek::wrap_algorithm::<P::KeyWrap>();
 		let named = kem.kem == kem_algorithm::<P>() && kem.kdf == kdf_algorithm::<P>();
-		if !named || kem.wrap != wrap_algorithm::<P>() {
+		if !named || kem.wrap != wrap {
 			return Err(EnvelopeError::RecipientAlgorithm);
 		}
 
@@ -471,41 +568,9 @@ impl<K: RecipientKem> Opener<'_, K> {
 
 		// 3. Derive the key-encryption key from the shared secret alone, and
 		//    unwrap the content key under it.
-		let wrap = wrap_algorithm::<P>();
 		let other_info = CmsOriForKemOtherInfo { wrap, kek_length, ukm: Some(ukm.clone()) };
 		let kek = other_info.derive_kek::<P::Kdf>(&shared_secret)?;
-		unwrap_key::<P>(&kek, kem.encrypted_key.as_bytes())
-	}
-
-	/// Unwrap the content key of `kek_info` under `kek` and the wrap of the
-	/// provider.
-	///
-	/// # Errors
-	///
-	/// - [`EnvelopeError::RecipientVersion`] -- the version is not 4.
-	/// - [`EnvelopeError::KeyIdentifier`] -- the `kekid` names another key.
-	/// - [`EnvelopeError::RecipientAlgorithm`] -- the key wrap is another than the provider's.
-	/// - [`EnvelopeError::KeyUnwrap`] -- the wrapped content key fails its integrity check.
-	fn unwrap_kek<P: CryptoProvider>(
-		kek: &[u8],
-		key_identifier: &[u8],
-		kek_info: &KekRecipientInfo,
-	) -> Result<ContentKey, EnvelopeError> {
-		if kek_info.version != CmsVersion::V4 {
-			return Err(EnvelopeError::RecipientVersion((kek_info.version, CmsVersion::V4).into()));
-		}
-
-		let kek_id = &kek_info.kek_id;
-		let bare = kek_id.date.is_none() && kek_id.other.is_none();
-		let named = kek_id.kek_identifier.as_bytes() == key_identifier && bare;
-		if !named {
-			return Err(EnvelopeError::KeyIdentifier);
-		}
-		if kek_info.key_enc_alg != wrap_algorithm::<P>() {
-			return Err(EnvelopeError::RecipientAlgorithm);
-		}
-
-		unwrap_key::<P>(kek, kek_info.encrypted_key.as_bytes())
+		kek::unwrap_key::<P::KeyWrap>(&kek, kem.encrypted_key.as_bytes(), content_key)
 	}
 }
 

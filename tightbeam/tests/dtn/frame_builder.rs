@@ -9,7 +9,6 @@ use tightbeam::{
 	builder::{frame::FrameBuilder, TypeBuilder},
 	compress::ZstdCompression,
 	crypto::{
-		aead::Aes256Gcm,
 		hash::Sha3_256,
 		sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey},
 	},
@@ -19,6 +18,7 @@ use tightbeam::{
 };
 
 use crate::dtn::{
+	certs::SharedCipher,
 	chain_processor::ChainProcessor,
 	fault_matrix::FaultMatrix,
 	messages::{CommandAck, EarthCommand, FrameRequest, FrameResponse, RelayMessage, RoverTelemetry, StatelessAck},
@@ -36,7 +36,7 @@ macro_rules! apply_common_builder_patterns {
 			.with_message_hasher::<Sha3_256>([])
 			.with_witness_hasher::<Sha3_256>()
 			.with_compression(ZstdCompression::default())
-			.with_aead($cipher.to_owned())
+			.with_encryptor($cipher.to_owned())
 			.with_signer::<Secp256k1Signature, _>(tightbeam::testing::TestIdentity::certified($signing_key.to_owned()));
 
 		// Set previous_frame if not the first frame
@@ -69,7 +69,7 @@ impl FrameBuilderHelper {
 		next_order: u64,
 		previous_digest: Option<DigestInfo>,
 		signing_key: &Secp256k1SigningKey,
-		cipher: &Aes256Gcm,
+		cipher: &SharedCipher,
 	) -> Result<Frame, TightBeamError> {
 		let relay_message = RelayMessage::FrameRequest(request);
 		let builder = FrameBuilder::from(Version::V3)
@@ -89,7 +89,7 @@ impl FrameBuilderHelper {
 		next_order: u64,
 		previous_digest: Option<DigestInfo>,
 		signing_key: &Secp256k1SigningKey,
-		cipher: &Aes256Gcm,
+		cipher: &SharedCipher,
 	) -> Result<Frame, TightBeamError> {
 		let relay_message = RelayMessage::FrameResponse(response);
 		let builder = FrameBuilder::from(Version::V3)
@@ -109,7 +109,7 @@ impl FrameBuilderHelper {
 		next_order: u64,
 		previous_digest: Option<DigestInfo>,
 		signing_key: &Secp256k1SigningKey,
-		cipher: &Aes256Gcm,
+		cipher: &SharedCipher,
 	) -> Result<Frame, TightBeamError> {
 		let relay_message = RelayMessage::Command(command.to_owned());
 		let builder = FrameBuilder::from(Version::V3)
@@ -130,7 +130,7 @@ impl FrameBuilderHelper {
 		next_order: u64,
 		previous_digest: Option<DigestInfo>,
 		signing_key: &Secp256k1SigningKey,
-		cipher: &Aes256Gcm,
+		cipher: &SharedCipher,
 	) -> Result<Frame, TightBeamError> {
 		let ack = CommandAck { command_order };
 		let relay_message = RelayMessage::CommandAck(ack);
@@ -152,7 +152,7 @@ impl FrameBuilderHelper {
 		next_order: u64,
 		previous_digest: Option<DigestInfo>,
 		signing_key: &Secp256k1SigningKey,
-		cipher: &Aes256Gcm,
+		cipher: &SharedCipher,
 	) -> Result<Frame, TightBeamError> {
 		let matrix_dyn = MatrixDyn::try_from(fault_matrix)?;
 		let relay_message = RelayMessage::Telemetry(telemetry);

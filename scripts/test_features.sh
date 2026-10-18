@@ -59,11 +59,11 @@ fi
 
 echo "=== Feature Combination Tests ==="
 
-echo "[1/16] Check: every feature on its own (cargo hack --each-feature)"
+echo "[1/17] Check: every feature on its own (cargo hack --each-feature)"
 cargo hack check --package tightbeam-rs --each-feature --no-dev-deps \
 	--exclude-features tcp,async-transport,tokio
 
-echo "[2/16] Check: the excluded features still refuse to build alone"
+echo "[2/17] Check: the excluded features still refuse to build alone"
 for feature in tcp async-transport tokio; do
 	if cargo check --package tightbeam-rs --no-default-features --features "$feature" >/dev/null 2>&1; then
 		echo "  FAIL: '$feature' now builds alone. Drop it from --exclude-features in step 1." >&2
@@ -72,53 +72,58 @@ for feature in tcp async-transport tokio; do
 	echo "  ok: $feature refuses to build without a handshake protocol"
 done
 
-echo "[3/16] Check: the protocol-requiring features with a protocol"
+echo "[3/17] Check: the protocol-requiring features with a protocol"
 cargo check --package tightbeam-rs --no-default-features --features "std,tcp,async-transport,tokio,transport-hpke"
 
-echo "[4/16] Check: Transport Full + TCP + Async"
+echo "[4/17] Check: Transport Full + TCP + Async"
 cargo check --package tightbeam-rs --no-default-features --features "std,transport-cms,transport-hpke,tcp,tokio,testing"
 
-echo "[5/16] Check: Transport CMS + Derive"
+echo "[5/17] Check: Transport CMS + Derive"
 cargo check --package tightbeam-rs --no-default-features --features "std,transport-cms,testing"
 
-echo "[6/16] Check: Testing CSP/FDR"
+echo "[6/17] Check: Testing CSP/FDR"
 cargo check --package tightbeam-rs --no-default-features --features "std,transport-cms,testing,testing-csp,testing-fdr"
 
-echo "[7/16] Check: Testing Timing"
+echo "[7/17] Check: Testing Timing"
 cargo check --package tightbeam-rs --no-default-features --features "std,transport-cms,testing,testing-csp,testing-timing,testing-schedulability"
 
-echo "[8/16] Test: Consumer expansion under a narrow and a wide selection"
+echo "[8/17] Test: Consumer expansion under a narrow and a wide selection"
 for selection in narrow wide; do
 	cargo test --manifest-path "$ROOT/consumers/expansion/Cargo.toml" \
 		--target-dir "$ROOT/target/probe-expansion" \
 		--no-default-features --features "$selection"
 done
 
-echo "[9/16] Test: Consumer macro expansions"
+echo "[9/17] Test: Consumer macro expansions"
 cargo test --package tightbeam-consumer-test
 
-echo "[10/16] Test: Consumer on tightbeam default features"
+echo "[10/17] Test: Consumer on tightbeam default features"
 cargo test --manifest-path "$ROOT/consumers/default/Cargo.toml" \
 	--target-dir "$ROOT/target/probe-default"
 
-echo "[11/16] Check: Transport CMS"
+echo "[11/17] Check: Transport CMS"
 cargo check --package tightbeam-rs --no-default-features --features "std,transport-cms,testing"
 
-echo "[12/16] Check: Transport HPKE"
+echo "[12/17] Check: Transport HPKE"
 cargo check --package tightbeam-rs --no-default-features --features "std,transport-hpke,testing"
 
-echo "[13/16] Check: Transport CMS-only + TCP + Async"
+echo "[13/17] Check: Transport CMS-only + TCP + Async"
 cargo check --package tightbeam-rs --no-default-features --features "std,transport-cms,tcp,tokio,testing"
 
-echo "[14/16] Test: Sync server stack (std + tcp + HPKE, no tokio)"
+echo "[14/17] Test: Sync server stack (std + tcp + HPKE, no tokio)"
 cargo test --manifest-path "$ROOT/consumers/sync/Cargo.toml" \
 	--target-dir "$ROOT/target/probe-sync"
 
-echo "[15/16] Test: Crate defaults plus the dev feature set"
+echo "[15/17] Test: Crate defaults plus the dev feature set"
 cargo test --package tightbeam-rs
 
-echo "[16/16] Test: Workspace all features"
+echo "[16/17] Test: Workspace all features"
 cargo test --workspace --all-features
+
+# The KEM recipients build under `hpke` and `signature`, and DHKEM needs the
+# ECDH of the `ecdh` feature, which `hpke` enables.
+echo "[17/17] Check: KEM recipients (hpke + signature)"
+cargo check --package tightbeam-rs --no-default-features --features "hpke,signature"
 
 # wasm32 browser transport core: async-transport compiles the generic
 # AsyncProtocolStream + TcpTransport without tokio.

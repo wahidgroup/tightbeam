@@ -4,8 +4,8 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
+use crate::asn1::{AuthEnvelopedData, WireDer};
 use crate::builder::error::BuildError;
-use crate::cms::enveloped_data::EncryptedContentInfo;
 use crate::matrix::MatrixDyn;
 use crate::{CompressedData, DigestInfo, MessagePriority, Metadata, Version};
 
@@ -16,7 +16,7 @@ pub struct MetadataBuilder {
 	pub(crate) order: Option<u64>,
 	pub(crate) integrity: Option<DigestInfo>,
 	pub(crate) compactness: Option<CompressedData>,
-	pub(crate) confidentiality: Option<EncryptedContentInfo>,
+	pub(crate) confidentiality: Option<WireDer<AuthEnvelopedData>>,
 	pub(crate) priority: Option<MessagePriority>,
 	pub(crate) lifetime: Option<u64>,
 	pub(crate) previous_frame: Option<DigestInfo>,
@@ -70,8 +70,9 @@ impl MetadataBuilder {
 		self
 	}
 
-	/// Set the encryption information
-	pub fn with_confidentiality_info(mut self, encryption: EncryptedContentInfo) -> Self {
+	/// Set the envelope of the encrypted body, its ciphertext detached into
+	/// the message, beside the DER it encodes as.
+	pub fn with_confidentiality_info(mut self, encryption: WireDer<AuthEnvelopedData>) -> Self {
 		self.confidentiality = Some(encryption);
 		self
 	}

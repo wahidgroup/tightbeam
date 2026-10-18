@@ -95,6 +95,18 @@ pub const TIGHTBEAM_C2S_KDF_INFO: &[u8] = b"tb/session/kdf/c2s/v1";
 /// KDF info string for the server-to-client session key (HKDF).
 pub const TIGHTBEAM_S2C_KDF_INFO: &[u8] = b"tb/session/kdf/s2c/v1";
 
+/// Domain label that leads the `kekid` of every record, ahead of the
+/// big-endian epoch of the directional key the record seals under.
+///
+/// Each directional key is the key-encryption key of its records, and the
+/// epoch names the renewal that derived it.
+///
+/// # Sources
+///
+/// - RFC 5652 § 6.2.3, the `kekid` of a key both ends hold:
+///   <https://datatracker.ietf.org/doc/html/rfc5652#section-6.2.3>
+pub const TIGHTBEAM_RECORD_KEY_ID_DOMAIN: &[u8] = b"tb/session/record/kekid/v1";
+
 /// KDF info string for the epoch secret retained for in-band rekeying.
 ///
 /// The label separates the epoch chain from the traffic keys.
@@ -121,6 +133,19 @@ pub const TIGHTBEAM_EPOCH_KDF_INFO: &[u8] = b"tb/session/kdf/epoch/v1";
 /// - RFC 9629 § 3 and § 5, the `ukm` and the KDF input:
 ///   <https://datatracker.ietf.org/doc/html/rfc9629#section-5>
 pub const TIGHTBEAM_OPENING_UKM_LABEL: &[u8] = b"tb/handshake/opening/ukm/v1";
+
+/// The purpose label that leads the `ukm` of the `KEMRecipientInfo` of a
+/// frame sealed to a recipient key, ahead of the 32 random octets the seal
+/// draws for itself.
+///
+/// A frame decryptor admits this label alone, so a KEM seal of another
+/// purpose, such as the CMS opening, does not open as a frame.
+///
+/// # Sources
+///
+/// - RFC 9629 § 3 and § 5, the `ukm` and the KDF input:
+///   <https://datatracker.ietf.org/doc/html/rfc9629#section-5>
+pub const TIGHTBEAM_FRAME_UKM_LABEL: &[u8] = b"tb/frame/ukm/v1";
 
 /// Domain label the CMS server Finished signs ahead of the transcript hash.
 pub const TIGHTBEAM_SERVER_FINISHED_DOMAIN: &[u8] = b"tb/handshake/finished/server/v1";
@@ -179,9 +204,6 @@ const _: () = assert!(prefix_free(TIGHTBEAM_SERVER_FINISHED_DOMAIN, TIGHTBEAM_CL
 /// the salt must carry at least this many bytes of randomness.
 pub const MIN_SALT_ENTROPY_BYTES: usize = 16;
 
-/// The HPKE `info` of a frame sealed to a recipient key (RFC 9180 § 5.1).
-pub const TIGHTBEAM_HPKE_FRAME_INFO: &[u8] = b"tb/hpke/frame/v1";
-
 /// Maximum HKDF output size in bytes for one dual-key expansion.
 pub const MAX_HKDF_OUTPUT_SIZE: usize = 128;
 
@@ -224,13 +246,16 @@ const TLS_FULL_SIZE_RECORD_BYTES: u64 = 1 << 14;
 /// intact (2^24, RFC 9846 § 5.5).
 const AES_GCM_FULL_SIZE_RECORDS_PER_KEY: u64 = 1 << 24;
 
-/// Bytes one AES-GCM key admits with its safety margin intact: 2^24
-/// full-size TLS records, which is 2^38 bytes (RFC 9846 § 5.5).
-pub(crate) const AES_GCM_VOLUME_BYTES_PER_KEY: u64 = AES_GCM_FULL_SIZE_RECORDS_PER_KEY * TLS_FULL_SIZE_RECORD_BYTES;
+/// The renewal volume of one directional key: 2^24 full-size TLS records,
+/// which is 2^38 bytes (RFC 9846 § 5.5). Each record runs under a fresh
+/// content key (RFC 5084 § 3.2), so this volume is the renewal trigger of the
+/// key that wraps them.
+pub(crate) const RENEWAL_VOLUME_BYTES: u64 = AES_GCM_FULL_SIZE_RECORDS_PER_KEY * TLS_FULL_SIZE_RECORD_BYTES;
 
-/// AEAD records one directional key admits at an encrypted-envelope ceiling
-/// of `encrypted_envelope` bytes: [`AES_GCM_VOLUME_BYTES_PER_KEY`] divided
-/// by the ceiling. A ceiling of zero counts as one byte.
+/// Records one directional key wraps before its renewal at an
+/// encrypted-envelope ceiling of `encrypted_envelope` bytes:
+/// [`RENEWAL_VOLUME_BYTES`] divided by the ceiling. A ceiling of zero
+/// counts as one byte.
 ///
 /// # Sources
 ///
@@ -242,14 +267,14 @@ pub(crate) const fn rekey_record_limit(encrypted_envelope: usize) -> u64 {
 		encrypted_envelope as u64
 	};
 
-	AES_GCM_VOLUME_BYTES_PER_KEY / envelope
+	RENEWAL_VOLUME_BYTES / envelope
 }
 
-/// AEAD record limit per directional key before a rekey is required.
+/// Record limit per directional key before a rekey is required.
 ///
 /// It is the record limit at [`DEFAULT_MAX_ENCRYPTED_ENVELOPE`]: 2^20
 /// records of up to 256 KiB, which keeps the per-key volume inside the
-/// AES-GCM bound. A session at a raised ceiling holds a lower limit. The
+/// renewal volume. A session at a raised ceiling holds a lower limit. The
 /// limit keeps room for one renewal exchange up to a 2 GiB ceiling (128
 /// records) and loses it at 4 GiB (64 records).
 ///
@@ -258,8 +283,9 @@ pub(crate) const fn rekey_record_limit(encrypted_envelope: usize) -> u64 {
 /// - Senders fail closed with `RekeyRequired` at their configured limit.
 /// - Receipt-bearing mux sessions renew in band first.
 /// - Other sessions drain via GoAway.
-/// - Receivers refuse a counter at or past this constant, at any ceiling.
-/// - Receivers refuse a record that takes the bytes one key opened past the AES-GCM volume.
+/// - Receivers refuse a sequence number at or past this constant, at any ceiling.
+/// - Receivers refuse a record that takes the bytes one key opened past the renewal volume.
+/// - Both receive-side refusals are the crate's own renewal policy. RFC 9846 § 5.5 sets the sender's limit.
 /// - `with_rekey_limit` overrides the renewal and drain trigger. Both receive-side refusals stay fixed.
 ///
 /// # Sources

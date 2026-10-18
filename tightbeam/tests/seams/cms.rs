@@ -10,11 +10,10 @@
 //! the outside KEM, and the provider's signature, digest, KDF, AEAD, and key
 //! wrap run the rest of the flow.
 
-use tightbeam::crypto::aead::DecryptContent;
 use tightbeam::crypto::k256::ecdsa::SigningKey;
-use tightbeam::crypto::secret::ToInsecure;
 use tightbeam::crypto::sign::SigningIdentity;
 use tightbeam::crypto::x509::KeyPurposes;
+use tightbeam::der::Encode;
 use tightbeam::oids::{HASH_SHA3_512, SIGNER_ECDSA_WITH_SHA3_512};
 use tightbeam::random::OsRng;
 use tightbeam::testing::TestCmsServer;
@@ -84,9 +83,9 @@ async fn an_outside_provider_runs_the_cms_flow() -> Result<(), Box<dyn std::erro
 	let client_session = client.complete()?;
 	let server_session = server.complete()?;
 
-	let record = client_session.keys().send().encrypt_next(CONTENT, None)?;
-	let opened = server_session.keys().recv().decrypt_content(&record)?;
-	assert_eq!(opened.to_insecure().as_slice(), CONTENT);
+	let mut record = client_session.keys().send().encrypt_next(CONTENT)?.to_der()?;
+	let opened = server_session.keys().recv().open(&mut record)?;
+	assert_eq!(opened, CONTENT);
 	Ok(())
 }
 

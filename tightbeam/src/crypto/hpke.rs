@@ -12,8 +12,9 @@
 //! - The KDF runs the key schedule.
 //! - The AEAD seals the message.
 //!
-//! [`HpkeSecp256k1Sha3Aes256Gcm`] is the suite of the default provider:
-//! DHKEM(secp256k1, HKDF-SHA3-256), HKDF-SHA3-256, and AES-256-GCM.
+//! [`HpkeSecp256k1Sha256Aes256Gcm`] is the house suite, the registered one:
+//! DHKEM(secp256k1, HKDF-SHA256), HKDF-SHA256, and AES-256-GCM. A suite is a
+//! type parameter, so an implementor brings its own suite to every operation.
 //!
 //! # Operations
 //!
@@ -39,16 +40,20 @@
 //! [RFC 9180 §7][rfc9180-7] gives each KEM, KDF, and AEAD a 16-bit identifier
 //! from an [IANA registry][iana-hpke].
 //!
-//! - The two AEAD values are registered.
-//! - [`KEM_DHKEM_SECP256K1_HKDF_SHA3_256`] and [`KDF_HKDF_SHA3_256`] are this
-//!   crate's own, because the registry holds no value for HKDF-SHA3-256 or for
-//!   a DHKEM that derives with it.
-//! - Both enter the labels of every derivation, so another value derives other keys.
-//! - The KEM takes its sizes from DHKEM(secp256k1, HKDF-SHA256), the registered
-//!   KEM `0x0016` ([draft-wahby-cfrg-hpke-kem-secp256k1-01][wahby]): `Nsecret`
-//!   is 32, and `Nenc`, `Npk`, and `Nsk` are 65, 65, and 32.
+//! - Every identifier of the house suite is registered: KEM `0x0016`, KDF `0x0001`, and AEAD `0x0002`.
+//! - The identifiers enter the labels of every derivation, so another value derives other keys.
+//! - The KEM `0x0016` is DHKEM(secp256k1, HKDF-SHA256)
+//!   ([draft-wahby-cfrg-hpke-kem-secp256k1-01][wahby]): `Nsecret` is 32, and
+//!   `Nenc`, `Npk`, and `Nsk` are 65, 65, and 32.
 //! - [`DhKemSecp256k1`] is that registered KEM under [`HkdfSha256`], as a KEM
 //!   alone. A CMS `KEMRecipientInfo` derives its key from its shared secret.
+//!
+//! ## Frames
+//!
+//! [`HpkeEncryptor`] and [`HpkeDecryptor`] seal and open a frame to a
+//! recipient key as an `AuthEnvelopedData` with a `KEMRecipientInfo`
+//! (RFC 9629), under the KEM, the KDF, the key wrap, and the AEAD of a
+//! provider.
 //!
 //! # Sources
 //!
@@ -70,44 +75,53 @@ use core::marker::PhantomData;
 
 #[cfg(all(not(feature = "std"), feature = "x509", feature = "signature", feature = "ecdh"))]
 use alloc::boxed::Box;
+#[cfg(all(not(feature = "std"), feature = "x509", feature = "signature", feature = "ecdh"))]
+use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
+#[cfg(all(feature = "std", feature = "x509", feature = "signature", feature = "ecdh"))]
+use std::sync::Arc;
 
 use crate::constants::EC_PUBKEY_UNCOMPRESSED_SIZE;
 use crate::crypto::aead::{Aead, AeadCore, Aes128Gcm, Aes256Gcm, KeyInit, Nonce, Payload};
 use crate::crypto::common::typenum::{Unsigned, U32};
 use crate::crypto::common::KeySizeUser;
-use crate::crypto::hash::Sha3_256;
 use crate::crypto::hkdf::{Hkdf, InvalidLength};
 use crate::crypto::k256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
 use crate::crypto::k256::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey, SecretKey};
 use crate::crypto::k256::sha2::Sha256;
 use crate::crypto::k256::Secp256k1;
-use crate::crypto::kdf::{EcdhSecret, HkdfSha3_256, KdfError};
+use crate::crypto::kdf::{EcdhSecret, KdfError};
 use crate::crypto::secret::{Secret, SecretSlice};
 use crate::random::{CryptoRngCore, OsRng, RngWrapper};
 use crate::zeroize::{Zeroize, Zeroizing};
 use crate::Errorizable;
 use crate::ZeroizingBytes;
 
-#[cfg(feature = "x509")]
-use crate::asn1::ObjectIdentifier;
-#[cfg(feature = "x509")]
-use crate::constants::TIGHTBEAM_HPKE_FRAME_INFO;
 #[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
-use crate::crypto::cms::{Encapsulation, EnvelopeError, RecipientKem};
+use crate::asn1::{AuthEnvelopedData, ObjectIdentifier};
+#[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
+use crate::constants::TIGHTBEAM_FRAME_UKM_LABEL;
+#[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
+use crate::crypto::aead::{AeadAlgorithm, CheckedContent, Decryptor, Encryptor};
+#[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
+use crate::crypto::cms::{
+	ContentEncryption, Encapsulation, EnvelopeError, KemKeyHolder, KemRecipient, Opener, Recipient, RecipientKem,
+};
 #[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
 use crate::crypto::key::DiffieHellman;
+#[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
+use crate::crypto::profiles::CryptoProvider;
 #[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
 use crate::crypto::x509::error::CertificateValidationError;
 #[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
 use crate::crypto::x509::ext::pkix::KeyUsages;
 #[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
 use crate::crypto::x509::EllipticCurvePoint;
-#[cfg(feature = "x509")]
+#[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
 use crate::der::oid::AssociatedOid;
 #[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
-use crate::oids::DHKEM_SECP256K1;
+use crate::oids::{DATA, DHKEM_SECP256K1};
 #[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
 use crate::spki::SubjectPublicKeyInfoRef;
 #[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
@@ -133,18 +147,6 @@ pub const AEAD_AES_128_GCM: u16 = 0x0001;
 ///
 /// [rfc9180-7.3]: https://datatracker.ietf.org/doc/html/rfc9180#section-7.3
 pub const AEAD_AES_256_GCM: u16 = 0x0002;
-
-/// DHKEM(secp256k1, HKDF-SHA3-256), under this crate's own KEM identifier.
-///
-/// The IANA registry holds no value for this KEM, and it has no range for
-/// private use. This value sits in the unassigned range.
-pub const KEM_DHKEM_SECP256K1_HKDF_SHA3_256: u16 = 0xFF16;
-
-/// HKDF-SHA3-256, under this crate's own KDF identifier.
-///
-/// The IANA registry holds no value for this KDF, and it has no range for
-/// private use. This value sits in the unassigned range.
-pub const KDF_HKDF_SHA3_256: u16 = 0xFF01;
 
 /// DHKEM(secp256k1, HKDF-SHA256) in the HPKE KEM registry
 /// ([draft-wahby-cfrg-hpke-kem-secp256k1-01][wahby]).
@@ -177,26 +179,6 @@ pub trait HpkeKdf {
 	///
 	/// - [`KdfError::DerivationFailed`] -- `prk` is shorter than `Nh`, or `len` is past the KDF's bound.
 	fn expand(prk: &[u8], info: &[u8], len: usize) -> core::result::Result<ZeroizingBytes, KdfError>;
-}
-
-impl HpkeKdf for HkdfSha3_256 {
-	const KDF_ID: u16 = KDF_HKDF_SHA3_256;
-
-	const EXTRACT_SIZE: usize = 32;
-
-	fn extract(salt: &[u8], ikm: &[u8]) -> ZeroizingBytes {
-		let (mut extracted, _) = Hkdf::<Sha3_256>::extract(Some(salt), ikm);
-		let prk = Zeroizing::new(extracted.to_vec());
-		extracted.as_mut_slice().zeroize();
-		prk
-	}
-
-	fn expand(prk: &[u8], info: &[u8], len: usize) -> core::result::Result<ZeroizingBytes, KdfError> {
-		let keyed = Hkdf::<Sha3_256>::from_prk(prk).map_err(|_| KdfError::DerivationFailed(InvalidLength))?;
-		let mut okm = Zeroizing::new(vec![0u8; len]);
-		keyed.expand(info, &mut okm).map_err(KdfError::DerivationFailed)?;
-		Ok(okm)
-	}
 }
 
 /// HKDF-SHA256 ([RFC 5869][rfc5869]), the KDF of the registered DHKEM on
@@ -295,11 +277,10 @@ where
 	const KEM_ID: u16 = KEM_ID;
 }
 
-/// DHKEM(secp256k1, HKDF-SHA3-256), HKDF-SHA3-256, and AES-256-GCM.
-///
-/// The KEM and KDF identifiers of this suite are this crate's own. See
-/// [`KEM_DHKEM_SECP256K1_HKDF_SHA3_256`] and [`KDF_HKDF_SHA3_256`].
-pub type HpkeSecp256k1Sha3Aes256Gcm = DhKemSuite<Secp256k1, HkdfSha3_256, Aes256Gcm, KEM_DHKEM_SECP256K1_HKDF_SHA3_256>;
+/// DHKEM(secp256k1, HKDF-SHA256), HKDF-SHA256, and AES-256-GCM: the
+/// registered suite (KEM `0x0016`, KDF `0x0001`, AEAD `0x0002`), and the house
+/// one.
+pub type HpkeSecp256k1Sha256Aes256Gcm = DhKemSuite<Secp256k1, HkdfSha256, Aes256Gcm, KEM_DHKEM_SECP256K1_HKDF_SHA256>;
 
 /// An error from an HPKE operation.
 #[derive(Errorizable, Debug, Clone)]
@@ -917,166 +898,115 @@ impl From<&crate::crypto::k256::SecretKey> for SecretSlice<u8> {
 	}
 }
 
-#[cfg(feature = "x509")]
-crate::define_oid_wrapper!(
-	/// The OID of [`HpkeSecp256k1Sha3Aes256Gcm`] in base mode.
-	HpkeSecp256k1Sha3Aes256GcmOid,
-	crate::oids::HPKE_SECP256K1_SHA3_256_AES_256_GCM
-);
-
-/// Seals messages to a recipient's secp256k1 public key with HPKE.
+/// Seals a frame to a recipient key as an `AuthEnvelopedData` with one
+/// `KEMRecipientInfo` (RFC 9629 §3), under the KEM of the provider `P`.
 ///
-/// It implements [`Encryptor`](crate::crypto::aead::Encryptor), so
-/// [`FrameBuilder::with_encryptor`] accepts it for asymmetric message
-/// encryption.
+/// - Every algorithm comes from `P`: its KEM, its KDF, its key wrap, and its AEAD.
+/// - It implements [`Encryptor`] under the AEAD of `P`.
+/// - [`FrameBuilder::with_encryptor`] therefore admits it for a frame of `P`'s profile.
 ///
 /// # Example
 ///
 /// ```
+/// use std::sync::Arc;
+///
 /// use tightbeam::crypto::aead::{DecryptContent, Encryptor};
+/// use tightbeam::crypto::cms::{BareKemKey, KemRecipient};
 /// use tightbeam::crypto::hpke::{HpkeDecryptor, HpkeEncryptor};
-/// use tightbeam::crypto::k256::SecretKey;
-/// use tightbeam::crypto::secret::ToInsecure;
+/// use tightbeam::crypto::k256::{PublicKey, Secp256k1};
+/// use tightbeam::crypto::key::{DiffieHellman, KeyBackend, Secp256k1KeyProvider};
+/// use tightbeam::crypto::profiles::DefaultCryptoProvider;
+/// use tightbeam::der::Encode;
 /// use tightbeam::random::OsRng;
+/// use tightbeam::SigningKey;
 ///
-/// let recipient = SecretKey::random(&mut OsRng);
-/// let encryptor = HpkeEncryptor::new(recipient.public_key());
-/// let info = encryptor.encrypt_content(b"hello", [], None)?;
+/// let signing_key = SigningKey::random(&mut OsRng);
+/// let public = PublicKey::from(signing_key.verifying_key());
+/// let backend: Arc<dyn DiffieHellman<Secp256k1>> = Arc::new(Secp256k1KeyProvider::from(signing_key));
+/// let recipient = KemRecipient::bare(backend.to_public_key_bytes()?)?;
 ///
-/// let decryptor = HpkeDecryptor::new(recipient);
-/// let plaintext = decryptor.decrypt_content(&info)?.to_insecure();
-/// assert_eq!(&plaintext[..], b"hello");
-/// # Ok::<(), tightbeam::TightBeamError>(())
+/// let encryptor = HpkeEncryptor::<DefaultCryptoProvider>::new(recipient);
+/// let mut sealed = encryptor.encrypt_content(b"hello".to_vec(), None, None)?;
+/// let mut content = sealed.take_content()?;
+/// let arrived = sealed.to_der()?;
+///
+/// let decryptor = HpkeDecryptor::<DefaultCryptoProvider>::new(BareKemKey::new(public, backend)?);
+/// let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+/// runtime.block_on(decryptor.decrypt_content(&sealed, &arrived, &mut content))?;
+/// assert_eq!(&content[..], b"hello");
+/// # Ok::<(), Box<dyn core::error::Error>>(())
 /// ```
 ///
 /// [`FrameBuilder::with_encryptor`]: crate::builder::FrameBuilder::with_encryptor
-#[cfg(feature = "x509")]
-pub struct HpkeEncryptor {
-	recipient_pubkey: PublicKey<Secp256k1>,
+#[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
+pub struct HpkeEncryptor<P: CryptoProvider> {
+	recipient: KemRecipient<P::Kem>,
 }
 
-#[cfg(feature = "x509")]
-impl HpkeEncryptor {
-	/// Create an HPKE encryptor for `recipient_pubkey`.
-	pub fn new(recipient_pubkey: impl Into<PublicKey<Secp256k1>>) -> Self {
-		Self { recipient_pubkey: recipient_pubkey.into() }
-	}
-
-	/// Create an encryptor from SEC1-encoded public key bytes.
-	///
-	/// # Errors
-	///
-	/// - [`HpkeError::InvalidPublicKey`] -- `bytes` fails SEC1 decoding, or it is off the curve.
-	pub fn from_bytes(bytes: impl AsRef<[u8]>) -> Result<Self> {
-		let parsed = PublicKey::<Secp256k1>::from_sec1_bytes(bytes.as_ref());
-		let pubkey = parsed.map_err(HpkeError::InvalidPublicKey)?;
-		Ok(Self::new(pubkey))
+#[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
+impl<P: CryptoProvider> HpkeEncryptor<P> {
+	/// Create an encryptor that seals to `recipient`, the recipient key and
+	/// the `rid` that names it.
+	pub fn new(recipient: KemRecipient<P::Kem>) -> Self {
+		Self { recipient }
 	}
 }
 
-#[cfg(feature = "x509")]
-impl crate::crypto::aead::Encryptor<HpkeSecp256k1Sha3Aes256GcmOid> for HpkeEncryptor {
+/// The `ukm` of the seal is the frame purpose label followed by 32 octets the
+/// seal draws, which the decryptor admits alone.
+#[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
+impl<P> Encryptor<<P::AeadCipher as AeadAlgorithm>::Oid> for HpkeEncryptor<P>
+where
+	P: CryptoProvider<AeadCipher: ContentEncryption>,
+{
 	fn encrypt_content(
 		&self,
-		data: impl AsRef<[u8]>,
-		_nonce: impl AsRef<[u8]>,
+		content: impl Into<Vec<u8>>,
 		content_type: Option<ObjectIdentifier>,
-	) -> crate::error::Result<crate::EncryptedContentInfo> {
-		let recipient = &self.recipient_pubkey;
-		let sealed = recipient.seal::<HpkeSecp256k1Sha3Aes256Gcm>(TIGHTBEAM_HPKE_FRAME_INFO, b"", data, None)?;
-
-		// The encrypted content holds the full HPKE message, which is the
-		// encapsulated key followed by the ciphertext.
-		let encrypted_bytes = sealed.to_bytes();
-		let content_type = content_type.unwrap_or(crate::oids::DATA);
-
-		// The algorithm carries no nonce parameter and `_nonce` goes unread,
-		// because the key schedule derives the nonce.
-		let oid = HpkeSecp256k1Sha3Aes256GcmOid::OID;
-		let content_enc_alg = crate::AlgorithmIdentifier { oid, parameters: None };
-		let encrypted_content = Some(crate::der::asn1::OctetString::new(encrypted_bytes)?);
-
-		Ok(crate::EncryptedContentInfo { content_type, content_enc_alg, encrypted_content })
+		rng: Option<&mut dyn CryptoRngCore>,
+	) -> crate::error::Result<AuthEnvelopedData> {
+		let recipient = Recipient::Kem { recipient: &self.recipient, ukm_label: TIGHTBEAM_FRAME_UKM_LABEL };
+		let content_type = content_type.unwrap_or(DATA);
+		Ok(AuthEnvelopedData::seal::<P>(recipient, content_type, content, [], rng)?)
 	}
 }
 
-/// Opens HPKE messages with the recipient's secp256k1 secret key.
+/// Opens a frame sealed to a recipient key, through the
+/// [`KemKeyHolder`] that pairs the key with the backend of its private half:
+/// a [`KeyAgreementIdentity`](crate::crypto::cms::KeyAgreementIdentity) or a
+/// [`BareKemKey`](crate::crypto::cms::BareKemKey).
 ///
-/// It implements [`Decryptor`](crate::crypto::aead::Decryptor), so a frame
-/// decrypts with it through [`Frame::decrypt`](crate::Frame::decrypt).
-///
-/// See [`HpkeEncryptor`] for a round trip.
-#[cfg(feature = "x509")]
-pub struct HpkeDecryptor {
-	secret_key: SecretKey<Secp256k1>,
+/// It implements [`Decryptor`], and the key stays behind the backend, which
+/// runs the KEM's private-key operation.
+#[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
+pub struct HpkeDecryptor<P: CryptoProvider> {
+	holder: Arc<dyn KemKeyHolder<P::Kem>>,
 }
 
-#[cfg(feature = "x509")]
-impl HpkeDecryptor {
-	/// Create an HPKE decryptor that holds `secret_key`.
-	pub fn new(secret_key: impl Into<SecretKey<Secp256k1>>) -> Self {
-		Self { secret_key: secret_key.into() }
+#[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
+impl<P: CryptoProvider> HpkeDecryptor<P> {
+	/// Create a decryptor that opens through `holder`.
+	pub fn new(holder: impl KemKeyHolder<P::Kem> + 'static) -> Self {
+		Self { holder: Arc::new(holder) }
 	}
 }
 
-#[cfg(feature = "x509")]
-impl crate::crypto::aead::Decryptor for HpkeDecryptor {
+/// The decryptor admits a `ukm` of the frame purpose label alone, and the
+/// content type the envelope's attributes authenticate.
+#[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
+impl<P> Decryptor for HpkeDecryptor<P>
+where
+	P: CryptoProvider<AeadCipher: ContentEncryption>,
+{
 	fn algorithm_oid(&self) -> ObjectIdentifier {
-		HpkeSecp256k1Sha3Aes256GcmOid::OID
+		<<P::AeadCipher as AeadAlgorithm>::Oid as AssociatedOid>::OID
 	}
 
-	fn open(&self, content: crate::crypto::aead::CheckedContent<'_>) -> crate::error::Result<SecretSlice<u8>> {
-		let encrypted_bytes = content
-			.info()
-			.encrypted_content
-			.as_ref()
-			.ok_or(crate::TightBeamError::MissingEncryptionInfo)?
-			.as_bytes();
-
-		let message = HpkeMessage::<HpkeSecp256k1Sha3Aes256Gcm>::from_bytes(encrypted_bytes)?;
-		Ok(self.secret_key.open(&message, TIGHTBEAM_HPKE_FRAME_INFO, b"")?)
-	}
-}
-
-/// An HPKE decryptor driven by a precomputed `DH(skR, pkE)` output.
-///
-/// It pairs with [`HpkeMessage::encapsulated_key`] and an async key-agreement
-/// backend (`DiffieHellman::agree`) so the recipient private key
-/// can stay inside an HSM, a KMS, or a secure enclave. It opens the suite that
-/// [`HpkeSecp256k1Sha3Aes256GcmOid`] names.
-#[cfg(feature = "x509")]
-pub struct HpkeSharedSecretDecryptor {
-	shared_secret: EcdhSecret,
-	recipient_pubkey: PublicKey<Secp256k1>,
-}
-
-#[cfg(feature = "x509")]
-impl HpkeSharedSecretDecryptor {
-	/// Build a decryptor from a precomputed DH output and the public key of
-	/// the recipient that computed it.
-	pub fn new(shared_secret: EcdhSecret, recipient_pubkey: impl Into<PublicKey<Secp256k1>>) -> Self {
-		Self { shared_secret, recipient_pubkey: recipient_pubkey.into() }
-	}
-}
-
-#[cfg(feature = "x509")]
-impl crate::crypto::aead::Decryptor for HpkeSharedSecretDecryptor {
-	fn algorithm_oid(&self) -> ObjectIdentifier {
-		HpkeSecp256k1Sha3Aes256GcmOid::OID
-	}
-
-	fn open(&self, content: crate::crypto::aead::CheckedContent<'_>) -> crate::error::Result<SecretSlice<u8>> {
-		let encrypted_bytes = content
-			.info()
-			.encrypted_content
-			.as_ref()
-			.ok_or(crate::TightBeamError::MissingEncryptionInfo)?
-			.as_bytes();
-
-		let message = HpkeMessage::<HpkeSecp256k1Sha3Aes256Gcm>::from_bytes(encrypted_bytes)?;
-		let shared_secret = self.shared_secret.duplicate();
-		let recipient = &self.recipient_pubkey;
-		Ok(shared_secret.open(recipient, &message, TIGHTBEAM_HPKE_FRAME_INFO, b"")?)
+	fn open<'a>(&'a self, content: CheckedContent<'a>) -> MaybeSendFuture<'a, crate::error::Result<()>> {
+		Box::pin(async move {
+			let opener = Opener::Kem { identity: &*self.holder, ukm_label: TIGHTBEAM_FRAME_UKM_LABEL };
+			content.open::<P>(&opener).await
+		})
 	}
 }
 
@@ -1090,8 +1020,8 @@ mod tests {
 	use crate::testing::{unhex, SeededStream};
 	use aead::{AeadInPlace, Tag};
 
-	/// The suite of the default provider.
-	type Suite = HpkeSecp256k1Sha3Aes256Gcm;
+	/// The house suite.
+	type Suite = HpkeSecp256k1Sha256Aes256Gcm;
 
 	const INFO: &[u8] = b"tb/hpke/test";
 
@@ -1122,26 +1052,26 @@ mod tests {
 	/// DHKEM(secp256k1, HKDF-SHA256), HKDF-SHA256, AES-256-GCM.
 	type RegisteredAes256 = DhKemSuite<Secp256k1, HkdfSha256, Aes256Gcm, KEM_DHKEM_SECP256K1_HKDF_SHA256>;
 
-	/// HKDF-SHA3-256 under another KEM identifier, and `LEN_SHIFT` bytes away
+	/// HKDF-SHA256 under another KEM identifier, and `LEN_SHIFT` bytes away
 	/// from a 12-byte request, as a relabeled or a faulty provider KDF is.
 	struct AlteredKdf<const KEM_SHIFT: u16, const LEN_SHIFT: i8>;
 
 	impl<const KEM_SHIFT: u16, const LEN_SHIFT: i8> HpkeKdf for AlteredKdf<KEM_SHIFT, LEN_SHIFT> {
-		const KDF_ID: u16 = KDF_HKDF_SHA3_256;
+		const KDF_ID: u16 = KDF_HKDF_SHA256;
 		const EXTRACT_SIZE: usize = 32;
 
 		fn extract(salt: &[u8], ikm: &[u8]) -> ZeroizingBytes {
-			HkdfSha3_256::extract(salt, ikm)
+			HkdfSha256::extract(salt, ikm)
 		}
 
 		fn expand(prk: &[u8], info: &[u8], len: usize) -> core::result::Result<ZeroizingBytes, KdfError> {
 			let shift = isize::from(LEN_SHIFT) * isize::from(len == 12);
-			HkdfSha3_256::expand(prk, info, len.saturating_add_signed(shift))
+			HkdfSha256::expand(prk, info, len.saturating_add_signed(shift))
 		}
 	}
 
 	/// The algorithms of [`Suite`] under another KEM identifier.
-	type Relabeled = DhKemSuite<Secp256k1, HkdfSha3_256, Aes256Gcm, { KEM_DHKEM_SECP256K1_HKDF_SHA3_256 + 1 }>;
+	type Relabeled = DhKemSuite<Secp256k1, HkdfSha256, Aes256Gcm, { KEM_DHKEM_SECP256K1_HKDF_SHA256 + 1 }>;
 
 	/// A KDF with no bound on its output, so the two-byte length frame of
 	/// `LabeledExpand` is the one refusal a long request meets.
@@ -1152,7 +1082,7 @@ mod tests {
 		const EXTRACT_SIZE: usize = 32;
 
 		fn extract(salt: &[u8], ikm: &[u8]) -> ZeroizingBytes {
-			HkdfSha3_256::extract(salt, ikm)
+			HkdfSha256::extract(salt, ikm)
 		}
 
 		fn expand(_prk: &[u8], _info: &[u8], len: usize) -> core::result::Result<ZeroizingBytes, KdfError> {
@@ -1201,28 +1131,14 @@ mod tests {
 		base_nonce: "d4d0dcfeeb6767d808f319e4",
 	};
 
-	/// The keys and the `info` of [`AES_256_GCM_VECTOR`] under [`Suite`]. An
-	/// independent implementation of RFC 9180 over HKDF-SHA3-256 computed the
-	/// three derived values, after it reproduced both published vectors.
-	const SHA3_SUITE_VECTOR: Vector = Vector {
-		shared_secret: "928f056b2e9e4ffc60c202f140bccc2c8ca2b532ddd7ab04aaa289163311ab11",
-		key: "a7b027a95f1670f92223d499bd37b3b82f9979436a6e341e5536b4b236c81d2b",
-		base_nonce: "28a60f79b7e449790ab1cf16",
-		..AES_256_GCM_VECTOR
-	};
-
 	/// The associated data and the plaintext of the sealed known answers.
 	const KNOWN_AAD: &[u8] = b"tb/hpke/test/aad";
 	const KNOWN_PLAINTEXT: &[u8] = b"known answer";
 
 	/// What [`AES_256_GCM_VECTOR`] seals [`KNOWN_PLAINTEXT`] to under
-	/// [`KNOWN_AAD`], from the same independent implementation and an
-	/// independent AES-GCM.
+	/// [`KNOWN_AAD`], from an independent implementation of RFC 9180 that
+	/// reproduced both published vectors, and an independent AES-GCM.
 	const REGISTERED_CIPHERTEXT: &str = "e0080fb223a2a45fe65407abafefade00abf2e6b11b7428df396d117";
-
-	/// What [`SHA3_SUITE_VECTOR`] seals [`KNOWN_PLAINTEXT`] to under
-	/// [`KNOWN_AAD`], from the same source.
-	const SHA3_SUITE_CIPHERTEXT: &str = "f742fee844fad9743f6d2fece69bb3e0ed60cc352d4dc544216993f6";
 
 	impl Vector {
 		/// The ephemeral secret key of the sender.
@@ -1410,16 +1326,14 @@ mod tests {
 		assert_eq!(<HkdfSha256 as HpkeKdf>::KDF_ID, 0x0001);
 	}
 
-	/// The SHA3-256 suite derives what an independent implementation derives
-	/// under the same identifiers, so the hash and the crate's two
-	/// identifiers are the whole difference from the registered suite.
+	/// The house suite is the registered one, so it runs under the three
+	/// identifiers the registry assigns: KEM `0x0016`, KDF `0x0001`, and AEAD
+	/// `0x0002`.
 	#[test]
-	fn the_sha3_suite_matches_its_known_answer() -> Result<()> {
-		let by_sender = Derived::by_sender::<Suite>(&SHA3_SUITE_VECTOR)?;
-		let by_recipient = Derived::by_recipient::<Suite>(&SHA3_SUITE_VECTOR)?;
-		assert_eq!(by_sender, Derived::published(&SHA3_SUITE_VECTOR));
-		assert_eq!(by_recipient, Derived::published(&SHA3_SUITE_VECTOR));
-		Ok(())
+	fn the_house_suite_carries_the_registered_identifiers() {
+		assert_eq!(<Suite as HpkeSuite>::KEM_ID, 0x0016);
+		assert_eq!(<<Suite as HpkeSuite>::Kdf as HpkeKdf>::KDF_ID, 0x0001);
+		assert_eq!(<<Suite as HpkeSuite>::Aead as HpkeAead>::AEAD_ID, 0x0002);
 	}
 
 	/// The sealed bytes are the encapsulated key the vector publishes and the
@@ -1428,23 +1342,20 @@ mod tests {
 	#[test]
 	fn a_sealed_message_matches_its_known_answer() -> Result<()> {
 		let registered = AES_256_GCM_VECTOR.sealed::<RegisteredAes256>()?.to_bytes();
-		let sha3 = SHA3_SUITE_VECTOR.sealed::<Suite>()?.to_bytes();
-
 		let enc = unhex(AES_256_GCM_VECTOR.ephemeral_public);
 		assert_eq!(registered, [enc.as_slice(), &unhex(REGISTERED_CIPHERTEXT)].concat());
-		assert_eq!(sha3, [enc.as_slice(), &unhex(SHA3_SUITE_CIPHERTEXT)].concat());
 		Ok(())
 	}
 
 	#[test]
 	fn the_recipient_opens_the_known_answer() -> Result<()> {
-		let enc = unhex(SHA3_SUITE_VECTOR.ephemeral_public);
-		let wire = [enc.as_slice(), &unhex(SHA3_SUITE_CIPHERTEXT)].concat();
+		let enc = unhex(AES_256_GCM_VECTOR.ephemeral_public);
+		let wire = [enc.as_slice(), &unhex(REGISTERED_CIPHERTEXT)].concat();
 		let message = HpkeMessage::<Suite>::from_bytes(wire)?;
 
-		let opened = SHA3_SUITE_VECTOR
+		let opened = AES_256_GCM_VECTOR
 			.recipient()
-			.open(&message, unhex(SHA3_SUITE_VECTOR.info), KNOWN_AAD)?;
+			.open(&message, unhex(AES_256_GCM_VECTOR.info), KNOWN_AAD)?;
 		assert_eq!(&opened.to_insecure()[..], KNOWN_PLAINTEXT);
 		Ok(())
 	}
@@ -1924,7 +1835,7 @@ mod tests {
 	/// because the key is derived at the cipher's own size.
 	#[test]
 	fn a_key_wider_than_32_bytes_round_trips() -> Result<()> {
-		type Wide = DhKemSuite<Secp256k1, HkdfSha3_256, WideKeyCipher, KEM_DHKEM_SECP256K1_HKDF_SHA3_256>;
+		type Wide = DhKemSuite<Secp256k1, HkdfSha256, WideKeyCipher, KEM_DHKEM_SECP256K1_HKDF_SHA256>;
 		let (secret, public) = keypair();
 		let sealed = public.seal::<Wide>(INFO, b"", b"wide", None)?;
 
@@ -1938,8 +1849,8 @@ mod tests {
 	/// alone.
 	#[test]
 	fn a_kdf_output_of_another_length_is_refused() {
-		type Overlong = DhKemSuite<Secp256k1, AlteredKdf<0, 1>, Aes256Gcm, KEM_DHKEM_SECP256K1_HKDF_SHA3_256>;
-		type Short = DhKemSuite<Secp256k1, AlteredKdf<0, -1>, Aes256Gcm, KEM_DHKEM_SECP256K1_HKDF_SHA3_256>;
+		type Overlong = DhKemSuite<Secp256k1, AlteredKdf<0, 1>, Aes256Gcm, KEM_DHKEM_SECP256K1_HKDF_SHA256>;
+		type Short = DhKemSuite<Secp256k1, AlteredKdf<0, -1>, Aes256Gcm, KEM_DHKEM_SECP256K1_HKDF_SHA256>;
 		let (_, public) = keypair();
 
 		let overlong = public.seal::<Overlong>(INFO, b"", b"plaintext", None);
@@ -1950,7 +1861,7 @@ mod tests {
 
 	/// `LabeledExpand` frames its length in two bytes, so a longer request is
 	/// refused ahead of the KDF. The KDF here answers any length, because
-	/// HKDF-SHA3-256 refuses past 8,160 bytes on its own and would hide the
+	/// HKDF-SHA256 refuses past 8,160 bytes on its own and would hide the
 	/// frame.
 	#[test]
 	fn a_labeled_expand_past_two_length_bytes_is_refused() {
@@ -1986,53 +1897,210 @@ mod tests {
 		Ok(())
 	}
 
-	/// The frame adapters seal and open under the frame context and stamp the
-	/// suite OID, so a message sealed under another `info` stays closed to
-	/// them.
-	#[cfg(feature = "x509")]
-	#[test]
-	fn the_frame_adapters_round_trip_under_the_frame_context() -> crate::error::Result<()> {
+	/// The frame KEM recipients of the house provider.
+	#[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
+	mod frames {
+		use super::*;
+		use crate::cms::enveloped_data::RecipientInfo;
 		use crate::crypto::aead::{DecryptContent, Encryptor};
-		use crate::oids::HPKE_SECP256K1_SHA3_256_AES_256_GCM;
-
-		let (secret, public) = keypair();
-		let encryptor = HpkeEncryptor::from_bytes(public.to_encoded_point(true))?;
-		let malformed = HpkeEncryptor::from_bytes([0xFFu8; 33]);
-		let decryptor = HpkeDecryptor::new(secret);
-		let mut info = encryptor.encrypt_content(b"framed", [], None)?;
-
-		let opened = decryptor.decrypt_content(&info)?.to_insecure();
-		let foreign = public.seal::<Suite>(INFO, b"", b"framed", None)?.to_bytes();
-		info.encrypted_content = Some(crate::der::asn1::OctetString::new(foreign)?);
-		assert_eq!(&opened[..], b"framed");
-		assert_eq!(info.content_enc_alg.oid, HPKE_SECP256K1_SHA3_256_AES_256_GCM);
-		assert!(matches!(malformed, Err(HpkeError::InvalidPublicKey(_))));
-		assert!(decryptor.decrypt_content(&info).is_err());
-		Ok(())
-	}
-
-	/// Open an HPKE payload with the recipient private key held behind a key
-	/// backend: the `DH(skR, pkE)` step runs via `DiffieHellman::agree`, then
-	/// the shared-secret decryptor opens it through the standard `Decryptor`.
-	#[cfg(all(feature = "x509", feature = "signature", feature = "ecdh", feature = "tokio"))]
-	#[tokio::test]
-	async fn shared_secret_decryptor_via_provider() -> crate::error::Result<()> {
-		use crate::crypto::aead::{DecryptContent, Encryptor};
-		use crate::crypto::key::{DiffieHellman, Secp256k1KeyProvider};
+		use crate::crypto::cms::{BareKemKey, KemRecipientInfo, KeyAgreementIdentity};
+		use crate::crypto::key::{DiffieHellman, KeyBackend, Secp256k1KeyProvider};
+		use crate::crypto::profiles::DefaultCryptoProvider;
 		use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
+		use crate::der::{Decode, Encode};
+		use crate::oids::{AES_256_GCM, AES_256_WRAP, HKDF_SHA3_256, ORI_KEM};
+		use crate::testing::{TestAttributes, TestCertificate};
+		use crate::ZeroizingBytes;
 
-		let plaintext = b"hsm-backed hpke decryption";
-		let (secret, public) = keypair();
-		let info = HpkeEncryptor::new(public).encrypt_content(plaintext, [], None)?;
-		let wire = info.encrypted_content.as_ref().ok_or(HpkeError::InvalidCiphertext)?.as_bytes();
+		type House = DefaultCryptoProvider;
 
-		let message = HpkeMessage::<Suite>::from_bytes(wire)?;
-		let provider = Secp256k1KeyProvider::from(Secp256k1SigningKey::from(secret));
-		let shared = provider.agree(message.encapsulated_key()).await?;
+		/// The frame purpose label `tb/frame/ukm/v1`, the 15 octets every frame
+		/// `ukm` leads with.
+		const FRAME_UKM_LABEL: &[u8] = b"tb/frame/ukm/v1";
 
-		let decryptor = HpkeSharedSecretDecryptor::new(EcdhSecret::try_from(shared)?, public);
-		let opened = decryptor.decrypt_content(&info)?.to_insecure();
-		assert_eq!(&opened[..], plaintext);
-		Ok(())
+		const FRAMED: &[u8] = b"framed content";
+
+		/// The `id-signedData` content type, `1.2.840.113549.1.7.2` (RFC 5652
+		/// §5.1), a type other than the default.
+		const ID_SIGNED_DATA: crate::der::asn1::ObjectIdentifier =
+			crate::der::asn1::ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.2");
+
+		/// A fresh secp256k1 key, its public point, and its house backend.
+		fn key_with_backend() -> (PublicKey<Secp256k1>, Arc<dyn DiffieHellman<Secp256k1>>) {
+			let key = Secp256k1SigningKey::random(&mut OsRng);
+			let public = PublicKey::from(key.verifying_key());
+			(public, Arc::new(Secp256k1KeyProvider::from(key)))
+		}
+
+		/// The bare recipient of `backend`'s key, from its SPKI.
+		fn bare_recipient(backend: &Arc<dyn DiffieHellman<Secp256k1>>) -> KemRecipient<DhKemSecp256k1> {
+			let spki = backend.to_public_key_bytes().expect("the backend encodes its key");
+			KemRecipient::bare(spki).expect("the key is a secp256k1 key")
+		}
+
+		/// [`FRAMED`] sealed to `recipient` by the house frame encryptor,
+		/// beside the DER it arrives as.
+		fn sealed_to(recipient: KemRecipient<DhKemSecp256k1>) -> (AuthEnvelopedData, Vec<u8>) {
+			let encryptor = HpkeEncryptor::<House>::new(recipient);
+			let sealed = encryptor.encrypt_content(FRAMED, None, None).expect("the frame seals");
+			let arrived = sealed.to_der().expect("the frame encodes");
+			(sealed, arrived)
+		}
+
+		/// `sealed` as a frame carries it: the envelope with its content
+		/// detached, beside the content.
+		fn detached(mut sealed: AuthEnvelopedData) -> (AuthEnvelopedData, ZeroizingBytes) {
+			let content = sealed.take_content().expect("the seal carries its content");
+			(sealed, content)
+		}
+
+		/// The `KEMRecipientInfo` of `sealed`.
+		fn kem_recipient_of(sealed: &AuthEnvelopedData) -> KemRecipientInfo {
+			let recipient = sealed.recipient_infos.0.as_slice().first().cloned();
+			let other = match recipient {
+				Some(RecipientInfo::Ori(other)) if other.ori_type == ORI_KEM => Some(other),
+				_ => None,
+			};
+
+			let other = other.expect("a frame seal carries one id-ori-kem recipient");
+			other.ori_value.decode_as().expect("the value is a KEMRecipientInfo")
+		}
+
+		#[tokio::test]
+		async fn a_frame_sealed_to_a_bare_key_opens_through_its_bare_kem_key() -> crate::error::Result<()> {
+			let (public, backend) = key_with_backend();
+			let (sealed, arrived) = sealed_to(bare_recipient(&backend));
+			let (envelope, mut content) = detached(sealed);
+
+			let decryptor = HpkeDecryptor::<House>::new(BareKemKey::new(public, backend)?);
+			decryptor.decrypt_content(&envelope, &arrived, &mut content).await?;
+			assert_eq!(&content[..], FRAMED);
+			Ok(())
+		}
+
+		#[tokio::test]
+		async fn a_frame_sealed_to_a_certificate_key_opens_through_its_identity() -> crate::error::Result<()> {
+			let key = Secp256k1SigningKey::random(&mut OsRng);
+			let backend: Arc<dyn DiffieHellman<Secp256k1>> = Arc::new(Secp256k1KeyProvider::from(key.to_owned()));
+			let identity = KeyAgreementIdentity::<DhKemSecp256k1>::new(TestCertificate::self_signed(&key), backend)?;
+			let (sealed, arrived) = sealed_to(identity.recipient().clone());
+			let (envelope, mut content) = detached(sealed);
+
+			let decryptor = HpkeDecryptor::<House>::new(identity);
+			decryptor.decrypt_content(&envelope, &arrived, &mut content).await?;
+			assert_eq!(&content[..], FRAMED);
+			Ok(())
+		}
+
+		#[tokio::test]
+		async fn a_frame_whose_rid_names_another_key_is_refused() -> crate::error::Result<()> {
+			let (_, sealed_backend) = key_with_backend();
+			let (public, backend) = key_with_backend();
+			let (sealed, arrived) = sealed_to(bare_recipient(&sealed_backend));
+			let (envelope, mut content) = detached(sealed);
+
+			let decryptor = HpkeDecryptor::<House>::new(BareKemKey::new(public, backend)?);
+			let refused = decryptor.decrypt_content(&envelope, &arrived, &mut content).await;
+			assert!(matches!(
+				refused,
+				Err(crate::TightBeamError::EnvelopeError(EnvelopeError::RecipientIdentifier))
+			));
+			Ok(())
+		}
+
+		/// A KEM seal of another purpose carries another `ukm`, so the frame
+		/// decryptor refuses it.
+		#[tokio::test]
+		async fn a_kem_seal_of_another_purpose_does_not_open_as_a_frame() -> crate::error::Result<()> {
+			let (public, backend) = key_with_backend();
+			let recipient = bare_recipient(&backend);
+			let opening = Recipient::Kem { recipient: &recipient, ukm_label: b"tb/handshake/opening/ukm/v1" };
+			let sealed = AuthEnvelopedData::seal::<House>(opening, DATA, FRAMED, [], None)?;
+			let arrived = sealed.to_der()?;
+			let (envelope, mut content) = detached(sealed);
+
+			let decryptor = HpkeDecryptor::<House>::new(BareKemKey::new(public, backend)?);
+			let refused = decryptor.decrypt_content(&envelope, &arrived, &mut content).await;
+			assert!(matches!(refused, Err(crate::TightBeamError::EnvelopeError(EnvelopeError::Ukm))));
+			Ok(())
+		}
+
+		/// The frame seal runs every algorithm of the house provider and names
+		/// each by its registered identifier.
+		#[test]
+		fn a_frame_seal_names_the_algorithms_of_its_provider() {
+			let (_, backend) = key_with_backend();
+			let (sealed, _) = sealed_to(bare_recipient(&backend));
+
+			let recipient = kem_recipient_of(&sealed);
+			assert_eq!(recipient.kem.oid, DHKEM_SECP256K1);
+			assert_eq!(recipient.kdf.oid, HKDF_SHA3_256);
+			assert_eq!(recipient.wrap.oid, AES_256_WRAP);
+			assert_eq!(sealed.auth_encrypted_content_info.content_enc_alg.oid, AES_256_GCM);
+		}
+
+		/// The `ukm` of a frame seal is the frame purpose label, then the 32
+		/// octets the seal draws.
+		#[test]
+		fn a_frame_seal_leads_its_ukm_with_the_frame_label() -> crate::error::Result<()> {
+			let (_, backend) = key_with_backend();
+			let (sealed, _) = sealed_to(bare_recipient(&backend));
+
+			let ukm = kem_recipient_of(&sealed).ukm.ok_or(EnvelopeError::Ukm)?;
+			let (label, random) = ukm.as_bytes().split_at(FRAME_UKM_LABEL.len());
+			assert_eq!(label, FRAME_UKM_LABEL);
+			assert_eq!(random.len(), 32);
+			Ok(())
+		}
+
+		/// A frame sealed as another content type declares that type, in its
+		/// content type and in its content-type attribute.
+		#[test]
+		fn a_frame_seal_declares_the_content_type_it_is_given() -> crate::error::Result<()> {
+			let (_, backend) = key_with_backend();
+			let encryptor = HpkeEncryptor::<House>::new(bare_recipient(&backend));
+			let sealed = encryptor.encrypt_content(FRAMED, Some(ID_SIGNED_DATA), None)?;
+
+			let declared = TestAttributes::declared_content_types(&sealed);
+			assert_eq!(declared, (ID_SIGNED_DATA, ID_SIGNED_DATA));
+			Ok(())
+		}
+
+		/// A frame sealed as another content type opens as that type, the type
+		/// its attributes authenticate.
+		#[tokio::test]
+		async fn a_frame_of_another_content_type_opens_as_that_type() -> crate::error::Result<()> {
+			let (public, backend) = key_with_backend();
+			let encryptor = HpkeEncryptor::<House>::new(bare_recipient(&backend));
+			let sealed = encryptor.encrypt_content(FRAMED, Some(ID_SIGNED_DATA), None)?;
+			let arrived = sealed.to_der()?;
+			let (envelope, mut content) = detached(sealed);
+
+			let decryptor = HpkeDecryptor::<House>::new(BareKemKey::new(public, backend)?);
+			decryptor.decrypt_content(&envelope, &arrived, &mut content).await?;
+			assert_eq!(&content[..], FRAMED);
+			Ok(())
+		}
+
+		/// Each frame seal draws its own ephemeral, so two seals to one
+		/// recipient carry two `kemct` values.
+		#[test]
+		fn each_frame_seal_encapsulates_afresh() {
+			let (_, backend) = key_with_backend();
+			let recipient = bare_recipient(&backend);
+			let (first, _) = sealed_to(recipient.clone());
+			let (second, _) = sealed_to(recipient);
+
+			assert_ne!(kem_recipient_of(&first).kemct, kem_recipient_of(&second).kemct);
+		}
+
+		/// A frame decodes back from the DER its seal encodes.
+		#[test]
+		fn a_frame_seal_decodes_back_from_its_encoding() -> crate::error::Result<()> {
+			let (_, backend) = key_with_backend();
+			let (sealed, arrived) = sealed_to(bare_recipient(&backend));
+			assert_eq!(AuthEnvelopedData::from_der(&arrived)?, sealed);
+			Ok(())
+		}
 	}
 }
