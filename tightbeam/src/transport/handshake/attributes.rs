@@ -19,24 +19,26 @@ use crate::cms::enveloped_data::OriginatorPublicKey;
 use crate::cms::signed_data::SignedData;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::cms::AttributesExt;
-#[cfg(feature = "transport-cms")]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::sign::Signed;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::x509::attr::Attributes;
-#[cfg(feature = "transport-cms")]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::der::asn1::OctetString;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::der::asn1::UintRef;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::oids::HANDSHAKE_ABORT_ALERT;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::oids::{HANDSHAKE_KEY_CONFIRMATION, RECEIPT_ACK, SESSION_RECEIPT};
 #[cfg(feature = "transport-cms")]
 use crate::oids::{
-	HANDSHAKE_KEY_CONFIRMATION, HANDSHAKE_SECURITY_ACCEPT, HANDSHAKE_SECURITY_OFFER, HANDSHAKE_SERVER_EPHEMERAL,
-	HANDSHAKE_TRANSPORT_ACCEPT, HANDSHAKE_TRANSPORT_OFFER, RECEIPT_ACK, SESSION_RECEIPT,
+	HANDSHAKE_SECURITY_ACCEPT, HANDSHAKE_SECURITY_OFFER, HANDSHAKE_SERVER_EPHEMERAL, HANDSHAKE_TRANSPORT_ACCEPT,
+	HANDSHAKE_TRANSPORT_OFFER,
 };
 #[cfg(feature = "transport-cms")]
 use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer, TransportAccept, TransportOffer};
-#[cfg(feature = "transport-cms")]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::schedule::KeyConfirmation;
 
 /// A CMS attribute that carries one value, as the handshake profile requires.
@@ -149,15 +151,15 @@ impl AttributePayload for TransportAccept {
 	const OID: ObjectIdentifier = HANDSHAKE_TRANSPORT_ACCEPT;
 }
 
-/// The session receipt a server Finished carries, as a server-signed artifact
-/// that a third party can verify.
-#[cfg(feature = "transport-cms")]
+/// The session receipt a reply carries, as a server-signed artifact that a
+/// third party can verify.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl AttributePayload for Signed<SignedData> {
 	const OID: ObjectIdentifier = SESSION_RECEIPT;
 }
 
-/// The sealed receipt acknowledgement a client Finished carries.
-#[cfg(feature = "transport-cms")]
+/// The sealed receipt acknowledgement a closing carries.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl AttributePayload for OctetString {
 	const OID: ObjectIdentifier = RECEIPT_ACK;
 }
@@ -169,8 +171,9 @@ impl AttributePayload for OriginatorPublicKey {
 	const OID: ObjectIdentifier = HANDSHAKE_SERVER_EPHEMERAL;
 }
 
-/// The key-confirmation tag a client Finished carries.
-#[cfg(feature = "transport-cms")]
+/// The key-confirmation tag a closing carries, and the server Finished the
+/// HPKE reply carries.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl AttributePayload for KeyConfirmation {
 	const OID: ObjectIdentifier = HANDSHAKE_KEY_CONFIRMATION;
 }
@@ -289,7 +292,7 @@ pub trait HandshakeAttributes {
 	/// Finds at most one unsigned attribute with `oid`, rejecting duplicates.
 	///
 	/// On a `SignedData` the search spans the SignerInfos of a parsed
-	/// Finished message or of an HPKE tunnel.
+	/// Finished message or of an HPKE reply.
 	///
 	/// # Duplicates
 	///

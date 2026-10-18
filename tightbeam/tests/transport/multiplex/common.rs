@@ -96,7 +96,7 @@ pub async fn establish_transports(
 			transport = transport.with_mux_offer(Some(offer));
 		}
 
-		// HPKE is exactly two client messages: ClientHello, ClientKeyExchange.
+		// HPKE is exactly two client messages: the hello and the closing.
 		serve_one_handshake_message(&mut transport).await?;
 		serve_one_handshake_message(&mut transport).await?;
 		Ok::<_, TightBeamError>(transport)
@@ -273,7 +273,7 @@ pub async fn accept_mux_server(
 	let (transport, _) = listener.accept().await?;
 	let mut transport = transport.with_mux_offer(Some(offer)).with_trace(trace);
 
-	// HPKE is exactly two client messages: ClientHello, ClientKeyExchange.
+	// HPKE is exactly two client messages: the hello and the closing.
 	serve_one_handshake_message(&mut transport).await?;
 	serve_one_handshake_message(&mut transport).await?;
 

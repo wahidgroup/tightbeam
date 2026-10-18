@@ -111,9 +111,9 @@ impl AuthEnvelopedData {
 	/// Seal `content`, of type `content_type`, to `recipient` under the
 	/// algorithms of `P`: its AEAD, its KDF, its key wrap, and its KEM.
 	///
-	/// Each seal draws a fresh content key and nonce from `rng`, or from the
-	/// OS source when `rng` is `None`. The authenticated attributes are the
-	/// content type and `auth_attrs`, and their DER is the associated data.
+	/// - Each seal draws a fresh content key and nonce from `rng`, or from the OS source without one.
+	/// - The authenticated attributes, the content type and `auth_attrs`, are the associated data in DER.
+	/// - The cipher encrypts `content` in place, so a `Vec` that moves in becomes the `encryptedContent`.
 	///
 	/// # Errors
 	///
@@ -125,7 +125,7 @@ impl AuthEnvelopedData {
 	pub fn seal<P>(
 		recipient: Recipient<'_>,
 		content_type: ObjectIdentifier,
-		content: impl AsRef<[u8]>,
+		content: impl Into<Vec<u8>>,
 		auth_attrs: impl IntoIterator<Item = Attribute>,
 		rng: Option<&mut dyn CryptoRngCore>,
 	) -> Result<Self, EnvelopeError>
@@ -151,7 +151,7 @@ impl AuthEnvelopedData {
 		let associated_data = auth_attrs.to_der()?;
 
 		// 4. Encrypt, with the tag detached into `mac`.
-		let mut ciphertext = Zeroizing::new(content.as_ref().to_vec());
+		let mut ciphertext = Zeroizing::new(content.into());
 		let cipher = P::AeadCipher::new_from_slice(&content_key).map_err(|_| EnvelopeError::Encryption)?;
 		let tag = cipher.encrypt_in_place_detached(&nonce, &associated_data, &mut ciphertext);
 		let tag = tag.map_err(|_| EnvelopeError::Encryption)?;

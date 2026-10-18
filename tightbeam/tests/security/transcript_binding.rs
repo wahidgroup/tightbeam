@@ -1,7 +1,7 @@
 //! # Transcript-binding downgrade threat
 //!
 //! ## Weakness
-//! Suppose the HPKE handshake transcript omits the negotiated
+//! Suppose the HPKE reply signs a transcript that omits the negotiated
 //! `security_accept` and covers only
 //! `client_random || server_random || server_public_key`. The signed transcript
 //! then leaves the chosen profile unauthenticated, so negotiation is unbound.
@@ -11,10 +11,11 @@
 //! transit.
 //!
 //! ## Attack
-//! 1. An adversary-in-the-middle rewrites `security_accept` to a weaker (still
-//!    offered) profile in transit. Randoms, certificate, and server signature
-//!    are untouched, so the transcript still verifies and the client silently
-//!    adopts the weaker profile.
+//! 1. An adversary-in-the-middle rewrites `security_accept` inside the reply's
+//!    `ServerHandshake` to a weaker (still offered) profile in transit.
+//!    Randoms, certificate, and server signature are untouched, so an unbound
+//!    transcript still verifies and the client silently adopts the weaker
+//!    profile.
 //! 2. The MITM strips or rewrites the `SecurityOffer` inside `ClientHello`
 //!    while preserving `client_random`. The server signs a transcript over the
 //!    modified hello. If the client bound only its random, the signature still
@@ -51,8 +52,8 @@ use tightbeam::{
 };
 
 use crate::common::security::{
-	expectation_failure, hpke_client_config, hpke_server_config, pinning_validator, strong_security_profile,
-	tunneled_handshake, tunneled_hello, tunneled_opening, tunneled_reply, weak_security_profile, ServerMaterials,
+	carried_hello, expectation_failure, hello_opening, hpke_client_config, hpke_server_config, pinning_validator,
+	rewritten_reply, signed_handshake, strong_security_profile, weak_security_profile, ServerMaterials,
 };
 
 pub(crate) const STRIPPED_OFFER_REJECTED: Urn<'static> =
@@ -141,7 +142,7 @@ job! {
 		let (mut client, mut server, strong, weak) = strong_weak_pair(&materials);
 		let reply = server.reply(client.start()?).await?;
 
-		let mut server_handshake = tunneled_handshake(reply);
+		let mut server_handshake = signed_handshake(reply.to_owned());
 		assert_eq!(
 			server_handshake.security_accept.as_ref().map(|accept| accept.value().profile),
 			Some(strong),
@@ -150,7 +151,7 @@ job! {
 
 		server_handshake.security_accept = Some(WireDer::new(SecurityAccept::new(weak))?);
 
-		let tampered = tunneled_reply(&server_handshake);
+		let tampered = rewritten_reply(reply, &server_handshake);
 		expect_client_reject(
 			client.respond(tampered).await,
 			&trace,
@@ -163,7 +164,7 @@ job! {
 		// client_random is preserved, so a random-only transcript would still
 		// verify. The full ClientHello DER binding must make the client reject.
 		let (mut client, mut server, _strong, _weak) = strong_weak_pair(&materials);
-		let client_hello = tunneled_hello(client.start()?);
+		let client_hello = carried_hello(client.start()?);
 		let mut stripped_hello = ClientHello::from_der(&client_hello)?;
 		stripped_hello.security_offer = None;
 		assert_ne!(
@@ -172,7 +173,7 @@ job! {
 			"offer stripping must change ClientHello bytes"
 		);
 
-		let reply = server.reply(tunneled_opening(&stripped_hello)).await?;
+		let reply = server.reply(hello_opening(&stripped_hello)).await?;
 		expect_client_reject(
 			client.respond(reply).await,
 			&trace,

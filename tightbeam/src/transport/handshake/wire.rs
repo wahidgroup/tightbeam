@@ -1,9 +1,9 @@
 //! Wire envelope mapping for the handshake drivers.
 //!
-//! Both handshake protocols carry their messages in the handshake containers
-//! of [`TransportEnvelope`]. HPKE tunnels its hello and its reply inside
-//! `SignedData` and sends its closing as a `ClientKeyExchange`, and the CMS
-//! handshake exchanges `AuthEnvelopedData` and `SignedData` themselves.
+//! Both handshake protocols carry their messages in the CMS containers of
+//! [`TransportEnvelope`]. HPKE sends its hello as a `ContentInfo` of type
+//! `id-data` and its reply as a `SignedData`, and the CMS handshake opens with
+//! an `AuthEnvelopedData`. Both close with an `AuthEnvelopedData`.
 
 use crate::transport::envelopes::TransportEnvelope;
 use crate::transport::error::TransportError;
@@ -25,7 +25,7 @@ impl From<HandshakeMessage> for TransportEnvelope {
 		match message {
 			HandshakeMessage::SignedData(signed) => Self::SignedData(signed),
 			HandshakeMessage::AuthEnvelopedData(enveloped) => Self::AuthEnvelopedData(enveloped),
-			HandshakeMessage::ClientKeyExchange(key_exchange) => Self::ClientKeyExchange(key_exchange),
+			HandshakeMessage::Data(data) => Self::Data(data),
 		}
 	}
 }
@@ -39,7 +39,7 @@ impl TryFrom<TransportEnvelope> for HandshakeMessage {
 		match envelope {
 			TransportEnvelope::SignedData(signed) => Ok(Self::SignedData(signed)),
 			TransportEnvelope::AuthEnvelopedData(enveloped) => Ok(Self::AuthEnvelopedData(enveloped)),
-			TransportEnvelope::ClientKeyExchange(key_exchange) => Ok(Self::ClientKeyExchange(key_exchange)),
+			TransportEnvelope::Data(data) => Ok(Self::Data(data)),
 			_ => Err(TransportError::InvalidMessage),
 		}
 	}

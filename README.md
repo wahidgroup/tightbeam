@@ -1164,7 +1164,7 @@ Each provider role MUST use the algorithm its profile names. The `Profile` bound
 
 Its associated profile is `TightbeamProfile` ([§6.2](#62-security-profile-types)).
 
-Every part is replaceable. An implementor brings its own algorithm as a type that implements the role's trait: a signature type for `SigningProvider`, a `ContentEncryption` cipher for `AeadProvider`, a `KeyWrapAlgorithm` for `KeyWrapProvider`, a `KdfFunction` for `KdfProvider`, and a `RecipientKem` for `CryptoProvider::Kem`. The envelope, the recipients, and the handshake then run that provider's algorithms and refuse any other. A provider that seals with HPKE also implements `HpkeProvider`.
+Every part is replaceable. An implementor brings its own algorithm as a type that implements the role's trait: a signature type for `SigningProvider`, a `ContentEncryption` cipher for `AeadProvider`, a `KeyWrapAlgorithm` for `KeyWrapProvider`, a `KdfFunction` for `KdfProvider`, and a `RecipientKem` for `CryptoProvider::Kem`. The envelope, the recipients, and the handshake then run that provider's algorithms and refuse any other. The handshake reads no HPKE suite, so a provider with these roles alone runs both handshake flows.
 
 ### 6.6 Cryptographic Requirements
 
@@ -1270,7 +1270,7 @@ let trust_store = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy::def
 | -------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
 | `TransportEncryptionConfig::new`, `ServerConfig.identity`                                                | The server reply or Finished, and the server receipt                                 |
 | `with_client_identity`, `CmsClientSettings.identity`                                                     | The client Finished, and the receipt countersignature                                |
-| `HpkeClientSettings.identity`                                                                            | The possession proof, and the receipt countersignature                               |
+| `HpkeClientSettings.identity`                                                                            | The client Finished, and the receipt countersignature                                |
 | `Frame::sign_with_provider`                                                                              | The frame                                                                            |
 | `ClusterTlsConfig::from_identity`, `HiveTlsConfig::from_identity`, `ServletConfigBuilder::with_identity` | The colony endpoint's handshakes and frames, such as the rumors a gateway originates |
 
@@ -1582,7 +1582,7 @@ let mut client = builder.connect(addr).await?;
 Two handshake protocols establish mutual authentication and a session key:
 
 - **CMS-based**: Full PKI with X.509 certificates and [RFC 5652][rfc5652] CMS structures
-- **HPKE-based**: Lighter wire form with less CMS nesting
+- **HPKE-based**: The shape of the TLS 1.3 handshake ([RFC 9846][rfc9846]) in CMS containers. The client learns the server from the reply, and the handshake secret derives from two ephemerals alone
 
 Security goals for both:
 
@@ -1599,29 +1599,33 @@ Security goals for both:
 ```text
 Phase 1: Client -> Server
 ┌─────────────────────────────────────────────────────────┐
-│ ClientHello (HPKE) or Opening (CMS)                     │
+│ Hello (HPKE) or Opening (CMS)                           │
 │ - Client nonce (32 bytes)                               │
 │ - Optional SecurityOffer (supported profiles)           │
-│ - Ephemeral public key (CMS: sealed in the opening)     │
+│ - Client ephemeral R (HPKE: in clear, as the TLS 1.3    │
+│   key share. CMS: sealed in the opening, beside the     │
+│   base secret)                                          │
 └─────────────────────────────────────────────────────────┘
 
 Phase 2: Server -> Client
 ┌─────────────────────────────────────────────────────────┐
-│ ServerHandshake (HPKE) or ServerFinished (CMS)          │
-│ - Server certificate                                    │
-│ - Server nonce (32 bytes)                               │
+│ Reply (HPKE) or ServerFinished (CMS)                    │
+│ - Server certificate (HPKE: in `certificates`)          │
+│ - Server nonce (32 bytes, HPKE)                         │
 │ - Selected SecurityProfile (if negotiation occurred)    │
-│ - Signature over a labelled digest of the transcript    │
+│ - Server ephemeral E                                    │
+│ - Signature over the transcript                         │
+│ - Server Finished, a MAC under the handshake secret     │
 └─────────────────────────────────────────────────────────┘
 
 Phase 3: Client -> Server
 ┌─────────────────────────────────────────────────────────┐
-│ ClientKeyExchange (HPKE) or ClientFinished (CMS)        │
-│ - Sealed base secret (HPKE)                             │
+│ Closing (both flows)                                    │
+│ - Sealed under a key of the handshake secret            │
 │ - Key-confirmation tag (one digest output wide)         │
-│ - Client certificate and signature, sealed under a key  │
-│   of the handshake secret (optional for HPKE)           │
-│   (CMS: the whole client Finished travels sealed)       │
+│ - Client Finished with the client certificate           │
+│   (absent for an anonymous HPKE client)                 │
+│ - Sealed receipt acknowledgement (budget-bearing)       │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -1642,31 +1646,31 @@ Init -> OpeningReceived -> ServerFinishedSent -> ClientFinishedReceived -> Compl
 **Transcript hash:**
 
 ```text
-transcript = ClientHello || server_random || server_ephemeral || server_public_key
-             || SecurityAccept || client_cert_required || TransportAccept
+HPKE: transcript = Hello ContentInfo DER || ServerHandshake DER || signing certificate DER
+CMS:  transcript = Opening DER || SecurityAccept || TransportAccept || server ephemeral
 transcript_hash = H(transcript)
 ```
 
-The `server_public_key` leg is the raw `subjectPublicKey` bits of the server certificate.
-
 `H` is the negotiated digest, SHA3-256 in the default profile. The transcript hash is its whole output: 32 bytes under SHA3-256, 64 under SHA3-512.
 
-The transcript hash binds the handshake messages. It blocks reordering, profile downgrade, and undetected man-in-the-middle edits of the transcript. The `client_cert_required` leg is one byte, so a stripped certificate demand changes the hash.
+The transcript hash binds the handshake messages. It blocks reordering, profile downgrade, and undetected man-in-the-middle edits of the transcript. The HPKE `ServerHandshake` carries the accepts, the certificate demand, and the server ephemeral, so a stripped certificate demand changes the hash. The HPKE transcript also covers the DER of the signing certificate, as TLS 1.3 signs over its Certificate ([RFC 9846 §4.5.2][rfc9846-4.5.2]).
 
 **Handshake secret:**
 
-The handshake secret `hs` derives from `ee || base`, the hybrid shared secret `Z′ = Z || T` of [NIST SP 800-56C Rev. 2][nist-800-56c] §2: the ephemeral-ephemeral ECDH output, followed by the client's base secret.
+The handshake secret `hs` of the CMS flow derives from `ee || base`, the hybrid shared secret `Z′ = Z || T` of [NIST SP 800-56C Rev. 2][nist-800-56c] §2: the ephemeral-ephemeral ECDH output, followed by the client's base secret. The HPKE flow derives `hs` from `ee` alone, as the ECDHE secret of TLS 1.3 does ([RFC 9846 §7.1][rfc9846-7.1]).
 
 **Key confirmation:**
 
-The client's key-confirmation tag follows the Finished construction of TLS 1.3 ([RFC 9846 §4.5.3][rfc9846-4.5.3]) under `H`, with the crate's label as the HKDF-Expand info in place of `HkdfLabel`. `hs` is the 32-byte output of the profile's KDF, too short a PRK for a 64-byte `H` ([RFC 5869][rfc5869] §2.3), so `H` extracts one first:
+Each key-confirmation tag follows the Finished construction of TLS 1.3 ([RFC 9846 §4.5.3][rfc9846-4.5.3]) under `H`, with one `MacKey` per role and the crate's label as the HKDF-Expand info in place of `HkdfLabel`. `hs` is the 32-byte output of the profile's KDF, too short a PRK for a 64-byte `H` ([RFC 5869][rfc5869] §2.3), so `H` extracts one first:
 
 ```text
-mac_key = HKDF-Expand-H(HKDF-Extract-H(S, hs), "tb/handshake/finished/v1", Hash.length)
-confirm = HMAC-H(mac_key, transcript_hash)
+mac_c   = HKDF-Expand-H(HKDF-Extract-H(S, hs), "tb/handshake/finished/client/mac/v1", Hash.length)
+mac_s   = HKDF-Expand-H(HKDF-Extract-H(S, hs), "tb/handshake/finished/server/mac/v1", Hash.length)
+confirm = HMAC-H(mac_c, transcript_hash)
+server  = HMAC-H(mac_s, transcript_hash || SignerInfo.signature)
 ```
 
-`S` is the handshake's salt, and `mac_key` keys this one tag. [NIST SP 800-56A Rev. 3][nist-800-56a] §5.9 is not claimed: its confirming party owns a static key-establishment key, and the client owns none.
+`S` is the handshake's salt. The client sends `confirm` in its closing, in both flows. The server of either flow sends `server`, the server Finished, in its reply, over the transcript hash and the octets of the reply's one signature, and the client verifies it before it builds its closing. [NIST SP 800-56A Rev. 3][nist-800-56a] §5.9 is not claimed: its confirming party owns a static key-establishment key, and the client owns none.
 
 #### 8.5.3 Implementation: CMS-Based Handshake Protocol
 
@@ -1674,14 +1678,14 @@ CMS handshake uses [RFC 5652][rfc5652] Cryptographic Message Syntax:
 
 - **`AuthEnvelopedData`** ([RFC 5083][rfc5083]): Every seal, under AES-256-GCM with `GCMParameters` ([RFC 5084][rfc5084]), the tag in `mac`, and the content type among the authenticated attributes
 - **`KEMRecipientInfo`** ([RFC 9629][rfc9629]): The opening's recipient. DHKEM(secp256k1, HKDF-SHA256) encapsulates to the server's certificate key, and HKDF-SHA3-256 derives the key that wraps the content key. [docs/dhkem-secp256k1.md](docs/dhkem-secp256k1.md) specifies the KEM
-- **`KEKRecipientInfo`**: The recipient of the sealed client Finished, under a key of the handshake secret
+- **`KEKRecipientInfo`**: The recipient of the closing, under a key of the handshake secret
 - **`SignedData`**: Transcript signatures for authentication
 
-The opening seals the base secret and the client's agreement ephemeral `R` to the server's certificate key, and it carries the security and transport offers as authenticated attributes.
+The opening seals the base secret and the client's agreement ephemeral `R` to the server's certificate key, and it carries the security and transport offers as authenticated attributes. The server Finished carries the server Finished MAC of [§8.5.2](#852-specification-handshake-flow-and-state-management) as an unsigned attribute, as the HPKE reply does, and the client verifies it before it builds its closing.
 
 **Mutual authentication flow:**
 
-For mutual authentication, the client signs its Finished over the transcript and seals the whole Finished, with the certificate it embeds, under a key of the handshake secret:
+For mutual authentication, the client signs its Finished over the transcript and seals the whole Finished, with the certificate it embeds, under a key of the handshake secret. The HPKE flow sends the same closing:
 
 ```text
 Client Side - Building the Client Finished:
@@ -1692,6 +1696,7 @@ Client Side - Building the Client Finished:
 ├─────────────────────────────────────────────────────────────────────┤
 │ 2. Sign the Client Finished                                         │
 │    signed = client_finished_domain || transcript_hash               │
+│             || SHA3-256(DER(client_certificate))                    │
 │    attrs = [content_type: id-data,                                  │
 │             message_digest: SHA3-256(signed),                       │
 │             algorithm_protection: SHA3-256, ecdsa-with-SHA3-256]    │
@@ -1706,15 +1711,15 @@ Client Side - Building the Client Finished:
 │    }                                                                │
 ├─────────────────────────────────────────────────────────────────────┤
 │ 4. Seal the Finished under the Handshake Secret                     │
-│    k_id = HKDF(hs, transcript_hash, "tb/session/kdf/identity/v1")   │
+│    k_close = HKDF(hs, salt, "tb/session/kdf/closing/v1")            │
 │    cek = random(32), nonce = random(12)                             │
 │    AuthEnvelopedData {                                              │
 │        recipient: KEKRecipientInfo {                                │
-│            kekid: "tb/handshake/identity/kekid/v1" || hash,         │
-│            encrypted_key: AES-256-KW(k_id, cek),                    │
+│            kekid: "tb/handshake/closing/kekid/v1" || hash,          │
+│            encrypted_key: AES-256-KW(k_close, cek),                 │
 │        },                                                           │
 │        algorithm: AES-256-GCM, GCMParameters { nonce, 16 },         │
-│        auth_attrs: [content_type: id-data, transcript_hash],        │
+│        auth_attrs: [content_type: id-signedData, transcript_hash],  │
 │        content, mac: AES-256-GCM.seal(cek, nonce,                   │
 │            aad: DER(auth_attrs), plaintext: pad(Finished DER)),     │
 │    }                                                                │
@@ -1727,7 +1732,7 @@ Server verification flow:
 Server Side - Verifying Client Authentication:
 ┌─────────────────────────────────────────────────────────────┐
 │ 1. Open the Sealed Finished                                 │
-│    cek = AES-256-KW.unwrap(k_id, encrypted_key)             │
+│    cek = AES-256-KW.unwrap(k_close, encrypted_key)          │
 │    finished = AES-256-GCM.open(cek, nonce, content, mac)    │
 │    ✓ The Finished embeds a certificate                      │
 ├─────────────────────────────────────────────────────────────┤
@@ -1743,6 +1748,7 @@ Server Side - Verifying Client Authentication:
 ├─────────────────────────────────────────────────────────────┤
 │ 5. Verify the Client Finished                               │
 │    signed = client_finished_domain || transcript_hash       │
+│             || SHA3-256(DER(client_certificate))            │
 │    ✓ attrs are the three, message_digest = SHA3-256(signed) │
 │    Verify(signature, SHA3-256(DER(attrs)), client_pub_key)  │
 │    ✓ Client witnessed same transcript                       │
@@ -1751,63 +1757,68 @@ Server Side - Verifying Client Authentication:
 
 #### 8.5.4 Implementation: HPKE-Based Handshake Protocol
 
-HPKE (Hybrid Public Key Encryption, [RFC 9180][rfc9180]) is the lighter handshake path. It seals the base secret to the server's static key without a CMS `AuthEnvelopedData` around it. Its hello and reply ride in `SignedData` tunnels, and its closing travels as a `ClientKeyExchange` of its own, because HPKE specifies no wire format (RFC 9180 §10).
+The HPKE flow is the lighter handshake path, in the shape of the TLS 1.3 handshake ([RFC 9846][rfc9846]). The client learns the server from the reply, and the handshake secret derives from the two ephemerals alone, so the server's certificate key only signs. Every message is a CMS container:
 
-Differences from CMS:
+- **Hello**: A `ContentInfo` of type `id-data` ([RFC 5652][rfc5652] §4) whose OCTET STRING is the `ClientHello`: the client random, the client ephemeral `R`, and the offers.
+- **Reply**: The signer's `SignedData` over the `ServerHandshake`, with the server ephemeral `E`, under the content type `1.3.6.1.4.1.64586.1.26`. Its signed attributes carry the transcript hash, its `certificates` carry the signing certificate that its `sid` names, and its unsigned attributes carry the server Finished and the session receipt.
+- **Closing**: The closing of both flows, an `AuthEnvelopedData` with a `KEKRecipientInfo` under a key of the handshake secret.
 
-- HPKE sealing instead of a CMS `AuthEnvelopedData` with a `KEMRecipientInfo`
-- Flatter ASN.1 structures instead of multi-level CMS nesting
-- Same security goals: mutual authentication, forward secrecy, replay protection
-- Both paths use ASN.1 DER. HPKE avoids [RFC 5652][rfc5652] container complexity
+The flow claims these properties of [RFC 9846 Appendix F.1][rfc9846-f.1]:
+
+| Property                                                              | Claimed | Why                                                                                           |
+| --------------------------------------------------------------------- | ------- | --------------------------------------------------------------------------------------------- |
+| Server authentication before the client sends its identity            | Yes     | The client verifies the reply's signature over the transcript first                           |
+| The client identity's protection against passive and active attackers | Yes     | It travels only under a key of this handshake's ephemeral agreement                           |
+| Forward secrecy                                                       | Yes     | The secret comes from two ephemerals alone                                                    |
+| The server identity's protection against a passive attacker           | No      | The signing certificate travels in clear in `certificates`                                    |
+| Explicit server key confirmation                                      | Yes     | The reply carries the server Finished, and the client verifies it before it sends its closing |
 
 **Mutual authentication flow:**
 
-For mutual authentication, the client signs a possession proof over its ephemeral and seals the certificate beside the proof under a key of the handshake secret:
+For mutual authentication, the client signs its Finished over the transcript and seals it, with the certificate it carries, under a key of the handshake secret. An anonymous client seals the key-confirmation tag and the acknowledgement alone:
 
 ```text
-Client Side - Building ClientKeyExchange:
+Client Side - Building the Closing:
 ┌─────────────────────────────────────────────────────────────────────┐
-│ 1. Agree with the Server Ephemeral                                  │
+│ 1. Draw R with the Hello                                            │
 │    (r, R) = GenerateKeyPair()                                       │
-│    ee = ECDH(r, server_ephemeral)                                   │
+│    hello = ContentInfo {                                            │
+│        id-data, ClientHello { client_random, R, offers }            │
+│    }                                                                │
 ├─────────────────────────────────────────────────────────────────────┤
-│ 2. Derive the Handshake Secret via HKDF                             │
+│ 2. Verify the Reply                                                 │
+│    transcript = hello DER || ServerHandshake DER || certificate DER │
+│    transcript_hash = SHA3-256(transcript)                           │
+│    ✓ signed attrs carry transcript_hash                             │
+│    ✓ Verify(signature, SHA3-256(DER(attrs)), server_pub_key)        │
+├─────────────────────────────────────────────────────────────────────┤
+│ 3. Derive the Handshake Secret                                      │
+│    ee = ECDH(r, E)                                                  │
 │    hs = HKDF-SHA3-256(                                              │
-│        ikm: ee || base,                                             │
+│        ikm: ee,                                                     │
 │        salt: client_random || server_random,                        │
 │        info: "tb/session/kdf/v1"                                    │
 │    )                                                                │
 ├─────────────────────────────────────────────────────────────────────┤
-│ 3. Sign the Possession Proof                                        │
-│    signed = domain || transcript_hash || R || client_certificate    │
-│    client_signature = DER(Sign(SHA3-256(signed), client_priv_key))  │
+│ 4. Verify the Server Finished                                       │
+│    ✓ server_finished =                                              │
+│        HMAC(mac_s, transcript_hash || signature)                    │
 ├─────────────────────────────────────────────────────────────────────┤
-│ 4. Seal the Identity under the Handshake Secret                     │
-│    k_id = HKDF(hs, salt, "tb/session/kdf/identity/v1")              │
-│    sealed_identity = DER(AuthEnvelopedData {                        │
-│        recipient: KEKRecipientInfo {                                │
-│            kekid: "tb/handshake/identity/kekid/v1" || hash,         │
-│            encrypted_key: AES-256-KW(k_id, random cek),             │
-│        },                                                           │
-│        AES-256-GCM(cek, random nonce, aad: DER(auth_attrs)),        │
-│        plaintext: pad(client_certificate, client_signature),        │
-│    })                                                               │
+│ 5. Sign the Client Finished (an identified client)                  │
+│    signed = client_finished_domain || transcript_hash               │
+│             || SHA3-256(DER(client_certificate))                    │
+│    SignedData {                                                     │
+│        content: signed,                                             │
+│        certificates: [client_certificate],                          │
+│        unsigned_attrs: [confirm, sealed_ack?],                      │
+│    }                                                                │
 ├─────────────────────────────────────────────────────────────────────┤
-│ 5. Seal the Payload with HPKE                                       │
-│    sealed_payload = HPKE-Seal(                                      │
-│        recipient_pub_key: server_pub_key,                           │
-│        info: "tb/hpke/handshake/v2",                                │
-│        aad: domain_tag,                                             │
-│        plaintext: base, client_random, R, confirm, sealed_identity  │
-│    )                                                                │
-├─────────────────────────────────────────────────────────────────────┤
-│ 6. Build ClientKeyExchange                                          │
-│    ┌──────────────────────────────────────────────────────────┐     │
-│    │ ClientKeyExchange {                                      │     │
-│    │     sealed_payload: sealed_payload,  // enc || ct        │     │
-│    │     unprotected_attrs: None,         // the alert slot   │     │
-│    │ }                                                        │     │
-│    └──────────────────────────────────────────────────────────┘     │
+│ 6. Seal the Closing under k_close                                   │
+│    AuthEnvelopedData {                                              │
+│        recipient: KEKRecipientInfo under k_close,                   │
+│        content_type: id-signedData (Finished)                       │
+│            or id-data (anonymous: [confirm, sealed_ack?]),          │
+│    }                                                                │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -1816,19 +1827,13 @@ Server verification flow:
 ```text
 Server Side - Verifying Client Authentication:
 ┌─────────────────────────────────────────────────────────────┐
-│ 1. Open the Payload                                         │
-│    payload = HPKE-Open(                                     │
-│        ciphertext: sealed_payload,                          │
-│        server_priv_key: server_private_key,                 │
-│        aad: domain_tag                                      │
-│    )                                                        │
-│    ✓ client_random echoes the hello                         │
+│ 1. Open the Closing                                         │
+│    cek = AES-256-KW.unwrap(k_close, encrypted_key)          │
+│    content = AES-256-GCM.open(cek, nonce, content, mac)     │
+│    ✓ The content type is id-signedData or id-data           │
 ├─────────────────────────────────────────────────────────────┤
-│ 2. Derive the Handshake Secret and Open the Identity        │
-│    ee = ECDH(server_ephemeral_priv, R)                      │
-│    hs = HKDF-SHA3-256(ee || base)                           │
-│    identity = AES-256-GCM.open(k_id, sealed_identity)       │
-│    ✓ R and enc differ from the certificate key              │
+│ 2. Compare R with the Certificate Key                       │
+│    ✓ R differs from the key of the offered certificate      │
 ├─────────────────────────────────────────────────────────────┤
 │ 3. Confirm the Handshake Secret                             │
 │    ✓ Key-confirmation tag matches                           │
@@ -1837,71 +1842,26 @@ Server Side - Verifying Client Authentication:
 │    ✓ Verify certificate is within validity period           │
 │    ✓ Check certificate chain against trust anchors          │
 ├─────────────────────────────────────────────────────────────┤
-│ 5. Verify the Possession Signature                          │
-│    signed = domain || transcript_hash || R || cert          │
-│    ✓ client_signature parses as DER ECDSA-Sig-Value         │
-│    Verify(client_signature, SHA3-256(signed), client_pub)   │
+│ 5. Verify the Client Finished                               │
+│    signed = client_finished_domain || transcript_hash       │
+│             || SHA3-256(DER(client_certificate))            │
+│    Verify(signature, SHA3-256(DER(attrs)), client_pub_key)  │
 │    ✓ Client holds the key of the certificate it offers      │
-│    ✓ Session established with forward secrecy               │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**HPKE sealing details:**
-
-The suite is DHKEM(secp256k1, HKDF-SHA3-256), HKDF-SHA3-256, and AES-256-GCM, in the base mode of [RFC 9180][rfc9180]:
-
-- **KEM**: Ephemeral-static ECDH, then a labeled HKDF over the encapsulated key and the recipient key
-- **KDF**: HKDF-SHA3-256 for the key schedule, which binds `info`
-- **AEAD**: AES-256-GCM under the derived key and nonce
-- **Ephemeral keys**: A fresh ephemeral key pair per message
-
-```text
-HPKE-Seal(recipient_pub_key, info, aad, plaintext):
-┌─────────────────────────────────────────────────────────┐
-│ 1. Generate ephemeral key pair                          │
-│    (ephemeral_priv, enc) = GenerateKeyPair()            │
-├─────────────────────────────────────────────────────────┤
-│ 2. Perform ECDH                                         │
-│    dh = ECDH(ephemeral_priv, recipient_pub)             │
-├─────────────────────────────────────────────────────────┤
-│ 3. Derive the KEM shared secret                         │
-│    shared_secret = ExtractAndExpand(                    │
-│        dh, enc || recipient_pub)                        │
-├─────────────────────────────────────────────────────────┤
-│ 4. Run the key schedule                                 │
-│    (key, base_nonce) = KeySchedule(shared_secret, info) │
-├─────────────────────────────────────────────────────────┤
-│ 5. Seal with AEAD                                       │
-│    ciphertext = AES-256-GCM.seal(                       │
-│        key, base_nonce, aad, plaintext)                 │
-├─────────────────────────────────────────────────────────┤
-│ 6. Return HPKE message                                  │
-│    return (enc || ciphertext)                           │
-└─────────────────────────────────────────────────────────┘
-```
-
-The IANA HPKE registry holds no value for HKDF-SHA3-256, so the KEM and KDF identifiers of this suite are tightbeam's own. `crypto::hpke` states both values.
-
-The handshake seals the payload under the domain tag alone. The client certificate and its signature ride inside the payload, sealed a second time under `k_id`, so an observer that later obtains the server's static key still reads no byte of them. [docs/handshake.md](docs/handshake.md#client-identity) states the padding and the associated data.
+A reply whose server Finished is absent or fails is refused before the client builds its closing, so the client sends no identity to a server that holds another secret. [docs/handshake.md](docs/handshake.md#client-identity) states the padding of the closing and the associated data.
 
 **Wire format comparison:**
 
-| Feature                | CMS-based                                           | HPKE-based                         |
-| ---------------------- | --------------------------------------------------- | ---------------------------------- |
-| Envelope structure     | RFC 5652 nested structures                          | Simplified ASN.1 structures        |
-| Key agreement          | DHKEM in a `KEMRecipientInfo` ([RFC 9629][rfc9629]) | DHKEM ([RFC 9180][rfc9180])        |
-| Session key encryption | `AuthEnvelopedData` + AES-KW + AES-256-GCM          | HPKE base mode + AES-256-GCM       |
-| Signatures             | `SignedData` structure                              | DER `ECDSA-Sig-Value` in ASN.1     |
-| Size overhead          | about 400-600 bytes                                 | about 200-300 bytes                |
-| Parsing complexity     | Multi-level ASN.1 nesting                           | Flat ASN.1 structures              |
-| Standards              | RFC 5652, [RFC 5083][rfc5083], [RFC 9629][rfc9629]  | [RFC 9180][rfc9180] + custom ASN.1 |
-
-**Performance characteristics** (relative to CMS on the same curves and algorithms):
-
-- Handshake time: about 20-30% faster (less parsing)
-- Memory use: about 30-40% lower (fewer ASN.1 intermediate structures)
-- Wire size: about 40-50% smaller
-- CPU for crypto primitives: similar
+| Feature             | CMS-based                                                                        | HPKE-based                                                             |
+| ------------------- | -------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| Opening             | `AuthEnvelopedData` with a `KEMRecipientInfo` ([RFC 9629][rfc9629])              | `ContentInfo` of type `id-data`                                        |
+| Server identity     | Provisioned before the opening                                                   | Learned from the reply's `certificates`                                |
+| Handshake secret    | Ephemeral ECDH and the base secret the opening seals                             | Ephemeral ECDH alone                                                   |
+| Server confirmation | The server Finished's signature over the transcript, and the server Finished MAC | The reply's signature over the transcript, and the server Finished MAC |
+| Closing             | `AuthEnvelopedData` with a `KEKRecipientInfo`                                    | The same closing                                                       |
+| Standards           | RFC 5652, [RFC 5083][rfc5083], [RFC 9629][rfc9629]                               | RFC 5652, [RFC 5083][rfc5083], the [RFC 9846][rfc9846] shape           |
 
 **Security equivalence:**
 
@@ -5966,9 +5926,12 @@ Unless you explicitly state otherwise, any contribution intentionally submitted 
 [rfc9688]: https://datatracker.ietf.org/doc/html/rfc9688
 [rfc9846]: https://datatracker.ietf.org/doc/html/rfc9846
 [rfc9846-4.2.3]: https://datatracker.ietf.org/doc/html/rfc9846#section-4.2.3
+[rfc9846-4.5.2]: https://datatracker.ietf.org/doc/html/rfc9846#section-4.5.2
 [rfc9846-4.5.3]: https://datatracker.ietf.org/doc/html/rfc9846#section-4.5.3
 [rfc9846-4.7.3]: https://datatracker.ietf.org/doc/html/rfc9846#section-4.7.3
 [rfc9846-5.5]: https://datatracker.ietf.org/doc/html/rfc9846#section-5.5
+[rfc9846-7.1]: https://datatracker.ietf.org/doc/html/rfc9846#section-7.1
+[rfc9846-f.1]: https://datatracker.ietf.org/doc/html/rfc9846#appendix-F.1
 [rfc9901]: https://datatracker.ietf.org/doc/html/rfc9901
 [itu-x680]: https://www.itu.int/rec/T-REC-X.680
 [itu-x690]: https://www.itu.int/rec/T-REC-X.690

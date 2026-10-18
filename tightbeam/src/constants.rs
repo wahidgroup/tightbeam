@@ -12,8 +12,9 @@
 //! - **Configuration.** Backpressure, mux, envelope, timeout, colony, gossip, and peer discovery bounds.
 
 /// KDF info string for the handshake secret (HKDF), which both protocols
-/// extract under the protocol salt from the ephemeral-ephemeral ECDH output
-/// followed by the client's base secret.
+/// extract under the protocol salt: the CMS flow from the ephemeral-ephemeral
+/// ECDH output followed by the client's base secret, and the HPKE flow from
+/// that output alone.
 pub const TIGHTBEAM_SESSION_KDF_INFO: &[u8] = b"tb/session/kdf/v1";
 
 /// KDF info string for the key that seals the receipt acknowledgement (HKDF).
@@ -34,44 +35,50 @@ pub const TIGHTBEAM_ACK_KDF_INFO: &[u8] = b"tb/session/kdf/ack/v1";
 /// so an opener of another purpose refuses the seal by its key identifier.
 pub const TIGHTBEAM_ACK_KEY_ID_DOMAIN: &[u8] = b"tb/handshake/ack/kekid/v1";
 
-/// KDF info label of the key that seals the client identity of a handshake
-/// (HKDF).
+/// KDF info label of the key that seals the closing of a handshake (HKDF):
+/// the client Finished, or the attributes of an anonymous client.
 ///
 /// The key derives from the handshake secret, which mixes the
-/// ephemeral-ephemeral agreement, so a later theft of the server's static key
-/// does not recover it. One identity travels per handshake, so the key is
+/// ephemeral-ephemeral agreement, so a later theft of a server static key
+/// does not recover it. One closing travels per handshake, so the key is
 /// single-use.
 ///
 /// # Sources
 ///
 /// - RFC 9846 § 4.5 and Appendix F.1, the client identity under handshake
 ///   keys: <https://datatracker.ietf.org/doc/html/rfc9846#appendix-F.1>
-pub const TIGHTBEAM_IDENTITY_KDF_INFO: &[u8] = b"tb/session/kdf/identity/v1";
+pub const TIGHTBEAM_CLOSING_KDF_INFO: &[u8] = b"tb/session/kdf/closing/v1";
 
-/// Domain label that leads the `kekid` of the identity seal, ahead of the
+/// Domain label that leads the `kekid` of the closing seal, ahead of the
 /// transcript hash.
-pub const TIGHTBEAM_IDENTITY_KEY_ID_DOMAIN: &[u8] = b"tb/handshake/identity/kekid/v1";
+pub const TIGHTBEAM_CLOSING_KEY_ID_DOMAIN: &[u8] = b"tb/handshake/closing/kekid/v1";
 
-/// Domain label that leads the bytes an HPKE client identity signs, ahead of
-/// the transcript hash, the client ephemeral, and the certificate.
-pub const TIGHTBEAM_HPKE_CLIENT_AUTH_DOMAIN: &[u8] = b"tb/handshake/client-auth/hpke/v1";
-
-/// Domain label that leads the bytes an HPKE server signs over its reply,
-/// ahead of the transcript hash.
-pub const TIGHTBEAM_HPKE_SERVER_AUTH_DOMAIN: &[u8] = b"tb/handshake/server-auth/hpke/v1";
-
-/// HKDF-Expand label of `mac_key`, the key of the key-confirmation tag.
+/// HKDF-Expand label of the `MacKey` of the client Finished, the key of the
+/// key-confirmation tag the closing carries.
 ///
-/// `mac_key` expands from the PRK of the handshake secret to the output length
+/// The key expands from the PRK of the handshake secret to the output length
 /// of the negotiated digest, and it keys the one HMAC over the transcript hash
 /// that forms the tag. The server derives the same tag before it settles, so a
 /// client that holds another secret ends the handshake at the closing.
 ///
 /// # Sources
 ///
-/// - RFC 9846 § 4.5.3, the Finished construction:
+/// - RFC 9846 § 4.5.3, a Finished key per role:
 ///   <https://datatracker.ietf.org/doc/html/rfc9846#section-4.5.3>
-pub const TIGHTBEAM_FINISHED_KEY_INFO: &[u8] = b"tb/handshake/finished/v1";
+pub const TIGHTBEAM_CLIENT_FINISHED_KEY_INFO: &[u8] = b"tb/handshake/finished/client/mac/v1";
+
+/// HKDF-Expand label of the `MacKey` of the server Finished, which the reply
+/// of either flow carries.
+///
+/// The key keys one HMAC over the transcript hash followed by the octets of
+/// the reply's signature, so the tag covers the transcript through the
+/// signature. The client verifies it before it sends its closing.
+///
+/// # Sources
+///
+/// - RFC 9846 § 4.5.3, the server Finished in the server's first flight:
+///   <https://datatracker.ietf.org/doc/html/rfc9846#section-4.5.3>
+pub const TIGHTBEAM_SERVER_FINISHED_KEY_INFO: &[u8] = b"tb/handshake/finished/server/mac/v1";
 
 /// KDF info string for the client-to-server session key (HKDF).
 ///
@@ -115,10 +122,11 @@ pub const TIGHTBEAM_EPOCH_KDF_INFO: &[u8] = b"tb/session/kdf/epoch/v1";
 ///   <https://datatracker.ietf.org/doc/html/rfc9629#section-5>
 pub const TIGHTBEAM_OPENING_UKM_LABEL: &[u8] = b"tb/handshake/opening/ukm/v1";
 
-/// Domain label a server CMS Finished signs ahead of the transcript hash.
+/// Domain label the CMS server Finished signs ahead of the transcript hash.
 pub const TIGHTBEAM_SERVER_FINISHED_DOMAIN: &[u8] = b"tb/handshake/finished/server/v1";
 
-/// Domain label a client CMS Finished signs ahead of the transcript hash.
+/// Domain label the client Finished of either flow signs ahead of the
+/// transcript hash.
 pub const TIGHTBEAM_CLIENT_FINISHED_DOMAIN: &[u8] = b"tb/handshake/finished/client/v1";
 
 /// Whether neither byte string is a prefix of the other, in a `const` context,
@@ -142,19 +150,9 @@ pub(crate) const fn prefix_free(a: &[u8], b: &[u8]) -> bool {
 	false
 }
 
-/// The domain labels that lead the bytes of each handshake signature. An
-/// associated-data domain enters an AEAD, so the set holds the signing labels
-/// alone. A new signing label joins this set, and the assertion below holds it
-/// apart from the others.
-const SIGNING_LABELS: [&[u8]; 4] = [
-	TIGHTBEAM_HPKE_SERVER_AUTH_DOMAIN,
-	TIGHTBEAM_HPKE_CLIENT_AUTH_DOMAIN,
-	TIGHTBEAM_SERVER_FINISHED_DOMAIN,
-	TIGHTBEAM_CLIENT_FINISHED_DOMAIN,
-];
-
 /// Whether no member of `labels` is a prefix of another member.
-const fn pairwise_prefix_free(labels: &[&[u8]]) -> bool {
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+pub(crate) const fn pairwise_prefix_free(labels: &[&[u8]]) -> bool {
 	let mut first = 0;
 	while first < labels.len() {
 		let mut second = first + 1;
@@ -170,25 +168,16 @@ const fn pairwise_prefix_free(labels: &[&[u8]]) -> bool {
 	true
 }
 
-// Each handshake signature signs its own label ahead of the bytes it covers.
-// When no label is a prefix of another, the signed bytes of one purpose never
-// read as those of another.
-const _: () = assert!(pairwise_prefix_free(&SIGNING_LABELS));
-
-/// AAD (Additional Authenticated Data) domain tag prefix.
-pub const TIGHTBEAM_AAD_DOMAIN_TAG: &[u8] = b"tb/aead/v1";
+// Each Finished signs its role's label ahead of the transcript hash. When
+// neither label is a prefix of the other, a Finished of one role never reads
+// as one of the other.
+const _: () = assert!(prefix_free(TIGHTBEAM_SERVER_FINISHED_DOMAIN, TIGHTBEAM_CLIENT_FINISHED_DOMAIN));
 
 /// Minimum salt entropy in bytes for secure key derivation (HKDF).
 ///
 /// CMS and HPKE both read it when they derive session keys through HKDF, and
 /// the salt must carry at least this many bytes of randomness.
 pub const MIN_SALT_ENTROPY_BYTES: usize = 16;
-
-/// The HPKE `info` of a handshake key exchange (RFC 9180 § 5.1).
-///
-/// It separates the key schedule of a handshake from that of a frame sealed to
-/// the same key, and it versions the grammar of the sealed payload.
-pub const TIGHTBEAM_HPKE_HANDSHAKE_INFO: &[u8] = b"tb/hpke/handshake/v2";
 
 /// The HPKE `info` of a frame sealed to a recipient key (RFC 9180 § 5.1).
 pub const TIGHTBEAM_HPKE_FRAME_INFO: &[u8] = b"tb/hpke/frame/v1";
@@ -946,6 +935,7 @@ mod tests {
 
 	/// A prefix pair at the two ends of a set fails the check, so the check
 	/// reaches every pair of the set.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[test]
 	fn a_prefix_pair_at_the_ends_of_a_set_is_found() {
 		let labels: [&[u8]; 3] = [b"tb/a", b"tb/b", b"tb/a/v1"];

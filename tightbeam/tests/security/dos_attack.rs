@@ -115,7 +115,7 @@ job! {
 
 			trace.event(DOS_INJECT_OVERSIZED)?;
 
-			// Inject at step 0 (ClientHello for HPKE, KeyExchange for CMS)
+			// Inject at step 0 (the hello for HPKE, the opening for CMS)
 			// The oversized message should be rejected
 			match session.inject_at_step(0, &oversized_payload).await? {
 				InjectionOutcome::Rejected(_) => {

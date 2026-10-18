@@ -11,13 +11,14 @@
 //!
 //! ## Expected control
 //! Both parties MUST sign `transcript_hash`, verified against certificates. Any
-//! modification MUST cause signature-verification failure (HPKE: tampered
-//! `ServerHandshake`; CMS: tampered `Finished` `SignedData`).
+//! modification MUST cause signature-verification failure (HPKE: the tampered
+//! `ServerHandshake` the reply signs, CMS: the tampered `Finished`
+//! `SignedData`).
 //!
 //! ## References
 //! - CWE-300: Channel Accessible by Non-Endpoint <https://cwe.mitre.org/data/definitions/300.html>
 //! - CAPEC-94: Adversary in the Middle (AiTM) <https://capec.mitre.org/data/definitions/94.html>
-//! - RFC 9846 (TLS 1.3) §4.4.3: transcript-bound CertificateVerify/Finished
+//! - RFC 9846 (TLS 1.3) §4.5.2 and §4.5.3: transcript-bound CertificateVerify and Finished
 
 use std::sync::Arc;
 
@@ -117,7 +118,7 @@ job! {
 
 			// ========================================
 			// Step 2: Find a server-to-client message to tamper
-			// HPKE: ServerHandshake (step 1)
+			// HPKE: the reply (step 1)
 			// CMS: ServerFinished (step 2)
 			// ========================================
 			let target = captured

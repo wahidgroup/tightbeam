@@ -39,9 +39,9 @@ mod multiplex {
 #[cfg(feature = "transport-multiplex")]
 use multiplex::*;
 
+use crate::cms::content_info::ContentInfo;
 use crate::cms::signed_data::SignedData;
 use crate::crypto::cms::AuthEnvelopedData;
-use crate::transport::handshake::ClientKeyExchange;
 use crate::transport::wire_der::WireDer;
 
 /// A request package that carries the message frame.
@@ -868,19 +868,21 @@ pub enum TransportEnvelope {
 	/// The response to a single-flight request.
 	#[asn1(context_specific = "1", constructed = "true")]
 	Response(ResponsePackage),
-	// Tag 2 is reserved for the retired `EnvelopedData` container, and tag 5
-	// for the retired `EncryptedData` container. Neither is reused, so an
-	// archived capture never decodes a stale meaning.
+	// Tag 2 is reserved for the retired `EnvelopedData` container, tag 5 for
+	// the retired `EncryptedData` container, and tag 6 for the retired HPKE
+	// key exchange. None is reused, so an archived capture never decodes a
+	// stale meaning.
 	/// A signed handshake container, kept with the bytes that carried it.
 	#[asn1(context_specific = "3", constructed = "true")]
 	SignedData(Box<WireDer<SignedData>>),
-	/// The closing of an HPKE handshake, kept with the bytes that carried it.
-	#[asn1(context_specific = "6", constructed = "true")]
-	ClientKeyExchange(Box<WireDer<ClientKeyExchange>>),
 	/// An authenticated-enveloped handshake container, kept with the bytes
 	/// that carried it.
 	#[asn1(context_specific = "7", constructed = "true")]
 	AuthEnvelopedData(Box<WireDer<AuthEnvelopedData>>),
+	/// A `ContentInfo` of type `id-data`, the HPKE hello, kept with the bytes
+	/// that carried it.
+	#[asn1(context_specific = "8", constructed = "true")]
+	Data(Box<WireDer<ContentInfo>>),
 	/// A multiplexing message.
 	#[cfg(feature = "transport-multiplex")]
 	#[asn1(context_specific = "4", constructed = "true")]
@@ -1441,18 +1443,14 @@ mod tests {
 		Ok(())
 	}
 
-	/// The closing of an HPKE handshake travels under context tag 6 of the
-	/// transport envelope.
+	/// Tag 6 stays reserved, so an envelope under it decodes as no message
+	/// and an archived capture never takes a stale meaning. The bytes are a
+	/// SEQUENCE of one empty OCTET STRING under `[6]`, the shape of the HPKE
+	/// key exchange the tag is reserved for.
 	#[test]
-	fn an_hpke_key_exchange_travels_under_tag_6() -> Result<(), Box<dyn Error>> {
-		use crate::asn1::OctetString;
-
-		let sealed_payload = OctetString::new([0u8; 16])?;
-		let key_exchange = ClientKeyExchange { sealed_payload, unprotected_attrs: None };
-		let envelope = TransportEnvelope::ClientKeyExchange(Box::new(WireDer::new(key_exchange)?));
-
-		let encoded = envelope.to_der()?;
-		assert_eq!(encoded.first(), Some(&0xA6));
-		Ok(())
+	fn an_envelope_under_the_reserved_tag_6_is_refused() {
+		let reserved = [0xA6, 0x04, 0x30, 0x02, 0x04, 0x00];
+		let decoded = TransportEnvelope::from_der(&reserved);
+		assert!(decoded.is_err());
 	}
 }

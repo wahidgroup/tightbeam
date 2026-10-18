@@ -1,39 +1,59 @@
-//! The messages of one handshake protocol.
+//! The messages of one handshake protocol, and the one closing both send.
 //!
-//! A flow encodes and decodes the three legs of one protocol, binds them into
-//! the transcript, carries the base secret, and makes the checks its messages
-//! define. The orchestrator owns the step order and every negotiation and
-//! admission decision, and it acts on the decoded facts alone.
+//! A flow encodes and decodes the opening and the reply of one protocol,
+//! binds them into the transcript, and makes the checks its messages define.
+//! The orchestrator owns the step order and every negotiation and admission
+//! decision, and it acts on the decoded facts alone.
 //!
 //! A step of the orchestrator works between three kinds of flow call:
 //!
 //! 1. A `read_*` or `bind_*` call returns the facts of the leg and the bytes to sign.
-//! 2. The orchestrator admits, negotiates, and countersigns. `sign` signs each
-//!    prehash under the signing identity.
+//! 2. The orchestrator admits, negotiates, and countersigns, and the signing identity signs each prehash.
 //! 3. An `encode_*` call takes the result and builds the message.
 //!
 //! The [legs](crate::transport::handshake#legs) table names the message each
 //! protocol sends on each leg.
+//!
+//! ## The closing
+//!
+//! Both flows derive the handshake secret at the reply, and both seal the
+//! closing under its closing key as an `AuthEnvelopedData` with one
+//! `KEKRecipientInfo`. [`ClosingDraft`] builds the closing and signs its
+//! client Finished, and [`ClosingContent`] is the one reader of its two forms:
+//!
+//! - `id-signedData`: the client Finished, which carries the key-confirmation tag and the acknowledgement.
+//! - `id-data`: the DER `SET OF Attribute` of an anonymous client, which holds those two attributes alone.
 
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, vec::Vec};
+use alloc::{boxed::Box, vec, vec::Vec};
 
-use crate::cms::signed_data::SignedData;
+use crate::cms::cert::CertificateChoices;
+use crate::cms::signed_data::{CertificateSet, SignedData};
+use crate::crypto::cms::AuthEnvelopedData;
 use crate::crypto::sign::elliptic_curve::ecdh::EphemeralSecret;
-use crate::crypto::sign::elliptic_curve::{CurveArithmetic, PublicKey};
-use crate::crypto::sign::{Signed, SigningIdentity};
+use crate::crypto::sign::elliptic_curve::{CurveArithmetic, PublicKey, SecretKey};
+use crate::crypto::sign::{CmsSigner, Signed, SignedContent, SignerInfoDraft, SigningIdentity};
+use crate::crypto::subtle::ConstantTimeEq;
+use crate::der::asn1::OctetString;
+use crate::der::{Decode, Encode};
+use crate::oids::{DATA, RECEIPT_ACK, SIGNED_DATA};
 use crate::random::CryptoRngCore;
+use crate::transport::handshake::attributes::{AttributePayload, HandshakeAttribute, HandshakeAttributes};
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::negotiation::{
 	RunnableProfile, SecurityAccept, SecurityOffer, TransportAccept, TransportOffer,
 };
-use crate::transport::handshake::peer::{PeerCertificate, PossessionProof, ServerTrust};
+use crate::transport::handshake::peer::{PeerCertificate, ServerTrust};
 use crate::transport::handshake::primitives::{KdfSalt, TranscriptHash};
 use crate::transport::handshake::schedule::{
-	ConfirmedSecret, KeyConfirmation, PeerEphemeral, PeerPoint, Salt, Sealer, Terms,
+	Agreement, ConfirmedSecret, FinishedRole, KeyConfirmation, PeerEphemeral, PeerPoint, Salt, Sealer, SecretSeal,
+	Terms,
 };
 use crate::transport::handshake::{HandshakeCurve, HandshakeMessage, HandshakeProvider, HandshakeSecret};
+use crate::transport::wire_der::WireDer;
 use crate::utils::marker::{MaybeSend, MaybeSendFuture, MaybeSync};
+use crate::x509::attr::{Attribute, Attributes};
+use crate::x509::Certificate;
 
 #[cfg(feature = "transport-cms")]
 mod cms;
@@ -55,25 +75,7 @@ mod sealed {
 /// A handshake protocol, named by its marker type.
 ///
 /// The trait is sealed, so [`Hpke`] and [`Cms`] are the only flows.
-pub trait HandshakeFlow: sealed::Sealed + Sized + MaybeSend + MaybeSync + 'static {
-	/// What a signed leg of this protocol carries of its signer.
-	type Signed: MaybeSend;
-
-	/// Sign `prehash` under `identity`, which returns the signature in its
-	/// canonical form.
-	///
-	/// The protocol makes the calls, so a key provider answers the ones its
-	/// messages need and no other.
-	///
-	/// # Errors
-	///
-	/// - [`HandshakeError::KeyError`] -- the key provider failed.
-	/// - [`HandshakeError::SignatureVerificationFailed`] -- the provider returned no DER signature.
-	fn sign<'a>(
-		identity: &'a SigningIdentity,
-		prehash: &'a [u8],
-	) -> MaybeSendFuture<'a, Result<Self::Signed, HandshakeError>>;
-}
+pub trait HandshakeFlow: sealed::Sealed + Sized + MaybeSend + MaybeSync + 'static {}
 
 /// What the client configuration contributes to the opening.
 pub struct OpeningParts<'a> {
@@ -114,41 +116,106 @@ pub struct ReplyIntake<F: ClientLegs<P>, P: HandshakeProvider> {
 	pub transcript_hash: TranscriptHash,
 	/// The KDF salt of the flow.
 	pub salt: Salt,
-	/// The signed reply, kept for verification and for the closing.
-	pub reply: F::Reply,
+	/// The signed reply, kept for verification and for the server Finished.
+	pub reply: SignedData,
 }
 
-/// What the orchestrator contributes to the closing.
-pub struct ClosingParts<'a, P: HandshakeProvider> {
-	/// The admitted server certificate, with its key.
-	pub server: &'a PeerCertificate<P::Curve>,
-	/// The hash of the sealed transcript.
-	pub transcript_hash: &'a TranscriptHash,
-	/// The DER of the `AuthEnvelopedData` that seals the receipt
-	/// countersignature under the handshake secret.
-	pub sealed_ack: Option<Vec<u8>>,
-	/// The proof that the client derived the handshake secret.
-	pub confirmation: KeyConfirmation,
-	/// The single-use seal the client identity is sealed under, keyed by the
-	/// handshake secret.
-	pub identity_sealer: Sealer<P>,
+/// The proof that the signature of a reply verified under the server the
+/// client admitted.
+///
+/// [`ClientLegs::verify_reply`] is its one constructor, and
+/// [`ServerConfirmed::confirm`] takes it, so a secret confirms only a server
+/// whose reply signature verified. Its field stays private to the flows.
+pub struct ReplyVerified(());
+
+/// The handshake secret of a client that verified the reply's signature and
+/// its server Finished.
+///
+/// [`Handshake::close`](crate::transport::handshake::Handshake) takes it, so a
+/// closing exists only after [`Self::confirm`] ran. [`Self::confirm`] is its
+/// one constructor, for both flows.
+pub struct ServerConfirmed(HandshakeSecret);
+
+impl ServerConfirmed {
+	/// Verify the server Finished of `reply` under `secret`, for a reply whose
+	/// signature `verified` proves, and confirm the server.
+	///
+	/// The server Finished travels once, as an unsigned attribute of the
+	/// reply's `SignerInfo`, and the secret comes back only when it verifies.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::MissingAttribute`] -- the reply carries no server Finished.
+	/// - [`HandshakeError::DuplicateAttribute`] -- the reply carries its server Finished twice.
+	/// - [`HandshakeError::DerError`] -- the server Finished is no OCTET STRING of 32 to 64 bytes.
+	/// - [`HandshakeError::SignatureVerificationFailed`] -- the reply does not have exactly one signer.
+	/// - [`HandshakeError::KeyConfirmationFailed`] -- the server Finished fails to verify.
+	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the server's `MacKey`.
+	/// - [`HandshakeError::TranscriptDigestLength`] -- the provider digest is not 32 to 64 bytes wide.
+	pub(crate) fn confirm<P: HandshakeProvider>(
+		reply: &SignedData,
+		verified: ReplyVerified,
+		secret: HandshakeSecret,
+		terms: &Terms<P>,
+	) -> Result<Self, HandshakeError> {
+		let ReplyVerified(()) = verified;
+		let finished = reply.find_unsigned_attr(KeyConfirmation::OID)?;
+		let finished = finished.ok_or(HandshakeError::MissingAttribute)?;
+		let received = finished.decode::<KeyConfirmation>()?;
+
+		let secret = terms.confirm_server(secret, reply, &received)?;
+		Ok(Self(secret))
+	}
+
+	/// Take the secret, for the closing and the session that derive from it.
+	pub(crate) fn into_secret(self) -> HandshakeSecret {
+		self.0
+	}
 }
 
-/// The possession proof a closing still needs: the bytes to sign, beside the
-/// identity that signs them.
-pub struct ProofRequest<'a> {
-	/// The bytes the client identity signs.
-	pub prehash: Vec<u8>,
-	/// The identity whose key signs them.
-	pub signer: &'a SigningIdentity,
+/// What a client flow holds from its opening to the agreement: the private
+/// half of its agreement ephemeral `R`, and the one decision of the flow,
+/// which agreement it makes with the server ephemeral.
+///
+/// [`Self::agree`] is the one settlement of the client's handshake secret.
+pub trait ClientAgreement<P: HandshakeProvider>: Sized {
+	/// The agreement this value makes with the server ephemeral `peer`: the
+	/// hybrid agreement with the base secret in the CMS flow, or the
+	/// ephemeral agreement in the HPKE flow.
+	fn agreement<'a>(&'a self, peer: &'a PeerPoint<P::Curve>) -> Agreement<'a, P>;
+
+	/// The private half of the client's agreement ephemeral `R`.
+	fn ephemeral(&self) -> &SecretKey<P::Curve>;
+
+	/// Settle the agreement with `server_ephemeral` under `salt`. The value
+	/// drops here, so each secret it holds is wiped with the call.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the handshake secret.
+	fn agree(
+		self,
+		server_ephemeral: &PeerPoint<P::Curve>,
+		salt: KdfSalt<'_>,
+	) -> Result<HandshakeSecret, HandshakeError> {
+		self.agreement(server_ephemeral).settle(self.ephemeral(), salt)
+	}
 }
 
-/// A closing that awaits its possession proof.
-pub struct ClosingBinding<'a, F: ClientLegs<P>, P: HandshakeProvider> {
-	/// The proof to sign, when an identity presents itself in the closing.
-	pub proof: Option<ProofRequest<'a>>,
-	/// The closing, complete except for that proof.
-	pub draft: F::Draft,
+/// What a server flow holds from its open of the opening to the reply: the
+/// client's agreement ephemeral `R`, and the one decision of the flow, which
+/// agreement it makes with `R`.
+///
+/// [`ServerPending::settle`] is the one settlement of the server's handshake
+/// secret.
+pub trait ServerAgreement<P: HandshakeProvider> {
+	/// The client's agreement ephemeral `R`.
+	fn client_ephemeral(&self) -> &PeerPoint<P::Curve>;
+
+	/// The agreement this value makes with `R`: the hybrid agreement with the
+	/// base secret in the CMS flow, or the ephemeral agreement in the HPKE
+	/// flow.
+	fn agreement(&self) -> Agreement<'_, P>;
 }
 
 /// The client side of one protocol. It is sealed, so the flow markers of this
@@ -164,7 +231,7 @@ impl<P: HandshakeProvider, F: ClientLegs<P>> ClientFlow<P> for F {}
 ///
 /// Both flows return the same intake shapes and refuse with the same
 /// [`HandshakeError`] set, so the orchestrator runs one step order over
-/// either.
+/// either. Both flows send the one closing this module builds.
 pub trait ClientLegs<P: HandshakeProvider>: HandshakeFlow {
 	/// What a client of this protocol is provisioned with.
 	type Settings: MaybeSend + MaybeSync + 'static;
@@ -173,13 +240,7 @@ pub trait ClientLegs<P: HandshakeProvider>: HandshakeFlow {
 	/// What the flow keeps from the opening to read the reply against.
 	type Opening: MaybeSend + MaybeSync + 'static;
 	/// The secrets the flow holds from the opening to the agreement.
-	type Pending: MaybeSend + MaybeSync + 'static;
-	/// The decoded reply, kept for verification and for the closing.
-	type Reply: MaybeSend + 'static;
-	/// What the agreement hands to the closing.
-	type Agreed: MaybeSend + 'static;
-	/// The closing that awaits its possession proof.
-	type Draft: MaybeSend + 'static;
+	type Pending: ClientAgreement<P> + MaybeSend + MaybeSync + 'static;
 
 	/// The identity the client presents, when it holds one.
 	fn identity(settings: &Self::Settings) -> Option<&SigningIdentity>;
@@ -209,6 +270,7 @@ pub trait ClientLegs<P: HandshakeProvider>: HandshakeFlow {
 	///
 	/// - [`HandshakeError::UnexpectedContainer`] -- the reply travels in another container.
 	/// - [`HandshakeError::AbortReceived`] -- the reply carries an abort alert.
+	/// - [`HandshakeError::MissingServerCertificate`] -- the reply carries no certificate its signer names.
 	/// - [`HandshakeError`] -- the reply fails to decode, or a leg fails to bind.
 	fn read_reply(
 		opening: Self::Opening,
@@ -217,68 +279,30 @@ pub trait ClientLegs<P: HandshakeProvider>: HandshakeFlow {
 	) -> Result<ReplyIntake<Self, P>, HandshakeError>;
 
 	/// Verify the signature of the reply under the key of `server`, over the
-	/// bytes this flow derives from `transcript_hash`.
+	/// content and the transcript hash this flow signs, and return the proof
+	/// that [`ServerConfirmed::confirm`] takes.
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError::SignatureError`] -- the HPKE signature fails to parse or to verify.
-	/// - [`HandshakeError::TranscriptDigestLength`] -- the HPKE digest is not 32 to 64 bytes wide.
-	/// - [`HandshakeError::SignatureVerificationFailed`] -- the CMS Finished
-	///   fails to verify, names another signer than `server`, or signs another
-	///   transcript or another role.
+	/// - [`HandshakeError::SignatureVerificationFailed`] -- the reply fails to
+	///   verify, names another signer than `server`, or signs another
+	///   transcript.
+	/// - [`HandshakeError::DerError`] -- a signed attribute fails to encode.
 	fn verify_reply(
-		reply: &Self::Reply,
+		reply: &SignedData,
 		server: &PeerCertificate<P::Curve>,
 		transcript_hash: &TranscriptHash,
-	) -> Result<(), HandshakeError>;
-
-	/// Derive the handshake secret from the client half of the agreement.
-	///
-	/// # Errors
-	///
-	/// - [`HandshakeError::RandomGenerationFailed`] -- the random source failed.
-	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the handshake secret.
-	fn agree(
-		pending: Self::Pending,
-		server_ephemeral: &PeerPoint<P::Curve>,
-		salt: KdfSalt<'_>,
-		rng: &mut dyn CryptoRngCore,
-	) -> Result<(HandshakeSecret, Self::Agreed), HandshakeError>;
-
-	/// Build the closing up to its possession proof, and name the bytes that
-	/// proof signs beside the identity that signs them.
-	///
-	/// # Errors
-	///
-	/// - [`HandshakeError`] -- the bytes the proof signs fail to encode or to hash.
-	fn bind_closing<'a>(
-		agreed: Self::Agreed,
-		reply: Self::Reply,
-		settings: &'a Self::Settings,
-		parts: ClosingParts<'_, P>,
-	) -> Result<ClosingBinding<'a, Self, P>, HandshakeError>;
-
-	/// Encode the closing with the possession proof, when the client signed
-	/// one.
-	///
-	/// # Errors
-	///
-	/// - [`HandshakeError::MutualAuthRequired`] -- the protocol requires a
-	///   proof and none came, or a certificate and its proof come apart.
-	/// - [`HandshakeError::SealedIdentity`] -- the envelope refused to seal the identity.
-	/// - [`HandshakeError::SealedFrame`] -- the identity exceeds the frame.
-	/// - [`HandshakeError::HpkeError`] -- the payload fails to seal to the server's static key.
-	/// - [`HandshakeError`] -- the closing fails to encode.
-	fn encode_closing(draft: Self::Draft, proof: Option<Self::Signed>) -> Result<HandshakeMessage, HandshakeError>;
+	) -> Result<ReplyVerified, HandshakeError>;
 }
 
-/// The facts of a decoded opening, with what it sealed to the static key.
+/// The facts of a decoded opening, with what the flow keeps for its open.
 pub struct OpeningIntake<F: ServerLegs<P>, P: HandshakeProvider> {
 	/// The security profiles the client offers.
 	pub security_offer: Option<SecurityOffer>,
 	/// The transport capabilities the client offers.
 	pub transport_offer: Option<TransportOffer>,
-	/// What the opening sealed to the server's static key.
+	/// What the server opens of the opening: the CMS content sealed to its
+	/// static key, or the HPKE hello.
 	pub sealed: F::Sealed,
 }
 
@@ -308,101 +332,59 @@ pub struct ReplyBinding<F: ServerLegs<P>, P: HandshakeProvider> {
 	pub draft: F::Draft,
 }
 
-/// The identity a client offers, with the proof that it holds the key, or
-/// none.
+/// What a server holds from its reply to the closing.
 ///
-/// Its constructors are private to the flows, so an offer exists only where a
-/// flow opened the closing. [`Self::new`] refuses an identity whose key
-/// collapses an ephemeral of the client, so no offer exists for that client.
-pub struct Offer<C: CurveArithmetic, Proof>(Option<(PeerCertificate<C>, Proof)>);
-
-impl<C: HandshakeCurve, Proof> Offer<C, Proof> {
-	/// The offer of a client that presents no identity. A CMS Finished is
-	/// itself a proof, so only an HPKE closing yields this offer.
-	#[cfg(feature = "transport-hpke")]
-	fn anonymous() -> Self {
-		Self(None)
-	}
-
-	/// The offer of `identity`, proven by `proof`.
-	///
-	/// A server learns its client's static key only after the agreement, so
-	/// the comparison lives here: each of `ephemerals` MUST have an
-	/// x-coordinate other than that of the identity's key. ECDH keeps the
-	/// x-coordinate alone, so a match would collapse the agreement into the
-	/// static one.
-	///
-	/// # Errors
-	///
-	/// - [`HandshakeError::ClientEphemeralIsStatic`] -- an ephemeral collapses into the key of `identity`.
-	fn new<'k>(
-		identity: PeerCertificate<C>,
-		proof: Proof,
-		ephemerals: impl IntoIterator<Item = &'k PublicKey<C>>,
-	) -> Result<Self, HandshakeError>
-	where
-		C: 'k,
-	{
-		let key = identity.key();
-		let collapsed = ephemerals.into_iter().any(|ephemeral| key.distinct(*ephemeral).is_none());
-		if collapsed {
-			return Err(HandshakeError::ClientEphemeralIsStatic);
-		}
-
-		Ok(Self(Some((identity, proof))))
-	}
-
-	/// The identity and its proof, for the admission that verifies them.
-	pub(crate) fn into_identity(self) -> Option<(PeerCertificate<C>, Proof)> {
-		self.0
-	}
-}
-
-/// What the server holds once the closing is opened.
-///
-/// The fields stay private to the flows, and [`Self::confirm`] is the one way
-/// out, so the offer reaches admission only after the key-confirmation tag
-/// verified.
-pub struct ClosingOpened<F: ServerLegs<P>, P: HandshakeProvider> {
-	/// The handshake secret both sides derived.
+/// Both flows derive the handshake secret at the reply. The client's
+/// agreement ephemeral `R` stays for the offer, which compares it with the key
+/// of the certificate the closing presents. [`Self::settle`] is its one
+/// constructor, for both flows.
+pub struct ServerPending<C: CurveArithmetic> {
+	/// The handshake secret, derived when the reply was built.
 	secret: HandshakeSecret,
-	/// The key-confirmation tag the closing carried.
-	confirmation: KeyConfirmation,
-	/// The DER of the envelope that seals the receipt countersignature under
-	/// the handshake secret.
-	receipt_ack: Option<Vec<u8>>,
-	/// The identity the client offers.
-	offer: Offer<P::Curve, F::Proof>,
+	/// The client's agreement ephemeral `R`.
+	client_ephemeral: PublicKey<C>,
 }
 
-impl<F: ServerLegs<P>, P: HandshakeProvider> ClosingOpened<F, P> {
-	/// Verify the key-confirmation tag against the secret, and release the
-	/// offer.
+impl<C: HandshakeCurve> ServerPending<C> {
+	/// Settle the agreement `opened` makes with the server `ephemeral` under
+	/// the salt of `terms`, and keep `R` for the offer. `opened` and the
+	/// ephemeral drop here, so each secret they hold is wiped with the call.
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the derivation.
-	/// - [`HandshakeError::KeyConfirmationFailed`] -- the client derived
-	///   another secret or confirmed another transcript.
-	pub(crate) fn confirm(self, terms: &Terms<P>) -> Result<ConfirmedClosing<F, P>, HandshakeError> {
-		let Self { secret, confirmation, receipt_ack, offer } = self;
-		let secret = terms.confirm(secret, &confirmation)?;
-		Ok(ConfirmedClosing { secret, receipt_ack, offer })
-	}
-}
+	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the handshake secret.
+	pub(crate) fn settle<P: HandshakeProvider<Curve = C>>(
+		opened: impl ServerAgreement<P>,
+		ephemeral: Box<EphemeralSecret<C>>,
+		terms: &Terms<P>,
+	) -> Result<Self, HandshakeError> {
+		let agreement = opened.agreement();
 
-/// A closing whose key-confirmation tag verified.
-///
-/// Its secret is a [`ConfirmedSecret`], which only the check of the tag
-/// yields, so the offer it holds passed that check.
-pub struct ConfirmedClosing<F: ServerLegs<P>, P: HandshakeProvider> {
-	/// The handshake secret the tag confirmed.
-	pub(crate) secret: ConfirmedSecret,
-	/// The DER of the envelope that seals the receipt countersignature under
-	/// the handshake secret.
-	pub(crate) receipt_ack: Option<Vec<u8>>,
-	/// The identity the client offers.
-	pub(crate) offer: Offer<P::Curve, F::Proof>,
+		let secret = agreement.settle(ephemeral.as_ref(), terms.kdf_salt())?;
+		let client_ephemeral = *opened.client_ephemeral().as_public_key();
+		Ok(Self { secret, client_ephemeral })
+	}
+
+	/// Attach the server Finished to `reply`: the MAC under the secret this
+	/// value holds over the transcript hash of `terms` and the octets of the
+	/// reply's one signature, as an unsigned attribute of its `SignerInfo`
+	/// (RFC 9846 § 4.5.3).
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the server's `MacKey`.
+	/// - [`HandshakeError::SignatureVerificationFailed`] -- `reply` does not have exactly one signer.
+	/// - [`HandshakeError::DerError`] -- the attribute or the reply fails to encode.
+	pub(crate) fn finish_reply<P: HandshakeProvider<Curve = C>>(
+		&self,
+		reply: Signed<SignedData>,
+		terms: &Terms<P>,
+	) -> Result<HandshakeMessage, HandshakeError> {
+		let finished = terms.server_confirmation(&self.secret, &reply)?;
+		let finished = Attribute::try_from(HandshakeAttribute::encode(&finished)?)?;
+		let reply = reply.with_unsigned_attribute(finished)?;
+		HandshakeMessage::try_from(reply.into_inner())
+	}
 }
 
 /// The server side of one protocol. It is sealed, so the flow markers of this
@@ -418,32 +400,27 @@ impl<P: HandshakeProvider, F: ServerLegs<P>> ServerFlow<P> for F {}
 ///
 /// Both flows return the same intake shapes and refuse with the same
 /// [`HandshakeError`] set, so the orchestrator runs one step order over
-/// either. The two asynchronous methods open what the client sealed, and a
-/// static-key step among them runs through the signing identity's key
-/// provider, so the private key can stay behind an external boundary.
+/// either. The asynchronous open of the opening runs a static-key step
+/// through the signing identity's key provider, so the private key can stay
+/// behind an external boundary.
 pub trait ServerLegs<P: HandshakeProvider>: HandshakeFlow {
 	/// What a server of this protocol is provisioned with.
 	type Settings: MaybeSend + MaybeSync + 'static;
 	/// What the opening sealed to the static key.
 	type Sealed: MaybeSend + 'static;
 	/// What the flow holds from the static open to the reply.
-	type Opened: MaybeSend + 'static;
+	type Opened: ServerAgreement<P> + MaybeSend + 'static;
 	/// The reply that awaits its signature and its receipt.
 	type Draft: MaybeSend + 'static;
-	/// The secrets the flow holds from the reply to the closing.
-	type Pending: MaybeSend + MaybeSync + 'static;
-	/// What the closing still holds for the agreement.
-	type Closing: MaybeSend + 'static;
-	/// The proof that the key of the offered certificate signed the closing.
-	type Proof: PossessionProof<P> + MaybeSend + 'static;
 
 	/// Decode the opening, and open the transcript over it.
 	///
 	/// # Errors
 	///
 	/// - [`HandshakeError::UnexpectedContainer`] -- the opening travels in another container.
-	/// - [`HandshakeError::AbortReceived`] -- the opening carries an abort alert.
+	/// - [`HandshakeError::AbortReceived`] -- the CMS opening carries an abort alert.
 	/// - [`HandshakeError::DuplicateAttribute`] -- an offer or the abort alert repeats.
+	/// - [`HandshakeError::InvalidPublicKey`] -- the HPKE client ephemeral is not a point on the curve.
 	/// - [`HandshakeError`] -- the opening fails to decode.
 	fn read_opening(
 		settings: &Self::Settings,
@@ -478,89 +455,486 @@ pub trait ServerLegs<P: HandshakeProvider>: HandshakeFlow {
 		rng: &mut dyn CryptoRngCore,
 	) -> Result<ReplyBinding<Self, P>, HandshakeError>;
 
-	/// Encode the reply with the server signature and the receipt artifact.
+	/// Encode the reply with the server signature and the receipt artifact,
+	/// up to the server Finished that [`ServerPending::finish_reply`]
+	/// attaches.
 	///
 	/// # Errors
 	///
 	/// - [`HandshakeError`] -- the reply fails to encode.
 	fn encode_reply(
 		draft: Self::Draft,
-		signed: Self::Signed,
+		signature: Vec<u8>,
 		artifact: Option<&Signed<SignedData>>,
-	) -> Result<HandshakeMessage, HandshakeError>;
+	) -> Result<Signed<SignedData>, HandshakeError>;
+}
 
-	/// Fix what the server carries from the reply to the closing.
-	///
-	/// The ephemeral arrives boxed, so a flow that keeps it for the closing
-	/// moves a pointer, and the scalar is wiped where the box drops.
+impl FinishedRole {
+	/// Draft the Finished that `identity` signs for this role over
+	/// `transcript_hash` and the certificate of `identity`.
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the handshake secret.
-	fn pend(
-		opened: Self::Opened,
-		ephemeral: Box<EphemeralSecret<P::Curve>>,
-		terms: &Terms<P>,
-	) -> Result<Self::Pending, HandshakeError>;
+	/// - [`HandshakeError::DerError`] -- the certificate or a signed attribute fails to encode.
+	/// - [`HandshakeError::TranscriptDigestLength`] -- the provider digest is not 32 to 64 bytes wide.
+	pub(crate) fn draft<P: HandshakeProvider>(
+		self,
+		identity: &SigningIdentity,
+		transcript_hash: &TranscriptHash,
+	) -> Result<FinishedDraft, HandshakeError> {
+		let content = self.content::<P::Digest>(transcript_hash, identity.certificate())?;
+		let signer = identity.draft(SignedContent::data(&content))?;
+		Ok(FinishedDraft { content, signer })
+	}
 
-	/// Decode the closing without opening it.
+	/// Verify that `finished` is signed under the key of `certificate`, which
+	/// its one `SignerInfo` names, and that its content is this role's over
+	/// `transcript_hash` and `certificate`.
 	///
-	/// It takes the pending state of the reply, and the closing it returns
-	/// holds what [`Self::settle`] reads of that state.
+	/// The `SignedData` carries the signed attributes of the CMS signer over
+	/// content of type `id-data`. A Finished whose content names the other
+	/// role is a reflected Finished.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::SignatureVerificationFailed`] -- the Finished
+	///   carries another number of signers, fails the signer's checks, or
+	///   signs another role, another transcript, or another certificate.
+	/// - [`HandshakeError::DerError`] -- the certificate or a signed attribute fails to encode.
+	/// - [`HandshakeError::CertificateValidationError`] -- the key identifier fails to decode.
+	/// - [`HandshakeError::TranscriptDigestLength`] -- the provider digest is not 32 to 64 bytes wide.
+	pub(crate) fn verify<P: HandshakeProvider>(
+		self,
+		finished: &SignedData,
+		certificate: &PeerCertificate<P::Curve>,
+		transcript_hash: &TranscriptHash,
+	) -> Result<(), HandshakeError> {
+		let content = CmsSigner::content(finished, DATA)?;
+		certificate.verify_signed::<P>(finished, SignedContent::data(content))?;
+
+		let expected = self.content::<P::Digest>(transcript_hash, certificate.certificate())?;
+		let content_matches: bool = content.ct_eq(expected.as_slice()).into();
+		if !content_matches {
+			return Err(HandshakeError::SignatureVerificationFailed);
+		}
+
+		Ok(())
+	}
+}
+
+/// A Finished up to its signature: the content it signs, and its
+/// `SignerInfo`, complete up to the signature over that content.
+pub(crate) struct FinishedDraft {
+	/// The role's domain label, the transcript hash, and for the client
+	/// Finished the digest of its certificate.
+	content: Vec<u8>,
+	/// The Finished's `SignerInfo`, complete up to its signature.
+	signer: SignerInfoDraft,
+}
+
+impl FinishedDraft {
+	/// The bytes the signer's key signs.
+	pub(crate) fn prehash(&self) -> &[u8] {
+		self.signer.prehash()
+	}
+
+	/// Build the Finished: the `SignedData` over the content, with
+	/// `signature` completing its `SignerInfo`, `unsigned_attrs` attached to
+	/// it, and `certificate` in `certificates`.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::DerError`] -- the content, a SET, or the signature fails to encode.
+	pub(crate) fn finish(
+		self,
+		signature: Vec<u8>,
+		unsigned_attrs: Attributes,
+		certificate: Option<Certificate>,
+	) -> Result<Signed<SignedData>, HandshakeError> {
+		let Self { content, signer } = self;
+		let signer_info = signer.complete(signature, Some(unsigned_attrs))?;
+		let certificates = match certificate {
+			Some(certificate) => {
+				let choice = CertificateChoices::Certificate(certificate);
+				Some(CertificateSet(vec![choice].try_into()?))
+			}
+			None => None,
+		};
+
+		Ok(CmsSigner::signed_data(
+			SignedContent::data(&content),
+			signer_info,
+			certificates,
+		)?)
+	}
+}
+
+/// The client Finished: the `SignedData` in which the client signs its role
+/// and the transcript hash, as the proof that it holds the key of the
+/// certificate it presents.
+pub struct ClientFinished(SignedData);
+
+impl ClientFinished {
+	/// Verify that the one signer names `identity` and verifies under its
+	/// key, and that the signed content is the client role over the sealed
+	/// transcript hash of `terms`.
+	///
+	/// # Errors
+	///
+	/// - The [`FinishedRole::verify`] set.
+	pub(crate) fn verify<P: HandshakeProvider>(
+		self,
+		identity: &PeerCertificate<P::Curve>,
+		terms: &Terms<P>,
+	) -> Result<(), HandshakeError> {
+		FinishedRole::Client.verify::<P>(&self.0, identity, terms.transcript_hash())
+	}
+}
+
+/// The identity a client offers, with the client Finished that proves it
+/// holds the key, or none.
+///
+/// Its constructors are private to the closing, so an offer exists only where
+/// a closing opened. [`Self::new`] refuses an identity whose key collapses the
+/// client ephemeral, so no offer exists for that client.
+pub struct Offer<C: CurveArithmetic>(Option<(PeerCertificate<C>, ClientFinished)>);
+
+impl<C: HandshakeCurve> Offer<C> {
+	/// The offer of a client that presents no identity.
+	fn anonymous() -> Self {
+		Self(None)
+	}
+
+	/// The offer of `identity`, proven by `finished`.
+	///
+	/// A server learns its client's static key only after the agreement, so
+	/// the comparison lives here: `ephemeral` MUST have an x-coordinate other
+	/// than that of the identity's key. ECDH keeps the x-coordinate alone, so
+	/// a match would collapse the agreement into the static one.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::ClientEphemeralIsStatic`] -- the ephemeral collapses into the key of `identity`.
+	fn new(
+		identity: PeerCertificate<C>,
+		finished: ClientFinished,
+		ephemeral: &PublicKey<C>,
+	) -> Result<Self, HandshakeError> {
+		let collapsed = identity.key().distinct(*ephemeral).is_none();
+		if collapsed {
+			return Err(HandshakeError::ClientEphemeralIsStatic);
+		}
+
+		Ok(Self(Some((identity, finished))))
+	}
+
+	/// The identity and its proof, for the admission that verifies them.
+	pub(crate) fn into_identity(self) -> Option<(PeerCertificate<C>, ClientFinished)> {
+		self.0
+	}
+}
+
+/// What the orchestrator contributes to the closing.
+pub(crate) struct ClosingParts<'a, P: HandshakeProvider> {
+	/// The hash of the sealed transcript.
+	pub(crate) transcript_hash: &'a TranscriptHash,
+	/// The DER of the `AuthEnvelopedData` that seals the receipt
+	/// countersignature under the handshake secret.
+	pub(crate) sealed_ack: Option<Vec<u8>>,
+	/// The proof that the client derived the handshake secret.
+	pub(crate) confirmation: KeyConfirmation,
+	/// The single-use seal of the closing, keyed by the handshake secret.
+	pub(crate) sealer: Sealer<P>,
+}
+
+/// The client Finished of a closing, up to its signature, beside the identity
+/// whose key signs it and whose certificate it carries.
+struct ClientFinishedDraft<'a> {
+	/// The identity of the client.
+	identity: &'a SigningIdentity,
+	/// The Finished over the transcript hash and the identity's certificate.
+	draft: FinishedDraft,
+}
+
+/// The closing of either flow, up to the signature of its client Finished.
+///
+/// The key-confirmation tag and the sealed acknowledgement travel as
+/// attributes inside the seal: unsigned attributes of the client Finished,
+/// or the whole content of an anonymous closing. [`Self::seal`] signs the
+/// Finished the draft holds and seals either form under the closing key.
+pub(crate) struct ClosingDraft<'a, P: HandshakeProvider> {
+	/// The key-confirmation tag and the sealed acknowledgement.
+	attributes: Attributes,
+	/// The client Finished, when the client presents an identity.
+	finished: Option<ClientFinishedDraft<'a>>,
+	/// The single-use seal of the closing.
+	sealer: Sealer<P>,
+}
+
+impl<'a, P: HandshakeProvider> ClosingDraft<'a, P> {
+	/// Bind the closing of `identity`, or of an anonymous client when it is
+	/// `None`, and draft its client Finished.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::DerError`] -- an attribute or the certificate fails to encode.
+	/// - [`HandshakeError::TranscriptDigestLength`] -- the provider digest is not 32 to 64 bytes wide.
+	pub(crate) fn bind(
+		identity: Option<&'a SigningIdentity>,
+		parts: ClosingParts<'_, P>,
+	) -> Result<Self, HandshakeError> {
+		let ClosingParts { transcript_hash, sealed_ack, confirmation, sealer } = parts;
+
+		// 1. Carry the tag and the countersignature as attributes. The
+		//    handshake secret binds both: it derives the tag over the
+		//    transcript hash, and it seals the other.
+		let mut attributes = vec![Attribute::try_from(HandshakeAttribute::encode(&confirmation)?)?];
+		if let Some(sealed_ack) = sealed_ack {
+			let acknowledgement = HandshakeAttribute::encode(&OctetString::new(sealed_ack)?)?;
+			attributes.push(Attribute::try_from(acknowledgement)?);
+		}
+
+		let attributes = Attributes::try_from(attributes)?;
+
+		// 2. Draft the client Finished of an identity, over the transcript
+		//    hash and the identity's certificate.
+		let finished = match identity {
+			Some(identity) => {
+				let draft = FinishedRole::Client.draft::<P>(identity, transcript_hash)?;
+				Some(ClientFinishedDraft { identity, draft })
+			}
+			None => None,
+		};
+
+		Ok(Self { attributes, finished, sealer })
+	}
+
+	/// Sign the client Finished when the closing carries one, and seal the
+	/// closing under the closing key.
+	///
+	/// A Finished seals as content of type `id-signedData`, and an anonymous
+	/// closing as its attribute set of type `id-data`.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::KeyError`] -- the key provider failed to sign the Finished.
+	/// - [`HandshakeError::SignatureVerificationFailed`] -- the key provider returned no DER signature.
+	/// - [`HandshakeError::SealedClosing`] -- the envelope refused to seal the closing.
+	/// - [`HandshakeError::SealedFrame`] -- the closing exceeds the frame.
+	/// - [`HandshakeError::DerError`] -- the closing fails to encode.
+	pub(crate) async fn seal(self) -> Result<HandshakeMessage, HandshakeError> {
+		let Self { attributes, finished, sealer } = self;
+		let sealed = match finished {
+			Some(ClientFinishedDraft { identity, draft }) => {
+				let signature = identity.sign_prehash(draft.prehash()).await?;
+				let certificate = identity.certificate().clone();
+				let finished = draft.finish(signature, attributes, Some(certificate))?;
+				sealer.seal(SIGNED_DATA, finished.to_der()?)?
+			}
+			None => sealer.seal(DATA, attributes.to_der()?)?,
+		};
+
+		HandshakeMessage::try_from(sealed)
+	}
+}
+
+/// A decoded closing of either flow, which the closing key opens.
+pub(crate) struct Closing(WireDer<AuthEnvelopedData>);
+
+impl Closing {
+	/// Decode the closing, and refuse one that carries an abort alert. The
+	/// seal covers every other part of the closing.
 	///
 	/// # Errors
 	///
 	/// - [`HandshakeError::UnexpectedContainer`] -- the closing travels in another container.
 	/// - [`HandshakeError::AbortReceived`] -- the closing carries an abort alert.
-	/// - [`HandshakeError`] -- the closing fails to decode.
-	fn read_closing(
-		pending: Self::Pending,
-		settings: &Self::Settings,
-		closing: HandshakeMessage,
-	) -> Result<Self::Closing, HandshakeError>;
+	/// - [`HandshakeError::DuplicateAttribute`] -- the abort alert repeats.
+	pub(crate) fn read(message: HandshakeMessage) -> Result<Self, HandshakeError> {
+		let sealed = message.auth_enveloped()?;
+		sealed.value().unauth_attrs.refuse_alert()?;
+		Ok(Self(sealed))
+	}
 
-	/// Open the closing under the handshake secret, which HPKE derives here
-	/// and CMS derived at the reply, open the client identity under it, parse
-	/// the identity once, and build the [`Offer`].
+	/// Open the closing under the closing key of the secret `pending` holds,
+	/// read its tag and its acknowledgement, and build the [`Offer`].
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError::KeyError`] -- the key provider failed.
-	/// - [`HandshakeError::InvalidPublicKey`] -- the server certificate key is off the curve.
-	/// - [`HandshakeError::HpkeError`] -- the sealed payload fails to open.
-	/// - [`HandshakeError::InvalidDecryptedPayloadSize`] -- the opened payload fails to decode.
-	/// - [`HandshakeError::InvalidKeySize`] -- the base secret of the payload is not 32 bytes.
-	/// - [`HandshakeError::OctetStringLengthError`] -- the client random of the payload is not 32 bytes.
-	/// - [`HandshakeError::ClientRandomMismatchReplay`] -- the payload echoes another client random.
-	/// - [`HandshakeError::InvalidPublicKey`] -- the client ephemeral or the
-	///   key of the offered certificate is not a point on the curve.
-	/// - [`HandshakeError::SealedIdentity`] -- the sealed identity fails to
-	///   open: its envelope, its key, its tag, or its transcript is refused.
-	/// - [`HandshakeError::SealedFrame`] -- the opened identity's frame is malformed.
-	/// - [`HandshakeError::DerError`] -- the opened identity fails to decode,
-	///   or the key-confirmation tag of a CMS Finished is narrower than 32
-	///   bytes or wider than 64.
-	/// - [`HandshakeError::MissingAttribute`] -- a CMS Finished carries no key-confirmation tag.
-	/// - [`HandshakeError::DuplicateAttribute`] -- an attribute of a CMS Finished repeats.
-	/// - [`HandshakeError::MissingClientCertificate`] -- a CMS Finished names no certificate.
-	/// - [`HandshakeError::ClientEphemeralIsStatic`] -- a client ephemeral
-	///   collapses into the key of the offered certificate.
-	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the handshake secret or the identity key.
-	fn settle<'a>(
-		closing: Self::Closing,
-		terms: &'a Terms<P>,
-		identity: &'a SigningIdentity,
-	) -> MaybeSendFuture<'a, Result<ClosingOpened<Self, P>, HandshakeError>>;
+	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the closing key.
+	/// - The [`ClosingContent::open`] set.
+	/// - The [`ClosingContent::confirmation`] set.
+	/// - The [`ClosingContent::into_offer`] set.
+	pub(crate) async fn open<P: HandshakeProvider>(
+		self,
+		pending: ServerPending<P::Curve>,
+		terms: &Terms<P>,
+	) -> Result<ClosingOpened<P>, HandshakeError> {
+		let ServerPending { secret, client_ephemeral } = pending;
+
+		// 1. Open the content under the closing key of the secret, in the form
+		//    its content type names.
+		let sealer = terms.sealer(&secret, SecretSeal::Closing)?;
+		let content = ClosingContent::open(sealer, self.0).await?;
+
+		// 2. Read the key-confirmation tag, which is mandatory, and the sealed receipt acknowledgement.
+		let (confirmation, receipt_ack) = content.confirmation()?;
+
+		// 3. Build the offer, which compares `R` with the key of the certificate the Finished names.
+		let offer = content.into_offer(&client_ephemeral)?;
+		Ok(ClosingOpened { secret, confirmation, receipt_ack, offer })
+	}
+}
+
+/// The content of an opened closing, in the form its content type names.
+///
+/// [`Self::open`] is its one constructor, and the one branch on the content
+/// type that the closing's `authAttrs` authenticate. [`Self::confirmation`]
+/// is the one reader of the key-confirmation tag and the acknowledgement of
+/// either form.
+pub(crate) enum ClosingContent {
+	/// The client Finished of a client that presents an identity.
+	Finished(SignedData),
+	/// The attribute set of an anonymous client.
+	Anonymous(Attributes),
+}
+
+impl ClosingContent {
+	/// Open `closing` under `sealer`, and decode its content as the form its
+	/// content type names: `id-signedData` as the client Finished, `id-data`
+	/// as the attribute set. Any other type is refused before the closing key
+	/// runs, and the tag authenticates the type that opens.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::UnexpectedContainer`] -- the content type is not `id-signedData` or `id-data`.
+	/// - [`HandshakeError::SealedClosing`] -- the closing fails to open: its
+	///   envelope, its key, its tag, or its transcript is refused.
+	/// - [`HandshakeError::SealedFrame`] -- the opened frame is malformed.
+	/// - [`HandshakeError::DerError`] -- the content fails to decode as its form.
+	async fn open<P: HandshakeProvider>(
+		sealer: Sealer<P>,
+		closing: WireDer<AuthEnvelopedData>,
+	) -> Result<Self, HandshakeError> {
+		let content_type = closing.value().auth_encrypted_content_info.content_type;
+		let decode: fn(&[u8]) -> Result<Self, HandshakeError> = match content_type {
+			SIGNED_DATA => |der| Ok(Self::Finished(SignedData::from_der(der)?)),
+			DATA => |der| Ok(Self::Anonymous(Attributes::from_der(der)?)),
+			_ => return Err(HandshakeError::UnexpectedContainer),
+		};
+
+		let content = sealer.open(closing.der(), content_type).await?;
+		content.with(|der| decode(der))
+	}
+
+	/// The key-confirmation tag and the sealed acknowledgement, read once
+	/// from the attributes of either form: the unsigned attributes of the
+	/// client Finished, or the attribute set of an anonymous closing.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::MissingAttribute`] -- the closing carries no tag.
+	/// - [`HandshakeError::DuplicateAttribute`] -- the tag or the acknowledgement repeats.
+	/// - [`HandshakeError::DerError`] -- the tag is not an OCTET STRING of 32
+	///   to 64 bytes, or the acknowledgement is no OCTET STRING.
+	fn confirmation(&self) -> Result<(KeyConfirmation, Option<Vec<u8>>), HandshakeError> {
+		let attributes: &dyn HandshakeAttributes = match self {
+			Self::Finished(finished) => finished,
+			Self::Anonymous(attributes) => attributes,
+		};
+
+		let tag = attributes.find_unsigned_attr(KeyConfirmation::OID)?;
+		let confirmation = tag.ok_or(HandshakeError::MissingAttribute)?.decode::<KeyConfirmation>()?;
+		let acknowledgement = attributes.find_unsigned_attr(RECEIPT_ACK)?;
+		let acknowledgement = acknowledgement.map(|attribute| attribute.decode::<OctetString>()).transpose()?;
+		Ok((confirmation, acknowledgement.map(OctetString::into_bytes)))
+	}
+
+	/// The offer this closing makes: none for an anonymous closing, and for a
+	/// client Finished the certificate its signer names, compared with
+	/// `client_ephemeral`.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::MissingClientCertificate`] -- the Finished has no certificate its signer names.
+	/// - [`HandshakeError::SignatureVerificationFailed`] -- the Finished does not have exactly one signer.
+	/// - [`HandshakeError::InvalidPublicKey`] -- the certificate key is not a point on the curve.
+	/// - [`HandshakeError::ClientEphemeralIsStatic`] -- `client_ephemeral` equals the certificate key.
+	fn into_offer<C: HandshakeCurve>(self, client_ephemeral: &PublicKey<C>) -> Result<Offer<C>, HandshakeError> {
+		let Self::Finished(mut finished) = self else {
+			return Ok(Offer::anonymous());
+		};
+
+		// The certificate moves out of the Finished into the identity, so the
+		// session keeps it past the decoded Finished without a copy.
+		let certificate = CmsSigner::take_signer_certificate(&mut finished)?;
+		let certificate = certificate.ok_or(HandshakeError::MissingClientCertificate)?;
+		let identity = PeerCertificate::<C>::parse(certificate)?;
+		Offer::new(identity, ClientFinished(finished), client_ephemeral)
+	}
+}
+
+/// What the server holds once the closing is opened.
+///
+/// The fields stay private to the closing, and [`Self::confirm`] is the one
+/// way out, so the offer reaches admission only after the key-confirmation tag
+/// verified.
+pub(crate) struct ClosingOpened<P: HandshakeProvider> {
+	/// The handshake secret both sides derived.
+	secret: HandshakeSecret,
+	/// The key-confirmation tag the closing carried.
+	confirmation: KeyConfirmation,
+	/// The DER of the envelope that seals the receipt countersignature under
+	/// the handshake secret.
+	receipt_ack: Option<Vec<u8>>,
+	/// The identity the client offers.
+	offer: Offer<P::Curve>,
+}
+
+impl<P: HandshakeProvider> ClosingOpened<P> {
+	/// Verify the key-confirmation tag against the secret, and release the
+	/// offer.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the derivation.
+	/// - [`HandshakeError::KeyConfirmationFailed`] -- the client derived
+	///   another secret or confirmed another transcript.
+	pub(crate) fn confirm(self, terms: &Terms<P>) -> Result<ConfirmedClosing<P>, HandshakeError> {
+		let Self { secret, confirmation, receipt_ack, offer } = self;
+		let secret = terms.confirm(secret, &confirmation)?;
+		Ok(ConfirmedClosing { secret, receipt_ack, offer })
+	}
+}
+
+/// A closing whose key-confirmation tag verified.
+///
+/// Its secret is a [`ConfirmedSecret`], which only the check of the tag
+/// yields, so the offer it holds passed that check.
+pub(crate) struct ConfirmedClosing<P: HandshakeProvider> {
+	/// The handshake secret the tag confirmed.
+	pub(crate) secret: ConfirmedSecret,
+	/// The DER of the envelope that seals the receipt countersignature under
+	/// the handshake secret.
+	pub(crate) receipt_ack: Option<Vec<u8>>,
+	/// The identity the client offers.
+	pub(crate) offer: Offer<P::Curve>,
 }
 
 #[cfg(all(test, any(feature = "transport-cms", feature = "transport-hpke")))]
 mod tests {
+	use std::error::Error;
 	use std::sync::Arc;
 
 	use super::*;
+	use crate::crypto::hash::Sha3_256;
+	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::crypto::sign::ecdsa::k256::{Secp256k1, SecretKey};
 	use crate::random::OsRng;
-	use crate::transport::handshake::tests::{create_test_certificate, negated};
+	use crate::transport::handshake::tests::{
+		create_test_certificate, create_test_signed_data, fixture_confirmation, fixture_transcript, negated,
+		same_key_twin, signing_identity,
+	};
 
 	/// A fresh client identity, beside its static key.
 	fn identity() -> (PeerCertificate<Secp256k1>, PublicKey<Secp256k1>) {
@@ -570,20 +944,26 @@ mod tests {
 		(identity.expect("the test certificate holds a point"), static_key)
 	}
 
+	/// A client Finished the offer holds for admission, which verifies it, so
+	/// any signed content serves here.
+	fn finished() -> ClientFinished {
+		ClientFinished(create_test_signed_data(b"client finished"))
+	}
+
 	/// The public key of a fresh ephemeral.
 	fn ephemeral() -> PublicKey<Secp256k1> {
 		SecretKey::random(&mut OsRng).public_key()
 	}
 
-	/// An offer whose ephemerals all differ from the key of its identity holds
+	/// An offer whose ephemeral differs from the key of its identity holds
 	/// that identity.
 	#[test]
-	fn an_offer_of_distinct_ephemerals_holds_its_identity() -> Result<(), HandshakeError> {
+	fn an_offer_of_a_distinct_ephemeral_holds_its_identity() -> Result<(), HandshakeError> {
 		let (identity, _) = identity();
 		let expected = Arc::clone(identity.certificate());
-		let offer = Offer::new(identity, (), [&ephemeral(), &ephemeral()])?;
+		let offer = Offer::new(identity, finished(), &ephemeral())?;
 
-		let held = offer.into_identity().map(|(identity, ())| Arc::clone(identity.certificate()));
+		let held = offer.into_identity().map(|(identity, _)| Arc::clone(identity.certificate()));
 		assert_eq!(held, Some(expected));
 		Ok(())
 	}
@@ -591,7 +971,7 @@ mod tests {
 	#[test]
 	fn an_offer_refuses_an_ephemeral_equal_to_the_identity_key() {
 		let (identity, static_key) = identity();
-		let refused = Offer::new(identity, (), [&static_key]);
+		let refused = Offer::new(identity, finished(), &static_key);
 		assert!(matches!(refused, Err(HandshakeError::ClientEphemeralIsStatic)));
 	}
 
@@ -602,16 +982,50 @@ mod tests {
 		let (identity, static_key) = identity();
 		let negation = negated(&static_key);
 
-		let refused = Offer::new(identity, (), [&negation]);
+		let refused = Offer::new(identity, finished(), &negation);
 		assert!(matches!(refused, Err(HandshakeError::ClientEphemeralIsStatic)));
 	}
 
-	/// The offer compares every ephemeral of the client, so the identity key
-	/// after a distinct ephemeral is refused as it is in the first place.
-	#[test]
-	fn an_offer_refuses_the_identity_key_after_a_distinct_ephemeral() {
-		let (identity, static_key) = identity();
-		let refused = Offer::new(identity, (), [&ephemeral(), &static_key]);
-		assert!(matches!(refused, Err(HandshakeError::ClientEphemeralIsStatic)));
+	/// A client Finished of `identity` over `transcript_hash`, signed and
+	/// built as the closing builds it, with its key-confirmation tag.
+	async fn client_finished(identity: &SigningIdentity, transcript_hash: &TranscriptHash) -> Signed<SignedData> {
+		let draft = FinishedRole::Client.draft::<DefaultCryptoProvider>(identity, transcript_hash);
+		let draft = draft.expect("the Finished drafts");
+		let signature = identity.sign_prehash(draft.prehash()).await.expect("the client key signs");
+		let tag = HandshakeAttribute::encode(&fixture_confirmation()).expect("a tag encodes as an attribute");
+		let tag = Attribute::try_from(tag).expect("the attribute encodes");
+		let attributes = Attributes::try_from(vec![tag]).expect("one attribute is a SET");
+		let certificate = identity.certificate().to_owned();
+
+		let finished = draft.finish(signature, attributes, Some(certificate));
+		finished.expect("the Finished assembles")
+	}
+
+	/// A client Finished verifies under the certificate it carries.
+	#[tokio::test]
+	async fn a_client_finished_verifies_under_the_certificate_it_carries() -> Result<(), Box<dyn Error>> {
+		let client = create_test_certificate();
+		let transcript_hash = fixture_transcript::<Sha3_256>([0x07u8; 32]);
+		let finished = client_finished(&signing_identity(&client), &transcript_hash).await;
+		let carried = PeerCertificate::<Secp256k1>::parse(client.certificate)?;
+
+		let verified = FinishedRole::Client.verify::<DefaultCryptoProvider>(&finished, &carried, &transcript_hash);
+		assert!(verified.is_ok());
+		Ok(())
+	}
+
+	/// A client Finished binds the digest of the certificate it carries, so
+	/// it verifies under no other certificate of its key, as a TLS 1.3
+	/// signature covers the Certificate (RFC 9846 § 4.5.2).
+	#[tokio::test]
+	async fn a_client_finished_verifies_under_no_other_certificate_of_its_key() -> Result<(), Box<dyn Error>> {
+		let client = create_test_certificate();
+		let transcript_hash = fixture_transcript::<Sha3_256>([0x07u8; 32]);
+		let finished = client_finished(&signing_identity(&client), &transcript_hash).await;
+		let twin = PeerCertificate::<Secp256k1>::parse(same_key_twin(&client))?;
+
+		let refused = FinishedRole::Client.verify::<DefaultCryptoProvider>(&finished, &twin, &transcript_hash);
+		assert!(matches!(refused, Err(HandshakeError::SignatureVerificationFailed)));
+		Ok(())
 	}
 }

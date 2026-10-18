@@ -10,25 +10,28 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use tightbeam::{
-	constants::TIGHTBEAM_HPKE_HANDSHAKE_INFO,
+	cms::content_info::ContentInfo,
+	cms::enveloped_data::RecipientInfo,
+	cms::signed_data::SignedData,
+	constants::{TIGHTBEAM_CLOSING_KDF_INFO, TIGHTBEAM_SESSION_KDF_INFO},
 	crypto::{
 		aead::{Aes128Gcm, Aes128GcmOid},
+		cms::{AuthEnvelopedData, EnvelopeError, Opener},
 		hash::Sha3_256,
-		hpke::{DhKemSuite, HpkeMessage, HpkeSecp256k1Sha3Aes256Gcm, HpkeSecretKeyOps},
-		kdf::HkdfSha3_256,
+		kdf::{Hkdf, HkdfSha3_256},
 		profiles::{
 			AeadProvider, Aes128Wrap, CryptoProvider, CurveProvider, DefaultCryptoProvider, DigestProvider,
-			HpkeProvider, KdfProvider, KeyWrapProvider, SecurityProfile, SecurityProfileDesc, SigningProvider,
+			KdfProvider, KeyWrapProvider, SecurityProfile, SecurityProfileDesc, SigningProvider,
 		},
-		secret::ToInsecure,
+		secret::SecretSlice,
 		sign::ecdsa::{Secp256k1Signature, Secp256k1VerifyingKey},
 	},
-	der::{asn1::OctetString, Any, Decode, Encode, Sequence},
+	der::{asn1::OctetString, asn1::OctetStringRef, Any, Decode, Encode},
 	testing::error::{FdrConfigError, TestingError},
 	transport::handshake::{
 		negotiation::{NoStrengthFloor, ProfilePolicy, ProfileStrengthPolicy, SecurityOffer},
-		Client, ClientFlow, ClientHandshakeProtocol, Handshake, HandshakeMessage, HandshakeProvider, Hpke, Server,
-		ServerFlow, ServerHandshakeProtocol,
+		Client, ClientFlow, ClientHandshakeProtocol, ClientHello, Handshake, HandshakeMessage, HandshakeProvider, Hpke,
+		Server, ServerFlow, ServerHandshake, ServerHandshakeProtocol,
 	},
 	transport::wire_der::WireDer,
 	TightBeamError,
@@ -37,16 +40,12 @@ use tightbeam::{
 // The shared fixtures live in the crate-wide `common` module, so each threat
 // suite depends only on that module.
 pub use crate::common::security::{
-	carried_key_exchange, default_security_profile, expectation_failure, hpke_client_config, hpke_server_config,
-	pinning_validator, tunneled_handshake, tunneled_reply, weak_security_profile, ServerMaterials,
+	default_security_profile, expectation_failure, hpke_client_config, hpke_server_config, pinning_validator,
+	rewritten_reply, signed_handshake, weak_security_profile, ServerMaterials,
 };
 
 #[cfg(feature = "transport-cms")]
 use crate::common::security::{cms_client_config, cms_server_config, pinning_trust_store, ClientMaterials};
-#[cfg(feature = "transport-cms")]
-use tightbeam::cms::signed_data::SignedData;
-#[cfg(feature = "transport-cms")]
-use tightbeam::crypto::k256::elliptic_curve::sec1::ToEncodedPoint;
 #[cfg(feature = "transport-cms")]
 use tightbeam::transport::handshake::Cms;
 
@@ -103,10 +102,6 @@ impl CryptoProvider for Aes128CryptoProvider {
 	fn profile(&self) -> &Self::Profile {
 		&self.profile
 	}
-}
-
-impl HpkeProvider for Aes128CryptoProvider {
-	type HpkeSuite = DhKemSuite<k256::Secp256k1, HkdfSha3_256, Aes128Gcm, 0xFF16>;
 }
 
 /// The direction a handshake message travels in.
@@ -178,8 +173,8 @@ pub enum Container {
 	Signed,
 	/// An `AuthEnvelopedData`.
 	AuthEnveloped,
-	/// The `ClientKeyExchange` of an HPKE closing.
-	KeyExchange,
+	/// A `ContentInfo` of type `id-data`, the HPKE hello.
+	Data,
 }
 
 impl Container {
@@ -189,7 +184,7 @@ impl Container {
 		let message = match self {
 			Self::Signed => HandshakeMessage::SignedData(Box::new(WireDer::try_from(der)?)),
 			Self::AuthEnveloped => HandshakeMessage::AuthEnvelopedData(Box::new(WireDer::try_from(der)?)),
-			Self::KeyExchange => HandshakeMessage::ClientKeyExchange(Box::new(WireDer::try_from(der)?)),
+			Self::Data => HandshakeMessage::Data(Box::new(WireDer::try_from(der)?)),
 		};
 
 		Ok(message)
@@ -342,17 +337,18 @@ impl HandshakeBackendKind {
 	/// goes through the decoded message and re-encodes it, so the result is
 	/// well-formed DER that only a transcript or signature check can refuse.
 	///
-	/// - HPKE tampers the `ServerHandshake` server random.
+	/// - HPKE tampers the server random of the `ServerHandshake` the reply signs.
 	/// - CMS tampers the first byte of the content the `ServerFinished` signs,
 	///   which sits in the domain label ahead of the transcript hash.
 	pub fn tamper_server_message(self, payload: impl AsRef<[u8]>) -> Result<Vec<u8>, TightBeamError> {
 		let payload = payload.as_ref();
 		match self {
 			Self::Hpke => {
-				let mut message = tunneled_handshake(Container::Signed.message(payload)?);
+				let reply = Container::Signed.message(payload)?;
+				let mut message = signed_handshake(reply.to_owned());
 				let server_random = flip_first_byte(message.server_random.as_bytes())?;
 				message.server_random = OctetString::new(server_random)?;
-				Ok(tunneled_reply(&message).der().to_vec())
+				Ok(rewritten_reply(reply, &message).der().to_vec())
 			}
 			#[cfg(feature = "transport-cms")]
 			Self::Cms => {
@@ -531,6 +527,7 @@ fn invalid_step_error(msg: &'static str) -> TightBeamError {
 pub fn tamper_payload_append(payload: impl AsRef<[u8]>, extra: impl AsRef<[u8]>) -> Vec<u8> {
 	let payload = payload.as_ref();
 	let extra = extra.as_ref();
+
 	let mut tampered = payload.to_vec();
 	tampered.extend_from_slice(extra);
 	tampered
@@ -544,111 +541,151 @@ pub fn tamper_payload_truncate(payload: impl AsRef<[u8]>, keep_bytes: usize) -> 
 	payload.iter().take(keep_bytes).copied().collect()
 }
 
-/// The result of an attempt to decrypt an HPKE payload.
-#[derive(Debug)]
-pub enum DecryptionResult {
-	/// Decryption succeeded. `plaintext_len` is the length of the recovered
-	/// plaintext, which the caller checks against the size it expects.
-	Success { plaintext_len: usize },
-	/// Decryption failed, for example on a wrong key or a corrupted ciphertext.
-	Failed,
+/// The DER of the `ClientHello` that a captured HPKE hello carries.
+fn captured_hello(hello: &[u8]) -> Result<ClientHello, TightBeamError> {
+	let content_info = WireDer::<ContentInfo>::try_from(hello)?;
+	let octets = content_info.value().content.decode_as::<OctetStringRef<'_>>()?;
+	Ok(ClientHello::from_der(octets.as_bytes())?)
 }
 
-/// Return the sealed HPKE message (`sealed_payload`) of the
-/// `ClientKeyExchange` that the DER of a captured HPKE closing carries.
-pub fn extract_hpke_ciphertext(closing_der: impl AsRef<[u8]>) -> Result<Vec<u8>, TightBeamError> {
-	let closing = Container::KeyExchange.message(closing_der.as_ref())?;
-	let client_kex = carried_key_exchange(closing);
-	Ok(client_kex.sealed_payload.as_bytes().to_vec())
+/// The `ServerHandshake` that a captured HPKE reply signs.
+fn captured_handshake(reply: &[u8]) -> Result<ServerHandshake, TightBeamError> {
+	let signed = SignedData::from_der(reply)?;
+	let econtent = signed.encap_content_info.econtent;
+	let econtent = econtent.ok_or_else(|| expectation_failure("the reply carries no content"))?;
+	Ok(ServerHandshake::from_der(econtent.value())?)
 }
 
-/// The HPKE suite of the default provider, which seals the key exchange.
-type Suite = HpkeSecp256k1Sha3Aes256Gcm;
+/// The two ephemerals a captured HPKE handshake carries in the clear: the
+/// client ephemeral `R` of the hello and the server ephemeral `E` of the
+/// reply, each as its compressed SEC1 bytes.
+pub fn captured_ephemerals(hello: &[u8], reply: &[u8]) -> Result<(Vec<u8>, Vec<u8>), TightBeamError> {
+	let client_ephemeral = captured_hello(hello)?.client_ephemeral.into_bytes();
+	let server_ephemeral = captured_handshake(reply)?.server_ephemeral.into_bytes();
+	Ok((client_ephemeral, server_ephemeral))
+}
 
-/// Extract the encapsulated key from a sealed HPKE message.
+/// The x-coordinate of the SEC1 point `sec1`, which an ECDH output on it
+/// shares with its negation.
+pub fn x_coordinate(sec1: &[u8]) -> Result<Vec<u8>, TightBeamError> {
+	let point = k256::PublicKey::from_sec1_bytes(sec1).map_err(|_| expectation_failure("no point of secp256k1"))?;
+	let encoded = k256::elliptic_curve::sec1::ToEncodedPoint::to_encoded_point(&point, false);
+
+	let x = encoded.x();
+	let x = x.ok_or_else(|| expectation_failure("the identity point has no x-coordinate"))?;
+	Ok(x.to_vec())
+}
+
+/// A passive observer of one captured HPKE handshake who later obtained the
+/// server's static key.
 ///
-/// The message leads with the encapsulated key, which is the ephemeral public
-/// key HPKE drew for this one message. The function returns it as an
-/// uncompressed secp256k1 point.
-pub fn extract_ephemeral_pubkey(sealed: impl AsRef<[u8]>) -> Result<Vec<u8>, TightBeamError> {
-	let message = HpkeMessage::<Suite>::from_bytes(sealed)?;
-	let encapsulated = message.encapsulated_key().to_encoded_point(false);
-	Ok(encapsulated.as_bytes().to_vec())
+/// Each candidate stands in for the ephemeral-ephemeral secret `ee` and runs
+/// through the key schedule of the HPKE flow:
+///
+/// ```text
+/// S       = client_random || server_random
+/// hs      = HKDF-SHA3-256(ee, salt = S, info = "tb/session/kdf/v1")
+/// closing = HKDF-SHA3-256(hs, salt = S, info = "tb/session/kdf/closing/v1")
+/// ```
+///
+/// The candidates are:
+///
+/// - the all-zero secret,
+/// - the static key's agreement with the client ephemeral `R` of the hello,
+/// - the static key's agreement with the server ephemeral `E` of the reply, and
+/// - the x-coordinate of `R` and of `E`.
+pub struct StaticKeyObserver {
+	closing: Vec<u8>,
+	keks: Vec<Vec<u8>>,
 }
 
-/// The key-exchange payload as its DER carries it in an unmetered session of
-/// an anonymous client.
-#[derive(Sequence)]
-pub struct KeyExchangePayload {
-	/// The base secret of the key exchange.
-	pub base_key: OctetString,
-	/// The client random, which echoes the random of the client hello.
-	pub client_random: OctetString,
-	/// The public key of the client ephemeral.
-	pub client_ephemeral: OctetString,
-	/// The key-confirmation tag, which proves that the client derived the same
-	/// handshake secret.
-	pub key_confirmation: OctetString,
-}
+/// The number of candidate closing keys a [`StaticKeyObserver`] derives.
+pub const STATIC_KEY_CANDIDATES: usize = 5;
 
-/// Open a sealed key exchange with the server's static key under `aad`, and
-/// decode the payload it carries.
-pub fn open_key_exchange(
-	sealed: impl AsRef<[u8]>,
-	secret_key: &k256::SecretKey,
-	aad: impl AsRef<[u8]>,
-) -> Result<KeyExchangePayload, TightBeamError> {
-	let message = HpkeMessage::<Suite>::from_bytes(sealed)?;
-	let opened = secret_key.open(&message, TIGHTBEAM_HPKE_HANDSHAKE_INFO, aad)?;
-	Ok(KeyExchangePayload::from_der(&opened.to_insecure())?)
-}
+impl StaticKeyObserver {
+	/// The observer of the captured `hello`, `reply`, and `closing` who holds
+	/// `static_key`.
+	pub fn new(
+		hello: &[u8],
+		reply: &[u8],
+		closing: &[u8],
+		static_key: &k256::SecretKey,
+	) -> Result<Self, TightBeamError> {
+		let hello = captured_hello(hello)?;
+		let handshake = captured_handshake(reply)?;
+		let salt = [hello.client_random.as_bytes(), handshake.server_random.as_bytes()].concat();
+		let client_ephemeral = hello.client_ephemeral.as_bytes();
+		let server_ephemeral = handshake.server_ephemeral.as_bytes();
 
-/// The default domain tag an HPKE closing payload is sealed under, which is the
-/// whole associated data of the seal.
-pub const HANDSHAKE_AAD: &[u8] = b"tb/aead/v1";
+		let candidates = [
+			vec![0u8; 32],
+			static_agreement(static_key, client_ephemeral)?,
+			static_agreement(static_key, server_ephemeral)?,
+			x_coordinate(client_ephemeral)?,
+			x_coordinate(server_ephemeral)?,
+		];
 
-/// Try to open an HPKE message with the recipient's secret key.
-///
-/// `aad` defaults to [`HANDSHAKE_AAD`] when it is `None`.
-///
-/// # Returns
-///
-/// - [`DecryptionResult::Success`] with the plaintext length when decryption worked.
-/// - [`DecryptionResult::Failed`] when decryption failed, for example on a wrong key or invalid data.
-pub fn try_decrypt_hpke(
-	ciphertext: impl AsRef<[u8]>,
-	secret_key: &k256::SecretKey,
-	aad: Option<&[u8]>,
-) -> DecryptionResult {
-	let ciphertext = ciphertext.as_ref();
-	let message = match HpkeMessage::<Suite>::from_bytes(ciphertext) {
-		Ok(m) => m,
-		Err(_) => return DecryptionResult::Failed,
-	};
+		let keks = candidates.iter().map(|ee| closing_key(ee, &salt)).collect::<Result<_, _>>()?;
+		Ok(Self { closing: closing.to_vec(), keks })
+	}
 
-	let aad = aad.unwrap_or(HANDSHAKE_AAD);
-	match secret_key.open(&message, TIGHTBEAM_HPKE_HANDSHAKE_INFO, aad) {
-		Ok(plaintext) => {
-			let plaintext_bytes = plaintext.to_insecure();
-			DecryptionResult::Success { plaintext_len: plaintext_bytes.len() }
+	/// Open the closing under each candidate closing key, with the key
+	/// identifier the closing names, and report each outcome.
+	pub async fn closing_attempts(&self) -> Result<Vec<Result<SecretSlice<u8>, EnvelopeError>>, TightBeamError> {
+		let mut attempts = Vec::with_capacity(self.keks.len());
+		for kek in &self.keks {
+			let envelope = AuthEnvelopedData::from_der(&self.closing)?;
+			let content_type = envelope.auth_encrypted_content_info.content_type;
+			let key_identifier = kek_identifier(&envelope)?;
+			let opener = Opener::Kek { kek, key_identifier: &key_identifier };
+			let attempt = envelope.open::<DefaultCryptoProvider>(&self.closing, &opener, content_type);
+			attempts.push(attempt.await);
 		}
-		Err(_) => DecryptionResult::Failed,
+
+		Ok(attempts)
 	}
 }
 
-/// Generate a random secret key, to test decryption with a wrong key.
-pub fn generate_wrong_secret_key() -> k256::SecretKey {
-	k256::SecretKey::random(&mut rand_core::OsRng)
+/// The ECDH output of `static_key` with the SEC1 point `peer`.
+fn static_agreement(static_key: &k256::SecretKey, peer: &[u8]) -> Result<Vec<u8>, TightBeamError> {
+	let peer = k256::PublicKey::from_sec1_bytes(peer).map_err(|_| expectation_failure("no point of secp256k1"))?;
+	let shared = k256::ecdh::diffie_hellman(static_key.to_nonzero_scalar(), peer.as_affine());
+	Ok(shared.raw_secret_bytes().to_vec())
+}
+
+/// The closing key of the HPKE key schedule over the candidate `ee` under
+/// `salt`, through an HKDF-SHA3-256 of its own.
+pub fn closing_key(ee: &[u8], salt: &[u8]) -> Result<Vec<u8>, TightBeamError> {
+	let mut handshake_secret = [0u8; 32];
+	let mut kek = vec![0u8; 32];
+	let failed = |_| expectation_failure("HKDF refused a 32-byte output");
+	let session = Hkdf::<Sha3_256>::new(Some(salt), ee);
+	let expanded = session.expand(TIGHTBEAM_SESSION_KDF_INFO, &mut handshake_secret);
+	expanded.map_err(failed)?;
+
+	let closing = Hkdf::<Sha3_256>::new(Some(salt), &handshake_secret);
+	let expanded = closing.expand(TIGHTBEAM_CLOSING_KDF_INFO, &mut kek);
+	expanded.map_err(failed)?;
+	Ok(kek)
+}
+
+/// The `kekid.keyIdentifier` of the one `KEKRecipientInfo` of `envelope`.
+fn kek_identifier(envelope: &AuthEnvelopedData) -> Result<Vec<u8>, TightBeamError> {
+	let [RecipientInfo::Kekri(recipient)] = envelope.recipient_infos.0.as_slice() else {
+		return Err(expectation_failure("the closing carries one KEKRecipientInfo"));
+	};
+
+	Ok(recipient.kek_id.kek_identifier.as_bytes().to_vec())
 }
 
 /// The three messages an HPKE handshake exchanges.
 const HPKE_FLOW: &[FlowStep] = &[
-	FlowStep { index: 0, direction: Direction::ClientToServer, container: Container::Signed },
+	FlowStep { index: 0, direction: Direction::ClientToServer, container: Container::Data },
 	FlowStep { index: 1, direction: Direction::ServerToClient, container: Container::Signed },
 	FlowStep {
 		index: 2,
 		direction: Direction::ClientToServer,
-		container: Container::KeyExchange,
+		container: Container::AuthEnveloped,
 	},
 ];
 

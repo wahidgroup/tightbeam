@@ -59,8 +59,8 @@ mod sha3_512_profile {
 	pub use crate::crypto::hash::Sha3_512;
 	pub use crate::crypto::kdf::HkdfSha3_256;
 	pub use crate::crypto::profiles::{
-		AeadProvider, Aes256Wrap, CryptoProvider, CurveProvider, DigestProvider, HpkeProvider, KdfProvider,
-		KeyWrapProvider, SecurityProfile, SigningProvider,
+		AeadProvider, Aes256Wrap, CryptoProvider, CurveProvider, DigestProvider, KdfProvider, KeyWrapProvider,
+		SecurityProfile, SigningProvider,
 	};
 	pub use crate::crypto::sign::ecdsa::Secp256k1VerifyingKey;
 }
@@ -1102,11 +1102,6 @@ impl CryptoProvider for Aes256Sha3_512Provider {
 	fn profile(&self) -> &Self::Profile {
 		&self.profile
 	}
-}
-
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-impl HpkeProvider for Aes256Sha3_512Provider {
-	type HpkeSuite = crate::crypto::hpke::HpkeSecp256k1Sha3Aes256Gcm;
 }
 
 #[cfg(test)]

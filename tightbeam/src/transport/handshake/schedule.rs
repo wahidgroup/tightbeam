@@ -4,7 +4,7 @@
 //!
 //! - [`Agreement`] derives the [`HandshakeSecret`], the one secret a session
 //!   derives from, out of the [`EcdhSecret`] that [`HandshakeAgreement`]
-//!   produces and a [`BaseSecret`].
+//!   produces, followed in the CMS flow by a `BaseSecret`.
 //! - [`Terms`] holds what negotiation fixed: the profile, the multiplexing
 //!   terms, the transcript hash, and the protocol's salt.
 //! - [`Agreed`] derives everything a session takes from the handshake secret.
@@ -12,25 +12,30 @@
 //! # Key schedule
 //!
 //! Both protocols and both roles run the same schedule. `ee` is the
-//! ephemeral-ephemeral ECDH output, `base` is the random secret the client
-//! seals to the server's static key, `S` is the protocol's salt, and `H` is
-//! the negotiated digest, whose output is `Hash.length` bytes wide. `HKDF` is
-//! the KDF of the profile, HKDF-SHA3-256 in the default profile.
+//! ephemeral-ephemeral ECDH output, `base` is the random secret the CMS client
+//! seals to the server's certificate key, `S` is the protocol's salt, and `H`
+//! is the negotiated digest, whose output is `Hash.length` bytes wide. `HKDF`
+//! is the KDF of the profile, HKDF-SHA3-256 in the default profile.
 //!
 //! ```text
-//! hs      = HKDF(ee || base, salt = S, info = "tb/session/kdf/v1")
+//! hs      = HKDF(ee || base, salt = S, info = "tb/session/kdf/v1")    CMS
+//! hs      = HKDF(ee, salt = S, info = "tb/session/kdf/v1")            HPKE
 //! k_c2s   = HKDF(hs, S, "tb/session/kdf/c2s/v1")
 //! k_s2c   = HKDF(hs, S, "tb/session/kdf/s2c/v1")
 //! epoch_0 = HKDF(hs, S, "tb/session/kdf/epoch/v1")
 //! k_ack   = HKDF(hs, S, "tb/session/kdf/ack/v1")
-//! k_id    = HKDF(hs, S, "tb/session/kdf/identity/v1")
-//! mac_key = HKDF-Expand-H(HKDF-Extract-H(S, hs), "tb/handshake/finished/v1", Hash.length)
-//! confirm = HMAC-H(mac_key, transcript_hash)
+//! k_close = HKDF(hs, S, "tb/session/kdf/closing/v1")
+//! mac_c   = HKDF-Expand-H(HKDF-Extract-H(S, hs), "tb/handshake/finished/client/mac/v1", Hash.length)
+//! mac_s   = HKDF-Expand-H(HKDF-Extract-H(S, hs), "tb/handshake/finished/server/mac/v1", Hash.length)
+//! confirm = HMAC-H(mac_c, transcript_hash)
+//! server  = HMAC-H(mac_s, transcript_hash || SignerInfo.signature)    HPKE
 //! ```
 //!
 //! - `ee || base` is the hybrid shared secret `Z′ = Z || T` of NIST SP 800-56C Rev. 2 § 2.
-//! - `confirm` follows the Finished construction of RFC 9846 § 4.5.3, with the
-//!   crate's label as the HKDF-Expand info in place of `HkdfLabel`.
+//! - `confirm` and `server` follow the Finished construction of RFC 9846 §
+//!   4.5.3, one `MacKey` per role, with the crate's label as the HKDF-Expand
+//!   info in place of `HkdfLabel`. `server` covers the transcript through the
+//!   octets of the reply's signature.
 //!
 //! [Forward secrecy](crate::transport::handshake#forward-secrecy) states what
 //! this schedule withholds from a holder of the server's static key.
@@ -42,6 +47,10 @@ use core::marker::PhantomData;
 #[cfg(all(not(feature = "std"), any(feature = "transport-cms", feature = "transport-hpke")))]
 use alloc::vec::Vec;
 
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::cms::signed_data::SignedData;
+#[cfg(feature = "transport-cms")]
+use crate::constants::ECDH_SHARED_SECRET_SIZE;
 #[cfg(any(
 	feature = "transport-hpke",
 	all(feature = "transport-cms", feature = "transport-multiplex")
@@ -49,9 +58,10 @@ use alloc::vec::Vec;
 use crate::constants::EC_PUBKEY_COMPRESSED_SIZE;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::constants::{
-	prefix_free, ECDH_SHARED_SECRET_SIZE, MIN_SALT_ENTROPY_BYTES, TIGHTBEAM_ACK_KDF_INFO, TIGHTBEAM_ACK_KEY_ID_DOMAIN,
-	TIGHTBEAM_C2S_KDF_INFO, TIGHTBEAM_EPOCH_KDF_INFO, TIGHTBEAM_FINISHED_KEY_INFO, TIGHTBEAM_IDENTITY_KDF_INFO,
-	TIGHTBEAM_IDENTITY_KEY_ID_DOMAIN, TIGHTBEAM_S2C_KDF_INFO, TIGHTBEAM_SESSION_KDF_INFO,
+	pairwise_prefix_free, prefix_free, MIN_SALT_ENTROPY_BYTES, TIGHTBEAM_ACK_KDF_INFO, TIGHTBEAM_ACK_KEY_ID_DOMAIN,
+	TIGHTBEAM_C2S_KDF_INFO, TIGHTBEAM_CLIENT_FINISHED_DOMAIN, TIGHTBEAM_CLIENT_FINISHED_KEY_INFO,
+	TIGHTBEAM_CLOSING_KDF_INFO, TIGHTBEAM_CLOSING_KEY_ID_DOMAIN, TIGHTBEAM_EPOCH_KDF_INFO, TIGHTBEAM_S2C_KDF_INFO,
+	TIGHTBEAM_SERVER_FINISHED_DOMAIN, TIGHTBEAM_SERVER_FINISHED_KEY_INFO, TIGHTBEAM_SESSION_KDF_INFO,
 };
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::aead::{DirectionalCiphers, KeyInit, SessionKeys};
@@ -80,11 +90,13 @@ use crate::crypto::sign::elliptic_curve::sec1::ToEncodedPoint;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::sign::elliptic_curve::{CurveArithmetic, PublicKey, SecretKey};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::crypto::sign::CmsSigner;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::subtle::ConstantTimeEq;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::x509::utils::CertificateExt;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::der::asn1::{Any, OctetString, OctetStringRef, SetOfVec};
+use crate::der::asn1::{ObjectIdentifier, OctetStringRef};
 #[cfg(all(
 	feature = "transport-multiplex",
 	any(feature = "transport-cms", feature = "transport-hpke")
@@ -95,8 +107,8 @@ use crate::der::{
 	Decode, DecodeValue, EncodeValue, FixedTag, Header, Length, Reader, Result as DerResult, Tag, Writer,
 };
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::oids::{DATA, HANDSHAKE_TRANSCRIPT_HASH};
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::oids::HANDSHAKE_TRANSCRIPT_HASH;
+#[cfg(feature = "transport-cms")]
 use crate::random::{generate_nonce, CryptoRngCore};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::error::HandshakeError;
@@ -126,26 +138,28 @@ use crate::transport::handshake::{Arc, EstablishedSession, HandshakeCurve, Hands
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::utils::marker::{MaybeSend, MaybeSync};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::x509::attr::{Attribute, Attributes};
+use crate::x509::attr::Attributes;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::x509::Certificate;
+#[cfg(feature = "transport-cms")]
+use crate::ZeroizingArray;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::{ZeroizingArray, ZeroizingBytes};
+use crate::ZeroizingBytes;
 
-/// The 32-byte random secret the client seals to the server's static key.
+/// The 32-byte random secret the CMS client seals to the server's
+/// certificate key.
 ///
-/// It is the second input of [`HandshakeSecret::hybrid`]. HPKE carries it
-/// inside the key-exchange payload, and CMS as the content of the key-exchange
-/// envelope. The length is part of the type, so a parse that lands here has
-/// already refused every other length.
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+/// It is the second input of [`HandshakeSecret::hybrid`], and it travels as
+/// the content of the CMS opening. The length is part of the type, so a parse
+/// that lands here has already refused every other length.
+#[cfg(feature = "transport-cms")]
 pub(crate) struct BaseSecret(ZeroizingArray<BASE_SECRET_SIZE>);
 
 /// Base secret length in bytes.
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+#[cfg(feature = "transport-cms")]
 const BASE_SECRET_SIZE: usize = 32;
 
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+#[cfg(feature = "transport-cms")]
 impl BaseSecret {
 	/// Draw a fresh base secret from `rng`, or from the OS random source when
 	/// `rng` is `None`.
@@ -166,7 +180,7 @@ impl BaseSecret {
 }
 
 /// Parse the opened key-exchange content as the base secret.
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+#[cfg(feature = "transport-cms")]
 impl TryFrom<SecretSlice<u8>> for BaseSecret {
 	type Error = HandshakeError;
 
@@ -187,11 +201,12 @@ impl TryFrom<SecretSlice<u8>> for BaseSecret {
 	}
 }
 
-/// The secret both endpoints agree on: the ephemeral-ephemeral ECDH output and
-/// the client's base secret, extracted under the protocol salt.
+/// The secret both endpoints agree on: the ephemeral-ephemeral ECDH output,
+/// followed in the CMS flow by the client's base secret, extracted under the
+/// protocol salt.
 ///
-/// Every session key derives from this one value, and the crate's one
-/// constructor for it takes the two inputs named above.
+/// Every session key derives from this one value. Its constructor `hybrid`
+/// derives the CMS secret, and `ephemeral` derives the HPKE one.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub struct HandshakeSecret(ZeroizingBytes);
 
@@ -200,12 +215,12 @@ pub struct HandshakeSecret(ZeroizingBytes);
 const HANDSHAKE_SECRET_SIZE: usize = 32;
 
 /// Length in bytes of the hybrid shared secret `ee || base`.
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+#[cfg(feature = "transport-cms")]
 const HYBRID_SECRET_SIZE: usize = ECDH_SHARED_SECRET_SIZE + BASE_SECRET_SIZE;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl HandshakeSecret {
-	/// Derive the handshake secret from the hybrid shared secret
+	/// Derive the CMS handshake secret from the hybrid shared secret
 	/// `Z′ = ee || base`, extracted under `salt`.
 	///
 	/// `ee` is the ephemeral-ephemeral ECDH output, the shared secret `Z` of
@@ -216,6 +231,7 @@ impl HandshakeSecret {
 	/// # Errors
 	///
 	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the derivation.
+	#[cfg(feature = "transport-cms")]
 	fn hybrid<P>(ee: &EcdhSecret, base: &BaseSecret, salt: KdfSalt<'_>) -> Result<Self, HandshakeError>
 	where
 		P: CryptoProvider,
@@ -226,9 +242,39 @@ impl HandshakeSecret {
 		ee.with(|ee| shared.copy_from_slice(ee));
 		auxiliary.copy_from_slice(base.as_bytes());
 
+		Self::extract::<P>(hybrid.as_slice(), salt)
+	}
+
+	/// Derive the HPKE handshake secret from the shared secret `Z = ee` alone,
+	/// extracted under `salt`.
+	///
+	/// Both ephemerals serve this one agreement, so the secret holds forward
+	/// secrecy from them alone, as the ECDHE secret of TLS 1.3 does (RFC 9846
+	/// § 7.1).
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the derivation.
+	fn ephemeral<P>(ee: &EcdhSecret, salt: KdfSalt<'_>) -> Result<Self, HandshakeError>
+	where
+		P: CryptoProvider,
+	{
+		ee.with(|shared| Self::extract::<P>(shared, salt))
+	}
+
+	/// Extract the handshake secret from the shared secret `ikm` under `salt`,
+	/// the one derivation both constructors run.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the derivation.
+	fn extract<P>(ikm: &[u8], salt: KdfSalt<'_>) -> Result<Self, HandshakeError>
+	where
+		P: CryptoProvider,
+	{
 		let label = KdfInfo::new(TIGHTBEAM_SESSION_KDF_INFO);
 		let salt = Some(salt.as_bytes());
-		let secret = P::Kdf::derive_dynamic_key(hybrid.as_slice(), label.as_bytes(), salt, HANDSHAKE_SECRET_SIZE)?;
+		let secret = P::Kdf::derive_dynamic_key(ikm, label.as_bytes(), salt, HANDSHAKE_SECRET_SIZE)?;
 		Ok(Self(secret))
 	}
 
@@ -257,22 +303,20 @@ impl HandshakeSecret {
 		Ok(Sealer { kek, transcript_hash: *transcript_hash, purpose, provider: PhantomData })
 	}
 
-	/// Derive the key-confirmation tag over `transcript_hash`. It follows the
-	/// Finished construction of RFC 9846 § 4.5.3 under the digest `H` of `P`,
-	/// with the crate's label as the HKDF-Expand info in place of `HkdfLabel`.
+	/// Derive the key-confirmation tag of the client Finished over
+	/// `transcript_hash`, under the `MacKey` of [`FinishedRole::Client`].
 	///
 	/// ```text
-	/// mac_key = HKDF-Expand-H(HKDF-Extract-H(salt, hs), "tb/handshake/finished/v1", Hash.length)
-	/// tag     = HMAC-H(mac_key, transcript_hash)
+	/// mac_c = HKDF-Expand-H(HKDF-Extract-H(salt, hs), "tb/handshake/finished/client/mac/v1", Hash.length)
+	/// tag   = HMAC-H(mac_c, transcript_hash)
 	/// ```
 	///
-	/// A 32-byte `hs` is too short a PRK for a 64-byte `H` (RFC 5869 § 2.3), so
-	/// `H` extracts one first. The client owns no static key-establishment key,
-	/// so the key confirmation of NIST SP 800-56A Rev. 3 § 5.9 is not claimed.
+	/// The client owns no static key-establishment key, so the key
+	/// confirmation of NIST SP 800-56A Rev. 3 § 5.9 is not claimed.
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError::KdfError`] -- HKDF refused the length of `mac_key`.
+	/// - [`HandshakeError::KdfError`] -- HKDF refused the length of `mac_c`.
 	/// - [`HandshakeError::TranscriptDigestLength`] -- the digest of `P` is not 32 to 64 bytes.
 	pub(crate) fn confirmation<P>(
 		&self,
@@ -282,16 +326,97 @@ impl HandshakeSecret {
 	where
 		P: CryptoProvider,
 	{
-		// 1. Extract the PRK of the secret, and expand `mac_key` from it.
+		self.finished::<P>(FinishedRole::Client, salt, &[transcript_hash.as_bytes()])
+	}
+
+	/// Derive the server Finished over `transcript_hash` and the octets of
+	/// the one `SignerInfo.signature` of `reply`, under the `MacKey` of
+	/// [`FinishedRole::Server`] (RFC 9846 § 4.5.3).
+	///
+	/// ```text
+	/// mac_s  = HKDF-Expand-H(HKDF-Extract-H(salt, hs), "tb/handshake/finished/server/mac/v1", Hash.length)
+	/// server = HMAC-H(mac_s, transcript_hash || SignerInfo.signature)
+	/// ```
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::SignatureVerificationFailed`] -- `reply` does not have exactly one signer.
+	/// - [`HandshakeError::KdfError`] -- HKDF refused the length of `mac_s`.
+	/// - [`HandshakeError::TranscriptDigestLength`] -- the digest of `P` is not 32 to 64 bytes.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	pub(crate) fn server_confirmation<P>(
+		&self,
+		salt: KdfSalt<'_>,
+		transcript_hash: &TranscriptHash,
+		reply: &SignedData,
+	) -> Result<KeyConfirmation, HandshakeError>
+	where
+		P: CryptoProvider,
+	{
+		let signer_info = CmsSigner::sole_signer(reply)?;
+
+		let signature = signer_info.signature.as_bytes();
+		self.finished::<P>(FinishedRole::Server, salt, &[transcript_hash.as_bytes(), signature])
+	}
+
+	/// Verify that `received` is the server Finished of this secret over
+	/// `transcript_hash` and the signature of `reply`, and hand the secret
+	/// back.
+	///
+	/// # Errors
+	///
+	/// - The [`Self::server_confirmation`] set.
+	/// - [`HandshakeError::KeyConfirmationFailed`] -- the tags differ, so the
+	///   server derived another handshake secret or MACed another transcript or
+	///   another signature.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	pub(crate) fn confirm_server<P>(
+		self,
+		salt: KdfSalt<'_>,
+		transcript_hash: &TranscriptHash,
+		reply: &SignedData,
+		received: &KeyConfirmation,
+	) -> Result<Self, HandshakeError>
+	where
+		P: CryptoProvider,
+	{
+		let expected = self.server_confirmation::<P>(salt, transcript_hash, reply)?;
+		expected.verify(received)?;
+
+		Ok(self)
+	}
+
+	/// The Finished MAC of `role` over `parts` in order, under the role's
+	/// `MacKey` and the digest `H` of `P`.
+	///
+	/// A 32-byte `hs` is too short a PRK for a 64-byte `H` (RFC 5869 § 2.3), so
+	/// `H` extracts one first. Each role expands its own `MacKey` under its own
+	/// label, so the two tags of one handshake are MACs under distinct keys.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::KdfError`] -- HKDF refused the length of the `MacKey`.
+	/// - [`HandshakeError::TranscriptDigestLength`] -- the digest of `P` is not 32 to 64 bytes.
+	fn finished<P>(
+		&self,
+		role: FinishedRole,
+		salt: KdfSalt<'_>,
+		parts: &[&[u8]],
+	) -> Result<KeyConfirmation, HandshakeError>
+	where
+		P: CryptoProvider,
+	{
+		// 1. Extract the PRK of the secret, and expand the role's `MacKey` from it.
 		let prk = SimpleHkdf::<P::Digest>::new(Some(salt.as_bytes()), &self.0);
 		let mut mac_key = ZeroizingBytes::new(vec![0u8; <P::Digest as Digest>::output_size()]);
-		let expanded = prk.expand(TIGHTBEAM_FINISHED_KEY_INFO, &mut mac_key);
+		let expanded = prk.expand(role.key_label(), &mut mac_key);
 		expanded.map_err(KdfError::DerivationFailed)?;
 
-		// 2. MAC the transcript hash under `mac_key`.
+		// 2. MAC the parts in order under the `MacKey`.
 		let mac = <SimpleHmac<P::Digest> as KeyInit>::new_from_slice(&mac_key);
 		let mac = mac.map_err(|_| KdfError::DerivationFailed(InvalidLength))?;
-		let tag = mac.chain_update(transcript_hash.as_bytes()).finalize();
+		let mac = parts.iter().fold(mac, |mac, part| mac.chain_update(part));
+		let tag = mac.finalize();
 		Ok(KeyConfirmation(DigestOutput::parse(tag.into_bytes())?))
 	}
 
@@ -341,9 +466,9 @@ impl fmt::Debug for HandshakeSecret {
 pub(crate) enum SecretSeal {
 	/// The client's countersignature of the receipt, sealed in the closing.
 	Ack,
-	/// The client certificate and its proof of possession, sealed in the
-	/// closing.
-	Identity,
+	/// The closing of both flows: the client Finished, which carries the
+	/// client certificate, or the attributes of an anonymous client.
+	Closing,
 }
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -352,7 +477,7 @@ impl SecretSeal {
 	pub(crate) const fn label(self) -> &'static [u8] {
 		match self {
 			Self::Ack => TIGHTBEAM_ACK_KDF_INFO,
-			Self::Identity => TIGHTBEAM_IDENTITY_KDF_INFO,
+			Self::Closing => TIGHTBEAM_CLOSING_KDF_INFO,
 		}
 	}
 
@@ -360,20 +485,21 @@ impl SecretSeal {
 	pub(crate) const fn domain(self) -> &'static [u8] {
 		match self {
 			Self::Ack => TIGHTBEAM_ACK_KEY_ID_DOMAIN,
-			Self::Identity => TIGHTBEAM_IDENTITY_KEY_ID_DOMAIN,
+			Self::Closing => TIGHTBEAM_CLOSING_KEY_ID_DOMAIN,
 		}
 	}
 
 	/// The padding of the sealed plaintext, or `None` for a purpose sealed
 	/// bare.
 	///
-	/// Every field around the identity has a fixed width, so its length would
-	/// be the length of the certificate. Padding to a step with a floor gives a
-	/// fleet whose certificates come from one issuer one length.
+	/// Every field around the client certificate in a closing has a fixed
+	/// width, so its length would be the length of the certificate. Padding to
+	/// a step with a floor gives a fleet whose certificates come from one
+	/// issuer one length.
 	const fn padding(self) -> Option<Padding> {
 		match self {
 			Self::Ack => None,
-			Self::Identity => Some(Padding { floor: 1024, step: 512 }),
+			Self::Closing => Some(Padding { floor: 1024, step: 512 }),
 		}
 	}
 
@@ -382,25 +508,27 @@ impl SecretSeal {
 	pub(crate) fn refusal(self, error: EnvelopeError) -> HandshakeError {
 		match self {
 			Self::Ack => HandshakeError::ReceiptAckCipher(error),
-			Self::Identity => HandshakeError::SealedIdentity(error),
+			Self::Closing => HandshakeError::SealedClosing(error),
 		}
 	}
 
 	/// The plaintext as it is sealed.
 	///
-	/// A purpose with no padding seals the plaintext bare. A padded purpose
-	/// seals a big-endian `u16` length, the plaintext, and zero bytes up to its
-	/// padded length, so the opener finds the plaintext without reading it.
-	pub(crate) fn frame(self, plaintext: &[u8]) -> Result<ZeroizingBytes, HandshakeError> {
+	/// A purpose with no padding seals the plaintext bare, in the buffer it
+	/// moved in. A padded purpose seals a big-endian `u16` length, the
+	/// plaintext, and zero bytes up to its padded length, so the opener finds
+	/// the plaintext without reading it.
+	pub(crate) fn frame(self, plaintext: impl Into<Vec<u8>>) -> Result<ZeroizingBytes, HandshakeError> {
+		let plaintext = ZeroizingBytes::new(plaintext.into());
 		let Some(padding) = self.padding() else {
-			return Ok(ZeroizingBytes::new(plaintext.to_vec()));
+			return Ok(plaintext);
 		};
 
 		let length = u16::try_from(plaintext.len()).map_err(|_| HandshakeError::SealedFrame)?;
 		let padded_len = padding.padded_len(plaintext.len());
 		let mut framed = ZeroizingBytes::new(Vec::with_capacity(padded_len));
 		framed.extend_from_slice(&length.to_be_bytes());
-		framed.extend_from_slice(plaintext);
+		framed.extend_from_slice(&plaintext);
 		framed.resize(padded_len, 0);
 		Ok(framed)
 	}
@@ -452,24 +580,26 @@ impl Padding {
 	}
 }
 
-// The acknowledgement and the identity derive two keys from one secret, so
+// The acknowledgement and the closing derive two keys from one secret, so
 // their labels must differ (RFC 5869 § 3.2), which `prefix_free` implies.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-const _: () = assert!(prefix_free(SecretSeal::Ack.label(), SecretSeal::Identity.label()));
+const _: () = assert!(prefix_free(SecretSeal::Ack.label(), SecretSeal::Closing.label()));
 
-// When the negotiated digest is the hash of the profile's KDF, `mac_key`
-// expands from the PRK that the traffic, epoch, acknowledgement, and identity
-// keys extract from the handshake secret under the protocol salt. Its label
-// must then differ from each of theirs (RFC 5869 § 3.2), which `prefix_free`
-// implies.
+// When the negotiated digest is the hash of the profile's KDF, each `MacKey`
+// expands from the PRK that the traffic, epoch, acknowledgement, and closing
+// keys extract from the handshake secret under the protocol salt. Every label
+// must then differ from every other (RFC 5869 § 3.2), which
+// `pairwise_prefix_free` implies.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-const _: () = assert!(
-	prefix_free(TIGHTBEAM_FINISHED_KEY_INFO, TIGHTBEAM_C2S_KDF_INFO)
-		&& prefix_free(TIGHTBEAM_FINISHED_KEY_INFO, TIGHTBEAM_S2C_KDF_INFO)
-		&& prefix_free(TIGHTBEAM_FINISHED_KEY_INFO, TIGHTBEAM_EPOCH_KDF_INFO)
-		&& prefix_free(TIGHTBEAM_FINISHED_KEY_INFO, TIGHTBEAM_ACK_KDF_INFO)
-		&& prefix_free(TIGHTBEAM_FINISHED_KEY_INFO, TIGHTBEAM_IDENTITY_KDF_INFO)
-);
+const _: () = assert!(pairwise_prefix_free(&[
+	TIGHTBEAM_CLIENT_FINISHED_KEY_INFO,
+	TIGHTBEAM_SERVER_FINISHED_KEY_INFO,
+	TIGHTBEAM_C2S_KDF_INFO,
+	TIGHTBEAM_S2C_KDF_INFO,
+	TIGHTBEAM_EPOCH_KDF_INFO,
+	TIGHTBEAM_ACK_KDF_INFO,
+	TIGHTBEAM_CLOSING_KDF_INFO,
+]));
 
 /// The single-use seal of one [`SecretSeal`] purpose: an `AuthEnvelopedData`
 /// with one `KEKRecipientInfo` (RFC 5652 §6.2.3) under the purpose's key and
@@ -489,40 +619,52 @@ pub struct Sealer<P> {
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl<P: HandshakeProvider> Sealer<P> {
 	/// Seal `plaintext`, framed and padded as its purpose demands, as an
-	/// `AuthEnvelopedData` of type `id-data` whose authenticated attributes
-	/// carry the transcript hash.
+	/// `AuthEnvelopedData` of type `content_type` whose authenticated
+	/// attributes carry the transcript hash.
+	///
+	/// The framed buffer moves into the envelope, which encrypts it in place.
 	///
 	/// # Errors
 	///
 	/// - [`HandshakeError::ReceiptAckCipher`] -- the envelope refused to seal an acknowledgement.
-	/// - [`HandshakeError::SealedIdentity`] -- the envelope refused to seal an identity.
-	/// - [`HandshakeError::SealedFrame`] -- the identity exceeds the frame.
+	/// - [`HandshakeError::SealedClosing`] -- the envelope refused to seal a closing.
+	/// - [`HandshakeError::SealedFrame`] -- the closing exceeds the frame.
 	/// - [`HandshakeError::DerError`] -- the transcript hash attribute fails to encode.
-	pub(crate) fn seal(self, plaintext: impl AsRef<[u8]>) -> Result<AuthEnvelopedData, HandshakeError> {
-		let framed = self.purpose.frame(plaintext.as_ref())?;
-		let transcript = self.transcript_attribute()?;
+	pub(crate) fn seal(
+		self,
+		content_type: ObjectIdentifier,
+		plaintext: impl Into<Vec<u8>>,
+	) -> Result<AuthEnvelopedData, HandshakeError> {
+		let mut framed = self.purpose.frame(plaintext)?;
+		let transcript = self.transcript_hash.attribute()?;
 		let key_identifier = self.key_identifier();
 		let recipient = Recipient::Kek { kek: &self.kek, key_identifier: &key_identifier };
 
-		let sealed = AuthEnvelopedData::seal::<P>(recipient, DATA, framed.as_slice(), [transcript], None);
+		let content = core::mem::take(&mut *framed);
+		let sealed = AuthEnvelopedData::seal::<P>(recipient, content_type, content, [transcript], None);
 		sealed.map_err(|error| self.purpose.refusal(error))
 	}
 
-	/// Open the `AuthEnvelopedData` whose DER is `der`, which a sealer of the
-	/// same secret, purpose, and transcript sealed, and strip its frame.
+	/// Open the `AuthEnvelopedData` whose DER is `der`, of type
+	/// `content_type`, which a sealer of the same secret, purpose, and
+	/// transcript sealed, and strip its frame.
 	///
 	/// The transcript hash attribute is checked before the content decrypts,
-	/// and the tag then covers it.
+	/// and the tag then covers it and the content type.
 	///
 	/// # Errors
 	///
 	/// - [`HandshakeError::ReceiptAckCipher`] -- an acknowledgement fails to
 	///   open, so it was sealed under another handshake secret or another
 	///   transcript, or altered in flight.
-	/// - [`HandshakeError::SealedIdentity`] -- an identity fails to open.
-	/// - [`HandshakeError::SealedFrame`] -- the opened frame of an identity is malformed.
+	/// - [`HandshakeError::SealedClosing`] -- a closing fails to open.
+	/// - [`HandshakeError::SealedFrame`] -- the opened frame of a closing is malformed.
 	/// - [`HandshakeError::DerError`] -- the transcript hash attribute fails to encode.
-	pub(crate) async fn open(self, der: impl AsRef<[u8]>) -> Result<SecretSlice<u8>, HandshakeError> {
+	pub(crate) async fn open(
+		self,
+		der: impl AsRef<[u8]>,
+		content_type: ObjectIdentifier,
+	) -> Result<SecretSlice<u8>, HandshakeError> {
 		let der = der.as_ref();
 		let envelope = AuthEnvelopedData::from_der(der);
 		let envelope = envelope.map_err(|error| self.purpose.refusal(EnvelopeError::Encoding(error)))?;
@@ -533,7 +675,7 @@ impl<P: HandshakeProvider> Sealer<P> {
 		let opener = Opener::Kek { kek: &self.kek, key_identifier: &key_identifier };
 
 		// 2. Open the content under the tag, which covers the attributes.
-		let opened = envelope.open::<P>(der, &opener, DATA).await;
+		let opened = envelope.open::<P>(der, &opener, content_type).await;
 		let opened = opened.map_err(|error| self.purpose.refusal(error))?;
 		opened.with(|framed| self.purpose.unframe(framed))
 	}
@@ -551,17 +693,6 @@ impl<P: HandshakeProvider> Sealer<P> {
 		[self.purpose.domain(), self.transcript_hash.as_bytes()].concat()
 	}
 
-	/// The authenticated attribute that carries the transcript hash.
-	///
-	/// # Errors
-	///
-	/// - [`HandshakeError::DerError`] -- the attribute fails to encode.
-	fn transcript_attribute(&self) -> Result<Attribute, HandshakeError> {
-		let hash = OctetString::new(self.transcript_hash.as_bytes())?;
-		let values = SetOfVec::try_from(vec![Any::encode_from(&hash)?])?;
-		Ok(Attribute { oid: HANDSHAKE_TRANSCRIPT_HASH, values })
-	}
-
 	/// Refuse `auth_attrs` unless it carries the transcript hash attribute of
 	/// this sealer, once under its OID.
 	///
@@ -570,7 +701,7 @@ impl<P: HandshakeProvider> Sealer<P> {
 	/// - The refusal of the purpose -- the attribute is absent, repeated, or names another transcript.
 	/// - [`HandshakeError::DerError`] -- the expected attribute fails to encode.
 	fn refuse_unbound(&self, auth_attrs: Option<&Attributes>) -> Result<(), HandshakeError> {
-		let expected = self.transcript_attribute()?;
+		let expected = self.transcript_hash.attribute()?;
 		let unbound = || self.purpose.refusal(EnvelopeError::AuthenticatedAttribute);
 		let attrs = auth_attrs.ok_or_else(unbound)?;
 
@@ -650,6 +781,68 @@ impl<'a> DecodeValue<'a> for KeyConfirmation {
 		let octets = OctetStringRef::decode_value(reader, header)?;
 		let tag = DigestOutput::parse(octets.as_bytes()).map_err(|_| Tag::OctetString.length_error())?;
 		Ok(Self(tag))
+	}
+}
+
+/// The endpoint that sent a Finished.
+///
+/// Both Finished messages cover the same transcript hash, so each role names
+/// the label its signed Finished leads with and the label of its `MacKey`. A
+/// Finished one endpoint signed or MACed then verifies as no Finished of the
+/// other, and a peer cannot reflect one back.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FinishedRole {
+	/// The server Finished: the CMS server's signature, and the MAC the reply
+	/// of either flow carries.
+	Server,
+	/// The client Finished, signed with the client's key, and the
+	/// key-confirmation tag of the closing.
+	Client,
+}
+
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+impl FinishedRole {
+	/// The domain label this role signs ahead of the transcript hash.
+	const fn domain(self) -> &'static [u8] {
+		match self {
+			Self::Server => TIGHTBEAM_SERVER_FINISHED_DOMAIN,
+			Self::Client => TIGHTBEAM_CLIENT_FINISHED_DOMAIN,
+		}
+	}
+
+	/// The HKDF-Expand label of this role's `MacKey`.
+	pub(crate) const fn key_label(self) -> &'static [u8] {
+		match self {
+			Self::Server => TIGHTBEAM_SERVER_FINISHED_KEY_INFO,
+			Self::Client => TIGHTBEAM_CLIENT_FINISHED_KEY_INFO,
+		}
+	}
+
+	/// Build the content a signed Finished of this role signs: the role's
+	/// domain label, the transcript hash, and for the client Finished the
+	/// digest `D` of `certificate`, the certificate it carries (RFC 9846
+	/// § 4.5.2).
+	///
+	/// The CMS server's certificate is provisioned at its client before the
+	/// opening, so the server Finished binds the role and the transcript alone.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::DerError`] -- `certificate` fails to encode.
+	/// - [`HandshakeError::TranscriptDigestLength`] -- the output of `D` is not 32 to 64 bytes wide.
+	pub(crate) fn content<D: Digest>(
+		self,
+		transcript_hash: &TranscriptHash,
+		certificate: &Certificate,
+	) -> Result<Vec<u8>, HandshakeError> {
+		match self {
+			Self::Server => Ok([self.domain(), transcript_hash.as_bytes()].concat()),
+			Self::Client => {
+				let certificate = DigestOutput::of_der::<D>(certificate)?;
+				Ok([self.domain(), transcript_hash.as_bytes(), certificate.as_bytes()].concat())
+			}
+		}
 	}
 }
 
@@ -1058,26 +1251,44 @@ where
 	}
 }
 
-/// The peer point beside the base secret that follows its agreement output,
-/// borrowed for one settlement.
+/// The peer point, beside the base secret that follows its agreement output
+/// in the CMS flow, borrowed for one settlement.
 ///
-/// Each protocol builds one where both halves exist, and [`Self::settle`] is
-/// the one derivation of the [`HandshakeSecret`].
+/// [`Self::hybrid`] builds one for the CMS flow and [`Self::ephemeral`] for
+/// the HPKE flow, and [`Self::settle`] is the one derivation of the
+/// [`HandshakeSecret`].
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-pub(crate) struct Agreement<'a, P: HandshakeProvider> {
+pub struct Agreement<'a, P: HandshakeProvider> {
 	peer: &'a PeerPoint<P::Curve>,
-	base: &'a BaseSecret,
+	/// The base secret of the CMS flow, or `None` for the HPKE flow, whose
+	/// secret derives from the agreement output alone.
+	#[cfg(feature = "transport-cms")]
+	base: Option<&'a BaseSecret>,
 }
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl<'a, P: HandshakeProvider> Agreement<'a, P> {
-	/// Pair the ephemeral `peer` with the `base` that follows its agreement.
-	pub(crate) fn new(peer: &'a PeerPoint<P::Curve>, base: &'a BaseSecret) -> Self {
-		Self { peer, base }
+	/// Pair the ephemeral `peer` with the `base` that follows its agreement,
+	/// as the CMS flow derives the secret.
+	#[cfg(feature = "transport-cms")]
+	pub(crate) fn hybrid(peer: &'a PeerPoint<P::Curve>, base: &'a BaseSecret) -> Self {
+		Self { peer, base: Some(base) }
 	}
 
-	/// Run the agreement of `local` with the peer point, and derive the hybrid
-	/// handshake secret of that output and the base secret under `salt`.
+	/// The ephemeral `peer` alone, as the HPKE flow derives the secret.
+	#[cfg(feature = "transport-hpke")]
+	pub(crate) fn ephemeral(peer: &'a PeerPoint<P::Curve>) -> Self {
+		Self {
+			peer,
+			#[cfg(feature = "transport-cms")]
+			base: None,
+		}
+	}
+
+	/// Run the agreement of `local` with the peer point, and derive the
+	/// handshake secret of that output under `salt`: the hybrid secret with
+	/// the base secret of the CMS flow, or the ephemeral secret of the HPKE
+	/// flow.
 	///
 	/// # Errors
 	///
@@ -1088,7 +1299,12 @@ impl<'a, P: HandshakeProvider> Agreement<'a, P> {
 		salt: KdfSalt<'_>,
 	) -> Result<HandshakeSecret, HandshakeError> {
 		let shared = local.shared_secret(self.peer.as_public_key());
-		HandshakeSecret::hybrid::<P>(&shared, self.base, salt)
+		#[cfg(feature = "transport-cms")]
+		if let Some(base) = self.base {
+			return HandshakeSecret::hybrid::<P>(&shared, base, salt);
+		}
+
+		HandshakeSecret::ephemeral::<P>(&shared, salt)
 	}
 }
 
@@ -1251,6 +1467,37 @@ impl<P: HandshakeProvider> Terms<P> {
 		secret.confirmed::<P>(self.kdf_salt(), self.transcript_hash(), received)
 	}
 
+	/// The server Finished of `secret` over the transcript of these terms and
+	/// the signature of `reply`.
+	///
+	/// # Errors
+	///
+	/// - The [`HandshakeSecret::server_confirmation`] set.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	pub(crate) fn server_confirmation(
+		&self,
+		secret: &HandshakeSecret,
+		reply: &SignedData,
+	) -> Result<KeyConfirmation, HandshakeError> {
+		secret.server_confirmation::<P>(self.kdf_salt(), self.transcript_hash(), reply)
+	}
+
+	/// `secret`, once `received` is its server Finished over the transcript of
+	/// these terms and the signature of `reply`.
+	///
+	/// # Errors
+	///
+	/// - The [`HandshakeSecret::confirm_server`] set.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	pub(crate) fn confirm_server(
+		&self,
+		secret: HandshakeSecret,
+		reply: &SignedData,
+		received: &KeyConfirmation,
+	) -> Result<HandshakeSecret, HandshakeError> {
+		secret.confirm_server::<P>(self.kdf_salt(), self.transcript_hash(), reply, received)
+	}
+
 	/// The single-use seal of `purpose` under `secret`, bound to the salt and
 	/// the transcript of these terms.
 	///
@@ -1357,16 +1604,20 @@ impl HandshakeVerifyingKey for Certificate {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::cms::signed_data::{SignerInfo, SignerInfos};
 	use crate::constants::TIGHTBEAM_ACK_KEY_ID_DOMAIN;
 	use crate::crypto::hash::{Sha3_256, Sha3_512};
 	use crate::crypto::profiles::{AeadProvider, DefaultCryptoProvider};
 	use crate::crypto::secret::ToInsecure;
 	use crate::crypto::sign::ecdsa::k256::Secp256k1;
-	use crate::der::asn1::OctetString;
+	use crate::der::asn1::{OctetString, SetOfVec};
 	use crate::der::{Decode, Encode};
+	use crate::oids::DATA;
 	use crate::random::OsRng;
-	use crate::testing::{Aes256Sha3_512Provider, EnvelopeRecipient};
-	use crate::transport::handshake::tests::{create_test_certificate, fixture_transcript, negated};
+	use crate::testing::{Aes256Sha3_512Provider, EnvelopeRecipient, TestCertificate, TestKey};
+	use crate::transport::handshake::tests::{
+		create_test_certificate, create_test_signed_data, fixture_transcript, negated,
+	};
 
 	/// A base secret of `fill` bytes.
 	fn base_secret(fill: u8) -> BaseSecret {
@@ -1584,6 +1835,24 @@ mod tests {
 		Ok(())
 	}
 
+	/// The HPKE handshake secret is HKDF-SHA3-256 under the salt and the
+	/// session label over the ECDH output `0x11` × 32 alone.
+	///
+	/// The expected bytes come from an independent HKDF (Python's `hmac` and
+	/// `hashlib`), so a base secret mixed into the HPKE input fails here.
+	#[test]
+	fn the_ephemeral_handshake_secret_matches_its_known_answer() -> Result<(), HandshakeError> {
+		let shared = EcdhSecret::from([0x11u8; 32]);
+
+		let secret = HandshakeSecret::ephemeral::<DefaultCryptoProvider>(&shared, KdfSalt::new(&[0x99u8; 32]))?;
+		let expected = [
+			0xaa, 0x37, 0x22, 0x1e, 0x40, 0xaa, 0x14, 0xc2, 0x09, 0x0a, 0x1a, 0xeb, 0xec, 0xf8, 0x5e, 0x68, 0x29, 0x75,
+			0xe5, 0x39, 0xa3, 0xff, 0xbc, 0x80, 0xa2, 0x82, 0x12, 0x79, 0x02, 0x70, 0x5f, 0xf8,
+		];
+		assert_eq!(secret.as_bytes(), expected);
+		Ok(())
+	}
+
 	/// The handshake secret is HKDF-SHA3-256 under the salt and the session
 	/// label over the hybrid secret, the plain concatenation of the ECDH
 	/// output `0x11` × 32 and the base secret `0x42` × 32.
@@ -1602,8 +1871,8 @@ mod tests {
 	}
 
 	/// The key-confirmation tag is HMAC-SHA3-256 over the transcript hash,
-	/// keyed by the 32 bytes HKDF-SHA3-256 expands under the Finished label
-	/// from the PRK the salt extracts of the handshake secret.
+	/// keyed by the 32 bytes HKDF-SHA3-256 expands under the client Finished
+	/// label from the PRK the salt extracts of the handshake secret.
 	///
 	/// The expected bytes come from an independent HKDF and HMAC (Python's
 	/// `hmac` and `hashlib`), so no code of the crate computes them.
@@ -1614,8 +1883,8 @@ mod tests {
 
 		let tag = fixed_secret().confirmation::<DefaultCryptoProvider>(KdfSalt::new(&salt), &transcript_hash)?;
 		let expected = [
-			0x3c, 0x06, 0xdc, 0xe1, 0x71, 0xc7, 0xc0, 0xc4, 0x21, 0x78, 0x10, 0xf0, 0x10, 0xfd, 0x0a, 0x0e, 0xe5, 0xa1,
-			0x83, 0xed, 0xa5, 0x5a, 0xf6, 0xa3, 0x3f, 0x3f, 0x06, 0xf4, 0x66, 0x04, 0x9d, 0xee,
+			0xb6, 0x98, 0xa4, 0xe3, 0x74, 0xec, 0xce, 0xdf, 0x1e, 0xc1, 0x12, 0x58, 0xef, 0xa0, 0x92, 0x25, 0x50, 0x3c,
+			0x6f, 0x81, 0x01, 0xe4, 0xb5, 0xfa, 0x64, 0x08, 0x96, 0x13, 0xe5, 0xfa, 0x48, 0x02,
 		];
 		assert_eq!(tag.0.as_bytes(), expected);
 		Ok(())
@@ -1634,12 +1903,198 @@ mod tests {
 
 		let tag = fixed_secret().confirmation::<Aes256Sha3_512Provider>(KdfSalt::new(&salt), &transcript_hash)?;
 		let expected = [
-			0x73, 0x23, 0xc0, 0x00, 0x68, 0x56, 0xaf, 0xbf, 0x60, 0x4b, 0xd8, 0x71, 0xf0, 0x66, 0xe6, 0xe0, 0x4b, 0x55,
-			0x61, 0x91, 0x40, 0x63, 0xc8, 0xcd, 0x09, 0x90, 0x4e, 0xfa, 0xd4, 0xbf, 0xc1, 0xb5, 0xb0, 0x9c, 0x10, 0x95,
-			0x6b, 0xa6, 0xb9, 0x2f, 0x19, 0xfc, 0xce, 0x3b, 0x07, 0x5b, 0xca, 0xdc, 0x6a, 0x44, 0x55, 0x22, 0x55, 0xf4,
-			0x7a, 0xdb, 0xc1, 0x49, 0xc0, 0xe2, 0x3b, 0x61, 0xc4, 0x40,
+			0x36, 0x07, 0xb0, 0xcc, 0x6b, 0x27, 0x1d, 0xf9, 0x5d, 0x26, 0x99, 0xa8, 0xf2, 0x89, 0x74, 0x56, 0x04, 0xef,
+			0x55, 0xd9, 0xc6, 0x14, 0x30, 0x99, 0x57, 0x70, 0x5d, 0xa1, 0xbf, 0xd6, 0x97, 0x1a, 0x09, 0x29, 0x7a, 0x9e,
+			0xf4, 0xcc, 0xc0, 0x71, 0xa0, 0x7b, 0xf6, 0x60, 0xc6, 0x53, 0x17, 0xa2, 0x07, 0x30, 0xbc, 0x50, 0x1f, 0x22,
+			0xfe, 0xf7, 0x28, 0x1a, 0x20, 0x98, 0x4a, 0x14, 0x8e, 0x16,
 		];
 		assert_eq!(tag.0.as_bytes(), expected);
+		Ok(())
+	}
+
+	/// The signature octets of the reply a server Finished known answer MACs:
+	/// the 70 bytes `0x30` to `0x75`.
+	const REPLY_SIGNATURE: core::ops::Range<u8> = 0x30..0x76;
+
+	/// A reply whose one `SignerInfo` carries `signature`. The server Finished
+	/// reads the signature octets alone, so no key signs them.
+	fn reply_signed_as(signature: impl AsRef<[u8]>) -> SignedData {
+		let mut reply = create_test_signed_data(b"reply");
+		let signature = OctetString::new(signature.as_ref()).expect("bytes are an OCTET STRING");
+		let signers = core::mem::take(&mut reply.signer_infos.0).into_vec();
+		let resign = |signer| SignerInfo { signature: signature.clone(), ..signer };
+		let resigned: Vec<SignerInfo> = signers.into_iter().map(resign).collect();
+
+		let resigned = SetOfVec::try_from(resigned).expect("one signer is a SET");
+		reply.signer_infos = SignerInfos(resigned);
+		reply
+	}
+
+	/// The client Finished signs its domain label, the transcript hash, and
+	/// the SHA3-256 of the DER of the certificate it carries.
+	///
+	/// The certificate is the fixed self-signed test certificate of the fixed
+	/// test key. The expected digest comes from Python's `hashlib` over its
+	/// 283 DER bytes, so no code of the crate computes it.
+	#[test]
+	fn the_client_finished_content_matches_its_known_answer() -> Result<(), HandshakeError> {
+		let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+		let content = FinishedRole::Client.content::<Sha3_256>(&ack_transcript(), &certificate)?;
+
+		let certificate_digest = [
+			0x48, 0x29, 0xc7, 0xab, 0x13, 0xba, 0xd5, 0x3f, 0x37, 0x47, 0x5f, 0xc6, 0x60, 0x3e, 0xd6, 0xec, 0x32, 0x7e,
+			0x95, 0x11, 0x29, 0xd6, 0xf4, 0x02, 0x2f, 0x50, 0x3e, 0x9c, 0x20, 0xbb, 0x3b, 0x99,
+		];
+		let domain = b"tb/handshake/finished/client/v1".as_slice();
+		let expected = [domain, &[0x07u8; 32], &certificate_digest].concat();
+		assert_eq!(content, expected);
+		Ok(())
+	}
+
+	/// The CMS reply carries the server Finished of the HPKE reply, keyed by
+	/// the hybrid secret the CMS flow derives: the ECDH output `0x11` × 32,
+	/// then the base secret `0x42` × 32, under the transcript hash `0x07` × 32
+	/// as the salt.
+	///
+	/// The expected bytes come from an independent HKDF and HMAC (Python's
+	/// `hmac` and `hashlib`), so no code of the crate computes them.
+	#[test]
+	fn the_cms_server_finished_matches_its_known_answer() -> Result<(), HandshakeError> {
+		let transcript_hash = ack_transcript();
+		let secret = handshake_secret(0x11, 0x42, transcript_hash.as_bytes());
+		let reply = reply_signed_as(REPLY_SIGNATURE.collect::<Vec<_>>());
+
+		let salt = KdfSalt::new(transcript_hash.as_bytes());
+		let server = secret.server_confirmation::<DefaultCryptoProvider>(salt, &transcript_hash, &reply)?;
+		let expected = [
+			0x73, 0x5f, 0x78, 0x2b, 0xbc, 0x96, 0x70, 0xa1, 0x9c, 0x5e, 0x57, 0xb3, 0xed, 0x51, 0xe3, 0xb2, 0x1b, 0x12,
+			0x0d, 0xa0, 0x2c, 0xc2, 0x49, 0xf2, 0xd2, 0x58, 0xf9, 0x0e, 0xa6, 0x36, 0xb1, 0xd9,
+		];
+		assert_eq!(server.0.as_bytes(), expected);
+		Ok(())
+	}
+
+	/// The server Finished is HMAC-SHA3-256 over the transcript hash followed
+	/// by the octets of the reply's signature, keyed by the 32 bytes
+	/// HKDF-SHA3-256 expands under the server Finished label.
+	///
+	/// The expected bytes come from an independent HKDF and HMAC (Python's
+	/// `hmac` and `hashlib`), so a dropped signature or a swapped label fails
+	/// here.
+	#[test]
+	fn the_server_finished_matches_its_known_answer() -> Result<(), HandshakeError> {
+		let salt = KdfSalt::new(&[0x99u8; 32]);
+		let transcript_hash = ack_transcript();
+		let reply = reply_signed_as(REPLY_SIGNATURE.collect::<Vec<_>>());
+
+		let server = fixed_secret().server_confirmation::<DefaultCryptoProvider>(salt, &transcript_hash, &reply)?;
+		let expected = [
+			0x33, 0x48, 0x7a, 0x72, 0xda, 0x3c, 0xbf, 0xdb, 0x4d, 0xd0, 0xc3, 0x56, 0x75, 0xf7, 0x21, 0x22, 0x02, 0x59,
+			0xd5, 0x47, 0x91, 0xde, 0x95, 0x2f, 0xee, 0x6f, 0x01, 0x19, 0xdd, 0xcc, 0x1f, 0xc3,
+		];
+		assert_eq!(server.0.as_bytes(), expected);
+		Ok(())
+	}
+
+	/// Under a SHA3-512 provider, the server Finished is HMAC-SHA3-512 over
+	/// the 64-byte transcript hash and the signature octets.
+	///
+	/// The expected bytes come from an independent HKDF and HMAC (Python's
+	/// `hmac` and `hashlib`), so a tag or a key cut to 32 bytes fails here.
+	#[test]
+	fn a_sha3_512_server_finished_matches_its_known_answer() -> Result<(), HandshakeError> {
+		let salt = KdfSalt::new(&[0x99u8; 32]);
+		let transcript_hash = fixture_transcript::<Sha3_512>([0x07u8; 64]);
+		let reply = reply_signed_as(REPLY_SIGNATURE.collect::<Vec<_>>());
+
+		let server = fixed_secret().server_confirmation::<Aes256Sha3_512Provider>(salt, &transcript_hash, &reply)?;
+		let expected = [
+			0x0c, 0x6b, 0x09, 0x16, 0x69, 0x35, 0x0a, 0xca, 0x9b, 0x76, 0x9f, 0xac, 0xa1, 0x0d, 0xa2, 0xcb, 0x3e, 0xfe,
+			0xb5, 0xde, 0x85, 0xb9, 0x38, 0xf1, 0x12, 0x00, 0x8d, 0xcf, 0xad, 0xa1, 0xb5, 0x46, 0x79, 0xd1, 0x8c, 0xda,
+			0x7d, 0xc5, 0xe9, 0x40, 0xde, 0xd9, 0x0f, 0x7b, 0xd1, 0xde, 0x6f, 0xc7, 0x00, 0x43, 0xe3, 0x5b, 0x10, 0xa9,
+			0xf8, 0x66, 0xb5, 0x82, 0xdc, 0xbb, 0x08, 0xfb, 0x1d, 0xe8,
+		];
+		assert_eq!(server.0.as_bytes(), expected);
+		Ok(())
+	}
+
+	/// The two Finished MACs run under two keys: over a reply whose signature
+	/// is empty, the server Finished MACs the transcript hash alone, as the
+	/// client's tag does, and the two still differ.
+	#[test]
+	fn the_server_finished_and_the_client_tag_differ_by_key() -> Result<(), HandshakeError> {
+		let salt = KdfSalt::new(&[0x99u8; 32]);
+		let transcript_hash = ack_transcript();
+		let reply = reply_signed_as([]);
+
+		let client = fixed_secret().confirmation::<DefaultCryptoProvider>(salt, &transcript_hash)?;
+		let server = fixed_secret().server_confirmation::<DefaultCryptoProvider>(salt, &transcript_hash, &reply)?;
+		assert_ne!(client.0.as_bytes(), server.0.as_bytes());
+		Ok(())
+	}
+
+	/// A secret confirms the server Finished it derives itself, and hands
+	/// itself back.
+	#[test]
+	fn a_server_finished_confirms_its_own_secret() -> Result<(), HandshakeError> {
+		let salt = KdfSalt::new(&[0x99u8; 32]);
+		let transcript_hash = ack_transcript();
+		let reply = reply_signed_as(REPLY_SIGNATURE.collect::<Vec<_>>());
+		let server = fixed_secret().server_confirmation::<DefaultCryptoProvider>(salt, &transcript_hash, &reply)?;
+
+		let confirming = HandshakeSecret::confirm_server::<DefaultCryptoProvider>;
+		let confirmed = confirming(fixed_secret(), salt, &transcript_hash, &reply, &server)?;
+		assert_eq!(confirmed.as_bytes(), fixed_secret().as_bytes());
+		Ok(())
+	}
+
+	/// A server Finished over the signature of another reply fails, so the
+	/// MAC covers the transcript through the signature.
+	#[test]
+	fn a_server_finished_over_another_signature_is_refused() -> Result<(), HandshakeError> {
+		let salt = KdfSalt::new(&[0x99u8; 32]);
+		let transcript_hash = ack_transcript();
+		let signed = reply_signed_as(REPLY_SIGNATURE.collect::<Vec<_>>());
+		let other = reply_signed_as(REPLY_SIGNATURE.rev().collect::<Vec<_>>());
+		let server = fixed_secret().server_confirmation::<DefaultCryptoProvider>(salt, &transcript_hash, &signed)?;
+
+		let confirming = HandshakeSecret::confirm_server::<DefaultCryptoProvider>;
+		let refused = confirming(fixed_secret(), salt, &transcript_hash, &other, &server);
+		assert!(matches!(refused, Err(HandshakeError::KeyConfirmationFailed)));
+		Ok(())
+	}
+
+	/// The client's tag is no server Finished, so a reflected tag fails.
+	#[test]
+	fn a_client_tag_is_refused_as_the_server_finished() -> Result<(), HandshakeError> {
+		let salt = KdfSalt::new(&[0x99u8; 32]);
+		let transcript_hash = ack_transcript();
+		let reply = reply_signed_as([]);
+		let client = fixed_secret().confirmation::<DefaultCryptoProvider>(salt, &transcript_hash)?;
+
+		let confirming = HandshakeSecret::confirm_server::<DefaultCryptoProvider>;
+		let refused = confirming(fixed_secret(), salt, &transcript_hash, &reply, &client);
+		assert!(matches!(refused, Err(HandshakeError::KeyConfirmationFailed)));
+		Ok(())
+	}
+
+	/// The one signer of a fresh test `SignedData`.
+	fn fresh_signer() -> SignerInfo {
+		let signers = create_test_signed_data(b"reply").signer_infos.0.into_vec();
+		let [signer] = <[SignerInfo; 1]>::try_from(signers).expect("a test SignedData has one signer");
+		signer
+	}
+
+	/// A server Finished over a reply of two signers is refused, since the
+	/// reply has one signature to cover.
+	#[test]
+	fn a_server_finished_over_two_signers_is_refused() -> Result<(), Box<dyn core::error::Error>> {
+		let salt = KdfSalt::new(&[0x99u8; 32]);
+		let mut reply = create_test_signed_data(b"reply");
+		reply.signer_infos.0.insert(fresh_signer())?;
+
+		let refused = fixed_secret().server_confirmation::<DefaultCryptoProvider>(salt, &ack_transcript(), &reply);
+		assert!(matches!(refused, Err(HandshakeError::SignatureVerificationFailed)));
 		Ok(())
 	}
 
@@ -1722,8 +2177,7 @@ mod tests {
 	/// `sealed` with the transcript hash attribute naming `transcript_hash`
 	/// in place of its own, under the same `kekid`.
 	fn with_transcript_attribute(mut sealed: AuthEnvelopedData, transcript_hash: &TranscriptHash) -> AuthEnvelopedData {
-		let other = sealer_of(&fixed_secret(), SecretSeal::Ack, transcript_hash);
-		let attribute = other.transcript_attribute().expect("the attribute encodes");
+		let attribute = transcript_hash.attribute().expect("the attribute encodes");
 		let attrs = sealed.auth_attrs.take().expect("a seal carries authenticated attributes");
 		let attrs = attrs.into_vec().into_iter();
 		let kept = attrs.filter(|attr| attr.oid != HANDSHAKE_TRANSCRIPT_HASH);
@@ -1744,10 +2198,10 @@ mod tests {
 	#[tokio::test]
 	async fn a_sealed_ack_opens_under_the_same_handshake_secret() -> Result<(), HandshakeError> {
 		let secret = fixed_secret();
-		let sealed = sealer_of(&secret, SecretSeal::Ack, &ack_transcript()).seal(b"settlement answer")?;
+		let sealed = sealer_of(&secret, SecretSeal::Ack, &ack_transcript()).seal(DATA, b"settlement answer")?;
 
 		let opener = sealer_of(&secret, SecretSeal::Ack, &ack_transcript());
-		let opened = opener.open(sealed.to_der()?).await?;
+		let opened = opener.open(sealed.to_der()?, DATA).await?;
 		assert!(opened.with(|bytes| bytes.as_slice() == b"settlement answer"));
 		Ok(())
 	}
@@ -1759,10 +2213,10 @@ mod tests {
 		let salt = [0x99u8; 32];
 		let secret = handshake_secret(0x11, 0x42, &salt);
 		let other = handshake_secret(0x12, 0x42, &salt);
-		let sealed = sealer_of(&secret, SecretSeal::Ack, &ack_transcript()).seal(b"settlement answer")?;
+		let sealed = sealer_of(&secret, SecretSeal::Ack, &ack_transcript()).seal(DATA, b"settlement answer")?;
 
 		let opener = sealer_of(&other, SecretSeal::Ack, &ack_transcript());
-		let refused = opener.open(sealed.to_der()?).await;
+		let refused = opener.open(sealed.to_der()?, DATA).await;
 		assert!(matches!(
 			refused,
 			Err(HandshakeError::ReceiptAckCipher(EnvelopeError::KeyUnwrap))
@@ -1776,10 +2230,10 @@ mod tests {
 	async fn a_sealed_ack_refuses_another_transcript() -> Result<(), HandshakeError> {
 		let secret = fixed_secret();
 		let other_transcript = fixture_transcript::<Sha3_256>([0x08u8; 32]);
-		let sealed = sealer_of(&secret, SecretSeal::Ack, &ack_transcript()).seal(b"settlement answer")?;
+		let sealed = sealer_of(&secret, SecretSeal::Ack, &ack_transcript()).seal(DATA, b"settlement answer")?;
 
 		let opener = sealer_of(&secret, SecretSeal::Ack, &other_transcript);
-		let refused = opener.open(sealed.to_der()?).await;
+		let refused = opener.open(sealed.to_der()?, DATA).await;
 		assert!(matches!(
 			refused,
 			Err(HandshakeError::ReceiptAckCipher(EnvelopeError::AuthenticatedAttribute))
@@ -1793,12 +2247,12 @@ mod tests {
 	#[tokio::test]
 	async fn a_seal_whose_transcript_attribute_differs_is_refused() -> Result<(), HandshakeError> {
 		let secret = fixed_secret();
-		let sealed = sealer_of(&secret, SecretSeal::Ack, &ack_transcript()).seal(b"settlement answer")?;
+		let sealed = sealer_of(&secret, SecretSeal::Ack, &ack_transcript()).seal(DATA, b"settlement answer")?;
 		let other_transcript = fixture_transcript::<Sha3_256>([0x08u8; 32]);
 		let sealed = with_transcript_attribute(sealed, &other_transcript);
 
 		let opener = sealer_of(&secret, SecretSeal::Ack, &ack_transcript());
-		let refused = opener.open(sealed.to_der()?).await;
+		let refused = opener.open(sealed.to_der()?, DATA).await;
 		assert!(matches!(
 			refused,
 			Err(HandshakeError::ReceiptAckCipher(EnvelopeError::AuthenticatedAttribute))
@@ -1812,10 +2266,10 @@ mod tests {
 	async fn a_seal_refuses_a_64_byte_transcript_that_differs_in_its_last_byte() -> Result<(), HandshakeError> {
 		let transcript = fixture_transcript::<Sha3_512>([0x07u8; 64]);
 		let last_byte_differs = fixture_transcript::<Sha3_512>([[0x07u8; 63].as_slice(), &[0x08u8]].concat());
-		let sealed = sealer_of(&fixed_secret(), SecretSeal::Ack, &transcript).seal(b"settlement answer")?;
+		let sealed = sealer_of(&fixed_secret(), SecretSeal::Ack, &transcript).seal(DATA, b"settlement answer")?;
 
 		let opener = sealer_of(&fixed_secret(), SecretSeal::Ack, &last_byte_differs);
-		let refused = opener.open(sealed.to_der()?).await;
+		let refused = opener.open(sealed.to_der()?, DATA).await;
 		assert!(matches!(
 			refused,
 			Err(HandshakeError::ReceiptAckCipher(EnvelopeError::AuthenticatedAttribute))
@@ -1839,18 +2293,18 @@ mod tests {
 		assert_eq!(*sealer.kek, expected);
 	}
 
-	/// The identity key-encryption key is HKDF-SHA3-256 of the handshake
-	/// secret under the salt and the identity label.
+	/// The closing key-encryption key is HKDF-SHA3-256 of the handshake
+	/// secret under the salt and the closing label.
 	///
 	/// The expected bytes come from an independent HKDF (Python's `hmac` and
 	/// `hashlib`), so no code of the crate computes them.
 	#[test]
-	fn the_identity_key_matches_its_known_answer() {
-		let sealer = sealer_of(&fixed_secret(), SecretSeal::Identity, &ack_transcript());
+	fn the_closing_key_matches_its_known_answer() {
+		let sealer = sealer_of(&fixed_secret(), SecretSeal::Closing, &ack_transcript());
 
 		let expected = [
-			0xae, 0x1f, 0x8a, 0xa6, 0x84, 0x93, 0xcf, 0xc4, 0x31, 0x4d, 0xfd, 0xc3, 0xe3, 0xb9, 0xa5, 0x3a, 0x5c, 0x4c,
-			0xed, 0x34, 0x92, 0x67, 0x49, 0xa1, 0x1b, 0x86, 0x41, 0x6b, 0xa7, 0x37, 0x70, 0xda,
+			0x0c, 0x7c, 0x84, 0x0e, 0x00, 0x15, 0xfb, 0x07, 0xee, 0x63, 0x5c, 0x21, 0xdb, 0x3f, 0xd7, 0x53, 0x20, 0x16,
+			0x7d, 0xe5, 0x85, 0xbf, 0xae, 0x2d, 0x72, 0x6d, 0x23, 0x3a, 0x90, 0x11, 0xc5, 0x2d,
 		];
 		assert_eq!(*sealer.kek, expected);
 	}
@@ -1859,7 +2313,7 @@ mod tests {
 	/// hash.
 	#[test]
 	fn a_seal_names_its_key_by_its_purpose_and_its_transcript() -> Result<(), HandshakeError> {
-		let sealed = sealer_of(&fixed_secret(), SecretSeal::Ack, &ack_transcript()).seal(b"settlement answer")?;
+		let sealed = sealer_of(&fixed_secret(), SecretSeal::Ack, &ack_transcript()).seal(DATA, b"settlement answer")?;
 
 		let expected = [TIGHTBEAM_ACK_KEY_ID_DOMAIN, [0x07u8; 32].as_slice()].concat();
 		assert_eq!(key_identifier_of(&sealed), expected);
@@ -1869,7 +2323,7 @@ mod tests {
 	/// A seal carries the transcript hash as an authenticated attribute.
 	#[test]
 	fn a_seal_authenticates_its_transcript_hash() -> Result<(), HandshakeError> {
-		let sealed = sealer_of(&fixed_secret(), SecretSeal::Ack, &ack_transcript()).seal(b"settlement answer")?;
+		let sealed = sealer_of(&fixed_secret(), SecretSeal::Ack, &ack_transcript()).seal(DATA, b"settlement answer")?;
 		let attrs = sealed.auth_attrs.as_ref();
 		let carried = attrs.into_iter().flat_map(|attrs| attrs.iter());
 		let mut named = carried.filter(|attribute| attribute.oid == HANDSHAKE_TRANSCRIPT_HASH);
@@ -1884,62 +2338,63 @@ mod tests {
 	/// the plaintext.
 	#[test]
 	fn an_ack_seals_unframed() -> Result<(), HandshakeError> {
-		let sealed = sealer_of(&fixed_secret(), SecretSeal::Ack, &ack_transcript()).seal(b"settlement answer")?;
+		let sealed = sealer_of(&fixed_secret(), SecretSeal::Ack, &ack_transcript()).seal(DATA, b"settlement answer")?;
 		assert_eq!(content_len(&sealed), Some(b"settlement answer".len()));
 		Ok(())
 	}
 
-	/// The identity seal frames the plaintext with its length and pads it with
+	/// The closing seal frames the plaintext with its length and pads it with
 	/// zero bytes to 1024, so its encrypted content is 1024 octets.
 	#[test]
-	fn an_identity_seals_padded_to_the_floor() -> Result<(), HandshakeError> {
-		let sealed = sealer_of(&fixed_secret(), SecretSeal::Identity, &ack_transcript()).seal(b"client identity")?;
+	fn a_closing_seals_padded_to_the_floor() -> Result<(), HandshakeError> {
+		let sealer = sealer_of(&fixed_secret(), SecretSeal::Closing, &ack_transcript());
+		let sealed = sealer.seal(DATA, b"client identity")?;
 		assert_eq!(content_len(&sealed), Some(1024));
 		Ok(())
 	}
 
-	/// An identity opens to the plaintext it sealed, without its frame.
+	/// A closing opens to the plaintext it sealed, without its frame.
 	#[tokio::test]
-	async fn a_sealed_identity_opens_to_its_plaintext() -> Result<(), HandshakeError> {
+	async fn a_sealed_closing_opens_to_its_plaintext() -> Result<(), HandshakeError> {
 		let secret = fixed_secret();
-		let sealed = sealer_of(&secret, SecretSeal::Identity, &ack_transcript()).seal(b"client identity")?;
+		let sealed = sealer_of(&secret, SecretSeal::Closing, &ack_transcript()).seal(DATA, b"client identity")?;
 
-		let opener = sealer_of(&secret, SecretSeal::Identity, &ack_transcript());
-		let opened = opener.open(sealed.to_der()?).await?;
+		let opener = sealer_of(&secret, SecretSeal::Closing, &ack_transcript());
+		let opened = opener.open(sealed.to_der()?, DATA).await?;
 
 		assert!(opened.with(|bytes| bytes.as_slice() == b"client identity"));
 		Ok(())
 	}
 
-	/// Two identities whose lengths differ within one padding step seal to
-	/// one length, so the length does not tell the two clients apart.
+	/// Two closings whose lengths differ within one padding step seal to one
+	/// length, so the length does not tell the two clients apart.
 	#[test]
-	fn two_identities_within_one_step_seal_to_one_length() -> Result<(), HandshakeError> {
+	fn two_closings_within_one_step_seal_to_one_length() -> Result<(), HandshakeError> {
 		let secret = fixed_secret();
 
-		let short = sealer_of(&secret, SecretSeal::Identity, &ack_transcript()).seal([0x01u8; 600])?;
-		let long = sealer_of(&secret, SecretSeal::Identity, &ack_transcript()).seal([0x01u8; 900])?;
+		let short = sealer_of(&secret, SecretSeal::Closing, &ack_transcript()).seal(DATA, [0x01u8; 600])?;
+		let long = sealer_of(&secret, SecretSeal::Closing, &ack_transcript()).seal(DATA, [0x01u8; 900])?;
 		assert_eq!(short.to_der()?.len(), long.to_der()?.len());
 		Ok(())
 	}
 
-	/// An identity past the floor pads to the next step.
+	/// A closing past the floor pads to the next step.
 	#[test]
-	fn an_identity_past_the_floor_pads_to_the_next_step() -> Result<(), HandshakeError> {
-		let sealed = sealer_of(&fixed_secret(), SecretSeal::Identity, &ack_transcript()).seal([0x01u8; 1100])?;
+	fn a_closing_past_the_floor_pads_to_the_next_step() -> Result<(), HandshakeError> {
+		let sealed = sealer_of(&fixed_secret(), SecretSeal::Closing, &ack_transcript()).seal(DATA, [0x01u8; 1100])?;
 		assert_eq!(content_len(&sealed), Some(1536));
 		Ok(())
 	}
 
-	/// The two purposes derive two keys, so an identity does not open under
-	/// the acknowledgement key.
+	/// The two purposes derive two keys, so a closing does not open under the
+	/// acknowledgement key.
 	#[tokio::test]
-	async fn an_identity_does_not_open_under_the_ack_key() -> Result<(), HandshakeError> {
+	async fn a_closing_does_not_open_under_the_ack_key() -> Result<(), HandshakeError> {
 		let secret = fixed_secret();
-		let sealed = sealer_of(&secret, SecretSeal::Identity, &ack_transcript()).seal(b"client identity")?;
+		let sealed = sealer_of(&secret, SecretSeal::Closing, &ack_transcript()).seal(DATA, b"client identity")?;
 
 		let opener = sealer_of(&secret, SecretSeal::Ack, &ack_transcript());
-		let refused = opener.open(sealed.to_der()?).await;
+		let refused = opener.open(sealed.to_der()?, DATA).await;
 		assert!(matches!(
 			refused,
 			Err(HandshakeError::ReceiptAckCipher(EnvelopeError::KeyIdentifier))
@@ -1955,7 +2410,7 @@ mod tests {
 		framed[..3].copy_from_slice(&[0x00, 0x01, 0xaa]);
 		framed[1023] = 0x01;
 
-		let refused = SecretSeal::Identity.unframe(&framed);
+		let refused = SecretSeal::Closing.unframe(&framed);
 		assert!(matches!(refused, Err(HandshakeError::SealedFrame)));
 	}
 
@@ -1963,7 +2418,7 @@ mod tests {
 	#[test]
 	fn a_frame_whose_length_runs_past_its_end_is_refused() {
 		let framed = [0x00, 0x09, 0xaa, 0x00];
-		let refused = SecretSeal::Identity.unframe(&framed);
+		let refused = SecretSeal::Closing.unframe(&framed);
 		assert!(matches!(refused, Err(HandshakeError::SealedFrame)));
 	}
 
@@ -1974,20 +2429,20 @@ mod tests {
 		let mut framed = vec![0x00u8; 1536];
 		framed[..3].copy_from_slice(&[0x00, 0x01, 0xaa]);
 
-		let refused = SecretSeal::Identity.unframe(&framed);
+		let refused = SecretSeal::Closing.unframe(&framed);
 		assert!(matches!(refused, Err(HandshakeError::SealedFrame)));
 	}
 
-	/// An identity whose length prefix carries its frame past the floor opens
-	/// to the plaintext it sealed.
+	/// A closing whose length prefix carries its frame past the floor opens to
+	/// the plaintext it sealed.
 	#[tokio::test]
-	async fn an_identity_whose_prefix_crosses_the_floor_opens() -> Result<(), HandshakeError> {
+	async fn a_closing_whose_prefix_crosses_the_floor_opens() -> Result<(), HandshakeError> {
 		let secret = fixed_secret();
 		let identity = [0x01u8; 1023];
-		let sealed = sealer_of(&secret, SecretSeal::Identity, &ack_transcript()).seal(identity)?;
+		let sealed = sealer_of(&secret, SecretSeal::Closing, &ack_transcript()).seal(DATA, identity)?;
 
-		let opener = sealer_of(&secret, SecretSeal::Identity, &ack_transcript());
-		let opened = opener.open(sealed.to_der()?).await?;
+		let opener = sealer_of(&secret, SecretSeal::Closing, &ack_transcript());
+		let opened = opener.open(sealed.to_der()?, DATA).await?;
 
 		assert!(opened.with(|bytes| bytes.as_slice() == identity));
 		Ok(())
@@ -1998,15 +2453,15 @@ mod tests {
 	#[test]
 	fn a_frame_shorter_than_its_padded_length_is_refused() {
 		let framed = [0x00, 0x01, 0xaa, 0x00];
-		let refused = SecretSeal::Identity.unframe(&framed);
+		let refused = SecretSeal::Closing.unframe(&framed);
 		assert!(matches!(refused, Err(HandshakeError::SealedFrame)));
 	}
 
-	/// An identity past the `u16` length of the frame is refused at the seal.
+	/// A closing past the `u16` length of the frame is refused at the seal.
 	#[test]
-	fn an_identity_past_the_frame_length_is_refused() {
+	fn a_closing_past_the_frame_length_is_refused() {
 		let oversized = vec![0x01u8; usize::from(u16::MAX) + 1];
-		let refused = sealer_of(&fixed_secret(), SecretSeal::Identity, &ack_transcript()).seal(oversized);
+		let refused = sealer_of(&fixed_secret(), SecretSeal::Closing, &ack_transcript()).seal(DATA, oversized);
 		assert!(matches!(refused, Err(HandshakeError::SealedFrame)));
 	}
 
@@ -2068,15 +2523,15 @@ mod tests {
 		Terms::new(RunnableProfile::native(), None, *transcript_hash, salt)
 	}
 
-	/// The terms derive one key per purpose, so an identity they seal does
-	/// not open under their acknowledgement key.
+	/// The terms derive one key per purpose, so a closing they seal does not
+	/// open under their acknowledgement key.
 	#[tokio::test]
 	async fn the_terms_seal_each_purpose_under_its_own_key() -> Result<(), HandshakeError> {
 		let terms = terms_with(&ack_transcript(), Salt::transcript_hash());
 		let secret = fixed_secret();
-		let sealed = terms.sealer(&secret, SecretSeal::Identity)?.seal(b"client identity")?;
+		let sealed = terms.sealer(&secret, SecretSeal::Closing)?.seal(DATA, b"client identity")?;
 
-		let refused = terms.sealer(&secret, SecretSeal::Ack)?.open(sealed.to_der()?).await;
+		let refused = terms.sealer(&secret, SecretSeal::Ack)?.open(sealed.to_der()?, DATA).await;
 		assert!(matches!(
 			refused,
 			Err(HandshakeError::ReceiptAckCipher(EnvelopeError::KeyIdentifier))

@@ -191,17 +191,17 @@ async fn hpke_loopback(trace: &TraceCollector, materials: &ServerMaterials) -> R
 	let server_config = hpke_server_config::<DefaultCryptoProvider>(materials, [profile]);
 	let mut server = Handshake::server(server_config);
 
-	// The flow is ClientHello, then ServerHandshake, then ClientKeyExchange,
-	// which draws no reply.
+	// The flow is the hello, then the signed reply, then the closing, which
+	// draws no reply.
 	let client_hello = ClientHandshakeProtocol::start(&mut client).await?;
 	let server_reply = server.handle_request(client_hello).await?;
-	let server_handshake = require_reply(server_reply, "HPKE server must answer ClientHello")?;
+	let server_handshake = require_reply(server_reply, "HPKE server must answer the hello")?;
 
 	let client_reply = client.handle_response(server_handshake).await?;
-	let client_kex = require_reply(client_reply, "HPKE client must answer ServerHandshake")?;
+	let closing = require_reply(client_reply, "HPKE client must answer the reply")?;
 
-	let no_reply = server.handle_request(client_kex).await?;
-	require_terminal(no_reply, "HPKE server must not reply to ClientKeyExchange")?;
+	let no_reply = server.handle_request(closing).await?;
+	require_terminal(no_reply, "HPKE server must not reply to the closing")?;
 
 	let events = (LOOPBACK_HPKE_COMPLETE, LOOPBACK_HPKE_ROUNDTRIP, LOOPBACK_HPKE_PROFILE_AGREED);
 	emit_session_ready(Box::new(client), Box::new(server), profile, trace, events).await
@@ -224,16 +224,17 @@ fn build_cms_pair(
 	Ok((Handshake::client(pair.client), Handshake::server(pair.server)))
 }
 
-/// Drive a CMS pair through its three legs. The flow is KeyExchange, then
-/// ServerFinished, then ClientFinished, which draws no reply.
+/// Drive a CMS pair through its three legs. The flow is the opening, then
+/// ServerFinished, then the closing with the ClientFinished, which draws no
+/// reply.
 #[cfg(feature = "transport-cms")]
 async fn drive_cms_pair(
 	client: &mut Handshake<Client, Cms, DefaultCryptoProvider>,
 	server: &mut Handshake<Server, Cms, DefaultCryptoProvider>,
 ) -> Result<(), TightBeamError> {
-	let key_exchange = ClientHandshakeProtocol::start(client).await?;
-	let server_reply = server.handle_request(key_exchange).await?;
-	let server_finished = require_reply(server_reply, "CMS server must answer KeyExchange with ServerFinished")?;
+	let opening = ClientHandshakeProtocol::start(client).await?;
+	let server_reply = server.handle_request(opening).await?;
+	let server_finished = require_reply(server_reply, "CMS server must answer the opening with ServerFinished")?;
 
 	let client_reply = client.handle_response(server_finished).await?;
 	let client_finished = require_reply(client_reply, "CMS client must answer ServerFinished with ClientFinished")?;

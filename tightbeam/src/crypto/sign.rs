@@ -6,9 +6,6 @@
 //! - [`CertifiedKey`] pairs a certificate with a key that signs in place.
 //! - [`VerifiedSignature`] is what a successful verification returns, in its canonical form.
 //!
-//! The signerless `SignedData` tunnels of the HPKE handshake are the one
-//! other `SignedData` the crate emits.
-//!
 //! ## Signature values
 //!
 //! An ECDSA signature value is the DER `ECDSA-Sig-Value` (RFC 3279 §2.2.3,

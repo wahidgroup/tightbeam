@@ -78,7 +78,7 @@ pub type TransportResult<T> = Result<T, TransportError>;
 
 use crate::constants::{
 	DEFAULT_HANDSHAKE_MAX_WIRE, DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_MAX_CLEARTEXT_ENVELOPE,
-	DEFAULT_MAX_ENCRYPTED_ENVELOPE, DEFAULT_OPERATION_TIMEOUT, TIGHTBEAM_AAD_DOMAIN_TAG,
+	DEFAULT_MAX_ENCRYPTED_ENVELOPE, DEFAULT_OPERATION_TIMEOUT,
 };
 use crate::crypto::profiles::CryptoProvider;
 use crate::crypto::sign::SigningIdentity;
@@ -150,8 +150,6 @@ pub struct TransportEncryptionConfig<P: CryptoProvider> {
 	pub(crate) identity: SigningIdentity,
 	/// How this server authenticates its client.
 	pub(crate) peer_authentication: PeerAuthentication,
-	/// Domain-separation tag bound into every AEAD associated-data block.
-	pub(crate) aad_domain_tag: &'static [u8],
 	/// Every ceiling this endpoint enforces.
 	pub(crate) limits: TransportLimits,
 	/// The provider the endpoint's handshakes run under.
@@ -169,7 +167,6 @@ impl<P: CryptoProvider> From<TransportEncryptionConfig<P>> for DialableEncryptio
 		let encryption = EncryptionConfig {
 			server_identity: Some(config.identity),
 			peer_authentication: config.peer_authentication,
-			aad_domain_tag: config.aad_domain_tag,
 			..EncryptionConfig::unconfigured()
 		};
 
@@ -278,7 +275,6 @@ impl<P: CryptoProvider> TransportEncryptionConfig<P> {
 		Self {
 			identity,
 			peer_authentication: PeerAuthentication::Anonymous,
-			aad_domain_tag: TIGHTBEAM_AAD_DOMAIN_TAG,
 			limits: TransportLimits::default(),
 			_provider: core::marker::PhantomData,
 		}
@@ -312,18 +308,6 @@ impl<P: CryptoProvider> TransportEncryptionConfig<P> {
 	#[must_use]
 	pub fn with_limits(mut self, limits: TransportLimits) -> Self {
 		self.limits = limits;
-		self
-	}
-
-	/// Replace the domain-separation tag of the HPKE key exchange.
-	///
-	/// The HPKE handshake binds this tag into the associated data of the
-	/// encrypted key exchange, so an HPKE session completes only when both
-	/// endpoints hold the same tag. The CMS handshake and session records do
-	/// not read it.
-	#[must_use]
-	pub fn with_aad_domain_tag(mut self, tag: &'static [u8]) -> Self {
-		self.aad_domain_tag = tag;
 		self
 	}
 

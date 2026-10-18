@@ -222,7 +222,7 @@ pub async fn establish_mutual_transports(
 			transport = transport.with_trace(trace);
 		}
 
-		// HPKE is exactly two client messages: ClientHello, ClientKeyExchange.
+		// HPKE is exactly two client messages: the hello and the closing.
 		serve_one_handshake_message(&mut transport).await?;
 		serve_one_handshake_message(&mut transport).await?;
 		Ok::<_, TightBeamError>(transport)
@@ -267,13 +267,13 @@ pub async fn serve_one_handshake_message(transport: &mut TcpTransport<TokioStrea
 pub async fn accept_handshaken_split(listener: TokioListener) -> Result<SplitTransport<TokioStream>, TightBeamError> {
 	let (mut transport, _) = listener.accept().await?;
 
-	// HPKE is exactly two client messages: ClientHello, ClientKeyExchange.
+	// HPKE is exactly two client messages: the hello and the closing.
 	serve_one_handshake_message(&mut transport).await?;
 	serve_one_handshake_message(&mut transport).await?;
 
 	assert!(
 		matches!(transport.session_state().phase(), SessionPhase::Encrypted(_)),
-		"server handshake must complete after ClientKeyExchange"
+		"server handshake must complete after the closing"
 	);
 
 	let halves = transport.into_split()?;

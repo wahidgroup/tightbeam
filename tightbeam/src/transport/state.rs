@@ -10,7 +10,6 @@ use alloc::{boxed::Box, sync::Arc};
 #[cfg(feature = "std")]
 use std::sync::Arc;
 
-use crate::constants::TIGHTBEAM_AAD_DOMAIN_TAG;
 use crate::crypto::aead::{RecvCipher, SendCipher};
 use crate::crypto::profiles::CryptoProvider;
 use crate::crypto::sign::SigningIdentity;
@@ -516,9 +515,6 @@ pub struct EncryptionConfig<P: CryptoProvider> {
 	pub(crate) client_identity: Option<SigningIdentity>,
 	/// How a server endpoint authenticates its client.
 	pub(crate) peer_authentication: PeerAuthentication,
-	/// Domain-separation tag of the HPKE key exchange. Both HPKE endpoints
-	/// MUST hold the same tag for a session to complete.
-	pub(crate) aad_domain_tag: &'static [u8],
 	/// Local multiplexing capability advertised in the handshake.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub(crate) mux_offer: Option<Arc<TransportOffer>>,
@@ -583,7 +579,6 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 			peer_authentication,
 			server_certificate_chain: _,
 			client_identity: _,
-			aad_domain_tag: _,
 			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 				mux_offer: _,
 			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -635,7 +630,6 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 			server_certificate_chain: None,
 			client_identity: None,
 			peer_authentication: PeerAuthentication::Anonymous,
-			aad_domain_tag: TIGHTBEAM_AAD_DOMAIN_TAG,
 			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 			mux_offer: None,
 			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]

@@ -381,14 +381,20 @@ pub const RECEIPT_ANSWER: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6
 /// [rfc5652-6.2.2]: https://datatracker.ietf.org/doc/html/rfc5652#section-6.2.2
 pub const HANDSHAKE_SERVER_EPHEMERAL: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.23");
 
-/// Key-confirmation tag OID (CMS attribute carriage). The value is a 32-byte
-/// OCTET STRING on the client Finished, derived from the handshake secret and
-/// the transcript hash.
+/// Key-confirmation tag OID (CMS attribute carriage). The value is an OCTET
+/// STRING as wide as the negotiated digest, an HMAC under a key of the
+/// handshake secret. The closing carries the client's tag, and the HPKE reply
+/// carries the server Finished.
 pub const HANDSHAKE_KEY_CONFIRMATION: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.24");
 
 /// The content type of the CMS opening, sealed in its `AuthEnvelopedData`.
 /// The content carries the client's base secret and its agreement ephemeral.
 pub const HANDSHAKE_OPENING_CONTENT: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.25");
+
+/// The content type of the HPKE reply, signed in its `SignedData`. The
+/// content is the `ServerHandshake`, which carries the server ephemeral and
+/// the negotiated terms.
+pub const HANDSHAKE_REPLY_CONTENT: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.26");
 
 /// PKCS #9 content-type signed attribute ([RFC 5652 §11.1][rfc5652-11.1]).
 ///
@@ -468,6 +474,7 @@ mod tests {
 			(HANDSHAKE_SERVER_EPHEMERAL, "1.3.6.1.4.1.64586.1.23"),
 			(HANDSHAKE_KEY_CONFIRMATION, "1.3.6.1.4.1.64586.1.24"),
 			(HANDSHAKE_OPENING_CONTENT, "1.3.6.1.4.1.64586.1.25"),
+			(HANDSHAKE_REPLY_CONTENT, "1.3.6.1.4.1.64586.1.26"),
 			(ATTR_CONTENT_TYPE, "1.2.840.113549.1.9.3"),
 			(ATTR_MESSAGE_DIGEST, "1.2.840.113549.1.9.4"),
 			(ATTR_CMS_ALGORITHM_PROTECTION, "1.2.840.113549.1.9.52"),

@@ -9,17 +9,17 @@
 //! ## Attack
 //! 1. The attacker holds the certificate of a victim, but not its signing key.
 //! 2. The attacker runs a handshake of its own and offers the certificate of the victim as its identity.
-//! 3. The attacker's key provider claims the victim's key and signs the proof under its own key.
+//! 3. The attacker's key provider claims the victim's key and signs the client Finished under its own key.
 //!
-//! The closing seals the certificate and its proof under a key of the
-//! handshake secret, so an attacker cannot lift the proof of a victim from a
-//! recorded closing and splice it into its own.
+//! The closing seals the client Finished, which carries the certificate, under
+//! a key of the handshake secret, so an attacker cannot lift the Finished of a
+//! victim from a recorded closing and splice it into its own.
 //!
 //! ## Expected control
-//! The possession signature MUST verify under the key of the offered
-//! certificate, over the digest of the domain, the transcript hash, the client
-//! ephemeral, and the certificate DER. The closing of the attacker MUST fail
-//! signature verification.
+//! The client Finished MUST verify under the key of the certificate its signer
+//! names, over signed attributes that bind the client role and the transcript
+//! hash of this handshake. The closing of the attacker MUST fail signature
+//! verification.
 //!
 //! ## References
 //! - CWE-347: Improper Verification of Cryptographic Signature
@@ -48,8 +48,8 @@ use tightbeam::{
 };
 
 use crate::common::security::{
-	default_security_profile, expectation_failure, hpke_client_config, hpke_server_config, pinning_validator,
-	ClientMaterials, ServerMaterials,
+	default_security_profile, hpke_client_config, hpke_server_config, pinning_validator, ClientMaterials,
+	ServerMaterials,
 };
 
 /// A key provider that claims the public key of `claimed` and signs under
@@ -74,15 +74,15 @@ impl SigningKeyProvider for SplicedKeyProvider {
 	}
 }
 
-pub(crate) const SPLICED_KEX_REJECTED: Urn<'static> =
-	tightbeam::urn!("test", "event:splice-attack/spliced-kex-rejected");
+pub(crate) const SPLICED_CLOSING_REJECTED: Urn<'static> =
+	tightbeam::urn!("test", "event:splice-attack/spliced-closing-rejected");
 
 tb_assert_spec! {
 	pub SpliceAttackSpec,
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(SPLICED_KEX_REJECTED, exactly!(1u32))
+			(SPLICED_CLOSING_REJECTED, exactly!(1u32), equals!(true))
 		]
 	}
 }
@@ -90,15 +90,15 @@ tb_assert_spec! {
 tb_process_spec! {
 	pub SpliceAttackProcess,
 	events {
-		observable { SPLICED_KEX_REJECTED }
+		observable { SPLICED_CLOSING_REJECTED }
 		hidden { }
 	}
 	states {
-		Idle => { SPLICED_KEX_REJECTED => Done },
+		Idle => { SPLICED_CLOSING_REJECTED => Done },
 		Done => { }
 	}
 	terminal { Done }
-	annotations { description: "Splice attack: the possession signature must verify under the offered certificate" }
+	annotations { description: "Splice attack: the client Finished must verify under the offered certificate" }
 }
 
 tb_scenario! {
@@ -147,16 +147,12 @@ job! {
 		let reply = server.reply(client.start()?).await?;
 		let closing = client.respond(reply).await?;
 
-		// The possession signature is the control, so the refusal must name
-		// it. The key confirmation and the validator both admit the closing of
-		// the attacker, so no other check refuses it first.
-		match server.finish(closing).await {
-			Err(HandshakeError::SignatureError(_)) => {
-				trace.event(SPLICED_KEX_REJECTED)?;
-			}
-			Err(_) => return Err(expectation_failure("the splice was refused by a check other than the possession signature")),
-			Ok(_) => return Err(expectation_failure("server accepted a spliced identity")),
-		}
+		// The signature of the client Finished is the control, so the refusal
+		// must name it. The key confirmation and the validator both admit the
+		// closing of the attacker, so no other check refuses it first.
+		let finished = server.finish(closing).await;
+		let refused = matches!(finished, Err(HandshakeError::SignatureVerificationFailed));
+		trace.event_with(SPLICED_CLOSING_REJECTED, &[], refused)?;
 
 		Ok(())
 	}

@@ -16,6 +16,7 @@ use crate::cms::signed_data::{SignedData, SignerInfo};
 use crate::crypto::sign::{Signed, SigningIdentity};
 use crate::der::asn1::OctetString;
 use crate::der::{Decode, Encode};
+use crate::oids::DATA;
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::negotiation::{TransportAccept, TransportAuthorizer};
 use crate::transport::handshake::peer::PeerCertificate;
@@ -138,7 +139,7 @@ impl IssuedReceipt {
 			Some(sealed) => {
 				let key = secret.secret();
 				let sealer = terms.sealer(key, SecretSeal::Ack)?;
-				let plaintext = sealer.open(sealed).await?;
+				let plaintext = sealer.open(sealed, DATA).await?;
 				Some(plaintext.with(|bytes| Signed::<SignerInfo>::from_der(bytes))?)
 			}
 			None => None,
@@ -337,9 +338,9 @@ impl CountersignedReceipt {
 		P: HandshakeProvider,
 	{
 		let Self { artifact, countersignature } = self;
-		let ack_der = Zeroizing::new(countersignature.to_der()?);
+		let mut ack_der = Zeroizing::new(countersignature.to_der()?);
 		let sealer = terms.sealer(secret, SecretSeal::Ack)?;
-		let sealed_ack = sealer.seal(&ack_der)?.to_der()?;
+		let sealed_ack = sealer.seal(DATA, core::mem::take(&mut *ack_der))?.to_der()?;
 
 		// Both endpoints retain the identical completed artifact.
 		let completed = artifact.with_signer(countersignature)?;

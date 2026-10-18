@@ -558,11 +558,8 @@ pub trait EncryptedMessageIO: MessageIO {
 		let encryption = self.encryption();
 		let store = encryption.trust_store.as_ref().ok_or(HandshakeError::MissingTrustStore)?;
 		let validator = Arc::clone(store) as Arc<dyn CertificateValidation>;
-		let settings = HpkeClientSettings {
-			trust: LearnedTrust { validator },
-			aad_domain_tag: encryption.aad_domain_tag,
-			identity: encryption.client_identity.clone(),
-		};
+		let identity = encryption.client_identity.clone();
+		let settings = HpkeClientSettings { trust: LearnedTrust { validator }, identity };
 
 		let mut config = ClientConfig::<Hpke, P>::new(settings);
 		config.transport_offer = encryption.mux_offer.as_deref().cloned();
@@ -746,10 +743,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		Self: EncryptedProtocolState<CryptoProvider = P>,
 		P: HandshakeProvider,
 	{
-		let encryption = self.encryption();
-		let settings = HpkeServerSettings { aad_domain_tag: encryption.aad_domain_tag };
-
-		let config = self.server_config::<Hpke, P>(settings)?;
+		let config = self.server_config::<Hpke, P>(HpkeServerSettings)?;
 		Ok(Box::new(Handshake::server(config)))
 	}
 
@@ -908,9 +902,9 @@ pub trait EncryptedMessageIO: MessageIO {
 		let (status, response) = match response_envelope {
 			TransportEnvelope::Response(pkg) => (pkg.status, pkg.message),
 			TransportEnvelope::Request(_) => return Err(TransportError::InvalidMessage),
-			TransportEnvelope::SignedData(_)
-			| TransportEnvelope::ClientKeyExchange(_)
-			| TransportEnvelope::AuthEnvelopedData(_) => return Err(TransportError::InvalidMessage),
+			TransportEnvelope::SignedData(_) | TransportEnvelope::AuthEnvelopedData(_) | TransportEnvelope::Data(_) => {
+				return Err(TransportError::InvalidMessage)
+			}
 			#[cfg(feature = "transport-multiplex")]
 			TransportEnvelope::Mux(_) => return Err(TransportError::InvalidMessage),
 		};
@@ -941,9 +935,9 @@ impl TransportEnvelope {
 		match self {
 			TransportEnvelope::Request(msg) => Ok(msg.message),
 			TransportEnvelope::Response(_) => Err(TransportError::InvalidMessage),
-			TransportEnvelope::SignedData(_)
-			| TransportEnvelope::ClientKeyExchange(_)
-			| TransportEnvelope::AuthEnvelopedData(_) => Err(TransportError::InvalidMessage),
+			TransportEnvelope::SignedData(_) | TransportEnvelope::AuthEnvelopedData(_) | TransportEnvelope::Data(_) => {
+				Err(TransportError::InvalidMessage)
+			}
 			#[cfg(feature = "transport-multiplex")]
 			TransportEnvelope::Mux(_) => Err(TransportError::InvalidMessage),
 		}
