@@ -310,7 +310,7 @@ pub struct Metadata {
 
 The fields are private, and each has a read accessor of the same name. A `Frame` enters memory only through `FrameBuilder` or the DER decoder. Both reject a field that the Frame version forbids ([§5.6](#56-version-specific-constraints)), so no in-memory Frame carries one. The methods that change a Frame in place, such as `attach_signer_info` and `encrypt_with_provider`, apply the same rule.
 
-The `nonrepudiation` field holds a `Signed<SignerInfo>`. The CMS signer of `crypto::sign` builds every value the crate emits, and the DER decoder yields every value it reads. A value read from the wire decodes from any DER, so it is trusted only after `Frame::verify` checks it through `CmsSigner::verify`, or `Frame::verify_under` checks it through `CmsSigner::verify_with_policy`, as a trust store does ([§5.7.5](#575-nonrepudiation-coverage-and-binding)).
+The `nonrepudiation` field holds a `Signed<SignerInfo>`. The CMS signer of `crypto::sign` builds every value the crate emits, and the DER decoder yields every value it reads. A value read from the wire decodes from any DER, so it is trusted only after `Frame::verify` checks it through `CmsSigner::verify_signer` under a certificate admitted for signing, or `Frame::verify_under` checks it through `CmsSigner::verify_with_policy`, as a trust store does ([§5.7.5](#575-nonrepudiation-coverage-and-binding)).
 
 ```rust,ignore
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1264,7 +1264,7 @@ let trust_store = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy::def
 
 #### Signing Identities
 
-`SigningIdentity` pairs a certificate with the `SigningKeyProvider` that holds its private key. Its constructor refuses a key whose public half differs from the certificate's SubjectPublicKeyInfo (`SignerError::KeyMismatch`), so every signature it makes verifies under the certificate its `sid` names. It also refuses a key whose algorithm is not the provider's, and it brings every value the provider returns to its canonical form, the DER low-`s` form for ECDSA. `SigningIdentity::new` signs under `DefaultCryptoProvider`. An implementor brings its own signature algorithm with `SigningIdentity::with_provider::<P>`, where `P` is a `SigningProvider` whose signature type implements `CanonicalForm`, `SignatureEncoding`, and `SignatureAlgorithmIdentifier`, and whose verifying key implements `PrehashVerifier` and `DecodePublicKey`. `ProviderPolicy::<P>` verifies its signatures. It is the one home of an endpoint's signing material:
+`SigningIdentity` pairs a certificate with the `SigningKeyProvider` that holds its private key. Its constructor refuses a certificate that is not admitted for signing ([Certificate Use](#certificate-use)), and a key whose public half differs from the certificate's SubjectPublicKeyInfo (`SignerError::KeyMismatch`), so every signature it makes verifies under the certificate its `sid` names. It also refuses a key whose algorithm is not the provider's, and it brings every value the provider returns to its canonical form, the DER low-`s` form for ECDSA. `SigningIdentity::new` signs under `DefaultCryptoProvider`. An implementor brings its own signature algorithm with `SigningIdentity::with_provider::<P>`, where `P` is a `SigningProvider` whose signature type implements `CanonicalForm`, `SignatureEncoding`, and `SignatureAlgorithmIdentifier`, and whose verifying key implements `PrehashVerifier` and `DecodePublicKey`. `ProviderPolicy::<P>` verifies its signatures. It is the one home of an endpoint's signing material:
 
 | Consumer                                                                                                 | What the identity signs                                                              |
 | -------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
@@ -1283,6 +1283,53 @@ frame.sign_with_provider(&server).await?;
 A builder that signs synchronously, such as `FrameBuilder::with_signer`, takes a `CertifiedKey`: a key that signs in place beside its certificate, under the same key check.
 
 `SigningIdentity::sign`, `SigningIdentity::draft`, and the `CmsSigner` functions take the `SignedContent` by value. Each attribute of the caller's profile moves into the signed set, so a signature clones none of them.
+
+#### Certificate Use
+
+A certificate serves only the use and the role its extensions allow ([RFC 5280][rfc5280] §4.2). `PeerCertificate<U>` admits a certificate for one use and parses the key of that use once. The type that performs the use reads the key: the CMS signer a signing key, and the KEM recipient a recipient key.
+
+| Use               | `keyUsage` bit                                 | Read by                                                                      |
+| ----------------- | ---------------------------------------------- | ---------------------------------------------------------------------------- |
+| `Signing<P>`      | `digitalSignature`                             | `Frame::verify`, and every handshake signature check                         |
+| `ErasedSigning`   | `digitalSignature`                             | The trust store, `Frame::verify_under`, and `SigningIdentity::with_provider` |
+| `KeyAgreement<K>` | `K::USAGE`, `keyAgreement` for the house DHKEM | `KemRecipient::from_certificate`, and `KeyAgreementIdentity::new`            |
+
+Each use refuses a certificate whose `keyUsage` is absent or lacks its bit, that carries one extension twice, or that carries a critical extension the crate does not process. A use whose bit is `keyAgreement` also refuses a certificate that asserts `decipherOnly` (§4.2.1.3). A use that reads an `id-ecPublicKey` key refuses a point whose first octet is not `0x02`, `0x03`, or `0x04`, the compressed and uncompressed forms ([RFC 5480][rfc5480] §2.2). A certificate that carries both bits is admitted for each use.
+
+The role is the key purpose of `extendedKeyUsage` (§4.2.1.12). `KeyPurposes` maps each role to one purpose, and `KeyPurposes::HOUSE` holds the defaults:
+
+| Role   | Its certificates                                    | House purpose                                       |
+| ------ | --------------------------------------------------- | --------------------------------------------------- |
+| Server | The server's signing and key-agreement certificates | `id-kp-serverAuth`                                  |
+| Client | The certificate of the client identity              | `id-kp-clientAuth`                                  |
+| Signer | The certificate of a frame or colony signer         | `oids::KEY_PURPOSE_SIGNER`, `1.3.6.1.4.1.64586.3.1` |
+
+A role also admits `anyExtendedKeyUsage`, and a certificate with no `extendedKeyUsage` serves every role. `PeerCertificate::parse` takes the purpose of the role it admits for. Each side of a handshake carries its purposes in one place, `ClientConfig` and `ServerConfig`, whose constructors check the endpoint's own identity for its role once, and `with_key_purposes` sets an implementor's own on `TransportEncryptionConfig`, `ClientBuilder`, `ConnectionPool`, and `CertificateTrustBuilder`.
+
+#### Key-Agreement Identities
+
+`KeyAgreementIdentity<K>` pairs a key-agreement certificate with the backend of its private key, the `K::PrivateKey` of the KEM `K`. The house DHKEM's backend is a `DiffieHellman<C>`, which `Secp256k1KeyProvider` implements. A signing backend and a key-agreement backend are two traits under `KeyBackend`. The compiler refuses one `dyn` handle in the other's place, and `CmsIdentityPair::new` refuses one key in both identities (`KeyReuse`), so a backend of both, such as `Secp256k1KeyProvider`, serves one identity per key. The constructor refuses a certificate without the bit of `K::USAGE`, and a backend whose public half differs from the certificate's key (`EnvelopeError::KeyMismatch`).
+
+A CMS server holds a signing identity and a key-agreement identity of one subject with two keys ([NIST SP 800-57 Part 1 Rev. 5][nist-800-57] §5.2). The client provisions both certificates in a `ProvisionedTrust`, built once with its configuration, which refuses two subjects, two trust anchors, and one key in both:
+
+```rust,ignore
+// The server: the signing identity signs, and the key-agreement identity
+// opens the opening sealed to it.
+let config = TransportEncryptionConfig::new(signing_identity)
+    .with_key_agreement(KeyAgreementIdentity::new(agreement_cert, agreement_backend)?)?;
+
+// The client: both certificates, named by their fields, admitted against
+// the store once.
+let certificates = CmsServerCertificates {
+    signing: CmsServerIdentity::Certificate(Arc::new(signing_cert)),
+    key_agreement: CmsServerIdentity::Certificate(Arc::new(agreement_cert)),
+};
+let server_trust = ProvisionedTrust::new(certificates, trust_store)?;
+let client = ClientBuilder::<TokioListener>::builder()
+    .with_cms_server(server_trust)
+    .with_client_identity(client_identity)
+    .build();
+```
 
 ## 8. Transport Layer
 
@@ -1677,11 +1724,11 @@ server  = HMAC-H(mac_s, transcript_hash || SignerInfo.signature)
 CMS handshake uses [RFC 5652][rfc5652] Cryptographic Message Syntax:
 
 - **`AuthEnvelopedData`** ([RFC 5083][rfc5083]): Every seal, under AES-256-GCM with `GCMParameters` ([RFC 5084][rfc5084]), the tag in `mac`, and the content type among the authenticated attributes
-- **`KEMRecipientInfo`** ([RFC 9629][rfc9629]): The opening's recipient. DHKEM(secp256k1, HKDF-SHA256) encapsulates to the server's certificate key, and HKDF-SHA3-256 derives the key that wraps the content key. [docs/dhkem-secp256k1.md](docs/dhkem-secp256k1.md) specifies the KEM
+- **`KEMRecipientInfo`** ([RFC 9629][rfc9629]): The opening's recipient. DHKEM(secp256k1, HKDF-SHA256) encapsulates to the key of the server's key-agreement certificate, and HKDF-SHA3-256 derives the key that wraps the content key. [docs/dhkem-secp256k1.md](docs/dhkem-secp256k1.md) specifies the KEM
 - **`KEKRecipientInfo`**: The recipient of the closing, under a key of the handshake secret
 - **`SignedData`**: Transcript signatures for authentication
 
-The opening seals the base secret and the client's agreement ephemeral `R` to the server's certificate key, and it carries the security and transport offers as authenticated attributes. The server Finished carries the server Finished MAC of [§8.5.2](#852-specification-handshake-flow-and-state-management) as an unsigned attribute, as the HPKE reply does, and the client verifies it before it builds its closing.
+The opening seals the base secret and the client's agreement ephemeral `R` to the server's key-agreement certificate, and it carries the security and transport offers as authenticated attributes. The server's signing certificate signs the server Finished, and the client refuses a server ephemeral that shares the x-coordinate of either certificate key. The server Finished carries the server Finished MAC of [§8.5.2](#852-specification-handshake-flow-and-state-management) as an unsigned attribute, as the HPKE reply does, and the client verifies it before it builds its closing.
 
 **Mutual authentication flow:**
 
@@ -3355,8 +3402,10 @@ work.sign_with_provider(&identity).await?;
 // to the servlet's complete response frame.
 let response = client.submit_work_to(calculator_urn, &work).await?;
 
-// The servlet's envelope is verifiable end to end.
-response.verify::<Secp256k1Signature>(&servlet_public_key)?;
+// The servlet's envelope is verifiable end to end, under the servlet's
+// certificate admitted for signing under the house frame signer purpose.
+let servlet = PeerCertificate::<Signing<DefaultCryptoProvider>>::parse(servlet_certificate, KeyPurposes::HOUSE.signer)?;
+response.verify(&servlet)?;
 let result: CalcResponse = decode(&response.message)?;
 ```
 

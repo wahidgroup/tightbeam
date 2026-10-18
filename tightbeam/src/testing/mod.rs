@@ -70,6 +70,8 @@ pub use fdr::{FaultInjection, FaultModel, InjectedFaultRecord, InjectionStrategy
 pub use fixtures::TestAttributes;
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 pub use fixtures::TestCertificateChain;
+#[cfg(feature = "transport-cms")]
+pub use fixtures::TestCmsServer;
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 pub use fixtures::TestIdentity;
 #[cfg(all(feature = "secp256k1", feature = "signature"))]

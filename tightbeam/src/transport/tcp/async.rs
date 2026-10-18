@@ -255,7 +255,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> EncryptedProtocol for TokioListe
 	) -> Result<(Self::Listener, Self::Address), Self::Error> {
 		let listener = TcpListener::bind(addr.0).await?;
 		let bound_addr = listener.local_addr()?;
-		let config = EndpointConfig::from(config);
+		let config = EndpointConfig::try_from(config).map_err(std::io::Error::other)?;
 
 		Ok((Self { listener, config }, TightBeamSocketAddr(bound_addr)))
 	}
@@ -937,22 +937,22 @@ mod tests {
 	use std::sync::atomic::{AtomicBool, Ordering};
 
 	use super::*;
-	use crate::crypto::key::Secp256k1KeyProvider;
 	use crate::crypto::policy::Secp256k1Policy;
-	use crate::crypto::sign::ecdsa::{Secp256k1VerifyingKey, SigningKey};
-	use crate::crypto::sign::Sha3Signer;
-	use crate::crypto::sign::SigningIdentity;
-	use crate::crypto::x509::ext::pkix::KeyUsages;
+	use crate::crypto::sign::ecdsa::SigningKey;
 	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
 	use crate::policy::TransitStatus;
 	use crate::prelude::TightBeamSocketAddr;
-	use crate::spki::SubjectPublicKeyInfoOwned;
 	use crate::testing::*;
 	use crate::transport::handshake::{HandshakeError, HandshakeProtocolKind};
 	use crate::transport::io::EncryptedMessageIO;
 	use crate::transport::state::{DialableEncryption, EncryptionConfig};
 	use crate::transport::{MessageCollector, MessageEmitter, TransportEncryptionConfig};
 	use crate::utils::time::SystemClock;
+
+	#[cfg(feature = "transport-cms")]
+	use crate::transport::handshake::tests::create_test_signed_data;
+	#[cfg(feature = "transport-cms")]
+	use crate::transport::handshake::HandshakeMessage;
 
 	/// Serve one single-flight request.
 	///
@@ -1244,39 +1244,22 @@ mod tests {
 	}
 
 	struct EncryptedTestServer {
-		cert: Certificate,
+		server: TestCmsServer,
 		config: TransportEncryptionConfig<DefaultCryptoProvider>,
 	}
 
+	/// An endpoint of a fresh test server that signs with its signing
+	/// identity and opens the CMS opening with its key-agreement identity.
 	fn encrypted_test_server() -> TransportResult<EncryptedTestServer> {
-		let signing_key = TestKey::insecure_fixed_signing();
-		let verifying_key = Secp256k1VerifyingKey::from(&signing_key);
-		let sha3_signer = Sha3Signer::from(&signing_key);
-		let spki = SubjectPublicKeyInfoOwned::from_key(verifying_key)?;
-
-		// The server certificate signs its Finished and receives the KEM's
-		// encapsulation of the opening (RFC 5480 §3, RFC 9629 §3).
-		let cert = crate::cert!(
-			profile: Leaf,
-			subject: "CN=Test Server,O=Test Org,C=US",
-			issuer: "CN=Test Server,O=Test Org,C=US",
-			serial: 1u32,
-			duration: Duration::from_secs(365 * 24 * 60 * 60),
-			subject_public_key: spki,
-			signer: &sha3_signer,
-			key_usage: KeyUsages::DigitalSignature | KeyUsages::KeyAgreement
-		)?;
-
-		let provider = Arc::new(Secp256k1KeyProvider::from(signing_key));
-		let identity = SigningIdentity::new(cert.to_owned(), provider).map_err(|_| TransportError::InvalidState)?;
-		let config = TransportEncryptionConfig::new(identity);
-		Ok(EncryptedTestServer { cert, config })
+		let server = TestCmsServer::generate("Test Server");
+		let config = TransportEncryptionConfig::new(server.signing_identity());
+		let config = config.with_key_agreement(server.key_agreement_identity())?;
+		Ok(EncryptedTestServer { server, config })
 	}
 
-	fn trust_store_for(cert: Certificate) -> TransportResult<Arc<dyn CertificateTrust>> {
-		let builder = CertificateTrustBuilder::from(Secp256k1Policy::default());
-		let trust = builder.with_certificate(cert)?.build();
-		Ok(Arc::new(trust))
+	/// A store that holds the authority of `server`'s two certificates.
+	fn trust_store_for(server: &TestCmsServer) -> Arc<dyn CertificateTrust> {
+		Arc::new(server.store())
 	}
 
 	#[cfg(feature = "transport-cms")]
@@ -1355,14 +1338,11 @@ mod tests {
 
 	#[cfg(feature = "transport-cms")]
 	#[tokio::test]
-	async fn cms_client_without_trust_store_fails_closed() -> TransportResult<()> {
+	async fn cleartext_cms_client_without_server_trust_fails_closed() -> TransportResult<()> {
 		let (_listener, client_stream) = bind_and_connect().await?;
 		let mut transport = cms_test_client(client_stream, None);
 		let handshake = transport.perform_client_handshake().await;
-		assert!(matches!(
-			handshake,
-			Err(TransportError::HandshakeError(HandshakeError::MissingTrustStore))
-		));
+		assert!(matches!(handshake, Err(TransportError::MissingServerCertificateChain)));
 		Ok(())
 	}
 
@@ -1384,10 +1364,10 @@ mod tests {
 	#[tokio::test]
 	async fn cms_client_without_identity_fails_closed() -> TransportResult<()> {
 		let (_listener, client_stream) = bind_and_connect().await?;
-		let server_certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+		let server = TestCmsServer::generate("Test Server");
 		let encryption = EncryptionConfig {
 			trust_store: Some(empty_trust_store()),
-			server_certificate_chain: Some(Arc::from(vec![server_certificate])),
+			cms_server: Some(server.trust()),
 			handshake_protocol: HandshakeProtocolKind::Cms,
 			..EncryptionConfig::unconfigured()
 		};
@@ -1396,6 +1376,24 @@ mod tests {
 		let dial = transport.perform_client_handshake().await;
 		let refused = matches!(dial, Err(TransportError::HandshakeError(HandshakeError::MutualAuthRequired)));
 		assert!(refused);
+		Ok(())
+	}
+
+	/// A CMS server that holds a signing identity alone holds no key for the
+	/// opening to seal to, so it refuses the handshake before it reads the
+	/// opening.
+	#[cfg(feature = "transport-cms")]
+	#[tokio::test]
+	async fn cms_server_without_key_agreement_identity_fails_closed() -> TransportResult<()> {
+		let (_listener, stream) = bind_and_connect().await?;
+		let server = TestCmsServer::generate("Test Server");
+		let endpoint = EndpointConfig::try_from(TransportEncryptionConfig::new(server.signing_identity()))?;
+		let transport = TcpTransport::new(TokioStream::from(stream), endpoint);
+		let mut transport = transport.with_handshake_protocol(HandshakeProtocolKind::Cms);
+		let opening = HandshakeMessage::try_from(create_test_signed_data(b"opening"))?;
+
+		let refused = transport.perform_server_handshake(opening).await;
+		assert!(matches!(refused, Err(TransportError::MissingKeyAgreementIdentity)));
 		Ok(())
 	}
 
@@ -1417,7 +1415,7 @@ mod tests {
 	#[cfg(feature = "transport-cms")]
 	#[tokio::test]
 	async fn async_cms_round_trip() -> TransportResult<()> {
-		let EncryptedTestServer { cert: server_cert, config } = encrypted_test_server()?;
+		let EncryptedTestServer { server, config } = encrypted_test_server()?;
 		let (listener, server_addr) = bind_encrypted(config).await?;
 
 		let request = TestFrame::v0(None, None);
@@ -1440,13 +1438,12 @@ mod tests {
 
 		let client_key = SigningKey::from_bytes(&[2u8; 32].into()).map_err(|_| TransportError::InvalidState)?;
 		let client_identity = TestIdentity::of(&client_key);
-		let server_chain = Arc::from(vec![server_cert.to_owned()]);
-		let trust_store = trust_store_for(server_cert)?;
+		let trust_store = trust_store_for(&server);
 
 		let client_stream = TcpStream::connect(server_addr).await?;
 		let encryption = EncryptionConfig {
 			trust_store: Some(trust_store),
-			server_certificate_chain: Some(server_chain),
+			cms_server: Some(server.trust()),
 			client_identity: Some(client_identity),
 			handshake_protocol: HandshakeProtocolKind::Cms,
 			..EncryptionConfig::unconfigured()
@@ -1523,7 +1520,7 @@ mod tests {
 			}
 		}
 
-		let EncryptedTestServer { cert, config } = encrypted_test_server()?;
+		let EncryptedTestServer { server, config } = encrypted_test_server()?;
 		let (listener, server_addr) = bind_encrypted(config).await?;
 
 		let request = TestFrame::v0(None, None);
@@ -1543,7 +1540,7 @@ mod tests {
 			respond_with(&mut transport, &echo).await
 		});
 
-		let trust_store = trust_store_for(cert)?;
+		let trust_store = trust_store_for(&server);
 		let client_stream = TcpStream::connect(server_addr).await?;
 		let mut transport = trusting_client(client_stream, trust_store);
 		let first_emit = transport.emit(request.to_owned(), None).await;
@@ -1569,7 +1566,7 @@ mod tests {
 	#[cfg(feature = "transport-hpke")]
 	#[tokio::test]
 	async fn handshake_completes_alone_and_populates_peer_certificate() -> TransportResult<()> {
-		let EncryptedTestServer { cert, config } = encrypted_test_server()?;
+		let EncryptedTestServer { server, config } = encrypted_test_server()?;
 		let (listener, server_addr) = bind_encrypted(config).await?;
 
 		let request = TestFrame::v0(None, None);
@@ -1585,7 +1582,7 @@ mod tests {
 			.await
 		});
 
-		let trust_store = trust_store_for(cert)?;
+		let trust_store = trust_store_for(&server);
 		let client_stream = TcpStream::connect(server_addr).await?;
 		let mut transport = trusting_client(client_stream, trust_store);
 		assert!(transport.session_state().peer_certificate().is_none());

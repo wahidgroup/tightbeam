@@ -13,7 +13,7 @@ use crate::crypto::sign::SigningIdentity;
 use crate::crypto::x509::error::CertificateValidationError;
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::crypto::x509::store::CertificateTrust;
-use crate::crypto::x509::Certificate;
+use crate::crypto::x509::{Certificate, ErasedSigning, PeerCertificate};
 use crate::spki::SubjectPublicKeyInfoOwned;
 use crate::transport::client::{ConnectionBuilder, ConnectionPool, PoolConfig};
 use crate::transport::Protocol;
@@ -100,7 +100,10 @@ impl CertificateTrust for ValidatedTrust {
 		self.validate_leaf(leaf)
 	}
 
-	fn find_by_signer_identifier(&self, sid: &crate::cms::signed_data::SignerIdentifier) -> Option<&Certificate> {
+	fn find_by_signer_identifier(
+		&self,
+		sid: &crate::cms::signed_data::SignerIdentifier,
+	) -> Option<&PeerCertificate<ErasedSigning>> {
 		self.store.find_by_signer_identifier(sid)
 	}
 

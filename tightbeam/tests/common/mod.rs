@@ -8,6 +8,9 @@
 #[cfg(any(feature = "tokio", feature = "transport-multiplex"))]
 pub mod poll;
 
+#[cfg(all(feature = "x509", feature = "hex"))]
+pub mod static_pair;
+
 #[cfg(all(
 	feature = "x509",
 	feature = "secp256k1",

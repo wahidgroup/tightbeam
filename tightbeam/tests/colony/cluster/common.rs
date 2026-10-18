@@ -47,7 +47,9 @@ use tightbeam::cms::signed_data::SignerIdentifier;
 use tightbeam::crypto::policy::VerificationPolicy;
 use tightbeam::crypto::x509::error::CertificateValidationError;
 use tightbeam::crypto::x509::policy::CertificateValidation;
+use tightbeam::crypto::x509::{ErasedSigning, KeyPurposes, PeerCertificate, Signing};
 use tightbeam::spki::SubjectPublicKeyInfoOwned;
+use tightbeam::testing::TestCertificate;
 pub use tightbeam::{
 	at_least, at_most,
 	builder::TypeBuilder,
@@ -76,7 +78,7 @@ pub use tightbeam::{
 		key::Secp256k1KeyProvider,
 		policy::Secp256k1Policy,
 		profiles::DefaultCryptoProvider,
-		sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey},
+		sign::ecdsa::Secp256k1SigningKey,
 		x509::{
 			store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder},
 			Certificate, CertificateSpec,
@@ -206,7 +208,7 @@ impl CertificateTrust for SwitchTrust {
 		self.current().verify_chain(chain)
 	}
 
-	fn find_by_signer_identifier(&self, sid: &SignerIdentifier) -> Option<&Certificate> {
+	fn find_by_signer_identifier(&self, sid: &SignerIdentifier) -> Option<&PeerCertificate<ErasedSigning>> {
 		self.current().find_by_signer_identifier(sid)
 	}
 
@@ -391,11 +393,15 @@ pub fn probe_signing_key() -> Secp256k1SigningKey {
 /// Returns whether `frame` carries a signature that verifies against the
 /// public half of `key` over the frame's to-be-signed bytes.
 ///
-/// A verified signature proves byte fidelity end to end. The version,
-/// metadata, message, and integrity fields arrived exactly as signed.
-/// It adapts [`Frame::verify`] to a boolean for trace events.
+/// Every fixture certificate of a key carries that key's identifier, so the
+/// self-signed one is the signer any frame of `key` names. A verified
+/// signature proves byte fidelity end to end, and the helper adapts
+/// [`Frame::verify`] to a boolean for trace events.
 pub fn frame_signature_verifies(frame: &Frame, key: &Secp256k1SigningKey) -> bool {
-	frame.verify::<Secp256k1Signature>(key.verifying_key()).is_ok()
+	let certificate = TestCertificate::self_signed(key);
+	let signer = PeerCertificate::<Signing<DefaultCryptoProvider>>::parse(certificate, KeyPurposes::HOUSE.signer);
+	let signer = signer.expect("a fixture certificate asserts digitalSignature");
+	frame.verify(&signer).is_ok()
 }
 
 /// Signs a [`ClusterRequest::PublishGossip`] control frame with an

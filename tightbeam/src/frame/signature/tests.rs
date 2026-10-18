@@ -7,6 +7,13 @@ use crate::error::Result;
 use crate::testing::{TestKey, TestMessage, TestSigner};
 use crate::{Frame, TightBeamError, Version};
 
+#[cfg(feature = "secp256k1")]
+use crate::crypto::profiles::DefaultCryptoProvider;
+#[cfg(feature = "secp256k1")]
+use crate::crypto::x509::{KeyPurposes, PeerCertificate, Signing};
+#[cfg(feature = "secp256k1")]
+use crate::testing::TestCertificate;
+
 fn unsigned_frame(version: Version) -> Result<Frame> {
 	let message = TestMessage::sample(None);
 	FrameBuilder::from(version)
@@ -14,6 +21,15 @@ fn unsigned_frame(version: Version) -> Result<Frame> {
 		.with_order(1696521600)
 		.with_message(message)
 		.build()
+}
+
+/// The certificate of the fixed test key, admitted for signing under the
+/// house provider.
+#[cfg(feature = "secp256k1")]
+fn fixed_signer() -> PeerCertificate<Signing<DefaultCryptoProvider>> {
+	let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+	let signer = PeerCertificate::parse(certificate, KeyPurposes::HOUSE.signer);
+	signer.expect("the fixed test certificate is admitted for signing")
 }
 
 #[test]
@@ -63,13 +79,16 @@ mod sign {
 	use crate::crypto::policy::Secp256k1Policy;
 	use crate::crypto::sign::ecdsa::Secp256k1Signature;
 	use crate::crypto::sign::{Signed, SignerError};
+	use crate::crypto::x509::{ErasedSigning, PeerCertificate};
 	use crate::der::asn1::{ObjectIdentifier, OctetString};
+	use crate::der::oid::AssociatedOid;
 	use crate::der::{Decode, Encode};
 	use crate::error::ReceivedExpectedError;
 	use crate::oids::{ATTR_CMS_ALGORITHM_PROTECTION, ATTR_CONTENT_TYPE, ATTR_MESSAGE_DIGEST, DATA};
 	use crate::oids::{HASH_SHA3_256, HASH_SHA3_512};
 	use crate::spki::AlgorithmIdentifierOwned;
 	use crate::testing::{TestAttributes, TestCertificate, TestIdentity};
+	use crate::x509::ext::pkix::SubjectKeyIdentifier;
 	use crate::SignerInfo;
 
 	/// A frame signature names the identity's certificate (RFC 5652 §5.3).
@@ -98,8 +117,7 @@ mod sign {
 
 		frame.attach_signer_info(received)?;
 
-		let key = TestKey::insecure_fixed_signing();
-		let refused = frame.verify::<Secp256k1Signature>(key.verifying_key());
+		let refused = frame.verify(&fixed_signer());
 		let algorithms = ReceivedExpectedError::from((HASH_SHA3_512, HASH_SHA3_256));
 		assert!(matches!(refused, Err(TightBeamError::UnexpectedAlgorithm(received)) if received == algorithms));
 		Ok(())
@@ -155,9 +173,7 @@ mod sign {
 		let mut frame = unsigned_frame(Version::V1)?;
 		frame.sign_with_provider(&TestIdentity::insecure_fixed()).await?;
 
-		let key = TestKey::insecure_fixed_signing();
-		let verified = frame.verify::<Secp256k1Signature>(key.verifying_key())?;
-
+		let verified = frame.verify(&fixed_signer())?;
 		let signer_info = frame.nonrepudiation().ok_or(TightBeamError::MissingSignatureInfo)?;
 		assert_eq!(verified.as_bytes(), signer_info.signature.as_bytes());
 		Ok(())
@@ -170,8 +186,7 @@ mod sign {
 		let identity = TestIdentity::insecure_fixed();
 		let mut frame = unsigned_frame(Version::V1)?;
 		frame.sign_with_provider(&identity).await?;
-		frame.verify_under(identity.certificate(), &Secp256k1Policy::default())?;
-
+		frame.verify_under(identity.signing_certificate(), &Secp256k1Policy::default())?;
 		Ok(())
 	}
 
@@ -182,8 +197,9 @@ mod sign {
 		let mut frame = unsigned_frame(Version::V1)?;
 		frame.sign_with_provider(&TestIdentity::insecure_fixed()).await?;
 
-		let mut other = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
-		other.tbs_certificate.extensions = None;
+		let other = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+		let other = TestCertificate::without_extension(other, SubjectKeyIdentifier::OID);
+		let other = PeerCertificate::<ErasedSigning>::parse(other, KeyPurposes::HOUSE.signer)?;
 
 		let refused = frame.verify_under(&other, &Secp256k1Policy::default());
 		assert!(matches!(refused, Err(TightBeamError::Signer(SignerError::SignerIdentifier))));
@@ -230,7 +246,7 @@ mod detached_sign {
 			crate::crypto::sign::PrehashSigner::sign_prehash(&signing_key, draft.prehash())?;
 
 		frame.attach_signer_info(draft.complete(signature.to_bytes(), None)?)?;
-		frame.verify::<Secp256k1Signature>(signing_key.verifying_key())?;
+		frame.verify(&fixed_signer())?;
 		Ok(())
 	}
 
@@ -247,7 +263,7 @@ mod detached_sign {
 		let bare: Secp256k1Signature = signing_key.sign_canonical::<Sha3_256>(&tbs)?;
 		frame.attach_signer_info(draft.complete(bare.to_bytes(), None)?)?;
 
-		let refused = frame.verify::<Secp256k1Signature>(signing_key.verifying_key());
+		let refused = frame.verify(&fixed_signer());
 		assert!(matches!(refused, Err(TightBeamError::SignatureError(_))));
 		Ok(())
 	}

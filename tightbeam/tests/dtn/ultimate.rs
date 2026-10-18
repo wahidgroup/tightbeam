@@ -144,9 +144,9 @@ use crate::dtn::{
 use crate::dtn::{
 	bms::BatteryManagementSystem,
 	certs::{
-		earth_relay_verifying_key, generate_shared_cipher, mars_relay_verifying_key, mission_control_verifying_key,
-		rover_verifying_key, EARTH_RELAY_CERT, EARTH_RELAY_KEY, MARS_RELAY_CERT, MARS_RELAY_KEY, MISSION_CONTROL_CERT,
-		MISSION_CONTROL_KEY, ROVER_CERT, ROVER_KEY,
+		earth_relay_signer, generate_shared_cipher, mars_relay_signer, mission_control_signer, rover_signer,
+		EARTH_RELAY_CERT, EARTH_RELAY_KEY, MARS_RELAY_CERT, MARS_RELAY_KEY, MISSION_CONTROL_CERT, MISSION_CONTROL_KEY,
+		ROVER_CERT, ROVER_KEY,
 	},
 	chain_processor::ChainProcessor,
 	clock::{advance_clock, delays, init_mission_clock, mission_time_ms},
@@ -746,11 +746,11 @@ tb_scenario! {
 			let shared_mission_state = Arc::clone(&config.mission_state);
 			let rover_processor = Arc::clone(&config.rover_chain_processor);
 
-			// Verifying keys (shared across servlets)
-			let mc_verifying_key = mission_control_verifying_key();
-			let earth_relay_verifying_key_val = earth_relay_verifying_key();
-			let mars_relay_verifying_key_val = mars_relay_verifying_key();
-			let rover_verifying_key_val = rover_verifying_key();
+			// Signer certificates (shared across servlets)
+			let mc_signer = mission_control_signer();
+			let earth_relay_signer_val = earth_relay_signer();
+			let mars_relay_signer_val = mars_relay_signer();
+			let rover_signer_val = rover_signer();
 
 
 			// Mission Control: store, signing key, chain processor, frame
@@ -854,8 +854,8 @@ tb_scenario! {
 				mars_relay_addr: socket_addr,
 				mars_relay_pool: rover_mars_pool,
 				rover_signing_key: rover_signing_key.to_owned(),
-				mission_control_verifying_key: mc_verifying_key,
-				mars_relay_verifying_key: mars_relay_verifying_key_val,
+				mission_control_signer: mc_signer.to_owned(),
+				mars_relay_signer: mars_relay_signer_val.to_owned(),
 				shared_cipher: shared_cipher.to_owned(),
 				chain_processor: Arc::clone(&rover_processor),
 				_fault_manager: Arc::clone(&rover_fault_manager),
@@ -912,9 +912,9 @@ tb_scenario! {
 			let mars_earth_relay_addr = Arc::new(RwLock::new(None));
 			let mars_relay_config = MarsRelaySatelliteServletConfig {
 				mars_relay_signing_key: mars_relay_signing_key.to_owned(),
-				mission_control_verifying_key: mc_verifying_key,
-				earth_relay_verifying_key: earth_relay_verifying_key_val,
-				rover_verifying_key: rover_verifying_key_val,
+				mission_control_signer: mc_signer.to_owned(),
+				earth_relay_signer: earth_relay_signer_val.to_owned(),
+				rover_signer: rover_signer_val.to_owned(),
 				shared_cipher: shared_cipher.to_owned(),
 				rover_addr,
 				earth_relay_addr: Arc::clone(&mars_earth_relay_addr),
@@ -962,9 +962,9 @@ tb_scenario! {
 			let earth_mission_control_addr = Arc::new(RwLock::new(None));
 			let earth_relay_config = EarthRelaySatelliteServletConfig {
 				earth_relay_signing_key: earth_relay_signing_key.to_owned(),
-				mission_control_verifying_key: mc_verifying_key,
-				mars_relay_verifying_key: mars_relay_verifying_key_val,
-				rover_verifying_key: rover_verifying_key_val,
+				mission_control_signer: mc_signer.to_owned(),
+				mars_relay_signer: mars_relay_signer_val.to_owned(),
+				rover_signer: rover_signer_val.to_owned(),
 				shared_cipher: shared_cipher.to_owned(),
 				mars_relay_addr, // Now we have the real address!
 				mission_control_addr: Arc::clone(&earth_mission_control_addr),
@@ -1003,8 +1003,8 @@ tb_scenario! {
 			// 4. Start the Mission Control servlet
 			let mc_config = MissionControlServletConfig {
 				mission_control_signing_key: mission_control_signing_key.to_owned(),
-				rover_verifying_key: rover_verifying_key_val,
-				earth_relay_verifying_key: earth_relay_verifying_key_val,
+				rover_signer: rover_signer_val.to_owned(),
+				earth_relay_signer: earth_relay_signer_val.to_owned(),
 				shared_cipher: shared_cipher.to_owned(),
 				chain_processor: Arc::clone(&mc_processor),
 				frame_builder: Arc::clone(&mc_frame_builder),

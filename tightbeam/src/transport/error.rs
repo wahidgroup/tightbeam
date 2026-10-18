@@ -120,10 +120,14 @@ pub enum TransportError {
 	/// This transport does not support the configured handshake protocol.
 	#[error("Handshake protocol not supported by this transport: {0:?}")]
 	UnsupportedHandshakeProtocol(HandshakeProtocolKind),
-	/// The operation requires a server certificate chain, and none is
-	/// provisioned.
+	/// The CMS handshake requires the two provisioned certificates of the
+	/// server, and none are provisioned.
 	#[error("Server certificate chain required but not provisioned")]
 	MissingServerCertificateChain,
+	/// A server of the CMS flow requires a key-agreement identity beside its
+	/// signing identity, and only the signing identity is provisioned.
+	#[error("Key-agreement identity required but not provisioned")]
+	MissingKeyAgreementIdentity,
 	/// The client has no trust store. Install one, or call `allow_cleartext`
 	/// to choose cleartext.
 	#[error("Client has no trust store: install one or call allow_cleartext to choose cleartext")]

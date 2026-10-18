@@ -15,6 +15,7 @@ use tightbeam::{
 		x509::policy::{CertificateValidation, DirectTrustValidator},
 		x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder},
 	},
+	der::asn1::ObjectIdentifier,
 	oids::{AES_128_GCM, AES_128_WRAP},
 	random::OsRng,
 	testing::{
@@ -24,6 +25,9 @@ use tightbeam::{
 	x509::Certificate,
 	TightBeamError,
 };
+
+#[cfg(feature = "transport-cms")]
+use tightbeam::testing::TestCmsServer;
 
 /// Build the standard testing error that threat scenarios use to signal an
 /// observed insecure outcome, which becomes a spec `ModeMismatch`.
@@ -61,6 +65,10 @@ pub struct ServerMaterials {
 	/// what it fails to open. It sits in an `Arc`, so the bundle is `Clone`
 	/// without copying secret material.
 	secret_key: Arc<k256::SecretKey>,
+	/// The two identities a CMS server holds under one test authority: a
+	/// signing certificate and a key-agreement certificate of one subject.
+	#[cfg(feature = "transport-cms")]
+	pub cms: Arc<TestCmsServer>,
 }
 
 impl ServerMaterials {
@@ -73,7 +81,13 @@ impl ServerMaterials {
 
 		let server_key = Secp256k1SigningKey::from(signing_key);
 		let provider: Arc<dyn SigningKeyProvider> = Arc::new(Secp256k1KeyProvider::from(server_key));
-		Self { certificate, key_provider: provider, secret_key: Arc::new(secret_key) }
+		Self {
+			certificate,
+			key_provider: provider,
+			secret_key: Arc::new(secret_key),
+			#[cfg(feature = "transport-cms")]
+			cms: Arc::new(TestCmsServer::generate("tightbeam test server")),
+		}
 	}
 
 	/// The server's static secret key, which an observer test holds.
@@ -86,6 +100,14 @@ impl ServerMaterials {
 		let certificate = Arc::clone(&self.certificate);
 		let key_provider = Arc::clone(&self.key_provider);
 		SigningIdentity::new(certificate, key_provider).expect("the server key matches its certificate")
+	}
+
+	/// These materials with a certificate whose `extendedKeyUsage` names
+	/// `purpose` alone.
+	pub fn with_key_purpose(mut self, purpose: ObjectIdentifier) -> Self {
+		let certificate = self.certificate.as_ref().to_owned();
+		self.certificate = Arc::new(TestCertificate::with_key_purposes(certificate, [purpose]));
+		self
 	}
 }
 
@@ -124,6 +146,14 @@ impl ClientMaterials {
 		let certificate = Arc::clone(&self.certificate);
 		let key_provider = Arc::clone(&self.key_provider);
 		SigningIdentity::new(certificate, key_provider).expect("the client key matches its certificate")
+	}
+
+	/// These materials with a certificate whose `extendedKeyUsage` names
+	/// `purpose` alone.
+	pub fn with_key_purpose(mut self, purpose: ObjectIdentifier) -> Self {
+		let certificate = self.certificate.as_ref().to_owned();
+		self.certificate = Arc::new(TestCertificate::with_key_purposes(certificate, [purpose]));
+		self
 	}
 }
 
@@ -346,7 +376,9 @@ mod hpke_handshake {
 
 	use tightbeam::cms::content_info::ContentInfo;
 	use tightbeam::crypto::profiles::SecurityProfileDesc;
+	use tightbeam::crypto::sign::SigningIdentity;
 	use tightbeam::crypto::x509::policy::CertificateValidation;
+	use tightbeam::crypto::x509::KeyPurposes;
 	use tightbeam::der::asn1::OctetStringRef;
 	use tightbeam::der::{Any, Decode, Encode, Tag};
 	use tightbeam::oids::DATA;
@@ -363,7 +395,20 @@ mod hpke_handshake {
 		validator: Arc<dyn CertificateValidation>,
 	) -> ClientConfig<Hpke, P> {
 		let trust = LearnedTrust::from(validator);
-		ClientConfig::new(HpkeClientSettings::new(trust))
+		let config = ClientConfig::new(HpkeClientSettings::new(trust), KeyPurposes::HOUSE);
+		config.expect("an anonymous client holds no identity to refuse")
+	}
+
+	/// The configuration of an HPKE client that admits its server through
+	/// `validator` and presents `identity`.
+	pub fn hpke_client_config_presenting<P: HandshakeProvider>(
+		validator: Arc<dyn CertificateValidation>,
+		identity: SigningIdentity,
+	) -> ClientConfig<Hpke, P> {
+		let mut settings = HpkeClientSettings::new(LearnedTrust::from(validator));
+		settings.identity = Some(identity);
+		let config = ClientConfig::new(settings, KeyPurposes::HOUSE);
+		config.expect("a test client identity serves the client role")
 	}
 
 	/// The configuration of an HPKE server that presents the certificate of
@@ -375,7 +420,8 @@ mod hpke_handshake {
 	) -> ServerConfig<Hpke, P> {
 		let settings = HpkeServerSettings::new();
 		let profiles = SupportedProfiles::new(profiles).expect("a server fixture runs at least one profile");
-		ServerConfig::new(settings, materials.identity(), profiles)
+		let config = ServerConfig::new(settings, materials.identity(), profiles, KeyPurposes::HOUSE);
+		config.expect("a test server identity serves the server role")
 	}
 
 	/// The DER of the `ClientHello` that `opening` carries as the OCTET
@@ -427,39 +473,42 @@ pub use hpke_handshake::*;
 mod cms_pair {
 	use std::sync::Arc;
 
+	use tightbeam::crypto::hpke::DhKemSecp256k1;
 	use tightbeam::crypto::profiles::{DefaultCryptoProvider, SecurityProfileDesc};
 	use tightbeam::crypto::sign::SigningIdentity;
-	use tightbeam::crypto::x509::store::CertificateTrust;
+	use tightbeam::crypto::x509::KeyPurposes;
 	use tightbeam::transport::handshake::negotiation::SecurityOffer;
 	use tightbeam::transport::handshake::{
-		ClientConfig, Cms, CmsClientSettings, CmsServerIdentity, CmsServerSettings, HandshakeProvider,
-		PeerAuthentication, ProvisionedTrust, ServerConfig, SupportedProfiles,
+		ClientConfig, Cms, CmsClientSettings, CmsServerSettings, HandshakeProvider, PeerAuthentication, ServerConfig,
+		SupportedProfiles,
 	};
 	use tightbeam::x509::Certificate;
 	use tightbeam::TightBeamError;
 
-	use super::{pinning_trust_store, ClientMaterials, ServerMaterials};
+	use super::{ClientMaterials, ServerMaterials};
 
-	/// The configuration of a CMS client that presents `identity` and
-	/// encrypts to `server`, which `store` admits.
-	pub fn cms_client_config<P: HandshakeProvider>(
-		server: &Arc<Certificate>,
-		store: Arc<dyn CertificateTrust>,
+	/// The configuration of a CMS client that presents `identity` and seals
+	/// to the CMS server of `materials`, whose two certificates the store of
+	/// their authority admits.
+	pub fn cms_client_config<P: HandshakeProvider<Kem = DhKemSecp256k1>>(
+		materials: &ServerMaterials,
 		identity: SigningIdentity,
 	) -> ClientConfig<Cms, P> {
-		let pinned = CmsServerIdentity::Certificate(Arc::clone(server));
-		let trust = ProvisionedTrust { identity: pinned, store };
-		ClientConfig::new(CmsClientSettings { trust, identity })
+		let trust = materials.cms.trust();
+		let config = ClientConfig::new(CmsClientSettings { trust, identity }, KeyPurposes::HOUSE);
+		config.expect("a test client identity serves the client role")
 	}
 
-	/// The configuration of a CMS server that holds the key of `materials`,
-	/// runs `profiles` in preference order, and records no client as its peer.
-	pub fn cms_server_config<P: HandshakeProvider>(
+	/// The configuration of a CMS server that holds the two identities of
+	/// `materials`, runs `profiles` in preference order, and records no client
+	/// as its peer.
+	pub fn cms_server_config<P: HandshakeProvider<Kem = DhKemSecp256k1>>(
 		materials: &ServerMaterials,
 		profiles: impl IntoIterator<Item = SecurityProfileDesc>,
 	) -> ServerConfig<Cms, P> {
 		let profiles = SupportedProfiles::new(profiles).expect("a server fixture runs at least one profile");
-		ServerConfig::new(CmsServerSettings, materials.identity(), profiles)
+		let config = ServerConfig::new(CmsServerSettings, materials.cms.pair(), profiles, KeyPurposes::HOUSE);
+		config.expect("a test server pair serves the server role")
 	}
 
 	/// A CMS client and server over the fixture server identity, beside the
@@ -490,9 +539,8 @@ mod cms_pair {
 		let server_profiles: Vec<SecurityProfileDesc> = server_profiles.into_iter().collect();
 		let client_materials = ClientMaterials::generate();
 		let client_certificate = Arc::clone(&client_materials.certificate);
-		let trust_store = pinning_trust_store(&materials.certificate)?;
 
-		let mut client = cms_client_config(&materials.certificate, trust_store, client_materials.identity());
+		let mut client = cms_client_config(materials, client_materials.identity());
 		client.security_offer = Some(SecurityOffer::new(client_profiles));
 
 		// The server learns the client certificate from the closing it opens,

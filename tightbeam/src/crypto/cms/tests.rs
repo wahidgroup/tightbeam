@@ -6,18 +6,20 @@ use crate::cms::enveloped_data::{
 };
 use crate::crypto::cms::recipient::ContentKey;
 use crate::crypto::cms::{
-	AuthEnvelopedData, CmsOriForKemOtherInfo, EnvelopeError, GcmParameters, KemRecipientInfo, Opener, Recipient,
+	AuthEnvelopedData, CmsOriForKemOtherInfo, EnvelopeError, GcmParameters, KemRecipient, KemRecipientInfo,
+	KeyAgreementIdentity, Opener, Recipient,
 };
+use crate::crypto::hpke::DhKemSecp256k1;
 use crate::crypto::k256::elliptic_curve::sec1::ToEncodedPoint;
-use crate::crypto::k256::PublicKey;
+use crate::crypto::k256::{PublicKey, Secp256k1};
 use crate::crypto::kdf::HkdfSha3_256;
-use crate::crypto::key::{KeyError, Secp256k1KeyProvider, SigningKeyProvider};
+use crate::crypto::key::{DiffieHellman, KeyBackend, KeyError, Secp256k1KeyProvider};
 use crate::crypto::profiles::{Aes128Wrap, Aes192Wrap, Aes256Wrap, DefaultCryptoProvider, KeyWrapAlgorithm};
 use crate::crypto::secret::{SecretSlice, ToInsecure};
 use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
-use crate::crypto::sign::{SignerError, SigningIdentity};
 use crate::crypto::x509::error::CertificateValidationError;
 use crate::crypto::x509::utils::CertificateExt;
+use crate::crypto::x509::{KeyAgreement, KeyPurposes, PeerCertificate};
 use crate::der::asn1::{GeneralizedTime, Null, ObjectIdentifier, OctetString, SetOfVec};
 use crate::der::oid::AssociatedOid;
 use crate::der::{Any, Decode, Encode, EncodeValue, Tagged};
@@ -27,7 +29,7 @@ use crate::oids::{
 };
 use crate::random::OsRng;
 use crate::spki::AlgorithmIdentifierOwned;
-use crate::testing::{unhex, EnvelopeRecipient, SeededStream, TestCertificate, TestIdentity};
+use crate::testing::{unhex, EnvelopeRecipient, SeededStream, TestCertificate};
 use crate::utils::marker::MaybeSendFuture;
 use crate::x509::attr::{Attribute, Attributes};
 use crate::x509::ext::pkix::{KeyUsage, KeyUsages, SubjectKeyIdentifier};
@@ -38,6 +40,12 @@ use crate::zeroize::Zeroizing;
 /// The house provider, whose algorithms every seal here runs: AES-256-GCM,
 /// HKDF-SHA3-256, AES-256 key wrap, and DHKEM(secp256k1, HKDF-SHA256).
 type House = DefaultCryptoProvider;
+
+/// The KEM of the house provider.
+type HouseKem = DhKemSecp256k1;
+
+/// A key-agreement identity under the house KEM.
+type HouseIdentity = KeyAgreementIdentity<HouseKem>;
 
 /// The content every test seals.
 const CONTENT: &[u8] = b"authenticated envelope content";
@@ -56,7 +64,7 @@ const UKM_LABEL: &[u8] = b"tb/test/ukm/v1";
 const PUBLISHED_RECIPIENT_SECRET: &str = "a795c287c132154a8b96dc81dc8b4e2f02bbbad78dab0567b59db1d1540751f6";
 
 /// The holder of [`KEK`], as the recipient of a seal.
-fn kek_recipient_of() -> Recipient<'static> {
+fn kek_recipient_of() -> Recipient<'static, HouseKem> {
 	Recipient::Kek { kek: &KEK, key_identifier: KEY_IDENTIFIER }
 }
 
@@ -75,27 +83,40 @@ fn kek_sealed_from_seed() -> AuthEnvelopedData {
 }
 
 /// The opener of the holder of [`KEK`].
-fn kek_opener() -> Opener<'static> {
+fn kek_opener() -> Opener<'static, HouseKem> {
 	Opener::Kek { kek: &KEK, key_identifier: KEY_IDENTIFIER }
 }
 
-/// The identity of a fresh secp256k1 key under a certificate that carries its
-/// key identifier.
-fn kem_identity() -> SigningIdentity {
-	TestIdentity::of(&Secp256k1SigningKey::random(&mut OsRng))
+/// The house backend of `key`, as the trait object the house KEM decapsulates
+/// through.
+fn backend_of(key: &Secp256k1SigningKey) -> Arc<dyn DiffieHellman<Secp256k1>> {
+	Arc::new(Secp256k1KeyProvider::from(key.to_owned()))
 }
 
-/// The identity of the published recipient key.
-fn published_identity() -> SigningIdentity {
+/// The key-agreement identity of `key` under `certificate`.
+fn agreement_identity(certificate: Certificate, key: &Secp256k1SigningKey) -> HouseIdentity {
+	let identity = KeyAgreementIdentity::new(certificate, backend_of(key));
+	identity.expect("the test key matches its certificate")
+}
+
+/// The key-agreement identity of a fresh secp256k1 key under a certificate
+/// that carries its key identifier.
+fn kem_identity() -> HouseIdentity {
+	let key = Secp256k1SigningKey::random(&mut OsRng);
+	agreement_identity(TestCertificate::self_signed(&key), &key)
+}
+
+/// The key-agreement identity of the published recipient key.
+fn published_identity() -> HouseIdentity {
 	let secret = unhex(PUBLISHED_RECIPIENT_SECRET);
 	let key = Secp256k1SigningKey::from_slice(&secret).expect("the vector holds a scalar");
-	TestIdentity::of(&key)
+	agreement_identity(TestCertificate::self_signed(&key), &key)
 }
 
-/// [`CONTENT`] sealed as `id-data` to the certificate of `identity`, with a
+/// [`CONTENT`] sealed as `id-data` to the recipient of `identity`, with a
 /// `ukm` led by `ukm_label`.
-fn kem_sealed(identity: &SigningIdentity, ukm_label: &[u8]) -> AuthEnvelopedData {
-	let recipient = Recipient::Kem { certificate: identity.certificate(), ukm_label };
+fn kem_sealed(identity: &HouseIdentity, ukm_label: &[u8]) -> AuthEnvelopedData {
+	let recipient = Recipient::Kem { recipient: identity.recipient(), ukm_label };
 	let sealed = AuthEnvelopedData::seal::<House>(recipient, DATA, CONTENT, [], None);
 	sealed.expect("the content seals")
 }
@@ -105,21 +126,22 @@ fn kem_sealed(identity: &SigningIdentity, ukm_label: &[u8]) -> AuthEnvelopedData
 /// ephemeral scalar of `0x03`, and `ukm` random octets of `0x04`.
 fn kem_sealed_from_seed() -> AuthEnvelopedData {
 	let identity = published_identity();
-	let recipient = Recipient::Kem { certificate: identity.certificate(), ukm_label: UKM_LABEL };
+	let recipient = Recipient::Kem { recipient: identity.recipient(), ukm_label: UKM_LABEL };
 	let mut stream = SeededStream(0);
+
 	let sealed = AuthEnvelopedData::seal::<House>(recipient, DATA, CONTENT, [], Some(&mut stream));
 	sealed.expect("the content seals")
 }
 
 /// The opener of `identity` under [`UKM_LABEL`].
-fn kem_opener(identity: &SigningIdentity) -> Opener<'_> {
+fn kem_opener(identity: &HouseIdentity) -> Opener<'_, HouseKem> {
 	Opener::Kem { identity, ukm_label: UKM_LABEL }
 }
 
 /// Open `envelope` as it encodes, as a reader that received its DER does.
 async fn opened(
 	envelope: AuthEnvelopedData,
-	opener: &Opener<'_>,
+	opener: &Opener<'_, HouseKem>,
 	content_type: ObjectIdentifier,
 ) -> Result<SecretSlice<u8>, EnvelopeError> {
 	let arrived = envelope.to_der()?;
@@ -154,6 +176,7 @@ fn content_type_values(envelope: &AuthEnvelopedData) -> Vec<ObjectIdentifier> {
 	let attrs = attrs.expect("the envelope carries authenticated attributes");
 	let named = attrs.iter().filter(|attribute| attribute.oid == ATTR_CONTENT_TYPE);
 	let values = named.flat_map(|attribute| attribute.values.iter());
+
 	let decoded = values.map(|value| value.decode_as::<ObjectIdentifier>().expect("a content type decodes"));
 	decoded.collect()
 }
@@ -191,6 +214,7 @@ fn with_misordered_auth_attrs(envelope: &AuthEnvelopedData) -> Vec<u8> {
 	let reversed: Vec<u8> = encoded.iter().rev().flatten().copied().collect();
 	let at = der.windows(ordered.len()).position(|window| window == ordered.as_slice());
 	let at = at.expect("the attributes sit in the envelope");
+
 	let mut misordered = der;
 	misordered[at..at + ordered.len()].copy_from_slice(&reversed);
 	misordered
@@ -238,8 +262,8 @@ fn with_compressed_kemct(kem: KemRecipientInfo) -> KemRecipientInfo {
 	KemRecipientInfo { kemct, ..kem }
 }
 
-/// A key provider that records the peer key of each agreement it is asked
-/// for, and agrees as [`Secp256k1KeyProvider`] does.
+/// A key-agreement backend that records the peer key of each agreement it is
+/// asked for, and agrees as [`Secp256k1KeyProvider`] does.
 #[derive(Debug)]
 struct RecordingAgreement {
 	inner: Secp256k1KeyProvider,
@@ -259,7 +283,7 @@ impl RecordingAgreement {
 	}
 }
 
-impl SigningKeyProvider for RecordingAgreement {
+impl KeyBackend for RecordingAgreement {
 	fn algorithm(&self) -> AlgorithmIdentifierOwned {
 		self.inner.algorithm()
 	}
@@ -267,15 +291,13 @@ impl SigningKeyProvider for RecordingAgreement {
 	fn to_public_key_bytes(&self) -> Result<Vec<u8>, KeyError> {
 		self.inner.to_public_key_bytes()
 	}
+}
 
-	fn sign_prehash(&self, prehash: &[u8]) -> MaybeSendFuture<'_, Result<Vec<u8>, KeyError>> {
-		self.inner.sign_prehash(prehash)
-	}
-
-	fn key_agreement(&self, peer_public_key: &[u8]) -> MaybeSendFuture<'_, Result<SecretSlice<u8>, KeyError>> {
+impl DiffieHellman<Secp256k1> for RecordingAgreement {
+	fn agree<'a>(&'a self, peer: &'a PublicKey) -> MaybeSendFuture<'a, Result<SecretSlice<u8>, KeyError>> {
 		let mut agreements = self.agreements.lock().expect("no agreement panicked while holding the record");
-		agreements.push(peer_public_key.to_vec());
-		self.inner.key_agreement(peer_public_key)
+		agreements.push(peer.to_encoded_point(false).as_bytes().to_vec());
+		self.inner.agree(peer)
 	}
 }
 
@@ -1032,11 +1054,11 @@ async fn a_compressed_kem_ciphertext_is_refused() {
 /// The opener parses the `kemct` before the key provider runs, so a
 /// compressed `kemct` is refused with no agreement asked of the provider.
 #[tokio::test]
-async fn a_compressed_kem_ciphertext_is_refused_before_the_agreement() -> Result<(), SignerError> {
+async fn a_compressed_kem_ciphertext_is_refused_before_the_agreement() -> Result<(), EnvelopeError> {
 	let key = Secp256k1SigningKey::random(&mut OsRng);
 	let certificate = TestCertificate::self_signed(&key);
 	let provider = Arc::new(RecordingAgreement::new(key));
-	let identity = SigningIdentity::new(certificate, provider.to_owned())?;
+	let identity = KeyAgreementIdentity::<HouseKem>::new(certificate, provider.to_owned())?;
 	let envelope = kem_sealed(&identity, UKM_LABEL);
 	let kem = with_compressed_kemct(envelope.kem_recipient());
 	let envelope = envelope.with_kem_recipient(&kem);
@@ -1047,88 +1069,95 @@ async fn a_compressed_kem_ciphertext_is_refused_before_the_agreement() -> Result
 	Ok(())
 }
 
-/// A KEM seal refuses a recipient certificate that carries no `keyUsage`
+/// A clone of a key-agreement identity shares the one checked value, so it
+/// copies no recipient and no `rid`.
+#[test]
+fn a_cloned_key_agreement_identity_shares_its_recipient() {
+	let identity = kem_identity();
+	let clone = identity.clone();
+	assert!(core::ptr::eq(identity.recipient(), clone.recipient()));
+}
+
+/// A KEM sender seals only to a `KemRecipient`, which the key-agreement use
+/// builds, so a certificate that carries no `keyUsage` names no recipient
 /// (RFC 9629 §3, RFC 5280 §4.2.1.3).
 #[test]
-fn a_kem_seal_to_a_certificate_without_key_usage_is_refused() {
+fn a_recipient_certificate_without_key_usage_names_no_kem_recipient() {
 	let certificate = certificate_with_key_usage(&Secp256k1SigningKey::random(&mut OsRng), None);
-	let recipient = Recipient::Kem { certificate: &certificate, ukm_label: UKM_LABEL };
-
-	let refused = AuthEnvelopedData::seal::<House>(recipient, DATA, CONTENT, [], None);
-	let missing = matches!(
+	let refused = PeerCertificate::<KeyAgreement<HouseKem>>::parse(certificate, KeyPurposes::HOUSE.server);
+	assert!(matches!(
 		refused,
-		Err(EnvelopeError::Certificate(CertificateValidationError::MissingKeyUsage(
-			KeyUsages::KeyAgreement
-		)))
-	);
-	assert!(missing);
+		Err(CertificateValidationError::MissingKeyUsage(KeyUsages::KeyAgreement))
+	));
 }
 
-/// A KEM seal refuses a recipient certificate whose `keyUsage` lacks
-/// `keyAgreement`.
+/// A certificate whose `keyUsage` lacks `keyAgreement` names no recipient
+/// a KEM sender seals to.
 #[test]
-fn a_kem_seal_to_a_certificate_without_key_agreement_is_refused() {
+fn a_recipient_certificate_without_key_agreement_names_no_kem_recipient() {
 	let key_usage = Some(KeyUsage(KeyUsages::DigitalSignature | KeyUsages::NonRepudiation));
 	let certificate = certificate_with_key_usage(&Secp256k1SigningKey::random(&mut OsRng), key_usage);
-	let recipient = Recipient::Kem { certificate: &certificate, ukm_label: UKM_LABEL };
 
-	let refused = AuthEnvelopedData::seal::<House>(recipient, DATA, CONTENT, [], None);
-	let missing = matches!(
+	let refused = PeerCertificate::<KeyAgreement<HouseKem>>::parse(certificate, KeyPurposes::HOUSE.server);
+	assert!(matches!(
 		refused,
-		Err(EnvelopeError::Certificate(CertificateValidationError::MissingKeyUsage(
-			KeyUsages::KeyAgreement
-		)))
-	);
-	assert!(missing);
+		Err(CertificateValidationError::MissingKeyUsage(KeyUsages::KeyAgreement))
+	));
 }
 
-/// A KEM seal names a recipient certificate whose `keyUsage` asserts
-/// `digitalSignature` and `keyAgreement` (RFC 5480 §3).
+/// A KEM seal to a certificate whose `keyUsage` asserts `digitalSignature`
+/// and `keyAgreement` (RFC 5480 §3) names the certificate as its `rid`.
 #[test]
 fn a_kem_seal_to_a_key_agreement_certificate_names_it() -> Result<(), Box<dyn core::error::Error>> {
 	let certificate = certificate_with_key_usage(&Secp256k1SigningKey::random(&mut OsRng), server_key_usage());
-	let recipient = Recipient::Kem { certificate: &certificate, ukm_label: UKM_LABEL };
+	let admitted = PeerCertificate::<KeyAgreement<HouseKem>>::parse(certificate.to_owned(), KeyPurposes::HOUSE.server)?;
+	let recipient = KemRecipient::from_certificate(admitted)?;
 
+	let recipient = Recipient::Kem { recipient: &recipient, ukm_label: UKM_LABEL };
 	let sealed = AuthEnvelopedData::seal::<House>(recipient, DATA, CONTENT, [], None)?;
 	assert_eq!(sealed.kem_recipient().rid, certificate.recipient_identifier()?);
 	Ok(())
 }
 
-/// An opener whose certificate carries no `keyUsage` refuses a KEM seal to
-/// its key, before its key provider runs.
-#[tokio::test]
-async fn an_opener_whose_certificate_lacks_key_usage_is_refused() {
+/// A KEM opener pairs its backend only with a certificate admitted for key
+/// agreement, so one that carries no `keyUsage` is refused.
+#[test]
+fn a_kem_opener_refuses_a_certificate_without_key_usage() {
 	let key = Secp256k1SigningKey::random(&mut OsRng);
-	let identity = TestIdentity::presenting(certificate_with_key_usage(&key, None), &key);
-	let envelope = kem_sealed(&TestIdentity::of(&key), UKM_LABEL);
-
-	let refused = opened(envelope, &kem_opener(&identity), DATA).await;
-	let missing = matches!(
+	let refused = HouseIdentity::new(certificate_with_key_usage(&key, None), backend_of(&key));
+	assert!(matches!(
 		refused,
 		Err(EnvelopeError::Certificate(CertificateValidationError::MissingKeyUsage(
 			KeyUsages::KeyAgreement
 		)))
-	);
-	assert!(missing);
+	));
 }
 
-/// An opener whose certificate's `keyUsage` lacks `keyAgreement` refuses a
-/// KEM seal to its key.
-#[tokio::test]
-async fn an_opener_whose_certificate_lacks_key_agreement_is_refused() {
+/// A KEM opener refuses a certificate whose `keyUsage` lacks `keyAgreement`.
+#[test]
+fn a_kem_opener_refuses_a_certificate_without_key_agreement() {
 	let key = Secp256k1SigningKey::random(&mut OsRng);
 	let key_usage = Some(KeyUsage(KeyUsages::DigitalSignature | KeyUsages::NonRepudiation));
-	let identity = TestIdentity::presenting(certificate_with_key_usage(&key, key_usage), &key);
-	let envelope = kem_sealed(&TestIdentity::of(&key), UKM_LABEL);
 
-	let refused = opened(envelope, &kem_opener(&identity), DATA).await;
-	let missing = matches!(
+	let refused = HouseIdentity::new(certificate_with_key_usage(&key, key_usage), backend_of(&key));
+	assert!(matches!(
 		refused,
 		Err(EnvelopeError::Certificate(CertificateValidationError::MissingKeyUsage(
 			KeyUsages::KeyAgreement
 		)))
-	);
-	assert!(missing);
+	));
+}
+
+/// A key-agreement identity refuses a backend whose public half differs
+/// from the certificate's key, so the key that decapsulates is the key the
+/// `rid` names.
+#[test]
+fn a_key_agreement_identity_refuses_a_backend_of_another_key() {
+	let key = Secp256k1SigningKey::random(&mut OsRng);
+	let other = Secp256k1SigningKey::random(&mut OsRng);
+
+	let refused = HouseIdentity::new(TestCertificate::self_signed(&key), backend_of(&other));
+	assert!(matches!(refused, Err(EnvelopeError::KeyMismatch)));
 }
 
 /// An opener whose certificate asserts `digitalSignature` and
@@ -1136,7 +1165,7 @@ async fn an_opener_whose_certificate_lacks_key_agreement_is_refused() {
 #[tokio::test]
 async fn an_opener_whose_certificate_permits_key_agreement_opens() -> Result<(), EnvelopeError> {
 	let key = Secp256k1SigningKey::random(&mut OsRng);
-	let identity = TestIdentity::presenting(certificate_with_key_usage(&key, server_key_usage()), &key);
+	let identity = agreement_identity(certificate_with_key_usage(&key, server_key_usage()), &key);
 	let envelope = kem_sealed(&identity, UKM_LABEL);
 
 	let opened = opened(envelope, &kem_opener(&identity), DATA).await?;

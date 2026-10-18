@@ -45,7 +45,9 @@ pub use crate::common::security::{
 };
 
 #[cfg(feature = "transport-cms")]
-use crate::common::security::{cms_client_config, cms_server_config, pinning_trust_store, ClientMaterials};
+use crate::common::security::{cms_client_config, cms_server_config, ClientMaterials};
+#[cfg(feature = "transport-cms")]
+use tightbeam::crypto::hpke::DhKemSecp256k1;
 #[cfg(feature = "transport-cms")]
 use tightbeam::transport::handshake::Cms;
 
@@ -761,23 +763,21 @@ impl<P: HandshakeProvider> SessionFlow<P> for Hpke {
 }
 
 #[cfg(feature = "transport-cms")]
-impl<P: HandshakeProvider> SessionFlow<P> for Cms {
+impl<P: HandshakeProvider<Kem = DhKemSecp256k1>> SessionFlow<P> for Cms {
 	const BACKEND: HandshakeBackendKind = HandshakeBackendKind::Cms;
 	const STEPS: &'static [FlowStep] = CMS_FLOW;
 
-	/// The client pins the server certificate and presents a fresh identity.
+	/// The client provisions the server's two certificates and presents a
+	/// fresh identity.
 	fn client(
 		materials: &ServerMaterials,
 		offer: SecurityOffer,
 		policy: ProfilePolicy<P>,
 	) -> Handshake<Client, Self, P> {
 		let client_materials = ClientMaterials::generate();
-		let trust_store = pinning_trust_store(&materials.certificate)
-			.expect("a trust store builds from the generated server certificate");
-
 		let identity = client_materials.identity();
 
-		let mut config = cms_client_config(&materials.certificate, trust_store, identity);
+		let mut config = cms_client_config(materials, identity);
 		config.security_offer = Some(offer);
 		config.profiles = policy;
 		Handshake::client(config)

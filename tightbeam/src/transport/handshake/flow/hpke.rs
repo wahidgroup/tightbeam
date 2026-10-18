@@ -36,6 +36,7 @@ use crate::cms::content_info::ContentInfo;
 use crate::cms::signed_data::{CertificateSet, SignedData};
 use crate::crypto::sign::elliptic_curve::SecretKey;
 use crate::crypto::sign::{CmsSigner, Signed, SignedContent, SignerInfoDraft, SigningIdentity};
+use crate::crypto::x509::{PeerCertificate, Signing};
 use crate::der::asn1::OctetStringRef;
 use crate::der::{Any, Decode, Encode, Tag};
 use crate::oids::{DATA, HANDSHAKE_REPLY_CONTENT};
@@ -47,7 +48,7 @@ use crate::transport::handshake::flow::{
 	ReplyParts, ReplyVerified, ServerAgreement, ServerLegs,
 };
 use crate::transport::handshake::negotiation::SecurityAccept;
-use crate::transport::handshake::peer::{LearnedTrust, PeerCertificate};
+use crate::transport::handshake::peer::LearnedTrust;
 use crate::transport::handshake::primitives::transcript::Transcript;
 use crate::transport::handshake::primitives::TranscriptHash;
 use crate::transport::handshake::schedule::{Agreement, CompressedPoint, PeerPoint, Salt};
@@ -189,14 +190,16 @@ impl<P: HandshakeProvider> ClientLegs<P> for Hpke {
 
 	fn verify_reply(
 		reply: &SignedData,
-		server: &PeerCertificate<P::Curve>,
+		server: &PeerCertificate<Signing<P>>,
 		transcript_hash: &TranscriptHash,
 	) -> Result<ReplyVerified, HandshakeError> {
 		// The transcript hash is a signed attribute, so a signer that saw
-		// another transcript fails the attribute set.
+		// another transcript fails the attribute set. The hash is fresh for
+		// each handshake, so the verified signature is the key of no ledger
+		// and drops here.
 		let content = CmsSigner::content(reply, HANDSHAKE_REPLY_CONTENT)?;
 		let signed = SignedContent::new(HANDSHAKE_REPLY_CONTENT, content).with_attribute(transcript_hash.attribute()?);
-		server.verify_signed::<P>(reply, signed)?;
+		CmsSigner::verify_sole_signer::<P>(reply, server, signed).map(drop)?;
 		Ok(ReplyVerified(()))
 	}
 }
@@ -251,6 +254,7 @@ pub struct HpkeReplyDraft {
 
 impl<P: HandshakeProvider> ServerLegs<P> for Hpke {
 	type Settings = HpkeServerSettings;
+	type Identity = SigningIdentity;
 	type Sealed = HpkeHello<P::Curve>;
 	type Opened = HpkeHello<P::Curve>;
 	type Draft = HpkeReplyDraft;
@@ -380,7 +384,9 @@ mod tests {
 	use crate::crypto::sign::ecdsa::k256::Secp256k1;
 	use crate::crypto::sign::ecdsa::Secp256k1Signature;
 	use crate::crypto::sign::elliptic_curve::PublicKey;
+	use crate::crypto::x509::error::CertificateValidationError;
 	use crate::crypto::x509::policy::{DirectTrustValidator, ExpiryValidator};
+	use crate::crypto::x509::KeyPurposes;
 	use crate::der::asn1::{ObjectIdentifier, PrintableString, SetOfVec};
 	use crate::oids::{
 		AUTH_ENVELOPED_DATA, HANDSHAKE_ABORT_ALERT, HANDSHAKE_TRANSCRIPT_HASH, HASH_SHA3_384, RECEIPT_ACK, SIGNED_DATA,
@@ -443,7 +449,7 @@ mod tests {
 	/// A real server of `identity` and a real anonymous client that trusts
 	/// it, with the reply the server sent to the client's hello.
 	async fn replied(identity: &TestCertificate) -> (TestClient<Hpke>, HandshakeMessage) {
-		let mut server = Handshake::server(Hpke::server(identity));
+		let mut server = Handshake::server(hpke_server(identity));
 		let mut client = Handshake::client(anonymous_client(identity));
 		let opening = client.start().expect("a fresh client builds its hello");
 		let reply = server.reply(opening).await.expect("the server admits the hello");
@@ -618,7 +624,7 @@ mod tests {
 		/// A server of a fresh identity under `peer_authentication`, after a
 		/// hand-built hello of the agreement ephemeral `ephemeral`.
 		async fn with_ephemeral(peer_authentication: PeerAuthentication, ephemeral: SecretKey<Secp256k1>) -> Self {
-			let mut config = Hpke::server(&create_test_certificate());
+			let mut config = hpke_server(&create_test_certificate());
 			config.peer_authentication = peer_authentication;
 
 			let mut server = Handshake::server(config);
@@ -757,7 +763,7 @@ mod tests {
 	#[tokio::test]
 	async fn the_reply_signs_the_hash_of_the_hello_the_content_and_the_certificate() -> Result<(), Box<dyn Error>> {
 		let identity = create_test_certificate();
-		let mut server = Handshake::server(Hpke::server(&identity));
+		let mut server = Handshake::server(hpke_server(&identity));
 		let mut client = Handshake::client(anonymous_client(&identity));
 		let opening = client.start()?;
 		let reply = server.reply(opening.to_owned()).await?;
@@ -808,8 +814,9 @@ mod tests {
 	async fn an_hpke_reply_fetches_no_public_key() -> Result<(), Box<dyn Error>> {
 		let identity = create_test_certificate();
 		let provider = Arc::new(CountingProvider::new(identity.signing_key.to_owned()));
-		let mut config = Hpke::server(&identity);
-		config.identity = presenting(&identity, Arc::clone(&provider) as Arc<dyn SigningKeyProvider>);
+		let identity = presenting(&identity, Arc::clone(&provider) as Arc<dyn SigningKeyProvider>);
+		let profiles = SupportedProfiles::from(create_default_test_profile());
+		let config = TestServerConfig::<Hpke>::new(HpkeServerSettings::new(), identity, profiles, KeyPurposes::HOUSE)?;
 
 		let fetched_at_construction = provider.public_keys();
 		let mut server = Handshake::server(config);
@@ -852,7 +859,7 @@ mod tests {
 	#[tokio::test]
 	async fn a_flipped_certificate_demand_fails_the_reply_signature() -> Result<(), Box<dyn Error>> {
 		let identity = create_test_certificate();
-		let mut config = Hpke::server(&identity);
+		let mut config = hpke_server(&identity);
 		config.peer_authentication = mutual_with(ExpiryValidator);
 
 		let mut server = Handshake::server(config);
@@ -889,8 +896,8 @@ mod tests {
 		let anchors = [identity.certificate.to_owned(), twin.to_owned()];
 		let trusted = DirectTrustValidator::default().with_trust_chain(anchors);
 		let settings = HpkeClientSettings::new(LearnedTrust::new(trusted));
-		let mut client = Handshake::client(TestClientConfig::<Hpke>::new(settings));
-		let mut server = Handshake::server(Hpke::server(&identity));
+		let mut client = Handshake::client(TestClientConfig::<Hpke>::new(settings, KeyPurposes::HOUSE)?);
+		let mut server = Handshake::server(hpke_server(&identity));
 		let reply = server.reply(client.start()?).await?;
 		let choice = CertificateChoices::Certificate(twin);
 		let swapped = with_certificates(&reply, Some(CertificateSet(vec![choice].try_into()?)));
@@ -1041,7 +1048,7 @@ mod tests {
 	#[tokio::test]
 	async fn an_anonymous_client_refuses_a_server_that_demands_an_identity() -> Result<(), Box<dyn Error>> {
 		let identity = create_test_certificate();
-		let mut config = Hpke::server(&identity);
+		let mut config = hpke_server(&identity);
 		config.peer_authentication = mutual_with(ExpiryValidator);
 
 		let mut server = Handshake::server(config);
@@ -1061,7 +1068,7 @@ mod tests {
 	#[tokio::test]
 	async fn a_failed_hpke_closing_leaves_the_client_spent() -> Result<(), Box<dyn Error>> {
 		let identity = create_test_certificate();
-		let mut config = Hpke::server(&identity);
+		let mut config = hpke_server(&identity);
 		config.peer_authentication = mutual_with(ExpiryValidator);
 		config.transport = Some(budget_offer());
 
@@ -1086,7 +1093,7 @@ mod tests {
 	/// refused at the hello, before any negotiation.
 	#[tokio::test]
 	async fn an_off_curve_client_ephemeral_is_refused() {
-		let mut server = Handshake::server(Hpke::server(&create_test_certificate()));
+		let mut server = Handshake::server(hpke_server(&create_test_certificate()));
 
 		let refusal = server.reply(hello_opening(&hello_carrying(off_curve_point()))).await;
 		assert!(matches!(refusal, Err(HandshakeError::InvalidPublicKey(_))));
@@ -1096,7 +1103,7 @@ mod tests {
 	/// its content is read.
 	#[tokio::test]
 	async fn a_hello_of_another_content_type_is_refused() -> Result<(), Box<dyn Error>> {
-		let mut server = Handshake::server(Hpke::server(&create_test_certificate()));
+		let mut server = Handshake::server(hpke_server(&create_test_certificate()));
 		let ephemeral = SecretKey::<Secp256k1>::random(&mut OsRng);
 		let hello = hello_of(&ephemeral).to_der()?;
 		let content = Any::new(Tag::OctetString, hello)?;
@@ -1111,7 +1118,7 @@ mod tests {
 	/// is read.
 	#[tokio::test]
 	async fn an_hpke_server_refuses_a_signed_data_as_its_hello() -> Result<(), Box<dyn Error>> {
-		let mut server = Handshake::server(Hpke::server(&create_test_certificate()));
+		let mut server = Handshake::server(hpke_server(&create_test_certificate()));
 		let signed = HandshakeMessage::try_from(create_test_signed_data(b"hello"))?;
 
 		let refusal = server.reply(signed).await;
@@ -1124,7 +1131,7 @@ mod tests {
 	#[tokio::test]
 	async fn an_anonymous_closing_seals_its_attributes_as_data() -> Result<(), Box<dyn Error>> {
 		let identity = create_test_certificate();
-		let run = run(anonymous_client(&identity), Hpke::server(&identity)).await;
+		let run = run(anonymous_client(&identity), hpke_server(&identity)).await;
 
 		let closing = run.closing.auth_enveloped()?;
 		let content_type = closing.value().auth_encrypted_content_info.content_type;
@@ -1150,7 +1157,7 @@ mod tests {
 	#[tokio::test]
 	async fn an_anonymous_closing_opens_and_records_no_peer() -> Result<(), Box<dyn Error>> {
 		let identity = create_test_certificate();
-		let mut run = run(anonymous_client(&identity), Hpke::server(&identity)).await;
+		let mut run = run(anonymous_client(&identity), hpke_server(&identity)).await;
 
 		let session = run.server.complete()?;
 		assert!(session.peer().is_none());
@@ -1374,12 +1381,18 @@ mod tests {
 		let client = create_test_certificate();
 		let mut off_curve = client.certificate.to_owned();
 		put_off_curve_key(&mut off_curve);
+
 		let mut awaiting = AwaitingClosing::new(PeerAuthentication::Anonymous).await;
 		let transcript_hash = awaiting.confirming.transcript_hash;
 		let closing = awaiting.identified_over(&client, &transcript_hash, off_curve).await;
 
 		let refusal = awaiting.server.finish(closing).await;
-		assert!(matches!(refusal, Err(HandshakeError::InvalidPublicKey(_))));
+		assert!(matches!(
+			refusal,
+			Err(HandshakeError::CertificateValidationError(
+				CertificateValidationError::SpkiError(_)
+			))
+		));
 	}
 
 	/// A handshake under a provider whose digest is SHA3-512 seals the whole
@@ -1388,10 +1401,13 @@ mod tests {
 	#[tokio::test]
 	async fn a_sha3_512_profile_carries_a_64_byte_transcript_hash() -> Result<(), Box<dyn Error>> {
 		let server_identity = create_test_certificate();
-		let settings = Hpke::client(&server_identity.certificate, &create_test_certificate()).flow;
+		let identity = Some(client_identity(&create_test_certificate()));
+		let settings = hpke_client_settings(&server_identity.certificate, identity);
 		let profiles = SupportedProfiles::from(RunnableProfile::<Aes256Sha3_512Provider>::native().descriptor());
-		let server_config = ServerConfig::new(HpkeServerSettings::new(), signing_identity(&server_identity), profiles);
-		let mut client = Handshake::<Client, Hpke, Aes256Sha3_512Provider>::client(ClientConfig::new(settings));
+		let signing = signing_identity(&server_identity);
+		let server_config = ServerConfig::new(HpkeServerSettings::new(), signing, profiles, KeyPurposes::HOUSE)?;
+		let client_config = ClientConfig::new(settings, KeyPurposes::HOUSE)?;
+		let mut client = Handshake::<Client, Hpke, Aes256Sha3_512Provider>::client(client_config);
 		let mut server = Handshake::<Server, Hpke, Aes256Sha3_512Provider>::server(server_config);
 
 		let opening = client.start()?;
@@ -1437,10 +1453,11 @@ mod tests {
 	/// fixed secret, so a reader holds its key.
 	async fn emitted() -> Emitted {
 		let identity = create_test_certificate();
-		let mut server = Handshake::server(Hpke::server(&identity));
+		let mut server = Handshake::server(hpke_server(&identity));
 		let mut client = Handshake::client(anonymous_client(&identity));
 		let hello = client.start().expect("a fresh client builds its hello");
 		let reply = server.reply(hello.to_owned()).await.expect("the server admits the hello");
+
 		client.respond(reply.to_owned()).await.expect("the client admits the reply");
 
 		let transcript_hash = fixture_transcript::<Sha3_256>([0x07u8; 32]);

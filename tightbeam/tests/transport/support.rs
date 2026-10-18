@@ -17,6 +17,7 @@ use tokio::task::JoinHandle;
 
 use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
+use tightbeam::crypto::x509::KeyPurposes;
 use tightbeam::der::Decode;
 use tightbeam::policy::TransitStatus;
 use tightbeam::prelude::TightBeamSocketAddr;
@@ -148,9 +149,33 @@ pub async fn bind_mutual_listener(
 	materials: &ServerMaterials,
 	client_certificate: &Certificate,
 ) -> Result<(TokioListener, SocketAddr), TightBeamError> {
+	bind_mutual_listener_under(materials, client_certificate, KeyPurposes::HOUSE).await
+}
+
+/// Bind a listener that presents `materials`, pins `client_certificate` as
+/// its one client, and admits each role under `key_purposes`.
+pub async fn bind_mutual_listener_under(
+	materials: &ServerMaterials,
+	client_certificate: &Certificate,
+	key_purposes: KeyPurposes,
+) -> Result<(TokioListener, SocketAddr), TightBeamError> {
 	let validators = vec![pinning_validator(client_certificate)];
 	let config = TransportEncryptionConfig::new(materials.identity()).with_client_validators(validators);
-	bind_with_config(config).await
+	bind_with_config(config.with_key_purposes(key_purposes)).await
+}
+
+/// Bind a listener that presents the CMS server of `materials`, its signing
+/// identity paired with its key-agreement identity, and pins
+/// `client_certificate` as its one client.
+#[cfg(feature = "transport-cms")]
+pub async fn bind_cms_mutual_listener(
+	materials: &ServerMaterials,
+	client_certificate: &Certificate,
+) -> Result<(TokioListener, SocketAddr), TightBeamError> {
+	let validators = vec![pinning_validator(client_certificate)];
+	let config = TransportEncryptionConfig::new(materials.cms.signing_identity());
+	let config = config.with_key_agreement(materials.cms.key_agreement_identity())?;
+	bind_with_config(config.with_client_validators(validators)).await
 }
 
 pub async fn connect_mutual_client(
@@ -158,7 +183,19 @@ pub async fn connect_mutual_client(
 	server_certificate: &Certificate,
 	client: &ClientMaterials,
 ) -> Result<TcpTransport<TokioStream>, TightBeamError> {
+	connect_mutual_client_under(addr, server_certificate, client, KeyPurposes::HOUSE).await
+}
+
+/// Connect a client that presents `client`, pins `server_certificate`, and
+/// admits each role under `key_purposes`.
+pub async fn connect_mutual_client_under(
+	addr: SocketAddr,
+	server_certificate: &Certificate,
+	client: &ClientMaterials,
+	key_purposes: KeyPurposes,
+) -> Result<TcpTransport<TokioStream>, TightBeamError> {
 	let builder = pinned_client(server_certificate)?.with_client_identity(client.identity());
+	let builder = builder.with_key_purposes(key_purposes);
 	let stream = TcpStream::connect(addr).await?;
 
 	let adopted = builder.adopt(TokioStream::from(stream))?;
@@ -203,7 +240,22 @@ pub async fn establish_mutual_transports(
 ) -> Result<MutualTransports, TightBeamError> {
 	let materials = ServerMaterials::generate();
 	let client_materials = ClientMaterials::generate();
-	let (listener, addr) = bind_mutual_listener(&materials, &client_materials.certificate).await?;
+	let key_purposes = KeyPurposes::HOUSE;
+	establish_mutual_transports_of(client_offer, server_offer, hooks, &materials, &client_materials, key_purposes).await
+}
+
+/// Establish a mutual-auth pair in which the server presents `materials`,
+/// the client presents `client_materials`, and both endpoints admit each
+/// role under `key_purposes`.
+pub async fn establish_mutual_transports_of(
+	client_offer: TransportOffer,
+	server_offer: TransportOffer,
+	hooks: MutualSessionHooks,
+	materials: &ServerMaterials,
+	client_materials: &ClientMaterials,
+	key_purposes: KeyPurposes,
+) -> Result<MutualTransports, TightBeamError> {
+	let (listener, addr) = bind_mutual_listener_under(materials, &client_materials.certificate, key_purposes).await?;
 
 	#[cfg(feature = "instrument")]
 	let server_trace = hooks.trace.as_ref().map(TraceCollector::share);
@@ -228,7 +280,7 @@ pub async fn establish_mutual_transports(
 		Ok::<_, TightBeamError>(transport)
 	});
 
-	let mut client = connect_mutual_client(addr, &materials.certificate, &client_materials).await?;
+	let mut client = connect_mutual_client_under(addr, &materials.certificate, client_materials, key_purposes).await?;
 	client = client.with_mux_offer(Some(client_offer));
 
 	if let Some(approver) = hooks.approver {

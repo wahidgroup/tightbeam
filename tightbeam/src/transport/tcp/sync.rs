@@ -338,7 +338,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> EncryptedProtocol for TcpListene
 	) -> Result<(Self::Listener, <Self as Protocol>::Address), <Self as Protocol>::Error> {
 		let listener = NetTcpListener::bind(addr.0)?;
 		let bound_addr = listener.local_addr()?;
-		let config = EndpointConfig::from(config);
+		let config = EndpointConfig::try_from(config).map_err(std::io::Error::other)?;
 
 		Ok((TcpListener { listener, config }, TightBeamSocketAddr(bound_addr)))
 	}

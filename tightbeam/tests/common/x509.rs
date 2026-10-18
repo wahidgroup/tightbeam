@@ -35,7 +35,9 @@ use tightbeam::{
 	Frame, TightBeamError,
 };
 
-/// Create a test certificate with signing key for a given subject and validity period
+/// Create a self-issued end-entity test certificate with its signing key
+/// for a given subject and validity period. Its `keyUsage` asserts
+/// `digitalSignature`, so a handshake admits it for signing.
 pub fn create_test_cert_with_key(
 	subject: impl AsRef<str>,
 	validity_days: u64,
@@ -48,12 +50,13 @@ pub fn create_test_cert_with_key(
 	let validity_duration = Duration::from_secs(validity_days * 24 * 60 * 60);
 
 	let cert = cert! {
-		profile: Root,
+		profile: Leaf,
 		subject: subject,
+		issuer: subject,
 		serial: 1u32,
 		duration: validity_duration,
-		signer: &sha3_signer,
-		subject_public_key: spki
+		subject_public_key: spki,
+		signer: &sha3_signer
 	}?;
 
 	Ok((cert, signing_key))

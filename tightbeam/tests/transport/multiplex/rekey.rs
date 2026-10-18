@@ -5,8 +5,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use tightbeam::at_least;
-use tightbeam::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1VerifyingKey};
+use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::crypto::sign::elliptic_curve::sec1::ToEncodedPoint;
+use tightbeam::crypto::x509::{KeyPurposes, PeerCertificate, Signing};
 use tightbeam::der::asn1::OctetString;
 use tightbeam::der::Encode;
 use tightbeam::exactly;
@@ -24,10 +25,10 @@ use tightbeam::utils::marker::MaybeSendFuture;
 use tightbeam::TightBeamError;
 use tokio::time::timeout;
 
-use crate::common::security::expectation_failure;
+use crate::common::security::{expectation_failure, ClientMaterials, ServerMaterials};
 use crate::transport::support::{
-	await_receipt_rotation, await_transport, establish_mutual_transports, mux_frame, mux_offer, MutualSessionHooks,
-	MutualTransports,
+	await_receipt_rotation, await_transport, establish_mutual_transports, establish_mutual_transports_of, mux_frame,
+	mux_offer, MutualSessionHooks, MutualTransports,
 };
 
 use super::common::*;
@@ -456,8 +457,10 @@ tb_scenario! {
 			let session = establish_renewal_session(MutualSessionHooks::default()).await?;
 			let handshake_receipt = session.client.session_receipt();
 			let initial = handshake_receipt.map(|receipt| receipt.to_owned());
-			let server_certificate = session.server_certificate.to_owned();
-			let client_certificate = session.client_certificate.to_owned();
+			let server_certificate: PeerCertificate<Signing<DefaultCryptoProvider>> =
+				PeerCertificate::parse(session.server_certificate.to_owned(), KeyPurposes::HOUSE.server)?;
+			let client_certificate: PeerCertificate<Signing<DefaultCryptoProvider>> =
+				PeerCertificate::parse(session.client_certificate.to_owned(), KeyPurposes::HOUSE.client)?;
 			let pair = spawn_echo_pair_with(session.client, session.server, rekey_config(), rekey_config(), trace.share())?;
 
 			let first_batch = emit_series(&pair.client.handle, "rekey-chain-a", 5).await?;
@@ -477,10 +480,7 @@ tb_scenario! {
 			trace.event_with(CONSECUTIVE_EPOCHS_ROTATE_DISTINCT_RECEIPTS, &[], distinct)?;
 
 			let latest = second.ok_or_else(|| expectation_failure("second renewal must rotate the receipt"))?;
-			let verdict = latest.verify::<Secp256k1Signature, Secp256k1VerifyingKey>(
-				&server_certificate,
-				&client_certificate,
-			);
+			let verdict = latest.verify(&server_certificate, &client_certificate);
 
 			trace.event_with(
 				CHAINED_RECEIPT_VERIFIES_AGAINST_ORIGINAL_CERTS,
@@ -852,4 +852,39 @@ tb_scenario! {
 			Ok(())
 		}
 	}
+}
+
+/// A mutual session whose server certificate names the house server purpose
+/// alone and whose client certificate names the house client purpose alone.
+async fn establish_purposed_session() -> Result<MutualTransports, TightBeamError> {
+	let materials = ServerMaterials::generate().with_key_purpose(KeyPurposes::HOUSE.server);
+	let client_materials = ClientMaterials::generate().with_key_purpose(KeyPurposes::HOUSE.client);
+
+	let client_offer = chunked_offer(1).with_budgets(AMPLE_BUDGETS);
+	let server_offer = chunked_offer(1).with_budgets(AMPLE_BUDGETS);
+	let hooks = MutualSessionHooks::default();
+	let key_purposes = KeyPurposes::HOUSE;
+	establish_mutual_transports_of(client_offer, server_offer, hooks, &materials, &client_materials, key_purposes).await
+}
+
+/// The client reads its server's certificate under the server purpose, so a
+/// certificate of that purpose alone yields the client's rekey materials.
+#[tokio::test]
+async fn a_client_detaches_its_rekey_materials_under_the_server_purpose() -> Result<(), TightBeamError> {
+	let MutualTransports { mut client, .. } = establish_purposed_session().await?;
+
+	let rekey = MuxConnector::take_rekey(&mut client)?;
+	assert!(rekey.is_some());
+	Ok(())
+}
+
+/// The server reads its client's certificate under the client purpose, so a
+/// certificate of that purpose alone yields the server's rekey materials.
+#[tokio::test]
+async fn a_server_detaches_its_rekey_materials_under_the_client_purpose() -> Result<(), TightBeamError> {
+	let MutualTransports { mut server, .. } = establish_purposed_session().await?;
+
+	let rekey = MuxAcceptor::take_rekey(&mut server)?;
+	assert!(rekey.is_some());
+	Ok(())
 }

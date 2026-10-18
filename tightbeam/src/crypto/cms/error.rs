@@ -124,10 +124,15 @@ pub enum EnvelopeError {
 	#[error("KDF error: {0}")]
 	Kdf(crate::crypto::kdf::KdfError),
 
-	/// The certificate failed to name its recipient, or holds no point on
-	/// secp256k1.
+	/// The certificate is refused for key agreement, holds no key of the KEM,
+	/// or fails to name its recipient.
 	#[error("Certificate error: {0}")]
 	Certificate(crate::crypto::x509::error::CertificateValidationError),
+
+	/// The public half of a key-agreement backend differs from the key of the
+	/// certificate it is paired with.
+	#[error("The backend's public key differs from the certificate's key")]
+	KeyMismatch,
 
 	/// A structure or an attribute failed to encode or decode.
 	#[error("CMS encoding error: {0}")]

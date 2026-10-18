@@ -18,6 +18,7 @@ use tightbeam::crypto::kdf::HkdfSha3_256;
 use tightbeam::crypto::profiles::{Aes128Wrap, SecurityProfile, SecurityProfileDesc};
 use tightbeam::crypto::sign::ecdsa::Secp256k1Signature;
 use tightbeam::crypto::sign::SigningIdentity;
+use tightbeam::crypto::x509::KeyPurposes;
 use tightbeam::exactly;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_scenario;
@@ -103,8 +104,9 @@ tb_scenario! {
 			let mut client = Handshake::client(config);
 
 			let settings = HpkeServerSettings::new();
+			let purposes = KeyPurposes::HOUSE;
 			let server_config =
-				ServerConfig::<Hpke, Aes256Sha3_512Provider>::new(settings, server_identity, server_profiles);
+				ServerConfig::<Hpke, Aes256Sha3_512Provider>::new(settings, server_identity, server_profiles, purposes)?;
 			let mut server = Handshake::server(server_config);
 
 			let opening = client.start()?;

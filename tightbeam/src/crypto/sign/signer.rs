@@ -40,6 +40,7 @@ use crate::crypto::sign::{
 	CertifiedKey, PrehashSigner, PrehashVerifier, SignatureAlgorithmIdentifier, SignatureEncoding, SignerError,
 };
 use crate::crypto::x509::utils::CertificateExt;
+use crate::crypto::x509::{ErasedSigning, PeerCertificate, Signing};
 use crate::der::asn1::{ObjectIdentifier, OctetString, SetOfVec};
 use crate::der::oid::AssociatedOid;
 use crate::der::{Any, Encode, Sequence, Tag, Tagged};
@@ -48,7 +49,7 @@ use crate::der::{AnyRef, Decode, Header, Reader, SliceReader, TagNumber};
 use crate::error::ReceivedExpectedError;
 use crate::frame::Signed;
 use crate::oids::{ATTR_CMS_ALGORITHM_PROTECTION, ATTR_CONTENT_TYPE, ATTR_MESSAGE_DIGEST, DATA};
-use crate::spki::{AlgorithmIdentifierOwned, DecodePublicKey};
+use crate::spki::{AlgorithmIdentifierOwned, DecodePublicKey, SubjectPublicKeyInfoRef};
 use crate::x509::attr::Attribute;
 use crate::x509::Certificate;
 
@@ -475,34 +476,60 @@ impl CmsSigner {
 		)?)
 	}
 
-	/// Verify that `signer_info` names `certificate`, and verify it over
-	/// `content` under `key`, the key of that certificate.
+	/// Verify that `signer_info` names `signer`, a certificate admitted for
+	/// signing under `P`, and verify it over `content` under the key of that
+	/// certificate.
 	///
 	/// # Errors
 	///
 	/// - [`SignerError::Certificate`] -- the certificate's key identifier fails to decode.
 	/// - [`SignerError::SignerIdentifier`] -- the `sid` names another certificate.
 	/// - The errors of [`Self::verify`].
-	pub fn verify_signer<S, V>(
+	pub fn verify_signer<P>(
 		signer_info: &SignerInfo,
-		certificate: &Certificate,
-		key: &V,
+		signer: &PeerCertificate<Signing<P>>,
 		content: SignedContent<'_>,
 	) -> Result<VerifiedSignature, SignerError>
 	where
-		S: CanonicalForm + SignatureEncoding + SignatureAlgorithmIdentifier,
-		V: PrehashVerifier<S> + ?Sized,
+		P: SigningProvider,
+		P::VerifyingKey: for<'a> TryFrom<SubjectPublicKeyInfoRef<'a>, Error = crate::spki::Error>,
 	{
-		Self::expect_signer(signer_info, certificate)?;
-		Self::verify::<S, V>(signer_info, key, content)
+		Self::expect_signer(signer_info, signer.certificate())?;
+		Self::verify::<P::Signature, _>(signer_info, &signer.key, content)
 	}
 
-	/// Verify `signer_info` over `content` under `certificate`, with the
-	/// algorithms of `policy`.
+	/// Verify the one `SignerInfo` of `signed_data` over `content` under the
+	/// key of `signer`, which its `sid` must name.
+	///
+	/// A handshake message carries exactly one signer, so every handshake
+	/// signature verifies here.
+	///
+	/// # Errors
+	///
+	/// - [`SignerError::SignerIdentifier`] -- `signed_data` does not have
+	///   exactly one signer, or its `sid` names another certificate.
+	/// - The errors of [`Self::verify_signer`].
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	pub(crate) fn verify_sole_signer<P>(
+		signed_data: &SignedData,
+		signer: &PeerCertificate<Signing<P>>,
+		content: SignedContent<'_>,
+	) -> Result<VerifiedSignature, SignerError>
+	where
+		P: SigningProvider,
+		P::VerifyingKey: for<'a> TryFrom<SubjectPublicKeyInfoRef<'a>, Error = crate::spki::Error>,
+	{
+		let signer_info = Self::sole_signer(signed_data)?;
+		Self::verify_signer::<P>(signer_info, signer, content)
+	}
+
+	/// Verify `signer_info` over `content` under `signer`, a certificate
+	/// admitted for signing, with the algorithms of `policy`.
 	///
 	/// The verifier names the algorithms at run time, so the policy digests
 	/// the content and verifies the signature by the pair the `SignerInfo`
-	/// names, and refuses a pair it does not hold.
+	/// names, and refuses a pair it does not hold. It reads the key from the
+	/// certificate's SPKI at each verify, which is the cost of the erasure.
 	///
 	/// # Errors
 	///
@@ -515,10 +542,11 @@ impl CmsSigner {
 	/// - [`SignerError::Encoding`] -- an attribute or the public key fails to encode.
 	pub fn verify_with_policy(
 		signer_info: &SignerInfo,
-		certificate: &Certificate,
+		signer: &PeerCertificate<ErasedSigning>,
 		policy: &dyn VerificationPolicy,
 		content: SignedContent<'_>,
 	) -> Result<VerifiedSignature, SignerError> {
+		let certificate = signer.certificate();
 		Self::expect_signer(signer_info, certificate)?;
 
 		let signature_oid = signer_info.signature_algorithm.oid;

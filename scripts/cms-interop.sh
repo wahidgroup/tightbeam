@@ -3,22 +3,34 @@
 #
 # The samples come from the test
 # `the_emitted_structures_write_their_interop_samples`, which writes one
-# `ContentInfo` per structure to target/cms-samples/, and the server and
-# client certificates as server-certificate.crt and client-certificate.crt,
-# when the environment holds TIGHTBEAM_CMS_SAMPLES. `make interop` runs both
-# steps:
+# `ContentInfo` per structure to target/cms-samples/, and the DER of three
+# certificates, when the environment holds TIGHTBEAM_CMS_SAMPLES. `make
+# interop` runs both steps:
 #
 #   TIGHTBEAM_CMS_SAMPLES=1 cargo test -p tightbeam-rs --all-features --lib \
 #     the_emitted_structures_write_their_interop_samples
 #   scripts/cms-interop.sh
 #
+# Each certificate carries the keyUsage bit of its one use:
+#
+#   server-certificate.crt                 digitalSignature, signs the reply
+#   server-key-agreement-certificate.crt   keyAgreement, receives the opening
+#   client-certificate.crt                 digitalSignature, signs the closing
+#
+# The script parses each with `openssl x509` and reads its keyUsage. It reads
+# the subjectKeyIdentifier of both server certificates. It parses the
+# KEMRecipientInfo of the cms-opening sample with `openssl asn1parse
+# -strparse`, reads its rid, and checks that the rid is the [0]
+# subjectKeyIdentifier of the key-agreement certificate and not that of the
+# signing certificate.
+#
 # For each sample, the script runs `openssl asn1parse` and
 # `openssl cms -cmsout -print`. For each SignedData sample it also runs
-# `openssl cms -verify -noverify -binary`, with the server and client
-# certificates as a -certfile for a signer that embeds no certificate. The
-# receipt both ends signed needs both. -noverify skips the chain to a trust
-# anchor, so the check covers the signature, the signed attributes, and the
-# content digest. It prints one result line per sample.
+# `openssl cms -verify -noverify -binary`, with the server signing certificate
+# and the client certificate as a -certfile for a signer that embeds no
+# certificate. The receipt both ends signed needs both. -noverify skips the
+# chain to a trust anchor, so the check covers the signature, the signed
+# attributes, and the content digest. It prints one result line per sample.
 #
 # For each AuthEnvelopedData sample under a KEKRecipientInfo, the test also
 # writes the KEK, the kekid, and the expected plaintext, from fixed test keys,
@@ -51,7 +63,9 @@
 #
 # The script exits non-zero when a sample fails `asn1parse`, fails the CMS
 # parse under either tagging, fails to verify, fails to decrypt to its
-# expected plaintext, or when a sample of `required` is absent.
+# expected plaintext, when a certificate lacks the bit of its use, when the
+# opening's rid names another certificate, or when a sample of `required` is
+# absent.
 # It has no dependency on the crate.
 #
 # References:
@@ -82,10 +96,25 @@ required=(
 	cms-opening server-finished session-receipt sealed-finished kek-seal frame-signature joined-receipt
 	hpke-hello hpke-reply hpke-closing
 )
+
+# Each certificate the samples name, beside the keyUsage bit of its use as
+# OpenSSL prints it.
+certificates=(
+	"server-certificate:Digital Signature"
+	"server-key-agreement-certificate:Key Agreement"
+	"client-certificate:Digital Signature"
+)
+
 absent=0
 for name in "${required[@]}"; do
 	if [ ! -f "$SAMPLE_DIR/$name.der" ]; then
 		echo "cms-interop: no $name sample in $SAMPLE_DIR" >&2
+		absent=$((absent + 1))
+	fi
+done
+for entry in "${certificates[@]}"; do
+	if [ ! -f "$SAMPLE_DIR/${entry%%:*}.crt" ]; then
+		echo "cms-interop: no ${entry%%:*} certificate in $SAMPLE_DIR" >&2
 		absent=$((absent + 1))
 	fi
 done
@@ -96,13 +125,41 @@ fi
 scratch="$(mktemp -d)"
 trap 'rm -rf "$scratch"' EXIT
 
-signers_pem=""
+signers_pem="$scratch/signers.pem"
 for certificate in "$SAMPLE_DIR/server-certificate.crt" "$SAMPLE_DIR/client-certificate.crt"; do
-	if [ -f "$certificate" ]; then
-		signers_pem="$scratch/signers.pem"
-		"$OPENSSL" x509 -inform DER -in "$certificate" >> "$signers_pem"
-	fi
+	"$OPENSSL" x509 -inform DER -in "$certificate" >> "$signers_pem"
 done
+
+# Print the keyUsage names a certificate sample asserts, comma-separated.
+key_usage() {
+	"$OPENSSL" x509 -inform DER -in "$1" -noout -ext keyUsage 2> /dev/null | tail -n +2 | sed 's/^ *//'
+}
+
+# Print the subjectKeyIdentifier of a certificate sample as lowercase hex.
+key_identifier() {
+	"$OPENSSL" x509 -inform DER -in "$1" -noout -ext subjectKeyIdentifier 2> /dev/null |
+		tail -n +2 | tr -d ' :\n' | tr 'A-F' 'a-f'
+}
+
+# Print the rid of the KEMRecipientInfo in the opening sample `$1`, as
+# lowercase hex, when it is the [0] subjectKeyIdentifier form (RFC 9629
+# section 3, RFC 5652 section 6.2.1). The KEMRecipientInfo is the value that
+# follows the id-ori-kem OID. The parse is re-rooted there, and the rid is
+# its second field.
+opening_rid() {
+	local sample="$1" recipient="$scratch/kem-recipient-info.der" offset field header length
+	offset="$("$OPENSSL" asn1parse -inform DER -in "$sample" | awk '
+		/:(1\.2\.840\.113549\.1\.9\.16\.13\.3|id-ori-kem|id-smime-ori-kem)[[:space:]]*$/ { found = 1; next }
+		found { split($1, at, ":"); print at[1]; exit }')"
+	[ -n "$offset" ] || return 1
+	"$OPENSSL" asn1parse -inform DER -in "$sample" -strparse "$offset" -noout -out "$recipient" > /dev/null || return 1
+
+	field="$("$OPENSSL" asn1parse -inform DER -in "$recipient" | awk '/:d=1 / { count++ } count == 2 { print; exit }')"
+	printf '%s\n' "$field" | grep -q 'prim: cont \[ 0 \]' || return 1
+	read -r offset header length < <(printf '%s\n' "$field" |
+		sed -E 's/^ *([0-9]+):d=[0-9]+ +hl= *([0-9]+) +l= *([0-9]+) .*$/\1 \2 \3/')
+	od -An -tx1 -v -j "$((offset + header))" -N "$length" "$recipient" | tr -d ' \n'
+}
 
 # Print the content type and the first recipient kind of a parsed sample.
 summary() {
@@ -164,6 +221,34 @@ echo "cms-interop: $("$OPENSSL" version)"
 failures=0
 deviations=0
 unauthenticated=0
+for entry in "${certificates[@]}"; do
+	name="${entry%%:*}"
+	bit="${entry#*:}"
+	if ! usage="$(key_usage "$SAMPLE_DIR/$name.crt")" || [ -z "$usage" ]; then
+		printf '%-34s x509 parse FAILED, or no keyUsage\n' "$name"
+		failures=$((failures + 1))
+	elif printf '%s\n' "$usage" | grep -q "$bit"; then
+		printf '%-34s x509 parses, keyUsage %s, the bit of its use\n' "$name" "$usage"
+	else
+		printf '%-34s x509 parses, keyUsage %s, lacks %s FAILED\n' "$name" "$usage" "$bit"
+		failures=$((failures + 1))
+	fi
+done
+
+agreement_id="$(key_identifier "$SAMPLE_DIR/server-key-agreement-certificate.crt")"
+signing_id="$(key_identifier "$SAMPLE_DIR/server-certificate.crt")"
+if ! rid="$(opening_rid "$SAMPLE_DIR/cms-opening.der")" || [ -z "$rid" ]; then
+	echo "cms-opening rid: asn1parse parses no [0] subjectKeyIdentifier from the KEMRecipientInfo FAILED"
+	failures=$((failures + 1))
+elif [ -z "$agreement_id" ] || [ -z "$signing_id" ]; then
+	echo "cms-opening rid: a server certificate carries no subjectKeyIdentifier FAILED"
+	failures=$((failures + 1))
+elif [ "$rid" = "$agreement_id" ] && [ "$rid" != "$signing_id" ]; then
+	echo "cms-opening rid: asn1parse parses the KEMRecipientInfo rid as the subjectKeyIdentifier of server-key-agreement-certificate, not of server-certificate"
+else
+	echo "cms-opening rid: asn1parse parses the KEMRecipientInfo rid as another certificate's subjectKeyIdentifier FAILED"
+	failures=$((failures + 1))
+fi
 for sample in "${samples[@]}"; do
 	name="$(basename "$sample" .der)"
 

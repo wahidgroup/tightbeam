@@ -15,8 +15,9 @@ use std::sync::Arc;
 
 use tightbeam::asn1::Any;
 use tightbeam::cms::signed_data::{SignedData, SignerInfo};
-use tightbeam::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1VerifyingKey};
+use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::crypto::sign::Signed;
+use tightbeam::crypto::x509::{KeyPurposes, PeerCertificate, Signing};
 use tightbeam::der::asn1::{OctetString, SetOfVec};
 use tightbeam::der::{Decode, Encode};
 use tightbeam::exactly;
@@ -248,7 +249,11 @@ fn third_party_verifies(
 		return Ok(false);
 	};
 
-	let verdict = stored.verify::<Secp256k1Signature, Secp256k1VerifyingKey>(server_certificate, client_certificate);
+	let server = server_certificate.to_owned();
+	let server = PeerCertificate::<Signing<DefaultCryptoProvider>>::parse(server, KeyPurposes::HOUSE.server)?;
+	let client = client_certificate.to_owned();
+	let client = PeerCertificate::<Signing<DefaultCryptoProvider>>::parse(client, KeyPurposes::HOUSE.client)?;
+	let verdict = stored.verify(&server, &client);
 	Ok(verdict.is_ok())
 }
 

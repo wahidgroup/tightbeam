@@ -13,10 +13,7 @@ use std::time::Duration;
 
 use tightbeam::{
 	compress::{Inflator, ZstdCompression},
-	crypto::{
-		aead::Aes256Gcm,
-		sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey, Secp256k1VerifyingKey},
-	},
+	crypto::{aead::Aes256Gcm, sign::ecdsa::Secp256k1SigningKey},
 	decode,
 	prelude::*,
 	servlet,
@@ -28,6 +25,7 @@ use tightbeam::{
 use crate::common::poll::poll_until;
 use crate::common::security::expectation_failure;
 use crate::dtn::{
+	certs::FrameSigner,
 	chain_processor::{ChainProcessor, ProcessResult},
 	clock::mission_time_ms,
 	events::{
@@ -59,7 +57,7 @@ trait DtnNode {
 	// Abstract methods (each servlet config implements)
 	fn node_name(&self) -> &str;
 	fn signing_key(&self) -> &Secp256k1SigningKey;
-	fn verifying_keys(&self) -> Vec<&Secp256k1VerifyingKey>;
+	fn signers(&self) -> Vec<&FrameSigner>;
 	fn cipher(&self) -> &Aes256Gcm;
 	fn chain_processor(&self) -> &Arc<ChainProcessor>;
 	fn frame_builder(&self) -> &Arc<FrameBuilderHelper>;
@@ -70,8 +68,8 @@ trait DtnNode {
 			return Ok(false);
 		}
 
-		for key in self.verifying_keys() {
-			if frame.verify::<Secp256k1Signature>(key).is_ok() {
+		for signer in self.signers() {
+			if frame.verify(signer).is_ok() {
 				return Ok(true);
 			}
 		}
@@ -157,8 +155,8 @@ async fn wait_for_address(
 #[derive(Clone)]
 pub struct MissionControlServletConfig {
 	pub mission_control_signing_key: Secp256k1SigningKey,
-	pub rover_verifying_key: Secp256k1VerifyingKey,
-	pub earth_relay_verifying_key: Secp256k1VerifyingKey,
+	pub rover_signer: FrameSigner,
+	pub earth_relay_signer: FrameSigner,
 	pub shared_cipher: Aes256Gcm,
 	pub chain_processor: Arc<ChainProcessor>,
 	pub frame_builder: Arc<FrameBuilderHelper>,
@@ -296,8 +294,8 @@ impl DtnNode for MissionControlServletConfig {
 		&self.mission_control_signing_key
 	}
 
-	fn verifying_keys(&self) -> Vec<&Secp256k1VerifyingKey> {
-		vec![&self.rover_verifying_key, &self.earth_relay_verifying_key]
+	fn signers(&self) -> Vec<&FrameSigner> {
+		vec![&self.rover_signer, &self.earth_relay_signer]
 	}
 
 	fn cipher(&self) -> &Aes256Gcm {
@@ -316,9 +314,9 @@ impl DtnNode for MissionControlServletConfig {
 #[derive(Clone)]
 pub struct EarthRelaySatelliteServletConfig {
 	pub earth_relay_signing_key: Secp256k1SigningKey,
-	pub mission_control_verifying_key: Secp256k1VerifyingKey,
-	pub mars_relay_verifying_key: Secp256k1VerifyingKey,
-	pub rover_verifying_key: Secp256k1VerifyingKey,
+	pub mission_control_signer: FrameSigner,
+	pub mars_relay_signer: FrameSigner,
+	pub rover_signer: FrameSigner,
 	pub shared_cipher: Aes256Gcm,
 	pub mars_relay_addr: TightBeamSocketAddr,
 	pub mission_control_addr: Arc<RwLock<Option<TightBeamSocketAddr>>>,
@@ -337,9 +335,9 @@ servlet! {
 		let config: &EarthRelaySatelliteServletConfig = ctx.env_config();
 		// Verify signature and determine source
 		let from_mission_control = if frame.nonrepudiation().is_some() {
-			if frame.verify::<Secp256k1Signature>(&config.mission_control_verifying_key).is_ok() {
+			if frame.verify(&config.mission_control_signer).is_ok() {
 				true
-			} else if frame.verify::<Secp256k1Signature>(&config.rover_verifying_key).is_ok() {
+			} else if frame.verify(&config.rover_signer).is_ok() {
 				false
 			} else {
 				return Err(TightBeamError::MissingSignature);
@@ -505,12 +503,8 @@ impl DtnNode for EarthRelaySatelliteServletConfig {
 		&self.earth_relay_signing_key
 	}
 
-	fn verifying_keys(&self) -> Vec<&Secp256k1VerifyingKey> {
-		vec![
-			&self.mission_control_verifying_key,
-			&self.mars_relay_verifying_key,
-			&self.rover_verifying_key,
-		]
+	fn signers(&self) -> Vec<&FrameSigner> {
+		vec![&self.mission_control_signer, &self.mars_relay_signer, &self.rover_signer]
 	}
 
 	fn cipher(&self) -> &Aes256Gcm {
@@ -529,9 +523,9 @@ impl DtnNode for EarthRelaySatelliteServletConfig {
 #[derive(Clone)]
 pub struct MarsRelaySatelliteServletConfig {
 	pub mars_relay_signing_key: Secp256k1SigningKey,
-	pub mission_control_verifying_key: Secp256k1VerifyingKey,
-	pub earth_relay_verifying_key: Secp256k1VerifyingKey,
-	pub rover_verifying_key: Secp256k1VerifyingKey,
+	pub mission_control_signer: FrameSigner,
+	pub earth_relay_signer: FrameSigner,
+	pub rover_signer: FrameSigner,
 	pub shared_cipher: Aes256Gcm,
 	pub rover_addr: TightBeamSocketAddr,
 	pub earth_relay_addr: Arc<RwLock<Option<TightBeamSocketAddr>>>,
@@ -551,9 +545,9 @@ servlet! {
 		// Verify signature and determine source Earth Relay forwards messages,
 		// so could be from Mission Control or Rover
 		let from_rover = if frame.nonrepudiation().is_some() {
-			if frame.verify::<Secp256k1Signature>(&config.rover_verifying_key).is_ok() {
+			if frame.verify(&config.rover_signer).is_ok() {
 				true
-			} else if frame.verify::<Secp256k1Signature>(&config.mission_control_verifying_key).is_ok() {
+			} else if frame.verify(&config.mission_control_signer).is_ok() {
 				false
 			} else {
 				return Err(TightBeamError::MissingSignature);
@@ -731,12 +725,8 @@ impl DtnNode for MarsRelaySatelliteServletConfig {
 		&self.mars_relay_signing_key
 	}
 
-	fn verifying_keys(&self) -> Vec<&Secp256k1VerifyingKey> {
-		vec![
-			&self.mission_control_verifying_key,
-			&self.earth_relay_verifying_key,
-			&self.rover_verifying_key,
-		]
+	fn signers(&self) -> Vec<&FrameSigner> {
+		vec![&self.mission_control_signer, &self.earth_relay_signer, &self.rover_signer]
 	}
 
 	fn cipher(&self) -> &Aes256Gcm {
@@ -757,8 +747,8 @@ pub struct RoverServletConfig {
 	pub mars_relay_addr: TightBeamSocketAddr,
 	pub mars_relay_pool: Arc<ConnectionPool<TokioListener>>,
 	pub rover_signing_key: Secp256k1SigningKey,
-	pub mission_control_verifying_key: Secp256k1VerifyingKey,
-	pub mars_relay_verifying_key: Secp256k1VerifyingKey,
+	pub mission_control_signer: FrameSigner,
+	pub mars_relay_signer: FrameSigner,
 	pub shared_cipher: Aes256Gcm,
 	pub chain_processor: Arc<ChainProcessor>,
 	// TODO
@@ -776,8 +766,8 @@ servlet! {
 		let config: &RoverServletConfig = ctx.env_config();
 		// Verify signature
 		if frame.nonrepudiation().is_some()
-			&& frame.verify::<Secp256k1Signature>(&config.mission_control_verifying_key).is_err()
-			&& frame.verify::<Secp256k1Signature>(&config.mars_relay_verifying_key).is_err()
+			&& frame.verify(&config.mission_control_signer).is_err()
+			&& frame.verify(&config.mars_relay_signer).is_err()
 		{
 			return Err(TightBeamError::MissingSignature);
 		}
@@ -884,8 +874,8 @@ impl DtnNode for RoverServletConfig {
 		&self.rover_signing_key
 	}
 
-	fn verifying_keys(&self) -> Vec<&Secp256k1VerifyingKey> {
-		vec![&self.mission_control_verifying_key, &self.mars_relay_verifying_key]
+	fn signers(&self) -> Vec<&FrameSigner> {
+		vec![&self.mission_control_signer, &self.mars_relay_signer]
 	}
 
 	fn cipher(&self) -> &Aes256Gcm {

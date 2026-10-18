@@ -68,8 +68,8 @@ mod hpke {
 	use tightbeam::TightBeamError;
 
 	use crate::common::security::{
-		default_security_profile, flip_sealed_content, hpke_client_config, hpke_server_config, pinning_validator,
-		ClientMaterials, PayingApprover, RecordingObserver, ServerMaterials, SettleSpyAuthorizer,
+		default_security_profile, flip_sealed_content, hpke_client_config_presenting, hpke_server_config,
+		pinning_validator, ClientMaterials, PayingApprover, RecordingObserver, ServerMaterials, SettleSpyAuthorizer,
 	};
 
 	const CHALLENGE: &[u8] = b"evidence-invoice";
@@ -99,8 +99,8 @@ mod hpke {
 				let client_materials = ClientMaterials::deterministic();
 				let client_identity = client_materials.identity();
 
-				let mut config = hpke_client_config::<DefaultCryptoProvider>(pinning_validator(&materials.certificate));
-				config.flow.identity = Some(client_identity);
+				let validator = pinning_validator(&materials.certificate);
+				let mut config = hpke_client_config_presenting::<DefaultCryptoProvider>(validator, client_identity);
 				config.security_offer = Some(SecurityOffer::new(vec![profile]));
 				config.transport_offer = Some(TransportOffer::mux(4).with_budgets(REQUEST));
 				config.receipt_approver = Some(Arc::new(PayingApprover::answering(RESPONSE)?));

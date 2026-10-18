@@ -1,16 +1,18 @@
 //! The CMS flow.
 //!
-//! CMS exchanges the three containers themselves. The client seals the base
-//! secret to the server's certificate key on the opening, so the server
-//! identity is provisioned before the handshake starts.
+//! CMS exchanges the three containers themselves. A CMS server holds two
+//! certificates of one subject: its signing certificate and its key-agreement
+//! certificate. The client seals the base secret to the key-agreement
+//! certificate on the opening, so both are provisioned before the handshake
+//! starts, and the signing certificate verifies the reply.
 //!
 //! ## Opening
 //!
 //! The opening is an `AuthEnvelopedData` (RFC 5083) with one
-//! `KEMRecipientInfo` (RFC 9629) to the server's certificate key. Its content
-//! carries the base secret and the client's agreement ephemeral `R`, and its
-//! authenticated attributes carry the offers. Each client ephemeral serves one
-//! agreement:
+//! `KEMRecipientInfo` (RFC 9629) to the server's key-agreement certificate,
+//! under the provider's KEM. Its content carries the base secret and the
+//! client's agreement ephemeral `R`, and its authenticated attributes carry
+//! the offers. Each client ephemeral serves one agreement:
 //!
 //! - The KEM draws its own, whose shared secret derives the key that wraps
 //!   the content key alone (RFC 9629 §7).
@@ -24,7 +26,7 @@
 //! closes, as the HPKE client does.
 //!
 //! The client closes with the closing of both flows, sealed under the closing
-//! key of the handshake secret. The server's certificate key opens the base
+//! key of the handshake secret. The server's key-agreement key opens the base
 //! secret alone, so a recording plus that key reads no byte of the client
 //! identity.
 
@@ -38,6 +40,7 @@ use crate::crypto::cms::{AuthEnvelopedData, Opener, Recipient};
 use crate::crypto::secret::SecretSlice;
 use crate::crypto::sign::elliptic_curve::SecretKey;
 use crate::crypto::sign::{Signed, SigningIdentity};
+use crate::crypto::x509::{PeerCertificate, Signing};
 use crate::der::asn1::{BitString, OctetString};
 use crate::der::{Choice, Decode, DecodeValue, Encode, Error as DerError, Sequence};
 use crate::oids::HANDSHAKE_OPENING_CONTENT;
@@ -50,11 +53,11 @@ use crate::transport::handshake::flow::{
 	ReplyBinding, ReplyIntake, ReplyParts, ReplyVerified, ServerAgreement, ServerLegs,
 };
 use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer, TransportAccept, TransportOffer};
-use crate::transport::handshake::peer::{AdmittedServer, PeerCertificate, ProvisionedTrust};
+use crate::transport::handshake::peer::{AdmittedServer, ProvisionedServer, ProvisionedTrust};
 use crate::transport::handshake::primitives::transcript::{ServerFinishedLegs, Transcript};
 use crate::transport::handshake::primitives::TranscriptHash;
 use crate::transport::handshake::schedule::{Agreement, BaseSecret, FinishedRole, PeerPoint, Salt};
-use crate::transport::handshake::{HandshakeCurve, HandshakeMessage, HandshakeProvider};
+use crate::transport::handshake::{CmsIdentityPair, HandshakeCurve, HandshakeMessage, HandshakeProvider};
 use crate::transport::wire_der::WireDer;
 use crate::utils::marker::MaybeSendFuture;
 use crate::x509::attr::{Attribute, Attributes};
@@ -76,18 +79,19 @@ impl HandshakeFlow for Cms {}
 /// A CMS client signs its Finished, and the server verifies that signature
 /// under the certificate the Finished embeds, so the identity is mandatory.
 pub struct CmsClientSettings {
-	/// The provisioned server identity, beside the store that admits it.
+	/// The server's two provisioned certificates, beside the store that
+	/// admits them.
 	pub trust: ProvisionedTrust,
 	/// The identity the client presents and signs its Finished under.
 	pub identity: SigningIdentity,
 }
 
 /// What a CMS client keeps from its opening to read the reply against.
-pub struct CmsOpening<C: HandshakeCurve> {
+pub struct CmsOpening<P: HandshakeProvider> {
 	/// The transcript, open over the opening as it was sent.
 	transcript: Transcript,
 	/// The server the opening sealed to.
-	server: AdmittedServer<C>,
+	server: AdmittedServer<P>,
 }
 
 /// The secrets a CMS client holds from its opening to the agreement.
@@ -221,7 +225,7 @@ impl<T> ReceivedAttribute<T> {
 impl<P: HandshakeProvider> ClientLegs<P> for Cms {
 	type Settings = CmsClientSettings;
 	type Trust = ProvisionedTrust;
-	type Opening = CmsOpening<P::Curve>;
+	type Opening = CmsOpening<P>;
 	type Pending = Box<CmsPending<P::Curve>>;
 
 	fn identity(settings: &Self::Settings) -> Option<&SigningIdentity> {
@@ -234,7 +238,7 @@ impl<P: HandshakeProvider> ClientLegs<P> for Cms {
 
 	fn open(
 		_settings: &Self::Settings,
-		server: AdmittedServer<P::Curve>,
+		server: ProvisionedServer<P>,
 		parts: OpeningParts<'_>,
 		rng: &mut dyn CryptoRngCore,
 	) -> Result<Opened<Self, P>, HandshakeError> {
@@ -254,7 +258,7 @@ impl<P: HandshakeProvider> ClientLegs<P> for Cms {
 		let mut content_der = Zeroizing::new(content.to_der()?);
 		content.base_secret.into_bytes().zeroize();
 
-		// 4. Seal the content to the admitted server's certificate key, with
+		// 4. Seal the content to the admitted server's key-agreement key, with
 		//    each offer as an authenticated attribute. The client certificate
 		//    travels only in the sealed Finished.
 		let mut offers = Vec::new();
@@ -265,8 +269,8 @@ impl<P: HandshakeProvider> ClientLegs<P> for Cms {
 			offers.push(Attribute::try_from(HandshakeAttribute::encode(offer)?)?);
 		}
 
-		let certificate = server.identity().certificate();
-		let recipient = Recipient::Kem { certificate, ukm_label: TIGHTBEAM_OPENING_UKM_LABEL };
+		let (recipient, server) = server.into_recipient()?;
+		let recipient = Recipient::Kem { recipient: &recipient, ukm_label: TIGHTBEAM_OPENING_UKM_LABEL };
 		let content_type = HANDSHAKE_OPENING_CONTENT;
 		let content = core::mem::take(&mut *content_der);
 		let sealed = AuthEnvelopedData::seal::<P>(recipient, content_type, content, offers, Some(rng))?;
@@ -338,7 +342,7 @@ impl<P: HandshakeProvider> ClientLegs<P> for Cms {
 
 	fn verify_reply(
 		reply: &SignedData,
-		server: &PeerCertificate<P::Curve>,
+		server: &PeerCertificate<Signing<P>>,
 		transcript_hash: &TranscriptHash,
 	) -> Result<ReplyVerified, HandshakeError> {
 		FinishedRole::Server.verify::<P>(reply, server, transcript_hash)?;
@@ -361,8 +365,9 @@ impl<P: HandshakeProvider> ClientAgreement<P> for Box<CmsPending<P::Curve>> {
 
 /// What a CMS server is provisioned with.
 ///
-/// The shared server configuration covers the whole protocol: its signing
-/// identity signs the Finished, and the identity's key opens the opening.
+/// The shared server configuration covers the whole protocol: its
+/// [`CmsIdentityPair`] signs the Finished with one key, and opens the opening
+/// with the other.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CmsServerSettings;
 
@@ -396,6 +401,7 @@ pub struct CmsReplyDraft {
 
 impl<P: HandshakeProvider> ServerLegs<P> for Cms {
 	type Settings = CmsServerSettings;
+	type Identity = CmsIdentityPair<P::Kem>;
 	type Sealed = CmsSealed;
 	type Opened = Box<CmsOpened<P::Curve>>;
 	type Draft = CmsReplyDraft;
@@ -426,17 +432,17 @@ impl<P: HandshakeProvider> ServerLegs<P> for Cms {
 
 	fn open_opening<'a>(
 		sealed: Self::Sealed,
-		identity: &'a SigningIdentity,
+		identity: &'a CmsIdentityPair<P::Kem>,
 	) -> MaybeSendFuture<'a, Result<Self::Opened, HandshakeError>> {
 		Box::pin(async move {
 			let CmsSealed { opening, transcript } = sealed;
 
-			// 1. Open the content under the key of the server's certificate.
-			//    The opener refuses another recipient kind, another `ukm`
-			//    purpose, and an algorithm outside the profile before the key
-			//    provider runs, and the tag before any byte of the content is
-			//    read.
-			let opener = Opener::Kem { identity, ukm_label: TIGHTBEAM_OPENING_UKM_LABEL };
+			// 1. Open the content under the key of the server's key-agreement
+			//    certificate. The opener refuses another recipient kind,
+			//    another `ukm` purpose, and an algorithm outside the profile
+			//    before the backend runs, and the tag before any byte of the
+			//    content is read.
+			let opener = Opener::Kem { identity: identity.key_agreement(), ukm_label: TIGHTBEAM_OPENING_UKM_LABEL };
 			let (arrived, opening) = opening.into_parts();
 			let content = opening.open::<P>(arrived, &opener, HANDSHAKE_OPENING_CONTENT).await?;
 			let OpeningContent { base_secret, agreement_key } = content.with(|der| OpeningContent::from_der(der))?;
@@ -541,8 +547,9 @@ mod tests {
 	use crate::cms::content_info::{CmsVersion, ContentInfo};
 	use crate::cms::signed_data::{CertificateSet, SignerInfo};
 	use crate::constants::{TIGHTBEAM_CLOSING_KEY_ID_DOMAIN, TIGHTBEAM_SERVER_FINISHED_DOMAIN};
-	use crate::crypto::cms::{EnvelopeError, GcmParameters, KemRecipientInfo};
+	use crate::crypto::cms::{EnvelopeError, GcmParameters, KemRecipient, KemRecipientInfo};
 	use crate::crypto::hash::Sha3_256;
+	use crate::crypto::hpke::DhKemSecp256k1;
 	use crate::crypto::profiles::{DefaultCryptoProvider, SecurityProfileDesc};
 	use crate::crypto::secret::ToInsecure;
 	use crate::crypto::sign::ecdsa::k256::Secp256k1;
@@ -550,8 +557,11 @@ mod tests {
 	use crate::crypto::sign::elliptic_curve::sec1::ToEncodedPoint;
 	use crate::crypto::sign::elliptic_curve::PublicKey;
 	use crate::crypto::sign::{CmsSigner, SignedContent, SignerError};
+	use crate::crypto::x509::error::CertificateValidationError;
 	use crate::crypto::x509::policy::ExpiryValidator;
 	use crate::crypto::x509::utils::CertificateExt;
+	use crate::crypto::x509::KeyAgreement;
+	use crate::crypto::x509::KeyPurposes;
 	use crate::der::asn1::ObjectIdentifier;
 	use crate::der::Any;
 	use crate::der::{Choice, DecodeValue, EncodeValue, Tagged};
@@ -566,9 +576,10 @@ mod tests {
 	use crate::transport::handshake::schedule::{KeyConfirmation, Sealer, SecretSeal, TrafficSecret};
 	use crate::transport::handshake::tests::*;
 	use crate::transport::handshake::{
-		Client, ClientConfig, CmsServerIdentity, Handshake, HandshakeAlert, HandshakePhase, PeerAuthentication, Server,
-		ServerConfig, SupportedProfiles,
+		Client, ClientConfig, Handshake, HandshakeAlert, HandshakePhase, PeerAuthentication, Server, ServerConfig,
+		SupportedProfiles,
 	};
+	use crate::x509::ext::pkix::{KeyUsage, KeyUsages};
 	use crate::x509::Certificate;
 
 	/// The base secret a hand-built opening carries.
@@ -661,10 +672,10 @@ mod tests {
 	/// A client pinned to `server` that has sent its opening under `offer`,
 	/// with that opening.
 	fn client_after_opening(
-		server: &TestCertificate,
+		server: &TestServerIdentity,
 		offer: Option<SecurityOffer>,
 	) -> (TestClient<Cms>, WireDer<AuthEnvelopedData>) {
-		let mut config = Cms::client(&server.certificate, &create_test_certificate());
+		let mut config = Cms::client(server, &create_test_certificate());
 		config.security_offer = offer;
 
 		let mut client = Handshake::client(config);
@@ -856,7 +867,8 @@ mod tests {
 		let content = content.to_der().expect("the content encodes");
 		let attributes: Result<Vec<_>, _> = auth_attrs.into_iter().map(Attribute::try_from).collect();
 		let attributes = attributes.expect("each handshake attribute is an attribute");
-		let recipient = Recipient::Kem { certificate: server, ukm_label: TIGHTBEAM_OPENING_UKM_LABEL };
+		let recipient = recipient_of(server);
+		let recipient = Recipient::Kem { recipient: &recipient, ukm_label: TIGHTBEAM_OPENING_UKM_LABEL };
 
 		let sealed = AuthEnvelopedData::seal::<DefaultCryptoProvider>(
 			recipient,
@@ -866,6 +878,15 @@ mod tests {
 			None,
 		);
 		sealed.expect("the opening seals")
+	}
+
+	/// The KEM recipient of `certificate`, admitted for key agreement under
+	/// the house KEM.
+	fn recipient_of(certificate: &Certificate) -> KemRecipient<DhKemSecp256k1> {
+		let purpose = KeyPurposes::HOUSE.server;
+		let admitted = PeerCertificate::<KeyAgreement<DhKemSecp256k1>>::parse(certificate.to_owned(), purpose);
+		let admitted = admitted.expect("the test certificate is admitted for key agreement");
+		KemRecipient::from_certificate(admitted).expect("the test certificate names its recipient")
 	}
 
 	/// An unprotected attribute the server ignores, told apart by `arc`.
@@ -909,20 +930,20 @@ mod tests {
 	}
 
 	/// A server that holds `identity` under `peer_authentication`, with the
-	/// certificate a hand-built opening seals to.
+	/// key-agreement certificate a hand-built opening seals to.
 	fn server_with(
-		identity: &TestCertificate,
+		identity: &TestServerIdentity,
 		peer_authentication: PeerAuthentication,
 	) -> (TestServer<Cms>, Certificate) {
 		let mut config = Cms::server(identity);
 		config.peer_authentication = peer_authentication;
-		(Handshake::server(config), identity.certificate.to_owned())
+		(Handshake::server(config), identity.key_agreement.certificate.to_owned())
 	}
 
 	/// A server that demands no client certificate, with the certificate a
 	/// hand-built opening seals to.
 	fn anonymous_server() -> (TestServer<Cms>, Certificate) {
-		server_with(&create_test_certificate(), PeerAuthentication::Anonymous)
+		server_with(&create_test_server(), PeerAuthentication::Anonymous)
 	}
 
 	/// A server that has answered a hand-built opening, so it awaits the
@@ -979,7 +1000,7 @@ mod tests {
 	/// A server that holds `identity` under `peer_authentication` and has
 	/// answered a hand-built opening under the agreement key `ephemeral`.
 	async fn awaiting_finished(
-		identity: &TestCertificate,
+		identity: &TestServerIdentity,
 		peer_authentication: PeerAuthentication,
 		ephemeral: SecretKey<Secp256k1>,
 	) -> AwaitingFinished {
@@ -992,14 +1013,14 @@ mod tests {
 	/// hand-built opening under the agreement key `ephemeral` that carries
 	/// `offers`.
 	async fn awaiting_finished_under(
-		identity: &TestCertificate,
+		identity: &TestServerIdentity,
 		config: TestServerConfig<Cms>,
 		ephemeral: SecretKey<Secp256k1>,
 		offers: impl IntoIterator<Item = HandshakeAttribute>,
 	) -> AwaitingFinished {
 		let mut server = Handshake::server(config);
 		let sender = ephemeral.to_owned();
-		let sealed = build_test_opening_from(sender, &identity.certificate, &TEST_BASE_SECRET, offers);
+		let sealed = build_test_opening_from(sender, &identity.key_agreement.certificate, &TEST_BASE_SECRET, offers);
 
 		let replying = server.reply(opening(sealed)).await;
 		let reply = replying.expect("the server answers the opening");
@@ -1026,7 +1047,7 @@ mod tests {
 	/// A server that demands no client certificate and awaits the client
 	/// Finished of a fresh agreement key.
 	async fn server_awaiting_finished() -> AwaitingFinished {
-		let identity = create_test_certificate();
+		let identity = create_test_server();
 		let ephemeral = SecretKey::<Secp256k1>::random(&mut OsRng);
 		awaiting_finished(&identity, PeerAuthentication::Anonymous, ephemeral).await
 	}
@@ -1043,14 +1064,15 @@ mod tests {
 	}
 
 	/// The content of `finished` once its one signer verifies under the
-	/// certificate and key of `signer`.
+	/// certificate of `signer`, admitted for signing.
 	fn verified_content(finished: &SignedData, signer: &TestCertificate) -> Result<Vec<u8>, SignerError> {
 		let content = CmsSigner::content(finished, DATA)?;
 		let signer_info = finished.signer_infos.0.iter().next().ok_or(SignerError::Content)?;
-		let key = signer.signing_key.verifying_key();
+		let presented = signer.certificate.to_owned();
+		let purpose = KeyPurposes::HOUSE.server;
+		let certificate = PeerCertificate::<Signing<DefaultCryptoProvider>>::parse(presented, purpose)?;
 
-		let verifying = CmsSigner::verify_signer::<Secp256k1Signature, _>;
-		verifying(signer_info, &signer.certificate, key, SignedContent::data(content))?;
+		CmsSigner::verify_signer::<DefaultCryptoProvider>(signer_info, &certificate, SignedContent::data(content))?;
 		Ok(content.to_vec())
 	}
 
@@ -1062,12 +1084,12 @@ mod tests {
 	}
 
 	/// The opening carries the 32-byte base secret, and it opens under the
-	/// key of the certificate the client was pinned to.
+	/// key of the server's key-agreement certificate.
 	#[tokio::test]
-	async fn the_opening_opens_under_the_server_certificate_key() -> Result<(), Box<dyn Error>> {
-		let server = create_test_certificate();
+	async fn the_opening_opens_under_the_server_key_agreement_key() -> Result<(), Box<dyn Error>> {
+		let server = create_test_server();
 		let (_, sealed) = client_after_opening(&server, None);
-		let identity = signing_identity(&server);
+		let identity = server.key_agreement_identity();
 		let opener = Opener::Kem { identity: &identity, ukm_label: TIGHTBEAM_OPENING_UKM_LABEL };
 		let (arrived, sealed) = sealed.into_parts();
 		let opened = sealed.open::<DefaultCryptoProvider>(arrived, &opener, HANDSHAKE_OPENING_CONTENT);
@@ -1084,7 +1106,7 @@ mod tests {
 	/// itself.
 	#[test]
 	fn an_opening_ukm_is_the_opening_label_and_32_random_octets() {
-		let server = create_test_certificate();
+		let server = create_test_server();
 		let (_, sealed) = client_after_opening(&server, None);
 
 		let kem = sealed.value().kem_recipient();
@@ -1097,7 +1119,7 @@ mod tests {
 	/// covers.
 	#[test]
 	fn an_opening_carries_its_offers_in_the_authenticated_attributes() -> Result<(), Box<dyn Error>> {
-		let server = create_test_certificate();
+		let server = create_test_server();
 		let offer = SecurityOffer::new(vec![create_default_test_profile()]);
 		let (_, sealed) = client_after_opening(&server, Some(offer.to_owned()));
 
@@ -1107,25 +1129,29 @@ mod tests {
 		Ok(())
 	}
 
-	/// A client provisioned with a server its store does not hold refuses to
-	/// build the opening, and the refusal spends the client.
+	/// A client whose store refuses its provisioned server after the trust
+	/// was built refuses to build the opening, and the refusal spends the
+	/// client.
 	#[test]
-	fn a_refused_provisioned_server_leaves_the_client_spent() {
-		let trusted = create_test_certificate();
-		let stranger = create_test_certificate();
-		let mut config = Cms::client(&trusted.certificate, &create_test_certificate());
-		config.flow.trust.identity = CmsServerIdentity::Certificate(Arc::new(stranger.certificate));
+	fn a_refused_provisioned_server_leaves_the_client_spent() -> Result<(), Box<dyn Error>> {
+		let server = create_test_server();
+		let revocation = LaterRevocation::of(server.signing.certificate.to_owned());
+		let trust = ProvisionedTrust::new(server.certificates(), Arc::new(server.store_with(revocation.clone())))?;
+		revocation.revoke();
+		let identity = client_identity(&create_test_certificate());
+		let config = TestClientConfig::<Cms>::new(CmsClientSettings { trust, identity }, KeyPurposes::HOUSE)?;
 
 		let mut client = Handshake::client(config);
 		let refusal = client.start();
 		assert!(matches!(refusal, Err(HandshakeError::CertificateValidationError(_))));
 		assert_eq!(client.phase(), HandshakePhase::Spent);
 		assert!(matches!(client.start(), Err(HandshakeError::InvalidState)));
+		Ok(())
 	}
 
 	/// A client of a server of `identity`, beside the reply the server sent
 	/// to the client's opening.
-	async fn replied(identity: &TestCertificate) -> (TestClient<Cms>, HandshakeMessage) {
+	async fn replied(identity: &TestServerIdentity) -> (TestClient<Cms>, HandshakeMessage) {
 		let (mut server, _) = server_with(identity, PeerAuthentication::Anonymous);
 		let (client, sealed) = client_after_opening(identity, None);
 		let reply = server.reply(opening(sealed.into_value())).await;
@@ -1154,7 +1180,7 @@ mod tests {
 	/// `AuthEnvelopedData` of content type `id-signedData`.
 	#[tokio::test]
 	async fn a_reply_is_answered_with_a_sealed_client_finished() -> Result<(), Box<dyn Error>> {
-		let (mut client, reply) = replied(&create_test_certificate()).await;
+		let (mut client, reply) = replied(&create_test_server()).await;
 
 		let closing = client.respond(reply).await?;
 		let sealed = closing.auth_enveloped()?;
@@ -1167,9 +1193,9 @@ mod tests {
 	/// client admits no further step.
 	#[tokio::test]
 	async fn a_reply_without_a_server_finished_mac_is_refused_before_the_closing() {
-		let server = create_test_certificate();
+		let server = create_test_server();
 		let (mut client, sealed) = client_after_opening(&server, None);
-		let finished = server_finished_over(&server.signing_key, &sealed, &fresh_server_ephemeral());
+		let finished = server_finished_over(&server.signing.signing_key, &sealed, &fresh_server_ephemeral());
 
 		let refusal = client.respond(reply(finished)).await;
 		assert!(matches!(refusal, Err(HandshakeError::MissingAttribute)));
@@ -1181,7 +1207,7 @@ mod tests {
 	/// signature verifies.
 	#[tokio::test]
 	async fn a_reply_whose_server_finished_covers_another_signature_is_refused() {
-		let (mut client, reply) = replied(&create_test_certificate()).await;
+		let (mut client, reply) = replied(&create_test_server()).await;
 		let flipped = with_signature_flipped(&reply);
 
 		let refusal = client.respond(flipped).await;
@@ -1192,7 +1218,7 @@ mod tests {
 	/// The sealed client Finished a client answers a reply with, beside the
 	/// transcript hash the reply's server Finished signed.
 	async fn sealed_client_finished() -> (AuthEnvelopedData, TranscriptHash) {
-		let (mut client, reply) = replied(&create_test_certificate()).await;
+		let (mut client, reply) = replied(&create_test_server()).await;
 		let transcript_hash = signed_transcript(&reply_signed_data(&reply));
 
 		let closing = client.respond(reply).await.expect("the client answers the reply");
@@ -1232,9 +1258,9 @@ mod tests {
 	/// ephemeral is the one leg that differs.
 	#[tokio::test]
 	async fn a_tampered_server_ephemeral_fails_the_cms_finished() -> Result<(), Box<dyn Error>> {
-		let identity = create_test_certificate();
+		let identity = create_test_server();
 		let mut server = Handshake::server(Cms::server(&identity));
-		let mut client = Handshake::client(Cms::client(&identity.certificate, &create_test_certificate()));
+		let mut client = Handshake::client(Cms::client(&identity, &create_test_certificate()));
 
 		let finished = server.reply(client.start()?).await?.signed()?;
 		let accept = SecurityAccept::new(create_default_test_profile());
@@ -1251,9 +1277,9 @@ mod tests {
 	/// the selection, so the refusal names the signature and not the selection.
 	#[tokio::test]
 	async fn a_stripped_accept_fails_the_cms_finished() -> Result<(), Box<dyn Error>> {
-		let identity = create_test_certificate();
+		let identity = create_test_server();
 		let mut server = Handshake::server(Cms::server(&identity));
-		let mut client = Handshake::client(Cms::client(&identity.certificate, &create_test_certificate()));
+		let mut client = Handshake::client(Cms::client(&identity, &create_test_certificate()));
 
 		let finished = server.reply(client.start()?).await?.signed()?;
 		let ephemeral = finished.value().find_unsigned_attr(HANDSHAKE_SERVER_EPHEMERAL)?;
@@ -1271,9 +1297,9 @@ mod tests {
 	/// the transcript seals, so no session forms without the agreement.
 	#[tokio::test]
 	async fn a_missing_server_ephemeral_is_refused() {
-		let server = create_test_certificate();
+		let server = create_test_server();
 		let (mut client, sent) = client_after_opening(&server, None);
-		let finished = server_finished_over(&server.signing_key, &sent, &fresh_server_ephemeral());
+		let finished = server_finished_over(&server.signing.signing_key, &sent, &fresh_server_ephemeral());
 		let stripped = with_unsigned_attrs(finished, None);
 
 		let result = client.respond(reply(stripped)).await;
@@ -1284,9 +1310,9 @@ mod tests {
 	/// attribute is read.
 	#[tokio::test]
 	async fn a_server_finished_with_an_abort_alert_is_refused() -> Result<(), Box<dyn Error>> {
-		let server = create_test_certificate();
+		let server = create_test_server();
 		let (mut client, sent) = client_after_opening(&server, None);
-		let finished = server_finished_over(&server.signing_key, &sent, &fresh_server_ephemeral());
+		let finished = server_finished_over(&server.signing.signing_key, &sent, &fresh_server_ephemeral());
 		let alert = HandshakeAttribute::new_single(HANDSHAKE_ABORT_ALERT, Any::encode_from(&4u8)?)?;
 		let alerted = with_unsigned_attrs(finished, Some(unsigned_attrs(vec![alert])));
 
@@ -1300,13 +1326,13 @@ mod tests {
 	/// no session forms without an agreed profile.
 	#[tokio::test]
 	async fn a_server_finished_without_a_security_accept_is_refused() -> Result<(), Box<dyn Error>> {
-		let server = create_test_certificate();
+		let server = create_test_server();
 		let (mut client, sent) = client_after_opening(&server, None);
 		let ephemeral = fresh_server_ephemeral();
 		let ephemeral_bytes = HandshakeAttribute::transcript_bytes(&ephemeral)?;
 		let transcript = [sent.der(), ephemeral_bytes.as_slice()].concat();
 		let attrs = unsigned_attrs(vec![attribute(&ephemeral)]);
-		let finished = signed_server_finished(&server.signing_key, &transcript, attrs);
+		let finished = signed_server_finished(&server.signing.signing_key, &transcript, attrs);
 
 		let result = client.respond(reply(finished)).await;
 		assert!(matches!(result, Err(HandshakeError::InvalidProfileSelection)));
@@ -1317,11 +1343,11 @@ mod tests {
 	/// client's offer is refused.
 	#[tokio::test]
 	async fn a_client_refuses_a_profile_it_did_not_offer() {
-		let server = create_test_certificate();
+		let server = create_test_server();
 		let foreign = SecurityProfileDesc { aead: Some(AES_128_GCM), ..create_default_test_profile() };
 		let offer = SecurityOffer::new(vec![foreign]);
 		let (mut client, sent) = client_after_opening(&server, Some(offer));
-		let finished = server_finished_over(&server.signing_key, &sent, &fresh_server_ephemeral());
+		let finished = server_finished_over(&server.signing.signing_key, &sent, &fresh_server_ephemeral());
 
 		let result = client.respond(reply(finished)).await;
 		assert!(matches!(result, Err(HandshakeError::InvalidProfileSelection)));
@@ -1331,10 +1357,10 @@ mod tests {
 	/// refused at the parse, before any scalar multiplication.
 	#[tokio::test]
 	async fn an_identity_server_ephemeral_is_refused() {
-		let server = create_test_certificate();
+		let server = create_test_server();
 		let (mut client, sent) = client_after_opening(&server, None);
 		let identity = with_point(fresh_server_ephemeral(), &[0x00]);
-		let finished = server_finished_over(&server.signing_key, &sent, &identity);
+		let finished = server_finished_over(&server.signing.signing_key, &sent, &identity);
 
 		let result = client.respond(reply(finished)).await;
 		assert!(matches!(result, Err(HandshakeError::InvalidPublicKey(_))));
@@ -1344,10 +1370,10 @@ mod tests {
 	/// curve is refused at the parse, before any scalar multiplication.
 	#[tokio::test]
 	async fn an_off_curve_server_ephemeral_is_refused() {
-		let server = create_test_certificate();
+		let server = create_test_server();
 		let (mut client, sent) = client_after_opening(&server, None);
 		let off_curve = with_point(fresh_server_ephemeral(), &off_curve_point());
-		let finished = server_finished_over(&server.signing_key, &sent, &off_curve);
+		let finished = server_finished_over(&server.signing.signing_key, &sent, &off_curve);
 
 		let result = client.respond(reply(finished)).await;
 		assert!(matches!(result, Err(HandshakeError::InvalidPublicKey(_))));
@@ -1357,10 +1383,25 @@ mod tests {
 	/// is refused, so the agreement cannot collapse into the static one.
 	#[tokio::test]
 	async fn a_server_ephemeral_equal_to_the_static_key_is_refused() -> Result<(), Box<dyn Error>> {
-		let server = create_test_certificate();
+		let server = create_test_server();
 		let (mut client, sent) = client_after_opening(&server, None);
-		let static_key = server.signing_key.verifying_key().originator_key()?;
-		let finished = server_finished_over(&server.signing_key, &sent, &static_key);
+		let static_key = server.signing.signing_key.verifying_key().originator_key()?;
+		let finished = server_finished_over(&server.signing.signing_key, &sent, &static_key);
+
+		let result = client.respond(reply(finished)).await;
+		assert!(matches!(result, Err(HandshakeError::ServerEphemeralIsStatic)));
+		Ok(())
+	}
+
+	/// A validly signed server ephemeral that is the key of the server's
+	/// key-agreement certificate is refused, so the agreement cannot collapse
+	/// into the key the opening sealed to.
+	#[tokio::test]
+	async fn a_server_ephemeral_equal_to_the_key_agreement_key_is_refused() -> Result<(), Box<dyn Error>> {
+		let server = create_test_server();
+		let (mut client, sent) = client_after_opening(&server, None);
+		let static_key = server.key_agreement.signing_key.verifying_key().originator_key()?;
+		let finished = server_finished_over(&server.signing.signing_key, &sent, &static_key);
 
 		let result = client.respond(reply(finished)).await;
 		assert!(matches!(result, Err(HandshakeError::ServerEphemeralIsStatic)));
@@ -1379,21 +1420,21 @@ mod tests {
 	/// fails here even when a client binds the same one.
 	#[tokio::test]
 	async fn a_hand_built_opening_is_answered_with_a_signed_server_finished() -> Result<(), Box<dyn Error>> {
-		let identity = create_test_certificate();
+		let identity = create_test_server();
 		let (mut server, server_certificate) = server_with(&identity, PeerAuthentication::Anonymous);
 		let sealed = build_test_opening(&server_certificate, &TEST_BASE_SECRET, []);
 		let message = opening(sealed);
 		let sent = message.der().to_vec();
 
 		let finished = server.reply(message).await?.signed()?;
-		let content = verified_content(finished.value(), &identity)?;
+		let content = verified_content(finished.value(), &identity.signing)?;
 
 		let accept = HandshakeAttribute::transcript_bytes(&SecurityAccept::new(create_default_test_profile()))?;
 		let ephemeral = finished.value().find_unsigned_attr(HANDSHAKE_SERVER_EPHEMERAL)?;
 		let ephemeral = ephemeral.ok_or("the server Finished carries its ephemeral")?;
 		let ephemeral = HandshakeAttribute::transcript_bytes(&ephemeral.decode::<OriginatorPublicKey>()?)?;
 		let expected = Transcript::digest::<Sha3_256>([sent, accept, ephemeral].concat())?;
-		let server_content = FinishedRole::Server.content::<Sha3_256>(&expected, &identity.certificate)?;
+		let server_content = FinishedRole::Server.content::<Sha3_256>(&expected, &identity.signing.certificate)?;
 		assert_eq!(content, server_content);
 		Ok(())
 	}
@@ -1457,7 +1498,9 @@ mod tests {
 			base_secret: OctetString::new(TEST_BASE_SECRET)?,
 			agreement_key: fresh_server_ephemeral(),
 		};
-		let recipient = Recipient::Kem { certificate: &server_certificate, ukm_label: b"tb/handshake/other/ukm/v1" };
+
+		let recipient = recipient_of(&server_certificate);
+		let recipient = Recipient::Kem { recipient: &recipient, ukm_label: b"tb/handshake/other/ukm/v1" };
 		let content_type = HANDSHAKE_OPENING_CONTENT;
 		let sealed =
 			AuthEnvelopedData::seal::<DefaultCryptoProvider>(recipient, content_type, content.to_der()?, [], None)?;
@@ -1484,14 +1527,18 @@ mod tests {
 	/// authorizer never reads an offer the tag has not covered.
 	#[tokio::test]
 	async fn a_tampered_offer_never_reaches_the_authorizer() {
-		let identity = create_test_certificate();
+		let identity = create_test_server();
 		let authorizer = Arc::new(RecordingAuthorizer::default());
 		let mut config = Cms::server(&identity);
 		config.transport = Some(budget_offer());
 		config.transport_authorizer = Some(authorizer.to_owned());
 		let mut server = Handshake::server(config);
 
-		let sealed = build_test_opening(&identity.certificate, &TEST_BASE_SECRET, [attribute(&budget_offer())]);
+		let sealed = build_test_opening(
+			&identity.key_agreement.certificate,
+			&TEST_BASE_SECRET,
+			[attribute(&budget_offer())],
+		);
 		let tampered = with_transport_offer(sealed, &TransportOffer::mux(8).with_budgets(TEST_BUDGETS));
 		let refusal = server.reply(opening(tampered)).await;
 		assert!(matches!(refusal, Err(HandshakeError::Envelope(EnvelopeError::Authentication))));
@@ -1561,7 +1608,7 @@ mod tests {
 	/// the algorithm protection as signed attributes (RFC 5652 §5.3, RFC 6211).
 	#[tokio::test]
 	async fn a_server_finished_carries_the_three_signed_attributes() -> Result<(), Box<dyn Error>> {
-		let identity = create_test_certificate();
+		let identity = create_test_server();
 		let (mut server, server_certificate) = server_with(&identity, PeerAuthentication::Anonymous);
 		let sealed = build_test_opening(&server_certificate, &TEST_BASE_SECRET, []);
 
@@ -1579,14 +1626,14 @@ mod tests {
 	/// version 3 (RFC 5652 §5.1, §5.3).
 	#[tokio::test]
 	async fn a_server_finished_is_version_3_under_its_key_identifier() -> Result<(), Box<dyn Error>> {
-		let identity = create_test_certificate();
+		let identity = create_test_server();
 		let (mut server, server_certificate) = server_with(&identity, PeerAuthentication::Anonymous);
 		let sealed = build_test_opening(&server_certificate, &TEST_BASE_SECRET, []);
 
 		let finished = server.reply(opening(sealed)).await?.signed()?;
 		let signer = finished_signer(finished.value());
 		assert_eq!(signer.version, CmsVersion::V3);
-		assert_eq!(signer.sid, identity.certificate.signer_identifier()?);
+		assert_eq!(signer.sid, identity.signing.certificate.signer_identifier()?);
 		assert_eq!(finished.value().version, CmsVersion::V3);
 		Ok(())
 	}
@@ -1595,9 +1642,9 @@ mod tests {
 	/// by the client (RFC 5652 §5.4).
 	#[tokio::test]
 	async fn a_server_finished_without_signed_attributes_is_refused() -> Result<(), Box<dyn Error>> {
-		let server = create_test_certificate();
+		let server = create_test_server();
 		let (mut client, sent) = client_after_opening(&server, None);
-		let finished = server_finished_over(&server.signing_key, &sent, &fresh_server_ephemeral());
+		let finished = server_finished_over(&server.signing.signing_key, &sent, &fresh_server_ephemeral());
 		let mut signer = finished_signer(&finished);
 		signer.signed_attrs = None;
 
@@ -1611,9 +1658,9 @@ mod tests {
 	/// rule is refused by the client.
 	#[tokio::test]
 	async fn a_server_finished_of_the_wrong_version_is_refused() -> Result<(), Box<dyn Error>> {
-		let server = create_test_certificate();
+		let server = create_test_server();
 		let (mut client, sent) = client_after_opening(&server, None);
-		let finished = server_finished_over(&server.signing_key, &sent, &fresh_server_ephemeral());
+		let finished = server_finished_over(&server.signing.signing_key, &sent, &fresh_server_ephemeral());
 		let downgraded = SignedData { version: CmsVersion::V1, ..finished };
 
 		let refusal = client.respond(reply(downgraded)).await;
@@ -1625,9 +1672,9 @@ mod tests {
 	/// the client, though its signature verifies under the server's key.
 	#[tokio::test]
 	async fn a_server_finished_naming_another_certificate_is_refused() -> Result<(), Box<dyn Error>> {
-		let server = create_test_certificate();
+		let server = create_test_server();
 		let (mut client, sent) = client_after_opening(&server, None);
-		let finished = server_finished_over(&server.signing_key, &sent, &fresh_server_ephemeral());
+		let finished = server_finished_over(&server.signing.signing_key, &sent, &fresh_server_ephemeral());
 		let mut signer = finished_signer(&finished);
 		signer.sid = create_test_certificate().certificate.signer_identifier()?;
 
@@ -1642,7 +1689,7 @@ mod tests {
 	/// closing whose certificate holds that key.
 	#[tokio::test]
 	async fn an_agreement_key_equal_to_the_client_static_key_is_refused() {
-		let identity = create_test_certificate();
+		let identity = create_test_server();
 		let client = create_test_certificate();
 		let static_key = SecretKey::<Secp256k1>::from(&client.signing_key);
 		let mut awaiting = awaiting_finished(&identity, PeerAuthentication::Anonymous, static_key).await;
@@ -1666,7 +1713,113 @@ mod tests {
 		let closing = awaiting.sealed(&finished);
 
 		let refusal = awaiting.server.finish(closing).await;
-		assert!(matches!(refusal, Err(HandshakeError::InvalidPublicKey(_))));
+		assert!(matches!(
+			refusal,
+			Err(HandshakeError::CertificateValidationError(
+				CertificateValidationError::SpkiError(_)
+			))
+		));
+	}
+
+	/// An offered certificate whose `keyUsage` lacks `digitalSignature` is
+	/// refused where the opened Finished is parsed, as the signing use reads
+	/// it.
+	#[tokio::test]
+	async fn an_offered_certificate_without_digital_signature_is_refused() {
+		let mut awaiting = server_awaiting_finished().await;
+		let mut client = create_test_certificate();
+		let usage = KeyUsage(KeyUsages::KeyAgreement.into());
+		client.certificate = crate::testing::fixtures::TestCertificate::with_key_usage(client.certificate, usage);
+
+		let finished = build_test_client_finished(&client, awaiting.transcript_hash(), &awaiting.confirmation);
+		let closing = awaiting.sealed(&finished);
+
+		let refusal = awaiting.server.finish(closing).await;
+		assert!(matches!(
+			refusal,
+			Err(HandshakeError::CertificateValidationError(
+				CertificateValidationError::MissingKeyUsage(KeyUsages::DigitalSignature)
+			))
+		));
+	}
+
+	/// An offered certificate that names the server's purpose alone is
+	/// refused for the client role (RFC 5280 §4.2.1.12).
+	#[tokio::test]
+	async fn an_offered_server_certificate_is_refused_as_the_client() {
+		let mut awaiting = server_awaiting_finished().await;
+		let mut client = create_test_certificate();
+		client.certificate = of_purpose(client.certificate, KeyPurposes::HOUSE.server);
+
+		let finished = build_test_client_finished(&client, awaiting.transcript_hash(), &awaiting.confirmation);
+		let closing = awaiting.sealed(&finished);
+
+		let refusal = awaiting.server.finish(closing).await;
+		assert!(matches!(
+			refusal,
+			Err(HandshakeError::CertificateValidationError(
+				CertificateValidationError::ExcludedKeyPurpose
+			))
+		));
+	}
+
+	/// A server whose own certificate names the client's purpose alone holds
+	/// no certificate of its role, so its configuration is refused.
+	#[test]
+	fn a_server_configuration_of_a_client_certificate_is_refused() {
+		let mut identity = create_test_server();
+		identity.signing.certificate = of_purpose(identity.signing.certificate, KeyPurposes::HOUSE.client);
+		let profiles = SupportedProfiles::from(create_default_test_profile());
+
+		let refusal = TestServerConfig::<Cms>::new(CmsServerSettings, identity.pair(), profiles, KeyPurposes::HOUSE);
+		assert!(matches!(
+			refusal,
+			Err(HandshakeError::CertificateValidationError(
+				CertificateValidationError::ExcludedKeyPurpose
+			))
+		));
+	}
+
+	/// A server configured with an implementor's own server purpose reads its
+	/// signing certificate of that purpose as its role's, so it replies.
+	#[tokio::test]
+	async fn a_server_of_its_own_purpose_replies() -> Result<(), Box<dyn Error>> {
+		let own = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.3.10");
+		let mut identity = create_test_server();
+		identity.signing.certificate = of_purpose(identity.signing.certificate, own);
+		let sealed = build_test_opening(&identity.key_agreement.certificate, &TEST_BASE_SECRET, []);
+		let profiles = SupportedProfiles::from(create_default_test_profile());
+		let purposes = KeyPurposes { server: own, ..KeyPurposes::HOUSE };
+		let config = TestServerConfig::<Cms>::new(CmsServerSettings, identity.pair(), profiles, purposes)?;
+		let mut server = Handshake::server(config);
+
+		let reply = server.reply(opening(sealed)).await;
+		assert!(reply.is_ok());
+		Ok(())
+	}
+
+	/// A client whose own certificate names the server's purpose alone holds
+	/// no certificate of its role, so its configuration is refused.
+	#[test]
+	fn a_client_configuration_of_a_server_certificate_is_refused() {
+		let server = create_test_server();
+		let client = create_test_certificate();
+		let certificate = of_purpose(client.certificate, KeyPurposes::HOUSE.server);
+		let identity = TestIdentity::presenting(certificate, &client.signing_key);
+		let settings = CmsClientSettings { trust: server.trust(), identity };
+
+		let refusal = TestClientConfig::<Cms>::new(settings, KeyPurposes::HOUSE);
+		assert!(matches!(
+			refusal,
+			Err(HandshakeError::CertificateValidationError(
+				CertificateValidationError::ExcludedKeyPurpose
+			))
+		));
+	}
+
+	/// `certificate` with an `extendedKeyUsage` that names `purpose` alone.
+	fn of_purpose(certificate: Certificate, purpose: ObjectIdentifier) -> Certificate {
+		crate::testing::fixtures::TestCertificate::with_key_purposes(certificate, [purpose])
 	}
 
 	/// The container an HPKE hello travels in, a `ContentInfo` of type
@@ -1931,7 +2084,7 @@ mod tests {
 	/// the server certificate.
 	#[tokio::test]
 	async fn a_reflected_server_finished_is_refused() {
-		let server_identity = create_test_certificate();
+		let server_identity = create_test_server();
 		let ephemeral = SecretKey::<Secp256k1>::random(&mut OsRng);
 		let mutual = mutual_with(ExpiryValidator);
 
@@ -1939,7 +2092,7 @@ mod tests {
 		// validator accepts. The tag confirms the secret the server derives,
 		// so the refusal is the role mismatch in the signature.
 		let mut awaiting = awaiting_finished(&server_identity, mutual, ephemeral).await;
-		let reflected = with_certificate(awaiting.server_finished.to_owned(), &server_identity.certificate);
+		let reflected = with_certificate(awaiting.server_finished.to_owned(), &server_identity.signing.certificate);
 		let reflected = with_confirmation(reflected, &awaiting.confirmation);
 		let closing = awaiting.sealed(&reflected);
 
@@ -2118,7 +2271,7 @@ mod tests {
 	/// so a withheld countersignature leaves evidence (CWE-778).
 	#[tokio::test]
 	async fn a_withheld_countersignature_is_refused_and_recorded() -> Result<(), Box<dyn Error>> {
-		let identity = create_test_certificate();
+		let identity = create_test_server();
 		let observer = Arc::new(CountingObserver::default());
 		let mut config = Cms::server(&identity);
 		config.peer_authentication = mutual_with(ExpiryValidator);
@@ -2195,11 +2348,14 @@ mod tests {
 	/// opens under that hash.
 	#[tokio::test]
 	async fn a_sha3_512_profile_carries_a_64_byte_transcript_hash() -> Result<(), Box<dyn Error>> {
-		let server_identity = create_test_certificate();
-		let settings = Cms::client(&server_identity.certificate, &create_test_certificate()).flow;
+		let server_identity = create_test_server();
+		let identity = client_identity(&create_test_certificate());
+		let settings = CmsClientSettings { trust: server_identity.trust(), identity };
 		let profiles = SupportedProfiles::from(RunnableProfile::<Aes256Sha3_512Provider>::native().descriptor());
-		let server_config = ServerConfig::new(CmsServerSettings, signing_identity(&server_identity), profiles);
-		let mut client = Handshake::<Client, Cms, Aes256Sha3_512Provider>::client(ClientConfig::new(settings));
+		let pair = server_identity.pair();
+		let server_config = ServerConfig::new(CmsServerSettings, pair, profiles, KeyPurposes::HOUSE)?;
+		let client_config = ClientConfig::new(settings, KeyPurposes::HOUSE)?;
+		let mut client = Handshake::<Client, Cms, Aes256Sha3_512Provider>::client(client_config);
 		let mut server = Handshake::<Server, Cms, Aes256Sha3_512Provider>::server(server_config);
 
 		let opening = client.start()?;
@@ -2225,11 +2381,12 @@ mod tests {
 	}
 
 	/// Write each sample of `emitted` under its name, what opens each
-	/// `KEKRecipientInfo` sample, and the DER of both certificates, when the
-	/// environment asks for interop samples.
+	/// `KEKRecipientInfo` sample, and the DER of the three certificates, when
+	/// the environment asks for interop samples.
 	fn write_samples(emitted: &Emitted) -> std::io::Result<()> {
 		let certificates = [
 			("server-certificate", &emitted.server_certificate),
+			("server-key-agreement-certificate", &emitted.server_key_agreement_certificate),
 			("client-certificate", &emitted.client_certificate),
 		];
 		write_interop_samples(&emitted.samples(), &emitted.kek_openings(), &certificates)
@@ -2258,8 +2415,9 @@ mod tests {
 		signed.expect("the frame signature assembles").into_inner()
 	}
 
-	/// One of each structure the CMS flow and a signed frame emit, and the
-	/// two certificates that verify the signed ones.
+	/// One of each structure the CMS flow and a signed frame emit, the two
+	/// certificates that verify the signed ones, and the certificate the
+	/// opening seals to.
 	struct Emitted {
 		/// The opening, an `AuthEnvelopedData` with a `KEMRecipientInfo`.
 		opening: AuthEnvelopedData,
@@ -2277,8 +2435,11 @@ mod tests {
 		/// The receipt the server and the client both signed, as the session
 		/// observer of the server receives it.
 		joined_receipt: SignedData,
-		/// The certificate of the server.
+		/// The signing certificate of the server.
 		server_certificate: Certificate,
+		/// The key-agreement certificate of the server, which the opening
+		/// names as its recipient.
+		server_key_agreement_certificate: Certificate,
 		/// The certificate of the client.
 		client_certificate: Certificate,
 		/// What OpenSSL opens [`Self::sealed_finished`] with.
@@ -2359,7 +2520,8 @@ mod tests {
 			kek_seal,
 			frame_signature: frame_signature().await,
 			joined_receipt: joined_receipt.into_inner(),
-			server_certificate: server_identity.certificate,
+			server_certificate: server_identity.signing.certificate,
+			server_key_agreement_certificate: server_identity.key_agreement.certificate,
 			client_certificate: client_identity.certificate,
 			sealed_finished_opening,
 			kek_seal_opening,

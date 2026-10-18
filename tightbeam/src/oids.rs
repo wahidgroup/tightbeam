@@ -12,6 +12,7 @@
 //!   handshake attribute OIDs of the FULL_CMS profile.
 //! - `.1.100` is reserved, because published releases gave it to another key exchange profile.
 //! - `.2` holds the algorithms, such as zstd, the HPKE suite, and DHKEM over secp256k1.
+//! - `.3` holds the key purposes of `extendedKeyUsage` (RFC 5280 §4.2.1.12).
 
 use crate::der::asn1::ObjectIdentifier;
 
@@ -136,6 +137,18 @@ pub const HPKE_SECP256K1_SHA3_256_AES_256_GCM: ObjectIdentifier = ObjectIdentifi
 /// - draft-wahby-cfrg-hpke-kem-secp256k1-01:
 ///   <https://datatracker.ietf.org/doc/html/draft-wahby-cfrg-hpke-kem-secp256k1-01>
 pub const DHKEM_SECP256K1: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.2.3");
+
+/// The key purpose of a tightbeam frame and colony signer, as a
+/// `KeyPurposeId` of `extendedKeyUsage`.
+///
+/// No registry names a purpose for a CMS frame signer, and RFC 5280 lets any
+/// organization define one. This OID is therefore assigned under Wahid Group,
+/// LLC IANA PEN 64586, in the key purposes arc `.3`.
+///
+/// # Sources
+///
+/// - RFC 5280 §4.2.1.12, Extended Key Usage: <https://datatracker.ietf.org/doc/html/rfc5280#section-4.2.1.12>
+pub const KEY_PURPOSE_SIGNER: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.3.1");
 
 /// HKDF with SHA3-256 (`id-alg-hkdf-with-sha3-256`), in the S/MIME algorithms
 /// arc. A security profile names its key derivation function by this OID.
@@ -433,6 +446,7 @@ mod tests {
 			(COMPRESSION_ZSTD, "1.3.6.1.4.1.64586.2.1"),
 			(HPKE_SECP256K1_SHA3_256_AES_256_GCM, "1.3.6.1.4.1.64586.2.2"),
 			(DHKEM_SECP256K1, "1.3.6.1.4.1.64586.2.3"),
+			(KEY_PURPOSE_SIGNER, "1.3.6.1.4.1.64586.3.1"),
 			(HASH_SHA256, "2.16.840.1.101.3.4.2.1"),
 			(HASH_SHA3_256, "2.16.840.1.101.3.4.2.8"),
 			(HASH_SHA3_384, "2.16.840.1.101.3.4.2.9"),

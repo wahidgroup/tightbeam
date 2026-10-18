@@ -5,8 +5,10 @@
 //!
 //! - a signature, ECDSA over secp256k1 under `ecdsa-with-SHA3-512`, whose
 //!   canonical form refuses a high `s`, as a [`SigningProvider`],
-//! - a KDF, HKDF over SHA3-512 under an identifier of its own arc, as a [`KdfProvider`], and
-//! - a KEM, the DHKEM over secp256k1 under a KEM identifier of its own, through [`RecipientKem`].
+//! - a KDF, HKDF over SHA3-512 under an identifier of its own arc, as a [`KdfProvider`],
+//! - a KEM, the DHKEM over secp256k1 under a KEM identifier of its own, through [`RecipientKem`],
+//! - a signing backend, as a [`SigningKeyProvider`], and
+//! - a key-agreement backend that runs its own scalar product, as a [`DiffieHellman`] backend.
 //!
 //! The house types the outside provider selects:
 //!
@@ -14,25 +16,32 @@
 //! - the AEAD, AES-128-GCM, through [`ContentEncryption`].
 //!
 //! The provider names no HPKE suite, and [`hpke`] and [`cms`] run both
-//! handshakes under it.
+//! handshakes under it. [`kem`] brings a KEM whose private-key operation is
+//! not Diffie-Hellman.
 
 #[cfg(feature = "transport-cms")]
 mod cms;
 #[cfg(feature = "transport-hpke")]
 mod hpke;
+mod kem;
+mod trust;
 
 use std::sync::Arc;
 
 use tightbeam::builder::frame::FrameBuilder;
 use tightbeam::builder::TypeBuilder;
 use tightbeam::crypto::aead::{Aes128Gcm, Aes128GcmOid};
-use tightbeam::crypto::cms::{AuthEnvelopedData, Encapsulation, EnvelopeError, Opener, Recipient, RecipientKem};
+use tightbeam::crypto::cms::{
+	AuthEnvelopedData, Encapsulation, EnvelopeError, KemRecipient, KeyAgreementIdentity, Opener, Recipient,
+	RecipientKem,
+};
 use tightbeam::crypto::hash::{Digest, Sha3_512};
 use tightbeam::crypto::hpke::{DhKem, HkdfSha256};
 use tightbeam::crypto::k256::ecdsa::{DerSignature, Signature, SigningKey, VerifyingKey};
-use tightbeam::crypto::k256::{PublicKey, Secp256k1};
+use tightbeam::crypto::k256::elliptic_curve::point::AffineCoordinates;
+use tightbeam::crypto::k256::{AffinePoint, NonZeroScalar, PublicKey, Secp256k1};
 use tightbeam::crypto::kdf::{Hkdf, KdfError, KdfFunction};
-use tightbeam::crypto::key::{KeyError, Secp256k1KeyProvider, SigningKeyProvider};
+use tightbeam::crypto::key::{DiffieHellman, KeyBackend, KeyError, Secp256k1KeyProvider, SigningKeyProvider};
 use tightbeam::crypto::policy::ProviderPolicy;
 use tightbeam::crypto::profiles::{
 	AeadProvider, Aes128Wrap, CryptoProvider, CurveProvider, DefaultCryptoProvider, DigestProvider, KdfProvider,
@@ -43,14 +52,19 @@ use tightbeam::crypto::sign::{
 	CanonicalForm, CmsSigner, Error as SignatureError, PrehashSigner, PrehashVerifier, SignatureAlgorithmIdentifier,
 	SignatureEncoding, SignedContent, SignerError, SigningIdentity, Verifier,
 };
+use tightbeam::crypto::x509::error::CertificateValidationError;
+use tightbeam::crypto::x509::{KeyAgreement, KeyPurposes, PeerCertificate};
 use tightbeam::der::asn1::ObjectIdentifier;
 use tightbeam::der::oid::AssociatedOid;
-use tightbeam::der::Encode;
-use tightbeam::oids::{AES_128_GCM, AES_128_WRAP, DATA, SIGNER_ECDSA_WITH_SHA3_256, SIGNER_ECDSA_WITH_SHA3_512};
+use tightbeam::der::{Any, Encode};
+use tightbeam::oids::{
+	AES_128_GCM, AES_128_WRAP, CURVE_SECP256K1, DATA, SIGNER_ECDSA_WITH_SHA3_256, SIGNER_ECDSA_WITH_SHA3_512,
+};
 use tightbeam::random::{CryptoRngCore, OsRng};
 use tightbeam::spki::{AlgorithmIdentifierOwned, Document, EncodePublicKey, SubjectPublicKeyInfoRef};
 use tightbeam::testing::{unhex, EnvelopeRecipient, SeededStream, TestCertificate, TestMessage};
 use tightbeam::utils::marker::MaybeSendFuture;
+use tightbeam::x509::ext::pkix::KeyUsages;
 use tightbeam::x509::Certificate;
 use tightbeam::zeroize::Zeroizing;
 use tightbeam::{Version, ZeroizingBytes};
@@ -65,6 +79,10 @@ const OUTSIDE_KEM: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.
 
 /// The identifier of the outside KDF, under the same arc.
 const OUTSIDE_KDF: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.3.2");
+
+/// `id-ecPublicKey` (RFC 5480 §2.1.1), the algorithm of the key the outside
+/// key-agreement backend holds.
+const EC_PUBLIC_KEY: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.2.1");
 
 /// The HPKE KEM identifier of the outside KEM, which its `suite_id` carries
 /// in place of the registered `0x0016`.
@@ -161,6 +179,14 @@ impl From<PublicKey> for OutsideVerifyingKey {
 	}
 }
 
+/// The point of the key, lent by reference, which a handshake compares an
+/// agreement ephemeral with.
+impl AsRef<AffinePoint> for OutsideVerifyingKey {
+	fn as_ref(&self) -> &AffinePoint {
+		self.0.as_affine()
+	}
+}
+
 impl EncodePublicKey for OutsideVerifyingKey {
 	fn to_public_key_der(&self) -> tightbeam::spki::Result<Document> {
 		self.0.to_public_key_der()
@@ -198,16 +224,24 @@ struct OutsideKem;
 
 impl RecipientKem for OutsideKem {
 	const OID: ObjectIdentifier = OUTSIDE_KEM;
+	const USAGE: KeyUsages = KeyUsages::KeyAgreement;
+	type PublicKey = PublicKey;
+	type PrivateKey = dyn DiffieHellman<Secp256k1>;
 
-	fn encapsulate(certificate: &Certificate, rng: &mut dyn CryptoRngCore) -> Result<Encapsulation, EnvelopeError> {
-		OutsideDhKem::encap_to(certificate, rng)
+	fn public_key(spki: SubjectPublicKeyInfoRef<'_>) -> Result<PublicKey, CertificateValidationError> {
+		Ok(PublicKey::try_from(spki)?)
+	}
+
+	fn encapsulate(recipient: &PublicKey, rng: &mut dyn CryptoRngCore) -> Result<Encapsulation, EnvelopeError> {
+		OutsideDhKem::encap_to(recipient, rng)
 	}
 
 	fn decapsulate<'a>(
-		identity: &'a SigningIdentity,
+		key: &'a dyn DiffieHellman<Secp256k1>,
+		recipient: &'a PublicKey,
 		kemct: &'a [u8],
 	) -> MaybeSendFuture<'a, Result<ZeroizingBytes, EnvelopeError>> {
-		OutsideDhKem::decap_through(identity, kemct)
+		OutsideDhKem::decap_through(key, recipient, kemct)
 	}
 }
 
@@ -265,15 +299,14 @@ impl CryptoProvider for OutsideProvider {
 	}
 }
 
-/// The key provider of an outside identity: it signs under
-/// `ecdsa-with-SHA3-512`, and agrees as the house provider does.
+/// The signing backend of an outside identity: it signs under
+/// `ecdsa-with-SHA3-512`.
 #[derive(Debug)]
 struct OutsideKeyProvider {
 	key: SigningKey,
-	agreement: Secp256k1KeyProvider,
 }
 
-impl SigningKeyProvider for OutsideKeyProvider {
+impl KeyBackend for OutsideKeyProvider {
 	fn algorithm(&self) -> AlgorithmIdentifierOwned {
 		AlgorithmIdentifierOwned { oid: SIGNER_ECDSA_WITH_SHA3_512, parameters: None }
 	}
@@ -281,23 +314,71 @@ impl SigningKeyProvider for OutsideKeyProvider {
 	fn to_public_key_bytes(&self) -> Result<Vec<u8>, KeyError> {
 		Ok(self.key.verifying_key().to_public_key_der()?.into_vec())
 	}
+}
 
+impl SigningKeyProvider for OutsideKeyProvider {
 	fn sign_prehash(&self, prehash: &[u8]) -> MaybeSendFuture<'_, Result<Vec<u8>, KeyError>> {
 		let signed: Result<DerSignature, SignatureError> = self.key.sign_prehash(prehash);
 		let signed = signed.map(|signature| signature.to_vec()).map_err(KeyError::from);
 		Box::pin(async move { signed })
-	}
-
-	fn key_agreement(&self, peer_public_key: &[u8]) -> MaybeSendFuture<'_, Result<SecretSlice<u8>, KeyError>> {
-		self.agreement.key_agreement(peer_public_key)
 	}
 }
 
 impl OutsideKeyProvider {
 	/// The outside key provider of `key`.
 	fn of(key: SigningKey) -> Self {
-		let agreement = Secp256k1KeyProvider::from(key.clone());
-		Self { key, agreement }
+		Self { key }
+	}
+}
+
+/// The key-agreement backend of an outside identity: it holds a secp256k1
+/// scalar and runs the Diffie-Hellman product itself, so the scalar leaves
+/// it in no value the crate reads.
+struct OutsideAgreementBackend {
+	scalar: NonZeroScalar,
+}
+
+/// The public key names the backend, and the scalar stays out of the output.
+impl core::fmt::Debug for OutsideAgreementBackend {
+	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+		f.debug_struct("OutsideAgreementBackend")
+			.field("public_key", &self.public_key())
+			.finish_non_exhaustive()
+	}
+}
+
+impl OutsideAgreementBackend {
+	/// The outside key-agreement backend of the scalar of `key`.
+	fn of(key: &SigningKey) -> Self {
+		Self { scalar: *key.as_nonzero_scalar() }
+	}
+
+	/// The public half of the scalar.
+	fn public_key(&self) -> PublicKey {
+		PublicKey::from_secret_scalar(&self.scalar)
+	}
+}
+
+impl KeyBackend for OutsideAgreementBackend {
+	/// `id-ecPublicKey` on secp256k1, the algorithm of the key the backend
+	/// holds.
+	fn algorithm(&self) -> AlgorithmIdentifierOwned {
+		let parameters = Any::encode_from(&CURVE_SECP256K1).ok();
+		AlgorithmIdentifierOwned { oid: EC_PUBLIC_KEY, parameters }
+	}
+
+	fn to_public_key_bytes(&self) -> Result<Vec<u8>, KeyError> {
+		Ok(self.public_key().to_public_key_der()?.into_vec())
+	}
+}
+
+/// The x-coordinate of the product of the backend's scalar and the peer
+/// point (SEC 1 v2.0 §3.3.1).
+impl DiffieHellman<Secp256k1> for OutsideAgreementBackend {
+	fn agree<'a>(&'a self, peer: &'a PublicKey) -> MaybeSendFuture<'a, Result<SecretSlice<u8>, KeyError>> {
+		let product = (peer.to_projective() * *self.scalar).to_affine();
+		let agreed = SecretSlice::from(product.x().to_vec());
+		Box::pin(async move { Ok(agreed) })
 	}
 }
 
@@ -306,7 +387,7 @@ impl OutsideKeyProvider {
 #[derive(Debug)]
 struct HighSKeyProvider(OutsideKeyProvider);
 
-impl SigningKeyProvider for HighSKeyProvider {
+impl KeyBackend for HighSKeyProvider {
 	fn algorithm(&self) -> AlgorithmIdentifierOwned {
 		self.0.algorithm()
 	}
@@ -314,16 +395,14 @@ impl SigningKeyProvider for HighSKeyProvider {
 	fn to_public_key_bytes(&self) -> Result<Vec<u8>, KeyError> {
 		self.0.to_public_key_bytes()
 	}
+}
 
+impl SigningKeyProvider for HighSKeyProvider {
 	fn sign_prehash(&self, prehash: &[u8]) -> MaybeSendFuture<'_, Result<Vec<u8>, KeyError>> {
 		let signed: Result<Signature, SignatureError> = self.0.key.sign_prehash(prehash);
 		let high = signed.and_then(|low| Signature::from_scalars(low.r(), -*low.s()));
 		let high = high.map(|signature| signature.to_der().to_vec()).map_err(KeyError::from);
 		Box::pin(async move { high })
-	}
-
-	fn key_agreement(&self, peer_public_key: &[u8]) -> MaybeSendFuture<'_, Result<SecretSlice<u8>, KeyError>> {
-		self.0.key_agreement(peer_public_key)
 	}
 }
 
@@ -339,6 +418,30 @@ fn outside_identity() -> SigningIdentity {
 	let key = SigningKey::random(&mut OsRng);
 	let certificate = TestCertificate::self_signed(&key);
 	outside_identity_of(certificate, key)
+}
+
+/// The key-agreement identity under [`OutsideKem`] of `certificate`, whose
+/// key `key` is, behind an [`OutsideAgreementBackend`].
+fn outside_agreement_identity_of(certificate: Certificate, key: &SigningKey) -> KeyAgreementIdentity<OutsideKem> {
+	let backend: Arc<dyn DiffieHellman<Secp256k1>> = Arc::new(OutsideAgreementBackend::of(key));
+	let identity = KeyAgreementIdentity::new(certificate, backend);
+	identity.expect("the outside backend holds the key of its certificate")
+}
+
+/// A key-agreement identity under [`OutsideKem`], of a fresh key, whose
+/// certificate asserts `keyAgreement`.
+fn outside_agreement_identity() -> KeyAgreementIdentity<OutsideKem> {
+	let key = SigningKey::random(&mut OsRng);
+	let certificate = TestCertificate::self_signed(&key);
+	outside_agreement_identity_of(certificate, &key)
+}
+
+/// The recipient under [`OutsideKem`] of `certificate`, admitted for key
+/// agreement.
+fn outside_recipient(certificate: Certificate) -> KemRecipient<OutsideKem> {
+	let admitted = PeerCertificate::<KeyAgreement<OutsideKem>>::parse(certificate, KeyPurposes::HOUSE.server);
+	let admitted = admitted.expect("the certificate asserts keyAgreement on a secp256k1 key");
+	KemRecipient::from_certificate(admitted).expect("the certificate names its recipient")
 }
 
 /// The policy of both endpoints of a handshake under [`OutsideProvider`].
@@ -365,7 +468,7 @@ async fn run_legs<F>(
 }
 
 /// [`CONTENT`] sealed under [`OutsideProvider`] to `recipient`.
-fn outside_sealed(recipient: Recipient<'_>) -> AuthEnvelopedData {
+fn outside_sealed(recipient: Recipient<'_, OutsideKem>) -> AuthEnvelopedData {
 	let sealed = AuthEnvelopedData::seal::<OutsideProvider>(recipient, DATA, CONTENT, [], None);
 	sealed.expect("the content seals under the outside provider")
 }
@@ -379,7 +482,7 @@ async fn an_outside_identity_signs_under_its_own_algorithm() -> Result<(), Box<d
 	let signer_info = identity.sign(SignedContent::data(CONTENT)).await?;
 
 	let policy = ProviderPolicy::<OutsideProvider>::default();
-	CmsSigner::verify_with_policy(&signer_info, identity.certificate(), &policy, content)?;
+	CmsSigner::verify_with_policy(&signer_info, identity.signing_certificate(), &policy, content)?;
 	Ok(())
 }
 
@@ -403,22 +506,35 @@ async fn an_outside_identity_verifies_its_own_signature() -> Result<(), Box<dyn 
 	let mut frame = builder.with_message(TestMessage::sample(None)).build()?;
 	frame.sign_with_provider(&identity).await?;
 
-	frame.verify_under(identity.certificate(), identity.policy())?;
+	frame.verify_under(identity.signing_certificate(), identity.policy())?;
 	Ok(())
 }
 
-/// A seal to the outside identity under a `KEMRecipientInfo` opens under the
-/// outside provider.
+/// A seal to the outside key-agreement identity under a `KEMRecipientInfo`
+/// opens under the outside provider, through the outside backend's own
+/// Diffie-Hellman product.
 #[tokio::test]
 async fn an_outside_provider_opens_its_kem_seal() -> Result<(), Box<dyn std::error::Error>> {
-	let identity = outside_identity();
-	let sealed = outside_sealed(Recipient::Kem { certificate: identity.certificate(), ukm_label: UKM_LABEL });
+	let identity = outside_agreement_identity();
+	let sealed = outside_sealed(Recipient::Kem { recipient: identity.recipient(), ukm_label: UKM_LABEL });
 
 	let opener = Opener::Kem { identity: &identity, ukm_label: UKM_LABEL };
 	let arrived = sealed.to_der()?;
 	let opened = sealed.open::<OutsideProvider>(arrived, &opener, DATA).await?;
 	assert_eq!(opened.to_insecure().as_slice(), CONTENT);
 	Ok(())
+}
+
+/// The pairing constructor refuses an outside backend that holds another key
+/// than the certificate it is paired with.
+#[test]
+fn a_key_agreement_identity_refuses_an_outside_backend_of_another_key() {
+	let certificate = TestCertificate::self_signed(&SigningKey::random(&mut OsRng));
+	let other = SigningKey::random(&mut OsRng);
+	let backend: Arc<dyn DiffieHellman<Secp256k1>> = Arc::new(OutsideAgreementBackend::of(&other));
+
+	let refused = KeyAgreementIdentity::<OutsideKem>::new(certificate, backend);
+	assert!(matches!(refused, Err(EnvelopeError::KeyMismatch)));
 }
 
 /// A seal under a 16-octet KEK, the key size of AES-128 key wrap, opens under
@@ -439,8 +555,8 @@ async fn an_outside_provider_opens_its_kek_seal() -> Result<(), Box<dyn std::err
 /// AES-128-GCM, the outside KEM and KDF, and AES-128 key wrap.
 #[test]
 fn an_outside_seal_names_its_algorithms() {
-	let identity = outside_identity();
-	let sealed = outside_sealed(Recipient::Kem { certificate: identity.certificate(), ukm_label: UKM_LABEL });
+	let identity = outside_agreement_identity();
+	let sealed = outside_sealed(Recipient::Kem { recipient: identity.recipient(), ukm_label: UKM_LABEL });
 	let kem = sealed.kem_recipient();
 
 	let cipher = sealed.auth_encrypted_content_info.content_enc_alg.oid;
@@ -454,8 +570,8 @@ fn an_outside_seal_names_its_algorithms() {
 #[test]
 fn an_outside_kem_seal_wraps_under_the_outside_derivation() -> Result<(), Box<dyn std::error::Error>> {
 	let key = SigningKey::from_bytes(&KNOWN_RECIPIENT_KEY.into())?;
-	let certificate = TestCertificate::self_signed(&key);
-	let recipient = Recipient::Kem { certificate: &certificate, ukm_label: UKM_LABEL };
+	let recipient = outside_recipient(TestCertificate::self_signed(&key));
+	let recipient = Recipient::Kem { recipient: &recipient, ukm_label: UKM_LABEL };
 	let mut rng = SeededStream(0);
 	let sealed = AuthEnvelopedData::seal::<OutsideProvider>(recipient, DATA, CONTENT, [], Some(&mut rng))?;
 

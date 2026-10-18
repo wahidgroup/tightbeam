@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 use tightbeam::{
 	crypto::{
-		key::{KeyError, SigningKeyProvider},
+		key::{KeyBackend, KeyError, SigningKeyProvider},
 		profiles::DefaultCryptoProvider,
 		sign::SigningIdentity,
 		x509::policy::{CertificateValidation, ExpiryValidator},
@@ -48,7 +48,7 @@ use tightbeam::{
 };
 
 use crate::common::security::{
-	default_security_profile, hpke_client_config, hpke_server_config, pinning_validator, ClientMaterials,
+	default_security_profile, hpke_client_config_presenting, hpke_server_config, pinning_validator, ClientMaterials,
 	ServerMaterials,
 };
 
@@ -60,7 +60,7 @@ struct SplicedKeyProvider {
 	signer: Arc<dyn SigningKeyProvider>,
 }
 
-impl SigningKeyProvider for SplicedKeyProvider {
+impl KeyBackend for SplicedKeyProvider {
 	fn algorithm(&self) -> AlgorithmIdentifierOwned {
 		self.signer.algorithm()
 	}
@@ -68,7 +68,9 @@ impl SigningKeyProvider for SplicedKeyProvider {
 	fn to_public_key_bytes(&self) -> Result<Vec<u8>, KeyError> {
 		self.claimed.to_public_key_bytes()
 	}
+}
 
+impl SigningKeyProvider for SplicedKeyProvider {
 	fn sign_prehash(&self, prehash: &[u8]) -> MaybeSendFuture<'_, Result<Vec<u8>, KeyError>> {
 		self.signer.sign_prehash(prehash)
 	}
@@ -131,8 +133,7 @@ job! {
 		let spliced = SigningIdentity::new(Arc::clone(&victim.certificate), provider)?;
 		let validator = pinning_validator(&materials.certificate);
 
-		let mut config = hpke_client_config::<DefaultCryptoProvider>(validator);
-		config.flow.identity = Some(spliced);
+		let mut config = hpke_client_config_presenting::<DefaultCryptoProvider>(validator, spliced);
 		config.security_offer = Some(SecurityOffer::new(vec![profile]));
 
 		let mut client = Handshake::client(config);

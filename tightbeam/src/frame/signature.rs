@@ -2,14 +2,17 @@
 use alloc::vec::Vec;
 
 use crate::crypto::policy::VerificationPolicy;
+use crate::crypto::profiles::SigningProvider;
 use crate::crypto::sign::{
-	CanonicalForm, CmsSigner, PrehashVerifier, SignatureAlgorithmIdentifier, SignatureEncoding, Signed, SignedContent,
-	SignerInfoDraft, SigningIdentity, VerifiedSignature,
+	CanonicalForm, CmsSigner, SignatureAlgorithmIdentifier, SignatureEncoding, Signed, SignedContent, SignerInfoDraft,
+	SigningIdentity, VerifiedSignature,
 };
 use crate::crypto::x509::utils::CertificateExt;
+use crate::crypto::x509::{ErasedSigning, PeerCertificate, Signing};
 use crate::der::Encode;
 use crate::error::Result;
 use crate::frame::scaffold::TbsScaffold;
+use crate::spki::SubjectPublicKeyInfoRef;
 use crate::version::GatedField;
 use crate::x509::Certificate;
 use crate::{Frame, SignerInfo, TightBeamError};
@@ -33,42 +36,51 @@ impl Frame {
 		Ok(scaffold.to_der()?)
 	}
 
-	/// Verify the signature of the TightBeam message under `verifier`.
+	/// Verify the signature of the TightBeam message under `signer`, a
+	/// certificate admitted for signing under the provider `P`.
 	///
-	/// The `SignerInfo` signs the TBS encoding as content of type `id-data`,
-	/// so the CMS signer checks its signed attributes against those bytes and
-	/// verifies the signature over the attributes (RFC 5652 §5.4). It returns
-	/// the signature in its canonical form, the replay key of the frame.
+	/// The `SignerInfo` signs the TBS encoding as content of type `id-data`, so
+	/// the CMS signer checks it in this order (RFC 5652 §5.4):
+	///
+	/// 1. Its `sid` names `signer`.
+	/// 2. Its signed attributes match those bytes.
+	/// 3. The signature verifies over the attributes.
+	///
+	/// It returns the signature in its canonical form, the replay key of the
+	/// frame.
 	///
 	/// # Errors
 	///
 	/// - [`TightBeamError::MissingSignature`] -- the frame holds no signature.
 	/// - [`TightBeamError::UnexpectedAlgorithm`] -- the SignerInfo names
-	///   another signature algorithm than `S`'s, or another digest than the
+	///   another signature algorithm than `P`'s, or another digest than the
 	///   one it names.
 	/// - [`TightBeamError::SerializationError`] -- the TBS or a signed attribute fails to encode.
-	/// - [`TightBeamError::SignatureError`] -- the signature is no `S` value or fails to verify.
-	/// - [`TightBeamError::Signer`] -- the version or the signed attributes break the CMS rules.
+	/// - [`TightBeamError::SignatureError`] -- the signature is no value of `P` or fails to verify.
+	/// - [`TightBeamError::CertificateValidationError`] -- the key identifier of `signer` fails to decode.
+	/// - [`TightBeamError::Signer`] -- the `sid` names another certificate, or
+	///   the version or the signed attributes break the CMS rules.
 	///
 	/// # See also
 	///
 	/// - [`Frame::sign_with_provider`]: the signing counterpart under the same convention
 	/// - [`Frame::to_tbs`]: the exact bytes the signature covers
-	pub fn verify<S>(&self, verifier: &impl PrehashVerifier<S>) -> Result<VerifiedSignature>
+	pub fn verify<P>(&self, signer: &PeerCertificate<Signing<P>>) -> Result<VerifiedSignature>
 	where
-		S: CanonicalForm + SignatureEncoding + SignatureAlgorithmIdentifier,
+		P: SigningProvider,
+		P::VerifyingKey: for<'a> TryFrom<SubjectPublicKeyInfoRef<'a>, Error = crate::spki::Error>,
 	{
 		let signer_info = self.nonrepudiation.as_ref().ok_or(TightBeamError::MissingSignature)?;
 		let tbs = self.to_tbs()?;
 		let content = SignedContent::data(&tbs);
-		Ok(CmsSigner::verify::<S, _>(signer_info, verifier, content)?)
+		Ok(CmsSigner::verify_signer::<P>(signer_info, signer, content)?)
 	}
 
-	/// Verify the signature of the TightBeam message under `certificate`,
-	/// with the algorithms of `policy`.
+	/// Verify the signature of the TightBeam message under `signer`, a
+	/// certificate admitted for signing, with the algorithms of `policy`.
 	///
 	/// A trust store verifies a frame this way once it resolved the signer's
-	/// certificate. The `sid` must name `certificate`.
+	/// certificate. The `sid` must name `signer`.
 	///
 	/// # Errors
 	///
@@ -79,13 +91,13 @@ impl Frame {
 	/// - [`TightBeamError::Signer`] -- the `sid`, version, or signed attributes break a CMS rule.
 	pub fn verify_under(
 		&self,
-		certificate: &Certificate,
+		signer: &PeerCertificate<ErasedSigning>,
 		policy: &dyn VerificationPolicy,
 	) -> Result<VerifiedSignature> {
 		let signer_info = self.nonrepudiation.as_ref().ok_or(TightBeamError::MissingSignature)?;
 		let tbs = self.to_tbs()?;
 		let content = SignedContent::data(&tbs);
-		Ok(CmsSigner::verify_with_policy(signer_info, certificate, policy, content)?)
+		Ok(CmsSigner::verify_with_policy(signer_info, signer, policy, content)?)
 	}
 
 	/// Sign the frame under `identity`, whose key provider may be an HSM or a

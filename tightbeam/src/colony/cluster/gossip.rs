@@ -134,7 +134,7 @@ impl ClusterTlsConfig {
 	///
 	/// - [`TightBeamError`] -- the frame carries no signature, or the signature fails to verify.
 	pub(crate) fn verify_own(&self, frame: Frame) -> Result<VerifiedRumor, TightBeamError> {
-		let signature = frame.verify_under(self.identity.certificate(), self.identity.policy())?;
+		let signature = frame.verify_under(self.identity.signing_certificate(), self.identity.policy())?;
 		Ok(VerifiedRumor::new(frame, signature))
 	}
 }
@@ -910,10 +910,10 @@ mod tests {
 	const WINDOW: Duration = Duration::from_millis(30_000);
 
 	/// `rumor` beside its signature, as its verification under the fixed test
-	/// key returns it.
+	/// identity returns it.
 	fn verified(rumor: Frame) -> VerifiedRumor {
-		let key = TestKey::insecure_fixed_signing();
-		let verifying = rumor.verify::<Secp256k1Signature>(key.verifying_key());
+		let identity = TestIdentity::insecure_fixed();
+		let verifying = rumor.verify_under(identity.signing_certificate(), identity.policy());
 		let signature = verifying.expect("the fixed test key signed the rumor");
 		VerifiedRumor::new(rumor, signature)
 	}

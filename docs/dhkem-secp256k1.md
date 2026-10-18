@@ -87,21 +87,21 @@ KEK = HKDF-SHA3-256(IKM = shared_secret, salt = "", info = DER(CMSORIforKEMOther
 
 ## Certificate conventions
 
-The recipient's public key travels in a certificate whose SubjectPublicKeyInfo is `id-ecPublicKey` with the named curve secp256k1 ([RFC 5480][rfc5480] § 2).
+The recipient's public key travels in a certificate whose SubjectPublicKeyInfo is `id-ecPublicKey` with the named curve secp256k1 ([RFC 5480][rfc5480] § 2). Its point MUST be compressed or uncompressed, and the sender and the recipient refuse a first octet other than `0x02`, `0x03`, or `0x04` ([RFC 5480][rfc5480] § 2.2).
 
-The certificate MUST carry a `keyUsage` extension, and it MUST assert `keyAgreement`. Two standards disagree on the bit, and this specification follows the second:
+The certificate MUST carry a `keyUsage` extension, it MUST assert `keyAgreement`, and it MUST NOT assert `decipherOnly`, which would limit the agreed key to deciphering ([RFC 5280][rfc5280] § 4.2.1.3). Two standards disagree on the bit, and this specification follows the second:
 
 - [RFC 9629][rfc9629] § 3 says that "a recipient X.509 version 3 certificate that contains a key usage extension MUST assert the keyEncipherment bit".
 - [RFC 5480][rfc5480] § 3 limits the `keyUsage` of an `id-ecPublicKey` end-entity certificate to `digitalSignature`, `nonRepudiation`, and `keyAgreement`, so no conforming certificate of this key type carries `keyEncipherment`. [RFC 5280][rfc5280] § 4.2.1.3 names `keyAgreement` for a key used in key agreement, which DHKEM is.
 
-A certificate with no `keyUsage` extension would leave its use unchecked. The sender refuses to encapsulate to a certificate whose `keyUsage` is absent or lacks `keyAgreement`, and the recipient refuses to open under one. tightbeam makes both checks in one place, `CertificateExt::require_key_usage`, so an outside KEM gets them without writing them. A CMS server certificate signs its Finished and receives the opening, so it asserts `digitalSignature` and `keyAgreement`, which RFC 5480 § 3 allows on one `id-ecPublicKey` end-entity certificate.
+A certificate with no `keyUsage` extension would leave its use unchecked. The sender refuses to encapsulate to a certificate whose `keyUsage` is absent, lacks `keyAgreement`, or asserts `decipherOnly`, and the recipient refuses to open under one. tightbeam makes these checks in one place, the parse of `PeerCertificate<KeyAgreement<K>>`: a `KemRecipient` is built from that parse, and `KeyAgreementIdentity::new` runs it, so an outside KEM gets the checks without writing them. The bit is the KEM's `RecipientKem::USAGE`, `keyAgreement` for this KEM, so an outside KEM whose certificate profile names `keyEncipherment`, as ML-KEM's does ([RFC 9935][rfc9935] § 5, [RFC 9629][rfc9629] § 3), sets that bit instead. A certificate whose `keyUsage` also asserts `digitalSignature` is admitted, as RFC 5480 § 3 allows on one `id-ecPublicKey` end-entity certificate.
 
 ## Security considerations
 
 - secp256k1 offers about 128 bits of security. HKDF-SHA256 and HKDF-SHA3-256 offer at least that, as [RFC 9629][rfc9629] § 7 asks of the KDF.
 - Each encapsulation draws a fresh ephemeral, and its shared secret serves one `KEMRecipientInfo` alone. The shared secret MUST NOT be reused for any other purpose ([RFC 9629][rfc9629] § 7).
 - `Decap` runs only on a point that `DeserializePublicKey` admitted, so no scalar multiplication runs on an invalid point.
-- A recipient key that also signs serves two purposes. A deployment SHOULD certify the KEM recipient key apart from its signing key ([NIST SP 800-57 Part 1 Rev. 5][sp800-57] § 5.2).
+- A recipient key that also signs serves two purposes. A deployment SHOULD certify the KEM recipient key apart from its signing key ([NIST SP 800-57 Part 1 Rev. 5][sp800-57] § 5.2). The tightbeam CMS handshake does: its server holds a key-agreement certificate apart from its signing certificate, and refuses one key in both.
 
 ## Test vectors
 
@@ -111,6 +111,7 @@ The KEM layer has published vectors in [draft-wahby-cfrg-hpke-kem-secp256k1-01][
 
 - [RFC 9629][rfc9629]: Using Key Encapsulation Mechanism (KEM) Algorithms in the Cryptographic Message Syntax (CMS)
 - [RFC 9936][rfc9936]: Use of ML-KEM in the Cryptographic Message Syntax (CMS)
+- [RFC 9935][rfc9935]: Algorithm Identifiers for the Module-Lattice-Based Key-Encapsulation Mechanism (ML-KEM) in the Internet X.509 Public Key Infrastructure
 - [RFC 9180][rfc9180]: Hybrid Public Key Encryption
 - [draft-wahby-cfrg-hpke-kem-secp256k1-01][wahby]: Hybrid Public Key Encryption with secp256k1
 - [RFC 9688][rfc9688]: Use of the SHA3 One-Way Hash Functions in the Cryptographic Message Syntax (CMS)
@@ -123,6 +124,7 @@ The KEM layer has published vectors in [draft-wahby-cfrg-hpke-kem-secp256k1-01][
 
 [rfc9629]: https://datatracker.ietf.org/doc/html/rfc9629
 [rfc9936]: https://datatracker.ietf.org/doc/html/rfc9936
+[rfc9935]: https://datatracker.ietf.org/doc/html/rfc9935
 [rfc9180]: https://datatracker.ietf.org/doc/html/rfc9180
 [wahby]: https://datatracker.ietf.org/doc/html/draft-wahby-cfrg-hpke-kem-secp256k1-01
 [rfc9688]: https://datatracker.ietf.org/doc/html/rfc9688

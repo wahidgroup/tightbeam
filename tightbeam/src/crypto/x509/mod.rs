@@ -3,8 +3,21 @@ pub mod policy;
 pub mod store;
 pub mod utils;
 
+mod peer;
+
+pub use peer::{CertificateUse, ErasedSigning, KeyPurposes, PeerCertificate};
 pub use x509_cert::{attr, ext, name, serial_number, time, Certificate, TbsCertificate, Version};
 
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+pub(crate) use peer::AgreementPoint;
+#[cfg(all(feature = "hpke", feature = "signature", feature = "ecdh"))]
+pub(crate) use peer::EllipticCurvePoint;
+#[cfg(all(feature = "hpke", feature = "signature"))]
+pub use peer::KeyAgreement;
+#[cfg(feature = "signature")]
+pub use peer::Signing;
+#[cfg(feature = "transport-cms")]
+pub(crate) use peer::SubjectKey;
 #[cfg(feature = "builder")]
 pub use x509_cert::builder;
 

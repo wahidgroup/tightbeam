@@ -85,6 +85,14 @@ use crate::crypto::sign::SigningIdentity;
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::transport::handshake::PeerAuthentication;
 use crate::transport::state::{DialableEncryption, EncryptionConfig};
+
+#[cfg(feature = "transport-cms")]
+use crate::crypto::cms::KeyAgreementIdentity;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::crypto::x509::KeyPurposes;
+#[cfg(feature = "transport-cms")]
+use crate::transport::handshake::{CmsIdentityPair, HandshakeError};
+use crate::transport::state::ServerIdentities;
 use crate::utils::time::Clock;
 use crate::x509::Certificate;
 
@@ -146,31 +154,43 @@ impl Default for TransportLimits {
 #[non_exhaustive]
 pub struct TransportEncryptionConfig<P: CryptoProvider> {
 	/// The certificate this endpoint presents during the handshake, with the
-	/// key that signs for it.
-	pub(crate) identity: SigningIdentity,
+	/// key that signs for it, and for a CMS server its key-agreement identity.
+	pub(crate) identity: ServerIdentities<P>,
 	/// How this server authenticates its client.
 	pub(crate) peer_authentication: PeerAuthentication,
+	/// The key purpose of each role the server's handshakes admit.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	pub(crate) key_purposes: KeyPurposes,
 	/// Every ceiling this endpoint enforces.
 	pub(crate) limits: TransportLimits,
 	/// The provider the endpoint's handshakes run under.
 	_provider: core::marker::PhantomData<fn() -> P>,
 }
 
-impl<P: CryptoProvider> From<TransportEncryptionConfig<P>> for DialableEncryption<P> {
+impl<P: CryptoProvider> TryFrom<TransportEncryptionConfig<P>> for DialableEncryption<P> {
+	type Error = TransportError;
+
 	/// The one place a server's configuration becomes provisioning.
 	///
-	/// A server presents a certificate, which is one of the things that answers
-	/// for the peer, so the dialer rule holds for every configuration of this
-	/// shape and is discharged by the type rather than by a check. `limits` is
+	/// It answers through [`DialableEncryption::new`], the one guard of every
+	/// provisioning. A server presents a certificate, which answers for the
+	/// peer, so the dialer rule holds for every configuration of this shape,
+	/// and the identity is admitted for the server purpose once. `limits` is
 	/// not provisioning, so [`EndpointConfig`] carries it beside this value.
-	fn from(config: TransportEncryptionConfig<P>) -> Self {
+	///
+	/// # Errors
+	///
+	/// - The [`DialableEncryption::new`] set.
+	fn try_from(config: TransportEncryptionConfig<P>) -> TransportResult<Self> {
 		let encryption = EncryptionConfig {
 			server_identity: Some(config.identity),
 			peer_authentication: config.peer_authentication,
+			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+			key_purposes: config.key_purposes,
 			..EncryptionConfig::unconfigured()
 		};
 
-		Self::from_peer_authority(encryption)
+		Self::new(encryption)
 	}
 }
 
@@ -259,10 +279,16 @@ impl<P: CryptoProvider> Clone for EndpointConfig<P> {
 /// A server endpoint on the operating system's clocks, enforcing the
 /// ceilings `config` names.
 #[cfg(host_clock)]
-impl<P: CryptoProvider> From<TransportEncryptionConfig<P>> for EndpointConfig<P> {
-	fn from(config: TransportEncryptionConfig<P>) -> Self {
+impl<P: CryptoProvider> TryFrom<TransportEncryptionConfig<P>> for EndpointConfig<P> {
+	type Error = TransportError;
+
+	/// # Errors
+	///
+	/// - The [`DialableEncryption`] conversion set.
+	fn try_from(config: TransportEncryptionConfig<P>) -> TransportResult<Self> {
 		let limits = config.limits;
-		Self::new(config, Arc::new(SystemClock)).with_limits(limits)
+		let encryption = DialableEncryption::try_from(config)?;
+		Ok(Self::new(encryption, Arc::new(SystemClock)).with_limits(limits))
 	}
 }
 
@@ -273,8 +299,10 @@ impl<P: CryptoProvider> TransportEncryptionConfig<P> {
 	/// the two arrive checked against each other.
 	pub fn new(identity: SigningIdentity) -> Self {
 		Self {
-			identity,
+			identity: identity.into(),
 			peer_authentication: PeerAuthentication::Anonymous,
+			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+			key_purposes: KeyPurposes::default(),
 			limits: TransportLimits::default(),
 			_provider: core::marker::PhantomData,
 		}
@@ -316,10 +344,40 @@ impl<P: CryptoProvider> TransportEncryptionConfig<P> {
 		&self.limits
 	}
 
+	/// Set the key purpose of each role: the purpose the server's own
+	/// certificates carry, and the purpose a client's certificate carries.
+	/// The default is [`KeyPurposes::HOUSE`].
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	#[must_use]
+	pub fn with_key_purposes(mut self, key_purposes: KeyPurposes) -> Self {
+		self.key_purposes = key_purposes;
+		self
+	}
+
 	/// Return the identity certificate this endpoint presents during the
-	/// handshake.
+	/// handshake, the one whose key signs its replies.
 	pub fn certificate(&self) -> &Certificate {
-		self.identity.certificate()
+		self.identity.signing().certificate()
+	}
+}
+
+#[cfg(feature = "transport-cms")]
+impl<P: CryptoProvider> TransportEncryptionConfig<P> {
+	/// Pair the signing identity this endpoint presents with `key_agreement`,
+	/// the identity the CMS opening seals to, once, as a
+	/// [`CmsIdentityPair`].
+	///
+	/// A server of the CMS flow needs the pair, and a server of the HPKE flow
+	/// signs with the signing identity alone.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::SubjectMismatch`] -- the two certificates name two subjects.
+	/// - [`HandshakeError::KeyReuse`] -- the two certificates hold one key.
+	pub fn with_key_agreement(self, key_agreement: KeyAgreementIdentity<P::Kem>) -> Result<Self, HandshakeError> {
+		let signing = self.identity.into_signing();
+		let pair = CmsIdentityPair::new(signing, key_agreement)?;
+		Ok(Self { identity: ServerIdentities::Cms(pair), ..self })
 	}
 }
 

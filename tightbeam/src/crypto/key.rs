@@ -1,11 +1,15 @@
 //! Pluggable key backends for tightbeam transport encryption.
 //!
-//! The [`SigningKeyProvider`] trait abstracts the cryptographic key
-//! operations, so a backend may hold its keys in memory, in an HSM, in a KMS,
-//! or in an enclave.
+//! A backend may hold its keys in memory, in an HSM, in a KMS, or in an
+//! enclave. Each private-key operation is a trait of its own, so the compiler
+//! refuses a backend where another operation belongs:
 //!
-//! The trait is algorithm-agnostic and carries every value as bytes. A
-//! concrete implementation such as [`EcdsaKeyProvider`] handles the
+//! - [`KeyBackend`] states what every private-key backend states about
+//!   itself: its algorithm and its public key.
+//! - [`SigningKeyProvider`] signs a prehash.
+//! - [`DiffieHellman`] runs the agreement that a DHKEM decapsulation asks of its key holder.
+//!
+//! A concrete implementation such as [`EcdsaKeyProvider`] handles the
 //! algorithm-specific encoding and decoding.
 
 #[cfg(not(feature = "std"))]
@@ -25,8 +29,6 @@ use crate::Errorizable;
 
 #[cfg(feature = "signature")]
 use crate::utils::marker::{MaybeSend, MaybeSendFuture, MaybeSync};
-#[cfg(all(feature = "signature", feature = "ecdh"))]
-use crate::zeroize::Zeroizing;
 #[cfg(all(feature = "std", any(feature = "signature", feature = "aead")))]
 use std::sync::Arc;
 
@@ -80,7 +82,7 @@ mod common {
 #[cfg(any(feature = "signature", feature = "aead"))]
 use common::*;
 
-#[cfg(any(feature = "signature", feature = "aead"))]
+#[cfg(any(all(feature = "signature", feature = "ecdh"), feature = "aead"))]
 use crate::crypto::secret::SecretSlice;
 
 /// Errors from key provider operations.
@@ -127,10 +129,6 @@ pub enum KeyError {
 	#[cfg(feature = "signature")]
 	#[error("Signing key length mismatch: {0}")]
 	KeyLengthError(crate::error::ReceivedExpectedError<usize, usize>),
-
-	/// This key provider does not support the operation.
-	#[error("Operation not supported by this key provider")]
-	UnsupportedOperation,
 }
 
 crate::impl_from!(crate::spki::Error => KeyError::SpkiError);
@@ -210,24 +208,13 @@ impl SigningKeySpec {
 	}
 }
 
-/// A pluggable backend for private key operations.
+/// What every private-key backend states about itself, shared by the
+/// signing and the key-agreement backends.
 ///
-/// An implementation provides key agreement and signing without exposing the
-/// raw key material. Hardware Security Modules (HSMs), Key Management Services
-/// (KMS), and secure enclaves can therefore hold private keys inside their
-/// secure boundary.
-///
-/// # Security Properties
-///
-/// - **Key encapsulation**: private keys stay inside the provider boundary.
-/// - **Uniform interface**: in-memory and remote backends use identical APIs.
-/// - **Async private-key operations**: signing and key agreement are async, so
-///   a remote backend fits the same API. The public key is read in place, so
-///   a [`SigningIdentity`] checks it against its certificate when it is built,
-///   and a remote backend fetches it once when the provider is built.
-/// - **Algorithm agnostic**: the byte encoding admits any signature or key algorithm.
-///
-/// [`SigningIdentity`]: crate::crypto::sign::SigningIdentity
+/// An implementation keeps its private key inside its boundary, so a Hardware
+/// Security Module (HSM), a Key Management Service (KMS), or a secure enclave
+/// can hold it. The operation the key performs is a trait of its own that
+/// names this one as its supertrait, such as [`SigningKeyProvider`].
 ///
 /// # Threading
 ///
@@ -235,17 +222,44 @@ impl SigningKeySpec {
 /// single-threaded executor lets JavaScript-backed providers (WebAuthn,
 /// wallets, remote KMS bridges) implement the trait.
 #[cfg(feature = "signature")]
-pub trait SigningKeyProvider: MaybeSend + MaybeSync + Debug {
+pub trait KeyBackend: MaybeSend + MaybeSync + Debug {
 	/// Returns the algorithm identifier for this key.
 	fn algorithm(&self) -> AlgorithmIdentifierOwned;
 
 	/// Returns the public key as a DER SubjectPublicKeyInfo.
 	///
+	/// The public key is read in place, so an identity checks it against its
+	/// certificate when it is built, and a remote backend fetches it once when
+	/// the backend is built.
+	///
 	/// # Errors
 	///
 	/// - [`KeyError`] -- the backend fails to encode the public key.
 	fn to_public_key_bytes(&self) -> Result<Vec<u8>, KeyError>;
+}
 
+/// A shared backend is a backend, so one handle serves every endpoint that
+/// holds the same key.
+#[cfg(feature = "signature")]
+impl<T: KeyBackend + ?Sized> KeyBackend for Arc<T> {
+	fn algorithm(&self) -> AlgorithmIdentifierOwned {
+		T::algorithm(self)
+	}
+
+	fn to_public_key_bytes(&self) -> Result<Vec<u8>, KeyError> {
+		T::to_public_key_bytes(self)
+	}
+}
+
+/// A backend whose private key signs.
+///
+/// The signature is async, so a remote backend fits the same API, and the
+/// byte encoding admits any signature algorithm. The compiler refuses a
+/// `dyn SigningKeyProvider` where a `dyn DiffieHellman` belongs, and
+/// `CmsIdentityPair::new` refuses one key in both, so a backend of both,
+/// such as [`EcdsaKeyProvider`], serves one identity per key.
+#[cfg(feature = "signature")]
+pub trait SigningKeyProvider: KeyBackend {
 	/// Signs a precomputed digest (prehash) with this provider's private key.
 	///
 	/// The canonical tightbeam convention hashes content exactly once (see
@@ -263,51 +277,43 @@ pub trait SigningKeyProvider: MaybeSend + MaybeSync + Debug {
 	///
 	/// [`sign_canonical`]: crate::crypto::sign::CanonicalSigner::sign_canonical
 	fn sign_prehash(&self, prehash: &[u8]) -> MaybeSendFuture<'_, Result<Vec<u8>, KeyError>>;
-
-	/// Performs key agreement, such as ECDH or X25519.
-	///
-	/// It computes a shared secret for session key derivation from this
-	/// provider's private key and the peer's public key. The result is a
-	/// [`SecretSlice`], so the secret zeroizes on drop (CWE-212).
-	///
-	/// - `peer_public_key`: the peer's public key bytes, SEC1 or DER encoded.
-	///
-	/// # Default
-	///
-	/// The default returns [`KeyError::UnsupportedOperation`], because some
-	/// key types have no key agreement.
-	///
-	/// # Errors
-	///
-	/// - [`KeyError::UnsupportedOperation`] -- the key type has no key agreement.
-	/// - [`KeyError`] -- the peer key fails to parse, or the backend fails.
-	fn key_agreement(&self, _peer_public_key: &[u8]) -> MaybeSendFuture<'_, Result<SecretSlice<u8>, KeyError>> {
-		Box::pin(async { Err(KeyError::UnsupportedOperation) })
-	}
 }
 
 /// A shared provider is a provider, so one handle serves every endpoint that
 /// signs with the same key.
 #[cfg(feature = "signature")]
 impl<T: SigningKeyProvider + ?Sized> SigningKeyProvider for Arc<T> {
-	fn algorithm(&self) -> AlgorithmIdentifierOwned {
-		T::algorithm(self)
-	}
-
-	fn to_public_key_bytes(&self) -> Result<Vec<u8>, KeyError> {
-		T::to_public_key_bytes(self)
-	}
-
 	fn sign_prehash(&self, prehash: &[u8]) -> MaybeSendFuture<'_, Result<Vec<u8>, KeyError>> {
 		T::sign_prehash(self, prehash)
 	}
+}
 
-	fn key_agreement(&self, peer_public_key: &[u8]) -> MaybeSendFuture<'_, Result<SecretSlice<u8>, KeyError>> {
-		T::key_agreement(self, peer_public_key)
+/// The one operation a DHKEM asks of the holder of its recipient key: the
+/// Diffie-Hellman agreement on the curve `C` (RFC 9180 §4.1).
+///
+/// The house [`EcdsaKeyProvider`] implements it, and a KMS implements it
+/// without revealing the scalar. The result is a [`SecretSlice`], so the
+/// shared secret zeroizes on drop (CWE-212).
+#[cfg(all(feature = "signature", feature = "ecdh"))]
+pub trait DiffieHellman<C: CurveArithmetic>: KeyBackend {
+	/// The x-coordinate of the product of this backend's scalar and `peer`.
+	///
+	/// # Errors
+	///
+	/// - [`KeyError`] -- the backend fails the agreement.
+	fn agree<'a>(&'a self, peer: &'a PublicKey<C>) -> MaybeSendFuture<'a, Result<SecretSlice<u8>, KeyError>>;
+}
+
+/// A shared backend agrees as the backend it shares.
+#[cfg(all(feature = "signature", feature = "ecdh"))]
+impl<C: CurveArithmetic, T: DiffieHellman<C> + ?Sized> DiffieHellman<C> for Arc<T> {
+	fn agree<'a>(&'a self, peer: &'a PublicKey<C>) -> MaybeSendFuture<'a, Result<SecretSlice<u8>, KeyError>> {
+		T::agree(self, peer)
 	}
 }
 
-/// An ECDSA key provider that signs and runs ECDH key agreement.
+/// An ECDSA key provider that signs, and runs ECDH key agreement under
+/// `ecdh`.
 ///
 /// It wraps an ECDSA signing key on any curve `C`. It is the recommended
 /// provider for the TightBeam transport handshakes.
@@ -352,7 +358,7 @@ where
 }
 
 #[cfg(all(feature = "signature", feature = "secp256k1"))]
-impl<C> SigningKeyProvider for EcdsaKeyProvider<C>
+impl<C> KeyBackend for EcdsaKeyProvider<C>
 where
 	C: PrimeCurve + CurveArithmetic + DigestPrimitive + PointCompression + AssociatedOid + Send + Sync + 'static,
 	Scalar<C>: Invert<Output = CtOption<Scalar<C>>> + SignPrimitive<C> + Reduce<C::Uint>,
@@ -373,7 +379,22 @@ where
 		let encoded = self.signing_key.verifying_key().to_public_key_der()?;
 		Ok(encoded.into_vec())
 	}
+}
 
+#[cfg(all(feature = "signature", feature = "secp256k1"))]
+impl<C> SigningKeyProvider for EcdsaKeyProvider<C>
+where
+	C: PrimeCurve + CurveArithmetic + DigestPrimitive + PointCompression + AssociatedOid + Send + Sync + 'static,
+	Scalar<C>: Invert<Output = CtOption<Scalar<C>>> + SignPrimitive<C> + Reduce<C::Uint>,
+	SignatureSize<C>: ArrayLength<u8>,
+	MaxSize<C>: ArrayLength<u8>,
+	<FieldBytesSize<C> as core::ops::Add>::Output: core::ops::Add<MaxOverhead> + ArrayLength<u8>,
+	FieldBytesSize<C>: ModulusSize,
+	AffinePoint<C>: VerifyPrimitive<C> + FromEncodedPoint<C> + ToEncodedPoint<C>,
+	SigningKey<C>: PrehashSigner<DerSignature<C>> + Keypair + Send + Sync + Debug,
+	<SigningKey<C> as Keypair>::VerifyingKey: EncodePublicKey,
+	DerSignature<C>: SignatureEncoding + SignatureAlgorithmIdentifier + Send + Sync,
+{
 	/// The ECDSA signer of the curve returns `s` in the low half of the order,
 	/// and the result is its DER encoding.
 	fn sign_prehash(&self, prehash: &[u8]) -> MaybeSendFuture<'_, Result<Vec<u8>, KeyError>> {
@@ -385,20 +406,29 @@ where
 
 		Box::pin(async move { result })
 	}
+}
 
-	#[cfg(feature = "ecdh")]
-	fn key_agreement(&self, peer_public_key: &[u8]) -> MaybeSendFuture<'_, Result<SecretSlice<u8>, KeyError>> {
-		let pk_result = PublicKey::<C>::from_sec1_bytes(peer_public_key);
-		// The scalar copy lives across the await, so `Zeroizing` wraps it. A
-		// cancelled agreement then drops the copy wiped, and no freed future
-		// holds the private key (CWE-226).
-		let secret_key = Zeroizing::new(*self.signing_key.as_nonzero_scalar());
-
-		Box::pin(async move {
-			let pk = pk_result?;
-			let shared_secret = diffie_hellman(*secret_key, pk.as_affine());
-			Ok(SecretSlice::from(shared_secret.raw_secret_bytes().to_vec()))
-		})
+/// The agreement runs before the future is built, so no copy of the scalar
+/// lives across an await, and a cancelled agreement leaves none behind
+/// (CWE-226).
+#[cfg(all(feature = "signature", feature = "secp256k1", feature = "ecdh"))]
+impl<C> DiffieHellman<C> for EcdsaKeyProvider<C>
+where
+	C: PrimeCurve + CurveArithmetic + DigestPrimitive + PointCompression + AssociatedOid + Send + Sync + 'static,
+	Scalar<C>: Invert<Output = CtOption<Scalar<C>>> + SignPrimitive<C> + Reduce<C::Uint>,
+	SignatureSize<C>: ArrayLength<u8>,
+	MaxSize<C>: ArrayLength<u8>,
+	<FieldBytesSize<C> as core::ops::Add>::Output: core::ops::Add<MaxOverhead> + ArrayLength<u8>,
+	FieldBytesSize<C>: ModulusSize,
+	AffinePoint<C>: VerifyPrimitive<C> + FromEncodedPoint<C> + ToEncodedPoint<C>,
+	SigningKey<C>: PrehashSigner<DerSignature<C>> + Keypair + Send + Sync + Debug,
+	<SigningKey<C> as Keypair>::VerifyingKey: EncodePublicKey,
+	DerSignature<C>: SignatureEncoding + SignatureAlgorithmIdentifier + Send + Sync,
+{
+	fn agree<'a>(&'a self, peer: &'a PublicKey<C>) -> MaybeSendFuture<'a, Result<SecretSlice<u8>, KeyError>> {
+		let shared_secret = diffie_hellman(self.signing_key.as_nonzero_scalar(), peer.as_affine());
+		let agreed = SecretSlice::from(shared_secret.raw_secret_bytes().to_vec());
+		Box::pin(async move { Ok(agreed) })
 	}
 }
 
@@ -653,6 +683,7 @@ mod tests {
 		Ok(())
 	}
 
+	#[cfg(feature = "ecdh")]
 	#[tokio::test]
 	async fn test_secp256k1_provider_key_agreement() -> Result<(), Box<dyn std::error::Error>> {
 		let signing_key1 = SigningKey::random(&mut OsRng);
@@ -661,14 +692,12 @@ mod tests {
 		let provider1 = Secp256k1KeyProvider::from(signing_key1.clone());
 		let provider2 = Secp256k1KeyProvider::from(signing_key2.clone());
 
-		// This provider's `key_agreement` parses SEC1 public keys only, so the
-		// test passes SEC1 points instead of DER SPKI.
-		let public1 = signing_key1.verifying_key().to_encoded_point(false).as_bytes().to_vec();
-		let public2 = signing_key2.verifying_key().to_encoded_point(false).as_bytes().to_vec();
+		let public1 = PublicKey::from(signing_key1.verifying_key());
+		let public2 = PublicKey::from(signing_key2.verifying_key());
 
 		// Both sides must compute the same shared secret.
-		let shared1 = provider1.key_agreement(&public2).await?.to_insecure();
-		let shared2 = provider2.key_agreement(&public1).await?.to_insecure();
+		let shared1 = provider1.agree(&public2).await?.to_insecure();
+		let shared2 = provider2.agree(&public1).await?.to_insecure();
 		assert_eq!(shared1, shared2);
 		assert_eq!(shared1.len(), 32); // secp256k1 shared secret is 32 bytes
 		Ok(())

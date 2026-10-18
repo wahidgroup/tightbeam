@@ -8,14 +8,17 @@ use crate::cms::content_info::CmsVersion;
 use crate::cms::revocation::{OtherRevocationInfoFormat, RevocationInfoChoice, RevocationInfoChoices};
 use crate::cms::signed_data::{CertificateSet, SignedAttributes, SignedData, SignerIdentifier, SignerInfo};
 use crate::crypto::hash::Sha3_256;
-use crate::crypto::key::{KeyError, Secp256k1KeyProvider, SigningKeyProvider};
+use crate::crypto::key::{KeyBackend, KeyError, Secp256k1KeyProvider, SigningKeyProvider};
 use crate::crypto::policy::Secp256k1Policy;
 use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::crypto::sign::ecdsa::{Secp256k1, Secp256k1Signature, Secp256k1SigningKey};
 use crate::crypto::sign::elliptic_curve::ALGORITHM_OID as EC_PUBLIC_KEY;
 use crate::crypto::x509::error::CertificateValidationError;
 use crate::crypto::x509::utils::{CertificateExt, Skid};
+use crate::crypto::x509::KeyPurposes;
+use crate::crypto::x509::{ErasedSigning, PeerCertificate, Signing};
 use crate::der::asn1::{BitString, OctetString, SetOfVec};
+use crate::der::oid::AssociatedOid;
 use crate::der::{Any, Decode, Encode, Tag};
 use crate::error::ReceivedExpectedError;
 use crate::oids::{
@@ -26,7 +29,7 @@ use crate::spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoOwned};
 use crate::testing::fixtures::{TestAttributes, TestCertificate, TestIdentity, TestKey};
 use crate::utils::marker::MaybeSendFuture;
 use crate::x509::attr::Attribute;
-use crate::x509::ext::pkix::SubjectKeyIdentifier;
+use crate::x509::ext::pkix::{KeyUsage, KeyUsages, SubjectKeyIdentifier};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -37,8 +40,8 @@ const CONTENT: &[u8] = b"cms signer content";
 /// names it by issuer and serial number.
 fn issuer_and_serial_key() -> CertifiedKey<Secp256k1SigningKey> {
 	let key = TestKey::insecure_fixed_signing();
-	let mut certificate = TestCertificate::self_signed(&key);
-	certificate.tbs_certificate.extensions = None;
+	let certificate = TestCertificate::self_signed(&key);
+	let certificate = TestCertificate::without_extension(certificate, SubjectKeyIdentifier::OID);
 	CertifiedKey::new(&certificate, key).expect("the test key matches its certificate")
 }
 
@@ -70,7 +73,7 @@ struct ExternalProvider {
 	reshape: fn(ecdsa::Signature<Secp256k1>) -> Vec<u8>,
 }
 
-impl SigningKeyProvider for ExternalProvider {
+impl KeyBackend for ExternalProvider {
 	fn algorithm(&self) -> AlgorithmIdentifierOwned {
 		AlgorithmIdentifierOwned { oid: self.algorithm, parameters: None }
 	}
@@ -78,7 +81,9 @@ impl SigningKeyProvider for ExternalProvider {
 	fn to_public_key_bytes(&self) -> Result<Vec<u8>, KeyError> {
 		self.inner.to_public_key_bytes()
 	}
+}
 
+impl SigningKeyProvider for ExternalProvider {
 	fn sign_prehash(&self, prehash: &[u8]) -> MaybeSendFuture<'_, Result<Vec<u8>, KeyError>> {
 		let signing = self.inner.sign_prehash(prehash);
 		let reshape = self.reshape;
@@ -558,6 +563,41 @@ fn a_signing_identity_refuses_an_algorithm_it_has_no_form_for() {
 	assert!(matches!(refused, Err(SignerError::UnsupportedAlgorithm(oid)) if oid == SIGNER_ECDSA_WITH_SHA256));
 }
 
+/// A certificate whose `keyUsage` carries `keyAgreement` alone pairs with
+/// no signing identity, so its key signs nothing the identity emits.
+#[test]
+fn a_signing_identity_refuses_a_certificate_without_digital_signature() {
+	let key = TestKey::insecure_fixed_signing();
+	let certificate = TestCertificate::self_signed(&key);
+	let certificate = TestCertificate::with_key_usage(certificate, KeyUsage(KeyUsages::KeyAgreement.into()));
+	let provider = Arc::new(Secp256k1KeyProvider::from(key));
+
+	let refused = SigningIdentity::with_provider::<DefaultCryptoProvider>(certificate, provider);
+	assert!(matches!(
+		refused,
+		Err(SignerError::Certificate(CertificateValidationError::MissingKeyUsage(
+			KeyUsages::DigitalSignature
+		)))
+	));
+}
+
+/// A key that signs in place pairs with no certificate whose `keyUsage`
+/// lacks `digitalSignature`.
+#[test]
+fn a_certified_key_refuses_a_certificate_without_digital_signature() {
+	let key = TestKey::insecure_fixed_signing();
+	let certificate = TestCertificate::self_signed(&key);
+	let certificate = TestCertificate::with_key_usage(certificate, KeyUsage(KeyUsages::KeyAgreement.into()));
+
+	let refused = CertifiedKey::new(&certificate, key);
+	assert!(matches!(
+		refused,
+		Err(SignerError::Certificate(CertificateValidationError::MissingKeyUsage(
+			KeyUsages::DigitalSignature
+		)))
+	));
+}
+
 /// A provider that declares `ecdsa-with-SHA3-256` and returns `public_key`
 /// as its SubjectPublicKeyInfo. Its `sign_prehash` refuses every prehash.
 #[derive(Debug)]
@@ -565,7 +605,7 @@ struct DeclaringProvider {
 	public_key: Vec<u8>,
 }
 
-impl SigningKeyProvider for DeclaringProvider {
+impl KeyBackend for DeclaringProvider {
 	fn algorithm(&self) -> AlgorithmIdentifierOwned {
 		AlgorithmIdentifierOwned { oid: SIGNER_ECDSA_WITH_SHA3_256, parameters: None }
 	}
@@ -573,9 +613,11 @@ impl SigningKeyProvider for DeclaringProvider {
 	fn to_public_key_bytes(&self) -> Result<Vec<u8>, KeyError> {
 		Ok(self.public_key.clone())
 	}
+}
 
+impl SigningKeyProvider for DeclaringProvider {
 	fn sign_prehash(&self, _prehash: &[u8]) -> MaybeSendFuture<'_, Result<Vec<u8>, KeyError>> {
-		Box::pin(async { Err(KeyError::UnsupportedOperation) })
+		Box::pin(async { Err(KeyError::SignatureError(crate::crypto::sign::Error::new())) })
 	}
 }
 
@@ -803,12 +845,12 @@ async fn an_identity_signs_under_its_certificate_name() -> TestResult {
 #[tokio::test]
 async fn a_signer_info_verifies_under_the_certificate_it_names() -> TestResult {
 	let identity = TestIdentity::insecure_fixed();
-	let key = TestKey::insecure_fixed_signing();
+
 	let content = SignedContent::data(CONTENT);
 	let signer_info = identity.sign(SignedContent::data(CONTENT)).await?;
-
-	let verifying = CmsSigner::verify_signer::<Secp256k1Signature, _>;
-	verifying(&signer_info, identity.certificate(), key.verifying_key(), content)?;
+	let certificate = identity.certificate_arc();
+	let signer = PeerCertificate::<Signing<DefaultCryptoProvider>>::parse(certificate, KeyPurposes::HOUSE.signer)?;
+	CmsSigner::verify_signer::<DefaultCryptoProvider>(&signer_info, &signer, content)?;
 	Ok(())
 }
 
@@ -819,11 +861,11 @@ async fn a_signer_info_checked_against_another_certificate_is_refused() -> TestR
 	let identity = TestIdentity::insecure_fixed();
 	let other_key = Secp256k1SigningKey::from_bytes(&[2u8; 32].into())?;
 	let other = TestCertificate::self_signed(&other_key);
+	let other = PeerCertificate::<Signing<DefaultCryptoProvider>>::parse(other, KeyPurposes::HOUSE.signer)?;
 	let content = SignedContent::data(CONTENT);
 	let signer_info = identity.sign(SignedContent::data(CONTENT)).await?;
 
-	let verifying = CmsSigner::verify_signer::<Secp256k1Signature, _>;
-	let refused = verifying(&signer_info, &other, other_key.verifying_key(), content);
+	let refused = CmsSigner::verify_signer::<DefaultCryptoProvider>(&signer_info, &other, content);
 	assert!(matches!(refused, Err(SignerError::SignerIdentifier)));
 	Ok(())
 }
@@ -835,8 +877,10 @@ async fn a_signer_info_checked_by_policy_against_another_certificate_is_refused(
 	let identity = TestIdentity::insecure_fixed();
 	let content = SignedContent::data(CONTENT);
 	let signer_info = identity.sign(SignedContent::data(CONTENT)).await?;
-	let mut other = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
-	other.tbs_certificate.extensions = None;
+	let other = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+	let other = TestCertificate::without_extension(other, SubjectKeyIdentifier::OID);
+	let other = PeerCertificate::<ErasedSigning>::parse(other, KeyPurposes::HOUSE.signer)?;
+
 	let refused = CmsSigner::verify_with_policy(&signer_info, &other, &Secp256k1Policy::default(), content);
 	assert!(matches!(refused, Err(SignerError::SignerIdentifier)));
 	Ok(())
@@ -852,7 +896,7 @@ async fn a_policy_refuses_a_digest_the_signature_algorithm_does_not_name() -> Te
 	let digest_alg = AlgorithmIdentifierOwned { oid: HASH_SHA3_512, parameters: None };
 	let mismatched = SignerInfo { digest_alg, ..signer_info.into_inner() };
 	let policy = Secp256k1Policy::default();
-	let refused = CmsSigner::verify_with_policy(&mismatched, identity.certificate(), &policy, content);
+	let refused = CmsSigner::verify_with_policy(&mismatched, identity.signing_certificate(), &policy, content);
 
 	let unsupported = matches!(
 		refused,

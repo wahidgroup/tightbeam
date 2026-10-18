@@ -68,6 +68,24 @@ mod sha3_512_profile {
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use sha3_512_profile::*;
 
+#[cfg(feature = "transport-cms")]
+mod cms_server {
+	pub use crate::crypto::cms::KeyAgreementIdentity;
+	pub use crate::crypto::hpke::DhKemSecp256k1;
+	pub use crate::crypto::key::DiffieHellman;
+	pub use crate::crypto::policy::Secp256k1Policy;
+	pub use crate::crypto::sign::ecdsa::Secp256k1;
+	pub use crate::crypto::x509::store::{
+		CertificateTrustBuilder, CertificateTrustStore, NoRevocation, RevocationChecker, TrustBuilder,
+	};
+	pub use crate::transport::handshake::{
+		CmsIdentityPair, CmsServerCertificates, CmsServerIdentity, ProvisionedTrust,
+	};
+}
+
+#[cfg(feature = "transport-cms")]
+use cms_server::*;
+
 /// A simple message that the tests encode and send.
 #[derive(Beamable, Clone, Debug, PartialEq, Sequence)]
 pub struct TestMessage {
@@ -123,7 +141,7 @@ mod cert {
 	pub use crate::x509::attr::AttributeTypeAndValue;
 	pub use crate::x509::ext::pkix::name::GeneralName;
 	pub use crate::x509::ext::pkix::{AuthorityKeyIdentifier, SubjectKeyIdentifier};
-	pub use crate::x509::ext::pkix::{BasicConstraints, KeyUsage, KeyUsages, SubjectAltName};
+	pub use crate::x509::ext::pkix::{BasicConstraints, ExtendedKeyUsage, KeyUsage, KeyUsages, SubjectAltName};
 	pub use crate::x509::ext::Extension;
 	pub use crate::x509::name::{RdnSequence, RelativeDistinguishedName};
 	pub use crate::x509::serial_number::SerialNumber;
@@ -211,15 +229,17 @@ fn test_key_identifiers(subject_key: &SigningKey, issuer_key: &SigningKey) -> Ve
 	extensions
 }
 
-/// The `keyUsage` of an end-entity test certificate, which signs and opens a
-/// KEM's encapsulation as a CMS server does (RFC 5480 §3, RFC 9629 §3).
+/// The `keyUsage` of an end-entity test certificate: `digitalSignature` and
+/// `keyAgreement`, so the certificate is admitted for each use (RFC 5280
+/// §4.2.1.3, RFC 5480 §3).
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 fn test_end_entity_key_usage() -> Extension {
 	test_extension(&KeyUsage(KeyUsages::DigitalSignature | KeyUsages::KeyAgreement))
 }
 
 /// Builds a certificate for `subject_key` under `subject`, signed by
-/// `issuer_key` under `issuer`, with a real signature.
+/// `issuer_key` under `issuer`, with a real signature and `serial` as its
+/// serial number.
 ///
 /// The key identifier extensions come first, ahead of `extensions`.
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
@@ -228,6 +248,7 @@ fn issue_test_certificate(
 	issuer: RdnSequence,
 	subject_key: &SigningKey,
 	subject: RdnSequence,
+	serial: u8,
 	extensions: Vec<Extension>,
 ) -> TbResult<Certificate> {
 	let subject_public_key_info = test_public_key(subject_key);
@@ -237,7 +258,7 @@ fn issue_test_certificate(
 
 	let tbs = TbsCertificate {
 		version: X509Version::V3,
-		serial_number: SerialNumber::new(&[1])?,
+		serial_number: SerialNumber::new(&[serial])?,
 		signature: algorithm.to_owned(),
 		issuer,
 		validity: test_validity()?,
@@ -777,7 +798,7 @@ impl TestCertificate {
 	pub fn authority(signing_key: &SigningKey, cn: impl AsRef<str>) -> TbResult<Certificate> {
 		let name = test_cn_name(cn)?;
 		let extensions = TestCertificate::ca_extensions(true, true, None);
-		issue_test_certificate(signing_key, name.to_owned(), signing_key, name, extensions)
+		issue_test_certificate(signing_key, name.to_owned(), signing_key, name, 1, extensions)
 	}
 
 	/// Builds a leaf `CN=<cn>` that the authority `CN=<issuer_cn>` signs with
@@ -800,7 +821,86 @@ impl TestCertificate {
 		let issuer = test_cn_name(issuer_cn)?;
 		let subject = test_cn_name(cn)?;
 		let extensions = vec![test_end_entity_key_usage(), test_uri_san_extension(uris)];
-		issue_test_certificate(issuer_key, issuer, signing_key, subject, extensions)
+		issue_test_certificate(issuer_key, issuer, signing_key, subject, 1, extensions)
+	}
+
+	/// Builds a leaf `CN=<cn>` with `serial` as its serial number that the
+	/// authority `CN=<issuer_cn>` signs with `issuer_key`, whose `keyUsage`
+	/// is `key_usage` alone.
+	///
+	/// # Errors
+	///
+	/// - [`crate::TightBeamError`] -- a name, the DER encoding, or the signing fails.
+	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+	pub fn issued(
+		issuer_key: &SigningKey,
+		issuer_cn: impl AsRef<str>,
+		signing_key: &SigningKey,
+		cn: impl AsRef<str>,
+		serial: u8,
+		key_usage: KeyUsage,
+	) -> TbResult<Certificate> {
+		let issuer = test_cn_name(issuer_cn)?;
+		let subject = test_cn_name(cn)?;
+		let extensions = vec![test_extension(&key_usage)];
+		issue_test_certificate(issuer_key, issuer, signing_key, subject, serial, extensions)
+	}
+
+	/// `certificate` with `key_usage` as its one `keyUsage` extension, in
+	/// place of the one it carried.
+	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+	pub fn with_key_usage(certificate: Certificate, key_usage: KeyUsage) -> Certificate {
+		let replaced = TestCertificate::without_extension(certificate, KeyUsage::OID);
+		TestCertificate::with_extension(replaced, test_extension(&key_usage))
+	}
+
+	/// `certificate` with one non-critical `extendedKeyUsage` that names
+	/// `purposes`, in place of the one it carried.
+	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+	pub fn with_key_purposes(
+		certificate: Certificate,
+		purposes: impl IntoIterator<Item = ObjectIdentifier>,
+	) -> Certificate {
+		let replaced = TestCertificate::without_extension(certificate, ExtendedKeyUsage::OID);
+		let purposes = ExtendedKeyUsage(purposes.into_iter().collect());
+		TestCertificate::with_extension(replaced, TestCertificate::extension(&purposes, false))
+	}
+
+	/// `certificate` with `extension` after the extensions it carries.
+	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+	pub fn with_extension(mut certificate: Certificate, extension: Extension) -> Certificate {
+		let extensions = certificate.tbs_certificate.extensions.get_or_insert_with(Vec::new);
+		extensions.push(extension);
+		certificate
+	}
+
+	/// `certificate` with no extension of `oid`.
+	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+	pub fn without_extension(mut certificate: Certificate, oid: ObjectIdentifier) -> Certificate {
+		let extensions = certificate.tbs_certificate.extensions.get_or_insert_with(Vec::new);
+		extensions.retain(|extension| extension.extn_id != oid);
+		certificate
+	}
+
+	/// The extension of `value`, critical when `critical` holds (RFC 5280
+	/// §4.2).
+	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+	pub fn extension<T>(value: &T, critical: bool) -> Extension
+	where
+		T: AssociatedOid + Encode,
+	{
+		let extension = test_extension(value);
+		Extension { critical, ..extension }
+	}
+
+	/// An extension of `oid` with an empty value, critical when `critical`
+	/// holds, for the RFC 5280 §4.2 checks of an extension the crate does not
+	/// read.
+	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+	pub fn opaque_extension(oid: impl AsRef<str>, critical: bool) -> Extension {
+		let extn_id = ObjectIdentifier::new(oid.as_ref()).expect("a test OID parses");
+		let extn_value = OctetString::new(Vec::new()).expect("an empty value fits an OCTET STRING");
+		Extension { extn_id, critical, extn_value }
 	}
 
 	/// Create a valid certificate chain in which a root signs an intermediate
@@ -990,6 +1090,107 @@ impl TestAttributes {
 		let attribute = matching.next().expect("the signer writes the attribute");
 		let value = attribute.values.iter().next().expect("the attribute holds a value");
 		value.clone()
+	}
+}
+
+/// The two identities of a test CMS server under one test authority: a
+/// signing certificate with `digitalSignature` alone, and a key-agreement
+/// certificate of the same subject with `keyAgreement` alone, each beside its
+/// key.
+///
+/// A client's store holds the authority, so the store validates both
+/// certificates by their chain.
+#[cfg(feature = "transport-cms")]
+pub struct TestCmsServer {
+	/// The authority that issued both certificates.
+	pub authority: Certificate,
+	/// The certificate whose key signs the server's reply.
+	pub signing: Certificate,
+	/// The key of [`Self::signing`].
+	pub signing_key: SigningKey,
+	/// The certificate whose key the CMS opening seals to.
+	pub key_agreement: Certificate,
+	/// The key of [`Self::key_agreement`].
+	pub key_agreement_key: SigningKey,
+}
+
+#[cfg(feature = "transport-cms")]
+impl TestCmsServer {
+	/// A server `CN=<cn>` with fresh keys, both certificates issued by the
+	/// authority `CN=<cn> authority`.
+	pub fn generate(cn: impl AsRef<str>) -> Self {
+		let cn = cn.as_ref();
+		let signing_key = SigningKey::random(&mut crate::random::OsRng);
+		let key_agreement_key = SigningKey::random(&mut crate::random::OsRng);
+		TestCmsServer::of(cn, signing_key, key_agreement_key)
+	}
+
+	/// A server `CN=<cn>` of `signing_key` and `key_agreement_key`, both
+	/// certificates issued by a fresh authority `CN=<cn> authority`.
+	pub fn of(cn: impl AsRef<str>, signing_key: SigningKey, key_agreement_key: SigningKey) -> Self {
+		let cn = cn.as_ref();
+		let authority_cn = format!("{cn} authority");
+		let authority_key = SigningKey::random(&mut crate::random::OsRng);
+		let authority = TestCertificate::authority(&authority_key, &authority_cn);
+		let authority = authority.expect("a test authority issues itself");
+
+		let signing_usage = KeyUsage(KeyUsages::DigitalSignature.into());
+		let signing = TestCertificate::issued(&authority_key, &authority_cn, &signing_key, cn, 2, signing_usage);
+		let signing = signing.expect("the authority issues the signing certificate");
+		let agreement_usage = KeyUsage(KeyUsages::KeyAgreement.into());
+		let key_agreement =
+			TestCertificate::issued(&authority_key, &authority_cn, &key_agreement_key, cn, 3, agreement_usage);
+		let key_agreement = key_agreement.expect("the authority issues the key-agreement certificate");
+
+		TestCmsServer { authority, signing, signing_key, key_agreement, key_agreement_key }
+	}
+
+	/// The signing identity of the server.
+	pub fn signing_identity(&self) -> SigningIdentity {
+		TestIdentity::presenting(self.signing.to_owned(), &self.signing_key)
+	}
+
+	/// The key-agreement identity of the server, whose backend holds
+	/// [`Self::key_agreement_key`].
+	pub fn key_agreement_identity(&self) -> KeyAgreementIdentity<DhKemSecp256k1> {
+		let backend: Arc<dyn DiffieHellman<Secp256k1>> =
+			Arc::new(Secp256k1KeyProvider::from(self.key_agreement_key.to_owned()));
+		let identity = KeyAgreementIdentity::new(self.key_agreement.to_owned(), backend);
+		identity.expect("the test key matches its key-agreement certificate")
+	}
+
+	/// The server's two identities as the pair a CMS server holds.
+	pub fn pair(&self) -> CmsIdentityPair<DhKemSecp256k1> {
+		let pair = CmsIdentityPair::new(self.signing_identity(), self.key_agreement_identity());
+		pair.expect("the two test certificates name one subject with two keys")
+	}
+
+	/// The server's two certificates as a client provisions them, each a
+	/// bare certificate.
+	pub fn certificates(&self) -> CmsServerCertificates {
+		let signing = CmsServerIdentity::Certificate(Arc::new(self.signing.to_owned()));
+		let key_agreement = CmsServerIdentity::Certificate(Arc::new(self.key_agreement.to_owned()));
+		CmsServerCertificates { signing, key_agreement }
+	}
+
+	/// A store that holds the authority of both certificates.
+	pub fn store(&self) -> CertificateTrustStore {
+		self.store_with(NoRevocation)
+	}
+
+	/// A store that holds the authority of both certificates and consults
+	/// `checker` on revocation.
+	pub fn store_with(&self, checker: impl RevocationChecker + 'static) -> CertificateTrustStore {
+		let builder = CertificateTrustBuilder::from(Secp256k1Policy::default()).with_revocation_checker(checker);
+		let builder = builder.with_certificate(self.authority.to_owned());
+		builder.expect("the store takes the test authority").build()
+	}
+
+	/// The trust of a client that provisions this server against
+	/// [`Self::store`].
+	pub fn trust(&self) -> ProvisionedTrust {
+		let trust = ProvisionedTrust::new(self.certificates(), Arc::new(self.store()));
+		trust.expect("the store admits both test certificates as one server")
 	}
 }
 
