@@ -583,7 +583,7 @@ mod tests {
 			let metadata = frame.metadata();
 			let envelope = metadata.confidentiality().ok_or(TightBeamError::MissingEncryptionInfo)?;
 			let mut relabelled = envelope.clone();
-			
+
 			relabelled.auth_encrypted_content_info.content_enc_alg.oid = crate::oids::AES_128_GCM;
 			frame.metadata.confidentiality = Some(WireDer::new(relabelled)?);
 
