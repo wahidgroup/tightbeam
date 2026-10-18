@@ -191,9 +191,7 @@ async fn a_refused_reply_leaves_the_client_spent<F: TestFlow>() -> Result<(), Bo
 	client.start()?;
 
 	let refused = client.respond(stray.to_owned()).await;
-	let forged = matches!(refused, Err(HandshakeError::SignatureError(_)));
-	let unverified = matches!(refused, Err(HandshakeError::SignatureVerificationFailed));
-	assert!(forged || unverified);
+	assert!(matches!(refused, Err(HandshakeError::SignatureVerificationFailed)));
 	assert_eq!(client.phase(), HandshakePhase::Spent);
 
 	let replayed = client.respond(stray).await;
@@ -204,9 +202,7 @@ async fn a_refused_reply_leaves_the_client_spent<F: TestFlow>() -> Result<(), Bo
 }
 
 /// A closing from another handshake is refused, and the server admits no
-/// step after the refusal. HPKE refuses the payload, which another client
-/// sealed to the static key of another server. CMS refuses the sealed
-/// Finished, which another handshake secret sealed.
+/// step after the refusal: another handshake secret sealed it.
 async fn a_refused_closing_leaves_the_server_spent<F: TestFlow>() -> Result<(), Box<dyn Error>> {
 	let (mut client, mut server) = pair::<F>(PeerAuthentication::Anonymous);
 	let other = established::<F>(PeerAuthentication::Anonymous).await;
@@ -214,9 +210,7 @@ async fn a_refused_closing_leaves_the_server_spent<F: TestFlow>() -> Result<(), 
 	server.reply(client.start()?).await?;
 
 	let refused = server.finish(other.run.closing.to_owned()).await;
-	let sealed_to_another_server = matches!(refused, Err(HandshakeError::HpkeError(_)));
-	let sealed_under_another_secret = matches!(refused, Err(HandshakeError::SealedIdentity(_)));
-	assert!(sealed_to_another_server || sealed_under_another_secret);
+	assert!(matches!(refused, Err(HandshakeError::SealedClosing(_))));
 	assert_eq!(server.phase(), HandshakePhase::Spent);
 
 	let replayed = server.finish(other.run.closing).await;
@@ -248,50 +242,26 @@ async fn both_sides_derive_the_same_keys_under_mutual_authentication<F: TestFlow
 }
 
 /// A passive observer who records the whole session and later obtains the
-/// server's static key still recovers the base secret. No traffic key the
-/// observer derives from that base and the recording opens a recorded frame.
+/// server's static key recovers the CMS base secret, and the HPKE flow seals
+/// nothing to that key. No traffic key the observer derives from what it
+/// holds and the recording opens a recorded frame.
 async fn a_recorded_session_does_not_open_under_the_server_static_key<F: TestFlow>() -> Result<(), Box<dyn Error>> {
 	let established = established::<F>(PeerAuthentication::Anonymous).await;
 	let Established { server_identity, run, client_session, .. } = established;
 
 	let frame = sealed_record(&client_session)?;
-
-	// `recover` expects the static key to recover the base secret.
 	let Recovered { observer, .. } = F::recover(&run, &server_identity).await;
 
 	let attempts = observer.record_attempts(&frame)?;
 	let mut outcomes = attempts.iter();
-	assert_eq!(attempts.len(), RECORD_ATTEMPTS);
+	assert_eq!(attempts.len(), F::RECORD_ATTEMPTS);
 	assert!(outcomes.all(|attempt| matches!(attempt, Err(TightBeamError::EncryptionError(_)))));
-	Ok(())
-}
-
-/// The base secret crosses the wire only sealed, so no leg carries its bytes
-/// in the clear (CWE-311).
-async fn the_base_secret_crosses_the_wire_only_sealed<F: TestFlow>() -> Result<(), Box<dyn Error>> {
-	let Parties { server_identity, client, server, .. } = parties::<F>(PeerAuthentication::Anonymous);
-	let run = run(client, server).await;
-
-	let Recovered { base, .. } = F::recover(&run, &server_identity).await;
-	assert!(!contains_window(run.wire_bytes(), &base));
-	Ok(())
-}
-
-/// Two handshakes draw two base secrets, so no session shares its key
-/// schedule input with another (CWE-321).
-async fn two_handshakes_draw_different_base_secrets<F: TestFlow>() -> Result<(), Box<dyn Error>> {
-	let first = established::<F>(PeerAuthentication::Anonymous).await;
-	let second = established::<F>(PeerAuthentication::Anonymous).await;
-
-	let first = F::recover(&first.run, &first.server_identity).await;
-	let second = F::recover(&second.run, &second.server_identity).await;
-	assert_ne!(first.base, second.base);
 	Ok(())
 }
 
 /// A mutual handshake carries no byte of the client identity in clear: not
 /// its certificate, its key identifier, its issuer and serial number, its key,
-/// or its possession signature.
+/// or the signature of its client Finished.
 async fn a_mutual_handshake_carries_no_byte_of_the_client_identity<F: TestFlow>() -> Result<(), Box<dyn Error>> {
 	let client_identity = create_issued_test_certificate([0x5a; 16]);
 	let recorder = Arc::new(RecordingProvider::new(client_identity.signing_key.to_owned()));
@@ -306,7 +276,7 @@ async fn a_mutual_handshake_carries_no_byte_of_the_client_identity<F: TestFlow>(
 	let key = tbs.subject_public_key_info.subject_public_key.raw_bytes();
 	let parsed_key = PublicKey::<Secp256k1>::from_sec1_bytes(key)?;
 	let compressed_key = parsed_key.to_encoded_point(true);
-	let signature = recorder.last_signature().ok_or("the client signs its possession proof")?;
+	let signature = recorder.last_signature().ok_or("the client signs its client Finished")?;
 	let wire = run.wire_bytes();
 
 	// Positive control: the server read the identity from the closing.
@@ -335,11 +305,42 @@ async fn two_identities_of_different_lengths_close_with_one_length<F: TestFlow>(
 	Ok(())
 }
 
-/// A recorder that later obtains the server's static key opens what the
-/// client seals to that key, but the sealed identity holds no byte of the
-/// certificate, and no identity key the recorder derives opens it. The session
-/// is budget-bearing, so a CMS Finished carries the countersignature inside
-/// that seal.
+/// The length of the padded content the closing of `run` seals.
+fn sealed_length<F: TestFlow>(run: &Run<F>) -> usize {
+	let closing = run.closing.to_owned().auth_enveloped();
+	let closing = closing.expect("a closing is an AuthEnvelopedData");
+
+	let content = closing.value().auth_encrypted_content_info.encrypted_content.as_ref();
+	content.expect("the closing carries its content").as_bytes().len()
+}
+
+/// The client Finished adds about 440 bytes to the 285-byte test
+/// certificate, so an identified closing pads to the 1024-byte floor.
+async fn an_identified_closing_pads_to_the_floor<F: TestFlow>() -> Result<(), Box<dyn Error>> {
+	let Parties { client, server, .. } = parties::<F>(mutual_with(ExpiryValidator));
+	let run = run(client, server).await;
+	assert_eq!(sealed_length(&run), 1024);
+	Ok(())
+}
+
+/// A receipt countersignature adds about 620 bytes more, so a budget-bearing
+/// identified closing pads past the floor to 1536 bytes.
+async fn a_budget_bearing_identified_closing_pads_past_the_floor<F: TestFlow>() -> Result<(), Box<dyn Error>> {
+	let Parties { mut client, mut server, .. } = parties::<F>(mutual_with(ExpiryValidator));
+	client.transport_offer = Some(budget_offer());
+	client.receipt_approver = Some(Arc::new(PayingApprover));
+	server.transport = Some(budget_offer());
+	server.transport_authorizer = Some(Arc::new(ChallengingAuthorizer));
+
+	let run = run(client, server).await;
+	assert_eq!(sealed_length(&run), 1536);
+	Ok(())
+}
+
+/// A recorder that later obtains the server's static key holds no closing
+/// key: the closing holds no byte of the certificate, and no closing key the
+/// recorder derives opens it. The session is budget-bearing, so the client
+/// Finished carries the countersignature inside that seal.
 async fn the_client_identity_is_sealed_from_the_server_static_key<F: TestFlow>() -> Result<(), Box<dyn Error>> {
 	let mutual = mutual_with(ExpiryValidator);
 	let Parties { server_identity, client_identity, mut client, mut server } = parties::<F>(mutual);
@@ -349,15 +350,15 @@ async fn the_client_identity_is_sealed_from_the_server_static_key<F: TestFlow>()
 	server.transport_authorizer = Some(Arc::new(ChallengingAuthorizer));
 
 	let run = run(client, server).await;
-	let Recovered { observer, sealed_identity, .. } = F::recover(&run, &server_identity).await;
-	let sealed = sealed_identity.ok_or("a mutual closing carries the sealed identity")?;
+	let Recovered { observer, .. } = F::recover(&run, &server_identity).await;
+	let sealed = run.closing.der();
 	let certificate_der = client_identity.certificate.to_der()?;
 
-	let attempts = observer.identity_attempts(&run.transcript_hash, &sealed).await?;
+	let attempts = observer.closing_attempts(&run.transcript_hash, sealed).await?;
 	let mut outcomes = attempts.iter();
-	assert!(!contains_window(&sealed, &certificate_der));
-	assert_eq!(attempts.len(), SEAL_ATTEMPTS);
-	assert!(outcomes.all(|attempt| matches!(attempt, Err(HandshakeError::SealedIdentity(_)))));
+	assert!(!contains_window(sealed, &certificate_der));
+	assert_eq!(attempts.len(), F::CLOSING_ATTEMPTS);
+	assert!(outcomes.all(|attempt| matches!(attempt, Err(HandshakeError::SealedClosing(_)))));
 	Ok(())
 }
 
@@ -570,11 +571,11 @@ over_each_flow! {
 	both_sides_derive_the_same_keys_anonymously,
 	both_sides_derive_the_same_keys_under_mutual_authentication,
 	a_recorded_session_does_not_open_under_the_server_static_key,
-	the_base_secret_crosses_the_wire_only_sealed,
 	a_mutual_handshake_carries_no_byte_of_the_client_identity,
 	two_identities_of_different_lengths_close_with_one_length,
+	an_identified_closing_pads_to_the_floor,
+	a_budget_bearing_identified_closing_pads_past_the_floor,
 	the_client_identity_is_sealed_from_the_server_static_key,
-	two_handshakes_draw_different_base_secrets,
 	a_refused_settlement_leaves_the_server_spent,
 	an_anonymous_server_records_no_peer,
 	a_mutual_server_records_the_accepted_peer,
@@ -586,4 +587,31 @@ over_each_flow! {
 	multiplexing_negotiates_when_offered_and_enabled,
 	an_offer_alone_stays_single_flight,
 	a_local_advertisement_alone_stays_single_flight,
+}
+
+/// The base secret of the CMS opening crosses the wire only sealed, so no
+/// leg carries its bytes in the clear (CWE-311).
+#[cfg(feature = "transport-cms")]
+#[tokio::test]
+async fn the_base_secret_crosses_the_wire_only_sealed() -> Result<(), Box<dyn Error>> {
+	let Parties { server_identity, client, server, .. } = parties::<Cms>(PeerAuthentication::Anonymous);
+	let run = run(client, server).await;
+
+	let Recovered { base, .. } = Cms::recover(&run, &server_identity).await;
+	let base = base.ok_or("the CMS opening carries a base secret")?;
+	assert!(!contains_window(run.wire_bytes(), &base));
+	Ok(())
+}
+
+/// Two CMS handshakes draw two base secrets, so no session shares its key
+/// schedule input with another (CWE-321).
+#[cfg(feature = "transport-cms")]
+#[tokio::test]
+async fn two_handshakes_draw_different_base_secrets() {
+	let first = established::<Cms>(PeerAuthentication::Anonymous).await;
+	let second = established::<Cms>(PeerAuthentication::Anonymous).await;
+
+	let first = Cms::recover(&first.run, &first.server_identity).await;
+	let second = Cms::recover(&second.run, &second.server_identity).await;
+	assert_ne!(first.base, second.base);
 }

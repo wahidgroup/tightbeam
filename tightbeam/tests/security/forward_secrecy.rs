@@ -3,28 +3,31 @@
 //! ## Weakness
 //! Reusing ephemeral key material across handshakes means compromise of the
 //! server's long-term key (or a single ephemeral key) can expose past sessions.
+//! An ephemeral equal to the server's static key would collapse the agreement
+//! into one that key recovers.
 //!
 //! ## Attack
 //! Multiple handshakes are run and their ephemeral public keys compared for
-//! uniqueness and randomness. A client holds two: the key of its agreement with
-//! the server ephemeral, inside the sealed payload, and the key HPKE seals
-//! that payload under, in the clear.
+//! uniqueness. Each handshake carries two in the clear: the client ephemeral
+//! `R` of the hello and the server ephemeral `E` of the reply.
 //!
 //! ## Expected control
-//! Each handshake MUST generate a fresh, random ephemeral key, so session keys
-//! from different handshakes are independent and past traffic stays protected.
-//! The two client keys of one handshake MUST differ, because the randomness of
-//! an HPKE encapsulation serves nothing else.
+//! Each handshake MUST draw a fresh, random ephemeral on each side, so session
+//! keys from different handshakes are independent and past traffic stays
+//! protected. The HPKE handshake secret derives from `R` and `E` alone, so
+//! `R` and `E` MUST NOT share the x-coordinate of the server's static key,
+//! which ECDH keeps alone.
 //!
 //! ## References
 //! - CWE-323: Reusing a Nonce, Key Pair in Encryption <https://cwe.mitre.org/data/definitions/323.html>
 //! - NIST SP 800-56A Rev. 3 §5.6: ephemeral key-pair generation
-//! - RFC 9180 §9.2.3: KEM key reuse <https://www.rfc-editor.org/rfc/rfc9180#section-9.2.3>
+//! - RFC 9846 §7.1: the ECDHE shared secret <https://datatracker.ietf.org/doc/html/rfc9846#section-7.1>
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use tightbeam::{
-	constants::EC_PUBKEY_UNCOMPRESSED_SIZE,
+	crypto::sign::ecdsa::k256::elliptic_curve::sec1::ToEncodedPoint,
 	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
 	testing::{ScenarioConfig, SetupEnv},
 	trace::TraceCollector,
@@ -33,8 +36,7 @@ use tightbeam::{
 };
 
 use crate::security::common::{
-	expectation_failure, extract_ephemeral_pubkey, extract_hpke_ciphertext, open_key_exchange, Direction,
-	HandshakeBackendKind, SecurityThreatHarness, HANDSHAKE_AAD,
+	captured_ephemerals, expectation_failure, x_coordinate, HandshakeBackendKind, SecurityThreatHarness,
 };
 
 pub(crate) const FS_ALL_EPHEMERAL_UNIQUE: Urn<'static> =
@@ -54,7 +56,7 @@ tb_assert_spec! {
 		assertions: [
 			(FS_CAPTURE_HANDSHAKE, exactly!(HANDSHAKE_COUNT as u32)),
 			(FS_EXTRACT_EPHEMERAL, exactly!(HANDSHAKE_COUNT as u32)),
-			(FS_ALL_EPHEMERAL_UNIQUE, exactly!(1u32))
+			(FS_ALL_EPHEMERAL_UNIQUE, exactly!(1u32), equals!(true))
 		]
 	}
 }
@@ -100,92 +102,46 @@ tb_scenario! {
 	}
 }
 
+/// The x-coordinates of the two ephemerals of each of `count` captured HPKE
+/// handshakes, client ephemeral first.
+async fn captured_coordinates(
+	harness: &SecurityThreatHarness,
+	trace: &TraceCollector,
+	count: usize,
+) -> Result<Vec<Vec<u8>>, TightBeamError> {
+	let mut coordinates = Vec::with_capacity(2 * count);
+	for _ in 0..count {
+		let mut session = harness.spawn(HandshakeBackendKind::Hpke);
+		let captured = session.capture_full().await?;
+
+		trace.event(FS_CAPTURE_HANDSHAKE)?;
+
+		let hello = captured.message_at(0).ok_or_else(|| expectation_failure("no hello captured"))?;
+		let reply = captured.message_at(1).ok_or_else(|| expectation_failure("no reply captured"))?;
+		let (client_ephemeral, server_ephemeral) = captured_ephemerals(&hello.payload, &reply.payload)?;
+
+		coordinates.push(x_coordinate(&client_ephemeral)?);
+		coordinates.push(x_coordinate(&server_ephemeral)?);
+		trace.event(FS_EXTRACT_EPHEMERAL)?;
+	}
+
+	Ok(coordinates)
+}
+
 job! {
 	name: ForwardSecrecyScenario,
 	async fn run((trace,): (Arc<TraceCollector>,)) -> Result<(), TightBeamError> {
 		let harness = SecurityThreatHarness::with_trace(Arc::clone(&trace));
-		// Only test HPKE (has ephemeral keys in the clear)
-		let kind = HandshakeBackendKind::Hpke;
+		let coordinates = captured_coordinates(&harness, &trace, HANDSHAKE_COUNT).await?;
 
-		// Collect ephemeral public keys from multiple handshakes
-		let mut ephemeral_keys: Vec<Vec<u8>> = Vec::with_capacity(HANDSHAKE_COUNT);
-		let mut agreement_keys: Vec<Vec<u8>> = Vec::with_capacity(HANDSHAKE_COUNT);
-		for _ in 0..HANDSHAKE_COUNT {
-			// Capture a complete handshake
-			let mut session = harness.spawn(kind);
-			let captured = session.capture_full().await?;
+		// The server's static key joins the set, so an ephemeral that repeats
+		// across handshakes, that one side reflects from the other, or that
+		// shares the x-coordinate of the static key shrinks it.
+		let static_key = harness.materials().secret_key().public_key().to_encoded_point(false);
+		let static_coordinate = x_coordinate(static_key.as_bytes())?;
+		let distinct: BTreeSet<Vec<u8>> = coordinates.into_iter().chain([static_coordinate]).collect();
 
-			trace.event(FS_CAPTURE_HANDSHAKE)?;
-
-			// Extract HPKE ciphertext from ClientKeyExchange (step 2)
-			let client_kex = captured
-				.messages
-				.iter()
-				.find(|m| m.step == 2 && m.direction == Direction::ClientToServer)
-				.ok_or_else(|| expectation_failure("no ClientKeyExchange message captured"))?;
-
-			// The encapsulated key leads the message in the clear, and the
-			// server's static key opens the payload that holds the agreement
-			// key.
-			let ciphertext = extract_hpke_ciphertext(&client_kex.payload)?;
-			let ephemeral_pubkey = extract_ephemeral_pubkey(&ciphertext)?;
-			let payload = open_key_exchange(&ciphertext, harness.materials().secret_key(), HANDSHAKE_AAD)?;
-			let agreement_key = payload.client_ephemeral.into_bytes();
-
-			// The x coordinate follows the tag byte in both encodings. Equal
-			// coordinates mean one scalar served the HPKE encapsulation and
-			// the agreement.
-			if ephemeral_pubkey.get(1..33) == agreement_key.get(1..33) {
-				return Err(expectation_failure("the HPKE ephemeral is the agreement key"));
-			}
-
-			ephemeral_keys.push(ephemeral_pubkey);
-			agreement_keys.push(agreement_key);
-
-			trace.event(FS_EXTRACT_EPHEMERAL)?;
-		}
-
-		// ========================================
-		// Verify all ephemeral keys are unique
-		// ========================================
-
-		// Check for duplicates by comparing each key against all others
-		for keys in [&ephemeral_keys, &agreement_keys] {
-			for i in 0..keys.len() {
-				for j in (i + 1)..keys.len() {
-					if keys[i] == keys[j] {
-						return Err(expectation_failure("duplicate ephemeral keys detected - forward secrecy violated"));
-					}
-				}
-			}
-		}
-
-		// Additional sanity checks:
-		// 1. All keys should be 65 bytes (uncompressed secp256k1 public key)
-		for key in &ephemeral_keys {
-			if key.len() != EC_PUBKEY_UNCOMPRESSED_SIZE {
-				return Err(expectation_failure("ephemeral key is not 65 bytes"));
-			}
-
-			// 2. First byte should be 0x04 (uncompressed point prefix)
-			if key[0] != 0x04 {
-				return Err(expectation_failure("ephemeral key has invalid prefix"));
-			}
-		}
-
-		// 3. All agreement keys should be 33 bytes (compressed secp256k1 public key)
-		for key in &agreement_keys {
-			if key.len() != 33 {
-				return Err(expectation_failure("agreement key is not 33 bytes"));
-			}
-
-			// 4. First byte should be 0x02 or 0x03 (compressed point prefix)
-			if key[0] != 0x02 && key[0] != 0x03 {
-				return Err(expectation_failure("agreement key has invalid prefix"));
-			}
-		}
-
-		trace.event(FS_ALL_EPHEMERAL_UNIQUE)?;
+		trace.event_with(FS_ALL_EPHEMERAL_UNIQUE, &[], distinct.len() == 2 * HANDSHAKE_COUNT + 1)?;
 
 		Ok(())
 	}

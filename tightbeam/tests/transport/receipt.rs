@@ -518,7 +518,8 @@ tb_assert_spec! {
 	}
 }
 
-// HPKE completes client-side on key exchange send; rejection surfaces on first read.
+// HPKE completes client-side when it sends the closing, and a rejection
+// surfaces on the first read.
 tb_scenario! {
 	name: receipt_settle_rejection_fails_closed,
 	spec: ReceiptSettleRejectionSpec,

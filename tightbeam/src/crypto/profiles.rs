@@ -447,30 +447,6 @@ pub trait CryptoProvider:
 ))]
 pub type AeadKeySize<P> = <<P as AeadProvider>::AeadCipher as KeySizeUser>::KeySize;
 
-/// Provider role for the HPKE single-shot seal (RFC 9180).
-///
-/// The role sits beside [`CryptoProvider`], so a provider on a curve that
-/// has no HPKE suite still runs every other role.
-#[cfg(all(
-	feature = "digest",
-	feature = "aead",
-	feature = "signature",
-	feature = "kdf",
-	feature = "ecdh",
-	feature = "hpke"
-))]
-pub trait HpkeProvider: CryptoProvider {
-	/// The HPKE suite this provider seals under. Its curve, its KDFs, and its
-	/// AEAD are the types the roles of [`CryptoProvider`] use, so the suite
-	/// runs the algorithms the profile negotiates.
-	type HpkeSuite: crate::crypto::hpke::HpkeSuite<
-		Curve = Self::Curve,
-		KemKdf = Self::Kdf,
-		Kdf = Self::Kdf,
-		Aead = Self::AeadCipher,
-	>;
-}
-
 /// The profile [`DefaultCryptoProvider`] runs: SHA3-256, AES-256-GCM, ECDSA
 /// over secp256k1, HKDF-SHA3-256, and AES-256 key wrap.
 #[derive(Debug, Default, Clone, Copy)]
@@ -539,25 +515,14 @@ impl CryptoProvider for DefaultCryptoProvider {
 	}
 }
 
-#[cfg(all(
-	feature = "aead",
-	feature = "signature",
-	feature = "kdf",
-	feature = "ecdh",
-	feature = "hpke"
-))]
-impl HpkeProvider for DefaultCryptoProvider {
-	type HpkeSuite = crate::crypto::hpke::HpkeSecp256k1Sha3Aes256Gcm;
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
 	use crate::constants::{
-		TIGHTBEAM_ACK_KEY_ID_DOMAIN, TIGHTBEAM_CLIENT_FINISHED_DOMAIN, TIGHTBEAM_HPKE_CLIENT_AUTH_DOMAIN,
-		TIGHTBEAM_HPKE_FRAME_INFO, TIGHTBEAM_HPKE_HANDSHAKE_INFO, TIGHTBEAM_HPKE_SERVER_AUTH_DOMAIN,
-		TIGHTBEAM_IDENTITY_KDF_INFO, TIGHTBEAM_IDENTITY_KEY_ID_DOMAIN, TIGHTBEAM_OPENING_UKM_LABEL,
-		TIGHTBEAM_SERVER_FINISHED_DOMAIN, TIGHTBEAM_SESSION_KDF_INFO,
+		TIGHTBEAM_ACK_KEY_ID_DOMAIN, TIGHTBEAM_CLIENT_FINISHED_DOMAIN, TIGHTBEAM_CLIENT_FINISHED_KEY_INFO,
+		TIGHTBEAM_CLOSING_KDF_INFO, TIGHTBEAM_CLOSING_KEY_ID_DOMAIN, TIGHTBEAM_HPKE_FRAME_INFO,
+		TIGHTBEAM_OPENING_UKM_LABEL, TIGHTBEAM_SERVER_FINISHED_DOMAIN, TIGHTBEAM_SERVER_FINISHED_KEY_INFO,
+		TIGHTBEAM_SESSION_KDF_INFO,
 	};
 
 	/// Guard the domain constants against accidental change.
@@ -571,12 +536,11 @@ mod tests {
 		assert_eq!(TIGHTBEAM_SERVER_FINISHED_DOMAIN, b"tb/handshake/finished/server/v1");
 		assert_eq!(TIGHTBEAM_CLIENT_FINISHED_DOMAIN, b"tb/handshake/finished/client/v1");
 		assert_eq!(TIGHTBEAM_ACK_KEY_ID_DOMAIN, b"tb/handshake/ack/kekid/v1");
-		assert_eq!(TIGHTBEAM_HPKE_HANDSHAKE_INFO, b"tb/hpke/handshake/v2");
 		assert_eq!(TIGHTBEAM_HPKE_FRAME_INFO, b"tb/hpke/frame/v1");
-		assert_eq!(TIGHTBEAM_IDENTITY_KDF_INFO, b"tb/session/kdf/identity/v1");
-		assert_eq!(TIGHTBEAM_IDENTITY_KEY_ID_DOMAIN, b"tb/handshake/identity/kekid/v1");
-		assert_eq!(TIGHTBEAM_HPKE_CLIENT_AUTH_DOMAIN, b"tb/handshake/client-auth/hpke/v1");
-		assert_eq!(TIGHTBEAM_HPKE_SERVER_AUTH_DOMAIN, b"tb/handshake/server-auth/hpke/v1");
+		assert_eq!(TIGHTBEAM_CLOSING_KDF_INFO, b"tb/session/kdf/closing/v1");
+		assert_eq!(TIGHTBEAM_CLOSING_KEY_ID_DOMAIN, b"tb/handshake/closing/kekid/v1");
+		assert_eq!(TIGHTBEAM_CLIENT_FINISHED_KEY_INFO, b"tb/handshake/finished/client/mac/v1");
+		assert_eq!(TIGHTBEAM_SERVER_FINISHED_KEY_INFO, b"tb/handshake/finished/server/mac/v1");
 	}
 
 	/// Each optional field carries its own tag, so an absent algorithm does not

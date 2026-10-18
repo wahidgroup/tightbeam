@@ -5,8 +5,8 @@
 //! [legs](crate::transport::handshake#legs) of a handshake.
 //!
 //! - A server admits its client through [`PeerAuthentication::admit`], the one
-//!   constructor of [`AdmittedPeer`]. An offered certificate's proof of
-//!   possession is always verified, and a session records a peer only through
+//!   constructor of [`AdmittedPeer`]. An offered certificate's client Finished
+//!   is always verified, and a session records a peer only through
 //!   [`AdmittedPeer::proven`], so every session identity is a certificate a
 //!   validator chain accepted and whose key signed the closing.
 //! - A client admits its server through [`ProvisionedTrust`] when the identity
@@ -24,7 +24,11 @@ use std::sync::Arc;
 use crate::crypto::x509::policy::CertificateValidation;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::cms::signed_data::SignedData;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::sign::elliptic_curve::{CurveArithmetic, PublicKey};
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::crypto::sign::{CmsSigner, SignedContent};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::x509::utils::CertificateExt;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -116,27 +120,34 @@ impl<C: HandshakeCurve> PeerCertificate<C> {
 	pub(crate) fn key(&self) -> &PublicKey<C> {
 		&self.key
 	}
-}
 
-/// A closing's proof that the key of the offered certificate signed it.
-///
-/// Each protocol carries the proof in its own form, and
-/// [`PeerAuthentication::admit`] verifies it against the certificate that the
-/// [`Offer`] holds beside it.
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-pub trait PossessionProof<P: HandshakeProvider> {
-	/// Verify this proof under the key of `identity`, against the transcript
-	/// that `terms` sealed.
+	/// Verify the one `SignerInfo` of `signed_data` over `content` under the
+	/// key of this certificate, which its `sid` must name.
+	///
+	/// Each signature verified here covers a transcript hash, which is fresh
+	/// for each handshake, so the verified signature is the key of no ledger
+	/// and drops here.
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError::SignatureVerificationFailed`] -- the proof is
-	///   malformed, or it signs another transcript or another role.
-	/// - [`HandshakeError::SignatureError`] -- the signature fails to verify.
-	/// - [`HandshakeError::DerError`] -- the certificate fails to encode for
-	///   the digest, or the content a CMS proof signs is not an OCTET STRING.
-	/// - [`HandshakeError::SpkiError`] -- the key fails to encode as the SPKI that names a CMS signer.
-	fn verify(self, identity: &PeerCertificate<P::Curve>, terms: &Terms<P>) -> Result<(), HandshakeError>;
+	/// - [`HandshakeError::SignatureVerificationFailed`] -- `signed_data` does not
+	///   have exactly one signer, or the signer's checks refuse it.
+	/// - [`HandshakeError::DerError`] -- a signed attribute fails to encode.
+	/// - [`HandshakeError::CertificateValidationError`] -- the key identifier fails to decode.
+	pub(crate) fn verify_signed<P>(
+		&self,
+		signed_data: &SignedData,
+		content: SignedContent<'_>,
+	) -> Result<(), HandshakeError>
+	where
+		P: HandshakeProvider<Curve = C>,
+	{
+		let signer_info = CmsSigner::sole_signer(signed_data)?;
+		let key = P::VerifyingKey::from(self.key);
+		let verifying = CmsSigner::verify_signer::<P::Signature, _>;
+		verifying(signer_info, &self.certificate, &key, content).map(drop)?;
+		Ok(())
+	}
 }
 
 impl PeerAuthentication {
@@ -166,15 +177,15 @@ impl PeerAuthentication {
 	}
 
 	/// Decide what the handshake may do with the identity the client offered,
-	/// and verify the proof that the client holds its key.
+	/// and verify the client Finished that proves the client holds its key.
 	///
 	/// [`Handshake::finish`](crate::transport::handshake::Handshake::finish)
 	/// calls this, and it is the one constructor of [`AdmittedPeer`]. The rule
 	/// is the same for both protocols:
 	///
-	/// - An [`Offer`] holds a certificate with its proof, or neither.
-	/// - Under mutual authentication, the validity check and then every validator run before the proof.
-	/// - The proof is verified whenever a certificate is offered, so an
+	/// - An [`Offer`] holds a certificate with its client Finished, or neither.
+	/// - Under mutual authentication, the validity check and then every validator run before the Finished.
+	/// - The Finished is verified whenever a certificate is offered, so an
 	///   anonymous server also refuses a certificate the client cannot prove.
 	///
 	/// # Errors
@@ -183,18 +194,19 @@ impl PeerAuthentication {
 	///   is configured and the client offered no certificate.
 	/// - [`HandshakeError::CertificateValidationError`] -- the certificate is
 	///   outside its validity period, or a validator refused it.
-	/// - Any error of [`PossessionProof::verify`] -- the proof fails to verify.
+	/// - Any error of [`ClientFinished::verify`] -- the client Finished fails to verify.
+	///
+	/// [`ClientFinished::verify`]: crate::transport::handshake::flow::ClientFinished::verify
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-	pub(crate) fn admit<P, Proof>(
+	pub(crate) fn admit<P>(
 		&self,
-		offer: Offer<P::Curve, Proof>,
+		offer: Offer<P::Curve>,
 		terms: &Terms<P>,
 	) -> Result<AdmittedPeer<P::Curve>, HandshakeError>
 	where
 		P: HandshakeProvider,
-		Proof: PossessionProof<P>,
 	{
-		let Some((identity, proof)) = offer.into_identity() else {
+		let Some((identity, finished)) = offer.into_identity() else {
 			return match self {
 				Self::Anonymous => Ok(AdmittedPeer(Admission::Unidentified)),
 				Self::Mutual(_) => Err(HandshakeError::MissingClientCertificate),
@@ -208,7 +220,7 @@ impl PeerAuthentication {
 			chain.evaluate(certificate)?;
 		}
 
-		proof.verify(&identity, terms)?;
+		finished.verify(&identity, terms)?;
 
 		let admission = match self {
 			Self::Anonymous => Admission::Offered,

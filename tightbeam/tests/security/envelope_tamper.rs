@@ -59,8 +59,8 @@ pub(crate) const DELETED_ENVELOPE_DETECTED: Urn<'static> =
 pub(crate) const REPLAYED_ENVELOPE_DETECTED: Urn<'static> =
 	tightbeam::urn!("test", "event:envelope-tamper/replayed-envelope-detected");
 
-/// HPKE sends exactly two cleartext client frames (ClientHello,
-/// ClientKeyExchange), so the first encrypted envelope is frame 3.
+/// HPKE sends exactly two client handshake frames, the hello and the closing,
+/// as cleartext envelopes, so the first encrypted envelope is frame 3.
 const FIRST_ENCRYPTED_FRAME: usize = 3;
 
 // ---------------------------------------------------------------------------

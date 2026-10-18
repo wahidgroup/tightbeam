@@ -12,6 +12,14 @@
 //!
 //! - the key wrap, AES-128 key wrap, through [`KeyWrapProvider`], and
 //! - the AEAD, AES-128-GCM, through [`ContentEncryption`].
+//!
+//! The provider names no HPKE suite, and [`hpke`] and [`cms`] run both
+//! handshakes under it.
+
+#[cfg(feature = "transport-cms")]
+mod cms;
+#[cfg(feature = "transport-hpke")]
+mod hpke;
 
 use std::sync::Arc;
 
@@ -19,10 +27,10 @@ use tightbeam::builder::frame::FrameBuilder;
 use tightbeam::builder::TypeBuilder;
 use tightbeam::crypto::aead::{Aes128Gcm, Aes128GcmOid};
 use tightbeam::crypto::cms::{AuthEnvelopedData, Encapsulation, EnvelopeError, Opener, Recipient, RecipientKem};
-use tightbeam::crypto::hash::Sha3_512;
+use tightbeam::crypto::hash::{Digest, Sha3_512};
 use tightbeam::crypto::hpke::{DhKem, HkdfSha256};
 use tightbeam::crypto::k256::ecdsa::{DerSignature, Signature, SigningKey, VerifyingKey};
-use tightbeam::crypto::k256::Secp256k1;
+use tightbeam::crypto::k256::{PublicKey, Secp256k1};
 use tightbeam::crypto::kdf::{Hkdf, KdfError, KdfFunction};
 use tightbeam::crypto::key::{KeyError, Secp256k1KeyProvider, SigningKeyProvider};
 use tightbeam::crypto::policy::ProviderPolicy;
@@ -33,19 +41,24 @@ use tightbeam::crypto::profiles::{
 use tightbeam::crypto::secret::{SecretSlice, ToInsecure};
 use tightbeam::crypto::sign::{
 	CanonicalForm, CmsSigner, Error as SignatureError, PrehashSigner, PrehashVerifier, SignatureAlgorithmIdentifier,
-	SignatureEncoding, SignedContent, SignerError, SigningIdentity,
+	SignatureEncoding, SignedContent, SignerError, SigningIdentity, Verifier,
 };
 use tightbeam::der::asn1::ObjectIdentifier;
 use tightbeam::der::oid::AssociatedOid;
 use tightbeam::der::Encode;
 use tightbeam::oids::{AES_128_GCM, AES_128_WRAP, DATA, SIGNER_ECDSA_WITH_SHA3_256, SIGNER_ECDSA_WITH_SHA3_512};
 use tightbeam::random::{CryptoRngCore, OsRng};
-use tightbeam::spki::{AlgorithmIdentifierOwned, EncodePublicKey, SubjectPublicKeyInfoRef};
+use tightbeam::spki::{AlgorithmIdentifierOwned, Document, EncodePublicKey, SubjectPublicKeyInfoRef};
 use tightbeam::testing::{unhex, EnvelopeRecipient, SeededStream, TestCertificate, TestMessage};
 use tightbeam::utils::marker::MaybeSendFuture;
 use tightbeam::x509::Certificate;
 use tightbeam::zeroize::Zeroizing;
 use tightbeam::{Version, ZeroizingBytes};
+
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use tightbeam::transport::handshake::negotiation::{NoStrengthFloor, ProfilePolicy};
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use tightbeam::transport::handshake::{Client, ClientFlow, Handshake, Server, ServerFlow};
 
 /// The identifier of the outside KEM, under an arc of its own.
 const OUTSIDE_KEM: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.3.1");
@@ -128,6 +141,29 @@ impl TryFrom<SubjectPublicKeyInfoRef<'_>> for OutsideVerifyingKey {
 
 	fn try_from(spki: SubjectPublicKeyInfoRef<'_>) -> Result<Self, Self::Error> {
 		VerifyingKey::try_from(spki).map(Self)
+	}
+}
+
+/// The ECDSA check over the SHA3-512 digest of `message`, as
+/// `ecdsa-with-SHA3-512` names it.
+impl Verifier<OutsideSignature> for OutsideVerifyingKey {
+	fn verify(&self, message: &[u8], signature: &OutsideSignature) -> Result<(), SignatureError> {
+		let prehash = Sha3_512::digest(message);
+		self.0.verify_prehash(&prehash, &signature.0)
+	}
+}
+
+/// The key of a point on secp256k1, as a handshake reads it from a
+/// certificate.
+impl From<PublicKey> for OutsideVerifyingKey {
+	fn from(key: PublicKey) -> Self {
+		Self(VerifyingKey::from(key))
+	}
+}
+
+impl EncodePublicKey for OutsideVerifyingKey {
+	fn to_public_key_der(&self) -> tightbeam::spki::Result<Document> {
+		self.0.to_public_key_der()
 	}
 }
 
@@ -303,6 +339,29 @@ fn outside_identity() -> SigningIdentity {
 	let key = SigningKey::random(&mut OsRng);
 	let certificate = TestCertificate::self_signed(&key);
 	outside_identity_of(certificate, key)
+}
+
+/// The policy of both endpoints of a handshake under [`OutsideProvider`].
+/// The outside profile runs AES-128-GCM, below the default floor of 256-bit
+/// keys, so both endpoints apply no floor.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+fn outside_policy() -> ProfilePolicy<OutsideProvider> {
+	ProfilePolicy::with_floor(Arc::new(NoStrengthFloor))
+}
+
+/// Run the three legs of `client` and `server` of flow `F` under
+/// [`OutsideProvider`].
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+async fn run_legs<F>(
+	client: &mut Handshake<Client, F, OutsideProvider>,
+	server: &mut Handshake<Server, F, OutsideProvider>,
+) where
+	F: ClientFlow<OutsideProvider> + ServerFlow<OutsideProvider>,
+{
+	let opening = client.start().expect("the outside client opens");
+	let reply = server.reply(opening).await.expect("the outside server replies");
+	let closing = client.respond(reply).await.expect("the outside client closes");
+	server.finish(closing).await.expect("the outside server admits the closing");
 }
 
 /// [`CONTENT`] sealed under [`OutsideProvider`] to `recipient`.

@@ -11,9 +11,6 @@ use crate::instrumentation::events;
 ))]
 use crate::urn::Urn;
 
-/// Result type for handshake operations.
-pub type Result<T> = core::result::Result<T, HandshakeError>;
-
 /// Errors that a handshake operation returns.
 ///
 /// The handshake reports an invariant violation through one of these variants
@@ -21,10 +18,6 @@ pub type Result<T> = core::result::Result<T, HandshakeError>;
 #[derive(Debug, Errorizable)]
 #[non_exhaustive]
 pub enum HandshakeError {
-	/// The server key exchange message is invalid.
-	#[error("Invalid server key exchange message")]
-	InvalidServerKeyExchange,
-
 	/// A public key in the handshake is invalid.
 	#[error("Invalid public key in handshake: {0}")]
 	#[from]
@@ -135,24 +128,24 @@ pub enum HandshakeError {
 	#[error("Receipt acknowledgement envelope refused: {0}")]
 	ReceiptAckCipher(crate::crypto::cms::EnvelopeError),
 
-	/// The envelope refused to seal or open the client identity of the
-	/// closing under the key the handshake secret derives. It was sealed under
-	/// another handshake secret or another transcript, or altered in flight.
-	/// A sealed CMS Finished is refused the same way. The payload is the
-	/// envelope's refusal.
+	/// The envelope refused to seal or open the closing under the key the
+	/// handshake secret derives. The closing was sealed under another
+	/// handshake secret or another transcript, or altered in flight. The
+	/// payload is the envelope's refusal.
 	#[cfg(feature = "hpke")]
-	#[error("Sealed client identity refused: {0}")]
-	SealedIdentity(crate::crypto::cms::EnvelopeError),
+	#[error("Sealed closing refused: {0}")]
+	SealedClosing(crate::crypto::cms::EnvelopeError),
 
-	/// The client identity exceeds the padded frame it seals in, or an opened
-	/// frame carries a length past its end, a non-zero padding byte, or
-	/// another padded length.
+	/// The closing exceeds the padded frame it seals in, or an opened frame
+	/// carries a length past its end, a non-zero padding byte, or another
+	/// padded length.
 	#[error("Sealed frame malformed")]
 	SealedFrame,
 
-	/// The key-confirmation tag of the closing differs from the tag the server
-	/// derived. The client holds another handshake secret, or it confirmed
-	/// another transcript.
+	/// A key-confirmation tag differs from the tag its receiver derived: the
+	/// client's tag in the closing, or the server Finished of the HPKE reply.
+	/// The peer holds another handshake secret, or it confirmed another
+	/// transcript.
 	#[error("Key confirmation failed")]
 	KeyConfirmationFailed,
 
@@ -212,13 +205,6 @@ pub enum HandshakeError {
 	#[error("Authenticated envelope refused: {0}")]
 	#[from]
 	Envelope(crate::crypto::cms::EnvelopeError),
-	/// The decrypted HPKE payload has an invalid size.
-	#[error("Invalid decrypted payload size")]
-	InvalidDecryptedPayloadSize,
-	/// The client random differs from the expected value, which indicates a
-	/// possible replay attack.
-	#[error("client_random mismatch - possible replay attack")]
-	ClientRandomMismatchReplay,
 
 	/// A KDF operation failed.
 	#[error("KDF operation failed: {0}")]
@@ -249,9 +235,9 @@ impl HandshakeError {
 	///
 	/// - A receipt approval or settlement refusal records
 	///   [`SESSION_RECEIPT_REFUSED`](events::SESSION_RECEIPT_REFUSED).
-	/// - A refused peer certificate or proof of possession, including a
-	///   certificate the peer did not present and a sealed identity or frame
-	///   that fails to open, records
+	/// - A refused peer certificate or client Finished, including a
+	///   certificate the peer did not present and a closing or frame that
+	///   fails to open, records
 	///   [`SESSION_CERT_REJECTED`](events::SESSION_CERT_REJECTED).
 	pub(crate) fn audit_event(&self) -> Option<Urn<'static>> {
 		match self {
@@ -259,7 +245,7 @@ impl HandshakeError {
 			Self::CertificateValidationError(_)
 			| Self::SignatureVerificationFailed
 			| Self::MissingClientCertificate
-			| Self::SealedIdentity(_)
+			| Self::SealedClosing(_)
 			| Self::SealedFrame
 			| Self::MutualAuthRequired => Some(events::SESSION_CERT_REJECTED),
 			_ => None,
@@ -327,11 +313,11 @@ mod tests {
 		assert_eq!(event, Some(events::SESSION_CERT_REJECTED));
 	}
 
-	/// A sealed identity that fails to open names no certificate the server
-	/// could check, so it records the refusal of an unproven identity.
+	/// A closing that fails to open names no certificate the server could
+	/// check, so it records the refusal of an unproven identity.
 	#[test]
 	fn a_sealed_identity_that_fails_to_open_is_a_certificate_rejection() {
-		let event = HandshakeError::SealedIdentity(EnvelopeError::Authentication).audit_event();
+		let event = HandshakeError::SealedClosing(EnvelopeError::Authentication).audit_event();
 		assert_eq!(event, Some(events::SESSION_CERT_REJECTED));
 	}
 

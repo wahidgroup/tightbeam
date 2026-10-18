@@ -56,7 +56,6 @@ mod hpke {
 		NO_OUTCOME_BEFORE_CONCLUSION, SESSION_NEVER_ACTIVATES, SETTLE_NEVER_FIRED, TAMPERED_CIPHERTEXT_REJECTED,
 	};
 
-	use tightbeam::asn1::OctetString;
 	use tightbeam::crypto::profiles::DefaultCryptoProvider;
 	use tightbeam::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
 	use tightbeam::exactly;
@@ -65,12 +64,12 @@ mod hpke {
 	use tightbeam::testing::SetupEnv;
 	use tightbeam::transport::handshake::negotiation::{MuxBudgets, SecurityOffer, TransportOffer};
 	use tightbeam::transport::handshake::receipt::SessionObserver;
-	use tightbeam::transport::handshake::{Handshake, HandshakeError, PeerAuthentication};
+	use tightbeam::transport::handshake::{Handshake, HandshakeError, HandshakeMessage, PeerAuthentication};
 	use tightbeam::TightBeamError;
 
 	use crate::common::security::{
-		carried_closing, carried_key_exchange, default_security_profile, hpke_client_config, hpke_server_config,
-		pinning_validator, ClientMaterials, PayingApprover, RecordingObserver, ServerMaterials, SettleSpyAuthorizer,
+		default_security_profile, flip_sealed_content, hpke_client_config, hpke_server_config, pinning_validator,
+		ClientMaterials, PayingApprover, RecordingObserver, ServerMaterials, SettleSpyAuthorizer,
 	};
 
 	const CHALLENGE: &[u8] = b"evidence-invoice";
@@ -119,20 +118,17 @@ mod hpke {
 
 				let mut server = Handshake::server(server_config);
 				let reply = server.reply(client.start()?).await?;
-				let closing = client.respond(reply).await?;
+				let sealed_closing = client.respond(reply).await?.auth_enveloped()?;
 
-				// The payload is authenticated encryption, and a flipped
-				// ciphertext byte is the only wire handle a MITM has on the
+				// The closing is authenticated encryption, and a flipped
+				// content byte is the only wire handle a MITM has on the
 				// sealed acknowledgement.
-				let mut kex = carried_key_exchange(closing);
-				let mut forged = kex.sealed_payload.as_bytes().to_vec();
-				let middle = forged.len() / 2;
-				forged[middle] ^= 0xFF;
-				kex.sealed_payload = OctetString::new(forged)?;
+				let tampered = flip_sealed_content(sealed_closing.value())?;
 
-				let kex_result = server.finish(carried_closing(&kex)).await;
-				let rejected = matches!(kex_result, Err(HandshakeError::HpkeError(_)));
+				let closing = server.finish(HandshakeMessage::try_from(tampered)?).await;
+				let rejected = matches!(closing, Err(HandshakeError::SealedClosing(_)));
 				trace.event_with(TAMPERED_CIPHERTEXT_REJECTED, &[], rejected)?;
+
 				let unsettled = authorizer.settle_calls() == 0;
 				trace.event_with(SETTLE_NEVER_FIRED, &[], unsettled)?;
 
@@ -158,8 +154,6 @@ mod cms {
 		NO_OUTCOME_BEFORE_CONCLUSION, SESSION_NEVER_ACTIVATES, SETTLE_NEVER_FIRED, TAMPERED_CIPHERTEXT_REJECTED,
 	};
 
-	use tightbeam::asn1::OctetString;
-	use tightbeam::crypto::cms::AuthEnvelopedData;
 	use tightbeam::exactly;
 	use tightbeam::tb_assert_spec;
 	use tightbeam::tb_scenario;
@@ -170,28 +164,13 @@ mod cms {
 	use tightbeam::TightBeamError;
 
 	use crate::common::security::{
-		cms_mutual_budget_pair, expectation_failure, CmsSessionHooks, PayingApprover, RecordingObserver,
+		cms_mutual_budget_pair, flip_sealed_content, CmsSessionHooks, PayingApprover, RecordingObserver,
 		ServerMaterials, SettleSpyAuthorizer,
 	};
 
 	const CHALLENGE: &[u8] = b"evidence-cms-invoice";
 	const RESPONSE: &[u8] = b"evidence-cms-preimage";
 	const REQUEST: MuxBudgets = MuxBudgets { client_to_server: 64, server_to_client: 128 };
-
-	/// The sealed client Finished with the middle byte of its encrypted content
-	/// flipped. A flipped content byte is the one wire handle a MITM has on the
-	/// sealed acknowledgement inside it.
-	fn flip_sealed_content(sealed_finished: &AuthEnvelopedData) -> Result<AuthEnvelopedData, TightBeamError> {
-		let mut tampered = sealed_finished.to_owned();
-		let content = tampered.auth_encrypted_content_info.encrypted_content.as_ref();
-		let content = content.ok_or_else(|| expectation_failure("a sealed Finished carries content"))?;
-		let mut forged = content.as_bytes().to_vec();
-		let middle = forged.len() / 2;
-
-		forged[middle] ^= 0xFF;
-		tampered.auth_encrypted_content_info.encrypted_content = Some(OctetString::new(forged)?);
-		Ok(tampered)
-	}
 
 	tb_assert_spec! {
 		pub CmsCountersignatureTamperSpec,
@@ -228,7 +207,7 @@ mod cms {
 				let tampered = flip_sealed_content(sealed_finished.value())?;
 
 				let closing = server.finish(HandshakeMessage::try_from(tampered)?).await;
-				let rejected = matches!(closing, Err(HandshakeError::SealedIdentity(_)));
+				let rejected = matches!(closing, Err(HandshakeError::SealedClosing(_)));
 				trace.event_with(TAMPERED_CIPHERTEXT_REJECTED, &[], rejected)?;
 
 				let unsettled = authorizer.settle_calls() == 0;

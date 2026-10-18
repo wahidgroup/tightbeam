@@ -5,7 +5,9 @@
 use std::sync::Arc;
 
 use tightbeam::{
+	asn1::OctetString,
 	crypto::{
+		cms::AuthEnvelopedData,
 		key::{Secp256k1KeyProvider, SigningKeyProvider},
 		policy::Secp256k1Policy,
 		profiles::{SecurityProfileDesc, TightbeamProfile},
@@ -32,6 +34,22 @@ pub fn expectation_failure(reason: &'static str) -> TightBeamError {
 	}))
 }
 
+/// The sealed closing with the middle byte of its encrypted content flipped.
+/// A flipped content byte is the one wire handle a MITM has on what the
+/// closing seals: the client Finished or the anonymous attributes, and the
+/// acknowledgement inside either.
+pub fn flip_sealed_content(sealed_closing: &AuthEnvelopedData) -> Result<AuthEnvelopedData, TightBeamError> {
+	let mut tampered = sealed_closing.to_owned();
+	let content = tampered.auth_encrypted_content_info.encrypted_content.as_ref();
+	let content = content.ok_or_else(|| expectation_failure("a sealed closing carries content"))?;
+	let mut forged = content.as_bytes().to_vec();
+	let middle = forged.len() / 2;
+
+	forged[middle] ^= 0xFF;
+	tampered.auth_encrypted_content_info.encrypted_content = Some(OctetString::new(forged)?);
+	Ok(tampered)
+}
+
 /// The server credentials of a handshake fixture, over the fixed test key.
 #[derive(Clone)]
 pub struct ServerMaterials {
@@ -39,8 +57,9 @@ pub struct ServerMaterials {
 	pub certificate: Arc<Certificate>,
 	/// The provider of the server's static signing key.
 	pub key_provider: Arc<dyn SigningKeyProvider>,
-	/// The secret key a test decrypts an HPKE payload with. It sits in an
-	/// `Arc`, so the bundle is `Clone` without copying secret material.
+	/// The server's static secret key, which an observer test holds to show
+	/// what it fails to open. It sits in an `Arc`, so the bundle is `Clone`
+	/// without copying secret material.
 	secret_key: Arc<k256::SecretKey>,
 }
 
@@ -57,7 +76,7 @@ impl ServerMaterials {
 		Self { certificate, key_provider: provider, secret_key: Arc::new(secret_key) }
 	}
 
-	/// The secret key, which a test uses to decrypt an HPKE payload.
+	/// The server's static secret key, which an observer test holds.
 	pub fn secret_key(&self) -> &k256::SecretKey {
 		&self.secret_key
 	}
@@ -325,13 +344,15 @@ pub use receipt_fixtures::*;
 mod hpke_handshake {
 	use std::sync::Arc;
 
-	use tightbeam::cms::signed_data::SignedData;
+	use tightbeam::cms::content_info::ContentInfo;
 	use tightbeam::crypto::profiles::SecurityProfileDesc;
 	use tightbeam::crypto::x509::policy::CertificateValidation;
-	use tightbeam::der::Encode;
+	use tightbeam::der::asn1::OctetStringRef;
+	use tightbeam::der::{Any, Decode, Encode, Tag};
+	use tightbeam::oids::DATA;
 	use tightbeam::transport::handshake::{
-		ClientConfig, ClientHello, ClientKeyExchange, HandshakeMessage, HandshakeProvider, Hpke, HpkeClientSettings,
-		HpkeServerSettings, LearnedTrust, ServerConfig, ServerHandshake, SupportedProfiles,
+		ClientConfig, ClientHello, HandshakeMessage, HandshakeProvider, Hpke, HpkeClientSettings, HpkeServerSettings,
+		LearnedTrust, ServerConfig, ServerHandshake, SupportedProfiles,
 	};
 
 	use super::ServerMaterials;
@@ -357,41 +378,39 @@ mod hpke_handshake {
 		ServerConfig::new(settings, materials.identity(), profiles)
 	}
 
-	/// The DER of the `ClientHello` that `opening` tunnels.
-	pub fn tunneled_hello(opening: HandshakeMessage) -> Vec<u8> {
-		let tunnel = opening.signed().expect("an HPKE opening travels in a SignedData");
-		let hello = ClientHello::try_from(tunnel.value()).expect("the opening tunnels a ClientHello");
-		hello.to_der().expect("a decoded ClientHello encodes")
+	/// The DER of the `ClientHello` that `opening` carries as the OCTET
+	/// STRING of its `ContentInfo`.
+	pub fn carried_hello(opening: HandshakeMessage) -> Vec<u8> {
+		let data = opening.data().expect("an HPKE opening is a ContentInfo");
+		let octets = data.value().content.decode_as::<OctetStringRef<'_>>();
+		let octets = octets.expect("the opening carries its hello as an OCTET STRING");
+		octets.as_bytes().to_vec()
 	}
 
-	/// `hello` as the opening an HPKE server reads.
-	pub fn tunneled_opening(hello: &ClientHello) -> HandshakeMessage {
-		let tunnel = SignedData::try_from(hello).expect("a ClientHello tunnels in a SignedData");
-		HandshakeMessage::try_from(tunnel).expect("the tunnel encodes")
+	/// `hello` as the opening an HPKE server reads: a `ContentInfo` of type
+	/// `id-data` whose OCTET STRING is its DER.
+	pub fn hello_opening(hello: &ClientHello) -> HandshakeMessage {
+		let der = hello.to_der().expect("a ClientHello encodes");
+		let content = Any::new(Tag::OctetString, der).expect("the hello fits an OCTET STRING");
+		let opening = HandshakeMessage::try_from(ContentInfo { content_type: DATA, content });
+		opening.expect("the opening encodes")
 	}
 
-	/// The `ServerHandshake` that `reply` tunnels.
-	pub fn tunneled_handshake(reply: HandshakeMessage) -> ServerHandshake {
-		let tunnel = reply.signed().expect("an HPKE reply travels in a SignedData");
-		ServerHandshake::try_from(tunnel.value()).expect("the reply tunnels a ServerHandshake")
+	/// The `ServerHandshake` that `reply` signs as its content.
+	pub fn signed_handshake(reply: HandshakeMessage) -> ServerHandshake {
+		let signed = reply.signed().expect("an HPKE reply is a SignedData").into_value();
+		let econtent = signed.encap_content_info.econtent.expect("the reply carries its content");
+		ServerHandshake::from_der(econtent.value()).expect("the reply signs a ServerHandshake")
 	}
 
-	/// `handshake` as the reply an HPKE client reads.
-	pub fn tunneled_reply(handshake: &ServerHandshake) -> HandshakeMessage {
-		let tunnel = SignedData::try_from(handshake).expect("a ServerHandshake tunnels in a SignedData");
-		HandshakeMessage::try_from(tunnel).expect("the tunnel encodes")
-	}
-
-	/// The `ClientKeyExchange` that `closing` carries.
-	pub fn carried_key_exchange(closing: HandshakeMessage) -> ClientKeyExchange {
-		let key_exchange = closing.key_exchange().expect("an HPKE closing is a ClientKeyExchange");
-		key_exchange.into_value()
-	}
-
-	/// `key_exchange` as the closing an HPKE server reads.
-	pub fn carried_closing(key_exchange: &ClientKeyExchange) -> HandshakeMessage {
-		let closing = HandshakeMessage::try_from(key_exchange.to_owned());
-		closing.expect("the key exchange encodes")
+	/// `reply` with `handshake` in place of the content it signs, as a MITM
+	/// rewrites it. The signature and every attribute stay as they were.
+	pub fn rewritten_reply(reply: HandshakeMessage, handshake: &ServerHandshake) -> HandshakeMessage {
+		let mut signed = reply.signed().expect("an HPKE reply is a SignedData").into_value();
+		let der = handshake.to_der().expect("a ServerHandshake encodes");
+		let content = Any::new(Tag::OctetString, der).expect("the content fits an OCTET STRING");
+		signed.encap_content_info.econtent = Some(content);
+		HandshakeMessage::try_from(signed).expect("the rewritten reply encodes")
 	}
 }
 
@@ -476,8 +495,8 @@ mod cms_pair {
 		let mut client = cms_client_config(&materials.certificate, trust_store, client_materials.identity());
 		client.security_offer = Some(SecurityOffer::new(client_profiles));
 
-		// The server learns the client certificate from the KeyExchange it
-		// processes, as it does in production. Seeding it here would test a
+		// The server learns the client certificate from the closing it opens,
+		// as it does in production. Seeding it here would test a
 		// server that already knows what the handshake is meant to establish.
 		let mut server = cms_server_config(materials, server_profiles);
 		server.peer_authentication = peer_authentication;

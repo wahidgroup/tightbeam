@@ -861,3 +861,96 @@ async fn a_policy_refuses_a_digest_the_signature_algorithm_does_not_name() -> Te
 	assert!(unsupported);
 	Ok(())
 }
+
+/// The `SignedData` of [`signed`] carrying `certificates`, which DER sorts.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+fn signed_data_carrying(certificates: impl IntoIterator<Item = crate::x509::Certificate>) -> SignedData {
+	let choices: Vec<CertificateChoices> = certificates.into_iter().map(CertificateChoices::Certificate).collect();
+	let set = CertificateSet(choices.try_into().expect("distinct certificates are a SET"));
+	let signed_data = CmsSigner::signed_data(SignedContent::data(CONTENT), signed(), Some(set));
+	signed_data.expect("the SignedData assembles").into_inner()
+}
+
+/// The certificate the one signer names moves out of `certificates`, and
+/// the rest of the set stays (RFC 5652 §5.3).
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+#[test]
+fn taking_the_signer_certificate_leaves_the_rest_of_the_set() -> TestResult {
+	let named = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+	let other = TestCertificate::self_signed(&Secp256k1SigningKey::random(&mut crate::random::OsRng));
+	let mut signed_data = signed_data_carrying([other.to_owned(), named.to_owned()]);
+
+	let taken = CmsSigner::take_signer_certificate(&mut signed_data)?;
+	let rest = signed_data.certificates.map(|set| set.0.into_vec());
+	assert_eq!(taken, Some(named));
+	assert_eq!(rest, Some(vec![CertificateChoices::Certificate(other)]));
+	Ok(())
+}
+
+/// A set that holds no certificate the signer names gives none, and keeps
+/// what it holds.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+#[test]
+fn taking_from_a_set_without_the_signer_certificate_takes_nothing() -> TestResult {
+	let other = TestCertificate::self_signed(&Secp256k1SigningKey::random(&mut crate::random::OsRng));
+	let mut signed_data = signed_data_carrying([other.to_owned()]);
+
+	let taken = CmsSigner::take_signer_certificate(&mut signed_data)?;
+	let kept = signed_data.certificates.map(|set| set.0.into_vec());
+	assert_eq!(taken, None);
+	assert_eq!(kept, Some(vec![CertificateChoices::Certificate(other)]));
+	Ok(())
+}
+
+/// The scan of the received set returns the certificate the one signer
+/// names, parsed from the element it arrived as, beside those bytes. Under
+/// the fixed key `0x02` × 32, the other certificate sorts first in the SET,
+/// so the named certificate is the second element.
+#[cfg(feature = "transport-hpke")]
+#[test]
+fn the_received_signer_certificate_is_the_one_its_sid_names() -> TestResult {
+	let named = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+	let other = TestCertificate::self_signed(&Secp256k1SigningKey::from_bytes(&[0x02u8; 32].into())?);
+	let signed_data = signed_data_carrying([other.to_owned(), named.to_owned()]);
+	let first = signed_data.certificates.iter().flat_map(|set| set.0.iter()).next();
+	let received = signed_data.to_der()?;
+	let expected = named.to_der()?;
+
+	let arrived = CmsSigner::signer_certificate_der(&signed_data, &received)?;
+	assert_eq!(first, Some(&CertificateChoices::Certificate(other)));
+	assert_eq!(arrived, Some((named, expected.as_slice())));
+	Ok(())
+}
+
+/// An unsigned attribute joins the one signer of a `SignedData`, and the
+/// signature still verifies, since it covers no unsigned attribute.
+#[cfg(feature = "transport-hpke")]
+#[test]
+fn an_unsigned_attribute_joins_the_one_signer() -> TestResult {
+	let content = SignedContent::data(CONTENT);
+	let signed_data = CmsSigner::signed_data(content, signed(), None)?;
+	let attribute = Attribute { oid: RECEIPT_ROLE, values: SetOfVec::try_from(vec![Any::encode_from(&1u8)?])? };
+
+	let joined = signed_data.with_unsigned_attribute(attribute.to_owned())?;
+	let signer = joined.signer_infos.0.iter().next().ok_or("the SignedData has a signer")?;
+	let carried = signer.unsigned_attrs.as_ref().map(|attrs| attrs.as_slice().to_vec());
+	assert_eq!(carried, Some(vec![attribute]));
+	verify(signer)?;
+	Ok(())
+}
+
+/// A `SignedData` of two signers takes no unsigned attribute, since it names
+/// no one signer.
+#[cfg(feature = "transport-hpke")]
+#[test]
+fn an_unsigned_attribute_refuses_two_signers() -> TestResult {
+	let content = SignedContent::data(CONTENT);
+	let first = CmsSigner::signed_data(content, signed(), None)?;
+	let other = TestIdentity::certified(Secp256k1SigningKey::random(&mut crate::random::OsRng));
+	let both = first.with_signer(signed_by(&other, SignedContent::data(CONTENT)))?;
+	let attribute = Attribute { oid: RECEIPT_ROLE, values: SetOfVec::try_from(vec![Any::encode_from(&1u8)?])? };
+
+	let refused = both.with_unsigned_attribute(attribute);
+	assert!(matches!(refused, Err(SignerError::SignerIdentifier)));
+	Ok(())
+}

@@ -28,6 +28,12 @@
 # DHKEM over secp256k1 under the crate's KEM identifier, so it parses the
 # KEMRecipientInfo sample and cannot open it.
 #
+# The HPKE flow writes three samples. OpenSSL parses hpke-hello, the
+# `ContentInfo` of type id-data whose content is the ClientHello. It verifies
+# hpke-reply, the reply SignedData, under the certificate the reply carries.
+# It decrypts hpke-closing, the anonymous closing under a KEKRecipientInfo,
+# under its fixed test KEK.
+#
 # OpenSSL feeds no authAttrs to the cipher as associated data
 # (crypto/cms/cms_env.c and cms_enc.c set none), where RFC 5083 section 2.2
 # makes their DER the AAD. It writes the content before it checks the tag, so
@@ -45,7 +51,7 @@
 #
 # The script exits non-zero when a sample fails `asn1parse`, fails the CMS
 # parse under either tagging, fails to verify, fails to decrypt to its
-# expected plaintext, or when no sample is present.
+# expected plaintext, or when a sample of `required` is absent.
 # It has no dependency on the crate.
 #
 # References:
@@ -67,6 +73,23 @@ shopt -s nullglob
 samples=("$SAMPLE_DIR"/*.der)
 if [ "${#samples[@]}" -eq 0 ]; then
 	echo "cms-interop: no samples in $SAMPLE_DIR" >&2
+	exit 1
+fi
+
+# Each structure the handshake emits, so a writer that stops emitting one
+# fails the run.
+required=(
+	cms-opening server-finished session-receipt sealed-finished kek-seal frame-signature joined-receipt
+	hpke-hello hpke-reply hpke-closing
+)
+absent=0
+for name in "${required[@]}"; do
+	if [ ! -f "$SAMPLE_DIR/$name.der" ]; then
+		echo "cms-interop: no $name sample in $SAMPLE_DIR" >&2
+		absent=$((absent + 1))
+	fi
+done
+if [ "$absent" -ne 0 ]; then
 	exit 1
 fi
 

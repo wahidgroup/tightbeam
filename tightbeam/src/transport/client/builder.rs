@@ -202,17 +202,6 @@ impl<P: Protocol> ClientBuilder<P> {
 		self
 	}
 
-	/// Replace the domain-separation tag of the HPKE key exchange.
-	///
-	/// The HPKE handshake binds this tag into the associated data of the
-	/// encrypted key exchange, so an HPKE session completes only when both
-	/// endpoints hold the same tag. The CMS handshake and session records do
-	/// not read it.
-	pub fn with_aad_domain_tag(mut self, tag: &'static [u8]) -> Self {
-		self.encryption.aad_domain_tag = tag;
-		self
-	}
-
 	/// Run this client without authenticating the server.
 	///
 	/// A client with no trust store verifies nobody, so [`Self::connect`] and

@@ -974,8 +974,6 @@ mod tests {
 	}
 
 	#[cfg(feature = "transport-hpke")]
-	use crate::crypto::hpke::HpkeError;
-	#[cfg(feature = "transport-hpke")]
 	use crate::policy::SessionContext;
 	#[cfg(feature = "transport-hpke")]
 	use crate::transport::policy::CollectorGateConfig;
@@ -1601,58 +1599,6 @@ mod tests {
 
 		let received = received_rx.recv().await;
 		assert_eq!(Some(request), received);
-
-		server_handle.await??;
-		Ok(())
-	}
-
-	// Both endpoints bind the domain tag into the key exchange's associated
-	// data, so a server tag the client does not share fails the session
-	// before the first frame is answered.
-	#[cfg(feature = "transport-hpke")]
-	#[tokio::test]
-	async fn a_server_domain_tag_the_client_does_not_share_fails_the_session() -> TransportResult<()> {
-		let EncryptedTestServer { cert, config } = encrypted_test_server()?;
-		let config = config.with_aad_domain_tag(b"tightbeam-test-other-domain");
-		let (listener, server_addr) = bind_encrypted(config).await?;
-		let server_handle = spawn_accept_handle_request(listener);
-
-		let trust_store = trust_store_for(cert)?;
-		let client_stream = TcpStream::connect(server_addr).await?;
-		let mut transport = trusting_client(client_stream, trust_store);
-
-		// The server cannot authenticate the key exchange, so it refuses the
-		// handshake and closes the connection under the client's frame.
-		let emitted = transport.emit(TestFrame::v0(None, None), None).await;
-		let served = server_handle.await?;
-		assert!(matches!(emitted, Err(TransportError::ConnectionClosed)));
-		assert!(matches!(
-			served,
-			Err(TransportError::HandshakeError(HandshakeError::HpkeError(
-				HpkeError::DecryptionFailed(_)
-			)))
-		));
-		Ok(())
-	}
-
-	#[cfg(feature = "transport-hpke")]
-	#[tokio::test]
-	async fn endpoints_that_share_a_domain_tag_complete_the_session() -> TransportResult<()> {
-		const DOMAIN_TAG: &[u8] = b"tightbeam-test-other-domain";
-		let EncryptedTestServer { cert, config } = encrypted_test_server()?;
-		let (listener, server_addr) = bind_encrypted(config.with_aad_domain_tag(DOMAIN_TAG)).await?;
-		let server_handle = spawn_accept_handle_request(listener);
-
-		let trust_store = trust_store_for(cert)?;
-		let client_stream = TcpStream::connect(server_addr).await?;
-		let encryption = EncryptionConfig {
-			trust_store: Some(trust_store),
-			aad_domain_tag: DOMAIN_TAG,
-			..EncryptionConfig::unconfigured()
-		};
-
-		let mut transport = client_over(client_stream, encryption);
-		transport.emit(TestFrame::v0(None, None), None).await?;
 
 		server_handle.await??;
 		Ok(())

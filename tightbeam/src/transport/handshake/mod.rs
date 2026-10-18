@@ -2,8 +2,9 @@
 //!
 //! This module implements two handshake protocols:
 //!
-//! - **HPKE-based**: the client seals the base secret to the server's static
-//!   key (RFC 9180), and the closing travels as a [`ClientKeyExchange`].
+//! - **HPKE**: the shape of the TLS 1.3 handshake (RFC 9846) in CMS
+//!   containers. The server's key signs its reply, and the handshake secret
+//!   derives from the two ephemerals alone.
 //! - **CMS-based**: full X.509 PKI with signed and authenticated-enveloped data.
 //!
 //! Both protocols establish authenticated, encrypted sessions and negotiate
@@ -28,19 +29,23 @@
 //! │                                                                        │
 //! │ Client ─────────────────────────── Server                              │
 //! │  │                           │                                         │
-//! │  │── ClientHello ───────────►│  (client_rand, security_offer?)         │
+//! │  │── ClientHello ───────────►│  (client_rand, R, security_offer?)      │
 //! │  │                           │                                         │
-//! │  │◄─ ServerHandshake ────────│  (server_rand, eph, cert, sig, accept?, │
-//! │  │                           │   ma?)                                  │
-//! │  │── ClientKeyExchange ─────►│  (hpke(base, R, tag, ack?,              │
-//! │  │                           │   seal(cert, sig)?))                    │
+//! │  │◄─ ServerHandshake ────────│  (server_rand, E, accept?, ma?,         │
+//! │  │                           │   signed, cert, server Finished)        │
+//! │  │── Closing ───────────────►│  (seal(Finished?, tag, ack?))           │
+//! │  │                           │                                         │
 //! │  │ ◄═ Session Established ═► │  (AEAD keys derived)                    │
 //! │  │                           │                                         │
 //! │  └───────────────────────────┘                                         │
 //! └────────────────────────────────────────────────────────────────────────┘
 //! **Legend:**
-//! - `seal(cert, sig)` = the client certificate and its signature, sealed under a key of the handshake secret
-//! - `eph` = the server's per-handshake ephemeral public key, inside the signed transcript
+//! - `R`, `E` = the client's and the server's per-handshake ephemeral public
+//!   keys, inside the signed transcript
+//! - `server Finished` = the MAC over the transcript hash and the reply's
+//!   signature, which the client verifies
+//! - `seal(...)` = the closing, sealed under a key of the handshake secret
+//! - `Finished?` = the client Finished, which carries the client certificate, when the client presents one
 //! - `tag` = the client's key-confirmation tag, which the server verifies before it settles
 //! - Arrows show message direction and content
 //! - Session establishment occurs after successful key exchange
@@ -48,20 +53,21 @@
 //!
 //! # Forward secrecy
 //!
-//! Both protocols derive every traffic key from one [`HandshakeSecret`],
-//! which takes two inputs:
+//! Both protocols derive every traffic key from one [`HandshakeSecret`], whose
+//! inputs are:
 //!
 //! - the ECDH output of the client's ephemeral and the server's ephemeral, and
-//! - the base secret the client seals to the server's static key.
+//! - in the CMS flow, the base secret the client seals to the server's certificate key.
 //!
 //! The server signs its ephemeral inside the transcript, and both ephemeral
 //! private keys drop at the step that consumes them. A recording plus a later
-//! copy of the server's static key therefore recovers the base secret alone.
-//! These need the ECDH output, which needs a private key neither side kept:
+//! copy of a server's static key therefore recovers the CMS base secret alone,
+//! and nothing of an HPKE session, whose server key only signs. These need the
+//! ECDH output, which needs a private key neither side kept:
 //!
 //! - the traffic keys and the rekey epochs,
 //! - the sealed receipt acknowledgement, and
-//! - the sealed client identity.
+//! - the closing, with the client identity it carries.
 //!
 //! # Architecture
 //!
@@ -142,14 +148,17 @@
 //!
 //! | Leg | Sender | HPKE message | CMS message |
 //! | --- | --- | --- | --- |
-//! | Opening | Client | `ClientHello` | `AuthEnvelopedData` to the server's certificate |
-//! | Reply | Server | `ServerHandshake` | Server Finished |
-//! | Closing | Client | `ClientKeyExchange` | Client Finished, sealed in `AuthEnvelopedData` |
+//! | Opening | Client | `ClientHello` in an `id-data` `ContentInfo` | `AuthEnvelopedData` to the server's certificate |
+//! | Reply | Server | `ServerHandshake` in a `SignedData`, with the server Finished | Server Finished, with the MAC |
+//! | Closing | Client | The closing of both flows, sealed in `AuthEnvelopedData` | The same closing |
 //!
-//! A server reads the closing in one order in both protocols: it opens the
-//! closing, confirms the handshake secret, admits the client, and settles the
-//! receipt. The client identity opens only under the handshake secret, so the
-//! comparison of the client ephemerals with the client's static key waits for
+//! The closing is the client Finished of a client that presents an identity,
+//! or the key-confirmation attributes of an anonymous client. A server reads
+//! it in one order in both protocols: it opens the closing, confirms the
+//! handshake secret, admits the client, and settles the receipt.
+//!
+//! The client identity opens only under the handshake secret, so the
+//! comparison of the client ephemeral with the client's static key waits for
 //! the open. [`Handshake::finish`] states each step.
 //!
 //! ## State machine
@@ -237,37 +246,26 @@ pub(crate) use schedule::{CompressedPoint, EpochSecret, PeerEphemeral};
 pub(crate) use wire::HandshakeOctets;
 
 use crate::asn1::OctetString;
-use crate::cms::content_info::CmsVersion;
-use crate::cms::signed_data::{EncapsulatedContentInfo, SignedData, SignerInfos};
+use crate::cms::content_info::ContentInfo;
+use crate::cms::signed_data::SignedData;
 use crate::crypto::aead::SessionKeys;
 use crate::crypto::cms::AuthEnvelopedData;
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::crypto::cms::ContentEncryption;
 use crate::crypto::profiles::SecurityProfileDesc;
-use crate::crypto::sign::Signed;
-use crate::der::asn1::SetOfVec;
-use crate::der::{Any, Encode, Enumerated, Sequence, Tag};
-use crate::oids::DATA;
+use crate::der::{Enumerated, Sequence};
 use crate::transport::error::TransportError;
-use crate::transport::handshake::error::Result;
 use crate::transport::handshake::negotiation::{
 	MuxSettings, SecurityAccept, SecurityOffer, TransportAccept, TransportOffer,
 };
 use crate::transport::handshake::receipt::StoredReceipt;
 use crate::transport::wire_der::WireDer;
 use crate::utils::marker::{MaybeSend, MaybeSendFuture};
-use crate::x509::attr::Attributes;
 use crate::x509::Certificate;
 use crate::Beamable;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::crypto::cms::ContentEncryption;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::profiles::CryptoProvider;
-#[cfg(feature = "transport-hpke")]
-use crate::der::asn1::OctetStringRef;
-#[cfg(feature = "transport-hpke")]
-use crate::der::Decode;
-#[cfg(feature = "transport-hpke")]
-use schedule::KeyConfirmation;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 mod transport {
@@ -319,10 +317,10 @@ impl<C> HandshakeCurve for C where
 /// - a signature parses from its encoded bytes,
 /// - the verifying key builds from a public key on that curve, verifies a
 ///   signature, and encodes as an SPKI, and
-/// - the AEAD cipher keys from derived bytes and seals an envelope, and
-/// - the provider holds an HPKE suite when the build runs the HPKE flow.
+/// - the AEAD cipher keys from derived bytes and seals an envelope.
 ///
-/// Every provider that meets the bounds is a handshake provider.
+/// Every provider that meets the bounds is a handshake provider, so a
+/// provider with no HPKE suite runs both flows.
 ///
 /// # Examples
 ///
@@ -342,8 +340,7 @@ pub trait HandshakeProvider:
 		VerifyingKey: Verifier<Self::Signature> + From<PublicKey<Self::Curve>> + EncodePublicKey + 'static,
 		Digest: 'static,
 		AeadCipher: KeyInit + ContentEncryption + 'static,
-	> + HandshakeHpke
-	+ Send
+	> + Send
 	+ Sync
 	+ 'static
 {
@@ -357,30 +354,11 @@ impl<P> HandshakeProvider for P where
 			VerifyingKey: Verifier<P::Signature> + From<PublicKey<P::Curve>> + EncodePublicKey + 'static,
 			Digest: 'static,
 			AeadCipher: KeyInit + ContentEncryption + 'static,
-		> + HandshakeHpke
-		+ Send
+		> + Send
 		+ Sync
 		+ 'static
 {
 }
-
-/// The HPKE role a handshake provider holds: [`HpkeProvider`] when the build
-/// runs the HPKE flow.
-///
-/// [`HpkeProvider`]: crate::crypto::profiles::HpkeProvider
-#[cfg(feature = "transport-hpke")]
-pub trait HandshakeHpke: crate::crypto::profiles::HpkeProvider {}
-
-#[cfg(feature = "transport-hpke")]
-impl<P: crate::crypto::profiles::HpkeProvider> HandshakeHpke for P {}
-
-/// The HPKE role of a build that runs the CMS flow alone, which every provider
-/// holds.
-#[cfg(all(feature = "transport-cms", not(feature = "transport-hpke")))]
-pub trait HandshakeHpke {}
-
-#[cfg(all(feature = "transport-cms", not(feature = "transport-hpke")))]
-impl<P> HandshakeHpke for P {}
 
 /// Provisioned server identity for a CMS client handshake.
 ///
@@ -432,22 +410,22 @@ pub enum HandshakeAlert {
 	// decode a stale meaning.
 }
 
-/// A handshake message travels in one of three containers, two of them CMS.
+/// A handshake message travels in one of three CMS containers (RFC 5652).
 ///
-/// HPKE carries its hello and its reply inside a `SignedData`, and its
-/// closing in a [`ClientKeyExchange`] of its own, because HPKE specifies no
-/// wire format (RFC 9180 § 10). The CMS handshake exchanges the CMS
-/// containers themselves.
+/// The HPKE hello is a `ContentInfo` of type `id-data`, and its reply is the
+/// signer's `SignedData`. The CMS flow opens with an `AuthEnvelopedData`, and
+/// its server Finished is a `SignedData`. Both flows close with an
+/// `AuthEnvelopedData` under a key of the handshake secret.
 #[derive(Debug, Clone, PartialEq)]
 pub enum HandshakeMessage {
-	/// Carries an HPKE `ClientHello` or `ServerHandshake`, or a CMS server
-	/// Finished.
+	/// Carries the HPKE reply, or the CMS server Finished.
 	SignedData(Box<WireDer<SignedData>>),
-	/// Carries a CMS opening, or a CMS client Finished sealed under the
-	/// identity key of the handshake secret (RFC 5083).
+	/// Carries a CMS opening, or the closing of either flow, sealed under the
+	/// closing key of the handshake secret (RFC 5083).
 	AuthEnvelopedData(Box<WireDer<AuthEnvelopedData>>),
-	/// Carries the closing of an HPKE handshake.
-	ClientKeyExchange(Box<WireDer<ClientKeyExchange>>),
+	/// Carries the HPKE hello: a `ContentInfo` of type `id-data` whose OCTET
+	/// STRING is the DER of the [`ClientHello`].
+	Data(Box<WireDer<ContentInfo>>),
 }
 
 impl HandshakeMessage {
@@ -460,7 +438,7 @@ impl HandshakeMessage {
 	pub fn signed(self) -> CoreResult<WireDer<SignedData>, HandshakeError> {
 		match self {
 			Self::SignedData(signed) => Ok(*signed),
-			Self::AuthEnvelopedData(_) | Self::ClientKeyExchange(_) => Err(HandshakeError::UnexpectedContainer),
+			Self::AuthEnvelopedData(_) | Self::Data(_) => Err(HandshakeError::UnexpectedContainer),
 		}
 	}
 
@@ -473,19 +451,20 @@ impl HandshakeMessage {
 	pub fn auth_enveloped(self) -> CoreResult<WireDer<AuthEnvelopedData>, HandshakeError> {
 		match self {
 			Self::AuthEnvelopedData(enveloped) => Ok(*enveloped),
-			Self::SignedData(_) | Self::ClientKeyExchange(_) => Err(HandshakeError::UnexpectedContainer),
+			Self::SignedData(_) | Self::Data(_) => Err(HandshakeError::UnexpectedContainer),
 		}
 	}
 
-	/// Returns the HPKE key exchange.
+	/// Returns the `ContentInfo` of type `id-data` that carries the HPKE
+	/// hello.
 	///
 	/// # Errors
 	///
 	/// - [`HandshakeError::UnexpectedContainer`] -- the message holds another
 	///   container, which this step refuses.
-	pub fn key_exchange(self) -> CoreResult<WireDer<ClientKeyExchange>, HandshakeError> {
+	pub fn data(self) -> CoreResult<WireDer<ContentInfo>, HandshakeError> {
 		match self {
-			Self::ClientKeyExchange(key_exchange) => Ok(*key_exchange),
+			Self::Data(data) => Ok(*data),
 			Self::SignedData(_) | Self::AuthEnvelopedData(_) => Err(HandshakeError::UnexpectedContainer),
 		}
 	}
@@ -495,7 +474,7 @@ impl HandshakeMessage {
 		match self {
 			Self::SignedData(signed) => signed.der(),
 			Self::AuthEnvelopedData(enveloped) => enveloped.der(),
-			Self::ClientKeyExchange(key_exchange) => key_exchange.der(),
+			Self::Data(data) => data.der(),
 		}
 	}
 }
@@ -521,13 +500,13 @@ impl TryFrom<AuthEnvelopedData> for HandshakeMessage {
 	}
 }
 
-/// Wraps an HPKE key exchange this endpoint built, encoded once for sending.
-impl TryFrom<ClientKeyExchange> for HandshakeMessage {
+/// Wraps a `ContentInfo` this endpoint built, encoded once for sending.
+impl TryFrom<ContentInfo> for HandshakeMessage {
 	type Error = HandshakeError;
 
-	fn try_from(key_exchange: ClientKeyExchange) -> CoreResult<Self, Self::Error> {
-		let key_exchange = WireDer::new(key_exchange)?;
-		Ok(Self::ClientKeyExchange(Box::new(key_exchange)))
+	fn try_from(content_info: ContentInfo) -> CoreResult<Self, Self::Error> {
+		let content_info = WireDer::new(content_info)?;
+		Ok(Self::Data(Box::new(content_info)))
 	}
 }
 
@@ -742,11 +721,19 @@ pub enum HandshakeProtocolKind {
 	Cms,
 }
 
-/// Opening handshake message from the client, bound into the transcript.
+/// The HPKE hello, the opening of the client, bound into the transcript.
+///
+/// It travels as the OCTET STRING of a `ContentInfo` of type `id-data`
+/// (RFC 5652 § 4), as TLS 1.3 sends its `ClientHello` with the key share.
 #[derive(Beamable, Sequence, Debug, Clone, PartialEq)]
 pub struct ClientHello {
 	/// 32-byte anti-replay nonce mixed into the key derivation.
 	pub client_random: OctetString,
+	/// The client's agreement ephemeral `R`, as a compressed SEC1 point on the
+	/// negotiated curve. Its ECDH with the server ephemeral derives the
+	/// handshake secret alone (see
+	/// [forward secrecy](crate::transport::handshake#forward-secrecy)).
+	pub client_ephemeral: OctetString,
 	/// Security profiles the client offers for negotiation.
 	#[asn1(optional = "true")]
 	pub security_offer: Option<SecurityOffer>,
@@ -756,201 +743,32 @@ pub struct ClientHello {
 	pub transport_offer: Option<TransportOffer>,
 }
 
-/// Server response to a [`ClientHello`], bound into the transcript.
+/// The content of the HPKE reply, which the server signs in its `SignedData`
+/// under [`HANDSHAKE_REPLY_CONTENT`](crate::oids::HANDSHAKE_REPLY_CONTENT).
+///
+/// The `SignedData` carries the server's certificate in `certificates`, and
+/// its `SignerInfo` names it. The transcript binds this content as it was
+/// sent, beside the hello and that certificate.
 #[derive(Beamable, Sequence, Debug, Clone, PartialEq)]
 pub struct ServerHandshake {
-	/// Server identity certificate the client validates against its
-	/// trust store.
-	pub certificate: Certificate,
 	/// 32-byte anti-replay nonce mixed into the key derivation.
 	pub server_random: OctetString,
 	/// The server's per-handshake ephemeral public key, as a compressed SEC1
 	/// point on the negotiated curve. The signed transcript binds it, and its
-	/// ECDH with the client ephemeral feeds the handshake secret (see
+	/// ECDH with the client ephemeral derives the handshake secret (see
 	/// [forward secrecy](crate::transport::handshake#forward-secrecy)).
 	pub server_ephemeral: OctetString,
-	/// Server signature over the labelled digest of the transcript hash, which
-	/// proves possession of the certificate's private key.
-	pub signature: OctetString,
 	/// Profile the server selected. It travels with the bytes the server
-	/// encoded, so both endpoints bind one encoding into the transcript.
+	/// encoded.
 	#[asn1(optional = "true")]
 	pub security_accept: Option<WireDer<SecurityAccept>>,
 	/// `true` when the server requires a client certificate for mutual
-	/// authentication. The client must then provide its certificate in the
-	/// [`ClientKeyExchange`].
+	/// authentication. The client must then present its identity in the
+	/// closing.
 	pub client_cert_required: bool,
 	/// Transport capability accept for multiplexing. Present only when the
 	/// client offered and the server enabled multiplexing locally. It travels
-	/// with the bytes the server encoded, so both endpoints bind one encoding
-	/// into the transcript.
+	/// with the bytes the server encoded.
 	#[asn1(context_specific = "0", optional = "true")]
 	pub transport_accept: Option<WireDer<TransportAccept>>,
-	/// Server-signed session receipt artifact for a budget-bearing session.
-	///
-	/// The artifact is a CMS `SignedData` ([RFC 5652 §5][rfc5652-5]). Its
-	/// `eContent` is the receipt body with the transcript hash, the granted
-	/// budgets, and the settlement challenge. Its single `SignerInfo` is the
-	/// server's signature over that body.
-	///
-	/// [rfc5652-5]: https://datatracker.ietf.org/doc/html/rfc5652#section-5
-	#[asn1(context_specific = "1", optional = "true")]
-	pub session_receipt: Option<Signed<SignedData>>,
-}
-
-/// Confidential plaintext of the HPKE key exchange.
-///
-/// Only the server decrypts it. It carries the base secret, the anti-replay
-/// client random, the client ephemeral, the key-confirmation tag, the sealed
-/// receipt countersignature, and the sealed client identity.
-#[cfg(feature = "transport-hpke")]
-#[derive(Clone, Sequence)]
-pub(crate) struct HpkeSessionPayload {
-	/// 32-byte base secret, one of the two inputs of the handshake secret.
-	pub base_key: OctetString,
-	/// 32-byte client random echoed back for replay resistance.
-	pub client_random: OctetString,
-	/// The client's ephemeral public key, as a compressed SEC1 point, which
-	/// the server pairs with its own ephemeral for the handshake secret. It
-	/// serves that agreement alone, and HPKE draws the key it seals under
-	/// itself (RFC 9180 § 9.2.3).
-	pub client_ephemeral: OctetString,
-	/// The proof that the client derived the handshake secret, which the
-	/// server verifies before it settles.
-	pub key_confirmation: KeyConfirmation,
-	/// The DER of the envelope that seals the client receipt `SignerInfo`
-	/// under the acknowledgement key. Its signed attributes bind the bearer
-	/// settlement answer (see
-	/// [forward secrecy](crate::transport::handshake#forward-secrecy)).
-	/// It is required exactly when the server issued a receipt.
-	#[asn1(context_specific = "0", optional = "true")]
-	pub receipt_ack: Option<OctetString>,
-	/// The DER of the `AuthEnvelopedData` that seals the client's
-	/// [`HpkeIdentity`] under the identity key of the handshake secret, when
-	/// the client presents an identity. The key needs the ephemeral-ephemeral
-	/// agreement, so a later theft of the server's static key does not open it.
-	#[asn1(context_specific = "1", optional = "true")]
-	pub sealed_identity: Option<OctetString>,
-}
-
-/// The identity an HPKE client presents: its certificate and the signature
-/// that proves it holds the certificate's key.
-///
-/// It travels only sealed, inside [`HpkeSessionPayload::sealed_identity`], so
-/// the pair crosses the wire as one value or not at all.
-#[cfg(feature = "transport-hpke")]
-#[derive(Sequence)]
-pub(crate) struct HpkeIdentity {
-	/// The client certificate.
-	pub certificate: Certificate,
-	/// The signature of the certificate's key over the possession digest.
-	pub signature: OctetString,
-}
-
-/// The closing of an HPKE handshake, in a container of its own.
-///
-/// HPKE specifies no wire format (RFC 9180 § 10), so the container holds the
-/// HPKE message and the alert slot alone. The negotiated profile names the
-/// suite, and the transcript binds the server key the message is sealed to.
-#[derive(Beamable, Sequence, Debug, Clone, PartialEq)]
-pub struct ClientKeyExchange {
-	/// The HPKE message, the encapsulated key followed by the ciphertext. It
-	/// seals the session payload to the server's static key, and the payload
-	/// carries the client ephemeral of the handshake secret and the client
-	/// identity sealed under a key of that secret.
-	pub sealed_payload: OctetString,
-	/// Attributes outside the seal, where a receiver refuses an abort alert.
-	/// The tag is the one `EnvelopedData` and `EncryptedData` give their
-	/// unprotected attributes.
-	#[asn1(
-		context_specific = "1",
-		tag_mode = "IMPLICIT",
-		constructed = "true",
-		optional = "true"
-	)]
-	pub unprotected_attrs: Option<Attributes>,
-}
-
-fn encodable_to_signed_data<T: Encode>(message: &T) -> Result<SignedData> {
-	let message_der = message.to_der()?;
-	let octet_string = OctetString::new(message_der)?;
-	let econtent = Any::new(Tag::OctetString, octet_string.to_der()?)?;
-	let encap_content_info = EncapsulatedContentInfo { econtent_type: DATA, econtent: Some(econtent) };
-
-	Ok(SignedData {
-		version: CmsVersion::V1,
-		digest_algorithms: Default::default(),
-		encap_content_info,
-		certificates: None,
-		crls: None,
-		signer_infos: SignerInfos::from(SetOfVec::new()),
-	})
-}
-
-/// Access to the HPKE message a `SignedData` tunnels.
-///
-/// The step that reads the message decodes it from these bytes and binds the
-/// same bytes into its transcript, so the message is parsed once and hashed as
-/// it arrived.
-#[cfg(feature = "transport-hpke")]
-pub(crate) trait TunneledMessage {
-	/// The DER of the tunneled message, as it arrived.
-	///
-	/// # Errors
-	///
-	/// - [`HandshakeError::InvalidServerKeyExchange`] -- the container carries no content.
-	/// - [`HandshakeError::DerError`] -- the content is not an OCTET STRING.
-	fn tunneled_der(&self) -> Result<&[u8]>;
-}
-
-#[cfg(feature = "transport-hpke")]
-impl TunneledMessage for SignedData {
-	fn tunneled_der(&self) -> Result<&[u8]> {
-		let econtent = self
-			.encap_content_info
-			.econtent
-			.as_ref()
-			.ok_or(HandshakeError::InvalidServerKeyExchange)?;
-
-		let octets = OctetStringRef::from_der(econtent.value())?;
-		Ok(octets.as_bytes())
-	}
-}
-
-/// Wraps a [`ClientHello`] in an opaque `SignedData`.
-impl TryFrom<&ClientHello> for SignedData {
-	type Error = HandshakeError;
-
-	fn try_from(hello: &ClientHello) -> CoreResult<Self, Self::Error> {
-		encodable_to_signed_data(hello)
-	}
-}
-
-/// Wraps a [`ServerHandshake`] in an opaque `SignedData`.
-impl TryFrom<&ServerHandshake> for SignedData {
-	type Error = HandshakeError;
-
-	fn try_from(handshake: &ServerHandshake) -> CoreResult<Self, Self::Error> {
-		encodable_to_signed_data(handshake)
-	}
-}
-
-/// Reads the [`ClientHello`] that an opaque `SignedData` tunnels.
-#[cfg(feature = "transport-hpke")]
-impl TryFrom<&SignedData> for ClientHello {
-	type Error = HandshakeError;
-
-	fn try_from(tunnel: &SignedData) -> CoreResult<Self, Self::Error> {
-		Ok(Self::from_der(tunnel.tunneled_der()?)?)
-	}
-}
-
-/// Reads the [`ServerHandshake`] that an opaque `SignedData` tunnels.
-#[cfg(feature = "transport-hpke")]
-impl TryFrom<&SignedData> for ServerHandshake {
-	type Error = HandshakeError;
-
-	fn try_from(tunnel: &SignedData) -> CoreResult<Self, Self::Error> {
-		Ok(Self::from_der(tunnel.tunneled_der()?)?)
-	}
 }
