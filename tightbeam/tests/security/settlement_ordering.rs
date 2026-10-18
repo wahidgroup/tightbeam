@@ -114,7 +114,7 @@ tb_scenario! {
 			let client_materials = ClientMaterials::deterministic();
 			let client_identity = client_materials.identity();
 
-			let mut config = hpke_client_config(pinning_validator(&materials.certificate));
+			let mut config = hpke_client_config::<DefaultCryptoProvider>(pinning_validator(&materials.certificate));
 			config.flow.identity = Some(client_identity);
 			config.security_offer = Some(SecurityOffer::new(vec![profile]));
 			config.transport_offer = Some(TransportOffer::mux(4).with_budgets(REQUEST));

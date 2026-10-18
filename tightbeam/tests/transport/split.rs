@@ -127,7 +127,7 @@ tb_scenario! {
 			let listener = TokioListener::<DefaultCryptoProvider>::bind_cleartext("127.0.0.1:0").await?;
 			let listen_addr = listener.local_addr()?;
 			let client_stream = TcpStream::connect(listen_addr).await?;
-			let trust_store: Arc<dyn CertificateTrust> = Arc::new(CertificateTrustBuilder::from(Secp256k1Policy).build());
+			let trust_store: Arc<dyn CertificateTrust> = Arc::new(CertificateTrustBuilder::from(Secp256k1Policy::default()).build());
 			let client = ClientBuilder::<TokioListener>::builder().with_trust_store(trust_store);
 			let transport = client.adopt(TokioStream::from(client_stream))?.into_transport();
 

@@ -81,8 +81,8 @@ use crate::constants::{
 	DEFAULT_MAX_ENCRYPTED_ENVELOPE, DEFAULT_OPERATION_TIMEOUT, TIGHTBEAM_AAD_DOMAIN_TAG,
 };
 use crate::crypto::profiles::CryptoProvider;
+use crate::crypto::sign::SigningIdentity;
 use crate::crypto::x509::policy::CertificateValidation;
-use crate::transport::handshake::HandshakeKeyManager;
 use crate::transport::handshake::PeerAuthentication;
 use crate::transport::state::{DialableEncryption, EncryptionConfig};
 use crate::utils::time::Clock;
@@ -145,16 +145,17 @@ impl Default for TransportLimits {
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct TransportEncryptionConfig<P: CryptoProvider> {
-	/// Identity certificate this endpoint presents during the handshake.
-	pub(crate) certificate: Arc<Certificate>,
-	/// Signing and key-agreement material backing the certificate.
-	pub(crate) key_manager: Arc<HandshakeKeyManager<P>>,
+	/// The certificate this endpoint presents during the handshake, with the
+	/// key that signs for it.
+	pub(crate) identity: SigningIdentity,
 	/// How this server authenticates its client.
 	pub(crate) peer_authentication: PeerAuthentication,
 	/// Domain-separation tag bound into every AEAD associated-data block.
 	pub(crate) aad_domain_tag: &'static [u8],
 	/// Every ceiling this endpoint enforces.
 	pub(crate) limits: TransportLimits,
+	/// The provider the endpoint's handshakes run under.
+	_provider: core::marker::PhantomData<fn() -> P>,
 }
 
 impl<P: CryptoProvider> From<TransportEncryptionConfig<P>> for DialableEncryption<P> {
@@ -166,10 +167,9 @@ impl<P: CryptoProvider> From<TransportEncryptionConfig<P>> for DialableEncryptio
 	/// not provisioning, so [`EndpointConfig`] carries it beside this value.
 	fn from(config: TransportEncryptionConfig<P>) -> Self {
 		let encryption = EncryptionConfig {
-			server_certificate: Some(config.certificate),
+			server_identity: Some(config.identity),
 			peer_authentication: config.peer_authentication,
 			aad_domain_tag: config.aad_domain_tag,
-			key_manager: Some(config.key_manager),
 			..EncryptionConfig::unconfigured()
 		};
 
@@ -265,26 +265,22 @@ impl<P: CryptoProvider> Clone for EndpointConfig<P> {
 impl<P: CryptoProvider> From<TransportEncryptionConfig<P>> for EndpointConfig<P> {
 	fn from(config: TransportEncryptionConfig<P>) -> Self {
 		let limits = config.limits;
-
 		Self::new(config, Arc::new(SystemClock)).with_limits(limits)
 	}
 }
 
 impl<P: CryptoProvider> TransportEncryptionConfig<P> {
-	/// Create a server configuration from its certificate and key manager.
+	/// Create a server configuration that presents `identity`.
 	///
-	/// `certificate` accepts an owned certificate or a handle to a shared one,
-	/// so a caller that already parsed its identity hands it over without
-	/// copying it.
-	pub fn new(certificate: impl Into<Arc<Certificate>>, key_manager: impl Into<Arc<HandshakeKeyManager<P>>>) -> Self {
-		let certificate = certificate.into();
-		let key_manager = key_manager.into();
+	/// The identity pairs the certificate with the key that signs for it, so
+	/// the two arrive checked against each other.
+	pub fn new(identity: SigningIdentity) -> Self {
 		Self {
-			certificate,
-			key_manager,
+			identity,
 			peer_authentication: PeerAuthentication::Anonymous,
 			aad_domain_tag: TIGHTBEAM_AAD_DOMAIN_TAG,
 			limits: TransportLimits::default(),
+			_provider: core::marker::PhantomData,
 		}
 	}
 
@@ -339,7 +335,7 @@ impl<P: CryptoProvider> TransportEncryptionConfig<P> {
 	/// Return the identity certificate this endpoint presents during the
 	/// handshake.
 	pub fn certificate(&self) -> &Certificate {
-		&self.certificate
+		self.identity.certificate()
 	}
 }
 
@@ -357,14 +353,12 @@ mod tests {
 	fn an_empty_validator_set_keeps_the_configured_authentication() {
 		use crate::crypto::profiles::DefaultCryptoProvider;
 		use crate::crypto::x509::policy::ExpiryValidator;
-		use crate::testing::fixtures::{TestCertificate, TestKey};
-		use crate::transport::handshake::HandshakeKeyManager;
+		use crate::testing::fixtures::TestIdentity;
 
-		let key = TestKey::insecure_fixed_signing();
-		let certificate = TestCertificate::self_signed(&key);
-		let key_manager = HandshakeKeyManager::<DefaultCryptoProvider>::from(key);
+		let identity = TestIdentity::insecure_fixed();
 		let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator);
-		let mutual = TransportEncryptionConfig::new(certificate, key_manager).with_client_validators([validator]);
+		let config = TransportEncryptionConfig::<DefaultCryptoProvider>::new(identity);
+		let mutual = config.with_client_validators([validator]);
 
 		let config = mutual.with_client_validators([]);
 		assert!(config.peer_authentication.requires_certificate());

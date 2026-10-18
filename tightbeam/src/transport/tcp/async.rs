@@ -939,16 +939,18 @@ mod tests {
 	use super::*;
 	use crate::crypto::key::Secp256k1KeyProvider;
 	use crate::crypto::policy::Secp256k1Policy;
-	use crate::crypto::sign::ecdsa::{Secp256k1SigningKey, Secp256k1VerifyingKey, SigningKey};
+	use crate::crypto::sign::ecdsa::{Secp256k1VerifyingKey, SigningKey};
 	use crate::crypto::sign::Sha3Signer;
+	use crate::crypto::sign::SigningIdentity;
+	use crate::crypto::x509::ext::pkix::KeyUsages;
 	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
 	use crate::policy::TransitStatus;
 	use crate::prelude::TightBeamSocketAddr;
 	use crate::spki::SubjectPublicKeyInfoOwned;
 	use crate::testing::*;
-	use crate::transport::handshake::{HandshakeError, HandshakeKeyManager, HandshakeProtocolKind};
+	use crate::transport::handshake::{HandshakeError, HandshakeProtocolKind};
 	use crate::transport::io::EncryptedMessageIO;
-	use crate::transport::state::{ClientIdentity, DialableEncryption, EncryptionConfig};
+	use crate::transport::state::{DialableEncryption, EncryptionConfig};
 	use crate::transport::{MessageCollector, MessageEmitter, TransportEncryptionConfig};
 	use crate::utils::time::SystemClock;
 
@@ -1254,28 +1256,34 @@ mod tests {
 		let sha3_signer = Sha3Signer::from(&signing_key);
 		let spki = SubjectPublicKeyInfoOwned::from_key(verifying_key)?;
 
+		// The server certificate signs its Finished and receives the KEM's
+		// encapsulation of the opening (RFC 5480 §3, RFC 9629 §3).
 		let cert = crate::cert!(
-			profile: Root,
-			subject: "CN=Test Root CA,O=Test Org,C=US",
+			profile: Leaf,
+			subject: "CN=Test Server,O=Test Org,C=US",
+			issuer: "CN=Test Server,O=Test Org,C=US",
 			serial: 1u32,
 			duration: Duration::from_secs(365 * 24 * 60 * 60),
+			subject_public_key: spki,
 			signer: &sha3_signer,
-			subject_public_key: spki
+			key_usage: KeyUsages::DigitalSignature | KeyUsages::KeyAgreement
 		)?;
 
-		let key_manager = HandshakeKeyManager::<DefaultCryptoProvider>::from(signing_key);
-		let config = TransportEncryptionConfig::new(cert.to_owned(), key_manager);
+		let provider = Arc::new(Secp256k1KeyProvider::from(signing_key));
+		let identity = SigningIdentity::new(cert.to_owned(), provider).map_err(|_| TransportError::InvalidState)?;
+		let config = TransportEncryptionConfig::new(identity);
 		Ok(EncryptedTestServer { cert, config })
 	}
 
 	fn trust_store_for(cert: Certificate) -> TransportResult<Arc<dyn CertificateTrust>> {
-		let trust = CertificateTrustBuilder::from(Secp256k1Policy).with_certificate(cert)?.build();
+		let builder = CertificateTrustBuilder::from(Secp256k1Policy::default());
+		let trust = builder.with_certificate(cert)?.build();
 		Ok(Arc::new(trust))
 	}
 
 	#[cfg(feature = "transport-cms")]
 	fn empty_trust_store() -> Arc<dyn CertificateTrust> {
-		let trust = CertificateTrustBuilder::from(Secp256k1Policy).build();
+		let trust = CertificateTrustBuilder::from(Secp256k1Policy::default()).build();
 		Arc::new(trust)
 	}
 
@@ -1326,13 +1334,11 @@ mod tests {
 		TcpTransport::new(TokioStream::from(stream), EndpointConfig::cleartext())
 	}
 
-	/// A CMS client holding a signing key, and `trust_store` if one is given.
+	/// A CMS client holding a signing identity, and `trust_store` if one is
+	/// given.
 	#[cfg(feature = "transport-cms")]
 	fn cms_test_client(stream: TcpStream, trust_store: Option<Arc<dyn CertificateTrust>>) -> TcpTransport<TokioStream> {
-		let signing_key = Secp256k1SigningKey::from(TestKey::insecure_fixed_signing());
-		let key_provider = Secp256k1KeyProvider::from(signing_key);
-		let provider = Arc::new(key_provider);
-		let key_manager = HandshakeKeyManager::new(provider);
+		let identity = TestIdentity::insecure_fixed();
 
 		// Without a trust store the client names cleartext, which is the only
 		// way to build it, and the handshake it is then driven through must
@@ -1340,7 +1346,7 @@ mod tests {
 		let allow_cleartext = trust_store.is_none();
 		let encryption = EncryptionConfig {
 			trust_store,
-			key_manager: Some(Arc::new(key_manager)),
+			client_identity: Some(identity),
 			handshake_protocol: HandshakeProtocolKind::Cms,
 			allow_cleartext,
 			..EncryptionConfig::unconfigured()
@@ -1435,23 +1441,18 @@ mod tests {
 		});
 
 		let client_key = SigningKey::from_bytes(&[2u8; 32].into()).map_err(|_| TransportError::InvalidState)?;
-		let client_cert = Arc::new(TestCertificate::self_signed(&client_key));
-		let client_signing = Secp256k1SigningKey::from(client_key);
-		let key_provider = Secp256k1KeyProvider::from(client_signing);
-		let client_provider = Arc::new(key_provider);
-		let client_keys = Arc::new(HandshakeKeyManager::new(client_provider));
+		let client_identity = TestIdentity::of(&client_key);
 		let server_chain = Arc::from(vec![server_cert.to_owned()]);
 		let trust_store = trust_store_for(server_cert)?;
 
 		let client_stream = TcpStream::connect(server_addr).await?;
-		let mut encryption = EncryptionConfig {
+		let encryption = EncryptionConfig {
 			trust_store: Some(trust_store),
 			server_certificate_chain: Some(server_chain),
+			client_identity: Some(client_identity),
 			handshake_protocol: HandshakeProtocolKind::Cms,
 			..EncryptionConfig::unconfigured()
 		};
-
-		ClientIdentity::new(client_cert, client_keys).install(&mut encryption);
 
 		let mut transport = client_over(client_stream, encryption);
 		let response = transport.emit(request.to_owned(), None).await?;

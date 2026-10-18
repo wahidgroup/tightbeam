@@ -7,13 +7,13 @@
 
 use super::common::*;
 use super::federation::{drive_until_advertised, federation_conf};
+use crate::seams::outside_identity_of;
 use core::sync::atomic::AtomicUsize;
 use tightbeam::colony::common::{reply_frame, PeerGossip};
 use tightbeam::constants::MAX_PEX_SAMPLE;
 use tightbeam::prelude::TightBeamSocketAddr;
 use tightbeam::server;
 use tightbeam::testing::TestFrame;
-use tightbeam::transport::handshake::HandshakeKeyManager;
 use tightbeam::transport::{EncryptedProtocol, TransportEncryptionConfig};
 use tightbeam::utils::time::{Clock, ManualClock};
 
@@ -79,8 +79,8 @@ async fn mint_origin_rumor(
 		.with_message(body)
 		.build()?;
 
-	let provider = Secp256k1KeyProvider::from(key.to_owned());
-	signed.sign_with_provider::<Sha3_256, _>(&provider).await?;
+	let identity = TestIdentity::of(key);
+	signed.sign_with_provider(&identity).await?;
 	Ok(signed)
 }
 
@@ -100,8 +100,8 @@ async fn signed_relay_gossip(
 		.with_message(ClusterRequest::Gossip(Box::new(rumor)))
 		.build()?;
 
-	let provider = Secp256k1KeyProvider::from(key.to_owned());
-	signed.sign_with_provider::<Sha3_256, _>(&provider).await?;
+	let identity = TestIdentity::of(key);
+	signed.sign_with_provider(&identity).await?;
 	Ok(signed)
 }
 
@@ -209,8 +209,8 @@ async fn signed_reconcile_gossip(
 		.with_message(ClusterRequest::ReconcileGossip(GossipReconciliation { held }))
 		.build()?;
 
-	let provider = Secp256k1KeyProvider::from(key.to_owned());
-	signed.sign_with_provider::<Sha3_256, _>(&provider).await?;
+	let identity = TestIdentity::of(key);
+	signed.sign_with_provider(&identity).await?;
 	Ok(signed)
 }
 
@@ -576,7 +576,7 @@ fn gossip_plane_ctx() -> GossipPlaneCtx {
 	let peer_cert = TestCertificate::self_signed(&raw);
 	let peer_key = Secp256k1SigningKey::from(raw);
 	let peer_trust: Arc<dyn CertificateTrust> = Arc::new(
-		CertificateTrustBuilder::from(Secp256k1Policy)
+		CertificateTrustBuilder::from(Secp256k1Policy::default())
 			.with_certificate(peer_cert)
 			.expect("peer trust")
 			.build(),
@@ -826,11 +826,11 @@ impl GossipJournal for CountingJournal {
 		self.inner.held_digests(now)
 	}
 
-	fn fetch(&self, wanted: &[GossipDigest], now: UnixMillis) -> Result<Vec<Frame>, ClusterError> {
+	fn fetch(&self, wanted: &[GossipDigest], now: UnixMillis) -> Result<Vec<(GossipDigest, Frame)>, ClusterError> {
 		self.inner.fetch(wanted, now)
 	}
 
-	fn pending_local(&self, now: UnixMillis) -> Result<Vec<Frame>, ClusterError> {
+	fn pending_local(&self, now: UnixMillis) -> Result<Vec<(GossipDigest, Frame)>, ClusterError> {
 		self.inner.pending_local(now)
 	}
 
@@ -1142,11 +1142,11 @@ impl GossipJournal for HeldJournal {
 		self.inner.held_digests(now)
 	}
 
-	fn fetch(&self, wanted: &[GossipDigest], now: UnixMillis) -> Result<Vec<Frame>, ClusterError> {
+	fn fetch(&self, wanted: &[GossipDigest], now: UnixMillis) -> Result<Vec<(GossipDigest, Frame)>, ClusterError> {
 		self.inner.fetch(wanted, now)
 	}
 
-	fn pending_local(&self, now: UnixMillis) -> Result<Vec<Frame>, ClusterError> {
+	fn pending_local(&self, now: UnixMillis) -> Result<Vec<(GossipDigest, Frame)>, ClusterError> {
 		self.inner.pending_local(now)
 	}
 
@@ -1340,11 +1340,11 @@ impl GossipJournal for AmnesiacJournal {
 		Ok(Vec::new())
 	}
 
-	fn fetch(&self, _wanted: &[GossipDigest], _now: UnixMillis) -> Result<Vec<Frame>, ClusterError> {
+	fn fetch(&self, _wanted: &[GossipDigest], _now: UnixMillis) -> Result<Vec<(GossipDigest, Frame)>, ClusterError> {
 		Ok(Vec::new())
 	}
 
-	fn pending_local(&self, _now: UnixMillis) -> Result<Vec<Frame>, ClusterError> {
+	fn pending_local(&self, _now: UnixMillis) -> Result<Vec<(GossipDigest, Frame)>, ClusterError> {
 		Ok(Vec::new())
 	}
 
@@ -3015,8 +3015,8 @@ struct OversizedReplier {
 /// The TLS identity is honest, so the prober's membership proof passes.
 /// Only the reply volume abuses the protocol.
 async fn start_oversized_reconcile_server(certs: &ClusterTestCerts) -> Result<OversizedReplier, TightBeamError> {
-	let key_manager = HandshakeKeyManager::new(Arc::new(Secp256k1KeyProvider::from(certs.key.to_owned())));
-	let config = TransportEncryptionConfig::new(certs.cert.to_owned(), key_manager);
+	let identity = signing_identity(certs.cert.to_owned(), certs.key.to_owned());
+	let config = TransportEncryptionConfig::new(identity);
 	let bind_addr = "127.0.0.1:0".parse::<TightBeamSocketAddr>()?;
 	let (listener, addr) = TokioListener::bind_with(bind_addr, config).await?;
 
@@ -3220,12 +3220,12 @@ impl GossipJournal for FaultSwitchJournal {
 		self.inner.held_digests(now)
 	}
 
-	fn fetch(&self, wanted: &[GossipDigest], now: UnixMillis) -> Result<Vec<Frame>, ClusterError> {
+	fn fetch(&self, wanted: &[GossipDigest], now: UnixMillis) -> Result<Vec<(GossipDigest, Frame)>, ClusterError> {
 		self.guard()?;
 		self.inner.fetch(wanted, now)
 	}
 
-	fn pending_local(&self, now: UnixMillis) -> Result<Vec<Frame>, ClusterError> {
+	fn pending_local(&self, now: UnixMillis) -> Result<Vec<(GossipDigest, Frame)>, ClusterError> {
 		self.inner.pending_local(now)
 	}
 
@@ -3301,6 +3301,61 @@ tb_scenario! {
 
 			prober.stop();
 			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
+/// The one anchor of [`outside_origin_conf`], a dead loopback address that the
+/// fan-out counts as unreached.
+const DEAD_ANCHOR: &str = "127.0.0.1:9";
+
+/// A colony member whose identity signs under the outside provider of
+/// `tests/seams`, anchored to [`DEAD_ANCHOR`] on a fast beat.
+fn outside_origin_conf() -> ClusterConfig {
+	let (certificate, key) = member_identity("Outside gateway");
+	let trust = combined_trust(&[&certificate]);
+	let identity = outside_identity_of(certificate, key);
+	let tls = ClusterTlsConfig::from_identity(identity)
+		.with_hive_trust(Arc::clone(&trust))
+		.with_peer_trust(trust);
+
+	ClusterConfig::builder(tls)
+		.with_peers(vec![DEAD_ANCHOR.to_string()])
+		.expect("the anchor names a socket")
+		.with_advertise_interval(Duration::from_millis(100))
+		.build()
+}
+
+tb_assert_spec! {
+	pub ClusterOutsideOriginSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(OUTSIDE_RUMOR_FANNED_OUT, exactly!(1), equals!(true)),
+			(events::CLUSTER_PEER_AD_PUBLISH_FAILED, exactly!(0))
+		]
+	}
+}
+
+// A gateway whose identity signs under an outside provider originates its
+// slate rumor. The gateway verifies its own signature under the identity's
+// policy, so the rumor reaches its fan-out.
+//
+// - The fan-out traces the dead anchor as unreached (OUTSIDE_RUMOR_FANNED_OUT).
+// - No publish fails (CLUSTER_PEER_AD_PUBLISH_FAILED).
+tb_scenario! {
+	name: cluster_outside_identity_originates_its_rumor,
+	spec: ClusterOutsideOriginSpec,
+	environment Bare {
+		exec: |SetupEnv { trace, context: _ }| async move {
+			let gateway = start_cluster(&trace, outside_origin_conf()).await?;
+
+			let fanned_out = || trace.recorded(events::CLUSTER_GOSSIP_FANOUT_UNREACHED) >= 1;
+			let fanned_out = poll_until(50, Duration::from_millis(100), fanned_out).await;
+			trace.event_with(OUTSIDE_RUMOR_FANNED_OUT, &[], fanned_out)?;
+
+			gateway.stop();
 			Ok(())
 		}
 	}

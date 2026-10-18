@@ -15,8 +15,8 @@ use std::sync::Arc;
 
 use tightbeam::asn1::Any;
 use tightbeam::cms::signed_data::{SignedData, SignerInfo};
-use tightbeam::crypto::hash::Sha3_256;
 use tightbeam::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1VerifyingKey};
+use tightbeam::crypto::sign::Signed;
 use tightbeam::der::asn1::{OctetString, SetOfVec};
 use tightbeam::der::{Decode, Encode};
 use tightbeam::exactly;
@@ -232,15 +232,10 @@ async fn establish_settled_session(trace: &TraceCollector) -> Result<MutualTrans
 	establish_settled_session_observed(None, trace).await
 }
 
-fn verifying_key_from(certificate: &Certificate) -> Result<Secp256k1VerifyingKey, TightBeamError> {
-	let sec1 = certificate
-		.tbs_certificate
-		.subject_public_key_info
-		.subject_public_key
-		.raw_bytes();
-
-	Secp256k1VerifyingKey::from_sec1_bytes(sec1)
-		.map_err(|_| expectation_failure("certificate must carry a valid SEC1 public key"))
+/// `artifact` as a third party reads it back from storage.
+fn stored_artifact(artifact: &SignedData) -> Result<Signed<SignedData>, TightBeamError> {
+	let der = artifact.to_der()?;
+	Ok(Signed::<SignedData>::from_der(&der)?)
 }
 
 /// Third-party verify via [`StoredReceipt::verify`].
@@ -249,13 +244,11 @@ fn third_party_verifies(
 	server_certificate: &Certificate,
 	client_certificate: &Certificate,
 ) -> Result<bool, TightBeamError> {
-	let Ok(stored) = StoredReceipt::try_from(artifact.to_owned()) else {
+	let Ok(stored) = StoredReceipt::try_from(stored_artifact(artifact)?) else {
 		return Ok(false);
 	};
 
-	let server_key = verifying_key_from(server_certificate)?;
-	let client_key = verifying_key_from(client_certificate)?;
-	let verdict = stored.verify::<Sha3_256, Secp256k1Signature, _>(&server_key, &client_key);
+	let verdict = stored.verify::<Secp256k1Signature, Secp256k1VerifyingKey>(server_certificate, client_certificate);
 	Ok(verdict.is_ok())
 }
 
@@ -291,7 +284,7 @@ fn tamper_signer(
 	role: ReceiptRole,
 	mutate: fn(&mut SignerInfo) -> Result<(), TightBeamError>,
 ) -> Result<(), TightBeamError> {
-	let stored = StoredReceipt::try_from(artifact.to_owned())?;
+	let stored = StoredReceipt::try_from(stored_artifact(artifact)?)?;
 	let target = stored.signer(role)?.to_owned();
 
 	let mut rebuilt = Vec::new();
@@ -493,7 +486,7 @@ tb_scenario! {
 			trace.event_with(BOTH_SIGNATURES_VERIFY_OFFLINE, &[], pristine_verifies)?;
 
 			for (forgery, tamper) in TAMPER_CASES {
-				let mut tampered = stored.artifact().to_owned();
+				let mut tampered = SignedData::clone(stored.artifact());
 				tamper(&mut tampered)?;
 
 				let forgery_verifies =

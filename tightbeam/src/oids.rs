@@ -11,7 +11,7 @@
 //! - `.1` holds the handshake and session attributes, which are the transport
 //!   handshake attribute OIDs of the FULL_CMS profile.
 //! - `.1.100` is reserved, because published releases gave it to another key exchange profile.
-//! - `.2` holds the algorithms, such as zstd and the HPKE suite.
+//! - `.2` holds the algorithms, such as zstd, the HPKE suite, and DHKEM over secp256k1.
 
 use crate::der::asn1::ObjectIdentifier;
 
@@ -38,6 +38,35 @@ pub const SIGNED_DATA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.
 /// - RFC 5652, Cryptographic Message Syntax: <https://datatracker.ietf.org/doc/html/rfc5652>
 /// - OID repository entry: <https://oid-base.com/get/1.2.840.113549.1.7.3>
 pub const ENVELOPED_DATA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.3");
+
+/// The CMS `id-ct-authEnvelopedData` content type.
+///
+/// ```text
+/// id-ct-authEnvelopedData OBJECT IDENTIFIER ::= {
+///     iso(1)   member-body(2)  us(840)    rsadsi(113549)
+///     pkcs(1)  pkcs-9(9)       smime(16)  ct(1) 23
+/// }
+/// ```
+///
+/// # Sources
+///
+/// - RFC 5083 §2.1, CMS Authenticated-Enveloped-Data:
+///   <https://datatracker.ietf.org/doc/html/rfc5083#section-2.1>
+pub const AUTH_ENVELOPED_DATA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.1.23");
+
+/// The `OtherRecipientInfo` type of a `KEMRecipientInfo`, `id-ori-kem`.
+///
+/// ```text
+/// id-ori-kem OBJECT IDENTIFIER ::= {
+///     iso(1)   member-body(2)  us(840)    rsadsi(113549)
+///     pkcs(1)  pkcs-9(9)       smime(16)  id-ori(13) 3
+/// }
+/// ```
+///
+/// # Sources
+///
+/// - RFC 9629 §3, Using KEM Algorithms in CMS: <https://datatracker.ietf.org/doc/html/rfc9629#section-3>
+pub const ORI_KEM: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.13.3");
 
 /// The CMS `id-ct-compressedData` content type.
 ///
@@ -91,6 +120,22 @@ pub const COMPRESSION_ZSTD: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3
 ///
 /// - RFC 9180, Hybrid Public Key Encryption: <https://datatracker.ietf.org/doc/html/rfc9180>
 pub const HPKE_SECP256K1_SHA3_256_AES_256_GCM: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.2.2");
+
+/// DHKEM(secp256k1, HKDF-SHA256), HPKE KEM `0x0016`, as the `kem` of a CMS
+/// `KEMRecipientInfo`. Its parameters are absent.
+///
+/// No registry assigns an OID to a DHKEM over secp256k1. This OID is therefore
+/// assigned under Wahid Group, LLC IANA PEN 64586, in the algorithms arc `.2`,
+/// and `docs/dhkem-secp256k1.md` specifies its use in the shape of RFC 9629
+/// §6.1.
+///
+/// # Sources
+///
+/// - RFC 9629 §6.1, the KEM algorithm class: <https://datatracker.ietf.org/doc/html/rfc9629#section-6.1>
+/// - RFC 9180 §4.1, DH-based KEM: <https://datatracker.ietf.org/doc/html/rfc9180#section-4.1>
+/// - draft-wahby-cfrg-hpke-kem-secp256k1-01:
+///   <https://datatracker.ietf.org/doc/html/draft-wahby-cfrg-hpke-kem-secp256k1-01>
+pub const DHKEM_SECP256K1: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.2.3");
 
 /// HKDF with SHA3-256 (`id-alg-hkdf-with-sha3-256`), in the S/MIME algorithms
 /// arc. A security profile names its key derivation function by this OID.
@@ -305,9 +350,9 @@ pub const HANDSHAKE_TRANSPORT_ACCEPT: ObjectIdentifier = ObjectIdentifier::new_u
 // artifact.
 
 /// Session receipt acknowledgement OID. The value is an OCTET STRING holding
-/// the AEAD ciphertext, under a key derived from the handshake secret, of the
-/// client's receipt `SignerInfo` (countersignature plus confidential
-/// settlement answer).
+/// the DER of an `AuthEnvelopedData`, under a key derived from the handshake
+/// secret, that seals the client's receipt `SignerInfo` (countersignature plus
+/// confidential settlement answer).
 pub const RECEIPT_ACK: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.18");
 
 /// Session receipt artifact OID (CMS attribute carriage). The value is
@@ -341,6 +386,10 @@ pub const HANDSHAKE_SERVER_EPHEMERAL: ObjectIdentifier = ObjectIdentifier::new_u
 /// the transcript hash.
 pub const HANDSHAKE_KEY_CONFIRMATION: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.24");
 
+/// The content type of the CMS opening, sealed in its `AuthEnvelopedData`.
+/// The content carries the client's base secret and its agreement ephemeral.
+pub const HANDSHAKE_OPENING_CONTENT: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.25");
+
 /// PKCS #9 content-type signed attribute ([RFC 5652 §11.1][rfc5652-11.1]).
 ///
 /// [rfc5652-11.1]: https://datatracker.ietf.org/doc/html/rfc5652#section-11.1
@@ -350,6 +399,12 @@ pub const ATTR_CONTENT_TYPE: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.
 ///
 /// [rfc5652-11.2]: https://datatracker.ietf.org/doc/html/rfc5652#section-11.2
 pub const ATTR_MESSAGE_DIGEST: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.4");
+
+/// CMS algorithm identifier protection signed attribute,
+/// `id-aa-CMSAlgorithmProtection` ([RFC 6211 §2][rfc6211-2]).
+///
+/// [rfc6211-2]: https://datatracker.ietf.org/doc/html/rfc6211#section-2
+pub const ATTR_CMS_ALGORITHM_PROTECTION: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.52");
 
 #[cfg(test)]
 mod tests {
@@ -364,11 +419,14 @@ mod tests {
 			(DATA, "1.2.840.113549.1.7.1"),
 			(SIGNED_DATA, "1.2.840.113549.1.7.2"),
 			(ENVELOPED_DATA, "1.2.840.113549.1.7.3"),
+			(AUTH_ENVELOPED_DATA, "1.2.840.113549.1.9.16.1.23"),
+			(ORI_KEM, "1.2.840.113549.1.9.16.13.3"),
 			(COMPRESSION_CONTENT, "1.2.840.113549.1.9.16.1.9"),
 			(COMPRESSION_ZLIB, "1.2.840.113549.1.9.16.3.8"),
 			(HKDF_SHA3_256, "1.2.840.113549.1.9.16.3.33"),
 			(COMPRESSION_ZSTD, "1.3.6.1.4.1.64586.2.1"),
 			(HPKE_SECP256K1_SHA3_256_AES_256_GCM, "1.3.6.1.4.1.64586.2.2"),
+			(DHKEM_SECP256K1, "1.3.6.1.4.1.64586.2.3"),
 			(HASH_SHA256, "2.16.840.1.101.3.4.2.1"),
 			(HASH_SHA3_256, "2.16.840.1.101.3.4.2.8"),
 			(HASH_SHA3_384, "2.16.840.1.101.3.4.2.9"),
@@ -409,8 +467,10 @@ mod tests {
 			(RECEIPT_ANSWER, "1.3.6.1.4.1.64586.1.22"),
 			(HANDSHAKE_SERVER_EPHEMERAL, "1.3.6.1.4.1.64586.1.23"),
 			(HANDSHAKE_KEY_CONFIRMATION, "1.3.6.1.4.1.64586.1.24"),
+			(HANDSHAKE_OPENING_CONTENT, "1.3.6.1.4.1.64586.1.25"),
 			(ATTR_CONTENT_TYPE, "1.2.840.113549.1.9.3"),
 			(ATTR_MESSAGE_DIGEST, "1.2.840.113549.1.9.4"),
+			(ATTR_CMS_ALGORITHM_PROTECTION, "1.2.840.113549.1.9.52"),
 		];
 
 		for (oid, expected) in pinned {

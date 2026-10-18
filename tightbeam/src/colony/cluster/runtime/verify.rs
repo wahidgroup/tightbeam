@@ -32,6 +32,7 @@ use crate::colony::cluster::peer::ColonyCertificate;
 use crate::colony::cluster::runtime::gossip_tasks::{GossipOrigin, GossipPipelineCtx};
 use crate::colony::cluster::runtime::LoopFault;
 use crate::colony::cluster::{ClusterConfig, SharedId};
+use crate::crypto::sign::VerifiedSignature;
 use crate::crypto::x509::store::TrustVerification;
 use crate::crypto::x509::Certificate;
 use crate::instrumentation::events::{
@@ -194,6 +195,7 @@ impl VerifyRefusal {
 pub(crate) struct VerifiedControlFrame<'a> {
 	frame: &'a Frame,
 	signer_cert: &'a Certificate,
+	signature: VerifiedSignature,
 	party: Party,
 	fingerprint: VerifiedSignerId,
 }
@@ -209,6 +211,18 @@ impl<'a> VerifiedControlFrame<'a> {
 	#[must_use]
 	pub(crate) fn signer_cert(&self) -> &'a Certificate {
 		self.signer_cert
+	}
+
+	/// The signature that verified, the frame's replay key.
+	#[must_use]
+	pub(crate) fn signature(&self) -> &VerifiedSignature {
+		&self.signature
+	}
+
+	/// Give up the signature that verified, so it moves rather than copies.
+	#[must_use]
+	pub(crate) fn into_signature(self) -> VerifiedSignature {
+		self.signature
 	}
 
 	/// The plane membership of [`Self::signer_cert`].
@@ -245,8 +259,8 @@ impl ClusterConfig {
 		let Some(trust) = store else {
 			return Err(VerifyRefusal::NoStore);
 		};
-		let signer_cert = match trust.verify_frame(frame) {
-			TrustVerification::Verified(cert) => cert,
+		let (signer_cert, signature) = match trust.verify_frame(frame) {
+			TrustVerification::Verified(cert, signature) => (cert, signature),
 			TrustVerification::MissingSignature => return Err(VerifyRefusal::Unsigned),
 			TrustVerification::UnknownSigner => return Err(VerifyRefusal::UnknownSigner),
 			TrustVerification::Invalid => return Err(VerifyRefusal::Forged),
@@ -262,7 +276,7 @@ impl ClusterConfig {
 			.map(VerifiedSignerId)
 			.ok_or(VerifyRefusal::Unidentifiable)?;
 
-		Ok(VerifiedControlFrame { frame, signer_cert, party, fingerprint })
+		Ok(VerifiedControlFrame { frame, signer_cert, signature, party, fingerprint })
 	}
 
 	/// The slate key of the gateway that presented `cert` in a handshake.
@@ -409,11 +423,9 @@ mod tests {
 	use crate::crypto::key::Secp256k1KeyProvider;
 	use crate::crypto::policy::Secp256k1Policy;
 	use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
-	use crate::crypto::sign::{CanonicalSigner, Signatory, SignatureAlgorithmIdentifier};
+	use crate::crypto::sign::PrehashSigner;
 	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, CertificateTrustStore, TrustBuilder};
 	use crate::crypto::x509::Certificate;
-	use crate::der::oid::AssociatedOid;
-	use crate::spki::AlgorithmIdentifierOwned;
 	use crate::tb_cases;
 	use crate::testing::{TestCertificate, TestKey, TestMessage};
 	use crate::Version;
@@ -447,7 +459,7 @@ mod tests {
 
 	/// A config whose peer plane enrolls `enrolled` alone.
 	fn config_enrolling(enrolled: &Certificate) -> ClusterConfig {
-		let builder = CertificateTrustBuilder::from(Secp256k1Policy).with_certificate(enrolled.clone());
+		let builder = CertificateTrustBuilder::from(Secp256k1Policy::default()).with_certificate(enrolled.clone());
 		let store = builder.expect("the test certificate satisfies the trust builder").build();
 
 		let mut config = exporting_config();
@@ -516,7 +528,7 @@ mod tests {
 	}
 
 	fn trust_of(cert: &Certificate) -> Arc<dyn CertificateTrust> {
-		let store = CertificateTrustBuilder::from(Secp256k1Policy)
+		let store = CertificateTrustBuilder::from(Secp256k1Policy::default())
 			.with_certificate(cert.clone())
 			.expect("test certificates satisfy the trust builder")
 			.build();
@@ -537,15 +549,13 @@ mod tests {
 			.build()
 			.expect("test frame builds");
 
-		let tbs = frame.to_tbs().expect("test frame encodes");
-		let signature: Secp256k1Signature = signer.sign_canonical::<Sha3_256>(&tbs).expect("test key signs");
-		let sig_alg = AlgorithmIdentifierOwned { oid: Secp256k1Signature::ALGORITHM_OID, parameters: None };
-		let digest_alg = AlgorithmIdentifierOwned { oid: Sha3_256::OID, parameters: None };
-		let sid = claimed.signer_identifier().expect("test key yields a signer id");
+		let claimed_certificate = TestCertificate::self_signed(claimed);
+		let draft = frame.signing_draft::<Secp256k1Signature>(&claimed_certificate);
+		let draft = draft.expect("test frame drafts its signature");
+		let signature: Secp256k1Signature = signer.sign_prehash(draft.prehash()).expect("test key signs");
+		let signer_info = draft.complete(signature.to_bytes(), None).expect("the signature completes");
 
-		frame
-			.attach_signature(signature.to_bytes(), sig_alg, digest_alg, sid)
-			.expect("test signature attaches");
+		frame.attach_signer_info(signer_info).expect("test signature attaches");
 		frame
 	}
 

@@ -37,7 +37,7 @@ macro_rules! apply_common_builder_patterns {
 			.with_witness_hasher::<Sha3_256>()
 			.with_compression(ZstdCompression::default())
 			.with_aead($cipher.to_owned())
-			.with_signer::<Secp256k1Signature, _>($signing_key.to_owned());
+			.with_signer::<Secp256k1Signature, _>(tightbeam::testing::TestIdentity::certified($signing_key.to_owned()));
 
 		// Set previous_frame if not the first frame
 		if let Some(digest) = $previous_digest {

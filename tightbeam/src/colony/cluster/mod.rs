@@ -55,6 +55,7 @@ pub use export::{
 pub use gossip::{
 	gossip_fresh, gossip_want, wanted_digests, Admission, AdmittedGossip, GossipAdmission, GossipConfig, GossipDigest,
 	GossipJournal, JournalLimits, LocalClaim, LocalClaimGuard, MemoryGossipJournal, TokenBucketAdmission,
+	VerifiedRumor,
 };
 pub use peer::{AdmittedPeerAd, HopBudget, RelayTrail, WireHopBudget};
 pub use peer_table::{
@@ -77,12 +78,12 @@ use std::sync::Arc;
 
 use crate::constants::{DEFAULT_AD_RUMOR_REFRESH_MS, DEFAULT_MAX_HOPS};
 use crate::crypto::key::SigningKeyProvider;
+use crate::crypto::sign::SigningIdentity;
 use crate::crypto::x509::{policy::CertificateValidation, CertificateSpec};
 use crate::policy::GatePolicy;
 use crate::trace::TraceCollector;
 use crate::transport::client::PoolConfig;
 use crate::transport::handshake::PeerAuthentication;
-use crate::transport::state::ClientIdentity;
 use crate::transport::{Protocol, TightBeamAddress};
 use crate::urn::Urn;
 use crate::utils::time::Clock;
@@ -164,10 +165,10 @@ pub type HeartbeatCallback = Arc<dyn Fn(HeartbeatEvent) + Send + Sync>;
 /// TLS material for the gateway accept loop and hive/peer dials.
 #[non_exhaustive]
 pub struct ClusterTlsConfig {
-	/// The gateway certificate and handshake key, decoded once by
-	/// [`Self::new`]. The certificate is the server identity, and outbound
-	/// dials present it as the client certificate.
-	identity: ClientIdentity,
+	/// The gateway certificate and handshake key, from [`Self::new`] or
+	/// [`Self::from_identity`]. The certificate is the server identity, and
+	/// outbound dials present it as the client certificate.
+	identity: SigningIdentity,
 	/// Server-certificate validators for outbound dials.
 	///
 	/// Each validator evaluates the dialed server certificate after the
@@ -197,7 +198,8 @@ pub struct ClusterTlsConfig {
 }
 
 impl ClusterTlsConfig {
-	/// Decode `certificate` and bind it to the key that proves it.
+	/// Decode `certificate` and bind it to the key that proves it, under the
+	/// house provider.
 	///
 	/// One identity serves every plane: the colony and edge listeners present
 	/// it, and outbound hive and peer dials offer it as the client
@@ -209,15 +211,21 @@ impl ClusterTlsConfig {
 	/// - [`TightBeamError::SerializationError`] -- `certificate` holds PEM or
 	///   DER that does not decode as a certificate.
 	pub fn new(certificate: CertificateSpec, key: Arc<dyn SigningKeyProvider>) -> Result<Self, TightBeamError> {
-		let identity = ClientIdentity::from_spec(certificate, key)?;
+		let identity = SigningIdentity::from_spec(certificate, key)?;
+		Ok(Self::from_identity(identity))
+	}
 
-		Ok(Self {
+	/// Serve every plane under `identity`, whose key signs under the
+	/// [`SigningProvider`](crate::crypto::profiles::SigningProvider) it was
+	/// paired under.
+	pub fn from_identity(identity: SigningIdentity) -> Self {
+		Self {
 			identity,
 			validators: Vec::new(),
 			client_validators: Vec::new(),
 			hive_trust: None,
 			peer_trust: None,
-		})
+		}
 	}
 
 	/// Replace the server-certificate validators applied to outbound dials.
@@ -279,7 +287,7 @@ impl ClusterTlsConfig {
 	/// One identity serves the colony listener, the edge listener, and every
 	/// outbound hive and peer dial, so all of them read it here and cannot
 	/// disagree.
-	pub fn identity(&self) -> &ClientIdentity {
+	pub fn identity(&self) -> &SigningIdentity {
 		&self.identity
 	}
 }
@@ -299,7 +307,7 @@ impl Clone for ClusterTlsConfig {
 impl core::fmt::Debug for ClusterTlsConfig {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 		f.debug_struct("ClusterTlsConfig")
-			.field("identity", &"<ClientIdentity>")
+			.field("identity", &self.identity)
 			.field("validators", &format!("[{} validators]", self.validators.len()))
 			.field("client_validators", &format!("[{} validators]", self.client_validators.len()))
 			.field("hive_trust", &self.hive_trust.as_ref().map(|_| "Some(<TrustStore>)"))

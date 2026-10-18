@@ -84,6 +84,13 @@ pub enum CertificateValidationError {
 	#[error("SKID collision: two certificates share key identifier {skid}")]
 	SkidCollision { skid: String },
 
+	/// Two certificates with different fingerprints hold the same public key.
+	///
+	/// The error carries the colliding SubjectPublicKeyInfo DER in hex, so the
+	/// store entry can be found.
+	#[error("Public key collision: two certificates share SubjectPublicKeyInfo {public_key}")]
+	PublicKeyCollision { public_key: String },
+
 	/// The issuer certificate is not a CA (RFC 5280 §6.1.4(k)).
 	#[error("Issuer certificate is not a CA")]
 	IssuerNotCa,
@@ -92,6 +99,16 @@ pub enum CertificateValidationError {
 	/// (RFC 5280 §6.1.4(n)).
 	#[error("Issuer keyUsage does not permit certificate signing")]
 	MissingKeyCertSign,
+
+	/// The `keyUsage` extension is absent, or it does not assert the usage the
+	/// certificate's role needs (RFC 5280 §4.2.1.3).
+	#[error("Certificate keyUsage does not assert {0:?}")]
+	MissingKeyUsage(crate::crypto::x509::ext::pkix::KeyUsages),
+
+	/// The certificate carries more than one instance of an extension (RFC 5280
+	/// §4.2).
+	#[error("Duplicate extension: {0}")]
+	DuplicateExtension(der::asn1::ObjectIdentifier),
 
 	/// The certification path exceeds the pathLenConstraint of an issuer
 	/// (RFC 5280 §6.1.4(m)).

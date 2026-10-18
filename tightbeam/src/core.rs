@@ -97,7 +97,7 @@ mod tests {
 		vec::Vec,
 	};
 
-	use crate::testing::{TestKey, TestMessage};
+	use crate::testing::{TestIdentity, TestKey, TestMessage};
 	use crate::Beamable;
 	use crate::MessagePriority;
 	use crate::{EncryptedContentInfo, SignerInfo};
@@ -264,7 +264,7 @@ mod tests {
 					order: 1696521800,
 					message: message,
 					confidentiality: cipher,
-					nonrepudiation<Secp256k1Signature, _>: signing_key
+					nonrepudiation<Secp256k1Signature, _>: TestIdentity::certified(signing_key)
 			}?
 		},
 		tightbeam_v2_full: {
@@ -280,7 +280,7 @@ mod tests {
 					order: 1696521900,
 					message: message,
 					confidentiality: cipher,
-					nonrepudiation<Secp256k1Signature, _>: signing_key,
+					nonrepudiation<Secp256k1Signature, _>: TestIdentity::certified(signing_key),
 					message_integrity<Sha3_256>: [],
 					priority: MessagePriority::HighThroughput,
 					lifetime: 3600
@@ -327,7 +327,7 @@ mod tests {
 					order: 2000,
 					message: message,
 					confidentiality: cipher,
-					nonrepudiation<Secp256k1Signature, _>: signing_key,
+					nonrepudiation<Secp256k1Signature, _>: TestIdentity::certified(signing_key),
 					message_integrity<Sha3_256>: [],
 					priority: MessagePriority::Expedited,
 					lifetime: 60
@@ -377,9 +377,9 @@ mod tests {
 					order: 3000,
 					message: message,
 					confidentiality: cipher,
-					nonrepudiation<Secp256k1Signature, _>: signing_key
+					nonrepudiation<Secp256k1Signature, _>: TestIdentity::certified(signing_key)
 			}?
-		} => SignerInfo,
+		} => crate::crypto::sign::Signed<SignerInfo>,
 		tightbeam_v2_to_encryption_info: {
 			use crate::crypto::sign::ecdsa::Secp256k1Signature;
 			use crate::crypto::hash::Sha3_256;
@@ -394,7 +394,7 @@ mod tests {
 					order: 4000,
 					message: message,
 					confidentiality: cipher,
-					nonrepudiation<Secp256k1Signature, _>: signing_key,
+					nonrepudiation<Secp256k1Signature, _>: TestIdentity::certified(signing_key),
 					message_integrity<Sha3_256>: [],
 					priority: MessagePriority::LowLatency,
 					lifetime: 120
@@ -412,7 +412,7 @@ mod tests {
 					order: 5000,
 					message: message
 			}?
-		} => SignerInfo,
+		} => crate::crypto::sign::Signed<SignerInfo>,
 		tightbeam_v0_to_encryption_info_fails: {
 			let message = TestMessage::sample(None);
 			compose! {

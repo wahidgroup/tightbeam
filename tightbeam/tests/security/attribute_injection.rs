@@ -1,9 +1,9 @@
 //! # Unprotected-attribute injection threat (CMS)
 //!
 //! ## Weakness
-//! The client Finished travels sealed as an `EncryptedData`, whose
-//! unprotected attributes (RFC 5652 § 8) no key covers. An intermediary can
-//! add attributes there without invalidating the message.
+//! The client Finished travels sealed as an `AuthEnvelopedData`, whose
+//! unauthenticated attributes (RFC 5083 § 2.1) no key covers. An intermediary
+//! can add attributes there without invalidating the message.
 //!
 //! If the server read a handshake attribute from beside the seal, an injected
 //! value would steer what the server consumes, such as a forged receipt
@@ -11,7 +11,7 @@
 //!
 //! ## Attack
 //! A MITM captures the sealed client Finished and inserts a `RECEIPT_ACK`
-//! unprotected attribute that carries a forged value beside the seal.
+//! unauthenticated attribute that carries a forged value beside the seal.
 //!
 //! ## Expected control
 //! The server reads every handshake attribute of the client Finished from
@@ -28,16 +28,15 @@
 //!   <https://cwe.mitre.org/data/definitions/345.html>
 //! - CWE-694: Use of Multiple Resources with Duplicate Identifier
 //!   <https://cwe.mitre.org/data/definitions/694.html>
-//! - RFC 5652 § 8: the unprotected attributes of `EncryptedData`
-//!   <https://datatracker.ietf.org/doc/html/rfc5652#section-8>
+//! - RFC 5083 § 2.1: the unauthenticated attributes of `AuthEnvelopedData`
+//!   <https://datatracker.ietf.org/doc/html/rfc5083#section-2.1>
 
 #![cfg(all(feature = "transport-cms", feature = "transport-multiplex", feature = "testing"))]
 
 use std::sync::Arc;
 
 use tightbeam::asn1::{Any, OctetString};
-use tightbeam::cms::content_info::CmsVersion;
-use tightbeam::cms::encrypted_data::EncryptedData;
+use tightbeam::crypto::cms::AuthEnvelopedData;
 use tightbeam::der::asn1::SetOfVec;
 use tightbeam::exactly;
 use tightbeam::oids::RECEIPT_ACK;
@@ -59,9 +58,9 @@ use crate::common::security::{cms_mutual_budget_pair, CmsSessionHooks, GrantingA
 
 const REQUEST: MuxBudgets = MuxBudgets { client_to_server: 64, server_to_client: 128 };
 
-/// The sealed client Finished with a `RECEIPT_ACK` unprotected attribute
-/// that carries a forged value beside the seal.
-fn inject_receipt_ack(sealed_finished: &EncryptedData) -> Result<EncryptedData, TightBeamError> {
+/// The sealed client Finished with a `RECEIPT_ACK` unauthenticated
+/// attribute that carries a forged value beside the seal.
+fn inject_receipt_ack(sealed_finished: &AuthEnvelopedData) -> Result<AuthEnvelopedData, TightBeamError> {
 	let forged_value = Any::encode_from(&OctetString::new(*b"forged-acknowledgement")?)?;
 	let mut values = SetOfVec::new();
 	values.insert(forged_value)?;
@@ -69,9 +68,7 @@ fn inject_receipt_ack(sealed_finished: &EncryptedData) -> Result<EncryptedData, 
 	let mut attrs = Attributes::new();
 	attrs.insert(Attribute { oid: RECEIPT_ACK, values })?;
 
-	// An EncryptedData with unprotected attributes is version 2 (RFC 5652 § 8).
-	let version = CmsVersion::V2;
-	Ok(EncryptedData { version, unprotected_attrs: Some(attrs), ..sealed_finished.to_owned() })
+	Ok(AuthEnvelopedData { unauth_attrs: Some(attrs), ..sealed_finished.to_owned() })
 }
 
 tb_assert_spec! {
@@ -85,7 +82,7 @@ tb_assert_spec! {
 	}
 }
 
-// No key covers an unprotected attribute, so the injected acknowledgement
+// No key covers an unauthenticated attribute, so the injected acknowledgement
 // travels beside the seal unchanged. The server reads the acknowledgement only
 // from inside the seal, so the closing settles on the client's own
 // acknowledgement.
@@ -106,7 +103,7 @@ tb_scenario! {
 			let reply = server.reply(client.start()?).await?;
 
 			// The MITM injects the forged acknowledgement on the wire.
-			let sealed_finished = client.respond(reply).await?.encrypted()?;
+			let sealed_finished = client.respond(reply).await?.auth_enveloped()?;
 			let injected = inject_receipt_ack(sealed_finished.value())?;
 
 			let closing = server.finish(HandshakeMessage::try_from(injected)?).await;

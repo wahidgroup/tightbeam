@@ -18,6 +18,10 @@ use crate::cms::enveloped_data::OriginatorPublicKey;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::cms::signed_data::SignedData;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::crypto::cms::AttributesExt;
+#[cfg(feature = "transport-cms")]
+use crate::crypto::sign::Signed;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::x509::attr::Attributes;
 #[cfg(feature = "transport-cms")]
 use crate::der::asn1::OctetString;
@@ -106,7 +110,7 @@ impl From<&Attribute> for HandshakeAttribute {
 }
 
 /// Converts a [`HandshakeAttribute`] into the X.509 attribute an
-/// `EnvelopedData` carries.
+/// `AuthEnvelopedData` carries.
 impl TryFrom<HandshakeAttribute> for Attribute {
 	type Error = HandshakeError;
 
@@ -148,7 +152,7 @@ impl AttributePayload for TransportAccept {
 /// The session receipt a server Finished carries, as a server-signed artifact
 /// that a third party can verify.
 #[cfg(feature = "transport-cms")]
-impl AttributePayload for SignedData {
+impl AttributePayload for Signed<SignedData> {
 	const OID: ObjectIdentifier = SESSION_RECEIPT;
 }
 
@@ -159,7 +163,7 @@ impl AttributePayload for OctetString {
 }
 
 /// The server's per-handshake ephemeral public key on its Finished, carried
-/// as the same type the client's KARI originator uses.
+/// as the same type the client's agreement key uses in the opening.
 #[cfg(feature = "transport-cms")]
 impl AttributePayload for OriginatorPublicKey {
 	const OID: ObjectIdentifier = HANDSHAKE_SERVER_EPHEMERAL;
@@ -329,17 +333,8 @@ pub trait HandshakeAttributes {
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl HandshakeAttributes for Attributes {
 	fn find_unsigned_attr(&self, oid: ObjectIdentifier) -> Result<Option<HandshakeAttribute>, HandshakeError> {
-		let mut found = None;
-		let matches = self.iter().filter(|attr| attr.oid == oid);
-		for attr in matches {
-			if found.is_some() {
-				return Err(HandshakeError::DuplicateAttribute);
-			}
-
-			found = Some(HandshakeAttribute::from(attr));
-		}
-
-		Ok(found)
+		let found = self.single(oid, HandshakeError::DuplicateAttribute)?;
+		Ok(found.map(HandshakeAttribute::from))
 	}
 }
 

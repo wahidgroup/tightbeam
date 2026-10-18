@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use tightbeam::transport::state::ClientIdentity;
+use tightbeam::crypto::sign::SigningIdentity;
 use tightbeam::urn::Urn;
 
 pub(crate) const CLIENT_CONNECT: Urn<'static> = tightbeam::urn!("test", "event:connection-reuse/client-connect");
@@ -113,7 +113,7 @@ const CLIENT_PINNING: PublicKeyPinning<1> = PublicKeyPinning::new([CLIENT_PUB_KE
 fn make_server_trust_store() -> Result<Arc<dyn CertificateTrust>, TightBeamError> {
 	let server_cert = Certificate::try_from(SERVER_CERT)?;
 	Ok(Arc::new(
-		CertificateTrustBuilder::from(Secp256k1Policy)
+		CertificateTrustBuilder::from(Secp256k1Policy::default())
 			.with_certificate(server_cert)?
 			.build(),
 	))
@@ -239,7 +239,7 @@ tb_scenario! {
 			let key = CLIENT_KEY.to_provider::<Secp256k1>()?;
 			let builder = ClientBuilder::<TokioListener>::builder()
 				.with_trust_store(make_server_trust_store()?)
-				.with_client_identity(ClientIdentity::from_spec(CLIENT_CERT, key)?)
+				.with_client_identity(SigningIdentity::from_spec(CLIENT_CERT, key)?)
 				.build();
 
 			// Send 3 messages using the same TLS client

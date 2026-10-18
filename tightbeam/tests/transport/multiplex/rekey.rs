@@ -5,7 +5,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use tightbeam::at_least;
-use tightbeam::crypto::hash::Sha3_256;
 use tightbeam::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1VerifyingKey};
 use tightbeam::crypto::sign::elliptic_curve::sec1::ToEncodedPoint;
 use tightbeam::der::asn1::OctetString;
@@ -22,7 +21,6 @@ use tightbeam::transport::handshake::receipt::{ApprovalRefusal, ReceiptApprover,
 use tightbeam::transport::multiplex::{MuxAcceptor, MuxConnector, MuxHandle, MuxRole};
 use tightbeam::transport::{EnvelopeSink, EnvelopeSource, TransportEnvelope};
 use tightbeam::utils::marker::MaybeSendFuture;
-use tightbeam::x509::Certificate;
 use tightbeam::TightBeamError;
 use tokio::time::timeout;
 
@@ -125,17 +123,6 @@ async fn await_rotation(handle: &MuxHandle, previous: Option<&StoredReceipt>) ->
 
 async fn await_matching_receipt(handle: &MuxHandle, expected: &StoredReceipt) -> bool {
 	await_transport(|| handle.session_receipt().as_deref() == Some(expected)).await
-}
-
-fn verifying_key_from(certificate: &Certificate) -> Result<Secp256k1VerifyingKey, TightBeamError> {
-	let sec1 = certificate
-		.tbs_certificate
-		.subject_public_key_info
-		.subject_public_key
-		.raw_bytes();
-
-	Secp256k1VerifyingKey::from_sec1_bytes(sec1)
-		.map_err(|_| expectation_failure("certificate must carry a valid SEC1 public key"))
 }
 
 /// A hand-built rekey request that carries `seed` as its randomness and a
@@ -475,7 +462,6 @@ tb_scenario! {
 
 			let first_batch = emit_series(&pair.client.handle, "rekey-chain-a", 5).await?;
 			let first = await_rotation(&pair.client.handle, initial.as_ref()).await;
-
 			let second_batch = emit_series(&pair.client.handle, "rekey-chain-b", 5).await?;
 			let second = await_rotation(&pair.client.handle, first.as_deref()).await;
 
@@ -487,12 +473,15 @@ tb_scenario! {
 				let epochs_differ = initial.as_ref() != second.as_deref();
 				first_rotated && second_rotated && epochs_differ
 			};
+
 			trace.event_with(CONSECUTIVE_EPOCHS_ROTATE_DISTINCT_RECEIPTS, &[], distinct)?;
 
 			let latest = second.ok_or_else(|| expectation_failure("second renewal must rotate the receipt"))?;
-			let server_key = verifying_key_from(&server_certificate)?;
-			let client_key = verifying_key_from(&client_certificate)?;
-			let verdict = latest.verify::<Sha3_256, Secp256k1Signature, _>(&server_key, &client_key);
+			let verdict = latest.verify::<Secp256k1Signature, Secp256k1VerifyingKey>(
+				&server_certificate,
+				&client_certificate,
+			);
+
 			trace.event_with(
 				CHAINED_RECEIPT_VERIFIES_AGAINST_ORIGINAL_CERTS,
 				&[],

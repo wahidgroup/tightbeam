@@ -16,7 +16,7 @@ use core::time::Duration;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tightbeam::transport::state::ClientIdentity;
+use tightbeam::crypto::sign::SigningIdentity;
 use tightbeam::utils::time::{Clock, ManualClock};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
@@ -35,14 +35,13 @@ use tightbeam::prelude::TightBeamSocketAddr;
 use tightbeam::server;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_scenario;
-use tightbeam::testing::{ClientEnv, SetupEnv, TestCertificate};
+use tightbeam::testing::{ClientEnv, SetupEnv, TestCertificate, TestIdentity};
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::envelopes::MUX_APPLICATION_CODE_FLOOR;
 use tightbeam::transport::handshake::negotiation::{
 	AuthorizationGrant, AuthorizationRefusal, MuxBudgets, TransportAuthorizer, TransportOffer,
 };
 use tightbeam::transport::handshake::receipt::SessionReceipt;
-use tightbeam::transport::handshake::HandshakeKeyManager;
 use tightbeam::transport::multiplex::{
 	CallContext, MuxAcceptor, MuxRole, MuxService, MuxTransport, ReplySink, StreamBody,
 };
@@ -707,50 +706,48 @@ tb_scenario! {
 /// Two trusted server identities for one address.
 ///
 /// `gate` holds the first identity's materials and the hold on the first
-/// frame it serves. `second_certificate` and `second_provider` are a distinct
-/// identity, which takes the address over once the first listener closes.
+/// frame it serves. `second` is a distinct identity, which takes the address
+/// over once the first listener closes.
 struct IdentityFlipContext {
 	gate: GatedContext,
-	second_certificate: Certificate,
-	second_provider: Arc<dyn SigningKeyProvider>,
+	second: SigningIdentity,
 }
 
 impl IdentityFlipContext {
 	fn generate() -> Self {
 		let second_key = random_signing_key();
+
 		// A distinct CN, so the trust store validates the second certificate
 		// as its own anchor rather than chaining it under the first subject.
 		let second_certificate = TestCertificate::with_cn_and_uri_sans(&second_key, "pool-mux-second-identity", &[]);
-		let second_provider: Arc<dyn SigningKeyProvider> = Arc::new(Secp256k1KeyProvider::from(second_key));
-
-		Self { gate: GatedContext::generate(), second_certificate, second_provider }
+		let second = TestIdentity::presenting(second_certificate, &second_key);
+		Self { gate: GatedContext::generate(), second }
 	}
 
 	/// A pool that trusts both identities, as a peer trust store that holds
 	/// two peers' certificates does.
 	fn pool_trusting_both(&self, trace: &TraceCollector) -> Result<Arc<ConnectionPool<TokioListener>>, TightBeamError> {
-		let trust_store = CertificateTrustBuilder::from(Secp256k1Policy)
+		let trust_store = CertificateTrustBuilder::from(Secp256k1Policy::default())
 			.with_certificate(Certificate::clone(&self.gate.materials.certificate))?
-			.with_certificate(self.second_certificate.clone())?
+			.with_certificate(self.second.certificate().clone())?
 			.build();
 		let config = PoolConfig {
 			max_connections: 2,
 			mux_offer: Some(Arc::new(mux_offer(4))),
 			..PoolConfig::default()
 		};
+
 		let pool = ConnectionPool::<TokioListener>::builder()
 			.with_config(config)
 			.with_trust_store(Arc::new(trust_store))
 			.with_trace(trace.share())
 			.build();
-
 		Ok(Arc::new(pool))
 	}
 
 	/// The listener configuration of the second identity.
 	fn second_encryption(&self) -> TransportEncryptionConfig<tightbeam::crypto::profiles::DefaultCryptoProvider> {
-		let key_manager = HandshakeKeyManager::new(Arc::clone(&self.second_provider));
-		TransportEncryptionConfig::new(self.second_certificate.clone(), key_manager)
+		TransportEncryptionConfig::new(self.second.clone())
 	}
 }
 
@@ -1838,11 +1835,11 @@ fn metered_pool(
 	let builder = ConnectionPool::<TokioListener>::builder()
 		.with_config(config)
 		.with_trust_store(trust_store)
-		.with_client_identity(ClientIdentity::from_spec(identity, client_provider)?)
+		.with_client_identity(SigningIdentity::from_spec(identity, client_provider)?)
 		.with_receipt_approver(receipt_approver)
 		.with_trace(trace.share());
-	let pool = Arc::new(builder.build());
 
+	let pool = Arc::new(builder.build());
 	Ok(pool)
 }
 

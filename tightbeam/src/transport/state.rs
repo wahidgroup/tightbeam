@@ -2,6 +2,7 @@
 //!
 //! The module separates encrypted-transport state accessors from I/O.
 
+use core::marker::PhantomData;
 use core::time::Duration;
 
 #[cfg(not(feature = "std"))]
@@ -11,16 +12,15 @@ use std::sync::Arc;
 
 use crate::constants::TIGHTBEAM_AAD_DOMAIN_TAG;
 use crate::crypto::aead::{RecvCipher, SendCipher};
-use crate::crypto::key::SigningKeyProvider;
-use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
+use crate::crypto::profiles::CryptoProvider;
+use crate::crypto::sign::SigningIdentity;
 use crate::crypto::x509::store::CertificateTrust;
-use crate::crypto::x509::CertificateSpec;
 use crate::transport::builders::EnvelopeBuilder;
 use crate::transport::envelopes::WireMode;
 use crate::transport::error::{TransportError, TransportFailure};
 use crate::transport::handshake::receipt::StoredReceipt;
 use crate::transport::handshake::{EpochMaterials, EstablishedSession};
-use crate::transport::handshake::{HandshakeKeyManager, HandshakeProtocolKind, PeerAuthentication};
+use crate::transport::handshake::{HandshakeProtocolKind, PeerAuthentication};
 use crate::transport::TransportLimits;
 use crate::transport::TransportResult;
 use crate::utils::time::MonotonicInstant;
@@ -493,80 +493,6 @@ impl<P: CryptoProvider> SessionState<P> {
 	}
 }
 
-/// A client certificate bound to the handshake key that proves it.
-///
-/// The pair travels as one value, so a caller always hands over both. Both
-/// halves are `Arc`, so a clone of the pair is two refcount bumps.
-#[derive(Clone)]
-pub struct ClientIdentity<C: CryptoProvider = DefaultCryptoProvider> {
-	certificate: Arc<Certificate>,
-	key: Arc<HandshakeKeyManager<C>>,
-}
-
-impl<C: CryptoProvider> ClientIdentity<C> {
-	/// Bind a certificate to the handshake key that proves it.
-	pub fn new(certificate: Arc<Certificate>, key: Arc<HandshakeKeyManager<C>>) -> Self {
-		Self { certificate, key }
-	}
-
-	/// Decode `certificate` and bind it to the key that proves it.
-	///
-	/// It is the one place a [`CertificateSpec`] becomes an endpoint identity,
-	/// so every builder that accepts one decodes it the same way and holds the
-	/// result as shared handles.
-	///
-	/// # Errors
-	///
-	/// - [`SerializationError`] -- `certificate` holds PEM or DER that does not decode as a certificate.
-	///
-	/// [`SerializationError`]: crate::TightBeamError::SerializationError
-	pub fn from_spec(
-		certificate: CertificateSpec,
-		key: Arc<dyn SigningKeyProvider>,
-	) -> Result<Self, crate::TightBeamError>
-	where
-		C: Send + Sync + 'static,
-	{
-		let certificate = Certificate::try_from(certificate)?;
-		let key_manager = HandshakeKeyManager::new(key);
-
-		Ok(Self::new(Arc::new(certificate), Arc::new(key_manager)))
-	}
-
-	/// The certificate and the key that proves it, as handles.
-	pub fn parts(&self) -> (Arc<Certificate>, Arc<HandshakeKeyManager<C>>) {
-		(Arc::clone(&self.certificate), Arc::clone(&self.key))
-	}
-
-	/// Shared handle to the certificate this identity presents.
-	///
-	/// A caller that needs the certificate alone takes this half, so it pays
-	/// one refcount instead of the two that [`Self::parts`] charges for a pair.
-	pub fn certificate_arc(&self) -> Arc<Certificate> {
-		Arc::clone(&self.certificate)
-	}
-
-	/// The certificate this identity presents.
-	pub fn certificate(&self) -> &Certificate {
-		&self.certificate
-	}
-
-	/// The signing key provider behind this identity, read from its key
-	/// manager through [`HandshakeKeyManager::provider`].
-	pub fn signing_provider(&self) -> &dyn SigningKeyProvider {
-		self.key.provider()
-	}
-
-	/// Write this identity into `encryption`, so both halves land together.
-	///
-	/// The key also answers as this endpoint's own signing key, the role a
-	/// server's key manager fills, so both land in one write.
-	pub fn install(&self, encryption: &mut EncryptionConfig<C>) {
-		encryption.client_identity = Some(self.clone());
-		encryption.key_manager = Some(Arc::clone(&self.key));
-	}
-}
-
 /// Everything an endpoint was provisioned with before any handshake runs.
 ///
 /// Provisioning is decided once, when the endpoint is built, so it travels as
@@ -579,19 +505,17 @@ pub struct EncryptionConfig<P: CryptoProvider> {
 	/// peer identity to a lower layer, which [`Self::check_dial_permitted`]
 	/// requires the endpoint to have named.
 	pub(crate) trust_store: Option<Arc<dyn CertificateTrust>>,
-	/// Local server certificate this endpoint presents.
-	pub(crate) server_certificate: Option<Arc<Certificate>>,
+	/// The identity this endpoint presents as a server: the certificate and
+	/// the key that signs its replies and its receipts.
+	pub(crate) server_identity: Option<SigningIdentity>,
 	/// Provisioned server chain, ordered root to leaf, required by the CMS
 	/// key-transport handshake before the server speaks.
 	pub(crate) server_certificate_chain: Option<Arc<[Certificate]>>,
-	/// Client identity presented for mutual authentication: the certificate
-	/// and the key that proves it, bound as one value.
-	pub(crate) client_identity: Option<ClientIdentity<P>>,
+	/// The identity this endpoint presents as a client for mutual
+	/// authentication: the certificate and the key that proves it.
+	pub(crate) client_identity: Option<SigningIdentity>,
 	/// How a server endpoint authenticates its client.
 	pub(crate) peer_authentication: PeerAuthentication,
-	/// Signing key manager backing this endpoint's identity and
-	/// countersignatures.
-	pub(crate) key_manager: Option<Arc<HandshakeKeyManager<P>>>,
 	/// Domain-separation tag of the HPKE key exchange. Both HPKE endpoints
 	/// MUST hold the same tag for a session to complete.
 	pub(crate) aad_domain_tag: &'static [u8],
@@ -613,6 +537,8 @@ pub struct EncryptionConfig<P: CryptoProvider> {
 	pub(crate) handshake_protocol: HandshakeProtocolKind,
 	/// Whether this endpoint accepts running without authenticating its peer.
 	pub(crate) allow_cleartext: bool,
+	/// The provider the endpoint's handshakes and sessions run under.
+	pub(crate) provider: PhantomData<fn() -> P>,
 }
 
 impl<P: CryptoProvider> EncryptionConfig<P> {
@@ -623,12 +549,12 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 
 	/// Local server certificate this endpoint presents.
 	pub fn server_certificate(&self) -> Option<&Certificate> {
-		self.server_certificate.as_deref()
+		self.server_identity.as_ref().map(SigningIdentity::certificate)
 	}
 
 	/// Client certificate presented for mutual authentication.
 	pub fn client_certificate(&self) -> Option<&Certificate> {
-		self.client_identity.as_ref().map(ClientIdentity::certificate)
+		self.client_identity.as_ref().map(SigningIdentity::certificate)
 	}
 
 	/// Handshake protocol used once encryption is provisioned.
@@ -652,12 +578,11 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 		// someone says whether it implies a handshake, so no new key material
 		// silently leaves the endpoint in `Cleartext` (CWE-311).
 		let Self {
-			server_certificate,
+			server_identity,
 			trust_store,
 			peer_authentication,
 			server_certificate_chain: _,
 			client_identity: _,
-			key_manager: _,
 			aad_domain_tag: _,
 			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 				mux_offer: _,
@@ -669,9 +594,10 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 				session_observer: _,
 			handshake_protocol: _,
 			allow_cleartext: _,
+			provider: _,
 		} = self;
 
-		server_certificate.is_some() || trust_store.is_some() || peer_authentication.requires_certificate()
+		server_identity.is_some() || trust_store.is_some() || peer_authentication.requires_certificate()
 	}
 
 	/// Whether this endpoint carries a client identity.
@@ -705,11 +631,10 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 	pub(crate) fn unconfigured() -> Self {
 		Self {
 			trust_store: None,
-			server_certificate: None,
+			server_identity: None,
 			server_certificate_chain: None,
 			client_identity: None,
 			peer_authentication: PeerAuthentication::Anonymous,
-			key_manager: None,
 			aad_domain_tag: TIGHTBEAM_AAD_DOMAIN_TAG,
 			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 			mux_offer: None,
@@ -721,6 +646,7 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 			session_observer: None,
 			handshake_protocol: HandshakeProtocolKind::default(),
 			allow_cleartext: false,
+			provider: PhantomData,
 		}
 	}
 }

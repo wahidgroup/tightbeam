@@ -17,9 +17,9 @@ use crate::TightBeamError;
 
 use crate::crypto::key::SigningKeyProvider;
 use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
+use crate::crypto::sign::SigningIdentity;
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::crypto::x509::CertificateSpec;
-use crate::transport::state::ClientIdentity;
 use crate::transport::TransportEncryptionConfig;
 
 /// How a servlet accepts connections.
@@ -139,13 +139,13 @@ impl<C: CryptoProvider> AcceptState<C> for WithCertificate<C> {}
 /// Builder for [`ServletConfig`].
 ///
 /// `A` is the accept state, and it holds the accept material. A fresh builder
-/// is in [`NoAcceptState`], and one of two calls moves it to a state that
+/// is in [`NoAcceptState`], and one of three calls moves it to a state that
 /// builds:
 ///
-/// - [`ServletConfigBuilder::with_certificate`] moves it to
-///   [`WithCertificate`], where [`ServletConfigBuilder::with_mux_offer`]
-///   exists. The offer has its one place beside the certificate, so the pair
-///   stays together.
+/// - [`ServletConfigBuilder::with_certificate`] or
+///   [`ServletConfigBuilder::with_identity`] moves it to [`WithCertificate`],
+///   where [`ServletConfigBuilder::with_mux_offer`] exists. The offer has its
+///   one place beside the certificate, so the pair stays together.
 /// - [`ServletConfigBuilder::allow_cleartext`] moves it to [`Cleartext`].
 ///
 /// A servlet therefore serves in the clear only where its configuration says
@@ -287,10 +287,12 @@ where
 }
 
 /// A fresh builder serves the unit env and is in [`NoAcceptState`]. These are
-/// the states the builder supplies on its own. Three calls leave them:
-/// [`ServletConfigBuilder::with_config`] for the env, and
-/// [`ServletConfigBuilder::with_certificate`] or
-/// [`ServletConfigBuilder::allow_cleartext`] for the accept state.
+/// the states the builder supplies on its own, and four calls leave them:
+///
+/// - [`ServletConfigBuilder::with_config`] for the env.
+/// - [`ServletConfigBuilder::with_certificate`],
+///   [`ServletConfigBuilder::with_identity`], or
+///   [`ServletConfigBuilder::allow_cleartext`] for the accept state.
 impl<P, M, C> Default for ServletConfigBuilder<P, M, C, (), NoAcceptState>
 where
 	P: Protocol,
@@ -440,14 +442,15 @@ where
 	///
 	/// Its frames then travel in the clear and it accepts every client that
 	/// connects, which suits a loopback fixture or a link a lower layer
-	/// already secures. `build` exists after this call or after
-	/// [`Self::with_certificate`].
+	/// already secures. `build` exists after this call, after
+	/// [`Self::with_certificate`], or after [`Self::with_identity`].
 	#[must_use]
 	pub fn allow_cleartext(self) -> ServletConfigBuilder<P, M, C, Env, Cleartext> {
 		self.with_accept(Cleartext)
 	}
 
-	/// Enables encrypted transport with the given server certificate.
+	/// Enables encrypted transport with the given server certificate, under
+	/// the house provider.
 	///
 	/// - A non-empty `validators` turns on mutual authentication, and every
 	///   validator must accept the client certificate.
@@ -459,18 +462,32 @@ where
 	/// # Errors
 	///
 	/// - [`TightBeamError`] -- the certificate or key does not decode, as
-	///   [`ClientIdentity::from_spec`] reports it.
+	///   [`SigningIdentity::from_spec`] reports it, or the key differs from
+	///   the certificate's public key.
 	pub fn with_certificate(
 		self,
 		cert: CertificateSpec,
 		key: Arc<dyn SigningKeyProvider>,
 		validators: impl IntoIterator<Item = Arc<dyn CertificateValidation>>,
 	) -> Result<ServletConfigBuilder<P, M, C, Env, WithCertificate<C>>, TightBeamError> {
-		let (certificate, key_manager) = ClientIdentity::<C>::from_spec(cert, key)?.parts();
-		let encryption = TransportEncryptionConfig::new(certificate, key_manager).with_client_validators(validators);
+		let identity = SigningIdentity::from_spec(cert, key)?;
+		let with_certificate = self.with_identity(identity, validators);
 
-		let with_certificate = self.with_accept(WithCertificate { encryption, mux_offer: None });
 		Ok(with_certificate)
+	}
+
+	/// Enables encrypted transport under `identity`, whose key signs under the
+	/// [`SigningProvider`](crate::crypto::profiles::SigningProvider) it was
+	/// paired under. `validators` acts as in [`Self::with_certificate`].
+	#[must_use]
+	pub fn with_identity(
+		self,
+		identity: SigningIdentity,
+		validators: impl IntoIterator<Item = Arc<dyn CertificateValidation>>,
+	) -> ServletConfigBuilder<P, M, C, Env, WithCertificate<C>> {
+		let encryption = TransportEncryptionConfig::new(identity).with_client_validators(validators);
+
+		self.with_accept(WithCertificate { encryption, mux_offer: None })
 	}
 }
 
@@ -483,9 +500,10 @@ where
 	/// Advertises multiplexing on accepted connections.
 	///
 	/// The offer is bound into the handshake transcript, so this exists
-	/// only after [`ServletConfigBuilder::with_certificate`] has put the
-	/// builder in the [`WithCertificate`] state, and it lands beside the
-	/// certificate it binds to.
+	/// only after [`ServletConfigBuilder::with_certificate`] or
+	/// [`ServletConfigBuilder::with_identity`] has put the builder in the
+	/// [`WithCertificate`] state, and it lands beside the certificate it binds
+	/// to.
 	#[must_use]
 	pub fn with_mux_offer(mut self, offer: impl IntoMuxOffer) -> Self {
 		self.accept.mux_offer = offer.into_mux_offer();

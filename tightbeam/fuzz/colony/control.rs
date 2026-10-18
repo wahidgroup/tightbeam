@@ -3,18 +3,18 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use sha3::Sha3_256;
 use tightbeam::builder::TypeBuilder;
 use tightbeam::colony::cluster::{Cluster, ClusterRequest};
 use tightbeam::colony::common::{PeerAdvertisement, PeerAdvertisementResponse};
 use tightbeam::crypto::key::Secp256k1KeyProvider;
 use tightbeam::crypto::sign::ecdsa::Secp256k1SigningKey;
+use tightbeam::crypto::sign::SigningIdentity;
 use tightbeam::crypto::x509::store::CertificateTrust;
 use tightbeam::crypto::x509::CertificateSpec;
 use tightbeam::decode;
 use tightbeam::policy::TransitStatus;
+use tightbeam::testing::TestIdentity;
 use tightbeam::trace::TraceCollector;
-use tightbeam::transport::state::ClientIdentity;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::{ClientBuilder, ConnectionBuilder, GenericClient, Protocol};
 use tightbeam::urn::Urn;
@@ -46,8 +46,8 @@ pub(crate) async fn signed_control_frame(
 		.with_message(request)
 		.build()?;
 
-	let provider = Secp256k1KeyProvider::from(key.to_owned());
-	signed.sign_with_provider::<Sha3_256, _>(&provider).await?;
+	let identity = TestIdentity::of(key);
+	signed.sign_with_provider(&identity).await?;
 	Ok(signed)
 }
 
@@ -62,7 +62,7 @@ async fn connect_as(
 	Ok(ClientBuilder::<TokioListener>::builder()
 		.with_timeout(CLIENT_IO_TIMEOUT)
 		.with_trust_store(server_trust)
-		.with_client_identity(ClientIdentity::from_spec(cert, key)?)
+		.with_client_identity(SigningIdentity::from_spec(cert, key)?)
 		.build()
 		.connect(addr.to_owned())
 		.await?)

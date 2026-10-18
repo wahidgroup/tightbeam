@@ -715,7 +715,7 @@ pub trait EncryptedMessageIO: MessageIO {
 	///
 	/// # Errors
 	///
-	/// - [`TransportError::MissingEncryption`] -- no key manager is configured.
+	/// - [`TransportError::MissingEncryption`] -- no server identity is configured.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	fn server_config<F, P>(&self, flow: F::Settings) -> TransportResult<ServerConfig<F, P>>
 	where
@@ -724,10 +724,10 @@ pub trait EncryptedMessageIO: MessageIO {
 		P: HandshakeProvider,
 	{
 		let encryption = self.encryption();
-		let key_manager = encryption.key_manager.as_ref().ok_or(TransportError::MissingEncryption)?;
+		let identity = encryption.server_identity.as_ref().ok_or(TransportError::MissingEncryption)?;
 		let profiles = SupportedProfiles::from(RunnableProfile::<P>::native().descriptor());
 
-		let mut config = ServerConfig::new(flow, key_manager.signing_provider(), profiles);
+		let mut config = ServerConfig::new(flow, identity.clone(), profiles);
 		config.peer_authentication = encryption.peer_authentication.clone();
 		config.transport = encryption.mux_offer.as_deref().cloned();
 		config.transport_authorizer = encryption.transport_authorizer.as_ref().map(Arc::clone);
@@ -739,7 +739,7 @@ pub trait EncryptedMessageIO: MessageIO {
 	///
 	/// # Errors
 	///
-	/// - [`TransportError::MissingEncryption`] -- no server certificate or key manager is configured.
+	/// - [`TransportError::MissingEncryption`] -- no server identity is configured.
 	#[cfg(feature = "transport-hpke")]
 	fn build_hpke_server_orchestrator<P>(&self) -> TransportResult<BoxedServerHandshake>
 	where
@@ -747,10 +747,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		P: HandshakeProvider,
 	{
 		let encryption = self.encryption();
-		let certificate = encryption.server_certificate.as_ref();
-		let certificate = certificate.ok_or(TransportError::MissingEncryption)?;
-		let certificate = Arc::clone(certificate);
-		let settings = HpkeServerSettings { certificate, aad_domain_tag: encryption.aad_domain_tag };
+		let settings = HpkeServerSettings { aad_domain_tag: encryption.aad_domain_tag };
 
 		let config = self.server_config::<Hpke, P>(settings)?;
 		Ok(Box::new(Handshake::server(config)))
@@ -760,7 +757,7 @@ pub trait EncryptedMessageIO: MessageIO {
 	///
 	/// # Errors
 	///
-	/// - [`TransportError::MissingEncryption`] -- no key manager is configured.
+	/// - [`TransportError::MissingEncryption`] -- no server identity is configured.
 	#[cfg(feature = "transport-cms")]
 	fn build_cms_server_orchestrator<P>(&self) -> TransportResult<BoxedServerHandshake>
 	where
@@ -911,10 +908,9 @@ pub trait EncryptedMessageIO: MessageIO {
 		let (status, response) = match response_envelope {
 			TransportEnvelope::Response(pkg) => (pkg.status, pkg.message),
 			TransportEnvelope::Request(_) => return Err(TransportError::InvalidMessage),
-			TransportEnvelope::EnvelopedData(_)
-			| TransportEnvelope::SignedData(_)
-			| TransportEnvelope::EncryptedData(_)
-			| TransportEnvelope::ClientKeyExchange(_) => return Err(TransportError::InvalidMessage),
+			TransportEnvelope::SignedData(_)
+			| TransportEnvelope::ClientKeyExchange(_)
+			| TransportEnvelope::AuthEnvelopedData(_) => return Err(TransportError::InvalidMessage),
 			#[cfg(feature = "transport-multiplex")]
 			TransportEnvelope::Mux(_) => return Err(TransportError::InvalidMessage),
 		};
@@ -945,10 +941,9 @@ impl TransportEnvelope {
 		match self {
 			TransportEnvelope::Request(msg) => Ok(msg.message),
 			TransportEnvelope::Response(_) => Err(TransportError::InvalidMessage),
-			TransportEnvelope::EnvelopedData(_)
-			| TransportEnvelope::SignedData(_)
-			| TransportEnvelope::EncryptedData(_)
-			| TransportEnvelope::ClientKeyExchange(_) => Err(TransportError::InvalidMessage),
+			TransportEnvelope::SignedData(_)
+			| TransportEnvelope::ClientKeyExchange(_)
+			| TransportEnvelope::AuthEnvelopedData(_) => Err(TransportError::InvalidMessage),
 			#[cfg(feature = "transport-multiplex")]
 			TransportEnvelope::Mux(_) => Err(TransportError::InvalidMessage),
 		}

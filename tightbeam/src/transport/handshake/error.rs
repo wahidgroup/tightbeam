@@ -1,8 +1,3 @@
-#[cfg(not(feature = "std"))]
-extern crate alloc;
-#[cfg(not(feature = "std"))]
-use alloc::string::ToString;
-
 use crate::Errorizable;
 
 #[cfg(all(
@@ -26,10 +21,6 @@ pub type Result<T> = core::result::Result<T, HandshakeError>;
 #[derive(Debug, Errorizable)]
 #[non_exhaustive]
 pub enum HandshakeError {
-	/// The client key exchange message is invalid.
-	#[error("Invalid client key exchange message")]
-	InvalidClientKeyExchange,
-
 	/// The server key exchange message is invalid.
 	#[error("Invalid server key exchange message")]
 	InvalidServerKeyExchange,
@@ -81,10 +72,6 @@ pub enum HandshakeError {
 	#[from]
 	KeyError(crate::crypto::key::KeyError),
 
-	/// The CMS builder failed.
-	#[error("CMS builder error: {0}")]
-	CmsBuilderError(crate::cms::builder::Error),
-
 	/// The handshake state is invalid for this operation.
 	#[error("Invalid handshake state")]
 	InvalidState,
@@ -106,11 +93,11 @@ pub enum HandshakeError {
 	#[error("Missing client certificate")]
 	MissingClientCertificate,
 
-	/// The digest output width differs from the required transcript hash
-	/// width. `expected` is the required width and `received` is the digest
-	/// output width, both in bytes.
-	#[error("Transcript digest length invalid: expected {expected} bytes, got {received}")]
-	TranscriptDigestLength { expected: usize, received: usize },
+	/// A digest output lies outside the widths the handshake admits for a
+	/// transcript hash and a key-confirmation tag, `min` to `max` bytes.
+	/// `received` is the width of the output, in bytes.
+	#[error("Transcript digest length invalid: {received} bytes, outside {min} to {max}")]
+	TranscriptDigestLength { min: usize, max: usize, received: usize },
 
 	/// The server requires mutual authentication, and the client has no
 	/// identity configured.
@@ -140,20 +127,28 @@ pub enum HandshakeError {
 	#[error("Settlement rejected: code {code}")]
 	SettlementRejected { code: u32 },
 
-	/// The AEAD refused to seal or open the receipt acknowledgement under the
-	/// key the handshake secret derives. On the opening side the
-	/// acknowledgement was sealed under another handshake secret or altered
-	/// in flight.
-	#[error("Receipt acknowledgement AEAD failure: {0}")]
-	ReceiptAckCipher(crate::crypto::aead::Error),
+	/// The envelope refused to seal or open the receipt acknowledgement under
+	/// the key the handshake secret derives. On the opening side the
+	/// acknowledgement was sealed under another handshake secret or another
+	/// transcript, or altered in flight. The payload is the envelope's refusal.
+	#[cfg(feature = "hpke")]
+	#[error("Receipt acknowledgement envelope refused: {0}")]
+	ReceiptAckCipher(crate::crypto::cms::EnvelopeError),
 
-	/// The sealed client identity of the closing fails to open under the key
-	/// the handshake secret derives, or its frame is malformed. It was sealed
-	/// under another handshake secret or another transcript, or altered in
-	/// flight. A sealed CMS Finished is refused the same way when it names
-	/// another content type or algorithm, or carries no content.
-	#[error("Sealed client identity failed to open")]
-	SealedIdentity,
+	/// The envelope refused to seal or open the client identity of the
+	/// closing under the key the handshake secret derives. It was sealed under
+	/// another handshake secret or another transcript, or altered in flight.
+	/// A sealed CMS Finished is refused the same way. The payload is the
+	/// envelope's refusal.
+	#[cfg(feature = "hpke")]
+	#[error("Sealed client identity refused: {0}")]
+	SealedIdentity(crate::crypto::cms::EnvelopeError),
+
+	/// The client identity exceeds the padded frame it seals in, or an opened
+	/// frame carries a length past its end, a non-zero padding byte, or
+	/// another padded length.
+	#[error("Sealed frame malformed")]
+	SealedFrame,
 
 	/// The key-confirmation tag of the closing differs from the tag the server
 	/// derived. The client holds another handshake secret, or it confirmed
@@ -211,6 +206,12 @@ pub enum HandshakeError {
 	#[error("HPKE operation failed: {0}")]
 	#[from]
 	HpkeError(crate::crypto::hpke::HpkeError),
+	/// The authenticated envelope of a CMS opening fails to open, or an
+	/// envelope fails to seal.
+	#[cfg(feature = "hpke")]
+	#[error("Authenticated envelope refused: {0}")]
+	#[from]
+	Envelope(crate::crypto::cms::EnvelopeError),
 	/// The decrypted HPKE payload has an invalid size.
 	#[error("Invalid decrypted payload size")]
 	InvalidDecryptedPayloadSize,
@@ -227,25 +228,6 @@ pub enum HandshakeError {
 	/// and the actual key length in bytes.
 	#[error("Invalid key size: expected {expected}, got {received}")]
 	InvalidKeySize { expected: usize, received: usize },
-	/// The recipient index is invalid.
-	#[error("Invalid recipient index")]
-	InvalidRecipientIndex,
-	/// The KeyAgreeRecipientInfo carries no user keying material (UKM).
-	#[error("Missing UKM in KeyAgreeRecipientInfo")]
-	MissingUkm,
-	/// The originator identifier type is unsupported.
-	#[error("Unsupported originator identifier type")]
-	UnsupportedOriginatorIdentifier,
-	/// The KARI builder was already consumed.
-	#[error("KARI builder already consumed")]
-	KariBuilderConsumed,
-	/// The security profile configures no key wrap algorithm.
-	#[error("Key wrap algorithm not configured in security profile")]
-	MissingKeyWrapAlgorithm,
-	/// The negotiated key wrap algorithm is not AES-128, AES-192, or AES-256
-	/// key wrap.
-	#[error("Negotiated key wrap algorithm unsupported (expected AES-128/192/256 key wrap)")]
-	UnsupportedKeyWrapAlgorithm,
 
 	/// Random generation failed.
 	#[error("Random generation failed")]
@@ -268,8 +250,8 @@ impl HandshakeError {
 	/// - A receipt approval or settlement refusal records
 	///   [`SESSION_RECEIPT_REFUSED`](events::SESSION_RECEIPT_REFUSED).
 	/// - A refused peer certificate or proof of possession, including a
-	///   certificate the peer did not present and a sealed identity that fails
-	///   to open, records
+	///   certificate the peer did not present and a sealed identity or frame
+	///   that fails to open, records
 	///   [`SESSION_CERT_REJECTED`](events::SESSION_CERT_REJECTED).
 	pub(crate) fn audit_event(&self) -> Option<Urn<'static>> {
 		match self {
@@ -277,7 +259,8 @@ impl HandshakeError {
 			Self::CertificateValidationError(_)
 			| Self::SignatureVerificationFailed
 			| Self::MissingClientCertificate
-			| Self::SealedIdentity
+			| Self::SealedIdentity(_)
+			| Self::SealedFrame
 			| Self::MutualAuthRequired => Some(events::SESSION_CERT_REJECTED),
 			_ => None,
 		}
@@ -301,23 +284,30 @@ impl From<crate::error::TightBeamError> for HandshakeError {
 			TightBeamError::SignatureError(e) => HandshakeError::SignatureError(e),
 			#[cfg(feature = "hpke")]
 			TightBeamError::HpkeError(e) => HandshakeError::HpkeError(e),
+			#[cfg(feature = "hpke")]
+			TightBeamError::EnvelopeError(e) => HandshakeError::Envelope(e),
 			TightBeamError::OsRngError(_) => HandshakeError::RandomGenerationFailed,
 			_ => HandshakeError::InvalidState,
 		}
 	}
 }
 
-/// Narrows [`HandshakeError`] into the foreign [`crate::cms::builder::Error`].
+/// Narrows a CMS signer error into [`HandshakeError`].
 ///
-/// A variant without a counterpart collapses into
-/// [`Builder`](crate::cms::builder::Error::Builder) through its `Display`.
-impl From<HandshakeError> for crate::cms::builder::Error {
-	fn from(err: HandshakeError) -> Self {
+/// An encoding, key, or certificate failure keeps its variant. Every other
+/// refusal of a signature, its signer, its version, or its signed attributes
+/// is [`HandshakeError::SignatureVerificationFailed`], the one verdict both
+/// flows report for a signature they refuse.
+impl From<crate::crypto::sign::SignerError> for HandshakeError {
+	fn from(err: crate::crypto::sign::SignerError) -> Self {
+		use crate::crypto::sign::SignerError;
+
 		match err {
-			HandshakeError::CmsBuilderError(e) => e,
-			HandshakeError::DerError(e) => crate::cms::builder::Error::Asn1(e),
-			HandshakeError::SpkiError(e) => crate::cms::builder::Error::PublicKey(e),
-			other => crate::cms::builder::Error::Builder(other.to_string()),
+			SignerError::Encoding(e) => HandshakeError::DerError(e),
+			SignerError::PublicKey(e) => HandshakeError::SpkiError(e),
+			SignerError::Key(e) => HandshakeError::KeyError(e),
+			SignerError::Certificate(e) => HandshakeError::CertificateValidationError(e),
+			_ => HandshakeError::SignatureVerificationFailed,
 		}
 	}
 }
@@ -329,6 +319,7 @@ impl From<HandshakeError> for crate::cms::builder::Error {
 ))]
 mod tests {
 	use super::*;
+	use crate::crypto::cms::EnvelopeError;
 
 	#[test]
 	fn a_missing_client_certificate_is_a_certificate_rejection() {
@@ -340,7 +331,7 @@ mod tests {
 	/// could check, so it records the refusal of an unproven identity.
 	#[test]
 	fn a_sealed_identity_that_fails_to_open_is_a_certificate_rejection() {
-		let event = HandshakeError::SealedIdentity.audit_event();
+		let event = HandshakeError::SealedIdentity(EnvelopeError::Authentication).audit_event();
 		assert_eq!(event, Some(events::SESSION_CERT_REJECTED));
 	}
 

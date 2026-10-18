@@ -24,6 +24,7 @@ use crate::builder::error::{BuildError, MetadataError};
 use crate::builder::MetadataBuilder;
 
 mod compress;
+mod signed;
 
 #[cfg(feature = "aead")]
 mod aead;
@@ -36,6 +37,7 @@ mod signature;
 
 #[cfg(feature = "digest")]
 pub(crate) use scaffold::FrameIntegrityScaffold;
+pub use signed::Signed;
 
 /// The per-message metadata that a [`Frame`] carries beside its body.
 ///
@@ -247,7 +249,7 @@ pub struct Frame {
 	#[cfg_attr(feature = "zeroize", zeroize(skip))]
 	integrity: Option<DigestInfo>,
 	#[cfg_attr(feature = "zeroize", zeroize(skip))]
-	nonrepudiation: Option<SignerInfo>,
+	nonrepudiation: Option<Signed<SignerInfo>>,
 }
 
 wire_sequence!(Frame {
@@ -368,7 +370,7 @@ impl Frame {
 	}
 
 	/// The signature over the to-be-signed encoding of this frame (V1+).
-	pub fn nonrepudiation(&self) -> Option<&SignerInfo> {
+	pub fn nonrepudiation(&self) -> Option<&Signed<SignerInfo>> {
 		self.nonrepudiation.as_ref()
 	}
 

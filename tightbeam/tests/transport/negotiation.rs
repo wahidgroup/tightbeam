@@ -12,31 +12,19 @@
 	feature = "tokio"
 ))]
 
-use std::sync::Arc;
-
-use tightbeam::crypto::aead::{Aes128GcmOid, Aes256Gcm, Aes256GcmOid};
-use tightbeam::crypto::hash::{Sha3_256, Sha3_512};
-use tightbeam::crypto::hpke::HpkeSecp256k1Sha3Aes256Gcm;
+use tightbeam::crypto::aead::Aes128GcmOid;
+use tightbeam::crypto::hash::Sha3_256;
 use tightbeam::crypto::kdf::HkdfSha3_256;
-use tightbeam::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
-use tightbeam::crypto::profiles::{
-	AeadProvider, CryptoProvider, CurveProvider, DigestProvider, KdfProvider, SecurityProfile, SecurityProfileDesc,
-	SigningProvider,
-};
-use tightbeam::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey, Secp256k1VerifyingKey};
-use tightbeam::der::asn1::ObjectIdentifier;
+use tightbeam::crypto::profiles::{Aes128Wrap, SecurityProfile, SecurityProfileDesc};
+use tightbeam::crypto::sign::ecdsa::Secp256k1Signature;
+use tightbeam::crypto::sign::SigningIdentity;
 use tightbeam::exactly;
-use tightbeam::oids::{AES_128_WRAP, AES_256_WRAP};
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_scenario;
-use tightbeam::testing::{
-	fixtures::{TestCertificate, TestKey},
-	SetupEnv,
-};
+use tightbeam::testing::{Aes256Sha3_512Profile, Aes256Sha3_512Provider, SetupEnv, TestIdentity};
 use tightbeam::transport::handshake::negotiation::SecurityOffer;
 use tightbeam::transport::handshake::{Handshake, Hpke, HpkeServerSettings, ServerConfig, SupportedProfiles};
 use tightbeam::urn::Urn;
-use tightbeam::x509::Certificate;
 
 use crate::common::security::{hpke_client_config, pinning_validator};
 
@@ -48,57 +36,6 @@ pub(crate) const PROFILE_VERIFIED: Urn<'static> = tightbeam::urn!("test", "event
 pub(crate) const SERVER_HELLO_RECEIVED: Urn<'static> =
 	tightbeam::urn!("test", "event:negotiation/server-hello-received");
 pub(crate) const SERVER_KEX_RECEIVED: Urn<'static> = tightbeam::urn!("test", "event:negotiation/server-kex-received");
-
-/// The stronger profile is AES-256-GCM with SHA3-512. The negotiation selects
-/// it when both sides offer it, because it is the one profile the test
-/// provider runs.
-#[derive(Debug, Default, Clone, Copy)]
-struct Aes256Sha3_512Profile;
-
-impl SecurityProfile for Aes256Sha3_512Profile {
-	type Digest = Sha3_512;
-	type AeadOid = Aes256GcmOid;
-	type SignatureAlg = Secp256k1Signature;
-	type Kdf = HkdfSha3_256;
-	type Curve = k256::Secp256k1;
-	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(AES_256_WRAP);
-}
-
-#[derive(Debug, Default, Clone, Copy)]
-struct Aes256Sha3_512Provider {
-	profile: Aes256Sha3_512Profile,
-}
-
-impl DigestProvider for Aes256Sha3_512Provider {
-	type Digest = Sha3_512;
-}
-
-impl AeadProvider for Aes256Sha3_512Provider {
-	type AeadCipher = Aes256Gcm;
-}
-
-impl SigningProvider for Aes256Sha3_512Provider {
-	type Signature = Secp256k1Signature;
-	type SigningKey = Secp256k1SigningKey;
-	type VerifyingKey = Secp256k1VerifyingKey;
-}
-
-impl KdfProvider for Aes256Sha3_512Provider {
-	type Kdf = HkdfSha3_256;
-}
-
-impl CurveProvider for Aes256Sha3_512Provider {
-	type Curve = k256::Secp256k1;
-}
-
-impl CryptoProvider for Aes256Sha3_512Provider {
-	type Profile = Aes256Sha3_512Profile;
-	type HpkeSuite = HpkeSecp256k1Sha3Aes256Gcm;
-
-	fn profile(&self) -> &Self::Profile {
-		&self.profile
-	}
-}
 
 /// The weaker profile is AES-128-GCM with SHA3-256. The client offer and the
 /// server list both include it, and the test provider does not run it, so
@@ -112,7 +49,7 @@ impl SecurityProfile for Aes128Sha3_256Profile {
 	type SignatureAlg = Secp256k1Signature;
 	type Kdf = HkdfSha3_256;
 	type Curve = k256::Secp256k1;
-	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(AES_128_WRAP);
+	type KeyWrapOid = Aes128Wrap;
 }
 
 fn preferred_profile() -> SecurityProfileDesc {
@@ -123,12 +60,8 @@ fn fallback_profile() -> SecurityProfileDesc {
 	SecurityProfileDesc::from(&Aes128Sha3_256Profile)
 }
 
-fn server_materials() -> (Certificate, Arc<dyn SigningKeyProvider>) {
-	let server_signing_key = TestKey::insecure_fixed_signing();
-	let server_cert = TestCertificate::self_signed(&server_signing_key);
-	let signing_key = Secp256k1SigningKey::from(server_signing_key);
-	let server_key_provider: Arc<dyn SigningKeyProvider> = Arc::new(Secp256k1KeyProvider::from(signing_key));
-	(server_cert, server_key_provider)
+fn server_identity() -> SigningIdentity {
+	TestIdentity::insecure_fixed()
 }
 
 tb_assert_spec! {
@@ -156,22 +89,22 @@ tb_scenario! {
 
 			let preferred = preferred_profile();
 			let fallback = fallback_profile();
-			let (server_cert, server_key_provider) = server_materials();
+			let server_identity = server_identity();
 
 			// The client prefers AES-256 and the server lists AES-128 first.
 			// The provider runs AES-256 alone, so the server still selects it.
 			let client_offer = SecurityOffer::new(vec![preferred, fallback]);
 			let server_profiles = SupportedProfiles::new([fallback, preferred])?;
-			let validator = pinning_validator(&server_cert);
+			let validator = pinning_validator(server_identity.certificate());
 
 			let mut config = hpke_client_config::<Aes256Sha3_512Provider>(validator);
 			config.security_offer = Some(client_offer);
 
 			let mut client = Handshake::client(config);
 
-			let settings = HpkeServerSettings::new(server_cert.to_owned());
-			let key = Arc::clone(&server_key_provider);
-			let server_config = ServerConfig::<Hpke, Aes256Sha3_512Provider>::new(settings, key, server_profiles);
+			let settings = HpkeServerSettings::new();
+			let server_config =
+				ServerConfig::<Hpke, Aes256Sha3_512Provider>::new(settings, server_identity, server_profiles);
 			let mut server = Handshake::server(server_config);
 
 			let opening = client.start()?;

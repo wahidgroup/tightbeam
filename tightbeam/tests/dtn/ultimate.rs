@@ -39,7 +39,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use tightbeam::transport::state::ClientIdentity;
+use tightbeam::crypto::sign::SigningIdentity;
 use tightbeam::{
 	asn1::MessagePriority,
 	at_most,
@@ -172,9 +172,8 @@ use crate::dtn::{
 
 fn make_trust_store(cert_spec: CertificateSpec) -> Result<Arc<dyn CertificateTrust>, TightBeamError> {
 	let cert = Certificate::try_from(cert_spec)?;
-	Ok(Arc::new(
-		CertificateTrustBuilder::from(Secp256k1Policy).with_certificate(cert)?.build(),
-	))
+	let builder = CertificateTrustBuilder::from(Secp256k1Policy::default());
+	Ok(Arc::new(builder.with_certificate(cert)?.build()))
 }
 
 /// Configuration for 4-tier DTN scenario
@@ -804,42 +803,42 @@ tb_scenario! {
 			let mc_earth_pool = Arc::new(ConnectionPool::<TokioListener>::builder()
 				.with_config(pool_config.to_owned())
 				.with_trust_store(make_trust_store(EARTH_RELAY_CERT)?)
-				.with_client_identity(ClientIdentity::from_spec(MISSION_CONTROL_CERT, MISSION_CONTROL_KEY.to_provider::<Secp256k1>()?)?)
+				.with_client_identity(SigningIdentity::from_spec(MISSION_CONTROL_CERT, MISSION_CONTROL_KEY.to_provider::<Secp256k1>()?)?)
 				.build());
 
 			// Pool from the Earth relay to Mission Control.
 			let earth_mc_pool = Arc::new(ConnectionPool::<TokioListener>::builder()
 				.with_config(pool_config.to_owned())
 				.with_trust_store(make_trust_store(MISSION_CONTROL_CERT)?)
-				.with_client_identity(ClientIdentity::from_spec(EARTH_RELAY_CERT, EARTH_RELAY_KEY.to_provider::<Secp256k1>()?)?)
+				.with_client_identity(SigningIdentity::from_spec(EARTH_RELAY_CERT, EARTH_RELAY_KEY.to_provider::<Secp256k1>()?)?)
 				.build());
 
 			// Pool from the Earth relay to the Mars relay.
 			let earth_mars_pool = Arc::new(ConnectionPool::<TokioListener>::builder()
 				.with_config(pool_config.to_owned())
 				.with_trust_store(make_trust_store(MARS_RELAY_CERT)?)
-				.with_client_identity(ClientIdentity::from_spec(EARTH_RELAY_CERT, EARTH_RELAY_KEY.to_provider::<Secp256k1>()?)?)
+				.with_client_identity(SigningIdentity::from_spec(EARTH_RELAY_CERT, EARTH_RELAY_KEY.to_provider::<Secp256k1>()?)?)
 				.build());
 
 			// Pool from the Mars relay to the Earth relay.
 			let mars_earth_pool = Arc::new(ConnectionPool::<TokioListener>::builder()
 				.with_config(pool_config.to_owned())
 				.with_trust_store(make_trust_store(EARTH_RELAY_CERT)?)
-				.with_client_identity(ClientIdentity::from_spec(MARS_RELAY_CERT, MARS_RELAY_KEY.to_provider::<Secp256k1>()?)?)
+				.with_client_identity(SigningIdentity::from_spec(MARS_RELAY_CERT, MARS_RELAY_KEY.to_provider::<Secp256k1>()?)?)
 				.build());
 
 			// Pool from the Mars relay to the rover.
 			let mars_rover_pool = Arc::new(ConnectionPool::<TokioListener>::builder()
 				.with_config(pool_config.to_owned())
 				.with_trust_store(make_trust_store(ROVER_CERT)?)
-				.with_client_identity(ClientIdentity::from_spec(MARS_RELAY_CERT, MARS_RELAY_KEY.to_provider::<Secp256k1>()?)?)
+				.with_client_identity(SigningIdentity::from_spec(MARS_RELAY_CERT, MARS_RELAY_KEY.to_provider::<Secp256k1>()?)?)
 				.build());
 
 			// Pool from the rover to the Mars relay.
 			let rover_mars_pool = Arc::new(ConnectionPool::<TokioListener>::builder()
 				.with_config(pool_config)
 				.with_trust_store(make_trust_store(MARS_RELAY_CERT)?)
-				.with_client_identity(ClientIdentity::from_spec(ROVER_CERT, ROVER_KEY.to_provider::<Secp256k1>()?)?)
+				.with_client_identity(SigningIdentity::from_spec(ROVER_CERT, ROVER_KEY.to_provider::<Secp256k1>()?)?)
 				.build());
 
 
@@ -1073,7 +1072,7 @@ tb_scenario! {
 				// Connect to Earth Relay and send initial command
 				let mut earth_relay_client = ClientBuilder::<TokioListener>::builder()
 					.with_trust_store(make_trust_store(EARTH_RELAY_CERT)?)
-					.with_client_identity(ClientIdentity::from_spec(MISSION_CONTROL_CERT, MISSION_CONTROL_KEY.to_provider::<Secp256k1>()?)?)
+					.with_client_identity(SigningIdentity::from_spec(MISSION_CONTROL_CERT, MISSION_CONTROL_KEY.to_provider::<Secp256k1>()?)?)
 					.with_timeout(Duration::from_millis(5000))
 					.build()
 					.connect(earth_relay_addr)
@@ -1091,7 +1090,7 @@ tb_scenario! {
 			// Connect Rover client to Mars Relay
 			let client = ClientBuilder::<TokioListener>::builder()
 				.with_trust_store(make_trust_store(MARS_RELAY_CERT)?)
-				.with_client_identity(ClientIdentity::from_spec(ROVER_CERT, ROVER_KEY.to_provider::<Secp256k1>()?)?)
+				.with_client_identity(SigningIdentity::from_spec(ROVER_CERT, ROVER_KEY.to_provider::<Secp256k1>()?)?)
 				.with_timeout(Duration::from_millis(5000))
 				.build()
 				.connect(mars_relay_addr)

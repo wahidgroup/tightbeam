@@ -27,7 +27,7 @@ use crate::colony::cluster::runtime::hop::{FloodClient, Hop, PeerPlane};
 use crate::colony::cluster::runtime::refuse::Refusal;
 use crate::colony::cluster::runtime::{LoopFault, VerifiedSignerId};
 use crate::colony::cluster::{
-	gossip_fresh, wanted_digests, Admission, AdmittedGossip, GossipDigest, PeerCaps, PeerHint, RouteKind,
+	gossip_fresh, wanted_digests, Admission, AdmittedGossip, GossipDigest, PeerCaps, PeerHint, RouteKind, VerifiedRumor,
 };
 use crate::colony::cluster::{AdmittedDial, ClusterConfig, ClusterError, PeerAddress, ServletRegistry};
 use crate::colony::common::IssuedAt;
@@ -155,9 +155,7 @@ impl ClusterConfig {
 			.with_witness_hasher::<D>()
 			.build()?;
 
-		signed_frame
-			.sign_with_provider::<D, _>(self.tls.identity().signing_provider())
-			.await?;
+		signed_frame.sign_with_provider(self.tls.identity()).await?;
 		Ok(signed_frame)
 	}
 
@@ -189,13 +187,12 @@ impl ClusterConfig {
 			.build()
 			.ok()?;
 
-		rumor
-			.sign_with_provider::<D, _>(self.tls.identity().signing_provider())
-			.await
-			.ok()?;
-		let digest = rumor.gossip_digest::<D>().ok()?;
-		let signer_id = rumor.signer_id()?;
+		rumor.sign_with_provider(self.tls.identity()).await.ok()?;
 
+		let verified = self.tls.verify_own(rumor).ok()?;
+		let digest = verified.gossip_digest::<D>().ok()?;
+		let rumor = verified.into_frame();
+		let signer_id = rumor.signer_id()?;
 		Some(MintedAdRumor { rumor, digest, signer_id, minted_at })
 	}
 
@@ -592,12 +589,9 @@ where
 			}
 		};
 
-		let signing = signed_frame
-			.sign_with_provider::<D, _>(self.config.tls.identity().signing_provider())
-			.await;
+		let signing = signed_frame.sign_with_provider(self.config.tls.identity()).await;
 		if signing.is_err() {
 			self.trace.event(CLUSTER_GOSSIP_REFLOOD_FAILED)?;
-
 			return Ok(());
 		}
 
@@ -784,9 +778,7 @@ where
 			return Ok(());
 		};
 
-		let signing = signed_frame
-			.sign_with_provider::<D, _>(self.config.tls.identity().signing_provider())
-			.await;
+		let signing = signed_frame.sign_with_provider(self.config.tls.identity()).await;
 		if signing.is_err() {
 			return Ok(());
 		}
@@ -945,16 +937,13 @@ where
 		let missing = self.config.gossip.journal.fetch(wanted, now)?;
 		let admissible = missing
 			.into_iter()
-			.filter(|rumor| gossip_fresh(rumor.issued_at(), seen_ttl, now));
+			.filter(|(_, rumor)| gossip_fresh(rumor.issued_at(), seen_ttl, now));
 
-		for rumor in admissible {
+		for (pushed_digest, rumor) in admissible {
 			let origin = rumor.signer_id();
 			if !self.offers(peer, origin.as_deref(), now) {
 				continue;
 			}
-			let Ok(pushed_digest) = rumor.gossip_digest::<D>() else {
-				continue;
-			};
 
 			let push = ClusterRequest::Gossip(Box::new(rumor));
 			let mut signed = FrameBuilder::from(Version::V2)
@@ -965,9 +954,7 @@ where
 				.with_witness_hasher::<D>()
 				.build()?;
 
-			signed
-				.sign_with_provider::<D, _>(self.config.tls.identity().signing_provider())
-				.await?;
+			signed.sign_with_provider(self.config.tls.identity()).await?;
 
 			let Some(push_reply) = client.emit(signed, None).await? else {
 				continue;
@@ -1096,11 +1083,8 @@ where
 	/// retained kind, so delivery accepts that kind alone.
 	async fn retry_pending_local<D: ClusterDigest>(&self) -> Result<(), LoopFault> {
 		let pending = self.config.gossip.journal.pending_local(self.config.clock.unix())?;
-		for rumor in pending {
+		for (digest, rumor) in pending {
 			let Ok(body) = decode::<GossipRumor>(rumor.message()) else {
-				continue;
-			};
-			let Ok(digest) = rumor.gossip_digest::<D>() else {
 				continue;
 			};
 			let GossipRumorKind::Application = body.kind else {
@@ -1129,19 +1113,22 @@ where
 		self,
 		origin: GossipOrigin,
 		frame: Frame,
-		rumor: Frame,
+		rumor: VerifiedRumor,
 		hop_ttl: u64,
 		relay_id: Option<VerifiedSignerId>,
 		rumor_signer: Option<VerifiedSignerId>,
 	) -> Result<Option<Frame>, TightBeamError> {
-		let admitted =
-			match AdmittedGossip::admit::<D>(&rumor, hop_ttl, self.config.gossip.seen_ttl, self.config.clock.unix()) {
-				Ok(admitted) => admitted,
-				Err(status) => {
-					let scored = self.weaken_invalid_relay(origin, relay_id.as_ref());
-					return Refusal::to(&frame, &self.trace).gossip_scored(scored, status);
-				}
-			};
+		let seen_ttl = self.config.gossip.seen_ttl;
+		let now = self.config.clock.unix();
+		let admitted = AdmittedGossip::admit::<D>(&rumor, hop_ttl, seen_ttl, now);
+		let rumor = rumor.into_frame();
+		let admitted = match admitted {
+			Ok(admitted) => admitted,
+			Err(status) => {
+				let scored = self.weaken_invalid_relay(origin, relay_id.as_ref());
+				return Refusal::to(&frame, &self.trace).gossip_scored(scored, status);
+			}
+		};
 
 		// Rate and journal keys use the verified origin signer, so a relay
 		// spends the origin's budget (CWE-770).

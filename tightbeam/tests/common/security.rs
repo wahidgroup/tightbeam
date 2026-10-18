@@ -5,12 +5,11 @@
 use std::sync::Arc;
 
 use tightbeam::{
-	crypto::profiles::DefaultCryptoProvider,
 	crypto::{
 		key::{Secp256k1KeyProvider, SigningKeyProvider},
 		policy::Secp256k1Policy,
 		profiles::{SecurityProfileDesc, TightbeamProfile},
-		sign::ecdsa::Secp256k1SigningKey,
+		sign::{ecdsa::Secp256k1SigningKey, SigningIdentity},
 		x509::policy::{CertificateValidation, DirectTrustValidator},
 		x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder},
 	},
@@ -20,8 +19,6 @@ use tightbeam::{
 		error::{FdrConfigError, TestingError},
 		fixtures::{TestCertificate, TestKey},
 	},
-	transport::handshake::HandshakeKeyManager,
-	transport::state::ClientIdentity,
 	x509::Certificate,
 	TightBeamError,
 };
@@ -64,6 +61,13 @@ impl ServerMaterials {
 	pub fn secret_key(&self) -> &k256::SecretKey {
 		&self.secret_key
 	}
+
+	/// The certificate and its key as the one value a server signs under.
+	pub fn identity(&self) -> SigningIdentity {
+		let certificate = Arc::clone(&self.certificate);
+		let key_provider = Arc::clone(&self.key_provider);
+		SigningIdentity::new(certificate, key_provider).expect("the server key matches its certificate")
+	}
 }
 
 /// The client credentials of a mutual-authentication handshake fixture.
@@ -71,10 +75,7 @@ impl ServerMaterials {
 pub struct ClientMaterials {
 	/// The certificate the client presents.
 	pub certificate: Arc<Certificate>,
-	/// The key manager that holds the client's signing key.
-	pub key_manager: Arc<HandshakeKeyManager<DefaultCryptoProvider>>,
-	/// The same provider the key manager holds, for a key manager under
-	/// another crypto provider.
+	/// The provider of the client's signing key.
 	pub key_provider: Arc<dyn SigningKeyProvider>,
 }
 
@@ -91,18 +92,19 @@ impl ClientMaterials {
 		Self::from_signing_key(signing_key)
 	}
 
-	/// A self-signed certificate over `signing_key`, bound to the key manager
-	/// that proves it.
+	/// A self-signed certificate over `signing_key`, beside the provider that
+	/// proves it.
 	fn from_signing_key(signing_key: Secp256k1SigningKey) -> Self {
 		let certificate = Arc::new(test_certificate(&signing_key));
 		let key_provider: Arc<dyn SigningKeyProvider> = Arc::new(Secp256k1KeyProvider::from(signing_key));
-		let key_manager = Arc::new(HandshakeKeyManager::new(Arc::clone(&key_provider)));
-		Self { certificate, key_manager, key_provider }
+		Self { certificate, key_provider }
 	}
 
 	/// The certificate and its key as the one value a handshake client takes.
-	pub fn identity(&self) -> ClientIdentity<DefaultCryptoProvider> {
-		ClientIdentity::new(Arc::clone(&self.certificate), Arc::clone(&self.key_manager))
+	pub fn identity(&self) -> SigningIdentity {
+		let certificate = Arc::clone(&self.certificate);
+		let key_provider = Arc::clone(&self.key_provider);
+		SigningIdentity::new(certificate, key_provider).expect("the client key matches its certificate")
 	}
 }
 
@@ -118,7 +120,7 @@ pub fn pinning_validator(certificate: &Certificate) -> Arc<dyn CertificateValida
 
 /// A trust store that pins the given server certificate, for a CMS client.
 pub fn pinning_trust_store(certificate: &Certificate) -> Result<Arc<dyn CertificateTrust>, TightBeamError> {
-	let store = CertificateTrustBuilder::from(Secp256k1Policy)
+	let store = CertificateTrustBuilder::from(Secp256k1Policy::default())
 		.with_certificate(certificate.to_owned())?
 		.build();
 	Ok(Arc::new(store))
@@ -350,10 +352,9 @@ mod hpke_handshake {
 		materials: &ServerMaterials,
 		profiles: impl IntoIterator<Item = SecurityProfileDesc>,
 	) -> ServerConfig<Hpke, P> {
-		let settings = HpkeServerSettings::new(Arc::clone(&materials.certificate));
-		let key = Arc::clone(&materials.key_provider);
+		let settings = HpkeServerSettings::new();
 		let profiles = SupportedProfiles::new(profiles).expect("a server fixture runs at least one profile");
-		ServerConfig::new(settings, key, profiles)
+		ServerConfig::new(settings, materials.identity(), profiles)
 	}
 
 	/// The DER of the `ClientHello` that `opening` tunnels.
@@ -408,13 +409,13 @@ mod cms_pair {
 	use std::sync::Arc;
 
 	use tightbeam::crypto::profiles::{DefaultCryptoProvider, SecurityProfileDesc};
+	use tightbeam::crypto::sign::SigningIdentity;
 	use tightbeam::crypto::x509::store::CertificateTrust;
 	use tightbeam::transport::handshake::negotiation::SecurityOffer;
 	use tightbeam::transport::handshake::{
 		ClientConfig, Cms, CmsClientSettings, CmsServerIdentity, CmsServerSettings, HandshakeProvider,
 		PeerAuthentication, ProvisionedTrust, ServerConfig, SupportedProfiles,
 	};
-	use tightbeam::transport::state::ClientIdentity;
 	use tightbeam::x509::Certificate;
 	use tightbeam::TightBeamError;
 
@@ -425,7 +426,7 @@ mod cms_pair {
 	pub fn cms_client_config<P: HandshakeProvider>(
 		server: &Arc<Certificate>,
 		store: Arc<dyn CertificateTrust>,
-		identity: ClientIdentity<P>,
+		identity: SigningIdentity,
 	) -> ClientConfig<Cms, P> {
 		let pinned = CmsServerIdentity::Certificate(Arc::clone(server));
 		let trust = ProvisionedTrust { identity: pinned, store };
@@ -438,9 +439,8 @@ mod cms_pair {
 		materials: &ServerMaterials,
 		profiles: impl IntoIterator<Item = SecurityProfileDesc>,
 	) -> ServerConfig<Cms, P> {
-		let key = Arc::clone(&materials.key_provider);
 		let profiles = SupportedProfiles::new(profiles).expect("a server fixture runs at least one profile");
-		ServerConfig::new(CmsServerSettings, key, profiles)
+		ServerConfig::new(CmsServerSettings, materials.identity(), profiles)
 	}
 
 	/// A CMS client and server over the fixture server identity, beside the

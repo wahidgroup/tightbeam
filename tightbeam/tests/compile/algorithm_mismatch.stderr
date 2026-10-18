@@ -1,5 +1,5 @@
 error[E0271]: type mismatch resolving `<AesGcm<Aes256, UInt<UInt<UInt<UInt<UTerm, B1>, B1>, B0>, B0>> as AeadAlgorithm>::Oid == Aes128GcmOid`
-  --> tests/compile/algorithm_mismatch.rs:42:4
+  --> tests/compile/algorithm_mismatch.rs:44:4
    |
-42 |         .with_aead(cipher);
+44 |         .with_aead(cipher);
    |          ^^^^^^^^^ expected `Aes128GcmOid`, found `Aes256GcmOid`

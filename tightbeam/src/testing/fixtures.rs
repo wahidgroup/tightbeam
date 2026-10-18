@@ -5,11 +5,9 @@
 
 use std::sync::Arc;
 
-use crate::asn1::{
-	AlgorithmIdentifier, AlgorithmIdentifierOwned, DigestInfo, Frame, ObjectIdentifier, OctetString, SignerInfo,
-};
+use crate::asn1::{AlgorithmIdentifier, AlgorithmIdentifierOwned, DigestInfo, Frame, ObjectIdentifier, OctetString};
 use crate::der::Sequence;
-use crate::oids::{HASH_SHA256, HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA3_256};
+use crate::oids::HASH_SHA256;
 use crate::Beamable;
 use crate::{decode, Message, Version};
 
@@ -55,6 +53,21 @@ mod x509_certs {
 #[cfg(feature = "x509")]
 use x509_certs::*;
 
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+mod sha3_512_profile {
+	pub use crate::crypto::aead::Aes256GcmOid;
+	pub use crate::crypto::hash::Sha3_512;
+	pub use crate::crypto::kdf::HkdfSha3_256;
+	pub use crate::crypto::profiles::{
+		AeadProvider, Aes256Wrap, CryptoProvider, CurveProvider, DigestProvider, HpkeProvider, KdfProvider,
+		KeyWrapProvider, SecurityProfile, SigningProvider,
+	};
+	pub use crate::crypto::sign::ecdsa::Secp256k1VerifyingKey;
+}
+
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use sha3_512_profile::*;
+
 /// A simple message that the tests encode and send.
 #[derive(Beamable, Clone, Debug, PartialEq, Sequence)]
 pub struct TestMessage {
@@ -97,15 +110,19 @@ use signing::*;
 
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 mod cert {
-	pub use crate::crypto::sign::ecdsa::{Secp256k1, Signature};
-	pub use crate::crypto::sign::CanonicalSigner;
+	pub use crate::crypto::key::Secp256k1KeyProvider;
+	pub use crate::crypto::sign::ecdsa::Secp256k1Signature;
+	pub use crate::crypto::sign::{CanonicalSigner, CertifiedKey, SignatureEncoding, SigningIdentity};
+	pub use crate::crypto::x509::utils::Skid;
 	pub use crate::der::asn1::{BitString, Ia5String, PrintableString, SetOfVec, UtcTime};
 	pub use crate::der::oid::AssociatedOid;
 	pub use crate::der::{Any, Decode, Encode};
 	pub use crate::error::Result as TbResult;
-	pub use crate::spki::{EncodePublicKey, SubjectPublicKeyInfoOwned};
+	pub use crate::oids::SIGNER_ECDSA_WITH_SHA3_256;
+	pub use crate::spki::SubjectPublicKeyInfoOwned;
 	pub use crate::x509::attr::AttributeTypeAndValue;
 	pub use crate::x509::ext::pkix::name::GeneralName;
+	pub use crate::x509::ext::pkix::{AuthorityKeyIdentifier, SubjectKeyIdentifier};
 	pub use crate::x509::ext::pkix::{BasicConstraints, KeyUsage, KeyUsages, SubjectAltName};
 	pub use crate::x509::ext::Extension;
 	pub use crate::x509::name::{RdnSequence, RelativeDistinguishedName};
@@ -158,8 +175,53 @@ fn test_uri_san_extension(uris: &[&str]) -> Extension {
 	test_extension(&SubjectAltName(names))
 }
 
+/// The SubjectPublicKeyInfo of `key`'s public half.
+#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+fn test_public_key(key: &SigningKey) -> SubjectPublicKeyInfoOwned {
+	SubjectPublicKeyInfoOwned::from_key(*key.verifying_key()).expect("a test key encodes to an SPKI")
+}
+
+/// The key identifier extensions of a certificate for `subject_key` that
+/// `issuer_key` signs, by RFC 7093 §2 method 1.
+///
+/// The `subjectKeyIdentifier` is always present (RFC 5280 §4.2.1.2). The
+/// `authorityKeyIdentifier` names the issuer's key when another key signs
+/// (RFC 5280 §4.2.1.1). Both are non-critical.
+#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+fn test_key_identifiers(subject_key: &SigningKey, issuer_key: &SigningKey) -> Vec<Extension> {
+	let subject_identifier = Skid::of_public_key(&test_public_key(subject_key));
+	let subject_key_identifier =
+		SubjectKeyIdentifier::try_from(subject_identifier).expect("a 20-byte identifier wraps in an OctetString");
+
+	let mut extensions = vec![test_noncritical_extension(&subject_key_identifier)];
+	if subject_key.verifying_key() == issuer_key.verifying_key() {
+		return extensions;
+	}
+
+	let issuer_identifier = Skid::of_public_key(&test_public_key(issuer_key));
+	let key_identifier = OctetString::new(issuer_identifier.as_bytes().as_slice())
+		.expect("a 20-byte identifier wraps in an OctetString");
+	let authority = AuthorityKeyIdentifier {
+		key_identifier: Some(key_identifier),
+		authority_cert_issuer: None,
+		authority_cert_serial_number: None,
+	};
+
+	extensions.push(test_noncritical_extension(&authority));
+	extensions
+}
+
+/// The `keyUsage` of an end-entity test certificate, which signs and opens a
+/// KEM's encapsulation as a CMS server does (RFC 5480 §3, RFC 9629 §3).
+#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+fn test_end_entity_key_usage() -> Extension {
+	test_extension(&KeyUsage(KeyUsages::DigitalSignature | KeyUsages::KeyAgreement))
+}
+
 /// Builds a certificate for `subject_key` under `subject`, signed by
 /// `issuer_key` under `issuer`, with a real signature.
+///
+/// The key identifier extensions come first, ahead of `extensions`.
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 fn issue_test_certificate(
 	issuer_key: &SigningKey,
@@ -168,9 +230,10 @@ fn issue_test_certificate(
 	subject: RdnSequence,
 	extensions: Vec<Extension>,
 ) -> TbResult<Certificate> {
-	let public_key_der = subject_key.verifying_key().to_public_key_der()?;
-	let subject_public_key_info = SubjectPublicKeyInfoOwned::from_der(public_key_der.as_bytes())?;
+	let subject_public_key_info = test_public_key(subject_key);
 	let algorithm = test_signature_algorithm();
+	let mut all_extensions = test_key_identifiers(subject_key, issuer_key);
+	all_extensions.extend(extensions);
 
 	let tbs = TbsCertificate {
 		version: X509Version::V3,
@@ -182,7 +245,7 @@ fn issue_test_certificate(
 		subject_public_key_info,
 		issuer_unique_id: None,
 		subject_unique_id: None,
-		extensions: Some(extensions),
+		extensions: Some(all_extensions),
 	};
 
 	sign_test_certificate(tbs, &algorithm, issuer_key)
@@ -197,19 +260,18 @@ fn test_certificate_with_extensions(signing_key: &SigningKey, extensions: Option
 }
 
 /// Builds a placeholder-signed test certificate with `name` as both the subject
-/// and the issuer, a fixed serial, and caller-chosen extensions.
+/// and the issuer, a fixed serial, its key identifier, and caller-chosen
+/// extensions after it.
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 fn test_certificate_named(
 	signing_key: &SigningKey,
 	name: RdnSequence,
 	extensions: Option<Vec<Extension>>,
 ) -> Certificate {
-	let verifying_key = *signing_key.verifying_key();
-	let public_key_der = verifying_key
-		.to_public_key_der()
-		.expect("test verifying key encodes to SPKI DER");
-	let subject_public_key_info =
-		SubjectPublicKeyInfoOwned::from_der(public_key_der.as_bytes()).expect("freshly encoded SPKI re-decodes");
+	let subject_public_key_info = test_public_key(signing_key);
+	let mut all_extensions = test_key_identifiers(signing_key, signing_key);
+	all_extensions.push(test_end_entity_key_usage());
+	all_extensions.extend(extensions.into_iter().flatten());
 
 	let algorithm = test_signature_algorithm();
 	let validity = test_validity().expect("fixed test validity window is valid");
@@ -226,13 +288,14 @@ fn test_certificate_named(
 		subject_public_key_info,
 		issuer_unique_id: None,
 		subject_unique_id: None,
-		extensions,
+		extensions: Some(all_extensions),
 	};
 
 	Certificate { tbs_certificate, signature_algorithm: algorithm, signature }
 }
 
-/// Wrap a DER-encodable extension value in an `Extension` (RFC 5280 §4.2).
+/// Wrap a DER-encodable extension value in a critical `Extension` (RFC 5280
+/// §4.2).
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 fn test_extension<T>(value: &T) -> Extension
 where
@@ -241,6 +304,18 @@ where
 	let extn_value = OctetString::new(value.to_der().expect("extension value encodes to DER"))
 		.expect("DER bytes wrap in an OctetString");
 	Extension { extn_id: T::OID, critical: true, extn_value }
+}
+
+/// Wrap a DER-encodable extension value in a non-critical `Extension`, the
+/// form RFC 5280 §4.2.1.1 and §4.2.1.2 give a key identifier.
+#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+fn test_noncritical_extension<T>(value: &T) -> Extension
+where
+	T: AssociatedOid + Encode,
+{
+	let extn_value = OctetString::new(value.to_der().expect("extension value encodes to DER"))
+		.expect("DER bytes wrap in an OctetString");
+	Extension { extn_id: T::OID, critical: false, extn_value }
 }
 
 /// A certificate chain in which a root signs an intermediate and the
@@ -278,6 +353,8 @@ fn test_cn_name(cn: impl AsRef<str>) -> TbResult<RdnSequence> {
 }
 
 /// Sign `tbs` with `key` under the test ECDSA-SHA3-256 algorithm.
+///
+/// The `signatureValue` is the DER `ECDSA-Sig-Value` (RFC 3279 §2.2.3).
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 fn sign_test_certificate(
 	tbs: TbsCertificate,
@@ -285,7 +362,7 @@ fn sign_test_certificate(
 	key: &SigningKey,
 ) -> TbResult<Certificate> {
 	let tbs_der = tbs.to_der()?;
-	let signature: Signature<Secp256k1> = key.sign_canonical::<Sha3_256>(&tbs_der)?;
+	let signature: Secp256k1Signature = key.sign_canonical::<Sha3_256>(&tbs_der)?;
 
 	let certificate = Certificate {
 		tbs_certificate: tbs,
@@ -524,6 +601,37 @@ impl TestFrame {
 		crate::der::Decode::from_der(&encoded).expect("a same-length rewrite still decodes")
 	}
 
+	/// Returns `frame` with its signature's `s` flipped to `n - s`.
+	///
+	/// ECDSA verifies both values (SEC 1 v2.0 §4.1.4), so a test models a
+	/// relay that rewrites a captured signature this way. The flipped
+	/// `SignerInfo` enters through the DER decoder, as it would off the wire.
+	#[cfg(all(feature = "secp256k1", feature = "signature"))]
+	pub fn with_flipped_s(frame: &Frame) -> Frame {
+		use crate::crypto::sign::ecdsa::{Secp256k1, Secp256k1Signature, Signature};
+		use crate::crypto::sign::Signed;
+		use crate::der::{Decode, Encode};
+		use crate::SignerInfo;
+
+		let signed = frame.nonrepudiation().expect("the frame carries a signature");
+		let signer_info = signed.as_ref().clone();
+		let der = Secp256k1Signature::from_bytes(signer_info.signature.as_bytes()).expect("the signature is DER");
+		let scalars = Signature::<Secp256k1>::try_from(der).expect("a DER signature holds two scalars");
+		let (r, s) = scalars.split_scalars();
+		let high = Signature::<Secp256k1>::from_scalars(r, -s).expect("n - s is a scalar");
+		let signature = OctetString::new(high.to_der().as_bytes()).expect("a signature wraps in an OCTET STRING");
+
+		let flipped = SignerInfo { signature, ..signer_info };
+		let flipped_der = flipped.to_der().expect("the SignerInfo encodes");
+		let decoded = Signed::<SignerInfo>::from_der(&flipped_der).expect("the SignerInfo decodes");
+
+		let mut rewritten = frame.clone();
+		rewritten
+			.attach_signer_info(decoded)
+			.expect("the frame version carries a signature");
+		rewritten
+	}
+
 	/// Returns the DER of `container` with the version of its embedded `frame`
 	/// rewritten to `version`.
 	///
@@ -568,6 +676,15 @@ impl TestKey {
 		let secret_bytes = [1u8; 32];
 		SigningKey::from_bytes(&secret_bytes.into()).expect("Failed to create signing key")
 	}
+
+	/// The RFC 7093 §2 method 1 key identifier of the public key of
+	/// [`Self::insecure_fixed_signing`]: the leftmost 160 bits of SHA-256 of
+	/// the uncompressed point `04 1b84c556..dd078f 70beaf8f..69a8e8d1`. An
+	/// independent computation (Python's `hashlib`) gave this value.
+	pub const INSECURE_FIXED_KEY_IDENTIFIER: [u8; 20] = [
+		0xc0, 0xc5, 0xe0, 0xd9, 0x27, 0xe4, 0xcc, 0xbb, 0x5b, 0xbf, 0x03, 0xd5, 0x0d, 0xae, 0x76, 0xa7, 0x91, 0x14,
+		0xa2, 0x96,
+	];
 
 	/// Returns the AES-256-GCM key made of thirty-two `0x33` bytes, with its
 	/// cipher.
@@ -623,6 +740,18 @@ impl TestCertificate {
 		test_certificate_named_with_uri_sans(signing_key, name, uris)
 	}
 
+	/// `certificate` with its `subjectKeyIdentifier` extension value written
+	/// as `identifier`, which a method other than the crate's may have derived.
+	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+	pub fn with_key_identifier(mut certificate: Certificate, identifier: SubjectKeyIdentifier) -> Certificate {
+		let value = identifier.to_der().expect("the identifier encodes");
+		let extn_value = OctetString::new(value).expect("the identifier wraps");
+		let extensions = certificate.tbs_certificate.extensions.get_or_insert_with(Vec::new);
+		extensions.retain(|extension| extension.extn_id != SubjectKeyIdentifier::OID);
+		extensions.push(Extension { extn_id: SubjectKeyIdentifier::OID, critical: false, extn_value });
+		certificate
+	}
+
 	/// Build CA issuer extensions: `basicConstraints` (RFC 5280 §4.2.1.9) and
 	/// `keyUsage` (§4.2.1.3), as required for certificate-path validation.
 	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
@@ -670,7 +799,7 @@ impl TestCertificate {
 	) -> TbResult<Certificate> {
 		let issuer = test_cn_name(issuer_cn)?;
 		let subject = test_cn_name(cn)?;
-		let extensions = vec![test_uri_san_extension(uris)];
+		let extensions = vec![test_end_entity_key_usage(), test_uri_san_extension(uris)];
 		issue_test_certificate(issuer_key, issuer, signing_key, subject, extensions)
 	}
 
@@ -703,8 +832,10 @@ impl TestCertificate {
 		let algorithm = test_signature_algorithm();
 
 		// The root certificate is self-signed.
-		let root_pub_der = root_key.verifying_key().to_public_key_der()?;
-		let subject_public_key_info = SubjectPublicKeyInfoOwned::from_der(root_pub_der.as_bytes())?;
+		let subject_public_key_info = test_public_key(&root_key);
+		let mut root_extensions = test_key_identifiers(&root_key, &root_key);
+		root_extensions.extend(TestCertificate::ca_extensions(true, true, None));
+
 		let root_tbs = TbsCertificate {
 			version: X509Version::V3,
 			serial_number: SerialNumber::new(&[1])?,
@@ -717,13 +848,15 @@ impl TestCertificate {
 			subject_unique_id: None,
 			// RFC 5280 §6.1.4(k),(n): the root is a CA permitted to sign
 			// certificates.
-			extensions: Some(TestCertificate::ca_extensions(true, true, None)),
+			extensions: Some(root_extensions),
 		};
 		let root = sign_test_certificate(root_tbs, &algorithm, &root_key)?;
 
 		// The root signs the intermediate certificate.
-		let inter_pub_der = intermediate_key.verifying_key().to_public_key_der()?;
-		let subject_public_key_info = SubjectPublicKeyInfoOwned::from_der(inter_pub_der.as_bytes())?;
+		let subject_public_key_info = test_public_key(&intermediate_key);
+		let mut intermediate_extensions = test_key_identifiers(&intermediate_key, &root_key);
+		intermediate_extensions.extend(TestCertificate::ca_extensions(true, true, None));
+
 		let inter_tbs = TbsCertificate {
 			version: X509Version::V3,
 			serial_number: SerialNumber::new(&[2])?,
@@ -736,13 +869,16 @@ impl TestCertificate {
 			subject_unique_id: None,
 			// RFC 5280 §6.1.4(k),(n): the intermediate is a CA permitted to
 			// sign certificates.
-			extensions: Some(TestCertificate::ca_extensions(true, true, None)),
+			extensions: Some(intermediate_extensions),
 		};
+
 		let intermediate = sign_test_certificate(inter_tbs, &algorithm, &root_key)?;
 
 		// The intermediate signs the leaf certificate.
-		let leaf_pub_der = leaf_key.verifying_key().to_public_key_der()?;
-		let subject_public_key_info = SubjectPublicKeyInfoOwned::from_der(leaf_pub_der.as_bytes())?;
+		let subject_public_key_info = test_public_key(&leaf_key);
+		let mut leaf_extensions = test_key_identifiers(&leaf_key, &intermediate_key);
+		leaf_extensions.push(test_end_entity_key_usage());
+
 		let leaf_tbs = TbsCertificate {
 			version: X509Version::V3,
 			serial_number: SerialNumber::new(&[3])?,
@@ -753,7 +889,7 @@ impl TestCertificate {
 			subject_public_key_info,
 			issuer_unique_id: None,
 			subject_unique_id: None,
-			extensions: None,
+			extensions: Some(leaf_extensions),
 		};
 		let leaf = sign_test_certificate(leaf_tbs, &algorithm, &intermediate_key)?;
 
@@ -808,34 +944,88 @@ impl TestCertificate {
 
 /// Signer material for CMS structures.
 ///
-/// The material is fixed placeholder bytes, because these tests exercise the
-/// encoding and leave the signature unchecked.
+/// The CMS signer signs fixed placeholder content under the fixed test key,
+/// because these tests exercise the encoding of a frame's signature slot.
+#[cfg(all(feature = "secp256k1", feature = "signature"))]
 pub struct TestSigner;
 
+#[cfg(all(feature = "secp256k1", feature = "signature"))]
 impl TestSigner {
-	pub fn info() -> SignerInfo {
-		use crate::cms::content_info::CmsVersion;
-		use crate::cms::signed_data::SignerIdentifier;
-		use crate::x509::ext::pkix::SubjectKeyIdentifier;
+	/// A `SignerInfo` the CMS signer built over placeholder content.
+	pub fn info() -> crate::crypto::sign::Signed<crate::SignerInfo> {
+		use crate::crypto::sign::{CmsSigner, SignedContent};
 
-		let version = CmsVersion::V1;
-		let skid = OctetString::new([0u8; 20]).expect("20-byte SKID wraps in an OctetString");
-		let sid = SignerIdentifier::SubjectKeyIdentifier(SubjectKeyIdentifier::from(skid));
-		let digest_alg = AlgorithmIdentifierOwned { oid: HASH_SHA3_256, parameters: None };
-		let signed_attrs = None;
-		let signature_algorithm = AlgorithmIdentifierOwned { oid: SIGNER_ECDSA_WITH_SHA3_256, parameters: None };
-		let signature = OctetString::new([0u8; 64]).expect("64-byte placeholder wraps in an OctetString");
-		let unsigned_attrs = None;
+		let key = TestIdentity::certified(TestKey::insecure_fixed_signing());
+		let content = SignedContent::data(b"test signer content");
+		CmsSigner::sign_with::<Secp256k1Signature, _>(&key, content).expect("the fixed test key signs")
+	}
+}
 
-		SignerInfo {
-			version,
-			sid,
-			digest_alg,
-			signed_attrs,
-			signature_algorithm,
-			signature,
-			unsigned_attrs,
-		}
+/// Reads on the signed attributes of a `SignerInfo`, which the signed
+/// structure tests share.
+#[cfg(feature = "signature")]
+pub struct TestAttributes;
+
+#[cfg(feature = "signature")]
+impl TestAttributes {
+	/// The algorithm protection of `id-sha3-256` beside `ecdsa-with-SHA3-256`
+	/// as RFC 6211 §2 writes it under `DEFINITIONS IMPLICIT TAGS`, built by
+	/// hand: the `[1]` tag replaces the SEQUENCE tag of the second
+	/// AlgorithmIdentifier.
+	pub const ALGORITHM_PROTECTION: [u8; 28] = [
+		0x30, 0x1a, 0x30, 0x0b, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x08, 0xa1, 0x0b, 0x06,
+		0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x0a,
+	];
+
+	/// The OIDs of the signed attributes of `signer_info`, in DER order.
+	pub fn oids(signer_info: &crate::SignerInfo) -> Vec<crate::der::asn1::ObjectIdentifier> {
+		let attributes = signer_info.signed_attrs.as_ref().expect("the signer writes signed attributes");
+		attributes.iter().map(|attribute| attribute.oid).collect()
+	}
+
+	/// The one value of the signed attribute of `signer_info` under `oid`.
+	pub fn value(signer_info: &crate::SignerInfo, oid: crate::der::asn1::ObjectIdentifier) -> crate::der::Any {
+		let attributes = signer_info.signed_attrs.as_ref().expect("the signer writes signed attributes");
+		let mut matching = attributes.iter().filter(|attribute| attribute.oid == oid);
+		let attribute = matching.next().expect("the signer writes the attribute");
+		let value = attribute.values.iter().next().expect("the attribute holds a value");
+		value.clone()
+	}
+}
+
+/// Signing identities, each a certificate beside the key that proves it.
+#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+pub struct TestIdentity;
+
+#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+impl TestIdentity {
+	/// The identity of `key` under the placeholder-signed
+	/// [`TestCertificate::self_signed`] certificate.
+	pub fn of(key: &SigningKey) -> SigningIdentity {
+		let certificate = TestCertificate::self_signed(key);
+		TestIdentity::presenting(certificate, key)
+	}
+
+	/// The identity of `certificate`, whose key is `key`.
+	pub fn presenting(certificate: impl Into<Arc<Certificate>>, key: &SigningKey) -> SigningIdentity {
+		let provider = Arc::new(Secp256k1KeyProvider::from(key.clone()));
+		SigningIdentity::new(certificate, provider).expect("the test key matches its certificate")
+	}
+
+	/// The identity of [`TestKey::insecure_fixed_signing`].
+	///
+	/// # Security
+	///
+	/// The key is public, so every signature it makes is forgeable.
+	pub fn insecure_fixed() -> SigningIdentity {
+		TestIdentity::of(&TestKey::insecure_fixed_signing())
+	}
+
+	/// `key` beside the placeholder-signed [`TestCertificate::self_signed`]
+	/// certificate, for a builder that signs in place.
+	pub fn certified(key: SigningKey) -> CertifiedKey<SigningKey> {
+		let certificate = TestCertificate::self_signed(&key);
+		CertifiedKey::new(&certificate, key).expect("the test key matches its certificate")
 	}
 }
 
@@ -847,6 +1037,76 @@ impl TestDigest {
 		let digest = OctetString::new(vec![0u8; 32]).expect("Failed to create OctetString");
 		DigestInfo { algorithm: AlgorithmIdentifier { oid: HASH_SHA256, parameters: None }, digest }
 	}
+}
+
+/// The default profile with SHA3-512 as its digest: AES-256-GCM, ECDSA over
+/// secp256k1 with SHA3-256, HKDF-SHA3-256, and AES-256 key wrap.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Aes256Sha3_512Profile;
+
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+impl SecurityProfile for Aes256Sha3_512Profile {
+	type Digest = Sha3_512;
+	type AeadOid = Aes256GcmOid;
+	type SignatureAlg = Secp256k1Signature;
+	type Kdf = HkdfSha3_256;
+	type Curve = k256::Secp256k1;
+	type KeyWrapOid = Aes256Wrap;
+}
+
+/// A provider that runs [`Aes256Sha3_512Profile`], so a handshake under it
+/// hashes its transcript with SHA3-512.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Aes256Sha3_512Provider {
+	profile: Aes256Sha3_512Profile,
+}
+
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+impl DigestProvider for Aes256Sha3_512Provider {
+	type Digest = Sha3_512;
+}
+
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+impl AeadProvider for Aes256Sha3_512Provider {
+	type AeadCipher = Aes256Gcm;
+}
+
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+impl KeyWrapProvider for Aes256Sha3_512Provider {
+	type KeyWrap = Aes256Wrap;
+}
+
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+impl SigningProvider for Aes256Sha3_512Provider {
+	type Signature = Secp256k1Signature;
+	type VerifyingKey = Secp256k1VerifyingKey;
+}
+
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+impl KdfProvider for Aes256Sha3_512Provider {
+	type Kdf = HkdfSha3_256;
+}
+
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+impl CurveProvider for Aes256Sha3_512Provider {
+	type Curve = k256::Secp256k1;
+}
+
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+impl CryptoProvider for Aes256Sha3_512Provider {
+	type Profile = Aes256Sha3_512Profile;
+	type Kem = crate::crypto::hpke::DhKemSecp256k1;
+
+	fn profile(&self) -> &Self::Profile {
+		&self.profile
+	}
+}
+
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+impl HpkeProvider for Aes256Sha3_512Provider {
+	type HpkeSuite = crate::crypto::hpke::HpkeSecp256k1Sha3Aes256Gcm;
 }
 
 #[cfg(test)]

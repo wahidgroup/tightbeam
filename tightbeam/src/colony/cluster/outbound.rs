@@ -9,18 +9,18 @@ use std::sync::Arc;
 use crate::colony::cluster::ClusterTlsConfig;
 use crate::crypto::policy::VerificationPolicy;
 use crate::crypto::profiles::DefaultCryptoProvider;
+use crate::crypto::sign::SigningIdentity;
 use crate::crypto::x509::error::CertificateValidationError;
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::crypto::x509::store::CertificateTrust;
 use crate::crypto::x509::Certificate;
+use crate::spki::SubjectPublicKeyInfoOwned;
 use crate::transport::client::{ConnectionBuilder, ConnectionPool, PoolConfig};
-use crate::transport::handshake::HandshakeKeyManager;
 use crate::transport::Protocol;
 use crate::utils::time::Clock;
 use crate::TightBeamError;
 
 type ClusterPool<P> = ConnectionPool<P>;
-type ClusterKey = HandshakeKeyManager<DefaultCryptoProvider>;
 
 /// The hive pool plus the optional peer-plane pool.
 ///
@@ -104,6 +104,10 @@ impl CertificateTrust for ValidatedTrust {
 		self.store.find_by_signer_identifier(sid)
 	}
 
+	fn find_by_public_key(&self, spki: &SubjectPublicKeyInfoOwned) -> Option<&Certificate> {
+		self.store.find_by_public_key(spki)
+	}
+
 	fn to_policy_ref(&self) -> &dyn VerificationPolicy {
 		self.store.to_policy_ref()
 	}
@@ -125,14 +129,12 @@ fn validated_trust(
 }
 
 impl PoolConfig {
-	/// One outbound pool on this configuration, presenting `certificate`
-	/// and `key`, validating servers against `trust`, and measuring time on
-	/// `clock`.
+	/// One outbound pool on this configuration, presenting `identity`,
+	/// validating servers against `trust`, and measuring time on `clock`.
 	fn build_one<P>(
 		&self,
 		clock: &Arc<dyn Clock>,
-		certificate: Arc<Certificate>,
-		key: Arc<ClusterKey>,
+		identity: SigningIdentity,
 		trust: Option<Arc<dyn CertificateTrust>>,
 	) -> Arc<ClusterPool<P>>
 	where
@@ -145,7 +147,7 @@ impl PoolConfig {
 		let mut builder = ClusterPool::<P>::builder()
 			.with_config(self.clone())
 			.with_clock(Arc::clone(clock))
-			.with_shared_client_identity(certificate, key);
+			.with_client_identity(identity);
 
 		if let Some(store) = trust {
 			builder = builder.with_trust_store(store);
@@ -171,11 +173,10 @@ impl PoolConfig {
 		P::Address: core::hash::Hash + Eq + Clone + Send + Sync,
 		P::Transport: Send + Sync,
 	{
-		let (certificate, key) = tls.identity().parts();
+		let identity = tls.identity();
 		let hive_pool = self.build_one::<P>(
 			clock,
-			Arc::clone(&certificate),
-			Arc::clone(&key),
+			identity.clone(),
 			tls.hive_trust
 				.as_ref()
 				.map(|trust| validated_trust(Arc::clone(trust), &tls.validators)),
@@ -183,8 +184,7 @@ impl PoolConfig {
 		let peer_pool = tls.peer_trust.as_ref().map(|trust| {
 			self.build_one::<P>(
 				clock,
-				Arc::clone(&certificate),
-				Arc::clone(&key),
+				identity.clone(),
 				Some(validated_trust(Arc::clone(trust), &tls.validators)),
 			)
 		});
@@ -209,7 +209,7 @@ mod tests {
 	}
 
 	fn trust_of(cert: &Certificate) -> Arc<dyn CertificateTrust> {
-		let store = CertificateTrustBuilder::from(Secp256k1Policy)
+		let store = CertificateTrustBuilder::from(Secp256k1Policy::default())
 			.with_certificate(cert.clone())
 			.expect("test certificates satisfy the trust builder")
 			.build();
