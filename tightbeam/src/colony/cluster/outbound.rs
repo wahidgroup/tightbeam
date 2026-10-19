@@ -90,15 +90,16 @@ impl CertificateTrust for ValidatedTrust {
 		self.store.is_trusted(cert)
 	}
 
-	fn verify_chain(&self, chain: &[Certificate]) -> Result<(), CertificateValidationError> {
-		self.store.verify_chain(chain)?;
+	fn verify_chain(&self, chain: &[Certificate]) -> Result<Arc<Certificate>, CertificateValidationError> {
+		let anchor = self.store.verify_chain(chain)?;
 
 		// The chain is anchor-first, so the dialed server identity is the
 		// last entry. Operator validators target that leaf rather than an
 		// intermediate, so a pin on the server certificate cannot false-fail
 		// on a CA.
 		let leaf = chain.last().ok_or(CertificateValidationError::EmptyChain)?;
-		self.validate_leaf(leaf)
+		self.validate_leaf(leaf)?;
+		Ok(anchor)
 	}
 
 	fn trust_anchor(&self, cert: &Certificate) -> Result<Arc<Certificate>, CertificateValidationError> {
@@ -210,6 +211,11 @@ mod tests {
 	use crate::crypto::x509::store::{CertificateTrustBuilder, TrustBuilder};
 	use crate::testing::{TestCertificate, TestKey};
 
+	#[cfg(feature = "transport-cms")]
+	use crate::testing::TestCmsServer;
+	#[cfg(feature = "transport-cms")]
+	use crate::transport::handshake::{CmsServerChain, CmsServerIdentity, HandshakeError, ProvisionedTrust};
+
 	struct RejectAll;
 
 	impl CertificateValidation for RejectAll {
@@ -260,6 +266,47 @@ mod tests {
 		let composed = validated_trust(trust_of(&cert), &[Arc::new(RejectAll)]);
 
 		let refused = composed.trust_anchor(&cert);
+		assert!(matches!(refused, Err(CertificateValidationError::CertificateDenied)));
+	}
+
+	/// An operator validator that admits the one certificate it pins, as a
+	/// pin on the dialed server's key does.
+	#[cfg(feature = "transport-cms")]
+	struct PinnedLeaf(Certificate);
+
+	#[cfg(feature = "transport-cms")]
+	impl CertificateValidation for PinnedLeaf {
+		fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
+			let pinned = *cert == self.0;
+			pinned.then_some(()).ok_or(CertificateValidationError::CertificateDenied)
+		}
+	}
+
+	/// A pin on the key-agreement leaf admits a pinned chain of that leaf,
+	/// because the operator validators read the leaf and never the anchor.
+	#[cfg(feature = "transport-cms")]
+	#[test]
+	fn a_leaf_pin_admits_a_pinned_chain_of_its_leaf() -> Result<(), HandshakeError> {
+		let server = TestCmsServer::generate("pinned chain server");
+		let pin: Arc<dyn CertificateValidation> = Arc::new(PinnedLeaf(server.key_agreement.to_owned()));
+		let composed = validated_trust(trust_of(&server.authority), &[pin]);
+
+		let chain = CmsServerChain::new([server.authority.to_owned(), server.key_agreement.to_owned()])?;
+		ProvisionedTrust::new(CmsServerIdentity::Chain(chain), composed)?;
+		Ok(())
+	}
+
+	/// The same pin refuses a chain whose leaf is another certificate, so the
+	/// validators still read the leaf of the chain.
+	#[cfg(feature = "transport-cms")]
+	#[test]
+	fn a_leaf_pin_refuses_a_chain_of_another_leaf() {
+		let server = TestCmsServer::generate("pinned chain server");
+		let pin: Arc<dyn CertificateValidation> = Arc::new(PinnedLeaf(server.key_agreement.to_owned()));
+		let composed = validated_trust(trust_of(&server.authority), &[pin]);
+
+		let chain = [server.authority.to_owned(), server.signing.to_owned()];
+		let refused = composed.verify_chain(&chain);
 		assert!(matches!(refused, Err(CertificateValidationError::CertificateDenied)));
 	}
 }

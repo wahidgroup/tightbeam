@@ -204,7 +204,7 @@ impl CertificateTrust for SwitchTrust {
 		self.current().is_trusted(cert)
 	}
 
-	fn verify_chain(&self, chain: &[Certificate]) -> Result<(), CertificateValidationError> {
+	fn verify_chain(&self, chain: &[Certificate]) -> Result<Arc<Certificate>, CertificateValidationError> {
 		self.current().verify_chain(chain)
 	}
 

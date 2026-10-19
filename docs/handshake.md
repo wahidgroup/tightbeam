@@ -19,12 +19,12 @@ This page specifies how two TightBeam endpoints establish a session: the message
 
 TightBeam has two handshake flows. Both send three messages, encode every message as a CMS type (RFC 5652), and close the same way.
 
-|                     | HPKE flow                                                           | CMS flow                                                                                       |
-| ------------------- | ------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| Shape               | The TLS 1.3 handshake (RFC 9846) in CMS containers                  | The client seals its first message to the server's key-agreement certificate                   |
-| First message       | The hello: a `ContentInfo` of type `id-data` with the `ClientHello` | The opening: an `AuthEnvelopedData` with the base secret and the client ephemeral              |
+|                     | HPKE flow                                                           | CMS flow                                                                                            |
+| ------------------- | ------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| Shape               | The TLS 1.3 handshake (RFC 9846) in CMS containers                  | The client seals its first message to the server's key-agreement certificate                        |
+| First message       | The hello: a `ContentInfo` of type `id-data` with the `ClientHello` | The opening: an `AuthEnvelopedData` with the base secret and the client ephemeral                   |
 | Server certificates | One signing certificate, sent in the reply                          | A signing certificate, sent in the server Finished, and a key-agreement certificate the client pins |
-| Handshake secret    | `ee`, the ECDH output of the two ephemerals                         | `ee \|\| base`, which adds the base secret of the opening                                     |
+| Handshake secret    | `ee`, the ECDH output of the two ephemerals                         | `ee \|\| base`, which adds the base secret of the opening                                           |
 
 ## Message flow
 
@@ -44,13 +44,13 @@ sequenceDiagram
 
 The HPKE flow claims these properties of RFC 9846 Appendix F.1:
 
-| Property                                                       | Claimed | Why                                                                                   |
-| -------------------------------------------------------------- | ------- | ------------------------------------------------------------------------------------- |
-| Server authentication before the client sends its identity     | Yes     | The client verifies the reply's signature over the transcript first                   |
-| Client identity protected from passive and active attackers    | Yes     | It travels only under a key of this handshake's ephemeral agreement                   |
-| Forward secrecy                                                | Yes     | The secret comes from two ephemerals alone                                            |
-| Server identity protected from a passive attacker              | No      | The signing certificate travels in clear in `certificates`                            |
-| Explicit server key confirmation                               | Yes     | The reply carries the server Finished, which the client verifies before it closes     |
+| Property                                                    | Claimed | Why                                                                               |
+| ----------------------------------------------------------- | ------- | --------------------------------------------------------------------------------- |
+| Server authentication before the client sends its identity  | Yes     | The client verifies the reply's signature over the transcript first               |
+| Client identity protected from passive and active attackers | Yes     | It travels only under a key of this handshake's ephemeral agreement               |
+| Forward secrecy                                             | Yes     | The secret comes from two ephemerals alone                                        |
+| Server identity protected from a passive attacker           | No      | The signing certificate travels in clear in `certificates`                        |
+| Explicit server key confirmation                            | Yes     | The reply carries the server Finished, which the client verifies before it closes |
 
 ### CMS flow
 
@@ -88,17 +88,18 @@ As in the HPKE flow, a passive observer reads the signing certificate. The openi
    5. It settles the receipt countersignature.
 
    So a client that derived another secret reaches no validator. A budget-bearing session activates only after the countersignature verifies. A refused settlement drops the handshake secret, so a replay of that message has nothing to complete.
+
 4. One `ProfilePolicy` negotiates the security profile. The server chooses from a `SupportedProfiles`, which cannot be empty (`NoSupportedProfiles`). The client refuses a reply that selects nothing (`InvalidProfileSelection`).
 
 ## Wire containers
 
 Every handshake message is one `HandshakeMessage`. Each variant holds a `WireDer`, the decoded value beside the bytes it was encoded or received as.
 
-| Variant             | Carries                                         | `TransportEnvelope` tag |
-| ------------------- | ----------------------------------------------- | ----------------------- |
-| `Data`              | The HPKE hello                                  | 8                       |
-| `SignedData`        | The HPKE reply, or the CMS server Finished      | 3                       |
-| `AuthEnvelopedData` | The CMS opening, or the closing of either flow  | 7                       |
+| Variant             | Carries                                        | `TransportEnvelope` tag |
+| ------------------- | ---------------------------------------------- | ----------------------- |
+| `Data`              | The HPKE hello                                 | 8                       |
+| `SignedData`        | The HPKE reply, or the CMS server Finished     | 3                       |
+| `AuthEnvelopedData` | The CMS opening, or the closing of either flow | 7                       |
 
 - Tags 2, 5, and 6 are reserved and never reused, so an archived capture never decodes to a stale meaning.
 - A step asks for the one container it expects (`data()`, `signed()`, or `auth_enveloped()`), and any other fails with `HandshakeError::UnexpectedContainer`.
@@ -109,19 +110,19 @@ Every handshake message is one `HandshakeMessage`. Each variant holds a `WireDer
 
 Every certificate is admitted for one use and one role before its key is read. `PeerCertificate<U>` is that admission, and `PeerCertificate::parse` is its one constructor.
 
-| Use               | Its readers                                                                                     | `keyUsage` bit                                                |
-| ----------------- | ----------------------------------------------------------------------------------------------- | ------------------------------------------------------------- |
-| `Signing<P>`      | The verifiers of the HPKE reply, the CMS server Finished, the client Finished, and the receipt | `digitalSignature`                                            |
-| `KeyAgreement<K>` | The CMS client that seals the opening, and `KeyAgreementIdentity::new`                          | `RecipientKem::USAGE` of `K`: `keyAgreement` for the house DHKEM |
-| `ErasedSigning`   | The trust store, and `SigningIdentity::with_provider`                                           | `digitalSignature`                                            |
+| Use               | Its readers                                                                                    | `keyUsage` bit                                                   |
+| ----------------- | ---------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| `Signing<P>`      | The verifiers of the HPKE reply, the CMS server Finished, the client Finished, and the receipt | `digitalSignature`                                               |
+| `KeyAgreement<K>` | The CMS client that seals the opening, and `KeyAgreementIdentity::new`                         | `RecipientKem::USAGE` of `K`: `keyAgreement` for the house DHKEM |
+| `ErasedSigning`   | The trust store, and `SigningIdentity::with_provider`                                          | `digitalSignature`                                               |
 
 The role is an `extendedKeyUsage` purpose (RFC 5280 § 4.2.1.12). `KeyPurposes` maps each role to one purpose, and `KeyPurposes::HOUSE` holds the defaults:
 
-| Role   | Its certificates                                    | House purpose                                 | Checked by                                                                    |
-| ------ | --------------------------------------------------- | --------------------------------------------- | ----------------------------------------------------------------------------- |
-| Server | The server's signing and key-agreement certificates | `id-kp-serverAuth`                            | The client's `ServerTrust`, and the server's own configuration, once          |
+| Role   | Its certificates                                    | House purpose                                 | Checked by                                                                     |
+| ------ | --------------------------------------------------- | --------------------------------------------- | ------------------------------------------------------------------------------ |
+| Server | The server's signing and key-agreement certificates | `id-kp-serverAuth`                            | The client's `ServerTrust`, and the server's own configuration, once           |
 | Client | The certificate of the client identity              | `id-kp-clientAuth`                            | The server when it opens the closing, and the client's own configuration, once |
-| Signer | The certificate of a frame or colony signer         | `KEY_PURPOSE_SIGNER`, `1.3.6.1.4.1.64586.3.1` | The trust store, when it resolves the signer of a frame                       |
+| Signer | The certificate of a frame or colony signer         | `KEY_PURPOSE_SIGNER`, `1.3.6.1.4.1.64586.3.1` | The trust store, when it resolves the signer of a frame                        |
 
 ```asn1
 id-tightbeam-kp-signer OBJECT IDENTIFIER ::= {
@@ -153,9 +154,9 @@ A CMS server holds two identities of one subject, each with its own key (NIST SP
 
 Each side holds the pair through one constructor, and both constructors call one decider, `CmsPairing::pairs_with`:
 
-| Side   | Constructor                                                                   | Refuses                                                                                              |
-| ------ | ----------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| Server | `CmsIdentityPair::new`, which `with_key_agreement` calls once                 | Two subjects (`SubjectMismatch`), one key in both (`KeyReuse`)                                       |
+| Side   | Constructor                                                                        | Refuses                                                                                              |
+| ------ | ---------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| Server | `CmsIdentityPair::new`, which `with_key_agreement` calls once                      | Two subjects (`SubjectMismatch`), one key in both (`KeyReuse`)                                       |
 | Client | `CmsServerPair::admit`, at each reply, over the carried and the pinned certificate | Two subjects (`SubjectMismatch`), one key in both (`KeyReuse`), two trust anchors (`AnchorMismatch`) |
 
 - **One key.** Two elliptic-curve keys of one curve and one x-coordinate are one key, in either SEC 1 encoding and under negation. Two keys of another kind are one key when their SubjectPublicKeyInfo is one.
@@ -169,7 +170,7 @@ An HPKE server holds one signing identity, and its secret derives from the two e
 
 ### Trust anchors and issuers
 
-- Two certificates name one trust anchor when the store's path validation of each ends at that anchor (RFC 5280 § 6.1.1 (d)). `CertificateTrust::trust_anchor` returns it, so a signing certificate under an intermediate pairs with a key-agreement certificate that the root issued.
+- Two certificates name one trust anchor when the store's path validation of each ends at that anchor (RFC 5280 § 6.1.1 (d)). `CertificateTrust::trust_anchor` returns it for a certificate, and `CertificateTrust::verify_chain` for a pinned chain. A signing certificate under an intermediate therefore pairs with a key-agreement certificate that the root issued, and a chain that starts at a held intermediate names the root above it.
 - The house store builds a path from the certificates it holds, and from no other source. The client's store must therefore hold every intermediate between the server's signing certificate and its anchor.
 - Of the held certificates of one name, the walk takes the first in the order of RFC 4158 § 3.5.12, and the signature check decides:
   1. A `subjectKeyIdentifier` equal to the `authorityKeyIdentifier` of the certificate below.
@@ -180,20 +181,20 @@ An HPKE server holds one signing identity, and its secret derives from the two e
 
 An endpoint must be able to authenticate its peer before it dials, or it must name cleartext (CWE-295). `DialableEncryption::new` runs this check, and every `SessionState` is built from one, so the builder, the connection pool, the colony dialers, and the `client!` macro share it.
 
-| Configuration                            | Sends frames                                | Reason                                         |
-| ---------------------------------------- | ------------------------------------------- | ---------------------------------------------- |
-| A trust store                            | Yes                                         | It authenticates the peer                      |
-| A provisioned CMS server trust           | Yes                                         | Its store authenticates the server             |
-| Client validators                        | Yes                                         | A mutual-auth server authenticates its client  |
-| A server certificate                     | Yes                                         | A server presents its own identity             |
-| A client identity alone                  | No: `PeerAuthenticationUnconfigured`        | It proves who the client is, not the server    |
-| A client identity and `allow_cleartext()` | Yes                                        | The risk is named                              |
+| Configuration                             | Sends frames                         | Reason                                        |
+| ----------------------------------------- | ------------------------------------ | --------------------------------------------- |
+| A trust store                             | Yes                                  | It authenticates the peer                     |
+| A provisioned CMS server trust            | Yes                                  | Its store authenticates the server            |
+| Client validators                         | Yes                                  | A mutual-auth server authenticates its client |
+| A server certificate                      | Yes                                  | A server presents its own identity            |
+| A client identity alone                   | No: `PeerAuthenticationUnconfigured` | It proves who the client is, not the server   |
+| A client identity and `allow_cleartext()` | Yes                                  | The risk is named                             |
 
 A frame leaves through one of two writers, and each reads the session phase:
 
-| Writer            | Rule                                                                                                                                  |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| `apply_wire_mode` | `Encrypted` sends under the session key, `Cleartext` sends in clear, and a pending handshake fails with `EncryptorUnavailable`        |
+| Writer            | Rule                                                                                                                                                       |
+| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `apply_wire_mode` | `Encrypted` sends under the session key, `Cleartext` sends in clear, and a pending handshake fails with `EncryptorUnavailable`                             |
 | `TransportWriter` | Takes its mode at `into_split`. An encrypted half owns the send key, a cleartext half needs a `Cleartext` phase, and a pending handshake refuses the split |
 
 ### Admit a client
@@ -230,13 +231,13 @@ confirm = HMAC-H(mac_c, transcript_hash)
 server  = HMAC-H(mac_s, transcript_hash || SignerInfo.signature)
 ```
 
-| Input  | What it is                                                                                                     |
-| ------ | -------------------------------------------------------------------------------------------------------------- |
-| `ee`   | The ECDH output of the client's ephemeral and the server's ephemeral                                           |
-| `base` | The 32-byte base secret that the CMS client seals to the key-agreement certificate. The HPKE flow has none     |
-| `S`    | The salt: `client_random \|\| server_random` for HPKE, the transcript hash for CMS                             |
-| `HKDF` | The profile's KDF, extract then expand under its own hash: HKDF-SHA3-256 in the default profile                |
-| `H`    | The negotiated digest, SHA3-256 in the default profile. `Hash.length` is its output length                     |
+| Input  | What it is                                                                                                 |
+| ------ | ---------------------------------------------------------------------------------------------------------- |
+| `ee`   | The ECDH output of the client's ephemeral and the server's ephemeral                                       |
+| `base` | The 32-byte base secret that the CMS client seals to the key-agreement certificate. The HPKE flow has none |
+| `S`    | The salt: `client_random \|\| server_random` for HPKE, the transcript hash for CMS                         |
+| `HKDF` | The profile's KDF, extract then expand under its own hash: HKDF-SHA3-256 in the default profile            |
+| `H`    | The negotiated digest, SHA3-256 in the default profile. `Hash.length` is its output length                 |
 
 `ee || base` is the hybrid secret `Z′ = Z || T` of NIST SP 800-56C Rev. 2 § 2: the shared secret, then an auxiliary secret whose format both ends fix in advance. Both parts are 32 bytes, so the plain concatenation is unambiguous. The HPKE flow takes `ee` alone, as TLS 1.3 takes its ECDHE secret (RFC 9846 § 7.1).
 
@@ -244,23 +245,23 @@ server  = HMAC-H(mac_s, transcript_hash || SignerInfo.signature)
 
 The server draws a fresh `E` for each handshake and signs it inside the transcript. The client draws `R` for this agreement alone. The CMS opening's KEM draws a third ephemeral, whose shared secret derives the key-encryption key alone (RFC 9629 § 7).
 
-| Step                          | HPKE                                                       | CMS                                        |
-| ----------------------------- | ---------------------------------------------------------- | ------------------------------------------ |
-| The client sends `R`          | In clear, as a field of the hello, as TLS 1.3 sends its key share | Sealed, as a field of the opening content |
-| The client draws its private half | In `start`                                             | In `start`                                 |
-| The client drops its private half | In `respond`, at the agreement                         | In `respond`, at the agreement             |
-| The server drops its private half | In `reply`, at the agreement, before it encodes the reply | In `reply`, at the agreement            |
+| Step                              | HPKE                                                              | CMS                                       |
+| --------------------------------- | ----------------------------------------------------------------- | ----------------------------------------- |
+| The client sends `R`              | In clear, as a field of the hello, as TLS 1.3 sends its key share | Sealed, as a field of the opening content |
+| The client draws its private half | In `start`                                                        | In `start`                                |
+| The client drops its private half | In `respond`, at the agreement                                    | In `respond`, at the agreement            |
+| The server drops its private half | In `reply`, at the agreement, before it encodes the reply         | In `reply`, at the agreement              |
 
 `PeerPoint::parse` parses every received ephemeral before any scalar multiplication. It refuses a malformed, off-curve, or identity point, and the agreement takes no other point type.
 
 An ephemeral with the x-coordinate of its sender's static key would collapse the agreement into the static one, so each side refuses it:
 
-| Comparison                                                                                     | Home            | When                                                    |
-| ---------------------------------------------------------------------------------------------- | --------------- | ------------------------------------------------------- |
+| Comparison                                                                                      | Home            | When                                                    |
+| ----------------------------------------------------------------------------------------------- | --------------- | ------------------------------------------------------- |
 | The client compares `E` with the key of each server certificate, the key-agreement one included | `PeerEphemeral` | At the reply, before the agreement                      |
-| The server compares `R` with the key of the offered certificate                                | `Offer::new`    | At the closing, once the identity opens, before the tag |
-| A rekey server compares `Ce` with the client's static key                                      | `PeerEphemeral` | At the request                                          |
-| A rekey client compares `Se` with every static key of the server                               | `ServerKeys`    | At the response                                         |
+| The server compares `R` with the key of the offered certificate                                 | `Offer::new`    | At the closing, once the identity opens, before the tag |
+| A rekey server compares `Ce` with the client's static key                                       | `PeerEphemeral` | At the request                                          |
+| A rekey client compares `Se` with every static key of the server                                | `ServerKeys`    | At the response                                         |
 
 - The comparison reads the x-coordinate, because ECDH keeps that coordinate alone. A key and its negation agree to one secret.
 - A server reads the client's static key only once the identity opens. An anonymous client holds none.
@@ -271,13 +272,13 @@ An ephemeral with the x-coordinate of its sender's static key would collapse the
 
 An observer who records a session and later obtains the server's static keys recovers nothing at or below `hs`:
 
-| Value                         | HPKE observer    | CMS observer     | Reason                                           |
-| ----------------------------- | ---------------- | ---------------- | ------------------------------------------------ |
-| `base`                        | No such value    | Recovers         | The key-agreement key opens the CMS opening      |
-| `S`                           | Recovers         | Recovers         | It is public in the handshake messages           |
-| `ee`                          | Does not recover | Does not recover | It needs `r` or `e`, and neither side kept its own |
-| `hs` and every key below it   | Does not recover | Does not recover | One of its inputs is unknown                     |
-| The client identity           | Does not recover | Does not recover | It is sealed under `k_close`, below `hs`         |
+| Value                       | HPKE observer    | CMS observer     | Reason                                             |
+| --------------------------- | ---------------- | ---------------- | -------------------------------------------------- |
+| `base`                      | No such value    | Recovers         | The key-agreement key opens the CMS opening        |
+| `S`                         | Recovers         | Recovers         | It is public in the handshake messages             |
+| `ee`                        | Does not recover | Does not recover | It needs `r` or `e`, and neither side kept its own |
+| `hs` and every key below it | Does not recover | Does not recover | One of its inputs is unknown                       |
+| The client identity         | Does not recover | Does not recover | It is sealed under `k_close`, below `hs`           |
 
 The traffic keys, the receipt acknowledgement, the closing, and every rekey epoch derive below `hs`.
 
@@ -291,21 +292,21 @@ epoch_next = HKDF(u32be(32) || epoch || u32be(32) || ee, salt = client_random ||
 
 Here `ee` is the ECDH output of the two rekey ephemerals, and `u32be(n)` is the 4-byte big-endian length of the input after it. A holder of one epoch secret lacks `ee`, so it derives nothing of the next epoch.
 
-| Rule                                                              | Enforced by                                                                                                                       |
-| ----------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| The next epoch needs a rekey scalar                               | `EpochSecret::next` runs the agreement itself                                                                                     |
-| Both ephemerals are authenticated                                 | The server signs a receipt over `H(hash \|\| request \|\| server_random \|\| Se)`, the request carries `Ce`, and the client countersigns |
-| A peer ephemeral is a curve point, and never the peer's static key | `PeerEphemeral` yields a `PeerPoint`, the one point type `EpochSecret::next` takes                                               |
-| The server holds no rekey scalar across an await                  | It agrees and drops its scalar before it awaits its authorizer, and holds the derived secret until the acknowledgement           |
-| The client holds its rekey scalar across no await of a step       | `EpochSecret::next` takes the boxed scalar by value before the client awaits its approver                                         |
+| Rule                                                               | Enforced by                                                                                                                              |
+| ------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| The next epoch needs a rekey scalar                                | `EpochSecret::next` runs the agreement itself                                                                                            |
+| Both ephemerals are authenticated                                  | The server signs a receipt over `H(hash \|\| request \|\| server_random \|\| Se)`, the request carries `Ce`, and the client countersigns |
+| A peer ephemeral is a curve point, and never the peer's static key | `PeerEphemeral` yields a `PeerPoint`, the one point type `EpochSecret::next` takes                                                       |
+| The server holds no rekey scalar across an await                   | It agrees and drops its scalar before it awaits its authorizer, and holds the derived secret until the acknowledgement                   |
+| The client holds its rekey scalar across no await of a step        | `EpochSecret::next` takes the boxed scalar by value before the client awaits its approver                                                |
 
 ### Traffic secrets
 
 The directional derivation takes only a `TrafficSecret`, a sealed trait, so every traffic key traces back to a handshake secret:
 
-| Secret            | Constructors                                                                                                       |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------ |
-| `HandshakeSecret` | `HandshakeSecret::hybrid` for the CMS flow, `HandshakeSecret::ephemeral` for the HPKE flow                         |
+| Secret            | Constructors                                                                                                      |
+| ----------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `HandshakeSecret` | `HandshakeSecret::hybrid` for the CMS flow, `HandshakeSecret::ephemeral` for the HPKE flow                        |
 | `EpochSecret`     | `EpochMaterials::derive`, from a handshake secret. `EpochSecret::next`, from the last epoch and a fresh agreement |
 
 ### Key confirmation
@@ -342,25 +343,25 @@ Every seal of the handshake and the session is an `AuthEnvelopedData` (RFC 5083)
 
 `Opener::unwrap` is the one decision on the kind of a `RecipientInfo`. Before any key runs, it refuses another recipient kind, a `ukm` of another purpose, a `kekid` of another key, an algorithm outside the profile, and a `kekLength` other than the wrap's key size. `AuthEnvelopedData::open` refuses a version other than 0, a cipher other than the provider's AEAD, a tag length other than 16, and a missing or unexpected content type.
 
-| Seal                        | Recipient                                                               | Key-encryption key                                                                                 |
-| --------------------------- | ----------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
-| The CMS opening             | `KEMRecipientInfo` (RFC 9629) to the server's key-agreement certificate | The provider's KDF of the DHKEM shared secret, empty salt, `DER(CMSORIforKEMOtherInfo)` as `info`  |
-| The receipt acknowledgement | `KEKRecipientInfo` (RFC 5652 § 6.2.3)                                   | `k_ack`                                                                                            |
-| The closing of either flow  | `KEKRecipientInfo`                                                      | `k_close`                                                                                          |
-| Each session record         | `KEKRecipientInfo`                                                      | `k_c2s` or `k_s2c` of its epoch                                                                    |
+| Seal                        | Recipient                                                               | Key-encryption key                                                                                |
+| --------------------------- | ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| The CMS opening             | `KEMRecipientInfo` (RFC 9629) to the server's key-agreement certificate | The provider's KDF of the DHKEM shared secret, empty salt, `DER(CMSORIforKEMOtherInfo)` as `info` |
+| The receipt acknowledgement | `KEKRecipientInfo` (RFC 5652 § 6.2.3)                                   | `k_ack`                                                                                           |
+| The closing of either flow  | `KEKRecipientInfo`                                                      | `k_close`                                                                                         |
+| Each session record         | `KEKRecipientInfo`                                                      | `k_c2s` or `k_s2c` of its epoch                                                                   |
 
 ### The opening
 
-| Field       | Value                                                                                                                                        |
-| ----------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| `version`   | 0                                                                                                                                            |
-| `rid`       | The key-agreement certificate's `subjectKeyIdentifier`, else its issuer and serial number                                                    |
+| Field       | Value                                                                                                                                               |
+| ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `version`   | 0                                                                                                                                                   |
+| `rid`       | The key-agreement certificate's `subjectKeyIdentifier`, else its issuer and serial number                                                           |
 | `kem`       | `1.3.6.1.4.1.64586.2.3`, parameters absent: DHKEM(secp256k1, HKDF-SHA256), HPKE KEM `0x0016`. [dhkem-secp256k1.md](dhkem-secp256k1.md) specifies it |
-| `kemct`     | DHKEM's `enc`, the 65-octet uncompressed point of an ephemeral drawn for this seal                                                           |
-| `kdf`       | `id-alg-hkdf-with-sha3-256` (RFC 9688 § 5.1), parameters absent, so the salt is empty                                                        |
-| `kekLength` | 32                                                                                                                                           |
-| `ukm`       | `tb/handshake/opening/ukm/v1`, then 32 random octets that the seal draws                                                                     |
-| `wrap`      | `id-aes256-wrap`                                                                                                                             |
+| `kemct`     | DHKEM's `enc`, the 65-octet uncompressed point of an ephemeral drawn for this seal                                                                  |
+| `kdf`       | `id-alg-hkdf-with-sha3-256` (RFC 9688 § 5.1), parameters absent, so the salt is empty                                                               |
+| `kekLength` | 32                                                                                                                                                  |
+| `ukm`       | `tb/handshake/opening/ukm/v1`, then 32 random octets that the seal draws                                                                            |
+| `wrap`      | `id-aes256-wrap`                                                                                                                                    |
 
 - The content, of type `1.3.6.1.4.1.64586.1.25`, is `SEQUENCE { baseSecret OCTET STRING, agreementKey OriginatorPublicKey }`: the base secret and `R`.
 - The authenticated attributes carry the security and transport offers beside the content type. The unauthenticated attributes carry the abort alert alone.
@@ -380,10 +381,10 @@ The receipt acknowledgement and the closing each seal through a `KEKRecipientInf
 
 Both flows close with one `AuthEnvelopedData` under `k_close`. The content type, which the closing's `authAttrs` authenticate, names its form:
 
-| Form            | Content type    | Content                                                                                                                                                                   |
-| --------------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Form            | Content type    | Content                                                                                                                                                                                                                            |
+| --------------- | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Client Finished | `id-signedData` | The signer's `SignedData` over `tb/handshake/finished/client/v1`, the transcript hash, and the digest of the client certificate. The certificate is in `certificates`, and the tag and the acknowledgement are unsigned attributes |
-| Anonymous       | `id-data`       | The DER `SET OF Attribute` with the tag and the acknowledgement alone                                                                                                     |
+| Anonymous       | `id-data`       | The DER `SET OF Attribute` with the tag and the acknowledgement alone                                                                                                                                                              |
 
 - `ClosingContent` is the one reader of both forms. Its constructor refuses any other content type with `UnexpectedContainer` before the closing key runs.
 - A form that carries the tag or the acknowledgement twice fails with `DuplicateAttribute`, and one without a tag fails with `MissingAttribute`.
@@ -404,24 +405,24 @@ An identified client's certificate travels only inside its client Finished, seal
 
 Each record after the handshake is an `AuthEnvelopedData` under the directional key of its epoch. `SendCipher::encrypt_next` encrypts the payload in place, and `RecvCipher::open` decrypts it in the buffer it arrived in.
 
-| Field                 | Value                                                                                                                                      |
-| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| `recipientInfos`      | One `KEKRecipientInfo` (RFC 5652 § 6.2.3), version 4, under the provider's key wrap                                                        |
+| Field                 | Value                                                                                                                                            |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `recipientInfos`      | One `KEKRecipientInfo` (RFC 5652 § 6.2.3), version 4, under the provider's key wrap                                                              |
 | `kekid.keyIdentifier` | `tb/session/record/kekid/v1`, then the direction octet (`0x00` client to server, `0x01` server to client), then the epoch as 4 big-endian octets |
-| Content key and nonce | Fresh for each record (RFC 5084 § 3.2)                                                                                                     |
-| Content type          | `id-data`                                                                                                                                  |
-| `authAttrs`           | The content type, and `RecordSequence ::= SEQUENCE { epoch INTEGER, sequence INTEGER }` under `1.3.6.1.4.1.64586.1.27`                    |
+| Content key and nonce | Fresh for each record (RFC 5084 § 3.2)                                                                                                           |
+| Content type          | `id-data`                                                                                                                                        |
+| `authAttrs`           | The content type, and `RecordSequence ::= SEQUENCE { epoch INTEGER, sequence INTEGER }` under `1.3.6.1.4.1.64586.1.27`                           |
 
 `RecvCipher::open` reads the epoch and the sequence before the content key unwraps, and refuses:
 
-| Record                                                                                      | Refusal          |
-| ------------------------------------------------------------------------------------------- | ---------------- |
-| Another epoch than the cipher's                                                             | `RecordEpoch`    |
-| Another sequence than the next one: a replayed, reordered, or deleted record                | `NonceReplayed`  |
-| A sequence at the record limit, or bytes past the renewal volume                            | `RekeyRequired`  |
+| Record                                                                                                    | Refusal          |
+| --------------------------------------------------------------------------------------------------------- | ---------------- |
+| Another epoch than the cipher's                                                                           | `RecordEpoch`    |
+| Another sequence than the next one: a replayed, reordered, or deleted record                              | `NonceReplayed`  |
+| A sequence at the record limit, or bytes past the renewal volume                                          | `RekeyRequired`  |
 | A record relabelled to this epoch, or reflected from the other direction, whose `kekid` names another key | `KeyIdentifier`  |
-| A record whose `kekid` was rewritten too, so its key is wrapped under another epoch's key   | `KeyUnwrap`      |
-| A record whose sequence changed in transit, which the tag covers                            | `Authentication` |
+| A record whose `kekid` was rewritten too, so its key is wrapped under another epoch's key                 | `KeyUnwrap`      |
+| A record whose sequence changed in transit, which the tag covers                                          | `Authentication` |
 
 - The sequence advances only after the tag passes, so a refused record leaves it unchanged.
 - RFC 9846 § 5.5 sets the record limit on the sender, and `SendCipher` holds it. The two `RekeyRequired` refusals of the receiver are the crate's own policy, which holds a peer that ignores its limit to the bounds an honest sender keeps.
@@ -437,49 +438,49 @@ The transcript hash is the whole output of the negotiated digest, 32 to 64 bytes
 
 `Transcript` builds both transcripts, and each flow binds its legs in one order:
 
-| Flow | Legs, in order                                                                                                              |
-| ---- | --------------------------------------------------------------------------------------------------------------------------- |
-| HPKE | The hello `ContentInfo` DER, the `ServerHandshake` DER that the reply signs, and the DER of the signing certificate         |
-| CMS  | The opening DER, the security accept, the transport accept, the server ephemeral, and the DER of the signing certificate    |
+| Flow | Legs, in order                                                                                                           |
+| ---- | ------------------------------------------------------------------------------------------------------------------------ |
+| HPKE | The hello `ContentInfo` DER, the `ServerHandshake` DER that the reply signs, and the DER of the signing certificate      |
+| CMS  | The opening DER, the security accept, the transport accept, the server ephemeral, and the DER of the signing certificate |
 
 The sender hashes the bytes it encoded, and the receiver hashes the bytes it received, never a re-encoding (CWE-345). The pinned `der` decoder sorts a `SET OF` as it decodes, so a mis-ordered set decodes to the same value as a well-ordered one. Hashing the received bytes makes a reordered set diverge the two transcripts, and the signature fails.
 
-| What the transcript binds              | Read through                                                                                   |
-| -------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| A container                            | `WireDer::der`                                                                                 |
-| A CMS accept or ephemeral attribute    | `HandshakeAttribute::received_bytes`                                                           |
-| The HPKE reply content                 | The reply's `eContent` octets, as they arrived                                                 |
+| What the transcript binds              | Read through                                                                                       |
+| -------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| A container                            | `WireDer::der`                                                                                     |
+| A CMS accept or ephemeral attribute    | `HandshakeAttribute::received_bytes`                                                               |
+| The HPKE reply content                 | The reply's `eContent` octets, as they arrived                                                     |
 | The signing certificate of either flow | `CmsSigner::signer_certificate_der`: the bytes of the certificate the `sid` names, as they arrived |
 
 Both flows bind the signing certificate, as RFC 9846 § 4.5.2 signs over the Certificate. A reply whose certificate was swapped for another with the same key gives the client another transcript, and the signature fails. The server binds the DER that `SigningIdentity::certificate_der` keeps, and the client binds the bytes that arrived.
 
 Each signature signs under a domain of its own. Neither Finished label is a prefix of the other, which a compile-time assertion holds, so a signature made for one purpose verifies as no other:
 
-| Signature           | What it signs                                                                                                                                                           |
-| ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Signature           | What it signs                                                                                                                                                                          |
+| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | HPKE reply          | Its signed attributes: content type `1.3.6.1.4.1.64586.1.26`, the message digest of the `ServerHandshake` DER, algorithm protection, and the transcript hash (`1.3.6.1.4.1.64586.1.8`) |
-| CMS server Finished | Its signed attributes, whose digest covers `tb/handshake/finished/server/v1` and the transcript hash                                                                   |
-| Client Finished     | Its signed attributes, whose digest covers `tb/handshake/finished/client/v1`, the transcript hash, and the digest of the client certificate (RFC 9846 § 4.5.2)          |
+| CMS server Finished | Its signed attributes, whose digest covers `tb/handshake/finished/server/v1` and the transcript hash                                                                                   |
+| Client Finished     | Its signed attributes, whose digest covers `tb/handshake/finished/client/v1`, the transcript hash, and the digest of the client certificate (RFC 9846 § 4.5.2)                         |
 
 Both transcripts bind both ephemerals:
 
-| Ephemeral        | Bound by                                                                    | Tampering fails at                                                                                       |
-| ---------------- | --------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
-| Server `E`, HPKE | A field of the `ServerHandshake`, which the reply signs                     | The reply signature. An off-curve point fails `InvalidPublicKey` at its parse                            |
-| Server `E`, CMS  | A transcript leg after the accepts and before the signing certificate       | The server signature. A removed one fails `MissingAttribute`                                             |
-| Client `R`, HPKE | A field of the `ClientHello`, whose DER is the first leg                    | The client's check of the reply signature. An off-curve point fails `InvalidPublicKey` at the server     |
+| Ephemeral        | Bound by                                                                        | Tampering fails at                                                                                   |
+| ---------------- | ------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| Server `E`, HPKE | A field of the `ServerHandshake`, which the reply signs                         | The reply signature. An off-curve point fails `InvalidPublicKey` at its parse                        |
+| Server `E`, CMS  | A transcript leg after the accepts and before the signing certificate           | The server signature. A removed one fails `MissingAttribute`                                         |
+| Client `R`, HPKE | A field of the `ClientHello`, whose DER is the first leg                        | The client's check of the reply signature. An off-curve point fails `InvalidPublicKey` at the server |
 | Client `R`, CMS  | A field of the opening content, under the tag. The opening DER is the first leg | The opening's tag (`HandshakeError::Envelope`). An off-curve point fails `InvalidPublicKey`          |
 
 ## Signatures
 
 Every handshake signature is made under a `SigningIdentity`: a certificate beside the `SigningKeyProvider` that holds its private key. Its constructor refuses a certificate not admitted for signing, and a key whose public half differs from the certificate's. The HPKE hello carries no signature, and the reply's transcript hash covers it.
 
-| Endpoint        | Where the identity is held                                                                                   |
-| --------------- | ------------------------------------------------------------------------------------------------------------ |
-| Server          | `ServerConfig.identity`. A CMS server holds it in the `CmsIdentityPair` that `with_key_agreement` builds     |
-| CMS client      | `CmsClientSettings.identity`                                                                                 |
-| HPKE client     | `HpkeClientSettings.identity`, absent for an anonymous client                                                |
-| Transport build | `with_client_identity` on `ClientBuilder` and `ConnectionPool`, and the `client!` macro                      |
+| Endpoint        | Where the identity is held                                                                               |
+| --------------- | -------------------------------------------------------------------------------------------------------- |
+| Server          | `ServerConfig.identity`. A CMS server holds it in the `CmsIdentityPair` that `with_key_agreement` builds |
+| CMS client      | `CmsClientSettings.identity`                                                                             |
+| HPKE client     | `HpkeClientSettings.identity`, absent for an anonymous client                                            |
+| Transport build | `with_client_identity` on `ClientBuilder` and `ConnectionPool`, and the `client!` macro                  |
 
 Each signature value is a DER `ECDSA-Sig-Value` (RFC 3279 § 2.2.3) in a `SignerInfo`:
 
@@ -489,14 +490,14 @@ Each signature value is a DER `ECDSA-Sig-Value` (RFC 3279 § 2.2.3) in a `Signer
 
 `CmsSigner` builds every `SignerInfo` and `SignedData` the handshake emits, and verifies every one it reads (RFC 5652 § 5.4):
 
-| Field                         | Rule                                                                                                          |
-| ----------------------------- | ------------------------------------------------------------------------------------------------------------- |
-| `SignerInfo.sid`              | The certificate's `subjectKeyIdentifier`, or its issuer and serial number when it carries none                |
-| `SignerInfo.version`          | 3 under a `subjectKeyIdentifier`, 1 under an issuer and serial number (RFC 5652 § 5.3)                        |
-| `SignerInfo.digestAlgorithm`  | The digest that the signature algorithm names (RFC 5753 § 2.1.1)                                              |
-| `SignerInfo.signedAttrs`      | Always present: content type, message digest, and `CMSAlgorithmProtection` (RFC 6211), beside the profile's  |
-| `SignedData.version`          | The rule of RFC 5652 § 5.1, which a reader checks before it reads the content                                 |
-| `SignedData.digestAlgorithms` | Every digest algorithm a signer names                                                                         |
+| Field                         | Rule                                                                                                        |
+| ----------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `SignerInfo.sid`              | The certificate's `subjectKeyIdentifier`, or its issuer and serial number when it carries none              |
+| `SignerInfo.version`          | 3 under a `subjectKeyIdentifier`, 1 under an issuer and serial number (RFC 5652 § 5.3)                      |
+| `SignerInfo.digestAlgorithm`  | The digest that the signature algorithm names (RFC 5753 § 2.1.1)                                            |
+| `SignerInfo.signedAttrs`      | Always present: content type, message digest, and `CMSAlgorithmProtection` (RFC 6211), beside the profile's |
+| `SignedData.version`          | The rule of RFC 5652 § 5.1, which a reader checks before it reads the content                               |
+| `SignedData.digestAlgorithms` | Every digest algorithm a signer names                                                                       |
 
 A reader refuses a digest that the signature algorithm does not name, a missing or extra signed attribute, an algorithm protection that names other algorithms, and a version that breaks its rule.
 
@@ -506,11 +507,11 @@ A reader refuses a digest that the signature algorithm does not name, a missing 
 
 One type, `Handshake<R, F, P>`, runs both roles over both flows:
 
-| Parameter | Values                | What it fixes                                                                     |
-| --------- | --------------------- | --------------------------------------------------------------------------------- |
-| `R`       | `Client`, `Server`    | The step order, and every negotiation and admission decision                      |
-| `F`       | `Hpke`, `Cms`         | The messages of the flow, and the checks those messages define                    |
-| `P`       | A `HandshakeProvider` | The algorithms. A provider with no HPKE suite runs both flows                     |
+| Parameter | Values                | What it fixes                                                  |
+| --------- | --------------------- | -------------------------------------------------------------- |
+| `R`       | `Client`, `Server`    | The step order, and every negotiation and admission decision   |
+| `F`       | `Hpke`, `Cms`         | The messages of the flow, and the checks those messages define |
+| `P`       | A `HandshakeProvider` | The algorithms. A provider with no HPKE suite runs both flows  |
 
 ```rust
 let mut client = Handshake::client(client_config);
@@ -524,10 +525,10 @@ server.finish(closing).await?;
 
 Each configuration's type requires what its role cannot run without:
 
-| Configuration           | Requires                                                                                                   |
-| ----------------------- | ---------------------------------------------------------------------------------------------------------- |
-| `ClientConfig<Hpke, P>` | A validator for the certificate the server names (`LearnedTrust`)                                          |
-| `ClientConfig<Cms, P>`  | The pinned key-agreement certificate beside its store (`ProvisionedTrust`), and a client identity          |
+| Configuration           | Requires                                                                                                     |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `ClientConfig<Hpke, P>` | A validator for the certificate the server names (`LearnedTrust`)                                            |
+| `ClientConfig<Cms, P>`  | The pinned key-agreement certificate beside its store (`ProvisionedTrust`), and a client identity            |
 | `ServerConfig<F, P>`    | The flow's server identity: a `SigningIdentity` for HPKE, a `CmsIdentityPair` for CMS. A `SupportedProfiles` |
 
 Both roles run one machine, read through `HandshakePhase`:
@@ -602,9 +603,9 @@ flowchart TD
     C --> D[MissingEncryption]
 ```
 
-| The peer disconnects while | Error                                                              |
-| -------------------------- | ------------------------------------------------------------------ |
-| A handshake is pending     | `PeerClosedBeforeHandshake`                                        |
+| The peer disconnects while | Error                                                                |
+| -------------------------- | -------------------------------------------------------------------- |
+| A handshake is pending     | `PeerClosedBeforeHandshake`                                          |
 | A session is agreed        | `ConnectionClosed`, which a pool acts on when it evicts a connection |
 
 ## Sources

@@ -512,8 +512,8 @@ impl CmsServerIdentity {
 	///   without reading it, and the store then names its anchor.
 	/// - A chain is path-validated against the store
 	///   ([RFC 5280 §6.1][rfc5280-6.1]), which owns the validity period of
-	///   each certificate in it. Its leaf identifies the server, and its anchor
-	///   is the one the store names for its first certificate.
+	///   each certificate in it. Its leaf identifies the server, and
+	///   [`CertificateTrust::verify_chain`] returns its anchor.
 	///
 	/// # Errors
 	///
@@ -529,8 +529,7 @@ impl CmsServerIdentity {
 				Ok((certificate, anchor))
 			}
 			Self::Chain(chain) => {
-				store.verify_chain(chain.path())?;
-				let anchor = store.trust_anchor(chain.root())?;
+				let anchor = store.verify_chain(chain.path())?;
 				Ok((chain.leaf(), anchor))
 			}
 		}
@@ -810,8 +809,8 @@ mod tests {
 				true
 			}
 
-			fn verify_chain(&self, _chain: &[Certificate]) -> Result<(), CertificateValidationError> {
-				Ok(())
+			fn verify_chain(&self, _chain: &[Certificate]) -> Result<Arc<Certificate>, CertificateValidationError> {
+				Ok(Arc::clone(&self.anchor))
 			}
 
 			fn trust_anchor(&self, _cert: &Certificate) -> Result<Arc<Certificate>, CertificateValidationError> {
@@ -1238,6 +1237,23 @@ mod tests {
 			Ok(())
 		}
 
+		/// A pinned chain that starts at an intermediate the store holds ends
+		/// at the store's root, as the walk of a signing certificate under that
+		/// intermediate does (RFC 5280 §6.1.1 (d)).
+		#[test]
+		fn a_chain_from_a_held_intermediate_pairs_with_its_signing_certificate() -> Result<(), HandshakeError> {
+			let chain = fixed_chain();
+			let key_agreement = key_agreement_leaf(&chain.intermediate_key, "Intermediate");
+			let pinned = [chain.intermediate.to_owned(), key_agreement];
+			let pinned = CmsServerIdentity::Chain(CmsServerChain::new(pinned)?);
+			let store = store_holding([chain.root.to_owned(), chain.intermediate.to_owned()]);
+			let trust = ProvisionedTrust::new(pinned, store)?;
+
+			let paired = admit_reply(&trust, &chain.leaf, SERVER)?;
+			assert_eq!(paired.signing().certificate().as_ref(), &chain.leaf);
+			Ok(())
+		}
+
 		#[test]
 		fn an_empty_provisioned_chain_is_refused() {
 			let refused = CmsServerChain::new(Vec::new());
@@ -1424,7 +1440,7 @@ mod tests {
 				self.pin(cert).is_some()
 			}
 
-			fn verify_chain(&self, _chain: &[Certificate]) -> Result<(), CertificateValidationError> {
+			fn verify_chain(&self, _chain: &[Certificate]) -> Result<Arc<Certificate>, CertificateValidationError> {
 				Err(CertificateValidationError::CertificateNotTrusted)
 			}
 

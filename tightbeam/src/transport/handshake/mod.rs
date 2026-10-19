@@ -429,11 +429,6 @@ impl CmsServerChain {
 		&self.path
 	}
 
-	/// The certificate the chain starts at, the trust anchor of its path.
-	pub fn root(&self) -> &Certificate {
-		self.path.first().unwrap_or(&self.leaf)
-	}
-
 	/// The leaf, which identifies the server.
 	pub fn leaf(&self) -> &Arc<Certificate> {
 		&self.leaf

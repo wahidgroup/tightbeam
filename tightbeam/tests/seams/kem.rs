@@ -54,8 +54,8 @@ mod flow {
 	pub use tightbeam::testing::{TestCmsServer, TestIdentity};
 	pub use tightbeam::transport::handshake::negotiation::RunnableProfile;
 	pub use tightbeam::transport::handshake::{
-		Client, ClientConfig, Cms, CmsClientSettings, CmsIdentityPair, CmsServerIdentity, CmsServerSettings, Handshake,
-		HandshakeError, ProvisionedTrust, Server, ServerConfig, SupportedProfiles,
+		Client, ClientConfig, Cms, CmsClientSettings, CmsIdentityPair, CmsServerChain, CmsServerIdentity,
+		CmsServerSettings, Handshake, HandshakeError, ProvisionedTrust, Server, ServerConfig, SupportedProfiles,
 	};
 }
 
@@ -366,5 +366,18 @@ async fn an_outside_store_of_two_anchors_refuses_the_pair() -> Result<(), Box<dy
 
 	let refused = client.respond(reply).await;
 	assert!(matches!(refused, Err(HandshakeError::AnchorMismatch)));
+	Ok(())
+}
+
+/// An outside store anchors a pinned chain at the authority it names for the
+/// chain's leaf, so a client pins the chain through it.
+#[cfg(feature = "transport-cms")]
+#[test]
+fn an_outside_store_anchors_a_pinned_chain() -> Result<(), HandshakeError> {
+	let server = TestCmsServer::generate("stub server");
+	let store = PinningTrust::under(server.authority.to_owned(), vec![server.key_agreement.to_owned()]);
+
+	let chain = CmsServerChain::new([server.authority.to_owned(), server.key_agreement.to_owned()])?;
+	ProvisionedTrust::new(CmsServerIdentity::Chain(chain), Arc::new(store))?;
 	Ok(())
 }

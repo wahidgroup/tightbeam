@@ -204,10 +204,13 @@ pub trait CertificateTrust: CertificateValidation + Debug + Send + Sync {
 	/// the key whatever certificate carries it.
 	fn find_by_public_key(&self, spki: &SubjectPublicKeyInfoOwned) -> Option<&Certificate>;
 
-	/// Verify a certificate chain with partial RFC 5280 §6.1 path validation.
+	/// Verify a certificate chain with partial RFC 5280 §6.1 path validation,
+	/// and return the trust anchor at which its path ends.
 	///
-	/// `chain` is ordered root, then intermediates, then leaf. The call returns
-	/// `Ok(())` when the chain is valid and terminates at a trusted root.
+	/// `chain` is ordered root, then intermediates, then leaf, and it must
+	/// terminate at a trusted root. The anchor is the one that
+	/// [`Self::trust_anchor`] names for a certificate of the same path, so the
+	/// two compare.
 	///
 	/// # Checks
 	///
@@ -229,7 +232,31 @@ pub trait CertificateTrust: CertificateValidation + Debug + Send + Sync {
 	/// # Errors
 	///
 	/// - [`CertificateValidationError`] -- the chain fails validation.
-	fn verify_chain(&self, chain: &[Certificate]) -> Result<(), CertificateValidationError>;
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::crypto::policy::Secp256k1Policy;
+	/// use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
+	/// use tightbeam::testing::fixtures::{TestCertificate, TestCertificateChain};
+	///
+	/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+	/// // The keys of the fixture chain are public, so it serves an example
+	/// // alone.
+	/// let chain = TestCertificate::insecure_fixed_chain()?;
+	/// let TestCertificateChain { root, intermediate, leaf, .. } = chain;
+	///
+	/// // The store holds the root alone, and the chain carries the rest.
+	/// let builder = CertificateTrustBuilder::from(Secp256k1Policy::default());
+	/// let store = builder.with_certificate(root.to_owned())?.build();
+	///
+	/// let path = [root.to_owned(), intermediate, leaf];
+	/// let anchor = store.verify_chain(&path)?;
+	/// assert_eq!(*anchor, root);
+	/// # Ok(())
+	/// # }
+	/// ```
+	fn verify_chain(&self, chain: &[Certificate]) -> Result<Arc<Certificate>, CertificateValidationError>;
 
 	/// Validate `cert` as [`CertificateValidation::evaluate`] does, and return
 	/// the trust anchor at which its certification path ends, the anchor that
@@ -746,32 +773,35 @@ impl CertificateValidation for CertificateTrustStore {
 	/// signature check of the path decides.
 	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
 		// The evaluation admits the certificate alone, so its anchor drops.
-		self.validate_to_anchor(cert).map(drop)
+		self.validate_to_anchor(core::slice::from_ref(cert)).map(drop)
 	}
 }
 
 #[cfg(feature = "std")]
 impl CertificateTrustStore {
-	/// Walk the issuer hierarchy from `cert` as far as the store material
-	/// allows, validate the accumulated path, and return the fingerprint of
-	/// the trust anchor the walk ended at, a certificate this store holds.
+	/// Walk the issuer hierarchy from the first certificate of `presented`,
+	/// an anchor-first path, as far as the store material allows. Validate
+	/// the walked issuers followed by `presented` as one path, and return the
+	/// fingerprint of the trust anchor the walk ended at, which this store
+	/// holds.
 	///
 	/// # Errors
 	///
+	/// - [`CertificateValidationError::EmptyChain`] -- `presented` holds no certificate.
 	/// - [`CertificateValidationError::CertificateNotTrusted`] -- the walk ends at no anchor of this store.
 	/// - The [`Self::validate_path`] set.
-	fn validate_to_anchor(&self, cert: &Certificate) -> Result<Sha3Fingerprint, CertificateValidationError> {
+	fn validate_to_anchor(&self, presented: &[Certificate]) -> Result<Sha3Fingerprint, CertificateValidationError> {
+		let start = presented.first().ok_or(CertificateValidationError::EmptyChain)?;
 		let mut path: Vec<&Certificate> = Vec::new();
 		let mut visited: HashSet<Sha3Fingerprint> = HashSet::new();
 
-		let mut anchor = Self::to_fingerprint(cert)?;
+		let mut anchor = Self::to_fingerprint(start)?;
 		visited.insert(anchor);
-		path.push(cert);
 
-		// The authority identifier of `cert` reads in place here, and those of
+		// The authority identifier of `start` reads in place here, and those of
 		// the held certificates decoded where the store was built.
-		let mut current = cert;
-		let mut authority = KeyIdentifiers::authority_of(cert)?;
+		let mut current = start;
+		let mut authority = KeyIdentifiers::authority_of(start)?;
 		loop {
 			// RFC 5280 §6.1.3(a)(4): locate the issuer of the current
 			// certificate, whose fingerprint `anchor` holds.
@@ -796,10 +826,24 @@ impl CertificateTrustStore {
 			return Err(CertificateValidationError::CertificateNotTrusted);
 		}
 
-		// Validate anchor first, issuer before subject, as `verify_chain` does.
+		// Validate anchor first, issuer before subject: the walked issuers from
+		// the top, then the presented path.
 		path.reverse();
+		path.extend(presented);
 		self.validate_path(&path)?;
 		Ok(anchor)
+	}
+
+	/// The certificate this store holds under `fingerprint`, as a shared
+	/// handle.
+	///
+	/// # Errors
+	///
+	/// - [`CertificateValidationError::CertificateNotTrusted`] -- the store holds no such certificate.
+	fn held(&self, fingerprint: &Sha3Fingerprint) -> Result<Arc<Certificate>, CertificateValidationError> {
+		let held = self.certificates.get(fingerprint);
+		let certificate = held.map(|held| Arc::clone(&held.certificate));
+		certificate.ok_or(CertificateValidationError::CertificateNotTrusted)
 	}
 
 	/// The certificate this store holds that issued `cert`, beside its
@@ -833,26 +877,27 @@ impl CertificateTrust for CertificateTrustStore {
 		}
 	}
 
-	fn verify_chain(&self, chain: &[Certificate]) -> Result<(), CertificateValidationError> {
+	/// The anchor is the top of the issuer walk from the chain's root, as for
+	/// [`Self::trust_anchor`], so a chain that starts at a held intermediate
+	/// names the root above it.
+	fn verify_chain(&self, chain: &[Certificate]) -> Result<Arc<Certificate>, CertificateValidationError> {
 		// RFC 5280 §6.1.1: the chain must end at a configured trust anchor.
 		let root = chain.first().ok_or(CertificateValidationError::EmptyChain)?;
 		if !self.is_trusted(root) {
 			return Err(CertificateValidationError::CertificateNotTrusted);
 		}
 
-		// `evaluate` shares this path-validation routine, so the two entry
-		// points cannot diverge.
-		let path: Vec<&Certificate> = chain.iter().collect();
-		self.validate_path(&path)
+		// `evaluate` and `trust_anchor` share this walk and its one path
+		// validation, so the entry points cannot diverge.
+		let anchor = self.validate_to_anchor(chain)?;
+		self.held(&anchor)
 	}
 
 	/// The anchor is the certificate the issuer walk of
 	/// [`CertificateValidation::evaluate`] ended at, as the store holds it.
 	fn trust_anchor(&self, cert: &Certificate) -> Result<Arc<Certificate>, CertificateValidationError> {
-		let anchor = self.validate_to_anchor(cert)?;
-		let held = self.certificates.get(&anchor);
-		let certificate = held.map(|held| Arc::clone(&held.certificate));
-		certificate.ok_or(CertificateValidationError::CertificateNotTrusted)
+		let anchor = self.validate_to_anchor(core::slice::from_ref(cert))?;
+		self.held(&anchor)
 	}
 
 	fn find_by_signer_identifier(&self, sid: &SignerIdentifier) -> Option<&PeerCertificate<ErasedSigning>> {
@@ -1384,7 +1429,7 @@ mod tests {
 			let store = build_store(&chain, *store_certs)?;
 			let chain_vec: Vec<_> = chain_slice.iter().map(|c| (*c).to_owned()).collect();
 
-			let result: Result<(), CertificateValidationError> = store.verify_chain(&chain_vec);
+			let result: Result<Arc<Certificate>, CertificateValidationError> = store.verify_chain(&chain_vec);
 			assert_eq!(
 				result.is_ok(),
 				*should_succeed,

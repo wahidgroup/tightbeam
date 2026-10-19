@@ -77,9 +77,10 @@ impl CertificateTrust for PinningTrust {
 		self.pin(cert).is_ok()
 	}
 
-	fn verify_chain(&self, chain: &[Certificate]) -> Result<(), CertificateValidationError> {
+	fn verify_chain(&self, chain: &[Certificate]) -> Result<Arc<Certificate>, CertificateValidationError> {
+		// The store trusts pins, so a chain's anchor is the one its leaf names.
 		let leaf = chain.last().ok_or(CertificateValidationError::EmptyChain)?;
-		self.evaluate(leaf)
+		self.trust_anchor(leaf)
 	}
 
 	fn trust_anchor(&self, cert: &Certificate) -> Result<Arc<Certificate>, CertificateValidationError> {
