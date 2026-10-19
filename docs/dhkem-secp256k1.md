@@ -1,6 +1,6 @@
 # DHKEM over secp256k1 in CMS
 
-This document specifies DHKEM(secp256k1, HKDF-SHA256) as the KEM of a CMS `KEMRecipientInfo` ([RFC 9629][rfc9629]). It takes the shape of [RFC 9629][rfc9629] § 6.1, and [RFC 9936][rfc9936], which does the same for ML-KEM, is its model. tightbeam seals its CMS opening, and each frame sealed to a recipient key, with this KEM.
+This document specifies DHKEM(secp256k1, HKDF-SHA256) as the KEM of a CMS `KEMRecipientInfo` ([RFC 9629][rfc9629]). It follows the shape of [RFC 9629][rfc9629] § 6.1, with [RFC 9936][rfc9936], which specifies ML-KEM the same way, as its model. tightbeam seals its CMS opening, and each frame sealed to a recipient key, under this KEM.
 
 ## Contents
 
@@ -89,12 +89,18 @@ KEK = HKDF-SHA3-256(IKM = shared_secret, salt = "", info = DER(CMSORIforKEMOther
 
 The recipient's public key travels in a certificate whose SubjectPublicKeyInfo is `id-ecPublicKey` with the named curve secp256k1 ([RFC 5480][rfc5480] § 2). Its point MUST be compressed or uncompressed, and the sender and the recipient refuse a first octet other than `0x02`, `0x03`, or `0x04` ([RFC 5480][rfc5480] § 2.2).
 
-The certificate MUST carry a `keyUsage` extension, it MUST assert `keyAgreement`, and it MUST NOT assert `decipherOnly`, which would limit the agreed key to deciphering ([RFC 5280][rfc5280] § 4.2.1.3). Two standards disagree on the bit, and this specification follows the second:
+The certificate MUST carry a `keyUsage` extension, it MUST assert `keyAgreement`, and it MUST NOT assert `decipherOnly`, which would limit the agreed key to deciphering ([RFC 5280][rfc5280] § 4.2.1.3). A certificate with no `keyUsage` would leave its use unchecked.
+
+Two standards disagree on the bit, and this specification follows the second:
 
 - [RFC 9629][rfc9629] § 3 says that "a recipient X.509 version 3 certificate that contains a key usage extension MUST assert the keyEncipherment bit".
 - [RFC 5480][rfc5480] § 3 limits the `keyUsage` of an `id-ecPublicKey` end-entity certificate to `digitalSignature`, `nonRepudiation`, and `keyAgreement`, so no conforming certificate of this key type carries `keyEncipherment`. [RFC 5280][rfc5280] § 4.2.1.3 names `keyAgreement` for a key used in key agreement, which DHKEM is.
 
-A certificate with no `keyUsage` extension would leave its use unchecked. The sender refuses to encapsulate to a certificate whose `keyUsage` is absent, lacks `keyAgreement`, or asserts `decipherOnly`, and the recipient refuses to open under one. tightbeam makes these checks in one place, the parse of `PeerCertificate<KeyAgreement<K>>`: a `KemRecipient` is built from that parse, and `KeyAgreementIdentity::new` runs it, so an outside KEM gets the checks without writing them. The bit is the KEM's `RecipientKem::USAGE`, `keyAgreement` for this KEM, so an outside KEM whose certificate profile names `keyEncipherment`, as ML-KEM's does ([RFC 9935][rfc9935] § 5, [RFC 9629][rfc9629] § 3), sets that bit instead. A certificate whose `keyUsage` also asserts `digitalSignature` is admitted, as RFC 5480 § 3 allows on one `id-ecPublicKey` end-entity certificate.
+tightbeam enforces these rules in one place:
+
+- The parse of `PeerCertificate<KeyAgreement<K>>` makes every check. The sender builds its `KemRecipient` from that parse, and `KeyAgreementIdentity::new` runs it for the recipient, so an outside KEM gets the checks without writing them.
+- The bit is the KEM's `RecipientKem::USAGE`: `keyAgreement` for this KEM. An outside KEM whose certificate profile names `keyEncipherment`, as ML-KEM's does ([RFC 9935][rfc9935] § 5, [RFC 9629][rfc9629] § 3), sets that bit instead.
+- A certificate whose `keyUsage` also asserts `digitalSignature` is admitted, as RFC 5480 § 3 allows for one `id-ecPublicKey` end-entity certificate.
 
 ## Security considerations
 
@@ -105,7 +111,11 @@ A certificate with no `keyUsage` extension would leave its use unchecked. The se
 
 ## Test vectors
 
-The KEM layer has published vectors in [draft-wahby-cfrg-hpke-kem-secp256k1-01][wahby] Appendix B: B.1.1 and B.2.1 give an ephemeral key, a recipient key, and the `shared_secret` they encapsulate to. tightbeam runs both through `Encap` and `Decap`, and pins the key-encryption key of one `CMSORIforKEMOtherInfo` against an independent HKDF-SHA3-256. It also pins one whole seal to the B.1.1 recipient key under fixed random draws: `kemct`, `ukm`, `encryptedKey`, the ciphertext, and `mac`, each from an independent implementation.
+[draft-wahby-cfrg-hpke-kem-secp256k1-01][wahby] Appendix B publishes the KEM's vectors: B.1.1 and B.2.1 each give an ephemeral key, a recipient key, and the `shared_secret` they encapsulate to. tightbeam pins three layers:
+
+- **The KEM.** Both vectors run through `Encap` and `Decap`.
+- **The key derivation.** The key-encryption key of one `CMSORIforKEMOtherInfo` matches an independent HKDF-SHA3-256.
+- **A whole seal.** One seal to the B.1.1 recipient key, under fixed random draws, matches an independent implementation in its `kemct`, `ukm`, `encryptedKey`, ciphertext, and `mac`.
 
 ## References
 

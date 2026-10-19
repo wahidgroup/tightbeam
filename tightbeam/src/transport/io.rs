@@ -575,7 +575,7 @@ pub trait EncryptedMessageIO: MessageIO {
 	/// Build the CMS client orchestrator from transport state.
 	///
 	/// CMS seals the base secret to the server's key-agreement certificate up
-	/// front, so both server certificates come from the trust the client's
+	/// front, so that certificate comes from the trust the client's
 	/// configuration built once. The server verifies the client Finished
 	/// under the client's certificate, so a client without an identity fails
 	/// closed before it sends anything.

@@ -173,6 +173,13 @@ impl ServerConfirmed {
 	pub(crate) fn into_secret(self) -> HandshakeSecret {
 		self.0
 	}
+
+	/// The proof over `secret`, for a unit test of a step that takes the
+	/// proof as its precondition.
+	#[cfg(test)]
+	pub(crate) fn assumed(secret: HandshakeSecret) -> Self {
+		Self(secret)
+	}
 }
 
 /// What a client flow holds from its opening to the agreement: the private

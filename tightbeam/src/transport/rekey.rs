@@ -31,7 +31,8 @@
 //!
 //! A holder of one epoch secret who records the renewal therefore derives
 //! nothing of the next epoch. Each side refuses a peer ephemeral that is off
-//! the curve or equal to the peer's static key.
+//! the curve or equal to a static key of the peer: the client's one key, or
+//! either key of a CMS server, as the handshake refuses it.
 //!
 //! # Bindings
 //!
@@ -58,9 +59,10 @@ use crate::cms::signed_data::SignedData;
 use crate::constants::EC_PUBKEY_COMPRESSED_SIZE;
 use crate::crypto::aead::{DirectionalCiphers, RecvCipher, SendCipher, SessionKeys};
 use crate::crypto::sign::elliptic_curve::ecdh::EphemeralSecret;
+use crate::crypto::sign::elliptic_curve::PublicKey;
 use crate::crypto::sign::{Signed, SigningIdentity};
 use crate::crypto::x509::{PeerCertificate, Signing};
-use crate::der::asn1::OctetString;
+use crate::der::asn1::{ObjectIdentifier, OctetString};
 use crate::der::Encode;
 use crate::random::{generate_nonce, OsRng};
 use crate::transport::envelopes::{MuxRekeyAckPackage, MuxRekeyRequestPackage, MuxRekeyResponsePackage};
@@ -71,12 +73,11 @@ use crate::transport::handshake::receipt::{
 	ReceiptApprover, ReceiptRole, SessionObserver, SessionOutcome, SessionReceipt, SessionVerdict, StoredReceipt,
 };
 use crate::transport::handshake::{
-	CompressedPoint, EpochMaterials, EpochSecret, HandshakeCurve, HandshakeError, HandshakeOctets, HandshakeProvider,
-	PeerEphemeral,
+	AgreementCertificate, CompressedPoint, EpochMaterials, EpochSecret, HandshakeCurve, HandshakeError,
+	HandshakeOctets, HandshakeProvider, PeerEphemeral, ServerKeys, SessionPeer,
 };
 use crate::transport::multiplex::MuxRole;
 use crate::utils::marker::{MaybeSend, MaybeSendFuture};
-use crate::x509::Certificate;
 
 /// Shared epoch state and identities for one session's rekey exchanges.
 ///
@@ -85,9 +86,10 @@ use crate::x509::Certificate;
 /// - the epoch secret chain,
 /// - the initial receipt terms, which are the credit-match reference,
 /// - the local signing identity, and
-/// - the peer's certificate, admitted for signing, whose key verifies the
-///   peer's receipt signatures and which each rekey ephemeral is parsed
-///   beside.
+/// - the peer the session recorded: its certificate, admitted for signing,
+///   whose key verifies the peer's receipt signatures and which each rekey
+///   ephemeral is parsed beside, and the key of a CMS server's key-agreement
+///   certificate.
 ///
 /// The provider's cipher type names the AEAD, and its curve the agreement.
 pub(crate) struct RekeyMaterials<P>
@@ -98,6 +100,10 @@ where
 	reference: SessionReceipt,
 	identity: SigningIdentity,
 	peer: PeerCertificate<Signing<P>>,
+	/// The key of a CMS server's key-agreement certificate as a point of the
+	/// handshake curve, which each server ephemeral must differ from beside
+	/// the key of [`Self::peer`]. A client's certificate carries none.
+	peer_key_agreement: Option<PublicKey<P::Curve>>,
 }
 
 /// Fresh per-direction state produced by a completed exchange.
@@ -123,18 +129,28 @@ impl<P> RekeyMaterials<P>
 where
 	P: HandshakeProvider,
 {
-	/// Materials for a session whose peer presented `peer`.
+	/// Materials for a session whose peer the session recorded as `peer`, its
+	/// certificate admitted for signing under `purpose`, the key purpose of
+	/// the peer's role.
 	///
-	/// The key that verifies the peer's receipt signatures and the key each
-	/// rekey ephemeral is compared with are the one key of `peer`, so the two
-	/// cannot name different peers.
+	/// The key of `peer` verifies the peer's receipt signatures, and each rekey
+	/// ephemeral is compared with it and with the key-agreement key of a CMS
+	/// server, so each key a rekey reads names the one peer.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::CertificateValidationError`] -- the signing use or `purpose` refuses `peer`.
 	pub(crate) fn new(
 		epoch: EpochMaterials,
 		reference: SessionReceipt,
 		identity: SigningIdentity,
-		peer: PeerCertificate<Signing<P>>,
-	) -> Self {
-		Self { epoch, reference, identity, peer }
+		peer: &SessionPeer,
+		purpose: ObjectIdentifier,
+	) -> Result<Self, HandshakeError> {
+		let signing = PeerCertificate::parse(Arc::clone(peer.certificate()), purpose)?;
+		let key_agreement = peer.key_agreement();
+		let peer_key_agreement = key_agreement.and_then(|certificate| certificate.agreement_point::<P::Curve>());
+		Ok(Self { epoch, reference, identity, peer: signing, peer_key_agreement })
 	}
 
 	/// The current epoch number.
@@ -201,6 +217,8 @@ impl<P> ClientRekey<P>
 where
 	P: HandshakeProvider,
 {
+	/// The client half over `materials`, whose peer is the server. Each server
+	/// ephemeral must differ from every static key of that server.
 	pub(crate) fn new(materials: RekeyMaterials<P>, approver: Option<Arc<dyn ReceiptApprover>>) -> Self {
 		Self { materials, approver, pending: None }
 	}
@@ -250,7 +268,7 @@ where
 	/// - [`HandshakeError::ReceiptMismatch`] -- the exchange pin or the credit match fails.
 	/// - [`HandshakeError::SignatureVerificationFailed`] -- the server `SignerInfo` is invalid.
 	/// - [`HandshakeError::InvalidPublicKey`] -- the server ephemeral is not a point on the curve.
-	/// - [`HandshakeError::ServerEphemeralIsStatic`] -- the server ephemeral is the server's static key.
+	/// - [`HandshakeError::ServerEphemeralIsStatic`] -- the server ephemeral is a static key of the server.
 	/// - [`HandshakeError::ApprovalRefused`] -- the approver refuses the renewal.
 	pub(crate) async fn process_response(
 		&mut self,
@@ -278,9 +296,12 @@ where
 		receipt.verify_terms(&challenge_hash, reference_budgets, reference_unit)?;
 
 		// The receipt the server signed pins its ephemeral, so the point is
-		// authenticated here. The agreement takes the scalar by value and runs
-		// before the approver is awaited, so no await of this step holds it.
-		let server_ephemeral = self.materials.peer.server_ephemeral(&server_point)?;
+		// authenticated here, and it must differ from every static key of the
+		// server. The agreement takes the scalar by value and runs before the
+		// approver is awaited, so no await of this step holds it.
+		let materials = &self.materials;
+		let keys = ServerKeys { signing: &materials.peer, key_agreement: materials.peer_key_agreement.as_ref() };
+		let server_ephemeral = keys.server_ephemeral(&server_point)?;
 		let salt = RandomsSalt::new(&client_random, &server_random);
 		let next_secret = epoch.secret.next::<P>(ephemeral, &server_ephemeral, salt.as_kdf_salt())?;
 
@@ -290,11 +311,14 @@ where
 		let countersignature = receipt.countersign(answer_bytes, identity).await?;
 
 		// The countersignature has two owners by design. One copy folds into
-		// the retained artifact, and the other is DER-encoded into the ack.
-		let completed = artifact.with_signer(countersignature.clone())?;
+		// the retained artifact, and the other is DER-encoded into the ack. The
+		// artifact carries its own copy of the client's certificate, since a
+		// `CertificateSet` owns each certificate it holds.
+		let signer = countersignature.signer().clone();
+		let completed = artifact.with_certified_signer(countersignature)?;
 		let stored = StoredReceipt::try_from(completed)?;
 
-		let ack = MuxRekeyAckPackage::new(Some(countersignature));
+		let ack = MuxRekeyAckPackage::new(Some(signer));
 		let ack_der = ack.to_der()?;
 		let next_hash = self
 			.materials
@@ -338,7 +362,6 @@ where
 	materials: RekeyMaterials<P>,
 	authorizer: Option<Arc<dyn TransportAuthorizer>>,
 	observer: Option<Arc<dyn SessionObserver>>,
-	client_certificate: Option<Arc<Certificate>>,
 	pending: Option<PendingSettlement>,
 }
 
@@ -346,13 +369,14 @@ impl<P> ServerRekey<P>
 where
 	P: HandshakeProvider,
 {
+	/// The server half over `materials`, whose peer is the client, which
+	/// each outcome names to `observer`.
 	pub(crate) fn new(
 		materials: RekeyMaterials<P>,
 		authorizer: Option<Arc<dyn TransportAuthorizer>>,
 		observer: Option<Arc<dyn SessionObserver>>,
-		client_certificate: Option<Arc<Certificate>>,
 	) -> Self {
-		Self { materials, authorizer, observer, client_certificate, pending: None }
+		Self { materials, authorizer, observer, pending: None }
 	}
 
 	/// The current epoch number, which unit tests observe.
@@ -466,21 +490,19 @@ where
 		let ack_der = ack.to_der()?;
 		let MuxRekeyAckPackage { countersignature } = ack;
 		let countersignature = countersignature.map(|boxed| *boxed);
-
-		let (verdict, ancillary_response) = pending
-			.receipt
-			.settle_ack::<P>(countersignature.as_deref(), &self.materials.peer, self.authorizer.as_deref())
-			.await?;
-
 		let countersignature_der = countersignature.as_ref().map(Encode::to_der).transpose()?;
 
-		// A verified countersignature completes the artifact. A failed one
-		// stays out of it, but its DER remains in the outcome as evidence.
-		let artifact = match (verdict, countersignature) {
-			(SessionVerdict::Activated | SessionVerdict::SettlementRejected { .. }, Some(signer)) => {
-				pending.artifact.with_signer(signer)?
-			}
-			(_, _) => pending.artifact,
+		let (verdict, ancillary_response, countersigner) = pending
+			.receipt
+			.settle_ack::<P>(countersignature, &self.materials.peer, self.authorizer.as_deref())
+			.await?;
+
+		// A verified countersignature completes the artifact, beside the
+		// client's certificate it verified under. A failed one stays out of it,
+		// but its DER remains in the outcome as evidence.
+		let artifact = match countersigner {
+			Some(countersigner) => pending.artifact.with_certified_signer(countersigner)?,
+			None => pending.artifact,
 		};
 
 		// The refusal path still needs the dual-signed view after the
@@ -491,7 +513,7 @@ where
 		};
 
 		let countersignature_octet = countersignature_der.map(OctetString::new).transpose()?;
-		let client_certificate = self.client_certificate.as_ref().map(Arc::clone);
+		let client_certificate = Some(Arc::clone(self.materials.peer.certificate()));
 		let outcome = SessionOutcome {
 			receipt: pending.receipt,
 			artifact,
@@ -659,7 +681,20 @@ pub(crate) mod tests {
 	use crate::transport::handshake::negotiation::MuxBudgets;
 	use crate::transport::handshake::primitives::KdfSalt;
 	use crate::transport::handshake::tests::{fixture_handshake_secret, fixture_transcript, off_curve_point};
+	use crate::x509::Certificate;
 	use crate::TightBeamError;
+
+	#[cfg(feature = "transport-cms")]
+	mod cms_session {
+		pub use crate::testing::{TestCmsServer, TestKey};
+		pub use crate::transport::handshake::EstablishedSession;
+		pub use crate::transport::multiplex::MuxRekeyContext;
+		pub use crate::transport::state::{EncryptedProtocolState, EncryptionConfig, SessionPhase, SessionState};
+		pub use crate::transport::TransportLimits;
+	}
+
+	#[cfg(feature = "transport-cms")]
+	use cms_session::*;
 
 	/// The provider every rekey test runs under.
 	type Provider = DefaultCryptoProvider;
@@ -681,12 +716,10 @@ pub(crate) mod tests {
 	}
 
 	impl Identity {
-		/// The certificate the party presents, admitted for signing as its
-		/// peer holds it.
-		fn peer(&self) -> PeerCertificate<Signing<Provider>> {
-			let certificate = self.signing.certificate_arc();
-			let peer = PeerCertificate::parse(certificate, KeyPurposes::HOUSE.server);
-			peer.expect("a test identity's certificate is admitted for signing")
+		/// The party as its peer's session records it, by the certificate it
+		/// presents.
+		fn peer(&self) -> SessionPeer {
+			SessionPeer::from(self.signing.certificate_arc())
 		}
 	}
 
@@ -755,7 +788,7 @@ pub(crate) mod tests {
 		let identity = test_identity()?;
 		let peer = test_identity()?;
 		let reference = sample_reference(SAMPLE_CREDIT_UNIT)?;
-		Ok(RekeyMaterials::new(epoch, reference, identity.signing, peer.peer()))
+		RekeyMaterials::new(epoch, reference, identity.signing, &peer.peer(), KeyPurposes::HOUSE.server)
 	}
 
 	/// The SHA3-256 `DigestInfo` a receipt carries for `hash`.
@@ -784,25 +817,39 @@ pub(crate) mod tests {
 	}
 
 	fn rekey_parties() -> Result<Parties, HandshakeError> {
+		rekey_parties_with(SessionPeer::from, None)
+	}
+
+	/// The parties of [`rekey_parties`], whose client renews with the peer
+	/// `server` makes of the server's signing certificate, as a CMS client
+	/// renews with the server's key-agreement certificate beside it, and
+	/// whose server reports each outcome to `observer`.
+	fn rekey_parties_with(
+		server: impl FnOnce(Arc<Certificate>) -> SessionPeer,
+		observer: Option<Arc<dyn SessionObserver>>,
+	) -> Result<Parties, HandshakeError> {
 		let client_identity = test_identity()?;
 		let server_identity = test_identity()?;
 		let reference = sample_reference(SAMPLE_CREDIT_UNIT)?;
 
+		let server_peer = server(server_identity.signing.certificate_arc());
 		let client_materials = RekeyMaterials::new(
 			sample_epoch()?,
 			reference.to_owned(),
 			client_identity.signing.clone(),
-			server_identity.peer(),
-		);
+			&server_peer,
+			KeyPurposes::HOUSE.server,
+		)?;
 		let server_materials = RekeyMaterials::new(
 			sample_epoch()?,
 			reference,
 			server_identity.signing.clone(),
-			client_identity.peer(),
-		);
+			&client_identity.peer(),
+			KeyPurposes::HOUSE.client,
+		)?;
 
 		let client = ClientRekey::new(client_materials, None);
-		let server = ServerRekey::new(server_materials, None, None, None);
+		let server = ServerRekey::new(server_materials, None, observer);
 		Ok(Parties { client, server, client_identity, server_identity })
 	}
 
@@ -825,6 +872,43 @@ pub(crate) mod tests {
 		let outcome = server.process_ack(ack).await?;
 		assert!(outcome.rejection.is_none());
 		Ok((client_install, outcome.install))
+	}
+
+	/// Records the client certificate that each outcome a server reports
+	/// names.
+	#[derive(Default)]
+	struct ClientCertificateObserver(std::sync::Mutex<Vec<Option<Arc<Certificate>>>>);
+
+	impl ClientCertificateObserver {
+		/// The client certificates the server reported, in order.
+		fn reported(&self) -> Vec<Option<Arc<Certificate>>> {
+			let reported = self.0.lock().expect("no observer panicked while holding the record");
+			reported.to_owned()
+		}
+	}
+
+	impl SessionObserver for ClientCertificateObserver {
+		fn on_outcome<'a>(&'a self, outcome: &'a SessionOutcome) -> MaybeSendFuture<'a, ()> {
+			Box::pin(async move {
+				let mut reported = self.0.lock().expect("no observer panicked while holding the record");
+				reported.push(outcome.client_certificate.as_ref().map(Arc::clone));
+			})
+		}
+	}
+
+	/// A server rekey names to its observer the client whose certificate its
+	/// materials verify the countersignature under.
+	#[tokio::test]
+	async fn a_server_rekey_reports_the_client_of_its_materials() -> Result<(), Box<dyn std::error::Error>> {
+		let observer = Arc::new(ClientCertificateObserver::default());
+		let reporting = Arc::clone(&observer) as Arc<dyn SessionObserver>;
+		let parties = rekey_parties_with(SessionPeer::from, Some(reporting))?;
+		let Parties { mut client, mut server, client_identity, .. } = parties;
+		run_exchange(&mut client, &mut server).await?;
+
+		let expected = Some(client_identity.signing.certificate_arc());
+		assert_eq!(observer.reported(), vec![expected]);
+		Ok(())
 	}
 
 	#[tokio::test]
@@ -1077,7 +1161,7 @@ pub(crate) mod tests {
 
 		let intruder = test_identity()?;
 		let forged = receipt.countersign(None, &intruder.signing).await?;
-		let foreign_ack = MuxRekeyAckPackage::new(Some(forged));
+		let foreign_ack = MuxRekeyAckPackage::new(Some(forged.signer().to_owned()));
 		let foreign = server.process_ack(foreign_ack).await;
 		assert!(matches!(foreign, Err(HandshakeError::SignatureVerificationFailed)));
 		Ok(())
@@ -1203,6 +1287,115 @@ pub(crate) mod tests {
 		let (_receipt, artifact) = issuing.await?;
 
 		let response = MuxRekeyResponsePackage::new(SAMPLE_SERVER_RANDOM, &static_point, Some(artifact))?;
+		let refused = client.process_response(response).await;
+		assert!(matches!(refused, Err(HandshakeError::ServerEphemeralIsStatic)));
+		Ok(())
+	}
+
+	/// The session of a CMS client, as a transport holds it once the
+	/// handshake completed.
+	#[cfg(feature = "transport-cms")]
+	struct CmsClientProbe {
+		state: SessionState<DefaultCryptoProvider>,
+		limits: TransportLimits,
+	}
+
+	#[cfg(feature = "transport-cms")]
+	impl crate::transport::state::sealed::Sealed for CmsClientProbe {}
+
+	#[cfg(feature = "transport-cms")]
+	impl EncryptedProtocolState for CmsClientProbe {
+		type CryptoProvider = DefaultCryptoProvider;
+
+		fn limits(&self) -> &TransportLimits {
+			&self.limits
+		}
+
+		fn session_state(&self) -> &SessionState<DefaultCryptoProvider> {
+			&self.state
+		}
+
+		fn session_state_mut(&mut self) -> &mut SessionState<DefaultCryptoProvider> {
+			&mut self.state
+		}
+	}
+
+	/// The session a client of `server` established with a dual-signed
+	/// receipt of the sample terms and the sample epoch, keeping `server`'s
+	/// key-agreement certificate as a CMS client's session keeps it.
+	#[cfg(feature = "transport-cms")]
+	async fn cms_client_session(server: &TestCmsServer) -> CmsClientProbe {
+		let client = TestIdentity::of(&Secp256k1SigningKey::random(&mut OsRng));
+		let signer = server.signing_identity();
+		let issuing = SessionReceipt::issue(sample_chain_root(), SAMPLE_BUDGETS, SAMPLE_CREDIT_UNIT, None, &signer);
+		let (receipt, artifact) = issuing.await.expect("the server signs the receipt");
+		let countersignature = receipt.countersign(None, &client).await.expect("the client countersigns");
+		let completed = artifact.with_certified_signer(countersignature);
+		let stored = StoredReceipt::try_from(completed.expect("the receipt joins")).expect("the receipt is complete");
+
+		let keys = SessionKeys::for_client(TestKey::insecure_directional_keys());
+		let peer = SessionPeer::paired(Arc::new(server.signing.to_owned()), Arc::new(server.key_agreement.to_owned()));
+		let epoch = sample_epoch().expect("the sample epoch derives");
+		let session = EstablishedSession::new(keys, None, Some(Arc::new(stored)), Some(peer), Some(epoch));
+		let encryption = EncryptionConfig { client_identity: Some(client), ..EncryptionConfig::unconfigured() };
+		let state = SessionState::at(encryption, SessionPhase::Encrypted(Box::new(session)));
+
+		CmsClientProbe { state, limits: TransportLimits::default() }
+	}
+
+	/// The client half of the rekey `probe`'s session hands over.
+	#[cfg(feature = "transport-cms")]
+	fn client_exchange(probe: &mut CmsClientProbe) -> Arc<FuturesMutex<Box<dyn ClientRekeyExchange>>> {
+		let context = MuxRekeyContext::detach(probe, MuxRole::Client).expect("the session detaches its rekey");
+		let context = context.expect("a receipt-bearing session renews");
+		let RekeyDriver::Client(exchange) = context.driver else {
+			panic!("the client role yields the client half");
+		};
+
+		exchange
+	}
+
+	/// The rekey a CMS client's session hands over compares a server ephemeral
+	/// with the key of the server's key-agreement certificate the session
+	/// kept, so a renewal that names that key is refused.
+	#[cfg(feature = "transport-cms")]
+	#[tokio::test]
+	async fn a_cms_session_hands_its_rekey_the_key_agreement_key() -> Result<(), Box<dyn std::error::Error>> {
+		let server = TestCmsServer::generate("tightbeam rekey server");
+		let mut probe = cms_client_session(&server).await;
+		let exchange = client_exchange(&mut probe);
+		let mut exchange = exchange.lock().await;
+		let request = exchange.start_renewal()?;
+		let point = point_of(&PublicKey::from(server.key_agreement_key.verifying_key()));
+		let pin = sample_epoch()?.exchange_pin::<Sha3_256>(request.to_der()?, &SAMPLE_SERVER_RANDOM, &point)?;
+		let signer = server.signing_identity();
+		let issuing = SessionReceipt::issue(pin, SAMPLE_BUDGETS, SAMPLE_CREDIT_UNIT, None, &signer);
+		let (_receipt, artifact) = issuing.await?;
+
+		let response = MuxRekeyResponsePackage::new(SAMPLE_SERVER_RANDOM, &point, Some(artifact))?;
+		let refused = exchange.process_response(response).await;
+		assert!(matches!(refused, Err(HandshakeError::ServerEphemeralIsStatic)));
+		Ok(())
+	}
+
+	/// A server ephemeral that is the key of a CMS server's key-agreement
+	/// certificate is refused, as the handshake refuses it, even under a
+	/// receipt the server signed over it.
+	#[tokio::test]
+	async fn a_server_ephemeral_equal_to_the_key_agreement_key_is_refused() -> Result<(), HandshakeError> {
+		let key_agreement_key = Secp256k1SigningKey::random(&mut OsRng);
+		let key_agreement = Arc::new(TestCertificate::self_signed(&key_agreement_key));
+		let paired = |signing| SessionPeer::paired(signing, key_agreement);
+		let Parties { mut client, server_identity, .. } = rekey_parties_with(paired, None)?;
+		let request = client.start_renewal()?;
+		let key_agreement_point = point_of(&PublicKey::from(key_agreement_key.verifying_key()));
+		let epoch = sample_epoch()?;
+		let pin = epoch.exchange_pin::<Sha3_256>(request.to_der()?, &SAMPLE_SERVER_RANDOM, &key_agreement_point)?;
+		let signer = &server_identity.signing;
+		let issuing = SessionReceipt::issue(pin, SAMPLE_BUDGETS, SAMPLE_CREDIT_UNIT, None, signer);
+		let (_receipt, artifact) = issuing.await?;
+
+		let response = MuxRekeyResponsePackage::new(SAMPLE_SERVER_RANDOM, &key_agreement_point, Some(artifact))?;
 		let refused = client.process_response(response).await;
 		assert!(matches!(refused, Err(HandshakeError::ServerEphemeralIsStatic)));
 		Ok(())

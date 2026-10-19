@@ -74,13 +74,13 @@ use crate::Frame;
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 use crate::constants::DEFAULT_HOP_BUDGET;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::crypto::x509::{KeyPurposes, PeerCertificate, Signing};
+use crate::crypto::x509::KeyPurposes;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::der::asn1::ObjectIdentifier;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::receipt::StoredReceipt;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::transport::handshake::HandshakeProvider;
+use crate::transport::handshake::{EstablishedSession, HandshakeProvider};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::rekey::{ClientRekey, RekeyDriver, RekeyMaterials, ServerRekey};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -415,23 +415,26 @@ impl MuxRekeyContext {
 			return Ok(None);
 		};
 
-		let Some(peer_certificate) = state.session_state().peer_certificate_arc() else {
+		let established = state.session_state().established();
+		let Some(session_peer) = established.and_then(EstablishedSession::session_peer).cloned() else {
 			return Ok(None);
 		};
 
 		// The peer serves the other role, under the key purpose the handshake
 		// admitted it for.
 		let purpose = role.peer_purpose(&state.encryption().key_purposes);
-		let peer = PeerCertificate::<Signing<P>>::parse(Arc::clone(&peer_certificate), purpose)?;
 
-		// The materials detach last, so a session refused above keeps them.
+		// The materials detach after the refusals above, so a refused session
+		// keeps them.
 		let Some(epoch) = state.session_state_mut().take_epoch_materials() else {
 			return Ok(None);
 		};
 
+		// A rekey's server ephemeral differs from every static key the
+		// handshake compared it with, a CMS server's key-agreement key among
+		// them, so the materials take the whole peer the session recorded.
 		let reference_receipt = stored.receipt().clone();
-		let materials = RekeyMaterials::<P>::new(epoch, reference_receipt, identity, peer);
-
+		let materials = RekeyMaterials::<P>::new(epoch, reference_receipt, identity, &session_peer, purpose)?;
 		let driver = match role {
 			MuxRole::Client => {
 				let approver = state.encryption().receipt_approver.as_ref().map(Arc::clone);
@@ -443,7 +446,6 @@ impl MuxRekeyContext {
 					materials,
 					state.encryption().transport_authorizer.as_ref().map(Arc::clone),
 					state.encryption().session_observer.as_ref().map(Arc::clone),
-					Some(peer_certificate),
 				);
 				RekeyDriver::server(exchange)
 			}

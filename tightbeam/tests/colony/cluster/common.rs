@@ -208,6 +208,10 @@ impl CertificateTrust for SwitchTrust {
 		self.current().verify_chain(chain)
 	}
 
+	fn trust_anchor(&self, cert: &Certificate) -> Result<Arc<Certificate>, CertificateValidationError> {
+		self.current().trust_anchor(cert)
+	}
+
 	fn find_by_signer_identifier(&self, sid: &SignerIdentifier) -> Option<&PeerCertificate<ErasedSigning>> {
 		self.current().find_by_signer_identifier(sid)
 	}

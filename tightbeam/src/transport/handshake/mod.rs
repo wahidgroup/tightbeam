@@ -231,6 +231,11 @@ pub(crate) use peer::AdmittedPeer;
 pub use peer::LearnedTrust;
 #[cfg(feature = "transport-cms")]
 pub use peer::ProvisionedTrust;
+#[cfg(all(
+	feature = "transport-multiplex",
+	any(feature = "transport-cms", feature = "transport-hpke")
+))]
+pub(crate) use peer::{AgreementCertificate, ServerKeys};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub use schedule::HandshakeSecret;
 #[cfg(all(
@@ -374,8 +379,11 @@ impl<P> HandshakeProvider for P where
 {
 }
 
-/// One provisioned certificate of a CMS server, for a CMS client handshake:
-/// a leaf, or a chain that ends at the leaf.
+/// The certificate a CMS client pins for its server: the server's
+/// key-agreement certificate, a leaf or a chain that ends at the leaf.
+///
+/// Its `keyUsage` asserts the bit of the provider's KEM,
+/// [`RecipientKem::USAGE`]: `keyAgreement` for the house DHKEM.
 #[cfg(feature = "transport-cms")]
 #[derive(Clone)]
 pub enum CmsServerIdentity {
@@ -430,23 +438,6 @@ impl CmsServerChain {
 	pub fn leaf(&self) -> &Arc<Certificate> {
 		&self.leaf
 	}
-}
-
-/// The two provisioned certificates of a CMS server: the one whose key signs
-/// the reply, and the one whose key the opening seals the base secret to.
-///
-/// The fields carry their roles by name, so the two cannot be swapped by
-/// position. [`ProvisionedTrust::new`] admits the pair against a store.
-#[cfg(feature = "transport-cms")]
-#[derive(Clone)]
-pub struct CmsServerCertificates {
-	/// The server's signing certificate, with `digitalSignature` in its
-	/// `keyUsage`.
-	pub signing: CmsServerIdentity,
-	/// The server's key-agreement certificate, whose `keyUsage` asserts the
-	/// bit of the provider's KEM, [`RecipientKem::USAGE`]: `keyAgreement` for
-	/// the house DHKEM.
-	pub key_agreement: CmsServerIdentity,
 }
 
 #[cfg(feature = "transport-cms")]
@@ -584,6 +575,68 @@ impl TryFrom<ContentInfo> for HandshakeMessage {
 	}
 }
 
+/// The peer a session recorded: the certificate the handshake validated,
+/// and for a CMS server the key-agreement certificate the admission paired
+/// with it.
+///
+/// Its fields are private to this module, so a key-agreement certificate
+/// travels only beside the signing certificate it was paired with.
+#[derive(Clone)]
+pub(crate) struct SessionPeer {
+	/// The certificate the handshake validated: the client's under mutual
+	/// authentication, or the server's signing certificate.
+	certificate: Arc<Certificate>,
+	/// The key-agreement certificate of a CMS server, whose key a rekey's
+	/// server ephemeral must differ from, as the handshake's did.
+	#[cfg(all(
+		feature = "transport-multiplex",
+		any(feature = "transport-cms", feature = "transport-hpke")
+	))]
+	key_agreement: Option<Arc<Certificate>>,
+}
+
+/// A peer of one certificate: a client, or an HPKE server.
+impl From<Arc<Certificate>> for SessionPeer {
+	fn from(certificate: Arc<Certificate>) -> Self {
+		Self {
+			certificate,
+			#[cfg(all(
+				feature = "transport-multiplex",
+				any(feature = "transport-cms", feature = "transport-hpke")
+			))]
+			key_agreement: None,
+		}
+	}
+}
+
+impl SessionPeer {
+	/// A CMS server of `certificate`, its signing certificate, beside
+	/// `key_agreement`, the key-agreement certificate paired with it, for a
+	/// test that builds a session.
+	#[cfg(all(
+		test,
+		feature = "transport-multiplex",
+		any(feature = "transport-cms", feature = "transport-hpke")
+	))]
+	pub(crate) fn paired(certificate: Arc<Certificate>, key_agreement: Arc<Certificate>) -> Self {
+		Self { certificate, key_agreement: Some(key_agreement) }
+	}
+
+	/// The certificate the handshake validated.
+	pub(crate) fn certificate(&self) -> &Arc<Certificate> {
+		&self.certificate
+	}
+
+	/// The key-agreement certificate of a CMS server.
+	#[cfg(all(
+		feature = "transport-multiplex",
+		any(feature = "transport-cms", feature = "transport-hpke")
+	))]
+	pub(crate) fn key_agreement(&self) -> Option<&Certificate> {
+		self.key_agreement.as_deref()
+	}
+}
+
 /// What a completed handshake agreed, handed over in one value.
 ///
 /// A handshake settles the keys and the terms that go with them at the same
@@ -599,8 +652,8 @@ pub struct EstablishedSession {
 	mux: Option<MuxSettings>,
 	/// Dual-signed receipt from a budget-bearing handshake.
 	receipt: Option<Arc<StoredReceipt>>,
-	/// Peer certificate validated during mutual authentication.
-	peer: Option<Arc<Certificate>>,
+	/// The peer the handshake validated.
+	peer: Option<SessionPeer>,
 	/// Epoch-0 rekey materials, present exactly while a rekey could use them.
 	epoch: Option<EpochMaterials>,
 }
@@ -617,7 +670,7 @@ impl EstablishedSession {
 		keys: SessionKeys,
 		mux: Option<MuxSettings>,
 		receipt: Option<Arc<StoredReceipt>>,
-		peer: Option<Arc<Certificate>>,
+		peer: Option<SessionPeer>,
 		epoch: Option<EpochMaterials>,
 	) -> Self {
 		let renewable = receipt.is_some() && peer.is_some();
@@ -625,6 +678,15 @@ impl EstablishedSession {
 		let epoch = epoch.filter(|_| renewable);
 
 		Self { keys, mux, receipt, peer, epoch }
+	}
+
+	/// The peer the handshake validated, which a rekey renews against.
+	#[cfg(all(
+		feature = "transport-multiplex",
+		any(feature = "transport-cms", feature = "transport-hpke")
+	))]
+	pub(crate) fn session_peer(&self) -> Option<&SessionPeer> {
+		self.peer.as_ref()
 	}
 
 	/// Detach the epoch rekey materials, once.
@@ -661,12 +723,14 @@ impl EstablishedSession {
 
 	/// Peer certificate validated during mutual authentication.
 	pub fn peer(&self) -> Option<&Certificate> {
-		self.peer.as_deref()
+		let peer = self.peer.as_ref();
+		peer.map(|peer| peer.certificate().as_ref())
 	}
 
 	/// Shared handle to the validated peer certificate.
 	pub fn peer_arc(&self) -> Option<Arc<Certificate>> {
-		self.peer.as_ref().map(Arc::clone)
+		let peer = self.peer.as_ref();
+		peer.map(|peer| Arc::clone(peer.certificate()))
 	}
 
 	/// Shared handle to the dual-signed session receipt.
@@ -790,8 +854,9 @@ pub enum HandshakeProtocolKind {
 	///
 	/// The client seals its first message to the server's key-agreement
 	/// certificate and signs its Finished, so it MUST provision a trust store,
-	/// the server's two certificates, and a client identity. A missing one
-	/// fails closed, and so does this kind without the `transport-cms` feature.
+	/// the server's key-agreement certificate, and a client identity. A
+	/// missing one fails closed, and so does this kind without the
+	/// `transport-cms` feature.
 	Cms,
 }
 

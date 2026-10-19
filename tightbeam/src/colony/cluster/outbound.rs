@@ -37,12 +37,13 @@ pub struct ClusterPools<P: Protocol> {
 /// Outbound trust store composed with the operator validator chain.
 ///
 /// The handshake client validates the server identity through the pool
-/// trust store on two paths:
+/// trust store on three paths:
 ///
 /// - [`CertificateValidation::evaluate`] for a bare certificate.
 /// - [`CertificateTrust::verify_chain`] for a provisioned chain.
+/// - [`CertificateTrust::trust_anchor`] for a certificate whose trust anchor the client compares.
 ///
-/// This composite appends `ClusterTlsConfig::validators` to both paths, so
+/// This composite appends `ClusterTlsConfig::validators` to each path, so
 /// each outbound dial enforces the operator's extra checks (pinning,
 /// expiry, policy).
 ///
@@ -98,6 +99,12 @@ impl CertificateTrust for ValidatedTrust {
 		// on a CA.
 		let leaf = chain.last().ok_or(CertificateValidationError::EmptyChain)?;
 		self.validate_leaf(leaf)
+	}
+
+	fn trust_anchor(&self, cert: &Certificate) -> Result<Arc<Certificate>, CertificateValidationError> {
+		let anchor = self.store.trust_anchor(cert)?;
+		self.validate_leaf(cert)?;
+		Ok(anchor)
 	}
 
 	fn find_by_signer_identifier(
@@ -243,5 +250,16 @@ mod tests {
 
 		let composed = validated_trust(store, &[Arc::new(RejectAll)]);
 		assert!(composed.verify_chain(&chain).is_err());
+	}
+
+	/// The operator validators run on the anchor path as well, so a
+	/// certificate the store anchors is refused when a validator refuses it.
+	#[test]
+	fn operator_validator_rejects_store_anchored_certificate() {
+		let cert = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+		let composed = validated_trust(trust_of(&cert), &[Arc::new(RejectAll)]);
+
+		let refused = composed.trust_anchor(&cert);
+		assert!(matches!(refused, Err(CertificateValidationError::CertificateDenied)));
 	}
 }

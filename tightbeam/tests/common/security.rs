@@ -407,6 +407,7 @@ mod hpke_handshake {
 	) -> ClientConfig<Hpke, P> {
 		let mut settings = HpkeClientSettings::new(LearnedTrust::from(validator));
 		settings.identity = Some(identity);
+
 		let config = ClientConfig::new(settings, KeyPurposes::HOUSE);
 		config.expect("a test client identity serves the client role")
 	}
@@ -420,6 +421,7 @@ mod hpke_handshake {
 	) -> ServerConfig<Hpke, P> {
 		let settings = HpkeServerSettings::new();
 		let profiles = SupportedProfiles::new(profiles).expect("a server fixture runs at least one profile");
+
 		let config = ServerConfig::new(settings, materials.identity(), profiles, KeyPurposes::HOUSE);
 		config.expect("a test server identity serves the server role")
 	}
@@ -438,6 +440,7 @@ mod hpke_handshake {
 	pub fn hello_opening(hello: &ClientHello) -> HandshakeMessage {
 		let der = hello.to_der().expect("a ClientHello encodes");
 		let content = Any::new(Tag::OctetString, der).expect("the hello fits an OCTET STRING");
+
 		let opening = HandshakeMessage::try_from(ContentInfo { content_type: DATA, content });
 		opening.expect("the opening encodes")
 	}
@@ -489,7 +492,8 @@ mod cms_pair {
 
 	/// The configuration of a CMS client that presents `identity` and seals
 	/// to the CMS server of `materials`, whose two certificates the store of
-	/// their authority admits.
+	/// their authority admits: the one it pins, and the one the reply
+	/// carries.
 	pub fn cms_client_config<P: HandshakeProvider<Kem = DhKemSecp256k1>>(
 		materials: &ServerMaterials,
 		identity: SigningIdentity,

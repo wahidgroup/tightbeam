@@ -84,9 +84,7 @@ mod cms_server {
 	pub use crate::crypto::x509::store::{
 		CertificateTrustBuilder, CertificateTrustStore, NoRevocation, RevocationChecker, TrustBuilder,
 	};
-	pub use crate::transport::handshake::{
-		CmsIdentityPair, CmsServerCertificates, CmsServerIdentity, ProvisionedTrust,
-	};
+	pub use crate::transport::handshake::{CmsIdentityPair, ProvisionedTrust};
 }
 
 #[cfg(feature = "transport-cms")]
@@ -768,7 +766,6 @@ impl TestKey {
 	#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 	pub fn insecure_fixed_cipher() -> ([u8; 32], Aes256GcmKeyProvider) {
 		let key_bytes = [0x33; 32];
-
 		let cipher = Aes256GcmKeyProvider::new(key_bytes.to_vec(), b"tb/test/kek/v1".to_vec());
 		let cipher = cipher.expect("32 octets is the key of AES-256 key wrap");
 		(key_bytes, cipher)
@@ -797,14 +794,12 @@ impl TestCertificate {
 	}
 
 	/// Builds a [`Self::with_uri_sans`] variant with a `CN=<cn>` subject and
-	/// issuer.
+	/// issuer, for a test whose certificates each need a name of their own.
 	///
-	/// Trust-store issuer selection commits to the first subject-DN match (see
-	/// [`CertificateValidation::evaluate`]), so a store that anchors more than
-	/// one self-signed identity needs each under a distinct DN. The
-	/// empty-subject SAN fixtures all share one DN and would collide.
+	/// [`CertificateTrustStore::evaluate`] states how a store selects the
+	/// issuer of a certificate.
 	///
-	/// [`CertificateValidation::evaluate`]: crate::crypto::x509::policy::CertificateValidation::evaluate
+	/// [`CertificateTrustStore::evaluate`]: crate::crypto::x509::store::CertificateTrustStore#method.evaluate
 	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 	pub fn with_cn_and_uri_sans(signing_key: &SigningKey, cn: impl AsRef<str>, uris: &[&str]) -> Certificate {
 		let cn = cn.as_ref();
@@ -821,6 +816,7 @@ impl TestCertificate {
 		let extensions = certificate.tbs_certificate.extensions.get_or_insert_with(Vec::new);
 		extensions.retain(|extension| extension.extn_id != SubjectKeyIdentifier::OID);
 		extensions.push(Extension { extn_id: SubjectKeyIdentifier::OID, critical: false, extn_value });
+
 		certificate
 	}
 
@@ -1182,6 +1178,9 @@ impl TestAttributes {
 pub struct TestCmsServer {
 	/// The authority that issued both certificates.
 	pub authority: Certificate,
+	/// The key of [`Self::authority`], which issues further certificates
+	/// under it.
+	pub authority_key: SigningKey,
 	/// The certificate whose key signs the server's reply.
 	pub signing: Certificate,
 	/// The key of [`Self::signing`].
@@ -1220,7 +1219,21 @@ impl TestCmsServer {
 			TestCertificate::issued(&authority_key, &authority_cn, &key_agreement_key, cn, 3, agreement_usage);
 		let key_agreement = key_agreement.expect("the authority issues the key-agreement certificate");
 
-		TestCmsServer { authority, signing, signing_key, key_agreement, key_agreement_key }
+		TestCmsServer { authority, authority_key, signing, signing_key, key_agreement, key_agreement_key }
+	}
+
+	/// A server with fresh keys whose fresh authority issues both
+	/// certificates to `subject`, a name of the caller's shape.
+	pub fn named(subject: RdnSequence) -> Self {
+		let server = TestCmsServer::generate("tightbeam named server");
+		let signing = server.issue_signing(&server.signing_key, subject.to_owned(), 2);
+		let issuer = server.authority.tbs_certificate.subject.to_owned();
+		let usage = vec![test_extension(&KeyUsage(KeyUsages::KeyAgreement.into()))];
+		let key = &server.key_agreement_key;
+		let key_agreement = issue_test_certificate(&server.authority_key, issuer, key, subject, 3, usage);
+		let key_agreement = key_agreement.expect("the authority issues the key-agreement certificate");
+
+		TestCmsServer { signing, key_agreement, ..server }
 	}
 
 	/// The signing identity of the server.
@@ -1243,14 +1256,6 @@ impl TestCmsServer {
 		pair.expect("the two test certificates name one subject with two keys")
 	}
 
-	/// The server's two certificates as a client provisions them, each a
-	/// bare certificate.
-	pub fn certificates(&self) -> CmsServerCertificates {
-		let signing = CmsServerIdentity::Certificate(Arc::new(self.signing.to_owned()));
-		let key_agreement = CmsServerIdentity::Certificate(Arc::new(self.key_agreement.to_owned()));
-		CmsServerCertificates { signing, key_agreement }
-	}
-
 	/// A store that holds the authority of both certificates.
 	pub fn store(&self) -> CertificateTrustStore {
 		self.store_with(NoRevocation)
@@ -1264,11 +1269,47 @@ impl TestCmsServer {
 		builder.expect("the store takes the test authority").build()
 	}
 
-	/// The trust of a client that provisions this server against
-	/// [`Self::store`].
+	/// The trust of a client that pins this server's key-agreement
+	/// certificate, bare, against [`Self::store`].
 	pub fn trust(&self) -> ProvisionedTrust {
-		let trust = ProvisionedTrust::new(self.certificates(), Arc::new(self.store()));
-		trust.expect("the store admits both test certificates as one server")
+		let pinned = Arc::new(self.key_agreement.to_owned());
+		let trust = ProvisionedTrust::new(pinned, Arc::new(self.store()));
+		trust.expect("the store admits the test key-agreement certificate")
+	}
+
+	/// A certificate of the signing key that the authority issues under
+	/// `serial`, apart from [`Self::signing`] in its serial number alone, so
+	/// its `subjectKeyIdentifier` names the same key.
+	pub fn signing_twin(&self, serial: u8) -> Certificate {
+		let subject = self.signing.tbs_certificate.subject.to_owned();
+		self.issue_signing(&self.signing_key, subject, serial)
+	}
+
+	/// This server with both certificates issued again by its authority, each
+	/// with an `extendedKeyUsage` that names `purposes`.
+	pub fn with_key_purposes(self, purposes: &[ObjectIdentifier]) -> Self {
+		let issuer = self.authority.tbs_certificate.subject.to_owned();
+		let purposes = TestCertificate::extension(&ExtendedKeyUsage(purposes.to_vec()), false);
+		let reissue = |certificate: &Certificate, key: &SigningKey, usage: KeyUsages, serial: u8| {
+			let subject = certificate.tbs_certificate.subject.to_owned();
+			let extensions = vec![test_extension(&KeyUsage(usage.into())), purposes.to_owned()];
+			let issued =
+				issue_test_certificate(&self.authority_key, issuer.to_owned(), key, subject, serial, extensions);
+			issued.expect("the authority issues a certificate of the purposes")
+		};
+
+		let signing = reissue(&self.signing, &self.signing_key, KeyUsages::DigitalSignature, 2);
+		let key_agreement = reissue(&self.key_agreement, &self.key_agreement_key, KeyUsages::KeyAgreement, 3);
+		TestCmsServer { signing, key_agreement, ..self }
+	}
+
+	/// A certificate of `key` the authority issues to `subject` under
+	/// `serial`, whose `keyUsage` asserts `digitalSignature` alone.
+	pub fn issue_signing(&self, key: &SigningKey, subject: RdnSequence, serial: u8) -> Certificate {
+		let issuer = self.authority.tbs_certificate.subject.to_owned();
+		let usage = vec![test_extension(&KeyUsage(KeyUsages::DigitalSignature.into()))];
+		let issued = issue_test_certificate(&self.authority_key, issuer, key, subject, serial, usage);
+		issued.expect("the authority issues a signing certificate")
 	}
 }
 

@@ -42,12 +42,12 @@ use crate::transport::handshake::negotiation::{
 	AuthorizedTransport, MuxSettings, ProfilePolicy, SecurityOffer, SupportedProfiles, TransportAuthorizer,
 	TransportNegotiation, TransportOffer,
 };
-use crate::transport::handshake::peer::{AdmittedPeer, AdmittedServer, PeerAuthentication, ServerTrust};
+use crate::transport::handshake::peer::{PeerAuthentication, ServerTrust};
 use crate::transport::handshake::primitives::TranscriptHash;
 use crate::transport::handshake::receipt::{
 	CountersignedReceipt, IssuedReceipt, PendingReceipt, ReceiptApprover, SessionObserver, Settlement, StoredReceipt,
 };
-use crate::transport::handshake::schedule::{Agreed, PeerEphemeral, PeerIdentity, SecretSeal, Terms};
+use crate::transport::handshake::schedule::{Agreed, PeerEphemeral, SecretSeal, Terms};
 use crate::transport::handshake::{
 	Arc, ClientHandshakeProtocol, EstablishedSession, HandshakeMessage, HandshakeProvider, HandshakeSecret,
 	ServerHandshakeProtocol, ServerIdentity,
@@ -76,9 +76,6 @@ pub enum HandshakePhase {
 
 /// The role-generic view of a phase.
 pub trait PhaseView<P: HandshakeProvider>: sealed::Sealed + MaybeSend + MaybeSync + Sized {
-	/// The peer the role records.
-	type Peer: PeerIdentity;
-
 	/// The phase a step leaves behind while it runs.
 	fn spent() -> Self;
 
@@ -92,10 +89,10 @@ pub trait PhaseView<P: HandshakeProvider>: sealed::Sealed + MaybeSend + MaybeSyn
 	fn terms(&self) -> Option<&Terms<P>>;
 
 	/// What the handshake agreed, from the last leg to completion.
-	fn agreed(&self) -> Option<&Agreed<P, Self::Peer>>;
+	fn agreed(&self) -> Option<&Agreed<P>>;
 
 	/// Take what the handshake agreed, or hand the phase back unchanged.
-	fn take_agreed(self) -> Result<Agreed<P, Self::Peer>, Self>;
+	fn take_agreed(self) -> Result<Agreed<P>, Self>;
 }
 
 /// A side of the handshake. The trait is sealed, so [`Client`] and [`Server`]
@@ -160,6 +157,7 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> ClientConfig<F, P> {
 		if let Some(identity) = F::identity(&flow) {
 			identity.certificate().require_purpose(key_purposes.client)?;
 		}
+
 		Ok(Self::admitted(flow, key_purposes))
 	}
 
@@ -203,7 +201,7 @@ pub enum ClientPhase<F: ClientFlow<P>, P: HandshakeProvider> {
 	ClosingSent {
 		/// What the handshake agreed. It is boxed, so a phase move copies a
 		/// pointer.
-		agreed: Box<Agreed<P, AdmittedServer<P>>>,
+		agreed: Box<Agreed<P>>,
 	},
 	/// Completion took everything the handshake agreed.
 	Completed,
@@ -214,8 +212,6 @@ pub enum ClientPhase<F: ClientFlow<P>, P: HandshakeProvider> {
 impl<F: ClientFlow<P>, P: HandshakeProvider> sealed::Sealed for ClientPhase<F, P> {}
 
 impl<F: ClientFlow<P>, P: HandshakeProvider> PhaseView<P> for ClientPhase<F, P> {
-	type Peer = AdmittedServer<P>;
-
 	fn spent() -> Self {
 		Self::Spent
 	}
@@ -238,14 +234,14 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> PhaseView<P> for ClientPhase<F, P> 
 		self.agreed().map(Agreed::terms)
 	}
 
-	fn agreed(&self) -> Option<&Agreed<P, Self::Peer>> {
+	fn agreed(&self) -> Option<&Agreed<P>> {
 		match self {
 			Self::ClosingSent { agreed } => Some(agreed),
 			Self::Idle | Self::OpeningSent { .. } | Self::Completed | Self::Spent => None,
 		}
 	}
 
-	fn take_agreed(self) -> Result<Agreed<P, Self::Peer>, Self> {
+	fn take_agreed(self) -> Result<Agreed<P>, Self> {
 		match self {
 			Self::ClosingSent { agreed } => Ok(*agreed),
 			other => Err(other),
@@ -377,7 +373,7 @@ pub enum ServerPhase<F: ServerFlow<P>, P: HandshakeProvider> {
 	ClosingReceived {
 		/// What the handshake agreed. It is boxed, so a phase move copies a
 		/// pointer.
-		agreed: Box<Agreed<P, AdmittedPeer<P>>>,
+		agreed: Box<Agreed<P>>,
 	},
 	/// Completion took everything the handshake agreed.
 	Completed,
@@ -388,8 +384,6 @@ pub enum ServerPhase<F: ServerFlow<P>, P: HandshakeProvider> {
 impl<F: ServerFlow<P>, P: HandshakeProvider> sealed::Sealed for ServerPhase<F, P> {}
 
 impl<F: ServerFlow<P>, P: HandshakeProvider> PhaseView<P> for ServerPhase<F, P> {
-	type Peer = AdmittedPeer<P>;
-
 	fn spent() -> Self {
 		Self::Spent
 	}
@@ -416,14 +410,14 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> PhaseView<P> for ServerPhase<F, P> 
 		}
 	}
 
-	fn agreed(&self) -> Option<&Agreed<P, Self::Peer>> {
+	fn agreed(&self) -> Option<&Agreed<P>> {
 		match self {
 			Self::ClosingReceived { agreed } => Some(agreed),
 			Self::Idle | Self::ReplySent { .. } | Self::Completed | Self::Spent => None,
 		}
 	}
 
-	fn take_agreed(self) -> Result<Agreed<P, Self::Peer>, Self> {
+	fn take_agreed(self) -> Result<Agreed<P>, Self> {
 		match self {
 			Self::ClosingReceived { agreed } => Ok(*agreed),
 			other => Err(other),
@@ -458,8 +452,8 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> PhaseView<P> for ServerPhase<F, P> 
 ///     ServerConfig, SupportedProfiles,
 /// };
 ///
-/// # fn main() -> Result<(), HandshakeError> {
-/// # let runtime = tokio::runtime::Builder::new_current_thread().build().expect("doctest runtime");
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # let runtime = tokio::runtime::Builder::new_current_thread().build()?;
 /// # runtime.block_on(async {
 /// // The fixture key is public, so it serves an example alone. A real server
 /// // holds a key of its own.
@@ -489,8 +483,9 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> PhaseView<P> for ServerPhase<F, P> 
 ///
 /// client.complete()?;
 /// server.complete()?;
+/// # Ok::<(), HandshakeError>(())
+/// # })?;
 /// # Ok(())
-/// # })
 /// # }
 /// ```
 pub struct Handshake<R: Role<F, P>, F: HandshakeFlow, P: HandshakeProvider> {
@@ -541,7 +536,9 @@ impl<R: Role<F, P>, F: HandshakeFlow, P: HandshakeProvider> Handshake<R, F, P> {
 	pub fn complete(&mut self) -> Result<EstablishedSession, HandshakeError> {
 		let agreed = self.step(PhaseView::take_agreed)?;
 		let session = agreed.complete(R::session_keys)?;
+
 		self.phase = R::Phase::completed();
+
 		Ok(session)
 	}
 
@@ -579,8 +576,8 @@ impl<R: Role<F, P>, F: HandshakeFlow, P: HandshakeProvider> Handshake<R, F, P> {
 	/// The certificate of the peer this role recorded, from the last leg to
 	/// completion.
 	pub fn peer_certificate(&self) -> Option<&Certificate> {
-		let recorded = self.phase.agreed().and_then(|agreed| agreed.peer().certificate());
-		recorded.map(Arc::as_ref)
+		let recorded = self.phase.agreed().and_then(Agreed::peer);
+		recorded.map(|peer| peer.certificate().as_ref())
 	}
 }
 
@@ -633,6 +630,7 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> Handshake<Client, F, P> {
 			security_offer: config.security_offer.as_ref(),
 			transport_offer: config.transport_offer.as_ref(),
 		};
+
 		let Opened { message, opening, pending } = F::open(&config.flow, server, parts, &mut OsRng)?;
 
 		// 4. Keep what the reply is read against.
@@ -655,6 +653,9 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> Handshake<Client, F, P> {
 	///   Finished of the HPKE reply is no OCTET STRING of 32 to 64 bytes.
 	/// - [`HandshakeError::OctetStringLengthError`] -- a fixed-width field of the reply has another width.
 	/// - [`HandshakeError::CertificateValidationError`] -- the trust refused the server the reply names.
+	/// - [`HandshakeError::SubjectMismatch`] -- the CMS reply's certificate names another subject.
+	/// - [`HandshakeError::AnchorMismatch`] -- the CMS reply's certificate ends at another trust anchor.
+	/// - [`HandshakeError::KeyReuse`] -- the CMS reply's certificate holds the key of the pinned one.
 	/// - [`HandshakeError::MissingServerCertificate`] -- the reply carries no certificate its signer names.
 	/// - [`HandshakeError::SignatureVerificationFailed`] -- the reply fails to
 	///   verify or signs another transcript, or the receipt fails the server
@@ -722,11 +723,7 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> Handshake<Client, F, P> {
 		//    beside every static key of the server it must differ from.
 		let server_ephemeral = server.server_ephemeral(&server_ephemeral)?;
 
-		// 8. Verify the session receipt against the accept, which fails closed on a mismatch.
-		let accept = transport_accept.as_ref();
-		let pending_receipt = PendingReceipt::verify::<P>(receipt, accept, &transcript_hash, server.signing())?;
-
-		// 9. Refuse a server that demands an identity this client does not
+		// 8. Refuse a server that demands an identity this client does not
 		//    hold. The refusal runs before the approver is asked and before
 		//    the handshake secret is derived.
 		let identity = F::identity(settings);
@@ -734,9 +731,24 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> Handshake<Client, F, P> {
 			return Err(HandshakeError::MutualAuthRequired);
 		}
 
-		// 10. Approve and countersign the receipt. The handshake secret is not
-		//     derived yet, so the approver and the signing key are awaited
-		//     without it in hand.
+		// 9. Derive the handshake secret, and verify the server Finished under
+		//    it, before the receipt is read and before any part of the closing
+		//    exists. The Finished proves that the holder of the handshake
+		//    secret stood behind the reply's signature, so a certificate the
+		//    store admits for the server's name, which this server never sent,
+		//    reaches neither the receipt check nor the approver (RFC 9846
+		//    §4.5.3). The receipt check takes the confirmation as its proof.
+		let secret = pending.agree(&server_ephemeral, terms.kdf_salt())?;
+		let confirmed = ServerConfirmed::confirm(&reply, verified, secret, &terms)?;
+
+		// 10. Verify the session receipt against the accept, which fails closed on a mismatch.
+		let accept = transport_accept.as_ref();
+		let signing = server.signing();
+		let pending_receipt = PendingReceipt::verify::<P>(&confirmed, receipt, accept, &transcript_hash, signing)?;
+
+		// 11. Approve and countersign the receipt. The confirmed secret waits
+		//     on the heap across the approver and the signing key, and it is
+		//     wiped where it drops, so a dropped step leaves no copy.
 		let countersigned = match pending_receipt {
 			Some(pending_receipt) => {
 				let approver = config.receipt_approver.as_deref();
@@ -744,11 +756,6 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> Handshake<Client, F, P> {
 			}
 			None => None,
 		};
-
-		// 11. Derive the handshake secret, and verify the server Finished under
-		//     it, before any part of the closing exists.
-		let secret = pending.agree(&server_ephemeral, terms.kdf_salt())?;
-		let confirmed = ServerConfirmed::confirm(&reply, verified, secret, &terms)?;
 
 		// 12. Seal the countersignature, and build the closing up to its
 		//     client Finished. The step awaits nothing.
@@ -758,9 +765,10 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> Handshake<Client, F, P> {
 		// 13. Sign the client Finished under the client identity, and seal the closing.
 		let closing = closing.seal().await?;
 
-		// 14. Keep what the handshake agreed. The admitted server stays for post-handshake renewals.
-		let agreed = Agreed::new(terms, secret, receipt, server);
+		// 14. Keep what the handshake agreed. The server's certificates stay for post-handshake renewals.
+		let agreed = Agreed::new(terms, secret, receipt, &server);
 		self.phase = ClientPhase::ClosingSent { agreed: Box::new(agreed) };
+
 		Ok(closing)
 	}
 
@@ -985,7 +993,7 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> Handshake<Server, F, P> {
 		let receipt = settling.await?;
 
 		// 7. Keep what the handshake agreed.
-		let agreed = Agreed::new(terms, secret.into_secret(), receipt, peer);
+		let agreed = Agreed::new(terms, secret.into_secret(), receipt, &peer);
 		self.phase = ServerPhase::ClosingReceived { agreed: Box::new(agreed) };
 		Ok(())
 	}

@@ -91,8 +91,8 @@ pub enum HandshakeError {
 	#[error("The two server certificates name two subjects")]
 	SubjectMismatch,
 
-	/// The two provisioned certificates of a CMS server chain to two trust
-	/// anchors.
+	/// The signing certificate a CMS server's Finished carries and the
+	/// key-agreement certificate its client pins chain to two trust anchors.
 	#[error("The two server certificates chain to two trust anchors")]
 	AnchorMismatch,
 

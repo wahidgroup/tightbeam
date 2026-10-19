@@ -44,10 +44,11 @@ mod signer;
 
 pub use error::SignerError;
 pub use identity::{CertifiedKey, SigningIdentity};
+pub(crate) use signer::SignerSeal;
 pub use signer::{CmsSigner, SignedContent, SignerInfoDraft};
 
-pub(crate) use signer::SignerSeal;
-
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+pub(crate) use signer::CertifiedSigner;
 #[cfg(test)]
 pub(crate) use signer::CmsAlgorithmProtection;
 

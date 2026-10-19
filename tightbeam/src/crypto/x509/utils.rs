@@ -23,7 +23,7 @@ use crate::crypto::x509::Certificate;
 use crate::der::asn1::{GeneralizedTime, ObjectIdentifier, OctetString};
 use crate::der::oid::db::rfc5280::ANY_EXTENDED_KEY_USAGE;
 use crate::der::oid::AssociatedOid;
-use crate::der::{DecodeOwned, Encode};
+use crate::der::{Decode, Encode};
 use crate::x509::certificate::{CertificateInner, Profile};
 use crate::x509::serial_number::SerialNumber;
 
@@ -218,7 +218,9 @@ pub trait CertificateExt {
 	///
 	/// The method locates the extension (RFC 5280 §4.2) whose `extnID` matches
 	/// the requested type's [`AssociatedOid`] and decodes its `extnValue`. It
-	/// returns `Ok(None)` when the certificate carries no such extension.
+	/// returns `Ok(None)` when the certificate carries no such extension. A
+	/// type that borrows, such as one over `OctetStringRef`, reads the value
+	/// in place.
 	///
 	/// # Errors
 	///
@@ -228,9 +230,9 @@ pub trait CertificateExt {
 	/// # Sources
 	///
 	/// - RFC 5280 §4.2, certificate extensions: <https://datatracker.ietf.org/doc/html/rfc5280#section-4.2>
-	fn extension<T>(&self) -> Result<Option<T>, CertificateValidationError>
+	fn extension<'a, T>(&'a self) -> Result<Option<T>, CertificateValidationError>
 	where
-		T: AssociatedOid + DecodeOwned;
+		T: AssociatedOid + Decode<'a>;
 
 	/// The CMS `SignerIdentifier` that names this certificate (RFC 5652
 	/// §5.3).
@@ -375,9 +377,9 @@ impl<P: Profile> CertificateExt for CertificateInner<P> {
 	/// Decode a typed X.509 extension by its associated OID, if present.
 	///
 	/// [`CertificateExt::extension`] owns the RFC 5280 §4.2 contract.
-	fn extension<T>(&self) -> Result<Option<T>, CertificateValidationError>
+	fn extension<'a, T>(&'a self) -> Result<Option<T>, CertificateValidationError>
 	where
-		T: AssociatedOid + DecodeOwned,
+		T: AssociatedOid + Decode<'a>,
 	{
 		let Some(extensions) = self.tbs_certificate.extensions.as_ref() else {
 			return Ok(None);

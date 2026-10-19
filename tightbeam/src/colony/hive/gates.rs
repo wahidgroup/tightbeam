@@ -1393,6 +1393,10 @@ mod tests {
 			Ok(())
 		}
 
+		fn trust_anchor(&self, _cert: &Certificate) -> Result<Arc<Certificate>, CertificateValidationError> {
+			Ok(Arc::clone(self.signer.certificate()))
+		}
+
 		fn find_by_signer_identifier(&self, _sid: &SignerIdentifier) -> Option<&PeerCertificate<ErasedSigning>> {
 			Some(&self.signer)
 		}
@@ -1449,6 +1453,10 @@ mod tests {
 
 		fn verify_chain(&self, _chain: &[Certificate]) -> Result<(), CertificateValidationError> {
 			Ok(())
+		}
+
+		fn trust_anchor(&self, _cert: &Certificate) -> Result<Arc<Certificate>, CertificateValidationError> {
+			Ok(Arc::clone(self.signer.certificate()))
 		}
 
 		fn find_by_signer_identifier(&self, _sid: &SignerIdentifier) -> Option<&PeerCertificate<ErasedSigning>> {

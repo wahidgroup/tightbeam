@@ -34,10 +34,12 @@ use crate::crypto::x509::CertificateSpec;
 /// - refuses a key whose public half differs from the certificate's SubjectPublicKeyInfo, and
 /// - brings each value the provider returns to its canonical form.
 ///
-/// Both halves are `Arc`, and a clone also copies the `sid`.
+/// Both halves are `Arc`, and so is the DER of the certificate, which encodes
+/// once at construction. A clone also copies the `sid`.
 #[derive(Clone)]
 pub struct SigningIdentity {
 	certificate: PeerCertificate<ErasedSigning>,
+	certificate_der: Arc<[u8]>,
 	key: Arc<dyn SigningKeyProvider>,
 	sid: SignerIdentifier,
 	scheme: Scheme,
@@ -74,7 +76,7 @@ impl SigningIdentity {
 	/// - [`SignerError::UnsupportedAlgorithm`] -- the key declares another
 	///   algorithm than `P`, or its public half is no key of `P`.
 	/// - [`SignerError::Key`] -- the provider fails to return its public key.
-	/// - [`SignerError::Encoding`] -- the certificate's SubjectPublicKeyInfo fails to encode.
+	/// - [`SignerError::Encoding`] -- the certificate or its SubjectPublicKeyInfo fails to encode.
 	/// - [`SignerError::PublicKey`] -- the certificate's key is no key of `P`.
 	/// - [`SignerError::KeyMismatch`] -- the key's public half differs from the certificate's.
 	pub fn with_provider<P>(
@@ -99,8 +101,9 @@ impl SigningIdentity {
 		let scheme_key = scheme_key.map_err(|_| SignerError::UnsupportedAlgorithm(algorithm))?;
 
 		let sid = signer_identifier_of(certificate.certificate(), &scheme_key)?;
+		let certificate_der = Arc::<[u8]>::from(certificate.certificate().to_der()?);
 
-		Ok(Self { certificate, key, sid, scheme })
+		Ok(Self { certificate, certificate_der, key, sid, scheme })
 	}
 
 	/// Decode `certificate` and pair it with `key`.
@@ -130,6 +133,12 @@ impl SigningIdentity {
 	/// Shared handle to the certificate this identity presents.
 	pub fn certificate_arc(&self) -> Arc<Certificate> {
 		Arc::clone(self.certificate.certificate())
+	}
+
+	/// The DER of the certificate this identity presents, encoded once at
+	/// construction, which a handshake transcript binds as it is sent.
+	pub fn certificate_der(&self) -> &[u8] {
+		&self.certificate_der
 	}
 
 	/// The certificate this identity presents, as the signing use admitted

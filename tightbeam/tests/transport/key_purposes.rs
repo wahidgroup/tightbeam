@@ -48,10 +48,8 @@ mod cms {
 	pub use tightbeam::crypto::hpke::DhKemSecp256k1;
 	pub use tightbeam::crypto::key::{DiffieHellman, Secp256k1KeyProvider};
 	pub use tightbeam::crypto::sign::ecdsa::Secp256k1;
-	pub use tightbeam::testing::{TestCertificate, TestCmsServer, TestIdentity};
-	pub use tightbeam::transport::handshake::{
-		CmsServerCertificates, CmsServerIdentity, HandshakeProtocolKind, ProvisionedTrust,
-	};
+	pub use tightbeam::testing::{TestCmsServer, TestIdentity};
+	pub use tightbeam::transport::handshake::{HandshakeProtocolKind, ProvisionedTrust};
 	pub use tightbeam::transport::EncryptedProtocol;
 
 	pub use crate::common::security::pinning_validator;
@@ -223,37 +221,69 @@ async fn bind_cms_listener(
 	Ok((listener, *bound))
 }
 
-/// The CMS client provisions both server certificates under the own server
-/// purpose, and the server reads its own pair and its client under the own
+/// The CMS client pins the server's key-agreement certificate under the own
+/// server purpose and admits the signing certificate of that purpose from the
+/// reply, and the server reads its own pair and its client under the own
 /// purposes, so the CMS session establishes.
 #[cfg(feature = "transport-cms")]
 #[tokio::test]
 async fn a_cms_session_under_its_own_purposes_establishes() -> Result<(), TightBeamError> {
-	let server = TestCmsServer::generate("tightbeam own purposes");
-	let signing = TestCertificate::with_key_purposes(server.signing.to_owned(), [OWN_SERVER]);
-	let key_agreement = TestCertificate::with_key_purposes(server.key_agreement.to_owned(), [OWN_SERVER]);
+	let server = TestCmsServer::generate("tightbeam own purposes").with_key_purposes(&[OWN_SERVER]);
+	let signing = server.signing.to_owned();
+	let key_agreement = server.key_agreement.to_owned();
 	let client_materials = ClientMaterials::generate().with_key_purpose(OWN_CLIENT);
 	let (listener, addr) = bind_cms_listener(&server, &signing, &key_agreement, &client_materials.certificate).await?;
 	let served = tokio::spawn(serve_handshake(listener, |transport| {
 		transport.with_handshake_protocol(HandshakeProtocolKind::Cms)
 	}));
 
-	let certificates = CmsServerCertificates {
-		signing: CmsServerIdentity::Certificate(Arc::new(signing.to_owned())),
-		key_agreement: CmsServerIdentity::Certificate(Arc::new(key_agreement.to_owned())),
-	};
-	let trust = ProvisionedTrust::new(certificates, pinning_store(&[&signing, &key_agreement])?)?;
+	let trust = ProvisionedTrust::new(Arc::new(key_agreement), Arc::new(server.store()))?;
 	let builder = ClientBuilder::<TokioListener>::builder()
 		.with_client_identity(client_materials.identity())
 		.with_cms_server(trust)
 		.with_handshake_protocol(HandshakeProtocolKind::Cms)
 		.with_key_purposes(OWN_PURPOSES);
+
 	let stream = TcpStream::connect(addr).await?;
 	let mut client = builder.adopt(TokioStream::from(stream))?.into_transport();
-
 	client.perform_client_handshake().await?;
+
 	let served = await_ok(served, "the CMS server task must not panic").await?;
 	let peer = served.session_state().peer_certificate_arc();
 	assert_eq!(peer, Some(Arc::clone(&client_materials.certificate)));
+	Ok(())
+}
+
+/// A pool carries the trust of one pinned key-agreement certificate to every
+/// CMS connection it dials, so a frame round-trips to the CMS server of the
+/// own purposes through it.
+#[cfg(feature = "transport-cms")]
+#[tokio::test]
+async fn a_pooled_cms_session_under_its_own_purposes_round_trips() -> Result<(), TightBeamError> {
+	let server = TestCmsServer::generate("tightbeam pooled own purposes").with_key_purposes(&[OWN_SERVER]);
+	let signing = server.signing.to_owned();
+	let key_agreement = server.key_agreement.to_owned();
+	let client_materials = ClientMaterials::generate().with_key_purpose(OWN_CLIENT);
+	let (listener, addr) = bind_cms_listener(&server, &signing, &key_agreement, &client_materials.certificate).await?;
+	let served = tokio::spawn(async move {
+		let cms = |transport: TcpTransport<TokioStream>| transport.with_handshake_protocol(HandshakeProtocolKind::Cms);
+		let transport = serve_handshake(listener, cms).await?;
+		respond_echo(transport).await?;
+		Ok::<_, TightBeamError>(())
+	});
+
+	let trust = ProvisionedTrust::new(Arc::new(key_agreement), Arc::new(server.store()))?;
+	let pool = ConnectionPool::<TokioListener>::builder()
+		.with_client_identity(client_materials.identity())
+		.with_cms_server(trust)
+		.with_handshake_protocol(HandshakeProtocolKind::Cms)
+		.with_key_purposes(OWN_PURPOSES)
+		.build();
+
+	let pool = Arc::new(pool);
+	let mut pooled = pool.connect(TightBeamSocketAddr(addr)).await?;
+	let reply = pooled.conn()?.emit(TestFrame::v0(Some("pooled-cms"), None), None).await?;
+	await_ok(served, "the pooled CMS server task must not panic").await?;
+	assert!(reply.is_some());
 	Ok(())
 }
