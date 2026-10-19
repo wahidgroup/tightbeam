@@ -4,9 +4,9 @@
 //! handshake over a real TCP socket through public interfaces only:
 //!
 //! - the `server!` policy list selects the protocol per accepted connection, and
-//! - [`ClientBuilder`] carries the server's two certificates: the client's
-//!   first flight seals its base secret to the key-agreement certificate, and
-//!   the signing certificate verifies the reply.
+//! - [`ClientBuilder`] pins the server's key-agreement certificate: the
+//!   client's first flight seals its base secret to it, and the store admits
+//!   the signing certificate the reply carries.
 
 #![cfg(all(
 	feature = "tcp",

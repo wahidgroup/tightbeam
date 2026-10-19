@@ -1,10 +1,12 @@
 //! A trust store an outside crate defines through [`CertificateTrust`]
 //! alone.
 //!
-//! [`PinningTrust`] trusts the certificates its operator pins, and resolves a
-//! frame signer among them admitted for the signer purpose. The crate's
-//! default `verify_frame` runs over it and returns the admitted certificate
-//! in [`TrustVerification::Verified`].
+//! [`PinningTrust`] trusts the certificates its operator pins, names the
+//! trust anchor of each, and resolves a frame signer among them admitted for
+//! the signer purpose. The crate's default `verify_frame` runs over it and
+//! returns the admitted certificate in [`TrustVerification::Verified`].
+
+use std::sync::Arc;
 
 use tightbeam::builder::frame::FrameBuilder;
 use tightbeam::builder::TypeBuilder;
@@ -29,39 +31,62 @@ use tightbeam::{Frame, Version};
 #[derive(Debug)]
 pub(crate) struct PinningTrust {
 	/// The certificates the operator pinned.
-	pinned: Vec<Certificate>,
+	pinned: Vec<Arc<Certificate>>,
 	/// The pinned certificates the signer purpose admits.
 	signers: Vec<PeerCertificate<ErasedSigning>>,
+	/// The anchor the operator names for every pin, or `None` when each pin
+	/// is its own anchor.
+	anchor: Option<Arc<Certificate>>,
 }
 
 impl PinningTrust {
-	/// A store that pins `pinned`. A certificate the signer purpose refuses
-	/// stays pinned and resolves no signer, so its refusal drops here.
+	/// A store that pins `pinned`, each its own trust anchor. A certificate
+	/// the signer purpose refuses stays pinned and resolves no signer, so its
+	/// refusal drops here.
 	pub(crate) fn of(pinned: Vec<Certificate>) -> Self {
 		let purpose = KeyPurposes::HOUSE.signer;
 		let admit = |certificate: &Certificate| PeerCertificate::parse(certificate.to_owned(), purpose);
 		let signers = pinned.iter().filter_map(|certificate| admit(certificate).ok()).collect();
-		Self { pinned, signers }
+		let pinned = pinned.into_iter().map(Arc::new).collect();
+		Self { pinned, signers, anchor: None }
+	}
+
+	/// A store that pins `pinned` under `anchor`, the authority that issued
+	/// them, as the trust anchor of each.
+	pub(crate) fn under(anchor: Certificate, pinned: Vec<Certificate>) -> Self {
+		let anchor = Some(Arc::new(anchor));
+		Self { anchor, ..Self::of(pinned) }
+	}
+
+	/// The pin that is `cert`.
+	fn pin(&self, cert: &Certificate) -> Result<&Arc<Certificate>, CertificateValidationError> {
+		let pin = self.pinned.iter().find(|pin| pin.as_ref() == cert);
+		pin.ok_or(CertificateValidationError::CertificateNotTrusted)
 	}
 }
 
 impl CertificateValidation for PinningTrust {
 	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
-		match self.pinned.contains(cert) {
-			true => Ok(()),
-			false => Err(CertificateValidationError::CertificateNotTrusted),
-		}
+		// The evaluation admits the certificate alone, so its pin drops here.
+		self.pin(cert).map(drop)
 	}
 }
 
 impl CertificateTrust for PinningTrust {
 	fn is_trusted(&self, cert: &Certificate) -> bool {
-		self.pinned.contains(cert)
+		self.pin(cert).is_ok()
 	}
 
-	fn verify_chain(&self, chain: &[Certificate]) -> Result<(), CertificateValidationError> {
+	fn verify_chain(&self, chain: &[Certificate]) -> Result<Arc<Certificate>, CertificateValidationError> {
+		// The store trusts pins, so a chain's anchor is the one its leaf names.
 		let leaf = chain.last().ok_or(CertificateValidationError::EmptyChain)?;
-		self.evaluate(leaf)
+		self.trust_anchor(leaf)
+	}
+
+	fn trust_anchor(&self, cert: &Certificate) -> Result<Arc<Certificate>, CertificateValidationError> {
+		let pin = self.pin(cert)?;
+		let anchor = self.anchor.as_ref().unwrap_or(pin);
+		Ok(Arc::clone(anchor))
 	}
 
 	fn find_by_signer_identifier(&self, sid: &SignerIdentifier) -> Option<&PeerCertificate<ErasedSigning>> {
@@ -70,8 +95,8 @@ impl CertificateTrust for PinningTrust {
 	}
 
 	fn find_by_public_key(&self, spki: &SubjectPublicKeyInfoOwned) -> Option<&Certificate> {
-		let holds_key = |certificate: &&Certificate| certificate.tbs_certificate.subject_public_key_info == *spki;
-		self.pinned.iter().find(holds_key)
+		let holds_key = |certificate: &&Arc<Certificate>| certificate.tbs_certificate.subject_public_key_info == *spki;
+		self.pinned.iter().find(holds_key).map(Arc::as_ref)
 	}
 
 	fn to_policy_ref(&self) -> &dyn VerificationPolicy {

@@ -44,8 +44,8 @@ fn outside_pair(server: &TestCmsServer) -> CmsIdentityPair<OutsideKem> {
 	pair.expect("the two server certificates name one subject with two keys")
 }
 
-/// A client that provisions the two certificates of `server` against the
-/// store of their authority and presents `identity`, beside a server that
+/// A client that pins the key-agreement certificate of `server` against the
+/// store of its authority and presents `identity`, beside a server that
 /// holds both identities of `server`, both under the outside provider.
 fn outside_handshakes(server: &TestCmsServer, identity: SigningIdentity) -> (OutsideClient, OutsideServer) {
 	let settings = CmsClientSettings { trust: server.trust(), identity };
@@ -61,6 +61,7 @@ fn outside_handshakes(server: &TestCmsServer, identity: SigningIdentity) -> (Out
 	let server_config = ServerConfig::<Cms, OutsideProvider>::new(CmsServerSettings, pair, profiles, purposes);
 	let mut server_config = server_config.expect("an outside server pair serves the server role");
 	server_config.policy = outside_policy();
+
 	(Handshake::client(client), Handshake::server(server_config))
 }
 

@@ -139,9 +139,7 @@ use crate::transport::handshake::primitives::{KdfInfo, KdfSalt};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::receipt::StoredReceipt;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::transport::handshake::{Arc, EstablishedSession, HandshakeCurve, HandshakeProvider};
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::utils::marker::{MaybeSend, MaybeSync};
+use crate::transport::handshake::{Arc, EstablishedSession, HandshakeCurve, HandshakeProvider, SessionPeer};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::x509::attr::Attributes;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -829,8 +827,8 @@ impl FinishedRole {
 	/// digest `D` of `certificate`, the certificate it carries (RFC 9846
 	/// § 4.5.2).
 	///
-	/// The CMS server's certificate is provisioned at its client before the
-	/// opening, so the server Finished binds the role and the transcript alone.
+	/// The CMS transcript binds the server's certificate as it was sent, so the
+	/// server Finished binds the role and the transcript alone.
 	///
 	/// # Errors
 	///
@@ -1507,33 +1505,38 @@ impl<P: HandshakeProvider> Terms<P> {
 	}
 }
 
-/// The certificate a role records as its peer.
+/// The peer a role records.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-pub trait PeerIdentity: MaybeSend + MaybeSync + 'static {
-	/// The certificate the session records, or `None` when the peer proved no
+pub trait PeerIdentity {
+	/// The peer the session records, or `None` when the peer proved no
 	/// identity.
-	fn certificate(&self) -> Option<&Arc<Certificate>>;
+	fn peer(&self) -> Option<SessionPeer>;
 }
 
 /// What both sides hold once the handshake secret exists.
 ///
 /// [`Self::complete`] consumes it, so one handshake derives one session.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-pub struct Agreed<P: HandshakeProvider, Peer: PeerIdentity> {
+pub struct Agreed<P: HandshakeProvider> {
 	terms: Terms<P>,
 	secret: HandshakeSecret,
 	receipt: Option<StoredReceipt>,
-	peer: Peer,
+	peer: Option<SessionPeer>,
 }
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-impl<P: HandshakeProvider, Peer: PeerIdentity> Agreed<P, Peer> {
-	/// Gather what one handshake agreed.
+impl<P: HandshakeProvider> Agreed<P> {
+	/// Gather what one handshake agreed, and the peer `peer` records.
 	///
 	/// `receipt` is the dual-signed receipt of a budget-bearing session, and
 	/// `None` for an unmetered one.
-	pub(crate) fn new(terms: Terms<P>, secret: HandshakeSecret, receipt: Option<StoredReceipt>, peer: Peer) -> Self {
-		Self { terms, secret, receipt, peer }
+	pub(crate) fn new(
+		terms: Terms<P>,
+		secret: HandshakeSecret,
+		receipt: Option<StoredReceipt>,
+		peer: &impl PeerIdentity,
+	) -> Self {
+		Self { terms, secret, receipt, peer: peer.peer() }
 	}
 
 	/// The negotiated terms.
@@ -1547,8 +1550,8 @@ impl<P: HandshakeProvider, Peer: PeerIdentity> Agreed<P, Peer> {
 	}
 
 	/// The peer this role recorded.
-	pub(crate) fn peer(&self) -> &Peer {
-		&self.peer
+	pub(crate) fn peer(&self) -> Option<&SessionPeer> {
+		self.peer.as_ref()
 	}
 
 	/// Derive everything a session takes from the handshake secret, and hand
@@ -1572,9 +1575,8 @@ impl<P: HandshakeProvider, Peer: PeerIdentity> Agreed<P, Peer> {
 		let salt = terms.kdf_salt();
 		let epoch = EpochMaterials::derive::<P>(&secret, salt, terms.transcript_hash)?;
 		let ciphers = DirectionalCiphers::derive::<P, _>(&secret, salt, epoch.epoch)?;
-
 		let receipt = receipt.map(Arc::new);
-		let peer = peer.certificate().map(Arc::clone);
+
 		let session = EstablishedSession::new(keys(ciphers), terms.mux, receipt, peer, Some(epoch));
 		Ok(session)
 	}

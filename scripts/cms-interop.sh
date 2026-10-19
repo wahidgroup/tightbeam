@@ -1,80 +1,38 @@
 #!/bin/bash
-# CMS interop check: parse each DER sample the crate emits with OpenSSL.
+# CMS interop check: OpenSSL parses, verifies, or decrypts every CMS sample
+# the crate emits, with no tightbeam code in the loop.
 #
-# The samples come from the tests named
-# `the_emitted_structures_write_their_interop_samples`, which write one
-# `ContentInfo` per structure to target/cms-samples/, and the DER of three
-# certificates, when the environment holds TIGHTBEAM_CMS_SAMPLES. `make
-# interop` runs both steps:
+# `make interop` runs both steps:
 #
 #   TIGHTBEAM_CMS_SAMPLES=1 cargo test -p tightbeam-rs --all-features --lib \
 #     the_emitted_structures_write_their_interop_samples
-#   scripts/cms-interop.sh
+#   scripts/cms-interop.sh [sample-dir]
 #
-# Each certificate carries the keyUsage bit of its one use:
+# The test writes one ContentInfo per structure to target/cms-samples/, the
+# four certificates the samples name, and the KEK, kekid, and plaintext of
+# each sample sealed under a KEK. OPENSSL names the binary to run.
 #
-#   server-certificate.crt                 digitalSignature, signs the reply
-#   server-key-agreement-certificate.crt   keyAgreement, receives the opening
-#   client-certificate.crt                 digitalSignature, signs the closing
+# Each check prints one line:
 #
-# The script parses each with `openssl x509` and reads its keyUsage. It reads
-# the subjectKeyIdentifier of both server certificates. It parses the
-# KEMRecipientInfo of the cms-opening sample with `openssl asn1parse
-# -strparse`, reads its rid, and checks that the rid is the [0]
-# subjectKeyIdentifier of the key-agreement certificate and not that of the
-# signing certificate.
+# - Certificate: it parses, and its keyUsage carries the bit of its one use.
+# - Opening: its KEMRecipientInfo rid is the key-agreement certificate's subjectKeyIdentifier.
+# - SignedData: `cms -verify` with no -certfile. The Finished and both receipts also chain to test-root.
+# - AuthEnvelopedData under a KEK: `cms -decrypt` recovers the expected plaintext.
+# - KEMRecipientInfo: parse only, because OpenSSL has no DHKEM over secp256k1.
+# - CompressedData: its encapContentInfo declares id-data (RFC 3274 section 1.1).
 #
-# For each sample, the script runs `openssl asn1parse` and
-# `openssl cms -cmsout -print`. For each SignedData sample it also runs
-# `openssl cms -verify -noverify -binary`, with the server signing certificate
-# and the client certificate as a -certfile for a signer that embeds no
-# certificate. The receipt both ends signed needs both. -noverify skips the
-# chain to a trust anchor, so the check covers the signature, the signed
-# attributes, and the content digest. It prints one result line per sample.
+# OpenSSL deviates from the RFCs in three ways, and the script counts each
+# apart from a failure:
 #
-# For each AuthEnvelopedData sample under a KEKRecipientInfo, the test also
-# writes the KEK, the kekid, and the expected plaintext, from fixed test keys,
-# as <name>.kek, <name>.kekid, and <name>.plain. The script runs
-# `openssl cms -decrypt -secretkey -secretkeyid` on the copy under OpenSSL's
-# tags, and compares the output with the expected plaintext. OpenSSL has no
-# DHKEM over secp256k1 under the crate's KEM identifier, so it parses the
-# KEMRecipientInfo sample and cannot open it.
+# - It reads authAttrs under [2] and unauthAttrs under [3] (cms_asn1.c), where RFC 5083 section 2.1
+#   writes [1] and [2]. The script parses a retagged copy.
+# - It feeds no authAttrs to the cipher as AAD (cms_env.c, cms_enc.c), against RFC 5083 section 2.2,
+#   so it recovers the plaintext and then refuses the tag.
+# - OpenSSL 3.0 cannot verify an ecdsa-with-SHA3-256 certificate signature. A self-signed probe
+#   decides: when it fails, the chained samples verify without the chain, and their lines say so.
 #
-# The HPKE flow writes three samples. OpenSSL parses hpke-hello, the
-# `ContentInfo` of type id-data whose content is the ClientHello. It verifies
-# hpke-reply, the reply SignedData, under the certificate the reply carries.
-# It decrypts hpke-closing, the anonymous closing under a KEKRecipientInfo,
-# under its fixed test KEK.
-#
-# Frames and records write three samples. OpenSSL decrypts record, one
-# session record under a KEKRecipientInfo, under its fixed test KEK. It
-# parses frame-kem, the envelope of a frame sealed to a bare KEM recipient,
-# and cannot open it, as with cms-opening. It parses compressed-data, the
-# CompressedData of a compressed frame body, and the script checks that its
-# encapContentInfo declares id-data (RFC 3274 section 1.1).
-#
-# OpenSSL feeds no authAttrs to the cipher as associated data
-# (crypto/cms/cms_env.c and cms_enc.c set none), where RFC 5083 section 2.2
-# makes their DER the AAD. It writes the content before it checks the tag, so
-# it recovers the plaintext of a sample that carries authAttrs and then
-# refuses its tag. A content equal to the expected plaintext still shows the
-# kekid, the key wrap, the GCM parameters, and the keystream, and the line
-# names the refused tag apart from a failure.
-#
-# OpenSSL's template of AuthEnvelopedData (crypto/cms/cms_asn1.c) reads
-# authAttrs under [2] and unauthAttrs under [3], the tags of AuthenticatedData
-# (RFC 5652 section 9.1). RFC 5083 section 2.1 writes [1] and [2], and the crate
-# follows RFC 5083. When OpenSSL refuses an AuthEnvelopedData sample, the script
-# retags a copy to OpenSSL's tags and parses it again, so the line tells that
-# deviation apart from a structure OpenSSL cannot read at all.
-#
-# The script exits non-zero when a sample fails `asn1parse`, fails the CMS
-# parse under either tagging, fails to verify, fails to decrypt to its
-# expected plaintext, when a CompressedData sample declares another content
-# type than id-data, when a certificate lacks the bit of its use, when the
-# opening's rid names another certificate, or when a sample of `required` is
-# absent.
-# It has no dependency on the crate.
+# The script exits non-zero on any FAILED line, a missing sample, or a probe
+# certificate that fails to generate.
 #
 # References:
 #   RFC 5652, Cryptographic Message Syntax:
@@ -114,7 +72,12 @@ certificates=(
 	"server-certificate:Digital Signature"
 	"server-key-agreement-certificate:Key Agreement"
 	"client-certificate:Digital Signature"
+	"test-root:Certificate Sign"
 )
+
+# Each SignedData sample whose signers' certificates the test root issued,
+# which the sample carries in its certificates.
+anchored=(server-finished session-receipt joined-receipt)
 
 absent=0
 for name in "${required[@]}"; do
@@ -136,10 +99,25 @@ fi
 scratch="$(mktemp -d)"
 trap 'rm -rf "$scratch"' EXIT
 
-signers_pem="$scratch/signers.pem"
-for certificate in "$SAMPLE_DIR/server-certificate.crt" "$SAMPLE_DIR/client-certificate.crt"; do
-	"$OPENSSL" x509 -inform DER -in "$certificate" >> "$signers_pem"
-done
+root_pem="$scratch/test-root.pem"
+"$OPENSSL" x509 -inform DER -in "$SAMPLE_DIR/test-root.crt" -out "$root_pem"
+
+# The probe: a self-signed secp256k1 authority this OpenSSL generates under
+# ecdsa-with-SHA3-256, verified against itself. It reads no sample, so a
+# defect of the test root fails the run whenever the probe passes.
+probe_key="$scratch/probe.key"
+probe_pem="$scratch/probe.pem"
+probe="OpenSSL refuses a self-signed secp256k1 probe certificate under ecdsa-with-SHA3-256"
+if ! "$OPENSSL" ecparam -name secp256k1 -genkey -noout -out "$probe_key" > /dev/null 2>&1 ||
+	! "$OPENSSL" req -x509 -new -key "$probe_key" -sha3-256 -subj "/CN=cms-interop probe" -days 1 \
+		-out "$probe_pem" > /dev/null 2>&1; then
+	echo "cms-interop: the secp256k1 probe certificate under ecdsa-with-SHA3-256 fails to generate" >&2
+	exit 1
+fi
+chains=0
+if "$OPENSSL" verify -CAfile "$probe_pem" "$probe_pem" > /dev/null 2>&1; then
+	chains=1
+fi
 
 # Print the keyUsage names a certificate sample asserts, comma-separated.
 key_usage() {
@@ -180,17 +158,27 @@ summary() {
 	printf 'contentType %s%s' "${content_type:-unknown}" "${recipient:+, $recipient}"
 }
 
-# Verify a SignedData sample, with the server and client certificates as
-# extra signer certificates when the samples carry them.
+# Verify a SignedData sample under the certificates it carries alone. A
+# sample of `anchored` also verifies each signer's chain to the test root,
+# and any other skips the chain.
 verify() {
-	local sample="$1"
-	local certfile=()
-	if [ -n "$signers_pem" ]; then
-		certfile=(-certfile "$signers_pem")
-	fi
-	if "$OPENSSL" cms -verify -inform DER -in "$sample" -noverify -binary ${certfile[@]+"${certfile[@]}"} \
-		-out /dev/null > /dev/null 2>&1; then
-		echo "cms -verify ok"
+	local sample="$1" name
+	name="$(basename "$sample" .der)"
+	if printf '%s\n' "${anchored[@]}" | grep -qx "$name" && [ "$chains" -eq 1 ]; then
+		if "$OPENSSL" cms -verify -inform DER -in "$sample" -CAfile "$root_pem" -binary \
+			-out /dev/null > /dev/null 2>&1; then
+			echo "cms -verify ok under the certificates it carries, chained to test-root"
+		else
+			echo "cms -verify under the certificates it carries, chained to test-root FAILED"
+		fi
+	elif printf '%s\n' "${anchored[@]}" | grep -qx "$name"; then
+		if "$OPENSSL" cms -verify -inform DER -in "$sample" -noverify -binary -out /dev/null > /dev/null 2>&1; then
+			echo "cms -verify ok under the certificates it carries, chain unchecked: $probe"
+		else
+			echo "cms -verify under the certificates it carries FAILED"
+		fi
+	elif "$OPENSSL" cms -verify -inform DER -in "$sample" -noverify -binary -out /dev/null > /dev/null 2>&1; then
+		echo "cms -verify ok under the certificate it carries"
 	else
 		echo "cms -verify FAILED"
 	fi
@@ -242,6 +230,7 @@ echo "cms-interop: $("$OPENSSL" version)"
 failures=0
 deviations=0
 unauthenticated=0
+unchained=0
 for entry in "${certificates[@]}"; do
 	name="${entry%%:*}"
 	bit="${entry#*:}"
@@ -255,6 +244,15 @@ for entry in "${certificates[@]}"; do
 		failures=$((failures + 1))
 	fi
 done
+
+if [ "$chains" -eq 0 ]; then
+	echo "test-root chain: unchecked, $probe"
+elif root_check="$("$OPENSSL" verify -CAfile "$root_pem" "$root_pem" 2>&1)"; then
+	echo "test-root chain: the ecdsa-with-SHA3-256 probe verifies, and verify accepts test-root against itself"
+else
+	echo "test-root chain: verify refuses test-root against itself FAILED: $(printf '%s\n' "$root_check" | grep -m 1 -i 'error' || true)"
+	failures=$((failures + 1))
+fi
 
 agreement_id="$(key_identifier "$SAMPLE_DIR/server-key-agreement-certificate.crt")"
 signing_id="$(key_identifier "$SAMPLE_DIR/server-certificate.crt")"
@@ -287,6 +285,7 @@ for sample in "${samples[@]}"; do
 			verified="$(verify "$sample")"
 			case "$verified" in
 				*FAILED) failures=$((failures + 1)) ;;
+				*"chain unchecked"*) unchained=$((unchained + 1)) ;;
 			esac
 		elif printf '%s\n' "$printed" | grep -q 'contentType: id-smime-ct-compressedData'; then
 			verified="$(declared "$printed")"
@@ -319,7 +318,7 @@ for sample in "${samples[@]}"; do
 	printf '%-16s %s, %s%s\n' "$name" "$asn1" "$cms" "${verified:+, $verified}"
 done
 
-echo "cms-interop: ${#samples[@]} samples, $failures failed, $deviations parse only under OpenSSL's AuthEnvelopedData tags, $unauthenticated decrypt with no AAD check"
+echo "cms-interop: ${#samples[@]} samples, $failures failed, $deviations parse only under OpenSSL's AuthEnvelopedData tags, $unauthenticated decrypt with no AAD check, $unchained verify with the chain unchecked"
 if [ "$failures" -ne 0 ]; then
 	exit 1
 fi

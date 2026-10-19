@@ -1317,7 +1317,7 @@ A role also admits `anyExtendedKeyUsage`, and a certificate with no `extendedKey
 
 `KeyAgreementIdentity<K>` pairs a key-agreement certificate with the backend of its private key, the `K::PrivateKey` of the KEM `K`. The house DHKEM's backend is a `DiffieHellman<C>`, which `Secp256k1KeyProvider` implements. A signing backend and a key-agreement backend are two traits under `KeyBackend`. The compiler refuses one `dyn` handle in the other's place, and `CmsIdentityPair::new` refuses one key in both identities (`KeyReuse`), so a backend of both, such as `Secp256k1KeyProvider`, serves one identity per key. The constructor refuses a certificate without the bit of `K::USAGE`, and a backend whose public half differs from the certificate's key (`EnvelopeError::KeyMismatch`).
 
-A CMS server holds a signing identity and a key-agreement identity of one subject with two keys ([NIST SP 800-57 Part 1 Rev. 5][nist-800-57] §5.2). The client provisions both certificates in a `ProvisionedTrust`, built once with its configuration, which refuses two subjects, two trust anchors, and one key in both:
+A CMS server holds a signing identity and a key-agreement identity of one subject with two keys ([NIST SP 800-57 Part 1 Rev. 5][nist-800-57] §5.2). The client pins the key-agreement certificate alone in a `ProvisionedTrust`, built once with its configuration. The server Finished carries the signing certificate, and at each reply the trust's store admits it and the client refuses two subjects, two trust anchors, and one key in both:
 
 ```rust,ignore
 // The server: the signing identity signs, and the key-agreement identity
@@ -1325,13 +1325,9 @@ A CMS server holds a signing identity and a key-agreement identity of one subjec
 let config = TransportEncryptionConfig::new(signing_identity)
     .with_key_agreement(KeyAgreementIdentity::new(agreement_cert, agreement_backend)?)?;
 
-// The client: both certificates, named by their fields, admitted against
-// the store once.
-let certificates = CmsServerCertificates {
-    signing: CmsServerIdentity::Certificate(Arc::new(signing_cert)),
-    key_agreement: CmsServerIdentity::Certificate(Arc::new(agreement_cert)),
-};
-let server_trust = ProvisionedTrust::new(certificates, trust_store)?;
+// The client: the key-agreement certificate alone, admitted against the
+// store once. The store admits the signing certificate the reply carries.
+let server_trust = ProvisionedTrust::new(Arc::new(agreement_cert), trust_store)?;
 let client = ClientBuilder::<TokioListener>::builder()
     .with_cms_server(server_trust)
     .with_client_identity(client_identity)
@@ -1712,13 +1708,13 @@ Init -> OpeningReceived -> ServerFinishedSent -> ClientFinishedReceived -> Compl
 
 ```text
 HPKE: transcript = Hello ContentInfo DER || ServerHandshake DER || signing certificate DER
-CMS:  transcript = Opening DER || SecurityAccept || TransportAccept || server ephemeral
+CMS:  transcript = Opening DER || SecurityAccept || TransportAccept || server ephemeral || signing certificate DER
 transcript_hash = H(transcript)
 ```
 
 `H` is the negotiated digest, SHA3-256 in the default profile. The transcript hash is its whole output: 32 bytes under SHA3-256, 64 under SHA3-512.
 
-The transcript hash binds the handshake messages. It blocks reordering, profile downgrade, and undetected man-in-the-middle edits of the transcript. The HPKE `ServerHandshake` carries the accepts, the certificate demand, and the server ephemeral, so a stripped certificate demand changes the hash. The HPKE transcript also covers the DER of the signing certificate, as TLS 1.3 signs over its Certificate ([RFC 9846 §4.5.2][rfc9846-4.5.2]).
+The transcript hash binds the handshake messages. It blocks reordering, profile downgrade, and undetected man-in-the-middle edits of the transcript. The HPKE `ServerHandshake` carries the accepts, the certificate demand, and the server ephemeral, so a stripped certificate demand changes the hash. Both transcripts also cover the DER of the signing certificate, as TLS 1.3 signs over its Certificate ([RFC 9846 §4.5.2][rfc9846-4.5.2]).
 
 **Handshake secret:**
 
@@ -1757,6 +1753,7 @@ Client Side - Building the Client Finished:
 ┌─────────────────────────────────────────────────────────────────────┐
 │ 1. Seal the Transcript                                              │
 │    transcript = Opening || accepts || server_ephemeral              │
+│                 || signing certificate                              │
 │    transcript_hash = SHA3-256(transcript)                           │
 ├─────────────────────────────────────────────────────────────────────┤
 │ 2. Sign the Client Finished                                         │
@@ -1919,14 +1916,14 @@ A reply whose server Finished is absent or fails is refused before the client bu
 
 **Wire format comparison:**
 
-| Feature             | CMS-based                                                                        | HPKE-based                                                             |
-| ------------------- | -------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
-| Opening             | `AuthEnvelopedData` with a `KEMRecipientInfo` ([RFC 9629][rfc9629])              | `ContentInfo` of type `id-data`                                        |
-| Server identity     | Provisioned before the opening                                                   | Learned from the reply's `certificates`                                |
-| Handshake secret    | Ephemeral ECDH and the base secret the opening seals                             | Ephemeral ECDH alone                                                   |
-| Server confirmation | The server Finished's signature over the transcript, and the server Finished MAC | The reply's signature over the transcript, and the server Finished MAC |
-| Closing             | `AuthEnvelopedData` with a `KEKRecipientInfo`                                    | The same closing                                                       |
-| Standards           | RFC 5652, [RFC 5083][rfc5083], [RFC 9629][rfc9629]                               | RFC 5652, [RFC 5083][rfc5083], the [RFC 9846][rfc9846] shape           |
+| Feature             | CMS-based                                                                                                                      | HPKE-based                                                             |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------- |
+| Opening             | `AuthEnvelopedData` with a `KEMRecipientInfo` ([RFC 9629][rfc9629])                                                            | `ContentInfo` of type `id-data`                                        |
+| Server identity     | The key-agreement certificate pinned before the opening, and the signing certificate from the server Finished's `certificates` | Learned from the reply's `certificates`                                |
+| Handshake secret    | Ephemeral ECDH and the base secret the opening seals                                                                           | Ephemeral ECDH alone                                                   |
+| Server confirmation | The server Finished's signature over the transcript, and the server Finished MAC                                               | The reply's signature over the transcript, and the server Finished MAC |
+| Closing             | `AuthEnvelopedData` with a `KEKRecipientInfo`                                                                                  | The same closing                                                       |
+| Standards           | RFC 5652, [RFC 5083][rfc5083], [RFC 9629][rfc9629]                                                                             | RFC 5652, [RFC 5083][rfc5083], the [RFC 9846][rfc9846] shape           |
 
 **Security equivalence:**
 
@@ -2149,7 +2146,7 @@ either:     Cancel(code)  Credit(limit)
 
 **Session authorization**: A server-side `TransportAuthorizer` reads the offer's opaque `authorization` token. It grants budgets, attaches a settlement challenge, or refuses the session. It runs before authentication, so keep it cheap.
 
-**Session receipts**: Every metered session produces a receipt that both peers sign, as CMS `SignedData` ([RFC 5652 §5][rfc5652-5]). The receipt binds the handshake transcript, the budgets, and the settlement answer, so a third party with both certificates can verify the agreement. Budgets REQUIRE mutual authentication. Read the receipt with `session_receipt()`.
+**Session receipts**: Every metered session produces a receipt that both peers sign, as CMS `SignedData` ([RFC 5652 §5][rfc5652-5]). The receipt binds the handshake transcript, the budgets, and the settlement answer, and it carries the certificate of each signer. A third party therefore verifies the agreement from the receipt alone: `StoredReceipt::certificate` returns each certificate, and the verifier admits each against its own trust before `StoredReceipt::verify`. Budgets REQUIRE mutual authentication. Read the receipt with `session_receipt()`.
 
 **Epoch renewal**: Metered sessions renew keys, budgets, and receipts in band before the cipher record limit ([RFC 9846 §5.5][rfc9846-5.5]). A renewal keeps the negotiated terms. A failed renewal drains the connection. Sessions without receipts drain via GoAway, and the caller reconnects.
 

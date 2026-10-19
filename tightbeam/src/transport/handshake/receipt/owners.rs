@@ -13,12 +13,13 @@
 use alloc::vec::Vec;
 
 use crate::cms::signed_data::{SignedData, SignerInfo};
-use crate::crypto::sign::{Signed, SigningIdentity};
+use crate::crypto::sign::{CertifiedSigner, Signed, SigningIdentity};
 use crate::crypto::x509::{PeerCertificate, Signing};
 use crate::der::asn1::OctetString;
 use crate::der::{Decode, Encode};
 use crate::oids::DATA;
 use crate::transport::handshake::error::HandshakeError;
+use crate::transport::handshake::flow::ServerConfirmed;
 use crate::transport::handshake::negotiation::{TransportAccept, TransportAuthorizer};
 use crate::transport::handshake::primitives::TranscriptHash;
 use crate::transport::handshake::receipt::{
@@ -145,8 +146,12 @@ impl IssuedReceipt {
 			None => None,
 		};
 
-		let (verdict, ancillary_response) = match ack.as_ref() {
-			None => (SessionVerdict::CountersignatureMissing, None),
+		// Take the evidence DER before the move. The raw bytes stay in the
+		// outcome even when the SignerInfo folds into the artifact.
+		let countersignature = ack.as_ref().map(Encode::to_der).transpose()?;
+
+		let (verdict, ancillary_response, countersigner) = match ack {
+			None => (SessionVerdict::CountersignatureMissing, None, None),
 			Some(ack) => {
 				let client = peer.proven().ok_or(HandshakeError::MutualAuthRequired)?;
 				let settling = receipt.settle_ack::<P>(Some(ack), client, authorizer);
@@ -154,22 +159,17 @@ impl IssuedReceipt {
 			}
 		};
 
-		// Take the evidence DER before the move. The raw bytes stay in the
-		// outcome even when the SignerInfo folds into the artifact.
-		let countersignature = ack.as_ref().map(Encode::to_der).transpose()?;
-
-		// A verified countersignature completes the artifact. A failed one
-		// stays out of it, but its DER remains in the outcome as evidence.
-		let artifact = match (verdict, ack) {
-			(SessionVerdict::Activated | SessionVerdict::SettlementRejected { .. }, Some(ack)) => {
-				artifact.with_signer(ack)?
-			}
-			(_, _) => artifact,
+		// A verified countersignature completes the artifact, beside the
+		// certificate it verified under. A failed one stays out of it, but its
+		// DER remains in the outcome as evidence.
+		let proven = peer.proven();
+		let client_certificate = proven.map(|identity| Arc::clone(identity.certificate()));
+		let artifact = match countersigner {
+			Some(countersigner) => artifact.with_certified_signer(countersigner)?,
+			None => artifact,
 		};
 
 		let countersignature = countersignature.map(OctetString::new).transpose()?;
-		let proven = peer.proven();
-		let client_certificate = proven.map(|identity| Arc::clone(identity.certificate()));
 		let outcome = SessionOutcome {
 			receipt,
 			artifact,
@@ -220,7 +220,8 @@ pub struct PendingReceipt {
 
 impl PendingReceipt {
 	/// Match the server's receipt against the negotiated `accept`, and verify
-	/// the server's signature over it under the key of `server`.
+	/// the server's signature over it under the key of `server`. It takes the
+	/// proof that the server Finished verified (RFC 9846 §4.5.3).
 	///
 	/// It returns `None` for an unmetered session. A budget-bearing accept
 	/// demands an artifact whose body states the negotiated terms over
@@ -233,6 +234,7 @@ impl PendingReceipt {
 	///   session, or it disagrees with the accept or the transcript.
 	/// - [`HandshakeError::SignatureVerificationFailed`] -- the server signature fails to verify.
 	pub(crate) fn verify<P>(
+		_confirmed: &ServerConfirmed,
 		artifact: Option<Signed<SignedData>>,
 		accept: Option<&TransportAccept>,
 		transcript_hash: &TranscriptHash,
@@ -266,9 +268,10 @@ impl PendingReceipt {
 	/// - The approver, or the fail-closed default, answers the settlement challenge.
 	/// - The countersignature binds the receipt body and that answer to the client identity.
 	///
-	/// Both awaits run here, and neither needs a secret of the handshake. The
-	/// caller therefore draws its secrets after this returns, and
-	/// [`CountersignedReceipt::seal`] seals the result with no await.
+	/// Both awaits run here. [`Self::verify`] took the proof that the server
+	/// Finished verified, so the approver answers only a server that proved the
+	/// handshake secret, and [`CountersignedReceipt::seal`] seals the result
+	/// with no await.
 	///
 	/// # Fail closed
 	///
@@ -303,7 +306,9 @@ impl PendingReceipt {
 /// secret exists to seal the countersignature.
 pub struct CountersignedReceipt {
 	artifact: Signed<SignedData>,
-	countersignature: Signed<SignerInfo>,
+	/// The countersignature, beside the certificate of the client identity
+	/// that made it.
+	countersignature: CertifiedSigner,
 }
 
 impl CountersignedReceipt {
@@ -334,12 +339,15 @@ impl CountersignedReceipt {
 		P: HandshakeProvider,
 	{
 		let Self { artifact, countersignature } = self;
-		let mut ack_der = Zeroizing::new(countersignature.to_der()?);
+		let mut ack_der = Zeroizing::new(countersignature.signer().to_der()?);
 		let sealer = terms.sealer(secret, SecretSeal::Ack)?;
 		let sealed_ack = sealer.seal(DATA, core::mem::take(&mut *ack_der))?.to_der()?;
 
-		// Both endpoints retain the identical completed artifact.
-		let completed = artifact.with_signer(countersignature)?;
+		// Both endpoints retain the identical completed artifact, which
+		// carries the client's certificate beside the countersignature. A
+		// `CertificateSet` owns each certificate it holds, so the artifact
+		// takes its own copy.
+		let completed = artifact.with_certified_signer(countersignature)?;
 		let stored = StoredReceipt::try_from(completed)?;
 		Ok((sealed_ack, stored))
 	}
@@ -354,7 +362,8 @@ mod tests {
 	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::crypto::x509::KeyPurposes;
 	use crate::transport::handshake::tests::{
-		budget_offer, create_test_certificate, fixture_transcript, signing_identity, TestCertificate, TEST_BUDGETS,
+		budget_offer, create_test_certificate, fixture_handshake_secret, fixture_transcript, signing_identity,
+		TestCertificate, TEST_BUDGETS,
 	};
 
 	/// The transcript hash the test receipts bind.
@@ -387,7 +396,8 @@ mod tests {
 		issued.artifact().to_owned()
 	}
 
-	/// Verify `artifact` as a client that admitted `server`.
+	/// Verify `artifact` as a client that admitted `server` and confirmed its
+	/// server Finished.
 	fn verified_under(
 		artifact: Signed<SignedData>,
 		server: &TestCertificate,
@@ -395,7 +405,9 @@ mod tests {
 		let accept = budget_accept();
 		let identity = PeerCertificate::parse(server.certificate.clone(), KeyPurposes::HOUSE.server);
 		let identity = identity.expect("the test certificate holds a point");
-		PendingReceipt::verify::<DefaultCryptoProvider>(Some(artifact), Some(&accept), &transcript(), &identity)
+		let confirmed = ServerConfirmed::assumed(fixture_handshake_secret(0x42));
+		let artifact = Some(artifact);
+		PendingReceipt::verify::<DefaultCryptoProvider>(&confirmed, artifact, Some(&accept), &transcript(), &identity)
 	}
 
 	#[tokio::test]

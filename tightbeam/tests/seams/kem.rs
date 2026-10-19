@@ -54,8 +54,8 @@ mod flow {
 	pub use tightbeam::testing::{TestCmsServer, TestIdentity};
 	pub use tightbeam::transport::handshake::negotiation::RunnableProfile;
 	pub use tightbeam::transport::handshake::{
-		ClientConfig, Cms, CmsClientSettings, CmsIdentityPair, CmsServerCertificates, CmsServerIdentity,
-		CmsServerSettings, Handshake, ProvisionedTrust, ServerConfig, SupportedProfiles,
+		Client, ClientConfig, Cms, CmsClientSettings, CmsIdentityPair, CmsServerChain, CmsServerIdentity,
+		CmsServerSettings, Handshake, HandshakeError, ProvisionedTrust, Server, ServerConfig, SupportedProfiles,
 	};
 }
 
@@ -287,36 +287,97 @@ fn with_stub_key(certificate: Certificate) -> Certificate {
 	TestCertificate::with_key_usage(certificate, KeyUsage(KeyUsages::KeyEncipherment.into()))
 }
 
-/// A CMS server whose key-agreement certificate holds a key of the stub KEM
-/// runs the whole flow under [`StubProvider`]: the opening seals to that key,
-/// the stub backend opens it, and the client compares the server ephemeral
-/// with the signing key alone. A store an outside crate defines pins both
-/// certificates.
+/// The stub CMS server, whose key-agreement certificate holds a key of the
+/// stub KEM, a client of it that pins that certificate against the outside
+/// store `store` makes of the server and that certificate, and the server's
+/// handshake, both under [`StubProvider`].
 #[cfg(feature = "transport-cms")]
-#[tokio::test]
-async fn a_kem_of_its_own_key_type_runs_the_cms_flow() -> Result<(), Box<dyn std::error::Error>> {
+fn stub_parties(store: impl FnOnce(&TestCmsServer, Certificate) -> PinningTrust) -> StubParties {
 	let server = TestCmsServer::generate("stub server");
 	let key_agreement = with_stub_key(server.key_agreement.to_owned());
-	let identity = KeyAgreementIdentity::<StubKem>::new(key_agreement.to_owned(), backend_of(&key_agreement))?;
-	let pair = CmsIdentityPair::new(server.signing_identity(), identity)?;
+	let identity = KeyAgreementIdentity::<StubKem>::new(key_agreement.to_owned(), backend_of(&key_agreement));
+	let pair = CmsIdentityPair::new(server.signing_identity(), identity.expect("the stub backend holds its key"));
 
-	let signing = CmsServerIdentity::Certificate(Arc::new(server.signing.to_owned()));
-	let provisioned = CmsServerIdentity::Certificate(Arc::new(key_agreement.to_owned()));
-	let store = PinningTrust::of(vec![server.signing.to_owned(), key_agreement]);
-	let certificates = CmsServerCertificates { signing, key_agreement: provisioned };
-	let trust = ProvisionedTrust::new(certificates, Arc::new(store))?;
+	let pinned = CmsServerIdentity::Certificate(Arc::new(key_agreement.to_owned()));
+	let store = store(&server, key_agreement);
+	let trust = ProvisionedTrust::new(pinned, Arc::new(store)).expect("the store admits the pinned certificate");
 
 	let client_identity = TestIdentity::of(&SigningKey::random(&mut OsRng));
 	let settings = CmsClientSettings { trust, identity: client_identity };
-	let mut client = Handshake::client(ClientConfig::<Cms, StubProvider>::new(settings, KeyPurposes::HOUSE)?);
+	let client = ClientConfig::<Cms, StubProvider>::new(settings, KeyPurposes::HOUSE);
 	let profiles = SupportedProfiles::from(RunnableProfile::<StubProvider>::native().descriptor());
-	let server_config = ServerConfig::<Cms, StubProvider>::new(CmsServerSettings, pair, profiles, KeyPurposes::HOUSE)?;
-	let mut server_handshake = Handshake::server(server_config);
+	let pair = pair.expect("the stub server's certificates name one subject with two keys");
+	let server_config = ServerConfig::<Cms, StubProvider>::new(CmsServerSettings, pair, profiles, KeyPurposes::HOUSE);
 
+	let client = Handshake::client(client.expect("the client configuration holds"));
+	let handshake = Handshake::server(server_config.expect("the server configuration holds"));
+	StubParties { client, handshake, server }
+}
+
+/// What [`stub_parties`] returns.
+#[cfg(feature = "transport-cms")]
+struct StubParties {
+	/// The client, before its opening.
+	client: Handshake<Client, Cms, StubProvider>,
+	/// The server's handshake.
+	handshake: Handshake<Server, Cms, StubProvider>,
+	/// The server's certificates and keys.
+	server: TestCmsServer,
+}
+
+/// A CMS server whose key-agreement certificate holds a key of the stub KEM
+/// runs the whole flow under [`StubProvider`]:
+///
+/// - The client pins the key-agreement certificate, and the opening seals to its key.
+/// - The stub backend opens the opening.
+/// - A store an outside crate defines admits both certificates under one trust anchor.
+/// - The client compares the server ephemeral with the signing key alone.
+#[cfg(feature = "transport-cms")]
+#[tokio::test]
+async fn a_kem_of_its_own_key_type_runs_the_cms_flow() -> Result<(), Box<dyn std::error::Error>> {
+	let under_authority = |server: &TestCmsServer, key_agreement: Certificate| {
+		PinningTrust::under(server.authority.to_owned(), vec![server.signing.to_owned(), key_agreement])
+	};
+
+	let StubParties { mut client, mut handshake, server } = stub_parties(under_authority);
 	let opening = client.start()?;
-	let reply = server_handshake.reply(opening).await?;
+	let reply = handshake.reply(opening).await?;
 	let closing = client.respond(reply).await?;
-	server_handshake.finish(closing).await?;
+
+	handshake.finish(closing).await?;
+
 	assert_eq!(client.peer_certificate(), Some(&server.signing));
+	Ok(())
+}
+
+/// An outside store that names each pin its own trust anchor gives the two
+/// certificates of the stub server two anchors, so the client refuses the
+/// reply.
+#[cfg(feature = "transport-cms")]
+#[tokio::test]
+async fn an_outside_store_of_two_anchors_refuses_the_pair() -> Result<(), Box<dyn std::error::Error>> {
+	let each_its_own_anchor = |server: &TestCmsServer, key_agreement: Certificate| {
+		PinningTrust::of(vec![server.signing.to_owned(), key_agreement])
+	};
+
+	let StubParties { mut client, mut handshake, .. } = stub_parties(each_its_own_anchor);
+	let opening = client.start()?;
+	let reply = handshake.reply(opening).await?;
+
+	let refused = client.respond(reply).await;
+	assert!(matches!(refused, Err(HandshakeError::AnchorMismatch)));
+	Ok(())
+}
+
+/// An outside store anchors a pinned chain at the authority it names for the
+/// chain's leaf, so a client pins the chain through it.
+#[cfg(feature = "transport-cms")]
+#[test]
+fn an_outside_store_anchors_a_pinned_chain() -> Result<(), HandshakeError> {
+	let server = TestCmsServer::generate("stub server");
+	let store = PinningTrust::under(server.authority.to_owned(), vec![server.key_agreement.to_owned()]);
+
+	let chain = CmsServerChain::new([server.authority.to_owned(), server.key_agreement.to_owned()])?;
+	ProvisionedTrust::new(CmsServerIdentity::Chain(chain), Arc::new(store))?;
 	Ok(())
 }

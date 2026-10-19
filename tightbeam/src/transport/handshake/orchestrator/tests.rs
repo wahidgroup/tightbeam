@@ -6,9 +6,12 @@
 //! that flow.
 
 use std::error::Error;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use crate::asn1::OctetString;
 use crate::cms::cert::IssuerAndSerialNumber;
+use crate::cms::signed_data::{SignerInfo, SignerInfos};
 use crate::crypto::cms::EnvelopeError;
 use crate::crypto::hash::Sha3_256;
 use crate::crypto::key::SigningKeyProvider;
@@ -16,21 +19,30 @@ use crate::crypto::profiles::SecurityProfileDesc;
 use crate::crypto::sign::ecdsa::k256::Secp256k1;
 use crate::crypto::sign::elliptic_curve::sec1::ToEncodedPoint;
 use crate::crypto::sign::elliptic_curve::PublicKey;
+use crate::crypto::sign::CmsSigner;
 use crate::crypto::x509::error::CertificateValidationError::Expired;
 use crate::crypto::x509::policy::{DirectTrustValidator, ExpiryValidator, RuntimeCertificatePinning};
 use crate::crypto::x509::utils::Skid;
+use crate::der::asn1::SetOfVec;
 use crate::der::Encode;
-use crate::oids::AES_128_GCM;
+use crate::oids::{AES_128_GCM, SESSION_RECEIPT};
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::negotiation::{MuxSettings, NegotiationError, SecurityOffer, TransportOffer};
+use crate::transport::handshake::receipt::{ApprovalRefusal, ReceiptApprover, SessionReceipt};
 use crate::transport::handshake::tests::*;
-use crate::transport::handshake::{Handshake, HandshakeMessage, HandshakePhase, PeerAuthentication};
+use crate::transport::handshake::{
+	Handshake, HandshakeAttribute, HandshakeMessage, HandshakePhase, PeerAuthentication,
+};
+use crate::utils::marker::MaybeSendFuture;
+use crate::x509::attr::{Attribute, Attributes};
 use crate::TightBeamError;
 
 #[cfg(feature = "transport-cms")]
 use crate::transport::handshake::Cms;
 #[cfg(feature = "transport-hpke")]
 use crate::transport::handshake::Hpke;
+#[cfg(all(feature = "transport-cms", feature = "transport-multiplex"))]
+use crate::transport::handshake::SessionPeer;
 
 /// The reply a fresh handshake of flow `F` produces, which no other handshake
 /// admits.
@@ -387,6 +399,133 @@ async fn a_refused_settlement_leaves_the_server_spent<F: TestFlow>() -> Result<(
 	Ok(())
 }
 
+/// An approver that pays each receipt, as [`PayingApprover`] does, and
+/// counts its calls.
+#[derive(Default)]
+struct CountingApprover(AtomicUsize);
+
+impl CountingApprover {
+	/// The number of receipts this approver answered.
+	fn calls(&self) -> usize {
+		self.0.load(Ordering::SeqCst)
+	}
+}
+
+impl ReceiptApprover for CountingApprover {
+	fn approve<'a>(
+		&'a self,
+		receipt: &'a SessionReceipt,
+	) -> MaybeSendFuture<'a, Result<Option<OctetString>, ApprovalRefusal>> {
+		self.0.fetch_add(1, Ordering::SeqCst);
+		PayingApprover.approve(receipt)
+	}
+}
+
+/// `reply` with its server Finished replaced by a tag under another secret,
+/// as an on-path party would forge it. The signature covers no unsigned
+/// attribute, so it still verifies.
+fn with_forged_server_finished(reply: HandshakeMessage) -> HandshakeMessage {
+	let forged = HandshakeAttribute::encode(&fixture_confirmation()).expect("a tag encodes as an attribute");
+	let forged = Attribute::try_from(forged).expect("the attribute encodes");
+	with_unsigned_attribute(reply, forged)
+}
+
+/// `reply` with the session receipt of `other`, the reply of another
+/// session, in place of its own. The signature covers no unsigned attribute,
+/// so it still verifies.
+fn with_receipt_of(reply: HandshakeMessage, other: HandshakeMessage) -> HandshakeMessage {
+	let other = other.signed().expect("a reply is a SignedData").into_value();
+	let signer = CmsSigner::sole_signer(&other).expect("a reply has one signer");
+	let mut carried = signer.unsigned_attrs.iter().flat_map(|attributes| attributes.iter());
+	let receipt = carried.find(|attribute| attribute.oid == SESSION_RECEIPT);
+	let receipt = receipt.expect("a budget-bearing reply carries its receipt");
+	with_unsigned_attribute(reply, receipt.to_owned())
+}
+
+/// `reply` with `attribute` in place of the unsigned attribute of its OID.
+fn with_unsigned_attribute(reply: HandshakeMessage, attribute: Attribute) -> HandshakeMessage {
+	let mut signed_data = reply.signed().expect("a reply is a SignedData").into_value();
+	let signers = core::mem::take(&mut signed_data.signer_infos.0).into_vec();
+	let [signer] = <[SignerInfo; 1]>::try_from(signers).expect("a reply has one signer");
+	let carried = signer.unsigned_attrs.to_owned().map(SetOfVec::into_vec).unwrap_or_default();
+	let oid = attribute.oid;
+	let kept = carried.into_iter().filter(|carried| carried.oid != oid);
+
+	let unsigned = Attributes::try_from(kept.chain([attribute]).collect::<Vec<_>>()).expect("the attributes are a SET");
+	let signer = SignerInfo { unsigned_attrs: Some(unsigned), ..signer };
+	signed_data.signer_infos = SignerInfos(SetOfVec::try_from(vec![signer]).expect("one signer is a SET"));
+
+	HandshakeMessage::try_from(signed_data).expect("the reply encodes")
+}
+
+/// A budget-bearing client of flow `F` whose approver is `approver`, and the
+/// server it opened to, with that server's reply.
+async fn budget_bearing_reply<F: TestFlow>(approver: &Arc<CountingApprover>) -> (TestClient<F>, HandshakeMessage) {
+	let Parties { mut client, mut server, .. } = parties::<F>(mutual_with(ExpiryValidator));
+	client.transport_offer = Some(budget_offer());
+	client.receipt_approver = Some(approver.to_owned());
+	server.transport = Some(budget_offer());
+	server.transport_authorizer = Some(Arc::new(ChallengingAuthorizer));
+
+	let mut client = Handshake::client(client);
+	let mut server = Handshake::server(server);
+	let opening = client.start().expect("a fresh client builds its opening");
+	let reply = server.reply(opening).await.expect("the server admits the opening");
+
+	(client, reply)
+}
+
+/// The client confirms the server Finished before it reads the receipt, so
+/// a reply whose Finished fails is refused before the approver runs, and the
+/// approver sees no call.
+async fn a_reply_whose_server_finished_fails_never_reaches_the_approver<F: TestFlow>() -> Result<(), Box<dyn Error>> {
+	let approver = Arc::new(CountingApprover::default());
+	let (mut client, reply) = budget_bearing_reply::<F>(&approver).await;
+
+	let refused = client.respond(with_forged_server_finished(reply)).await;
+	assert!(matches!(refused, Err(HandshakeError::KeyConfirmationFailed)));
+	assert_eq!(approver.calls(), 0);
+	Ok(())
+}
+
+/// A control of the test above: the honest reply of the same session reaches
+/// the approver once.
+async fn an_honest_budget_bearing_reply_reaches_the_approver_once<F: TestFlow>() -> Result<(), Box<dyn Error>> {
+	let approver = Arc::new(CountingApprover::default());
+	let (mut client, reply) = budget_bearing_reply::<F>(&approver).await;
+
+	client.respond(reply).await?;
+	assert_eq!(approver.calls(), 1);
+	Ok(())
+}
+
+/// The client confirms the server Finished before it verifies the receipt, so
+/// a reply whose Finished fails beside the receipt of another session is
+/// refused for its Finished.
+async fn a_forged_server_finished_is_refused_before_the_receipt_is_read<F: TestFlow>() -> Result<(), Box<dyn Error>> {
+	let approver = Arc::new(CountingApprover::default());
+	let (mut client, reply) = budget_bearing_reply::<F>(&approver).await;
+	let (_, other) = budget_bearing_reply::<F>(&approver).await;
+	let foreign = with_receipt_of(reply, other);
+	let forged = with_forged_server_finished(foreign);
+
+	let refused = client.respond(forged).await;
+	assert!(matches!(refused, Err(HandshakeError::KeyConfirmationFailed)));
+	Ok(())
+}
+
+/// A control of the test above: the receipt of another session beside an
+/// honest server Finished is refused by the receipt check.
+async fn a_reply_beside_the_receipt_of_another_session_is_refused<F: TestFlow>() -> Result<(), Box<dyn Error>> {
+	let approver = Arc::new(CountingApprover::default());
+	let (mut client, reply) = budget_bearing_reply::<F>(&approver).await;
+	let (_, other) = budget_bearing_reply::<F>(&approver).await;
+
+	let refused = client.respond(with_receipt_of(reply, other)).await;
+	assert!(matches!(refused, Err(HandshakeError::ReceiptMismatch)));
+	Ok(())
+}
+
 /// A server that demands no client certificate verifies the proof of an
 /// offered one and records no peer.
 async fn an_anonymous_server_records_no_peer<F: TestFlow>() -> Result<(), Box<dyn Error>> {
@@ -577,6 +716,10 @@ over_each_flow! {
 	a_budget_bearing_identified_closing_pads_past_the_floor,
 	the_client_identity_is_sealed_from_the_server_static_key,
 	a_refused_settlement_leaves_the_server_spent,
+	a_reply_whose_server_finished_fails_never_reaches_the_approver,
+	an_honest_budget_bearing_reply_reaches_the_approver_once,
+	a_forged_server_finished_is_refused_before_the_receipt_is_read,
+	a_reply_beside_the_receipt_of_another_session_is_refused,
 	an_anonymous_server_records_no_peer,
 	a_mutual_server_records_the_accepted_peer,
 	a_mutual_server_refuses_a_refused_certificate,
@@ -587,6 +730,17 @@ over_each_flow! {
 	multiplexing_negotiates_when_offered_and_enabled,
 	an_offer_alone_stays_single_flight,
 	a_local_advertisement_alone_stays_single_flight,
+}
+
+/// A CMS client's session keeps the key-agreement certificate its opening
+/// sealed to, which a rekey compares the server ephemeral with.
+#[cfg(all(feature = "transport-cms", feature = "transport-multiplex"))]
+#[tokio::test]
+async fn a_cms_client_session_keeps_the_key_agreement_certificate() {
+	let established = established::<Cms>(PeerAuthentication::Anonymous).await;
+	let session_peer = established.client_session.session_peer();
+	let kept = session_peer.and_then(SessionPeer::key_agreement);
+	assert_eq!(kept, Some(&established.server_identity.key_agreement.certificate));
 }
 
 /// The base secret of the CMS opening crosses the wire only sealed, so no

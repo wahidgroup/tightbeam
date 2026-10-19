@@ -1389,8 +1389,12 @@ mod tests {
 			true
 		}
 
-		fn verify_chain(&self, _chain: &[Certificate]) -> Result<(), CertificateValidationError> {
-			Ok(())
+		fn verify_chain(&self, _chain: &[Certificate]) -> Result<Arc<Certificate>, CertificateValidationError> {
+			Ok(Arc::clone(self.signer.certificate()))
+		}
+
+		fn trust_anchor(&self, _cert: &Certificate) -> Result<Arc<Certificate>, CertificateValidationError> {
+			Ok(Arc::clone(self.signer.certificate()))
 		}
 
 		fn find_by_signer_identifier(&self, _sid: &SignerIdentifier) -> Option<&PeerCertificate<ErasedSigning>> {
@@ -1447,8 +1451,12 @@ mod tests {
 			true
 		}
 
-		fn verify_chain(&self, _chain: &[Certificate]) -> Result<(), CertificateValidationError> {
-			Ok(())
+		fn verify_chain(&self, _chain: &[Certificate]) -> Result<Arc<Certificate>, CertificateValidationError> {
+			Ok(Arc::clone(self.signer.certificate()))
+		}
+
+		fn trust_anchor(&self, _cert: &Certificate) -> Result<Arc<Certificate>, CertificateValidationError> {
+			Ok(Arc::clone(self.signer.certificate()))
 		}
 
 		fn find_by_signer_identifier(&self, _sid: &SignerIdentifier) -> Option<&PeerCertificate<ErasedSigning>> {

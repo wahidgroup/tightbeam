@@ -349,8 +349,8 @@ impl AuthEnvelopedData {
 	/// - The [`Self::check`] set: a field, the cipher, or the attributes differ.
 	/// - The `KEKRecipientInfo` set of the holder: the recipient names
 	///   another key or another key-encryption algorithm than the holder's.
-	/// - [`EnvelopeError::Key`] -- the holder refused to decrypt the content key.
-	/// - [`EnvelopeError::KeyUnwrap`] -- the content key is no key of the cipher.
+	/// - [`EnvelopeError::Key`] -- the holder refused to decrypt the content
+	///   key, or decrypted a key of another size than the cipher's.
 	/// - [`EnvelopeError::Authentication`] -- the tag fails.
 	pub(crate) async fn open_with_holder<P>(
 		&self,
@@ -368,11 +368,11 @@ impl AuthEnvelopedData {
 		let algorithm = holder.algorithm();
 		let encrypted_key = kek::named_kek(&self.recipient_infos, holder.key_identifier(), &algorithm)?;
 
-		// 2. The holder decrypts the content key, and the content decrypts in place under it.
-		let content_key = holder.decrypt(encrypted_key).await?;
-		let cipher = content_key.with(|content_key| <P::AeadCipher as KeyInit>::new_from_slice(content_key));
-		let cipher = cipher.map_err(|_| EnvelopeError::KeyUnwrap)?;
-		opening.decrypt(&cipher, content)
+		// 2. The holder decrypts the content key onto the stack, and the content
+		//    decrypts in place under it.
+		let mut content_key = ContentKey::<P::AeadCipher>::default();
+		holder.decrypt_into(encrypted_key, &mut content_key).await?;
+		opening.decrypt(&<P::AeadCipher as KeyInit>::new(&content_key), content)
 	}
 
 	/// The encrypted content of this envelope, taken out into a buffer that

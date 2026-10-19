@@ -15,22 +15,21 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
-#[cfg(all(not(feature = "std"), any(feature = "signature", feature = "aead")))]
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
-
 use core::fmt::Debug;
 
+#[cfg(all(not(feature = "std"), any(feature = "signature", feature = "aead")))]
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 #[cfg(feature = "aead")]
 use core::future::Future;
 #[cfg(feature = "aead")]
 use core::pin::Pin;
+#[cfg(all(feature = "std", any(feature = "signature", feature = "aead")))]
+use std::sync::Arc;
 
 use crate::Errorizable;
 
 #[cfg(feature = "signature")]
 use crate::utils::marker::{MaybeSend, MaybeSendFuture, MaybeSync};
-#[cfg(all(feature = "std", any(feature = "signature", feature = "aead")))]
-use std::sync::Arc;
 
 #[cfg(feature = "signature")]
 mod signing {
@@ -478,6 +477,61 @@ pub trait EncryptingKeyProvider: Send + Sync + Debug {
 		&self,
 		encrypted_key: &[u8],
 	) -> Pin<Box<dyn Future<Output = Result<SecretSlice<u8>, KeyError>> + Send + '_>>;
+
+	/// Decrypts `encrypted_key`, the `encryptedKey` of a `KEKRecipientInfo`
+	/// under this key, into `content_key`, which takes the content-encryption
+	/// key whole, so a caller decrypts it onto its own stack.
+	///
+	/// The default decrypts through [`Self::decrypt`] and copies the key into
+	/// `content_key`, and the copy [`Self::decrypt`] returns wipes as it drops.
+	/// A provider that can write into the caller's buffer overrides it.
+	///
+	/// # Errors
+	///
+	/// - The [`Self::decrypt`] set.
+	/// - [`KeyError::WrapLength`] -- `content_key` is another size than the decrypted key.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::crypto::key::{Aes256GcmKeyProvider, EncryptingKeyProvider, KeyError};
+	/// use tightbeam::zeroize::Zeroizing;
+	///
+	/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+	/// # let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+	/// # runtime.block_on(async {
+	/// // A fixed key-encryption key serves an example alone. A real holder
+	/// // keeps a key of its own.
+	/// let holder = Aes256GcmKeyProvider::new(vec![0x5A; 32], b"example-kek".to_vec())?;
+	/// let wrapped = holder.encrypt(&[0xC3; 32]).await?;
+	///
+	/// // The content key lands in the caller's buffer, which wipes where it
+	/// // drops.
+	/// let mut content_key = Zeroizing::new([0u8; 32]);
+	/// holder.decrypt_into(&wrapped, &mut *content_key).await?;
+	/// assert_eq!(*content_key, [0xC3; 32]);
+	/// # Ok::<(), KeyError>(())
+	/// # })?;
+	/// # Ok(())
+	/// # }
+	/// ```
+	fn decrypt_into<'a>(
+		&'a self,
+		encrypted_key: &'a [u8],
+		content_key: &'a mut [u8],
+	) -> Pin<Box<dyn Future<Output = Result<(), KeyError>> + Send + 'a>> {
+		Box::pin(async move {
+			let decrypted = self.decrypt(encrypted_key).await?;
+			decrypted.with(|key| {
+				if key.len() != content_key.len() {
+					return Err(KeyError::WrapLength((content_key.len(), key.len()).into()));
+				}
+
+				content_key.iter_mut().zip(key.iter()).for_each(|(slot, octet)| *slot = *octet);
+				Ok(())
+			})
+		})
+	}
 }
 
 /// A shared provider is a provider, as for [`SigningKeyProvider`].
@@ -500,6 +554,14 @@ impl<T: EncryptingKeyProvider + ?Sized> EncryptingKeyProvider for Arc<T> {
 		encrypted_key: &[u8],
 	) -> Pin<Box<dyn Future<Output = Result<SecretSlice<u8>, KeyError>> + Send + '_>> {
 		T::decrypt(self, encrypted_key)
+	}
+
+	fn decrypt_into<'a>(
+		&'a self,
+		encrypted_key: &'a [u8],
+		content_key: &'a mut [u8],
+	) -> Pin<Box<dyn Future<Output = Result<(), KeyError>> + Send + 'a>> {
+		T::decrypt_into(self, encrypted_key, content_key)
 	}
 }
 
@@ -566,6 +628,17 @@ impl<P: CryptoProvider> EncryptingKeyProvider for InMemoryEncryptingKeyProvider<
 		let unwrapped = P::KeyWrap::unwrap(&self.kek, encrypted_key);
 		let content_key = unwrapped.map(|mut key| SecretSlice::from(core::mem::take(&mut *key)));
 		Box::pin(async move { content_key })
+	}
+
+	/// The key wrap of `P` unwraps straight into `content_key`, the caller's
+	/// buffer.
+	fn decrypt_into<'a>(
+		&'a self,
+		encrypted_key: &'a [u8],
+		content_key: &'a mut [u8],
+	) -> Pin<Box<dyn Future<Output = Result<(), KeyError>> + Send + 'a>> {
+		let unwrapped = P::KeyWrap::unwrap_into(&self.kek, encrypted_key, content_key);
+		Box::pin(async move { unwrapped })
 	}
 }
 
@@ -658,7 +731,6 @@ mod tests {
 
 		let signature = Secp256k1Signature::from_bytes(&signature_bytes)?;
 		signing_key.verifying_key().verify_prehash(&digest, &signature)?;
-
 		Ok(())
 	}
 
@@ -718,7 +790,6 @@ mod tests {
 		// The one blanket impl serves a shared trait object as well.
 		let shared: Arc<dyn SigningKeyProvider> = provider;
 		assert_eq!(shared.to_public_key_bytes()?, public_key_bytes);
-
 		Ok(())
 	}
 
@@ -750,5 +821,85 @@ mod tests {
 		let rendered = format!("{spec:?}");
 		assert!(!rendered.contains("171"));
 		assert!(rendered.contains("32"));
+	}
+
+	/// The content key the house provider wraps in the tests of its open.
+	#[cfg(all(feature = "aead", feature = "kdf", feature = "ecdh", feature = "aes-gcm"))]
+	const CONTENT_KEY: [u8; 32] = [0xC3u8; 32];
+
+	/// The house in-memory provider of the default profile, under a fixed KEK.
+	#[cfg(all(feature = "aead", feature = "kdf", feature = "ecdh", feature = "aes-gcm"))]
+	fn house_holder() -> Aes256GcmKeyProvider {
+		let holder = Aes256GcmKeyProvider::new(vec![0x5Au8; 32], b"tb/test/kek/v1".to_vec());
+		holder.expect("a 32-octet KEK is the size of the house wrap's key")
+	}
+
+	/// The house provider unwraps into the caller's buffer the content key it
+	/// wrapped.
+	#[cfg(all(feature = "aead", feature = "kdf", feature = "ecdh", feature = "aes-gcm"))]
+	#[tokio::test]
+	async fn the_house_provider_decrypts_into_the_callers_buffer() -> Result<(), KeyError> {
+		let holder = house_holder();
+		let wrapped = holder.encrypt(&CONTENT_KEY).await?;
+		let mut content_key = [0u8; 32];
+
+		holder.decrypt_into(&wrapped, &mut content_key).await?;
+
+		assert_eq!(content_key, CONTENT_KEY);
+		Ok(())
+	}
+
+	/// `wrapped` with its last octet altered, as a wrapped key the integrity
+	/// check of the wrap refuses (RFC 3394 §2.2.3).
+	#[cfg(all(feature = "aead", feature = "kdf", feature = "ecdh", feature = "aes-gcm"))]
+	fn altered(mut wrapped: Vec<u8>) -> Vec<u8> {
+		let last = wrapped.last_mut().expect("a wrapped key holds octets");
+		*last ^= 0x01;
+		wrapped
+	}
+
+	/// The house provider hands the caller's buffer to the key wrap itself,
+	/// so the wrap refuses a buffer of another size and names the 32 octets
+	/// a wrapped key of 40 octets holds (RFC 3394 §2.2.2).
+	#[cfg(all(feature = "aead", feature = "kdf", feature = "ecdh", feature = "aes-gcm"))]
+	#[tokio::test]
+	async fn the_house_wrap_refuses_a_buffer_of_another_size() -> Result<(), KeyError> {
+		let holder = house_holder();
+		let wrapped = holder.encrypt(&CONTENT_KEY).await?;
+		let mut short = [0u8; 16];
+
+		let refused = holder.decrypt_into(&wrapped, &mut short).await;
+		assert!(matches!(refused, Err(KeyError::WrapLength(sizes)) if (sizes.received, sizes.expected) == (16, 32)));
+		Ok(())
+	}
+
+	/// The house wrap checks the size of the caller's buffer before it
+	/// unwraps, so it refuses an altered wrapped key into a buffer of another
+	/// size for the size of the buffer.
+	#[cfg(all(feature = "aead", feature = "kdf", feature = "ecdh", feature = "aes-gcm"))]
+	#[tokio::test]
+	async fn the_house_provider_checks_the_buffer_before_it_unwraps() -> Result<(), KeyError> {
+		let holder = house_holder();
+		let wrapped = altered(holder.encrypt(&CONTENT_KEY).await?);
+		let mut short = [0u8; 16];
+
+		let refused = holder.decrypt_into(&wrapped, &mut short).await;
+		assert!(matches!(refused, Err(KeyError::WrapLength(_))));
+		Ok(())
+	}
+
+	/// A shared house provider reaches the same override, so it refuses an
+	/// altered wrapped key into a buffer of another size for the size of the
+	/// buffer.
+	#[cfg(all(feature = "aead", feature = "kdf", feature = "ecdh", feature = "aes-gcm"))]
+	#[tokio::test]
+	async fn a_shared_house_provider_refuses_through_its_override() -> Result<(), KeyError> {
+		let holder = Arc::new(house_holder());
+		let wrapped = altered(holder.encrypt(&CONTENT_KEY).await?);
+		let mut short = [0u8; 16];
+
+		let refused = holder.decrypt_into(&wrapped, &mut short).await;
+		assert!(matches!(refused, Err(KeyError::WrapLength(_))));
+		Ok(())
 	}
 }

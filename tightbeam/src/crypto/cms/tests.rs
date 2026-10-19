@@ -4,7 +4,6 @@ use crate::cms::content_info::CmsVersion;
 use crate::cms::enveloped_data::{
 	KekIdentifier, KekRecipientInfo, OtherRecipientInfo, RecipientIdentifier, RecipientInfo,
 };
-use crate::crypto::aead::aes_kw::Error as AesKwError;
 use crate::crypto::cms::{
 	AuthEnvelopedData, BareKemKey, CmsOriForKemOtherInfo, EnvelopeError, GcmParameters, KemKeyHolder, KemRecipient,
 	KemRecipientInfo, KeyAgreementIdentity, Opener, Recipient,
@@ -647,16 +646,13 @@ fn aes_256_key_unwrap_into_matches_rfc_3394_4_3() -> Result<(), KeyError> {
 	Ok(())
 }
 
-/// `aes-kw` refuses a buffer of another size than the wrapped key, and names
-/// the 16 octets the key takes.
+/// The house wrap refuses a buffer of another size than the wrapped key, and
+/// names the 16 octets the key takes.
 #[test]
 fn the_house_unwrap_into_refuses_a_buffer_of_another_size() {
 	let mut key = [0u8; 32];
 	let refused = Aes256Wrap::unwrap_into(&rfc_3394_kek(32), &unhex(RFC_3394_4_3), &mut key);
-	assert!(matches!(
-		refused,
-		Err(KeyError::WrapFailed(AesKwError::InvalidOutputSize { expected: 16 }))
-	));
+	assert!(matches!(refused, Err(KeyError::WrapLength(sizes)) if (sizes.received, sizes.expected) == (32, 16)));
 }
 
 #[test]

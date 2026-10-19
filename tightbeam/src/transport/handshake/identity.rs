@@ -27,6 +27,8 @@ use crate::crypto::cms::{KeyAgreementIdentity, RecipientKem};
 use crate::crypto::x509::SubjectKey;
 #[cfg(feature = "transport-cms")]
 use crate::transport::handshake::HandshakeError;
+#[cfg(feature = "transport-cms")]
+use crate::x509::Certificate;
 
 /// The identity a handshake server holds, which hands the orchestrator the
 /// half that signs the reply and its receipt.
@@ -79,16 +81,7 @@ impl<K: RecipientKem> CmsIdentityPair<K> {
 	/// - [`HandshakeError::KeyReuse`] -- the two certificates hold one key,
 	///   in either SEC 1 encoding of one point or its negation.
 	pub fn new(signing: SigningIdentity, key_agreement: KeyAgreementIdentity<K>) -> Result<Self, HandshakeError> {
-		let signing_certificate = &signing.certificate().tbs_certificate;
-		let key_agreement_certificate = &key_agreement.certificate().tbs_certificate;
-		if signing_certificate.subject != key_agreement_certificate.subject {
-			return Err(HandshakeError::SubjectMismatch);
-		}
-		let signing_key = &signing_certificate.subject_public_key_info;
-		let key_agreement_key = &key_agreement_certificate.subject_public_key_info;
-		if signing_key.same_key(key_agreement_key) {
-			return Err(HandshakeError::KeyReuse);
-		}
+		signing.certificate().pairs_with(key_agreement.certificate())?;
 
 		Ok(Self { signing, key_agreement })
 	}
@@ -117,6 +110,39 @@ impl<K: RecipientKem> CmsIdentityPair<K> {
 	pub(crate) fn require_purpose(&self, purpose: ObjectIdentifier) -> Result<(), CertificateValidationError> {
 		self.signing.certificate().require_purpose(purpose)?;
 		self.key_agreement.certificate().require_purpose(purpose)
+	}
+}
+
+/// The rule that binds the two certificates of a CMS server, which the server
+/// and its client both apply: one subject, and two distinct keys.
+#[cfg(feature = "transport-cms")]
+pub(crate) trait CmsPairing {
+	/// Refuse `key_agreement` as the partner of this signing certificate
+	/// unless the two name one subject with two distinct keys.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::SubjectMismatch`] -- the two certificates name two subjects.
+	/// - [`HandshakeError::KeyReuse`] -- the two certificates hold one key,
+	///   in either SEC 1 encoding of one point or its negation.
+	fn pairs_with(&self, key_agreement: &Certificate) -> Result<(), HandshakeError>;
+}
+
+#[cfg(feature = "transport-cms")]
+impl CmsPairing for Certificate {
+	fn pairs_with(&self, key_agreement: &Certificate) -> Result<(), HandshakeError> {
+		let signing = &self.tbs_certificate;
+		let key_agreement = &key_agreement.tbs_certificate;
+		if signing.subject != key_agreement.subject {
+			return Err(HandshakeError::SubjectMismatch);
+		}
+
+		let signing_key = &signing.subject_public_key_info;
+		if signing_key.same_key(&key_agreement.subject_public_key_info) {
+			return Err(HandshakeError::KeyReuse);
+		}
+
+		Ok(())
 	}
 }
 

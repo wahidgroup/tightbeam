@@ -117,6 +117,13 @@ macro_rules! impl_aes_key_wrap {
 					return Err(KeyError::WrapLength((wrapped.len(), 24).into()));
 				}
 
+				// A wrapped key of n + 1 blocks holds n (RFC 3394 §2.2.2), so
+				// the size of `out` is checked before the key schedule runs.
+				let key_len = wrapped.len().saturating_sub(8);
+				if out.len() != key_len {
+					return Err(KeyError::WrapLength((out.len(), key_len).into()));
+				}
+
 				let unwrapped = crate::crypto::aead::aes_kw::Kek::<$cipher>::new(&kek).unwrap(wrapped, out);
 				unwrapped.map_err(KeyError::WrapFailed)
 			}

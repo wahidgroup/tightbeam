@@ -120,8 +120,8 @@ pub enum TransportError {
 	/// This transport does not support the configured handshake protocol.
 	#[error("Handshake protocol not supported by this transport: {0:?}")]
 	UnsupportedHandshakeProtocol(HandshakeProtocolKind),
-	/// The CMS handshake requires the two provisioned certificates of the
-	/// server, and none are provisioned.
+	/// The CMS handshake requires the server's pinned key-agreement
+	/// certificate, and none is provisioned.
 	#[error("Server certificate chain required but not provisioned")]
 	MissingServerCertificateChain,
 	/// A server of the CMS flow requires a key-agreement identity beside its

@@ -767,7 +767,7 @@ impl<P: HandshakeProvider<Kem = DhKemSecp256k1>> SessionFlow<P> for Cms {
 	const BACKEND: HandshakeBackendKind = HandshakeBackendKind::Cms;
 	const STEPS: &'static [FlowStep] = CMS_FLOW;
 
-	/// The client provisions the server's two certificates and presents a
+	/// The client pins the server's key-agreement certificate and presents a
 	/// fresh identity.
 	fn client(
 		materials: &ServerMaterials,

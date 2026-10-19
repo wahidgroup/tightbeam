@@ -22,9 +22,14 @@
 //! its signature algorithm names (RFC 5753 §2.1.1). The signer brings every
 //! signature value to its canonical form before it attaches it.
 
+use core::borrow::Borrow;
+
+#[cfg(all(not(feature = "std"), any(feature = "transport-cms", feature = "transport-hpke")))]
+use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
 use alloc::{vec, vec::Vec};
-use core::borrow::Borrow;
+#[cfg(all(feature = "std", any(feature = "transport-cms", feature = "transport-hpke")))]
+use std::sync::Arc;
 
 use crate::cms::cert::CertificateChoices;
 use crate::cms::content_info::CmsVersion;
@@ -44,14 +49,15 @@ use crate::crypto::x509::{ErasedSigning, PeerCertificate, Signing};
 use crate::der::asn1::{ObjectIdentifier, OctetString, SetOfVec};
 use crate::der::oid::AssociatedOid;
 use crate::der::{Any, Encode, Sequence, Tag, Tagged};
-#[cfg(feature = "transport-hpke")]
-use crate::der::{AnyRef, Decode, Header, Reader, SliceReader, TagNumber};
 use crate::error::ReceivedExpectedError;
 use crate::frame::Signed;
 use crate::oids::{ATTR_CMS_ALGORITHM_PROTECTION, ATTR_CONTENT_TYPE, ATTR_MESSAGE_DIGEST, DATA};
 use crate::spki::{AlgorithmIdentifierOwned, DecodePublicKey, SubjectPublicKeyInfoRef};
 use crate::x509::attr::Attribute;
 use crate::x509::Certificate;
+
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::der::{AnyRef, Decode, Header, Reader, SliceReader, TagNumber};
 
 /// The proof that the signer built a [`Signed`] value.
 ///
@@ -694,14 +700,27 @@ impl CmsSigner {
 	/// - [`SignerError::Certificate`] -- a certificate's key identifier fails to decode.
 	pub fn signer_certificate(signed_data: &SignedData) -> Result<Option<&Certificate>, SignerError> {
 		let signer_info = Self::sole_signer(signed_data)?;
+		Self::named_certificate(signed_data, signer_info)
+	}
 
+	/// The certificate of the `certificates` of `signed_data` that
+	/// `signer_info`, one of its signers, names by its `sid` (RFC 5652 §5.3),
+	/// or `None` when the set holds no such certificate.
+	///
+	/// # Errors
+	///
+	/// - [`SignerError::Certificate`] -- a certificate's key identifier fails to decode.
+	pub(crate) fn named_certificate<'a>(
+		signed_data: &'a SignedData,
+		signer_info: &SignerInfo,
+	) -> Result<Option<&'a Certificate>, SignerError> {
 		let choices = signed_data.certificates.iter().flat_map(|set| set.0.iter());
 		let certificates = choices.filter_map(|choice| match choice {
 			CertificateChoices::Certificate(certificate) => Some((certificate, ())),
 			CertificateChoices::Other(_) => None,
 		});
-		let named = Self::first_named(signer_info, certificates)?;
 
+		let named = Self::first_named(signer_info, certificates)?;
 		Ok(named.map(|(certificate, ())| certificate))
 	}
 
@@ -718,7 +737,7 @@ impl CmsSigner {
 	/// - [`SignerError::SignerIdentifier`] -- `signed_data` does not have exactly one signer.
 	/// - [`SignerError::Certificate`] -- a certificate's key identifier fails to decode.
 	/// - [`SignerError::Encoding`] -- `der` is no SEQUENCE of elements.
-	#[cfg(feature = "transport-hpke")]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub(crate) fn signer_certificate_der<'a>(
 		signed_data: &SignedData,
 		der: &'a [u8],
@@ -766,6 +785,7 @@ impl CmsSigner {
 			(CertificateChoices::Certificate(held), Some(named)) => core::ptr::eq(held, named),
 			_ => false,
 		};
+
 		let mut choices = signed_data.certificates.iter().flat_map(|set| set.0.iter());
 		let Some(position) = choices.position(is_named) else {
 			return Ok(None);
@@ -856,16 +876,20 @@ impl Signed<SignedData> {
 		Ok(Signed::new(signed_data, SignerSeal(())))
 	}
 
-	/// Add `signer` to this `SignedData`, and take the version that the
-	/// joined signers give it (RFC 5652 §5.1).
+	/// Add `signer` to this `SignedData` beside the certificate its `sid`
+	/// names, and take the version that the joined signers give it (RFC 5652
+	/// §5.1). A set that holds the certificate already keeps its one copy.
 	///
-	/// A receipt countersignature joins the server's `SignedData` this way.
+	/// A receipt countersignature joins the server's `SignedData` this way, so
+	/// the artifact carries the certificate of each of its signers.
 	///
 	/// # Errors
 	///
 	/// - [`SignerError::Encoding`] -- a SET of the `SignedData` refuses the insertion.
-	pub fn with_signer(self, signer: Signed<SignerInfo>) -> Result<Self, SignerError> {
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	pub(crate) fn with_certified_signer(self, signer: CertifiedSigner) -> Result<Self, SignerError> {
 		let mut signed_data = self.into_inner();
+		let CertifiedSigner { signer, certificate } = signer;
 		let signer = signer.into_inner();
 
 		let digest_present = signed_data.digest_algorithms.as_ref().contains(&signer.digest_alg);
@@ -875,6 +899,20 @@ impl Signed<SignedData> {
 
 		signed_data.signer_infos.0.insert(signer)?;
 
+		// A `CertificateSet` owns each certificate it holds, so a certificate
+		// the set lacks joins as its own copy. The client's identity, or the
+		// server's record of its peer, keeps a handle for the session, so each
+		// join of a session makes a deep clone.
+		let set = signed_data.certificates.get_or_insert_with(|| CertificateSet(SetOfVec::new()));
+		let held = set.0.iter().any(|choice| match choice {
+			CertificateChoices::Certificate(held) => *held == *certificate,
+			CertificateChoices::Other(_) => false,
+		});
+		if !held {
+			let choice = CertificateChoices::Certificate(Arc::unwrap_or_clone(certificate));
+			set.0.insert(choice)?;
+		}
+
 		let certificates = signed_data.certificates.as_ref();
 		let crls = signed_data.crls.as_ref();
 		let content_type = signed_data.encap_content_info.econtent_type;
@@ -882,5 +920,40 @@ impl Signed<SignedData> {
 		signed_data.version = signed_data_version(certificates, crls, &signed_data.signer_infos, content_type);
 
 		Ok(Signed::new(signed_data, SignerSeal(())))
+	}
+}
+
+/// A `SignerInfo` beside the certificate its `sid` names (RFC 5652 §5.3), the
+/// form in which a signer joins a `SignedData` that carries the certificate
+/// of each of its signers.
+///
+/// [`Self::new`] is its one constructor, and it admits only the certificate
+/// the `sid` names, so [`Signed::with_certified_signer`] joins each signer
+/// beside its own certificate.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+pub(crate) struct CertifiedSigner {
+	/// The `SignerInfo` that joins a `SignedData`.
+	signer: Signed<SignerInfo>,
+	/// The certificate the `sid` of the signer names.
+	certificate: Arc<Certificate>,
+}
+
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+impl CertifiedSigner {
+	/// `signer` beside `certificate`, the certificate its `sid` names.
+	///
+	/// # Errors
+	///
+	/// - [`SignerError::SignerIdentifier`] -- the `sid` names another certificate.
+	/// - [`SignerError::Certificate`] -- the certificate's key identifier fails to decode.
+	pub(crate) fn new(signer: Signed<SignerInfo>, certificate: Arc<Certificate>) -> Result<Self, SignerError> {
+		CmsSigner::expect_signer(&signer, &certificate)?;
+		Ok(Self { signer, certificate })
+	}
+
+	/// The signer, which a message also carries apart from the `SignedData`
+	/// it joins.
+	pub(crate) fn signer(&self) -> &Signed<SignerInfo> {
+		&self.signer
 	}
 }

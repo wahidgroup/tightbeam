@@ -246,24 +246,6 @@ impl Transcript {
 		}
 	}
 
-	/// Append the DER of `value` to an open transcript, encoded into the
-	/// transcript's own buffer.
-	///
-	/// # Errors
-	///
-	/// - [`HandshakeError::InvalidState`] -- the transcript is sealed.
-	/// - [`HandshakeError::DerError`] -- `value` fails to encode.
-	#[cfg(feature = "transport-hpke")]
-	pub(crate) fn append_der(&mut self, value: &impl Encode) -> Result<(), HandshakeError> {
-		match &mut self.0 {
-			State::Open(buffer) => {
-				value.encode_to_vec(buffer)?;
-				Ok(())
-			}
-			State::Sealed => Err(HandshakeError::InvalidState),
-		}
-	}
-
 	/// Append the server Finished legs in the order both endpoints bind them.
 	///
 	/// The server appends the bytes it is about to send and the client the
@@ -274,8 +256,8 @@ impl Transcript {
 	///
 	/// - [`HandshakeError::InvalidState`] -- the transcript is sealed.
 	#[cfg(feature = "transport-cms")]
-	pub(crate) fn append_server_finished(&mut self, legs: ServerFinishedLegs) -> Result<(), HandshakeError> {
-		let ServerFinishedLegs { security_accept, transport_accept, server_ephemeral } = legs;
+	pub(crate) fn append_server_finished(&mut self, legs: ServerFinishedLegs<'_>) -> Result<(), HandshakeError> {
+		let ServerFinishedLegs { security_accept, transport_accept, server_ephemeral, certificate } = legs;
 		if let Some(accept) = security_accept {
 			self.append(accept)?;
 		}
@@ -283,7 +265,9 @@ impl Transcript {
 			self.append(accept)?;
 		}
 
-		self.append(server_ephemeral)
+		self.append(server_ephemeral)?;
+
+		self.append(certificate)
 	}
 
 	/// Fix the hash over the bytes appended so far under digest `D`, and
@@ -304,13 +288,15 @@ impl Transcript {
 	}
 }
 
-/// The server Finished attributes the CMS transcript binds, as encoded bytes.
+/// The server Finished legs the CMS transcript binds: its attributes as
+/// encoded bytes, then the DER of the signing certificate it carries.
 ///
 /// The accepts are present when negotiation produced them, and the server
-/// ephemeral public key is mandatory, so every sealed transcript binds one.
-/// [`Transcript::append_server_finished`] fixes the order.
+/// ephemeral public key and the certificate are mandatory, so every sealed
+/// transcript binds both. [`Transcript::append_server_finished`] fixes the
+/// order.
 #[cfg(feature = "transport-cms")]
-pub(crate) struct ServerFinishedLegs {
+pub(crate) struct ServerFinishedLegs<'a> {
 	/// The `SecurityAccept` attribute value, when a profile was negotiated.
 	pub(crate) security_accept: Option<Vec<u8>>,
 	/// The `TransportAccept` attribute value, when transport terms were
@@ -319,6 +305,10 @@ pub(crate) struct ServerFinishedLegs {
 	/// The `OriginatorPublicKey` attribute value carrying the server
 	/// ephemeral.
 	pub(crate) server_ephemeral: Vec<u8>,
+	/// The DER of the signing certificate the Finished carries in
+	/// `certificates`, which its `sid` names: the server's as its identity
+	/// encoded it once, the client's as the bytes arrived (RFC 9846 §4.5.2).
+	pub(crate) certificate: &'a [u8],
 }
 
 #[cfg(test)]
@@ -343,41 +333,6 @@ mod tests {
 		transcript.seal::<Sha3_256>()?;
 
 		let refusal = transcript.append(b"server finished");
-		assert!(matches!(refusal, Err(HandshakeError::InvalidState)));
-		Ok(())
-	}
-
-	/// A transcript binds the DER of a value it appends after the bytes before
-	/// it.
-	///
-	/// The expected digest comes from an independent SHA3-256 (Python's
-	/// `hashlib`) over `hello` and the DER `04 04 63 65 72 74`, so no code of
-	/// the crate computes it.
-	#[cfg(feature = "transport-hpke")]
-	#[test]
-	fn a_transcript_binds_the_der_it_appends() -> Result<(), HandshakeError> {
-		let mut transcript = Transcript::new();
-		transcript.append(b"hello")?;
-		transcript.append_der(&OctetString::new(*b"cert")?)?;
-
-		let hash = transcript.seal::<Sha3_256>()?;
-		let expected = [
-			0x3a, 0xa6, 0x78, 0xe9, 0x3e, 0xb5, 0xc1, 0x57, 0xda, 0x44, 0x4d, 0x15, 0xda, 0x2b, 0x42, 0x84, 0xe2, 0xa5,
-			0xcb, 0x56, 0x70, 0x16, 0x2a, 0xac, 0xd2, 0xd5, 0x9f, 0x18, 0xe4, 0xfa, 0xe9, 0x8f,
-		];
-		assert_eq!(hash.as_bytes(), expected);
-		Ok(())
-	}
-
-	/// A sealed transcript appends no DER either.
-	#[cfg(feature = "transport-hpke")]
-	#[test]
-	fn a_sealed_transcript_refuses_more_der() -> Result<(), HandshakeError> {
-		let mut transcript = Transcript::new();
-		transcript.append(b"hello")?;
-		transcript.seal::<Sha3_256>()?;
-
-		let refusal = transcript.append_der(&OctetString::new(*b"cert")?);
 		assert!(matches!(refusal, Err(HandshakeError::InvalidState)));
 		Ok(())
 	}
@@ -415,17 +370,25 @@ mod tests {
 	}
 
 	/// The CMS transcript hash of a key exchange followed by server Finished
-	/// legs that carry `server_ephemeral`.
+	/// legs that carry `server_ephemeral` and `certificate`.
 	#[cfg(feature = "transport-cms")]
-	fn cms_hash_with_ephemeral(server_ephemeral: &[u8]) -> Result<TranscriptHash, HandshakeError> {
+	fn cms_hash_of(server_ephemeral: &[u8], certificate: &[u8]) -> Result<TranscriptHash, HandshakeError> {
 		let mut transcript = Transcript::new();
 		transcript.append(b"key exchange")?;
 		transcript.append_server_finished(ServerFinishedLegs {
 			security_accept: Some(b"accept".to_vec()),
 			transport_accept: None,
 			server_ephemeral: server_ephemeral.to_vec(),
+			certificate,
 		})?;
 		transcript.seal::<Sha3_256>()
+	}
+
+	/// The CMS transcript hash of a key exchange followed by server Finished
+	/// legs that carry `server_ephemeral` and a fixed certificate.
+	#[cfg(feature = "transport-cms")]
+	fn cms_hash_with_ephemeral(server_ephemeral: &[u8]) -> Result<TranscriptHash, HandshakeError> {
+		cms_hash_of(server_ephemeral, b"certificate")
 	}
 
 	/// Two CMS transcripts that differ only in the server ephemeral hash
@@ -436,6 +399,19 @@ mod tests {
 		let first = cms_hash_with_ephemeral(&[0x02u8; 33])?;
 		let second = cms_hash_with_ephemeral(&[0x03u8; 33])?;
 		assert_ne!(first, second);
+		Ok(())
+	}
+
+	/// The CMS transcript binds the server's certificate after the server
+	/// ephemeral, so the expected hash is SHA3-256 of the legs in that order,
+	/// computed by the `sha3` crate outside the transcript.
+	#[cfg(feature = "transport-cms")]
+	#[test]
+	fn the_cms_transcript_binds_the_certificate_after_the_ephemeral() -> Result<(), HandshakeError> {
+		let bound = cms_hash_of(&[0x02u8; 33], b"certificate")?;
+		let legs = [b"key exchange".as_slice(), b"accept", &[0x02u8; 33], b"certificate"].concat();
+		let expected = Sha3_256::digest(&legs);
+		assert_eq!(bound.as_bytes(), expected.as_slice());
 		Ok(())
 	}
 

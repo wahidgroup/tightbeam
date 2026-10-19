@@ -30,6 +30,7 @@ use crate::testing::fixtures::{TestAttributes, TestCertificate, TestIdentity, Te
 use crate::utils::marker::MaybeSendFuture;
 use crate::x509::attr::Attribute;
 use crate::x509::ext::pkix::{KeyUsage, KeyUsages, SubjectKeyIdentifier};
+use crate::x509::Certificate;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -55,6 +56,15 @@ fn signed_by(key: &CertifiedKey<Secp256k1SigningKey>, content: SignedContent<'_>
 fn signed() -> Signed<SignerInfo> {
 	let key = TestIdentity::certified(TestKey::insecure_fixed_signing());
 	signed_by(&key, SignedContent::data(CONTENT))
+}
+
+/// [`signed`] beside the certificate its `sid` names, the self-signed
+/// certificate of the fixed test key.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+fn certified() -> CertifiedSigner {
+	let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+	let certified = CertifiedSigner::new(signed(), Arc::new(certificate));
+	certified.expect("the sid names the certificate of its key")
 }
 
 /// The `SignedData` that carries [`CONTENT`] and [`signed`].
@@ -743,30 +753,79 @@ fn a_signed_data_with_another_revocation_format_reads_at_version_5() -> TestResu
 
 /// A version 3 countersignature lifts a version 1 `SignedData` to version 3
 /// (RFC 5652 §5.1).
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 #[test]
 fn a_version_3_countersignature_lifts_the_signed_data_to_version_3() -> TestResult {
 	let content = SignedContent::data(CONTENT);
 	let signer = signed_by(&issuer_and_serial_key(), SignedContent::data(CONTENT));
 	let signed_data = CmsSigner::signed_data(content, signer, None)?;
 
-	let joined = signed_data.with_signer(signed())?;
+	let joined = signed_data.with_certified_signer(certified())?;
 	assert_eq!(joined.version, CmsVersion::V3);
 	Ok(())
 }
 
 /// A joining signer's digest algorithm enters `digestAlgorithms` (RFC 5652
 /// §5.1).
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 #[test]
 fn a_joining_signer_declares_its_digest_algorithm() -> TestResult {
 	let content = SignedContent::data(CONTENT);
 	let signed_data = CmsSigner::signed_data(content, signed(), None)?;
 	let digest_alg = AlgorithmIdentifierOwned { oid: HASH_SHA3_512, parameters: None };
 	let foreign = SignerInfo { digest_alg: digest_alg.clone(), ..signed().into_inner() };
+	let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
 
 	let joiner = Signed::<SignerInfo>::from_der(&foreign.to_der()?)?;
-	let joined = signed_data.with_signer(joiner)?;
+	let joiner = CertifiedSigner::new(joiner, Arc::new(certificate))?;
+	let joined = signed_data.with_certified_signer(joiner)?;
 	assert!(joined.digest_algorithms.as_ref().contains(&digest_alg));
 	Ok(())
+}
+
+/// A joining signer brings the certificate its `sid` names into
+/// `certificates`, so the `SignedData` carries the certificate of each of its
+/// signers (RFC 5652 §5.1).
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+#[test]
+fn a_joining_signer_brings_its_certificate() -> TestResult {
+	let content = SignedContent::data(CONTENT);
+	let signer = signed_by(&issuer_and_serial_key(), SignedContent::data(CONTENT));
+	let signed_data = CmsSigner::signed_data(content, signer, None)?;
+	let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+
+	let joined = signed_data.with_certified_signer(certified())?;
+	let carried = joined.certificates.as_ref().map(|set| set.0.as_slice().to_vec());
+	assert_eq!(carried, Some(vec![CertificateChoices::Certificate(certificate)]));
+	Ok(())
+}
+
+/// A joining signer whose certificate the `SignedData` carries already joins
+/// beside that one copy (RFC 5652 §5.1).
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+#[test]
+fn a_joining_signer_whose_certificate_the_set_holds_keeps_one_copy() -> TestResult {
+	let content = SignedContent::data(CONTENT);
+	let signer = signed_by(&issuer_and_serial_key(), SignedContent::data(CONTENT));
+	let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+	let held = CertificateChoices::Certificate(certificate.to_owned());
+	let certificates = CertificateSet(SetOfVec::try_from(vec![held])?);
+	let signed_data = CmsSigner::signed_data(content, signer, Some(certificates))?;
+
+	let joined = signed_data.with_certified_signer(certified())?;
+	let carried = joined.certificates.as_ref().map(|set| set.0.as_slice().to_vec());
+	assert_eq!(carried, Some(vec![CertificateChoices::Certificate(certificate)]));
+	Ok(())
+}
+
+/// A certificate the `sid` of a signer does not name is refused beside it
+/// (RFC 5652 §5.3).
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+#[test]
+fn a_signer_beside_a_certificate_its_sid_does_not_name_is_refused() {
+	let other = TestCertificate::self_signed(&Secp256k1SigningKey::random(&mut crate::random::OsRng));
+	let refused = CertifiedSigner::new(signed(), Arc::new(other));
+	assert!(matches!(refused, Err(SignerError::SignerIdentifier)));
 }
 
 /// A `SignedData` whose version differs from the RFC 5652 §5.1 rule is
@@ -836,6 +895,20 @@ fn a_signing_identity_accepts_the_key_of_its_certificate() -> TestResult {
 
 	let identity = SigningIdentity::new(certificate.clone(), provider)?;
 	assert_eq!(identity.signer_identifier(), &certificate.signer_identifier()?);
+	Ok(())
+}
+
+/// A signing identity keeps the DER its certificate decoded from, the bytes
+/// a handshake transcript binds.
+#[test]
+fn a_signing_identity_keeps_the_der_of_its_certificate() -> TestResult {
+	let key = TestKey::insecure_fixed_signing();
+	let der = TestCertificate::self_signed(&key).to_der()?;
+	let certificate = Certificate::from_der(&der)?;
+	let provider = Arc::new(Secp256k1KeyProvider::from(key));
+
+	let identity = SigningIdentity::new(certificate, provider)?;
+	assert_eq!(identity.certificate_der(), der.as_slice());
 	Ok(())
 }
 
@@ -1036,8 +1109,11 @@ fn an_unsigned_attribute_joins_the_one_signer() -> TestResult {
 fn an_unsigned_attribute_refuses_two_signers() -> TestResult {
 	let content = SignedContent::data(CONTENT);
 	let first = CmsSigner::signed_data(content, signed(), None)?;
-	let other = TestIdentity::certified(Secp256k1SigningKey::random(&mut crate::random::OsRng));
-	let both = first.with_signer(signed_by(&other, SignedContent::data(CONTENT)))?;
+	let other_key = Secp256k1SigningKey::random(&mut crate::random::OsRng);
+	let other_certificate = Arc::new(TestCertificate::self_signed(&other_key));
+	let other = signed_by(&TestIdentity::certified(other_key), SignedContent::data(CONTENT));
+	let other = CertifiedSigner::new(other, other_certificate)?;
+	let both = first.with_certified_signer(other)?;
 	let attribute = Attribute { oid: RECEIPT_ROLE, values: SetOfVec::try_from(vec![Any::encode_from(&1u8)?])? };
 
 	let refused = both.with_unsigned_attribute(attribute);

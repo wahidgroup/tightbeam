@@ -318,10 +318,11 @@ impl<P: HandshakeProvider> ServerLegs<P> for Hpke {
 
 		// 2. Bind the content and the signing certificate after the hello, and
 		//    seal. The transcript covers the certificate the reply's `sid`
-		//    names, as TLS 1.3 signs over its Certificate.
+		//    names, as TLS 1.3 signs over its Certificate, in the DER its
+		//    identity encoded once.
 		let certificate = identity.certificate();
 		opened.transcript.append(&content)?;
-		opened.transcript.append_der(certificate)?;
+		opened.transcript.append(identity.certificate_der())?;
 		let transcript_hash = opened.transcript.seal::<P::Digest>()?;
 
 		// 3. Draft the reply's `SignerInfo`, whose signed attributes carry the
@@ -387,7 +388,7 @@ mod tests {
 	use crate::crypto::x509::error::CertificateValidationError;
 	use crate::crypto::x509::policy::{DirectTrustValidator, ExpiryValidator};
 	use crate::crypto::x509::KeyPurposes;
-	use crate::der::asn1::{ObjectIdentifier, PrintableString, SetOfVec};
+	use crate::der::asn1::{ObjectIdentifier, SetOfVec};
 	use crate::oids::{
 		AUTH_ENVELOPED_DATA, HANDSHAKE_ABORT_ALERT, HANDSHAKE_TRANSCRIPT_HASH, HASH_SHA3_384, RECEIPT_ACK, SIGNED_DATA,
 	};
@@ -403,8 +404,6 @@ mod tests {
 		Client, ClientConfig, Handshake, HandshakeAlert, HandshakePhase, PeerAuthentication, Server, ServerConfig,
 		SupportedProfiles,
 	};
-	use crate::x509::attr::AttributeTypeAndValue;
-	use crate::x509::name::{RdnSequence, RelativeDistinguishedName};
 
 	/// The client random each hand-built hello of this module carries.
 	const CLIENT_RANDOM: [u8; 32] = [7u8; 32];
@@ -492,39 +491,6 @@ mod tests {
 		let mut signed_data = reply_signed_data(reply);
 		signed_data.certificates = certificates;
 		HandshakeMessage::try_from(signed_data).expect("the reply encodes")
-	}
-
-	/// The two values of the one RDN of [`two_valued_name`]: a CN and an O.
-	fn rdn_values() -> [AttributeTypeAndValue; 2] {
-		let value = |oid: &str, text: &str| {
-			let text = PrintableString::new(text).expect("the text is printable");
-			AttributeTypeAndValue { oid: ObjectIdentifier::new_unwrap(oid), value: Any::from(&text) }
-		};
-		[value("2.5.4.3", "server"), value("2.5.4.10", "tightbeam")]
-	}
-
-	/// A name of one RDN that holds both [`rdn_values`]. DER sorts the values
-	/// of the RDN's SET OF, and a decoder restores that order.
-	fn two_valued_name() -> RdnSequence {
-		let values = SetOfVec::try_from(rdn_values().to_vec()).expect("two distinct values are a SET");
-		RdnSequence::from(vec![RelativeDistinguishedName::from(values)])
-	}
-
-	/// `reply` with the two values of [`two_valued_name`] swapped in the bytes
-	/// it carries, so its certificate decodes to the same value from another
-	/// encoding.
-	fn with_rdn_values_swapped(reply: &HandshakeMessage) -> HandshakeMessage {
-		let name = two_valued_name();
-		let values = name.0.iter().flat_map(|rdn| rdn.0.iter());
-		let sorted: Vec<Vec<u8>> = values.map(|value| value.to_der().expect("a value encodes")).collect();
-		let encoded = sorted.concat();
-		let swapped = sorted.iter().rev().flatten().copied().collect::<Vec<u8>>();
-
-		let carried = reply.der().windows(encoded.len()).position(|window| window == encoded);
-		let (head, tail) = reply.der().split_at(carried.expect("the reply carries the RDN"));
-		let bytes = [head, swapped.as_slice(), &tail[encoded.len()..]].concat();
-		let signed = WireDer::try_from(bytes.as_slice()).expect("the reordered reply decodes");
-		HandshakeMessage::SignedData(Box::new(signed))
 	}
 
 	/// An attribute of `oid` whose one value is `value`.

@@ -596,8 +596,8 @@ pub struct EncryptionConfig<P: CryptoProvider> {
 	/// the key that signs its replies and its receipts, and for a CMS server
 	/// the key-agreement identity its opening seals to.
 	pub(crate) server_identity: Option<ServerIdentities<P>>,
-	/// The trust in the CMS server, built once over its two provisioned
-	/// certificates, which the CMS handshake needs before the server speaks.
+	/// The trust in the CMS server, built once over its pinned key-agreement
+	/// certificate, which the CMS handshake needs before the server speaks.
 	#[cfg(feature = "transport-cms")]
 	pub(crate) cms_server: Option<ProvisionedTrust>,
 	/// The identity this endpoint presents as a client for mutual
@@ -935,6 +935,8 @@ mod tests {
 	use crate::testing::fixtures::TestCmsServer;
 	#[cfg(feature = "testing")]
 	use crate::testing::fixtures::{TestCertificate, TestKey};
+	#[cfg(feature = "testing")]
+	use crate::transport::handshake::SessionPeer;
 
 	/// Holds the phase the trait reads back.
 	struct PhaseProbe {
@@ -1340,7 +1342,8 @@ mod tests {
 	#[cfg(feature = "testing")]
 	fn established_session() -> EstablishedSession {
 		let keys = SessionKeys::for_client(crate::testing::TestKey::insecure_directional_keys());
-		EstablishedSession::new(keys, None, None, Some(Arc::new(fixture_certificate())), None)
+		let peer = SessionPeer::from(Arc::new(fixture_certificate()));
+		EstablishedSession::new(keys, None, None, Some(peer), None)
 	}
 
 	#[cfg(feature = "testing")]

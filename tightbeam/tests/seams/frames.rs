@@ -4,7 +4,8 @@
 //! - a frame sealed to the bare recipient of the outside KEM, which an outside
 //!   backend opens through a [`BareKemKey`],
 //! - a frame and a record under the outside AEAD and key wrap, and a refused frame that keeps its ciphertext,
-//! - a key-encryption key an outside crate holds, as an [`EncryptingKeyProvider`],
+//! - a key-encryption key an outside crate holds, as an
+//!   [`EncryptingKeyProvider`] that keeps the provided `decrypt_into`,
 //! - a frame cipher an outside crate writes, as an [`Encryptor`] and a [`Decryptor`],
 //! - a frame decryptor an outside crate writes, which opens the parts of a [`CheckedContent`] itself,
 //! - a codec an outside crate writes, as a [`Compressor`] and an [`Inflator`], and
@@ -263,6 +264,35 @@ async fn a_frame_sealed_through_an_outside_kek_holder_opens_through_it() -> Resu
 	frame.encrypt_with_provider::<OutsideProvider>(&holder).await?;
 	frame.decrypt_with_provider::<OutsideProvider>(&holder).await?;
 	assert_eq!(tightbeam::decode::<TestMessage>(frame.message())?, message);
+	Ok(())
+}
+
+/// The content key the outside holder wraps in the tests of its open.
+const OUTSIDE_CONTENT_KEY: [u8; 32] = [0x6Bu8; 32];
+
+/// The outside holder keeps the provided `decrypt_into`, which decrypts
+/// through its `decrypt` and copies the content key into the caller's buffer.
+#[tokio::test]
+async fn an_outside_kek_holder_decrypts_into_the_callers_buffer() -> Result<(), KeyError> {
+	let holder = OutsideKekHolder { kek: [0x48; 32] };
+	let wrapped = holder.encrypt(&OUTSIDE_CONTENT_KEY).await?;
+	let mut content_key = [0u8; 32];
+
+	holder.decrypt_into(&wrapped, &mut content_key).await?;
+	assert_eq!(content_key, OUTSIDE_CONTENT_KEY);
+	Ok(())
+}
+
+/// The provided `decrypt_into` refuses a buffer of another size than the key
+/// the holder decrypts, and names both sizes.
+#[tokio::test]
+async fn the_provided_decrypt_into_refuses_a_buffer_of_another_size() -> Result<(), KeyError> {
+	let holder = OutsideKekHolder { kek: [0x48; 32] };
+	let wrapped = holder.encrypt(&OUTSIDE_CONTENT_KEY).await?;
+	let mut short = [0u8; 16];
+
+	let refused = holder.decrypt_into(&wrapped, &mut short).await;
+	assert!(matches!(refused, Err(KeyError::WrapLength(sizes)) if (sizes.received, sizes.expected) == (16, 32)));
 	Ok(())
 }
 

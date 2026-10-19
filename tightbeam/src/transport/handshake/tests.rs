@@ -51,7 +51,7 @@ use crate::crypto::x509::utils::Skid;
 use crate::crypto::x509::{ErasedSigning, KeyPurposes, PeerCertificate};
 use crate::der::asn1::BitString;
 use crate::der::asn1::GeneralizedTime;
-use crate::der::asn1::{Any as AnyValue, ObjectIdentifier};
+use crate::der::asn1::{Any as AnyValue, ObjectIdentifier, PrintableString, SetOfVec};
 use crate::der::oid::AssociatedOid;
 use crate::der::{Decode, Encode, EncodeValue, Tagged};
 use crate::oids::{AES_256_WRAP, DATA, HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA256, SIGNER_ECDSA_WITH_SHA3_256};
@@ -71,9 +71,12 @@ use crate::transport::handshake::{
 	HandshakeMessage, HandshakeSecret, PeerAuthentication, Server, ServerConfig, ServerFlow, ServerHandshake,
 	SupportedProfiles,
 };
+use crate::transport::wire_der::WireDer;
 use crate::utils::marker::MaybeSendFuture;
+use crate::x509::attr::AttributeTypeAndValue;
 use crate::x509::ext::pkix::{KeyUsage, KeyUsages, SubjectKeyIdentifier};
 use crate::x509::ext::Extension;
+use crate::x509::name::RelativeDistinguishedName;
 use crate::x509::serial_number::SerialNumber;
 use crate::x509::time::Time;
 use crate::x509::time::Validity;
@@ -111,8 +114,7 @@ mod cms {
 	pub use crate::oids::{HANDSHAKE_OPENING_CONTENT, HANDSHAKE_SERVER_EPHEMERAL, RECEIPT_ACK};
 	pub use crate::transport::handshake::attributes::HandshakeAttributes;
 	pub use crate::transport::handshake::{
-		Cms, CmsClientSettings, CmsIdentityPair, CmsServerCertificates, CmsServerIdentity, CmsServerSettings,
-		ProvisionedTrust,
+		Cms, CmsClientSettings, CmsIdentityPair, CmsServerSettings, ProvisionedTrust,
 	};
 }
 
@@ -133,6 +135,39 @@ pub struct TestCertificate {
 	pub signing_key: Secp256k1SigningKey,
 	/// The certificate over the public key of `signing_key`.
 	pub certificate: Certificate,
+}
+
+/// The two values of the one RDN of [`two_valued_name`]: a CN and an O.
+pub fn rdn_values() -> [AttributeTypeAndValue; 2] {
+	let value = |oid: &str, text: &str| {
+		let text = PrintableString::new(text).expect("the text is printable");
+		AttributeTypeAndValue { oid: ObjectIdentifier::new_unwrap(oid), value: AnyValue::from(&text) }
+	};
+	[value("2.5.4.3", "server"), value("2.5.4.10", "tightbeam")]
+}
+
+/// A name of one RDN that holds both [`rdn_values`]. DER sorts the values
+/// of the RDN's SET OF, and a decoder restores that order.
+pub fn two_valued_name() -> RdnSequence {
+	let values = SetOfVec::try_from(rdn_values().to_vec()).expect("two distinct values are a SET");
+	RdnSequence::from(vec![RelativeDistinguishedName::from(values)])
+}
+
+/// `reply` with the two values of [`two_valued_name`] swapped in the bytes
+/// it carries, so its certificate decodes to the same value from another
+/// encoding.
+pub fn with_rdn_values_swapped(reply: &HandshakeMessage) -> HandshakeMessage {
+	let name = two_valued_name();
+	let values = name.0.iter().flat_map(|rdn| rdn.0.iter());
+	let sorted: Vec<Vec<u8>> = values.map(|value| value.to_der().expect("a value encodes")).collect();
+	let encoded = sorted.concat();
+	let swapped = sorted.iter().rev().flatten().copied().collect::<Vec<u8>>();
+	let carried = reply.der().windows(encoded.len()).position(|window| window == encoded);
+	let (head, tail) = reply.der().split_at(carried.expect("the reply carries the RDN"));
+	let bytes = [head, swapped.as_slice(), &tail[encoded.len()..]].concat();
+
+	let signed = WireDer::try_from(bytes.as_slice()).expect("the reordered reply decodes");
+	HandshakeMessage::SignedData(Box::new(signed))
 }
 
 /// Create a test certificate with a secp256k1 keypair.
@@ -159,13 +194,16 @@ pub struct TestServerIdentity {
 	pub key_agreement: TestCertificate,
 	/// The authority that issued both certificates.
 	pub authority: Certificate,
+	/// The key of [`Self::authority`].
+	pub authority_key: Secp256k1SigningKey,
 }
 
 impl TestServerIdentity {
 	/// The certificates and keys as the shared test fixture holds them.
-	fn fixture(&self) -> TestCmsServer {
+	pub fn fixture(&self) -> TestCmsServer {
 		TestCmsServer {
 			authority: self.authority.to_owned(),
+			authority_key: self.authority_key.to_owned(),
 			signing: self.signing.certificate.to_owned(),
 			signing_key: self.signing.signing_key.to_owned(),
 			key_agreement: self.key_agreement.certificate.to_owned(),
@@ -189,13 +227,6 @@ impl TestServerIdentity {
 	#[cfg(feature = "transport-cms")]
 	pub fn trust(&self) -> ProvisionedTrust {
 		self.fixture().trust()
-	}
-
-	/// The two certificates a CMS client provisions, each a bare
-	/// certificate.
-	#[cfg(feature = "transport-cms")]
-	pub fn certificates(&self) -> CmsServerCertificates {
-		self.fixture().certificates()
 	}
 
 	/// A store that holds the authority of both certificates.
@@ -243,10 +274,24 @@ impl RevocationChecker for LaterRevocation {
 
 /// Create a test server identity with fresh keys under a fresh authority.
 pub fn create_test_server() -> TestServerIdentity {
-	let fixture = TestCmsServer::generate("tightbeam test server");
-	let signing = TestCertificate { signing_key: fixture.signing_key, certificate: fixture.signing };
-	let key_agreement = TestCertificate { signing_key: fixture.key_agreement_key, certificate: fixture.key_agreement };
-	TestServerIdentity { signing, key_agreement, authority: fixture.authority }
+	TestServerIdentity::from(TestCmsServer::generate("tightbeam test server"))
+}
+
+/// A test server whose authority issues both of its certificates to
+/// `subject`.
+pub fn create_named_test_server(subject: RdnSequence) -> TestServerIdentity {
+	TestServerIdentity::from(TestCmsServer::named(subject))
+}
+
+/// The certificates and keys of the shared test fixture, as a test server
+/// holds them.
+impl From<TestCmsServer> for TestServerIdentity {
+	fn from(server: TestCmsServer) -> Self {
+		let TestCmsServer { authority, authority_key, signing, signing_key, key_agreement, key_agreement_key } = server;
+		let signing = TestCertificate { signing_key, certificate: signing };
+		let key_agreement = TestCertificate { signing_key: key_agreement_key, certificate: key_agreement };
+		TestServerIdentity { signing, key_agreement, authority, authority_key }
+	}
 }
 
 /// A test certificate whose validity period ended one second after the epoch.

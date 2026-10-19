@@ -273,10 +273,10 @@ impl<P: Protocol> ConnectionPoolBuilder<P> {
 		self
 	}
 
-	/// Provision the trust in the CMS server, built once over its two
-	/// certificates and shared by every pooled connection: the opening seals
-	/// to its key-agreement certificate, and its signing certificate verifies
-	/// the reply.
+	/// Provision the trust in the CMS server, built once over its pinned
+	/// key-agreement certificate and shared by every pooled connection: the
+	/// opening seals to it, and the trust's store admits the signing
+	/// certificate the reply carries.
 	#[cfg(feature = "transport-cms")]
 	pub fn with_cms_server(mut self, trust: ProvisionedTrust) -> Self {
 		self.tls.set_cms_server(trust);
