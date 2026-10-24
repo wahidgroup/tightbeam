@@ -11,18 +11,20 @@ use crate::der::Enumerated;
 use crate::{Frame, Message};
 
 #[cfg(feature = "transport")]
-use crate::der::Encode;
+use crate::crypto::x509::CanonicalKey;
 #[cfg(feature = "transport")]
 use crate::transport::handshake::receipt::StoredReceipt;
+#[cfg(feature = "transport")]
+use crate::transport::handshake::SessionPeer;
 #[cfg(feature = "transport")]
 use crate::transport::state::EncryptedProtocolState;
 #[cfg(feature = "transport")]
 use crate::x509::Certificate;
 
-/// Transport response status codes.
+/// A transport response status code.
 ///
-/// The gRPC canonical status registry (`google.rpc.Code`), adopted
-/// as-is so wire values match the registry.
+/// The variants adopt the gRPC canonical status registry (`google.rpc.Code`)
+/// as-is, so wire values match the registry.
 #[derive(Enumerated, Default, Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum TransitStatus {
@@ -30,7 +32,7 @@ pub enum TransitStatus {
 	Ok = 0,
 	/// The caller cancelled the operation.
 	Cancelled = 1,
-	/// Unclassified failure. It is never a valid gate verdict, so
+	/// An unclassified failure. It is never a valid gate verdict, so
 	/// evaluation normalizes it to [`TransitStatus::Internal`].
 	#[default]
 	Unknown = 2,
@@ -44,7 +46,8 @@ pub enum TransitStatus {
 	AlreadyExists = 6,
 	/// The caller is identified but refused authorization.
 	PermissionDenied = 7,
-	/// Capacity refusal. A retry with backoff may succeed.
+	/// The receiver refused for lack of capacity. A retry with backoff may
+	/// succeed.
 	ResourceExhausted = 8,
 	/// System state must change before a retry can succeed.
 	FailedPrecondition = 9,
@@ -54,24 +57,24 @@ pub enum TransitStatus {
 	OutOfRange = 11,
 	/// No handler answers the requested operation.
 	Unimplemented = 12,
-	/// The receiver hit a local fault; nothing was wrong with the request.
+	/// The receiver hit a local fault, and the request itself was valid.
 	Internal = 13,
-	/// Transient unavailability. Retry with backoff.
+	/// The receiver is unavailable for a transient reason. Retry with backoff.
 	Unavailable = 14,
-	/// Unrecoverable data loss or corruption.
+	/// The receiver hit unrecoverable data loss or corruption.
 	DataLoss = 15,
 	/// The caller lacks valid authentication credentials.
 	Unauthenticated = 16,
 }
 
 impl TransitStatus {
-	/// Gate-verdict normalization for [`GatePolicy`] and export-gate loops.
+	/// Normalizes a gate verdict for [`GatePolicy`] and export-gate loops.
 	///
 	/// [`TransitStatus::Unknown`] is a local bug, not a verdict, so it
 	/// maps to [`TransitStatus::Internal`]. The peer then sees a server
-	/// fault. Call sites apply this before a gate status reaches the wire
-	/// or the export audit trail. The built-in export allowlist does not
-	/// use this helper.
+	/// fault. Call sites apply this to a configured gate's status before it
+	/// reaches the wire or the export audit trail. The built-in export
+	/// allowlist's verdict goes out as it stands.
 	#[cfg(feature = "transport-policy")]
 	#[must_use]
 	pub(crate) const fn normalized_verdict(self) -> Self {
@@ -81,7 +84,7 @@ impl TransitStatus {
 		}
 	}
 
-	/// This status as a terminal stream refusal.
+	/// Converts this status into a terminal stream refusal.
 	///
 	/// The mux responder maps the failure onto the stream's `End` trailer.
 	#[cfg(all(feature = "transport", feature = "colony"))]
@@ -90,7 +93,7 @@ impl TransitStatus {
 		crate::transport::error::TransportError::from(self).into()
 	}
 
-	/// Canonical variant name, e.g. as an audit-event label.
+	/// The canonical name of the variant, which an audit event uses as a label.
 	pub const fn as_str(&self) -> &'static str {
 		match self {
 			Self::Ok => "Ok",
@@ -114,11 +117,12 @@ impl TransitStatus {
 	}
 }
 
-/// Authenticated peer context of one established session.
+/// The authenticated peer context of one established session.
 ///
 /// These are the identity facts a gate or request handler may key on:
 ///
 /// - The validated peer certificate from a mutual-auth handshake.
+/// - The [`CanonicalKey`] of the peer's key.
 /// - The dual-signed session receipt, when the session is budget-bearing.
 ///
 /// The empty (default) context means no authenticated facts. Cleartext
@@ -129,35 +133,31 @@ impl TransitStatus {
 ///
 /// On the mux serving path (`MuxAcceptor::serve`) the context is assembled
 /// per invocation with the live receipt, so gates and handlers observe
-/// post-rekey rotations. Single-flight sessions cannot rekey, so a
-/// one-shot [`SessionContext::capture`] is exact there.
+/// post-rekey rotations. A single-flight session keeps the keys of its
+/// handshake for its whole life, so a one-shot [`SessionContext::capture`] is
+/// exact there.
 #[derive(Clone, Debug, Default)]
 pub struct SessionContext {
+	/// The record of the peer the session holds: the certificate, and the DER
+	/// and the canonical form of its key, which the handshake derived from it
+	/// once.
 	#[cfg(feature = "transport")]
-	peer_certificate: Option<Arc<Certificate>>,
-	#[cfg(feature = "transport")]
-	peer_public_key: Option<Arc<[u8]>>,
+	peer: Option<Arc<SessionPeer>>,
 	#[cfg(feature = "transport")]
 	session_receipt: Option<Arc<StoredReceipt>>,
-}
-
-/// DER-encoded `SubjectPublicKeyInfo` of a certificate.
-#[cfg(feature = "transport")]
-fn spki_der(certificate: &Certificate) -> Option<Arc<[u8]>> {
-	let der = certificate.tbs_certificate.subject_public_key_info.to_der().ok()?;
-	Some(Arc::from(der))
 }
 
 #[cfg(feature = "transport")]
 impl SessionContext {
 	/// Snapshot the peer identity and settled receipt off an encrypted
 	/// transport after its handshake completed.
+	///
+	/// The snapshot shares the session's record of its peer and its receipt,
+	/// at one reference count each.
 	pub fn capture<T: EncryptedProtocolState>(transport: &T) -> Self {
-		// Capture encodes SPKI once per session snapshot.
-		let peer_certificate = transport.session_state().peer_certificate_arc();
-		let peer_public_key = peer_certificate.as_deref().and_then(spki_der);
-		let session_receipt = transport.session_state().receipt_arc();
-		Self { peer_certificate, peer_public_key, session_receipt }
+		let session = transport.session_state();
+		let peer = session.session_peer().map(Arc::clone);
+		Self { peer, session_receipt: session.receipt_arc() }
 	}
 
 	/// The same identity with the receipt replaced when a live one exists.
@@ -168,48 +168,66 @@ impl SessionContext {
 	))]
 	pub(crate) fn with_live_receipt(&self, receipt: Option<Arc<StoredReceipt>>) -> Self {
 		Self {
-			peer_certificate: self.peer_certificate.clone(),
-			peer_public_key: self.peer_public_key.clone(),
+			peer: self.peer.clone(),
 			session_receipt: receipt.or_else(|| self.session_receipt.clone()),
 		}
 	}
 
-	/// Validated peer certificate. On a mutual-auth server this is the
+	/// The validated peer certificate. On a mutual-auth server this is the
 	/// client identity. On a client it is the trust-store-validated
 	/// server identity.
 	pub fn peer_certificate(&self) -> Option<&Certificate> {
-		self.peer_certificate.as_deref()
+		let peer = self.peer.as_deref();
+		peer.map(|peer| peer.certificate().as_ref())
 	}
 
-	/// DER-encoded `SubjectPublicKeyInfo` of the authenticated peer,
-	/// which is the stable account key services meter or list against.
-	/// Encoded once at capture. `None` without a peer certificate or
-	/// when encoding failed.
-	pub fn peer_public_key(&self) -> Option<&[u8]> {
-		self.peer_public_key.as_deref()
+	/// The key identity of the authenticated peer, which a peer list matches,
+	/// or `None` without a peer certificate.
+	///
+	/// A gate that lists a peer by its key compares this value with the
+	/// canonical form that [`CanonicalKey::of`] reads from that key.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::crypto::x509::{CanonicalKey, Certificate};
+	/// use tightbeam::policy::SessionContext;
+	/// use tightbeam::testing::fixtures::{TestCertificate, TestKey};
+	///
+	/// // Whether the peer of `session` holds the key that `listed` carries.
+	/// fn is_listed(session: &SessionContext, listed: &Certificate) -> bool {
+	///     let listed = CanonicalKey::of(&listed.tbs_certificate.subject_public_key_info);
+	///     listed.is_ok_and(|listed| session.peer_key() == Some(&listed))
+	/// }
+	///
+	/// // A context that proved no peer lists no key.
+	/// let listed = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+	/// assert!(!is_listed(&SessionContext::default(), &listed));
+	/// ```
+	pub fn peer_key(&self) -> Option<&CanonicalKey> {
+		self.peer.as_deref().map(SessionPeer::key)
 	}
 
-	/// Session bound to `certificate` as its authenticated peer.
+	/// A session bound to `certificate` as its authenticated peer.
 	#[cfg(all(test, feature = "colony"))]
 	pub(crate) fn for_peer(certificate: Arc<Certificate>) -> Self {
-		let peer_public_key = spki_der(&certificate);
-		Self { peer_certificate: Some(certificate), peer_public_key, session_receipt: None }
+		let peer = SessionPeer::try_from(certificate).expect("a test certificate records its peer");
+		Self { peer: Some(Arc::new(peer)), session_receipt: None }
 	}
 
 	/// The identity this session's handshake proved.
 	///
-	/// [`None`] where the transport authenticated no peer.
+	/// It returns [`None`] when the transport authenticated no peer.
 	///
 	/// A per-identity budget MUST NOT fall back to a shared stand-in:
 	/// every unauthenticated caller would key on the same row, so one
 	/// caller's failures would deny all the others (CWE-645). Each caller
 	/// decides what an unauthenticated transport may do instead.
-	#[cfg(feature = "transport")]
 	pub fn proven_peer(&self) -> Option<ProvenPeer<'_>> {
-		self.peer_public_key.as_deref().map(ProvenPeer)
+		self.peer_key().map(ProvenPeer)
 	}
 
-	/// Dual-signed session receipt, when the session is budget-bearing.
+	/// The dual-signed session receipt, when the session is budget-bearing.
 	pub fn session_receipt(&self) -> Option<&Arc<StoredReceipt>> {
 		self.session_receipt.as_ref()
 	}
@@ -218,65 +236,94 @@ impl SessionContext {
 /// An identity the transport handshake proved.
 ///
 /// A gate that counts failures before it checks a frame's signature MUST
-/// key those counts on something the sender could not choose. Minting is
-/// [`SessionContext::proven_peer`] alone, so frame-carried bytes stay out
-/// of a per-identity budget (CWE-345).
+/// key those counts on something the sender could not choose. This type is
+/// that key:
 ///
-/// A session whose transport proved no peer yields no `ProvenPeer` at all,
-/// so a budget keyed on this type is always attributable to one caller.
+/// - [`SessionContext::proven_peer`] alone creates one, so frame-carried bytes
+///   stay out of a per-identity budget (CWE-345).
+/// - A `ProvenPeer` exists only for a session whose transport proved a peer,
+///   so a budget keyed on this type is always attributable to one caller.
+#[cfg(feature = "transport")]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct ProvenPeer<'a>(&'a [u8]);
+pub struct ProvenPeer<'a>(&'a CanonicalKey);
 
+#[cfg(feature = "transport")]
 impl<'a> ProvenPeer<'a> {
-	/// Key bytes for the identity.
+	/// The key identity of the peer, as the [`CanonicalKey`] of its key.
 	///
-	/// A gate keys its per-identity state on these bytes. They come from
-	/// the transport handshake, so a sender cannot pick which budget its
-	/// frames are counted against.
+	/// A gate keys its per-identity state on this value. It comes from the
+	/// transport handshake, so a sender cannot pick which budget its frames
+	/// are counted against.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::crypto::x509::CanonicalKey;
+	/// use tightbeam::policy::SessionContext;
+	/// use tightbeam::testing::fixtures::{TestCertificate, TestKey};
+	///
+	/// // Whether the handshake of `session` proved the key `listed`.
+	/// fn is_proven(session: &SessionContext, listed: &CanonicalKey) -> bool {
+	///     session.proven_peer().is_some_and(|peer| peer.as_key() == listed)
+	/// }
+	///
+	/// // A context that proved no peer proves no key.
+	/// let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+	/// let listed = CanonicalKey::of(&certificate.tbs_certificate.subject_public_key_info)?;
+	/// assert!(!is_proven(&SessionContext::default(), &listed));
+	/// # Ok::<(), tightbeam::der::Error>(())
+	/// ```
 	#[must_use]
-	pub fn as_key(&self) -> &'a [u8] {
+	pub fn as_key(&self) -> &'a CanonicalKey {
 		self.0
 	}
 
-	/// Mint an identity for a test that stands in for a handshake.
+	/// Create an identity for a test that stands in for a handshake.
 	#[cfg(all(test, feature = "colony"))]
-	pub(crate) fn for_test(key: &'a (impl AsRef<[u8]> + ?Sized)) -> Self {
-		let key = key.as_ref();
+	pub(crate) fn for_test(key: &'a CanonicalKey) -> Self {
 		Self(key)
 	}
 }
 
-/// Policy trait a user implements to decide message acceptance.
+/// The policy trait a user implements to decide message acceptance.
 ///
-/// Gate policies are stateless procedures that evaluate whether a message
-/// should be accepted or rejected. Every evaluation carries the connection's
-/// [`SessionContext`]: identity-blind gates ignore it, identity gates
-/// (black/white lists, receipt checks) key on it. Sites without authenticated
-/// facts pass the empty context.
+/// A gate policy is a stateless procedure that decides whether to accept or
+/// reject a message. Every evaluation carries the connection's
+/// [`SessionContext`], and a site without authenticated facts passes the
+/// empty context:
+///
+/// - An identity-blind gate ignores the context.
+/// - An identity gate, such as an allow or deny list or a receipt check, keys on it.
+///
+/// # Streams
 ///
 /// `message` is [`None`] when the stream kind has no request frame at dispatch
-/// (mux streaming / duplex). Choose the `None` verdict by gate class:
-/// - Session / capacity gates (peer lists, backpressure): ignore the
-///   frame and key on `session` or shared state.
-/// - Optional integrity (e.g. [`FrameIntegrityGate`]): return [`TransitStatus::Ok`] when no frame exists.
-/// - Auth that requires a signed or intact frame: fail closed with
+/// (mux streaming and duplex). Choose the `None` verdict by gate class:
+///
+/// - A session or capacity gate (peer lists, backpressure) ignores the frame
+///   and keys on `session` or shared state.
+/// - An optional integrity gate, such as [`FrameIntegrityGate`], returns
+///   [`TransitStatus::Ok`] when no frame exists.
+/// - An auth gate that requires a signed or intact frame fails closed with
 ///   [`TransitStatus::Unauthenticated`] or [`TransitStatus::PermissionDenied`].
 ///
-/// Streaming authz belongs on session facts (mutual TLS, peer lists).
-/// Frame-content rules alone do not protect stream opens.
+/// Streaming authorization belongs on session facts (mutual TLS, peer lists),
+/// because frame-content rules alone leave stream opens unprotected.
 pub trait GatePolicy: Send + Sync {
 	fn evaluate(&self, message: Option<&Frame>, session: &SessionContext) -> TransitStatus;
 }
 
-/// Policy trait a user implements to decide message acceptance.
+/// The policy trait a user implements to decide whether to accept a typed
+/// message.
 pub trait ReceptorPolicy<T: Message>: Send + Sync {
 	fn evaluate(&self, message: &T) -> TransitStatus;
 }
 
-/// Middleware wrapper for receptor policies that observes evaluations.
+/// A middleware wrapper for receptor policies that observes evaluations.
 ///
-/// Wraps any `ReceptorPolicy` and calls a closure with the evaluation result.
-/// The middleware is transparent.
+/// It wraps any [`ReceptorPolicy`] and calls a closure with the evaluation
+/// result. The middleware is transparent and passes through the policy's
+/// decision unchanged.
 pub struct ReceptorMiddleware<T: Message, R: ReceptorPolicy<T>, F>
 where
 	F: Fn(&T, &TransitStatus) + Send + Sync,
@@ -293,8 +340,8 @@ where
 	/// Create a new middleware wrapper around a receptor policy.
 	///
 	/// # Arguments
-	/// * `inner` - The underlying receptor policy to wrap
-	/// * `observer` - Closure called with the message and evaluation result
+	/// * `inner` - The underlying receptor policy to wrap.
+	/// * `observer` - The closure the middleware calls with the message and the evaluation result.
 	pub fn new(inner: R, observer: F) -> Self {
 		Self { inner, observer, _phantom: PhantomData }
 	}
@@ -312,7 +359,7 @@ where
 		status
 	}
 }
-/// Default gate that always accepts.
+/// The default gate, which accepts every message.
 #[derive(Default)]
 pub struct AcceptAllGate;
 
@@ -322,9 +369,9 @@ impl GatePolicy for AcceptAllGate {
 	}
 }
 
-/// Ordered gate composition. Member gates evaluate in insertion order and
-/// the first non-[`TransitStatus::Ok`] verdict decides. An empty chain
-/// accepts, matching [`AcceptAllGate`].
+/// An ordered composition of gates. Member gates evaluate in insertion order,
+/// and the first non-[`TransitStatus::Ok`] verdict decides. An empty chain
+/// accepts, as [`AcceptAllGate`] does.
 #[derive(Default)]
 pub struct GateChain {
 	gates: Vec<Box<dyn GatePolicy>>,
@@ -353,7 +400,7 @@ impl GatePolicy for GateChain {
 	}
 }
 
-/// Gate that requires every frame to carry a valid frame integrity (FI) digest.
+/// A gate that requires a valid frame integrity (FI) digest on every frame.
 ///
 /// A frame is [`TransitStatus::Ok`] only when it carries an FI value that
 /// recomputes to the same digest under `D`. Every other case is rejected with
@@ -389,9 +436,9 @@ where
 	}
 }
 
-/// Middleware wrapper for gate policies that observes evaluations.
+/// A middleware wrapper for gate policies that observes evaluations.
 ///
-/// Wraps any `GatePolicy` and calls a closure with the evaluation result.
+/// It wraps any [`GatePolicy`] and calls a closure with the evaluation result.
 /// The middleware is transparent and passes through the gate's decision
 /// unchanged.
 #[derive(Debug, Clone)]
@@ -410,8 +457,8 @@ where
 	/// Create a new middleware wrapper around a gate policy.
 	///
 	/// # Arguments
-	/// * `inner` - The underlying gate policy to wrap
-	/// * `observer` - Closure called with the message and evaluation result
+	/// * `inner` - The underlying gate policy to wrap.
+	/// * `observer` - The closure the middleware calls with the message and the evaluation result.
 	pub fn new(inner: G, observer: F) -> Self {
 		Self { inner, observer }
 	}

@@ -103,7 +103,7 @@ rayon = { version = "=1.12.0", default-features = false }
 rand_core = { version = "=0.6.4", default-features = false, features = [
 	"getrandom",
 ] }
-tokio = { version = "=1.53.1", default-features = false, features = [
+tokio = { version = "=1.53.3", default-features = false, features = [
 	"rt",
 	"rt-multi-thread",
 	"net",
@@ -134,4 +134,4 @@ syn = { version = "=2.0.119", features = ["full", "derive"] }
 
 ## Fuzzing dependencies
 afl = { version = "=0.17.1" }
-proptest = { version = "=1.11.0", default-features = false, features = ["std"] }
+proptest = { version = "=1.6.0", default-features = false, features = ["std"] }

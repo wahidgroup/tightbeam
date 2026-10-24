@@ -21,7 +21,6 @@ use super::outbound::Outbound;
 use super::shared::MuxShared;
 use crate::transport::envelopes::{GoAwayPackage, GoAwayReason, TransportEnvelope};
 use crate::transport::io::EnvelopeSink;
-use crate::transport::multiplex::MuxRole;
 use crate::transport::TransportResult;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -142,10 +141,13 @@ where
 		}
 	}
 
-	/// Attach a shared handle to the client half of the rekey exchange.
+	/// Attach the shared handle to the client half of the rekey exchange, the
+	/// half [`RekeyDriver::renewal_opener`] yields, or `None` for a server.
+	///
+	/// [`RekeyDriver::renewal_opener`]: crate::transport::rekey::RekeyDriver::renewal_opener
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-	pub(crate) fn set_exchange(&mut self, exchange: Arc<FuturesMutex<Box<dyn ClientRekeyExchange>>>) {
-		self.exchange = Some(exchange);
+	pub(crate) fn set_exchange(&mut self, exchange: Option<Arc<FuturesMutex<Box<dyn ClientRekeyExchange>>>>) {
+		self.exchange = exchange;
 	}
 
 	/// Override the time budget for one renewal exchange.
@@ -261,7 +263,7 @@ where
 	/// `RekeyAck` waits out owed c2s chunks first.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	async fn handle_install(&mut self, envelope: TransportEnvelope, cipher: Box<SendCipher>) -> TransportResult<()> {
-		if self.shared.role == MuxRole::Client {
+		if self.shared.role().holds_key_switch() {
 			self.pending_ack = Some((envelope, cipher));
 			return Ok(());
 		}
@@ -422,15 +424,19 @@ mod tests {
 	use super::super::testing::{client_shared, noop_cx};
 	use super::super::transport::MuxTransport;
 	use super::*;
-	use crate::transport::envelopes::{MuxRekeyAckPackage, MuxRekeyRequestPackage, MuxRekeyResponsePackage};
+	use crate::transport::envelopes::{
+		MuxPingPackage, MuxRekeyAckPackage, MuxRekeyRequestPackage, MuxRekeyResponsePackage,
+	};
 	use crate::transport::handshake::HandshakeError;
-	use crate::transport::multiplex::MuxSettings;
-	use crate::transport::rekey::EpochInstall;
+	use crate::transport::multiplex::{MuxRekeyContext, MuxRole, MuxSettings};
+	use crate::transport::rekey::tests::{rekey_pair, run_exchange};
+	use crate::transport::rekey::{EpochInstall, RekeyDriver};
 	use crate::transport::{EnvelopeSource, TransportError};
 	use crate::utils::marker::MaybeSendFuture;
 	use crate::utils::time::ManualClock;
 
-	/// A sink that accepts every envelope and reports unlimited records.
+	/// A sink that accepts every envelope and every send cipher, and reports
+	/// unlimited records.
 	struct OpenSink;
 
 	impl EnvelopeSink for OpenSink {
@@ -440,6 +446,10 @@ mod tests {
 
 		fn remaining_records(&self) -> u64 {
 			u64::MAX
+		}
+
+		fn install_send_cipher(&mut self, _cipher: SendCipher) -> TransportResult<()> {
+			Ok(())
 		}
 	}
 
@@ -496,7 +506,7 @@ mod tests {
 
 		let (sender, commands) = mpsc::channel(1);
 		let mut driver = MuxWriterDriver::new(sink, commands, shared, 0);
-		driver.set_exchange(Arc::new(FuturesMutex::new(Box::new(StalledExchange))));
+		driver.set_exchange(Some(Arc::new(FuturesMutex::new(Box::new(StalledExchange)))));
 		driver.set_renewal_deadline(deadline);
 		(driver, sender)
 	}
@@ -549,6 +559,44 @@ mod tests {
 
 		let (_handle, _reader, writer, _responder) = mux.into_parts();
 		assert_eq!(writer.clock.monotonic(), replacement.monotonic());
+	}
+
+	/// Whether the writer of a transport that `with_rekey` assembles from
+	/// `driver` holds its key-switch marker after `install`, the install of
+	/// the half `driver` holds at the end of one exchange.
+	async fn holds_key_switch(driver: RekeyDriver, install: EpochInstall) -> bool {
+		let EpochInstall { send_cipher, receipt, .. } = install;
+		let context = MuxRekeyContext { driver, receipt: Arc::new(receipt) };
+		let mux = MuxTransport::with_rekey(IdleSource, OpenSink, context, MuxSettings::symmetric(4));
+		let (_handle, _reader, mut writer, _responder) = mux.into_parts();
+		let envelope = TransportEnvelope::from(MuxPingPackage::new(false, 0));
+
+		let installed = writer.handle_install(envelope, Box::new(send_cipher)).await;
+		installed.expect("the writer takes the install");
+		writer.pending_ack.is_some()
+	}
+
+	/// A transport assembled from a client's rekey context holds its
+	/// key-switch marker until its owed chunks quiesce, as the client role
+	/// does, since the context alone decides the role.
+	#[tokio::test]
+	async fn a_client_rekey_context_assembles_a_client_transport() -> Result<(), Box<dyn std::error::Error>> {
+		let (mut client, mut server) = rekey_pair()?;
+		let (install, _) = run_exchange(&mut client, &mut server).await?;
+
+		assert!(holds_key_switch(RekeyDriver::client(client), install).await);
+		Ok(())
+	}
+
+	/// A transport assembled from a server's rekey context writes its
+	/// key-switch marker at once, as the server role does.
+	#[tokio::test]
+	async fn a_server_rekey_context_assembles_a_server_transport() -> Result<(), Box<dyn std::error::Error>> {
+		let (mut client, mut server) = rekey_pair()?;
+		let (_, install) = run_exchange(&mut client, &mut server).await?;
+
+		assert!(!holds_key_switch(RekeyDriver::server(server), install).await);
+		Ok(())
 	}
 
 	/// The renewal deadline is stamped and waited out on the driver's clock,

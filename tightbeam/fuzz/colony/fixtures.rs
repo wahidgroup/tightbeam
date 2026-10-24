@@ -13,17 +13,15 @@ use tightbeam::crypto::key::Secp256k1KeyProvider;
 use tightbeam::crypto::policy::Secp256k1Policy;
 use tightbeam::crypto::sign::ecdsa::Secp256k1SigningKey;
 use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
-use tightbeam::crypto::x509::{Certificate, CertificateSpec};
-use tightbeam::der::Encode;
+use tightbeam::crypto::x509::{CanonicalKey, Certificate, CertificateSpec};
 use tightbeam::testing::fixtures::{TestCertificate, TestKey};
 use tightbeam::transport::handshake::negotiation::TransportOffer;
 use tightbeam::urn::Urn;
 
 /// Gateway identity bundle used by the colony fuzz topology.
 ///
-/// The SPKI DER is encoded once at construction and shared as
-/// `Arc<[u8]>`, so the shadow oracle borrows it per attempt instead of
-/// re-encoding DER on every prediction.
+/// The canonical key is read once at construction, so the shadow oracle
+/// borrows it per attempt instead of reading the key on every prediction.
 pub(crate) struct GatewayCerts {
 	/// Gateway leaf certificate shared across dials and trust anchors.
 	pub cert: Arc<Certificate>,
@@ -31,17 +29,18 @@ pub(crate) struct GatewayCerts {
 	pub key: Secp256k1SigningKey,
 	/// Trust store that anchors this gateway identity alone.
 	pub trust: Arc<dyn CertificateTrust>,
-	/// DER-encoded SubjectPublicKeyInfo shared for shadow and ACL lookups.
-	pub spki: Arc<[u8]>,
+	/// The canonical form of the certificate's key, which a session proves
+	/// its peer by, shared for shadow and ACL lookups.
+	pub canonical: Option<CanonicalKey>,
 }
 
 impl GatewayCerts {
-	/// Build a bundle from a certificate and key, encoding the SPKI DER
-	/// once. Falls back to an empty SPKI when the certificate cannot
-	/// encode, which the shadow treats as an unmatched identity.
+	/// Build a bundle from a certificate and key, and read the canonical key
+	/// once. For a certificate whose key the encoder refuses, the bundle holds
+	/// `None`, which the shadow treats as an unmatched identity.
 	pub fn new(cert: Arc<Certificate>, key: Secp256k1SigningKey, trust: Arc<dyn CertificateTrust>) -> Self {
-		let spki = spki_der(cert.as_ref());
-		Self { cert, key, trust, spki }
+		let canonical = CanonicalKey::of(&cert.tbs_certificate.subject_public_key_info).ok();
+		Self { cert, key, trust, canonical }
 	}
 
 	#[allow(dead_code)]
@@ -53,15 +52,6 @@ impl GatewayCerts {
 		let key = Secp256k1SigningKey::from(raw);
 		let trust = combined_trust(&[cert.as_ref()]);
 		Self::new(cert, key, trust)
-	}
-}
-
-/// DER-encode a certificate's `SubjectPublicKeyInfo` once for shared,
-/// borrow-only reuse by the shadow oracle.
-fn spki_der(cert: &Certificate) -> Arc<[u8]> {
-	match cert.tbs_certificate.subject_public_key_info.to_der() {
-		Ok(der) => Arc::from(der),
-		Err(_) => Arc::from(Vec::new()),
 	}
 }
 
@@ -84,7 +74,7 @@ pub(crate) fn servlet_urn(name: &(impl AsRef<str> + ?Sized)) -> Urn<'static> {
 /// Build a fixed secp256k1 key from a non-zero seed byte.
 ///
 /// Distinct orgs MUST use distinct seeds so SPKIs and trust anchors stay
-/// unique while remaining identical across AFL executions.
+/// unique, and each stays identical across AFL executions.
 pub(crate) fn fixed_signing_key(seed: u8) -> k256::ecdsa::SigningKey {
 	let secret = [seed.max(1); 32];
 	k256::ecdsa::SigningKey::from_bytes(&secret.into()).expect("non-zero seed is a valid secp256k1 key")

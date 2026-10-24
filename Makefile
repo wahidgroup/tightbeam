@@ -1,4 +1,4 @@
-.PHONY: all help help-body help-ref version setup check build clean test lint doc-lint spellcheck doc test-all fuzz-build fuzz-test analyze-fuzz clean-fuzz release release-derive check-yanked check-semver audit interop ci
+.PHONY: all help help-body help-ref version setup check build clean test lint lint-code lint-doc spellcheck doc test-all fuzz-build fuzz-test analyze-fuzz clean-fuzz release release-derive check-yanked check-semver audit interop ci
 
 .NOTPARALLEL: ci
 
@@ -56,6 +56,7 @@ help-body:
 	@printf '    analyze-fuzz    Analyze a specific crash/hang file (requires file=...)\n'
 	@printf '    clean-fuzz      Remove fuzz output artifacts\n'
 	@printf '    lint            Lint + spellcheck + rustdoc (fix=1 to auto-fix; extra clippy args via ARGS)\n'
+	@printf '    lint-code       Rustfmt + clippy, the pre-push check (fix=1 to auto-fix; extra clippy args via ARGS)\n'
 	@printf '    spellcheck      Spellcheck the repository with typos\n'
 	@printf '    audit           Run dependency audit (cargo-deny: advisories, licences, bans)\n'
 	@printf '    interop         Write the CMS samples and check each with OpenSSL\n'
@@ -147,8 +148,14 @@ clean-fuzz:
 	rm -rf built/fuzz/out
 	@echo "Fuzz output directory cleaned."
 
-lint: setup
-	@echo "Running linters (mode: $(LINT_MODE))..."
+lint:
+	@$(MAKE) lint-code
+	@$(MAKE) lint-doc
+	@$(MAKE) spellcheck
+
+# The pre-push hook runs this alone, and CI runs all of lint.
+lint-code: setup
+	@echo "Checking rustfmt and clippy (mode: $(LINT_MODE))..."
 ifeq ($(LINT_MODE),fix)
 	cargo fmt --all
 	cargo clippy --fix --allow-dirty --allow-staged --all-targets --all-features $(ARGS)
@@ -156,12 +163,10 @@ else
 	cargo fmt --all --check
 	cargo clippy --all-targets --all-features $(ARGS) -- -D warnings
 endif
-	@$(MAKE) doc-lint
-	@$(MAKE) spellcheck
 
 # Rustdoc has no cargo --fix path for intra-doc / private-link warnings.
 # Both lint and doc deny them so CI and local builds fail closed the same way.
-doc-lint: setup
+lint-doc: setup
 	@echo "Checking rustdoc (RUSTDOCFLAGS=-D warnings)..."
 	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 
@@ -169,7 +174,7 @@ spellcheck: setup
 	@echo "Checking spelling..."
 	typos
 
-doc: doc-lint
+doc: lint-doc
 	@echo "Documentation build complete."
 
 audit: setup

@@ -87,7 +87,11 @@ As in the HPKE flow, a passive observer reads the signing certificate. The openi
    4. It admits the client: the validity period, the validators, and then the client Finished.
    5. It settles the receipt countersignature.
 
-   So a client that derived another secret reaches no validator. A budget-bearing session activates only after the countersignature verifies. A refused settlement drops the handshake secret, so a replay of that message has nothing to complete.
+   The order has these results:
+
+   - A client that derived another secret reaches no validator.
+   - A budget-bearing session activates only after the countersignature verifies.
+   - A refused settlement drops the handshake secret, so a replay of that message has nothing to complete.
 
 4. One `ProfilePolicy` negotiates the security profile. The server chooses from a `SupportedProfiles`, which cannot be empty (`NoSupportedProfiles`). The client refuses a reply that selects nothing (`InvalidProfileSelection`).
 
@@ -108,7 +112,7 @@ Every handshake message is one `HandshakeMessage`. Each variant holds a `WireDer
 
 ### Certificate use
 
-Every certificate is admitted for one use and one role before its key is read. `PeerCertificate<U>` is that admission, and `PeerCertificate::parse` is its one constructor.
+Every certificate is admitted for one use and one role before its key is read. `PeerCertificate<U>` is that admission, and `PeerCertificate::parse` is its one constructor for a peer's certificate.
 
 | Use               | Its readers                                                                                    | `keyUsage` bit                                                   |
 | ----------------- | ---------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
@@ -132,13 +136,13 @@ id-tightbeam-kp-signer OBJECT IDENTIFIER ::= {
 
 - Each role also admits `anyExtendedKeyUsage`, and a certificate with no `extendedKeyUsage` serves every role.
 - `ClientConfig::key_purposes` and `ServerConfig::key_purposes` hold each side's purposes. `ClientConfig::new` and `ServerConfig::new` check the endpoint's own identity for its role once.
-- An implementor sets other purposes with `with_key_purposes` on `TransportEncryptionConfig`, `ClientBuilder`, `ConnectionPool`, and `CertificateTrustBuilder`.
+- An implementor sets other purposes with `with_key_purposes` on `TransportEncryptionConfig`, `ClientBuilder`, `ConnectionPoolBuilder`, and `CertificateTrustBuilder`.
 
 The parse of each use refuses a certificate in these cases (RFC 5280 § 4.2):
 
 - Its `keyUsage` is absent, or it lacks the bit of the use (§ 4.2.1.3).
 - The use is key agreement, and its `keyUsage` also asserts `decipherOnly` (§ 4.2.1.3).
-- Its `id-ecPublicKey` point starts with an octet other than `0x02`, `0x03`, or `0x04` (RFC 5480 § 2.2).
+- The use reads an `id-ecPublicKey` key, and its point starts with an octet other than `0x02`, `0x03`, or `0x04`, or is an uncompressed point whose two coordinates differ in length (RFC 5480 § 2.2). `Signing<P>` and `KeyAgreement<K>` read the key under every provider and every KEM, and `ErasedSigning` leaves the key to the verifier's policy at each verify.
 - Its `extendedKeyUsage` names neither the role's purpose nor `anyExtendedKeyUsage` (§ 4.2.1.12).
 - It carries one extension twice.
 - It carries a critical extension that the crate does not process. The crate processes `basicConstraints`, `keyUsage`, `extendedKeyUsage`, and `subjectAltName`.
@@ -160,6 +164,7 @@ Each side holds the pair through one constructor, and both constructors call one
 | Client | `CmsServerPair::admit`, at each reply, over the carried and the pinned certificate | Two subjects (`SubjectMismatch`), one key in both (`KeyReuse`), two trust anchors (`AnchorMismatch`) |
 
 - **One key.** Two elliptic-curve keys of one curve and one x-coordinate are one key, in either SEC 1 encoding and under negation. Two keys of another kind are one key when their SubjectPublicKeyInfo is one.
+- **One subject.** Two certificates name one subject when they carry one subject name that is not empty. An empty subject names its holder by its `subjectAltName` alone (RFC 5280 § 4.1.2.6), so two certificates of an empty subject name one subject when they carry one `subjectAltName`. A pair of an empty subject with no `subjectAltName` fails with `SubjectMismatch`.
 - **Backends.** A signing backend is a `SigningKeyProvider`, and a key-agreement backend is a `DiffieHellman<C>`. Both extend `KeyBackend`, so the compiler refuses one in the other's place. `KeyAgreementIdentity::new` refuses a backend whose public key differs from the certificate's (`KeyMismatch`).
 - **The pinned certificate.** `ProvisionedTrust::new` takes the key-agreement certificate, bare or as a root-to-leaf `CmsServerChain`, beside the store. It admits the certificate once at configuration, and again before each opening, because the store's verdict and the validity period change.
 - **The carried certificate.** At each reply, the client takes the certificate that the server Finished's `sid` names, and the store admits it for signing within its validity period.
@@ -170,12 +175,70 @@ An HPKE server holds one signing identity, and its secret derives from the two e
 
 ### Trust anchors and issuers
 
-- Two certificates name one trust anchor when the store's path validation of each ends at that anchor (RFC 5280 § 6.1.1 (d)). `CertificateTrust::trust_anchor` returns it for a certificate, and `CertificateTrust::verify_chain` for a pinned chain. A signing certificate under an intermediate therefore pairs with a key-agreement certificate that the root issued, and a chain that starts at a held intermediate names the root above it.
+- Two certificates name one trust anchor when the store's path validation of each ends at that anchor (RFC 5280 § 6.1.1 (d)). `CertificateTrust::trust_anchor` returns it for a certificate, and `CertificateTrust::verify_chain` for a pinned chain.
+- A signing certificate under an intermediate therefore pairs with a key-agreement certificate that the root issued, and a chain that starts at a held intermediate names the root above it.
 - The house store builds a path from the certificates it holds, and from no other source. The client's store must therefore hold every intermediate between the server's signing certificate and its anchor.
 - Of the held certificates of one name, the walk takes the first in the order of RFC 4158 § 3.5.12, and the signature check decides:
   1. A `subjectKeyIdentifier` equal to the `authorityKeyIdentifier` of the certificate below.
   2. No `subjectKeyIdentifier`, or no `authorityKeyIdentifier` to compare it with.
   3. A `subjectKeyIdentifier` that differs, so an identifier that another method derived still reaches the signature check.
+
+### The server policy
+
+A client may set a server policy: a list of `CertificateValidation` checks that narrow which server it dials. Four places set it:
+
+- `ClientConfig::with_server_policy`, `ClientBuilder::with_server_policy`, and `ConnectionPoolBuilder::with_server_policy` set it for a client.
+- `ClusterTlsConfig::validators` sets it for each dial of a gateway, and every gateway dial runs the HPKE flow.
+
+The policy evaluates the identity certificate of the flow once the store admits that certificate:
+
+| Flow | The policy evaluates                    | When                                                                           | The store alone admits                                                       |
+| ---- | --------------------------------------- | ------------------------------------------------------------------------------ | ---------------------------------------------------------------------------- |
+| HPKE | The signing certificate the reply names | At the reply                                                                   | The issuers of its path                                                      |
+| CMS  | The pinned key-agreement certificate    | Before each opening, so the opening seals to a certificate the policy admitted | The issuers of each path, and the signing certificate of the server Finished |
+
+- `CmsServerPair::admit` and the Finished MAC bind the CMS signing certificate to the key-agreement certificate, so a client that pins the key-agreement certificate admits a rotated signing certificate.
+- Each evaluation method of the policy takes one identity type, so the policy reads the identity certificate of its flow alone.
+- The trust store admits a certificate by its contents alone, whatever role the handshake reads it in.
+- A check of a server's identity belongs in the client's server policy, and a check of a client's identity belongs in the validators of the server's `PeerAuthentication::mutual`.
+- The built-in store runs path validation and revocation on each certificate that `evaluate`, `trust_anchor`, or `verify_chain` admits. Each of its lookups runs its `RevocationChecker` over the path of the certificate it answers with, so a check of every certificate, such as a denylist, belongs in that checker.
+- An empty list sets no policy.
+
+### Key identity
+
+The trust store's key index, its collision check, `PublicKeyPinning`, `PeerListGate`, and the hive's circuit breaker decide "the same key" through one rule, `KeyIdentity`: the algorithm with its parameters, and the key as the rule below reads it. `CanonicalKey` states the same rule in its rustdoc.
+
+A key reads as a point, the y parity and the x-coordinate as the compressed form names them, when all three hold:
+
+1. It is an `id-ecPublicKey` key on a named curve outside the binary-field curves of SEC 2 and ANSI X9.62.
+2. Its point is in the compressed (`0x02`, `0x03`) or the uncompressed (`0x04`) SEC 1 form (SEC 1 v2.0 § 2.3.3).
+3. The decoder the reader holds for its curve, if any, accepts it (SEC 1 v2.0 § 2.3.4).
+
+Every other key reads as its bits: an encoding that the decoder of its curve refuses, a malformed point or a form that RFC 5480 § 2.2 refuses (the compact form `0x05` and the hybrid forms among them), an `id-ecPublicKey` key with no named curve, a key on a binary-field curve of SEC 2 or ANSI X9.62, and a key of another algorithm.
+
+- A point is one key in its compressed and its uncompressed SEC 1 form, and a point and its negation are two keys (SEC 1 v2.0 § 2.3.3). The parity is y mod 2, the rule over an odd prime field, so a key on a binary-field curve of SEC 2 or ANSI X9.62 compares by its bits.
+- The reader knows a binary-field curve by the lists of SEC 2 and ANSI X9.62, and reads a key on every other named curve by the parity rule.
+
+A reader holds its decoders in a `KeyCurves`, and the first decoder of a curve decides:
+
+- A decoder only refuses, so a valid point reads alike under every set and every reader agrees on it.
+- `KeyCurves::HOUSE`, the default of each reader, holds the decoder of secp256k1 in a build with the `secp256k1` feature, which the `transport` feature enables. A session reads its peer's key under it.
+- `PublicKeyPinning::with_curves`, `CertificateTrustBuilder::new`, `PeerListGate::new`, and `KeyIndex::new` take another set.
+- An outside crate brings its curve as a `CurvePoints` implementation or a `Sec1Curve<C>`.
+
+The handshake and its identities read each elliptic-curve key as a point:
+
+- The handshake records a session peer from a certificate its signing use decoded, and it refuses an elliptic-curve key that reads as no point under `KeyCurves::HOUSE`, so the elliptic-curve key of every session peer is a point of its curve.
+- The parse of the signing use, under every provider, and of the key-agreement use, under every KEM, refuses a first octet other than `0x02`, `0x03`, or `0x04`, and an uncompressed point whose two coordinates differ in length (RFC 5480 § 2.2).
+- `SigningIdentity` and `KeyAgreementIdentity` compare the decoded key types of the provider, which read one point in either form alike.
+
+`CanonicalKey` and `KeyIndex` carry the rule to a gate and a store:
+
+- `CanonicalKey` holds a key identity as a SubjectPublicKeyInfo DER whose point is in the compressed form (RFC 5480 § 2.2), so two keys are one key exactly when their canonical forms under the `KeyCurves` of the reader are one.
+- `SessionContext::peer_key` and `ProvenPeer::as_key` return the canonical form of the key of the session's peer.
+- `CanonicalKey::of`, under `KeyCurves::HOUSE`, and `KeyCurves::canonical`, under its own set, read the canonical form of a listed SubjectPublicKeyInfo, so a gate compares a peer with a listed key by their canonical forms.
+- `KeyIndex` reads each key it inserts, finds, or removes under its own `KeyCurves`, and finds a key in either SEC 1 form of its point. `insert` returns the value the key held before.
+- A `KeyIndex` lookup writes the canonical form on the stack, so a lookup of a named-curve key stays on the stack. The built-in store indexes its keys with one, and an outside store can too.
 
 ### Peer authentication
 
@@ -188,6 +251,8 @@ An endpoint must be able to authenticate its peer before it dials, or it must na
 | Client validators                         | Yes                                  | A mutual-auth server authenticates its client |
 | A server certificate                      | Yes                                  | A server presents its own identity            |
 | A client identity alone                   | No: `PeerAuthenticationUnconfigured` | It proves who the client is, not the server   |
+| A server policy alone                     | No: `PeerAuthenticationUnconfigured` | It narrows which server a trust admits        |
+| A server policy and `allow_cleartext()`   | No: `PeerAuthenticationUnconfigured` | It needs a trust that admits the server       |
 | A client identity and `allow_cleartext()` | Yes                                  | The risk is named                             |
 
 A frame leaves through one of two writers, and each reads the session phase:
@@ -239,11 +304,18 @@ server  = HMAC-H(mac_s, transcript_hash || SignerInfo.signature)
 | `HKDF` | The profile's KDF, extract then expand under its own hash: HKDF-SHA3-256 in the default profile            |
 | `H`    | The negotiated digest, SHA3-256 in the default profile. `Hash.length` is its output length                 |
 
-`ee || base` is the hybrid secret `Z′ = Z || T` of NIST SP 800-56C Rev. 2 § 2: the shared secret, then an auxiliary secret whose format both ends fix in advance. Both parts are 32 bytes, so the plain concatenation is unambiguous. The HPKE flow takes `ee` alone, as TLS 1.3 takes its ECDHE secret (RFC 9846 § 7.1).
+Each input follows a standard:
+
+- CMS: `ee || base` is the hybrid secret `Z′ = Z || T` of NIST SP 800-56C Rev. 2 § 2: the shared secret, then an auxiliary secret whose format both ends fix in advance. Both parts are 32 bytes, so the plain concatenation is unambiguous.
+- HPKE: the flow takes `ee` alone, as TLS 1.3 takes its ECDHE secret (RFC 9846 § 7.1).
 
 ### Ephemeral keys
 
-The server draws a fresh `E` for each handshake and signs it inside the transcript. The client draws `R` for this agreement alone. The CMS opening's KEM draws a third ephemeral, whose shared secret derives the key-encryption key alone (RFC 9629 § 7).
+A handshake draws these ephemerals:
+
+- The server draws a fresh `E` for each handshake and signs it inside the transcript.
+- The client draws `R` for this agreement alone.
+- The CMS opening's KEM draws a third ephemeral, whose shared secret derives the key-encryption key alone (RFC 9629 § 7).
 
 | Step                              | HPKE                                                              | CMS                                       |
 | --------------------------------- | ----------------------------------------------------------------- | ----------------------------------------- |
@@ -341,7 +413,10 @@ Every seal of the handshake and the session is an `AuthEnvelopedData` (RFC 5083)
 - One `RecipientInfo` wraps the content key under the provider's key wrap: `id-aes256-wrap` (RFC 3565, RFC 3394) for the house provider.
 - `AuthEnvelopedData::seal` encrypts the content in the buffer it takes, and `open` decrypts in the buffer the ciphertext arrived in, so the content is never copied.
 
-`Opener::unwrap` is the one decision on the kind of a `RecipientInfo`. Before any key runs, it refuses another recipient kind, a `ukm` of another purpose, a `kekid` of another key, an algorithm outside the profile, and a `kekLength` other than the wrap's key size. `AuthEnvelopedData::open` refuses a version other than 0, a cipher other than the provider's AEAD, a tag length other than 16, and a missing or unexpected content type.
+`Opener::unwrap` is the one decision on the kind of a `RecipientInfo`. Two checks refuse a seal:
+
+- `Opener::unwrap`, before any key runs, refuses another recipient kind, a `ukm` of another purpose, a `kekid` of another key, an algorithm outside the profile, and a `kekLength` other than the wrap's key size.
+- `AuthEnvelopedData::open` refuses a version other than 0, a cipher other than the provider's AEAD, a tag length other than 16, and a missing or unexpected content type.
 
 | Seal                        | Recipient                                                               | Key-encryption key                                                                                |
 | --------------------------- | ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
@@ -443,7 +518,10 @@ The transcript hash is the whole output of the negotiated digest, 32 to 64 bytes
 | HPKE | The hello `ContentInfo` DER, the `ServerHandshake` DER that the reply signs, and the DER of the signing certificate      |
 | CMS  | The opening DER, the security accept, the transport accept, the server ephemeral, and the DER of the signing certificate |
 
-The sender hashes the bytes it encoded, and the receiver hashes the bytes it received, never a re-encoding (CWE-345). The pinned `der` decoder sorts a `SET OF` as it decodes, so a mis-ordered set decodes to the same value as a well-ordered one. Hashing the received bytes makes a reordered set diverge the two transcripts, and the signature fails.
+The sender hashes the bytes it encoded, and the receiver hashes the bytes it received, never a re-encoding (CWE-345):
+
+1. The pinned `der` decoder sorts a `SET OF` as it decodes, so a mis-ordered set decodes to the same value as a well-ordered one.
+2. Hashing the received bytes makes a reordered set diverge the two transcripts, and the signature fails.
 
 | What the transcript binds              | Read through                                                                                       |
 | -------------------------------------- | -------------------------------------------------------------------------------------------------- |
@@ -452,7 +530,10 @@ The sender hashes the bytes it encoded, and the receiver hashes the bytes it rec
 | The HPKE reply content                 | The reply's `eContent` octets, as they arrived                                                     |
 | The signing certificate of either flow | `CmsSigner::signer_certificate_der`: the bytes of the certificate the `sid` names, as they arrived |
 
-Both flows bind the signing certificate, as RFC 9846 § 4.5.2 signs over the Certificate. A reply whose certificate was swapped for another with the same key gives the client another transcript, and the signature fails. The server binds the DER that `SigningIdentity::certificate_der` keeps, and the client binds the bytes that arrived.
+Both flows bind the signing certificate, as RFC 9846 § 4.5.2 signs over the Certificate:
+
+- The server binds the DER that `SigningIdentity::certificate_der` keeps, and the client binds the bytes that arrived.
+- A reply whose certificate was swapped for another with the same key gives the client another transcript, and the signature fails.
 
 Each signature signs under a domain of its own. Neither Finished label is a prefix of the other, which a compile-time assertion holds, so a signature made for one purpose verifies as no other:
 
@@ -473,14 +554,17 @@ Both transcripts bind both ephemerals:
 
 ## Signatures
 
-Every handshake signature is made under a `SigningIdentity`: a certificate beside the `SigningKeyProvider` that holds its private key. Its constructor refuses a certificate not admitted for signing, and a key whose public half differs from the certificate's. The HPKE hello carries no signature, and the reply's transcript hash covers it.
+Every handshake signature is made under a `SigningIdentity`: a certificate beside the `SigningKeyProvider` that holds its private key.
+
+- Its constructor refuses a certificate not admitted for signing, and a key whose public half differs from the certificate's.
+- The HPKE hello travels unsigned, and the reply's transcript hash covers it.
 
 | Endpoint        | Where the identity is held                                                                               |
 | --------------- | -------------------------------------------------------------------------------------------------------- |
 | Server          | `ServerConfig.identity`. A CMS server holds it in the `CmsIdentityPair` that `with_key_agreement` builds |
 | CMS client      | `CmsClientSettings.identity`                                                                             |
 | HPKE client     | `HpkeClientSettings.identity`, absent for an anonymous client                                            |
-| Transport build | `with_client_identity` on `ClientBuilder` and `ConnectionPool`, and the `client!` macro                  |
+| Transport build | `with_client_identity` on `ClientBuilder` and `ConnectionPoolBuilder`, and the `client!` macro           |
 
 Each signature value is a DER `ECDSA-Sig-Value` (RFC 3279 § 2.2.3) in a `SignerInfo`:
 
@@ -551,7 +635,7 @@ stateDiagram-v2
 
 ### The session phase
 
-A transport holds one `SessionState`, which pairs the endpoint's provisioning with one `SessionPhase`:
+A transport holds one `SessionState`, which pairs the endpoint's provisioning and its negotiation input with one `SessionPhase`:
 
 ```rust
 pub enum SessionPhase {
@@ -584,9 +668,9 @@ stateDiagram-v2
 `Handshake::complete` is the one completion of both roles. It moves the agreed terms out into one `EstablishedSession` and marks the handshake `Completed`, so a second completion fails with `HandshakeError::InvalidState`.
 
 - The session answers `keys()`, `mux()`, `receipt()`, and `peer()`, and its fields are private.
-- `peer()` returns one `SessionPeer`: the validated certificate and, for a CMS server in a multiplexing build, the pinned key-agreement certificate. A rekey takes the whole value.
+- The session holds its peer as one `SessionPeer` behind an `Arc`: the validated certificate, the canonical form of its key, and, for a CMS server in a multiplexing build, the pinned key-agreement certificate. Each `SessionContext` shares that one record, a rekey reads it once when it detaches, and `peer()` lends its certificate.
 - The certificates and the receipt travel as `Arc`, so completion copies neither.
-- `install_session` bounds both session ciphers by the endpoint's encrypted-envelope ceiling, which keeps each key's volume inside the AES-GCM bound.
+- `install_session` bounds the send cipher by the endpoint's encrypted-envelope ceiling, and the receive cipher counts the bytes it opens, so each key's volume stays inside the AES-GCM bound.
 
 ### Reset and disconnect
 
@@ -617,8 +701,11 @@ flowchart TD
 - RFC 9688, SHA3 in CMS, § 5.1: <https://datatracker.ietf.org/doc/html/rfc9688#section-5.1>
 - RFC 3394, AES Key Wrap, and RFC 3565, AES in CMS: <https://datatracker.ietf.org/doc/html/rfc3394>, <https://datatracker.ietf.org/doc/html/rfc3565>
 - RFC 5280, X.509 Certificate and CRL Profile: <https://datatracker.ietf.org/doc/html/rfc5280>
+- RFC 3279, Algorithms and Identifiers for the X.509 PKI, § 2.2.3, the ECDSA signature value, and § 2.3.5, the ANSI X9.62 curve arcs: <https://datatracker.ietf.org/doc/html/rfc3279>
 - RFC 4158, Certification Path Building, § 3.5.12: <https://datatracker.ietf.org/doc/html/rfc4158#section-3.5.12>
-- RFC 5480, ECC SubjectPublicKeyInfo, § 3: <https://datatracker.ietf.org/doc/html/rfc5480#section-3>
+- RFC 5480, ECC SubjectPublicKeyInfo, § 2.2 and § 3: <https://datatracker.ietf.org/doc/html/rfc5480>
+- SEC 1 v2.0, Elliptic Curve Cryptography, § 2.3.3, § 2.3.4, and § 4.1.4: <https://www.secg.org/sec1-v2.pdf>
+- SEC 2 v1.0, Recommended Elliptic Curve Domain Parameters, Appendix A: <https://www.secg.org/SEC2-Ver-1.0.pdf>
 - RFC 5869, HKDF: <https://datatracker.ietf.org/doc/html/rfc5869>
 - RFC 9846, TLS 1.3, § 4.5.2, § 4.5.3, § 5.5, § 7.1, and Appendix F.1: <https://datatracker.ietf.org/doc/html/rfc9846>
 - NIST SP 800-56C Rev. 2, Key-Derivation Methods, § 2: <https://doi.org/10.6028/NIST.SP.800-56Cr2>

@@ -205,6 +205,7 @@ macro_rules! impl_tcp_common {
 			pub fn new(stream: S, config: $crate::transport::EndpointConfig<P>) -> Self {
 				let $crate::transport::EndpointConfig {
 					encryption,
+					negotiation,
 					limits,
 					clock,
 					#[cfg(feature = "instrument")]
@@ -216,7 +217,7 @@ macro_rules! impl_tcp_common {
 					restart_policy: Box::new($crate::transport::policy::NoRestart),
 					emitter_gate: $crate::policy::GateChain::default(),
 					collector_gate: $crate::policy::GateChain::default(),
-					state: $crate::transport::state::SessionState::new(encryption),
+					state: $crate::transport::state::SessionState::negotiating(encryption, negotiation),
 					limits,
 					clock,
 					server_handshake: None,

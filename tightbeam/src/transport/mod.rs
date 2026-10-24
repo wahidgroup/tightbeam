@@ -84,20 +84,20 @@ use crate::crypto::profiles::CryptoProvider;
 use crate::crypto::sign::SigningIdentity;
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::transport::handshake::PeerAuthentication;
-use crate::transport::state::{DialableEncryption, EncryptionConfig};
+use crate::transport::state::{DialableEncryption, EncryptionConfig, Negotiation};
+
+use crate::transport::state::ServerIdentities;
+use crate::utils::time::Clock;
+use crate::x509::Certificate;
 
 #[cfg(feature = "transport-cms")]
 use crate::crypto::cms::KeyAgreementIdentity;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::x509::KeyPurposes;
-#[cfg(feature = "transport-cms")]
-use crate::transport::handshake::{CmsIdentityPair, HandshakeError};
-use crate::transport::state::ServerIdentities;
-use crate::utils::time::Clock;
-use crate::x509::Certificate;
-
 #[cfg(feature = "instrument")]
 use crate::trace::TraceCollector;
+#[cfg(feature = "transport-cms")]
+use crate::transport::handshake::{CmsIdentityPair, HandshakeError};
 #[cfg(host_clock)]
 use crate::utils::time::SystemClock;
 
@@ -195,15 +195,18 @@ impl<P: CryptoProvider> TryFrom<TransportEncryptionConfig<P>> for DialableEncryp
 }
 
 /// Everything a transport is built from: provisioning that answered the
-/// dialer rule, the ceilings it enforces, and the clock it measures against.
+/// dialer rule, its negotiation input, the ceilings it enforces, and the clock
+/// it measures against.
 ///
 /// Listeners, clients, and pools each build one of these, and every transport
-/// constructor takes it whole, so no transport exists without all three. A
-/// clone bumps refcounts and copies no certificate.
+/// constructor takes it whole, so every transport holds all four. A clone
+/// bumps refcounts, so it shares each certificate with the original.
 pub struct EndpointConfig<P: CryptoProvider> {
 	pub(crate) encryption: DialableEncryption<P>,
+	pub(crate) negotiation: Negotiation,
 	pub(crate) limits: TransportLimits,
 	pub(crate) clock: Arc<dyn Clock>,
+
 	#[cfg(feature = "instrument")]
 	pub(crate) trace: Option<TraceCollector>,
 }
@@ -214,6 +217,7 @@ impl<P: CryptoProvider> EndpointConfig<P> {
 	pub fn new(encryption: impl Into<DialableEncryption<P>>, clock: Arc<dyn Clock>) -> Self {
 		Self {
 			encryption: encryption.into(),
+			negotiation: Negotiation::default(),
 			limits: TransportLimits::default(),
 			clock,
 			#[cfg(feature = "instrument")]
@@ -228,6 +232,14 @@ impl<P: CryptoProvider> EndpointConfig<P> {
 	#[cfg(host_clock)]
 	pub fn cleartext() -> Self {
 		Self::new(DialableEncryption::cleartext(), Arc::new(SystemClock))
+	}
+
+	/// Replace the negotiation input each transport built from this
+	/// configuration starts with.
+	#[must_use]
+	pub(crate) fn with_negotiation(mut self, negotiation: Negotiation) -> Self {
+		self.negotiation = negotiation;
+		self
 	}
 
 	/// Replace every ceiling this endpoint enforces.
@@ -268,6 +280,7 @@ impl<P: CryptoProvider> Clone for EndpointConfig<P> {
 	fn clone(&self) -> Self {
 		Self {
 			encryption: self.encryption.clone(),
+			negotiation: self.negotiation.clone(),
 			limits: self.limits,
 			clock: Arc::clone(&self.clock),
 			#[cfg(feature = "instrument")]
@@ -373,6 +386,8 @@ impl<P: CryptoProvider> TransportEncryptionConfig<P> {
 	/// # Errors
 	///
 	/// - [`HandshakeError::SubjectMismatch`] -- the two certificates name two subjects.
+	/// - [`HandshakeError::CertificateValidationError`] -- a `subjectAltName`
+	///   of an empty subject fails to decode.
 	/// - [`HandshakeError::KeyReuse`] -- the two certificates hold one key.
 	pub fn with_key_agreement(self, key_agreement: KeyAgreementIdentity<P::Kem>) -> Result<Self, HandshakeError> {
 		let signing = self.identity.into_signing();

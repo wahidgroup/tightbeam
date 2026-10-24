@@ -12,8 +12,8 @@
 //!
 //! - A step called in a phase that does not admit it stores the phase back and
 //!   refuses with [`HandshakeError::InvalidState`].
-//! - A step that began and failed leaves the handshake [`HandshakePhase::Spent`],
-//!   and every secret the phase held drops with the step.
+//! - A step that began and failed leaves the handshake
+//!   [`HandshakePhase::Spent`], and the step drops every secret the phase held.
 //!
 //! ```text
 //! Client   Idle ── start ──▶ Exchanging ── respond ──▶ Agreed ── complete ──▶ Completed
@@ -30,6 +30,7 @@ use crate::crypto::aead::{DirectionalCiphers, RuntimeAead, SessionKeys};
 use crate::crypto::profiles::SecurityProfileDesc;
 use crate::crypto::sign::elliptic_curve::ecdh::EphemeralSecret;
 use crate::crypto::sign::SigningIdentity;
+use crate::crypto::x509::policy::CertificateValidation;
 use crate::crypto::x509::utils::CertificateExt;
 use crate::crypto::x509::KeyPurposes;
 use crate::random::OsRng;
@@ -42,7 +43,7 @@ use crate::transport::handshake::negotiation::{
 	AuthorizedTransport, MuxSettings, ProfilePolicy, SecurityOffer, SupportedProfiles, TransportAuthorizer,
 	TransportNegotiation, TransportOffer,
 };
-use crate::transport::handshake::peer::{PeerAuthentication, ServerTrust};
+use crate::transport::handshake::peer::{PeerAuthentication, ServerAdmission, ServerTrust, ValidatorChain};
 use crate::transport::handshake::primitives::TranscriptHash;
 use crate::transport::handshake::receipt::{
 	CountersignedReceipt, IssuedReceipt, PendingReceipt, ReceiptApprover, SessionObserver, Settlement, StoredReceipt,
@@ -143,6 +144,9 @@ pub struct ClientConfig<F: ClientFlow<P>, P: HandshakeProvider> {
 	/// The approver consulted before a session receipt is countersigned.
 	/// Without one a challenge-bearing receipt fails closed.
 	pub receipt_approver: Option<Arc<dyn ReceiptApprover>>,
+	/// The server policy, which [`Self::with_server_policy`] sets, or `None`
+	/// for a client that sets none.
+	server_policy: Option<ValidatorChain>,
 }
 
 impl<F: ClientFlow<P>, P: HandshakeProvider> ClientConfig<F, P> {
@@ -158,13 +162,31 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> ClientConfig<F, P> {
 			identity.certificate().require_purpose(key_purposes.client)?;
 		}
 
-		Ok(Self::admitted(flow, key_purposes))
+		Ok(Self::offering_nothing(flow, key_purposes))
 	}
 
-	/// A configuration whose client identity was admitted for the client
-	/// purpose of `key_purposes` where the transport's provisioning was
-	/// answered, once.
-	pub(crate) fn admitted(flow: F::Settings, key_purposes: KeyPurposes) -> Self {
+	/// The configuration of a client whose client identity was admitted for
+	/// the client purpose where the transport's provisioning was answered,
+	/// once. The transport offer, the receipt approver, and the server policy
+	/// are required parameters, so the builder of each flow passes them alike.
+	pub(crate) fn admitted(
+		flow: F::Settings,
+		key_purposes: KeyPurposes,
+		transport_offer: Option<TransportOffer>,
+		receipt_approver: Option<Arc<dyn ReceiptApprover>>,
+		server_policy: Option<ValidatorChain>,
+	) -> Self {
+		Self {
+			transport_offer,
+			receipt_approver,
+			server_policy,
+			..Self::offering_nothing(flow, key_purposes)
+		}
+	}
+
+	/// A configuration that offers nothing, sets no server policy, applies
+	/// the default strength floor, and admits each role under `key_purposes`.
+	fn offering_nothing(flow: F::Settings, key_purposes: KeyPurposes) -> Self {
 		Self {
 			flow,
 			security_offer: None,
@@ -172,6 +194,7 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> ClientConfig<F, P> {
 			profiles: ProfilePolicy::new(),
 			key_purposes,
 			receipt_approver: None,
+			server_policy: None,
 		}
 	}
 
@@ -183,6 +206,46 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> ClientConfig<F, P> {
 	/// The key purpose of each role.
 	pub fn key_purposes(&self) -> &KeyPurposes {
 		&self.key_purposes
+	}
+
+	/// Set the server policy, which every validator of `validators` runs on
+	/// the identity certificate of the server once its trust admits it:
+	///
+	/// - CMS: the pinned key-agreement certificate, before the opening seals to it.
+	/// - HPKE: the signing certificate the reply names.
+	///
+	/// An empty set sets no policy. A check of every certificate, such as a
+	/// denylist, belongs in the store's
+	/// [`RevocationChecker`](crate::crypto::x509::store::RevocationChecker).
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::crypto::profiles::DefaultCryptoProvider;
+	/// use tightbeam::crypto::x509::policy::{CertificateValidation, DirectTrustValidator, ExpiryValidator};
+	/// use tightbeam::crypto::x509::KeyPurposes;
+	/// use tightbeam::transport::handshake::{ClientConfig, Hpke, HpkeClientSettings, LearnedTrust};
+	///
+	/// let trust = LearnedTrust::new(DirectTrustValidator::default());
+	/// let settings = HpkeClientSettings::new(trust);
+	/// let config = ClientConfig::<Hpke, DefaultCryptoProvider>::new(settings, KeyPurposes::HOUSE)?;
+	///
+	/// // The policy reads the signing certificate the reply names.
+	/// let expiry: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator);
+	/// let _config = config.with_server_policy([expiry]);
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	pub fn with_server_policy(mut self, validators: impl IntoIterator<Item = Arc<dyn CertificateValidation>>) -> Self {
+		self.server_policy = ValidatorChain::new(validators);
+		self
+	}
+
+	/// The server policy, which each trust runs on the identity certificate
+	/// of its flow.
+	pub(crate) fn server_policy(&self) -> Option<&ValidatorChain> {
+		self.server_policy.as_ref()
 	}
 }
 
@@ -600,14 +663,15 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> Handshake<Client, F, P> {
 
 	/// Build the opening, the first message for the server.
 	///
-	/// A provisioned server identity is admitted before anything is encrypted
-	/// to it.
+	/// A provisioned server identity is admitted, under the server policy,
+	/// before anything is encrypted to it.
 	///
 	/// # Errors
 	///
 	/// - [`HandshakeError::InvalidState`] -- the client is past [`HandshakePhase::Idle`].
 	/// - [`HandshakeError::MissingServerCertificate`] -- the provisioned chain is empty.
-	/// - [`HandshakeError::CertificateValidationError`] -- the trust refused the provisioned server.
+	/// - [`HandshakeError::CertificateValidationError`] -- the trust or the
+	///   server policy refused the provisioned server.
 	/// - [`HandshakeError::InvalidPublicKey`] -- the provisioned server
 	///   certificate key is not a point on the curve.
 	/// - [`HandshakeError::RandomGenerationFailed`] -- the random source failed.
@@ -623,7 +687,7 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> Handshake<Client, F, P> {
 		// 2. Admit the server when its identity is provisioned.
 		let config = &self.config;
 		let trust = F::server_trust(&config.flow);
-		let server = trust.admit_provisioned(config.key_purposes.server)?;
+		let server = trust.admit_provisioned(ServerAdmission::of(config))?;
 
 		// 3. Build the opening.
 		let parts = OpeningParts {
@@ -649,10 +713,14 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> Handshake<Client, F, P> {
 	/// - [`HandshakeError::MissingAttribute`] -- the reply carries no server
 	///   ephemeral, or no server Finished.
 	/// - [`HandshakeError::DuplicateAttribute`] -- an attribute of the reply repeats.
-	/// - [`HandshakeError::DerError`] -- the reply fails to decode, or the server
-	///   Finished of the HPKE reply is no OCTET STRING of 32 to 64 bytes.
+	/// - [`HandshakeError::DerError`] -- the reply fails to decode, the HPKE
+	///   reply's server Finished is no OCTET STRING of 32 to 64 bytes, or the
+	///   encoder refuses the key of the admitted server.
 	/// - [`HandshakeError::OctetStringLengthError`] -- a fixed-width field of the reply has another width.
-	/// - [`HandshakeError::CertificateValidationError`] -- the trust refused the server the reply names.
+	/// - [`HandshakeError::CertificateValidationError`] -- the trust or the
+	///   server policy refused the server the reply names, its key reads as no
+	///   point of its curve, or a `subjectAltName` of the empty subject of a
+	///   CMS pair fails to decode.
 	/// - [`HandshakeError::SubjectMismatch`] -- the CMS reply's certificate names another subject.
 	/// - [`HandshakeError::AnchorMismatch`] -- the CMS reply's certificate ends at another trust anchor.
 	/// - [`HandshakeError::KeyReuse`] -- the CMS reply's certificate holds the key of the pinned one.
@@ -704,7 +772,7 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> Handshake<Client, F, P> {
 		} = F::read_reply(opening, settings, reply)?;
 
 		// 3. Admit the server the reply names.
-		let server = F::server_trust(settings).admit_named(server, config.key_purposes.server)?;
+		let server = F::server_trust(settings).admit_named(server, ServerAdmission::of(config))?;
 
 		// 4. Verify the reply signature, which covers the transcript hash,
 		//    under the admitted server's signing certificate.
@@ -766,7 +834,7 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> Handshake<Client, F, P> {
 		let closing = closing.seal().await?;
 
 		// 14. Keep what the handshake agreed. The server's certificates stay for post-handshake renewals.
-		let agreed = Agreed::new(terms, secret, receipt, &server);
+		let agreed = Agreed::new(terms, secret, receipt, server);
 		self.phase = ClientPhase::ClosingSent { agreed: Box::new(agreed) };
 
 		Ok(closing)
@@ -934,12 +1002,14 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> Handshake<Server, F, P> {
 	/// - [`HandshakeError::DuplicateAttribute`] -- an attribute of the closing repeats.
 	/// - [`HandshakeError::MissingAttribute`] -- the closing carries no key-confirmation tag.
 	/// - [`HandshakeError::DerError`] -- the key-confirmation tag is narrower
-	///   than 32 bytes or wider than 64, or the opened content fails to decode.
+	///   than 32 bytes or wider than 64, the opened content fails to decode,
+	///   or the encoder refuses the key of the admitted client.
 	/// - [`HandshakeError::MissingClientCertificate`] -- the server demands a
 	///   certificate and none came, or a client Finished came without one.
 	/// - [`HandshakeError::CertificateValidationError`] -- the certificate is
-	///   outside its validity period, a validator refused it, or the signing
-	///   use or the client's key purpose refused it.
+	///   outside its validity period, a validator refused it, the signing use
+	///   or the client's key purpose refused it, or its key reads as no point
+	///   of its curve.
 	/// - [`HandshakeError::InvalidPublicKey`] -- the offered certificate key is not a point on the curve.
 	/// - [`HandshakeError::SignatureVerificationFailed`] -- the client Finished
 	///   fails to verify, or the countersignature fails to verify.
@@ -993,7 +1063,7 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> Handshake<Server, F, P> {
 		let receipt = settling.await?;
 
 		// 7. Keep what the handshake agreed.
-		let agreed = Agreed::new(terms, secret.into_secret(), receipt, &peer);
+		let agreed = Agreed::new(terms, secret.into_secret(), receipt, peer);
 		self.phase = ServerPhase::ClosingReceived { agreed: Box::new(agreed) };
 		Ok(())
 	}

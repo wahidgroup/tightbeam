@@ -645,6 +645,11 @@ impl<P: HandshakeProvider> Offer<P> {
 	pub(crate) fn into_identity(self) -> Option<(PeerCertificate<Signing<P>>, ClientFinished)> {
 		self.0
 	}
+
+	/// The certificate of the identity, for the policy that admits it.
+	pub(crate) fn certificate(&self) -> Option<&PeerCertificate<Signing<P>>> {
+		self.0.as_ref().map(|(identity, _)| identity)
+	}
 }
 
 /// What the orchestrator contributes to the closing.
@@ -787,8 +792,7 @@ impl Closing {
 	) -> Result<ClosingOpened<P>, HandshakeError> {
 		let ServerPending { secret, client_ephemeral } = pending;
 
-		// 1. Open the content under the closing key of the secret, in the form
-		//    its content type names.
+		// 1. Open the content under the closing key of the secret, in the form its content type names.
 		let sealer = terms.sealer(&secret, SecretSeal::Closing)?;
 		let content = ClosingContent::open(sealer, self.0).await?;
 

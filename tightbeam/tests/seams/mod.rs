@@ -15,12 +15,15 @@
 //! The outside provider selects one house type, the key wrap, AES-128 key
 //! wrap, through [`KeyWrapProvider`].
 //!
-//! The provider names no HPKE suite, and [`hpke`] and [`cms`] run both
-//! handshakes under it. [`kem`] brings a KEM whose private-key operation is
-//! not Diffie-Hellman.
+//! The suites that run under it:
+//!
+//! - [`hpke`] and [`cms`] run both handshakes, under a provider that names no HPKE suite.
+//! - [`kem`] brings a KEM whose private-key operation is not Diffie-Hellman.
+//! - [`curves`] brings the decoder of a curve, which refuses its off-curve encodings at each reader of keys.
 
 #[cfg(feature = "transport-cms")]
 mod cms;
+mod curves;
 mod frames;
 #[cfg(feature = "transport-hpke")]
 mod hpke;
@@ -654,6 +657,19 @@ fn a_key_agreement_identity_refuses_an_outside_backend_of_another_key() {
 
 	let refused = KeyAgreementIdentity::<OutsideKem>::new(certificate, backend);
 	assert!(matches!(refused, Err(EnvelopeError::KeyMismatch)));
+}
+
+/// The key-agreement use refuses a point in the compact form before the
+/// outside KEM reads the key, though the parse of that KEM decodes the form
+/// (RFC 5480 §2.2).
+#[test]
+fn the_key_agreement_use_refuses_a_compact_point_for_an_outside_kem() -> Result<(), Box<dyn std::error::Error>> {
+	let key = SigningKey::from_bytes(&KNOWN_RECIPIENT_KEY.into())?;
+	let compact = TestCertificate::with_compact_key(TestCertificate::self_signed(&key));
+
+	let refused = PeerCertificate::<KeyAgreement<OutsideKem>>::parse(compact, KeyPurposes::HOUSE.server);
+	assert!(matches!(refused, Err(CertificateValidationError::SpkiError(_))));
+	Ok(())
 }
 
 /// A seal under a 16-octet KEK, the key size of AES-128 key wrap, opens under

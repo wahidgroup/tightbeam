@@ -169,11 +169,13 @@ pub struct ClusterTlsConfig {
 	/// [`Self::from_identity`]. The certificate is the server identity, and
 	/// outbound dials present it as the client certificate.
 	identity: SigningIdentity,
-	/// Server-certificate validators for outbound dials.
+	/// The server policy of every outbound dial on both planes. Every gateway
+	/// dial runs the HPKE flow, so each validator evaluates the signing
+	/// certificate that the dialed server's reply names.
 	///
-	/// Each validator evaluates the dialed server certificate after the
-	/// trust-store check, on both the hive and the peer plane. Use this
-	/// chain for operator checks such as pinning or expiry policy.
+	/// The store alone admits each issuer and each root. A check of every
+	/// certificate, such as a denylist, belongs in the store's
+	/// [`RevocationChecker`](crate::crypto::x509::store::RevocationChecker).
 	pub validators: Vec<Arc<dyn CertificateValidation>>,
 	/// Client-certificate validators for inbound mutual TLS.
 	pub client_validators: Vec<Arc<dyn CertificateValidation>>,
@@ -228,7 +230,9 @@ impl ClusterTlsConfig {
 		}
 	}
 
-	/// Replace the server-certificate validators applied to outbound dials.
+	/// Replace the server policy of outbound dials, which evaluates the
+	/// signing certificate that the dialed server's HPKE reply names, as
+	/// [`Self::validators`] states.
 	#[must_use]
 	pub fn with_validators(mut self, validators: Vec<Arc<dyn CertificateValidation>>) -> Self {
 		self.validators = validators;
@@ -285,8 +289,7 @@ impl ClusterTlsConfig {
 	/// The certificate and handshake key this gateway presents.
 	///
 	/// One identity serves the colony listener, the edge listener, and every
-	/// outbound hive and peer dial, so all of them read it here and cannot
-	/// disagree.
+	/// outbound hive and peer dial, so all of them read it here and agree.
 	pub fn identity(&self) -> &SigningIdentity {
 		&self.identity
 	}
@@ -381,7 +384,7 @@ pub struct PeerConfig {
 	/// - It is off by default, so an implementor whose trust store admits
 	///   parties it does not control turns it on.
 	/// - A signer is one certificate, counted by fingerprint. A party that
-	///   enrolls several certificates holds this many entries under each.
+	///   enrolls more than one certificate holds this many entries under each.
 	/// - The field is private because the builder copies it into the table at
 	///   build, so a later write changes nothing. Set it with
 	///   [`ClusterConfigBuilder::with_tried_per_signer`].
@@ -598,7 +601,7 @@ impl ClusterConfig {
 		Some((added, removed))
 	}
 
-	/// One balancer draw over `entries`, guarding the untrusted index.
+	/// Draws one balancer pick over `entries` and guards the untrusted index.
 	///
 	/// The balancer is operator-configurable, so its answer is untrusted.
 	pub(crate) fn pick_instance<'e>(
@@ -673,7 +676,7 @@ impl core::fmt::Debug for ClusterConfig {
 
 pub use crate::colony::common::{ClusterRequest, ClusterWorkRequest, ClusterWorkResponse};
 
-/// Trait for cluster gateway implementations.
+/// The trait a cluster gateway implements.
 ///
 /// Gateways route work to registered hives by servlet type. Hives
 /// register dynamically, and servlet types are learned from those
@@ -691,7 +694,7 @@ pub trait Cluster: Sized + Send + Sync {
 		config: ClusterConfig,
 	) -> impl Future<Output = Result<Self, crate::TightBeamError>> + Send;
 
-	/// Gateway listen address, borrowed without a clone.
+	/// The address the gateway listens on.
 	fn addr(&self) -> &Self::Address;
 
 	/// Servlet types available from registered local hives.

@@ -28,6 +28,8 @@ use crate::crypto::x509::SubjectKey;
 #[cfg(feature = "transport-cms")]
 use crate::transport::handshake::HandshakeError;
 #[cfg(feature = "transport-cms")]
+use crate::x509::ext::pkix::SubjectAltName;
+#[cfg(feature = "transport-cms")]
 use crate::x509::Certificate;
 
 /// The identity a handshake server holds, which hands the orchestrator the
@@ -78,6 +80,8 @@ impl<K: RecipientKem> CmsIdentityPair<K> {
 	/// # Errors
 	///
 	/// - [`HandshakeError::SubjectMismatch`] -- the two certificates name two subjects.
+	/// - [`HandshakeError::CertificateValidationError`] -- a `subjectAltName`
+	///   of an empty subject fails to decode.
 	/// - [`HandshakeError::KeyReuse`] -- the two certificates hold one key,
 	///   in either SEC 1 encoding of one point or its negation.
 	pub fn new(signing: SigningIdentity, key_agreement: KeyAgreementIdentity<K>) -> Result<Self, HandshakeError> {
@@ -115,6 +119,10 @@ impl<K: RecipientKem> CmsIdentityPair<K> {
 
 /// The rule that binds the two certificates of a CMS server, which the server
 /// and its client both apply: one subject, and two distinct keys.
+///
+/// An empty subject names its holder by a critical `subjectAltName` alone
+/// (RFC 5280 §4.1.2.6), so two certificates of an empty subject name one
+/// subject when they carry one `subjectAltName`.
 #[cfg(feature = "transport-cms")]
 pub(crate) trait CmsPairing {
 	/// Refuse `key_agreement` as the partner of this signing certificate
@@ -123,26 +131,49 @@ pub(crate) trait CmsPairing {
 	/// # Errors
 	///
 	/// - [`HandshakeError::SubjectMismatch`] -- the two certificates name two subjects.
+	/// - [`HandshakeError::CertificateValidationError`] -- a `subjectAltName`
+	///   of an empty subject fails to decode.
 	/// - [`HandshakeError::KeyReuse`] -- the two certificates hold one key,
 	///   in either SEC 1 encoding of one point or its negation.
 	fn pairs_with(&self, key_agreement: &Certificate) -> Result<(), HandshakeError>;
+
+	/// Whether this certificate and `other` name one subject: one subject
+	/// name that is not empty, or an empty subject name and one
+	/// `subjectAltName`.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::CertificateValidationError`] -- a `subjectAltName`
+	///   of an empty subject fails to decode.
+	fn names_one_subject(&self, other: &Certificate) -> Result<bool, HandshakeError>;
 }
 
 #[cfg(feature = "transport-cms")]
 impl CmsPairing for Certificate {
 	fn pairs_with(&self, key_agreement: &Certificate) -> Result<(), HandshakeError> {
-		let signing = &self.tbs_certificate;
-		let key_agreement = &key_agreement.tbs_certificate;
-		if signing.subject != key_agreement.subject {
+		if !self.names_one_subject(key_agreement)? {
 			return Err(HandshakeError::SubjectMismatch);
 		}
 
-		let signing_key = &signing.subject_public_key_info;
-		if signing_key.same_key(&key_agreement.subject_public_key_info) {
+		let signing_key = &self.tbs_certificate.subject_public_key_info;
+		if signing_key.same_key(&key_agreement.tbs_certificate.subject_public_key_info) {
 			return Err(HandshakeError::KeyReuse);
 		}
 
 		Ok(())
+	}
+
+	fn names_one_subject(&self, other: &Certificate) -> Result<bool, HandshakeError> {
+		let subject = &self.tbs_certificate.subject;
+		if *subject != other.tbs_certificate.subject {
+			return Ok(false);
+		}
+		if !subject.0.is_empty() {
+			return Ok(true);
+		}
+
+		let names = self.extension::<SubjectAltName>()?;
+		Ok(names.is_some() && names == other.extension::<SubjectAltName>()?)
 	}
 }
 
@@ -185,10 +216,14 @@ mod tests {
 	use crate::crypto::sign::ecdsa::k256::Secp256k1;
 	use crate::crypto::sign::ecdsa::SigningKey;
 	use crate::crypto::x509::KeyPurposes;
+	use crate::der::asn1::Ia5String;
 	use crate::random::OsRng;
 	use crate::testing::{TestCertificate, TestCmsServer, TestIdentity};
 	use crate::transport::handshake::Arc;
+	use crate::x509::ext::pkix::name::GeneralName;
 	use crate::x509::ext::pkix::{KeyUsage, KeyUsages};
+	use crate::x509::ext::Extension;
+	use crate::x509::name::RdnSequence;
 
 	#[test]
 	fn a_pair_of_one_subject_with_two_keys_is_built() {
@@ -246,6 +281,50 @@ mod tests {
 		let other = TestCmsServer::generate("another pair");
 
 		let refused = CmsIdentityPair::new(server.signing_identity(), other.key_agreement_identity());
+		assert!(matches!(refused, Err(HandshakeError::SubjectMismatch)));
+	}
+
+	/// The critical `subjectAltName` that names `uri` alone.
+	fn naming(uri: &str) -> Extension {
+		let uri = Ia5String::new(uri).expect("a test URI is IA5 text");
+		let names = SubjectAltName(vec![GeneralName::UniformResourceIdentifier(uri)]);
+		TestCertificate::extension(&names, true)
+	}
+
+	/// The signing and key-agreement certificates of a server of an empty
+	/// subject, which the `subjectAltName` of `signing` and of
+	/// `key_agreement` name.
+	fn unnamed_pair(signing: &str, key_agreement: &str) -> (Certificate, Certificate) {
+		let server = TestCmsServer::named(RdnSequence::default());
+		let signing = TestCertificate::with_extension(server.signing, naming(signing));
+		let key_agreement = TestCertificate::with_extension(server.key_agreement, naming(key_agreement));
+		(signing, key_agreement)
+	}
+
+	/// An empty subject names its holder by its `subjectAltName`, so two
+	/// certificates of an empty subject that name two holders are two
+	/// subjects (RFC 5280 §4.1.2.6).
+	#[test]
+	fn two_certificates_of_an_empty_subject_that_name_two_holders_are_refused() {
+		let (signing, key_agreement) = unnamed_pair("urn:tightbeam:signer", "urn:tightbeam:other");
+		let refused = signing.pairs_with(&key_agreement);
+		assert!(matches!(refused, Err(HandshakeError::SubjectMismatch)));
+	}
+
+	/// Two certificates of an empty subject that name one holder by their
+	/// `subjectAltName` are one subject.
+	#[test]
+	fn two_certificates_of_an_empty_subject_that_name_one_holder_pair() -> Result<(), HandshakeError> {
+		let (signing, key_agreement) = unnamed_pair("urn:tightbeam:signer", "urn:tightbeam:signer");
+		signing.pairs_with(&key_agreement)
+	}
+
+	/// An empty subject with no `subjectAltName` names no holder, so two such
+	/// certificates are refused as two subjects.
+	#[test]
+	fn two_certificates_of_an_empty_subject_and_no_name_are_refused() {
+		let server = TestCmsServer::named(RdnSequence::default());
+		let refused = server.signing.pairs_with(&server.key_agreement);
 		assert!(matches!(refused, Err(HandshakeError::SubjectMismatch)));
 	}
 }

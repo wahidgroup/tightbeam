@@ -13,11 +13,13 @@ use std::sync::{Arc, Mutex};
 use crate::colony::common::{ClusterCommand, ClusterCommandKind, ClusterCommandResponse, IssuedAt, ReplyShape};
 use crate::crypto::sign::VerifiedSignature;
 use crate::crypto::x509::store::{CertificateTrust, TrustVerification};
-use crate::der::Encode;
+use crate::crypto::x509::{CanonicalKey, KeyCurves, KeyIdentity};
+use crate::der::{Decode, Encode};
 use crate::policy::{GatePolicy, ProvenPeer, SessionContext, TransitStatus};
+use crate::spki::SubjectPublicKeyInfoRef;
 use crate::utils::time::{Clock, MonotonicInstant, UnixMillis};
 use crate::utils::BasisPoints;
-use crate::{Frame, TightBeamError};
+use crate::{Errorizable, Frame, TightBeamError};
 
 /// The states of one signer's circuit in a [`ClusterCircuitBreaker`].
 ///
@@ -37,10 +39,10 @@ pub enum CircuitState {
 
 /// Circuit breaker for cluster authentication failures.
 ///
-/// It trips after consecutive auth failures, halting cluster communication with
-/// that signer, and after a cooldown moves to half-open to let one probe
-/// through. The cooldown is measured on the monotonic reading of the clock the
-/// breaker is given, so a step of the system time neither shortens nor
+/// It trips after consecutive auth failures, which halts cluster communication
+/// with that signer, and after a cooldown it moves to half-open to let one
+/// probe through. The breaker measures the cooldown on the monotonic reading of
+/// the clock it is given, so a step of the system time neither shortens nor
 /// stretches it.
 ///
 /// # Failures that count
@@ -55,11 +57,11 @@ pub enum CircuitState {
 /// half-open happens under the lock and exactly one caller performs it per
 /// cooldown expiry.
 pub struct ClusterCircuitBreaker {
-	/// Per-signer circuits. A signer with no failure history holds no row.
+	/// Per-signer circuits, one row for each signer that has a failure history.
 	///
 	/// A poisoned lock answers every signer as open, so the breaker fails
 	/// closed the way the replay guard does.
-	signers: Mutex<HashMap<Vec<u8>, SignerCircuit>>,
+	signers: Mutex<HashMap<CanonicalKey, SignerCircuit>>,
 	/// The count of consecutive failures that trips a signer's circuit.
 	failure_threshold: u8,
 	/// Time an open circuit waits before it lets one probe through.
@@ -192,7 +194,7 @@ impl ClusterCircuitBreaker {
 			return;
 		};
 
-		let circuit = signers.entry(signer.as_key().to_vec()).or_insert(SignerCircuit::CLOSED);
+		let circuit = signers.entry(signer.as_key().clone()).or_insert(SignerCircuit::CLOSED);
 		if matches!(circuit.position, Position::HalfOpen) {
 			circuit.position = Position::Open(self.clock.monotonic());
 			return;
@@ -245,7 +247,7 @@ impl ClusterCircuitBreaker {
 pub const REPLAY_GUARD_CAPACITY: usize = 1024;
 
 /// Recorded signatures per signer, each with the instant it was recorded.
-type SignerPartitions = HashMap<Vec<u8>, HashMap<VerifiedSignature, UnixMillis>>;
+type SignerPartitions = HashMap<Arc<[u8]>, HashMap<VerifiedSignature, UnixMillis>>;
 
 /// Recorded signatures, partitioned by signer and indexed by signature.
 ///
@@ -257,7 +259,7 @@ type SignerPartitions = HashMap<Vec<u8>, HashMap<VerifiedSignature, UnixMillis>>
 #[derive(Default)]
 struct SeenSignatures {
 	partitions: SignerPartitions,
-	owner: HashMap<VerifiedSignature, Vec<u8>>,
+	owner: HashMap<VerifiedSignature, Arc<[u8]>>,
 }
 
 impl SeenSignatures {
@@ -269,7 +271,7 @@ impl SeenSignatures {
 	fn is_live(&self, signature: &VerifiedSignature, now: UnixMillis, window: Duration) -> bool {
 		self.owner
 			.get(signature)
-			.and_then(|signer| self.partitions.get(signer.as_slice()))
+			.and_then(|signer| self.partitions.get(signer.as_ref()))
 			.and_then(|sigs| sigs.get(signature))
 			.is_some_and(|at| now.abs_diff(*at) <= window)
 	}
@@ -315,26 +317,29 @@ impl SeenSignatures {
 		}
 	}
 
+	/// Record `signature` of `signer` at `now`. The partition and the owner
+	/// index share one allocation of the signer, which is the key of its
+	/// partition once the signer holds one.
 	fn record(&mut self, signer: impl AsRef<[u8]>, signature: &VerifiedSignature, now: UnixMillis) {
 		let signer = signer.as_ref();
-		self.partitions
-			.entry(signer.to_vec())
-			.or_default()
-			.insert(signature.clone(), now);
-		self.owner.insert(signature.clone(), signer.to_vec());
+		let held = self.partitions.get_key_value(signer).map(|(held, _)| Arc::clone(held));
+		let shared = held.unwrap_or_else(|| Arc::from(signer));
+		let partition = self.partitions.entry(Arc::clone(&shared)).or_default();
+		partition.insert(signature.clone(), now);
+		self.owner.insert(signature.clone(), shared);
 	}
 
 	fn forget(&mut self, signature: &VerifiedSignature) {
 		let Some(signer) = self.owner.remove(signature) else {
 			return;
 		};
-		let Some(sigs) = self.partitions.get_mut(&signer) else {
+		let Some(sigs) = self.partitions.get_mut(signer.as_ref()) else {
 			return;
 		};
 
 		sigs.remove(signature);
 		if sigs.is_empty() {
-			self.partitions.remove(&signer);
+			self.partitions.remove(signer.as_ref());
 		}
 	}
 
@@ -488,7 +493,8 @@ pub struct ClusterSecurityGate {
 /// call site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GateLimits {
-	/// The consecutive bad signatures from one peer that open its circuit.
+	/// The count of consecutive bad signatures from one peer that opens its
+	/// circuit.
 	pub failure_threshold: u8,
 	/// Time an open circuit waits before it lets one probe through.
 	pub cooldown: Duration,
@@ -689,8 +695,8 @@ impl ClusterSecurityGate {
 	/// enforces `limits` on `clock`.
 	///
 	/// The gate builds its own circuit breaker and replay guard from that
-	/// one clock, so the cooldown and the freshness window can never read
-	/// different times.
+	/// one clock, so the cooldown and the freshness window always read the
+	/// same time.
 	pub fn new(trust_store: Arc<dyn CertificateTrust>, limits: GateLimits, clock: Arc<dyn Clock>) -> Self {
 		let GateLimits { failure_threshold, cooldown, freshness_window } = limits;
 		let circuit_breaker = ClusterCircuitBreaker::new(failure_threshold, cooldown, Arc::clone(&clock));
@@ -778,7 +784,7 @@ impl ClusterSecurityGate {
 	pub(crate) fn admit(&self, frame: Frame, session: &SessionContext) -> Result<AdmittedCommand, Box<AdmitRefusal>> {
 		// The body decodes once, and that decode proves the CHOICE that the
 		// body spells as tagged optional fields. A body that names none or
-		// several is not a command, so the ambiguous form stops here.
+		// more than one is not a command, so the ambiguous form stops here.
 		let body = ClusterCommand::choice_of(&frame);
 
 		let shape = ReplyShape::of(body.as_ref());
@@ -787,7 +793,7 @@ impl ClusterSecurityGate {
 			Ok(authenticated) => authenticated,
 			Err(refusal) => {
 				// A bad signature counts once, here, where the frame was
-				// actually submitted for admission.
+				// submitted for admission.
 				if let (InspectRefusal::BadSignature, Some(breaker_key)) = (&refusal, session.proven_peer()) {
 					self.circuit_breaker.record_auth_failure(breaker_key);
 				}
@@ -852,8 +858,8 @@ impl GatePolicy for ClusterSecurityGate {
 
 /// One reading of a hive's load, and the verdict that describes it.
 ///
-/// The pair comes from one atomic load, so a caller reporting both cannot
-/// name a utilization that disagrees with the status beside it.
+/// The pair comes from one atomic load, so a caller that reports both names
+/// a utilization that agrees with the status beside it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BackpressureReport {
 	/// The hive-wide utilization at the moment of the read.
@@ -897,7 +903,7 @@ impl BackpressureGate {
 	///
 	/// This is the one comparison of utilization against the threshold. The
 	/// gate answers requests with it, and the heartbeat reports the same
-	/// verdict, so a hive can never refuse work while reporting capacity.
+	/// verdict, so the capacity a hive reports matches the work it admits.
 	#[must_use]
 	pub fn status(&self) -> TransitStatus {
 		self.report().status
@@ -905,8 +911,8 @@ impl BackpressureGate {
 
 	/// The utilization and the verdict that describes it.
 	///
-	/// Both come from one load, so a heartbeat cannot report capacity that
-	/// disagrees with the status beside it.
+	/// Both come from one load, so the capacity a heartbeat reports agrees
+	/// with the status beside it.
 	#[must_use]
 	pub fn report(&self) -> BackpressureReport {
 		let utilization = self.current_utilization();
@@ -935,46 +941,138 @@ pub enum PeerListMode {
 	Deny,
 }
 
+/// Why [`PeerListGate::new`] refuses a list.
+///
+/// Each variant names the entry by its position in the list, so the operator
+/// can find it. A list that holds a key no session can match would let the
+/// peer it meant to name pass a deny list, so the gate refuses the list.
+#[derive(Errorizable, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerListError {
+	/// The entry is no SubjectPublicKeyInfo DER, or its canonical form
+	/// exceeds the DER length cap.
+	#[error("Peer list entry {index} is no SubjectPublicKeyInfo")]
+	Unreadable {
+		/// The position of the entry in the list.
+		index: usize,
+	},
+	/// The entry names an elliptic-curve key that reads as no point, which is
+	/// one of these:
+	///
+	/// - A malformed point, or a form that RFC 5480 §2.2 refuses.
+	/// - An encoding that the decoder of its curve refuses.
+	/// - A key with no named curve.
+	/// - A key on a binary-field curve of SEC 2 or ANSI X9.62.
+	/// - A key under `id-ecDH` or `id-ecMQV` (RFC 5480 §2.1.2).
+	///
+	/// The handshake refuses every peer that holds one.
+	#[error("Peer list entry {index} names an elliptic-curve key that is no point")]
+	NoPoint {
+		/// The position of the entry in the list.
+		index: usize,
+	},
+	/// The entry names a point on a named curve that the gate's
+	/// [`KeyCurves`] holds no decoder for, so the gate cannot tell the point
+	/// from an off-curve encoding of another key. A set that holds a decoder
+	/// of the curve reads the entry.
+	#[error("Peer list entry {index} names a curve the gate holds no decoder for")]
+	NoDecoder {
+		/// The position of the entry in the list.
+		index: usize,
+	},
+}
+
 /// An allow list or a deny list of session identities.
 ///
-/// The gate keys on the DER-encoded `SubjectPublicKeyInfo` of the
-/// connection's mutually authenticated peer certificate. It reads the
-/// transport peer alone, so the frame signer stays an application-level
-/// concern. An empty session context answers as an absent peer, so an allow
-/// list fails closed (`Unauthenticated`) and a deny list admits.
+/// - The gate keys on the [`CanonicalKey`] of the mutually authenticated peer certificate.
+/// - The frame signer stays an application concern.
+/// - An empty session context answers as an absent peer, so an allow list
+///   fails closed (`Unauthenticated`) and a deny list admits.
 #[derive(Clone)]
 pub struct PeerListGate {
-	keys: HashSet<Vec<u8>>,
+	keys: HashSet<CanonicalKey>,
 	mode: PeerListMode,
 }
 
 impl PeerListGate {
-	/// An allow list that admits only these peer public keys (SPKI DER).
-	pub fn allow<I, K>(keys: I) -> Self
+	/// A list in `mode` of these peer public keys (SPKI DER), each read under
+	/// `curves`, so the decoder of a curve refuses its off-curve encodings.
+	///
+	/// # Errors
+	///
+	/// - [`PeerListError::Unreadable`] -- an entry is no SubjectPublicKeyInfo
+	///   DER, or its canonical form exceeds the DER length cap.
+	/// - [`PeerListError::NoPoint`] -- an entry names an elliptic-curve key that reads as no point.
+	/// - [`PeerListError::NoDecoder`] -- an entry names a point on a curve that
+	///   `curves` holds no decoder for.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::colony::hive::{PeerListError, PeerListGate, PeerListMode};
+	/// use tightbeam::crypto::x509::KeyCurves;
+	///
+	/// // An entry that is no SubjectPublicKeyInfo refuses the whole list.
+	/// let refused = PeerListGate::new(PeerListMode::Deny, KeyCurves::HOUSE, [b"not a key"]);
+	/// assert_eq!(refused.err(), Some(PeerListError::Unreadable { index: 0 }));
+	/// ```
+	pub fn new<I, K>(mode: PeerListMode, curves: KeyCurves, keys: I) -> Result<Self, PeerListError>
 	where
 		I: IntoIterator<Item = K>,
-		K: Into<Vec<u8>>,
+		K: AsRef<[u8]>,
 	{
-		Self { keys: keys.into_iter().map(Into::into).collect(), mode: PeerListMode::Allow }
+		let read = |(index, der): (usize, K)| Self::identity(index, der.as_ref(), curves);
+		let keys = keys.into_iter().enumerate().map(read);
+		let keys = keys.collect::<Result<HashSet<_>, _>>()?;
+		Ok(Self { keys, mode })
 	}
 
-	/// A deny list that refuses these peer public keys (SPKI DER).
-	pub fn deny<I, K>(keys: I) -> Self
+	/// An allow list that admits only these peer public keys (SPKI DER), read
+	/// under [`KeyCurves::HOUSE`].
+	///
+	/// # Errors
+	///
+	/// - The [`Self::new`] set.
+	pub fn allow<I, K>(keys: I) -> Result<Self, PeerListError>
 	where
 		I: IntoIterator<Item = K>,
-		K: Into<Vec<u8>>,
+		K: AsRef<[u8]>,
 	{
-		Self { keys: keys.into_iter().map(Into::into).collect(), mode: PeerListMode::Deny }
+		Self::new(PeerListMode::Allow, KeyCurves::HOUSE, keys)
+	}
+
+	/// A deny list that refuses these peer public keys (SPKI DER), read under
+	/// [`KeyCurves::HOUSE`].
+	///
+	/// # Errors
+	///
+	/// - The [`Self::new`] set.
+	pub fn deny<I, K>(keys: I) -> Result<Self, PeerListError>
+	where
+		I: IntoIterator<Item = K>,
+		K: AsRef<[u8]>,
+	{
+		Self::new(PeerListMode::Deny, KeyCurves::HOUSE, keys)
+	}
+
+	/// The canonical form of the key of `der`, the SubjectPublicKeyInfo DER at
+	/// `index` of the list, read in place under `curves`.
+	fn identity(index: usize, der: &[u8], curves: KeyCurves) -> Result<CanonicalKey, PeerListError> {
+		let unreadable = PeerListError::Unreadable { index };
+		let spki = SubjectPublicKeyInfoRef::from_der(der).map_err(|_| unreadable)?;
+		let identity = KeyIdentity::read(spki, curves);
+		if identity.names_no_point() {
+			return Err(PeerListError::NoPoint { index });
+		}
+		if identity.names_an_undecoded_curve() {
+			return Err(PeerListError::NoDecoder { index });
+		}
+
+		identity.to_canonical().map_err(|_| unreadable)
 	}
 
 	/// The verdict for one peer identity.
-	///
-	/// A certified peer with an absent key means the SPKI failed to
-	/// encode locally. Both modes refuse it as [`TransitStatus::Internal`], so
-	/// a deny list evaluates the same verdict.
-	fn admit(&self, has_certificate: bool, peer_key: Option<&[u8]>) -> TransitStatus {
+	fn admit(&self, peer_key: Option<&CanonicalKey>) -> TransitStatus {
 		match (self.mode, peer_key) {
-			(_, None) if has_certificate => TransitStatus::Internal,
 			(PeerListMode::Allow, Some(key)) if self.keys.contains(key) => TransitStatus::Ok,
 			(PeerListMode::Allow, Some(_)) => TransitStatus::PermissionDenied,
 			(PeerListMode::Allow, None) => TransitStatus::Unauthenticated,
@@ -986,7 +1084,7 @@ impl PeerListGate {
 
 impl GatePolicy for PeerListGate {
 	fn evaluate(&self, _message: Option<&Frame>, session: &SessionContext) -> TransitStatus {
-		self.admit(session.peer_certificate().is_some(), session.peer_public_key())
+		self.admit(session.peer_key())
 	}
 }
 
@@ -1005,15 +1103,25 @@ mod tests {
 	use crate::crypto::x509::store::{CertificateTrustBuilder, TrustBuilder};
 	use crate::crypto::x509::{Certificate, ErasedSigning, PeerCertificate};
 	use crate::der::asn1::ObjectIdentifier;
+	use crate::der::oid::db::rfc5912::ID_EC_DH;
+	use crate::der::oid::db::rfc8410::ID_ED_25519;
+	use crate::oids::CURVE_NIST_P256;
 	use crate::spki::SubjectPublicKeyInfoOwned;
 	use crate::tb_cases;
-	use crate::testing::fixtures::TestIdentity;
+	use crate::testing::fixtures::{TestCertificate, TestIdentity, TestKey, TestP256Points};
 	use crate::testing::TestFrame;
 	use crate::testing::TestMessage;
 	use crate::utils::time::ManualClock;
 	use crate::{MessagePriority, Version};
+	use std::sync::LazyLock;
 
 	const SIGNER: &[u8] = b"signer-under-test";
+
+	/// The key identity of [`listed_peer`], the signer under test.
+	static SIGNER_KEY: LazyLock<CanonicalKey> = LazyLock::new(|| key_of(&listed_peer()));
+
+	/// The key identity of [`unlisted_peer`], a second signer.
+	static OTHER_KEY: LazyLock<CanonicalKey> = LazyLock::new(|| key_of(&unlisted_peer()));
 
 	/// The cooldown every breaker fixture waits out.
 	const COOLDOWN: Duration = Duration::from_millis(60_000);
@@ -1042,7 +1150,7 @@ mod tests {
 		breaker_on(&manual_clock(), 3)
 	}
 
-	/// [`breaker`] with [`SIGNER`]'s circuit already open.
+	/// [`breaker`] with the circuit of [`signer`] already open.
 	fn tripped_breaker() -> ClusterCircuitBreaker {
 		let breaker = breaker();
 		breaker.record_auth_failure(signer());
@@ -1070,17 +1178,78 @@ mod tests {
 
 	/// The identity under test, as a handshake would prove it.
 	fn signer() -> ProvenPeer<'static> {
-		ProvenPeer::for_test(SIGNER)
+		ProvenPeer::for_test(&SIGNER_KEY)
 	}
 
 	/// A second proven identity, for isolation assertions.
 	fn other() -> ProvenPeer<'static> {
-		ProvenPeer::for_test(b"other-signer")
+		ProvenPeer::for_test(&OTHER_KEY)
+	}
+
+	/// The identity the handshake proved for `session`.
+	fn proven(session: &SessionContext) -> ProvenPeer<'_> {
+		session.proven_peer().expect("the session proved a peer")
 	}
 
 	/// The key the handshake proved for `session`.
-	fn peer_key(session: &SessionContext) -> Vec<u8> {
-		session.peer_public_key().expect("the session carries a peer key").to_vec()
+	fn peer_key(session: &SessionContext) -> CanonicalKey {
+		proven(session).as_key().clone()
+	}
+
+	/// The certificate of the fixed test key, whose point is uncompressed.
+	fn listed_peer() -> Certificate {
+		TestCertificate::self_signed(&TestKey::insecure_fixed_signing())
+	}
+
+	/// [`listed_peer`] with the P-256 key of RFC 6979 §A.2.5 in the SEC 1 form
+	/// `point` holds.
+	fn with_p256_point(point: &[u8]) -> Certificate {
+		TestCertificate::with_curve_point(listed_peer(), CURVE_NIST_P256, point)
+	}
+
+	/// The certificate of the negation of the fixed test key, another key.
+	fn unlisted_peer() -> Certificate {
+		TestCertificate::self_signed(&TestKey::negation_of(&TestKey::insecure_fixed_signing()))
+	}
+
+	/// `sect233k1`, a SEC 2 curve over a binary field.
+	const SECT233K1: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.132.0.26");
+
+	/// The set that holds the decoder of P-256 alone.
+	const P256: KeyCurves = KeyCurves::new(&[&TestP256Points]);
+
+	/// [`listed_peer`] with its key under `algorithm` and no parameters, a key
+	/// of another algorithm than `id-ecPublicKey`.
+	fn under_algorithm(algorithm: ObjectIdentifier) -> Certificate {
+		let mut certificate = listed_peer();
+		let spki = &mut certificate.tbs_certificate.subject_public_key_info;
+		spki.algorithm.oid = algorithm;
+		spki.algorithm.parameters = None;
+		certificate
+	}
+
+	/// The refusal of a deny list whose second entry is the key of `entry`.
+	fn refusal_of(entry: &Certificate) -> Option<PeerListError> {
+		PeerListGate::deny([listed(&listed_peer()), listed(entry)]).err()
+	}
+
+	/// The SubjectPublicKeyInfo DER of `certificate`, as an operator lists it.
+	fn listed(certificate: &Certificate) -> Vec<u8> {
+		let spki = &certificate.tbs_certificate.subject_public_key_info;
+		spki.to_der().expect("a test key encodes")
+	}
+
+	/// The key identity a session of `certificate` proves.
+	fn key_of(certificate: &Certificate) -> CanonicalKey {
+		let spki = &certificate.tbs_certificate.subject_public_key_info;
+		CanonicalKey::of(spki).expect("a test key has a canonical form")
+	}
+
+	/// A session whose peer holds the key of [`listed_peer`] in the
+	/// compressed form.
+	fn compressed_session() -> SessionContext {
+		let compressed = TestCertificate::with_compressed_key(listed_peer());
+		SessionContext::for_peer(Arc::new(compressed))
 	}
 
 	/// The signer identifier `frame`'s signature names.
@@ -1302,45 +1471,41 @@ mod tests {
 	}
 
 	#[test]
-	fn peer_allow_list_admits_listed_key_only() {
-		let gate = PeerListGate::allow([b"key-a".to_vec()]);
-		assert_eq!(gate.admit(true, Some(b"key-a")), TransitStatus::Ok);
-		assert_eq!(gate.admit(true, Some(b"key-b")), TransitStatus::PermissionDenied);
+	fn peer_allow_list_admits_listed_key_only() -> Result<(), PeerListError> {
+		let gate = PeerListGate::allow([listed(&listed_peer())])?;
+		assert_eq!(gate.admit(Some(&key_of(&listed_peer()))), TransitStatus::Ok);
+		assert_eq!(gate.admit(Some(&key_of(&unlisted_peer()))), TransitStatus::PermissionDenied);
+		Ok(())
 	}
 
 	#[test]
-	fn peer_allow_list_fails_closed_without_identity() {
-		let gate = PeerListGate::allow([b"key-a".to_vec()]);
-		assert_eq!(gate.admit(false, None), TransitStatus::Unauthenticated);
+	fn peer_allow_list_fails_closed_without_identity() -> Result<(), PeerListError> {
+		let gate = PeerListGate::allow([listed(&listed_peer())])?;
+		assert_eq!(gate.admit(None), TransitStatus::Unauthenticated);
+		Ok(())
 	}
 
 	#[test]
-	fn peer_deny_list_refuses_listed_key_only() {
-		let gate = PeerListGate::deny([b"key-a".to_vec()]);
-		assert_eq!(gate.admit(true, Some(b"key-a")), TransitStatus::PermissionDenied);
-		assert_eq!(gate.admit(true, Some(b"key-b")), TransitStatus::Ok);
+	fn peer_deny_list_refuses_listed_key_only() -> Result<(), PeerListError> {
+		let gate = PeerListGate::deny([listed(&listed_peer())])?;
+		assert_eq!(gate.admit(Some(&key_of(&listed_peer()))), TransitStatus::PermissionDenied);
+		assert_eq!(gate.admit(Some(&key_of(&unlisted_peer()))), TransitStatus::Ok);
+		Ok(())
 	}
 
 	#[test]
-	fn peer_deny_list_admits_absent_identity() {
-		let gate = PeerListGate::deny([b"key-a".to_vec()]);
-		assert_eq!(gate.admit(false, None), TransitStatus::Ok);
+	fn peer_deny_list_admits_absent_identity() -> Result<(), PeerListError> {
+		let gate = PeerListGate::deny([listed(&listed_peer())])?;
+		assert_eq!(gate.admit(None), TransitStatus::Ok);
+		Ok(())
 	}
 
 	#[test]
-	fn peer_list_refuses_certified_peer_without_spki() {
-		let allow = PeerListGate::allow([b"key-a".to_vec()]);
-		let deny = PeerListGate::deny([b"key-a".to_vec()]);
-		assert_eq!(allow.admit(true, None), TransitStatus::Internal);
-		assert_eq!(deny.admit(true, None), TransitStatus::Internal);
-	}
-
-	#[test]
-	fn peer_list_empty_context_answers_as_absent_peer() -> Result<(), TightBeamError> {
+	fn peer_list_empty_context_answers_as_absent_peer() -> Result<(), Box<dyn std::error::Error>> {
 		let frame = work_frame(None)?;
 		let empty = SessionContext::default();
-		let allow = PeerListGate::allow([b"key-a".to_vec()]);
-		let deny = PeerListGate::deny([b"key-a".to_vec()]);
+		let allow = PeerListGate::allow([listed(&listed_peer())])?;
+		let deny = PeerListGate::deny([listed(&listed_peer())])?;
 		assert_eq!(
 			GatePolicy::evaluate(&allow, Some(&frame), &empty),
 			TransitStatus::Unauthenticated
@@ -1348,6 +1513,124 @@ mod tests {
 		assert_eq!(GatePolicy::evaluate(&deny, Some(&frame), &empty), TransitStatus::Ok);
 
 		Ok(())
+	}
+
+	/// One secp256k1 point in either SEC 1 form is one key, so a deny list of
+	/// the uncompressed key refuses a session of its compressed form.
+	#[test]
+	fn a_deny_list_refuses_its_key_in_the_compressed_form() -> Result<(), PeerListError> {
+		let gate = PeerListGate::deny([listed(&listed_peer())])?;
+		let refused = GatePolicy::evaluate(&gate, None, &compressed_session());
+		assert_eq!(refused, TransitStatus::PermissionDenied);
+		Ok(())
+	}
+
+	/// An allow list of the uncompressed key admits a session of its
+	/// compressed form, as the store admits a certificate re-issued in it.
+	#[test]
+	fn an_allow_list_admits_its_key_in_the_compressed_form() -> Result<(), PeerListError> {
+		let gate = PeerListGate::allow([listed(&listed_peer())])?;
+		let admitted = GatePolicy::evaluate(&gate, None, &compressed_session());
+		assert_eq!(admitted, TransitStatus::Ok);
+		Ok(())
+	}
+
+	/// A deny list of the P-256 key of RFC 6979 §A.2.5 in the uncompressed
+	/// form, read under a decoder of P-256, refuses a session of its
+	/// compressed form.
+	#[test]
+	fn a_deny_list_refuses_a_p256_key_in_the_compressed_form() -> Result<(), PeerListError> {
+		let uncompressed = with_p256_point(&TestKey::RFC6979_P256_UNCOMPRESSED);
+		let compressed = with_p256_point(&TestKey::RFC6979_P256_COMPRESSED);
+		let gate = PeerListGate::new(PeerListMode::Deny, P256, [listed(&uncompressed)])?;
+
+		let session = SessionContext::for_peer(Arc::new(compressed));
+		let refused = GatePolicy::evaluate(&gate, None, &session);
+		assert_eq!(refused, TransitStatus::PermissionDenied);
+		Ok(())
+	}
+
+	/// A list under the house set holds no decoder of P-256, so an entry of
+	/// the P-256 key of RFC 6979 §A.2.5 refuses the list.
+	#[test]
+	fn a_list_entry_on_a_curve_without_a_decoder_refuses_the_list() {
+		let p256 = with_p256_point(&TestKey::RFC6979_P256_UNCOMPRESSED);
+		assert_eq!(refusal_of(&p256), Some(PeerListError::NoDecoder { index: 1 }));
+	}
+
+	/// A key of another algorithm names no point of a curve, so a deny list
+	/// holds it and refuses its session.
+	#[test]
+	fn a_deny_list_of_a_key_of_another_algorithm_refuses_its_session() -> Result<(), PeerListError> {
+		let ed25519 = under_algorithm(ID_ED_25519);
+		let gate = PeerListGate::deny([listed(&ed25519)])?;
+		let session = SessionContext::for_peer(Arc::new(ed25519));
+
+		let refused = GatePolicy::evaluate(&gate, None, &session);
+		assert_eq!(refused, TransitStatus::PermissionDenied);
+		Ok(())
+	}
+
+	/// An entry that is no SubjectPublicKeyInfo refuses the list, so a deny
+	/// list never lets the peer it meant to name pass.
+	#[test]
+	fn a_list_entry_that_is_no_key_refuses_the_list() {
+		let refused = PeerListGate::deny([b"key-a"]);
+		assert_eq!(refused.err(), Some(PeerListError::Unreadable { index: 0 }));
+	}
+
+	/// An entry that names an off-curve encoding of a secp256k1 key refuses
+	/// the list, because no session holds that key.
+	#[test]
+	fn a_list_entry_off_its_curve_refuses_the_list() {
+		let alias = TestCertificate::with_off_curve_key(listed_peer());
+		assert_eq!(refusal_of(&alias), Some(PeerListError::NoPoint { index: 1 }));
+	}
+
+	/// RFC 5480 §2.2 refuses the compact form, so an entry in it names no
+	/// point and refuses the list.
+	#[test]
+	fn a_list_entry_in_the_compact_form_refuses_the_list() {
+		let compact = TestCertificate::with_compact_key(listed_peer());
+		assert_eq!(refusal_of(&compact), Some(PeerListError::NoPoint { index: 1 }));
+	}
+
+	/// RFC 5480 §2.2 refuses the hybrid form, so an entry in it names no
+	/// point and refuses the list.
+	#[test]
+	fn a_list_entry_in_the_hybrid_form_refuses_the_list() {
+		let hybrid = TestCertificate::with_key_form(listed_peer(), 0x06);
+		assert_eq!(refusal_of(&hybrid), Some(PeerListError::NoPoint { index: 1 }));
+	}
+
+	/// A key on a binary-field curve reads as its bits, so an entry of one
+	/// names no point and refuses the list.
+	#[test]
+	fn a_list_entry_on_a_binary_field_curve_refuses_the_list() {
+		let binary = TestCertificate::with_named_curve(listed_peer(), SECT233K1);
+		assert_eq!(refusal_of(&binary), Some(PeerListError::NoPoint { index: 1 }));
+	}
+
+	/// No use reads a key under `id-ecDH` (RFC 5480 §2.1.2), so an entry of
+	/// one refuses the list.
+	#[test]
+	fn a_list_entry_under_ec_dh_refuses_the_list() {
+		let restricted = under_algorithm(ID_EC_DH);
+		assert_eq!(refusal_of(&restricted), Some(PeerListError::NoPoint { index: 1 }));
+	}
+
+	/// The breaker keys on the identity of the peer's key, so the failures of
+	/// a session of one form open the circuit of a session of the other.
+	#[test]
+	fn the_breaker_counts_one_point_in_either_form_as_one_peer() {
+		let uncompressed = SessionContext::for_peer(Arc::new(listed_peer()));
+		let compressed = compressed_session();
+		let breaker = breaker();
+		breaker.record_auth_failure(proven(&uncompressed));
+		breaker.record_auth_failure(proven(&uncompressed));
+		breaker.record_auth_failure(proven(&uncompressed));
+
+		assert!(breaker.is_open(proven(&compressed)));
 	}
 
 	/// A trust store that resolves every signer and fails every signature,
@@ -1650,7 +1933,6 @@ mod tests {
 	async fn a_forged_signer_id_gates_the_sender_not_the_signer() -> Result<(), TightBeamError> {
 		let clock = manual_clock();
 		let identity = TestIdentity::insecure_fixed();
-		let certificate = identity.certificate().clone();
 
 		let mut signed = Version::V2
 			.compose()
@@ -1661,12 +1943,12 @@ mod tests {
 			.build()?;
 		signed.sign_with_provider(&identity).await?;
 
-		let signer_id = signer_id(&signed);
+		let signer_key = key_of(identity.certificate());
 		let signer = identity.signing_certificate().clone();
 		let trust_store = Arc::new(AlwaysInvalid { signer });
 		let gate = ClusterSecurityGate::new(trust_store, limits(), erased(&clock));
 
-		let sender = SessionContext::for_peer(Arc::new(certificate));
+		let sender = SessionContext::for_peer(Arc::new(unlisted_peer()));
 		let sender_key = peer_key(&sender);
 		let refusals = [
 			gate.admit(signed.to_owned(), &sender).err().map(|refusal| refusal.status()),
@@ -1676,7 +1958,7 @@ mod tests {
 
 		assert_eq!(refusals, [Some(TransitStatus::PermissionDenied); 3]);
 		assert!(gate.circuit_breaker.is_open(ProvenPeer::for_test(&sender_key)));
-		assert!(!gate.circuit_breaker.is_open(ProvenPeer::for_test(&signer_id)));
+		assert!(!gate.circuit_breaker.is_open(ProvenPeer::for_test(&signer_key)));
 
 		Ok(())
 	}

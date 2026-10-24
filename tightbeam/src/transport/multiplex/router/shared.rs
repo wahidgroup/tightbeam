@@ -288,9 +288,10 @@ struct MuxState {
 	/// `true` while a renewal is in flight with send records down to the
 	/// drain headroom, so data chunks park until the fresh cipher installs.
 	rekey_hard_floor: bool,
-	/// Whether this endpoint can open renewals, which takes the client role
-	/// with rekey materials attached.
-	rekey_client: bool,
+	/// Whether this endpoint opens renewals: rekey materials are attached in
+	/// a role that opens them. [`MuxShared::mark_rekey_attached`] derives it
+	/// from the role, so the readers read one value.
+	opens_renewals: bool,
 	/// Wakers parked on renewal transitions: admissions that wait out a
 	/// renewal, chunks on the hard floor, and the writer that waits for owed
 	/// chunks to quiesce ahead of the `RekeyAck`.
@@ -331,13 +332,21 @@ impl MuxState {
 
 		self.next_stream_id.ok_or(TransportError::Draining)
 	}
+
+	/// Whether a renewal may open in this state: the phase is
+	/// [`RekeyPhase::Idle`], and the connection still admits work.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	fn admits_renewal(&self) -> bool {
+		self.rekey == RekeyPhase::Idle && self.pending.refusal().is_none()
+	}
 }
 
 /// Connection-wide mux state that the drivers and the stream handles share
 /// through an `Arc`.
 pub struct MuxShared {
-	/// Whether this endpoint initiates or accepts streams.
-	pub role: MuxRole,
+	/// Whether this endpoint initiates or accepts streams, which
+	/// [`Self::new`] sets once.
+	role: MuxRole,
 	state: Mutex<MuxState>,
 	/// Concurrent streams this endpoint may initiate, as the peer advertised.
 	pub local_cap: u32,
@@ -415,10 +424,15 @@ impl MuxShared {
 				slot_wakers: Vec::new(),
 				rekey: RekeyPhase::Idle,
 				rekey_hard_floor: false,
-				rekey_client: false,
+				opens_renewals: false,
 				rekey_wakers: Vec::new(),
 			}),
 		}
+	}
+
+	/// Whether this endpoint initiates or accepts streams.
+	pub fn role(&self) -> MuxRole {
+		self.role
 	}
 
 	/// Lock the connection state, recovering the guard from a poisoned lock.
@@ -760,7 +774,8 @@ impl MuxShared {
 	) -> Poll<TransportResult<BudgetStanding>> {
 		let mut state = self.lock();
 		let draining = state.pending.is_draining();
-		if state.rekey_client && state.rekey != RekeyPhase::Idle && !draining {
+		let renewing = state.opens_renewals && state.rekey != RekeyPhase::Idle;
+		if renewing && !draining {
 			park_waker(&mut state.rekey_wakers, cx);
 			return Poll::Pending;
 		}
@@ -794,15 +809,14 @@ impl MuxShared {
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub fn renewal_ready(&self) -> bool {
 		let state = self.lock();
-		let admits = state.pending.refusal().is_none();
-		state.rekey_client && state.rekey == RekeyPhase::Idle && admits
+		state.opens_renewals && state.admits_renewal()
 	}
 
-	/// Mark this endpoint as the client half of a rekey exchange, which
+	/// Mark rekey materials attached, which in a role that opens renewals
 	/// activates renewal triggers and admission gating.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-	pub fn mark_rekey_client(&self) {
-		self.lock().rekey_client = true;
+	pub fn mark_rekey_attached(&self) {
+		self.lock().opens_renewals = self.role.opens_renewals();
 	}
 
 	/// Transition `Idle` to `AwaitingResponse` exactly once.
@@ -814,7 +828,7 @@ impl MuxShared {
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub fn enter_renewal<T>(&self, open: impl FnOnce() -> Option<T>) -> Option<T> {
 		let mut state = self.lock();
-		if state.rekey != RekeyPhase::Idle || state.pending.refusal().is_some() {
+		if !state.admits_renewal() {
 			return None;
 		}
 
@@ -945,10 +959,12 @@ impl MuxShared {
 	}
 
 	/// Publish the completed epoch receipt to handle accessors.
+	///
+	/// `receipt` accepts an owned receipt or a handle to a shared one.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-	pub fn rotate_receipt(&self, receipt: StoredReceipt) {
+	pub fn rotate_receipt(&self, receipt: impl Into<Arc<StoredReceipt>>) {
 		let mut slot = self.session_receipt.lock().unwrap_or_else(PoisonError::into_inner);
-		*slot = Some(Arc::new(receipt));
+		*slot = Some(receipt.into());
 	}
 
 	/// The current epoch's dual-signed receipt, once a handshake or a renewal
@@ -1929,8 +1945,18 @@ mod tests {
 	#[test]
 	fn test_no_renewal_after_connection_failure() {
 		let shared = shared(MuxRole::Client, 8);
-		shared.mark_rekey_client();
+		shared.mark_rekey_attached();
 		shared.fail_all_pending();
+		assert!(!shared.renewal_ready());
+	}
+
+	// A server holds its rekey materials to answer renewals, so its budget
+	// reserve takes the GoAway drain.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	#[test]
+	fn test_renewal_readiness_takes_the_client_role() {
+		let shared = shared(MuxRole::Server, 8);
+		shared.mark_rekey_attached();
 		assert!(!shared.renewal_ready());
 	}
 
@@ -2322,8 +2348,8 @@ mod tests {
 	/// Put a client-side shared state into an in-flight renewal.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	fn begin_client_renewal(shared: &MuxShared) {
+		shared.mark_rekey_attached();
 		let mut state = shared.lock();
-		state.rekey_client = true;
 		state.rekey = RekeyPhase::AwaitingResponse;
 	}
 

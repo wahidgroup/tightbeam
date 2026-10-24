@@ -20,8 +20,10 @@ use crate::crypto::sign::ecdsa::k256::Secp256k1;
 use crate::crypto::sign::elliptic_curve::sec1::ToEncodedPoint;
 use crate::crypto::sign::elliptic_curve::PublicKey;
 use crate::crypto::sign::CmsSigner;
-use crate::crypto::x509::error::CertificateValidationError::Expired;
-use crate::crypto::x509::policy::{DirectTrustValidator, ExpiryValidator, RuntimeCertificatePinning};
+use crate::crypto::x509::error::CertificateValidationError::{CertificateNotPinned, Expired};
+use crate::crypto::x509::policy::{
+	CertificateValidation, DirectTrustValidator, ExpiryValidator, RuntimeCertificatePinning,
+};
 use crate::crypto::x509::utils::Skid;
 use crate::der::asn1::SetOfVec;
 use crate::der::Encode;
@@ -35,14 +37,19 @@ use crate::transport::handshake::{
 };
 use crate::utils::marker::MaybeSendFuture;
 use crate::x509::attr::{Attribute, Attributes};
+use crate::x509::Certificate;
 use crate::TightBeamError;
 
+#[cfg(feature = "transport-cms")]
+use crate::crypto::x509::KeyPurposes;
 #[cfg(feature = "transport-cms")]
 use crate::transport::handshake::Cms;
 #[cfg(feature = "transport-hpke")]
 use crate::transport::handshake::Hpke;
 #[cfg(all(feature = "transport-cms", feature = "transport-multiplex"))]
 use crate::transport::handshake::SessionPeer;
+#[cfg(feature = "transport-cms")]
+use crate::transport::handshake::{CmsServerSettings, ServerConfig, SupportedProfiles};
 
 /// The reply a fresh handshake of flow `F` produces, which no other handshake
 /// admits.
@@ -739,7 +746,7 @@ over_each_flow! {
 async fn a_cms_client_session_keeps_the_key_agreement_certificate() {
 	let established = established::<Cms>(PeerAuthentication::Anonymous).await;
 	let session_peer = established.client_session.session_peer();
-	let kept = session_peer.and_then(SessionPeer::key_agreement);
+	let kept = session_peer.map(Arc::as_ref).and_then(SessionPeer::key_agreement);
 	assert_eq!(kept, Some(&established.server_identity.key_agreement.certificate));
 }
 
@@ -768,4 +775,74 @@ async fn two_handshakes_draw_different_base_secrets() {
 	let first = Cms::recover(&first.run, &first.server_identity).await;
 	let second = Cms::recover(&second.run, &second.server_identity).await;
 	assert_ne!(first.base, second.base);
+}
+
+/// The server policy that pins `certificate` alone, by its fingerprint.
+fn pin_of(certificate: &Certificate) -> Arc<dyn CertificateValidation> {
+	let pin = RuntimeCertificatePinning::<Sha3_256>::from_certificates([certificate.to_owned()]);
+	Arc::new(pin.expect("the test certificate has a fingerprint"))
+}
+
+/// The configuration of the CMS server of `server_identity` after its
+/// authority issued its signing certificate again, to the same subject, for a
+/// fresh key, beside that certificate.
+#[cfg(feature = "transport-cms")]
+fn rotated_cms_server(server_identity: &TestServerIdentity) -> (TestServerConfig<Cms>, Certificate) {
+	let (pair, rotated) = server_identity.fixture().rotated_pair();
+	let profiles = SupportedProfiles::from(create_default_test_profile());
+	let config = ServerConfig::new(CmsServerSettings, pair, profiles, KeyPurposes::HOUSE);
+	(config.expect("a rotated test server pair serves the server role"), rotated)
+}
+
+/// A CMS server policy reads the pinned key-agreement certificate, so a pin
+/// of it admits the server after the server rotates its signing certificate.
+#[cfg(feature = "transport-cms")]
+#[tokio::test]
+async fn a_cms_key_agreement_pin_admits_a_rotated_signing_certificate() -> Result<(), Box<dyn Error>> {
+	let server_identity = create_test_server();
+	let pin = pin_of(&server_identity.key_agreement.certificate);
+	let client = Cms::client(&server_identity, &create_test_certificate()).with_server_policy([pin]);
+	let (server, rotated) = rotated_cms_server(&server_identity);
+
+	let mut client = Handshake::client(client);
+	let mut server = Handshake::server(server);
+	let reply = server.reply(client.start()?).await?;
+	client.respond(reply).await?;
+	assert_eq!(client.peer_certificate(), Some(&rotated));
+	Ok(())
+}
+
+/// A CMS server policy that refuses the pinned key-agreement certificate
+/// refuses the server before the client seals its opening to it.
+#[cfg(feature = "transport-cms")]
+#[test]
+fn a_cms_policy_that_refuses_the_pinned_certificate_builds_no_opening() {
+	let Parties { server_identity, client, .. } = parties::<Cms>(PeerAuthentication::Anonymous);
+	let pin = pin_of(&server_identity.signing.certificate);
+	let mut client = Handshake::client(client.with_server_policy([pin]));
+
+	let refused = client.start();
+	assert!(matches!(
+		refused,
+		Err(HandshakeError::CertificateValidationError(CertificateNotPinned))
+	));
+}
+
+/// An HPKE server policy that pins another server refuses the server the
+/// reply names, though the client's trust admits it.
+#[cfg(feature = "transport-hpke")]
+#[tokio::test]
+async fn an_hpke_pin_refuses_another_server() -> Result<(), Box<dyn Error>> {
+	let Parties { client, server, .. } = parties::<Hpke>(PeerAuthentication::Anonymous);
+	let pin = pin_of(&create_test_certificate().certificate);
+	let mut client = Handshake::client(client.with_server_policy([pin]));
+	let mut server = Handshake::server(server);
+
+	let reply = server.reply(client.start()?).await?;
+	let refused = client.respond(reply).await;
+	assert!(matches!(
+		refused,
+		Err(HandshakeError::CertificateValidationError(CertificateNotPinned))
+	));
+	Ok(())
 }

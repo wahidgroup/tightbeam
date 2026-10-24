@@ -691,6 +691,7 @@ tb_assert_spec! {
 			(events::MUX_PROTOCOL_ERROR, exactly!(1)),
 			(events::MUX_REKEY_RECEIPT_ISSUED, exactly!(1)),
 			(events::MUX_REKEY_RENEWED, exactly!(0)),
+			(events::MUX_REKEY_VERIFY_FAILED, exactly!(0)),
 			(FIRST_REQUEST_ANSWERED, exactly!(1), equals!(true)),
 			(DUPLICATE_REQUEST_VIOLATES_PROTOCOL, exactly!(1), equals!(true))
 		]

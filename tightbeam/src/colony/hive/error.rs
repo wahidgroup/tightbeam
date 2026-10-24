@@ -1,5 +1,6 @@
 //! Hive-specific error types
 
+use crate::colony::hive::PeerListError;
 use crate::transport::error::TransportError;
 use crate::{Errorizable, TightBeamError};
 
@@ -48,6 +49,11 @@ pub enum HiveError {
 	/// No trusted keys configured for ClusterSecurityGate
 	#[error("No trusted keys configured")]
 	NoTrustedKeys,
+
+	/// A peer list refused an entry it was built from.
+	#[error("Peer list error: {0}")]
+	#[from]
+	PeerList(PeerListError),
 }
 
 impl<T> From<std::sync::PoisonError<T>> for HiveError {

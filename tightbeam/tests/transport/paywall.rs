@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use tightbeam::at_least;
 use tightbeam::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
 use tightbeam::crypto::sign::SigningIdentity;
-use tightbeam::crypto::x509::CertificateSpec;
+use tightbeam::crypto::x509::{CanonicalKey, CertificateSpec};
 use tightbeam::decode;
 use tightbeam::der::asn1::OctetString;
 use tightbeam::der::Encode;
@@ -335,7 +335,8 @@ async fn start_ledger_lottery_server(
 			let ledger = Arc::clone(&ledger);
 			async move {
 				let account = session
-					.peer_public_key()
+					.peer_key()
+					.map(CanonicalKey::as_der)
 					.ok_or_else(|| expectation_failure("mutual handshake left no client public key"))?;
 				let pick: TestMessage = decode(ticket.message())?;
 				let announced = ledger.announce(account, rig, &pick.content);

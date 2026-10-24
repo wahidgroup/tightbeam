@@ -9,6 +9,7 @@
 
 use super::common::*;
 use super::streaming::{pooled_cluster_client, start_stream_hive};
+use tightbeam::crypto::x509::policy::{CertificateValidation, DirectTrustValidator};
 use tightbeam::utils::time::ManualClock;
 
 /// A dial address nothing listens on, so a dead direct trail fails fast.
@@ -391,6 +392,56 @@ tb_scenario! {
 			trace.event(WORK_SENT)?;
 
 			let refused_work = emit_ping_work(&mut client, &ctx.a.key, b"bound-hop-work").await;
+			record_work_refusal(&trace, refused_work)?;
+
+			gateway_a.stop();
+			gateway_c.stop();
+			hive.stop();
+			Ok(())
+		}
+	}
+}
+
+// The forwarding gateway runs `ClusterTlsConfig::validators` as the server
+// policy of each dial on its peer plane, so a policy that admits no
+// certificate leaves the work unrouted.
+//
+// The topology is that of
+// `cluster_work_reaches_only_the_gateway_that_advertised`, with the
+// advertisement signed by C's own key, so A's policy alone ends the hop.
+//
+// - A ends the hop at its dial to C, so C routes no work (CLUSTER_WORK_ROUTED exactly 0).
+// - The client reads the refusal (WORK_STATUS).
+tb_scenario! {
+	name: cluster_server_policy_runs_on_the_dial_to_its_peer,
+	spec: ClusterBoundHopSpec,
+	environment Hive {
+		context: federation_ctx(),
+		start: |SetupEnv { trace, context: ctx }| async move {
+			start_ping_hive(trace, Arc::clone(&ctx.c), None).await
+		},
+		client: |HiveEnv { trace, context: ctx, hive }| async move {
+			let mut conf_c = federation_conf(&ctx.c, Arc::clone(&ctx.peers_of_c), vec![], 1);
+			conf_c.peer.advertise_interval = None;
+
+			let gateway_c = start_cluster(&trace, conf_c).await?;
+			hive.register_with_cluster(gateway_c.addr()).await?;
+
+			let refuses_every_server: Arc<dyn CertificateValidation> = Arc::new(DirectTrustValidator::default());
+			let mut conf_a = federation_conf(&ctx.a, Arc::clone(&ctx.peers_of_a), vec![], 1);
+			conf_a.peer.advertise_interval = None;
+			conf_a.tls.validators = vec![refuses_every_server];
+
+			let gateway_a = start_cluster(&trace, conf_a).await?;
+
+			let claimed = gateway_c.addr().to_string();
+			let slate = vec![servlet_urn("ping")];
+			advertise_peer_signed(&trace, &ctx.a, &ctx.c.key, &gateway_a, claimed.as_bytes(), slate).await?;
+
+			let mut client = connect_cluster(&ctx.a, gateway_a.addr()).await?;
+			trace.event(WORK_SENT)?;
+
+			let refused_work = emit_ping_work(&mut client, &ctx.a.key, b"peer-policy-work").await;
 			record_work_refusal(&trace, refused_work)?;
 
 			gateway_a.stop();
