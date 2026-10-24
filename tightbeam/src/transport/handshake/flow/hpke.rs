@@ -1,8 +1,8 @@
 //! The HPKE flow, in the shape of the TLS 1.3 handshake (RFC 9846).
 //!
 //! The client learns the server from the reply. The handshake secret derives
-//! from the ephemeral-ephemeral agreement alone, so the flow encrypts to no
-//! server key, and the server's certificate key only signs.
+//! from the ephemeral-ephemeral agreement alone, so the hello travels
+//! unsealed, and the server's certificate key only signs.
 //!
 //! ## Messages
 //!
@@ -11,10 +11,10 @@
 //! - The closing is the closing of both flows, under the closing key of the handshake secret.
 //!
 //! The reply's signed attributes carry the transcript hash, which covers the
-//! hello, the reply content, and the signing certificate, which travels in
-//! `certificates` and which the reply's `sid` names. A certificate swapped
-//! for another of the same key changes the transcript, so the signature
-//! fails (RFC 9846 § 4.5.2).
+//! hello, the reply content, and the reply's `certificates` field. The field
+//! holds the signing certificate the `sid` names and each issuer above it
+//! that the server presents, so a swapped certificate of the same key or the
+//! same subject fails the signature (RFC 9846 § 4.5.2).
 //!
 //! ## Key confirmation
 //!
@@ -31,7 +31,6 @@
 use alloc::{boxed::Box, vec, vec::Vec};
 
 use crate::asn1::OctetString;
-use crate::cms::cert::CertificateChoices;
 use crate::cms::content_info::ContentInfo;
 use crate::cms::signed_data::{CertificateSet, SignedData};
 use crate::crypto::sign::elliptic_curve::SecretKey;
@@ -57,7 +56,6 @@ use crate::transport::handshake::{ClientHello, HandshakeCurve, HandshakeMessage,
 use crate::transport::wire_der::WireDer;
 use crate::utils::marker::MaybeSendFuture;
 use crate::x509::attr::{Attribute, Attributes};
-use crate::x509::Certificate;
 
 /// The HPKE handshake protocol.
 ///
@@ -72,7 +70,7 @@ impl HandshakeFlow for Hpke {}
 
 /// What an HPKE client is provisioned with.
 pub struct HpkeClientSettings {
-	/// The trust that admits the certificate the reply names.
+	/// The trust that admits the server the reply names.
 	pub trust: LearnedTrust,
 	/// The identity the client presents for mutual authentication.
 	pub identity: Option<SigningIdentity>,
@@ -159,24 +157,23 @@ impl<P: HandshakeProvider> ClientLegs<P> for Hpke {
 		let handshake = ServerHandshake::from_der(content)?;
 		transcript.append(content)?;
 
-		// 2. Find the certificate the reply's signer names, parsed from the
-		//    bytes it arrived as, and bind those bytes after the content,
-		//    then seal.
-		let named = CmsSigner::signer_certificate_der(reply.value(), reply.der())?;
-		let (certificate, received) = named.ok_or(HandshakeError::MissingServerCertificate)?;
-		transcript.append(received)?;
+		// 2. Build the path the reply's signer presents, parsed from the bytes
+		//    it arrived as, for the trust to admit, and bind the `certificates`
+		//    field as it arrived after the content, then seal.
+		let presented = CmsSigner::signer_path(reply.value(), reply.der())?;
+		let (server, certificates) = presented.ok_or(HandshakeError::MissingServerCertificate)?;
+		transcript.append(certificates)?;
 		let transcript_hash = transcript.seal::<P::Digest>()?;
 
 		// 3. Keep the decoded reply, for its signature and its attributes.
 		let reply = reply.into_value();
 
-		// 4. Return the facts of the reply, with the session receipt its
-		//    signer attached.
+		// 4. Return the facts of the reply, with the session receipt its signer attached.
 		let receipt = reply.find_unsigned_attr(<Signed<SignedData> as AttributePayload>::OID)?;
 		let receipt = receipt.map(|attribute| attribute.decode::<Signed<SignedData>>()).transpose()?;
 		let server_random = handshake.server_random.to_32_byte_array()?;
 		Ok(ReplyIntake {
-			server: certificate,
+			server,
 			security_accept: handshake.security_accept.map(WireDer::into_value),
 			transport_accept: handshake.transport_accept.map(WireDer::into_value),
 			server_ephemeral: handshake.server_ephemeral.into_bytes(),
@@ -248,8 +245,9 @@ pub struct HpkeReplyDraft {
 	content: Vec<u8>,
 	/// The reply's `SignerInfo`, complete up to its signature.
 	signer: SignerInfoDraft,
-	/// The signing certificate the reply carries, which its `SignerInfo` names.
-	certificate: Certificate,
+	/// The certificates the reply carries: the signing certificate its
+	/// `SignerInfo` names, and the issuers above it that the server presents.
+	certificates: CertificateSet,
 }
 
 impl<P: HandshakeProvider> ServerLegs<P> for Hpke {
@@ -268,8 +266,7 @@ impl<P: HandshakeProvider> ServerLegs<P> for Hpke {
 		let mut transcript = Transcript::new();
 		transcript.append(hello.der())?;
 
-		// 2. Decode the `ClientHello` from the OCTET STRING of a `ContentInfo`
-		//    of type `id-data`.
+		// 2. Decode the `ClientHello` from the OCTET STRING of a `ContentInfo` of type `id-data`.
 		let content_info = hello.value();
 		if content_info.content_type != DATA {
 			return Err(HandshakeError::UnexpectedContainer);
@@ -304,8 +301,7 @@ impl<P: HandshakeProvider> ServerLegs<P> for Hpke {
 	) -> Result<ReplyBinding<Self, P>, HandshakeError> {
 		let ReplyParts { identity, profile, transport_accept, server_ephemeral, client_cert_required } = parts;
 
-		// 1. Encode the reply content once, so the transcript binds the bytes
-		//    the reply signs.
+		// 1. Encode the reply content once, so the transcript binds the bytes the reply signs.
 		let server_random = generate_nonce::<32>(Some(rng))?;
 		let handshake = ServerHandshake {
 			server_random: OctetString::new(server_random)?,
@@ -316,22 +312,21 @@ impl<P: HandshakeProvider> ServerLegs<P> for Hpke {
 		};
 		let content = handshake.to_der()?;
 
-		// 2. Bind the content and the signing certificate after the hello, and
-		//    seal. The transcript covers the certificate the reply's `sid`
-		//    names, as TLS 1.3 signs over its Certificate, in the DER its
-		//    identity encoded once.
-		let certificate = identity.certificate();
+		// 2. Bind the content and the `certificates` field after the hello,
+		//    and seal. The transcript covers the certificate the reply's `sid`
+		//    names and each issuer the reply presents, as TLS 1.3 signs over
+		//    its Certificate, in the DER its identity encoded once.
+		let presented = identity.presented();
 		opened.transcript.append(&content)?;
-		opened.transcript.append(identity.certificate_der())?;
+		opened.transcript.append(presented.field())?;
 		let transcript_hash = opened.transcript.seal::<P::Digest>()?;
 
-		// 3. Draft the reply's `SignerInfo`, whose signed attributes carry the
-		//    transcript hash.
+		// 3. Draft the reply's `SignerInfo`, whose signed attributes carry the transcript hash.
 		let signed = SignedContent::new(HANDSHAKE_REPLY_CONTENT, &content).with_attribute(transcript_hash.attribute()?);
 		let signer = identity.draft(signed)?;
 		let prehash = signer.prehash().to_vec();
 		let salt = Salt::randoms(&opened.client_random, &server_random);
-		let draft = HpkeReplyDraft { content, signer, certificate: certificate.clone() };
+		let draft = HpkeReplyDraft { content, signer, certificates: presented.set() };
 		Ok(ReplyBinding { transcript_hash, salt, prehash, draft })
 	}
 
@@ -340,7 +335,7 @@ impl<P: HandshakeProvider> ServerLegs<P> for Hpke {
 		signature: Vec<u8>,
 		artifact: Option<&Signed<SignedData>>,
 	) -> Result<Signed<SignedData>, HandshakeError> {
-		let HpkeReplyDraft { content, signer, certificate } = draft;
+		let HpkeReplyDraft { content, signer, certificates } = draft;
 
 		// 1. Complete the `SignerInfo`, with the session receipt as an unsigned
 		//    attribute. The artifact has two owners by design: this copy is
@@ -351,8 +346,7 @@ impl<P: HandshakeProvider> ServerLegs<P> for Hpke {
 		let unsigned_attrs = receipt.map(|receipt| Attributes::try_from(vec![receipt])).transpose()?;
 		let signer_info = signer.complete(signature, unsigned_attrs)?;
 
-		// 2. Assemble the reply, which carries the signing certificate.
-		let certificates = CertificateSet(vec![CertificateChoices::Certificate(certificate)].try_into()?);
+		// 2. Assemble the reply, which carries the signing certificate and the issuers above it.
 		let signed = SignedContent::new(HANDSHAKE_REPLY_CONTENT, &content);
 		Ok(CmsSigner::signed_data(signed, signer_info, Some(certificates))?)
 	}
@@ -404,6 +398,7 @@ mod tests {
 		Client, ClientConfig, Handshake, HandshakeAlert, HandshakePhase, PeerAuthentication, Server, ServerConfig,
 		SupportedProfiles,
 	};
+	use crate::x509::Certificate;
 
 	/// The client random each hand-built hello of this module carries.
 	const CLIENT_RANDOM: [u8; 32] = [7u8; 32];
@@ -455,9 +450,9 @@ mod tests {
 		(client, reply)
 	}
 
-	/// `reply` with its content rewritten by `edit` and nothing else changed,
-	/// as an on-path party would rewrite it. The signature still covers the
-	/// content the server signed.
+	/// `reply` with only its content rewritten by `edit`, as an on-path party
+	/// would rewrite it. The signature still covers the content the server
+	/// signed.
 	fn with_content(reply: &HandshakeMessage, edit: impl FnOnce(&mut ServerHandshake)) -> HandshakeMessage {
 		let mut signed_data = reply_signed_data(reply);
 		let mut handshake = signed_handshake(reply);
@@ -470,7 +465,7 @@ mod tests {
 	}
 
 	/// `reply` with the unsigned attributes of its one signer rewritten by
-	/// `edit`. The signature covers no unsigned attribute.
+	/// `edit`. The unsigned attributes sit outside the signature.
 	fn with_unsigned(
 		reply: &HandshakeMessage,
 		edit: impl FnOnce(Vec<Attribute>) -> Vec<Attribute>,
@@ -522,8 +517,7 @@ mod tests {
 		let key = TestIdentity::certified(server.signing_key.to_owned());
 		let signer = CmsSigner::sign_with::<Secp256k1Signature, _>(&key, signed).expect("the test key signs");
 
-		let choice = CertificateChoices::Certificate(server.certificate.to_owned());
-		let certificates = CertificateSet(vec![choice].try_into().expect("one certificate is a SET"));
+		let certificates = CertificateFixtures::set_of([server.certificate.to_owned()]);
 		let content = SignedContent::new(content_type, &content);
 		let reply = CmsSigner::signed_data(content, signer, Some(certificates)).expect("the reply assembles");
 		HandshakeMessage::try_from(reply.into_inner()).expect("the reply encodes")
@@ -531,7 +525,7 @@ mod tests {
 
 	/// The reply `server` signs over `handshake` in answer to `opening`, over
 	/// the transcript a client of that opening seals: the hello, the content,
-	/// and the signing certificate.
+	/// and the `certificates` field that holds the signing certificate.
 	fn signed_reply(
 		server: &TestCertificate,
 		opening: &HandshakeMessage,
@@ -548,8 +542,8 @@ mod tests {
 		content_type: ObjectIdentifier,
 	) -> HandshakeMessage {
 		let content = handshake.to_der().expect("the content encodes");
-		let certificate = server.certificate.to_der().expect("the certificate encodes");
-		let transcript = [opening.der(), content.as_slice(), certificate.as_slice()].concat();
+		let certificates = certificates_field([server.certificate.to_owned()]);
+		let transcript = [opening.der(), content.as_slice(), certificates.as_slice()].concat();
 		let transcript_hash = Transcript::digest::<Sha3_256>(transcript).expect("the transcript hashes");
 		signed_reply_over(server, handshake, &transcript_hash, content_type)
 	}
@@ -644,7 +638,8 @@ mod tests {
 			let signature = identity.sign_prehash(draft.prehash()).await.expect("the client key signs");
 			let attributes = Attributes::try_from(vec![finished_attribute(&self.tag())]);
 			let attributes = attributes.expect("one attribute is a SET");
-			let finished = draft.finish(signature, attributes, Some(certificate));
+			let certificates = CertificateFixtures::set_of([certificate]);
+			let finished = draft.finish(signature, attributes, Some(certificates));
 			let finished = finished.expect("the Finished assembles");
 			let finished = finished.to_der().expect("the Finished encodes");
 
@@ -720,14 +715,13 @@ mod tests {
 	}
 
 	/// The reply signs the transcript hash as a signed attribute: SHA3-256 of
-	/// the hello as it was sent, the reply content, and the signing
-	/// certificate, in that order (RFC 9846 § 4.5.2 signs over the
-	/// Certificate).
+	/// the hello as it was sent, the reply content, and the `certificates`
+	/// field, in that order (RFC 9846 § 4.5.2 signs over the Certificate).
 	///
-	/// The expected digest comes from the `sha3` crate over those bytes, so no
-	/// transcript code of the crate computes it.
+	/// The expected digest comes from the `sha3` crate over those bytes, so
+	/// the check is independent of the crate's transcript code.
 	#[tokio::test]
-	async fn the_reply_signs_the_hash_of_the_hello_the_content_and_the_certificate() -> Result<(), Box<dyn Error>> {
+	async fn the_reply_signs_the_hash_of_the_hello_the_content_and_the_certificates() -> Result<(), Box<dyn Error>> {
 		let identity = create_test_certificate();
 		let mut server = Handshake::server(hpke_server(&identity));
 		let mut client = Handshake::client(anonymous_client(&identity));
@@ -735,9 +729,9 @@ mod tests {
 		let reply = server.reply(opening.to_owned()).await?;
 		let signed_data = reply_signed_data(&reply);
 		let content = CmsSigner::content(&signed_data, HANDSHAKE_REPLY_CONTENT)?;
-		let certificate = identity.certificate.to_der()?;
+		let certificates = certificates_field([identity.certificate.to_owned()]);
 		let expected = Sha3_256::new().chain_update(opening.der()).chain_update(content);
-		let expected = expected.chain_update(certificate).finalize();
+		let expected = expected.chain_update(certificates).finalize();
 
 		let signer = signed_data.signer_infos.0.iter().next().ok_or("the reply has a signer")?;
 		let signed_attrs = signer.signed_attrs.as_ref().ok_or("the reply carries signed attributes")?;
@@ -865,8 +859,7 @@ mod tests {
 		let mut client = Handshake::client(TestClientConfig::<Hpke>::new(settings, KeyPurposes::HOUSE)?);
 		let mut server = Handshake::server(hpke_server(&identity));
 		let reply = server.reply(client.start()?).await?;
-		let choice = CertificateChoices::Certificate(twin);
-		let swapped = with_certificates(&reply, Some(CertificateSet(vec![choice].try_into()?)));
+		let swapped = with_certificates(&reply, Some(CertificateFixtures::set_of([twin])));
 
 		let refusal = client.respond(swapped).await;
 		assert!(matches!(refusal, Err(HandshakeError::SignatureVerificationFailed)));
@@ -888,8 +881,8 @@ mod tests {
 		assert!(matches!(refusal, Err(HandshakeError::SignatureVerificationFailed)));
 	}
 
-	/// A reply that carries no certificate its signer names names no server
-	/// to admit.
+	/// A reply without the certificate its signer names is refused, because it
+	/// names no server to admit.
 	#[tokio::test]
 	async fn a_reply_without_its_certificate_is_refused() {
 		let (mut client, reply) = replied(&create_test_certificate()).await;

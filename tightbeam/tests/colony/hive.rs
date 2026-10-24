@@ -10,6 +10,7 @@ use tightbeam::utils::time::UnixMillis;
 use tightbeam::crypto::x509::policy::DirectTrustValidator;
 
 use sha3::Sha3_256;
+use tightbeam::cms::signed_data::SignerIdentifier;
 use tightbeam::{
 	builder::{frame::FrameBuilder, TypeBuilder},
 	colony::{
@@ -93,13 +94,17 @@ pub(crate) const UNSIGNED_HEARTBEAT_HEARTBEAT_SHAPE: Urn<'static> =
 pub(crate) const UNSIGNED_MANAGE_MANAGE_SHAPE: Urn<'static> =
 	tightbeam::urn!("test", "event:hive/unsigned-manage-manage-shape");
 
+/// The request whose `value` the hive's test servlets double.
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 pub struct HiveTestRequest {
+	/// The number the servlet doubles.
 	pub value: u32,
 }
 
+/// The reply of a hive test servlet.
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 pub struct HiveTestResponse {
+	/// Twice the request's `value`.
 	pub doubled: u32,
 }
 
@@ -372,8 +377,8 @@ async fn signed_stop_frame(identity: &SigningIdentity, id: impl AsRef<[u8]>) -> 
 	Ok(frame)
 }
 
-/// Signs a command body the CHOICE cannot read: `alternatives` chooses
-/// whether the body names none of its alternatives or both of them.
+/// Signs a command body the CHOICE cannot read: `both` chooses whether the
+/// body names both of its alternatives or none of them.
 async fn signed_unreadable_command_frame(
 	identity: &SigningIdentity,
 	id: impl AsRef<[u8]>,
@@ -621,10 +626,10 @@ tb_assert_spec! {
 }
 
 // A command body spells its CHOICE as tagged optional fields, so the wire
-// can carry none or several. Both forms must draw a refusal the sender can
-// decode. Answering with silence would hang the cluster until its own
-// timeout and count as a lost hive, and answering PermissionDenied would
-// tell a correctly authorized sender its credentials were the problem.
+// can carry none of them or more than one. Both forms must draw a refusal
+// the sender can decode. A silent hive would hang the cluster until its own
+// timeout and count as a lost hive. A PermissionDenied answer would tell a
+// correctly authorized sender its credentials were the problem.
 tb_scenario! {
 	name: hive_refuses_a_command_without_one_alternative,
 	spec: HiveChoiceRefusalSpec,
@@ -776,6 +781,10 @@ impl ServletBox for LocatorStopProbe {
 				.event(SERVLET_STOPPED)
 				.expect("recording the servlet stop is what this probe exists to do");
 		}
+	}
+
+	fn signer(&self) -> Option<&SignerIdentifier> {
+		None
 	}
 }
 

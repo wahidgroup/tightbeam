@@ -190,9 +190,9 @@ impl PeerAddress {
 
 /// Network locality bucket of one peer address.
 ///
-/// IPv4 groups by a /16 prefix. IPv6 groups by a /32 prefix. Table capacity
-/// is spent per prefix, so an attacker inside one prefix is bounded by one
-/// bucket. See the module-level sources for the eclipse analysis.
+/// IPv4 groups by a /16 prefix and IPv6 by a /32 prefix. Table capacity is
+/// spent per prefix, so one bucket bounds an attacker inside one prefix. See
+/// the module-level sources for the eclipse analysis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum AddressGroup {
 	/// IPv4 /16 prefix formed from the first two octets.
@@ -267,7 +267,7 @@ pub struct PeerRecord {
 	pub peer_id: Option<Vec<u8>>,
 	/// Whether a probe has verified this peer as a flood member.
 	pub tried: bool,
-	/// When the last probe attempt ran.
+	/// The time the last probe attempt ran.
 	pub last_probe: UnixMillis,
 }
 
@@ -385,7 +385,8 @@ impl PeerTable {
 		Self { anchors, state, store, persisted: Mutex::new(0) }
 	}
 
-	/// Admit unverified peer hints into the new table.
+	/// Admit unverified peer hints into the new table, each stamped at `now`,
+	/// and return how many it admitted.
 	///
 	/// Admission drops a hint in each case below:
 	///
@@ -393,19 +394,34 @@ impl PeerTable {
 	/// - It is beyond the per-prefix or table caps, and no candidate that failed a probe yields its slot.
 	///
 	/// Cap overflow is the eclipse bound: one address prefix draws its own
-	/// share of discovery (CWE-770).
-	///
-	/// Returns how many hints were admitted.
+	/// share of discovery (CWE-770). `now` is the gateway clock's reading, so
+	/// a hint the table learns again orders the probe backlog by its return.
 	///
 	/// # Errors
 	///
 	/// - [`ClusterError::LockPoisoned`] -- the table lock is poisoned.
-	pub fn learn<I>(&self, hints: I) -> Result<usize, ClusterError>
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::colony::cluster::{PeerConfig, PeerTable};
+	/// use tightbeam::colony::common::PeerGossip;
+	/// use tightbeam::utils::time::UnixMillis;
+	///
+	/// let gossip = PeerGossip { peer_id: Vec::new(), gateway_addr: b"10.0.0.1:9000".to_vec() };
+	/// let hint = PeerConfig::default().admit_hint(gossip)?;
+	/// let table = PeerTable::default();
+	///
+	/// let admitted = table.learn([hint], UnixMillis::new(1_000))?;
+	/// assert_eq!(admitted, 1);
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	pub fn learn<I>(&self, hints: I, now: UnixMillis) -> Result<usize, ClusterError>
 	where
 		I: IntoIterator<Item = PeerHint>,
 	{
 		self.with_table(|state| {
-			let admitted = state.learn(hints);
+			let admitted = state.learn(hints, now);
 			(admitted, admitted > 0)
 		})
 	}
@@ -536,6 +552,13 @@ impl PeerTable {
 		})
 	}
 
+	/// Poisons the table lock, as a thread that panicked under the guard
+	/// leaves it.
+	#[cfg(test)]
+	pub(crate) fn poison(&self) {
+		self.state.poison();
+	}
+
 	/// Dial targets for the advertise/reconcile beat and gossip reflood.
 	///
 	/// - Anchors always lead the set, then verified tried peers.
@@ -544,7 +567,7 @@ impl PeerTable {
 	///   caller proves membership before each reconcile round and each rumor.
 	///
 	/// The returned targets outlive the table lock, so each beat draws
-	/// owned copies. The set is bounded by the anchor and tried caps.
+	/// owned copies. The anchor and tried caps bound the set.
 	///
 	/// # Errors
 	///
@@ -871,7 +894,7 @@ mod tests {
 	#[test]
 	fn learn_admits_hints_and_skips_anchors() -> Result<(), ClusterError> {
 		let table = table_with_anchor("127.0.0.1:9000");
-		let admitted = table.learn(vec![hint("127.0.0.1:9000"), hint("10.0.0.1:9000")])?;
+		let admitted = table.learn(vec![hint("127.0.0.1:9000"), hint("10.0.0.1:9000")], UnixMillis::default())?;
 		assert_eq!(admitted, 1);
 		assert_eq!(table.learned()?, (1, 0));
 		Ok(())
@@ -882,7 +905,7 @@ mod tests {
 	// is the one refusal left for learning to apply here.
 	fn learn_drops_duplicate_hints() -> Result<(), ClusterError> {
 		let table = PeerTable::default();
-		let admitted = table.learn(vec![hint("10.0.0.1:9000"), hint("10.0.0.1:9000")])?;
+		let admitted = table.learn(vec![hint("10.0.0.1:9000"), hint("10.0.0.1:9000")], UnixMillis::default())?;
 		assert_eq!(admitted, 1);
 		Ok(())
 	}
@@ -893,7 +916,7 @@ mod tests {
 		let hints: Vec<PeerHint> = (0..MAX_PEER_BUCKET + 3)
 			.map(|host| hint(format!("10.0.0.{}:9000", host + 1)))
 			.collect();
-		let admitted = table.learn(hints)?;
+		let admitted = table.learn(hints, UnixMillis::default())?;
 		assert_eq!(admitted, MAX_PEER_BUCKET);
 		Ok(())
 	}
@@ -901,7 +924,7 @@ mod tests {
 	#[test]
 	fn promote_moves_candidate_into_tried_once() -> Result<(), ClusterError> {
 		let table = PeerTable::default();
-		table.learn(vec![hint("10.0.0.1:9000")])?;
+		table.learn(vec![hint("10.0.0.1:9000")], UnixMillis::default())?;
 
 		let first = table.promote(addr("10.0.0.1:9000"), Some(b"fp-a"), UnixMillis::new(1_000))?;
 		let second = table.promote(addr("10.0.0.1:9000"), Some(b"fp-a"), UnixMillis::new(2_000))?;
@@ -941,7 +964,7 @@ mod tests {
 			table.promote(addr(format!("10.0.0.{}:9000", host + 1)), None, UnixMillis::new(1_000))?;
 		}
 
-		table.learn(vec![hint("10.0.9.9:9000")])?;
+		table.learn(vec![hint("10.0.9.9:9000")], UnixMillis::default())?;
 
 		let promoted = table.promote(addr("10.0.9.9:9000"), None, UnixMillis::new(2_000))?;
 		assert!(!promoted);
@@ -1053,7 +1076,7 @@ mod tests {
 		let table = PeerTable::default();
 		table.exclude_self(PeerAddress::fixture("10.0.0.1:9000"))?;
 
-		let admitted = table.learn(vec![hint("10.0.0.1:9000")])?;
+		let admitted = table.learn(vec![hint("10.0.0.1:9000")], UnixMillis::default())?;
 		let promoted = table.promote(addr("10.0.0.1:9000"), None, UnixMillis::new(1_000))?;
 		assert_eq!(admitted, 0);
 		assert!(!promoted);
@@ -1065,7 +1088,7 @@ mod tests {
 	#[test]
 	fn exclude_self_evicts_an_address_already_learned() -> Result<(), ClusterError> {
 		let table = PeerTable::default();
-		table.learn(vec![hint("10.0.0.1:9000")])?;
+		table.learn(vec![hint("10.0.0.1:9000")], UnixMillis::default())?;
 		table.promote(addr("10.1.0.1:9000"), None, UnixMillis::new(1_000))?;
 
 		table.exclude_self(PeerAddress::fixture("10.0.0.1:9000"))?;
@@ -1078,7 +1101,7 @@ mod tests {
 	#[test]
 	fn discard_prunes_only_the_new_table() -> Result<(), ClusterError> {
 		let table = PeerTable::default();
-		table.learn(vec![hint("10.0.0.1:9000")])?;
+		table.learn(vec![hint("10.0.0.1:9000")], UnixMillis::default())?;
 		table.promote(addr("10.1.0.1:9000"), None, UnixMillis::new(1_000))?;
 
 		table.discard(addr("10.0.0.1:9000"))?;
@@ -1155,10 +1178,10 @@ mod tests {
 	#[test]
 	fn record_probe_failure_keeps_the_candidate_in_new() -> Result<(), ClusterError> {
 		let table = PeerTable::default();
-		table.learn(vec![hint("10.0.0.1:9000")])?;
+		table.learn(vec![hint("10.0.0.1:9000")], UnixMillis::default())?;
 
 		table.record_probe_failure(addr("10.0.0.1:9000"), UnixMillis::new(1_000))?;
-		let relearned = table.learn(vec![hint("10.0.0.1:9000")])?;
+		let relearned = table.learn(vec![hint("10.0.0.1:9000")], UnixMillis::default())?;
 
 		assert_eq!(relearned, 0);
 		assert_eq!(table.learned()?, (1, 0));
@@ -1170,7 +1193,7 @@ mod tests {
 	#[test]
 	fn probe_sample_draws_a_failed_candidate_after_a_fresher_one() -> Result<(), ClusterError> {
 		let table = PeerTable::default();
-		table.learn(vec![hint("10.0.0.1:9000"), hint("10.0.0.2:9000")])?;
+		table.learn(vec![hint("10.0.0.1:9000"), hint("10.0.0.2:9000")], UnixMillis::default())?;
 		table.probe_sample(UnixMillis::new(2_000))?;
 		table.record_probe_failure(addr("10.0.0.1:9000"), UnixMillis::new(1_000))?;
 
@@ -1183,7 +1206,8 @@ mod tests {
 	fn table_with_a_full_bucket() -> PeerTable {
 		let table = PeerTable::default();
 		let residents: Vec<PeerHint> = (1..=MAX_PEER_BUCKET).map(|host| hint(format!("10.0.0.{host}:9000"))).collect();
-		table.learn(residents).expect("a fresh table lock is not poisoned");
+		let learned = table.learn(residents, UnixMillis::default());
+		learned.expect("a fresh table lock is not poisoned");
 
 		table
 	}
@@ -1191,7 +1215,7 @@ mod tests {
 	#[test]
 	fn a_full_bucket_refuses_a_newcomer_while_no_candidate_has_failed() -> Result<(), ClusterError> {
 		let table = table_with_a_full_bucket();
-		let admitted = table.learn(vec![hint("10.0.0.200:9000")])?;
+		let admitted = table.learn(vec![hint("10.0.0.200:9000")], UnixMillis::default())?;
 		assert_eq!(admitted, 0);
 		Ok(())
 	}
@@ -1203,10 +1227,10 @@ mod tests {
 		let table = table_with_a_full_bucket();
 		table.record_probe_failure(addr("10.0.0.3:9000"), UnixMillis::new(1_000))?;
 
-		let newcomer = table.learn(vec![hint("10.0.0.200:9000")])?;
+		let newcomer = table.learn(vec![hint("10.0.0.200:9000")], UnixMillis::default())?;
 		table.record_probe_failure(addr("10.0.0.5:9000"), UnixMillis::new(2_000))?;
 
-		let returned = table.learn(vec![hint("10.0.0.3:9000")])?;
+		let returned = table.learn(vec![hint("10.0.0.3:9000")], UnixMillis::default())?;
 		assert_eq!((newcomer, returned), (1, 1));
 		assert_eq!(table.learned()?, (MAX_PEER_BUCKET, 0));
 		Ok(())
@@ -1215,7 +1239,7 @@ mod tests {
 	#[test]
 	fn expel_clears_both_learned_tables() -> Result<(), ClusterError> {
 		let table = PeerTable::default();
-		table.learn(vec![hint("10.0.0.1:9000")])?;
+		table.learn(vec![hint("10.0.0.1:9000")], UnixMillis::default())?;
 		table.promote(addr("10.1.0.1:9000"), None, UnixMillis::new(1_000))?;
 		table.expel(addr("10.0.0.1:9000"))?;
 		table.expel(addr("10.1.0.1:9000"))?;
@@ -1236,7 +1260,7 @@ mod tests {
 	#[test]
 	fn target_set_leads_with_anchors_and_hides_new() -> Result<(), ClusterError> {
 		let table = table_with_anchor("127.0.0.1:9000");
-		table.learn(vec![hint("10.0.0.1:9000")])?;
+		table.learn(vec![hint("10.0.0.1:9000")], UnixMillis::default())?;
 		table.promote(addr("10.1.0.1:9000"), None, UnixMillis::new(1_000))?;
 
 		let targets = table.target_set()?;
@@ -1251,8 +1275,8 @@ mod tests {
 			.map(|host| hint(format!("10.0.0.{}:9000", host + 1)))
 			.collect();
 
-		table.learn(crowded)?;
-		table.learn(vec![hint("10.1.0.1:9000")])?;
+		table.learn(crowded, UnixMillis::default())?;
+		table.learn(vec![hint("10.1.0.1:9000")], UnixMillis::default())?;
 
 		let sample = table.probe_sample(UnixMillis::new(1_000))?;
 		assert_eq!(sample.len(), PEER_PROBE_PER_BEAT);
@@ -1263,7 +1287,7 @@ mod tests {
 	#[test]
 	fn probe_sample_rotates_through_backlog() -> Result<(), ClusterError> {
 		let table = PeerTable::default();
-		table.learn(vec![hint("10.0.0.1:9000"), hint("10.1.0.1:9000")])?;
+		table.learn(vec![hint("10.0.0.1:9000"), hint("10.1.0.1:9000")], UnixMillis::default())?;
 
 		let first = table.probe_sample(UnixMillis::new(1_000))?;
 		let second = table.probe_sample(UnixMillis::new(2_000))?;
@@ -1277,7 +1301,8 @@ mod tests {
 	fn table_with_a_candidate_per_prefix(prefixes: usize) -> PeerTable {
 		let table = PeerTable::default();
 		let hints: Vec<PeerHint> = (0..prefixes).map(|prefix| hint(format!("10.{prefix}.0.1:9000"))).collect();
-		table.learn(hints).expect("a fresh table lock is not poisoned");
+		let learned = table.learn(hints, UnixMillis::default());
+		learned.expect("a fresh table lock is not poisoned");
 		table
 	}
 
@@ -1307,7 +1332,7 @@ mod tests {
 	#[test]
 	fn probe_sample_skips_a_failed_candidate_until_its_wait_has_passed() -> Result<(), ClusterError> {
 		let table = PeerTable::default();
-		table.learn(vec![hint("10.0.0.1:9000")])?;
+		table.learn(vec![hint("10.0.0.1:9000")], UnixMillis::default())?;
 		table.record_probe_failure(addr("10.0.0.1:9000"), UnixMillis::new(10_000))?;
 
 		let early = table.probe_sample(UnixMillis::new(10_000 + PEER_PROBE_BACKOFF_MS - 1))?;
@@ -1360,7 +1385,7 @@ mod tests {
 	#[test]
 	fn held_among_keeps_what_the_table_holds_and_drops_what_it_expelled() -> Result<(), ClusterError> {
 		let table = table_with_anchor("127.0.0.1:9000");
-		table.learn(vec![hint("10.0.0.1:9000"), hint("10.0.0.2:9000")])?;
+		table.learn(vec![hint("10.0.0.1:9000"), hint("10.0.0.2:9000")], UnixMillis::default())?;
 		table.promote(addr("10.1.0.1:9000"), None, UnixMillis::new(1_000))?;
 		table.expel(addr("10.0.0.2:9000"))?;
 
@@ -1412,7 +1437,7 @@ mod tests {
 	#[test]
 	fn sample_for_pex_shares_only_tried_peers() -> Result<(), ClusterError> {
 		let table = PeerTable::default();
-		table.learn(vec![hint("10.0.0.1:9000")])?;
+		table.learn(vec![hint("10.0.0.1:9000")], UnixMillis::default())?;
 
 		let sample = table.sample_for_pex(8)?;
 		assert!(sample.is_empty());
@@ -1450,7 +1475,7 @@ mod tests {
 		let driver: Arc<dyn PeerStore> = store.clone();
 		let table = table_over(driver);
 
-		table.learn(vec![hint("10.0.0.1:9000")])?;
+		table.learn(vec![hint("10.0.0.1:9000")], UnixMillis::default())?;
 		table.promote(addr("10.0.0.1:9000"), None, UnixMillis::new(1_000))?;
 		assert_eq!(store.persists.load(Ordering::SeqCst), 2);
 		Ok(())
@@ -1504,7 +1529,7 @@ mod tests {
 	}
 
 	/// A snapshot taken under the guard holds every earlier change, so the
-	/// driver's rows only ever grow. A stale snapshot landing after a newer
+	/// driver's rows only ever grow. A stale snapshot that lands after a newer
 	/// one would hydrate peers a later mutation removed (CWE-362).
 	///
 	/// The first write stalls inside the driver while a second mutation
@@ -1514,12 +1539,12 @@ mod tests {
 		let store = Arc::new(StallingStore::default());
 		let table = Arc::new(table_over(Arc::clone(&store) as Arc<dyn PeerStore>));
 		let first = Arc::clone(&table);
-		let stalled = std::thread::spawn(move || first.learn(vec![hint("10.1.0.1:9000")]));
+		let stalled = std::thread::spawn(move || first.learn(vec![hint("10.1.0.1:9000")], UnixMillis::default()));
 
 		store.await_first_write();
 
 		let second = Arc::clone(&table);
-		let follower = std::thread::spawn(move || second.learn(vec![hint("10.2.0.1:9000")]));
+		let follower = std::thread::spawn(move || second.learn(vec![hint("10.2.0.1:9000")], UnixMillis::default()));
 
 		std::thread::sleep(Duration::from_millis(50));
 		store.release();
@@ -1564,7 +1589,7 @@ mod tests {
 		let table = Arc::new(anchored("10.0.0.1:9000", Arc::clone(&store) as Arc<dyn PeerStore>));
 
 		*store.table.lock().expect("driver handle") = Some(Arc::clone(&table));
-		table.learn(vec![hint("10.1.0.1:9000")])?;
+		table.learn(vec![hint("10.1.0.1:9000")], UnixMillis::default())?;
 
 		assert_eq!(store.observed.load(Ordering::SeqCst), 1);
 		Ok(())

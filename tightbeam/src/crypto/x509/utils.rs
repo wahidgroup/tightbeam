@@ -17,13 +17,13 @@ use crate::cms::signed_data::SignerIdentifier;
 use crate::crypto::hash::{Digest, U32};
 use crate::crypto::x509::error::CertificateValidationError;
 use crate::crypto::x509::ext::pkix::{
-	BasicConstraints, ExtendedKeyUsage, KeyUsage, KeyUsages, SubjectAltName, SubjectKeyIdentifier,
+	BasicConstraints, ExtendedKeyUsage, KeyUsage, KeyUsages, NameConstraints, SubjectAltName, SubjectKeyIdentifier,
 };
 use crate::crypto::x509::Certificate;
-use crate::der::asn1::{GeneralizedTime, ObjectIdentifier, OctetString};
+use crate::der::asn1::{GeneralizedTime, ObjectIdentifier, OctetString, OctetStringRef};
 use crate::der::oid::db::rfc5280::ANY_EXTENDED_KEY_USAGE;
 use crate::der::oid::AssociatedOid;
-use crate::der::{Decode, Encode, Writer};
+use crate::der::{Decode, Encode, Reader, Writer};
 use crate::x509::certificate::{CertificateInner, Profile};
 use crate::x509::serial_number::SerialNumber;
 
@@ -109,7 +109,7 @@ impl<D: Digest> Writer for DigestWriter<D> {
 /// A 20-octet key identifier by RFC 7093 §2 method 1: the leftmost 160 bits
 /// of the SHA-256 hash of the `subjectPublicKey` BIT STRING value.
 ///
-/// Every certificate the crate mints carries its key's identifier as its
+/// Every certificate the crate creates carries its key's identifier as its
 /// `subjectKeyIdentifier`, and an issued one carries its issuer's as its
 /// `authorityKeyIdentifier`.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
@@ -158,6 +158,22 @@ impl TryFrom<Skid> for SubjectKeyIdentifier {
 	}
 }
 
+/// The `subjectKeyIdentifier` extension (RFC 5280 §4.2.1.2), read in place.
+///
+/// [`CertificateExt::is_named_by`] and the trust store each read the value
+/// through it, so a reader of the identifier borrows the certificate.
+pub(crate) struct SubjectKeyIdentifierRef<'a>(pub(crate) OctetStringRef<'a>);
+
+impl AssociatedOid for SubjectKeyIdentifierRef<'_> {
+	const OID: ObjectIdentifier = SubjectKeyIdentifier::OID;
+}
+
+impl<'a> Decode<'a> for SubjectKeyIdentifierRef<'a> {
+	fn decode<R: Reader<'a>>(reader: &mut R) -> crate::der::Result<Self> {
+		OctetStringRef::decode(reader).map(Self)
+	}
+}
+
 #[macro_export]
 macro_rules! pem {
 	(
@@ -169,7 +185,7 @@ macro_rules! pem {
 	}};
 }
 
-/// Certificate checks this crate runs before trusting a peer.
+/// The certificate checks this crate runs before it trusts a peer.
 ///
 /// `Certificate` is defined in `x509-cert`, so the checks are trait methods,
 /// and a caller still invokes each check on the certificate itself.
@@ -245,8 +261,8 @@ pub trait CertificateExt {
 	where
 		T: AssociatedOid + Decode<'a>;
 
-	/// The CMS `SignerIdentifier` that names this certificate (RFC 5652
-	/// §5.3).
+	/// The CMS `SignerIdentifier` that names this certificate
+	/// (RFC 5652 §5.3).
 	///
 	/// It is the `subjectKeyIdentifier` extension value when the certificate
 	/// carries one, and the issuer and serial number when it carries none.
@@ -257,8 +273,8 @@ pub trait CertificateExt {
 	///   or the serial number fails to decode.
 	fn signer_identifier(&self) -> Result<SignerIdentifier, CertificateValidationError>;
 
-	/// The CMS `RecipientIdentifier` that names this certificate (RFC 9629
-	/// §3), under the rule of [`Self::signer_identifier`].
+	/// The CMS `RecipientIdentifier` that names this certificate
+	/// (RFC 9629 §3), under the rule of [`Self::signer_identifier`].
 	///
 	/// # Errors
 	///
@@ -268,7 +284,8 @@ pub trait CertificateExt {
 
 	/// Whether `sid` names this certificate: a `subjectKeyIdentifier` form by
 	/// the value of this certificate's extension, an issuer-and-serial form
-	/// by its issuer and serial number (RFC 5652 §5.3).
+	/// by its issuer and serial number (RFC 5652 §5.3). The method compares
+	/// the extension value in place.
 	///
 	/// # Errors
 	///
@@ -311,6 +328,19 @@ pub trait CertificateExt {
 	///   critical extension is outside the processed set.
 	fn ensure_critical_extensions_processed(&self) -> Result<(), CertificateValidationError>;
 
+	/// Refuse this certificate when it carries a `nameConstraints` extension
+	/// (RFC 5280 §4.2.1.10), critical or not.
+	///
+	/// RFC 5280 §6.1.4(g) applies the extension whatever its criticality,
+	/// and name constraints stay out of the scope of the store's path
+	/// validation, so a certificate that states one fails closed.
+	///
+	/// # Errors
+	///
+	/// - [`CertificateValidationError::NameConstraintsUnapplied`] -- the
+	///   certificate carries a `nameConstraints` extension.
+	fn ensure_no_name_constraints(&self) -> Result<(), CertificateValidationError>;
+
 	/// Refuse this certificate for a use whose `keyUsage` bit is `usage`.
 	/// Every use a certificate is admitted for runs these checks, in order:
 	///
@@ -322,7 +352,7 @@ pub trait CertificateExt {
 	/// - [`CertificateValidationError::DuplicateExtension`] -- an extension repeats.
 	/// - [`CertificateValidationError::UnprocessedCriticalExtension`] -- a
 	///   critical extension is outside the processed set.
-	/// - The [`CertificateExt::require_key_usage`] set.
+	/// - The errors of [`CertificateExt::require_key_usage`].
 	fn require_use(&self, usage: KeyUsages) -> Result<(), CertificateValidationError>;
 
 	/// Refuse this certificate for a role whose key purpose is `purpose`
@@ -375,8 +405,8 @@ impl<P: Profile> CertificateExt for CertificateInner<P> {
 
 	/// Enforce algorithm-identifier consistency within a certificate.
 	///
-	/// [`CertificateExt::ensure_signature_algorithm_consistency`] owns the RFC
-	/// 5280 §4.1.1.2 contract.
+	/// [`CertificateExt::ensure_signature_algorithm_consistency`] owns the
+	/// RFC 5280 §4.1.1.2 contract.
 	fn ensure_signature_algorithm_consistency(&self) -> Result<(), CertificateValidationError> {
 		if self.signature_algorithm != self.tbs_certificate.signature {
 			return Err(CertificateValidationError::AlgorithmMismatch);
@@ -439,8 +469,8 @@ impl<P: Profile> CertificateExt for CertificateInner<P> {
 				Ok(tbs.issuer == named.issuer && tbs.serial_number.as_bytes() == named.serial_number.as_bytes())
 			}
 			SignerIdentifier::SubjectKeyIdentifier(named) => {
-				let own = self.extension::<SubjectKeyIdentifier>()?;
-				Ok(own.is_some_and(|own| own == *named))
+				let own = self.extension::<SubjectKeyIdentifierRef<'_>>()?;
+				Ok(own.is_some_and(|own| own.0.as_bytes() == named.0.as_bytes()))
 			}
 		}
 	}
@@ -483,8 +513,8 @@ impl<P: Profile> CertificateExt for CertificateInner<P> {
 
 	/// Find the first critical extension outside the processed set.
 	///
-	/// [`CertificateExt::ensure_critical_extensions_processed`] owns the RFC
-	/// 5280 §4.2 contract.
+	/// [`CertificateExt::ensure_critical_extensions_processed`] owns the
+	/// RFC 5280 §4.2 contract.
 	fn ensure_critical_extensions_processed(&self) -> Result<(), CertificateValidationError> {
 		let Some(extensions) = self.tbs_certificate.extensions.as_ref() else {
 			return Ok(());
@@ -498,6 +528,23 @@ impl<P: Profile> CertificateExt for CertificateInner<P> {
 			Some(extension) => Err(CertificateValidationError::UnprocessedCriticalExtension(extension.extn_id)),
 			None => Ok(()),
 		}
+	}
+
+	/// Find a `nameConstraints` extension of either criticality.
+	///
+	/// [`CertificateExt::ensure_no_name_constraints`] owns the
+	/// RFC 5280 §6.1.4(g) contract.
+	fn ensure_no_name_constraints(&self) -> Result<(), CertificateValidationError> {
+		let Some(extensions) = self.tbs_certificate.extensions.as_ref() else {
+			return Ok(());
+		};
+
+		let constrained = extensions.iter().any(|extension| extension.extn_id == NameConstraints::OID);
+		if constrained {
+			return Err(CertificateValidationError::NameConstraintsUnapplied);
+		}
+
+		Ok(())
 	}
 
 	/// Run the checks of one use, in the order the contract lists them.
@@ -563,7 +610,7 @@ mod tests {
 	}
 
 	/// The extension value a SKID converts to carries the SKID bytes whole,
-	/// so a minted certificate holds the 20 bytes its key names.
+	/// so a certificate the crate creates holds the 20 bytes its key names.
 	#[test]
 	fn a_skid_converts_to_the_extension_value_that_carries_it() -> Result<(), crate::der::Error> {
 		let skid = Skid::parse([0x5au8; 20]).ok_or(crate::der::Tag::OctetString.value_error())?;
@@ -634,7 +681,7 @@ mod tests {
 		let result = validator.evaluate(&expired_cert);
 		assert!(result.is_err(), "Expired certificate should be rejected");
 
-		// The rejection is specifically an expiry error.
+		// The rejection is an expiry error.
 		match result {
 			Err(CertificateValidationError::Expired) => {
 				// This arm is the expected error.
@@ -660,14 +707,14 @@ mod tests {
 			TestCertificate::self_signed(&TestKey::insecure_fixed_signing())
 		}
 
-		/// [`both_uses`] with `extendedKeyUsage` naming `purposes` alone.
+		/// [`both_uses`] with an `extendedKeyUsage` of `purposes` alone.
 		fn with_purposes(purposes: Vec<crate::der::asn1::ObjectIdentifier>) -> Certificate {
 			TestCertificate::with_key_purposes(both_uses(), purposes)
 		}
 
 		#[test]
 		fn rejects_unknown_critical_extension() {
-			// nameConstraints (2.5.29.30) is not processed by this validator.
+			// nameConstraints (2.5.29.30) sits outside the processed set.
 			let mut cert = both_uses();
 			cert.tbs_certificate.extensions = Some(vec![TestCertificate::opaque_extension("2.5.29.30", true)]);
 			assert!(matches!(
@@ -690,7 +737,7 @@ mod tests {
 			assert!(cert.ensure_critical_extensions_processed().is_ok());
 		}
 
-		/// `extendedKeyUsage` is processed, so a critical one is admitted
+		/// The crate processes `extendedKeyUsage`, so it admits a critical one
 		/// (RFC 5280 §4.2.1.12).
 		#[test]
 		fn accepts_a_critical_extended_key_usage() {
@@ -699,8 +746,8 @@ mod tests {
 			assert!(cert.ensure_critical_extensions_processed().is_ok());
 		}
 
-		/// A certificate with two `keyUsage` extensions is refused (RFC 5280
-		/// §4.2).
+		/// A certificate with two `keyUsage` extensions is refused
+		/// (RFC 5280 §4.2).
 		#[test]
 		fn rejects_a_repeated_extension() {
 			let mut cert = both_uses();
@@ -721,8 +768,8 @@ mod tests {
 
 		#[test]
 		fn accepts_critical_subject_alt_name() {
-			// Colony membership reads subjectAltName (2.5.29.17). RFC 5280
-			// §4.1.2.6 marks it critical when the subject DN is empty.
+			// Colony membership reads subjectAltName (2.5.29.17).
+			// RFC 5280 §4.1.2.6 marks it critical when the subject DN is empty.
 			let mut cert = both_uses();
 			cert.tbs_certificate.extensions = Some(vec![TestCertificate::opaque_extension("2.5.29.17", true)]);
 			assert!(cert.ensure_critical_extensions_processed().is_ok());
@@ -777,8 +824,8 @@ mod tests {
 			));
 		}
 
-		/// An `extendedKeyUsage` that omits a purpose refuses its role (RFC
-		/// 5280 §4.2.1.12).
+		/// An `extendedKeyUsage` that omits a purpose refuses its role
+		/// (RFC 5280 §4.2.1.12).
 		#[test]
 		fn a_purpose_the_extended_key_usage_omits_is_refused() {
 			let cert = with_purposes(vec![ID_KP_TIME_STAMPING]);

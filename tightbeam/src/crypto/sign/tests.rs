@@ -1,5 +1,7 @@
 //! The CMS signer, the signing identity, and the key identifier.
 
+use core::iter;
+use core::str::FromStr;
 use std::sync::Arc;
 
 use super::*;
@@ -14,6 +16,7 @@ use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::crypto::sign::ecdsa::{Secp256k1, Secp256k1Signature, Secp256k1SigningKey};
 use crate::crypto::sign::elliptic_curve::ALGORITHM_OID as EC_PUBLIC_KEY;
 use crate::crypto::x509::error::CertificateValidationError;
+use crate::crypto::x509::error::CertificateValidationError::{AmbiguousIssuer, InvalidChain, PathLenExceeded};
 use crate::crypto::x509::utils::{CertificateExt, Skid};
 use crate::crypto::x509::KeyPurposes;
 use crate::crypto::x509::{ErasedSigning, PeerCertificate, Signing};
@@ -25,11 +28,14 @@ use crate::oids::{
 	ATTR_CMS_ALGORITHM_PROTECTION, ATTR_CONTENT_TYPE, ATTR_MESSAGE_DIGEST, DATA, HASH_SHA3_256, HASH_SHA3_512,
 	RECEIPT_ROLE, SESSION_RECEIPT_CONTENT, SIGNER_ECDSA_WITH_SHA256,
 };
+use crate::random::OsRng;
 use crate::spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoOwned};
 use crate::testing::fixtures::{TestAttributes, TestCertificate, TestIdentity, TestKey};
 use crate::utils::marker::MaybeSendFuture;
 use crate::x509::attr::Attribute;
 use crate::x509::ext::pkix::{KeyUsage, KeyUsages, SubjectKeyIdentifier};
+use crate::x509::name::RdnSequence;
+use crate::x509::serial_number::SerialNumber;
 use crate::x509::Certificate;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -205,7 +211,7 @@ fn the_key_identifier_matches_its_known_answer() -> TestResult {
 	Ok(())
 }
 
-/// A certificate the crate mints carries its key identifier, so it names
+/// A certificate the crate creates carries its key identifier, so it names
 /// its signer by the `subjectKeyIdentifier` (RFC 5652 §5.3).
 #[test]
 fn a_minted_certificate_names_its_signer_by_its_key_identifier() -> TestResult {
@@ -823,7 +829,7 @@ fn a_joining_signer_whose_certificate_the_set_holds_keeps_one_copy() -> TestResu
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 #[test]
 fn a_signer_beside_a_certificate_its_sid_does_not_name_is_refused() {
-	let other = TestCertificate::self_signed(&Secp256k1SigningKey::random(&mut crate::random::OsRng));
+	let other = TestCertificate::self_signed(&Secp256k1SigningKey::random(&mut OsRng));
 	let refused = CertifiedSigner::new(signed(), Arc::new(other));
 	assert!(matches!(refused, Err(SignerError::SignerIdentifier)));
 }
@@ -898,17 +904,17 @@ fn a_signing_identity_accepts_the_key_of_its_certificate() -> TestResult {
 	Ok(())
 }
 
-/// A signing identity keeps the DER its certificate decoded from, the bytes
-/// a handshake transcript binds.
+/// A signing identity with no chain presents its certificate alone in the
+/// `certificates` set a handshake carries.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 #[test]
-fn a_signing_identity_keeps_the_der_of_its_certificate() -> TestResult {
+fn a_signing_identity_presents_its_certificate_alone() -> TestResult {
 	let key = TestKey::insecure_fixed_signing();
-	let der = TestCertificate::self_signed(&key).to_der()?;
-	let certificate = Certificate::from_der(&der)?;
+	let certificate = TestCertificate::self_signed(&key);
 	let provider = Arc::new(Secp256k1KeyProvider::from(key));
 
-	let identity = SigningIdentity::new(certificate, provider)?;
-	assert_eq!(identity.certificate_der(), der.as_slice());
+	let identity = SigningIdentity::new(certificate.to_owned(), provider)?;
+	assert_eq!(identity.presented().set(), TestCertificate::set_of([certificate]));
 	Ok(())
 }
 
@@ -1027,66 +1033,273 @@ async fn a_policy_refuses_a_digest_the_signature_algorithm_does_not_name() -> Te
 
 /// The `SignedData` of [`signed`] carrying `certificates`, which DER sorts.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-fn signed_data_carrying(certificates: impl IntoIterator<Item = crate::x509::Certificate>) -> SignedData {
-	let choices: Vec<CertificateChoices> = certificates.into_iter().map(CertificateChoices::Certificate).collect();
-	let set = CertificateSet(choices.try_into().expect("distinct certificates are a SET"));
+fn signed_data_carrying(certificates: impl IntoIterator<Item = Certificate>) -> SignedData {
+	let set = TestCertificate::set_of(certificates);
 	let signed_data = CmsSigner::signed_data(SignedContent::data(CONTENT), signed(), Some(set));
 	signed_data.expect("the SignedData assembles").into_inner()
 }
 
-/// The certificate the one signer names moves out of `certificates`, and
-/// the rest of the set stays (RFC 5652 §5.3).
+/// The `SignedData` of [`signed`] whose set holds the certificate its signer
+/// names beside eight choices of another format, nine choices in all.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-#[test]
-fn taking_the_signer_certificate_leaves_the_rest_of_the_set() -> TestResult {
-	let named = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
-	let other = TestCertificate::self_signed(&Secp256k1SigningKey::random(&mut crate::random::OsRng));
-	let mut signed_data = signed_data_carrying([other.to_owned(), named.to_owned()]);
+fn signed_data_of_nine_choices() -> SignedData {
+	let named = CertificateChoices::Certificate(TestCertificate::self_signed(&TestKey::insecure_fixed_signing()));
+	let choices = iter::once(named).chain((0..8).map(other_format));
+	let set = SetOfVec::try_from(choices.collect::<Vec<_>>()).expect("distinct choices are a SET");
+	let signed_data = CmsSigner::signed_data(SignedContent::data(CONTENT), signed(), Some(CertificateSet(set)));
+	signed_data.expect("the SignedData assembles").into_inner()
+}
 
-	let taken = CmsSigner::take_signer_certificate(&mut signed_data)?;
-	let rest = signed_data.certificates.map(|set| set.0.into_vec());
-	assert_eq!(taken, Some(named));
-	assert_eq!(rest, Some(vec![CertificateChoices::Certificate(other)]));
+/// The path the one signer presents moves out of `certificates`, which the
+/// call leaves empty, as a server takes it from a client Finished (RFC 5652
+/// §5.3).
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+#[tokio::test]
+async fn taking_the_signer_path_moves_the_set_out() -> TestResult {
+	let identity = chained_identity();
+	let signer = identity.sign(SignedContent::data(CONTENT)).await?;
+	let presented = Some(identity.presented().set());
+	let signed = CmsSigner::signed_data(SignedContent::data(CONTENT), signer, presented)?;
+	let mut signed_data = signed.into_inner();
+
+	let path = CmsSigner::take_signer_path(&mut signed_data)?.ok_or("the set holds the named certificate")?;
+	let (leaf, issuers) = path.into_parts();
+	let [chained_leaf, intermediate] = chained_certificates();
+	let taken = (leaf, issuers.as_slice(), signed_data.certificates);
+	assert_eq!(taken, (chained_leaf, [intermediate].as_slice(), None));
 	Ok(())
 }
 
-/// A set that holds no certificate the signer names gives none, and keeps
-/// what it holds.
+/// A set that holds no certificate the signer names gives no path, and the
+/// call still leaves the set empty.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 #[test]
-fn taking_from_a_set_without_the_signer_certificate_takes_nothing() -> TestResult {
-	let other = TestCertificate::self_signed(&Secp256k1SigningKey::random(&mut crate::random::OsRng));
-	let mut signed_data = signed_data_carrying([other.to_owned()]);
+fn taking_from_a_set_without_the_signer_certificate_takes_no_path() -> TestResult {
+	let other = TestCertificate::self_signed(&Secp256k1SigningKey::random(&mut OsRng));
+	let mut signed_data = signed_data_carrying([other]);
 
-	let taken = CmsSigner::take_signer_certificate(&mut signed_data)?;
-	let kept = signed_data.certificates.map(|set| set.0.into_vec());
-	assert_eq!(taken, None);
-	assert_eq!(kept, Some(vec![CertificateChoices::Certificate(other)]));
+	let path = CmsSigner::take_signer_path(&mut signed_data)?;
+	assert_eq!((path.is_none(), signed_data.certificates), (true, None));
 	Ok(())
 }
 
-/// The scan of the received set returns the certificate the one signer
-/// names, parsed from the element it arrived as, beside those bytes. Under
-/// the fixed key `0x02` × 32, the other certificate sorts first in the SET,
-/// so the named certificate is the second element.
-#[cfg(feature = "transport-hpke")]
+/// The cap of the path a server takes out of a client Finished counts each
+/// choice of the set, so a choice of another format counts toward it.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 #[test]
-fn the_received_signer_certificate_is_the_one_its_sid_names() -> TestResult {
+fn taking_a_path_counts_a_choice_of_another_format_toward_the_cap() {
+	let mut signed_data = signed_data_of_nine_choices();
+
+	let refused = CmsSigner::take_signer_path(&mut signed_data);
+	let capped = matches!(refused, Err(SignerError::Certificate(PathLenExceeded)));
+	assert!(capped);
+}
+
+/// The scan of the received set builds the path of the certificate the one
+/// signer names. Under the fixed key `0x02` × 32, the other certificate sorts
+/// first in the SET, so the named certificate is the second element, and the
+/// other one issues no certificate of the path.
+#[cfg(feature = "transport-cms")]
+#[test]
+fn the_received_path_starts_at_the_certificate_its_sid_names() -> TestResult {
 	let named = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
 	let other = TestCertificate::self_signed(&Secp256k1SigningKey::from_bytes(&[0x02u8; 32].into())?);
 	let signed_data = signed_data_carrying([other.to_owned(), named.to_owned()]);
-	let first = signed_data.certificates.iter().flat_map(|set| set.0.iter()).next();
 	let received = signed_data.to_der()?;
-	let expected = named.to_der()?;
 
-	let arrived = CmsSigner::signer_certificate_der(&signed_data, &received)?;
-	assert_eq!(first, Some(&CertificateChoices::Certificate(other)));
-	assert_eq!(arrived, Some((named, expected.as_slice())));
+	let (path, _) = CmsSigner::signer_path(&signed_data, &received)?.ok_or("the set holds the named certificate")?;
+	let (leaf, issuers) = path.into_parts();
+	assert_eq!((leaf, issuers.as_slice()), (named, [].as_slice()));
 	Ok(())
 }
 
+/// The `certificates` field an identity encodes once is the field a
+/// `SignedData` of its set carries, as a reader finds it on arrival, so both
+/// ends of a handshake bind one encoding.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+#[tokio::test]
+async fn an_identity_binds_the_field_a_reader_finds() -> TestResult {
+	let identity = chained_identity();
+	let signer = identity.sign(SignedContent::data(CONTENT)).await?;
+	let presented = Some(identity.presented().set());
+	let signed_data = CmsSigner::signed_data(SignedContent::data(CONTENT), signer, presented)?;
+	let received = signed_data.to_der()?;
+
+	let (_, field) = CmsSigner::signer_path(&signed_data, &received)?.ok_or("the set holds the named certificate")?;
+	assert_eq!(field, identity.presented().field());
+	Ok(())
+}
+
+/// A set of nine certificates, one past
+/// [`MAX_PRESENTED_PATH`](crate::constants::MAX_PRESENTED_PATH), is refused.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+#[test]
+fn a_set_of_nine_certificates_is_refused() -> TestResult {
+	let named = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+	let signed_data = signed_data_carrying(iter::once(named).chain(TestCertificate::strangers(8)));
+	let received = signed_data.to_der()?;
+
+	let refused = CmsSigner::signer_path(&signed_data, &received);
+	let capped = matches!(refused, Err(SignerError::Certificate(PathLenExceeded)));
+	assert!(capped);
+	Ok(())
+}
+
+/// The cap counts each choice of the set as it arrived, before any
+/// certificate parses, so a choice of another format counts toward it.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+#[test]
+fn a_choice_of_another_format_counts_toward_the_cap() -> TestResult {
+	let signed_data = signed_data_of_nine_choices();
+	let received = signed_data.to_der()?;
+
+	let refused = CmsSigner::signer_path(&signed_data, &received);
+	let capped = matches!(refused, Err(SignerError::Certificate(PathLenExceeded)));
+	assert!(capped);
+	Ok(())
+}
+
+/// The walk takes the issuer of each certificate by name, so a set that holds
+/// the root and the intermediate of the fixed chain yields both above the
+/// leaf, the top first.
+#[cfg(feature = "transport-cms")]
+#[test]
+fn the_walk_takes_each_issuer_by_name_the_top_first() -> TestResult {
+	let chain = TestCertificate::insecure_fixed_chain()?;
+	let stranger = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+	let held = vec![chain.intermediate.to_owned(), stranger, chain.root.to_owned()];
+
+	let path = PresentedPath::walk(chain.leaf.to_owned(), held)?;
+	let (leaf, issuers) = path.into_parts();
+	let top_first = [chain.root, chain.intermediate];
+	assert_eq!((leaf, issuers.as_slice()), (chain.leaf, top_first.as_slice()));
+	Ok(())
+}
+
+/// Two certificates of the subject of one issuer leave the walk no one
+/// issuer, so it refuses the set.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+#[test]
+fn the_walk_refuses_two_issuers_of_one_subject() -> TestResult {
+	let chain = TestCertificate::insecure_fixed_chain()?;
+	let mut twin = chain.intermediate.to_owned();
+	twin.tbs_certificate.serial_number = SerialNumber::new(&[9])?;
+	let held = vec![chain.intermediate.to_owned(), twin];
+
+	let refused = PresentedPath::walk(chain.leaf, held);
+	assert!(matches!(refused, Err(CertificateValidationError::AmbiguousIssuer { .. })));
+	Ok(())
+}
+
+/// A set whose issuers name each other leads the walk back into its path, so
+/// the walk refuses it.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+#[test]
+fn the_walk_refuses_a_path_that_returns_to_itself() -> TestResult {
+	let chain = TestCertificate::insecure_fixed_chain()?;
+	let held = Vec::from(TestCertificate::looping_issuers(&chain.intermediate));
+
+	let refused = PresentedPath::walk(chain.leaf, held);
+	assert!(matches!(refused, Err(CertificateValidationError::PathCycle { .. })));
+	Ok(())
+}
+
+/// An identity presents the intermediate it is given beside its own
+/// certificate.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+#[test]
+fn an_identity_presents_its_chain_in_its_certificates_field() {
+	let identity = chained_identity();
+	let expected = TestCertificate::set_of(chained_certificates());
+
+	assert_eq!(identity.presented().set(), expected);
+}
+
+/// A chain in which a certificate does not name the next one as its issuer
+/// is refused where it is set.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+#[test]
+fn an_identity_refuses_a_chain_that_names_another_issuer() -> TestResult {
+	let chain = TestCertificate::insecure_fixed_chain()?;
+	let identity = TestIdentity::presenting(chain.leaf, &chain.leaf_key);
+
+	let refused = identity.with_chain([chain.root]);
+	let unchained = matches!(refused, Err(SignerError::Certificate(InvalidChain { .. })));
+	assert!(unchained);
+	Ok(())
+}
+
+/// A self-issued certificate is its own issuer, so a chain that sets a
+/// certificate of its name above it holds two issuers of one name, which the
+/// identity refuses where the chain is set.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+#[test]
+fn an_identity_refuses_a_chain_above_its_self_issued_certificate() {
+	let identity = TestIdentity::of(&TestKey::insecure_fixed_signing());
+	let stranger = TestCertificate::strangers(1);
+
+	let refused = identity.with_chain(stranger);
+	let ambiguous = matches!(refused, Err(SignerError::Certificate(AmbiguousIssuer { .. })));
+	assert!(ambiguous);
+}
+
+/// A chain past the cap is refused where it is set, so an identity presents
+/// no path its peers refuse.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+#[test]
+fn an_identity_refuses_a_chain_past_the_cap() -> TestResult {
+	let chain = TestCertificate::insecure_fixed_chain()?;
+	let identity = TestIdentity::presenting(chain.leaf.to_owned(), &chain.leaf_key);
+
+	let refused = identity.with_chain(long_chain_above(&chain.leaf));
+	let capped = matches!(refused, Err(SignerError::Certificate(PathLenExceeded)));
+	assert!(capped);
+	Ok(())
+}
+
+/// The identity of the leaf of the fixed chain, which presents the
+/// intermediate.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+fn chained_identity() -> SigningIdentity {
+	let chain = TestCertificate::insecure_fixed_chain().expect("the fixed test chain issues");
+	let identity = TestIdentity::presenting(chain.leaf, &chain.leaf_key);
+	let chained = identity.with_chain([chain.intermediate]);
+	chained.expect("the intermediate issued the leaf")
+}
+
+/// The leaf and the intermediate of the fixed chain, as a set holds them.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+fn chained_certificates() -> [Certificate; 2] {
+	let chain = TestCertificate::insecure_fixed_chain().expect("the fixed test chain issues");
+	[chain.leaf, chain.intermediate]
+}
+
+/// A choice of another certificate format that holds `octet`, from which no
+/// certificate parses.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+fn other_format(octet: u8) -> CertificateChoices {
+	let content = OctetString::new([octet]).expect("one octet is an OCTET STRING");
+	let other_cert = Any::encode_from(&content).expect("an OCTET STRING encodes");
+	CertificateChoices::Other(OtherCertificateFormat { other_cert_format: DATA, other_cert })
+}
+
+/// Eight certificates above `leaf`, each named the issuer of the one below,
+/// a chain one past the cap with `leaf`.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+fn long_chain_above(leaf: &Certificate) -> Vec<Certificate> {
+	let mut below = leaf.tbs_certificate.issuer.to_owned();
+	let mut chain = TestCertificate::strangers(8);
+	for (level, issuer) in (1u8..).zip(chain.iter_mut()) {
+		issuer.tbs_certificate.subject = below;
+		below = RdnSequence::from_str(&format!("CN=level {level}")).expect("a level name parses");
+		issuer.tbs_certificate.issuer = below.to_owned();
+	}
+
+	chain
+}
+
 /// An unsigned attribute joins the one signer of a `SignedData`, and the
-/// signature still verifies, since it covers no unsigned attribute.
+/// signature still verifies, since it covers the signed attributes alone.
 #[cfg(feature = "transport-hpke")]
 #[test]
 fn an_unsigned_attribute_joins_the_one_signer() -> TestResult {
@@ -1109,7 +1322,7 @@ fn an_unsigned_attribute_joins_the_one_signer() -> TestResult {
 fn an_unsigned_attribute_refuses_two_signers() -> TestResult {
 	let content = SignedContent::data(CONTENT);
 	let first = CmsSigner::signed_data(content, signed(), None)?;
-	let other_key = Secp256k1SigningKey::random(&mut crate::random::OsRng);
+	let other_key = Secp256k1SigningKey::random(&mut OsRng);
 	let other_certificate = Arc::new(TestCertificate::self_signed(&other_key));
 	let other = signed_by(&TestIdentity::certified(other_key), SignedContent::data(CONTENT));
 	let other = CertifiedSigner::new(other, other_certificate)?;

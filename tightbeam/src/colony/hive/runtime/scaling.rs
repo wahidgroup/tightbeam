@@ -1,4 +1,5 @@
-//! Hive auto-scaling loop: per-type scale decisions and cluster fan-out.
+//! The hive auto-scaling loop: per-type scale decisions and the cluster
+//! fan-out.
 
 use core::sync::atomic::{AtomicU16, Ordering};
 use core::time::Duration;
@@ -6,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use crate::colony::common::{
-	aggregate_utilization, ScalingDecision, ScalingMetrics, ServletChange, ServletInfo, ServletScaleConfig, TaskGroup,
+	aggregate_utilization, ScalingDecision, ScalingMetrics, ServletChange, ServletScaleConfig, TaskGroup,
 };
 use crate::colony::hive::runtime::{ClusterLink, HiveContextImpl, HiveInstances};
 use crate::colony::hive::{HashMapRegistry, HiveConfig, ServletRegistration, ServletRegistry, SpawnerFn};
@@ -125,11 +126,11 @@ where
 	}
 }
 
-/// Instance count and summed utilization over one servlet type.
+/// The instance count and the summed utilization of one servlet type.
 ///
 /// The two numbers are only meaningful together: a mean over the wrong
-/// count reads as a different load. Carrying them in one value keeps the
-/// division with the pair it divides.
+/// count reads as a different load. One value carries both, so the division
+/// stays with the pair it divides.
 #[derive(Default)]
 struct TypeLoad {
 	instances: usize,
@@ -270,12 +271,15 @@ where
 		// The registry takes the instance before the announcement, because
 		// the notify failure path reconciles from the registry.
 		let instances = HiveInstances::new(self.servlets.as_ref(), &self.hive_context);
-		let Ok((instance, addr_bytes)) = instances.insert(registration) else {
+		let Ok(placed) = instances.insert(registration) else {
 			return;
 		};
 
-		let added = ServletInfo { servlet_id: instance, address: addr_bytes.as_ref().to_vec() };
-		self.announce(ServletChange::Added(added));
+		// An instance that names no signer has no route, as the slate leaves
+		// it out, so the cluster hears of no route to it.
+		if let Some(added) = placed.into_servlet_info() {
+			self.announce(ServletChange::Added(added));
+		}
 		cooldowns.stamp(type_key);
 	}
 
@@ -332,7 +336,8 @@ mod tests {
 		Arc::new(ManualClock::default())
 	}
 
-	/// Cooldowns on `clock`, with the `echo` type stamped now.
+	/// Cooldowns on `clock`, with the `echo` type stamped at its current
+	/// instant.
 	fn stamped_cooldowns(clock: &Arc<ManualClock>) -> Cooldowns {
 		let mut cooldowns = Cooldowns::new(Arc::clone(clock) as Arc<dyn Clock>);
 		cooldowns.stamp(b"echo".as_slice());

@@ -37,7 +37,7 @@ use crate::TightBeamError;
 
 use crate::colony::hive::{BackpressureGate, ClusterSecurityGate, GateLimits};
 use crate::crypto::x509::store::CertificateTrust;
-use crate::transport::TransportEncryptionConfig;
+use crate::transport::state::EncryptedProtocolState;
 
 /// The accept plane a cluster reaches this hive on.
 ///
@@ -183,8 +183,7 @@ where
 		};
 
 		let bind_addr = P::default_bind_address()?;
-		let encryption_config = TransportEncryptionConfig::new(hive_tls.identity().clone());
-		let encryption_config = encryption_config.with_client_validators(hive_tls.validators.iter().map(Arc::clone));
+		let encryption_config = hive_tls.accept_encryption();
 		Ok(Some(P::bind_with(bind_addr, encryption_config).await?))
 	}
 }
@@ -202,7 +201,14 @@ where
 	P::Address: Hash + Eq + Clone + Copy + Send + Sync + FromStr + 'static,
 	P::Stream: Send + 'static,
 	P::Error: Send + 'static,
-	P::Transport: MessageEmitter + MessageCollector + PolicyConfig + MuxConnector + Send + Sync + 'static,
+	P::Transport: MessageEmitter
+		+ MessageCollector
+		+ PolicyConfig
+		+ MuxConnector
+		+ EncryptedProtocolState
+		+ Send
+		+ Sync
+		+ 'static,
 	TightBeamError: From<P::Error>,
 {
 	type Protocol = P;
@@ -380,8 +386,8 @@ where
 		self.drain.begin();
 
 		// Stop the beats before waiting on commands. A re-announce or a
-		// scale-up that outlived the wait would reinstall the very routes
-		// this drain withdraws (CWE-362).
+		// scale-up that outlived the wait would reinstall the routes this
+		// drain withdraws (CWE-362).
 		self.tasks.abort_all();
 
 		// Wait on commands, not on open connections: a control connection
@@ -398,8 +404,8 @@ where
 			.into_iter()
 			.for_each(|(_, reg)| reg.servlet.stop_boxed());
 
-		// Announce the emptied slate so gateways retire this hive's routes
-		// now, ahead of the heartbeat that would eventually miss.
+		// Announce the emptied slate so gateways retire this hive's routes at
+		// once, ahead of the heartbeat that would eventually miss.
 		if let Some(link) = self.cluster_link() {
 			link.announce_slate().await;
 		}

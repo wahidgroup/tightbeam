@@ -37,17 +37,17 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 		};
 
 		// The heartbeat dials the control address, so a hive the protocol
-		// cannot parse would register, go unbeaten, and leave by silent
-		// eviction. The check runs before anything is installed.
+		// cannot parse would register, get no heartbeat, and leave by silent
+		// eviction. The check runs before the membership step installs it.
 		let hive_addr: Arc<[u8]> = request.hive_addr.clone().into();
 		if DialTarget::of_registered(&hive_addr).protocol_address::<P::Address>().is_err() {
 			return self.refuse_register(&frame, TransitStatus::PermissionDenied);
 		}
 
 		// A hive registered with no signer is claimable by the next signer
-		// that names it, so an identifier that does not encode refuses here
-		// rather than installing an unbound entry (CWE-639).
-		let Some(signer_id) = frame.signer_id().map(Arc::from) else {
+		// that names it, so a frame that names none refuses here rather than
+		// installing an unbound entry (CWE-639).
+		let Some(signer) = frame.nonrepudiation().map(|info| Arc::new(info.sid.clone())) else {
 			return self.refuse_register(&frame, TransitStatus::PermissionDenied);
 		};
 
@@ -60,7 +60,7 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 		// The membership step installs the hive entry and its full slate
 		// atomically, or rolls both back. A re-registration replaces the
 		// prior rows.
-		let registered = self.membership().admit(request, signer_id, slate);
+		let registered = self.membership().admit(request, signer, slate);
 		let counted = registered.and_then(|()| self.registry.len());
 		match counted {
 			Ok(hive_count) => {
@@ -96,13 +96,13 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 		// A hive registered with no signer is claimable by the next signer
 		// that names it, so an unsigned update refuses here rather than
 		// reaching the bind check (CWE-639).
-		let Some(signer_id) = frame.signer_id().map(Arc::from) else {
+		let Some(signer) = frame.nonrepudiation().map(|info| &info.sid) else {
 			return self.refuse_update_release(&frame, &signature, TransitStatus::PermissionDenied);
 		};
 
 		// The signer bind and the route write are one membership step, so
 		// a retirement cannot land between them (CWE-362).
-		match self.membership().update_addresses(&signer_id, added, &removed) {
+		match self.membership().update_addresses(signer, added, &removed) {
 			Ok(()) => {
 				self.trace.event(CLUSTER_UPDATE_ACCEPTED)?;
 

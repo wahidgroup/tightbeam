@@ -1,7 +1,7 @@
-//! Connection Keep-Alive and Reuse Tests
+//! Tests of connection keep-alive and reuse.
 //!
-//! Tests that a single client connection can send multiple messages
-//! without reconnecting (connection keep-alive):
+//! The tests check that one client connection sends three messages without a
+//! reconnect (connection keep-alive):
 //! - Basic TCP connection reuse (no TLS)
 //! - TLS connection reuse with session persistence
 
@@ -35,7 +35,7 @@ use tightbeam::{
 };
 
 #[cfg(feature = "x509")]
-use crate::common::static_pair::{CLIENT_CERT, CLIENT_KEY, CLIENT_PINNING, SERVER_CERT, SERVER_KEY};
+use crate::common::static_pair::{client_pinning, CLIENT_CERT, CLIENT_KEY, SERVER_CERT, SERVER_KEY};
 #[cfg(feature = "x509")]
 use tightbeam::{
 	crypto::{
@@ -50,18 +50,14 @@ use tightbeam::{
 	error::TightBeamError,
 };
 
-// ============================================================================
-// Test Message Types
-// ============================================================================
+// The tests exchange this message type.
 
 #[derive(Clone, Debug, PartialEq, Beamable, Sequence)]
 struct TestMessage {
 	content: String,
 }
 
-// ============================================================================
-// Test Helpers
-// ============================================================================
+// The tests share this helper.
 
 #[cfg(feature = "x509")]
 fn make_server_trust_store() -> Result<Arc<dyn CertificateTrust>, TightBeamError> {
@@ -73,9 +69,7 @@ fn make_server_trust_store() -> Result<Arc<dyn CertificateTrust>, TightBeamError
 	))
 }
 
-// ============================================================================
-// Spec Definitions
-// ============================================================================
+// These specs state the event contract of both scenarios.
 
 tb_process_spec! {
 	pub ConnectionReuseProcess,
@@ -107,16 +101,14 @@ tb_assert_spec! {
 	}
 }
 
-// ============================================================================
-// Scenario: Basic TCP Connection Reuse (No TLS)
-// ============================================================================
+// Scenario: one cleartext TCP connection carries three messages.
 
 tb_scenario! {
 	name: tcp_connection_reuse,
 	spec: ConnectionReuseSpec,
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
-			// Start echo servlet
+			// The echo servlet answers each frame with itself.
 			servlet! {
 				EchoServlet<TestMessage, EnvConfig = ()>,
 				protocol: TokioListener,
@@ -130,7 +122,7 @@ tb_scenario! {
 
 			trace.event(CLIENT_CONNECT)?;
 
-			// Send 3 messages using the same client (connection keep-alive)
+			// One client sends all three messages over its one connection.
 			let client_builder = ClientBuilder::<TokioListener>::builder().allow_cleartext().build();
 			let mut client = client_builder.connect(addr).await?;
 			for i in 1..=3 {
@@ -151,9 +143,7 @@ tb_scenario! {
 	}
 }
 
-// ============================================================================
-// Scenario: TLS Connection Reuse with Session Persistence
-// ============================================================================
+// Scenario: one TLS connection carries three messages in one session.
 
 #[cfg(all(
 	feature = "x509",
@@ -168,7 +158,7 @@ tb_scenario! {
 	spec: ConnectionReuseSpec,
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
-			// Start TLS echo servlet
+			// The TLS echo servlet answers each frame with itself.
 			servlet! {
 				TlsEchoServlet<TestMessage, EnvConfig = ()>,
 				protocol: TokioListener,
@@ -178,7 +168,7 @@ tb_scenario! {
 			}
 
 			let key = SERVER_KEY.to_provider::<Secp256k1>()?;
-			let validators = vec![Arc::new(CLIENT_PINNING) as Arc<dyn CertificateValidation>];
+			let validators = vec![Arc::new(client_pinning()) as Arc<dyn CertificateValidation>];
 			let servlet_conf = ServletConfig::<TokioListener, TestMessage>::builder()
 				.with_certificate(SERVER_CERT, key, validators)?
 				.with_config(Arc::new(()))
@@ -189,15 +179,14 @@ tb_scenario! {
 
 			trace.event(CLIENT_CONNECT)?;
 
-			// Configure client with TLS credentials
+			// The client presents its own certificate and trusts the server's.
 			let key = CLIENT_KEY.to_provider::<Secp256k1>()?;
 			let builder = ClientBuilder::<TokioListener>::builder()
 				.with_trust_store(make_server_trust_store()?)
 				.with_client_identity(SigningIdentity::from_spec(CLIENT_CERT, key)?)
 				.build();
 
-			// Send 3 messages using the same TLS client
-			// (no re-handshake, session reuse)
+			// One TLS client sends all three messages after one handshake.
 			let mut client = builder.connect(addr).await?;
 			for i in 1..=3 {
 				trace.event(SEND_MESSAGE)?;

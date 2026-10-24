@@ -26,23 +26,23 @@
 //! The server Finished is the signer's `SignedData` over the server role and
 //! the transcript hash:
 //!
-//! - It carries the signing certificate in `certificates` (RFC 5652 §5.1).
-//! - The transcript binds that certificate as it was sent and as it arrived,
-//!   as the HPKE transcript binds its own.
+//! - It carries the signing certificate and the issuers above it that the
+//!   server presents in `certificates` (RFC 5652 §5.1).
+//! - The transcript binds that field as it was sent and as it arrived, as the HPKE transcript binds its own.
 //! - Its `SignerInfo` carries the server Finished MAC of both flows as an
 //!   unsigned attribute, which the client verifies before it closes, as the
 //!   HPKE client does.
 //!
 //! The client closes with the closing of both flows, sealed under the closing
 //! key of the handshake secret. The server's key-agreement key opens the base
-//! secret alone, so a recording plus that key reads no byte of the client
-//! identity.
+//! secret alone, so the client identity stays secret from a party that holds
+//! a recording and that key.
 
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, vec::Vec};
 
 use crate::cms::enveloped_data::OriginatorPublicKey;
-use crate::cms::signed_data::SignedData;
+use crate::cms::signed_data::{CertificateSet, SignedData};
 use crate::constants::TIGHTBEAM_OPENING_UKM_LABEL;
 use crate::crypto::cms::{AuthEnvelopedData, Opener, Recipient};
 use crate::crypto::secret::SecretSlice;
@@ -71,7 +71,6 @@ use crate::transport::handshake::{CmsIdentityPair, HandshakeCurve, HandshakeMess
 use crate::transport::wire_der::WireDer;
 use crate::utils::marker::MaybeSendFuture;
 use crate::x509::attr::{Attribute, Attributes};
-use crate::x509::Certificate;
 use crate::zeroize::{Zeroize, Zeroizing};
 
 /// The CMS handshake protocol.
@@ -327,21 +326,21 @@ impl<P: HandshakeProvider> ClientLegs<P> for Cms {
 		let received_artifact = ReceivedAttribute::<Signed<SignedData>>::extract(finished)?;
 		let receipt = received_artifact.map(|received| received.into_parts().0);
 
-		// 3. Find the certificate the Finished's signer names, parsed from the
-		//    bytes it arrived as.
-		let named = CmsSigner::signer_certificate_der(finished, reply.der())?;
-		let (signing, received) = named.ok_or(HandshakeError::MissingServerCertificate)?;
+		// 3. Build the path the Finished's signer presents, parsed from the bytes it arrived as.
+		let presented = CmsSigner::signer_path(finished, reply.der())?;
+		let (signing, certificates) = presented.ok_or(HandshakeError::MissingServerCertificate)?;
 
 		// 4. Append the received encodings and seal the transcript. A tampered
 		//    attribute diverges the hashes and fails the signature (CWE-345),
 		//    and a reordered `SET OF` cannot normalise back to the signed form.
-		//    The certificate binds as it arrived, so one swapped for another
-		//    of the same key fails the signature too (RFC 9846 §4.5.2).
+		//    The `certificates` field binds as it arrived, so a certificate
+		//    swapped for another of the same key or the same subject fails the
+		//    signature too (RFC 9846 §4.5.2).
 		let legs = ServerFinishedLegs {
 			security_accept: security_accept_bytes,
 			transport_accept: transport_accept_bytes,
 			server_ephemeral: server_ephemeral_bytes,
-			certificate: received,
+			certificates,
 		};
 
 		transcript.append_server_finished(legs)?;
@@ -419,9 +418,9 @@ pub struct CmsReplyDraft {
 	security_accept: SecurityAccept,
 	transport_accept: Option<TransportAccept>,
 	server_ephemeral: OriginatorPublicKey,
-	/// The signing certificate the Finished carries, which its `SignerInfo`
-	/// names.
-	certificate: Certificate,
+	/// The certificates the Finished carries: the signing certificate its
+	/// `SignerInfo` names, and the issuers above it that the server presents.
+	certificates: CertificateSet,
 }
 
 impl<P: HandshakeProvider> ServerLegs<P> for Cms {
@@ -502,28 +501,29 @@ impl<P: HandshakeProvider> ServerLegs<P> for Cms {
 		let ephemeral_key = P::VerifyingKey::from(server_ephemeral);
 		let server_ephemeral = (&ephemeral_key).originator_key()?;
 
-		// 2. Append both selections, the ephemeral, and the signing certificate
-		//    the Finished carries, as the DER its identity encoded once. Then
-		//    seal, so the Finished signature binds all four (CWE-345), as
+		// 2. Append both selections, the ephemeral, and the `certificates`
+		//    field the Finished carries, as the DER its identity encoded once.
+		//    Then seal, so the Finished signature binds all four (CWE-345), as
 		//    TLS 1.3 signs over its Certificate.
+		let presented = identity.presented();
 		let legs = ServerFinishedLegs {
 			security_accept: Some(HandshakeAttribute::transcript_bytes(&security_accept)?),
 			transport_accept: transport_accept.map(HandshakeAttribute::transcript_bytes).transpose()?,
 			server_ephemeral: HandshakeAttribute::transcript_bytes(&server_ephemeral)?,
-			certificate: identity.certificate_der(),
+			certificates: presented.field(),
 		};
 		opened.transcript.append_server_finished(legs)?;
 
 		let transcript_hash = opened.transcript.seal::<P::Digest>()?;
 
 		// 3. Draft the Finished's SignerInfo, which names the digest the server
-		//    signs. The Finished carries its own copy of the certificate, since
-		//    a `CertificateSet` owns each certificate it holds.
+		//    signs. The Finished carries its own copy of the certificates,
+		//    since a `CertificateSet` owns each certificate it holds.
 		let finished = FinishedRole::Server.draft::<P>(identity, &transcript_hash)?;
 		let prehash = finished.prehash().to_vec();
 		let transport_accept = transport_accept.copied();
-		let certificate = identity.certificate().clone();
-		let draft = CmsReplyDraft { finished, security_accept, transport_accept, server_ephemeral, certificate };
+		let certificates = presented.set();
+		let draft = CmsReplyDraft { finished, security_accept, transport_accept, server_ephemeral, certificates };
 		Ok(ReplyBinding { transcript_hash, salt: Salt::transcript_hash(), prehash, draft })
 	}
 
@@ -532,7 +532,7 @@ impl<P: HandshakeProvider> ServerLegs<P> for Cms {
 		signature: Vec<u8>,
 		artifact: Option<&Signed<SignedData>>,
 	) -> Result<Signed<SignedData>, HandshakeError> {
-		let CmsReplyDraft { finished, security_accept, transport_accept, server_ephemeral, certificate } = draft;
+		let CmsReplyDraft { finished, security_accept, transport_accept, server_ephemeral, certificates } = draft;
 
 		// The accepts and the ephemeral are advisory as attributes, like TLS
 		// ServerHello extensions before Finished. A tampered one diverges the
@@ -550,7 +550,7 @@ impl<P: HandshakeProvider> ServerLegs<P> for Cms {
 		let encoded: Result<Vec<Attribute>, HandshakeError> = attributes.into_iter().map(Attribute::try_from).collect();
 		let unsigned_attrs = Attributes::try_from(encoded?)?;
 
-		finished.finish(signature, unsigned_attrs, Some(certificate))
+		finished.finish(signature, unsigned_attrs, Some(certificates))
 	}
 }
 
@@ -575,9 +575,8 @@ mod tests {
 	use std::sync::Arc;
 
 	use super::*;
-	use crate::cms::cert::CertificateChoices;
 	use crate::cms::content_info::{CmsVersion, ContentInfo};
-	use crate::cms::signed_data::{CertificateSet, SignerInfo};
+	use crate::cms::signed_data::SignerInfo;
 	use crate::constants::{TIGHTBEAM_CLOSING_KEY_ID_DOMAIN, TIGHTBEAM_SERVER_FINISHED_DOMAIN};
 	use crate::crypto::cms::{EnvelopeError, GcmParameters, KemRecipient, KemRecipientInfo};
 	use crate::crypto::hash::Sha3_256;
@@ -657,7 +656,8 @@ mod tests {
 
 	/// A server Finished signed by `server` over the transcript of `opening`
 	/// followed by the default profile's accept, `ephemeral`, and the
-	/// certificate of `server`, as a server under dealer's choice sends it.
+	/// `certificates` field of `server`, as a server under dealer's choice
+	/// sends it.
 	fn server_finished_over(
 		server: &TestCertificate,
 		opening: &WireDer<AuthEnvelopedData>,
@@ -666,8 +666,8 @@ mod tests {
 		let accept = SecurityAccept::new(create_default_test_profile());
 		let accept_bytes = HandshakeAttribute::transcript_bytes(&accept).expect("an accept has transcript bytes");
 		let ephemeral_bytes = HandshakeAttribute::transcript_bytes(ephemeral).expect("a key has transcript bytes");
-		let certificate = server.certificate.to_der().expect("the certificate encodes");
-		let transcript = [opening.der(), &accept_bytes, &ephemeral_bytes, &certificate].concat();
+		let certificates = certificates_field([server.certificate.to_owned()]);
+		let transcript = [opening.der(), &accept_bytes, &ephemeral_bytes, &certificates].concat();
 		let attrs = unsigned_attrs(vec![attribute(&accept), attribute(ephemeral)]);
 
 		signed_server_finished(server, &transcript, attrs)
@@ -815,18 +815,14 @@ mod tests {
 
 	/// `finished` with `certificate` embedded as its one certificate.
 	fn with_certificate(mut finished: SignedData, certificate: &Certificate) -> SignedData {
-		let embedded = CertificateChoices::Certificate(certificate.to_owned());
-		let certificates = vec![embedded].try_into().expect("one certificate fits a set");
-		finished.certificates = Some(CertificateSet(certificates));
+		finished.certificates = Some(CertificateFixtures::set_of([certificate.to_owned()]));
 		finished
 	}
 
 	/// `finished` with its `certificates` set to `certificates`, which DER
 	/// sorts.
 	fn with_certificates(mut finished: SignedData, certificates: impl IntoIterator<Item = Certificate>) -> SignedData {
-		let embedded: Vec<CertificateChoices> = certificates.into_iter().map(CertificateChoices::Certificate).collect();
-		let certificates = embedded.try_into().expect("distinct certificates fit a set");
-		finished.certificates = Some(CertificateSet(certificates));
+		finished.certificates = Some(CertificateFixtures::set_of(certificates));
 		finished
 	}
 
@@ -834,8 +830,8 @@ mod tests {
 	/// its certificate and carries `confirmation`, as a client with an identity
 	/// builds it before the seal.
 	///
-	/// No client builds it, so a server that reads it is tested against the
-	/// message format alone.
+	/// The fixture builds it outside the client flow, so a server that reads it
+	/// is tested against the message format alone.
 	fn build_test_client_finished(
 		client: &TestCertificate,
 		transcript_hash: &TranscriptHash,
@@ -848,7 +844,8 @@ mod tests {
 
 	/// `finished` with its key-confirmation tag replaced by `confirmation` and
 	/// every other unsigned attribute kept, as a reflecting party would build
-	/// it. The signature covers no unsigned attribute, so it still verifies.
+	/// it. The unsigned attributes sit outside the signature, so it still
+	/// verifies.
 	fn with_confirmation(finished: SignedData, confirmation: &KeyConfirmation) -> SignedData {
 		let signer = finished.signer_infos.0.iter().next().expect("a Finished has one signer");
 		let carried = signer.unsigned_attrs.iter().flat_map(|attrs| attrs.iter());
@@ -863,8 +860,8 @@ mod tests {
 	/// An opening built by hand from the envelope, which seals `base` and a
 	/// fresh agreement key to `server` and authenticates `auth_attrs`.
 	///
-	/// No client builds it, so a server that reads it is tested against the
-	/// message format alone.
+	/// The fixture builds it outside the client flow, so a server that reads it
+	/// is tested against the message format alone.
 	fn build_test_opening(
 		server: &Certificate,
 		base: &[u8],
@@ -1367,8 +1364,8 @@ mod tests {
 		let (mut client, sent) = client_after_opening(&server, None);
 		let ephemeral = fresh_server_ephemeral();
 		let ephemeral_bytes = HandshakeAttribute::transcript_bytes(&ephemeral)?;
-		let certificate = server.signing.certificate.to_der()?;
-		let transcript = [sent.der(), &ephemeral_bytes, &certificate].concat();
+		let certificates = certificates_field([server.signing.certificate.to_owned()]);
+		let transcript = [sent.der(), &ephemeral_bytes, &certificates].concat();
 		let attrs = unsigned_attrs(vec![attribute(&ephemeral)]);
 		let finished = signed_server_finished(&server.signing, &transcript, attrs);
 
@@ -1446,17 +1443,17 @@ mod tests {
 		Ok(())
 	}
 
-	/// A server answers a hand-built opening with a Finished that
-	/// verifies under its static key. Its content is the server role over the
-	/// hash of four legs, in this order:
+	/// A server answers a hand-built opening with a Finished that verifies
+	/// under its static key. Its content is the server role over the hash of
+	/// four legs, in this order:
 	///
 	/// 1. the opening as it was sent,
 	/// 2. the accept,
 	/// 3. the server ephemeral, and
-	/// 4. the signing certificate the Finished carries.
+	/// 4. the `certificates` field the Finished carries.
 	///
-	/// No client reads the Finished, so a server that binds another layout
-	/// fails here even when a client binds the same one.
+	/// The test computes the expected hash by hand, so a server that binds
+	/// another layout fails here even when a client binds the same one.
 	#[tokio::test]
 	async fn a_hand_built_opening_is_answered_with_a_signed_server_finished() -> Result<(), Box<dyn Error>> {
 		let identity = create_test_server();
@@ -1472,8 +1469,8 @@ mod tests {
 		let ephemeral = finished.value().find_unsigned_attr(HANDSHAKE_SERVER_EPHEMERAL)?;
 		let ephemeral = ephemeral.ok_or("the server Finished carries its ephemeral")?;
 		let ephemeral = HandshakeAttribute::transcript_bytes(&ephemeral.decode::<OriginatorPublicKey>()?)?;
-		let certificate = identity.signing.certificate.to_der()?;
-		let expected = Transcript::digest::<Sha3_256>([sent, accept, ephemeral, certificate].concat())?;
+		let certificates = certificates_field([identity.signing.certificate.to_owned()]);
+		let expected = Transcript::digest::<Sha3_256>([sent, accept, ephemeral, certificates].concat())?;
 		let server_content = FinishedRole::Server.content::<Sha3_256>(&expected, &identity.signing.certificate)?;
 		assert_eq!(content, server_content);
 		Ok(())
@@ -1498,9 +1495,9 @@ mod tests {
 		let accept = HandshakeAttribute::transcript_bytes(&SecurityAccept::new(create_default_test_profile()))?;
 		let ephemeral = server_finished.value().find_unsigned_attr(HANDSHAKE_SERVER_EPHEMERAL)?;
 		let ephemeral = ephemeral.ok_or("the server Finished carries its ephemeral")?.received_bytes()?;
-		let certificate = identity.signing.certificate.to_der()?;
+		let certificates = certificates_field([identity.signing.certificate.to_owned()]);
 
-		let expected = Transcript::digest::<Sha3_256>([sent, accept, ephemeral, certificate].concat())?;
+		let expected = Transcript::digest::<Sha3_256>([sent, accept, ephemeral, certificates].concat())?;
 		assert_eq!(signed_transcript(server_finished.value()), expected);
 		Ok(())
 	}
@@ -1741,8 +1738,8 @@ mod tests {
 		Ok(())
 	}
 
-	/// A server Finished that carries no certificate its signer names names
-	/// no server to admit.
+	/// A server Finished without the certificate its signer names is refused,
+	/// because it names no server to admit.
 	#[tokio::test]
 	async fn a_server_finished_without_its_certificate_is_refused() {
 		let (mut client, sent) = replied(&create_test_server()).await;
@@ -1976,9 +1973,9 @@ mod tests {
 		Ok(())
 	}
 
-	/// An opening carrying a duplicate SecurityOffer attribute fails
-	/// closed rather than reading as no offer and falling through to dealer's
-	/// choice, matching the client's fail-closed behaviour.
+	/// An opening that carries a duplicate SecurityOffer attribute fails
+	/// closed, as the client does. Read as no offer, it would fall through to
+	/// dealer's choice.
 	#[tokio::test]
 	async fn a_duplicate_security_offer_fails_closed() -> Result<(), Box<dyn Error>> {
 		let (mut server, server_certificate) = anonymous_server();
@@ -1993,9 +1990,9 @@ mod tests {
 		Ok(())
 	}
 
-	/// An opening carrying a duplicate TransportOffer attribute fails
-	/// closed the same way, rather than reading as no offer and leaving the
-	/// connection single-flight.
+	/// An opening that carries a duplicate TransportOffer attribute fails
+	/// closed the same way. Read as no offer, it would leave the connection
+	/// single-flight.
 	#[tokio::test]
 	async fn a_duplicate_transport_offer_fails_closed() -> Result<(), Box<dyn Error>> {
 		let (mut server, server_certificate) = anonymous_server();
@@ -2125,7 +2122,7 @@ mod tests {
 
 	/// A budget-bearing closing altered in flight fails to open, so it is
 	/// refused ahead of settlement and the observer hears of no outcome. The
-	/// tag and the countersignature both ride inside the sealed Finished, so
+	/// tag and the countersignature both travel inside the sealed Finished, so
 	/// an on-path party can change neither alone.
 	#[tokio::test]
 	async fn an_altered_sealed_finished_settles_nothing() -> Result<(), Box<dyn Error>> {
@@ -2151,6 +2148,29 @@ mod tests {
 		));
 		assert_eq!(server.phase(), HandshakePhase::Spent);
 		assert_eq!(observer.outcomes(), 0);
+		Ok(())
+	}
+
+	/// An honest budget-bearing closing settles, and the observer hears of one
+	/// outcome, so this test is the control for the count of zero after an
+	/// altered closing.
+	#[tokio::test]
+	async fn an_honest_budget_bearing_closing_reports_one_outcome() -> Result<(), Box<dyn Error>> {
+		let Parties { mut client, mut server, .. } = parties::<Cms>(mutual_with(ExpiryValidator));
+		let observer = Arc::new(CountingObserver::default());
+		client.transport_offer = Some(budget_offer());
+		client.receipt_approver = Some(Arc::new(PayingApprover));
+		server.transport = Some(budget_offer());
+		server.transport_authorizer = Some(Arc::new(ChallengingAuthorizer));
+		server.session_observer = Some(observer.to_owned());
+
+		let mut client = Handshake::client(client);
+		let mut server = Handshake::server(server);
+
+		let reply = server.reply(client.start()?).await?;
+		let closing = client.respond(reply).await?;
+		server.finish(closing).await?;
+		assert_eq!(observer.outcomes(), 1);
 		Ok(())
 	}
 
@@ -2215,8 +2235,8 @@ mod tests {
 	/// A sealed client Finished that carries an abort alert beside it is
 	/// refused before the server opens it.
 	///
-	/// The content is sealed under a key the server does not derive, and the
-	/// refusal names the alert, so the alert is read first.
+	/// The content is sealed under a foreign key, and the refusal names the
+	/// alert, so the alert is read first.
 	#[tokio::test]
 	async fn a_client_finished_with_an_abort_alert_is_refused() -> Result<(), Box<dyn Error>> {
 		let client = create_test_certificate();
@@ -2436,8 +2456,8 @@ mod tests {
 	/// ephemeral followed by its base secret.
 	///
 	/// The expected bytes come from an independent ECDH (Python's
-	/// `cryptography`) and HKDF (Python's `hmac` and `hashlib`), so no code of
-	/// the crate computes them.
+	/// `cryptography`) and HKDF (Python's `hmac` and `hashlib`), so they are
+	/// independent of the crate's code.
 	#[test]
 	fn the_cms_handshake_secret_matches_its_known_answer() -> Result<(), Box<dyn Error>> {
 		let ephemeral = SecretKey::<Secp256k1>::from_slice(&[0x03u8; 32])?;
@@ -2493,7 +2513,7 @@ mod tests {
 	}
 
 	/// Write each sample of `emitted` under its name, what opens each
-	/// `KEKRecipientInfo` sample, and the DER of the four certificates, when
+	/// `KEKRecipientInfo` sample, and the DER of the five certificates, when
 	/// the environment asks for interop samples.
 	fn write_samples(emitted: &Emitted) -> std::io::Result<()> {
 		let certificates = [
@@ -2501,6 +2521,7 @@ mod tests {
 			("server-key-agreement-certificate", &emitted.server_key_agreement_certificate),
 			("client-certificate", &emitted.client_certificate),
 			("test-root", &emitted.test_root),
+			("chain-root", &emitted.chain_root),
 		];
 		write_interop_samples(&emitted.samples(), &emitted.kek_openings(), &certificates)
 	}
@@ -2522,8 +2543,7 @@ mod tests {
 
 		let tbs = frame.to_tbs().expect("the frame encodes its TBS");
 		let signer = frame.nonrepudiation().expect("the frame carries its signature").to_owned();
-		let certificate = CertificateChoices::Certificate(identity.certificate().to_owned());
-		let certificates = CertificateSet(vec![certificate].try_into().expect("one certificate is a SET"));
+		let certificates = CertificateFixtures::set_of([identity.certificate().to_owned()]);
 		let signed = CmsSigner::signed_data(SignedContent::data(&tbs), signer, Some(certificates));
 		signed.expect("the frame signature assembles").into_inner()
 	}
@@ -2536,6 +2556,9 @@ mod tests {
 		opening: AuthEnvelopedData,
 		/// The server Finished, the signer's `SignedData`.
 		server_finished: SignedData,
+		/// The server Finished of a server whose signing certificate sits
+		/// under an intermediate, which the Finished carries beside it.
+		chained_finished: SignedData,
 		/// The session receipt the server Finished carries, a `SignedData`.
 		session_receipt: SignedData,
 		/// The sealed client Finished, an `AuthEnvelopedData` with a
@@ -2558,6 +2581,9 @@ mod tests {
 		/// The authority that issued the server's two certificates and the
 		/// client's, the one root OpenSSL verifies the signed samples under.
 		test_root: Certificate,
+		/// The root of the chained server, the one certificate OpenSSL holds
+		/// when it verifies [`Self::chained_finished`].
+		chain_root: Certificate,
 		/// What OpenSSL opens [`Self::sealed_finished`] with.
 		sealed_finished_opening: KekOpening,
 		/// What OpenSSL opens [`Self::kek_seal`] with.
@@ -2567,10 +2593,11 @@ mod tests {
 	impl Emitted {
 		/// Each structure as its interop sample: its file name and the DER of
 		/// its `ContentInfo`.
-		fn samples(&self) -> [(&'static str, Vec<u8>); 7] {
+		fn samples(&self) -> [(&'static str, Vec<u8>); 8] {
 			[
 				("cms-opening", content_info(AUTH_ENVELOPED_DATA, &self.opening)),
 				("server-finished", content_info(SIGNED_DATA, &self.server_finished)),
+				("server-finished-chained", content_info(SIGNED_DATA, &self.chained_finished)),
 				("session-receipt", content_info(SIGNED_DATA, &self.session_receipt)),
 				("sealed-finished", content_info(AUTH_ENVELOPED_DATA, &self.sealed_finished)),
 				("kek-seal", content_info(AUTH_ENVELOPED_DATA, &self.kek_seal)),
@@ -2593,6 +2620,23 @@ mod tests {
 		let subject = RdnSequence::from_str("CN=tightbeam interop client").expect("the name parses");
 		let certificate = server.fixture().issue_signing(&signing_key, subject, 5);
 		TestCertificate { signing_key, certificate }
+	}
+
+	/// The server Finished of a server whose signing certificate sits under an
+	/// intermediate, as a client whose store holds the root alone admits it.
+	async fn chained_finished() -> (SignedData, Certificate) {
+		let chained = ChainedTestServer::fixed();
+		let client = Cms::client(&chained.identity, &create_test_certificate());
+		let server = Cms::server_presenting(&chained.identity, chained.signing_identity());
+
+		let (mut client, mut server) = (Handshake::client(client), Handshake::server(server));
+		let opening = client.start().expect("the client of the chained server opens");
+		let reply = server.reply(opening).await.expect("the chained server replies");
+		let admitted = client.respond(reply.to_owned()).await;
+		admitted.expect("a client of the root alone admits the reply");
+
+		let finished = reply.signed().expect("the reply is a SignedData");
+		(finished.into_value(), chained.identity.authority)
 	}
 
 	/// Run one CMS handshake with a budget, and take one of each structure it
@@ -2642,10 +2686,12 @@ mod tests {
 		let session_receipt = receipt.decode::<Signed<SignedData>>().expect("the receipt is a SignedData");
 		let joined_receipt = observer.artifacts().pop().expect("the server reports its outcome");
 		let opening = opening.auth_enveloped().expect("the opening is an AuthEnvelopedData");
+		let (chained_finished, chain_root) = chained_finished().await;
 
 		Emitted {
 			opening: opening.value().to_owned(),
 			server_finished: reply.value().to_owned(),
+			chained_finished,
 			session_receipt: session_receipt.into_inner(),
 			sealed_finished,
 			kek_seal,
@@ -2655,6 +2701,7 @@ mod tests {
 			server_key_agreement_certificate: server_identity.key_agreement.certificate,
 			client_certificate: client_identity.certificate,
 			test_root: server_identity.authority,
+			chain_root,
 			sealed_finished_opening,
 			kek_seal_opening,
 		}
@@ -2670,6 +2717,12 @@ mod tests {
 	async fn the_server_finished_decodes_back_from_its_content_info() {
 		let emitted = emitted().await;
 		assert!(decodes_back(SIGNED_DATA, &emitted.server_finished));
+	}
+
+	#[tokio::test]
+	async fn the_chained_server_finished_decodes_back_from_its_content_info() {
+		let emitted = emitted().await;
+		assert!(decodes_back(SIGNED_DATA, &emitted.chained_finished));
 	}
 
 	#[tokio::test]

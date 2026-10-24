@@ -1,6 +1,6 @@
 #!/bin/bash
-# CMS interop check: OpenSSL parses, verifies, or decrypts every CMS sample
-# the crate emits, with no tightbeam code in the loop.
+# CMS interop check: OpenSSL alone parses, verifies, or decrypts every CMS
+# sample the crate emits.
 #
 # `make interop` runs both steps:
 #
@@ -9,27 +9,31 @@
 #   scripts/cms-interop.sh [sample-dir]
 #
 # The test writes one ContentInfo per structure to target/cms-samples/, the
-# four certificates the samples name, and the KEK, kekid, and plaintext of
+# five certificates the samples name, and the KEK, kekid, and plaintext of
 # each sample sealed under a KEK. OPENSSL names the binary to run.
 #
 # Each check prints one line:
 #
 # - Certificate: it parses, and its keyUsage carries the bit of its one use.
 # - Opening: its KEMRecipientInfo rid is the key-agreement certificate's subjectKeyIdentifier.
-# - SignedData: `cms -verify` with no -certfile. The Finished and both receipts also chain to test-root.
+# - SignedData: it verifies under `cms -verify` with no -certfile. The Finished
+#   and both receipts also chain to test-root.
+# - Chained Finished: it chains to chain-root, the one certificate OpenSSL
+#   holds, through the intermediate it carries.
 # - AuthEnvelopedData under a KEK: `cms -decrypt` recovers the expected plaintext.
-# - KEMRecipientInfo: parse only, because OpenSSL has no DHKEM over secp256k1.
+# - KEMRecipientInfo: OpenSSL only parses it, because it has no DHKEM over secp256k1.
 # - CompressedData: its encapContentInfo declares id-data (RFC 3274 section 1.1).
 #
 # OpenSSL deviates from the RFCs in three ways, and the script counts each
 # apart from a failure:
 #
-# - It reads authAttrs under [2] and unauthAttrs under [3] (cms_asn1.c), where RFC 5083 section 2.1
-#   writes [1] and [2]. The script parses a retagged copy.
-# - It feeds no authAttrs to the cipher as AAD (cms_env.c, cms_enc.c), against RFC 5083 section 2.2,
-#   so it recovers the plaintext and then refuses the tag.
-# - OpenSSL 3.0 cannot verify an ecdsa-with-SHA3-256 certificate signature. A self-signed probe
-#   decides: when it fails, the chained samples verify without the chain, and their lines say so.
+# - It reads authAttrs under [2] and unauthAttrs under [3] (cms_asn1.c), where
+#   RFC 5083 section 2.1 writes [1] and [2]. The script parses a retagged copy.
+# - It feeds no authAttrs to the cipher as AAD (cms_env.c, cms_enc.c), against
+#   RFC 5083 section 2.2, so it recovers the plaintext and then refuses the tag.
+# - OpenSSL 3.0 cannot verify an ecdsa-with-SHA3-256 certificate signature. A
+#   self-signed probe decides: when it fails, the chained samples verify
+#   without the chain, and their lines say so.
 #
 # The script exits non-zero on any FAILED line, a missing sample, or a probe
 # certificate that fails to generate.
@@ -58,26 +62,28 @@ if [ "${#samples[@]}" -eq 0 ]; then
 	exit 1
 fi
 
-# Each structure the handshake, the session, and a frame emit, so a writer
-# that stops emitting one fails the run.
+# The array lists each structure that the handshake, the session, and a frame
+# emit, so a writer that stops emitting one fails the run.
 required=(
-	cms-opening server-finished session-receipt sealed-finished kek-seal frame-signature joined-receipt
-	hpke-hello hpke-reply hpke-closing
+	cms-opening server-finished server-finished-chained session-receipt sealed-finished kek-seal frame-signature
+	joined-receipt hpke-hello hpke-reply hpke-closing
 	record frame-kem compressed-data
 )
 
-# Each certificate the samples name, beside the keyUsage bit of its use as
-# OpenSSL prints it.
+# The array pairs each certificate the samples name with the keyUsage bit of
+# its use, as OpenSSL prints it.
 certificates=(
 	"server-certificate:Digital Signature"
 	"server-key-agreement-certificate:Key Agreement"
 	"client-certificate:Digital Signature"
 	"test-root:Certificate Sign"
+	"chain-root:Certificate Sign"
 )
 
-# Each SignedData sample whose signers' certificates the test root issued,
-# which the sample carries in its certificates.
-anchored=(server-finished session-receipt joined-receipt)
+# The array lists each SignedData sample whose signers' certificates chain to a
+# root outside the sample. The chained Finished carries the intermediate
+# between its signer and chain-root.
+anchored=(server-finished session-receipt joined-receipt server-finished-chained)
 
 absent=0
 for name in "${required[@]}"; do
@@ -101,10 +107,21 @@ trap 'rm -rf "$scratch"' EXIT
 
 root_pem="$scratch/test-root.pem"
 "$OPENSSL" x509 -inform DER -in "$SAMPLE_DIR/test-root.crt" -out "$root_pem"
+chain_root_pem="$scratch/chain-root.pem"
+"$OPENSSL" x509 -inform DER -in "$SAMPLE_DIR/chain-root.crt" -out "$chain_root_pem"
 
-# The probe: a self-signed secp256k1 authority this OpenSSL generates under
-# ecdsa-with-SHA3-256, verified against itself. It reads no sample, so a
-# defect of the test root fails the run whenever the probe passes.
+# Print the root an anchored sample chains to.
+anchor_of() {
+	case "$1" in
+		server-finished-chained) printf '%s' "$chain_root_pem" ;;
+		*) printf '%s' "$root_pem" ;;
+	esac
+}
+
+# The probe is a self-signed secp256k1 authority that this OpenSSL generates
+# under ecdsa-with-SHA3-256 and verifies against itself. It is independent of
+# the samples, so a defect of the test root fails the run whenever the probe
+# passes.
 probe_key="$scratch/probe.key"
 probe_pem="$scratch/probe.pem"
 probe="OpenSSL refuses a self-signed secp256k1 probe certificate under ecdsa-with-SHA3-256"
@@ -133,8 +150,8 @@ key_identifier() {
 # Print the rid of the KEMRecipientInfo in the opening sample `$1`, as
 # lowercase hex, when it is the [0] subjectKeyIdentifier form (RFC 9629
 # section 3, RFC 5652 section 6.2.1). The KEMRecipientInfo is the value that
-# follows the id-ori-kem OID. The parse is re-rooted there, and the rid is
-# its second field.
+# follows the id-ori-kem OID. The function re-roots the parse there, and the
+# rid is its second field.
 opening_rid() {
 	local sample="$1" recipient="$scratch/kem-recipient-info.der" offset field header length
 	offset="$("$OPENSSL" asn1parse -inform DER -in "$sample" | awk '
@@ -159,17 +176,17 @@ summary() {
 }
 
 # Verify a SignedData sample under the certificates it carries alone. A
-# sample of `anchored` also verifies each signer's chain to the test root,
-# and any other skips the chain.
+# sample of `anchored` also verifies each signer's chain to the root that
+# `anchor_of` names, and any other skips the chain.
 verify() {
 	local sample="$1" name
 	name="$(basename "$sample" .der)"
 	if printf '%s\n' "${anchored[@]}" | grep -qx "$name" && [ "$chains" -eq 1 ]; then
-		if "$OPENSSL" cms -verify -inform DER -in "$sample" -CAfile "$root_pem" -binary \
+		if "$OPENSSL" cms -verify -inform DER -in "$sample" -CAfile "$(anchor_of "$name")" -binary \
 			-out /dev/null > /dev/null 2>&1; then
-			echo "cms -verify ok under the certificates it carries, chained to test-root"
+			echo "cms -verify ok under the certificates it carries, chained to $(basename "$(anchor_of "$name")" .pem)"
 		else
-			echo "cms -verify under the certificates it carries, chained to test-root FAILED"
+			echo "cms -verify under the certificates it carries, chained to $(basename "$(anchor_of "$name")" .pem) FAILED"
 		fi
 	elif printf '%s\n' "${anchored[@]}" | grep -qx "$name"; then
 		if "$OPENSSL" cms -verify -inform DER -in "$sample" -noverify -binary -out /dev/null > /dev/null 2>&1; then

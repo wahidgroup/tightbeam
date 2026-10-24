@@ -2,12 +2,11 @@
 //!
 //! - `servlet!` builds [`crate::colony::servlet::ServletHandlers`] and calls [`ServletRuntime::start`].
 //! - A [`ServletService`] written without the macro uses the same entry point.
-//! - Address bytes are encoded once at start and shared as [`Arc<[u8]>`].
-//! - Callers borrow [`addr`](ServletRuntime::addr) instead of cloning it.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use crate::cms::signed_data::SignerIdentifier;
 use crate::colony::hive::{HiveContext, ServletBox};
 use crate::colony::servlet::serve::ContextService;
 use crate::colony::servlet::{RuntimeServletConf, Servlet, ServletConfig, ServletContext, ServletService, WorkerBox};
@@ -33,6 +32,9 @@ use crate::transport::EncryptedProtocol;
 /// The config fields [`ServletRuntime::start`] needs after the listener
 /// binds.
 pub(crate) struct ServletRuntimeParts<Env> {
+	/// The signer of the certificate the listener presents, [`None`] in the
+	/// clear.
+	pub(crate) signer: Option<SignerIdentifier>,
 	pub(crate) env_config: Arc<Env>,
 	pub(crate) collector_gates: Vec<Arc<dyn GatePolicy + Send + Sync>>,
 	pub(crate) mux_offer: Option<Arc<TransportOffer>>,
@@ -52,6 +54,8 @@ pub struct ServletRuntime<P: Protocol> {
 	server_handle: Option<rt::JoinHandle>,
 	addr: P::Address,
 	addr_bytes: Arc<[u8]>,
+	/// The signer of the certificate the listener presents, recorded at start.
+	signer: Option<SignerIdentifier>,
 	trace_handle: Arc<Mutex<Arc<TraceCollector>>>,
 }
 
@@ -100,6 +104,7 @@ where
 		Env: Send + Sync + 'static,
 	{
 		let ServletRuntimeParts {
+			signer,
 			env_config,
 			collector_gates,
 			mux_offer,
@@ -142,7 +147,7 @@ where
 		let addr_bytes: Arc<[u8]> = Arc::from(addr.clone().into());
 		let trace_handle = Arc::new(Mutex::new(trace));
 
-		let runtime = Self { server_handle: Some(server_handle), addr, addr_bytes, trace_handle };
+		let runtime = Self { server_handle: Some(server_handle), addr, addr_bytes, signer, trace_handle };
 		Ok(runtime)
 	}
 }
@@ -204,6 +209,10 @@ where
 
 	fn stop_boxed(self: Box<Self>) {
 		(*self).stop();
+	}
+
+	fn signer(&self) -> Option<&SignerIdentifier> {
+		self.signer.as_ref()
 	}
 }
 

@@ -40,6 +40,8 @@ pub use crate::frame::Signed;
 
 mod error;
 mod identity;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+mod path;
 mod signer;
 
 pub use error::SignerError;
@@ -47,6 +49,8 @@ pub use identity::{CertifiedKey, SigningIdentity};
 pub(crate) use signer::SignerSeal;
 pub use signer::{CmsSigner, SignedContent, SignerInfoDraft};
 
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+pub(crate) use path::{PresentedCertificates, PresentedIssuers, PresentedPath};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub(crate) use signer::CertifiedSigner;
 #[cfg(test)]

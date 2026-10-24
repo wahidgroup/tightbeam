@@ -221,6 +221,7 @@ zeroize = [
 	"aes?/zeroize",
 	"ghash?/zeroize",
 	"polyval?/zeroize",
+	"sha3?/zeroize",
 ]
 
 aes-gcm = ["crypto", "dep:aes-gcm", "dep:aes", "dep:ghash", "dep:polyval", "cms/aes"]

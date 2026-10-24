@@ -63,8 +63,7 @@ pub const TIGHTBEAM_CLOSING_KEY_ID_DOMAIN: &[u8] = b"tb/handshake/closing/kekid/
 ///
 /// # Sources
 ///
-/// - RFC 9846 § 4.5.3, a Finished key per role:
-///   <https://datatracker.ietf.org/doc/html/rfc9846#section-4.5.3>
+/// - RFC 9846 § 4.5.3, a Finished key per role: <https://datatracker.ietf.org/doc/html/rfc9846#section-4.5.3>
 pub const TIGHTBEAM_CLIENT_FINISHED_KEY_INFO: &[u8] = b"tb/handshake/finished/client/mac/v1";
 
 /// HKDF-Expand label of the `MacKey` of the server Finished, which the reply
@@ -620,10 +619,26 @@ pub const DEFAULT_HANDSHAKE_TIMEOUT: core::time::Duration = core::time::Duration
 ///   <https://cwe.mitre.org/data/definitions/770.html>
 pub const DEFAULT_HANDSHAKE_MAX_WIRE: usize = 16 * 1024;
 
+/// Ceiling on the certificates a signer presents in the `certificates` of one
+/// `SignedData`: its signing certificate and the issuers above it.
+///
+/// A reply, and the client Finished of a mutual client, carry the path of the
+/// signing certificate below the trust anchor of the peer (RFC 5652 §5.1). A
+/// reader refuses a larger set before it walks a path or checks a signature,
+/// so an unauthenticated peer cannot make it build a long path.
+///
+/// # Sources
+///
+/// - RFC 5652 §5.1, the `certificates` of a `SignedData`:
+///   <https://datatracker.ietf.org/doc/html/rfc5652#section-5.1>
+/// - CWE-770, allocation of resources without limits or throttling:
+///   <https://cwe.mitre.org/data/definitions/770.html>
+pub const MAX_PRESENTED_PATH: usize = 8;
+
 /// Default ceiling for decompressed message bodies (16 MiB).
 ///
 /// Compressed frame bodies arrive under the transport's envelope ceiling, and
-/// zstd can expand a small input by several orders of magnitude. Capping the
+/// zstd can inflate a body under that ceiling past this one. Capping the
 /// inflated size bounds the memory an attacker can force with a
 /// decompression bomb.
 ///
@@ -650,9 +665,9 @@ pub const MAX_MUX_REASSEMBLY_BYTES: usize = DEFAULT_MAX_DECOMPRESSED_LEN;
 ///
 /// [`MAX_MUX_REASSEMBLY_BYTES`] bounds a single stream. A peer that opens many
 /// streams multiplies it, so the connection carries this ceiling as well and
-/// every stream charges against it. A connection legitimately reassembling
-/// several streams at once stays inside four stream ceilings. Beyond that the
-/// peer spends this endpoint's memory without making progress.
+/// every stream charges against it. A connection that legitimately
+/// reassembles concurrent streams stays inside four stream ceilings. Beyond
+/// that, the peer spends this endpoint's memory and makes no progress.
 ///
 /// # Sources
 ///

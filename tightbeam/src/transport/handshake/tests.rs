@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 use rand_core::{CryptoRng, RngCore};
 
 use crate::asn1::OctetString;
+use crate::cms::cert::CertificateChoices;
 use crate::cms::content_info::ContentInfo as ContentInfoValue;
 use crate::cms::signed_data::SignedData;
 use crate::cms::signed_data::SignerIdentifier;
@@ -40,7 +41,7 @@ use crate::crypto::sign::ecdsa::k256::{Secp256k1, SecretKey};
 use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
 use crate::crypto::sign::elliptic_curve::sec1::ToEncodedPoint;
 use crate::crypto::sign::elliptic_curve::PublicKey;
-use crate::crypto::sign::{CmsSigner, Signed, SignedContent, SigningIdentity};
+use crate::crypto::sign::{CanonicalSigner, CmsSigner, Signed, SignedContent, SigningIdentity};
 use crate::crypto::x509::attr::{Attribute, Attributes};
 use crate::crypto::x509::error::CertificateValidationError;
 use crate::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
@@ -51,12 +52,13 @@ use crate::crypto::x509::utils::Skid;
 use crate::crypto::x509::{ErasedSigning, KeyPurposes, PeerCertificate};
 use crate::der::asn1::BitString;
 use crate::der::asn1::GeneralizedTime;
-use crate::der::asn1::{Any as AnyValue, ObjectIdentifier, PrintableString, SetOfVec};
+use crate::der::asn1::{Any as AnyValue, ContextSpecificRef, ObjectIdentifier, PrintableString, SetOfVec};
 use crate::der::oid::AssociatedOid;
-use crate::der::{Decode, Encode, EncodeValue, Tagged};
+use crate::der::{Decode, Encode, EncodeValue, TagMode, TagNumber, Tagged};
 use crate::oids::{AES_256_WRAP, DATA, HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA256, SIGNER_ECDSA_WITH_SHA3_256};
 use crate::random::{generate_nonce, OsRng};
 use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey, SubjectPublicKeyInfoOwned};
+pub use crate::testing::fixtures::{TestCertificate as CertificateFixtures, TestCertificateChain};
 use crate::testing::{TestCmsServer, TestIdentity};
 use crate::transport::handshake::flow::ClientFlow;
 use crate::transport::handshake::negotiation::{
@@ -128,7 +130,8 @@ pub fn create_default_test_profile() -> SecurityProfileDesc {
 	RunnableProfile::<DefaultCryptoProvider>::native().descriptor()
 }
 
-/// Test certificate data, so every test creates certificates the same way.
+/// A test certificate beside its signing key, so every test creates
+/// certificates the same way.
 #[derive(Debug, Clone)]
 pub struct TestCertificate {
 	/// The signing key whose public key the certificate carries.
@@ -294,6 +297,95 @@ impl From<TestCmsServer> for TestServerIdentity {
 	}
 }
 
+/// A test server whose signing certificate sits under an intermediate, which
+/// the server presents beside it.
+///
+/// The root of the fixed test chain issued the intermediate, which issued the
+/// signing certificate, and the root issued the key-agreement certificate of
+/// the same subject. A store that holds the root alone admits both once the
+/// reply presents the intermediate.
+pub struct ChainedTestServer {
+	/// The identity, whose authority is the root of the chain.
+	pub identity: TestServerIdentity,
+	/// The intermediate that issued the signing certificate.
+	pub intermediate: Certificate,
+}
+
+impl ChainedTestServer {
+	/// The server of the fixed test chain, with a fresh key-agreement key.
+	pub fn fixed() -> Self {
+		let chain = CertificateFixtures::insecure_fixed_chain().expect("the fixed test chain issues");
+		let TestCertificateChain { root, intermediate, leaf, root_key, leaf_key, .. } = chain;
+		let key_agreement_key = create_test_signing_key();
+		let usage = KeyUsage(KeyUsages::KeyAgreement.into());
+		let key_agreement = CertificateFixtures::issued(&root_key, "Root", &key_agreement_key, "Leaf", 4, usage);
+		let key_agreement = key_agreement.expect("the root issues the key-agreement certificate");
+
+		let signing = TestCertificate { signing_key: leaf_key, certificate: leaf };
+		let key_agreement = TestCertificate { signing_key: key_agreement_key, certificate: key_agreement };
+		let identity = TestServerIdentity { signing, key_agreement, authority: root, authority_key: root_key };
+		Self { identity, intermediate }
+	}
+
+	/// The signing identity of the server, which presents the intermediate.
+	pub fn signing_identity(&self) -> SigningIdentity {
+		let identity = signing_identity(&self.identity.signing).with_chain([self.intermediate.to_owned()]);
+		identity.expect("the intermediate issued the signing certificate")
+	}
+
+	/// The intermediate that the root issues again under another serial
+	/// number. It has the subject and the key of the intermediate, so it
+	/// validates where the intermediate does.
+	pub fn intermediate_twin(&self) -> Certificate {
+		reissued(&self.intermediate, &self.identity.authority_key, 9)
+	}
+}
+
+/// The DER of the `certificates` field of a `SignedData` that holds
+/// `certificates`, the bytes a handshake transcript binds.
+pub fn certificates_field(certificates: impl IntoIterator<Item = Certificate>) -> Vec<u8> {
+	let choices: Vec<CertificateChoices> = certificates.into_iter().map(CertificateChoices::Certificate).collect();
+	let set = SetOfVec::try_from(choices).expect("distinct certificates are a SET");
+	let field = ContextSpecificRef { tag_number: TagNumber::N0, tag_mode: TagMode::Implicit, value: &set };
+	field.to_der().expect("the field encodes")
+}
+
+/// `certificate` signed again by `issuer_key` under `serial`, with its
+/// subject, its key, and its extensions unchanged.
+pub fn reissued(certificate: &Certificate, issuer_key: &Secp256k1SigningKey, serial: u8) -> Certificate {
+	let mut tbs_certificate = certificate.tbs_certificate.to_owned();
+	tbs_certificate.serial_number = SerialNumber::new(&[serial]).expect("a test serial number encodes");
+	let message = tbs_certificate.to_der().expect("a test certificate encodes");
+	let signature: Secp256k1Signature = issuer_key.sign_canonical::<Sha3_256>(message).expect("the issuer key signs");
+	let signature = BitString::from_bytes(signature.as_bytes()).expect("a signature is a BIT STRING");
+	let signature_algorithm = certificate.signature_algorithm.to_owned();
+	Certificate { tbs_certificate, signature, signature_algorithm }
+}
+
+/// `reply` with `certificates` in place of the set it carries. No signature
+/// covers the set, so only the transcript tells the two apart.
+pub fn with_presented(
+	reply: &HandshakeMessage,
+	certificates: impl IntoIterator<Item = Certificate>,
+) -> HandshakeMessage {
+	let signed_data = reply.to_owned().signed().expect("a reply travels in a SignedData");
+	let mut signed_data = signed_data.into_value();
+	signed_data.certificates = Some(CertificateFixtures::set_of(certificates));
+	HandshakeMessage::try_from(signed_data).expect("the reply encodes")
+}
+
+/// The certificates `reply` carries, in the order its SET holds them.
+pub fn presented_certificates(reply: &HandshakeMessage) -> Vec<Certificate> {
+	let signed_data = reply.to_owned().signed().expect("a reply travels in a SignedData");
+	let certificates = signed_data.into_value().certificates;
+	let choices = certificates.map(|set| set.0.into_vec()).unwrap_or_default();
+	let certificate = |choice| match choice {
+		CertificateChoices::Certificate(certificate) => Some(certificate),
+		CertificateChoices::Other(_) => None,
+	};
+	choices.into_iter().filter_map(certificate).collect()
+}
+
 /// A test certificate whose validity period ended one second after the epoch.
 pub fn create_expired_test_certificate() -> TestCertificate {
 	let mut expired = create_test_certificate();
@@ -332,7 +424,7 @@ pub fn create_issued_test_certificate(serial: impl AsRef<[u8]>) -> TestCertifica
 /// Create a self-signed certificate whose public key matches `signing_key`.
 ///
 /// It carries the `subjectKeyIdentifier` of RFC 7093 §2 method 1, as every
-/// certificate the crate mints does, so a CMS signer names it by that value.
+/// certificate the crate creates does, so a CMS signer names it by that value.
 fn create_test_certificate_inner(signing_key: &Secp256k1SigningKey) -> Result<Certificate, Box<dyn Error>> {
 	let verifying_key = *signing_key.verifying_key();
 	let public_key_der = verifying_key.to_public_key_der()?;
@@ -415,7 +507,7 @@ pub fn put_off_curve_key(certificate: &mut Certificate) {
 	certificate.tbs_certificate.subject_public_key_info.subject_public_key = off_curve;
 }
 
-/// Whether `needle` appears anywhere inside `haystack`.
+/// Reports whether `needle` appears anywhere inside `haystack`.
 pub fn contains_window(haystack: impl AsRef<[u8]>, needle: impl AsRef<[u8]>) -> bool {
 	let needle = needle.as_ref();
 	haystack.as_ref().windows(needle.len()).any(|window| window == needle)
@@ -502,7 +594,7 @@ pub fn fixture_confirmation() -> KeyConfirmation {
 	derived.expect("a fixture secret derives a tag")
 }
 
-/// What a hand-built closing confirms, as a client reads it from the reply.
+/// The values a hand-built closing confirms, which a client reads in the reply.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 #[derive(Clone)]
 pub struct Confirming {
@@ -555,7 +647,7 @@ impl Confirming {
 pub struct CountingObserver(AtomicUsize);
 
 impl CountingObserver {
-	/// How many outcomes the server reported.
+	/// Returns how many outcomes the server reported.
 	pub fn outcomes(&self) -> usize {
 		self.0.load(Ordering::SeqCst)
 	}
@@ -837,7 +929,7 @@ impl CountingProvider {
 		Self { inner: into_provider(signing_key), public_keys: AtomicUsize::new(0) }
 	}
 
-	/// How many public keys this provider handed out.
+	/// Returns how many public keys this provider handed out.
 	pub fn public_keys(&self) -> usize {
 		self.public_keys.load(Ordering::SeqCst)
 	}
@@ -1082,10 +1174,10 @@ pub fn signed_handshake(reply: &HandshakeMessage) -> ServerHandshake {
 	ServerHandshake::from_der(content).expect("the content is a ServerHandshake")
 }
 
-/// What an observer who holds the server's static key recovers from a
-/// recorded handshake.
+/// The material that an observer who holds the server's static key recovers
+/// from a recorded handshake.
 pub struct Recovered {
-	/// The observer, holding the static key and everything it opened.
+	/// The observer, which holds the static key and everything it opened.
 	pub observer: StaticKeyObserver,
 	/// The base secret the static key opened, when the flow seals one to it.
 	/// The HPKE flow seals nothing to the server, so for HPKE it is `None`.
@@ -1118,7 +1210,14 @@ pub trait TestFlow: ClientFlow<DefaultCryptoProvider> + ServerFlow<DefaultCrypto
 
 	/// The configuration of a server that holds `identity`, demands no client
 	/// certificate, and runs the default test profile.
-	fn server(identity: &TestServerIdentity) -> TestServerConfig<Self>;
+	fn server(identity: &TestServerIdentity) -> TestServerConfig<Self> {
+		Self::server_presenting(identity, signing_identity(&identity.signing))
+	}
+
+	/// The configuration of a server that holds `identity` and signs under
+	/// `signing`, demands no client certificate, and runs the default test
+	/// profile.
+	fn server_presenting(identity: &TestServerIdentity, signing: SigningIdentity) -> TestServerConfig<Self>;
 
 	/// Open the recorded legs of `run` with the static keys of
 	/// `server_identity`, through the same path the server runs.
@@ -1146,8 +1245,10 @@ impl TestFlow for Hpke {
 		hpke_client(&server.signing.certificate, Some(identity))
 	}
 
-	fn server(identity: &TestServerIdentity) -> TestServerConfig<Self> {
-		hpke_server(&identity.signing)
+	fn server_presenting(_identity: &TestServerIdentity, signing: SigningIdentity) -> TestServerConfig<Self> {
+		let profiles = SupportedProfiles::from(create_default_test_profile());
+		let config = ServerConfig::new(HpkeServerSettings::new(), signing, profiles, KeyPurposes::HOUSE);
+		config.expect("a test server identity serves the server role")
 	}
 
 	/// The HPKE flow seals nothing to the server, so the static key opens no
@@ -1177,9 +1278,11 @@ impl TestFlow for Cms {
 		config.expect("a test client identity serves the client role")
 	}
 
-	fn server(identity: &TestServerIdentity) -> TestServerConfig<Self> {
+	fn server_presenting(identity: &TestServerIdentity, signing: SigningIdentity) -> TestServerConfig<Self> {
 		let profiles = SupportedProfiles::from(create_default_test_profile());
-		let config = ServerConfig::new(CmsServerSettings, identity.pair(), profiles, KeyPurposes::HOUSE);
+		let pair = CmsIdentityPair::new(signing, identity.key_agreement_identity());
+		let pair = pair.expect("the two test certificates name one subject with two keys");
+		let config = ServerConfig::new(CmsServerSettings, pair, profiles, KeyPurposes::HOUSE);
 		config.expect("a test server pair serves the server role")
 	}
 
@@ -1345,16 +1448,16 @@ pub struct KekOpening {
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl KekOpening {
-	/// What opens the seal `sealer` makes for `purpose` over `plaintext`,
-	/// whose frame is the plaintext a reader recovers.
+	/// Collects what opens the seal that `sealer` makes for `purpose` over
+	/// `plaintext`, whose frame is the plaintext a reader recovers.
 	pub fn of(sealer: &Sealer<DefaultCryptoProvider>, purpose: SecretSeal, plaintext: &[u8]) -> Self {
 		let (kek, key_identifier) = sealer.kek_opening();
 		let framed = purpose.frame(plaintext).expect("the plaintext fits its frame");
 		Self { kek, key_identifier, plaintext: framed.to_vec() }
 	}
 
-	/// What opens a seal under `kek`, which `key_identifier` names, over
-	/// `plaintext`.
+	/// Collects what opens a seal under `kek`, which `key_identifier` names,
+	/// over `plaintext`.
 	pub fn new(kek: impl Into<Vec<u8>>, key_identifier: impl Into<Vec<u8>>, plaintext: impl Into<Vec<u8>>) -> Self {
 		Self {
 			kek: kek.into(),

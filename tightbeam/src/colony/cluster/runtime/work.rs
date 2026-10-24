@@ -1,19 +1,15 @@
 //! Work routing selects a route, forwards the payload, and updates the
 //! pheromone scores.
 
-use core::hash::Hash;
-use core::str::FromStr;
 use std::sync::Arc;
 
-use crate::colony::cluster::runtime::bounds::ClusterPool;
-use crate::colony::cluster::runtime::bounds::GatewayRuntimeCtx;
-use crate::colony::cluster::runtime::hop::{Hop, PeerPlane};
+use crate::colony::cluster::runtime::bounds::{ColonyDialProtocol, GatewayRuntimeCtx};
+use crate::colony::cluster::runtime::hop::{HivePlane, Hop, PeerPlane};
 use crate::colony::cluster::servlet_registry::RoutePlane;
 use crate::colony::cluster::{
-	ClusterConfig, ClusterError, ClusterWorkResponse, DialTarget, HopBudget, RouteKind, ServletRegistry,
+	ClusterConfig, ClusterError, ClusterWorkResponse, DialTarget, HopBudget, RouteKind, ServletEntry, ServletRegistry,
 };
 use crate::colony::common::{reply_frame, ClusterRequest, ClusterWorkRequest, ServletTypeKey};
-use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::decode;
 use crate::encode;
 use crate::instrumentation::events::{
@@ -21,11 +17,8 @@ use crate::instrumentation::events::{
 };
 use crate::policy::TransitStatus;
 use crate::trace::TraceCollector;
-use crate::transport::messaging::{MessageCollector, MessageEmitter};
-use crate::transport::multiplex::MuxConnector;
-use crate::transport::policy::PolicyConfig;
-use crate::transport::state::EncryptedProtocolState;
-use crate::transport::{EncryptedProtocol, PersistentConnection, Protocol};
+use crate::transport::multiplex::StreamRoute;
+use crate::transport::Protocol;
 use crate::urn::Urn;
 use crate::{Frame, TightBeamError};
 
@@ -41,29 +34,122 @@ pub(crate) struct RouteChoice {
 }
 
 impl RouteChoice {
-	/// Whether the route forwards to a peer gateway.
-	pub(crate) fn is_peer(&self) -> bool {
-		matches!(self.plane, RoutePlane::Peer { .. })
+	/// The choice that forwards through `entry`.
+	pub(crate) fn of(entry: &ServletEntry) -> Self {
+		Self {
+			route_key: Arc::clone(entry.route_key()),
+			dial: entry.dial_target().clone(),
+			plane: entry.plane(),
+		}
 	}
 
-	/// The hop this route dials: on `hive` for a local route, and on `peers`
-	/// for a peer route, bound to the gateway the route names.
+	/// Whether the route forwards to a peer gateway.
+	pub(crate) fn is_peer(&self) -> bool {
+		self.plane.is_peer()
+	}
+
+	/// The hop this route dials, on the plane [`RoutePlane::hop`] names.
 	///
 	/// # Errors
 	///
-	/// - [`ClusterError::ConnectFailed`] -- a peer route with no peer plane configured.
+	/// - Every error of [`RoutePlane::hop`].
 	pub(crate) fn hop<'p, P: Protocol>(
 		&'p self,
-		hive: &'p Arc<ClusterPool<P>>,
+		hive: &'p HivePlane<P>,
 		peers: Option<&'p PeerPlane<P>>,
 	) -> Result<Hop<'p, P>, ClusterError> {
 		let dial = self.dial.clone();
-		match &self.plane {
-			RoutePlane::Hive => Ok(Hop::new(hive, dial)),
-			RoutePlane::Peer { gateway_id } => {
+		self.plane.hop(dial, hive, peers)
+	}
+}
+
+impl RoutePlane {
+	/// Whether this plane forwards to a peer gateway.
+	pub(crate) fn is_peer(&self) -> bool {
+		matches!(self, Self::Peer { .. })
+	}
+
+	/// The hop that dials `dial` on this plane: on `hive` bound to the signer
+	/// a servlet's registration names, or on `peers` bound to the gateway a
+	/// peer route names.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::ConnectFailed`] -- a peer route meets a gateway with no peer plane.
+	pub(crate) fn hop<'p, P: Protocol>(
+		&'p self,
+		dial: DialTarget,
+		hive: &'p HivePlane<P>,
+		peers: Option<&'p PeerPlane<P>>,
+	) -> Result<Hop<'p, P>, ClusterError> {
+		match self {
+			Self::Hive { signer } => Ok(hive.servlet(dial, Arc::clone(signer))),
+			Self::Peer { gateway_id } => {
 				let peers = peers.ok_or(ClusterError::ConnectFailed)?;
 				Ok(peers.hop(dial, gateway_id))
 			}
+		}
+	}
+
+	/// Delivers one forward on `hop`, a hop of this plane, and returns the
+	/// bytes that answered it.
+	///
+	/// - A local servlet receives the client's frame on the hive trust plane:
+	///   the frame `frame_cache` holds, or the decode of `payload`.
+	/// - A peer gateway receives `payload` as a Work envelope with `budget`
+	///   decremented, on the peer trust plane.
+	async fn deliver<P: ColonyDialProtocol>(
+		&self,
+		hop: Hop<'_, P>,
+		servlet_type: &Urn<'static>,
+		payload: Vec<u8>,
+		budget: HopBudget,
+		frame_cache: &mut Option<Frame>,
+	) -> Result<Vec<u8>, ClusterError> {
+		match self {
+			Self::Hive { .. } => {
+				let frame = match frame_cache.take() {
+					Some(frame) => frame,
+					None => decode(&payload)?,
+				};
+				hop.deliver_frame(frame).await
+			}
+			Self::Peer { .. } => {
+				let work = budget.relayed_work(servlet_type.clone(), payload);
+				let envelope = encode(&ClusterRequest::Work(work))?;
+				hop.deliver_envelope(envelope).await
+			}
+		}
+	}
+
+	/// Classifies one forward this plane answered with `response_payload`.
+	fn classify(&self, response_payload: Vec<u8>) -> ForwardOutcome {
+		match self {
+			Self::Hive { .. } => ForwardOutcome::Local(response_payload),
+			Self::Peer { .. } => match decode::<ClusterWorkResponse>(&response_payload) {
+				Ok(peer_response) => ForwardOutcome::Peer(peer_response),
+				Err(_) => ForwardOutcome::PeerGarbled,
+			},
+		}
+	}
+
+	/// The route a splice on this plane stamps on its open: local on the hive
+	/// plane, and relayed to `target` with `budget` decremented on the peer
+	/// plane.
+	///
+	/// # Errors
+	///
+	/// - [`TransitStatus::Unavailable`] -- a peer route meets a gateway with no peer plane.
+	pub(crate) fn stream_route<P: Protocol>(
+		&self,
+		target: &Urn<'static>,
+		budget: HopBudget,
+		peers: Option<&PeerPlane<P>>,
+	) -> Result<StreamRoute, TransitStatus> {
+		match self {
+			Self::Hive { .. } => Ok(StreamRoute::local()),
+			Self::Peer { .. } if peers.is_none() => Err(TransitStatus::Unavailable),
+			Self::Peer { .. } => Ok(budget.relayed_route(target)),
 		}
 	}
 }
@@ -82,30 +168,18 @@ enum ForwardOutcome {
 }
 
 impl ForwardOutcome {
-	/// Classify one answered forward by route kind.
-	fn classify(plane: &RoutePlane, response_payload: impl Into<Vec<u8>>) -> Self {
-		let response_payload: Vec<u8> = response_payload.into();
-		match plane {
-			RoutePlane::Hive => Self::Local(response_payload),
-			RoutePlane::Peer { .. } => match decode::<ClusterWorkResponse>(&response_payload) {
-				Ok(peer_response) => Self::Peer(peer_response),
-				Err(_) => Self::PeerGarbled,
-			},
-		}
-	}
-
-	/// Whether a live route reported that it cannot serve the type.
+	/// Whether the answer proves that the frame never ran, so a retry on
+	/// another route runs it at most once.
 	///
-	/// This is the same failover class as a transport fault mapped to
-	/// [`TransitStatus::Unavailable`]. The trail is useless for this type
-	/// right now, and a garbled peer reply joins the class because it proves
-	/// nothing better. Every other refusal relays unchanged so the caller
-	/// keeps its retryability contract.
-	fn is_unavailable(&self) -> bool {
+	/// - A peer's [`TransitStatus::Unavailable`] proves it, because a gateway
+	///   answers that status only for a frame it proved undelivered
+	///   ([`ClusterError::forward_status`]).
+	/// - A garbled reply follows a delivered frame, so it proves nothing.
+	/// - Every other refusal relays unchanged, so the caller keeps its retryability contract.
+	fn proves_undelivered(&self) -> bool {
 		match self {
-			Self::Local(_) => false,
+			Self::Local(_) | Self::PeerGarbled => false,
 			Self::Peer(peer_response) => peer_response.status == TransitStatus::Unavailable,
-			Self::PeerGarbled => true,
 		}
 	}
 }
@@ -123,26 +197,9 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 	}
 }
 
-impl<P> GatewayRuntimeCtx<P>
-where
-	P: Protocol
-		+ PersistentConnection
-		+ EncryptedProtocol<CryptoProvider = DefaultCryptoProvider>
-		+ Send
-		+ Sync
-		+ 'static,
-	P::Address: Hash + Eq + Clone + Send + Sync + FromStr + 'static,
-	P::Transport: MessageEmitter
-		+ MessageCollector
-		+ PolicyConfig
-		+ MuxConnector
-		+ EncryptedProtocolState
-		+ Send
-		+ Sync
-		+ 'static,
-{
-	/// Forward along one selected route. A local servlet receives the client's
-	/// frame. A peer gateway receives a budget-decremented Work envelope.
+impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
+	/// Forward along one selected route, as the client's frame to a local
+	/// servlet or as a budget-decremented Work envelope to a peer gateway.
 	///
 	/// `frame_cache` holds the frame the admission check already decoded from
 	/// `payload`. A local forward consumes it, so the admission decode is the
@@ -157,25 +214,9 @@ where
 		frame_cache: &mut Option<Frame>,
 	) -> Result<Vec<u8>, ClusterError> {
 		let payload: Vec<u8> = payload.into();
-		let hop = choice.hop(&self.pool, self.peer_plane.as_ref())?;
+		let hop = choice.hop(&self.hive_plane, self.peer_plane.as_ref())?;
 
-		// Local hops deliver the client's frame on the hive
-		// trust plane. Peer hops re-enter the peer gateway as Work with
-		// the budget decremented, on the peer trust plane.
-		match choice.plane {
-			RoutePlane::Hive => {
-				let frame = match frame_cache.take() {
-					Some(frame) => frame,
-					None => decode(&payload)?,
-				};
-				hop.deliver_frame(frame).await
-			}
-			RoutePlane::Peer { .. } => {
-				let work = budget.relayed_work(servlet_type.clone(), payload);
-				let envelope = encode(&ClusterRequest::Work(work))?;
-				hop.deliver_envelope(envelope).await
-			}
-		}
+		choice.plane.deliver(hop, servlet_type, payload, budget, frame_cache).await
 	}
 
 	/// Settles an answered forward by reinforcing or weakening the trail and
@@ -207,7 +248,10 @@ where
 
 				reply_frame(frame.metadata().id(), peer_response)
 			}
-			ForwardOutcome::PeerGarbled => self.work_trail_fail(&choice.route_key, frame, TransitStatus::Unavailable),
+			// The peer read the frame before it garbled the reply, so the
+			// frame may have run, and the caller hears that its outcome is
+			// unknown.
+			ForwardOutcome::PeerGarbled => self.work_trail_fail(&choice.route_key, frame, TransitStatus::Unknown),
 		}
 	}
 
@@ -223,19 +267,19 @@ where
 		budget: HopBudget,
 	) -> Result<Option<Frame>, TightBeamError> {
 		// A work target must be a servlet URN in this gateway's
-		// namespace. Foreign authorities and realms are refused
-		// before the registry is consulted.
+		// namespace. The gateway refuses foreign authorities and realms
+		// before it consults the registry.
 		let Some(type_key) = self.config.namespace.servlet_type_key(&request.servlet_type) else {
 			self.trace.event(CLUSTER_WORK_REFUSED)?;
 			return reply_frame(frame.metadata().id(), ClusterWorkResponse::err(TransitStatus::PermissionDenied));
 		};
 
 		// The payload must decode as the client's end-to-end frame. Bytes
-		// that do not are a permanent caller fault, refused before route
-		// selection so one malformed request can never weaken a healthy
-		// pheromone trail, burn the bounded failover retry, or misreport
-		// as a retryable infrastructure fault. The decoded frame is kept
-		// for the first local forward, which re-emits it as-is.
+		// that do not are a permanent caller fault, so the refusal precedes
+		// route selection, and one malformed request never weakens a healthy
+		// pheromone trail, burns the bounded failover retry, or misreports
+		// as a retryable infrastructure fault. The first local forward
+		// re-emits the decoded frame as-is.
 		let client_frame: Frame = match decode(&request.payload) {
 			Ok(client_frame) => client_frame,
 			Err(_) => {
@@ -250,8 +294,8 @@ where
 		let mut excluded: Option<Arc<[u8]>> = None;
 
 		// At most two selections run: the pheromone-chosen trail and, after
-		// an Unavailable outcome, one bounded retry on the next-best trail
-		// excluding the failed route key.
+		// an outcome that proves the frame never ran, one bounded retry on
+		// the next-best trail excluding the failed route key.
 		loop {
 			let choice = match self
 				.servlet_registry
@@ -270,7 +314,7 @@ where
 			};
 
 			// The forward consumes its payload buffer into the emitted
-			// frame, so a copy is retained while a retry is still open.
+			// frame, so the loop retains a copy while a retry is open.
 			let retry_payload = if excluded.is_none() {
 				Some(attempt_payload.clone())
 			} else {
@@ -286,13 +330,13 @@ where
 			// that fail.
 			match forward_result {
 				Ok(response_payload) => {
-					let outcome = ForwardOutcome::classify(&choice.plane, response_payload);
+					let outcome = choice.plane.classify(response_payload);
 
 					// A live peer that reports it cannot serve the type
-					// joins the same bounded failover as a transport
-					// fault, so the trail weakens and the next-best one
-					// gets the retry.
-					if outcome.is_unavailable() && excluded.is_none() {
+					// joins the same bounded failover as a fault before the
+					// write, so the trail weakens and the next-best one gets
+					// the retry.
+					if outcome.proves_undelivered() && excluded.is_none() {
 						if let Some(retry) = retry_payload {
 							self.servlet_registry
 								.work_trail_weaken(&choice.route_key, &self.config, &self.trace)?;
@@ -308,9 +352,11 @@ where
 				Err(error) => {
 					let status = error.forward_status();
 
-					// Failover is fast: an unavailable trail weakens now and
-					// the next-best trail gets the single retry.
-					if status == TransitStatus::Unavailable && excluded.is_none() {
+					// A trail that proved the frame never ran weakens at once,
+					// and the next-best trail gets the single retry. A frame
+					// that may have run goes back to the caller as a failure,
+					// so it runs at most once.
+					if error.proves_undelivered() && excluded.is_none() {
 						if let Some(retry) = retry_payload {
 							self.servlet_registry
 								.work_trail_weaken(&choice.route_key, &self.config, &self.trace)?;
@@ -334,7 +380,7 @@ impl ServletRegistry {
 	///
 	/// - `hops_remaining == 0` selects `Local` only.
 	/// - A live budget selects `Local` and `Peer`, so pheromone prefers
-	///   nearby nests while still failing over across the colony.
+	///   nearby nests and can still fail over across the colony.
 	/// - A relay trail spends one hop at the relay before the owner is reached,
 	///   so it selects only when the budget affords at least two forwards.
 	///
@@ -375,11 +421,7 @@ impl ServletRegistry {
 		// An out-of-range balancer answer degrades to `Unavailable` instead of
 		// panicking the request path (see [`ClusterConfig::pick_instance`]).
 		let selected_entry = config.pick_instance(&entries)?;
-		Some(RouteChoice {
-			route_key: Arc::clone(selected_entry.route_key()),
-			dial: selected_entry.dial_target().clone(),
-			plane: selected_entry.plane(),
-		})
+		Some(RouteChoice::of(selected_entry))
 	}
 
 	/// Reinforce a trail that answered, and record the routing event.
@@ -428,13 +470,14 @@ mod tests {
 		AdmittedDial, PeerRoute, RelayRoute, ServletEntry, SharedId, DEFAULT_ABANDONMENT_LIMIT,
 		DEFAULT_INITIAL_PHEROMONE,
 	};
-	use crate::colony::common::{ColonyNamespace, InstanceMetrics, LoadBalancer};
+	use crate::colony::common::{ColonyNamespace, InstanceMetrics, LoadBalancer, ServletInfo};
 	use crate::constants::{DEFAULT_HOP_BUDGET, DEFAULT_MAX_HOPS};
 
 	use crate::colony::cluster::{CertificateSpec, ClusterTlsConfig, PheromoneConfig};
 	use crate::crypto::key::Secp256k1KeyProvider;
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 	use crate::testing::{TestCertificate, TestKey};
+	use crate::transport::TokioListener;
 	use crate::utils::time::ManualClock;
 
 	/// A registry on a clock only the test moves.
@@ -490,6 +533,11 @@ mod tests {
 		encode(response).expect("test responses satisfy the codec")
 	}
 
+	/// The plane of a local route, bound to the fixture servlet's signer.
+	fn local_plane() -> RoutePlane {
+		RoutePlane::Hive { signer: Arc::new(ServletInfo::fixture_signer()) }
+	}
+
 	/// The plane of a direct peer route.
 	fn peer_plane() -> RoutePlane {
 		peer_entry(b"first", "192.0.2.1:9001").plane()
@@ -502,40 +550,43 @@ mod tests {
 
 	#[test]
 	fn forward_outcome_local_reply_never_fails_over() {
-		let outcome = ForwardOutcome::classify(&RoutePlane::Hive, b"pong".to_vec());
-		assert!(!outcome.is_unavailable());
+		let outcome = local_plane().classify(b"pong".to_vec());
+		assert!(!outcome.proves_undelivered());
 		assert!(matches!(outcome, ForwardOutcome::Local(payload) if payload == b"pong"));
 	}
 
 	#[test]
 	fn forward_outcome_peer_unavailable_reply_fails_over() {
 		let bytes = encoded_work_response(&ClusterWorkResponse::err(TransitStatus::Unavailable));
-		assert!(ForwardOutcome::classify(&peer_plane(), bytes).is_unavailable());
+		assert!(peer_plane().classify(bytes).proves_undelivered());
 	}
 
 	#[test]
 	fn forward_outcome_relay_unavailable_reply_fails_over() {
 		let bytes = encoded_work_response(&ClusterWorkResponse::err(TransitStatus::Unavailable));
-		assert!(ForwardOutcome::classify(&relay_plane(), bytes).is_unavailable());
+		assert!(relay_plane().classify(bytes).proves_undelivered());
 	}
 
 	#[test]
 	fn forward_outcome_peer_ok_reply_settles() {
 		let bytes = encoded_work_response(&ClusterWorkResponse::ok(b"pong".to_vec()));
-		assert!(!ForwardOutcome::classify(&peer_plane(), bytes).is_unavailable());
+		assert!(!peer_plane().classify(bytes).proves_undelivered());
 	}
 
 	#[test]
 	fn forward_outcome_peer_refusal_relays_unchanged() {
 		let bytes = encoded_work_response(&ClusterWorkResponse::err(TransitStatus::PermissionDenied));
-		assert!(!ForwardOutcome::classify(&peer_plane(), bytes).is_unavailable());
+		assert!(!peer_plane().classify(bytes).proves_undelivered());
 	}
 
+	// A garbled reply follows a frame the peer read, so it proves nothing, and
+	// the frame stays with its first route.
 	#[test]
-	fn forward_outcome_garbled_peer_reply_fails_over() {
-		let outcome = ForwardOutcome::classify(&peer_plane(), b"not-a-response".to_vec());
+	fn forward_outcome_garbled_peer_reply_never_fails_over() {
+		let outcome = peer_plane().classify(b"not-a-response".to_vec());
+
 		assert!(matches!(outcome, ForwardOutcome::PeerGarbled));
-		assert!(outcome.is_unavailable());
+		assert!(!outcome.proves_undelivered());
 	}
 
 	fn test_config() -> ClusterConfig {
@@ -603,6 +654,23 @@ mod tests {
 		let entries = vec![Arc::new(peer_entry(b"first", "192.0.2.1:9001"))];
 		let config = config_balancing_with(Arc::new(RogueBalancer));
 		assert!(config.pick_instance(&entries).is_none());
+	}
+
+	// A local splice opens a local route on the hive plane.
+	#[test]
+	fn a_local_splice_opens_a_local_route() {
+		let route = local_plane().stream_route::<TokioListener>(&ping_type(), HopBudget::for_test(2), None);
+
+		assert_eq!(route, Ok(StreamRoute::local()));
+	}
+
+	// A peer splice needs the peer plane to dial its gateway, so with none
+	// configured it refuses as unavailable before any dial.
+	#[test]
+	fn a_peer_splice_with_no_peer_plane_is_unavailable() {
+		let route = peer_plane().stream_route::<TokioListener>(&ping_type(), HopBudget::for_test(2), None);
+
+		assert_eq!(route, Err(TransitStatus::Unavailable));
 	}
 
 	#[test]

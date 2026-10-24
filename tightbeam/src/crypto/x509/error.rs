@@ -68,15 +68,32 @@ pub enum CertificateValidationError {
 	#[error("Certificate not trusted")]
 	CertificateNotTrusted,
 
-	/// The certificate chain is invalid, because a certificate's issuer does
-	/// not name the subject of the certificate above it.
-	#[error("Certificate chain broken: issuer {issuer} does not match subject {subject}")]
+	/// The certificate chain is invalid, because the issuer of a certificate
+	/// is another name than the subject of the certificate above it.
+	#[error("Certificate chain broken at issuer {issuer} and subject {subject}")]
 	InvalidChain {
 		/// The issuer name of the lower certificate.
 		issuer: String,
-		/// The subject name of the certificate above it, which that issuer name
-		/// does not match.
+		/// The subject name of the certificate the chain reached above it.
 		subject: String,
+	},
+
+	/// Two certificates of a presented path carry as subject the issuer name
+	/// of one certificate, so the path names no single issuer above it. A
+	/// self-issued certificate names itself as issuer, so a chain that sets
+	/// another certificate of its name above it holds two.
+	#[error("Certificate path holds two issuers named {issuer}")]
+	AmbiguousIssuer {
+		/// The issuer name that two certificates carry.
+		issuer: String,
+	},
+
+	/// A presented path returns to a certificate it holds, so it reaches no
+	/// trust anchor.
+	#[error("Certificate path returns to the issuer {issuer}")]
+	PathCycle {
+		/// The issuer name at which the path returns.
+		issuer: String,
 	},
 
 	/// The certificate chain is empty.
@@ -85,8 +102,8 @@ pub enum CertificateValidationError {
 
 	/// Two certificates with different fingerprints have the same SKID.
 	///
-	/// The error carries the colliding key identifier, so the store entry can
-	/// be found.
+	/// The error carries the colliding key identifier, so the operator can
+	/// find the store entry.
 	#[error("SKID collision: two certificates share key identifier {skid}")]
 	SkidCollision {
 		/// The key identifier both certificates carry, in hex.
@@ -126,18 +143,20 @@ pub enum CertificateValidationError {
 	ExcludedKeyUsage(crate::crypto::x509::ext::pkix::KeyUsages),
 
 	/// The `extendedKeyUsage` extension names neither the purpose of the role
-	/// the certificate is read for nor `anyExtendedKeyUsage` (RFC 5280
-	/// §4.2.1.12).
+	/// the certificate is read for nor `anyExtendedKeyUsage`
+	/// (RFC 5280 §4.2.1.12).
 	#[error("Certificate extendedKeyUsage excludes the role")]
 	ExcludedKeyPurpose,
 
-	/// The certificate carries more than one instance of an extension (RFC 5280
-	/// §4.2).
+	/// The certificate carries more than one instance of an extension
+	/// (RFC 5280 §4.2).
 	#[error("Duplicate extension: {0}")]
 	DuplicateExtension(der::asn1::ObjectIdentifier),
 
-	/// The certification path exceeds the pathLenConstraint of an issuer
-	/// (RFC 5280 §6.1.4(m)).
+	/// The certification path is longer than a constraint allows: the
+	/// `pathLenConstraint` of an issuer (RFC 5280 §6.1.4(m)), or the
+	/// [`MAX_PRESENTED_PATH`](crate::constants::MAX_PRESENTED_PATH)
+	/// certificates a reader takes from one `SignedData`.
 	#[error("Certification path length constraint exceeded")]
 	PathLenExceeded,
 
@@ -145,6 +164,12 @@ pub enum CertificateValidationError {
 	/// not process (RFC 5280 §4.2).
 	#[error("Unprocessed critical extension: {0}")]
 	UnprocessedCriticalExtension(der::asn1::ObjectIdentifier),
+
+	/// A certificate of the path carries a `nameConstraints` extension, which
+	/// RFC 5280 §6.1.4(g) applies whatever its criticality, and which the
+	/// store's path validation does not apply.
+	#[error("Certificate states name constraints that path validation does not apply")]
+	NameConstraintsUnapplied,
 
 	/// The end-entity certificate asserts `basicConstraints.cA`.
 	#[error("End-entity certificate asserts the CA basic constraint")]

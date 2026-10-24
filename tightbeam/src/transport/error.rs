@@ -26,24 +26,26 @@ pub type Result<T> = core::result::Result<T, TransportError>;
 /// The reason an operation failed, either locally or as a peer refusal.
 ///
 /// Each peer-refusal variant maps one to one onto a non-Ok [`TransitStatus`],
-/// and the local-only variants carry no wire status.
+/// and a local-only variant fails that conversion.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum TransportFailure {
 	/// DER encoding failed.
 	EncodingFailed,
 	/// AEAD encryption failed, or an encrypted envelope did not decrypt.
 	EncryptionFailed,
-	/// The message size exceeds the configured limits.
+	/// The message size exceeds the configured limits. A reply header past the
+	/// read cap raises it after the request's write completed.
 	SizeExceeded,
-	/// No encryptor is available.
+	/// No encryptor is available. The read side raises it for a session with
+	/// no keys, whose write fails first on the same missing keys.
 	EncryptorUnavailable,
 	/// Random nonce generation failed.
 	NonceGenerationFailed,
 	/// The AEAD record limit was reached, because the send cipher halted or
 	/// the peer overran the volume bound. Reestablish the session to rekey.
 	RekeyRequired,
-	/// An inbound AEAD sequence violation, which is a replay, reorder, or
-	/// deletion of an envelope on the connection (CWE-345).
+	/// An inbound envelope broke the AEAD sequence by a replay, reorder, or
+	/// deletion on the connection (CWE-345).
 	TamperDetected,
 	/// The local stream cap is exhausted on a multiplexed connection, because
 	/// every concurrent stream slot is in flight. Retry after a response frees
@@ -88,7 +90,8 @@ pub enum TransportFailure {
 	/// The peer refused the call because it broke an internal invariant.
 	Internal,
 	/// The peer refused the call on a transient unavailability, such as a
-	/// draining peer.
+	/// draining peer. A peer answers it before its handler runs, so a retry
+	/// on another peer runs the call at most once.
 	Unavailable,
 	/// The peer refused the call on unrecoverable data loss or corruption.
 	DataLoss,
@@ -128,8 +131,8 @@ pub enum TransportError {
 	/// signing identity, and only the signing identity is provisioned.
 	#[error("Key-agreement identity required but not provisioned")]
 	MissingKeyAgreementIdentity,
-	/// The client holds no trust in a server, a trust store or a CMS server
-	/// trust. Install one, or remove any server policy and call
+	/// The client holds no server trust, which is a trust store or a CMS
+	/// server trust. Install one, or remove any server policy and call
 	/// `allow_cleartext` to choose cleartext.
 	#[error("Client holds no server trust: install one, or remove any server policy and call allow_cleartext")]
 	PeerAuthenticationUnconfigured,
@@ -351,8 +354,8 @@ impl TransportError {
 		}
 	}
 
-	/// The failure that kept a [`TransportError::MessageNotSent`] frame from
-	/// sending, or `None` for any other variant.
+	/// Return the failure that kept a [`TransportError::MessageNotSent`] frame
+	/// from sending, or `None` for any other variant.
 	pub fn failure_reason(&self) -> Option<&TransportFailure> {
 		match self {
 			TransportError::MessageNotSent(_, reason) => Some(reason),
@@ -360,11 +363,37 @@ impl TransportError {
 		}
 	}
 
-	/// Whether the error means the connection is dead, which drives
+	/// Report whether this fault proves that the frame never reached a handler
+	/// of the peer, so a retry on another route runs it at most once. Three
+	/// kinds of fault prove it:
+	///
+	/// - A send the transport reports as not sent, or a failed write.
+	/// - A local refusal before the write: a full stream table, a spent
+	///   budget, an unencodable frame, or a missing encryptor or nonce.
+	/// - A peer's [`TransportFailure::Unavailable`], which a peer answers before its handler runs.
+	#[cfg(feature = "colony")]
+	#[must_use]
+	pub(crate) fn proves_unsent(&self) -> bool {
+		matches!(
+			self,
+			TransportError::MessageNotSent(..)
+				| TransportError::SendFailed
+				| TransportError::OperationFailed(
+					TransportFailure::Unavailable
+						| TransportFailure::StreamsExhausted
+						| TransportFailure::BudgetExhausted
+						| TransportFailure::EncodingFailed
+						| TransportFailure::EncryptorUnavailable
+						| TransportFailure::NonceGenerationFailed
+				)
+		)
+	}
+
+	/// Report whether the error means the connection is dead, which drives
 	/// auto-reconnect.
 	///
-	/// Returns `true` for errors that suggest the underlying connection should
-	/// be discarded and a new connection established.
+	/// A `true` result tells the caller to discard the underlying connection
+	/// and establish a new one.
 	pub fn is_connection_error(&self) -> bool {
 		matches!(
 			self,

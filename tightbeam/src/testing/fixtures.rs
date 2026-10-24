@@ -53,6 +53,8 @@ use random_id::*;
 
 #[cfg(feature = "x509")]
 mod x509_certs {
+	pub use crate::cms::cert::CertificateChoices;
+	pub use crate::cms::signed_data::CertificateSet;
 	pub use crate::x509::Certificate;
 }
 
@@ -370,6 +372,12 @@ impl TestCertificateChain {
 	}
 }
 
+/// The fixed test key whose secret scalar is thirty-two `scalar` bytes.
+#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+fn test_fixed_key(scalar: u8) -> SigningKey {
+	SigningKey::from_bytes(&[scalar; 32].into()).expect("a small nonzero scalar is a key")
+}
+
 /// Builds the single-AVA `CN=<cn>` distinguished name for test certificates.
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 fn test_cn_name(cn: impl AsRef<str>) -> TbResult<RdnSequence> {
@@ -453,7 +461,7 @@ macro_rules! test_builder {
 		);
 	};
 
-	// Internal arm that the two public forms expand into.
+	// The two public forms expand into this internal arm.
 	(@impl
 		$test_name:ident,
 		$builder_type:ty,
@@ -684,8 +692,9 @@ impl TestFrame {
 	/// Returns the DER of `container` with the version of its embedded `frame`
 	/// rewritten to `version`.
 	///
-	/// No constructor yields a frame whose version forbids a field it carries.
-	/// A test that feeds such a frame to a decoder forges the bytes here.
+	/// Every constructor yields a frame whose version admits each field it
+	/// carries, so a test that feeds a decoder a version that forbids one of
+	/// those fields forges the bytes here.
 	pub fn forge_version(container: &impl crate::der::Encode, frame: &Frame, version: Version) -> Vec<u8> {
 		let mut encoded = crate::der::Encode::to_der(container).expect("the container encodes");
 		let frame_der = crate::der::Encode::to_der(frame).expect("the frame encodes");
@@ -1157,6 +1166,48 @@ impl TestCertificate {
 		let extn_id = ObjectIdentifier::new(oid.as_ref()).expect("a test OID parses");
 		let extn_value = OctetString::new(Vec::new()).expect("an empty value fits an OCTET STRING");
 		Extension { extn_id, critical, extn_value }
+	}
+
+	/// `certificate` signed again by `issuer_key` under the test algorithm, so
+	/// a test that edits its fields keeps a signature that verifies.
+	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+	pub fn signed_by(certificate: Certificate, issuer_key: &SigningKey) -> Certificate {
+		let Certificate { tbs_certificate, signature_algorithm, .. } = certificate;
+		let signed = sign_test_certificate(tbs_certificate, &signature_algorithm, issuer_key);
+		signed.expect("the test key signs the certificate")
+	}
+
+	/// The `certificates` set of a `SignedData` that holds `certificates`,
+	/// which DER sorts (RFC 5652 §5.1).
+	#[cfg(feature = "x509")]
+	pub fn set_of(certificates: impl IntoIterator<Item = Certificate>) -> CertificateSet {
+		let choices: Vec<CertificateChoices> = certificates.into_iter().map(CertificateChoices::Certificate).collect();
+		CertificateSet(choices.try_into().expect("distinct certificates are a SET"))
+	}
+
+	/// `count` self-signed certificates of distinct fixed keys, each a
+	/// stranger to every path.
+	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+	pub fn strangers(count: u8) -> Vec<Certificate> {
+		let stranger = |offset: u8| TestCertificate::self_signed(&test_fixed_key(offset.saturating_add(16)));
+		(0..count).map(stranger).collect()
+	}
+
+	/// Two certificates that lead a walk from a certificate `intermediate`
+	/// issued back into itself: the first carries the subject of
+	/// `intermediate` and names the second as its issuer, which names the
+	/// first.
+	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+	pub fn looping_issuers(intermediate: &Certificate) -> [Certificate; 2] {
+		let looping = test_cn_name("Looping issuer").expect("a test common name satisfies PrintableString");
+		let subject = intermediate.tbs_certificate.subject.to_owned();
+		let mut first = TestCertificate::self_signed(&test_fixed_key(0x60));
+		first.tbs_certificate.subject = subject.to_owned();
+		first.tbs_certificate.issuer = looping.to_owned();
+		let mut second = TestCertificate::self_signed(&test_fixed_key(0x61));
+		second.tbs_certificate.subject = looping;
+		second.tbs_certificate.issuer = subject;
+		[first, second]
 	}
 
 	/// Create a valid certificate chain in which a root signs an intermediate

@@ -1,9 +1,12 @@
-//! Servlet macros: parse handler arms into [`crate::colony::servlet::ServletHandlers`], then start
-//! a [`ServletRuntime`](crate::colony::servlet::ServletRuntime).
+//! The servlet macros parse handler arms into
+//! [`ServletHandlers`](crate::colony::servlet::ServletHandlers), then start a
+//! [`ServletRuntime`](crate::colony::servlet::ServletRuntime).
 //!
-//! Accept-loop and lifecycle logic live on the runtime, not in these arms.
+//! The runtime owns the accept loop and the lifecycle, so an arm holds its
+//! handler code alone.
 
-/// Build [`crate::colony::servlet::ServletHandlers`] from optional unary, stream, and duplex arms.
+/// Build [`ServletHandlers`](crate::colony::servlet::ServletHandlers) from the
+/// optional unary, stream, and duplex arms.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __servlet_handlers {
@@ -30,7 +33,8 @@ macro_rules! __servlet_handlers {
 	}};
 }
 
-/// Named servlet wrapper: struct, `Deref` to runtime, [`Servlet`] + [`ServletBox`].
+/// Define a named servlet: a struct that derefs to its runtime and implements
+/// [`Servlet`] and [`ServletBox`].
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __servlet_define {
@@ -58,7 +62,8 @@ macro_rules! __servlet_define {
 		}
 
 		impl $servlet_name {
-			/// Start convenience that does not require the [`Servlet`] trait in scope.
+			/// Start the servlet. This inherent method needs no [`Servlet`]
+			/// import at the call site.
 			#[allow(dead_code)]
 			$vis async fn start(
 				trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
@@ -72,13 +77,15 @@ macro_rules! __servlet_define {
 				<Self as $crate::colony::servlet::Servlet<$input, $env_config>>::start(trace, config).await
 			}
 
-			/// Stop convenience for by-value calls without the [`Servlet`] trait in scope.
+			/// Stop the servlet by value. This inherent method needs no
+			/// [`Servlet`] import at the call site.
 			#[allow(dead_code)]
 			pub fn stop(self) {
 				self.runtime.stop();
 			}
 
-			/// Join convenience; Deref cannot forward by-value [`ServletRuntime::join`].
+			/// Wait for the accept loop to finish. `Deref` cannot forward the
+			/// by-value [`ServletRuntime::join`], so this method calls it.
 			#[allow(dead_code)]
 			pub async fn join(
 				self,
@@ -136,6 +143,10 @@ macro_rules! __servlet_define {
 				self.runtime.stop();
 			}
 
+			fn signer(&self) -> Option<&$crate::cms::signed_data::SignerIdentifier> {
+				$crate::colony::hive::ServletBox::signer(&self.runtime)
+			}
+
 			fn utilization(&self) -> Option<$crate::utils::BasisPoints> {
 				use $crate::colony::servlet::Servlet;
 				<Self as Servlet<_, _>>::utilization(self)
@@ -146,26 +157,27 @@ macro_rules! __servlet_define {
 
 /// Create a containerized TightBeam servlet.
 ///
-/// At least one handler arm is required. Absent kinds refuse with
-/// `Unimplemented`.
+/// The macro requires at least one handler arm. A kind with no arm refuses
+/// with `Unimplemented`.
 ///
 /// # Unary
 ///
-/// - `handle: |msg, frame, ctx|`: typed delivery (default). Encrypted or
-///   compressed bodies are normalized in place before decode.
-/// - `handle: raw |frame, ctx|`: caller owns the frame lifecycle.
+/// - `handle: |msg, frame, ctx|`: typed delivery, the default. The arm
+///   normalizes an encrypted or compressed body in place before decode.
+/// - `handle: raw |frame, ctx|`: the caller owns the frame lifecycle.
 ///
 /// # Streaming (multiplexed)
 ///
 /// - `stream: |body, ctx|`: consume a
-///   [`StreamBody`](crate::transport::multiplex::StreamBody); optional unary reply.
+///   [`StreamBody`](crate::transport::multiplex::StreamBody), with an
+///   optional unary reply.
 /// - `duplex: |body, reply, ctx|`: request and reply chunks on one stream via
 ///   [`ReplySink`](crate::transport::multiplex::ReplySink).
 ///
 /// # Macro-free path
 ///
-/// Implement [`ServletService`](crate::colony::servlet::ServletService) and
-/// call [`ServletRuntime::start`](crate::colony::servlet::ServletRuntime::start).
+/// 1. Implement [`ServletService`](crate::colony::servlet::ServletService).
+/// 2. Pass it to [`ServletRuntime::start`](crate::colony::servlet::ServletRuntime::start).
 #[macro_export]
 macro_rules! servlet {
 	// No handler arms: refuse at compile time.
@@ -179,7 +191,7 @@ macro_rules! servlet {
 		);
 	};
 
-	// Typed delivery (public or private).
+	// Typed delivery, at any visibility, expands to the raw arm with a decode.
 	(
 		$(#[$meta:meta])*
 		$vis:vis $servlet_name:ident<$input:ty, EnvConfig = $env_config:ty>,
@@ -205,7 +217,7 @@ macro_rules! servlet {
 		}
 	};
 
-	// Raw frame (unary arm optional).
+	// This arm takes a raw frame, and its unary handler is optional.
 	(
 		$(#[$meta:meta])*
 		$vis:vis $servlet_name:ident<$input:ty, EnvConfig = $env_config:ty>,

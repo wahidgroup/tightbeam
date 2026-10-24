@@ -12,8 +12,8 @@
 //! - an AEAD, AES-128-GCM under a cipher type of its own, as a [`ContentEncryption`], and
 //! - a key wrap that brings `wrap` and `unwrap` alone, as a [`KeyWrapAlgorithm`].
 //!
-//! The outside provider selects one house type, the key wrap, AES-128 key
-//! wrap, through [`KeyWrapProvider`].
+//! The outside provider selects one house type through [`KeyWrapProvider`]:
+//! the AES-128 key wrap.
 //!
 //! The suites that run under it:
 //!
@@ -28,6 +28,7 @@ mod frames;
 #[cfg(feature = "transport-hpke")]
 mod hpke;
 mod kem;
+mod servlet;
 mod trust;
 
 use std::sync::Arc;
@@ -144,8 +145,8 @@ impl SignatureAlgorithmIdentifier for OutsideSignature {
 	type Digest = Sha3_512;
 }
 
-/// The DER form with a low `s`. A high `s` is refused, where the house form
-/// normalizes it.
+/// The DER form with a low `s`. It refuses a high `s`, which the house form
+/// normalizes.
 impl CanonicalForm for OutsideSignature {
 	fn canonical(encoded: &[u8]) -> Result<Self, SignatureError> {
 		let signature = Signature::from_der(encoded)?;
@@ -454,8 +455,8 @@ impl OutsideKeyProvider {
 }
 
 /// The key-agreement backend of an outside identity: it holds a secp256k1
-/// scalar and runs the Diffie-Hellman product itself, so the scalar leaves
-/// it in no value the crate reads.
+/// scalar and runs the Diffie-Hellman product itself, so the scalar stays
+/// inside the backend.
 struct OutsideAgreementBackend {
 	scalar: NonZeroScalar,
 }
@@ -542,8 +543,8 @@ fn outside_identity() -> SigningIdentity {
 	outside_identity_of(certificate, key)
 }
 
-/// The key-agreement identity under [`OutsideKem`] of `certificate`, whose
-/// key `key` is, behind an [`OutsideAgreementBackend`].
+/// The key-agreement identity under [`OutsideKem`] of `certificate` and its
+/// key `key`, behind an [`OutsideAgreementBackend`].
 fn outside_agreement_identity_of(certificate: Certificate, key: &SigningKey) -> KeyAgreementIdentity<OutsideKem> {
 	let backend: Arc<dyn DiffieHellman<Secp256k1>> = Arc::new(OutsideAgreementBackend::of(key));
 	let identity = KeyAgreementIdentity::new(certificate, backend);
@@ -568,7 +569,7 @@ fn outside_recipient(certificate: Certificate) -> KemRecipient<OutsideKem> {
 
 /// The policy of both endpoints of a handshake under [`OutsideProvider`].
 /// The outside profile runs AES-128-GCM, below the default floor of 256-bit
-/// keys, so both endpoints apply no floor.
+/// keys, so both endpoints opt out of the floor.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 fn outside_policy() -> ProfilePolicy<OutsideProvider> {
 	ProfilePolicy::with_floor(Arc::new(NoStrengthFloor))

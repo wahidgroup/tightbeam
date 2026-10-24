@@ -1,13 +1,14 @@
 //! Cluster gateway runtime: accept loop, background tasks, and mux routing.
 //!
 //! [`ClusterGateway`] owns the listener, heartbeat, evaporation, and advertise
-//! tasks. Incoming connections are served through [`GatewayMuxService`], which
-//! routes unary control frames to dispatch and splices streamed or duplex opens
-//! by servlet target.
+//! tasks. [`GatewayMuxService`] serves each incoming connection: it routes
+//! unary control frames to dispatch and splices streamed or duplex opens by
+//! servlet target.
 //!
 //! Each sibling module owns one of the surfaces a request reaches: dispatch,
 //! registration, work, streaming, gossip, and heartbeat.
 
+mod advertise;
 mod bounds;
 mod dispatch;
 mod freshness;
@@ -20,6 +21,7 @@ mod registration;
 mod streaming;
 mod verify;
 
+pub(crate) use bounds::ColonyDialProtocol;
 pub(crate) use verify::{VerifiedControlFrame, VerifiedSignerId};
 mod work;
 
@@ -28,10 +30,10 @@ use core::marker::PhantomData;
 use core::time::Duration;
 use std::sync::{Arc, Mutex};
 
-use self::bounds::{ClusterDigest, ClusterPool, GatewayAcceptProtocol, GatewayColonyProtocol, GatewayRuntimeCtx};
+use self::bounds::{ClusterDigest, GatewayAcceptProtocol, GatewayColonyProtocol, GatewayRuntimeCtx};
 use self::freshness::GatewayReplayGuard;
 use self::heartbeat::HiveBeat;
-use self::hop::PeerPlane;
+use self::hop::{HivePlane, PeerPlane};
 use crate::colony::cluster::peer::WireHopBudget;
 use crate::colony::cluster::{
 	Cluster, ClusterConfig, ClusterError, ClusterHeartbeat, HeartbeatConfig, HiveRegistry, HopBudget, PeerRouteInfo,
@@ -40,7 +42,6 @@ use crate::colony::cluster::{
 use crate::colony::common::{HeartbeatResult, TaskGroup};
 use crate::constants::{DEFAULT_AD_RUMOR_REFRESH_MS, DEFAULT_MAX_SERVER_CONNECTIONS};
 use crate::crypto::hash::Sha3_256;
-use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::macros::server::{serve_connection_service, AcceptedConnection};
 use crate::policy::TransitStatus;
 use crate::runtime::rt;
@@ -49,7 +50,7 @@ use crate::transport::accept::AcceptPlane;
 use crate::transport::handshake::negotiation::TransportOffer;
 use crate::transport::multiplex::{CallContext, MuxCapable, MuxService, ReplySink, StreamBody};
 use crate::transport::policy::PolicyConfig;
-use crate::transport::{AsyncListenerTrait, Protocol, TransportEncryptionConfig, TransportError};
+use crate::transport::{AsyncListenerTrait, Protocol, TransportError};
 use crate::urn::Urn;
 use crate::utils::time::Clock;
 use crate::Frame;
@@ -62,9 +63,9 @@ use crate::instrumentation::events::{
 /// Why one background loop of the gateway ended.
 ///
 /// Every loop reads registries and tables and records to the trace, and
-/// either can refuse. The two refusals are kept apart so the exit records
-/// a poisoned lock by name and lets a trace fault end the loop silently,
-/// which is the effect a `testing-fault` injection observes.
+/// either can refuse. The two variants keep the refusals apart, so the exit
+/// records a poisoned lock by name and lets a trace fault end the loop
+/// silently, which is the effect a `testing-fault` injection observes.
 pub(crate) enum LoopFault {
 	/// The trace refused an event, or a task the loop awaited did not join.
 	Runtime(TightBeamError),
@@ -143,24 +144,6 @@ impl ClusterConfig {
 
 		Ok(())
 	}
-
-	/// Builds the accept-side TLS config the colony and edge listeners share.
-	///
-	/// Both planes present the same certificate and key so an external edge
-	/// client pins the same gateway identity that hives already trust. The
-	/// client authentication is [`ClusterTlsConfig::peer_authentication`].
-	///
-	/// `ClusterTlsConfig::new` already decoded the certificate, so assembly
-	/// here always returns `Ok`.
-	///
-	/// [`ClusterTlsConfig::peer_authentication`]: crate::colony::cluster::ClusterTlsConfig::peer_authentication
-	fn accept_encryption_config(&self) -> Result<TransportEncryptionConfig<DefaultCryptoProvider>, TightBeamError> {
-		let encryption_config = TransportEncryptionConfig::new(self.tls.identity().clone());
-		let validators = self.tls.client_validators.iter().map(Arc::clone);
-
-		let encryption_config = encryption_config.with_client_validators(validators);
-		Ok(encryption_config)
-	}
 }
 
 /// Running cluster gateway for protocol `P`, digest `D`, and edge protocol `E`.
@@ -175,8 +158,8 @@ impl ClusterConfig {
 /// - `E` defaults to `P`, so a gateway without an edge declaration uses a single accept plane.
 /// - When [`ClusterConfig::edge_bind_addr`] is set, the gateway binds a second
 ///   listener over `E` with the same TLS material.
-/// - Edge connections are served by a separate edge mux service, whose one route is `Work` submission.
-/// - Hives and peers keep using the colony plane at [`Cluster::addr`].
+/// - A separate edge mux service serves edge connections, and its one route is `Work` submission.
+/// - Hives and peers use the colony plane at [`Cluster::addr`].
 pub struct ClusterGateway<P, D = Sha3_256, E = P>
 where
 	P: Protocol,
@@ -185,7 +168,8 @@ where
 	registry: Arc<HiveRegistry>,
 	servlet_registry: Arc<ServletRegistry>,
 	config: Arc<ClusterConfig>,
-	pool: Arc<ClusterPool<P>>,
+	/// The plane a heartbeat dials its hive on.
+	hive_plane: HivePlane<P>,
 	/// The colony accept plane task, which [`Cluster::join`] awaits together
 	/// with the edge task.
 	server_handle: Option<rt::JoinHandle>,
@@ -206,9 +190,9 @@ where
 	E: Protocol,
 {
 	/// Bound edge accept plane address, or `None` when
-	/// [`ClusterConfig::edge_bind_addr`] was unset.
+	/// [`ClusterConfig::edge_bind_addr`] is unset.
 	///
-	/// External clients dial this address. Hives keep registering on
+	/// External clients dial this address. Hives register on
 	/// [`Cluster::addr`].
 	pub fn edge_addr(&self) -> Option<&E::Address> {
 		self.edge_addr.as_ref()
@@ -248,7 +232,7 @@ where
 			}
 
 			// The certificate and the namespace stay writable until here,
-			// so membership binds to the pair this gateway actually serves.
+			// so membership binds to the pair this gateway serves.
 			config.bind_colony_membership();
 			config
 		};
@@ -262,7 +246,7 @@ where
 			None => P::default_bind_address().map_err(TightBeamError::transport)?,
 		};
 
-		let (listener, addr) = P::bind_with(bind_addr, config.accept_encryption_config()?)
+		let (listener, addr) = P::bind_with(bind_addr, config.tls.accept_encryption())
 			.await
 			.map_err(TightBeamError::transport)?;
 
@@ -273,8 +257,9 @@ where
 
 		let servlet_registry = Arc::new(routes);
 		let pools = config.pool_config.build_cluster_pools::<P>(&config.tls, &config.clock)?;
-		let pool = pools.hive;
-		let peer_plane = pools.peer.map(|peer_pool| PeerPlane::new(peer_pool, Arc::clone(&config)));
+		let hive_plane = HivePlane::new(pools.hive, Arc::clone(&trace));
+		let build_peer_plane = |peer_pool| PeerPlane::new(peer_pool, Arc::clone(&config), Arc::clone(&trace));
+		let peer_plane = pools.peer.map(build_peer_plane);
 
 		let replay_guard_for_server = GatewayReplayGuard::new(control_window, Arc::clone(&config.clock));
 		let tasks = TaskGroup::default();
@@ -283,7 +268,7 @@ where
 			servlet_registry: Arc::clone(&servlet_registry),
 			admission: Arc::new(Mutex::new(())),
 			config: Arc::clone(&config),
-			pool: Arc::clone(&pool),
+			hive_plane: hive_plane.clone(),
 			peer_plane,
 			trace: Arc::clone(&trace),
 			replay_guard: replay_guard_for_server,
@@ -297,7 +282,7 @@ where
 		let (edge_listener, edge_addr) = match config.edge_bind_addr.as_deref() {
 			Some(raw) => {
 				let edge_bind: E::Address = raw.parse().map_err(|_| TransportError::InvalidMessage)?;
-				let (edge_listener, edge_addr) = E::bind_with(edge_bind, config.accept_encryption_config()?)
+				let (edge_listener, edge_addr) = E::bind_with(edge_bind, config.tls.accept_encryption())
 					.await
 					.map_err(TightBeamError::transport)?;
 
@@ -316,7 +301,7 @@ where
 		let gateway_bytes: Vec<u8> = addr.clone().into();
 		let gateway_addr = config.peer.advertised_address(gateway_bytes)?;
 
-		// Every field of the context is an `Arc`, so the clone is cheap.
+		// Each field of the context is reference-counted, so a clone is cheap.
 		let server_handle = ctx.clone().serve_colony::<P::Listener, D>(listener);
 
 		// The edge plane serves [`EdgeMuxService`], whose only route is work
@@ -340,7 +325,7 @@ where
 			registry,
 			servlet_registry,
 			config,
-			pool,
+			hive_plane,
 			server_handle: Some(server_handle),
 			edge_handle,
 			tasks,
@@ -421,7 +406,12 @@ where
 	}
 
 	async fn send_heartbeat(&self, addr: Self::Address) -> Result<HeartbeatResult, ClusterError> {
-		HiveBeat::new(&self.config, &self.pool).send::<D>(addr).await
+		let hive_id: Vec<u8> = addr.into();
+		let Some(hive) = self.registry.entry(&hive_id)? else {
+			return Err(ClusterError::InvalidAddress(hive_id));
+		};
+
+		HiveBeat::new(&self.config, &self.hive_plane).send::<D>(&hive).await
 	}
 }
 
@@ -583,8 +573,8 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 impl<P: GatewayColonyProtocol> GatewayRuntimeCtx<P> {
 	/// Serves the colony accept plane through [`GatewayMuxService`].
 	///
-	/// `L` is the listener actually bound, which feeds the service over the
-	/// colony pool protocol `P`.
+	/// `L` is the bound listener, which feeds the service over the colony pool
+	/// protocol `P`.
 	pub(crate) fn serve_colony<L, D>(self, listener: L) -> rt::JoinHandle
 	where
 		L: AsyncListenerTrait + Sync + 'static,
@@ -613,7 +603,7 @@ impl<P: GatewayColonyProtocol> GatewayRuntimeCtx<P> {
 		Self::accept_into(listener, mux_offer, clock, service)
 	}
 
-	/// Accepts on `listener`, dispatching every connection through `service`.
+	/// Accepts on `listener` and dispatches every connection through `service`.
 	///
 	/// Each admitted transport shares one mux offer by reference count, and
 	/// accept retries wait on `clock`, the gateway's own.
@@ -639,5 +629,32 @@ impl<P: GatewayColonyProtocol> GatewayRuntimeCtx<P> {
 			let service = Arc::clone(&service);
 			async move { serve_connection_service(transport, service, None, None).await }
 		}))
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::colony::cluster::ClusterTlsConfig;
+	use crate::crypto::key::Secp256k1KeyProvider;
+	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
+	use crate::crypto::sign::SigningIdentity;
+	use crate::crypto::x509::KeyPurposes;
+	use crate::testing::{TestCertificate, TestKey};
+
+	// The accept planes hold the gateway's identity to the purposes its TLS
+	// config names, so the transport and the colony read one purpose set.
+	#[test]
+	fn the_accept_planes_take_the_configured_key_purposes() -> Result<(), TightBeamError> {
+		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
+		let certificate = TestCertificate::self_signed(&key);
+		let identity = SigningIdentity::new(certificate, Arc::new(Secp256k1KeyProvider::from(key)))?;
+		let configured = KeyPurposes { server: KeyPurposes::HOUSE.client, ..KeyPurposes::HOUSE };
+		let tls = ClusterTlsConfig::from_identity(identity, configured)?;
+
+		let accept = tls.accept_encryption();
+
+		assert_eq!(accept.key_purposes, configured);
+		Ok(())
 	}
 }

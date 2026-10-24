@@ -1,5 +1,13 @@
 //! Work routing through the cluster gateway.
 
+use std::net::Ipv4Addr;
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinHandle;
+
+use tightbeam::colony::hive::{HiveContext, HiveContextImpl};
 use tightbeam::crypto::x509::policy::{CertificateValidation, DirectTrustValidator};
 use tightbeam::testing::TestDigest;
 use tightbeam::{cluster, servlet};
@@ -459,9 +467,9 @@ tb_assert_spec! {
 
 // A work payload that does not decode as a frame is a permanent caller
 // fault. The gateway must refuse it as InvalidArgument at admission,
-// before route selection: zero CLUSTER_WORK_FAILED proves no healthy
-// pheromone trail was weakened and no failover retry burned, and the
-// follow-up valid work echoing through the same trail proves the route
+// before route selection. Zero CLUSTER_WORK_FAILED proves that no healthy
+// pheromone trail was weakened and no failover retry burned. The follow-up
+// valid work then echoes through the same trail, which proves the route
 // stayed serviceable.
 tb_scenario! {
 	name: cluster_refuses_malformed_work_payload,
@@ -505,11 +513,11 @@ tb_scenario! {
 }
 
 cluster! {
-	/// Gateway with an edge accept plane, proving the `edge:` macro arm.
+	/// Gateway with an edge accept plane, which proves the `edge:` macro arm.
 	///
 	/// The edge protocol matches the colony protocol here because core
-	/// ships one async transport, so a mixed-transport colony (TCP colony,
-	/// WebSocket edge) is exercised by the transport extensions.
+	/// ships one async transport, so the transport extensions exercise a
+	/// mixed-transport colony (TCP colony, WebSocket edge).
 	EdgeClusterGateway,
 	protocol: TokioListener,
 	edge: TokioListener
@@ -607,6 +615,500 @@ tb_scenario! {
 
 			trace.event_with(EDGE_START_FAILED, &[], failed)?;
 
+			Ok(())
+		}
+	}
+}
+
+servlet! {
+	/// The first instance of a two-instance type. It reads each frame and
+	/// answers with no frame, so the forward that reached it ends after a
+	/// delivered frame.
+	FirstInstanceServlet<PingRequest, EnvConfig = ()>,
+	protocol: TokioListener,
+	handle: |_req, _frame, ctx| async move {
+		ctx.trace().event(FIRST_INSTANCE_RECEIVED)?;
+		Ok(None)
+	}
+}
+
+servlet! {
+	/// The second instance of a two-instance type. It records each frame it
+	/// receives and echoes the ping.
+	SecondInstanceServlet<PingRequest, EnvConfig = ()>,
+	protocol: TokioListener,
+	handle: |req, frame, ctx| async move {
+		ctx.trace().event(SECOND_INSTANCE_RECEIVED)?;
+
+		let response = Version::V0.compose()
+			.with_id(frame.metadata().id())
+			.with_message(PingResponse { doubled: req.value * 2 })
+			.build()?;
+		Ok(Some(response))
+	}
+}
+
+/// A balancer that picks the instance at `first` while it is in the draw,
+/// and the first candidate otherwise, so a scenario decides which instance
+/// a forward tries before the bounded retry.
+struct FirstAddressBalancer {
+	first: Vec<u8>,
+}
+
+impl LoadBalancer for FirstAddressBalancer {
+	fn select(&self, candidates: &[InstanceMetrics]) -> Option<usize> {
+		let preferred = candidates.iter().position(|candidate| candidate.instance_key == self.first);
+		preferred.or_else(|| candidates.first().map(|_| 0))
+	}
+}
+
+/// A loopback port that refuses every connect for as long as this value
+/// lives, against a concurrent test that binds a port of its own.
+///
+/// - The socket holds the port in the bound state, so the kernel answers a connect to it with a reset.
+/// - The socket binds with `SO_REUSEADDR` cleared, so every other bind of the port conflicts with it.
+/// - A port that went back to the kernel could go to a listener of another test, which would answer the dial.
+struct RefusingPort {
+	_held: HeldPort,
+	address: String,
+}
+
+impl RefusingPort {
+	/// Holds a fresh loopback port.
+	fn hold() -> Self {
+		let held = HeldPort::hold(Ipv4Addr::LOCALHOST, PortSharing::Exclusive);
+		let address = held.address().to_string();
+
+		Self { _held: held, address }
+	}
+
+	/// The held port's address, in the spelling a hive registers.
+	fn address(&self) -> &str {
+		&self.address
+	}
+}
+
+/// Starts a gateway whose balancer tries `first` before any other instance,
+/// and registers one hive that serves `ping` at `first` and at `second`.
+///
+/// The gateway's hive pool offers `mux_offer`, and with none it stays
+/// single-flight.
+async fn gateway_trying_first(
+	trace: &TraceCollector,
+	certs: &ClusterTestCerts,
+	first: &str,
+	second: &str,
+	mux_offer: Option<TransportOffer>,
+) -> Result<(ClusterGateway, GenericClient<TokioListener>), TightBeamError> {
+	let balancer = FirstAddressBalancer { first: first.as_bytes().to_vec() };
+	let builder = ClusterConfig::builder(cluster_tls_config(certs));
+	let mut conf = builder.with_load_balancer(balancer).build();
+	conf.pool_config.mux_offer = mux_offer.map(Arc::new);
+	let cluster = start_cluster(trace, conf).await?;
+
+	let mut client = connect_cluster(certs, cluster.addr()).await?;
+	let hive_addr = b"127.0.0.1:65030";
+	let servlets = [servlet_info("ping", first), servlet_info("ping", second)];
+	let registered = register_signed_hive_serving(&mut client, &certs.key, b"two", hive_addr, servlets).await?;
+	trace.event_with(REGISTER_STATUS, &[], registered.status)?;
+
+	Ok((cluster, client))
+}
+
+tb_assert_spec! {
+	pub ClusterNoRetryAfterDeliverySpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(REGISTER_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
+			(FIRST_INSTANCE_RECEIVED, exactly!(1)),
+			(SECOND_INSTANCE_RECEIVED, exactly!(0)),
+			(WORK_STATUS, exactly!(1), equals!(TransitStatus::Unknown)),
+			(WORK_PAYLOAD, exactly!(1), equals!(0u64))
+		]
+	}
+}
+
+// A signed client command runs at most once. The first instance reads the
+// frame and answers with no frame, so the frame may have run there. The
+// gateway keeps it on the first instance and answers the client that the
+// outcome is unknown.
+tb_scenario! {
+	name: cluster_work_never_retries_a_frame_the_first_instance_read,
+	spec: ClusterNoRetryAfterDeliverySpec,
+	environment Bare {
+		context: cluster_certs(),
+		exec: |SetupEnv { trace, context: certs }| async move {
+			let first = FirstInstanceServlet::start(Arc::new(trace.share()), servlet_tls_config(&certs)?).await?;
+			let second = SecondInstanceServlet::start(Arc::new(trace.share()), servlet_tls_config(&certs)?).await?;
+			let first_addr = first.addr().to_string();
+			let second_addr = second.addr().to_string();
+			let (cluster, mut client) = gateway_trying_first(&trace, &certs, &first_addr, &second_addr, None).await?;
+
+			let refused = emit_ping_work(&mut client, &certs.key, b"read-once").await;
+			record_work_refusal(&trace, refused)?;
+
+			cluster.stop();
+			first.stop();
+			second.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterRetryAfterRefusedConnectSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(REGISTER_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
+			(SECOND_INSTANCE_RECEIVED, exactly!(1)),
+			(WORK_ECHOED, exactly!(1), equals!(42u64))
+		]
+	}
+}
+
+// A refused connect proves the frame never left, so the bounded retry takes
+// it to the second instance, which answers.
+tb_scenario! {
+	name: cluster_work_retries_a_frame_the_first_instance_refused,
+	spec: ClusterRetryAfterRefusedConnectSpec,
+	environment Bare {
+		context: cluster_certs(),
+		exec: |SetupEnv { trace, context: certs }| async move {
+			let second = SecondInstanceServlet::start(Arc::new(trace.share()), servlet_tls_config(&certs)?).await?;
+			let refusing = RefusingPort::hold();
+			let first_addr = refusing.address();
+			let second_addr = second.addr().to_string();
+			let (cluster, mut client) = gateway_trying_first(&trace, &certs, first_addr, &second_addr, None).await?;
+
+			let echoed = emit_ping_work(&mut client, &certs.key, b"refused-first").await?;
+			let ping = decode_ping_echo(&echoed)?;
+			trace.event_with(WORK_ECHOED, &[], u64::from(ping.doubled))?;
+
+			cluster.stop();
+			second.stop();
+			Ok(())
+		}
+	}
+}
+
+servlet! {
+	/// The first instance behind an [`OversizedReplyRelay`]. It sets its
+	/// environment flag once it ran the frame, so the relay answers the
+	/// gateway in place of its reply, and echoes the ping.
+	RelayedFirstServlet<PingRequest, EnvConfig = AtomicBool>,
+	protocol: TokioListener,
+	handle: |req, frame, ctx| async move {
+		ctx.trace().event(FIRST_INSTANCE_RECEIVED)?;
+		ctx.env_config().store(true, Ordering::SeqCst);
+
+		let response = Version::V0.compose()
+			.with_id(frame.metadata().id())
+			.with_message(PingResponse { doubled: req.value * 2 })
+			.build()?;
+		Ok(Some(response))
+	}
+}
+
+/// The length octets a relayed reply header carries: 1 MiB, past the 256 KiB
+/// cap the gateway reads an encrypted envelope under.
+const OVERSIZED_LENGTH: [u8; 4] = [0x83, 0x10, 0x00, 0x00];
+
+/// A loopback relay in front of one servlet, as an on-path party that
+/// rewrites the length octets of a reply.
+///
+/// - The relay forwards the handshake and the request whole.
+/// - Once the servlet's handler ran, the relay answers the gateway with the
+///   tag of the servlet's reply and [`OVERSIZED_LENGTH`] in place of that
+///   reply.
+struct OversizedReplyRelay {
+	address: String,
+	task: JoinHandle<()>,
+}
+
+impl OversizedReplyRelay {
+	/// Relays each connection to the servlet at `servlet`, whose handler sets
+	/// `ran`.
+	async fn start(servlet: String, ran: Arc<AtomicBool>) -> Self {
+		let bound = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await;
+		let listener = bound.expect("a loopback port binds");
+		let address = listener.local_addr().expect("a bound listener has an address").to_string();
+		let task = tokio::spawn(async move {
+			while let Ok((gateway, _)) = listener.accept().await {
+				let Ok(upstream) = TcpStream::connect(servlet.as_str()).await else {
+					return;
+				};
+
+				tokio::spawn(Self::relay(gateway, upstream, Arc::clone(&ran)));
+			}
+		});
+
+		Self { address, task }
+	}
+
+	/// The relay's address, in the spelling a hive registers.
+	fn address(&self) -> &str {
+		&self.address
+	}
+
+	/// Forwards the gateway's bytes to the servlet, and the servlet's replies
+	/// to the gateway through [`Self::replies`].
+	async fn relay(gateway: TcpStream, servlet: TcpStream, ran: Arc<AtomicBool>) {
+		let (mut gateway_read, mut gateway_write) = gateway.into_split();
+		let (mut servlet_read, mut servlet_write) = servlet.into_split();
+		let requests = tokio::io::copy(&mut gateway_read, &mut servlet_write);
+		let replies = Self::replies(&mut servlet_read, &mut gateway_write, &ran);
+
+		// Either side's close ends the relay of this connection, and the
+		// scenario reads the gateway's answer, so neither outcome is read.
+		let _ended = tokio::join!(requests, replies);
+	}
+
+	/// Forwards each DER element the servlet writes until its handler ran,
+	/// then writes the element's tag and [`OVERSIZED_LENGTH`] in its place.
+	async fn replies(
+		servlet: &mut OwnedReadHalf,
+		gateway: &mut OwnedWriteHalf,
+		ran: &AtomicBool,
+	) -> std::io::Result<()> {
+		loop {
+			let (tag, element) = Self::read_element(servlet).await?;
+			if ran.load(Ordering::SeqCst) {
+				let header = [&[tag], &OVERSIZED_LENGTH[..]].concat();
+				return gateway.write_all(&header).await;
+			}
+
+			gateway.write_all(&element).await?;
+		}
+	}
+
+	/// Reads one DER element off `stream`, and returns its tag beside the
+	/// whole element.
+	async fn read_element(stream: &mut OwnedReadHalf) -> std::io::Result<(u8, Vec<u8>)> {
+		let mut header = [0u8; 2];
+		stream.read_exact(&mut header).await?;
+		let [tag, first] = header;
+		let mut element = header.to_vec();
+
+		let length = if first < 0x80 {
+			usize::from(first)
+		} else {
+			let mut octets = vec![0u8; usize::from(first & 0x7f)];
+			stream.read_exact(&mut octets).await?;
+			element.extend_from_slice(&octets);
+			octets.iter().fold(0, |length, octet| (length << 8) | usize::from(*octet))
+		};
+
+		let start = element.len();
+		element.resize(start + length, 0);
+		stream.read_exact(&mut element[start..]).await?;
+
+		Ok((tag, element))
+	}
+}
+
+impl Drop for OversizedReplyRelay {
+	fn drop(&mut self) {
+		self.task.abort();
+	}
+}
+
+// A reply header past the read cap arrives after the frame ran, so it proves
+// nothing about delivery. The gateway keeps the frame on the first instance
+// and answers the client that the outcome is unknown.
+tb_scenario! {
+	name: cluster_work_never_retries_a_frame_whose_reply_header_passes_the_cap,
+	spec: ClusterNoRetryAfterDeliverySpec,
+	environment Bare {
+		context: cluster_certs(),
+		exec: |SetupEnv { trace, context: certs }| async move {
+			let ran = Arc::new(AtomicBool::new(false));
+			let first_conf = servlet_tls_builder(&certs)?.with_config(Arc::clone(&ran)).build();
+			let first = RelayedFirstServlet::start(Arc::new(trace.share()), first_conf).await?;
+			let relay = OversizedReplyRelay::start(first.addr().to_string(), ran).await;
+			let second = SecondInstanceServlet::start(Arc::new(trace.share()), servlet_tls_config(&certs)?).await?;
+			let second_addr = second.addr().to_string();
+			let first_addr = relay.address();
+			let (cluster, mut client) = gateway_trying_first(&trace, &certs, first_addr, &second_addr, None).await?;
+
+			let refused = emit_ping_work(&mut client, &certs.key, b"oversized-reply").await;
+			record_work_refusal(&trace, refused)?;
+
+			cluster.stop();
+			first.stop();
+			second.stop();
+			Ok(())
+		}
+	}
+}
+
+servlet! {
+	/// A sibling whose gate refuses every call as unavailable, as a draining
+	/// servlet does. It records each frame its handler receives.
+	DrainingSiblingServlet<PingRequest, EnvConfig = ()>,
+	protocol: TokioListener,
+	handle: |_req, _frame, ctx| async move {
+		ctx.trace().event(SIBLING_RECEIVED)?;
+		Ok(None)
+	}
+}
+
+/// A collector gate that refuses every call as unavailable, the refusal a
+/// draining servlet answers before its handler runs.
+struct DrainingGate;
+
+impl GatePolicy for DrainingGate {
+	fn evaluate(&self, _message: Option<&Frame>, _session: &SessionContext) -> TransitStatus {
+		TransitStatus::Unavailable
+	}
+}
+
+servlet! {
+	/// The first instance of a two-instance type. Its handler calls a sibling
+	/// with the frame and fails with the sibling's refusal, so the handler has
+	/// run when its failure answers the gateway.
+	SiblingCallingServlet<PingRequest, EnvConfig = ()>,
+	protocol: TokioListener,
+	handle: |_req, frame, ctx| async move {
+		ctx.trace().event(FIRST_INSTANCE_RECEIVED)?;
+
+		let siblings = ctx.hive_context().ok_or(TightBeamError::MissingResponse)?;
+		let sibling = servlet_urn("sibling");
+		siblings.call(&sibling, frame).await?;
+		Ok(None)
+	}
+}
+
+/// The routes a servlet under the [`cluster_certs`] identity calls its
+/// siblings through: one route to the sibling of type `sibling` at
+/// `address`, which answers under that identity too.
+fn sibling_routes(certs: &ClusterTestCerts, address: impl AsRef<str>) -> Arc<dyn HiveContext> {
+	let address = address.as_ref();
+	let mux_offer = Some(Arc::new(TransportOffer::mux(8)));
+	let config = PoolConfig { idle_timeout: None, max_connections: 2, mux_offer };
+	let pool = ConnectionPool::<TokioListener>::builder().with_config(config);
+	let pool = pool.with_trust_store(Arc::clone(&certs.trust)).build();
+
+	let routes = HiveContextImpl::new(Arc::new(pool));
+	let sibling_type = servlet_urn("sibling");
+	let instance = sibling_type.servlet_instance(address);
+	let instance = instance.expect("a servlet type URN yields an instance URN");
+	let instance_key = instance.canonical_bytes();
+	let type_key = sibling_type.canonical_bytes();
+	let route_address: Arc<[u8]> = Arc::from(address.as_bytes());
+	routes.add_route(instance_key, route_address, servlet_signer(), type_key);
+
+	Arc::new(routes)
+}
+
+tb_assert_spec! {
+	pub ClusterNoRetryAfterHandlerFailureSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(REGISTER_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
+			(FIRST_INSTANCE_RECEIVED, exactly!(1)),
+			(SIBLING_RECEIVED, exactly!(0)),
+			(SECOND_INSTANCE_RECEIVED, exactly!(0)),
+			(WORK_STATUS, exactly!(1), equals!(TransitStatus::Unknown)),
+			(WORK_PAYLOAD, exactly!(1), equals!(0u64))
+		]
+	}
+}
+
+// A handler that ran and failed answers `Unknown`, though its failure carries
+// the `Unavailable` a sibling's gate refused it with. A gateway retries only
+// the `Unavailable` a gate answers before any handler runs, so it keeps the
+// frame on the first instance.
+tb_scenario! {
+	name: cluster_work_never_retries_a_frame_whose_handler_relayed_unavailable,
+	spec: ClusterNoRetryAfterHandlerFailureSpec,
+	environment Bare {
+		context: cluster_certs(),
+		exec: |SetupEnv { trace, context: certs }| async move {
+			let sibling_builder = servlet_tls_builder(&certs)?.with_collector_gate(DrainingGate);
+			let sibling_conf = sibling_builder.with_config(Arc::new(())).build();
+			let sibling = DrainingSiblingServlet::start(Arc::new(trace.share()), sibling_conf).await?;
+			let siblings = sibling_routes(&certs, sibling.addr().to_string());
+			let first_conf = servlet_tls_builder(&certs)?.with_hive_context(siblings).with_config(Arc::new(())).build();
+			let first = SiblingCallingServlet::start(Arc::new(trace.share()), first_conf).await?;
+			let second = SecondInstanceServlet::start(Arc::new(trace.share()), servlet_tls_config(&certs)?).await?;
+			let first_addr = first.addr().to_string();
+			let second_addr = second.addr().to_string();
+			let mux = Some(TransportOffer::mux(8));
+			let (cluster, mut client) = gateway_trying_first(&trace, &certs, &first_addr, &second_addr, mux).await?;
+
+			let refused = emit_ping_work(&mut client, &certs.key, b"relayed-unavailable").await;
+			record_work_refusal(&trace, refused)?;
+
+			cluster.stop();
+			first.stop();
+			second.stop();
+			sibling.stop();
+			Ok(())
+		}
+	}
+}
+
+servlet! {
+	/// A servlet that answers at a registered address under an identity the
+	/// registration does not name. It records each frame it receives and
+	/// echoes the ping.
+	ImpostorServlet<PingRequest, EnvConfig = ()>,
+	protocol: TokioListener,
+	handle: |req, frame, ctx| async move {
+		ctx.trace().event(IMPOSTOR_RECEIVED)?;
+
+		let response = Version::V0.compose()
+			.with_id(frame.metadata().id())
+			.with_message(PingResponse { doubled: req.value * 2 })
+			.build()?;
+		Ok(Some(response))
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterWorkImpostorSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(REGISTER_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
+			(events::CLUSTER_DIAL_REFUSED, exactly!(1)),
+			(IMPOSTOR_RECEIVED, exactly!(0)),
+			(WORK_STATUS, exactly!(1), equals!(TransitStatus::Unavailable)),
+			(WORK_PAYLOAD, exactly!(1), equals!(0u64))
+		]
+	}
+}
+
+// A work forward reaches a servlet only under the identity its registration
+// names. The gateway's hive trust holds both identities, so the handshake
+// completes, and the dial's binding alone refuses the answer (CWE-346). The
+// refusal proves the frame never left, so the client hears `Unavailable`.
+tb_scenario! {
+	name: cluster_work_refuses_a_servlet_answering_under_another_identity,
+	spec: ClusterWorkImpostorSpec,
+	environment Bare {
+		context: cluster_certs(),
+		exec: |SetupEnv { trace, context: certs }| async move {
+			let impostor_certs = stranger_gateway_certs();
+			let impostor_conf = servlet_tls_config(&impostor_certs)?;
+			let impostor = ImpostorServlet::start(Arc::new(trace.share()), impostor_conf).await?;
+			let cluster = start_cluster(&trace, impostor_trusting_conf(&certs, &impostor_certs)).await?;
+
+			let mut client = connect_cluster(&certs, cluster.addr()).await?;
+			let hive_addr = b"127.0.0.1:65033";
+			let servlets = [servlet_info("ping", impostor.addr().to_string())];
+			let registered =
+				register_signed_hive_serving(&mut client, &certs.key, b"impostor", hive_addr, servlets).await?;
+			trace.event_with(REGISTER_STATUS, &[], registered.status)?;
+
+			let refused = emit_ping_work(&mut client, &certs.key, b"impostor-work").await;
+			record_work_refusal(&trace, refused)?;
+
+			cluster.stop();
+			impostor.stop();
 			Ok(())
 		}
 	}

@@ -1,10 +1,16 @@
 //! A trust store an outside crate defines through [`CertificateTrust`]
 //! alone, and a server policy it defines through [`CertificateValidation`].
 //!
-//! [`PinningTrust`] trusts the certificates its operator pins, names the
-//! trust anchor of each, and resolves a frame signer among them admitted for
-//! the signer purpose. The crate's default `verify_frame` runs over it and
-//! returns the admitted certificate in [`TrustVerification::Verified`].
+//! [`PinningTrust`] trusts the certificates its operator pins and names the
+//! trust anchor of each:
+//!
+//! - It resolves a frame signer among them admitted for the signer purpose,
+//!   so the crate's default `verify_frame` runs over it and returns the
+//!   admitted certificate in [`TrustVerification::Verified`].
+//! - An HPKE client anchors on it through `LearnedTrust::anchored`, which
+//!   reads the crate's default `verify_presented` over its `verify_chain`.
+//! - A mutual server admits its client through it, which reads the crate's
+//!   default `evaluate_presented` over its `evaluate`.
 //!
 //! It reads a key by its [`CanonicalKey`], the rule that the contract of
 //! [`CertificateTrust`] names.
@@ -32,11 +38,15 @@ use tightbeam::crypto::hpke::DhKemSecp256k1;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use tightbeam::crypto::profiles::DefaultCryptoProvider;
 #[cfg(feature = "transport-hpke")]
+use tightbeam::crypto::x509::error::CertificateValidationError::CertificateNotTrusted;
+#[cfg(feature = "transport-hpke")]
 use tightbeam::crypto::x509::policy::DirectTrustValidator;
 #[cfg(feature = "transport-cms")]
 use tightbeam::testing::TestCmsServer;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use tightbeam::transport::handshake::negotiation::RunnableProfile;
+#[cfg(feature = "transport-hpke")]
+use tightbeam::transport::handshake::PeerAuthentication;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use tightbeam::transport::handshake::SupportedProfiles;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -253,16 +263,33 @@ fn hpke_endpoints(
 	policy: Arc<dyn CertificateValidation>,
 ) -> (HouseClient<Hpke>, HouseServer<Hpke>) {
 	let trust = DirectTrustValidator::default().with_trust_chain([server.certificate().to_owned()]);
-	let settings = HpkeClientSettings::new(LearnedTrust::new(trust));
-	let client = ClientConfig::<Hpke, DefaultCryptoProvider>::new(settings, KeyPurposes::HOUSE);
-	let client = client.expect("an anonymous client serves the client role");
+	let client = hpke_client(LearnedTrust::new(trust));
+	let client = Handshake::client(client.with_server_policy([policy]));
+	(client, hpke_server(server))
+}
 
+/// The configuration of an anonymous HPKE client that admits its server
+/// under `trust`.
+#[cfg(feature = "transport-hpke")]
+fn hpke_client(trust: LearnedTrust) -> ClientConfig<Hpke, DefaultCryptoProvider> {
+	let settings = HpkeClientSettings::new(trust);
+	let client = ClientConfig::<Hpke, DefaultCryptoProvider>::new(settings, KeyPurposes::HOUSE);
+	client.expect("an anonymous client serves the client role")
+}
+
+/// The configuration of the HPKE server that signs under `server`.
+#[cfg(feature = "transport-hpke")]
+fn hpke_server_config(server: SigningIdentity) -> ServerConfig<Hpke, DefaultCryptoProvider> {
 	let settings = HpkeServerSettings::new();
 	let purposes = KeyPurposes::HOUSE;
 	let config = ServerConfig::<Hpke, DefaultCryptoProvider>::new(settings, server, house_profiles(), purposes);
-	let config = config.expect("a test server identity serves the server role");
-	let client = Handshake::client(client.with_server_policy([policy]));
-	(client, Handshake::server(config))
+	config.expect("a test server identity serves the server role")
+}
+
+/// The HPKE server that signs under `server`.
+#[cfg(feature = "transport-hpke")]
+fn hpke_server(server: SigningIdentity) -> HouseServer<Hpke> {
+	Handshake::server(hpke_server_config(server))
 }
 
 /// A CMS client that pins the key-agreement certificate of `server` and runs
@@ -320,6 +347,42 @@ async fn an_outside_policy_refuses_an_hpke_server_it_does_not_pin() -> Result<()
 	Ok(())
 }
 
+/// An HPKE client anchored on the outside store admits the server whose
+/// certificate the store pins, through the path validation the store
+/// defines.
+#[cfg(feature = "transport-hpke")]
+#[tokio::test]
+async fn an_outside_store_anchors_an_hpke_client_on_the_server_it_pins() -> Result<(), HandshakeError> {
+	let server = TestIdentity::of(&TestKey::insecure_fixed_signing());
+	let expected = server.certificate().to_owned();
+	let store = Arc::new(PinningTrust::of(vec![expected.to_owned()]));
+	let mut client = Handshake::client(hpke_client(LearnedTrust::anchored(store)));
+	let mut server = hpke_server(server);
+
+	let reply = server.reply(client.start()?).await?;
+	client.respond(reply).await?;
+	assert_eq!(client.peer_certificate(), Some(&expected));
+	Ok(())
+}
+
+/// An HPKE client anchored on the outside store refuses a server whose
+/// certificate the store does not pin.
+#[cfg(feature = "transport-hpke")]
+#[tokio::test]
+async fn an_outside_store_refuses_an_hpke_server_it_does_not_pin() -> Result<(), HandshakeError> {
+	let server = TestIdentity::of(&TestKey::insecure_fixed_signing());
+	let other = TestCertificate::self_signed(&TestKey::negation_of(&TestKey::insecure_fixed_signing()));
+	let store = Arc::new(PinningTrust::of(vec![other]));
+	let mut client = Handshake::client(hpke_client(LearnedTrust::anchored(store)));
+	let mut server = hpke_server(server);
+
+	let reply = server.reply(client.start()?).await?;
+	let refused = client.respond(reply).await;
+	let untrusted = matches!(refused, Err(HandshakeError::CertificateValidationError(CertificateNotTrusted)));
+	assert!(untrusted);
+	Ok(())
+}
+
 /// The outside policy reads the pinned key-agreement certificate of a CMS
 /// server, so a pin of its key admits the server after the server rotates
 /// its signing certificate.
@@ -352,4 +415,31 @@ fn an_outside_policy_refuses_a_cms_server_before_the_opening() {
 			CertificateValidationError::PublicKeyNotPinned
 		))
 	));
+}
+
+/// A mutual HPKE server whose one client validator is the outside store
+/// admits the client it pins, through the default `evaluate_presented`,
+/// which reads the client's certificate alone beside the issuers its
+/// Finished presents.
+#[cfg(feature = "transport-hpke")]
+#[tokio::test]
+async fn an_outside_store_admits_the_client_it_pins_beside_its_presented_issuers() -> Result<(), HandshakeError> {
+	let chain = TestCertificate::insecure_fixed_chain()?;
+	let identity = TestIdentity::presenting(chain.leaf.to_owned(), &chain.leaf_key).with_chain([chain.intermediate])?;
+	let server = TestIdentity::of(&TestKey::insecure_fixed_signing());
+	let trust = DirectTrustValidator::default().with_trust_chain([server.certificate().to_owned()]);
+	let mut settings = HpkeClientSettings::new(LearnedTrust::new(trust));
+	settings.identity = Some(identity);
+	let client = ClientConfig::<Hpke, DefaultCryptoProvider>::new(settings, KeyPurposes::HOUSE)?;
+	let mut server = hpke_server_config(server);
+	let validator: Arc<dyn CertificateValidation> = Arc::new(PinningTrust::of(vec![chain.leaf.to_owned()]));
+	server.peer_authentication = PeerAuthentication::mutual([validator]);
+	let (mut client, mut server) = (Handshake::client(client), Handshake::server(server));
+
+	let reply = server.reply(client.start()?).await?;
+	let closing = client.respond(reply).await?;
+	server.finish(closing).await?;
+	let session = server.complete()?;
+	assert_eq!(session.peer(), Some(&chain.leaf));
+	Ok(())
 }

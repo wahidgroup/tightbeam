@@ -1,6 +1,6 @@
 //! Peer federation tests for the advertisement control plane.
 
-use std::net::TcpListener;
+use std::net::{Ipv4Addr, TcpListener};
 
 use super::common::*;
 use tightbeam::colony::cluster::ClusterConfigBuilder;
@@ -114,7 +114,7 @@ tb_assert_spec! {
 
 // A trusted peer advertisement installs peer routes: the advertised type
 // surfaces in `peer_servlets` (learned), never in `available_servlets`
-// (local hives only). No forwarding happens in this stage.
+// (local hives only). This scenario stops at the install, before any forward.
 tb_scenario! {
 	name: cluster_accepts_peer_advertisement,
 	spec: ClusterPeerRouteIntrospectionSpec,
@@ -273,7 +273,7 @@ tb_scenario! {
 }
 
 // Federation is default-off: a gateway without `peer_trust` refuses every
-// advertisement fail-closed, installing no peer routes.
+// advertisement fail-closed and installs no peer routes.
 tb_scenario! {
 	name: cluster_refuses_advertisement_without_peer_trust,
 	spec: ClusterPeerRefusedSpec,
@@ -750,7 +750,7 @@ tb_scenario! {
 			}
 
 			// Heal the colony: a local ping hive joins after the bad nest
-			// is abandoned, leaving one live route for the type.
+			// is abandoned, which leaves one live route for the type.
 			hive.register_with_cluster(importer.addr()).await?;
 
 			trace.event(WORK_SENT)?;
@@ -849,7 +849,7 @@ tb_assert_spec! {
 	}
 }
 
-// Reconciliation is by replacement: a later advertisement carrying an
+// Reconciliation is by replacement: a later advertisement that carries an
 // empty slate retires every route of the peer's earlier slate.
 tb_scenario! {
 	name: cluster_empty_advertisement_clears_peer_routes,
@@ -1149,10 +1149,30 @@ fn wildcard_advertising_builder(certs: &ClusterTestCerts, peer: impl Into<String
 		.with_advertise_interval(Duration::from_millis(100))
 }
 
-/// A port on the IPv4 wildcard that no listener holds when this returns.
-fn vacant_wildcard_port() -> u16 {
-	let probe = TcpListener::bind("0.0.0.0:0").expect("the wildcard has a free port");
-	probe.local_addr().expect("a bound listener has an address").port()
+/// A port on the IPv4 wildcard that this value reserves for the scenario's
+/// own listener, against a concurrent test that binds a port of its own.
+///
+/// - The socket holds the port in the bound state with `SO_REUSEADDR` set.
+/// - A listener that names the port and sets `SO_REUSEADDR` binds beside the reservation.
+/// - A bind that asks the kernel for any port passes over the reserved one.
+struct ReservedWildcardPort {
+	_held: HeldPort,
+	port: u16,
+}
+
+impl ReservedWildcardPort {
+	/// Reserves a fresh port on the IPv4 wildcard.
+	fn hold() -> Self {
+		let held = HeldPort::hold(Ipv4Addr::UNSPECIFIED, PortSharing::Shared);
+		let port = held.address().port();
+
+		Self { _held: held, port }
+	}
+
+	/// The reserved port.
+	fn port(&self) -> u16 {
+		self.port
+	}
 }
 
 /// Whether a fresh listener can take `port` on the IPv4 wildcard, which
@@ -1170,7 +1190,8 @@ tb_scenario! {
 	environment Bare {
 		context: cluster_certs(),
 		exec: |SetupEnv { trace, context: certs }| async move {
-			let port = vacant_wildcard_port();
+			let reserved = ReservedWildcardPort::hold();
+			let port = reserved.port();
 			let conf = wildcard_advertising_builder(&certs, "127.0.0.1:65210")
 				.with_bind_addr(format!("0.0.0.0:{port}"))
 				.build();

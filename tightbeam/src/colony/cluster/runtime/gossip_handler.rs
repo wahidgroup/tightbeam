@@ -1,12 +1,9 @@
 //! Peer-ad, gossip relay, publish, and reconcile request handlers.
 
-use core::hash::Hash;
-use core::str::FromStr;
-
 use crate::builder::frame::FrameBuilder;
 use crate::builder::TypeBuilder;
 use crate::colony::cluster::peer::AdmittedPeerAd;
-use crate::colony::cluster::runtime::bounds::{ClusterDigest, GatewayRuntimeCtx};
+use crate::colony::cluster::runtime::bounds::{ClusterDigest, ColonyDialProtocol, GatewayRuntimeCtx};
 use crate::colony::cluster::runtime::gossip_tasks::{GossipOrigin, GossipPipelineCtx};
 use crate::colony::cluster::runtime::refuse::Refusal;
 use crate::colony::cluster::{gossip_want, RouteKind};
@@ -18,14 +15,9 @@ use crate::colony::common::{
 };
 use crate::constants::MAX_PEX_SAMPLE;
 use crate::constants::{MAX_GOSSIP_LOG, MAX_GOSSIP_TTL};
-use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::instrumentation::events::CLUSTER_PEER_ADVERTISED;
 use crate::policy::TransitStatus;
-use crate::transport::messaging::{MessageCollector, MessageEmitter};
-use crate::transport::multiplex::MuxConnector;
-use crate::transport::policy::PolicyConfig;
-use crate::transport::state::EncryptedProtocolState;
-use crate::transport::{EncryptedProtocol, PersistentConnection, Protocol};
+use crate::transport::Protocol;
 use crate::Frame;
 use crate::TightBeamError;
 use crate::Version;
@@ -64,7 +56,8 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 		// seed-bootstrapped node. The hint sits in the capped new table until
 		// that probe proves the address answers as a flood member.
 		let hint = admitted.discovery_hint();
-		if self.config.peer.table.learn([hint]).is_err() {
+		let learned_at = self.config.clock.unix();
+		if self.config.peer.table.learn([hint], learned_at).is_err() {
 			let unavailable = TransitStatus::Unavailable;
 			return Refusal::to(&frame, &self.trace).peer_ad_release(&self.replay_guard, signature, unavailable);
 		}
@@ -85,24 +78,7 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 	}
 }
 
-impl<P> GossipPipelineCtx<P>
-where
-	P: Protocol
-		+ PersistentConnection
-		+ EncryptedProtocol<CryptoProvider = DefaultCryptoProvider>
-		+ Send
-		+ Sync
-		+ 'static,
-	P::Address: Hash + Eq + Clone + Send + Sync + FromStr + 'static,
-	P::Transport: MessageEmitter
-		+ MessageCollector
-		+ PolicyConfig
-		+ MuxConnector
-		+ EncryptedProtocolState
-		+ Send
-		+ Sync
-		+ 'static,
-{
+impl<P: ColonyDialProtocol> GossipPipelineCtx<P> {
 	/// Admit a peer-relayed origin-signed rumor and continue the flood.
 	pub(crate) async fn relay<D: ClusterDigest>(
 		self,
@@ -273,7 +249,7 @@ impl ClusterConfig {
 				gateway_addr: entry.dial_target().route_bytes().to_vec(),
 			});
 
-		// The sample holds to MAX_PEX_SAMPLE, so a linear scan dedupes
+		// The sample is capped at `MAX_PEX_SAMPLE`, so a linear scan dedupes
 		// by dial address without a set allocation per entry.
 		let mut pex: Vec<PeerGossip> = Vec::new();
 		for candidate in verified.chain(routes) {

@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use crate::colony::hive::runtime::HiveContextImpl;
-use crate::colony::hive::{RefusedRegistration, ServletRegistration, ServletRegistry};
+use crate::colony::hive::{RefusedRegistration, ServletPlacement, ServletRegistration, ServletRegistry};
 use crate::transport::Protocol;
 use crate::urn::Urn;
 use crate::{Errorizable, TightBeamError};
@@ -50,10 +50,11 @@ impl<'a, R: ServletRegistry, P: Protocol> HiveInstances<'a, R, P> {
 
 	/// Registers one servlet and the route that reaches it.
 	///
-	/// Returns the instance URN and shared address bytes, which callers
-	/// notify the cluster with. A registration that does not land stops
-	/// its servlet through [`ServletBox::stop_boxed`], whichever step
-	/// refused it.
+	/// Returns where the servlet sits, which callers notify the cluster with.
+	/// A servlet that names no signer gets no route, because a sibling's dial
+	/// admits a servlet's answer by that signer alone (CWE-346). A
+	/// registration that does not land stops its servlet through
+	/// [`ServletBox::stop_boxed`], whichever step refused it.
 	///
 	/// [`ServletBox::stop_boxed`]: crate::colony::hive::ServletBox::stop_boxed
 	///
@@ -61,10 +62,9 @@ impl<'a, R: ServletRegistry, P: Protocol> HiveInstances<'a, R, P> {
 	///
 	/// - [`InsertRefusal::Unnameable`] -- the servlet's address is not a valid instance locator.
 	/// - [`InsertRefusal::Registry`] -- the registry did not take the registration. No route is added.
-	pub fn insert(&self, registration: ServletRegistration) -> Result<(Urn<'static>, Arc<[u8]>), InsertRefusal> {
-		let addr_bytes = registration.servlet.addr_bytes();
-		let instance = match registration.servlet_type.instance_urn(addr_bytes.as_ref()) {
-			Ok(instance) => instance,
+	pub(crate) fn insert(&self, registration: ServletRegistration) -> Result<ServletPlacement, InsertRefusal> {
+		let placement = match registration.placement() {
+			Ok(placement) => placement,
 			Err(error) => {
 				let refused = RefusedRegistration { error, registration };
 
@@ -72,7 +72,7 @@ impl<'a, R: ServletRegistry, P: Protocol> HiveInstances<'a, R, P> {
 			}
 		};
 
-		let key_bytes = instance.canonical_bytes();
+		let key_bytes = placement.instance.canonical_bytes();
 		let type_key = registration.servlet_type.canonical_bytes();
 		// The route map and the registry each own a key, so the bytes clone.
 		let route_key = key_bytes.clone();
@@ -82,9 +82,12 @@ impl<'a, R: ServletRegistry, P: Protocol> HiveInstances<'a, R, P> {
 		self.servlets
 			.insert(key_bytes, registration)
 			.map_err(|refused| InsertRefusal::Registry(refused.stop_servlet()))?;
-		self.routes.add_route(route_key, Arc::clone(&addr_bytes), &type_key);
+		if let Some(signer) = &placement.signer {
+			let address = Arc::clone(&placement.address);
+			self.routes.add_route(route_key, address, Arc::clone(signer), &type_key);
+		}
 
-		Ok((instance, addr_bytes))
+		Ok(placement)
 	}
 
 	/// Removes one instance: its registry entry, then its route, then the
@@ -117,6 +120,7 @@ mod tests {
 	use core::sync::atomic::{AtomicBool, Ordering};
 
 	use super::*;
+	use crate::cms::signed_data::SignerIdentifier;
 	use crate::colony::common::ColonyNamespace;
 	use crate::colony::hive::{HashMapRegistry, HiveContext, ServletBox, ServletInfo, SpawnerFn};
 	use crate::router::RouterError;
@@ -132,6 +136,7 @@ mod tests {
 	/// stop call was made. This probe records the call instead.
 	struct StopProbe {
 		stopped: Arc<AtomicBool>,
+		signer: Option<SignerIdentifier>,
 	}
 
 	impl ServletBox for StopProbe {
@@ -141,6 +146,10 @@ mod tests {
 
 		fn stop_boxed(self: Box<Self>) {
 			self.stopped.store(true, Ordering::SeqCst);
+		}
+
+		fn signer(&self) -> Option<&SignerIdentifier> {
+			self.signer.as_ref()
 		}
 	}
 
@@ -153,6 +162,7 @@ mod tests {
 		routes: Arc<HiveContextImpl<TokioListener>>,
 		servlet_type: Urn<'static>,
 		routed_at_stop: Arc<AtomicBool>,
+		signer: SignerIdentifier,
 	}
 
 	impl ServletBox for RouteProbe {
@@ -163,6 +173,10 @@ mod tests {
 		fn stop_boxed(self: Box<Self>) {
 			let routed = self.routes.resolves(&self.servlet_type);
 			self.routed_at_stop.store(routed, Ordering::SeqCst);
+		}
+
+		fn signer(&self) -> Option<&SignerIdentifier> {
+			Some(&self.signer)
 		}
 	}
 
@@ -225,17 +239,25 @@ mod tests {
 		}
 	}
 
-	/// A registration of one [`StopProbe`] under `servlet_type`.
-	///
-	/// The insert under test reads no spawner, so the one it carries is
-	/// the registered type's own probe factory.
-	fn probe_registration(servlet_type: Urn<'static>, stopped: &Arc<AtomicBool>) -> ServletRegistration {
-		let probe = StopProbe { stopped: Arc::clone(stopped) };
-		let spawner: SpawnerFn = Arc::new(|_| {
-			Box::pin(async { Ok(Box::new(StopProbe { stopped: Arc::default() }) as Box<dyn ServletBox>) })
-		});
+	/// The spawner every probe registration carries. The insert under test
+	/// reads no spawner, so it is the registered type's own probe factory.
+	fn probe_spawner() -> SpawnerFn {
+		Arc::new(|_| {
+			let probe = StopProbe { stopped: Arc::default(), signer: None };
+			Box::pin(async move { Ok(Box::new(probe) as Box<dyn ServletBox>) })
+		})
+	}
 
-		ServletRegistration { servlet: Box::new(probe), spawner, servlet_type }
+	/// A registration of one [`StopProbe`] under `servlet_type` that names
+	/// `signer`.
+	fn probe_registration(
+		servlet_type: Urn<'static>,
+		stopped: &Arc<AtomicBool>,
+		signer: Option<SignerIdentifier>,
+	) -> ServletRegistration {
+		let probe = StopProbe { stopped: Arc::clone(stopped), signer };
+
+		ServletRegistration { servlet: Box::new(probe), spawner: probe_spawner(), servlet_type }
 	}
 
 	/// A registration of one [`RouteProbe`] under `servlet_type`, watching
@@ -249,10 +271,9 @@ mod tests {
 			routes: Arc::clone(routes),
 			servlet_type: servlet_type.clone(),
 			routed_at_stop: Arc::clone(routed_at_stop),
+			signer: ServletInfo::fixture_signer(),
 		};
-		let spawner: SpawnerFn = Arc::new(|_| {
-			Box::pin(async { Ok(Box::new(StopProbe { stopped: Arc::default() }) as Box<dyn ServletBox>) })
-		});
+		let spawner = probe_spawner();
 
 		ServletRegistration { servlet: Box::new(probe), spawner, servlet_type: servlet_type.clone() }
 	}
@@ -277,7 +298,7 @@ mod tests {
 		let servlets = RefusingRegistry;
 		let routes = routes();
 		let stopped = Arc::new(AtomicBool::new(false));
-		let registration = probe_registration(servlet_type.clone(), &stopped);
+		let registration = probe_registration(servlet_type.clone(), &stopped, Some(ServletInfo::fixture_signer()));
 
 		let inserted = HiveInstances::new(&servlets, &routes).insert(registration);
 
@@ -298,12 +319,30 @@ mod tests {
 		let routed_at_stop = Arc::new(AtomicBool::new(true));
 		let registration = route_probe_registration(&routes, &servlet_type, &routed_at_stop);
 		let instances = HiveInstances::new(&servlets, &routes);
-		let (instance, _addr) = instances.insert(registration)?;
+		let placed = instances.insert(registration)?;
 
-		let removed = instances.remove(instance.canonical_bytes());
+		let removed = instances.remove(placed.instance.canonical_bytes());
 
 		assert!(removed.is_some());
 		assert!(!routed_at_stop.load(Ordering::SeqCst));
+		Ok(())
+	}
+
+	/// A servlet that names no signer registers and gets no route, because a
+	/// sibling's dial admits a servlet's answer by that signer alone
+	/// (CWE-346).
+	#[tokio::test]
+	async fn an_unsigned_servlet_registers_with_no_route() -> Result<(), Box<dyn Error>> {
+		let servlet_type = ColonyNamespace::default().servlet("echo")?;
+		let servlets = HashMapRegistry::default();
+		let routes = routes();
+		let registration = probe_registration(servlet_type.clone(), &Arc::default(), None);
+
+		HiveInstances::new(&servlets, &routes).insert(registration)?;
+
+		let unrouted = routes.call(&servlet_type, call_frame()).await;
+		assert_eq!(servlets.count(), 1);
+		assert!(matches!(unrouted, Err(TightBeamError::RouterError(RouterError::UnknownRoute))));
 		Ok(())
 	}
 }

@@ -56,6 +56,7 @@ mod hpke {
 		NO_OUTCOME_BEFORE_CONCLUSION, SESSION_NEVER_ACTIVATES, SETTLE_NEVER_FIRED, TAMPERED_CIPHERTEXT_REJECTED,
 	};
 
+	use tightbeam::crypto::cms::EnvelopeError;
 	use tightbeam::crypto::profiles::DefaultCryptoProvider;
 	use tightbeam::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
 	use tightbeam::exactly;
@@ -126,7 +127,7 @@ mod hpke {
 				let tampered = flip_sealed_content(sealed_closing.value())?;
 
 				let closing = server.finish(HandshakeMessage::try_from(tampered)?).await;
-				let rejected = matches!(closing, Err(HandshakeError::SealedClosing(_)));
+				let rejected = matches!(closing, Err(HandshakeError::SealedClosing(EnvelopeError::Authentication)));
 				trace.event_with(TAMPERED_CIPHERTEXT_REJECTED, &[], rejected)?;
 
 				let unsettled = authorizer.settle_calls() == 0;
@@ -154,6 +155,7 @@ mod cms {
 		NO_OUTCOME_BEFORE_CONCLUSION, SESSION_NEVER_ACTIVATES, SETTLE_NEVER_FIRED, TAMPERED_CIPHERTEXT_REJECTED,
 	};
 
+	use tightbeam::crypto::cms::EnvelopeError;
 	use tightbeam::exactly;
 	use tightbeam::tb_assert_spec;
 	use tightbeam::tb_scenario;
@@ -207,7 +209,7 @@ mod cms {
 				let tampered = flip_sealed_content(sealed_finished.value())?;
 
 				let closing = server.finish(HandshakeMessage::try_from(tampered)?).await;
-				let rejected = matches!(closing, Err(HandshakeError::SealedClosing(_)));
+				let rejected = matches!(closing, Err(HandshakeError::SealedClosing(EnvelopeError::Authentication)));
 				trace.event_with(TAMPERED_CIPHERTEXT_REJECTED, &[], rejected)?;
 
 				let unsettled = authorizer.settle_calls() == 0;

@@ -41,7 +41,8 @@
 //! The scenario proves the observable end-to-end property with three events:
 //!
 //! - The plaintext settlement answer is absent from the DER of the closing.
-//! - The server refuses the corrupted closing at step 2 with [`HandshakeError::SealedClosing`].
+//! - The server refuses the corrupted closing at step 2 with
+//!   [`HandshakeError::SealedClosing`] of `EnvelopeError::Authentication`.
 //! - The authorizer's `settle` hook records zero calls.
 //!
 //! Layer 1 catches the corruption, so the property holds independent of the
@@ -58,6 +59,7 @@
 
 use std::sync::Arc;
 
+use tightbeam::crypto::cms::EnvelopeError::Authentication;
 use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
 use tightbeam::exactly;
@@ -148,7 +150,7 @@ tb_scenario! {
 			// `finish` refuses the closing before the key confirmation, the
 			// admission, and the settlement side effect.
 			let closing_result = server.finish(HandshakeMessage::try_from(corrupted)?).await;
-			let rejected = matches!(closing_result, Err(HandshakeError::SealedClosing(_)));
+			let rejected = matches!(closing_result, Err(HandshakeError::SealedClosing(Authentication)));
 
 			trace.event_with(CORRUPTED_CLOSING_REJECTED, &[], rejected)?;
 			trace.event_with(SETTLE_NEVER_FIRED, &[], authorizer.settle_calls() == 0)?;

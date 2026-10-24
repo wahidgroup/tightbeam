@@ -1,10 +1,10 @@
-//! Thin gateway request router for unary control frames.
+//! Gateway request router for unary control frames.
 //!
-//! `handle_request` evaluates gate policies, decodes the request envelope,
-//! and dispatches by [`ClusterRequest`] variant. `handle_edge_request` is
-//! the same path for an edge accept plane, where the envelope narrows to a
-//! work request. Export gates run only on the work arm, where the servlet
-//! target is known after decode.
+//! [`GatewayRuntimeCtx::handle_request`] evaluates gate policies, decodes the
+//! request envelope, and dispatches by [`ClusterRequest`] variant.
+//! [`GatewayRuntimeCtx::handle_edge_request`] is the same path for an edge
+//! accept plane, where the envelope narrows to a work request. Export gates
+//! run only on the work arm, where the servlet target is known after decode.
 //!
 //! # Evaluation order
 //!
@@ -12,22 +12,13 @@
 //! 2. Decode [`ClusterRequest`] from the frame body.
 //! 3. On [`ClusterRequest::Work`], `evaluate_export_gates` with
 //!    [`HopBudget::is_relayed`] before [`GatewayRuntimeCtx::handle_work`].
-//! 4. Route all other variants to their handlers (registration, gossip, etc.).
+//! 4. Route every other variant to its handler, such as registration or gossip.
 
-use core::hash::Hash;
-use core::str::FromStr;
-
-use crate::colony::cluster::runtime::bounds::{ClusterDigest, GatewayRuntimeCtx};
+use crate::colony::cluster::runtime::bounds::{ClusterDigest, ColonyDialProtocol, GatewayRuntimeCtx};
 use crate::colony::cluster::{ClusterWorkRequest, ClusterWorkResponse, HopBudget, WireHopBudget};
 use crate::colony::common::{reply_frame, ClusterRequest};
-use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::decode;
 use crate::policy::{SessionContext, TransitStatus};
-use crate::transport::messaging::{MessageCollector, MessageEmitter};
-use crate::transport::multiplex::MuxConnector;
-use crate::transport::policy::PolicyConfig;
-use crate::transport::state::EncryptedProtocolState;
-use crate::transport::{EncryptedProtocol, PersistentConnection, Protocol};
 use crate::Frame;
 use crate::TightBeamError;
 
@@ -41,24 +32,7 @@ enum RequestAdmission {
 	Refused(TransitStatus),
 }
 
-impl<P> GatewayRuntimeCtx<P>
-where
-	P: Protocol
-		+ PersistentConnection
-		+ EncryptedProtocol<CryptoProvider = DefaultCryptoProvider>
-		+ Send
-		+ Sync
-		+ 'static,
-	P::Address: Hash + Eq + Clone + Send + Sync + FromStr + 'static,
-	P::Transport: MessageEmitter
-		+ MessageCollector
-		+ PolicyConfig
-		+ MuxConnector
-		+ EncryptedProtocolState
-		+ Send
-		+ Sync
-		+ 'static,
-{
+impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 	/// Route one unary gateway request from frame decode through dispatch.
 	///
 	/// Gate policies run first. Export gates run on the work arm only,
@@ -92,8 +66,9 @@ where
 	/// Route one unary request that arrived on an edge accept plane.
 	///
 	/// An edge plane is a work-submission surface, so the envelope narrows
-	/// to [`ClusterWorkRequest`] here. Registration, peer advertisement,
-	/// and gossip have no edge form to dispatch.
+	/// to [`ClusterWorkRequest`] here. Every other envelope, such as a
+	/// registration, a peer advertisement, or a gossip rumor, answers
+	/// [`TransitStatus::PermissionDenied`].
 	pub(crate) async fn handle_edge_request(
 		self,
 		frame: Frame,
@@ -133,8 +108,8 @@ where
 
 	/// Export-gate and route one work request.
 	///
-	/// Target and relayed flag are known after decode, so export gates run
-	/// here rather than beside the transport gates.
+	/// The target and the relayed flag are known after decode, so export gates
+	/// run here rather than beside the transport gates.
 	async fn handle_work_request(
 		self,
 		frame: Frame,

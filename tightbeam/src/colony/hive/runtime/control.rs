@@ -100,7 +100,8 @@ impl InFlight {
 	}
 }
 
-/// Releases its count on drop, so an early return still settles the drain.
+/// One command's share of the [`InFlight`] count. The guard releases it on
+/// drop, so an early return still settles the drain.
 pub struct InFlightGuard(Arc<InFlightState>);
 
 impl Drop for InFlightGuard {
@@ -268,15 +269,15 @@ impl<P: Protocol> HiveControlCtx<P> {
 
 		let registration = ServletRegistration { servlet: new_servlet, spawner: Arc::clone(spawner), servlet_type };
 		let instances = HiveInstances::new(self.servlets.as_ref(), &self.hive_context);
-		let (instance, addr_bytes) = match instances.insert(registration) {
+		let placed = match instances.insert(registration) {
 			Ok(placed) => placed,
 			Err(InsertRefusal::Unnameable(_)) => return admitted.refuse(CommandRefusal::UnnameableInstance),
 			Err(InsertRefusal::Registry(_)) => return admitted.refuse(CommandRefusal::RegistryFault),
 		};
 
-		// The manage response owns its address bytes, so this copy is real.
-		let address = addr_bytes.as_ref().to_vec();
-		let response = HiveManagementResponse::spawn_ok(address, instance);
+		// The manage response owns its address bytes, so this copy is needed.
+		let address = placed.address.as_ref().to_vec();
+		let response = HiveManagementResponse::spawn_ok(address, placed.instance);
 
 		admitted.reply(ClusterCommandResponse::manage(response))
 	}

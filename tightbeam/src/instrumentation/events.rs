@@ -1,4 +1,4 @@
-//! Event URN constants for tightbeam instrumentation events.
+//! Each constant here names one tightbeam instrumentation event by its URN.
 //!
 //! The single system-wide inventory assigns one URN per emit site or event
 //! kind. Domain-scoped NSS segments keep identities from colliding across
@@ -137,10 +137,21 @@ pub const CLUSTER_WORK_UNAVAILABLE: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "e
 pub const CLUSTER_WORK_FAILED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:cluster/work-failed");
 pub const CLUSTER_WORK_FORWARDED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:cluster/work-forwarded");
 pub const CLUSTER_HIVE_EVICTED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:cluster/hive-evicted");
-/// A registry, table, or journal lock a gateway loop read is poisoned, so
-/// that loop has ended. The payload names the fault. A poisoned std lock
-/// never clears, and the loop's task returns nothing its owner reads, so
-/// this event is the one place the end is visible.
+/// Marks a dial of a target that a route or a registration names, refused
+/// because the party that answered there presented another certificate or
+/// none. The payload is the dialed address, and the dial ended before any
+/// frame left.
+///
+/// ```
+/// use tightbeam::instrumentation::events::CLUSTER_DIAL_REFUSED;
+///
+/// assert_eq!(CLUSTER_DIAL_REFUSED.to_string(), "urn:tightbeam:event:cluster/dial-refused");
+/// ```
+pub const CLUSTER_DIAL_REFUSED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:cluster/dial-refused");
+/// Marks a gateway loop that ended because a registry, table, or journal
+/// lock it read is poisoned. The payload names the fault. A poisoned std
+/// lock never clears, and the loop's task returns nothing its owner reads,
+/// so this event is the one place the end is visible.
 pub const CLUSTER_LOOP_POISONED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:cluster/loop-poisoned");
 
 // Cluster export events
@@ -158,6 +169,16 @@ pub const CLUSTER_PEER_AD_PUBLISH_FAILED: Urn<'static> =
 	crate::urn!(TIGHTBEAM_NID, "event:cluster/peer-ad-publish-failed");
 pub const CLUSTER_PEER_DISCOVERED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:cluster/peer-discovered");
 pub const CLUSTER_PEER_EVICTED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:cluster/peer-evicted");
+/// Marks a peer address that answered from outside the flood, so it left the
+/// peer exchange sample and each learned table that held it. The payload is
+/// the address, and the routes that dial it stay.
+///
+/// ```
+/// use tightbeam::instrumentation::events::CLUSTER_PEER_EXPELLED;
+///
+/// assert_eq!(CLUSTER_PEER_EXPELLED.to_string(), "urn:tightbeam:event:cluster/peer-expelled");
+/// ```
+pub const CLUSTER_PEER_EXPELLED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:cluster/peer-expelled");
 pub const CLUSTER_PEER_ADVERTISE_REFUSED: Urn<'static> =
 	crate::urn!(TIGHTBEAM_NID, "event:cluster/peer-advertise-refused");
 

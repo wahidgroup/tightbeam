@@ -51,6 +51,16 @@ impl PeerEntry {
 		now.abs_diff(self.last_probe) >= self.probe_wait()
 	}
 
+	/// The durable record of this entry for the peer at `addr`, which `tried`
+	/// places in the tried table or the new one.
+	///
+	/// Peer exchange and the persisted snapshot both read an entry through
+	/// this one mapping, so the two agree on what a record holds.
+	pub fn record(&self, addr: AdmittedDial, tried: bool) -> PeerRecord {
+		let peer_id = self.peer_id.clone();
+		PeerRecord { gateway_addr: addr.address(), peer_id, tried, last_probe: self.last_probe }
+	}
+
 	/// The wait the failed probes of this candidate have earned.
 	fn probe_wait(&self) -> Duration {
 		let Some(doublings) = self.failures.checked_sub(1) else {
@@ -67,11 +77,12 @@ impl PeerEntry {
 
 /// The bounds every admission into the table is held to.
 ///
-/// A table is built with its bounds and keeps them, so no later admission
-/// can be handed other ones.
+/// A table is built with its bounds and keeps them, so every later admission
+/// meets those same bounds.
 #[derive(Debug, Default)]
 pub struct Bounds {
-	/// The configured anchors, which no learned table holds.
+	/// The configured anchors, which admission keeps out of both learned
+	/// tables.
 	pub anchors: HashSet<AdmittedDial>,
 	/// Cap on the tried entries one signer holds, where `None` sets no cap.
 	pub tried_per_signer: Option<NonZeroUsize>,
@@ -87,7 +98,7 @@ pub struct Bounds {
 pub struct TableState {
 	/// The bounds every admission is held to, fixed when the table is built.
 	bounds: Bounds,
-	/// Learned peers that no probe has verified yet.
+	/// Learned peers that wait for their first verified probe.
 	new: HashMap<AdmittedDial, PeerEntry>,
 	/// Learned peers that a probe has verified.
 	tried: HashMap<AdmittedDial, PeerEntry>,
@@ -179,11 +190,12 @@ impl TableState {
 		true
 	}
 
-	/// Admits `hints` as unverified candidates, and returns how many it took.
-	pub fn learn(&mut self, hints: impl IntoIterator<Item = PeerHint>) -> usize {
+	/// Admits `hints` as unverified candidates stamped at `now`, and returns
+	/// how many it took.
+	pub fn learn(&mut self, hints: impl IntoIterator<Item = PeerHint>, now: UnixMillis) -> usize {
 		let mut admitted = 0;
 		for hint in hints {
-			let entry = PeerEntry { peer_id: hint.peer_id, last_probe: UnixMillis::default(), failures: 0 };
+			let entry = PeerEntry { peer_id: hint.peer_id, last_probe: now, failures: 0 };
 			let candidate = Candidate { dial: hint.dial, tried: false, entry };
 			if self.admit(candidate) {
 				admitted += 1;
@@ -313,12 +325,7 @@ impl TableState {
 	/// The record peer exchange shares for the verified peer at `addr`.
 	fn shared_record(&self, addr: AdmittedDial) -> Option<PeerRecord> {
 		let entry = self.tried.get(&addr).or_else(|| self.anchors_verified.get(&addr))?;
-		let record = PeerRecord {
-			gateway_addr: addr.address(),
-			peer_id: entry.peer_id.clone(),
-			tried: true,
-			last_probe: entry.last_probe,
-		};
+		let record = entry.record(addr, true);
 
 		Some(record)
 	}
@@ -343,7 +350,7 @@ impl TableState {
 	}
 }
 
-/// Count entries in `map` that share the prefix bucket of `group`.
+/// Counts the entries in `map` that share the prefix bucket of `group`.
 fn bucket_len(map: &HashMap<AdmittedDial, PeerEntry>, group: AddressGroup) -> usize {
 	map.keys().filter(|addr| addr.address().group() == group).count()
 }
@@ -490,6 +497,19 @@ impl GuardedTable {
 		Self { state: Mutex::new(state) }
 	}
 
+	/// Poisons the table lock, as a thread that panicked under the guard
+	/// leaves it.
+	#[cfg(test)]
+	pub fn poison(&self) {
+		let poisoner = || {
+			let _guard = self.state.lock();
+			panic!("a thread panicked under the table guard");
+		};
+
+		// The panic is the point, so the joined result carries nothing to read.
+		let _panicked = std::thread::scope(|scope| scope.spawn(poisoner).join());
+	}
+
 	/// Reads the table under the guard.
 	///
 	/// # Errors
@@ -502,7 +522,7 @@ impl GuardedTable {
 
 	/// Applies `change` under the guard.
 	///
-	/// A `change` reporting a durable edit bumps the generation and returns
+	/// A `change` that reports a durable edit bumps the generation and returns
 	/// the snapshot at that generation. The caller hands it to the driver
 	/// after the guard is released, so a slow driver delays no reader
 	/// (CWE-667).
@@ -532,12 +552,7 @@ impl GuardedTable {
 			.iter()
 			.map(|(addr, entry)| (addr, entry, false))
 			.chain(state.tried.iter().map(|(addr, entry)| (addr, entry, true)))
-			.map(|(addr, entry, tried)| PeerRecord {
-				gateway_addr: addr.address(),
-				peer_id: entry.peer_id.clone(),
-				tried,
-				last_probe: entry.last_probe,
-			})
+			.map(|(addr, entry, tried)| entry.record(*addr, tried))
 			.collect()
 	}
 }

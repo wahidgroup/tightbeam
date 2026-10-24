@@ -27,9 +27,7 @@ pub use crate::colony::common::{
 pub use error::HiveError;
 pub use gates::{BackpressureGate, CircuitState, ClusterCircuitBreaker};
 
-pub use gates::{
-	BackpressureReport, ClusterSecurityGate, GateLimits, PeerListError, PeerListGate, PeerListMode, ReplayGuard,
-};
+pub use gates::{BackpressureReport, ClusterSecurityGate, GateLimits, PeerListGate, PeerListMode, ReplayGuard};
 
 use core::future::Future;
 use core::pin::Pin;
@@ -37,13 +35,19 @@ use core::time::Duration;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use crate::cms::signed_data::SignerIdentifier;
 use crate::constants::DEFAULT_BACKPRESSURE_THRESHOLD_BPS;
+use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::crypto::sign::SigningIdentity;
+use crate::crypto::x509::error::CertificateValidationError;
+use crate::crypto::x509::utils::CertificateExt;
+use crate::crypto::x509::KeyPurposes;
 use crate::trace::TraceCollector;
 use crate::transport::client::PoolConfig;
 use crate::transport::multiplex::{RequestSink, StreamBody};
 use crate::transport::policy::CoreRetryPolicy;
-use crate::transport::Protocol;
+use crate::transport::state::EncryptionConfig;
+use crate::transport::{Protocol, TransportEncryptionConfig};
 use crate::urn::Urn;
 use crate::utils::time::{Clock, SystemClock};
 use crate::utils::BasisPoints;
@@ -72,6 +76,51 @@ pub trait ServletBox: Send + Sync {
 
 	/// Stops the servlet and consumes the boxed instance.
 	fn stop_boxed(self: Box<Self>);
+
+	/// The `SignerIdentifier` that names the certificate the servlet presents
+	/// in its handshake (RFC 5652 §5.3), or [`None`] for a servlet that
+	/// presents no certificate.
+	///
+	/// - A hive's registration carries this signer, and a gateway or a
+	///   sibling that dials the servlet admits only the certificate it names.
+	/// - A servlet that names none has no route: the slate and the hive's sibling routes leave it out.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::cms::signed_data::SignerIdentifier;
+	/// use tightbeam::colony::hive::ServletBox;
+	/// use tightbeam::crypto::key::Secp256k1KeyProvider;
+	/// use tightbeam::crypto::sign::SigningIdentity;
+	/// use tightbeam::testing::{TestCertificate, TestKey};
+	///
+	/// /// A servlet that answers under `identity`.
+	/// struct Signed {
+	///     identity: SigningIdentity,
+	/// }
+	///
+	/// impl ServletBox for Signed {
+	///     fn addr_bytes(&self) -> Arc<[u8]> {
+	///         Arc::from(b"127.0.0.1:7000".as_slice())
+	///     }
+	///
+	///     fn stop_boxed(self: Box<Self>) {}
+	///
+	///     fn signer(&self) -> Option<&SignerIdentifier> {
+	///         Some(self.identity.signer_identifier())
+	///     }
+	/// }
+	///
+	/// let key = TestKey::insecure_fixed_signing();
+	/// let certificate = TestCertificate::self_signed(&key);
+	/// let provider = Arc::new(Secp256k1KeyProvider::from(key));
+	/// let servlet = Signed { identity: SigningIdentity::new(certificate, provider)? };
+	/// assert!(servlet.signer().is_some());
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	fn signer(&self) -> Option<&SignerIdentifier>;
 
 	/// The servlet's current utilization, from 0 to 10000 basis points.
 	///
@@ -102,6 +151,59 @@ pub struct ServletRegistration {
 	pub spawner: SpawnerFn,
 	/// The type URN that identifies this servlet kind for routing and scaling.
 	pub servlet_type: Urn<'static>,
+}
+
+impl ServletRegistration {
+	/// Where this registration's servlet sits: its instance URN, derived once
+	/// from the type and the address, the address, and its signer.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError::UrnValidationError`] -- the servlet's address is not a valid instance locator.
+	pub(crate) fn placement(&self) -> Result<ServletPlacement, TightBeamError> {
+		let address = self.servlet.addr_bytes();
+		let instance = self.servlet_type.instance_urn(address.as_ref())?;
+		let signer = self.servlet.signer().cloned().map(Arc::new);
+
+		Ok(ServletPlacement { instance, address, signer })
+	}
+
+	/// The slate entry of this registration: the instance, the address that
+	/// reaches it, and the signer of the certificate it presents.
+	///
+	/// It is [`None`] for an address that is not a valid instance locator, or
+	/// for a servlet that names no signer, as
+	/// [`ServletPlacement::into_servlet_info`] states.
+	pub(crate) fn servlet_info(&self) -> Option<ServletInfo> {
+		self.placement().ok()?.into_servlet_info()
+	}
+}
+
+/// Where one registered servlet sits: its instance URN, the address that
+/// reaches it, and the signer of the certificate it presents.
+pub(crate) struct ServletPlacement {
+	/// The instance URN, derived from the servlet type and the address.
+	pub(crate) instance: Urn<'static>,
+	/// The address the servlet answers at.
+	pub(crate) address: Arc<[u8]>,
+	/// The signer of the certificate the servlet presents, or [`None`] for a
+	/// servlet that presents none.
+	pub(crate) signer: Option<Arc<SignerIdentifier>>,
+}
+
+impl ServletPlacement {
+	/// The slate entry of this instance, or [`None`] for a servlet that names
+	/// no signer.
+	///
+	/// A gateway admits a servlet's answer by that signer alone, so a servlet
+	/// that names none has no route to offer.
+	pub(crate) fn into_servlet_info(self) -> Option<ServletInfo> {
+		let signer = self.signer?;
+		let signer = Arc::try_unwrap(signer).unwrap_or_else(|shared| (*shared).clone());
+		let address = self.address.to_vec();
+
+		Some(ServletInfo { servlet_id: self.instance, address, signer })
+	}
 }
 
 /// A registration a [`ServletRegistry`] refused, handed back to its caller.
@@ -159,18 +261,12 @@ pub trait ServletRegistry: Send + Sync {
 
 	/// The current servlet slate, one entry per registered instance.
 	///
-	/// A registration whose address is not a valid instance locator is
-	/// skipped, so a malformed entry costs its own row and not the slate.
+	/// The slate skips a registration whose address is not a valid instance
+	/// locator, or whose servlet names no signer, so such an entry costs its
+	/// own row and not the slate.
 	fn slate(&self) -> Vec<ServletInfo> {
 		let mut list = Vec::new();
-		self.for_each(|_key, reg| {
-			let address = reg.servlet.addr_bytes();
-			let Ok(servlet_id) = reg.servlet_type.instance_urn(address.as_ref()) else {
-				return;
-			};
-
-			list.push(ServletInfo { servlet_id, address: address.as_ref().to_vec() });
-		});
+		self.for_each(|_key, reg| list.extend(reg.servlet_info()));
 
 		list
 	}
@@ -419,6 +515,10 @@ pub struct HiveTlsConfig {
 	/// The certificate and handshake key this hive presents, from
 	/// [`Self::new`] or [`Self::from_identity`].
 	identity: SigningIdentity,
+	/// The key purpose of each role the identity serves. The identity's
+	/// certificate is held to the signer purpose here, and the control plane
+	/// and the gateway dials hold it to the server and client purposes.
+	key_purposes: KeyPurposes,
 	/// The client certificate validators, such as public-key pinning.
 	pub validators: Vec<Arc<dyn crate::crypto::x509::policy::CertificateValidation>>,
 }
@@ -436,31 +536,90 @@ impl HiveTlsConfig {
 	///
 	/// - [`TightBeamError::SerializationError`] -- `certificate` holds PEM or
 	///   DER that does not decode as a certificate.
+	/// - [`TightBeamError::CertificateValidationError`] -- the
+	///   [`Self::from_identity`] set, under [`KeyPurposes::HOUSE`].
+	/// - [`TightBeamError`] -- the errors of [`SigningIdentity::new`], as their conversion names them.
 	pub fn new(
 		certificate: crate::crypto::x509::CertificateSpec,
 		key: Arc<dyn crate::crypto::key::SigningKeyProvider>,
 		validators: Vec<Arc<dyn crate::crypto::x509::policy::CertificateValidation>>,
 	) -> Result<Self, TightBeamError> {
 		let identity = SigningIdentity::from_spec(certificate, key)?;
-		Ok(Self::from_identity(identity, validators))
+		Ok(Self::from_identity(identity, validators, KeyPurposes::HOUSE)?)
 	}
 
-	/// Presents `identity`, whose key signs under the
-	/// [`SigningProvider`](crate::crypto::profiles::SigningProvider) it was
-	/// paired under, and holds the client certificate `validators`.
+	/// Presents `identity` under the key purpose of each role that
+	/// `key_purposes` names, and holds the client certificate `validators`.
+	/// [`KeyPurposes::HOUSE`] holds the house purposes.
+	///
+	/// - The identity signs this hive's registrations, so its certificate MUST
+	///   name `key_purposes.signer` or `anyExtendedKeyUsage`, or carry no
+	///   `extendedKeyUsage` (RFC 5280 §4.2.1.12).
+	/// - The control plane and the gateway dials hold the certificate to the server and client purposes.
+	///
+	/// # Errors
+	///
+	/// - The [`CertificateExt::require_purpose`] set, for `key_purposes.signer`.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::colony::hive::HiveTlsConfig;
+	/// use tightbeam::crypto::key::Secp256k1KeyProvider;
+	/// use tightbeam::crypto::sign::SigningIdentity;
+	/// use tightbeam::crypto::x509::KeyPurposes;
+	/// use tightbeam::der::asn1::ObjectIdentifier;
+	/// use tightbeam::testing::{TestCertificate, TestKey};
+	///
+	/// let key = TestKey::insecure_fixed_signing();
+	/// let own = ObjectIdentifier::new("1.3.6.1.4.1.99999.3.12")?;
+	/// let certificate = TestCertificate::self_signed(&key);
+	/// let certificate = TestCertificate::with_key_purposes(certificate, [own]);
+	/// let provider = Arc::new(Secp256k1KeyProvider::from(key));
+	/// let identity = SigningIdentity::new(certificate, provider)?;
+	///
+	/// let purposes = KeyPurposes { signer: own, ..KeyPurposes::HOUSE };
+	/// let tls = HiveTlsConfig::from_identity(identity, Vec::new(), purposes)?;
+	/// assert!(tls.validators.is_empty());
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
 	pub fn from_identity(
 		identity: SigningIdentity,
 		validators: Vec<Arc<dyn crate::crypto::x509::policy::CertificateValidation>>,
-	) -> Self {
-		Self { identity, validators }
+		key_purposes: KeyPurposes,
+	) -> Result<Self, CertificateValidationError> {
+		identity.certificate().require_purpose(key_purposes.signer)?;
+
+		Ok(Self { identity, key_purposes, validators })
 	}
 
 	/// The certificate and handshake key this hive presents.
 	///
 	/// One identity serves the control plane, sibling dials, and gateway
-	/// dials, so all three read it here and cannot disagree.
+	/// dials, so all three read the same identity here.
 	pub fn identity(&self) -> &SigningIdentity {
 		&self.identity
+	}
+
+	/// The encryption config of the control plane: this identity, the client
+	/// [`Self::validators`], and the key purposes [`Self::from_identity`]
+	/// installed.
+	pub(crate) fn accept_encryption(&self) -> TransportEncryptionConfig<DefaultCryptoProvider> {
+		let encryption = TransportEncryptionConfig::new(self.identity.clone());
+		let validators = self.validators.iter().map(Arc::clone);
+
+		let encryption = encryption.with_client_validators(validators);
+		encryption.with_key_purposes(self.key_purposes)
+	}
+
+	/// Configures `encryption` to dial a gateway under this identity: it
+	/// presents the identity as its client certificate, and holds both sides
+	/// to the key purposes [`Self::from_identity`] installed.
+	pub(crate) fn outbound(&self, encryption: &mut EncryptionConfig<DefaultCryptoProvider>) {
+		encryption.client_identity = Some(self.identity.clone());
+		encryption.key_purposes = self.key_purposes;
 	}
 }
 
@@ -468,6 +627,7 @@ impl core::fmt::Debug for HiveTlsConfig {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 		f.debug_struct("HiveTlsConfig")
 			.field("identity", &self.identity)
+			.field("key_purposes", &self.key_purposes)
 			.field("validators", &format!("[{} validators]", self.validators.len()))
 			.finish()
 	}
@@ -647,7 +807,8 @@ impl Default for HiveScalingConfig {
 pub struct HiveControlConfig {
 	/// The utilization threshold that trips manage-path backpressure.
 	pub backpressure_threshold: BasisPoints,
-	/// The longest wait for a graceful drain before remaining servlets stop.
+	/// The longest wait for a graceful drain, after which the remaining
+	/// servlets stop.
 	pub drain_timeout: Duration,
 	/// The anti-entropy interval for re-announcing the servlet slate.
 	///
@@ -662,8 +823,9 @@ pub struct HiveControlConfig {
 	pub circuit_breaker_cooldown: Duration,
 	/// The freshness window for signed cluster commands.
 	///
-	/// Commands whose `Frame.metadata.order` is outside this window, or whose
-	/// signature was already seen inside it, are rejected. See [`ReplayGuard`].
+	/// The hive rejects a command whose `Frame.metadata.order` is outside this
+	/// window, or whose signature it already saw inside it. See
+	/// [`ReplayGuard`].
 	pub command_freshness_window: Duration,
 	/// The retry policy for the fan-out of scaling updates to gateways.
 	pub notify_retry: Arc<dyn CoreRetryPolicy + Send + Sync>,
@@ -786,3 +948,192 @@ impl Default for HiveConfig {
 // the crate root.
 #[path = "macros.rs"]
 mod macros_impl;
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::crypto::key::Secp256k1KeyProvider;
+	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
+	use crate::crypto::x509::error::CertificateValidationError::ExcludedKeyPurpose;
+	use crate::crypto::x509::CertificateSpec;
+	use crate::der::asn1::ObjectIdentifier;
+	use crate::der::oid::db::rfc5280::ANY_EXTENDED_KEY_USAGE;
+	use crate::tb_cases;
+	use crate::testing::{TestCertificate, TestKey};
+
+	/// A signer purpose of an implementor's own, outside the house purposes.
+	const OWN_SIGNER: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.3.12");
+
+	/// An identity on the fixed test key whose certificate names `purpose` as
+	/// its one key purpose, or carries no `extendedKeyUsage` for `None`.
+	fn identity_naming(purpose: Option<ObjectIdentifier>) -> SigningIdentity {
+		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
+		let certificate = TestCertificate::self_signed(&key);
+		let certificate = match purpose {
+			Some(purpose) => TestCertificate::with_key_purposes(certificate, [purpose]),
+			None => certificate,
+		};
+
+		let provider = Arc::new(Secp256k1KeyProvider::from(key));
+		SigningIdentity::new(certificate, provider).expect("the fixture key proves its certificate")
+	}
+
+	// The identity signs the hive's registrations, so it is held to the
+	// signer purpose where it is installed (RFC 5280 §4.2.1.12). A
+	// certificate that names the signer purpose, any purpose, or no purpose
+	// at all installs.
+	tb_cases! {
+		fn from_identity_admits_an_identity_for_the_signer(
+			purpose: Option<ObjectIdentifier>
+		) -> Result<(), TightBeamError> {
+			HiveTlsConfig::from_identity(identity_naming(purpose), Vec::new(), KeyPurposes::HOUSE)?;
+
+			Ok(())
+		}
+		cases {
+			an_identity_for_the_signer => Some(KeyPurposes::HOUSE.signer),
+			an_identity_for_any_purpose => Some(ANY_EXTENDED_KEY_USAGE),
+			an_identity_with_no_key_purpose => None,
+		}
+	}
+
+	// A certificate whose key purposes leave the signer out is refused.
+	tb_cases! {
+		fn from_identity_refuses_an_identity_outside_the_signer(purpose: ObjectIdentifier) {
+			let identity = identity_naming(Some(purpose));
+
+			let installed = HiveTlsConfig::from_identity(identity, Vec::new(), KeyPurposes::HOUSE);
+
+			let excluded = matches!(installed, Err(ExcludedKeyPurpose));
+			assert!(excluded);
+		}
+		cases {
+			an_identity_for_servers_alone => KeyPurposes::HOUSE.server,
+			an_identity_for_clients_alone => KeyPurposes::HOUSE.client,
+		}
+	}
+
+	// An identity that names an implementor's own signer purpose alone
+	// installs under the purposes that name it.
+	#[test]
+	fn from_identity_installs_an_own_signer_purpose_under_the_purposes_that_name_it() -> Result<(), TightBeamError> {
+		let key_purposes = KeyPurposes { signer: OWN_SIGNER, ..KeyPurposes::HOUSE };
+
+		HiveTlsConfig::from_identity(identity_naming(Some(OWN_SIGNER)), Vec::new(), key_purposes)?;
+
+		Ok(())
+	}
+
+	// The house purposes refuse an identity that names an implementor's own
+	// signer purpose alone.
+	#[test]
+	fn from_identity_refuses_an_own_signer_purpose_under_the_house_purposes() {
+		let identity = identity_naming(Some(OWN_SIGNER));
+
+		let installed = HiveTlsConfig::from_identity(identity, Vec::new(), KeyPurposes::HOUSE);
+
+		let excluded = matches!(installed, Err(ExcludedKeyPurpose));
+		assert!(excluded);
+	}
+
+	/// A servlet at a fixed locator that names `signer` as the identity it
+	/// answers under.
+	struct SignerProbe {
+		signer: Option<SignerIdentifier>,
+	}
+
+	impl ServletBox for SignerProbe {
+		fn addr_bytes(&self) -> Arc<[u8]> {
+			Arc::from(b"127.0.0.1:7003".as_slice())
+		}
+
+		fn stop_boxed(self: Box<Self>) {}
+
+		fn signer(&self) -> Option<&SignerIdentifier> {
+			self.signer.as_ref()
+		}
+	}
+
+	/// The spawner of a [`SignerProbe`] that names no signer.
+	fn probe_spawner() -> SpawnerFn {
+		Arc::new(|_| Box::pin(async { Ok(Box::new(SignerProbe { signer: None }) as Box<dyn ServletBox>) }))
+	}
+
+	/// A registry holding one [`SignerProbe`] that names `signer`.
+	fn registry_holding(signer: Option<SignerIdentifier>) -> HashMapRegistry {
+		let registry = HashMapRegistry::default();
+		let namespace = ColonyNamespace::default();
+		let servlet_type = namespace.servlet("echo").expect("test names satisfy the mint grammar");
+		let spawner = probe_spawner();
+		let registration = ServletRegistration { servlet: Box::new(SignerProbe { signer }), spawner, servlet_type };
+
+		let inserted = registry.insert(b"echo".to_vec(), registration);
+		assert!(inserted.is_ok(), "the map registry takes every registration");
+
+		registry
+	}
+
+	// The slate carries the signer each servlet names, and leaves out a
+	// servlet that names none, which no gateway dial could admit (CWE-346).
+	tb_cases! {
+		fn the_slate_carries_the_signer_each_servlet_names(
+			(signer, carried): (Option<SignerIdentifier>, Vec<SignerIdentifier>)
+		) {
+			let registry = registry_holding(signer);
+
+			let slate = registry.slate();
+
+			let signers: Vec<SignerIdentifier> = slate.into_iter().map(|info| info.signer).collect();
+			assert_eq!(signers, carried);
+		}
+		cases {
+			a_signed_servlet_joins => (Some(ServletInfo::fixture_signer()), vec![ServletInfo::fixture_signer()]),
+			an_unsigned_servlet_is_left_out => (None, Vec::new()),
+		}
+	}
+
+	/// Purposes that name the client purpose in the server role, which the
+	/// house purposes do not.
+	const SWAPPED_SERVER: KeyPurposes = KeyPurposes { server: KeyPurposes::HOUSE.client, ..KeyPurposes::HOUSE };
+
+	// The control plane holds the hive's identity to the purposes its TLS
+	// config names, so the transport and the hive read one purpose set.
+	#[test]
+	fn the_control_plane_takes_the_configured_key_purposes() -> Result<(), TightBeamError> {
+		let tls = HiveTlsConfig::from_identity(identity_naming(None), Vec::new(), SWAPPED_SERVER)?;
+
+		let accept = tls.accept_encryption();
+
+		assert_eq!(accept.key_purposes, SWAPPED_SERVER);
+		Ok(())
+	}
+
+	// A gateway dial presents the hive's identity under the purposes its TLS
+	// config names.
+	#[test]
+	fn a_gateway_dial_takes_the_configured_key_purposes() -> Result<(), TightBeamError> {
+		let tls = HiveTlsConfig::from_identity(identity_naming(None), Vec::new(), SWAPPED_SERVER)?;
+		let mut encryption = EncryptionConfig::unconfigured();
+
+		tls.outbound(&mut encryption);
+
+		assert_eq!(encryption.key_purposes, SWAPPED_SERVER);
+		Ok(())
+	}
+
+	// `new` installs through `from_identity`, so it refuses the same identity
+	// in its own error.
+	#[test]
+	fn new_refuses_an_identity_for_servers_alone() -> Result<(), TightBeamError> {
+		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
+		let certificate = TestCertificate::self_signed(&key);
+		let certificate = TestCertificate::with_key_purposes(certificate, [KeyPurposes::HOUSE.server]);
+		let spec = CertificateSpec::Built(Box::new(certificate));
+
+		let refused = HiveTlsConfig::new(spec, Arc::new(Secp256k1KeyProvider::from(key)), Vec::new());
+
+		let excluded = matches!(refused, Err(TightBeamError::CertificateValidationError(ExcludedKeyPurpose)));
+		assert!(excluded);
+		Ok(())
+	}
+}

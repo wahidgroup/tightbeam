@@ -4,27 +4,84 @@
 //! it. [`Hop`] holds that pair, so the plane a payload travels on is
 //! chosen once at construction rather than re-paired at each call.
 //!
-//! - A hive hop dials on the hive pool.
+//! - A servlet hop dials through [`HivePlane::servlet`], which binds the hop
+//!   to the signer the servlet's registration names.
+//! - A heartbeat dials through [`HivePlane::hive`], which binds the hop to the
+//!   signer of the hive's registration.
 //! - A peer hop dials through [`PeerPlane::hop`], which binds the hop to the gateway its route names.
 //! - A gossip dial goes through [`PeerPlane::connect_member`], which proves the answer is a flood member.
-//! - A direct advertisement goes through [`PeerPlane::connect_unbound`], which holds an address only.
+//! - A direct advertisement goes through [`PeerPlane::advertiser`], which
+//!   hands out the one unbound dial, so its client talks to whichever gateway
+//!   answers.
 
-use core::hash::Hash;
-use core::str::FromStr;
 use std::sync::Arc;
 
+use crate::cms::signed_data::SignerIdentifier;
+use crate::colony::bound_dial::{BoundDial, ExpectedSigner};
 use crate::colony::cluster::peer::FloodMember;
-use crate::colony::cluster::runtime::bounds::ClusterPool;
-use crate::colony::cluster::{ClusterConfig, ClusterError, DialTarget};
-use crate::crypto::profiles::DefaultCryptoProvider;
+use crate::colony::cluster::runtime::advertise::Advertiser;
+use crate::colony::cluster::runtime::bounds::{ClusterPool, ColonyDialProtocol};
+use crate::colony::cluster::{ClusterConfig, ClusterError, DialTarget, HiveEntry};
 use crate::crypto::x509::Certificate;
-use crate::transport::messaging::{MessageCollector, MessageEmitter};
-use crate::transport::multiplex::MuxConnector;
-use crate::transport::policy::PolicyConfig;
-use crate::transport::state::EncryptedProtocolState;
+use crate::instrumentation::events::CLUSTER_DIAL_REFUSED;
+use crate::trace::TraceCollector;
 use crate::transport::TransportResult;
-use crate::transport::{EncryptedProtocol, PersistentConnection, PooledClient, Protocol};
+use crate::transport::{PooledClient, Protocol};
 use crate::{encode, Frame};
+
+/// The plane this gateway dials its own hives and their servlets on.
+///
+/// The pool is private, and the plane offers two ways to it, each a
+/// [`BoundDial`], so a frame leaves toward a hive or a servlet only under the
+/// identity its registration names (CWE-346):
+///
+/// - [`Self::servlet`] binds a hop to the signer a servlet's registration names.
+/// - [`Self::hive`] binds a hop to the signer of a hive's registration.
+///
+/// A gateway with no peer pool dials its peers on this pool, through the
+/// [`PeerPlane`] that [`Self::peers`] lends it to.
+pub(crate) struct HivePlane<P: Protocol> {
+	pool: Arc<ClusterPool<P>>,
+	/// The collector that records each refused hop.
+	trace: Arc<TraceCollector>,
+}
+
+// The impl is manual because a derive would demand `P: Clone`, and every
+// field is reference-counted regardless of `P`.
+impl<P: Protocol> Clone for HivePlane<P> {
+	fn clone(&self) -> Self {
+		Self { pool: Arc::clone(&self.pool), trace: Arc::clone(&self.trace) }
+	}
+}
+
+impl<P: Protocol> HivePlane<P> {
+	/// A plane that dials hives and their servlets on `pool`, and records
+	/// each refused hop on `trace`.
+	pub(crate) fn new(pool: Arc<ClusterPool<P>>, trace: Arc<TraceCollector>) -> Self {
+		Self { pool, trace }
+	}
+
+	/// Targets the servlet at `dial`, bound to `signer`, the signer its hive's
+	/// registration names.
+	pub(crate) fn servlet(&self, dial: DialTarget, signer: Arc<SignerIdentifier>) -> Hop<'_, P> {
+		let bound = BoundDial::new(dial, ExpectedSigner::Hive(signer));
+
+		Hop { pool: &self.pool, dial: bound, trace: &self.trace }
+	}
+
+	/// Targets the control address of `hive`, bound to the signer of its
+	/// registration, so a heartbeat admits that identity alone (CWE-346).
+	pub(crate) fn hive(&self, hive: &HiveEntry) -> Hop<'_, P> {
+		Hop { pool: &self.pool, dial: hive.bound_dial(), trace: &self.trace }
+	}
+
+	/// The peer plane over this plane's pool, for a gateway that configures
+	/// no peer pool. It names each gateway that answers by `config`'s peer
+	/// trust.
+	pub(crate) fn peers(&self, config: Arc<ClusterConfig>) -> PeerPlane<P> {
+		PeerPlane::new(Arc::clone(&self.pool), config, Arc::clone(&self.trace))
+	}
+}
 
 /// The plane this gateway dials peer gateways on: the peer pool, or the hive
 /// pool when no peer trust is configured.
@@ -38,32 +95,48 @@ use crate::{encode, Frame};
 /// - [`Self::connect_member`] holds an address and proves the answer is a
 ///   flood member before any frame leaves. A reconcile round and a rumor
 ///   flood dial this way, so gossip stays inside the flood (CWE-668).
-/// - [`Self::connect_unbound`] holds an address only, so its client talks to
-///   whichever gateway answers. A direct advertisement dials this way.
+/// - [`Self::advertiser`] hands out the one unbound dial, so its client talks
+///   to whichever gateway answers. A direct advertisement dials this way.
 pub(crate) struct PeerPlane<P: Protocol> {
 	pool: Arc<ClusterPool<P>>,
 	config: Arc<ClusterConfig>,
+	/// The collector that records each refused hop.
+	trace: Arc<TraceCollector>,
 }
 
-// The impl is manual because a derive would demand `P: Clone`, and both
-// fields are reference-counted regardless of `P`.
+// The impl is manual because a derive would demand `P: Clone`, and every
+// field is reference-counted regardless of `P`.
 impl<P: Protocol> Clone for PeerPlane<P> {
 	fn clone(&self) -> Self {
-		Self { pool: Arc::clone(&self.pool), config: Arc::clone(&self.config) }
+		Self {
+			pool: Arc::clone(&self.pool),
+			config: Arc::clone(&self.config),
+			trace: Arc::clone(&self.trace),
+		}
 	}
 }
 
 impl<P: Protocol> PeerPlane<P> {
-	/// A plane that dials peer gateways on `pool` and names each gateway that
-	/// answers by `config`'s peer trust.
-	pub(crate) fn new(pool: Arc<ClusterPool<P>>, config: Arc<ClusterConfig>) -> Self {
-		Self { pool, config }
+	/// A plane that dials peer gateways on `pool`, names each gateway that
+	/// answers by `config`'s peer trust, and records each refused hop on
+	/// `trace`.
+	pub(crate) fn new(pool: Arc<ClusterPool<P>>, config: Arc<ClusterConfig>, trace: Arc<TraceCollector>) -> Self {
+		Self { pool, config, trace }
 	}
 
 	/// Targets `dial` on this plane, bound to the gateway whose slate key is
 	/// `gateway_id`.
 	pub(crate) fn hop<'p>(&'p self, dial: DialTarget, gateway_id: &'p (impl AsRef<[u8]> + ?Sized)) -> Hop<'p, P> {
-		Hop { plane: Plane::Peer { peers: self, gateway_id: gateway_id.as_ref() }, dial }
+		let expected = ExpectedSigner::Gateway { gateway_id: gateway_id.as_ref(), config: &self.config };
+		let bound = BoundDial::new(dial, expected);
+
+		Hop { pool: &self.pool, dial: bound, trace: &self.trace }
+	}
+
+	/// The one unbound dial on this plane's pool, which a direct
+	/// advertisement sends through.
+	pub(crate) fn advertiser(&self) -> Advertiser<P> {
+		Advertiser::new(Arc::clone(&self.pool))
 	}
 }
 
@@ -73,32 +146,11 @@ impl<P: Protocol> PeerPlane<P> {
 /// [`PeerPlane::connect_member`] is the only constructor, and a gossip frame
 /// leaves through [`Self::emit`] alone, so gossip reaches a flood member and
 /// no other gateway (CWE-668).
-pub(crate) struct FloodClient<P>
-where
-	P: Protocol + PersistentConnection,
-	P::Address: Hash + Eq + Send + Sync,
-{
+pub(crate) struct FloodClient<P: ColonyDialProtocol> {
 	client: PooledClient<P>,
 }
 
-impl<P> FloodClient<P>
-where
-	P: Protocol
-		+ PersistentConnection
-		+ EncryptedProtocol<CryptoProvider = DefaultCryptoProvider>
-		+ Send
-		+ Sync
-		+ 'static,
-	P::Address: Hash + Eq + Clone + Send + Sync + FromStr + 'static,
-	P::Transport: MessageEmitter
-		+ MessageCollector
-		+ PolicyConfig
-		+ MuxConnector
-		+ EncryptedProtocolState
-		+ Send
-		+ Sync
-		+ 'static,
-{
+impl<P: ColonyDialProtocol> FloodClient<P> {
 	/// Wraps `client`, whose far end `_proof` names as a flood member.
 	fn new(client: PooledClient<P>, _proof: FloodMember) -> Self {
 		Self { client }
@@ -119,66 +171,21 @@ where
 	}
 }
 
-/// The plane a hop dials on.
-enum Plane<'p, P: Protocol> {
-	/// The hive pool, which reaches this gateway's own hives and servlets.
-	Hive(&'p Arc<ClusterPool<P>>),
-	/// The peer plane, bound to the one gateway the route names.
-	Peer {
-		/// The plane the hop dials on.
-		peers: &'p PeerPlane<P>,
-		/// The slate key of the gateway that must answer.
-		gateway_id: &'p [u8],
-	},
-}
-
-/// A plane and the target to dial on it.
+/// A bound dial on the pool of its plane.
+///
+/// Every hop is a [`BoundDial`], so a frame leaves a hop only toward the party
+/// its route names.
 pub(crate) struct Hop<'p, P: Protocol> {
-	plane: Plane<'p, P>,
-	dial: DialTarget,
+	/// The pool the hop dials on: the hive pool for a hive or a servlet, and
+	/// the peer plane's pool for a gateway.
+	pool: &'p Arc<ClusterPool<P>>,
+	/// The target, and the identity its answer must prove.
+	dial: BoundDial<'p>,
+	/// The collector that records a refused dial.
+	trace: &'p TraceCollector,
 }
 
-impl<'p, P: Protocol> Hop<'p, P> {
-	/// Targets `dial` on the hive pool `pool`.
-	pub(crate) fn new(pool: &'p Arc<ClusterPool<P>>, dial: DialTarget) -> Self {
-		Self { plane: Plane::Hive(pool), dial }
-	}
-}
-
-impl<P> PeerPlane<P>
-where
-	P: Protocol
-		+ PersistentConnection
-		+ EncryptedProtocol<CryptoProvider = DefaultCryptoProvider>
-		+ Send
-		+ Sync
-		+ 'static,
-	P::Address: Hash + Eq + Clone + Send + Sync + FromStr + 'static,
-	P::Transport: MessageEmitter
-		+ MessageCollector
-		+ PolicyConfig
-		+ MuxConnector
-		+ EncryptedProtocolState
-		+ Send
-		+ Sync
-		+ 'static,
-{
-	/// Connects to `address` and returns a client to the gateway that answers.
-	///
-	/// A direct advertisement dials this way. It is owed to every beat target,
-	/// and the receiver decides whether to admit it.
-	///
-	/// # Errors
-	///
-	/// - [`ClusterError::Transport`] -- the dial failed.
-	pub(crate) async fn connect_unbound(
-		&self,
-		address: impl Into<P::Address>,
-	) -> Result<PooledClient<P>, ClusterError> {
-		let client = self.pool.connect(address).await?;
-		Ok(client)
-	}
-
+impl<P: ColonyDialProtocol> PeerPlane<P> {
 	/// Connects to `address` and returns the client once the gateway that
 	/// answered proved it belongs to this gateway's flood.
 	///
@@ -214,54 +221,9 @@ where
 
 		Ok(Some(FloodClient::new(client, member)))
 	}
-
-	/// Connects to `address` and returns the client once the gateway that
-	/// answered proved to be the one whose slate key is `gateway_id`.
-	///
-	/// - A cold connection defers its handshake to the first emit, so the
-	///   handshake completes here, before the caller can send anything.
-	/// - [`ClusterConfig::peer_identity`] names the answer the way an
-	///   advertisement names its signer, so a gateway that rotated its
-	///   certificate under one key keeps its name.
-	/// - An answer with no certificate, or with a key the peer trust store does not hold, fails closed.
-	///
-	/// # Errors
-	///
-	/// - [`ClusterError::PeerMismatch`] -- the answer presented another gateway's certificate, or none.
-	/// - [`ClusterError::ConnectFailed`] -- the dial or the handshake failed.
-	async fn connect_bound(&self, address: P::Address, gateway_id: &[u8]) -> Result<PooledClient<P>, ClusterError> {
-		let connected = self.pool.connect(address).await;
-		let mut client = connected.map_err(|_| ClusterError::ConnectFailed)?;
-		let handshake = client.complete_handshake().await;
-		handshake.map_err(|_| ClusterError::ConnectFailed)?;
-
-		let answered = client.peer_certificate().and_then(|cert| self.config.peer_identity(cert));
-		if answered.as_deref() != Some(gateway_id) {
-			return Err(ClusterError::PeerMismatch);
-		}
-
-		Ok(client)
-	}
 }
 
-impl<'p, P> Hop<'p, P>
-where
-	P: Protocol
-		+ PersistentConnection
-		+ EncryptedProtocol<CryptoProvider = DefaultCryptoProvider>
-		+ Send
-		+ Sync
-		+ 'static,
-	P::Address: Hash + Eq + Clone + Send + Sync + FromStr + 'static,
-	P::Transport: MessageEmitter
-		+ MessageCollector
-		+ PolicyConfig
-		+ MuxConnector
-		+ EncryptedProtocolState
-		+ Send
-		+ Sync
-		+ 'static,
-{
+impl<P: ColonyDialProtocol> Hop<'_, P> {
 	/// Delivers a client's end-to-end frame and returns the peer's
 	/// complete reply frame, encoded.
 	///
@@ -280,8 +242,9 @@ where
 	/// Delivers hop-local bytes under a fresh transport wrapper and
 	/// returns the reply body.
 	///
-	/// This path carries the one message that is not an end-to-end frame: a
-	/// re-encoded [`ClusterRequest::Work`] envelope toward a peer gateway.
+	/// This path carries the one hop-local message, a re-encoded
+	/// [`ClusterRequest::Work`] envelope toward a peer gateway. Every other
+	/// path carries an end-to-end frame.
 	///
 	/// [`ClusterRequest::Work`]: crate::colony::common::ClusterRequest::Work
 	pub(crate) async fn deliver_envelope(self, message: impl Into<Vec<u8>>) -> Result<Vec<u8>, ClusterError> {
@@ -292,23 +255,27 @@ where
 		Ok(response.into_message())
 	}
 
-	/// Opens a pooled connection to the target.
+	/// Opens a pooled connection to the target, with its handshake complete,
+	/// so a refused handshake is a refused connect and no frame has left.
 	///
-	/// The target becomes a protocol address through
-	/// [`DialTarget::protocol_address`], so a stream open and a unary emit
-	/// reach a peer through the one conversion every dial uses.
+	/// - The target becomes a protocol address through
+	///   [`DialTarget::protocol_address`], so a stream open and a unary emit
+	///   reach a peer through the one conversion every dial uses.
+	/// - A refused answer records [`CLUSTER_DIAL_REFUSED`] with the dialed address as its payload.
 	///
 	/// # Errors
 	///
-	/// - [`ClusterError::InvalidAddress`] -- the target does not parse as an address of this protocol.
-	/// - [`ClusterError::PeerMismatch`] -- a peer hop was answered by a gateway the route does not name.
-	/// - [`ClusterError::ConnectFailed`] -- the dial or the handshake failed.
+	/// - Every error of [`BoundDial::connect`].
+	/// - [`ClusterError::Frame`] -- `trace` refused the refusal event.
 	pub(crate) async fn connect(self) -> Result<PooledClient<P>, ClusterError> {
-		let address: P::Address = self.dial.protocol_address()?;
-		match self.plane {
-			Plane::Hive(pool) => pool.connect(address).await.map_err(|_| ClusterError::ConnectFailed),
-			Plane::Peer { peers, gateway_id } => peers.connect_bound(address, gateway_id).await,
+		let target = self.dial.target().clone();
+		let connected = self.dial.connect(self.pool).await;
+		if matches!(connected, Err(ClusterError::PeerMismatch)) {
+			let refused = target.route_bytes();
+			self.trace.event(CLUSTER_DIAL_REFUSED)?.with_payload(&refused).emit();
 		}
+
+		connected
 	}
 
 	/// Dials the target, emits `frame`, and returns the reply frame.

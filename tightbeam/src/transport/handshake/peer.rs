@@ -31,8 +31,14 @@ use crate::crypto::x509::policy::CertificateValidation;
 use crate::crypto::sign::elliptic_curve::point::AffineCoordinates;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::sign::elliptic_curve::PublicKey;
+#[cfg(feature = "transport-hpke")]
+use crate::crypto::sign::PresentedIssuers;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::crypto::sign::PresentedPath;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::x509::error::CertificateValidationError;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::crypto::x509::store::CertificateTrust;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::x509::utils::CertificateExt;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -69,7 +75,6 @@ use crate::x509::Certificate;
 #[cfg(feature = "transport-cms")]
 mod provisioned {
 	pub use crate::crypto::cms::{KemRecipient, RecipientKem};
-	pub use crate::crypto::x509::store::CertificateTrust;
 	pub use crate::crypto::x509::KeyAgreement;
 	pub(crate) use crate::transport::handshake::identity::CmsPairing;
 	pub use crate::transport::handshake::CmsServerIdentity;
@@ -81,8 +86,8 @@ use provisioned::*;
 /// How a handshake server authenticates its client.
 #[derive(Clone)]
 pub enum PeerAuthentication {
-	/// Only the server authenticates. The session peer stays empty, and an
-	/// offered client certificate names nobody.
+	/// Only the server authenticates. The session peer stays empty, even for a
+	/// client that offers a certificate.
 	Anonymous,
 	/// Both sides authenticate. The client MUST offer a certificate, and every
 	/// validator in the chain MUST accept it before the session records it.
@@ -103,8 +108,8 @@ mod chain {
 	/// policy of its client, or a client's policy of its server.
 	///
 	/// [`Self::new`] alone builds a chain, so every chain runs at least one
-	/// check. A build without a handshake protocol has no handshake to
-	/// evaluate the chain, so the chain records only that a policy is set.
+	/// check. In a build without a handshake protocol, the chain records only
+	/// that a policy is set.
 	#[derive(Clone)]
 	pub struct ValidatorChain(
 		#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))] Arc<[Arc<dyn CertificateValidation>]>,
@@ -128,8 +133,7 @@ mod chain {
 			Some(chain)
 		}
 
-		/// Run every validator against `certificate`, stopping at the first
-		/// refusal.
+		/// Run every validator against `certificate` until the first refusal.
 		#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 		fn evaluate(&self, certificate: &Certificate) -> Result<(), HandshakeError> {
 			for validator in self.0.iter() {
@@ -141,23 +145,29 @@ mod chain {
 
 		/// Admit the certificate `offer` holds under this chain, the policy of
 		/// a mutual server: within its validity period, then as every
-		/// validator decides. This chain passes an offer of no certificate, and
+		/// validator decides on it beside the issuers the client presents
+		/// above it. This chain passes an offer of no certificate, and
 		/// [`PeerAuthentication::admit`] decides on it.
 		///
 		/// # Errors
 		///
 		/// - [`HandshakeError::CertificateValidationError`] -- the certificate
-		///   is outside its validity period, or a validator refused it.
+		///   is outside its validity period, or a validator refused it or its
+		///   path.
 		#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 		pub(super) fn admit_offer<P: HandshakeProvider>(&self, offer: &Offer<P>) -> Result<(), HandshakeError> {
-			let Some(identity) = offer.certificate() else {
+			let Some((identity, issuers)) = offer.presented() else {
 				return Ok(());
 			};
 			// A validator may accept a certificate without reading its validity
 			// period, as a pin does, so the chain reads it first.
 			let certificate = identity.certificate();
 			certificate.validate_expiry()?;
-			self.evaluate(certificate)
+			for validator in self.0.iter() {
+				validator.evaluate_presented(issuers.as_slice(), certificate)?;
+			}
+
+			Ok(())
 		}
 
 		/// Admit `key_agreement`, the pinned certificate of a CMS server, under
@@ -194,10 +204,10 @@ mod chain {
 impl PeerAuthentication {
 	/// Build mutual authentication against `validators`.
 	///
-	/// An empty set names no check to run, so it demands nothing and yields
-	/// [`Self::Anonymous`]. `ValidatorChain::new` is the one definition of
-	/// that rule, so a caller that holds a possibly empty collection passes it
-	/// here and lets this method decide.
+	/// An empty set names no check to run, so it yields [`Self::Anonymous`].
+	/// `ValidatorChain::new` is the one definition of that rule, so a caller
+	/// that holds a possibly empty collection passes it here and lets this
+	/// method decide.
 	pub fn mutual(validators: impl IntoIterator<Item = Arc<dyn CertificateValidation>>) -> Self {
 		ValidatorChain::new(validators).map_or(Self::Anonymous, Self::Mutual)
 	}
@@ -215,7 +225,10 @@ impl PeerAuthentication {
 	/// is the same for both protocols:
 	///
 	/// - An [`Offer`] holds a certificate with its client Finished, or neither.
-	/// - Under mutual authentication, the validity check and then every validator run before the Finished.
+	/// - Under mutual authentication, the validity check and then every
+	///   validator run before the Finished. Each validator reads the
+	///   certificate beside the issuers the Finished presents, through
+	///   [`CertificateValidation::evaluate_presented`].
 	/// - The Finished is verified whenever a certificate is offered, so an
 	///   anonymous server also refuses a certificate the client cannot prove.
 	///
@@ -262,7 +275,8 @@ impl PeerAuthentication {
 ///
 /// It is sealed to this module, so its implementors are the admissions of
 /// both roles. Each builds its record where it admits, so
-/// [`Agreed::new`](super::schedule::Agreed::new) records only a peer an
+/// [`Agreed::server`](super::schedule::Agreed::server) and
+/// [`Agreed::client`](super::schedule::Agreed::client) record only a peer an
 /// admission built.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub(crate) trait PeerIdentity: sealed::Admitted {
@@ -292,7 +306,7 @@ enum Admission<P: HandshakeProvider> {
 	/// Under server-only authentication, the client offered no certificate.
 	Unidentified,
 	/// Under server-only authentication, the client proved the key of the
-	/// certificate it offered, and the certificate names nobody.
+	/// certificate it offered, and the session stays anonymous.
 	Offered,
 	/// Every configured validator accepted the certificate, and the client
 	/// proved its key.
@@ -659,10 +673,10 @@ pub trait ServerTrust<P: HandshakeProvider>: MaybeSend + MaybeSync + 'static {
 	/// # Errors
 	///
 	/// - [`HandshakeError::CertificateValidationError`] -- the certificate is
-	///   outside its validity period, the validator refused it, the signing
-	///   use or the server's purpose refused it, or the server policy of an
-	///   HPKE server refused it.
-	/// - The [`CmsServerPair::admit`] set, for a CMS server.
+	///   outside its validity period, the trust refused it or its path, the
+	///   signing use or the server's purpose refused it, or the server policy
+	///   of an HPKE server refused it.
+	/// - The errors of [`CmsServerPair::admit`], for a CMS server.
 	fn admit_named(
 		&self,
 		named: Self::Named,
@@ -674,7 +688,7 @@ pub trait ServerTrust<P: HandshakeProvider>: MaybeSend + MaybeSync + 'static {
 impl CmsServerIdentity {
 	/// Admit this provisioned certificate against `store`, and return its
 	/// leaf beside the trust anchor at which the store's path validation ends
-	/// (RFC 5280 §6.1.1 (d)).
+	/// (RFC 5280 §6.1.1(d)).
 	///
 	/// - A bare certificate must be within its validity period, because a
 	///   store's [`evaluate`](CertificateValidation::evaluate) may accept one
@@ -807,14 +821,15 @@ impl<P: HandshakeProvider> ProvisionedKeyAgreement<P> {
 	}
 }
 
-/// What a CMS reply names for its client to admit: the signing certificate its
-/// Finished carries, beside the key-agreement certificate the opening sealed
-/// to.
+/// What a CMS reply names for its client to admit: the path of the signing
+/// certificate its Finished carries, beside the key-agreement certificate the
+/// opening sealed to.
 #[cfg(feature = "transport-cms")]
 pub struct CmsNamedServer<P: HandshakeProvider> {
-	/// The certificate the Finished's `sid` names, parsed from the bytes the
-	/// transcript bound.
-	pub(crate) signing: Certificate,
+	/// The certificate the Finished's `sid` names and the issuers above it
+	/// that the Finished presents, parsed from the bytes the transcript
+	/// bound.
+	pub(crate) signing: PresentedPath,
 	/// The key-agreement certificate, admitted before the opening.
 	pub(crate) key_agreement: PinnedKeyAgreement<P>,
 }
@@ -841,25 +856,27 @@ impl<P: HandshakeProvider> ServerTrust<P> for ProvisionedTrust {
 		ProvisionedKeyAgreement::new(admitted, anchor, admission.policy)
 	}
 
-	/// Admit the server the reply names: its signing certificate against the
-	/// store for signing under the server's purpose, then the pair it makes
-	/// with the key-agreement certificate the opening sealed to, which the
-	/// server policy admitted.
+	/// Admit the server the reply names: its signing certificate for signing
+	/// under the server's purpose, with the path the reply presents validated
+	/// to an anchor of the store (RFC 5280 §6.1), then the pair it makes with
+	/// the key-agreement certificate the opening sealed to, which the server
+	/// policy admitted.
 	///
 	/// # Errors
 	///
 	/// - [`HandshakeError::CertificateValidationError`] -- the signing
-	///   certificate is outside its validity period, the store refused it, or
-	///   the signing use or the server's purpose refused it.
-	/// - The [`CmsServerPair::admit`] set.
+	///   certificate is outside its validity period, the store refused its
+	///   path, or the signing use or the server's purpose refused it.
+	/// - The errors of [`CmsServerPair::admit`].
 	fn admit_named(
 		&self,
 		named: CmsNamedServer<P>,
 		admission: ServerAdmission<'_>,
 	) -> Result<AdmittedServer<P>, HandshakeError> {
 		let CmsNamedServer { signing, key_agreement } = named;
-		let trust_anchor = |certificate: &Certificate| self.store.trust_anchor(certificate);
-		let signing = AdmittedSigning::admit(signing, admission.purpose, trust_anchor)?;
+		let (leaf, issuers) = signing.into_parts();
+		let anchor = |leaf: &Certificate| self.store.verify_presented(issuers.as_slice(), leaf);
+		let signing = AdmittedSigning::admit(leaf, admission.purpose, anchor)?;
 
 		let pair = CmsServerPair::admit(signing, key_agreement)?;
 		AdmittedServer::paired(pair)
@@ -867,17 +884,88 @@ impl<P: HandshakeProvider> ServerTrust<P> for ProvisionedTrust {
 }
 
 /// Trust in a server whose identity the client learns from the reply.
+///
+/// The reply presents its signing certificate and the issuers above it. The
+/// trust admits them in one of two forms:
+///
+/// - [`Self::anchored`] validates the presented path to an anchor of a store
+///   (RFC 5280 §6.1), as a CMS client does.
+/// - [`Self::new`] runs a validator on the signing certificate alone, such as a pin of that certificate.
 #[cfg(feature = "transport-hpke")]
-pub struct LearnedTrust {
-	/// The validator that authenticates the certificate the reply names.
-	pub validator: Arc<dyn CertificateValidation>,
+pub struct LearnedTrust(Learned);
+
+/// The form of a [`LearnedTrust`]. It stays private, so the constructors of
+/// the trust alone pick one.
+#[cfg(feature = "transport-hpke")]
+enum Learned {
+	/// A validator that reads the signing certificate alone.
+	Validator(Arc<dyn CertificateValidation>),
+	/// A store that validates the presented path to one of its trust anchors.
+	Store(Arc<dyn CertificateTrust>),
 }
 
 #[cfg(feature = "transport-hpke")]
 impl LearnedTrust {
 	/// Trust in the servers whose certificate `validator` accepts.
 	pub fn new(validator: impl CertificateValidation + 'static) -> Self {
-		Self { validator: Arc::new(validator) }
+		Self(Learned::Validator(Arc::new(validator)))
+	}
+
+	/// Trust in the servers whose presented path `store` validates to one of
+	/// its trust anchors, through [`CertificateTrust::verify_presented`].
+	///
+	/// A reply carries the issuers above its signing certificate
+	/// (RFC 5652 §5.1), so a store that holds the root alone admits a server
+	/// whose signing certificate an intermediate issued.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::crypto::policy::Secp256k1Policy;
+	/// use tightbeam::crypto::profiles::DefaultCryptoProvider;
+	/// use tightbeam::crypto::x509::store::{CertificateTrustBuilder, TrustBuilder};
+	/// use tightbeam::crypto::x509::KeyPurposes;
+	/// use tightbeam::testing::fixtures::{TestCertificate, TestCertificateChain};
+	/// use tightbeam::transport::handshake::{ClientConfig, Hpke, HpkeClientSettings, LearnedTrust};
+	///
+	/// // The keys of the fixture chain are public, so it serves an example
+	/// // alone.
+	/// let TestCertificateChain { root, .. } = TestCertificate::insecure_fixed_chain()?;
+	///
+	/// // The store holds the root alone, and each reply presents the path
+	/// // below it.
+	/// let builder = CertificateTrustBuilder::from(Secp256k1Policy::default());
+	/// let store = builder.with_certificate(root)?.build();
+	/// let settings = HpkeClientSettings::new(LearnedTrust::anchored(Arc::new(store)));
+	/// let _config = ClientConfig::<Hpke, DefaultCryptoProvider>::new(settings, KeyPurposes::HOUSE)?;
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	pub fn anchored(store: Arc<dyn CertificateTrust>) -> Self {
+		Self(Learned::Store(store))
+	}
+
+	/// Validate `leaf`, the signing certificate a reply names, beside
+	/// `issuers`, the issuers above it that the reply presents.
+	///
+	/// A validator reads `leaf` alone. A store validates the path of `leaf`
+	/// under `issuers`.
+	///
+	/// # Errors
+	///
+	/// - The errors of the validator's [`CertificateValidation::evaluate`].
+	/// - The errors of the store's [`CertificateTrust::verify_presented`].
+	fn validate(&self, leaf: &Certificate, issuers: PresentedIssuers) -> Result<(), CertificateValidationError> {
+		match &self.0 {
+			Learned::Validator(validator) => validator.evaluate(leaf),
+			Learned::Store(store) => {
+				// An HPKE server signs under one certificate, so no other path
+				// compares with this anchor, and the anchor drops here.
+				let anchor = store.verify_presented(issuers.as_slice(), leaf);
+				anchor.map(drop)
+			}
+		}
 	}
 }
 
@@ -885,39 +973,40 @@ impl LearnedTrust {
 #[cfg(feature = "transport-hpke")]
 impl From<Arc<dyn CertificateValidation>> for LearnedTrust {
 	fn from(validator: Arc<dyn CertificateValidation>) -> Self {
-		Self { validator }
+		Self(Learned::Validator(validator))
 	}
 }
 
 #[cfg(feature = "transport-hpke")]
 impl<P: HandshakeProvider> ServerTrust<P> for LearnedTrust {
 	type Provisioned = ();
-	type Named = Certificate;
+	type Named = PresentedPath;
 
 	/// The reply names the server, so the admission before the opening is `()`.
 	fn admit_provisioned(&self, _admission: ServerAdmission<'_>) -> Result<(), HandshakeError> {
 		Ok(())
 	}
 
-	/// Admit the certificate `named` by the reply, for signing under the
-	/// server's purpose, then under the server policy of `admission`.
+	/// Admit `named`, the path the reply presents: its signing certificate for
+	/// signing under the server's purpose, as the trust validates the
+	/// certificate or the path, then under the server policy of `admission`.
 	///
-	/// The certificate must be within its validity period, and the validator
-	/// must accept it.
+	/// The certificate must be within its validity period.
 	///
 	/// # Errors
 	///
 	/// - [`HandshakeError::CertificateValidationError`] -- the certificate is
-	///   outside its validity period, the validator refused it, the signing
-	///   use or the server's purpose refused it, or the server policy refused
-	///   it.
+	///   outside its validity period, the trust refused it or its path, the
+	///   signing use or the server's purpose refused it, or the server policy
+	///   refused it.
 	fn admit_named(
 		&self,
-		named: Certificate,
+		named: PresentedPath,
 		admission: ServerAdmission<'_>,
 	) -> Result<AdmittedServer<P>, HandshakeError> {
-		let evaluate = |certificate: &Certificate| LearnedVerdict::of(self, certificate);
-		let signing = AdmittedSigning::admit(named, admission.purpose, evaluate)?;
+		let (leaf, issuers) = named.into_parts();
+		let evaluate = |leaf: &Certificate| LearnedVerdict::of(self, leaf, issuers);
+		let signing = AdmittedSigning::admit(leaf, admission.purpose, evaluate)?;
 		AdmittedServer::learned(signing, admission.policy)
 	}
 }
@@ -932,19 +1021,24 @@ mod learned {
 	use super::*;
 
 	/// What a [`LearnedTrust`] returns for the signing certificate an HPKE
-	/// reply names: the proof that its validator admitted the certificate.
-	/// The HPKE evaluation of the server policy takes it, so the policy reads
-	/// a certificate that trust admitted.
+	/// reply names: the proof that the trust admitted the certificate. The
+	/// HPKE evaluation of the server policy takes it, so the policy reads a
+	/// certificate that trust admitted.
 	pub(super) struct LearnedVerdict(());
 
 	impl LearnedVerdict {
-		/// The verdict of `trust` on `certificate`.
+		/// The verdict of `trust` on `leaf`, the signing certificate, beside
+		/// `issuers`, the issuers above it that the reply presents.
 		///
 		/// # Errors
 		///
-		/// - The [`CertificateValidation::evaluate`] set of the trust's validator.
-		pub(super) fn of(trust: &LearnedTrust, certificate: &Certificate) -> Result<Self, CertificateValidationError> {
-			trust.validator.evaluate(certificate)?;
+		/// - The errors of [`LearnedTrust::validate`].
+		pub(super) fn of(
+			trust: &LearnedTrust,
+			leaf: &Certificate,
+			issuers: PresentedIssuers,
+		) -> Result<Self, CertificateValidationError> {
+			trust.validate(leaf, issuers)?;
 			Ok(Self(()))
 		}
 	}
@@ -990,6 +1084,12 @@ mod tests {
 	/// The server policy that pins `certificate` alone, by its fingerprint.
 	fn pinning_policy(certificate: &Certificate) -> ValidatorChain {
 		policy_of([pin_of(certificate)])
+	}
+
+	/// The path a reply presents when it carries `certificate` alone.
+	fn named(certificate: &Certificate) -> PresentedPath {
+		let path = PresentedPath::walk(certificate.to_owned(), Vec::new());
+		path.expect("a lone certificate is a path")
 	}
 
 	#[test]
@@ -1093,7 +1193,7 @@ mod tests {
 			}
 		}
 
-		/// The built-in store, holding `trusted`.
+		/// The built-in store that holds `trusted`.
 		fn store_holding(trusted: impl IntoIterator<Item = Certificate>) -> Arc<dyn CertificateTrust> {
 			let builder = CertificateTrustBuilder::from(Secp256k1Policy::default());
 			let builder = trusted.into_iter().try_fold(builder, TrustBuilder::with_certificate);
@@ -1126,7 +1226,7 @@ mod tests {
 			let admission = ServerAdmission { purpose, policy: None };
 			let provisioned: HouseKeyAgreement = trust.admit_provisioned(admission)?;
 			let (key_agreement, _) = provisioned.into_parts();
-			let named = CmsNamedServer { signing: signing.to_owned(), key_agreement };
+			let named = CmsNamedServer { signing: named(signing), key_agreement };
 			trust.admit_named(named, admission)
 		}
 
@@ -1472,9 +1572,9 @@ mod tests {
 			Ok(())
 		}
 
-		/// The anchor is the one the store's path validation ends at (RFC 5280
-		/// §6.1.1 (d)), so a signing certificate under an intermediate pairs
-		/// with a key-agreement certificate the root issued.
+		/// The anchor is the one the store's path validation ends at
+		/// (RFC 5280 §6.1.1(d)), so a signing certificate under an
+		/// intermediate pairs with a key-agreement certificate the root issued.
 		#[test]
 		fn a_signing_certificate_under_an_intermediate_pairs_with_one_the_root_issued() -> Result<(), HandshakeError> {
 			let chain = fixed_chain();
@@ -1505,7 +1605,7 @@ mod tests {
 
 		/// A pinned chain that starts at an intermediate the store holds ends
 		/// at the store's root, as the walk of a signing certificate under that
-		/// intermediate does (RFC 5280 §6.1.1 (d)).
+		/// intermediate does (RFC 5280 §6.1.1(d)).
 		#[test]
 		fn a_chain_from_a_held_intermediate_pairs_with_its_signing_certificate() -> Result<(), HandshakeError> {
 			let chain = fixed_chain();
@@ -1749,8 +1849,11 @@ mod tests {
 				self.pin(cert).is_some()
 			}
 
-			fn verify_chain(&self, _chain: &[Certificate]) -> Result<Arc<Certificate>, CertificateValidationError> {
-				Err(CertificateValidationError::CertificateNotTrusted)
+			/// Each pin is its own anchor, so a chain ends at the pin of its
+			/// leaf.
+			fn verify_chain(&self, chain: &[Certificate]) -> Result<Arc<Certificate>, CertificateValidationError> {
+				let leaf = chain.last().ok_or(CertificateValidationError::EmptyChain)?;
+				self.trust_anchor(leaf)
 			}
 
 			fn trust_anchor(&self, cert: &Certificate) -> Result<Arc<Certificate>, CertificateValidationError> {
@@ -1792,7 +1895,7 @@ mod tests {
 		#[test]
 		fn a_learned_certificate_the_validator_accepts_is_admitted() -> Result<(), Box<dyn Error>> {
 			let server = create_test_certificate().certificate;
-			let admitted: HouseServer = pinned(&server).admit_named(server.to_owned(), ADMISSION)?;
+			let admitted: HouseServer = pinned(&server).admit_named(named(&server), ADMISSION)?;
 			let certificate = admitted.signing().certificate();
 			assert_eq!(certificate.as_ref(), &server);
 			Ok(())
@@ -1803,7 +1906,7 @@ mod tests {
 		fn a_learned_certificate_the_validator_refuses_is_refused() {
 			let trust = LearnedTrust::new(DirectTrustValidator::default());
 			let unknown = create_test_certificate().certificate;
-			let refusal: Result<HouseServer, _> = trust.admit_named(unknown, ADMISSION);
+			let refusal: Result<HouseServer, _> = trust.admit_named(named(&unknown), ADMISSION);
 			assert!(matches!(refusal, Err(HandshakeError::CertificateValidationError(_))));
 		}
 
@@ -1812,7 +1915,7 @@ mod tests {
 		#[test]
 		fn a_learned_certificate_past_its_validity_is_refused() {
 			let expired = TestCertificate::expired();
-			let refusal: Result<HouseServer, _> = pinned(&expired).admit_named(expired, ADMISSION);
+			let refusal: Result<HouseServer, _> = pinned(&expired).admit_named(named(&expired), ADMISSION);
 			assert!(matches!(refusal, Err(HandshakeError::CertificateValidationError(Expired))));
 		}
 
@@ -1824,7 +1927,7 @@ mod tests {
 			put_off_curve_key(&mut server);
 
 			let learned = pinned(&server);
-			let refusal: Result<HouseServer, _> = learned.admit_named(server, ADMISSION);
+			let refusal: Result<HouseServer, _> = learned.admit_named(named(&server), ADMISSION);
 			assert!(matches!(
 				refusal,
 				Err(HandshakeError::CertificateValidationError(
@@ -1840,7 +1943,7 @@ mod tests {
 			let usage = KeyUsage(KeyUsages::KeyAgreement.into());
 			let server = TestCertificate::with_key_usage(create_test_certificate().certificate, usage);
 
-			let refusal: Result<HouseServer, _> = pinned(&server).admit_named(server.to_owned(), ADMISSION);
+			let refusal: Result<HouseServer, _> = pinned(&server).admit_named(named(&server), ADMISSION);
 			assert!(matches!(
 				refusal,
 				Err(HandshakeError::CertificateValidationError(
@@ -1856,7 +1959,7 @@ mod tests {
 			let server = create_test_certificate().certificate;
 			let server = TestCertificate::with_key_purposes(server, [KeyPurposes::HOUSE.client]);
 
-			let refusal: Result<HouseServer, _> = pinned(&server).admit_named(server.to_owned(), ADMISSION);
+			let refusal: Result<HouseServer, _> = pinned(&server).admit_named(named(&server), ADMISSION);
 			assert!(matches!(
 				refusal,
 				Err(HandshakeError::CertificateValidationError(
@@ -1874,7 +1977,7 @@ mod tests {
 			let trust = pinned(&server);
 			let admission = ServerAdmission { purpose: own, policy: None };
 
-			let admitted: Result<HouseServer, _> = trust.admit_named(server, admission);
+			let admitted: Result<HouseServer, _> = trust.admit_named(named(&server), admission);
 			assert!(admitted.is_ok());
 		}
 
@@ -1886,7 +1989,7 @@ mod tests {
 			let policy = pinning_policy(&server);
 			let admission = admission_under(&policy);
 
-			let admitted: HouseServer = pinned(&server).admit_named(server.to_owned(), admission)?;
+			let admitted: HouseServer = pinned(&server).admit_named(named(&server), admission)?;
 			assert_eq!(admitted.signing().certificate().as_ref(), &server);
 			Ok(())
 		}
@@ -1899,7 +2002,7 @@ mod tests {
 			let policy = pinning_policy(&create_test_certificate().certificate);
 			let admission = admission_under(&policy);
 
-			let refusal: Result<HouseServer, _> = pinned(&server).admit_named(server.to_owned(), admission);
+			let refusal: Result<HouseServer, _> = pinned(&server).admit_named(named(&server), admission);
 			assert!(matches!(
 				refusal,
 				Err(HandshakeError::CertificateValidationError(CertificateNotPinned))
@@ -1915,7 +2018,7 @@ mod tests {
 			let policy = policy_of([expiry, pin_of(&create_test_certificate().certificate)]);
 			let admission = admission_under(&policy);
 
-			let refusal: Result<HouseServer, _> = pinned(&server).admit_named(server.to_owned(), admission);
+			let refusal: Result<HouseServer, _> = pinned(&server).admit_named(named(&server), admission);
 			assert!(matches!(
 				refusal,
 				Err(HandshakeError::CertificateValidationError(CertificateNotPinned))

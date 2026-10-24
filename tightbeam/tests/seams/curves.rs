@@ -10,17 +10,15 @@ use tightbeam::crypto::policy::Secp256k1Policy;
 use tightbeam::crypto::x509::error::CertificateValidationError;
 use tightbeam::crypto::x509::policy::{CertificateValidation, PublicKeyPinning};
 use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
-use tightbeam::crypto::x509::{Certificate, CurvePoints, KeyCurves, KeyIndex};
+use tightbeam::crypto::x509::{Certificate, CurvePoints, KeyCurves, KeyIndex, KeyListError};
 use tightbeam::der::asn1::ObjectIdentifier;
-use tightbeam::der::Error;
+use tightbeam::der::{Encode, Error};
 use tightbeam::oids::CURVE_NIST_P256;
 use tightbeam::spki::SubjectPublicKeyInfoOwned;
 use tightbeam::testing::fixtures::{TestCertificate, TestKey};
 
 #[cfg(feature = "colony")]
-use tightbeam::colony::hive::{PeerListError, PeerListGate, PeerListMode};
-#[cfg(feature = "colony")]
-use tightbeam::der::Encode;
+use tightbeam::colony::hive::{PeerListGate, PeerListMode};
 
 /// The decoder of P-256 an outside crate brings, which accepts the two SEC 1
 /// forms of the RFC 6979 key alone. It keeps the contract of [`CurvePoints`]
@@ -69,28 +67,36 @@ fn store_of(point: &[u8]) -> Result<impl CertificateTrust, CertificateValidation
 	Ok(builder.with_certificate(certificate_of(point))?.build())
 }
 
-/// A pin that holds the outside decoder refuses a certificate of the alias.
-#[test]
-fn an_outside_decoder_refuses_an_alias_at_the_pin() {
-	let pin = PublicKeyPinning::new([&TestKey::RFC6979_P256_COMPRESSED]).with_curves(CURVES);
-	let refused = pin.evaluate(&certificate_of(&ALIAS));
-	assert!(matches!(refused, Err(CertificateValidationError::PublicKeyNotPinned)));
+/// The pin of a key that is `point` on P-256: the DER of its
+/// SubjectPublicKeyInfo.
+fn pin_of(point: &[u8]) -> Vec<u8> {
+	spki_of(point).to_der().expect("a test SubjectPublicKeyInfo encodes")
 }
 
-/// A pin of the alias reads as its bits under the outside decoder, so it
-/// refuses the certificate of the valid key whose x and y parity it keeps.
+/// A pin that holds the outside decoder refuses a certificate of the alias.
 #[test]
-fn an_outside_decoder_reads_a_pin_of_the_alias_as_its_bits() {
-	let pin = PublicKeyPinning::new([&ALIAS]).with_curves(CURVES);
-	let refused = pin.evaluate(&certificate_of(&TestKey::RFC6979_P256_UNCOMPRESSED));
+fn an_outside_decoder_refuses_an_alias_at_the_pin() -> Result<(), KeyListError> {
+	let pin = PublicKeyPinning::with_curves(CURVES, [pin_of(&TestKey::RFC6979_P256_COMPRESSED)])?;
+
+	let refused = pin.evaluate(&certificate_of(&ALIAS));
 	assert!(matches!(refused, Err(CertificateValidationError::PublicKeyNotPinned)));
+	Ok(())
+}
+
+/// A pin of the alias reads as no point under the outside decoder, so the
+/// pinning refuses it where it is built, with its index.
+#[test]
+fn an_outside_decoder_refuses_a_pin_of_the_alias() {
+	let refused = PublicKeyPinning::with_curves(CURVES, [pin_of(&ALIAS)]);
+	assert_eq!(refused.err(), Some(KeyListError::NoPoint { index: 0 }));
 }
 
 /// A pin that holds the outside decoder admits the pinned key in its other
 /// SEC 1 form, so the decoder changes no valid point.
 #[test]
-fn an_outside_decoder_admits_a_pinned_key_in_its_other_form() -> Result<(), CertificateValidationError> {
-	let pin = PublicKeyPinning::new([&TestKey::RFC6979_P256_COMPRESSED]).with_curves(CURVES);
+fn an_outside_decoder_admits_a_pinned_key_in_its_other_form() -> Result<(), Box<dyn core::error::Error>> {
+	let pin = PublicKeyPinning::with_curves(CURVES, [pin_of(&TestKey::RFC6979_P256_COMPRESSED)])?;
+
 	pin.evaluate(&certificate_of(&TestKey::RFC6979_P256_UNCOMPRESSED))?;
 	Ok(())
 }
@@ -157,6 +163,6 @@ fn an_outside_decoder_enrols_an_alias_as_its_bits_at_the_store() -> Result<(), C
 fn an_outside_decoder_refuses_an_alias_at_the_gate() -> Result<(), Error> {
 	let entry = spki_of(&ALIAS).to_der()?;
 	let refused = PeerListGate::new(PeerListMode::Deny, CURVES, [entry]);
-	assert_eq!(refused.err(), Some(PeerListError::NoPoint { index: 0 }));
+	assert_eq!(refused.err(), Some(KeyListError::NoPoint { index: 0 }));
 	Ok(())
 }

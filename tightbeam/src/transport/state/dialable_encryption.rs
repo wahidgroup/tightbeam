@@ -1,7 +1,7 @@
-//! The provisioning a transport is built from, once it passes the dialer rule
-//! and the key-purpose check, and the negotiation input a session holds beside
-//! it. Each flow builds its configurations, and each mux role its renewal,
-//! from the two.
+//! This module holds the provisioning a transport is built from, once it
+//! passes the dialer rule and the key-purpose check, and the negotiation input
+//! a session holds beside it. Each flow builds its configurations, and each mux
+//! role its renewal, from the two.
 //!
 //! The field of [`DialableEncryption`] is private to this module, so it keeps
 //! what the checks read. The fields of [`Negotiation`] are private too, so its
@@ -14,8 +14,6 @@ use crate::transport::TransportResult;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use super::Arc;
-#[cfg(feature = "transport-hpke")]
-use crate::crypto::x509::policy::CertificateValidation;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::error::TransportError;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -63,7 +61,7 @@ impl<P: CryptoProvider> DialableEncryption<P> {
 	/// # Errors
 	///
 	/// - [`TransportError::PeerAuthenticationUnconfigured`] -- the endpoint
-	///   authenticates no peer and did not name cleartext, or it sets a server
+	///   authenticates no peer and does not name cleartext, or it sets a server
 	///   policy and holds no trust in a server, whether or not it names
 	///   cleartext.
 	/// - [`TransportError::HandshakeError`] -- an identity names another key purpose than its role's.
@@ -118,7 +116,7 @@ pub(crate) struct Negotiation {
 	/// fails closed when a challenge is present.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	receipt_approver: Option<Arc<dyn ReceiptApprover>>,
-	/// Observer recording budget-bearing handshake outcomes.
+	/// Observer that records budget-bearing handshake outcomes.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	session_observer: Option<Arc<dyn SessionObserver>>,
 	/// Handshake protocol used once encryption is provisioned.
@@ -196,7 +194,7 @@ impl<'a, P: CryptoProvider> Endpoint<'a, P> {
 	///
 	/// # Errors
 	///
-	/// - The [`HandshakeProtocolKind::client_handshake`] set.
+	/// - The errors of [`HandshakeProtocolKind::client_handshake`].
 	pub(crate) fn client_handshake(&self) -> TransportResult<BoxedClientHandshake>
 	where
 		P: HandshakeProvider,
@@ -209,7 +207,7 @@ impl<'a, P: CryptoProvider> Endpoint<'a, P> {
 	///
 	/// # Errors
 	///
-	/// - The [`HandshakeProtocolKind::server_handshake`] set.
+	/// - The errors of [`HandshakeProtocolKind::server_handshake`].
 	pub(crate) fn server_handshake(&self) -> TransportResult<BoxedServerHandshake>
 	where
 		P: HandshakeProvider,
@@ -287,9 +285,9 @@ impl<'a, P: CryptoProvider> Endpoint<'a, P> {
 }
 
 /// The HPKE flow learns its server from the reply, so its client takes the
-/// trust store as the validator of the certificate the reply names, beside
-/// the client identity when one is set. Its server signs with the signing
-/// identity it presents, and its secret derives from the two ephemerals alone.
+/// trust store to validate the path the reply presents, beside the client
+/// identity when one is set. Its server signs with the signing identity it
+/// presents, and its secret derives from the two ephemerals alone.
 #[cfg(feature = "transport-hpke")]
 impl<P: HandshakeProvider> FlowProvisioning<Hpke, P> for Endpoint<'_, P> {
 	/// The client proves its identity when one is set and dials anonymously
@@ -303,10 +301,10 @@ impl<P: HandshakeProvider> FlowProvisioning<Hpke, P> for Endpoint<'_, P> {
 	fn client_config(&self) -> TransportResult<ClientConfig<Hpke, P>> {
 		let encryption = &self.proof.0;
 		let store = encryption.trust_store.as_ref().ok_or(HandshakeError::MissingTrustStore)?;
-		let validator = Arc::clone(store) as Arc<dyn CertificateValidation>;
+		let trust = LearnedTrust::anchored(Arc::clone(store));
 		let identity = encryption.client_identity.clone();
 
-		let settings = HpkeClientSettings { trust: LearnedTrust { validator }, identity };
+		let settings = HpkeClientSettings { trust, identity };
 		Ok(self.client_config_with::<Hpke>(settings))
 	}
 

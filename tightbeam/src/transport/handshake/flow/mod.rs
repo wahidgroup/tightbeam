@@ -27,12 +27,11 @@
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, vec, vec::Vec};
 
-use crate::cms::cert::CertificateChoices;
 use crate::cms::signed_data::{CertificateSet, SignedData};
 use crate::crypto::cms::AuthEnvelopedData;
 use crate::crypto::sign::elliptic_curve::ecdh::EphemeralSecret;
 use crate::crypto::sign::elliptic_curve::{CurveArithmetic, PublicKey, SecretKey};
-use crate::crypto::sign::{CmsSigner, Signed, SignedContent, SignerInfoDraft, SigningIdentity};
+use crate::crypto::sign::{CmsSigner, PresentedIssuers, Signed, SignedContent, SignerInfoDraft, SigningIdentity};
 use crate::crypto::subtle::ConstantTimeEq;
 use crate::crypto::x509::{PeerCertificate, Signing};
 use crate::der::asn1::{ObjectIdentifier, OctetString};
@@ -55,7 +54,6 @@ use crate::transport::handshake::{
 use crate::transport::wire_der::WireDer;
 use crate::utils::marker::{MaybeSend, MaybeSendFuture, MaybeSync};
 use crate::x509::attr::{Attribute, Attributes};
-use crate::x509::Certificate;
 
 #[cfg(feature = "transport-cms")]
 mod cms;
@@ -169,7 +167,12 @@ impl ServerConfirmed {
 		Ok(Self(secret))
 	}
 
-	/// Take the secret, for the closing and the session that derive from it.
+	/// The confirmed secret, for the closing that derives from it.
+	pub(crate) fn secret(&self) -> &HandshakeSecret {
+		&self.0
+	}
+
+	/// Take the secret out, for the session that derives from it.
 	pub(crate) fn into_secret(self) -> HandshakeSecret {
 		self.0
 	}
@@ -555,7 +558,7 @@ impl FinishedDraft {
 
 	/// Build the Finished: the `SignedData` over the content, with
 	/// `signature` completing its `SignerInfo`, `unsigned_attrs` attached to
-	/// it, and `certificate` in `certificates`.
+	/// it, and `certificates` as its certificate set.
 	///
 	/// # Errors
 	///
@@ -564,17 +567,10 @@ impl FinishedDraft {
 		self,
 		signature: Vec<u8>,
 		unsigned_attrs: Attributes,
-		certificate: Option<Certificate>,
+		certificates: Option<CertificateSet>,
 	) -> Result<Signed<SignedData>, HandshakeError> {
 		let Self { content, signer } = self;
 		let signer_info = signer.complete(signature, Some(unsigned_attrs))?;
-		let certificates = match certificate {
-			Some(certificate) => {
-				let choice = CertificateChoices::Certificate(certificate);
-				Some(CertificateSet(vec![choice].try_into()?))
-			}
-			None => None,
-		};
 
 		Ok(CmsSigner::signed_data(
 			SignedContent::data(&content),
@@ -596,7 +592,7 @@ impl ClientFinished {
 	///
 	/// # Errors
 	///
-	/// - The [`FinishedRole::verify`] set.
+	/// - The errors of [`FinishedRole::verify`].
 	pub(crate) fn verify<P: HandshakeProvider>(
 		self,
 		identity: &PeerCertificate<Signing<P>>,
@@ -606,13 +602,23 @@ impl ClientFinished {
 	}
 }
 
-/// The identity a client offers, with the client Finished that proves it
-/// holds the key, or none.
+/// The identity a client offers, with the issuers it presents above it and
+/// the client Finished that proves it holds the key, or none.
 ///
 /// Its constructors are private to the closing, so an offer exists only where
 /// a closing opened. [`Self::new`] refuses an identity whose key collapses the
 /// client ephemeral, so no offer exists for that client.
-pub struct Offer<P: HandshakeProvider>(Option<(PeerCertificate<Signing<P>>, ClientFinished)>);
+pub struct Offer<P: HandshakeProvider>(Option<Offered<P>>);
+
+/// What a client that presents an identity offers.
+struct Offered<P: HandshakeProvider> {
+	/// The certificate the client Finished's `sid` names.
+	identity: PeerCertificate<Signing<P>>,
+	/// The issuers above it that the client Finished presents, the top first.
+	issuers: PresentedIssuers,
+	/// The client Finished, which proves the client holds the key.
+	finished: ClientFinished,
+}
 
 impl<P: HandshakeProvider> Offer<P> {
 	/// The offer of a client that presents no identity.
@@ -620,7 +626,7 @@ impl<P: HandshakeProvider> Offer<P> {
 		Self(None)
 	}
 
-	/// The offer of `identity`, proven by `finished`.
+	/// The offer of `identity` under `issuers`, proven by `finished`.
 	///
 	/// A server learns its client's static key only after the agreement, so
 	/// the comparison lives here: `ephemeral` MUST be distinct from the key
@@ -631,6 +637,7 @@ impl<P: HandshakeProvider> Offer<P> {
 	/// - [`HandshakeError::ClientEphemeralIsStatic`] -- the ephemeral collapses into the key of `identity`.
 	fn new(
 		identity: PeerCertificate<Signing<P>>,
+		issuers: PresentedIssuers,
 		finished: ClientFinished,
 		ephemeral: &PublicKey<P::Curve>,
 	) -> Result<Self, HandshakeError> {
@@ -638,17 +645,18 @@ impl<P: HandshakeProvider> Offer<P> {
 			return Err(HandshakeError::ClientEphemeralIsStatic);
 		}
 
-		Ok(Self(Some((identity, finished))))
+		Ok(Self(Some(Offered { identity, issuers, finished })))
 	}
 
 	/// The identity and its proof, for the admission that verifies them.
 	pub(crate) fn into_identity(self) -> Option<(PeerCertificate<Signing<P>>, ClientFinished)> {
-		self.0
+		self.0.map(|Offered { identity, finished, .. }| (identity, finished))
 	}
 
-	/// The certificate of the identity, for the policy that admits it.
-	pub(crate) fn certificate(&self) -> Option<&PeerCertificate<Signing<P>>> {
-		self.0.as_ref().map(|(identity, _)| identity)
+	/// The certificate of the identity beside the issuers the client presents
+	/// above it, for the policy that admits them.
+	pub(crate) fn presented(&self) -> Option<(&PeerCertificate<Signing<P>>, &PresentedIssuers)> {
+		self.0.as_ref().map(|Offered { identity, issuers, .. }| (identity, issuers))
 	}
 }
 
@@ -666,7 +674,7 @@ pub(crate) struct ClosingParts<'a, P: HandshakeProvider> {
 }
 
 /// The client Finished of a closing, up to its signature, beside the identity
-/// whose key signs it and whose certificate it carries.
+/// whose key signs it and whose presented certificates it carries.
 struct ClientFinishedDraft<'a> {
 	/// The identity of the client.
 	identity: &'a SigningIdentity,
@@ -745,8 +753,8 @@ impl<'a, P: HandshakeProvider> ClosingDraft<'a, P> {
 		let sealed = match finished {
 			Some(ClientFinishedDraft { identity, draft }) => {
 				let signature = identity.sign_prehash(draft.prehash()).await?;
-				let certificate = identity.certificate().clone();
-				let finished = draft.finish(signature, attributes, Some(certificate))?;
+				let certificates = identity.presented().set();
+				let finished = draft.finish(signature, attributes, Some(certificates))?;
 				sealer.seal(SIGNED_DATA, finished.to_der()?)?
 			}
 			None => sealer.seal(DATA, attributes.to_der()?)?,
@@ -781,9 +789,9 @@ impl Closing {
 	/// # Errors
 	///
 	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the closing key.
-	/// - The [`ClosingContent::open`] set.
-	/// - The [`ClosingContent::confirmation`] set.
-	/// - The [`ClosingContent::into_offer`] set.
+	/// - The errors of [`ClosingContent::open`].
+	/// - The errors of [`ClosingContent::confirmation`].
+	/// - The errors of [`ClosingContent::into_offer`].
 	pub(crate) async fn open<P: HandshakeProvider>(
 		self,
 		pending: ServerPending<P::Curve>,
@@ -871,15 +879,20 @@ impl ClosingContent {
 
 	/// The offer this closing makes: none for an anonymous closing, and for a
 	/// client Finished the certificate its signer names, admitted for signing
-	/// under `purpose` and compared with `client_ephemeral`.
+	/// under `purpose` and compared with `client_ephemeral`, beside the
+	/// issuers above it that the Finished presents.
 	///
 	/// # Errors
 	///
 	/// - [`HandshakeError::MissingClientCertificate`] -- the Finished has no certificate its signer names.
 	/// - [`HandshakeError::SignatureVerificationFailed`] -- the Finished does not have exactly one signer.
-	/// - [`HandshakeError::CertificateValidationError`] -- the signing use or
-	///   `purpose` refuses the certificate.
+	/// - [`HandshakeError::CertificateValidationError`] -- the Finished
+	///   presents more than [`MAX_PRESENTED_PATH`] certificates, the walk
+	///   refuses the path, or the signing use or `purpose` refuses the
+	///   certificate.
 	/// - [`HandshakeError::ClientEphemeralIsStatic`] -- `client_ephemeral` equals the certificate key.
+	///
+	/// [`MAX_PRESENTED_PATH`]: crate::constants::MAX_PRESENTED_PATH
 	fn into_offer<P: HandshakeProvider>(
 		self,
 		client_ephemeral: &PublicKey<P::Curve>,
@@ -889,12 +902,12 @@ impl ClosingContent {
 			return Ok(Offer::anonymous());
 		};
 
-		// The certificate moves out of the Finished into the identity, so the
-		// session keeps it past the decoded Finished without a copy.
-		let certificate = CmsSigner::take_signer_certificate(&mut finished)?;
-		let certificate = certificate.ok_or(HandshakeError::MissingClientCertificate)?;
+		// The path moves out of the Finished into the offer, so the session
+		// keeps the certificate past the decoded Finished without a copy.
+		let path = CmsSigner::take_signer_path(&mut finished)?;
+		let (certificate, issuers) = path.ok_or(HandshakeError::MissingClientCertificate)?.into_parts();
 		let identity = PeerCertificate::parse(certificate, purpose)?;
-		Offer::new(identity, ClientFinished(finished), client_ephemeral)
+		Offer::new(identity, issuers, ClientFinished(finished), client_ephemeral)
 	}
 }
 
@@ -954,12 +967,14 @@ mod tests {
 	use crate::crypto::hash::Sha3_256;
 	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::crypto::sign::ecdsa::k256::{Secp256k1, SecretKey};
+	use crate::crypto::sign::PresentedPath;
 	use crate::crypto::x509::KeyPurposes;
 	use crate::random::OsRng;
 	use crate::transport::handshake::tests::{
 		create_test_certificate, create_test_signed_data, fixture_confirmation, fixture_transcript, negated,
 		same_key_twin, signing_identity,
 	};
+	use crate::x509::Certificate;
 
 	/// A client certificate admitted for signing under the house provider.
 	type HouseSigner = PeerCertificate<Signing<DefaultCryptoProvider>>;
@@ -983,13 +998,25 @@ mod tests {
 		SecretKey::random(&mut OsRng).public_key()
 	}
 
+	/// The offer of `identity`, which presents its certificate alone, beside
+	/// `ephemeral`.
+	fn offer_of(
+		identity: HouseSigner,
+		ephemeral: &PublicKey<Secp256k1>,
+	) -> Result<Offer<DefaultCryptoProvider>, HandshakeError> {
+		let leaf = Certificate::clone(identity.certificate());
+		let path = PresentedPath::walk(leaf, Vec::new()).expect("a certificate alone is a path");
+		let (_, issuers) = path.into_parts();
+		Offer::new(identity, issuers, finished(), ephemeral)
+	}
+
 	/// An offer whose ephemeral differs from the key of its identity holds
 	/// that identity.
 	#[test]
 	fn an_offer_of_a_distinct_ephemeral_holds_its_identity() -> Result<(), HandshakeError> {
 		let (identity, _) = identity();
 		let expected = Arc::clone(identity.certificate());
-		let offer = Offer::new(identity, finished(), &ephemeral())?;
+		let offer = offer_of(identity, &ephemeral())?;
 
 		let held = offer.into_identity().map(|(identity, _)| Arc::clone(identity.certificate()));
 		assert_eq!(held, Some(expected));
@@ -999,7 +1026,7 @@ mod tests {
 	#[test]
 	fn an_offer_refuses_an_ephemeral_equal_to_the_identity_key() {
 		let (identity, static_key) = identity();
-		let refused = Offer::new(identity, finished(), &static_key);
+		let refused = offer_of(identity, &static_key);
 		assert!(matches!(refused, Err(HandshakeError::ClientEphemeralIsStatic)));
 	}
 
@@ -1010,7 +1037,7 @@ mod tests {
 		let (identity, static_key) = identity();
 		let negation = negated(&static_key);
 
-		let refused = Offer::new(identity, finished(), &negation);
+		let refused = offer_of(identity, &negation);
 		assert!(matches!(refused, Err(HandshakeError::ClientEphemeralIsStatic)));
 	}
 
@@ -1023,9 +1050,9 @@ mod tests {
 		let tag = HandshakeAttribute::encode(&fixture_confirmation()).expect("a tag encodes as an attribute");
 		let tag = Attribute::try_from(tag).expect("the attribute encodes");
 		let attributes = Attributes::try_from(vec![tag]).expect("one attribute is a SET");
-		let certificate = identity.certificate().to_owned();
+		let certificates = identity.presented().set();
 
-		let finished = draft.finish(signature, attributes, Some(certificate));
+		let finished = draft.finish(signature, attributes, Some(certificates));
 		finished.expect("the Finished assembles")
 	}
 

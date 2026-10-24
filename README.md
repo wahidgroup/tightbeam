@@ -1320,6 +1320,7 @@ let trust_store = CertificateTrustBuilder::from(Secp256k1Policy::default())
 
 - Its constructor refuses a certificate that is not admitted for signing ([Certificate Use](#certificate-use)), and a key whose public half differs from the certificate's SubjectPublicKeyInfo (`SignerError::KeyMismatch`), so every signature it makes verifies under the certificate its `sid` names.
 - It also refuses a key whose algorithm is not the provider's, and it brings every value the provider returns to its canonical form, the DER low-`s` form for ECDSA.
+- `SigningIdentity::with_chain` sets the issuers above its certificate, nearest first. A server's handshake reply and a mutual client's Finished carry them in `certificates` ([RFC 5652][rfc5652] §5.1), so a peer of either flow validates the path when its store holds the trust anchor alone. The CMS trust, the `LearnedTrust::anchored` trust of a transport HPKE client, and a server whose client validators hold the store each validate it this way. `with_chain` refuses a chain in which a certificate does not name the next one as its issuer, and a chain of more than `MAX_PRESENTED_PATH` certificates with its own.
 - `SigningIdentity::new` signs under `DefaultCryptoProvider`.
 - An implementor brings its own signature algorithm with `SigningIdentity::with_provider::<P>`, where `P` is a `SigningProvider` whose signature type implements `CanonicalForm`, `SignatureEncoding`, and `SignatureAlgorithmIdentifier`, and whose verifying key implements `PrehashVerifier` and `DecodePublicKey`. `ProviderPolicy::<P>` verifies its signatures.
 - It is the one home of an endpoint's signing material, which these consumers read:
@@ -1372,6 +1373,7 @@ A role also admits `anyExtendedKeyUsage`, and a certificate with no `extendedKey
 - `PeerCertificate::parse` takes the purpose of the role it admits for.
 - Each side of a handshake carries its purposes in one place, `ClientConfig` and `ServerConfig`, whose constructors check the endpoint's own identity for its role once.
 - `with_key_purposes` sets an implementor's own purposes on `TransportEncryptionConfig`, `ClientBuilder`, `ConnectionPoolBuilder`, and `CertificateTrustBuilder`.
+- `ClusterTlsConfig::from_identity` and `HiveTlsConfig::from_identity` take the purposes, and hold the colony identity to the signer purpose where it is installed.
 
 #### Key-Agreement Identities
 
@@ -1613,9 +1615,11 @@ let doorman = PeerListGate::allow([member_spki_der])?;
 
 The gate reads each listed SubjectPublicKeyInfo by the key rule of the trust store, so a point in either SEC 1 form is one listed key. An entry that no session can match would let the peer it names pass a deny list, so `PeerListGate::new` refuses the whole list when an entry is one of these:
 
-- An entry that is no SubjectPublicKeyInfo, or whose canonical form exceeds the DER length cap (`PeerListError::Unreadable`).
-- An elliptic-curve entry that reads as no point (`PeerListError::NoPoint`): an encoding the decoder of its curve refuses, a malformed point, the compact or a hybrid form, a key with no named curve, a key on a binary-field curve, or a key under `id-ecDH` or `id-ecMQV`.
-- A point on a curve that the gate's `KeyCurves` holds no decoder for (`PeerListError::NoDecoder`).
+- An entry that is no SubjectPublicKeyInfo, or whose canonical form exceeds the DER length cap (`KeyListError::Unreadable`).
+- An elliptic-curve entry that reads as no point (`KeyListError::NoPoint`): an encoding the decoder of its curve refuses, a malformed point, the compact or a hybrid form, a key with no named curve, a key on a binary-field curve, or a key under `id-ecDH` or `id-ecMQV`.
+- A point on a curve that the gate's `KeyCurves` holds no decoder for (`KeyListError::NoDecoder`).
+
+`PublicKeyPinning` reads its pins through the same key list, so `PublicKeyPinning::new` and `with_curves` refuse the same entries with the same `KeyListError`. A pin is the DER of a SubjectPublicKeyInfo, so it names a key with its algorithm and its curve.
 
 `PeerListGate::allow` and `deny` read under `KeyCurves::HOUSE`, so a list of keys on another curve is built with `PeerListGate::new` and a decoder of that curve. The hive's circuit breaker keys on the same value as the gate.
 
@@ -1790,14 +1794,14 @@ Init -> OpeningReceived -> ServerFinishedSent -> ClientFinishedReceived -> Compl
 **Transcript hash:**
 
 ```text
-HPKE: transcript = Hello ContentInfo DER || ServerHandshake DER || signing certificate DER
-CMS:  transcript = Opening DER || SecurityAccept || TransportAccept || server ephemeral || signing certificate DER
+HPKE: transcript = Hello ContentInfo DER || ServerHandshake DER || certificates field DER
+CMS:  transcript = Opening DER || SecurityAccept || TransportAccept || server ephemeral || certificates field DER
 transcript_hash = H(transcript)
 ```
 
 `H` is the negotiated digest, SHA3-256 in the default profile. The transcript hash is its whole output: 32 bytes under SHA3-256, 64 under SHA3-512.
 
-The transcript hash binds the handshake messages. It blocks reordering, profile downgrade, and undetected man-in-the-middle edits of the transcript. The HPKE `ServerHandshake` carries the accepts, the certificate demand, and the server ephemeral, so a stripped certificate demand changes the hash. Both transcripts also cover the DER of the signing certificate, as TLS 1.3 signs over its Certificate ([RFC 9846 §4.5.2][rfc9846-4.5.2]).
+The transcript hash binds the handshake messages. It blocks reordering, profile downgrade, and undetected man-in-the-middle edits of the transcript. The HPKE `ServerHandshake` carries the accepts, the certificate demand, and the server ephemeral, so a stripped certificate demand changes the hash. Both transcripts also cover the DER of the reply's `certificates` field, which holds the signing certificate and the issuers above it that the server presents, as TLS 1.3 signs over its Certificate message ([RFC 9846 §4.5.2][rfc9846-4.5.2]).
 
 **Handshake secret:**
 
@@ -1914,7 +1918,7 @@ Server Side - Verifying Client Authentication:
 The HPKE flow is the lighter handshake path, in the shape of the TLS 1.3 handshake ([RFC 9846][rfc9846]). The client learns the server from the reply, and the handshake secret derives from the two ephemerals alone, so the server's certificate key only signs. Every message is a CMS container:
 
 - **Hello**: A `ContentInfo` of type `id-data` ([RFC 5652][rfc5652] §4) whose OCTET STRING is the `ClientHello`: the client random, the client ephemeral `R`, and the offers.
-- **Reply**: The signer's `SignedData` over the `ServerHandshake`, with the server ephemeral `E`, under the content type `1.3.6.1.4.1.64586.1.26`. Its signed attributes carry the transcript hash, its `certificates` carry the signing certificate that its `sid` names, and its unsigned attributes carry the server Finished and the session receipt.
+- **Reply**: The signer's `SignedData` over the `ServerHandshake`, with the server ephemeral `E`, under the content type `1.3.6.1.4.1.64586.1.26`. Its signed attributes carry the transcript hash, its `certificates` carry the signing certificate that its `sid` names and the issuers above it that the server presents, and its unsigned attributes carry the server Finished and the session receipt.
 - **Closing**: The closing of both flows, an `AuthEnvelopedData` with a `KEKRecipientInfo` under a key of the handshake secret.
 
 The flow claims these properties of [RFC 9846 Appendix F.1][rfc9846-f.1]:
@@ -1929,51 +1933,51 @@ The flow claims these properties of [RFC 9846 Appendix F.1][rfc9846-f.1]:
 
 **Mutual authentication flow:**
 
-For mutual authentication, the client signs its Finished over the transcript and seals it, with the certificate it carries, under a key of the handshake secret. An anonymous client seals the key-confirmation tag and the acknowledgement alone:
+For mutual authentication, the client signs its Finished over the transcript and seals it, with the certificates it presents, under a key of the handshake secret. An anonymous client seals the key-confirmation tag and the acknowledgement alone:
 
 ```text
 Client Side - Building the Closing:
-┌─────────────────────────────────────────────────────────────────────┐
-│ 1. Draw R with the Hello                                            │
-│    (r, R) = GenerateKeyPair()                                       │
-│    hello = ContentInfo {                                            │
-│        id-data, ClientHello { client_random, R, offers }            │
-│    }                                                                │
-├─────────────────────────────────────────────────────────────────────┤
-│ 2. Verify the Reply                                                 │
-│    transcript = hello DER || ServerHandshake DER || certificate DER │
-│    transcript_hash = SHA3-256(transcript)                           │
-│    ✓ signed attrs carry transcript_hash                             │
-│    ✓ Verify(signature, SHA3-256(DER(attrs)), server_pub_key)        │
-├─────────────────────────────────────────────────────────────────────┤
-│ 3. Derive the Handshake Secret                                      │
-│    ee = ECDH(r, E)                                                  │
-│    hs = HKDF-SHA3-256(                                              │
-│        ikm: ee,                                                     │
-│        salt: client_random || server_random,                        │
-│        info: "tb/session/kdf/v1"                                    │
-│    )                                                                │
-├─────────────────────────────────────────────────────────────────────┤
-│ 4. Verify the Server Finished                                       │
-│    ✓ server_finished =                                              │
-│        HMAC(mac_s, transcript_hash || signature)                    │
-├─────────────────────────────────────────────────────────────────────┤
-│ 5. Sign the Client Finished (an identified client)                  │
-│    signed = client_finished_domain || transcript_hash               │
-│             || SHA3-256(DER(client_certificate))                    │
-│    SignedData {                                                     │
-│        content: signed,                                             │
-│        certificates: [client_certificate],                          │
-│        unsigned_attrs: [confirm, sealed_ack?],                      │
-│    }                                                                │
-├─────────────────────────────────────────────────────────────────────┤
-│ 6. Seal the Closing under k_close                                   │
-│    AuthEnvelopedData {                                              │
-│        recipient: KEKRecipientInfo under k_close,                   │
-│        content_type: id-signedData (Finished)                       │
-│            or id-data (anonymous: [confirm, sealed_ack?]),          │
-│    }                                                                │
-└─────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│ 1. Draw R with the Hello                                             │
+│    (r, R) = GenerateKeyPair()                                        │
+│    hello = ContentInfo {                                             │
+│        id-data, ClientHello { client_random, R, offers }             │
+│    }                                                                 │
+├──────────────────────────────────────────────────────────────────────┤
+│ 2. Verify the Reply                                                  │
+│    transcript = hello DER || ServerHandshake DER || certificates DER │
+│    transcript_hash = SHA3-256(transcript)                            │
+│    ✓ signed attrs carry transcript_hash                              │
+│    ✓ Verify(signature, SHA3-256(DER(attrs)), server_pub_key)         │
+├──────────────────────────────────────────────────────────────────────┤
+│ 3. Derive the Handshake Secret                                       │
+│    ee = ECDH(r, E)                                                   │
+│    hs = HKDF-SHA3-256(                                               │
+│        ikm: ee,                                                      │
+│        salt: client_random || server_random,                         │
+│        info: "tb/session/kdf/v1"                                     │
+│    )                                                                 │
+├──────────────────────────────────────────────────────────────────────┤
+│ 4. Verify the Server Finished                                        │
+│    ✓ server_finished =                                               │
+│        HMAC(mac_s, transcript_hash || signature)                     │
+├──────────────────────────────────────────────────────────────────────┤
+│ 5. Sign the Client Finished (an identified client)                   │
+│    signed = client_finished_domain || transcript_hash                │
+│             || SHA3-256(DER(client_certificate))                     │
+│    SignedData {                                                      │
+│        content: signed,                                              │
+│        certificates: [client_certificate, issuers?],                 │
+│        unsigned_attrs: [confirm, sealed_ack?],                       │
+│    }                                                                 │
+├──────────────────────────────────────────────────────────────────────┤
+│ 6. Seal the Closing under k_close                                    │
+│    AuthEnvelopedData {                                               │
+│        recipient: KEKRecipientInfo under k_close,                    │
+│        content_type: id-signedData (Finished)                        │
+│            or id-data (anonymous: [confirm, sealed_ack?]),           │
+│    }                                                                 │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 Server verification flow:
@@ -2116,35 +2120,34 @@ let security_accept = SecurityAccept {
 
 **Failure modes:**
 
-| Error                         | Cause                                              | Recovery            |
-| ----------------------------- | -------------------------------------------------- | ------------------- |
-| `CertificateValidationFailed` | Invalid certificate chain                          | Reject connection   |
-| `TranscriptMismatch`          | MITM or protocol error                             | Abort handshake     |
-| `NonceReplay`                 | Duplicate nonce detected                           | Reject message      |
-| `UnsupportedProfile`          | No mutual profile                                  | Negotiate or reject |
-| `UnsolicitedTransportAccept`  | Peer accepted a transport capability never offered | Abort handshake     |
-| `AuthorizationRefused`        | Server's `TransportAuthorizer` refused the session | Abort handshake     |
-| `InvalidState`                | Out-of-order message                               | Reset state machine |
-| `DecryptionFailed`            | Wrong key or corrupted data                        | Abort handshake     |
+| Error                         | Cause                                                                                          | Recovery            |
+| ----------------------------- | ---------------------------------------------------------------------------------------------- | ------------------- |
+| `CertificateValidationError`  | The certificate or its path fails validation                                                   | Reject connection   |
+| `SignatureVerificationFailed` | A signature over another transcript, such as a replayed reply, or under another key            | Abort handshake     |
+| `SealedClosing`               | A closing sealed under another handshake secret, such as a replayed closing, or corrupted data | Abort handshake     |
+| `NoMutualProfile`             | No mutual profile                                                                              | Negotiate or reject |
+| `UnsolicitedTransportAccept`  | Peer accepted a transport capability never offered                                             | Abort handshake     |
+| `AuthorizationRefused`        | Server's `TransportAuthorizer` refused the session                                             | Abort handshake     |
+| `InvalidState`                | Out-of-order message                                                                           | Reset state machine |
 
 #### 8.5.7 Threat-to-Control Mapping
 
-| Threat                     | Control                                     | Implementation                                                                                                                                                                                                    |
-| -------------------------- | ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Replay Attack**          | 32-byte nonce + replay set                  | Server maintains set of seen nonces. Rejects duplicates                                                                                                                                                           |
-| **Record Replay**          | Authenticated record sequence               | Each record carries its epoch and sequence in `authAttrs`. A receiver refuses another epoch and another sequence than the next                                                                                    |
-| **Downgrade Attack**       | Profile list in signed transcript           | Transcript hash covers SecurityOffer/SecurityAccept                                                                                                                                                               |
-| **Multiplexing Downgrade** | Transport offer/accept in signed transcript | Transcript hash covers TransportOffer/TransportAccept. Unsolicited accept fails closed                                                                                                                            |
-| **MITM**                   | Transcript signatures                       | Each signature covers a labelled digest of transcript_hash. Verified against certificates                                                                                                                         |
-| **Confidentiality**        | ECDH + HKDF derived AEAD key                | Session key never transmitted. Derived from ECDH shared secret                                                                                                                                                    |
-| **Forward Secrecy**        | Ephemeral keys on both sides                | A fresh ephemeral pair per handshake and per rekey. A later key compromise does not expose past sessions or past epochs                                                                                           |
-| **DoS**                    | 16 KiB handshake size cap                   | Reject oversized handshake messages before processing                                                                                                                                                             |
-| **Stream Cap Inflation**   | Clamp + ResourceExhausted                   | Caps clamped to `MAX_MUX_STREAM_CAP`. Local exhaustion returns `ResourceExhausted`                                                                                                                                |
-| **Reassembly Exhaustion**  | Chunk + credit + cap clamps                 | Chunk size clamped to `MIN..=MAX_MUX_CHUNK_SIZE`, stream credit to `MAX_MUX_STREAM_CREDIT`. Per-stream reassembly memory bounded by granted credit and concurrent partial streams by the advertised cap (CWE-770) |
-| **Flow-Control Overrun**   | Receiver-side duplicate accounting          | Oversize chunks, credit overruns, and session-budget overspends each answered with GoAway(`ProtocolError`)                                                                                                        |
-| **Rapid Reset**            | Cancel budget + GoAway                      | Peer cancels that abort in-flight handlers draw on `DEFAULT_MUX_CANCEL_BUDGET`. Exhaustion sends GoAway(`EnhanceYourCalm`) (CVE-2023-44487 / [RFC 9113 §7][rfc9113-7])                                            |
-| **Certificate Forgery**    | X.509 chain validation                      | Verify against a configured root of trust (application responsibility)                                                                                                                                            |
-| **Nonce Reuse**            | Fresh content key per record                | Each record draws a fresh content key and nonce, and wraps the content key under the session key (RFC 5084 §3.2)                                                                                                  |
+| Threat                     | Control                                     | Implementation                                                                                                                                                                                                                                                                                |
+| -------------------------- | ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Replay Attack**          | Transcript binding of the opening           | The reply signs a transcript that binds the opening with its client random, and the closing authenticates that transcript hash under a key of its own handshake, so a replayed reply fails `SignatureVerificationFailed` and a replayed closing fails `SealedClosing(AuthenticatedAttribute)` |
+| **Record Replay**          | Authenticated record sequence               | Each record carries its epoch and sequence in `authAttrs`. A receiver refuses another epoch and another sequence than the next                                                                                                                                                                |
+| **Downgrade Attack**       | Profile list in signed transcript           | Transcript hash covers SecurityOffer/SecurityAccept                                                                                                                                                                                                                                           |
+| **Multiplexing Downgrade** | Transport offer/accept in signed transcript | Transcript hash covers TransportOffer/TransportAccept. Unsolicited accept fails closed                                                                                                                                                                                                        |
+| **MITM**                   | Transcript signatures                       | Each signature covers a labelled digest of transcript_hash. Verified against certificates                                                                                                                                                                                                     |
+| **Confidentiality**        | ECDH + HKDF derived AEAD key                | Session key never transmitted. Derived from ECDH shared secret                                                                                                                                                                                                                                |
+| **Forward Secrecy**        | Ephemeral keys on both sides                | A fresh ephemeral pair per handshake and per rekey. A later key compromise does not expose past sessions or past epochs                                                                                                                                                                       |
+| **DoS**                    | 16 KiB handshake size cap                   | Reject oversized handshake messages before processing                                                                                                                                                                                                                                         |
+| **Stream Cap Inflation**   | Clamp + ResourceExhausted                   | Caps clamped to `MAX_MUX_STREAM_CAP`. Local exhaustion returns `ResourceExhausted`                                                                                                                                                                                                            |
+| **Reassembly Exhaustion**  | Chunk + credit + cap clamps                 | Chunk size clamped to `MIN..=MAX_MUX_CHUNK_SIZE`, stream credit to `MAX_MUX_STREAM_CREDIT`. Per-stream reassembly memory bounded by granted credit and concurrent partial streams by the advertised cap (CWE-770)                                                                             |
+| **Flow-Control Overrun**   | Receiver-side duplicate accounting          | Oversize chunks, credit overruns, and session-budget overspends each answered with GoAway(`ProtocolError`)                                                                                                                                                                                    |
+| **Rapid Reset**            | Cancel budget + GoAway                      | Peer cancels that abort in-flight handlers draw on `DEFAULT_MUX_CANCEL_BUDGET`. Exhaustion sends GoAway(`EnhanceYourCalm`) (CVE-2023-44487 / [RFC 9113 §7][rfc9113-7])                                                                                                                        |
+| **Certificate Forgery**    | X.509 chain validation                      | Verify against a configured root of trust (application responsibility)                                                                                                                                                                                                                        |
+| **Nonce Reuse**            | Fresh content key per record                | Each record draws a fresh content key and nonce, and wraps the content key under the session key (RFC 5084 §3.2)                                                                                                                                                                              |
 
 ### 8.6 Multiplexing
 
@@ -3295,7 +3298,7 @@ Behavior:
 4. A hive route and a peer route never share a socket. The gateway refuses whichever claim arrives second with `PermissionDenied`. Sockets compare as parsed addresses, so any spelling of one socket is the same socket.
 5. The load balancer chooses among local and peer routes together.
 6. Each forward spends a hop budget (`PeerConfig::max_hops`, default 1), so work cannot bounce between peers.
-7. A forward goes out only when the gateway that answers holds the key that signed the advertisement, or the relay's key for a relay trail. Any other answer ends the hop before a frame is sent. The trail counts a failure, and the client reads `Unavailable` unless another trail serves the retry.
+7. A forward goes out only when the gateway that answers holds the key that signed the advertisement, or the relay's key for a relay trail. Any other answer ends the hop before a frame is sent. The trail counts a failure, and the client reads `Unavailable` unless another trail serves the retry. A forward that may have run answers `Unknown`, and the gateway does not retry it. Only a fault that proves the frame never left moves to the next instance: a refused connect, a refused handshake, a failed write, or a gate's `Unavailable` backpressure refusal.
 8. A gateway of another colony is a peer like any other: it advertises, serves work, gossips, and is discovered. A learned address that answers with no colony URN of the namespace leaves the peer table and keeps its routes. A configured peer keeps its place in the dial list.
 
 A gateway with an advertise beat that binds a wildcard address (`0.0.0.0` or `[::]`) MUST set `with_advertise_addr`, or it refuses to start with `ClusterError::AdvertiseAddressRequired`.
@@ -5003,7 +5006,7 @@ These queries enable CSP-style reasoning about process behavior at specific stat
 
 ### 12.6 Fault Injection
 
-Fault injection enables systematic error testing through CSP state-driven fault injection during refinement checking. It requires the `testing-fault` feature flag.
+Fault injection enables systematic error testing in two ways: CSP state-driven fault injection during refinement checking, and runtime injection at trace events. `FaultModel::with_event_fault` keys a fault by event with its probability in basis points, and `TraceCollector::with_fault_model` installs the model, so `event` and `event_with` of that label return the injected error at that probability. It requires the `testing-fault` feature flag.
 
 #### 12.6.1 FaultModel Configuration
 
@@ -5064,8 +5067,8 @@ pub trait ProcessState: Copy + Debug {
 	fn full_key(&self) -> Cow<'static, str>;
 }
 
-pub trait ProcessEvent: Copy + Debug {
-	fn event_label(&self) -> &'static str;
+pub trait ProcessEvent: Clone + Debug {
+	fn event_label(&self) -> Cow<'static, str>;
 }
 ```
 

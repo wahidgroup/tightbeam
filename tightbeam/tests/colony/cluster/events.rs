@@ -1,8 +1,9 @@
 //! Client-side cluster scenario event markers.
 //!
-//! These URNs record facts that only the client observes, such as a client
-//! send completing or a probe firing. Gateway decisions are asserted through
-//! the built-in `tightbeam` events the cluster fires on the scenario trace.
+//! These URNs record facts that only the client observes, such as a completed
+//! client send or a probe that fired. Scenarios assert gateway decisions
+//! through the built-in `tightbeam` events the cluster fires on the scenario
+//! trace.
 //!
 //! # Export boundary
 //!
@@ -183,3 +184,24 @@ pub(crate) const CLIENT_GOT_SERVLET_SIG_VALID: Urn<'static> =
 	tightbeam::urn!("test", "event:cluster/client-got-servlet-sig-valid");
 pub(crate) const OUTSIDE_RUMOR_FANNED_OUT: Urn<'static> =
 	tightbeam::urn!("test", "event:cluster/outside-rumor-fanned-out");
+pub(crate) const HEARTBEAT_PEER_MISMATCH: Urn<'static> =
+	tightbeam::urn!("test", "event:cluster/heartbeat-peer-mismatch");
+pub(crate) const HEARTBEAT_UNREGISTERED_REFUSED: Urn<'static> =
+	tightbeam::urn!("test", "event:cluster/heartbeat-unregistered-refused");
+pub(crate) const HEARTBEAT_ANSWER_DECODED: Urn<'static> =
+	tightbeam::urn!("test", "event:cluster/heartbeat-answer-decoded");
+pub(crate) const FIRST_INSTANCE_RECEIVED: Urn<'static> =
+	tightbeam::urn!("test", "event:cluster/first-instance-received");
+pub(crate) const SECOND_INSTANCE_RECEIVED: Urn<'static> =
+	tightbeam::urn!("test", "event:cluster/second-instance-received");
+pub(crate) const SIBLING_RECEIVED: Urn<'static> = tightbeam::urn!("test", "event:cluster/sibling-received");
+pub(crate) const IMPOSTOR_RECEIVED: Urn<'static> = tightbeam::urn!("test", "event:cluster/impostor-received");
+pub(crate) const IMPOSTOR_STREAM_REFUSED: Urn<'static> =
+	tightbeam::urn!("test", "event:cluster/impostor-stream-refused");
+pub(crate) const IMPOSTOR_DUPLEX_REFUSED: Urn<'static> =
+	tightbeam::urn!("test", "event:cluster/impostor-duplex-refused");
+pub(crate) const PEER_RELEARNED_HINT_STAMPED: Urn<'static> =
+	tightbeam::urn!("test", "event:cluster/peer-relearned-hint-stamped");
+pub(crate) const ADVERTISER_HINT_STAMPED: Urn<'static> =
+	tightbeam::urn!("test", "event:cluster/advertiser-hint-stamped");
+pub(crate) const ORIGIN_HINT_STAMPED: Urn<'static> = tightbeam::urn!("test", "event:cluster/origin-hint-stamped");

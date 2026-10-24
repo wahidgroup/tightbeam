@@ -9,8 +9,10 @@ use super::{
 	ClusterError, HiveSlate, KindCaps, LocalRoute, PeerCaps, PeerRoute, PheromoneConfig, RelayRoute, RouteKind,
 	RoutePlane, Routes, ServletEntry, ServletRegistry, SharedId, DEFAULT_ABANDONMENT_LIMIT, DEFAULT_INITIAL_PHEROMONE,
 };
+use crate::cms::signed_data::SignerIdentifier;
 use crate::colony::cluster::peer::{AdmittedPeerAd, RelayTrail};
 use crate::colony::cluster::{AdmittedDial, PeerAddress};
+use crate::colony::common::ServletInfo;
 use crate::colony::common::ServletTypeKey;
 use crate::colony::common::MAX_PHEROMONE;
 use crate::tb_cases;
@@ -39,7 +41,7 @@ fn registry_abandoning_after(limit: u32) -> ServletRegistry {
 	ServletRegistry::new(config, manual_clock())
 }
 
-/// Read guard over the registry's routes, where the admission logic lives.
+/// The read guard over the registry's routes, where the admission logic lives.
 fn routes(registry: &ServletRegistry) -> RwLockReadGuard<'_, Routes> {
 	registry.routes.read().expect("routes lock")
 }
@@ -70,6 +72,7 @@ fn test_entry(pheromone: u64, abandonment_limit: u32) -> ServletEntry {
 			address: Arc::from(b"addr".as_slice()),
 			servlet_type: Arc::from(b"type".as_slice()),
 			hive_id: Arc::from(b"hive".as_slice()),
+			signer: ServletInfo::fixture_signer(),
 		},
 		pheromone,
 		abandonment_limit,
@@ -86,10 +89,16 @@ fn named_entry(addr: impl AsRef<[u8]>, servlet_type: impl AsRef<[u8]>, hive: imp
 			address: Arc::from(addr),
 			servlet_type: Arc::from(servlet_type),
 			hive_id: Arc::from(hive),
+			signer: ServletInfo::fixture_signer(),
 		},
 		DEFAULT_INITIAL_PHEROMONE,
 		DEFAULT_ABANDONMENT_LIMIT,
 	)
+}
+
+/// The signer of a fixture servlet's registration.
+fn servlet_signer() -> Arc<SignerIdentifier> {
+	Arc::new(ServletInfo::fixture_signer())
 }
 
 /// The slate `hive` registers, holding `entries`.
@@ -97,7 +106,7 @@ fn hive_slate(hive: impl AsRef<[u8]>, entries: impl IntoIterator<Item = ServletE
 	HiveSlate::of(hive, entries)
 }
 
-/// A peer entry for `servlet_type` advertised by `peer_id`, dialing the
+/// A peer entry for `servlet_type` advertised by `peer_id`, which dials the
 /// fixture gateway socket.
 fn peer_entry(servlet_type: impl AsRef<[u8]>, peer_id: impl AsRef<[u8]>) -> ServletEntry {
 	peer_entry_dial(servlet_type, peer_id, b"127.0.0.1:9000")
@@ -157,7 +166,7 @@ fn admitted_with_order(
 	AdmittedPeerAd { peer_hive_id: Arc::from(hive), dial, slate, order: UnixMillis::new(order) }
 }
 
-/// Installs one direct peer slate for `peer` dialing the fixture socket.
+/// Installs one direct peer slate for `peer` that dials the fixture socket.
 fn install_peer_slate(
 	registry: &ServletRegistry,
 	peer: impl AsRef<[u8]>,
@@ -196,8 +205,8 @@ fn relay_trail(
 	}
 }
 
-/// The one entry of a relay trail for `origin` through `relay`, dialing the
-/// relay at the fixture socket.
+/// The one entry of a relay trail for `origin` through `relay`, which dials
+/// the relay at the fixture socket.
 fn relay_trail_entry(origin: impl AsRef<[u8]>, relay: impl AsRef<[u8]>) -> ServletEntry {
 	let mut slate = relay_trail(origin, relay, b"ping", b"127.0.0.1:9001").slate;
 	slate.pop().expect("the fixture trail holds one entry")
@@ -206,6 +215,11 @@ fn relay_trail_entry(origin: impl AsRef<[u8]>, relay: impl AsRef<[u8]>) -> Servl
 /// The peer plane bound to the gateway whose slate key is `gateway_id`.
 fn peer_plane(gateway_id: impl AsRef<[u8]>) -> RoutePlane {
 	RoutePlane::Peer { gateway_id: SharedId::from(gateway_id.as_ref()) }
+}
+
+/// The hive plane bound to `signer`.
+fn hive_plane(signer: Arc<SignerIdentifier>) -> RoutePlane {
+	RoutePlane::Hive { signer }
 }
 
 /// Counts `times` failures against the route at `key`.
@@ -302,8 +316,9 @@ fn entry_route_kind_defaults_local() {
 	assert_eq!(entry.route_kind(), RouteKind::Local);
 }
 
-// A route dials on the hive plane, or on the peer plane bound to one gateway:
-// its advertiser for a direct route and the relay for a relay trail.
+// A route dials on the hive plane bound to the signer its registration
+// names, or on the peer plane bound to one gateway: its advertiser for a
+// direct route and the relay for a relay trail.
 tb_cases! {
 	fn entry_names_the_plane_it_dials_on((entry, plane): (ServletEntry, RoutePlane)) {
 		let named = entry.plane();
@@ -311,7 +326,7 @@ tb_cases! {
 	}
 
 	cases {
-		a_local_route_dials_the_hive_plane => (named_entry(b"addr1", b"calc", b"hive1"), RoutePlane::Hive),
+		a_local_route_names_its_signer => (named_entry(b"addr1", b"calc", b"hive1"), hive_plane(servlet_signer())),
 		a_direct_route_names_its_advertiser => (peer_entry(b"ping", b"peer-a"), peer_plane(b"peer-a")),
 		a_relay_trail_names_its_relay => (relay_trail_entry(b"peer-a", b"peer-b"), peer_plane(b"peer-b")),
 	}
@@ -588,20 +603,21 @@ fn a_hive_cannot_register_a_peer_gateways_socket() -> Result<(), ClusterError> {
 /// A second owner's claim on `claimed`, placed against the registry.
 type Claim = fn(&ServletRegistry, &[u8]) -> Result<(), ClusterError>;
 
-/// A peer `gw` claiming `claimed` as its gateway socket.
+/// A peer `gw` that claims `claimed` as its gateway socket.
 fn claimed_by_a_peer(registry: &ServletRegistry, claimed: &[u8]) -> Result<(), ClusterError> {
 	let claim = admitted(b"gw", claimed, vec![peer_entry_dial(b"calc", b"gw", claimed)]);
 	registry.reconcile_peer_slate(claim, PeerCaps::default())
 }
 
-/// A second hive registering a servlet at `claimed`.
+/// A second hive that registers a servlet at `claimed`.
 fn claimed_by_another_hive(registry: &ServletRegistry, claimed: &[u8]) -> Result<(), ClusterError> {
 	registry.reconcile_by_hive(hive_slate(b"hive2", vec![named_entry(claimed, b"calc", b"hive2")]))
 }
 
-// Another owner's socket is refused under any spelling, and to a second
-// hive as to a peer, because a dual-stack host, a scope id, and a wildcard
-// listener each reach one socket by several spellings (CWE-706, CWE-639).
+// The registry refuses another owner's socket under any spelling, to a
+// second hive as to a peer, because a dual-stack host, a scope id, and a
+// wildcard listener each reach one socket by more than one spelling
+// (CWE-706, CWE-639).
 tb_cases! {
 	fn a_socket_another_owner_holds_is_refused_under_any_spelling((local, claimed, claim, expected): (&[u8], &[u8], Claim, ClusterError)) -> Result<(), ClusterError> {
 		let registry = registry();
@@ -1094,7 +1110,7 @@ fn a_peer_cannot_advertise_under_a_hives_bucket() -> Result<(), ClusterError> {
 
 // A hive whose id equals a peer's fingerprint bytes may not register
 // under that bucket: the slate swap would sweep the peer's routes, so the
-// sweep is refused by the one decider before anything moves (CWE-639).
+// one decider refuses the sweep before anything moves (CWE-639).
 #[test]
 fn a_hive_cannot_sweep_a_peers_bucket() -> Result<(), ClusterError> {
 	let registry = registry();
@@ -1107,8 +1123,8 @@ fn a_hive_cannot_sweep_a_peers_bucket() -> Result<(), ClusterError> {
 	Ok(())
 }
 
-// Retiring a hive takes only the routes it owns, so a peer's routes under
-// the same bucket bytes survive the retirement.
+// The retirement of a hive takes only the routes it owns, so a peer's routes
+// under the same bucket bytes survive it.
 #[test]
 fn removing_a_hive_leaves_a_peers_routes_under_the_same_bucket() -> Result<(), ClusterError> {
 	let registry = registry();
@@ -1120,9 +1136,9 @@ fn removing_a_hive_leaves_a_peers_routes_under_the_same_bucket() -> Result<(), C
 	Ok(())
 }
 
-// A peer advertisement is admitted when a local servlet merely shares its
-// bucket bytes as an address: the keys and sockets differ, so nothing is
-// taken over.
+// The registry admits a peer advertisement when a local servlet shares its
+// bucket bytes as an address: the keys and sockets differ, so both routes
+// stay.
 #[test]
 fn a_peer_may_share_bytes_with_a_local_address() -> Result<(), ClusterError> {
 	let registry = registry();
@@ -1175,7 +1191,7 @@ fn registry_reregistration_moves_entry_across_types() -> Result<(), ClusterError
 }
 
 /// One hive cannot take over an address another hive registered. The
-/// slate is refused whole, and the first hive keeps its route.
+/// registry refuses the slate whole, and the first hive keeps its route.
 #[test]
 fn a_hive_cannot_take_over_another_hives_address() -> Result<(), ClusterError> {
 	let registry = registry();
@@ -1319,8 +1335,8 @@ fn calc_routes(registry: &ServletRegistry) -> Result<Vec<(SharedId, SharedId)>, 
 	Ok(found)
 }
 
-// Every entry is checked before any map moves, so a refused update leaves
-// the registry exactly as seeded, and an accepted one lands whole.
+// The registry checks every entry before any map moves, so a refused update
+// leaves the registry exactly as seeded, and an accepted one lands whole.
 tb_cases! {
 	fn apply_address_update_ownership_and_atomicity(case: ApplyAddressUpdateCase) -> Result<(), ClusterError> {
 		let registry = registry();

@@ -7,25 +7,27 @@
 //! then leaves the chosen profile unauthenticated, so negotiation is unbound.
 //!
 //! Likewise, if the transcript binds only the client *random* and omits the
-//! full `ClientHello`, the client's `SecurityOffer` can be rewritten in
-//! transit.
+//! full `ClientHello`, an attacker can rewrite the client's `SecurityOffer`
+//! in transit.
 //!
 //! ## Attack
 //! 1. An adversary-in-the-middle rewrites `security_accept` inside the reply's
 //!    `ServerHandshake` to a weaker (still offered) profile in transit.
-//!    Randoms, certificate, and server signature are untouched, so an unbound
-//!    transcript still verifies and the client silently adopts the weaker
-//!    profile.
+//!    The randoms, the certificate, and the server signature stay untouched,
+//!    so an unbound transcript still verifies and the client silently adopts
+//!    the weaker profile.
 //! 2. The MITM strips or rewrites the `SecurityOffer` inside `ClientHello`
-//!    while preserving `client_random`. The server signs a transcript over the
+//!    and keeps `client_random`. The server signs a transcript over the
 //!    modified hello. If the client bound only its random, the signature still
 //!    verifies and negotiation happened over an offer the client never made.
 //!
 //! ## Expected control
-//! Negotiated parameters MUST be authenticated by the signed transcript. The
+//! The signed transcript MUST authenticate the negotiated parameters. The
 //! client MUST reject a `security_accept` it did not receive under signature,
 //! and MUST reject a server signature computed over a `ClientHello` that
 //! differs from the exact DER bytes it sent (TLS-style full-message binding).
+//!
+//! Each case fails the signature of the reply (`SignatureVerificationFailed`).
 //!
 //! ## References
 //! - CWE-757: Selection of Less-Secure Algorithm During Negotiation ('Algorithm
@@ -44,7 +46,7 @@ use tightbeam::{
 	trace::TraceCollector,
 	transport::handshake::{
 		negotiation::{SecurityAccept, SecurityOffer},
-		Client, ClientHello, Handshake, Hpke, Server,
+		Client, ClientHello, Handshake, HandshakeError, Hpke, Server,
 	},
 	transport::wire_der::WireDer,
 	urn::Urn,
@@ -69,8 +71,8 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(TAMPERED_ACCEPT_REJECTED, exactly!(1u32)),
-			(STRIPPED_OFFER_REJECTED, exactly!(1u32))
+			(TAMPERED_ACCEPT_REJECTED, exactly!(1u32), equals!(true)),
+			(STRIPPED_OFFER_REJECTED, exactly!(1u32), equals!(true))
 		]
 	}
 }
@@ -117,15 +119,18 @@ fn strong_weak_pair(materials: &ServerMaterials) -> (HpkeClient, HpkeServer, Sec
 	(client, server, strong, weak)
 }
 
-async fn expect_client_reject<T, E>(
-	result: Result<T, E>,
+async fn expect_client_reject<T>(
+	result: Result<T, HandshakeError>,
 	trace: &TraceCollector,
 	event: Urn<'static>,
 	on_accept: &'static str,
 ) -> Result<(), TightBeamError> {
 	match result {
-		Err(_) => {
-			trace.event(event)?;
+		Err(error) => {
+			// The reply signs a transcript that differs from the client's, so
+			// its signature fails.
+			let bound = matches!(error, HandshakeError::SignatureVerificationFailed);
+			trace.event_with(event, &[], bound)?;
 			Ok(())
 		}
 		Ok(_) => Err(expectation_failure(on_accept)),
@@ -161,8 +166,9 @@ job! {
 		.await?;
 
 		// Phase 2: A MITM strips the SecurityOffer from the ClientHello. The
-		// client_random is preserved, so a random-only transcript would still
-		// verify. The full ClientHello DER binding must make the client reject.
+		// strip keeps client_random, so a random-only transcript would still
+		// verify, and the binding of the full ClientHello DER must make the
+		// client reject the reply.
 		let (mut client, mut server, _strong, _weak) = strong_weak_pair(&materials);
 		let client_hello = carried_hello(client.start()?);
 		let mut stripped_hello = ClientHello::from_der(&client_hello)?;

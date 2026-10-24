@@ -64,7 +64,7 @@ where
 	writer: W,
 	commands: mpsc::Receiver<Outbound>,
 	shared: Arc<MuxShared>,
-	/// Records reserved for draining before the send cipher halts.
+	/// Records reserved for the drain before the send cipher halts.
 	/// See [`MuxSettings::drain_reserve_records`] for the bound derivation.
 	drain_headroom: u64,
 	/// Client half of the rekey exchange, shared with the reader driver. The
@@ -118,7 +118,7 @@ where
 	/// home. The driver adopts the clock of the link it writes to, so the
 	/// renewal deadline runs on the clock the endpoint reads.
 	///
-	/// - `drain_headroom`: the records reserved for draining before the send cipher halts.
+	/// - `drain_headroom`: the records reserved for the drain before the send cipher halts.
 	pub fn new(writer: W, commands: mpsc::Receiver<Outbound>, shared: Arc<MuxShared>, drain_headroom: u64) -> Self {
 		#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
 		let clock = writer.clock();
@@ -194,9 +194,9 @@ where
 	/// Wait for the next unit of work.
 	///
 	/// With a renewal in flight and a timer available, the renewal deadline
-	/// bounds the wait, so a peer that never answers cannot park the
-	/// connection forever. The wait runs on the driver's clock, so a test
-	/// that installed a manual clock reaches the deadline by advancing it.
+	/// bounds the wait, so a peer that never answers parks the connection only
+	/// until that deadline. The wait runs on the driver's clock, so a test that
+	/// installed a manual clock reaches the deadline by advancing it.
 	async fn next_step(&mut self) -> WriterStep {
 		#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
 		if let Some(deadline) = self.renewal_deadline() {
@@ -470,8 +470,8 @@ mod tests {
 		}
 	}
 
-	/// A client exchange that refuses every leg, standing in for the handle
-	/// whose presence the deadline checks.
+	/// A client exchange that refuses every leg, in place of the handle whose
+	/// presence the deadline checks.
 	struct StalledExchange;
 
 	impl ClientRekeyExchange for StalledExchange {
@@ -583,7 +583,6 @@ mod tests {
 	async fn a_client_rekey_context_assembles_a_client_transport() -> Result<(), Box<dyn std::error::Error>> {
 		let (mut client, mut server) = rekey_pair()?;
 		let (install, _) = run_exchange(&mut client, &mut server).await?;
-
 		assert!(holds_key_switch(RekeyDriver::client(client), install).await);
 		Ok(())
 	}
@@ -594,7 +593,6 @@ mod tests {
 	async fn a_server_rekey_context_assembles_a_server_transport() -> Result<(), Box<dyn std::error::Error>> {
 		let (mut client, mut server) = rekey_pair()?;
 		let (_, install) = run_exchange(&mut client, &mut server).await?;
-
 		assert!(!holds_key_switch(RekeyDriver::server(server), install).await);
 		Ok(())
 	}

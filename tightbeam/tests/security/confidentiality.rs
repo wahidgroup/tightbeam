@@ -134,7 +134,7 @@ job! {
 		let kind = HandshakeBackendKind::Hpke;
 
 		// Step 1: Capture a complete handshake.
-		let mut session = harness.spawn(kind);
+		let mut session = harness.spawn(kind)?;
 		let captured = session.capture_full().await?;
 
 		trace.event(CONF_CAPTURE_HANDSHAKE)?;
@@ -159,7 +159,7 @@ job! {
 
 		// Step 4: Two handshakes seal two closings, each under a fresh content
 		// key and nonce.
-		let mut session2 = harness.spawn(kind);
+		let mut session2 = harness.spawn(kind)?;
 		let captured2 = session2.capture_full().await?;
 		let closing2 = message_of(&captured2, 2)?;
 

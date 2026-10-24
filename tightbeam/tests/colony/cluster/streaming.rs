@@ -1,9 +1,9 @@
 //! Cross-cluster streaming and duplex forwarding through the gateway splice.
 //!
 //! The stream-echo servlet lives only in cluster B. A client opens a
-//! routed stream against cluster A (`open_stream_to` / `open_duplex_to`),
+//! routed stream against cluster A (`open_stream_to` or `open_duplex_to`),
 //! and A splices it to B's gateway with the hop budget spent. B then
-//! serves it locally. Cancelling the client stream propagates across
+//! serves it locally. A cancel of the client stream propagates across
 //! the splice to the servlet.
 
 use tightbeam::transport::{PooledClient, Protocol};
@@ -12,14 +12,14 @@ use tightbeam::{compose, servlet};
 use super::common::*;
 use crate::common::security::expectation_failure;
 
-/// Set by the duplex cancel probe, so the cancel scenario can wait for
-/// propagation deterministically instead of sleeping a fixed time.
+/// The flag the duplex cancel probe sets, so the cancel scenario waits for
+/// the propagation itself rather than a fixed sleep.
 ///
 /// # Sharing
 ///
-/// Every scenario in this binary shares it, yet only a genuine mid-stream abort
-/// can set it: a completing duplex handler disarms its probe before the
-/// responder sends the End trailer the client waits on.
+/// Every scenario in this binary shares it, but only a mid-stream abort can
+/// set it, because a duplex handler that completes disarms its probe before
+/// the responder sends the End trailer the client waits on.
 ///
 /// A new scenario that cancels this servlet MUST NOT run beside
 /// [`cluster_duplex_cancel_propagates_to_peer`].
@@ -27,7 +27,7 @@ static DUPLEX_CANCEL_SEEN: AtomicBool = AtomicBool::new(false);
 
 /// Observes a propagated cancel from inside the duplex servlet handler.
 ///
-/// A cancelled stream aborts the handler task, dropping its future and
+/// A cancelled stream aborts the handler task, which drops its future and
 /// this probe with it. A normal completion disarms first, so only an
 /// abort reports.
 struct CancelProbe {
@@ -46,8 +46,9 @@ impl Drop for CancelProbe {
 		if self.armed {
 			DUPLEX_CANCEL_SEEN.store(true, Ordering::SeqCst);
 			if let Err(error) = self.trace.event(SERVLET_DUPLEX_CANCELLED) {
-				// Panicking inside a drop that is itself unwinding aborts the
-				// process, so let the first failure be the one reported.
+				// A panic inside a drop that is itself unwinding aborts the
+				// process, so the assert fires only outside an unwind and the
+				// first failure stays the one reported.
 				assert!(std::thread::panicking(), "recording the duplex cancel failed: {error}");
 			}
 		}
@@ -82,7 +83,7 @@ servlet! {
 	}
 }
 
-/// A hive hosting one stream-echo servlet, muxed on both the servlet
+/// A hive that hosts one stream-echo servlet, muxed on both the servlet
 /// server and the hive-to-cluster pool.
 pub async fn start_stream_hive(
 	trace: TraceCollector,
@@ -138,8 +139,8 @@ pub async fn pooled_cluster_client(
 }
 
 /// Starts two peered gateways with the stream-echo hive registered in the
-/// exporter. This is the shared preamble for every splice scenario, and it
-/// returns the importer the client dials first and the exporter second.
+/// exporter. It is the shared preamble for every splice scenario. It returns
+/// the importer, which the client dials, and then the exporter.
 async fn start_spliced_clusters(
 	trace: &TraceCollector,
 	certs: &Arc<ClusterTestCerts>,
@@ -230,8 +231,8 @@ tb_assert_spec! {
 }
 
 // Duplex cross-cluster forward: both directions relay concurrently
-// across the splice: request chunks reach the exporter's servlet as
-// they are pushed, and its echoes arrive before the request closes.
+// across the splice. Request chunks reach the exporter's servlet as
+// the client pushes them, and its echoes arrive before the request closes.
 tb_scenario! {
 	name: cluster_forwards_duplex_to_peer_gateway,
 	spec: ClusterDuplexForwardSpec,
@@ -281,8 +282,8 @@ tb_assert_spec! {
 }
 
 // Gate policies cover stream opens: the reject-all policy that denies
-// unary work also refuses routed streaming and duplex opens before any
-// route is consulted, so mux streams cannot bypass `with_gate_policy`.
+// unary work also refuses routed streaming and duplex opens before the
+// gateway consults any route, so mux streams cannot bypass `with_gate_policy`.
 tb_scenario! {
 	name: cluster_policy_gate_blocks_streams,
 	spec: ClusterStreamGateSpec,
@@ -333,7 +334,7 @@ tb_assert_spec! {
 
 /// The wire status a refused open carries.
 ///
-/// A test that only asks whether the open failed goes green on any
+/// A test that only asks whether the open failed passes on any
 /// refusal, including the `Unimplemented` a plane with no route would
 /// give. The Edge policy names `PermissionDenied`, so that is what the
 /// scenario records.
@@ -344,9 +345,9 @@ fn refusal_status<T>(outcome: Result<T, tightbeam::transport::TransportError>) -
 	}
 }
 
-// The edge accept plane is Work-only: with a live stream servlet registered
-// on the colony plane, mux streaming and duplex opens on the edge address
-// still fail closed. Without the plane refuse, those opens would splice.
+// The edge accept plane admits Work frames only. With a live stream servlet
+// registered on the colony plane, mux streaming and duplex opens on the edge
+// address fail closed, and without the plane's refusal they would splice.
 tb_scenario! {
 	name: cluster_edge_plane_refuses_streams,
 	spec: ClusterEdgePlaneStreamRefuseSpec,
@@ -403,9 +404,9 @@ tb_assert_spec! {
 // Cancel propagation across the splice: the client proves the duplex
 // path is live (one chunk echoes end to end), then drops its stream
 // halves. The cancel crosses the importer, the exporter, and the
-// servlet, aborting the servlet handler, which the cancel probe
-// reports. The propagation flag is recorded before any teardown, so
-// a shutdown abort cannot satisfy the spec spuriously.
+// servlet, and aborts the servlet handler, which the cancel probe
+// reports. The client records the propagation flag before any teardown,
+// so a shutdown abort cannot satisfy the spec by accident.
 tb_scenario! {
 	name: cluster_duplex_cancel_propagates_to_peer,
 	spec: ClusterDuplexCancelSpec,
@@ -432,6 +433,65 @@ tb_scenario! {
 			exporter.stop();
 			importer.stop();
 			hive.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterStreamImpostorSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(REGISTER_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
+			(events::CLUSTER_DIAL_REFUSED, exactly!(2)),
+			(STREAM_SERVLET_HANDLED, exactly!(0)),
+			(DUPLEX_SERVLET_HANDLED, exactly!(0)),
+			(IMPOSTOR_STREAM_REFUSED, exactly!(1), equals!(TransitStatus::Unknown)),
+			(IMPOSTOR_DUPLEX_REFUSED, exactly!(1), equals!(TransitStatus::Unknown))
+		]
+	}
+}
+
+// A stream and a duplex splice reach a servlet only under the identity its
+// registration names. The gateway's hive trust holds both identities, so the
+// handshake completes, and the dial's binding alone refuses each open before
+// any body chunk leaves (CWE-346). The refusal is the gateway handler's
+// failure, so the client hears `Unknown`.
+tb_scenario! {
+	name: cluster_splice_refuses_a_servlet_answering_under_another_identity,
+	spec: ClusterStreamImpostorSpec,
+	environment Bare {
+		context: cluster_certs(),
+		exec: |SetupEnv { trace, context: certs }| async move {
+			let impostor_certs = stranger_gateway_certs();
+			let impostor_conf = servlet_tls_config(&impostor_certs)?;
+			let impostor = StreamEchoServlet::start(Arc::new(trace.share()), impostor_conf).await?;
+			let cluster = start_cluster(&trace, impostor_trusting_conf(&certs, &impostor_certs)).await?;
+
+			let mut control = connect_cluster(&certs, cluster.addr()).await?;
+			let hive_addr = b"127.0.0.1:65034";
+			let servlets = [servlet_info("stream-echo", impostor.addr().to_string())];
+			let registered =
+				register_signed_hive_serving(&mut control, &certs.key, b"impostor", hive_addr, servlets).await?;
+			trace.event_with(REGISTER_STATUS, &[], registered.status)?;
+
+			let client = pooled_cluster_client(&trace, &certs, cluster.addr()).await?;
+
+			let (sink, response) = client.open_stream_to(servlet_urn("stream-echo"))?;
+			sink.close_with(b"impostor").await?;
+
+			let refused = refusal_status(response.await);
+			trace.event_with(IMPOSTOR_STREAM_REFUSED, &[], refused.unwrap_or(TransitStatus::Ok))?;
+
+			let (sink, mut body) = client.open_duplex_to(servlet_urn("stream-echo"))?;
+			sink.close_with(b"impostor").await?;
+
+			let refused = refusal_status(body.chunk().await);
+			trace.event_with(IMPOSTOR_DUPLEX_REFUSED, &[], refused.unwrap_or(TransitStatus::Ok))?;
+
+			cluster.stop();
+			impostor.stop();
 			Ok(())
 		}
 	}

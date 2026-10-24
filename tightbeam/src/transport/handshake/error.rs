@@ -1,3 +1,6 @@
+#[cfg(not(feature = "std"))]
+use alloc::boxed::Box;
+
 use crate::Errorizable;
 
 #[cfg(all(
@@ -74,7 +77,7 @@ pub enum HandshakeError {
 	UnexpectedContainer,
 
 	/// No trust store or certificate validator is configured, so the handshake
-	/// refuses expiry-only peer certificate validation.
+	/// refuses to validate a peer certificate by its expiry alone.
 	#[error("Trust store required: refusing expiry-only peer certificate validation")]
 	MissingTrustStore,
 
@@ -97,8 +100,7 @@ pub enum HandshakeError {
 	AnchorMismatch,
 
 	/// The signing and the key-agreement certificate of a CMS server hold one
-	/// key, which would serve two purposes (NIST SP 800-57 Part 1 Rev. 5
-	/// §5.2).
+	/// key, which would serve two purposes (NIST SP 800-57 Part 1 Rev. 5 §5.2).
 	#[error("The two server certificates hold one key")]
 	KeyReuse,
 
@@ -239,6 +241,12 @@ pub enum HandshakeError {
 	#[error("Invalid key material length: {0}")]
 	#[from]
 	InvalidKeyMaterialLength(crypto_common::InvalidLength),
+
+	/// A crate error that names no handshake fault, kept whole.
+	/// [`Error::source`](core::error::Error::source) returns it as the cause.
+	#[error("Crate error during the handshake")]
+	#[source]
+	Other(Box<crate::error::TightBeamError>),
 }
 
 #[cfg(all(
@@ -255,6 +263,7 @@ impl HandshakeError {
 	///   certificate the peer did not present and a closing or frame that
 	///   fails to open, records
 	///   [`SESSION_CERT_REJECTED`](events::SESSION_CERT_REJECTED).
+	/// - A crate error that names no handshake fault records [`ERROR`](events::ERROR).
 	pub(crate) fn audit_event(&self) -> Option<Urn<'static>> {
 		match self {
 			Self::ApprovalRefused { .. } | Self::SettlementRejected { .. } => Some(events::SESSION_RECEIPT_REFUSED),
@@ -264,6 +273,7 @@ impl HandshakeError {
 			| Self::SealedClosing(_)
 			| Self::SealedFrame
 			| Self::MutualAuthRequired => Some(events::SESSION_CERT_REJECTED),
+			Self::Other(_) => Some(events::ERROR),
 			_ => None,
 		}
 	}
@@ -272,8 +282,9 @@ impl HandshakeError {
 /// Narrows [`TightBeamError`](crate::error::TightBeamError) into
 /// [`HandshakeError`].
 ///
-/// A variant without a handshake counterpart collapses to
-/// [`HandshakeError::InvalidState`].
+/// A variant with a handshake counterpart becomes that counterpart. Any other
+/// variant becomes [`HandshakeError::Other`], which keeps it as the source, so
+/// the conversion reports a handshake fault only when the error names one.
 impl From<crate::error::TightBeamError> for HandshakeError {
 	fn from(err: crate::error::TightBeamError) -> Self {
 		use crate::error::TightBeamError;
@@ -284,12 +295,17 @@ impl From<crate::error::TightBeamError> for HandshakeError {
 			TightBeamError::CertificateValidationError(e) => HandshakeError::CertificateValidationError(e),
 			TightBeamError::KeyError(e) => HandshakeError::KeyError(e),
 			TightBeamError::SignatureError(e) => HandshakeError::SignatureError(e),
+			TightBeamError::SignatureEncodingError => HandshakeError::SignatureVerificationFailed,
+			TightBeamError::Signer(e) => HandshakeError::from(e),
+			TightBeamError::EllipticCurveError(e) => HandshakeError::InvalidPublicKey(e),
+			TightBeamError::KeyDerivationError(e) => HandshakeError::KdfError(e),
+			TightBeamError::InvalidKeyLength(e) => HandshakeError::InvalidKeyMaterialLength(e),
 			#[cfg(feature = "hpke")]
 			TightBeamError::HpkeError(e) => HandshakeError::HpkeError(e),
 			#[cfg(feature = "hpke")]
 			TightBeamError::EnvelopeError(e) => HandshakeError::Envelope(e),
 			TightBeamError::OsRngError(_) => HandshakeError::RandomGenerationFailed,
-			_ => HandshakeError::InvalidState,
+			other => HandshakeError::Other(Box::new(other)),
 		}
 	}
 }
@@ -322,6 +338,9 @@ impl From<crate::crypto::sign::SignerError> for HandshakeError {
 mod tests {
 	use super::*;
 	use crate::crypto::cms::EnvelopeError;
+	use crate::crypto::kdf::KdfError;
+	use crate::crypto::sign::{elliptic_curve, SignerError};
+	use crate::TightBeamError;
 
 	#[test]
 	fn a_missing_client_certificate_is_a_certificate_rejection() {
@@ -346,5 +365,62 @@ mod tests {
 	#[test]
 	fn a_state_error_records_no_audit_event() {
 		assert_eq!(HandshakeError::InvalidState.audit_event(), None);
+	}
+
+	/// A crate error with no handshake counterpart keeps its cause, so the
+	/// conversion reports no state fault.
+	#[test]
+	fn an_unmapped_crate_error_reads_back_through_its_source() -> Result<(), Box<dyn core::error::Error>> {
+		let error = HandshakeError::from(TightBeamError::MissingEncryptionInfo);
+		let source = core::error::Error::source(&error).ok_or("the conversion keeps the cause")?;
+
+		let downcast = source.downcast_ref::<Box<TightBeamError>>();
+		let cause = downcast.ok_or("the cause is the crate error")?;
+		assert!(matches!(**cause, TightBeamError::MissingEncryptionInfo));
+		Ok(())
+	}
+
+	/// A key derivation failure has a handshake counterpart, so it keeps its
+	/// kind.
+	#[test]
+	fn a_key_derivation_failure_converts_to_its_counterpart() {
+		let error = HandshakeError::from(TightBeamError::KeyDerivationError(KdfError::InvalidSharedSecretLength(16)));
+		let kept = matches!(error, HandshakeError::KdfError(KdfError::InvalidSharedSecretLength(16)));
+		assert!(kept);
+	}
+
+	/// A signature that fails to encode is a signature the handshake refuses.
+	#[test]
+	fn a_signature_encoding_failure_is_a_failed_verification() {
+		let error = HandshakeError::from(TightBeamError::SignatureEncodingError);
+		assert!(matches!(error, HandshakeError::SignatureVerificationFailed));
+	}
+
+	/// A signer error that the crate error carries whole converts as the
+	/// signer conversion converts it.
+	#[test]
+	fn a_carried_signer_error_converts_as_a_signer_refusal() {
+		let error = HandshakeError::from(TightBeamError::Signer(SignerError::SignerIdentifier));
+		assert!(matches!(error, HandshakeError::SignatureVerificationFailed));
+	}
+
+	/// A curve failure is an invalid public key.
+	#[test]
+	fn a_curve_failure_is_an_invalid_public_key() {
+		let error = HandshakeError::from(TightBeamError::EllipticCurveError(elliptic_curve::Error));
+		assert!(matches!(error, HandshakeError::InvalidPublicKey(_)));
+	}
+
+	/// Key material of the wrong length keeps its kind.
+	#[test]
+	fn an_invalid_key_length_converts_to_its_counterpart() {
+		let error = HandshakeError::from(TightBeamError::InvalidKeyLength(crypto_common::InvalidLength));
+		assert!(matches!(error, HandshakeError::InvalidKeyMaterialLength(_)));
+	}
+
+	#[test]
+	fn an_unmapped_crate_error_records_the_generic_failure() {
+		let event = HandshakeError::from(TightBeamError::MissingEncryptionInfo).audit_event();
+		assert_eq!(event, Some(events::ERROR));
 	}
 }

@@ -9,6 +9,7 @@
 
 use super::{reply_frame, reply_frame_with_priority};
 use crate::asn1::Frame;
+use crate::cms::signed_data::SignerIdentifier;
 use crate::constants::DEFAULT_HOP_BUDGET;
 use crate::der::{Choice, Enumerated, Sequence};
 use crate::policy::TransitStatus;
@@ -34,8 +35,8 @@ pub struct ClusterWorkRequest {
 	/// integrity, and previous-frame linkage stay verifiable at the
 	/// servlet ([`Frame::verify`]).
 	pub payload: Vec<u8>,
-	/// The relay budget, counting how many gateway forwards this work
-	/// may still spend.
+	/// The relay budget, which counts the gateway forwards this work may
+	/// still spend.
 	///
 	/// - A client origin stamps the [`DEFAULT_HOP_BUDGET`] sentinel through
 	///   [`ClusterWorkRequest::new`], so gateway policy decides the budget.
@@ -53,9 +54,9 @@ wire_sequence!(ClusterWorkRequest {
 });
 
 impl ClusterWorkRequest {
-	/// Builds origin work from a client, nesting the client's complete
-	/// frame as the end-to-end payload. The sentinel budget defers the
-	/// hop cap to the first gateway's `max_hops` policy.
+	/// Builds origin work from a client, with the client's complete frame
+	/// nested as the end-to-end payload. The sentinel budget defers the hop
+	/// cap to the first gateway's `max_hops` policy.
 	pub fn new(servlet_type: Urn<'static>, frame: &Frame) -> Result<Self, TightBeamError> {
 		Ok(Self { servlet_type, payload: encode(frame)?, hops_remaining: DEFAULT_HOP_BUDGET })
 	}
@@ -156,7 +157,7 @@ impl ClusterWorkResponse {
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError::MissingResponse`] -- the gateway answered with no frame at all.
+	/// - [`TightBeamError::MissingResponse`] -- the gateway answered with no frame.
 	/// - [`TightBeamError::SerializationError`] -- the reply does not decode as a work response.
 	/// - Any error that [`Self::served`] reports for the decoded response.
 	pub(crate) fn served_reply(reply: Option<Frame>) -> Result<Frame, TightBeamError> {
@@ -245,13 +246,13 @@ pub struct ServletAddressUpdate {
 /// One servlet instance entering or leaving a hive's slate.
 ///
 /// The encoded update carries an instance under `added` and a bare URN under
-/// `removed`, so the direction picks which field the instance lands in.
-/// Naming the direction as a variant keeps that choice with the value it
+/// `removed`, so the direction picks which field the instance lands in. A
+/// variant names the direction, so that choice stays with the value it
 /// applies to.
 pub(crate) enum ServletChange {
-	/// An instance that has joined the slate, with the address to reach it.
+	/// An instance that joined the slate, with the address that reaches it.
 	Added(ServletInfo),
-	/// An instance that has left the slate, named by its instance URN.
+	/// An instance that left the slate, named by its instance URN.
 	Removed(Urn<'static>),
 }
 
@@ -272,12 +273,13 @@ pub struct ServletAddressUpdateResponse {
 	pub status: TransitStatus,
 }
 
-/// A peer gateway advertising the servlet types its colony exports.
+/// A peer gateway's advertisement of the servlet types its colony exports.
 ///
 /// A gateway sends it to a peer gateway, so the receiving colony learns
 /// which types the peer serves and forwards work there. It carries type URNs
-/// only, and no instance addresses. The peer is reached at `gateway_addr`,
-/// which resolves the whole peer colony rather than a single servlet.
+/// alone, without instance addresses. Peers reach the gateway at
+/// `gateway_addr`, which resolves the whole peer colony rather than a single
+/// servlet.
 #[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct PeerAdvertisement {
 	/// The address that peers dial to reach the advertising gateway.
@@ -302,11 +304,12 @@ pub struct PeerAdvertisementResponse {
 #[derive(Enumerated, Default, Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum GossipRumorKind {
-	/// Opaque application payload delivered through the ingress policy.
+	/// An opaque application payload, delivered through the ingress policy.
 	#[default]
 	Application = 0,
-	/// Origin-signed peer advertisement frame bytes, applied to the
-	/// receiving gateway's peer routing state for transitive discovery.
+	/// The bytes of an origin-signed peer advertisement frame, which the
+	/// receiving gateway applies to its peer routing state for transitive
+	/// discovery.
 	PeerAdvertisement = 1,
 }
 
@@ -336,13 +339,13 @@ pub enum GossipRumorKind {
 ///
 /// - The rumor frame's `metadata.id` is the rumor identity, and its
 ///   `metadata.order` is the issue time in unix milliseconds (§5.7.1 permits
-///   a time-based order). Both are copied from the publish frame.
+///   a time-based order). The origin gateway copies both from the publish frame.
 /// - Hop state such as the remaining flood radius MUST stay outside the rumor
 ///   frame. It travels in the `metadata.lifetime` of the outer relay frame,
 ///   which each relay rebuilds and re-signs.
 #[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct GossipRumor {
-	/// Opaque application payload delivered through the ingress policy.
+	/// The opaque application payload, delivered through the ingress policy.
 	pub payload: Vec<u8>,
 	/// How the receiving gateway consumes `payload`. The common
 	/// application kind is the DER DEFAULT, so the encoding omits it.
@@ -369,8 +372,8 @@ impl GossipRumor {
 /// The response to a gossip rumor.
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
 pub struct GossipResponse {
-	/// The status of the rumor, where `Ok` means the rumor was accepted,
-	/// delivered, and considered for a reflood.
+	/// The status of the rumor, where `Ok` means the receiver accepted the
+	/// rumor, delivered it, and considered it for a reflood.
 	///
 	/// On a relayed rumor, `Unauthenticated` means the receiver's trust does
 	/// not hold the rumor's origin, and it tells the sender to stop offering
@@ -401,7 +404,7 @@ impl GossipResponse {
 /// (CWE-20).
 #[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct GossipReconciliation {
-	/// Content digests the sender currently retains.
+	/// The content digests the sender retains.
 	pub held: Vec<Vec<u8>>,
 }
 
@@ -482,28 +485,52 @@ impl ActivateServletResponse {
 	}
 }
 
-/// One servlet instance and the address that reaches it.
+/// One servlet instance, the address that reaches it, and the identity it
+/// answers under.
 #[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct ServletInfo {
 	/// The servlet instance URN, which is the type URN with a `/{addr}` tail.
 	pub servlet_id: Urn<'static>,
 	/// The address that reaches the servlet.
 	pub address: Vec<u8>,
+	/// The `SignerIdentifier` that names the certificate the servlet presents
+	/// in its handshake (RFC 5652 §5.3), encoded as its own DER.
+	///
+	/// A gateway that dials the servlet admits only the certificate this
+	/// signer names, so a party that answers at the address under another
+	/// identity receives no frame (CWE-346).
+	pub signer: SignerIdentifier,
 }
 
-wire_sequence!(ServletInfo { servlet_id: plain, address: octets });
+wire_sequence!(ServletInfo { servlet_id: plain, address: octets, signer: plain });
+
+#[cfg(test)]
+impl ServletInfo {
+	/// The signer of the certificate on the fixed test key, which a fixture
+	/// servlet that serves under that key presents.
+	pub(crate) fn fixture_signer() -> SignerIdentifier {
+		use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
+		use crate::crypto::x509::utils::CertificateExt;
+		use crate::testing::{TestCertificate, TestKey};
+
+		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
+		let certificate = TestCertificate::self_signed(&key);
+
+		certificate.signer_identifier().expect("the fixture certificate names its key")
+	}
+}
 
 /// Why a CHOICE-shaped product named no single alternative.
 ///
 /// DER CHOICE admits exactly one alternative. These products spell a choice
-/// as tagged optional fields, so the encoding can carry none or several, and a
-/// reader refuses both rather than guessing.
+/// as tagged optional fields, so the encoding can carry none or more than one,
+/// and a reader refuses both rather than guess.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Errorizable)]
 pub enum ChoiceRefusal {
-	/// No alternative was set.
+	/// The product sets no alternative.
 	#[error("the product named no alternative")]
 	NoneSet,
-	/// More than one alternative was set.
+	/// The product sets more than one alternative.
 	#[error("the product named more than one alternative")]
 	ManySet,
 }
@@ -539,7 +566,7 @@ pub enum ClusterCommandKind {
 	Manage(HiveManagement),
 }
 
-/// The management alternative a manage command is answered in.
+/// The management alternative that answers a manage command.
 ///
 /// The cluster decodes a management response in the alternative it asked
 /// in, so a refusal to a spawn answers in the spawn alternative.
@@ -553,12 +580,12 @@ pub enum ManageShape {
 	Stop,
 }
 
-/// The reply shape a cluster command is answered in.
+/// The reply shape that answers a cluster command.
 ///
 /// A sender decodes the response in the shape it asked in, so a refusal
 /// answered in another one reads as a malformed response and counts toward
-/// eviction. The shape is a property of the command body, so it lives here
-/// rather than being re-derived per refusal site.
+/// eviction. The shape is a property of the command body, so it lives here,
+/// once, for every refusal site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplyShape {
 	/// Answer in the heartbeat alternative.
@@ -594,9 +621,9 @@ impl ReplyShape {
 	/// The shape a reply to `body` must use.
 	///
 	/// A body that named no single alternative has no shape of its own, so
-	/// it is answered in the stop alternative. That alternative carries only
-	/// a status, which is the one thing a refusal of an unreadable command
-	/// can report.
+	/// its reply uses the stop alternative. That alternative carries only a
+	/// status, which is the one thing a refusal of an unreadable command can
+	/// report.
 	#[must_use]
 	pub fn of(body: Option<&ClusterCommandKind>) -> Self {
 		body.map_or(Self::Manage(ManageShape::Stop), ClusterCommandKind::reply_shape)
@@ -648,9 +675,9 @@ pub enum ClusterCommandOutcome {
 
 /// The hive management request, a CHOICE spelled as tagged optional fields.
 ///
-/// Context-specific tags tell the request types apart. Exactly one field is
-/// set per request, and [`HiveManagementRequest::into_choice`] refuses a
-/// request that sets none or several.
+/// Context-specific tags tell the request types apart. A request sets exactly
+/// one field, and [`HiveManagementRequest::into_choice`] refuses a request
+/// that sets none or more than one.
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
 pub struct HiveManagementRequest {
 	/// A request to spawn a new servlet instance [context 0].
@@ -664,7 +691,7 @@ pub struct HiveManagementRequest {
 	pub stop: Option<StopServletParams>,
 }
 
-/// The parameters for spawning a new servlet.
+/// The parameters of a request that spawns a new servlet.
 #[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct SpawnServletParams {
 	/// The type URN of the servlet to spawn, such as
@@ -676,7 +703,7 @@ pub struct SpawnServletParams {
 
 wire_sequence!(SpawnServletParams { servlet_type: plain, config: octets_opt });
 
-/// The parameters for listing servlets.
+/// The parameters of a request that lists servlets.
 #[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct ListServletsParams {
 	/// A filter that is reserved for future use.
@@ -685,7 +712,7 @@ pub struct ListServletsParams {
 
 wire_sequence!(ListServletsParams { filter: octets_opt });
 
-/// The parameters for stopping a servlet.
+/// The parameters of a request that stops a servlet.
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
 pub struct StopServletParams {
 	/// The instance URN of the servlet to stop.
@@ -694,9 +721,9 @@ pub struct StopServletParams {
 
 /// The hive management response, a CHOICE spelled as tagged optional fields.
 ///
-/// Context-specific tags tell the response types apart. Exactly one field is
-/// set per response, and [`HiveManagementResponse::into_choice`] refuses a
-/// response that sets none or several.
+/// Context-specific tags tell the response types apart. A response sets
+/// exactly one field, and [`HiveManagementResponse::into_choice`] refuses a
+/// response that sets none or more than one.
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
 pub struct HiveManagementResponse {
 	/// The answer to a spawn request [context 0].
@@ -710,7 +737,7 @@ pub struct HiveManagementResponse {
 	pub stop: Option<StopServletResult>,
 }
 
-/// The result of spawning a servlet.
+/// The result of a spawn request.
 #[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct SpawnServletResult {
 	/// The status of the spawn request.
@@ -724,7 +751,7 @@ pub struct SpawnServletResult {
 
 wire_sequence!(SpawnServletResult { status: plain, servlet_address: octets_opt, servlet_id: plain });
 
-/// The result of listing servlets.
+/// The result of a list request.
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
 pub struct ListServletsResult {
 	/// The status of the request.
@@ -733,7 +760,7 @@ pub struct ListServletsResult {
 	pub servlets: Vec<ServletInfo>,
 }
 
-/// The result of stopping a servlet.
+/// The result of a stop request.
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
 pub struct StopServletResult {
 	/// The status of the stop request.
@@ -804,7 +831,7 @@ impl HiveManagementResponse {
 /// The status that a cluster reports in a heartbeat.
 ///
 /// A cluster reports its operational status to its hives in each heartbeat.
-/// A hive may use it to adjust its behavior, such as reducing capacity while
+/// A hive may use it to adjust its behavior, such as a lower capacity while
 /// the cluster drains.
 #[derive(Enumerated, Default, Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -823,12 +850,12 @@ pub enum ClusterStatus {
 /// The cluster command message, a CHOICE spelled as tagged optional fields.
 ///
 /// It carries commands from the cluster to a hive. Context-specific tags
-/// discriminate the CHOICE, and exactly one field is set per message.
+/// discriminate the CHOICE, and a message sets exactly one field.
 ///
 /// # Security
 ///
 /// - A command requires a nonrepudiation signature and frame integrity. A
-///   frame without them is refused as `Unauthenticated`. Only a signature
+///   hive refuses a frame without them as `Unauthenticated`. Only a signature
 ///   that fails to verify counts toward the circuit breaker.
 /// - Freshness binds to `Frame.metadata.order` (unix milliseconds), so hives
 ///   reject commands outside their freshness window and replays of
@@ -858,7 +885,7 @@ pub struct HeartbeatParams {
 /// The cluster command response, a CHOICE spelled as tagged optional fields.
 ///
 /// A hive answers a cluster command with it. Context-specific tags
-/// discriminate the CHOICE, and exactly one field is set per response.
+/// discriminate the CHOICE, and a response sets exactly one field.
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
 pub struct ClusterCommandResponse {
 	/// The heartbeat answer [context 0].
@@ -876,7 +903,8 @@ impl From<HiveManagement> for HiveManagementRequest {
 	///
 	/// This is the send-side counterpart of
 	/// [`HiveManagementRequest::into_choice`]: a request built here names
-	/// exactly one alternative, so no sender has to remember the rule.
+	/// exactly one alternative, so every sender keeps the rule by
+	/// construction.
 	fn from(request: HiveManagement) -> Self {
 		match request {
 			HiveManagement::Spawn(spawn) => Self { spawn: Some(spawn), list: None, stop: None },
@@ -903,7 +931,7 @@ impl HiveManagementRequest {
 	/// # Errors
 	///
 	/// - [`ChoiceRefusal::NoneSet`] -- the product names no request.
-	/// - [`ChoiceRefusal::ManySet`] -- the product names several requests.
+	/// - [`ChoiceRefusal::ManySet`] -- the product names more than one request.
 	pub fn into_choice(self) -> Result<HiveManagement, ChoiceRefusal> {
 		match (self.spawn, self.list, self.stop) {
 			(Some(spawn), None, None) => Ok(HiveManagement::Spawn(spawn)),
@@ -921,7 +949,7 @@ impl HiveManagementResponse {
 	/// # Errors
 	///
 	/// - [`ChoiceRefusal::NoneSet`] -- the product names no result.
-	/// - [`ChoiceRefusal::ManySet`] -- the product names several results.
+	/// - [`ChoiceRefusal::ManySet`] -- the product names more than one result.
 	pub fn into_choice(self) -> Result<HiveManagementOutcome, ChoiceRefusal> {
 		match (self.spawn, self.list, self.stop) {
 			(Some(spawn), None, None) => Ok(HiveManagementOutcome::Spawn(spawn)),
@@ -949,13 +977,13 @@ impl ClusterCommand {
 	/// Consumes this product for the one command it names.
 	///
 	/// A management command proves its own alternative here as well, so a
-	/// dispatcher matches an exhaustive body rather than reading fields.
+	/// dispatcher matches an exhaustive body instead of the fields.
 	///
 	/// # Errors
 	///
 	/// - [`ChoiceRefusal::NoneSet`] -- the product names no command.
 	/// - [`ChoiceRefusal::ManySet`] -- the product names both commands, or its
-	///   management request names several.
+	///   management request names more than one.
 	pub fn into_choice(self) -> Result<ClusterCommandKind, ChoiceRefusal> {
 		match (self.heartbeat, self.manage) {
 			(Some(heartbeat), None) => Ok(ClusterCommandKind::Heartbeat(heartbeat)),
@@ -973,7 +1001,7 @@ impl ClusterCommandResponse {
 	///
 	/// - [`ChoiceRefusal::NoneSet`] -- the product names no answer.
 	/// - [`ChoiceRefusal::ManySet`] -- the product names both answers, or its
-	///   management response names several.
+	///   management response names more than one.
 	pub fn into_choice(self) -> Result<ClusterCommandOutcome, ChoiceRefusal> {
 		match (self.heartbeat, self.manage) {
 			(Some(heartbeat), None) => Ok(ClusterCommandOutcome::Heartbeat(heartbeat)),
@@ -1032,8 +1060,8 @@ impl ClusterCommandResponse {
 ///
 /// The frame layer leaves `metadata.order` protocol-opaque. Colony control
 /// frames, rumors, and advertisements all put their issue time there as unix
-/// milliseconds (§5.7.1 permits a time-based order). This is the one place
-/// that reading is made, so every freshness and replay decision compares the
+/// milliseconds (§5.7.1 permits a time-based order). This trait is the one
+/// place that reads it, so every freshness and replay decision compares the
 /// same instant.
 pub(crate) trait IssuedAt {
 	/// The instant this frame says it was issued.
@@ -1130,6 +1158,7 @@ mod tests {
 					.servlet_instance("127.0.0.1:9001")
 					.expect("a servlet type URN yields an instance URN"),
 				address: b"127.0.0.1:9001".to_vec(),
+				signer: ServletInfo::fixture_signer(),
 			}],
 			metadata: None,
 		}))
@@ -1379,7 +1408,7 @@ mod tests {
 		}
 	}
 
-	/// A body that named no single alternative is answered in the stop
+	/// The reply to a body that named no single alternative uses the stop
 	/// alternative, which carries only the status a refusal has to report.
 	#[test]
 	fn an_unreadable_command_is_answered_in_the_stop_alternative() {

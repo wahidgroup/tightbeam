@@ -1,7 +1,7 @@
-//! Testing module orchestrator
+//! The testing module gathers the test submodules and re-exports their types.
 //!
-//! Aggregates submodules and provides demo macro usage to surface
-//! compilation errors early when introducing new declarative APIs.
+//! Its demo spec uses the declarative macros, so a new declarative API that
+//! fails to expand shows its compile error here first.
 
 // Test-fixture surface: constructors take fixed, valid-by-construction
 // inputs, and a fixture that cannot build must abort the test run with
@@ -40,7 +40,6 @@ pub mod routes;
 #[cfg(feature = "testing-timing")]
 pub mod timing;
 
-// Re-exports
 pub use config::{
 	AcceptedObserver, Expect, HookContext, RejectedObserver, ScenarioConfig, ScenarioConfigBuilder,
 	ScenarioConfigError, TestHooks,
@@ -65,7 +64,7 @@ pub use fault::{ProcessEvent, ProcessState};
 #[cfg(feature = "testing-fdr")]
 pub use fdr::{Decision, FdrConfig, FdrTraceExt, FdrVerdict, SchedulerModel, TraceProcessMode};
 #[cfg(feature = "testing-fault")]
-pub use fdr::{FaultInjection, FaultModel, InjectedFaultRecord, InjectionStrategy};
+pub use fdr::{FaultModel, InjectedFaultRecord, InjectionStrategy};
 #[cfg(feature = "signature")]
 pub use fixtures::TestAttributes;
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]

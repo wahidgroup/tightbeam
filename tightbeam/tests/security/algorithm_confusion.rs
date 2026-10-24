@@ -1,18 +1,20 @@
 //! # Signature algorithm-confusion threat
 //!
 //! ## Weakness
-//! `Secp256k1Policy::verify_signature` ignores its `algorithm_oid` argument and
-//! unconditionally verifies the bytes as secp256k1 ECDSA, so a relying party can
-//! be made to accept a signature under an algorithm it never agreed to.
+//! If `Secp256k1Policy::verify_signature` ignored its `algorithm_oid` argument
+//! and verified the bytes as secp256k1 ECDSA unconditionally, an attacker could
+//! make a relying party accept a signature under an algorithm it never agreed
+//! to.
 //!
 //! ## Attack
-//! A signature that genuinely verifies under the real ECDSA OID is presented
-//! under an unrelated algorithm OID (here AES-256-GCM); the policy accepts it.
+//! An attacker takes a signature that genuinely verifies under the real ECDSA
+//! OID and presents it under an unrelated algorithm OID (here AES-256-GCM). A
+//! flawed policy accepts it.
 //!
 //! ## Expected control
-//! A sound policy MUST reject an algorithm OID it does not support. The same
-//! key/message/signature accepted under the genuine ECDSA OID MUST be refused
-//! under an unrelated OID.
+//! A sound policy MUST reject an algorithm OID it does not support. It MUST
+//! refuse under an unrelated OID (`UnsupportedAlgorithm`) the same key,
+//! message, and signature that it accepts under the genuine ECDSA OID.
 //!
 //! ## References
 //! - CWE-347: Improper Verification of Cryptographic Signature
@@ -27,6 +29,7 @@ use tightbeam::{
 		hash::Sha3_256,
 		policy::{Secp256k1Policy, VerificationPolicy},
 		sign::{ecdsa::Secp256k1Signature, CanonicalSigner},
+		x509::error::CertificateValidationError::UnsupportedAlgorithm,
 	},
 	der::Encode,
 	exactly, job,
@@ -48,7 +51,7 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(FOREIGN_OID_REJECTED, exactly!(1u32))
+			(FOREIGN_OID_REJECTED, exactly!(1u32), equals!(true))
 		]
 	}
 }
@@ -99,8 +102,11 @@ job! {
 
 		// Under an unrelated algorithm OID a sound policy must refuse it.
 		match policy.verify_signature(&AES_256_GCM, &spki_der, message, signature_bytes.as_ref()) {
-			Err(_) => {
-				trace.event(FOREIGN_OID_REJECTED)?;
+			Err(error) => {
+				// The policy holds one algorithm, so it refuses the foreign OID
+				// by name before it reads the key.
+				let unsupported = matches!(error, UnsupportedAlgorithm(oid) if oid == AES_256_GCM);
+				trace.event_with(FOREIGN_OID_REJECTED, &[], unsupported)?;
 			}
 			Ok(_) => return Err(expectation_failure("signature accepted under an unsupported algorithm OID")),
 		}

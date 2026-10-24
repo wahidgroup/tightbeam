@@ -7,18 +7,16 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use core::fmt;
-#[cfg(feature = "testing-fault")]
-use std::collections::HashMap;
 #[cfg(any(test, feature = "testing", feature = "instrument", feature = "testing-fault"))]
 use std::sync::Mutex;
+#[cfg(feature = "testing-fault")]
+use std::sync::OnceLock;
 #[cfg(any(test, feature = "testing"))]
 use std::sync::PoisonError;
 
 use crate::trace::{AssertionValue, TraceConfigBuilder};
 use crate::urn::Urn;
 
-#[cfg(feature = "testing-fault")]
-use crate::constants::DEFAULT_FAULT_SEED;
 #[cfg(feature = "instrument")]
 use crate::crypto::hash::{Digest, Sha3_256};
 #[cfg(any(test, feature = "testing"))]
@@ -28,9 +26,7 @@ use crate::instrumentation::{events, BoundedMemorySink, EventSink, TbEvent, TbIn
 #[cfg(all(feature = "policy", any(test, feature = "testing")))]
 use crate::policy::TransitStatus;
 #[cfg(feature = "testing-fault")]
-use crate::testing::fdr::FaultModel;
-#[cfg(feature = "testing-fault")]
-use crate::testing::fdr::InjectionStrategy;
+use crate::testing::fdr::{FaultModel, StrategyDraw};
 #[cfg(feature = "logging")]
 use crate::trace::logging::LogRecord;
 #[cfg(any(test, feature = "testing"))]
@@ -63,15 +59,15 @@ impl IntoEventLabel for &Urn<'_> {
 /// Configuration for trace collection.
 #[derive(Default)]
 pub struct TraceConfig {
-	/// Instrumentation settings. `None` uses the default settings.
+	/// The instrumentation settings. `None` uses the default settings.
 	#[cfg(feature = "instrument")]
 	pub instrumentation: Option<TbInstrumentationConfig>,
-	/// Event retention and export sink. `None` uses the default bounded
-	/// in-memory buffer ([`BoundedMemorySink`]) sized by
+	/// The sink that retains and exports events. `None` uses the default
+	/// bounded in-memory buffer ([`BoundedMemorySink`]) sized by
 	/// `instrumentation.max_events`.
 	#[cfg(feature = "instrument")]
 	pub sink: Option<Arc<dyn EventSink>>,
-	/// Log backend configuration. `None` leaves events off the log backend.
+	/// The log backend configuration. `None` leaves events off the log backend.
 	#[cfg(feature = "logging")]
 	pub logger: Option<super::logging::LoggerConfig>,
 }
@@ -122,7 +118,7 @@ impl From<TbInstrumentationConfig> for TraceConfig {
 	}
 }
 
-/// Builder that constructs and emits one trace event.
+/// A builder that constructs and emits one trace event.
 ///
 /// Timing and payload information chain on optionally.
 ///
@@ -326,7 +322,7 @@ pub struct TraceCollector {
 	state: Arc<TraceState>,
 }
 
-/// Debug-opaque handle around the configured event sink.
+/// A Debug-opaque handle around the configured event sink.
 #[cfg(feature = "instrument")]
 struct SinkHandle(Arc<dyn EventSink>);
 
@@ -344,7 +340,7 @@ impl Default for SinkHandle {
 	}
 }
 
-/// Monotonic trace clock whose event timestamps count nanoseconds since the
+/// A monotonic trace clock whose event timestamps count nanoseconds since the
 /// collector's construction. The construction time origin is recorded once
 /// (`TRACE_CLOCK_ORIGIN`), so absolute times are reconstructible without a
 /// per-event syscall.
@@ -393,6 +389,49 @@ impl TraceClock {
 	}
 }
 
+/// The runtime fault model of a collector, beside the draw state of its
+/// injection strategy.
+///
+/// [`Self::new`] starts the strategy at its beginning, so one model injects
+/// the same faults on each run.
+#[cfg(feature = "testing-fault")]
+#[derive(Debug)]
+struct RuntimeFaults {
+	/// The model whose runtime injection points [`Self::draw`] reads.
+	model: FaultModel,
+	/// The draw state of the model's strategy.
+	strategy: StrategyDraw,
+}
+
+#[cfg(feature = "testing-fault")]
+impl RuntimeFaults {
+	/// Creates the faults of `model`, with its strategy at its start.
+	fn new(model: FaultModel) -> Self {
+		let strategy = model.strategy_draw();
+		Self { model, strategy }
+	}
+
+	/// Draws the fault the model injects at this record of `label`, or `None`.
+	///
+	/// The label stays the `Cow` that the count keys, as the check that calls
+	/// this states.
+	#[allow(clippy::ptr_arg)]
+	fn draw(&mut self, label: &Cow<'static, str>) -> Option<crate::TightBeamError> {
+		let injection = self.model.runtime_injection(label)?;
+		let inject = self.strategy.injects(label, injection);
+
+		inject.then(|| (injection.error_factory)())
+	}
+}
+
+/// The faults of the default model, whose set of injection points is empty.
+#[cfg(feature = "testing-fault")]
+impl Default for RuntimeFaults {
+	fn default() -> Self {
+		Self::new(FaultModel::default())
+	}
+}
+
 #[derive(Debug)]
 struct TraceState {
 	#[cfg(any(test, feature = "testing"))]
@@ -410,12 +449,11 @@ struct TraceState {
 	clock: TraceClock,
 	#[cfg(feature = "testing-fuzz")]
 	oracle: Option<crate::testing::fuzz::FuzzContext>,
+	/// The runtime fault model with the draw state of its strategy. The slot
+	/// is empty until [`TraceCollector::with_fault_model`] installs a model,
+	/// and an event reads an empty slot with one atomic load.
 	#[cfg(feature = "testing-fault")]
-	runtime_fault_model: Option<FaultModel>,
-	#[cfg(feature = "testing-fault")]
-	fault_rng_state: Mutex<u64>, // The seeded RNG state for the random strategy.
-	#[cfg(feature = "testing-fault")]
-	fault_call_counters: Mutex<HashMap<Cow<'static, str>, u32>>, // The per-label call counters for the deterministic strategy.
+	runtime_faults: OnceLock<Mutex<RuntimeFaults>>,
 	#[cfg(feature = "logging")]
 	logger_config: Option<super::logging::LoggerConfig>,
 }
@@ -436,11 +474,7 @@ impl Default for TraceState {
 			#[cfg(feature = "testing-fuzz")]
 			oracle: None,
 			#[cfg(feature = "testing-fault")]
-			runtime_fault_model: None,
-			#[cfg(feature = "testing-fault")]
-			fault_rng_state: Mutex::new(DEFAULT_FAULT_SEED),
-			#[cfg(feature = "testing-fault")]
-			fault_call_counters: Mutex::new(HashMap::new()),
+			runtime_faults: OnceLock::new(),
 			#[cfg(feature = "logging")]
 			logger_config: None,
 		}
@@ -462,11 +496,7 @@ impl TraceState {
 			#[cfg(feature = "testing-fuzz")]
 			oracle: None,
 			#[cfg(feature = "testing-fault")]
-			runtime_fault_model: None,
-			#[cfg(feature = "testing-fault")]
-			fault_rng_state: Mutex::new(DEFAULT_FAULT_SEED),
-			#[cfg(feature = "testing-fault")]
-			fault_call_counters: Mutex::new(HashMap::new()),
+			runtime_faults: OnceLock::new(),
 			#[cfg(feature = "logging")]
 			logger_config: None,
 		}
@@ -489,11 +519,7 @@ impl TraceState {
 			clock: TraceClock::default(),
 			oracle: Some(crate::testing::fuzz::FuzzContext::new(input, process)),
 			#[cfg(feature = "testing-fault")]
-			runtime_fault_model: None,
-			#[cfg(feature = "testing-fault")]
-			fault_rng_state: Mutex::new(DEFAULT_FAULT_SEED),
-			#[cfg(feature = "testing-fault")]
-			fault_call_counters: Mutex::new(HashMap::new()),
+			runtime_faults: OnceLock::new(),
 			#[cfg(feature = "logging")]
 			logger_config: None,
 		}
@@ -546,21 +572,60 @@ impl TraceCollector {
 		Self { state: Arc::new(TraceState::with_oracle(input, process)) }
 	}
 
-	/// The fuzz oracle, when this collector was built with one.
+	/// Returns the fuzz oracle, when this collector was built with one.
 	///
-	/// [`TraceCollector::with_fuzz_oracle`] is the only constructor that
-	/// installs one, and [`TraceCollector::share`] carries it, so every
-	/// handle a scenario receives answers the same way its collector does.
-	/// Every other collector returns [`None`].
+	/// - [`TraceCollector::with_fuzz_oracle`] is the one constructor that installs an oracle.
+	/// - [`TraceCollector::share`] carries it, so each handle a scenario gets answers as its collector does.
+	/// - Every other collector returns [`None`].
 	///
-	/// A fuzz harness wants the oracle itself rather than an `Option`, and
-	/// a missing one is a harness construction bug it should abort on.
-	/// `OracleAccess::oracle`, in the test-support surface, is that
-	/// accessor. This one is the total answer the library owes a caller
-	/// that is not a harness.
+	/// A fuzz harness wants the oracle itself rather than an `Option`, and a
+	/// missing one is a construction bug it should abort on, so it calls
+	/// `OracleAccess::oracle` in the test-support surface. This accessor is the
+	/// total answer that the library owes every other caller.
 	#[cfg(feature = "testing-fuzz")]
 	pub fn try_oracle(&self) -> Option<&crate::testing::fuzz::FuzzContext> {
 		self.state.oracle.as_ref()
+	}
+
+	/// Installs `model` as the runtime fault model of the state this
+	/// collector shares, so [`Self::event`] and [`Self::event_with`] inject
+	/// the faults that [`FaultModel::with_event_fault`] keys.
+	///
+	/// - Every handle that shares the state injects by the model.
+	/// - The model starts its strategy with the count of each label at zero and the generator at its seed.
+	/// - A model installed later replaces this one.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::FaultModel;
+	/// use tightbeam::trace::TraceCollector;
+	/// use tightbeam::urn::Urn;
+	/// use tightbeam::TightBeamError;
+	///
+	/// const SEND: Urn<'static> = tightbeam::urn!("test", "event:example/send");
+	///
+	/// // At 5000 bps (50%), the deterministic strategy injects on the second
+	/// // record of two.
+	/// let fault = || TightBeamError::ChannelClosed;
+	/// let model = FaultModel::default().with_event_fault(SEND, fault, tightbeam::bps!(5000));
+	/// let trace = TraceCollector::new().with_fault_model(model);
+	/// assert!(trace.event(SEND).is_ok());
+	/// assert!(matches!(trace.event(SEND), Err(TightBeamError::ChannelClosed)));
+	/// ```
+	#[cfg(feature = "testing-fault")]
+	pub fn with_fault_model(self, model: FaultModel) -> Self {
+		let faults = RuntimeFaults::new(model);
+
+		// The slot holds a model from the first install on, and each install
+		// replaces it under the lock. A panic under the lock leaves a whole
+		// model, and the install replaces it whole, so a poisoned lock takes
+		// the new model too.
+		let slot = self.state.runtime_faults.get_or_init(Mutex::default);
+		let mut installed = slot.lock().unwrap_or_else(PoisonError::into_inner);
+		*installed = faults;
+		drop(installed);
+		self
 	}
 
 	/// Checks whether the runtime fault model injects a fault at
@@ -569,7 +634,7 @@ impl TraceCollector {
 	/// # Errors
 	///
 	/// - The injection point's error, when the model injects a fault.
-	/// - A lock error, when a fault-state lock is poisoned.
+	/// - A lock error, when the fault-state lock is poisoned.
 	///
 	/// # Why `&Cow<'static, str>` instead of `&str`
 	///
@@ -583,47 +648,13 @@ impl TraceCollector {
 	#[allow(clippy::ptr_arg)]
 	#[cfg(feature = "testing-fault")]
 	fn check_runtime_fault_injection(&self, label_cow: &Cow<'static, str>) -> Result<(), crate::TightBeamError> {
-		if let Some(ref fault_config) = self.state.runtime_fault_model {
-			let key = (Cow::Borrowed("*"), Cow::Borrowed(label_cow.as_ref()));
-			if let Some(fault_injection) = fault_config.injection_points.get(&key) {
-				let should_inject = match fault_config.injection_strategy {
-					InjectionStrategy::Deterministic => {
-						// Counter-based injection keeps runs reproducible
-						// for DO-178C and IEC 61508. Cloning the `Cow` costs
-						// nothing for a static label and one allocation for
-						// a dynamic one.
-						let mut counters = self.state.fault_call_counters.lock()?;
-						let count = counters.entry(Cow::clone(label_cow)).or_insert(0);
-						*count += 1;
+		let Some(slot) = self.state.runtime_faults.get() else {
+			return Ok(());
+		};
 
-						// The count spreads injections by probability. For
-						// example, 3000 bps (30%) injects on calls 4, 7, and
-						// 10 out of 10.
-						(*count * fault_injection.probability_bps.get() as u32) % 10000
-							< fault_injection.probability_bps.get() as u32
-					}
-					InjectionStrategy::Random => {
-						// A seeded RNG gives statistical coverage, as FDR
-						// does.
-						let mut rng_state = self.state.fault_rng_state.lock()?;
-						if *rng_state == 0 {
-							*rng_state = fault_config.seed.wrapping_add(1);
-						}
-						// The LCG step matches FDR's `SeededRng`.
-						*rng_state = rng_state
-							.wrapping_mul(crate::constants::LCG_MULTIPLIER)
-							.wrapping_add(crate::constants::LCG_INCREMENT);
-						let rng_value = (*rng_state % 10000) as u16;
-						rng_value < fault_injection.probability_bps.get()
-					}
-				};
-
-				if should_inject {
-					return Err((fault_injection.error_factory)());
-				}
-			}
-		}
-		Ok(())
+		let mut faults = slot.lock()?;
+		let fault = faults.draw(label_cow);
+		fault.map_or(Ok(()), Err)
 	}
 
 	/// Records an event with no tags or value, and returns an
@@ -797,8 +828,6 @@ impl TraceCollector {
 	/// The label records why, such as the refusing status. The payload
 	/// records who, such as the peer's SPKI DER, as its SHA3-256 hash when
 	/// payload capture is enabled.
-	///
-	/// `label` accepts any type that converts via [`AsRef<str>`].
 	#[cfg(feature = "instrument")]
 	pub fn emit_event_with_evidence(&self, event: Urn<'static>, label: impl AsRef<str>, payload: Option<&[u8]>) {
 		let label = label.as_ref();
@@ -817,8 +846,6 @@ impl TraceCollector {
 	/// spec-assertable value. The label records why, such as the GoAway
 	/// reason name, and the value carries its wire code for `equals!`
 	/// assertions.
-	///
-	/// `label` accepts any type that converts via [`AsRef<str>`].
 	#[cfg(feature = "instrument")]
 	pub fn emit_event_with_value<V>(&self, event: Urn<'static>, label: impl AsRef<str>, value: V)
 	where
@@ -858,7 +885,7 @@ impl TraceCollector {
 		self.emit_internal(event_urn, Some(label.as_ref()), None, None, Some(timestamp.as_nanos() as u64));
 	}
 
-	/// How many recorded events carry `label`, read without draining them.
+	/// Counts the recorded events that carry `label`, without draining them.
 	///
 	/// A test waiting on a background task polls this, so the wait ends on
 	/// the event it expects rather than on elapsed time. Recording only
@@ -886,7 +913,7 @@ impl TraceCollector {
 		self.state.sink.0.drain()
 	}
 
-	/// Whether the configured sink dropped any event. The flag is sticky.
+	/// Reports whether the configured sink dropped any event, as a sticky flag.
 	///
 	/// Feed this into
 	/// [`crate::instrumentation::EvidenceArtifact::finalize`], so evidence
@@ -1031,7 +1058,7 @@ where
 	}
 }
 
-/// How a recorded run ended, as specs classify it.
+/// The way a recorded run ended, as specs classify it.
 #[cfg(any(test, feature = "testing"))]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ExecutionMode {
@@ -1045,7 +1072,7 @@ pub enum ExecutionMode {
 
 #[cfg(any(test, feature = "testing"))]
 impl ExecutionMode {
-	/// What the run did, read from the body's own result and the trace.
+	/// Reads what the run did from the body's own result and the trace.
 	///
 	/// An error is what the body returned, and a rejection is a gate decision
 	/// other than `Ok`. A run with no gate decision took no gate, so it reads
@@ -1135,6 +1162,82 @@ mod tests {
 				trace.event(BETA)?;
 				Ok(())
 			}
+		}
+	}
+
+	#[cfg(feature = "testing-fault")]
+	mod faults {
+		use super::{ALPHA, BETA};
+		use crate::testing::fdr::{FaultModel, InjectionStrategy};
+		use crate::trace::TraceCollector;
+		use crate::TightBeamError;
+
+		/// The seed of the random strategy in these tests.
+		const SEED: u64 = 7;
+
+		/// The records at which the random strategy injects at 5000 bps from
+		/// [`SEED`], computed outside the crate from the generator's LCG.
+		const SEED_DRAWS: [bool; 32] = [
+			true, true, true, true, false, false, true, true, true, false, true, true, true, true, false, true, false,
+			false, false, true, false, true, true, false, false, true, false, true, true, false, true, false,
+		];
+
+		/// The error each fault of these tests injects.
+		fn closed() -> TightBeamError {
+			TightBeamError::ChannelClosed
+		}
+
+		/// A model installed through one handle injects at every handle that
+		/// shares its state.
+		#[test]
+		fn a_model_installed_through_one_handle_injects_at_its_shares() -> Result<(), TightBeamError> {
+			let collector = TraceCollector::new();
+			let shared = collector.share();
+			let model = FaultModel::default().with_event_fault(ALPHA, closed, crate::bps!(10000));
+			let _collector = collector.with_fault_model(model);
+
+			assert!(matches!(shared.event(ALPHA), Err(TightBeamError::ChannelClosed)));
+			Ok(())
+		}
+
+		/// At 5000 bps the deterministic strategy injects on the second record
+		/// of each label, and it counts each label apart.
+		#[test]
+		fn the_deterministic_strategy_counts_each_label_apart() -> Result<(), TightBeamError> {
+			let model = FaultModel::default().with_event_fault(ALPHA, closed, crate::bps!(5000));
+			let model = model.with_event_fault(BETA, closed, crate::bps!(5000));
+			let collector = TraceCollector::new().with_fault_model(model);
+
+			collector.event(ALPHA)?;
+			collector.event(BETA)?;
+			assert!(matches!(collector.event(ALPHA), Err(TightBeamError::ChannelClosed)));
+			assert!(matches!(collector.event(BETA), Err(TightBeamError::ChannelClosed)));
+			Ok(())
+		}
+
+		/// A model installed later replaces the model the state holds.
+		#[test]
+		fn a_model_installed_later_replaces_the_first() -> Result<(), TightBeamError> {
+			let first = FaultModel::default().with_event_fault(ALPHA, closed, crate::bps!(10000));
+			let second = FaultModel::default().with_event_fault(BETA, closed, crate::bps!(10000));
+			let collector = TraceCollector::new().with_fault_model(first).with_fault_model(second);
+
+			collector.event(ALPHA)?;
+			assert!(matches!(collector.event(BETA), Err(TightBeamError::ChannelClosed)));
+			Ok(())
+		}
+
+		/// The random strategy draws as the FDR generator of the model's seed,
+		/// so the seed decides each fault.
+		#[test]
+		fn the_random_strategy_draws_from_the_seed_of_the_model() -> Result<(), TightBeamError> {
+			let model = FaultModel::from(InjectionStrategy::Random).with_seed(SEED);
+			let model = model.with_event_fault(ALPHA, closed, crate::bps!(5000));
+			let collector = TraceCollector::new().with_fault_model(model);
+
+			let drawn: Vec<bool> = (0..32).map(|_| collector.event(ALPHA).is_err()).collect();
+			assert_eq!(drawn, SEED_DRAWS);
+			Ok(())
 		}
 	}
 

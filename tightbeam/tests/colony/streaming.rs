@@ -7,13 +7,18 @@
 use std::sync::Arc;
 
 use tightbeam::{
+	cms::signed_data::SignerIdentifier,
 	colony::{
+		cluster::ClusterError,
 		common::ColonyNamespace,
-		hive::{Hive, HiveConfig},
+		hive::{Hive, HiveConfig, ServletBox},
 		servlet::ServletConfig,
 	},
 	compose,
-	crypto::x509::CertificateSpec,
+	crypto::{
+		key::Secp256k1KeyProvider,
+		x509::{utils::CertificateExt, CertificateSpec},
+	},
 	decode,
 	der::Sequence,
 	exactly, hive, servlet, tb_assert_spec, tb_scenario,
@@ -30,10 +35,13 @@ use tightbeam::{
 
 use tightbeam::transport::{PooledClient, TransportError, TransportFailure};
 
-use crate::common::security::{pinning_trust_store, ServerMaterials};
+use crate::common::security::{pinning_trust_store, random_signing_key, test_certificate, ServerMaterials};
+use crate::common::x509::combined_trust;
 
+/// The message the streaming servlets take and answer with.
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 pub struct StreamLabel {
+	/// The text the message carries.
 	pub label: String,
 }
 
@@ -200,8 +208,8 @@ pub(crate) const STREAM_ONLY_UNARY_REFUSED: Urn<'static> =
 	tightbeam::urn!("test", "event:colony-streaming/stream-only-unary-refused");
 
 servlet! {
-	/// A streaming-only servlet with no `handle:` arm at all. Unary requests
-	/// refuse with `Unimplemented` through the service defaults.
+	/// A servlet with a `stream:` arm alone. The service defaults refuse unary
+	/// requests with `Unimplemented`.
 	pub StreamOnlyServlet<StreamLabel, EnvConfig = ()>,
 	protocol: TokioListener,
 	stream: |body, _ctx| async move {
@@ -385,6 +393,188 @@ tb_scenario! {
 				&& trailer.is_none();
 
 			trace.event_with(HIVE_DUPLEX_ECHOES_CHUNKS, &[], value)?;
+
+			hive.stop();
+			Ok(())
+		}
+	}
+}
+
+pub(crate) const HIVE_IMPOSTOR_CALL_REFUSED: Urn<'static> =
+	tightbeam::urn!("test", "event:colony-streaming/hive-impostor-call-refused");
+pub(crate) const HIVE_IMPOSTOR_STREAM_REFUSED: Urn<'static> =
+	tightbeam::urn!("test", "event:colony-streaming/hive-impostor-stream-refused");
+pub(crate) const HIVE_IMPOSTOR_DUPLEX_REFUSED: Urn<'static> =
+	tightbeam::urn!("test", "event:colony-streaming/hive-impostor-duplex-refused");
+
+/// A servlet registered under the signer of another identity: its
+/// registration names `claimed`, and `inner` presents a certificate of its
+/// own.
+struct ClaimedServlet<S> {
+	inner: S,
+	claimed: SignerIdentifier,
+}
+
+impl<S: ServletBox> ServletBox for ClaimedServlet<S> {
+	fn addr_bytes(&self) -> Arc<[u8]> {
+		self.inner.addr_bytes()
+	}
+
+	fn stop_boxed(self: Box<Self>) {
+		Box::new(self.inner).stop_boxed();
+	}
+
+	fn signer(&self) -> Option<&SignerIdentifier> {
+		Some(&self.claimed)
+	}
+}
+
+/// Starts an established hive whose one sibling answers under an identity of
+/// its own, while its registration names the [`ServerMaterials`] identity.
+/// The intra-hive pool trusts both identities and offers mux, so the
+/// handshake completes, and the dial's signer binding alone tells the two
+/// apart.
+async fn start_impostor_hive(
+	trace: TraceCollector,
+	materials: &ServerMaterials,
+) -> Result<StreamingHive, TightBeamError> {
+	let impostor_key = random_signing_key();
+	let impostor_certificate = test_certificate(&impostor_key);
+	let impostor_spec = CertificateSpec::Built(Box::new(impostor_certificate.clone()));
+	let impostor_provider = Arc::new(Secp256k1KeyProvider::from(impostor_key));
+	let config = ServletConfig::<TokioListener, StreamLabel>::builder()
+		.with_certificate(impostor_spec, impostor_provider, vec![])?
+		.with_mux_offer(Some(TransportOffer::mux(8)))
+		.with_config(Arc::new(()))
+		.build();
+	let trace = Arc::new(trace.share());
+	let inner = StreamingEchoServlet::start(Arc::clone(&trace), config).await?;
+	let claimed = materials.certificate.signer_identifier()?;
+	let servlet = ClaimedServlet { inner, claimed: claimed.clone() };
+
+	let trust_store = combined_trust(&[&*materials.certificate, &impostor_certificate]);
+	let mut conf = HiveConfig { trust_store: Some(trust_store), ..Default::default() };
+	conf.pool.mux_offer = Some(Arc::new(TransportOffer::mux(8)));
+
+	let mut hive = StreamingHive::new(Some(conf))?;
+	hive.register(stream_echo_urn(), servlet, move |t| {
+		let claimed = claimed.clone();
+		async move {
+			let inner = StreamingEchoServlet::start(t, ServletConfig::cleartext()).await?;
+			Ok(ClaimedServlet { inner, claimed })
+		}
+	})?;
+	hive.establish(trace).await?;
+	Ok(hive)
+}
+
+/// Whether `outcome` is the refusal of a sibling dial whose answer presented
+/// a certificate its route does not name.
+fn is_peer_mismatch<T>(outcome: &Result<T, TightBeamError>) -> bool {
+	matches!(outcome, Err(TightBeamError::ClusterError(error)) if matches!(**error, ClusterError::PeerMismatch))
+}
+
+tb_assert_spec! {
+	pub HiveImpostorCallSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(SERVLET_UNARY_HANDLED, exactly!(0)),
+			(HIVE_IMPOSTOR_CALL_REFUSED, exactly!(1), equals!(true))
+		]
+	}
+}
+
+// A sibling call reaches a servlet only under the identity its registration
+// names. The hive pool trusts both identities, so the handshake completes,
+// and the dial's binding alone refuses the call before the frame leaves
+// (CWE-346).
+tb_scenario! {
+	name: hive_context_call_refuses_a_sibling_answering_under_another_identity,
+	spec: HiveImpostorCallSpec,
+	environment Hive {
+		context: ServerMaterials::generate(),
+		start: |SetupEnv { trace, context: materials }| async move {
+			start_impostor_hive(trace, &materials).await
+		},
+		client: |HiveEnv { trace, hive, .. }| async move {
+			let ctx = hive.context();
+			let stream_echo = stream_echo_urn();
+			let request = reply_frame("impostor-call")?;
+
+			let refused = ctx.call(&stream_echo, request).await;
+
+			trace.event_with(HIVE_IMPOSTOR_CALL_REFUSED, &[], is_peer_mismatch(&refused))?;
+
+			hive.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub HiveImpostorStreamSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(SERVLET_STREAM_HANDLED, exactly!(0)),
+			(HIVE_IMPOSTOR_STREAM_REFUSED, exactly!(1), equals!(true))
+		]
+	}
+}
+
+// A sibling stream opens only toward the identity its registration names, so
+// the dial's binding refuses the open before any chunk leaves (CWE-346).
+tb_scenario! {
+	name: hive_context_stream_refuses_a_sibling_answering_under_another_identity,
+	spec: HiveImpostorStreamSpec,
+	environment Hive {
+		context: ServerMaterials::generate(),
+		start: |SetupEnv { trace, context: materials }| async move {
+			start_impostor_hive(trace, &materials).await
+		},
+		client: |HiveEnv { trace, hive, .. }| async move {
+			let ctx = hive.context();
+			let stream_echo = stream_echo_urn();
+
+			let refused = ctx.open_stream(&stream_echo).await;
+
+			trace.event_with(HIVE_IMPOSTOR_STREAM_REFUSED, &[], is_peer_mismatch(&refused))?;
+
+			hive.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub HiveImpostorDuplexSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(SERVLET_DUPLEX_HANDLED, exactly!(0)),
+			(HIVE_IMPOSTOR_DUPLEX_REFUSED, exactly!(1), equals!(true))
+		]
+	}
+}
+
+// A sibling duplex opens only toward the identity its registration names, so
+// the dial's binding refuses the open before any chunk leaves (CWE-346).
+tb_scenario! {
+	name: hive_context_duplex_refuses_a_sibling_answering_under_another_identity,
+	spec: HiveImpostorDuplexSpec,
+	environment Hive {
+		context: ServerMaterials::generate(),
+		start: |SetupEnv { trace, context: materials }| async move {
+			start_impostor_hive(trace, &materials).await
+		},
+		client: |HiveEnv { trace, hive, .. }| async move {
+			let ctx = hive.context();
+			let stream_echo = stream_echo_urn();
+
+			let refused = ctx.open_duplex(&stream_echo).await;
+
+			trace.event_with(HIVE_IMPOSTOR_DUPLEX_REFUSED, &[], is_peer_mismatch(&refused))?;
 
 			hive.stop();
 			Ok(())

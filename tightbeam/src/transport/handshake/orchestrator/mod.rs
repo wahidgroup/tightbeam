@@ -50,8 +50,8 @@ use crate::transport::handshake::receipt::{
 };
 use crate::transport::handshake::schedule::{Agreed, PeerEphemeral, SecretSeal, Terms};
 use crate::transport::handshake::{
-	Arc, ClientHandshakeProtocol, EstablishedSession, HandshakeMessage, HandshakeProvider, HandshakeSecret,
-	ServerHandshakeProtocol, ServerIdentity,
+	Arc, ClientHandshakeProtocol, EstablishedSession, HandshakeMessage, HandshakeProvider, ServerHandshakeProtocol,
+	ServerIdentity,
 };
 use crate::utils::marker::{MaybeSend, MaybeSendFuture, MaybeSync};
 use crate::x509::Certificate;
@@ -63,7 +63,7 @@ mod sealed {
 /// Where a handshake stands, for either role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandshakePhase {
-	/// No leg has run.
+	/// The handshake is ready for its first leg.
 	Idle,
 	/// The role sent its first message and awaits the peer.
 	Exchanging,
@@ -251,7 +251,7 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> ClientConfig<F, P> {
 
 /// The phases of a client, each with the facts its steps established.
 pub enum ClientPhase<F: ClientFlow<P>, P: HandshakeProvider> {
-	/// No leg has run.
+	/// The handshake is ready for its first leg.
 	Idle,
 	/// The opening is out.
 	OpeningSent {
@@ -424,7 +424,7 @@ pub struct SentReply<F: ServerFlow<P>, P: HandshakeProvider> {
 
 /// The phases of a server, each with the facts its steps established.
 pub enum ServerPhase<F: ServerFlow<P>, P: HandshakeProvider> {
-	/// No leg has run.
+	/// The handshake is ready for its first leg.
 	Idle,
 	/// The reply is out.
 	ReplySent {
@@ -646,8 +646,9 @@ impl<R: Role<F, P>, F: HandshakeFlow, P: HandshakeProvider> Handshake<R, F, P> {
 
 /// What the client holds once its closing is bound.
 struct BoundClosing<'a, P: HandshakeProvider> {
-	/// The handshake secret both sides derive.
-	secret: HandshakeSecret,
+	/// The handshake secret both sides derive, as the server Finished
+	/// confirmed it.
+	confirmed: ServerConfirmed,
 	/// The dual-signed receipt, when the session carries budgets.
 	receipt: Option<StoredReceipt>,
 	/// The closing, which signs its client Finished as it seals.
@@ -826,15 +827,15 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> Handshake<Client, F, P> {
 		};
 
 		// 12. Seal the countersignature, and build the closing up to its
-		//     client Finished. The step awaits nothing.
+		//     client Finished. The step is synchronous.
 		let bound = Self::close(confirmed, identity, countersigned, &terms)?;
-		let BoundClosing { secret, receipt, closing } = bound;
+		let BoundClosing { confirmed, receipt, closing } = bound;
 
 		// 13. Sign the client Finished under the client identity, and seal the closing.
 		let closing = closing.seal().await?;
 
 		// 14. Keep what the handshake agreed. The server's certificates stay for post-handshake renewals.
-		let agreed = Agreed::new(terms, secret, receipt, server);
+		let agreed = Agreed::client(terms, confirmed, receipt, server);
 		self.phase = ClientPhase::ClosingSent { agreed: Box::new(agreed) };
 
 		Ok(closing)
@@ -844,7 +845,7 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> Handshake<Client, F, P> {
 	/// Finished, under the secret of a server whose Finished verified.
 	///
 	/// The function is synchronous, so it runs inside one poll, and it takes
-	/// [`ServerConfirmed`], so no closing exists before the server Finished
+	/// [`ServerConfirmed`], so a closing exists only after the server Finished
 	/// verified.
 	///
 	/// # Errors
@@ -859,22 +860,22 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> Handshake<Client, F, P> {
 		countersigned: Option<CountersignedReceipt>,
 		terms: &Terms<P>,
 	) -> Result<BoundClosing<'a, P>, HandshakeError> {
-		let secret = confirmed.into_secret();
+		let secret = confirmed.secret();
 
 		// 1. Seal the countersignature under the handshake secret.
-		let sealed = countersigned.map(|countersigned| countersigned.seal(&secret, terms));
+		let sealed = countersigned.map(|countersigned| countersigned.seal(secret, terms));
 		let (sealed_ack, receipt) = sealed.transpose()?.unzip();
 
 		// 2. Derive the key-confirmation tag, which proves this secret to the
 		//    server, and the sealer of the closing.
 		let transcript_hash = terms.transcript_hash();
-		let confirmation = terms.confirmation(&secret)?;
-		let sealer = terms.sealer(&secret, SecretSeal::Closing)?;
+		let confirmation = terms.confirmation(secret)?;
+		let sealer = terms.sealer(secret, SecretSeal::Closing)?;
 
 		// 3. Build the closing up to its client Finished.
 		let parts = ClosingParts { transcript_hash, sealed_ack, confirmation, sealer };
 		let closing = ClosingDraft::bind(identity, parts)?;
-		Ok(BoundClosing { secret, receipt, closing })
+		Ok(BoundClosing { confirmed, receipt, closing })
 	}
 }
 
@@ -989,8 +990,8 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> Handshake<Server, F, P> {
 	/// # Settlement
 	///
 	/// Settlement is irreversible, so it runs last, after the key-confirmation
-	/// tag proved that the client holds the same handshake secret. No
-	/// budget-bearing session reaches [`HandshakePhase::Agreed`] unsettled.
+	/// tag proved that the client holds the same handshake secret. Every
+	/// budget-bearing session in [`HandshakePhase::Agreed`] is settled.
 	///
 	/// # Errors
 	///
@@ -1040,13 +1041,13 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> Handshake<Server, F, P> {
 
 		// 3. Open the closing under the closing key of the handshake secret,
 		//    which the reply derived. The client identity sits behind that
-		//    key, so no static key runs before the server knows its client.
+		//    key, so the server knows its client before any static key runs.
 		let opening = closing.open(pending, &terms, config.key_purposes.client);
 		let opened = opening.await?;
 
 		// 4. Verify that the client derived the same handshake secret. The
-		//    offer leaves the closing only through this check, so a client
-		//    that holds another secret never reaches a validator.
+		//    offer leaves the closing only through this check, so only a
+		//    client that holds the same secret reaches a validator.
 		let confirmed = opened.confirm(&terms)?;
 		let ConfirmedClosing { secret, receipt_ack, offer } = confirmed;
 
@@ -1063,7 +1064,7 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> Handshake<Server, F, P> {
 		let receipt = settling.await?;
 
 		// 7. Keep what the handshake agreed.
-		let agreed = Agreed::new(terms, secret.into_secret(), receipt, peer);
+		let agreed = Agreed::server(terms, secret, receipt, peer);
 		self.phase = ServerPhase::ClosingReceived { agreed: Box::new(agreed) };
 		Ok(())
 	}
@@ -1111,7 +1112,7 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> ServerHandshakeProtocol for Handsha
 	) -> MaybeSendFuture<'a, Result<Option<HandshakeMessage>, Self::Error>> {
 		Box::pin(async move {
 			// The first message is the opening, which is owed a reply. Every
-			// later one is read as the closing, which is owed nothing.
+			// later one is read as the closing, which ends the exchange.
 			if self.phase() == HandshakePhase::Idle {
 				let reply = self.reply(msg).await?;
 				return Ok(Some(reply));

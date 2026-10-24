@@ -14,7 +14,7 @@ pub type Result<T> = core::result::Result<T, TightBeamError>;
 #[cfg(feature = "compress")]
 pub type CompressionResult<T> = core::result::Result<T, CompressionError>;
 
-/// Error indicating a mismatch between received and expected values.
+/// An error that reports a mismatch between a received and an expected value.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ReceivedExpectedError<Received, Expected> {
 	/// The value that arrived.
@@ -280,6 +280,13 @@ pub enum TightBeamError {
 	#[source]
 	CertificateValidationError(crate::crypto::x509::error::CertificateValidationError),
 
+	/// A key list, such as a pin list or a peer list, refused an entry it
+	/// was built from.
+	#[cfg(feature = "x509")]
+	#[error("Key list error: {0}")]
+	#[source]
+	KeyListError(crate::crypto::x509::KeyListError),
+
 	/// Key derivation failed.
 	#[cfg(feature = "kdf")]
 	#[error("Key derivation error: {0}")]
@@ -359,8 +366,8 @@ pub enum TightBeamError {
 	/// A message type's marker requires a protection the builder was not
 	/// given.
 	///
-	/// `marker` names the [`Message`](crate::core::Message) constant and
-	/// `call` the builder method that satisfies it.
+	/// `marker` names the [`Message`](crate::core::Message) constant, and
+	/// `call` names the builder method that satisfies it.
 	#[error("{marker} requires {call} before build")]
 	MissingProtection { marker: &'static str, call: &'static str },
 
@@ -489,15 +496,6 @@ crate::impl_from!(crate::builder::error::BuildError => TightBeamError::BuildErro
 crate::impl_from!(crate::standards::error::StandardError => TightBeamError::StandardError);
 #[cfg(feature = "colony")]
 crate::impl_from!(crate::colony::hive::HiveError => TightBeamError::HiveError);
-
-// A peer list's refusal reaches the crate error through the hive error that
-// carries it.
-#[cfg(feature = "colony")]
-impl From<crate::colony::hive::PeerListError> for TightBeamError {
-	fn from(error: crate::colony::hive::PeerListError) -> Self {
-		Self::HiveError(crate::colony::hive::HiveError::from(error))
-	}
-}
 #[cfg(feature = "colony")]
 crate::impl_from!(crate::colony::worker::WorkerRelayError => TightBeamError::WorkerRelay);
 
@@ -515,6 +513,8 @@ crate::impl_from!(crate::transport::error::TransportError => TightBeamError::Tra
 crate::impl_from!(rand_core::Error => TightBeamError::OsRngError);
 #[cfg(feature = "x509")]
 crate::impl_from!(crate::crypto::x509::error::CertificateValidationError => TightBeamError::CertificateValidationError);
+#[cfg(feature = "x509")]
+crate::impl_from!(crate::crypto::x509::KeyListError => TightBeamError::KeyListError);
 #[cfg(feature = "x509")]
 crate::impl_from!(spki::Error => TightBeamError::SpkiError);
 #[cfg(feature = "builder")]
@@ -579,21 +579,32 @@ impl TightBeamError {
 
 	/// Returns the terminal status that a service failure answers a peer with.
 	///
-	/// A failure already carrying a transit status keeps it. Anything else
-	/// answers [`TransitStatus::Internal`], so a peer tells a failure apart
-	/// from an accepted empty reply and the failure stays attributable.
+	/// - A failure that carries a transit status keeps it, apart from [`TransitStatus::Unavailable`].
+	/// - A carried `Unavailable` answers [`TransitStatus::Unknown`], because
+	///   the handler ran up to its failure. A peer reads `Unavailable` as a
+	///   refusal before any handler ran, which a gate answers, and a gateway
+	///   retries such a frame on another instance.
+	/// - Any other failure answers [`TransitStatus::Internal`], so a peer
+	///   tells a failure apart from an accepted empty reply and the failure
+	///   stays attributable.
 	///
 	/// [`TransitStatus::Internal`]: crate::policy::TransitStatus::Internal
+	/// [`TransitStatus::Unavailable`]: crate::policy::TransitStatus::Unavailable
+	/// [`TransitStatus::Unknown`]: crate::policy::TransitStatus::Unknown
 	#[cfg(pooled_mux)]
 	#[must_use]
 	pub(crate) fn failure_status(&self) -> crate::policy::TransitStatus {
 		use crate::policy::TransitStatus;
 
-		if let TightBeamError::TransportError(crate::transport::TransportError::OperationFailed(failure)) = self {
-			return TransitStatus::try_from(*failure).unwrap_or(TransitStatus::Internal);
-		}
+		let TightBeamError::TransportError(crate::transport::TransportError::OperationFailed(failure)) = self else {
+			return TransitStatus::Internal;
+		};
 
-		TransitStatus::Internal
+		match TransitStatus::try_from(*failure) {
+			Ok(TransitStatus::Unavailable) => TransitStatus::Unknown,
+			Ok(status) => status,
+			Err(_) => TransitStatus::Internal,
+		}
 	}
 
 	/// Returns the refusal behind every [`MuxService`] default.
@@ -641,6 +652,10 @@ impl<T> From<std::sync::PoisonError<T>> for TightBeamError {
 #[cfg(all(test, feature = "std"))]
 mod tests {
 	use super::*;
+	#[cfg(feature = "x509")]
+	use crate::crypto::x509::{policy::PublicKeyPinning, KeyListError};
+	#[cfg(pooled_mux)]
+	use crate::policy::TransitStatus;
 
 	#[test]
 	fn source_annotated_wrappers_expose_their_cause() {
@@ -683,5 +698,42 @@ mod tests {
 		let err = TightBeamError::transport(TransitStatus::Unimplemented);
 		let carries_the_failure = matches!(err, TightBeamError::TransportError(TransportError::OperationFailed(_)));
 		assert!(carries_the_failure);
+	}
+
+	/// A pin list's refusal reaches the crate error under its own name, so a
+	/// caller propagates it with `?` wherever `x509` builds.
+	#[cfg(feature = "x509")]
+	#[test]
+	fn a_key_list_refusal_propagates_under_its_own_name() {
+		fn pinned(pins: &[&[u8]]) -> Result<PublicKeyPinning> {
+			Ok(PublicKeyPinning::new(pins)?)
+		}
+
+		let refused = pinned(&[b"no SubjectPublicKeyInfo"]);
+
+		let expected = KeyListError::Unreadable { index: 0 };
+		let unreadable = matches!(refused, Err(TightBeamError::KeyListError(found)) if found == expected);
+		assert!(unreadable);
+	}
+
+	// A handler's failure keeps the status it carries, apart from
+	// `Unavailable`, which a peer reads as a refusal before any handler ran.
+	// A failure that carries no status answers `Internal`.
+	#[cfg(pooled_mux)]
+	crate::tb_cases! {
+		fn failure_status_of((failure, expected): (TightBeamError, TransitStatus)) {
+			let status = failure.failure_status();
+
+			assert_eq!(status, expected);
+		}
+
+		cases {
+			a_carried_unavailable_is_unknown => (TransitStatus::Unavailable.refusal(), TransitStatus::Unknown),
+			a_carried_refusal_keeps_its_status => (
+				TransitStatus::PermissionDenied.refusal(),
+				TransitStatus::PermissionDenied
+			),
+			a_failure_with_no_status_is_internal => (TightBeamError::InvalidBody, TransitStatus::Internal),
+		}
 	}
 }

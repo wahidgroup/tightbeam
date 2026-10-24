@@ -176,9 +176,9 @@ where
 	/// A hive whose URN could not be created withholds the update, because
 	/// the change needs an identity to attribute it to.
 	///
-	/// The fan-out runs under `tasks`, so stopping the hive stops an update
-	/// still retrying against an unreachable gateway. Exhausted retries fall
-	/// back to a full-slate announcement.
+	/// The fan-out runs under `tasks`, so a hive stop also stops an update that
+	/// retries against an unreachable gateway. When the retries run out, the
+	/// link announces the full slate.
 	pub(crate) fn notify_scaling(
 		&self,
 		tasks: &TaskGroup,
@@ -221,7 +221,7 @@ where
 			encryption.trust_store = Some(Arc::clone(store));
 		}
 		if let Some(hive_tls) = &self.config.hive_tls {
-			encryption.client_identity = Some(hive_tls.identity().clone());
+			hive_tls.outbound(&mut encryption);
 		}
 
 		let encryption = DialableEncryption::new(encryption)?;

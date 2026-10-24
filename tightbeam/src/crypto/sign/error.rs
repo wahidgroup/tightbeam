@@ -20,8 +20,8 @@ pub enum SignerError {
 	#[error("Key provider error: {0}")]
 	Key(crate::crypto::key::KeyError),
 
-	/// The certificate failed to name its signer, or a policy refused the
-	/// signature.
+	/// The certificate failed to name its signer, a policy refused the
+	/// signature, or a chain to present breaks the rules of a path.
 	#[error("Certificate error: {0}")]
 	Certificate(crate::crypto::x509::error::CertificateValidationError),
 

@@ -11,7 +11,7 @@ use digest::{Digest, OutputSizeUser};
 use crate::colony::cluster::registry::ColonyMembership;
 use crate::colony::cluster::runtime::freshness::GatewayReplayGuard;
 use crate::colony::cluster::runtime::gossip_tasks::PeerLedgers;
-use crate::colony::cluster::runtime::hop::PeerPlane;
+use crate::colony::cluster::runtime::hop::{HivePlane, PeerPlane};
 use crate::colony::cluster::{ClusterConfig, HiveRegistry, ServletRegistry};
 use crate::colony::common::TaskGroup;
 use crate::crypto::profiles::DefaultCryptoProvider;
@@ -29,9 +29,9 @@ pub(crate) type ClusterPool<P> = ConnectionPool<P>;
 
 /// Protocol that can bind a gateway accept plane (colony or edge).
 ///
-/// Associated-type bounds are written in supertrait position so
-/// `T: GatewayAcceptProtocol` implies listener and address requirements
-/// at use sites. Dial and pool machinery live on [`GatewayColonyProtocol`].
+/// The associated-type bounds sit in supertrait position, so
+/// `T: GatewayAcceptProtocol` implies the listener and address requirements
+/// at use sites. The dial and pool bounds live on [`ColonyDialProtocol`].
 pub(crate) trait GatewayAcceptProtocol:
 	Protocol<
 		Listener: AsyncListenerTrait
@@ -60,15 +60,16 @@ impl<T> GatewayAcceptProtocol for T where
 {
 }
 
-/// Colony protocol: the accept plane plus the dial stack of the outbound pool.
+/// Protocol of a colony dial: the pool, the handshake, and the transport that
+/// a bound dial connects, admits, and emits on.
 ///
-/// Edge protocols need only [`GatewayAcceptProtocol`]. The colony type is
-/// also the pool protocol (`P`) for hive and peer dials.
-pub(crate) trait GatewayColonyProtocol:
-	GatewayAcceptProtocol
-	+ PersistentConnection
-	+ Protocol<
-		Address: Hash + Eq,
+/// The associated-type bounds sit in supertrait position, so
+/// `T: ColonyDialProtocol` implies the address and transport requirements at
+/// use sites. The gateway's hive and peer planes and a hive's sibling calls
+/// dial through it.
+pub(crate) trait ColonyDialProtocol:
+	Protocol<
+		Address: Hash + Eq + Clone + Send + Sync + FromStr + 'static,
 		Transport: MessageEmitter
 		               + MessageCollector
 		               + PolicyConfig
@@ -77,15 +78,17 @@ pub(crate) trait GatewayColonyProtocol:
 		               + Send
 		               + Sync
 		               + 'static,
-	>
+	> + PersistentConnection
+	+ EncryptedProtocol<CryptoProvider = DefaultCryptoProvider>
+	+ Send
+	+ Sync
+	+ 'static
 {
 }
 
-impl<T> GatewayColonyProtocol for T where
-	T: GatewayAcceptProtocol
-		+ PersistentConnection
-		+ Protocol<
-			Address: Hash + Eq,
+impl<T> ColonyDialProtocol for T where
+	T: Protocol<
+			Address: Hash + Eq + Clone + Send + Sync + FromStr + 'static,
 			Transport: MessageEmitter
 			               + MessageCollector
 			               + PolicyConfig
@@ -94,9 +97,22 @@ impl<T> GatewayColonyProtocol for T where
 			               + Send
 			               + Sync
 			               + 'static,
-		>
+		> + PersistentConnection
+		+ EncryptedProtocol<CryptoProvider = DefaultCryptoProvider>
+		+ Send
+		+ Sync
+		+ 'static
 {
 }
+
+/// Colony protocol: the accept plane plus the dial stack of the outbound pool.
+///
+/// Edge protocols need only [`GatewayAcceptProtocol`]. The colony type is
+/// also the pool protocol (`P`) for hive and peer dials, through
+/// [`ColonyDialProtocol`].
+pub(crate) trait GatewayColonyProtocol: GatewayAcceptProtocol + ColonyDialProtocol {}
+
+impl<T> GatewayColonyProtocol for T where T: GatewayAcceptProtocol + ColonyDialProtocol {}
 
 /// Shared gateway state passed into accept-loop request handling.
 pub(crate) struct GatewayRuntimeCtx<P: Protocol> {
@@ -108,8 +124,9 @@ pub(crate) struct GatewayRuntimeCtx<P: Protocol> {
 	pub(crate) admission: Arc<Mutex<()>>,
 	/// Colony identity, gates, peer caps, and gossip policy.
 	pub(crate) config: Arc<ClusterConfig>,
-	/// Connection pool this gateway dials hives on.
-	pub(crate) pool: Arc<ClusterPool<P>>,
+	/// The plane this gateway dials its hives and their servlets on, which
+	/// holds the hive pool and hands out bound dials alone.
+	pub(crate) hive_plane: HivePlane<P>,
 	/// The plane peer gateways are dialed on, when one is configured.
 	pub(crate) peer_plane: Option<PeerPlane<P>>,
 	/// Instrumentation collector for gateway control-plane events.
@@ -140,7 +157,7 @@ impl<P: Protocol> Clone for GatewayRuntimeCtx<P> {
 			servlet_registry: Arc::clone(&self.servlet_registry),
 			admission: Arc::clone(&self.admission),
 			config: Arc::clone(&self.config),
-			pool: Arc::clone(&self.pool),
+			hive_plane: self.hive_plane.clone(),
 			peer_plane: self.peer_plane.clone(),
 			trace: Arc::clone(&self.trace),
 			tasks: self.tasks.clone(),

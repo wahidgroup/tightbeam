@@ -1,14 +1,22 @@
-//! The allocation counts of a lookup in a key index, under a counting
-//! allocator that this test binary alone installs.
+//! The allocation counts of the reads the handshake and a key index make
+//! in place, under a counting allocator that this test binary alone
+//! installs.
 //!
-//! A lookup writes the canonical form of a key on the stack when that form
-//! fits the stack buffer, which holds every named-curve key up to P-521. Only
-//! an allocation count shows that bound, so the counting allocator lives in
-//! this test binary alone.
+//! - A lookup writes the canonical form of a key on the stack when that form
+//!   fits the stack buffer, which holds every named-curve key up to P-521.
+//! - A `sid` of the key-identifier form names a certificate by the extension
+//!   value as the certificate holds it.
+//! - The built-in store validates a presented path from where its parts sit.
+//!
+//! Only an allocation count shows these bounds, so the counting allocator
+//! lives in this test binary alone.
 
 use core::cell::Cell;
 use std::alloc::{GlobalAlloc, Layout, System};
 
+use tightbeam::crypto::policy::Secp256k1Policy;
+use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
+use tightbeam::crypto::x509::utils::CertificateExt;
 use tightbeam::crypto::x509::KeyIndex;
 use tightbeam::der::asn1::{BitString, ObjectIdentifier};
 use tightbeam::der::oid::db::rfc8410::ID_ED_25519;
@@ -110,4 +118,52 @@ fn a_lookup_of_the_rfc6979_p521_key_allocates_nothing() {
 fn a_lookup_past_the_stack_bound_allocates() {
 	let lookup = lookup_of(&long_key());
 	assert!(matches!(lookup, (true, allocations) if allocations > 0));
+}
+
+/// Whether the `sid` of the house certificate of the fixed key names that
+/// certificate, beside the count of the allocations that the match makes.
+fn naming_of_the_house_certificate() -> (bool, usize) {
+	let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+	let sid = certificate.signer_identifier();
+	let sid = sid.expect("a house certificate carries its key identifier");
+
+	let before = ALLOCATIONS.with(Cell::get);
+	let named = certificate.is_named_by(&sid).expect("the key identifier decodes");
+	let after = ALLOCATIONS.with(Cell::get);
+	(named, after - before)
+}
+
+/// A `sid` of the key-identifier form names a house certificate by the
+/// extension value the certificate holds, read in place (RFC 5652 §5.3).
+#[test]
+fn a_key_identifier_names_its_certificate_with_no_allocation() {
+	assert_eq!(naming_of_the_house_certificate(), (true, 0));
+}
+
+/// The counts of the allocations that a store of the fixed root makes as it
+/// validates the fixed path, as one chain and as a presented path.
+fn validations_of_the_fixed_path() -> (usize, usize) {
+	let chain = TestCertificate::insecure_fixed_chain().expect("the fixed test chain issues");
+	let builder = CertificateTrustBuilder::from(Secp256k1Policy::default());
+	let builder = builder.with_certificate(chain.root);
+	let store = builder.expect("the root is within its validity period").build();
+	let whole = [chain.intermediate.to_owned(), chain.leaf.to_owned()];
+	let issuers = [chain.intermediate];
+
+	let before = ALLOCATIONS.with(Cell::get);
+	store.verify_chain(&whole).expect("the path validates as one chain");
+	let between = ALLOCATIONS.with(Cell::get);
+	let presented = store.verify_presented(&issuers, &chain.leaf);
+	presented.expect("the path validates as presented");
+	let after = ALLOCATIONS.with(Cell::get);
+	(between - before, after - between)
+}
+
+/// The built-in store validates a presented path from where its issuers and
+/// its leaf sit, so it allocates what one chain allocates, and no copy of a
+/// certificate.
+#[test]
+fn a_presented_path_validates_with_the_allocations_of_one_chain() {
+	let (whole, presented) = validations_of_the_fixed_path();
+	assert_eq!(presented, whole);
 }

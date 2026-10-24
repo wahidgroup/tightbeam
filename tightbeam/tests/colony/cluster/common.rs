@@ -41,12 +41,16 @@
 pub use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 pub use core::time::Duration;
 pub use std::collections::HashSet;
+use std::net::{Ipv4Addr, SocketAddr};
 pub use std::sync::{Arc, Mutex};
 
-use tightbeam::cms::signed_data::SignerIdentifier;
+use tokio::net::TcpSocket;
+
+pub use tightbeam::cms::signed_data::SignerIdentifier;
 use tightbeam::crypto::policy::VerificationPolicy;
 use tightbeam::crypto::x509::error::CertificateValidationError;
 use tightbeam::crypto::x509::policy::CertificateValidation;
+use tightbeam::crypto::x509::utils::CertificateExt;
 use tightbeam::crypto::x509::{ErasedSigning, KeyPurposes, PeerCertificate, Signing};
 use tightbeam::spki::SubjectPublicKeyInfoOwned;
 use tightbeam::testing::TestCertificate;
@@ -67,7 +71,7 @@ pub use tightbeam::{
 			Hive, HiveConfig, HiveTlsConfig, RegisterHiveRequest, RegisterHiveResponse, ServletAddressUpdate,
 			ServletAddressUpdateResponse, ServletBox, ServletInfo,
 		},
-		servlet::ServletConfig,
+		servlet::{ServletConfig, ServletConfigBuilder, WithCertificate},
 		SubmitWork,
 	},
 	constants::{
@@ -298,20 +302,71 @@ pub fn hive_tls_config(certs: &ClusterTestCerts) -> HiveConfig {
 	HiveConfig { trust_store: Some(Arc::clone(&certs.trust)), ..hive_tls_config_no_trust(certs) }
 }
 
+/// The builder of a servlet config on the fixture identity with the standard
+/// mux offer, for a scenario that adds a gate, a hive context, or an
+/// environment of its own before it builds.
+pub fn servlet_tls_builder<M: tightbeam::Message>(
+	certs: &ClusterTestCerts,
+) -> Result<
+	ServletConfigBuilder<TokioListener, M, DefaultCryptoProvider, (), WithCertificate<DefaultCryptoProvider>>,
+	TightBeamError,
+> {
+	let builder = ServletConfig::<TokioListener, M, DefaultCryptoProvider>::builder().with_certificate(
+		CertificateSpec::Built(Box::new(certs.cert.to_owned())),
+		Arc::new(Secp256k1KeyProvider::from(certs.key.to_owned())),
+		vec![],
+	)?;
+
+	Ok(builder.with_mux_offer(Some(TransportOffer::mux(8))))
+}
+
 /// A servlet config on the fixture identity, for a servlet of any message
 /// type `M`.
 pub fn servlet_tls_config<M: tightbeam::Message>(
 	certs: &ClusterTestCerts,
 ) -> Result<ServletConfig<TokioListener, M, DefaultCryptoProvider>, TightBeamError> {
-	Ok(ServletConfig::<TokioListener, M, DefaultCryptoProvider>::builder()
-		.with_certificate(
-			CertificateSpec::Built(Box::new(certs.cert.to_owned())),
-			Arc::new(Secp256k1KeyProvider::from(certs.key.to_owned())),
-			vec![],
-		)?
-		.with_mux_offer(Some(TransportOffer::mux(8)))
-		.with_config(Arc::new(()))
-		.build())
+	Ok(servlet_tls_builder(certs)?.with_config(Arc::new(())).build())
+}
+
+/// Whether another socket may bind beside a [`HeldPort`].
+#[derive(Clone, Copy)]
+pub enum PortSharing {
+	/// `SO_REUSEADDR` cleared, so every other bind of the port conflicts with
+	/// the hold.
+	Exclusive,
+	/// `SO_REUSEADDR` set, so a listener that names the port and sets it too
+	/// binds beside the hold.
+	Shared,
+}
+
+/// A port that a bound socket holds for as long as this value lives, against
+/// a concurrent test that binds a port of its own.
+///
+/// - The socket holds the port in the bound state alone.
+/// - A bind that asks the kernel for any port passes over the held one.
+pub struct HeldPort {
+	_socket: TcpSocket,
+	address: SocketAddr,
+}
+
+impl HeldPort {
+	/// Holds a fresh port on `host`, shared with other binds as `sharing`
+	/// names.
+	pub fn hold(host: Ipv4Addr, sharing: PortSharing) -> Self {
+		let socket = TcpSocket::new_v4().expect("a TCP socket opens");
+		let shared = matches!(sharing, PortSharing::Shared);
+		socket.set_reuseaddr(shared).expect("SO_REUSEADDR sets");
+		let any_port = SocketAddr::from((host, 0));
+		socket.bind(any_port).expect("the host has a free port");
+		let address = socket.local_addr().expect("a bound socket has an address");
+
+		Self { _socket: socket, address }
+	}
+
+	/// The held port's address.
+	pub fn address(&self) -> SocketAddr {
+		self.address
+	}
 }
 
 /// Starts the gateway on the scenario trace so the cluster's built-in
@@ -335,7 +390,7 @@ pub async fn emit_frame(client: &mut GenericClient<TokioListener>, frame: Frame)
 	client.emit(frame, None).await?.ok_or(TightBeamError::MissingResponse)
 }
 
-/// Gate policy that denies every request, for scenarios proving the
+/// Gate policy that denies every request, for scenarios that prove the
 /// gateway enforces `with_gate_policy` on unary work and stream opens.
 pub struct RejectAllPolicy;
 
@@ -518,7 +573,30 @@ pub fn servlet_address_update(
 	ClusterRequest::ServletAddressUpdate(ServletAddressUpdate { hive_id: hive_urn(hive_addr), added, removed })
 }
 
+/// The signer that names `certificate` (RFC 5652 §5.3).
+pub fn signer_of(certificate: &Certificate) -> SignerIdentifier {
+	certificate.signer_identifier().expect("a fixture certificate names its key")
+}
+
+/// The signer of the identity every [`cluster_certs`] servlet serves under,
+/// which a fixture registration names for its servlets.
+pub fn servlet_signer() -> SignerIdentifier {
+	signer_of(&cluster_certs().cert)
+}
+
+/// A registration entry for servlet type `servlet_name` at `address`, served
+/// under the [`cluster_certs`] identity.
 pub fn servlet_info(servlet_name: impl AsRef<str>, address: impl AsRef<[u8]>) -> ServletInfo {
+	servlet_info_signed_by(servlet_name, address, servlet_signer())
+}
+
+/// A registration entry for servlet type `servlet_name` at `address` that
+/// names `signer` as the identity the servlet answers under.
+pub fn servlet_info_signed_by(
+	servlet_name: impl AsRef<str>,
+	address: impl AsRef<[u8]>,
+	signer: SignerIdentifier,
+) -> ServletInfo {
 	let servlet_name = servlet_name.as_ref();
 	let address = address.as_ref();
 	ServletInfo {
@@ -526,6 +604,7 @@ pub fn servlet_info(servlet_name: impl AsRef<str>, address: impl AsRef<[u8]>) ->
 			.servlet_instance(String::from_utf8_lossy(address).as_ref())
 			.expect("a servlet type URN yields an instance URN"),
 		address: address.to_vec(),
+		signer,
 	}
 }
 
@@ -543,11 +622,12 @@ pub fn servlet_info_mismatched(
 			.servlet_instance(String::from_utf8_lossy(urn_addr).as_ref())
 			.expect("a servlet type URN yields an instance URN"),
 		address: route_addr.to_vec(),
+		signer: servlet_signer(),
 	}
 }
 
 /// Polls until the gateway has learned peer types or the attempts run out.
-/// The branching lives here, not in scenarios.
+/// The branching lives here, so scenarios stay assertion-focused.
 pub async fn wait_for_peer_types(
 	cluster: &ClusterGateway,
 	attempts: u32,
@@ -578,13 +658,17 @@ pub async fn wait_for_empty_registry(cluster: &ClusterGateway, attempts: u32, in
 	poll_until(attempts, interval, || cluster.hive_count().is_ok_and(|count| count == 0)).await
 }
 
+/// The request whose `value` the ping servlet doubles.
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 pub struct PingRequest {
+	/// The number the servlet doubles.
 	pub value: u32,
 }
 
+/// The ping servlet's reply.
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 pub struct PingResponse {
+	/// Twice the request's `value`.
 	pub doubled: u32,
 }
 
@@ -673,6 +757,17 @@ pub fn routing_cluster_conf(certs: &ClusterTestCerts, mux_offer: Option<Transpor
 	conf
 }
 
+/// A muxed gateway conf whose hive trust holds the fixture identity and
+/// `impostor`, so a servlet that serves under `impostor` completes the
+/// handshake, and only the dial's signer binding tells it from the servlet a
+/// registration names.
+pub fn impostor_trusting_conf(certs: &ClusterTestCerts, impostor: &ClusterTestCerts) -> ClusterConfig {
+	let trust = combined_trust(&[&certs.cert, &impostor.cert]);
+	let tls = cluster_tls_config_with_trust(certs, Some(trust));
+
+	with_mux_offer(ClusterConfig::new(tls))
+}
+
 /// Adds the standard eight-stream mux offer to a cluster conf, so the
 /// gateway serves routed streams and its pools open them.
 pub fn with_mux_offer(mut conf: ClusterConfig) -> ClusterConfig {
@@ -759,7 +854,7 @@ pub fn decode_ping_echo(frame: &Frame) -> Result<PingResponse, TightBeamError> {
 /// refuse into the refusal's transit status.
 ///
 /// A successful submission or a non-refusal error fails the scenario. The
-/// branching lives here, not in scenarios.
+/// branching lives here, so scenarios stay assertion-focused.
 pub fn work_refusal_status(result: Result<Frame, TightBeamError>) -> Result<TransitStatus, TightBeamError> {
 	match result {
 		Err(TightBeamError::WorkRefused(status)) => Ok(status),
@@ -896,9 +991,9 @@ pub fn containment_cluster_conf(certs: &ClusterTestCerts) -> ClusterConfig {
 	conf
 }
 
-/// Builds a conf like [`peering_cluster_conf`], but dialing `peers` as beat
-/// anchors. Peers must pass through the builder, because the discovery table
-/// derives its un-evictable anchor set at build.
+/// Builds a conf like [`peering_cluster_conf`], but one that dials `peers` as
+/// beat anchors. Peers must pass through the builder, because the discovery
+/// table derives its un-evictable anchor set at build.
 pub fn peering_cluster_conf_with_peers(
 	certs: &ClusterTestCerts,
 	peers: impl IntoIterator<Item = String>,

@@ -13,12 +13,12 @@ use alloc::vec::Vec;
 use crate::crypto::hash::{Digest, U32};
 use crate::crypto::policy::VerificationPolicy;
 use crate::crypto::x509::error::CertificateValidationError;
-use crate::crypto::x509::key::{KeyCurves, KeyIdentity};
 use crate::crypto::x509::utils::{CertificateExt, Fingerprint};
 use crate::crypto::x509::Certificate;
+use crate::crypto::x509::{KeyCurves, KeyList, KeyListError};
 use crate::der::Encode;
 
-/// The trait for a certificate validation strategy.
+/// A certificate validation strategy.
 ///
 /// An implementor checks one certificate against its own policy and trust
 /// model.
@@ -36,10 +36,59 @@ pub trait CertificateValidation: Send + Sync {
 	///
 	/// - [`CertificateValidationError`] -- `cert` fails a check of this policy.
 	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError>;
+
+	/// Validate `leaf`, the certificate a peer presents, beside `issuers`,
+	/// the issuers above it that the peer presents, the top first, so each
+	/// issues the one after it and the last issues `leaf`.
+	///
+	/// A mutual server admits its client here, with the issuers its client
+	/// Finished presents (RFC 5652 §5.1):
+	///
+	/// - The default runs [`Self::evaluate`] on `leaf` alone.
+	/// - [`CertificateTrustStore`] overrides it, and validates the path of
+	///   `leaf` under `issuers` to one of its trust anchors (RFC 5280 §6.1).
+	///
+	/// # Errors
+	///
+	/// - [`CertificateValidationError`] -- `leaf` or its path fails a check of this policy.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::crypto::policy::Secp256k1Policy;
+	/// use tightbeam::crypto::x509::policy::CertificateValidation;
+	/// use tightbeam::crypto::x509::store::{CertificateTrustBuilder, TrustBuilder};
+	/// use tightbeam::testing::fixtures::{TestCertificate, TestCertificateChain};
+	///
+	/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+	/// // The keys of the fixture chain are public, so it serves an example
+	/// // alone.
+	/// let TestCertificateChain { root, intermediate, leaf, .. } = TestCertificate::insecure_fixed_chain()?;
+	///
+	/// // The store holds the root alone, and the peer presents the
+	/// // intermediate beside its certificate.
+	/// let builder = CertificateTrustBuilder::from(Secp256k1Policy::default());
+	/// let store = builder.with_certificate(root)?.build();
+	/// store.evaluate_presented(&[intermediate], &leaf)?;
+	/// # Ok(())
+	/// # }
+	/// ```
+	///
+	/// [`CertificateTrustStore`]: crate::crypto::x509::store::CertificateTrustStore
+	fn evaluate_presented(
+		&self,
+		issuers: &[Certificate],
+		leaf: &Certificate,
+	) -> Result<(), CertificateValidationError> {
+		// The default reads the leaf alone, as `evaluate` does, so the issuers
+		// drop here.
+		let _ = issuers;
+		self.evaluate(leaf)
+	}
 }
 
-/// The trait for certificate validation with cryptographic signature
-/// verification.
+/// A certificate validation strategy that also verifies the cryptographic
+/// signature of the certificate.
 ///
 /// It extends [`CertificateValidation`] with a check of the certificate's
 /// signature under a verification policy the caller supplies.
@@ -64,8 +113,8 @@ pub trait SignatureVerification: CertificateValidation {
 }
 
 // The pinning and denylist validators below implement direct-trust models
-// (trust-on-first-use and key pinning, cf. RFC 7469), not RFC 5280 §6.1
-// certification-path validation.
+// (trust-on-first-use and key pinning, cf. RFC 7469). The certification-path
+// validation of RFC 5280 §6.1 belongs to `CertificateTrustStore`.
 
 /// A validator that checks certificate expiry alone.
 ///
@@ -76,66 +125,105 @@ pub struct ExpiryValidator;
 
 impl CertificateValidation for ExpiryValidator {
 	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
-		// RFC 5280 §6.1.3(a)(2): validity-period check only.
+		// The check covers the validity period of RFC 5280 §6.1.3(a)(2) alone.
 		cert.validate_expiry()
 	}
 }
 
-/// A validator that pins public keys in a const-generic array.
+/// A validator that admits a certificate whose key one of its pins names.
 ///
-/// The const generic parameter `N` specifies the number of pinned keys.
-///
-/// - A pin is the octets of a key's BIT STRING.
-/// - A check reads each pin under the algorithm of the certificate's key and the validator's [`KeyCurves`].
-/// - It admits the key when the two are one key by the rule that [`CanonicalKey`] states.
-/// - A pin names no curve, so a compressed pin admits the point of its x and y parity on every curve.
-/// - An uncompressed pin admits that point on each curve that the set holds no decoder for.
+/// - A pin is the DER of a SubjectPublicKeyInfo, which names a key with its
+///   algorithm and curve (RFC 5280 §4.1.2.7).
+/// - The validator reads each pin once, and the key of each certificate it checks, under one [`KeyCurves`].
+/// - It admits two keys that are one key by the rule of [`CanonicalKey`], so a
+///   pin admits a key of its own curve alone.
 ///
 /// [`CanonicalKey`]: crate::crypto::x509::CanonicalKey
-#[derive(Debug, Clone, Copy)]
-pub struct PublicKeyPinning<const N: usize> {
-	allowed_keys: [&'static [u8]; N],
-	curves: KeyCurves,
+#[derive(Debug, Clone)]
+pub struct PublicKeyPinning {
+	keys: KeyList,
 }
 
-impl<const N: usize> PublicKeyPinning<N> {
-	/// Create a validator that admits a key one of `keys` pins, read under
-	/// [`KeyCurves::HOUSE`].
-	pub const fn new(keys: [&'static [u8]; N]) -> Self {
-		Self { allowed_keys: keys, curves: KeyCurves::HOUSE }
+impl PublicKeyPinning {
+	/// A validator that admits a key one of `keys` pins, each pin the DER of a
+	/// SubjectPublicKeyInfo, read under [`KeyCurves::HOUSE`].
+	///
+	/// # Errors
+	///
+	/// - The errors of [`Self::with_curves`], under [`KeyCurves::HOUSE`].
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::crypto::x509::policy::{CertificateValidation, PublicKeyPinning};
+	/// use tightbeam::der::Encode;
+	/// use tightbeam::testing::fixtures::{TestCertificate, TestKey};
+	///
+	/// // The pin is the SubjectPublicKeyInfo of the certificate it admits.
+	/// let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+	/// let pin = certificate.tbs_certificate.subject_public_key_info.to_der()?;
+	/// let pinning = PublicKeyPinning::new([pin])?;
+	///
+	/// pinning.evaluate(&certificate)?;
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	pub fn new<I, K>(keys: I) -> Result<Self, KeyListError>
+	where
+		I: IntoIterator<Item = K>,
+		K: AsRef<[u8]>,
+	{
+		Self::with_curves(KeyCurves::HOUSE, keys)
 	}
 
-	/// Set the curves this validator reads each key under, so the decoder of a
-	/// curve refuses its off-curve encodings.
+	/// A validator that admits a key one of `keys` pins, each pin the DER of a
+	/// SubjectPublicKeyInfo, read under `curves`, so the decoder of a curve
+	/// refuses its off-curve encodings.
+	///
+	/// # Errors
+	///
+	/// - [`KeyListError::Unreadable`] -- a pin is no SubjectPublicKeyInfo DER,
+	///   or its canonical form exceeds the DER length cap.
+	/// - [`KeyListError::NoPoint`] -- a pin names an elliptic-curve key that reads as no point.
+	/// - [`KeyListError::NoDecoder`] -- a pin names a point on a curve that `curves` holds no decoder for.
 	///
 	/// # Examples
 	///
 	/// ```
 	/// use tightbeam::crypto::x509::policy::{CertificateValidation, PublicKeyPinning};
 	/// use tightbeam::crypto::x509::KeyCurves;
+	/// use tightbeam::der::Encode;
 	/// use tightbeam::oids::CURVE_NIST_P256;
-	/// use tightbeam::testing::fixtures::{TestCertificate, TestKey};
+	/// use tightbeam::testing::fixtures::{TestCertificate, TestKey, TestP256Points};
+	///
+	/// // A set that reads the points of P-256.
+	/// const P256: KeyCurves = KeyCurves::new(&[&TestP256Points]);
 	///
 	/// // A pin of the compressed point of RFC 6979 §A.2.5 admits the key in
 	/// // its uncompressed form.
-	/// let pinning = PublicKeyPinning::new([&TestKey::RFC6979_P256_COMPRESSED]).with_curves(KeyCurves::HOUSE);
 	/// let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
-	/// let point = &TestKey::RFC6979_P256_UNCOMPRESSED;
-	/// let certificate = TestCertificate::with_curve_point(certificate, CURVE_NIST_P256, point);
+	/// let compressed = &TestKey::RFC6979_P256_COMPRESSED;
+	/// let pinned = TestCertificate::with_curve_point(certificate.clone(), CURVE_NIST_P256, compressed);
+	/// let pin = pinned.tbs_certificate.subject_public_key_info.to_der()?;
+	/// let pinning = PublicKeyPinning::with_curves(P256, [pin])?;
 	///
-	/// pinning.evaluate(&certificate)?;
+	/// let uncompressed = &TestKey::RFC6979_P256_UNCOMPRESSED;
+	/// let presented = TestCertificate::with_curve_point(certificate, CURVE_NIST_P256, uncompressed);
+	/// pinning.evaluate(&presented)?;
 	/// # Ok::<(), Box<dyn core::error::Error>>(())
 	/// ```
-	#[must_use]
-	pub const fn with_curves(self, curves: KeyCurves) -> Self {
-		Self { allowed_keys: self.allowed_keys, curves }
+	pub fn with_curves<I, K>(curves: KeyCurves, keys: I) -> Result<Self, KeyListError>
+	where
+		I: IntoIterator<Item = K>,
+		K: AsRef<[u8]>,
+	{
+		let keys = KeyList::read(curves, keys)?;
+		Ok(Self { keys })
 	}
 }
 
-impl<const N: usize> CertificateValidation for PublicKeyPinning<N> {
+impl CertificateValidation for PublicKeyPinning {
 	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
-		let key = KeyIdentity::of(&cert.tbs_certificate.subject_public_key_info, self.curves);
-		let pinned = self.allowed_keys.iter().any(|pin| key.holds(pin));
+		let pinned = self.keys.holds(&cert.tbs_certificate.subject_public_key_info);
 		pinned.then_some(()).ok_or(CertificateValidationError::PublicKeyNotPinned)
 	}
 }
@@ -246,8 +334,8 @@ where
 		Ok(Self { fingerprints, _digest: PhantomData })
 	}
 
-	/// Create a validator from fingerprints already computed by
-	/// [`Fingerprint::from_certificate`].
+	/// Create a validator from fingerprints that
+	/// [`Fingerprint::from_certificate`] computed.
 	///
 	/// [`Fingerprint::from_certificate`]: crate::crypto::x509::utils::Fingerprint::from_certificate
 	pub fn from_fingerprints(fingerprints: impl IntoIterator<Item = Fingerprint<D>>) -> Self {
@@ -270,20 +358,22 @@ where
 	}
 }
 
-/// Direct-trust certificate validator.
+/// A validator that trusts a certificate when the certificate is itself a
+/// configured trust anchor (direct trust, RFC 5280 §6.1.1).
 ///
-/// This is **not** a full RFC 5280 §6.1 certification-path validator: it does
-/// not build paths, walk name chains, or check `basicConstraints`/`keyUsage`.
+/// It checks the presented certificate alone. Path building, name chaining,
+/// and the `basicConstraints` and `keyUsage` checks of RFC 5280 §6.1 belong
+/// to the certification-path validation of `CertificateTrustStore`.
 ///
-/// - [`CertificateValidation::evaluate`]: validity period
-///   (RFC 5280 §6.1.3(a)(2)) plus direct-trust anchoring - the presented
-///   certificate must itself be a configured trust anchor (RFC 5280 §6.1.1).
-///   With no anchors configured (e.g. `Default`), every certificate is
-///   rejected. Configure anchors via [`Self::with_trust_chain`].
-/// - [`SignatureVerification::verify_with_policy`]: the validity of one
-///   certificate, algorithm-identifier consistency (RFC 5280 §4.1.1.2), and
-///   signature verification against a caller-supplied issuer key
-///   (RFC 5280 §6.1.3(a)(1)).
+/// - [`CertificateValidation::evaluate`] checks the validity period
+///   (RFC 5280 §6.1.3(a)(2)) and requires the presented certificate to be a
+///   configured trust anchor. With no anchors configured, as under `Default`,
+///   it refuses every certificate. [`Self::with_trust_chain`] configures the
+///   anchors.
+/// - [`SignatureVerification::verify_with_policy`] checks the validity of one
+///   certificate, the consistency of its algorithm identifiers
+///   (RFC 5280 §4.1.1.2), and its signature under an issuer key that the
+///   caller supplies (RFC 5280 §6.1.3(a)(1)).
 /// - Both refuse a certificate that repeats an extension or bears a critical
 ///   extension the crate does not process (RFC 5280 §4.2), as path validation
 ///   does.
@@ -316,11 +406,11 @@ impl CertificateValidation for DirectTrustValidator {
 		cert.ensure_unique_extensions()?;
 		cert.ensure_critical_extensions_processed()?;
 
-		// RFC 5280 §6.1.1: direct trust - the presented certificate must itself
-		// be a configured trust anchor (no path building is performed here).
-		// An empty anchor set therefore trusts nothing: fail closed rather
-		// than silently degrade to expiry-only checking (CWE-1188 insecure
-		// default). Use [`ExpiryValidator`] for deliberate expiry-only checks.
+		// RFC 5280 §6.1.1 direct trust: the presented certificate must itself
+		// be a configured trust anchor, a path of one certificate. An empty
+		// anchor set therefore trusts nothing, so the validator fails closed
+		// instead of degrading to an expiry-only check (CWE-1188, insecure
+		// default). `ExpiryValidator` is the deliberate expiry-only check.
 		let cert_der = cert.to_der()?;
 		for anchor in &self.trust_chain {
 			if anchor.to_der()? == cert_der {
@@ -418,7 +508,9 @@ mod tests {
 	mod public_key_pinning {
 		use crate::crypto::x509::error::CertificateValidationError;
 		use crate::crypto::x509::policy::{CertificateValidation, PublicKeyPinning};
-		use crate::crypto::x509::Certificate;
+		use crate::crypto::x509::{Certificate, KeyListError};
+		use crate::der::Encode;
+		use crate::oids::CURVE_NIST_P256;
 		use crate::testing::fixtures::{TestCertificate, TestKey};
 
 		/// The certificate of the fixed test key, whose point is in the
@@ -427,19 +519,27 @@ mod tests {
 			TestCertificate::self_signed(&TestKey::insecure_fixed_signing())
 		}
 
-		/// The octets of the key of `certificate` as a static pin, the form a
-		/// const configuration names.
-		fn pin_of(certificate: &Certificate) -> &'static [u8] {
+		/// The pin of the key of `certificate`: the DER of its
+		/// SubjectPublicKeyInfo.
+		fn pin_of(certificate: &Certificate) -> Vec<u8> {
 			let spki = &certificate.tbs_certificate.subject_public_key_info;
-			Box::leak(spki.subject_public_key.raw_bytes().to_vec().into_boxed_slice())
+			spki.to_der().expect("a test SubjectPublicKeyInfo encodes")
+		}
+
+		/// `certificate` with its point read under P-256, the bits of its
+		/// secp256k1 key under another named curve.
+		fn on_p256(certificate: Certificate) -> Certificate {
+			let spki = &certificate.tbs_certificate.subject_public_key_info;
+			let point = spki.subject_public_key.raw_bytes().to_vec();
+			TestCertificate::with_curve_point(certificate, CURVE_NIST_P256, &point)
 		}
 
 		/// A pin of the compressed point admits the certificate of that point
 		/// in the uncompressed form.
 		#[test]
-		fn a_compressed_pin_admits_the_uncompressed_key() -> Result<(), CertificateValidationError> {
+		fn a_compressed_pin_admits_the_uncompressed_key() -> Result<(), Box<dyn core::error::Error>> {
 			let compressed = TestCertificate::with_compressed_key(uncompressed());
-			let pinning = PublicKeyPinning::new([pin_of(&compressed)]);
+			let pinning = PublicKeyPinning::new([pin_of(&compressed)])?;
 
 			pinning.evaluate(&uncompressed())?;
 			Ok(())
@@ -448,21 +548,22 @@ mod tests {
 		/// A pin of the negated point names another key, so it refuses the
 		/// certificate.
 		#[test]
-		fn a_pin_of_the_negated_point_refuses_the_key() {
+		fn a_pin_of_the_negated_point_refuses_the_key() -> Result<(), KeyListError> {
 			let negation = TestKey::negation_of(&TestKey::insecure_fixed_signing());
-			let pinning = PublicKeyPinning::new([pin_of(&TestCertificate::self_signed(&negation))]);
+			let pinning = PublicKeyPinning::new([pin_of(&TestCertificate::self_signed(&negation))])?;
 
 			let refused = pinning.evaluate(&uncompressed());
 			assert!(matches!(refused, Err(CertificateValidationError::PublicKeyNotPinned)));
+			Ok(())
 		}
 
 		/// A pinning admits a key that any one of its pins names, so a second
 		/// pin of the key admits it after a first pin of another key.
 		#[test]
-		fn the_second_pin_admits_its_key() -> Result<(), CertificateValidationError> {
+		fn the_second_pin_admits_its_key() -> Result<(), Box<dyn core::error::Error>> {
 			let negation = TestKey::negation_of(&TestKey::insecure_fixed_signing());
 			let other = pin_of(&TestCertificate::self_signed(&negation));
-			let pinning = PublicKeyPinning::new([other, pin_of(&uncompressed())]);
+			let pinning = PublicKeyPinning::new([other, pin_of(&uncompressed())])?;
 
 			pinning.evaluate(&uncompressed())?;
 			Ok(())
@@ -472,12 +573,44 @@ mod tests {
 		/// that is no point of its curve names another key, so the pin refuses
 		/// it (SEC 1 v2.0 §2.3.4).
 		#[test]
-		fn a_pin_refuses_an_off_curve_alias_of_its_key() {
-			let pinning = PublicKeyPinning::new([pin_of(&uncompressed())]);
+		fn a_pin_refuses_an_off_curve_alias_of_its_key() -> Result<(), KeyListError> {
+			let pinning = PublicKeyPinning::new([pin_of(&uncompressed())])?;
 			let alias = TestCertificate::with_off_curve_key(uncompressed());
 
 			let refused = pinning.evaluate(&alias);
 			assert!(matches!(refused, Err(CertificateValidationError::PublicKeyNotPinned)));
+			Ok(())
+		}
+
+		/// A pin names its key with its curve, so a secp256k1 pin refuses a
+		/// P-256 certificate that holds the same uncompressed point bits
+		/// (RFC 5280 §4.1.2.7).
+		#[test]
+		fn a_secp256k1_pin_refuses_the_same_bits_on_p256() -> Result<(), KeyListError> {
+			let pinning = PublicKeyPinning::new([pin_of(&uncompressed())])?;
+
+			let refused = pinning.evaluate(&on_p256(uncompressed()));
+			assert!(matches!(refused, Err(CertificateValidationError::PublicKeyNotPinned)));
+			Ok(())
+		}
+
+		/// The curve separates the two keys in the compressed form too.
+		#[test]
+		fn a_secp256k1_pin_refuses_the_same_compressed_bits_on_p256() -> Result<(), KeyListError> {
+			let compressed = TestCertificate::with_compressed_key(uncompressed());
+			let pinning = PublicKeyPinning::new([pin_of(&compressed)])?;
+
+			let refused = pinning.evaluate(&on_p256(compressed));
+			assert!(matches!(refused, Err(CertificateValidationError::PublicKeyNotPinned)));
+			Ok(())
+		}
+
+		/// A pin that is no SubjectPublicKeyInfo fails the construction, and
+		/// the error names its position.
+		#[test]
+		fn a_malformed_pin_fails_at_construction_with_its_index() {
+			let refused = PublicKeyPinning::new([pin_of(&uncompressed()), b"no key".to_vec()]);
+			assert_eq!(refused.err(), Some(KeyListError::Unreadable { index: 1 }));
 		}
 	}
 
@@ -497,8 +630,8 @@ mod tests {
 			TestCertificate::self_signed(&TestKey::insecure_fixed_signing())
 		}
 
-		/// Run the out-of-the-box policy over `cert`, supplying the issuer key
-		/// that matches `signing_key`.
+		/// Run the out-of-the-box policy over `cert`, with the issuer key that
+		/// matches `signing_key`.
 		fn verify(signing_key: &SigningKey, cert: &Certificate) -> Result<(), CertificateValidationError> {
 			let issuer_pub = signing_key.verifying_key().to_public_key_der()?;
 			let policy = Secp256k1Policy::default();
@@ -563,14 +696,14 @@ mod tests {
 			));
 		}
 
-		/// [`test_cert`] carrying the extension `oid` twice.
+		/// [`test_cert`] with the extension `oid` twice.
 		fn with_repeated(oid: &str) -> Certificate {
 			let extension = TestCertificate::opaque_extension(oid, false);
 			let cert = TestCertificate::with_extension(test_cert(), extension.clone());
 			TestCertificate::with_extension(cert, extension)
 		}
 
-		/// [`test_cert`] carrying `nameConstraints`, which the crate does not
+		/// [`test_cert`] with `nameConstraints`, which the crate does not
 		/// process, as a critical extension.
 		fn with_unknown_critical() -> Certificate {
 			let extension = TestCertificate::opaque_extension("2.5.29.30", true);

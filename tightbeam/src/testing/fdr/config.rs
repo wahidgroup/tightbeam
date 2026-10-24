@@ -1,7 +1,7 @@
-//! Configuration types for FDR refinement checking
+//! Configuration types for FDR refinement checking.
 //!
-//! This module contains the core configuration structures and result types
-//! used by the FDR exploration engine.
+//! The module holds the configuration structures and the result types that
+//! the FDR exploration engine uses.
 
 #[cfg(feature = "testing-fault")]
 use std::{borrow::Cow, collections::HashMap, sync::Arc};
@@ -11,51 +11,116 @@ use crate::testing::specs::csp::Process;
 
 #[cfg(feature = "testing-fault")]
 use crate::testing::fault::{ProcessEvent, ProcessState};
+#[cfg(feature = "testing-fault")]
+use crate::testing::fdr::SeededRng;
 #[cfg(feature = "testing-fmea")]
 use crate::testing::fmea::FmeaConfig;
 #[cfg(feature = "testing-fault")]
 use crate::{constants::DEFAULT_FAULT_SEED, error::TightBeamError, testing::error::FdrConfigError, utils::BasisPoints};
 
-/// Scheduler model type
-/// Panics if used when `testing-fault` feature is not enabled
+/// The scheduling model of the processes in an FDR exploration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchedulerModel {
-	/// Cooperative scheduling (yield-based)
+	/// Cooperative scheduling, where each process yields.
 	Cooperative,
-	/// Preemptive scheduling (time-sliced)
+	/// Preemptive scheduling, where the scheduler slices time.
 	Preemptive,
 }
 
-/// Fault injection strategy for runtime and FDR-based fault injection
+/// The strategy that decides when an injection point injects its fault, at
+/// runtime and in FDR exploration.
 ///
-/// - **Deterministic**: Counter-based injection for reproducibility (DO-178C/IEC 61508)
-/// - **Random**: Seeded RNG for statistical coverage (same seed = same faults)
+/// - **Deterministic**: counter-based injection, so runs repeat for DO-178C and IEC 61508.
+/// - **Random**: a seeded RNG for statistical coverage, where a repeated seed injects the same faults.
 #[cfg(feature = "testing-fault")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InjectionStrategy {
-	/// Deterministic fault injection (counter-based)
-	/// Injects faults based on call counters: predictable, reproducible
+	/// Deterministic fault injection, which counts the records of each event,
+	/// so its injections are predictable and repeat from run to run.
 	Deterministic,
-	/// Random fault injection (seeded RNG)
-	/// Injects faults probabilistically but deterministically via seed
+	/// Random fault injection from a seeded RNG, which injects by probability
+	/// and repeats under the same seed.
 	Random,
 }
 
-/// Individual fault injection configuration
+#[cfg(feature = "testing-fault")]
+impl InjectionStrategy {
+	/// The draw state of this strategy at its start, with the generator of
+	/// the random strategy at `seed`.
+	fn draw(self, seed: u64) -> StrategyDraw {
+		match self {
+			Self::Deterministic => StrategyDraw::Counted(HashMap::new()),
+			Self::Random => StrategyDraw::Seeded(SeededRng::new(seed)),
+		}
+	}
+}
+
+/// The draw state of an injection strategy, which decides whether an
+/// injection point injects at a record of its event.
+#[cfg(feature = "testing-fault")]
+#[derive(Debug)]
+pub(crate) enum StrategyDraw {
+	/// The deterministic strategy, with the count of the records of each
+	/// label.
+	Counted(HashMap<Cow<'static, str>, u32>),
+	/// The random strategy, with its generator, seeded from the model as FDR
+	/// exploration seeds its own.
+	Seeded(SeededRng),
+}
+
+#[cfg(feature = "testing-fault")]
+impl StrategyDraw {
+	/// Whether `injection` fires at this record of `label`.
+	///
+	/// - The count spreads the injections over the records of each label, so
+	///   runs repeat for DO-178C and IEC 61508: 3000 bps (30%) injects on
+	///   records 4, 7, and 10 of 10.
+	/// - The generator draws as FDR exploration does.
+	///
+	/// The label stays the `Cow` that the count keys, as the check that calls
+	/// this states.
+	#[allow(clippy::ptr_arg)]
+	pub(crate) fn injects(&mut self, label: &Cow<'static, str>, injection: &FaultInjection) -> bool {
+		let probability = u64::from(injection.probability_bps.get());
+		match self {
+			Self::Counted(calls) => {
+				let count = calls.entry(Cow::clone(label)).or_insert(0);
+				*count = count.saturating_add(1);
+				u64::from(*count) * probability % 10000 < probability
+			}
+			Self::Seeded(rng) => injection.should_inject(rng.get_next()),
+		}
+	}
+}
+
+/// The place of an injection point: an event in one process state, or an
+/// event in every state.
+#[cfg(feature = "testing-fault")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum InjectionKey<'a> {
+	/// An event of FDR exploration in the state that `state` names as
+	/// `Process.State`.
+	State { state: Cow<'a, str>, event: Cow<'a, str> },
+	/// A runtime record of an event, in every process state.
+	Event(Cow<'a, str>),
+}
+
+/// The configuration of one fault injection point.
 #[cfg(feature = "testing-fault")]
 #[derive(Clone)]
-pub struct FaultInjection {
-	pub error_factory: Arc<dyn Fn() -> TightBeamError + Send + Sync>,
-	/// Probability in basis points (0-10000, where 10000 = 100%)
-	/// Compile-time validated via BasisPoints type
-	pub probability_bps: BasisPoints,
+pub(crate) struct FaultInjection {
+	pub(crate) error_factory: Arc<dyn Fn() -> TightBeamError + Send + Sync>,
+	/// The injection probability in basis points (0 to 10000, where 10000 is
+	/// 100%), which the `BasisPoints` type validates at compile time.
+	pub(crate) probability_bps: BasisPoints,
 }
 
 #[cfg(feature = "testing-fault")]
 impl FaultInjection {
-	/// Check if fault should fire based on RNG value (0-9999)
-	pub fn should_inject(&self, rng_value: u32) -> bool {
-		(rng_value % 10000) < (self.probability_bps.get() as u32)
+	/// Whether the fault fires for the draw `rng_value`, read in basis points
+	/// as `rng_value` modulo 10,000.
+	pub(crate) fn should_inject(&self, rng_value: u64) -> bool {
+		rng_value % 10000 < u64::from(self.probability_bps.get())
 	}
 }
 
@@ -68,17 +133,37 @@ impl core::fmt::Debug for FaultInjection {
 	}
 }
 
-/// Fault model configuration with HashMap for O(1) lookups
-/// Key: (csp_state, event_label)
-/// Panics if used when `testing-fault` feature is not enabled
+/// The fault model configuration, a `HashMap` of injection points for O(1)
+/// lookups. Each point keys on a process state and an event, or on an event in
+/// every state. The model needs the `testing-fault` feature.
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam::testing::{FaultModel, InjectionStrategy};
+/// use tightbeam::trace::TraceCollector;
+/// use tightbeam::urn::Urn;
+/// use tightbeam::TightBeamError;
+///
+/// const SEND: Urn<'static> = tightbeam::urn!("test", "event:example/send");
+///
+/// // The builders set the strategy, the seed, and each injection point.
+/// let fault = || TightBeamError::ChannelClosed;
+/// let model = FaultModel::from(InjectionStrategy::Random).with_seed(7);
+/// let model = model.with_event_fault(SEND, fault, tightbeam::bps!(10000));
+/// let trace = TraceCollector::new().with_fault_model(model);
+/// assert!(matches!(trace.event(SEND), Err(TightBeamError::ChannelClosed)));
+/// ```
 #[cfg(feature = "testing-fault")]
 #[derive(Clone)]
 pub struct FaultModel {
-	pub injection_points: HashMap<(Cow<'static, str>, Cow<'static, str>), FaultInjection>,
-	pub injection_strategy: InjectionStrategy,
-	/// Seed for deterministic fault injection
-	/// - reproducibility for DO-178C/IEC 61508
-	pub seed: u64,
+	/// The injection points, each at its place.
+	injection_points: HashMap<InjectionKey<'static>, FaultInjection>,
+	/// The strategy that decides whether a point injects at a record.
+	injection_strategy: InjectionStrategy,
+	/// The seed of the random strategy's generator, so its injections repeat
+	/// for DO-178C and IEC 61508.
+	seed: u64,
 }
 
 #[cfg(feature = "testing-fault")]
@@ -111,87 +196,155 @@ impl From<InjectionStrategy> for FaultModel {
 
 #[cfg(feature = "testing-fault")]
 impl FaultModel {
-	/// Type-safe fault injection using ProcessState and ProcessEvent traits
+	/// Inject a fault at a process state and an event, typed through the
+	/// `ProcessState` and `ProcessEvent` traits.
 	///
-	/// Injects a fault at the specified (process state, event) combination with
-	/// the given probability in basis points (0-10000, where 10000 = 100%).
+	/// The fault fires at that (process state, event) pair with the probability
+	/// `probability_bps` in basis points (0 to 10000, where 10000 is 100%).
 	///
-	/// Uses ProcessState and ProcessEvent traits for compile-time validation when
-	/// used with enums generated by tb_process_spec! macro.
-	pub fn with_fault<S, E, F, Err>(mut self, state: S, event: E, error_fn: F, probability_bps: BasisPoints) -> Self
+	/// The traits validate the pair at compile time when the enums come from
+	/// the `tb_process_spec!` macro.
+	pub fn with_fault<S, E, F, Err>(self, state: S, event: E, error_fn: F, probability_bps: BasisPoints) -> Self
 	where
 		S: ProcessState,
 		E: ProcessEvent,
 		F: Fn() -> Err + Send + Sync + 'static,
 		Err: Into<TightBeamError>,
 	{
-		let key = (state.full_key(), event.event_label());
-		self.injection_points.insert(
-			key,
-			FaultInjection { error_factory: Arc::new(move || error_fn().into()), probability_bps },
-		);
+		let key = InjectionKey::State { state: state.full_key(), event: event.event_label() };
+		self.with_point(key, error_fn, probability_bps)
+	}
+
+	/// Inject a fault at each runtime record of `event`, in every process
+	/// state, with the probability `probability_bps` in basis points.
+	///
+	/// A collector injects the fault once [`TraceCollector::with_fault_model`]
+	/// installs the model, and its [`TraceCollector::event`] then returns the
+	/// error of `error_fn`.
+	///
+	/// [`TraceCollector::with_fault_model`]: crate::trace::TraceCollector::with_fault_model
+	/// [`TraceCollector::event`]: crate::trace::TraceCollector::event
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::FaultModel;
+	/// use tightbeam::trace::TraceCollector;
+	/// use tightbeam::urn::Urn;
+	/// use tightbeam::TightBeamError;
+	///
+	/// const SPAWN: Urn<'static> = tightbeam::urn!("test", "event:example/spawn");
+	///
+	/// // Every record of the event fails.
+	/// let fault = || TightBeamError::MissingResponse;
+	/// let model = FaultModel::default().with_event_fault(SPAWN, fault, tightbeam::bps!(10000));
+	/// let trace = TraceCollector::new().with_fault_model(model);
+	/// assert!(matches!(trace.event(SPAWN), Err(TightBeamError::MissingResponse)));
+	/// ```
+	pub fn with_event_fault<E, F, Err>(self, event: E, error_fn: F, probability_bps: BasisPoints) -> Self
+	where
+		E: ProcessEvent,
+		F: Fn() -> Err + Send + Sync + 'static,
+		Err: Into<TightBeamError>,
+	{
+		let key = InjectionKey::Event(event.event_label());
+		self.with_point(key, error_fn, probability_bps)
+	}
+
+	/// Insert the injection point at `key`, whose error `error_fn` builds.
+	fn with_point<F, Err>(mut self, key: InjectionKey<'static>, error_fn: F, probability_bps: BasisPoints) -> Self
+	where
+		F: Fn() -> Err + Send + Sync + 'static,
+		Err: Into<TightBeamError>,
+	{
+		let injection = FaultInjection { error_factory: Arc::new(move || error_fn().into()), probability_bps };
+		self.injection_points.insert(key, injection);
 		self
 	}
 
-	/// Set seed for deterministic fault injection
+	/// The injection point of a runtime record of the event `label`, as
+	/// [`Self::with_event_fault`] keys it.
+	///
+	/// The lookup key borrows `label`, so the point borrows it too.
+	pub(crate) fn runtime_injection<'a>(&'a self, label: &'a str) -> Option<&'a FaultInjection> {
+		let key = InjectionKey::Event(Cow::Borrowed(label));
+		self.injection_points.get(&key)
+	}
+
+	/// The injection point of the event `event` in the process state `state`,
+	/// named `Process.State`, as [`Self::with_fault`] keys it.
+	///
+	/// The lookup key borrows both names, so the point borrows them too.
+	pub(crate) fn state_injection<'a>(&'a self, state: &'a str, event: &'a str) -> Option<&'a FaultInjection> {
+		let key = InjectionKey::State { state: Cow::Borrowed(state), event: Cow::Borrowed(event) };
+		self.injection_points.get(&key)
+	}
+
+	/// The draw state of the model's strategy at its start, with the
+	/// generator of the random strategy at the model's seed.
+	pub(crate) fn strategy_draw(&self) -> StrategyDraw {
+		self.injection_strategy.draw(self.seed)
+	}
+
+	/// Set the seed of the random strategy's generator, so a run repeats.
 	pub fn with_seed(mut self, seed: u64) -> Self {
 		self.seed = seed;
 		self
 	}
 }
 
-/// FDR configuration for refinement checking and multi-seed exploration
+/// The FDR configuration for refinement checking and multi-seed exploration.
 ///
-/// Supports two modes:
-/// 1. Single-process exploration: Verify properties of one process
-/// 2. Refinement checking: Verify Spec ⊑ Impl (traces/failures/divergences)
+/// The configuration supports two modes:
+/// 1. Single-process exploration: verify the properties of one process.
+/// 2. Refinement checking: verify Spec ⊑ Impl (traces, failures, divergences).
 #[derive(Debug, Clone)]
 pub struct FdrConfig {
-	/// Number of exploration seeds (different scheduling)
+	/// The number of exploration seeds, each of which runs another schedule.
 	pub seeds: u32,
 
-	/// Maximum trace depth before cutoff
+	/// The maximum trace depth, where exploration cuts a trace off.
 	pub max_depth: usize,
 
-	/// Maximum consecutive τ-transitions before divergence detection
+	/// The maximum run of consecutive τ-transitions, past which exploration
+	/// detects a divergence.
 	pub max_internal_run: usize,
 
-	/// Per-seed timeout in milliseconds
+	/// The timeout of each seed, in milliseconds.
 	pub timeout_ms: u64,
 
-	/// Additional processes for refinement checking
-	/// If provided, check: specs\[0\] ⊑ main_process
+	/// The additional processes for refinement checking. When the list holds a
+	/// process, exploration checks specs\[0\] ⊑ main_process.
 	pub specs: Vec<Process>,
 
-	/// Stop refinement checking on first violation (fast-fail mode)
-	/// When true (default), returns immediately after finding first counter-example
-	/// When false, checks all specs and collects all violations
+	/// Whether refinement checks stop at the first violation (fast-fail mode).
+	/// When true (the default), the check returns at the first counter-example.
+	/// When false, it checks every spec and collects every violation.
 	pub fail_fast: bool,
 
-	/// Number of schedulers (m) - for resource constraint modeling
-	/// When m < n (process_count), some traces become impossible
-	/// Optional: set to Some(_) to enable scheduler modeling, None to disable.
-	/// When set, both scheduler_count and process_count must be Some(_).
+	/// The number of schedulers (m), for resource constraint modeling. When m
+	/// is below n (`process_count`), some traces become impossible. `Some(_)`
+	/// turns scheduler modeling on, and `None` turns it off. When set, both
+	/// `scheduler_count` and `process_count` must be `Some(_)`.
 	#[cfg(feature = "testing-fault")]
 	pub scheduler_count: Option<u32>,
 
-	/// Number of concurrent processes (n) - for resource constraint modeling
-	/// Optional: set to Some(_) to enable scheduler modeling, None to disable.
-	/// When set, both scheduler_count and process_count must be Some(_).
+	/// The number of concurrent processes (n), for resource constraint
+	/// modeling. `Some(_)` turns scheduler modeling on, and `None` turns it
+	/// off. When set, both `scheduler_count` and `process_count` must be
+	/// `Some(_)`.
 	#[cfg(feature = "testing-fault")]
 	pub process_count: Option<u32>,
 
-	/// Scheduler model type (Cooperative or Preemptive)
-	/// Panics if set to Some(_) when `testing-fault` feature is not enabled
+	/// The scheduler model, cooperative or preemptive.
 	pub scheduler_model: Option<SchedulerModel>,
 
-	/// Fault injection model
-	/// When provided, enables CSP state-driven fault injection during
-	/// FDR exploration
+	/// The fault injection model. When set, it turns on CSP state-driven fault
+	/// injection during FDR exploration.
 	#[cfg(feature = "testing-fault")]
 	pub fault_model: Option<FaultModel>,
 
-	/// FMEA configuration
+	/// The configuration of the FMEA, the failure mode and effects analysis.
 	#[cfg(feature = "testing-fmea")]
 	pub fmea_config: Option<FmeaConfig>,
 }
@@ -219,20 +372,21 @@ impl Default for FdrConfig {
 }
 
 impl FdrConfig {
-	/// Validate scheduler model constraints with detailed error messages.
+	/// Validate the constraints of the scheduler model, with a detailed error
+	/// message for each.
 	///
-	/// Checks:
-	/// - scheduler_count and process_count must both be Some(_) or both be None
-	/// - If set, scheduler_count must be <= process_count
-	/// - If set, scheduler_count and process_count must be > 0
+	/// It checks these rules:
+	/// - `scheduler_count` and `process_count` must both be `Some(_)` or both be `None`.
+	/// - When set, `scheduler_count` must not exceed `process_count`.
+	/// - When set, `scheduler_count` and `process_count` must each be above 0.
 	///
 	/// ## Returns
-	/// - `Ok(())` if validation passes
-	/// - `Err(TestingError)` if validation fails
+	/// - `Ok(())` when every check passes.
+	/// - `Err(TestingError)` when a check fails.
 	#[cfg(feature = "testing-fault")]
 	pub fn validate_scheduler_model(&self) -> Result<(), TestingError> {
 		match (self.scheduler_count, self.process_count) {
-			(None, None) => Ok(()), // Scheduler modeling disabled - valid
+			(None, None) => Ok(()), // Scheduler modeling is off and valid.
 			(Some(_), None) | (None, Some(_)) => Err(TestingError::InvalidFdrConfig(FdrConfigError {
 				field: "scheduler_count/process_count",
 				reason: "both must be set or both be None for resource constraint modeling",
@@ -269,20 +423,25 @@ impl FdrConfig {
 		self.validate_scheduler_model()
 	}
 
-	/// Validate all constraints (no-op when testing-fault is not enabled).
+	/// Validate all constraints. Every configuration passes when the
+	/// `testing-fault` feature is off.
 	#[cfg(not(feature = "testing-fault"))]
 	pub fn validate(&self) -> Result<(), TestingError> {
 		Ok(())
 	}
 }
 
-/// Record of an injected fault during FDR exploration
+/// The record of a fault that FDR exploration injected.
 #[cfg(feature = "testing-fault")]
 #[derive(Debug, Clone, PartialEq)]
 pub struct InjectedFaultRecord {
+	/// The CSP state of the injection, as `process.state`.
 	pub csp_state: String,
+	/// The label of the event at which the fault fired.
 	pub event_label: String,
+	/// The message of the injected error.
 	pub error_message: String,
+	/// The injection probability of the point, in basis points.
 	pub probability_bps: u16,
 }
 
@@ -293,7 +452,7 @@ mod tests {
 	use super::*;
 	use crate::testing::specs::csp::{Observation, State, TransitionRelation};
 
-	// ========== FaultModel Unit Tests ==========
+	// These unit tests cover `FaultModel`.
 
 	#[cfg(feature = "testing-fault")]
 	mod fault_model {
@@ -360,8 +519,7 @@ mod tests {
 		/// event label.
 		fn injection<'a>(model: &'a FaultModel, state: &'static str, event: &'static str) -> &'a FaultInjection {
 			model
-				.injection_points
-				.get(&(Cow::Borrowed(state), Cow::Borrowed(event)))
+				.state_injection(state, event)
 				.expect("fault registered for the requested state and event")
 		}
 
@@ -457,7 +615,7 @@ mod tests {
 		}
 	}
 
-	// ========== FdrConfig Tests ==========
+	// These tests cover `FdrConfig`.
 
 	#[test]
 	fn default_configuration() {

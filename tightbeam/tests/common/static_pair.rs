@@ -44,8 +44,11 @@ pub(crate) const SERVER_KEY: SigningKeySpec =
 pub(crate) const CLIENT_KEY: SigningKeySpec =
 	SigningKeySpec::Bytes(&hex!("0202020202020202020202020202020202020202020202020202020202020202"));
 
-/// The client's public key, which [`CLIENT_PINNING`] pins.
-const CLIENT_PUB_KEY: &[u8] = &hex!("044d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d07662a3eada2d0fe208b6d257ceb0f064284662e857f57b66b54c198bd310ded36d0");
+/// The SubjectPublicKeyInfo DER of the client's key, which
+/// [`client_pinning`] pins.
+const CLIENT_SPKI: &[u8] = &hex!("3056301006072a8648ce3d020106052b8104000a034200044d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d07662a3eada2d0fe208b6d257ceb0f064284662e857f57b66b54c198bd310ded36d0");
 
 /// A server's pin of the client's key, which admits the client certificate.
-pub(crate) const CLIENT_PINNING: PublicKeyPinning<1> = PublicKeyPinning::new([CLIENT_PUB_KEY]);
+pub(crate) fn client_pinning() -> PublicKeyPinning {
+	PublicKeyPinning::new([CLIENT_SPKI]).expect("the client pin is a SubjectPublicKeyInfo of a point")
+}

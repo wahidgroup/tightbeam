@@ -12,6 +12,7 @@
 //! - [`KeyCurves`] holds the decoders of a reader.
 //! - [`CanonicalKey`] holds one identity in its canonical form.
 //! - [`KeyIndex`] finds a key in either SEC 1 form of its point.
+//! - [`KeyListError`] names the entry a list of keys refuses, for a pin list and a peer list alike.
 //!
 //! ## Sources
 //!
@@ -25,6 +26,8 @@
 //! [`PeerListGate`]: crate::colony::hive::PeerListGate
 //! [`PublicKeyPinning`]: crate::crypto::x509::policy::PublicKeyPinning
 
+use core::borrow::Borrow;
+use core::cmp::Ordering;
 use core::fmt::{self, Debug, Formatter};
 use core::marker::PhantomData;
 
@@ -33,30 +36,25 @@ use elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 use elliptic_curve::{AffinePoint, CurveArithmetic, FieldBytesSize, PublicKey};
 
 use crate::der::asn1::{BitStringRef, ObjectIdentifier};
-use crate::der::oid::db::rfc5912::ID_EC_PUBLIC_KEY;
+use crate::der::oid::db::rfc5912::{ID_EC_DH, ID_EC_MQV, ID_EC_PUBLIC_KEY};
 use crate::der::oid::AssociatedOid;
 use crate::der::referenced::OwnedToRef;
-use crate::der::{Encode, EncodeValue, FixedTag, Length, Tag, Writer};
+use crate::der::{Decode, Encode, EncodeValue, FixedTag, Length, Tag, Writer};
 use crate::oids::{BINARY_FIELD_CURVES, CURVE_X962_C_TWO};
 use crate::spki::{AlgorithmIdentifierRef, SubjectPublicKeyInfoOwned, SubjectPublicKeyInfoRef};
+use crate::Errorizable;
 
+#[cfg(not(feature = "std"))]
+use alloc::collections::BTreeSet;
 #[cfg(not(feature = "std"))]
 use alloc::sync::Arc;
 #[cfg(feature = "std")]
-use core::borrow::Borrow;
-#[cfg(feature = "std")]
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 #[cfg(feature = "std")]
 use std::sync::Arc;
 
 #[cfg(feature = "secp256k1")]
 use crate::crypto::k256::Secp256k1;
-#[cfg(any(
-	feature = "transport-cms",
-	feature = "transport-hpke",
-	all(test, feature = "transport")
-))]
-use crate::der::oid::db::rfc5912::{ID_EC_DH, ID_EC_MQV};
 
 /// A point of an `id-ecPublicKey` key, read in place as its compressed SEC 1
 /// form names it: the parity of its y-coordinate and its x-coordinate.
@@ -112,8 +110,8 @@ pub trait CurvePoints: Debug + Send + Sync {
 	fn decodes(&self, point: &[u8]) -> bool;
 }
 
-/// The decoder of the curve `C`, which runs the range and curve checks of SEC 1
-/// v2.0 §2.3.4 through the arithmetic of `C`, on the stack.
+/// The decoder of the curve `C`, which runs the range and curve checks of
+/// SEC 1 v2.0 §2.3.4 through the arithmetic of `C`, on the stack.
 ///
 /// # Examples
 ///
@@ -205,7 +203,7 @@ impl KeyCurves {
 	#[cfg(not(feature = "secp256k1"))]
 	pub const HOUSE: Self = Self(&[]);
 
-	/// The set of `decoders`.
+	/// The set that holds `decoders`.
 	#[must_use]
 	pub const fn new(decoders: &'static [&'static dyn CurvePoints]) -> Self {
 		Self(decoders)
@@ -349,35 +347,12 @@ impl<'a> KeyIdentity<'a> {
 		Self { algorithm: spki.algorithm, key, curves }
 	}
 
-	/// Whether `bits`, the octets of a key BIT STRING under this identity's
-	/// algorithm, hold this key as the curves of this identity read them. A
-	/// pin names a key by these octets alone.
-	///
-	/// The SEC 1 form of a pin compares before its decoder runs, so only a pin
-	/// of this point pays for the decode.
-	pub(crate) fn holds(&self, bits: &[u8]) -> bool {
-		let Ok(bits) = BitStringRef::from_bytes(bits) else {
-			return false;
-		};
-
-		let candidate = match self.key {
-			KeyValue::Point(point) => bits.as_bytes().and_then(Sec1Point::read) == Some(point),
-			KeyValue::Bits(own) => bits == own,
-		};
-		candidate && KeyValue::read(self.algorithm, bits, self.curves) == self.key
-	}
-
 	/// Whether this identity names an elliptic-curve key that reads as no
 	/// point, by the rule that [`CanonicalKey`] states. The handshake refuses
 	/// every peer that holds such a key, which is one of these:
 	///
 	/// - An `id-ecPublicKey` key that reads as its bits.
 	/// - A key under `id-ecDH` or `id-ecMQV` (RFC 5480 §2.1.2), which each use refuses.
-	#[cfg(any(
-		feature = "transport-cms",
-		feature = "transport-hpke",
-		all(test, feature = "transport")
-	))]
 	pub(crate) fn names_no_point(&self) -> bool {
 		let restricted = self.algorithm.oid == ID_EC_DH || self.algorithm.oid == ID_EC_MQV;
 		let unread = self.algorithm.oid == ID_EC_PUBLIC_KEY && matches!(self.key, KeyValue::Bits(_));
@@ -387,7 +362,6 @@ impl<'a> KeyIdentity<'a> {
 	/// Whether this identity names a point on a named curve that its curves
 	/// hold no decoder for. Its reader reads an off-curve encoding with the x
 	/// and the y parity of the point as that point.
-	#[cfg(feature = "colony")]
 	pub(crate) fn names_an_undecoded_curve(&self) -> bool {
 		let point = matches!(self.key, KeyValue::Point(_));
 		let curve = KeyValue::named_curve(self.algorithm);
@@ -459,8 +433,8 @@ impl EncodeValue for KeyIdentity<'_> {
 /// [`KeyCurves`] of the reader:
 ///
 /// - A point of a named curve outside the binary-field curves of SEC 2 and
-///   ANSI X9.62, in either SEC 1 form, reads as its compressed form (RFC 5480
-///   §2.2), and its negation is another key.
+///   ANSI X9.62, in either SEC 1 form, reads as its compressed form
+///   (RFC 5480 §2.2), and its negation is another key.
 /// - Every other key keeps its bits as they arrived:
 ///   - An encoding that the decoder of its curve refuses.
 ///   - A malformed point, or a form that RFC 5480 §2.2 refuses.
@@ -615,18 +589,147 @@ impl<V> KeyIndex<V> {
 	}
 }
 
-/// A key of a [`KeyIndex`], which the index finds by its canonical DER.
+/// A key of a [`KeyIndex`] or a [`KeyList`], which each finds by its
+/// canonical DER.
 ///
-/// It hashes and compares as its DER, so [`Borrow`] keeps the contract of a
-/// map that finds it by that DER.
-#[cfg(feature = "std")]
-#[derive(Debug, PartialEq, Eq, Hash)]
+/// It hashes, compares, and orders as its DER, so [`Borrow`] keeps the
+/// contract of a map or a set that finds it by that DER.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct IndexedKey(CanonicalKey);
 
-#[cfg(feature = "std")]
 impl Borrow<[u8]> for IndexedKey {
 	fn borrow(&self) -> &[u8] {
 		self.0.as_der()
+	}
+}
+
+impl Ord for IndexedKey {
+	fn cmp(&self, other: &Self) -> Ordering {
+		self.0.as_der().cmp(other.0.as_der())
+	}
+}
+
+impl PartialOrd for IndexedKey {
+	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+		Some(self.cmp(other))
+	}
+}
+
+/// Why a list of keys, each the DER of a SubjectPublicKeyInfo, is refused.
+///
+/// A pin list and a peer list each read their entries through one parse, so
+/// both refuse the same entries. Each variant names the entry by its position
+/// in the list, so the operator can find it. A list that holds a key no
+/// certificate can match would let the peer it meant to name pass a deny
+/// list, so the whole list is refused.
+#[derive(Errorizable, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyListError {
+	/// The entry is no SubjectPublicKeyInfo DER, or its canonical form
+	/// exceeds the DER length cap.
+	#[error("Key list entry {index} is no SubjectPublicKeyInfo")]
+	Unreadable {
+		/// The position of the entry in the list.
+		index: usize,
+	},
+	/// The entry names an elliptic-curve key that reads as no point, which is
+	/// one of these:
+	///
+	/// - A malformed point, or a form that RFC 5480 §2.2 refuses.
+	/// - An encoding that the decoder of its curve refuses.
+	/// - A key with no named curve.
+	/// - A key on a binary-field curve of SEC 2 or ANSI X9.62.
+	/// - A key under `id-ecDH` or `id-ecMQV` (RFC 5480 §2.1.2).
+	///
+	/// The handshake refuses every peer that holds one.
+	#[error("Key list entry {index} names an elliptic-curve key that is no point")]
+	NoPoint {
+		/// The position of the entry in the list.
+		index: usize,
+	},
+	/// The entry names a point on a named curve that the [`KeyCurves`] of the
+	/// list holds no decoder for, so the list cannot tell the point from an
+	/// off-curve encoding of another key. A set that holds a decoder of the
+	/// curve reads the entry.
+	#[error("Key list entry {index} names a curve the list holds no decoder for")]
+	NoDecoder {
+		/// The position of the entry in the list.
+		index: usize,
+	},
+}
+
+/// A list of keys, each read once from the DER of a SubjectPublicKeyInfo by
+/// the rule of [`CanonicalKey`], under the decoders of one [`KeyCurves`].
+///
+/// [`PublicKeyPinning`] and [`PeerListGate`] each hold one, so a pin and a
+/// peer-list entry name a key with its algorithm and its curve. A lookup
+/// writes the canonical DER of the key it looks for on the stack.
+///
+/// [`PeerListGate`]: crate::colony::hive::PeerListGate
+/// [`PublicKeyPinning`]: crate::crypto::x509::policy::PublicKeyPinning
+#[derive(Clone, Debug)]
+pub(crate) struct KeyList {
+	/// Each listed key, found by its canonical DER.
+	keys: BTreeSet<IndexedKey>,
+	/// The decoders the list reads each entry and each looked-up key under.
+	curves: KeyCurves,
+}
+
+impl KeyList {
+	/// The list of `keys`, each the DER of a SubjectPublicKeyInfo, read in
+	/// place under `curves`.
+	///
+	/// # Errors
+	///
+	/// - [`KeyListError::Unreadable`] -- an entry is no SubjectPublicKeyInfo
+	///   DER, or its canonical form exceeds the DER length cap.
+	/// - [`KeyListError::NoPoint`] -- an entry names an elliptic-curve key that reads as no point.
+	/// - [`KeyListError::NoDecoder`] -- an entry names a point on a curve that `curves` holds no decoder for.
+	pub(crate) fn read<I, K>(curves: KeyCurves, keys: I) -> Result<Self, KeyListError>
+	where
+		I: IntoIterator<Item = K>,
+		K: AsRef<[u8]>,
+	{
+		let read = |(index, der): (usize, K)| Self::entry(index, der.as_ref(), curves);
+		let keys = keys.into_iter().enumerate().map(read);
+		let keys = keys.collect::<Result<BTreeSet<_>, _>>()?;
+		Ok(Self { keys, curves })
+	}
+
+	/// The canonical form of the key of `der`, the SubjectPublicKeyInfo DER at
+	/// `index` of the list, read in place under `curves`.
+	///
+	/// # Errors
+	///
+	/// - The errors of [`Self::read`], for the entry at `index`.
+	fn entry(index: usize, der: &[u8], curves: KeyCurves) -> Result<IndexedKey, KeyListError> {
+		let unreadable = KeyListError::Unreadable { index };
+		let spki = SubjectPublicKeyInfoRef::from_der(der).map_err(|_| unreadable)?;
+		let identity = KeyIdentity::read(spki, curves);
+		if identity.names_no_point() {
+			return Err(KeyListError::NoPoint { index });
+		}
+		if identity.names_an_undecoded_curve() {
+			return Err(KeyListError::NoDecoder { index });
+		}
+
+		let key = identity.to_canonical().map_err(|_| unreadable)?;
+		Ok(IndexedKey(key))
+	}
+
+	/// Whether the list holds `key`, a canonical form a session holds.
+	#[cfg(feature = "colony")]
+	pub(crate) fn contains(&self, key: &CanonicalKey) -> bool {
+		self.keys.contains(key.as_der())
+	}
+
+	/// Whether the list holds the key that `spki` holds, read under the curves
+	/// of the list, in either SEC 1 form of its point.
+	pub(crate) fn holds(&self, spki: &SubjectPublicKeyInfoOwned) -> bool {
+		let identity = KeyIdentity::of(spki, self.curves);
+		let found = identity.lend(|der| self.keys.contains(der));
+		// A key whose canonical form the encoder refuses names no listed key,
+		// so the lookup finds nothing.
+		found.unwrap_or(false)
 	}
 }
 
@@ -692,6 +795,11 @@ mod tests {
 		let negation = TestKey::negation_of(&TestKey::insecure_fixed_signing());
 		let certificate = TestCertificate::self_signed(&negation);
 		certificate.tbs_certificate.subject_public_key_info
+	}
+
+	/// The DER of `spki`, the form a list names a key in.
+	fn der_of(spki: &SubjectPublicKeyInfoOwned) -> Vec<u8> {
+		spki.to_der().expect("a test SubjectPublicKeyInfo encodes")
 	}
 
 	/// [`uncompressed`] under the named curve `curve`.
@@ -995,8 +1103,8 @@ mod tests {
 		Ok(())
 	}
 
-	/// A key index returns the value that the key it indexes again, in its
-	/// other SEC 1 form, held before.
+	/// A key index that indexes a key again, in its other SEC 1 form, returns
+	/// the value that the key held before.
 	#[test]
 	fn an_index_returns_the_value_it_replaces() -> Result<(), Error> {
 		let mut index = KeyIndex::default();
@@ -1055,61 +1163,67 @@ mod tests {
 		Ok(())
 	}
 
-	/// A key holds no point of its negation, whose x-coordinate it shares.
+	/// A list of the negation of a key holds no point of that key, whose
+	/// x-coordinate the negation shares.
 	#[test]
-	fn a_key_holds_no_point_of_its_negation() {
-		let negated = negated();
-		let uncompressed = uncompressed();
+	fn a_list_of_the_negation_holds_no_point_of_the_key() -> Result<(), KeyListError> {
+		let list = KeyList::read(KeyCurves::HOUSE, [der_of(&negated())])?;
 
-		let bits = negated.subject_public_key.raw_bytes();
-		assert!(!KeyIdentity::of(&uncompressed, KeyCurves::HOUSE).holds(bits));
+		assert!(!list.holds(&uncompressed()));
+		Ok(())
 	}
 
-	/// The key holds its point in the other form, the octets a pin names.
+	/// A list of the compressed form of a point holds the point in its
+	/// uncompressed form.
 	#[test]
-	fn a_key_holds_its_point_in_the_other_form() {
-		let compressed = compressed();
-		let uncompressed = uncompressed();
+	fn a_list_holds_its_point_in_the_other_form() -> Result<(), KeyListError> {
+		let list = KeyList::read(KeyCurves::HOUSE, [der_of(&compressed())])?;
 
-		let bits = compressed.subject_public_key.raw_bytes();
-		assert!(KeyIdentity::of(&uncompressed, KeyCurves::HOUSE).holds(bits));
+		assert!(list.holds(&uncompressed()));
+		Ok(())
 	}
 
-	/// A key reads a pin under the curves it was read under, so a key read
-	/// with no decoder of secp256k1 holds an off-curve alias of its point.
+	/// A list read with no decoder of secp256k1 cannot tell a point of that
+	/// curve from an off-curve alias, so it refuses the entry with its index.
 	#[test]
-	fn a_key_reads_a_pin_under_its_own_curves() {
-		let alias = off_curve_alias();
-		let uncompressed = uncompressed();
-
-		let bits = alias.subject_public_key.raw_bytes();
-		assert!(KeyIdentity::of(&uncompressed, NO_DECODER).holds(bits));
+	fn a_list_with_no_decoder_of_a_curve_refuses_its_point() {
+		let refused = KeyList::read(NO_DECODER, [der_of(&uncompressed())]);
+		assert_eq!(refused.err(), Some(KeyListError::NoDecoder { index: 0 }));
 	}
 
-	/// A key of another algorithm reads its BIT STRING whole, so the octets
-	/// of its point in another form name another key.
+	/// A key of another algorithm is another key, though its BIT STRING
+	/// holds the octets of a listed point.
 	#[test]
-	fn a_key_of_another_algorithm_holds_its_bits_alone() {
-		let compressed = compressed();
+	fn a_list_holds_no_key_of_another_algorithm() -> Result<(), KeyListError> {
+		let list = KeyList::read(KeyCurves::HOUSE, [der_of(&uncompressed())])?;
 		let mut other = uncompressed();
 		other.algorithm.oid = ID_ED_25519;
 
-		let bits = compressed.subject_public_key.raw_bytes();
-		assert!(!KeyIdentity::of(&other, KeyCurves::HOUSE).holds(bits));
+		assert!(!list.holds(&other));
+		Ok(())
 	}
 
-	/// A key of another algorithm holds the octets of its own BIT STRING.
+	/// A list of a key of another algorithm holds that key by its bits.
 	#[test]
-	fn a_key_of_another_algorithm_holds_its_own_bits() {
+	fn a_list_holds_a_key_of_another_algorithm_by_its_bits() -> Result<(), KeyListError> {
 		let ed25519 = under(ID_ED_25519);
+		let list = KeyList::read(KeyCurves::HOUSE, [der_of(&ed25519)])?;
 
-		let bits = ed25519.subject_public_key.raw_bytes();
-		assert!(KeyIdentity::of(&ed25519, KeyCurves::HOUSE).holds(bits));
+		assert!(list.holds(&ed25519));
+		Ok(())
+	}
+
+	/// An entry that is no SubjectPublicKeyInfo refuses the list with its
+	/// index.
+	#[test]
+	fn a_list_refuses_an_unreadable_entry_with_its_index() {
+		let refused = KeyList::read(KeyCurves::HOUSE, [der_of(&uncompressed()), b"no key".to_vec()]);
+		assert_eq!(refused.err(), Some(KeyListError::Unreadable { index: 1 }));
 	}
 
 	/// An encoding of the x-coordinate and the y parity of the fixed key that
-	/// is no point of its curve reads as its bits, so it is another key (SEC 1
-	/// v2.0 §2.3.4).
+	/// is no point of its curve reads as its bits, so it is another key
+	/// (SEC 1 v2.0 §2.3.4).
 	#[test]
 	fn an_off_curve_alias_of_a_point_is_another_key() -> Result<(), Error> {
 		let alias = off_curve_alias();

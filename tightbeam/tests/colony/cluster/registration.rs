@@ -33,6 +33,10 @@ impl ServletBox for StopProbeServlet {
 			.event(SERVLET_STOPPED)
 			.expect("recording the servlet stop is what this probe exists to do");
 	}
+
+	fn signer(&self) -> Option<&SignerIdentifier> {
+		None
+	}
 }
 
 // Environment teardown must run `Hive::stop`, which drains registered
@@ -212,8 +216,7 @@ fn hive_lease(cluster: &ClusterGateway) -> MonotonicInstant {
 //
 // The claim is proven on the beat that does run:
 //
-// - A second gateway admits the hive, and the hive's beat re-registers with
-//   the gateways it queued.
+// - A second gateway admits the hive, and the hive's beat re-registers with the gateways it queued.
 // - A re-registration stamps a fresh lease on the gateway's clock, which the
 //   test has moved, so the renewed lease is the beat's footprint.
 // - The hive dials queued gateways in the order it queued them, so a
@@ -259,7 +262,7 @@ tb_scenario! {
 
 			// The hive's beat re-announces to every gateway it queued, and
 			// the accepting gateway stamps the renewed lease on the clock
-			// the test just moved.
+			// the test advances.
 			clock.advance(Duration::from_millis(50));
 			let renewed = poll_until(50, Duration::from_millis(20), || hive_lease(&accepting) > first_lease).await;
 			trace.event_with(BEAT_REREGISTERED, &[], u64::from(renewed))?;
@@ -600,7 +603,7 @@ tb_assert_spec! {
 // Eviction ordering: a hive can only be evicted after it registered.
 // The client-side REJECTED_HEARTBEAT_DECODED marker stays out of the
 // alphabet because the heartbeat task fires the eviction event after the
-// registry empties, racing the client's poll.
+// registry empties, and that event races the client's poll.
 tb_process_spec! {
 	pub ClusterEvictionProcess,
 	events {
@@ -619,7 +622,7 @@ tb_process_spec! {
 }
 
 /// A heartbeat-eviction fixture. The heartbeat callback, set in `start`,
-/// records whether a decoded rejected heartbeat was observed. The client
+/// records whether it saw a rejected heartbeat that decoded. The client
 /// surfaces that flag as a valued event the spec pins after eviction.
 struct HeartbeatRejectionContext {
 	certs: ClusterTestCerts,
@@ -731,6 +734,174 @@ fn dual_hive_certs() -> DualHiveCerts {
 	);
 
 	DualHiveCerts { gateway, hive_a: (cert_a, key_a), hive_b: (cert_b, key_b), hive_trust }
+}
+
+/// Starts a hive whose control plane answers under hive B's identity and
+/// admits the gateway's commands, so a heartbeat that reaches it is answered.
+async fn start_hive_b(certs: &DualHiveCerts, trace: &TraceCollector) -> Result<ClusterTestHive, TightBeamError> {
+	let (cert, key) = &certs.hive_b;
+	let spec = CertificateSpec::Built(Box::new(cert.to_owned()));
+	let hive_tls = HiveTlsConfig::new(spec, Arc::new(Secp256k1KeyProvider::from(key.to_owned())), vec![])?;
+	let trust_store = Some(Arc::clone(&certs.gateway.trust));
+	let conf = HiveConfig { hive_tls: Some(Arc::new(hive_tls)), trust_store, ..Default::default() };
+
+	let mut hive = ClusterTestHive::new(Some(conf))?;
+	hive.establish(Arc::new(trace.share())).await?;
+	Ok(hive)
+}
+
+/// Registers the control address of `hive` under hive A's signature, so the
+/// registration names an identity other than the one that answers there.
+async fn register_under_hive_a(
+	certs: &DualHiveCerts,
+	cluster: &ClusterGateway,
+	hive: &ClusterTestHive,
+) -> Result<RegisterHiveResponse, TightBeamError> {
+	let hive_addr = hive.addr().ok_or(TightBeamError::NotEstablished)?.to_string();
+	let mut client = connect_cluster(&certs.gateway, cluster.addr()).await?;
+
+	register_signed_hive(&mut client, &certs.hive_a.1, b"reg-b-as-a", hive_addr).await
+}
+
+tb_assert_spec! {
+	pub ClusterHeartbeatBindingSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(REGISTER_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
+			(HEARTBEAT_PEER_MISMATCH, exactly!(1), equals!(true)),
+			(events::CLUSTER_DIAL_REFUSED, at_least!(1))
+		]
+	}
+}
+
+// A heartbeat is bound to the identity that signed the hive's registration
+// (CWE-346). Hive A registers the control address where hive B answers, so
+// the heartbeat finds another identity there and ends before its command
+// leaves.
+tb_scenario! {
+	name: cluster_heartbeat_refuses_a_hive_answering_under_another_identity,
+	spec: ClusterHeartbeatBindingSpec,
+	environment Cluster {
+		context: dual_hive_certs(),
+		start: |SetupEnv { trace, context: certs }| async move {
+			let tls = cluster_tls_config_with_trust(&certs.gateway, Some(Arc::clone(&certs.hive_trust)));
+			start_cluster(&trace, ClusterConfig::new(tls)).await
+		},
+		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+			let hive = start_hive_b(&certs, &trace).await?;
+			let hive_addr = *hive.addr().ok_or(TightBeamError::NotEstablished)?;
+			let response = register_under_hive_a(&certs, &cluster, &hive).await?;
+			trace.event_with(REGISTER_STATUS, &[], response.status)?;
+
+			let refused = cluster.send_heartbeat(hive_addr).await;
+			trace.event_with(HEARTBEAT_PEER_MISMATCH, &[], matches!(refused, Err(ClusterError::PeerMismatch)))?;
+
+			hive.stop();
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterHeartbeatUnregisteredSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(HEARTBEAT_UNREGISTERED_REFUSED, exactly!(1), equals!(true)),
+			(events::CLUSTER_DIAL_REFUSED, exactly!(0))
+		]
+	}
+}
+
+// A heartbeat names the hive by its registration, so a heartbeat to an
+// address with no registration is refused before any dial.
+tb_scenario! {
+	name: cluster_heartbeat_refuses_an_address_no_hive_registered,
+	spec: ClusterHeartbeatUnregisteredSpec,
+	environment Cluster {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| async move {
+			start_cluster(&trace, ClusterConfig::new(cluster_tls_config(&certs))).await
+		},
+		client: |ClusterEnv { trace, cluster, .. }| async move {
+			let unregistered = *cluster.addr();
+
+			let refused = cluster.send_heartbeat(unregistered).await;
+			let unregistered_refused = matches!(refused, Err(ClusterError::InvalidAddress(_)));
+			trace.event_with(HEARTBEAT_UNREGISTERED_REFUSED, &[], unregistered_refused)?;
+
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterHeartbeatBindingEvictionSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(REGISTER_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
+			(REGISTRY_EMPTIED, exactly!(1), equals!(1u64)),
+			(HEARTBEAT_ANSWER_DECODED, exactly!(1), equals!(0u64)),
+			(events::CLUSTER_DIAL_REFUSED, at_least!(1)),
+			(events::CLUSTER_HIVE_EVICTED, exactly!(1))
+		]
+	}
+}
+
+/// The heartbeat-binding fixture, with a flag the heartbeat callback raises
+/// when a hive's answer decoded.
+struct HeartbeatBindingContext {
+	certs: DualHiveCerts,
+	answer_decoded: AtomicBool,
+}
+
+// The background beat keeps a hive alive on its own identity's answer alone.
+// Hive B admits the gateway's heartbeat, and the beat ends each dial to it
+// before the command leaves, so the hive leaves at its first failed beat with
+// no answer decoded.
+tb_scenario! {
+	name: cluster_heartbeat_keeps_no_hive_alive_on_another_identity,
+	spec: ClusterHeartbeatBindingEvictionSpec,
+	environment Cluster {
+		context: HeartbeatBindingContext { certs: dual_hive_certs(), answer_decoded: AtomicBool::new(false) },
+		start: |SetupEnv { trace, context: binding }| async move {
+			let callback_binding = Arc::clone(&binding);
+			let heartbeat = HeartbeatConfig::builder()
+				.with_interval(Duration::from_millis(100))
+				.with_max_failures(1)
+				.with_callback(Arc::new(move |event| {
+					// `utilization` is `Some` only when the hive's answer
+					// decoded, so it marks a heartbeat that reached a hive.
+					let decoded = event.utilization.is_some();
+					callback_binding.answer_decoded.fetch_or(decoded, Ordering::SeqCst);
+				}))
+				.build();
+
+			let hive_trust = Some(Arc::clone(&binding.certs.hive_trust));
+			let tls = cluster_tls_config_with_trust(&binding.certs.gateway, hive_trust);
+			let conf = ClusterConfig::builder(tls).with_heartbeat_config(heartbeat).build();
+			start_cluster(&trace, conf).await
+		},
+		client: |ClusterEnv { trace, context: binding, cluster }| async move {
+			let hive = start_hive_b(&binding.certs, &trace).await?;
+			let response = register_under_hive_a(&binding.certs, &cluster, &hive).await?;
+			trace.event_with(REGISTER_STATUS, &[], response.status)?;
+
+			let emptied = wait_for_empty_registry(&cluster, 50, Duration::from_millis(100)).await;
+			trace.event_with(REGISTRY_EMPTIED, &[], u64::from(emptied))?;
+
+			let decoded = binding.answer_decoded.load(Ordering::SeqCst);
+			trace.event_with(HEARTBEAT_ANSWER_DECODED, &[], u64::from(decoded))?;
+
+			hive.stop();
+			cluster.stop();
+			Ok(())
+		}
+	}
 }
 
 tb_assert_spec! {
@@ -997,7 +1168,7 @@ tb_process_spec! {
 
 // A signed update that removes an instance URN unroutes it: work for
 // the type routed before the removal and is Unavailable after. A
-// removal naming a foreign realm is refused wholesale.
+// removal that names a foreign realm is refused wholesale.
 tb_scenario! {
 	name: cluster_removal_update_unroutes_instance,
 	config: ScenarioConfig::builder()
@@ -1059,8 +1230,8 @@ tb_assert_spec! {
 	}
 }
 
-// Admitting a hive the heartbeat cannot dial would leave it to expire at the
-// lease timeout with no refusal to show for it.
+// A gateway that admitted a hive the heartbeat cannot dial would leave it to
+// expire at the lease timeout with no refusal to show for it.
 tb_scenario! {
 	name: cluster_refuses_a_hive_whose_control_address_the_protocol_cannot_dial,
 	spec: ClusterUndialableHiveSpec,

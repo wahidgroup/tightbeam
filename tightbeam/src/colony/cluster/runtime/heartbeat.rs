@@ -5,83 +5,70 @@
 //! the registries, and the loop that evaporates pheromone and prunes stale
 //! relay trails.
 
-use core::hash::Hash;
-use core::str::FromStr;
 use core::time::Duration;
 use std::sync::Arc;
 
 use crate::builder::frame::FrameBuilder;
 use crate::builder::TypeBuilder;
-use crate::colony::cluster::runtime::bounds::{ClusterDigest, ClusterPool, GatewayRuntimeCtx};
+use crate::colony::cluster::runtime::bounds::{ClusterDigest, ColonyDialProtocol, GatewayRuntimeCtx};
+use crate::colony::cluster::runtime::hop::HivePlane;
 use crate::colony::cluster::runtime::LoopFault;
-use crate::colony::cluster::{ClusterConfig, ClusterError, HeartbeatEvent};
+use crate::colony::cluster::{ClusterConfig, ClusterError, HeartbeatEvent, HiveEntry};
 use crate::colony::common::{
 	ClusterCommand, ClusterCommandKind, ClusterCommandOutcome, ClusterCommandResponse, ClusterStatus, HeartbeatParams,
 	HeartbeatResult,
 };
-use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::decode;
 use crate::instrumentation::events::{CLUSTER_HIVE_EVICTED, CLUSTER_RELAY_TRAIL_PRUNED};
 use crate::policy::TransitStatus;
 use crate::runtime::rt;
-use crate::transport::messaging::{MessageCollector, MessageEmitter};
-use crate::transport::multiplex::MuxConnector;
-use crate::transport::policy::PolicyConfig;
-use crate::transport::state::EncryptedProtocolState;
-use crate::transport::{EncryptedProtocol, PersistentConnection, Protocol};
+use crate::transport::Protocol;
 use crate::TightBeamError;
 use crate::{MessagePriority, Version};
 
-/// The dial half of a heartbeat: the signing key and the pool to send on.
+/// The dial half of a heartbeat: the signing key and the plane to send on.
 ///
 /// Both the background beat and [`ClusterHeartbeat::send_heartbeat`]
 /// reach a hive through this one composer, so a probe from either side
-/// carries the same command, version, and freshness binding.
+/// carries the same command, version, freshness binding, and [`BoundDial`].
 ///
-/// [`ClusterHeartbeat::send_heartbeat`]:
-/// crate::colony::cluster::ClusterHeartbeat::send_heartbeat
+/// [`ClusterHeartbeat::send_heartbeat`]: crate::colony::cluster::ClusterHeartbeat::send_heartbeat
+/// [`BoundDial`]: crate::colony::bound_dial::BoundDial
 pub(crate) struct HiveBeat<P: Protocol> {
 	config: Arc<ClusterConfig>,
-	pool: Arc<ClusterPool<P>>,
+	/// The plane the probe dials on, which records a dial the hive's answer
+	/// refused.
+	plane: HivePlane<P>,
 }
 
-impl<P> HiveBeat<P>
-where
-	P: Protocol
-		+ PersistentConnection
-		+ EncryptedProtocol<CryptoProvider = DefaultCryptoProvider>
-		+ Send
-		+ Sync
-		+ 'static,
-	P::Address: Hash + Eq + Clone + Send + Sync + FromStr + 'static,
-	P::Transport: MessageEmitter
-		+ MessageCollector
-		+ PolicyConfig
-		+ MuxConnector
-		+ EncryptedProtocolState
-		+ Send
-		+ Sync
-		+ 'static,
-{
-	/// Signs with `config`'s identity and dials over `pool`.
-	pub(crate) fn new(config: &Arc<ClusterConfig>, pool: &Arc<ClusterPool<P>>) -> Self {
-		Self { config: Arc::clone(config), pool: Arc::clone(pool) }
+impl<P: ColonyDialProtocol> HiveBeat<P> {
+	/// A composer that signs with `config`'s identity and dials on `plane`.
+	pub(crate) fn new(config: &Arc<ClusterConfig>, plane: &HivePlane<P>) -> Self {
+		Self { config: Arc::clone(config), plane: plane.clone() }
 	}
 
-	/// Sends one signed heartbeat command to a hive and decodes its answer.
+	/// Sends one signed heartbeat command to `hive` and decodes its answer.
+	///
+	/// The dial is [`HivePlane::hive`], so the command leaves only toward the
+	/// identity that signed the hive's registration (CWE-346).
 	///
 	/// # Errors
 	///
+	/// - [`ClusterError::PeerMismatch`] -- another identity answered at the hive's address.
+	/// - [`ClusterError::InvalidAddress`] -- the hive's address does not parse
+	///   as an address of this protocol.
+	/// - [`ClusterError::ConnectFailed`] -- the dial or the handshake failed.
 	/// - [`ClusterError::NoResponse`] -- the hive closed without answering.
 	/// - [`ClusterError::MalformedResponse`] -- the answer carried no heartbeat result.
-	/// - [`ClusterError::Transport`] -- the dial or the emit failed.
-	/// - [`ClusterError::Frame`] -- the frame failed to build, sign, or decode.
-	pub(crate) async fn send<D: ClusterDigest>(self, addr: P::Address) -> Result<HeartbeatResult, ClusterError> {
+	/// - [`ClusterError::Transport`] -- the emit failed.
+	/// - [`ClusterError::Frame`] -- the frame failed to build, sign, or decode,
+	///   or the trace refused the event of a refused dial.
+	pub(crate) async fn send<D: ClusterDigest>(self, hive: &HiveEntry) -> Result<HeartbeatResult, ClusterError> {
 		let probe = ClusterCommandKind::Heartbeat(HeartbeatParams { cluster_status: ClusterStatus::Healthy });
 		let cmd = ClusterCommand::from(probe);
 
 		// Priority is a V2+ metadata field. Composing it on V1 fails at
-		// build time and every heartbeat would count as a send failure.
+		// build time, so every heartbeat would count as a send failure.
 		// `metadata.order` is the command freshness binding (CWE-294).
 		let mut signed_frame = FrameBuilder::from(Version::V2)
 			.with_id(b"heartbeat")
@@ -93,7 +80,7 @@ where
 
 		signed_frame.sign_with_provider(self.config.tls.identity()).await?;
 
-		let mut client = self.pool.connect(addr).await?;
+		let mut client = self.plane.hive(hive).connect().await?;
 		let response = client.emit(signed_frame, None).await?.ok_or(ClusterError::NoResponse)?;
 
 		let cmd_response: ClusterCommandResponse = decode(response.message())?;
@@ -104,32 +91,15 @@ where
 	}
 }
 
-impl<P> GatewayRuntimeCtx<P>
-where
-	P: Protocol
-		+ PersistentConnection
-		+ EncryptedProtocol<CryptoProvider = DefaultCryptoProvider>
-		+ Send
-		+ Sync
-		+ 'static,
-	P::Address: Hash + Eq + Clone + Send + Sync + FromStr + 'static,
-	P::Transport: MessageEmitter
-		+ MessageCollector
-		+ PolicyConfig
-		+ MuxConnector
-		+ EncryptedProtocolState
-		+ Send
-		+ Sync
-		+ 'static,
-{
-	/// Dials one hive and settles the answer against `hive_addr`.
+impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
+	/// Dials one hive and settles the answer against its address.
 	///
 	/// A dial fault is this hive's answer and settles as a failed beat, so
 	/// every other hive in the interval still settles and the next interval
 	/// retries this one. A registry fault is the loop's to end on.
-	async fn beat_hive<D: ClusterDigest>(self, hive_addr: Arc<[u8]>, addr: P::Address) -> Result<(), LoopFault> {
-		let result = HiveBeat::new(&self.config, &self.pool).send::<D>(addr).await;
-		self.settle_heartbeat(hive_addr, result)
+	async fn beat_hive<D: ClusterDigest>(self, hive: HiveEntry) -> Result<(), LoopFault> {
+		let result = HiveBeat::new(&self.config, &self.hive_plane).send::<D>(&hive).await;
+		self.settle_heartbeat(hive.address, result)
 	}
 
 	/// Settles one heartbeat outcome against the registries.
@@ -221,13 +191,12 @@ where
 					let max_concurrent = config.heartbeat.max_concurrent;
 					let mut set = tokio::task::JoinSet::new();
 
-					let tasks: Vec<_> = hives.into_iter().filter_map(|hive| hive.dial_target()).collect();
-					for (hive_addr, addr) in tasks {
+					for hive in hives {
 						while set.len() >= max_concurrent {
 							Self::settle_joined(set.join_next().await)?;
 						}
 
-						set.spawn(beat_ctx.clone().beat_hive::<D>(hive_addr, addr));
+						set.spawn(beat_ctx.clone().beat_hive::<D>(hive));
 					}
 
 					while let Some(joined) = set.join_next().await {

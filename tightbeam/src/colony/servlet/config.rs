@@ -2,6 +2,7 @@ use core::marker::PhantomData;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::cms::signed_data::SignerIdentifier;
 use crate::colony::hive::HiveContext;
 use crate::colony::servlet::runtime;
 use crate::colony::servlet::WorkerBox;
@@ -24,10 +25,10 @@ use crate::transport::TransportEncryptionConfig;
 
 /// How a servlet accepts connections.
 ///
-/// A multiplexing advertisement is bound into the handshake transcript, so
-/// it exists only where there is a handshake. The encrypted arm carries it,
-/// so a cleartext servlet that advertises multiplexing is unrepresentable
-/// rather than silently ignored.
+/// The handshake binds a multiplexing advertisement into its transcript, so
+/// the advertisement exists only where a handshake exists. The encrypted arm
+/// carries it, so a cleartext servlet that advertises multiplexing is
+/// unrepresentable rather than silently ignored.
 pub enum ServletAccept<C: CryptoProvider> {
 	/// The servlet accepts cleartext connections without multiplexing.
 	Cleartext,
@@ -41,12 +42,21 @@ pub enum ServletAccept<C: CryptoProvider> {
 }
 
 impl<C: CryptoProvider> ServletAccept<C> {
+	/// The [`SignerIdentifier`] that names the certificate this servlet
+	/// presents in its handshake (RFC 5652 §5.3), or [`None`] in the clear.
+	pub(crate) fn signer(&self) -> Option<&SignerIdentifier> {
+		match self {
+			Self::Cleartext => None,
+			Self::Encrypted { encryption, .. } => Some(encryption.identity.signing().signer_identifier()),
+		}
+	}
+
 	/// Bind a listener of `P` on `addr` the way this servlet accepts: under
 	/// its transport encryption, or in the clear.
 	///
 	/// # Errors
 	///
-	/// The protocol's error when the bind fails.
+	/// - `P::Error` -- the protocol fails to bind the listener.
 	pub(crate) async fn bind<P>(self, addr: P::Address) -> Result<(P::Listener, P::Address), P::Error>
 	where
 		P: EncryptedProtocol<CryptoProvider = C>,
@@ -98,13 +108,13 @@ pub(crate) mod sealed {
 /// [`Cleartext`] and [`WithCertificate`].
 ///
 /// The state carries the accept material itself, so the builder holds the
-/// certificate and the mux offer in exactly one place and `build` reads
-/// the state rather than re-deriving it.
+/// certificate and the mux offer in exactly one place, and
+/// [`ServletConfigBuilder::build`] reads the state rather than re-deriving it.
 pub trait AcceptState<C: CryptoProvider>: sealed::Sealed<C> {}
 
-/// The state of a fresh builder, ahead of a certificate or the word for
-/// cleartext. `build` exists on the two [`AcceptState`] types alone, so the
-/// compiler refuses a configuration that names neither.
+/// The state of a fresh builder, before it names a certificate or cleartext.
+/// [`ServletConfigBuilder::build`] exists on the two [`AcceptState`] types
+/// alone, so the compiler refuses a configuration that names neither.
 #[derive(Default)]
 pub struct NoAcceptState;
 
@@ -265,13 +275,16 @@ where
 	}
 
 	/// Splits the config into the accept state, which binds the listener, and
-	/// the parts the accept loop keeps.
+	/// the parts the accept loop keeps, the signer the listener presents
+	/// among them.
 	///
 	/// The split happens once, so the encryption and the offer it was paired
 	/// with always leave together.
 	pub(crate) fn into_bind_parts(self) -> (ServletAccept<C>, runtime::ServletRuntimeParts<Env>) {
 		let mux_offer = self.mux_offer();
+		let signer = self.accept.signer().cloned();
 		let parts = runtime::ServletRuntimeParts {
+			signer,
 			env_config: self.servlet_config,
 			collector_gates: self.collector_gates,
 			mux_offer,
@@ -322,8 +335,8 @@ where
 {
 	/// Sets the application env config.
 	///
-	/// This names the servlet's env type, so the handlers that read it and
-	/// the config that carries it are checked against each other.
+	/// This names the servlet's env type, so the compiler checks the handlers
+	/// that read it against the config that carries it.
 	#[must_use]
 	pub fn with_config<NewEnv>(self, config: Arc<NewEnv>) -> ServletConfigBuilder<P, M, C, NewEnv, A> {
 		ServletConfigBuilder {
@@ -341,7 +354,7 @@ where
 
 	/// Sets the clock the servlet's accept loop paces its retries on.
 	///
-	/// A builder that never sets one uses [`SystemClock`].
+	/// The clock defaults to [`SystemClock`].
 	#[must_use]
 	pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
 		self.clock = clock;
@@ -440,10 +453,14 @@ where
 {
 	/// Names cleartext as the intent of this servlet.
 	///
-	/// Its frames then travel in the clear and it accepts every client that
-	/// connects, which suits a loopback fixture or a link a lower layer
-	/// already secures. `build` exists after this call, after
-	/// [`Self::with_certificate`], or after [`Self::with_identity`].
+	/// - Its frames travel in the clear, and it accepts every client that connects.
+	/// - It suits a loopback fixture or a link a lower layer already secures.
+	/// - It names no signer, so its hive gives it no route ([`ServletBox::signer`]).
+	///
+	/// `build` exists after this call, after [`Self::with_certificate`], or
+	/// after [`Self::with_identity`].
+	///
+	/// [`ServletBox::signer`]: crate::colony::hive::ServletBox::signer
 	#[must_use]
 	pub fn allow_cleartext(self) -> ServletConfigBuilder<P, M, C, Env, Cleartext> {
 		self.with_accept(Cleartext)
@@ -499,7 +516,7 @@ where
 {
 	/// Advertises multiplexing on accepted connections.
 	///
-	/// The offer is bound into the handshake transcript, so this exists
+	/// The handshake binds the offer into its transcript, so this exists
 	/// only after [`ServletConfigBuilder::with_certificate`] or
 	/// [`ServletConfigBuilder::with_identity`] has put the builder in the
 	/// [`WithCertificate`] state, and it lands beside the certificate it binds

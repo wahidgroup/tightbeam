@@ -41,6 +41,8 @@ use crate::cms::signed_data::{
 use crate::crypto::hash::Digest;
 use crate::crypto::policy::{CanonicalForm, ProviderPolicy, VerificationPolicy, VerifiedSignature};
 use crate::crypto::profiles::SigningProvider;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::crypto::sign::PresentedPath;
 use crate::crypto::sign::{
 	CertifiedKey, PrehashSigner, PrehashVerifier, SignatureAlgorithmIdentifier, SignatureEncoding, SignerError,
 };
@@ -724,84 +726,129 @@ impl CmsSigner {
 		Ok(named.map(|(certificate, ())| certificate))
 	}
 
-	/// The certificate the one signer of `signed_data` names by its `sid`,
-	/// parsed from `der`, the encoding `signed_data` decoded from, beside the
-	/// bytes it arrived as, or `None` when the set holds no such certificate.
+	/// The certification path the one signer of `signed_data` presents, and
+	/// the bytes of its `certificates` field as they arrived in `der`, the
+	/// encoding `signed_data` decoded from. It is `None` when the set holds no
+	/// certificate the signer names.
 	///
-	/// Both come from one element of the received set, so a reader that binds
-	/// the bytes binds the certificate it keeps, and a decoder that normalizes
-	/// an encoding changes no byte the binding covers (CWE-345).
+	/// - The leaf is the certificate the `sid` names (RFC 5652 §5.3), and
+	///   [`PresentedPath::walk`] takes each issuer above it by name.
+	/// - Every certificate parses from the bytes it arrived as, so a reader
+	///   that binds the field binds the path it keeps, and a decoder that
+	///   normalizes an encoding changes no byte the binding covers (CWE-345).
 	///
 	/// # Errors
 	///
 	/// - [`SignerError::SignerIdentifier`] -- `signed_data` does not have exactly one signer.
-	/// - [`SignerError::Certificate`] -- a certificate's key identifier fails to decode.
+	/// - [`SignerError::Certificate`] -- the set holds more than
+	///   [`MAX_PRESENTED_PATH`](crate::constants::MAX_PRESENTED_PATH)
+	///   certificates, which the reader refuses before it walks a path or
+	///   checks a signature, a certificate's key identifier fails to decode,
+	///   or the walk refuses the path.
 	/// - [`SignerError::Encoding`] -- `der` is no SEQUENCE of elements.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-	pub(crate) fn signer_certificate_der<'a>(
+	pub(crate) fn signer_path<'a>(
 		signed_data: &SignedData,
 		der: &'a [u8],
-	) -> Result<Option<(Certificate, &'a [u8])>, SignerError> {
+	) -> Result<Option<(PresentedPath, &'a [u8])>, SignerError> {
 		let signer_info = Self::sole_signer(signed_data)?;
 
+		// 1. Find the `certificates` field as it arrived.
 		let certificates_tag = Tag::ContextSpecific { constructed: true, number: TagNumber::N0 };
 		let mut reader = SliceReader::new(der)?;
 		let header = Header::decode(&mut reader)?;
-		let arrived = reader.read_nested(header.length, |fields| {
-			let mut arrived = Vec::new();
+		let field = reader.read_nested(header.length, |fields| {
+			let mut field = None;
 			while !fields.is_finished() {
-				let field = AnyRef::decode(fields)?;
-				if field.tag() != certificates_tag {
-					continue;
-				}
-
-				let mut choices = SliceReader::new(field.value())?;
-				while !choices.is_finished() {
-					arrived.push(choices.tlv_bytes()?);
+				let arrived = fields.tlv_bytes()?;
+				if AnyRef::from_der(arrived)?.tag() == certificates_tag {
+					field = Some(arrived);
 				}
 			}
-			Ok(arrived)
+			Ok(field)
 		})?;
-
-		let parse = |bytes: &'a [u8]| Some((Certificate::from_der(bytes).ok()?, bytes));
-		Self::first_named(signer_info, arrived.into_iter().filter_map(parse))
-	}
-
-	/// Take out of `certificates` the certificate that
-	/// [`Self::signer_certificate`] returns, and leave the rest of the set in
-	/// place, or `None` when the set holds no such certificate.
-	///
-	/// A reader that keeps the signer's certificate past the decoded
-	/// `SignedData` moves it out this way, with no copy.
-	///
-	/// # Errors
-	///
-	/// - The [`Self::signer_certificate`] set.
-	/// - [`SignerError::Encoding`] -- the rest of the set fails to rebuild.
-	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-	pub(crate) fn take_signer_certificate(signed_data: &mut SignedData) -> Result<Option<Certificate>, SignerError> {
-		let named = Self::signer_certificate(signed_data)?;
-		let is_named = |choice: &CertificateChoices| match (choice, named) {
-			(CertificateChoices::Certificate(held), Some(named)) => core::ptr::eq(held, named),
-			_ => false,
-		};
-
-		let mut choices = signed_data.certificates.iter().flat_map(|set| set.0.iter());
-		let Some(position) = choices.position(is_named) else {
+		let Some(field) = field else {
 			return Ok(None);
 		};
 
-		let set = signed_data.certificates.take();
-		let mut rest = set.map(|set| set.0.into_vec()).unwrap_or_default();
-		let taken = (position < rest.len()).then(|| rest.remove(position));
-		let remaining = (!rest.is_empty()).then(|| SetOfVec::try_from(rest)).transpose()?;
-
-		signed_data.certificates = remaining.map(CertificateSet);
-
-		match taken {
-			Some(CertificateChoices::Certificate(certificate)) => Ok(Some(certificate)),
-			Some(CertificateChoices::Other(_)) | None => Ok(None),
+		// 2. Count its elements, and refuse a set past the cap before it walks a path or checks a signature.
+		let mut choices = SliceReader::new(AnyRef::from_der(field)?.value())?;
+		let mut arrived = Vec::new();
+		while !choices.is_finished() {
+			arrived.push(choices.tlv_bytes()?);
 		}
+
+		PresentedPath::bound(arrived.len())?;
+
+		// 3. Parse each certificate from its bytes, and walk the path of the one the `sid` names.
+		let parse = |bytes: &[u8]| Certificate::from_der(bytes).ok();
+		let certificates = arrived.into_iter().filter_map(parse).collect();
+		let path = Self::path_among(signer_info, certificates)?;
+		Ok(path.map(|path| (path, field)))
+	}
+
+	/// Take out of `certificates` the certification path the one signer of
+	/// `signed_data` presents, or `None` when the set holds no certificate
+	/// the signer names. The set is empty after the call, whatever it
+	/// returns.
+	///
+	/// A mutual server reads the path a client Finished presents here:
+	///
+	/// - The leaf is the certificate the `sid` names (RFC 5652 §5.3), and
+	///   [`PresentedPath::walk`] takes each issuer above it by name.
+	/// - Each certificate moves out of the decoded set, so it parses once.
+	///
+	/// # Errors
+	///
+	/// - [`SignerError::SignerIdentifier`] -- `signed_data` does not have exactly one signer.
+	/// - [`SignerError::Certificate`] -- the set holds more than
+	///   [`MAX_PRESENTED_PATH`](crate::constants::MAX_PRESENTED_PATH)
+	///   certificates, which the reader refuses before it walks a path or
+	///   checks a signature, a certificate's key identifier fails to decode,
+	///   or the walk refuses the path.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	pub(crate) fn take_signer_path(signed_data: &mut SignedData) -> Result<Option<PresentedPath>, SignerError> {
+		// 1. Take the set out, and refuse one past the cap before it walks a path or checks a signature.
+		let set = signed_data.certificates.take();
+		let choices = set.map(|set| set.0.into_vec()).unwrap_or_default();
+		let signer_info = Self::sole_signer(signed_data)?;
+		PresentedPath::bound(choices.len())?;
+
+		// 2. Walk the path of the certificate the `sid` names.
+		let certificate = |choice| match choice {
+			CertificateChoices::Certificate(certificate) => Some(certificate),
+			CertificateChoices::Other(_) => None,
+		};
+		let certificates = choices.into_iter().filter_map(certificate).collect();
+		Self::path_among(signer_info, certificates)
+	}
+
+	/// The path of the certificate of `certificates` that `signer_info` names
+	/// by its `sid`, under each issuer above it that the rest hold, or `None`
+	/// when it names none of them.
+	///
+	/// The named certificate moves out by its position, and
+	/// [`PresentedPath::walk`] takes each issuer by name, so the order of the
+	/// rest is free.
+	///
+	/// # Errors
+	///
+	/// - [`SignerError::Certificate`] -- a certificate's key identifier fails
+	///   to decode, or the walk refuses the path.
+	/// - [`SignerError::SignerIdentifier`] -- the scan names a position outside `certificates`.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	fn path_among(
+		signer_info: &SignerInfo,
+		mut certificates: Vec<Certificate>,
+	) -> Result<Option<PresentedPath>, SignerError> {
+		let candidates = certificates.iter().enumerate().map(|(index, held)| (held, index));
+		let Some((_, position)) = Self::first_named(signer_info, candidates)? else {
+			return Ok(None);
+		};
+
+		let leaf = (position < certificates.len()).then(|| certificates.swap_remove(position));
+		let leaf = leaf.ok_or(SignerError::SignerIdentifier)?;
+		Ok(Some(PresentedPath::walk(leaf, certificates)?))
 	}
 
 	/// Refuse `signer_info` unless its `sid` names `certificate`.
@@ -855,7 +902,7 @@ impl Signed<SignedData> {
 	/// Attach `attribute` to the unsigned attributes of the one `SignerInfo`
 	/// of this `SignedData`.
 	///
-	/// The signature covers no unsigned attribute (RFC 5652 §5.3), so the
+	/// The signature covers the signed attributes alone (RFC 5652 §5.3), so the
 	/// value stays the signer's. A server Finished joins the HPKE reply this
 	/// way, after the signature it covers exists.
 	///

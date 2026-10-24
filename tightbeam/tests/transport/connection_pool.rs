@@ -1,11 +1,11 @@
-//! Connection Pool Integration Tests
+//! Integration tests of the connection pool.
 //!
-//! Tests connection pooling functionality:
-//! - Connection pool reuse across multiple acquire/release cycles
+//! The tests cover these pool behaviors:
+//! - Connection pool reuse across three acquire and release cycles
 //! - Per-destination pool isolation
-//! - Concurrent pool access
+//! - Sequential access through one shared pool (`pool_concurrent_access`)
 //!
-//! For basic connection keep-alive tests, see connection_reuse.rs
+//! The basic connection keep-alive tests live in `connection_reuse.rs`.
 
 #![cfg(all(
 	feature = "std",
@@ -41,7 +41,7 @@ use tightbeam::{
 };
 
 #[cfg(feature = "x509")]
-use crate::common::static_pair::{CLIENT_CERT, CLIENT_KEY, CLIENT_PINNING, SERVER_CERT, SERVER_KEY};
+use crate::common::static_pair::{client_pinning, CLIENT_CERT, CLIENT_KEY, SERVER_CERT, SERVER_KEY};
 #[cfg(feature = "x509")]
 use tightbeam::{
 	crypto::{
@@ -64,18 +64,14 @@ pub(crate) const SEND_MESSAGE: Urn<'static> = tightbeam::urn!("test", "event:con
 pub(crate) const SERVLET1_COUNT: Urn<'static> = tightbeam::urn!("test", "event:connection-pool/servlet1-count");
 pub(crate) const SERVLET2_COUNT: Urn<'static> = tightbeam::urn!("test", "event:connection-pool/servlet2-count");
 
-// ============================================================================
-// Test Message Types
-// ============================================================================
+// The tests exchange this message type.
 
 #[derive(Clone, Debug, PartialEq, Beamable, Sequence)]
 struct TestMessage {
 	content: String,
 }
 
-// ============================================================================
-// Test Helpers
-// ============================================================================
+// The tests share this helper.
 
 #[cfg(feature = "x509")]
 fn make_server_trust_store() -> Result<Arc<dyn CertificateTrust>, TightBeamError> {
@@ -87,9 +83,7 @@ fn make_server_trust_store() -> Result<Arc<dyn CertificateTrust>, TightBeamError
 	))
 }
 
-// ============================================================================
-// Spec Definitions
-// ============================================================================
+// These specs state the event contract of each scenario.
 
 tb_process_spec! {
 	pub PoolReuseProcess,
@@ -131,9 +125,9 @@ tb_assert_spec! {
 			(MESSAGE_COUNT, exactly!(1), equals!(3u64))
 		]
 	},
-	// 1.1.0: the round-trip outcome joins the contract: every response
-	// event must carry proof that the pooled emit returned a reply, so
-	// the spec verifies delivery instead of an inline assert.
+	// Version 1.1.0 adds the round-trip outcome to the contract. Every response
+	// event must carry proof that the pooled emit returned a reply, so the spec
+	// verifies delivery instead of an inline assert.
 	V(1,1,0): {
 		mode: Accept,
 		assertions: [
@@ -167,9 +161,9 @@ tb_assert_spec! {
 			(SERVLET2_COUNT, exactly!(1), equals!(1u64))
 		]
 	},
-	// 1.1.0: the round-trip outcome joins the contract: every response
-	// event must carry proof that the pooled emit returned a reply, so
-	// the spec verifies delivery instead of an inline assert.
+	// Version 1.1.0 adds the round-trip outcome to the contract. Every response
+	// event must carry proof that the pooled emit returned a reply, so the spec
+	// verifies delivery instead of an inline assert.
 	V(1,1,0): {
 		mode: Accept,
 		assertions: [
@@ -187,9 +181,7 @@ tb_assert_spec! {
 	}
 }
 
-// ============================================================================
-// Shared echo servlet fixture (pool scenarios)
-// ============================================================================
+// The pool scenarios share this echo servlet fixture.
 
 #[cfg(all(
 	feature = "x509",
@@ -241,7 +233,7 @@ fn pool_echo_conf(
 	TightBeamError,
 > {
 	let key = SERVER_KEY.to_provider::<Secp256k1>()?;
-	let validators = vec![Arc::new(CLIENT_PINNING) as Arc<dyn CertificateValidation>];
+	let validators = vec![Arc::new(client_pinning()) as Arc<dyn CertificateValidation>];
 
 	Ok(ServletConfig::<TokioListener, TestMessage>::builder()
 		.with_certificate(SERVER_CERT, key, validators)?
@@ -261,9 +253,7 @@ async fn start_pool_echo_servlet(message_count: Arc<AtomicUsize>) -> Result<Pool
 	PoolEchoServlet::start(Arc::new(TraceCollector::default()), pool_echo_conf(message_count)?).await
 }
 
-// ============================================================================
-// Scenario: Connection Pool Reuse
-// ============================================================================
+// Scenario: the pool reuses one connection across three acquire cycles.
 
 #[cfg(all(
 	feature = "x509",
@@ -313,13 +303,11 @@ tb_scenario! {
 	}
 }
 
-// ============================================================================
-// Regression: connection accounting across reuse cycles
-// ============================================================================
+// Regression: the connection accounting holds across reuse cycles.
 
-/// A full acquire -> release -> reuse -> release cycle must leave the pool's
-/// connection accounting intact: a subsequent brand-new connection (different
-/// destination, so the reuse path cannot serve it) must still be admitted.
+/// A full cycle of acquire, release, reuse, and release must leave the pool's
+/// connection accounting intact. The pool must still admit a later brand-new
+/// connection to another destination, which the reuse path cannot serve.
 #[cfg(all(
 	feature = "x509",
 	feature = "transport-policy",
@@ -344,20 +332,21 @@ async fn pool_admits_new_connections_after_reuse_cycle() -> Result<(), Box<dyn s
 			.build(),
 	);
 
-	// Cycle 1: fresh connection, released healthy back to the pool.
+	// Cycle 1: a fresh connection goes back to the pool healthy.
 	let mut first = pool.connect(addr1).await?;
 	let first_reply = first.conn()?.emit(TestFrame::v0(Some("cycle-1"), None), None).await?;
 	assert!(first_reply.is_some(), "first acquire must round-trip a message");
 	drop(first);
 
-	// Cycle 2: same destination, must be served from the pool (reuse path).
+	// Cycle 2: the same destination must reuse the pooled connection.
 	let mut second = pool.connect(addr1).await?;
 	let second_reply = second.conn()?.emit(TestFrame::v0(Some("cycle-2"), None), None).await?;
 	assert!(second_reply.is_some(), "reused connection must round-trip a message");
 	drop(second);
 
-	// A new destination cannot be served from addr1's idle set, so the pool
-	// must admit a brand-new connection; a wedged counter reports ResourceExhausted here.
+	// The idle set of addr1 cannot serve a new destination, so the pool must
+	// admit a brand-new connection. A wedged counter reports ResourceExhausted
+	// here.
 	let third = pool.connect(addr2).await;
 	assert!(
 		third.is_ok(),
@@ -370,10 +359,11 @@ async fn pool_admits_new_connections_after_reuse_cycle() -> Result<(), Box<dyn s
 	Ok(())
 }
 
-// Single-flight envelope bound.
-// Content near the default encrypted ceiling (256 KiB) round-trips.
-// Content past it is refused locally with typed `SizeExceeded` (CWE-400).
-// The refusal must not be a connection reset from the server's fail-before-read path.
+// The single-flight envelope bound holds on both sides of the ceiling.
+// Content near the default encrypted ceiling (256 KiB) round-trips, and the
+// client refuses content past it locally with a typed `SizeExceeded`
+// (CWE-400). The refusal must not be a connection reset from the server's
+// fail-before-read path.
 #[cfg(all(
 	feature = "x509",
 	feature = "transport-policy",
@@ -408,9 +398,9 @@ async fn envelope_ceiling_refuses_oversize_locally() -> Result<(), Box<dyn std::
 
 	drop(client);
 
-	// The builder refuses with `MessageNotSent(frame, SizeExceeded)`.
-	// The retry layer strips the frame once the restart policy declines.
-	// The public emit surface therefore reports `OperationFailed(SizeExceeded)`.
+	// The builder refuses with `MessageNotSent(frame, SizeExceeded)`, and the
+	// retry layer strips the frame once the restart policy declines. The public
+	// emit surface therefore reports `OperationFailed(SizeExceeded)`.
 	let over_cap = "x".repeat(263_000);
 	let msg = TestFrame::v0(Some(&over_cap), None);
 	let mut client = pool.connect(addr).await?;
@@ -423,9 +413,7 @@ async fn envelope_ceiling_refuses_oversize_locally() -> Result<(), Box<dyn std::
 	Ok(())
 }
 
-// ============================================================================
-// Scenario: Pool Per-Destination Isolation
-// ============================================================================
+// Scenario: the pool keeps the connections of each destination apart.
 
 #[cfg(all(
 	feature = "x509",
@@ -477,9 +465,7 @@ tb_scenario! {
 	}
 }
 
-// ============================================================================
-// Scenario: Concurrent Pool Access
-// ============================================================================
+// Scenario: three acquire cycles run in sequence through one shared pool.
 
 #[cfg(all(
 	feature = "x509",

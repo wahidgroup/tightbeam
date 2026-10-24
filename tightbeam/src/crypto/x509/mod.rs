@@ -6,7 +6,7 @@ pub mod utils;
 mod key;
 mod peer;
 
-pub use key::{CanonicalKey, CurvePoints, KeyCurves, Sec1Curve};
+pub use key::{CanonicalKey, CurvePoints, KeyCurves, KeyListError, Sec1Curve};
 pub use peer::{CertificateUse, ErasedSigning, KeyPurposes, PeerCertificate};
 pub use x509_cert::{attr, ext, name, serial_number, time, Certificate, TbsCertificate, Version};
 
@@ -18,6 +18,7 @@ pub use x509_cert::{attr, ext, name, serial_number, time, Certificate, TbsCertif
 pub(crate) use key::KeyIdentity;
 #[cfg(feature = "std")]
 pub use key::KeyIndex;
+pub(crate) use key::KeyList;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub(crate) use peer::AgreementPoint;
 #[cfg(all(feature = "hpke", feature = "signature", feature = "ecdh"))]

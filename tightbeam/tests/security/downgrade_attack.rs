@@ -2,21 +2,21 @@
 //!
 //! ## Weakness
 //! A negotiated handshake may complete with a weaker cipher than both parties
-//! support if message substitution across cipher strengths is not detected by
-//! the signed transcript.
+//! support if the signed transcript does not detect message substitution
+//! across cipher strengths.
 //!
 //! ## Attack
-//! 1. Victim offers AES-256-GCM (strong); the `SecurityOffer` in `ClientHello`
-//!    carries the AEAD OID (`...3.4.1.46`).
-//! 2. A MITM captures its own AES-128-GCM (weak) handshake (OID `...3.4.1.6`).
-//! 3. The MITM substitutes the victim's `ClientHello` with the weak one.
-//! 4. The server signs a transcript containing the weak hello; the victim
-//!    verifies against a transcript containing the strong hello.
+//! 1. The victim offers AES-256-GCM, the strong cipher: the `SecurityOffer` of
+//!    its opening carries the AEAD OID (`...3.4.1.46`).
+//! 2. A MITM replaces the opening with one that offers AES-128-GCM, the weak cipher (OID `...3.4.1.6`).
+//! 3. A server that runs the weak cipher answers it with a reply that selects AES-128-GCM.
+//! 4. The MITM hands that reply to the victim. The harness takes it from a weak handshake of the MITM's own.
 //!
 //! ## Expected control
-//! The transcript MUST bind the negotiated cipher: strong and weak sessions
-//! produce different wire bytes, so substitution MUST cause a transcript-hash
-//! mismatch and signature-verification failure.
+//! The transcript MUST bind the opening with its offer. The server signed a
+//! transcript of the weak opening, and the victim checks the reply against a
+//! transcript of its strong opening, so the reply's signature MUST fail
+//! (`SignatureVerificationFailed`) before the victim reads the selection.
 //!
 //! ## References
 //! - CWE-757: Selection of Less-Secure Algorithm During Negotiation ('Algorithm
@@ -31,6 +31,7 @@ use tightbeam::{
 	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
 	testing::{ScenarioConfig, SetupEnv},
 	trace::TraceCollector,
+	transport::handshake::HandshakeError::SignatureVerificationFailed,
 	urn::Urn,
 	TightBeamError,
 };
@@ -56,7 +57,7 @@ tb_assert_spec! {
 			(DOWNGRADE_CAPTURE_STRONG, exactly!(BACKEND_COUNT_U32)),
 			(DOWNGRADE_CAPTURE_WEAK, exactly!(BACKEND_COUNT_U32)),
 			(DOWNGRADE_PROFILES_DIFFER, exactly!(BACKEND_COUNT_U32)),
-			(DOWNGRADE_SUBSTITUTION_REJECTED, exactly!(BACKEND_COUNT_U32))
+			(DOWNGRADE_SUBSTITUTION_REJECTED, exactly!(BACKEND_COUNT_U32), equals!(true))
 		]
 	}
 }
@@ -125,28 +126,22 @@ job! {
 	async fn run((trace,): (Arc<TraceCollector>,)) -> Result<(), TightBeamError> {
 		let harness = SecurityThreatHarness::with_trace(Arc::clone(&trace));
 		for kind in HandshakeBackendKind::all() {
-			// ========================================
-			// Step 1: Capture STRONG handshake (AES-256-GCM)
-			// Uses DefaultCryptoProvider
-			// ========================================
-			let mut strong_session = harness.spawn(kind);
+			// Step 1: Capture the strong handshake (AES-256-GCM) under
+			// DefaultCryptoProvider.
+			let mut strong_session = harness.spawn(kind)?;
 			let strong_handshake = strong_session.capture_full().await?;
 
 			trace.event(DOWNGRADE_CAPTURE_STRONG)?;
 
-			// ========================================
-			// Step 2: Capture WEAK handshake (AES-128-GCM)
-			// Uses Aes128CryptoProvider - actual different cipher!
-			// ========================================
-			let mut weak_session = harness.spawn_weak(kind);
+			// Step 2: Capture the weak handshake (AES-128-GCM) under
+			// Aes128CryptoProvider, which runs AES-128 at the cipher level.
+			let mut weak_session = harness.spawn_weak(kind)?;
 			let weak_handshake = weak_session.capture_full().await?;
 
 			trace.event(DOWNGRADE_CAPTURE_WEAK)?;
 
-			// ========================================
-			// Step 3: Verify wire bytes are DIFFERENT
-			// Different cipher OIDs -> different SecurityOffer -> different bytes
-			// ========================================
+			// Step 3: Verify that the two openings differ in their wire bytes.
+			// Their cipher OIDs differ, so their `SecurityOffer` values differ.
 			let strong_hello = strong_handshake
 				.client_messages()
 				.next()
@@ -163,21 +158,23 @@ job! {
 
 			trace.event(DOWNGRADE_PROFILES_DIFFER)?;
 
-			// ========================================
-			// Step 4: Attempt downgrade substitution
-			// Inject WEAK hello into a STRONG session
-			// ========================================
-			let mut attack_session = harness.spawn(kind);
-			match attack_session.inject_at_step(weak_hello.step, &weak_hello.payload).await? {
-				InjectionOutcome::Rejected(_) => {
-					// Downgrade substitution rejected - the strong server's
-					// strength floor refuses the AES-128 offer, and the
-					// negotiated cipher is bound into the signed transcript.
-					trace.event(DOWNGRADE_SUBSTITUTION_REJECTED)?;
+			// Step 4: Attempt the downgrade substitution, and hand the reply to
+			// the weak opening to a strong client.
+			let weak_reply = weak_handshake.server_reply();
+			let weak_reply = weak_reply.ok_or_else(|| expectation_failure("no weak reply"))?;
+
+			let mut attack_session = harness.spawn(kind)?;
+			match attack_session.inject_at_step(weak_reply.step, &weak_reply.payload).await? {
+				InjectionOutcome::Rejected(error) => {
+					// The reply signs a transcript of the weak opening, and the
+					// strong client binds its own, so the signature fails
+					// before the client reads the weak selection.
+					let bound = matches!(error, TightBeamError::HandshakeError(SignatureVerificationFailed));
+					trace.event_with(DOWNGRADE_SUBSTITUTION_REJECTED, &[], bound)?;
 				}
 				InjectionOutcome::Accepted => {
-					// A strong session that accepts a weak ClientHello is a
-					// downgrade. The control MUST reject it.
+					// A strong client that accepts the reply to a weak opening
+					// is a downgrade. The control MUST reject it.
 					return Err(expectation_failure("downgrade substitution was accepted"));
 				}
 			}

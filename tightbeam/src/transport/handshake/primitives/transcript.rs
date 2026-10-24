@@ -202,8 +202,8 @@ pub fn transcript_hash<P: CryptoProvider>(messages: &[&[u8]]) -> Result<Transcri
 
 /// The bytes a handshake binds, until their hash is sealed.
 ///
-/// Only an open transcript accepts bytes, so nothing reaches the transcript
-/// after its hash is fixed. The state stays private, so a hash exists only
+/// Only an open transcript accepts bytes, so the hash covers every byte the
+/// transcript ever held. The state stays private, so a hash exists only
 /// where [`Transcript::seal`] computed it.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub(crate) struct Transcript(State);
@@ -257,7 +257,7 @@ impl Transcript {
 	/// - [`HandshakeError::InvalidState`] -- the transcript is sealed.
 	#[cfg(feature = "transport-cms")]
 	pub(crate) fn append_server_finished(&mut self, legs: ServerFinishedLegs<'_>) -> Result<(), HandshakeError> {
-		let ServerFinishedLegs { security_accept, transport_accept, server_ephemeral, certificate } = legs;
+		let ServerFinishedLegs { security_accept, transport_accept, server_ephemeral, certificates } = legs;
 		if let Some(accept) = security_accept {
 			self.append(accept)?;
 		}
@@ -267,7 +267,7 @@ impl Transcript {
 
 		self.append(server_ephemeral)?;
 
-		self.append(certificate)
+		self.append(certificates)
 	}
 
 	/// Fix the hash over the bytes appended so far under digest `D`, and
@@ -289,10 +289,10 @@ impl Transcript {
 }
 
 /// The server Finished legs the CMS transcript binds: its attributes as
-/// encoded bytes, then the DER of the signing certificate it carries.
+/// encoded bytes, then the DER of the `certificates` field it carries.
 ///
 /// The accepts are present when negotiation produced them, and the server
-/// ephemeral public key and the certificate are mandatory, so every sealed
+/// ephemeral public key and the field are mandatory, so every sealed
 /// transcript binds both. [`Transcript::append_server_finished`] fixes the
 /// order.
 #[cfg(feature = "transport-cms")]
@@ -302,13 +302,14 @@ pub(crate) struct ServerFinishedLegs<'a> {
 	/// The `TransportAccept` attribute value, when transport terms were
 	/// negotiated.
 	pub(crate) transport_accept: Option<Vec<u8>>,
-	/// The `OriginatorPublicKey` attribute value carrying the server
+	/// The `OriginatorPublicKey` attribute value that carries the server
 	/// ephemeral.
 	pub(crate) server_ephemeral: Vec<u8>,
-	/// The DER of the signing certificate the Finished carries in
-	/// `certificates`, which its `sid` names: the server's as its identity
-	/// encoded it once, the client's as the bytes arrived (RFC 9846 §4.5.2).
-	pub(crate) certificate: &'a [u8],
+	/// The DER of the `certificates` field the Finished carries, which holds
+	/// the signing certificate its `sid` names and the issuers above it: the
+	/// server's as its identity encoded it once, the client's as the bytes
+	/// arrived (RFC 9846 §4.5.2).
+	pub(crate) certificates: &'a [u8],
 }
 
 #[cfg(test)]
@@ -370,25 +371,25 @@ mod tests {
 	}
 
 	/// The CMS transcript hash of a key exchange followed by server Finished
-	/// legs that carry `server_ephemeral` and `certificate`.
+	/// legs that carry `server_ephemeral` and `certificates`.
 	#[cfg(feature = "transport-cms")]
-	fn cms_hash_of(server_ephemeral: &[u8], certificate: &[u8]) -> Result<TranscriptHash, HandshakeError> {
+	fn cms_hash_of(server_ephemeral: &[u8], certificates: &[u8]) -> Result<TranscriptHash, HandshakeError> {
 		let mut transcript = Transcript::new();
 		transcript.append(b"key exchange")?;
 		transcript.append_server_finished(ServerFinishedLegs {
 			security_accept: Some(b"accept".to_vec()),
 			transport_accept: None,
 			server_ephemeral: server_ephemeral.to_vec(),
-			certificate,
+			certificates,
 		})?;
 		transcript.seal::<Sha3_256>()
 	}
 
 	/// The CMS transcript hash of a key exchange followed by server Finished
-	/// legs that carry `server_ephemeral` and a fixed certificate.
+	/// legs that carry `server_ephemeral` and a fixed `certificates` field.
 	#[cfg(feature = "transport-cms")]
 	fn cms_hash_with_ephemeral(server_ephemeral: &[u8]) -> Result<TranscriptHash, HandshakeError> {
-		cms_hash_of(server_ephemeral, b"certificate")
+		cms_hash_of(server_ephemeral, b"certificates")
 	}
 
 	/// Two CMS transcripts that differ only in the server ephemeral hash
@@ -402,14 +403,14 @@ mod tests {
 		Ok(())
 	}
 
-	/// The CMS transcript binds the server's certificate after the server
-	/// ephemeral, so the expected hash is SHA3-256 of the legs in that order,
-	/// computed by the `sha3` crate outside the transcript.
+	/// The CMS transcript binds the server's `certificates` field after the
+	/// server ephemeral, so the expected hash is SHA3-256 of the legs in that
+	/// order, computed by the `sha3` crate outside the transcript.
 	#[cfg(feature = "transport-cms")]
 	#[test]
-	fn the_cms_transcript_binds_the_certificate_after_the_ephemeral() -> Result<(), HandshakeError> {
-		let bound = cms_hash_of(&[0x02u8; 33], b"certificate")?;
-		let legs = [b"key exchange".as_slice(), b"accept", &[0x02u8; 33], b"certificate"].concat();
+	fn the_cms_transcript_binds_the_certificates_after_the_ephemeral() -> Result<(), HandshakeError> {
+		let bound = cms_hash_of(&[0x02u8; 33], b"certificates")?;
+		let legs = [b"key exchange".as_slice(), b"accept", &[0x02u8; 33], b"certificates"].concat();
 		let expected = Sha3_256::digest(&legs);
 		assert_eq!(bound.as_bytes(), expected.as_slice());
 		Ok(())

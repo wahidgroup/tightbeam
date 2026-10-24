@@ -84,8 +84,8 @@ use crate::utils::marker::MaybeSend;
 ))]
 use crate::x509::Certificate;
 
-/// Tokio TCP stream that carries DER-framed envelopes through the byte-level
-/// traits.
+/// A tokio TCP stream that carries DER-framed envelopes through the
+/// byte-level traits.
 #[cfg(feature = "tokio")]
 pub struct TokioStream {
 	stream: TcpStream,
@@ -116,7 +116,7 @@ impl AsyncByteStream for TokioStream {
 	}
 }
 
-/// Owned read half of a [`TokioStream`].
+/// The owned read half of a [`TokioStream`].
 #[cfg(feature = "tokio")]
 pub struct TokioReadHalf {
 	half: OwnedReadHalf,
@@ -131,7 +131,7 @@ impl AsyncByteRead for TokioReadHalf {
 	}
 }
 
-/// Owned write half of a [`TokioStream`].
+/// The owned write half of a [`TokioStream`].
 #[cfg(feature = "tokio")]
 pub struct TokioWriteHalf {
 	half: OwnedWriteHalf,
@@ -169,13 +169,13 @@ impl From<TcpStream> for TokioStream {
 #[cfg(feature = "tokio")]
 pub struct TokioListener<P: CryptoProvider = DefaultCryptoProvider> {
 	listener: TcpListener,
-	/// What every accepted transport is built from.
+	/// The configuration that every accepted transport is built from.
 	config: EndpointConfig<P>,
 }
 
 #[cfg(feature = "tokio")]
 impl<P: CryptoProvider + Send + Sync + 'static> TokioListener<P> {
-	/// The local address that the listener is bound to.
+	/// Return the local address that the listener is bound to.
 	///
 	/// # Errors
 	///
@@ -578,8 +578,9 @@ where
 		}
 	}
 
-	/// The number of records still readable before the receive cipher demands
-	/// a rekey. A cleartext half never demands one, so it reports `u64::MAX`.
+	/// Return the number of records still readable before the receive cipher
+	/// demands a rekey. A cleartext half never demands one, so it reports
+	/// `u64::MAX`.
 	fn remaining_records(&self) -> u64 {
 		match &self.mode {
 			SplitRecv::Cleartext => u64::MAX,
@@ -682,8 +683,9 @@ where
 		Ok(())
 	}
 
-	/// The number of records still writable before the send cipher demands a
-	/// rekey. A cleartext half never demands one, so it reports `u64::MAX`.
+	/// Return the number of records still writable before the send cipher
+	/// demands a rekey. A cleartext half never demands one, so it reports
+	/// `u64::MAX`.
 	fn remaining_records(&self) -> u64 {
 		match &self.mode {
 			SplitSend::Cleartext => u64::MAX,
@@ -950,6 +952,10 @@ mod tests {
 	use crate::transport::{MessageCollector, MessageEmitter, TransportEncryptionConfig};
 	use crate::utils::time::SystemClock;
 
+	#[cfg(feature = "transport-hpke")]
+	use crate::crypto::key::Secp256k1KeyProvider;
+	#[cfg(feature = "transport-hpke")]
+	use crate::crypto::sign::SigningIdentity;
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	use crate::crypto::x509::error::CertificateValidationError::CertificateNotTrusted;
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -1525,6 +1531,27 @@ mod tests {
 		Ok(())
 	}
 
+	/// An HPKE client whose store holds the root alone admits a server whose
+	/// signing certificate an intermediate issued, since the endpoint's trust
+	/// validates the path the reply presents to that root (RFC 5280 §6.1).
+	#[cfg(feature = "transport-hpke")]
+	#[tokio::test]
+	async fn an_hpke_client_of_the_root_alone_admits_an_intermediate() -> Result<(), Box<dyn std::error::Error>> {
+		let TestCertificateChain { root, intermediate, leaf, leaf_key, .. } = TestCertificate::insecure_fixed_chain()?;
+		let identity = SigningIdentity::new(leaf, Arc::new(Secp256k1KeyProvider::from(leaf_key)))?;
+		let config = TransportEncryptionConfig::new(identity.with_chain([intermediate])?);
+		let (listener, server_addr) = bind_encrypted(config).await?;
+		let _server = spawn_accept_handle_request(listener);
+
+		let builder = CertificateTrustBuilder::from(Secp256k1Policy::default());
+		let store = builder.with_certificate(root)?.build();
+		let client_stream = TcpStream::connect(server_addr).await?;
+		let mut transport = trusting_client(client_stream, Arc::new(store));
+		transport.ensure_handshake_complete().await?;
+		assert!(transport.session_state().peer_certificate().is_some());
+		Ok(())
+	}
+
 	/// `ClientBuilder::with_server_policy` carries its policy into the dial,
 	/// so a policy that refuses the server's certificate refuses the server
 	/// that the builder's store admits, at the first exchange.
@@ -1725,7 +1752,7 @@ mod tests {
 		assert!(transport.session_state().peer_certificate().is_none());
 
 		transport.ensure_handshake_complete().await?;
-		assert!(transport.session_state().peer_certificate().is_some());
+		assert_eq!(transport.session_state().peer_certificate(), Some(&server.signing));
 		assert!(received_rx.try_recv().is_err());
 
 		transport.ensure_handshake_complete().await?;

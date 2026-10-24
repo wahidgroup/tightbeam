@@ -1,13 +1,13 @@
 //! # Forward secrecy threat
 //!
 //! ## Weakness
-//! Reusing ephemeral key material across handshakes means compromise of the
-//! server's long-term key (or a single ephemeral key) can expose past sessions.
+//! When handshakes reuse ephemeral key material, a compromise of the server's
+//! long-term key (or of a single ephemeral key) can expose past sessions.
 //! An ephemeral equal to the server's static key would collapse the agreement
 //! into one that key recovers.
 //!
 //! ## Attack
-//! Multiple handshakes are run and their ephemeral public keys compared for
+//! The test runs five handshakes and compares their ephemeral public keys for
 //! uniqueness. Each handshake carries two in the clear: the client ephemeral
 //! `R` of the hello and the server ephemeral `E` of the reply.
 //!
@@ -46,7 +46,7 @@ pub(crate) const FS_CAPTURE_HANDSHAKE: Urn<'static> =
 pub(crate) const FS_EXTRACT_EPHEMERAL: Urn<'static> =
 	tightbeam::urn!("test", "event:forward-secrecy/fs-extract-ephemeral");
 
-/// Number of handshakes to perform for forward secrecy verification.
+/// The number of handshakes that the forward secrecy check runs.
 const HANDSHAKE_COUNT: usize = 5;
 
 tb_assert_spec! {
@@ -111,7 +111,7 @@ async fn captured_coordinates(
 ) -> Result<Vec<Vec<u8>>, TightBeamError> {
 	let mut coordinates = Vec::with_capacity(2 * count);
 	for _ in 0..count {
-		let mut session = harness.spawn(HandshakeBackendKind::Hpke);
+		let mut session = harness.spawn(HandshakeBackendKind::Hpke)?;
 		let captured = session.capture_full().await?;
 
 		trace.event(FS_CAPTURE_HANDSHAKE)?;

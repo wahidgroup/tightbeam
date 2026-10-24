@@ -19,12 +19,12 @@ This page specifies how two TightBeam endpoints establish a session: the message
 
 TightBeam has two handshake flows. Both send three messages, encode every message as a CMS type (RFC 5652), and close the same way.
 
-|                     | HPKE flow                                                           | CMS flow                                                                                            |
-| ------------------- | ------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
-| Shape               | The TLS 1.3 handshake (RFC 9846) in CMS containers                  | The client seals its first message to the server's key-agreement certificate                        |
-| First message       | The hello: a `ContentInfo` of type `id-data` with the `ClientHello` | The opening: an `AuthEnvelopedData` with the base secret and the client ephemeral                   |
-| Server certificates | One signing certificate, sent in the reply                          | A signing certificate, sent in the server Finished, and a key-agreement certificate the client pins |
-| Handshake secret    | `ee`, the ECDH output of the two ephemerals                         | `ee \|\| base`, which adds the base secret of the opening                                           |
+|                     | HPKE flow                                                            | CMS flow                                                                                                                      |
+| ------------------- | -------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| Shape               | The TLS 1.3 handshake (RFC 9846) in CMS containers                   | The client seals its first message to the server's key-agreement certificate                                                  |
+| First message       | The hello: a `ContentInfo` of type `id-data` with the `ClientHello`  | The opening: an `AuthEnvelopedData` with the base secret and the client ephemeral                                             |
+| Server certificates | One signing certificate, sent in the reply with the issuers above it | A signing certificate, sent in the server Finished with the issuers above it, and a key-agreement certificate the client pins |
+| Handshake secret    | `ee`, the ECDH output of the two ephemerals                          | `ee \|\| base`, which adds the base secret of the opening                                                                     |
 
 ## Message flow
 
@@ -36,7 +36,7 @@ sequenceDiagram
     participant S as Server
     C->>S: Hello: the ClientHello with the client random, the ephemeral R, and the offers
     Note over S: negotiates a profile, draws E, derives hs from the ECDH of E and R
-    S->>C: Reply: SignedData over the ServerHandshake with E. The signing certificate in certificates. The server Finished and any receipt as unsigned attributes
+    S->>C: Reply: SignedData over the ServerHandshake with E. The signing certificate and the issuers above it in certificates. The server Finished and any receipt as unsigned attributes
     Note over C: admits the certificate, verifies the signature, derives hs, verifies the server Finished
     C->>S: Closing: AuthEnvelopedData under k_close with the client Finished, or the anonymous tag set
     Note over S: opens the closing, verifies the tag, admits the client, settles the receipt
@@ -49,7 +49,7 @@ The HPKE flow claims these properties of RFC 9846 Appendix F.1:
 | Server authentication before the client sends its identity  | Yes     | The client verifies the reply's signature over the transcript first               |
 | Client identity protected from passive and active attackers | Yes     | It travels only under a key of this handshake's ephemeral agreement               |
 | Forward secrecy                                             | Yes     | The secret comes from two ephemerals alone                                        |
-| Server identity protected from a passive attacker           | No      | The signing certificate travels in clear in `certificates`                        |
+| Server identity protected from a passive attacker           | No      | The signing certificate and its issuers travel in clear in `certificates`         |
 | Explicit server key confirmation                            | Yes     | The reply carries the server Finished, which the client verifies before it closes |
 
 ### CMS flow
@@ -60,8 +60,8 @@ sequenceDiagram
     participant S as Server
     C->>S: Opening: AuthEnvelopedData with a KEMRecipientInfo to the pinned key-agreement certificate. Content: the base secret and R. Offers as authenticated attributes
     Note over S: decapsulates through its key-agreement backend, opens the base secret and R
-    S->>C: Server Finished: SignedData under the signing certificate in certificates, binding E. The server Finished MAC and any receipt as unsigned attributes
-    Note over C: admits the signing certificate, pairs it with the pinned one, verifies the signature
+    S->>C: Server Finished: SignedData under the signing certificate, which certificates carries with the issuers above it, binding E. The server Finished MAC and any receipt as unsigned attributes
+    Note over C: validates the path of the signing certificate, pairs it with the pinned one, verifies the signature
     Note over C,S: both derive hs from the ECDH of E and R, and the base secret
     Note over C: verifies the server Finished MAC, then reads the receipt
     C->>S: Closing: AuthEnvelopedData under k_close with the client Finished, its certificate, and the receipt countersignature
@@ -70,7 +70,7 @@ sequenceDiagram
 
 The CMS flow differs from the HPKE flow in three ways:
 
-- The client pins the server's key-agreement certificate alone. The server Finished carries the signing certificate (RFC 5652 § 5.1), and the client admits it at each reply. See [The CMS server's two certificates](#the-cms-servers-two-certificates).
+- The client pins the server's key-agreement certificate alone. The server Finished carries the signing certificate and the issuers above it (RFC 5652 § 5.1), and the client admits it at each reply. See [The CMS server's two certificates](#the-cms-servers-two-certificates).
 - The secret is hybrid, so an observer needs both the ephemeral agreement and the key-agreement key. See [Forward secrecy](#forward-secrecy).
 - A CMS client always presents its identity, so it always sends a client Finished.
 
@@ -167,7 +167,7 @@ Each side holds the pair through one constructor, and both constructors call one
 - **One subject.** Two certificates name one subject when they carry one subject name that is not empty. An empty subject names its holder by its `subjectAltName` alone (RFC 5280 § 4.1.2.6), so two certificates of an empty subject name one subject when they carry one `subjectAltName`. A pair of an empty subject with no `subjectAltName` fails with `SubjectMismatch`.
 - **Backends.** A signing backend is a `SigningKeyProvider`, and a key-agreement backend is a `DiffieHellman<C>`. Both extend `KeyBackend`, so the compiler refuses one in the other's place. `KeyAgreementIdentity::new` refuses a backend whose public key differs from the certificate's (`KeyMismatch`).
 - **The pinned certificate.** `ProvisionedTrust::new` takes the key-agreement certificate, bare or as a root-to-leaf `CmsServerChain`, beside the store. It admits the certificate once at configuration, and again before each opening, because the store's verdict and the validity period change.
-- **The carried certificate.** At each reply, the client takes the certificate that the server Finished's `sid` names, and the store admits it for signing within its validity period.
+- **The carried certificate.** At each reply, the client builds the path the server Finished presents from the certificate its `sid` names. The store validates that path to one of its trust anchors, and the client admits the certificate for signing within its validity period.
 - **Rotation.** The server can replace its signing certificate under the same subject and anchor with no change at its clients.
 - **A missing identity.** A CMS transport server that holds a signing identity alone refuses the handshake with `MissingKeyAgreementIdentity` before it reads the opening.
 
@@ -175,9 +175,13 @@ An HPKE server holds one signing identity, and its secret derives from the two e
 
 ### Trust anchors and issuers
 
-- Two certificates name one trust anchor when the store's path validation of each ends at that anchor (RFC 5280 § 6.1.1 (d)). `CertificateTrust::trust_anchor` returns it for a certificate, and `CertificateTrust::verify_chain` for a pinned chain.
+- Two certificates name one trust anchor when the store's path validation of each ends at that anchor (RFC 5280 § 6.1.1 (d)). `CertificateTrust::trust_anchor` returns it for a certificate, `CertificateTrust::verify_chain` returns it for a pinned chain, and `CertificateTrust::verify_presented` returns it for the path a reply presents.
 - A signing certificate under an intermediate therefore pairs with a key-agreement certificate that the root issued, and a chain that starts at a held intermediate names the root above it.
-- The house store builds a path from the certificates it holds, and from no other source. The client's store must therefore hold every intermediate between the server's signing certificate and its anchor.
+- A server presents the issuers above its signing certificate with `SigningIdentity::with_chain`, and its reply carries them in `certificates` (RFC 5652 § 5.1). A client's store in either flow can therefore hold trust anchors alone: the house store extends the presented path upward from the issuers it holds, up to an anchor, and validates it whole.
+- A mutual client presents its issuers the same way, in the `certificates` of its client Finished. Each client validator of the server reads them through `CertificateValidation::evaluate_presented`: the house store validates the path to one of its anchors, so a server's store can hold trust anchors alone too, and the default implementation reads the client certificate alone.
+- Each certificate a store holds anchors every path below it, so a presented intermediate is input the store never vetted. A path certificate that states `nameConstraints`, critical or not, is refused with `NameConstraintsUnapplied`, because the store's path validation does not apply name constraints (RFC 5280 § 6.1.4 (g)).
+- An HPKE client admits the signing certificate through its `LearnedTrust`. `LearnedTrust::anchored` validates the presented path through `CertificateTrust::verify_presented`, as the CMS client does, and a transport client anchors on its trust store in this form. `LearnedTrust::new` runs a validator on the signing certificate alone, such as a pin, so a store in that form must hold every intermediate between the signing certificate and its anchor.
+- Each side builds the path its peer presents once: a client in `CmsSigner::signer_path` and a server in `CmsSigner::take_signer_path`, from the certificate the `sid` names, then each issuer by name. Each refuses a set of more than `MAX_PRESENTED_PATH` (8) certificates before it walks a path or checks a signature. The walk refuses two certificates of one issuer name (`AmbiguousIssuer`) and a path that returns to a certificate it holds (`PathCycle`).
 - Of the held certificates of one name, the walk takes the first in the order of RFC 4158 § 3.5.12, and the signature check decides:
   1. A `subjectKeyIdentifier` equal to the `authorityKeyIdentifier` of the certificate below.
   2. No `subjectKeyIdentifier`, or no `authorityKeyIdentifier` to compare it with.
@@ -201,7 +205,7 @@ The policy evaluates the identity certificate of the flow once the store admits 
 - Each evaluation method of the policy takes one identity type, so the policy reads the identity certificate of its flow alone.
 - The trust store admits a certificate by its contents alone, whatever role the handshake reads it in.
 - A check of a server's identity belongs in the client's server policy, and a check of a client's identity belongs in the validators of the server's `PeerAuthentication::mutual`.
-- The built-in store runs path validation and revocation on each certificate that `evaluate`, `trust_anchor`, or `verify_chain` admits. Each of its lookups runs its `RevocationChecker` over the path of the certificate it answers with, so a check of every certificate, such as a denylist, belongs in that checker.
+- The built-in store runs path validation and revocation on each certificate that `evaluate`, `evaluate_presented`, `trust_anchor`, `verify_chain`, or `verify_presented` admits. Each of its lookups runs its `RevocationChecker` over the path of the certificate it answers with, so a check of every certificate, such as a denylist, belongs in that checker.
 - An empty list sets no policy.
 
 ### Key identity
@@ -271,7 +275,7 @@ A frame leaves through one of two writers, and each reads the session phase:
 | Nothing                               | Admitted, no peer recorded          | Refused: `MissingClientCertificate`                                          |
 | A certificate and its client Finished | Finished verified, no peer recorded | Validity period read, every validator runs, Finished verified, peer recorded |
 
-A client Finished that names no certificate is refused with `MissingClientCertificate` under either policy.
+Each validator reads the offered certificate beside the issuers its client Finished presents, through `CertificateValidation::evaluate_presented`. A client Finished that names no certificate is refused with `MissingClientCertificate` under either policy.
 
 ## Key schedule
 
@@ -456,14 +460,14 @@ The receipt acknowledgement and the closing each seal through a `KEKRecipientInf
 
 Both flows close with one `AuthEnvelopedData` under `k_close`. The content type, which the closing's `authAttrs` authenticate, names its form:
 
-| Form            | Content type    | Content                                                                                                                                                                                                                            |
-| --------------- | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Client Finished | `id-signedData` | The signer's `SignedData` over `tb/handshake/finished/client/v1`, the transcript hash, and the digest of the client certificate. The certificate is in `certificates`, and the tag and the acknowledgement are unsigned attributes |
-| Anonymous       | `id-data`       | The DER `SET OF Attribute` with the tag and the acknowledgement alone                                                                                                                                                              |
+| Form            | Content type    | Content                                                                                                                                                                                                                                                                   |
+| --------------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Client Finished | `id-signedData` | The signer's `SignedData` over `tb/handshake/finished/client/v1`, the transcript hash, and the digest of the client certificate. The certificate and the issuers its identity presents are in `certificates`, and the tag and the acknowledgement are unsigned attributes |
+| Anonymous       | `id-data`       | The DER `SET OF Attribute` with the tag and the acknowledgement alone                                                                                                                                                                                                     |
 
 - `ClosingContent` is the one reader of both forms. Its constructor refuses any other content type with `UnexpectedContainer` before the closing key runs.
 - A form that carries the tag or the acknowledgement twice fails with `DuplicateAttribute`, and one without a tag fails with `MissingAttribute`.
-- The client certificate is the one the Finished's `sid` names (RFC 5652 § 5.3), so `certificates` may also carry its chain, in any order.
+- The client certificate is the one the Finished's `sid` names (RFC 5652 § 5.3), so `certificates` carries the issuers above it in any order, as `SigningIdentity::with_chain` set them. The seal under `k_close` authenticates them with the rest of the Finished.
 - The closing draft holds the client Finished beside the identity that signs it, and its one seal signs and seals together. No closing carries an unsigned Finished.
 - A server refuses a closing whose unauthenticated attributes carry an abort alert, before any key runs.
 
@@ -513,27 +517,28 @@ The transcript hash is the whole output of the negotiated digest, 32 to 64 bytes
 
 `Transcript` builds both transcripts, and each flow binds its legs in one order:
 
-| Flow | Legs, in order                                                                                                           |
-| ---- | ------------------------------------------------------------------------------------------------------------------------ |
-| HPKE | The hello `ContentInfo` DER, the `ServerHandshake` DER that the reply signs, and the DER of the signing certificate      |
-| CMS  | The opening DER, the security accept, the transport accept, the server ephemeral, and the DER of the signing certificate |
+| Flow | Legs, in order                                                                                                               |
+| ---- | ---------------------------------------------------------------------------------------------------------------------------- |
+| HPKE | The hello `ContentInfo` DER, the `ServerHandshake` DER that the reply signs, and the DER of the reply's `certificates` field |
+| CMS  | The opening DER, the security accept, the transport accept, the server ephemeral, and the DER of the `certificates` field    |
 
 The sender hashes the bytes it encoded, and the receiver hashes the bytes it received, never a re-encoding (CWE-345):
 
 1. The pinned `der` decoder sorts a `SET OF` as it decodes, so a mis-ordered set decodes to the same value as a well-ordered one.
 2. Hashing the received bytes makes a reordered set diverge the two transcripts, and the signature fails.
 
-| What the transcript binds              | Read through                                                                                       |
-| -------------------------------------- | -------------------------------------------------------------------------------------------------- |
-| A container                            | `WireDer::der`                                                                                     |
-| A CMS accept or ephemeral attribute    | `HandshakeAttribute::received_bytes`                                                               |
-| The HPKE reply content                 | The reply's `eContent` octets, as they arrived                                                     |
-| The signing certificate of either flow | `CmsSigner::signer_certificate_der`: the bytes of the certificate the `sid` names, as they arrived |
+| What the transcript binds               | Read through                                                                                                         |
+| --------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| A container                             | `WireDer::der`                                                                                                       |
+| A CMS accept or ephemeral attribute     | `HandshakeAttribute::received_bytes`                                                                                 |
+| The HPKE reply content                  | The reply's `eContent` octets, as they arrived                                                                       |
+| The `certificates` field of either flow | `CmsSigner::signer_path`: the bytes of the field as they arrived, which hold the signing certificate and its issuers |
 
-Both flows bind the signing certificate, as RFC 9846 § 4.5.2 signs over the Certificate:
+Both flows bind the whole `certificates` field, as RFC 9846 § 4.5.2 signs over the Certificate message, which carries the chain:
 
-- The server binds the DER that `SigningIdentity::certificate_der` keeps, and the client binds the bytes that arrived.
+- The server binds the DER of the field that its `SigningIdentity` encoded once, and the client binds the bytes that arrived.
 - A reply whose certificate was swapped for another with the same key gives the client another transcript, and the signature fails.
+- A reply whose intermediate was swapped for another of the same subject and key holds a path that validates, and it gives the client another transcript, so the signature fails too.
 
 Each signature signs under a domain of its own. Neither Finished label is a prefix of the other, which a compile-time assertion holds, so a signature made for one purpose verifies as no other:
 
@@ -548,7 +553,7 @@ Both transcripts bind both ephemerals:
 | Ephemeral        | Bound by                                                                        | Tampering fails at                                                                                   |
 | ---------------- | ------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
 | Server `E`, HPKE | A field of the `ServerHandshake`, which the reply signs                         | The reply signature. An off-curve point fails `InvalidPublicKey` at its parse                        |
-| Server `E`, CMS  | A transcript leg after the accepts and before the signing certificate           | The server signature. A removed one fails `MissingAttribute`                                         |
+| Server `E`, CMS  | A transcript leg after the accepts and before the `certificates` field          | The server signature. A removed one fails `MissingAttribute`                                         |
 | Client `R`, HPKE | A field of the `ClientHello`, whose DER is the first leg                        | The client's check of the reply signature. An off-curve point fails `InvalidPublicKey` at the server |
 | Client `R`, CMS  | A field of the opening content, under the tag. The opening DER is the first leg | The opening's tag (`HandshakeError::Envelope`). An off-curve point fails `InvalidPublicKey`          |
 
@@ -611,7 +616,7 @@ Each configuration's type requires what its role cannot run without:
 
 | Configuration           | Requires                                                                                                     |
 | ----------------------- | ------------------------------------------------------------------------------------------------------------ |
-| `ClientConfig<Hpke, P>` | A validator for the certificate the server names (`LearnedTrust`)                                            |
+| `ClientConfig<Hpke, P>` | A store that anchors the path the reply presents, or a validator of its signing certificate (`LearnedTrust`) |
 | `ClientConfig<Cms, P>`  | The pinned key-agreement certificate beside its store (`ProvisionedTrust`), and a client identity            |
 | `ServerConfig<F, P>`    | The flow's server identity: a `SigningIdentity` for HPKE, a `CmsIdentityPair` for CMS. A `SupportedProfiles` |
 

@@ -6,6 +6,7 @@
 //! one body.
 
 use std::future::Future;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -27,13 +28,16 @@ use tightbeam::{
 		sign::ecdsa::{Secp256k1Signature, Secp256k1VerifyingKey},
 	},
 	der::{asn1::OctetString, asn1::OctetStringRef, Any, Decode, Encode},
+	prelude::TightBeamSocketAddr,
 	testing::error::{FdrConfigError, TestingError},
 	transport::handshake::{
 		negotiation::{NoStrengthFloor, ProfilePolicy, ProfileStrengthPolicy, SecurityOffer},
 		Client, ClientFlow, ClientHandshakeProtocol, ClientHello, Handshake, HandshakeMessage, HandshakeProvider, Hpke,
 		Server, ServerFlow, ServerHandshake, ServerHandshakeProtocol,
 	},
+	transport::tcp::r#async::TokioListener,
 	transport::wire_der::WireDer,
+	transport::{EncryptedProtocol, TransportEncryptionConfig},
 	TightBeamError,
 };
 
@@ -144,6 +148,12 @@ impl CapturedHandshake {
 	/// Return every client-to-server message.
 	pub fn client_messages(&self) -> impl Iterator<Item = &CapturedMessage> {
 		self.messages.iter().filter(|m| m.direction == Direction::ClientToServer)
+	}
+
+	/// Return the reply, the one server-to-client message, which the server
+	/// signs over the transcript of its client's opening.
+	pub fn server_reply(&self) -> Option<&CapturedMessage> {
+		self.messages.iter().find(|m| m.direction == Direction::ServerToClient)
 	}
 
 	/// Return the message captured at `step`.
@@ -323,6 +333,30 @@ impl HandshakeBackendKind {
 		}
 	}
 
+	/// Bind a listener on a free local port that serves this backend under
+	/// the default transport limits, beside its address.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError`] -- the CMS pair refuses its key-agreement identity, or the socket fails to bind.
+	pub async fn bind_listener(
+		self,
+		materials: &ServerMaterials,
+	) -> Result<(TokioListener, SocketAddr), TightBeamError> {
+		let config: TransportEncryptionConfig<DefaultCryptoProvider> = match self {
+			Self::Hpke => TransportEncryptionConfig::new(materials.identity()),
+			#[cfg(feature = "transport-cms")]
+			Self::Cms => {
+				let config = TransportEncryptionConfig::new(materials.cms.signing_identity());
+				config.with_key_agreement(materials.cms.key_agreement_identity())?
+			}
+		};
+
+		let addr = "127.0.0.1:0".parse::<TightBeamSocketAddr>()?;
+		let (listener, bound) = TokioListener::bind_with(addr, config).await?;
+		Ok((listener, *bound))
+	}
+
 	/// Return every enabled backend.
 	pub fn all() -> Vec<Self> {
 		let mut kinds = vec![Self::Hpke];
@@ -436,7 +470,11 @@ impl SecurityThreatHarness {
 
 	/// Spawn a protocol session of `kind`, where both endpoints run the default
 	/// security profile.
-	pub fn spawn(&self, kind: HandshakeBackendKind) -> Box<dyn HandshakeProtocol> {
+	///
+	/// # Errors
+	///
+	/// - The errors of [`Self::spawn_with_profiles`].
+	pub fn spawn(&self, kind: HandshakeBackendKind) -> Result<Box<dyn HandshakeProtocol>, TightBeamError> {
 		let client_profiles = vec![default_security_profile()];
 		let server_profiles = vec![default_security_profile()];
 		self.spawn_with_profiles(kind, client_profiles, server_profiles)
@@ -447,36 +485,41 @@ impl SecurityThreatHarness {
 	///
 	/// - The client offers `client_profiles`.
 	/// - The server accepts `server_profiles`.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError`] -- the trace collector refused a hidden event, as
+	///   an injected fault of a `testing-fault` run does.
 	pub fn spawn_with_profiles(
 		&self,
 		kind: HandshakeBackendKind,
 		client_profiles: impl IntoIterator<Item = SecurityProfileDesc>,
 		server_profiles: impl IntoIterator<Item = SecurityProfileDesc>,
-	) -> Box<dyn HandshakeProtocol> {
+	) -> Result<Box<dyn HandshakeProtocol>, TightBeamError> {
 		let client_profiles: Vec<SecurityProfileDesc> = client_profiles.into_iter().collect();
 		let server_profiles: Vec<SecurityProfileDesc> = server_profiles.into_iter().collect();
 
-		self.emit(Self::HARNESS_SPAWN_SESSION).ok();
+		self.emit(Self::HARNESS_SPAWN_SESSION)?;
 
 		match kind {
 			HandshakeBackendKind::Hpke => {
-				self.emit(Self::HARNESS_SPAWN_HPKE).ok();
-				Box::new(Session::<Hpke, DefaultCryptoProvider>::with_profiles(
+				self.emit(Self::HARNESS_SPAWN_HPKE)?;
+				Ok(Box::new(Session::<Hpke, DefaultCryptoProvider>::with_profiles(
 					&self.materials,
 					client_profiles,
 					server_profiles,
 					None,
-				))
+				)))
 			}
 			#[cfg(feature = "transport-cms")]
 			HandshakeBackendKind::Cms => {
-				self.emit(Self::HARNESS_SPAWN_CMS).ok();
-				Box::new(Session::<Cms, DefaultCryptoProvider>::with_profiles(
+				self.emit(Self::HARNESS_SPAWN_CMS)?;
+				Ok(Box::new(Session::<Cms, DefaultCryptoProvider>::with_profiles(
 					&self.materials,
 					client_profiles,
 					server_profiles,
 					None,
-				))
+				)))
 			}
 		}
 	}
@@ -489,27 +532,32 @@ impl SecurityThreatHarness {
 	/// - The session is deliberately weak. It opts out of the default strength
 	///   floor with [`NoStrengthFloor`], so the downgrade harness can capture
 	///   the messages of an AES-128 session.
-	pub fn spawn_weak(&self, kind: HandshakeBackendKind) -> Box<dyn HandshakeProtocol> {
-		self.emit(Self::HARNESS_SPAWN_WEAK).ok();
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError`] -- the trace collector refused a hidden event, as
+	///   an injected fault of a `testing-fault` run does.
+	pub fn spawn_weak(&self, kind: HandshakeBackendKind) -> Result<Box<dyn HandshakeProtocol>, TightBeamError> {
+		self.emit(Self::HARNESS_SPAWN_WEAK)?;
 		match kind {
 			HandshakeBackendKind::Hpke => {
-				self.emit(Self::HARNESS_SPAWN_HPKE_WEAK).ok();
-				Box::new(Session::<Hpke, Aes128CryptoProvider>::with_profiles(
+				self.emit(Self::HARNESS_SPAWN_HPKE_WEAK)?;
+				Ok(Box::new(Session::<Hpke, Aes128CryptoProvider>::with_profiles(
 					&self.materials,
 					vec![weak_security_profile()],
 					vec![weak_security_profile()],
 					Some(Arc::new(NoStrengthFloor)),
-				))
+				)))
 			}
 			#[cfg(feature = "transport-cms")]
 			HandshakeBackendKind::Cms => {
-				self.emit(Self::HARNESS_SPAWN_CMS_WEAK).ok();
-				Box::new(Session::<Cms, Aes128CryptoProvider>::with_profiles(
+				self.emit(Self::HARNESS_SPAWN_CMS_WEAK)?;
+				Ok(Box::new(Session::<Cms, Aes128CryptoProvider>::with_profiles(
 					&self.materials,
 					vec![weak_security_profile()],
 					vec![weak_security_profile()],
 					Some(Arc::new(NoStrengthFloor)),
-				))
+				)))
 			}
 		}
 	}
@@ -543,7 +591,7 @@ pub fn tamper_payload_truncate(payload: impl AsRef<[u8]>, keep_bytes: usize) -> 
 	payload.iter().take(keep_bytes).copied().collect()
 }
 
-/// The DER of the `ClientHello` that a captured HPKE hello carries.
+/// The `ClientHello` that a captured HPKE hello carries, decoded from its DER.
 fn captured_hello(hello: &[u8]) -> Result<ClientHello, TightBeamError> {
 	let content_info = WireDer::<ContentInfo>::try_from(hello)?;
 	let octets = content_info.value().content.decode_as::<OctetStringRef<'_>>()?;
@@ -849,8 +897,8 @@ impl<F: SessionFlow<P>, P: HandshakeProvider> HandshakeFlow for Session<F, P> {
 			let step = F::STEPS.iter().find(|step| step.index == index);
 			let step = step.ok_or_else(|| invalid_step_error("step is not part of this handshake flow"))?;
 
-			// The server answers the opening with its reply and the closing
-			// with nothing, and the client answers the reply with its closing.
+			// The server answers the opening with its reply and ends the flow
+			// at the closing. The client answers the reply with its closing.
 			let message = step.container.message(msg)?;
 			let answer = match step.direction {
 				Direction::ClientToServer => self.server.handle_request(message).await?,

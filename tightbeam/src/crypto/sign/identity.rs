@@ -22,6 +22,8 @@ use crate::x509::Certificate;
 
 #[cfg(all(feature = "aead", feature = "kdf", feature = "ecdh"))]
 use crate::crypto::profiles::DefaultCryptoProvider;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::crypto::sign::PresentedCertificates;
 #[cfg(all(feature = "aead", feature = "kdf", feature = "ecdh"))]
 use crate::crypto::x509::CertificateSpec;
 
@@ -34,15 +36,19 @@ use crate::crypto::x509::CertificateSpec;
 /// - refuses a key whose public half differs from the certificate's SubjectPublicKeyInfo, and
 /// - brings each value the provider returns to its canonical form.
 ///
-/// Both halves are `Arc`, and so is the DER of the certificate, which encodes
-/// once at construction. A clone also copies the `sid`.
+/// Both halves are `Arc`, and so is the `certificates` field the identity
+/// presents, which encodes once at construction. A clone also copies the
+/// `sid`.
 #[derive(Clone)]
 pub struct SigningIdentity {
 	certificate: PeerCertificate<ErasedSigning>,
-	certificate_der: Arc<[u8]>,
 	key: Arc<dyn SigningKeyProvider>,
 	sid: SignerIdentifier,
 	scheme: Scheme,
+	/// The certificate and the issuers above it that a handshake reply and a
+	/// client Finished present in `certificates`.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	presented: PresentedCertificates,
 }
 
 impl SigningIdentity {
@@ -53,7 +59,7 @@ impl SigningIdentity {
 	///
 	/// # Errors
 	///
-	/// - The [`Self::with_provider`] set.
+	/// - The errors of [`Self::with_provider`].
 	#[cfg(all(feature = "aead", feature = "kdf", feature = "ecdh"))]
 	pub fn new(
 		certificate: impl Into<Arc<Certificate>>,
@@ -76,7 +82,8 @@ impl SigningIdentity {
 	/// - [`SignerError::UnsupportedAlgorithm`] -- the key declares another
 	///   algorithm than `P`, or its public half is no key of `P`.
 	/// - [`SignerError::Key`] -- the provider fails to return its public key.
-	/// - [`SignerError::Encoding`] -- the certificate or its SubjectPublicKeyInfo fails to encode.
+	/// - [`SignerError::Encoding`] -- the `certificates` field or the
+	///   certificate's SubjectPublicKeyInfo fails to encode.
 	/// - [`SignerError::PublicKey`] -- the certificate's key is no key of `P`.
 	/// - [`SignerError::KeyMismatch`] -- the key's public half differs from the certificate's.
 	pub fn with_provider<P>(
@@ -101,9 +108,62 @@ impl SigningIdentity {
 		let scheme_key = scheme_key.map_err(|_| SignerError::UnsupportedAlgorithm(algorithm))?;
 
 		let sid = signer_identifier_of(certificate.certificate(), &scheme_key)?;
-		let certificate_der = Arc::<[u8]>::from(certificate.certificate().to_der()?);
+		#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+		let presented = PresentedCertificates::chain(certificate.certificate(), &[])?;
 
-		Ok(Self { certificate, certificate_der, key, sid, scheme })
+		Ok(Self {
+			certificate,
+			key,
+			sid,
+			scheme,
+			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+			presented,
+		})
+	}
+
+	/// Present `intermediates` beside the certificate of this identity: the
+	/// issuers of its path below the trust anchor of its peers, nearest
+	/// first, so each certificate names the next one as its issuer.
+	///
+	/// - A server's reply and a mutual client's Finished carry them in `certificates` (RFC 5652 §5.1).
+	/// - A peer whose store holds the trust anchor alone then builds the path.
+	/// - The chain replaces a chain this identity presented before.
+	///
+	/// # Errors
+	///
+	/// - [`SignerError::Certificate`] -- a certificate does not name the next
+	///   one as its issuer, a self-issued certificate sits below another, the
+	///   chain repeats a subject or returns to a certificate it holds, or it
+	///   holds more than
+	///   [`MAX_PRESENTED_PATH`](crate::constants::MAX_PRESENTED_PATH)
+	///   certificates with the certificate of this identity.
+	/// - [`SignerError::Encoding`] -- the set or the field fails to encode.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::crypto::key::Secp256k1KeyProvider;
+	/// use tightbeam::crypto::sign::SigningIdentity;
+	/// use tightbeam::testing::fixtures::{TestCertificate, TestCertificateChain};
+	///
+	/// // The leaf of the fixture chain, which its intermediate issued.
+	/// let TestCertificateChain { intermediate, leaf, leaf_key, .. } = TestCertificate::insecure_fixed_chain()?;
+	/// let identity = SigningIdentity::new(leaf, Arc::new(Secp256k1KeyProvider::from(leaf_key)))?;
+	///
+	/// // A reply of the identity carries the intermediate beside the leaf.
+	/// let _identity = identity.with_chain([intermediate])?;
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	pub fn with_chain(
+		self,
+		intermediates: impl IntoIterator<Item = impl Into<Arc<Certificate>>>,
+	) -> Result<Self, SignerError> {
+		let intermediates: Vec<Arc<Certificate>> = intermediates.into_iter().map(Into::into).collect();
+		let presented = PresentedCertificates::chain(self.certificate(), &intermediates)?;
+		Ok(Self { presented, ..self })
 	}
 
 	/// Decode `certificate` and pair it with `key`.
@@ -135,10 +195,11 @@ impl SigningIdentity {
 		Arc::clone(self.certificate.certificate())
 	}
 
-	/// The DER of the certificate this identity presents, encoded once at
-	/// construction, which a handshake transcript binds as it is sent.
-	pub fn certificate_der(&self) -> &[u8] {
-		&self.certificate_der
+	/// The `certificates` field a handshake message of this identity
+	/// presents: its certificate and the chain [`Self::with_chain`] set.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	pub(crate) fn presented(&self) -> &PresentedCertificates {
+		&self.presented
 	}
 
 	/// The certificate this identity presents, as the signing use admitted
@@ -210,7 +271,8 @@ impl SigningIdentity {
 	}
 }
 
-/// The subject and the signer identifier, with the key behind its provider.
+/// Shows the subject and the signer identifier alone, so the key stays behind
+/// its provider.
 impl fmt::Debug for SigningIdentity {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.debug_struct("SigningIdentity")

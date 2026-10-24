@@ -15,19 +15,24 @@ use crate::cms::signed_data::{SignerInfo, SignerInfos};
 use crate::crypto::cms::EnvelopeError;
 use crate::crypto::hash::Sha3_256;
 use crate::crypto::key::SigningKeyProvider;
+use crate::crypto::policy::Secp256k1Policy;
 use crate::crypto::profiles::SecurityProfileDesc;
 use crate::crypto::sign::ecdsa::k256::Secp256k1;
 use crate::crypto::sign::elliptic_curve::sec1::ToEncodedPoint;
 use crate::crypto::sign::elliptic_curve::PublicKey;
 use crate::crypto::sign::CmsSigner;
-use crate::crypto::x509::error::CertificateValidationError::{CertificateNotPinned, Expired};
+use crate::crypto::x509::error::CertificateValidationError::{
+	AmbiguousIssuer, CertificateNotPinned, CertificateNotTrusted, Expired, PathCycle, PathLenExceeded,
+};
 use crate::crypto::x509::policy::{
 	CertificateValidation, DirectTrustValidator, ExpiryValidator, RuntimeCertificatePinning,
 };
+use crate::crypto::x509::store::{CertificateTrustBuilder, TrustBuilder};
 use crate::crypto::x509::utils::Skid;
 use crate::der::asn1::SetOfVec;
 use crate::der::Encode;
 use crate::oids::{AES_128_GCM, SESSION_RECEIPT};
+use crate::testing::TestIdentity;
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::negotiation::{MuxSettings, NegotiationError, SecurityOffer, TransportOffer};
 use crate::transport::handshake::receipt::{ApprovalRefusal, ReceiptApprover, SessionReceipt};
@@ -40,7 +45,7 @@ use crate::x509::attr::{Attribute, Attributes};
 use crate::x509::Certificate;
 use crate::TightBeamError;
 
-#[cfg(feature = "transport-cms")]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::x509::KeyPurposes;
 #[cfg(feature = "transport-cms")]
 use crate::transport::handshake::Cms;
@@ -48,6 +53,8 @@ use crate::transport::handshake::Cms;
 use crate::transport::handshake::Hpke;
 #[cfg(all(feature = "transport-cms", feature = "transport-multiplex"))]
 use crate::transport::handshake::SessionPeer;
+#[cfg(feature = "transport-hpke")]
+use crate::transport::handshake::{ClientConfig, HpkeClientSettings, LearnedTrust};
 #[cfg(feature = "transport-cms")]
 use crate::transport::handshake::{CmsServerSettings, ServerConfig, SupportedProfiles};
 
@@ -676,6 +683,134 @@ async fn a_local_advertisement_alone_stays_single_flight<F: TestFlow>() -> Resul
 	Ok(())
 }
 
+/// A server of the fixed test chain, which presents its intermediate, beside a
+/// client of flow `F` that admits it. The CMS client's store holds the root
+/// alone.
+fn chained_pair<F: TestFlow>() -> (ChainedTestServer, TestClient<F>, TestServer<F>) {
+	let chained = ChainedTestServer::fixed();
+	let client = F::client(&chained.identity, &create_test_certificate());
+	let server = F::server_presenting(&chained.identity, chained.signing_identity());
+	(chained, Handshake::client(client), Handshake::server(server))
+}
+
+/// A reply carries the intermediate its server presents beside the signing
+/// certificate (RFC 5652 §5.1).
+async fn a_reply_carries_the_intermediate_its_server_presents<F: TestFlow>() -> Result<(), Box<dyn Error>> {
+	let (chained, mut client, mut server) = chained_pair::<F>();
+
+	let reply = server.reply(client.start()?).await?;
+	assert!(presented_certificates(&reply).contains(&chained.intermediate));
+	Ok(())
+}
+
+/// A reply whose intermediate was swapped for its twin of one subject and one
+/// key still holds a valid path, and the transcript binds the `certificates`
+/// field the server sent, so the reply's signature fails.
+async fn a_reply_whose_intermediate_was_swapped_is_refused<F: TestFlow>() -> Result<(), Box<dyn Error>> {
+	let (chained, mut client, mut server) = chained_pair::<F>();
+	let reply = server.reply(client.start()?).await?;
+	let leaf = chained.identity.signing.certificate.to_owned();
+	let swapped = with_presented(&reply, [leaf, chained.intermediate_twin()]);
+
+	let refused = client.respond(swapped).await;
+	assert!(matches!(refused, Err(HandshakeError::SignatureVerificationFailed)));
+	Ok(())
+}
+
+/// A reply of nine certificates is refused before any certificate of it is
+/// read or any signature checked (CWE-770).
+async fn a_reply_of_nine_certificates_is_refused<F: TestFlow>() -> Result<(), Box<dyn Error>> {
+	let (chained, mut client, mut server) = chained_pair::<F>();
+	let reply = server.reply(client.start()?).await?;
+	let path = [chained.identity.signing.certificate.to_owned(), chained.intermediate.to_owned()];
+	let crowded = with_presented(&reply, path.into_iter().chain(CertificateFixtures::strangers(7)));
+
+	let refused = client.respond(crowded).await;
+	let capped = matches!(refused, Err(HandshakeError::CertificateValidationError(PathLenExceeded)));
+	assert!(capped);
+	Ok(())
+}
+
+/// A reply whose issuers lead the walk back to a certificate of its path is
+/// refused before its signature is read.
+async fn a_reply_whose_path_returns_to_itself_is_refused<F: TestFlow>() -> Result<(), Box<dyn Error>> {
+	let (chained, mut client, mut server) = chained_pair::<F>();
+	let reply = server.reply(client.start()?).await?;
+	let leaf = chained.identity.signing.certificate.to_owned();
+	let [first, second] = CertificateFixtures::looping_issuers(&chained.intermediate);
+	let looping = with_presented(&reply, [leaf, first, second]);
+
+	let refused = client.respond(looping).await;
+	let cycled = matches!(refused, Err(HandshakeError::CertificateValidationError(PathCycle { .. })));
+	assert!(cycled);
+	Ok(())
+}
+
+/// A reply that carries two certificates of the subject of the signing
+/// certificate's issuer is refused, since the walk cannot tell which one
+/// issued it.
+async fn a_reply_with_two_issuers_of_one_subject_is_refused<F: TestFlow>() -> Result<(), Box<dyn Error>> {
+	let (chained, mut client, mut server) = chained_pair::<F>();
+	let reply = server.reply(client.start()?).await?;
+	let leaf = chained.identity.signing.certificate.to_owned();
+	let repeated = with_presented(&reply, [leaf, chained.intermediate.to_owned(), chained.intermediate_twin()]);
+
+	let refused = client.respond(repeated).await;
+	let ambiguous = matches!(refused, Err(HandshakeError::CertificateValidationError(AmbiguousIssuer { .. })));
+	assert!(ambiguous);
+	Ok(())
+}
+
+/// A client of flow `F` that presents the leaf of `chain` with `issuers`
+/// above it, beside a mutual server whose one client validator is a store
+/// that holds the root of `chain` alone.
+fn root_anchored_mutual<F: TestFlow>(
+	chain: &TestCertificateChain,
+	issuers: [Certificate; 1],
+) -> (TestClientConfig<F>, TestServerConfig<F>) {
+	let identity = TestIdentity::presenting(chain.leaf.to_owned(), &chain.leaf_key).with_chain(issuers);
+	let identity = identity.expect("the leaf names the issuer above it");
+	let server_identity = create_test_server();
+	let client = F::client_presenting(&server_identity, identity);
+
+	let store = CertificateTrustBuilder::from(Secp256k1Policy::default()).with_certificate(chain.root.to_owned());
+	let store = store.expect("the root is within its validity period").build();
+	let mut server = F::server(&server_identity);
+	server.peer_authentication = mutual_with(store);
+	(client, server)
+}
+
+/// A mutual server whose store holds the root alone admits a client whose
+/// certificate an intermediate issued, since the client Finished presents
+/// the intermediate and the server validates that path to the root (RFC
+/// 5280 §6.1).
+async fn a_root_only_server_admits_a_presented_intermediate<F: TestFlow>() -> Result<(), Box<dyn Error>> {
+	let chain = CertificateFixtures::insecure_fixed_chain()?;
+	let (client, server) = root_anchored_mutual::<F>(&chain, [chain.intermediate.to_owned()]);
+
+	let mut run = run(client, server).await;
+	let session = run.server.complete()?;
+	assert_eq!(session.peer(), Some(&chain.leaf));
+	Ok(())
+}
+
+/// A mutual server whose store holds the root alone refuses a client whose
+/// Finished presents another authority of the intermediate's name in its
+/// place, since that path reaches no anchor of the store.
+async fn a_root_only_server_refuses_a_swapped_intermediate<F: TestFlow>() -> Result<(), Box<dyn Error>> {
+	let chain = CertificateFixtures::insecure_fixed_chain()?;
+	let impostor = CertificateFixtures::authority(&create_test_signing_key(), "Intermediate")?;
+	let (client, server) = root_anchored_mutual::<F>(&chain, [impostor]);
+	let (mut client, mut server) = (Handshake::client(client), Handshake::server(server));
+
+	let reply = server.reply(client.start()?).await?;
+	let closing = client.respond(reply).await?;
+	let refused = server.finish(closing).await;
+	let untrusted = matches!(refused, Err(HandshakeError::CertificateValidationError(CertificateNotTrusted)));
+	assert!(untrusted);
+	Ok(())
+}
+
 /// Run each named test body once per protocol.
 macro_rules! over_each_flow {
 	($($test:ident),* $(,)?) => {
@@ -737,6 +872,73 @@ over_each_flow! {
 	multiplexing_negotiates_when_offered_and_enabled,
 	an_offer_alone_stays_single_flight,
 	a_local_advertisement_alone_stays_single_flight,
+	a_reply_carries_the_intermediate_its_server_presents,
+	a_reply_whose_intermediate_was_swapped_is_refused,
+	a_reply_of_nine_certificates_is_refused,
+	a_reply_whose_path_returns_to_itself_is_refused,
+	a_reply_with_two_issuers_of_one_subject_is_refused,
+	a_root_only_server_admits_a_presented_intermediate,
+	a_root_only_server_refuses_a_swapped_intermediate,
+}
+
+/// A CMS client whose store holds the root alone admits a signing certificate
+/// under an intermediate the reply presents, since it validates the presented
+/// path to that root (RFC 5280 §6.1).
+#[cfg(feature = "transport-cms")]
+#[tokio::test]
+async fn a_cms_client_of_the_root_alone_admits_a_presented_intermediate() -> Result<(), Box<dyn Error>> {
+	let (chained, mut client, mut server) = chained_pair::<Cms>();
+
+	let reply = server.reply(client.start()?).await?;
+	client.respond(reply).await?;
+	assert_eq!(client.peer_certificate(), Some(&chained.identity.signing.certificate));
+	Ok(())
+}
+
+/// An HPKE client whose trust validates each presented path to the root of
+/// `chained` alone.
+#[cfg(feature = "transport-hpke")]
+fn root_anchored_hpke_client(chained: &ChainedTestServer) -> TestClient<Hpke> {
+	let trust = LearnedTrust::anchored(Arc::new(chained.identity.store()));
+	let config = ClientConfig::new(HpkeClientSettings::new(trust), KeyPurposes::HOUSE);
+	Handshake::client(config.expect("an anonymous client serves the client role"))
+}
+
+/// An HPKE client whose store holds the root alone completes a handshake with
+/// a server whose signing certificate an intermediate issued, since it
+/// validates the path the reply presents to that root (RFC 5280 §6.1).
+#[cfg(feature = "transport-hpke")]
+#[tokio::test]
+async fn an_hpke_client_of_the_root_alone_completes_under_a_presented_intermediate() -> Result<(), Box<dyn Error>> {
+	let chained = ChainedTestServer::fixed();
+	let mut client = root_anchored_hpke_client(&chained);
+	let mut server = Handshake::server(Hpke::server_presenting(&chained.identity, chained.signing_identity()));
+
+	let reply = server.reply(client.start()?).await?;
+	let closing = client.respond(reply).await?;
+	let admitted = client.peer_certificate().cloned();
+	server.finish(closing).await?;
+	client.complete()?;
+	server.complete()?;
+	assert_eq!(admitted.as_ref(), Some(&chained.identity.signing.certificate));
+	Ok(())
+}
+
+/// An HPKE client whose store holds the root alone refuses a server that
+/// presents its signing certificate without the intermediate, since that
+/// path stops below its anchor.
+#[cfg(feature = "transport-hpke")]
+#[tokio::test]
+async fn an_hpke_client_of_the_root_alone_refuses_a_path_short_of_its_anchor() -> Result<(), Box<dyn Error>> {
+	let chained = ChainedTestServer::fixed();
+	let mut client = root_anchored_hpke_client(&chained);
+	let mut server = Handshake::server(Hpke::server(&chained.identity));
+
+	let reply = server.reply(client.start()?).await?;
+	let refused = client.respond(reply).await;
+	let short = matches!(refused, Err(HandshakeError::CertificateValidationError(CertificateNotTrusted)));
+	assert!(short);
+	Ok(())
 }
 
 /// A CMS client's session keeps the key-agreement certificate its opening

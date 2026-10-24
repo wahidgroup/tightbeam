@@ -63,6 +63,7 @@ pub use peer_table::{
 };
 pub use registry::{HiveEntry, HiveRegistry, SharedId};
 pub use runtime::ClusterGateway;
+pub(crate) use runtime::ColonyDialProtocol;
 pub(crate) use servlet_registry::HiveSlate;
 pub use servlet_registry::{
 	DialTarget, LocalRoute, PeerCaps, PeerRoute, PeerRouteInfo, PheromoneConfig, RelayRoute, RouteKind, ServletEntry,
@@ -78,13 +79,16 @@ use std::sync::Arc;
 
 use crate::constants::{DEFAULT_AD_RUMOR_REFRESH_MS, DEFAULT_MAX_HOPS};
 use crate::crypto::key::SigningKeyProvider;
+use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::crypto::sign::SigningIdentity;
-use crate::crypto::x509::{policy::CertificateValidation, CertificateSpec};
+use crate::crypto::x509::error::CertificateValidationError;
+use crate::crypto::x509::utils::CertificateExt;
+use crate::crypto::x509::{policy::CertificateValidation, CertificateSpec, KeyPurposes};
 use crate::policy::GatePolicy;
 use crate::trace::TraceCollector;
-use crate::transport::client::PoolConfig;
+use crate::transport::client::{ConnectionBuilder, ConnectionPoolBuilder, PoolConfig};
 use crate::transport::handshake::PeerAuthentication;
-use crate::transport::{Protocol, TightBeamAddress};
+use crate::transport::{Protocol, TightBeamAddress, TransportEncryptionConfig};
 use crate::urn::Urn;
 use crate::utils::time::Clock;
 use crate::TightBeamError;
@@ -107,7 +111,7 @@ pub struct HeartbeatConfig {
 	pub timeout: Duration,
 	/// Cap on concurrent heartbeat dials per cycle.
 	pub max_concurrent: usize,
-	/// Consecutive failures before unregistering a hive.
+	/// Consecutive failures that unregister a hive.
 	pub max_failures: u32,
 	/// Optional per-result callback for monitoring or tests.
 	pub on_heartbeat: Option<HeartbeatCallback>,
@@ -169,6 +173,10 @@ pub struct ClusterTlsConfig {
 	/// [`Self::from_identity`]. The certificate is the server identity, and
 	/// outbound dials present it as the client certificate.
 	identity: SigningIdentity,
+	/// The key purpose of each role the identity serves. The identity's
+	/// certificate is held to the signer purpose here, and the accept planes
+	/// and the outbound dials hold it to the server and client purposes.
+	key_purposes: KeyPurposes,
 	/// The server policy of every outbound dial on both planes. Every gateway
 	/// dial runs the HPKE flow, so each validator evaluates the signing
 	/// certificate that the dialed server's reply names.
@@ -205,29 +213,77 @@ impl ClusterTlsConfig {
 	///
 	/// One identity serves every plane: the colony and edge listeners present
 	/// it, and outbound hive and peer dials offer it as the client
-	/// certificate. Decoding it here means those planes share one certificate
-	/// rather than each decoding the specification again.
+	/// certificate. This method decodes it once, so those planes share one
+	/// certificate rather than each decoding the specification again.
 	///
 	/// # Errors
 	///
 	/// - [`TightBeamError::SerializationError`] -- `certificate` holds PEM or
 	///   DER that does not decode as a certificate.
+	/// - [`TightBeamError::CertificateValidationError`] -- the certificate
+	///   fails [`Self::from_identity`] under [`KeyPurposes::HOUSE`].
+	/// - [`TightBeamError`] -- the errors of [`SigningIdentity::new`], as their conversion names them.
 	pub fn new(certificate: CertificateSpec, key: Arc<dyn SigningKeyProvider>) -> Result<Self, TightBeamError> {
 		let identity = SigningIdentity::from_spec(certificate, key)?;
-		Ok(Self::from_identity(identity))
+		Ok(Self::from_identity(identity, KeyPurposes::HOUSE)?)
 	}
 
-	/// Serve every plane under `identity`, whose key signs under the
-	/// [`SigningProvider`](crate::crypto::profiles::SigningProvider) it was
-	/// paired under.
-	pub fn from_identity(identity: SigningIdentity) -> Self {
-		Self {
+	/// Serve every plane under `identity`, with the key purpose of each role
+	/// that `key_purposes` names. [`KeyPurposes::HOUSE`] holds the house
+	/// purposes.
+	///
+	/// - The identity signs this gateway's frames, so its certificate MUST
+	///   name `key_purposes.signer` or `anyExtendedKeyUsage`, or carry no
+	///   `extendedKeyUsage` (RFC 5280 §4.2.1.12).
+	/// - The accept planes and the outbound dials hold the certificate to the
+	///   server and client purposes, as
+	///   [`TransportEncryptionConfig::with_key_purposes`] states.
+	///
+	/// # Errors
+	///
+	/// - [`CertificateValidationError`] -- the certificate fails
+	///   [`CertificateExt::require_purpose`] for `key_purposes.signer`.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::colony::cluster::ClusterTlsConfig;
+	/// use tightbeam::crypto::key::Secp256k1KeyProvider;
+	/// use tightbeam::crypto::sign::SigningIdentity;
+	/// use tightbeam::crypto::x509::KeyPurposes;
+	/// use tightbeam::der::asn1::ObjectIdentifier;
+	/// use tightbeam::testing::{TestCertificate, TestKey};
+	///
+	/// let key = TestKey::insecure_fixed_signing();
+	/// let own = ObjectIdentifier::new("1.3.6.1.4.1.99999.3.12")?;
+	/// let certificate = TestCertificate::self_signed(&key);
+	/// let certificate = TestCertificate::with_key_purposes(certificate, [own]);
+	/// let provider = Arc::new(Secp256k1KeyProvider::from(key));
+	/// let identity = SigningIdentity::new(certificate, provider)?;
+	///
+	/// let purposes = KeyPurposes { signer: own, ..KeyPurposes::HOUSE };
+	/// let tls = ClusterTlsConfig::from_identity(identity, purposes)?;
+	/// assert!(tls.peer_trust.is_none());
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	///
+	/// [`TransportEncryptionConfig::with_key_purposes`]: crate::transport::TransportEncryptionConfig::with_key_purposes
+	pub fn from_identity(
+		identity: SigningIdentity,
+		key_purposes: KeyPurposes,
+	) -> Result<Self, CertificateValidationError> {
+		identity.certificate().require_purpose(key_purposes.signer)?;
+
+		Ok(Self {
 			identity,
+			key_purposes,
 			validators: Vec::new(),
 			client_validators: Vec::new(),
 			hive_trust: None,
 			peer_trust: None,
-		}
+		})
 	}
 
 	/// Replace the server policy of outbound dials, which evaluates the
@@ -279,7 +335,7 @@ impl ClusterTlsConfig {
 	///
 	/// A configured peer plane keeps peer dials on `peer_trust`. A gateway with
 	/// no peer plane dials its peers on the hive pool, so `hive_trust` answers
-	/// for it. `PoolConfig::build_cluster_pools` builds the pools in the same
+	/// for it. [`PoolConfig::build_cluster_pools`] builds the pools in the same
 	/// order.
 	#[must_use]
 	pub(crate) fn peer_dial_trust(&self) -> Option<&dyn crate::crypto::x509::store::CertificateTrust> {
@@ -293,12 +349,39 @@ impl ClusterTlsConfig {
 	pub fn identity(&self) -> &SigningIdentity {
 		&self.identity
 	}
+
+	/// The encryption config the colony and edge listeners share.
+	///
+	/// Both planes present the same certificate and key, so an external edge
+	/// client pins the same gateway identity that hives already trust.
+	///
+	/// - The client validators are those of [`Self::peer_authentication`].
+	/// - The key purposes are the ones [`Self::from_identity`] installed.
+	pub(crate) fn accept_encryption(&self) -> TransportEncryptionConfig<DefaultCryptoProvider> {
+		let encryption = TransportEncryptionConfig::new(self.identity.clone());
+		let validators = self.client_validators.iter().map(Arc::clone);
+
+		let encryption = encryption.with_client_validators(validators);
+		encryption.with_key_purposes(self.key_purposes)
+	}
+
+	/// Configures `builder` to dial under this identity: the pool presents the
+	/// identity as its client certificate, runs [`Self::validators`] as the
+	/// server policy, and holds both sides to the key purposes
+	/// [`Self::from_identity`] installed.
+	pub(crate) fn outbound<P: Protocol>(&self, builder: ConnectionPoolBuilder<P>) -> ConnectionPoolBuilder<P> {
+		let validators = self.validators.iter().map(Arc::clone);
+		let builder = builder.with_client_identity(self.identity.clone());
+
+		builder.with_server_policy(validators).with_key_purposes(self.key_purposes)
+	}
 }
 
 impl Clone for ClusterTlsConfig {
 	fn clone(&self) -> Self {
 		Self {
 			identity: self.identity.clone(),
+			key_purposes: self.key_purposes,
 			validators: self.validators.iter().map(Arc::clone).collect(),
 			client_validators: self.client_validators.iter().map(Arc::clone).collect(),
 			hive_trust: self.hive_trust.as_ref().map(Arc::clone),
@@ -311,6 +394,7 @@ impl core::fmt::Debug for ClusterTlsConfig {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 		f.debug_struct("ClusterTlsConfig")
 			.field("identity", &self.identity)
+			.field("key_purposes", &self.key_purposes)
 			.field("validators", &format!("[{} validators]", self.validators.len()))
 			.field("client_validators", &format!("[{} validators]", self.client_validators.len()))
 			.field("hive_trust", &self.hive_trust.as_ref().map(|_| "Some(<TrustStore>)"))
@@ -328,7 +412,7 @@ impl core::fmt::Debug for ClusterTlsConfig {
 pub struct PeerConfig {
 	/// Peer gateway addresses dialed to advertise exported types.
 	///
-	/// - The dial list is not an identity gate, and partial or asymmetric federation graphs are expected.
+	/// - The dial list picks dial targets alone, and partial or asymmetric federation graphs are expected.
 	/// - An empty list disables outbound advertisement.
 	/// - Each beat snapshots the local servlet registry as the slate, so peers
 	///   learn the types currently served.
@@ -478,7 +562,7 @@ impl core::fmt::Debug for PeerConfig {
 
 /// Runtime configuration for a cluster gateway.
 ///
-/// Assembled through [`ClusterConfigBuilder`] or
+/// Build one with [`ClusterConfigBuilder`] or
 /// [`ClusterConfig::new`]. The load balancer defaults to
 /// [`StochasticForager`](crate::colony::common::StochasticForager).
 pub struct ClusterConfig {
@@ -491,7 +575,7 @@ pub struct ClusterConfig {
 	pub load_balancer: Arc<dyn LoadBalancer>,
 	/// Hive health probes and eviction policy.
 	pub heartbeat: HeartbeatConfig,
-	/// Route scoring: reinforcement, weaken, and evaporation.
+	/// Route scoring: reinforcement, weakening, and evaporation.
 	pub pheromone: PheromoneConfig,
 	/// Gate policies evaluated before request decode.
 	pub policies: Vec<Arc<dyn GatePolicy + Send + Sync>>,
@@ -539,7 +623,7 @@ pub struct ClusterConfig {
 	/// re-admit a replay as new (CWE-294).
 	pub gossip: GossipConfig,
 	/// The clock every freshness, replay, retention and lease decision on
-	/// this gateway reads. Defaults to
+	/// this gateway reads. It defaults to
 	/// [`SystemClock`](crate::utils::time::SystemClock).
 	pub clock: Arc<dyn Clock>,
 	/// Colony URN from the gateway certificate URI SAN.
@@ -569,8 +653,8 @@ impl ClusterConfig {
 	/// A refresh slower than the gossip freshness window would re-publish
 	/// rumors that peers refuse as stale, so the configured interval is
 	/// clamped to [`GossipConfig::seen_ttl`] here. The window itself narrows
-	/// at startup to journal retention, so deriving on read keeps the two in
-	/// agreement.
+	/// at startup to journal retention, so this method derives the interval
+	/// on each read and the two stay in agreement.
 	#[must_use]
 	pub fn rumor_refresh(&self) -> Duration {
 		self.peer.rumor_refresh.min(self.gossip.seen_ttl)
@@ -634,7 +718,7 @@ impl ClusterConfig {
 		self.colony_urn.as_ref()
 	}
 
-	/// Binds colony membership to the certificate this config now holds.
+	/// Binds colony membership to the certificate this config holds.
 	///
 	/// # Caching
 	///
@@ -679,7 +763,7 @@ pub use crate::colony::common::{ClusterRequest, ClusterWorkRequest, ClusterWorkR
 /// The trait a cluster gateway implements.
 ///
 /// Gateways route work to registered hives by servlet type. Hives
-/// register dynamically, and servlet types are learned from those
+/// register dynamically, and the gateway learns servlet types from those
 /// registrations.
 pub trait Cluster: Sized + Send + Sync {
 	/// Protocol this gateway serves.
@@ -704,7 +788,7 @@ pub trait Cluster: Sized + Send + Sync {
 	/// - [`ClusterError::LockPoisoned`] -- the route registry is poisoned.
 	fn available_servlets(&self) -> Result<Vec<SharedId>, ClusterError>;
 
-	/// Servlet types reachable through peer gateways (learned, not local).
+	/// Servlet types reachable through the routes learned from peer gateways.
 	///
 	/// # Errors
 	///
@@ -749,10 +833,25 @@ pub trait ClusterHeartbeat: Cluster {
 	/// Heartbeat interval, timeout, and failure policy.
 	fn heartbeat_config(&self) -> &HeartbeatConfig;
 
-	/// Send one signed heartbeat to a hive via the connection pool.
+	/// Send one signed heartbeat to the hive registered at `addr`, via the
+	/// connection pool.
 	///
-	/// The background loop, a `JoinSet` with bounded concurrency, lives in
+	/// The dial admits only the identity that signed the hive's registration,
+	/// so the command leaves only toward that identity (CWE-346). The
+	/// background loop, a `JoinSet` with bounded concurrency, lives in
 	/// [`ClusterGateway::start`] rather than on this trait.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::InvalidAddress`] -- no hive is registered at `addr`,
+	///   or `addr` does not parse to dial.
+	/// - [`ClusterError::PeerMismatch`] -- another identity answered at `addr`.
+	/// - [`ClusterError::ConnectFailed`] -- the dial or the handshake failed.
+	/// - [`ClusterError::NoResponse`] -- the hive closed without answering.
+	/// - [`ClusterError::MalformedResponse`] -- the answer carried no heartbeat result.
+	/// - [`ClusterError::Transport`] -- the emit failed.
+	/// - [`ClusterError::Frame`] -- the frame failed to build, sign, or decode.
+	/// - [`ClusterError::LockPoisoned`] -- the hive registry is poisoned.
 	fn send_heartbeat(
 		&self,
 		addr: Self::Address,
@@ -762,14 +861,23 @@ pub trait ClusterHeartbeat: Cluster {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::cms::signed_data::SignerIdentifier;
 	use crate::colony::common::{ColonyNamespace, RegisterHiveRequest};
 	use crate::colony::hive::ServletInfo;
 	use crate::crypto::key::Secp256k1KeyProvider;
+	use crate::crypto::policy::Secp256k1Policy;
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
+	use crate::crypto::x509::error::CertificateValidationError::ExcludedKeyPurpose;
 	use crate::crypto::x509::policy::ExpiryValidator;
+	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
+	use crate::der::asn1::ObjectIdentifier;
+	use crate::der::oid::db::rfc5280::ANY_EXTENDED_KEY_USAGE;
 	use crate::policy::TransitStatus;
 	use crate::tb_cases;
 	use crate::testing::{TestCertificate, TestKey};
+	use crate::transport::client::ConnectionPool;
+	use crate::transport::tcp::TightBeamSocketAddr;
+	use crate::transport::TokioListener;
 	use crate::utils::time::ManualClock;
 
 	fn test_tls_config() -> ClusterTlsConfig {
@@ -779,6 +887,117 @@ mod tests {
 			Arc::new(Secp256k1KeyProvider::from(key)),
 		)
 		.expect("the test certificate must decode")
+	}
+
+	/// A signer purpose of an implementor's own, outside the house purposes.
+	const OWN_SIGNER: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.3.12");
+
+	/// An identity on the fixed test key whose certificate names `purpose` as
+	/// its one key purpose, or carries no `extendedKeyUsage` for `None`.
+	fn identity_naming(purpose: Option<ObjectIdentifier>) -> SigningIdentity {
+		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
+		let certificate = TestCertificate::self_signed(&key);
+		let certificate = match purpose {
+			Some(purpose) => TestCertificate::with_key_purposes(certificate, [purpose]),
+			None => certificate,
+		};
+
+		let provider = Arc::new(Secp256k1KeyProvider::from(key));
+		SigningIdentity::new(certificate, provider).expect("the fixture key proves its certificate")
+	}
+
+	// The identity signs the gateway's frames, so it is held to the signer
+	// purpose where it is installed (RFC 5280 §4.2.1.12). A certificate that
+	// names the signer purpose, any purpose, or no purpose at all installs.
+	tb_cases! {
+		fn from_identity_admits_an_identity_for_the_signer(
+			purpose: Option<ObjectIdentifier>
+		) -> Result<(), TightBeamError> {
+			ClusterTlsConfig::from_identity(identity_naming(purpose), KeyPurposes::HOUSE)?;
+
+			Ok(())
+		}
+		cases {
+			an_identity_for_the_signer => Some(KeyPurposes::HOUSE.signer),
+			an_identity_for_any_purpose => Some(ANY_EXTENDED_KEY_USAGE),
+			an_identity_with_no_key_purpose => None,
+		}
+	}
+
+	// A certificate whose key purposes leave the signer out is refused.
+	tb_cases! {
+		fn from_identity_refuses_an_identity_outside_the_signer(purpose: ObjectIdentifier) {
+			let installed = ClusterTlsConfig::from_identity(identity_naming(Some(purpose)), KeyPurposes::HOUSE);
+
+			let excluded = matches!(installed, Err(ExcludedKeyPurpose));
+			assert!(excluded);
+		}
+		cases {
+			an_identity_for_servers_alone => KeyPurposes::HOUSE.server,
+			an_identity_for_clients_alone => KeyPurposes::HOUSE.client,
+		}
+	}
+
+	// An identity that names an implementor's own signer purpose alone
+	// installs under the purposes that name it.
+	#[test]
+	fn from_identity_installs_an_own_signer_purpose_under_the_purposes_that_name_it() -> Result<(), TightBeamError> {
+		let key_purposes = KeyPurposes { signer: OWN_SIGNER, ..KeyPurposes::HOUSE };
+
+		ClusterTlsConfig::from_identity(identity_naming(Some(OWN_SIGNER)), key_purposes)?;
+
+		Ok(())
+	}
+
+	// The house purposes refuse an identity that names an implementor's own
+	// signer purpose alone.
+	#[test]
+	fn from_identity_refuses_an_own_signer_purpose_under_the_house_purposes() {
+		let installed = ClusterTlsConfig::from_identity(identity_naming(Some(OWN_SIGNER)), KeyPurposes::HOUSE);
+
+		let excluded = matches!(installed, Err(ExcludedKeyPurpose));
+		assert!(excluded);
+	}
+
+	/// A client purpose of an implementor's own, outside the house purposes.
+	const OWN_CLIENT: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.3.13");
+
+	// An outbound pool holds the gateway's identity to the client purpose its
+	// TLS config names. The pool answers that at the dial, before any
+	// handshake, so a dial of an identity of the own client purpose returns
+	// its lease.
+	#[tokio::test]
+	async fn the_outbound_pool_takes_the_configured_key_purposes() -> Result<(), Box<dyn core::error::Error>> {
+		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
+		let certificate = TestCertificate::self_signed(&key);
+		let certificate = TestCertificate::with_key_purposes(certificate, [OWN_CLIENT, KeyPurposes::HOUSE.signer]);
+		let trust = CertificateTrustBuilder::from(Secp256k1Policy::default()).with_certificate(certificate.clone())?;
+		let trust: Arc<dyn CertificateTrust> = Arc::new(trust.build());
+		let identity = SigningIdentity::new(certificate, Arc::new(Secp256k1KeyProvider::from(key)))?;
+		let tls = ClusterTlsConfig::from_identity(identity, KeyPurposes { client: OWN_CLIENT, ..KeyPurposes::HOUSE })?;
+		let pool = tls.outbound(ConnectionPool::<TokioListener>::builder()).with_trust_store(trust);
+		let pool = Arc::new(pool.build());
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+
+		pool.connect(TightBeamSocketAddr(listener.local_addr()?)).await?;
+
+		Ok(())
+	}
+
+	// `new` installs through `from_identity`, so it refuses the same identity
+	// in its own error.
+	#[test]
+	fn new_refuses_an_identity_for_servers_alone() -> Result<(), TightBeamError> {
+		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
+		let certificate = TestCertificate::self_signed(&key);
+		let certificate = TestCertificate::with_key_purposes(certificate, [KeyPurposes::HOUSE.server]);
+		let spec = CertificateSpec::Built(Box::new(certificate));
+
+		let refused = ClusterTlsConfig::new(spec, Arc::new(Secp256k1KeyProvider::from(key)));
+
+		let excluded = matches!(refused, Err(TightBeamError::CertificateValidationError(ExcludedKeyPurpose)));
+		assert!(excluded);
+		Ok(())
 	}
 
 	// An empty client-validator list is server authentication only, and a
@@ -812,8 +1031,8 @@ mod tests {
 
 	/// The signer every fixture registration binds. Registration always
 	/// names one, so the tests name one too.
-	fn test_signer() -> SharedId {
-		Arc::from(b"test-signer".as_slice())
+	fn test_signer() -> Arc<SignerIdentifier> {
+		Arc::new(ServletInfo::fixture_signer())
 	}
 
 	fn request(addr: impl AsRef<[u8]>, servlets: &[&str]) -> RegisterHiveRequest {
@@ -823,7 +1042,11 @@ mod tests {
 			metadata: None,
 			servlet_addresses: servlets
 				.iter()
-				.map(|s| ServletInfo { servlet_id: servlet_urn(s), address: addr.to_vec() })
+				.map(|s| ServletInfo {
+					servlet_id: servlet_urn(s),
+					address: addr.to_vec(),
+					signer: ServletInfo::fixture_signer(),
+				})
 				.collect(),
 		}
 	}
@@ -844,6 +1067,7 @@ mod tests {
 		let mismatched = ServletInfo {
 			servlet_id: instance_urn("ping", "127.0.0.1:9001"),
 			address: b"127.0.0.1:9002".to_vec(),
+			signer: ServletInfo::fixture_signer(),
 		};
 
 		let refused = config.servlet_slate(&[mismatched], &hive_addr);

@@ -5,14 +5,19 @@
 //! forged or untrusted certificate can pass validation and be accepted.
 //!
 //! ## Attack
-//! A certificate bearing the wrong (forged) public key is presented during the
-//! handshake alongside a genuine certificate, exercising the configured
-//! validators (here, key pinning).
+//! During the handshake, a peer presents a certificate that carries the wrong
+//! (forged) public key, beside a genuine certificate, which exercises the
+//! configured validators (here, key pinning).
 //!
 //! ## Expected control
-//! Certificate validation MUST be enforced during the handshake: a forged
-//! certificate MUST be rejected and a valid certificate MUST pass. Validator
-//! configuration is the application's responsibility.
+//! The handshake MUST enforce certificate validation: it MUST reject a forged
+//! certificate, and a valid certificate MUST pass. Validator configuration is
+//! the application's responsibility.
+//!
+//! The handshake carries the refusal of the validator:
+//!
+//! - `PublicKeyNotPinned` from the pin of a wrong key.
+//! - `CertificateDenied` from the validator that refuses every certificate.
 //!
 //! ## References
 //! - CWE-295: Improper Certificate Validation <https://cwe.mitre.org/data/definitions/295.html>
@@ -25,11 +30,15 @@
 use std::sync::Arc;
 
 use tightbeam::{
-	crypto::x509::{error::CertificateValidationError, policy::CertificateValidation, Certificate},
+	crypto::x509::{
+		error::CertificateValidationError::{self, CertificateDenied, PublicKeyNotPinned},
+		policy::CertificateValidation,
+		Certificate,
+	},
 	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
 	testing::{ScenarioConfig, SetupEnv},
 	trace::TraceCollector,
-	transport::handshake::Handshake,
+	transport::handshake::{Handshake, HandshakeError},
 	urn::Urn,
 	TightBeamError,
 };
@@ -50,7 +59,7 @@ pub struct RejectAllValidator;
 
 impl CertificateValidation for RejectAllValidator {
 	fn evaluate(&self, _cert: &Certificate) -> Result<(), CertificateValidationError> {
-		Err(CertificateValidationError::CertificateDenied)
+		Err(CertificateDenied)
 	}
 }
 
@@ -71,8 +80,8 @@ impl SingleKeyPinning {
 		Self { allowed_key: key }
 	}
 
-	/// Create a pinning validator that accepts a DIFFERENT key, for the
-	/// rejection test.
+	/// Create a pinning validator that accepts another key, for the rejection
+	/// test.
 	pub fn wrong_key() -> Self {
 		// These bytes match no real certificate.
 		Self { allowed_key: vec![0xDE; 65] }
@@ -85,7 +94,7 @@ impl CertificateValidation for SingleKeyPinning {
 		if pub_key_bytes == self.allowed_key.as_slice() {
 			Ok(())
 		} else {
-			Err(CertificateValidationError::PublicKeyNotPinned)
+			Err(PublicKeyNotPinned)
 		}
 	}
 }
@@ -96,8 +105,8 @@ tb_assert_spec! {
 		mode: Accept,
 		assertions: [
 			(CERT_VALID_ACCEPTED, exactly!(1u32)),
-			(CERT_WRONG_KEY_REJECTED, exactly!(1u32)),
-			(CERT_REJECT_ALL_REJECTED, exactly!(1u32))
+			(CERT_WRONG_KEY_REJECTED, exactly!(1u32), equals!(true)),
+			(CERT_REJECT_ALL_REJECTED, exactly!(1u32), equals!(true))
 		]
 	}
 }
@@ -175,8 +184,9 @@ job! {
 			// Run the handshake, which fails when the client reads the reply.
 			let reply = server.reply(client.start()?).await?;
 			match client.respond(reply).await {
-				Err(_) => {
-					trace.event(CERT_WRONG_KEY_REJECTED)?;
+				Err(error) => {
+					let unpinned = matches!(error, HandshakeError::CertificateValidationError(PublicKeyNotPinned));
+					trace.event_with(CERT_WRONG_KEY_REJECTED, &[], unpinned)?;
 				}
 				Ok(_) => {
 					return Err(expectation_failure("certificate with wrong pinned key should be rejected"));
@@ -197,8 +207,9 @@ job! {
 			// Run the handshake, which fails when the client reads the reply.
 			let reply = server.reply(client.start()?).await?;
 			match client.respond(reply).await {
-				Err(_) => {
-					trace.event(CERT_REJECT_ALL_REJECTED)?;
+				Err(error) => {
+					let denied = matches!(error, HandshakeError::CertificateValidationError(CertificateDenied));
+					trace.event_with(CERT_REJECT_ALL_REJECTED, &[], denied)?;
 				}
 				Ok(_) => {
 					return Err(expectation_failure("RejectAll validator should reject all certificates"));

@@ -1,22 +1,22 @@
 //! Colony framework for distributed servlet orchestration.
 //!
-//! This module provides the building blocks for creating distributed message
-//! processing systems:
+//! A distributed message processing system has four parts:
 //!
-//! - **Workers**: Fundamental processing units that receive messages and produce responses
+//! - **Workers**: The base processing units, which receive messages and produce responses
 //! - **Servlets**: Self-contained, policy-driven message processing applications
-//! - **Hives**: Orchestrators that manage servlet instances (single or multiple)
+//! - **Hives**: Orchestrators that manage one or more servlet instances
 //! - **Clusters**: Gateways that route work requests to registered hives
 //!
 //! # Module Organization
 //!
-//! - [`common`]: Shared types like load balancers, message routers, and protocol messages
+//! - [`common`]: Shared types such as load balancers, message routers, and protocol messages
 //! - [`worker`]: Worker trait and runtime abstractions
 //! - [`servlet`]: Servlet trait and configuration builders
 //! - [`hive`]: Hive trait, configuration, and security gates
 //! - [`cluster`]: Cluster trait, registry, and configuration
 //! - [`client`]: Client-side work submission against a cluster gateway
 
+pub(crate) mod bound_dial;
 pub mod client;
 pub mod cluster;
 pub mod common;

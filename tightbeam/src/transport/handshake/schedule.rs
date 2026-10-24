@@ -36,10 +36,10 @@
 //! - `ee || base` is the hybrid shared secret `Z′ = Z || T` of NIST SP 800-56C Rev. 2 § 2.
 //! - `k_c2s` and `k_s2c` are the key-encryption keys of each direction's
 //!   records, at the key size of the provider's wrap.
-//! - `confirm` and `server` follow the Finished construction of RFC 9846 §
-//!   4.5.3, one `MacKey` per role, with the crate's label as the HKDF-Expand
-//!   info in place of `HkdfLabel`. `server` covers the transcript through the
-//!   octets of the reply's signature.
+//! - `confirm` and `server` follow the Finished construction of
+//!   RFC 9846 § 4.5.3, one `MacKey` per role, with the crate's label as the
+//!   HKDF-Expand info in place of `HkdfLabel`. `server` covers the transcript
+//!   through the octets of the reply's signature.
 //!
 //! [Forward secrecy](crate::transport::handshake#forward-secrecy) states what
 //! this schedule withholds from a holder of the server's static key.
@@ -117,6 +117,8 @@ use crate::oids::HANDSHAKE_TRANSCRIPT_HASH;
 use crate::random::{generate_nonce, CryptoRngCore};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::error::HandshakeError;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::transport::handshake::flow::ServerConfirmed;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::negotiation::{MuxSettings, RunnableProfile};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -198,8 +200,8 @@ impl TryFrom<SecretSlice<u8>> for BaseSecret {
 			return Err(HandshakeError::InvalidKeySize { expected: BASE_SECRET_SIZE, received });
 		}
 
-		// The copy lands in its wiping buffer directly, so no plain array of
-		// the secret exists on the way (CWE-226).
+		// The copy lands in its wiping buffer directly, so the secret sits only
+		// in wiping memory on the way (CWE-226).
 		let mut sized = ZeroizingArray::new([0u8; BASE_SECRET_SIZE]);
 		content.with(|bytes| sized.copy_from_slice(bytes));
 		Ok(Self(sized))
@@ -254,8 +256,8 @@ impl HandshakeSecret {
 	/// extracted under `salt`.
 	///
 	/// Both ephemerals serve this one agreement, so the secret holds forward
-	/// secrecy from them alone, as the ECDHE secret of TLS 1.3 does (RFC 9846
-	/// § 7.1).
+	/// secrecy from them alone, as the ECDHE secret of TLS 1.3 does
+	/// (RFC 9846 § 7.1).
 	///
 	/// # Errors
 	///
@@ -370,7 +372,7 @@ impl HandshakeSecret {
 	///
 	/// # Errors
 	///
-	/// - The [`Self::server_confirmation`] set.
+	/// - The errors of [`Self::server_confirmation`].
 	/// - [`HandshakeError::KeyConfirmationFailed`] -- the tags differ, so the
 	///   server derived another handshake secret or MACed another transcript or
 	///   another signature.
@@ -429,7 +431,7 @@ impl HandshakeSecret {
 	/// `transcript_hash`, and hand the secret back as confirmed.
 	///
 	/// The secret is consumed, so a caller that holds a [`ConfirmedSecret`]
-	/// holds no unconfirmed copy beside it.
+	/// holds the only copy of the secret.
 	///
 	/// # Errors
 	///
@@ -499,8 +501,8 @@ impl SecretSeal {
 	///
 	/// Every field around the client certificate in a closing has a fixed
 	/// width, so its length would be the length of the certificate. Padding to
-	/// a step with a floor gives a fleet whose certificates come from one
-	/// issuer one length.
+	/// a step with a floor gives the closings of a fleet whose certificates
+	/// come from one issuer one length.
 	const fn padding(self) -> Option<Padding> {
 		match self {
 			Self::Ack => None,
@@ -793,8 +795,8 @@ impl<'a> DecodeValue<'a> for KeyConfirmation {
 ///
 /// Both Finished messages cover the same transcript hash, so each role names
 /// the label its signed Finished leads with and the label of its `MacKey`. A
-/// Finished one endpoint signed or MACed then verifies as no Finished of the
-/// other, and a peer cannot reflect one back.
+/// Finished one endpoint signed or MACed then verifies only as a Finished of
+/// that endpoint, so a Finished a peer reflects back fails.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FinishedRole {
@@ -826,8 +828,8 @@ impl FinishedRole {
 
 	/// Build the content a signed Finished of this role signs: the role's
 	/// domain label, the transcript hash, and for the client Finished the
-	/// digest `D` of `certificate`, the certificate it carries (RFC 9846
-	/// § 4.5.2).
+	/// digest `D` of `certificate`, the certificate it carries
+	/// (RFC 9846 § 4.5.2).
 	///
 	/// The CMS transcript binds the server's certificate as it was sent, so the
 	/// server Finished binds the role and the transcript alone.
@@ -909,12 +911,12 @@ impl EpochSecret {
 	/// epoch_next = HKDF(u32be(32) || epoch || u32be(32) || ee, salt, "tb/session/kdf/epoch/v1")
 	/// ```
 	///
-	/// The agreement runs here, so no later link exists without a rekey
-	/// scalar. A holder of this link who records the whole renewal derives
-	/// nothing of the next one.
+	/// The agreement runs here, so every later link takes a rekey scalar. A
+	/// holder of this link who records the whole renewal still needs that
+	/// scalar to derive the next one.
 	///
-	/// - `local` is a single-use scalar, moved in. It is wiped where this
-	///   function returns, so its holder cannot keep it across a later await.
+	/// - `local` is a single-use scalar, moved in. It is wiped before the
+	///   derivation runs, so it is gone before any later await of the caller.
 	/// - `peer` is a [`PeerPoint`], so the point passed [`PeerEphemeral`].
 	///
 	/// # Errors
@@ -966,7 +968,7 @@ impl EpochSecret {
 /// `hash_0`. The handshake secret itself drops at completion.
 pub struct EpochMaterials {
 	/// Current epoch secret, zeroized on drop and on rotation
-	/// (RFC 9846, 7.2). Only `transport::rekey` reads it, and a build can
+	/// (RFC 9846 § 7.2). Only `transport::rekey` reads it, and a build can
 	/// include the handshake without the `transport-multiplex` consumers.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[allow(dead_code)]
@@ -1008,8 +1010,8 @@ impl EpochMaterials {
 	///
 	/// The derivation uses the same `secret` and `salt` pair as the
 	/// directional traffic keys. The distinct label yields an independent
-	/// secret (RFC 5869 domain separation), so retaining it never weakens the
-	/// traffic keys.
+	/// secret (RFC 5869 domain separation), so the traffic keys keep their
+	/// strength while it is retained.
 	///
 	/// # Errors
 	///
@@ -1156,8 +1158,8 @@ impl<C: CurveArithmetic> PeerPoint<C> {
 /// The static keys a peer's ephemeral is admitted against, when the peer
 /// holds any.
 ///
-/// The parse refuses a malformed, off-curve, or identity point, so no scalar
-/// multiplication runs on an invalid one. A point that collapses an ECDH
+/// The parse refuses a malformed, off-curve, or identity point, so every
+/// scalar multiplication runs on a valid one. A point that collapses an ECDH
 /// agreement into one with a static key of the peer is refused as well: the
 /// key itself, or its negation, since ECDH keeps the x-coordinate alone.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -1456,7 +1458,7 @@ impl<P: HandshakeProvider> Terms<P> {
 	///
 	/// # Errors
 	///
-	/// - The [`HandshakeSecret::confirmed`] set.
+	/// - The errors of [`HandshakeSecret::confirmed`].
 	pub(crate) fn confirm(
 		&self,
 		secret: HandshakeSecret,
@@ -1470,7 +1472,7 @@ impl<P: HandshakeProvider> Terms<P> {
 	///
 	/// # Errors
 	///
-	/// - The [`HandshakeSecret::server_confirmation`] set.
+	/// - The errors of [`HandshakeSecret::server_confirmation`].
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub(crate) fn server_confirmation(
 		&self,
@@ -1485,7 +1487,7 @@ impl<P: HandshakeProvider> Terms<P> {
 	///
 	/// # Errors
 	///
-	/// - The [`HandshakeSecret::confirm_server`] set.
+	/// - The errors of [`HandshakeSecret::confirm_server`].
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub(crate) fn confirm_server(
 		&self,
@@ -1501,7 +1503,7 @@ impl<P: HandshakeProvider> Terms<P> {
 	///
 	/// # Errors
 	///
-	/// - The [`HandshakeSecret::sealer`] set.
+	/// - The errors of [`HandshakeSecret::sealer`].
 	pub(crate) fn sealer(&self, secret: &HandshakeSecret, purpose: SecretSeal) -> Result<Sealer<P>, HandshakeError> {
 		secret.sealer::<P>(purpose, self.kdf_salt(), self.transcript_hash())
 	}
@@ -1520,18 +1522,33 @@ pub struct Agreed<P: HandshakeProvider> {
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl<P: HandshakeProvider> Agreed<P> {
-	/// Gather what one handshake agreed, and the peer that `peer`, the
-	/// admitted party, records.
+	/// Gather what a server agreed: the secret whose client tag verified,
+	/// and the client that `peer`, the admitted party, records.
 	///
 	/// `receipt` is the dual-signed receipt of a budget-bearing session, and
 	/// `None` for an unmetered one.
-	pub(crate) fn new(
+	pub(crate) fn server(
 		terms: Terms<P>,
-		secret: HandshakeSecret,
+		secret: ConfirmedSecret,
 		receipt: Option<StoredReceipt>,
 		peer: impl PeerIdentity,
 	) -> Self {
-		Self { terms, secret, receipt, peer: peer.into_peer() }
+		Self { terms, secret: secret.into_secret(), receipt, peer: peer.into_peer() }
+	}
+
+	/// Gather what a client agreed: the secret of a server whose reply
+	/// signature and server Finished verified, and the server that `peer`,
+	/// the admitted party, records.
+	///
+	/// `receipt` is the dual-signed receipt of a budget-bearing session, and
+	/// `None` for an unmetered one.
+	pub(crate) fn client(
+		terms: Terms<P>,
+		confirmed: ServerConfirmed,
+		receipt: Option<StoredReceipt>,
+		peer: impl PeerIdentity,
+	) -> Self {
+		Self { terms, secret: confirmed.into_secret(), receipt, peer: peer.into_peer() }
 	}
 
 	/// The negotiated terms.

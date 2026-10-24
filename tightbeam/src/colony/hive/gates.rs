@@ -7,19 +7,18 @@
 
 use core::sync::atomic::{AtomicU16, Ordering};
 use core::time::Duration;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::colony::common::{ClusterCommand, ClusterCommandKind, ClusterCommandResponse, IssuedAt, ReplyShape};
 use crate::crypto::sign::VerifiedSignature;
 use crate::crypto::x509::store::{CertificateTrust, TrustVerification};
-use crate::crypto::x509::{CanonicalKey, KeyCurves, KeyIdentity};
-use crate::der::{Decode, Encode};
+use crate::crypto::x509::{CanonicalKey, KeyCurves, KeyList, KeyListError};
+use crate::der::Encode;
 use crate::policy::{GatePolicy, ProvenPeer, SessionContext, TransitStatus};
-use crate::spki::SubjectPublicKeyInfoRef;
 use crate::utils::time::{Clock, MonotonicInstant, UnixMillis};
 use crate::utils::BasisPoints;
-use crate::{Errorizable, Frame, TightBeamError};
+use crate::{Frame, TightBeamError};
 
 /// The states of one signer's circuit in a [`ClusterCircuitBreaker`].
 ///
@@ -101,8 +100,9 @@ struct SignerCircuit {
 impl SignerCircuit {
 	const CLOSED: Self = Self { position: Position::Closed, failures: 0 };
 
-	/// A closed circuit with no failures carries no history, so its row is
-	/// dropped and the map stays bounded by the signers currently failing.
+	/// Whether this circuit is closed with no failures. Such a circuit carries
+	/// no history, so [`ClusterCircuitBreaker::prune`] drops its row and the
+	/// map stays bounded by the signers currently failing.
 	const fn is_quiescent(&self) -> bool {
 		matches!(self.position, Position::Closed) && self.failures == 0
 	}
@@ -941,55 +941,18 @@ pub enum PeerListMode {
 	Deny,
 }
 
-/// Why [`PeerListGate::new`] refuses a list.
-///
-/// Each variant names the entry by its position in the list, so the operator
-/// can find it. A list that holds a key no session can match would let the
-/// peer it meant to name pass a deny list, so the gate refuses the list.
-#[derive(Errorizable, Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PeerListError {
-	/// The entry is no SubjectPublicKeyInfo DER, or its canonical form
-	/// exceeds the DER length cap.
-	#[error("Peer list entry {index} is no SubjectPublicKeyInfo")]
-	Unreadable {
-		/// The position of the entry in the list.
-		index: usize,
-	},
-	/// The entry names an elliptic-curve key that reads as no point, which is
-	/// one of these:
-	///
-	/// - A malformed point, or a form that RFC 5480 §2.2 refuses.
-	/// - An encoding that the decoder of its curve refuses.
-	/// - A key with no named curve.
-	/// - A key on a binary-field curve of SEC 2 or ANSI X9.62.
-	/// - A key under `id-ecDH` or `id-ecMQV` (RFC 5480 §2.1.2).
-	///
-	/// The handshake refuses every peer that holds one.
-	#[error("Peer list entry {index} names an elliptic-curve key that is no point")]
-	NoPoint {
-		/// The position of the entry in the list.
-		index: usize,
-	},
-	/// The entry names a point on a named curve that the gate's
-	/// [`KeyCurves`] holds no decoder for, so the gate cannot tell the point
-	/// from an off-curve encoding of another key. A set that holds a decoder
-	/// of the curve reads the entry.
-	#[error("Peer list entry {index} names a curve the gate holds no decoder for")]
-	NoDecoder {
-		/// The position of the entry in the list.
-		index: usize,
-	},
-}
-
 /// An allow list or a deny list of session identities.
 ///
 /// - The gate keys on the [`CanonicalKey`] of the mutually authenticated peer certificate.
+/// - The gate reads its entries through the key list that [`PublicKeyPinning`] reads its pins through.
 /// - The frame signer stays an application concern.
 /// - An empty session context answers as an absent peer, so an allow list
 ///   fails closed (`Unauthenticated`) and a deny list admits.
+///
+/// [`PublicKeyPinning`]: crate::crypto::x509::policy::PublicKeyPinning
 #[derive(Clone)]
 pub struct PeerListGate {
-	keys: HashSet<CanonicalKey>,
+	keys: KeyList,
 	mode: PeerListMode,
 }
 
@@ -999,30 +962,27 @@ impl PeerListGate {
 	///
 	/// # Errors
 	///
-	/// - [`PeerListError::Unreadable`] -- an entry is no SubjectPublicKeyInfo
+	/// - [`KeyListError::Unreadable`] -- an entry is no SubjectPublicKeyInfo
 	///   DER, or its canonical form exceeds the DER length cap.
-	/// - [`PeerListError::NoPoint`] -- an entry names an elliptic-curve key that reads as no point.
-	/// - [`PeerListError::NoDecoder`] -- an entry names a point on a curve that
-	///   `curves` holds no decoder for.
+	/// - [`KeyListError::NoPoint`] -- an entry names an elliptic-curve key that reads as no point.
+	/// - [`KeyListError::NoDecoder`] -- an entry names a point on a curve that `curves` holds no decoder for.
 	///
 	/// # Examples
 	///
 	/// ```
-	/// use tightbeam::colony::hive::{PeerListError, PeerListGate, PeerListMode};
-	/// use tightbeam::crypto::x509::KeyCurves;
+	/// use tightbeam::colony::hive::{PeerListGate, PeerListMode};
+	/// use tightbeam::crypto::x509::{KeyCurves, KeyListError};
 	///
 	/// // An entry that is no SubjectPublicKeyInfo refuses the whole list.
 	/// let refused = PeerListGate::new(PeerListMode::Deny, KeyCurves::HOUSE, [b"not a key"]);
-	/// assert_eq!(refused.err(), Some(PeerListError::Unreadable { index: 0 }));
+	/// assert_eq!(refused.err(), Some(KeyListError::Unreadable { index: 0 }));
 	/// ```
-	pub fn new<I, K>(mode: PeerListMode, curves: KeyCurves, keys: I) -> Result<Self, PeerListError>
+	pub fn new<I, K>(mode: PeerListMode, curves: KeyCurves, keys: I) -> Result<Self, KeyListError>
 	where
 		I: IntoIterator<Item = K>,
 		K: AsRef<[u8]>,
 	{
-		let read = |(index, der): (usize, K)| Self::identity(index, der.as_ref(), curves);
-		let keys = keys.into_iter().enumerate().map(read);
-		let keys = keys.collect::<Result<HashSet<_>, _>>()?;
+		let keys = KeyList::read(curves, keys)?;
 		Ok(Self { keys, mode })
 	}
 
@@ -1032,7 +992,7 @@ impl PeerListGate {
 	/// # Errors
 	///
 	/// - The [`Self::new`] set.
-	pub fn allow<I, K>(keys: I) -> Result<Self, PeerListError>
+	pub fn allow<I, K>(keys: I) -> Result<Self, KeyListError>
 	where
 		I: IntoIterator<Item = K>,
 		K: AsRef<[u8]>,
@@ -1046,28 +1006,12 @@ impl PeerListGate {
 	/// # Errors
 	///
 	/// - The [`Self::new`] set.
-	pub fn deny<I, K>(keys: I) -> Result<Self, PeerListError>
+	pub fn deny<I, K>(keys: I) -> Result<Self, KeyListError>
 	where
 		I: IntoIterator<Item = K>,
 		K: AsRef<[u8]>,
 	{
 		Self::new(PeerListMode::Deny, KeyCurves::HOUSE, keys)
-	}
-
-	/// The canonical form of the key of `der`, the SubjectPublicKeyInfo DER at
-	/// `index` of the list, read in place under `curves`.
-	fn identity(index: usize, der: &[u8], curves: KeyCurves) -> Result<CanonicalKey, PeerListError> {
-		let unreadable = PeerListError::Unreadable { index };
-		let spki = SubjectPublicKeyInfoRef::from_der(der).map_err(|_| unreadable)?;
-		let identity = KeyIdentity::read(spki, curves);
-		if identity.names_no_point() {
-			return Err(PeerListError::NoPoint { index });
-		}
-		if identity.names_an_undecoded_curve() {
-			return Err(PeerListError::NoDecoder { index });
-		}
-
-		identity.to_canonical().map_err(|_| unreadable)
 	}
 
 	/// The verdict for one peer identity.
@@ -1229,7 +1173,7 @@ mod tests {
 	}
 
 	/// The refusal of a deny list whose second entry is the key of `entry`.
-	fn refusal_of(entry: &Certificate) -> Option<PeerListError> {
+	fn refusal_of(entry: &Certificate) -> Option<KeyListError> {
 		PeerListGate::deny([listed(&listed_peer()), listed(entry)]).err()
 	}
 
@@ -1471,7 +1415,7 @@ mod tests {
 	}
 
 	#[test]
-	fn peer_allow_list_admits_listed_key_only() -> Result<(), PeerListError> {
+	fn peer_allow_list_admits_listed_key_only() -> Result<(), KeyListError> {
 		let gate = PeerListGate::allow([listed(&listed_peer())])?;
 		assert_eq!(gate.admit(Some(&key_of(&listed_peer()))), TransitStatus::Ok);
 		assert_eq!(gate.admit(Some(&key_of(&unlisted_peer()))), TransitStatus::PermissionDenied);
@@ -1479,14 +1423,14 @@ mod tests {
 	}
 
 	#[test]
-	fn peer_allow_list_fails_closed_without_identity() -> Result<(), PeerListError> {
+	fn peer_allow_list_fails_closed_without_identity() -> Result<(), KeyListError> {
 		let gate = PeerListGate::allow([listed(&listed_peer())])?;
 		assert_eq!(gate.admit(None), TransitStatus::Unauthenticated);
 		Ok(())
 	}
 
 	#[test]
-	fn peer_deny_list_refuses_listed_key_only() -> Result<(), PeerListError> {
+	fn peer_deny_list_refuses_listed_key_only() -> Result<(), KeyListError> {
 		let gate = PeerListGate::deny([listed(&listed_peer())])?;
 		assert_eq!(gate.admit(Some(&key_of(&listed_peer()))), TransitStatus::PermissionDenied);
 		assert_eq!(gate.admit(Some(&key_of(&unlisted_peer()))), TransitStatus::Ok);
@@ -1494,7 +1438,7 @@ mod tests {
 	}
 
 	#[test]
-	fn peer_deny_list_admits_absent_identity() -> Result<(), PeerListError> {
+	fn peer_deny_list_admits_absent_identity() -> Result<(), KeyListError> {
 		let gate = PeerListGate::deny([listed(&listed_peer())])?;
 		assert_eq!(gate.admit(None), TransitStatus::Ok);
 		Ok(())
@@ -1518,7 +1462,7 @@ mod tests {
 	/// One secp256k1 point in either SEC 1 form is one key, so a deny list of
 	/// the uncompressed key refuses a session of its compressed form.
 	#[test]
-	fn a_deny_list_refuses_its_key_in_the_compressed_form() -> Result<(), PeerListError> {
+	fn a_deny_list_refuses_its_key_in_the_compressed_form() -> Result<(), KeyListError> {
 		let gate = PeerListGate::deny([listed(&listed_peer())])?;
 		let refused = GatePolicy::evaluate(&gate, None, &compressed_session());
 		assert_eq!(refused, TransitStatus::PermissionDenied);
@@ -1528,7 +1472,7 @@ mod tests {
 	/// An allow list of the uncompressed key admits a session of its
 	/// compressed form, as the store admits a certificate re-issued in it.
 	#[test]
-	fn an_allow_list_admits_its_key_in_the_compressed_form() -> Result<(), PeerListError> {
+	fn an_allow_list_admits_its_key_in_the_compressed_form() -> Result<(), KeyListError> {
 		let gate = PeerListGate::allow([listed(&listed_peer())])?;
 		let admitted = GatePolicy::evaluate(&gate, None, &compressed_session());
 		assert_eq!(admitted, TransitStatus::Ok);
@@ -1539,7 +1483,7 @@ mod tests {
 	/// form, read under a decoder of P-256, refuses a session of its
 	/// compressed form.
 	#[test]
-	fn a_deny_list_refuses_a_p256_key_in_the_compressed_form() -> Result<(), PeerListError> {
+	fn a_deny_list_refuses_a_p256_key_in_the_compressed_form() -> Result<(), KeyListError> {
 		let uncompressed = with_p256_point(&TestKey::RFC6979_P256_UNCOMPRESSED);
 		let compressed = with_p256_point(&TestKey::RFC6979_P256_COMPRESSED);
 		let gate = PeerListGate::new(PeerListMode::Deny, P256, [listed(&uncompressed)])?;
@@ -1555,13 +1499,13 @@ mod tests {
 	#[test]
 	fn a_list_entry_on_a_curve_without_a_decoder_refuses_the_list() {
 		let p256 = with_p256_point(&TestKey::RFC6979_P256_UNCOMPRESSED);
-		assert_eq!(refusal_of(&p256), Some(PeerListError::NoDecoder { index: 1 }));
+		assert_eq!(refusal_of(&p256), Some(KeyListError::NoDecoder { index: 1 }));
 	}
 
 	/// A key of another algorithm names no point of a curve, so a deny list
 	/// holds it and refuses its session.
 	#[test]
-	fn a_deny_list_of_a_key_of_another_algorithm_refuses_its_session() -> Result<(), PeerListError> {
+	fn a_deny_list_of_a_key_of_another_algorithm_refuses_its_session() -> Result<(), KeyListError> {
 		let ed25519 = under_algorithm(ID_ED_25519);
 		let gate = PeerListGate::deny([listed(&ed25519)])?;
 		let session = SessionContext::for_peer(Arc::new(ed25519));
@@ -1576,7 +1520,7 @@ mod tests {
 	#[test]
 	fn a_list_entry_that_is_no_key_refuses_the_list() {
 		let refused = PeerListGate::deny([b"key-a"]);
-		assert_eq!(refused.err(), Some(PeerListError::Unreadable { index: 0 }));
+		assert_eq!(refused.err(), Some(KeyListError::Unreadable { index: 0 }));
 	}
 
 	/// An entry that names an off-curve encoding of a secp256k1 key refuses
@@ -1584,7 +1528,7 @@ mod tests {
 	#[test]
 	fn a_list_entry_off_its_curve_refuses_the_list() {
 		let alias = TestCertificate::with_off_curve_key(listed_peer());
-		assert_eq!(refusal_of(&alias), Some(PeerListError::NoPoint { index: 1 }));
+		assert_eq!(refusal_of(&alias), Some(KeyListError::NoPoint { index: 1 }));
 	}
 
 	/// RFC 5480 §2.2 refuses the compact form, so an entry in it names no
@@ -1592,7 +1536,7 @@ mod tests {
 	#[test]
 	fn a_list_entry_in_the_compact_form_refuses_the_list() {
 		let compact = TestCertificate::with_compact_key(listed_peer());
-		assert_eq!(refusal_of(&compact), Some(PeerListError::NoPoint { index: 1 }));
+		assert_eq!(refusal_of(&compact), Some(KeyListError::NoPoint { index: 1 }));
 	}
 
 	/// RFC 5480 §2.2 refuses the hybrid form, so an entry in it names no
@@ -1600,7 +1544,7 @@ mod tests {
 	#[test]
 	fn a_list_entry_in_the_hybrid_form_refuses_the_list() {
 		let hybrid = TestCertificate::with_key_form(listed_peer(), 0x06);
-		assert_eq!(refusal_of(&hybrid), Some(PeerListError::NoPoint { index: 1 }));
+		assert_eq!(refusal_of(&hybrid), Some(KeyListError::NoPoint { index: 1 }));
 	}
 
 	/// A key on a binary-field curve reads as its bits, so an entry of one
@@ -1608,7 +1552,7 @@ mod tests {
 	#[test]
 	fn a_list_entry_on_a_binary_field_curve_refuses_the_list() {
 		let binary = TestCertificate::with_named_curve(listed_peer(), SECT233K1);
-		assert_eq!(refusal_of(&binary), Some(PeerListError::NoPoint { index: 1 }));
+		assert_eq!(refusal_of(&binary), Some(KeyListError::NoPoint { index: 1 }));
 	}
 
 	/// No use reads a key under `id-ecDH` (RFC 5480 §2.1.2), so an entry of
@@ -1616,7 +1560,7 @@ mod tests {
 	#[test]
 	fn a_list_entry_under_ec_dh_refuses_the_list() {
 		let restricted = under_algorithm(ID_EC_DH);
-		assert_eq!(refusal_of(&restricted), Some(PeerListError::NoPoint { index: 1 }));
+		assert_eq!(refusal_of(&restricted), Some(KeyListError::NoPoint { index: 1 }));
 	}
 
 	/// The breaker keys on the identity of the peer's key, so the failures of

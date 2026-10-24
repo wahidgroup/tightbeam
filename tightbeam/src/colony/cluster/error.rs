@@ -39,8 +39,9 @@ pub enum ClusterError {
 	#[error("Connect failed")]
 	ConnectFailed,
 
-	/// The gateway that answered a peer hop is not the gateway the route names,
-	/// so the hop ended before any frame was sent to it.
+	/// The party that answered a bound dial presented no certificate, or one
+	/// its route or its registration does not name, so the dial ended before
+	/// any frame was sent to it.
 	#[error("Peer identity mismatch")]
 	PeerMismatch,
 
@@ -67,8 +68,9 @@ pub enum ClusterError {
 	#[error("Registration failed")]
 	RegistrationFailed,
 
-	/// An address is not one the protocol can dial, or a servlet locator names
-	/// another address than the one beside it.
+	/// An address is not one the protocol can dial, a servlet locator names
+	/// another address than the one beside it, or a heartbeat names an address
+	/// that no hive registered.
 	#[error("Invalid address: {:#?}")]
 	InvalidAddress(Vec<u8>),
 
@@ -125,8 +127,8 @@ impl ClusterError {
 	/// The status a refused hive registration or address update answers
 	/// with.
 	///
-	/// A poisoned registry is this gateway's fault, so the hive is told the
-	/// gateway is unavailable rather than that it lacks the right to
+	/// A poisoned registry is this gateway's fault, so the gateway tells the
+	/// hive it is unavailable rather than that the hive lacks the right to
 	/// register. Every other refusal is a claim the gateway judged and
 	/// denied.
 	#[must_use]
@@ -137,18 +139,45 @@ impl ClusterError {
 		}
 	}
 
-	/// Transit status a failed forward relays to the caller.
+	/// The transit status a failed forward relays to the caller.
 	///
-	/// A servlet refusal relays unchanged so the caller keeps its
-	/// retryability contract. Everything else degrades to
-	/// [`TransitStatus::Unavailable`].
+	/// - A refusal the far end answered relays unchanged, so the caller keeps its retryability contract.
+	/// - A fault that [`Self::proves_undelivered`] answers [`TransitStatus::Unavailable`].
+	/// - Any other fault answers [`TransitStatus::Unknown`], because the frame may have run.
+	///
+	/// A gateway that forwards to this one therefore reads `Unavailable` as a
+	/// frame that never ran, and retries it on another route.
 	#[must_use]
-	pub(crate) fn forward_status(self) -> TransitStatus {
+	pub(crate) fn forward_status(&self) -> TransitStatus {
+		let answered = match self {
+			ClusterError::Transport(TransportError::OperationFailed(failure)) => TransitStatus::try_from(*failure).ok(),
+			_ => None,
+		};
+
+		match answered {
+			Some(status) => status,
+			None if self.proves_undelivered() => TransitStatus::Unavailable,
+			None => TransitStatus::Unknown,
+		}
+	}
+
+	/// Whether this forward fault proves that the frame never reached its
+	/// party, so a retry on another route runs it at most once.
+	///
+	/// Two kinds of fault prove it:
+	///
+	/// - A refused connect or handshake, an answer from another identity, or an
+	///   address the protocol cannot dial.
+	/// - A transport fault that [`TransportError::proves_unsent`] names.
+	///
+	/// Every other fault, such as a closed connection or a reply that never
+	/// came, can follow a frame that arrived, so the frame may have run.
+	#[must_use]
+	pub(crate) fn proves_undelivered(&self) -> bool {
 		match self {
-			ClusterError::Transport(TransportError::OperationFailed(failure)) => {
-				TransitStatus::try_from(failure).unwrap_or(TransitStatus::Unavailable)
-			}
-			_ => TransitStatus::Unavailable,
+			ClusterError::ConnectFailed | ClusterError::PeerMismatch | ClusterError::InvalidAddress(_) => true,
+			ClusterError::Transport(fault) => fault.proves_unsent(),
+			_ => false,
 		}
 	}
 }
@@ -163,6 +192,7 @@ impl<T> From<std::sync::PoisonError<T>> for ClusterError {
 mod tests {
 	use super::*;
 	use crate::tb_cases;
+	use crate::transport::error::TransportFailure;
 
 	// A poisoned lock is the gateway's own fault and answers unavailable.
 	// Every other refusal denies the hive's claim.
@@ -181,7 +211,9 @@ mod tests {
 	}
 
 	// A hop that never reached its gateway answers unavailable, so the trail
-	// weakens and the bounded retry takes the next route.
+	// weakens and the bounded retry takes the next route. A hop that may have
+	// delivered answers unknown, so a gateway upstream keeps it on its first
+	// route.
 	tb_cases! {
 		fn forward_status_of((error, expected): (ClusterError, TransitStatus)) {
 			let status = error.forward_status();
@@ -192,6 +224,47 @@ mod tests {
 		cases {
 			a_failed_dial_is_unavailable => (ClusterError::ConnectFailed, TransitStatus::Unavailable),
 			another_gateway_at_the_socket_is_unavailable => (ClusterError::PeerMismatch, TransitStatus::Unavailable),
+			a_reply_that_never_came_is_unknown => (ClusterError::NoResponse, TransitStatus::Unknown),
+			a_closed_connection_is_unknown => (
+				ClusterError::Transport(TransportError::ConnectionClosed),
+				TransitStatus::Unknown
+			),
+			an_answered_refusal_relays => (
+				ClusterError::Transport(TransportError::OperationFailed(TransportFailure::PermissionDenied)),
+				TransitStatus::PermissionDenied
+			),
+		}
+	}
+
+	// A fault before the frame's write completed, or the far end's own
+	// `Unavailable`, proves the frame never ran. A fault after the write proves
+	// nothing.
+	tb_cases! {
+		fn proves_undelivered_of((error, expected): (ClusterError, bool)) {
+			let undelivered = error.proves_undelivered();
+
+			assert_eq!(undelivered, expected);
+		}
+
+		cases {
+			a_refused_connect_proves_it => (ClusterError::ConnectFailed, true),
+			an_answer_from_another_identity_proves_it => (ClusterError::PeerMismatch, true),
+			a_failed_write_proves_it => (ClusterError::Transport(TransportError::SendFailed), true),
+			an_unavailable_reply_proves_it => (
+				ClusterError::Transport(TransportError::OperationFailed(TransportFailure::Unavailable)),
+				true
+			),
+			a_full_stream_table_proves_it => (
+				ClusterError::Transport(TransportError::OperationFailed(TransportFailure::StreamsExhausted)),
+				true
+			),
+			a_reply_header_past_the_cap_does_not => (
+				ClusterError::Transport(TransportError::OperationFailed(TransportFailure::SizeExceeded)),
+				false
+			),
+			a_reply_that_never_came_does_not => (ClusterError::NoResponse, false),
+			a_closed_connection_does_not => (ClusterError::Transport(TransportError::ConnectionClosed), false),
+			a_malformed_reply_does_not => (ClusterError::MalformedResponse, false),
 		}
 	}
 }

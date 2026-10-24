@@ -1,15 +1,19 @@
 //! # Handshake replay threat
 //!
 //! ## Weakness
-//! Captured handshake messages could be replayed to establish an unauthorized
-//! session if completed handshakes are not bound to fresh, single-use state.
+//! An attacker could replay captured handshake messages to establish an
+//! unauthorized session if completed handshakes are not bound to fresh,
+//! single-use state.
 //!
 //! ## Attack
-//! A valid client handshake message is captured and re-sent to the server (all
-//! enabled backends: HPKE, CMS).
+//! An attacker captures a valid client handshake message and re-sends it to
+//! the server (on every enabled backend: HPKE, CMS).
 //!
 //! ## Expected control
-//! Replayed handshake messages MUST be rejected.
+//! The server MUST reject a replayed handshake message. The closing seals
+//! under a key of its own handshake and authenticates that handshake's
+//! transcript hash, so a fresh session MUST refuse a replayed closing by that
+//! binding (`SealedClosing(AuthenticatedAttribute)`).
 //!
 //! ## References
 //! - CWE-294: Authentication Bypass by Capture-replay <https://cwe.mitre.org/data/definitions/294.html>
@@ -18,9 +22,11 @@
 use std::sync::Arc;
 
 use tightbeam::{
+	crypto::cms::EnvelopeError::AuthenticatedAttribute,
 	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
 	testing::{ScenarioConfig, SetupEnv},
 	trace::TraceCollector,
+	transport::handshake::HandshakeError::SealedClosing,
 	urn::Urn,
 	TightBeamError,
 };
@@ -28,6 +34,9 @@ use tightbeam::{
 use crate::security::common::{
 	expectation_failure, HandshakeBackendKind, InjectionOutcome, SecurityThreatHarness, BACKEND_COUNT_U32,
 };
+
+#[cfg(feature = "testing-fault")]
+use tightbeam::testing::{error::TestingError, FaultModel};
 
 pub(crate) const REPLAY_ATTEMPT: Urn<'static> = tightbeam::urn!("test", "event:replay-attack/replay-attempt");
 pub(crate) const REPLAY_DETECTED: Urn<'static> = tightbeam::urn!("test", "event:replay-attack/replay-detected");
@@ -42,7 +51,7 @@ tb_assert_spec! {
 		assertions: [
 			(REPLAY_INIT_HANDSHAKE, exactly!(BACKEND_COUNT_U32)),
 			(REPLAY_ATTEMPT, exactly!(BACKEND_COUNT_U32)),
-			(REPLAY_DETECTED, exactly!(BACKEND_COUNT_U32)),
+			(REPLAY_DETECTED, exactly!(BACKEND_COUNT_U32), equals!(true)),
 			(REPLAY_REJECTED, exactly!(BACKEND_COUNT_U32))
 		]
 	}
@@ -101,25 +110,29 @@ job! {
 	async fn run((trace,): (Arc<TraceCollector>,)) -> Result<(), TightBeamError> {
 		let harness = SecurityThreatHarness::with_trace(Arc::clone(&trace));
 		for kind in HandshakeBackendKind::all() {
-			// Capture a complete handshake
-			let mut session = harness.spawn(kind);
+			// Capture a complete handshake.
+			let mut session = harness.spawn(kind)?;
 			let captured = session.capture_full().await?;
 
 			trace.event(REPLAY_INIT_HANDSHAKE)?;
 
-			// Get the final client message (replay target for all backends)
+			// The final client message is the replay target on every backend.
 			let target = captured
 				.final_client_message()
 				.ok_or_else(|| expectation_failure("no client messages captured"))?;
 
-			// Attempt replay on a fresh session
-			let mut attack_session = harness.spawn(captured.kind);
+			// Attempt the replay on a fresh session.
+			let mut attack_session = harness.spawn(captured.kind)?;
 
 			trace.event(REPLAY_ATTEMPT)?;
 
 			match attack_session.inject_at_step(target.step, &target.payload).await? {
-				InjectionOutcome::Rejected(_) => {
-					trace.event(REPLAY_DETECTED)?;
+				InjectionOutcome::Rejected(error) => {
+					// The closing authenticates the transcript of the session
+					// it was sealed in, so the fresh session refuses it by
+					// that binding.
+					let bound = matches!(error, TightBeamError::HandshakeError(SealedClosing(AuthenticatedAttribute)));
+					trace.event_with(REPLAY_DETECTED, &[], bound)?;
 					trace.event(REPLAY_REJECTED)?;
 				}
 				InjectionOutcome::Accepted => {
@@ -130,4 +143,20 @@ job! {
 
 		Ok(())
 	}
+}
+
+/// A fault that the trace injects at the spawn of a session fails the
+/// scenario that spawns it, with the injected error.
+#[cfg(feature = "testing-fault")]
+#[tokio::test]
+async fn a_fault_at_the_session_spawn_fails_the_scenario() -> Result<(), Box<dyn std::error::Error>> {
+	let spawn = SecurityThreatHarness::HARNESS_SPAWN_SESSION;
+	let fault = || TestingError::InvariantViolated;
+	let model = FaultModel::default().with_event_fault(spawn, fault, tightbeam::bps!(10000));
+	let trace = Arc::new(TraceCollector::new().with_fault_model(model));
+
+	let outcome = ReplayAttackScenario::run((trace,)).await;
+	let injected = matches!(outcome, Err(TightBeamError::TestingError(TestingError::InvariantViolated)));
+	assert!(injected);
+	Ok(())
 }

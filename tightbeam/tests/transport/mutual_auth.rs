@@ -1,6 +1,6 @@
-//! Mutual Authentication Integration Test
+//! Integration test of mutual authentication.
 //!
-//! Tests end-to-end mutual authentication using X.509 certificates
+//! The test runs end-to-end mutual authentication with X.509 certificates.
 
 #![cfg(all(
 	feature = "x509",
@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use crate::common::static_pair::{CLIENT_CERT, CLIENT_KEY, CLIENT_PINNING, SERVER_CERT, SERVER_KEY};
+use crate::common::static_pair::{client_pinning, CLIENT_CERT, CLIENT_KEY, SERVER_CERT, SERVER_KEY};
 use tightbeam::crypto::sign::SigningIdentity;
 use tightbeam::{
 	at_least,
@@ -51,9 +51,7 @@ pub(crate) const SERVER_ID: Urn<'static> = tightbeam::urn!("test", "event:mutual
 pub(crate) const CLIENT_CERT_REJECTED: Urn<'static> = tightbeam::urn!("test", "event:mutual-auth/client-cert-rejected");
 pub(crate) const SERVER_CERT_REJECTED: Urn<'static> = tightbeam::urn!("test", "event:mutual-auth/server-cert-rejected");
 
-// ============================================================================
-// Test Helpers
-// ============================================================================
+// The tests share this helper.
 
 fn make_server_trust_store() -> Result<Arc<dyn CertificateTrust>, TightBeamError> {
 	let server_cert = Certificate::try_from(SERVER_CERT)?;
@@ -64,9 +62,7 @@ fn make_server_trust_store() -> Result<Arc<dyn CertificateTrust>, TightBeamError
 	))
 }
 
-// ============================================================================
-// Message Types
-// ============================================================================
+// The client and the servlet exchange these message types.
 
 #[derive(Clone, Debug, PartialEq, Beamable, Sequence)]
 struct AuthRequest {
@@ -79,9 +75,7 @@ struct AuthResponse {
 	authenticated: bool,
 }
 
-// ============================================================================
-// Mutual Authentication Servlet with X.509
-// ============================================================================
+// This servlet runs mutual authentication with X.509 certificates.
 
 servlet! {
 	pub MutualAuthServlet<AuthRequest, EnvConfig = ()>,
@@ -101,11 +95,9 @@ servlet! {
 	}
 }
 
-// ============================================================================
-// Test Scenario
-// ============================================================================
+// The positive scenario authenticates both ends and exchanges one request.
 
-// Verification spec
+// The spec checks the reply of the authenticated exchange.
 tb_assert_spec! {
 	MutualAuthSpec,
 	V(1,0,0): {
@@ -125,7 +117,7 @@ tb_scenario! {
 		start: |env| async move {
 			let trace = Arc::new(env.trace);
 			let key = SERVER_KEY.to_provider::<Secp256k1>()?;
-			let validators = vec![Arc::new(CLIENT_PINNING) as Arc<dyn CertificateValidation>];
+			let validators = vec![Arc::new(client_pinning()) as Arc<dyn CertificateValidation>];
 			let servlet_conf = ServletConfig::<TokioListener, AuthRequest>::builder()
 				.with_certificate(SERVER_CERT, key, validators)?
 				.with_config(Arc::new(()))
@@ -145,7 +137,6 @@ tb_scenario! {
 		},
 		client: |env| async move {
 			let (trace, mut client) = (env.trace, env.client);
-			// Send authenticated request
 			let request = AuthRequest {
 				client_id: "test-client-mutual-001".to_string(),
 			};
@@ -155,7 +146,7 @@ tb_scenario! {
 				message: request
 			}?;
 
-			// Emit trace events unconditionally - assertion spec validates them
+			// Each trace event fires unconditionally for the spec to check.
 			let response_frame: Option<Frame> = client.emit(request_frame, None).await?;
 			trace.event_with(RESPONSE_RECEIVED, &[], Presence::of_option(&response_frame))?;
 
@@ -171,10 +162,10 @@ tb_scenario! {
 }
 
 /// Drive the lazy encryption handshake to a verdict: `connect` only
-/// dials, so a certificate rejection surfaces on the first exchange.
-/// Probes with a well-formed request so a decode failure cannot
-/// masquerade as a handshake refusal. The client transport carries the
-/// scenario collector so its own handshake verdicts are recorded.
+/// dials, so a certificate rejection surfaces on the first exchange. The
+/// probe is a well-formed request, so a decode failure cannot masquerade as
+/// a handshake refusal. The client transport carries the scenario
+/// collector, so the collector records its own handshake verdicts.
 async fn handshake_rejected(
 	builder: ClientBuilder<TokioListener>,
 	addr: TightBeamSocketAddr,
@@ -195,7 +186,7 @@ async fn handshake_rejected(
 	Ok(result.is_err())
 }
 
-// Negative test A: Invalid client certificate
+// Negative test A: the server refuses an invalid client certificate.
 tb_assert_spec! {
 	pub InvalidClientSpec,
 	V(1,0,0): {
@@ -213,7 +204,7 @@ tb_scenario! {
 		start: |env| async move {
 			let trace = Arc::new(env.trace);
 			let key = SERVER_KEY.to_provider::<Secp256k1>()?;
-			let validators = vec![Arc::new(CLIENT_PINNING) as Arc<dyn CertificateValidation>];
+			let validators = vec![Arc::new(client_pinning()) as Arc<dyn CertificateValidation>];
 			let servlet_conf = ServletConfig::<TokioListener, AuthRequest>::builder()
 				.with_certificate(SERVER_CERT, key, validators)?
 				.with_config(Arc::new(()))
@@ -225,9 +216,9 @@ tb_scenario! {
 			use tightbeam::crypto::key::Secp256k1KeyProvider;
 			use tightbeam::testing::fixtures::{TestKey, TestCertificate};
 
-			// Client identity outside the server's pin set: certificate
-			// and signing provider share one fresh key, so the rejection
-			// is the pin check and not a key/certificate mismatch.
+			// The client identity sits outside the server's pin set. Its
+			// certificate and signing provider share one fresh key, so the
+			// rejection is the pin check and not a key/certificate mismatch.
 			let invalid_key = TestKey::insecure_fixed_signing();
 			let invalid_cert = TestCertificate::self_signed(&invalid_key);
 
@@ -251,9 +242,9 @@ tb_scenario! {
 	}
 }
 
-// Negative test B: Invalid server certificate. The client transport
-// carries the scenario collector, so the client-side rejection must also
-// record the production audit event.
+// Negative test B: the client refuses an invalid server certificate. The
+// client transport carries the scenario collector, so the client-side
+// rejection must also record the production audit event.
 tb_assert_spec! {
 	pub InvalidServerSpec,
 	V(1,0,0): {
@@ -274,16 +265,16 @@ tb_scenario! {
 			use tightbeam::crypto::key::Secp256k1KeyProvider;
 			use tightbeam::testing::fixtures::{TestKey, TestCertificate};
 
-			// Server presents a certificate outside the client's trust
-			// store: certificate and signing provider share one fresh
-			// key, so the rejection is the trust check and not a
-			// key/certificate mismatch.
+			// The server presents a certificate outside the client's trust
+			// store. Its certificate and signing provider share one fresh key,
+			// so the rejection is the trust check and not a key/certificate
+			// mismatch.
 			let invalid_server_key = TestKey::insecure_fixed_signing();
 			let invalid_server_cert = TestCertificate::self_signed(&invalid_server_key);
 
 			let certificate = CertificateSpec::Built(Box::new(invalid_server_cert));
 			let provider = Arc::new(Secp256k1KeyProvider::from(invalid_server_key));
-			let validators = vec![Arc::new(CLIENT_PINNING) as Arc<dyn CertificateValidation>];
+			let validators = vec![Arc::new(client_pinning()) as Arc<dyn CertificateValidation>];
 			let servlet_conf = ServletConfig::<TokioListener, AuthRequest>::builder()
 				.with_certificate(certificate, provider, validators)?
 				.with_config(Arc::new(()))
@@ -292,7 +283,7 @@ tb_scenario! {
 			MutualAuthServlet::start(Arc::clone(&trace), servlet_conf).await
 		},
 		setup: |env| async move {
-			// Client trusts only SERVER_CERT; the presented certificate
+			// The client trusts only SERVER_CERT. The presented certificate
 			// differs, so the client-side validation must refuse it.
 			let key = CLIENT_KEY.to_provider::<Secp256k1>()?;
 			let builder = ClientBuilder::<TokioListener>::builder()

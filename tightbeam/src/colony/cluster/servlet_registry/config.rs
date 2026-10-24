@@ -16,11 +16,11 @@ pub const DEFAULT_EVAPORATION_RATE_BPS: u16 = 1000;
 pub const DEFAULT_EVAPORATION_INTERVAL_SECS: u64 = 30;
 /// Default starting pheromone level for a new entry.
 pub const DEFAULT_INITIAL_PHEROMONE: u64 = 5000;
-/// Default consecutive failures before a route abandons.
+/// Default consecutive failures before the registry abandons a route.
 pub const DEFAULT_ABANDONMENT_LIMIT: u32 = 5;
 /// Default reinforcement boost (500 = 5% pheromone increase on success).
 pub const DEFAULT_REINFORCEMENT_BOOST: u64 = 500;
-/// Default weakening penalty (0 = only increment trial count on failure).
+/// Default weakening penalty. At 0, a failure only adds to the trial count.
 pub const DEFAULT_WEAKENING_PENALTY: u64 = 0;
 
 /// Configuration for pheromone-based servlet tracking.
@@ -77,6 +77,7 @@ impl ClusterConfig {
 	/// Builds the route entries for one hive's advertised servlets.
 	///
 	/// - Each instance URN locator MUST equal the address advertised beside it (CWE-639).
+	/// - Each entry answers under the signer advertised beside it (CWE-346).
 	/// - Each entry starts on this colony's pheromone level and abandonment limit.
 	///
 	/// A servlet that advertises one address under the identity of another
@@ -102,9 +103,11 @@ impl ClusterConfig {
 				address: Arc::from(info.address.as_slice()),
 				servlet_type: Arc::from(info.servlet_id.type_canonical_bytes().as_slice()),
 				hive_id: Arc::clone(hive_addr),
+				signer: info.signer.clone(),
 			};
 
-			let entry = ServletEntry::local(route, self.pheromone.initial_pheromone, self.pheromone.abandonment_limit);
+			let PheromoneConfig { initial_pheromone, abandonment_limit, .. } = self.pheromone;
+			let entry = ServletEntry::local(route, initial_pheromone, abandonment_limit);
 			entries.push(entry);
 		}
 
@@ -113,10 +116,10 @@ impl ClusterConfig {
 }
 
 impl PheromoneConfig {
-	/// Builds the peer-routed slate, with each entry keyed by `peer_hive_id`
-	/// NUL type.
+	/// Builds the peer-routed slate, where each entry keys by
+	/// `peer_hive_id NUL type`.
 	///
-	/// `dial` is the admitted gateway socket stored on every entry, so every
+	/// `dial` is the admitted gateway socket that every entry stores, so every
 	/// type this peer advertises resolves to the one gateway that owns it.
 	pub(crate) fn peer_slate(
 		&self,
