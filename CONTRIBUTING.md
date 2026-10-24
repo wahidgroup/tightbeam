@@ -17,7 +17,7 @@ Use `make help` for the full command list. Apply fixes with `make lint fix=1`.
 Git hooks live in `.husky/` and are installed automatically by [husky-rs](https://crates.io/crates/husky-rs) (which sets `core.hooksPath`) the first time `cargo test` builds dev-dependencies. Set `NO_HUSKY_HOOKS=1` to skip installation (CI does this).
 
 - `commit-msg` - enforces the commit header format (see [Title](#title))
-- `pre-push` - runs `make lint` and verifies commit signatures. Commits MUST be signed before push.
+- `pre-push` - runs `make lint-code` (rustfmt and clippy) and verifies commit signatures. CI runs the full `make lint`, which adds the rustdoc build and the spellcheck. Commits MUST be signed before push.
 
 ### Code Style
 
