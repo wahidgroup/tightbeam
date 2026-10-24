@@ -44,9 +44,9 @@ impl PeerEntry {
 	/// - A failed one waits [`PEER_PROBE_BACKOFF_MS`] after its last probe, and
 	///   each further failure doubles that wait.
 	/// - The wait stops growing at [`PEER_PROBE_BACKOFF_MAX_MS`].
-	/// - The distance to the last probe is taken in either clock direction, so
-	///   a stamp from before a backward clock step holds no candidate out for
-	///   good.
+	/// - The check takes the distance to the last probe in either clock
+	///   direction, so a stamp from before a backward clock step holds no
+	///   candidate out for good.
 	pub fn probe_due(&self, now: UnixMillis) -> bool {
 		now.abs_diff(self.last_probe) >= self.probe_wait()
 	}
@@ -75,10 +75,10 @@ impl PeerEntry {
 	}
 }
 
-/// The bounds every admission into the table is held to.
+/// The bounds that every admission into the table meets.
 ///
-/// A table is built with its bounds and keeps them, so every later admission
-/// meets those same bounds.
+/// [`GuardedTable::new`] gives a table its bounds, and the table keeps them,
+/// so every later admission meets those same bounds.
 #[derive(Debug, Default)]
 pub struct Bounds {
 	/// The configured anchors, which admission keeps out of both learned
@@ -96,7 +96,7 @@ pub struct Bounds {
 /// with other bounds, in its place.
 #[derive(Debug)]
 pub struct TableState {
-	/// The bounds every admission is held to, fixed when the table is built.
+	/// The bounds that every admission meets, fixed for the life of the table.
 	bounds: Bounds,
 	/// Learned peers that wait for their first verified probe.
 	new: HashMap<AdmittedDial, PeerEntry>,
@@ -104,8 +104,8 @@ pub struct TableState {
 	tried: HashMap<AdmittedDial, PeerEntry>,
 	/// Anchors whose beat dial proved flood membership.
 	///
-	/// A seed shares its verified anchors over PEX, which is how a
-	/// bootstrapping peer learns its first dial targets. An anchor that later
+	/// A seed shares its verified anchors over PEX, which is how a peer at
+	/// bootstrap learns its first dial targets. An anchor that later
 	/// answers from outside the flood leaves this map.
 	anchors_verified: HashMap<AdmittedDial, PeerEntry>,
 	/// This gateway's own advertised address, held out of peer admission.
@@ -113,7 +113,7 @@ pub struct TableState {
 	/// The prefix the last feeler draw ended on, so the next draw starts at
 	/// the prefix after it. The cursor lives in memory only.
 	probe_cursor: Option<AddressGroup>,
-	/// The prefix the last peer-exchange draw ended on. It is kept apart from
+	/// The prefix the last peer-exchange draw ended on. It stays apart from
 	/// the feeler cursor, so each walk is fair on its own.
 	pex_cursor: Option<AddressGroup>,
 	/// Count of durable mutations applied so far, each one taken inside the
@@ -193,12 +193,12 @@ impl TableState {
 	/// Admits `hints` as unverified candidates stamped at `now`, and returns
 	/// how many it took.
 	pub fn learn(&mut self, hints: impl IntoIterator<Item = PeerHint>, now: UnixMillis) -> usize {
-		let mut admitted = 0;
+		let mut admitted: usize = 0;
 		for hint in hints {
 			let entry = PeerEntry { peer_id: hint.peer_id, last_probe: now, failures: 0 };
 			let candidate = Candidate { dial: hint.dial, tried: false, entry };
 			if self.admit(candidate) {
-				admitted += 1;
+				admitted = admitted.saturating_add(1);
 			}
 		}
 
@@ -207,7 +207,7 @@ impl TableState {
 
 	/// Records a verified probe of `addr` under the signer that answered.
 	///
-	/// It returns whether the address was promoted into tried, and whether a
+	/// It returns whether it promoted the address into tried, and whether a
 	/// learned table moved.
 	pub fn promote(&mut self, addr: AdmittedDial, peer_id: Option<&[u8]>, now: UnixMillis) -> (bool, bool) {
 		// Anchors are configured rather than learned, so a verified anchor
@@ -232,7 +232,7 @@ impl TableState {
 		if was_resident && !admitted {
 			// The signer that answered is at its cap, so the address waits
 			// in `new` the way a capped candidate does. A full `new` table
-			// drops it, which leaves it to be learned again.
+			// drops it, so a later hint can teach it again.
 			self.admit(Candidate { dial: addr, tried: false, entry });
 		}
 
@@ -253,7 +253,7 @@ impl TableState {
 	}
 
 	/// Counts a failed beat dial on the tried peer at `addr`, and evicts the
-	/// peer at the failure threshold. It returns whether the peer was evicted.
+	/// peer at the failure threshold. It returns whether it evicted the peer.
 	pub fn record_failure(&mut self, addr: AdmittedDial) -> bool {
 		let Some(entry) = self.tried.get_mut(&addr) else {
 			return false;
@@ -311,8 +311,8 @@ impl TableState {
 
 	/// Draws up to `cap` verified peers to share over peer exchange.
 	pub fn pex_sample(&mut self, cap: usize) -> Vec<PeerRecord> {
-		// Anchors and tried are disjoint maps, so chaining them borrows a
-		// disjoint shareable view without building a merged copy. Only the
+		// Anchors and tried are disjoint maps, so a chain of the two borrows a
+		// disjoint shareable view and builds no merged copy. Only the
 		// sampled records own their data, because they outlive the guard.
 		let shareable = self.tried.iter().chain(self.anchors_verified.iter());
 		let draw = diversity_sample(shareable, cap, self.pex_cursor);
@@ -391,10 +391,10 @@ struct Draw {
 
 /// Round-robin sample across prefix buckets.
 ///
-/// - Buckets are visited in prefix order from the prefix after `after`, so the draw is deterministic.
+/// - The walk visits buckets in prefix order from the prefix after `after`, so the draw is deterministic.
 /// - Each bucket prefers the peer with the fewest failed probes, then its least recently probed one.
 /// - One prefix therefore draws at most its own share of a bounded sample.
-/// - A peer that failed a probe is drawn after every fresher one in its bucket.
+/// - The walk draws a peer that failed a probe after every fresher one in its bucket.
 ///
 /// # Starting prefix
 ///
@@ -403,8 +403,8 @@ struct Draw {
 /// other prefix (CWE-770). The caller therefore passes the prefix its last
 /// draw ended on as `after`, and keeps [`Draw::served_last`] for the next.
 ///
-/// The walk holds borrowed pairs only. The drawn addresses, at most `cap`
-/// of them, are copied out because they outlive the table lock.
+/// The walk holds borrowed pairs only. It copies out the drawn addresses,
+/// at most `cap` of them, because they outlive the table lock.
 fn diversity_sample<'t, I>(entries: I, cap: usize, after: Option<AddressGroup>) -> Draw
 where
 	I: Iterator<Item = (&'t AdmittedDial, &'t PeerEntry)>,
@@ -431,7 +431,7 @@ where
 	let served_last = last_lane.map(|(group, _)| *group);
 
 	let mut sample = Vec::new();
-	let mut depth = 0;
+	let mut depth: usize = 0;
 	while sample.len() < cap {
 		let mut drew = false;
 		for (_, lane) in &lanes {
@@ -448,14 +448,14 @@ where
 			break;
 		}
 
-		depth += 1;
+		depth = depth.saturating_add(1);
 	}
 
 	Draw { sample, served_last }
 }
 
-/// One peer on its way into a table, with the proof its address was
-/// admitted.
+/// One peer on its way into a table, with the proof that the dial policy
+/// admitted its address.
 ///
 /// Learned hints, verified probes, and hydrated records all enter through
 /// this one shape, so every path applies the anchor exclusion and the
@@ -486,7 +486,7 @@ pub struct GuardedTable {
 impl GuardedTable {
 	/// A guarded table held to `bounds`.
 	///
-	/// `candidates` are replayed through admission before any caller can reach
+	/// It replays `candidates` through admission before any caller can reach
 	/// the table, which is how persisted records come back.
 	pub fn new(bounds: Bounds, candidates: impl IntoIterator<Item = Candidate>) -> Self {
 		let mut state = TableState::new(bounds);
@@ -524,7 +524,7 @@ impl GuardedTable {
 	///
 	/// A `change` that reports a durable edit bumps the generation and returns
 	/// the snapshot at that generation. The caller hands it to the driver
-	/// after the guard is released, so a slow driver delays no reader
+	/// after it releases the guard, so a slow driver delays no reader
 	/// (CWE-667).
 	///
 	/// # Errors

@@ -1,27 +1,28 @@
-//! Delay-Tolerant Networking (DTN) tests
+//! The Delay-Tolerant Networking (DTN) tests.
 //!
-//! These tests demonstrate tightbeam's ability to provide DTN capabilities
-//! without traditional DTN infrastructure (custody transfer, Bundle Protocol, etc.)
+//! These tests show that tightbeam provides delay tolerance without the
+//! traditional DTN infrastructure, such as custody transfer and the Bundle
+//! Protocol.
 //!
 //! ## Traditional DTN Architecture
 //!
 //! Traditional DTN systems require:
-//! - **Custody Transfer Protocol**: Hop-by-hop acknowledgments with trusted intermediaries
-//! - **Bundle Protocol**: Complex protocol stack for store-and-forward
-//! - **Persistent Storage**: Each hop stores bundles until next hop available
-//! - **Trusted Nodes**: Each relay must be trusted to handle custody
+//! - **Custody Transfer Protocol**: Hop-by-hop acknowledgments with trusted intermediaries.
+//! - **Bundle Protocol**: A complex protocol stack for store-and-forward.
+//! - **Persistent Storage**: Each hop stores bundles until the next hop is available.
+//! - **Trusted Nodes**: Each relay must be trusted to handle custody.
 //!
 //! ## Tightbeam DTN Approach
 //!
-//! Tightbeam achieves delay tolerance through first-principles design:
-//! - **Cryptographic Chain**: `previous_frame` hash chain enables end-to-end verification
-//! - **Self-Verifying Messages**: No custody transfer needed - destination verifies directly
-//! - **No Trusted Intermediaries**: Relays are untrusted - crypto proves integrity
-//! - **TTL & Priorities**: Built into metadata, not separate protocol layers
-//! - **Matrix State**: Arbitrary application state encoded in cryptographically-bound matrix
+//! Tightbeam reaches delay tolerance through its first-principles design:
+//! - **Cryptographic Chain**: The `previous_frame` hash chain gives end-to-end verification.
+//! - **Self-Verifying Messages**: The destination verifies each message itself, with no custody transfer.
+//! - **No Trusted Intermediaries**: Relays stay untrusted, and cryptography proves integrity.
+//! - **TTL & Priorities**: The frame metadata carries them, with no separate protocol layer.
+//! - **Matrix State**: A cryptographically bound matrix encodes arbitrary application state.
 //!
-//! This represents a fundamental rethinking of DTN based on Information Theory's
-//! constraint: `I(t) ∈ (0,1) for all t ∈ T`
+//! The approach rests on the information fidelity constraint
+//! `I(t) ∈ (0,1) for all t ∈ T`.
 
 #![cfg(all(
 	feature = "testing-csp",
@@ -40,6 +41,8 @@ pub mod bms;
 pub mod certs;
 pub mod chain_processor;
 pub mod clock;
+pub mod delay;
+pub mod delay_tolerant;
 pub mod events;
 pub mod fault_manager;
 pub mod fault_matrix;

@@ -1,4 +1,4 @@
-//! Servlet export boundary integration tests.
+//! Integration tests of the servlet export boundary.
 //!
 //! These scenarios prove discoverability and enforcement on federated
 //! gateways with split trust planes. Gateway A anchors its own identity in
@@ -8,20 +8,20 @@
 //! # Planes
 //!
 //! - **Discoverability**: the advertise beat filters the slate through
-//!   `exported_types`, so an observer never installs a trail for an
-//!   unexported type.
+//!   `exported_types`, so an observer installs trails for exported types
+//!   alone.
 //! - **Enforcement**: the fail-closed allowlist refuses unexported targets
 //!   for external peers, relayed requests, and anonymous sessions, while
 //!   A's own first-party origin traffic and exported targets stay routable.
 //! - **Grants**: a positive `ExportGrant` opens one unexported target to a
-//!   selected caller identity without advertising it.
+//!   selected caller identity, and the ads still leave that target out.
 //!
 //! # Harness
 //!
 //! First-party recognition needs the inbound mutual-TLS accept plane, so
 //! the enforcement scenarios turn on `client_validators` and dial with an
-//! explicit client identity. Route claims are injected as direct signed
-//! advertisements with the beats off, so every event count is exact.
+//! explicit client identity. The scenarios inject route claims as direct
+//! signed advertisements with the beats off, so every event count is exact.
 
 use super::common::*;
 use super::federation::{type_route_count, wait_for_type_routes};
@@ -35,7 +35,7 @@ use tightbeam::der::Encode;
 ///
 /// Each `GatewayCerts.trust` anchors only that organization's own identity.
 /// A gateway places its own store on `hive_trust` and the other
-/// organization's store on `peer_trust`, so a peer session is anchored on
+/// organization's store on `peer_trust`, so a peer session anchors on
 /// exactly one plane.
 ///
 /// # Classification at A
@@ -76,9 +76,9 @@ fn split_plane_tls(own: &ClusterTestCerts, peer: &ClusterTestCerts) -> ClusterTl
 /// [`split_plane_tls`] with the inbound mutual-TLS accept plane on.
 ///
 /// The gateway captures the caller certificate only under mutual TLS, so
-/// first-party recognition of unexported origin traffic needs it. Both
-/// organizations are admitted at the transport layer, and the export
-/// boundary alone decides the verdict.
+/// first-party recognition of unexported origin traffic needs it. The
+/// transport layer admits both organizations, and the export boundary alone
+/// decides the verdict.
 fn mtls_split_plane_tls(own: &ClusterTestCerts, peer: &ClusterTestCerts) -> ClusterTlsConfig {
 	let mut tls = split_plane_tls(own, peer);
 	tls.client_validators = vec![combined_validator(&[&own.cert, &peer.cert])];
@@ -134,8 +134,9 @@ fn exporter_conf_with_gate(
 /// An exporter on a fast beat toward `peer_addr`, carrying one grant.
 ///
 /// The ad-filter scenario, which tests discoverability itself, uses it. The
-/// grant proves the slate stays filtered even when a caller is granted an
-/// unexported type, because grants are per-session and never enter ads.
+/// grant proves that the slate stays filtered even when a grant opens an
+/// unexported type to a caller, because grants are per-session and stay out
+/// of ads.
 fn advertising_exporter_conf(
 	own: &ClusterTestCerts,
 	peer: &ClusterTestCerts,
@@ -202,7 +203,8 @@ fn partner_grant(holder: &ClusterTestCerts, target: Urn<'static>) -> Result<Arc<
 /// An edge peer that receives advertisements from the exporter and forwards
 /// work to it.
 ///
-/// It runs no beat and carries no export list of its own.
+/// It keeps the default config, whose beat is off and whose export list is
+/// unset.
 fn edge_peer_conf(own: &ClusterTestCerts, peer: &ClusterTestCerts) -> ClusterConfig {
 	peering_cluster_conf_with_trust(own, Arc::clone(&peer.trust))
 }
@@ -306,8 +308,9 @@ tb_assert_spec! {
 // and "ledger" but exports "ping" alone, while a grant opens "ledger" to
 // B's key. Every beat frame (direct ad and slate rumor) carries the filtered
 // slate, so the observer installs exactly one ping trail and zero ledger
-// trails. The grant never enters ads. One ad carries the whole slate, so
-// once ping is installed the ledger absence is decisive, not a race.
+// trails. The grant stays out of ads. One ad carries the whole slate, so
+// once the ping trail installs, the absent ledger trail is decisive and not
+// a race.
 tb_scenario! {
 	name: cluster_export_list_filters_advertised_slate,
 	spec: ClusterExportAdFilterSpec,
@@ -330,6 +333,7 @@ tb_scenario! {
 			hive.register_with_cluster(exporter.addr()).await?;
 
 			let installed = wait_for_type_routes(&observer, "ping", 1, 100, Duration::from_millis(100)).await;
+			wait_for_direct_advertisement(&trace, 100, Duration::from_millis(100)).await;
 			trace.event_with(PEER_ROUTES_AFTER_INSTALLS, &[], installed as u64)?;
 			trace.event_with(EXPORT_HIDDEN_ROUTES, &[], type_route_count(&observer, "ledger") as u64)?;
 
@@ -364,16 +368,16 @@ tb_assert_spec! {
 //
 // The boundary refuses what the filter hides. B holds injected trails for
 // both of A's types, as if it had learned them before the export list
-// narrowed (guessing a name and holding a stale trail are the same attack).
+// narrowed (a guessed name and a stale trail are the same attack).
 // The scenario drives all four verdicts the fail-closed allowlist
 // distinguishes:
 //
 // 1. B relays "ledger": the request spent relay budget, so the allowlist
 //    refuses it (`PermissionDenied`, `CLUSTER_EXPORT_REFUSED`).
-// 2. B relays "ping": exported, served, echoed.
-// 3. B dials A directly and sends "ledger" at the origin budget: not
-//    relayed, but B's certificate is an external peer, so the identity rule
-//    refuses it. This is the fail-closed case a default-allow gate would
+// 2. B relays "ping": the target is exported, so A serves it and the echo returns.
+// 3. B dials A directly and sends "ledger" at the origin budget: the request
+//    is not relayed, but B's certificate is an external peer, so the identity
+//    rule refuses it. This is the fail-closed case a default-allow gate would
 //    have admitted.
 // 4. A's own client dials A directly with A's first-party identity and
 //    reaches "ledger": a recognized origin caller crosses the boundary.
@@ -460,11 +464,11 @@ tb_assert_spec! {
 //    carries the relayed flag (`CLUSTER_EXPORT_GRANTED` value `true`).
 // 2. C dials A directly with an admitted but ungranted identity and sends
 //    "ledger" at the origin budget: no allow source matches, so the
-//    boundary refuses (`CLUSTER_EXPORT_REFUSED` value `false`), proving the
-//    grant keys on one identity rather than opening the target.
+//    boundary refuses (`CLUSTER_EXPORT_REFUSED` value `false`). That proves
+//    the grant opens the target to one identity alone.
 //
-// Discoverability of granted types is covered by the ad-filter scenario,
-// whose exporter carries this same grant while the slate stays filtered.
+// The ad-filter scenario covers the discoverability of granted types, because
+// its exporter carries this same grant while the slate stays filtered.
 tb_scenario! {
 	name: cluster_export_grant_opens_private_type_for_partner,
 	spec: ClusterExportGrantSpec,
@@ -541,15 +545,16 @@ tb_assert_spec! {
 
 // # Enforcement (stream)
 //
-// The twin of the unary boundary across both stream openers.
+// This scenario is the twin of the unary boundary across both stream openers.
 //
-// 1. A peer-spliced stream open for the unexported "vault" is refused at
-//    A's edge before any route is consulted, and the response future errors.
-// 2. A peer-spliced duplex open for "vault" is refused the same way, so neither opener bypasses the boundary.
-// 3. An anonymous client dialing A directly is refused on "vault" at the
-//    origin budget: without an identity there is no first-party pass.
+// 1. A's edge refuses a peer-spliced stream open for the unexported "vault"
+//    before it consults any route, and the response future errors.
+// 2. A's edge refuses a peer-spliced duplex open for "vault" the same way, so
+//    neither opener bypasses the boundary.
+// 3. A refuses "vault" at the origin budget to an anonymous client that dials
+//    it directly, because a session with no identity gets no first-party pass.
 // 4. The exported "stream-echo" splices through B to A's servlet and echoes
-//    the body length, proving the refusal is target-scoped, not plane-wide.
+//    the body length. That proves the refusal is target-scoped, not plane-wide.
 // 5. The posture warnings fire once each: A exports without identity capture
 //    and B federates without an export list.
 tb_scenario! {

@@ -1,6 +1,6 @@
-//! Simple 3-state workflow fuzz target for AFL
+//! A simple three-state workflow fuzz target for AFL.
 //!
-//! Run with:
+//! Run it with these commands:
 //!   cargo install cargo-afl
 //!   cargo afl build --test simple_workflow --features "std,testing-csp"
 //!   mkdir -p fuzz_in && echo "seed" > fuzz_in/seed.txt
@@ -48,17 +48,16 @@ tb_scenario! {
 	csp: SimpleFuzzProc,
 	config: ScenarioConfig::builder()
 		.with_spec(SimpleFuzzSpec::latest())
-		.with_csp(SimpleFuzzProc)
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
-			// Oracle-guided fuzzing: interprets AFL input as event choices
+			// The oracle reads the AFL input as event choices.
 			let oracle = trace.oracle();
 			oracle.fuzz_from_bytes()?;
 
-			// Make assertions based on execution trace
+			// The collector records the oracle trace, which the spec checks.
 			for event in oracle.trace() {
-				trace.event(event)?;
+				trace.collector().event(event)?;
 			}
 
 			Ok::<(), tightbeam::TightBeamError>(())

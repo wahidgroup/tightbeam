@@ -68,8 +68,9 @@ impl Drop for CancelOnDrop {
 }
 
 /// Forgets the pending ping if the owning ping future is dropped
-/// before its ack arrives. A later ack resolves nothing (discarded
-/// like a stale response), so no peer notification is needed.
+/// before its ack arrives. A later ack finds no pending entry and
+/// resolves nothing, as a stale response does, so the peer needs no
+/// notification.
 struct ForgetPingOnDrop {
 	shared: Arc<MuxShared>,
 	opaque: u64,
@@ -130,15 +131,15 @@ impl MuxHandle {
 
 	/// Send a request on a freshly allocated stream and await its response.
 	///
-	/// Frames beyond the peer's advertised chunk size are segmented into
-	/// `Open(first) Data(...)* Data(last)`, each chunk gated by the peer's
-	/// stream credit.
+	/// The call segments a frame beyond the peer's advertised chunk size into
+	/// `Open(first) Data(...)* Data(last)`, and the peer's stream credit gates
+	/// each chunk.
 	///
 	/// # Cancellation
 	///
-	/// Dropping the returned future before it resolves cancels the
-	/// stream: the pending entry is removed, the cap slot freed, and a
-	/// best-effort [`crate::transport::envelopes::MuxCancelPackage`] sent.
+	/// Dropping the returned future before it resolves cancels the stream. The
+	/// cancel removes the pending entry, frees the cap slot, and sends a
+	/// best-effort [`crate::transport::envelopes::MuxCancelPackage`].
 	///
 	/// # Errors
 	///
@@ -232,7 +233,7 @@ impl MuxHandle {
 
 	/// Open a streaming request carrying a fully-formed [`StreamRoute`].
 	///
-	/// - [`open_stream`](Self::open_stream) and [`open_stream_to`](Self::open_stream_to) share this open core.
+	/// - [`open_stream`](Self::open_stream) and [`open_stream_to`](Self::open_stream_to) share this core.
 	/// - A gateway re-emits a client stream to a peer through it, with [`StreamRoute::relayed_to`].
 	///
 	/// The route parts stay on the sink until its first chunk emits the Open.
@@ -313,7 +314,7 @@ impl MuxHandle {
 
 	/// Open a duplex stream carrying a fully-formed [`StreamRoute`].
 	///
-	/// - [`open_duplex`](Self::open_duplex) and [`open_duplex_to`](Self::open_duplex_to) share this open core.
+	/// - [`open_duplex`](Self::open_duplex) and [`open_duplex_to`](Self::open_duplex_to) share this core.
 	/// - A gateway re-emits a client duplex stream to a peer through it, with [`StreamRoute::relayed_to`].
 	///
 	/// The route parts stay on the sink until its first chunk emits the Open.
@@ -351,7 +352,7 @@ impl MuxHandle {
 		let mut sent: u64 = 0;
 		let first = chunks.next().unwrap_or(&[]);
 
-		sent += 1;
+		sent = sent.saturating_add(1);
 		let mut request = OpenRequest {
 			kind: MuxStreamKind::Unary,
 			last: sent == total,
@@ -363,7 +364,7 @@ impl MuxHandle {
 
 		let stream_id = self.link.send_open_envelope(reservation, &mut request).await?;
 		for chunk in chunks {
-			sent += 1;
+			sent = sent.saturating_add(1);
 
 			let data = MuxDataPackage::new(stream_id, sent == total, chunk)?;
 			let data_envelope = TransportEnvelope::from(data);
@@ -571,8 +572,8 @@ mod tests {
 		Ok(())
 	}
 
-	// An explicit spent budget on the Open is served locally and
-	// never re-forwarded by a peer gateway.
+	// An explicit spent budget reaches the Open, so a peer gateway serves
+	// the stream locally and never re-forwards it.
 	#[test]
 	fn test_open_stream_with_relayed_route_stamps_budget() -> TransportResult<()> {
 		let (handle, mut sent) = duplex_handle();
@@ -696,7 +697,7 @@ mod tests {
 	fn test_unopened_duplex_body_ends_on_peer_goaway() -> TransportResult<()> {
 		let (handle, _sent) = duplex_handle();
 		let (_sink, mut body) = handle.open_duplex()?;
-		handle.link.shared().fail_pending_above(0, GoAwayReason::Shutdown);
+		handle.link.shared().fail_pending_above(0, GoAwayReason::Shutdown)?;
 
 		let ended = body.poll_chunk_now();
 		assert!(matches!(ended, Poll::Ready(Err(TransportError::Draining))));

@@ -5,13 +5,16 @@
 
 // Test-fixture surface: constructors take fixed, valid-by-construction
 // inputs, and a fixture that cannot build must abort the test run with
-// a stated invariant (`expect`).
+// a stated invariant (`expect`). An index or an integer operation outside
+// its range aborts the run the same way.
 #![allow(
 	clippy::expect_used,
 	clippy::panic,
 	clippy::unreachable,
 	clippy::todo,
-	clippy::unimplemented
+	clippy::unimplemented,
+	clippy::indexing_slicing,
+	clippy::arithmetic_side_effects
 )]
 
 pub mod assertions;

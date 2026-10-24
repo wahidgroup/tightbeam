@@ -1,4 +1,4 @@
-error[E0080]: evaluation panicked: malformed URN literal: the NID must be 2-32 ASCII alphanumerics or hyphens starting with a letter
+error[E0080]: evaluation panicked: malformed URN literal: the NID must be 2-32 ASCII alphanumerics or hyphens starting with a letter and ending with an alphanumeric
  --> tests/compile/urn_nid_malformed.rs:5:32
   |
 5 | const REJECTED: Urn<'static> = tightbeam::urn!("9bad", "resource");

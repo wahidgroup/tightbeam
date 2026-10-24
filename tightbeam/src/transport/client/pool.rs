@@ -108,7 +108,8 @@ pub trait ConnectionBuilder<P: Protocol>: Sized {
 /// Limits and multiplexing policy for a [`ConnectionPool`].
 #[derive(Clone, Debug)]
 pub struct PoolConfig {
-	/// Drop idle exclusive leases after this duration.
+	/// The pool drops a pooled connection, exclusive or multiplexed, once it
+	/// has idled for this duration.
 	///
 	/// `None` keeps idle connections until the pool evicts them for other
 	/// reasons.
@@ -131,7 +132,7 @@ impl Default for PoolConfig {
 }
 
 #[derive(Clone)]
-/// Shared TLS assets reused across pooled connections without reallocations.
+/// Shared TLS assets that every pooled connection reuses.
 struct PoolTlsConfig<C: CryptoProvider> {
 	/// Every dial from this pool starts with this provisioning.
 	encryption: EncryptionConfig<C>,
@@ -416,8 +417,9 @@ pooled_mux! {
 pooled_mux! {
 	/// One shared multiplexed connection to a destination.
 	///
-	/// The handle is cloneable, so every caller shares the entry, and the entry
-	/// leaves the pool only through eviction.
+	/// The handle is cloneable, so every caller shares the entry. The entry
+	/// leaves the pool when its reader ends, when it idles out, or when a
+	/// terminal failure evicts it.
 	struct MuxEntry {
 		id: u64,
 		handle: MuxHandle,
@@ -434,7 +436,7 @@ pooled_mux! {
 		/// Validated peer certificate pinned at the eager mux handshake.
 		///
 		/// The mux drivers consume the transport, so the certificate is
-		/// captured at dial. Every lease on this entry reads peer
+		/// captured at dial. Every lease on this entry reads the peer
 		/// identity from this shared handle.
 		peer_certificate: Option<Arc<Certificate>>,
 	}
@@ -539,13 +541,17 @@ impl<P: Protocol> ConnectionPool<P> {
 	/// Write a pool lifecycle event twice: the core kind URN into the
 	/// instrument log, and the stable label for spec assertions and CSP
 	/// alphabets.
+	///
+	/// # Errors
+	///
+	/// - The injected error, when the runtime fault model injects a fault at `event`.
 	#[cfg(feature = "instrument")]
-	fn emit_event(&self, event: Urn<'static>) {
+	fn emit_event(&self, event: Urn<'static>) -> TransportResult<()> {
 		let Some(trace) = self.trace.as_ref() else {
-			return;
+			return Ok(());
 		};
 
-		trace.emit_event(event);
+		Ok(trace.emit_event(event)?)
 	}
 }
 
@@ -588,12 +594,17 @@ where
 	{
 		let mut pools = self.write_pools()?;
 		if let Some(dest_pool) = pools.get_mut(addr) {
-			self.prune_idle_locked(dest_pool, self.clock.monotonic());
+			self.prune_idle_locked(dest_pool, self.clock.monotonic())?;
 
 			while let Some(entry) = dest_pool.available.pop_front() {
 				if <P as PersistentConnection>::is_connected(entry.client.transport()) {
+					// A fault at the lease fails the lease, and the live
+					// connection stays pooled.
 					#[cfg(feature = "instrument")]
-					self.emit_event(events::POOL_REUSE_READY);
+					if let Err(fault) = self.emit_event(events::POOL_REUSE_READY) {
+						dest_pool.available.push_front(entry);
+						return Err(fault);
+					}
 
 					return Ok(Some(entry.client));
 				}
@@ -603,7 +614,7 @@ where
 				self.release_connection_count();
 
 				#[cfg(feature = "instrument")]
-				self.emit_event(events::POOL_EVICTED);
+				self.emit_event(events::POOL_EVICTED)?;
 			}
 		}
 		Ok(None)
@@ -618,12 +629,12 @@ where
 				if current >= self.config.max_connections {
 					None
 				} else {
-					Some(current + 1)
+					current.checked_add(1)
 				}
 			});
 		if reserved.is_err() {
 			#[cfg(feature = "instrument")]
-			self.emit_event(events::POOL_EXHAUSTED);
+			self.emit_event(events::POOL_EXHAUSTED)?;
 
 			return Err(TransportError::OperationFailed(TransportFailure::ResourceExhausted));
 		}
@@ -638,15 +649,24 @@ where
 			}
 		};
 
+		// The guard gives the reservation back when the prune fails.
+		let slot = SlotGuard::new(Arc::clone(self));
 		let dest_pool = pools.entry(addr.clone()).or_default();
-		self.prune_idle_locked(dest_pool, self.clock.monotonic());
+		self.prune_idle_locked(dest_pool, self.clock.monotonic())?;
 
-		Ok(SlotGuard::new(Arc::clone(self)))
+		Ok(slot)
 	}
 
-	fn prune_idle_locked(&self, dest_pool: &mut DestinationPool<P>, now: MonotonicInstant) {
+	/// Prune the idle connections of `dest_pool` that passed the idle timeout
+	/// at `now`. Every expired mux entry leaves the pool before the events of
+	/// the prune record, so a fault at one leaves the pool whole.
+	///
+	/// # Errors
+	///
+	/// - The injected error, when the runtime fault model injects a fault at a prune.
+	fn prune_idle_locked(&self, dest_pool: &mut DestinationPool<P>, now: MonotonicInstant) -> TransportResult<()> {
 		let Some(timeout) = self.config.idle_timeout else {
-			return;
+			return Ok(());
 		};
 
 		while let Some(entry) = dest_pool.available.front() {
@@ -657,7 +677,7 @@ where
 				self.release_connection_count();
 
 				#[cfg(feature = "instrument")]
-				self.emit_event(events::POOL_PRUNED_IDLE);
+				self.emit_event(events::POOL_PRUNED_IDLE)?;
 			} else {
 				break;
 			}
@@ -665,6 +685,8 @@ where
 
 		// The pruner only reads the stamp that leases write at emit time,
 		// outside the pool lock (see `MuxEntry::last_used`).
+		#[cfg(all(pooled_mux, feature = "instrument"))]
+		let live_before = dest_pool.mux.len();
 		#[cfg(pooled_mux)]
 		dest_pool.mux.retain(|entry| {
 			if entry.handle.has_pending_streams() {
@@ -688,12 +710,15 @@ where
 
 				// A pruned idle connection leaves the live set.
 				self.release_connection_count();
-				#[cfg(feature = "instrument")]
-				self.emit_event(events::POOL_PRUNED_IDLE);
 			}
 
 			!expired
 		});
+		#[cfg(all(pooled_mux, feature = "instrument"))]
+		for _ in dest_pool.mux.len()..live_before {
+			self.emit_event(events::POOL_PRUNED_IDLE)?;
+		}
+		Ok(())
 	}
 
 	/// Lease a ready connection or open a fresh one, held exclusively.
@@ -716,7 +741,7 @@ where
 		}
 
 		#[cfg(feature = "instrument")]
-		self.emit_event(events::POOL_DIAL);
+		self.emit_event(events::POOL_DIAL)?;
 
 		let client = GenericClient::from_transport(transport);
 
@@ -834,7 +859,7 @@ pooled_mux! {
 			transport.complete_client_handshake().await?;
 
 			#[cfg(feature = "instrument")]
-			self.emit_event(events::POOL_DIAL);
+			self.emit_event(events::POOL_DIAL)?;
 
 			let settings = match transport.negotiated_mux() {
 				Some(settings) => settings,
@@ -842,7 +867,7 @@ pooled_mux! {
 					// The peer declined the mux offer, so the connection
 					// pools as an exclusive lease instead.
 					#[cfg(feature = "instrument")]
-					self.emit_event(events::POOL_MUX_DECLINED);
+					self.emit_event(events::POOL_MUX_DECLINED)?;
 
 					let client = GenericClient::from_transport(transport);
 
@@ -912,20 +937,25 @@ pooled_mux! {
 				None => return Ok(None),
 			};
 
-			self.prune_idle_locked(dest_pool, self.clock.monotonic());
+			self.prune_idle_locked(dest_pool, self.clock.monotonic())?;
 
+			// Every dead entry leaves the pool before the events of the
+			// evictions record, so a fault at one leaves the pool whole.
+			#[cfg(feature = "instrument")]
+			let live_before = dest_pool.mux.len();
 			dest_pool.mux.retain(|entry| {
 				let alive = !entry.reader_task.is_finished();
 				if !alive {
 					// A dead mux connection is discarded here, so it leaves
 					// the live set.
 					self.release_connection_count();
-
-					#[cfg(feature = "instrument")]
-					self.emit_event(events::POOL_EVICTED);
 				}
 				alive
 			});
+			#[cfg(feature = "instrument")]
+			for _ in dest_pool.mux.len()..live_before {
+				self.emit_event(events::POOL_EVICTED)?;
+			}
 
 			if dest_pool.mux.len() > 1 {
 				dest_pool.mux.rotate_left(1);
@@ -947,7 +977,7 @@ pooled_mux! {
 
 			#[cfg(feature = "instrument")]
 			if selected.is_some() {
-				self.emit_event(events::POOL_REUSE_MUX);
+				self.emit_event(events::POOL_REUSE_MUX)?;
 			}
 
 			Ok(selected)
@@ -956,10 +986,15 @@ pooled_mux! {
 		/// Remove a mux entry after a terminal failure (`ConnectionClosed`
 		/// or rekey `Draining`). The next connect re-establishes the
 		/// connection, and a poisoned pool map skips the eviction.
-		fn evict_mux(&self, addr: &P::Address, id: u64) {
+		///
+		/// # Errors
+		///
+		/// - The injected error, when the runtime fault model injects a fault
+		///   at the eviction, which the entry has already left.
+		fn evict_mux(&self, addr: &P::Address, id: u64) -> TransportResult<()> {
 			let mut pools = match self.pools.write() {
 				Ok(pools) => pools,
-				Err(_) => return,
+				Err(_) => return Ok(()),
 			};
 			if let Some(dest_pool) = pools.get_mut(addr) {
 				let live_before = dest_pool.mux.len();
@@ -971,9 +1006,10 @@ pooled_mux! {
 					self.release_connection_count();
 
 					#[cfg(feature = "instrument")]
-					self.emit_event(events::POOL_EVICTED);
+					self.emit_event(events::POOL_EVICTED)?;
 				}
 			}
+			Ok(())
 		}
 
 		fn wrap_mux_client(self: &Arc<Self>, lease: MuxLease, addr: P::Address) -> PooledClient<P> {
@@ -1151,7 +1187,7 @@ pooled_mux! {
 					self.emit_failover(frame, attempt).await
 				}
 				Err(err @ (TransportError::ConnectionClosed | TransportError::Draining)) => {
-					self.pool.evict_mux(&self.addr, lease_id);
+					self.pool.evict_mux(&self.addr, lease_id)?;
 					Err(err)
 				}
 				outcome => outcome,
@@ -1185,10 +1221,17 @@ pooled_mux! {
 		/// - An exclusive lease closes its connection and gives back its slot.
 		/// - A mux lease evicts its entry, which every lease of the connection
 		///   shares, and drains the connection as an idle prune does.
+		///
+		/// # Errors
+		///
+		/// - The injected error, when the runtime fault model injects a fault
+		///   at the eviction, which the connection has already left.
 		#[cfg(feature = "colony")]
-		pub(crate) fn discard(mut self) {
+		pub(crate) fn discard(mut self) -> TransportResult<()> {
 			if let Some(lease) = self.mux.take() {
-				self.pool.evict_mux(&self.addr, lease.id);
+				// The entry leaves the pool before its event can fault, so the
+				// drain starts whatever the event answers.
+				let evicted = self.pool.evict_mux(&self.addr, lease.id);
 
 				// The drain runs detached, as an idle prune's does. Its only
 				// failure is `ConnectionClosed`, which names a connection that
@@ -1196,6 +1239,7 @@ pooled_mux! {
 				rt::spawn(async move {
 					let _ = lease.handle.shutdown().await;
 				});
+				evicted?;
 			}
 
 			if let Some(client) = self.client.take() {
@@ -1205,8 +1249,10 @@ pooled_mux! {
 				self.pool.release_connection_count();
 
 				#[cfg(feature = "instrument")]
-				self.pool.emit_event(events::POOL_EVICTED);
+				self.pool.emit_event(events::POOL_EVICTED)?;
 			}
+
+			Ok(())
 		}
 
 		/// Returns this lease's mux handle, with its activity recorded.
@@ -1233,7 +1279,7 @@ pooled_mux! {
 		/// # Errors
 		///
 		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and streaming needs the mux plane.
-		/// - The [`MuxHandle::open_stream`] set.
+		/// - The errors of [`MuxHandle::open_stream`].
 		pub fn open_stream(
 			&self,
 		) -> TransportResult<(RequestSink, impl Future<Output = TransportResult<Option<Frame>>> + MaybeSend)> {
@@ -1249,7 +1295,7 @@ pooled_mux! {
 		/// # Errors
 		///
 		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and streaming needs the mux plane.
-		/// - The [`MuxHandle::open_stream`] set.
+		/// - The errors of [`MuxHandle::open_stream`].
 		pub fn open_stream_to(
 			&self,
 			target: impl Into<Urn<'static>>,
@@ -1257,7 +1303,7 @@ pooled_mux! {
 			self.stamped_handle()?.open_stream_to(target)
 		}
 
-		/// Open a streamed request carrying a fully-formed [`StreamRoute`].
+		/// Open a streamed request carrying a fully formed [`StreamRoute`].
 		///
 		/// - [`StreamRoute::to`] builds the route for an origin open.
 		/// - [`StreamRoute::relayed_to`] builds the route that re-emits a spent hop budget.
@@ -1270,7 +1316,7 @@ pooled_mux! {
 		/// # Errors
 		///
 		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and streaming needs the mux plane.
-		/// - The [`MuxHandle::open_stream`] set.
+		/// - The errors of [`MuxHandle::open_stream`].
 		#[cfg(feature = "colony")]
 		pub(crate) fn open_stream_with_route(
 			&self,
@@ -1286,7 +1332,7 @@ pooled_mux! {
 		/// # Errors
 		///
 		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and streaming needs the mux plane.
-		/// - The [`MuxHandle::open_duplex`] set.
+		/// - The errors of [`MuxHandle::open_duplex`].
 		pub fn open_duplex(&self) -> TransportResult<(RequestSink, StreamBody)> {
 			self.stamped_handle()?.open_duplex()
 		}
@@ -1300,12 +1346,12 @@ pooled_mux! {
 		/// # Errors
 		///
 		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and streaming needs the mux plane.
-		/// - The [`MuxHandle::open_duplex`] set.
+		/// - The errors of [`MuxHandle::open_duplex`].
 		pub fn open_duplex_to(&self, target: impl Into<Urn<'static>>) -> TransportResult<(RequestSink, StreamBody)> {
 			self.stamped_handle()?.open_duplex_to(target)
 		}
 
-		/// Open a duplex stream carrying a fully-formed [`StreamRoute`].
+		/// Open a duplex stream carrying a fully formed [`StreamRoute`].
 		///
 		/// - [`StreamRoute::to`] builds the route for an origin open.
 		/// - [`StreamRoute::relayed_to`] builds the route that re-emits a spent hop budget.
@@ -1318,7 +1364,7 @@ pooled_mux! {
 		/// # Errors
 		///
 		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and streaming needs the mux plane.
-		/// - The [`MuxHandle::open_duplex`] set.
+		/// - The errors of [`MuxHandle::open_duplex`].
 		#[cfg(feature = "colony")]
 		pub(crate) fn open_duplex_with_route(&self, route: StreamRoute) -> TransportResult<(RequestSink, StreamBody)> {
 			self.stamped_handle()?.open_duplex_with_route(route)
@@ -1343,7 +1389,7 @@ pooled_mux! {
 			}
 
 			#[cfg(feature = "instrument")]
-			self.pool.emit_event(events::POOL_FAILOVER);
+			self.pool.emit_event(events::POOL_FAILOVER)?;
 
 			let pinned = self.mux.as_ref().and_then(|lease| lease.peer_certificate.clone());
 			let moved = self
@@ -1380,8 +1426,10 @@ where
 			None => return,
 		};
 
+		// A drop has no caller to fail, so a fault the trace injects at the
+		// release ends with the drop, and the connection returns to the pool.
 		#[cfg(feature = "instrument")]
-		self.pool.emit_event(events::POOL_RELEASED);
+		drop(self.pool.emit_event(events::POOL_RELEASED));
 
 		let mut returned_to_pool = false;
 

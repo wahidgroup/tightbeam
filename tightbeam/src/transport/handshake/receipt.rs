@@ -10,8 +10,9 @@
 //!
 //! - The server signs the body inside its handshake response.
 //! - The client countersigns inside its closing leg and may answer the challenge through a signed attribute.
-//! - Each signature covers the standard signed attributes: content type,
-//!   message digest, role, and the client's answer.
+//! - Each signature covers the signed attributes of the receipt profile:
+//!   content type, message digest, algorithm protection, the role, and for
+//!   the client its answer.
 //!
 //! The completed artifact, held as a [`StoredReceipt`], carries the
 //! certificate of each signer in its `certificates` (RFC 5652 §5.1). A third
@@ -180,12 +181,13 @@ impl TryFrom<u8> for ReceiptRole {
 /// settlement answer as signed attributes of the receipt profile.
 ///
 /// The CMS signer adds the content type, the message digest, and the
-/// algorithm protection ([RFC 5652
-/// §11](https://datatracker.ietf.org/doc/html/rfc5652#section-11), RFC 6211).
+/// algorithm protection ([RFC 5652 §11][rfc5652-11], RFC 6211).
 ///
 /// # Errors
 ///
 /// - [`HandshakeError::DerError`] -- the role or the answer fails to encode.
+///
+/// [rfc5652-11]: https://datatracker.ietf.org/doc/html/rfc5652#section-11
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 fn receipt_content<'a>(
 	receipt_der: &'a (impl AsRef<[u8]> + ?Sized),
@@ -363,7 +365,9 @@ impl StoredReceipt {
 	/// `SignerInfo` names (RFC 5652 §5.3). Construction validated its presence.
 	///
 	/// A third-party verifier takes both certificates from here, admits each
-	/// against its own trust, and passes them to [`Self::verify`].
+	/// against its own trust, and passes them to [`Self::verify`]. The decode
+	/// of a [`Signed`] `SignedData` holds each one to the DER it arrived as
+	/// (X.690 §11.5), so the trust evaluates the bytes the issuer signed.
 	///
 	/// # Errors
 	///
@@ -492,9 +496,10 @@ impl fmt::Debug for StoredReceipt {
 ///
 /// # Code space
 ///
-/// - Application codes sit at or above
-///   [`MUX_APPLICATION_CODE_FLOOR`](crate::transport::envelopes::MUX_APPLICATION_CODE_FLOOR).
+/// - Application codes sit at or above [`MUX_APPLICATION_CODE_FLOOR`].
 /// - Codes below the floor are reserved for the TightBeam protocol, such as [`SETTLEMENT_UNSUPPORTED_CODE`].
+///
+/// [`MUX_APPLICATION_CODE_FLOOR`]: crate::transport::envelopes::MUX_APPLICATION_CODE_FLOOR
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ApprovalRefusal {
 	/// Refusal code from the u32 space that settlement refusals also use.
@@ -519,7 +524,7 @@ pub struct ApprovalRefusal {
 ///
 /// # Without an approver
 ///
-/// A challenge-free receipt is countersigned without an answer. A
+/// The client countersigns a challenge-free receipt without an answer. A
 /// challenge-bearing receipt aborts the handshake with
 /// [`SETTLEMENT_UNSUPPORTED_CODE`].
 pub trait ReceiptApprover: MaybeSend + MaybeSync {
@@ -725,10 +730,11 @@ impl SessionReceipt {
 	/// # Errors
 	///
 	/// - [`HandshakeError::SignatureVerificationFailed`] -- a parse or verify
-	///   step failed. The failures collapse to this one variant, so both
-	///   carriages report the same error.
+	///   step of the CMS signer failed. Those failures collapse to this one
+	///   variant, so both carriages report the same error.
 	/// - [`HandshakeError::ReceiptMismatch`] -- the answer attribute repeats,
 	///   does not carry exactly one value, or does not decode.
+	/// - [`HandshakeError::DerError`] -- the receipt body or a signed attribute fails to encode.
 	pub(crate) fn verify_signer<P>(
 		&self,
 		signer: &SignerInfo,
@@ -876,6 +882,7 @@ pub(crate) trait ReceiptArtifact: Sized {
 	///
 	/// - [`HandshakeError::ReceiptMismatch`] -- the artifact carries a foreign
 	///   `eContentType` or a detached body.
+	/// - [`HandshakeError::DerError`] -- the body fails to decode.
 	fn receipt(&self) -> Result<SessionReceipt, HandshakeError>;
 
 	/// Find this artifact's `SignerInfo` for one role.
@@ -1214,8 +1221,8 @@ mod tests {
 		}
 
 		/// An artifact that carries a countersignature without the certificate
-		/// it names is one no third party verifies alone, so it is no stored
-		/// receipt.
+		/// it names fails to parse as a stored receipt, because no third party
+		/// can verify it alone.
 		#[tokio::test]
 		async fn an_artifact_without_the_client_certificate_is_not_a_stored_receipt() -> Result<(), HandshakeError> {
 			let (stored, _, _) = dual_signed(None).await?;
@@ -1225,7 +1232,7 @@ mod tests {
 
 			artifact.certificates = Some(CertificateSet(SetOfVec::try_from(vec![kept])?));
 
-			let der = artifact.to_der()?;
+			let der = crate::encode(&artifact)?;
 			let refused = StoredReceipt::try_from(Signed::<SignedData>::from_der(&der)?);
 			assert!(matches!(refused, Err(HandshakeError::MissingClientCertificate)));
 			Ok(())
@@ -1240,7 +1247,7 @@ mod tests {
 
 			artifact.certificates = Some(CertificateSet(SetOfVec::try_from(vec![kept])?));
 
-			let refused = StoredReceipt::try_from(Signed::<SignedData>::from_der(&artifact.to_der()?)?);
+			let refused = StoredReceipt::try_from(Signed::<SignedData>::from_der(&crate::encode(&artifact)?)?);
 			assert!(matches!(refused, Err(HandshakeError::MissingServerCertificate)));
 			Ok(())
 		}

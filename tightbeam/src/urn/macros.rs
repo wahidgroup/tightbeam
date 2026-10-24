@@ -32,7 +32,7 @@ macro_rules! urn {
 
 			if $crate::urn::Urn::validate_nid(nid).is_err() {
 				::core::panic!(
-					"malformed URN literal: the NID must be 2-32 ASCII alphanumerics or hyphens starting with a letter"
+					"malformed URN literal: the NID must be 2-32 ASCII alphanumerics or hyphens starting with a letter and ending with an alphanumeric"
 				);
 			}
 

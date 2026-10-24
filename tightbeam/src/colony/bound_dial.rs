@@ -91,6 +91,8 @@ impl<'a> BoundDial<'a> {
 	/// - [`ClusterError::InvalidAddress`] -- the target does not parse as an address of this protocol.
 	/// - [`ClusterError::ConnectFailed`] -- the dial or the handshake failed.
 	/// - [`ClusterError::PeerMismatch`] -- the answer presented another party's certificate, or none.
+	/// - [`ClusterError::Transport`] -- the runtime fault model injects a fault
+	///   at the eviction of the refused connection.
 	pub(crate) async fn connect<P: ColonyDialProtocol>(
 		self,
 		pool: &Arc<ConnectionPool<P>>,
@@ -103,7 +105,7 @@ impl<'a> BoundDial<'a> {
 
 		let admitted = client.peer_certificate().is_some_and(|answer| self.expected.admits(answer));
 		if !admitted {
-			client.discard();
+			client.discard()?;
 			return Err(ClusterError::PeerMismatch);
 		}
 

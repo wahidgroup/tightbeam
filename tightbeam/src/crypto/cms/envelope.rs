@@ -8,9 +8,10 @@ use core::ops::Range;
 
 use aead::{AeadCore, AeadInPlace, Key, KeyInit, Nonce, Tag};
 
+use crate::asn1::admission::DerAdmission;
 use crate::asn1::GcmParametersRef;
 use crate::cms::content_info::CmsVersion;
-use crate::cms::enveloped_data::{EncryptedContentInfo, OriginatorInfo, RecipientInfo, RecipientInfos};
+use crate::cms::enveloped_data::{EncryptedContentInfo, RecipientInfo, RecipientInfos};
 use crate::crypto::aead::{AeadAlgorithm, Aes128Gcm, Aes256Gcm};
 use crate::crypto::cms::kek::{self, ContentKey};
 use crate::crypto::cms::{AttributesExt, AuthEnvelopedData, EnvelopeError};
@@ -22,7 +23,7 @@ use crate::der::asn1::{ObjectIdentifier, OctetString, OctetStringRef, SetOfVec};
 use crate::der::oid::AssociatedOid;
 use crate::der::{
 	Any, AnyRef, Decode, DecodeValue, Encode, EncodeValue, FixedTag, Header, Length, Reader, Sequence, SliceReader,
-	Tag as DerTag, Writer,
+	Tag as DerTag, Tagged, Writer,
 };
 use crate::oids::ATTR_CONTENT_TYPE;
 use crate::random::{CryptoRngCore, OsRng};
@@ -135,7 +136,7 @@ impl AuthEnvelopedData {
 	///
 	/// - [`EnvelopeError::ContentTypeAttribute`] -- `auth_attrs` carries a content-type attribute.
 	/// - [`EnvelopeError::Random`] -- the random source failed.
-	/// - The `Recipient::wrap` set: the recipient key, its name, the wrap, or a derivation failed.
+	/// - The errors of `Recipient::wrap`: the recipient key, its name, the wrap, or a derivation failed.
 	/// - [`EnvelopeError::Encryption`] -- the cipher refused the content.
 	/// - [`EnvelopeError::Encoding`] -- an attribute or a parameter fails to encode.
 	#[cfg(all(feature = "hpke", feature = "signature"))]
@@ -159,7 +160,7 @@ impl AuthEnvelopedData {
 	///
 	/// # Errors
 	///
-	/// - The [`Self::seal`] set, with the wrap of `P` as the recipient.
+	/// - The errors of [`Self::seal`], with the wrap of `P` as the recipient.
 	pub(crate) fn seal_kek<P>(
 		kek: &[u8],
 		key_identifier: &[u8],
@@ -177,14 +178,14 @@ impl AuthEnvelopedData {
 		Self::sealed::<P::AeadCipher>(content_type, content, auth_attrs, rng, wrap)
 	}
 
-	/// Seal `content` under the cipher `A`, with the content key `wrap`
+	/// Seal `content` under the cipher `A`, with the content key that `wrap`
 	/// wraps for the one recipient.
 	///
 	/// # Errors
 	///
 	/// - [`EnvelopeError::Random`] -- the random source failed.
 	/// - The errors of `wrap`.
-	/// - The [`Draw::seal`] set.
+	/// - The errors of [`Draw::seal`].
 	fn sealed<A: ContentEncryption>(
 		content_type: ObjectIdentifier,
 		content: impl Into<Vec<u8>>,
@@ -217,7 +218,7 @@ impl AuthEnvelopedData {
 	///
 	/// - [`EnvelopeError::Random`] -- the random source failed.
 	/// - [`EnvelopeError::Key`] -- the holder refused to encrypt the content key.
-	/// - The [`Draw::seal_in_place`] set.
+	/// - The errors of [`Draw::seal_in_place`].
 	pub(crate) async fn seal_to_holder<P>(
 		holder: &(impl EncryptingKeyProvider + ?Sized),
 		content_type: ObjectIdentifier,
@@ -240,7 +241,7 @@ impl AuthEnvelopedData {
 	/// Open the content, which must be of type `content_type`, with `opener`
 	/// under the algorithms of `P`, in the buffer the ciphertext arrived in.
 	///
-	/// `arrived` is the encoding `self` decoded from. Every field is checked
+	/// `arrived` is the encoding `self` decoded from. This checks every field
 	/// before the content key unwraps, so a refused envelope costs the
 	/// opener's key no operation. A content that returns has passed its tag,
 	/// so the authenticated attributes it arrived with passed it too.
@@ -257,7 +258,7 @@ impl AuthEnvelopedData {
 	/// - [`EnvelopeError::ContentEncryptionAlgorithm`] -- the algorithm or its
 	///   parameters are not the provider's cipher's.
 	/// - [`EnvelopeError::TagLength`] -- the parameters or `mac` name another tag length than the cipher's.
-	/// - The [`Opener`] set: the recipient differs from the opener, or its key fails to unwrap.
+	/// - The errors of [`Opener`]: the recipient differs from the opener, or its key fails to unwrap.
 	/// - [`EnvelopeError::KeyUnwrap`] -- the content key is no key of the cipher.
 	/// - [`EnvelopeError::Authentication`] -- the tag fails.
 	#[cfg(all(feature = "hpke", feature = "signature"))]
@@ -283,7 +284,7 @@ impl AuthEnvelopedData {
 	///
 	/// # Errors
 	///
-	/// - The [`Self::open`] set after the content leaves the envelope.
+	/// - The errors of [`Self::open`], for the content outside the envelope.
 	#[cfg(all(feature = "hpke", feature = "signature"))]
 	pub(crate) async fn open_detached<P>(
 		&self,
@@ -299,8 +300,7 @@ impl AuthEnvelopedData {
 		//    and its authenticated attributes to DER.
 		let opening = self.check::<P::AeadCipher>(arrived, content_type)?;
 
-		// 2. Unwrap the content key onto the stack, then decrypt the content
-		//    in place under it.
+		// 2. Unwrap the content key onto the stack, then decrypt the content in place under it.
 		let mut content_key = ContentKey::<P::AeadCipher>::default();
 		opener.unwrap::<P>(&self.recipient_infos, &mut content_key).await?;
 		opening.decrypt(&<P::AeadCipher as KeyInit>::new(&content_key), content)
@@ -313,8 +313,8 @@ impl AuthEnvelopedData {
 	///
 	/// # Errors
 	///
-	/// - The [`Self::check`] set: a field, the cipher, or the attributes differ.
-	/// - The `KEKRecipientInfo` set: the recipient names another key or another wrap than `P`'s.
+	/// - The errors of [`Self::check`]: a field, the cipher, or the attributes differ.
+	/// - The errors of the `KEKRecipientInfo`: the recipient names another key or another wrap than `P`'s.
 	/// - [`EnvelopeError::KeyUnwrap`] -- the wrapped content key fails its integrity check.
 	/// - [`EnvelopeError::Authentication`] -- the tag fails.
 	pub(crate) fn open_detached_kek<P>(
@@ -332,8 +332,7 @@ impl AuthEnvelopedData {
 		//    and its authenticated attributes to DER.
 		let opening = self.check::<P::AeadCipher>(arrived, content_type)?;
 
-		// 2. Unwrap the content key onto the stack, then decrypt the content
-		//    in place under it.
+		// 2. Unwrap the content key onto the stack, then decrypt the content in place under it.
 		let mut content_key = ContentKey::<P::AeadCipher>::default();
 		kek::unwrap_kek::<P::KeyWrap>(kek, key_identifier, &self.recipient_infos, &mut content_key)?;
 		opening.decrypt(&<P::AeadCipher as KeyInit>::new(&content_key), content)
@@ -346,8 +345,8 @@ impl AuthEnvelopedData {
 	///
 	/// # Errors
 	///
-	/// - The [`Self::check`] set: a field, the cipher, or the attributes differ.
-	/// - The `KEKRecipientInfo` set of the holder: the recipient names
+	/// - The errors of [`Self::check`]: a field, the cipher, or the attributes differ.
+	/// - The errors of the holder's `KEKRecipientInfo`: the recipient names
 	///   another key or another key-encryption algorithm than the holder's.
 	/// - [`EnvelopeError::Key`] -- the holder refused to decrypt the content
 	///   key, or decrypted a key of another size than the cipher's.
@@ -368,8 +367,7 @@ impl AuthEnvelopedData {
 		let algorithm = holder.algorithm();
 		let encrypted_key = kek::named_kek(&self.recipient_infos, holder.key_identifier(), &algorithm)?;
 
-		// 2. The holder decrypts the content key onto the stack, and the content
-		//    decrypts in place under it.
+		// 2. The holder decrypts the content key onto the stack, and the content decrypts in place under it.
 		let mut content_key = ContentKey::<P::AeadCipher>::default();
 		holder.decrypt_into(encrypted_key, &mut content_key).await?;
 		opening.decrypt(&<P::AeadCipher as KeyInit>::new(&content_key), content)
@@ -393,8 +391,8 @@ impl AuthEnvelopedData {
 	///
 	/// # Errors
 	///
-	/// - The [`Self::associated_data`] set.
-	/// - The [`Self::opening`] set.
+	/// - The errors of [`Self::associated_data`].
+	/// - The errors of [`Self::opening`].
 	fn check<A: ContentEncryption>(
 		&self,
 		arrived: &[u8],
@@ -404,6 +402,36 @@ impl AuthEnvelopedData {
 		self.opening::<A>(associated_data)
 	}
 
+	/// The one recipient of `arrived`, the `recipientInfos` of a record as it
+	/// arrived, as the set the envelope holds.
+	///
+	/// A record names one recipient, the key of its direction and epoch, so
+	/// this refuses a set of another count before `der` sorts it, and the set
+	/// of one that this builds sorts nothing.
+	///
+	/// # Errors
+	///
+	/// - [`EnvelopeError::RecipientKind`] -- the set holds another number of recipients than one.
+	/// - [`EnvelopeError::Encoding`] -- `arrived` is no SET, or its element is no `RecipientInfo`.
+	fn sole_recipient(arrived: AnyRef<'_>) -> Result<RecipientInfos, EnvelopeError> {
+		if arrived.tag() != DerTag::Set {
+			return Err(EnvelopeError::Encoding(arrived.tag().unexpected_error(Some(DerTag::Set))));
+		}
+
+		let mut recipients = SliceReader::new(arrived.value())?;
+		let mut sole = None;
+		while !recipients.is_finished() {
+			let recipient = recipients.tlv_bytes()?;
+			if sole.replace(recipient).is_some() {
+				return Err(EnvelopeError::RecipientKind);
+			}
+		}
+
+		let sole = sole.ok_or(EnvelopeError::RecipientKind)?;
+		let recipient = RecipientInfo::from_der(sole)?;
+		Ok(RecipientInfos(SetOfVec::try_from(vec![recipient])?))
+	}
+
 	/// The associated data of an open of this envelope, whose encoding is
 	/// `arrived`, of type `expected`, as [`Self::aad_as_arrived`] admits it.
 	/// It reads the attributes from `arrived` in place.
@@ -411,7 +439,7 @@ impl AuthEnvelopedData {
 	/// # Errors
 	///
 	/// - [`EnvelopeError::Encoding`] -- `arrived` is no DER `AuthEnvelopedData`.
-	/// - The [`Self::aad_as_arrived`] set.
+	/// - The errors of [`Self::aad_as_arrived`].
 	pub(super) fn associated_data(&self, arrived: &[u8], expected: ObjectIdentifier) -> Result<Vec<u8>, EnvelopeError> {
 		let arrived = ArrivedEnvelopeRef::from_der(arrived)?;
 		self.aad_as_arrived(expected, arrived.auth_attrs)
@@ -444,9 +472,12 @@ impl AuthEnvelopedData {
 	///
 	/// # Errors
 	///
-	/// - [`EnvelopeError::Encoding`] -- `record` is no DER `AuthEnvelopedData`.
+	/// - [`EnvelopeError::Encoding`] -- `record` is no DER `AuthEnvelopedData`
+	///   that the admission walk admits, or it carries `originatorInfo` or
+	///   `unauthAttrs`.
+	/// - [`EnvelopeError::RecipientKind`] -- `record` carries another number of recipients than one.
 	/// - [`EnvelopeError::MissingContent`] -- the envelope carries no encrypted content.
-	/// - The [`Self::aad_as_arrived`] set.
+	/// - The errors of [`Self::aad_as_arrived`].
 	pub(in crate::crypto) fn detach(
 		record: &mut [u8],
 		content_type: ObjectIdentifier,
@@ -462,12 +493,20 @@ impl AuthEnvelopedData {
 	///
 	/// # Errors
 	///
-	/// - The [`Self::detach`] set.
+	/// - The errors of [`Self::detach`].
 	fn decode_detached(
 		arrived: &[u8],
 		content_type: ObjectIdentifier,
 	) -> Result<(Self, Vec<u8>, Range<usize>), EnvelopeError> {
+		DerAdmission::Cms.admit(arrived)?;
 		let decoded = ArrivedEnvelope::from_der(arrived)?;
+		// The sender of a record leaves both fields out, and the tag covers
+		// neither, so this refuses an envelope that carries one before any key
+		// runs.
+		if let Some(unauthenticated) = decoded.originator_info.or(decoded.unauth_attrs) {
+			return Err(EnvelopeError::Encoding(unauthenticated.tag().value_error()));
+		}
+
 		let ArrivedContentInfo { content_type: encrypted_type, content_enc_alg, encrypted_content } =
 			decoded.auth_encrypted_content_info;
 
@@ -478,12 +517,12 @@ impl AuthEnvelopedData {
 
 		let envelope = Self {
 			version: decoded.version,
-			originator_info: decoded.originator_info,
-			recipient_infos: decoded.recipient_infos,
+			originator_info: None,
+			recipient_infos: Self::sole_recipient(decoded.recipient_infos)?,
 			auth_encrypted_content_info,
 			auth_attrs: decoded.auth_attrs.map(ArrivedAttributes::attributes).transpose()?,
 			mac: decoded.mac,
-			unauth_attrs: decoded.unauth_attrs,
+			unauth_attrs: None,
 		};
 
 		let associated_data = envelope.aad_as_arrived(content_type, decoded.auth_attrs)?;
@@ -533,10 +572,12 @@ impl AuthEnvelopedData {
 	}
 
 	/// The associated data of an open: the DER of the authenticated
-	/// attributes under the universal `SET OF` tag (RFC 5083 §2.2), once
-	/// their content-type attribute and the encrypted content name `expected`
-	/// and `arrived`, the attributes as they arrived, are that DER (RFC 5083
-	/// §2.1). It is the one encode of the attributes on an open.
+	/// attributes under the universal `SET OF` tag (RFC 5083 §2.2). It is the
+	/// one encode of the attributes on an open, and it returns the DER when
+	/// both conditions hold:
+	///
+	/// - The content-type attribute and the encrypted content name `expected`.
+	/// - `arrived`, the attributes as they arrived, are that DER (RFC 5083 §2.1).
 	///
 	/// # Errors
 	///
@@ -602,7 +643,7 @@ impl<A: ContentEncryption> Draw<A> {
 	///
 	/// # Errors
 	///
-	/// - The [`Self::seal_in_place`] set.
+	/// - The errors of [`Self::seal_in_place`].
 	fn seal(
 		self,
 		recipient_info: RecipientInfo,
@@ -718,7 +759,7 @@ impl<'a> Detached<'a> {
 	///
 	/// # Errors
 	///
-	/// - The [`AuthEnvelopedData::open_detached_kek`] set after the attributes.
+	/// - The errors of [`AuthEnvelopedData::open_detached_kek`] that follow the attributes.
 	pub(in crate::crypto) fn open_kek<P>(self, kek: &[u8], key_identifier: &[u8]) -> Result<&'a [u8], EnvelopeError>
 	where
 		P: CryptoProvider<AeadCipher: ContentEncryption>,
@@ -733,8 +774,9 @@ impl<'a> Detached<'a> {
 }
 
 /// The syntax of [`AuthEnvelopedData`] with the encrypted content and the
-/// authenticated attributes borrowed from the buffer they arrived in. Each
-/// other field decodes as the field of the owned type does.
+/// authenticated attributes borrowed from the buffer they arrived in. The
+/// `originatorInfo` and the `unauthAttrs` stay as they arrived, and each other
+/// field decodes as the field of the owned type does.
 #[derive(Sequence)]
 struct ArrivedEnvelope<'a> {
 	version: CmsVersion,
@@ -744,8 +786,8 @@ struct ArrivedEnvelope<'a> {
 		constructed = "true",
 		optional = "true"
 	)]
-	originator_info: Option<OriginatorInfo>,
-	recipient_infos: RecipientInfos,
+	originator_info: Option<AnyRef<'a>>,
+	recipient_infos: AnyRef<'a>,
 	auth_encrypted_content_info: ArrivedContentInfo<'a>,
 	#[asn1(
 		context_specific = "1",
@@ -761,7 +803,7 @@ struct ArrivedEnvelope<'a> {
 		constructed = "true",
 		optional = "true"
 	)]
-	unauth_attrs: Option<Attributes>,
+	unauth_attrs: Option<AnyRef<'a>>,
 }
 
 /// The syntax of [`AuthEnvelopedData`] borrowed whole from the buffer it

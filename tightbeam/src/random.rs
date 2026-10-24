@@ -8,8 +8,8 @@ use rand_core::CryptoRng;
 /// bounds required by generic constructors such as `SecretKey::random`.
 ///
 /// A `dyn` RNG is unsized, so `impl CryptoRngCore` bounds take this sized
-/// wrapper. It forwards every method to the underlying trait object,
-/// letting callers inject their own CSPRNG.
+/// wrapper. It forwards every method to the underlying trait object, so
+/// callers can inject their own CSPRNG.
 #[cfg(any(feature = "transport-cms", feature = "hpke"))]
 pub(crate) struct RngWrapper<'a>(pub(crate) &'a mut dyn CryptoRngCore);
 
@@ -71,12 +71,12 @@ pub fn generate_nonce<const N: usize>(rng: Option<&mut dyn CryptoRngCore>) -> Re
 /// `None` draws from the OS CSPRNG, as [`generate_nonce`] does.
 pub fn generate_random_number<const N: usize>(rng: Option<&mut dyn CryptoRngCore>) -> Result<usize> {
 	const USIZE_BYTES: usize = core::mem::size_of::<usize>();
-	if N > USIZE_BYTES {
-		return Err(crate::TightBeamError::InvalidOverflowValue);
-	}
-
 	let mut bytes = [0u8; USIZE_BYTES];
-	generate_random_bytes(&mut bytes[..N], rng)?;
+	let Some(drawn) = bytes.get_mut(..N) else {
+		return Err(crate::TightBeamError::InvalidOverflowValue);
+	};
+
+	generate_random_bytes(drawn, rng)?;
 	Ok(usize::from_le_bytes(bytes))
 }
 

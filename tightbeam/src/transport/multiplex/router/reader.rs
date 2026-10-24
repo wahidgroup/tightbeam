@@ -2,7 +2,6 @@
 //! under granted credit, and buffers control-plane replies so the read loop
 //! keeps running while the writer queue is full.
 
-use core::sync::atomic::{AtomicUsize, Ordering};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
@@ -14,6 +13,7 @@ use super::body::{BodyEvent, DrainNote, ForwardedStream, StreamBody};
 use super::flow::{cap_as_usize, BufferedGrantor, ChunkSize, CreditGrantor};
 use super::link::MuxLink;
 use super::outbound::Outbound;
+use super::reassembly::{Reassembly, ReassemblyBudget};
 use super::shared::{OpenSlot, PeerStream, StreamOutcome};
 use crate::der::Decode;
 use crate::policy::TransitStatus;
@@ -85,87 +85,21 @@ fn refusal_reason(code: u32) -> GoAwayReason {
 	GoAwayReason::SettlementFailed
 }
 
-/// Reassembly bytes buffered across every stream on one connection.
-///
-/// A per-stream ceiling multiplies by the number of streams a peer opens, so
-/// the connection holds this shared counter and every [`RecvStream`] charges
-/// against it.
-#[derive(Debug)]
-struct ReassemblyBudget {
-	used: AtomicUsize,
-	ceiling: usize,
-}
-
-impl Default for ReassemblyBudget {
-	fn default() -> Self {
-		Self::with_ceiling(crate::constants::MAX_MUX_CONNECTION_REASSEMBLY_BYTES)
-	}
-}
-
-impl ReassemblyBudget {
-	fn with_ceiling(ceiling: usize) -> Self {
-		Self { used: AtomicUsize::new(0), ceiling }
-	}
-
-	/// Reserve `bytes` for a stream, or refuse when the connection is full.
-	fn try_charge(&self, bytes: usize) -> bool {
-		let mut used = self.used.load(Ordering::Relaxed);
-		loop {
-			let Some(next) = used.checked_add(bytes).filter(|next| *next <= self.ceiling) else {
-				return false;
-			};
-
-			match self
-				.used
-				.compare_exchange_weak(used, next, Ordering::Relaxed, Ordering::Relaxed)
-			{
-				Ok(_) => return true,
-				Err(observed) => used = observed,
-			}
-		}
-	}
-
-	/// Return `bytes` to the connection.
-	fn release(&self, bytes: usize) {
-		self.used.fetch_sub(bytes, Ordering::Relaxed);
-	}
-}
-
-/// Receiver-side reassembly state for one inbound stream direction.
+/// Receiver-side state of one inbound stream direction: the credit it was
+/// granted, and the bytes it reassembled.
 struct RecvStream {
-	/// Chunks concatenated in arrival order. The AEAD channel already proves
-	/// order and completeness.
-	buffer: Vec<u8>,
+	/// Chunks concatenated in arrival order, under the stream and connection
+	/// ceilings. The AEAD channel already proves order and completeness.
+	bytes: Reassembly,
 	/// Count of chunks accepted so far.
 	received: u64,
 	/// Absolute cumulative chunk limit granted to the sender.
 	limit: u64,
-	/// Hard byte ceiling on `buffer`, which credit grants cannot raise.
-	max_bytes: usize,
-	/// Connection-wide ceiling this stream's bytes are charged against.
-	///
-	/// The stream holds the budget rather than taking it per call, so the
-	/// [`Drop`] below returns the bytes whichever path discards the stream.
-	budget: Arc<ReassemblyBudget>,
-}
-
-/// Return the buffered bytes of this stream to the connection budget.
-///
-/// Map removal, an error return, and task teardown all run this, so every
-/// path that discards the stream releases its reservation.
-impl Drop for RecvStream {
-	fn drop(&mut self) {
-		self.budget.release(self.buffer.len());
-	}
 }
 
 impl RecvStream {
 	fn new(limit: u64, budget: Arc<ReassemblyBudget>) -> Self {
-		Self::with_ceiling(limit, crate::constants::MAX_MUX_REASSEMBLY_BYTES, budget)
-	}
-
-	fn with_ceiling(limit: u64, max_bytes: usize, budget: Arc<ReassemblyBudget>) -> Self {
-		Self { buffer: Vec::new(), received: 0, limit, max_bytes, budget }
+		Self { bytes: Reassembly::new(budget), received: 0, limit }
 	}
 
 	/// Account one accepted chunk against the granted limit and buffer it.
@@ -173,24 +107,12 @@ impl RecvStream {
 	/// Returns `false` when the sender overran its credit, the hard reassembly
 	/// byte ceiling, or the connection ceiling.
 	fn accept_chunk(&mut self, payload: impl AsRef<[u8]>) -> bool {
-		let payload = payload.as_ref();
 		self.received = self.received.saturating_add(1);
 		if self.received > self.limit {
 			return false;
 		}
-		if self.buffer.len().saturating_add(payload.len()) > self.max_bytes {
-			return false;
-		}
-		// The connection ceiling is charged before the bytes are held, so a
-		// peer spreading its payload across many streams is refused at the
-		// same total as one stream reaching its own ceiling.
-		if !self.budget.try_charge(payload.len()) {
-			return false;
-		}
 
-		self.buffer.extend_from_slice(payload);
-
-		true
+		self.bytes.append(payload).is_ok()
 	}
 }
 
@@ -198,8 +120,8 @@ impl RecvStream {
 ///
 /// Spawn [`MuxReaderDriver::drive`] on the caller's executor.
 ///
-/// - Responses resolve their pending stream. Unknown IDs are discarded
-///   silently, because cancel and response races are benign.
+/// - Responses resolve their pending stream. The driver discards an unknown
+///   ID silently, because cancel and response races are benign.
 /// - Requests flow to the [`crate::transport::multiplex::MuxResponder`].
 /// - Chunked payloads reassemble here, bounded by the credit this endpoint
 ///   granted. The [`CreditGrantor`] decides when to raise a stream's limit.
@@ -225,8 +147,6 @@ where
 	/// Credits the peer may still spend inbound, or `None` when the session is
 	/// unmetered.
 	recv_budget: Option<u64>,
-	/// Reassembly ceiling shared by every stream on this connection.
-	reassembly_budget: Arc<ReassemblyBudget>,
 	/// Reassembly of peer-initiated request streams.
 	peer_reassembly: HashMap<u32, RecvStream>,
 	/// Streaming peer-initiated requests, whose chunks forward to the
@@ -242,13 +162,14 @@ where
 	/// note per live body.
 	drained: mpsc::Receiver<DrainNote>,
 	/// Control commands buffered while the writer queue is full, so the read
-	/// loop never parks, as [RFC 9113 § 5.2.2][rfc9113-5.2.2] warns.
+	/// loop keeps running. [RFC 9113 § 5.2.2][rfc9113-5.2.2] warns of the
+	/// deadlock a parked reader causes.
 	///
 	/// The buffer is bounded:
 	///
 	/// - Grants coalesce per stream and evict when the stream closes.
 	/// - Ping acks and refusals are capped.
-	/// - Rekey legs are one-in-flight.
+	/// - Rekey legs hold one exchange in flight at a time.
 	///
 	/// [rfc9113-5.2.2]: https://datatracker.ietf.org/doc/html/rfc9113#section-5.2.2
 	pending_control: VecDeque<Outbound>,
@@ -344,7 +265,6 @@ where
 			recv_chunk_size: ChunkSize::new(cap_as_usize(settings.recv_chunk_size)),
 			initial_recv_credit: settings.initial_recv_credit.max(1),
 			recv_budget: settings.recv_budget,
-			reassembly_budget: Arc::new(ReassemblyBudget::default()),
 			peer_reassembly: HashMap::new(),
 			peer_bodies: HashMap::new(),
 			local_reassembly: HashMap::new(),
@@ -386,7 +306,8 @@ where
 	///
 	/// # Errors
 	///
-	/// - [`TransportError::InvalidMessage`] -- the peer broke the mux protocol, and a GoAway was sent.
+	/// - [`TransportError::InvalidMessage`] -- the peer broke the mux protocol,
+	///   and the reader queued a best-effort GoAway.
 	/// - [`TransportError::ConnectionClosed`] -- the writer driver is gone.
 	/// - The read or receive-cipher install failure of the [`EnvelopeSource`].
 	pub async fn drive(mut self) -> TransportResult<()> {
@@ -427,12 +348,14 @@ where
 			MuxEnvelope::Ping(package) => self.route_ping(package),
 			MuxEnvelope::GoAway(package) => {
 				let shared = self.link.shared();
-				shared.fail_pending_above(package.last_stream_id(), package.reason());
+				// Every stream above the watermark ends before a fault at the
+				// record of the GoAway returns.
+				let received = shared.fail_pending_above(package.last_stream_id(), package.reason());
 				shared.fail_duplex_above(package.last_stream_id());
-				// The peer will never answer these streams, so their partial
-				// response buffers are dropped.
+				// The peer will never answer these streams, so the reader drops
+				// their partial response buffers.
 				self.local_reassembly.retain(|id, _| shared.is_pending(*id));
-				Ok(())
+				received
 			}
 			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 			MuxEnvelope::RekeyRequest(package) => self.route_rekey_request(package).await,
@@ -465,7 +388,7 @@ where
 		let Some(exchange) = self.rekey.as_ref().and_then(RekeyDriver::renewal_opener) else {
 			return Ok(());
 		};
-		let Some(request) = self.link.shared().open_renewal(exchange) else {
+		let Some(request) = self.link.shared().open_renewal(exchange)? else {
 			return Ok(());
 		};
 
@@ -485,16 +408,22 @@ where
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	fn drain_refused(&mut self, code: u32) -> TransportResult<()> {
 		#[cfg(feature = "instrument")]
-		self.link.shared().emit_event(events::MUX_REKEY_REFUSED);
+		self.link.shared().emit_event(events::MUX_REKEY_REFUSED)?;
 
-		let Some(package) = self.link.shared().goaway_package(refusal_reason(code)) else {
+		let reason = refusal_reason(code);
+		let Some(package) = self.link.shared().goaway_package(reason) else {
 			return Ok(());
 		};
 
-		self.queue_control(package.into())
+		self.queue_control(package.into())?;
+
+		#[cfg(feature = "instrument")]
+		self.link.shared().emit_goaway_event(events::MUX_GOAWAY_SENT, reason)?;
+
+		Ok(())
 	}
 
-	/// Server leg: issue the epoch receipt for a renewal request.
+	/// On the server leg, issue the epoch receipt for a renewal request.
 	///
 	/// The rekey-flood bound (CWE-400) makes a request a protocol violation in
 	/// two cases:
@@ -518,7 +447,7 @@ where
 		match issued {
 			Some(Ok(RequestAnswer::Issued(response))) => {
 				#[cfg(feature = "instrument")]
-				self.link.shared().emit_event(events::MUX_REKEY_RECEIPT_ISSUED);
+				self.link.shared().emit_event(events::MUX_REKEY_RECEIPT_ISSUED)?;
 
 				let envelope = TransportEnvelope::from(response);
 				self.queue_control(envelope)
@@ -526,7 +455,7 @@ where
 			Some(Err(HandshakeError::SettlementRejected { code })) => self.drain_refused(code),
 			Some(Err(_)) => {
 				#[cfg(feature = "instrument")]
-				self.link.shared().emit_event(events::MUX_REKEY_VERIFY_FAILED);
+				self.link.shared().emit_event(events::MUX_REKEY_VERIFY_FAILED)?;
 
 				Err(self.protocol_violation())
 			}
@@ -544,9 +473,9 @@ where
 	/// The receive-side install waits for `RekeyDone`.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	async fn route_rekey_response(&mut self, package: MuxRekeyResponsePackage) -> TransportResult<()> {
-		// Admitting the response parks new c2s admissions before it is
-		// verified, so no admission can debit the old epoch once the ack
-		// is in motion.
+		// Admitting the response parks new c2s admissions before the driver
+		// verifies it, so no admission can debit the old epoch once the
+		// ack is in motion.
 		if !self.link.shared().admit_rekey_response() {
 			return Err(self.protocol_violation());
 		}
@@ -561,7 +490,7 @@ where
 		match processed {
 			Ok((ack, install)) => {
 				#[cfg(feature = "instrument")]
-				self.link.shared().emit_event(events::MUX_REKEY_RECEIPT_COUNTERSIGNED);
+				self.link.shared().emit_event(events::MUX_REKEY_RECEIPT_COUNTERSIGNED)?;
 
 				let EpochInstall { send_cipher, recv_cipher, receipt, epoch: _ } = install;
 
@@ -577,14 +506,14 @@ where
 			}
 			Err(_) => {
 				#[cfg(feature = "instrument")]
-				self.link.shared().emit_event(events::MUX_REKEY_VERIFY_FAILED);
+				self.link.shared().emit_event(events::MUX_REKEY_VERIFY_FAILED)?;
 
 				Err(self.protocol_violation())
 			}
 		}
 	}
 
-	/// Server leg: settle the countersignature and switch epochs.
+	/// On the server leg, settle the countersignature and switch epochs.
 	///
 	/// The receive cipher installs even on a settlement refusal, because the
 	/// client switched its send direction at the `RekeyAck` boundary and the
@@ -604,7 +533,7 @@ where
 		};
 		let Ok(outcome) = settled else {
 			#[cfg(feature = "instrument")]
-			self.link.shared().emit_event(events::MUX_REKEY_VERIFY_FAILED);
+			self.link.shared().emit_event(events::MUX_REKEY_VERIFY_FAILED)?;
 
 			return Err(self.protocol_violation());
 		};
@@ -621,7 +550,7 @@ where
 		// The budget boundary sits at `RekeyDone`. The strict c2s park keeps
 		// nothing in flight across the inbound reset, and every post-reset
 		// outbound debit queues behind the `RekeyDone` about to be enqueued.
-		self.renew_epoch_terms(receipt);
+		self.renew_epoch_terms(receipt)?;
 
 		let done_package = MuxRekeyDonePackage::default();
 		let done_envelope = TransportEnvelope::from(done_package);
@@ -649,7 +578,7 @@ where
 		}
 
 		#[cfg(feature = "instrument")]
-		self.link.shared().emit_event(events::MUX_REKEY_RENEWED);
+		self.link.shared().emit_event(events::MUX_REKEY_RENEWED)?;
 
 		Ok(())
 	}
@@ -659,14 +588,20 @@ where
 	/// Both budgets reset to the negotiated figures, and the dual-signed
 	/// receipt rotates. The credit-match invariant keeps epoch terms equal to
 	/// the initial ones.
+	///
+	/// # Errors
+	///
+	/// - The injected error, when the runtime fault model injects a fault at
+	///   the event of the renewal, after the terms changed.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-	fn renew_epoch_terms(&mut self, receipt: StoredReceipt) {
+	fn renew_epoch_terms(&mut self, receipt: StoredReceipt) -> TransportResult<()> {
 		self.recv_budget = self.initial_recv_budget;
 		self.link.shared().reset_send_budget();
 		self.link.shared().rotate_receipt(receipt);
 
 		#[cfg(feature = "instrument")]
-		self.link.shared().emit_event(events::MUX_REKEY_RENEWED);
+		self.link.shared().emit_event(events::MUX_REKEY_RENEWED)?;
+		Ok(())
 	}
 
 	/// Enforce the advertised chunk ceiling and debit the inbound session
@@ -684,17 +619,17 @@ where
 		};
 
 		let credits = self.recv_chunk_size.credits(payload.len(), self.link.shared().credit_unit);
-		if credits > balance {
+		let Some(remaining) = balance.checked_sub(credits) else {
 			return Err(self.protocol_violation());
-		}
+		};
 
-		self.recv_budget = Some(balance - credits);
+		self.recv_budget = Some(remaining);
 		Ok(())
 	}
 
 	/// Await the next unit of read-loop work: an inbound envelope, a
-	/// body-drain report, or a completed control flush. The read
-	/// never parks behind the flush or the drain reports.
+	/// body-drain report, or a completed control flush. The read races the
+	/// flush and the drain reports, and the first one ready wins.
 	async fn next_event(&mut self) -> TransportResult<ReaderEvent> {
 		let Self { reader, drained, link, pending_control, .. } = self;
 
@@ -834,8 +769,8 @@ where
 	/// the stream's limit.
 	fn maybe_grant(&mut self, stream_id: u32, stream: &mut RecvStream) -> TransportResult<()> {
 		// Grants stop once the byte ceiling is full, because raising the chunk
-		// window admits no payload past `max_bytes`.
-		if stream.buffer.len() >= stream.max_bytes {
+		// window admits no payload past it.
+		if stream.bytes.is_full() {
 			return Ok(());
 		}
 
@@ -893,9 +828,9 @@ where
 			return self.finish_duplex_body(forwarder, &package);
 		}
 
-		// Resolve before decoding. Stale ends are discarded without inspecting
-		// their payload, and non-Ok trailers contribute no frame, so garbage
-		// bytes on either cannot tear down the connection.
+		// Resolve before decoding. The reader discards a stale end without
+		// inspecting its payload, and a non-Ok trailer contributes no frame, so
+		// garbage bytes on either cannot tear down the connection.
 		let Some(sender) = self.link.shared().remove_pending(stream_id) else {
 			self.local_reassembly.remove(&stream_id);
 			return Ok(());
@@ -907,7 +842,7 @@ where
 		}
 
 		let message = match package.status() {
-			TransitStatus::Ok => self.decode_stream_frame(&stream.buffer)?,
+			TransitStatus::Ok => self.decode_stream_frame(stream.bytes.as_slice())?,
 			_ => None,
 		};
 
@@ -976,7 +911,7 @@ where
 			return Err(self.protocol_violation());
 		}
 
-		let stream = RecvStream::new(self.initial_recv_credit, Arc::clone(&self.reassembly_budget));
+		let stream = RecvStream::new(self.initial_recv_credit, self.link.shared().reassembly_budget());
 		let stream = self.park_reassembly(stream_id, stream, package.payload())?;
 		self.peer_reassembly.insert(stream_id, stream);
 
@@ -1006,6 +941,7 @@ where
 			OpenSlot::assigned(stream_id),
 			self.initial_recv_credit,
 			self.link.drain_feedback(),
+			self.link.shared().reassembly_budget(),
 		);
 		if !forwarder.accept_and_forward(package.payload()) {
 			return Err(self.protocol_violation());
@@ -1015,8 +951,8 @@ where
 		let route = StreamRoute::from_parts(package.target().cloned(), package.hops_remaining());
 
 		if package.last() {
-			// The body is handed to the handler below, and a handler that
-			// drops it unread has closed the stream either way.
+			// The reader hands the body to the handler below, and a handler
+			// that drops it unread has closed the stream either way.
 			let _ = forwarder.forward(BodyEvent::End);
 		} else {
 			self.peer_bodies.insert(stream_id, forwarder);
@@ -1043,13 +979,13 @@ where
 		Ok(())
 	}
 
-	/// Refuse an open past our GoAway watermark.
+	/// Refuse an open past this endpoint's GoAway watermark.
 	///
 	/// The chunk still crossed the wire under the sender's ledgers, so the
 	/// reader debits it inbound.
 	fn reject_draining_open(&mut self, stream_id: u32, package: MuxOpenPackage) -> TransportResult<()> {
 		#[cfg(feature = "instrument")]
-		self.link.shared().emit_event(events::MUX_OPEN_DRAINING);
+		self.link.shared().emit_event(events::MUX_OPEN_DRAINING)?;
 
 		self.charge_inbound_chunk(package.payload())?;
 		self.refuse_stream(stream_id)?;
@@ -1097,7 +1033,7 @@ where
 	fn take_local_reassembly(&mut self, stream_id: u32) -> RecvStream {
 		self.local_reassembly
 			.remove(&stream_id)
-			.unwrap_or_else(|| RecvStream::new(self.initial_recv_credit, Arc::clone(&self.reassembly_budget)))
+			.unwrap_or_else(|| RecvStream::new(self.initial_recv_credit, self.link.shared().reassembly_budget()))
 	}
 
 	/// Accept a non-final chunk and raise credit when the grantor asks.
@@ -1140,7 +1076,7 @@ where
 			// stream is leaving reassembly.
 			let stream = self.accept_chunk_or_violate(stream, package.payload())?;
 			self.evict_credit(stream_id);
-			return self.dispatch_request(stream_id, &stream.buffer).await;
+			return self.dispatch_request(stream_id, stream.bytes.as_slice()).await;
 		}
 
 		let stream = self.park_reassembly(stream_id, stream, package.payload())?;
@@ -1151,11 +1087,11 @@ where
 
 	/// Forward one streaming request chunk into its body channel.
 	///
-	/// - Overrunning the granted limit is a violation exactly as in reassembly.
+	/// - Overrunning the granted limit is a violation, as in reassembly.
 	/// - A dropped body, refused at the cap or abandoned by its handler, evicts
 	///   the forwarder. The stream's remaining flushes then route through the
 	///   tolerated refused-stream path instead of being copied into a dead
-	///   channel, and consumed credit stays consumed (no refunds).
+	///   channel, and consumed credit stays consumed, with no refund.
 	fn forward_request_chunk(&mut self, package: &MuxDataPackage) -> TransportResult<()> {
 		let stream_id = package.stream_id();
 		let Some(stream) = self.peer_bodies.get_mut(&stream_id) else {
@@ -1283,9 +1219,9 @@ where
 	///
 	/// # Flood bound
 	///
-	/// - After our GoAway, the writer reserves its remaining records for owed
-	///   stream traffic (see [`MuxSettings::drain_reserve_records`]), so peer
-	///   probes draw no acks.
+	/// - After this endpoint's GoAway, the writer reserves its remaining
+	///   records for owed stream traffic (see
+	///   [`MuxSettings::drain_reserve_records`]), so peer probes draw no acks.
 	/// - The ack backlog is capped at [`MAX_PENDING_PING_ACKS`].
 	///
 	/// Together they bound what a ping flood can extract (CVE-2019-9512).
@@ -1313,7 +1249,7 @@ where
 	/// A conforming peer holds at most `peer_cap` opens in flight, so that
 	/// many buffered refusals cover every stream it can have outstanding. An
 	/// open beyond that backlog comes from a peer flooding past its cap or
-	/// past our GoAway, and it draws no cancel for two reasons:
+	/// past this endpoint's GoAway, and it draws no cancel for two reasons:
 	///
 	/// - The GoAway already disowns everything above its watermark.
 	/// - A zero-credit open then extracts nothing from a stalled writer
@@ -1324,13 +1260,18 @@ where
 	}
 
 	/// Send a best-effort `ProtocolError` GoAway and return the error that
-	/// fails the driver.
+	/// fails the driver. A fault the trace injects at either event is that
+	/// error.
 	fn protocol_violation(&mut self) -> TransportError {
 		#[cfg(feature = "instrument")]
-		self.link.shared().emit_event(events::MUX_PROTOCOL_ERROR);
+		if let Err(fault) = self.link.shared().emit_event(events::MUX_PROTOCOL_ERROR) {
+			return fault;
+		}
 
 		let last = self.link.shared().last_peer_stream_id();
-		self.link.goaway_best_effort(last, GoAwayReason::ProtocolError);
+		if let Err(fault) = self.link.goaway_best_effort(last, GoAwayReason::ProtocolError) {
+			return fault;
+		}
 
 		TransportError::InvalidMessage
 	}
@@ -1356,7 +1297,7 @@ mod tests {
 		assert!(stream.accept_chunk(b"ab"));
 		assert!(stream.accept_chunk(b"cd"));
 		assert!(!stream.accept_chunk(b"ef"));
-		assert_eq!(stream.buffer.as_slice(), b"abcd");
+		assert_eq!(stream.bytes.as_slice(), b"abcd");
 	}
 
 	// A peer that spreads its payload across many streams must hit the same
@@ -1380,7 +1321,7 @@ mod tests {
 		}
 
 		assert_eq!(charged, connection_ceiling);
-		assert_eq!(budget.used.load(Ordering::Relaxed), connection_ceiling);
+		assert_eq!(budget.used(), connection_ceiling);
 	}
 
 	// Dropping a stream returns its bytes, so a long-lived connection that
@@ -1391,10 +1332,10 @@ mod tests {
 		{
 			let mut stream = RecvStream::new(u64::MAX, Arc::clone(&budget));
 			assert!(stream.accept_chunk([0u8; 128]));
-			assert_eq!(budget.used.load(Ordering::Relaxed), 128);
+			assert_eq!(budget.used(), 128);
 		}
 
-		assert_eq!(budget.used.load(Ordering::Relaxed), 0);
+		assert_eq!(budget.used(), 0);
 
 		let mut reused = RecvStream::new(u64::MAX, Arc::clone(&budget));
 		assert!(reused.accept_chunk([0u8; 128]));
@@ -1405,7 +1346,8 @@ mod tests {
 	#[test]
 	fn test_recv_stream_rejects_past_reassembly_ceiling() {
 		let ceiling = 256usize;
-		let mut stream = RecvStream::with_ceiling(1, ceiling, Arc::new(ReassemblyBudget::default()));
+		let bytes = Reassembly::with_ceiling(ceiling, Arc::new(ReassemblyBudget::default()));
+		let mut stream = RecvStream { bytes, received: 0, limit: 1 };
 		let chunk = [0u8; 64];
 		let mut accepted = 0usize;
 		loop {
@@ -1420,7 +1362,7 @@ mod tests {
 			assert!(accepted.saturating_mul(chunk.len()) <= ceiling);
 		}
 
-		assert!(stream.buffer.len() <= ceiling);
+		assert!(stream.bytes.as_slice().len() <= ceiling);
 		assert!(accepted > 0);
 	}
 
@@ -1462,7 +1404,7 @@ mod tests {
 		driver: MuxReaderDriver<ScriptedSource>,
 		/// Receiving end of the full outbound queue.
 		outbound: mpsc::Receiver<Outbound>,
-		/// Held open so the driver's inbound channel stays open.
+		/// Receiving end of the inbound channel, held to keep it open.
 		inbound: mpsc::Receiver<InboundEvent>,
 		/// Count of envelopes the source has delivered.
 		delivered: Arc<AtomicUsize>,
@@ -1725,10 +1667,10 @@ mod tests {
 		}
 	}
 
-	/// A peer that keeps opening streams into our drain, or past the cap it
-	/// was advertised, costs itself nothing per open, so the refusals it can
-	/// buffer while the writer is stalled stop at the fixture's peer cap
-	/// (CWE-770).
+	/// A peer that keeps opening streams into this endpoint's drain, or past
+	/// the cap it was advertised, costs itself nothing per open, so the
+	/// refusals it can buffer while the writer is stalled stop at the fixture's
+	/// peer cap (CWE-770).
 	#[test]
 	fn test_refusal_backlog_is_capped_at_the_peer_cap() {
 		let mut fixture = reader_with_full_queue(Vec::new());

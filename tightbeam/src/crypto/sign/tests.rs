@@ -5,6 +5,8 @@ use core::str::FromStr;
 use std::sync::Arc;
 
 use super::*;
+use crate::asn1::admission::fixtures::tlv;
+use crate::asn1::admission::DerAdmission;
 use crate::cms::cert::{CertificateChoices, IssuerAndSerialNumber, OtherCertificateFormat};
 use crate::cms::content_info::CmsVersion;
 use crate::cms::revocation::{OtherRevocationInfoFormat, RevocationInfoChoice, RevocationInfoChoices};
@@ -22,8 +24,10 @@ use crate::crypto::x509::KeyPurposes;
 use crate::crypto::x509::{ErasedSigning, PeerCertificate, Signing};
 use crate::der::asn1::{BitString, OctetString, SetOfVec};
 use crate::der::oid::AssociatedOid;
-use crate::der::{Any, Decode, Encode, Tag};
+use crate::der::{Any, AnyRef, Decode, Encode, ErrorKind, Header, Reader, SliceReader, Tag, TagNumber};
 use crate::error::ReceivedExpectedError;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::frame::{ArrivedCertificates, CERTIFICATES_TAG};
 use crate::oids::{
 	ATTR_CMS_ALGORITHM_PROTECTION, ATTR_CONTENT_TYPE, ATTR_MESSAGE_DIGEST, DATA, HASH_SHA3_256, HASH_SHA3_512,
 	RECEIPT_ROLE, SESSION_RECEIPT_CONTENT, SIGNER_ECDSA_WITH_SHA256,
@@ -705,8 +709,8 @@ fn a_signed_data_of_a_version_3_signer_is_version_3() -> TestResult {
 	Ok(())
 }
 
-/// A `SignedData` of a version 1 signer over `id-data` is version 1 (RFC
-/// 5652 §5.1).
+/// A `SignedData` of a version 1 signer over `id-data` is version 1
+/// (RFC 5652 §5.1).
 #[test]
 fn a_signed_data_of_a_version_1_signer_over_data_is_version_1() -> TestResult {
 	let content = SignedContent::data(CONTENT);
@@ -729,8 +733,8 @@ fn a_signed_data_over_another_content_type_is_version_3() -> TestResult {
 	Ok(())
 }
 
-/// A `SignedData` that holds a certificate of type `other` is version 5 (RFC
-/// 5652 §5.1).
+/// A `SignedData` that holds a certificate of type `other` is version 5
+/// (RFC 5652 §5.1).
 #[test]
 fn a_signed_data_with_another_certificate_format_is_version_5() -> TestResult {
 	let content = SignedContent::data(CONTENT);
@@ -932,8 +936,8 @@ fn a_signing_identity_refuses_a_key_other_than_its_certificate_names() -> TestRe
 }
 
 /// A signing identity pairs a key with a certificate that holds the key's
-/// point in the compressed SEC 1 form, since both forms name one key (RFC
-/// 5480 §2.2).
+/// point in the compressed SEC 1 form, since both forms name one key
+/// (RFC 5480 §2.2).
 #[test]
 fn a_signing_identity_admits_its_key_in_the_compressed_form() -> TestResult {
 	let key = TestKey::insecure_fixed_signing();
@@ -1060,9 +1064,9 @@ async fn taking_the_signer_path_moves_the_set_out() -> TestResult {
 	let signer = identity.sign(SignedContent::data(CONTENT)).await?;
 	let presented = Some(identity.presented().set());
 	let signed = CmsSigner::signed_data(SignedContent::data(CONTENT), signer, presented)?;
-	let mut signed_data = signed.into_inner();
 
-	let path = CmsSigner::take_signer_path(&mut signed_data)?.ok_or("the set holds the named certificate")?;
+	let (signed_data, path) = CmsSigner::take_signer_path(signed)?;
+	let path = path.ok_or("the set holds the named certificate")?;
 	let (leaf, issuers) = path.into_parts();
 	let [chained_leaf, intermediate] = chained_certificates();
 	let taken = (leaf, issuers.as_slice(), signed_data.certificates);
@@ -1076,9 +1080,9 @@ async fn taking_the_signer_path_moves_the_set_out() -> TestResult {
 #[test]
 fn taking_from_a_set_without_the_signer_certificate_takes_no_path() -> TestResult {
 	let other = TestCertificate::self_signed(&Secp256k1SigningKey::random(&mut OsRng));
-	let mut signed_data = signed_data_carrying([other]);
+	let finished = received_as_signed(&signed_data_carrying([other]));
 
-	let path = CmsSigner::take_signer_path(&mut signed_data)?;
+	let (signed_data, path) = CmsSigner::take_signer_path(finished)?;
 	assert_eq!((path.is_none(), signed_data.certificates), (true, None));
 	Ok(())
 }
@@ -1087,12 +1091,33 @@ fn taking_from_a_set_without_the_signer_certificate_takes_no_path() -> TestResul
 /// choice of the set, so a choice of another format counts toward it.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 #[test]
-fn taking_a_path_counts_a_choice_of_another_format_toward_the_cap() {
-	let mut signed_data = signed_data_of_nine_choices();
+fn taking_a_path_counts_a_choice_of_another_format_toward_the_cap() -> TestResult {
+	let finished = received_as_signed(&signed_data_of_nine_choices());
 
-	let refused = CmsSigner::take_signer_path(&mut signed_data);
+	let refused = CmsSigner::take_signer_path(finished);
 	let capped = matches!(refused, Err(SignerError::Certificate(PathLenExceeded)));
 	assert!(capped);
+	Ok(())
+}
+
+/// A server holds the presented set of a client Finished to its cap as it
+/// arrived, before the typed decode sorts the set.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+#[test]
+fn a_presented_set_past_the_cap_is_refused_before_its_decode() -> TestResult {
+	let received = signed_data_of_nine_choices().to_der()?;
+
+	let refused = CmsSigner::bound_presented(&received);
+	let capped = matches!(refused, Err(SignerError::Certificate(PathLenExceeded)));
+	assert!(capped);
+	Ok(())
+}
+
+/// `signed_data` as a peer's `Signed` decode reads it from its DER.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+fn received_as_signed(signed_data: &SignedData) -> Signed<SignedData> {
+	let received = signed_data.to_der().expect("a test SignedData encodes");
+	Signed::<SignedData>::from_der(&received).expect("a test SignedData decodes")
 }
 
 /// The scan of the received set builds the path of the certificate the one
@@ -1145,6 +1170,131 @@ fn a_set_of_nine_certificates_is_refused() -> TestResult {
 	Ok(())
 }
 
+/// The DER of the `SignedData` of [`signed`] with two `certificates` fields
+/// beside each other, one carrying `first`, then one carrying `second`.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+fn twice_certified(first: Certificate, second: Certificate) -> Vec<u8> {
+	let first = elements_of(&signed_data_carrying([first]).to_der().expect("a SignedData encodes"));
+	let second = elements_of(&signed_data_carrying([second]).to_der().expect("a SignedData encodes"));
+	let second_field = second.get(3).expect("a SignedData of a set carries its certificates fourth");
+	let (head, signers) = first.split_at(4);
+	let fields = [head.concat(), second_field.to_owned(), signers.concat()];
+	tlv(Tag::Sequence, &fields.concat())
+}
+
+/// The DER of the `SignedData` of [`signed`] whose `certificates` field
+/// carries `certificate`, the DER of one certificate as it arrives.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+fn carrying_encoding(certificate: &[u8]) -> Vec<u8> {
+	let placeholder = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+	let fields = elements_of(&signed_data_carrying([placeholder]).to_der().expect("a SignedData encodes"));
+	let (head, rest) = fields.split_at(3);
+	let signers = rest.get(1..).expect("a SignedData of a set carries its signers after it");
+	let certificates = tlv(CERTIFICATES_TAG, certificate);
+	tlv(Tag::Sequence, &[head.concat(), certificates, signers.concat()].concat())
+}
+
+/// The DER of `certificate` with an explicit `critical FALSE` in its first
+/// extension that states no criticality, the default that DER omits
+/// (X.690 § 11.5).
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+fn with_explicit_default(certificate: &Certificate) -> Vec<u8> {
+	let mut parts = elements_of(&certificate.to_der().expect("a certificate encodes"));
+	let tbs = parts.first_mut().expect("a certificate starts with its TBS");
+	let mut fields = elements_of(tbs);
+	let tagged = fields.pop().expect("a test certificate carries extensions last");
+	let mut extensions = elements_of(AnyRef::from_der(&tagged).expect("an element decodes").value());
+	let unstated = extensions.iter_mut().find(|extension| elements_of(extension).len() == 2);
+	let unstated = unstated.expect("a test certificate carries an extension that states no criticality");
+	let mut extension = elements_of(unstated);
+	extension.insert(1, Vec::from([0x01, 0x01, 0x00]));
+	*unstated = tlv(Tag::Sequence, &extension.concat());
+
+	let extensions_tag = Tag::ContextSpecific { constructed: true, number: TagNumber::N3 };
+	fields.push(tlv(extensions_tag, &tlv(Tag::Sequence, &extensions.concat())));
+	*tbs = tlv(Tag::Sequence, &fields.concat());
+	tlv(Tag::Sequence, &parts.concat())
+}
+
+/// The elements of the SEQUENCE that `der` encodes, each as it arrived.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+fn elements_of(der: &[u8]) -> Vec<Vec<u8>> {
+	let mut reader = SliceReader::new(der).expect("a test encoding fits a DER length");
+	let header = Header::decode(&mut reader).expect("a test encoding starts with a header");
+	let elements = reader.read_nested(header.length, |elements| {
+		let mut read = Vec::new();
+		while !elements.is_finished() {
+			read.push(elements.tlv_bytes()?.to_vec());
+		}
+		Ok(read)
+	});
+	elements.expect("a test encoding is a SEQUENCE of elements")
+}
+
+/// The typed decode keeps the first of two `certificates` fields, and the
+/// scan of the received bytes refuses the second, so the two reads name one
+/// set.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+#[test]
+fn a_signed_data_with_two_certificates_fields_is_refused() -> TestResult {
+	let named = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+	let stranger_key = Secp256k1SigningKey::from_bytes(&[2; 32].into())?;
+	let stranger = TestCertificate::self_signed(&stranger_key);
+	let received = twice_certified(stranger, named);
+	let decoded = SignedData::from_der(&received)?;
+
+	let refused = CmsSigner::signer_path(&decoded, &received);
+	let second_field = ErrorKind::TagUnexpected { expected: None, actual: CERTIFICATES_TAG };
+	assert!(matches!(refused, Err(SignerError::Encoding(error)) if error.kind() == second_field));
+	Ok(())
+}
+
+/// A certificate whose bytes differ from its DER decodes to the certificate
+/// its CA signed, and the store would verify that DER, so the presented set
+/// refuses it.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+#[test]
+fn a_certificate_in_another_encoding_than_its_der_is_refused() -> TestResult {
+	let named = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+	let received = carrying_encoding(&with_explicit_default(&named));
+	let decoded = SignedData::from_der(&received)?;
+
+	let refused = CmsSigner::signer_path(&decoded, &received);
+	let noncanonical = ErrorKind::Noncanonical { tag: Tag::Sequence };
+	assert!(matches!(refused, Err(SignerError::Encoding(error)) if error.kind() == noncanonical));
+	Ok(())
+}
+
+/// The `Signed` decode of a client Finished, or of a receipt, compares the
+/// DER of each certificate with the bytes it arrived as, as the client does,
+/// and refuses a certificate in another encoding.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+#[test]
+fn a_signed_decode_refuses_a_certificate_in_another_encoding_than_its_der() -> TestResult {
+	let named = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+	let received = carrying_encoding(&with_explicit_default(&named));
+
+	let refused = Signed::<SignedData>::from_der(&received).map_err(|error| error.kind());
+	assert_eq!(refused, Err(ErrorKind::Noncanonical { tag: Tag::Sequence }));
+	Ok(())
+}
+
+/// The `Signed` decode reads the `certificates` field as it arrived, so it
+/// refuses a second field that the typed decode skipped, as the client does.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+#[test]
+fn a_signed_decode_refuses_two_certificates_fields() -> TestResult {
+	let named = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+	let stranger_key = Secp256k1SigningKey::from_bytes(&[2; 32].into())?;
+	let stranger = TestCertificate::self_signed(&stranger_key);
+	let received = twice_certified(stranger, named);
+
+	let refused = Signed::<SignedData>::from_der(&received).map_err(|error| error.kind());
+	let second_field = ErrorKind::TagUnexpected { expected: None, actual: CERTIFICATES_TAG };
+	assert_eq!(refused, Err(second_field));
+	Ok(())
+}
+
 /// The cap counts each choice of the set as it arrived, before any
 /// certificate parses, so a choice of another format counts toward it.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -1176,8 +1326,8 @@ fn the_walk_takes_each_issuer_by_name_the_top_first() -> TestResult {
 	Ok(())
 }
 
-/// Two certificates of the subject of one issuer leave the walk no one
-/// issuer, so it refuses the set.
+/// Two certificates whose subject is the name of one issuer leave the walk
+/// no single issuer, so the walk refuses the set.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 #[test]
 fn the_walk_refuses_two_issuers_of_one_subject() -> TestResult {
@@ -1312,6 +1462,119 @@ fn an_unsigned_attribute_joins_the_one_signer() -> TestResult {
 	let carried = signer.unsigned_attrs.as_ref().map(|attrs| attrs.as_slice().to_vec());
 	assert_eq!(carried, Some(vec![attribute]));
 	verify(signer)?;
+	Ok(())
+}
+
+/// The scalar of the key, 32 octets of it, whose countersignature `der`
+/// sorts ahead of the signer of [`signed`], against the octet order of DER.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+const DIVERGENT_SCALAR: u8 = 5;
+
+/// The countersignature over [`CONTENT`] of the key whose scalar is 32
+/// octets of `scalar`, beside its self-signed certificate.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+fn certified_stranger(scalar: u8) -> CertifiedSigner {
+	let key = Secp256k1SigningKey::from_bytes(&[scalar; 32].into()).expect("a small scalar is a key");
+	let certificate = Arc::new(TestCertificate::self_signed(&key));
+	let signer = signed_by(&TestIdentity::certified(key), SignedContent::data(CONTENT));
+	CertifiedSigner::new(signer, certificate).expect("the sid names the certificate of its key")
+}
+
+/// The `SignedData` of [`signed`] that the key of [`DIVERGENT_SCALAR`]
+/// countersigned, whose signers `der` holds in another order than DER's.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+fn countersigned() -> Signed<SignedData> {
+	let first = CmsSigner::signed_data(SignedContent::data(CONTENT), signed(), None).expect("the test key signs");
+	let both = first.with_certified_signer(certified_stranger(DIVERGENT_SCALAR));
+	both.expect("a second signer joins")
+}
+
+/// A countersigned `SignedData` whose signers `der` holds in another order
+/// than DER's encodes them in DER's order (X.690 § 11.6), so the admission
+/// of its own encoding passes.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+#[test]
+fn a_countersigned_signed_data_encodes_its_signers_in_der_order() -> TestResult {
+	let both = countersigned();
+	let in_der_sort = both.as_ref().to_der()?;
+	let encoded = both.to_der()?;
+
+	let admission = DerAdmission::SetOrder;
+	let refused = admission.admit(in_der_sort).map_err(|error| error.kind());
+	assert_eq!(refused, Err(ErrorKind::SetOrdering));
+	admission.admit(encoded)?;
+	Ok(())
+}
+
+/// `der` orders each universal SET of a `SignerInfo` by its octets: the RDN
+/// of an `IssuerAndSerialNumber` `sid`, the signed attributes, and their
+/// values. A `SignerInfo` that holds two-valued sets of each kind, of unequal
+/// lengths, encodes in DER order with no arrangement, which the in-place
+/// encode of a `Signed` `SignerInfo` rests on.
+#[test]
+fn a_signer_info_of_two_valued_sets_encodes_in_der_order() -> TestResult {
+	let mut signer_info = signed().into_inner();
+	let issuer = RdnSequence::from_str("CN=a common name of some length+O=b")?;
+	let serial_number = SerialNumber::new(&[0x01])?;
+	signer_info.sid = SignerIdentifier::IssuerAndSerialNumber(IssuerAndSerialNumber { issuer, serial_number });
+	let long = Any::encode_from(&OctetString::new(*b"a value of some length")?)?;
+	let short = Any::encode_from(&OctetString::new(*b"b")?)?;
+	let values = SetOfVec::try_from([long, short])?;
+	let attribute = Attribute { oid: ObjectIdentifier::new_unwrap("1.2.3.4"), values };
+	let signed_attrs = signer_info.signed_attrs.get_or_insert_with(SignedAttributes::new);
+	signed_attrs.insert(attribute)?;
+
+	DerAdmission::SetOrder.admit(signer_info.to_der()?)?;
+	Ok(())
+}
+
+/// Two self-signed certificates under fixed keys, of one length, that a SET
+/// OF `der` sorts in the reverse of their DER order. `der` 0.7 compares two
+/// certificate choices of one length by their encodings read as a SEQUENCE
+/// OF INTEGER, which counts the octets past `0x7f` first.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+fn certificates_der_sorts_out_of_order() -> [Certificate; 2] {
+	let first = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+	let second_of = |octet: u8| {
+		let key = Secp256k1SigningKey::from_bytes(&[octet; 32].into()).expect("a fixed octet is a test key");
+		TestCertificate::self_signed(&key)
+	};
+	let out_of_order = |second: &Certificate| {
+		let set = TestCertificate::set_of([first.to_owned(), second.to_owned()]);
+		let encodings: Vec<Vec<u8>> = set.0.iter().map(|choice| choice.to_der().expect("a choice encodes")).collect();
+		encodings.windows(2).any(|pair| pair.first() > pair.get(1))
+	};
+
+	let second = (2..=u8::MAX).map(second_of).find(out_of_order);
+	let second = second.expect("one fixed key gives a pair that `der` sorts out of DER order");
+	[first, second]
+}
+
+/// A `SignedData` sends its `certificates` in DER order (X.690 § 11.6), as
+/// the client Finished, the reply, and a receipt do through their `Signed`
+/// encode, though `der` sorts the set in another order.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+#[test]
+fn a_signed_data_sends_its_certificates_in_der_order() -> TestResult {
+	let set = TestCertificate::set_of(certificates_der_sorts_out_of_order());
+	let signed = CmsSigner::signed_data(SignedContent::data(CONTENT), signed(), Some(set))?;
+	let sent = signed.to_der()?;
+
+	let arrived = ArrivedCertificates::read(&sent)?.ok_or("the SignedData carries its certificates")?;
+	let choices = AnyRef::from_der(arrived.field())?;
+	DerAdmission::SetOrder.admit(tlv(Tag::Set, choices.value()))?;
+	Ok(())
+}
+
+/// The DER encoder of the crate gives the signers of a countersigned
+/// `SignedData` their DER order, even outside its `Signed` wrapper.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+#[test]
+fn the_der_encoder_gives_the_signers_their_der_order() -> TestResult {
+	let both = countersigned();
+
+	let encoded = crate::encode(both.as_ref())?;
+	DerAdmission::SetOrder.admit(encoded)?;
 	Ok(())
 }
 

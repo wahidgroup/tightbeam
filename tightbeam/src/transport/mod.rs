@@ -136,6 +136,15 @@ impl TransportLimits {
 			self.cleartext_envelope
 		}
 	}
+
+	/// The ceiling in bytes of a wire envelope of `mode`. A write and a read
+	/// both take their ceiling from here.
+	pub(crate) const fn envelope_ceiling(&self, mode: WireMode) -> usize {
+		match mode {
+			WireMode::Cleartext => self.cleartext_envelope,
+			WireMode::Encrypted => self.encrypted_envelope,
+		}
+	}
 }
 
 impl Default for TransportLimits {
@@ -180,7 +189,7 @@ impl<P: CryptoProvider> TryFrom<TransportEncryptionConfig<P>> for DialableEncryp
 	///
 	/// # Errors
 	///
-	/// - The [`DialableEncryption::new`] set.
+	/// - The errors of [`DialableEncryption::new`].
 	fn try_from(config: TransportEncryptionConfig<P>) -> TransportResult<Self> {
 		let encryption = EncryptionConfig {
 			server_identity: Some(config.identity),
@@ -297,7 +306,7 @@ impl<P: CryptoProvider> TryFrom<TransportEncryptionConfig<P>> for EndpointConfig
 
 	/// # Errors
 	///
-	/// - The [`DialableEncryption`] conversion set.
+	/// - The errors of the [`DialableEncryption`] conversion.
 	fn try_from(config: TransportEncryptionConfig<P>) -> TransportResult<Self> {
 		let limits = config.limits;
 		let encryption = DialableEncryption::try_from(config)?;

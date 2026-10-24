@@ -58,7 +58,7 @@ impl MuxLink {
 	/// The drain channel has a zero-length buffer, so its capacity is one slot
 	/// per live sender.
 	///
-	/// - Outstanding notes are bounded by live bodies, and a reader that stops
+	/// - Live bodies bound the outstanding notes, so a reader that stops
 	///   draining cannot be made to hold more (CWE-770).
 	/// - A body whose slot is taken reports its current count once the slot
 	///   frees ([`StreamBody`](super::body::StreamBody)).
@@ -167,7 +167,7 @@ impl MuxLink {
 	///
 	/// - Full chunks travel as `Data(last = false)`, and the final chunk
 	///   travels inline in the `End` trailer (responder grammar).
-	/// - Every payload-bearing record is gated by the peer's stream credit.
+	/// - The peer's stream credit gates every payload-bearing record.
 	/// - A response the session budget cannot carry degrades to a payload-free `ResourceExhausted` refusal.
 	///
 	/// # Errors
@@ -184,9 +184,7 @@ impl MuxLink {
 		let credits = self.shared.credits_for(payload.len());
 		match self.shared.admit_debit(credits, true).await {
 			Ok(BudgetStanding::Healthy) => {}
-			Ok(BudgetStanding::Exhausting) => {
-				self.announce_goaway(GoAwayReason::BudgetExhausted).await?;
-			}
+			Ok(BudgetStanding::Exhausting) => self.drain_budget(credits).await?,
 			// Even the drain reserve cannot carry the payload, so refuse the
 			// stream for free instead of tearing the connection down.
 			Err(_) => {
@@ -206,7 +204,7 @@ impl MuxLink {
 
 		let mut sent: u64 = 0;
 		for chunk in payload.chunks(chunk_size.get()) {
-			sent += 1;
+			sent = sent.saturating_add(1);
 
 			let envelope = if sent == total {
 				TransportEnvelope::from(MuxEndPackage::new(stream_id, status, chunk)?)
@@ -325,11 +323,14 @@ impl MuxLink {
 	/// Queue a GoAway with `reason` and halt the allocator, exactly once per
 	/// connection.
 	///
-	/// Graceful shutdown and the budget drain share this path.
+	/// Graceful shutdown and the budget drain share this path. The GoAway is
+	/// recorded once it is queued, so a fault the trace injects at the record
+	/// leaves the GoAway on its way.
 	///
 	/// # Errors
 	///
 	/// - [`TransportError::ConnectionClosed`] -- the writer queue closed.
+	/// - The injected error, when the runtime fault model injects a fault at the event of the GoAway.
 	pub(crate) async fn announce_goaway(&self, reason: GoAwayReason) -> TransportResult<()> {
 		let Some(package) = self.shared.goaway_package(reason) else {
 			return Ok(());
@@ -340,18 +341,45 @@ impl MuxLink {
 			.await
 			.map_err(|_| TransportError::ConnectionClosed)?;
 
+		#[cfg(feature = "instrument")]
+		self.shared.emit_goaway_event(events::MUX_GOAWAY_SENT, reason)?;
+
 		Ok(())
 	}
 
-	/// Queue a best-effort GoAway on a fault path. A full queue drops it.
-	pub(crate) fn goaway_best_effort(&self, last_stream_id: u32, reason: GoAwayReason) {
-		#[cfg(feature = "instrument")]
-		self.shared.emit_goaway_event(events::MUX_GOAWAY_SENT, reason);
+	/// Announce the drain that a debit of `credits` from the reserve reached.
+	///
+	/// The debit stands once the drain recorded its GoAway. A drain that fails
+	/// returns the credits to the budget, because the payload they meter does
+	/// not leave.
+	///
+	/// # Errors
+	///
+	/// - The errors of [`announce_goaway`](Self::announce_goaway).
+	pub(crate) async fn drain_budget(&self, credits: u64) -> TransportResult<()> {
+		let drained = self.announce_goaway(GoAwayReason::BudgetExhausted).await;
+		if drained.is_err() {
+			self.shared.refund_budget(credits);
+		}
 
+		drained
+	}
+
+	/// Queue a best-effort GoAway on a fault path. A full queue drops it.
+	///
+	/// # Errors
+	///
+	/// - The injected error, when the runtime fault model injects a fault at the event of the GoAway.
+	pub(crate) fn goaway_best_effort(&self, last_stream_id: u32, reason: GoAwayReason) -> TransportResult<()> {
 		let package = GoAwayPackage::new(last_stream_id, reason);
 		// A full or closed queue drops the GoAway, which is the best effort
 		// a fault path promises.
 		let _ = self.sender().try_send(Outbound::Envelope(package.into()));
+
+		#[cfg(feature = "instrument")]
+		self.shared.emit_goaway_event(events::MUX_GOAWAY_SENT, reason)?;
+
+		Ok(())
 	}
 
 	/// Renew in band when a budget reaches the drain reserve, or drain with a
@@ -370,5 +398,72 @@ impl MuxLink {
 		}
 
 		self.announce_goaway(GoAwayReason::BudgetExhausted).await
+	}
+}
+
+#[cfg(all(test, feature = "testing-fault", feature = "instrument"))]
+mod tests {
+	use core::task::Poll;
+
+	use super::super::testing::poll_now;
+	use super::*;
+	use crate::testing::{FaultModel, TestFrame};
+	use crate::trace::TraceCollector;
+	use crate::transport::envelopes::MuxEnvelope;
+	use crate::transport::handshake::negotiation::MuxSettings;
+	use crate::transport::multiplex::MuxRole;
+
+	/// A server link under `settings` whose trace injects
+	/// [`TransportError::InvalidAddress`] at every record of `MUX_GOAWAY_SENT`,
+	/// beside the receiver of its outbound queue.
+	fn goaway_faulting_link(settings: &MuxSettings) -> (MuxLink, mpsc::Receiver<Outbound>) {
+		let injected = || TransportError::InvalidAddress;
+		let model = FaultModel::default().with_event_fault(events::MUX_GOAWAY_SENT, injected, crate::bps!(10000));
+		let mut shared = MuxShared::new(MuxRole::Server, settings);
+		shared.trace = Some(TraceCollector::new().with_fault_model(model));
+
+		let (outbound, wire) = mpsc::channel(4);
+		let (link, _drained) = MuxLink::new(Arc::new(shared), outbound);
+		(link, wire)
+	}
+
+	/// Settings whose budget holds `credits`, above a drain reserve of five
+	/// records at one credit each.
+	fn budget_settings(credits: u64) -> MuxSettings {
+		let mut settings = MuxSettings::symmetric(1);
+		settings.send_chunk_size = 1024;
+		settings.credit_unit = 1024;
+		settings.send_budget = Some(credits);
+		settings
+	}
+
+	/// Whether `command` carries a GoAway.
+	fn is_goaway(command: &Outbound) -> bool {
+		matches!(command, Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::GoAway(_))))
+	}
+
+	/// The GoAway is recorded once it is queued, so a fault the trace injects
+	/// at the record leaves the GoAway on its way to the peer
+	/// (RFC 9113 § 6.8).
+	#[test]
+	fn a_fault_at_the_goaway_record_leaves_the_goaway_queued() {
+		let (link, mut wire) = goaway_faulting_link(&MuxSettings::symmetric(4));
+
+		let announced = poll_now(link.announce_goaway(GoAwayReason::Shutdown));
+		assert!(matches!(announced, Poll::Ready(Err(TransportError::InvalidAddress))));
+		assert!(wire.try_recv().is_ok_and(|command| is_goaway(&command)));
+	}
+
+	/// A response whose debit reaches the drain reserve, and whose drain
+	/// fails at its record, returns its credits, because the response does
+	/// not leave.
+	#[test]
+	fn a_failed_drain_returns_its_debit() {
+		let (link, _wire) = goaway_faulting_link(&budget_settings(6));
+		let response = ResponsePackage::new(TransitStatus::Ok, Some(TestFrame::v0(None, None)));
+
+		let sent = poll_now(link.send_response(1, response));
+		assert!(matches!(sent, Poll::Ready(Err(TransportError::InvalidAddress))));
+		assert_eq!(link.shared().send_budget(), Some(6));
 	}
 }

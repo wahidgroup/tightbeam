@@ -18,7 +18,7 @@ use crate::der::{Decode, Encode};
 use crate::encode;
 use crate::policy::TransitStatus;
 use crate::transport::builders::EnvelopeBuilder;
-use crate::transport::envelopes::{Arrived, TransportEnvelope, WireEnvelope};
+use crate::transport::envelopes::{TransportEnvelope, WireEnvelope};
 use crate::transport::error::TransportError;
 use crate::transport::state::EncryptedProtocolState;
 use crate::transport::TransportResult;
@@ -28,7 +28,7 @@ use crate::zeroize::Zeroizing;
 
 #[cfg(host_clock)]
 use crate::utils::time::SystemClock;
-// Named only by `emit_handshake_outcome`, so this carries that method's gate.
+// Only `emit_handshake_outcome` names this import, so it takes its gate.
 #[cfg(all(
 	feature = "instrument",
 	any(feature = "transport-cms", feature = "transport-hpke")
@@ -36,6 +36,9 @@ use crate::utils::time::SystemClock;
 use crate::instrumentation::events;
 #[cfg(feature = "instrument")]
 use crate::trace::TraceCollector;
+// Only doc links name this import, so the docs build alone carries it.
+#[cfg(doc)]
+use crate::transport::error::TransportFailure;
 
 #[cfg(all(
 	feature = "tokio",
@@ -60,7 +63,6 @@ use crate::transport::state::ServerHandshakeSlot;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 mod handshake {
-	pub use crate::transport::error::TransportFailure;
 	pub use crate::transport::handshake::{
 		BoxedClientHandshake, ClientHandshakeProtocol, HandshakeMessage, HandshakeProvider, ServerHandshakeProtocol,
 	};
@@ -75,7 +77,8 @@ use handshake::*;
 /// The trait decouples the
 /// [`MuxTransport`](crate::transport::multiplex::MuxTransport) router from the
 /// link's protection policy. An encrypting implementation decrypts and
-/// enforces AEAD sequencing, while a cleartext one enforces neither.
+/// enforces AEAD sequencing, while a cleartext one reads envelopes as they
+/// arrive.
 pub trait EnvelopeSource: MaybeSend {
 	/// Read the next envelope from the link.
 	///
@@ -90,7 +93,7 @@ pub trait EnvelopeSource: MaybeSend {
 	///
 	/// The count tracks the peer's send counter on the ordered channel, so a
 	/// rekey initiator watches the receive direction with no extra protocol
-	/// field. A link without keys never rekeys and reports `u64::MAX`.
+	/// field. A link without keys reports the default, `u64::MAX`.
 	fn remaining_records(&self) -> u64 {
 		u64::MAX
 	}
@@ -131,7 +134,7 @@ pub trait EnvelopeSink: MaybeSend {
 	/// Returns the number of envelopes still writable before the link demands a
 	/// rekey.
 	///
-	/// A link without keys never rekeys and reports `u64::MAX`.
+	/// A link without keys reports `u64::MAX`.
 	fn remaining_records(&self) -> u64;
 
 	/// Install a fresh send-direction cipher at an epoch key-switch boundary
@@ -221,8 +224,8 @@ pub trait MessageIO {
 	///
 	/// # Errors
 	///
-	/// - The [`read_envelope_bytes`](Self::read_envelope_bytes) and
-	///   [`decode_envelope`](Self::decode_envelope) sets.
+	/// - The errors of [`read_envelope_bytes`](Self::read_envelope_bytes) and
+	///   [`decode_envelope`](Self::decode_envelope).
 	fn read_decoded_envelope(&mut self) -> impl Future<Output = TransportResult<TransportEnvelope>> + MaybeSend
 	where
 		Self: MaybeSend,
@@ -251,8 +254,8 @@ pub trait MessageIO {
 	///
 	/// # Errors
 	///
-	/// - The [`read_decoded_envelope`](Self::read_decoded_envelope) set, apart
-	///   from the close that maps to `Ok(None)`.
+	/// - The errors of [`read_decoded_envelope`](Self::read_decoded_envelope),
+	///   apart from the close that maps to `Ok(None)`.
 	fn try_read_decoded_envelope(
 		&mut self,
 	) -> impl Future<Output = TransportResult<Option<TransportEnvelope>>> + MaybeSend
@@ -292,12 +295,14 @@ pub trait EncryptedMessageIO: MessageIO {
 	///
 	/// - [`TransportError::OperationFailed`] with
 	///   [`TransportFailure::SizeExceeded`] -- the wire envelope passes the
-	///   ceiling of its kind.
+	///   ceiling of its mode.
 	/// - [`TransportError::MissingEncryption`] -- cleartext traffic arrived
 	///   where encryption is required, and the session was reset.
 	/// - [`TransportError::OperationFailed`] with
-	///   [`TransportFailure::EncryptionFailed`] -- an encrypted envelope came
-	///   before encryption or did not decrypt, and the session was reset.
+	///   [`TransportFailure::EncryptionFailed`] -- a record came before the
+	///   session was established, and the session was reset.
+	/// - The open failure of a record that did not open, such as
+	///   [`TransportFailure::TamperDetected`], after the session was reset.
 	/// - The read and decode failures.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[allow(async_fn_in_trait)]
@@ -306,65 +311,14 @@ pub trait EncryptedMessageIO: MessageIO {
 		Self: EncryptedProtocolState + Sized,
 	{
 		// A record opens in the buffer it arrived in, so the buffer wipes when
-		// it drops.
+		// it drops. The session admits the arrival by its outer tag before any
+		// decode.
 		let mut wire_bytes = Zeroizing::new(self.read_envelope_bytes().await?);
-		let wire_len = wire_bytes.len();
-		let wire_envelope = WireEnvelope::arrive(&mut wire_bytes)?;
-		let ceiling = match &wire_envelope {
-			Arrived::Cleartext(_) => self.limits().cleartext_envelope,
-			Arrived::Encrypted(_) => self.limits().encrypted_envelope,
-		};
-		if wire_len > ceiling {
-			return Err(TransportError::OperationFailed(TransportFailure::SizeExceeded));
-		}
+		let limits = *self.limits();
+		let contents = self.session_state_mut().admit_arrival(&mut wire_bytes, &limits)?;
+		let envelope = Self::decode_envelope(contents)?;
 
-		// An established session admits only encrypted traffic. Before that, a
-		// provisioned endpoint admits only the handshake containers, and an
-		// unprovisioned one admits traffic.
-		let established = self.session_state().phase().requires_encryption();
-		let expects_encryption = self.session_state().phase().is_handshake_pending();
-		match wire_envelope {
-			Arrived::Cleartext(envelope) => {
-				if established {
-					// Circuit breaker: a cleartext frame on an agreed session
-					// is not the peer this session established (CWE-319).
-					self.session_state_mut().reset();
-					return Err(TransportError::MissingEncryption);
-				}
-
-				if expects_encryption {
-					// Circuit breaker: once encryption is configured, only a
-					// handshake container arrives in cleartext, and any other
-					// envelope is application traffic that arrived unsealed.
-					// The refusal names that cause, `MissingEncryption`, and
-					// not the `InvalidMessage` of the conversion.
-					let Ok(message) = HandshakeMessage::try_from(envelope) else {
-						self.session_state_mut().reset();
-						return Err(TransportError::MissingEncryption);
-					};
-					Ok(CollectStep::Handshake(message))
-				} else {
-					Ok(CollectStep::Envelope(envelope))
-				}
-			}
-			Arrived::Encrypted(record) => {
-				if !matches!(self.session_state().phase(), SessionPhase::Encrypted(_)) {
-					self.session_state_mut().reset();
-					return Err(TransportError::OperationFailed(TransportFailure::EncryptionFailed));
-				}
-
-				let opened = match self.session_state().decryptor()?.open(record) {
-					Ok(content) => content,
-					Err(_) => {
-						self.session_state_mut().reset();
-						return Err(TransportError::OperationFailed(TransportFailure::EncryptionFailed));
-					}
-				};
-
-				let envelope = Self::decode_envelope(opened)?;
-				Ok(CollectStep::Envelope(envelope))
-			}
-		}
+		self.session_state_mut().collect(envelope)
 	}
 
 	/// Wrap a message in a request [`TransportEnvelope`].
@@ -409,7 +363,8 @@ pub trait EncryptedMessageIO: MessageIO {
 	///
 	/// - [`TransportError::MessageNotSent`] -- the envelope did not encode,
 	///   encrypt, or fit its ceiling, and the frame travels with the error.
-	/// - The [`EncryptedProtocolState::apply_wire_mode`] set, while the handshake has not yet installed keys.
+	/// - The errors of [`EncryptedProtocolState::apply_wire_mode`], while the
+	///   handshake has not yet installed keys.
 	///
 	/// [`TransportLimits`]: crate::transport::TransportLimits
 	#[allow(async_fn_in_trait)]
@@ -424,14 +379,21 @@ pub trait EncryptedMessageIO: MessageIO {
 
 	/// Decrypt a response from its encoded bytes.
 	///
-	/// The default is protocol-agnostic.
+	/// The default is protocol-agnostic. The answer reads under the phase rule
+	/// of the inbound collector, so the session admits it by its outer tag
+	/// before any decode.
 	///
 	/// # Errors
 	///
+	/// - [`TransportError::OperationFailed`] with `SizeExceeded` -- the answer
+	///   passes the ceiling of its mode.
 	/// - [`TransportError::MissingEncryption`] -- a cleartext answer arrived
 	///   on an established session, and the session was reset.
+	/// - [`TransportError::OperationFailed`] with `EncryptionFailed` -- an
+	///   encrypted answer arrived before the session was established, and the
+	///   session was reset.
 	/// - [`TransportError::DerError`] -- the bytes are not a wire envelope.
-	/// - The decrypt failure of an encrypted answer.
+	/// - The open failure of an encrypted answer, after the session was reset.
 	#[allow(async_fn_in_trait)]
 	async fn decrypt_response(&mut self, wire_bytes: impl Into<Vec<u8>>) -> TransportResult<TransportEnvelope>
 	where
@@ -440,70 +402,81 @@ pub trait EncryptedMessageIO: MessageIO {
 		// A record opens in the buffer it arrived in, so the buffer wipes when
 		// it drops.
 		let mut wire_bytes = Zeroizing::new(wire_bytes.into());
-		let wire_envelope = WireEnvelope::arrive(&mut wire_bytes)?;
-		match wire_envelope {
-			Arrived::Cleartext(env) => {
-				// The phase decides the wire mode for both directions, so an
-				// established session refuses an unauthenticated cleartext
-				// answer (CWE-319) and resets, as the inbound collector does.
-				if self.session_state().phase().requires_encryption() {
-					self.session_state_mut().reset();
-					return Err(TransportError::MissingEncryption);
-				}
+		let limits = *self.limits();
+		let contents = self.session_state_mut().admit_arrival(&mut wire_bytes, &limits)?;
 
-				Ok(env)
-			}
-			Arrived::Encrypted(record) => {
-				let opened = self.session_state().decryptor()?.open(record)?;
-				Self::decode_envelope(opened)
-			}
-		}
+		Self::decode_envelope(contents)
 	}
 
-	/// Dual-write the handshake outcome at the transport driver interface.
+	/// Dual-write the outcome of a handshake at the transport driver
+	/// interface, and return the outcome.
 	///
 	/// - A completed handshake records the completion, and the settlement when the session holds a receipt.
 	/// - A refused handshake records the audit event its error names: a receipt
 	///   approval or settlement refusal, or a rejected certificate or proof.
+	///
+	/// # Errors
+	///
+	/// - The error of a refused handshake. It comes first, so a fault the
+	///   trace injects at its record leaves it in place.
+	/// - The injected error, when the runtime fault model injects a fault at
+	///   an event of a completed handshake.
+	///
+	/// # Examples
+	///
+	/// ```no_run
+	/// use tightbeam::transport::tcp::r#async::{TcpTransport, TokioStream};
+	/// use tightbeam::transport::{EncryptedMessageIO, TransportResult};
+	///
+	/// /// Record the outcome of the handshake that `transport` ran, and hand
+	/// /// it on.
+	/// fn settle(transport: &TcpTransport<TokioStream>, outcome: TransportResult<()>) -> TransportResult<()> {
+	///     transport.emit_handshake_outcome(outcome)
+	/// }
+	/// ```
 	#[cfg(all(
 		feature = "instrument",
 		any(feature = "transport-cms", feature = "transport-hpke")
 	))]
-	fn emit_handshake_outcome(&self, outcome: &TransportResult<()>)
+	fn emit_handshake_outcome(&self, outcome: TransportResult<()>) -> TransportResult<()>
 	where
 		Self: EncryptedProtocolState,
 	{
 		let Some(trace) = self.to_trace_ref() else {
-			return;
+			return outcome;
 		};
 
-		match outcome {
-			// A multi-round server handshake reports `Ok` per round, so only
-			// the encrypted phase marks the session as established.
-			Ok(()) => {
-				if !matches!(self.session_state().phase(), SessionPhase::Encrypted(_)) {
-					return;
-				}
+		if let Err(refusal) = &outcome {
+			let audit_event = match refusal {
+				TransportError::HandshakeError(error) => error.audit_event(),
+				_ => None,
+			};
+			let recorded = audit_event.map_or(Ok(()), |event| trace.emit_event(event));
 
-				trace.emit_event(events::SESSION_HANDSHAKE_COMPLETE);
-				if self.session_state().receipt().is_some() {
-					trace.emit_event(events::SESSION_RECEIPT_SETTLED);
-				}
-			}
-			Err(TransportError::HandshakeError(error)) => {
-				if let Some(event) = error.audit_event() {
-					trace.emit_event(event);
-				}
-			}
-			Err(_) => {}
+			// The error of the handshake names why the session failed, so it
+			// comes ahead of a fault at its record.
+			return outcome.and(recorded.map_err(TransportError::from));
 		}
+
+		// A multi-round server handshake reports `Ok` per round, so only the
+		// encrypted phase marks the session as established.
+		if !matches!(self.session_state().phase(), SessionPhase::Encrypted(_)) {
+			return outcome;
+		}
+
+		trace.emit_event(events::SESSION_HANDSHAKE_COMPLETE)?;
+		if self.session_state().receipt().is_some() {
+			trace.emit_event(events::SESSION_RECEIPT_SETTLED)?;
+		}
+
+		outcome
 	}
 
 	/// Run the client handshake when the session is still provisioned.
 	///
 	/// # Errors
 	///
-	/// - The [`perform_client_handshake`](Self::perform_client_handshake) set.
+	/// - The errors of [`perform_client_handshake`](Self::perform_client_handshake).
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[allow(async_fn_in_trait)]
 	async fn ensure_handshake_complete<P>(&mut self) -> TransportResult<()>
@@ -527,8 +500,10 @@ pub trait EncryptedMessageIO: MessageIO {
 	///
 	/// # Errors
 	///
-	/// - [`TransportError::InvalidMessage`] -- a handshake message passes the
-	///   wire ceiling, or the server response arrived encrypted.
+	/// - [`TransportError::InvalidMessage`] -- a handshake message passes the wire ceiling.
+	/// - [`TransportError::OperationFailed`] with
+	///   [`TransportFailure::EncryptionFailed`] -- the server response arrived
+	///   encrypted, and the session was reset.
 	/// - [`TransportError::InvalidState`] -- the session refused the move to the handshaking phase.
 	/// - The orchestrator, read, write, and install failures.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -553,16 +528,12 @@ pub trait EncryptedMessageIO: MessageIO {
 		}
 
 		// Step 2: Receive the server response. The read runs under the
-		// handshake ceiling, because the phase is handshaking.
+		// handshake ceiling, because the phase is handshaking, and the phase
+		// admits the response in cleartext alone.
 		let mut response_wire_bytes = self.read_session_bytes().await?;
-		let response_wire = WireEnvelope::arrive(&mut response_wire_bytes)?;
-		let response_envelope = match response_wire {
-			Arrived::Cleartext(env) => env,
-			Arrived::Encrypted(_) => {
-				// A handshake message must travel in cleartext.
-				return Err(TransportError::InvalidMessage);
-			}
-		};
+		let limits = *self.limits();
+		let response_contents = self.session_state_mut().admit_arrival(&mut response_wire_bytes, &limits)?;
+		let response_envelope = Self::decode_envelope(response_contents)?;
 
 		// Step 3: Handle the server response, which may yield the next message.
 		let response = HandshakeMessage::try_from(response_envelope)?;
@@ -591,8 +562,10 @@ pub trait EncryptedMessageIO: MessageIO {
 	/// # Errors
 	///
 	/// - [`TransportError::UnsupportedHandshakeProtocol`] -- this build lacks the configured protocol.
-	/// - The orchestrator build failure, and the
-	///   [`drive_client_handshake`](Self::drive_client_handshake) set.
+	/// - The orchestrator build failure, and the errors of
+	///   [`drive_client_handshake`](Self::drive_client_handshake).
+	/// - The injected error, when the runtime fault model injects a fault at
+	///   an event of a completed handshake.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[allow(async_fn_in_trait)]
 	async fn perform_client_handshake<P>(&mut self) -> TransportResult<()>
@@ -605,7 +578,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		let outcome = self.drive_client_handshake(orchestrator).await;
 
 		#[cfg(feature = "instrument")]
-		self.emit_handshake_outcome(&outcome);
+		let outcome = self.emit_handshake_outcome(outcome);
 
 		outcome
 	}
@@ -670,8 +643,10 @@ pub trait EncryptedMessageIO: MessageIO {
 	/// - [`TransportError::UnsupportedHandshakeProtocol`] -- this build lacks the configured protocol.
 	/// - [`TransportError::OperationFailed`] with
 	///   [`TransportFailure::DeadlineExceeded`] -- the handshake timed out.
-	/// - The orchestrator build failure, and the
-	///   [`drive_server_handshake`](Self::drive_server_handshake) set.
+	/// - The orchestrator build failure, and the errors of
+	///   [`drive_server_handshake`](Self::drive_server_handshake).
+	/// - The injected error, when the runtime fault model injects a fault at
+	///   an event of a completed handshake.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[allow(async_fn_in_trait)]
 	async fn perform_server_handshake<P>(&mut self, request: HandshakeMessage) -> TransportResult<()>
@@ -704,7 +679,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		let outcome = self.drive_server_handshake(request).await;
 
 		#[cfg(feature = "instrument")]
-		self.emit_handshake_outcome(&outcome);
+		let outcome = self.emit_handshake_outcome(outcome);
 
 		outcome
 	}
@@ -718,9 +693,10 @@ pub trait EncryptedMessageIO: MessageIO {
 	/// # Errors
 	///
 	/// - [`TransportError::InvalidMessage`] -- the reply is not a response envelope.
-	/// - The [`wrap_and_encrypt_message`](Self::wrap_and_encrypt_message),
+	/// - The errors of
+	///   [`wrap_and_encrypt_message`](Self::wrap_and_encrypt_message),
 	///   [`read_session_bytes`](Self::read_session_bytes), and
-	///   [`decrypt_response`](Self::decrypt_response) sets.
+	///   [`decrypt_response`](Self::decrypt_response).
 	#[allow(async_fn_in_trait)]
 	async fn perform_emit_cycle(
 		&mut self,
@@ -794,8 +770,22 @@ mod tests {
 
 	use crate::crypto::aead::SessionKeys;
 	use crate::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
+	use crate::transport::error::TransportFailure;
 	use crate::transport::handshake::PeerAuthentication;
 	use crate::transport::TransportLimits;
+
+	#[cfg(all(
+		feature = "instrument",
+		feature = "testing-fault",
+		any(feature = "transport-cms", feature = "transport-hpke")
+	))]
+	use crate::testing::FaultModel;
+	#[cfg(all(
+		feature = "instrument",
+		feature = "testing-fault",
+		any(feature = "transport-cms", feature = "transport-hpke")
+	))]
+	use crate::transport::handshake::HandshakeError;
 
 	/// A minimal `MessageIO` probe, so ingress goes through `decode_envelope`.
 	#[derive(Default)]
@@ -824,6 +814,8 @@ mod tests {
 		limits: TransportLimits,
 		clock: ManualClock,
 		inbound: Option<Vec<u8>>,
+		#[cfg(feature = "instrument")]
+		trace: Option<TraceCollector>,
 	}
 
 	impl StreamProbe {
@@ -839,6 +831,8 @@ mod tests {
 				limits: TransportLimits::default(),
 				clock: ManualClock::default(),
 				inbound: None,
+				#[cfg(feature = "instrument")]
+				trace: None,
 			}
 		}
 
@@ -849,7 +843,23 @@ mod tests {
 			probe.inbound = Some(envelope.to_der().expect("a wire envelope encodes"));
 			probe
 		}
+
+		/// Returns the endpoint of [`Self::at`], whose stream yields `bytes`
+		/// once before it closes.
+		fn reading_bytes(phase: SessionPhase, bytes: &[u8]) -> Self {
+			let mut probe = Self::at(phase);
+			probe.inbound = Some(bytes.to_vec());
+			probe
+		}
 	}
+
+	/// A wire envelope under the cleartext tag whose contents, a NULL, decode
+	/// to no transport envelope.
+	const UNDECODABLE_CLEARTEXT: [u8; 4] = [0xa0, 0x02, 0x05, 0x00];
+
+	/// A wire envelope under the record tag whose contents, a NULL, open under
+	/// no receive cipher.
+	const UNOPENED_RECORD: [u8; 4] = [0xa1, 0x02, 0x05, 0x00];
 
 	impl MessageIO for StreamProbe {
 		fn clock(&self) -> &dyn Clock {
@@ -882,6 +892,11 @@ mod tests {
 
 		fn session_state_mut(&mut self) -> &mut SessionState<DefaultCryptoProvider> {
 			&mut self.state
+		}
+
+		#[cfg(feature = "instrument")]
+		fn to_trace_ref(&self) -> Option<&TraceCollector> {
+			self.trace.as_ref()
 		}
 	}
 
@@ -931,6 +946,90 @@ mod tests {
 		let refusal = probe.collect_step().await;
 		assert!(matches!(refusal, Err(TransportError::MissingEncryption)));
 		assert!(matches!(probe.session_state().phase(), SessionPhase::Provisioned));
+	}
+
+	/// An established session refuses a cleartext envelope by its outer tag,
+	/// before its contents decode, so contents that decode to nothing trip the
+	/// breaker as any cleartext does.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	#[tokio::test]
+	async fn an_established_session_refuses_cleartext_before_it_decodes() {
+		let mut probe = StreamProbe::reading_bytes(encrypted_phase(), &UNDECODABLE_CLEARTEXT);
+
+		let refusal = probe.collect_step().await;
+		assert!(matches!(refusal, Err(TransportError::MissingEncryption)));
+		assert!(matches!(probe.session_state().phase(), SessionPhase::Provisioned));
+	}
+
+	/// An answer reads under the phase rule of the inbound collector, so an
+	/// established session refuses a cleartext answer before it decodes.
+	#[tokio::test]
+	async fn an_established_session_refuses_a_cleartext_answer_before_it_decodes() {
+		let mut probe = StreamProbe::at(encrypted_phase());
+
+		let refusal = probe.decrypt_response(UNDECODABLE_CLEARTEXT).await;
+		assert!(matches!(refusal, Err(TransportError::MissingEncryption)));
+	}
+
+	/// A record that arrives while a handshake is pending trips the circuit
+	/// breaker, so the session drops the handshake and returns to its
+	/// provisioned start.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	#[tokio::test]
+	async fn a_record_during_the_handshake_trips_the_breaker() {
+		let mut probe = StreamProbe::reading_bytes(handshaking_phase(), &UNOPENED_RECORD);
+		let expected = TransportFailure::EncryptionFailed;
+
+		let refusal = probe.collect_step().await;
+		let refused = matches!(refusal, Err(TransportError::OperationFailed(failure)) if failure == expected);
+		assert!(refused);
+		assert!(matches!(probe.session_state().phase(), SessionPhase::Provisioned));
+	}
+
+	/// An answer that fails to open on an established session trips the
+	/// circuit breaker, as a record on the inbound collector does.
+	#[tokio::test]
+	async fn an_answer_that_fails_to_open_trips_the_breaker() {
+		let mut probe = StreamProbe::at(encrypted_phase());
+
+		let refusal = probe.decrypt_response(UNOPENED_RECORD).await;
+		assert!(refusal.is_err());
+		assert!(matches!(probe.session_state().phase(), SessionPhase::Provisioned));
+	}
+
+	/// An answer passes under the ceiling of its own mode, so a cleartext
+	/// answer past the cleartext ceiling is refused, though it fits the
+	/// encrypted one.
+	#[tokio::test]
+	async fn a_cleartext_answer_past_its_ceiling_is_refused() -> crate::error::Result<()> {
+		let mut probe = StreamProbe::at(SessionPhase::Cleartext);
+		probe.limits.cleartext_envelope = UNDECODABLE_CLEARTEXT.len();
+		let response = TransportEnvelope::Response(ResponsePackage::new(TransitStatus::Ok, None));
+		let answer = WireEnvelope::Cleartext(response).to_der()?;
+
+		let refusal = probe.decrypt_response(answer).await;
+		let oversize = matches!(refusal, Err(TransportError::OperationFailed(TransportFailure::SizeExceeded)));
+		assert!(oversize);
+		Ok(())
+	}
+
+	/// The error of a refused handshake names why the session failed, so a
+	/// fault the trace injects at the record of the refusal leaves it in place.
+	#[cfg(all(
+		feature = "instrument",
+		feature = "testing-fault",
+		any(feature = "transport-cms", feature = "transport-hpke")
+	))]
+	#[test]
+	fn a_fault_at_the_record_of_a_refused_handshake_keeps_its_error() {
+		let injected = || TransportError::InvalidAddress;
+		let model = FaultModel::default().with_event_fault(events::SESSION_CERT_REJECTED, injected, crate::bps!(10000));
+		let mut probe = StreamProbe::at(handshaking_phase());
+		probe.trace = Some(TraceCollector::new().with_fault_model(model));
+
+		let refusal = probe.emit_handshake_outcome(Err(HandshakeError::MutualAuthRequired.into()));
+		let kept = matches!(refusal, Err(TransportError::HandshakeError(HandshakeError::MutualAuthRequired)));
+		assert!(kept);
 	}
 
 	/// Cases of `(label, envelope bytes, whether ingress accepts them)`.

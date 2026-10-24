@@ -87,15 +87,11 @@
 //!
 //! # TightBeam Protocol
 //!
-//! A lightweight, versioned messaging protocol with cryptographic primitives
-//! built on ASN.1 DER encoding.
+//! TightBeam is a lightweight, versioned messaging protocol with cryptographic
+//! primitives, built on ASN.1 DER encoding.
 
 #![deny(unsafe_code)]
-// Zero-panic: raw `unwrap()` is banned everywhere, tests included. Test
-// helpers state their invariant through `expect`, test cases propagate
-// with `?`. The remaining panic paths are banned in production code, while
-// tests are exempt, and the `testing` fixture surface carries its own
-// scoped allowance (see `src/testing/mod.rs`).
+// Zero-panic: the crate denies raw `unwrap()` everywhere, tests included.
 #![deny(clippy::unwrap_used)]
 #![cfg_attr(
 	not(test),
@@ -108,6 +104,9 @@
 	)
 )]
 #![cfg_attr(test, allow(clippy::clone_on_ref_ptr))]
+// The workspace denies an index or an integer operation that can panic. Tests
+// are exempt from both, as they are from `expect`.
+#![cfg_attr(test, allow(clippy::indexing_slicing, clippy::arithmetic_side_effects))]
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![doc = include_str!("features.md")]
@@ -120,13 +119,13 @@ use alloc::vec::Vec;
 
 mod wire;
 
-// Compiles every README example as a doctest, so a renamed item fails the
-// build instead of leaving the README stale.
+// This module compiles every README example as a doctest, so a renamed item
+// fails the build instead of leaving the README stale.
 #[cfg(doctest)]
 #[doc = include_str!("../../README.md")]
 mod readme {}
 
-// Before other modules so `compose!` is in crate-wide textual scope.
+// `compose!` is in textual scope for every module declared after this one.
 #[cfg(feature = "builder")]
 #[macro_use]
 mod compose;
@@ -174,7 +173,6 @@ pub mod transport;
 #[cfg(feature = "zeroize")]
 pub use zeroize;
 
-// Re-export
 pub use asn1::{
 	AlgorithmIdentifier, CompressedData, DigestInfo, EncryptedContentInfo, Frame, MessagePriority, Metadata,
 	ObjectIdentifier, SignerInfo, Version,
@@ -215,8 +213,9 @@ pub use crate::crypto::sign::ecdsa::Secp256k1SigningKey as SigningKey;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
-/// Secure bytes type
+/// A byte vector that zeroizes its contents on drop.
 #[cfg(feature = "zeroize")]
 pub type ZeroizingBytes = zeroize::Zeroizing<Vec<u8>>;
+/// A fixed-size byte array that zeroizes its contents on drop.
 #[cfg(feature = "zeroize")]
 pub type ZeroizingArray<const N: usize> = zeroize::Zeroizing<[u8; N]>;

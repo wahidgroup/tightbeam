@@ -45,8 +45,8 @@ fn gateway_of(name: &str) -> (Certificate, Secp256k1SigningKey) {
 ///
 /// - The transport store holds all three certificates, so each scenario's
 ///   trust layout lives on the peer plane alone.
-/// - Each peer store holds its own gateway's certificate, so a rumor a
-///   neighbor echoes back verifies and is dropped as a duplicate.
+/// - Each peer store holds its own gateway's certificate, so a rumor that a
+///   neighbor echoes back verifies, and the gateway drops it as a duplicate.
 fn three_colonies(
 	identities: [(Certificate, Secp256k1SigningKey); 3],
 	peer_stores: [Arc<dyn CertificateTrust>; 3],
@@ -84,25 +84,6 @@ fn uniform_trust_ctx() -> ThreeColonyCtx {
 	uniform_trust_ctx_around(gateway_of("main"))
 }
 
-/// [`uniform_trust_ctx`] where the gateway of colony "main" holds the shared
-/// gateway identity.
-///
-/// The ingress servlet checks a delivered rumor against that identity's fixed
-/// key, so a rumor "main" signed is told apart from one another gateway
-/// signed.
-fn shared_origin_ctx() -> ThreeColonyCtx {
-	let shared = cluster_certs();
-	uniform_trust_ctx_around((shared.cert, shared.key))
-}
-
-/// The hive-plane identity under a trust store that covers `gateway`, so a
-/// hive that holds it can dial that gateway.
-fn hive_plane_certs_for(gateway: &ClusterTestCerts) -> Arc<ClusterTestCerts> {
-	let hive = hive_plane_certs();
-	let trust = combined_trust(&[&gateway.cert, &hive.cert]);
-	Arc::new(GatewayCerts { cert: hive.cert.to_owned(), key: hive.key.to_owned(), trust })
-}
-
 /// Three colonies where "other" is a bridge: it trusts both neighbors, and
 /// each neighbor trusts it alone.
 fn bridged_trust_ctx() -> ThreeColonyCtx {
@@ -121,8 +102,8 @@ fn bridged_trust_ctx() -> ThreeColonyCtx {
 /// [`federation_conf`], and `journal` as its journal.
 ///
 /// The hive plane admits the hive-plane identity, which signs every publish
-/// here: the gateway's own key is a peer key in these stores, and a peer key
-/// is refused on the hive plane.
+/// here: the gateway's own key is a peer key in these stores, and the hive
+/// plane refuses a peer key.
 fn flood_conf(
 	certs: &ClusterTestCerts,
 	peer_trust: &Arc<dyn CertificateTrust>,
@@ -158,11 +139,11 @@ async fn publish_at(
 	ttl: u64,
 ) -> Result<(), TightBeamError> {
 	let body = rumor_body(encode(&PingRequest { value: 21 })?);
-	let frame = hive_publish_gossip(id, body, ttl).await?;
+	let frame = hive_publish_gossip(certs, id, body, ttl).await?;
 	send_gossip_frame(trace, certs, gateway, frame).await
 }
 
-/// Polls until gateways have promoted `count` peers, or ten seconds pass.
+/// Polls until the gateways promote `count` peers, or ten seconds pass.
 async fn wait_for_discoveries(trace: &TraceCollector, count: usize) -> bool {
 	let discovered = || trace.recorded(events::CLUSTER_PEER_DISCOVERED) >= count;
 	poll_until(100, Duration::from_millis(100), discovered).await
@@ -206,13 +187,13 @@ tb_scenario! {
 	name: cluster_flood_reaches_three_colonies,
 	spec: ClusterFloodThreeColoniesSpec,
 	environment Bare {
-		context: shared_origin_ctx(),
+		context: uniform_trust_ctx(),
 		exec: |SetupEnv { trace, context: ctx }| async move {
 			let mut conf_third = quiet_flood_conf(&ctx.third, &ctx.peers_of_third, vec![], &ctx.journal_of_third);
 			conf_third.gossip.ingress = Some(servlet_ingress("rumor"));
 
 			let third = start_cluster(&trace, conf_third).await?;
-			let ingress_hive = start_rumor_hive(trace.share(), hive_plane_certs_for(&ctx.third)).await?;
+			let ingress_hive = start_rumor_hive(trace.share(), hive_plane_certs(&ctx.third), ctx.main.key.to_owned()).await?;
 			ingress_hive.register_with_cluster(third.addr()).await?;
 
 			let dials_third = vec![third.addr().to_string()];
@@ -258,7 +239,7 @@ tb_assert_spec! {
 
 // Anti-entropy repairs a rumor across colonies.
 //
-// - "main" publishes at zero hops, so the rumor never floods.
+// - "main" publishes at zero hops, so the rumor moves by reconcile alone.
 // - "other" learns it only when the beat of "main" reconciles digests and pushes it (GOSSIP_CONVERGED).
 tb_scenario! {
 	name: cluster_flood_repairs_a_rumor_across_colonies,

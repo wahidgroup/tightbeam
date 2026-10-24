@@ -1,6 +1,7 @@
-//! Integration tests for automatic instrumentation in testing framework
+//! The integration tests of automatic instrumentation in the testing framework.
 //!
-//! Demonstrates Phase 2: tb_scenario! automatic instrumentation capture
+//! The scenario shows that `tb_scenario!` captures instrumentation events
+//! automatically.
 
 #![cfg(all(feature = "instrument", feature = "tokio", feature = "tcp", feature = "testing"))]
 
@@ -25,7 +26,7 @@ tb_assert_spec! {
 	}
 }
 
-// CSP process spec for automatic message flow verification
+// The CSP process spec that verifies the automatic message flow.
 tb_process_spec! {
 	pub MessageFlowProc,
 	events {
@@ -46,7 +47,7 @@ mod sink {
 	use tightbeam::instrumentation::{events, EventSink, TbEvent, TbInstrumentationConfig};
 	use tightbeam::trace::{TraceCollector, TraceConfig};
 
-	/// Mission-critical sink: retains every event, never drops.
+	/// A mission-critical sink that holds every event in an unbounded list.
 	#[derive(Default)]
 	struct LossFreeSink {
 		events: Mutex<Vec<TbEvent>>,
@@ -78,7 +79,7 @@ mod sink {
 	}
 
 	#[test]
-	fn consumer_sink_keeps_every_event_past_default_bound() {
+	fn consumer_sink_keeps_every_event_past_default_bound() -> Result<(), tightbeam::TightBeamError> {
 		let config = TbInstrumentationConfig { max_events: 1, ..Default::default() };
 		let collector = TraceCollector::from(
 			TraceConfig::builder()
@@ -87,9 +88,9 @@ mod sink {
 				.build(),
 		);
 
-		collector.emit_event(events::MUX_GOAWAY_SENT);
-		collector.emit_event(events::MUX_EMIT_DRAINING);
-		collector.emit_event(events::MUX_GOAWAY_RECV);
+		collector.emit_event(events::MUX_GOAWAY_SENT)?;
+		collector.emit_event(events::MUX_EMIT_DRAINING)?;
+		collector.emit_event(events::MUX_GOAWAY_RECV)?;
 
 		assert!(!collector.overflowed(), "loss-free sink must never report overflow");
 
@@ -101,18 +102,20 @@ mod sink {
 			"sink must retain emit-draining"
 		);
 		assert_eq!(count_urn(&drained, events::MUX_GOAWAY_RECV), 1, "sink must retain goaway-recv");
+		Ok(())
 	}
 
 	#[test]
-	fn default_bounded_sink_truncates_and_reports_overflow() {
+	fn default_bounded_sink_truncates_and_reports_overflow() -> Result<(), tightbeam::TightBeamError> {
 		let config = TbInstrumentationConfig { max_events: 1, ..Default::default() };
 		let collector = TraceCollector::from(TraceConfig::with_instrumentation(config));
 
-		collector.emit_event(events::MUX_GOAWAY_SENT);
-		collector.emit_event(events::MUX_EMIT_DRAINING);
+		collector.emit_event(events::MUX_GOAWAY_SENT)?;
+		collector.emit_event(events::MUX_EMIT_DRAINING)?;
 
 		assert!(collector.overflowed(), "bounded sink past cap must latch overflow");
 		assert_eq!(collector.drain_events().len(), 1, "bounded sink must retain only up to cap");
+		Ok(())
 	}
 }
 
@@ -145,9 +148,9 @@ tb_scenario! {
 				V0: id: "test", order: 1u64, message: test_message
 			}?;
 
-			trace.emit_event(MESSAGE_EMIT);
+			trace.emit_event(MESSAGE_EMIT)?;
 			let response = client.emit(test_frame, None).await?;
-			trace.emit_event(MESSAGE_COLLECT);
+			trace.emit_event(MESSAGE_COLLECT)?;
 
 			assert!(response.is_some(), "the echo handler must return the frame it received");
 			Ok(())

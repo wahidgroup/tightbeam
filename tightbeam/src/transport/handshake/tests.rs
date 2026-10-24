@@ -73,7 +73,6 @@ use crate::transport::handshake::{
 	HandshakeMessage, HandshakeSecret, PeerAuthentication, Server, ServerConfig, ServerFlow, ServerHandshake,
 	SupportedProfiles,
 };
-use crate::transport::wire_der::WireDer;
 use crate::utils::marker::MaybeSendFuture;
 use crate::x509::attr::AttributeTypeAndValue;
 use crate::x509::ext::pkix::{KeyUsage, KeyUsages, SubjectKeyIdentifier};
@@ -156,10 +155,9 @@ pub fn two_valued_name() -> RdnSequence {
 	RdnSequence::from(vec![RelativeDistinguishedName::from(values)])
 }
 
-/// `reply` with the two values of [`two_valued_name`] swapped in the bytes
-/// it carries, so its certificate decodes to the same value from another
-/// encoding.
-pub fn with_rdn_values_swapped(reply: &HandshakeMessage) -> HandshakeMessage {
+/// The bytes of `reply` with the two values of [`two_valued_name`] swapped,
+/// another encoding of the same certificate value, which DER forbids.
+pub fn with_rdn_values_swapped(reply: &HandshakeMessage) -> Vec<u8> {
 	let name = two_valued_name();
 	let values = name.0.iter().flat_map(|rdn| rdn.0.iter());
 	let sorted: Vec<Vec<u8>> = values.map(|value| value.to_der().expect("a value encodes")).collect();
@@ -167,10 +165,7 @@ pub fn with_rdn_values_swapped(reply: &HandshakeMessage) -> HandshakeMessage {
 	let swapped = sorted.iter().rev().flatten().copied().collect::<Vec<u8>>();
 	let carried = reply.der().windows(encoded.len()).position(|window| window == encoded);
 	let (head, tail) = reply.der().split_at(carried.expect("the reply carries the RDN"));
-	let bytes = [head, swapped.as_slice(), &tail[encoded.len()..]].concat();
-
-	let signed = WireDer::try_from(bytes.as_slice()).expect("the reordered reply decodes");
-	HandshakeMessage::SignedData(Box::new(signed))
+	[head, swapped.as_slice(), &tail[encoded.len()..]].concat()
 }
 
 /// Create a test certificate with a secp256k1 keypair.
@@ -808,7 +803,7 @@ impl StaticKeyObserver {
 		let mut attempts = Vec::new();
 		for secret in self.handshake_secrets()? {
 			let sealer = secret.sealer::<DefaultCryptoProvider>(purpose, salt, transcript_hash)?;
-			attempts.push(sealer.open(sealed, content_type).await);
+			attempts.push(sealer.open(purpose.admit(sealed)?, content_type).await);
 		}
 
 		let Some(base) = &self.base else {
@@ -1429,7 +1424,7 @@ const SAMPLE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../target/cms-sam
 /// The variable that asks a sample test to write its samples.
 const SAMPLE_VARIABLE: &str = "TIGHTBEAM_CMS_SAMPLES";
 
-/// `content` of `content_type` inside a CMS `ContentInfo` (RFC 5652 § 3),
+/// `content` of `content_type` inside a CMS `ContentInfo` (RFC 5652 §3),
 /// the form a CMS parser reads.
 pub fn content_info<T: EncodeValue + Tagged>(content_type: ObjectIdentifier, content: &T) -> Vec<u8> {
 	let content = AnyValue::encode_from(content).expect("the content encodes");

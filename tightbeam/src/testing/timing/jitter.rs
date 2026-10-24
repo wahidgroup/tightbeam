@@ -1,37 +1,37 @@
-//! Jitter calculation utilities
+//! Jitter calculation for timing verification.
 //!
-//! Provides traits and implementations for calculating jitter from observed
-//! durations, for timing verification.
+//! `JitterCalculator` turns observed durations into one jitter value, and this
+//! module holds four calculators of it.
 
 use crate::transport::policy::decorrelated_bounds;
-use crate::utils::math::integer_sqrt;
 use crate::TightBeamError;
 
-/// Trait for calculating jitter from a collection of observed durations.
+/// A method that calculates jitter from a collection of observed durations.
 ///
-/// Jitter represents the variation in execution times. Different calculation
-/// methods provide different statistical measures of this variation.
+/// Jitter is the variation in execution times, and each method measures that
+/// variation with a different statistic.
 pub trait JitterCalculator: Send + Sync + core::fmt::Debug {
-	/// Calculate jitter from observed durations.
+	/// Calculates jitter from observed durations.
 	///
 	/// # Arguments
-	/// * `durations` - Slice of observed durations in nanoseconds
+	/// * `durations` - The observed durations, in nanoseconds.
 	///
 	/// # Returns
-	/// * `Ok(u64)` - Calculated jitter in nanoseconds
-	/// * `Err(TightBeamError)` - If calculation fails (e.g., insufficient data)
+	/// * `Ok(u64)` - The jitter, in nanoseconds.
+	/// * `Err(TightBeamError)` - The calculation failed, for example on too little data.
 	///
 	/// # Errors
 	/// Returns an error if:
-	/// * `durations` is empty
-	/// * `durations` has fewer than 2 elements (for methods requiring multiple samples)
+	/// * `durations` is empty.
+	/// * `durations` holds fewer samples than the calculator needs. The
+	///   calculators of this module return 0 for a single sample.
 	fn calculate(&self, durations: &[u64]) -> Result<u64, TightBeamError>;
 }
 
-/// Min-Max jitter calculator (default).
+/// The min-max jitter calculator, which timing verification uses by default.
 ///
-/// Calculates jitter as the difference between maximum and minimum observed
-/// durations. This is the simplest and most commonly used jitter metric.
+/// The jitter is the difference between the largest and the smallest observed
+/// duration, which is the simplest jitter metric.
 #[derive(Default, Debug, Clone, Copy)]
 pub struct MinMaxJitter;
 
@@ -51,10 +51,10 @@ impl JitterCalculator for MinMaxJitter {
 	}
 }
 
-/// Variance-based jitter calculator.
+/// The variance jitter calculator.
 ///
-/// Calculates jitter as the variance of observed durations.
-/// Variance measures the spread of data points around the mean.
+/// The jitter is the variance of the observed durations, which measures their
+/// spread around the mean.
 #[derive(Default, Debug, Clone, Copy)]
 pub struct VarianceJitter;
 
@@ -68,12 +68,11 @@ impl JitterCalculator for VarianceJitter {
 			return Ok(0);
 		}
 
-		// Calculate mean
 		let sum: u64 = durations.iter().sum();
 		let count = durations.len() as u64;
 		let mean = sum / count;
 
-		// Calculate variance: sum of squared differences from mean
+		// The variance sums the squared differences from the mean.
 		let variance_sum: u128 = durations
 			.iter()
 			.map(|&d| {
@@ -82,17 +81,16 @@ impl JitterCalculator for VarianceJitter {
 			})
 			.sum();
 
-		// Return variance (average of squared differences)
+		// The variance is the average of the squared differences.
 		let variance = (variance_sum / count as u128) as u64;
 		Ok(variance)
 	}
 }
 
-/// Standard deviation-based jitter calculator.
+/// The standard deviation jitter calculator.
 ///
-/// Calculates jitter as the standard deviation of observed durations.
-/// Standard deviation is the square root of variance, providing a measure
-/// in the same units as the original data.
+/// The jitter is the standard deviation of the observed durations. It is the
+/// square root of the variance, so it has the same unit as the durations.
 #[derive(Default, Debug, Clone, Copy)]
 pub struct StdDevJitter;
 
@@ -106,12 +104,11 @@ impl JitterCalculator for StdDevJitter {
 			return Ok(0);
 		}
 
-		// Calculate mean
 		let sum: u64 = durations.iter().sum();
 		let count = durations.len() as u64;
 		let mean = sum / count;
 
-		// Calculate variance: sum of squared differences from mean
+		// The variance sums the squared differences from the mean.
 		let variance_sum: u128 = durations
 			.iter()
 			.map(|&d| {
@@ -120,21 +117,19 @@ impl JitterCalculator for StdDevJitter {
 			})
 			.sum();
 
-		// Calculate variance (average of squared differences)
+		// The variance is the average of the squared differences.
 		let variance = variance_sum / count as u128;
 
-		// Calculate standard deviation: square root of variance
-		// Use integer square root approximation
-		let std_dev = integer_sqrt(variance);
+		// The standard deviation is the integer square root of the variance.
+		let std_dev = variance.isqrt();
 		Ok(std_dev as u64)
 	}
 }
 
-/// Decorrelated jitter calculator.
+/// The decorrelated jitter calculator.
 ///
-/// Calculates jitter using the decorrelated jitter algorithm.
-/// Uses max duration as base and returns the width of the
-/// decorrelated window (max/3 to max) as the jitter value.
+/// The jitter is the width of the decorrelated window that the largest
+/// duration sets as its base, from max/3 to max.
 #[derive(Default, Debug, Clone, Copy)]
 pub struct DecorrelatedJitterCalculator;
 
@@ -179,9 +174,9 @@ mod tests {
 		assert!(matches!(calculator.calculate(&[]), Err(TightBeamError::InvalidMetadata)));
 		assert_eq!(calculator.calculate(&[100])?, 0);
 
-		// Test with known values: [100, 200]
-		// Mean = 150, variance = ((100-150)² + (200-150)²) / 2
-		// = (2500 + 2500) / 2 = 2500
+		// For [100, 200], the mean is 150 and the variance is
+		// ((100-150)² + (200-150)²) / 2
+		// = (2500 + 2500) / 2 = 2500.
 		let result = calculator.calculate(&[100, 200])?;
 		assert_eq!(result, 2500);
 
@@ -194,8 +189,8 @@ mod tests {
 		assert!(matches!(calculator.calculate(&[]), Err(TightBeamError::InvalidMetadata)));
 		assert_eq!(calculator.calculate(&[100])?, 0);
 
-		// Test with known values: [100, 200]
-		// Variance = 2500, std_dev = sqrt(2500) = 50
+		// For [100, 200], the variance is 2500 and
+		// std_dev = sqrt(2500) = 50.
 		let result = calculator.calculate(&[100, 200])?;
 		assert_eq!(result, 50);
 
@@ -208,10 +203,10 @@ mod tests {
 		assert!(matches!(calculator.calculate(&[]), Err(TightBeamError::InvalidMetadata)));
 		assert_eq!(calculator.calculate(&[100])?, 0);
 
-		// Test with max = 300: range = 300 - (300/3) = 300 - 100 = 200
+		// With max = 300, range = 300 - (300/3) = 300 - 100 = 200.
 		assert_eq!(calculator.calculate(&[100, 200, 300])?, 200);
 
-		// Test with max = 150: range = 150 - (150/3) = 150 - 50 = 100
+		// With max = 150, range = 150 - (150/3) = 150 - 50 = 100.
 		assert_eq!(calculator.calculate(&[50, 100, 150])?, 100);
 
 		Ok(())

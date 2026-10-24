@@ -1,11 +1,11 @@
 #!/bin/bash
 # Generic Fuzz Quality Analysis Tool
 #
-# Runs AFL fuzzing on any fuzz test with UI display and generates
-# a comprehensive analysis report.
+# The script runs AFL on one fuzz test, with the AFL UI shown by default, and
+# reports the performance, coverage, test cases, crashes, and hangs of the run.
 #
-# This script can be used from any Rust project root that uses cargo-afl.
-# It automatically detects the project structure and fuzz test locations.
+# It works in the project root above its own scripts/ directory, and it finds
+# the fuzz test and its seeds in the source trees of detect_fuzz_base.
 #
 # References:
 #   GNU CLI Guidelines: https://www.gnu.org/prep/standards/html_node/Command_002dLine-Interfaces.html
@@ -15,15 +15,15 @@ set -euo pipefail
 
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-# Script is in scripts/ directory, project root is one level up
+# The script sits in scripts/, so the project root is one level up.
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 
-# Project metadata
+# The name and version that the usage and --version text print.
 PROJECT="analyze_fuzz"
 VERSION="1.0.0"
 
-# Default values
+# The defaults, which the arguments below override.
 DURATION=60
 SHOW_UI=true
 SKIP_CRASH_CHECK=true
@@ -35,12 +35,13 @@ SEED_DIR=""
 VERIFY_CODE=false
 VERIFY_PATTERNS=()
 
-# Auto-detect fuzz test locations
-# Try common locations: tests/fuzz/, <crate>/tests/fuzz/, fuzz/
+# Print the first source tree that holds the test, in the order tightbeam/fuzz,
+# tests/fuzz, tightbeam/tests/fuzz, fuzz, and tests. When none holds it, print
+# tightbeam/fuzz, or tests/fuzz when only that tree exists.
 detect_fuzz_base() {
     local test_name="$1"
-    # Prefer source trees. Never fall back into target/ (rustdoc and
-    # build artifacts also match *fuzz* and steal seed paths).
+    # The search reads source trees alone. Rustdoc and build artifacts under
+    # target/ also match *fuzz*, so a match there would steal the seed paths.
     for base in "tightbeam/fuzz" "tests/fuzz" "tightbeam/tests/fuzz" "fuzz" "tests"; do
         if [ -d "$base/$test_name" ] || [ -f "$base/${test_name}.rs" ]; then
             echo "$base"
@@ -58,7 +59,6 @@ detect_fuzz_base() {
     echo "tightbeam/fuzz"
 }
 
-# Print usage information
 usage() {
     cat << EOF
 USAGE:
@@ -104,7 +104,6 @@ REFERENCES:
 EOF
 }
 
-# Print version information
 version() {
     cat << EOF
 $PROJECT $VERSION
@@ -114,7 +113,7 @@ Works with any Rust project using cargo-afl.
 EOF
 }
 
-# Parse arguments using getopt (GNU/POSIX compliant)
+# GNU getopt parses the options in the form the guidelines above describe.
 if ! OPTS=$(getopt -o hVncCFkP:s:vp: --long help,version,no-ui,skip-checks,skip-crash-check,skip-cpu-freq,keep-output,path:,seeds:,verify,pattern: -n "$PROJECT" -- "$@"); then
     echo "Error: Failed to parse options" >&2
     usage >&2
@@ -181,7 +180,7 @@ while true; do
     esac
 done
 
-# Handle TEST_NAME argument (required)
+# TEST_NAME is the one required argument.
 if [ $# -eq 0 ]; then
     echo "Error: TEST_NAME is required" >&2
     usage >&2
@@ -191,20 +190,20 @@ fi
 TEST_NAME="$1"
 shift
 
-# The test name is the target, so it names this run. Asking scripts/fuzz-run.sh
-# keeps the output layout in one place, and gives each target its own directory
-# so a run here neither collides with `make fuzz-test` nor deletes its results.
+# The test name is the target, so it names this run. scripts/fuzz-run.sh holds
+# the output layout in one place and gives each target its own directory, so a
+# run here neither collides with `make fuzz-test` nor deletes its results.
 FUZZ_RUN="$(FUZZ_TARGET="fuzz_${TEST_NAME}" "$SCRIPT_DIR/fuzz-run.sh")"
 FUZZ_OUT="$(dirname "$FUZZ_RUN")"
 FUZZ_IN="$PROJECT_ROOT/built/fuzz/in/fuzz_${TEST_NAME}"
 
-# Handle DURATION argument (optional)
+# DURATION, in seconds, is optional.
 if [ $# -gt 0 ] && [[ "$1" =~ ^[0-9]+$ ]]; then
     DURATION="$1"
     shift
 fi
 
-# Handle AFL_ARGS (everything remaining after TEST_NAME/DURATION, optional leading --)
+# Every argument after TEST_NAME and DURATION goes to AFL, past an optional --.
 AFL_ARGS_ARRAY=()
 AFL_ARGS=""
 if [ $# -gt 0 ]; then
@@ -218,16 +217,16 @@ if [ $# -gt 0 ]; then
     set --
 fi
 
-# Validate duration
 if ! [[ "$DURATION" =~ ^[0-9]+$ ]] || [ "$DURATION" -le 0 ]; then
     echo "Error: Duration must be a positive integer (seconds)" >&2
     exit 1
 fi
 
-# Tokio colony/chess targets: no memcap, no forkserver, and a hang
-# timeout that tolerates multi-gateway boot. Ephemeral ports / multi-task
-# I/O break AFL's forkserver dry run even when the runtime is built
-# inside the fuzz closure.
+# The colony and chess targets run Tokio. Unless the caller passes -m or -t,
+# they get no memory limit and a hang timeout of 5000 ms that covers a
+# multi-gateway boot. They always run without the forkserver, because ephemeral
+# ports and multi-task I/O break its dry run even when the fuzz closure builds
+# the runtime.
 DISABLE_FORKSRV=false
 has_mem_limit=false
 has_timeout=false
@@ -252,13 +251,13 @@ case "$TEST_NAME" in
 		;;
 esac
 
-# Validate verify patterns if verify is enabled
+# --verify needs at least one --pattern.
 if [ "$VERIFY_CODE" = true ] && [ ${#VERIFY_PATTERNS[@]} -eq 0 ]; then
     echo "Error: --verify requires at least one --pattern" >&2
     exit 1
 fi
 
-# Determine fuzz base directory
+# --path names the fuzz base, and detect_fuzz_base finds one otherwise.
 if [ -n "$CUSTOM_FUZZ_BASE" ]; then
 	if [ ! -d "$CUSTOM_FUZZ_BASE" ]; then
 		echo "Error: Provided path does not exist: $CUSTOM_FUZZ_BASE" >&2
@@ -269,15 +268,14 @@ else
 	FUZZ_BASE=$(detect_fuzz_base "$TEST_NAME")
 fi
 
-# Set default seed directory if not provided
+# Without --seeds, the seeds sit in <fuzz base>/<test>/seeds.
 if [ -z "$SEED_DIR" ]; then
     SEED_DIR="$FUZZ_BASE/${TEST_NAME}/seeds"
 fi
 
-# Determine test file path for code verification
+# --verify reads the test source, <test>/mod.rs or else <test>.rs.
 TEST_FILE="$FUZZ_BASE/${TEST_NAME}/mod.rs"
 if [ ! -f "$TEST_FILE" ]; then
-    # Try .rs file instead
     TEST_FILE="$FUZZ_BASE/${TEST_NAME}.rs"
 fi
 
@@ -286,9 +284,7 @@ echo "Fuzz Quality Analysis Tool - $TEST_NAME"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 
-# ============================================================================
-# Phase 1: Preparation
-# ============================================================================
+# Phase 1 checks the tools, builds the target, and prepares the seeds.
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "Phase 1: Preparation"
@@ -312,7 +308,6 @@ if [ -n "$AFL_ARGS" ]; then
 fi
 echo ""
 
-# Check prerequisites
 echo "[*] Checking prerequisites..."
 if ! command -v cargo-afl &> /dev/null; then
     echo "[!] ERROR: cargo-afl not found. Run: make setup" >&2
@@ -333,7 +328,8 @@ fi
 echo "[+] getopt found"
 echo ""
 
-# Build fuzz target
+# The build tries `make fuzz-build`, then `cargo afl build` on the binary of
+# the target, then on the `fuzzing` test.
 echo "[*] Building fuzz target..."
 BUILD_OK=false
 TARGET_HINT="fuzz_${TEST_NAME}"
@@ -375,21 +371,22 @@ fi
 echo "[+] Fuzz target built successfully"
 echo ""
 
-# Locate fuzz target binary
-# Try common binary locations and patterns
+# The binary is the first executable match of these patterns, in order, in the
+# directory that scripts/fuzz-run.sh names.
 FUZZ_TARGET=""
+BIN_DIR="$("$SCRIPT_DIR/fuzz-run.sh" --bin-dir)"
 SEARCH_PATTERNS=()
 if [ -n "$TARGET_HINT" ]; then
-	SEARCH_PATTERNS+=("target/debug/${TARGET_HINT}")
-	SEARCH_PATTERNS+=("target/debug/${TARGET_HINT}-*")
-	SEARCH_PATTERNS+=("target/debug/deps/${TARGET_HINT}-*")
+	SEARCH_PATTERNS+=("$BIN_DIR/${TARGET_HINT}")
+	SEARCH_PATTERNS+=("$BIN_DIR/${TARGET_HINT}-*")
+	SEARCH_PATTERNS+=("$BIN_DIR/deps/${TARGET_HINT}-*")
 fi
-SEARCH_PATTERNS+=("target/debug/fuzz_${TEST_NAME}")
-SEARCH_PATTERNS+=("target/debug/${TEST_NAME}")
-SEARCH_PATTERNS+=("target/debug/deps/fuzzing-*")
-SEARCH_PATTERNS+=("target/debug/deps/*fuzz*")
-SEARCH_PATTERNS+=("target/debug/fuzz_*")
-SEARCH_PATTERNS+=("target/debug/*fuzz*")
+SEARCH_PATTERNS+=("$BIN_DIR/fuzz_${TEST_NAME}")
+SEARCH_PATTERNS+=("$BIN_DIR/${TEST_NAME}")
+SEARCH_PATTERNS+=("$BIN_DIR/deps/fuzzing-*")
+SEARCH_PATTERNS+=("$BIN_DIR/deps/*fuzz*")
+SEARCH_PATTERNS+=("$BIN_DIR/fuzz_*")
+SEARCH_PATTERNS+=("$BIN_DIR/*fuzz*")
 
 for pattern in "${SEARCH_PATTERNS[@]}"; do
 	while IFS= read -r candidate; do
@@ -402,14 +399,14 @@ done
 
 if [ -z "$FUZZ_TARGET" ] || [ ! -f "$FUZZ_TARGET" ]; then
     echo "[!] ERROR: Could not find fuzzing binary" >&2
-    echo "    Searched in: target/debug/deps/, target/debug/" >&2
-    echo "    Try building with: cargo afl build --test fuzzing" >&2
+    echo "    Searched in: $BIN_DIR/deps/, $BIN_DIR/" >&2
+    echo "    Run 'make fuzz-build' first" >&2
     exit 1
 fi
 echo "[+] Found fuzz target: $(basename "$FUZZ_TARGET")"
 echo ""
 
-# Determine afl-fuzz runner (prefer native afl-fuzz if available to avoid rebuilds)
+# A native afl-fuzz runs the binary as built, and `cargo afl fuzz` may rebuild.
 if AFL_FUZZ_BIN=$(command -v afl-fuzz 2>/dev/null); then
 	echo "[+] Using afl-fuzz binary: $AFL_FUZZ_BIN"
 	USE_CARGO_AFL=false
@@ -419,7 +416,7 @@ else
 fi
 echo ""
 
-# Prepare seed inputs
+# A run without --keep-output starts from an empty output directory.
 echo "[*] Preparing seed inputs..."
 mkdir -p "$FUZZ_IN"
 if [ "$KEEP_OUTPUT" = false ]; then
@@ -427,9 +424,10 @@ if [ "$KEEP_OUTPUT" = false ]; then
 fi
 mkdir -p "$FUZZ_OUT"
 
-# Copy seeds from version-controlled directory to AFL input directory
+# The seeds come from the version-controlled seed directory. AFL refuses an
+# empty input directory, so a minimal seed stands in when that holds none.
 if [ -d "$SEED_DIR" ]; then
-    # Copy all seed files from seed directory
+    # A seed file ends in .txt, .bin, or .dat.
     find "$SEED_DIR" -type f \( -name "*.txt" -o -name "*.bin" -o -name "*.dat" \) -exec cp {} "$FUZZ_IN/" \;
     SEED_COUNT=$(find "$FUZZ_IN" -type f | wc -l)
     if [ "$SEED_COUNT" -gt 0 ]; then
@@ -449,9 +447,7 @@ fi
 echo "[+] Prepared $SEED_COUNT seed files for fuzzing"
 echo ""
 
-# ============================================================================
-# Phase 2: Code Verification (optional)
-# ============================================================================
+# Phase 2 runs with --verify and checks the test source for each --pattern.
 
 if [ "$VERIFY_CODE" = true ]; then
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -481,11 +477,11 @@ if [ "$VERIFY_CODE" = true ]; then
 
         echo "Checking $TEST_NAME fuzz test implementation..."
         for pattern_entry in "${VERIFY_PATTERNS[@]}"; do
-            # Split pattern entry (format: "feature:pattern")
+            # Each entry reads feature:pattern.
             feature="${pattern_entry%%:*}"
             pattern="${pattern_entry#*:}"
             if [ "$feature" = "$pattern_entry" ]; then
-                # No colon found, use entire string as pattern
+                # An entry with no colon is a pattern alone.
                 feature="Pattern"
                 pattern="$pattern_entry"
             fi
@@ -501,16 +497,13 @@ if [ "$VERIFY_CODE" = true ]; then
     fi
 fi
 
-# ============================================================================
-# Phase 3: Fuzzing Execution
-# ============================================================================
+# Phase 3 runs AFL for DURATION seconds.
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "Phase 3: Fuzzing Execution (${DURATION} seconds)"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 
-# Set up AFL environment
 AFL_ENV_VARS=()
 if [ "$SKIP_CRASH_CHECK" = true ]; then
     AFL_ENV_VARS+=("AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1")
@@ -569,7 +562,7 @@ run_afl_command() {
     fi
 }
 
-# Run fuzzer
+# timeout exits with 124 when DURATION ends the run.
 if [ "$SHOW_UI" = true ]; then
     echo "[*] AFL UI will be displayed below..."
     echo "    Press Ctrl+C to stop early (analysis will still be generated)"
@@ -613,9 +606,7 @@ fi
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 
-# ============================================================================
-# Phase 4: Analysis Report
-# ============================================================================
+# Phase 4 reads fuzzer_stats and prints the report.
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "Phase 4: Analysis Report"
@@ -627,19 +618,18 @@ if [ ! -f "$FUZZ_RUN/fuzzer_stats" ]; then
     exit 1
 fi
 
-# Extract statistics
 STATS_FILE="$FUZZ_RUN/fuzzer_stats"
 EXECS=$(grep "^execs_done" "$STATS_FILE" | awk '{print $3}' || echo "0")
 EXECS_PER_SEC=$(grep "^execs_per_sec" "$STATS_FILE" | awk '{print $3}' || echo "0")
 CORPUS_COUNT=$(grep "^corpus_count" "$STATS_FILE" | awk '{print $3}' || echo "0")
-# Strip % from stability if present (AFL sometimes includes it)
+# AFL may append a % sign to stability.
 STABILITY=$(grep "^stability" "$STATS_FILE" | awk '{print $3}' | sed 's/%//' || echo "0")
-# Strip % from coverage if present
+# The same holds for bitmap_cvg.
 COVERAGE=$(grep "^bitmap_cvg" "$STATS_FILE" | awk '{print $3}' | sed 's/%//' || echo "0")
 EDGES_FOUND=$(grep "^edges_found" "$STATS_FILE" | awk '{print $3}' || echo "0")
 TOTAL_EDGES=$(grep "^total_edges" "$STATS_FILE" | awk '{print $3}' || echo "0")
 CYCLES=$(grep "^cycles_done" "$STATS_FILE" | awk '{print $3}' || echo "0")
-# AFL++ 4.x writes saved_*; older AFL used unique_*. Prefer saved_*.
+# AFL++ 4.x writes saved_*, and older AFL writes unique_*. saved_* wins.
 UNIQUE_CRASHES=$(grep "^saved_crashes" "$STATS_FILE" | awk '{print $3}')
 if [ -z "$UNIQUE_CRASHES" ]; then
 	UNIQUE_CRASHES=$(grep "^unique_crashes" "$STATS_FILE" | awk '{print $3}' || echo "0")
@@ -651,7 +641,6 @@ if [ -z "$UNIQUE_HANGS" ]; then
 fi
 UNIQUE_HANGS=${UNIQUE_HANGS:-0}
 
-# Performance Metrics
 echo "[*] Performance Metrics"
 echo "──────────────────────────────────────────────────────────────────"
 printf "    %-30s %'d\n" "Total Executions:" "$EXECS"
@@ -659,7 +648,7 @@ printf "    %-30s %.2f/sec\n" "Execution Rate:" "$EXECS_PER_SEC"
 printf "    %-30s %d\n" "Cycles Completed:" "$CYCLES"
 printf "    %-30s %.2f%s\n" "Stability:" "$STABILITY" "%"
 
-# Calculate runtime from stats if available
+# The run time prints only when fuzzer_stats holds both timestamps.
 START_TIME=$(grep "^start_time" "$STATS_FILE" | awk '{print $3}' 2>/dev/null || echo "")
 LAST_UPDATE=$(grep "^last_update" "$STATS_FILE" | awk '{print $3}' 2>/dev/null || echo "")
 if [ -n "$START_TIME" ] && [ -n "$LAST_UPDATE" ]; then
@@ -671,7 +660,6 @@ if [ -n "$START_TIME" ] && [ -n "$LAST_UPDATE" ]; then
 fi
 echo ""
 
-# Coverage Analysis
 echo "[*] Coverage Analysis"
 echo "──────────────────────────────────────────────────────────────────"
 printf "    %-30s %.2f%s\n" "Bitmap Coverage:" "$COVERAGE" "%"
@@ -683,7 +671,6 @@ else
 fi
 echo ""
 
-# Test Case Analysis
 echo "[*] Test Case Analysis"
 echo "──────────────────────────────────────────────────────────────────"
 printf "    %-30s %d\n" "Unique Test Cases:" "$CORPUS_COUNT"
@@ -692,7 +679,6 @@ if [ -d "$FUZZ_RUN/queue" ]; then
     QUEUE_COUNT=$(ls $FUZZ_RUN/queue/id:* 2>/dev/null | wc -l)
     printf "    %-30s %d\n" "Queue Size:" "$QUEUE_COUNT"
 
-    # Size distribution
     if [ "$QUEUE_COUNT" -gt 0 ]; then
         LARGEST=$(ls -S $FUZZ_RUN/queue/id:* 2>/dev/null | head -1)
         if [ -n "$LARGEST" ] && [ -f "$LARGEST" ]; then
@@ -711,7 +697,6 @@ else
 fi
 echo ""
 
-# Safety Analysis
 echo "[*] Safety Analysis"
 echo "──────────────────────────────────────────────────────────────────"
 printf "    %-30s %d\n" "Unique Crashes:" "$UNIQUE_CRASHES"
@@ -730,7 +715,6 @@ if [ "$UNIQUE_HANGS" -gt 0 ]; then
 fi
 echo ""
 
-# Recommendations
 echo "[*] Recommendations"
 echo "──────────────────────────────────────────────────────────────────"
 
@@ -749,7 +733,6 @@ if [ "$UNIQUE_CRASHES" -eq 0 ] && [ "$UNIQUE_HANGS" -eq 0 ]; then
 fi
 echo ""
 
-# Summary
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "[*] Summary"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

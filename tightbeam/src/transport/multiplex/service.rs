@@ -18,6 +18,7 @@ use crate::policy::TransitStatus;
 use crate::transport::envelopes::ResponsePackage;
 use crate::transport::messaging::GateInbound;
 use crate::transport::multiplex::{MuxDispatch, MuxHandle, ReplySink, StreamBody, StreamRoute};
+use crate::transport::TransportResult;
 use crate::urn::Urn;
 use crate::utils::marker::MaybeSend;
 use crate::{Frame, TightBeamError};
@@ -198,37 +199,52 @@ impl<S> GatedService<S> {
 	fn session(&self) -> SessionContext {
 		self.snapshot.with_live_receipt(self.handle.session_receipt())
 	}
+
+	/// Gate one invocation, and record its verdict in the connection's trace.
+	///
+	/// # Errors
+	///
+	/// - The fault the trace injects at the event of the verdict.
+	fn verdict(&self, frame: Option<&Frame>, session: &SessionContext) -> TransportResult<TransitStatus> {
+		Ok(self.handle.gate_inbound(self.gate.as_ref(), frame, session)?)
+	}
 }
 
 impl<S: MuxService> MuxDispatch for GatedService<S> {
-	fn unary(&self, frame: Arc<Frame>) -> impl Future<Output = ResponsePackage> + MaybeSend {
-		// Gates are synchronous: evaluate and audit at dispatch, so
-		// only the service and its inputs enter the task.
+	fn unary(&self, frame: Arc<Frame>) -> impl Future<Output = TransportResult<ResponsePackage>> + MaybeSend {
+		// Gates are synchronous, so the call evaluates and audits at
+		// dispatch, and only the service and its inputs enter the task.
 		let session = self.session();
-		let status = self.handle.gate_inbound(self.gate.as_ref(), Some(frame.as_ref()), &session);
+		let verdict = self.verdict(Some(frame.as_ref()), &session);
 		let service = Arc::clone(&self.service);
 		async move {
+			let status = verdict?;
 			if status != TransitStatus::Ok {
-				return ResponsePackage::new(status, None);
+				return Ok(ResponsePackage::new(status, None));
 			}
 
 			let request = Arc::try_unwrap(frame).unwrap_or_else(|shared| (*shared).clone());
 			let cx = CallContext::new(session, StreamRoute::local());
-			ResponsePackage::from_outcome(service.unary(request, cx).await)
+			Ok(ResponsePackage::from_outcome(service.unary(request, cx).await))
 		}
 	}
 
-	fn streaming(&self, body: StreamBody, route: StreamRoute) -> impl Future<Output = ResponsePackage> + MaybeSend {
+	fn streaming(
+		&self,
+		body: StreamBody,
+		route: StreamRoute,
+	) -> impl Future<Output = TransportResult<ResponsePackage>> + MaybeSend {
 		let session = self.session();
-		let status = self.handle.gate_inbound(self.gate.as_ref(), None, &session);
+		let verdict = self.verdict(None, &session);
 		let service = Arc::clone(&self.service);
 		async move {
+			let status = verdict?;
 			if status != TransitStatus::Ok {
-				return ResponsePackage::new(status, None);
+				return Ok(ResponsePackage::new(status, None));
 			}
 
 			let cx = CallContext::new(session, route);
-			ResponsePackage::from_outcome(service.streaming(body, cx).await)
+			Ok(ResponsePackage::from_outcome(service.streaming(body, cx).await))
 		}
 	}
 
@@ -237,20 +253,22 @@ impl<S: MuxService> MuxDispatch for GatedService<S> {
 		body: StreamBody,
 		reply: ReplySink,
 		route: StreamRoute,
-	) -> impl Future<Output = TransitStatus> + MaybeSend {
+	) -> impl Future<Output = TransportResult<TransitStatus>> + MaybeSend {
 		let session = self.session();
-		let status = self.handle.gate_inbound(self.gate.as_ref(), None, &session);
+		let verdict = self.verdict(None, &session);
 		let service = Arc::clone(&self.service);
 		async move {
+			let status = verdict?;
 			if status != TransitStatus::Ok {
-				return status;
+				return Ok(status);
 			}
 
 			let cx = CallContext::new(session, route);
-			match service.duplex(body, reply, cx).await {
+			let status = match service.duplex(body, reply, cx).await {
 				Ok(()) => TransitStatus::Ok,
 				Err(error) => error.failure_status(),
-			}
+			};
+			Ok(status)
 		}
 	}
 }

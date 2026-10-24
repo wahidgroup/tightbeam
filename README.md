@@ -541,6 +541,8 @@ enum { anonymous(0), rsa(1), dsa(2), ecdsa(3), (255) }
 - Multi-byte integers use network byte order (big-endian).
 - Textual content uses UTF-8. Binary fields use raw octets.
 - Absent optional fields MUST NOT be encoded.
+- Decoders MUST refuse a `SET OF` under its universal tag whose elements are not in ascending DER order ([ITU-T X.690][itu-x690] § 11.6).
+- Decoders MUST refuse a `Frame` or a `Metadata` that repeats a context-tagged field or carries one out of schema order ([ITU-T X.690][itu-x690] § 8.9.2).
 
 ### 5.6 Version-Specific Constraints
 
@@ -3088,7 +3090,7 @@ let hive_conf = HiveConfig {
 };
 ```
 
-When `hive_tls` is set, the hive control server binds with TLS and outbound control frames (registration, scaling updates) are signed with the hive key. Cluster gateways reject control frames they cannot verify against `hive_trust`, so hives participating in a cluster require a signing identity.
+When `hive_tls` is set, the hive control server binds with TLS, and the hive signs its outbound control frames (registration, scaling updates) with the hive key. Cluster gateways reject control frames they cannot verify against `hive_trust`, so a hive in a cluster requires a signing identity. When `trust_store` is set too, the control server demands a client certificate that the store validates, because the hive authenticates each cluster command against the peer its handshake proves. The `validators` add checks to that store.
 
 ##### HiveConfig Reference
 
@@ -3686,7 +3688,7 @@ urn:tightbeam:event:<domain>/<event-name>
 
 Domains include `core`, `gate`, `transport`, `connection`, `assert`, `mux`, `pool`, `session`, `hive`, and `cluster`. The `process` and `fdr` domains need the `testing-csp` and `testing-fdr` features. `tightbeam::instrumentation::events` lists every event.
 
-Internal events (`handler`, `crypto`, `route`, and similar) fire only when `enable_internal_detail` is set. Accept and refuse events always fire.
+`enable_internal_detail` is reserved for internal events (`handler`, `crypto`, `route`, and similar), which the crate does not emit. Accept and refuse events always fire.
 
 > Note: `TightbeamUrnSpec` (`urn:tightbeam:instrumentation:<resource_type>/<resource_id>`) is a separate helper for application/test labeling. Production control-plane events use the `event:<domain>/<name>` inventory above. See [§11.1.1](#1111-urns).
 
@@ -5349,9 +5351,9 @@ tightbeam integrates [AFL.rs](https://github.com/rust-fuzz/afl.rs), a Rust port 
 ```rust,ignore
 tb_scenario! {
 	fuzz: afl,                        // ← AFL fuzzing mode
+	csp: MyProcess,                   // ← the one process: the oracle reads the input through it, and the trace is verified against it
 	config: ScenarioConfig::builder()
 		.with_spec(MySpec::latest())
-		.with_csp(MyProcess)          // ← oracle for valid state navigation
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
@@ -5360,7 +5362,7 @@ tb_scenario! {
 			match oracle.fuzz_from_bytes() {
 				Ok(()) => {
 					for event in oracle.trace() {
-						trace.event(event.0)?;
+						trace.collector().event(event)?;
 					}
 					Ok(())
 				}
@@ -5426,7 +5428,6 @@ tb_scenario! {
 	csp: SimpleFuzzProc,
 	config: ScenarioConfig::builder()
 		.with_spec(SimpleFuzzSpec::latest())
-		.with_csp(SimpleFuzzProc)
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
@@ -5436,7 +5437,7 @@ tb_scenario! {
 
 			// Make assertions based on execution trace
 			for event in oracle.trace() {
-				trace.event(event)?;
+				trace.collector().event(event)?;
 			}
 
 			Ok::<(), tightbeam::TightBeamError>(())

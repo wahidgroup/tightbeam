@@ -15,8 +15,8 @@ tb_assert_spec! {
 			(events::CLUSTER_PEER_ADVERTISED, exactly!(1))
 		]
 	},
-	// Version 1.1.0 adds the status the peer receives to the contract, so
-	// accepting scenarios prove the peer saw Ok as well as the install event.
+	// Version 1.1.0 adds the status the peer receives to the contract, so a
+	// scenario that accepts proves the peer saw Ok and the install event.
 	V(1,1,0): {
 		mode: Accept,
 		assertions: [
@@ -60,7 +60,8 @@ tb_assert_spec! {
 	}
 }
 
-// A claimed dial outside the optional allowlist is refused before install.
+// The gateway refuses a claimed dial outside the optional allowlist before it
+// installs a route.
 tb_scenario! {
 	name: cluster_refuses_peer_dial_outside_allowlist,
 	spec: ClusterPeerRefusedSpec,
@@ -192,7 +193,7 @@ tb_scenario! {
 	}
 }
 
-/// Receiver identity plus a second, independently trusted peer signer.
+/// The receiver identity plus a second, independently trusted peer signer.
 struct PeerPairCerts {
 	gateway: GatewayCerts,
 	peer_b: (Certificate, Secp256k1SigningKey),
@@ -212,7 +213,7 @@ fn peer_pair_certs() -> PeerPairCerts {
 	PeerPairCerts { gateway, peer_b: (cert_b, key_b), peer_trust }
 }
 
-/// Receiver conf that anchors both pair identities in `peer_trust`.
+/// The receiver conf that anchors both pair identities in `peer_trust`.
 fn peering_pair_conf(certs: &PeerPairCerts) -> ClusterConfig {
 	let tls = cluster_tls_config(&certs.gateway).with_peer_trust(Arc::clone(&certs.peer_trust));
 	ClusterConfig::new(tls)
@@ -291,8 +292,31 @@ tb_scenario! {
 	}
 }
 
+// Each scenario draws its own gateway identity, so a gateway answers an
+// advertisement signed under the key of another scenario as one from an
+// unknown signer, and installs no route.
+tb_scenario! {
+	name: cluster_refuses_the_identity_of_another_scenario,
+	spec: ClusterPeerRefusedSpec,
+	environment Cluster {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| async move {
+			start_cluster(&trace, peering_cluster_conf(&certs)).await
+		},
+		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+			let other_scenario = cluster_certs();
+			let ping = vec![servlet_urn("ping")];
+			advertise_peer_signed(&trace, &certs, &other_scenario.key, &cluster, PEER_GATEWAY_ADDR, ping).await?;
+
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
 // Nestmate recognition: an advertised type from a foreign namespace fails the
-// structural CHC half and is refused even under a valid peer certificate.
+// structural CHC half, and the gateway refuses it even under a valid peer
+// certificate.
 tb_scenario! {
 	name: cluster_refuses_foreign_realm_advertisement,
 	spec: ClusterPeerRefusedSpec,
@@ -327,9 +351,9 @@ tb_assert_spec! {
 	}
 }
 
-// Retry ordering: the conflicted advertisement is refused before the
-// byte-identical resend installs. Counting alone cannot prove the
-// refusal preceded the install.
+// Retry ordering: the gateway refuses the conflicted advertisement before the
+// byte-identical resend installs. A count alone cannot prove that the refusal
+// preceded the install.
 tb_process_spec! {
 	pub ClusterAdRetryProcess,
 	events {
@@ -368,7 +392,7 @@ tb_scenario! {
 		client: |ClusterEnv { trace, context: certs, cluster }| async move {
 			let hive_addr = b"127.0.0.1:65031".as_slice();
 			let locator = String::from_utf8_lossy(PEER_GATEWAY_ADDR);
-			let hive_id = hive_plane_certs();
+			let hive_id = hive_plane_certs(&certs);
 			let mut client = connect_cluster(&certs, cluster.addr()).await?;
 
 			register_signed_hive(&mut client, &hive_id.key, b"reg-conflict", hive_addr).await?;
@@ -376,7 +400,7 @@ tb_scenario! {
 				&mut client,
 				&hive_id.key,
 				b"add-conflict",
-				servlet_address_update(hive_addr, vec![servlet_info("ping", PEER_GATEWAY_ADDR)], vec![]),
+				servlet_address_update(hive_addr, vec![servlet_info(&certs, "ping", PEER_GATEWAY_ADDR)], vec![]),
 			)
 			.await?;
 
@@ -479,7 +503,7 @@ tb_scenario! {
 
 			hive.register_with_cluster(advertiser.addr()).await?;
 
-			let learned = wait_for_peer_types(&receiver, 50, Duration::from_millis(100)).await;
+			let learned = wait_for_peer_types(&trace, &receiver, 50, Duration::from_millis(100)).await;
 			trace.event_with(PEER_ROUTES_AFTER_INSTALLS, &[], learned.len() as u64)?;
 
 			trace.event(WORK_SENT)?;
@@ -514,7 +538,7 @@ tb_scenario! {
 
 			hive.register_with_cluster(advertiser.addr()).await?;
 
-			let learned = wait_for_peer_types(&receiver, 50, Duration::from_millis(100)).await;
+			let learned = wait_for_peer_types(&trace, &receiver, 50, Duration::from_millis(100)).await;
 			trace.event_with(PEER_ROUTES_AFTER_INSTALLS, &[], learned.len() as u64)?;
 
 			trace.event(WORK_SENT)?;
@@ -548,8 +572,8 @@ tb_assert_spec! {
 	}
 }
 
-// A claimed `gateway_addr` that matches a local servlet address is refused,
-// and the refusal gates routing state only:
+// The gateway refuses a claimed `gateway_addr` that matches a local servlet
+// address, and the refusal gates routing state only:
 // - The admitted identity still lands in the discovery new table, where the probe gate decides its fate.
 // - A slate refusal therefore leaves graph connectivity intact.
 tb_scenario! {
@@ -557,7 +581,7 @@ tb_scenario! {
 	spec: ClusterPeerCollideSpec,
 	environment Hive {
 		context: cluster_certs(),
-		start: |SetupEnv { trace, context: _ }| start_ping_hive(trace, hive_plane_certs(), None),
+		start: |SetupEnv { trace, context: certs }| start_ping_hive(trace, hive_plane_certs(&certs), None),
 		client: |HiveEnv { trace, context: certs, hive }| async move {
 			let mut conf = peering_cluster_conf(&certs);
 			conf.tls.hive_trust = Some(split_hive_trust(&certs));
@@ -574,13 +598,13 @@ tb_scenario! {
 				.to_string()
 				.into_bytes();
 
-			let hive_id = hive_plane_certs();
+			let hive_id = hive_plane_certs(&certs);
 			let mut client = connect_cluster(&certs, cluster.addr()).await?;
 			emit_servlet_update(
 				&mut client,
 				&hive_id.key,
 				b"collide-local",
-				servlet_address_update(&hive_addr, vec![servlet_info("ping", PEER_GATEWAY_ADDR)], vec![]),
+				servlet_address_update(&hive_addr, vec![servlet_info(&certs, "ping", PEER_GATEWAY_ADDR)], vec![]),
 			)
 			.await?;
 
@@ -613,8 +637,8 @@ tb_assert_spec! {
 }
 
 // Abandonment ordering: unavailability must follow exactly
-// CONTAINMENT_ABANDON_LIMIT failed forwards on the installed route.
-// Counting cannot prove the trail failed before selection dropped it.
+// CONTAINMENT_ABANDON_LIMIT failed forwards on the installed route. A count
+// cannot prove that the trail failed before selection dropped it.
 tb_process_spec! {
 	pub ClusterContainmentProcess,
 	events {
@@ -664,9 +688,9 @@ tb_scenario! {
 				work_refusal_status(refused_work)?;
 			}
 
-			// Once the trail is abandoned, selection drops it, so the
-			// peer-only type is Unavailable and no further forward is
-			// attempted.
+			// Once the trail reaches abandonment, selection drops it, so the
+			// peer-only type is Unavailable and the gateway attempts no
+			// further forward.
 			trace.event(WORK_SENT)?;
 			let refused_work = emit_ping_work(&mut client, &certs.key, b"gone").await;
 			work_refusal_status(refused_work)?;
@@ -694,7 +718,7 @@ tb_assert_spec! {
 
 // Healing ordering: the local hive joins only after the dead trail has
 // absorbed its full failure budget, and the successful route follows the
-// join. Counting cannot prove work failed before the colony healed.
+// join. A count cannot prove that work failed before the colony healed.
 tb_process_spec! {
 	pub ClusterIsolationProcess,
 	events {
@@ -718,8 +742,8 @@ tb_process_spec! {
 	terminal { Served }
 }
 
-// Containment isolates only the bad nest: after the dead peer trail is
-// abandoned, a local ping hive joins and serves the same type, so work
+// Containment isolates only the bad nest: after the dead peer trail reaches
+// abandonment, a local ping hive joins and serves the same type, so work
 // keeps flowing on-colony while the peer stays dropped.
 tb_scenario! {
 	name: cluster_isolates_abandoned_peer_and_serves_local,
@@ -729,7 +753,7 @@ tb_scenario! {
 		.build(),
 	environment Hive {
 		context: cluster_certs(),
-		start: |SetupEnv { trace, context: _ }| start_ping_hive(trace, hive_plane_certs(), None),
+		start: |SetupEnv { trace, context: certs }| start_ping_hive(trace, hive_plane_certs(&certs), None),
 		client: |HiveEnv { trace, context: certs, hive }| async move {
 			let mut conf = containment_cluster_conf(&certs);
 			conf.tls.hive_trust = Some(split_hive_trust(&certs));
@@ -750,7 +774,7 @@ tb_scenario! {
 			}
 
 			// Heal the colony: a local ping hive joins after the bad nest
-			// is abandoned, which leaves one live route for the type.
+			// reaches abandonment, which leaves one live route for the type.
 			hive.register_with_cluster(importer.addr()).await?;
 
 			trace.event(WORK_SENT)?;
@@ -788,7 +812,7 @@ tb_scenario! {
 	spec: ClusterPeerLocalitySpec,
 	environment Hive {
 		context: cluster_certs(),
-		start: |SetupEnv { trace, context: _ }| start_ping_hive(trace, hive_plane_certs(), None),
+		start: |SetupEnv { trace, context: certs }| start_ping_hive(trace, hive_plane_certs(&certs), None),
 		client: |HiveEnv { trace, context: certs, hive }| async move {
 			let mut local_conf = peering_cluster_conf(&certs);
 			local_conf.tls.hive_trust = Some(split_hive_trust(&certs));
@@ -813,7 +837,7 @@ tb_scenario! {
 			let peer_hive = start_ping_hive(trace.share(), Arc::clone(&certs), None).await?;
 			peer_hive.register_with_cluster(peer_gateway.addr()).await?;
 
-			let learned = wait_for_peer_types(&local_gateway, 50, Duration::from_millis(100)).await;
+			let learned = wait_for_peer_types(&trace, &local_gateway, 50, Duration::from_millis(100)).await;
 			trace.event_with(PEER_ROUTES_AFTER_INSTALLS, &[], learned.len() as u64)?;
 
 			for i in 0..24u8 {
@@ -901,7 +925,7 @@ tb_scenario! {
 
 			hive.register_with_cluster(advertiser.addr()).await?;
 
-			let learned = wait_for_peer_types(&receiver, 50, Duration::from_millis(100)).await;
+			let learned = wait_for_peer_types(&trace, &receiver, 50, Duration::from_millis(100)).await;
 			trace.event_with(PEER_ROUTES_AFTER_INSTALLS, &[], learned.len() as u64)?;
 
 			let ping_canonical = servlet_urn("ping").type_canonical_bytes();
@@ -953,11 +977,11 @@ tb_scenario! {
 				&mut client,
 				&certs.key,
 				b"add-beat-echo",
-				servlet_address_update(hive_addr, vec![servlet_info("echo", b"127.0.0.1:65042")], vec![]),
+				servlet_address_update(hive_addr, vec![servlet_info(&certs, "echo", b"127.0.0.1:65042")], vec![]),
 			)
 			.await?;
 
-			let learned = wait_for_peer_types(&receiver, 50, Duration::from_millis(100)).await;
+			let learned = wait_for_peer_types(&trace, &receiver, 50, Duration::from_millis(100)).await;
 			trace.event_with(PEER_ROUTES_AFTER_INSTALLS, &[], learned.len() as u64)?;
 
 			advertiser.stop();
@@ -1002,7 +1026,7 @@ tb_scenario! {
 			let over_cap: Vec<ServletInfo> = (0..=MAX_ADVERTISED_TYPES)
 				.map(|i| {
 					let addr = format!("127.0.0.1:{}", 20000 + i);
-					servlet_info(format!("t{i}"), addr.as_bytes())
+					servlet_info(&certs, format!("t{i}"), addr.as_bytes())
 				})
 				.collect();
 			emit_servlet_update(
@@ -1013,7 +1037,7 @@ tb_scenario! {
 			)
 			.await?;
 
-			let learned = wait_for_peer_types(&receiver, 50, Duration::from_millis(100)).await;
+			let learned = wait_for_peer_types(&trace, &receiver, 50, Duration::from_millis(100)).await;
 			trace.event_with(PEER_ROUTES_AFTER_INSTALLS, &[], learned.len() as u64)?;
 
 			advertiser.stop();
@@ -1053,7 +1077,7 @@ fn share_certs(certs: &ClusterTestCerts) -> Arc<ClusterTestCerts> {
 	})
 }
 
-/// Receiver with its own identity: `peer_trust` anchors the exporter's
+/// A receiver with its own identity: `peer_trust` anchors the exporter's
 /// certificate so its signed advertisements verify.
 fn receiving_peer_conf(certs: &SplitPlaneCerts) -> ClusterConfig {
 	ClusterConfig::new(
@@ -1067,7 +1091,7 @@ fn receiving_peer_conf(certs: &SplitPlaneCerts) -> ClusterConfig {
 	)
 }
 
-/// Advertiser whose hive plane cannot validate the receiver: only
+/// An advertiser whose hive plane cannot validate the receiver: only
 /// `peer_trust` anchors the receiver's identity.
 fn cross_plane_advertising_conf(certs: &SplitPlaneCerts, peer: impl Into<String>) -> ClusterConfig {
 	let peer: String = peer.into();
@@ -1108,7 +1132,7 @@ tb_scenario! {
 
 			hive.register_with_cluster(advertiser.addr()).await?;
 
-			let learned = wait_for_peer_types(&receiver, 50, Duration::from_millis(100)).await;
+			let learned = wait_for_peer_types(&trace, &receiver, 50, Duration::from_millis(100)).await;
 			trace.event_with(PEER_ROUTES_AFTER_INSTALLS, &[], learned.len() as u64)?;
 
 			advertiser.stop();
@@ -1127,8 +1151,8 @@ tb_assert_spec! {
 			(WILDCARD_START_REFUSED, exactly!(1), equals!(true))
 		]
 	},
-	// Version 1.1.0 adds the port to the contract, so a refused start is
-	// proven to leave no accept loop holding the socket it bound.
+	// Version 1.1.0 adds the port to the contract, so the scenario proves that
+	// a refused start leaves no accept loop on the socket it bound.
 	V(1,1,0): {
 		mode: Accept,
 		assertions: [
@@ -1247,10 +1271,10 @@ tb_scenario! {
 
 			let mut client = connect_cluster(&certs, &loopback_of(&advertiser)).await?;
 			let hive_addr = b"127.0.0.1:65212";
-			let servlets = vec![servlet_info("ping", hive_addr)];
+			let servlets = vec![servlet_info(&certs, "ping", hive_addr)];
 			register_signed_hive_serving(&mut client, &certs.key, b"reg-wildcard", hive_addr, servlets).await?;
 
-			let learned = wait_for_peer_types(&receiver, 50, Duration::from_millis(100)).await;
+			let learned = wait_for_peer_types(&trace, &receiver, 50, Duration::from_millis(100)).await;
 			let routes = receiver.peer_routes()?;
 			let learned_any = !learned.is_empty();
 			let all_dial_advertised = routes.iter().all(|route| route.dial_addr.as_ref() == ADVERTISED_GATEWAY_ADDR);

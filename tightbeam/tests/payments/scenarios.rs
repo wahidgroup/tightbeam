@@ -1,7 +1,7 @@
-//! Payment Gateway Test Scenario
+//! The payment gateway test scenario.
 //!
-//! One comprehensive scenario exercises TightBeam's full feature set
-//! through the Cluster environment with bio-inspired ACO/ABC routing.
+//! One scenario sends a signed, hashed, and encrypted payment authorization
+//! through a cluster, a hive, and a servlet with bio-inspired ACO/ABC routing.
 
 #![cfg(all(
 	feature = "std",
@@ -50,6 +50,7 @@ use tightbeam::{
 	TightBeamError, Version,
 };
 
+use crate::common::hive::scenario_hive_config;
 use crate::common::x509::create_test_cert_with_key;
 
 use super::cluster::PaymentGatewayCluster;
@@ -64,7 +65,7 @@ pub(crate) const WORK_STATUS: Urn<'static> = tightbeam::urn!("test", "event:scen
 /// Client-observed approval decoded from inside the servlet's response frame.
 pub(crate) const CLIENT_AUTH_APPROVED: Urn<'static> = tightbeam::urn!("test", "event:scenarios/client-auth-approved");
 
-/// Type URN the payment scenario registers and targets.
+/// The type URN that the payment scenario registers and targets.
 fn authorization_urn() -> Urn<'static> {
 	ColonyNamespace::default()
 		.servlet("authorization")
@@ -125,7 +126,7 @@ fn hive_tls_config(certs: &TestCerts) -> HiveConfig {
 	HiveConfig {
 		hive_tls: Some(hive_tls),
 		trust_store: Some(Arc::clone(&certs.cluster_trust)),
-		..Default::default()
+		..scenario_hive_config()
 	}
 }
 
@@ -139,7 +140,8 @@ fn servlet_tls_config(
 				Arc::new(Secp256k1KeyProvider::from(certs.hive_key.to_owned())),
 				vec![],
 			)?
-			// Match cluster/hive mux offers so work forwards negotiate mux.
+			// The servlet offers mux as the cluster and the hive do, so work
+			// forwards negotiate mux.
 			.with_mux_offer(Some(TransportOffer::mux(8)))
 			.with_message_decryptor(shared_payment_cipher())
 			.with_config(Arc::new(()))
@@ -147,7 +149,7 @@ fn servlet_tls_config(
 	)
 }
 
-/// Shared key-encryption key for the client-to-servlet confidential body.
+/// The shared key-encryption key of the client-to-servlet confidential body.
 ///
 /// `CreditTransferTransaction` declares `confidential`, so the client
 /// frame carries an encrypted message and the servlet decrypts it before
@@ -203,8 +205,9 @@ tb_scenario! {
 	environment Bare {
 		context: TestCerts::generate(),
 		exec: |SetupEnv { trace, context: certs }| async move {
-			// One shared collector so cluster instrument events and servlet
-			// outcomes land on the scenario spec (colony registration style).
+			// The cluster, the hive, and the servlet share one collector, so
+			// cluster instrument events and servlet outcomes land on the
+			// scenario spec, as in the colony registration tests.
 			let mut cluster_conf = ClusterConfig::new(cluster_tls_config(&certs));
 			cluster_conf.pool_config.mux_offer = Some(Arc::new(TransportOffer::mux(8)));
 
@@ -241,9 +244,9 @@ tb_scenario! {
 
 			// One call on the public client surface wraps the work frame
 			// in the hop-local transport envelope and resolves the reply
-			// to the servlet's response frame. `served` admits only an
-			// `Ok` gateway status, so reaching the next line pins the
-			// wire status the spec asserts.
+			// to the servlet's response frame. `ClusterWorkResponse::served`
+			// admits only an `Ok` gateway status, so reaching the next line
+			// pins the wire status the spec asserts.
 			let mut client = builder.connect(cluster_addr.to_owned()).await?;
 			let servlet_frame = client.submit_work_to(authorization_urn(), &inner).await?;
 			trace.event_with(WORK_STATUS, &[], TransitStatus::Ok)?;

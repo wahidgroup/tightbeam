@@ -77,8 +77,8 @@ where
 	/// the wire.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pending_ack: Option<(TransportEnvelope, Box<SendCipher>)>,
-	/// The instant the in-flight renewal was first observed, which starts the
-	/// deadline that bounds a stalled exchange.
+	/// The instant the driver first observed the in-flight renewal, which
+	/// starts the deadline that bounds a stalled exchange.
 	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
 	renewal_started: Option<MonotonicInstant>,
 	/// Time budget for one renewal exchange before the connection drains. The
@@ -204,9 +204,9 @@ where
 			let budget = deadline.saturating_duration_since(clock.monotonic());
 			let mut expiry = clock.sleep(budget);
 
-			// The queued work is polled first, as a timeout does, so a command
-			// that is already ready wins over a deadline reached in the same
-			// instant.
+			// The queued work takes the first poll, as in a timeout, so a
+			// command that is already ready wins over a deadline reached in the
+			// same instant.
 			return poll_fn(|cx| {
 				if let Poll::Ready(step) = self.poll_step(cx) {
 					return Poll::Ready(step);
@@ -244,7 +244,7 @@ where
 
 	/// Deadline of the in-flight renewal, stamped on first observation from
 	/// the driver's clock and cleared when the exchange concludes. A deadline
-	/// past every reading never arrives, so it is absent.
+	/// past every reading of the clock never arrives, so it is `None`.
 	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
 	fn renewal_deadline(&mut self) -> Option<MonotonicInstant> {
 		if self.exchange.is_none() || self.shared.rekey_phase() == RekeyPhase::Idle {
@@ -301,7 +301,7 @@ where
 		let Some(exchange) = self.exchange.as_ref() else {
 			return Ok(());
 		};
-		let Some(request) = self.shared.open_renewal(exchange) else {
+		let Some(request) = self.shared.open_renewal(exchange)? else {
 			return Ok(());
 		};
 
@@ -318,6 +318,9 @@ where
 		if let Some(package) = self.shared.goaway_package(GoAwayReason::Shutdown) {
 			let envelope = TransportEnvelope::from(package);
 			self.writer.write_envelope(envelope).await?;
+
+			#[cfg(feature = "instrument")]
+			self.shared.emit_goaway_event(events::MUX_GOAWAY_SENT, GoAwayReason::Shutdown)?;
 		}
 
 		self.shared.finish_renewal();
@@ -347,7 +350,7 @@ where
 			if remaining > renewal_floor(drain_floor) {
 				return Ok(());
 			}
-			if let Some(request) = self.shared.open_renewal(exchange) {
+			if let Some(request) = self.shared.open_renewal(exchange)? {
 				return self.writer.write_envelope(request).await;
 			}
 			if remaining > drain_floor {
@@ -367,6 +370,9 @@ where
 		if let Some(package) = self.shared.goaway_package(GoAwayReason::Shutdown) {
 			let envelope = TransportEnvelope::from(package);
 			self.writer.write_envelope(envelope).await?;
+
+			#[cfg(feature = "instrument")]
+			self.shared.emit_goaway_event(events::MUX_GOAWAY_SENT, GoAwayReason::Shutdown)?;
 		}
 
 		Ok(())
@@ -376,35 +382,42 @@ where
 impl MuxShared {
 	/// Halt the allocator and build the GoAway, once per connection.
 	///
-	/// Returns `None` when shutdown already began.
+	/// Returns `None` when shutdown already began. The caller records
+	/// `MUX_GOAWAY_SENT` once it queued or wrote the package, so a fault the
+	/// trace injects at the record leaves the GoAway on its way.
 	pub(crate) fn goaway_package(&self, reason: GoAwayReason) -> Option<GoAwayPackage> {
 		let last_peer = self.begin_shutdown()?;
-
-		#[cfg(feature = "instrument")]
-		self.emit_goaway_event(events::MUX_GOAWAY_SENT, reason);
 
 		Some(GoAwayPackage::new(last_peer, reason))
 	}
 
 	/// Open a renewal exactly once and return its `RekeyRequest` envelope.
 	///
-	/// The readiness check and the phase transition happen while the exchange
-	/// is held, so concurrent triggers collapse to a single `RekeyRequest`. A
-	/// contended exchange means a renewal is already in progress, so opening
-	/// is moot and the call returns `None`.
+	/// The readiness check and the phase transition happen while this call
+	/// holds the exchange, so concurrent triggers collapse to a single
+	/// `RekeyRequest`. A contended exchange means a renewal is already in
+	/// progress, so opening is moot and the call returns `None`.
+	///
+	/// # Errors
+	///
+	/// - The injected error, when the runtime fault model injects a fault at the event of the request.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub(crate) fn open_renewal(
 		&self,
 		exchange: &FuturesMutex<Box<dyn ClientRekeyExchange>>,
-	) -> Option<TransportEnvelope> {
-		let mut guard = exchange.try_lock()?;
-		let request = self.enter_renewal(|| guard.start_renewal().ok())?;
+	) -> TransportResult<Option<TransportEnvelope>> {
+		let Some(mut guard) = exchange.try_lock() else {
+			return Ok(None);
+		};
+		let Some(request) = self.enter_renewal(|| guard.start_renewal().ok()) else {
+			return Ok(None);
+		};
 
 		#[cfg(feature = "instrument")]
-		self.emit_event(events::MUX_REKEY_REQUESTED);
+		self.emit_event(events::MUX_REKEY_REQUESTED)?;
 
 		let envelope = TransportEnvelope::from(request);
-		Some(envelope)
+		Ok(Some(envelope))
 	}
 }
 

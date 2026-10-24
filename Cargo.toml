@@ -37,9 +37,15 @@ cargo-afl = "0.18.2"
 unused_imports = "deny"
 
 [workspace.lints.clippy]
-# Zero-copy: Arc/Rc refcount bumps must be written as `Arc::clone(&x)` so they
-# disambiguated from deep copies.
+# Zero-copy: an Arc or Rc refcount bump must read `Arc::clone(&x)`, so a
+# reader can tell it from a deep copy.
 clone_on_ref_ptr = "deny"
+# Zero-panic: these lints deny an index or an integer operation that can
+# panic in production code. Test code is exempt: `lib.rs` allows both under
+# `cfg(test)`, `testing/mod.rs` allows both for the fixture surface, and a test
+# or fuzz target that indexes allows both at its root.
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
 
 [workspace.dependencies]
 tightbeam-derive = { version = "=0.1.7", path = "tightbeam-derive" }
@@ -56,8 +62,8 @@ pkcs12 = { version = "=0.1.0", default-features = false }
 hkdf = { version = "=0.12.4", default-features = false }
 x509-cert = { version = "=0.2.5", default-features = false, features = [
 	"pem",
-	# `Profile::Manual`, so `cert!` writes the key identifiers of RFC 7093 §2
-	# method 1 in place of the builder's SHA-1 ones.
+	# The `hazmat` feature opens `Profile::Manual`, so `cert!` writes the key
+	# identifiers of RFC 7093 §2 method 1 in place of the builder's SHA-1 ones.
 	"hazmat",
 ] }
 hex-literal = { version = "=1.1.0", default-features = false }

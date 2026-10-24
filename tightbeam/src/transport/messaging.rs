@@ -13,6 +13,7 @@ use std::sync::Arc;
 use core::future::Future;
 
 use crate::asn1::Frame;
+use crate::error::TightBeamError;
 use crate::policy::{GatePolicy, SessionContext, TransitStatus};
 use crate::transport::envelopes::TransportEnvelope;
 use crate::transport::error::{TransportError, TransportFailure};
@@ -74,7 +75,16 @@ pub(crate) trait GateInbound: GateAudit {
 	/// - A gate that returns [`TransitStatus::Unknown`] signals a local bug, so
 	///   [`TransitStatus::normalized_verdict`] maps it to
 	///   [`TransitStatus::Internal`] and the peer sees a server fault.
-	fn gate_inbound<G>(&self, gate: &G, frame: Option<&Frame>, session: &SessionContext) -> TransitStatus
+	///
+	/// # Errors
+	///
+	/// - The injected error, when the runtime fault model injects a fault at the event of the verdict.
+	fn gate_inbound<G>(
+		&self,
+		gate: &G,
+		frame: Option<&Frame>,
+		session: &SessionContext,
+	) -> Result<TransitStatus, TightBeamError>
 	where
 		G: GatePolicy + ?Sized,
 	{
@@ -92,10 +102,10 @@ pub(crate) trait GateInbound: GateAudit {
 			// peer's key names who, so one peer leaves one audit identity in
 			// either SEC 1 form of its key.
 			let peer = session.peer_key().map(CanonicalKey::as_der);
-			trace.emit_event_with_evidence(event, status.as_str(), peer);
+			trace.emit_event_with_evidence(event, status.as_str(), peer)?;
 		}
 
-		status
+		Ok(status)
 	}
 }
 
@@ -232,7 +242,7 @@ async fn emit_with_retry<T: MessageEmitter + MaybeSend + ?Sized>(
 				emitter.clock().sleep(delay).await;
 
 				letter.try_return_to_sender(*frame)?;
-				current_attempt += 1;
+				current_attempt = current_attempt.saturating_add(1);
 				continue;
 			}
 		};
@@ -259,7 +269,7 @@ async fn emit_with_retry<T: MessageEmitter + MaybeSend + ?Sized>(
 				let (frame, delay) = evaluate_retry(emitter.to_restart_policy_ref(), error, current_attempt)?;
 				emitter.clock().sleep(delay).await;
 				letter.try_return_to_sender(*frame)?;
-				current_attempt += 1;
+				current_attempt = current_attempt.saturating_add(1);
 			}
 			Ok(_) => {
 				return Ok(response);
@@ -315,7 +325,7 @@ pub trait MessageCollector: CollectorRequirements {
 		async move {
 			let decoded_envelope = match self.try_read_decoded_envelope().await? {
 				Some(envelope) => envelope,
-				None => return Ok(None), // Connection closed gracefully
+				None => return Ok(None), // The connection closed gracefully.
 			};
 
 			// A cleartext connection carries no peer identity, so it gets the
@@ -368,7 +378,7 @@ where
 	T: MessageCollector + ?Sized,
 {
 	let request = envelope.into_request_frame()?;
-	let status = transport.gate_inbound(transport.collector_gate(), Some(request.as_ref()), session);
+	let status = transport.gate_inbound(transport.collector_gate(), Some(request.as_ref()), session)?;
 	Ok((request, status))
 }
 
@@ -388,6 +398,9 @@ mod tests {
 	use crate::utils::marker::MaybeSendFuture;
 	use crate::utils::time::{Clock, MonotonicInstant, UnixMillis};
 	use crate::TightBeamError;
+
+	#[cfg(feature = "testing-fault")]
+	use crate::testing::fdr::FaultModel;
 
 	struct DenyGate;
 
@@ -494,7 +507,7 @@ mod tests {
 		let audit = AuditProbe(TraceCollector::new());
 		let frame = TestFrame::v0(Some("gated"), None);
 
-		let status = audit.gate_inbound(&DenyGate, Some(&frame), &SessionContext::default());
+		let status = audit.gate_inbound(&DenyGate, Some(&frame), &SessionContext::default())?;
 		assert_eq!(status, TransitStatus::PermissionDenied);
 
 		let recorded = audit.0.drain_events();
@@ -505,6 +518,20 @@ mod tests {
 		assert_eq!(reject.label.as_deref(), Some("PermissionDenied"));
 		assert!(reject.timestamp_ns.is_some());
 		Ok(())
+	}
+
+	/// A fault the trace injects at the event of a verdict fails the gate, so
+	/// the collector that gates the request fails with it.
+	#[cfg(feature = "testing-fault")]
+	#[test]
+	fn a_fault_at_the_verdict_fails_the_gate() {
+		let fault = || TightBeamError::ChannelClosed;
+		let model = FaultModel::default().with_event_fault(events::GATE_REJECT, fault, crate::bps!(10000));
+		let audit = AuditProbe(TraceCollector::new().with_fault_model(model));
+		let frame = TestFrame::v0(Some("gated"), None);
+
+		let refused = audit.gate_inbound(&DenyGate, Some(&frame), &SessionContext::default());
+		assert!(matches!(refused, Err(TightBeamError::ChannelClosed)));
 	}
 
 	/// The evidence a gate verdict records of its peer, read from a session
@@ -523,7 +550,8 @@ mod tests {
 		fn rejection_evidence(session: &SessionContext) -> Option<[u8; 32]> {
 			let config = TbInstrumentationConfig { enable_payloads: true, ..TbInstrumentationConfig::default() };
 			let audit = AuditProbe(TraceCollector::from(TraceConfig::with_instrumentation(config)));
-			audit.gate_inbound(&DenyGate, None, session);
+			let verdict = audit.gate_inbound(&DenyGate, None, session);
+			assert!(verdict.is_ok(), "a collector with no fault model records the verdict");
 
 			let recorded = audit.0.drain_events();
 			let reject = recorded.iter().find(|event| event.urn == events::GATE_REJECT);

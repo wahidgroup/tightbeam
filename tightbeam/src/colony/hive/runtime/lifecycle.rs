@@ -134,7 +134,7 @@ impl<P: Protocol> HiveRuntime<P> {
 		}
 	}
 
-	/// The control plane's one admission gate, trusting `store` and reading
+	/// The control plane's one admission gate, which trusts `store` and reads
 	/// the hive clock.
 	fn security_gate(&self, store: &Arc<dyn CertificateTrust>) -> ClusterSecurityGate {
 		let control = &self.config.control;
@@ -178,12 +178,11 @@ where
 	/// travel cleartext, and a hive with no identity signs no registration,
 	/// so no cluster can learn this address to dial it.
 	async fn bind_control_listener(config: &HiveConfig) -> Result<Option<(P::Listener, P::Address)>, TightBeamError> {
-		let Some(hive_tls) = config.hive_tls.as_ref() else {
+		let Some(encryption_config) = config.control_encryption() else {
 			return Ok(None);
 		};
 
 		let bind_addr = P::default_bind_address()?;
-		let encryption_config = hive_tls.accept_encryption();
 		Ok(Some(P::bind_with(bind_addr, encryption_config).await?))
 	}
 }

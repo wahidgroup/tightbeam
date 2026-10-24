@@ -120,7 +120,7 @@ impl From<TbInstrumentationConfig> for TraceConfig {
 
 /// A builder that constructs and emits one trace event.
 ///
-/// Timing and payload information chain on optionally.
+/// The timing and the payload are optional calls that chain onto the builder.
 ///
 /// # Examples
 ///
@@ -503,8 +503,7 @@ impl TraceState {
 	}
 
 	#[cfg(feature = "testing-fuzz")]
-	fn with_oracle(input: impl Into<Vec<u8>>, process: crate::testing::specs::csp::Process) -> Self {
-		let input: Vec<u8> = input.into();
+	fn with_oracle(oracle: crate::testing::fuzz::FuzzContext) -> Self {
 		Self {
 			// The testing-fuzz feature implies testing, so the field exists
 			// here.
@@ -517,7 +516,7 @@ impl TraceState {
 			seq: Mutex::new(0),
 			#[cfg(feature = "instrument")]
 			clock: TraceClock::default(),
-			oracle: Some(crate::testing::fuzz::FuzzContext::new(input, process)),
+			oracle: Some(oracle),
 			#[cfg(feature = "testing-fault")]
 			runtime_faults: OnceLock::new(),
 			#[cfg(feature = "logging")]
@@ -565,26 +564,11 @@ impl TraceCollector {
 		self
 	}
 
-	/// Creates a trace collector with a fuzz oracle for CSP-guided fuzzing.
+	/// Creates a trace collector that steps `oracle` live as each event is
+	/// recorded.
 	#[cfg(feature = "testing-fuzz")]
-	pub fn with_fuzz_oracle(input: impl Into<Vec<u8>>, process: crate::testing::specs::csp::Process) -> Self {
-		let input: Vec<u8> = input.into();
-		Self { state: Arc::new(TraceState::with_oracle(input, process)) }
-	}
-
-	/// Returns the fuzz oracle, when this collector was built with one.
-	///
-	/// - [`TraceCollector::with_fuzz_oracle`] is the one constructor that installs an oracle.
-	/// - [`TraceCollector::share`] carries it, so each handle a scenario gets answers as its collector does.
-	/// - Every other collector returns [`None`].
-	///
-	/// A fuzz harness wants the oracle itself rather than an `Option`, and a
-	/// missing one is a construction bug it should abort on, so it calls
-	/// `OracleAccess::oracle` in the test-support surface. This accessor is the
-	/// total answer that the library owes every other caller.
-	#[cfg(feature = "testing-fuzz")]
-	pub fn try_oracle(&self) -> Option<&crate::testing::fuzz::FuzzContext> {
-		self.state.oracle.as_ref()
+	pub(crate) fn with_fuzz_context(oracle: crate::testing::fuzz::FuzzContext) -> Self {
+		Self { state: Arc::new(TraceState::with_oracle(oracle)) }
 	}
 
 	/// Installs `model` as the runtime fault model of the state this
@@ -739,7 +723,7 @@ impl TraceCollector {
 	fn next_seq(&self) -> u32 {
 		if let Ok(mut seq) = self.state.seq.lock() {
 			let current = *seq;
-			*seq += 1;
+			*seq = current.wrapping_add(1);
 			current
 		} else {
 			0
@@ -811,58 +795,101 @@ impl TraceCollector {
 	/// instrument log, and the same URN becomes the assertion label for spec
 	/// assertions and CSP alphabets when the testing layer observes the
 	/// trace.
+	///
+	/// # Errors
+	///
+	/// - The injected error, when the runtime fault model injects a fault at `event`.
+	///
+	/// # Examples
+	///
+	/// ```rust
+	/// # use tightbeam::trace::TraceCollector;
+	/// # const POOL_DIAL: tightbeam::urn::Urn<'static> = tightbeam::urn!("tightbeam", "event:pool/dial");
+	/// let trace = TraceCollector::default();
+	/// trace.emit_event(POOL_DIAL)?;
+	/// # Ok::<(), tightbeam::TightBeamError>(())
+	/// ```
 	#[cfg(feature = "instrument")]
-	pub fn emit_event(&self, event: Urn<'static>) {
+	pub fn emit_event(&self, event: Urn<'static>) -> Result<(), crate::TightBeamError> {
 		#[cfg(feature = "testing")]
-		{
-			if let Ok(builder) = self.event(&event) {
-				builder.emit()
-			}
-		}
+		self.event(&event)?.emit();
 
 		self.record_clock_origin();
 		self.emit_internal(event, None, None, None, self.state.clock.now_ns());
+		Ok(())
 	}
 
 	/// Dual-writes a production control-plane event that carries evidence.
 	/// The label records why, such as the refusing status. The payload
 	/// records who, such as the peer's SPKI DER, as its SHA3-256 hash when
 	/// payload capture is enabled.
+	///
+	/// # Errors
+	///
+	/// - The injected error, when the runtime fault model injects a fault at `event`.
+	///
+	/// # Examples
+	///
+	/// ```rust
+	/// # use tightbeam::trace::TraceCollector;
+	/// # const GATE_REJECT: tightbeam::urn::Urn<'static> = tightbeam::urn!("tightbeam", "event:gate/reject");
+	/// let trace = TraceCollector::default();
+	/// trace.emit_event_with_evidence(GATE_REJECT, "PermissionDenied", Some(b"peer key"))?;
+	/// # Ok::<(), tightbeam::TightBeamError>(())
+	/// ```
 	#[cfg(feature = "instrument")]
-	pub fn emit_event_with_evidence(&self, event: Urn<'static>, label: impl AsRef<str>, payload: Option<&[u8]>) {
+	pub fn emit_event_with_evidence(
+		&self,
+		event: Urn<'static>,
+		label: impl AsRef<str>,
+		payload: Option<&[u8]>,
+	) -> Result<(), crate::TightBeamError> {
 		let label = label.as_ref();
 		#[cfg(feature = "testing")]
-		{
-			if let Ok(builder) = self.event(&event) {
-				builder.emit()
-			}
-		}
+		self.event(&event)?.emit();
 
 		self.record_clock_origin();
 		self.emit_internal(event, Some(label), payload, None, self.state.clock.now_ns());
+		Ok(())
 	}
 
 	/// Dual-writes a production control-plane event that carries a
 	/// spec-assertable value. The label records why, such as the GoAway
 	/// reason name, and the value carries its wire code for `equals!`
 	/// assertions.
+	///
+	/// # Errors
+	///
+	/// - The injected error, when the runtime fault model injects a fault at `event`.
+	///
+	/// # Examples
+	///
+	/// ```rust
+	/// # use tightbeam::trace::TraceCollector;
+	/// # const GOAWAY_SENT: tightbeam::urn::Urn<'static> = tightbeam::urn!("tightbeam", "event:mux/goaway");
+	/// let trace = TraceCollector::default();
+	/// trace.emit_event_with_value(GOAWAY_SENT, "Shutdown", 0u32)?;
+	/// # Ok::<(), tightbeam::TightBeamError>(())
+	/// ```
 	#[cfg(feature = "instrument")]
-	pub fn emit_event_with_value<V>(&self, event: Urn<'static>, label: impl AsRef<str>, value: V)
+	pub fn emit_event_with_value<V>(
+		&self,
+		event: Urn<'static>,
+		label: impl AsRef<str>,
+		value: V,
+	) -> Result<(), crate::TightBeamError>
 	where
 		V: Into<EventValue>,
 	{
 		let label = label.as_ref();
 		#[cfg(feature = "testing")]
-		{
-			if let Ok(builder) = self.event_with(&event, &[], value) {
-				builder.emit()
-			}
-		}
+		self.event_with(&event, &[], value)?.emit();
 		#[cfg(not(feature = "testing"))]
 		let _ = value;
 
 		self.record_clock_origin();
 		self.emit_internal(event, Some(label), None, None, self.state.clock.now_ns());
+		Ok(())
 	}
 
 	#[cfg(feature = "instrument")]
@@ -1108,40 +1135,6 @@ mod tests {
 	const ALPHA: Urn<'static> = crate::urn!("test", "event:collector/alpha");
 	const BETA: Urn<'static> = crate::urn!("test", "event:collector/beta");
 
-	/// A collector built without `csp:` has no oracle, and reading one
-	/// reports that rather than ending the process.
-	#[test]
-	#[cfg(feature = "testing-fuzz")]
-	fn a_collector_without_an_oracle_reports_its_absence() {
-		let collector = super::TraceCollector::default();
-
-		assert!(collector.try_oracle().is_none());
-	}
-
-	/// Every handle a scenario receives answers the way its collector does.
-	/// A `share` that dropped the oracle would disarm every fuzz harness
-	/// silently, because the harness reads the shared handle, not the one
-	/// the macro built.
-	#[test]
-	#[cfg(feature = "testing-fuzz")]
-	fn a_collector_built_with_an_oracle_hands_it_to_every_share(
-	) -> Result<(), crate::testing::specs::csp::ProcessBuildError> {
-		use crate::testing::specs::csp::{Event, Process, State};
-
-		let process = Process::builder("ShareSpec")
-			.initial_state(State("S0"))
-			.add_observable(Event("step"))
-			.add_transition(State("S0"), Event("step"), State("S1"))
-			.add_terminal(State("S1"))
-			.build()?;
-
-		let collector = super::TraceCollector::with_fuzz_oracle(Vec::new(), process);
-
-		assert!(collector.try_oracle().is_some());
-		assert!(collector.share().try_oracle().is_some());
-		Ok(())
-	}
-
 	tb_assert_spec! {
 		pub TraceCollectorSpec,
 		V(1,0,0): {
@@ -1225,6 +1218,37 @@ mod tests {
 			collector.event(ALPHA)?;
 			assert!(matches!(collector.event(BETA), Err(TightBeamError::ChannelClosed)));
 			Ok(())
+		}
+
+		/// A collector that injects every fault at [`ALPHA`].
+		fn faulting_at_alpha() -> TraceCollector {
+			let model = FaultModel::default().with_event_fault(ALPHA, closed, crate::bps!(10000));
+			TraceCollector::new().with_fault_model(model)
+		}
+
+		/// A dual-write emit returns the fault injected at its event, so its
+		/// caller fails.
+		#[cfg(feature = "instrument")]
+		#[test]
+		fn an_emit_returns_the_fault_injected_at_its_event() {
+			let refused = faulting_at_alpha().emit_event(ALPHA);
+			assert!(matches!(refused, Err(TightBeamError::ChannelClosed)));
+		}
+
+		/// An emit with evidence returns the fault injected at its event.
+		#[cfg(feature = "instrument")]
+		#[test]
+		fn an_emit_with_evidence_returns_the_fault_injected_at_its_event() {
+			let refused = faulting_at_alpha().emit_event_with_evidence(ALPHA, "refused", None);
+			assert!(matches!(refused, Err(TightBeamError::ChannelClosed)));
+		}
+
+		/// An emit with a value returns the fault injected at its event.
+		#[cfg(feature = "instrument")]
+		#[test]
+		fn an_emit_with_a_value_returns_the_fault_injected_at_its_event() {
+			let refused = faulting_at_alpha().emit_event_with_value(ALPHA, "refused", 7u32);
+			assert!(matches!(refused, Err(TightBeamError::ChannelClosed)));
 		}
 
 		/// The random strategy draws as the FDR generator of the model's seed,

@@ -204,7 +204,9 @@ impl<P: ColonyDialProtocol> PeerPlane<P> {
 	///
 	/// # Errors
 	///
-	/// - [`ClusterError::Transport`] -- the dial or the handshake failed.
+	/// - [`ClusterError::Transport`] -- the dial or the handshake failed, or the
+	///   runtime fault model injects a fault at the eviction of an answer
+	///   outside the flood.
 	pub(crate) async fn connect_member(
 		&self,
 		address: impl Into<P::Address>,
@@ -214,7 +216,7 @@ impl<P: ColonyDialProtocol> PeerPlane<P> {
 
 		let member = client.peer_certificate().and_then(|answer| self.config.flood_member(answer));
 		let Some(member) = member else {
-			client.discard();
+			client.discard()?;
 			return Ok(None);
 		};
 

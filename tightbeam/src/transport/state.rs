@@ -1,6 +1,8 @@
-//! Protocol state management traits.
+//! Session state and provisioning for the encrypted transports.
 //!
-//! The module separates encrypted-transport state accessors from I/O.
+//! The module holds the phase table a session moves through, the provisioning
+//! an endpoint was built with, and the sealed traits that give each transport
+//! its state accessors apart from I/O.
 
 use core::marker::PhantomData;
 use core::time::Duration;
@@ -15,7 +17,7 @@ use crate::crypto::profiles::CryptoProvider;
 use crate::crypto::sign::SigningIdentity;
 use crate::crypto::x509::store::CertificateTrust;
 use crate::transport::builders::EnvelopeBuilder;
-use crate::transport::envelopes::WireMode;
+use crate::transport::envelopes::{ArrivingEnvelope, WireEnvelope, WireMode};
 use crate::transport::error::{TransportError, TransportFailure};
 use crate::transport::handshake::receipt::StoredReceipt;
 use crate::transport::handshake::{EstablishedSession, SessionPeer};
@@ -35,6 +37,8 @@ use crate::crypto::x509::KeyPurposes;
 use crate::der::asn1::ObjectIdentifier;
 #[cfg(feature = "instrument")]
 use crate::trace::TraceCollector;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::transport::envelopes::TransportEnvelope;
 #[cfg(all(
 	any(feature = "tcp", feature = "async-transport"),
 	any(feature = "transport-cms", feature = "transport-hpke")
@@ -51,7 +55,7 @@ use crate::transport::handshake::negotiation::TransportOffer;
 ))]
 use crate::transport::handshake::receipt::{ReceiptApprover, SessionObserver};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::transport::handshake::{BoxedServerHandshake, ServerIdentity, ValidatorChain};
+use crate::transport::handshake::{BoxedServerHandshake, HandshakeMessage, ServerIdentity, ValidatorChain};
 #[cfg(feature = "transport-cms")]
 use crate::transport::handshake::{CmsIdentityPair, ProvisionedTrust};
 #[cfg(all(
@@ -59,6 +63,8 @@ use crate::transport::handshake::{CmsIdentityPair, ProvisionedTrust};
 	any(feature = "transport-cms", feature = "transport-hpke")
 ))]
 use crate::transport::handshake::{EpochMaterials, HandshakeError, HandshakeProvider};
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::transport::io::CollectStep;
 #[cfg(all(
 	feature = "transport-multiplex",
 	any(feature = "transport-cms", feature = "transport-hpke")
@@ -132,10 +138,10 @@ impl SessionPhase {
 	const fn admits(&self, event: &SessionEvent) -> bool {
 		matches!(
 			(self, event),
-			// The handshake, which may take more than one round.
+			// A handshake may take more than one round.
 			(Self::Provisioned | Self::Handshaking { .. }, SessionEvent::BeginHandshake(_))
 				| (Self::Handshaking { .. }, SessionEvent::Install(_))
-				// The circuit breaker, from wherever the session got to.
+				// The circuit breaker resets the session from any phase.
 				| (_, SessionEvent::Reset)
 		)
 	}
@@ -276,7 +282,7 @@ impl ReadPolicy {
 /// transports implement [`sealed::Sealed`], each by name, so both come from a
 /// handshake this crate ran.
 pub(crate) mod sealed {
-	/// Implemented by name for each in-crate transport.
+	/// Each in-crate transport implements this trait by name.
 	pub trait Sealed {}
 }
 
@@ -415,6 +421,90 @@ impl<P: CryptoProvider> SessionState<P> {
 		// is spent, so the replaced phase carries nothing a caller could act
 		// on.
 		let _dropped = self.apply(SessionEvent::Reset);
+	}
+
+	/// Admit `wire`, the DER of one wire envelope that arrived on this
+	/// session, under `limits`, and return the DER of the transport envelope
+	/// it carries.
+	///
+	/// It is the receive twin of [`EncryptedProtocolState::apply_wire_mode`].
+	/// The outer tag names the wire mode, and the phase decides which mode it
+	/// admits, before a byte of the contents decodes:
+	///
+	/// - An envelope past the ceiling of its mode is refused, and the session stays where it was.
+	/// - An established session admits records alone, and opens each under its receive cipher.
+	/// - Every other phase admits cleartext alone.
+	/// - A refused mode, and a record that fails to open, trip the circuit
+	///   breaker, so the session resets before the error returns.
+	///
+	/// # Errors
+	///
+	/// - The decode error -- `wire` is no wire envelope.
+	/// - [`TransportError::OperationFailed`] with
+	///   [`TransportFailure::SizeExceeded`] -- the envelope passes the ceiling
+	///   of its mode.
+	/// - [`TransportError::MissingEncryption`] -- cleartext arrived on an established session (CWE-319).
+	/// - [`TransportError::OperationFailed`] with
+	///   [`TransportFailure::EncryptionFailed`] -- a record arrived before the
+	///   session was established.
+	/// - The open failure of a record, such as
+	///   [`TransportFailure::TamperDetected`] for a record out of sequence.
+	pub(crate) fn admit_arrival<'w>(
+		&mut self,
+		wire: &'w mut (impl AsMut<[u8]> + ?Sized),
+		limits: &TransportLimits,
+	) -> TransportResult<&'w [u8]> {
+		let wire = wire.as_mut();
+		let wire_len = wire.len();
+		let arriving = WireEnvelope::admit(wire)?;
+		if wire_len > limits.envelope_ceiling(arriving.mode()) {
+			return Err(TransportError::OperationFailed(TransportFailure::SizeExceeded));
+		}
+
+		let admitted = match (&self.phase, arriving) {
+			(SessionPhase::Encrypted(session), ArrivingEnvelope::Encrypted(record)) => {
+				session.keys().recv().open(record).map_err(TransportError::from)
+			}
+			(SessionPhase::Encrypted(_), ArrivingEnvelope::Cleartext(_)) => Err(TransportError::MissingEncryption),
+			(_, ArrivingEnvelope::Cleartext(contents)) => Ok(contents),
+			(_, ArrivingEnvelope::Encrypted(_)) => {
+				Err(TransportError::OperationFailed(TransportFailure::EncryptionFailed))
+			}
+		};
+		if admitted.is_err() {
+			self.reset();
+		}
+
+		admitted
+	}
+
+	/// Classify `envelope`, which [`Self::admit_arrival`] admitted, as one
+	/// step of the inbound collector.
+	///
+	/// While a handshake is pending, the one cleartext this session admits is
+	/// a handshake container, which goes to the server's dispatcher. Any other
+	/// envelope then is application traffic that arrived unsealed, so it trips
+	/// the circuit breaker. Every other phase hands the envelope on.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::MissingEncryption`] -- an envelope other than a
+	///   handshake container arrived while a handshake was pending, and the
+	///   session was reset.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	pub(crate) fn collect(&mut self, envelope: TransportEnvelope) -> TransportResult<CollectStep> {
+		if !self.phase.is_handshake_pending() {
+			return Ok(CollectStep::Envelope(envelope));
+		}
+
+		// The refusal names its cause, `MissingEncryption`, and not the
+		// `InvalidMessage` of the conversion.
+		let Ok(message) = HandshakeMessage::try_from(envelope) else {
+			self.reset();
+			return Err(TransportError::MissingEncryption);
+		};
+
+		Ok(CollectStep::Handshake(message))
 	}
 
 	/// Detach the established session, returning this state to its start.
@@ -624,8 +714,8 @@ impl<P: CryptoProvider> SessionState<P> {
 		self.established()?.receipt_arc()
 	}
 
-	/// Place a probe directly in `phase`, so a test of the table does not have
-	/// to walk the table to reach its starting point.
+	/// Place a probe directly in `phase`, so a test of the table starts from
+	/// any phase without walking the table to reach it.
 	#[cfg(test)]
 	pub(crate) fn at(encryption: EncryptionConfig<P>, phase: SessionPhase) -> Self {
 		let encryption = DialableEncryption::unchecked(encryption);
@@ -687,7 +777,7 @@ impl<P: CryptoProvider> ServerIdentities<P> {
 	///
 	/// # Errors
 	///
-	/// - The [`CertificateExt::require_purpose`] set.
+	/// - The errors of [`CertificateExt::require_purpose`].
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub(crate) fn require_purpose(&self, purpose: ObjectIdentifier) -> Result<(), CertificateValidationError> {
 		match self {
@@ -879,8 +969,9 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 	///
 	/// # Errors
 	///
-	/// - The [`CertificateExt::require_purpose`] set, for the server identity
-	///   under the server purpose or the client identity under the client's.
+	/// - The errors of [`CertificateExt::require_purpose`], for the server
+	///   identity under the server purpose or the client identity under the
+	///   client's.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub(crate) fn admit_own_identities(&self) -> Result<(), CertificateValidationError> {
 		if let Some(identity) = &self.server_identity {

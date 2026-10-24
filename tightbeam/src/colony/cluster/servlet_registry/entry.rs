@@ -143,7 +143,7 @@ pub(crate) enum RoutePlane {
 	},
 }
 
-/// A servlet instance tracked with pheromone score and trial count.
+/// A servlet instance, tracked with its pheromone score and trial count.
 ///
 /// The fields are private, so the route-key discipline holds by
 /// construction:
@@ -167,7 +167,7 @@ pub struct ServletEntry {
 	/// The certificate fingerprint of the relaying gateway this entry dials,
 	/// when the route is a relay trail.
 	relay_id: Option<SharedId>,
-	/// The endpoint dialed when forwarding. A local entry dials the endpoint
+	/// The endpoint that a forward dials. A local entry dials the endpoint
 	/// its `route_key` names, in canonical form.
 	dial: DialTarget,
 	/// The plane the entry dials on, and the party that must answer there:
@@ -358,12 +358,9 @@ impl ServletEntry {
 	pub fn relay_bucket(origin_id: impl AsRef<[u8]>, relay_id: impl AsRef<[u8]>) -> SharedId {
 		let origin_id = origin_id.as_ref();
 		let relay_id = relay_id.as_ref();
-		let mut bucket = Vec::with_capacity(origin_id.len() + 1 + relay_id.len());
-		bucket.extend_from_slice(origin_id);
-		bucket.push(0);
-		bucket.extend_from_slice(relay_id);
+		let bucket = origin_id.iter().chain(&[0]).chain(relay_id);
 
-		Arc::from(bucket.as_slice())
+		bucket.copied().collect()
 	}
 
 	/// Builds a peer-routed entry. Both peer-routed kinds key as
@@ -376,10 +373,8 @@ impl ServletEntry {
 		abandonment_limit: u32,
 	) -> Self {
 		let PeerIdentity { bucket, owner_id, relay_id, route_kind } = identity;
-		let mut route_key = Vec::with_capacity(bucket.len() + 1 + servlet_type.len());
-		route_key.extend_from_slice(&bucket);
-		route_key.push(0);
-		route_key.extend_from_slice(&servlet_type);
+		let route_parts = bucket.iter().chain(&[0]).chain(servlet_type.iter());
+		let route_key: SharedId = route_parts.copied().collect();
 
 		// A relay trail dials its relay, and a direct route dials the origin
 		// that advertised the type.
@@ -387,7 +382,7 @@ impl ServletEntry {
 		let plane = RoutePlane::Peer { gateway_id: Arc::clone(gateway_id) };
 
 		Self {
-			route_key: Arc::from(route_key.as_slice()),
+			route_key,
 			servlet_type,
 			bucket,
 			owner_id,
@@ -408,7 +403,7 @@ impl ServletEntry {
 		&self.route_key
 	}
 
-	/// The endpoint dialed when forwarding through this entry.
+	/// The endpoint that a forward through this entry dials.
 	#[must_use]
 	pub fn dial_target(&self) -> &DialTarget {
 		&self.dial

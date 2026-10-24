@@ -1,17 +1,17 @@
 //! Instrumentation subsystem.
 //!
 //! Implements the normative event taxonomy and evidence artifact hashing
-//! defined for the tighbeam protocol.
+//! defined for the tightbeam protocol.
 //!
 //! Feature gating contract:
-//! - The module and [`events`] URN inventory are available whenever `std` is
-//!   enabled so callers can label trace records without opting into TbEvent.
-//! - When `instrument` is disabled, emit APIs are no-op stubs.
-//! - When `instrument` is enabled, emission MUST be amortized O(1) and overflow
-//!   MUST set a flag.
+//! - The module and the [`events`] URN inventory are available whenever
+//!   `std` is enabled, so callers can label trace records without opting
+//!   into TbEvent.
+//! - When `instrument` is disabled, the emit APIs are stubs that do nothing.
+//! - When `instrument` is enabled, emission MUST be amortized O(1) and overflow MUST set a flag.
 //!
 //! Evidence hashing uses SHA3-256 over a stable length-prefixed byte
-//! layout. `TbEvent` / `EvidenceArtifact` themselves encode as DER.
+//! layout. `TbEvent` and `EvidenceArtifact` themselves encode as DER.
 
 #![allow(clippy::module_name_repetitions)]
 
@@ -24,24 +24,82 @@ pub mod stub {
 
 	#[derive(Clone, Debug)]
 	pub struct TbEvent {
+		/// The sequence number within the trace.
 		pub seq: u32,
+		/// The URN of the event kind.
 		pub urn: Urn<'static>,
+		/// The event label, when the event has one.
 		pub label: Option<String>,
+		/// The SHA3-256 hash of the payload, when the event carries one.
 		pub payload_hash: Option<[u8; 32]>,
+		/// The elapsed time of the instrumented operation, a span length.
 		pub duration_ns: Option<u64>,
+		/// The instant the event occurred, relative to the trace clock origin.
 		pub timestamp_ns: Option<u64>,
+		/// The event flags.
 		pub flags: u32,
+		/// Opaque extension bytes, when the event carries any.
 		pub extras: Option<Vec<u8>>,
 	}
 
+	/// The instrumentation settings of a trace, in a build without the
+	/// `instrument` feature.
+	///
+	/// The fields are those of the `instrument` build, so code that sets them
+	/// compiles in both builds. [`Default`] turns every flag off and sets
+	/// `max_events` to 1024.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::instrumentation::TbInstrumentationConfig;
+	///
+	/// let defaults = TbInstrumentationConfig::default();
+	/// let config = TbInstrumentationConfig { enable_payloads: true, ..defaults };
+	///
+	/// assert_eq!(config.max_events, 1024);
+	/// ```
 	#[derive(Clone, Copy, Debug)]
 	pub struct TbInstrumentationConfig {
+		/// Whether each event carries the SHA3-256 hash of its payload.
 		pub enable_payloads: bool,
+		/// Whether the trace records the internal events: the handler entry and
+		/// exit, and the crypto, compress, route, and policy steps.
+		///
+		/// # Warning
+		///
+		/// No code reads this flag yet, so either value gives the same trace.
 		pub enable_internal_detail: bool,
+		/// Whether the FDR exploration records a sample of the enabled event
+		/// set of each state, as an [`ENABLED_SET_SAMPLE`] event.
+		///
+		/// # Warning
+		///
+		/// No code reads this flag yet, so either value gives the same trace.
+		///
+		/// [`ENABLED_SET_SAMPLE`]: super::events::ENABLED_SET_SAMPLE
 		pub sample_enabled_sets: bool,
+		/// Whether the FDR exploration records a snapshot of the refusals of
+		/// each state, as a [`REFUSAL_SNAPSHOT`] event.
+		///
+		/// # Warning
+		///
+		/// No code reads this flag yet, so either value gives the same trace.
+		///
+		/// [`REFUSAL_SNAPSHOT`]: super::events::REFUSAL_SNAPSHOT
 		pub sample_refusals: bool,
+		/// Whether the FDR exploration runs its divergence heuristics and
+		/// records each divergence it finds, as a [`DIVERGENCE_DETECT`] event.
+		///
+		/// # Warning
+		///
+		/// No code reads this flag yet, so either value gives the same trace.
+		///
+		/// [`DIVERGENCE_DETECT`]: super::events::DIVERGENCE_DETECT
 		pub divergence_heuristics: bool,
+		/// How many events the default bounded sink holds before it drops more.
 		pub max_events: u32,
+		/// Whether each event keeps the duration that its caller measured.
 		pub record_durations: bool,
 	}
 
@@ -88,31 +146,31 @@ pub mod active {
 
 	#[derive(Clone, Debug, PartialEq)]
 	pub struct TbEvent {
-		/// Sequence number within the trace
+		/// The sequence number within the trace.
 		pub seq: u32,
-		/// Event kind URN
+		/// The URN of the event kind.
 		pub urn: Urn<'static>,
-		/// Optional event label
+		/// The event label, when the event has one.
 		pub label: Option<String>,
-		/// Optional SHA3-256 payload hash
+		/// The SHA3-256 hash of the payload, when the event carries one.
 		pub payload_hash: Option<[u8; 32]>,
-		/// Elapsed time of the instrumented operation (a span length)
+		/// The elapsed time of the instrumented operation, a span length.
 		pub duration_ns: Option<u64>,
-		/// Instant the event occurred, relative to the trace clock origin
-		/// (a point in time; used for deadline start/end matching)
+		/// The instant the event occurred, relative to the trace clock origin.
+		/// It is a point in time, which deadline start and end matching reads.
 		pub timestamp_ns: Option<u64>,
-		/// Event flags
+		/// The event flags.
 		pub flags: u32,
-		/// Optional opaque extension bytes
+		/// Opaque extension bytes, when the event carries any.
 		pub extras: Option<Vec<u8>>,
 	}
 
 	/// Context-specific tag numbers for `TbEvent` optional fields.
 	///
 	/// Every OPTIONAL field carries an EXPLICIT context tag so adjacent
-	/// optionals of the same universal type (`duration_ns`/`timestamp_ns`,
-	/// `payload_hash`/`extras`) stay unambiguous on the wire when any subset
-	/// is absent.
+	/// optionals of the same universal type (`duration_ns` and `timestamp_ns`,
+	/// or `payload_hash` and `extras`) stay unambiguous on the wire when any
+	/// subset is absent.
 	pub(super) mod tb_event_tags {
 		use crate::der::TagNumber;
 
@@ -127,14 +185,14 @@ pub mod active {
 		ContextSpecific { tag_number, tag_mode: TagMode::Explicit, value }
 	}
 
-	/// Borrowing variant for encode-only paths: avoids cloning the value
-	/// just to wrap it in a context-specific tag.
+	/// The borrowing form of `tagged` for encode-only paths, so wrapping the
+	/// value in a context-specific tag needs no clone.
 	fn tagged_ref<T>(tag_number: TagNumber, value: &T) -> ContextSpecificRef<'_, T> {
 		ContextSpecificRef { tag_number, tag_mode: TagMode::Explicit, value }
 	}
 
-	// Manual DER implementation: Sequence derive can't handle Urn<'static>
-	// lifetime
+	// This impl writes the DER encoding by hand, because the Sequence derive
+	// cannot handle the `Urn<'static>` lifetime.
 	impl FixedTag for TbEvent {
 		const TAG: Tag = Tag::Sequence;
 	}
@@ -211,7 +269,7 @@ pub mod active {
 
 				let label =
 					ContextSpecific::<String>::decode_explicit(reader, tb_event_tags::LABEL)?.map(|cs| cs.value);
-				// A present hash of the wrong length is malformed input
+				// A present hash of the wrong length is malformed input.
 				let payload_hash: Option<[u8; 32]> =
 					match ContextSpecific::<OctetString>::decode_explicit(reader, tb_event_tags::PAYLOAD_HASH)? {
 						None => None,
@@ -239,14 +297,65 @@ pub mod active {
 		}
 	}
 
+	/// The instrumentation settings of a trace.
+	///
+	/// [`TraceConfig::with_instrumentation`] takes the settings, and the
+	/// collector applies them to each event it records. [`Default`] turns every
+	/// flag off and sets `max_events` to 1024.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::instrumentation::TbInstrumentationConfig;
+	///
+	/// let defaults = TbInstrumentationConfig::default();
+	/// let config = TbInstrumentationConfig { enable_payloads: true, ..defaults };
+	///
+	/// assert_eq!(config.max_events, 1024);
+	/// ```
+	///
+	/// [`TraceConfig::with_instrumentation`]: crate::trace::TraceConfig::with_instrumentation
 	#[derive(Clone, Copy, Debug)]
 	pub struct TbInstrumentationConfig {
+		/// Whether each event carries the SHA3-256 hash of its payload.
 		pub enable_payloads: bool,
+		/// Whether the trace records the internal events: the handler entry and
+		/// exit, and the crypto, compress, route, and policy steps.
+		///
+		/// # Warning
+		///
+		/// No code reads this flag yet, so either value gives the same trace.
 		pub enable_internal_detail: bool,
+		/// Whether the FDR exploration records a sample of the enabled event
+		/// set of each state, as an [`ENABLED_SET_SAMPLE`] event.
+		///
+		/// # Warning
+		///
+		/// No code reads this flag yet, so either value gives the same trace.
+		///
+		/// [`ENABLED_SET_SAMPLE`]: super::events::ENABLED_SET_SAMPLE
 		pub sample_enabled_sets: bool,
+		/// Whether the FDR exploration records a snapshot of the refusals of
+		/// each state, as a [`REFUSAL_SNAPSHOT`] event.
+		///
+		/// # Warning
+		///
+		/// No code reads this flag yet, so either value gives the same trace.
+		///
+		/// [`REFUSAL_SNAPSHOT`]: super::events::REFUSAL_SNAPSHOT
 		pub sample_refusals: bool,
+		/// Whether the FDR exploration runs its divergence heuristics and
+		/// records each divergence it finds, as a [`DIVERGENCE_DETECT`] event.
+		///
+		/// # Warning
+		///
+		/// No code reads this flag yet, so either value gives the same trace.
+		///
+		/// [`DIVERGENCE_DETECT`]: super::events::DIVERGENCE_DETECT
 		pub divergence_heuristics: bool,
+		/// How many events the default bounded sink holds before it drops more.
 		pub max_events: u32,
+		/// Whether each event keeps the duration that its caller measured.
 		pub record_durations: bool,
 	}
 
@@ -264,13 +373,13 @@ pub mod active {
 		}
 	}
 
-	/// Event retention policy for a [`TraceCollector`](crate::trace::TraceCollector).
+	/// Event retention policy for a
+	/// [`TraceCollector`](crate::trace::TraceCollector), which delivers every
+	/// emitted [`TbEvent`] to exactly one sink.
 	///
-	/// The collector delivers every emitted [`TbEvent`] to exactly one sink.
-	/// When [`TraceConfig::sink`](crate::trace::TraceConfig::sink) is `None`,
-	/// the collector MUST use [`BoundedMemorySink`] sized by `max_events`.
-	/// Implementations MAY forward to an exporter, spill to disk, or retain
-	/// unbounded history.
+	/// - When [`TraceConfig::sink`](crate::trace::TraceConfig::sink) is `None`,
+	///   the collector MUST use [`BoundedMemorySink`] sized by `max_events`.
+	/// - Implementations MAY forward to an exporter, spill to disk, or retain unbounded history.
 	///
 	/// [`Self::emit`] runs on the hot control-plane path: implementations
 	/// MUST be amortized O(1) and MUST NOT block on I/O (buffer and defer).
@@ -284,20 +393,21 @@ pub mod active {
 		/// Forward-only sinks that retain nothing MUST return an empty vector.
 		fn drain(&self) -> Vec<TbEvent>;
 
-		/// Sticky latch: `true` if any event was dropped since creation.
+		/// A sticky latch that reads `true` once any event was dropped since
+		/// creation.
 		///
 		/// Feeds the `overflow` field of [`EvidenceArtifact::finalize`].
 		/// Evidence from a truncated trace MUST NOT claim completeness.
 		fn overflowed(&self) -> bool;
 	}
 
-	/// Default [`EventSink`]: bounded in-memory buffer with a sticky
+	/// The default [`EventSink`], a bounded in-memory buffer with a sticky
 	/// overflow latch.
 	///
-	/// Events past `max_events` are dropped (newest lost, oldest kept) and
-	/// the latch is set. [`EventSink::drain`] frees capacity but MUST NOT
-	/// clear the latch. Dropped events still consume collector sequence
-	/// numbers, so gaps in [`TbEvent::seq`] mark truncation.
+	/// The sink drops each event past `max_events`, so the newest are lost and
+	/// the oldest kept, and it sets the latch. [`EventSink::drain`] frees
+	/// capacity but MUST NOT clear the latch. Dropped events still consume
+	/// collector sequence numbers, so gaps in [`TbEvent::seq`] mark truncation.
 	#[derive(Debug)]
 	pub struct BoundedMemorySink {
 		max_events: u32,
@@ -347,15 +457,20 @@ pub mod active {
 
 	#[derive(Beamable, Sequence, Debug, Clone, PartialEq)]
 	pub struct EvidenceArtifact {
+		/// The 32-byte hash of the spec that the caller passed to `finalize`.
 		pub spec_hash: OctetString,
+		/// The SHA3-256 hash of the events in their length-prefixed layout.
 		pub trace_hash: OctetString,
+		/// The SHA3-256 hash of `spec_hash` followed by `trace_hash`.
 		pub evidence_hash: OctetString,
+		/// The events the trace hash covers, in the order given.
 		pub events: Vec<TbEvent>,
+		/// Whether the collector dropped events at its `max_events` bound.
 		pub overflow: bool,
 	}
 
 	impl EvidenceArtifact {
-		/// Finalize evidence artifact from events
+		/// Builds the evidence artifact of `events` against `spec_hash`.
 		///
 		/// `overflow` MUST reflect whether the collector dropped events at
 		/// its `max_events` bound (see `TraceCollector::overflowed`).
@@ -365,12 +480,12 @@ pub mod active {
 			overflow: bool,
 		) -> Result<Self, TightBeamError> {
 			let events: Vec<TbEvent> = events.into_iter().collect();
-			// Canonical byte representation (stable ordering) for trace hash
-			let mut bytes = Vec::with_capacity(events.len() * 64);
+			// The trace hash reads a canonical byte layout in a stable order.
+			let mut bytes = Vec::with_capacity(events.len().saturating_mul(64));
 			for ev in &events {
 				bytes.extend_from_slice(&ev.seq.to_be_bytes());
 
-				// URN serialized as string representation
+				// The URN enters the layout as its string form.
 				let urn_str = ev.urn.to_string();
 				let urn_bytes = urn_str.as_bytes();
 				bytes.extend_from_slice(&(urn_bytes.len() as u32).to_be_bytes());

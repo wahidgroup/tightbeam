@@ -15,10 +15,10 @@ use crate::random::generate_nonce;
 
 /// Bounds of the decorrelated-jitter window for a base value.
 ///
-/// Returns `(min, range)` where the window spans `min..=min + range` with
-/// `min = base / 3`. Shared by the restart backoff strategy
-/// ([`DecorrelatedJitter`]) and the timing framework's
-/// `DecorrelatedJitterCalculator`, so the algorithm is defined once.
+/// Returns `(min, range)` with `min = base / 3`, and the window spans
+/// `min..min + range`. The restart backoff strategy ([`DecorrelatedJitter`])
+/// and the timing framework's `DecorrelatedJitterCalculator` share it, so the
+/// algorithm has one definition.
 #[cfg(feature = "std")]
 pub(crate) const fn decorrelated_bounds(base: u64) -> (u64, u64) {
 	let min = base / 3;
@@ -135,11 +135,11 @@ impl JitterStrategy for DecorrelatedJitter {
 		let seed = generate_nonce::<8>(None).map_or(base_delay, u64::from_le_bytes);
 
 		let (min, range) = decorrelated_bounds(base_delay);
-		if range == 0 {
+		let Some(offset) = seed.checked_rem(range) else {
 			return base_delay;
-		}
+		};
 
-		min + (seed % range)
+		min.saturating_add(offset)
 	}
 }
 
@@ -265,7 +265,7 @@ impl_timed_backoff_policy!(RestartLinearBackoff, |policy: &RestartLinearBackoff,
 	policy
 		.scale_factor
 		.saturating_mul(policy.interval.as_millis() as u64)
-		.saturating_mul(attempt as u64 + 1)
+		.saturating_mul((attempt as u64).saturating_add(1))
 });
 
 #[cfg(feature = "std")]
@@ -295,7 +295,7 @@ impl CoreRetryPolicy for RestartLinearBackoff {
 		let base_delay = self
 			.scale_factor
 			.saturating_mul(self.interval.as_millis() as u64)
-			.saturating_mul(attempt as u64 + 1);
+			.saturating_mul((attempt as u64).saturating_add(1));
 
 		match &self.jitter {
 			Some(jitter_strategy) => jitter_strategy.apply(base_delay),

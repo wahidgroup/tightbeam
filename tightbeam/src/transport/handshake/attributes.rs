@@ -47,7 +47,7 @@ use crate::transport::handshake::schedule::KeyConfirmation;
 /// `attrValues` to exactly one element, and [`Self::value`] enforces it.
 #[derive(Sequence, Debug, Clone, PartialEq, Eq)]
 pub struct HandshakeAttribute {
-	/// OID naming the attribute (RFC 5652 § 5.3 `attrType`).
+	/// OID that names the attribute (RFC 5652 § 5.3 `attrType`).
 	pub attr_type: ObjectIdentifier,
 	/// Values of the attribute. The profile requires exactly one element.
 	pub attr_values: Vec<Any>,
@@ -95,10 +95,10 @@ impl HandshakeAttribute {
 	///
 	/// - [`HandshakeError::InvalidAttributeArity`] -- the attribute carries zero values or more than one.
 	pub fn value(&self) -> Result<&Any, HandshakeError> {
-		if self.attr_values.len() != 1 {
-			return Err(HandshakeError::InvalidAttributeArity);
+		match self.attr_values.as_slice() {
+			[value] => Ok(value),
+			_ => Err(HandshakeError::InvalidAttributeArity),
 		}
-		Ok(&self.attr_values[0])
 	}
 }
 
@@ -191,7 +191,7 @@ impl HandshakeAttribute {
 		Self::new_single(T::OID, Any::encode_from(payload)?)
 	}
 
-	/// Decodes this attribute, requiring the OID `T` is carried under.
+	/// Decodes this attribute as `T`, when it carries the OID of `T`.
 	///
 	/// An attribute of another type yields
 	/// [`HandshakeError::MissingAttribute`], so a peer cannot substitute one
@@ -217,8 +217,8 @@ impl HandshakeAttribute {
 	///
 	/// A receiver binds what the peer sent. Re-encoding the decoded value
 	/// instead would erase any difference the decoder normalised away: `der`
-	/// sorts a `SET OF` before validating it, so a reordered set would hash
-	/// the same as the well-ordered one and pass unseen (CWE-345).
+	/// sorts a `SET OF` before it validates the set, so a reordered set would
+	/// hash the same as the well-ordered one and pass unseen (CWE-345).
 	///
 	/// # Errors
 	///
@@ -234,8 +234,8 @@ impl HandshakeAttribute {
 	///
 	/// The sender calls this and the receiver calls [`Self::received_bytes`].
 	/// These are the bytes the sender is about to transmit, so both sides hash
-	/// the same encoding and a tampered attribute diverges the two transcript
-	/// hashes (CWE-345).
+	/// the same encoding and a tampered attribute makes the two transcript
+	/// hashes differ (CWE-345).
 	///
 	/// # Errors
 	///
@@ -254,15 +254,11 @@ impl HandshakeAttribute {
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 fn u16_from_any(any: &Any) -> Result<u16, HandshakeError> {
 	let uint_ref: UintRef = any.decode_as().map_err(|_| HandshakeError::InvalidIntegerEncoding)?;
-	let b = uint_ref.as_bytes();
-	if b.is_empty() || b.len() > 2 {
-		return Err(HandshakeError::IntegerOutOfRange);
+	match uint_ref.as_bytes() {
+		[low] => Ok(u16::from(*low)),
+		[high, low] => Ok(u16::from_be_bytes([*high, *low])),
+		_ => Err(HandshakeError::IntegerOutOfRange),
 	}
-	if b.len() == 1 {
-		return Ok(b[0] as u16);
-	}
-
-	Ok(((b[0] as u16) << 8) | b[1] as u16)
 }
 
 /// Decode an alert code from a single INTEGER-bearing `Any`.
@@ -289,7 +285,7 @@ fn alert_from_any(any: &Any) -> Result<HandshakeAlert, HandshakeError> {
 /// Handshake attribute lookups on a CMS `SignedData` or an attribute set.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub trait HandshakeAttributes {
-	/// Finds at most one unsigned attribute with `oid`, rejecting duplicates.
+	/// Finds at most one unsigned attribute with `oid`, and rejects duplicates.
 	///
 	/// On a `SignedData` the search spans the SignerInfos of a parsed
 	/// Finished message or of an HPKE reply.
@@ -430,8 +426,8 @@ mod tests {
 		Ok(Attribute { oid, values: SetOfVec::try_from(vec![value])? })
 	}
 
-	/// The one `SignerInfo` of a fresh test `SignedData`, carrying the same
-	/// security offer as an unsigned attribute on every call.
+	/// The one `SignerInfo` of a fresh test `SignedData`, which carries the
+	/// same security offer as an unsigned attribute on every call.
 	fn signer_with_offer() -> SignerInfo {
 		let signed_data = create_test_signed_data([0x07u8; 32]);
 		let value = mk_octet([0x11u8; 32]).expect("a 32-byte OCTET STRING encodes");
@@ -578,10 +574,20 @@ mod tests {
 		let wide = mk_alert_attr([0x01, 0x02, 0x03])?;
 		assert!(matches!(wide.handshake_alert(), Err(HandshakeError::IntegerOutOfRange)));
 
-		// 0x0101 = 257. Truncating to u8 would alias alert code 1
+		// 0x0101 is 257, which a truncation to u8 would alias to alert code 1
 		// (AuthRequired).
 		let above = mk_alert_attr([0x01, 0x01])?;
 		assert!(matches!(above.handshake_alert(), Err(HandshakeError::IntegerOutOfRange)));
+		Ok(())
+	}
+
+	/// A two-octet alert code reads big-endian: `0x0100` is 256, past the
+	/// alert domain, and never alert 1.
+	#[test]
+	fn a_two_octet_alert_code_reads_big_endian() -> Result<(), der::Error> {
+		let wide = mk_alert_attr([0x01, 0x00])?;
+
+		assert!(matches!(wide.handshake_alert(), Err(HandshakeError::IntegerOutOfRange)));
 		Ok(())
 	}
 

@@ -217,6 +217,36 @@ impl From<TightBeamError> for TransportError {
 	}
 }
 
+#[cfg(all(
+	feature = "transport-multiplex",
+	any(feature = "tokio", feature = "async-transport")
+))]
+impl TransportError {
+	/// Returns the terminal status that a peer stream reads when its handler
+	/// fails with this error.
+	///
+	/// - A failure that carries a transit status keeps it, apart from [`TransitStatus::Unavailable`].
+	/// - A carried `Unavailable` answers [`TransitStatus::Unknown`], because
+	///   the handler ran up to its failure. A peer reads `Unavailable` as a
+	///   refusal before any handler ran, which a gate answers, and a gateway
+	///   retries such a frame on another instance.
+	/// - Any other failure answers [`TransitStatus::Internal`], so a peer
+	///   tells a failure apart from an accepted empty reply and the failure
+	///   stays attributable.
+	#[must_use]
+	pub(crate) fn failure_status(&self) -> TransitStatus {
+		let Self::OperationFailed(failure) = self else {
+			return TransitStatus::Internal;
+		};
+
+		match TransitStatus::try_from(*failure) {
+			Ok(TransitStatus::Unavailable) => TransitStatus::Unknown,
+			Ok(status) => status,
+			Err(_) => TransitStatus::Internal,
+		}
+	}
+}
+
 impl TryFrom<TransitStatus> for TransportFailure {
 	type Error = TransportError;
 
@@ -542,5 +572,30 @@ mod tests {
 			relayed,
 			Err(TransportError::OperationFailed(TransportFailure::EncodingFailed))
 		));
+	}
+
+	// A handler's failure keeps the status it carries, apart from
+	// `Unavailable`, which a peer reads as a refusal before any handler ran.
+	// A failure that carries no status answers `Internal`.
+	#[cfg(all(
+		feature = "transport-multiplex",
+		any(feature = "tokio", feature = "async-transport")
+	))]
+	crate::tb_cases! {
+		fn failure_status_of((failure, expected): (TransportError, TransitStatus)) {
+			let status = failure.failure_status();
+
+			assert_eq!(status, expected);
+		}
+
+		cases {
+			a_carried_unavailable_is_unknown => (TransitStatus::Unavailable.into(), TransitStatus::Unknown),
+			a_carried_refusal_keeps_its_status => (TransitStatus::PermissionDenied.into(), TransitStatus::PermissionDenied),
+			a_local_failure_is_internal => (
+				TransportError::OperationFailed(TransportFailure::SizeExceeded),
+				TransitStatus::Internal
+			),
+			a_failure_with_no_status_is_internal => (TransportError::ConnectionClosed, TransitStatus::Internal),
+		}
 	}
 }

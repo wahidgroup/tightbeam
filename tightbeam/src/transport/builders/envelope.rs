@@ -34,8 +34,8 @@ impl EnvelopePayload {
 	}
 }
 
-/// Builder responsible for constructing `WireEnvelope` instances with shared
-/// size validation and encryption logic.
+/// Builder that constructs `WireEnvelope` instances with shared size
+/// validation and encryption logic.
 pub struct EnvelopeBuilder<'a> {
 	pub(crate) payload: EnvelopePayload,
 	pub(crate) encryptor: Option<&'a SendCipher>,
@@ -84,23 +84,27 @@ impl<'a> EnvelopeBuilder<'a> {
 		self
 	}
 
-	/// Finalize the builder, returning a `WireEnvelope`.
+	/// Finalize the builder into its wire form. An encrypted wire mode seals
+	/// the envelope, and the call refuses a wire form past the envelope
+	/// ceiling of its limits.
 	pub fn finish(self) -> TransportResult<WireEnvelope> {
 		let EnvelopeBuilder { payload, encryptor, limits, wire_mode } = self;
 
 		let envelope = payload.materialize();
 		let with_frame = Self::frame_error_context(&envelope);
 
-		let (wire, ceiling) = match wire_mode {
-			WireMode::Cleartext => (WireEnvelope::Cleartext(envelope), limits.cleartext_envelope),
+		let wire = match wire_mode {
+			WireMode::Cleartext => WireEnvelope::Cleartext(envelope),
 			WireMode::Encrypted => {
 				let encrypted = Self::encrypt(envelope, encryptor, &with_frame)?;
-				(WireEnvelope::Encrypted(encrypted), limits.encrypted_envelope)
+				WireEnvelope::Encrypted(encrypted)
 			}
 		};
 
-		// The ceiling names the wire form, so the tag and wrapper are inside the
-		// measurement. `encoded_len` computes it without building a buffer.
+		// The ceiling names the wire form, so the tag and wrapper are inside
+		// the measurement. `encoded_len` computes it without building a
+		// buffer.
+		let ceiling = limits.envelope_ceiling(wire_mode);
 		let wire_len = u32::from(wire.encoded_len().map_err(|_| with_frame(TransportFailure::EncodingFailed))?);
 		if wire_len as usize > ceiling {
 			return Err(with_frame(TransportFailure::SizeExceeded));
@@ -122,7 +126,7 @@ impl<'a> EnvelopeBuilder<'a> {
 				.as_ref()
 				.map(Arc::clone)
 				.map(|arc| {
-					// Non-hot path clone
+					// The clone runs on the error path alone, off the hot path.
 					let frame = Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone());
 					failure.with_frame(frame)
 				})

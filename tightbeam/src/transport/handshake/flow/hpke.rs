@@ -14,14 +14,14 @@
 //! hello, the reply content, and the reply's `certificates` field. The field
 //! holds the signing certificate the `sid` names and each issuer above it
 //! that the server presents, so a swapped certificate of the same key or the
-//! same subject fails the signature (RFC 9846 § 4.5.2).
+//! same subject fails the signature (RFC 9846 §4.5.2).
 //!
 //! ## Key confirmation
 //!
 //! The server derives the handshake secret before it encodes the reply, so
 //! the reply carries the server Finished as an unsigned attribute of its
 //! `SignerInfo`: a MAC over the transcript hash and the octets of the reply's
-//! signature (RFC 9846 § 4.5.3). The CMS reply carries the same MAC, so both
+//! signature (RFC 9846 §4.5.3). The CMS reply carries the same MAC, so both
 //! clients confirm the server alike.
 //!
 //! The client verifies the server Finished before it seals its closing, and
@@ -371,6 +371,7 @@ mod tests {
 	use std::sync::Arc;
 
 	use super::*;
+	use crate::asn1::admission::fixtures::{descending_attribute, tlv};
 	use crate::cms::signed_data::{SignerInfo, SignerInfos};
 	use crate::crypto::cms::AuthEnvelopedData;
 	use crate::crypto::hash::{Digest, Sha3_256};
@@ -383,6 +384,7 @@ mod tests {
 	use crate::crypto::x509::policy::{DirectTrustValidator, ExpiryValidator};
 	use crate::crypto::x509::KeyPurposes;
 	use crate::der::asn1::{ObjectIdentifier, SetOfVec};
+	use crate::der::{ErrorKind, Tag, TagNumber};
 	use crate::oids::{
 		AUTH_ENVELOPED_DATA, HANDSHAKE_ABORT_ALERT, HANDSHAKE_TRANSCRIPT_HASH, HASH_SHA3_384, RECEIPT_ACK, SIGNED_DATA,
 	};
@@ -605,6 +607,14 @@ mod tests {
 			self.confirming.tag(None, &self.ephemeral)
 		}
 
+		/// The closing that carries `content`, of `content_type`, as its
+		/// content, sealed as the client that built the hello seals it.
+		fn sealed_as(&self, content_type: ObjectIdentifier, content: Vec<u8>) -> HandshakeMessage {
+			let sealer = self.confirming.closing_sealer(None, &self.ephemeral);
+			let sealed = sealer.seal(content_type, content).expect("the closing seals");
+			HandshakeMessage::try_from(sealed).expect("the closing encodes")
+		}
+
 		/// The closing that carries `attributes` as the attribute set of an
 		/// anonymous client, sealed under `sealing`'s closing key.
 		fn anonymous_under(&self, sealing: &Confirming, attributes: Vec<Attribute>) -> HandshakeMessage {
@@ -657,7 +667,7 @@ mod tests {
 		}
 	}
 
-	/// The hello is a `ContentInfo` of type `id-data` (RFC 5652 § 4).
+	/// The hello is a `ContentInfo` of type `id-data` (RFC 5652 §4).
 	#[test]
 	fn the_hello_is_a_content_info_of_type_data() -> Result<(), Box<dyn Error>> {
 		let (_, opening) = client_after_hello(&create_test_certificate(), None);
@@ -716,7 +726,7 @@ mod tests {
 
 	/// The reply signs the transcript hash as a signed attribute: SHA3-256 of
 	/// the hello as it was sent, the reply content, and the `certificates`
-	/// field, in that order (RFC 9846 § 4.5.2 signs over the Certificate).
+	/// field, in that order (RFC 9846 §4.5.2 signs over the Certificate).
 	///
 	/// The expected digest comes from the `sha3` crate over those bytes, so
 	/// the check is independent of the crate's transcript code.
@@ -866,19 +876,20 @@ mod tests {
 		Ok(())
 	}
 
-	/// The client binds the server certificate as its bytes arrived, so a
-	/// reply whose certificate carries its RDN values in another order than
-	/// the server encoded, which decodes to the same value, fails the reply
-	/// signature (CWE-345).
+	/// A reply whose certificate carries its RDN values in another order than
+	/// DER, which would decode to the same value, is refused as it arrives
+	/// under its `[3]` envelope, before the client binds a byte of it
+	/// (X.690 §11.6, CWE-345).
 	#[tokio::test]
 	async fn a_reply_whose_certificate_bytes_were_reordered_is_refused() {
 		let mut server = create_test_certificate();
 		server.certificate.tbs_certificate.subject = two_valued_name();
-		let (mut client, reply) = replied(&server).await;
-		let reordered = with_rdn_values_swapped(&reply);
+		let (_client, reply) = replied(&server).await;
+		let envelope_tag = Tag::ContextSpecific { constructed: true, number: TagNumber::N3 };
+		let arrived = tlv(envelope_tag, &with_rdn_values_swapped(&reply));
 
-		let refusal = client.respond(reordered).await;
-		assert!(matches!(refusal, Err(HandshakeError::SignatureVerificationFailed)));
+		let refused = TransportEnvelope::from_der(&arrived).err().map(|error| error.kind());
+		assert_eq!(refused, Some(ErrorKind::SetOrdering));
 	}
 
 	/// A reply without the certificate its signer names is refused, because it
@@ -1202,6 +1213,37 @@ mod tests {
 
 		let refusal = awaiting.server.finish(closing).await;
 		assert!(matches!(refusal, Err(HandshakeError::SealedClosing(_))));
+	}
+
+	/// The attribute set of an anonymous closing passes the admission walk
+	/// before its decode sorts a set in it (X.690 §11.6).
+	#[tokio::test]
+	async fn an_anonymous_closing_of_a_descending_set_is_refused() {
+		let mut awaiting = AwaitingClosing::new(PeerAuthentication::Anonymous).await;
+		let closing = awaiting.sealed_as(DATA, tlv(Tag::Set, &descending_attribute()));
+
+		let refusal = awaiting.server.finish(closing).await;
+		assert_eq!(der_refusal(refusal), Some(ErrorKind::SetOrdering));
+	}
+
+	/// The kind of the DER error that refused a closing, or `None` for
+	/// another outcome.
+	fn der_refusal<T>(outcome: Result<T, HandshakeError>) -> Option<ErrorKind> {
+		match outcome {
+			Err(HandshakeError::DerError(error)) => Some(error.kind()),
+			_ => None,
+		}
+	}
+
+	/// A client Finished passes the admission walk, as a `Signed` structure,
+	/// before its decode sorts a set in it (X.690 §11.6).
+	#[tokio::test]
+	async fn a_client_finished_of_a_descending_set_is_refused() {
+		let mut awaiting = AwaitingClosing::new(mutual_with(ExpiryValidator)).await;
+		let closing = awaiting.sealed_as(SIGNED_DATA, tlv(Tag::Sequence, &descending_attribute()));
+
+		let refusal = awaiting.server.finish(closing).await;
+		assert_eq!(der_refusal(refusal), Some(ErrorKind::SetOrdering));
 	}
 
 	/// The key-confirmation tag is mandatory in either form of the closing.

@@ -596,15 +596,11 @@ impl TightBeamError {
 	pub(crate) fn failure_status(&self) -> crate::policy::TransitStatus {
 		use crate::policy::TransitStatus;
 
-		let TightBeamError::TransportError(crate::transport::TransportError::OperationFailed(failure)) = self else {
+		let TightBeamError::TransportError(error) = self else {
 			return TransitStatus::Internal;
 		};
 
-		match TransitStatus::try_from(*failure) {
-			Ok(TransitStatus::Unavailable) => TransitStatus::Unknown,
-			Ok(status) => status,
-			Err(_) => TransitStatus::Internal,
-		}
+		error.failure_status()
 	}
 
 	/// Returns the refusal behind every [`MuxService`] default.

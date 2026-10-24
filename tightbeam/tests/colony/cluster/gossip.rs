@@ -45,15 +45,32 @@ fn gossip_cluster_conf(
 	(conf, journal)
 }
 
-/// A publish frame signed on the hive-plane identity.
+/// A publish frame signed on the hive-plane identity of `gateway`.
 ///
 /// Origin publishes verify against `hive_trust`, and the hive plane refuses a
 /// signer that `peer_trust` also holds.
-pub async fn hive_publish_gossip(id: impl AsRef<[u8]>, body: GossipRumor, ttl: u64) -> Result<Frame, TightBeamError> {
-	let id = id.as_ref();
-	let publisher = hive_plane_certs();
+pub async fn hive_publish_gossip(
+	gateway: &ClusterTestCerts,
+	id: impl AsRef<[u8]>,
+	body: GossipRumor,
+	ttl: u64,
+) -> Result<Frame, TightBeamError> {
+	hive_publish_gossip_at(gateway, id, body, ttl, UnixMillis::now()).await
+}
 
-	signed_publish_gossip(&publisher.key, id, body, ttl).await
+/// A publish frame like [`hive_publish_gossip`], issued at `issued_at` on the
+/// clock its gateway judges freshness on.
+pub async fn hive_publish_gossip_at(
+	gateway: &ClusterTestCerts,
+	id: impl AsRef<[u8]>,
+	body: GossipRumor,
+	ttl: u64,
+	issued_at: UnixMillis,
+) -> Result<Frame, TightBeamError> {
+	let id = id.as_ref();
+	let publisher = hive_plane_certs(gateway);
+
+	signed_publish_gossip_at(&publisher.key, id, body, ttl, issued_at).await
 }
 
 /// A payload-only rumor body.
@@ -314,13 +331,15 @@ tb_assert_spec! {
 //
 // - The journal absorbs a second publish of the byte-identical rumor as one DUPLICATE.
 // - The gateway answers the duplicate Ok and delivers it nowhere a second time.
-// - The duplicate fires before its reply, so the count needs no polling.
+// - The duplicate fires before its reply, so the count needs no poll.
 tb_scenario! {
 	name: cluster_gossip_floods_every_cluster_once,
 	spec: ClusterGossipFloodSpec,
 	environment Hive {
 		context: cluster_certs(),
-		start: |SetupEnv { trace, context: _ }| start_rumor_hive(trace, hive_plane_certs()),
+		start: |SetupEnv { trace, context: certs }| {
+			start_scenario_rumor_hive(trace, &certs)
+		},
 		client: |HiveEnv { trace, context: certs, hive }| async move {
 			let (conf_c, journal_c) = gossip_cluster_conf(&certs, vec![]);
 			let gateway_c = start_cluster(&trace, conf_c).await?;
@@ -332,16 +351,18 @@ tb_scenario! {
 			let (conf_a, journal_a) = gossip_cluster_conf(&certs, peers_a);
 			let gateway_a = start_cluster(&trace, conf_a).await?;
 
-			let hive_b = start_rumor_hive(trace.share(), hive_plane_certs()).await?;
-			let hive_c = start_rumor_hive(trace.share(), hive_plane_certs()).await?;
+			let hive_b = start_scenario_rumor_hive(trace.share(), &certs).await?;
+			let hive_c = start_scenario_rumor_hive(trace.share(), &certs).await?;
 			hive.register_with_cluster(gateway_a.addr()).await?;
 			hive_b.register_with_cluster(gateway_b.addr()).await?;
 			hive_c.register_with_cluster(gateway_c.addr()).await?;
 
-			// One signed publish frame is resent byte-identical. The origin
-			// gateway re-creates the same rumor, with the same id, order, and
-			// body, and the journal absorbs the second as a Duplicate.
+			// The test resends one signed publish frame byte-identical. The
+			// origin gateway re-creates the same rumor, with the same id,
+			// order, and body, and the journal absorbs the second as a
+			// Duplicate.
 			let frame = hive_publish_gossip(
+				&certs,
 				b"flood-rumor",
 				rumor_body(encode(&PingRequest { value: 21 })?),
 				4,
@@ -392,7 +413,9 @@ tb_scenario! {
 	spec: ClusterGossipChainSpec,
 	environment Hive {
 		context: cluster_certs(),
-		start: |SetupEnv { trace, context: _ }| start_rumor_hive(trace, hive_plane_certs()),
+		start: |SetupEnv { trace, context: certs }| {
+			start_scenario_rumor_hive(trace, &certs)
+		},
 		client: |HiveEnv { trace, context: certs, hive }| async move {
 			let (conf_c, journal_c) = gossip_cluster_conf(&certs, vec![]);
 			let gateway_c = start_cluster(&trace, conf_c).await?;
@@ -403,13 +426,14 @@ tb_scenario! {
 			let (conf_a, journal_a) = gossip_cluster_conf(&certs, vec![gateway_b.addr().to_string()]);
 			let gateway_a = start_cluster(&trace, conf_a).await?;
 
-			let hive_b = start_rumor_hive(trace.share(), hive_plane_certs()).await?;
-			let hive_c = start_rumor_hive(trace.share(), hive_plane_certs()).await?;
+			let hive_b = start_scenario_rumor_hive(trace.share(), &certs).await?;
+			let hive_c = start_scenario_rumor_hive(trace.share(), &certs).await?;
 			hive.register_with_cluster(gateway_a.addr()).await?;
 			hive_b.register_with_cluster(gateway_b.addr()).await?;
 			hive_c.register_with_cluster(gateway_c.addr()).await?;
 
 			let frame = hive_publish_gossip(
+				&certs,
 				b"chain-rumor",
 				rumor_body(encode(&PingRequest { value: 21 })?),
 				2,
@@ -461,7 +485,9 @@ tb_scenario! {
 	spec: ClusterGossipHiveTrustOnlySpec,
 	environment Hive {
 		context: cluster_certs(),
-		start: |SetupEnv { trace, context: _ }| start_rumor_hive(trace, hive_plane_certs()),
+		start: |SetupEnv { trace, context: certs }| {
+			start_scenario_rumor_hive(trace, &certs)
+		},
 		client: |HiveEnv { trace, context: certs, hive }| async move {
 			let (conf_b, journal_b) = gossip_cluster_conf(&certs, vec![]);
 			let gateway_b = start_cluster(&trace, conf_b).await?;
@@ -471,11 +497,12 @@ tb_scenario! {
 
 			let gateway_a = start_cluster(&trace, conf_a).await?;
 
-			let hive_b = start_rumor_hive(trace.share(), hive_plane_certs()).await?;
+			let hive_b = start_scenario_rumor_hive(trace.share(), &certs).await?;
 			hive.register_with_cluster(gateway_a.addr()).await?;
 			hive_b.register_with_cluster(gateway_b.addr()).await?;
 
 			let frame = hive_publish_gossip(
+				&certs,
 				b"hive-only-rumor",
 				rumor_body(encode(&PingRequest { value: 21 })?),
 				1,
@@ -516,14 +543,16 @@ tb_assert_spec! {
 // publish may request.
 //
 // - With ttl 0 configured, the gateway clamps a publish that requests the protocol maximum.
-// - It is delivered locally and never refloods to the configured peer.
+// - The gateway delivers it locally, and it never refloods to the configured peer.
 // - A leaked reflood would raise ACCEPTED past one.
 tb_scenario! {
 	name: cluster_gossip_origin_clamps_configured_ttl,
 	spec: ClusterGossipTtlClampSpec,
 	environment Hive {
 		context: cluster_certs(),
-		start: |SetupEnv { trace, context: _ }| start_rumor_hive(trace, hive_plane_certs()),
+		start: |SetupEnv { trace, context: certs }| {
+			start_scenario_rumor_hive(trace, &certs)
+		},
 		client: |HiveEnv { trace, context: certs, hive }| async move {
 			let (conf_b, journal_b) = gossip_cluster_conf(&certs, vec![]);
 			let gateway_b = start_cluster(&trace, conf_b).await?;
@@ -532,11 +561,12 @@ tb_scenario! {
 			conf_a.gossip.ttl = 0;
 			let gateway_a = start_cluster(&trace, conf_a).await?;
 
-			let hive_b = start_rumor_hive(trace.share(), hive_plane_certs()).await?;
+			let hive_b = start_scenario_rumor_hive(trace.share(), &certs).await?;
 			hive.register_with_cluster(gateway_a.addr()).await?;
 			hive_b.register_with_cluster(gateway_b.addr()).await?;
 
 			let frame = hive_publish_gossip(
+				&certs,
 				b"clamped-rumor",
 				rumor_body(encode(&PingRequest { value: 21 })?),
 				u64::from(MAX_GOSSIP_TTL),
@@ -566,9 +596,8 @@ tb_scenario! {
 /// The gateway's own certs anchor the hive plane. A distinct random identity
 /// anchors the peer plane.
 ///
-/// [`GatewayCerts::generate`] cannot serve here, because every generated
-/// cert shares the fixed test signing key, so two "identities" would verify
-/// interchangeably.
+/// The peer identity draws its own random key, so each plane's signer
+/// verifies only under its own anchor.
 struct GossipPlaneCtx {
 	gateway: ClusterTestCerts,
 	peer_key: Secp256k1SigningKey,
@@ -608,8 +637,8 @@ tb_assert_spec! {
 //
 // - A hive-plane signer must not relay peer gossip.
 // - A peer-plane signer must not publish origin gossip.
-// - An oversized rumor is refused at admission even on the correct plane.
-// - Nothing is delivered or recorded for reflood.
+// - Admission refuses an oversized rumor even on the correct plane.
+// - The gateway delivers nothing and records nothing for reflood.
 tb_scenario! {
 	name: cluster_gossip_refuses_wrong_plane_and_oversized,
 	spec: ClusterGossipPlaneSpec,
@@ -623,7 +652,7 @@ tb_scenario! {
 			start_cluster(&trace, conf).await
 		},
 		client: |ClusterEnv { trace, context: ctx, cluster }| async move {
-			// The outer frame is signed on the hive plane, so peer trust
+			// The hive-plane identity signs the outer frame, so peer trust
 			// refuses it before the gateway examines the nested rumor.
 			let dummy = mint_origin_rumor(
 				&ctx.gateway.key,
@@ -694,18 +723,20 @@ tb_assert_spec! {
 
 // Anti-entropy repair over the beat.
 //
-// - Publisher F starts the rumor at ttl 0 so it never floods.
+// - Publisher F starts the rumor at ttl 0, so it moves by reconcile alone.
 // - Receiver R learns the rumor only when F's beat reconciles digests and pushes it.
 tb_scenario! {
 	name: cluster_gossip_repairs_missing_peer_over_beat,
 	spec: ClusterGossipReconcileRepairSpec,
 	environment Hive {
 		context: cluster_certs(),
-		start: |SetupEnv { trace, context: _ }| start_rumor_hive(trace, hive_plane_certs()),
+		start: |SetupEnv { trace, context: certs }| {
+			start_scenario_rumor_hive(trace, &certs)
+		},
 		client: |HiveEnv { trace, context: certs, hive }| async move {
 			let (conf_r, journal_r) = gossip_cluster_conf(&certs, vec![]);
 			let gateway_r = start_cluster(&trace, conf_r).await?;
-			let hive_r = start_rumor_hive(trace.share(), hive_plane_certs()).await?;
+			let hive_r = start_scenario_rumor_hive(trace.share(), &certs).await?;
 
 			let (mut conf_f, journal_f) = gossip_cluster_conf(&certs, vec![gateway_r.addr().to_string()]);
 			conf_f.peer.advertise_interval = Some(Duration::from_millis(100));
@@ -715,6 +746,7 @@ tb_scenario! {
 			hive.register_with_cluster(gateway_f.addr()).await?;
 
 			let frame = hive_publish_gossip(
+				&certs,
 				b"repair-rumor",
 				rumor_body(encode(&PingRequest { value: 21 })?),
 				0,
@@ -761,7 +793,9 @@ tb_scenario! {
 	spec: ClusterGossipRetrySpec,
 	environment Hive {
 		context: cluster_certs(),
-		start: |SetupEnv { trace, context: _ }| start_rumor_hive(trace, hive_plane_certs()),
+		start: |SetupEnv { trace, context: certs }| {
+			start_scenario_rumor_hive(trace, &certs)
+		},
 		client: |HiveEnv { trace, context: certs, hive }| async move {
 			let (mut conf_r, journal_r) = gossip_cluster_conf(&certs, vec![]);
 			conf_r.peer.advertise_interval = Some(Duration::from_millis(100));
@@ -773,6 +807,7 @@ tb_scenario! {
 			hive.register_with_cluster(gateway_f.addr()).await?;
 
 			let frame = hive_publish_gossip(
+				&certs,
 				b"retry-rumor",
 				rumor_body(encode(&PingRequest { value: 21 })?),
 				1,
@@ -783,7 +818,7 @@ tb_scenario! {
 			let pending = wait_for_pending_local(&journal_r, 1, 50, Duration::from_millis(100)).await;
 			trace.event_with(GOSSIP_PENDING_BEFORE_REGISTER, &[], u64::from(pending))?;
 
-			let hive_r = start_rumor_hive(trace.share(), hive_plane_certs()).await?;
+			let hive_r = start_scenario_rumor_hive(trace.share(), &certs).await?;
 			hive_r.register_with_cluster(gateway_r.addr()).await?;
 
 			let converged = wait_for_gossip_converged(&[journal_f, journal_r], 1, 50, Duration::from_millis(100)).await;
@@ -896,7 +931,9 @@ tb_scenario! {
 	spec: ClusterGossipRateLimitSpec,
 	environment Hive {
 		context: cluster_certs(),
-		start: |SetupEnv { trace, context: _ }| start_rumor_hive(trace, hive_plane_certs()),
+		start: |SetupEnv { trace, context: certs }| {
+			start_scenario_rumor_hive(trace, &certs)
+		},
 		client: |HiveEnv { trace, context: certs, hive }| async move {
 			let mut conf = peering_cluster_conf(&certs);
 			conf.tls.hive_trust = Some(split_hive_trust(&certs));
@@ -910,6 +947,7 @@ tb_scenario! {
 			hive.register_with_cluster(gateway.addr()).await?;
 
 			let frame = hive_publish_gossip(
+				&certs,
 				b"rate-rumor-1",
 				rumor_body(encode(&PingRequest { value: 21 })?),
 				0,
@@ -918,6 +956,7 @@ tb_scenario! {
 			send_gossip_frame(&trace, &certs, &gateway, frame).await?;
 
 			let frame = hive_publish_gossip(
+				&certs,
 				b"rate-rumor-2",
 				rumor_body(encode(&PingRequest { value: 22 })?),
 				0,
@@ -952,7 +991,8 @@ tb_assert_spec! {
 //
 // The conf asks for an hour-wide window over a one-second journal.
 // After the journal prunes the entry, the gateway refuses a byte-identical
-// replay as stale rather than re-admit it as New.
+// replay as stale rather than re-admit it as New. The scenario issues the
+// rumor at the reading of the gateway's manual clock, which it alone moves.
 //
 // - Without the clamp the replay reads as "fresh".
 // - It records again and delivers the same rumor to local servlets twice.
@@ -965,7 +1005,9 @@ tb_scenario! {
 	spec: ClusterGossipRetentionClampSpec,
 	environment Hive {
 		context: cluster_certs(),
-		start: |SetupEnv { trace, context: _ }| start_rumor_hive(trace, hive_plane_certs()),
+		start: |SetupEnv { trace, context: certs }| {
+			start_scenario_rumor_hive(trace, &certs)
+		},
 		client: |HiveEnv { trace, context: certs, hive }| async move {
 			let clock = Arc::new(ManualClock::default());
 			let mut conf = peering_cluster_conf(&certs);
@@ -981,10 +1023,12 @@ tb_scenario! {
 			let gateway = start_cluster(&trace, conf).await?;
 			hive.register_with_cluster(gateway.addr()).await?;
 
-			let frame = hive_publish_gossip(
+			let frame = hive_publish_gossip_at(
+				&certs,
 				b"clamp-rumor",
 				rumor_body(encode(&PingRequest { value: 21 })?),
 				0,
+				clock.unix(),
 			)
 			.await?;
 			send_gossip_frame(&trace, &certs, &gateway, frame.clone()).await?;
@@ -1016,7 +1060,7 @@ tb_assert_spec! {
 	}
 }
 
-// Duplicates do not spend rate tokens.
+// Duplicates leave rate tokens unspent.
 //
 // A two-token bucket with a slow refill admits rumor A.
 //
@@ -1031,7 +1075,9 @@ tb_scenario! {
 	spec: ClusterGossipDuplicateFreeSpec,
 	environment Hive {
 		context: cluster_certs(),
-		start: |SetupEnv { trace, context: _ }| start_rumor_hive(trace, hive_plane_certs()),
+		start: |SetupEnv { trace, context: certs }| {
+			start_scenario_rumor_hive(trace, &certs)
+		},
 		client: |HiveEnv { trace, context: certs, hive }| async move {
 			let mut conf = peering_cluster_conf(&certs);
 			conf.tls.hive_trust = Some(split_hive_trust(&certs));
@@ -1045,6 +1091,7 @@ tb_scenario! {
 			hive.register_with_cluster(gateway.addr()).await?;
 
 			let first = hive_publish_gossip(
+				&certs,
 				b"dup-rumor-1",
 				rumor_body(encode(&PingRequest { value: 21 })?),
 				0,
@@ -1055,6 +1102,7 @@ tb_scenario! {
 			send_gossip_frame(&trace, &certs, &gateway, first).await?;
 
 			let second = hive_publish_gossip(
+				&certs,
 				b"dup-rumor-2",
 				rumor_body(encode(&PingRequest { value: 22 })?),
 				0,
@@ -1079,7 +1127,9 @@ tb_scenario! {
 	spec: ClusterGossipJournalSeamSpec,
 	environment Hive {
 		context: cluster_certs(),
-		start: |SetupEnv { trace, context: _ }| start_rumor_hive(trace, hive_plane_certs()),
+		start: |SetupEnv { trace, context: certs }| {
+			start_scenario_rumor_hive(trace, &certs)
+		},
 		client: |HiveEnv { trace, context: certs, hive }| async move {
 			let journal = Arc::new(CountingJournal::default());
 			let mut conf = peering_cluster_conf(&certs);
@@ -1093,6 +1143,7 @@ tb_scenario! {
 			hive.register_with_cluster(gateway.addr()).await?;
 
 			let frame = hive_publish_gossip(
+				&certs,
 				b"seam-rumor",
 				rumor_body(encode(&PingRequest { value: 21 })?),
 				0,
@@ -1188,7 +1239,7 @@ tb_assert_spec! {
 	}
 }
 
-// A rumor another task already claimed is not delivered a second time.
+// A rumor that another task already claimed gets no second delivery.
 //
 // The delivery path must take the claim before the ingress round trip. A
 // path that skipped the claim would deliver this rumor, ack it, and trace
@@ -1199,7 +1250,9 @@ tb_scenario! {
 	spec: ClusterGossipHeldClaimSpec,
 	environment Hive {
 		context: cluster_certs(),
-		start: |SetupEnv { trace, context: _ }| start_rumor_hive(trace, hive_plane_certs()),
+		start: |SetupEnv { trace, context: certs }| {
+			start_scenario_rumor_hive(trace, &certs)
+		},
 		client: |HiveEnv { trace, context: certs, hive }| async move {
 			let journal = Arc::new(HeldJournal::default());
 			let mut conf = peering_cluster_conf(&certs);
@@ -1214,6 +1267,7 @@ tb_scenario! {
 			hive.register_with_cluster(gateway.addr()).await?;
 
 			let frame = hive_publish_gossip(
+				&certs,
 				b"held-rumor",
 				rumor_body(encode(&PingRequest { value: 21 })?),
 				0,
@@ -1254,16 +1308,18 @@ tb_assert_spec! {
 // flood request) weakens its own advertised work routes.
 //
 // - Each refusal weakens the trail by one trial until the gateway abandons it.
-// - `peer_routes` then stops exposing it.
+// - `peer_routes` then leaves it out.
 // - The fourth refusal scores nothing once the trail is gone.
 // - An honest relay from the same signer still delivers.
-// - Work-route abandonment leaves flooding untouched.
+// - Work-route abandonment leaves the flood untouched.
 tb_scenario! {
 	name: cluster_gossip_abandons_invalid_relay_routes,
 	spec: ClusterGossipInvalidRelaySpec,
 	environment Hive {
 		context: cluster_certs(),
-		start: |SetupEnv { trace, context: _ }| start_rumor_hive(trace, hive_plane_certs()),
+		start: |SetupEnv { trace, context: certs }| {
+			start_scenario_rumor_hive(trace, &certs)
+		},
 		client: |HiveEnv { trace, context: certs, hive }| async move {
 			let mut conf = containment_cluster_conf(&certs);
 			conf.tls.hive_trust = Some(split_hive_trust(&certs));
@@ -1355,7 +1411,7 @@ impl GossipJournal for AmnesiacJournal {
 		Ok(Vec::new())
 	}
 
-	// The grey hole retains nothing, so no rumor of its is ever retried.
+	// The grey hole retains nothing, so it has no rumor to retry.
 	fn claim_local(&self, _digest: &GossipDigest, _now: UnixMillis) -> Result<LocalClaim, ClusterError> {
 		Ok(LocalClaim::Untracked)
 	}
@@ -1401,18 +1457,20 @@ tb_assert_spec! {
 // - It weakens B's advertised work route once per round.
 // - It abandons the route past the limit.
 // - The rumor still converges to honest C through the same beat.
-// - Flooding to B keeps running off the static peer list.
+// - The flood to B keeps running off the static peer list.
 // - Only work routing drops the grey hole.
 tb_scenario! {
 	name: cluster_gossip_abandons_grey_hole_peer,
 	spec: ClusterGossipGreyHoleSpec,
 	environment Hive {
 		context: cluster_certs(),
-		start: |SetupEnv { trace, context: _ }| start_rumor_hive(trace, hive_plane_certs()),
+		start: |SetupEnv { trace, context: certs }| {
+			start_scenario_rumor_hive(trace, &certs)
+		},
 		client: |HiveEnv { trace, context: certs, hive }| async move {
 			let (conf_c, journal_c) = gossip_cluster_conf(&certs, vec![]);
 			let gateway_c = start_cluster(&trace, conf_c).await?;
-			let hive_c = start_rumor_hive(trace.share(), hive_plane_certs()).await?;
+			let hive_c = start_scenario_rumor_hive(trace.share(), &certs).await?;
 			hive_c.register_with_cluster(gateway_c.addr()).await?;
 
 			let mut conf_b = peering_cluster_conf(&certs);
@@ -1436,6 +1494,7 @@ tb_scenario! {
 			advertise_peer(&trace, &certs, &gateway_a, dial.as_bytes(), vec![servlet_urn("ping")]).await?;
 
 			let frame = hive_publish_gossip(
+				&certs,
 				b"grey-hole-rumor",
 				rumor_body(encode(&PingRequest { value: 21 })?),
 				0,
@@ -1538,10 +1597,10 @@ tb_assert_spec! {
 // A trusted peer relays two rumors whose origin the gateway does not hold. The
 // relay's own rate bucket holds one token.
 //
-// - The first rumor draws Unauthenticated, which tells the relay to stop offering that origin.
+// - The first rumor draws Unauthenticated, which tells the relay to stop its offers of that origin.
 // - The drop spends the relay's one token, so the second answers ResourceExhausted.
 // - The token came from the relay's own bucket, so a rumor the relay signed itself is limited too.
-// - The relay is never scored, so its routes stay (PEER_ROUTES_AFTER_UNKNOWN_ORIGIN).
+// - The gateway never scores the relay, so its routes stay (PEER_ROUTES_AFTER_UNKNOWN_ORIGIN).
 tb_scenario! {
 	name: cluster_gossip_unknown_origin_costs_the_relay_a_token_and_no_score,
 	spec: ClusterGossipUnknownOriginSpec,
@@ -1642,7 +1701,7 @@ tb_assert_spec! {
 	}
 }
 
-// A target that refuses an origin is offered that origin once.
+// A target that refuses an origin gets that origin once.
 //
 // The bridge holds rumors of two origins the edge does not trust, and beats on
 // a clock only this test moves. Each origin costs the bridge one refusal at the
@@ -1967,6 +2026,7 @@ tb_scenario! {
 		},
 		client: |ClusterEnv { trace, context: certs, cluster }| async move {
 			let frame = hive_publish_gossip(
+				&certs,
 				b"non-member-rumor",
 				rumor_body(encode(&PingRequest { value: 21 })?),
 				0,
@@ -2164,7 +2224,7 @@ tb_scenario! {
 			trace.event_with(PEER_EXPEL_ADDRESS_VERIFIED, &[], verified)?;
 
 			let body = rumor_body(encode(&PingRequest { value: 21 })?);
-			let frame = hive_publish_gossip(b"before-removal", body, 1).await?;
+			let frame = hive_publish_gossip(&ctx.local, b"before-removal", body, 1).await?;
 			send_gossip_frame(&trace, &ctx.local, &gateway, frame).await?;
 
 			let journals = [Arc::clone(&journal_of_neighbor)];
@@ -2174,7 +2234,7 @@ tb_scenario! {
 			ctx.trust.switch();
 
 			let body = rumor_body(encode(&PingRequest { value: 22 })?);
-			let frame = hive_publish_gossip(b"after-removal", body, 1).await?;
+			let frame = hive_publish_gossip(&ctx.local, b"after-removal", body, 1).await?;
 			send_gossip_frame(&trace, &ctx.local, &gateway, frame).await?;
 
 			let dropped = wait_for_target_dropped(&table, neighbor_addr, 50, Duration::from_millis(100)).await;
@@ -2280,7 +2340,7 @@ tb_scenario! {
 			trace.event_with(PEER_EXPEL_ADDRESS_VERIFIED, &[], verified)?;
 
 			let body = rumor_body(encode(&PingRequest { value: 21 })?);
-			let frame = hive_publish_gossip(b"authority-rumor", body, 1).await?;
+			let frame = hive_publish_gossip(&ctx.local, b"authority-rumor", body, 1).await?;
 			send_gossip_frame(&trace, &ctx.local, &gateway, frame).await?;
 
 			let dropped = wait_for_target_dropped(&table, leaf_addr, 50, Duration::from_millis(100)).await;
@@ -2313,7 +2373,7 @@ tb_assert_spec! {
 	}
 }
 
-// Peer exchange stops sharing an address the table expelled.
+// Peer exchange withholds an address that the table expelled.
 //
 // A member's advertisement installs a route and teaches the table its address.
 // No beat runs, so the address stays a candidate until the scenario expels it,
@@ -2377,14 +2437,16 @@ tb_scenario! {
 	spec: ClusterGossipIngressOriginSpec,
 	environment Hive {
 		context: cluster_certs(),
-		start: |SetupEnv { trace, context: _ }| start_rumor_hive(trace, hive_plane_certs()),
+		start: |SetupEnv { trace, context: certs }| {
+			start_scenario_rumor_hive(trace, &certs)
+		},
 		client: |HiveEnv { trace, context: certs, hive }| async move {
 			let (conf, _journal) = gossip_cluster_conf(&certs, vec![]);
 			let gateway = start_cluster(&trace, conf).await?;
 			hive.register_with_cluster(gateway.addr()).await?;
 
 			let body = rumor_body(encode(&PingRequest { value: 21 })?);
-			let frame = hive_publish_gossip(b"ingress-origin-rumor", body, 0).await?;
+			let frame = hive_publish_gossip(&certs, b"ingress-origin-rumor", body, 0).await?;
 			send_gossip_frame(&trace, &certs, &gateway, frame).await?;
 
 			gateway.stop();
@@ -2419,9 +2481,9 @@ tb_scenario! {
 	environment Bare {
 		context: cluster_certs(),
 		exec: |SetupEnv { trace, context: certs }| async move {
-			let hive_plane = hive_plane_certs();
+			let hive_plane = hive_plane_certs(&certs);
 			let impostor_certs = stranger_gateway_certs();
-			let impostor_conf = servlet_tls_config(&impostor_certs)?;
+			let impostor_conf = servlet_tls_builder(&impostor_certs)?.with_config(Arc::new(None)).build();
 			let impostor = ClusterRumorServlet::start(Arc::new(trace.share()), impostor_conf).await?;
 
 			let (mut conf, _journal) = gossip_cluster_conf(&certs, vec![]);
@@ -2437,7 +2499,7 @@ tb_scenario! {
 			trace.event_with(REGISTER_STATUS, &[], registered.status)?;
 
 			let body = rumor_body(encode(&PingRequest { value: 21 })?);
-			let frame = hive_publish_gossip(b"ingress-impostor-rumor", body, 0).await?;
+			let frame = hive_publish_gossip(&certs, b"ingress-impostor-rumor", body, 0).await?;
 			send_gossip_frame(&trace, &certs, &gateway, frame).await?;
 
 			gateway.stop();
@@ -2478,7 +2540,7 @@ tb_assert_spec! {
 // - The gateway answers the publish Ok and retains it (held = 1).
 // - The gateway acks the record at once, so it never enters the pending retry set.
 // - The gateway reports no local delivery (ACCEPTED = 0).
-// - The journal settles before the publish reply returns, so the probes need no polling.
+// - The journal settles before the publish reply returns, so the probes need no poll.
 tb_scenario! {
 	name: cluster_gossip_ingress_none_acks_on_record,
 	spec: ClusterGossipIngressNoneSpec,
@@ -2496,6 +2558,7 @@ tb_scenario! {
 		},
 		client: |ClusterEnv { trace, context: ctx, cluster }| async move {
 			let frame = hive_publish_gossip(
+				&ctx.certs,
 				b"ingress-none-rumor",
 				rumor_body(encode(&PingRequest { value: 21 })?),
 				0,
@@ -2535,14 +2598,16 @@ tb_assert_spec! {
 // - S's beat verifies its anchor P and shares P over PEX.
 // - X learns P, feeler-probes it, proves its flood membership, and promotes it (CLUSTER_PEER_DISCOVERED).
 // - X's advertisement teaches P to dial back, and P promotes X the same way.
-// - A rumor published at P at ttl 0 never floods.
+// - A rumor that P publishes at ttl 0 moves by repair alone.
 // - It reaches X's ingress only across those two discovered edges.
 tb_scenario! {
 	name: cluster_peer_discovery_bootstraps_from_seed,
 	spec: ClusterPeerDiscoverySpec,
 	environment Hive {
 		context: cluster_certs(),
-		start: |SetupEnv { trace, context: _ }| start_rumor_hive(trace, hive_plane_certs()),
+		start: |SetupEnv { trace, context: certs }| {
+			start_scenario_rumor_hive(trace, &certs)
+		},
 		client: |HiveEnv { trace, context: certs, hive }| async move {
 			let (mut conf_p, journal_p) = gossip_cluster_conf(&certs, vec![]);
 			conf_p.peer.advertise_interval = Some(Duration::from_millis(100));
@@ -2558,11 +2623,12 @@ tb_scenario! {
 			let table_x = Arc::clone(conf_x.peer.table());
 			let gateway_x = start_cluster(&trace, conf_x).await?;
 
-			let hive_x = start_rumor_hive(trace.share(), hive_plane_certs()).await?;
+			let hive_x = start_scenario_rumor_hive(trace.share(), &certs).await?;
 			hive_x.register_with_cluster(gateway_x.addr()).await?;
 			hive.register_with_cluster(gateway_p.addr()).await?;
 
 			let frame = hive_publish_gossip(
+				&certs,
 				b"discovery-rumor",
 				rumor_body(encode(&PingRequest { value: 21 })?),
 				0,
@@ -2576,7 +2642,7 @@ tb_scenario! {
 
 			// The spec counts promotions, and each one is a beat apart from
 			// convergence. Wait for the beats this scenario is about before
-			// taking the gateways away from them.
+			// the scenario takes the gateways away from them.
 			wait_for_promoted(&table_s, 1, 100, Duration::from_millis(100)).await;
 			wait_for_promoted(&table_x, 1, 100, Duration::from_millis(100)).await;
 
@@ -2905,7 +2971,7 @@ tb_scenario! {
 	}
 }
 
-/// Polls until gateways have refused `count` advertisements, or five seconds
+/// Polls until the gateways refuse `count` advertisements, or five seconds
 /// pass.
 async fn wait_for_refused_advertisements(trace: &TraceCollector, count: usize) -> bool {
 	let refused = || trace.recorded(events::CLUSTER_PEER_ADVERTISE_REFUSED) >= count;
@@ -3015,7 +3081,7 @@ tb_scenario! {
 			trace.event_with(PEER_EXPEL_ADDRESS_VERIFIED, &[], verified)?;
 
 			let body = rumor_body(encode(&PingRequest { value: 21 })?);
-			let frame = hive_publish_gossip(b"reflood-expel-rumor", body, 1).await?;
+			let frame = hive_publish_gossip(&ctx.local, b"reflood-expel-rumor", body, 1).await?;
 			send_gossip_frame(&trace, &ctx.local, &publisher, frame).await?;
 
 			let dropped = wait_for_target_dropped(&table, outside_addr, 50, Duration::from_millis(100)).await;
@@ -3034,7 +3100,7 @@ pub fn peer_addr(text: impl AsRef<str>) -> PeerAddress {
 }
 
 /// The fixture dial address `text`, admitted by `conf`'s dial policy the
-/// way a peer-exchange entry is admitted before the table learns it.
+/// way the policy admits a peer-exchange entry before the table learns it.
 pub fn dial_admitted_by(conf: &ClusterConfig, text: impl AsRef<str>) -> AdmittedDial {
 	let socket = peer_addr(text);
 	let admitted = conf.peer.admit_dial(socket);
@@ -3538,7 +3604,8 @@ tb_assert_spec! {
 	}
 }
 
-// The beat never scores a local journal fault against an answering peer.
+// The beat charges a local journal fault to this gateway, not to an
+// answering peer.
 //
 // The prober promotes the live member into tried, then its own journal
 // fails `held_digests` at the start of every reconcile round.

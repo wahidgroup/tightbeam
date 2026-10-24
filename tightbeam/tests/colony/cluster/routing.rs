@@ -190,8 +190,8 @@ servlet! {
 
 		// The SIGNED and PREVIOUS probes witness presence only. Byte
 		// fidelity rests on SIG_VALID, whose signature covers the
-		// frame's to-be-signed bytes, so SIG_VALID must not be weakened
-		// on the assumption the presence probes cover fidelity.
+		// frame's to-be-signed bytes, so no change may weaken SIG_VALID
+		// on the assumption that the presence probes cover fidelity.
 		let sig_valid = frame_signature_verifies(&frame, &probe_signing_key());
 
 		trace.event_with(PROBE_FRAME_CLIENT_ID, &[], u32::from(frame.metadata().id() == b"client-signed-work"))?;
@@ -327,7 +327,7 @@ tb_scenario! {
 	}
 }
 
-// Work must target a servlet TYPE: instance-narrowed URNs are refused
+// Work must target a servlet TYPE: the gateway refuses instance-narrowed URNs
 // even when the type is routable, so nothing bypasses the load balancer.
 tb_scenario! {
 	name: cluster_refuses_instance_addressed_work,
@@ -356,8 +356,8 @@ tb_scenario! {
 	}
 }
 
-// Peer-hop frame delivery: the same end-to-end contract must hold when
-// the serving gateway is reached through a peer forward, not locally.
+// Peer-hop frame delivery: the same end-to-end contract must hold when a
+// peer forward, not a local route, reaches the serving gateway.
 
 /// Two member gateways with distinct identities.
 ///
@@ -467,10 +467,10 @@ tb_assert_spec! {
 
 // A work payload that does not decode as a frame is a permanent caller
 // fault. The gateway must refuse it as InvalidArgument at admission,
-// before route selection. Zero CLUSTER_WORK_FAILED proves that no healthy
-// pheromone trail was weakened and no failover retry burned. The follow-up
-// valid work then echoes through the same trail, which proves the route
-// stayed serviceable.
+// before route selection. Zero CLUSTER_WORK_FAILED proves that the gateway
+// weakened no healthy pheromone trail and burned no failover retry. The
+// follow-up valid work then echoes through the same trail, which proves the
+// route stayed serviceable.
 tb_scenario! {
 	name: cluster_refuses_malformed_work_payload,
 	spec: ClusterMalformedWorkSpec,
@@ -481,7 +481,7 @@ tb_scenario! {
 		},
 		hives: |SetupEnv { trace, context: certs }| vec![start_ping_hive(trace, certs, None)],
 		client: |ClusterEnv { trace, context: certs, cluster }| async move {
-			// The dual wrap is composed manually because the malformed
+			// The test composes the dual wrap by hand because the malformed
 			// `Work` payload is itself the wire shape under test.
 			let malformed = ClusterWorkRequest {
 				servlet_type: servlet_urn("ping"),
@@ -513,7 +513,7 @@ tb_scenario! {
 }
 
 cluster! {
-	/// Gateway with an edge accept plane, which proves the `edge:` macro arm.
+	/// A gateway with an edge accept plane, which proves the `edge:` macro arm.
 	///
 	/// The edge protocol matches the colony protocol here because core
 	/// ships one async transport, so the transport extensions exercise a
@@ -539,8 +539,8 @@ tb_assert_spec! {
 
 // The edge accept plane is a work-only surface on its own listener. Work
 // submitted at the edge address routes to the servlet exactly like colony
-// work, while a validly signed hive registration on the same connection
-// is refused with PermissionDenied. The hive keeps registering through
+// work, while the edge refuses a validly signed hive registration on the same
+// connection with PermissionDenied. The hive keeps registering through
 // the colony plane (CLUSTER_HIVE_REGISTERED stays 1).
 tb_scenario! {
 	name: cluster_edge_plane_admits_work_only,
@@ -598,8 +598,8 @@ tb_assert_spec! {
 }
 
 // A configured edge plane that cannot parse its bind address fails
-// Cluster::start closed: the call returns Err and no accept loop is
-// left running (bind-then-spawn owns both listeners before spawn).
+// Cluster::start closed: the call returns Err and no accept loop stays
+// running (bind-then-spawn owns both listeners before spawn).
 tb_scenario! {
 	name: cluster_edge_bind_failure_fails_start,
 	spec: ClusterEdgeBindFailureSpec,
@@ -708,7 +708,7 @@ async fn gateway_trying_first(
 
 	let mut client = connect_cluster(certs, cluster.addr()).await?;
 	let hive_addr = b"127.0.0.1:65030";
-	let servlets = [servlet_info("ping", first), servlet_info("ping", second)];
+	let servlets = [servlet_info(certs, "ping", first), servlet_info(certs, "ping", second)];
 	let registered = register_signed_hive_serving(&mut client, &certs.key, b"two", hive_addr, servlets).await?;
 	trace.event_with(REGISTER_STATUS, &[], registered.status)?;
 
@@ -861,7 +861,8 @@ impl OversizedReplyRelay {
 		let replies = Self::replies(&mut servlet_read, &mut gateway_write, &ran);
 
 		// Either side's close ends the relay of this connection, and the
-		// scenario reads the gateway's answer, so neither outcome is read.
+		// scenario reads the gateway's answer, so the relay reads neither
+		// outcome.
 		let _ended = tokio::join!(requests, replies);
 	}
 
@@ -997,7 +998,7 @@ fn sibling_routes(certs: &ClusterTestCerts, address: impl AsRef<str>) -> Arc<dyn
 	let instance_key = instance.canonical_bytes();
 	let type_key = sibling_type.canonical_bytes();
 	let route_address: Arc<[u8]> = Arc::from(address.as_bytes());
-	routes.add_route(instance_key, route_address, servlet_signer(), type_key);
+	routes.add_route(instance_key, route_address, signer_of(&certs.cert), type_key);
 
 	Arc::new(routes)
 }
@@ -1099,7 +1100,7 @@ tb_scenario! {
 
 			let mut client = connect_cluster(&certs, cluster.addr()).await?;
 			let hive_addr = b"127.0.0.1:65033";
-			let servlets = [servlet_info("ping", impostor.addr().to_string())];
+			let servlets = [servlet_info(&certs, "ping", impostor.addr().to_string())];
 			let registered =
 				register_signed_hive_serving(&mut client, &certs.key, b"impostor", hive_addr, servlets).await?;
 			trace.event_with(REGISTER_STATUS, &[], registered.status)?;

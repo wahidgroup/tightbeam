@@ -47,10 +47,14 @@
 use core::fmt;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use core::marker::PhantomData;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use core::num::NonZeroUsize;
 
 #[cfg(all(not(feature = "std"), any(feature = "transport-cms", feature = "transport-hpke")))]
 use alloc::vec::Vec;
 
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::asn1::WireDer;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::cms::signed_data::SignedData;
 #[cfg(feature = "transport-cms")]
@@ -68,7 +72,7 @@ use crate::constants::{
 	TIGHTBEAM_SERVER_FINISHED_DOMAIN, TIGHTBEAM_SERVER_FINISHED_KEY_INFO, TIGHTBEAM_SESSION_KDF_INFO,
 };
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::crypto::aead::{DirectionalCiphers, KeyInit, RuntimeAead, SessionKeys};
+use crate::crypto::aead::{DirectionalCiphers, RuntimeAead, SessionKeys};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::cms::{AttributesExt, AuthEnvelopedData, ContentEncryption, EnvelopeError, Opener, Recipient};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -76,11 +80,7 @@ use crate::crypto::common::typenum::Unsigned;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::hash::Digest;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::crypto::hkdf::hmac::{Mac, SimpleHmac};
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::crypto::hkdf::{InvalidLength, SimpleHkdf};
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::crypto::kdf::{EcdhSecret, KdfError, KdfFunction};
+use crate::crypto::kdf::{EcdhSecret, KdfError, KdfFunction, ZeroizingHkdf, ZeroizingHmac};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::profiles::{CryptoProvider, KeyWrapAlgorithm};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -108,9 +108,7 @@ use crate::der::asn1::{ObjectIdentifier, OctetStringRef};
 ))]
 use crate::der::oid::AssociatedOid;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::der::{
-	Decode, DecodeValue, EncodeValue, FixedTag, Header, Length, Reader, Result as DerResult, Tag, Writer,
-};
+use crate::der::{DecodeValue, EncodeValue, FixedTag, Header, Length, Reader, Result as DerResult, Tag, Writer};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::oids::HANDSHAKE_TRANSCRIPT_HASH;
 #[cfg(feature = "transport-cms")]
@@ -414,17 +412,16 @@ impl HandshakeSecret {
 		P: CryptoProvider,
 	{
 		// 1. Extract the PRK of the secret, and expand the role's `MacKey` from it.
-		let prk = SimpleHkdf::<P::Digest>::new(Some(salt.as_bytes()), &self.0);
+		let prk = ZeroizingHkdf::<P::Digest>::new(salt.as_bytes(), &self.0);
 		let mut mac_key = ZeroizingBytes::new(vec![0u8; <P::Digest as Digest>::output_size()]);
 		let expanded = prk.expand(role.key_label(), &mut mac_key);
 		expanded.map_err(KdfError::DerivationFailed)?;
 
 		// 2. MAC the parts in order under the `MacKey`.
-		let mac = <SimpleHmac<P::Digest> as KeyInit>::new_from_slice(&mac_key);
-		let mac = mac.map_err(|_| KdfError::DerivationFailed(InvalidLength))?;
+		let mac = ZeroizingHmac::<P::Digest>::new(&mac_key);
 		let mac = parts.iter().fold(mac, |mac, part| mac.chain_update(part));
 		let tag = mac.finalize();
-		Ok(KeyConfirmation(DigestOutput::parse(tag.into_bytes())?))
+		Ok(KeyConfirmation(DigestOutput::parse(tag.as_slice())?))
 	}
 
 	/// Verify that `received` is the key-confirmation tag of this secret over
@@ -506,7 +503,7 @@ impl SecretSeal {
 	const fn padding(self) -> Option<Padding> {
 		match self {
 			Self::Ack => None,
-			Self::Closing => Some(Padding { floor: 1024, step: 512 }),
+			Self::Closing => Some(Padding { floor: 1024, step: CLOSING_STEP }),
 		}
 	}
 
@@ -519,12 +516,25 @@ impl SecretSeal {
 		}
 	}
 
+	/// The sealed envelope `der` carries, admitted by the CMS rules of the
+	/// admission walk and decoded once, for a [`Sealer`] of this purpose to
+	/// open.
+	///
+	/// # Errors
+	///
+	/// - The [`Self::refusal`] of [`EnvelopeError::Encoding`] -- `der` is no
+	///   DER `AuthEnvelopedData` that the walk admits.
+	pub(crate) fn admit(self, der: impl AsRef<[u8]>) -> Result<WireDer<AuthEnvelopedData>, HandshakeError> {
+		let admitted = WireDer::try_from(der.as_ref());
+		admitted.map_err(|error| self.refusal(EnvelopeError::Encoding(error)))
+	}
+
 	/// The plaintext as it is sealed.
 	///
 	/// A purpose with no padding seals the plaintext bare, in the buffer it
 	/// moved in. A padded purpose seals a big-endian `u16` length, the
 	/// plaintext, and zero bytes up to its padded length, so the opener finds
-	/// the plaintext without reading it.
+	/// the end of the plaintext from the prefix alone.
 	pub(crate) fn frame(self, plaintext: impl Into<Vec<u8>>) -> Result<ZeroizingBytes, HandshakeError> {
 		let plaintext = ZeroizingBytes::new(plaintext.into());
 		let Some(padding) = self.padding() else {
@@ -532,7 +542,7 @@ impl SecretSeal {
 		};
 
 		let length = u16::try_from(plaintext.len()).map_err(|_| HandshakeError::SealedFrame)?;
-		let padded_len = padding.padded_len(plaintext.len());
+		let padded_len = padding.padded_len(plaintext.len()).ok_or(HandshakeError::SealedFrame)?;
 		let mut framed = ZeroizingBytes::new(Vec::with_capacity(padded_len));
 		framed.extend_from_slice(&length.to_be_bytes());
 		framed.extend_from_slice(&plaintext);
@@ -554,7 +564,7 @@ impl SecretSeal {
 		let (plaintext, pad) = rest.split_at_checked(length).ok_or(HandshakeError::SealedFrame)?;
 
 		let padded = pad.iter().all(|byte| *byte == 0);
-		let conforming = framed.len() == padding.padded_len(length);
+		let conforming = padding.padded_len(length) == Some(framed.len());
 		if !padded || !conforming {
 			return Err(HandshakeError::SealedFrame);
 		}
@@ -567,23 +577,32 @@ impl SecretSeal {
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 const FRAME_LENGTH_SIZE: usize = 2;
 
+/// The step a closing pads to, 512 octets.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+const CLOSING_STEP: NonZeroUsize = match NonZeroUsize::new(512) {
+	Some(step) => step,
+	None => NonZeroUsize::MIN,
+};
+
 /// The length a framed plaintext pads to: the next multiple of `step`, and at
 /// least `floor`.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Padding {
 	floor: usize,
-	step: usize,
+	step: NonZeroUsize,
 }
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl Padding {
 	/// The padded length of the frame of a plaintext of `plaintext` bytes,
-	/// whose length prefix the frame adds ahead of it.
-	fn padded_len(self, plaintext: usize) -> usize {
-		let framed = FRAME_LENGTH_SIZE + plaintext;
-		let stepped = framed.div_ceil(self.step) * self.step;
-		stepped.max(self.floor)
+	/// whose length prefix the frame adds ahead of it, or `None` when that
+	/// length overflows a `usize`.
+	fn padded_len(self, plaintext: usize) -> Option<usize> {
+		let framed = plaintext.checked_add(FRAME_LENGTH_SIZE)?;
+		let step = self.step.get();
+		let stepped = framed.div_ceil(step).checked_mul(step)?;
+		Some(stepped.max(self.floor))
 	}
 }
 
@@ -652,12 +671,12 @@ impl<P: HandshakeProvider> Sealer<P> {
 		sealed.map_err(|error| self.purpose.refusal(error))
 	}
 
-	/// Open the `AuthEnvelopedData` whose DER is `der`, of type
-	/// `content_type`, which a sealer of the same secret, purpose, and
-	/// transcript sealed, and strip its frame.
+	/// Open `sealed`, an `AuthEnvelopedData` of type `content_type` that a
+	/// sealer of the same secret, purpose, and transcript sealed, and strip
+	/// its frame.
 	///
-	/// The transcript hash attribute is checked before the content decrypts,
-	/// and the tag then covers it and the content type.
+	/// The open checks the transcript hash attribute before the content
+	/// decrypts, and the tag then covers it and the content type.
 	///
 	/// # Errors
 	///
@@ -669,12 +688,10 @@ impl<P: HandshakeProvider> Sealer<P> {
 	/// - [`HandshakeError::DerError`] -- the transcript hash attribute fails to encode.
 	pub(crate) async fn open(
 		self,
-		der: impl AsRef<[u8]>,
+		sealed: WireDer<AuthEnvelopedData>,
 		content_type: ObjectIdentifier,
 	) -> Result<SecretSlice<u8>, HandshakeError> {
-		let der = der.as_ref();
-		let envelope = AuthEnvelopedData::from_der(der);
-		let envelope = envelope.map_err(|error| self.purpose.refusal(EnvelopeError::Encoding(error)))?;
+		let (der, envelope) = sealed.into_parts();
 
 		// 1. Refuse another transcript before the content decrypts.
 		self.refuse_unbound(envelope.auth_attrs.as_ref())?;
@@ -682,7 +699,7 @@ impl<P: HandshakeProvider> Sealer<P> {
 		let opener = Opener::Kek { kek: &self.kek, key_identifier: &key_identifier };
 
 		// 2. Open the content under the tag, which covers the attributes.
-		let opened = envelope.open::<P>(der, &opener, content_type).await;
+		let opened = envelope.open::<P>(&der, &opener, content_type).await;
 		let opened = opened.map_err(|error| self.purpose.refusal(error))?;
 		opened.with(|framed| self.purpose.unframe(framed))
 	}
@@ -917,7 +934,8 @@ impl EpochSecret {
 	///
 	/// - `local` is a single-use scalar, moved in. It is wiped before the
 	///   derivation runs, so it is gone before any later await of the caller.
-	/// - `peer` is a [`PeerPoint`], so the point passed [`PeerEphemeral`].
+	/// - `peer` is a [`PeerPoint`], so it is a point of the curve other than
+	///   the identity. Each rekey caller admits it through [`PeerEphemeral`].
 	///
 	/// # Errors
 	///
@@ -1602,6 +1620,7 @@ impl<P: HandshakeProvider> Agreed<P> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::asn1::admission::fixtures::{descending_attribute, tlv};
 	use crate::cms::signed_data::{SignerInfo, SignerInfos};
 	use crate::constants::TIGHTBEAM_ACK_KEY_ID_DOMAIN;
 	use crate::crypto::aead::{RecordDirection, RecvCipher, SendCipher};
@@ -1611,7 +1630,7 @@ mod tests {
 	use crate::crypto::sign::ecdsa::k256::Secp256k1;
 	use crate::crypto::x509::KeyPurposes;
 	use crate::der::asn1::{OctetString, SetOfVec};
-	use crate::der::{Decode, Encode};
+	use crate::der::{Decode, Encode, ErrorKind};
 	use crate::oids::DATA;
 	use crate::random::OsRng;
 	use crate::testing::{Aes256Sha3_512Provider, EnvelopeRecipient, TestCertificate, TestKey};
@@ -2202,6 +2221,24 @@ mod tests {
 		content.map(|content| content.as_bytes().len())
 	}
 
+	/// A sealed acknowledgement arrives inside an OCTET STRING, which the walk
+	/// of the closing reads as octets, so its own admission walks it before
+	/// its decode sorts a set in it (X.690 § 11.6).
+	#[test]
+	fn a_sealed_ack_of_a_descending_set_is_refused() {
+		let refused = SecretSeal::Ack.admit(tlv(Tag::Sequence, &descending_attribute()));
+		assert_eq!(ack_encoding_refusal(refused), Some(ErrorKind::SetOrdering));
+	}
+
+	/// The kind of the DER error that refused an acknowledgement, or `None`
+	/// for another outcome.
+	fn ack_encoding_refusal<T>(outcome: Result<T, HandshakeError>) -> Option<ErrorKind> {
+		match outcome {
+			Err(HandshakeError::ReceiptAckCipher(EnvelopeError::Encoding(error))) => Some(error.kind()),
+			_ => None,
+		}
+	}
+
 	/// An acknowledgement sealed under one handshake secret opens under the
 	/// same secret, salt, and transcript.
 	#[tokio::test]
@@ -2210,7 +2247,7 @@ mod tests {
 		let sealed = sealer_of(&secret, SecretSeal::Ack, &ack_transcript()).seal(DATA, b"settlement answer")?;
 
 		let opener = sealer_of(&secret, SecretSeal::Ack, &ack_transcript());
-		let opened = opener.open(sealed.to_der()?, DATA).await?;
+		let opened = opener.open(WireDer::new(sealed)?, DATA).await?;
 		assert!(opened.with(|bytes| bytes.as_slice() == b"settlement answer"));
 		Ok(())
 	}
@@ -2225,7 +2262,7 @@ mod tests {
 		let sealed = sealer_of(&secret, SecretSeal::Ack, &ack_transcript()).seal(DATA, b"settlement answer")?;
 
 		let opener = sealer_of(&other, SecretSeal::Ack, &ack_transcript());
-		let refused = opener.open(sealed.to_der()?, DATA).await;
+		let refused = opener.open(WireDer::new(sealed)?, DATA).await;
 		assert!(matches!(
 			refused,
 			Err(HandshakeError::ReceiptAckCipher(EnvelopeError::KeyUnwrap))
@@ -2242,7 +2279,7 @@ mod tests {
 		let sealed = sealer_of(&secret, SecretSeal::Ack, &ack_transcript()).seal(DATA, b"settlement answer")?;
 
 		let opener = sealer_of(&secret, SecretSeal::Ack, &other_transcript);
-		let refused = opener.open(sealed.to_der()?, DATA).await;
+		let refused = opener.open(WireDer::new(sealed)?, DATA).await;
 		assert!(matches!(
 			refused,
 			Err(HandshakeError::ReceiptAckCipher(EnvelopeError::AuthenticatedAttribute))
@@ -2261,7 +2298,7 @@ mod tests {
 		let sealed = with_transcript_attribute(sealed, &other_transcript);
 
 		let opener = sealer_of(&secret, SecretSeal::Ack, &ack_transcript());
-		let refused = opener.open(sealed.to_der()?, DATA).await;
+		let refused = opener.open(WireDer::new(sealed)?, DATA).await;
 		assert!(matches!(
 			refused,
 			Err(HandshakeError::ReceiptAckCipher(EnvelopeError::AuthenticatedAttribute))
@@ -2278,7 +2315,7 @@ mod tests {
 		let sealed = sealer_of(&fixed_secret(), SecretSeal::Ack, &transcript).seal(DATA, b"settlement answer")?;
 
 		let opener = sealer_of(&fixed_secret(), SecretSeal::Ack, &last_byte_differs);
-		let refused = opener.open(sealed.to_der()?, DATA).await;
+		let refused = opener.open(WireDer::new(sealed)?, DATA).await;
 		assert!(matches!(
 			refused,
 			Err(HandshakeError::ReceiptAckCipher(EnvelopeError::AuthenticatedAttribute))
@@ -2369,7 +2406,7 @@ mod tests {
 		let sealed = sealer_of(&secret, SecretSeal::Closing, &ack_transcript()).seal(DATA, b"client identity")?;
 
 		let opener = sealer_of(&secret, SecretSeal::Closing, &ack_transcript());
-		let opened = opener.open(sealed.to_der()?, DATA).await?;
+		let opened = opener.open(WireDer::new(sealed)?, DATA).await?;
 
 		assert!(opened.with(|bytes| bytes.as_slice() == b"client identity"));
 		Ok(())
@@ -2403,7 +2440,7 @@ mod tests {
 		let sealed = sealer_of(&secret, SecretSeal::Closing, &ack_transcript()).seal(DATA, b"client identity")?;
 
 		let opener = sealer_of(&secret, SecretSeal::Ack, &ack_transcript());
-		let refused = opener.open(sealed.to_der()?, DATA).await;
+		let refused = opener.open(WireDer::new(sealed)?, DATA).await;
 		assert!(matches!(
 			refused,
 			Err(HandshakeError::ReceiptAckCipher(EnvelopeError::KeyIdentifier))
@@ -2451,7 +2488,7 @@ mod tests {
 		let sealed = sealer_of(&secret, SecretSeal::Closing, &ack_transcript()).seal(DATA, identity)?;
 
 		let opener = sealer_of(&secret, SecretSeal::Closing, &ack_transcript());
-		let opened = opener.open(sealed.to_der()?, DATA).await?;
+		let opened = opener.open(WireDer::new(sealed)?, DATA).await?;
 
 		assert!(opened.with(|bytes| bytes.as_slice() == identity));
 		Ok(())
@@ -2546,7 +2583,7 @@ mod tests {
 		let secret = fixed_secret();
 		let sealed = terms.sealer(&secret, SecretSeal::Closing)?.seal(DATA, b"client identity")?;
 
-		let refused = terms.sealer(&secret, SecretSeal::Ack)?.open(sealed.to_der()?, DATA).await;
+		let refused = terms.sealer(&secret, SecretSeal::Ack)?.open(WireDer::new(sealed)?, DATA).await;
 		assert!(matches!(
 			refused,
 			Err(HandshakeError::ReceiptAckCipher(EnvelopeError::KeyIdentifier))

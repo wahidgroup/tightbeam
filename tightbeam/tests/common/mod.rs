@@ -1,10 +1,12 @@
-//! Common test helpers and utilities
+//! The test helpers that the integration suites share.
 //!
-//! Shared code for integration tests including certificate creation,
-//! server fixtures, and validation helpers.
+//! They cover certificate creation, server fixtures, and validation helpers.
 
-// Every suite that waits on another task: colony and DTN through `tokio`,
-// and the multiplex transport suites, which can build without it.
+#[cfg(feature = "colony")]
+pub mod hive;
+
+// Every suite that waits on another task uses it: colony and DTN through
+// `tokio`, and the multiplex transport suites, which can build without it.
 #[cfg(any(feature = "tokio", feature = "transport-multiplex"))]
 pub mod poll;
 

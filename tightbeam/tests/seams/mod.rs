@@ -28,6 +28,8 @@ mod frames;
 #[cfg(feature = "transport-hpke")]
 mod hpke;
 mod kem;
+#[cfg(all(feature = "transport-multiplex", feature = "tcp", feature = "tokio"))]
+mod mux;
 mod servlet;
 mod trust;
 

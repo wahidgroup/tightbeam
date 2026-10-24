@@ -1,4 +1,4 @@
-//! Unified configuration for `tb_scenario!` tests
+//! The configuration that a `tb_scenario!` test runs.
 //!
 //! The builder takes owned values and `build()` wraps them in `Arc`, so the
 //! macro and the servlets share by refcount rather than by copy.
@@ -45,7 +45,8 @@ impl Expect {
 	}
 }
 
-/// Why [`ScenarioConfigBuilder::build`] refused a configuration.
+/// Why [`ScenarioConfigBuilder::build`] or [`ScenarioConfig::guided_by`]
+/// refused a configuration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Errorizable)]
 pub enum ScenarioConfigError {
 	/// Nothing this configuration names can reject a run.
@@ -55,9 +56,15 @@ pub enum ScenarioConfigError {
 	/// The expectation names a layer that cannot reject this configuration.
 	#[error("expected a violation from {0:?}, which cannot reject this configuration")]
 	ExpectViolationWithoutVerifier(Layer),
+
+	/// A guided fuzz run names its CSP process in `csp:`, and its
+	/// configuration names a process too.
+	#[error("a guided fuzz run names its CSP process in csp: alone, and this configuration names one too")]
+	CspNamedTwice,
 }
 
-/// Unified configuration for tb_scenario! tests (zero-copy with Arc wrapping)
+/// The configuration of a `tb_scenario!` test, whose fields sit behind `Arc`
+/// so a clone shares them rather than copying them.
 #[derive(Clone)]
 pub struct ScenarioConfig {
 	specs: Arc<Vec<&'static BuiltAssertSpec>>,
@@ -72,12 +79,12 @@ pub struct ScenarioConfig {
 }
 
 impl ScenarioConfig {
-	/// Create a new builder
+	/// Starts an empty builder.
 	pub fn builder() -> ScenarioConfigBuilder {
 		ScenarioConfigBuilder::default()
 	}
 
-	// ===== Accessors (zero-copy) =====
+	// The accessors below return borrows of the shared fields.
 
 	pub fn specs(&self) -> &[&'static BuiltAssertSpec] {
 		&self.specs
@@ -86,6 +93,63 @@ impl ScenarioConfig {
 	#[cfg(feature = "testing-csp")]
 	pub fn csp(&self) -> Option<&Arc<dyn ProcessSpec + Send + Sync>> {
 		self.csp.as_ref()
+	}
+
+	/// The configuration of a guided fuzz run whose one CSP process is `csp`,
+	/// which both steers the oracle and grades the CSP layer.
+	///
+	/// `tb_scenario!` calls it with the process its `csp:` key names, so a
+	/// guided target names its process once.
+	///
+	/// # Errors
+	///
+	/// - [`ScenarioConfigError::CspNamedTwice`] -- this configuration names a process already.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::{ScenarioConfig, ScenarioConfigError};
+	/// use tightbeam::urn::Urn;
+	/// use tightbeam::{exactly, tb_assert_spec, tb_process_spec};
+	///
+	/// const STEP: Urn<'static> = tightbeam::urn!("doc", "event:guided/step");
+	///
+	/// tb_assert_spec! {
+	///     pub StepSpec,
+	///     V(1,0,0): {
+	///         mode: Accept,
+	///         assertions: [ (STEP, exactly!(1)) ]
+	///     },
+	/// }
+	///
+	/// tb_process_spec! {
+	///     pub StepProc,
+	///     events {
+	///         observable { STEP }
+	///         hidden { }
+	///     }
+	///     states {
+	///         S0 => { STEP => S1 }
+	///     }
+	///     terminal { S1 }
+	/// }
+	///
+	/// let config = ScenarioConfig::builder().with_spec(StepSpec::latest()).build()?;
+	/// let guided = config.guided_by(StepProc)?;
+	/// assert!(guided.csp().is_some());
+	///
+	/// let named_twice = guided.guided_by(StepProc);
+	/// assert_eq!(named_twice.err(), Some(ScenarioConfigError::CspNamedTwice));
+	/// # Ok::<(), ScenarioConfigError>(())
+	/// ```
+	#[cfg(feature = "testing-csp")]
+	pub fn guided_by<P: ProcessSpec + Send + Sync + 'static>(mut self, csp: P) -> Result<Self, ScenarioConfigError> {
+		if self.csp.is_some() {
+			return Err(ScenarioConfigError::CspNamedTwice);
+		}
+
+		self.csp = Some(Arc::new(csp));
+		Ok(self)
 	}
 
 	#[cfg(feature = "testing-fdr")]
@@ -136,11 +200,12 @@ impl ScenarioConfig {
 		ScenarioVerdict::from_layers(layer1, layer2, layer3)
 	}
 
-	/// Grades the scenario against the refinement model the configuration names.
+	/// Grades the scenario against the FDR configuration it names.
 	///
-	/// With a CSP spec, the spec model answers deadlock and divergence freedom
-	/// and the recorded trace answers refinement against the FDR specs, and the
-	/// two verdicts are merged. Without one, the trace is graded alone.
+	/// With a CSP spec, the spec model answers deadlock and divergence freedom.
+	/// When the FDR configuration also names specs, the recorded trace answers
+	/// refinement against them, and the two verdicts merge. Without a CSP spec,
+	/// the function grades the trace alone.
 	#[cfg(feature = "testing-fdr")]
 	fn explore(&self, trace: &ConsumedTrace) -> Option<FdrVerdict> {
 		let fdr_cfg = self.fdr()?;
@@ -173,7 +238,7 @@ impl ScenarioConfig {
 		Some(verdict.with_refinement_from(trace_verdict))
 	}
 
-	/// The timing constraints the first FDR spec declares, when it declares any.
+	/// The timing constraints that the first FDR spec declares, if any.
 	#[cfg(all(feature = "testing-timing", feature = "testing-fdr"))]
 	fn spec_timing_constraints(&self) -> Option<Arc<TimingConstraints>> {
 		let fdr_cfg = self.fdr()?;
@@ -183,7 +248,7 @@ impl ScenarioConfig {
 		Some(Arc::new(constraints))
 	}
 
-	/// The timing constraints the first FDR spec declares, when it declares any.
+	/// Returns `None`, because a build without `testing-fdr` holds no FDR spec.
 	#[cfg(all(feature = "testing-timing", not(feature = "testing-fdr")))]
 	fn spec_timing_constraints(&self) -> Option<Arc<TimingConstraints>> {
 		None
@@ -205,7 +270,8 @@ impl Default for ScenarioConfig {
 	}
 }
 
-/// Builder for ScenarioConfig (consumes owned values, wraps in Arc on build)
+/// The builder of a `ScenarioConfig`, which takes owned values and wraps them
+/// in `Arc` on build.
 #[derive(Default)]
 pub struct ScenarioConfigBuilder {
 	specs: Vec<&'static BuiltAssertSpec>,
@@ -220,13 +286,13 @@ pub struct ScenarioConfigBuilder {
 }
 
 impl ScenarioConfigBuilder {
-	/// Add a single spec to the list (builder convention)
+	/// Adds one spec to the list.
 	pub fn with_spec(mut self, spec: &'static BuiltAssertSpec) -> Self {
 		self.specs.push(spec);
 		self
 	}
 
-	/// Replace entire spec list (builder convention)
+	/// Replaces the whole spec list.
 	pub fn with_specs(mut self, specs: impl IntoIterator<Item = &'static BuiltAssertSpec>) -> Self {
 		self.specs = specs.into_iter().collect();
 		self
@@ -254,7 +320,8 @@ impl ScenarioConfigBuilder {
 		self
 	}
 
-	/// What the scenario expects its layers to decide. Omitted means all pass.
+	/// What the scenario expects its layers to decide. Without this call, the
+	/// scenario expects every layer to accept.
 	pub fn with_expect(mut self, expect: Expect) -> Self {
 		self.expect = expect;
 		self
@@ -390,8 +457,8 @@ impl HookContext {
 	}
 }
 
-/// Reads a scenario every layer accepted. An observer reports, so it decides
-/// nothing and returns nothing.
+/// Reads a scenario every layer accepted. An observer only reports, and its
+/// `()` return leaves every decision to the harness.
 pub type AcceptedObserver = Arc<dyn Fn(&HookContext) + Send + Sync>;
 
 /// Reads a scenario some layer rejected, with the violations it produced.
@@ -402,7 +469,6 @@ pub type AcceptedObserver = Arc<dyn Fn(&HookContext) + Send + Sync>;
 pub type RejectedObserver = Arc<dyn Fn(&HookContext, &Violations) + Send + Sync>;
 
 /// What a scenario runs after it is graded, before it panics on a rejection.
-///
 #[derive(Default)]
 pub struct TestHooks {
 	on_pass: Option<AcceptedObserver>,
@@ -512,6 +578,24 @@ mod tests {
 				refused.err(),
 				Some(ScenarioConfigError::ExpectViolationWithoutVerifier(Layer::Refinement))
 			);
+		}
+
+		#[test]
+		fn a_guided_run_takes_its_process_from_the_csp_key() -> Result<(), ScenarioConfigError> {
+			let config = ScenarioConfig::builder().with_spec(ErrorBodySpec::latest()).build()?;
+
+			let guided = config.guided_by(AcceptsEveryTrace)?;
+			assert!(guided.csp().is_some());
+			Ok(())
+		}
+
+		#[test]
+		fn a_guided_run_refuses_a_config_that_names_a_process() -> Result<(), ScenarioConfigError> {
+			let config = ScenarioConfig::builder().with_csp(AcceptsEveryTrace).build()?;
+
+			let refused = config.guided_by(AcceptsEveryTrace);
+			assert_eq!(refused.err(), Some(ScenarioConfigError::CspNamedTwice));
+			Ok(())
 		}
 
 		#[test]

@@ -2,8 +2,8 @@
 //! servlet all bind to the in-memory "laser" protocol, and work routes end to
 //! end.
 //!
-//! A laser tightbeam arrives at the cluster gateway and is relayed to a servlet
-//! through the hive, with every link encrypted and multiplexed.
+//! A laser tightbeam arrives at the cluster gateway, which relays it to a
+//! servlet through the hive, with every link encrypted and multiplexed.
 
 #![cfg(all(
 	feature = "std",
@@ -47,6 +47,7 @@ use tightbeam::{
 	Beamable, Frame, TightBeamError, Version,
 };
 
+use crate::common::hive::scenario_hive_config;
 use crate::common::laser::{LaserAddr, LaserListener};
 use crate::common::security::expectation_failure;
 use crate::common::x509::{signing_identity, GatewayCerts};
@@ -73,13 +74,17 @@ const REGISTRATION_ROUNDS: u32 = 10_000;
 /// above the slots that `LaserAddr::ANY` assigns sequentially.
 const RESTART_GATEWAY_ADDR: &str = "laser://9901";
 
+/// The request whose `value` the laser servlet doubles.
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 pub struct BeamRequest {
+	/// The number the servlet doubles.
 	pub value: u32,
 }
 
+/// The laser servlet's reply.
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 pub struct BeamResponse {
+	/// Twice the request's `value`.
 	pub doubled: u32,
 }
 
@@ -154,7 +159,7 @@ fn laser_hive_conf(certs: &GatewayCerts) -> HiveConfig {
 	let mut conf = HiveConfig {
 		hive_tls: Some(hive_tls),
 		trust_store: Some(Arc::clone(&certs.trust)),
-		..Default::default()
+		..scenario_hive_config()
 	};
 	conf.pool.mux_offer = Some(Arc::new(TransportOffer::mux(8)));
 	conf

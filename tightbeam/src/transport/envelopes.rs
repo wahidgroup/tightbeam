@@ -372,8 +372,8 @@ macro_rules! mux_chunk_package {
 /// on the Open record.
 ///
 /// It tells the responder whether the body reassembles into one [`Frame`]
-/// and which reply shape the initiator awaits, so dispatch needs no
-/// heuristics.
+/// and which reply shape the initiator awaits, so dispatch reads the shape
+/// from the record instead of guessing it.
 #[cfg(feature = "transport-multiplex")]
 #[derive(Enumerated, Default, Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -607,8 +607,9 @@ impl MuxCancelPackage {
 /// A connection-level liveness probe ([RFC 9113 § 6.7][rfc9113-6.7]).
 ///
 /// `opaque` is an initiator-chosen correlation value that the ack echoes
-/// unchanged. Pings never allocate a stream and never reach the application
-/// handler, so they keep idle connections alive through intermediaries.
+/// unchanged. A ping ends at the connection's reader, ahead of every stream
+/// and the application handler, so pings keep idle connections alive through
+/// intermediaries.
 ///
 /// [rfc9113-6.7]: https://datatracker.ietf.org/doc/html/rfc9113#section-6.7
 #[cfg(feature = "transport-multiplex")]
@@ -805,9 +806,14 @@ impl EncodeValue for MuxRekeyDonePackage {
 	}
 }
 
+/// The package is an empty `SEQUENCE`, so a length past zero is refused
+/// (X.690 § 8.1.3).
 #[cfg(feature = "transport-multiplex")]
 impl<'a> DecodeValue<'a> for MuxRekeyDonePackage {
-	fn decode_value<R: Reader<'a>>(_reader: &mut R, _header: Header) -> DerResult<Self> {
+	fn decode_value<R: Reader<'a>>(_reader: &mut R, header: Header) -> DerResult<Self> {
+		if header.length != Length::ZERO {
+			return Err(Tag::Sequence.length_error());
+		}
 		Ok(Self {})
 	}
 }
@@ -820,7 +826,7 @@ impl FixedTag for MuxRekeyDonePackage {
 /// Every multiplexing message, nested under one [`TransportEnvelope`] arm.
 ///
 /// The nesting lets the mux plane evolve with no change to the top-level
-/// envelope grammar, and non-mux code never sees a mux variant.
+/// envelope grammar, and only mux code matches a mux variant.
 #[cfg(feature = "transport-multiplex")]
 #[derive(Choice, Clone, Debug, PartialEq)]
 pub enum MuxEnvelope {
@@ -955,6 +961,43 @@ pub enum Arrived<'a> {
 	Encrypted(&'a mut [u8]),
 }
 
+/// A wire envelope whose outer header was read, with the contents of its arm
+/// left undecoded in the buffer it arrived in.
+///
+/// The variant is the wire mode the outer tag named, so a reader applies the
+/// ceiling and the session phase of that mode before a byte of the contents
+/// decodes, from one read of the tag.
+pub(crate) enum ArrivingEnvelope<'a> {
+	/// The DER of a transport envelope sent without encryption.
+	Cleartext(&'a [u8]),
+	/// The DER of the record's `AuthEnvelopedData`, which the session's
+	/// receive cipher opens in place.
+	Encrypted(&'a mut [u8]),
+}
+
+impl<'a> ArrivingEnvelope<'a> {
+	/// The wire mode the outer tag named.
+	pub(crate) const fn mode(&self) -> WireMode {
+		match self {
+			Self::Cleartext(_) => WireMode::Cleartext,
+			Self::Encrypted(_) => WireMode::Encrypted,
+		}
+	}
+
+	/// Decode the transport envelope of a cleartext arrival, and keep the
+	/// record of an encrypted one in place.
+	///
+	/// # Errors
+	///
+	/// - The decode error -- the cleartext contents are no transport envelope.
+	fn arrive(self) -> DerResult<Arrived<'a>> {
+		match self {
+			Self::Cleartext(contents) => Ok(Arrived::Cleartext(TransportEnvelope::from_der(contents)?)),
+			Self::Encrypted(record) => Ok(Arrived::Encrypted(record)),
+		}
+	}
+}
+
 impl WireEnvelope {
 	/// Read `wire`, the DER of one wire envelope. A cleartext envelope
 	/// decodes, and the record of an encrypted one stays in `wire`, so its
@@ -964,6 +1007,18 @@ impl WireEnvelope {
 	///
 	/// - The decode error -- `wire` is no wire envelope, or carries bytes past it.
 	pub fn arrive(wire: &mut [u8]) -> DerResult<Arrived<'_>> {
+		Self::admit(wire)?.arrive()
+	}
+
+	/// Read the outer header of `wire`, the DER of one wire envelope, and lend
+	/// the contents of its arm undecoded.
+	///
+	/// # Errors
+	///
+	/// - The decode error -- `wire` is no wire envelope, carries bytes past it,
+	///   or starts with another tag than either arm's.
+	pub(crate) fn admit(wire: &mut (impl AsMut<[u8]> + ?Sized)) -> DerResult<ArrivingEnvelope<'_>> {
+		let wire = wire.as_mut();
 		let mut reader = SliceReader::new(wire)?;
 		let header = Header::decode(&mut reader)?;
 		reader.read_slice(header.length)?;
@@ -975,8 +1030,8 @@ impl WireEnvelope {
 		let end = start.checked_add(usize::try_from(header.length)?).ok_or(ErrorKind::Overflow)?;
 		let contents = wire.get_mut(start..end).ok_or(ErrorKind::Overflow)?;
 		match header.tag {
-			tag if tag == CLEARTEXT_TAG => Ok(Arrived::Cleartext(TransportEnvelope::from_der(contents)?)),
-			tag if tag == RECORD_TAG => Ok(Arrived::Encrypted(contents)),
+			tag if tag == CLEARTEXT_TAG => Ok(ArrivingEnvelope::Cleartext(contents)),
+			tag if tag == RECORD_TAG => Ok(ArrivingEnvelope::Encrypted(contents)),
 			tag => Err(tag.value_error()),
 		}
 	}
@@ -1578,5 +1633,17 @@ mod tests {
 		let refused = WireEnvelope::arrive(&mut wire);
 		assert!(matches!(refused, Err(error) if matches!(error.kind(), ErrorKind::TrailingData { .. })));
 		Ok(())
+	}
+
+	/// A `RekeyDone` is an empty `SEQUENCE`, so one that claims five octets
+	/// and holds none is refused.
+	#[cfg(feature = "transport-multiplex")]
+	#[test]
+	fn a_rekey_done_that_claims_contents_is_refused() {
+		let forged = [0xa4, 0x04, 0xaa, 0x02, 0x30, 0x05];
+
+		let refused = TransportEnvelope::from_der(&forged);
+		let claimed_contents = ErrorKind::Length { tag: Tag::Sequence };
+		assert_eq!(refused.map_err(|error| error.kind()), Err(claimed_contents));
 	}
 }

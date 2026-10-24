@@ -8,7 +8,12 @@
 //!
 //! - The default provider is HKDF ([RFC 5869][rfc5869]) with SHA3-256.
 //! - Derivation is deterministic and domain-separated by the `info` parameter ([RFC 5869 §3.2][rfc5869-3.2]).
-//! - Key material stays in `Zeroizing` and `ZeroizingArray` buffers.
+//! - Key material stays in buffers that wipe on drop. The keys and outputs
+//!   are `Zeroizing` and `ZeroizingArray` buffers. HKDF and X9.63 hash
+//!   through the core of the digest with a buffer of their own, so the
+//!   pseudorandom key, each output block, and each input that a hash buffers
+//!   wipe as well. The digest core wipes its own state, as the contract of
+//!   [`DigestProvider::Digest`] asks and the house SHA3 cores hold.
 //! - Input validation covers the shared secret, which [`EcdhSecret`] fixes at
 //!   32 bytes, and the output length, which each provider bounds.
 //!
@@ -16,17 +21,17 @@
 //!
 //! - HKDF providers honor the optional `salt` parameter per [RFC 5869 §2.2][rfc5869-2.2].
 //! - ANSI X9.63 providers ignore `salt`. Their derivation depends on the shared
-//!   secret Z and the `info` (SharedInfo) context bytes only ([SECG SEC 1 v2.0
-//!   §3.6][sec1-3.6]).
+//!   secret Z and the `info` (SharedInfo) context bytes only
+//!   ([SECG SEC 1 v2.0 §3.6][sec1-3.6]).
 //!
 //! # ECIES
 //!
-//! - ECIES profiles such as [SECG SEC 1 v2.0 §5.1][sec1-5.1], [IEEE Std
-//!   1363a-2004][ieee1363a], and [ISO/IEC 18033-2:2006][iso18033] mandate
-//!   separate symmetric encryption and MAC keys.
+//! - ECIES profiles such as [SECG SEC 1 v2.0 §5.1][sec1-5.1],
+//!   [IEEE Std 1363a-2004][ieee1363a], and [ISO/IEC 18033-2:2006][iso18033]
+//!   mandate separate symmetric encryption and MAC keys.
 //!   [`DualKeyKdf::derive_dual_keys`] enforces that key separation with one
-//!   expansion split into two disjoint keys ([SECG SEC 1 v2.0
-//!   §5.1.3][sec1-5.1.3]).
+//!   expansion split into two disjoint keys
+//!   ([SECG SEC 1 v2.0 §5.1.3][sec1-5.1.3]).
 //! - Those standards derive with a counter-mode hash KDF. [`X963Sha3_256`] is
 //!   the ANSI X9.63 construction ([SECG SEC 1 v2.0 §3.6][sec1-3.6]) over
 //!   SHA3-256.
@@ -47,6 +52,7 @@
 //! - [IEEE Std 1363a-2004][ieee1363a]: Public-Key Cryptography, Amendment 1 (Additional Techniques).
 //! - [ISO/IEC 18033-2:2006][iso18033]: Encryption algorithms, Part 2: Asymmetric ciphers.
 //!
+//! [`DigestProvider::Digest`]: crate::crypto::profiles::DigestProvider::Digest
 //! [rfc5869]: https://datatracker.ietf.org/doc/html/rfc5869
 //! [rfc9180]: https://datatracker.ietf.org/doc/html/rfc9180
 //! [rfc5869-2.2]: https://datatracker.ietf.org/doc/html/rfc5869#section-2.2
@@ -60,9 +66,12 @@
 //! [ieee1363a]: https://standards.ieee.org/standard/1363a-2004.html
 //! [iso18033]: https://www.iso.org/standard/37971.html
 
-use core::cmp::min;
+mod zeroizing;
 
 pub use crate::crypto::hkdf::Hkdf;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+pub(crate) use zeroizing::ZeroizingHmac;
+pub(crate) use zeroizing::{ZeroizingHash, ZeroizingHkdf};
 
 use crate::constants::{ECDH_SHARED_SECRET_SIZE, MAX_HKDF_OUTPUT_SIZE, MIN_KEY_SIZE};
 use crate::crypto::hash::{Digest, Sha3_256};
@@ -88,6 +97,10 @@ pub type Result<T> = ::core::result::Result<T, KdfError>;
 /// A key derivation function that a provider type implements.
 ///
 /// A consumer plugs in a RustCrypto KDF or a custom KDF through this trait.
+/// The contract of an implementation is to wipe the pseudorandom key, each
+/// output block it chains, and each input that a hash buffers, once the
+/// derivation ends (NIST SP 800-56C Rev. 2 §5.1). The house providers hold
+/// it through hashes whose buffers wipe on drop.
 pub trait KdfFunction {
 	/// Derive a key whose size is known only at run time.
 	///
@@ -101,7 +114,7 @@ pub trait KdfFunction {
 	///
 	/// # Errors
 	///
-	/// - [`KdfError::DerivationFailed`] when `key_size` is outside the valid range.
+	/// - [`KdfError::DerivationFailed`] -- `key_size` is outside the valid range.
 	fn derive_dynamic_key(ikm: &[u8], info: &[u8], salt: Option<&[u8]>, key_size: usize) -> Result<ZeroizingBytes>;
 }
 
@@ -123,8 +136,8 @@ pub trait DualKeyKdf: KdfFunction {
 	///
 	/// # Errors
 	///
-	/// - [`KdfError::DerivationFailed`] when `N` is below [`MIN_KEY_SIZE`], or
-	///   when the KDF refuses `2 * N` bytes or returns another length.
+	/// - [`KdfError::DerivationFailed`] -- `N` is below [`MIN_KEY_SIZE`], or
+	///   the KDF refuses `2 * N` bytes or returns another length.
 	///
 	/// # Sources
 	///
@@ -212,11 +225,11 @@ impl KdfFunction for HkdfSha3_256 {
 	fn derive_dynamic_key(ikm: &[u8], info: &[u8], salt: Option<&[u8]>, key_size: usize) -> Result<ZeroizingBytes> {
 		assert_hkdf_key_size(key_size)?;
 
-		let hk = Hkdf::<Sha3_256>::new(salt, ikm);
-		let mut okm = vec![0u8; key_size];
-		hk.expand(info, &mut okm).map_err(KdfError::DerivationFailed)?;
+		let hkdf = ZeroizingHkdf::<Sha3_256>::new(salt.unwrap_or_default(), ikm);
+		let mut okm = Zeroizing::new(vec![0u8; key_size]);
+		hkdf.expand(info, &mut okm).map_err(KdfError::DerivationFailed)?;
 
-		Ok(Zeroizing::new(okm))
+		Ok(okm)
 	}
 }
 
@@ -240,22 +253,18 @@ impl X963Sha3_256 {
 	/// `Counter_i` starts at 1. A counter that would overflow `u32` fails the
 	/// derivation, so the counter never wraps.
 	fn expand(out: &mut [u8], ikm: &[u8], info: &[u8]) -> Result<()> {
-		let mut offset = 0usize;
 		let mut counter: u32 = 1;
-		while offset < out.len() {
-			let mut hasher = Sha3_256::new();
-			hasher.update(ikm);
-			hasher.update(counter.to_be_bytes());
-			hasher.update(info);
+		let mut windows = out.chunks_mut(<Sha3_256 as Digest>::output_size()).peekable();
+		while let Some(window) = windows.next() {
+			let hasher = ZeroizingHash::<Sha3_256>::new().chain_update(ikm);
+			let hasher = hasher.chain_update(&counter.to_be_bytes()).chain_update(info);
 
 			let block = hasher.finalize();
-			let take = min(block.len(), out.len() - offset);
+			for (octet, derived) in window.iter_mut().zip(block.as_slice()) {
+				*octet = *derived;
+			}
 
-			out[offset..offset + take].copy_from_slice(&block[..take]);
-
-			offset += take;
-
-			if offset < out.len() {
+			if windows.peek().is_some() {
 				counter = counter.checked_add(1).ok_or(KdfError::DerivationFailed(InvalidLength))?;
 			}
 		}
@@ -279,8 +288,8 @@ pub enum KdfError {
 
 /// An ECDH shared secret on a 256-bit curve.
 ///
-/// The length is part of the type, so a derivation that takes one runs no
-/// length check of its own. It wipes on drop like every [`Secret`].
+/// The length is part of the type, so a derivation that takes one relies on
+/// the type for its length check. It wipes on drop like every [`Secret`].
 pub type EcdhSecret = Secret<[u8; ECDH_SHARED_SECRET_SIZE]>;
 
 impl TryFrom<SecretSlice<u8>> for EcdhSecret {
@@ -288,7 +297,7 @@ impl TryFrom<SecretSlice<u8>> for EcdhSecret {
 
 	/// # Errors
 	///
-	/// - [`KdfError::InvalidSharedSecretLength`] when the secret is not [`ECDH_SHARED_SECRET_SIZE`] bytes.
+	/// - [`KdfError::InvalidSharedSecretLength`] -- the secret is not [`ECDH_SHARED_SECRET_SIZE`] bytes.
 	fn try_from(secret: SecretSlice<u8>) -> Result<Self> {
 		secret.with(|bytes| sized_shared_secret(bytes))
 	}
@@ -513,6 +522,30 @@ mod tests {
 		let (k_enc, k_mac) = HkdfSha3_256::derive_dual_keys::<32>(b"ikm", INFO_V1, Some(SALT))?;
 		assert_eq!(k_enc[..], expected[..32]);
 		assert_eq!(k_mac[..], expected[32..]);
+		Ok(())
+	}
+
+	// An unsalted derivation is the RFC 5869 derivation under a salt of
+	// zeros as long as the hash, which `hkdf` 0.12 takes for an absent salt.
+	#[test]
+	fn an_unsalted_hkdf_key_is_the_expansion_under_a_salt_of_zeros() -> crate::error::Result<()> {
+		let mut expected = [0u8; 32];
+		let reference = Hkdf::<Sha3_256>::new(None, b"ikm").expand(INFO_V1, &mut expected);
+		reference.map_err(KdfError::DerivationFailed)?;
+
+		let key = HkdfSha3_256::derive_dynamic_key(b"ikm", INFO_V1, None, 32)?;
+		assert_eq!(key[..], expected[..]);
+		Ok(())
+	}
+
+	// Each X9.63 block is the hash of the secret, the counter, and the
+	// SharedInfo, in that order.
+	#[test]
+	fn an_x963_block_is_the_hash_of_the_secret_the_counter_and_the_info() -> crate::error::Result<()> {
+		let expected = Sha3_256::digest([SHARED_SECRET, &1u32.to_be_bytes(), INFO_V1].concat());
+
+		let key = X963Sha3_256::derive_dynamic_key(SHARED_SECRET, INFO_V1, None, 32)?;
+		assert_eq!(key[..], expected[..]);
 		Ok(())
 	}
 

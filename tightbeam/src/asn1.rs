@@ -1,7 +1,7 @@
+pub(crate) mod admission;
 mod syntax;
 pub mod wire_der;
 
-// Re-exports
 pub use crate::cms::compressed_data::CompressedData;
 pub use crate::cms::content_info::ContentInfo;
 pub use crate::cms::enveloped_data::EncryptedContentInfo;
@@ -12,12 +12,14 @@ pub use crate::frame::{BodyTransform, Frame, Metadata};
 pub use crate::pkcs12::digest_info::DigestInfo;
 pub use crate::spki::{AlgorithmIdentifier, AlgorithmIdentifierOwned};
 pub use crate::version::GatedField;
-#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
-pub(crate) use syntax::GcmParametersRef;
 pub use syntax::{AuthEnvelopedData, CmsOriForKemOtherInfo, GcmParameters, KemRecipientInfo};
 pub use wire_der::WireDer;
 
-/// Protocol version determines metadata structure and features
+#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
+pub(crate) use syntax::GcmParametersRef;
+
+/// The protocol version of a frame, which selects the metadata structure and
+/// the features the frame can use.
 ///
 /// ASN.1 Definition:
 /// ```asn1
@@ -37,10 +39,10 @@ pub enum Version {
 	V3 = 3,
 }
 
-/// Message priority levels (V2+)
+/// The priority level of a message, from protocol version V2 on.
 ///
-/// IETF Differentiated Services (DiffServ) architecture.
-/// Each level maps to a DiffServ Per-Hop Behavior (PHB) or service class.
+/// The levels follow the IETF Differentiated Services (DiffServ) architecture,
+/// so each level maps to a DiffServ Per-Hop Behavior (PHB) or service class.
 ///
 /// Mapping (lowest to highest priority):
 /// - LowEffort: LE PHB (RFC 8622) -- background, non-urgent traffic, logs
@@ -51,7 +53,7 @@ pub enum Version {
 /// - NetworkControl: Network Control / CS6-CS7 (RFC 2474, RFC 4594) -- control
 ///   plane, security/emergency alerts, keep-alive signals
 ///
-/// Secondary mapping: ITU-T X.400/X.420 message importance (low/normal/high).
+/// The levels also map to ITU-T X.400 and X.420 importance (low, normal, high).
 ///
 /// ASN.1 Definition:
 /// ```asn1

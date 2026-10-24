@@ -11,6 +11,7 @@ use core::hash::{Hash, Hasher};
 use core::marker::PhantomData;
 use core::time::Duration;
 
+use crate::asn1::admission::DerAdmission;
 use crate::cms::cert::IssuerAndSerialNumber;
 use crate::cms::enveloped_data::RecipientIdentifier;
 use crate::cms::signed_data::SignerIdentifier;
@@ -252,7 +253,9 @@ pub trait CertificateExt {
 	/// # Errors
 	///
 	/// - [`CertificateValidationError::DuplicateExtension`] -- the certificate carries the extension twice.
-	/// - [`CertificateValidationError::EncodingError`] -- the extension's `extnValue` fails to decode.
+	/// - [`CertificateValidationError::EncodingError`] -- the extension's
+	///   `extnValue` fails to decode, or a SET in it holds its elements out of
+	///   DER order.
 	///
 	/// # Sources
 	///
@@ -293,9 +296,9 @@ pub trait CertificateExt {
 	fn is_named_by(&self, sid: &SignerIdentifier) -> Result<bool, CertificateValidationError>;
 
 	/// Refuse this certificate unless its `keyUsage` extension is present and
-	/// asserts `usage` (RFC 5280 §4.2.1.3). Beside `keyAgreement`, the
-	/// extension must leave out `decipherOnly`, which restricts the key to
-	/// deciphering.
+	/// asserts `usage` (RFC 5280 §4.2.1.3). For `keyAgreement`, the
+	/// extension must also leave out `decipherOnly`, which restricts the key
+	/// to deciphering.
 	///
 	/// # Errors
 	///
@@ -434,7 +437,9 @@ impl<P: Profile> CertificateExt for CertificateInner<P> {
 			return Err(CertificateValidationError::DuplicateExtension(T::OID));
 		}
 
-		Ok(Some(T::from_der(extension.extn_value.as_bytes())?))
+		let value = extension.extn_value.as_bytes();
+		DerAdmission::SetOrder.admit(value)?;
+		Ok(Some(T::from_der(value)?))
 	}
 
 	/// Name this certificate as a CMS signer.
@@ -475,7 +480,7 @@ impl<P: Profile> CertificateExt for CertificateInner<P> {
 		}
 	}
 
-	/// Read the `keyUsage` this certificate asserts.
+	/// Check `usage` against the `keyUsage` this certificate asserts.
 	///
 	/// [`CertificateExt::require_key_usage`] owns the RFC 5280 §4.2.1.3
 	/// contract.
@@ -557,7 +562,7 @@ impl<P: Profile> CertificateExt for CertificateInner<P> {
 		self.require_key_usage(usage)
 	}
 
-	/// Read the key purposes this certificate names.
+	/// Check `purpose` against the key purposes this certificate names.
 	///
 	/// [`CertificateExt::require_purpose`] owns the RFC 5280 §4.2.1.12
 	/// contract.
@@ -588,13 +593,56 @@ pub(crate) fn recipient_identifier_of(sid: &SignerIdentifier) -> RecipientIdenti
 
 #[cfg(test)]
 mod tests {
-	use super::{Fingerprint, Skid};
+	use super::{CertificateExt, Fingerprint, Skid};
+	use crate::asn1::admission::fixtures::{tlv, DESCENDING_LEN};
 	use crate::crypto::hash::{Digest, Sha3_256};
 	use crate::crypto::x509::error::CertificateValidationError;
+	use crate::crypto::x509::error::CertificateValidationError::EncodingError;
 	use crate::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
-	use crate::der::Encode;
+	use crate::crypto::x509::Certificate;
+	use crate::der::asn1::OctetString;
+	use crate::der::oid::AssociatedOid;
+	use crate::der::{Encode, ErrorKind, Tag, TagNumber};
 	use crate::testing::{TestCertificate, TestKey};
-	use crate::x509::ext::pkix::SubjectKeyIdentifier;
+	use crate::x509::ext::pkix::{IssuerAltName, SubjectKeyIdentifier};
+	use crate::x509::ext::Extension;
+
+	/// The self-signed test certificate with an `issuerAltName` extension
+	/// around `value`. The lookup of an extension reads the extensions alone,
+	/// so the stale signature leaves the lookup as it is.
+	fn with_issuer_alt_name(value: Vec<u8>) -> Certificate {
+		let mut certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+		let extn_value = OctetString::new(value).expect("a test value fits an OCTET STRING");
+		let extension = Extension { extn_id: IssuerAltName::OID, critical: false, extn_value };
+		let extensions = certificate.tbs_certificate.extensions.get_or_insert_with(Vec::new);
+		extensions.push(extension);
+		certificate
+	}
+
+	/// The `GeneralNames` of one `directoryName` whose one RDN holds
+	/// [`DESCENDING_LEN`] common names in descending order, which `der`
+	/// decodes and sorts.
+	fn descending_general_names() -> Vec<u8> {
+		let common_name = tlv(Tag::ObjectIdentifier, &[0x55, 0x04, 0x03]);
+		let entries = (0..DESCENDING_LEN).rev().map(|value| {
+			let value = tlv(Tag::OctetString, &value.to_be_bytes());
+			tlv(Tag::Sequence, &[common_name.as_slice(), &value].concat())
+		});
+		let rdn = tlv(Tag::Set, &entries.collect::<Vec<_>>().concat());
+		let directory_name = Tag::ContextSpecific { constructed: true, number: TagNumber::N4 };
+		tlv(Tag::Sequence, &tlv(directory_name, &tlv(Tag::Sequence, &rdn)))
+	}
+
+	/// The one decoder of extension values admits the value before the name
+	/// in it decodes and sorts its RDN.
+	#[test]
+	fn an_extension_of_a_descending_set_is_refused() {
+		let certificate = with_issuer_alt_name(descending_general_names());
+
+		let refused = certificate.extension::<IssuerAltName>();
+		let set_ordering = matches!(refused, Err(EncodingError(error)) if error.kind() == ErrorKind::SetOrdering);
+		assert!(set_ordering);
+	}
 
 	/// A fingerprint that the encoder streams into the digest equals the
 	/// digest of the whole DER, which the encoder writes outside the code
@@ -681,7 +729,6 @@ mod tests {
 		let result = validator.evaluate(&expired_cert);
 		assert!(result.is_err(), "Expired certificate should be rejected");
 
-		// The rejection is an expiry error.
 		match result {
 			Err(CertificateValidationError::Expired) => {
 				// This arm is the expected error.
@@ -768,8 +815,8 @@ mod tests {
 
 		#[test]
 		fn accepts_critical_subject_alt_name() {
-			// Colony membership reads subjectAltName (2.5.29.17).
-			// RFC 5280 §4.1.2.6 marks it critical when the subject DN is empty.
+			// Colony membership reads subjectAltName (2.5.29.17), which
+			// RFC 5280 §4.1.2.6 marks critical when the subject DN is empty.
 			let mut cert = both_uses();
 			cert.tbs_certificate.extensions = Some(vec![TestCertificate::opaque_extension("2.5.29.17", true)]);
 			assert!(cert.ensure_critical_extensions_processed().is_ok());

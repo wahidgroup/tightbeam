@@ -157,18 +157,12 @@ pub const TIGHTBEAM_CLIENT_FINISHED_DOMAIN: &[u8] = b"tb/handshake/finished/clie
 /// where slice comparison is unavailable. Two equal strings are each a prefix
 /// of the other.
 pub(crate) const fn prefix_free(a: &[u8], b: &[u8]) -> bool {
-	let shorter = if a.len() < b.len() {
-		a.len()
-	} else {
-		b.len()
-	};
-
-	let mut index = 0;
-	while index < shorter {
-		if a[index] != b[index] {
+	let (mut a, mut b) = (a, b);
+	while let ([a_first, a_rest @ ..], [b_first, b_rest @ ..]) = (a, b) {
+		if *a_first != *b_first {
 			return true;
 		}
-		index += 1;
+		(a, b) = (a_rest, b_rest);
 	}
 
 	false
@@ -177,16 +171,16 @@ pub(crate) const fn prefix_free(a: &[u8], b: &[u8]) -> bool {
 /// Whether no member of `labels` is a prefix of another member.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub(crate) const fn pairwise_prefix_free(labels: &[&[u8]]) -> bool {
-	let mut first = 0;
-	while first < labels.len() {
-		let mut second = first + 1;
-		while second < labels.len() {
-			if !prefix_free(labels[first], labels[second]) {
+	let mut rest = labels;
+	while let [first, later @ ..] = rest {
+		let mut others = later;
+		while let [second, after @ ..] = others {
+			if !prefix_free(first, second) {
 				return false;
 			}
-			second += 1;
+			others = after;
 		}
-		first += 1;
+		rest = later;
 	}
 
 	true
@@ -260,13 +254,10 @@ pub(crate) const RENEWAL_VOLUME_BYTES: u64 = AES_GCM_FULL_SIZE_RECORDS_PER_KEY *
 ///
 /// - RFC 9846 § 5.5, AEAD limits: <https://datatracker.ietf.org/doc/html/rfc9846#section-5.5>
 pub(crate) const fn rekey_record_limit(encrypted_envelope: usize) -> u64 {
-	let envelope = if encrypted_envelope == 0 {
-		1
-	} else {
-		encrypted_envelope as u64
-	};
-
-	RENEWAL_VOLUME_BYTES / envelope
+	match RENEWAL_VOLUME_BYTES.checked_div(encrypted_envelope as u64) {
+		Some(limit) => limit,
+		None => RENEWAL_VOLUME_BYTES,
+	}
 }
 
 /// Record limit per directional key before a rekey is required.
@@ -301,7 +292,7 @@ const _: () = assert!(DEFAULT_REKEY_RECORD_LIMIT > DEFAULT_REKEY_MIN_SPEND_RECOR
 /// finish before the hard floor parks data.
 ///
 /// - If the exchange finishes in time, data resumes under the new epoch.
-/// - Otherwise data parks until install completes, or the renewal deadline triggers GoAway drain.
+/// - Otherwise data parks until the install completes, or the renewal deadline triggers the GoAway drain.
 pub const DEFAULT_REKEY_RENEWAL_ALLOWANCE: u64 = 64;
 
 /// Minimum records a server must have received since the last epoch
@@ -318,8 +309,8 @@ pub const DEFAULT_REKEY_RENEWAL_ALLOWANCE: u64 = 64;
 ///   <https://datatracker.ietf.org/doc/html/rfc9846>
 pub const DEFAULT_REKEY_MIN_SPEND_RECORDS: u64 = 4;
 
-/// Seconds a rekey initiator waits for the exchange to complete before
-/// draining the connection.
+/// Seconds a rekey initiator waits for the exchange to complete before it
+/// drains the connection.
 ///
 /// The deadline bounds the c2s data park, which spans the Ack-to-Done window
 /// plus the hard floor. When a peer stops answering, expiry releases the park
@@ -348,7 +339,7 @@ pub const DEFAULT_ACCEPT_RETRY_DELAY: core::time::Duration = core::time::Duratio
 /// # Properties
 ///
 /// - Period: 2^64, the full period for a 64-bit state.
-/// - Spectral test: passes all dimensions up to at least dimension 6.
+/// - Spectral test: the multiplier passes all dimensions up to at least dimension 6.
 /// - The value comes from Donald Knuth's MMIX LCG parameters.
 ///
 /// # Used by
@@ -403,7 +394,7 @@ pub const SPLITMIX64_MIX_1: u64 = 0xBF58476D1CE4E5B9;
 /// See [`SPLITMIX64_GAMMA`] for the sources.
 pub const SPLITMIX64_MIX_2: u64 = 0x94D049BB133111EB;
 
-/// Default seed for fault injection reproducibility.
+/// Default seed of the random fault injection strategy, so a run repeats.
 ///
 /// The value `0xDEADBEEF` is a recognizable debug marker. Systems
 /// programming conventionally uses it for test, debug, or uninitialized
@@ -538,23 +529,22 @@ pub const MAX_MUX_STREAM_CREDIT: u64 = 4096;
 
 /// Default initial per-stream chunk credit window.
 ///
-/// 64 chunks at the default chunk size bounds per-stream reassembly at
-/// 1 MiB before the receiver must grant more.
+/// At the default chunk size, 64 chunks bound per-stream reassembly at 1 MiB
+/// before the receiver must grant more.
 pub const DEFAULT_MUX_STREAM_CREDIT: u64 = 64;
 
 /// Ceiling on a negotiated per-direction session budget, in credits.
 ///
-/// Budgets meter data-chunk credits only.
+/// Budgets meter data-chunk credits only. The cap is half the per-key record
+/// limit, so in the worst case the data records of one epoch stay under
+/// [`DEFAULT_REKEY_RECORD_LIMIT`].
 ///
+/// - Every data chunk debits at least one credit and consumes exactly one record.
 /// - Control envelopes (credit grants, cancels, pings, GoAway) pass outside the
 ///   budget but still consume AEAD records.
-/// - Every data chunk debits at least one credit and consumes exactly one record.
-/// - Capping budgets at half the per-key record limit therefore bounds
-///   worst-case epoch data-record consumption under
-///   [`DEFAULT_REKEY_RECORD_LIMIT`].
-/// - This holds at the default ceiling. At a raised one the record limit can fall below the budget.
-/// - The default batching grantor keeps control traffic at `O(data chunks /
-///   window)` records, inside the remaining half.
+/// - The default batching grantor keeps control traffic at
+///   `O(data chunks / window)` records, inside the remaining half.
+/// - The bound holds at the default ceiling. At a raised one the record limit can fall below the budget.
 /// - The record limit itself stays the fail-closed backstop either way.
 pub const MAX_MUX_SESSION_BUDGET: u64 = DEFAULT_REKEY_RECORD_LIMIT / 2;
 
@@ -570,13 +560,13 @@ pub const DEFAULT_MAX_CLEARTEXT_ENVELOPE: usize = 128 * 1024;
 /// Default ceiling in bytes for an encoded encrypted envelope (256 KiB).
 ///
 /// A server refuses a frame whose declared content length exceeds this
-/// ceiling. It refuses before reading the content, so the declared length
+/// ceiling. It refuses before it reads the content, so the declared length
 /// bounds the allocation.
 ///
 /// - The refusal closes the connection.
 /// - The sender sees a reset instead of a typed error.
 /// - Clients therefore preflight outgoing encrypted envelopes against this ceiling.
-/// - When no explicit limit is set, the client fails locally with typed `SizeExceeded`.
+/// - When no explicit limit is set, the client fails locally with a typed `SizeExceeded`.
 ///
 /// # Sources
 ///
@@ -611,7 +601,7 @@ pub const DEFAULT_HANDSHAKE_TIMEOUT: core::time::Duration = core::time::Duration
 ///
 /// A handshake message carries certificates, a key share, and a signature. It
 /// is bounded far below a data envelope so an unauthenticated peer cannot make
-/// this endpoint buffer a large allocation before proving its identity.
+/// this endpoint buffer a large allocation before it proves its identity.
 ///
 /// # Sources
 ///
@@ -635,6 +625,21 @@ pub const DEFAULT_HANDSHAKE_MAX_WIRE: usize = 16 * 1024;
 ///   <https://cwe.mitre.org/data/definitions/770.html>
 pub const MAX_PRESENTED_PATH: usize = 8;
 
+/// Ceiling on the elements of a universal SET, or of a constructed
+/// context-specific element, in the CMS values a peer sends, such as the
+/// `signerInfos` or the `certificates` of a `SignedData`.
+///
+/// The pinned `der` decoder sorts such a set in time quadratic in its length
+/// whatever order it arrives in. The value is above [`MAX_PRESENTED_PATH`]
+/// and above every such set the crate emits.
+///
+/// # Sources
+///
+/// - ITU-T X.690 (02/2021) § 11.6, set-of components:
+///   <https://www.itu.int/rec/dologin_pub.asp?id=T-REC-X.690-202102-I%21%21PDF-E&lang=e&type=items#page=29>
+/// - CWE-407, inefficient algorithmic complexity: <https://cwe.mitre.org/data/definitions/407.html>
+pub(crate) const MAX_CMS_SET_LEN: usize = 32;
+
 /// Default ceiling for decompressed message bodies (16 MiB).
 ///
 /// Compressed frame bodies arrive under the transport's envelope ceiling, and
@@ -649,7 +654,8 @@ pub const MAX_PRESENTED_PATH: usize = 8;
 /// - CWE-409, improper handling of highly compressed data: <https://cwe.mitre.org/data/definitions/409.html>
 pub const DEFAULT_MAX_DECOMPRESSED_LEN: usize = 16 * 1024 * 1024;
 
-/// Hard ceiling on unary mux reassembly buffer bytes per stream.
+/// Hard ceiling on the bytes one mux stream reassembles: a unary reassembly
+/// buffer, or the body that `StreamBody::into_bytes` collects.
 ///
 /// Credit grants may raise the chunk window, and accepted payload bytes still
 /// stay within this bound. The value equals
@@ -910,11 +916,11 @@ pub const MAX_PEER_TABLE_NEW: usize = 256;
 ///   <https://cwe.mitre.org/data/definitions/770.html>
 pub const MAX_PEER_TABLE_TRIED: usize = MAX_PEER_GATEWAYS;
 
-/// Ceiling on peer-table entries sharing one address prefix bucket.
+/// Ceiling on peer-table entries that share one address prefix bucket.
 ///
 /// Discovery buckets learned peers by /16 (IPv4) or /32 (IPv6) prefix. The
 /// per-bucket bound is the eclipse countermeasure, so one network position
-/// holds its own share of either table.
+/// holds at most this many entries of either table.
 ///
 /// # Sources
 ///

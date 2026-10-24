@@ -28,6 +28,7 @@ use alloc::{borrow::ToOwned, string::ToString, sync::Arc, vec::Vec};
 #[cfg(feature = "std")]
 use std::sync::Arc;
 
+use crate::asn1::admission::DerAdmission;
 use crate::cms::cert::CertificateChoices;
 use crate::cms::signed_data::CertificateSet;
 use crate::constants::MAX_PRESENTED_PATH;
@@ -35,6 +36,7 @@ use crate::crypto::sign::SignerError;
 use crate::crypto::x509::error::CertificateValidationError;
 use crate::der::asn1::{ContextSpecificRef, SetOfVec};
 use crate::der::{Encode, TagMode, TagNumber};
+use crate::frame::CERTIFICATES_TAG;
 use crate::x509::Certificate;
 
 /// The certification path of a signing certificate as a `SignedData`
@@ -109,7 +111,7 @@ impl PresentedPath {
 	/// # Errors
 	///
 	/// - [`CertificateValidationError::AmbiguousIssuer`] -- two certificates of
-	///   `held` carry the name of one issuer.
+	///   `held` carry as subject the name of one issuer.
 	/// - [`CertificateValidationError::PathCycle`] -- the walk returns to a certificate of the path.
 	fn issuer_order(leaf: &Certificate, held: &[Certificate]) -> Result<Vec<usize>, CertificateValidationError> {
 		let mut order: Vec<usize> = Vec::new();
@@ -201,13 +203,16 @@ impl PresentedCertificates {
 		let held = issuers.iter().map(|issuer| Certificate::clone(issuer)).collect();
 		let (leaf, issuers) = PresentedPath::walk(leaf.to_owned(), held)?.into_parts();
 
-		// 3. Encode the set, and the field that holds it, once.
+		// 3. Encode the set, and the field that holds it, once, with its
+		//    choices in DER order (X.690 § 11.6), as a `Signed` encode of a
+		//    `SignedData` of the set sends them.
 		let presented = iter::once(leaf).chain(issuers.0);
 		let choices: Vec<CertificateChoices> = presented.map(CertificateChoices::Certificate).collect();
 		let set = SetOfVec::try_from(choices)?;
 		let field = ContextSpecificRef { tag_number: TagNumber::N0, tag_mode: TagMode::Implicit, value: &set };
-		let field = Arc::from(field.to_der()?);
-		Ok(Self { set: Arc::new(CertificateSet(set)), field })
+		let mut field = field.to_der()?;
+		DerAdmission::arrange_fields(&mut field, &[CERTIFICATES_TAG])?;
+		Ok(Self { set: Arc::new(CertificateSet(set)), field: Arc::from(field) })
 	}
 
 	/// The set the signer writes into `certificates`, as a copy a

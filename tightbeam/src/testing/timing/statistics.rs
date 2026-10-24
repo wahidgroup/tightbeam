@@ -1,21 +1,20 @@
-//! Statistical analysis utilities
+//! Statistical analysis of timing data.
 //!
-//! Provides traits and implementations for statistical analysis of timing data.
-//! Used for percentile-based WCET analysis and other statistical measures.
+//! `StatisticalAnalyzer` turns observed durations into percentiles, a mean, a
+//! median, and confidence intervals for percentile-based WCET analysis.
 
 use crate::der::{Enumerated, Sequence};
 use crate::error::TightBeamError;
-use crate::utils::math::integer_sqrt;
 
 #[cfg(not(feature = "std"))]
 use alloc::{string::String, vec::Vec};
 
-/// Trait for statistical analysis of timing data.
+/// A statistical model of timing data.
 ///
-/// Allows plugging in custom statistical models without modifying core
-/// verification logic. Similar to `JitterCalculator` pattern.
+/// A custom model implements this trait and plugs in with no change to the
+/// core verification logic, as a `JitterCalculator` does.
 pub trait StatisticalAnalyzer: Send + Sync + core::fmt::Debug {
-	/// Analyze observed durations, in nanoseconds, into statistical measures
+	/// Analyzes observed durations, in nanoseconds, into statistical measures
 	/// such as percentiles and confidence intervals.
 	///
 	/// # Errors
@@ -29,22 +28,22 @@ pub trait StatisticalAnalyzer: Send + Sync + core::fmt::Debug {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Enumerated)]
 #[repr(u8)]
 pub enum Percentile {
-	/// 50th percentile (median)
+	/// The 50th percentile, which is the median.
 	P50 = 0,
-	/// 90th percentile
+	/// The 90th percentile.
 	P90 = 1,
-	/// 95th percentile
+	/// The 95th percentile.
 	P95 = 2,
-	/// 99th percentile
+	/// The 99th percentile.
 	P99 = 3,
-	/// 99.9th percentile
+	/// The 99.9th percentile.
 	P99_9 = 4,
-	/// 99.99th percentile
+	/// The 99.99th percentile.
 	P99_99 = 5,
 }
 
 impl Percentile {
-	/// Get the percentile value as a float (0.0 to 1.0).
+	/// The percentile as a fraction from 0.0 to 1.0.
 	pub fn as_float(self) -> f64 {
 		match self {
 			Percentile::P50 => 0.50,
@@ -74,26 +73,30 @@ impl Percentile {
 #[derive(Debug, Clone, Sequence, PartialEq)]
 #[non_exhaustive]
 pub struct ConfidenceIntervals {
-	/// Confidence level (e.g., 9500 for 95% - stored as integer * 10000)
+	/// The confidence level as a fixed-point integer scaled by 10000, so 95% is
+	/// 9500.
 	pub level: u32,
-	/// Lower bound (nanoseconds)
+	/// The lower bound, in nanoseconds.
 	pub lower: u64,
-	/// Upper bound (nanoseconds)
+	/// The upper bound, in nanoseconds.
 	pub upper: u64,
 }
 
-/// Key-value pair for percentile data (ASN.1-compatible)
+/// One percentile and its value, as an ASN.1 sequence.
 #[derive(Debug, Clone, Sequence, PartialEq)]
 pub struct PercentileValue {
+	/// The percentile level.
 	pub percentile: Percentile,
+	/// The duration at that percentile, in nanoseconds.
 	pub value: u64,
 }
 
-/// Key-value pair for custom metrics (ASN.1-compatible)
+/// One custom metric and its value, as an ASN.1 sequence.
 #[derive(Debug, Clone, Sequence, PartialEq)]
 pub struct CustomMetric {
+	/// The metric name.
 	pub key: String,
-	/// Value stored as integer * 10000 (fixed-point representation)
+	/// The value as a fixed-point integer scaled by 10000.
 	pub value: i64,
 }
 
@@ -101,27 +104,27 @@ pub struct CustomMetric {
 #[derive(Debug, Clone, Sequence, PartialEq)]
 #[non_exhaustive]
 pub struct StatisticalMeasures {
-	/// Sample count
+	/// The number of samples.
 	pub count: u64,
-	/// Mean (average) in nanoseconds
+	/// The mean (average), in nanoseconds.
 	pub mean: u64,
-	/// Median (50th percentile) in nanoseconds
+	/// The median (50th percentile), in nanoseconds.
 	pub median: u64,
-	/// Percentiles (P95, P99, P99.9, etc.) in nanoseconds
+	/// The percentiles, such as P95, P99, and P99.9, in nanoseconds.
 	pub percentiles: Vec<PercentileValue>,
-	/// Confidence intervals (optional)
+	/// The confidence intervals, when the sample is large enough.
 	#[asn1(optional = "true")]
 	pub confidence_intervals: Option<ConfidenceIntervals>,
-	/// Additional custom metrics (extensible)
+	/// The custom metrics an analyzer adds beside the standard measures.
 	pub custom: Vec<CustomMetric>,
 }
 
-/// Basic statistical analyzer (default implementation).
+/// The default statistical analyzer.
 ///
-/// Provides:
-/// - Percentiles (P50, P90, P95, P99, P99.9)
-/// - Mean, median
-/// - Simple confidence intervals (if sample size sufficient)
+/// It computes:
+/// - The percentiles P50, P90, P95, P99, P99.9, and P99.99.
+/// - The mean and the median.
+/// - A simple 95% confidence interval of the mean, from 30 samples on.
 #[derive(Default, Debug, Clone, Copy)]
 pub struct DefaultStatisticalAnalyzer;
 
@@ -135,30 +138,27 @@ impl StatisticalAnalyzer for DefaultStatisticalAnalyzer {
 		let mut sorted = durations.to_vec();
 		sorted.sort_unstable();
 
-		// Calculate mean
 		let sum: u64 = durations.iter().sum();
 		let mean = sum / count as u64;
 
-		// Calculate median (P50)
 		let median = if count.is_multiple_of(2) {
 			(sorted[count / 2 - 1] + sorted[count / 2]) / 2
 		} else {
 			sorted[count / 2]
 		};
 
-		// Helper to calculate percentile value using integer math
-		// p_fixed is percentile * 10000 (e.g., 9500 for 95%)
-		// Formula: index = (p_fixed * (count - 1) + 5000) / 10000
+		// The percentile index uses integer math. `p_fixed` is the percentile
+		// scaled by 10000 (9500 for 95%), and the index is
+		// (p_fixed * (count - 1) + 5000) / 10000.
 		let percentile_value = |p_fixed: u32| -> u64 {
 			let count_minus_one = (count - 1) as u128;
 			let p_fixed_u128 = p_fixed as u128;
-			// Calculate: (p_fixed * (count - 1) + 5000) / 10000
-			// Use u128 to avoid overflow in multiplication
+			// The product runs in u128, so the multiplication cannot overflow.
 			let index = ((p_fixed_u128 * count_minus_one + 5000) / 10000) as usize;
 			sorted[index.min(count - 1)]
 		};
 
-		// Calculate percentiles as Vec for ASN.1 compatibility
+		// The percentiles are a `Vec` of pairs for ASN.1 compatibility.
 		let percentiles = vec![
 			PercentileValue { percentile: Percentile::P50, value: median },
 			PercentileValue {
@@ -183,10 +183,10 @@ impl StatisticalAnalyzer for DefaultStatisticalAnalyzer {
 			},
 		];
 
-		// Calculate confidence intervals (simple approximation for large
-		// samples)
+		// A sample of 30 or more gets a simple confidence interval
+		// approximation.
 		let confidence_intervals = if count >= 30 {
-			// Use standard error approximation
+			// The interval uses the standard error approximation.
 			let variance: u64 = durations
 				.iter()
 				.map(|&x| {
@@ -196,15 +196,15 @@ impl StatisticalAnalyzer for DefaultStatisticalAnalyzer {
 				.sum::<u64>()
 				/ count as u64;
 
-			// Calculate standard deviation using integer square root
-			// Use u128 to avoid overflow in intermediate calculations
-			let std_dev = integer_sqrt(variance as u128) as u64;
+			// The standard deviation is the integer square root of the
+			// variance.
+			let std_dev = variance.isqrt();
 
-			// 95% confidence interval margin: (1.96 * std_dev) / sqrt(count)
-			// Using integer math: (std_dev * 196) / (100 * sqrt(count))
-			// Use u128 for intermediate to avoid overflow
-			let count_sqrt = integer_sqrt(count as u128) as u64;
-			// std_dev * 196 could overflow u64, so use u128
+			// The 95% confidence margin is (1.96 * std_dev) / sqrt(count),
+			// which integer math computes as
+			// (std_dev * 196) / (100 * sqrt(count)).
+			let count_sqrt = count.isqrt() as u64;
+			// std_dev * 196 can overflow u64, so the product runs in u128.
 			let margin = ((std_dev as u128 * 196) / (100 * count_sqrt.max(1) as u128)) as u64;
 
 			Some(ConfidenceIntervals {
@@ -282,7 +282,7 @@ mod tests {
 	#[test]
 	fn test_basic_analyzer_multiple_values() -> Result<(), Box<dyn core::error::Error>> {
 		let analyzer = DefaultStatisticalAnalyzer;
-		// Durations: 10ms, 20ms, 30ms, 40ms, 50ms
+		// The durations are 10ms, 20ms, 30ms, 40ms, and 50ms.
 		let durations = vec![10_000_000, 20_000_000, 30_000_000, 40_000_000, 50_000_000];
 
 		let result = analyzer.analyze(&durations)?;
@@ -312,7 +312,7 @@ mod tests {
 	#[test]
 	fn test_basic_analyzer_confidence_intervals() -> Result<(), Box<dyn core::error::Error>> {
 		let analyzer = DefaultStatisticalAnalyzer;
-		// Generate 30+ values for confidence interval calculation
+		// A confidence interval needs 30 or more values, so the test uses 50.
 		let durations: Vec<u64> = (1..=50).map(|i| i * 1_000_000).collect();
 
 		let result = analyzer.analyze(&durations)?;
@@ -330,10 +330,10 @@ mod tests {
 	#[test]
 	fn test_basic_analyzer_percentiles() -> Result<(), Box<dyn core::error::Error>> {
 		let analyzer = DefaultStatisticalAnalyzer;
-		// 100 values from 1ms to 100ms
+		// The input holds 100 values from 1ms to 100ms.
 		let durations: Vec<u64> = (1..=100).map(|i| i * 1_000_000).collect();
 
-		// Check all percentiles are present
+		// Every percentile level is present.
 		let result = analyzer.analyze(&durations)?;
 		assert!(result.percentiles.iter().any(|pv| pv.percentile == Percentile::P50));
 		assert!(result.percentiles.iter().any(|pv| pv.percentile == Percentile::P90));
@@ -342,8 +342,8 @@ mod tests {
 		assert!(result.percentiles.iter().any(|pv| pv.percentile == Percentile::P99_9));
 		assert!(result.percentiles.iter().any(|pv| pv.percentile == Percentile::P99_99));
 
-		// Percentiles should be monotonic (P50 <= P90 <= P95 <= P99 <= P99.9 <=
-		// P99.99)
+		// The percentiles are monotonic: P50 <= P90 <= P95 <= P99 <= P99.9 <=
+		// P99.99.
 		let p50 = result
 			.percentiles
 			.iter()

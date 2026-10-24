@@ -148,7 +148,7 @@ where
 
 /// The direction a record key serves. Its octet leads the epoch in the
 /// `kekid` of every record, so a record reflected into the other direction
-/// names another key, and is refused before any key runs.
+/// names another key, and the receiver refuses it before any key runs.
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecordDirection {
@@ -301,7 +301,7 @@ impl<'a> CheckedContent<'a> {
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError::UnexpectedAlgorithm`] when `envelope` names another algorithm.
+	/// - [`TightBeamError::UnexpectedAlgorithm`] -- `envelope` names another algorithm.
 	pub(crate) fn check(
 		envelope: &'a AuthEnvelopedData,
 		arrived: &'a [u8],
@@ -328,7 +328,7 @@ impl<'a> CheckedContent<'a> {
 	///
 	/// # Errors
 	///
-	/// - The [`AuthEnvelopedData::open`] set after the content leaves the envelope.
+	/// - The errors of [`AuthEnvelopedData::open`], for the content outside the envelope.
 	#[cfg(all(feature = "hpke", feature = "signature"))]
 	pub async fn open<P>(self, opener: &Opener<'_, P::Kem>) -> TbResult<()>
 	where
@@ -345,7 +345,7 @@ impl<'a> CheckedContent<'a> {
 	///
 	/// # Errors
 	///
-	/// - The [`AuthEnvelopedData::open`] set, with `kek` as the opener.
+	/// - The errors of [`AuthEnvelopedData::open`], with `kek` as the opener.
 	#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 	pub(crate) fn open_kek<P>(self, kek: &[u8], key_identifier: &[u8]) -> TbResult<()>
 	where
@@ -400,13 +400,13 @@ pub trait DecryptContent {
 	/// is `arrived`, in place, so `content` holds the plaintext once the
 	/// decryption returns.
 	///
-	/// An envelope that names an algorithm other than
-	/// [`Decryptor::algorithm_oid`] is refused before any decryption, and a
-	/// refused decryption leaves `content` as it was.
+	/// This refuses an envelope that names an algorithm other than
+	/// [`Decryptor::algorithm_oid`] before any decryption, and a refused
+	/// decryption leaves `content` as it was.
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError::UnexpectedAlgorithm`] when `envelope` names another algorithm.
+	/// - [`TightBeamError::UnexpectedAlgorithm`] -- `envelope` names another algorithm.
 	/// - The errors of [`Decryptor::open`].
 	fn decrypt_content<'a>(
 		&'a self,
@@ -534,7 +534,7 @@ impl SendCipher {
 	///
 	/// The limit clamps to the renewal volume at this cipher's envelope
 	/// ceiling, [`DEFAULT_REKEY_RECORD_LIMIT`] by default, because the record
-	/// limit of RFC 9846 § 5.5 is a MUST that no configuration may raise.
+	/// limit of RFC 9846 §5.5 is a MUST that no configuration may raise.
 	pub fn with_rekey_limit(mut self, limit: u64) -> Self {
 		self.rekey_limit = limit.min(self.volume_bound);
 		self
@@ -575,10 +575,10 @@ impl SendCipher {
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError::RekeyRequired`] when the record limit is reached.
+	/// - [`TightBeamError::RekeyRequired`] -- the cipher is at the record limit.
 	///   Reestablish the session for fresh keys.
-	/// - [`TightBeamError::NonceExhausted`] when the 64-bit sequence space is spent.
-	/// - [`TightBeamError::EnvelopeError`] when the envelope refuses to seal.
+	/// - [`TightBeamError::NonceExhausted`] -- the 64-bit sequence space is spent.
+	/// - [`TightBeamError::EnvelopeError`] -- the envelope refuses to seal.
 	pub fn encrypt_next(&self, payload: impl Into<Vec<u8>>) -> TbResult<AuthEnvelopedData> {
 		// The failed update leaves the counter parked at the limit, so
 		// every subsequent call fails, which holds the sequence unique.
@@ -639,7 +639,7 @@ impl SendCipher {
 /// - Any other value is a replay, a reorder, or a deletion, and the cipher refuses it.
 /// - An attacker who excises a record desynchronizes the sequence, so the next record exposes it (CWE-345).
 ///
-/// This matches the receiver-side sequence discipline of RFC 9846 § 5.3.
+/// This matches the receiver-side sequence discipline of RFC 9846 §5.3.
 ///
 /// # Renewal bound
 ///
@@ -650,17 +650,17 @@ impl SendCipher {
 /// - A sequence number at or past [`DEFAULT_REKEY_RECORD_LIMIT`], which an honest [`SendCipher`] stays below.
 /// - A record that takes the bytes opened under this key past the renewal volume.
 ///
-/// RFC 9846 § 5.5 sets its limit on the sender, and [`SendCipher`] holds it.
+/// RFC 9846 §5.5 sets its limit on the sender, and [`SendCipher`] holds it.
 /// The configurable rekey limit is a renewal-trigger threshold. Both refusals
 /// stay fixed whatever it is.
 ///
 /// # Envelope ceiling
 ///
-/// The encrypted-envelope ceiling is not negotiated, so the byte bound counts
+/// Each peer sets its own encrypted-envelope ceiling, so the byte bound counts
 /// what the key opened instead of assuming the peer's record size:
 ///
 /// - An honest sender's record limit times its own ceiling is at most the volume, so it is never refused.
-/// - A peer that ignores its send clamp is refused once its records carry the volume.
+/// - The cipher refuses a peer that ignores its send clamp once its records carry the volume.
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 pub struct RecvCipher {
 	aead: RuntimeAead,
@@ -770,9 +770,9 @@ impl RecvCipher {
 	/// Open `record`, the DER of one record's `AuthEnvelopedData`, in the
 	/// buffer it arrived in, and return the content it decrypted in place.
 	///
-	/// The epoch and the sequence number the record carries are checked
-	/// before the content key unwraps, and the sequence advances once the tag
-	/// passes. A refused record leaves the sequence where it was.
+	/// This checks the epoch and the sequence number the record carries before
+	/// the content key unwraps, and advances the sequence once the tag passes.
+	/// A refused record leaves the sequence where it was.
 	///
 	/// # Errors
 	///
@@ -781,16 +781,14 @@ impl RecvCipher {
 	/// - [`TightBeamError::NonceReplayed`] -- the record carries another sequence number than the next.
 	/// - [`TightBeamError::RekeyRequired`] -- at either renewal bound.
 	pub fn open<'a>(&self, record: &'a mut [u8]) -> TbResult<&'a [u8]> {
-		// 1. Decode the record with its content left where it arrived, and
-		//    read the position it claims.
+		// 1. Decode the record with its content left where it arrived, and read the position it claims.
 		let record = AuthEnvelopedData::detach(record, RECORD_CONTENT_TYPE)?;
 		let carried = RecordSequence::carried_by(record.envelope())?;
 		if carried.epoch != self.epoch {
 			return Err(TightBeamError::RecordEpoch((carried.epoch, self.epoch).into()));
 		}
 
-		// 2. Refuse at the crate's renewal bounds, by record count and by the
-		//    bytes this key has opened.
+		// 2. Refuse at the crate's renewal bounds, by record count and by the bytes this key has opened.
 		let counter = carried.sequence;
 		if counter >= DEFAULT_REKEY_RECORD_LIMIT {
 			return Err(TightBeamError::RekeyRequired);
@@ -815,9 +813,9 @@ impl RecvCipher {
 		//    `kekid` names this key's direction and epoch.
 		let opened = self.aead.open(record, &self.key_identifier)?;
 
-		// Advance only after successful authentication, otherwise a forged
-		// record could block all future legitimate ones. The counter is below
-		// the record limit, so the next one fits its share of the word.
+		// Advance only after the tag passes, because a forged record could
+		// otherwise block every later legitimate one. The counter is below the
+		// record limit, so the next one fits its share of the word.
 		let next = Progress { counter: counter.saturating_add(1), opened_bytes };
 		self.progress
 			.compare_exchange(word, next.pack(), Ordering::Relaxed, Ordering::Relaxed)
@@ -859,9 +857,9 @@ impl RecvCipher {
 /// directions. [`SessionKeys`] maps them into send and receive sides, and
 /// names each key's records by the direction of its field.
 pub struct DirectionalCiphers<C> {
-	/// Cipher for the client-to-server direction.
+	/// The cipher of the client-to-server direction.
 	pub client_to_server: C,
-	/// Cipher for the server-to-client direction.
+	/// The cipher of the server-to-client direction.
 	pub server_to_client: C,
 	/// The epoch both keys serve: 0 at the handshake, and one more at each
 	/// renewal. Each record carries it.
@@ -871,7 +869,7 @@ pub struct DirectionalCiphers<C> {
 /// Role-mapped directional session keys produced by handshake completion.
 ///
 /// The handshake derives one client-to-server and one server-to-client key
-/// (RFC 9846 § 7.3 precedent). Each endpoint sends on its own direction and
+/// (RFC 9846 §7.3 precedent). Each endpoint sends on its own direction and
 /// receives on the peer's, so record sequences stay distinct per direction.
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 pub struct SessionKeys {
@@ -938,12 +936,13 @@ impl SessionKeys {
 ))]
 mod tests {
 	use super::*;
+	use crate::asn1::admission::fixtures::{descending_values, tlv};
 	use crate::cms::enveloped_data::RecipientInfo;
 	use crate::constants::DEFAULT_MAX_ENCRYPTED_ENVELOPE;
 	use crate::crypto::key::KeyError;
 	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::der::asn1::ObjectIdentifier as Oid;
-	use crate::der::{Decode, Encode};
+	use crate::der::{AnyRef, Decode, Encode, ErrorKind, Header, Reader, SliceReader, Tag as DerTag, TagNumber};
 	use crate::error::ReceivedExpectedError;
 	use crate::testing::{unhex, TestAttributes};
 
@@ -1012,6 +1011,75 @@ mod tests {
 		let at = record.windows(in_order.len()).position(|window| window == in_order.as_slice());
 		let at = at.expect("the record carries its attributes in DER order");
 		[&record[..at], swapped.as_slice(), &record[at + in_order.len()..]].concat()
+	}
+
+	/// The values in the descending `unauthAttrs` of a forged record: sixty
+	/// thousand, a 240 KB record.
+	const FORGED_VALUES_LEN: u16 = 60_000;
+
+	/// The fields of the `AuthEnvelopedData` of `record`, after its header.
+	fn fields_of(record: &[u8]) -> &[u8] {
+		let mut reader = SliceReader::new(record).expect("a record fits a DER length");
+		Header::decode(&mut reader).expect("a record starts with a header");
+		let header_len = usize::try_from(reader.position()).expect("a header length fits usize");
+		record.get(header_len..).expect("the header lies inside the record")
+	}
+
+	/// `record` with `element` after its last field.
+	fn with_trailing(record: &[u8], element: &[u8]) -> Vec<u8> {
+		tlv(DerTag::Sequence, &[fields_of(record), element].concat())
+	}
+
+	/// `record` with a second recipient beside its first, which differs from
+	/// it in one octet, in the DER order of the two.
+	fn with_two_recipients(record: &[u8]) -> Vec<u8> {
+		let (version, rest) = fields_of(record).split_at(3);
+		let mut reader = SliceReader::new(rest).expect("a record fits a DER length");
+		let recipients = reader.tlv_bytes().expect("a record carries its recipients after its version");
+		let after = &rest[recipients.len()..];
+
+		let first = AnyRef::from_der(recipients).expect("the recipients decode").value().to_vec();
+		let mut second = first.clone();
+		let last = second.last_mut().expect("a recipient ends with its wrapped key");
+		*last ^= 0x01;
+		let mut both = [first, second];
+		both.sort();
+
+		let recipients = tlv(DerTag::Set, &both.concat());
+		tlv(DerTag::Sequence, &[version, recipients.as_slice(), after].concat())
+	}
+
+	/// `record` with an empty `[0] originatorInfo` after its version, where
+	/// RFC 5083 §2.1 places the field.
+	fn with_originator_info(record: &[u8]) -> Vec<u8> {
+		let (version, rest) = fields_of(record).split_at(3);
+		tlv(DerTag::Sequence, &[version, &[0xa0, 0x00], rest].concat())
+	}
+
+	/// `record` with its tag changed in its last octet, the last of `mac`.
+	fn with_forged_tag(record: &[u8]) -> Vec<u8> {
+		let mut forged = record.to_vec();
+		let last = forged.last_mut().expect("a record ends with its tag");
+		*last ^= 1;
+		forged
+	}
+
+	/// An `[2] unauthAttrs` of one attribute whose `count` values arrive in
+	/// descending order.
+	fn unauth_attrs(count: u16) -> Vec<u8> {
+		let oid = Oid::new_unwrap("1.2.3.4").to_der().expect("a test OID encodes");
+		let values = tlv(DerTag::Set, &descending_values(count));
+		let attribute = tlv(DerTag::Sequence, &[oid, values].concat());
+		tlv(DerTag::ContextSpecific { constructed: true, number: TagNumber::N2 }, &attribute)
+	}
+
+	/// The kind of the DER error that refused a record, or `None` for another
+	/// outcome.
+	fn encoding_refusal(outcome: TbResult<&[u8]>) -> Option<ErrorKind> {
+		match outcome {
+			Err(TightBeamError::EnvelopeError(EnvelopeError::Encoding(error))) => Some(error.kind()),
+			_ => None,
+		}
 	}
 
 	/// A record `sender` seals over [`PLAINTEXT`], as its DER.
@@ -1187,6 +1255,50 @@ mod tests {
 		));
 	}
 
+	/// The admission refuses a 240 KB record with a forged tag and sixty
+	/// thousand `unauthAttrs` values in descending order, before its tag runs.
+	#[test]
+	fn a_record_of_descending_values_is_refused_before_its_tag() {
+		let forged = with_forged_tag(&record_of(&test_sender(0)));
+		let mut record = with_trailing(&forged, &unauth_attrs(FORGED_VALUES_LEN));
+
+		let refused = test_receiver(0).open(&mut record);
+		assert_eq!(encoding_refusal(refused), Some(ErrorKind::SetOrdering));
+	}
+
+	/// A record names one recipient, so the receiver refuses a set of two
+	/// before `der` sorts it, ahead of the epoch the record also gets wrong.
+	#[test]
+	fn a_record_of_two_recipients_is_refused_before_its_epoch() {
+		let mut record = with_two_recipients(&record_of(&test_sender(1)));
+
+		let refused = test_receiver(0).open(&mut record);
+		let recipients = matches!(refused, Err(TightBeamError::EnvelopeError(EnvelopeError::RecipientKind)));
+		assert!(recipients);
+	}
+
+	/// The tag of a record covers no `unauthAttrs`, so the receiver refuses a
+	/// record that carries them, even under a tag that passes.
+	#[test]
+	fn a_record_that_carries_unauthenticated_attributes_is_refused() {
+		let mut record = with_trailing(&record_of(&test_sender(0)), &unauth_attrs(1));
+
+		let refused = test_receiver(0).open(&mut record);
+		let unauth_tag = DerTag::ContextSpecific { constructed: true, number: TagNumber::N2 };
+		assert_eq!(encoding_refusal(refused), Some(ErrorKind::Value { tag: unauth_tag }));
+	}
+
+	/// The tag of a record covers no `originatorInfo`, so the receiver refuses
+	/// a record that carries one, even under a tag that passes.
+	#[test]
+	fn a_record_that_carries_an_originator_is_refused() {
+		let mut record = with_originator_info(&record_of(&test_sender(0)));
+
+		let refused = test_receiver(0).open(&mut record);
+		let originator_tag = DerTag::ContextSpecific { constructed: true, number: TagNumber::N0 };
+		assert_eq!(encoding_refusal(refused), Some(ErrorKind::Value { tag: originator_tag }));
+	}
+
 	/// Each record draws its own content key, and AES key wrap is
 	/// deterministic, so two records under one key-encryption key carry two
 	/// wrapped keys only when their content keys differ.
@@ -1235,8 +1347,8 @@ mod tests {
 		let mut second = record_of(&sender);
 		let mut early = second.clone();
 
-		// The early record is refused, as `a_reordered_record_is_refused`
-		// shows, and the refusal is the step under test.
+		// The early record fails, as `a_reordered_record_is_refused` shows, and
+		// the refusal is the step under test.
 		let receiver = test_receiver(0);
 		let _refused = receiver.open(&mut early);
 		receiver.open(&mut first)?;
@@ -1256,15 +1368,15 @@ mod tests {
 		let receiver = test_receiver(0);
 		receiver.open(&mut first)?;
 
-		// An attacker excising the middle record desynchronizes the sequence.
-		// The very next record exposes the deletion.
+		// An attacker who excises the middle record desynchronizes the
+		// sequence, so the next record exposes the deletion.
 		let gapped = receiver.open(&mut third);
 		let expected = ReceivedExpectedError { received: 2, expected: 1 };
 		assert!(matches!(gapped, Err(TightBeamError::NonceReplayed(found)) if found == expected));
 		Ok(())
 	}
 
-	/// A replay whose position was rewritten to the next sequence number
+	/// A replay whose position an attacker rewrote to the next sequence number
 	/// passes the pre-check, and the tag over the attributes refuses it, so
 	/// the authenticated sequence decides.
 	#[test]
@@ -1425,8 +1537,8 @@ mod tests {
 		Ok(())
 	}
 
-	/// Every opened record counts toward the volume, so the second of two
-	/// records is refused when only the first fits.
+	/// Every opened record counts toward the volume, so the key refuses the
+	/// second of two records when only the first fits.
 	#[test]
 	fn recv_cipher_counts_every_record_it_opens() -> TbResult<()> {
 		let sender = test_sender(0);
@@ -1442,8 +1554,8 @@ mod tests {
 		Ok(())
 	}
 
-	/// The sender's envelopes set the per-key volume, and the ceiling is not
-	/// negotiated. An honest sender at a lowered ceiling keeps the constant
+	/// The sender's envelopes set the per-key volume, and each peer sets its
+	/// own ceiling. An honest sender at a lowered ceiling keeps the constant
 	/// record limit, and a receiver at the default ceiling and a receiver at a
 	/// raised one both accept the last record under that limit.
 	#[test]
@@ -1568,8 +1680,8 @@ mod tests {
 
 	/// Write a record of epoch 3 under the fixed key `0x42` repeated 32 times.
 	/// `scripts/cms-interop.sh` decrypts it with OpenSSL under that key, named
-	/// by its `kekid`, when the run sets `TIGHTBEAM_CMS_SAMPLES`, which `make
-	/// interop` does.
+	/// by its `kekid`, when the run sets `TIGHTBEAM_CMS_SAMPLES`, which
+	/// `make interop` does.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[test]
 	fn the_emitted_structures_write_their_interop_samples() -> TbResult<()> {

@@ -17,7 +17,7 @@ tb_assert_spec! {
 	}
 }
 
-/// Records the teardown call instead of serving traffic: `stop_boxed` is
+/// Records the teardown call rather than serve traffic: `stop_boxed` is
 /// the observable under test.
 struct StopProbeServlet {
 	trace: TraceCollector,
@@ -214,14 +214,14 @@ fn hive_lease(cluster: &ClusterGateway) -> MonotonicInstant {
 // anti-entropy beat would otherwise keep calling a peer that already
 // rejected the hive, and scaling updates would fan out there too.
 //
-// The claim is proven on the beat that does run:
+// The beat that does run proves the claim:
 //
 // - A second gateway admits the hive, and the hive's beat re-registers with the gateways it queued.
 // - A re-registration stamps a fresh lease on the gateway's clock, which the
 //   test has moved, so the renewed lease is the beat's footprint.
 // - The hive dials queued gateways in the order it queued them, so a
-//   refusing gateway wrongly queued first would be refused again before the
-//   re-registration lands, and the refusal count pins that.
+//   refusing gateway that it wrongly queued first would refuse again before
+//   the re-registration lands, and the refusal count pins that.
 // - The hive and the accepting gateway read the one clock the test advances,
 //   so the beat fires when the test says and the frames they sign for each
 //   other stay fresh.
@@ -297,8 +297,8 @@ tb_scenario! {
 		context: cluster_certs(),
 		start: |SetupEnv { trace, context: certs }| async move {
 			// A gateway without `hive_trust` cannot authenticate control
-			// frames and must fail closed, so even a validly signed
-			// registration is rejected.
+			// frames and must fail closed, so it rejects even a validly
+			// signed registration.
 			let tls = ClusterTlsConfig::new(CertificateSpec::Built(Box::new(certs.cert.to_owned())), Arc::new(Secp256k1KeyProvider::from(certs.key.to_owned())))
 				.expect("the test certificate must decode");
 			start_cluster(&trace, ClusterConfig::new(tls)).await
@@ -338,9 +338,9 @@ tb_assert_spec! {
 	}
 }
 
-// Alignment ordering: the mismatched registration is refused before the
-// clean one lands, and the mismatched update is refused only after the
-// hive registered. Counting cannot prove which registration was refused.
+// Alignment ordering: the gateway refuses the mismatched registration before
+// the clean one lands, and refuses the mismatched update only after the hive
+// registered. A count cannot prove which registration the gateway refused.
 tb_process_spec! {
 	pub ClusterLocatorAlignProcess,
 	events {
@@ -379,7 +379,7 @@ tb_scenario! {
 			let mut client = connect_cluster(&certs, cluster_addr).await?;
 			let hive_addr = b"127.0.0.1:65100";
 
-			let mismatch = servlet_info_mismatched("ping", b"127.0.0.1:65101", b"127.0.0.1:65199");
+			let mismatch = servlet_info_mismatched(&certs, "ping", b"127.0.0.1:65101", b"127.0.0.1:65199");
 			let refused_reg = signed_control_frame(
 				&certs,
 				b"misalign-reg",
@@ -407,7 +407,7 @@ tb_scenario! {
 
 			let bad_add = servlet_address_update(
 				hive_addr,
-				vec![servlet_info_mismatched("ping", b"127.0.0.1:65102", b"127.0.0.1:65198")],
+				vec![servlet_info_mismatched(&certs, "ping", b"127.0.0.1:65102", b"127.0.0.1:65198")],
 				vec![],
 			);
 
@@ -435,10 +435,10 @@ tb_assert_spec! {
 	}
 }
 
-// Anti-replay ordering: only after a registration lands can its replay
-// (then a stale resend) be refused, and only after a fresh update lands
-// can its replay be refused. Counting alone cannot prove the refusals
-// follow the acceptances.
+// Anti-replay ordering: the gateway can refuse a registration's replay (then
+// a stale resend) only after the registration lands, and an update's replay
+// only after the fresh update lands. A count alone cannot prove that the
+// refusals follow the acceptances.
 tb_process_spec! {
 	pub ClusterReplayProcess,
 	events {
@@ -476,7 +476,7 @@ tb_scenario! {
 			let cluster_addr = cluster.addr();
 			let mut client = connect_cluster(&certs, cluster_addr).await?;
 
-			// A fresh signed registration is accepted.
+			// The gateway accepts a fresh signed registration.
 			let fresh = signed_control_frame(
 				&certs,
 				b"replay-reg",
@@ -509,7 +509,7 @@ tb_scenario! {
 			// The same enforcement applies to servlet address updates.
 			let update = servlet_address_update(
 				b"127.0.0.1:65000",
-				vec![servlet_info("ping", b"127.0.0.1:65001")],
+				vec![servlet_info(&certs, "ping", b"127.0.0.1:65001")],
 				vec![],
 			);
 			let fresh_update = signed_control_frame(&certs, b"replay-update", update).await?;
@@ -600,7 +600,7 @@ tb_assert_spec! {
 	}
 }
 
-// Eviction ordering: a hive can only be evicted after it registered.
+// Eviction ordering: the gateway can evict a hive only after it registered.
 // The client-side REJECTED_HEARTBEAT_DECODED marker stays out of the
 // alphabet because the heartbeat task fires the eviction event after the
 // registry empties, and that event races the client's poll.
@@ -737,7 +737,7 @@ fn dual_hive_certs() -> DualHiveCerts {
 }
 
 /// Starts a hive whose control plane answers under hive B's identity and
-/// admits the gateway's commands, so a heartbeat that reaches it is answered.
+/// admits the gateway's commands, so it answers a heartbeat that reaches it.
 async fn start_hive_b(certs: &DualHiveCerts, trace: &TraceCollector) -> Result<ClusterTestHive, TightBeamError> {
 	let (cert, key) = &certs.hive_b;
 	let spec = CertificateSpec::Built(Box::new(cert.to_owned()));
@@ -815,8 +815,8 @@ tb_assert_spec! {
 	}
 }
 
-// A heartbeat names the hive by its registration, so a heartbeat to an
-// address with no registration is refused before any dial.
+// A heartbeat names the hive by its registration, so the gateway refuses a
+// heartbeat to an address with no registration before any dial.
 tb_scenario! {
 	name: cluster_heartbeat_refuses_an_address_no_hive_registered,
 	spec: ClusterHeartbeatUnregisteredSpec,
@@ -918,9 +918,9 @@ tb_assert_spec! {
 	}
 }
 
-// Tamper ordering: the cross-hive poison update is refused before the
-// owner's update lands. Counting cannot prove the refusal hit the
-// poison rather than the owner's own update.
+// Tamper ordering: the gateway refuses the cross-hive poison update before the
+// owner's update lands. A count cannot prove that the refusal hit the poison
+// rather than the owner's own update.
 tb_process_spec! {
 	pub ClusterCrossUpdateProcess,
 	events {
@@ -973,12 +973,12 @@ tb_scenario! {
 				(
 					&certs.hive_b.1,
 					b"cross-update".as_slice(),
-					servlet_address_update(hive_a_addr, vec![servlet_info("poison", b"127.0.0.1:65099")], vec![]),
+					servlet_address_update(hive_a_addr, vec![servlet_info(&certs.gateway, "poison", b"127.0.0.1:65099")], vec![]),
 				),
 				(
 					&certs.hive_a.1,
 					b"owner-update".as_slice(),
-					servlet_address_update(hive_a_addr, vec![servlet_info("ping", b"127.0.0.1:65012")], vec![]),
+					servlet_address_update(hive_a_addr, vec![servlet_info(&certs.gateway, "ping", b"127.0.0.1:65012")], vec![]),
 				),
 			];
 
@@ -1008,7 +1008,7 @@ tb_assert_spec! {
 }
 
 // A second hive that registers a servlet address the first hive already
-// serves is refused whole, so the first hive keeps its route (CWE-639).
+// serves meets a whole refusal, so the first hive keeps its route (CWE-639).
 // The first hive then removes that address under its own signature, which
 // only the route's owner may do, so the accepted removal is the proof it
 // kept the route.
@@ -1028,16 +1028,16 @@ tb_scenario! {
 			let mut client = connect_cluster(&certs.gateway, cluster.addr()).await?;
 			let servlet_addr = b"127.0.0.1:65020".as_slice();
 
-			let owner = [servlet_info("calc", servlet_addr)];
+			let owner = [servlet_info(&certs.gateway, "calc", servlet_addr)];
 			register_signed_hive_serving(&mut client, &certs.hive_a.1, b"reg-a", b"127.0.0.1:65021", owner).await?;
 
-			let takeover = [servlet_info("calc", servlet_addr)];
+			let takeover = [servlet_info(&certs.gateway, "calc", servlet_addr)];
 			let response =
 				register_signed_hive_serving(&mut client, &certs.hive_b.1, b"reg-b", b"127.0.0.1:65022", takeover).await?;
 			trace.event_with(REGISTER_STATUS, &[], response.status)?;
 			trace.event_with(REGISTRY_HIVES, &[], count_u64(cluster.hive_count()?))?;
 
-			let owned_instance = servlet_info("calc", servlet_addr).servlet_id;
+			let owned_instance = servlet_info(&certs.gateway, "calc", servlet_addr).servlet_id;
 			let removal = servlet_address_update(b"127.0.0.1:65021", vec![], vec![owned_instance]);
 			let removed = emit_servlet_update(&mut client, &certs.hive_a.1, b"owner-removes", removal).await?;
 			trace.event_with(OWNER_UPDATE_STATUS, &[], removed.status)?;
@@ -1062,8 +1062,8 @@ tb_assert_spec! {
 }
 
 tb_process_spec! {
-	// Hijack ordering: the owner registers first, the hijacker's registration
-	// is refused, and only then does the owner's update land.
+	// Hijack ordering: the owner registers first, the gateway refuses the
+	// hijacker's registration, and only then does the owner's update land.
 	pub ClusterHijackProcess,
 	events {
 		observable {
@@ -1114,7 +1114,7 @@ tb_scenario! {
 				&mut client,
 				&certs.hive_a.1,
 				b"owner-still-bound",
-				servlet_address_update(hive_a_addr, vec![servlet_info("ping", b"127.0.0.1:65021")], vec![]),
+				servlet_address_update(hive_a_addr, vec![servlet_info(&certs.gateway, "ping", b"127.0.0.1:65021")], vec![]),
 			)
 			.await?;
 
@@ -1141,8 +1141,8 @@ tb_assert_spec! {
 tb_process_spec! {
 	// Removal ordering: work routes only between the add and the removal,
 	// the foreign-realm refusal lands between them, and unavailability
-	// follows the accepted removal. Counting cannot distinguish "routed
-	// then removed" from "removed then routed".
+	// follows the accepted removal. A count cannot tell "routed then
+	// removed" from "removed then routed".
 	pub ClusterRemovalProcess,
 	events {
 		observable {
@@ -1167,8 +1167,8 @@ tb_process_spec! {
 }
 
 // A signed update that removes an instance URN unroutes it: work for
-// the type routed before the removal and is Unavailable after. A
-// removal that names a foreign realm is refused wholesale.
+// the type routed before the removal and is Unavailable after. The
+// gateway refuses the whole of a removal that names a foreign realm.
 tb_scenario! {
 	name: cluster_removal_update_unroutes_instance,
 	config: ScenarioConfig::builder()
@@ -1192,7 +1192,7 @@ tb_scenario! {
 
 			register_signed_hive(&mut client, &certs.key, b"removal-reg", hive_addr).await?;
 
-			let added = vec![servlet_info("ping", servlet_addr.as_bytes())];
+			let added = vec![servlet_info(&certs, "ping", servlet_addr.as_bytes())];
 			let request = servlet_address_update(hive_addr, added, vec![]);
 			emit_servlet_update(&mut client, &certs.key, b"removal-add", request).await?;
 

@@ -95,19 +95,19 @@ use crate::transport::support::{
 	establish_mutual_transports, join_task, serve_one_handshake_message, MutualSessionHooks, MutualTransports,
 };
 
-/// Settlement challenge the authorizer binds into every receipt.
+/// The settlement challenge that the authorizer binds into every receipt.
 const CHALLENGE: &[u8] = b"receipt-invoice-42";
 
-/// Settlement answer the approver countersigns.
+/// The settlement answer that the approver countersigns.
 const RESPONSE: &[u8] = b"receipt-preimage-42";
 
-/// Application code for a settle refusal.
+/// The application code of a settle refusal.
 const SETTLE_REFUSAL_CODE: u32 = MUX_APPLICATION_CODE_FLOOR + 7;
 
-/// Application code for a client approval refusal.
+/// The application code of a client approval refusal.
 const APPROVAL_REFUSAL_CODE: u32 = MUX_APPLICATION_CODE_FLOOR + 8;
 
-/// Budgets requested by the client in every scenario.
+/// The budgets that the client requests in every scenario.
 const REQUEST: MuxBudgets = MuxBudgets { client_to_server: 64, server_to_client: 128 };
 
 fn server_offer() -> TransportOffer {
@@ -126,7 +126,8 @@ fn with_budget_approver(client: TcpTransport<TokioStream>, approver: Arc<PayingA
 	with_budget_offer(client).with_receipt_approver(approver as Arc<dyn ReceiptApprover>)
 }
 
-/// Settlement succeeds only for the expected answer.
+/// An authorizer that binds `CHALLENGE` into every grant. Settlement succeeds
+/// only for the expected answer, and only when `accept_settlement` is set.
 struct ChallengingAuthorizer {
 	challenge: OctetString,
 	expected_response: OctetString,
@@ -170,7 +171,8 @@ impl TransportAuthorizer for ChallengingAuthorizer {
 	}
 }
 
-/// Counts consultations so scenarios can prove the hook never fired.
+/// An approver that pays with the settlement answer or refuses with its code.
+/// It counts its consultations, so a scenario can prove the hook never fired.
 struct PayingApprover {
 	response: OctetString,
 	refusal: Option<u32>,
@@ -235,11 +237,12 @@ async fn establish_settled_session(trace: &TraceCollector) -> Result<MutualTrans
 
 /// `artifact` as a third party reads it back from storage.
 fn stored_artifact(artifact: &SignedData) -> Result<Signed<SignedData>, TightBeamError> {
-	let der = artifact.to_der()?;
+	let der = tightbeam::encode(artifact)?;
 	Ok(Signed::<SignedData>::from_der(&der)?)
 }
 
-/// Third-party verify via [`StoredReceipt::verify`].
+/// Whether a third party verifies `artifact` through [`StoredReceipt::verify`]
+/// under the server and client certificates.
 fn third_party_verifies(
 	artifact: &SignedData,
 	server_certificate: &Certificate,
@@ -335,7 +338,8 @@ fn set_answer_attr(signer: &mut SignerInfo, answer: Option<&'static [u8]>) -> Re
 
 type Tamper = fn(&mut SignedData) -> Result<(), TightBeamError>;
 
-/// Tamper cases: body, signatures, settlement answer.
+/// The tamper cases, which alter the signed body, a signature, or the
+/// settlement answer.
 const TAMPER_CASES: &[(&str, Tamper)] = &[
 	("budget drift in the signed body", |artifact| {
 		tamper_body(artifact, |receipt| {
@@ -435,7 +439,8 @@ tb_assert_spec! {
 	}
 }
 
-// Empty answer digest-identical to absent; both endpoints canonicalize to absent.
+// An empty answer is digest-identical to an absent one, because both
+// endpoints canonicalize it to absent.
 tb_scenario! {
 	name: receipt_empty_answer_normalized,
 	spec: ReceiptEmptyAnswerSpec,
@@ -560,7 +565,8 @@ tb_scenario! {
 			);
 			trace.event_with(SERVER_REJECTS_WITH_CODE, &[], server_rejected)?;
 
-			// Client completed optimistically; dead session on first read.
+			// The client completed optimistically, and its session fails on the
+			// first read.
 			trace.event_with(
 				CLIENT_COMPLETES_OPTIMISTICALLY,
 				&[],
@@ -696,7 +702,7 @@ tb_assert_spec! {
 	}
 }
 
-// Refused countersignature remains third-party verifiable evidence.
+// A refused countersignature remains evidence that a third party can verify.
 tb_scenario! {
 	name: receipt_outcome_preserves_refused_evidence,
 	spec: ReceiptOutcomeRefusedSpec,
@@ -821,7 +827,9 @@ tb_assert_spec! {
 	}
 }
 
-// Budgets without mutual auth: server cannot verify countersignature; client cannot countersign.
+// Budgets need mutual authentication: a server with no client validators
+// cannot verify a countersignature, and a client with no identity cannot
+// countersign.
 tb_scenario! {
 	name: receipt_budgets_require_mutual_auth,
 	spec: ReceiptMutualAuthSpec,
@@ -830,7 +838,7 @@ tb_scenario! {
 			let materials = ServerMaterials::generate();
 			let client_materials = ClientMaterials::generate();
 
-			// Server: no client validators.
+			// The first server has no client validators.
 			let (listener, addr) = bind_encrypted_listener(&materials).await?;
 			let server_task = tokio::spawn(async move {
 				let (transport, _) = listener.accept().await?;
@@ -859,7 +867,8 @@ tb_scenario! {
 				server_refused,
 			)?;
 
-			// Client: pinned, no identity to countersign with.
+			// The second client pins the server, and it has no identity to
+			// countersign with.
 			let (listener, addr) = bind_mutual_listener(&materials, &client_materials.certificate).await?;
 			let server_task = tokio::spawn(async move {
 				let (transport, _) = listener.accept().await?;
@@ -892,7 +901,8 @@ tb_scenario! {
 				client_refused,
 			)?;
 
-			// Identity check before approver: settlement answer is irreversible.
+			// The identity check runs before the approver, because a settlement
+			// answer is irreversible.
 			trace.event_with(
 				IDENTITYLESS_CLIENT_NEVER_CONSULTS_APPROVER,
 				&[],

@@ -1,47 +1,50 @@
-//! Integration tests for TightBeam
+//! The integration tests of TightBeam.
 //!
-//! Organized test suites for various components of the TightBeam protocol.
+//! Each module holds the test suite of one component of the TightBeam protocol.
 
-// Tests are exempt from the zero-copy Arc::clone discipline (workspace lints)
+// Tests are exempt from the zero-copy `Arc::clone` rule (workspace lints).
 #![allow(clippy::clone_on_ref_ptr)]
-// Raw `unwrap()` is banned crate-wide: test cases propagate with `?`,
+// Tests are exempt from the zero-panic index and arithmetic lints (workspace
+// lints): an index out of range fails its test at its location.
+#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+// Raw `unwrap()` is banned crate-wide: test cases propagate with `?`, and
 // helpers state their invariant through `expect`.
 #![deny(clippy::unwrap_used)]
 
-// Common test helpers
+// The shared test helpers.
 mod common;
 
-// Job/Pipeline tests
+// The job and pipeline tests.
 mod jobs;
 
-// Instrumentation tests
+// The instrumentation tests.
 #[cfg(feature = "instrument")]
 mod instrumentation;
 
-// Core protocol tests
+// The protocol integration tests.
 #[cfg(feature = "full")]
 mod tightbeam_core;
 
-// tests/core/
+// The frame encoding tests of the core protocol.
 #[cfg(feature = "full")]
 mod protocol_core;
 
 #[cfg(feature = "transport")]
 mod transport;
 
-// The one decider for a scenario's pass or fail
+// The one decider for a scenario's pass or fail.
 #[cfg(feature = "testing")]
 mod scenario_verdict;
 
-// FDR refinement checking tests
+// The tests of FDR refinement checking.
 #[cfg(feature = "testing-fdr")]
 mod fdr;
 
-// Timing verification integration tests
+// The integration tests of timing verification.
 #[cfg(all(feature = "testing-timing", feature = "testing-fdr", feature = "instrument"))]
 mod timing;
 
-// Schedulability analysis integration tests
+// The integration tests of schedulability analysis.
 #[cfg(all(
 	feature = "testing-timing",
 	feature = "testing-schedulability",
@@ -49,46 +52,46 @@ mod timing;
 ))]
 mod schedulability;
 
-// Colony tests
+// The colony tests.
 #[cfg(feature = "colony")]
 mod colony;
 
-// Fault injection tests
+// The fault injection tests.
 #[cfg(feature = "testing-fault")]
 mod fault;
 
-// FMEA tests
+// The FMEA tests.
 #[cfg(feature = "testing-fmea")]
 mod fmea;
 
-// Delay-Tolerant Networking tests
+// The Delay-Tolerant Networking tests.
 #[cfg(feature = "full")]
 mod dtn;
 
-// Security tests
+// The security tests.
 #[cfg(feature = "transport")]
 mod security;
 
-// Payment Processing Gateway tests
+// The payment processing gateway tests.
 #[cfg(feature = "colony")]
 mod payments;
 
-// Gate decision reading
+// The reading of a trace with no gate decision.
 #[cfg(feature = "testing")]
 mod gate;
 
-// Scenario configuration refusals
+// The refusals of `ScenarioConfigBuilder::build`.
 #[cfg(feature = "testing")]
 mod config;
 
-// Teardown on the panic path
+// Teardown on the panic path.
 #[cfg(feature = "testing")]
 mod teardown;
 
-// Properties over the wire types
+// Properties over the wire types.
 #[cfg(feature = "testing-property")]
 mod property;
 
-// Seams an outside crate fills with parts of its own
+// The seams an outside crate fills with parts of its own.
 #[cfg(all(feature = "transport", feature = "testing", feature = "hpke"))]
 mod seams;

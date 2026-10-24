@@ -1,16 +1,17 @@
 //! Paywall lottery integration tests.
 //!
-//! The full metered-service story on the real TCP + pool stack: a client
-//! connects, the house presents an invoice (the settlement challenge bound
-//! into the budget-bearing session receipt), the client countersigns to pay,
-//! and only then does the lottery serve draws. Credits are draws: every
-//! ticket debits one session-budget credit, so the negotiated budget is the
-//! number of draws a paid invoice buys.
+//! The tests run the full metered-service story on the real TCP and pool
+//! stack. The lottery serves draws only after these steps:
+//! 1. A client connects.
+//! 2. The house presents an invoice, the settlement challenge bound into the budget-bearing session receipt.
+//! 3. The client countersigns the invoice to pay.
 //!
-//! The draw itself is rigged per scenario: the house decides whether the
-//! reply repeats the client's pick (a win) or never does (the house keeps
-//! the pot), which turns settlement, budget, renewal, and refusal mechanics
-//! into observable lottery outcomes.
+//! Credits are draws: every ticket debits one session-budget credit, so the
+//! negotiated budget is the number of draws a paid invoice buys.
+//!
+//! The house rigs the draw per scenario: the reply repeats the client's pick
+//! (a win) or differs from it (the house keeps the pot), so settlement,
+//! budget, renewal, and refusal become observable lottery outcomes.
 
 #![cfg(all(
 	feature = "transport-hpke",
@@ -57,7 +58,7 @@ use tokio::task::JoinHandle;
 use crate::common::security::{
 	expectation_failure, pinning_trust_store, random_signing_key, test_certificate, PayingApprover, ServerMaterials,
 };
-use crate::transport::support::{await_receipt_rotation, bind_mutual_listener};
+use crate::transport::support::{await_receipt_rotation, await_transport, bind_mutual_listener};
 
 use tightbeam::instrumentation::events;
 use tightbeam::urn::Urn;
@@ -114,8 +115,8 @@ fn lottery_settings() -> MuxSettings {
 
 /// The draws served against the initial invoice before the budget watermark
 /// opens a renewal, which is a top-up invoice, for the rest. The value comes
-/// from the same public watermark math the mux enforces rather than from a
-/// copied reserve formula.
+/// from `MuxSettings::usable_send_budget`, the public watermark math that the
+/// mux enforces.
 fn prepaid_draws() -> u64 {
 	lottery_settings().usable_send_budget().unwrap_or_default()
 }
@@ -131,7 +132,7 @@ const OPENING_DRAWS: u64 = 3;
 enum DrawRig {
 	/// The reply repeats the pick: the client always wins.
 	AlwaysWin,
-	/// The reply never repeats the pick: the house keeps the pot.
+	/// The reply differs from the pick: the house keeps the pot.
 	HouseAlwaysWins,
 }
 
@@ -160,8 +161,8 @@ fn ledger_offer() -> Option<TransportOffer> {
 	Some(offer)
 }
 
-/// Invoices every session and every renewal. An unpaid or short-paid
-/// invoice fails closed with [`INVOICE_REFUSAL_CODE`].
+/// The house, which invoices every session and every renewal. An unpaid or
+/// short-paid invoice fails closed with [`INVOICE_REFUSAL_CODE`].
 struct LotteryHouse {
 	invoice: OctetString,
 	expected_payment: OctetString,
@@ -210,8 +211,8 @@ impl TransportAuthorizer for LotteryHouse {
 	}
 }
 
-/// Pays the first invoice, then refuses every renewal invoice with
-/// [`WALLET_EMPTY_CODE`]: the gambler is out of money.
+/// A wallet that pays the first invoice, then refuses every renewal invoice
+/// with [`WALLET_EMPTY_CODE`]: the gambler is out of money.
 struct EmptyWallet {
 	payment: OctetString,
 	invoices: AtomicUsize,
@@ -313,7 +314,7 @@ impl CreditLedger {
 	}
 }
 
-/// Lottery service whose credits live in a [`CreditLedger`] keyed by the
+/// The lottery service whose credits live in a [`CreditLedger`] keyed by the
 /// client's public key rather than in per-session budgets: the session-aware
 /// handler meters every ticket against the durable account of the
 /// authenticated peer.
@@ -393,8 +394,8 @@ fn pool_with_offer(
 	Ok(pool)
 }
 
-/// Plays one draw: it emits the pick as a ticket, decodes the announced
-/// number, and reports whether the gambler won.
+/// Plays one draw: it emits the pick as a ticket and returns the number
+/// that the house announces.
 async fn draw(lease: &mut PooledClient<TokioListener>, pick: impl AsRef<str>) -> Result<String, TightBeamError> {
 	let pick = pick.as_ref();
 	let ticket = TestFrame::v0(Some(pick), None);
@@ -476,7 +477,7 @@ tb_assert_spec! {
 	}
 }
 
-// A paid invoice unlocks the lottery. On the always-win rig, every announced
+// A paid invoice opens the lottery. On the always-win rig, every announced
 // number repeats the gambler's pick, well inside the prepaid credits.
 tb_scenario! {
 	name: paywall_paid_invoice_unlocks_winning_draws,
@@ -550,9 +551,9 @@ tb_assert_spec! {
 	}
 }
 
-// The house rig never announces the pick and the gambler's wallet cannot
-// pay the top-up invoice: the prepaid credits are the exact draw count,
-// then the refused renewal drains the window shut.
+// On the house rig every draw loses, and the gambler's wallet refuses the
+// top-up invoice: the prepaid credits buy the exact draw count, and the
+// refused renewal then drains the window shut.
 tb_scenario! {
 	name: paywall_house_rig_exhausts_draw_credits,
 	spec: PaywallExhaustedCreditsSpec,
@@ -566,10 +567,16 @@ tb_scenario! {
 
 			trace.event_with(INVOICE_SETTLES_BEFORE_SERVICE, &[], lease.session_receipt().is_some())?;
 
-			let tally = draw_until_cutoff(&mut lease, DRAW_CREDITS).await;
+			let tally = draw_until_cutoff(&mut lease, prepaid_draws()).await;
 			trace.event_with(HOUSE_NEVER_PAYS, &[], tally.wins == 0)?;
 			trace.event_with(GAMBLER_LOSES_EVERY_TICKET, &[], tally.losses == prepaid_draws())?;
-			trace.event_with(CREDITS_BOUND_THE_DRAWS, &[], tally.cutoff.is_some())?;
+
+			// The last prepaid draw opens the top-up renewal, which the wallet
+			// refuses, and the client drains the window with a GoAway. The
+			// wait ends on that GoAway, so the next ticket always meets a
+			// drained window.
+			let drained = await_transport(|| trace.recorded(events::MUX_GOAWAY_SENT) > 0).await;
+			trace.event_with(CREDITS_BOUND_THE_DRAWS, &[], drained)?;
 
 			// Stimulus for `events::MUX_EMIT_DRAINING`: the window is
 			// drained shut, so one more ticket is refused at admission.
@@ -646,10 +653,10 @@ tb_assert_spec! {
 	}
 }
 
-// A lost connection does not forfeit credits: the house books credits
-// against the authenticated public key, so a reconnecting gambler pays a
-// fresh invoice but resumes the balance the dead connection left behind,
-// down to the exact draw the account runs empty on.
+// Credits survive a lost connection: the house books credits against the
+// authenticated public key, so a reconnecting gambler pays a fresh invoice
+// but resumes the balance the dead connection left behind, down to the
+// exact draw the account runs empty on.
 tb_scenario! {
 	name: paywall_ledger_survives_reconnect,
 	spec: PaywallLedgerReconnectSpec,
@@ -734,10 +741,10 @@ tb_assert_spec! {
 	}
 }
 
-// The handler's session context carries the live receipt, not a
-// handshake snapshot: draws past the prepaid credits arrive after the
-// in-band renewal, so the house sees the epoch-1 receipt on them and
-// books two distinct transcript hashes across one connection.
+// The handler's session context carries the live receipt. Draws past the
+// prepaid credits arrive after the in-band renewal, so the house sees the
+// epoch-1 receipt on them and books two distinct transcript hashes across
+// one connection.
 tb_scenario! {
 	name: paywall_house_observes_rotated_receipt,
 	spec: PaywallLiveReceiptSpec,

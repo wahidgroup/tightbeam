@@ -131,7 +131,7 @@ pub(crate) struct OpeningContent {
 }
 
 /// Carriage of a public key as a CMS `OriginatorPublicKey`
-/// ([RFC 5652 § 6.2.2][rfc5652-6.2.2]).
+/// ([RFC 5652 §6.2.2][rfc5652-6.2.2]).
 ///
 /// The opening carries the client's agreement ephemeral this way from its
 /// SPKI, and the server Finished carries the server ephemeral the same way from
@@ -332,7 +332,7 @@ impl<P: HandshakeProvider> ClientLegs<P> for Cms {
 
 		// 4. Append the received encodings and seal the transcript. A tampered
 		//    attribute diverges the hashes and fails the signature (CWE-345),
-		//    and a reordered `SET OF` cannot normalise back to the signed form.
+		//    and a reordered `SET OF` cannot normalize back to the signed form.
 		//    The `certificates` field binds as it arrived, so a certificate
 		//    swapped for another of the same key or the same subject fails the
 		//    signature too (RFC 9846 §4.5.2).
@@ -575,6 +575,7 @@ mod tests {
 	use std::sync::Arc;
 
 	use super::*;
+	use crate::asn1::admission::fixtures::tlv;
 	use crate::cms::content_info::{CmsVersion, ContentInfo};
 	use crate::cms::signed_data::SignerInfo;
 	use crate::constants::{TIGHTBEAM_CLOSING_KEY_ID_DOMAIN, TIGHTBEAM_SERVER_FINISHED_DOMAIN};
@@ -595,7 +596,7 @@ mod tests {
 	use crate::crypto::x509::KeyPurposes;
 	use crate::der::asn1::ObjectIdentifier;
 	use crate::der::Any;
-	use crate::der::{Choice, DecodeValue, EncodeValue, Tagged};
+	use crate::der::{Choice, DecodeValue, EncodeValue, ErrorKind, Tag, TagNumber, Tagged};
 	use crate::oids::{AES_128_GCM, AUTH_ENVELOPED_DATA, HANDSHAKE_ABORT_ALERT, HANDSHAKE_SERVER_EPHEMERAL};
 	use crate::oids::{ATTR_CMS_ALGORITHM_PROTECTION, ATTR_CONTENT_TYPE, ATTR_MESSAGE_DIGEST};
 	use crate::oids::{DATA, SESSION_RECEIPT, SIGNED_DATA};
@@ -1194,7 +1195,7 @@ mod tests {
 	}
 
 	/// `reply` with the `s` of its signature flipped to `n - s`. ECDSA verifies
-	/// both (SEC 1 v2.0 § 4.1.4), so the signature still verifies, and the
+	/// both (SEC 1 v2.0 §4.1.4), so the signature still verifies, and the
 	/// server Finished MACs the octets of the other one.
 	fn with_signature_flipped(reply: &HandshakeMessage) -> HandshakeMessage {
 		let mut signed_data = reply_signed_data(reply);
@@ -1210,7 +1211,7 @@ mod tests {
 		HandshakeMessage::try_from(signed_data).expect("the reply encodes")
 	}
 
-	/// A reply is answered with the client Finished sealed as an
+	/// A client answers a reply with its client Finished sealed as an
 	/// `AuthEnvelopedData` of content type `id-signedData`.
 	#[tokio::test]
 	async fn a_reply_is_answered_with_a_sealed_client_finished() -> Result<(), Box<dyn Error>> {
@@ -1268,7 +1269,7 @@ mod tests {
 	}
 
 	/// The one recipient of a sealed client Finished is a `KEKRecipientInfo`
-	/// of version 4 (RFC 5652 § 6.2.3).
+	/// of version 4 (RFC 5652 §6.2.3).
 	#[tokio::test]
 	async fn a_sealed_client_finished_has_one_kek_recipient_of_version_4() {
 		let (closing, _) = sealed_client_finished().await;
@@ -1678,8 +1679,8 @@ mod tests {
 		Ok(())
 	}
 
-	/// A server Finished whose signer carries no signed attributes is refused
-	/// by the client (RFC 5652 §5.4).
+	/// The client refuses a server Finished whose signer carries no signed
+	/// attributes (RFC 5652 §5.4).
 	#[tokio::test]
 	async fn a_server_finished_without_signed_attributes_is_refused() -> Result<(), Box<dyn Error>> {
 		let server = create_test_server();
@@ -1694,8 +1695,8 @@ mod tests {
 		Ok(())
 	}
 
-	/// A server Finished whose `SignedData` version breaks the RFC 5652 §5.1
-	/// rule is refused by the client.
+	/// The client refuses a server Finished whose `SignedData` version breaks
+	/// the RFC 5652 §5.1 rule.
 	#[tokio::test]
 	async fn a_server_finished_of_the_wrong_version_is_refused() {
 		let server = create_test_server();
@@ -1725,8 +1726,8 @@ mod tests {
 	}
 
 	/// The server Finished carries the server's signing certificate in
-	/// `certificates`, and its one signer names that certificate (RFC 5652
-	/// §5.1, §5.3).
+	/// `certificates`, and its one signer names that certificate
+	/// (RFC 5652 §5.1, §5.3).
 	#[tokio::test]
 	async fn a_server_finished_carries_the_certificate_its_signer_names() -> Result<(), Box<dyn Error>> {
 		let identity = create_test_server();
@@ -1779,18 +1780,19 @@ mod tests {
 		Ok(())
 	}
 
-	/// The client binds the signing certificate as its bytes arrived, so a
-	/// reply whose certificate carries its RDN values in another order than
-	/// the server encoded, which decodes to the same value, fails the reply
-	/// signature (CWE-345).
+	/// A reply whose certificate carries its RDN values in another order than
+	/// DER, which would decode to the same value, is refused as it arrives
+	/// under its `[3]` envelope, before the client binds a byte of it
+	/// (X.690 §11.6, CWE-345).
 	#[tokio::test]
 	async fn a_reply_whose_certificate_bytes_were_reordered_is_refused() {
 		let identity = create_named_test_server(two_valued_name());
-		let (mut client, sent) = replied(&identity).await;
-		let reordered = with_rdn_values_swapped(&sent);
+		let (_client, sent) = replied(&identity).await;
+		let envelope_tag = Tag::ContextSpecific { constructed: true, number: TagNumber::N3 };
+		let arrived = tlv(envelope_tag, &with_rdn_values_swapped(&sent));
 
-		let refusal = client.respond(reordered).await;
-		assert!(matches!(refusal, Err(HandshakeError::SignatureVerificationFailed)));
+		let refused = TransportEnvelope::from_der(&arrived).err().map(|error| error.kind());
+		assert_eq!(refused, Some(ErrorKind::SetOrdering));
 	}
 
 	/// A client that names its static key as its agreement key `R` leaves the

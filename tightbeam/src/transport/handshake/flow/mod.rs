@@ -27,11 +27,14 @@
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, vec, vec::Vec};
 
+use crate::asn1::admission::DerAdmission;
 use crate::cms::signed_data::{CertificateSet, SignedData};
 use crate::crypto::cms::AuthEnvelopedData;
 use crate::crypto::sign::elliptic_curve::ecdh::EphemeralSecret;
 use crate::crypto::sign::elliptic_curve::{CurveArithmetic, PublicKey, SecretKey};
-use crate::crypto::sign::{CmsSigner, PresentedIssuers, Signed, SignedContent, SignerInfoDraft, SigningIdentity};
+use crate::crypto::sign::{
+	CmsSigner, PresentedIssuers, PresentedPath, Signed, SignedContent, SignerInfoDraft, SigningIdentity,
+};
 use crate::crypto::subtle::ConstantTimeEq;
 use crate::crypto::x509::{PeerCertificate, Signing};
 use crate::der::asn1::{ObjectIdentifier, OctetString};
@@ -380,7 +383,7 @@ impl<C: HandshakeCurve> ServerPending<C> {
 	/// Attach the server Finished to `reply`: the MAC under the secret this
 	/// value holds over the transcript hash of `terms` and the octets of the
 	/// reply's one signature, as an unsigned attribute of its `SignerInfo`
-	/// (RFC 9846 § 4.5.3).
+	/// (RFC 9846 §4.5.3).
 	///
 	/// # Errors
 	///
@@ -395,7 +398,8 @@ impl<C: HandshakeCurve> ServerPending<C> {
 		let finished = terms.server_confirmation(&self.secret, &reply)?;
 		let finished = Attribute::try_from(HandshakeAttribute::encode(&finished)?)?;
 		let reply = reply.with_unsigned_attribute(finished)?;
-		HandshakeMessage::try_from(reply.into_inner())
+		let reply = WireDer::signed(reply)?;
+		Ok(HandshakeMessage::SignedData(Box::new(reply)))
 	}
 }
 
@@ -820,17 +824,23 @@ impl Closing {
 /// is the one reader of the key-confirmation tag and the acknowledgement of
 /// either form.
 pub(crate) enum ClosingContent {
-	/// The client Finished of a client that presents an identity.
-	Finished(SignedData),
+	/// The client Finished of a client that presents an identity, beside the
+	/// certification path its signer presents, read from the bytes the
+	/// Finished arrived as.
+	Finished(SignedData, Option<Box<PresentedPath>>),
 	/// The attribute set of an anonymous client.
 	Anonymous(Attributes),
 }
 
 impl ClosingContent {
 	/// Open `closing` under `sealer`, and decode its content as the form its
-	/// content type names: `id-signedData` as the client Finished, `id-data`
-	/// as the attribute set. Any other type is refused before the closing key
-	/// runs, and the tag authenticates the type that opens.
+	/// content type names. Any other type is refused before the closing key
+	/// runs, and the tag authenticates the type that opens:
+	///
+	/// - `id-signedData`: the client Finished, held to the cap of a presented
+	///   set, then decoded as a [`Signed`] `SignedData`.
+	/// - `id-data`: the attribute set of an anonymous client, decoded once the
+	///   CMS rules of the admission walk admit it.
 	///
 	/// # Errors
 	///
@@ -838,19 +848,38 @@ impl ClosingContent {
 	/// - [`HandshakeError::SealedClosing`] -- the closing fails to open: its
 	///   envelope, its key, its tag, or its transcript is refused.
 	/// - [`HandshakeError::SealedFrame`] -- the opened frame is malformed.
-	/// - [`HandshakeError::DerError`] -- the content fails to decode as its form.
+	/// - [`HandshakeError::DerError`] -- the content fails to decode as its
+	///   form or to pass the walk, or the Finished carries a second
+	///   `certificates` field or a certificate in another encoding than its
+	///   DER.
+	/// - [`HandshakeError::SignatureVerificationFailed`] -- the Finished does not have exactly one signer.
+	/// - [`HandshakeError::CertificateValidationError`] -- the Finished
+	///   presents more than [`MAX_PRESENTED_PATH`] certificates, or the walk
+	///   refuses the path.
+	///
+	/// [`MAX_PRESENTED_PATH`]: crate::constants::MAX_PRESENTED_PATH
 	async fn open<P: HandshakeProvider>(
 		sealer: Sealer<P>,
 		closing: WireDer<AuthEnvelopedData>,
 	) -> Result<Self, HandshakeError> {
 		let content_type = closing.value().auth_encrypted_content_info.content_type;
 		let decode: fn(&[u8]) -> Result<Self, HandshakeError> = match content_type {
-			SIGNED_DATA => |der| Ok(Self::Finished(SignedData::from_der(der)?)),
-			DATA => |der| Ok(Self::Anonymous(Attributes::from_der(der)?)),
+			// The path moves out of the Finished, so the session keeps the
+			// certificate past the decoded Finished without a copy.
+			SIGNED_DATA => |der| {
+				CmsSigner::bound_presented(der)?;
+				let finished = Signed::<SignedData>::from_der(der)?;
+				let (finished, path) = CmsSigner::take_signer_path(finished)?;
+				Ok(Self::Finished(finished, path.map(Box::new)))
+			},
+			DATA => |der| {
+				DerAdmission::Cms.admit(der)?;
+				Ok(Self::Anonymous(Attributes::from_der(der)?))
+			},
 			_ => return Err(HandshakeError::UnexpectedContainer),
 		};
 
-		let content = sealer.open(closing.der(), content_type).await?;
+		let content = sealer.open(closing, content_type).await?;
 		content.with(|der| decode(der))
 	}
 
@@ -866,7 +895,7 @@ impl ClosingContent {
 	///   to 64 bytes, or the acknowledgement is no OCTET STRING.
 	fn confirmation(&self) -> Result<(KeyConfirmation, Option<Vec<u8>>), HandshakeError> {
 		let attributes: &dyn HandshakeAttributes = match self {
-			Self::Finished(finished) => finished,
+			Self::Finished(finished, _) => finished,
 			Self::Anonymous(attributes) => attributes,
 		};
 
@@ -885,26 +914,18 @@ impl ClosingContent {
 	/// # Errors
 	///
 	/// - [`HandshakeError::MissingClientCertificate`] -- the Finished has no certificate its signer names.
-	/// - [`HandshakeError::SignatureVerificationFailed`] -- the Finished does not have exactly one signer.
-	/// - [`HandshakeError::CertificateValidationError`] -- the Finished
-	///   presents more than [`MAX_PRESENTED_PATH`] certificates, the walk
-	///   refuses the path, or the signing use or `purpose` refuses the
-	///   certificate.
+	/// - [`HandshakeError::CertificateValidationError`] -- the signing use or
+	///   `purpose` refuses the certificate.
 	/// - [`HandshakeError::ClientEphemeralIsStatic`] -- `client_ephemeral` equals the certificate key.
-	///
-	/// [`MAX_PRESENTED_PATH`]: crate::constants::MAX_PRESENTED_PATH
 	fn into_offer<P: HandshakeProvider>(
 		self,
 		client_ephemeral: &PublicKey<P::Curve>,
 		purpose: ObjectIdentifier,
 	) -> Result<Offer<P>, HandshakeError> {
-		let Self::Finished(mut finished) = self else {
+		let Self::Finished(finished, path) = self else {
 			return Ok(Offer::anonymous());
 		};
 
-		// The path moves out of the Finished into the offer, so the session
-		// keeps the certificate past the decoded Finished without a copy.
-		let path = CmsSigner::take_signer_path(&mut finished)?;
 		let (certificate, issuers) = path.ok_or(HandshakeError::MissingClientCertificate)?.into_parts();
 		let identity = PeerCertificate::parse(certificate, purpose)?;
 		Offer::new(identity, issuers, ClientFinished(finished), client_ephemeral)
@@ -1071,7 +1092,7 @@ mod tests {
 
 	/// A client Finished binds the digest of the certificate it carries, so
 	/// it verifies under no other certificate of its key, as a TLS 1.3
-	/// signature covers the Certificate (RFC 9846 § 4.5.2).
+	/// signature covers the Certificate (RFC 9846 §4.5.2).
 	#[tokio::test]
 	async fn a_client_finished_verifies_under_no_other_certificate_of_its_key() -> Result<(), Box<dyn Error>> {
 		let client = create_test_certificate();

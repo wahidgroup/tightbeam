@@ -103,7 +103,9 @@ impl<P: ColonyDialProtocol> Advertiser<P> {
 	///
 	/// # Errors
 	///
-	/// - [`ClusterError::Transport`] -- the dial or the emit failed.
+	/// - [`ClusterError::Transport`] -- the dial or the emit failed, or the
+	///   runtime fault model injects a fault at the eviction of an unproven
+	///   answer.
 	/// - [`ClusterError::NoResponse`] -- the gateway closed without answering.
 	/// - [`ClusterError::Frame`] -- the answer does not decode.
 	pub(crate) async fn advertise(
@@ -116,7 +118,7 @@ impl<P: ColonyDialProtocol> Advertiser<P> {
 		let replied = client.emit(signed_frame, None).await;
 		let member = client.peer_certificate().and_then(|answer| self.config.flood_member(answer));
 		if member.is_none() {
-			client.discard();
+			client.discard()?;
 		}
 
 		let response = replied?.ok_or(ClusterError::NoResponse)?;

@@ -161,7 +161,8 @@ impl<'a> UrnBuilder<'a> {
 	/// # RFC 8141 Compliance
 	///
 	/// This method produces a URN in the format `urn:<NID>:<NSS>` where:
-	/// - NID is validated to be 2-32 characters, alphanumeric plus hyphens, starting with a letter
+	/// - NID is validated to be 2-32 characters, alphanumeric plus hyphens,
+	///   starting with a letter and ending with a letter or digit
 	/// - NSS is constructed according to the selected mode
 	///
 	/// # Errors

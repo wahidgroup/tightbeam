@@ -300,7 +300,7 @@ pub trait CertificateTrust: CertificateValidation + Debug + Send + Sync {
 
 	/// Returns the certificate this store holds for `cert`'s public key.
 	///
-	/// The lookup is the SubjectPublicKeyInfo, resolved through
+	/// The lookup key is the SubjectPublicKeyInfo, resolved through
 	/// [`Self::find_by_public_key`]. A rotated certificate for an enrolled key
 	/// therefore resolves to the enrolled one, which is the certificate a
 	/// signature by that key verifies against.
@@ -604,7 +604,7 @@ fn ensure_path_len(chain: &[&Certificate]) -> Result<(), CertificateValidationEr
 
 		// This counts the certificates strictly between this CA and the
 		// end-entity leaf.
-		let intermediates_below = chain.len().saturating_sub(index + 2);
+		let intermediates_below = chain.len().saturating_sub(index.saturating_add(2));
 		if intermediates_below as u64 > u64::from(max_intermediates) {
 			return Err(CertificateValidationError::PathLenExceeded);
 		}
@@ -954,9 +954,7 @@ impl CertificateTrustStore {
 		path.iter().try_for_each(|cert| cert.ensure_signature_algorithm_consistency())?;
 
 		// A sliding window checks each issuer and subject pair.
-		path.windows(2).try_for_each(|pair| {
-			let (issuer, cert) = (pair[0], pair[1]);
-
+		path.iter().zip(path.iter().skip(1)).try_for_each(|(issuer, cert)| {
 			// RFC 5280 §6.1.3(a)(4): the issuer DN must equal the preceding
 			// certificate's subject DN.
 			if cert.tbs_certificate.issuer != issuer.tbs_certificate.subject {
@@ -1143,7 +1141,7 @@ impl CertificateTrust for CertificateTrustStore {
 		self.held(&anchor)
 	}
 
-	/// The store reads `issuers` and `leaf` in place, with no copy.
+	/// The store reads `issuers` and `leaf` in place.
 	fn verify_presented(
 		&self,
 		issuers: &[Certificate],
@@ -1346,8 +1344,7 @@ impl TrustBuilder for CertificateTrustBuilder {
 
 		// The builder checks name chaining only, and signatures verify at run
 		// time.
-		chain.windows(2).try_for_each(|pair| {
-			let (issuer, cert) = (&pair[0], &pair[1]);
+		chain.iter().zip(chain.iter().skip(1)).try_for_each(|(issuer, cert)| {
 			(cert.tbs_certificate.issuer == issuer.tbs_certificate.subject)
 				.then_some(())
 				.ok_or_else(|| CertificateValidationError::InvalidChain {

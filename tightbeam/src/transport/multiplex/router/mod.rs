@@ -10,6 +10,7 @@ mod link;
 mod outbound;
 mod pending;
 mod reader;
+mod reassembly;
 mod responder;
 mod shared;
 mod sink;

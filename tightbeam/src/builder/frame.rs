@@ -119,9 +119,9 @@ impl ErrorAccumulator {
 			}
 			Self::Many(mut arr, len) => {
 				let len_usize = len as usize;
-				if len_usize < 5 {
-					arr[len_usize] = Some(error);
-					*self = Self::Many(arr, len + 1);
+				if let Some(slot) = arr.get_mut(len_usize) {
+					*slot = Some(error);
+					*self = Self::Many(arr, len.saturating_add(1));
 				} else {
 					let mut vec = Vec::with_capacity(6);
 					for item in arr.iter_mut().take(len_usize) {
@@ -921,7 +921,7 @@ mod tests {
 			assert!(tightbeam.metadata().confidentiality().is_some());
 			assert!(tightbeam.metadata().compactness().is_some());
 			assert!(tightbeam.metadata().previous_frame().is_some());
-			assert!(tightbeam.metadata().matrix().is_none()); // Matrix is V3+ only
+			assert!(tightbeam.metadata().matrix().is_none()); // The matrix needs V3 or later.
 			assert!(tightbeam.integrity().is_some());
 			assert!(tightbeam.nonrepudiation().is_some());
 			// Verify Message Integrity (MI): re-prove the commitment over the
@@ -1266,14 +1266,13 @@ mod tests {
 				);
 				let frame = result?;
 
-				// Test 3: Verify the README semantics. Each MUST flag requires
-				// the matching frame field.
+				// Test 3: Verify the README "Security Requirement Semantics".
+				// Each MUST flag requires the matching frame field.
 
-				// README line 363: MUST_BE_NON_REPUDIABLE=true requires the
-				// nonrepudiation field.
+				// MUST_BE_NON_REPUDIABLE=true requires the nonrepudiation
+				// field.
 				assert_eq!(frame.nonrepudiation().is_some(), $nonrepudiable);
-				// README line 364: MUST_BE_CONFIDENTIAL=true requires the
-				// confidentiality field.
+				// MUST_BE_CONFIDENTIAL=true requires the confidentiality field.
 				assert_eq!(frame.metadata().confidentiality().is_some(), $confidential);
 				// MUST_HAVE_MESSAGE_INTEGRITY=true requires the metadata
 				// integrity field.

@@ -85,9 +85,9 @@ pub(super) struct Routes {
 impl Routes {
 	/// Whether `entry` may be placed at its key.
 	///
-	/// This is the one decider for route ownership. `entry` is admitted when
-	/// its key is free or already held by its owner, and when its endpoint is
-	/// free or dialed by that owner alone (CWE-639). Peers may share an
+	/// This is the one decider for route ownership. It admits `entry` when
+	/// its key is free or its owner already holds it, and when its endpoint is
+	/// free or that owner alone dials it (CWE-639). Peers may share an
 	/// endpoint, because a relay trail dials the relay's own gateway.
 	///
 	/// # Errors
@@ -218,10 +218,10 @@ impl Routes {
 
 	/// Replaces `bucket`'s slate in one step.
 	///
-	/// Every entry is admitted and every route the swap would remove is
-	/// checked against `bucket.owner` before any map moves, so a refusal
-	/// leaves the bucket as it was. The new entries land before the
-	/// departed ones leave, so the bucket stays populated through the swap.
+	/// The swap admits every entry, and checks every route it would remove
+	/// against `bucket.owner`, before any map moves, so a refusal leaves the
+	/// bucket as it was. The new entries land before the departed ones leave,
+	/// so the bucket stays populated through the swap.
 	///
 	/// # Errors
 	///
@@ -289,7 +289,7 @@ impl Routes {
 		self.entries.values().map(|installed| &installed.entry)
 	}
 
-	/// Route keys serving `servlet_type`, borrowed from the index.
+	/// Route keys that serve `servlet_type`, borrowed from the index.
 	pub(super) fn addresses_for_type(&self, servlet_type: impl AsRef<[u8]>) -> &[SharedId] {
 		let servlet_type = servlet_type.as_ref();
 		self.by_type.get(servlet_type).map_or(&[], Vec::as_slice)
@@ -314,12 +314,12 @@ impl Routes {
 		let mut prior_for_bucket = 0usize;
 		let mut identities = HashSet::new();
 		for entry in self.values().filter(|entry| entry.route_kind() == count_kind) {
-			kind_total += 1;
+			kind_total = kind_total.saturating_add(1);
 
 			let entry_bucket = entry.bucket().as_ref();
 			identities.insert(entry_bucket);
 			if entry_bucket == bucket {
-				prior_for_bucket += 1;
+				prior_for_bucket = prior_for_bucket.saturating_add(1);
 			}
 		}
 
@@ -336,8 +336,8 @@ impl Routes {
 	///
 	/// The checks and writes run in this order:
 	///
-	/// 1. A slate older than the bucket's last applied order is refused.
-	/// 2. A slate that would pass the kind's caps is refused.
+	/// 1. It refuses a slate older than the bucket's last applied order.
+	/// 2. It refuses a slate that would pass the kind's caps.
 	/// 3. [`Self::reconcile`] asks the one decider about every key, socket, and swept route.
 	/// 4. An emptied direct slate also withdraws the relay trails learned from it.
 	/// 5. The ledger records the order the slate applied at.
@@ -380,7 +380,8 @@ impl Routes {
 	/// Drops the relay trails installed more than `max_age` before `now`.
 	///
 	/// The filter and the removal run under the one guard the caller holds,
-	/// so a trail that a reconcile refreshes is judged on its refreshed age.
+	/// so the filter reads the refreshed age of a trail that a reconcile
+	/// refreshes.
 	pub(super) fn prune_stale_relay_trails(&mut self, now: MonotonicInstant, max_age: Duration) -> usize {
 		let stale: Vec<SharedId> = self
 			.entries
@@ -452,7 +453,7 @@ impl Routes {
 
 	/// Applies one hive's additions and removals in a single step.
 	///
-	/// Every entry is checked before any map moves, so a refusal leaves the
+	/// It checks every entry before any map moves, so a refusal leaves the
 	/// registry as it was and the caller needs no compensating undo. The
 	/// slate names its hive, so every added route is that hive's by
 	/// construction and only the registry's own ownership question remains.
@@ -503,11 +504,11 @@ struct KindCaps {
 	max_routes: usize,
 }
 
-/// When an emptied bucket's order row may be dropped: once `window` has
-/// passed since it applied, as of `now`.
+/// When the registry may drop an emptied bucket's order row: once `window`
+/// has passed since it applied, as of `now`.
 ///
 /// The two travel together so an admission pairs the window with an
-/// instant from the clock the window is measured on.
+/// instant from the clock that measures the window.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Tombstone {
 	/// How long the row survives after its bucket empties.
@@ -526,8 +527,7 @@ pub struct ServletRegistry {
 	pub(super) routes: RwLock<Routes>,
 	/// How long a dead bucket's order tombstone survives.
 	pub(super) ad_tombstone_window: Duration,
-	/// The clock that tombstones, route installs, and relay-trail age are
-	/// measured on.
+	/// The clock that measures tombstones, route installs, and relay-trail age.
 	pub(super) clock: Arc<dyn Clock>,
 	/// Scoring and lifecycle configuration.
 	pub(super) config: PheromoneConfig,

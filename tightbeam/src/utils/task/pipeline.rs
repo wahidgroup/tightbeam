@@ -1,8 +1,8 @@
-//! Job orchestration pipeline engine
+//! A pipeline engine that orchestrates jobs.
 //!
-//! Implements a Pipeline trait for Result<T, E> and closures, making Result
-//! itself a pipeline. Jobs compose seamlessly with standard Rust code using
-//! familiar Result methods.
+//! The `Pipeline` trait covers `Result<T, E>` and the closures that return
+//! one, so a `Result` is itself a pipeline. Jobs compose with standard Rust
+//! code through the familiar `Result` methods.
 
 #[cfg(any(test, feature = "testing"))]
 use std::sync::Arc;
@@ -14,35 +14,34 @@ use crate::trace::TraceCollector;
 #[cfg(any(test, feature = "testing"))]
 use crate::urn::Urn;
 
-/// Pipeline trait - extends Result with trace and retry capabilities
+/// A chain of jobs, with `Result` as the base pipeline.
 ///
-/// This trait is implemented for Result<T, E>, making standard Rust Results
-/// composable with jobs. The familiar Result methods (and_then, map, or_else)
-/// work exactly as expected, with optional extensions for retry logic and tracing.
+/// The trait is implemented for `Result<T, E>`, so a standard `Result`
+/// composes with jobs. The familiar `Result` methods (`and_then`, `map`,
+/// `or_else`) work as they do on `Result`, and `TracedResult` adds tracing.
 pub trait Pipeline: Sized {
 	type Output;
 	type Error;
 
-	/// Chain another computation (like Result::and_then)
+	/// Chain another computation, as `Result::and_then` does.
 	fn and_then<F, U>(self, f: F) -> impl Pipeline<Output = U, Error = Self::Error>
 	where
 		F: FnOnce(Self::Output) -> Result<U, Self::Error>;
 
-	/// Transform the success value (like Result::map)
+	/// Transform the success value, as `Result::map` does.
 	fn map<F, U>(self, f: F) -> impl Pipeline<Output = U, Error = Self::Error>
 	where
 		F: FnOnce(Self::Output) -> U;
 
-	/// Handle errors (like Result::or_else)
+	/// Handle an error, as `Result::or_else` does.
 	fn or_else<F>(self, f: F) -> impl Pipeline<Output = Self::Output, Error = Self::Error>
 	where
 		F: FnOnce(Self::Error) -> Result<Self::Output, Self::Error>;
 
-	/// Execute the pipeline
+	/// Execute the pipeline and return its result.
 	fn run(self) -> Result<Self::Output, Self::Error>;
 }
 
-// Result<T, E> is a Pipeline
 impl<T, E> Pipeline for Result<T, E> {
 	type Output = T;
 	type Error = E;
@@ -58,7 +57,7 @@ impl<T, E> Pipeline for Result<T, E> {
 	where
 		F: FnOnce(T) -> U,
 	{
-		// Use built-in Result::map
+		// This call resolves to the inherent `Result::map`.
 		self.map(f)
 	}
 
@@ -66,16 +65,16 @@ impl<T, E> Pipeline for Result<T, E> {
 	where
 		F: FnOnce(E) -> Result<T, E>,
 	{
-		// Use built-in Result::or_else
+		// This call resolves to the inherent `Result::or_else`.
 		self.or_else(f)
 	}
 
 	fn run(self) -> Result<T, E> {
-		self // Already a Result
+		self // The value is already a `Result`.
 	}
 }
 
-/// Closures that return Result are also Pipelines
+/// A closure that returns a `Result` is also a pipeline.
 impl<F, T, E> Pipeline for F
 where
 	F: FnOnce() -> Result<T, E>,
@@ -109,30 +108,26 @@ where
 	}
 }
 
-/// Extract Job struct name from type_name and convert to snake_case for trace events
+/// The job struct name in `type_name`, in snake_case, for trace events.
 ///
-/// Handles Job::run function paths like `crate::module::CreateTestFrame::run`
-/// by extracting the struct name (second-to-last segment) and converting to snake_case.
+/// For a `Job::run` path such as `crate::module::CreateTestFrame::run`, the
+/// name is the struct name, the second-to-last segment. Any other path falls
+/// back to its last segment.
 ///
-/// Examples:
-/// - `suite::jobs::CreateTestFrame::run` -> `create_test_frame`
-/// - `my_crate::ValidateConfig::run` -> `validate_config`
-/// - `CreateHandshakeRequest` -> `create_handshake_request` (fallback)
+/// For example:
+/// - `suite::jobs::CreateTestFrame::run` becomes `create_test_frame`.
+/// - `my_crate::ValidateConfig::run` becomes `validate_config`.
+/// - `CreateHandshakeRequest` becomes `create_handshake_request`, by the fallback.
 #[cfg(any(test, feature = "testing"))]
 fn to_snake_case(type_name: impl AsRef<str>) -> String {
 	let type_name = type_name.as_ref();
-	// Split by "::" and collect segments
 	let segments: Vec<&str> = type_name.split("::").collect();
-	// For Job::run paths, the struct name is second-to-last (before "run")
-	// e.g., ["suite", "jobs", "CreateTestFrame", "run"] -> "CreateTestFrame"
-	let name = if segments.len() >= 2 && segments.last() == Some(&"run") {
-		segments[segments.len() - 2]
-	} else {
-		// Fallback: use last segment
-		segments.last().copied().unwrap_or(type_name)
+	let name = match segments.as_slice() {
+		[.., struct_name, "run"] => *struct_name,
+		_ => segments.last().copied().unwrap_or(type_name),
 	};
 
-	// Worst case: every char is uppercase -> "ABC" becomes "a_b_c" (2n - 1 chars)
+	// At worst every char is uppercase: "ABC" becomes "a_b_c", 2n - 1 chars.
 	let capacity = name.len().saturating_mul(2);
 	let mut result = String::with_capacity(capacity);
 	for (i, ch) in name.chars().enumerate() {
@@ -149,9 +144,9 @@ fn to_snake_case(type_name: impl AsRef<str>) -> String {
 	result
 }
 
-/// Create a tightbeam job event URN
+/// Create a tightbeam job event URN.
 ///
-/// Format: `urn:tightbeam:event:job/<job-name>-<suffix>`
+/// The URN has the form `urn:tightbeam:event:job/<job-name>-<suffix>`.
 #[cfg(any(test, feature = "testing"))]
 fn make_event_urn(
 	job_name: &(impl AsRef<str> + ?Sized),
@@ -163,10 +158,10 @@ fn make_event_urn(
 	Ok(Urn::from_parts("tightbeam", nss)?)
 }
 
-/// Result with trace context for auto-trace events
+/// A `Result` with the trace context that job events go to.
 ///
-/// TracedResult wraps a Result and automatically emits trace events when jobs execute.
-/// Job names are automatically derived from their type names using snake_case conversion.
+/// `and_then` emits a start event before each job and a success or error
+/// event after it, under the snake_case form of the job's type name.
 #[cfg(any(test, feature = "testing"))]
 pub struct TracedResult<T, E> {
 	result: Result<T, E>,
@@ -175,12 +170,12 @@ pub struct TracedResult<T, E> {
 
 #[cfg(any(test, feature = "testing"))]
 impl<T, E> TracedResult<T, E> {
-	/// Create a new TracedResult
+	/// Wrap `result` with the trace collector its jobs report to.
 	pub fn new(result: Result<T, E>, trace: Arc<TraceCollector>) -> Self {
 		Self { result, trace }
 	}
 
-	/// Get a reference to the trace collector
+	/// The trace collector the jobs report to.
 	pub fn trace(&self) -> &Arc<TraceCollector> {
 		&self.trace
 	}
@@ -198,11 +193,12 @@ where
 	where
 		F: FnOnce(T) -> Result<U, E>,
 	{
-		// Extract job name from closure type (e.g., "crate::CreateTestFrame::run" -> "create_test_frame")
+		// The job name comes from the closure type: for example,
+		// "crate::CreateTestFrame::run" gives "create_test_frame".
 		let job_name = to_snake_case(core::any::type_name::<F>());
 		TracedResult {
 			result: self.result.and_then(|val| {
-				// Auto-emit: urn:tightbeam:instrumentation:event/<job_name>_start
+				// The start event is urn:tightbeam:event:job/<job-name>-start.
 				let event_urn = match make_event_urn(&job_name, "start") {
 					Ok(urn) => urn,
 					Err(e) => return Err(E::from(e)),
@@ -211,7 +207,8 @@ where
 					return Err(E::from(e));
 				}
 
-				// Auto-emit: urn:tightbeam:instrumentation:event/<job_name>_success|error
+				// The job then runs, and its outcome emits the end event,
+				// urn:tightbeam:event:job/<job-name>-success or -error.
 				let res = f(val);
 				match &res {
 					Ok(_) => {
@@ -259,10 +256,10 @@ where
 	}
 }
 
-/// Builder for creating traced pipelines
+/// A builder for traced pipelines.
 ///
-/// PipelineBuilder initializes a pipeline with trace context, enabling automatic
-/// trace event emission for all jobs in the pipeline.
+/// It starts a pipeline with a trace context, so every job the pipeline
+/// chains with `and_then` emits trace events.
 #[cfg(any(test, feature = "testing"))]
 pub struct PipelineBuilder {
 	trace: Arc<TraceCollector>,
@@ -270,18 +267,18 @@ pub struct PipelineBuilder {
 
 #[cfg(any(test, feature = "testing"))]
 impl PipelineBuilder {
-	/// Create a new pipeline builder with trace context
+	/// Create a pipeline builder that reports to `trace`.
 	pub fn new(trace: Arc<TraceCollector>) -> Self {
 		Self { trace }
 	}
 
-	/// Start a pipeline with an initial value
+	/// Start a pipeline with `value` as its first output.
 	pub fn start<T, E>(self, value: T) -> TracedResult<T, E> {
 		TracedResult { result: Ok(value), trace: self.trace }
 	}
 }
 
-/// Join type for parallel execution of two pipelines
+/// The join of two pipelines, which runs them in order and pairs their outputs.
 pub struct Join<P1, P2> {
 	left: P1,
 	right: P2,
@@ -317,27 +314,30 @@ where
 	}
 
 	fn run(self) -> Result<(P1::Output, P2::Output), Self::Error> {
-		// Execute both pipelines
 		let left_result = self.left.run()?;
 		let right_result = self.right.run()?;
 		Ok((left_result, right_result))
 	}
 }
 
-/// Parallel execution of two pipelines (like tokio::join!)
+/// Join two pipelines into one whose output pairs theirs.
 ///
-/// Executes both pipelines and returns a tuple of their results.
-/// If either pipeline fails, the error is propagated.
+/// Running the join runs `pipe1` and then `pipe2`, and returns a tuple of
+/// their outputs. The first error ends the run and propagates.
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// use tightbeam::pipeline::join;
+/// ```rust
+/// use tightbeam::utils::task::{join, Pipeline};
 ///
-/// let (encrypted, signed) = join(
-///     EncryptPayload::run(payload),
-///     SignPayload::run(payload)
-/// ).run()?;
+/// let payload = b"telemetry";
+/// let length = || -> Result<usize, &'static str> { Ok(payload.len()) };
+/// let lead = || payload.first().copied().ok_or("an empty payload");
+///
+/// let (length, lead) = join(length, lead).run()?;
+///
+/// assert_eq!((length, lead), (9, b't'));
+/// # Ok::<(), &'static str>(())
 /// ```
 pub fn join<P1, P2>(pipe1: P1, pipe2: P2) -> Join<P1, P2>
 where
@@ -353,13 +353,13 @@ mod tests {
 
 	#[test]
 	fn test_to_snake_case() {
-		// Simple type names (fallback behavior)
+		// A bare type name takes the fallback, its last segment.
 		assert_eq!(to_snake_case("CreateHandshakeRequest"), "create_handshake_request");
 		assert_eq!(to_snake_case("ValidateConfig"), "validate_config");
 		assert_eq!(to_snake_case("HTTPRequest"), "h_t_t_p_request");
 		assert_eq!(to_snake_case("simple"), "simple");
 
-		// Job::run paths - extracts struct name (second-to-last segment)
+		// A `Job::run` path gives the struct name, the second-to-last segment.
 		assert_eq!(to_snake_case("suite::jobs::CreateTestFrame::run"), "create_test_frame");
 		assert_eq!(to_snake_case("my_crate::ValidateFrame::run"), "validate_frame");
 		assert_eq!(to_snake_case("TransformContent::run"), "transform_content");

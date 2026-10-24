@@ -35,7 +35,7 @@ use crate::der::Decode;
 use crate::der::Encode;
 use crate::policy::GatePolicy;
 use crate::policy::TransitStatus;
-use crate::transport::envelopes::{Arrived, TransportEnvelope, WireEnvelope};
+use crate::transport::envelopes::{ArrivingEnvelope, TransportEnvelope, WireEnvelope};
 use crate::transport::error::TransportFailure;
 use crate::transport::handshake::BoxedServerHandshake;
 use crate::transport::io::{EnvelopeSink, EnvelopeSource};
@@ -431,8 +431,9 @@ where
 	type EnvelopeReader = TransportReader<S::ReadHalf>;
 	type EnvelopeWriter = TransportWriter<S::WriteHalf>;
 
-	/// An endpoint without encryption provisioning runs no handshake and
-	/// negotiates no multiplexing, so it returns `Ok(None)` with no I/O.
+	/// A provisioned endpoint serves handshake rounds until its session is
+	/// encrypted, then returns the settings it negotiated. An endpoint without
+	/// encryption provisioning returns `Ok(None)` with no I/O.
 	async fn negotiate_mux(&mut self) -> TransportResult<Option<MuxSettings>> {
 		if !self.encryption().is_provisioned() {
 			return Ok(None);
@@ -477,6 +478,40 @@ enum SplitRecv {
 	Cleartext,
 	/// The receive-direction cipher of the established session.
 	Encrypted(RecvCipher),
+}
+
+impl SplitRecv {
+	/// The wire mode this half reads.
+	const fn wire_mode(&self) -> WireMode {
+		match self {
+			Self::Cleartext => WireMode::Cleartext,
+			Self::Encrypted(_) => WireMode::Encrypted,
+		}
+	}
+
+	/// Admit `arriving` in the mode of this half, and return the DER of the
+	/// transport envelope it carries: a cleartext envelope as it arrived, or
+	/// the content of a record this half's receive cipher opened in place.
+	///
+	/// An arrival of the other mode is refused before any decode.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::OperationFailed`] with
+	///   [`TransportFailure::EncryptionFailed`] -- a record arrived on a
+	///   cleartext half.
+	/// - [`TransportError::MissingEncryption`] -- a cleartext envelope arrived on an encrypted half.
+	/// - The open failure of a record.
+	fn admit<'w>(&self, arriving: ArrivingEnvelope<'w>) -> TransportResult<&'w [u8]> {
+		match (self, arriving) {
+			(Self::Cleartext, ArrivingEnvelope::Cleartext(contents)) => Ok(contents),
+			(Self::Encrypted(recv_key), ArrivingEnvelope::Encrypted(record)) => Ok(recv_key.open(record)?),
+			(Self::Cleartext, ArrivingEnvelope::Encrypted(_)) => {
+				Err(TransportError::OperationFailed(TransportFailure::EncryptionFailed))
+			}
+			(Self::Encrypted(_), ArrivingEnvelope::Cleartext(_)) => Err(TransportError::MissingEncryption),
+		}
+	}
 }
 
 /// The wire mode a split send half writes, with the cipher an encrypted
@@ -542,10 +577,7 @@ where
 	/// The operation deadline bounds the read in either mode, so a peer that
 	/// stops mid-frame cannot pin the reader task (CWE-400).
 	async fn read_envelope(&mut self) -> TransportResult<TransportEnvelope> {
-		let cap = match &self.mode {
-			SplitRecv::Cleartext => self.limits.cleartext_envelope,
-			SplitRecv::Encrypted(_) => self.limits.encrypted_envelope,
-		};
+		let cap = self.limits.envelope_ceiling(self.mode.wire_mode());
 
 		// A split half belongs to an established session, so the read runs
 		// under the policy of one.
@@ -561,21 +593,14 @@ where
 		let wire_bytes = self.stream.read_frame(policy.cap()).await?;
 
 		// A record opens in the buffer it arrived in, so the buffer wipes when
-		// it drops.
+		// it drops. The outer tag names the mode, so the half refuses another
+		// mode than its own before any decode.
 		let mut wire_bytes = Zeroizing::new(wire_bytes);
-		let wire_envelope = WireEnvelope::arrive(&mut wire_bytes)?;
-		match (&self.mode, wire_envelope) {
-			(SplitRecv::Cleartext, Arrived::Cleartext(envelope)) => Ok(envelope),
-			(SplitRecv::Cleartext, Arrived::Encrypted(_)) => {
-				Err(TransportError::OperationFailed(TransportFailure::EncryptionFailed))
-			}
-			(SplitRecv::Encrypted(_), Arrived::Cleartext(_)) => Err(TransportError::MissingEncryption),
-			(SplitRecv::Encrypted(recv_key), Arrived::Encrypted(record)) => {
-				let opened = recv_key.open(record)?;
-				let envelope = TransportEnvelope::from_der(opened)?;
-				Ok(envelope)
-			}
-		}
+		let arriving = WireEnvelope::admit(&mut wire_bytes)?;
+		let contents = self.mode.admit(arriving)?;
+		let envelope = TransportEnvelope::from_der(contents)?;
+
+		Ok(envelope)
 	}
 
 	/// Return the number of records still readable before the receive cipher
@@ -1238,6 +1263,59 @@ mod tests {
 			let reader_install = reader(SplitRecv::Cleartext).install_recv_cipher(recv_cipher);
 			assert!(matches!(reader_install, Err(TransportError::MissingEncryption)));
 		}
+
+		/// A frame stream whose every read yields the one wire envelope it
+		/// holds.
+		struct OneFrameStream(&'static [u8]);
+
+		impl AsyncReadStream for OneFrameStream {
+			type Error = IoError;
+
+			async fn read_frame(&mut self, _cap: usize) -> Result<Vec<u8>, Self::Error> {
+				Ok(self.0.to_vec())
+			}
+		}
+
+		/// A wire envelope under the cleartext tag whose contents, a NULL,
+		/// decode to no transport envelope.
+		const UNDECODABLE_CLEARTEXT: &[u8] = &[0xa0, 0x02, 0x05, 0x00];
+
+		/// A wire envelope under the record tag whose contents, a NULL, open
+		/// under no receive cipher.
+		const UNOPENED_RECORD: &[u8] = &[0xa1, 0x02, 0x05, 0x00];
+
+		/// A receive half in `mode` over a stream that yields `frame`.
+		fn reading(mode: SplitRecv, frame: &'static [u8]) -> TransportReader<OneFrameStream> {
+			TransportReader {
+				stream: OneFrameStream(frame),
+				mode,
+				limits: TransportLimits::default(),
+				clock: Arc::new(SystemClock),
+				#[cfg(feature = "instrument")]
+				trace: None,
+			}
+		}
+
+		/// An encrypted half refuses a cleartext envelope by its outer tag,
+		/// before its contents decode.
+		#[tokio::test]
+		async fn an_encrypted_half_refuses_cleartext_before_it_decodes() {
+			let mut reader = reading(SplitRecv::Encrypted(test_receiver()), UNDECODABLE_CLEARTEXT);
+
+			let outcome = reader.read_envelope().await;
+			assert!(matches!(outcome, Err(TransportError::MissingEncryption)));
+		}
+
+		/// A cleartext half refuses a record by its outer tag, before it opens.
+		#[tokio::test]
+		async fn a_cleartext_half_refuses_a_record_before_it_opens() {
+			let mut reader = reading(SplitRecv::Cleartext, UNOPENED_RECORD);
+			let expected = TransportFailure::EncryptionFailed;
+
+			let outcome = reader.read_envelope().await;
+			let refused = matches!(outcome, Err(TransportError::OperationFailed(failure)) if failure == expected);
+			assert!(refused);
+		}
 	}
 
 	#[tokio::test]
@@ -1638,9 +1716,8 @@ mod tests {
 		Ok(())
 	}
 
-	/// A handshake-phase frame whose declared length exceeds the 16 KiB
-	/// handshake cap must be rejected on the declared length, before the body
-	/// is read.
+	/// The server refuses a handshake-phase frame by its declared length when
+	/// that length exceeds the 16 KiB handshake cap, before it reads the body.
 	#[tokio::test]
 	async fn handshake_read_rejects_oversize_frame_before_body() -> TransportResult<()> {
 		let EncryptedTestServer { mut config, .. } = encrypted_test_server()?;

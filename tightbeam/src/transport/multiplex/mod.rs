@@ -249,13 +249,13 @@ impl StreamId {
 /// Stream state for multiplexed transports.
 ///
 /// Streams in `Open`, `HalfClosedLocal`, or `HalfClosedRemote` count toward
-/// the peer-advertised concurrency cap, and `Idle` and `Closed` streams do not
-/// ([RFC 9113 § 5.1.2][rfc9113-5.1.2]).
+/// the peer-advertised concurrency cap, and `Idle` and `Closed` streams are
+/// exempt from it ([RFC 9113 § 5.1.2][rfc9113-5.1.2]).
 ///
 /// [rfc9113-5.1.2]: https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.2
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamState {
-	/// The id is unused and does not count toward the concurrency cap.
+	/// The id is unused, so the stream is exempt from the concurrency cap.
 	Idle,
 	/// Both sides may send. The stream counts toward the concurrency cap.
 	Open,
@@ -265,8 +265,7 @@ pub enum StreamState {
 	/// Remote send is closed. The stream still counts toward the
 	/// concurrency cap.
 	HalfClosedRemote,
-	/// The stream is fully closed and does not count toward the
-	/// concurrency cap.
+	/// The stream is fully closed, so it is exempt from the concurrency cap.
 	Closed,
 }
 
@@ -540,6 +539,7 @@ pub trait MuxAcceptor: MuxCapable {
 	/// - Unary frames pass the transport's collector gate before reaching [`MuxService::unary`].
 	/// - Streaming and duplex streams evaluate the same gate with no request frame (`None`) first.
 	/// - Service failures close their stream with the failure's mapped status.
+	/// - A fault the trace injects at the verdict of the gate closes its stream as `Internal`.
 	///
 	/// # Arguments
 	///
@@ -547,8 +547,38 @@ pub trait MuxAcceptor: MuxCapable {
 	///
 	/// # Errors
 	///
-	/// - `InvalidState` or `OperationFailed(EncryptorUnavailable)` -- no handshake completed.
+	/// - [`TransportError::InvalidState`] -- the session is provisioned for
+	///   encryption and its handshake has not completed, so
+	///   [`MuxAcceptor::into_gated_halves`] cannot split the transport.
+	/// - [`TransportError::HandshakeError`] -- the signing use or the purpose of
+	///   the peer's role refuses the peer's certificate, so
+	///   [`MuxAcceptor::take_rekey`] cannot detach the rekey context.
 	/// - The terminal responder failures of [`MuxResponder::serve_with`].
+	///
+	/// # Examples
+	///
+	/// ```no_run
+	/// use tightbeam::transport::multiplex::{MuxAcceptor, MuxService};
+	/// use tightbeam::transport::tcp::r#async::{TcpTransport, TokioStream};
+	/// use tightbeam::transport::TransportResult;
+	///
+	/// /// Refuses every interaction through the defaults of the trait.
+	/// struct Closed;
+	///
+	/// impl MuxService for Closed {}
+	///
+	/// /// Serve one accepted connection under the multiplexing it negotiated.
+	/// async fn serve(mut transport: TcpTransport<TokioStream>) -> TransportResult<()> {
+	///     let Some(settings) = transport.negotiate_mux().await? else {
+	///         return Ok(());
+	///     };
+	///
+	///     transport.serve(settings, Closed, None).await
+	/// }
+	/// ```
+	///
+	/// [`TransportError::InvalidState`]: crate::transport::error::TransportError::InvalidState
+	/// [`TransportError::HandshakeError`]: crate::transport::error::TransportError::HandshakeError
 	#[cfg(pooled_mux)]
 	fn serve<S: MuxService>(
 		mut self,

@@ -11,7 +11,7 @@ use super::{reply_frame, reply_frame_with_priority};
 use crate::asn1::Frame;
 use crate::cms::signed_data::SignerIdentifier;
 use crate::constants::DEFAULT_HOP_BUDGET;
-use crate::der::{Choice, Enumerated, Sequence};
+use crate::der::{Choice, Enumerated, Sequence, TagNumber};
 use crate::policy::TransitStatus;
 use crate::urn::Urn;
 use crate::utils::time::UnixMillis;
@@ -57,6 +57,10 @@ impl ClusterWorkRequest {
 	/// Builds origin work from a client, with the client's complete frame
 	/// nested as the end-to-end payload. The sentinel budget defers the hop
 	/// cap to the first gateway's `max_hops` policy.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError::SerializationError`] -- `frame` does not encode.
 	pub fn new(servlet_type: Urn<'static>, frame: &Frame) -> Result<Self, TightBeamError> {
 		Ok(Self { servlet_type, payload: encode(frame)?, hops_remaining: DEFAULT_HOP_BUDGET })
 	}
@@ -123,6 +127,10 @@ impl ClusterWorkResponse {
 	///
 	/// A refusal carries no payload and yields [`None`]. A caller that treats
 	/// a refusal as an error uses [`ClusterWorkResponse::served`] instead.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError::SerializationError`] -- the payload does not decode as a frame.
 	pub fn into_frame(self) -> Result<Option<Frame>, TightBeamError> {
 		match self.payload {
 			Some(payload) => Ok(Some(decode(&payload)?)),
@@ -239,11 +247,11 @@ pub struct ServletAddressUpdate {
 	/// The newly spawned servlet instances and their addresses.
 	pub added: Vec<ServletInfo>,
 	/// The instance URNs of the removed servlets. An update names instances
-	/// in both directions, matching `added`.
+	/// in both directions, as `added` does.
 	pub removed: Vec<Urn<'static>>,
 }
 
-/// One servlet instance entering or leaving a hive's slate.
+/// One servlet instance that enters or leaves a hive's slate.
 ///
 /// The encoded update carries an instance under `added` and a bare URN under
 /// `removed`, so the direction picks which field the instance lands in. A
@@ -398,9 +406,9 @@ impl GossipResponse {
 /// A summary of the rumors a gateway retains, sent so a peer can pull the
 /// missing ones.
 ///
-/// This is the anti-entropy backstop to best-effort flooding. Reconciliation
+/// This is the anti-entropy backstop to the best-effort flood. Reconciliation
 /// is an unordered set difference over content digests, with no cursor. A
-/// receiver refuses a wrong-length entry rather than treating it as a digest
+/// receiver drops a wrong-length entry rather than treat it as a digest
 /// (CWE-20).
 #[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct GossipReconciliation {
@@ -678,18 +686,17 @@ pub enum ClusterCommandOutcome {
 /// Context-specific tags tell the request types apart. A request sets exactly
 /// one field, and [`HiveManagementRequest::into_choice`] refuses a request
 /// that sets none or more than one.
-#[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
+#[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct HiveManagementRequest {
 	/// A request to spawn a new servlet instance [context 0].
-	#[asn1(context_specific = "0", optional = "true")]
 	pub spawn: Option<SpawnServletParams>,
 	/// A request to list all active servlets [context 1].
-	#[asn1(context_specific = "1", optional = "true")]
 	pub list: Option<ListServletsParams>,
 	/// A request to stop a specific servlet instance [context 2].
-	#[asn1(context_specific = "2", optional = "true")]
 	pub stop: Option<StopServletParams>,
 }
+
+wire_sequence!(HiveManagementRequest { spawn: ctx(TagNumber::N0), list: ctx(TagNumber::N1), stop: ctx(TagNumber::N2) });
 
 /// The parameters of a request that spawns a new servlet.
 #[derive(Debug, Beamable, Clone, PartialEq)]
@@ -724,18 +731,21 @@ pub struct StopServletParams {
 /// Context-specific tags tell the response types apart. A response sets
 /// exactly one field, and [`HiveManagementResponse::into_choice`] refuses a
 /// response that sets none or more than one.
-#[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
+#[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct HiveManagementResponse {
 	/// The answer to a spawn request [context 0].
-	#[asn1(context_specific = "0", optional = "true")]
 	pub spawn: Option<SpawnServletResult>,
 	/// The answer to a list request [context 1].
-	#[asn1(context_specific = "1", optional = "true")]
 	pub list: Option<ListServletsResult>,
 	/// The answer to a stop request [context 2].
-	#[asn1(context_specific = "2", optional = "true")]
 	pub stop: Option<StopServletResult>,
 }
+
+wire_sequence!(HiveManagementResponse {
+	spawn: ctx(TagNumber::N0),
+	list: ctx(TagNumber::N1),
+	stop: ctx(TagNumber::N2),
+});
 
 /// The result of a spawn request.
 #[derive(Debug, Beamable, Clone, PartialEq)]
@@ -860,17 +870,17 @@ pub enum ClusterStatus {
 /// - Freshness binds to `Frame.metadata.order` (unix milliseconds), so hives
 ///   reject commands outside their freshness window and replays of
 ///   already-seen signatures within it (CWE-294).
-#[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
+#[derive(Debug, Beamable, Clone, PartialEq)]
 #[beam(frame_integrity)]
 pub struct ClusterCommand {
 	/// A heartbeat request [context 0].
-	#[asn1(context_specific = "0", optional = "true")]
 	pub heartbeat: Option<HeartbeatParams>,
 
 	/// A hive management request [context 1].
-	#[asn1(context_specific = "1", optional = "true")]
 	pub manage: Option<HiveManagementRequest>,
 }
+
+wire_sequence!(ClusterCommand { heartbeat: ctx(TagNumber::N0), manage: ctx(TagNumber::N1) });
 
 /// The parameters of a heartbeat.
 ///
@@ -886,16 +896,16 @@ pub struct HeartbeatParams {
 ///
 /// A hive answers a cluster command with it. Context-specific tags
 /// discriminate the CHOICE, and a response sets exactly one field.
-#[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
+#[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct ClusterCommandResponse {
 	/// The heartbeat answer [context 0].
-	#[asn1(context_specific = "0", optional = "true")]
 	pub heartbeat: Option<HeartbeatResult>,
 
 	/// The management answer [context 1].
-	#[asn1(context_specific = "1", optional = "true")]
 	pub manage: Option<HiveManagementResponse>,
 }
+
+wire_sequence!(ClusterCommandResponse { heartbeat: ctx(TagNumber::N0), manage: ctx(TagNumber::N1) });
 
 impl From<HiveManagement> for HiveManagementRequest {
 	/// Spells one management alternative as the tagged-optional product that
@@ -1080,6 +1090,7 @@ mod tests {
 	use crate::asn1::Version;
 	use crate::builder::{FrameBuilder, TypeBuilder};
 	use crate::colony::common::ColonyNamespace;
+	use crate::der::{Decode, ErrorKind, Tag};
 	use crate::error::Result;
 	use crate::tb_cases;
 
@@ -1237,6 +1248,35 @@ mod tests {
 	#[test]
 	fn cluster_request_publish_gossip_round_trips() -> Result<()> {
 		round_trip(ClusterRequest::PublishGossip(GossipRumor::application(vec![0x02, 0x01, 0x2A])))
+	}
+
+	/// The decoder refuses a command whose `[0]` repeats ahead of `[1]`,
+	/// rather than read it as one heartbeat with the repeats skipped
+	/// (X.690 § 8.9.2).
+	#[test]
+	fn a_command_that_repeats_a_context_field_is_refused() {
+		let repeated = [
+			0x30, 0x12, 0xa0, 0x05, 0x30, 0x03, 0x0a, 0x01, 0x00, 0xa0, 0x05, 0x30, 0x03, 0x0a, 0x01, 0x00, 0xa0, 0x02,
+			0x05, 0x00,
+		];
+
+		let refused = <ClusterCommand as Decode>::from_der(&repeated);
+		let heartbeat = Tag::ContextSpecific { constructed: true, number: TagNumber::N0 };
+		let manage = Tag::ContextSpecific { constructed: true, number: TagNumber::N1 };
+		let misplaced = ErrorKind::TagUnexpected { expected: Some(manage), actual: heartbeat };
+		assert_eq!(refused.map_err(|error| error.kind()), Err(misplaced));
+	}
+
+	/// The tagged fields of a command encode as EXPLICIT context fields
+	/// (X.690 § 8.14).
+	#[test]
+	fn a_heartbeat_command_encodes_its_known_answer() -> Result<()> {
+		let heartbeat = HeartbeatParams { cluster_status: ClusterStatus::Healthy };
+		let command = ClusterCommand::from(ClusterCommandKind::Heartbeat(heartbeat));
+
+		let encoded = crate::encode(&command)?;
+		assert_eq!(encoded, [0x30, 0x07, 0xa0, 0x05, 0x30, 0x03, 0x0a, 0x01, 0x00]);
+		Ok(())
 	}
 
 	#[test]

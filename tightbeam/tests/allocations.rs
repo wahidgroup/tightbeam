@@ -7,9 +7,14 @@
 //! - A `sid` of the key-identifier form names a certificate by the extension
 //!   value as the certificate holds it.
 //! - The built-in store validates a presented path from where its parts sit.
+//! - A signed `SignerInfo` encodes in place, as its inner value does.
 //!
 //! Only an allocation count shows these bounds, so the counting allocator
 //! lives in this test binary alone.
+
+// Tests are exempt from the zero-panic index and arithmetic lints (workspace
+// lints): an index out of range fails its test at its location.
+#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 
 use core::cell::Cell;
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -20,9 +25,10 @@ use tightbeam::crypto::x509::utils::CertificateExt;
 use tightbeam::crypto::x509::KeyIndex;
 use tightbeam::der::asn1::{BitString, ObjectIdentifier};
 use tightbeam::der::oid::db::rfc8410::ID_ED_25519;
+use tightbeam::der::Encode;
 use tightbeam::oids::{CURVE_NIST_P256, CURVE_NIST_P521};
 use tightbeam::spki::SubjectPublicKeyInfoOwned;
-use tightbeam::testing::fixtures::{TestCertificate, TestKey};
+use tightbeam::testing::fixtures::{TestCertificate, TestKey, TestSigner};
 
 thread_local! {
 	/// The count of the allocations of this thread. A `Cell` of an integer
@@ -166,4 +172,25 @@ fn validations_of_the_fixed_path() -> (usize, usize) {
 fn a_presented_path_validates_with_the_allocations_of_one_chain() {
 	let (whole, presented) = validations_of_the_fixed_path();
 	assert_eq!(presented, whole);
+}
+
+/// The counts of the allocations that the DER of the fixed signer structure
+/// makes, through its `Signed` wrapper and as its inner `SignerInfo`.
+fn encodings_of_the_fixed_signer() -> (usize, usize) {
+	let signed = TestSigner::info();
+
+	let before = ALLOCATIONS.with(Cell::get);
+	signed.to_der().expect("the signed structure encodes");
+	let between = ALLOCATIONS.with(Cell::get);
+	signed.as_ref().to_der().expect("the inner structure encodes");
+	let after = ALLOCATIONS.with(Cell::get);
+	(between - before, after - between)
+}
+
+/// A frame signature encodes in place, so the `Signed` wrapper of a
+/// `SignerInfo` allocates what its inner value allocates, and no buffer.
+#[test]
+fn a_signed_signer_info_encodes_with_the_allocations_of_its_value() {
+	let (wrapped, inner) = encodings_of_the_fixed_signer();
+	assert_eq!(wrapped, inner);
 }

@@ -1,4 +1,4 @@
-//! Multi-instance topology and load-balancer wiring.
+//! Multi-instance topology scenarios and the load balancers they route through.
 
 use super::common::*;
 
@@ -20,11 +20,11 @@ impl TopologyCtx {
 	}
 }
 
-/// Wraps any strategy to prove the `Arc<dyn LoadBalancer>` is consulted
-/// and a custom strategy threads through
-/// [`ClusterConfigBuilder::with_load_balancer`]: every offer is recorded as
-/// a `BALANCER_OFFERED` event valued with the slate width, and returned
-/// indices land in the shared selection set.
+/// Wraps any strategy to prove that the gateway consults the
+/// `Arc<dyn LoadBalancer>` and that a custom strategy threads through
+/// [`ClusterConfigBuilder::with_load_balancer`]. It records every offer as a
+/// `BALANCER_OFFERED` event valued with the slate width, and the indices it
+/// returns land in the shared selection set.
 struct RecordingBalancer<L: LoadBalancer> {
 	inner: L,
 	trace: TraceCollector,
@@ -63,9 +63,9 @@ fn topology_cluster_conf(
 
 /// Register two live ping servlets as instances of one type and route
 /// `routes` work requests through the gateway. Every submission must
-/// serve a response frame, which proves the gateway reported
-/// [`TransitStatus::Ok`], and that status is recorded as a valued event
-/// for the spec.
+/// serve a response frame, which proves that the gateway reported
+/// [`TransitStatus::Ok`], and the helper records that status as a valued
+/// event for the spec.
 async fn drive_topology_routes(
 	trace: &TraceCollector,
 	ctx: &TopologyCtx,
@@ -87,7 +87,10 @@ async fn drive_topology_routes(
 	let value = registered.status;
 	trace.event_with(TOPOLOGY_REGISTER_STATUS, &[], value)?;
 
-	let added = vec![servlet_info("ping", addr_a.as_bytes()), servlet_info("ping", addr_b.as_bytes())];
+	let added = vec![
+		servlet_info(&ctx.certs, "ping", addr_a.as_bytes()),
+		servlet_info(&ctx.certs, "ping", addr_b.as_bytes()),
+	];
 	let removed = vec![];
 	let request = servlet_address_update(hive_addr, added, removed);
 	let added = emit_servlet_update(&mut client, &ctx.certs.key, b"topo-add", request).await?;
@@ -140,7 +143,7 @@ tb_assert_spec! {
 	}
 }
 
-// A pluggable RoundRobin threads through the builder and deterministically
+// A pluggable `RoundRobin` threads through the builder and deterministically
 // spreads work across both registered instances of one type.
 tb_scenario! {
 	name: cluster_round_robin_spreads_work_across_instances,
@@ -160,9 +163,9 @@ tb_scenario! {
 	}
 }
 
-// The default pheromone forager (via `with_seed` for a reproducible stream)
-// explores both instances rather than locking onto one, the stigmergic
-// spread the deterministic-argmax predecessor could not provide.
+// The default pheromone forager, seeded through `with_seed` for a
+// reproducible stream, explores both instances and spreads work across them
+// by stigmergy.
 tb_scenario! {
 	name: cluster_default_forager_spreads_work_across_instances,
 	spec: TopologySpec,

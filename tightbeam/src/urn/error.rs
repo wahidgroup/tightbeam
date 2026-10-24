@@ -35,8 +35,9 @@ pub enum UrnValidationError {
 	#[error("Invalid NID: must start with a letter")]
 	InvalidNidStart,
 
-	/// NID contains invalid characters (must be alphanumeric and hyphens only)
-	#[error("Invalid NID characters: must be alphanumeric and hyphens only")]
+	/// The NID holds a character other than a letter, a digit, or a hyphen,
+	/// or it ends with a hyphen.
+	#[error("Invalid NID characters: must be alphanumeric or hyphens, and end with an alphanumeric")]
 	InvalidNidCharacters,
 
 	/// String is not of the form `urn:<nid>:<nss>`

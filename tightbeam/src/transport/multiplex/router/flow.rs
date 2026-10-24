@@ -1,5 +1,7 @@
 //! Flow-control arithmetic and the receiver-side credit policy.
 
+use core::num::{NonZeroU64, NonZeroUsize};
+
 use crate::constants::DEFAULT_MUX_STREAM_CREDIT;
 use crate::transport::multiplex::StreamId;
 
@@ -21,26 +23,31 @@ pub fn len_as_u64(len: usize) -> u64 {
 /// arithmetic silently inverts. The chunk size travels as its own type.
 /// The floor of one applies once here rather than at every call.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ChunkSize(usize);
+pub struct ChunkSize(NonZeroUsize);
 
 impl ChunkSize {
 	/// The chunk size for one direction of a link, floored at one byte.
 	#[must_use]
 	pub fn new(bytes: usize) -> Self {
-		Self(bytes.max(1))
+		Self(NonZeroUsize::new(bytes).unwrap_or(NonZeroUsize::MIN))
 	}
 
 	/// The size in bytes, for arithmetic that needs the count.
 	#[must_use]
 	pub fn get(self) -> usize {
-		self.0
+		self.0.get()
+	}
+
+	/// The size in bytes as the `u64` the credit arithmetic divides by.
+	fn width(self) -> NonZeroU64 {
+		NonZeroU64::try_from(self.0).unwrap_or(NonZeroU64::MAX)
 	}
 
 	/// Chunk records a payload occupies at this many bytes per chunk.
 	/// An empty payload travels inline in its trailer and occupies none.
 	#[must_use]
 	pub fn records(self, payload_len: usize) -> u64 {
-		len_as_u64(payload_len).div_ceil(len_as_u64(self.0))
+		len_as_u64(payload_len).div_ceil(self.width().get())
 	}
 
 	/// Session-budget credits a payload debits: `ceil(len / credit_unit)`
@@ -48,13 +55,13 @@ impl ChunkSize {
 	/// of the receiver's per-chunk debits.
 	#[must_use]
 	pub fn credits(self, payload_len: usize, credit_unit: u32) -> u64 {
-		let chunk_size = len_as_u64(self.0);
+		let chunk_size = self.width();
 		let unit = u64::from(credit_unit.max(1));
 		let len = len_as_u64(payload_len);
 
 		let full_chunks = len / chunk_size;
 		let remainder = len % chunk_size;
-		let per_full_chunk = chunk_size.div_ceil(unit);
+		let per_full_chunk = chunk_size.get().div_ceil(unit);
 
 		full_chunks
 			.saturating_mul(per_full_chunk)
@@ -63,14 +70,14 @@ impl ChunkSize {
 }
 
 /// Send records at which a renewal opens: the dynamic drain floor
-/// plus fixed slack so the exchange legs land before the drain
+/// plus a fixed slack, so the exchange legs land before the drain
 /// threshold would trip ([`DEFAULT_REKEY_RENEWAL_ALLOWANCE`]).
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub fn renewal_floor(drain_floor: u64) -> u64 {
 	drain_floor.saturating_add(DEFAULT_REKEY_RENEWAL_ALLOWANCE)
 }
 
-/// Receiver-side stream credit policy: decides when to raise a
+/// Receiver-side stream credit policy, which decides when to raise a
 /// stream's absolute cumulative chunk limit (QUIC MAX_STREAM_DATA,
 /// [RFC 9000 § 4.1](https://datatracker.ietf.org/doc/html/rfc9000#section-4.1)).
 ///
@@ -91,23 +98,23 @@ pub trait CreditGrantor: Send + Sync {
 	fn replenish(&self, stream_id: StreamId, received: u64, limit: u64) -> Option<u64>;
 }
 
-/// Default grantor: replenishes a fixed chunk window in batches,
-/// bounding per-stream reassembly memory at `window * chunk size`
-/// while letting frames of any length flow.
+/// Default grantor, which replenishes a fixed chunk window in batches.
+/// It bounds per-stream reassembly memory at `window * chunk size` and
+/// lets frames of any length flow.
 ///
 /// # Low-water mark
 ///
 /// Grants fire only once remaining credit falls to the half-window
 /// low-water mark, then top the limit back up to a full window ahead
 /// of arrival. One `MuxCredit` record therefore covers about half a
-/// window of data chunks, keeping control-plane AEAD record
-/// consumption at `O(chunks / window)`.
+/// window of data chunks, so control-plane AEAD record consumption
+/// stays at `O(chunks / window)`.
 pub struct BufferedGrantor {
 	window: u64,
 }
 
 impl BufferedGrantor {
-	/// Grantor keeping `window` chunks (at least one) of credit open.
+	/// Grantor that keeps `window` chunks (at least one) of credit open.
 	pub fn new(window: u64) -> Self {
 		Self { window: window.max(1) }
 	}
@@ -164,8 +171,8 @@ mod tests {
 			(100, 1024, 1000, 1),
 			(1024, 1024, 1024, 1),
 			(2048, 1024, 512, 4),
-			// Sender's whole-frame debit equals the receiver's
-			// per-chunk sum, not the naive whole-frame ceil (3)
+			// The sender's whole-frame debit equals the receiver's
+			// per-chunk sum, and not the naive whole-frame ceil (3).
 			(2500, 1024, 1000, 5),
 		] {
 			assert_eq!(ChunkSize::new(chunk).credits(len, unit), expect);
@@ -187,11 +194,11 @@ mod tests {
 	#[test]
 	fn test_buffered_grantor_batches_at_low_water() {
 		let grantor = BufferedGrantor::new(4);
-		// Above the half-window low-water mark: no grant
+		// Above the half-window low-water mark, no grant fires.
 		assert_eq!(grantor.replenish(StreamId::new(1), 0, 4), None);
 		assert_eq!(grantor.replenish(StreamId::new(1), 1, 4), None);
 		assert_eq!(grantor.replenish(StreamId::new(1), 3, 8), None);
-		// At the low-water mark: top back up to a full window ahead
+		// At the low-water mark, the grant tops back up to a full window ahead.
 		assert_eq!(grantor.replenish(StreamId::new(1), 2, 4), Some(6));
 		assert_eq!(grantor.replenish(StreamId::new(1), 6, 8), Some(10));
 	}
@@ -199,9 +206,9 @@ mod tests {
 	#[test]
 	fn test_buffered_grantor_single_chunk_window() {
 		let grantor = BufferedGrantor::new(1);
-		// A grant to limit itself would not raise it: stay silent
+		// A grant to the limit itself would not raise it, so none fires.
 		assert_eq!(grantor.replenish(StreamId::new(1), 3, 4), None);
-		// Fully consumed: open the next chunk
+		// A fully consumed window opens the next chunk.
 		assert_eq!(grantor.replenish(StreamId::new(1), 4, 4), Some(5));
 	}
 }

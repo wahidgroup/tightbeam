@@ -3,7 +3,7 @@
 //! [`Flags<N>`] stores N position-stable flag bytes and presents them through
 //! [`MatrixLike`] as the diagonal (r == c) of an N×N matrix, matching the
 //! profile convention documented on [`MatrixDyn`](crate::matrix::MatrixDyn):
-//! off-diagonal cells read as 0 and writes to them do nothing.
+//! off-diagonal cells read as 0 and discard writes.
 
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
@@ -25,8 +25,8 @@ pub enum FlagsError {
 
 /// A fixed-size array of flags, where each flag is a `u8`.
 ///
-/// Each position in the array holds a single `u8` flag value. The size `N` is
-/// fixed at compile time, so the container is a zero-cost abstraction.
+/// The size `N` is fixed at compile time, so the container is a zero-cost
+/// abstraction over `[u8; N]`.
 ///
 /// The wire format bounds the dimension to 1..=255. A flag set with `N`
 /// outside that range fails to compile:
@@ -41,17 +41,13 @@ pub struct Flags<const N: usize>([u8; N]);
 
 impl<const N: usize> Flags<N> {
 	pub fn set_at(&mut self, pos: usize, value: u8) {
-		if pos < N {
-			self.0[pos] = value;
+		if let Some(slot) = self.0.get_mut(pos) {
+			*slot = value;
 		}
 	}
 
 	pub fn get_at(&self, pos: usize) -> u8 {
-		if pos < N {
-			self.0[pos]
-		} else {
-			0
-		}
+		self.0.get(pos).copied().unwrap_or(0)
 	}
 }
 
@@ -74,11 +70,7 @@ where
 {
 	fn from(arr: [T; N]) -> Self {
 		const { crate::matrix::assert_wire_dimension::<N>() };
-		let mut bytes = [0u8; N];
-		for (i, item) in arr.into_iter().enumerate() {
-			bytes[i] = item.into();
-		}
-		Flags(bytes)
+		Flags(arr.map(Into::into))
 	}
 }
 
@@ -87,9 +79,9 @@ impl<const N: usize> TryFrom<&[u8]> for Flags<N> {
 
 	/// # Errors
 	///
-	/// - [`FlagsError::LengthMismatch`] when the slice is not exactly `N`
-	///   bytes. A shorter slice cannot say which flags it omits and a longer
-	///   one cannot say which to drop.
+	/// - [`FlagsError::LengthMismatch`] -- the slice is not exactly `N` bytes.
+	///   A shorter slice cannot say which flags it omits, and a longer one
+	///   cannot say which to drop.
 	fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
 		const { crate::matrix::assert_wire_dimension::<N>() };
 
@@ -127,23 +119,18 @@ impl<const N: usize> MatrixLike for Flags<N> {
 	}
 
 	fn get(&self, r: u8, c: u8) -> u8 {
-		if r == c && (r as usize) < N {
-			self.0[r as usize]
-		} else {
-			0
-		}
+		let diagonal = self.0.get(r as usize).filter(|_| r == c);
+		diagonal.copied().unwrap_or(0)
 	}
 
 	fn set(&mut self, r: u8, c: u8, value: u8) {
-		if r == c && (r as usize) < N {
-			self.0[r as usize] = value;
+		if let Some(slot) = self.0.get_mut(r as usize).filter(|_| r == c) {
+			*slot = value;
 		}
 	}
 
 	fn fill(&mut self, value: u8) {
-		for i in 0..N {
-			self.0[i] = value;
-		}
+		self.0.fill(value);
 	}
 }
 
@@ -219,5 +206,14 @@ mod tests {
 		let accepted = Flags::<3>::try_from([7u8, 8, 9].as_slice()).expect("three bytes name three flags");
 		assert_eq!(accepted.get_at(0), 7);
 		assert_eq!(accepted.get_at(2), 9);
+	}
+
+	/// The flags sit on the diagonal of the matrix view, so a cell off the
+	/// diagonal reads zero.
+	#[test]
+	fn a_cell_off_the_diagonal_reads_zero() {
+		let flags = Flags::<2>::from([1u8, 1]);
+
+		assert_eq!(MatrixLike::get(&flags, 0, 1), 0);
 	}
 }

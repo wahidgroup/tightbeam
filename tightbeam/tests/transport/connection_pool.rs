@@ -379,11 +379,12 @@ async fn envelope_ceiling_refuses_oversize_locally() -> Result<(), Box<dyn std::
 	let count = Arc::new(AtomicUsize::new(0));
 	let servlet = start_pool_echo_servlet(Arc::clone(&count)).await?;
 	let addr = servlet.addr().to_owned();
+	// The round trip near the ceiling is CPU work that a loaded machine
+	// stretches, so the default operation deadline bounds it.
 	let pool = Arc::new(
 		ConnectionPool::<TokioListener>::builder()
 			.with_trust_store(make_server_trust_store()?)
 			.with_client_identity(SigningIdentity::from_spec(CLIENT_CERT, CLIENT_KEY.to_provider::<Secp256k1>()?)?)
-			.with_timeout(Duration::from_millis(3000))
 			.build(),
 	);
 

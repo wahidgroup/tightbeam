@@ -156,7 +156,7 @@ proptest! {
 
 	/// What a URN displays, the parser reads back as the same URN.
 	#[test]
-	fn a_urn_survives_display_and_parse(nid in "[a-zA-Z][a-zA-Z0-9-]{1,31}", nss in ".{1,64}") {
+	fn a_urn_survives_display_and_parse(nid in "[a-zA-Z][a-zA-Z0-9-]{0,30}[a-zA-Z0-9]", nss in ".{1,64}") {
 		let urn = Urn::from_parts(nid, nss)?;
 		prop_assert_eq!(urn.to_string().parse::<Urn<'static>>()?, urn);
 	}

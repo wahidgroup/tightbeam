@@ -140,8 +140,8 @@ struct TypeLoad {
 impl TypeLoad {
 	/// Adds one type's load into this running hive total.
 	fn absorb(&mut self, load: &Self) {
-		self.instances += load.instances;
-		self.utilization_sum += load.utilization_sum;
+		self.instances = self.instances.saturating_add(load.instances);
+		self.utilization_sum = self.utilization_sum.saturating_add(load.utilization_sum);
 	}
 
 	/// The mean utilization across the counted instances.
@@ -152,8 +152,8 @@ impl TypeLoad {
 
 /// Per-type stamps for one scale direction, read against the hive clock.
 ///
-/// A stamp is written where a scale reached the registry, so an attempt
-/// that failed to spawn or found nothing to remove leaves the next
+/// The loop writes a stamp where a scale reached the registry, so an
+/// attempt that failed to spawn or found nothing to remove leaves the next
 /// evaluation free to retry.
 struct Cooldowns {
 	stamps: HashMap<Vec<u8>, MonotonicInstant>,
@@ -187,9 +187,9 @@ impl Cooldowns {
 /// One running scaling loop's resolved handles.
 ///
 /// [`ScalingLoop`] names what the hive supplies. This names what the loop
-/// body works with once the hive URN is created and the cluster link is
-/// bound, so every scale decision reads one owner instead of a parameter
-/// bundle rebuilt per attempt.
+/// body works with once the hive creates its URN and binds the cluster link,
+/// so every scale decision reads one owner instead of a parameter bundle
+/// rebuilt per attempt.
 struct ScalingTask<P: Protocol> {
 	servlets: Arc<HashMapRegistry>,
 	trace: Arc<TraceCollector>,
@@ -229,17 +229,18 @@ where
 		let type_prefix = type_prefix.as_ref();
 		let mut load = TypeLoad::default();
 		// Each sample is one `u16` insert, so a poisoned lock still holds a
-		// whole map and the samples are read rather than dropped.
+		// whole map, and the loop reads the samples rather than drop them.
 		let samples = self.utilization_map.lock().unwrap_or_else(PoisonError::into_inner);
 
 		self.servlets.for_each_by_type(type_prefix, |key, reg| {
-			load.instances += 1;
+			load.instances = load.instances.saturating_add(1);
 
 			let reported = reg.servlet.utilization().map(|bp| bp.get() as u64);
 			let cached = samples.get(key).map(|&sample| sample as u64);
 			let unknown = UNKNOWN_SERVLET_UTILIZATION_BPS as u64;
 
-			load.utilization_sum += reported.or(cached).unwrap_or(unknown);
+			let utilization = reported.or(cached).unwrap_or(unknown);
+			load.utilization_sum = load.utilization_sum.saturating_add(utilization);
 		});
 
 		load

@@ -110,7 +110,8 @@ impl ZstdCompression {
 	/// libzstd sizes its stream buffers from the declared window before it
 	/// produces any output, and admits up to 128 MiB by default.
 	fn window_log_max(&self) -> u32 {
-		let ceil_log2 = usize::BITS - self.max_output.saturating_sub(1).leading_zeros();
+		let window = self.max_output.checked_next_power_of_two();
+		let ceil_log2 = window.map_or(usize::BITS, usize::trailing_zeros);
 		ceil_log2.clamp(ZSTD_WINDOW_LOG_MIN, ZSTD_WINDOW_LOG_MAX)
 	}
 }
@@ -151,11 +152,12 @@ impl Inflator for ZstdCompression {
 		loop {
 			let consumed = input.pos;
 			let produced = out.len();
-			if produced >= ceiling {
+			let room = ceiling.saturating_sub(produced);
+			if room == 0 {
 				return Err(CompressionError::OutputLimitExceeded(self.max_output).into());
 			}
 			if out.capacity() == produced {
-				out.reserve(RESERVE_HINT.min(ceiling - produced));
+				out.reserve(RESERVE_HINT.min(room));
 			}
 
 			let remaining = {
@@ -186,7 +188,7 @@ impl Inflator for ZstdCompression {
 		// Octets past the frame belong to a second container, such as a
 		// skippable frame or a seekable-format seek table.
 		if input.pos != data.len() {
-			return Err(CompressionError::TrailingBytes(data.len() - input.pos).into());
+			return Err(CompressionError::TrailingBytes(data.len().abs_diff(input.pos)).into());
 		}
 
 		Ok(out)
@@ -232,7 +234,6 @@ mod tests {
 
 	#[test]
 	fn compress_then_decompress_round_trips() -> Result<()> {
-		// Data-driven cases
 		let patterned = (0u32..2048).map(|i| (i % 251) as u8).collect::<Vec<u8>>();
 		let big_repeat = vec![b'a'; 16 * 1024];
 		let cases: Vec<&[u8]> = vec![

@@ -1,7 +1,7 @@
 //! Multi-input key derivation functions for hybrid key agreement.
 //!
-//! The module provides composable KDF primitives for protocols that combine
-//! several shared secrets, for example ECDH with a KEM in PQXDH.
+//! The module holds KDF primitives for protocols that combine two or more
+//! shared secrets, for example ECDH with a KEM in PQXDH.
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
@@ -22,8 +22,8 @@ use crate::ZeroizingBytes;
 ///
 /// HKDF takes a salt and a label, and both arrive as bytes. A caller that
 /// holds them as two slices can exchange them and still compile, so each
-/// role travels as its own type and the exchange has no call site at which
-/// to occur.
+/// role travels as its own type and an exchange of the two fails to
+/// compile.
 ///
 /// # Sources
 ///
@@ -64,8 +64,10 @@ impl RandomsSalt {
 	/// Lay `client_random` ahead of `server_random`.
 	pub(crate) fn new(client_random: &[u8; 32], server_random: &[u8; 32]) -> Self {
 		let mut salt = Zeroizing::new([0u8; 64]);
-		salt[..32].copy_from_slice(client_random);
-		salt[32..].copy_from_slice(server_random);
+		let randoms = client_random.iter().chain(server_random);
+		for (octet, random) in salt.iter_mut().zip(randoms) {
+			*octet = *random;
+		}
 		Self(salt)
 	}
 
@@ -111,7 +113,7 @@ impl<'a> KdfInfo<'a> {
 pub struct KdfStage<'a> {
 	/// Input key material this stage extracts from.
 	pub input: &'a [u8],
-	/// The label separating this stage from every other.
+	/// The label that separates this stage from every other.
 	pub info: KdfInfo<'a>,
 }
 
@@ -202,8 +204,8 @@ pub fn kdf_chain<P: CryptoProvider>(
 		return Ok(Zeroizing::new(Vec::new()));
 	}
 
-	// Each intermediate output is key material. Keep every stage in a
-	// Zeroizing buffer so nothing lingers in the allocator.
+	// Each intermediate output is key material, so each stage holds it in a
+	// `Zeroizing` buffer that wipes it before the allocator reuses it.
 	let mut current = Zeroizing::new(initial_salt.as_bytes().to_vec());
 	for stage in stages {
 		current = P::Kdf::derive_dynamic_key(stage.input, stage.info.as_bytes(), Some(&current), 32)?;

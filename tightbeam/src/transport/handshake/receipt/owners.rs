@@ -102,7 +102,7 @@ impl IssuedReceipt {
 	/// authorizer, and record the outcome.
 	///
 	/// The step runs in that order, and it fails closed. A missing or invalid
-	/// countersignature aborts the handshake, and so does a settle refusal.
+	/// countersignature aborts the handshake, and so does a settlement refusal.
 	/// Every concluded exchange reaches the observer first.
 	///
 	/// # Ordering
@@ -140,7 +140,7 @@ impl IssuedReceipt {
 			Some(sealed) => {
 				let key = secret.secret();
 				let sealer = terms.sealer(key, SecretSeal::Ack)?;
-				let plaintext = sealer.open(sealed, DATA).await?;
+				let plaintext = sealer.open(SecretSeal::Ack.admit(sealed)?, DATA).await?;
 				Some(plaintext.with(|bytes| Signed::<SignerInfo>::from_der(bytes))?)
 			}
 			None => None,
@@ -183,10 +183,10 @@ impl IssuedReceipt {
 
 	/// Settle the receipt of a session, when the session issued one.
 	///
-	/// A session that issued no receipt owes no acknowledgement, so one that
-	/// arrives is refused instead of being dropped. The secret is a
-	/// [`ConfirmedSecret`], so no settlement runs for a client that did not
-	/// prove it holds the handshake secret.
+	/// A session that issued no receipt owes no acknowledgement, so this
+	/// function refuses one that arrives instead of dropping it. The secret
+	/// is a [`ConfirmedSecret`], so no settlement runs for a client that did
+	/// not prove it holds the handshake secret.
 	///
 	/// # Errors
 	///

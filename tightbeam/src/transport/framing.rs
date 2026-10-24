@@ -2,8 +2,8 @@
 //!
 //! Reading a DER envelope off a byte stream happens in stages: tag octet,
 //! first length octet, optional long-form length octets, then content. The
-//! classification, canonicality, and reconstruction logic lives here so the
-//! planes cannot diverge on wire framing.
+//! classification, canonicality, and reconstruction logic lives here, so both
+//! planes share one wire framing.
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
@@ -53,7 +53,7 @@ fn parse_der_length(first_byte: u8, length_octets: impl AsRef<[u8]>) -> Option<u
 
 	// Canonical form: no leading zero octet, and the long form is only used
 	// for values the short form cannot express (>= 128).
-	if length_octets[0] == 0 {
+	if length_octets.first() == Some(&0) {
 		return None;
 	}
 
@@ -71,9 +71,8 @@ fn parse_der_length(first_byte: u8, length_octets: impl AsRef<[u8]>) -> Option<u
 
 /// A DER frame header read from the wire, before any content is allocated.
 ///
-/// The declared content length has not been checked against any ceiling, so
-/// this type offers no way to read it: the accessor lives on
-/// [`AdmittedHeader`].
+/// The declared content length is unchecked against any ceiling, so its
+/// accessor lives on [`AdmittedHeader`] alone.
 pub(crate) struct FrameHeader {
 	tag: u8,
 	length_first: u8,
@@ -108,8 +107,8 @@ impl FrameHeader {
 	///
 	/// # Errors
 	///
-	/// [`TransportError::InvalidMessage`] when the length field is
-	/// non-canonical or uses the BER indefinite form.
+	/// - [`TransportError::InvalidMessage`] -- the length field is
+	///   non-canonical or uses the BER indefinite form.
 	pub(crate) fn parse(prefix: HeaderPrefix, length_octets: impl Into<Vec<u8>>) -> TransportResult<Self> {
 		let HeaderPrefix { tag, length_first } = prefix;
 		let length_octets: Vec<u8> = length_octets.into();
@@ -121,9 +120,9 @@ impl FrameHeader {
 	///
 	/// # Errors
 	///
-	/// [`TransportFailure::SizeExceeded`] when the declared length exceeds
-	/// `cap`. The refusal happens here, before the content is read or any
-	/// buffer is sized.
+	/// - [`TransportFailure::SizeExceeded`] -- the declared length exceeds
+	///   `cap`. The refusal comes before the content is read or any buffer is
+	///   sized.
 	pub(crate) fn admit(self, cap: usize) -> TransportResult<AdmittedHeader> {
 		if self.declared_len > cap {
 			return Err(TransportError::OperationFailed(TransportFailure::SizeExceeded));
@@ -187,7 +186,8 @@ fn reconstruct_der_encoding(
 ) -> Vec<u8> {
 	let length_octets = length_octets.as_ref();
 	let content = content.as_ref();
-	let mut buffer = Vec::with_capacity(2 + length_octets.len() + content.len());
+	let header_len = length_octets.len().saturating_add(2);
+	let mut buffer = Vec::with_capacity(header_len.saturating_add(content.len()));
 	buffer.push(tag);
 	buffer.push(length_first);
 
@@ -204,7 +204,7 @@ fn reconstruct_der_encoding(
 mod tests {
 	use super::*;
 
-	/// (first length octet, remaining octets, expected decode)
+	/// Cases of (first length octet, remaining octets, expected decode).
 	const PARSE_DER_LENGTH_CASES: &[(u8, &[u8], Option<usize>)] = &[
 		(0x00, &[], Some(0)),
 		(0x7F, &[], Some(127)),
@@ -226,9 +226,9 @@ mod tests {
 		}
 	}
 
-	/// (first length octet, content length)
+	/// Cases of (first length octet, content length).
 	const LENGTH_FORM_SHORT_CASES: &[(u8, usize)] = &[(0x00, 0), (0x7F, 127)];
-	/// (first length octet, further length octet count)
+	/// Cases of (first length octet, further length octet count).
 	const LENGTH_FORM_LONG_CASES: &[(u8, usize)] = &[(0x80, 0), (0x81, 1), (0x84, 4), (0xFF, 127)];
 
 	#[test]

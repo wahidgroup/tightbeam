@@ -1,12 +1,13 @@
 //! This module holds the shared colony types: load balancers, pheromone
-//! metrics, control-plane helpers, and scaling utilities used by cluster and
-//! hive.
+//! metrics, control-plane helpers, and the scaling utilities that the cluster
+//! and the hive use.
 
 pub mod messages;
 pub mod scaling;
 pub mod urn;
 
 use core::future::Future;
+use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -34,8 +35,8 @@ pub struct InstanceMetrics {
 	/// Canonical instance-URN bytes are short, so the per-round copy is
 	/// bounded and cheaper than that API cost.
 	pub instance_key: Vec<u8>,
-	/// Stigmergic trail strength in `0..=`[`MAX_PHEROMONE`], where higher is
-	/// stronger.
+	/// Stigmergic trail strength in `0..=`[`MAX_PHEROMONE`], where a higher
+	/// value is a stronger trail.
 	///
 	/// The registry raises it on a successful forward and lowers it on
 	/// failure or evaporation. Balancers use it as the sole selection signal.
@@ -104,8 +105,8 @@ fn splitmix64_next(state: &AtomicU64) -> u64 {
 
 /// Default balancer: stochastic, pheromone-proportional instance selection.
 ///
-/// Each instance is drawn with probability proportional to its foraging
-/// weight, which follows the stigmergic model the registry maintains. A
+/// The forager draws each instance with a probability proportional to its
+/// foraging weight, which follows the stigmergic model the registry keeps. A
 /// deterministic argmax would send every call to one of two equal trails,
 /// and the draw splits that load across the eligible instances instead.
 ///
@@ -114,8 +115,8 @@ fn splitmix64_next(state: &AtomicU64) -> u64 {
 /// - **Exploitation**: higher pheromone raises an instance's draw probability.
 /// - **Exploration**: the exploration floor keeps every live instance reachable.
 /// - **Repellency**: past the repellency threshold, additional pheromone
-///   *lowers* the draw weight, which stops any instance from monopolizing
-///   the wheel.
+///   *lowers* the draw weight, which caps the share of the wheel that one
+///   instance can hold.
 ///
 /// # Configuration
 ///
@@ -135,13 +136,13 @@ fn splitmix64_next(state: &AtomicU64) -> u64 {
 ///
 /// # Sources
 ///
-/// - Grassé (1959), stigmergy - indirect coordination through a shared
+/// - Grassé (1959), stigmergy as indirect coordination through a shared
 ///   medium: [doi:10.1007/BF02223791](https://doi.org/10.1007/BF02223791)
-/// - Di Caro & Dorigo (1998), AntNet - stochastic (not argmax) stigmergic
-///   routing: [doi:10.1613/jair.530](https://doi.org/10.1613/jair.530)
+/// - Di Caro & Dorigo (1998), AntNet, which routes by stochastic (not argmax)
+///   stigmergy: [doi:10.1613/jair.530](https://doi.org/10.1613/jair.530)
 /// - Nakrani & Tovey (2004), honey-bee dynamic server allocation:
 ///   [doi:10.1177/105971230401200308](https://doi.org/10.1177/105971230401200308)
-/// - Saran et al. (2007), termite trail pheromone turning repellent above
+/// - Saran et al. (2007), termite trail pheromone that turns repellent above
 ///   ~10 pg/cm: [doi:10.1007/s10886-006-9229-2](https://doi.org/10.1007/s10886-006-9229-2)
 #[derive(Debug, Clone)]
 pub struct StochasticForager {
@@ -194,13 +195,12 @@ impl StochasticForager {
 	///
 	/// The pheromone term declines once it crosses the repellency threshold.
 	fn forage_weight(&self, pheromone: u64) -> u64 {
-		let attractive = if pheromone <= self.repellency_threshold {
-			pheromone
-		} else {
-			self.repellency_threshold.saturating_sub(pheromone - self.repellency_threshold)
+		let attractive = match pheromone.checked_sub(self.repellency_threshold) {
+			Some(excess) if excess > 0 => self.repellency_threshold.saturating_sub(excess),
+			_ => pheromone,
 		};
 
-		self.exploration_floor + attractive
+		self.exploration_floor.saturating_add(attractive)
 	}
 }
 
@@ -210,25 +210,24 @@ impl LoadBalancer for StochasticForager {
 			0 => None,
 			1 => Some(0),
 			last_plus_one => {
-				let total: u64 = candidates.iter().map(|c| self.forage_weight(c.pheromone)).sum();
+				let weights = candidates.iter().map(|c| self.forage_weight(c.pheromone));
+				let total = weights.fold(0, u64::saturating_add);
 				let raw = splitmix64_next(&self.rng);
 
 				// A zero floor with dead trails makes every weight zero, so the
-				// draw is uniform, and the modulo below never sees a zero
-				// total.
-				if total == 0 {
-					return Some((raw as usize) % last_plus_one);
-				}
+				// draw is uniform.
+				let Some(draw) = raw.checked_rem(total) else {
+					return (raw as usize).checked_rem(last_plus_one);
+				};
 
-				let draw = raw % total;
 				let mut cumulative = 0u64;
 				for (index, candidate) in candidates.iter().enumerate() {
-					cumulative += self.forage_weight(candidate.pheromone);
+					cumulative = cumulative.saturating_add(self.forage_weight(candidate.pheromone));
 					if draw < cumulative {
 						return Some(index);
 					}
 				}
-				Some(last_plus_one - 1)
+				last_plus_one.checked_sub(1)
 			}
 		}
 	}
@@ -258,19 +257,21 @@ impl Default for PowerOfTwoChoices {
 
 impl LoadBalancer for PowerOfTwoChoices {
 	fn select(&self, candidates: &[InstanceMetrics]) -> Option<usize> {
-		match candidates.len() {
-			0 => None,
-			1 => Some(0),
-			2 => Some(usize::from(candidates[1].pheromone > candidates[0].pheromone)),
-			n => {
+		match candidates {
+			[] => None,
+			[_] => Some(0),
+			[first, second] => Some(usize::from(second.pheromone > first.pheromone)),
+			all => {
 				// One 64-bit draw splits into a uniform distinct pair: `second`
 				// comes from `[0, n-1)` and shifts past `first`.
+				let n = all.len();
 				let draw = splitmix64_next(&self.rng);
-				let first = ((draw >> 32) as usize) % n;
-				let offset = ((draw & u64::from(u32::MAX)) as usize) % (n - 1);
-				let second = offset + usize::from(offset >= first);
+				let others = n.checked_sub(1)?;
+				let first = ((draw >> 32) as usize).checked_rem(n)?;
+				let offset = ((draw & u64::from(u32::MAX)) as usize).checked_rem(others)?;
+				let second = offset.checked_add(usize::from(offset >= first))?;
 
-				if candidates[first].pheromone >= candidates[second].pheromone {
+				if all.get(first)?.pheromone >= all.get(second)?.pheromone {
 					Some(first)
 				} else {
 					Some(second)
@@ -294,7 +295,7 @@ impl LoadBalancer for RoundRobin {
 		}
 
 		let count = self.counter.fetch_add(1, Ordering::Relaxed);
-		Some((count as usize) % candidates.len())
+		(count as usize).checked_rem(candidates.len())
 	}
 }
 
@@ -305,11 +306,20 @@ impl LoadBalancer for RoundRobin {
 ///
 /// A hive with zero instances returns [`BasisPoints::MAX`] so backpressure
 /// and heartbeats report saturation. Per-type scaling still sees the zero
-/// count and can spawn.
+/// count and can spawn. A mean past the range of [`BasisPoints`] saturates.
+///
+/// # Examples
+///
+/// ```
+/// # use tightbeam::colony::common::aggregate_utilization;
+/// # use tightbeam::utils::BasisPoints;
+/// assert_eq!(aggregate_utilization(20_000, 4).get(), 5_000);
+/// assert_eq!(aggregate_utilization(131_072, 2), BasisPoints::MAX);
+/// ```
 pub fn aggregate_utilization(total_utilization: u64, instance_count: usize) -> BasisPoints {
-	match instance_count {
-		0 => BasisPoints::MAX,
-		n => BasisPoints::new_saturating((total_utilization / n as u64) as u16),
+	match NonZeroU64::new(instance_count as u64) {
+		None => BasisPoints::MAX,
+		Some(n) => BasisPoints::saturating_from(total_utilization / n),
 	}
 }
 
@@ -317,7 +327,7 @@ pub fn aggregate_utilization(total_utilization: u64, instance_count: usize) -> B
 ///
 /// # Errors
 ///
-/// - [`TightBeamError`] when the frame builder refuses the frame, such as when `message` fails to encode.
+/// - [`TightBeamError`] -- the frame builder refuses the frame, such as when `message` fails to encode.
 pub fn reply_frame<M: Message>(id: impl AsRef<[u8]>, message: M) -> Result<Option<Frame>, TightBeamError> {
 	let frame = Version::V0.compose().with_id(id).with_order(0).with_message(message).build()?;
 
@@ -331,7 +341,7 @@ pub fn reply_frame<M: Message>(id: impl AsRef<[u8]>, message: M) -> Result<Optio
 ///
 /// # Errors
 ///
-/// - [`TightBeamError`] when the frame builder refuses the frame, such as when `message` fails to encode.
+/// - [`TightBeamError`] -- the frame builder refuses the frame, such as when `message` fails to encode.
 pub fn reply_frame_with_priority<M: Message>(
 	id: impl AsRef<[u8]>,
 	priority: MessagePriority,
@@ -382,9 +392,9 @@ impl DrainMode {
 ///
 /// # Single spawn path
 ///
-/// Spawning without the group leaves a task running past the stop that was
-/// meant to end it (CWE-772), which is why the group is the only spawn path
-/// these runtimes offer.
+/// A task spawned outside the group runs past the stop that was meant to
+/// end it (CWE-772), which is why the group is the only spawn path these
+/// runtimes offer.
 #[derive(Clone, Default)]
 pub struct TaskGroup(Arc<Mutex<TaskGroupState>>);
 
@@ -396,11 +406,11 @@ struct TaskGroupState {
 }
 
 impl TaskGroup {
-	/// Takes ownership of `handle`, releasing handles whose task has ended.
+	/// Takes ownership of `handle`, and releases each handle whose task ended.
 	///
 	/// A stopped group aborts `handle` on arrival, so work that starts while
 	/// the runtime is stopping ends with the stop (CWE-772). The sweep bounds
-	/// the group by the tasks actually running, which keeps a runtime that
+	/// the group by the tasks that still run, which keeps a runtime that
 	/// spawns per request at the size of its live work.
 	pub fn adopt(&self, handle: rt::JoinHandle) {
 		let mut state = self.state();
@@ -423,7 +433,7 @@ impl TaskGroup {
 
 	/// Stops the group and aborts every task it still owns.
 	///
-	/// Stopping is terminal: a later [`TaskGroup::spawn`] aborts on
+	/// A stop is terminal: a later [`TaskGroup::spawn`] aborts on
 	/// arrival, which keeps the stop reaching every task the group starts.
 	pub fn abort_all(&self) {
 		let mut state = self.state();
@@ -606,6 +616,13 @@ mod tests {
 		}
 	}
 
+	// A mean of 65,536 basis points is past the `u16` range, and it reads as
+	// saturation.
+	#[test]
+	fn a_mean_past_the_u16_range_reads_as_saturation() {
+		assert_eq!(super::aggregate_utilization(131_072, 2), super::BasisPoints::MAX);
+	}
+
 	#[test]
 	fn a_fresh_runtime_is_not_draining() {
 		assert!(!DrainMode::default().is_draining());
@@ -669,9 +686,8 @@ mod tests {
 		assert!(!FINISHED.load(Ordering::SeqCst));
 	}
 
-	/// A beat already past its own checks is ended by the group that owns
-	/// it, so work cannot outlast the stop that withdrew its routes
-	/// (CWE-362).
+	/// The group that owns a beat ends it even past the beat's own checks,
+	/// so work cannot outlast the stop that withdrew its routes (CWE-362).
 	#[tokio::test(start_paused = true)]
 	async fn a_running_task_ends_when_its_group_stops() {
 		static BEATS: AtomicUsize = AtomicUsize::new(0);

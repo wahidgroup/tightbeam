@@ -37,7 +37,11 @@ mod signature;
 
 #[cfg(feature = "digest")]
 pub(crate) use scaffold::FrameIntegrityScaffold;
+#[cfg(feature = "signature")]
+pub(crate) use signed::ArrivedCertificates;
 pub use signed::Signed;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+pub(crate) use signed::CERTIFICATES_TAG;
 
 /// The per-message metadata that a [`Frame`] carries beside its body.
 ///
@@ -152,8 +156,8 @@ impl Metadata {
 
 	/// The digest of the prior frame in a hash chain (V2+).
 	///
-	/// This digest links frames. It is neither Message Integrity nor Frame
-	/// Integrity.
+	/// This digest links frames, and it stands apart from Message Integrity and
+	/// Frame Integrity.
 	pub fn previous_frame(&self) -> Option<&DigestInfo> {
 		self.previous_frame.as_ref()
 	}
@@ -163,7 +167,7 @@ impl Metadata {
 		self.matrix.as_ref()
 	}
 
-	/// The first field present here that `version` does not carry.
+	/// The first field present here that `version` forbids.
 	fn forbidden_field(&self, version: Version) -> Option<GatedField> {
 		let present = [
 			(GatedField::MessageIntegrity, self.integrity.is_some()),
@@ -186,8 +190,9 @@ impl TryFrom<MetadataBuilder> for Metadata {
 	///
 	/// # Errors
 	///
-	/// - [`MetadataError::MissingId`] or [`MetadataError::MissingOrder`] when a required field is unset.
-	/// - [`MetadataError::UnsupportedField`] when a set field is gated above the builder's version.
+	/// - [`MetadataError::MissingId`] -- the builder has no id.
+	/// - [`MetadataError::MissingOrder`] -- the builder has no order.
+	/// - [`MetadataError::UnsupportedField`] -- a set field is gated above the builder's version.
 	fn try_from(builder: MetadataBuilder) -> Result<Self, Self::Error> {
 		let MetadataBuilder {
 			version,
@@ -224,7 +229,7 @@ impl TryFrom<MetadataBuilder> for Metadata {
 	}
 }
 
-/// Core TightBeam message structure.
+/// The core TightBeam message structure.
 ///
 /// The version field determines which metadata fields the frame may carry.
 /// The signature covers the version, the metadata, the message, and the
@@ -310,7 +315,7 @@ impl Frame {
 	///
 	/// # Errors
 	///
-	/// - [`crate::TightBeamError::UnsupportedVersion`] when a part carries a field that `version` forbids.
+	/// - [`crate::TightBeamError::UnsupportedVersion`] -- a part carries a field that `version` forbids.
 	#[cfg(feature = "builder")]
 	pub(crate) fn assemble(
 		version: Version,
@@ -416,25 +421,26 @@ impl Frame {
 			.or_else(|| first_forbidden(self.version, present))
 	}
 
-	/// Refuse to add `field` when this frame's version does not carry it.
+	/// Refuse to add `field` when this frame's version forbids it.
 	///
 	/// # Errors
 	///
-	/// - [`crate::TightBeamError::UnsupportedVersion`] naming the frame
-	///   version and the version that introduced the field.
+	/// - [`crate::TightBeamError::UnsupportedVersion`] -- the frame's version
+	///   forbids `field`. The error names the frame version and the version
+	///   that introduced the field.
 	#[cfg(feature = "signature")]
 	fn ensure_allows(&self, field: GatedField) -> crate::error::Result<()> {
 		let forbidden = (!self.version.allows(field)).then_some(field);
 		self.refuse(forbidden)
 	}
 
-	/// Refuse `forbidden` when it names a field this frame's version does not
-	/// carry.
+	/// Refuse `forbidden` when it names a field this frame's version forbids.
 	///
 	/// # Errors
 	///
-	/// - [`crate::TightBeamError::UnsupportedVersion`] naming the frame
-	///   version and the version that introduced the field.
+	/// - [`crate::TightBeamError::UnsupportedVersion`] -- `forbidden` names a
+	///   field. The error names the frame version and the version that
+	///   introduced the field.
 	#[cfg(any(feature = "builder", feature = "signature"))]
 	fn refuse(&self, forbidden: Option<GatedField>) -> crate::error::Result<()> {
 		let Some(field) = forbidden else {
@@ -463,7 +469,7 @@ impl From<Frame> for Metadata {
 
 crate::impl_from!(Frame, tb => Version: tb.version);
 
-/// The first field that is present and that `version` does not carry.
+/// The first field that is present and that `version` forbids.
 fn first_forbidden<const N: usize>(version: Version, present: [(GatedField, bool); N]) -> Option<GatedField> {
 	present
 		.into_iter()

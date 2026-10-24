@@ -86,12 +86,12 @@ use crate::constants::EC_PUBKEY_UNCOMPRESSED_SIZE;
 use crate::crypto::aead::{Aead, AeadCore, Aes128Gcm, Aes256Gcm, KeyInit, Nonce, Payload};
 use crate::crypto::common::typenum::{Unsigned, U32};
 use crate::crypto::common::KeySizeUser;
-use crate::crypto::hkdf::{Hkdf, InvalidLength};
+use crate::crypto::hkdf::InvalidLength;
 use crate::crypto::k256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
 use crate::crypto::k256::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey, SecretKey};
 use crate::crypto::k256::sha2::Sha256;
 use crate::crypto::k256::Secp256k1;
-use crate::crypto::kdf::{EcdhSecret, KdfError};
+use crate::crypto::kdf::{EcdhSecret, KdfError, ZeroizingHkdf};
 use crate::crypto::secret::{Secret, SecretSlice};
 use crate::random::{CryptoRngCore, OsRng, RngWrapper};
 use crate::zeroize::{Zeroize, Zeroizing};
@@ -162,6 +162,10 @@ pub const KDF_HKDF_SHA256: u16 = 0x0001;
 /// A two-stage key derivation function of an HPKE suite
 /// ([RFC 9180 §4][rfc9180-4]).
 ///
+/// The contract of an implementation is to wipe each copy of the key
+/// material it holds, once a derivation ends, as
+/// [`KdfFunction`](crate::crypto::kdf::KdfFunction) states.
+///
 /// [rfc9180-4]: https://datatracker.ietf.org/doc/html/rfc9180#section-4
 pub trait HpkeKdf {
 	/// The identifier of this KDF in the HPKE KDF registry.
@@ -184,6 +188,11 @@ pub trait HpkeKdf {
 /// HKDF-SHA256 ([RFC 5869][rfc5869]), the KDF of the registered DHKEM on
 /// secp256k1.
 ///
+/// The pseudorandom key, each output block, and each input that the hash
+/// buffers wipe on drop. The SHA-256 core of `sha2` 0.10.9 holds its
+/// chaining state in plain words with private fields, so that state drops as
+/// it is.
+///
 /// [rfc5869]: https://datatracker.ietf.org/doc/html/rfc5869
 pub struct HkdfSha256;
 
@@ -193,14 +202,13 @@ impl HpkeKdf for HkdfSha256 {
 	const EXTRACT_SIZE: usize = 32;
 
 	fn extract(salt: &[u8], ikm: &[u8]) -> ZeroizingBytes {
-		let (mut extracted, _) = Hkdf::<Sha256>::extract(Some(salt), ikm);
-		let prk = Zeroizing::new(extracted.to_vec());
-		extracted.as_mut_slice().zeroize();
-		prk
+		let prk = ZeroizingHkdf::<Sha256>::extract(salt, ikm);
+		Zeroizing::new(prk.as_slice().to_vec())
 	}
 
 	fn expand(prk: &[u8], info: &[u8], len: usize) -> core::result::Result<ZeroizingBytes, KdfError> {
-		let keyed = Hkdf::<Sha256>::from_prk(prk).map_err(|_| KdfError::DerivationFailed(InvalidLength))?;
+		let keyed = ZeroizingHkdf::<Sha256>::from_prk(prk);
+		let keyed = keyed.map_err(|_| KdfError::DerivationFailed(InvalidLength))?;
 		let mut okm = Zeroizing::new(vec![0u8; len]);
 		keyed.expand(info, &mut okm).map_err(KdfError::DerivationFailed)?;
 		Ok(okm)
@@ -589,7 +597,7 @@ pub trait HpkeSecretKeyOps {
 	///
 	/// # Errors
 	///
-	/// - The [`EcdhSecret::open`] set.
+	/// - The errors of [`EcdhSecret::open`].
 	///
 	/// [rfc9180-6.1]: https://datatracker.ietf.org/doc/html/rfc9180#section-6.1
 	fn open<S>(
@@ -785,8 +793,8 @@ where
 	}
 
 	/// `Decap(kemct, skR)` through `key`, the backend that holds the private
-	/// half of `recipient`. The point is parsed first, then the backend runs
-	/// `DH(skR, pkE)`.
+	/// half of `recipient`. This parses the point first, and then the backend
+	/// runs `DH(skR, pkE)`.
 	///
 	/// `C`, `K`, and `KEM_ID` together name one KEM, so an implementor pairs a
 	/// `KEM_ID` with the KDF its registration names, as `0x0016` names
@@ -855,7 +863,7 @@ impl RecipientKem for DhKemSecp256k1 {
 
 	/// # Errors
 	///
-	/// - The [`DhKem::encap_to`] set.
+	/// - The errors of [`DhKem::encap_to`].
 	fn encapsulate(
 		recipient: &PublicKey<Secp256k1>,
 		rng: &mut dyn CryptoRngCore,
@@ -865,7 +873,7 @@ impl RecipientKem for DhKemSecp256k1 {
 
 	/// # Errors
 	///
-	/// - The [`DhKem::decap_through`] set.
+	/// - The errors of [`DhKem::decap_through`].
 	fn decapsulate<'a>(
 		key: &'a dyn DiffieHellman<Secp256k1>,
 		recipient: &'a PublicKey<Secp256k1>,
@@ -889,7 +897,7 @@ impl core::convert::TryFrom<SecretSlice<u8>> for crate::crypto::k256::SecretKey 
 
 impl From<&crate::crypto::k256::SecretKey> for SecretSlice<u8> {
 	fn from(secret_key: &crate::crypto::k256::SecretKey) -> Self {
-		// The scalar leaves the key as a plain array, so it is wiped once the
+		// The scalar leaves the key as a plain array, so this wipes it once the
 		// wiping buffer holds its copy (CWE-226).
 		let mut scalar = secret_key.to_bytes();
 		let bytes = Secret::from(scalar.to_vec());
@@ -952,8 +960,8 @@ impl<P: CryptoProvider> HpkeEncryptor<P> {
 	}
 }
 
-/// The `ukm` of the seal is the frame purpose label followed by 32 octets the
-/// seal draws, which the decryptor admits alone.
+/// The `ukm` of the seal is the frame purpose label followed by 32 octets that
+/// the seal draws. The decryptor admits a `ukm` of that form alone.
 #[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
 impl<P> Encryptor<<P::AeadCipher as AeadAlgorithm>::Oid> for HpkeEncryptor<P>
 where
@@ -991,8 +999,8 @@ impl<P: CryptoProvider> HpkeDecryptor<P> {
 	}
 }
 
-/// The decryptor admits a `ukm` of the frame purpose label alone, and the
-/// content type the envelope's attributes authenticate.
+/// The decryptor admits a `ukm` of the frame purpose label followed by 32
+/// octets, and the content type that the envelope's attributes authenticate.
 #[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
 impl<P> Decryptor for HpkeDecryptor<P>
 where
@@ -1034,12 +1042,13 @@ mod tests {
 		const EXTRACT_SIZE: usize = 64;
 
 		fn extract(salt: &[u8], ikm: &[u8]) -> ZeroizingBytes {
-			let (prk, _) = Hkdf::<Sha512>::extract(Some(salt), ikm);
-			Zeroizing::new(prk.to_vec())
+			let prk = ZeroizingHkdf::<Sha512>::extract(salt, ikm);
+			Zeroizing::new(prk.as_slice().to_vec())
 		}
 
 		fn expand(prk: &[u8], info: &[u8], len: usize) -> core::result::Result<ZeroizingBytes, KdfError> {
-			let keyed = Hkdf::<Sha512>::from_prk(prk).map_err(|_| KdfError::DerivationFailed(InvalidLength))?;
+			let keyed = ZeroizingHkdf::<Sha512>::from_prk(prk);
+			let keyed = keyed.map_err(|_| KdfError::DerivationFailed(InvalidLength))?;
 			let mut okm = Zeroizing::new(vec![0u8; len]);
 			keyed.expand(info, &mut okm).map_err(KdfError::DerivationFailed)?;
 			Ok(okm)
@@ -1731,8 +1740,8 @@ mod tests {
 		[enc.as_ref(), &vec![0xEEu8; tag]].concat()
 	}
 
-	/// A message that cannot carry an encapsulated key and a tag is refused
-	/// at the parse, ahead of any DH.
+	/// The parse refuses a message that cannot carry an encapsulated key and
+	/// a tag, ahead of any DH.
 	#[test]
 	fn a_message_too_short_for_a_key_and_a_tag_is_refused() -> Result<()> {
 		let enc = unhex(AES_256_GCM_VECTOR.ephemeral_public);
@@ -1746,8 +1755,8 @@ mod tests {
 		Ok(())
 	}
 
-	/// The parse validates the encapsulated key, so a point off the curve and
-	/// a compressed encoding at the uncompressed width are both refused.
+	/// The parse validates the encapsulated key, so it refuses a point off the
+	/// curve and a compressed encoding at the uncompressed width.
 	#[test]
 	fn an_encapsulated_key_that_is_no_point_is_refused() {
 		let mut off_curve = unhex(AES_256_GCM_VECTOR.ephemeral_public);
@@ -1859,8 +1868,8 @@ mod tests {
 		assert!(matches!(short, Err(HpkeError::Kdf(_))));
 	}
 
-	/// `LabeledExpand` frames its length in two bytes, so a longer request is
-	/// refused ahead of the KDF. The KDF here answers any length, because
+	/// `LabeledExpand` frames its length in two bytes, so it refuses a longer
+	/// request ahead of the KDF. The KDF here answers any length, because
 	/// HKDF-SHA256 refuses past 8,160 bytes on its own and would hide the
 	/// frame.
 	#[test]
@@ -1920,8 +1929,8 @@ mod tests {
 
 		const FRAMED: &[u8] = b"framed content";
 
-		/// The `id-signedData` content type, `1.2.840.113549.1.7.2` (RFC 5652
-		/// §5.1), a type other than the default.
+		/// The `id-signedData` content type, `1.2.840.113549.1.7.2`
+		/// (RFC 5652 §5.1), a type other than the default.
 		const ID_SIGNED_DATA: crate::der::asn1::ObjectIdentifier =
 			crate::der::asn1::ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.2");
 

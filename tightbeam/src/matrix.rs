@@ -33,7 +33,7 @@ pub trait MatrixLike {
 	fn get(&self, r: u8, c: u8) -> u8;
 
 	/// Set the cell at row `r` and column `c` to `value`. An out-of-bounds
-	/// write does nothing.
+	/// write leaves the matrix unchanged.
 	fn set(&mut self, r: u8, c: u8, value: u8);
 
 	/// Fill every cell with `value`.
@@ -53,7 +53,7 @@ pub trait IntoMatrixDyn {
 	fn into_matrix_dyn(self) -> Result<MatrixDyn, MatrixError>;
 }
 
-// A `MatrixDyn` converts to itself, so the conversion cannot fail.
+// A `MatrixDyn` converts to itself, so the conversion always succeeds.
 impl IntoMatrixDyn for MatrixDyn {
 	fn into_matrix_dyn(self) -> Result<MatrixDyn, MatrixError> {
 		Ok(self)
@@ -73,9 +73,10 @@ where
 
 /// Runtime-sized N×N matrix of u8 flags (row-major).
 ///
-/// This is the wire type for the V3 metadata matrix. Its fields are private
-/// and [`MatrixDyn::from_row_major`] is the only way to build one, so
-/// `data.len() == n * n` holds for every value that exists.
+/// This is the wire type for the V3 metadata matrix. Its fields are private,
+/// and each constructor builds exactly `n * n` cells, so `data.len() == n * n`
+/// holds for every value that exists. The DER decode runs through
+/// [`MatrixDyn::from_row_major`], and `TryFrom<u8>` and `Default` fill zeros.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "zeroize", derive(zeroize::ZeroizeOnDrop))]
 pub struct MatrixDyn {
@@ -84,7 +85,7 @@ pub struct MatrixDyn {
 }
 
 impl Default for MatrixDyn {
-	/// Smallest valid matrix (1×1, zeroed) so the `data.len() == n*n`
+	/// The smallest valid matrix (1×1, zeroed), so the `data.len() == n*n`
 	/// invariant holds for every reachable value.
 	fn default() -> Self {
 		Self { n: 1, data: vec![0u8; 1] }
@@ -94,7 +95,7 @@ impl Default for MatrixDyn {
 impl MatrixDyn {
 	/// Construct a matrix from `n * n` row-major bytes.
 	///
-	/// The length MUST be `n * n`, and any other length returns `None`.
+	/// The length MUST be `n * n`. A zero `n` or another length returns `None`.
 	pub fn from_row_major(n: u8, bytes: impl Into<Vec<u8>>) -> Option<Self> {
 		let bytes: Vec<u8> = bytes.into();
 		if n == 0 {
@@ -102,21 +103,23 @@ impl MatrixDyn {
 		}
 
 		let n_usize = n as usize;
-		if bytes.len() == n_usize * n_usize {
+		if n_usize.checked_mul(n_usize) == Some(bytes.len()) {
 			Some(Self { n, data: bytes })
 		} else {
 			None
 		}
 	}
 
-	/// Defense in depth: bounds by the actual buffer as well as `n`, so a
-	/// value constructed in violation of the `data.len() == n*n` invariant
+	/// Defense in depth: the index checks the buffer length as well as `n`,
+	/// so a value built in violation of the `data.len() == n*n` invariant
 	/// cannot produce an out-of-bounds index.
 	#[inline]
 	fn idx(&self, r: u8, c: u8) -> Option<usize> {
 		let n = self.n as usize;
 		let (ru, cu) = (r as usize, c as usize);
-		(ru < n && cu < n).then(|| ru * n + cu).filter(|i| *i < self.data.len())
+
+		let index = (ru < n && cu < n).then(|| ru.checked_mul(n)?.checked_add(cu)).flatten();
+		index.filter(|i| *i < self.data.len())
 	}
 
 	/// Borrow the underlying row-major bytes.
@@ -136,8 +139,9 @@ impl MatrixDyn {
 		}
 
 		let n = self.n as usize;
-		let start = r as usize * n;
-		self.data.get(start..start + n)
+		let start = (r as usize).checked_mul(n)?;
+		let end = start.checked_add(n)?;
+		self.data.get(start..end)
 	}
 }
 
@@ -146,19 +150,18 @@ impl crate::der::FixedTag for MatrixDyn {
 }
 
 impl<'a> crate::der::DecodeValue<'a> for MatrixDyn {
-	/// Read `n` and the row-major bytes, then hand both to the one
-	/// constructor, which owns the length check.
-	fn decode_value<R: crate::der::Reader<'a>>(
-		reader: &mut R,
-		_header: crate::der::Header,
-	) -> crate::der::Result<Self> {
+	/// Read `n` and the row-major bytes within the length of the `SEQUENCE`,
+	/// then hand both to the one constructor, which owns the length check.
+	fn decode_value<R: crate::der::Reader<'a>>(reader: &mut R, header: crate::der::Header) -> crate::der::Result<Self> {
 		use crate::der::asn1::OctetString;
 		use crate::der::Decode;
 
-		let n = u8::decode(reader)?;
-		let data = OctetString::decode(reader)?;
-		Self::from_row_major(n, data.as_bytes().to_vec())
-			.ok_or_else(|| crate::der::ErrorKind::Length { tag: crate::der::Tag::OctetString }.into())
+		reader.read_nested(header.length, |reader| {
+			let n = u8::decode(reader)?;
+			let data = OctetString::decode(reader)?;
+			Self::from_row_major(n, data.as_bytes().to_vec())
+				.ok_or_else(|| crate::der::ErrorKind::Length { tag: crate::der::Tag::OctetString }.into())
+		})
 	}
 }
 
@@ -187,12 +190,13 @@ impl MatrixLike for MatrixDyn {
 	}
 
 	fn get(&self, r: u8, c: u8) -> u8 {
-		self.idx(r, c).map(|i| self.data[i]).unwrap_or(0)
+		let cell = self.idx(r, c).and_then(|i| self.data.get(i));
+		cell.copied().unwrap_or(0)
 	}
 
 	fn set(&mut self, r: u8, c: u8, value: u8) {
-		if let Some(i) = self.idx(r, c) {
-			self.data[i] = value;
+		if let Some(cell) = self.idx(r, c).and_then(|i| self.data.get_mut(i)) {
+			*cell = value;
 		}
 	}
 
@@ -233,11 +237,7 @@ impl<const N: usize> Matrix<N> {
 
 	/// Borrow a row by index.
 	pub fn row(&self, r: u8) -> Option<&[u8; N]> {
-		if (r as usize) < N {
-			Some(&self.data[r as usize])
-		} else {
-			None
-		}
+		self.data.get(r as usize)
 	}
 }
 
@@ -247,25 +247,18 @@ impl<const N: usize> MatrixLike for Matrix<N> {
 	}
 
 	fn get(&self, r: u8, c: u8) -> u8 {
-		if (r as usize) < N && (c as usize) < N {
-			self.data[r as usize][c as usize]
-		} else {
-			0
-		}
+		let cell = self.data.get(r as usize).and_then(|row| row.get(c as usize));
+		cell.copied().unwrap_or(0)
 	}
 
 	fn set(&mut self, r: u8, c: u8, value: u8) {
-		if (r as usize) < N && (c as usize) < N {
-			self.data[r as usize][c as usize] = value;
+		if let Some(cell) = self.data.get_mut(r as usize).and_then(|row| row.get_mut(c as usize)) {
+			*cell = value;
 		}
 	}
 
 	fn fill(&mut self, value: u8) {
-		for r in 0..N {
-			for c in 0..N {
-				self.data[r][c] = value;
-			}
-		}
+		self.data.as_flattened_mut().fill(value);
 	}
 }
 
@@ -284,15 +277,15 @@ impl<const N: usize> TryFrom<&[u8]> for Matrix<N> {
 	///
 	/// # Errors
 	///
-	/// - [`MatrixError::LengthMismatch`] when the slice is not exactly `N * N`
-	///   bytes. Padding or dropping bytes would move every cell after the first
-	///   difference.
+	/// - [`MatrixError::LengthMismatch`] -- the slice is not exactly `N * N`
+	///   bytes. Padding or dropping bytes would move every cell after the
+	///   first difference.
 	fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
 		const { assert_wire_dimension::<N>() };
 
 		// The const block above bounds `N` to `1..=255`, so it fits a `u8`.
 		let n = N as u8;
-		if bytes.len() != N * N {
+		if bytes.len() != const { N * N } {
 			return Err(MatrixError::LengthMismatch { n, len: bytes.len() });
 		}
 
@@ -311,6 +304,10 @@ impl TryFrom<u8> for MatrixDyn {
 		validate_n!(n);
 
 		let n_usize = n as usize;
+		#[expect(
+			clippy::arithmetic_side_effects,
+			reason = "n is a u8, so n * n is at most 65,025"
+		)]
 		let data = vec![0u8; n_usize * n_usize];
 		Ok(Self { n, data })
 	}
@@ -320,6 +317,19 @@ impl TryFrom<u8> for MatrixDyn {
 mod tests {
 	use super::*;
 
+	/// A matrix `SEQUENCE` whose length claims no octets, ahead of the `n`
+	/// and the octets of a 2 × 2 matrix of zeros.
+	const MATRIX_OF_EMPTY_LENGTH: [u8; 11] = [0x30, 0x00, 0x02, 0x01, 0x02, 0x04, 0x04, 0x00, 0x00, 0x00, 0x00];
+
+	/// The decode reads within the length the `SEQUENCE` declares
+	/// (X.690 § 8.1.3), so a length that holds none of the fields is refused.
+	#[test]
+	fn a_matrix_whose_length_holds_no_fields_is_refused() {
+		let refused = <MatrixDyn as crate::der::Decode>::from_der(&MATRIX_OF_EMPTY_LENGTH);
+		let refusal = refused.map_err(|error| error.kind());
+		assert!(matches!(refusal, Err(crate::der::ErrorKind::Incomplete { .. })));
+	}
+
 	#[test]
 	#[cfg(feature = "std")]
 	fn default_matrix_dyn_upholds_invariant() {
@@ -328,6 +338,18 @@ mod tests {
 		assert_eq!(matrix.as_bytes(), &[0u8]);
 		assert_eq!(matrix.get(0, 0), 0);
 		assert!(matrix.row(0).is_some());
+	}
+
+	/// A column past the dimension reads zero, not the first cell of the next
+	/// row.
+	#[test]
+	#[cfg(feature = "std")]
+	fn a_column_past_the_dimension_reads_zero() -> Result<(), MatrixError> {
+		let mut matrix = MatrixDyn::try_from(2u8)?;
+		matrix.set(1, 0, 5);
+
+		assert_eq!(matrix.get(0, 2), 0);
+		Ok(())
 	}
 
 	#[test]
@@ -343,12 +365,12 @@ mod tests {
 	#[test]
 	#[cfg(feature = "std")]
 	fn test_matrix_like_reality_end_to_end() -> crate::error::Result<()> {
-		// Build a 3×3 from row-major bytes 0..9
+		// Both matrices start as a 3×3 grid of the row-major bytes 0..9.
 		let bytes: Vec<u8> = (0u8..9u8).collect();
 		let mut dyn_m = MatrixDyn::from_row_major(3, bytes.clone()).expect("n*n bytes");
 		let mut stat_m = Matrix::<3>::try_from(bytes.as_slice())?;
 
-		// Paint identity for any MatrixLike without recursion.
+		// Paint the identity on any `MatrixLike`.
 		fn paint_diag<M: MatrixLike>(m: &mut M) {
 			let n = m.n();
 			// Zero the off-diagonal cells first.
@@ -358,7 +380,6 @@ mod tests {
 			}
 		}
 
-		// Check the dimensions.
 		assert_eq!(dyn_m.n(), 3);
 		assert_eq!(stat_m.n(), 3);
 
@@ -375,11 +396,9 @@ mod tests {
 			&[3, 4, 5]
 		);
 
-		// Check indexing.
 		assert_eq!(dyn_m.get(2, 2), 8);
 		assert_eq!(stat_m.get(0, 2), 2);
 
-		// Paint the identity on both matrices.
 		paint_diag(&mut dyn_m);
 		paint_diag(&mut stat_m);
 
@@ -398,7 +417,6 @@ mod tests {
 			}
 		}
 
-		// Check fill and clear.
 		dyn_m.fill(7);
 		for r in 0..3 {
 			for c in 0..3 {
@@ -412,7 +430,6 @@ mod tests {
 			}
 		}
 
-		// Check the byte view length and the static reconstruction.
 		assert_eq!(dyn_m.as_bytes().len(), 9);
 
 		let stat_bytes = Matrix::<3>::try_from(bytes.as_slice())?;
@@ -432,7 +449,7 @@ mod tests {
 	#[test]
 	#[cfg(feature = "std")]
 	fn test_matrix_specification_compliance() -> crate::error::Result<()> {
-		// Test data for several matrix sizes.
+		// Test data for four matrix sizes, from 1 to 255.
 		let test_matrices = vec![
 			(1u8, vec![42u8]),
 			(2u8, vec![1, 2, 3, 4]),
@@ -440,7 +457,7 @@ mod tests {
 			(255u8, vec![0u8; 255 * 255]),
 		];
 
-		// Test 1: Wire format compliance (n ∈ [1, 255], data.len == n*n)
+		// Test 1: Wire format compliance (n ∈ [1, 255], data.len == n*n).
 		for (n, data) in &test_matrices {
 			let expected_len = (*n as usize) * (*n as usize);
 			assert_eq!(data.len(), expected_len);
@@ -471,22 +488,19 @@ mod tests {
 			}
 		}
 
-		// Verify row-major layout
 		let expected_bytes = vec![10, 11, 12, 20, 21, 22, 30, 31, 32];
 		assert_eq!(test_matrix.as_bytes(), expected_bytes.as_slice());
 
-		// Test 5: MatrixLike trait compliance
+		// Test 5: MatrixLike trait compliance.
 		let mut matrix = MatrixDyn::try_from(2u8)?;
 
-		// Test the get and set operations.
 		matrix.set(0, 1, 99);
 		assert_eq!(matrix.get(0, 1), 99);
 
-		// Test out-of-bounds behavior. A get returns 0 and a set does nothing.
+		// Out of bounds, a get returns 0 and a set leaves the matrix unchanged.
 		assert_eq!(matrix.get(5, 5), 0);
-		matrix.set(5, 5, 123); // Should be no-op
+		matrix.set(5, 5, 123);
 
-		// Test fill operation
 		matrix.fill(77);
 		for r in 0..2 {
 			for c in 0..2 {
@@ -494,7 +508,6 @@ mod tests {
 			}
 		}
 
-		// Test clear operation
 		matrix.clear();
 		for r in 0..2 {
 			for c in 0..2 {
@@ -502,7 +515,7 @@ mod tests {
 			}
 		}
 
-		// Test 6: Conversion consistency between Matrix<N> and MatrixDyn
+		// Test 6: Conversion consistency between Matrix<N> and MatrixDyn.
 		let static_matrix = Matrix::<3>::try_from([1, 2, 3, 4, 5, 6, 7, 8, 9].as_slice())?;
 		let dynamic_matrix = MatrixDyn::from_row_major(3, vec![1, 2, 3, 4, 5, 6, 7, 8, 9])
 			.ok_or(MatrixError::LengthMismatch { n: 3, len: 9 })?;

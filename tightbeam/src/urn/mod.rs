@@ -1,9 +1,9 @@
-//! RFC 8141 compliant URN (Uniform Resource Name) implementation
+//! An RFC 8141 URN (Uniform Resource Name).
 //!
-//! See: `<https://datatracker.ietf.org/doc/html/rfc8141>`
+//! The format follows `<https://datatracker.ietf.org/doc/html/rfc8141>`.
 //!
-//! Provides zero-copy URN construction with declarative specification support
-//! for validation and hierarchical NSS (Namespace-Specific String) structure.
+//! It provides zero-copy URN construction, and a declarative specification
+//! validates the hierarchical NSS (Namespace-Specific String) structure.
 //!
 //! # RFC 8141 Format
 //!
@@ -11,13 +11,13 @@
 //! urn:<NID>:<NSS>
 //! ```
 //!
-//! Note:
-//! The optional r-component, q-component, and f-component extensions from RFC
-//! 8141 are not included in this basic implementation.
+//! The two parts are:
+//! - **NID**: the Namespace Identifier, 2 to 32 ASCII letters, digits, or
+//!   hyphens, with a letter first and a letter or digit last.
+//! - **NSS**: the Namespace-Specific String, whose structure the namespace specification defines.
 //!
-//! Where:
-//! - **NID**: Namespace Identifier (2-32 chars, alphanumeric+hyphen, starts with letter)
-//! - **NSS**: Namespace-Specific String (structure defined by namespace spec)
+//! Note: this implementation leaves out the optional r-component,
+//! q-component, and f-component of RFC 8141.
 //!
 //! # Examples
 //!
@@ -77,20 +77,20 @@ pub use spec::{UrnComponents, UrnSpec};
 
 use crate::der::{DecodeValue, EncodeValue, FixedTag, Tag};
 
-/// RFC 8141 compliant URN structure
+/// An RFC 8141 URN.
 ///
-/// Uses `Cow<'a, str>` for zero-copy string handling.
+/// The parts are `Cow<'a, str>`, so a URN borrows its input without a copy.
 ///
-/// DER serialization: Encoded as a UTF8String containing the full URN
-/// representation "urn:nid:nss".
+/// The DER encoding is a UTF8String that holds the full form,
+/// "urn:nid:nss".
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Urn<'a> {
-	/// Namespace Identifier (2-32 chars, alphanumeric+hyphen, starts with
-	/// letter)
+	/// The Namespace Identifier, 2 to 32 ASCII letters, digits, or hyphens
+	/// with a letter first and a letter or digit last.
 	/// See: `<https://datatracker.ietf.org/doc/html/rfc8141#section-2.1>`
 	nid: Cow<'a, str>,
 
-	/// Namespace-Specific String (structure defined by namespace)
+	/// The Namespace-Specific String, whose structure the namespace defines.
 	/// See: `<https://datatracker.ietf.org/doc/html/rfc8141#section-2.2>`
 	nss: Cow<'a, str>,
 }
@@ -98,89 +98,112 @@ pub struct Urn<'a> {
 impl<'a> Urn<'a> {
 	/// A URN from static parts, with no checks.
 	///
-	/// Exists for [`urn!`](crate::urn!), which validates both parts in a
-	/// `const` block before calling it, and has to be `pub` because the
-	/// macro expands in downstream crates. Write `urn!` instead.
+	/// It exists for [`urn!`](crate::urn!), which validates both parts in a
+	/// `const` block before it calls this function, and it has to be `pub`
+	/// because the macro expands in downstream crates. Write `urn!` instead.
 	#[doc(hidden)]
 	pub const fn new_unchecked(nid: &'static str, nss: &'static str) -> Urn<'static> {
 		Urn { nid: Cow::Borrowed(nid), nss: Cow::Borrowed(nss) }
 	}
 
-	/// Build a URN from parts that are not known until run time.
+	/// Build a URN from parts known only at run time.
 	///
 	/// [`urn!`](crate::urn!) is the compile-time path for literals. This one
-	/// takes the same rules to values a caller assembles.
+	/// applies the same rules to values a caller assembles.
 	///
 	/// # Errors
 	///
-	/// - [`UrnValidationError::InvalidNidLength`], [`UrnValidationError::InvalidNidStart`]
-	///   or [`UrnValidationError::InvalidNidCharacters`] when `nid` is outside
-	///   RFC 8141's formal-namespace-identifier shape.
-	/// - [`UrnValidationError::RequiredFieldMissing`] when `nss` is empty.
+	/// - [`UrnValidationError::InvalidNidLength`] -- `nid` is shorter than 2 or longer than 32 characters.
+	/// - [`UrnValidationError::InvalidNidStart`] -- the first character of `nid` is no letter.
+	/// - [`UrnValidationError::InvalidNidCharacters`] -- a character of `nid`
+	///   is no letter, digit, or hyphen, or `nid` ends with a hyphen.
+	/// - [`UrnValidationError::RequiredFieldMissing`] -- `nss` is empty.
 	pub fn from_parts(nid: impl AsRef<str>, nss: impl AsRef<str>) -> Result<Urn<'static>, UrnValidationError> {
 		let nid = Cow::Owned(String::from(nid.as_ref()));
 		let nss = Cow::Owned(String::from(nss.as_ref()));
 		Urn::checked(nid, nss)
 	}
 
-	/// Namespace Identifier.
+	/// The Namespace Identifier.
 	pub fn nid(&self) -> &str {
 		&self.nid
 	}
 
-	/// Namespace-Specific String.
+	/// The Namespace-Specific String.
 	pub fn nss(&self) -> &str {
 		&self.nss
 	}
 
-	/// Verify this URN against a spec
+	/// Verify this URN against the spec `S`.
 	///
-	/// Validates that:
-	/// - The NID matches the spec's NID
-	/// - The NID format is valid (RFC 8141 compliant)
-	/// - The NSS structure conforms to the spec's requirements
+	/// # Errors
+	///
+	/// - [`UrnValidationError::NidMismatch`] -- the NID differs from `S::NID`.
+	/// - The errors of `validate_nid` -- the NID has an invalid format.
+	/// - The errors of `S::validate` -- the NSS structure breaks the spec's requirements.
 	pub fn verify<S: UrnSpec>(&self) -> Result<(), UrnValidationError> {
-		// Check NID matches spec
 		if self.nid.as_ref() != S::NID {
 			return Err(UrnValidationError::NidMismatch);
 		}
 
-		// Validate NID format
 		Self::validate_nid(self.nid.as_ref())?;
 
-		// Create a builder with this URN's data for spec validation
+		// The spec reads the URN's parts through a builder's `UrnComponents`.
 		let builder = UrnBuilder::default().with_nid(self.nid.as_ref()).with_nss(self.nss.as_ref());
 
-		// Validate using the spec with UrnComponents trait
 		S::validate(&builder as &dyn UrnComponents)
 	}
 
-	/// Validate that the NID conforms to RFC 8141 § 2.3.1
+	/// Validate the NID against RFC 8141 § 2.1.
 	/// See: `<https://datatracker.ietf.org/doc/html/rfc8141#section-2.1>`
 	///
-	/// NID must be 2-32 characters, alphanumeric plus hyphens, starting with a
-	/// letter. This implements the formal-namespace-identifier production from
-	/// RFC 8141.
+	/// The NID production of RFC 8141 § 2 is
+	/// `(alphanum) 0*30(ldh) (alphanum)`, so a valid NID meets these rules:
+	///
+	/// - It holds 2 to 32 ASCII letters, digits, and hyphens.
+	/// - Its last character is a letter or a digit.
+	/// - Its first character is a letter. The RFC also admits a digit, so this rule is the house's own.
+	///
+	/// # Errors
+	///
+	/// - [`UrnValidationError::InvalidNidLength`] -- `nid` is shorter than 2 or longer than 32 characters.
+	/// - [`UrnValidationError::InvalidNidStart`] -- the first character of `nid` is no letter.
+	/// - [`UrnValidationError::InvalidNidCharacters`] -- a character of `nid`
+	///   is no letter, digit, or hyphen, or `nid` ends with a hyphen.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::urn::{Urn, UrnValidationError};
+	///
+	/// assert_eq!(Urn::validate_nid("my-namespace"), Ok(()));
+	/// assert_eq!(Urn::validate_nid("namespace-"), Err(UrnValidationError::InvalidNidCharacters));
+	/// ```
 	pub const fn validate_nid(nid: &str) -> Result<(), UrnValidationError> {
-		// Byte-wise because `str::chars` is not available in a `const fn`.
+		// The check walks bytes, because a `const fn` cannot call `str::chars`.
 		// The production is ASCII, so bytes and characters agree here.
 		let bytes = nid.as_bytes();
 		if bytes.len() < 2 || bytes.len() > 32 {
 			return Err(UrnValidationError::InvalidNidLength);
 		}
 
-		if !bytes[0].is_ascii_alphabetic() {
+		let [first, middle @ .., last] = bytes else {
+			return Err(UrnValidationError::InvalidNidLength);
+		};
+		if !first.is_ascii_alphabetic() {
 			return Err(UrnValidationError::InvalidNidStart);
 		}
+		if !last.is_ascii_alphanumeric() {
+			return Err(UrnValidationError::InvalidNidCharacters);
+		}
 
-		let mut index = 1;
-		while index < bytes.len() {
-			let byte = bytes[index];
-			if !byte.is_ascii_alphanumeric() && byte != b'-' {
+		let mut remaining = middle;
+		while let [byte, after @ ..] = remaining {
+			if !byte.is_ascii_alphanumeric() && *byte != b'-' {
 				return Err(UrnValidationError::InvalidNidCharacters);
 			}
 
-			index += 1;
+			remaining = after;
 		}
 
 		Ok(())
@@ -188,12 +211,12 @@ impl<'a> Urn<'a> {
 
 	/// Validate a Namespace-Specific String.
 	///
-	/// RFC 8141 s2 requires at least one NSS character: `urn:nid:` names
+	/// RFC 8141 § 2 requires at least one NSS character: `urn:nid:` names
 	/// nothing, and an empty NSS would collide with every other empty one.
 	///
 	/// # Errors
 	///
-	/// - [`UrnValidationError::RequiredFieldMissing`] when `nss` is empty.
+	/// - [`UrnValidationError::RequiredFieldMissing`] -- `nss` is empty.
 	pub const fn validate_nss(nss: &str) -> Result<(), UrnValidationError> {
 		if nss.is_empty() {
 			return Err(UrnValidationError::RequiredFieldMissing("nss"));
@@ -206,7 +229,7 @@ impl<'a> Urn<'a> {
 	///
 	/// [`urn!`](crate::urn!) checks literals in const context. Every other
 	/// constructor, the parser and the builder included, comes through here,
-	/// so no path can produce a URN the constructors would refuse.
+	/// so every URN built at run time passes the same checks.
 	pub(super) fn checked(nid: Cow<'a, str>, nss: Cow<'a, str>) -> Result<Urn<'a>, UrnValidationError> {
 		Self::validate_nid(&nid)?;
 		Self::validate_nss(&nss)?;
@@ -214,11 +237,10 @@ impl<'a> Urn<'a> {
 		Ok(Urn { nid, nss })
 	}
 
-	/// Convert the URN to an owned version with 'static lifetime
+	/// Convert the URN to an owned version with the `'static` lifetime.
 	///
-	/// This converts borrowed strings to owned strings, allowing the URN to
-	/// outlive its original data sources. This is similar to
-	/// `Cow::into_owned()`.
+	/// The borrowed strings become owned strings, so the URN can outlive the
+	/// data it borrowed, as with `Cow::into_owned()`.
 	#[inline]
 	pub fn into_owned(self) -> Urn<'static> {
 		Urn { nid: Cow::Owned(self.nid.into_owned()), nss: Cow::Owned(self.nss.into_owned()) }
@@ -243,7 +265,6 @@ impl FromStr for Urn<'static> {
 	}
 }
 
-// DER serialization: Urn is encoded as a UTF8String containing "urn:nid:nss"
 impl<'a> FixedTag for Urn<'a> {
 	const TAG: Tag = Tag::Utf8String;
 }
@@ -251,13 +272,13 @@ impl<'a> FixedTag for Urn<'a> {
 impl<'a> EncodeValue for Urn<'a> {
 	fn value_len(&self) -> crate::der::Result<crate::der::Length> {
 		// "urn:" (4) + nid + ":" (1) + nss
-		let total_len = 4 + self.nid.len() + 1 + self.nss.len();
-		crate::der::Length::try_from(total_len)
+		let separators = crate::der::Length::new(5);
+		(separators + self.nid.len())? + self.nss.len()
 	}
 
 	fn encode_value(&self, encoder: &mut impl crate::der::Writer) -> crate::der::Result<()> {
-		// Manually write "urn:nid:nss" without format!() for no_std
-		// compatibility
+		// The writes put out "urn:nid:nss" part by part, without `format!()`,
+		// for no_std compatibility.
 		encoder.write(b"urn:")?;
 		encoder.write(self.nid.as_bytes())?;
 		encoder.write(b":")?;
@@ -284,32 +305,38 @@ impl<'a> DecodeValue<'a> for Urn<'static> {
 mod tests {
 	use super::*;
 
+	/// Each NID beside the outcome of the NID production of RFC 8141 § 2,
+	/// `(alphanum) 0*30(ldh) (alphanum)`, and of the house rule of a letter
+	/// first.
+	const NID_CASES: [(&str, Result<(), UrnValidationError>); 15] = [
+		// The two `alphanum` ends alone give the shortest NID.
+		("ab", Ok(())),
+		("a", Err(UrnValidationError::InvalidNidLength)),
+		("", Err(UrnValidationError::InvalidNidLength)),
+		// Two ends and 30 `ldh` give the longest NID.
+		("a123456789012345678901234567890b", Ok(())),
+		("a1234567890123456789012345678901b", Err(UrnValidationError::InvalidNidLength)),
+		// An `ldh` is a letter, a digit, or a hyphen, and hyphens may repeat.
+		("my-namespace", Ok(())),
+		("a--b", Ok(())),
+		("a_b", Err(UrnValidationError::InvalidNidCharacters)),
+		("a.b", Err(UrnValidationError::InvalidNidCharacters)),
+		("a\u{e9}b", Err(UrnValidationError::InvalidNidCharacters)),
+		// The last character is an `alphanum`.
+		("a9", Ok(())),
+		("ab-", Err(UrnValidationError::InvalidNidCharacters)),
+		// The first character is an `alphanum`, of either case.
+		("Ab", Ok(())),
+		("-ab", Err(UrnValidationError::InvalidNidStart)),
+		// The house rule refuses the digit first that the RFC admits.
+		("1ab", Err(UrnValidationError::InvalidNidStart)),
+	];
+
 	#[test]
-	fn test_urn_nid_validation() {
-		// Valid NIDs
-		let valid_cases: &[&str] = &["ab", "tightbeam", "isbn", "a123", "my-namespace"];
-		for nid in valid_cases {
-			assert!(Urn::validate_nid(nid).is_ok());
-		}
+	fn validate_nid_follows_the_rfc_8141_production() {
+		let outcomes = NID_CASES.map(|(nid, _)| (nid, Urn::validate_nid(nid)));
 
-		// Invalid NIDs - too short
-		assert!(Urn::validate_nid("a").is_err());
-
-		// Invalid NIDs - too long
-		let too_long = "a".repeat(33);
-		assert!(Urn::validate_nid(&too_long).is_err());
-
-		// Invalid NIDs - doesn't start with letter
-		let invalid_start: &[&str] = &["1abc", "-abc"];
-		for nid in invalid_start {
-			assert!(Urn::validate_nid(nid).is_err());
-		}
-
-		// Invalid NIDs - invalid characters
-		let invalid_chars: &[&str] = &["ab_cd", "ab.cd"];
-		for nid in invalid_chars {
-			assert!(Urn::validate_nid(nid).is_err());
-		}
+		assert_eq!(outcomes, NID_CASES);
 	}
 
 	#[test]

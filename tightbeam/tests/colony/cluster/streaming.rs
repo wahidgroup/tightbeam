@@ -151,14 +151,13 @@ async fn start_spliced_clusters(
 
 	hive.register_with_cluster(exporter.addr()).await?;
 
-	let learned = wait_for_peer_types(&importer, 50, Duration::from_millis(100)).await;
+	let learned = wait_for_peer_types(trace, &importer, 50, Duration::from_millis(100)).await;
 	trace.event_with(PEER_ROUTES_AFTER_INSTALLS, &[], learned.len() as u64)?;
 
 	Ok((importer, exporter))
 }
 
-/// Polls until the servlet-side cancel probe reports or the attempts run
-/// out.
+/// Polls until the servlet-side cancel probe reports or the attempts run out.
 async fn wait_for_cancel_probe(attempts: u32, interval: Duration) -> bool {
 	poll_until(attempts, interval, || DUPLEX_CANCEL_SEEN.load(Ordering::SeqCst)).await
 }
@@ -471,7 +470,7 @@ tb_scenario! {
 
 			let mut control = connect_cluster(&certs, cluster.addr()).await?;
 			let hive_addr = b"127.0.0.1:65034";
-			let servlets = [servlet_info("stream-echo", impostor.addr().to_string())];
+			let servlets = [servlet_info(&certs, "stream-echo", impostor.addr().to_string())];
 			let registered =
 				register_signed_hive_serving(&mut control, &certs.key, b"impostor", hive_addr, servlets).await?;
 			trace.event_with(REGISTER_STATUS, &[], registered.status)?;

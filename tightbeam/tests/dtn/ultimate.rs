@@ -14,7 +14,7 @@
 //!
 //! - Realistic NASA-inspired rover telemetry (APXS, ChemCam, Mastcam)
 //! - Simulated mission clock with realistic Mars-Earth delays
-//! - Cryptographic chain validation using previous_frame hash chains
+//! - Cryptographic chain validation over `previous_frame` hash chains
 //! - Matrix bit field for rover fault flags
 //! - Graceful fault handling: low power, then recharge, then resume
 //! - Cascading gap recovery
@@ -35,7 +35,6 @@
 //! | Telemetry | Earth Relay forwards | T+12.5min |
 //! | Telemetry | Mission Control receives it and sends the next command | T+13min |
 
-use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -75,8 +74,8 @@ use crate::dtn::messages::RoverInstrument;
 
 /// Gap-recovery steps shared by servlets and workers.
 ///
-/// Dynamic `node_name` call sites resolve through this enum onto the URN
-/// inventory above, so event identity stays URN-only.
+/// Call sites with a dynamic `node_name` resolve through this enum to the URN
+/// constants of `dtn::events`, so event identity stays URN-only.
 #[derive(Clone, Copy)]
 pub(crate) enum GapRecoveryStep {
 	GapDetected,
@@ -160,7 +159,7 @@ use crate::dtn::{
 		MarsRelaySatelliteServletConfig, MissionControlServlet, MissionControlServletConfig, MissionState,
 		RoverServlet, RoverServletConfig,
 	},
-	storage::FrameStore,
+	storage::{FrameStore, StorageRoot},
 	workers::{
 		CommandAckHandlerWorker, CommandExecutionWorker, FrameRequestHandlerWorker, FrameRequestHandlerWorkerConfig,
 		FrameResponseHandlerWorker, FrameResponseHandlerWorkerConfig, MissionControlTelemetryHandlerWorker,
@@ -216,13 +215,26 @@ pub struct DtnScenarioConfig {
 	pub _earth_relay_servlet: RwLock<Option<EarthRelaySatelliteServlet>>,
 	/// The Mars relay servlet, held to keep it alive for the test.
 	pub _mars_relay_servlet: RwLock<Option<MarsRelaySatelliteServlet>>,
+
+	/// Storage root of every node's frame store, which this scenario owns
+	/// alone. [`Drop`] removes it after it stops the servlets that write into
+	/// it.
+	storage: Option<StorageRoot>,
+}
+
+impl DtnScenarioConfig {
+	/// The storage root that every node's frame store sits in.
+	fn storage(&self) -> &StorageRoot {
+		self.storage.as_ref().expect("the storage root lives until the scenario drops")
+	}
 }
 
 impl Default for DtnScenarioConfig {
 	fn default() -> Self {
+		let storage = StorageRoot::create().expect("Failed to create the storage root");
 		// The rover's chain processor shares this frame store.
 		let rover_store = Arc::new(RwLock::new(
-			FrameStore::new(PathBuf::from("temp/dtn/rover")).expect("Failed to create rover storage"),
+			FrameStore::new(storage.node("rover")).expect("Failed to create rover storage"),
 		));
 
 		let rover_key_bytes = match ROVER_KEY {
@@ -260,6 +272,7 @@ impl Default for DtnScenarioConfig {
 			_mission_control_servlet: RwLock::new(None),
 			_earth_relay_servlet: RwLock::new(None),
 			_mars_relay_servlet: RwLock::new(None),
+			storage: Some(storage),
 		}
 	}
 }
@@ -271,12 +284,9 @@ impl Drop for DtnScenarioConfig {
 		self._earth_relay_servlet.write().ok().and_then(|mut g| g.take());
 		self._mars_relay_servlet.write().ok().and_then(|mut g| g.take());
 
-		// The cleanup is best effort, because `drop` returns `()`.
-		let _ = std::fs::remove_dir_all("temp/dtn/rover");
-		let _ = std::fs::remove_dir_all("temp/dtn/mission_control");
-		let _ = std::fs::remove_dir_all("temp/dtn/earth_relay");
-		let _ = std::fs::remove_dir_all("temp/dtn/mars_relay");
-		let _ = std::fs::remove_dir_all("temp/dtn");
+		// The servlets write into the storage tree, so the tree goes after
+		// them.
+		drop(self.storage.take());
 	}
 }
 
@@ -768,7 +778,7 @@ tb_scenario! {
 			};
 			let mission_control_signing_key = Secp256k1SigningKey::from_slice(mc_key_bytes)?;
 			let mc_store = Arc::new(RwLock::new(
-				FrameStore::new(PathBuf::from("temp/dtn/mission_control"))?,
+				FrameStore::new(config.storage().node("mission_control"))?,
 			));
 			let mc_processor = Arc::new(ChainProcessor::new(
 				Arc::clone(&mc_store),
@@ -780,7 +790,7 @@ tb_scenario! {
 			// The Earth relay gets a store, a chain processor, and a
 			// frame builder.
 			let earth_relay_store = Arc::new(RwLock::new(
-				FrameStore::new(PathBuf::from("temp/dtn/earth_relay"))?,
+				FrameStore::new(config.storage().node("earth_relay"))?,
 			));
 			let earth_relay_processor = Arc::new(ChainProcessor::new(
 				Arc::clone(&earth_relay_store),
@@ -792,7 +802,7 @@ tb_scenario! {
 			// The Mars relay gets a store, a chain processor, and a
 			// frame builder.
 			let mars_relay_store = Arc::new(RwLock::new(
-				FrameStore::new(PathBuf::from("temp/dtn/mars_relay"))?,
+				FrameStore::new(config.storage().node("mars_relay"))?,
 			));
 			let mars_relay_processor = Arc::new(ChainProcessor::new(
 				Arc::clone(&mars_relay_store),
@@ -804,8 +814,8 @@ tb_scenario! {
 			// The rover's frame builder runs over the processor from `Default`.
 			let rover_frame_builder = Arc::new(FrameBuilderHelper::new(Arc::clone(&rover_processor)));
 
-			// Relay pools dial each destination over TLS with mutual
-			// authentication, holding at most 3 connections per destination.
+			// Every pool dials its destination over TLS with mutual
+			// authentication and holds at most 3 connections per destination.
 			let pool_config = PoolConfig { max_connections: 3, ..PoolConfig::default() };
 
 			// Mission Control dials the Earth relay through this pool.
@@ -851,7 +861,7 @@ tb_scenario! {
 				.build());
 
 
-			// 1. Start the rover servlet
+			// 1. Start the rover servlet.
 			let rover_fault_manager = Arc::new(FaultManager::from_refs(
 				&config.bms,
 				&config.fault_matrix,
@@ -906,7 +916,7 @@ tb_scenario! {
 			config.rover_addr.write()?.replace(rover_addr);
 
 
-			// 2. Start the Mars relay servlet
+			// 2. Start the Mars relay servlet.
 			let mars_relay_key_bytes = match MARS_RELAY_KEY {
 				SigningKeySpec::Bytes(bytes) => bytes,
 				_ => panic!("MARS_RELAY_KEY must be KeySpec::Bytes"),
@@ -956,7 +966,7 @@ tb_scenario! {
 			config.mars_relay_addr.write()?.replace(mars_relay_addr);
 
 
-			// 3. Start the Earth relay servlet
+			// 3. Start the Earth relay servlet.
 			let earth_relay_key_bytes = match EARTH_RELAY_KEY {
 				SigningKeySpec::Bytes(bytes) => bytes,
 				_ => panic!("EARTH_RELAY_KEY must be KeySpec::Bytes"),
@@ -1006,7 +1016,7 @@ tb_scenario! {
 			config.earth_relay_addr.write()?.replace(earth_relay_addr);
 
 
-			// 4. Start the Mission Control servlet
+			// 4. Start the Mission Control servlet.
 			let mc_config = MissionControlServletConfig {
 				mission_control_signing_key: mission_control_signing_key.to_owned(),
 				rover_signer: rover_signer_val.to_owned(),
@@ -1054,12 +1064,12 @@ tb_scenario! {
 			config.mission_control_addr.write()?.replace(mc_addr);
 
 
-			// 5. Initialize the mission clock
+			// 5. Initialize the mission clock.
 			init_mission_clock();
 			trace.event(MISSION_START)?;
 
 
-			// 6. Send the initial command from Mission Control
+			// 6. Send the initial command from Mission Control.
 			{
 				let initial_cmd = RoverCommand::ProbeLocation { x: 100, y: 200 };
 				let (next_order, previous_digest) = mc_processor.prepare_outgoing()?;

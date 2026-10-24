@@ -12,10 +12,16 @@ use futures::channel::mpsc;
 use futures::Stream;
 
 use super::handle::CancelOnDrop;
+use super::reassembly::{Reassembly, ReassemblyBudget};
 use super::shared::OpenSlot;
 use crate::der::Decode;
 use crate::transport::{TransportError, TransportResult};
 use crate::Frame;
+
+#[cfg(doc)]
+use crate::constants::MAX_MUX_REASSEMBLY_BYTES;
+#[cfg(doc)]
+use crate::transport::TransportFailure;
 
 #[cfg(feature = "colony")]
 use super::sink::RequestSink;
@@ -79,6 +85,9 @@ pub struct StreamBody {
 	/// Armed only on locally-initiated duplex replies: abandoning the reply
 	/// must reclaim the stream like abandoning a response future does.
 	guard: Option<CancelOnDrop>,
+	/// The reassembly budget of the connection, which a collect of the body
+	/// charges as the unary reassembly of the reader does.
+	budget: Arc<ReassemblyBudget>,
 }
 
 impl StreamBody {
@@ -87,8 +96,14 @@ impl StreamBody {
 	///
 	/// Channel capacity covers the grant window plus the `End` marker. The
 	/// reader clamps streaming grants to `consumed + window`, so a conforming
-	/// peer always fits in the channel.
-	pub(crate) fn pair(slot: Arc<OpenSlot>, window: u64, drained: mpsc::Sender<DrainNote>) -> (Self, ForwardedStream) {
+	/// peer always fits in the channel. A collect of the body charges
+	/// `budget`, the reassembly budget of the connection.
+	pub(crate) fn pair(
+		slot: Arc<OpenSlot>,
+		window: u64,
+		drained: mpsc::Sender<DrainNote>,
+		budget: Arc<ReassemblyBudget>,
+	) -> (Self, ForwardedStream) {
 		let capacity = usize::try_from(window).unwrap_or(usize::MAX).saturating_add(1);
 		let (events, receiver) = mpsc::channel(capacity);
 
@@ -100,6 +115,7 @@ impl StreamBody {
 			consumed: 0,
 			finished: false,
 			guard: None,
+			budget,
 		};
 		let forwarder = ForwardedStream { events, received: 0, limit: window, window };
 		(body, forwarder)
@@ -113,7 +129,7 @@ impl StreamBody {
 	///
 	/// # Errors
 	///
-	/// Returns the first read or push failure and leaves the sink unclosed.
+	/// - The first read or push failure, which leaves the sink unclosed.
 	#[cfg(feature = "colony")]
 	pub(crate) async fn drain_into(mut self, mut sink: RequestSink) -> TransportResult<()> {
 		while let Some(chunk) = self.chunk().await? {
@@ -150,16 +166,44 @@ impl StreamBody {
 	/// body. Drain reports flow per chunk exactly as with
 	/// [`chunk`](Self::chunk), so credit replenishment is identical.
 	///
+	/// The chunks reassemble under the bounds of a unary reassembly, so a peer
+	/// stream reassembles to one bound on either path (CWE-770).
+	///
 	/// # Errors
 	///
-	/// The same set as [`chunk`](Self::chunk).
+	/// - The errors of [`chunk`](Self::chunk).
+	/// - [`TransportError::OperationFailed`] with
+	///   [`TransportFailure::SizeExceeded`] -- the chunks pass
+	///   [`MAX_MUX_REASSEMBLY_BYTES`], or the reassembly budget of the
+	///   connection.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::policy::TransitStatus;
+	/// use tightbeam::transport::multiplex::StreamBody;
+	/// use tightbeam::transport::{ResponsePackage, TransportError, TransportFailure, TransportResult};
+	///
+	/// /// Answer a streamed upload once its body is whole. A body past the
+	/// /// reassembly ceiling is the peer's to shrink, so it reads
+	/// /// `ResourceExhausted`.
+	/// async fn upload(body: StreamBody) -> TransportResult<ResponsePackage> {
+	///     match body.into_bytes().await {
+	///         Ok(_bytes) => Ok(ResponsePackage::new(TransitStatus::Ok, None)),
+	///         Err(TransportError::OperationFailed(TransportFailure::SizeExceeded)) => {
+	///             Ok(ResponsePackage::new(TransitStatus::ResourceExhausted, None))
+	///         }
+	///         Err(other) => Err(other),
+	///     }
+	/// }
+	/// ```
 	pub async fn into_bytes(mut self) -> TransportResult<Vec<u8>> {
-		let mut bytes = Vec::new();
+		let mut collected = Reassembly::new(Arc::clone(&self.budget));
 		while let Some(chunk) = self.chunk().await? {
-			bytes.extend_from_slice(&chunk);
+			collected.append(chunk)?;
 		}
 
-		Ok(bytes)
+		Ok(collected.into_bytes())
 	}
 
 	/// Collect the remaining chunks and decode them as one DER
@@ -167,8 +211,26 @@ impl StreamBody {
 	///
 	/// # Errors
 	///
-	/// - The [`chunk`](Self::chunk) set, while the body drains.
+	/// - The errors of [`chunk`](Self::chunk), while the body drains.
+	/// - [`TransportError::OperationFailed`] with
+	///   [`TransportFailure::SizeExceeded`] -- the chunks pass
+	///   [`MAX_MUX_REASSEMBLY_BYTES`], or the reassembly budget of the
+	///   connection.
 	/// - [`TransportError::DerError`] -- the collected bytes are not a DER frame.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::policy::TransitStatus;
+	/// use tightbeam::transport::multiplex::StreamBody;
+	/// use tightbeam::transport::{ResponsePackage, TransportResult};
+	///
+	/// /// Echo the frame a peer streamed, once its chunks are whole.
+	/// async fn echo(body: StreamBody) -> TransportResult<ResponsePackage> {
+	///     let frame = body.into_frame().await?;
+	///     Ok(ResponsePackage::new(TransitStatus::Ok, Some(frame)))
+	/// }
+	/// ```
 	pub async fn into_frame(self) -> TransportResult<Frame> {
 		let bytes = self.into_bytes().await?;
 		Frame::from_der(&bytes).map_err(TransportError::DerError)
@@ -287,7 +349,8 @@ impl ForwardedStream {
 
 	/// Raise the granted limit.
 	///
-	/// Grants are absolute and monotonic, so a stale lower value is ignored.
+	/// Grants are absolute and monotonic, so the call ignores a stale lower
+	/// value.
 	///
 	/// # Sources
 	///
@@ -348,10 +411,42 @@ impl ForwardedStream {
 mod tests {
 	use core::task::Poll;
 
-	use super::super::testing::{body_fixture, noop_cx, poll_now, FlagWake};
+	use super::super::testing::{body_fixture, budgeted_body_fixture, noop_cx, poll_now, FlagWake};
 	use super::*;
+	use crate::constants::MAX_MUX_REASSEMBLY_BYTES;
 	use crate::der::Encode;
 	use crate::testing::TestFrame;
+	use crate::transport::TransportFailure;
+
+	/// The length of each chunk of the bodies that meet the reassembly
+	/// ceiling.
+	const CEILING_CHUNK_LEN: usize = 64 * 1024;
+
+	/// The chunks of [`CEILING_CHUNK_LEN`] octets that fill the reassembly
+	/// ceiling exactly.
+	const CEILING_CHUNKS: usize = MAX_MUX_REASSEMBLY_BYTES / CEILING_CHUNK_LEN;
+
+	/// A body whose forwarder carried `count` chunks of [`CEILING_CHUNK_LEN`]
+	/// octets and then its end, beside the drain notes it reports.
+	fn forwarded_body(count: usize) -> (StreamBody, mpsc::Receiver<DrainNote>) {
+		let window = u64::try_from(count).expect("a chunk count fits u64");
+		let (body, mut forwarder, notes) = body_fixture(7, window);
+		let chunk = vec![0xAB; CEILING_CHUNK_LEN];
+		let forwarded = (0..count).all(|_| forwarder.accept_and_forward(&chunk));
+		let ended = forwarder.forward(BodyEvent::End);
+		assert!(forwarded && ended, "the window carries every chunk and the end");
+		(body, notes)
+	}
+
+	/// A body over `budget` whose forwarder carried two chunks of 100 octets
+	/// and then its end.
+	fn two_chunk_body(budget: Arc<ReassemblyBudget>) -> StreamBody {
+		let (body, mut forwarder, _notes) = budgeted_body_fixture(7, 4, budget);
+		let forwarded = (0..2).all(|_| forwarder.accept_and_forward([0xAB; 100]));
+		let ended = forwarder.forward(BodyEvent::End);
+		assert!(forwarded && ended, "the window carries both chunks and the end");
+		body
+	}
 
 	#[test]
 	fn test_stream_body_yields_chunks_and_reports_drain() {
@@ -484,6 +579,36 @@ mod tests {
 		assert!(matches!(decoded, Poll::Ready(Ok(decoded)) if decoded == frame));
 
 		Ok(())
+	}
+
+	#[test]
+	fn a_body_at_the_reassembly_ceiling_is_collected() {
+		let (body, _notes) = forwarded_body(CEILING_CHUNKS);
+
+		let collected = poll_now(body.into_bytes());
+		assert!(matches!(collected, Poll::Ready(Ok(bytes)) if bytes.len() == MAX_MUX_REASSEMBLY_BYTES));
+	}
+
+	/// A peer stream reassembles to the bound of a unary reassembly, so one
+	/// chunk past it refuses the body.
+	#[test]
+	fn a_body_past_the_reassembly_ceiling_is_refused() {
+		let (body, _notes) = forwarded_body(CEILING_CHUNKS + 1);
+		let oversize = TransportFailure::SizeExceeded;
+
+		let collected = poll_now(body.into_bytes());
+		assert!(matches!(collected, Poll::Ready(Err(TransportError::OperationFailed(failure))) if failure == oversize));
+	}
+
+	/// A body charges the reassembly budget of its connection as it collects,
+	/// so a body inside its own ceiling is refused past the budget.
+	#[test]
+	fn a_body_past_the_connection_budget_is_refused() {
+		let body = two_chunk_body(Arc::new(ReassemblyBudget::with_ceiling(128)));
+		let oversize = TransportFailure::SizeExceeded;
+
+		let collected = poll_now(body.into_bytes());
+		assert!(matches!(collected, Poll::Ready(Err(TransportError::OperationFailed(failure))) if failure == oversize));
 	}
 
 	#[test]

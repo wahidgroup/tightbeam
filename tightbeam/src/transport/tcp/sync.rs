@@ -41,9 +41,9 @@ use crate::transport::{EnvelopeBuilder, ProtocolStream};
 crate::impl_tcp_common!(TcpTransport, ProtocolStream);
 
 /// Slice sizes for deadline-bounded content reads. The stream timeout is
-/// per-recv (SO_RCVTIMEO), so the absolute budget is only re-checked between
-/// slices: the worst-case overrun past the deadline is one slice of
-/// per-recv resets.
+/// per-recv (SO_RCVTIMEO), so the read re-checks the absolute budget only
+/// between slices, and the worst-case overrun past the deadline is one slice
+/// of per-recv resets.
 #[cfg(feature = "std")]
 const HANDSHAKE_READ_SLICE: usize = 64;
 #[cfg(feature = "std")]
@@ -139,15 +139,10 @@ where
 						ESTABLISHED_READ_SLICE
 					};
 
-					let mut filled = 0;
-					while filled < content_length {
+					for slice in content.chunks_mut(slice_len) {
 						self.arm_read_deadline(&policy)?;
 
-						let end = usize::min(filled + slice_len, content_length);
-						self.stream
-							.read_exact(&mut content[filled..end])
-							.map_err(|e| (e.into()).inside_frame())?;
-						filled = end;
+						self.stream.read_exact(slice).map_err(|e| (e.into()).inside_frame())?;
 					}
 				} else {
 					self.stream.read_exact(&mut content).map_err(|e| (e.into()).inside_frame())?;

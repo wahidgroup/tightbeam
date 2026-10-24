@@ -7,7 +7,8 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use crate::der::asn1::ObjectIdentifier;
-use crate::der::Sequence;
+use crate::der::TagNumber;
+use crate::wire::wire_sequence;
 
 #[cfg(feature = "aead")]
 use crate::crypto::aead::AeadAlgorithm;
@@ -37,10 +38,10 @@ use crate::crypto::common::BlockSizeUser;
 	feature = "digest"
 ))]
 use crate::crypto::common::KeySizeUser;
-#[cfg(feature = "digest")]
-use crate::crypto::hash::Digest;
 #[cfg(all(feature = "digest", feature = "sha3"))]
 use crate::crypto::hash::Sha3_256;
+#[cfg(feature = "digest")]
+use crate::crypto::hash::{CoreProxy, Digest, HashCore};
 #[cfg(feature = "kdf")]
 use crate::crypto::kdf::{HkdfSha3_256, KdfFunction};
 #[cfg(feature = "aead")]
@@ -118,7 +119,7 @@ macro_rules! impl_aes_key_wrap {
 				}
 
 				// A wrapped key of n + 1 blocks holds n (RFC 3394 §2.2.2), so
-				// the size of `out` is checked before the key schedule runs.
+				// the size of `out` must match before the key schedule runs.
 				let key_len = wrapped.len().saturating_sub(8);
 				if out.len() != key_len {
 					return Err(KeyError::WrapLength((out.len(), key_len).into()));
@@ -157,27 +158,30 @@ fn stack_kek<N: ArrayLength<u8>>(kek: &[u8]) -> Result<Zeroizing<GenericArray<u8
 /// field even when an earlier algorithm is absent.
 ///
 /// The AEAD OID names the cipher, and the cipher type fixes the key length.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Sequence, Beamable)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Beamable)]
 pub struct SecurityProfileDesc {
 	/// OID of the digest algorithm that the profile negotiates.
-	#[asn1(context_specific = "0", optional = "true")]
 	pub digest: Option<ObjectIdentifier>,
 	/// OID of the AEAD algorithm that the profile negotiates.
-	#[asn1(context_specific = "1", optional = "true")]
 	pub aead: Option<ObjectIdentifier>,
 	/// OID of the signature algorithm that the profile negotiates.
-	#[asn1(context_specific = "2", optional = "true")]
 	pub signature: Option<ObjectIdentifier>,
 	/// OID of the key derivation function that the profile negotiates.
-	#[asn1(context_specific = "3", optional = "true")]
 	pub kdf: Option<ObjectIdentifier>,
 	/// OID of the elliptic curve for key agreement.
-	#[asn1(context_specific = "4", optional = "true")]
 	pub curve: Option<ObjectIdentifier>,
 	/// OID of the key-wrap algorithm that the profile negotiates.
-	#[asn1(context_specific = "5", optional = "true")]
 	pub key_wrap: Option<ObjectIdentifier>,
 }
+
+wire_sequence!(SecurityProfileDesc {
+	digest: ctx(TagNumber::N0),
+	aead: ctx(TagNumber::N1),
+	signature: ctx(TagNumber::N2),
+	kdf: ctx(TagNumber::N3),
+	curve: ctx(TagNumber::N4),
+	key_wrap: ctx(TagNumber::N5),
+});
 
 impl<P: SecurityProfile> From<&P> for SecurityProfileDesc {
 	fn from(_p: &P) -> Self {
@@ -259,13 +263,20 @@ pub trait SecurityProfile {
 /// names its block size, which HMAC keys over.
 #[cfg(feature = "digest")]
 pub trait DigestProvider {
-	type Digest: Digest + AssociatedOid + BlockSizeUser + Clone + Default + Send + Sync;
+	/// Digest algorithm, whose core the keyed hashes of the key schedule
+	/// drive with a buffer of their own ([`HashCore`]).
+	///
+	/// The contract of the core is to wipe its state on drop: an HMAC over
+	/// the core holds the key XOR `ipad` in that state (RFC 2104 § 2,
+	/// NIST SP 800-56C Rev. 2 § 5.1). The house SHA3 cores hold it, which
+	/// `crypto::hash` asserts at compile time.
+	type Digest: Digest + AssociatedOid + BlockSizeUser + CoreProxy<Core: HashCore> + Clone + Default + Send + Sync;
 
 	fn to_digest_algorithm_identifier(&self) -> AlgorithmIdentifierOwned {
 		AlgorithmIdentifierOwned { oid: <Self::Digest as AssociatedOid>::OID, parameters: None }
 	}
 
-	/// Convert this provider into a Digestor function.
+	/// A one-shot `Digestor` that digests its input under `Self::Digest`.
 	fn as_digestor<E>(&self) -> Digestor<E>
 	where
 		E: From<crate::TightBeamError>,
@@ -309,7 +320,8 @@ pub trait KeyWrapAlgorithm {
 	///
 	/// # Errors
 	///
-	/// - [`KeyError::WrapLength`] -- `kek` is another size, or `key` is no whole number of 64-bit blocks.
+	/// - [`KeyError::WrapLength`] -- `kek` is another size, or `key` is shorter
+	///   than two 64-bit blocks or no whole number of them.
 	/// - [`KeyError::WrapFailed`] -- the wrap refused the key.
 	fn wrap(kek: &[u8], key: &[u8]) -> Result<Vec<u8>, KeyError>;
 
@@ -330,7 +342,7 @@ pub trait KeyWrapAlgorithm {
 	///
 	/// # Errors
 	///
-	/// - The [`Self::unwrap`] set.
+	/// - The errors of [`Self::unwrap`].
 	/// - [`KeyError::WrapLength`] -- `out` is another size than the unwrapped key.
 	fn unwrap_into(kek: &[u8], wrapped: &[u8], out: &mut [u8]) -> Result<(), KeyError> {
 		let key = Self::unwrap(kek, wrapped)?;

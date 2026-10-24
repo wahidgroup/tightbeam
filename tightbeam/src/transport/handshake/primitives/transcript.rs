@@ -63,7 +63,9 @@ impl DigestOutput {
 		}
 
 		let mut bytes = [0u8; MAX_DIGEST_OUTPUT_LEN];
-		bytes[..received].copy_from_slice(output);
+		for (slot, octet) in bytes.iter_mut().zip(output) {
+			*slot = *octet;
+		}
 		Ok(Self { bytes, len: received })
 	}
 
@@ -82,6 +84,10 @@ impl DigestOutput {
 	}
 
 	/// The output bytes.
+	#[expect(
+		clippy::indexing_slicing,
+		reason = "`parse` holds `len` to 32..=64, within the 64 octets of `bytes`"
+	)]
 	pub(crate) fn as_bytes(&self) -> &[u8] {
 		&self.bytes[..self.len]
 	}
