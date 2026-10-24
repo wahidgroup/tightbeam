@@ -192,6 +192,7 @@ mod error;
 mod identity;
 mod peer;
 mod schedule;
+mod session_peer;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 mod flow;
@@ -212,6 +213,7 @@ pub use error::HandshakeError;
 pub use identity::ServerIdentity;
 pub use peer::PeerAuthentication;
 pub use schedule::EpochMaterials;
+pub(crate) use session_peer::SessionPeer;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub use flow::{ClientFlow, ServerFlow};
@@ -231,6 +233,8 @@ pub(crate) use peer::AdmittedPeer;
 pub use peer::LearnedTrust;
 #[cfg(feature = "transport-cms")]
 pub use peer::ProvisionedTrust;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+pub(crate) use peer::ValidatorChain;
 #[cfg(all(
 	feature = "transport-multiplex",
 	any(feature = "transport-cms", feature = "transport-hpke")
@@ -570,68 +574,6 @@ impl TryFrom<ContentInfo> for HandshakeMessage {
 	}
 }
 
-/// The peer a session recorded: the certificate the handshake validated,
-/// and for a CMS server the key-agreement certificate the admission paired
-/// with it.
-///
-/// Its fields are private to this module, so a key-agreement certificate
-/// travels only beside the signing certificate it was paired with.
-#[derive(Clone)]
-pub(crate) struct SessionPeer {
-	/// The certificate the handshake validated: the client's under mutual
-	/// authentication, or the server's signing certificate.
-	certificate: Arc<Certificate>,
-	/// The key-agreement certificate of a CMS server, whose key a rekey's
-	/// server ephemeral must differ from, as the handshake's did.
-	#[cfg(all(
-		feature = "transport-multiplex",
-		any(feature = "transport-cms", feature = "transport-hpke")
-	))]
-	key_agreement: Option<Arc<Certificate>>,
-}
-
-/// A peer of one certificate: a client, or an HPKE server.
-impl From<Arc<Certificate>> for SessionPeer {
-	fn from(certificate: Arc<Certificate>) -> Self {
-		Self {
-			certificate,
-			#[cfg(all(
-				feature = "transport-multiplex",
-				any(feature = "transport-cms", feature = "transport-hpke")
-			))]
-			key_agreement: None,
-		}
-	}
-}
-
-impl SessionPeer {
-	/// A CMS server of `certificate`, its signing certificate, beside
-	/// `key_agreement`, the key-agreement certificate paired with it, for a
-	/// test that builds a session.
-	#[cfg(all(
-		test,
-		feature = "transport-multiplex",
-		any(feature = "transport-cms", feature = "transport-hpke")
-	))]
-	pub(crate) fn paired(certificate: Arc<Certificate>, key_agreement: Arc<Certificate>) -> Self {
-		Self { certificate, key_agreement: Some(key_agreement) }
-	}
-
-	/// The certificate the handshake validated.
-	pub(crate) fn certificate(&self) -> &Arc<Certificate> {
-		&self.certificate
-	}
-
-	/// The key-agreement certificate of a CMS server.
-	#[cfg(all(
-		feature = "transport-multiplex",
-		any(feature = "transport-cms", feature = "transport-hpke")
-	))]
-	pub(crate) fn key_agreement(&self) -> Option<&Certificate> {
-		self.key_agreement.as_deref()
-	}
-}
-
 /// What a completed handshake agreed, handed over in one value.
 ///
 /// A handshake settles the keys and the terms that go with them at the same
@@ -647,46 +589,105 @@ pub struct EstablishedSession {
 	mux: Option<MuxSettings>,
 	/// Dual-signed receipt from a budget-bearing handshake.
 	receipt: Option<Arc<StoredReceipt>>,
-	/// The peer the handshake validated.
-	peer: Option<SessionPeer>,
+	/// The peer the handshake validated, one record that each session context
+	/// of a gate shares.
+	peer: Option<Arc<SessionPeer>>,
 	/// Epoch-0 rekey materials, present exactly while a rekey could use them.
-	epoch: Option<EpochMaterials>,
-}
-
-impl EstablishedSession {
-	/// Assemble what one handshake agreed.
-	///
-	/// Epoch materials serve a rekey alone, and a rekey re-signs against the
-	/// session receipt and the peer identity. A session missing either can
-	/// never renew, so this constructor releases its epoch secret instead of
-	/// holding it, unreachable, for the life of the session.
-	#[cfg(any(test, feature = "transport-cms", feature = "transport-hpke"))]
-	pub(crate) fn new(
-		keys: SessionKeys,
-		mux: Option<MuxSettings>,
-		receipt: Option<Arc<StoredReceipt>>,
-		peer: Option<SessionPeer>,
-		epoch: Option<EpochMaterials>,
-	) -> Self {
-		let renewable = receipt.is_some() && peer.is_some();
-
-		let epoch = epoch.filter(|_| renewable);
-
-		Self { keys, mux, receipt, peer, epoch }
-	}
-
-	/// The peer the handshake validated, which a rekey renews against.
+	/// The mux rekey reads them, so the field exists in a build with it.
 	#[cfg(all(
 		feature = "transport-multiplex",
 		any(feature = "transport-cms", feature = "transport-hpke")
 	))]
-	pub(crate) fn session_peer(&self) -> Option<&SessionPeer> {
+	epoch: Option<EpochMaterials>,
+}
+
+impl EstablishedSession {
+	/// Assemble what one handshake agreed, with no epoch materials.
+	///
+	/// It is private to the handshake, whose completion records only a peer
+	/// that an admission built.
+	#[cfg(any(test, feature = "transport-cms", feature = "transport-hpke"))]
+	fn new(
+		keys: SessionKeys,
+		mux: Option<MuxSettings>,
+		receipt: Option<Arc<StoredReceipt>>,
+		peer: Option<SessionPeer>,
+	) -> Self {
+		let peer = peer.map(Arc::new);
+
+		Self {
+			keys,
+			mux,
+			receipt,
+			peer,
+			#[cfg(all(
+				feature = "transport-multiplex",
+				any(feature = "transport-cms", feature = "transport-hpke")
+			))]
+			epoch: None,
+		}
+	}
+
+	/// This session with `epoch`, the epoch-0 rekey materials, kept exactly
+	/// while a rekey could use them.
+	///
+	/// Epoch materials serve a rekey alone, and a rekey re-signs against the
+	/// session receipt and the peer identity. A session renews only when it
+	/// holds both, so this method treats the epoch secret in two ways:
+	///
+	/// - A session with a receipt and a peer keeps it.
+	/// - Every other session releases it at once.
+	#[cfg(all(
+		feature = "transport-multiplex",
+		any(feature = "transport-cms", feature = "transport-hpke")
+	))]
+	fn with_epoch(self, epoch: EpochMaterials) -> Self {
+		let renewable = self.receipt.is_some() && self.peer.is_some();
+		let epoch = Some(epoch).filter(|_| renewable);
+		Self { epoch, ..self }
+	}
+
+	/// A session of `keys`, `receipt`, and `peer`, for a test that holds the
+	/// parts a handshake agrees.
+	#[cfg(test)]
+	pub(crate) fn forged(keys: SessionKeys, receipt: Option<Arc<StoredReceipt>>, peer: Option<SessionPeer>) -> Self {
+		Self::new(keys, None, receipt, peer)
+	}
+
+	/// This session with `epoch` under the rule of [`Self::with_epoch`], for
+	/// a test that holds the epoch a handshake derives.
+	#[cfg(all(
+		test,
+		feature = "transport-multiplex",
+		any(feature = "transport-cms", feature = "transport-hpke")
+	))]
+	pub(crate) fn with_forged_epoch(self, epoch: EpochMaterials) -> Self {
+		self.with_epoch(epoch)
+	}
+
+	/// The peer the handshake validated, which a rekey renews against and a
+	/// session context shares.
+	pub(crate) fn session_peer(&self) -> Option<&Arc<SessionPeer>> {
 		self.peer.as_ref()
 	}
 
 	/// Detach the epoch rekey materials, once.
+	#[cfg(all(
+		feature = "transport-multiplex",
+		any(feature = "transport-cms", feature = "transport-hpke")
+	))]
 	pub(crate) fn take_epoch(&mut self) -> Option<EpochMaterials> {
 		self.epoch.take()
+	}
+
+	/// The epoch rekey materials the session still holds.
+	#[cfg(all(
+		test,
+		feature = "transport-multiplex",
+		any(feature = "transport-cms", feature = "transport-hpke")
+	))]
+	pub(crate) fn epoch(&self) -> Option<&EpochMaterials> {
+		self.epoch.as_ref()
 	}
 
 	/// Bound the send cipher by the encrypted-envelope ceiling the transport
@@ -848,12 +849,107 @@ pub enum HandshakeProtocolKind {
 	/// CMS-based handshake (X.509 signed and authenticated-enveloped data).
 	///
 	/// The client seals its first message to the server's key-agreement
-	/// certificate and signs its Finished, so it MUST provision a trust store,
-	/// the server's key-agreement certificate, and a client identity. A
-	/// missing one fails closed, and so does this kind without the
-	/// `transport-cms` feature.
+	/// certificate and signs its Finished, so it MUST provision a client
+	/// identity and the trust in its server, `with_cms_server`. A missing one
+	/// fails closed, and so does this kind without the `transport-cms` feature.
 	Cms,
 }
+
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+impl HandshakeProtocolKind {
+	/// The client handshake of the flow this kind names, which `provisioning`
+	/// configures alone.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::UnsupportedHandshakeProtocol`] -- this build lacks the flow of this kind.
+	/// - The [`FlowProvisioning::client_config`] set of that flow.
+	pub(crate) fn client_handshake<P, E>(self, provisioning: &E) -> Result<BoxedClientHandshake, TransportError>
+	where
+		P: HandshakeProvider,
+		E: Provisioning<P>,
+	{
+		let handshake: BoxedClientHandshake = match self {
+			#[cfg(feature = "transport-hpke")]
+			Self::Hpke => Box::new(Handshake::client(FlowProvisioning::<Hpke, P>::client_config(provisioning)?)),
+
+			#[cfg(feature = "transport-cms")]
+			Self::Cms => Box::new(Handshake::client(FlowProvisioning::<Cms, P>::client_config(provisioning)?)),
+
+			#[cfg(not(all(feature = "transport-cms", feature = "transport-hpke")))]
+			unsupported => return Err(TransportError::UnsupportedHandshakeProtocol(unsupported)),
+		};
+
+		Ok(handshake)
+	}
+
+	/// The server handshake of the flow this kind names, which `provisioning`
+	/// configures alone.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::UnsupportedHandshakeProtocol`] -- this build lacks the flow of this kind.
+	/// - The [`FlowProvisioning::server_config`] set of that flow.
+	pub(crate) fn server_handshake<P, E>(self, provisioning: &E) -> Result<BoxedServerHandshake, TransportError>
+	where
+		P: HandshakeProvider,
+		E: Provisioning<P>,
+	{
+		let handshake: BoxedServerHandshake = match self {
+			#[cfg(feature = "transport-hpke")]
+			Self::Hpke => Box::new(Handshake::server(FlowProvisioning::<Hpke, P>::server_config(provisioning)?)),
+
+			#[cfg(feature = "transport-cms")]
+			Self::Cms => Box::new(Handshake::server(FlowProvisioning::<Cms, P>::server_config(provisioning)?)),
+
+			#[cfg(not(all(feature = "transport-cms", feature = "transport-hpke")))]
+			unsupported => return Err(TransportError::UnsupportedHandshakeProtocol(unsupported)),
+		};
+
+		Ok(handshake)
+	}
+}
+
+/// The provisioning of an endpoint, which builds both configurations of flow
+/// `F` from what it holds alone.
+///
+/// Each flow is one implementation, which reads the trust and the identity
+/// that its configurations take and refuses a provisioning that lacks a
+/// required one. [`HandshakeProtocolKind`] picks the flow.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+pub(crate) trait FlowProvisioning<F: ClientFlow<P> + ServerFlow<P>, P: HandshakeProvider> {
+	/// The configuration of a client handshake of flow `F`.
+	///
+	/// # Errors
+	///
+	/// - The refusal of flow `F` when this provisioning lacks the trust or the identity its client takes.
+	fn client_config(&self) -> Result<ClientConfig<F, P>, TransportError>;
+
+	/// The configuration of a server handshake of flow `F`.
+	///
+	/// # Errors
+	///
+	/// - The refusal of flow `F` when this provisioning lacks the identity its server presents.
+	fn server_config(&self) -> Result<ServerConfig<F, P>, TransportError>;
+}
+
+/// The provisioning of an endpoint, which builds each flow this build
+/// compiles. It is the bound of the flow choice of [`HandshakeProtocolKind`].
+#[cfg(all(feature = "transport-cms", feature = "transport-hpke"))]
+pub(crate) trait Provisioning<P: HandshakeProvider>:
+	FlowProvisioning<Hpke, P> + FlowProvisioning<Cms, P>
+{
+}
+
+/// The provisioning of an endpoint, which builds the HPKE flow, the one flow
+/// this build compiles.
+#[cfg(all(feature = "transport-hpke", not(feature = "transport-cms")))]
+pub(crate) trait Provisioning<P: HandshakeProvider>: FlowProvisioning<Hpke, P> {}
+
+/// The provisioning of an endpoint, which builds the CMS flow, the one flow
+/// this build compiles.
+#[cfg(all(feature = "transport-cms", not(feature = "transport-hpke")))]
+pub(crate) trait Provisioning<P: HandshakeProvider>: FlowProvisioning<Cms, P> {}
 
 /// The HPKE hello, the opening of the client, bound into the transcript.
 ///

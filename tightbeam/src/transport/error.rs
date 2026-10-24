@@ -20,10 +20,10 @@ use crate::Errorizable;
 #[cfg(not(feature = "std"))]
 use alloc::boxed::Box;
 
-/// Result type of transport operations.
+/// The result type of transport operations.
 pub type Result<T> = core::result::Result<T, TransportError>;
 
-/// Reason an operation failed, either locally or as a peer refusal.
+/// The reason an operation failed, either locally or as a peer refusal.
 ///
 /// Each peer-refusal variant maps one to one onto a non-Ok [`TransitStatus`],
 /// and the local-only variants carry no wire status.
@@ -97,7 +97,7 @@ pub enum TransportFailure {
 	Unauthenticated,
 }
 
-/// Error returned by every transport operation.
+/// The error every transport operation returns.
 #[derive(Debug, Errorizable)]
 #[non_exhaustive]
 pub enum TransportError {
@@ -128,9 +128,10 @@ pub enum TransportError {
 	/// signing identity, and only the signing identity is provisioned.
 	#[error("Key-agreement identity required but not provisioned")]
 	MissingKeyAgreementIdentity,
-	/// The client has no trust store. Install one, or call `allow_cleartext`
-	/// to choose cleartext.
-	#[error("Client has no trust store: install one or call allow_cleartext to choose cleartext")]
+	/// The client holds no trust in a server, a trust store or a CMS server
+	/// trust. Install one, or remove any server policy and call
+	/// `allow_cleartext` to choose cleartext.
+	#[error("Client holds no server trust: install one, or remove any server policy and call allow_cleartext")]
 	PeerAuthenticationUnconfigured,
 	/// A message broke the protocol or failed to decode, such as a mux
 	/// protocol violation or an oversized handshake message.

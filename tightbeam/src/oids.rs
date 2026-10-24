@@ -279,6 +279,44 @@ pub const CURVE_NIST_P384: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.
 /// - OID repository entry: <https://oid-base.com/get/1.3.132.0.35>
 pub const CURVE_NIST_P521: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.132.0.35");
 
+/// The `c-TwoCurve` arc of ANSI X9.62, `characteristic-two` curves, whose
+/// children are curves over a binary field.
+///
+/// # Sources
+///
+/// - RFC 3279 §2.3.5, the X9.62 curve arcs: <https://datatracker.ietf.org/doc/html/rfc3279#section-2.3.5>
+/// - OID repository entry: <https://oid-base.com/get/1.2.840.10045.3.0>
+pub const CURVE_X962_C_TWO: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.3.0");
+
+/// The SEC 2 curves over a binary field, `sect113r1` through `sect571r1`,
+/// under the `ellipticCurve` arc `1.3.132.0`.
+///
+/// # Sources
+///
+/// - SEC 2 v1.0 Appendix A, the curve OIDs: <https://www.secg.org/SEC2-Ver-1.0.pdf>
+/// - RFC 5480 §2.1.1.1, the named curves of PKIX:
+///   <https://datatracker.ietf.org/doc/html/rfc5480#section-2.1.1.1>
+pub const BINARY_FIELD_CURVES: [ObjectIdentifier; 18] = [
+	ObjectIdentifier::new_unwrap("1.3.132.0.1"),
+	ObjectIdentifier::new_unwrap("1.3.132.0.2"),
+	ObjectIdentifier::new_unwrap("1.3.132.0.3"),
+	ObjectIdentifier::new_unwrap("1.3.132.0.4"),
+	ObjectIdentifier::new_unwrap("1.3.132.0.5"),
+	ObjectIdentifier::new_unwrap("1.3.132.0.15"),
+	ObjectIdentifier::new_unwrap("1.3.132.0.16"),
+	ObjectIdentifier::new_unwrap("1.3.132.0.17"),
+	ObjectIdentifier::new_unwrap("1.3.132.0.22"),
+	ObjectIdentifier::new_unwrap("1.3.132.0.23"),
+	ObjectIdentifier::new_unwrap("1.3.132.0.24"),
+	ObjectIdentifier::new_unwrap("1.3.132.0.25"),
+	ObjectIdentifier::new_unwrap("1.3.132.0.26"),
+	ObjectIdentifier::new_unwrap("1.3.132.0.27"),
+	ObjectIdentifier::new_unwrap("1.3.132.0.36"),
+	ObjectIdentifier::new_unwrap("1.3.132.0.37"),
+	ObjectIdentifier::new_unwrap("1.3.132.0.38"),
+	ObjectIdentifier::new_unwrap("1.3.132.0.39"),
+];
+
 /// X25519, which is Curve25519 for ECDH. It is used with Ed25519 signatures.
 ///
 /// # Sources

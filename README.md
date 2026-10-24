@@ -249,9 +249,9 @@ Each protocol version inherits the required features of the prior version. A hig
 
 | Version | Required features                                          | Optional features                                                             |
 | ------- | ---------------------------------------------------------- | ----------------------------------------------------------------------------- |
-| V0      | Message identification (`id`); temporal ordering (`order`) | Compression (`compactness`)                                                   |
-| V1      | All V0 required features                                   | Message Integrity (MI); Frame Integrity (FI); confidentiality; Nonrepudiation |
-| V2      | All V1 required features                                   | Priority (`MessagePriority`); lifetime (TTL); Previous Frame chaining         |
+| V0      | Message identification (`id`), temporal ordering (`order`) | Compression (`compactness`)                                                   |
+| V1      | All V0 required features                                   | Message Integrity (MI), Frame Integrity (FI), confidentiality, Nonrepudiation |
+| V2      | All V1 required features                                   | Priority (`MessagePriority`), lifetime (TTL), Previous Frame chaining         |
 | V3      | All V2 required features                                   | Matrix control                                                                |
 
 > Note: Concrete field requirements and forbidden fields are stated in [§5.6 Version-Specific Constraints](#56-version-specific-constraints). Semantic rules for integrity, chaining, and signatures are stated in [§5.7 Semantic Constraints](#57-semantic-constraints).
@@ -302,7 +302,7 @@ pub struct Metadata {
 }
 ```
 
-> Note: `Metadata.integrity` is Message Integrity (MI). `Frame.integrity` is Frame Integrity (FI). Both MAY appear from V1 onward. Same type name, different coverage. See [§5.7.3](#573-integrity-semantics-order-of-operations).
+> Note: `Metadata.integrity` is Message Integrity (MI). `Frame.integrity` is Frame Integrity (FI). Both MAY appear from V1 onward. The two share a type name and differ in coverage. See [§5.7.3](#573-integrity-semantics-order-of-operations).
 
 ### 4.4 Frame Encapsulation
 
@@ -377,7 +377,7 @@ DigestInfo ::= SEQUENCE {
 }
 ```
 
-> Note: `DigestInfo` is reused in three roles: Message Integrity (`Metadata.integrity`), Frame Integrity (`Frame.integrity`), and Previous Frame chaining (`previous_frame`). The type is the same. The covered bytes differ. The `previous_frame` digest is not FI.
+> Note: `DigestInfo` is reused in three roles: Message Integrity (`Metadata.integrity`), Frame Integrity (`Frame.integrity`), and Previous Frame chaining (`previous_frame`). The type is the same in each role, the covered bytes differ, and the `previous_frame` digest is not FI.
 
 #### Authenticated-Enveloped Data ([RFC 5083][rfc5083] CMS)
 
@@ -395,7 +395,12 @@ AuthEnvelopedData ::= SEQUENCE {
 }
 ```
 
-> Note: Used in `Metadata.confidentiality` for body encryption. The envelope carries no `encryptedContent`: the ciphertext is `Frame.message`, detached as [RFC 5652][rfc5652] §6.1 permits. The content cipher is the provider's AEAD, AES-256-GCM with `GCMParameters` ([RFC 5084][rfc5084]) in the house provider, under a fresh content key for each frame. The content type is among the `authAttrs`, and a receiver refuses `authAttrs` that did not arrive as DER ([RFC 5083][rfc5083] §2.1). The one recipient is a `KEKRecipientInfo` named by the key identifier of its key-encryption key, or a `KEMRecipientInfo` ([RFC 9629][rfc9629]) to the recipient's public key.
+`Metadata.confidentiality` holds this type for body encryption:
+
+- The envelope carries no `encryptedContent`: the ciphertext is `Frame.message`, detached as [RFC 5652][rfc5652] §6.1 permits.
+- The content cipher is the provider's AEAD, AES-256-GCM with `GCMParameters` ([RFC 5084][rfc5084]) in the house provider, under a fresh content key for each frame.
+- The content type is among the `authAttrs`, and a receiver refuses `authAttrs` that did not arrive as DER ([RFC 5083][rfc5083] §2.1).
+- The one recipient is a `KEKRecipientInfo` named by the key identifier of its key-encryption key, or a `KEMRecipientInfo` ([RFC 9629][rfc9629]) to the recipient's public key.
 
 #### Signer Information ([RFC 5652][rfc5652] CMS)
 
@@ -413,7 +418,7 @@ SignerInfo ::= SEQUENCE {
 }
 ```
 
-> Note: Used in `Frame.nonrepudiation` for Nonrepudiation signatures.
+> Note: `Frame.nonrepudiation` holds this type for Nonrepudiation signatures.
 
 #### Compressed Data ([RFC 3274][rfc3274] CMS)
 
@@ -427,7 +432,7 @@ CompressedData ::= SEQUENCE {
 }
 ```
 
-> Note: Used in `Metadata.compactness` for compression. Compression rules are in [§5.7.2](#572-compression-requirements).
+> Note: `Metadata.compactness` holds this type for compression. Compression rules are in [§5.7.2](#572-compression-requirements).
 
 #### Matrix (tightbeam-specific)
 
@@ -438,7 +443,7 @@ Matrix ::= SEQUENCE {
 }
 ```
 
-> Note: Used in `Metadata.matrix`. Full Matrix rules are in [§5.8 What is the Matrix?](#58-what-is-the-matrix).
+> Note: `Metadata.matrix` holds this type. Full Matrix rules are in [§5.8 What is the Matrix?](#58-what-is-the-matrix).
 
 ### 5.3 Message Structure
 
@@ -544,11 +549,16 @@ Each protocol version has required, optional, and forbidden Frame and Metadata f
 | Version | Required fields          | Optional fields                                                                              | Forbidden                        |
 | ------- | ------------------------ | -------------------------------------------------------------------------------------------- | -------------------------------- |
 | V0      | `id`, `order`, `message` | `compactness`                                                                                | Fields introduced in V1 or later |
-| V1      | All V0 required fields   | `Metadata.integrity` (MI); `confidentiality`; `Frame.nonrepudiation`; `Frame.integrity` (FI) | Fields introduced in V2 or later |
-| V2      | All V1 required fields   | `priority`; `lifetime`; `previous_frame`                                                     | Fields introduced in V3 or later |
+| V1      | All V0 required fields   | `Metadata.integrity` (MI), `confidentiality`, `Frame.nonrepudiation`, `Frame.integrity` (FI) | Fields introduced in V2 or later |
+| V2      | All V1 required fields   | `priority`, `lifetime`, `previous_frame`                                                     | Fields introduced in V3 or later |
 | V3      | All V2 required fields   | `matrix`                                                                                     | None beyond the ASN.1 schema     |
 
-A version that inherits prior requirements MUST satisfy every required field of those prior versions. Absent optional fields MUST NOT be encoded (DER). Encoders MUST NOT emit a field that is forbidden for the Frame version in use. Decoders MUST reject Frames that carry forbidden fields for the declared version.
+Every version follows these rules:
+
+- A version that inherits prior requirements MUST satisfy every required field of those prior versions.
+- Absent optional fields MUST NOT be encoded (DER).
+- Encoders MUST NOT emit a field that is forbidden for the Frame version in use.
+- Decoders MUST reject Frames that carry forbidden fields for the declared version.
 
 ### 5.7 Semantic Constraints
 
@@ -582,7 +592,7 @@ Message Integrity (MI) and Frame Integrity (FI) bind different byte ranges. Rece
 
 ##### Optional Hiding Commitment (Salt)
 
-By default, MI is a plain-mode commitment over the body. That commitment is binding. It is not hiding. The digest travels in cleartext metadata. If the body has low entropy, an attacker who sees the digest MAY brute-force candidate preimages.
+By default, MI is a plain-mode commitment over the body, which is binding but not hiding. The digest travels in cleartext metadata, so if the body has low entropy, an attacker who sees the digest MAY brute-force candidate preimages.
 
 An application MAY store a hiding commitment in the same `Metadata.integrity` field. The commitment salts the body with a secret, high-entropy blinding value.
 
@@ -600,7 +610,7 @@ An application MAY store a hiding commitment in the same `Metadata.integrity` fi
 
 **Salt ownership**
 
-The salt is not a tightbeam responsibility. tightbeam does not generate, encrypt, store, or transmit the salt.
+The salt belongs to the caller, which generates it and decides whether to encrypt, store, or transmit it.
 
 | Concern                 | Owner                                  |
 | ----------------------- | -------------------------------------- |
@@ -646,7 +656,11 @@ where
 - AEAD tags prove that ciphertext was not modified. Examples include AES-GCM ([FIPS 197][fips197]) and ChaCha20-Poly1305 ([RFC 8439][rfc8439]).
 - MI proves that decrypted plaintext matches the original message content.
 
-When AEAD is enforced, the construction is cryptographically equivalent to Encrypt-then-MAC for ciphertext authenticity. An attacker cannot modify the ciphertext without failing AEAD authentication. An attacker cannot modify MI without breaking authenticated FI when signing is present. An attacker cannot decrypt without the key.
+When AEAD is enforced, the construction is cryptographically equivalent to Encrypt-then-MAC for ciphertext authenticity:
+
+- An attacker cannot modify the ciphertext without failing AEAD authentication.
+- An attacker cannot modify MI without breaking authenticated FI when signing is present.
+- An attacker cannot decrypt without the key.
 
 #### 5.7.4 Previous Frame Chaining
 
@@ -851,9 +865,9 @@ Frame t   (M_t)
 Frame t+1 (M_{t+1})
 ```
 
-Applications MAY define a transition model **P(M*t | M*{t-1})**. The model may capture deterministic application logic, noise, or both. Application-level fidelity MAY be expressed with mutual information, for example:
+Applications MAY define a transition model **P(M_t | M\_{t-1})**. The model may capture deterministic application logic, noise, or both. Application-level fidelity MAY be expressed with mutual information, for example:
 
-**I(t) = I(M*t; M*{t-1}) / H(M_t) ∈ (0,1)**.
+`I(t) = I(M_t; M_{t-1}) / H(M_t) ∈ (0,1)`.
 
 That ratio is application-defined. Protocol integrity still depends on digest verification and on the matrix encoding rules in [§5.8.4](#584-usage-rules). Partial recovery of earlier state remains an application concern when some cells are unused or unknown.
 
@@ -1171,7 +1185,13 @@ Each provider role MUST use the algorithm its profile names. The `Profile` bound
 
 Its associated profile is `TightbeamProfile` ([§6.2](#62-security-profile-types)).
 
-Every part is replaceable. An implementor brings its own algorithm as a type that implements the role's trait: a signature type for `SigningProvider`, a `ContentEncryption` cipher for `AeadProvider`, a `KeyWrapAlgorithm` for `KeyWrapProvider`, a `KdfFunction` for `KdfProvider`, and a `RecipientKem` for `CryptoProvider::Kem`. A `ContentEncryption` cipher MUST leave the buffer of a refused seal or open as it was, because a frame seals and opens its body in its own buffer. The envelope, the recipients, and the handshake then run that provider's algorithms and refuse any other. The handshake reads no HPKE suite, so a provider with these roles alone runs both handshake flows.
+Every part is replaceable, and the envelope, the recipients, and the handshake run the provider's algorithms and refuse any other. The handshake reads no HPKE suite, so a provider with these roles alone runs both handshake flows. An implementor brings its own algorithm as a type that implements the role's trait:
+
+- A signature type for `SigningProvider`.
+- A `ContentEncryption` cipher for `AeadProvider`. The cipher MUST leave the buffer of a refused seal or open as it was, because a frame seals and opens its body in its own buffer.
+- A `KeyWrapAlgorithm` for `KeyWrapProvider`.
+- A `KdfFunction` for `KdfProvider`.
+- A `RecipientKem` for `CryptoProvider::Kem`.
 
 ### 6.6 Cryptographic Requirements
 
@@ -1192,7 +1212,7 @@ A receiver MUST reject security fields that are forbidden for the declared Frame
 
 ### 6.8 ASN.1 Security Considerations
 
-ASN.1 DER encoding supports several security properties of the wire format:
+ASN.1 DER encoding supports four security properties of the wire format:
 
 - DER is canonical. Equal values produce one encoding, which reduces ambiguous-parsing attacks ([ITU-T X.690][itu-x690]).
 - Context-specific tags distinguish optional fields and reduce field-confusion risk.
@@ -1250,13 +1270,36 @@ The `CertificateTrust` trait verifies certificate chains and manages trust ancho
 - Validate a chain from trust anchor through intermediates to the leaf
 - Look up signer certificates when verifying Frame Nonrepudiation
 
-A store resolves a `SignerInfo` by its `sid`: a `subjectKeyIdentifier` through the extension of each certificate it holds, an `issuerAndSerialNumber` through the issuer and serial number. Every certificate the crate mints (`cert!` and the test fixtures) carries a subjectKeyIdentifier by [RFC 7093][rfc7093] §2 method 1: the leftmost 160 bits of the SHA-256 of the subjectPublicKey BIT STRING value. A certificate it issues also carries the authorityKeyIdentifier of its issuer.
+Every `CertificateTrust` implementation keeps three rules, which the handshake and the colony read through the trait:
+
+- A store admits a certificate by its contents alone, whatever role the handshake reads it in.
+- A check of a server's identity, such as a pin, belongs in the client's server policy, which `with_server_policy` sets on `ClientConfig`, `ClientBuilder`, or `ConnectionPoolBuilder`. A check of a client's identity belongs in the validators of the server's `PeerAuthentication::mutual`.
+- Wherever a method reads a key, two keys are one key exactly when they share one `CanonicalKey` under the store's `KeyCurves`.
+
+The built-in store runs its `RevocationChecker` at each admission, so a check of every certificate, such as a denylist, belongs in that checker:
+
+- Path validation, with revocation as one of its checks, runs on each certificate that `evaluate`, `trust_anchor`, or `verify_chain` admits.
+- Each lookup runs the checker over the path of the certificate it answers with, so a revoked certificate verifies no frame, and no key lookup finds it.
+
+The built-in store, `PublicKeyPinning`, `PeerListGate`, and `KeyIndex` read a key by the rule of `CanonicalKey`, under the decoders of their `KeyCurves`:
+
+- A point of a named curve outside the binary-field curves of SEC 2 and ANSI X9.62, in the compressed (`0x02`, `0x03`) or the uncompressed (`0x04`) SEC 1 form, reads as a point ([SEC 1][secg-sec1] v2.0 §2.3.3), so its two forms are one key and its negation is another key.
+- Every other key reads as its bits: an encoding that a decoder of its curve refuses ([SEC 1][secg-sec1] v2.0 §2.3.4), a malformed point or a form that [RFC 5480][rfc5480] §2.2 refuses, an `id-ecPublicKey` key with no named curve, a key on a binary-field curve of SEC 2 or ANSI X9.62, and a key of another algorithm.
+- `KeyCurves::HOUSE`, the default of each reader, holds the decoder of secp256k1 in a build with the `secp256k1` feature, which the `transport` feature enables. A session reads its peer's key under it, and the hive's circuit breaker keys on that key.
+- An outside crate brings its curve as a `CurvePoints` decoder. [docs/handshake.md](docs/handshake.md#key-identity) states the whole rule.
+
+A store resolves a `SignerInfo` by its `sid`:
+
+- A `subjectKeyIdentifier` resolves through the extension of each certificate it holds.
+- An `issuerAndSerialNumber` resolves through the issuer and serial number.
+
+Every certificate the crate creates (`cert!` and the test fixtures) carries a subjectKeyIdentifier by [RFC 7093][rfc7093] §2 method 1: the leftmost 160 bits of the SHA-256 of the subjectPublicKey BIT STRING value. A certificate it issues also carries the authorityKeyIdentifier of its issuer.
 
 **Building a trust store:**
 
 ```rust,ignore
 let cert = Certificate::try_from(CERT_PEM)?;
-let trust_store = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy::default())
+let trust_store = CertificateTrustBuilder::from(Secp256k1Policy::default())
     .with_certificate(cert)?
     .build();
 ```
@@ -1264,14 +1307,22 @@ let trust_store = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy::def
 **Adding a certificate chain:**
 
 ```rust,ignore
-let trust_store = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy::default())
+let trust_store = CertificateTrustBuilder::from(Secp256k1Policy::default())
     .with_chain(vec![root_cert, intermediate_cert, leaf_cert])?
     .build();
 ```
 
+`CertificateTrustBuilder::new(policy, curves)` builds a store that reads each key under another `KeyCurves`.
+
 #### Signing Identities
 
-`SigningIdentity` pairs a certificate with the `SigningKeyProvider` that holds its private key. Its constructor refuses a certificate that is not admitted for signing ([Certificate Use](#certificate-use)), and a key whose public half differs from the certificate's SubjectPublicKeyInfo (`SignerError::KeyMismatch`), so every signature it makes verifies under the certificate its `sid` names. It also refuses a key whose algorithm is not the provider's, and it brings every value the provider returns to its canonical form, the DER low-`s` form for ECDSA. `SigningIdentity::new` signs under `DefaultCryptoProvider`. An implementor brings its own signature algorithm with `SigningIdentity::with_provider::<P>`, where `P` is a `SigningProvider` whose signature type implements `CanonicalForm`, `SignatureEncoding`, and `SignatureAlgorithmIdentifier`, and whose verifying key implements `PrehashVerifier` and `DecodePublicKey`. `ProviderPolicy::<P>` verifies its signatures. It is the one home of an endpoint's signing material:
+`SigningIdentity` pairs a certificate with the `SigningKeyProvider` that holds its private key:
+
+- Its constructor refuses a certificate that is not admitted for signing ([Certificate Use](#certificate-use)), and a key whose public half differs from the certificate's SubjectPublicKeyInfo (`SignerError::KeyMismatch`), so every signature it makes verifies under the certificate its `sid` names.
+- It also refuses a key whose algorithm is not the provider's, and it brings every value the provider returns to its canonical form, the DER low-`s` form for ECDSA.
+- `SigningIdentity::new` signs under `DefaultCryptoProvider`.
+- An implementor brings its own signature algorithm with `SigningIdentity::with_provider::<P>`, where `P` is a `SigningProvider` whose signature type implements `CanonicalForm`, `SignatureEncoding`, and `SignatureAlgorithmIdentifier`, and whose verifying key implements `PrehashVerifier` and `DecodePublicKey`. `ProviderPolicy::<P>` verifies its signatures.
+- It is the one home of an endpoint's signing material, which these consumers read:
 
 | Consumer                                                                                                 | What the identity signs                                                              |
 | -------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
@@ -1301,7 +1352,12 @@ A certificate serves only the use and the role its extensions allow ([RFC 5280][
 | `ErasedSigning`   | `digitalSignature`                             | The trust store, `Frame::verify_under`, and `SigningIdentity::with_provider` |
 | `KeyAgreement<K>` | `K::USAGE`, `keyAgreement` for the house DHKEM | `KemRecipient::from_certificate`, and `KeyAgreementIdentity::new`            |
 
-Each use refuses a certificate whose `keyUsage` is absent or lacks its bit, that carries one extension twice, or that carries a critical extension the crate does not process. A use whose bit is `keyAgreement` also refuses a certificate that asserts `decipherOnly` (§4.2.1.3). A use that reads an `id-ecPublicKey` key refuses a point whose first octet is not `0x02`, `0x03`, or `0x04`, the compressed and uncompressed forms ([RFC 5480][rfc5480] §2.2). A certificate that carries both bits is admitted for each use.
+A certificate that carries both bits is admitted for each use, and each use refuses a certificate in these cases:
+
+- Its `keyUsage` is absent or lacks the bit of the use.
+- It carries one extension twice, or a critical extension the crate does not process.
+- The use's bit is `keyAgreement`, and the certificate asserts `decipherOnly` (§4.2.1.3).
+- The use reads an `id-ecPublicKey` key, and the point's first octet is not `0x02`, `0x03`, or `0x04`, the compressed and uncompressed forms, or the uncompressed point's two coordinates differ in length ([RFC 5480][rfc5480] §2.2).
 
 The role is the key purpose of `extendedKeyUsage` (§4.2.1.12). `KeyPurposes` maps each role to one purpose, and `KeyPurposes::HOUSE` holds the defaults:
 
@@ -1311,13 +1367,24 @@ The role is the key purpose of `extendedKeyUsage` (§4.2.1.12). `KeyPurposes` ma
 | Client | The certificate of the client identity              | `id-kp-clientAuth`                                  |
 | Signer | The certificate of a frame or colony signer         | `oids::KEY_PURPOSE_SIGNER`, `1.3.6.1.4.1.64586.3.1` |
 
-A role also admits `anyExtendedKeyUsage`, and a certificate with no `extendedKeyUsage` serves every role. `PeerCertificate::parse` takes the purpose of the role it admits for. Each side of a handshake carries its purposes in one place, `ClientConfig` and `ServerConfig`, whose constructors check the endpoint's own identity for its role once, and `with_key_purposes` sets an implementor's own on `TransportEncryptionConfig`, `ClientBuilder`, `ConnectionPool`, and `CertificateTrustBuilder`.
+A role also admits `anyExtendedKeyUsage`, and a certificate with no `extendedKeyUsage` serves every role. The purposes live in these places:
+
+- `PeerCertificate::parse` takes the purpose of the role it admits for.
+- Each side of a handshake carries its purposes in one place, `ClientConfig` and `ServerConfig`, whose constructors check the endpoint's own identity for its role once.
+- `with_key_purposes` sets an implementor's own purposes on `TransportEncryptionConfig`, `ClientBuilder`, `ConnectionPoolBuilder`, and `CertificateTrustBuilder`.
 
 #### Key-Agreement Identities
 
-`KeyAgreementIdentity<K>` pairs a key-agreement certificate with the backend of its private key, the `K::PrivateKey` of the KEM `K`. The house DHKEM's backend is a `DiffieHellman<C>`, which `Secp256k1KeyProvider` implements. A signing backend and a key-agreement backend are two traits under `KeyBackend`. The compiler refuses one `dyn` handle in the other's place, and `CmsIdentityPair::new` refuses one key in both identities (`KeyReuse`), so a backend of both, such as `Secp256k1KeyProvider`, serves one identity per key. The constructor refuses a certificate without the bit of `K::USAGE`, and a backend whose public half differs from the certificate's key (`EnvelopeError::KeyMismatch`).
+`KeyAgreementIdentity<K>` pairs a key-agreement certificate with the backend of its private key, the `K::PrivateKey` of the KEM `K`. The house DHKEM's backend is a `DiffieHellman<C>`, which `Secp256k1KeyProvider` implements. These rules hold:
 
-A CMS server holds a signing identity and a key-agreement identity of one subject with two keys ([NIST SP 800-57 Part 1 Rev. 5][nist-800-57] §5.2). The client pins the key-agreement certificate alone in a `ProvisionedTrust`, built once with its configuration. The server Finished carries the signing certificate, and at each reply the trust's store admits it and the client refuses two subjects, two trust anchors, and one key in both:
+- A signing backend and a key-agreement backend are two traits under `KeyBackend`, so the compiler refuses one `dyn` handle in the other's place.
+- `CmsIdentityPair::new` refuses one key in both identities (`KeyReuse`), so a backend of both, such as `Secp256k1KeyProvider`, serves one identity per key.
+- The constructor refuses a certificate without the bit of `K::USAGE`, and a backend whose public half differs from the certificate's key (`EnvelopeError::KeyMismatch`).
+
+A CMS server holds a signing identity and a key-agreement identity of one subject with two keys ([NIST SP 800-57 Part 1 Rev. 5][nist-800-57] §5.2):
+
+- The client pins the key-agreement certificate alone in a `ProvisionedTrust`, built once with its configuration.
+- The server Finished carries the signing certificate. At each reply, the trust's store admits it, and the client refuses two subjects, two trust anchors, and one key in both.
 
 ```rust,ignore
 // The server: the signing identity signs, and the key-agreement identity
@@ -1329,14 +1396,17 @@ let config = TransportEncryptionConfig::new(signing_identity)
 // store once. The store admits the signing certificate the reply carries.
 let server_trust = ProvisionedTrust::new(Arc::new(agreement_cert), trust_store)?;
 let client = ClientBuilder::<TokioListener>::builder()
+    .with_handshake_protocol(HandshakeProtocolKind::Cms)
     .with_cms_server(server_trust)
     .with_client_identity(client_identity)
     .build();
 ```
 
+Both endpoints select the CMS flow with `with_handshake_protocol(HandshakeProtocolKind::Cms)`, on the client builder and on the server's transport, and HPKE is the default.
+
 ## 8. Transport Layer
 
-The transport layer moves Frame bytes between endpoints. It establishes connections, applies security policies, and manages session cryptographic state. Policy details are in [§8.4](#84-transport-policies). Handshakes are in [§8.5](#85-handshake-protocols). Multiplexing and pooling are in [§8.6](#86-multiplexing) and [§8.7](#87-connection-pooling).
+The transport layer moves Frame bytes between endpoints. It establishes connections, applies security policies, and manages session cryptographic state. Policy details are in [§8.4](#84-transport-policies), handshakes in [§8.5](#85-handshake-protocols), and multiplexing and pooling in [§8.6](#86-multiplexing) and [§8.7](#87-connection-pooling).
 
 ### 8.1 Transport Architecture
 
@@ -1368,14 +1438,19 @@ With the `transport-multiplex` feature, `TransportEnvelope` also carries mux str
 
 An encrypted `WireEnvelope` carries one record, the DER `TransportEnvelope` sealed as an `AuthEnvelopedData` ([RFC 5083][rfc5083]):
 
-| Field | Value |
-| --- | --- |
-| `recipientInfos` | One `KEKRecipientInfo` ([RFC 5652][rfc5652] §6.2.3), version 4, under the session key of the record's direction and epoch |
+| Field                 | Value                                                                                                                                               |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `recipientInfos`      | One `KEKRecipientInfo` ([RFC 5652][rfc5652] §6.2.3), version 4, under the session key of the record's direction and epoch                           |
 | `kekid.keyIdentifier` | `tb/session/record/kekid/v1`, then the direction octet (`0x00` client to server, `0x01` server to client), then the epoch as four big-endian octets |
-| Content key and nonce | Fresh for each record, the content key wrapped under the session key |
-| `authAttrs` | The content type `id-data`, and a `RecordSequence ::= SEQUENCE { epoch INTEGER, sequence INTEGER }` under `1.3.6.1.4.1.64586.1.27` |
+| Content key and nonce | Fresh for each record, the content key wrapped under the session key                                                                                |
+| `authAttrs`           | The content type `id-data`, and a `RecordSequence ::= SEQUENCE { epoch INTEGER, sequence INTEGER }` under `1.3.6.1.4.1.64586.1.27`                  |
 
-A receiver opens a record in the buffer it arrived in. Before the content key unwraps, it refuses a record of another epoch, a record whose sequence is another than the next one it expects, a record at the record limit, and a record whose `kekid` names another direction or epoch. The tag covers the sequence, so a record moved to another position fails its tag. [RFC 9846 §5.5][rfc9846-5.5] sets the record limit on the sender, and the receiver's refusal at the limit is the crate's own renewal policy.
+A receiver opens a record in the buffer it arrived in. Before the content key unwraps, it refuses:
+
+- A record of another epoch.
+- A record whose sequence is another than the next one it expects. The tag covers the sequence, so a record moved to another position fails its tag.
+- A record at the record limit. [RFC 9846 §5.5][rfc9846-5.5] sets the record limit on the sender, and the receiver's refusal at the limit is the crate's own renewal policy.
+- A record whose `kekid` names another direction or epoch.
 
 DER tag-length-value encoding supplies framing. Default size limits:
 
@@ -1527,14 +1602,22 @@ impl GatePolicy for IdPatternGate {
 ```rust,ignore
 use tightbeam::colony::hive::PeerListGate;
 
-// Bar these public keys (SPKI DER) at the door; the gate matches the
+// Bar these public keys (SPKI DER) at the door. The gate matches the
 // session's mutually-authenticated peer certificate, not frame signers.
-let doorman = PeerListGate::deny([banned_spki_der]);
+let doorman = PeerListGate::deny([banned_spki_der])?;
 
-// Or admit only listed keys; sessions without an authenticated peer
+// Or admit only listed keys. Sessions without an authenticated peer
 // fail closed (Unauthenticated).
-let doorman = PeerListGate::allow([member_spki_der]);
+let doorman = PeerListGate::allow([member_spki_der])?;
 ```
+
+The gate reads each listed SubjectPublicKeyInfo by the key rule of the trust store, so a point in either SEC 1 form is one listed key. An entry that no session can match would let the peer it names pass a deny list, so `PeerListGate::new` refuses the whole list when an entry is one of these:
+
+- An entry that is no SubjectPublicKeyInfo, or whose canonical form exceeds the DER length cap (`PeerListError::Unreadable`).
+- An elliptic-curve entry that reads as no point (`PeerListError::NoPoint`): an encoding the decoder of its curve refuses, a malformed point, the compact or a hybrid form, a key with no named curve, a key on a binary-field curve, or a key under `id-ecDH` or `id-ecMQV`.
+- A point on a curve that the gate's `KeyCurves` holds no decoder for (`PeerListError::NoDecoder`).
+
+`PeerListGate::allow` and `deny` read under `KeyCurves::HOUSE`, so a list of keys on another curve is built with `PeerListGate::new` and a decoder of that curve. The hive's circuit breaker keys on the same value as the gate.
 
 **ReceptorPolicy (message-level filtering):**
 
@@ -1731,7 +1814,12 @@ confirm = HMAC-H(mac_c, transcript_hash)
 server  = HMAC-H(mac_s, transcript_hash || SignerInfo.signature)
 ```
 
-`S` is the handshake's salt. The client sends `confirm` in its closing, in both flows. The server of either flow sends `server`, the server Finished, in its reply, over the transcript hash and the octets of the reply's one signature, and the client verifies it before it builds its closing. [NIST SP 800-56A Rev. 3][nist-800-56a] §5.9 is not claimed: its confirming party owns a static key-establishment key, and the client owns none.
+`S` is the handshake's salt, and the two tags follow these rules:
+
+- The client sends `confirm` in its closing, in both flows.
+- The server of either flow sends `server`, the server Finished, in its reply, over the transcript hash and the octets of the reply's one signature. The client verifies it before it builds its closing.
+
+[NIST SP 800-56A Rev. 3][nist-800-56a] §5.9 is not claimed, because its confirming party owns a static key-establishment key, and the client owns none.
 
 #### 8.5.3 Implementation: CMS-Based Handshake Protocol
 
@@ -1742,7 +1830,11 @@ CMS handshake uses [RFC 5652][rfc5652] Cryptographic Message Syntax:
 - **`KEKRecipientInfo`**: The recipient of the closing, under a key of the handshake secret
 - **`SignedData`**: Transcript signatures for authentication
 
-The opening seals the base secret and the client's agreement ephemeral `R` to the server's key-agreement certificate, and it carries the security and transport offers as authenticated attributes. The server's signing certificate signs the server Finished, and the client refuses a server ephemeral that shares the x-coordinate of either certificate key. The server Finished carries the server Finished MAC of [§8.5.2](#852-specification-handshake-flow-and-state-management) as an unsigned attribute, as the HPKE reply does, and the client verifies it before it builds its closing.
+The CMS flow carries its keys and proofs as follows:
+
+- The opening seals the base secret and the client's agreement ephemeral `R` to the server's key-agreement certificate, and it carries the security and transport offers as authenticated attributes.
+- The server's signing certificate signs the server Finished, and the client refuses a server ephemeral that shares the x-coordinate of either certificate key.
+- The server Finished carries the server Finished MAC of [§8.5.2](#852-specification-handshake-flow-and-state-management) as an unsigned attribute, as the HPKE reply does, and the client verifies it before it builds its closing.
 
 **Mutual authentication flow:**
 
@@ -2058,9 +2150,9 @@ let security_accept = SecurityAccept {
 
 #### 8.6.1 Concept: Concurrent Streams Over One Connection
 
-A multiplexer (mux) runs concurrent request/response streams on one connection. The model follows [RFC 9113][rfc9113] HTTP/2 streams. Without mux, each `emit`/`collect` pair is single-flight. A slow peer response then stalls later requests on that connection. With mux, independent streams interleave on the wire. One delayed response does not block siblings.
+A multiplexer (mux) runs concurrent request/response streams on one connection, on the model of [RFC 9113][rfc9113] HTTP/2 streams. Without mux, each `emit`/`collect` pair is single-flight, so a slow peer response stalls later requests on that connection. With mux, independent streams interleave on the wire, so one delayed response leaves its siblings running.
 
-Mux is an application-layer stream router over the envelope transport. It does not replace TCP or the handshake. It sits above split envelope halves after session establishment.
+Mux is an application-layer stream router over the envelope transport. It runs above TCP and the handshake, on split envelope halves after session establishment.
 
 > Requires the `transport-multiplex` feature.
 
@@ -2080,7 +2172,7 @@ Mux is an application-layer stream router over the envelope transport. It does n
 
 | Mode      | Session                                                     | Settings source                                                 | Split API      | Security properties                                                 |
 | --------- | ----------------------------------------------------------- | --------------------------------------------------------------- | -------------- | ------------------------------------------------------------------- |
-| Encrypted | CMS or HPKE handshake with matching `TransportOffer`s       | `negotiated_mux()`                                              | `into_split()` | Handshake authentication + AEAD as configured for the session       |
+| Encrypted | CMS or HPKE handshake with matching `TransportOffer`s       | `negotiated_mux()`                                              | `into_mux`     | Handshake authentication + AEAD as configured for the session       |
 | Cleartext | None: the transport was built as a named cleartext endpoint | Out-of-band `MuxSettings::symmetric(cap)`. Both ends MUST agree | `into_split()` | NONE: no confidentiality, integrity, replay, or deletion protection |
 
 Cleartext mux is for controlled environments and tests. It MUST NOT replace an encrypted session on a hostile network.
@@ -2138,7 +2230,7 @@ responder:  Data(...)*    End(status, payload?)
 either:     Cancel(code)  Credit(limit)
 ```
 
-**Chunking** (mandatory, no opt-out): Every message segments at the peer-advertised `chunk_payload_size` (1-64 KiB, default 16 KiB, [RFC 9113 §4.2][rfc9113-4.2]). Reassembly follows arrival order. The ordered AEAD channel already proves order and completeness. Chunks carry no sequence numbers. An oversize chunk is a protocol violation: GoAway(`ProtocolError`). A unary message still travels in one record.
+**Chunking** (mandatory, no opt-out): Every message segments at the peer-advertised `chunk_payload_size` (1-64 KiB, default 16 KiB, [RFC 9113 §4.2][rfc9113-4.2]). Reassembly follows arrival order, because the ordered AEAD channel already proves order and completeness, so chunks carry no sequence numbers. An oversize chunk is a protocol violation: GoAway(`ProtocolError`). A unary message still travels in one record.
 
 **Stream credit**: Each inbound stream gets a chunk allowance (default 64) that the receiver refills with `Credit`. A sender out of credit waits. An overrun is a protocol violation, so reassembly memory stays bounded ([RFC 9000 §4.1][rfc9000-4.1]).
 
@@ -2257,26 +2349,21 @@ Client Side - Offering Mux:
 │        TransportOffer::mux(max_peer_initiated_streams)   │
 │    ))                                                    │
 │ 2. Perform CMS or HPKE handshake                         │
-│ 3. settings = transport.negotiated_mux()  // Some(...)   │
-│ 4. (reader, writer) = transport.into_split()             │
-│ 5. MuxTransport::new(reader, writer, MuxRole::Client,    │
-│                      settings)                           │
+│ 3. mux = transport.into_mux(MuxRole::Client)             │
 └──────────────────────────────────────────────────────────┘
 ```
 
 ```rust,ignore
 use tightbeam::policy::TransitStatus;
 use tightbeam::transport::handshake::negotiation::TransportOffer;
-use tightbeam::transport::multiplex::{MuxRole, MuxTransport};
+use tightbeam::transport::multiplex::MuxRole;
 use tightbeam::transport::ResponsePackage;
 use tightbeam::Frame;
 
 transport = transport.with_mux_offer(Some(TransportOffer::mux(32)));
 // ... perform CMS or HPKE handshake ...
 
-let settings = transport.negotiated_mux().expect("mux negotiated");
-let (reader, writer) = transport.into_split()?;
-let mux = MuxTransport::new(reader, writer, MuxRole::Client, settings);
+let mux = transport.into_mux(MuxRole::Client)?;
 let (handle, reader_drv, writer_drv, responder) = mux.into_parts();
 
 tokio::spawn(reader_drv.drive());
@@ -2294,6 +2381,12 @@ handle.shutdown().await?;
 ```
 
 `shutdown` sends GoAway(`Shutdown`) and waits for open streams to finish. Wrap it in a timer to bound the drain.
+
+A metered session renews its epoch in band only through the rekey context its handshake left:
+
+- `TcpTransport::into_mux(role)` detaches that context, splits the transport, and assembles it in one call, so it serves a metered session.
+- By hand, `MuxConnector::take_rekey` or `MuxAcceptor::take_rekey` detaches the context before the split, and `MuxTransport::with_rekey(reader, writer, context, settings)` assembles the transport in the role of that context.
+- A transport that `MuxTransport::new` assembles drains via GoAway near the record limit, as a session without a receipt does.
 
 **Cleartext path:**
 
@@ -2406,7 +2499,7 @@ let mut client = pool.connect(server_addr).await?;
 let response = client.emit(frame, None).await?;
 ```
 
-With an offer configured, `connect` shares one multiplexed connection per destination. Every caller leases a clone of the same `MuxHandle`. `emit` opens a fresh stream. `PooledClient::conn()` (the exclusive-connection accessor) answers `ResourceExhausted` on a mux lease. `emit` is the transport-agnostic call.
+With an offer configured, `connect` shares one multiplexed connection per destination, and every caller leases a clone of the same `MuxHandle`. `emit` is the transport-agnostic call, and it opens a fresh stream. `PooledClient::conn()` (the exclusive-connection accessor) answers `ResourceExhausted` on a mux lease.
 
 **Metered pooled sessions** (budgets on the offer, settlement hooks on the pool):
 
@@ -2511,11 +2604,11 @@ EEIC has four main components:
 - [Hives](#933-i-hives) - Interconnected infrastructure
 - [Clusters](#934-c-clusters) - Compute orchestration
 
-Think of workers as ants, servlets as ant hills, and clusters as ant colonies. Insects have specific functions with which they process organic matter using local information. These functions are often simple, but when combined in large numbers, they can perform complex tasks. The efficiency of each unit is attributed to their fungible nature--how well it can accomplish its singular task.
+Think of workers as ants, servlets as ant hills, and clusters as ant colonies. Insects have specific functions with which they process organic matter using local information. These functions are often simple, but when combined in large numbers, they can perform complex tasks. The efficiency of each unit comes from its fungible nature: how well it accomplishes its singular task.
 
 #### 9.3.1 E: Workers
 
-Workers are the smallest unit of computation in the EEIC--the "ants" that do the actual work. Most business logic does not need network context. A function that doubles a number does not care whether the input came from TCP, UDP, or an in-memory channel. Isolating that logic into workers gives:
+Workers are the smallest unit of computation in the EEIC: the "ants" that do the work. Most business logic does not need network context. A function that doubles a number does not care whether the input came from TCP, UDP, or an in-memory channel. Isolating that logic into workers gives:
 
 - **Parallelism**: Multiple workers can process messages concurrently
 - **Fault Isolation**: A failing worker does not crash the servlet
@@ -2530,7 +2623,7 @@ Workers are intentionally constrained:
 2. **Message-only**: Workers receive decoded messages, not raw Frames
 3. **Stateless between messages**: Configuration is fixed at creation time
 
-These constraints enable the parallelism and fault isolation that make EEIC effective. Workers do not coordinate with each other--they just transform input to output.
+These constraints give EEIC its parallelism and fault isolation. Each worker transforms input to output on its own, with no coordination between workers.
 
 > Note: Do not work around the Frame limitation by stuffing a Frame into a message parameter. Handle Frame concerns at the servlet boundary instead.
 
@@ -2611,7 +2704,7 @@ Assertion labels are `Urn` constants shared by emit sites and the spec (exact st
 
 #### 9.3.2 E: Servlets
 
-Servlets are the network endpoints of the EEIC--the "anthills" where messages arrive and are processed. Workers own pure business logic. Servlets own the protocol layer: accept connections, decode frames, dispatch to workers, and send responses.
+Servlets are the network endpoints of the EEIC: the "anthills" where messages arrive and are processed. Workers own pure business logic. Servlets own the protocol layer: accept connections, decode frames, dispatch to workers, and send responses.
 
 ##### Architecture
 
@@ -2623,7 +2716,7 @@ Servlets sit between the network and workers:
 4. **Dispatch** to one or more workers for processing
 5. **Compose** the response Frame and send it back
 
-This separation means servlets handle concerns like connection management, frame validation, and response composition--things workers should not know about.
+Servlets therefore own connection management, frame validation, and response composition, so workers stay free of those concerns.
 
 ##### Single Message Type Rule
 
@@ -2639,7 +2732,7 @@ pub enum CalcRequest {
 }
 ```
 
-> Note: It is preferable to implement a strict separation of concerns between servlets. Each servlet should handle only one message type. Abusing Choice types to group unrelated message types is poor form.
+> Note: Keep a strict separation of concerns between servlets. Each servlet should handle only one message type, and a Choice type that groups unrelated message types is poor form.
 
 ##### Gate Policies
 
@@ -2870,7 +2963,7 @@ Hives sit between clusters and servlets. A servlet handles one message type on o
 
 Hives support two operating modes:
 
-**Single-Servlet Mode** lets a hive "morph" between servlet types. The cluster sends an `ActivateServletRequest`. The hive stops its current servlet and starts the requested one. That supports dynamic workload reallocation--for example switching from "analysis" to "calculation" based on cluster demand.
+**Single-Servlet Mode** lets a hive "morph" between servlet types. The cluster sends an `ActivateServletRequest`. The hive stops its current servlet and starts the requested one. That supports dynamic workload reallocation, such as a switch from "analysis" to "calculation" on cluster demand.
 
 **Multi-Servlet Mode** runs all registered servlets at once, each on a different port. That requires a "mycelial" protocol (like TCP) which supports multiple endpoints. Call `establish(trace)` after `register` to spawn registered servlets, then register with a cluster to advertise capabilities.
 
@@ -2878,7 +2971,7 @@ The protocol's capabilities select the mode. On mycelial protocols, multi-servle
 
 ##### Mycelial Protocols
 
-"Mycelial" means a protocol can spawn multiple endpoints from one base address--like fungal mycelium branching from a central point. TCP is mycelial: one host address (for example `192.168.1.100`) can bind multiple ports (`SocketAddress`). A hive can then spawn servlets on ports 8001, 8002, 8003, and so on, each handling a different message type.
+"Mycelial" means a protocol can spawn multiple endpoints from one base address, as fungal mycelium branches from a central point. TCP is mycelial: one host address (for example `192.168.1.100`) can bind multiple ports (`SocketAddress`). A hive can then spawn servlets on ports 8001, 8002, 8003, and so on, each handling a different message type.
 
 Non-mycelial protocols (like in-memory channels) stay in single-servlet mode.
 
@@ -2933,7 +3026,7 @@ let hive_conf = HiveConfig {
 
 Without a trust store, all cluster commands are rejected. See [Trust Stores](#trust-stores) for building trust stores from cluster certificates.
 
-Signed commands are additionally checked for freshness: each signed command frame states its issue time in `metadata.order` (unix milliseconds), and the hive rejects commands outside `control.command_freshness_window` of `HiveConfig::clock` or whose signature was already seen inside that window (replay protection).
+Signed commands are also checked for freshness. Each signed command frame states its issue time in `metadata.order` (unix milliseconds), and the hive rejects a command outside `control.command_freshness_window` of `HiveConfig::clock`, or one whose signature it already saw inside that window (replay protection).
 
 ##### Resilience Features
 
@@ -3142,15 +3235,16 @@ let cluster = MyCluster::start(trace, ClusterConfig::new(tls)).await?;
 Clusters require TLS configuration for secure communication with hives and, when federating, with peer gateways. The cluster acts as a TLS client when connecting outbound, presenting its certificate for mutual authentication.
 
 ```rust,ignore
-let tls = ClusterTlsConfig {
-	certificate: CertificateSpec::Built(Box::new(cert)),
-	key: Arc::new(Secp256k1KeyProvider::from(key)),
-	validators: vec![],         // Optional: extra checks on dialed server certs (both planes)
-	client_validators: vec![],  // Non-empty: gateway requires client certs (mTLS)
-	hive_trust: Some(hive_trust),  // Hive-plane: registration, address updates, PublishGossip
-	peer_trust: Some(peer_trust),  // Peer-plane: AdvertisePeer, relayed Gossip, ReconcileGossip
-};
+let tls = ClusterTlsConfig::new(CertificateSpec::Built(Box::new(cert)), Arc::new(Secp256k1KeyProvider::from(key)))?
+	.with_validators(vec![])         // Optional: server policy of each dial (both planes)
+	.with_client_validators(vec![])  // Non-empty: gateway requires client certs (mTLS)
+	.with_hive_trust(hive_trust)     // Hive-plane: registration, address updates, PublishGossip
+	.with_peer_trust(peer_trust);    // Peer-plane: AdvertisePeer, relayed Gossip, ReconcileGossip
 ```
+
+`validators` is the server policy of each outbound dial. Every gateway dial runs the HPKE flow, so each validator evaluates the signing certificate that the dialed server's reply names.
+
+The store alone admits each issuer and each root. A check of every certificate, such as a denylist, belongs in the store's `RevocationChecker`, which the built-in store also runs at each frame verification and each plane check. [docs/handshake.md](docs/handshake.md#the-server-policy) states when each check runs.
 
 The two trust stores are separate planes and MUST NOT cross:
 
@@ -3257,24 +3351,25 @@ let conf = ClusterConfig::builder(tls)
 
 **Grants**
 
-`ExportGrant` opens one unexported target to selected caller identities. A target passes when it is exported, granted, or a first-party origin request, and every deny gate must then agree.
+`ExportGrant` opens one unexported target to selected caller identities. A target passes when it is exported, granted, or a first-party origin request, and every deny gate must then agree. A grant or a gate that keys on the caller's key asks a `PeerListGate` through `GatePolicy::evaluate`, which reads the key identity that the trust store reads.
 
 ```rust,ignore
 struct PartnerGrant {
-	granted_spki: Vec<u8>,
+	partners: PeerListGate,
 	target: Urn<'static>,
 }
 
 impl ExportGrant for PartnerGrant {
 	fn grants(&self, target: &Urn<'_>, session: &SessionContext, _relayed: bool) -> bool {
-		*target == self.target && session.peer_public_key() == Some(self.granted_spki.as_slice())
+		*target == self.target && GatePolicy::evaluate(&self.partners, None, session) == TransitStatus::Ok
 	}
 }
 
+let partners = PeerListGate::allow([granted_spki])?;
 let conf = ClusterConfig::builder(tls)
 	.with_exported_types([namespace.servlet("search")?])
 	// Partner B may reach "ledger" without it being advertised
-	.with_export_grant(Arc::new(PartnerGrant { granted_spki, target: namespace.servlet("ledger")? }))
+	.with_export_grant(Arc::new(PartnerGrant { partners, target: namespace.servlet("ledger")? }))
 	.build();
 ```
 
@@ -3290,23 +3385,24 @@ Custom gates add per-identity deny rules. Every gate must pass, and a deny overr
 
 ```rust,ignore
 struct DenyPeerKeyGate {
-	denied_spki: Vec<u8>,
+	denied: PeerListGate,
 	target: Urn<'static>,
 }
 
 impl ExportGate for DenyPeerKeyGate {
 	fn evaluate(&self, target: &Urn<'_>, session: &SessionContext, _planes: &TrustPlanes<'_>, _relayed: bool) -> TransitStatus {
-		if *target == self.target && session.peer_public_key() == Some(self.denied_spki.as_slice()) {
-			return TransitStatus::PermissionDenied;
+		if *target == self.target {
+			return GatePolicy::evaluate(&self.denied, None, session);
 		}
 
 		TransitStatus::Ok
 	}
 }
 
+let denied = PeerListGate::deny([denied_spki])?;
 let conf = ClusterConfig::builder(tls)
 	.with_exported_types([namespace.servlet("ping")?])
-	.with_export_gate(Arc::new(DenyPeerKeyGate { denied_spki, target: namespace.servlet("ping")? }))
+	.with_export_gate(Arc::new(DenyPeerKeyGate { denied, target: namespace.servlet("ping")? }))
 	.build();
 ```
 
@@ -3334,7 +3430,7 @@ Gossip delivery (`GossipConfig::ingress`) is outside the export boundary. The op
 Clusters continuously monitor hive health through heartbeats. Each heartbeat is a signed frame sent to the hive, which responds with its current utilization. This serves two purposes:
 
 - **Liveness Detection**: Hives that fail to respond are marked unhealthy and eventually evicted from the registry.
-- **Load Metrics**: Utilization data informs the load balancer, enabling smarter routing decisions.
+- **Load Metrics**: Utilization data informs the routing decisions of the load balancer.
 
 Configure heartbeat behavior via `HeartbeatConfig`:
 
@@ -3357,7 +3453,7 @@ The `on_heartbeat` callback enables monitoring and metrics collection:
 
 ##### Load Balancing
 
-When several instances serve one type, a `LoadBalancer` picks one across local and peer routes. The default `StochasticForager` picks in proportion to each route's pheromone strength, and it never starves or monopolizes an instance. Swap it with `with_load_balancer` for `RoundRobin`, `PowerOfTwoChoices`, or your own.
+When more than one instance serves one type, a `LoadBalancer` picks one across local and peer routes. The default `StochasticForager` picks in proportion to each route's pheromone strength, and it never starves or monopolizes an instance. Swap it with `with_load_balancer` for `RoundRobin`, `PowerOfTwoChoices`, or your own.
 
 ##### Colony Gossip
 
@@ -3554,11 +3650,15 @@ Omit `hives:` when registration itself is under test. For federation and gossip 
 
 ##### Conclusion
 
-How you wish to model your colonies is beyond the scope of this document. However, it is important to understand the basic building blocks and how they can be combined to create complex systems. The swarm is yours to command.
+This document leaves the model of a colony to the deployment. Workers, servlets, hives, and clusters are its building blocks, and a deployment combines them into larger systems. The swarm is yours to command.
 
 ## 10. Instrumentation
 
-Instrumentation produces a semantic event sequence for verification and audit. Tests MUST NOT assert against instrumentation events by inspecting or branching on individual events at runtime. Tests MUST declare expectations as a spec. Verification MUST treat the finalized event stream as the authoritative truth for a single execution.
+Instrumentation produces a semantic event sequence for verification and audit:
+
+- Tests MUST NOT assert against instrumentation events by inspecting or branching on individual events at runtime.
+- Tests MUST declare expectations as a spec.
+- Verification MUST treat the finalized event stream as the authoritative truth for a single execution.
 
 Feature gating:
 
@@ -3685,7 +3785,7 @@ Binary serialization requirements:
 
 Artifact integrity:
 
-- `trace_hash` MUST be SHA3-256 over a canonical byte encoding of the event list (sequence numbers, URN strings, labels, payload hashes, flags, durations, timestamps, and extras)--not a free-form dump of surrounding artifact fields.
+- `trace_hash` MUST be SHA3-256 over a canonical byte encoding of the event list (sequence numbers, URN strings, labels, payload hashes, flags, durations, timestamps, and extras), and not a free-form dump of surrounding artifact fields.
 - `evidence_hash` MUST be SHA3-256(`specHash` || `traceHash`) where `||` is raw byte concatenation.
 
 Privacy:
@@ -4258,7 +4358,7 @@ assertions: [
 
 #### 12.2.7 Tag-Based Assertion Filtering
 
-Assertions can be tagged with arbitrary string labels for flexible categorization and filtering. Tags enable version-scoped testing where a single scenario can validate multiple protocol versions.
+An assertion can carry arbitrary string tags, which a spec categorizes and filters on. Tags enable version-scoped testing, where a single scenario can validate multiple protocol versions.
 
 #### 12.2.8 Recording Trace Events
 
@@ -4281,8 +4381,8 @@ trace.event_with(RESPONSE_OK, &["tag_a"], true)?;
 **Tags:**
 
 - Emit with tags: `trace.event_with(FEATURE, &["v0", "v1"], ())`
-- Specs filter with `tag_filter: ["v0"]` -- only matching tagged assertions count
-- One emit can satisfy several versioned specs by listing multiple tags
+- Specs filter with `tag_filter: ["v0"]`, so only matching tagged assertions count
+- One emit can satisfy more than one versioned spec by listing multiple tags
 
 **Example: version-scoped testing:**
 
@@ -4346,7 +4446,7 @@ Supported schedulers:
 - **Earliest Deadline First (EDF)**: Dynamic priority scheduling with utilization bound ≤ 1.0 (exact for implicit deadlines)
 - **Response Time Analysis (RTA)**: Exact schedulability test for fixed-priority task sets (D ≤ T). EDF task sets are rejected since the fixed-priority recurrence does not model dynamic priorities
 
-Additional features include percentile-based WCET analysis (P50-P99.99), confidence intervals, and fixed-point arithmetic for deterministic calculations. See §12.3.5 for timing constraints in process specifications
+Additional features include percentile-based WCET analysis (P50-P99.99), confidence intervals, and fixed-point arithmetic for deterministic calculations. See §12.3.5 for timing constraints in process specifications.
 
 ### 12.3 Layer 2: Process Specifications (CSP)
 
@@ -4360,7 +4460,7 @@ ProcessSpec defines labeled transition systems (LTS) for formal process modeling
 - **Terminal states**: Valid end states
 - **Nondeterministic states**: States with internal choice
 
-Enabled with `testing-csp` feature flag.
+The `testing-csp` feature flag enables it.
 
 #### 12.3.2 Specification: tb_process_spec! Syntax
 
@@ -4561,7 +4661,7 @@ Composition properties (`deadlock_free`, `livelock_free`, `deterministic`) are c
 
 #### 12.4.1 Concept
 
-Refinement checking provides multi-seed exploration for trace and failures refinement verification. Formal definitions of traces, failures, and divergences are in §12.1.1 and §12.5. Configuration and verdict structure follow. The method is Failures-Divergences Refinement (FDR) from CSP theory. Enable it with the `testing-fdr` feature flag.
+Refinement checking applies Failures-Divergences Refinement (FDR) from CSP theory, with multi-seed exploration for trace and failures refinement verification. Formal definitions of traces, failures, and divergences are in §12.1.1 and §12.5, and configuration and verdict structure follow. Enable it with the `testing-fdr` feature flag.
 
 **Verification Properties**:
 
@@ -4751,7 +4851,7 @@ pub struct FdrVerdict {
 | **Stable Failures (F)**       | L2 ProcessSpec  | Valid refusals at choice points | failures(Impl) ⊆ failures(Spec) |
 | **Failures-Divergences (FD)** | L3 FDR          | Livelock freedom (no τ-loops)   | divergences(Impl) = ∅           |
 
-**Traces Model**: Verifies that all observable event sequences produced by the implementation are allowed by the specification. This ensures basic behavioral correctness - the system never produces an unexpected sequence of external events.
+**Traces Model**: Verifies that the specification allows every observable event sequence the implementation produces. That is basic behavioral correctness: every sequence of external events the system produces is one the specification expects.
 
 **Stable Failures Model**: Extends trace verification by checking what events a process can _refuse_ after each trace. A stable state is one where no internal progress (τ-transitions) can occur. At choice points, the implementation must not refuse events the specification accepts, preventing incorrect nondeterminism.
 
@@ -4810,7 +4910,7 @@ The `choice` annotation declares states where internal nondeterminism may occur.
 
 Based on research by Pedersen & Chalmers,[^pedersen2024] refinement in cooperatively scheduled systems depends on resource availability. With `n` concurrent processes and `m` schedulers where `m < n`, some traces become impossible due to scheduling constraints.
 
-**tightbeam addresses this through multi-seed exploration**: Each seed represents a different scheduling strategy, exploring alternative interleaving of concurrent events. This is analogous to testing with different numbers of schedulers to verify behavior across resource constraints:
+**tightbeam addresses this through multi-seed exploration**: Each seed represents a different scheduling strategy, exploring alternative interleaving of concurrent events. Each seed works like a test under another number of schedulers, so the exploration checks behavior across resource constraints:
 
 ```rust,ignore
 fdr: FdrConfig {
@@ -4848,7 +4948,7 @@ Generated CSPM includes:
 - Labeled transition system as CSP processes
 - Main process with τ-hiding: `Process = InitialState \ {| hidden |}`
 
-This enables:
+The export supports:
 
 1. **Independent verification** with FDR4's exhaustive model checker
 2. **Algebraic proofs** using CSP laws and theorems
@@ -4903,7 +5003,7 @@ These queries enable CSP-style reasoning about process behavior at specific stat
 
 ### 12.6 Fault Injection
 
-Fault injection enables systematic error testing through CSP state-driven fault injection during refinement checking. Requires `testing-fault` feature flag.
+Fault injection enables systematic error testing through CSP state-driven fault injection during refinement checking. It requires the `testing-fault` feature flag.
 
 #### 12.6.1 FaultModel Configuration
 
@@ -5368,7 +5468,7 @@ cargo afl fuzz -i fuzz_in -o fuzz_out "$FUZZ_TARGET"
 
 #### 12.8.4 Advanced: CSP Oracle Integration
 
-The `CspOracle` interprets AFL's random bytes as state machine navigation choices, ensuring fuzz inputs trigger valid protocol behavior:
+The `CspOracle` interprets AFL's random bytes as choices among state machine transitions, ensuring fuzz inputs trigger valid protocol behavior:
 
 **How It Works**:
 
@@ -5423,7 +5523,7 @@ tightbeam automatically derives IJON annotations from CSP process specifications
 
 **Automatic IJON Integration**:
 
-When built with `--features testing-fuzz-ijon`, tightbeam's `tb_scenario!` macro automatically inserts IJON calls after each successful fuzz execution
+When built with `--features testing-fuzz-ijon`, tightbeam's `tb_scenario!` macro automatically inserts IJON calls after each successful fuzz execution.
 
 **Comparison with Pure AFL**:
 
@@ -5473,35 +5573,35 @@ Capabilities by testing layer:
 | Assertion cardinality checks                    | ✓                | ✓                        | ✓                                | ✓                   |
 | Crash/panic detection                           | ✓                | ✓                        | ✓                                | ✓                   |
 | **CSP Modeling**                                |                  |                          |                                  |                     |
-| CSP process modeling                            | –                | ✓                        | ✓                                | –                   |
-| Compile-time label validation                   | –                | ✓                        | ✓                                | –                   |
-| Runtime trace validation                        | –                | ✓                        | ✓                                | –                   |
-| Terminal state verification                     | –                | ✓                        | ✓                                | –                   |
+| CSP process modeling                            | -                | ✓                        | ✓                                | -                   |
+| Compile-time label validation                   | -                | ✓                        | ✓                                | -                   |
+| Runtime trace validation                        | -                | ✓                        | ✓                                | -                   |
+| Terminal state verification                     | -                | ✓                        | ✓                                | -                   |
 | **FDR Refinement**                              |                  |                          |                                  |                     |
-| Multi-seed exploration                          | –                | –                        | ✓                                | –                   |
-| Trace refinement (⊑T)                           | –                | –                        | ✓                                | –                   |
-| Failures refinement (⊑F)                        | –                | –                        | ✓                                | –                   |
-| Divergence detection (τ-loops)                  | –                | –                        | ✓                                | –                   |
-| Determinism checking                            | –                | –                        | ✓                                | –                   |
-| Refusal set analysis                            | –                | –                        | ✓                                | –                   |
-| Acceptance set queries                          | –                | –                        | ✓                                | –                   |
-| CSPM export (FDR4)                              | –                | –                        | ✓                                | –                   |
+| Multi-seed exploration                          | -                | -                        | ✓                                | -                   |
+| Trace refinement (⊑T)                           | -                | -                        | ✓                                | -                   |
+| Failures refinement (⊑F)                        | -                | -                        | ✓                                | -                   |
+| Divergence detection (τ-loops)                  | -                | -                        | ✓                                | -                   |
+| Determinism checking                            | -                | -                        | ✓                                | -                   |
+| Refusal set analysis                            | -                | -                        | ✓                                | -                   |
+| Acceptance set queries                          | -                | -                        | ✓                                | -                   |
+| CSPM export (FDR4)                              | -                | -                        | ✓                                | -                   |
 | **AFL Fuzzing**                                 |                  |                          |                                  |                     |
-| Coverage-guided fuzzing                         | –                | –                        | –                                | ✓                   |
-| Edge coverage tracking                          | –                | –                        | –                                | ✓                   |
-| Input corpus evolution                          | –                | –                        | –                                | ✓                   |
+| Coverage-guided fuzzing                         | -                | -                        | -                                | ✓                   |
+| Edge coverage tracking                          | -                | -                        | -                                | ✓                   |
+| Input corpus evolution                          | -                | -                        | -                                | ✓                   |
 | **Timing Verification**                         |                  |                          |                                  |                     |
-| Timing constraints (WCET/Deadline/Jitter/Slack) | `testing-timing` | `testing-timing`         | `testing-timing`                 | –                   |
-| Timed CSP (clocks, guards)                      | –                | `testing-timing`         | `testing-timing`                 | –                   |
-| Schedulability analysis (RMA/EDF)               | –                | `testing-schedulability` | `testing-schedulability`         | –                   |
-| Early pruning (timing violations)               | –                | –                        | `testing-fdr` + `testing-timing` | –                   |
+| Timing constraints (WCET/Deadline/Jitter/Slack) | `testing-timing` | `testing-timing`         | `testing-timing`                 | -                   |
+| Timed CSP (clocks, guards)                      | -                | `testing-timing`         | `testing-timing`                 | -                   |
+| Schedulability analysis (RMA/EDF)               | -                | `testing-schedulability` | `testing-schedulability`         | -                   |
+| Early pruning (timing violations)               | -                | -                        | `testing-fdr` + `testing-timing` | -                   |
 | **Combined Capabilities**                       |                  |                          |                                  |                     |
-| CSP oracle for fuzzing                          | –                | –                        | –                                | `csp` + `fuzz`      |
-| IJON state annotations                          | –                | –                        | –                                | `csp` + `fuzz-ijon` |
+| CSP oracle for fuzzing                          | -                | -                        | -                                | `csp` + `fuzz`      |
+| IJON state annotations                          | -                | -                        | -                                | `csp` + `fuzz-ijon` |
 
 ### 12.10 Standards Compliance Mapping
 
-Maps tightbeam verification features to common high-assurance standards. The crate supports many evidence needs. Final certification evidence and process compliance remain the integrator's responsibility.
+The subsections below map tightbeam verification features to common high-assurance standards. The crate supports many evidence needs. Final certification evidence and process compliance remain the integrator's responsibility.
 
 #### 12.10.1 DO-178C DAL A / ISO 26262 ASIL-D
 
@@ -5640,9 +5740,9 @@ The following table summarizes tightbeam's native support for high-assurance sta
 | DO-178C         | DAL A  | 100% MC/DC, fault injection, traceability  | `FaultModel`, CSP specs, URN evidence      | `testing-fdr`, `testing-fault` |
 | ISO 26262       | ASIL-D | Systematic fault injection, FMEA/FMECA     | Auto-FMEA (ISO scale), fault campaigns     | `testing-fdr`, `testing-fmea`  |
 | IEC 61508       | SIL 4  | Error path coverage, reproducibility       | Deterministic injection, multi-seed FDR    | `testing-fdr`, `testing-fault` |
-| ECSS-E-HB-40A   | –      | SEU coverage, fault tree analysis          | Per-transition injection, CSP composition  | `testing-fdr`, `testing-fault` |
+| ECSS-E-HB-40A   | -      | SEU coverage, fault tree analysis          | Per-transition injection, CSP composition  | `testing-fdr`, `testing-fault` |
 | Common Criteria | EAL7   | Formal methods, machine-checkable evidence | CSP refinement, URN artifacts, CSPM export | `testing-fdr`                  |
-| MIL-STD-1629    | –      | FMEA with RPN calculation                  | Auto-severity (1-10), auto-RPN             | `testing-fmea`                 |
+| MIL-STD-1629    | -      | FMEA with RPN calculation                  | Auto-severity (1-10), auto-RPN             | `testing-fmea`                 |
 
 **Legend**:
 
@@ -5656,7 +5756,7 @@ The following table summarizes tightbeam's native support for high-assurance sta
 
 ### 13.1 Complete Client-Server Application
 
-End-to-end worker and servlet flows under `tb_scenario!` with AssertSpec + CSP. Assertion and process labels are `Urn` constants (exact match).
+These examples run end-to-end worker and servlet flows under `tb_scenario!` with AssertSpec + CSP. Assertion and process labels are `Urn` constants (exact match).
 
 #### Worker Integration Example
 
@@ -5920,7 +6020,7 @@ This project is licensed under either of
 
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
 
-**This means contributors grant rights under BOTH licenses**, providing:
+**Contributors therefore grant rights under BOTH licenses**, which provides:
 
 - MIT's simplicity for users who prefer it
 - Apache-2.0's patent grants for enhanced protection

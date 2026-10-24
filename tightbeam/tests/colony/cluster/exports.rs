@@ -27,6 +27,7 @@ use super::common::*;
 use super::federation::{type_route_count, wait_for_type_routes};
 use super::streaming::{pooled_cluster_client, StreamEchoServlet};
 use tightbeam::colony::cluster::{ExportGate, ExportGrant, TrustPlanes};
+use tightbeam::colony::hive::PeerListGate;
 use tightbeam::crypto::sign::SigningIdentity;
 use tightbeam::der::Encode;
 
@@ -64,7 +65,7 @@ fn exports_ctx() -> ExportsCtx {
 	}
 }
 
-/// Split-plane TLS for export scenarios.
+/// The split-plane TLS of the export scenarios.
 ///
 /// - `hive_trust` anchors the organization's own identity.
 /// - `peer_trust` anchors only the external peer.
@@ -84,9 +85,9 @@ fn mtls_split_plane_tls(own: &ClusterTestCerts, peer: &ClusterTestCerts) -> Clus
 	tls
 }
 
-/// Exporter with a static export list and no advertise beat.
+/// An exporter with a static export list and no advertise beat.
 ///
-/// Used by the stream-boundary scenario, which injects route claims directly.
+/// The stream-boundary scenario uses it and injects route claims directly.
 fn exporter_conf(
 	own: &ClusterTestCerts,
 	peer: &ClusterTestCerts,
@@ -116,7 +117,7 @@ fn mtls_exporter_conf(
 /// [`mtls_exporter_conf`] with one custom export gate beside the built-in
 /// allowlist.
 ///
-/// Used by the granular identity-rule scenario.
+/// The granular identity-rule scenario uses it.
 fn exporter_conf_with_gate(
 	own: &ClusterTestCerts,
 	peer: &ClusterTestCerts,
@@ -130,12 +131,11 @@ fn exporter_conf_with_gate(
 		.build()
 }
 
-/// Exporter on a fast beat toward `peer_addr`, carrying one grant.
+/// An exporter on a fast beat toward `peer_addr`, carrying one grant.
 ///
-/// Used by the ad-filter scenario, where discoverability itself is under
-/// test. The grant proves the slate stays filtered even when a caller is
-/// granted an unexported type, because grants are per-session and never
-/// enter ads.
+/// The ad-filter scenario, which tests discoverability itself, uses it. The
+/// grant proves the slate stays filtered even when a caller is granted an
+/// unexported type, because grants are per-session and never enter ads.
 fn advertising_exporter_conf(
 	own: &ClusterTestCerts,
 	peer: &ClusterTestCerts,
@@ -177,28 +177,29 @@ fn grant_exporter_conf(
 		.build()
 }
 
-/// Grant opening one target to one caller public key.
+/// A grant that opens one target to one caller public key.
 ///
 /// The granted subject is the adjacent authenticated principal, so on a
 /// relayed request the key belongs to the relaying peer gateway.
 struct PartnerGrant {
-	spki: Vec<u8>,
+	partners: PeerListGate,
 	target: Urn<'static>,
 }
 
 impl ExportGrant for PartnerGrant {
 	fn grants(&self, target: &Urn<'_>, session: &SessionContext, _relayed: bool) -> bool {
-		*target == self.target && session.peer_public_key() == Some(self.spki.as_slice())
+		*target == self.target && GatePolicy::evaluate(&self.partners, None, session) == TransitStatus::Ok
 	}
 }
 
 /// [`PartnerGrant`] for `holder`'s certificate key on `target`.
 fn partner_grant(holder: &ClusterTestCerts, target: Urn<'static>) -> Result<Arc<dyn ExportGrant>, TightBeamError> {
 	let spki = holder.cert.tbs_certificate.subject_public_key_info.to_der()?;
-	Ok(Arc::new(PartnerGrant { spki, target }))
+	let partners = PeerListGate::allow([spki])?;
+	Ok(Arc::new(PartnerGrant { partners, target }))
 }
 
-/// Edge peer that receives advertisements from the exporter and forwards
+/// An edge peer that receives advertisements from the exporter and forwards
 /// work to it.
 ///
 /// It runs no beat and carries no export list of its own.
@@ -206,7 +207,7 @@ fn edge_peer_conf(own: &ClusterTestCerts, peer: &ClusterTestCerts) -> ClusterCon
 	peering_cluster_conf_with_trust(own, Arc::clone(&peer.trust))
 }
 
-/// Hive hosting the echo servlet under two unary types.
+/// A hive that hosts the echo servlet under two unary types.
 ///
 /// - Exported: `"ping"`.
 /// - Private: `"ledger"`.
@@ -228,7 +229,7 @@ async fn start_split_hive(
 	Ok(hive)
 }
 
-/// Hive hosting the stream-echo servlet under two stream types.
+/// A hive that hosts the stream-echo servlet under two stream types.
 ///
 /// - Exported: `"stream-echo"`.
 /// - Private: `"vault"`.
@@ -268,7 +269,7 @@ async fn record_echo(
 	Ok(())
 }
 
-/// Client dialing `server_trust`'s gateway under `identity`, for a
+/// A client that dials `server_trust`'s gateway under `identity`, for a
 /// mutual-TLS gateway that captures the caller certificate.
 async fn connect_with_identity(
 	server_trust: Arc<dyn CertificateTrust>,
@@ -544,8 +545,7 @@ tb_assert_spec! {
 //
 // 1. A peer-spliced stream open for the unexported "vault" is refused at
 //    A's edge before any route is consulted, and the response future errors.
-// 2. A peer-spliced duplex open for "vault" is refused the same way, so
-//    neither opener bypasses the boundary.
+// 2. A peer-spliced duplex open for "vault" is refused the same way, so neither opener bypasses the boundary.
 // 3. An anonymous client dialing A directly is refused on "vault" at the
 //    origin budget: without an identity there is no first-party pass.
 // 4. The exported "stream-echo" splices through B to A's servlet and echoes
@@ -621,11 +621,11 @@ tb_scenario! {
 	}
 }
 
-/// Custom export gate that denies one authenticated peer key on one target.
+/// A custom export gate that denies one authenticated peer key on one target.
 ///
 /// This is the granular identity-rule DX the trait exists for.
 struct DenyPeerKeyGate {
-	denied_spki: Vec<u8>,
+	denied: PeerListGate,
 	target: Urn<'static>,
 }
 
@@ -637,8 +637,8 @@ impl ExportGate for DenyPeerKeyGate {
 		_planes: &TrustPlanes<'_>,
 		_relayed: bool,
 	) -> TransitStatus {
-		if *target == self.target && session.peer_public_key() == Some(self.denied_spki.as_slice()) {
-			return TransitStatus::PermissionDenied;
+		if *target == self.target {
+			return GatePolicy::evaluate(&self.denied, None, session);
 		}
 
 		TransitStatus::Ok
@@ -684,7 +684,8 @@ tb_scenario! {
 		},
 		client: |HiveEnv { trace, context: ctx, hive }| async move {
 			let denied_spki = ctx.b.cert.tbs_certificate.subject_public_key_info.to_der()?;
-			let gate = Arc::new(DenyPeerKeyGate { denied_spki, target: servlet_urn("ping") });
+			let denied = PeerListGate::deny([denied_spki])?;
+			let gate = Arc::new(DenyPeerKeyGate { denied, target: servlet_urn("ping") });
 			let conf_a = exporter_conf_with_gate(&ctx.a, &ctx.b, vec![servlet_urn("ping")], gate);
 			let gateway_a = start_cluster(&trace, conf_a).await?;
 			let gateway_b = start_cluster(&trace, edge_peer_conf(&ctx.b, &ctx.a)).await?;

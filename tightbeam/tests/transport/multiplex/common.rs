@@ -184,12 +184,12 @@ pub fn spawn_mux_endpoint_with(
 		writer = writer.with_rekey_limit(limit);
 	}
 
-	let mut mux = MuxTransport::new(reader, writer, role, settings);
+	let mut mux = match rekey {
+		Some(context) => MuxTransport::with_rekey(reader, writer, context, settings),
+		None => MuxTransport::new(reader, writer, role, settings),
+	};
 	if let Some(grantor) = config.grantor {
 		mux = mux.with_credit_grantor(grantor);
-	}
-	if let Some(context) = rekey {
-		mux = mux.with_rekey(context);
 	}
 	if let Some(deadline) = config.renewal_deadline {
 		mux = mux.with_renewal_deadline(deadline);

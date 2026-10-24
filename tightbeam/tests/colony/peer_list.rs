@@ -158,7 +158,7 @@ tb_scenario! {
 	environment ServiceClient {
 		context: DoormanContext::generate(),
 		server: |SetupEnv { context: ctx, trace }| async move {
-			let gate = PeerListGate::deny([ctx.client_key()?]);
+			let gate = PeerListGate::deny([ctx.client_key()?])?;
 			start_doorman_server(&ctx, gate, &trace).await
 		},
 		client: |ClientEnv { trace, context: ctx, addr }| async move {
@@ -201,7 +201,7 @@ tb_scenario! {
 	environment ServiceClient {
 		context: DoormanContext::generate(),
 		server: |SetupEnv { context: ctx, trace }| async move {
-			let gate = PeerListGate::allow([ctx.client_key()?]);
+			let gate = PeerListGate::allow([ctx.client_key()?])?;
 			start_doorman_server(&ctx, gate, &trace).await
 		},
 		client: |ClientEnv { trace, context: ctx, addr }| async move {

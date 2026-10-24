@@ -71,7 +71,13 @@ pub enum CertificateValidationError {
 	/// The certificate chain is invalid, because a certificate's issuer does
 	/// not name the subject of the certificate above it.
 	#[error("Certificate chain broken: issuer {issuer} does not match subject {subject}")]
-	InvalidChain { issuer: String, subject: String },
+	InvalidChain {
+		/// The issuer name of the lower certificate.
+		issuer: String,
+		/// The subject name of the certificate above it, which that issuer name
+		/// does not match.
+		subject: String,
+	},
 
 	/// The certificate chain is empty.
 	#[error("Empty certificate chain")]
@@ -82,14 +88,22 @@ pub enum CertificateValidationError {
 	/// The error carries the colliding key identifier, so the store entry can
 	/// be found.
 	#[error("SKID collision: two certificates share key identifier {skid}")]
-	SkidCollision { skid: String },
+	SkidCollision {
+		/// The key identifier both certificates carry, in hex.
+		skid: String,
+	},
 
-	/// Two certificates with different fingerprints hold the same public key.
+	/// Two certificates with different fingerprints hold the same public key,
+	/// by the key rule of the
+	/// [`CertificateTrust`](super::store::CertificateTrust#contract) contract.
 	///
-	/// The error carries the colliding SubjectPublicKeyInfo DER in hex, so the
-	/// store entry can be found.
-	#[error("Public key collision: two certificates share SubjectPublicKeyInfo {public_key}")]
-	PublicKeyCollision { public_key: String },
+	/// The error carries the SubjectPublicKeyInfo DER of the refused
+	/// certificate in hex, so the operator can find that certificate.
+	#[error("Public key collision: SubjectPublicKeyInfo {public_key} holds the key of another certificate")]
+	PublicKeyCollision {
+		/// The SubjectPublicKeyInfo DER of the second certificate, in hex.
+		public_key: String,
+	},
 
 	/// The issuer certificate is not a CA (RFC 5280 §6.1.4(k)).
 	#[error("Issuer certificate is not a CA")]

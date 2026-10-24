@@ -2,8 +2,6 @@
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
-#[cfg(all(not(feature = "std"), any(feature = "transport-cms", feature = "transport-hpke")))]
-use alloc::boxed::Box;
 #[cfg(not(feature = "std"))]
 use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
@@ -63,36 +61,14 @@ use crate::transport::state::ServerHandshakeSlot;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 mod handshake {
 	pub use crate::transport::error::TransportFailure;
-	pub use crate::transport::handshake::negotiation::RunnableProfile;
-	pub(crate) use crate::transport::handshake::ServerFlow;
 	pub use crate::transport::handshake::{
-		BoxedClientHandshake, BoxedServerHandshake, ClientConfig, ClientHandshakeProtocol, Handshake, HandshakeError,
-		HandshakeMessage, HandshakeProtocolKind, HandshakeProvider, ServerConfig, ServerHandshakeProtocol,
-		SupportedProfiles,
+		BoxedClientHandshake, ClientHandshakeProtocol, HandshakeMessage, HandshakeProvider, ServerHandshakeProtocol,
 	};
 	pub use crate::transport::state::SessionPhase;
 }
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use handshake::*;
-
-#[cfg(feature = "transport-hpke")]
-mod hpke {
-	pub use crate::crypto::x509::policy::CertificateValidation;
-	pub use crate::transport::handshake::{Hpke, HpkeClientSettings, HpkeServerSettings, LearnedTrust};
-}
-
-#[cfg(feature = "transport-hpke")]
-use hpke::*;
-
-#[cfg(feature = "transport-cms")]
-mod cms {
-	pub use crate::transport::handshake::negotiation::SecurityOffer;
-	pub use crate::transport::handshake::{Cms, CmsClientSettings, CmsServerSettings};
-}
-
-#[cfg(feature = "transport-cms")]
-use cms::*;
 
 /// Receive side of a split envelope link.
 ///
@@ -543,67 +519,6 @@ pub trait EncryptedMessageIO: MessageIO {
 		Ok(())
 	}
 
-	/// Build the HPKE client orchestrator from transport state.
-	///
-	/// The client proves the configured identity when one is present and dials
-	/// anonymously otherwise, so both cases run the one driver. The trust
-	/// store admits the certificate the server names, so a missing store fails
-	/// closed before the client sends anything (CWE-295).
-	///
-	/// # Errors
-	///
-	/// - [`TransportError::HandshakeError`] with
-	///   [`HandshakeError::MissingTrustStore`] -- no trust store is configured.
-	#[cfg(feature = "transport-hpke")]
-	fn build_hpke_client_orchestrator<P>(&self) -> TransportResult<BoxedClientHandshake>
-	where
-		Self: EncryptedProtocolState<CryptoProvider = P>,
-		P: HandshakeProvider,
-	{
-		let encryption = self.encryption();
-		let store = encryption.trust_store.as_ref().ok_or(HandshakeError::MissingTrustStore)?;
-		let validator = Arc::clone(store) as Arc<dyn CertificateValidation>;
-		let identity = encryption.client_identity.clone();
-		let settings = HpkeClientSettings { trust: LearnedTrust { validator }, identity };
-
-		let mut config = ClientConfig::<Hpke, P>::admitted(settings, encryption.key_purposes);
-		config.transport_offer = encryption.mux_offer.as_deref().cloned();
-		config.receipt_approver = encryption.receipt_approver.as_ref().map(Arc::clone);
-		Ok(Box::new(Handshake::client(config)))
-	}
-
-	/// Build the CMS client orchestrator from transport state.
-	///
-	/// CMS seals the base secret to the server's key-agreement certificate up
-	/// front, so that certificate comes from the trust the client's
-	/// configuration built once. The server verifies the client Finished
-	/// under the client's certificate, so a client without an identity fails
-	/// closed before it sends anything.
-	///
-	/// # Errors
-	///
-	/// - [`TransportError::MissingServerCertificateChain`] -- no server trust is provisioned.
-	/// - [`TransportError::HandshakeError`] with
-	///   [`HandshakeError::MutualAuthRequired`] -- no client identity is configured.
-	#[cfg(feature = "transport-cms")]
-	fn build_cms_client_orchestrator<P>(&self) -> TransportResult<BoxedClientHandshake>
-	where
-		Self: EncryptedProtocolState<CryptoProvider = P>,
-		P: HandshakeProvider,
-	{
-		let encryption = self.encryption();
-		let trust = encryption.cms_server.clone();
-		let trust = trust.ok_or(TransportError::MissingServerCertificateChain)?;
-		let identity = encryption.client_identity.as_ref().ok_or(HandshakeError::MutualAuthRequired)?;
-		let settings = CmsClientSettings { trust, identity: identity.clone() };
-
-		let mut config = ClientConfig::<Cms, P>::admitted(settings, encryption.key_purposes);
-		config.security_offer = Some(SecurityOffer::new(vec![RunnableProfile::<P>::native().descriptor()]));
-		config.transport_offer = encryption.mux_offer.as_deref().cloned();
-		config.receipt_approver = encryption.receipt_approver.as_ref().map(Arc::clone);
-		Ok(Box::new(Handshake::client(config)))
-	}
-
 	/// Drive the protocol-agnostic client handshake state machine, with bytes
 	/// in and bytes out.
 	///
@@ -685,17 +600,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		Self: Sized + MessageIO + EncryptedProtocolState<CryptoProvider = P>,
 		P: HandshakeProvider,
 	{
-		let kind = self.encryption().handshake_protocol;
-		let orchestrator = match kind {
-			#[cfg(feature = "transport-hpke")]
-			HandshakeProtocolKind::Hpke => self.build_hpke_client_orchestrator()?,
-
-			#[cfg(feature = "transport-cms")]
-			HandshakeProtocolKind::Cms => self.build_cms_client_orchestrator()?,
-
-			#[cfg(not(all(feature = "transport-cms", feature = "transport-hpke")))]
-			unsupported => return Err(TransportError::UnsupportedHandshakeProtocol(unsupported)),
-		};
+		let orchestrator = self.session_state().endpoint().client_handshake()?;
 
 		let outcome = self.drive_client_handshake(orchestrator).await;
 
@@ -703,69 +608,6 @@ pub trait EncryptedMessageIO: MessageIO {
 		self.emit_handshake_outcome(&outcome);
 
 		outcome
-	}
-
-	/// Returns the server configuration that every protocol shares, around the
-	/// settings and the identity of flow `F`.
-	///
-	/// The server runs the one profile its provider names, so the profile list
-	/// always holds that profile.
-	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-	fn server_config<F, P>(&self, flow: F::Settings, identity: F::Identity) -> ServerConfig<F, P>
-	where
-		Self: EncryptedProtocolState<CryptoProvider = P>,
-		F: ServerFlow<P>,
-		P: HandshakeProvider,
-	{
-		let encryption = self.encryption();
-		let profiles = SupportedProfiles::from(RunnableProfile::<P>::native().descriptor());
-
-		let mut config = ServerConfig::admitted(flow, identity, profiles, encryption.key_purposes);
-		config.peer_authentication = encryption.peer_authentication.clone();
-		config.transport = encryption.mux_offer.as_deref().cloned();
-		config.transport_authorizer = encryption.transport_authorizer.as_ref().map(Arc::clone);
-		config.session_observer = encryption.session_observer.as_ref().map(Arc::clone);
-		config
-	}
-
-	/// Build the HPKE server orchestrator from transport state. The HPKE
-	/// server signs with the signing identity it presents, and its secret
-	/// derives from the two ephemerals alone.
-	///
-	/// # Errors
-	///
-	/// - [`TransportError::MissingEncryption`] -- no server identity is configured.
-	#[cfg(feature = "transport-hpke")]
-	fn build_hpke_server_orchestrator<P>(&self) -> TransportResult<BoxedServerHandshake>
-	where
-		Self: EncryptedProtocolState<CryptoProvider = P>,
-		P: HandshakeProvider,
-	{
-		let identity = self.encryption().server_identity.as_ref();
-		let identity = identity.ok_or(TransportError::MissingEncryption)?;
-		let config = self.server_config::<Hpke, P>(HpkeServerSettings, identity.signing().clone());
-		Ok(Box::new(Handshake::server(config)))
-	}
-
-	/// Build the CMS server orchestrator from transport state, around the
-	/// pair of identities the server presents.
-	///
-	/// # Errors
-	///
-	/// - [`TransportError::MissingEncryption`] -- no server identity is configured.
-	/// - [`TransportError::MissingKeyAgreementIdentity`] -- the server holds a signing identity alone.
-	#[cfg(feature = "transport-cms")]
-	fn build_cms_server_orchestrator<P>(&self) -> TransportResult<BoxedServerHandshake>
-	where
-		Self: EncryptedProtocolState<CryptoProvider = P>,
-		P: HandshakeProvider,
-	{
-		let identity = self.encryption().server_identity.as_ref();
-		let identity = identity.ok_or(TransportError::MissingEncryption)?;
-		let pair = identity.cms_pair()?.clone();
-
-		let config = self.server_config::<Cms, P>(CmsServerSettings, pair);
-		Ok(Box::new(Handshake::server(config)))
 	}
 
 	/// Drive the protocol-agnostic server handshake state machine.
@@ -827,7 +669,7 @@ pub trait EncryptedMessageIO: MessageIO {
 	/// - [`TransportError::InvalidMessage`] -- the request passes the wire ceiling.
 	/// - [`TransportError::UnsupportedHandshakeProtocol`] -- this build lacks the configured protocol.
 	/// - [`TransportError::OperationFailed`] with
-	///   [`TransportFailure::DeadlineExceeded`] -- the handshake deadline elapsed.
+	///   [`TransportFailure::DeadlineExceeded`] -- the handshake timed out.
 	/// - The orchestrator build failure, and the
 	///   [`drive_server_handshake`](Self::drive_server_handshake) set.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -841,20 +683,9 @@ pub trait EncryptedMessageIO: MessageIO {
 			return Err(TransportError::InvalidMessage);
 		}
 
-		let kind = self.encryption().handshake_protocol;
-
 		// The orchestrator persists across messages, so it is created once.
 		if self.server_handshake_mut().is_none() {
-			let orchestrator = match kind {
-				#[cfg(feature = "transport-hpke")]
-				HandshakeProtocolKind::Hpke => self.build_hpke_server_orchestrator()?,
-
-				#[cfg(feature = "transport-cms")]
-				HandshakeProtocolKind::Cms => self.build_cms_server_orchestrator()?,
-
-				#[cfg(not(all(feature = "transport-cms", feature = "transport-hpke")))]
-				unsupported => return Err(TransportError::UnsupportedHandshakeProtocol(unsupported)),
-			};
+			let orchestrator = self.session_state().endpoint().server_handshake()?;
 
 			*self.server_handshake_mut() = Some(orchestrator);
 		}
@@ -919,7 +750,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		let returned_message = if status != TransitStatus::Ok {
 			match wire_envelope {
 				WireEnvelope::Cleartext(TransportEnvelope::Request(pkg)) => Some(pkg.message),
-				_ => None, // Encrypted - can't extract original
+				_ => None, // An encrypted request has no cleartext frame.
 			}
 		} else {
 			None
@@ -962,7 +793,7 @@ mod tests {
 	use crate::Version;
 
 	use crate::crypto::aead::SessionKeys;
-	use crate::crypto::x509::policy::ExpiryValidator;
+	use crate::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
 	use crate::transport::handshake::PeerAuthentication;
 	use crate::transport::TransportLimits;
 
@@ -1056,7 +887,7 @@ mod tests {
 
 	fn encrypted_phase() -> SessionPhase {
 		let keys = SessionKeys::for_client(crate::testing::TestKey::insecure_directional_keys());
-		SessionPhase::Encrypted(Box::new(EstablishedSession::new(keys, None, None, None, None)))
+		SessionPhase::Encrypted(Box::new(EstablishedSession::forged(keys, None, None)))
 	}
 
 	fn handshaking_phase() -> SessionPhase {

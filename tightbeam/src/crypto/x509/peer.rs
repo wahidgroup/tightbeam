@@ -45,6 +45,8 @@ use crate::x509::Certificate;
 #[cfg(feature = "signature")]
 use crate::crypto::profiles::SigningProvider;
 #[cfg(feature = "signature")]
+use crate::crypto::x509::key::Sec1Point;
+#[cfg(feature = "signature")]
 use crate::der::referenced::OwnedToRef;
 #[cfg(feature = "signature")]
 use crate::spki::SubjectPublicKeyInfoRef;
@@ -95,6 +97,14 @@ pub trait CertificateUse: sealed::Sealed {
 
 /// The signing use under the signature of `P`: the certificate's key
 /// verifies a CMS `SignerInfo` of `P` (RFC 5652 §5.4).
+///
+/// The parse of `P::VerifyingKey` MUST refuse two kinds of key, so each key
+/// this use admits is a point of the curve it names:
+///
+/// - A key whose parameters name a curve other than the curve of `P`.
+/// - A point off the curve of `P` (SEC 1 v2.0 §2.3.4).
+///
+/// The house providers refuse both.
 #[cfg(feature = "signature")]
 pub struct Signing<P>(PhantomData<fn() -> P>);
 
@@ -121,9 +131,11 @@ where
 /// The key-agreement use under the KEM `K`: a sender encapsulates to the
 /// certificate's key (RFC 9629 §3).
 ///
-/// The certificate asserts the bit of the KEM's certificate profile,
-/// [`RecipientKem::USAGE`]: `keyAgreement` for a DHKEM (RFC 5480 §3), and
-/// `keyEncipherment` for ML-KEM (RFC 9935 §5).
+/// - The certificate asserts the bit of the KEM's certificate profile,
+///   [`RecipientKem::USAGE`]: `keyAgreement` for a DHKEM (RFC 5480 §3), and
+///   `keyEncipherment` for ML-KEM (RFC 9935 §5).
+/// - The parse refuses an `id-ecPublicKey` point in a form that RFC 5480 §2.2
+///   refuses before the KEM reads the key, so the rule holds for every KEM.
 #[cfg(all(feature = "hpke", feature = "signature"))]
 pub struct KeyAgreement<K>(PhantomData<fn() -> K>);
 
@@ -138,6 +150,7 @@ impl<K: RecipientKem> CertificateUse for KeyAgreement<K> {
 	fn parse_key(certificate: &Certificate) -> Result<K::PublicKey, CertificateValidationError> {
 		certificate.require_use(Self::USAGE)?;
 		let spki = certificate.tbs_certificate.subject_public_key_info.owned_to_ref();
+		spki.require_point_form()?;
 		K::public_key(spki)
 	}
 }
@@ -285,7 +298,7 @@ where
 
 	/// Whether an agreement with this certificate's key equals one with a
 	/// point whose x-coordinate is `x`, so a check of one point against
-	/// several keys reads its x-coordinate once.
+	/// more than one key reads its x-coordinate once.
 	pub(crate) fn shares_x(&self, x: &FieldBytes<P::Curve>) -> bool {
 		AgreementPoint::<P::Curve>::shares_x(&self.key, x)
 	}
@@ -326,7 +339,8 @@ pub(crate) trait EllipticCurvePoint {
 	/// # Errors
 	///
 	/// - [`CertificateValidationError::SpkiError`] -- the first octet of the
-	///   point is not `0x02`, `0x03`, or `0x04`, which RFC 5480 §2.2 refuses.
+	///   point is not `0x02`, `0x03`, or `0x04`, which RFC 5480 §2.2 refuses,
+	///   or an uncompressed point holds no two coordinates of one length.
 	fn elliptic_curve_x(&self) -> Result<Option<&[u8]>, CertificateValidationError>;
 
 	/// Refuse an `id-ecPublicKey` key whose point is in a form RFC 5480 §2.2
@@ -348,12 +362,8 @@ impl EllipticCurvePoint for SubjectPublicKeyInfoRef<'_> {
 		}
 
 		let point = self.subject_public_key.as_bytes().ok_or(crate::spki::Error::KeyMalformed)?;
-		let (form, coordinates) = point.split_first().ok_or(crate::spki::Error::KeyMalformed)?;
-		match form {
-			0x02 | 0x03 => Ok(Some(coordinates)),
-			0x04 => Ok(coordinates.get(..coordinates.len() / 2)),
-			_ => Err(CertificateValidationError::SpkiError(crate::spki::Error::KeyMalformed)),
-		}
+		let point = Sec1Point::read(point).ok_or(crate::spki::Error::KeyMalformed)?;
+		Ok(Some(point.x()))
 	}
 }
 
@@ -743,6 +753,18 @@ mod tests {
 	#[test]
 	fn a_compact_signing_key_is_refused_for_signing() {
 		let refused = PeerCertificate::<HouseSigning>::parse(compact_twin(), SERVER);
+		assert!(matches!(refused, Err(CertificateValidationError::SpkiError(_))));
+	}
+
+	/// An uncompressed point whose two halves differ in length holds no x and
+	/// y of one field, so its form is refused.
+	#[test]
+	fn an_uncompressed_point_of_uneven_halves_fails_the_point_form() {
+		let point = fixed_point().to_encoded_point(false);
+		let uneven = [point.as_bytes(), &[0][..]].concat();
+		let spki = key_info(CURVE_SECP256K1, &uneven);
+
+		let refused = spki.owned_to_ref().require_point_form();
 		assert!(matches!(refused, Err(CertificateValidationError::SpkiError(_))));
 	}
 

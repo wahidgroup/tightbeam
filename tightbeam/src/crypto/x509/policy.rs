@@ -1,7 +1,9 @@
 //! Certificate validation policies and strategies.
 //!
-//! This module provides various certificate validation policies that can be
-//! used to validate X.509 certificates according to different trust models.
+//! [`CertificateValidation`] checks one X.509 certificate, and
+//! [`SignatureVerification`] adds a check of its signature under an issuer
+//! key. The built-in validators check expiry, pin keys or fingerprints, deny
+//! fingerprints, anchor direct trust, and chain other validators.
 
 use core::marker::PhantomData;
 
@@ -11,53 +13,47 @@ use alloc::vec::Vec;
 use crate::crypto::hash::{Digest, U32};
 use crate::crypto::policy::VerificationPolicy;
 use crate::crypto::x509::error::CertificateValidationError;
+use crate::crypto::x509::key::{KeyCurves, KeyIdentity};
 use crate::crypto::x509::utils::{CertificateExt, Fingerprint};
 use crate::crypto::x509::Certificate;
 use crate::der::Encode;
 
-/// Trait for certificate validation strategies.
+/// The trait for a certificate validation strategy.
 ///
-/// This trait allows pluggable certificate validation with different
-/// policies and trust models. Implementors can validate certificates
-/// against specific requirements.
+/// An implementor checks one certificate against its own policy and trust
+/// model.
 ///
 /// For simple validation (pinning, denylists, expiry checks), implement
 /// only this trait. For full PKI validation with signature verification,
-/// also implement `SignatureVerification`.
+/// also implement [`SignatureVerification`].
 pub trait CertificateValidation: Send + Sync {
-	/// Perform certificate validation.
+	/// Validate `cert` against this policy.
 	///
-	/// This method should perform all validation checks that don't require
-	/// cryptographic signature verification (expiry, pinning, denylists, etc.).
+	/// An implementor runs every check that needs no signature verification,
+	/// such as expiry, pinning, and denylists.
 	///
-	/// # Arguments
-	/// * `cert` - The certificate to validate
+	/// # Errors
 	///
-	/// # Returns
-	/// * `Ok(())` if validation succeeds
-	/// * `Err(_)` with specific error details
+	/// - [`CertificateValidationError`] -- `cert` fails a check of this policy.
 	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError>;
 }
 
-/// Trait for certificate validation with cryptographic signature verification.
+/// The trait for certificate validation with cryptographic signature
+/// verification.
 ///
-/// This trait extends `CertificateValidation` with the ability to verify
-/// certificate signatures using a pluggable verification policy.
+/// It extends [`CertificateValidation`] with a check of the certificate's
+/// signature under a verification policy the caller supplies.
 pub trait SignatureVerification: CertificateValidation {
-	/// Perform full certificate validation with cryptographic verification.
+	/// Validate `cert` in full, with a check of its signature under the
+	/// issuer's public key through `policy`.
 	///
-	/// This method verifies the certificate signature using the provided
-	/// verification policy and issuer's public key.
+	/// - `curr_time`: the current UNIX time, in seconds since the epoch.
+	/// - `issuer_pub_key`: the DER-encoded public key of the issuer.
+	/// - `policy`: the verification policy that checks the signature.
 	///
-	/// # Arguments
-	/// * `cert` - The certificate to validate
-	/// * `curr_time` - Current UNIX timestamp (seconds since epoch)
-	/// * `issuer_pub_key` - DER-encoded public key of the issuer
-	/// * `policy` - Verification policy to use for signature validation
+	/// # Errors
 	///
-	/// # Returns
-	/// * `Ok(())` if validation succeeds
-	/// * `Err(_)` with specific error details
+	/// - [`CertificateValidationError`] -- `cert` fails a check, or its signature does not verify.
 	fn verify_with_policy(
 		&self,
 		cert: &Certificate,
@@ -67,18 +63,14 @@ pub trait SignatureVerification: CertificateValidation {
 	) -> Result<(), CertificateValidationError>;
 }
 
-// ============================================================================
-// Built-in Validators
-//
 // The pinning and denylist validators below implement direct-trust models
-// (trust-on-first-use / key pinning, cf. RFC 7469), not RFC 5280 §6.1
+// (trust-on-first-use and key pinning, cf. RFC 7469), not RFC 5280 §6.1
 // certification-path validation.
-// ============================================================================
 
-/// Validate only certificate expiry.
+/// A validator that checks certificate expiry alone.
 ///
-/// This validator checks if the certificate is within its validity period
-/// but does not verify signatures or perform other cryptographic checks.
+/// Its one check is that the certificate is within its validity period, so a
+/// signature check belongs to a [`SignatureVerification`] validator.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ExpiryValidator;
 
@@ -89,39 +81,70 @@ impl CertificateValidation for ExpiryValidator {
 	}
 }
 
-/// Public key pinning validator with const-generic array
+/// A validator that pins public keys in a const-generic array.
 ///
 /// The const generic parameter `N` specifies the number of pinned keys.
+///
+/// - A pin is the octets of a key's BIT STRING.
+/// - A check reads each pin under the algorithm of the certificate's key and the validator's [`KeyCurves`].
+/// - It admits the key when the two are one key by the rule that [`CanonicalKey`] states.
+/// - A pin names no curve, so a compressed pin admits the point of its x and y parity on every curve.
+/// - An uncompressed pin admits that point on each curve that the set holds no decoder for.
+///
+/// [`CanonicalKey`]: crate::crypto::x509::CanonicalKey
 #[derive(Debug, Clone, Copy)]
 pub struct PublicKeyPinning<const N: usize> {
 	allowed_keys: [&'static [u8]; N],
+	curves: KeyCurves,
 }
 
 impl<const N: usize> PublicKeyPinning<N> {
-	/// Create a new public key pinning validator with the given allowed keys.
-	///
-	/// This is a const function, allowing creation in const contexts.
+	/// Create a validator that admits a key one of `keys` pins, read under
+	/// [`KeyCurves::HOUSE`].
 	pub const fn new(keys: [&'static [u8]; N]) -> Self {
-		Self { allowed_keys: keys }
+		Self { allowed_keys: keys, curves: KeyCurves::HOUSE }
+	}
+
+	/// Set the curves this validator reads each key under, so the decoder of a
+	/// curve refuses its off-curve encodings.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::crypto::x509::policy::{CertificateValidation, PublicKeyPinning};
+	/// use tightbeam::crypto::x509::KeyCurves;
+	/// use tightbeam::oids::CURVE_NIST_P256;
+	/// use tightbeam::testing::fixtures::{TestCertificate, TestKey};
+	///
+	/// // A pin of the compressed point of RFC 6979 §A.2.5 admits the key in
+	/// // its uncompressed form.
+	/// let pinning = PublicKeyPinning::new([&TestKey::RFC6979_P256_COMPRESSED]).with_curves(KeyCurves::HOUSE);
+	/// let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+	/// let point = &TestKey::RFC6979_P256_UNCOMPRESSED;
+	/// let certificate = TestCertificate::with_curve_point(certificate, CURVE_NIST_P256, point);
+	///
+	/// pinning.evaluate(&certificate)?;
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	#[must_use]
+	pub const fn with_curves(self, curves: KeyCurves) -> Self {
+		Self { allowed_keys: self.allowed_keys, curves }
 	}
 }
 
 impl<const N: usize> CertificateValidation for PublicKeyPinning<N> {
 	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
-		let pub_key_bytes = cert.tbs_certificate.subject_public_key_info.subject_public_key.raw_bytes();
-		self.allowed_keys
-			.contains(&pub_key_bytes)
-			.then_some(())
-			.ok_or(CertificateValidationError::PublicKeyNotPinned)
+		let key = KeyIdentity::of(&cert.tbs_certificate.subject_public_key_info, self.curves);
+		let pinned = self.allowed_keys.iter().any(|pin| key.holds(pin));
+		pinned.then_some(()).ok_or(CertificateValidationError::PublicKeyNotPinned)
 	}
 }
 
-/// Certificate fingerprint pinning validator with const-generic array.
+/// A validator that pins certificate fingerprints in a const-generic array.
 ///
-/// This validator is const-constructible, making it suitable for use in static
-/// configurations.
+/// Its constructor is `const`, so a static configuration can hold one.
 ///
-/// Generic over the digest algorithm and the number of pinned fingerprints.
+/// `D` is the digest algorithm, and `N` is the number of pinned fingerprints.
 #[derive(Debug, Clone, Copy)]
 pub struct FingerprintPinning<D, const N: usize> {
 	allowed_fingerprints: [&'static [u8; 32]; N],
@@ -132,9 +155,8 @@ impl<D, const N: usize> FingerprintPinning<D, N>
 where
 	D: Digest,
 {
-	/// Create a new fingerprint pinning validator with the given allowed fingerprints.
-	///
-	/// This is a const function, allowing creation in const contexts.
+	/// Create a validator that admits a certificate whose fingerprint
+	/// `fingerprints` pins.
 	pub const fn new(fingerprints: [&'static [u8; 32]; N]) -> Self {
 		Self { allowed_fingerprints: fingerprints, _digest: PhantomData }
 	}
@@ -154,10 +176,9 @@ where
 	}
 }
 
-/// Certificate fingerprint denylist validator with const-generic array.
+/// A validator that denies certificate fingerprints in a const-generic array.
 ///
-/// This validator is const-constructible, making it suitable for
-/// static configurations.
+/// Its constructor is `const`, so a static configuration can hold one.
 #[derive(Debug, Clone, Copy)]
 pub struct FingerprintDenylist<D, const N: usize> {
 	denied_fingerprints: [&'static [u8; 32]; N],
@@ -168,7 +189,8 @@ impl<D, const N: usize> FingerprintDenylist<D, N>
 where
 	D: Digest,
 {
-	/// Create a new fingerprint denylist validator with the given fingerprints.
+	/// Create a validator that refuses a certificate whose fingerprint
+	/// `fingerprints` lists.
 	pub const fn new(fingerprints: [&'static [u8; 32]; N]) -> Self {
 		Self { denied_fingerprints: fingerprints, _digest: PhantomData }
 	}
@@ -192,11 +214,11 @@ where
 	}
 }
 
-/// Runtime certificate pinning validator.
+/// A certificate pinning validator built at runtime.
 ///
-/// Pins to a specific set of certificates using fingerprint comparison.
-/// Unlike `FingerprintPinning<D, N>`, this validator can be created at runtime
-/// with dynamic certificate lists, making it suitable for use in builders.
+/// It pins a set of certificates and compares fingerprints. A builder can
+/// create it from a certificate list it holds at runtime, where
+/// [`FingerprintPinning`] takes a fixed array.
 #[cfg(feature = "std")]
 #[derive(Clone)]
 pub struct RuntimeCertificatePinning<D> {
@@ -209,9 +231,9 @@ impl<D> RuntimeCertificatePinning<D>
 where
 	D: Digest,
 {
-	/// Create a new runtime certificate pinning validator from certificates.
+	/// Create a validator that pins `certs`.
 	///
-	/// Computes fingerprints for each certificate and stores them for validation.
+	/// It computes the fingerprint of each certificate once, at construction.
 	pub fn from_certificates(certs: impl IntoIterator<Item = Certificate>) -> Result<Self, CertificateValidationError>
 	where
 		D: Digest<OutputSize = U32>,
@@ -224,7 +246,7 @@ where
 		Ok(Self { fingerprints, _digest: PhantomData })
 	}
 
-	/// Create a validator from fingerprints already minted by
+	/// Create a validator from fingerprints already computed by
 	/// [`Fingerprint::from_certificate`].
 	///
 	/// [`Fingerprint::from_certificate`]: crate::crypto::x509::utils::Fingerprint::from_certificate
@@ -258,9 +280,10 @@ where
 ///   certificate must itself be a configured trust anchor (RFC 5280 §6.1.1).
 ///   With no anchors configured (e.g. `Default`), every certificate is
 ///   rejected. Configure anchors via [`Self::with_trust_chain`].
-/// - [`SignatureVerification::verify_with_policy`]: single-certificate validity,
-///   algorithm-identifier consistency (RFC 5280 §4.1.1.2), and signature
-///   verification against a caller-supplied issuer key (RFC 5280 §6.1.3(a)(1)).
+/// - [`SignatureVerification::verify_with_policy`]: the validity of one
+///   certificate, algorithm-identifier consistency (RFC 5280 §4.1.1.2), and
+///   signature verification against a caller-supplied issuer key
+///   (RFC 5280 §6.1.3(a)(1)).
 /// - Both refuse a certificate that repeats an extension or bears a critical
 ///   extension the crate does not process (RFC 5280 §4.2), as path validation
 ///   does.
@@ -274,7 +297,7 @@ pub struct DirectTrustValidator {
 impl DirectTrustValidator {
 	/// Add a trust chain to the validator.
 	///
-	/// Accepts any iterator of [`Certificate`] values; an empty chain
+	/// It accepts any iterator of [`Certificate`] values, and an empty chain
 	/// keeps the fail-closed default (no anchors).
 	pub fn with_trust_chain(mut self, trust_chain: impl IntoIterator<Item = Certificate>) -> Self {
 		self.trust_chain = trust_chain.into_iter().collect();
@@ -284,7 +307,8 @@ impl DirectTrustValidator {
 
 impl CertificateValidation for DirectTrustValidator {
 	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
-		// RFC 5280 §6.1.3(a)(2): the certificate must be within its validity period.
+		// RFC 5280 §6.1.3(a)(2): the current time must fall within the
+		// certificate's validity period.
 		cert.validate_expiry()?;
 
 		// RFC 5280 §4.2: a repeated extension, or an unprocessed critical one,
@@ -332,7 +356,8 @@ impl SignatureVerification for DirectTrustValidator {
 			return Err(CertificateValidationError::EmptySignature);
 		}
 
-		// RFC 5280 §4.1.1.2: signatureAlgorithm must match tbsCertificate.signature.
+		// RFC 5280 §4.1.1.2: the signatureAlgorithm must match the
+		// tbsCertificate.signature field.
 		cert.ensure_signature_algorithm_consistency()?;
 
 		// RFC 5280 §6.1.3(a)(1): verify the signature using the issuer's key.
@@ -345,11 +370,12 @@ impl SignatureVerification for DirectTrustValidator {
 	}
 }
 
-/// Chain multiple validators together.
+/// A validator that chains other validators.
 ///
-/// All validators must succeed for the certificate to be accepted.
-/// Validators are evaluated in order. This validator only chains
-/// simple `evaluate()` calls and does not support signature verification.
+/// The validators run in order, and the certificate passes only when every
+/// one of them succeeds. The chain runs [`CertificateValidation::evaluate`]
+/// alone, so signature verification belongs to a [`SignatureVerification`]
+/// validator outside it.
 #[cfg(feature = "std")]
 #[derive(Default)]
 pub struct ChainValidator {
@@ -360,7 +386,7 @@ pub struct ChainValidator {
 impl ChainValidator {
 	/// Add a validator to the chain.
 	///
-	/// The validator is boxed inside, matching [`crate::policy::GateChain::push`].
+	/// It boxes the validator, as [`crate::policy::GateChain::push`] does.
 	#[allow(clippy::should_implement_trait)]
 	pub fn add(mut self, validator: impl CertificateValidation + 'static) -> Self {
 		self.validators.push(Box::new(validator));
@@ -381,21 +407,77 @@ mod tests {
 	use crate::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
 	use crate::testing::TestCertificate;
 
+	/// The expiry validator refuses a certificate past its validity period.
 	#[test]
-	fn test_expiry_validator_rejects_expired_cert() {
-		let expired_cert = TestCertificate::expired();
-		let validator = ExpiryValidator;
+	fn the_expiry_validator_refuses_an_expired_certificate() {
+		let refused = ExpiryValidator.evaluate(&TestCertificate::expired());
+		assert!(matches!(refused, Err(CertificateValidationError::Expired)));
+	}
 
-		// This certificate expired on August 17, 2019, so it should be rejected
-		let result = validator.evaluate(&expired_cert);
-		assert!(result.is_err(), "Expired certificate should be rejected");
+	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+	mod public_key_pinning {
+		use crate::crypto::x509::error::CertificateValidationError;
+		use crate::crypto::x509::policy::{CertificateValidation, PublicKeyPinning};
+		use crate::crypto::x509::Certificate;
+		use crate::testing::fixtures::{TestCertificate, TestKey};
 
-		// Verify it's specifically an expiry error
-		match result {
-			Err(CertificateValidationError::Expired) => {
-				// Expected error
-			}
-			other => panic!("Expected Expired error, got: {other:?}"),
+		/// The certificate of the fixed test key, whose point is in the
+		/// uncompressed form.
+		fn uncompressed() -> Certificate {
+			TestCertificate::self_signed(&TestKey::insecure_fixed_signing())
+		}
+
+		/// The octets of the key of `certificate` as a static pin, the form a
+		/// const configuration names.
+		fn pin_of(certificate: &Certificate) -> &'static [u8] {
+			let spki = &certificate.tbs_certificate.subject_public_key_info;
+			Box::leak(spki.subject_public_key.raw_bytes().to_vec().into_boxed_slice())
+		}
+
+		/// A pin of the compressed point admits the certificate of that point
+		/// in the uncompressed form.
+		#[test]
+		fn a_compressed_pin_admits_the_uncompressed_key() -> Result<(), CertificateValidationError> {
+			let compressed = TestCertificate::with_compressed_key(uncompressed());
+			let pinning = PublicKeyPinning::new([pin_of(&compressed)]);
+
+			pinning.evaluate(&uncompressed())?;
+			Ok(())
+		}
+
+		/// A pin of the negated point names another key, so it refuses the
+		/// certificate.
+		#[test]
+		fn a_pin_of_the_negated_point_refuses_the_key() {
+			let negation = TestKey::negation_of(&TestKey::insecure_fixed_signing());
+			let pinning = PublicKeyPinning::new([pin_of(&TestCertificate::self_signed(&negation))]);
+
+			let refused = pinning.evaluate(&uncompressed());
+			assert!(matches!(refused, Err(CertificateValidationError::PublicKeyNotPinned)));
+		}
+
+		/// A pinning admits a key that any one of its pins names, so a second
+		/// pin of the key admits it after a first pin of another key.
+		#[test]
+		fn the_second_pin_admits_its_key() -> Result<(), CertificateValidationError> {
+			let negation = TestKey::negation_of(&TestKey::insecure_fixed_signing());
+			let other = pin_of(&TestCertificate::self_signed(&negation));
+			let pinning = PublicKeyPinning::new([other, pin_of(&uncompressed())]);
+
+			pinning.evaluate(&uncompressed())?;
+			Ok(())
+		}
+
+		/// An encoding of the x-coordinate and the y parity of the pinned key
+		/// that is no point of its curve names another key, so the pin refuses
+		/// it (SEC 1 v2.0 §2.3.4).
+		#[test]
+		fn a_pin_refuses_an_off_curve_alias_of_its_key() {
+			let pinning = PublicKeyPinning::new([pin_of(&uncompressed())]);
+			let alias = TestCertificate::with_off_curve_key(uncompressed());
+
+			let refused = pinning.evaluate(&alias);
+			assert!(matches!(refused, Err(CertificateValidationError::PublicKeyNotPinned)));
 		}
 	}
 
@@ -458,7 +540,8 @@ mod tests {
 		fn rejects_algorithm_mismatch() {
 			let key = TestKey::insecure_fixed_signing();
 			let mut cert = TestCertificate::self_signed(&key);
-			// signatureAlgorithm disagrees with tbsCertificate.signature (RFC 5280 §4.1.1.2).
+			// signatureAlgorithm and tbsCertificate.signature disagree, which
+			// RFC 5280 §4.1.1.2 forbids.
 			cert.signature_algorithm.oid = SIGNER_ECDSA_WITH_SHA256;
 			assert!(matches!(
 				verify(&key, &cert),
@@ -470,7 +553,8 @@ mod tests {
 		fn rejects_foreign_algorithm() {
 			let key = TestKey::insecure_fixed_signing();
 			let mut cert = TestCertificate::self_signed(&key);
-			// Consistent identifiers, but an algorithm the out-of-the-box policy refuses.
+			// The identifiers agree on an algorithm that the out-of-the-box
+			// policy refuses.
 			cert.signature_algorithm.oid = SIGNER_ECDSA_WITH_SHA256;
 			cert.tbs_certificate.signature.oid = SIGNER_ECDSA_WITH_SHA256;
 			assert!(matches!(

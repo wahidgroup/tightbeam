@@ -35,6 +35,8 @@ mod x509 {
 use x509::*;
 
 #[cfg(feature = "instrument")]
+use crate::crypto::x509::CanonicalKey;
+#[cfg(feature = "instrument")]
 use crate::instrumentation::events;
 #[cfg(feature = "instrument")]
 use crate::trace::TraceCollector;
@@ -86,8 +88,11 @@ pub(crate) trait GateInbound: GateAudit {
 				events::GATE_REJECT
 			};
 
-			// As evidence, the status names why and the peer SPKI names who.
-			trace.emit_event_with_evidence(event, status.as_str(), session.peer_public_key());
+			// As evidence, the status names why and the canonical form of the
+			// peer's key names who, so one peer leaves one audit identity in
+			// either SEC 1 form of its key.
+			let peer = session.peer_key().map(CanonicalKey::as_der);
+			trace.emit_event_with_evidence(event, status.as_str(), peer);
 		}
 
 		status
@@ -500,5 +505,43 @@ mod tests {
 		assert_eq!(reject.label.as_deref(), Some("PermissionDenied"));
 		assert!(reject.timestamp_ns.is_some());
 		Ok(())
+	}
+
+	/// The evidence a gate verdict records of its peer, read from a session
+	/// that `SessionContext::for_peer` binds to a certificate.
+	#[cfg(feature = "colony")]
+	mod evidence {
+		use super::*;
+		use crate::crypto::hash::{Digest, Sha3_256};
+		use crate::instrumentation::TbInstrumentationConfig;
+		use crate::testing::{TestCertificate, TestKey};
+		use crate::trace::TraceConfig;
+
+		/// The SHA3-256 digest of the evidence that a gate refusal of
+		/// `session` records, under a collector that records the digest of
+		/// each evidence.
+		fn rejection_evidence(session: &SessionContext) -> Option<[u8; 32]> {
+			let config = TbInstrumentationConfig { enable_payloads: true, ..TbInstrumentationConfig::default() };
+			let audit = AuditProbe(TraceCollector::from(TraceConfig::with_instrumentation(config)));
+			audit.gate_inbound(&DenyGate, None, session);
+
+			let recorded = audit.0.drain_events();
+			let reject = recorded.iter().find(|event| event.urn == events::GATE_REJECT);
+			reject.and_then(|event| event.payload_hash)
+		}
+
+		/// The audit evidence of a gate verdict names the peer by the canonical
+		/// form of its key, so a peer whose certificate holds an uncompressed
+		/// point leaves the identity of its compressed form.
+		#[test]
+		fn gate_evidence_names_the_peer_by_its_canonical_key() -> Result<(), Box<dyn std::error::Error>> {
+			let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+			let canonical = CanonicalKey::of(&certificate.tbs_certificate.subject_public_key_info)?;
+
+			let expected: [u8; 32] = Sha3_256::digest(canonical.as_der()).into();
+			let session = SessionContext::for_peer(Arc::new(certificate));
+			assert_eq!(rejection_evidence(&session), Some(expected));
+			Ok(())
+		}
 	}
 }

@@ -136,11 +136,13 @@ mod cert {
 	pub use crate::crypto::sign::ecdsa::Secp256k1Signature;
 	pub use crate::crypto::sign::{CanonicalSigner, CertifiedKey, SignatureEncoding, SigningIdentity};
 	pub use crate::crypto::x509::utils::Skid;
+	pub use crate::crypto::x509::CurvePoints;
 	pub use crate::der::asn1::{BitString, Ia5String, PrintableString, SetOfVec, UtcTime};
+	pub use crate::der::oid::db::rfc5912::ID_EC_PUBLIC_KEY;
 	pub use crate::der::oid::AssociatedOid;
 	pub use crate::der::{Any, Decode, Encode};
 	pub use crate::error::Result as TbResult;
-	pub use crate::oids::SIGNER_ECDSA_WITH_SHA3_256;
+	pub use crate::oids::{CURVE_NIST_P256, SIGNER_ECDSA_WITH_SHA3_256};
 	pub use crate::spki::SubjectPublicKeyInfoOwned;
 	pub use crate::x509::attr::AttributeTypeAndValue;
 	pub use crate::x509::ext::pkix::name::GeneralName;
@@ -152,6 +154,8 @@ mod cert {
 	pub use crate::x509::time::{Time, Validity};
 	pub use crate::x509::{TbsCertificate, Version as X509Version};
 	pub use core::time::Duration;
+	pub use elliptic_curve::bigint::modular::runtime_mod::{DynResidue, DynResidueParams};
+	pub use elliptic_curve::bigint::{Encoding, U256};
 	pub use k256::elliptic_curve::sec1::ToEncodedPoint;
 	pub use k256::PublicKey;
 }
@@ -399,7 +403,7 @@ fn sign_test_certificate(
 	Ok(certificate)
 }
 
-/// Generic builder test macro.
+/// A generic builder test macro.
 ///
 /// The macro works like `test_case!` for builders. It provides a base
 /// builder instance, allows customization, and passes both the input message
@@ -513,7 +517,7 @@ where
 	}
 }
 
-/// Async test macro with worker setup.
+/// An async test macro with worker setup.
 ///
 /// The macro starts a worker, passes it to the assertions block, and shuts
 /// the worker down afterwards.
@@ -704,10 +708,134 @@ impl TestFrame {
 	}
 }
 
+/// The decoder of NIST P-256 that a test reads a P-256 key under: the range
+/// and curve checks of SEC 1 v2.0 §2.3.4 over the field arithmetic of
+/// `crypto-bigint`.
+///
+/// The tree holds the curve arithmetic of secp256k1 alone, so the decoder
+/// solves the curve equation y² = x³ - 3x + b of SEC 2 v2.0 §2.4.2 itself. It
+/// runs in variable time, which suits a public key alone.
+#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TestP256Points;
+
+#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+impl TestP256Points {
+	/// The prime p of the field of P-256 (SEC 2 v2.0 §2.4.2).
+	const PRIME: U256 = U256::from_be_hex("ffffffff00000001000000000000000000000000ffffffffffffffffffffffff");
+
+	/// The coefficient b of P-256, whose coefficient a is -3.
+	const B: U256 = U256::from_be_hex("5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b");
+
+	/// The exponent (p + 1) / 4. The prime is 3 modulo 4, so a square α has
+	/// the square root α to this power.
+	const ROOT: U256 = Self::PRIME.wrapping_add(&U256::ONE).shr_vartime(2);
+
+	/// The Montgomery parameters of the field.
+	const FIELD: DynResidueParams<{ U256::LIMBS }> = DynResidueParams::new(&Self::PRIME);
+
+	/// `octets` as an element of the field, or `None` when they are no
+	/// 32-octet integer below p (SEC 1 v2.0 §2.3.6).
+	fn element(octets: &[u8]) -> Option<DynResidue<{ U256::LIMBS }>> {
+		let octets: [u8; 32] = octets.try_into().ok()?;
+		let integer = U256::from_be_bytes(octets);
+		(integer < Self::PRIME).then(|| DynResidue::new(&integer, Self::FIELD))
+	}
+
+	/// x³ - 3x + b, the square of the y-coordinate of each point whose
+	/// x-coordinate is `x`.
+	fn right_side(x: &DynResidue<{ U256::LIMBS }>) -> DynResidue<{ U256::LIMBS }> {
+		let three = DynResidue::new(&U256::from_u8(3), Self::FIELD);
+		let b = DynResidue::new(&Self::B, Self::FIELD);
+		x.square().mul(x).sub(&three.mul(x)).add(&b)
+	}
+}
+
+/// A compressed point is a point when its x-coordinate gives a square, and
+/// an uncompressed one when its two coordinates solve the curve equation.
+#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+impl CurvePoints for TestP256Points {
+	fn curve(&self) -> ObjectIdentifier {
+		CURVE_NIST_P256
+	}
+
+	fn decodes(&self, point: &[u8]) -> bool {
+		let Some((form, coordinates)) = point.split_first() else {
+			return false;
+		};
+
+		match form {
+			0x02 | 0x03 => Self::element(coordinates).is_some_and(|x| {
+				let square = Self::right_side(&x);
+				square.pow(&Self::ROOT).square() == square
+			}),
+			0x04 => coordinates.split_at_checked(32).is_some_and(|(x, y)| {
+				let coordinates = Self::element(x).zip(Self::element(y));
+				coordinates.is_some_and(|(x, y)| y.square() == Self::right_side(&x))
+			}),
+			_ => false,
+		}
+	}
+}
+
 /// Signing and cipher keys with fixed, test-only material.
 pub struct TestKey;
 
 impl TestKey {
+	/// The P-256 public key of RFC 6979 §A.2.5 in the uncompressed SEC 1 form:
+	/// `0x04`, the x-coordinate, then the y-coordinate.
+	pub const RFC6979_P256_UNCOMPRESSED: [u8; 65] = [
+		0x04, 0x60, 0xfe, 0xd4, 0xba, 0x25, 0x5a, 0x9d, 0x31, 0xc9, 0x61, 0xeb, 0x74, 0xc6, 0x35, 0x6d, 0x68, 0xc0,
+		0x49, 0xb8, 0x92, 0x3b, 0x61, 0xfa, 0x6c, 0xe6, 0x69, 0x62, 0x2e, 0x60, 0xf2, 0x9f, 0xb6, 0x79, 0x03, 0xfe,
+		0x10, 0x08, 0xb8, 0xbc, 0x99, 0xa4, 0x1a, 0xe9, 0xe9, 0x56, 0x28, 0xbc, 0x64, 0xf2, 0xf1, 0xb2, 0x0c, 0x2d,
+		0x7e, 0x9f, 0x51, 0x77, 0xa3, 0xc2, 0x94, 0xd4, 0x46, 0x22, 0x99,
+	];
+
+	/// The P-256 public key of RFC 6979 §A.2.5 in the compressed SEC 1 form,
+	/// whose first octet `0x03` names its odd y.
+	pub const RFC6979_P256_COMPRESSED: [u8; 33] = [
+		0x03, 0x60, 0xfe, 0xd4, 0xba, 0x25, 0x5a, 0x9d, 0x31, 0xc9, 0x61, 0xeb, 0x74, 0xc6, 0x35, 0x6d, 0x68, 0xc0,
+		0x49, 0xb8, 0x92, 0x3b, 0x61, 0xfa, 0x6c, 0xe6, 0x69, 0x62, 0x2e, 0x60, 0xf2, 0x9f, 0xb6,
+	];
+
+	/// The P-521 public key of RFC 6979 §A.2.7 in the uncompressed SEC 1 form:
+	/// `0x04`, then Ux and Uy of 66 octets each, as the RFC prints them.
+	pub const RFC6979_P521_UNCOMPRESSED: [u8; 133] = [
+		0x04, 0x01, 0x89, 0x45, 0x50, 0xd0, 0x78, 0x59, 0x32, 0xe0, 0x0e, 0xaa, 0x23, 0xb6, 0x94, 0xf2, 0x13, 0xf8,
+		0xc3, 0x12, 0x1f, 0x86, 0xdc, 0x97, 0xa0, 0x4e, 0x5a, 0x71, 0x67, 0xdb, 0x4e, 0x5b, 0xcd, 0x37, 0x11, 0x23,
+		0xd4, 0x6e, 0x45, 0xdb, 0x6b, 0x5d, 0x53, 0x70, 0xa7, 0xf2, 0x0f, 0xb6, 0x33, 0x15, 0x5d, 0x38, 0xff, 0xa1,
+		0x6d, 0x2b, 0xd7, 0x61, 0xdc, 0xac, 0x47, 0x4b, 0x9a, 0x2f, 0x50, 0x23, 0xa4, 0x00, 0x49, 0x31, 0x01, 0xc9,
+		0x62, 0xcd, 0x4d, 0x2f, 0xdd, 0xf7, 0x82, 0x28, 0x5e, 0x64, 0x58, 0x41, 0x39, 0xc2, 0xf9, 0x1b, 0x47, 0xf8,
+		0x7f, 0xf8, 0x23, 0x54, 0xd6, 0x63, 0x0f, 0x74, 0x6a, 0x28, 0xa0, 0xdb, 0x25, 0x74, 0x1b, 0x5b, 0x34, 0xa8,
+		0x28, 0x00, 0x8b, 0x22, 0xac, 0xc2, 0x3f, 0x92, 0x4f, 0xaa, 0xfb, 0xd4, 0xd3, 0x3f, 0x81, 0xea, 0x66, 0x95,
+		0x6d, 0xfe, 0xaa, 0x2b, 0xfd, 0xfc, 0xf5,
+	];
+
+	/// The P-521 public key of RFC 6979 §A.2.7 in the compressed SEC 1 form,
+	/// whose first octet `0x03` names the odd Uy the RFC prints.
+	pub const RFC6979_P521_COMPRESSED: [u8; 67] = [
+		0x03, 0x01, 0x89, 0x45, 0x50, 0xd0, 0x78, 0x59, 0x32, 0xe0, 0x0e, 0xaa, 0x23, 0xb6, 0x94, 0xf2, 0x13, 0xf8,
+		0xc3, 0x12, 0x1f, 0x86, 0xdc, 0x97, 0xa0, 0x4e, 0x5a, 0x71, 0x67, 0xdb, 0x4e, 0x5b, 0xcd, 0x37, 0x11, 0x23,
+		0xd4, 0x6e, 0x45, 0xdb, 0x6b, 0x5d, 0x53, 0x70, 0xa7, 0xf2, 0x0f, 0xb6, 0x33, 0x15, 0x5d, 0x38, 0xff, 0xa1,
+		0x6d, 0x2b, 0xd7, 0x61, 0xdc, 0xac, 0x47, 0x4b, 0x9a, 0x2f, 0x50, 0x23, 0xa4,
+	];
+
+	/// The generator of secp256k1 in the compressed SEC 1 form, as SEC 2 v2.0
+	/// §2.4.1 publishes it.
+	pub const SEC2_SECP256K1_G_COMPRESSED: [u8; 33] = [
+		0x02, 0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce, 0x87, 0x0b, 0x07, 0x02,
+		0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81, 0x5b, 0x16, 0xf8, 0x17, 0x98,
+	];
+
+	/// The generator of secp256k1 in the uncompressed SEC 1 form, as SEC 2
+	/// v2.0 §2.4.1 publishes it.
+	pub const SEC2_SECP256K1_G_UNCOMPRESSED: [u8; 65] = [
+		0x04, 0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce, 0x87, 0x0b, 0x07, 0x02,
+		0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81, 0x5b, 0x16, 0xf8, 0x17, 0x98, 0x48, 0x3a, 0xda,
+		0x77, 0x26, 0xa3, 0xc4, 0x65, 0x5d, 0xa4, 0xfb, 0xfc, 0x0e, 0x11, 0x08, 0xa8, 0xfd, 0x17, 0xb4, 0x48, 0xa6,
+		0x85, 0x54, 0x19, 0x9c, 0x47, 0xd0, 0x8f, 0xfb, 0x10, 0xd4, 0xb8,
+	];
+
 	/// Returns the secp256k1 signing key whose secret scalar is thirty-two
 	/// `0x01` bytes.
 	///
@@ -910,6 +1038,75 @@ impl TestCertificate {
 		let key = PublicKey::from_sec1_bytes(point).expect("the key is a secp256k1 point");
 		let compressed = key.to_encoded_point(true);
 		spki.subject_public_key = BitString::from_bytes(compressed.as_bytes()).expect("a point is a BIT STRING");
+		certificate
+	}
+
+	/// `certificate` with the second-lowest bit of the y-coordinate of its
+	/// uncompressed secp256k1 point flipped. The encoding keeps x and the y
+	/// parity of the point, and it is no point of the curve:
+	///
+	/// - On the curve, x pairs with y and with p - y alone (SEC 1 v2.0 §2.3.4).
+	/// - p - y has the other parity, and the flipped y is neither of the two.
+	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+	pub fn with_off_curve_key(mut certificate: Certificate) -> Certificate {
+		let spki = &mut certificate.tbs_certificate.subject_public_key_info;
+		let mut point = spki.subject_public_key.raw_bytes().to_vec();
+		let low = point.last_mut().expect("the key holds a point");
+		*low ^= 0b10;
+
+		spki.subject_public_key = BitString::from_bytes(&point).expect("a point is a BIT STRING");
+		certificate
+	}
+
+	/// `certificate` with its secp256k1 point in the compact SEC 1 form: the
+	/// octet `0x05` before the x-coordinate alone, a form that RFC 5480 §2.2
+	/// refuses.
+	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+	pub fn with_compact_key(certificate: Certificate) -> Certificate {
+		let mut compressed = TestCertificate::with_compressed_key(certificate);
+		let spki = &mut compressed.tbs_certificate.subject_public_key_info;
+		let point = spki.subject_public_key.raw_bytes();
+		let (_, x) = point.split_first().expect("a compressed point names its form");
+		let compact = [&[0x05][..], x].concat();
+
+		spki.subject_public_key = BitString::from_bytes(&compact).expect("a point is a BIT STRING");
+		compressed
+	}
+
+	/// `certificate` with `form` in place of the first octet of its
+	/// uncompressed secp256k1 point, such as `0x06` or `0x07` of the hybrid
+	/// forms that RFC 5480 §2.2 refuses.
+	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+	pub fn with_key_form(mut certificate: Certificate, form: u8) -> Certificate {
+		let spki = &mut certificate.tbs_certificate.subject_public_key_info;
+		let point = spki.subject_public_key.raw_bytes();
+		let (_, coordinates) = point.split_first().expect("the key holds a point");
+		let formed = [&[form][..], coordinates].concat();
+
+		spki.subject_public_key = BitString::from_bytes(&formed).expect("a point is a BIT STRING");
+		certificate
+	}
+
+	/// `certificate` with its key under the named curve `curve`, the point
+	/// kept. Its signature then fails to verify, so it serves a reader of keys
+	/// alone.
+	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+	pub fn with_named_curve(mut certificate: Certificate, curve: ObjectIdentifier) -> Certificate {
+		let named_curve = Any::encode_from(&curve).expect("a curve OID encodes");
+		let spki = &mut certificate.tbs_certificate.subject_public_key_info;
+		spki.algorithm.parameters = Some(named_curve);
+		certificate
+	}
+
+	/// `certificate` with `point` as an `id-ecPublicKey` key on the named curve
+	/// `curve`, in place of its key. Its signature then fails to verify, so it
+	/// serves a reader of keys alone.
+	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+	pub fn with_curve_point(mut certificate: Certificate, curve: ObjectIdentifier, point: &[u8]) -> Certificate {
+		let named_curve = Any::encode_from(&curve).expect("a curve OID encodes");
+		let spki = &mut certificate.tbs_certificate.subject_public_key_info;
+		spki.algorithm = AlgorithmIdentifierOwned { oid: ID_EC_PUBLIC_KEY, parameters: Some(named_curve) };
+		spki.subject_public_key = BitString::from_bytes(point).expect("a point is a BIT STRING");
 		certificate
 	}
 
@@ -1283,6 +1480,21 @@ impl TestCmsServer {
 	pub fn signing_twin(&self, serial: u8) -> Certificate {
 		let subject = self.signing.tbs_certificate.subject.to_owned();
 		self.issue_signing(&self.signing_key, subject, serial)
+	}
+
+	/// The pair of this server after its authority issues its signing
+	/// certificate again, to the same subject, for the key whose scalar is
+	/// thirty-two `0x07` octets, beside that certificate. The key-agreement
+	/// certificate stays the one a client pins.
+	pub fn rotated_pair(&self) -> (CmsIdentityPair<DhKemSecp256k1>, Certificate) {
+		let key = SigningKey::from_slice(&[0x07; 32]).expect("seven is a secp256k1 scalar");
+		let subject = self.signing.tbs_certificate.subject.to_owned();
+		let signing = self.issue_signing(&key, subject, 7);
+
+		let identity = TestIdentity::presenting(signing.to_owned(), &key);
+		let pair = CmsIdentityPair::new(identity, self.key_agreement_identity());
+		let pair = pair.expect("the rotated certificate names the subject of the key-agreement certificate");
+		(pair, signing)
 	}
 
 	/// This server with both certificates issued again by its authority, each

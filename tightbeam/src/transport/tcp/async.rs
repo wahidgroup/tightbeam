@@ -290,6 +290,7 @@ mod mux {
 
 	pub(crate) use crate::transport::io::CollectStep;
 	pub use crate::transport::multiplex::{GatedHalves, MuxAcceptor};
+	pub(crate) use crate::transport::multiplex::{ACCEPTOR_ROLE, CONNECTOR_ROLE};
 }
 
 #[cfg(all(
@@ -363,11 +364,7 @@ where
 		let rekey = MuxRekeyContext::detach(&mut self, role)?;
 		let (reader, writer) = self.into_split()?;
 
-		let mut mux = MuxTransport::new(reader, writer, role, settings);
-		if let Some(context) = rekey {
-			mux = mux.with_rekey(context);
-		}
-
+		let mux = MuxTransport::assemble(reader, writer, role, settings, rekey);
 		Ok(mux)
 	}
 }
@@ -408,7 +405,7 @@ where
 	}
 
 	fn take_rekey(&mut self) -> TransportResult<Option<MuxRekeyContext>> {
-		MuxRekeyContext::detach(self, MuxRole::Client)
+		MuxRekeyContext::detach(self, CONNECTOR_ROLE)
 	}
 
 	fn handshake_peer_certificate(&self) -> Option<Arc<Certificate>> {
@@ -454,7 +451,7 @@ where
 	}
 
 	fn take_rekey(&mut self) -> TransportResult<Option<MuxRekeyContext>> {
-		MuxRekeyContext::detach(self, MuxRole::Server)
+		MuxRekeyContext::detach(self, ACCEPTOR_ROLE)
 	}
 
 	fn session_context(&self) -> SessionContext {
@@ -953,10 +950,20 @@ mod tests {
 	use crate::transport::{MessageCollector, MessageEmitter, TransportEncryptionConfig};
 	use crate::utils::time::SystemClock;
 
-	#[cfg(feature = "transport-cms")]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	use crate::crypto::x509::error::CertificateValidationError::CertificateNotTrusted;
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	use crate::crypto::x509::policy::{CertificateValidation, DirectTrustValidator};
+	#[cfg(feature = "transport-hpke")]
+	use crate::transport::client::ClientBuilder;
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	use crate::transport::handshake::tests::create_test_signed_data;
-	#[cfg(feature = "transport-cms")]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	use crate::transport::handshake::HandshakeMessage;
+	#[cfg(feature = "transport-hpke")]
+	use crate::transport::handshake::PeerAuthentication;
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	use crate::transport::handshake::ValidatorChain;
 
 	/// Serve one single-flight request.
 	///
@@ -1343,12 +1350,12 @@ mod tests {
 		let encryption = EncryptionConfig {
 			trust_store,
 			client_identity: Some(identity),
-			handshake_protocol: HandshakeProtocolKind::Cms,
 			allow_cleartext,
 			..EncryptionConfig::unconfigured()
 		};
 
-		client_over(stream, encryption)
+		let transport = client_over(stream, encryption);
+		transport.with_handshake_protocol(HandshakeProtocolKind::Cms)
 	}
 
 	#[cfg(feature = "transport-cms")]
@@ -1356,6 +1363,7 @@ mod tests {
 	async fn cleartext_cms_client_without_server_trust_fails_closed() -> TransportResult<()> {
 		let (_listener, client_stream) = bind_and_connect().await?;
 		let mut transport = cms_test_client(client_stream, None);
+
 		let handshake = transport.perform_client_handshake().await;
 		assert!(matches!(handshake, Err(TransportError::MissingServerCertificateChain)));
 		Ok(())
@@ -1383,12 +1391,13 @@ mod tests {
 		let encryption = EncryptionConfig {
 			trust_store: Some(empty_trust_store()),
 			cms_server: Some(server.trust()),
-			handshake_protocol: HandshakeProtocolKind::Cms,
 			..EncryptionConfig::unconfigured()
 		};
 
-		let mut transport = client_over(client_stream, encryption);
+		let transport = client_over(client_stream, encryption);
+		let mut transport = transport.with_handshake_protocol(HandshakeProtocolKind::Cms);
 		let dial = transport.perform_client_handshake().await;
+
 		let refused = matches!(dial, Err(TransportError::HandshakeError(HandshakeError::MutualAuthRequired)));
 		assert!(refused);
 		Ok(())
@@ -1412,6 +1421,25 @@ mod tests {
 		Ok(())
 	}
 
+	/// An HPKE server that presents no identity holds no key to sign its reply
+	/// with, so it refuses the handshake before it reads the opening.
+	#[cfg(feature = "transport-hpke")]
+	#[tokio::test]
+	async fn hpke_server_without_identity_fails_closed() -> TransportResult<()> {
+		let (_listener, stream) = bind_and_connect().await?;
+		// Client validators provision the endpoint, which presents no identity.
+		let peer_authentication = PeerAuthentication::mutual([refusing_validator()]);
+		let encryption = EncryptionConfig { peer_authentication, ..EncryptionConfig::unconfigured() };
+		let encryption = DialableEncryption::new(encryption)?;
+		let endpoint = EndpointConfig::new(encryption, Arc::new(SystemClock));
+		let mut transport = TcpTransport::new(TokioStream::from(stream), endpoint);
+		let opening = HandshakeMessage::try_from(create_test_signed_data(b"opening"))?;
+
+		let refused = transport.perform_server_handshake(opening).await;
+		assert!(matches!(refused, Err(TransportError::MissingEncryption)));
+		Ok(())
+	}
+
 	/// An HPKE client that holds no trust store has no validator for the
 	/// server the reply names, so it refuses before it sends anything.
 	#[cfg(feature = "transport-hpke")]
@@ -1423,6 +1451,100 @@ mod tests {
 
 		let dial = transport.perform_client_handshake().await;
 		let refused = matches!(dial, Err(TransportError::HandshakeError(HandshakeError::MissingTrustStore)));
+		assert!(refused);
+		Ok(())
+	}
+
+	/// A validator that refuses every certificate: a direct-trust validator
+	/// with no anchor.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	fn refusing_validator() -> Arc<dyn CertificateValidation> {
+		Arc::new(DirectTrustValidator::default())
+	}
+
+	/// A server policy that refuses every certificate.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	fn refusing_policy() -> Option<ValidatorChain> {
+		ValidatorChain::new([refusing_validator()])
+	}
+
+	/// A CMS client carries its server policy into the handshake, so a
+	/// policy that refuses the pinned key-agreement certificate refuses the
+	/// server before the client sends anything.
+	#[cfg(feature = "transport-cms")]
+	#[tokio::test]
+	async fn a_cms_client_runs_its_server_policy_before_the_opening() -> TransportResult<()> {
+		let (_listener, client_stream) = bind_and_connect().await?;
+		let server = TestCmsServer::generate("Test Server");
+		let encryption = EncryptionConfig {
+			cms_server: Some(server.trust()),
+			server_policy: refusing_policy(),
+			client_identity: Some(TestIdentity::insecure_fixed()),
+			..EncryptionConfig::unconfigured()
+		};
+
+		let transport = client_over(client_stream, encryption);
+		let mut transport = transport.with_handshake_protocol(HandshakeProtocolKind::Cms);
+		let dial = transport.perform_client_handshake().await;
+		let refused = matches!(
+			dial,
+			Err(TransportError::HandshakeError(HandshakeError::CertificateValidationError(
+				CertificateNotTrusted
+			)))
+		);
+		assert!(refused);
+		Ok(())
+	}
+
+	/// An HPKE client carries its server policy into the handshake, so a
+	/// policy that refuses the server's certificate refuses the server that
+	/// its store admits.
+	#[cfg(feature = "transport-hpke")]
+	#[tokio::test]
+	async fn an_hpke_client_runs_its_server_policy_at_the_reply() -> TransportResult<()> {
+		let EncryptedTestServer { server, config } = encrypted_test_server()?;
+		let (listener, server_addr) = bind_encrypted(config).await?;
+		let _server = spawn_accept_handle_request(listener);
+
+		let client_stream = TcpStream::connect(server_addr).await?;
+		let encryption = EncryptionConfig {
+			trust_store: Some(trust_store_for(&server)),
+			server_policy: refusing_policy(),
+			..EncryptionConfig::unconfigured()
+		};
+
+		let mut transport = client_over(client_stream, encryption);
+		let dial = transport.ensure_handshake_complete().await;
+		let refused = matches!(
+			dial,
+			Err(TransportError::HandshakeError(HandshakeError::CertificateValidationError(
+				CertificateNotTrusted
+			)))
+		);
+		assert!(refused);
+		Ok(())
+	}
+
+	/// `ClientBuilder::with_server_policy` carries its policy into the dial,
+	/// so a policy that refuses the server's certificate refuses the server
+	/// that the builder's store admits, at the first exchange.
+	#[cfg(feature = "transport-hpke")]
+	#[tokio::test]
+	async fn a_client_builder_runs_its_server_policy_on_the_dial() -> TransportResult<()> {
+		let EncryptedTestServer { server, config } = encrypted_test_server()?;
+		let (listener, server_addr) = bind_encrypted(config).await?;
+		let _server = spawn_accept_handle_request(listener);
+
+		let builder = ClientBuilder::<TokioListener>::builder().with_trust_store(trust_store_for(&server));
+		let mut client = builder.with_server_policy([refusing_validator()]).connect(server_addr).await?;
+
+		let exchange = client.emit(TestFrame::v0(None, None), None).await;
+		let refused = matches!(
+			exchange,
+			Err(TransportError::HandshakeError(HandshakeError::CertificateValidationError(
+				CertificateNotTrusted
+			)))
+		);
 		assert!(refused);
 		Ok(())
 	}
@@ -1460,11 +1582,11 @@ mod tests {
 			trust_store: Some(trust_store),
 			cms_server: Some(server.trust()),
 			client_identity: Some(client_identity),
-			handshake_protocol: HandshakeProtocolKind::Cms,
 			..EncryptionConfig::unconfigured()
 		};
 
-		let mut transport = client_over(client_stream, encryption);
+		let transport = client_over(client_stream, encryption);
+		let mut transport = transport.with_handshake_protocol(HandshakeProtocolKind::Cms);
 		let response = transport.emit(request.to_owned(), None).await?;
 		let received = received_rx.recv().await;
 		assert_eq!(Some(request), received);

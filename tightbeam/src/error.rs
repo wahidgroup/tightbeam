@@ -489,6 +489,15 @@ crate::impl_from!(crate::builder::error::BuildError => TightBeamError::BuildErro
 crate::impl_from!(crate::standards::error::StandardError => TightBeamError::StandardError);
 #[cfg(feature = "colony")]
 crate::impl_from!(crate::colony::hive::HiveError => TightBeamError::HiveError);
+
+// A peer list's refusal reaches the crate error through the hive error that
+// carries it.
+#[cfg(feature = "colony")]
+impl From<crate::colony::hive::PeerListError> for TightBeamError {
+	fn from(error: crate::colony::hive::PeerListError) -> Self {
+		Self::HiveError(crate::colony::hive::HiveError::from(error))
+	}
+}
 #[cfg(feature = "colony")]
 crate::impl_from!(crate::colony::worker::WorkerRelayError => TightBeamError::WorkerRelay);
 

@@ -23,8 +23,6 @@ use crate::transport::multiplex::MuxRole;
 use crate::runtime::rt;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::multiplex::MuxRekeyContext;
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::transport::rekey::RekeyDriver;
 #[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
 use crate::utils::time::Clock;
 
@@ -49,7 +47,8 @@ where
 	/// Assemble a multiplexed transport over split halves.
 	///
 	/// - `role` fixes odd or even stream IDs and MUST match the endpoint's
-	///   connection role, where the initiator is the client.
+	///   connection role, where the initiator is the client. A transport with
+	///   in-band rekey takes the role of its context ([`Self::with_rekey`]).
 	/// - On encrypted halves, `settings` MUST come from [`negotiated_mux`]. A
 	///   peer that never negotiated multiplexing rejects every muxed envelope
 	///   as invalid.
@@ -87,10 +86,13 @@ where
 		Self { handle, reader, writer, responder }
 	}
 
-	/// Attach in-band rekey, for receipt-bearing sessions only.
+	/// Assemble a multiplexed transport with in-band rekey over split halves,
+	/// for receipt-bearing sessions only. The transport takes the role of the
+	/// half `context` holds, so its stream IDs and its rekey exchange share one
+	/// role.
 	///
-	/// The call seeds the handle receipt accessor from the handshake artifact,
-	/// and each completed renewal overwrites it.
+	/// `settings` follow [`Self::new`]. The handshake artifact seeds the
+	/// handle receipt accessor, and each completed renewal overwrites it.
 	///
 	/// # Exchange halves
 	///
@@ -106,16 +108,55 @@ where
 	/// at the hard floor. A build without tokio has no timer here, so the
 	/// embedding application MUST bound parked emits itself by wrapping emit
 	/// futures in its own timeout. A cancelled emit frees its stream slot.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::transport::handshake::negotiation::MuxSettings;
+	/// use tightbeam::transport::multiplex::{MuxConnector, MuxRole, MuxTransport};
+	/// use tightbeam::transport::TransportResult;
+	///
+	/// // A dialed connection that negotiated `settings`, assembled in the role
+	/// // of the rekey context its handshake left, or as a client without one.
+	/// fn assemble<T: MuxConnector>(
+	///     mut connection: T,
+	///     settings: MuxSettings,
+	/// ) -> TransportResult<MuxTransport<T::EnvelopeReader, T::EnvelopeWriter>> {
+	///     let rekey = connection.take_rekey()?;
+	///     let (reader, writer) = connection.into_envelope_halves()?;
+	///     let mux = match rekey {
+	///         Some(context) => MuxTransport::with_rekey(reader, writer, context, settings),
+	///         None => MuxTransport::new(reader, writer, MuxRole::Client, settings),
+	///     };
+	///     Ok(mux)
+	/// }
+	/// ```
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-	#[must_use]
-	pub fn with_rekey(mut self, context: MuxRekeyContext) -> Self {
+	pub fn with_rekey(reader: R, writer: W, context: MuxRekeyContext, settings: MuxSettings) -> Self {
 		let MuxRekeyContext { driver, receipt } = context;
-		if let RekeyDriver::Client(exchange) = &driver {
-			self.writer.set_exchange(Arc::clone(exchange));
-		}
-		self.reader.attach_rekey(driver, receipt);
+		let mut transport = Self::new(reader, writer, driver.role(), settings);
+		let opener = driver.renewal_opener().map(Arc::clone);
+		transport.writer.set_exchange(opener);
+		transport.reader.attach_rekey(driver, receipt);
 
-		self
+		transport
+	}
+
+	/// Assemble a transport over split halves in `role`, or with in-band
+	/// rekey ([`Self::with_rekey`]) when `rekey` holds a context, which brings
+	/// the role it was detached for.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	pub(crate) fn assemble(
+		reader: R,
+		writer: W,
+		role: MuxRole,
+		settings: MuxSettings,
+		rekey: Option<MuxRekeyContext>,
+	) -> Self {
+		match rekey {
+			Some(context) => Self::with_rekey(reader, writer, context, settings),
+			None => Self::new(reader, writer, role, settings),
+		}
 	}
 
 	/// Override the time budget for one in-band renewal exchange. The default
@@ -205,15 +246,12 @@ where
 		SpawnedMux { handle, responder, reader_task }
 	}
 
-	/// Apply the optional cancel budget and rekey context, then spawn both
-	/// drivers through [`MuxTransport::spawn`].
+	/// Apply the optional cancel budget, then spawn both drivers through
+	/// [`MuxTransport::spawn`].
 	#[cfg(pooled_mux)]
-	pub(crate) fn spawn_with(mut self, cancel_budget: Option<u32>, rekey: Option<MuxRekeyContext>) -> SpawnedMux {
+	pub(crate) fn spawn_with(mut self, cancel_budget: Option<u32>) -> SpawnedMux {
 		if let Some(budget) = cancel_budget {
 			self = self.with_cancel_budget(budget);
-		}
-		if let Some(context) = rekey {
-			self = self.with_rekey(context);
 		}
 
 		self.spawn()

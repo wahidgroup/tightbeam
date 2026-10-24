@@ -20,13 +20,15 @@ use crate::transport::handshake::negotiation::TransportOffer;
 use crate::transport::handshake::HandshakeProtocolKind;
 use crate::transport::policy::{PolicyConfig, TimeoutConfig};
 use crate::transport::protocols::{PersistentConnection, Protocol};
-use crate::transport::state::{DialableEncryption, EncryptionConfig};
+use crate::transport::state::{DialableEncryption, EncryptionConfig, Negotiation};
 use crate::transport::MessageCollector;
 use crate::transport::MessageEmitter;
 use crate::transport::{EndpointConfig, TransportResult};
 use crate::utils::time::{Clock, MonotonicInstant};
 use crate::Frame;
 
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::crypto::x509::policy::CertificateValidation;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::x509::KeyPurposes;
 #[cfg(feature = "instrument")]
@@ -37,6 +39,8 @@ use crate::trace::TraceCollector;
 use crate::transport::handshake::receipt::ReceiptApprover;
 #[cfg(feature = "transport-cms")]
 use crate::transport::handshake::ProvisionedTrust;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::transport::handshake::ValidatorChain;
 #[cfg(any(feature = "instrument", pooled_mux))]
 use crate::urn::Urn;
 #[cfg(host_clock)]
@@ -64,7 +68,7 @@ pooled_mux! {
 	use crate::utils::marker::MaybeSend;
 	use crate::transport::handshake::receipt::StoredReceipt;
 	use crate::transport::multiplex::{
-		MuxCapable, MuxConnector, MuxHandle, MuxRole, MuxTransport, RequestSink, SpawnedMux, StreamBody,
+		MuxCapable, MuxConnector, MuxHandle, MuxTransport, RequestSink, SpawnedMux, StreamBody, CONNECTOR_ROLE,
 	};
 
 	#[cfg(feature = "colony")]
@@ -152,15 +156,6 @@ impl<C: CryptoProvider> PoolTlsConfig<C> {
 		self.encryption.key_purposes = key_purposes;
 	}
 
-	fn set_handshake_protocol(&mut self, kind: HandshakeProtocolKind) {
-		self.encryption.handshake_protocol = kind;
-	}
-
-	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-	fn set_receipt_approver(&mut self, approver: Arc<dyn ReceiptApprover>) {
-		self.encryption.receipt_approver = Some(approver);
-	}
-
 	/// Answer this provisioning once, when the pool is built: the dialer rule,
 	/// and the key purpose of the client identity's role.
 	fn answer(self) -> PoolProvisioning<C> {
@@ -183,14 +178,17 @@ enum PoolProvisioning<C: CryptoProvider> {
 }
 
 impl<C: CryptoProvider> PoolProvisioning<C> {
-	/// Returns everything that one dial from this pool is built from.
+	/// Returns the endpoint that one dial from this pool starts from, over this
+	/// provisioning and `clock`.
 	///
 	/// Cloning the answered provisioning bumps refcounts.
 	///
 	/// # Errors
 	///
 	/// - [`TransportError::PeerAuthenticationUnconfigured`] -- the pool
-	///   authenticates no peer and did not name cleartext.
+	///   authenticates no peer and did not name cleartext, or it sets a server
+	///   policy and holds no trust in a server, whether or not it names
+	///   cleartext.
 	/// - [`TransportError::HandshakeError`] -- the client identity names
 	///   another key purpose than the client's.
 	fn endpoint(&self, clock: &Arc<dyn Clock>) -> TransportResult<EndpointConfig<C>> {
@@ -209,6 +207,7 @@ pub struct ConnectionPoolBuilder<P: Protocol> {
 	clock: Arc<dyn Clock>,
 	timeout: Option<Duration>,
 	tls: PoolTlsConfig<P::CryptoProvider>,
+	negotiation: Negotiation,
 	#[cfg(feature = "instrument")]
 	trace: Option<TraceCollector>,
 	_phantom: PhantomData<P>,
@@ -223,6 +222,7 @@ impl<P: Protocol> ConnectionPoolBuilder<P> {
 			clock,
 			timeout: None,
 			tls: PoolTlsConfig::unconfigured(),
+			negotiation: Negotiation::default(),
 			#[cfg(feature = "instrument")]
 			trace: None,
 			_phantom: PhantomData,
@@ -292,9 +292,40 @@ impl<P: Protocol> ConnectionPoolBuilder<P> {
 		self
 	}
 
+	/// Set the server policy of every pooled connection, which every
+	/// validator of `validators` runs on the identity certificate of the
+	/// server under either flow, as [`ClientConfig::with_server_policy`]
+	/// states. An empty set sets no policy.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::crypto::policy::Secp256k1Policy;
+	/// use tightbeam::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
+	/// use tightbeam::crypto::x509::store::{CertificateTrustBuilder, TrustBuilder};
+	/// use tightbeam::transport::client::{ConnectionBuilder, ConnectionPool};
+	/// use tightbeam::transport::tcp::r#async::TokioListener;
+	///
+	/// let store = Arc::new(CertificateTrustBuilder::from(Secp256k1Policy::default()).build());
+	/// let builder = ConnectionPool::<TokioListener>::builder().with_trust_store(store);
+	///
+	/// // Every pooled dial runs the policy on the server the store admits.
+	/// let expiry: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator);
+	/// let _builder = builder.with_server_policy([expiry]);
+	/// ```
+	///
+	/// [`ClientConfig::with_server_policy`]: crate::transport::handshake::ClientConfig::with_server_policy
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	pub fn with_server_policy(mut self, validators: impl IntoIterator<Item = Arc<dyn CertificateValidation>>) -> Self {
+		self.tls.encryption.server_policy = ValidatorChain::new(validators);
+		self
+	}
+
 	/// Select the handshake protocol used by every pooled connection.
 	pub fn with_handshake_protocol(mut self, kind: HandshakeProtocolKind) -> Self {
-		self.tls.set_handshake_protocol(kind);
+		self.negotiation.select_handshake(kind);
 		self
 	}
 
@@ -305,7 +336,7 @@ impl<P: Protocol> ConnectionPoolBuilder<P> {
 	/// challenge-bearing receipts.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub fn with_receipt_approver(mut self, approver: Arc<dyn ReceiptApprover>) -> Self {
-		self.tls.set_receipt_approver(approver);
+		self.negotiation.approve_receipts(approver);
 		self
 	}
 }
@@ -339,6 +370,7 @@ impl<P: Protocol> ConnectionBuilder<P> for ConnectionPoolBuilder<P> {
 			#[cfg(pooled_mux)]
 			mux_ids: AtomicU64::new(0),
 			tls: self.tls.answer(),
+			negotiation: self.negotiation,
 			#[cfg(feature = "instrument")]
 			trace: self.trace,
 		}
@@ -457,6 +489,8 @@ pub struct ConnectionPool<P: Protocol> {
 	mux_ids: AtomicU64,
 	/// Shared TLS assets reused across pooled connections, answered once.
 	tls: PoolProvisioning<P::CryptoProvider>,
+	/// The negotiation input every dial from this pool starts with.
+	negotiation: Negotiation,
 	/// Production instrumentation collector, the single client-side entry
 	/// point.
 	#[cfg(feature = "instrument")]
@@ -477,8 +511,8 @@ impl<P: Protocol> ConnectionPool<P> {
 	}
 
 	/// Returns everything that one dial from this pool is built from: the
-	/// shared provisioning, the pool's clock, and its instrumentation
-	/// collector.
+	/// shared provisioning, the negotiation input, the pool's clock, and its
+	/// instrumentation collector.
 	///
 	/// The endpoint is built before the dial opens a socket, so a pool that
 	/// answers the dialer rule with a refusal never connects.
@@ -486,9 +520,12 @@ impl<P: Protocol> ConnectionPool<P> {
 	/// # Errors
 	///
 	/// - [`TransportError::PeerAuthenticationUnconfigured`] -- the pool
-	///   authenticates no peer and did not name cleartext.
+	///   authenticates no peer and did not name cleartext, or it sets a server
+	///   policy and holds no trust in a server, whether or not it names
+	///   cleartext.
 	fn dial_endpoint(&self) -> TransportResult<EndpointConfig<P::CryptoProvider>> {
 		let endpoint = self.tls.endpoint(&self.clock)?;
+		let endpoint = endpoint.with_negotiation(self.negotiation.clone());
 
 		#[cfg(feature = "instrument")]
 		let endpoint = match self.trace.as_ref() {
@@ -821,8 +858,8 @@ pooled_mux! {
 
 			let rekey = transport.take_rekey()?;
 			let (reader, writer) = transport.into_envelope_halves()?;
-			let mux = MuxTransport::new(reader, writer, MuxRole::Client, settings);
-			let SpawnedMux { handle, responder, reader_task } = mux.spawn_with(None, rekey);
+			let mux = MuxTransport::assemble(reader, writer, CONNECTOR_ROLE, settings, rekey);
+			let SpawnedMux { handle, responder, reader_task } = mux.spawn();
 
 			// Pool endpoints serve no peer-initiated streams, so dropping the
 			// responder refuses them.

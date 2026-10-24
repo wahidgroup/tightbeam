@@ -3,11 +3,21 @@ pub mod policy;
 pub mod store;
 pub mod utils;
 
+mod key;
 mod peer;
 
+pub use key::{CanonicalKey, CurvePoints, KeyCurves, Sec1Curve};
 pub use peer::{CertificateUse, ErasedSigning, KeyPurposes, PeerCertificate};
 pub use x509_cert::{attr, ext, name, serial_number, time, Certificate, TbsCertificate, Version};
 
+#[cfg(any(
+	feature = "transport-cms",
+	feature = "transport-hpke",
+	all(test, feature = "transport")
+))]
+pub(crate) use key::KeyIdentity;
+#[cfg(feature = "std")]
+pub use key::KeyIndex;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub(crate) use peer::AgreementPoint;
 #[cfg(all(feature = "hpke", feature = "signature", feature = "ecdh"))]
@@ -27,19 +37,20 @@ use alloc::{boxed::Box, vec::Vec};
 use crate::der::{Decode, DecodePem};
 use crate::TightBeamError;
 
-/// Specification for providing a certificate in various formats.
+/// A certificate given as PEM text, as DER bytes, or as a built
+/// [`Certificate`].
 ///
-/// This enum allows certificates to be specified in multiple ways for flexible
-/// configuration in const contexts (e.g., servlet! macro).
+/// The PEM and DER forms are `'static`, so a const context such as the
+/// `servlet!` macro can name a certificate in either form.
 #[derive(Debug, Clone)]
 pub enum CertificateSpec {
-	/// PEM-encoded certificate string
+	/// A PEM-encoded certificate string.
 	Pem(&'static str),
 
-	/// DER-encoded certificate bytes
+	/// The DER-encoded bytes of a certificate.
 	Der(&'static [u8]),
 
-	/// Pre-constructed Certificate instance
+	/// A certificate value that is already built.
 	Built(Box<Certificate>),
 }
 

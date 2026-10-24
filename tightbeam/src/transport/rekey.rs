@@ -51,13 +51,14 @@
 //! [rfc9846-4.7.3]: https://datatracker.ietf.org/doc/html/rfc9846#section-4.7.3
 //! [rfc9846-7.2]: https://datatracker.ietf.org/doc/html/rfc9846#section-7.2
 
+use core::marker::PhantomData;
 use std::sync::Arc;
 
 use futures::lock::Mutex as FuturesMutex;
 
 use crate::cms::signed_data::SignedData;
 use crate::constants::EC_PUBKEY_COMPRESSED_SIZE;
-use crate::crypto::aead::{DirectionalCiphers, RecvCipher, SendCipher, SessionKeys};
+use crate::crypto::aead::{DirectionalCiphers, RecvCipher, RuntimeAead, SendCipher, SessionKeys};
 use crate::crypto::sign::elliptic_curve::ecdh::EphemeralSecret;
 use crate::crypto::sign::elliptic_curve::PublicKey;
 use crate::crypto::sign::{Signed, SigningIdentity};
@@ -76,7 +77,6 @@ use crate::transport::handshake::{
 	AgreementCertificate, CompressedPoint, EpochMaterials, EpochSecret, HandshakeCurve, HandshakeError,
 	HandshakeOctets, HandshakeProvider, PeerEphemeral, ServerKeys, SessionPeer,
 };
-use crate::transport::multiplex::MuxRole;
 use crate::utils::marker::{MaybeSend, MaybeSendFuture};
 
 /// Shared epoch state and identities for one session's rekey exchanges.
@@ -86,10 +86,7 @@ use crate::utils::marker::{MaybeSend, MaybeSendFuture};
 /// - the epoch secret chain,
 /// - the initial receipt terms, which are the credit-match reference,
 /// - the local signing identity, and
-/// - the peer the session recorded: its certificate, admitted for signing,
-///   whose key verifies the peer's receipt signatures and which each rekey
-///   ephemeral is parsed beside, and the key of a CMS server's key-agreement
-///   certificate.
+/// - the [`RekeyPeer`] the session recorded, whose signing key verifies the peer's receipt signatures.
 ///
 /// The provider's cipher type names the AEAD, and its curve the agreement.
 pub(crate) struct RekeyMaterials<P>
@@ -99,11 +96,46 @@ where
 	epoch: EpochMaterials,
 	reference: SessionReceipt,
 	identity: SigningIdentity,
-	peer: PeerCertificate<Signing<P>>,
-	/// The key of a CMS server's key-agreement certificate as a point of the
-	/// handshake curve, which each server ephemeral must differ from beside
-	/// the key of [`Self::peer`]. A client's certificate carries none.
-	peer_key_agreement: Option<PublicKey<P::Curve>>,
+	peer: RekeyPeer<P>,
+}
+
+/// The peer a session recorded, once its certificate is admitted for signing
+/// under the key purpose of its role, with the key of a CMS server's
+/// key-agreement certificate as a point of the handshake curve.
+///
+/// A rekey's materials take it whole, so each key a rekey reads names the one
+/// peer.
+pub(crate) struct RekeyPeer<P>
+where
+	P: HandshakeProvider,
+{
+	/// The certificate, admitted for signing under the purpose of its role.
+	signing: PeerCertificate<Signing<P>>,
+	/// The key of a CMS server's key-agreement certificate.
+	key_agreement: Option<PublicKey<P::Curve>>,
+}
+
+impl<P> RekeyPeer<P>
+where
+	P: HandshakeProvider,
+{
+	/// Admit `peer` for signing under `purpose`, the key purpose of the peer's
+	/// role.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::CertificateValidationError`] -- the signing use or `purpose` refuses `peer`.
+	pub(crate) fn admit(peer: &SessionPeer, purpose: ObjectIdentifier) -> Result<Self, HandshakeError> {
+		let signing = PeerCertificate::parse(Arc::clone(peer.certificate()), purpose)?;
+		let key_agreement = peer.key_agreement();
+		let key_agreement = key_agreement.and_then(|certificate| certificate.agreement_point::<P::Curve>());
+		Ok(Self { signing, key_agreement })
+	}
+
+	/// The static keys of this peer as the server of its session.
+	fn server_keys(&self) -> ServerKeys<'_, P> {
+		ServerKeys { signing: &self.signing, key_agreement: self.key_agreement.as_ref() }
+	}
 }
 
 /// Fresh per-direction state produced by a completed exchange.
@@ -129,28 +161,14 @@ impl<P> RekeyMaterials<P>
 where
 	P: HandshakeProvider,
 {
-	/// Materials for a session whose peer the session recorded as `peer`, its
-	/// certificate admitted for signing under `purpose`, the key purpose of
-	/// the peer's role.
-	///
-	/// The key of `peer` verifies the peer's receipt signatures, and each rekey
-	/// ephemeral is compared with it and with the key-agreement key of a CMS
-	/// server, so each key a rekey reads names the one peer.
-	///
-	/// # Errors
-	///
-	/// - [`HandshakeError::CertificateValidationError`] -- the signing use or `purpose` refuses `peer`.
+	/// Materials for a session whose recorded peer is `peer`.
 	pub(crate) fn new(
 		epoch: EpochMaterials,
 		reference: SessionReceipt,
 		identity: SigningIdentity,
-		peer: &SessionPeer,
-		purpose: ObjectIdentifier,
-	) -> Result<Self, HandshakeError> {
-		let signing = PeerCertificate::parse(Arc::clone(peer.certificate()), purpose)?;
-		let key_agreement = peer.key_agreement();
-		let peer_key_agreement = key_agreement.and_then(|certificate| certificate.agreement_point::<P::Curve>());
-		Ok(Self { epoch, reference, identity, peer: signing, peer_key_agreement })
+		peer: RekeyPeer<P>,
+	) -> Self {
+		Self { epoch, reference, identity, peer }
 	}
 
 	/// The current epoch number.
@@ -164,14 +182,13 @@ where
 	/// The traffic keys come from `next_secret` under the directional labels
 	/// that the handshake finalization uses, and both ciphers take the next
 	/// epoch. Assigning the next secret drops the prior one, which zeroizes on
-	/// drop (RFC 9846 § 7.2).
+	/// drop (RFC 9846 § 7.2). Each half maps the ciphers to its own role.
 	fn rotate(
 		&mut self,
-		role: MuxRole,
 		next_secret: EpochSecret,
 		salt: &RandomsSalt,
 		next_hash: TranscriptHash,
-	) -> Result<(SendCipher, RecvCipher), HandshakeError> {
+	) -> Result<DirectionalCiphers<RuntimeAead>, HandshakeError> {
 		let next_epoch = self.epoch.epoch.checked_add(1).ok_or(HandshakeError::IntegerOutOfRange)?;
 		let directional = DirectionalCiphers::derive::<P, _>(&next_secret, salt.as_kdf_salt(), next_epoch)?;
 
@@ -179,11 +196,7 @@ where
 		self.epoch.epoch = next_epoch;
 		self.epoch.transcript_hash = next_hash;
 
-		let keys = match role {
-			MuxRole::Client => SessionKeys::for_client(directional),
-			MuxRole::Server => SessionKeys::for_server(directional),
-		};
-		Ok(keys.into_parts())
+		Ok(directional)
 	}
 }
 
@@ -286,7 +299,7 @@ where
 		let receipt = artifact.receipt()?;
 		let server_role = ReceiptRole::Server;
 		let server_signer = artifact.signer_for_role(server_role)?.ok_or(HandshakeError::ReceiptMissing)?;
-		receipt.verify_signer::<P>(server_signer, server_role, &self.materials.peer)?;
+		receipt.verify_signer::<P>(server_signer, server_role, &self.materials.peer.signing)?;
 
 		let epoch = &self.materials.epoch;
 		let challenge_hash = epoch.exchange_pin::<P::Digest>(&request_der, &server_random, &server_point)?;
@@ -299,8 +312,7 @@ where
 		// authenticated here, and it must differ from every static key of the
 		// server. The agreement takes the scalar by value and runs before the
 		// approver is awaited, so no await of this step holds it.
-		let materials = &self.materials;
-		let keys = ServerKeys { signing: &materials.peer, key_agreement: materials.peer_key_agreement.as_ref() };
+		let keys = self.materials.peer.server_keys();
 		let server_ephemeral = keys.server_ephemeral(&server_point)?;
 		let salt = RandomsSalt::new(&client_random, &server_random);
 		let next_secret = epoch.secret.next::<P>(ephemeral, &server_ephemeral, salt.as_kdf_salt())?;
@@ -325,8 +337,8 @@ where
 			.epoch
 			.advanced::<P::Digest>(&request_der, &response_der, &ack_der)?;
 
-		let rotated = self.materials.rotate(MuxRole::Client, next_secret, &salt, next_hash)?;
-		let (send_cipher, recv_cipher) = rotated;
+		let rotated = self.materials.rotate(next_secret, &salt, next_hash)?;
+		let (send_cipher, recv_cipher) = SessionKeys::for_client(rotated).into_parts();
 
 		let install = EpochInstall { send_cipher, recv_cipher, receipt: stored, epoch: self.materials.epoch() };
 		Ok((ack, install))
@@ -385,21 +397,22 @@ where
 		self.materials.epoch()
 	}
 
-	/// Whether an exchange awaits the client's acknowledgement.
+	/// Whether an exchange awaits the client's acknowledgement, which unit
+	/// tests observe.
+	#[cfg(test)]
 	pub(crate) fn exchange_in_flight(&self) -> bool {
 		self.pending.is_some()
 	}
 
-	/// Agree on the next epoch secret and issue the epoch receipt for a
-	/// renewal request, as the second leg.
+	/// Answer a renewal request: agree on the next epoch secret and issue the
+	/// epoch receipt as the second leg, or refuse the request while an
+	/// exchange awaits the client's acknowledgement.
 	///
 	/// The receipt inherits the initial budgets and credit unit. The
 	/// authorizer may attach a fresh settlement challenge for the epoch.
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError::InvalidState`] -- an exchange is already in flight.
-	///   The mux driver bounds request flooding before this check.
 	/// - [`HandshakeError::OctetStringLengthError`] -- the client ephemeral is not a compressed point.
 	/// - [`HandshakeError::InvalidPublicKey`] -- the client ephemeral is not a point on the curve.
 	/// - [`HandshakeError::ClientEphemeralIsStatic`] -- the client ephemeral is the client's static key.
@@ -407,15 +420,15 @@ where
 	pub(crate) async fn process_request(
 		&mut self,
 		request: &MuxRekeyRequestPackage,
-	) -> Result<MuxRekeyResponsePackage, HandshakeError> {
+	) -> Result<RequestAnswer, HandshakeError> {
 		if self.pending.is_some() {
-			return Err(HandshakeError::InvalidState);
+			return Ok(RequestAnswer::InFlight);
 		}
 
 		let request_der = request.to_der()?;
 		let client_random = request.client_random.to_32_byte_array()?;
 		let client_point = request.client_ephemeral.to_byte_array::<EC_PUBKEY_COMPRESSED_SIZE>()?;
-		let client_ephemeral = self.materials.peer.client_ephemeral(&client_point)?;
+		let client_ephemeral = self.materials.peer.signing.client_ephemeral(&client_point)?;
 		let server_random = generate_nonce::<32>(None)?;
 
 		// The agreement takes the scalar by value and runs before the first
@@ -462,7 +475,7 @@ where
 		};
 
 		self.pending = Some(pending);
-		Ok(response)
+		Ok(RequestAnswer::Issued(response))
 	}
 
 	/// Settle the client's countersignature, record the outcome, and
@@ -494,7 +507,7 @@ where
 
 		let (verdict, ancillary_response, countersigner) = pending
 			.receipt
-			.settle_ack::<P>(countersignature, &self.materials.peer, self.authorizer.as_deref())
+			.settle_ack::<P>(countersignature, &self.materials.peer.signing, self.authorizer.as_deref())
 			.await?;
 
 		// A verified countersignature completes the artifact, beside the
@@ -513,7 +526,7 @@ where
 		};
 
 		let countersignature_octet = countersignature_der.map(OctetString::new).transpose()?;
-		let client_certificate = Some(Arc::clone(self.materials.peer.certificate()));
+		let client_certificate = Some(Arc::clone(self.materials.peer.signing.certificate()));
 		let outcome = SessionOutcome {
 			receipt: pending.receipt,
 			artifact,
@@ -535,12 +548,25 @@ where
 		let epoch = &self.materials.epoch;
 		let next_hash = epoch.advanced::<P::Digest>(&pending.request_der, &pending.response_der, &ack_der)?;
 		let salt = RandomsSalt::new(&pending.client_random, &pending.server_random);
-		let rotated = self.materials.rotate(MuxRole::Server, pending.next_secret, &salt, next_hash)?;
-		let (send_cipher, recv_cipher) = rotated;
+		let rotated = self.materials.rotate(pending.next_secret, &salt, next_hash)?;
+		let (send_cipher, recv_cipher) = SessionKeys::for_server(rotated).into_parts();
 
 		let install = EpochInstall { send_cipher, recv_cipher, receipt: stored, epoch: self.materials.epoch() };
 		Ok(ServerAckOutcome { install, rejection })
 	}
+}
+
+/// The server's answer to a renewal request.
+///
+/// [`ServerRekey::process_request`] is its one source, so the server half
+/// alone decides whether a request may open an exchange.
+pub(crate) enum RequestAnswer {
+	/// The epoch receipt for the request, as the second leg.
+	Issued(MuxRekeyResponsePackage),
+	/// The refusal of a request that arrived while an exchange awaits the
+	/// client's acknowledgement, which the mux reader reads as a protocol
+	/// violation (CWE-400).
+	InFlight,
 }
 
 /// The server verdict on a settled acknowledgement.
@@ -587,14 +613,11 @@ where
 /// Object-safe server half of the rekey exchange, erasing the crypto
 /// provider so the mux driver stays non-generic.
 pub(crate) trait ServerRekeyExchange: MaybeSend {
-	/// Whether an exchange awaits the client's acknowledgement.
-	fn exchange_in_flight(&self) -> bool;
-
-	/// Issue the epoch receipt as the second leg.
+	/// Answer a renewal request, with the epoch receipt as the second leg.
 	fn process_request<'a>(
 		&'a mut self,
 		request: &'a MuxRekeyRequestPackage,
-	) -> MaybeSendFuture<'a, Result<MuxRekeyResponsePackage, HandshakeError>>;
+	) -> MaybeSendFuture<'a, Result<RequestAnswer, HandshakeError>>;
 
 	/// Settle the countersignature, record the outcome, and rotate the chain.
 	fn process_ack<'a>(
@@ -607,14 +630,10 @@ impl<P> ServerRekeyExchange for ServerRekey<P>
 where
 	P: HandshakeProvider,
 {
-	fn exchange_in_flight(&self) -> bool {
-		ServerRekey::exchange_in_flight(self)
-	}
-
 	fn process_request<'a>(
 		&'a mut self,
 		request: &'a MuxRekeyRequestPackage,
-	) -> MaybeSendFuture<'a, Result<MuxRekeyResponsePackage, HandshakeError>> {
+	) -> MaybeSendFuture<'a, Result<RequestAnswer, HandshakeError>> {
 		Box::pin(ServerRekey::process_request(self, request))
 	}
 
@@ -627,6 +646,9 @@ where
 }
 
 /// Role-fixed rekey exchange handed to the mux plane.
+///
+/// The mux reader and writer take each step of the exchange through a method
+/// of this type, which returns `None` for a step of the other role.
 ///
 /// # Locking
 ///
@@ -660,6 +682,177 @@ impl RekeyDriver {
 	{
 		RekeyDriver::Server(Box::new(rekey))
 	}
+
+	/// The half that opens renewals, which the writer shares for its record
+	/// trigger: the client's half.
+	pub(crate) fn renewal_opener(&self) -> Option<&Arc<FuturesMutex<Box<dyn ClientRekeyExchange>>>> {
+		match self {
+			RekeyDriver::Client(exchange) => Some(exchange),
+			RekeyDriver::Server(_) => None,
+		}
+	}
+
+	/// Answer `request` through the server's half, the server's step, with
+	/// the epoch receipt as the second leg.
+	///
+	/// It returns `None` for the client's half.
+	pub(crate) async fn process_request(
+		&mut self,
+		request: &MuxRekeyRequestPackage,
+	) -> Option<Result<RequestAnswer, HandshakeError>> {
+		match self {
+			RekeyDriver::Server(exchange) => {
+				let answered = exchange.process_request(request).await;
+				Some(answered)
+			}
+			RekeyDriver::Client(_) => None,
+		}
+	}
+
+	/// Verify, countersign, and rotate on the server's `response`, the
+	/// client's step.
+	///
+	/// The receiver is exclusive so that the future is `Send`: the server's
+	/// half is `Send` alone, and a shared borrow across an await needs `Sync`.
+	pub(crate) async fn process_response(
+		&mut self,
+		response: MuxRekeyResponsePackage,
+	) -> Option<Result<(MuxRekeyAckPackage, EpochInstall), HandshakeError>> {
+		match self {
+			RekeyDriver::Client(exchange) => {
+				let mut guard = exchange.lock().await;
+				let processed = guard.process_response(response).await;
+				Some(processed)
+			}
+			RekeyDriver::Server(_) => None,
+		}
+	}
+
+	/// Settle the countersignature of `ack`, record the outcome, and rotate
+	/// the chain, the server's step.
+	pub(crate) async fn process_ack(
+		&mut self,
+		ack: MuxRekeyAckPackage,
+	) -> Option<Result<ServerAckOutcome, HandshakeError>> {
+		match self {
+			RekeyDriver::Server(exchange) => {
+				let settled = exchange.process_ack(ack).await;
+				Some(settled)
+			}
+			RekeyDriver::Client(_) => None,
+		}
+	}
+}
+
+/// What one mux role of a session renews under: the identity it presented in
+/// the handshake, the key purpose its peer was admitted under, and the hooks
+/// of its half of the rekey exchange.
+///
+/// 1. [`Self::client`] or [`Self::server`] builds it for one role, under the
+///    provider of the endpoint that lends the parts.
+/// 2. The session admits its peer with [`Self::admit`].
+/// 3. The session runs the [`AdmittedRenewal`] once it hands over its epoch.
+pub(crate) struct Renewal<P> {
+	/// The identity that signs this role's epoch receipts.
+	identity: SigningIdentity,
+	/// The key purpose of the peer's role.
+	purpose: ObjectIdentifier,
+	/// The hooks of this role's half of the exchange.
+	hooks: RenewalHooks,
+	/// The provider of the endpoint that built it, which the rekey runs under.
+	provider: PhantomData<fn() -> P>,
+}
+
+/// A renewal whose peer passed the signing use and the purpose of its role,
+/// which runs once the session hands over its epoch.
+pub(crate) struct AdmittedRenewal<P: HandshakeProvider> {
+	/// The identity that signs this role's epoch receipts.
+	identity: SigningIdentity,
+	/// The peer the session recorded, admitted for this role's rekey.
+	peer: RekeyPeer<P>,
+	/// The hooks of this role's half of the exchange.
+	hooks: RenewalHooks,
+}
+
+/// The hooks of one role's half of the rekey exchange.
+enum RenewalHooks {
+	/// The client's half, which consults `approver` before it countersigns an
+	/// epoch receipt.
+	Client { approver: Option<Arc<dyn ReceiptApprover>> },
+	/// The server's half, which consults `authorizer` for each renewal and
+	/// reports each outcome to `observer`.
+	Server {
+		authorizer: Option<Arc<dyn TransportAuthorizer>>,
+		observer: Option<Arc<dyn SessionObserver>>,
+	},
+}
+
+impl<P> Renewal<P> {
+	/// The renewal of the client role: `identity` countersigns each epoch
+	/// receipt, the server was admitted under `purpose`, and `approver`
+	/// decides each receipt before the countersignature.
+	pub(crate) fn client(
+		identity: SigningIdentity,
+		purpose: ObjectIdentifier,
+		approver: Option<Arc<dyn ReceiptApprover>>,
+	) -> Self {
+		let hooks = RenewalHooks::Client { approver };
+		Self { identity, purpose, hooks, provider: PhantomData }
+	}
+
+	/// The renewal of the server role: `identity` signs each epoch receipt,
+	/// the client was admitted under `purpose`, `authorizer` decides each
+	/// renewal, and `observer` records each outcome.
+	pub(crate) fn server(
+		identity: SigningIdentity,
+		purpose: ObjectIdentifier,
+		authorizer: Option<Arc<dyn TransportAuthorizer>>,
+		observer: Option<Arc<dyn SessionObserver>>,
+	) -> Self {
+		let hooks = RenewalHooks::Server { authorizer, observer };
+		Self { identity, purpose, hooks, provider: PhantomData }
+	}
+}
+
+impl<P: HandshakeProvider> Renewal<P> {
+	/// This renewal with `peer`, the peer the session recorded, admitted for
+	/// signing under the purpose of the peer's role.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::CertificateValidationError`] -- the signing use or
+	///   the purpose of the peer's role refuses `peer`.
+	pub(crate) fn admit(self, peer: &SessionPeer) -> Result<AdmittedRenewal<P>, HandshakeError> {
+		let Self { identity, purpose, hooks, provider: _ } = self;
+		let peer = RekeyPeer::admit(peer, purpose)?;
+		Ok(AdmittedRenewal { identity, peer, hooks })
+	}
+}
+
+impl<P: HandshakeProvider> AdmittedRenewal<P> {
+	/// The rekey driver of this role over the session's `epoch` and the terms
+	/// of its `reference` receipt.
+	pub(crate) fn driver(self, epoch: EpochMaterials, reference: SessionReceipt) -> RekeyDriver {
+		let Self { identity, peer, hooks } = self;
+		let materials = RekeyMaterials::new(epoch, reference, identity, peer);
+		hooks.driver(materials)
+	}
+}
+
+impl RenewalHooks {
+	/// The driver of this half of the exchange over `materials`.
+	fn driver<P: HandshakeProvider>(self, materials: RekeyMaterials<P>) -> RekeyDriver {
+		match self {
+			Self::Client { approver } => {
+				let exchange = ClientRekey::new(materials, approver);
+				RekeyDriver::client(exchange)
+			}
+			Self::Server { authorizer, observer } => {
+				let exchange = ServerRekey::new(materials, authorizer, observer);
+				RekeyDriver::server(exchange)
+			}
+		}
+	}
 }
 
 #[cfg(test)]
@@ -677,20 +870,20 @@ pub(crate) mod tests {
 	use crate::der::Encode;
 	use crate::oids::HASH_SHA3_256;
 	use crate::random::OsRng;
-	use crate::testing::{TestCertificate, TestIdentity};
+	use crate::testing::{TestCertificate, TestIdentity, TestKey};
 	use crate::transport::handshake::negotiation::MuxBudgets;
 	use crate::transport::handshake::primitives::KdfSalt;
 	use crate::transport::handshake::tests::{fixture_handshake_secret, fixture_transcript, off_curve_point};
+	use crate::transport::handshake::EstablishedSession;
 	use crate::x509::Certificate;
 	use crate::TightBeamError;
 
 	#[cfg(feature = "transport-cms")]
 	mod cms_session {
-		pub use crate::testing::{TestCmsServer, TestKey};
-		pub use crate::transport::handshake::EstablishedSession;
-		pub use crate::transport::multiplex::MuxRekeyContext;
+		pub use crate::testing::TestCmsServer;
+		pub use crate::transport::multiplex::{MuxRekeyContext, MuxRole};
 		pub use crate::transport::state::{EncryptedProtocolState, EncryptionConfig, SessionPhase, SessionState};
-		pub use crate::transport::TransportLimits;
+		pub use crate::transport::{TransportError, TransportLimits};
 	}
 
 	#[cfg(feature = "transport-cms")]
@@ -718,8 +911,8 @@ pub(crate) mod tests {
 	impl Identity {
 		/// The party as its peer's session records it, by the certificate it
 		/// presents.
-		fn peer(&self) -> SessionPeer {
-			SessionPeer::from(self.signing.certificate_arc())
+		fn peer(&self) -> Result<SessionPeer, HandshakeError> {
+			SessionPeer::try_from(self.signing.certificate_arc())
 		}
 	}
 
@@ -788,7 +981,8 @@ pub(crate) mod tests {
 		let identity = test_identity()?;
 		let peer = test_identity()?;
 		let reference = sample_reference(SAMPLE_CREDIT_UNIT)?;
-		RekeyMaterials::new(epoch, reference, identity.signing, &peer.peer(), KeyPurposes::HOUSE.server)
+		let peer = RekeyPeer::admit(&peer.peer()?, KeyPurposes::HOUSE.server)?;
+		Ok(RekeyMaterials::new(epoch, reference, identity.signing, peer))
 	}
 
 	/// The SHA3-256 `DigestInfo` a receipt carries for `hash`.
@@ -817,7 +1011,7 @@ pub(crate) mod tests {
 	}
 
 	fn rekey_parties() -> Result<Parties, HandshakeError> {
-		rekey_parties_with(SessionPeer::from, None)
+		rekey_parties_with(SessionPeer::try_from, None)
 	}
 
 	/// The parties of [`rekey_parties`], whose client renews with the peer
@@ -825,28 +1019,24 @@ pub(crate) mod tests {
 	/// renews with the server's key-agreement certificate beside it, and
 	/// whose server reports each outcome to `observer`.
 	fn rekey_parties_with(
-		server: impl FnOnce(Arc<Certificate>) -> SessionPeer,
+		server: impl FnOnce(Arc<Certificate>) -> Result<SessionPeer, HandshakeError>,
 		observer: Option<Arc<dyn SessionObserver>>,
 	) -> Result<Parties, HandshakeError> {
 		let client_identity = test_identity()?;
 		let server_identity = test_identity()?;
 		let reference = sample_reference(SAMPLE_CREDIT_UNIT)?;
 
-		let server_peer = server(server_identity.signing.certificate_arc());
+		let server_peer = server(server_identity.signing.certificate_arc())?;
+		let server_peer = RekeyPeer::admit(&server_peer, KeyPurposes::HOUSE.server)?;
+		let client_peer = RekeyPeer::admit(&client_identity.peer()?, KeyPurposes::HOUSE.client)?;
 		let client_materials = RekeyMaterials::new(
 			sample_epoch()?,
 			reference.to_owned(),
 			client_identity.signing.clone(),
-			&server_peer,
-			KeyPurposes::HOUSE.server,
-		)?;
-		let server_materials = RekeyMaterials::new(
-			sample_epoch()?,
-			reference,
-			server_identity.signing.clone(),
-			&client_identity.peer(),
-			KeyPurposes::HOUSE.client,
-		)?;
+			server_peer,
+		);
+		let server_materials =
+			RekeyMaterials::new(sample_epoch()?, reference, server_identity.signing.clone(), client_peer);
 
 		let client = ClientRekey::new(client_materials, None);
 		let server = ServerRekey::new(server_materials, None, observer);
@@ -860,13 +1050,25 @@ pub(crate) mod tests {
 		Ok((client, server))
 	}
 
+	/// The epoch receipt `server` issues for `request`, with no exchange of
+	/// `server` in flight.
+	async fn issued(
+		server: &mut ServerRekey<DefaultCryptoProvider>,
+		request: &MuxRekeyRequestPackage,
+	) -> Result<MuxRekeyResponsePackage, HandshakeError> {
+		match server.process_request(request).await? {
+			RequestAnswer::Issued(response) => Ok(response),
+			RequestAnswer::InFlight => panic!("a server with no exchange in flight answers a request"),
+		}
+	}
+
 	/// Run one renewal to completion and return both endpoints' installs.
 	pub(crate) async fn run_exchange(
 		client: &mut ClientRekey<DefaultCryptoProvider>,
 		server: &mut ServerRekey<DefaultCryptoProvider>,
 	) -> Result<(EpochInstall, EpochInstall), HandshakeError> {
 		let request = client.start_renewal()?;
-		let response = server.process_request(&request).await?;
+		let response = issued(server, &request).await?;
 		let (ack, client_install) = client.process_response(response).await?;
 
 		let outcome = server.process_ack(ack).await?;
@@ -902,7 +1104,7 @@ pub(crate) mod tests {
 	async fn a_server_rekey_reports_the_client_of_its_materials() -> Result<(), Box<dyn std::error::Error>> {
 		let observer = Arc::new(ClientCertificateObserver::default());
 		let reporting = Arc::clone(&observer) as Arc<dyn SessionObserver>;
-		let parties = rekey_parties_with(SessionPeer::from, Some(reporting))?;
+		let parties = rekey_parties_with(SessionPeer::try_from, Some(reporting))?;
 		let Parties { mut client, mut server, client_identity, .. } = parties;
 		run_exchange(&mut client, &mut server).await?;
 
@@ -949,8 +1151,10 @@ pub(crate) mod tests {
 		let first_next = first.epoch.secret.next::<Provider>(client_scalar, &server_point, kdf_salt)?;
 		let second_next = second.epoch.secret.next::<Provider>(server_scalar, &client_point, kdf_salt)?;
 
-		let (first_send, _first_recv) = first.rotate(MuxRole::Client, first_next, &salt, sample_chain_root())?;
-		let (_second_send, second_recv) = second.rotate(MuxRole::Server, second_next, &salt, sample_chain_root())?;
+		let first_rotated = first.rotate(first_next, &salt, sample_chain_root())?;
+		let second_rotated = second.rotate(second_next, &salt, sample_chain_root())?;
+		let (first_send, _first_recv) = SessionKeys::for_client(first_rotated).into_parts();
+		let (_second_send, second_recv) = SessionKeys::for_server(second_rotated).into_parts();
 
 		let mut record = first_send.encrypt_next(PLAINTEXT)?.to_der()?;
 		assert!(second_recv.open(&mut record).is_err());
@@ -972,7 +1176,8 @@ pub(crate) mod tests {
 		let scalar = Box::new(fresh_ephemeral());
 		let next = epoch.secret.next::<Provider>(scalar, &peer, salt.as_kdf_salt())?;
 		let mut materials = materials_with(epoch)?;
-		let (_send, recv) = materials.rotate(MuxRole::Server, next, &salt, sample_chain_root())?;
+		let rotated = materials.rotate(next, &salt, sample_chain_root())?;
+		let (_send, recv) = SessionKeys::for_server(rotated).into_parts();
 
 		let mut record = previous_send.encrypt_next(PLAINTEXT)?.to_der()?;
 		let refused = recv.open(&mut record);
@@ -994,7 +1199,8 @@ pub(crate) mod tests {
 		let expected = DirectionalCiphers::derive::<Provider, _>(&next, salt.as_kdf_salt(), next_epoch)?;
 		let (_peer_send, peer_recv) = SessionKeys::for_server(expected).into_parts();
 		let mut materials = materials_with(epoch)?;
-		let (send, _recv) = materials.rotate(MuxRole::Client, next, &salt, sample_chain_root())?;
+		let rotated = materials.rotate(next, &salt, sample_chain_root())?;
+		let (send, _recv) = SessionKeys::for_client(rotated).into_parts();
 
 		let mut record = send.encrypt_next(PLAINTEXT)?.to_der()?;
 		let opened = peer_recv.open(&mut record)?;
@@ -1027,7 +1233,8 @@ pub(crate) mod tests {
 		let next = epoch.secret.next::<Provider>(scalar, &peer, salt.as_kdf_salt())?;
 		let mut materials = materials_with(epoch)?;
 
-		let (send, _recv) = materials.rotate(MuxRole::Client, next, &salt, sample_chain_root())?;
+		let rotated = materials.rotate(next, &salt, sample_chain_root())?;
+		let (send, _recv) = SessionKeys::for_client(rotated).into_parts();
 		let record = send.encrypt_next(PLAINTEXT)?;
 		assert_eq!(key_identifier_of(&record), expected);
 		Ok(())
@@ -1052,7 +1259,7 @@ pub(crate) mod tests {
 	async fn epoch_receipt_pins_the_exchange() -> Result<(), HandshakeError> {
 		let (mut client, mut server) = rekey_pair()?;
 		let request = client.start_renewal()?;
-		let response = server.process_request(&request).await?;
+		let response = issued(&mut server, &request).await?;
 
 		let epoch_receipt = response.epoch_receipt().ok_or(HandshakeError::ReceiptMissing)?;
 		let receipt = epoch_receipt.receipt()?;
@@ -1072,9 +1279,10 @@ pub(crate) mod tests {
 		let duplicate_start = client.start_renewal();
 		assert!(matches!(duplicate_start, Err(HandshakeError::InvalidState)));
 
-		server.process_request(&request).await?;
-		let duplicate = server.process_request(&request).await;
-		assert!(matches!(duplicate, Err(HandshakeError::InvalidState)));
+		issued(&mut server, &request).await?;
+
+		let duplicate = server.process_request(&request).await?;
+		assert!(matches!(duplicate, RequestAnswer::InFlight));
 		Ok(())
 	}
 
@@ -1082,7 +1290,7 @@ pub(crate) mod tests {
 	async fn unsolicited_legs_fail_closed() -> Result<(), HandshakeError> {
 		let (mut client, mut server) = rekey_pair()?;
 		let request = MuxRekeyRequestPackage::new([1u8; 32], &stray_point())?;
-		let response = server.process_request(&request).await?;
+		let response = issued(&mut server, &request).await?;
 
 		let unsolicited = client.process_response(response).await;
 		assert!(matches!(unsolicited, Err(HandshakeError::InvalidState)));
@@ -1111,7 +1319,7 @@ pub(crate) mod tests {
 		client.materials.reference = sample_reference(SAMPLE_CREDIT_UNIT + 1)?;
 
 		let request = client.start_renewal()?;
-		let response = server.process_request(&request).await?;
+		let response = issued(&mut server, &request).await?;
 		let drift = client.process_response(response).await;
 		assert!(matches!(drift, Err(HandshakeError::ReceiptMismatch)));
 		Ok(())
@@ -1121,7 +1329,7 @@ pub(crate) mod tests {
 	async fn replayed_response_fails_closed() -> Result<(), HandshakeError> {
 		let (mut client, mut server) = rekey_pair()?;
 		let request = client.start_renewal()?;
-		let response = server.process_request(&request).await?;
+		let response = issued(&mut server, &request).await?;
 		let replay = response.to_owned();
 
 		client.process_response(response).await.map(|_| ())?;
@@ -1142,7 +1350,7 @@ pub(crate) mod tests {
 		let (mut client, mut server) = rekey_pair()?;
 		let request = client.start_renewal()?;
 
-		server.process_request(&request).await?;
+		issued(&mut server, &request).await?;
 
 		let missing = server.process_ack(MuxRekeyAckPackage::new(None)).await;
 		assert!(matches!(missing, Err(HandshakeError::CountersignatureMissing)));
@@ -1153,7 +1361,7 @@ pub(crate) mod tests {
 	async fn foreign_countersignature_fails_closed() -> Result<(), HandshakeError> {
 		let (mut client, mut server) = rekey_pair()?;
 		let request = client.start_renewal()?;
-		let response = server.process_request(&request).await?;
+		let response = issued(&mut server, &request).await?;
 		let epoch_receipt = response.epoch_receipt().ok_or(HandshakeError::ReceiptMissing)?;
 		let receipt = epoch_receipt.receipt()?;
 
@@ -1177,7 +1385,7 @@ pub(crate) mod tests {
 	async fn the_next_epoch_needs_a_rekey_scalar() -> Result<(), Box<dyn std::error::Error>> {
 		let (mut client, mut server) = rekey_pair()?;
 		let request = client.start_renewal()?;
-		let response = server.process_request(&request).await?;
+		let response = issued(&mut server, &request).await?;
 		let wire_client = peer_static().server_ephemeral(request.client_ephemeral())?;
 		let wire_server = peer_static().server_ephemeral(response.server_ephemeral())?;
 		let client_random = request.client_random.to_32_byte_array()?;
@@ -1210,7 +1418,7 @@ pub(crate) mod tests {
 	async fn a_swapped_server_ephemeral_fails_the_pin() -> Result<(), HandshakeError> {
 		let (mut client, mut server) = rekey_pair()?;
 		let request = client.start_renewal()?;
-		let mut response = server.process_request(&request).await?;
+		let mut response = issued(&mut server, &request).await?;
 		response.server_ephemeral = OctetString::new(stray_point())?;
 
 		let swapped = client.process_response(response).await;
@@ -1227,7 +1435,7 @@ pub(crate) mod tests {
 		let mut request = client.start_renewal()?;
 		request.client_ephemeral = OctetString::new(stray_point())?;
 
-		let response = server.process_request(&request).await?;
+		let response = issued(&mut server, &request).await?;
 		let swapped = client.process_response(response).await;
 		assert!(matches!(swapped, Err(HandshakeError::ReceiptMismatch)));
 		Ok(())
@@ -1326,17 +1534,15 @@ pub(crate) mod tests {
 	#[cfg(feature = "transport-cms")]
 	async fn cms_client_session(server: &TestCmsServer) -> CmsClientProbe {
 		let client = TestIdentity::of(&Secp256k1SigningKey::random(&mut OsRng));
-		let signer = server.signing_identity();
-		let issuing = SessionReceipt::issue(sample_chain_root(), SAMPLE_BUDGETS, SAMPLE_CREDIT_UNIT, None, &signer);
-		let (receipt, artifact) = issuing.await.expect("the server signs the receipt");
-		let countersignature = receipt.countersign(None, &client).await.expect("the client countersigns");
-		let completed = artifact.with_certified_signer(countersignature);
-		let stored = StoredReceipt::try_from(completed.expect("the receipt joins")).expect("the receipt is complete");
+		let stored = dual_signed_receipt(&server.signing_identity(), &client).await;
 
 		let keys = SessionKeys::for_client(TestKey::insecure_directional_keys());
-		let peer = SessionPeer::paired(Arc::new(server.signing.to_owned()), Arc::new(server.key_agreement.to_owned()));
+		let signing = Arc::new(server.signing.to_owned());
+		let key_agreement = Arc::new(server.key_agreement.to_owned());
+		let peer = SessionPeer::paired(signing, key_agreement).expect("the pair records its peer");
 		let epoch = sample_epoch().expect("the sample epoch derives");
-		let session = EstablishedSession::new(keys, None, Some(Arc::new(stored)), Some(peer), Some(epoch));
+		let session = EstablishedSession::forged(keys, Some(Arc::new(stored)), Some(peer));
+		let session = session.with_forged_epoch(epoch);
 		let encryption = EncryptionConfig { client_identity: Some(client), ..EncryptionConfig::unconfigured() };
 		let state = SessionState::at(encryption, SessionPhase::Encrypted(Box::new(session)));
 
@@ -1348,11 +1554,9 @@ pub(crate) mod tests {
 	fn client_exchange(probe: &mut CmsClientProbe) -> Arc<FuturesMutex<Box<dyn ClientRekeyExchange>>> {
 		let context = MuxRekeyContext::detach(probe, MuxRole::Client).expect("the session detaches its rekey");
 		let context = context.expect("a receipt-bearing session renews");
-		let RekeyDriver::Client(exchange) = context.driver else {
-			panic!("the client role yields the client half");
-		};
+		let exchange = context.driver.renewal_opener().expect("the client role yields the client half");
 
-		exchange
+		Arc::clone(exchange)
 	}
 
 	/// The rekey a CMS client's session hands over compares a server ephemeral
@@ -1375,6 +1579,81 @@ pub(crate) mod tests {
 		let response = MuxRekeyResponsePackage::new(SAMPLE_SERVER_RANDOM, &point, Some(artifact))?;
 		let refused = exchange.process_response(response).await;
 		assert!(matches!(refused, Err(HandshakeError::ServerEphemeralIsStatic)));
+		Ok(())
+	}
+
+	/// A CMS client's session whose server certificate names the client
+	/// purpose alone refuses its rekey under the server purpose. It keeps its
+	/// receipt, its peer, and its epoch, because the epoch leaves the session
+	/// after every refusal.
+	#[cfg(feature = "transport-cms")]
+	#[tokio::test]
+	async fn a_session_refused_its_rekey_keeps_its_epoch() {
+		let server = TestCmsServer::generate("tightbeam refused rekey server");
+		let server = server.with_key_purposes(&[KeyPurposes::HOUSE.client]);
+		let mut probe = cms_client_session(&server).await;
+		let refused = MuxRekeyContext::detach(&mut probe, MuxRole::Client);
+
+		let refusal = matches!(
+			refused,
+			Err(TransportError::HandshakeError(HandshakeError::CertificateValidationError(_)))
+		);
+		let epoch = probe.state.established().and_then(EstablishedSession::epoch);
+		assert!(refusal);
+		assert!(probe.state.receipt().is_some());
+		assert!(probe.state.session_peer().is_some());
+		assert!(epoch.is_some());
+	}
+
+	/// A CMS client's session hands its epoch to the rekey it renews into, so
+	/// the session holds no epoch once its rekey detaches.
+	#[cfg(feature = "transport-cms")]
+	#[tokio::test]
+	async fn a_renewed_session_hands_over_its_epoch() -> Result<(), Box<dyn std::error::Error>> {
+		let server = TestCmsServer::generate("tightbeam renewed rekey server");
+		let mut probe = cms_client_session(&server).await;
+		let renewed = MuxRekeyContext::detach(&mut probe, MuxRole::Client)?;
+		let established = probe.state.established().ok_or("the renewed session stays established")?;
+
+		assert!(renewed.is_some());
+		assert!(established.epoch().is_none());
+		Ok(())
+	}
+
+	/// A receipt of the sample terms, rooted at the sample chain root, that
+	/// `server` signed and `client` countersigned.
+	async fn dual_signed_receipt(server: &SigningIdentity, client: &SigningIdentity) -> StoredReceipt {
+		let issuing = SessionReceipt::issue(sample_chain_root(), SAMPLE_BUDGETS, SAMPLE_CREDIT_UNIT, None, server);
+		let (receipt, artifact) = issuing.await.expect("the server signs the receipt");
+		let countersignature = receipt.countersign(None, client).await.expect("the client countersigns");
+		let completed = artifact.with_certified_signer(countersignature);
+		StoredReceipt::try_from(completed.expect("the receipt joins")).expect("the receipt is complete")
+	}
+
+	/// A session renews only under a dual-signed receipt, so a session built
+	/// without one releases its epoch materials where it is built.
+	#[test]
+	fn a_session_without_a_receipt_releases_its_epoch() -> Result<(), Box<dyn std::error::Error>> {
+		let keys = SessionKeys::for_client(TestKey::insecure_directional_keys());
+		let peer = test_identity()?.peer()?;
+		let session = EstablishedSession::forged(keys, None, Some(peer));
+		let session = session.with_forged_epoch(sample_epoch()?);
+
+		assert!(session.epoch().is_none());
+		Ok(())
+	}
+
+	/// A session renews only against a recorded peer, so a session built
+	/// without one releases its epoch materials where it is built.
+	#[tokio::test]
+	async fn a_session_without_a_peer_releases_its_epoch() -> Result<(), Box<dyn std::error::Error>> {
+		let (server, client) = (test_identity()?, test_identity()?);
+		let receipt = dual_signed_receipt(&server.signing, &client.signing).await;
+		let keys = SessionKeys::for_client(TestKey::insecure_directional_keys());
+		let session = EstablishedSession::forged(keys, Some(Arc::new(receipt)), None);
+		let session = session.with_forged_epoch(sample_epoch()?);
+
+		assert!(session.epoch().is_none());
 		Ok(())
 	}
 

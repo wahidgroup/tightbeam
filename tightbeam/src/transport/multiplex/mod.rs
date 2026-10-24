@@ -74,17 +74,13 @@ use crate::Frame;
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 use crate::constants::DEFAULT_HOP_BUDGET;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::crypto::x509::KeyPurposes;
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::der::asn1::ObjectIdentifier;
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::receipt::StoredReceipt;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::transport::handshake::{EstablishedSession, HandshakeProvider};
+use crate::transport::handshake::HandshakeProvider;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::transport::rekey::{ClientRekey, RekeyDriver, RekeyMaterials, ServerRekey};
+use crate::transport::rekey::{RekeyDriver, Renewal};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::transport::state::EncryptedProtocolState;
+use crate::transport::state::{EncryptedProtocolState, Endpoint};
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 use crate::urn::Urn;
 #[cfg(pooled_mux)]
@@ -309,16 +305,37 @@ impl MuxRole {
 			MuxRole::Server => MuxRole::Client,
 		}
 	}
+
+	/// Whether this role holds its key-switch marker until the data chunks it
+	/// owes under the old key quiesce. The client's `RekeyAck` trails every
+	/// such chunk, and the server's `RekeyDone` writes at once.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	const fn holds_key_switch(self) -> bool {
+		match self {
+			MuxRole::Client => true,
+			MuxRole::Server => false,
+		}
+	}
+
+	/// Whether this role opens renewals and parks its admissions across each
+	/// one. The client opens every exchange, and the server answers it.
+	const fn opens_renewals(self) -> bool {
+		match self {
+			MuxRole::Client => true,
+			MuxRole::Server => false,
+		}
+	}
 }
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl MuxRole {
-	/// The key purpose of the peer's role in `purposes`: a client's peer is a
-	/// server, and a server's peer is a client.
-	const fn peer_purpose(self, purposes: &KeyPurposes) -> ObjectIdentifier {
+	/// What this role renews under on `endpoint`: the identity it presented in
+	/// the handshake and the hooks of its half of the rekey exchange, or
+	/// `None` when the endpoint holds no identity of this role.
+	fn renewal<P: HandshakeProvider>(self, endpoint: &Endpoint<'_, P>) -> Option<Renewal<P>> {
 		match self {
-			MuxRole::Client => purposes.server,
-			MuxRole::Server => purposes.client,
+			MuxRole::Client => endpoint.client_renewal(),
+			MuxRole::Server => endpoint.server_renewal(),
 		}
 	}
 }
@@ -365,11 +382,12 @@ pub trait MuxCapable: Sized {
 /// It holds the role-fixed exchange half and the epoch-0 dual-signed receipt
 /// that the exchange rotates. An unmetered session carries no receipt, so it
 /// has no context and keeps the GoAway drain. The type is opaque, so the
-/// transport builds it and [`MuxTransport::with_rekey`] consumes it.
+/// transport builds it, and [`MuxTransport::with_rekey`] assembles a mux
+/// transport in the role of its half.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub struct MuxRekeyContext {
 	pub(crate) driver: RekeyDriver,
-	pub(crate) receipt: StoredReceipt,
+	pub(crate) receipt: Arc<StoredReceipt>,
 }
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -390,7 +408,8 @@ impl MuxRekeyContext {
 	///
 	/// # Errors
 	///
-	/// - [`TransportError::HandshakeError`] -- the peer key fails to extract.
+	/// - [`TransportError::HandshakeError`] -- the signing use or the purpose
+	///   of the peer's role refuses the peer's certificate.
 	///
 	/// [`TransportError::HandshakeError`]: crate::transport::error::TransportError::HandshakeError
 	/// [`MuxTransport::with_rekey`]: crate::transport::multiplex::MuxTransport::with_rekey
@@ -401,59 +420,38 @@ impl MuxRekeyContext {
 		T: EncryptedProtocolState<CryptoProvider = P>,
 		P: HandshakeProvider,
 	{
-		let Some(stored) = state.session_state().receipt().cloned() else {
-			return Ok(None);
-		};
-
-		// Each role renews under the identity it presented in the handshake.
-		let encryption = state.encryption();
-		let identity = match role {
-			MuxRole::Client => encryption.client_identity.as_ref(),
-			MuxRole::Server => encryption.server_identity.as_ref().map(|identity| identity.signing()),
-		};
-		let Some(identity) = identity.cloned() else {
-			return Ok(None);
-		};
-
-		let established = state.session_state().established();
-		let Some(session_peer) = established.and_then(EstablishedSession::session_peer).cloned() else {
-			return Ok(None);
-		};
-
-		// The peer serves the other role, under the key purpose the handshake
-		// admitted it for.
-		let purpose = role.peer_purpose(&state.encryption().key_purposes);
-
-		// The materials detach after the refusals above, so a refused session
-		// keeps them.
-		let Some(epoch) = state.session_state_mut().take_epoch_materials() else {
-			return Ok(None);
-		};
-
-		// A rekey's server ephemeral differs from every static key the
-		// handshake compared it with, a CMS server's key-agreement key among
-		// them, so the materials take the whole peer the session recorded.
-		let reference_receipt = stored.receipt().clone();
-		let materials = RekeyMaterials::<P>::new(epoch, reference_receipt, identity, &session_peer, purpose)?;
-		let driver = match role {
-			MuxRole::Client => {
-				let approver = state.encryption().receipt_approver.as_ref().map(Arc::clone);
-				let exchange = ClientRekey::new(materials, approver);
-				RekeyDriver::client(exchange)
-			}
-			MuxRole::Server => {
-				let exchange = ServerRekey::new(
-					materials,
-					state.encryption().transport_authorizer.as_ref().map(Arc::clone),
-					state.encryption().session_observer.as_ref().map(Arc::clone),
-				);
-				RekeyDriver::server(exchange)
-			}
-		};
-
-		Ok(Some(Self { driver, receipt: stored }))
+		// Each role renews under the identity it presented in the handshake,
+		// against a peer of the other role.
+		let renewed = state.session_state_mut().renew(|endpoint| role.renewal(endpoint))?;
+		Ok(renewed.map(|(driver, receipt)| Self { driver, receipt }))
 	}
 }
+
+// The mux role is a type of this module, so the role of a rekey half sits
+// here and `multiplex` alone depends on `rekey`.
+#[cfg(all(
+	any(feature = "tokio", feature = "async-transport"),
+	any(feature = "transport-cms", feature = "transport-hpke")
+))]
+impl RekeyDriver {
+	/// The mux role of this half, which a transport assembled with it takes.
+	const fn role(&self) -> MuxRole {
+		match self {
+			RekeyDriver::Client(_) => MuxRole::Client,
+			RekeyDriver::Server(_) => MuxRole::Server,
+		}
+	}
+}
+
+/// The mux role of every [`MuxConnector`], the handshake initiator, which its
+/// rekey detaches for and its transport assembles in.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+pub(crate) const CONNECTOR_ROLE: MuxRole = MuxRole::Client;
+
+/// The mux role of every [`MuxAcceptor`], the handshake responder, which its
+/// rekey detaches for and its transport assembles in.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+pub(crate) const ACCEPTOR_ROLE: MuxRole = MuxRole::Server;
 
 /// Client-side mux connection setup.
 ///
@@ -565,8 +563,8 @@ pub trait MuxAcceptor: MuxCapable {
 			let rekey = self.take_rekey()?;
 			let snapshot = self.session_context();
 			let (gate, (reader, writer)) = self.into_gated_halves()?;
-			let mux = MuxTransport::new(reader, writer, MuxRole::Server, settings);
-			let SpawnedMux { handle, responder, reader_task: _reader_task } = mux.spawn_with(cancel_budget, rekey);
+			let mux = MuxTransport::assemble(reader, writer, ACCEPTOR_ROLE, settings, rekey);
+			let SpawnedMux { handle, responder, reader_task: _reader_task } = mux.spawn_with(cancel_budget);
 
 			responder.serve_with(GatedService::new(service, gate, snapshot, handle)).await
 		}

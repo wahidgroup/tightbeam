@@ -21,7 +21,7 @@
 //!
 //! 1. An exported target passes for everyone.
 //! 2. An unexported relayed request is refused. The hop marker is
-//!    unauthenticated defense in depth; the identity rule below holds
+//!    unauthenticated defense in depth, and the identity rule below holds
 //!    against a forged budget.
 //! 3. An unexported origin request passes only for a first-party session:
 //!    not relayed, a member of `hive_trust`, and not of `peer_trust`.
@@ -33,31 +33,32 @@
 //!
 //! [`ExportGrant`] opens one unexported target to selected caller
 //! identities. Configure grants through
-//! [`ClusterConfigBuilder::with_export_grant`](super::ClusterConfigBuilder::with_export_grant).
-//! Allow sources compose as union: exported, granted, or first-party
-//! origin. Deny gates still override a grant.
+//! [`ClusterConfigBuilder::with_export_grant`]. Allow sources compose as
+//! union: exported, granted, or first-party origin. Deny gates still override
+//! a grant.
 //!
 //! # Custom gates
 //!
 //! [`ExportGate`] adds per-identity rules keyed on [`SessionContext`].
-//! Configure gates through
-//! [`ClusterConfigBuilder::with_export_gate`](super::ClusterConfigBuilder::with_export_gate).
-//! Gates compose as intersection with the allow sources, so a gate may
-//! only narrow access.
+//! Configure gates through [`ClusterConfigBuilder::with_export_gate`]. Gates
+//! compose as intersection with the allow sources, so a gate may only narrow
+//! access.
 //!
 //! # Mutual TLS
 //!
 //! First-party recognition requires mutual TLS. The accept plane stores
 //! a session certificate only when `ClusterTlsConfig::client_validators`
-//! is configured. Without that, every session is anonymous and an export
-//! list also blocks unexported targets on the origin plane. The gateway
-//! emits a startup posture warning in that configuration when the accept
-//! loop starts.
+//! is configured. Without that configuration:
+//!
+//! - Every session is anonymous, so an export list also blocks unexported targets on the origin plane.
+//! - The gateway emits a startup posture warning when the accept loop starts.
 //!
 //! # Sources
 //!
-//! - CWE-285, improper authorization:
-//!   <https://cwe.mitre.org/data/definitions/285.html>
+//! - CWE-285, improper authorization: <https://cwe.mitre.org/data/definitions/285.html>
+//!
+//! [`ClusterConfigBuilder::with_export_grant`]: super::ClusterConfigBuilder::with_export_grant
+//! [`ClusterConfigBuilder::with_export_gate`]: super::ClusterConfigBuilder::with_export_gate
 
 use core::str::from_utf8;
 use std::collections::HashSet;
@@ -69,14 +70,12 @@ use crate::crypto::x509::Certificate;
 use crate::policy::{SessionContext, TransitStatus};
 use crate::urn::Urn;
 
-/// Live export allowlist shared by discoverability and enforcement.
+/// A live export allowlist that discoverability and enforcement share.
 ///
-/// Install through
-/// [`ClusterConfigBuilder::with_export_allowlist`](super::ClusterConfigBuilder::with_export_allowlist)
-/// or the static helper
-/// [`ClusterConfigBuilder::with_exported_types`](super::ClusterConfigBuilder::with_exported_types).
-/// `None` on [`PeerConfig::exported_types`](super::PeerConfig) means every
-/// locally served type is exported.
+/// Install it through [`ClusterConfigBuilder::with_export_allowlist`] or the
+/// static helper [`ClusterConfigBuilder::with_exported_types`]. `None` on
+/// [`PeerConfig::exported_types`](super::PeerConfig) means every locally
+/// served type is exported.
 ///
 /// # Planes
 ///
@@ -92,6 +91,9 @@ use crate::urn::Urn;
 /// canonical bytes equal the registry's type keys. An instance-bearing
 /// entry would answer [`ExportAllowlist::contains`] on that exact target
 /// but never match an advertised type key.
+///
+/// [`ClusterConfigBuilder::with_export_allowlist`]: super::ClusterConfigBuilder::with_export_allowlist
+/// [`ClusterConfigBuilder::with_exported_types`]: super::ClusterConfigBuilder::with_exported_types
 pub trait ExportAllowlist: Send + Sync {
 	/// Whether `target` is on the export list.
 	fn contains(&self, target: &Urn<'_>) -> bool;
@@ -99,7 +101,7 @@ pub trait ExportAllowlist: Send + Sync {
 	/// Whether a canonical registry type key is exported.
 	///
 	/// The provided method parses `key` and delegates to
-	/// [`ExportAllowlist::contains`], so the two views cannot diverge.
+	/// [`ExportAllowlist::contains`], so the two views always agree.
 	/// The built-in lists override it with a cached-set lookup that
 	/// borrows `key`. A key that fails to parse is not exported.
 	fn allows_canonical(&self, key: &[u8]) -> bool {
@@ -114,7 +116,7 @@ pub trait ExportAllowlist: Send + Sync {
 	}
 }
 
-/// Fixed export list installed at config build.
+/// A fixed export list installed at config build.
 #[derive(Clone, Debug)]
 pub struct StaticExportList {
 	types: Vec<Urn<'static>>,
@@ -140,8 +142,8 @@ impl ExportAllowlist for StaticExportList {
 	}
 }
 
-/// URN list and its canonical key cache under one lock, so the two views
-/// of the membership mutate atomically and cannot diverge mid-update.
+/// The URN list and its canonical key cache under one lock, so the two views
+/// of the membership mutate atomically and agree through every update.
 #[derive(Default)]
 struct ExportMembership {
 	types: Vec<Urn<'static>>,
@@ -156,7 +158,7 @@ impl ExportMembership {
 	}
 }
 
-/// Interior-mutable export list for tests and long-running fuzz harnesses.
+/// An interior-mutable export list for tests and long-running fuzz harnesses.
 ///
 /// Mutations are visible to the next [`ExportAllowlist::contains`] and
 /// [`ExportAllowlist::allows_canonical`] call. Poisoned locks treat the
@@ -228,7 +230,7 @@ impl ExportAllowlist for DynamicExportList {
 	}
 }
 
-/// Custom export gate for servlet targets crossing the gateway.
+/// A custom export gate for servlet targets crossing the gateway.
 ///
 /// Every configured gate must answer [`TransitStatus::Ok`], so gates
 /// compose as intersection with the allow sources (exported list, grants,
@@ -236,7 +238,7 @@ impl ExportAllowlist for DynamicExportList {
 ///
 /// # Call sites
 ///
-/// Evaluated where the servlet target is known:
+/// The gateway evaluates it where the servlet target is known:
 ///
 /// - Unary work arm
 /// - Streaming and duplex open handlers
@@ -245,8 +247,9 @@ pub trait ExportGate: Send + Sync {
 	///
 	/// - `target`: servlet type under enforcement
 	/// - `session`: caller identity facts (see
-	///   [`SessionContext::peer_certificate`] and
-	///   [`SessionContext::peer_public_key`])
+	///   [`SessionContext::peer_certificate`]), whose peer key a rule reads by
+	///   asking a [`PeerListGate`](crate::colony::hive::PeerListGate) through
+	///   [`GatePolicy::evaluate`](crate::policy::GatePolicy::evaluate)
 	/// - `planes`: the two federation trust planes, for gates that reuse
 	///   the first-party classifier through
 	///   [`TrustPlanes::classify_session`] beside their own rules
@@ -262,7 +265,7 @@ pub trait ExportGate: Send + Sync {
 	) -> TransitStatus;
 }
 
-/// Positive grant widening the export boundary for selected callers.
+/// A positive grant that widens the export boundary for selected callers.
 ///
 /// A grant adds one allow source beside the exported list and the
 /// first-party origin rule. Allow sources compose as union, so a grant
@@ -280,9 +283,9 @@ pub trait ExportGate: Send + Sync {
 ///
 /// # Discoverability
 ///
-/// Granted types never appear on the advertised slate, because grants
-/// are per-session and ads are minted per beat. A granted type is a
-/// private interface whose URN the grantee learns out of band.
+/// The advertised slate lists exported types alone, because grants are
+/// per-session and ads are built per beat. A granted type is a private
+/// interface whose URN the grantee learns out of band.
 pub trait ExportGrant: Send + Sync {
 	/// Whether `session` is positively granted `target` on this gateway.
 	///
@@ -300,9 +303,10 @@ fn session_granted(grants: &[Arc<dyn ExportGrant>], target: &Urn<'_>, session: &
 	grants.iter().any(|grant| grant.grants(target, session, relayed))
 }
 
-/// Deciding allow source of a passed export boundary.
+/// The deciding allow source of a passed export boundary.
 ///
-/// Returned only when the full verdict passes, including deny gates.
+/// The boundary returns it only when the full verdict passes, deny gates
+/// included.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExportDecision {
 	/// The built-in allowlist allowed the target.
@@ -311,12 +315,12 @@ pub(crate) enum ExportDecision {
 	Granted,
 }
 
-/// Live-configuration view of the export boundary.
+/// The live-configuration view of the export boundary.
 ///
-/// Sealed composition derived from [`ClusterConfig`] through [`From`].
-/// Wire handlers never construct this view by hand. The unary work arm
-/// and the stream open handlers share one core through
-/// [`evaluate_export_gates`](super::runtime::verify::evaluate_export_gates).
+/// It is a sealed composition that wire handlers derive from
+/// [`ClusterConfig`] through [`From`] alone. The unary work arm and the
+/// stream open handlers share one core through
+/// [`ClusterConfig::evaluate_export_gates`].
 pub(crate) struct ExportPolicy<'a> {
 	exported: Option<&'a dyn ExportAllowlist>,
 	planes: TrustPlanes<'a>,
@@ -336,18 +340,19 @@ impl<'a> From<&'a ClusterConfig> for ExportPolicy<'a> {
 }
 
 impl ExportPolicy<'_> {
-	/// Boundary verdict on a resolved servlet target.
+	/// Decides the boundary verdict on a resolved servlet target, after
+	/// `GatePolicy` has evaluated.
 	///
-	/// The allow sources compose as union. When the built-in allowlist
-	/// refuses, any configured grant may still allow the target. Every
-	/// deny gate then evaluates, so a deny gate overrides a grant.
+	/// The allow sources compose as union, and the steps run in order:
 	///
-	/// [`ExportDecision::Granted`] reports a grant as the deciding
-	/// allow source only when the full verdict passes. A gate verdict
-	/// of [`TransitStatus::Unknown`] normalizes to
-	/// [`TransitStatus::Internal`] before it reaches the wire.
+	/// 1. The built-in allowlist answers.
+	/// 2. When it refuses, any configured grant may still allow the target.
+	/// 3. Every deny gate then evaluates, so a deny gate overrides a grant. A
+	///    gate verdict of [`TransitStatus::Unknown`] normalizes to
+	///    [`TransitStatus::Internal`] before it reaches the wire.
 	///
-	/// `GatePolicy` is evaluated separately before this step.
+	/// [`ExportDecision::Granted`] reports a grant as the deciding allow source
+	/// only when the full verdict passes.
 	pub(crate) fn verdict(
 		&self,
 		target: &Urn<'_>,
@@ -388,7 +393,7 @@ pub enum Party {
 	/// A member of the peer plane. Peer membership wins over hive
 	/// membership, so a certificate held by both stores lands here.
 	Peer,
-	/// Anonymous (`None`), or trusted by neither plane.
+	/// The caller is anonymous (`None`), or neither plane trusts it.
 	Untrusted,
 }
 
@@ -399,30 +404,27 @@ pub enum Party {
 /// unit so the precedence rule ("peer membership wins") lives in exactly
 /// one place, and a call site cannot transpose the two stores.
 ///
-/// Build one from a [`ClusterTlsConfig`](super::ClusterTlsConfig) through
-/// [`From`] on the enforcement path. [`TrustPlanes::new`] takes a
-/// [`TrustPlaneStores`] carrier so hive and peer borrows stay named.
-///
 /// # Fail-closed
 ///
 /// A missing hive store classifies nobody as first-party, so the boundary
-/// refuses callers it cannot place. Membership is trust-store lookup
-/// through [`CertificateTrust::is_trusted`], not chain path validation.
+/// refuses callers it cannot place. Membership is a trust-store lookup of
+/// the caller's key through [`CertificateTrust::trusts_public_key`], not
+/// chain path validation.
 #[derive(Clone, Copy)]
 pub struct TrustPlanes<'a> {
 	hive: Option<&'a dyn CertificateTrust>,
 	peer: Option<&'a dyn CertificateTrust>,
 }
 
-/// Named hive/peer trust-store borrows for [`TrustPlanes::new`].
+/// The named hive and peer trust-store borrows for [`TrustPlanes::new`].
 ///
 /// Named fields prevent swapping the two same-typed plane stores at the
 /// call site.
 #[derive(Clone, Copy)]
 pub struct TrustPlaneStores<'a> {
-	/// First-party (hive/client) trust plane.
+	/// The first-party (hive and client) trust plane.
 	pub hive: Option<&'a dyn CertificateTrust>,
-	/// Federated peer trust plane.
+	/// The federated peer trust plane.
 	pub peer: Option<&'a dyn CertificateTrust>,
 }
 
@@ -435,10 +437,11 @@ impl<'a> From<&'a super::ClusterTlsConfig> for TrustPlanes<'a> {
 impl<'a> TrustPlanes<'a> {
 	/// Pair a hive-plane and a peer-plane trust store.
 	///
-	/// Prefer [`From`] on a [`ClusterTlsConfig`](super::ClusterTlsConfig)
-	/// where one is available. This constructor serves callers that hold
-	/// the two stores directly, such as a test harness. Pass planes through
-	/// [`TrustPlaneStores`] so hive and peer cannot be swapped by position.
+	/// Prefer [`From`] on a [`ClusterTlsConfig`](super::ClusterTlsConfig), as
+	/// the enforcement path does, where one is available. This constructor
+	/// serves callers that hold the two stores directly, such as a test
+	/// harness. Pass planes through [`TrustPlaneStores`] so hive and peer
+	/// cannot be swapped by position.
 	#[must_use]
 	pub fn new(stores: TrustPlaneStores<'a>) -> Self {
 		Self { hive: stores.hive, peer: stores.peer }
@@ -465,7 +468,7 @@ impl<'a> TrustPlanes<'a> {
 		Party::Untrusted
 	}
 
-	/// [`TrustPlanes::classify`] on a session's authenticated identity.
+	/// Runs [`TrustPlanes::classify`] on a session's authenticated identity.
 	///
 	/// Custom [`ExportGate`] implementations classify the caller here
 	/// beside their own per-identity rules.
@@ -481,19 +484,18 @@ impl<'a> TrustPlanes<'a> {
 	}
 }
 
-/// Built-in allowlist verdict on a resolved servlet target.
+/// The built-in allowlist verdict on a resolved servlet target.
 ///
 /// `exported` is the configured allowlist, or `None` when the gateway
 /// exports every type. The verdict reads the live allowlist on each
-/// request so the enforcement plane and the advertise filter stay aligned.
-/// Grants are applied by the gateway after this allowlist refuses; this
-/// function is the allowlist step alone.
+/// request, so the enforcement plane and the advertise filter stay aligned.
+/// [`ExportPolicy::verdict`] applies grants after this step refuses.
 ///
 /// The rules apply in order:
 ///
 /// 1. An exported target passes for everyone.
 /// 2. An unexported relayed request is refused. The hop marker is
-///    unauthenticated defense in depth; the identity rule below holds
+///    unauthenticated defense in depth, and the identity rule below holds
 ///    against a forged budget.
 /// 3. An unexported origin request passes only for a first-party session.
 /// 4. Any other unexported request is refused.

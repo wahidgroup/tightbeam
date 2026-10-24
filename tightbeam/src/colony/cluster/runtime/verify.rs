@@ -489,7 +489,7 @@ mod tests {
 
 	impl ExportGrant for IdentityGrant {
 		fn grants(&self, _target: &Urn<'_>, session: &SessionContext, _relayed: bool) -> bool {
-			session.peer_public_key().is_some()
+			session.peer_key().is_some()
 		}
 	}
 

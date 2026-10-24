@@ -7,14 +7,10 @@
 use std::sync::Arc;
 
 use crate::colony::cluster::ClusterTlsConfig;
-use crate::crypto::policy::VerificationPolicy;
 use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::crypto::sign::SigningIdentity;
-use crate::crypto::x509::error::CertificateValidationError;
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::crypto::x509::store::CertificateTrust;
-use crate::crypto::x509::{Certificate, ErasedSigning, PeerCertificate};
-use crate::spki::SubjectPublicKeyInfoOwned;
 use crate::transport::client::{ConnectionBuilder, ConnectionPool, PoolConfig};
 use crate::transport::Protocol;
 use crate::utils::time::Clock;
@@ -34,119 +30,16 @@ pub struct ClusterPools<P: Protocol> {
 	pub peer: Option<Arc<ClusterPool<P>>>,
 }
 
-/// Outbound trust store composed with the operator validator chain.
-///
-/// The handshake client validates the server identity through the pool
-/// trust store on three paths:
-///
-/// - [`CertificateValidation::evaluate`] for a bare certificate.
-/// - [`CertificateTrust::verify_chain`] for a provisioned chain.
-/// - [`CertificateTrust::trust_anchor`] for a certificate whose trust anchor the client compares.
-///
-/// This composite appends `ClusterTlsConfig::validators` to each path, so
-/// each outbound dial enforces the operator's extra checks (pinning,
-/// expiry, policy).
-///
-/// # Evaluation order
-///
-/// 1. The underlying trust store evaluates the certificate or chain.
-/// 2. Each configured operator validator evaluates the dialed leaf in registration order.
-///
-/// [`CertificateTrust::is_trusted`] still delegates to the store alone.
-struct ValidatedTrust {
-	store: Arc<dyn CertificateTrust>,
-	validators: Vec<Arc<dyn CertificateValidation>>,
-}
-
-impl ValidatedTrust {
-	/// Run the operator validator chain over the dialed server leaf.
-	fn validate_leaf(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
-		for validator in self.validators.iter() {
-			validator.evaluate(cert)?;
-		}
-
-		Ok(())
-	}
-}
-
-impl core::fmt::Debug for ValidatedTrust {
-	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-		f.debug_struct("ValidatedTrust")
-			.field("store", &self.store)
-			.field("validators", &format!("[{} validators]", self.validators.len()))
-			.finish()
-	}
-}
-
-impl CertificateValidation for ValidatedTrust {
-	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
-		self.store.evaluate(cert)?;
-		self.validate_leaf(cert)
-	}
-}
-
-impl CertificateTrust for ValidatedTrust {
-	fn is_trusted(&self, cert: &Certificate) -> bool {
-		self.store.is_trusted(cert)
-	}
-
-	fn verify_chain(&self, chain: &[Certificate]) -> Result<Arc<Certificate>, CertificateValidationError> {
-		let anchor = self.store.verify_chain(chain)?;
-
-		// The chain is anchor-first, so the dialed server identity is the
-		// last entry. Operator validators target that leaf rather than an
-		// intermediate, so a pin on the server certificate cannot false-fail
-		// on a CA.
-		let leaf = chain.last().ok_or(CertificateValidationError::EmptyChain)?;
-		self.validate_leaf(leaf)?;
-		Ok(anchor)
-	}
-
-	fn trust_anchor(&self, cert: &Certificate) -> Result<Arc<Certificate>, CertificateValidationError> {
-		let anchor = self.store.trust_anchor(cert)?;
-		self.validate_leaf(cert)?;
-		Ok(anchor)
-	}
-
-	fn find_by_signer_identifier(
-		&self,
-		sid: &crate::cms::signed_data::SignerIdentifier,
-	) -> Option<&PeerCertificate<ErasedSigning>> {
-		self.store.find_by_signer_identifier(sid)
-	}
-
-	fn find_by_public_key(&self, spki: &SubjectPublicKeyInfoOwned) -> Option<&Certificate> {
-		self.store.find_by_public_key(spki)
-	}
-
-	fn to_policy_ref(&self) -> &dyn VerificationPolicy {
-		self.store.to_policy_ref()
-	}
-}
-
-/// Wrap `store` with the validator chain when one is configured.
-///
-/// An empty chain returns the store unchanged, so the common
-/// no-validator path adds no indirection.
-fn validated_trust(
-	store: Arc<dyn CertificateTrust>,
-	validators: &[Arc<dyn CertificateValidation>],
-) -> Arc<dyn CertificateTrust> {
-	if validators.is_empty() {
-		return store;
-	}
-
-	Arc::new(ValidatedTrust { store, validators: validators.iter().map(Arc::clone).collect() })
-}
-
 impl PoolConfig {
-	/// One outbound pool on this configuration, presenting `identity`,
-	/// validating servers against `trust`, and measuring time on `clock`.
+	/// Builds one outbound pool on this configuration. The pool presents
+	/// `identity`, validates servers against `trust` and then
+	/// `server_policy`, and measures time on `clock`.
 	fn build_one<P>(
 		&self,
 		clock: &Arc<dyn Clock>,
 		identity: SigningIdentity,
 		trust: Option<Arc<dyn CertificateTrust>>,
+		server_policy: &[Arc<dyn CertificateValidation>],
 	) -> Arc<ClusterPool<P>>
 	where
 		P: Protocol<CryptoProvider = DefaultCryptoProvider> + Send + Sync + 'static,
@@ -158,7 +51,8 @@ impl PoolConfig {
 		let mut builder = ClusterPool::<P>::builder()
 			.with_config(self.clone())
 			.with_clock(Arc::clone(clock))
-			.with_client_identity(identity);
+			.with_client_identity(identity)
+			.with_server_policy(server_policy.iter().map(Arc::clone));
 
 		if let Some(store) = trust {
 			builder = builder.with_trust_store(store);
@@ -185,128 +79,12 @@ impl PoolConfig {
 		P::Transport: Send + Sync,
 	{
 		let identity = tls.identity();
-		let hive_pool = self.build_one::<P>(
-			clock,
-			identity.clone(),
-			tls.hive_trust
-				.as_ref()
-				.map(|trust| validated_trust(Arc::clone(trust), &tls.validators)),
-		);
-		let peer_pool = tls.peer_trust.as_ref().map(|trust| {
-			self.build_one::<P>(
-				clock,
-				identity.clone(),
-				Some(validated_trust(Arc::clone(trust), &tls.validators)),
-			)
-		});
+		let hive_trust = tls.hive_trust.as_ref().map(Arc::clone);
+		let hive_pool = self.build_one::<P>(clock, identity.clone(), hive_trust, &tls.validators);
+		let peer_trust = tls.peer_trust.as_ref().map(Arc::clone);
+		let build_peer = |trust| self.build_one::<P>(clock, identity.clone(), Some(trust), &tls.validators);
+		let peer_pool = peer_trust.map(build_peer);
 
 		Ok(ClusterPools { hive: hive_pool, peer: peer_pool })
-	}
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-	use crate::crypto::policy::Secp256k1Policy;
-	use crate::crypto::x509::store::{CertificateTrustBuilder, TrustBuilder};
-	use crate::testing::{TestCertificate, TestKey};
-
-	#[cfg(feature = "transport-cms")]
-	use crate::testing::TestCmsServer;
-	#[cfg(feature = "transport-cms")]
-	use crate::transport::handshake::{CmsServerChain, CmsServerIdentity, HandshakeError, ProvisionedTrust};
-
-	struct RejectAll;
-
-	impl CertificateValidation for RejectAll {
-		fn evaluate(&self, _cert: &Certificate) -> Result<(), CertificateValidationError> {
-			Err(CertificateValidationError::CertificateDenied)
-		}
-	}
-
-	fn trust_of(cert: &Certificate) -> Arc<dyn CertificateTrust> {
-		let store = CertificateTrustBuilder::from(Secp256k1Policy::default())
-			.with_certificate(cert.clone())
-			.expect("test certificates satisfy the trust builder")
-			.build();
-		Arc::new(store)
-	}
-
-	#[test]
-	fn empty_validator_chain_returns_store_unchanged() {
-		let store = trust_of(&TestCertificate::self_signed(&TestKey::insecure_fixed_signing()));
-		let composed = validated_trust(Arc::clone(&store), &[]);
-		assert!(Arc::ptr_eq(&store, &composed));
-	}
-
-	#[test]
-	fn operator_validator_rejects_store_trusted_certificate() {
-		let cert = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
-		let composed = validated_trust(trust_of(&cert), &[Arc::new(RejectAll)]);
-		assert!(composed.is_trusted(&cert));
-		assert!(composed.evaluate(&cert).is_err());
-	}
-
-	#[test]
-	fn operator_validator_rejects_store_verified_chain() {
-		let cert = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
-		let store = trust_of(&cert);
-		let chain = [cert];
-		assert!(store.verify_chain(&chain).is_ok());
-
-		let composed = validated_trust(store, &[Arc::new(RejectAll)]);
-		assert!(composed.verify_chain(&chain).is_err());
-	}
-
-	/// The operator validators run on the anchor path as well, so a
-	/// certificate the store anchors is refused when a validator refuses it.
-	#[test]
-	fn operator_validator_rejects_store_anchored_certificate() {
-		let cert = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
-		let composed = validated_trust(trust_of(&cert), &[Arc::new(RejectAll)]);
-
-		let refused = composed.trust_anchor(&cert);
-		assert!(matches!(refused, Err(CertificateValidationError::CertificateDenied)));
-	}
-
-	/// An operator validator that admits the one certificate it pins, as a
-	/// pin on the dialed server's key does.
-	#[cfg(feature = "transport-cms")]
-	struct PinnedLeaf(Certificate);
-
-	#[cfg(feature = "transport-cms")]
-	impl CertificateValidation for PinnedLeaf {
-		fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
-			let pinned = *cert == self.0;
-			pinned.then_some(()).ok_or(CertificateValidationError::CertificateDenied)
-		}
-	}
-
-	/// A pin on the key-agreement leaf admits a pinned chain of that leaf,
-	/// because the operator validators read the leaf and never the anchor.
-	#[cfg(feature = "transport-cms")]
-	#[test]
-	fn a_leaf_pin_admits_a_pinned_chain_of_its_leaf() -> Result<(), HandshakeError> {
-		let server = TestCmsServer::generate("pinned chain server");
-		let pin: Arc<dyn CertificateValidation> = Arc::new(PinnedLeaf(server.key_agreement.to_owned()));
-		let composed = validated_trust(trust_of(&server.authority), &[pin]);
-
-		let chain = CmsServerChain::new([server.authority.to_owned(), server.key_agreement.to_owned()])?;
-		ProvisionedTrust::new(CmsServerIdentity::Chain(chain), composed)?;
-		Ok(())
-	}
-
-	/// The same pin refuses a chain whose leaf is another certificate, so the
-	/// validators still read the leaf of the chain.
-	#[cfg(feature = "transport-cms")]
-	#[test]
-	fn a_leaf_pin_refuses_a_chain_of_another_leaf() {
-		let server = TestCmsServer::generate("pinned chain server");
-		let pin: Arc<dyn CertificateValidation> = Arc::new(PinnedLeaf(server.key_agreement.to_owned()));
-		let composed = validated_trust(trust_of(&server.authority), &[pin]);
-
-		let chain = [server.authority.to_owned(), server.signing.to_owned()];
-		let refused = composed.verify_chain(&chain);
-		assert!(matches!(refused, Err(CertificateValidationError::CertificateDenied)));
 	}
 }

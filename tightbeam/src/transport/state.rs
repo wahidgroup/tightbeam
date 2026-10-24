@@ -18,7 +18,7 @@ use crate::transport::builders::EnvelopeBuilder;
 use crate::transport::envelopes::WireMode;
 use crate::transport::error::{TransportError, TransportFailure};
 use crate::transport::handshake::receipt::StoredReceipt;
-use crate::transport::handshake::{EpochMaterials, EstablishedSession};
+use crate::transport::handshake::{EstablishedSession, SessionPeer};
 use crate::transport::handshake::{HandshakeProtocolKind, PeerAuthentication};
 use crate::transport::TransportLimits;
 use crate::transport::TransportResult;
@@ -35,14 +35,43 @@ use crate::crypto::x509::KeyPurposes;
 use crate::der::asn1::ObjectIdentifier;
 #[cfg(feature = "instrument")]
 use crate::trace::TraceCollector;
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::transport::handshake::negotiation::{TransportAuthorizer, TransportOffer};
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+#[cfg(all(
+	any(feature = "tcp", feature = "async-transport"),
+	any(feature = "transport-cms", feature = "transport-hpke")
+))]
+use crate::transport::handshake::negotiation::TransportAuthorizer;
+#[cfg(all(
+	feature = "transport-multiplex",
+	any(feature = "transport-cms", feature = "transport-hpke")
+))]
+use crate::transport::handshake::negotiation::TransportOffer;
+#[cfg(all(
+	any(feature = "tcp", feature = "async-transport"),
+	any(feature = "transport-cms", feature = "transport-hpke")
+))]
 use crate::transport::handshake::receipt::{ReceiptApprover, SessionObserver};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::transport::handshake::{BoxedServerHandshake, HandshakeError, ServerIdentity};
+use crate::transport::handshake::{BoxedServerHandshake, ServerIdentity, ValidatorChain};
 #[cfg(feature = "transport-cms")]
 use crate::transport::handshake::{CmsIdentityPair, ProvisionedTrust};
+#[cfg(all(
+	feature = "transport-multiplex",
+	any(feature = "transport-cms", feature = "transport-hpke")
+))]
+use crate::transport::handshake::{EpochMaterials, HandshakeError, HandshakeProvider};
+#[cfg(all(
+	feature = "transport-multiplex",
+	any(feature = "transport-cms", feature = "transport-hpke")
+))]
+use crate::transport::rekey::{RekeyDriver, Renewal};
+
+mod dialable_encryption;
+
+pub use dialable_encryption::DialableEncryption;
+pub(crate) use dialable_encryption::Negotiation;
+
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+pub(crate) use dialable_encryption::Endpoint;
 
 /// Which wire mode a session is entitled to write, and the state backing it.
 ///
@@ -67,8 +96,8 @@ pub enum SessionPhase {
 		initiated_at: MonotonicInstant,
 	},
 	/// The handshake completed. The phase carries everything it agreed, so a
-	/// session's keys and the terms that go with them cannot be separated, and
-	/// leaving this phase drops all of them together.
+	/// session's keys travel with the terms that go with them, and leaving this
+	/// phase drops all of them together.
 	Encrypted(Box<EstablishedSession>),
 }
 
@@ -243,9 +272,9 @@ impl ReadPolicy {
 /// crate.
 ///
 /// The traits hand out session ciphers and the server handshake slot, which an
-/// outside implementation could supply from anywhere. Each in-crate transport
-/// implements [`sealed::Sealed`] by name, and no blanket implementation
-/// exists, so those come from a handshake this crate ran.
+/// outside implementation could supply from anywhere. Only the in-crate
+/// transports implement [`sealed::Sealed`], each by name, so both come from a
+/// handshake this crate ran.
 pub(crate) mod sealed {
 	/// Implemented by name for each in-crate transport.
 	pub trait Sealed {}
@@ -261,14 +290,16 @@ pub(crate) enum SessionEvent {
 	Reset,
 }
 
-/// A session's phase and the provisioning it was built for.
+/// A session's phase, the provisioning it was built for, and its negotiation
+/// input.
 ///
-/// Both are private and one constructor sets them together, so the phase an
-/// endpoint starts in, and returns to on a reset, always follows from the
+/// All three are private and one constructor sets them together, so the phase
+/// an endpoint starts in, and returns to on a reset, always follows from the
 /// provisioning it holds. Every move afterwards consults the transition table,
 /// so a session only ever sits in a phase that the table names.
 pub struct SessionState<P: CryptoProvider> {
-	encryption: EncryptionConfig<P>,
+	encryption: DialableEncryption<P>,
+	negotiation: Negotiation,
 	phase: SessionPhase,
 }
 
@@ -279,15 +310,46 @@ impl<P: CryptoProvider> SessionState<P> {
 	/// authority or named cleartext, so the start is `Provisioned` or a
 	/// chosen `Cleartext`.
 	pub fn new(encryption: DialableEncryption<P>) -> Self {
-		let encryption = encryption.0;
-		let phase = SessionPhase::start_for(&encryption);
+		Self::negotiating(encryption, Negotiation::default())
+	}
 
-		Self { encryption, phase }
+	/// A session for `encryption` that starts with the negotiation input
+	/// `negotiation`, at the phase that provisioning starts in.
+	pub(crate) fn negotiating(encryption: DialableEncryption<P>, negotiation: Negotiation) -> Self {
+		let phase = SessionPhase::start_for(encryption.encryption());
+
+		Self { encryption, negotiation, phase }
 	}
 
 	/// What this endpoint was provisioned with.
 	pub fn encryption(&self) -> &EncryptionConfig<P> {
-		&self.encryption
+		self.encryption.encryption()
+	}
+
+	/// The handshake protocol this session runs once provisioned.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::crypto::profiles::DefaultCryptoProvider;
+	/// use tightbeam::transport::handshake::HandshakeProtocolKind;
+	/// use tightbeam::transport::state::{DialableEncryption, SessionState};
+	///
+	/// // A session built with no negotiation input reports the default
+	/// // protocol.
+	/// let session = SessionState::new(DialableEncryption::<DefaultCryptoProvider>::cleartext());
+	/// assert_eq!(session.handshake_protocol(), HandshakeProtocolKind::Hpke);
+	/// ```
+	pub fn handshake_protocol(&self) -> HandshakeProtocolKind {
+		self.negotiation.handshake_protocol()
+	}
+
+	/// The endpoint this session runs as. It lends the proof that the
+	/// provisioning passed both checks of [`DialableEncryption::new`], beside
+	/// the negotiation input as the setters below last wrote it.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	pub(crate) fn endpoint(&self) -> Endpoint<'_, P> {
+		Endpoint::new(&self.encryption, &self.negotiation)
 	}
 
 	/// Where this session currently sits.
@@ -312,7 +374,7 @@ impl<P: CryptoProvider> SessionState<P> {
 				SessionPhase::Handshaking { initiated_at }
 			}
 			SessionEvent::Install(session) => SessionPhase::Encrypted(session),
-			SessionEvent::Reset => SessionPhase::start_for(&self.encryption),
+			SessionEvent::Reset => SessionPhase::start_for(self.encryption.encryption()),
 		};
 		let replaced = core::mem::replace(&mut self.phase, next);
 
@@ -330,9 +392,9 @@ impl<P: CryptoProvider> SessionState<P> {
 		self.apply(SessionEvent::BeginHandshake(now)).is_some()
 	}
 
-	/// Install everything a completed handshake agreed, with both session
-	/// ciphers bounded by `encrypted_envelope`, this endpoint's
-	/// encrypted-envelope ceiling (RFC 9846 § 5.5).
+	/// Install everything a completed handshake agreed, with the send cipher
+	/// bounded by `encrypted_envelope`, this endpoint's encrypted-envelope
+	/// ceiling (RFC 9846 § 5.5). The receive cipher counts the bytes it opens.
 	///
 	/// The terms enter the phase together, so a session that reports itself
 	/// encrypted always carries the terms it runs under and a per-key volume
@@ -378,14 +440,15 @@ impl<P: CryptoProvider> SessionState<P> {
 	/// Replace the multiplexing capability this endpoint offers.
 	///
 	/// This setter and the ones below change negotiation input and leave the
-	/// peer authority alone, so the phase this state starts in is independent
-	/// of them.
+	/// peer authority and the identities alone, so the phase this state starts
+	/// in and the answer of [`DialableEncryption::new`] are independent of
+	/// them.
 	#[cfg(all(
 		feature = "transport-multiplex",
 		any(feature = "transport-cms", feature = "transport-hpke")
 	))]
 	pub(crate) fn offer_mux(&mut self, offer: Option<Arc<TransportOffer>>) {
-		self.encryption.mux_offer = offer;
+		self.negotiation.offer_mux(offer);
 	}
 
 	/// Replace the budget-grant policy a server consults.
@@ -394,7 +457,7 @@ impl<P: CryptoProvider> SessionState<P> {
 		any(feature = "transport-cms", feature = "transport-hpke")
 	))]
 	pub(crate) fn authorize_transport(&mut self, authorizer: Arc<dyn TransportAuthorizer>) {
-		self.encryption.transport_authorizer = Some(authorizer);
+		self.negotiation.authorize_transport(authorizer);
 	}
 
 	/// Replace the observer of budget-bearing handshake outcomes.
@@ -403,7 +466,7 @@ impl<P: CryptoProvider> SessionState<P> {
 		any(feature = "transport-cms", feature = "transport-hpke")
 	))]
 	pub(crate) fn observe_sessions(&mut self, observer: Arc<dyn SessionObserver>) {
-		self.encryption.session_observer = Some(observer);
+		self.negotiation.observe_sessions(observer);
 	}
 
 	/// Replace the approver consulted before countersigning a
@@ -413,7 +476,7 @@ impl<P: CryptoProvider> SessionState<P> {
 		any(feature = "transport-cms", feature = "transport-hpke")
 	))]
 	pub(crate) fn approve_receipts(&mut self, approver: Arc<dyn ReceiptApprover>) {
-		self.encryption.receipt_approver = Some(approver);
+		self.negotiation.approve_receipts(approver);
 	}
 
 	/// Replace the handshake protocol a provisioned endpoint runs.
@@ -423,19 +486,80 @@ impl<P: CryptoProvider> SessionState<P> {
 	/// independent of the protocol.
 	#[cfg(any(feature = "tcp", feature = "async-transport"))]
 	pub(crate) fn select_handshake(&mut self, kind: HandshakeProtocolKind) {
-		self.encryption.handshake_protocol = kind;
+		self.negotiation.select_handshake(kind);
 	}
 
-	/// Detach the epoch rekey materials the handshake left, once.
+	/// Detach the epoch rekey materials the handshake left, once, for
+	/// [`Self::renew`] alone.
 	///
 	/// It is the only write into an installed session. Handing out the session
 	/// itself would let a caller swap the keys under a phase that already
 	/// reports the terms it agreed.
-	pub fn take_epoch_materials(&mut self) -> Option<EpochMaterials> {
+	#[cfg(all(
+		feature = "transport-multiplex",
+		any(feature = "transport-cms", feature = "transport-hpke")
+	))]
+	fn take_epoch_materials(&mut self) -> Option<EpochMaterials> {
 		match &mut self.phase {
 			SessionPhase::Encrypted(session) => session.take_epoch(),
 			_ => None,
 		}
+	}
+
+	/// Renew the established session under the terms of one mux role, which
+	/// `renewal` reads from this session's endpoint, into its rekey driver and
+	/// the dual-signed receipt it rotates.
+	///
+	/// - `renewal` runs once the session holds a receipt and a peer, so the
+	///   terms are built only for a session that renews.
+	/// - The session refuses before the epoch materials leave it, so a refused
+	///   session keeps its receipt, its peer, and its epoch.
+	///
+	/// # Returns
+	///
+	/// - `Ok(None)` when the session holds no dual-signed receipt, no recorded
+	///   peer, or no epoch materials, or when `renewal` names no terms for the
+	///   endpoint.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::CertificateValidationError`] -- the signing use or
+	///   the purpose of the peer's role refuses the peer's certificate.
+	#[cfg(all(
+		feature = "transport-multiplex",
+		any(feature = "transport-cms", feature = "transport-hpke")
+	))]
+	pub(crate) fn renew(
+		&mut self,
+		renewal: impl FnOnce(&Endpoint<'_, P>) -> Option<Renewal<P>>,
+	) -> Result<Option<(RekeyDriver, Arc<StoredReceipt>)>, HandshakeError>
+	where
+		P: HandshakeProvider,
+	{
+		let Some(receipt) = self.receipt_arc() else {
+			return Ok(None);
+		};
+		let Some(peer) = self.session_peer() else {
+			return Ok(None);
+		};
+		let Some(renewal) = renewal(&self.endpoint()) else {
+			return Ok(None);
+		};
+
+		// A rekey's server ephemeral differs from every static key the
+		// handshake compared it with, a CMS server's key-agreement key among
+		// them, so the renewal admits the whole peer the session recorded.
+		let admitted = renewal.admit(peer)?;
+
+		// The epoch detaches after the refusals above, so a refused session
+		// keeps it.
+		let Some(epoch) = self.take_epoch_materials() else {
+			return Ok(None);
+		};
+
+		let reference = receipt.receipt().clone();
+		let driver = admitted.driver(epoch, reference);
+		Ok(Some((driver, receipt)))
 	}
 
 	/// The session this endpoint established, if it has one.
@@ -484,6 +608,12 @@ impl<P: CryptoProvider> SessionState<P> {
 		self.established()?.peer_arc()
 	}
 
+	/// The peer the established session recorded, with the identity of its
+	/// key, as one record a session context shares.
+	pub(crate) fn session_peer(&self) -> Option<&Arc<SessionPeer>> {
+		self.established()?.session_peer()
+	}
+
 	/// Dual-signed session receipt from the established session.
 	pub fn receipt(&self) -> Option<&StoredReceipt> {
 		self.established()?.receipt()
@@ -498,7 +628,8 @@ impl<P: CryptoProvider> SessionState<P> {
 	/// to walk the table to reach its starting point.
 	#[cfg(test)]
 	pub(crate) fn at(encryption: EncryptionConfig<P>, phase: SessionPhase) -> Self {
-		Self { encryption, phase }
+		let encryption = DialableEncryption::unchecked(encryption);
+		Self { encryption, negotiation: Negotiation::default(), phase }
 	}
 }
 
@@ -600,6 +731,11 @@ pub struct EncryptionConfig<P: CryptoProvider> {
 	/// certificate, which the CMS handshake needs before the server speaks.
 	#[cfg(feature = "transport-cms")]
 	pub(crate) cms_server: Option<ProvisionedTrust>,
+	/// The server policy each client handshake of this endpoint runs on the
+	/// identity certificate of its server, under either flow, or `None` for a
+	/// client that sets none.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	pub(crate) server_policy: Option<ValidatorChain>,
 	/// The identity this endpoint presents as a client for mutual
 	/// authentication: the certificate and the key that proves it.
 	pub(crate) client_identity: Option<SigningIdentity>,
@@ -608,22 +744,6 @@ pub struct EncryptionConfig<P: CryptoProvider> {
 	/// The key purpose of each role the endpoint's handshakes admit.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub(crate) key_purposes: KeyPurposes,
-	/// Local multiplexing capability advertised in the handshake.
-	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-	pub(crate) mux_offer: Option<Arc<TransportOffer>>,
-	/// Budget-grant policy between the client's offer and the server's accept.
-	/// `None` grants the local configuration ceiling.
-	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-	pub(crate) transport_authorizer: Option<Arc<dyn TransportAuthorizer>>,
-	/// Approver consulted for a challenge-bearing session receipt. `None`
-	/// fails closed when a challenge is present.
-	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-	pub(crate) receipt_approver: Option<Arc<dyn ReceiptApprover>>,
-	/// Observer recording budget-bearing handshake outcomes.
-	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-	pub(crate) session_observer: Option<Arc<dyn SessionObserver>>,
-	/// Handshake protocol used once encryption is provisioned.
-	pub(crate) handshake_protocol: HandshakeProtocolKind,
 	/// Whether this endpoint accepts running without authenticating its peer.
 	pub(crate) allow_cleartext: bool,
 	/// The provider the endpoint's handshakes and sessions run under.
@@ -648,11 +768,6 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 		self.client_identity.as_ref().map(SigningIdentity::certificate)
 	}
 
-	/// Handshake protocol used once encryption is provisioned.
-	pub fn handshake_protocol(&self) -> HandshakeProtocolKind {
-		self.handshake_protocol
-	}
-
 	/// Whether this endpoint is provisioned to encrypt, which is the same as
 	/// whether it can establish who its peer is.
 	///
@@ -664,38 +779,58 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 	/// - The trust in a CMS server a client provisioned, which holds its store.
 	///
 	/// A client certificate proves who this endpoint is, so it answers a
-	/// different question and is absent here.
+	/// different question than the list above. A server policy narrows which
+	/// server a trust admits, so the trust in a server answers for it here.
 	pub fn is_provisioned(&self) -> bool {
 		// Naming every field without `..` breaks the build on a new field until
 		// someone says whether it implies a handshake, so no new key material
-		// silently leaves the endpoint in `Cleartext` (CWE-311).
+		// silently leaves the endpoint in `Cleartext` (CWE-311). The two trust
+		// fields are read in `trusts_a_server`, which names every field too.
 		let Self {
 			server_identity,
-			trust_store,
+			trust_store: _,
 			peer_authentication,
 			#[cfg(feature = "transport-cms")]
-			cms_server,
+				cms_server: _,
+			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+				server_policy: _,
 			client_identity: _,
 			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 				key_purposes: _,
+			allow_cleartext: _,
+			provider: _,
+		} = self;
+
+		server_identity.is_some() || self.trusts_a_server() || peer_authentication.requires_certificate()
+	}
+
+	/// Whether this endpoint holds a trust in a server, a trust store or the
+	/// trust in a CMS server, which [`Self::is_provisioned`] and the dialer
+	/// rule both read.
+	fn trusts_a_server(&self) -> bool {
+		// Naming every field without `..` breaks the build on a new field until
+		// someone says whether it is a trust in a server, so a new trust
+		// reaches the start phase and the dialer rule alike (CWE-311, CWE-295).
+		let Self {
+			trust_store,
+			#[cfg(feature = "transport-cms")]
+			cms_server,
+			server_identity: _,
+			peer_authentication: _,
 			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-				mux_offer: _,
+				server_policy: _,
+			client_identity: _,
 			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-				transport_authorizer: _,
-			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-				receipt_approver: _,
-			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-				session_observer: _,
-			handshake_protocol: _,
+				key_purposes: _,
 			allow_cleartext: _,
 			provider: _,
 		} = self;
 		#[cfg(feature = "transport-cms")]
-		let server_trust = cms_server.is_some();
+		let cms_server = cms_server.is_some();
 		#[cfg(not(feature = "transport-cms"))]
-		let server_trust = false;
+		let cms_server = false;
 
-		server_identity.is_some() || trust_store.is_some() || server_trust || peer_authentication.requires_certificate()
+		trust_store.is_some() || cms_server
 	}
 
 	/// Whether this endpoint carries a client identity.
@@ -713,13 +848,29 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 	/// # Errors
 	///
 	/// - [`TransportError::PeerAuthenticationUnconfigured`] -- the endpoint
-	///   authenticates no peer and did not name cleartext.
+	///   authenticates no peer and did not name cleartext, or it sets a server
+	///   policy and holds no trust in a server, whether or not it names
+	///   cleartext, because the policy runs on the server a trust admits.
 	pub fn check_dial_permitted(&self) -> TransportResult<()> {
 		if !self.is_provisioned() && !self.allow_cleartext {
 			return Err(TransportError::PeerAuthenticationUnconfigured);
 		}
+		if self.server_policy_without_trust() {
+			return Err(TransportError::PeerAuthenticationUnconfigured);
+		}
 
 		Ok(())
+	}
+
+	/// Whether this endpoint sets a server policy and holds no trust in a
+	/// server for the policy to read, a trust store or a CMS server trust.
+	fn server_policy_without_trust(&self) -> bool {
+		#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+		let policy = self.server_policy.is_some();
+		#[cfg(not(any(feature = "transport-cms", feature = "transport-hpke")))]
+		let policy = false;
+
+		policy && !self.trusts_a_server()
 	}
 
 	/// Refuse this provisioning when an identity it presents names another
@@ -752,19 +903,12 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 			server_identity: None,
 			#[cfg(feature = "transport-cms")]
 			cms_server: None,
+			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+			server_policy: None,
 			client_identity: None,
 			peer_authentication: PeerAuthentication::Anonymous,
 			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 			key_purposes: KeyPurposes::default(),
-			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-			mux_offer: None,
-			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-			transport_authorizer: None,
-			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-			receipt_approver: None,
-			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-			session_observer: None,
-			handshake_protocol: HandshakeProtocolKind::default(),
 			allow_cleartext: false,
 			provider: PhantomData,
 		}
@@ -780,46 +924,6 @@ pub trait ServerHandshakeSlot: sealed::Sealed {
 	/// It is `None` before the first client message arrives, and again once
 	/// the handshake completes and its terms are installed.
 	fn server_handshake_mut(&mut self) -> &mut Option<BoxedServerHandshake>;
-}
-
-/// Provisioning that has passed [`EncryptionConfig::check_dial_permitted`].
-///
-/// A transport is built only from this form, through [`SessionState::new`],
-/// so every installed provisioning has answered the dialer rule.
-#[derive(Clone)]
-pub struct DialableEncryption<P: CryptoProvider>(EncryptionConfig<P>);
-
-impl<P: CryptoProvider> DialableEncryption<P> {
-	/// Check `encryption` against the dialer rule, and each identity it
-	/// presents against the key purpose of its role.
-	///
-	/// # Errors
-	///
-	/// - [`TransportError::PeerAuthenticationUnconfigured`] -- the endpoint
-	///   authenticates no peer and did not name cleartext.
-	/// - [`TransportError::HandshakeError`] -- an identity names another key
-	///   purpose than its role's.
-	pub fn new(encryption: EncryptionConfig<P>) -> TransportResult<Self> {
-		encryption.check_dial_permitted()?;
-		#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-		encryption.admit_own_identities().map_err(HandshakeError::from)?;
-		Ok(Self(encryption))
-	}
-
-	/// Name cleartext as a choice, with no peer authority and no encryption.
-	///
-	/// Frames travel with no confidentiality, integrity, or peer
-	/// authentication, which suits a loopback fixture or a link a lower layer
-	/// already secures.
-	pub fn cleartext() -> Self {
-		let encryption = EncryptionConfig { allow_cleartext: true, ..EncryptionConfig::unconfigured() };
-		Self(encryption)
-	}
-
-	/// The provisioning this answer was given for.
-	pub fn encryption(&self) -> &EncryptionConfig<P> {
-		&self.0
-	}
 }
 
 /// State accessors for encrypted transports, separate from I/O.
@@ -859,8 +963,8 @@ pub trait EncryptedProtocolState: sealed::Sealed {
 
 	/// Mutable access to this endpoint's session state.
 	///
-	/// The state guards its own phase, so a caller reaching this still cannot
-	/// place the session in a phase the transition table does not name.
+	/// The state guards its own phase, so a caller reaching this still places
+	/// the session only in a phase the transition table names.
 	fn session_state_mut(&mut self) -> &mut SessionState<Self::CryptoProvider>;
 
 	/// Apply this session's wire mode to `builder`.
@@ -931,6 +1035,10 @@ mod tests {
 	use crate::testing::TestFrame;
 	use crate::utils::time::{Clock, ManualClock};
 
+	#[cfg(feature = "testing")]
+	use crate::crypto::x509::CanonicalKey;
+	#[cfg(feature = "testing")]
+	use crate::policy::SessionContext;
 	#[cfg(all(feature = "transport-cms", feature = "testing"))]
 	use crate::testing::fixtures::TestCmsServer;
 	#[cfg(feature = "testing")]
@@ -951,7 +1059,7 @@ mod tests {
 		}
 
 		fn cleartext(phase: SessionPhase) -> Self {
-			Self::holding(DialableEncryption::cleartext().0, phase)
+			Self::holding(DialableEncryption::cleartext().encryption().clone(), phase)
 		}
 
 		fn holding(encryption: EncryptionConfig<DefaultCryptoProvider>, phase: SessionPhase) -> Self {
@@ -1008,7 +1116,6 @@ mod tests {
 		let server = TestCmsServer::generate("tightbeam provisioned client");
 		let encryption = EncryptionConfig::<DefaultCryptoProvider> {
 			cms_server: Some(server.trust()),
-			handshake_protocol: HandshakeProtocolKind::Cms,
 			allow_cleartext: true,
 			..EncryptionConfig::unconfigured()
 		};
@@ -1338,12 +1445,46 @@ mod tests {
 		Ok(())
 	}
 
+	/// A capture lends the key identity its session recorded, so a session
+	/// whose peer holds a secp256k1 key in the compressed form proves the
+	/// identity of that key in the uncompressed form.
+	#[cfg(feature = "testing")]
+	#[test]
+	fn a_capture_proves_the_peer_of_a_key_in_either_form() -> TransportResult<()> {
+		let certificate = fixture_certificate();
+		let expected = CanonicalKey::of(&certificate.tbs_certificate.subject_public_key_info)?;
+		let compressed = TestCertificate::with_compressed_key(certificate);
+		let mut probe = PhaseProbe::provisioned(handshaking());
+		probe.install_established(session_of(compressed))?;
+
+		let captured = SessionContext::capture(&probe);
+		let proven = captured.proven_peer().map(|peer| peer.as_key());
+		assert_eq!(proven, Some(&expected));
+		Ok(())
+	}
+
+	/// A session runs the handshake protocol its last selection named, and
+	/// reports it.
+	#[cfg(any(feature = "tcp", feature = "async-transport"))]
+	#[test]
+	fn a_session_reports_the_handshake_protocol_it_selected() {
+		let mut state = SessionState::at(provisioned_encryption(), SessionPhase::Provisioned);
+		state.select_handshake(HandshakeProtocolKind::Cms);
+		assert_eq!(state.handshake_protocol(), HandshakeProtocolKind::Cms);
+	}
+
 	/// A completed session carrying a peer identity, which authorization reads.
 	#[cfg(feature = "testing")]
 	fn established_session() -> EstablishedSession {
+		session_of(fixture_certificate())
+	}
+
+	/// A completed session whose peer is `certificate`.
+	#[cfg(feature = "testing")]
+	fn session_of(certificate: Certificate) -> EstablishedSession {
 		let keys = SessionKeys::for_client(crate::testing::TestKey::insecure_directional_keys());
-		let peer = SessionPeer::from(Arc::new(fixture_certificate()));
-		EstablishedSession::new(keys, None, None, Some(peer), None)
+		let peer = SessionPeer::try_from(Arc::new(certificate)).expect("a test certificate records its peer");
+		EstablishedSession::forged(keys, None, Some(peer))
 	}
 
 	#[cfg(feature = "testing")]

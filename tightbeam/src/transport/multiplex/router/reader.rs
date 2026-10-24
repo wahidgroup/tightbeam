@@ -45,7 +45,7 @@ use crate::transport::handshake::receipt::StoredReceipt;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::HandshakeError;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::transport::rekey::{EpochInstall, RekeyDriver, ServerAckOutcome};
+use crate::transport::rekey::{EpochInstall, RekeyDriver, RequestAnswer, ServerAckOutcome};
 
 /// Cap on the ping acks the reader buffers while the writer queue is full.
 ///
@@ -372,16 +372,12 @@ where
 	///
 	/// 1. Seed the receipt accessor from the handshake artifact.
 	/// 2. Stamp the epoch baseline from the remaining records of the receive cipher.
-	/// 3. In the client role, open admissions gating for renewals.
+	/// 3. Mark the rekey attached, which in the client role opens admissions gating for renewals.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-	pub(crate) fn attach_rekey(&mut self, driver: RekeyDriver, receipt: StoredReceipt) {
+	pub(crate) fn attach_rekey(&mut self, driver: RekeyDriver, receipt: Arc<StoredReceipt>) {
 		self.link.shared().rotate_receipt(receipt);
 		self.epoch_recv_baseline = self.reader.remaining_records();
-
-		if matches!(&driver, RekeyDriver::Client(_)) {
-			self.link.shared().mark_rekey_client();
-		}
-
+		self.link.shared().mark_rekey_attached();
 		self.rekey = Some(driver);
 	}
 
@@ -466,7 +462,7 @@ where
 		if self.reader.remaining_records() > self.renewal_floor {
 			return Ok(());
 		}
-		let Some(RekeyDriver::Client(exchange)) = self.rekey.as_ref() else {
+		let Some(exchange) = self.rekey.as_ref().and_then(RekeyDriver::renewal_opener) else {
 			return Ok(());
 		};
 		let Some(request) = self.link.shared().open_renewal(exchange) else {
@@ -500,25 +496,27 @@ where
 
 	/// Server leg: issue the epoch receipt for a renewal request.
 	///
-	/// The rekey-flood bound (CWE-400) makes a request a protocol violation
-	/// when an exchange is in flight, or when the peer has spent fewer than
-	/// [`DEFAULT_REKEY_MIN_SPEND_RECORDS`] records since the last install.
+	/// The rekey-flood bound (CWE-400) makes a request a protocol violation in
+	/// two cases:
+	///
+	/// - The server's half answers that an exchange is in flight.
+	/// - The peer has spent fewer than [`DEFAULT_REKEY_MIN_SPEND_RECORDS`] records since the last install.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	async fn route_rekey_request(&mut self, package: MuxRekeyRequestPackage) -> TransportResult<()> {
 		let spent = self.epoch_recv_baseline.saturating_sub(self.reader.remaining_records());
 		let issued = {
-			let Some(RekeyDriver::Server(exchange)) = self.rekey.as_mut() else {
+			let Some(driver) = self.rekey.as_mut() else {
 				return Err(self.protocol_violation());
 			};
-			if exchange.exchange_in_flight() || spent < DEFAULT_REKEY_MIN_SPEND_RECORDS {
+			if spent < DEFAULT_REKEY_MIN_SPEND_RECORDS {
 				None
 			} else {
-				Some(exchange.process_request(&package).await)
+				driver.process_request(&package).await
 			}
 		};
 
 		match issued {
-			Some(Ok(response)) => {
+			Some(Ok(RequestAnswer::Issued(response))) => {
 				#[cfg(feature = "instrument")]
 				self.link.shared().emit_event(events::MUX_REKEY_RECEIPT_ISSUED);
 
@@ -532,7 +530,7 @@ where
 
 				Err(self.protocol_violation())
 			}
-			None => Err(self.protocol_violation()),
+			Some(Ok(RequestAnswer::InFlight)) | None => Err(self.protocol_violation()),
 		}
 	}
 
@@ -552,15 +550,13 @@ where
 		if !self.link.shared().admit_rekey_response() {
 			return Err(self.protocol_violation());
 		}
-		let Some(RekeyDriver::Client(exchange)) = self.rekey.as_ref() else {
+		let Some(driver) = self.rekey.as_mut() else {
 			return Err(self.protocol_violation());
 		};
 
-		let exchange = Arc::clone(exchange);
-		let mut guard = exchange.lock().await;
-		let processed = guard.process_response(package).await;
-
-		drop(guard);
+		let Some(processed) = driver.process_response(package).await else {
+			return Err(self.protocol_violation());
+		};
 
 		match processed {
 			Ok((ack, install)) => {
@@ -597,11 +593,14 @@ where
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	async fn route_rekey_ack(&mut self, package: MuxRekeyAckPackage) -> TransportResult<()> {
 		let settled = {
-			let Some(RekeyDriver::Server(exchange)) = self.rekey.as_mut() else {
+			let Some(driver) = self.rekey.as_mut() else {
 				return Err(self.protocol_violation());
 			};
 
-			exchange.process_ack(package).await
+			driver.process_ack(package).await
+		};
+		let Some(settled) = settled else {
+			return Err(self.protocol_violation());
 		};
 		let Ok(outcome) = settled else {
 			#[cfg(feature = "instrument")]
@@ -739,7 +738,7 @@ where
 	/// and coalesces newer reports into one pending note, so the clamp bounds
 	/// the chunks and the channel bounds the notes.
 	fn grant_streaming(&mut self, note: DrainNote) -> TransportResult<()> {
-		let limits = if self.link.shared().role.initiates(note.stream_id) {
+		let limits = if self.link.shared().role().initiates(note.stream_id) {
 			self.link.shared().duplex_limits(note.stream_id)
 		} else {
 			self.peer_bodies.get(&note.stream_id).map(ForwardedStream::limits)
@@ -758,7 +757,7 @@ where
 			return Ok(());
 		}
 
-		if self.link.shared().role.initiates(note.stream_id) {
+		if self.link.shared().role().initiates(note.stream_id) {
 			self.link.shared().set_duplex_limit(note.stream_id, new_limit);
 		} else if let Some(stream) = self.peer_bodies.get_mut(&note.stream_id) {
 			stream.raise_limit(new_limit);
@@ -875,7 +874,7 @@ where
 	/// Resolve a locally-initiated stream from its `End` trailer.
 	fn route_end(&mut self, package: MuxEndPackage) -> TransportResult<()> {
 		let stream_id = package.stream_id();
-		if !self.link.shared().role.initiates(stream_id) {
+		if !self.link.shared().role().initiates(stream_id) {
 			return Err(self.protocol_violation());
 		}
 
@@ -1069,10 +1068,10 @@ where
 			return Err(self.protocol_violation());
 		}
 
-		if self.link.shared().role.peer().initiates(stream_id) {
+		if self.link.shared().role().peer().initiates(stream_id) {
 			return self.route_request_data(package).await;
 		}
-		if self.link.shared().role.initiates(stream_id) {
+		if self.link.shared().role().initiates(stream_id) {
 			return self.route_response_data(package).await;
 		}
 
@@ -1242,7 +1241,7 @@ where
 	/// connection.
 	async fn route_cancel(&mut self, package: MuxCancelPackage) -> TransportResult<()> {
 		let stream_id = package.stream_id();
-		if self.link.shared().role.initiates(stream_id) {
+		if self.link.shared().role().initiates(stream_id) {
 			// The peer cancelled or refused a stream this endpoint initiated.
 			self.local_reassembly.remove(&stream_id);
 
@@ -1259,7 +1258,7 @@ where
 
 			return Ok(());
 		}
-		if self.link.shared().role.peer().initiates(stream_id) {
+		if self.link.shared().role().peer().initiates(stream_id) {
 			// The peer withdrew its own request. Drop any partial reassembly or
 			// streaming body, release the response ledger, and abort the
 			// handler. The dropped sender ends the body.

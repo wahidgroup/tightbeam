@@ -1,5 +1,6 @@
 //! Work routing through the cluster gateway.
 
+use tightbeam::crypto::x509::policy::{CertificateValidation, DirectTrustValidator};
 use tightbeam::testing::TestDigest;
 use tightbeam::{cluster, servlet};
 
@@ -37,7 +38,8 @@ tb_scenario! {
 	}
 }
 
-// Same routing path without mux offers: colony links stay single-flight.
+// This scenario takes the same routing path with no mux offer, so colony
+// links stay single-flight.
 tb_scenario! {
 	name: cluster_work_routing_single_flight,
 	spec: ClusterRoutingSpec,
@@ -49,6 +51,49 @@ tb_scenario! {
 		hives: |SetupEnv { trace, context: certs }| vec![start_ping_hive(trace, certs, None)],
 		client: |ClusterEnv { trace, context: certs, cluster }| async move {
 			record_ping_echo(&trace, &certs, &cluster).await?;
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterServerPolicySpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
+			(WORK_SENT, exactly!(1)),
+			(events::CLUSTER_WORK_ROUTED, exactly!(0)),
+			(WORK_STATUS, exactly!(1), equals!(TransitStatus::Unavailable)),
+			(WORK_PAYLOAD, exactly!(1), equals!(0u64))
+		]
+	}
+}
+
+// The gateway runs `ClusterTlsConfig::validators` as the server policy of
+// each dial to its hive, so a policy that admits no certificate leaves the
+// work unrouted. `cluster_work_routing_single_flight` routes the same work
+// with no policy.
+tb_scenario! {
+	name: cluster_server_policy_runs_on_the_dial_to_its_hive,
+	spec: ClusterServerPolicySpec,
+	environment Cluster {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| async move {
+			let refuses_every_server: Arc<dyn CertificateValidation> = Arc::new(DirectTrustValidator::default());
+			let mut conf = routing_cluster_conf(&certs, None);
+			conf.tls.validators = vec![refuses_every_server];
+			start_cluster(&trace, conf).await
+		},
+		hives: |SetupEnv { trace, context: certs }| vec![start_ping_hive(trace, certs, None)],
+		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+			let mut client = connect_cluster(&certs, cluster.addr()).await?;
+			trace.event(WORK_SENT)?;
+
+			let refused_work = emit_ping_work(&mut client, &certs.key, b"server-policy-work").await;
+			record_work_refusal(&trace, refused_work)?;
+
 			cluster.stop();
 			Ok(())
 		}
@@ -69,10 +114,11 @@ tb_assert_spec! {
 	}
 }
 
-// One hive, two independent gateways: registration fans out, each gateway
-// converges on its own registry (both count exactly this one hive), and
-// each routes work to the same servlet slate. Gateway redundancy needs no
-// consensus -- every registry is soft state the hive keeps fresh.
+// One hive registers with two independent gateways. Registration fans out,
+// each gateway converges on its own registry (both count exactly this one
+// hive), and each routes work to the same servlet slate. Gateway redundancy
+// needs no consensus, because every registry is soft state the hive keeps
+// fresh.
 tb_scenario! {
 	name: cluster_hive_serves_two_gateways,
 	spec: ClusterMultiGatewaySpec,
@@ -154,7 +200,8 @@ servlet! {
 	}
 }
 
-/// Probe-servlet hive registered under the ping type, on the scenario trace.
+/// Starts a hive of the probe servlet, registered under the ping type, on the
+/// scenario trace.
 async fn start_probe_hive(
 	trace: TraceCollector,
 	certs: Arc<ClusterTestCerts>,
@@ -174,8 +221,8 @@ async fn start_probe_hive(
 /// `gateway`: send the standard signed contract frame and record every
 /// client-observable property of the servlet's response envelope.
 ///
-/// Shared by the local-delivery and peer-hop scenarios, so both routes
-/// prove the identical contract.
+/// The local-delivery and peer-hop scenarios share it, so both routes prove
+/// the identical contract.
 async fn record_frame_contract(
 	trace: &TraceCollector,
 	certs: &ClusterTestCerts,

@@ -23,7 +23,7 @@ use crate::crypto::x509::Certificate;
 use crate::der::asn1::{GeneralizedTime, ObjectIdentifier, OctetString};
 use crate::der::oid::db::rfc5280::ANY_EXTENDED_KEY_USAGE;
 use crate::der::oid::AssociatedOid;
-use crate::der::{Decode, Encode};
+use crate::der::{Decode, Encode, Writer};
 use crate::x509::certificate::{CertificateInner, Profile};
 use crate::x509::serial_number::SerialNumber;
 
@@ -81,17 +81,28 @@ where
 {
 	/// Digest the certificate DER and bind the result to `D`.
 	///
+	/// The encoder writes the DER into the digest as it goes, so the encoding
+	/// of the certificate streams through the digest.
+	///
 	/// # Errors
 	///
 	/// - [`CertificateValidationError::EncodingError`] -- the certificate fails to DER-encode.
 	pub fn from_certificate(cert: &Certificate) -> Result<Self, CertificateValidationError> {
-		let der_bytes = cert.to_der()?;
-		let hash = D::digest(&der_bytes);
+		let mut digest = DigestWriter(D::new());
+		cert.encode(&mut digest)?;
 
-		let mut bytes = [0u8; 32];
-		bytes.copy_from_slice(hash.as_ref());
-
+		let bytes = digest.0.finalize().into();
 		Ok(Self { bytes, _digest: PhantomData })
+	}
+}
+
+/// A DER writer that feeds each encoded octet to the digest it holds.
+struct DigestWriter<D>(D);
+
+impl<D: Digest> Writer for DigestWriter<D> {
+	fn write(&mut self, slice: &[u8]) -> crate::der::Result<()> {
+		self.0.update(slice);
+		Ok(())
 	}
 }
 
@@ -530,20 +541,33 @@ pub(crate) fn recipient_identifier_of(sid: &SignerIdentifier) -> RecipientIdenti
 
 #[cfg(test)]
 mod tests {
-	use super::Skid;
+	use super::{Fingerprint, Skid};
+	use crate::crypto::hash::{Digest, Sha3_256};
 	use crate::crypto::x509::error::CertificateValidationError;
 	use crate::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
-	use crate::testing::TestCertificate;
+	use crate::der::Encode;
+	use crate::testing::{TestCertificate, TestKey};
 	use crate::x509::ext::pkix::SubjectKeyIdentifier;
+
+	/// A fingerprint that the encoder streams into the digest equals the
+	/// digest of the whole DER, which the encoder writes outside the code
+	/// under test.
+	#[test]
+	fn a_fingerprint_is_the_digest_of_the_certificate_der() -> Result<(), CertificateValidationError> {
+		let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+		let expected = Sha3_256::digest(certificate.to_der()?);
+
+		let fingerprint = Fingerprint::<Sha3_256>::from_certificate(&certificate)?;
+		assert_eq!(fingerprint.as_slice(), expected.as_slice());
+		Ok(())
+	}
 
 	/// The extension value a SKID converts to carries the SKID bytes whole,
 	/// so a minted certificate holds the 20 bytes its key names.
 	#[test]
 	fn a_skid_converts_to_the_extension_value_that_carries_it() -> Result<(), crate::der::Error> {
 		let skid = Skid::parse([0x5au8; 20]).ok_or(crate::der::Tag::OctetString.value_error())?;
-
 		let identifier = SubjectKeyIdentifier::try_from(skid)?;
-
 		assert_eq!(identifier.0.as_bytes(), skid.as_bytes());
 		Ok(())
 	}

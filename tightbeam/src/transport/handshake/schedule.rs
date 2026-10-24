@@ -119,6 +119,8 @@ use crate::random::{generate_nonce, CryptoRngCore};
 use crate::transport::handshake::error::HandshakeError;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::negotiation::{MuxSettings, RunnableProfile};
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::transport::handshake::peer::PeerIdentity;
 #[cfg(all(
 	feature = "transport-multiplex",
 	any(feature = "transport-cms", feature = "transport-hpke")
@@ -1505,14 +1507,6 @@ impl<P: HandshakeProvider> Terms<P> {
 	}
 }
 
-/// The peer a role records.
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-pub trait PeerIdentity {
-	/// The peer the session records, or `None` when the peer proved no
-	/// identity.
-	fn peer(&self) -> Option<SessionPeer>;
-}
-
 /// What both sides hold once the handshake secret exists.
 ///
 /// [`Self::complete`] consumes it, so one handshake derives one session.
@@ -1526,7 +1520,8 @@ pub struct Agreed<P: HandshakeProvider> {
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl<P: HandshakeProvider> Agreed<P> {
-	/// Gather what one handshake agreed, and the peer `peer` records.
+	/// Gather what one handshake agreed, and the peer that `peer`, the
+	/// admitted party, records.
 	///
 	/// `receipt` is the dual-signed receipt of a budget-bearing session, and
 	/// `None` for an unmetered one.
@@ -1534,9 +1529,9 @@ impl<P: HandshakeProvider> Agreed<P> {
 		terms: Terms<P>,
 		secret: HandshakeSecret,
 		receipt: Option<StoredReceipt>,
-		peer: &impl PeerIdentity,
+		peer: impl PeerIdentity,
 	) -> Self {
-		Self { terms, secret, receipt, peer: peer.peer() }
+		Self { terms, secret, receipt, peer: peer.into_peer() }
 	}
 
 	/// The negotiated terms.
@@ -1558,9 +1553,12 @@ impl<P: HandshakeProvider> Agreed<P> {
 	/// it over.
 	///
 	/// This is the one key-schedule sequence of both protocols and both roles:
-	/// the directional traffic keys, then the epoch-0 rekey materials, each
-	/// under the protocol's salt. `keys` maps the directional ciphers to the
-	/// keys of the calling role. The handshake secret drops when this returns.
+	/// the epoch-0 rekey materials, then the directional traffic keys, each
+	/// under the protocol's salt.
+	///
+	/// - `keys` maps the directional ciphers to the keys of the calling role.
+	/// - A build with the mux rekey hands the epoch to the session.
+	/// - The handshake secret drops when this returns.
 	///
 	/// # Errors
 	///
@@ -1577,7 +1575,9 @@ impl<P: HandshakeProvider> Agreed<P> {
 		let ciphers = DirectionalCiphers::derive::<P, _>(&secret, salt, epoch.epoch)?;
 		let receipt = receipt.map(Arc::new);
 
-		let session = EstablishedSession::new(keys(ciphers), terms.mux, receipt, peer, Some(epoch));
+		let session = EstablishedSession::new(keys(ciphers), terms.mux, receipt, peer);
+		#[cfg(feature = "transport-multiplex")]
+		let session = session.with_epoch(epoch);
 		Ok(session)
 	}
 }

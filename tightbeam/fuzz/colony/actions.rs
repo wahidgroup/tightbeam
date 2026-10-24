@@ -9,8 +9,9 @@ use tightbeam::compose;
 use tightbeam::crypto::key::Secp256k1KeyProvider;
 use tightbeam::crypto::sign::SigningIdentity;
 use tightbeam::crypto::x509::store::CertificateTrust;
-use tightbeam::crypto::x509::CertificateSpec;
+use tightbeam::crypto::x509::{CanonicalKey, CertificateSpec};
 use tightbeam::decode;
+use tightbeam::der::Encode;
 use tightbeam::policy::TransitStatus;
 use tightbeam::testing::fuzz::OracleAccess;
 use tightbeam::testing::routes::RoutedOpens;
@@ -158,10 +159,12 @@ fn pick_org_ref(topo: &ColonyTopology, idx: u8) -> &OrgNode {
 	}
 }
 
-/// Fixture-encoded SPKI DER borrowed from the identity bundle. Callers
-/// that need ownership (ACL mutation, CSR payloads) copy it themselves.
-fn org_spki(org: &OrgNode) -> &[u8] {
-	org.certs.spki.as_ref()
+/// The canonical key the fixtures read once, borrowed from the identity
+/// bundle, or `None` for an identity whose key the fixtures could not read.
+/// Such an identity matches no session, so a mutation of its grants or its
+/// gate changes no verdict.
+fn org_key(org: &OrgNode) -> Option<&CanonicalKey> {
+	org.certs.canonical.as_ref()
 }
 
 fn mutate_export(trace: &TraceCollector, org: &OrgNode, selector: u8) -> Result<(), TightBeamError> {
@@ -178,12 +181,14 @@ fn mutate_export(trace: &TraceCollector, org: &OrgNode, selector: u8) -> Result<
 
 fn mutate_grant(trace: &TraceCollector, topo: &ColonyTopology, selector: u8) -> Result<(), TightBeamError> {
 	let target = target_urn(selector);
-	let grantee_spki = org_spki(pick_org_ref(topo, selector >> 2));
+	let grantee = org_key(pick_org_ref(topo, selector >> 2));
 	let org = pick_org_ref(topo, selector);
-	if selector & 1 == 0 {
-		org.acl.grant(grantee_spki, &target);
-	} else {
-		org.acl.revoke_grant(grantee_spki, &target);
+	if let Some(grantee) = grantee {
+		if selector & 1 == 0 {
+			org.acl.grant(grantee, &target);
+		} else {
+			org.acl.revoke_grant(grantee, &target);
+		}
 	}
 
 	trace.event(events::GRANT_MUTATED)?;
@@ -191,11 +196,12 @@ fn mutate_grant(trace: &TraceCollector, topo: &ColonyTopology, selector: u8) -> 
 }
 
 fn mutate_gate(trace: &TraceCollector, org: &OrgNode, selector: u8) -> Result<(), TightBeamError> {
-	let spki = org_spki(org);
-	if selector & 1 == 0 {
-		org.acl.deny(spki);
-	} else {
-		org.acl.allow(spki);
+	if let Some(key) = org_key(org) {
+		if selector & 1 == 0 {
+			org.acl.deny(key);
+		} else {
+			org.acl.allow(key);
+		}
 	}
 
 	trace.event(events::GATE_MUTATED)?;
@@ -387,8 +393,8 @@ async fn emit_cluster_work(
 
 /// Predicts one hop against `org`'s export boundary through its shadow.
 ///
-/// SPKI DER is borrowed from the identity bundle, encoded once in the
-/// fixtures rather than re-encoded per prediction.
+/// The canonical key is borrowed from the identity bundle, which the
+/// fixtures read once rather than per prediction.
 fn shadow_predict(
 	org: &OrgNode,
 	target: &Urn<'static>,
@@ -398,7 +404,7 @@ fn shadow_predict(
 	org.predict(&AccessAttempt {
 		target,
 		caller_cert: identity.map(|id| id.cert.as_ref()),
-		caller_spki: identity.map(|id| id.spki.as_ref()),
+		caller_key: identity.and_then(|id| id.canonical.as_ref()),
 		relayed,
 	})
 }
@@ -474,13 +480,9 @@ async fn submit_csr(
 
 	let target = servlet_urn("csr");
 	let predicted = shadow_predict(org, &target, Some(&org.certs), false);
-	let spki = org_spki(org);
+	let spki = org.certs.cert.tbs_certificate.subject_public_key_info.to_der()?;
 
-	let req = CsrRequest {
-		spki: spki.to_vec(),
-		colony: colony_urn(org.name).to_string(),
-		cn: format!("csr-{}", selector),
-	};
+	let req = CsrRequest { spki, colony: colony_urn(org.name).to_string(), cn: format!("csr-{}", selector) };
 	let inner = compose! { V0: id: "colony-fuzz-csr-inner", order: 0u64, message: req }?;
 
 	emit_cluster_work(
