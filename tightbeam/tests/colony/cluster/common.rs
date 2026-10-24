@@ -229,6 +229,59 @@ impl CertificateTrust for SwitchTrust {
 	}
 }
 
+/// A peer trust store that enrolls both certificates of a gateway that rotated
+/// its certificate under one key, the enrolled one first.
+///
+/// Each lookup answers from `enrolled` when it holds an answer, and from
+/// `rotated` otherwise. A key therefore resolves to the enrolled certificate,
+/// and a `sid` that names the rotated certificate alone resolves to that one
+/// (RFC 5652 §5.3).
+#[derive(Debug)]
+pub struct RotatingTrust {
+	enrolled: Arc<dyn CertificateTrust>,
+	rotated: Arc<dyn CertificateTrust>,
+}
+
+impl RotatingTrust {
+	pub fn new(enrolled: Arc<dyn CertificateTrust>, rotated: Arc<dyn CertificateTrust>) -> Arc<Self> {
+		Arc::new(Self { enrolled, rotated })
+	}
+}
+
+impl CertificateValidation for RotatingTrust {
+	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
+		self.enrolled.evaluate(cert).or_else(|_| self.rotated.evaluate(cert))
+	}
+}
+
+impl CertificateTrust for RotatingTrust {
+	fn is_trusted(&self, cert: &Certificate) -> bool {
+		self.enrolled.is_trusted(cert) || self.rotated.is_trusted(cert)
+	}
+
+	fn verify_chain(&self, chain: &[Certificate]) -> Result<Arc<Certificate>, CertificateValidationError> {
+		self.enrolled.verify_chain(chain).or_else(|_| self.rotated.verify_chain(chain))
+	}
+
+	fn trust_anchor(&self, cert: &Certificate) -> Result<Arc<Certificate>, CertificateValidationError> {
+		self.enrolled.trust_anchor(cert).or_else(|_| self.rotated.trust_anchor(cert))
+	}
+
+	fn find_by_signer_identifier(&self, sid: &SignerIdentifier) -> Option<&PeerCertificate<ErasedSigning>> {
+		let enrolled = self.enrolled.find_by_signer_identifier(sid);
+		enrolled.or_else(|| self.rotated.find_by_signer_identifier(sid))
+	}
+
+	fn find_by_public_key(&self, spki: &SubjectPublicKeyInfoOwned) -> Option<&Certificate> {
+		let enrolled = self.enrolled.find_by_public_key(spki);
+		enrolled.or_else(|| self.rotated.find_by_public_key(spki))
+	}
+
+	fn to_policy_ref(&self) -> &dyn VerificationPolicy {
+		self.enrolled.to_policy_ref()
+	}
+}
+
 /// A [`colony_identity`] in the colony that [`test_colony_urn`] names.
 pub fn member_identity(cn: impl AsRef<str>) -> (Certificate, Secp256k1SigningKey) {
 	let cn = cn.as_ref();

@@ -1176,6 +1176,39 @@ pooled_mux! {
 			self.conn()?.complete_handshake().await
 		}
 
+		/// Takes this connection out of the pool and closes it, so no later
+		/// lease reaches the party that answered it.
+		///
+		/// A colony dial whose answer fails its proof ends the connection
+		/// here, in place of the drop that returns it to the pool (CWE-346).
+		///
+		/// - An exclusive lease closes its connection and gives back its slot.
+		/// - A mux lease evicts its entry, which every lease of the connection
+		///   shares, and drains the connection as an idle prune does.
+		#[cfg(feature = "colony")]
+		pub(crate) fn discard(mut self) {
+			if let Some(lease) = self.mux.take() {
+				self.pool.evict_mux(&self.addr, lease.id);
+
+				// The drain runs detached, as an idle prune's does. Its only
+				// failure is `ConnectionClosed`, which names a connection that
+				// is already closed.
+				rt::spawn(async move {
+					let _ = lease.handle.shutdown().await;
+				});
+			}
+
+			if let Some(client) = self.client.take() {
+				// Dropping the client closes its connection, so the connection
+				// leaves the live set.
+				drop(client);
+				self.pool.release_connection_count();
+
+				#[cfg(feature = "instrument")]
+				self.pool.emit_event(events::POOL_EVICTED);
+			}
+		}
+
 		/// Returns this lease's mux handle, with its activity recorded.
 		///
 		/// Every streaming entry point below needs the same two steps: refuse

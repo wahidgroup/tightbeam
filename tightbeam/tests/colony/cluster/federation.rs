@@ -6,11 +6,15 @@
 //! - Relay trails carry work around a dead direct address.
 //! - The `max_hops` clamp bounds the origin's sentinel budget.
 //! - A forward reaches only the gateway that signed the advertisement.
+//! - A forward reaches a gateway that rotated its certificate under one key.
 
 use super::common::*;
 use super::streaming::{pooled_cluster_client, start_stream_hive};
 use tightbeam::crypto::x509::policy::{CertificateValidation, DirectTrustValidator};
+use tightbeam::der::asn1::OctetString;
+use tightbeam::testing::TestCertificate;
 use tightbeam::utils::time::ManualClock;
+use tightbeam::x509::ext::pkix::SubjectKeyIdentifier;
 
 /// A dial address nothing listens on, so a dead direct trail fails fast.
 const DEAD_GATEWAY_ADDR: &[u8] = b"127.0.0.1:9";
@@ -396,6 +400,99 @@ tb_scenario! {
 
 			gateway_a.stop();
 			gateway_c.stop();
+			hive.stop();
+			Ok(())
+		}
+	}
+}
+
+/// Gateway B under the certificate it rotated to, beside gateway A, which
+/// imports B's routes.
+///
+/// - A's peer store enrolls B's certificate from before the rotation, and the rotated one after it.
+/// - The rotated certificate keeps B's key and names another key identifier,
+///   so B's advertisement names the rotated certificate alone.
+struct RotationCtx {
+	a: Arc<ClusterTestCerts>,
+	b: Arc<ClusterTestCerts>,
+	peers_of_a: Arc<dyn CertificateTrust>,
+	peers_of_b: Arc<dyn CertificateTrust>,
+}
+
+/// The certificate gateway B rotates to: B's key under a name of its own, and
+/// a `subjectKeyIdentifier` that another method than the crate's derived.
+fn rotated_certificate(key: &Secp256k1SigningKey) -> Certificate {
+	let colony = test_colony_urn().to_string();
+	let rotated = TestCertificate::with_cn_and_uri_sans(key, "Gateway B Rotated", &[&colony]);
+	let identifier = OctetString::new([0x52u8; 20]).expect("twenty octets wrap in an OctetString");
+	let rotated = TestCertificate::with_key_identifier(rotated, SubjectKeyIdentifier::from(identifier));
+
+	TestCertificate::signed_by(rotated, key)
+}
+
+fn rotation_ctx() -> RotationCtx {
+	let (cert_a, key_a) = member_identity("Gateway A");
+	let (enrolled, key_b) = member_identity("Gateway B");
+	let rotated = rotated_certificate(&key_b);
+	let trust = combined_trust(&[&cert_a, &rotated]);
+	let peers_of_a = RotatingTrust::new(combined_trust(&[&enrolled]), combined_trust(&[&rotated]));
+	let peers_of_b = combined_trust(&[&cert_a]);
+
+	RotationCtx {
+		a: Arc::new(GatewayCerts { cert: cert_a, key: key_a, trust: Arc::clone(&trust) }),
+		b: Arc::new(GatewayCerts { cert: rotated, key: key_b, trust }),
+		peers_of_a,
+		peers_of_b,
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterRotatedPeerHopSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
+			(PEER_ROUTES_AFTER_INSTALLS, exactly!(1), equals!(1u64)),
+			(WORK_SENT, exactly!(1)),
+			(events::CLUSTER_DIAL_REFUSED, exactly!(0)),
+			(events::CLUSTER_WORK_FORWARDED, exactly!(1)),
+			(WORK_ECHOED, exactly!(1), equals!(42u64))
+		]
+	}
+}
+
+// A gateway that rotated its certificate under one key keeps its name.
+//
+// B advertises to A under the rotated certificate, and A's peer store
+// resolves B's key to the certificate it enrolled before the rotation.
+//
+// - A keys the route it learns from the advertisement by B's name.
+// - B answers A's hop with the rotated certificate, and A names it by the
+//   same rule (CLUSTER_DIAL_REFUSED exactly 0).
+// - The work crosses to B and echoes (WORK_ECHOED).
+tb_scenario! {
+	name: cluster_peer_hop_admits_a_gateway_that_rotated_its_certificate,
+	spec: ClusterRotatedPeerHopSpec,
+	environment Hive {
+		context: rotation_ctx(),
+		start: |SetupEnv { trace, context: ctx }| async move {
+			start_ping_hive(trace, Arc::clone(&ctx.b), None).await
+		},
+		client: |HiveEnv { trace, context: ctx, hive }| async move {
+			let conf_a = federation_conf(&ctx.a, Arc::clone(&ctx.peers_of_a), vec![], 1);
+			let gateway_a = start_cluster(&trace, conf_a).await?;
+			let conf_b = federation_conf(&ctx.b, Arc::clone(&ctx.peers_of_b), vec![gateway_a.addr().to_string()], 1);
+			let gateway_b = start_cluster(&trace, conf_b).await?;
+
+			hive.register_with_cluster(gateway_b.addr()).await?;
+
+			let learned = wait_for_type_routes(&gateway_a, "ping", 1, 100, Duration::from_millis(100)).await;
+			trace.event_with(PEER_ROUTES_AFTER_INSTALLS, &[], learned as u64)?;
+
+			record_ping_echo(&trace, &ctx.a, &gateway_a).await?;
+
+			gateway_b.stop();
+			gateway_a.stop();
 			hive.stop();
 			Ok(())
 		}

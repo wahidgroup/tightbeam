@@ -24,7 +24,8 @@ pub(crate) enum ExpectedSigner<'a> {
 	Gateway {
 		/// The slate key of the gateway that must answer.
 		gateway_id: &'a [u8],
-		/// The configuration whose peer trust names the gateway that answers.
+		/// The configuration whose [`ClusterConfig::peer_identity`] names the
+		/// gateway that answers.
 		config: &'a ClusterConfig,
 	},
 	/// A hive, or a servlet of a hive, named by the [`SignerIdentifier`] its
@@ -82,6 +83,8 @@ impl<'a> BoundDial<'a> {
 	///    can send anything.
 	/// 2. Ask [`ExpectedSigner::admits`] about the certificate the answer presented.
 	/// 3. Refuse an answer with no certificate, or one the expected signer does not name.
+	/// 4. Take a refused answer's connection out of the pool, so a later dial
+	///    of the address meets the party that answers it then.
 	///
 	/// # Errors
 	///
@@ -100,6 +103,7 @@ impl<'a> BoundDial<'a> {
 
 		let admitted = client.peer_certificate().is_some_and(|answer| self.expected.admits(answer));
 		if !admitted {
+			client.discard();
 			return Err(ClusterError::PeerMismatch);
 		}
 
@@ -134,7 +138,6 @@ mod tests {
 		let expected = ExpectedSigner::Hive(Arc::new(registered.signer_identifier()?));
 
 		let admitted = expected.admits(&registered);
-
 		assert!(admitted);
 		Ok(())
 	}
@@ -147,7 +150,6 @@ mod tests {
 		let expected = ExpectedSigner::Hive(Arc::new(registered.signer_identifier()?));
 
 		let admitted = expected.admits(&other_certificate());
-
 		assert!(!admitted);
 		Ok(())
 	}

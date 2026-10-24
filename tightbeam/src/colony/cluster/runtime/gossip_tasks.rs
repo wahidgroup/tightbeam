@@ -20,7 +20,6 @@ use crate::builder::frame::FrameBuilder;
 use crate::builder::TypeBuilder;
 use crate::colony::cluster::gossip::LocalClaimGuard;
 use crate::colony::cluster::peer::AdmittedPeerAd;
-use crate::colony::cluster::peer::ColonyCertificate;
 use crate::colony::cluster::runtime::advertise::{Advertiser, SignedAdvertisement};
 use crate::colony::cluster::runtime::bounds::{ClusterDigest, ColonyDialProtocol, GatewayRuntimeCtx};
 use crate::colony::cluster::runtime::hop::{FloodClient, HivePlane, PeerPlane};
@@ -778,7 +777,7 @@ impl<P: ColonyDialProtocol> FloodBeat<P> {
 			// peer dies, so promotion waits for the reply. The membership
 			// proof alone would reset the failure count every beat and hold a
 			// dead peer.
-			let peer_id = client.peer_certificate().and_then(ColonyCertificate::fingerprint_id);
+			let peer_id = client.peer_certificate().and_then(|answer| self.config.peer_identity(answer));
 			if self.config.peer.table.promote(peer, peer_id.as_deref(), now)? {
 				self.trace
 					.event(CLUSTER_PEER_DISCOVERED)?
@@ -1595,6 +1594,8 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 
 #[cfg(test)]
 mod tests {
+	use core::num::NonZeroUsize;
+
 	use super::*;
 	use crate::colony::cluster::{CertificateSpec, Cluster, ClusterGateway, ClusterTlsConfig, PeerConfig};
 	use crate::colony::common::ColonyNamespace;
@@ -1881,6 +1882,105 @@ mod tests {
 		let round = beat.reconcile_round::<Sha3_256>(address, peer).await;
 
 		assert!(matches!(round, Err(LoopFault::Registry(ClusterError::LockPoisoned))));
+		Ok(())
+	}
+
+	/// The name of the authority that issues both certificates of
+	/// [`SignerRotation`].
+	const AUTHORITY: &str = "Signer Authority";
+
+	/// One gateway key under two certificates that one authority issued, and
+	/// the gossip arm of a colony member that enrolls the authority and the
+	/// first certificate alone.
+	///
+	/// - `enrolled` serves under the enrolled certificate, and `rotated` under the second.
+	/// - The member's discovery table holds one tried entry per signer.
+	struct SignerRotation {
+		beat: FloodBeat<TokioListener>,
+		enrolled: ClusterGateway<TokioListener>,
+		rotated: ClusterGateway<TokioListener>,
+	}
+
+	impl SignerRotation {
+		async fn start() -> Self {
+			let colony = ColonyNamespace::default().colony("main");
+			let colony = colony.expect("a literal colony name").to_string();
+			let authority_key = Secp256k1SigningKey::from_bytes(&[6u8; 32].into()).expect("a valid fixture scalar");
+			let gateway_key = Secp256k1SigningKey::from_bytes(&[7u8; 32].into()).expect("a valid fixture scalar");
+			let member_key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
+			let authority = TestCertificate::authority(&authority_key, AUTHORITY);
+			let authority = authority.expect("the authority issues its certificate");
+			let issue = |cn: &str| {
+				let uris = [colony.as_str()];
+				let issued = TestCertificate::issued_with_uri_sans(&authority_key, AUTHORITY, &gateway_key, cn, &uris);
+				issued.expect("the authority issues a gateway certificate")
+			};
+
+			let enrolled = issue("Signer Gateway");
+			let rotated = issue("Signer Gateway Rotated");
+			let member = TestCertificate::with_uri_sans(&member_key, &[&colony]);
+
+			let builder = CertificateTrustBuilder::from(Secp256k1Policy::default());
+			let builder = builder.with_certificate(authority).expect("the store admits it");
+			let builder = builder.with_certificate(enrolled.clone()).expect("the store admits it");
+			let peer_trust: Arc<dyn CertificateTrust> = Arc::new(builder.build());
+
+			let spec = CertificateSpec::Built(Box::new(member.clone()));
+			let tls = ClusterTlsConfig::new(spec, Arc::new(Secp256k1KeyProvider::from(member_key)));
+			let tls = tls.expect("the member certificate must decode").with_peer_trust(peer_trust);
+			let config = ClusterConfig::builder(tls).with_tried_per_signer(NonZeroUsize::MIN).build();
+			let config = Arc::new(config);
+
+			let trace = Arc::new(TraceCollector::default());
+			let pool_config = &config.pool_config;
+			let pools = pool_config.build_cluster_pools::<TokioListener>(&config.tls, &config.clock);
+			let peer_pool = pools.expect("the pools build").peer.expect("a peer trust builds a peer pool");
+			let peer_plane = PeerPlane::new(peer_pool, Arc::clone(&config), Arc::clone(&trace));
+			let registry = Arc::new(ServletRegistry::new(config.pheromone.clone(), Arc::clone(&config.clock)));
+			let beat = FloodBeat::new(config, peer_plane, registry, trace, Arc::default());
+
+			Self {
+				beat: beat.expect("a colony member is in a flood"),
+				enrolled: Self::serve(enrolled, &gateway_key, &member).await,
+				rotated: Self::serve(rotated, &gateway_key, &member).await,
+			}
+		}
+
+		/// A gateway that serves under `certificate` and answers the reconcile
+		/// round of `member`, which its peer trust enrolls.
+		async fn serve(
+			certificate: Certificate,
+			key: &Secp256k1SigningKey,
+			member: &Certificate,
+		) -> ClusterGateway<TokioListener> {
+			let spec = CertificateSpec::Built(Box::new(certificate));
+			let tls = ClusterTlsConfig::new(spec, Arc::new(Secp256k1KeyProvider::from(key.clone())));
+			let enrolled = CertificateTrustBuilder::from(Secp256k1Policy::default()).with_certificate(member.clone());
+			let peer_trust: Arc<dyn CertificateTrust> = Arc::new(enrolled.expect("the member enrolls").build());
+			let tls = tls.expect("the gateway certificate must decode").with_peer_trust(peer_trust);
+
+			let trace = Arc::new(TraceCollector::default());
+			let gateway = ClusterGateway::start(trace, ClusterConfig::new(tls)).await;
+			gateway.expect("the gateway starts")
+		}
+	}
+
+	// A gateway's name in the discovery table is the certificate the member
+	// enrolls for its key, so one gateway that presents a second certificate
+	// of that key at another address takes no second slot under the signer
+	// cap (CWE-770).
+	#[tokio::test]
+	async fn a_rotated_certificate_counts_as_the_signer_its_key_enrolls() -> Result<(), TightBeamError> {
+		let rotation = SignerRotation::start().await;
+		let beat = &rotation.beat;
+		let enrolled = *rotation.enrolled.addr();
+		let rotated = *rotation.rotated.addr();
+
+		let first = beat.reconcile_round::<Sha3_256>(enrolled, dial(&enrolled.to_string())).await;
+		let second = beat.reconcile_round::<Sha3_256>(rotated, dial(&rotated.to_string())).await;
+		let learned = beat.config.peer.table.learned()?;
+		assert_eq!([first.ok(), second.ok()], [Some(Round::Settled); 2]);
+		assert_eq!(learned, (0, 1));
 		Ok(())
 	}
 }

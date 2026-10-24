@@ -273,23 +273,31 @@ impl ClusterConfig {
 			return Err(VerifyRefusal::WrongPlane);
 		}
 
-		let fingerprint = signer_cert
-			.fingerprint_id()
-			.map(VerifiedSignerId)
-			.ok_or(VerifyRefusal::Unidentifiable)?;
+		// A peer's slate key is its name under `Self::peer_identity`, the rule
+		// a hop names its answer by, so a route keys the gateway a hop admits.
+		let fingerprint = match party {
+			Party::Peer => self.peer_identity(signer_cert),
+			Party::FirstParty | Party::Untrusted => signer_cert.fingerprint_id(),
+		};
 
+		let fingerprint = fingerprint.map(VerifiedSignerId).ok_or(VerifyRefusal::Unidentifiable)?;
 		Ok(VerifiedControlFrame { frame, signer_cert, signature, party, fingerprint })
 	}
 
-	/// The slate key of the gateway that presented `cert` in a handshake.
+	/// The slate key of the gateway that holds `cert`'s key, the one name a
+	/// peer gateway goes by: the fingerprint of the certificate that
+	/// [`ClusterTlsConfig::peer_dial_trust`] holds for that key.
 	///
-	/// A control frame keys its signer by the certificate `peer_trust` holds
-	/// for the signing key. The presented certificate resolves to that enrolled
-	/// one first, so a gateway that rotated its certificate under one key keeps
-	/// the key its advertisements carry. It is `None` with no peer trust, or
-	/// for a key the store does not hold.
+	/// - A route keys the gateway that signed its advertisement by it.
+	/// - A hop names the certificate its answer presents by it.
+	/// - The discovery table counts a signer by it.
+	/// - A gateway that rotated its certificate under one key keeps one name.
+	///
+	/// It is `None` with no such store, or for a key outside it.
+	///
+	/// [`ClusterTlsConfig::peer_dial_trust`]: crate::colony::cluster::ClusterTlsConfig::peer_dial_trust
 	pub(crate) fn peer_identity(&self, cert: &Certificate) -> Option<SharedId> {
-		let trust = self.tls.peer_trust.as_deref()?;
+		let trust = self.tls.peer_dial_trust()?;
 		let enrolled = trust.enrolled_certificate(cert)?;
 		enrolled.fingerprint_id()
 	}

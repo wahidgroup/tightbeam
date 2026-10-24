@@ -6,6 +6,7 @@
 //!
 //! - [`Advertiser`] holds the pool for that dial, and its unbound connect is private to this module.
 //! - The dial carries a [`SignedAdvertisement`] alone, which [`ClusterConfig::mint_ad_frame`] alone builds.
+//! - The connection stays pooled only when the gateway that answered proves it is a flood member.
 //! - Every other dial of a route-named target goes through a [`BoundDial`],
 //!   and every gossip dial through a membership proof.
 //!
@@ -79,12 +80,16 @@ impl ClusterConfig {
 /// The pool a gateway sends its direct advertisements on.
 pub(crate) struct Advertiser<P: Protocol> {
 	pool: Arc<ClusterPool<P>>,
+	/// The configuration whose flood decides whether a connection stays
+	/// pooled.
+	config: Arc<ClusterConfig>,
 }
 
 impl<P: Protocol> Advertiser<P> {
-	/// An advertiser that dials on `pool`.
-	pub(crate) fn new(pool: Arc<ClusterPool<P>>) -> Self {
-		Self { pool }
+	/// An advertiser that dials on `pool`, and keeps pooled only a connection
+	/// to a member of `config`'s flood.
+	pub(crate) fn new(pool: Arc<ClusterPool<P>>, config: Arc<ClusterConfig>) -> Self {
+		Self { pool, config }
 	}
 }
 
@@ -92,8 +97,9 @@ impl<P: ColonyDialProtocol> Advertiser<P> {
 	/// Sends `advertisement` to the gateway at `peer_addr` and returns the
 	/// status it answered.
 	///
-	/// The caller signs one advertisement per beat and fans it out, so one
-	/// signature serves every dial.
+	/// - The caller signs one advertisement per beat and fans it out, so one signature serves every dial.
+	/// - The answer is unproven, so the connection stays pooled only when
+	///   [`ClusterConfig::flood_member`] proves the gateway that answered.
 	///
 	/// # Errors
 	///
@@ -107,8 +113,13 @@ impl<P: ColonyDialProtocol> Advertiser<P> {
 	) -> Result<TransitStatus, ClusterError> {
 		let signed_frame = advertisement.frame().clone();
 		let mut client = self.connect_unbound(peer_addr).await?;
-		let response = client.emit(signed_frame, None).await?.ok_or(ClusterError::NoResponse)?;
+		let replied = client.emit(signed_frame, None).await;
+		let member = client.peer_certificate().and_then(|answer| self.config.flood_member(answer));
+		if member.is_none() {
+			client.discard();
+		}
 
+		let response = replied?.ok_or(ClusterError::NoResponse)?;
 		let decoded: PeerAdvertisementResponse = decode(response.message())?;
 		Ok(decoded.status)
 	}

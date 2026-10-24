@@ -12,7 +12,8 @@
 //! - A gossip dial goes through [`PeerPlane::connect_member`], which proves the answer is a flood member.
 //! - A direct advertisement goes through [`PeerPlane::advertiser`], which
 //!   hands out the one unbound dial, so its client talks to whichever gateway
-//!   answers.
+//!   answers. Its connection stays pooled only when that gateway is a flood
+//!   member.
 
 use std::sync::Arc;
 
@@ -76,8 +77,8 @@ impl<P: Protocol> HivePlane<P> {
 	}
 
 	/// The peer plane over this plane's pool, for a gateway that configures
-	/// no peer pool. It names each gateway that answers by `config`'s peer
-	/// trust.
+	/// no peer pool. It names each gateway that answers by `config`'s hive
+	/// trust, through [`ClusterConfig::peer_identity`].
 	pub(crate) fn peers(&self, config: Arc<ClusterConfig>) -> PeerPlane<P> {
 		PeerPlane::new(Arc::clone(&self.pool), config, Arc::clone(&self.trace))
 	}
@@ -118,8 +119,8 @@ impl<P: Protocol> Clone for PeerPlane<P> {
 
 impl<P: Protocol> PeerPlane<P> {
 	/// A plane that dials peer gateways on `pool`, names each gateway that
-	/// answers by `config`'s peer trust, and records each refused hop on
-	/// `trace`.
+	/// answers through [`ClusterConfig::peer_identity`] of `config`, and
+	/// records each refused hop on `trace`.
 	pub(crate) fn new(pool: Arc<ClusterPool<P>>, config: Arc<ClusterConfig>, trace: Arc<TraceCollector>) -> Self {
 		Self { pool, config, trace }
 	}
@@ -136,7 +137,7 @@ impl<P: Protocol> PeerPlane<P> {
 	/// The one unbound dial on this plane's pool, which a direct
 	/// advertisement sends through.
 	pub(crate) fn advertiser(&self) -> Advertiser<P> {
-		Advertiser::new(Arc::clone(&self.pool))
+		Advertiser::new(Arc::clone(&self.pool), Arc::clone(&self.config))
 	}
 }
 
@@ -198,6 +199,8 @@ impl<P: ColonyDialProtocol> PeerPlane<P> {
 	///   about the address, where an `Err` is a failed dial.
 	/// - The proof is asked on every call, so a pooled connection to a gateway
 	///   the trust store has since dropped yields `None`.
+	/// - An answer outside the flood takes its connection out of the pool, so a
+	///   later dial of the address meets the party that answers it then.
 	///
 	/// # Errors
 	///
@@ -209,13 +212,9 @@ impl<P: ColonyDialProtocol> PeerPlane<P> {
 		let mut client = self.pool.connect(address).await?;
 		client.complete_handshake().await?;
 
-		let Some(flood) = self.config.flood() else {
-			return Ok(None);
-		};
-		let Some(certificate) = client.peer_certificate() else {
-			return Ok(None);
-		};
-		let Ok(member) = flood.member(certificate) else {
+		let member = client.peer_certificate().and_then(|answer| self.config.flood_member(answer));
+		let Some(member) = member else {
+			client.discard();
 			return Ok(None);
 		};
 
@@ -286,5 +285,283 @@ impl<P: ColonyDialProtocol> Hop<'_, P> {
 			Ok(None) => Err(ClusterError::NoResponse),
 			Err(e) => Err(ClusterError::from(e)),
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::colony::cluster::peer::ColonyCertificate;
+	use crate::colony::cluster::runtime::advertise::SignedAdvertisement;
+	use crate::colony::cluster::{CertificateSpec, Cluster, ClusterGateway, ClusterTlsConfig, PeerAddress, SharedId};
+	use crate::colony::common::ColonyNamespace;
+	use crate::crypto::hash::Sha3_256;
+	use crate::crypto::key::Secp256k1KeyProvider;
+	use crate::crypto::policy::Secp256k1Policy;
+	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
+	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
+	use crate::crypto::x509::utils::CertificateExt;
+	use crate::testing::TestCertificate;
+	use crate::transport::client::PoolConfig;
+	use crate::transport::error::TransportError;
+	use crate::transport::handshake::negotiation::TransportOffer;
+	use crate::transport::tcp::r#async::TokioListener;
+	use crate::urn::Urn;
+
+	type Gateway = ClusterGateway<TokioListener, Sha3_256>;
+	type TestResult = Result<(), Box<dyn core::error::Error>>;
+
+	/// A gateway certificate on the fixed scalar `seed`, beside its key, that
+	/// carries each of `colonies` as a URI Subject Alternative Name.
+	fn identity(seed: u8, cn: &str, colonies: &[&str]) -> (Certificate, Secp256k1SigningKey) {
+		let key = Secp256k1SigningKey::from_bytes(&[seed; 32].into()).expect("the fixture scalar is a valid key");
+		let certificate = TestCertificate::with_cn_and_uri_sans(&key, cn, colonies);
+		(certificate, key)
+	}
+
+	/// The TLS material of a gateway that serves under `identity`.
+	fn tls_of(identity: &(Certificate, Secp256k1SigningKey)) -> ClusterTlsConfig {
+		let (certificate, key) = identity;
+		let spec = CertificateSpec::Built(Box::new(certificate.clone()));
+		let provider = Arc::new(Secp256k1KeyProvider::from(key.clone()));
+		ClusterTlsConfig::new(spec, provider).expect("the fixture certificate decodes")
+	}
+
+	/// A gateway that serves under `identity` on a loopback port, and accepts
+	/// a multiplexed dial.
+	async fn serve(identity: &(Certificate, Secp256k1SigningKey)) -> Gateway {
+		let mut config = ClusterConfig::new(tls_of(identity));
+		config.pool_config.mux_offer = Some(Arc::new(TransportOffer::mux(8)));
+
+		let trace = Arc::new(TraceCollector::default());
+		Gateway::start(trace, config).await.expect("a gateway binds a loopback port")
+	}
+
+	/// The dial target of the socket `gateway` listens on.
+	fn target_of(gateway: &Gateway) -> DialTarget {
+		DialTarget::Socket(PeerAddress::from(gateway.addr().0))
+	}
+
+	/// The signer identifier a registration that names `certificate` carries.
+	fn signer_of(certificate: &Certificate) -> Arc<SignerIdentifier> {
+		let signer = certificate.signer_identifier();
+		Arc::new(signer.expect("the fixture certificate names its signer"))
+	}
+
+	/// A gateway with no peer plane, which dials its peers on its hive pool,
+	/// and the two gateways it can reach there.
+	///
+	/// - Its hive trust holds the member and the stranger, so a handshake with either completes.
+	/// - The member carries the colony URN of the dialing gateway, and the stranger carries none.
+	struct Dialer {
+		config: Arc<ClusterConfig>,
+		pool: Arc<ClusterPool<TokioListener>>,
+		plane: HivePlane<TokioListener>,
+		member_certificate: Certificate,
+		stranger_certificate: Certificate,
+		member: Gateway,
+		stranger: Gateway,
+	}
+
+	impl Dialer {
+		/// Starts the member and the stranger, and builds the dialing
+		/// gateway's hive pool on `pool`.
+		async fn start(pool: PoolConfig) -> Self {
+			let colony = ColonyNamespace::default().colony("main");
+			let colony = colony.expect("a static colony name mints").to_string();
+			let member = identity(3, "Member Gateway", &[&colony]);
+			let stranger = identity(4, "Stranger Gateway", &[]);
+			let dialing = identity(5, "Dialing Gateway", &[&colony]);
+
+			let builder = CertificateTrustBuilder::from(Secp256k1Policy::default());
+			let builder = builder.with_certificate(member.0.clone()).expect("the store admits it");
+			let builder = builder.with_certificate(stranger.0.clone()).expect("the store admits it");
+			let hive_trust: Arc<dyn CertificateTrust> = Arc::new(builder.build());
+
+			let mut config = ClusterConfig::new(tls_of(&dialing).with_hive_trust(Some(hive_trust)));
+			config.pool_config = pool;
+
+			let pool_config = &config.pool_config;
+			let pools = pool_config.build_cluster_pools::<TokioListener>(&config.tls, &config.clock);
+			let pools = pools.expect("the hive pool builds");
+			let trace = Arc::new(TraceCollector::default());
+			let plane = HivePlane::new(Arc::clone(&pools.hive), trace);
+
+			Self {
+				config: Arc::new(config),
+				pool: pools.hive,
+				plane,
+				member_certificate: member.0.clone(),
+				stranger_certificate: stranger.0.clone(),
+				member: serve(&member).await,
+				stranger: serve(&stranger).await,
+			}
+		}
+
+		/// A hive pool that holds one connection, which it offers for
+		/// multiplexing when `multiplexed` holds.
+		fn one_connection(multiplexed: bool) -> PoolConfig {
+			let mux_offer = multiplexed.then(|| Arc::new(TransportOffer::mux(8)));
+			PoolConfig { idle_timeout: None, max_connections: 1, mux_offer }
+		}
+
+		/// The plane this gateway dials its peers on, which is its hive pool.
+		fn peers(&self) -> PeerPlane<TokioListener> {
+			self.plane.peers(Arc::clone(&self.config))
+		}
+
+		/// A servlet hop to `gateway`, bound to the signer that a registration
+		/// of the member names.
+		fn member_hop_to<'d>(&'d self, gateway: &Gateway) -> Hop<'d, TokioListener> {
+			self.plane.servlet(target_of(gateway), signer_of(&self.member_certificate))
+		}
+
+		/// A servlet hop to the stranger, bound to the signer that its own
+		/// certificate names, so the stranger's answer proves it.
+		fn stranger_hop(&self) -> Hop<'_, TokioListener> {
+			let signer = signer_of(&self.stranger_certificate);
+			self.plane.servlet(target_of(&self.stranger), signer)
+		}
+
+		/// The slate key a route of the member carries.
+		fn member_name(&self) -> SharedId {
+			let name = self.member_certificate.fingerprint_id();
+			name.expect("the member certificate has a fingerprint")
+		}
+
+		/// A signed advertisement of this gateway, of no types.
+		async fn advertisement(&self) -> SignedAdvertisement {
+			let types: Vec<Urn<'static>> = Vec::new();
+			let minted = self.config.mint_ad_frame::<Sha3_256>(b"127.0.0.1:1", types).await;
+			minted.expect("the dialing gateway signs its advertisement")
+		}
+	}
+
+	// A refused answer leaves the pool, so a later dial of the address meets
+	// whichever party answers it then.
+	#[tokio::test]
+	async fn a_refused_hop_leaves_the_pool() -> TestResult {
+		let dialer = Dialer::start(PoolConfig::default()).await;
+
+		let refused = dialer.member_hop_to(&dialer.stranger).connect().await;
+		let pooled = dialer.pool.try_acquire(dialer.stranger.addr())?;
+		assert!(matches!(refused, Err(ClusterError::PeerMismatch)));
+		assert!(pooled.is_none());
+		Ok(())
+	}
+
+	/// Dials the stranger and then the member on `pool`, each bound to the
+	/// signer of the member, and returns both answers.
+	async fn refuse_then_admit(pool: PoolConfig) -> [Result<PooledClient<TokioListener>, ClusterError>; 2] {
+		let dialer = Dialer::start(pool).await;
+
+		let refused = dialer.member_hop_to(&dialer.stranger).connect().await;
+		let admitted = dialer.member_hop_to(&dialer.member).connect().await;
+		[refused, admitted]
+	}
+
+	// A refused answer gives back the slot of its connection, so a pool of one
+	// connection still reaches the party a dial names.
+	#[tokio::test]
+	async fn a_refused_hop_gives_back_its_slot() -> TestResult {
+		let [refused, admitted] = refuse_then_admit(Dialer::one_connection(false)).await;
+
+		assert!(matches!(refused, Err(ClusterError::PeerMismatch)));
+		assert!(admitted.is_ok());
+		Ok(())
+	}
+
+	// A refused multiplexed answer takes its entry out of the pool and gives
+	// back its slot.
+	#[tokio::test]
+	async fn a_refused_multiplexed_hop_gives_back_its_slot() -> TestResult {
+		let [refused, admitted] = refuse_then_admit(Dialer::one_connection(true)).await;
+		assert!(matches!(refused, Err(ClusterError::PeerMismatch)));
+		assert!(admitted.is_ok());
+		Ok(())
+	}
+
+	// A refused multiplexed answer drains and closes the connection that every
+	// lease of it shares, so a lease that holds it sends nothing further.
+	#[tokio::test]
+	async fn a_refused_multiplexed_answer_drains_its_connection() -> TestResult {
+		let dialer = Dialer::start(Dialer::one_connection(true)).await;
+		let mut held = dialer.stranger_hop().connect().await?;
+		let refused = dialer.member_hop_to(&dialer.stranger).connect().await;
+
+		tokio::task::yield_now().await;
+
+		let emitted = held.emit(Frame::v0(b"after-refusal", Vec::new()), None).await;
+		let ended = matches!(emitted, Err(TransportError::Draining | TransportError::ConnectionClosed));
+		assert!(matches!(refused, Err(ClusterError::PeerMismatch)));
+		assert!(ended);
+		Ok(())
+	}
+
+	// A gossip dial that a gateway outside the flood answers leaves the pool.
+	#[tokio::test]
+	async fn a_gossip_dial_answered_outside_the_flood_leaves_the_pool() -> TestResult {
+		let dialer = Dialer::start(PoolConfig::default()).await;
+
+		let answered = dialer.peers().connect_member(*dialer.stranger.addr()).await?;
+		let pooled = dialer.pool.try_acquire(dialer.stranger.addr())?;
+		assert!(answered.is_none());
+		assert!(pooled.is_none());
+		Ok(())
+	}
+
+	// An advertisement goes to whichever gateway answers, and the connection
+	// leaves the pool when that gateway is outside the flood.
+	#[tokio::test]
+	async fn an_advertisement_answered_outside_the_flood_leaves_the_pool() -> TestResult {
+		let dialer = Dialer::start(PoolConfig::default()).await;
+		let advertisement = dialer.advertisement().await;
+		let advertiser = dialer.peers().advertiser();
+
+		advertiser.advertise(*dialer.stranger.addr(), &advertisement).await?;
+		let pooled = dialer.pool.try_acquire(dialer.stranger.addr())?;
+
+		assert!(pooled.is_none());
+		Ok(())
+	}
+
+	// An advertisement that a flood member answers keeps its connection
+	// pooled, so the gossip round that follows it reuses the connection.
+	#[tokio::test]
+	async fn an_advertisement_answered_by_a_member_stays_pooled() -> TestResult {
+		let dialer = Dialer::start(PoolConfig::default()).await;
+		let advertisement = dialer.advertisement().await;
+		let advertiser = dialer.peers().advertiser();
+		advertiser.advertise(*dialer.member.addr(), &advertisement).await?;
+
+		let pooled = dialer.pool.try_acquire(dialer.member.addr())?;
+		assert!(pooled.is_some());
+		Ok(())
+	}
+
+	// A gateway with no peer plane names the peer it dials by its hive trust,
+	// the store its hive pool verifies the handshake against.
+	#[tokio::test]
+	async fn a_peer_hop_without_a_peer_plane_admits_the_gateway_its_hive_trust_names() -> TestResult {
+		let dialer = Dialer::start(PoolConfig::default()).await;
+		let peers = dialer.peers();
+		let member = dialer.member_name();
+
+		let admitted = peers.hop(target_of(&dialer.member), &member).connect().await;
+		assert!(admitted.is_ok());
+		Ok(())
+	}
+
+	// A peer hop with no peer plane refuses a stranger at the address its
+	// route names, though the hive trust admits its handshake (CWE-346).
+	#[tokio::test]
+	async fn a_peer_hop_without_a_peer_plane_refuses_a_stranger() -> TestResult {
+		let dialer = Dialer::start(PoolConfig::default()).await;
+		let peers = dialer.peers();
+		let member = dialer.member_name();
+
+		let refused = peers.hop(target_of(&dialer.stranger), &member).connect().await;
+		assert!(matches!(refused, Err(ClusterError::PeerMismatch)));
+		Ok(())
 	}
 }

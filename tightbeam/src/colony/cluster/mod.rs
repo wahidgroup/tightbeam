@@ -331,7 +331,11 @@ impl ClusterTlsConfig {
 		self
 	}
 
-	/// The store a dial to a peer gateway is verified against.
+	/// The store that names a peer gateway this gateway dials.
+	///
+	/// - A dial to a peer verifies its handshake against it.
+	/// - The flood reads its members from it.
+	/// - [`ClusterConfig::peer_identity`] names a peer by it.
 	///
 	/// A configured peer plane keeps peer dials on `peer_trust`. A gateway with
 	/// no peer plane dials its peers on the hive pool, so `hive_trust` answers
@@ -943,9 +947,7 @@ mod tests {
 	#[test]
 	fn from_identity_installs_an_own_signer_purpose_under_the_purposes_that_name_it() -> Result<(), TightBeamError> {
 		let key_purposes = KeyPurposes { signer: OWN_SIGNER, ..KeyPurposes::HOUSE };
-
 		ClusterTlsConfig::from_identity(identity_naming(Some(OWN_SIGNER)), key_purposes)?;
-
 		Ok(())
 	}
 
@@ -954,7 +956,6 @@ mod tests {
 	#[test]
 	fn from_identity_refuses_an_own_signer_purpose_under_the_house_purposes() {
 		let installed = ClusterTlsConfig::from_identity(identity_naming(Some(OWN_SIGNER)), KeyPurposes::HOUSE);
-
 		let excluded = matches!(installed, Err(ExcludedKeyPurpose));
 		assert!(excluded);
 	}
@@ -994,7 +995,6 @@ mod tests {
 		let spec = CertificateSpec::Built(Box::new(certificate));
 
 		let refused = ClusterTlsConfig::new(spec, Arc::new(Secp256k1KeyProvider::from(key)));
-
 		let excluded = matches!(refused, Err(TightBeamError::CertificateValidationError(ExcludedKeyPurpose)));
 		assert!(excluded);
 		Ok(())

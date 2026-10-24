@@ -190,7 +190,8 @@ impl AdmittedPeerAd {
 	/// The checks run in this order:
 	///
 	/// 1. The signer MUST resolve on the peer plane, and the slate keys by its
-	///    certificate fingerprint rather than the claimed `gateway_addr`.
+	///    name under [`ClusterConfig::peer_identity`] rather than the claimed
+	///    `gateway_addr`.
 	/// 2. This gateway MUST be in a flood, and the signer MUST be a member of it.
 	/// 3. [`PeerConfig::admit_claim`] MUST admit the claimed address, and the
 	///    advertised types MUST be bare servlet types within the type cap.
@@ -410,6 +411,18 @@ impl ClusterConfig {
 
 		Some(Flood::new(&self.namespace, self.tls.peer_dial_trust()))
 	}
+
+	/// The proof that the gateway which presented `answer` in a handshake
+	/// belongs to this gateway's flood, or `None` when [`Flood::member`]
+	/// refuses it or this gateway is in no flood.
+	///
+	/// A gossip dial sends only on this proof, and an advertisement's
+	/// connection stays pooled only on it.
+	#[must_use]
+	pub(crate) fn flood_member(&self, answer: &Certificate) -> Option<FloodMember> {
+		let flood = self.flood()?;
+		flood.member(answer).ok()
+	}
 }
 
 impl ColonyNamespace {
@@ -456,7 +469,8 @@ impl ColonyNamespace {
 pub(crate) trait ColonyCertificate {
 	/// Stable peer key derived from the certificate itself.
 	///
-	/// Slates and misbehavior scoring key on this fingerprint, so one peer
+	/// Slates and misbehavior scoring key on this fingerprint of the
+	/// certificate that [`ClusterConfig::peer_identity`] resolves, so one peer
 	/// keeps one identity across every `gateway_addr` it advertises. The
 	/// answer is `None` when the trust store yields no fingerprint, so an
 	/// unidentifiable peer fails closed.
@@ -586,7 +600,6 @@ mod tests {
 		let origin: SharedId = Arc::from([1u8; 32].as_slice());
 		let relay: SharedId = Arc::from([2u8; 32].as_slice());
 		let ad = admitted_ad(&origin, "127.0.0.1:9000", &[ping_type()]);
-
 		let trail = some_trail(ad.relay_trail(&relay, relay_dial(), &PheromoneConfig::default()));
 
 		let expected_bucket: Vec<u8> = [origin.as_ref(), &[0u8], relay.as_ref()].concat();
