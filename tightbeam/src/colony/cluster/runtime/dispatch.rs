@@ -1,4 +1,4 @@
-//! Gateway request router for unary control frames.
+//! The gateway request router for unary control frames.
 //!
 //! [`GatewayRuntimeCtx::handle_request`] evaluates gate policies, decodes the
 //! request envelope, and dispatches by [`ClusterRequest`] variant.
@@ -8,13 +8,13 @@
 //!
 //! # Evaluation order
 //!
-//! 1. `evaluate_gates` on the request frame and session.
+//! 1. Run `evaluate_gates` on the request frame and the session.
 //! 2. Decode [`ClusterRequest`] from the frame body.
-//! 3. On [`ClusterRequest::Work`], `evaluate_export_gates` with
+//! 3. On [`ClusterRequest::Work`], run `evaluate_export_gates` with
 //!    [`HopBudget::is_relayed`] before [`GatewayRuntimeCtx::handle_work`].
 //! 4. Route every other variant to its handler, such as registration or gossip.
 
-use crate::colony::cluster::runtime::bounds::{ClusterDigest, ColonyDialProtocol, GatewayRuntimeCtx};
+use crate::colony::cluster::runtime::bounds::{ColonyDialProtocol, GatewayRuntimeCtx};
 use crate::colony::cluster::{ClusterWorkRequest, ClusterWorkResponse, HopBudget, WireHopBudget};
 use crate::colony::common::{reply_frame, ClusterRequest};
 use crate::decode;
@@ -24,7 +24,7 @@ use crate::TightBeamError;
 
 use crate::colony::cluster::runtime::gossip_tasks::GossipPipelineCtx;
 
-/// Outcome of gating and decoding one unary control frame.
+/// The outcome of the gates and the decode for one unary control frame.
 enum RequestAdmission {
 	/// The envelope the gates admitted.
 	Admitted(ClusterRequest),
@@ -40,7 +40,7 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 	///
 	/// - `frame`: admitted unary control frame
 	/// - `session`: caller identity facts for the connection
-	pub(crate) async fn handle_request<D: ClusterDigest>(
+	pub(crate) async fn handle_request(
 		self,
 		frame: Frame,
 		session: SessionContext,
@@ -57,8 +57,8 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 			ClusterRequest::ServletAddressUpdate(update) => self.handle_address_update(frame, update).await,
 			ClusterRequest::Work(request) => self.handle_work_request(frame, session, request).await,
 			ClusterRequest::AdvertisePeer(advertisement) => self.handle_peer_ad(frame, advertisement).await,
-			ClusterRequest::Gossip(rumor) => GossipPipelineCtx::from(self).relay::<D>(frame, rumor).await,
-			ClusterRequest::PublishGossip(body) => GossipPipelineCtx::from(self).publish::<D>(frame, body).await,
+			ClusterRequest::Gossip(rumor) => GossipPipelineCtx::from(self).relay(frame, rumor).await,
+			ClusterRequest::PublishGossip(body) => GossipPipelineCtx::from(self).publish(frame, body).await,
 			ClusterRequest::ReconcileGossip(reconciliation) => self.handle_reconcile(frame, reconciliation).await,
 		}
 	}
@@ -117,10 +117,11 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 		request: ClusterWorkRequest,
 	) -> Result<Option<Frame>, TightBeamError> {
 		let budget = HopBudget::from_wire(WireHopBudget::new(request.hops_remaining), self.config.peer.max_hops);
-		let export_status =
-			self.config
-				.evaluate_export_gates(&request.servlet_type, &session, budget.is_relayed(), &self.trace)?;
+		let target = &request.servlet_type;
+		let relayed = budget.is_relayed();
+		let config = &self.config;
 
+		let export_status = config.evaluate_export_gates(target, &session, relayed, &self.trace)?;
 		if export_status != TransitStatus::Ok {
 			return reply_frame(frame.metadata().id(), ClusterWorkResponse::err(export_status));
 		}

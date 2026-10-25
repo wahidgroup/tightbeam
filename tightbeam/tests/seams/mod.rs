@@ -1,7 +1,7 @@
-//! The seams an outside crate fills, each built here as such a crate must
+//! This module builds each seam an outside crate fills as such a crate must
 //! build it, through the public API of tightbeam alone.
 //!
-//! The parts the outside crate writes itself:
+//! The outside crate writes these parts itself:
 //!
 //! - a signature, ECDSA over secp256k1 under `ecdsa-with-SHA3-512`, whose
 //!   canonical form refuses a high `s`, as a [`SigningProvider`],
@@ -15,15 +15,23 @@
 //! The outside provider selects one house type through [`KeyWrapProvider`]:
 //! the AES-128 key wrap.
 //!
-//! The suites that run under it:
+//! These suites run under it:
 //!
 //! - [`hpke`] and [`cms`] run both handshakes, under a provider that names no HPKE suite.
 //! - [`kem`] brings a KEM whose private-key operation is not Diffie-Hellman.
 //! - [`curves`] brings the decoder of a curve, which refuses its off-curve encodings at each reader of keys.
+//! - [`colony`] runs two gateways, a hive, and its servlet, each signing and verifying under the provider.
+//! - [`floor`] holds the strength floor of a provider at the TCP transport, and refuses a mixed pair.
+//! - [`curve`] brings a provider on P-256, which runs both handshakes and a renewal on the curve of its own.
 
 #[cfg(feature = "transport-cms")]
 mod cms;
+mod colony;
+#[cfg(all(feature = "transport-cms", feature = "transport-hpke"))]
+mod curve;
 mod curves;
+#[cfg(all(feature = "transport-hpke", feature = "tcp", feature = "tokio"))]
+mod floor;
 mod frames;
 #[cfg(feature = "transport-hpke")]
 mod hpke;
@@ -57,7 +65,8 @@ use tightbeam::crypto::key::{DiffieHellman, KeyBackend, KeyError, Secp256k1KeyPr
 use tightbeam::crypto::policy::ProviderPolicy;
 use tightbeam::crypto::profiles::{
 	AeadProvider, Aes128Wrap, Aes256Wrap, CryptoProvider, CurveProvider, DefaultCryptoProvider, DigestProvider,
-	KdfProvider, KeyWrapAlgorithm, KeyWrapProvider, SecurityProfile, SigningProvider,
+	KdfProvider, KeyWrapAlgorithm, KeyWrapProvider, NoStrengthFloor, ProfileStrengthPolicy, SecurityProfile,
+	SigningProvider,
 };
 use tightbeam::crypto::secret::{SecretSlice, ToInsecure};
 use tightbeam::crypto::sign::{
@@ -83,9 +92,7 @@ use tightbeam::zeroize::Zeroizing;
 use tightbeam::{Version, ZeroizingBytes};
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use tightbeam::transport::handshake::negotiation::{NoStrengthFloor, ProfilePolicy};
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use tightbeam::transport::handshake::{Client, ClientFlow, Handshake, Server, ServerFlow};
+use tightbeam::transport::handshake::{Client, ClientFlow, Handshake, HandshakeProvider, Server, ServerFlow};
 
 /// The identifier of the outside KEM, under an arc of its own.
 const OUTSIDE_KEM: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.3.1");
@@ -147,8 +154,8 @@ impl SignatureAlgorithmIdentifier for OutsideSignature {
 	type Digest = Sha3_512;
 }
 
-/// The DER form with a low `s`. It refuses a high `s`, which the house form
-/// normalizes.
+/// The canonical form is the DER form with a low `s`. It refuses a high `s`,
+/// which the house form normalizes.
 impl CanonicalForm for OutsideSignature {
 	fn canonical(encoded: &[u8]) -> Result<Self, SignatureError> {
 		let signature = Signature::from_der(encoded)?;
@@ -157,7 +164,7 @@ impl CanonicalForm for OutsideSignature {
 	}
 }
 
-/// The secp256k1 key that verifies a [`OutsideSignature`].
+/// The secp256k1 key that verifies an [`OutsideSignature`].
 #[derive(Clone, Debug, PartialEq)]
 struct OutsideVerifyingKey(VerifyingKey);
 
@@ -206,8 +213,8 @@ impl EncodePublicKey for OutsideVerifyingKey {
 	}
 }
 
-/// HKDF over SHA3-512 under an identifier of the outside arc, apart from the
-/// house HKDF-SHA3-256.
+/// HKDF over SHA3-512 under an identifier of the outside arc, which differs
+/// from the house HKDF-SHA3-256.
 struct OutsideKdf;
 
 impl AssociatedOid for OutsideKdf {
@@ -374,7 +381,7 @@ fn an_outside_wrap_unwraps_into_a_buffer_of_its_key_size() -> Result<(), KeyErro
 	Ok(())
 }
 
-/// The provided `unwrap_into` refuses a buffer of another size than the key.
+/// The provided `unwrap_into` refuses a buffer whose size differs from the key.
 #[test]
 fn an_outside_wrap_refuses_a_buffer_of_another_size() {
 	let mut key = [0u8; 32];
@@ -384,7 +391,8 @@ fn an_outside_wrap_refuses_a_buffer_of_another_size() {
 }
 
 /// A provider an outside crate defines: its own signature, KDF, KEM, and
-/// AEAD cipher, beside the house AES-128 key wrap.
+/// AEAD cipher, beside the house AES-128 key wrap. Its AEAD key is 128 bits,
+/// below the default floor, so it names [`NoStrengthFloor`] as its floor.
 #[derive(Debug, Default, Clone, Copy)]
 struct OutsideProvider {
 	profile: OutsideProfile,
@@ -421,6 +429,10 @@ impl CryptoProvider for OutsideProvider {
 
 	fn profile(&self) -> &Self::Profile {
 		&self.profile
+	}
+
+	fn strength_floor() -> &'static (dyn ProfileStrengthPolicy + Send + Sync) {
+		&NoStrengthFloor
 	}
 }
 
@@ -569,22 +581,13 @@ fn outside_recipient(certificate: Certificate) -> KemRecipient<OutsideKem> {
 	KemRecipient::from_certificate(admitted).expect("the certificate names its recipient")
 }
 
-/// The policy of both endpoints of a handshake under [`OutsideProvider`].
-/// The outside profile runs AES-128-GCM, below the default floor of 256-bit
-/// keys, so both endpoints opt out of the floor.
+/// Run the three legs of `client` and `server` of flow `F` under the outside
+/// provider `P`.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-fn outside_policy() -> ProfilePolicy<OutsideProvider> {
-	ProfilePolicy::with_floor(Arc::new(NoStrengthFloor))
-}
-
-/// Run the three legs of `client` and `server` of flow `F` under
-/// [`OutsideProvider`].
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-async fn run_legs<F>(
-	client: &mut Handshake<Client, F, OutsideProvider>,
-	server: &mut Handshake<Server, F, OutsideProvider>,
-) where
-	F: ClientFlow<OutsideProvider> + ServerFlow<OutsideProvider>,
+async fn run_legs<P, F>(client: &mut Handshake<Client, F, P>, server: &mut Handshake<Server, F, P>)
+where
+	P: HandshakeProvider,
+	F: ClientFlow<P> + ServerFlow<P>,
 {
 	let opening = client.start().expect("the outside client opens");
 	let reply = server.reply(opening).await.expect("the outside server replies");
@@ -598,7 +601,7 @@ fn outside_sealed(recipient: Recipient<'_, OutsideKem>) -> AuthEnvelopedData {
 	sealed.expect("the content seals under the outside provider")
 }
 
-/// An identity under the outside provider signs a content, and the policy of
+/// An identity under the outside provider signs content, and the policy of
 /// that provider verifies the signature.
 #[tokio::test]
 async fn an_outside_identity_signs_under_its_own_algorithm() -> Result<(), Box<dyn std::error::Error>> {
@@ -650,8 +653,8 @@ async fn an_outside_provider_opens_its_kem_seal() -> Result<(), Box<dyn std::err
 	Ok(())
 }
 
-/// The pairing constructor refuses an outside backend that holds another key
-/// than the certificate it is paired with.
+/// The pairing constructor refuses an outside backend whose key differs from
+/// the key of the certificate it pairs.
 #[test]
 fn a_key_agreement_identity_refuses_an_outside_backend_of_another_key() {
 	let certificate = TestCertificate::self_signed(&SigningKey::random(&mut OsRng));
@@ -681,9 +684,9 @@ fn the_key_agreement_use_refuses_a_compact_point_for_an_outside_kem() -> Result<
 async fn an_outside_provider_opens_its_kek_seal() -> Result<(), Box<dyn std::error::Error>> {
 	let kek = [0x24u8; 16];
 	let sealed = outside_sealed(Recipient::Kek { kek: &kek, key_identifier: b"outside" });
-
 	let opener = Opener::Kek { kek: &kek, key_identifier: b"outside" };
 	let arrived = sealed.to_der()?;
+
 	let opened = sealed.open::<OutsideProvider>(arrived, &opener, DATA).await?;
 	assert_eq!(opened.to_insecure().as_slice(), CONTENT);
 	Ok(())
@@ -737,9 +740,9 @@ async fn an_outside_identity_refuses_a_high_s() -> Result<(), Box<dyn std::error
 async fn the_house_provider_refuses_an_outside_seal() -> Result<(), Box<dyn std::error::Error>> {
 	let kek = [0x24u8; 16];
 	let sealed = outside_sealed(Recipient::Kek { kek: &kek, key_identifier: b"outside" });
-
 	let opener = Opener::Kek { kek: &kek, key_identifier: b"outside" };
 	let arrived = sealed.to_der()?;
+
 	let refused = sealed.open::<DefaultCryptoProvider>(arrived, &opener, DATA).await;
 	assert!(matches!(refused, Err(EnvelopeError::ContentEncryptionAlgorithm)));
 	Ok(())

@@ -1,5 +1,5 @@
-//! The hive auto-scaling loop: per-type scale decisions and the cluster
-//! fan-out.
+//! The hive auto-scaling loop decides a scale per servlet type and fans each
+//! change out to the cluster.
 
 use core::sync::atomic::{AtomicU16, Ordering};
 use core::time::Duration;
@@ -12,7 +12,6 @@ use crate::colony::common::{
 use crate::colony::hive::runtime::{ClusterLink, HiveContextImpl, HiveInstances};
 use crate::colony::hive::{HashMapRegistry, HiveConfig, ServletRegistration, ServletRegistry, SpawnerFn};
 use crate::constants::UNKNOWN_SERVLET_UTILIZATION_BPS;
-use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::runtime::rt;
 use crate::trace::TraceCollector;
 use crate::transport::{MessageEmitter, Protocol};
@@ -51,7 +50,6 @@ pub struct ScalingLoop<P: Protocol> {
 
 impl<P> ScalingLoop<P>
 where
-	P: Protocol<CryptoProvider = DefaultCryptoProvider>,
 	P: Protocol + Send + Sync + 'static,
 	P::Address: Clone + Copy + Send + Sync + 'static,
 	P::Stream: Send + 'static,
@@ -59,8 +57,8 @@ where
 	P::Transport: MessageEmitter + Send + Sync + 'static,
 	TightBeamError: From<P::Error>,
 {
-	/// Spawns the loop that evaluates each servlet type once per cooldown and
-	/// scales its instances.
+	/// Spawns the loop that evaluates each servlet type once per cooldown,
+	/// scales its instances, and publishes the hive's aggregate utilization.
 	pub fn spawn(self) -> rt::JoinHandle {
 		let ScalingLoop {
 			servlets,
@@ -152,7 +150,7 @@ impl TypeLoad {
 
 /// Per-type stamps for one scale direction, read against the hive clock.
 ///
-/// The loop writes a stamp where a scale reached the registry, so an
+/// The loop writes a stamp only after a scale reaches the registry, so an
 /// attempt that failed to spawn or found nothing to remove leaves the next
 /// evaluation free to retry.
 struct Cooldowns {
@@ -187,9 +185,9 @@ impl Cooldowns {
 /// One running scaling loop's resolved handles.
 ///
 /// [`ScalingLoop`] names what the hive supplies. This names what the loop
-/// body works with once the hive creates its URN and binds the cluster link,
-/// so every scale decision reads one owner instead of a parameter bundle
-/// rebuilt per attempt.
+/// body works with once [`ScalingLoop::spawn`] derives the hive URN and binds
+/// the cluster link, so every scale decision reads one owner instead of a
+/// parameter bundle rebuilt per attempt.
 struct ScalingTask<P: Protocol> {
 	servlets: Arc<HashMapRegistry>,
 	trace: Arc<TraceCollector>,
@@ -204,7 +202,6 @@ struct ScalingTask<P: Protocol> {
 
 impl<P> ScalingTask<P>
 where
-	P: Protocol<CryptoProvider = DefaultCryptoProvider>,
 	P: Protocol + Send + Sync + 'static,
 	P::Address: Clone + Copy + Send + Sync + 'static,
 	P::Stream: Send + 'static,
@@ -276,8 +273,8 @@ where
 			return;
 		};
 
-		// An instance that names no signer has no route, as the slate leaves
-		// it out, so the cluster hears of no route to it.
+		// The slate leaves out an instance that names no signer, so the hive
+		// announces only an instance that has a route.
 		if let Some(added) = placed.into_servlet_info() {
 			self.announce(ServletChange::Added(added));
 		}
@@ -342,7 +339,6 @@ mod tests {
 	fn stamped_cooldowns(clock: &Arc<ManualClock>) -> Cooldowns {
 		let mut cooldowns = Cooldowns::new(Arc::clone(clock) as Arc<dyn Clock>);
 		cooldowns.stamp(b"echo".as_slice());
-
 		cooldowns
 	}
 
@@ -357,6 +353,7 @@ mod tests {
 
 			assert_eq!(cooldowns.active(b"echo", COOLDOWN), active);
 		}
+
 		cases {
 			one_millisecond_short => (COOLDOWN.saturating_sub(Duration::from_millis(1)), true),
 			at_the_cooldown => (COOLDOWN, false),

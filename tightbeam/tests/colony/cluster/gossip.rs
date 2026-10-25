@@ -1,9 +1,10 @@
-//! Gossip flood (rumor plane).
+//! The gossip flood scenarios of the rumor plane.
 //!
 //! Shared [`cluster_certs`] gateways put the gateway identity in
 //! `peer_trust` for relay verification. Hive registration and origin
-//! publishes therefore use [`hive_plane_certs`] with [`split_hive_trust`]
-//! so peer membership does not refuse the hive-plane signer.
+//! publishes therefore use [`hive_plane_certs`] with [`split_hive_trust`],
+//! so the hive-plane signer stays outside `peer_trust` and the hive plane
+//! admits it.
 
 use super::common::*;
 use super::federation::{drive_until_advertised, federation_conf, flood_ad_rumor};
@@ -324,7 +325,7 @@ tb_assert_spec! {
 	}
 }
 
-// Fan-out flood.
+// A rumor floods a fan-out.
 //
 // A refloods to B and C. Every cluster delivers the rumor to its local
 // ping servlet exactly once (ACCEPTED = 3).
@@ -402,8 +403,9 @@ tb_assert_spec! {
 	}
 }
 
-// Partial topology: A peers to B and B peers to C, but A is not peered to C.
-// The rumor therefore reaches C only through the reflood at B.
+// A rumor crosses a partial topology: A peers to B, B peers to C, and C is
+// outside A's peer list. The rumor therefore reaches C only through the
+// reflood at B.
 //
 // - The publish starts at ttl 2 and arrives at C with ttl 0.
 // - The rumor spends the hop budget exactly.
@@ -471,7 +473,7 @@ tb_assert_spec! {
 	}
 }
 
-// Hive-trust-only propagation.
+// A rumor propagates on hive trust alone.
 //
 // A configures a peer but no `peer_trust`, so it builds no peer pool. The
 // reflood falls back to the hive pool, the same preference the advertise beat
@@ -543,7 +545,7 @@ tb_assert_spec! {
 // publish may request.
 //
 // - With ttl 0 configured, the gateway clamps a publish that requests the protocol maximum.
-// - The gateway delivers it locally, and it never refloods to the configured peer.
+// - The gateway delivers it locally, and the journal of B, the configured peer, stays empty.
 // - A leaked reflood would raise ACCEPTED past one.
 tb_scenario! {
 	name: cluster_gossip_origin_clamps_configured_ttl,
@@ -591,7 +593,7 @@ tb_scenario! {
 	}
 }
 
-/// Fixture for the plane-separation scenario.
+/// The fixture of the plane-separation scenario.
 ///
 /// The gateway's own certs anchor the hive plane. A distinct random identity
 /// anchors the peer plane.
@@ -633,7 +635,7 @@ tb_assert_spec! {
 	}
 }
 
-// Trust-plane separation and admission bounds.
+// The trust planes stay apart, and admission bounds the rumor size.
 //
 // - A hive-plane signer must not relay peer gossip.
 // - A peer-plane signer must not publish origin gossip.
@@ -647,7 +649,7 @@ tb_scenario! {
 		start: |SetupEnv { trace, context: ctx }| async move {
 			// The oversized rumor exceeds a single-flight envelope, so the
 			// gateway offers mux, and the frame must chunk across the link to
-			// reach gossip admission at all.
+			// reach gossip admission.
 			let conf = with_mux_offer(peering_cluster_conf_with_trust(&ctx.gateway, Arc::clone(&ctx.peer_trust)));
 			start_cluster(&trace, conf).await
 		},
@@ -721,7 +723,7 @@ tb_assert_spec! {
 	}
 }
 
-// Anti-entropy repair over the beat.
+// Anti-entropy repairs a rumor over the beat.
 //
 // - Publisher F starts the rumor at ttl 0, so it moves by reconcile alone.
 // - Receiver R learns the rumor only when F's beat reconciles digests and pushes it.
@@ -782,7 +784,7 @@ tb_assert_spec! {
 	}
 }
 
-// Local-delivery retry on the beat.
+// The beat retries a local delivery.
 //
 // The rumor reaches R before R's ping servlet registers, so it stays pending.
 //
@@ -923,7 +925,7 @@ tb_assert_spec! {
 	}
 }
 
-// Per-signer rate admission at the pipeline chokepoint. A one-token bucket
+// Rate admission runs per signer at the pipeline chokepoint. A one-token bucket
 // with a slow refill admits the first publish and refuses the second with
 // ResourceExhausted before the journal records it.
 tb_scenario! {
@@ -1069,7 +1071,7 @@ tb_assert_spec! {
 // - If duplicates spent tokens, the echoes would drain the bucket.
 // - The bucket would then refuse B with ResourceExhausted.
 //
-// Relay echo traffic is normal, not abuse.
+// Relay echo traffic is normal, so it spends no rate token.
 tb_scenario! {
 	name: cluster_gossip_duplicates_spend_no_tokens,
 	spec: ClusterGossipDuplicateFreeSpec,
@@ -1302,7 +1304,7 @@ tb_assert_spec! {
 	}
 }
 
-// Invalid-relay scoring.
+// The gateway scores a relay whose rumors admission refuses.
 //
 // A trusted peer that relays rumors refused at admission (here an over-TTL
 // flood request) weakens its own advertised work routes.
@@ -1393,8 +1395,9 @@ impl GossipJournal for AmnesiacJournal {
 		Ok(Admission::New)
 	}
 
-	// The grey hole retains nothing, so it never reports a digest as seen,
-	// and every repair push reaches `record` and earns a fresh acknowledgement.
+	// The grey hole retains nothing, so `seen` answers `false` for every
+	// digest, and every repair push reaches `record` and earns a fresh
+	// acknowledgement.
 	fn seen(&self, _digest: &GossipDigest, _now: UnixMillis) -> Result<bool, ClusterError> {
 		Ok(false)
 	}
@@ -1411,7 +1414,7 @@ impl GossipJournal for AmnesiacJournal {
 		Ok(Vec::new())
 	}
 
-	// The grey hole retains nothing, so it has no rumor to retry.
+	// The grey hole retains nothing, so it answers every claim as untracked.
 	fn claim_local(&self, _digest: &GossipDigest, _now: UnixMillis) -> Result<LocalClaim, ClusterError> {
 		Ok(LocalClaim::Untracked)
 	}
@@ -1448,7 +1451,7 @@ tb_assert_spec! {
 	}
 }
 
-// Grey-hole containment over the beat.
+// The beat contains a grey hole.
 //
 // B acknowledges every repair push with `Ok` and retains nothing. Each
 // reconciliation round therefore re-wants a digest A already saw acknowledged.
@@ -1536,7 +1539,7 @@ tb_assert_spec! {
 	}
 }
 
-// Tampered-relay scoring.
+// The gateway scores a relay that tampers with a rumor.
 //
 // A trusted peer forwards an origin-signed rumor whose content it altered,
 // which breaks the origin signature.
@@ -1897,7 +1900,7 @@ tb_scenario! {
 	}
 }
 
-/// The fixture for origin-budget keying.
+/// The fixture for a rate budget keyed on the origin.
 ///
 /// It holds one origin identity and two relay identities, all members of
 /// the gateway's colony.
@@ -1950,9 +1953,9 @@ tb_assert_spec! {
 
 // Rate admission keys on the rumor's origin, not the relaying peer.
 //
-// A one-token bucket admits the origin's first rumor via relay A.
+// A one-token bucket admits the origin's first rumor through relay A.
 //
-// - It refuses the same origin's second rumor via relay B with ResourceExhausted.
+// - It refuses the same origin's second rumor through relay B with ResourceExhausted.
 // - An origin whose flood fans out through many relays gets no extra budget.
 // - The refusal is local policy, so the gateway never weakens relay B's routes.
 tb_scenario! {
@@ -2591,7 +2594,7 @@ tb_assert_spec! {
 	}
 }
 
-// Seed-bootstrap discovery over the beat (peer exchange).
+// The beat discovers peers from one seed through peer exchange.
 //
 // X anchors only seed S, S anchors publisher P, and P anchors nobody.
 //
@@ -2668,7 +2671,7 @@ tb_assert_spec! {
 	}
 }
 
-// Eclipse bound on the discovery table.
+// The discovery table bounds an eclipse attack.
 //
 // An attacker inside one /16 prefix floods hints past the bucket cap and
 // even passes every probe.
@@ -3150,9 +3153,9 @@ async fn start_reconcile_server(
 	pex: Vec<PeerGossip>,
 ) -> Result<ReconcileReplier, TightBeamError> {
 	let identity = signing_identity(certs.cert.to_owned(), certs.key.to_owned());
-	let config = TransportEncryptionConfig::new(identity);
+	let config = TransportEncryptionConfig::<DefaultCryptoProvider>::new(identity);
 	let bind_addr = "127.0.0.1:0".parse::<TightBeamSocketAddr>()?;
-	let (listener, addr) = TokioListener::bind_with(bind_addr, config).await?;
+	let (listener, addr) = <TokioListener as EncryptedProtocol>::bind_with(bind_addr, config).await?;
 
 	let answered = Arc::new(AtomicUsize::new(0));
 	let last_order = Arc::new(AtomicU64::new(0));

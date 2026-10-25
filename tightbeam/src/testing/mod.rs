@@ -3,10 +3,10 @@
 //! Its demo spec uses the declarative macros, so a new declarative API that
 //! fails to expand shows its compile error here first.
 
-// Test-fixture surface: constructors take fixed, valid-by-construction
-// inputs, and a fixture that cannot build must abort the test run with
-// a stated invariant (`expect`). An index or an integer operation outside
-// its range aborts the run the same way.
+// The fixture constructors take fixed inputs that are valid by construction,
+// and a fixture that cannot build must abort the test run with a stated
+// invariant (`expect`). An index or an integer operation outside its range
+// aborts the run the same way.
 #![allow(
 	clippy::expect_used,
 	clippy::panic,
@@ -76,6 +76,8 @@ pub use fixtures::TestCertificateChain;
 pub use fixtures::TestCmsServer;
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 pub use fixtures::TestIdentity;
+#[cfg(feature = "colony")]
+pub use fixtures::TestRumor;
 #[cfg(all(feature = "secp256k1", feature = "signature"))]
 pub use fixtures::TestSigner;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]

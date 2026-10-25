@@ -47,7 +47,7 @@ impl HiveEntry {
 	///
 	/// The control plane answers under the identity that signs the hive's
 	/// registrations, so a heartbeat admits that identity alone (CWE-346).
-	pub(crate) fn bound_dial(&self) -> BoundDial<'static> {
+	pub(crate) fn bound_dial<'a, P: 'a>(&self) -> BoundDial<'a, P> {
 		let target = DialTarget::of_registered(&self.address);
 
 		BoundDial::new(target, ExpectedSigner::Hive(Arc::clone(&self.signer)))
@@ -183,9 +183,9 @@ impl Members {
 /// std lock never clears, so the caller that sees it is the one that ends.
 pub struct HiveRegistry {
 	members: RwLock<Members>,
-	/// The silence after which a hive is evicted.
+	/// The silence after which the registry evicts a hive.
 	timeout: Duration,
-	/// The clock leases are stamped and judged on.
+	/// The clock that stamps and judges leases.
 	clock: Arc<dyn Clock>,
 }
 
@@ -201,14 +201,14 @@ impl HiveRegistry {
 	/// Returns the registration this call displaced, when the hive was
 	/// already registered. A caller that installs dependent state next
 	/// needs it to put the previous registration back if that install
-	/// fails, so dropping it forfeits the rollback.
+	/// fails, so a caller that drops it forfeits the rollback.
 	///
 	/// # Signer binding
 	///
 	/// `signer` is the [`SignerIdentifier`] of the registration frame. Later
 	/// `ServletAddressUpdate` calls must present the same signer for this hive
-	/// id, and re-registration is admitted only from the signer bound first
-	/// (CWE-639).
+	/// id, and the registry admits re-registration only from the signer it
+	/// bound first (CWE-639).
 	///
 	/// # Errors
 	///
@@ -289,7 +289,7 @@ impl HiveRegistry {
 	/// Whether `claimed` is the signer bound to `hive_id` at registration.
 	///
 	/// An unregistered hive answers `false`, unlike
-	/// [`Members::admits_signer`], which is asked about a free id. An
+	/// [`Members::admits_signer`], which answers `true` for a free id. An
 	/// update names a hive that is already serving, so a claim on an id
 	/// nobody holds is unattributable (CWE-639).
 	///
@@ -307,6 +307,10 @@ impl HiveRegistry {
 	}
 
 	/// Unregisters a hive and returns the entry it held.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::LockPoisoned`] -- the member table is poisoned.
 	pub(crate) fn unregister(&self, hive_id: impl AsRef<[u8]>) -> Result<Option<HiveEntry>, ClusterError> {
 		let hive_id = hive_id.as_ref();
 		Ok(self.members.write()?.remove(hive_id))
@@ -314,6 +318,10 @@ impl HiveRegistry {
 
 	/// Records the utilization a heartbeat reported, and answers whether the
 	/// hive is still registered to record it against.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::LockPoisoned`] -- the member table is poisoned.
 	pub fn update_utilization(
 		&self,
 		hive_id: impl AsRef<[u8]>,
@@ -325,12 +333,20 @@ impl HiveRegistry {
 	}
 
 	/// Counts one more heartbeat failure for a hive and returns the new count.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::LockPoisoned`] -- the member table is poisoned.
 	pub fn increment_failure(&self, hive_id: impl AsRef<[u8]>) -> Result<u32, ClusterError> {
 		let hive_id = hive_id.as_ref();
 		Ok(self.members.write()?.increment_failure(hive_id))
 	}
 
 	/// Clears a hive's heartbeat failure count.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::LockPoisoned`] -- the member table is poisoned.
 	pub fn reset_failure(&self, hive_id: impl AsRef<[u8]>) -> Result<(), ClusterError> {
 		let hive_id = hive_id.as_ref();
 		self.members.write()?.reset_failure(hive_id);
@@ -339,6 +355,10 @@ impl HiveRegistry {
 
 	/// Records a live heartbeat. It renews the lease on the registry's clock,
 	/// stores the utilization, and clears the failure count.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::LockPoisoned`] -- the member table is poisoned.
 	pub fn touch(&self, hive_id: impl AsRef<[u8]>, utilization: BasisPoints) -> Result<(), ClusterError> {
 		let hive_id = hive_id.as_ref();
 		let now = self.clock.monotonic();
@@ -350,6 +370,10 @@ impl HiveRegistry {
 	///
 	/// Returns the evicted entries, so a caller can retire the state that
 	/// depends on each hive, such as its servlet routes.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::LockPoisoned`] -- the member table is poisoned.
 	pub(crate) fn evict_stale(&self) -> Result<Vec<HiveEntry>, ClusterError> {
 		let now = self.clock.monotonic();
 		let mut members = self.members.write()?;
@@ -360,18 +384,30 @@ impl HiveRegistry {
 	}
 
 	/// A snapshot of every registered hive.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::LockPoisoned`] -- the member table is poisoned.
 	pub fn all_hives(&self) -> Result<Vec<HiveEntry>, ClusterError> {
 		let members = self.members.read()?;
 		Ok(members.all())
 	}
 
 	/// The number of registered hives.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::LockPoisoned`] -- the member table is poisoned.
 	pub fn len(&self) -> Result<usize, ClusterError> {
 		let members = self.members.read()?;
 		Ok(members.len())
 	}
 
 	/// Whether no hive is registered.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::LockPoisoned`] -- the member table is poisoned.
 	pub fn is_empty(&self) -> Result<bool, ClusterError> {
 		Ok(self.len()? == 0)
 	}
@@ -413,7 +449,7 @@ impl<'a> ColonyMembership<'a> {
 	/// Admits one hive with the servlet slate it registered.
 	///
 	/// A slate that fails to install rolls the hive entry back, so a
-	/// refused registration leaves neither registry holding half of it.
+	/// refused registration leaves no half of it in either registry.
 	///
 	/// # Errors
 	///
@@ -434,8 +470,8 @@ impl<'a> ColonyMembership<'a> {
 			return Ok(());
 		};
 
-		// A re-registration rolls back by restoring what it replaced, so a
-		// hive that was serving before this request arrived keeps serving.
+		// A re-registration rolls back to the entry it replaced, so a hive
+		// that served before this request arrived keeps serving.
 		match displaced {
 			Some(previous) => self.hives.restore(hive_addr, previous)?,
 			None => self.drop_membership(&hive_addr)?,
@@ -562,8 +598,8 @@ mod tests {
 		ClusterConfig::new(tls)
 	}
 
-	/// A registration of `servlets` at `addr`, each locator naming that same
-	/// address, as a hive advertises its own instances.
+	/// A registration of `servlets` at `addr`, whose locators each name that
+	/// same address, as a hive advertises its own instances.
 	fn request(addr: impl AsRef<[u8]>, servlets: &[&str]) -> RegisterHiveRequest {
 		let addr = addr.as_ref();
 		let locator = from_utf8(addr).expect("fixture addresses are UTF-8");
@@ -632,9 +668,9 @@ mod tests {
 		Ok(())
 	}
 
-	// A lease outlives its ttl or it does not, judged after the test moves
-	// the registry's clock rather than after it waits. A lease exactly at
-	// the ttl is still live, so the boundary row pins `>` against `>=`.
+	// The test judges whether a lease outlives its ttl after it moves the
+	// registry's clock, rather than after it waits. A lease exactly at the
+	// ttl is still live, so the boundary row pins `>` against `>=`.
 	tb_cases! {
 		fn evict_stale((ttl, evicted_len, remaining_len): (Duration, usize, usize)) -> Result<(), ClusterError> {
 			let clock = Arc::new(ManualClock::default());
@@ -642,8 +678,8 @@ mod tests {
 			registry.register(request(b"hive1", &["ping"]), test_signer())?;
 
 			clock.advance(Duration::from_secs(1));
-			let evicted = registry.evict_stale()?;
 
+			let evicted = registry.evict_stale()?;
 			assert_eq!(evicted.len(), evicted_len);
 			assert_eq!(registry.len()?, remaining_len);
 
@@ -689,7 +725,7 @@ mod tests {
 	}
 
 	/// What one race between two signers for one hive id left behind: how
-	/// many registrations were accepted, and which signer was bound.
+	/// many registrations the registry accepted, and which signer it bound.
 	struct RaceOutcome {
 		accepted: usize,
 		bound: Option<Arc<SignerIdentifier>>,
@@ -780,8 +816,8 @@ mod tests {
 		Ok(())
 	}
 
-	/// A first registration whose slate will not install must leave neither
-	/// registry holding half of it.
+	/// A first registration whose slate will not install must leave no half
+	/// of it in either registry.
 	#[test]
 	fn a_refused_first_registration_leaves_no_half() -> Result<(), ClusterError> {
 		let colony = Colony::new();

@@ -2,8 +2,9 @@
 //!
 //! The offer and accept structures carry algorithm and mux capability as DER
 //! values, so negotiation runs before any concrete crypto exists. The server
-//! and client helpers derive clamped [`MuxSettings`] and consult the optional
-//! [`TransportAuthorizer`] and [`ProfileStrengthPolicy`] hooks.
+//! and client helpers derive clamped [`MuxSettings`], consult the optional
+//! [`TransportAuthorizer`] hook, and hold each profile to the floor of a
+//! [`ProfileStrengthPolicy`].
 
 use core::marker::PhantomData;
 
@@ -25,7 +26,7 @@ use crate::constants::{
 };
 use crate::crypto::common::KeySizeUser;
 use crate::crypto::hash::Digest;
-use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
+use crate::crypto::profiles::{CryptoProvider, ProfileStrength, SecurityProfileDesc};
 use crate::der::asn1::OctetString;
 use crate::der::Error as DerDecodeError;
 use crate::der::Sequence;
@@ -36,6 +37,8 @@ use crate::Errorizable;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::constants::{MAX_MUX_CHUNK_SIZE, MAX_MUX_SESSION_BUDGET, MAX_MUX_STREAM_CREDIT, MIN_MUX_CHUNK_SIZE};
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::crypto::profiles::ProfileStrengthPolicy;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::error::HandshakeError;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -74,7 +77,7 @@ impl SecurityOffer {
 /// Server security-profile accept, encoded as DER.
 ///
 /// The accept carries the profile the server selected from the client's
-/// [`SecurityOffer`] under local preference and any
+/// [`SecurityOffer`] under its local preference and the floor of its
 /// [`ProfileStrengthPolicy`].
 #[derive(Clone, Debug, Eq, PartialEq, Beamable, Sequence)]
 pub struct SecurityAccept {
@@ -171,8 +174,9 @@ pub struct TransportOffer {
 }
 
 impl TransportOffer {
-	/// Create a multiplexing offer advertising the given peer-initiated
-	/// cap with default chunking, credit, and unmetered budget settings.
+	/// Create a multiplexing offer that advertises a peer-initiated cap of
+	/// `max_peer_initiated_streams`, with default chunking, credit, and
+	/// unmetered budget settings.
 	pub fn mux(max_peer_initiated_streams: u32) -> Self {
 		Self {
 			mux: true,
@@ -305,7 +309,7 @@ impl MuxSettings {
 	/// # Contract
 	///
 	/// Both endpoints MUST configure the same `cap`, or enforcement diverges.
-	/// The cap is clamped to [`MAX_MUX_STREAM_CAP`].
+	/// This call clamps the cap to [`MAX_MUX_STREAM_CAP`].
 	pub fn symmetric(cap: u32) -> Self {
 		let cap = clamp_stream_cap(cap);
 		Self {
@@ -381,7 +385,7 @@ fn clamp_stream_cap(cap: u32) -> u32 {
 /// Clamp an advertised chunk payload size into
 /// `MIN_MUX_CHUNK_SIZE..=MAX_MUX_CHUNK_SIZE`.
 ///
-/// The floor stops tiny advertisements from amplifying record consumption
+/// The floor bounds the records a tiny advertisement could consume
 /// (CWE-770). Chunking is the only send path, so no value opts out.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 fn clamp_chunk_size(size: u32) -> u32 {
@@ -408,15 +412,15 @@ fn clamp_stream_credit(credit: u64) -> u64 {
 
 /// The peer offer and the local configuration for one accept decision.
 ///
-/// Multiplexing activates only when the peer offered it and it is locally
-/// enabled. A missing side yields no accept, so both endpoints share the
-/// same activation decision.
+/// Multiplexing activates only when the peer offered it and the local
+/// configuration enables it. A missing side yields no accept, so both
+/// endpoints share the same activation decision.
 ///
 /// # Local configuration
 ///
 /// The local [`TransportOffer`] is the server configuration:
 ///
-/// - Its receive-side values are advertised back to the client.
+/// - The server advertises its receive-side values back to the client.
 /// - Its `requested_budgets` is the grant ceiling, combined with the client's
 ///   request by componentwise minimum.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -474,8 +478,8 @@ impl<'a> TransportNegotiation<'a> {
 	/// # Budgets
 	///
 	/// When an authorizer is present, its grant replaces the local-config
-	/// budget. The grant is still clamped to the componentwise minimum with
-	/// the client's request before the accept and the receipt bind it.
+	/// budget. This method still clamps the grant to the componentwise minimum
+	/// with the client's request before the accept and the receipt bind it.
 	///
 	/// # Errors
 	///
@@ -620,8 +624,8 @@ pub trait TransportAuthorizer: MaybeSend + MaybeSync {
 	/// # Default
 	///
 	/// A challenge-free receipt settles with `Ok`. An authorizer that issues
-	/// a challenge without overriding this method refuses every settlement
-	/// with [`SETTLEMENT_UNSUPPORTED_CODE`].
+	/// a challenge and keeps this default refuses every settlement with
+	/// [`SETTLEMENT_UNSUPPORTED_CODE`].
 	///
 	/// # Errors
 	///
@@ -665,9 +669,8 @@ pub trait TransportAuthorizer: MaybeSend + MaybeSync {
 	}
 }
 
-/// Refusal code the default [`TransportAuthorizer::settle`] emits when a
-/// challenge-bearing receipt reaches an authorizer that never implemented
-/// settlement.
+/// The refusal code the default [`TransportAuthorizer::settle`] emits for a
+/// challenge-bearing receipt.
 ///
 /// The code is protocol-reserved, because it sits below the application
 /// code floor.
@@ -782,7 +785,7 @@ impl MuxSettings {
 	/// The client validates the server's accept against its own offer, then
 	/// builds directional settings through the shared clamp choke points. The
 	/// receipt countersigns the raw granted budgets, so the client refuses
-	/// every divergence instead of repairing it by clamping.
+	/// every divergence rather than clamp it.
 	///
 	/// # Errors
 	///
@@ -790,17 +793,17 @@ impl MuxSettings {
 	///   mux without a matching mux offer, or it grants budgets the client
 	///   never requested.
 	/// - [`NegotiationError::BudgetBeyondCap`] -- the grant exceeds
-	///   [`MAX_MUX_SESSION_BUDGET`]. A conforming server never emits it, and
-	///   clamping would attest figures the client never enforces.
+	///   [`MAX_MUX_SESSION_BUDGET`]. A conforming server never emits it, and a
+	///   clamp would attest figures the client never enforces.
 	/// - [`NegotiationError::BudgetBeyondRequest`] -- the grant exceeds the
 	///   request. A conforming server grants the componentwise minimum with the
 	///   request, so the client refuses to countersign figures it never asked
 	///   for.
 	/// - [`NegotiationError::BudgetGrantWithheld`] -- the client requested
 	///   budgets and the accept grants none. A budget request asks for an
-	///   attested, spend-bounded session, and running unmetered would silently
-	///   drop the receipt. A client that tolerates an unmetered session
-	///   requests no budgets.
+	///   attested, spend-bounded session, and an unmetered session would
+	///   silently drop the receipt. A client that tolerates an unmetered
+	///   session requests no budgets.
 	pub(crate) fn for_client(
 		offer: Option<&TransportOffer>,
 		accept: Option<&TransportAccept>,
@@ -854,7 +857,7 @@ pub enum NegotiationError {
 	#[error("Security offer is empty")]
 	EmptyOffer,
 
-	/// No profile meets the configured minimum-strength policy.
+	/// No profile meets the minimum-strength policy.
 	#[error("No profile meets the minimum-strength policy")]
 	BelowStrengthFloor,
 
@@ -917,7 +920,7 @@ impl From<DerDecodeError> for NegotiationError {
 /// A peer's descriptor names algorithms, and `P` runs one fixed set of them.
 /// A descriptor becomes a `RunnableProfile` only when it names exactly the
 /// algorithms of `P`'s own profile. A handshake therefore signs and keys a
-/// session only under the identity its provider runs (CWE-345).
+/// session only under the algorithms its provider runs (CWE-345).
 pub struct RunnableProfile<P> {
 	descriptor: SecurityProfileDesc,
 	provider: PhantomData<fn() -> P>,
@@ -931,7 +934,7 @@ impl<P: CryptoProvider> RunnableProfile<P> {
 		Self { descriptor, provider: PhantomData }
 	}
 
-	/// The descriptor both endpoints negotiated.
+	/// The descriptor this profile names.
 	pub fn descriptor(&self) -> SecurityProfileDesc {
 		self.descriptor
 	}
@@ -985,72 +988,29 @@ impl<P> core::fmt::Debug for RunnableProfile<P> {
 	}
 }
 
-/// The strength of a runnable profile, as a [`ProfileStrengthPolicy`]
-/// judges it.
-///
-/// The sizes come from the provider's types, so a policy judges the
-/// algorithms the session runs.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub struct ProfileStrength {
-	/// The negotiated descriptor.
-	pub descriptor: SecurityProfileDesc,
-	/// Key length in bytes of the provider's AEAD cipher.
-	pub aead_key_bytes: usize,
-	/// Output length in bytes of the provider's digest.
-	pub digest_bytes: usize,
-}
-
-/// Minimum-strength filter a handshake endpoint applies to profiles.
-///
-/// The policy blocks downgrade (CWE-757), so an endpoint refuses a mutually
-/// supported weak profile unless the policy admits it.
-pub trait ProfileStrengthPolicy {
-	/// Returns `true` when `strength` meets the policy floor.
-	fn meets_floor(&self, strength: &ProfileStrength) -> bool;
-}
-
-/// Default strength floor.
-///
-/// # Requires
-///
-/// - The AEAD key size is at least 256 bits.
-/// - The digest output is at least 256 bits.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct DefaultStrengthFloor;
-
-/// Minimum AEAD key and digest output length in bytes, 256 bits each.
-const DEFAULT_FLOOR_BYTES: usize = 32;
-
-impl ProfileStrengthPolicy for DefaultStrengthFloor {
-	fn meets_floor(&self, strength: &ProfileStrength) -> bool {
-		let aead_ok = strength.aead_key_bytes >= DEFAULT_FLOOR_BYTES;
-		let digest_ok = strength.digest_bytes >= DEFAULT_FLOOR_BYTES;
-		aead_ok && digest_ok
-	}
-}
-
 /// The strength floor one handshake endpoint holds.
 ///
 /// A server selects only a profile that meets its floor, and a client accepts
 /// only such a profile, whether or not it sent an offer. Without an explicit
-/// policy the floor is [`DefaultStrengthFloor`].
+/// policy the floor is the one its provider names,
+/// [`CryptoProvider::strength_floor`].
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 #[derive(Clone, Default)]
 pub(crate) struct StrengthFloor(Option<Arc<dyn ProfileStrengthPolicy + Send + Sync>>);
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl StrengthFloor {
-	/// A floor that applies `policy` in place of [`DefaultStrengthFloor`].
+	/// A floor that applies `policy` in place of the floor of the provider.
 	pub(crate) fn with_policy(policy: Arc<dyn ProfileStrengthPolicy + Send + Sync>) -> Self {
 		Self(Some(policy))
 	}
 
-	/// The policy this floor applies.
-	pub(crate) fn policy(&self) -> &dyn ProfileStrengthPolicy {
+	/// The policy this floor applies under the provider `P`: the policy it
+	/// was built with, or the floor `P` names.
+	pub(crate) fn policy<P: CryptoProvider>(&self) -> &dyn ProfileStrengthPolicy {
 		match &self.0 {
 			Some(policy) => policy.as_ref(),
-			None => &DefaultStrengthFloor,
+			None => P::strength_floor(),
 		}
 	}
 
@@ -1060,7 +1020,7 @@ impl StrengthFloor {
 	///
 	/// - [`NegotiationError::BelowStrengthFloor`] -- the policy refuses the profile.
 	pub(crate) fn admit<P: CryptoProvider>(&self, profile: &RunnableProfile<P>) -> Result<(), NegotiationError> {
-		if !self.policy().meets_floor(&profile.strength()) {
+		if !self.policy::<P>().meets_floor(&profile.strength()) {
 			return Err(NegotiationError::BelowStrengthFloor);
 		}
 
@@ -1070,7 +1030,8 @@ impl StrengthFloor {
 
 /// The security profiles a server runs, in preference order.
 ///
-/// The list is never empty, so a server always has a profile to choose from.
+/// The list holds at least one profile, so a server always has a profile to
+/// choose from.
 ///
 /// # Examples
 ///
@@ -1119,7 +1080,7 @@ impl TryFrom<Vec<SecurityProfileDesc>> for SupportedProfiles {
 	}
 }
 
-/// One profile is a list that is never empty.
+/// One profile makes a list of one, so the conversion is infallible.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl From<SecurityProfileDesc> for SupportedProfiles {
 	fn from(profile: SecurityProfileDesc) -> Self {
@@ -1148,16 +1109,17 @@ impl<P: HandshakeProvider> Default for ProfilePolicy<P> {
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl<P: HandshakeProvider> ProfilePolicy<P> {
-	/// A policy under [`DefaultStrengthFloor`], which requires a 256-bit AEAD
-	/// key and a digest of 256 bits or more.
+	/// A policy under the floor `P` names, [`CryptoProvider::strength_floor`].
 	pub fn new() -> Self {
 		Self { floor: StrengthFloor::default(), provider: PhantomData }
 	}
 
-	/// A policy under `policy` in place of [`DefaultStrengthFloor`].
+	/// A policy under `policy` in place of the floor `P` names.
 	///
 	/// Pass [`NoStrengthFloor`] only where weaker profiles must remain
 	/// negotiable.
+	///
+	/// [`NoStrengthFloor`]: crate::crypto::profiles::NoStrengthFloor
 	pub fn with_floor(policy: Arc<dyn ProfileStrengthPolicy + Send + Sync>) -> Self {
 		Self { floor: StrengthFloor::with_policy(policy), provider: PhantomData }
 	}
@@ -1193,7 +1155,7 @@ impl<P: HandshakeProvider> ProfilePolicy<P> {
 			return Err(NegotiationError::UnrunnableProfile.into());
 		}
 
-		let policy = self.floor.policy();
+		let policy = self.floor.policy::<P>();
 		let meets_floor = |profile: &&RunnableProfile<P>| policy.meets_floor(&profile.strength());
 		let strong = runnable.iter().filter(meets_floor);
 		let eligible: Vec<SecurityProfileDesc> = strong.map(RunnableProfile::descriptor).collect();
@@ -1214,6 +1176,9 @@ impl<P: HandshakeProvider> ProfilePolicy<P> {
 	///
 	/// # Errors
 	///
+	/// Each [`NegotiationError`] arrives wrapped in
+	/// [`HandshakeError::NegotiationError`].
+	///
 	/// - [`HandshakeError::InvalidProfileSelection`] -- the server selected
 	///   nothing, or a profile outside the offer.
 	/// - [`NegotiationError::UnrunnableProfile`] -- `P` does not run the selection.
@@ -1232,20 +1197,6 @@ impl<P: HandshakeProvider> ProfilePolicy<P> {
 		let profile = RunnableProfile::<P>::try_from(accept.profile)?;
 		self.floor.admit(&profile)?;
 		Ok(profile)
-	}
-}
-
-/// Strength policy that admits every profile.
-///
-/// This policy is the explicit opt-out of the minimum-strength floor. Prefer
-/// [`DefaultStrengthFloor`] except for compatibility deployments and
-/// downgrade-attack tests.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct NoStrengthFloor;
-
-impl ProfileStrengthPolicy for NoStrengthFloor {
-	fn meets_floor(&self, _strength: &ProfileStrength) -> bool {
-		true
 	}
 }
 
@@ -1291,7 +1242,7 @@ mod tests {
 
 	use super::*;
 	use crate::asn1::{AlgorithmIdentifier, DigestInfo};
-	use crate::crypto::profiles::DefaultCryptoProvider;
+	use crate::crypto::profiles::{DefaultCryptoProvider, DefaultStrengthFloor};
 	use crate::oids::{
 		AES_128_GCM, AES_128_WRAP, AES_192_WRAP, AES_256_GCM, AES_256_WRAP, CURVE_SECP256K1, HASH_SHA3_256,
 		HKDF_SHA3_256, SIGNER_ECDSA_WITH_SHA3_512,
@@ -2131,8 +2082,8 @@ mod tests {
 		assert!(matches!(refusal, Err(HandshakeError::InvalidProfileSelection)));
 	}
 
-	/// Without an offer the server still names the profile it chose, so a
-	/// reply that selects nothing is refused.
+	/// Without an offer the server still names the profile it chose, so the
+	/// client refuses a reply that selects nothing.
 	#[test]
 	fn a_dealers_choice_client_refuses_a_missing_selection() {
 		let refusal = DefaultPolicy::new().admit(None, None);
@@ -2147,8 +2098,8 @@ mod tests {
 		Ok(())
 	}
 
-	/// A selection that names an algorithm the provider does not run is
-	/// refused, so the session never runs under a false identity.
+	/// The client refuses a selection that names an algorithm its provider does
+	/// not run, so a session runs only under its provider's algorithms.
 	#[test]
 	fn a_dealers_choice_client_refuses_a_profile_it_does_not_run() {
 		let accept = SecurityAccept::new(foreign_profile());

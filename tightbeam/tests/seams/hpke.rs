@@ -1,5 +1,5 @@
-//! The HPKE handshake under [`OutsideProvider`], a provider an outside crate
-//! defines that names no HPKE suite.
+//! The HPKE handshake runs here under [`OutsideProvider`], a provider an
+//! outside crate defines that names no HPKE suite.
 //!
 //! The flow derives its handshake secret from the ephemeral-ephemeral
 //! agreement alone, so the provider's signature, digest, KDF, AEAD, and key
@@ -18,7 +18,7 @@ use tightbeam::transport::handshake::{
 	Server, ServerConfig, SupportedProfiles,
 };
 
-use super::{outside_identity, outside_policy, run_legs, OutsideProvider, CONTENT, OUTSIDE_KDF};
+use super::{outside_identity, run_legs, OutsideProvider, CONTENT, OUTSIDE_KDF};
 
 /// A client of the HPKE flow under the outside provider.
 type OutsideClient = Handshake<Client, Hpke, OutsideProvider>;
@@ -38,8 +38,7 @@ fn outside_pair(
 	let mut settings = HpkeClientSettings::new(LearnedTrust::new(pinned));
 	settings.identity = identity;
 	let client = ClientConfig::<Hpke, OutsideProvider>::new(settings, KeyPurposes::HOUSE);
-	let mut client = client.expect("an outside client identity serves the client role");
-	client.profiles = outside_policy();
+	let client = client.expect("an outside client identity serves the client role");
 
 	let native = RunnableProfile::<OutsideProvider>::native().descriptor();
 	let profiles = SupportedProfiles::from(native);
@@ -47,7 +46,6 @@ fn outside_pair(
 	let purposes = KeyPurposes::HOUSE;
 	let server_config = ServerConfig::<Hpke, OutsideProvider>::new(server_settings, server, profiles, purposes);
 	let mut server_config = server_config.expect("an outside server identity serves the server role");
-	server_config.policy = outside_policy();
 	server_config.peer_authentication = peer_authentication;
 	(Handshake::client(client), Handshake::server(server_config))
 }

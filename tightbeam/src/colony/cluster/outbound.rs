@@ -1,55 +1,53 @@
-//! Outbound connection-pool construction for cluster gateways.
+//! The outbound connection pools of a cluster gateway.
 //!
 //! Hive and peer hops use separate pools, so each trust plane stays
-//! attached to the dials it authorizes. The client identity is materialized
-//! once and shared by `Arc` across both pools.
+//! attached to the dials it authorizes. The gateway builds its client
+//! identity once, and both pools share it by `Arc`.
 
 use std::sync::Arc;
 
 use crate::colony::cluster::ClusterTlsConfig;
-use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::crypto::x509::store::CertificateTrust;
 use crate::transport::client::{ConnectionBuilder, ConnectionPool, PoolConfig};
 use crate::transport::Protocol;
 use crate::utils::time::Clock;
-use crate::TightBeamError;
 
 type ClusterPool<P> = ConnectionPool<P>;
 
 /// The hive pool plus the optional peer-plane pool.
 ///
 /// The fields are named because both pools share one type, so a tuple would
-/// let a hive and peer transposition compile and cross the two trust planes.
+/// let a swap of the two pools compile and cross the two trust planes.
 pub struct ClusterPools<P: Protocol> {
-	/// Outbound dials to this gateway's own hives, on the `hive_trust` plane.
+	/// The pool of outbound dials to this gateway's own hives, on the
+	/// `hive_trust` plane.
 	pub hive: Arc<ClusterPool<P>>,
-	/// Outbound dials to federated peer gateways, on the `peer_trust` plane.
-	/// The value is `None` when federation is disabled.
+	/// The pool of outbound dials to federated peer gateways, on the
+	/// `peer_trust` plane. The value is `None` when `peer_trust` is unset.
 	pub peer: Option<Arc<ClusterPool<P>>>,
 }
 
-impl PoolConfig {
-	/// Builds one outbound pool on this configuration. The pool dials as
-	/// [`ClusterTlsConfig::outbound`] configures it, validates servers against
-	/// `trust` before the server policy of `tls`, and measures time on
-	/// `clock`.
-	fn build_one<P>(
+impl ClusterTlsConfig {
+	/// Builds one outbound pool from the settings `pool`. The pool dials as
+	/// [`Self::outbound`] configures it, validates servers against `trust`
+	/// before the server policy of this config, and measures time on `clock`.
+	fn pool<P>(
 		&self,
+		pool: &PoolConfig,
 		clock: &Arc<dyn Clock>,
-		tls: &ClusterTlsConfig,
 		trust: Option<Arc<dyn CertificateTrust>>,
 	) -> Arc<ClusterPool<P>>
 	where
-		P: Protocol<CryptoProvider = DefaultCryptoProvider> + Send + Sync + 'static,
+		P: Protocol + Send + Sync + 'static,
 		P::Address: core::hash::Hash + Eq + Clone + Send + Sync,
 		P::Transport: Send + Sync,
 	{
-		// `with_config` takes the config by value, so the copy costs a
-		// refcount bump on the mux offer.
+		// `with_config` takes the config by value, so the copy costs one `Arc`
+		// clone of the mux offer.
 		let builder = ClusterPool::<P>::builder()
-			.with_config(self.clone())
+			.with_config(pool.clone())
 			.with_clock(Arc::clone(clock));
-		let mut builder = tls.outbound(builder);
+		let mut builder = self.outbound(builder);
 
 		if let Some(store) = trust {
 			builder = builder.with_trust_store(store);
@@ -58,29 +56,25 @@ impl PoolConfig {
 		Arc::new(builder.build())
 	}
 
-	/// Builds the hive pool and, when peer trust is configured, the peer
-	/// pool from one client identity. Both pools measure time on the
-	/// gateway's `clock`.
+	/// Builds the hive pool from `pool` and, when `peer_trust` is set, the
+	/// peer pool, both under one client identity. Both pools measure time on
+	/// the gateway's `clock`.
 	///
-	/// The method takes the whole TLS config because `hive_trust` and
-	/// `peer_trust` share a type, so passing them positionally would let a
-	/// swap compile and cross the trust planes.
-	pub(crate) fn build_cluster_pools<P>(
-		&self,
-		tls: &ClusterTlsConfig,
-		clock: &Arc<dyn Clock>,
-	) -> Result<ClusterPools<P>, TightBeamError>
+	/// Each pool reads its trust plane here, on the config that holds both,
+	/// because `hive_trust` and `peer_trust` share a type, so a caller that
+	/// passed them by position could swap them and cross the trust planes.
+	pub(crate) fn pools<P>(&self, pool: &PoolConfig, clock: &Arc<dyn Clock>) -> ClusterPools<P>
 	where
-		P: Protocol<CryptoProvider = DefaultCryptoProvider> + Send + Sync + 'static,
+		P: Protocol + Send + Sync + 'static,
 		P::Address: core::hash::Hash + Eq + Clone + Send + Sync,
 		P::Transport: Send + Sync,
 	{
-		let hive_trust = tls.hive_trust.as_ref().map(Arc::clone);
-		let hive_pool = self.build_one::<P>(clock, tls, hive_trust);
-		let peer_trust = tls.peer_trust.as_ref().map(Arc::clone);
-		let build_peer = |trust| self.build_one::<P>(clock, tls, Some(trust));
+		let hive_trust = self.hive_trust.as_ref().map(Arc::clone);
+		let hive_pool = self.pool::<P>(pool, clock, hive_trust);
+		let peer_trust = self.peer_trust.as_ref().map(Arc::clone);
+		let build_peer = |trust| self.pool::<P>(pool, clock, Some(trust));
 		let peer_pool = peer_trust.map(build_peer);
 
-		Ok(ClusterPools { hive: hive_pool, peer: peer_pool })
+		ClusterPools { hive: hive_pool, peer: peer_pool }
 	}
 }

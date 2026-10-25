@@ -30,6 +30,7 @@ use core::time::Duration;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+use super::runtime::LoopFault;
 use super::{ClusterError, ClusterTlsConfig};
 use crate::asn1::Frame;
 use crate::colony::common::IssuedAt;
@@ -39,27 +40,110 @@ use crate::constants::{
 	DEFAULT_GOSSIP_TTL, MAX_GOSSIP_LOG, MAX_GOSSIP_LOG_PER_SIGNER, MAX_GOSSIP_PAYLOAD_BYTES, MAX_GOSSIP_RATE_SIGNERS,
 	MAX_GOSSIP_TTL,
 };
-use crate::crypto::hash::{Digest, OutputSizeUser, U32};
+use crate::crypto::hash::{Digest, OutputSizeUser};
 use crate::crypto::sign::VerifiedSignature;
 use crate::decode;
 use crate::policy::TransitStatus;
+use crate::transport::handshake::primitives::transcript::DigestOutput;
 use crate::utils::time::UnixMillis;
 use crate::TightBeamError;
 
-/// Fixed 32-byte content digest of a gossip rumor.
+/// The content digest of a gossip rumor, under the digest of the colony's
+/// provider.
 ///
-/// The algorithm is the deployment crypto-profile digest. Every gateway
-/// MUST derive the same digest for the same rumor.
-pub type GossipDigest = [u8; 32];
+/// Every gateway of a colony runs one provider, so every gateway derives the
+/// same digest for the same rumor, and the digest is as wide as the output of
+/// that provider's digest. [`VerifiedRumor::gossip_digest`] computes one, and
+/// [`GossipDigest::read`] reads one that a peer sent.
+///
+/// # Width
+///
+/// The digest sits inline at its width, from 32 to 64 octets, the widths of
+/// the digests a handshake runs. It is [`Copy`], so a rumor admits, journals,
+/// and compares its digest on the stack.
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam::colony::cluster::GossipDigest;
+/// use tightbeam::crypto::hash::{Sha3_256, Sha3_512};
+///
+/// let digest = GossipDigest::read::<Sha3_512>([7u8; 64]);
+/// assert!(digest.is_some_and(|digest| digest.as_bytes().len() == 64));
+///
+/// // An entry of another width names no rumor under the colony's digest.
+/// assert!(GossipDigest::read::<Sha3_256>([7u8; 64]).is_none());
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct GossipDigest(DigestOutput);
+
+impl GossipDigest {
+	/// Read `bytes` as a digest under `D`, or [`None`] for an entry of
+	/// another width, which names no rumor (CWE-20).
+	///
+	/// A durable [`GossipJournal`] keeps the [`Self::as_bytes`] of each digest
+	/// and restores the digest through this method. `D` is then the digest of
+	/// the colony's provider: for a gateway of protocol `P`,
+	/// `<<P as Protocol>::CryptoProvider as DigestProvider>::Digest`.
+	///
+	/// # Examples
+	///
+	/// A journal of the house colony, whose protocol is [`TokioListener`],
+	/// restores a digest it stored:
+	///
+	/// ```
+	/// use tightbeam::colony::cluster::GossipDigest;
+	/// use tightbeam::crypto::profiles::DigestProvider;
+	/// use tightbeam::transport::{Protocol, TokioListener};
+	///
+	/// type ColonyDigest = <<TokioListener as Protocol>::CryptoProvider as DigestProvider>::Digest;
+	///
+	/// let stored = [7u8; 32];
+	/// let restored = GossipDigest::read::<ColonyDigest>(stored).ok_or("a SHA3-256 digest is 32 octets")?;
+	/// assert_eq!(restored.as_bytes(), stored);
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	///
+	/// [`TokioListener`]: crate::transport::TokioListener
+	#[must_use]
+	pub fn read<D: OutputSizeUser>(bytes: impl AsRef<[u8]>) -> Option<Self> {
+		let bytes = bytes.as_ref();
+		let at_width = bytes.len() == D::output_size();
+		if !at_width {
+			return None;
+		}
+
+		let output = DigestOutput::parse(bytes).ok()?;
+		Some(Self(output))
+	}
+
+	/// The digest octets, as many as the output of the digest that made
+	/// them.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::colony::cluster::GossipDigest;
+	/// use tightbeam::crypto::hash::Sha3_512;
+	///
+	/// let digest = GossipDigest::read::<Sha3_512>([9u8; 64]).ok_or("a SHA3-512 digest is 64 octets")?;
+	/// assert_eq!(digest.as_bytes(), [9u8; 64]);
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	#[must_use]
+	pub fn as_bytes(&self) -> &[u8] {
+		self.0.as_bytes()
+	}
+}
 
 /// Whether a recorded rumor is newly seen or a suppressed duplicate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Admission {
-	/// The digest was unseen and is now recorded, so the caller delivers and
-	/// forwards the rumor.
+	/// The journal had not seen the digest and recorded it, so the caller
+	/// delivers and forwards the rumor.
 	New,
-	/// The digest was already recorded in the window, so the caller drops
-	/// the rumor.
+	/// The journal already held the digest in the window, so the caller
+	/// drops the rumor.
 	Duplicate,
 }
 
@@ -104,21 +188,18 @@ impl VerifiedRumor {
 	///
 	/// # Errors
 	///
-	/// - [`ClusterError`] -- the to-be-signed encoding fails.
-	pub fn gossip_digest<D>(&self) -> Result<GossipDigest, ClusterError>
-	where
-		D: Digest + OutputSizeUser<OutputSize = U32>,
-	{
+	/// - [`ClusterError::Frame`] -- the to-be-signed encoding fails, or the
+	///   output of `D` is outside the 32 to 64 octets of a [`GossipDigest`].
+	pub fn gossip_digest<D: Digest>(&self) -> Result<GossipDigest, ClusterError> {
 		let tbs = self.frame.to_tbs()?;
 		let mut hasher = D::new();
 		hasher.update(&tbs);
 		hasher.update(self.signature.as_bytes());
 
 		let output = hasher.finalize();
-		let mut digest = [0u8; 32];
-		digest.copy_from_slice(&output);
+		let output = DigestOutput::parse(output).map_err(TightBeamError::from)?;
 
-		Ok(digest)
+		Ok(GossipDigest(output))
 	}
 }
 
@@ -139,51 +220,68 @@ impl ClusterTlsConfig {
 	}
 }
 
-/// Digests that a peer advertised and this gateway lacks.
+/// Digests that a peer advertised and this gateway lacks, under the colony's
+/// digest `D`. Reconciliation is a set difference over content digests.
 ///
-/// Reconciliation is a set difference over content digests. An entry of
-/// another length than a [`GossipDigest`] names no rumor, so the want list
-/// drops it rather than echo it to its sender (CWE-20). A repeated
-/// advertisement entry appears once in the want list so a peer cannot
-/// inflate the reply by repeating itself (CWE-770).
+/// - An entry whose width differs from the output of `D` names no rumor, so the want list drops it (CWE-20).
+/// - A repeated entry appears once, so a peer cannot inflate the reply by repeating itself (CWE-770).
 ///
 /// # Examples
 ///
 /// ```
-/// use tightbeam::colony::cluster::gossip_want;
+/// use tightbeam::colony::cluster::{gossip_want, GossipDigest};
+/// use tightbeam::crypto::hash::Sha3_256;
 ///
+/// let held = [GossipDigest::read::<Sha3_256>([7u8; 32]).ok_or("a 32-octet digest reads")?];
 /// let advertised = vec![vec![7u8; 32], vec![9u8; 32], vec![1, 2, 3]];
-/// let want = gossip_want(&advertised, [[7u8; 32]]);
+/// let want = gossip_want::<Sha3_256>(&advertised, held);
 /// assert_eq!(want, vec![vec![9u8; 32]]);
+/// # Ok::<(), Box<dyn core::error::Error>>(())
 /// ```
 #[must_use]
-pub fn gossip_want(advertised: impl AsRef<[Vec<u8>]>, held: impl AsRef<[GossipDigest]>) -> Vec<Vec<u8>> {
+pub fn gossip_want<D: OutputSizeUser>(
+	advertised: impl AsRef<[Vec<u8>]>,
+	held: impl AsRef<[GossipDigest]>,
+) -> Vec<Vec<u8>> {
 	let advertised = advertised.as_ref();
 	let held = held.as_ref();
-	let local: HashSet<&[u8]> = held.iter().map(|digest| digest.as_slice()).collect();
+	let local: HashSet<&[u8]> = held.iter().map(GossipDigest::as_bytes).collect();
 	let mut unique: HashSet<&[u8]> = HashSet::new();
 
 	advertised
 		.iter()
-		.filter(|digest| digest.len() == size_of::<GossipDigest>())
+		.filter(|digest| digest.len() == D::output_size())
 		.filter(|digest| !local.contains(digest.as_slice()))
 		.filter(|digest| unique.insert(digest.as_slice()))
 		.cloned()
 		.collect()
 }
 
-/// Digests from a peer want-list that decode to a fixed 32-byte digest.
+/// Digests from a peer want-list that read as digests under the colony's
+/// digest `D`.
 ///
-/// The filter drops a wrong-length entry, which cannot be a retained digest
-/// (CWE-20). Duplicates collapse to one, because a peer MUST NOT multiply
-/// repair pushes (CWE-770).
+/// The width filter runs first, because an entry of another width cannot be a
+/// retained digest (CWE-20). The digests it reads then collapse their
+/// duplicates to one, because a peer MUST NOT multiply repair pushes
+/// (CWE-770).
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam::colony::cluster::wanted_digests;
+/// use tightbeam::crypto::hash::Sha3_512;
+///
+/// let want = vec![vec![9u8; 64], vec![9u8; 64], vec![7u8; 32]];
+/// let wanted = wanted_digests::<Sha3_512>(&want);
+/// assert_eq!(wanted.len(), 1);
+/// ```
 #[must_use]
-pub fn wanted_digests(want: impl AsRef<[Vec<u8>]>) -> Vec<GossipDigest> {
+pub fn wanted_digests<D: OutputSizeUser>(want: impl AsRef<[Vec<u8>]>) -> Vec<GossipDigest> {
 	let want = want.as_ref();
 	let mut unique: HashSet<GossipDigest> = HashSet::new();
 
 	want.iter()
-		.filter_map(|bytes| GossipDigest::try_from(bytes.as_slice()).ok())
+		.filter_map(GossipDigest::read::<D>)
 		.filter(|digest| unique.insert(*digest))
 		.collect()
 }
@@ -224,10 +322,12 @@ impl AdmittedGossip {
 	/// - `ttl` exceeds [`MAX_GOSSIP_TTL`], which caps the hop radius here at the trust boundary (CWE-770).
 	/// - The issue time is stale.
 	/// - The to-be-signed encoding of the rumor fails, so it has no digest.
-	pub fn admit<D>(rumor: &VerifiedRumor, ttl: u64, seen_ttl: Duration, now: UnixMillis) -> Result<Self, TransitStatus>
-	where
-		D: Digest + OutputSizeUser<OutputSize = U32>,
-	{
+	pub fn admit<D: Digest>(
+		rumor: &VerifiedRumor,
+		ttl: u64,
+		seen_ttl: Duration,
+		now: UnixMillis,
+	) -> Result<Self, TransitStatus> {
 		let frame = rumor.frame();
 		let body: GossipRumor = decode(frame.message()).map_err(|_| TransitStatus::PermissionDenied)?;
 
@@ -245,8 +345,8 @@ impl AdmittedGossip {
 
 	/// Content digest for deduplication and reconciliation.
 	#[must_use]
-	pub fn digest(&self) -> GossipDigest {
-		self.digest
+	pub fn digest(&self) -> &GossipDigest {
+		&self.digest
 	}
 
 	/// Application payload from the signed rumor body.
@@ -259,6 +359,109 @@ impl AdmittedGossip {
 	#[must_use]
 	pub fn kind(&self) -> GossipRumorKind {
 		self.kind
+	}
+}
+
+/// The two consumers of an admitted rumor: the local ingress and the routing
+/// state.
+///
+/// The gateway's gossip pipeline implements it, and the methods of
+/// [`GossipRumorKind`] call the consumer that each kind's rule names.
+pub(crate) trait RumorConsumer {
+	/// Deliver `rumor`, journaled under `digest`, to the local ingress
+	/// servlet.
+	async fn deliver(self, rumor: Frame, digest: GossipDigest) -> Result<(), LoopFault>;
+
+	/// Apply the advertisement frame that `payload` carries to the routing
+	/// state.
+	fn apply_advertisement(self, payload: &[u8]) -> Result<(), LoopFault>;
+}
+
+/// The rules that differ by the kind of a rumor.
+///
+/// Each one is a method here, so a new kind states its journal, its
+/// consumption, its retry, and the signer it names in this one place.
+impl GossipRumorKind {
+	/// Journal one admitted rumor of this kind under `digest`, against the
+	/// budget of `signer`.
+	///
+	/// - The journal retains an application rumor for anti-entropy repair and delivery retry.
+	/// - The journal witnesses an advertisement rumor for deduplication alone,
+	///   which keeps retention and repair bandwidth for the rumors that use
+	///   them.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError`] -- the errors of [`GossipJournal::record`] and [`GossipJournal::witness`].
+	pub(crate) fn journal(
+		self,
+		journal: &dyn GossipJournal,
+		signer: &[u8],
+		digest: GossipDigest,
+		rumor: &Frame,
+		now: UnixMillis,
+	) -> Result<Admission, ClusterError> {
+		match self {
+			Self::Application => journal.record(signer, digest, rumor, now),
+			Self::PeerAdvertisement => journal.witness(signer, digest, now),
+		}
+	}
+
+	/// Consume one admitted rumor of this kind through `consumer`.
+	///
+	/// - An application rumor goes to the local ingress. The ingress takes a
+	///   copy of `rumor`, because the reflood still carries it.
+	/// - An advertisement rumor applies the advertisement its `payload`
+	///   carries to the routing state, as gateway routing control.
+	///
+	/// # Errors
+	///
+	/// - [`LoopFault`] -- the errors of the consumer it calls.
+	pub(crate) async fn consume(
+		self,
+		consumer: impl RumorConsumer,
+		rumor: &Frame,
+		digest: GossipDigest,
+		payload: &[u8],
+	) -> Result<(), LoopFault> {
+		match self {
+			Self::Application => consumer.deliver(rumor.clone(), digest).await,
+			Self::PeerAdvertisement => consumer.apply_advertisement(payload),
+		}
+	}
+
+	/// Retry the local delivery of `rumor`, which the journal retained under
+	/// `digest` and which waits for its ingress.
+	///
+	/// The journal retains the application kind, so a retry delivers a rumor
+	/// of that kind. The journal witnesses an advertisement rumor alone, so
+	/// its retry completes at once.
+	///
+	/// # Errors
+	///
+	/// - [`LoopFault`] -- the errors of [`RumorConsumer::deliver`].
+	pub(crate) async fn retry(
+		self,
+		consumer: impl RumorConsumer,
+		rumor: Frame,
+		digest: GossipDigest,
+	) -> Result<(), LoopFault> {
+		match self {
+			Self::Application => consumer.deliver(rumor, digest).await,
+			Self::PeerAdvertisement => Ok(()),
+		}
+	}
+
+	/// The signer that the consumption of an origin rumor of this kind reads.
+	///
+	/// - An advertisement reads the signer `name` gives, which its apply binds
+	///   to the signer of the advertisement it carries.
+	/// - An application rumor gives [`None`], because its delivery reads the rumor alone.
+	pub(crate) fn origin_signer<S>(self, name: impl FnOnce() -> Option<S>) -> Option<S> {
+		match self {
+			Self::Application => None,
+			Self::PeerAdvertisement => name(),
+		}
 	}
 }
 
@@ -284,7 +487,7 @@ pub trait GossipAdmission: Send + Sync {
 	fn allow(&self, signer: &[u8], now: UnixMillis) -> Result<bool, ClusterError>;
 }
 
-/// One signer's bucket: remaining tokens and the last refill instant.
+/// One signer's bucket, with its remaining tokens and its last refill instant.
 struct TokenBucket {
 	tokens: u32,
 	refilled_at: UnixMillis,
@@ -391,6 +594,13 @@ impl GossipAdmission for TokenBucketAdmission {
 /// in-memory default gives bounded-window eventual delivery, and a durable
 /// backend can retain across restarts. Errors are typed [`ClusterError`]
 /// variants.
+///
+/// # Digest width
+///
+/// Every digest a gateway hands its journal has the width of the colony
+/// digest, the digest of the gateway's provider, which is fixed for the life
+/// of the gateway. A durable backend stores the [`GossipDigest::as_bytes`] of
+/// each one and restores it with [`GossipDigest::read`] under that digest.
 pub trait GossipJournal: Send + Sync {
 	/// Deduplicate and retain one origin-signed rumor in a single step.
 	///
@@ -413,9 +623,9 @@ pub trait GossipJournal: Send + Sync {
 
 	/// Deduplicate one ephemeral rumor digest without retaining the rumor.
 	///
-	/// Advertisement-class rumors dedup and loop-break on the seen set
-	/// only. The advertise beat re-publishes fresh state, so a repair of a
-	/// stale hint would waste relay bandwidth and retention capacity.
+	/// An advertisement rumor uses the seen set alone, to deduplicate and to
+	/// break loops. The advertise beat re-publishes fresh state, so a repair
+	/// of a stale hint would waste relay bandwidth and retention capacity.
 	///
 	/// # Witnessed digest
 	///
@@ -440,8 +650,8 @@ pub trait GossipJournal: Send + Sync {
 	/// a signer's token: relay echoes are normal and MUST NOT drain the bucket.
 	///
 	/// The probe is advisory. [`GossipJournal::record`] and
-	/// [`GossipJournal::witness`] remain the atomic dedup steps for races
-	/// past it.
+	/// [`GossipJournal::witness`] remain the atomic deduplication steps for
+	/// races past it.
 	///
 	/// # Errors
 	///
@@ -517,9 +727,9 @@ struct JournalEntry {
 /// What the journal keeps behind a deduplicated digest.
 ///
 /// A retained rumor serves anti-entropy repair and local delivery retry.
-/// A witnessed digest serves dedup only and holds no bytes. The retained
-/// rumor is boxed so a witnessed entry costs one pointer rather than a full
-/// inline [`Frame`].
+/// A witnessed digest serves deduplication alone and holds no bytes. The
+/// retained rumor is boxed, so a witnessed entry costs one pointer rather
+/// than a full inline [`Frame`].
 enum JournalBody {
 	Retained { rumor: Box<Frame>, local: LocalDelivery },
 	Witnessed,
@@ -615,7 +825,7 @@ impl Drop for LocalClaimGuard<'_> {
 enum LocalDelivery {
 	/// The rumor awaits delivery, with no task holding it.
 	Pending,
-	/// One task is delivering it now.
+	/// One task holds the rumor for its delivery.
 	Claimed,
 	/// The rumor is delivered, so the retry set drops it for good.
 	Delivered,
@@ -623,9 +833,9 @@ enum LocalDelivery {
 
 /// In-memory [`GossipJournal`] with per-signer partitioning.
 ///
-/// Dedup is global on the content digest: rumor bytes travel unchanged
-/// across relays (each relay rebuilds only the OUTER hop frame), so the digest
-/// matches wherever the rumor arrives.
+/// Deduplication is global on the content digest. Each relay rebuilds only
+/// the OUTER hop frame, so rumor bytes travel unchanged across relays and the
+/// digest matches wherever the rumor arrives.
 ///
 /// # Capacity
 ///
@@ -756,7 +966,7 @@ pub struct GossipConfig {
 	/// Every trusted colony delivers through this type, so an operator who
 	/// restricts exports should treat it as a channel for the whole flood.
 	pub ingress: Option<ServletTypeKey>,
-	/// Dedup and retention store, which owns its own retention window.
+	/// Deduplication and retention store, which owns its own retention window.
 	pub journal: Arc<dyn GossipJournal>,
 	/// Per-signer rate admission before record or reflood.
 	pub admission: Arc<dyn GossipAdmission>,
@@ -816,9 +1026,9 @@ impl MemoryGossipJournal {
 			.filter(|entry| entry.signer == signer)
 			.filter(|entry| discriminant(&entry.body) == body_kind)
 			.count();
+
 		let within_global = entries.len() < self.capacity;
 		let within_signer = signer_held < self.per_signer_capacity;
-
 		if within_global && within_signer {
 			let entry = JournalEntry { signer: signer.to_vec(), recorded_at: now, body };
 			entries.insert(digest, entry);
@@ -952,10 +1162,11 @@ mod tests {
 	use super::*;
 	use crate::asn1::Version;
 	use crate::builder::{FrameBuilder, TypeBuilder};
-	use crate::crypto::hash::Sha3_256;
+	use crate::crypto::hash::{Sha3_256, Sha3_512};
 	use crate::crypto::sign::ecdsa::Secp256k1Signature;
 	use crate::encode;
-	use crate::testing::{TestFrame, TestIdentity, TestKey, TestMessage};
+	use crate::tb_cases;
+	use crate::testing::{TestFrame, TestIdentity, TestKey, TestMessage, TestRumor};
 
 	/// The reference instant the fixture rumors are issued at.
 	const T0: UnixMillis = UnixMillis::new(1_000);
@@ -963,51 +1174,29 @@ mod tests {
 	/// The freshness and retention window the fixtures run under.
 	const WINDOW: Duration = Duration::from_millis(30_000);
 
-	/// `rumor` beside its signature, as its verification under the fixed test
-	/// identity returns it.
-	fn verified(rumor: Frame) -> VerifiedRumor {
-		let identity = TestIdentity::insecure_fixed();
-		let verifying = rumor.verify_under(identity.signing_certificate(), identity.policy());
-		let signature = verifying.expect("the fixed test key signed the rumor");
-		VerifiedRumor::new(rumor, signature)
-	}
-
 	fn digest(rumor: &Frame) -> GossipDigest {
-		let verified = verified(rumor.clone());
+		let verified = TestRumor::verified(rumor.clone());
 		verified.gossip_digest::<Sha3_256>().expect("test rumor frames encode")
-	}
-
-	/// A rumor of `payload` at `order`, signed by the fixed test key.
-	fn rumor(order: u64, payload: impl Into<Vec<u8>>) -> Frame {
-		let payload: Vec<u8> = payload.into();
-		let body = GossipRumor::application(payload);
-		FrameBuilder::from(Version::V1)
-			.with_id("rumor")
-			.with_order(order)
-			.with_message(body)
-			.with_signer::<Secp256k1Signature, _>(TestIdentity::certified(TestKey::insecure_fixed_signing()))
-			.build()
-			.expect("test rumor frames build")
 	}
 
 	#[test]
 	fn digest_is_deterministic() {
-		let frame = rumor(1_000, vec![1, 2, 3]);
+		let frame = TestRumor::application(1_000, vec![1, 2, 3]);
 		assert_eq!(digest(&frame), digest(&frame));
 	}
 
 	#[test]
 	fn digest_tracks_payload_and_order() {
-		let base = rumor(1_000, vec![1, 2, 3]);
-		let other_payload = rumor(1_000, vec![9, 9, 9]);
-		let other_order = rumor(2_000, vec![1, 2, 3]);
+		let base = TestRumor::application(1_000, vec![1, 2, 3]);
+		let other_payload = TestRumor::application(1_000, vec![9, 9, 9]);
+		let other_order = TestRumor::application(2_000, vec![1, 2, 3]);
 		assert_ne!(digest(&base), digest(&other_payload));
 		assert_ne!(digest(&base), digest(&other_order));
 	}
 
 	#[test]
 	fn digest_survives_decode_reencode() {
-		let frame = rumor(1_000, vec![1, 2, 3]);
+		let frame = TestRumor::application(1_000, vec![1, 2, 3]);
 		let relayed: Frame =
 			decode(&encode(&frame).expect("test rumor frames encode")).expect("canonical bytes decode");
 		assert_eq!(digest(&frame), digest(&relayed));
@@ -1015,32 +1204,34 @@ mod tests {
 
 	#[test]
 	fn admit_accepts_valid_rumor() -> Result<(), TransitStatus> {
-		let frame = rumor(1_000, vec![1, 2, 3]);
-		let admitted = AdmittedGossip::admit::<Sha3_256>(&verified(frame.clone()), 4, WINDOW, T0)?;
-		assert_eq!(admitted.digest(), digest(&frame));
+		let frame = TestRumor::application(1_000, vec![1, 2, 3]);
+		let rumor = TestRumor::verified(frame.clone());
+		let admitted = AdmittedGossip::admit::<Sha3_256>(&rumor, 4, WINDOW, T0)?;
+		assert_eq!(admitted.digest(), &digest(&frame));
 		assert_eq!(admitted.payload(), &[1, 2, 3]);
 		Ok(())
 	}
 
 	#[test]
 	fn admit_refuses_oversized_payload() {
-		let frame = rumor(1_000, vec![0u8; MAX_GOSSIP_PAYLOAD_BYTES + 1]);
-		let status = AdmittedGossip::admit::<Sha3_256>(&verified(frame), 4, WINDOW, T0);
+		let frame = TestRumor::application(1_000, vec![0u8; MAX_GOSSIP_PAYLOAD_BYTES + 1]);
+		let rumor = TestRumor::verified(frame);
+		let status = AdmittedGossip::admit::<Sha3_256>(&rumor, 4, WINDOW, T0);
 		assert_eq!(status.err(), Some(TransitStatus::PermissionDenied));
 	}
 
 	#[test]
 	fn admit_refuses_excessive_ttl() {
-		let frame = rumor(1_000, vec![1, 2, 3]);
+		let rumor = TestRumor::verified(TestRumor::application(1_000, vec![1, 2, 3]));
 		let over = u64::from(MAX_GOSSIP_TTL) + 1;
-		let status = AdmittedGossip::admit::<Sha3_256>(&verified(frame), over, WINDOW, T0);
+		let status = AdmittedGossip::admit::<Sha3_256>(&rumor, over, WINDOW, T0);
 		assert_eq!(status.err(), Some(TransitStatus::PermissionDenied));
 	}
 
 	#[test]
 	fn admit_refuses_stale_rumor() {
-		let frame = rumor(1_000, vec![1, 2, 3]);
-		let status = AdmittedGossip::admit::<Sha3_256>(&verified(frame), 4, WINDOW, UnixMillis::new(100_000));
+		let rumor = TestRumor::verified(TestRumor::application(1_000, vec![1, 2, 3]));
+		let status = AdmittedGossip::admit::<Sha3_256>(&rumor, 4, WINDOW, UnixMillis::new(100_000));
 		assert_eq!(status.err(), Some(TransitStatus::PermissionDenied));
 	}
 
@@ -1056,7 +1247,8 @@ mod tests {
 			.with_signer::<Secp256k1Signature, _>(signer)
 			.build()?;
 
-		let status = AdmittedGossip::admit::<Sha3_256>(&verified(frame), 4, WINDOW, T0);
+		let rumor = TestRumor::verified(frame);
+		let status = AdmittedGossip::admit::<Sha3_256>(&rumor, 4, WINDOW, T0);
 		assert_eq!(status.err(), Some(TransitStatus::PermissionDenied));
 		Ok(())
 	}
@@ -1067,7 +1259,7 @@ mod tests {
 	#[test]
 	fn a_rumor_replayed_with_its_s_flipped_is_a_duplicate() -> Result<(), ClusterError> {
 		let journal = MemoryGossipJournal::default();
-		let frame = rumor(1_000, vec![1, 2, 3]);
+		let frame = TestRumor::application(1_000, vec![1, 2, 3]);
 		let flipped = TestFrame::with_flipped_s(&frame);
 
 		journal.record(b"signer-a", digest(&frame), &frame, T0)?;
@@ -1080,7 +1272,7 @@ mod tests {
 	#[test]
 	fn record_dedups_same_digest() -> Result<(), ClusterError> {
 		let journal = MemoryGossipJournal::default();
-		let frame = rumor(1_000, vec![1, 2, 3]);
+		let frame = TestRumor::application(1_000, vec![1, 2, 3]);
 		let digest = digest(&frame);
 
 		let first = journal.record(b"signer-a", digest, &frame, T0)?;
@@ -1093,7 +1285,7 @@ mod tests {
 	#[test]
 	fn seen_tracks_retention_window() -> Result<(), ClusterError> {
 		let journal = MemoryGossipJournal::new(WINDOW);
-		let frame = rumor(1_000, vec![1, 2, 3]);
+		let frame = TestRumor::application(1_000, vec![1, 2, 3]);
 		let digest = digest(&frame);
 		let before = journal.seen(&digest, T0)?;
 
@@ -1110,7 +1302,7 @@ mod tests {
 	#[test]
 	fn witness_dedups_same_digest() -> Result<(), ClusterError> {
 		let journal = MemoryGossipJournal::default();
-		let frame = rumor(1_000, vec![1, 2, 3]);
+		let frame = TestRumor::application(1_000, vec![1, 2, 3]);
 		let digest = digest(&frame);
 
 		let first = journal.witness(b"signer-a", digest, T0)?;
@@ -1123,14 +1315,14 @@ mod tests {
 	#[test]
 	fn witness_is_seen_but_never_retained() -> Result<(), ClusterError> {
 		let journal = MemoryGossipJournal::default();
-		let frame = rumor(1_000, vec![1, 2, 3]);
+		let frame = TestRumor::application(1_000, vec![1, 2, 3]);
 		let digest = digest(&frame);
 
 		journal.witness(b"signer-a", digest, T0)?;
 
 		assert!(journal.seen(&digest, T0)?);
 		assert!(journal.held_digests(T0)?.is_empty());
-		assert!(journal.fetch(&[digest], T0)?.is_empty());
+		assert!(journal.fetch(core::slice::from_ref(&digest), T0)?.is_empty());
 		assert!(journal.pending_local(T0)?.is_empty());
 		Ok(())
 	}
@@ -1138,7 +1330,7 @@ mod tests {
 	#[test]
 	fn witness_blocks_record_of_same_digest() -> Result<(), ClusterError> {
 		let journal = MemoryGossipJournal::default();
-		let frame = rumor(1_000, vec![1, 2, 3]);
+		let frame = TestRumor::application(1_000, vec![1, 2, 3]);
 		let digest = digest(&frame);
 
 		journal.witness(b"signer-a", digest, T0)?;
@@ -1151,7 +1343,7 @@ mod tests {
 	#[test]
 	fn witness_expires_with_retention() -> Result<(), ClusterError> {
 		let journal = MemoryGossipJournal::new(WINDOW);
-		let frame = rumor(1_000, vec![1, 2, 3]);
+		let frame = TestRumor::application(1_000, vec![1, 2, 3]);
 		let digest = digest(&frame);
 
 		journal.witness(b"signer-a", digest, T0)?;
@@ -1163,8 +1355,8 @@ mod tests {
 	#[test]
 	fn witness_fails_closed_at_signer_capacity() -> Result<(), ClusterError> {
 		let journal = MemoryGossipJournal::with_limits(WINDOW, JournalLimits { total: 8, per_signer: 1 });
-		let first = rumor(1_000, vec![1]);
-		let second = rumor(1_000, vec![2]);
+		let first = TestRumor::application(1_000, vec![1]);
+		let second = TestRumor::application(1_000, vec![2]);
 
 		journal.witness(b"signer-a", digest(&first), T0)?;
 
@@ -1176,8 +1368,8 @@ mod tests {
 	#[test]
 	fn witness_and_record_spend_separate_signer_budgets() -> Result<(), ClusterError> {
 		let journal = MemoryGossipJournal::with_limits(WINDOW, JournalLimits { total: 8, per_signer: 1 });
-		let witnessed = rumor(1_000, vec![1]);
-		let retained = rumor(1_000, vec![2]);
+		let witnessed = TestRumor::application(1_000, vec![1]);
+		let retained = TestRumor::application(1_000, vec![2]);
 
 		let hint = journal.witness(b"signer-a", digest(&witnessed), T0)?;
 		let application = journal.record(b"signer-a", digest(&retained), &retained, T0)?;
@@ -1189,8 +1381,8 @@ mod tests {
 	#[test]
 	fn record_fails_closed_at_global_capacity() -> Result<(), ClusterError> {
 		let journal = MemoryGossipJournal::with_limits(WINDOW, JournalLimits { total: 1, per_signer: 8 });
-		let first = rumor(1_000, vec![1]);
-		let second = rumor(1_000, vec![2]);
+		let first = TestRumor::application(1_000, vec![1]);
+		let second = TestRumor::application(1_000, vec![2]);
 
 		journal.record(b"signer-a", digest(&first), &first, T0)?;
 
@@ -1202,9 +1394,9 @@ mod tests {
 	#[test]
 	fn record_fails_closed_at_per_signer_capacity() -> Result<(), ClusterError> {
 		let journal = MemoryGossipJournal::with_limits(WINDOW, JournalLimits { total: 8, per_signer: 1 });
-		let first = rumor(1_000, vec![1]);
-		let second = rumor(1_000, vec![2]);
-		let other = rumor(1_000, vec![3]);
+		let first = TestRumor::application(1_000, vec![1]);
+		let second = TestRumor::application(1_000, vec![2]);
+		let other = TestRumor::application(1_000, vec![3]);
 
 		journal.record(b"signer-a", digest(&first), &first, T0)?;
 
@@ -1218,7 +1410,7 @@ mod tests {
 	#[test]
 	fn pending_local_clears_on_ack() -> Result<(), ClusterError> {
 		let journal = MemoryGossipJournal::default();
-		let frame = rumor(1_000, vec![1, 2, 3]);
+		let frame = TestRumor::application(1_000, vec![1, 2, 3]);
 		let digest = digest(&frame);
 
 		journal.record(b"signer-a", digest, &frame, T0)?;
@@ -1236,7 +1428,7 @@ mod tests {
 	#[test]
 	fn a_claimed_rumor_is_not_offered_again() -> Result<(), ClusterError> {
 		let journal = MemoryGossipJournal::default();
-		let frame = rumor(1_000, vec![1, 2, 3]);
+		let frame = TestRumor::application(1_000, vec![1, 2, 3]);
 		let digest = digest(&frame);
 
 		journal.record(b"signer-a", digest, &frame, T0)?;
@@ -1260,7 +1452,7 @@ mod tests {
 	#[test]
 	fn a_dropped_delivery_returns_its_rumor_to_the_retry_set() -> Result<(), ClusterError> {
 		let journal = MemoryGossipJournal::default();
-		let frame = rumor(1_000, vec![1, 2, 3]);
+		let frame = TestRumor::application(1_000, vec![1, 2, 3]);
 		let digest = digest(&frame);
 
 		journal.record(b"signer-a", digest, &frame, T0)?;
@@ -1278,7 +1470,7 @@ mod tests {
 	#[test]
 	fn an_acked_delivery_retires_its_rumor() -> Result<(), ClusterError> {
 		let journal = MemoryGossipJournal::default();
-		let frame = rumor(1_000, vec![1, 2, 3]);
+		let frame = TestRumor::application(1_000, vec![1, 2, 3]);
 		let digest = digest(&frame);
 
 		journal.record(b"signer-a", digest, &frame, T0)?;
@@ -1294,7 +1486,7 @@ mod tests {
 	#[test]
 	fn a_released_rumor_is_offered_again() -> Result<(), ClusterError> {
 		let journal = MemoryGossipJournal::default();
-		let frame = rumor(1_000, vec![1, 2, 3]);
+		let frame = TestRumor::application(1_000, vec![1, 2, 3]);
 		let digest = digest(&frame);
 
 		journal.record(b"signer-a", digest, &frame, T0)?;
@@ -1308,74 +1500,86 @@ mod tests {
 	#[test]
 	fn fetch_returns_only_wanted() -> Result<(), ClusterError> {
 		let journal = MemoryGossipJournal::default();
-		let first = rumor(1_000, vec![1]);
-		let second = rumor(1_000, vec![2]);
+		let first = TestRumor::application(1_000, vec![1]);
+		let second = TestRumor::application(1_000, vec![2]);
 		let first_digest = digest(&first);
 
 		journal.record(b"signer-a", first_digest, &first, T0)?;
 		journal.record(b"signer-a", digest(&second), &second, T0)?;
 
-		let fetched = journal.fetch(&[first_digest], T0)?;
+		let fetched = journal.fetch(core::slice::from_ref(&first_digest), T0)?;
 		assert_eq!(fetched, vec![(first_digest, first)]);
 		Ok(())
 	}
 
 	#[test]
 	fn want_requests_only_unheld_digests() {
-		let held = rumor(1_000, vec![1]);
-		let missing = rumor(1_000, vec![2]);
+		let held = TestRumor::application(1_000, vec![1]);
+		let missing = TestRumor::application(1_000, vec![2]);
 		let held_digest = digest(&held);
-		let advertised = vec![held_digest.to_vec(), digest(&missing).to_vec()];
+		let advertised = vec![held_digest.as_bytes().to_vec(), digest(&missing).as_bytes().to_vec()];
 
-		let want = gossip_want(&advertised, [held_digest]);
-		assert_eq!(want, vec![digest(&missing).to_vec()]);
+		let want = gossip_want::<Sha3_256>(&advertised, [held_digest]);
+		assert_eq!(want, vec![digest(&missing).as_bytes().to_vec()]);
 	}
 
 	#[test]
 	fn want_is_empty_when_all_advertised_are_held() {
-		let first = digest(&rumor(1_000, vec![1]));
-		let second = digest(&rumor(1_000, vec![2]));
-		let advertised = vec![first.to_vec(), second.to_vec()];
+		let first = digest(&TestRumor::application(1_000, vec![1]));
+		let second = digest(&TestRumor::application(1_000, vec![2]));
+		let advertised = vec![first.as_bytes().to_vec(), second.as_bytes().to_vec()];
 
-		let want = gossip_want(&advertised, [first, second]);
+		let want = gossip_want::<Sha3_256>(&advertised, [first, second]);
 		assert!(want.is_empty());
 	}
 
 	#[test]
 	fn wanted_digests_keeps_only_correct_length() {
-		let good = digest(&rumor(1_000, vec![1]));
-		let want = vec![good.to_vec(), vec![0u8; 8], vec![0u8; 64]];
+		let good = digest(&TestRumor::application(1_000, vec![1]));
+		let want = vec![good.as_bytes().to_vec(), vec![0u8; 8], vec![0u8; 64]];
 
-		let decoded = wanted_digests(&want);
+		let decoded = wanted_digests::<Sha3_256>(&want);
 		assert_eq!(decoded, vec![good]);
 	}
 
 	#[test]
 	fn wanted_digests_collapses_duplicates() {
-		let good = digest(&rumor(1_000, vec![1]));
-		let want = vec![good.to_vec(), good.to_vec(), good.to_vec()];
+		let good = digest(&TestRumor::application(1_000, vec![1]));
+		let want = vec![good.as_bytes().to_vec(), good.as_bytes().to_vec(), good.as_bytes().to_vec()];
 
-		let decoded = wanted_digests(&want);
+		let decoded = wanted_digests::<Sha3_256>(&want);
 		assert_eq!(decoded, vec![good]);
 	}
 
-	/// An entry of another length than a digest names no rumor, so the want
+	/// Under a 64-octet digest, a 32-octet entry names no rumor, so the want
+	/// list reads the 64-octet entry alone.
+	#[test]
+	fn wanted_digests_read_at_the_width_of_the_colony_digest() {
+		let want = vec![vec![7u8; 32], vec![9u8; 64]];
+
+		let decoded = wanted_digests::<Sha3_512>(&want);
+		let read: Vec<&[u8]> = decoded.iter().map(GossipDigest::as_bytes).collect();
+		assert_eq!(read, vec![[9u8; 64].as_slice()]);
+	}
+
+	/// An entry whose length differs from a digest names no rumor, so the want
 	/// list drops it rather than echo it to its sender.
 	#[test]
 	fn want_drops_entries_of_another_length() {
 		let advertised = vec![vec![0u8; 5000], vec![1, 2, 3]];
 
-		let want = gossip_want(&advertised, []);
+		let want = gossip_want::<Sha3_256>(&advertised, []);
 		assert!(want.is_empty());
 	}
 
 	#[test]
 	fn want_collapses_repeated_advertisements() {
-		let missing = digest(&rumor(1_000, vec![2]));
-		let advertised = vec![missing.to_vec(), missing.to_vec(), missing.to_vec()];
+		let missing = digest(&TestRumor::application(1_000, vec![2]));
+		let entry = missing.as_bytes().to_vec();
+		let advertised = vec![entry.clone(), entry.clone(), entry];
 
-		let want = gossip_want(&advertised, []);
-		assert_eq!(want, vec![missing.to_vec()]);
+		let want = gossip_want::<Sha3_256>(&advertised, []);
+		assert_eq!(want, vec![missing.as_bytes().to_vec()]);
 	}
 
 	#[test]
@@ -1439,8 +1643,8 @@ mod tests {
 		let short_retention = Duration::from_millis(100);
 		let roomy = JournalLimits { total: 8, per_signer: 8 };
 		let journal = MemoryGossipJournal::with_limits(short_retention, roomy);
-		let early = rumor(1_000, vec![1]);
-		let late = rumor(1_000, vec![2]);
+		let early = TestRumor::application(1_000, vec![1]);
+		let late = TestRumor::application(1_000, vec![2]);
 
 		journal.record(b"signer-a", digest(&early), &early, UnixMillis::new(0))?;
 		journal.record(b"signer-a", digest(&late), &late, UnixMillis::new(200))?;
@@ -1455,17 +1659,29 @@ mod tests {
 		let short_retention = Duration::from_millis(100);
 		let roomy = JournalLimits { total: 8, per_signer: 8 };
 		let journal = MemoryGossipJournal::with_limits(short_retention, roomy);
-		let frame = rumor(1_000, vec![1]);
+		let frame = TestRumor::application(1_000, vec![1]);
 		let rumor_digest = digest(&frame);
 
 		journal.record(b"signer-a", rumor_digest, &frame, UnixMillis::new(0))?;
 
 		let held = journal.held_digests(T0)?;
-		let fetched = journal.fetch(&[rumor_digest], T0)?;
+		let fetched = journal.fetch(core::slice::from_ref(&rumor_digest), T0)?;
 		let pending = journal.pending_local(T0)?;
 		assert_eq!(held.len(), 0);
 		assert_eq!(fetched.len(), 0);
 		assert_eq!(pending.len(), 0);
 		Ok(())
+	}
+
+	// An origin advertisement names the signer its apply binds, and an origin
+	// application rumor, whose delivery reads no signer, names none.
+	tb_cases! {
+		fn an_origin_rumor_names_the_signer_its_kind_reads((kind, named): (GossipRumorKind, Option<u8>)) {
+			assert_eq!(kind.origin_signer(|| Some(7)), named);
+		}
+		cases {
+			application => (GossipRumorKind::Application, None),
+			peer_advertisement => (GossipRumorKind::PeerAdvertisement, Some(7)),
+		}
 	}
 }

@@ -1,17 +1,17 @@
-//! Peer-ad, gossip relay, publish, and reconcile request handlers.
+//! The request handlers for a peer ad, a gossip relay, a publish, and a
+//! reconcile round.
 
 use crate::builder::frame::FrameBuilder;
 use crate::builder::TypeBuilder;
 use crate::colony::cluster::peer::AdmittedPeerAd;
-use crate::colony::cluster::runtime::bounds::{ClusterDigest, ColonyDialProtocol, GatewayRuntimeCtx};
+use crate::colony::cluster::runtime::bounds::{ColonyConfig, ColonyDialProtocol, ColonyDigest, GatewayRuntimeCtx};
 use crate::colony::cluster::runtime::gossip_tasks::{GossipOrigin, GossipPipelineCtx};
 use crate::colony::cluster::runtime::refuse::Refusal;
-use crate::colony::cluster::{gossip_want, RouteKind};
+use crate::colony::cluster::{gossip_want, GossipDigest, RouteKind};
 use crate::colony::cluster::{ClusterConfig, ClusterError, PeerCaps, ServletRegistry, VerifiedRumor};
 use crate::colony::common::PeerGossip;
 use crate::colony::common::{
-	reply_frame, GossipReconciliation, GossipRumor, GossipRumorKind, GossipWant, PeerAdvertisement,
-	PeerAdvertisementResponse,
+	reply_frame, GossipReconciliation, GossipRumor, GossipWant, PeerAdvertisement, PeerAdvertisementResponse,
 };
 use crate::constants::MAX_PEX_SAMPLE;
 use crate::constants::{MAX_GOSSIP_LOG, MAX_GOSSIP_TTL};
@@ -80,11 +80,7 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 
 impl<P: ColonyDialProtocol> GossipPipelineCtx<P> {
 	/// Admit a peer-relayed origin-signed rumor and continue the flood.
-	pub(crate) async fn relay<D: ClusterDigest>(
-		self,
-		frame: Frame,
-		rumor: Box<Frame>,
-	) -> Result<Option<Frame>, TightBeamError> {
+	pub(crate) async fn relay(self, frame: Frame, rumor: Box<Frame>) -> Result<Option<Frame>, TightBeamError> {
 		let rumor = *rumor;
 		// The flood is scoped (CWE-668), so the relaying peer MUST be a member
 		// of it. A peer outside it is a policy refusal, so the relay's score
@@ -137,16 +133,12 @@ impl<P: ColonyDialProtocol> GossipPipelineCtx<P> {
 		// Freshness for a relayed rumor is its issue time, which `admit`
 		// checks against the seen TTL (seen-ttl) rather than the control
 		// window.
-		self.run::<D>(GossipOrigin::Relay, frame, rumor, hop_ttl, Some(relay_id), Some(rumor_signer))
+		self.run(GossipOrigin::Relay, frame, rumor, hop_ttl, Some(relay_id), Some(rumor_signer))
 			.await
 	}
 
 	/// Signs and floods origin gossip from a local hive-plane publisher.
-	pub(crate) async fn publish<D: ClusterDigest>(
-		self,
-		frame: Frame,
-		body: GossipRumor,
-	) -> Result<Option<Frame>, TightBeamError> {
+	pub(crate) async fn publish(self, frame: Frame, body: GossipRumor) -> Result<Option<Frame>, TightBeamError> {
 		if let Err(refusal) = self.config.verify_hive(&frame) {
 			return Refusal::to(&frame, &self.trace).gossip(refusal.into());
 		}
@@ -157,20 +149,20 @@ impl<P: ColonyDialProtocol> GossipPipelineCtx<P> {
 			return Refusal::to(&frame, &self.trace).gossip(TransitStatus::PermissionDenied);
 		}
 
-		// The hop radius is clamped outside the rumor body, so the rumor
-		// identity stays stable.
+		// The handler clamps the hop radius outside the rumor body, so the
+		// rumor identity stays stable.
 		let radius_cap = u64::from(self.config.gossip.ttl.min(MAX_GOSSIP_TTL));
 		let hop_ttl = frame.metadata().lifetime().unwrap_or(radius_cap).min(radius_cap);
 
 		// The rumor copies the id and order of the publish frame, so a
 		// replayed publish rebuilds an identical digest (CWE-294).
-		let peer_ad = matches!(body.kind, GossipRumorKind::PeerAdvertisement);
-		let rumor = FrameBuilder::from(Version::V2)
+		let kind = body.kind;
+		let builder = FrameBuilder::from(Version::V2)
 			.with_id(frame.metadata().id())
 			.with_order(frame.metadata().order())
-			.with_message(body)
-			.with_witness_hasher::<D>()
-			.build();
+			.with_message(body);
+
+		let rumor = self.config.witnessed(builder).build();
 		let mut rumor = match rumor {
 			Ok(rumor) => rumor,
 			Err(_) => {
@@ -183,7 +175,8 @@ impl<P: ColonyDialProtocol> GossipPipelineCtx<P> {
 			return Refusal::to(&frame, &self.trace).gossip(TransitStatus::Unavailable);
 		}
 
-		// The rumor's digest is taken under its own verified signature.
+		// The rumor's digest covers its signature, so `verify_own` verifies
+		// the signature this gateway made and pairs the two.
 		let Ok(rumor) = self.config.tls.verify_own(rumor) else {
 			return Refusal::to(&frame, &self.trace).gossip(TransitStatus::Unavailable);
 		};
@@ -191,29 +184,27 @@ impl<P: ColonyDialProtocol> GossipPipelineCtx<P> {
 		// A local peer-ad apply names the signer that this signing step
 		// proved. A hive-plane publish floods even when peer trust holds no
 		// anchor for this gateway, and the signer is then `None`.
-		let rumor_signer = if peer_ad {
+		let rumor_signer = kind.origin_signer(|| {
 			let verified = self.config.verify_peer(rumor.frame());
 			verified.map(|verified| verified.fingerprint()).ok()
-		} else {
-			None
-		};
+		});
 
-		self.run::<D>(GossipOrigin::Origin, frame, rumor, hop_ttl, None, rumor_signer)
-			.await
+		self.run(GossipOrigin::Origin, frame, rumor, hop_ttl, None, rumor_signer).await
 	}
 }
 
 impl ClusterConfig {
-	/// Peer-exchange sample for a reconcile reply.
+	/// The peer-exchange sample of a reconcile reply.
 	///
 	/// Probe-verified peers from the discovery table merge with live peer
 	/// routes installed from signed advertisements.
 	///
-	/// - Entries are deduped by dial address.
-	/// - The sample is capped at [`MAX_PEX_SAMPLE`].
+	/// - The sample deduplicates its entries by dial address.
+	/// - The sample holds at most [`MAX_PEX_SAMPLE`] entries.
 	/// - Both sources name flood members: a probe proved each table entry, and
 	///   a member's signed advertisement installed each route.
-	/// - A route outlives an expel, so a route's address is shared only while the peer table still holds it.
+	/// - A route outlives an expel, so the sample shares a route's address
+	///   only while the peer table still holds it.
 	/// - The receiver still treats every entry as an unverified hint until its own probe proves membership.
 	///
 	/// # Sources
@@ -249,8 +240,8 @@ impl ClusterConfig {
 				gateway_addr: entry.dial_target().route_bytes().to_vec(),
 			});
 
-		// The sample is capped at `MAX_PEX_SAMPLE`, so a linear scan dedupes
-		// by dial address without a set allocation per entry.
+		// The sample holds at most `MAX_PEX_SAMPLE` entries, so a linear scan
+		// deduplicates by dial address with no set allocation per entry.
 		let mut pex: Vec<PeerGossip> = Vec::new();
 		for candidate in verified.chain(routes) {
 			if pex.len() == MAX_PEX_SAMPLE {
@@ -262,6 +253,15 @@ impl ClusterConfig {
 		}
 
 		Ok(pex)
+	}
+}
+
+impl<P: Protocol> ColonyConfig<P> {
+	/// The digests of a peer's `advertised` list that this gateway lacks
+	/// beside its `held` digests, under the colony digest, by the rule of
+	/// [`gossip_want`].
+	fn gossip_want(&self, advertised: impl AsRef<[Vec<u8>]>, held: impl AsRef<[GossipDigest]>) -> Vec<Vec<u8>> {
+		gossip_want::<ColonyDigest<P>>(advertised, held)
 	}
 }
 
@@ -290,17 +290,18 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 			return Refusal::to(&frame, &self.trace).reconcile();
 		}
 
-		// The held digest list is capped at journal capacity (CWE-770).
+		// The handler caps the held digest list at journal capacity (CWE-770).
 		if reconciliation.held.len() > MAX_GOSSIP_LOG {
 			return Refusal::to(&frame, &self.trace).reconcile();
 		}
 
-		// A journal, table or registry this gateway cannot read refuses the
+		// A journal, table, or registry this gateway cannot read refuses the
 		// round, so the requester repairs from a member that can answer.
 		let Ok(held) = self.config.gossip.journal.held_digests(self.config.clock.unix()) else {
 			return Refusal::to(&frame, &self.trace).reconcile();
 		};
-		let want = gossip_want(&reconciliation.held, &held);
+
+		let want = self.config.gossip_want(&reconciliation.held, &held);
 
 		// The reply carries the peer-exchange sample, the GossipSub v1.1 PX
 		// piggyback shape. A seed-bootstrapped requester discovers the

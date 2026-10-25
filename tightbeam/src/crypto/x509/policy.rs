@@ -5,12 +5,10 @@
 //! key. The built-in validators check expiry, pin keys or fingerprints, deny
 //! fingerprints, anchor direct trust, and chain other validators.
 
-use core::marker::PhantomData;
-
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
-use crate::crypto::hash::{Digest, U32};
+use crate::crypto::hash::{Digest, OutputSizeUser};
 use crate::crypto::policy::VerificationPolicy;
 use crate::crypto::x509::error::CertificateValidationError;
 use crate::crypto::x509::utils::{CertificateExt, Fingerprint};
@@ -23,9 +21,9 @@ use crate::der::Encode;
 /// An implementor checks one certificate against its own policy and trust
 /// model.
 ///
-/// For simple validation (pinning, denylists, expiry checks), implement
-/// only this trait. For full PKI validation with signature verification,
-/// also implement [`SignatureVerification`].
+/// For a check that needs no signature, such as pinning, a denylist, or
+/// expiry, implement only this trait. For PKI validation with signature
+/// verification, also implement [`SignatureVerification`].
 pub trait CertificateValidation: Send + Sync {
 	/// Validate `cert` against this policy.
 	///
@@ -113,7 +111,7 @@ pub trait SignatureVerification: CertificateValidation {
 }
 
 // The pinning and denylist validators below implement direct-trust models
-// (trust-on-first-use and key pinning, cf. RFC 7469). The certification-path
+// (trust-on-first-use and key pinning, as in RFC 7469). The certification-path
 // validation of RFC 5280 §6.1 belongs to `CertificateTrustStore`.
 
 /// A validator that checks certificate expiry alone.
@@ -230,70 +228,130 @@ impl CertificateValidation for PublicKeyPinning {
 
 /// A validator that pins certificate fingerprints in a const-generic array.
 ///
-/// Its constructor is `const`, so a static configuration can hold one.
-///
 /// `D` is the digest algorithm, and `N` is the number of pinned fingerprints.
-#[derive(Debug, Clone, Copy)]
-pub struct FingerprintPinning<D, const N: usize> {
-	allowed_fingerprints: [&'static [u8; 32]; N],
-	_digest: PhantomData<D>,
+/// Each pin is a [`Fingerprint`] under `D`, so a pin of another width fails
+/// where it is read, through [`Fingerprint::try_from`].
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam::crypto::hash::Sha3_256;
+/// use tightbeam::crypto::x509::policy::{CertificateValidation, FingerprintPinning};
+/// use tightbeam::crypto::x509::utils::Fingerprint;
+/// use tightbeam::testing::{TestCertificate, TestKey};
+///
+/// let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+/// let pin = Fingerprint::<Sha3_256>::from_certificate(&certificate)?;
+///
+/// let pinning = FingerprintPinning::new([pin]);
+/// pinning.evaluate(&certificate)?;
+/// # Ok::<(), Box<dyn core::error::Error>>(())
+/// ```
+#[derive(Debug, Clone)]
+pub struct FingerprintPinning<D: OutputSizeUser, const N: usize> {
+	allowed_fingerprints: [Fingerprint<D>; N],
 }
 
-impl<D, const N: usize> FingerprintPinning<D, N>
-where
-	D: Digest,
-{
+impl<D: OutputSizeUser, const N: usize> FingerprintPinning<D, N> {
 	/// Create a validator that admits a certificate whose fingerprint
 	/// `fingerprints` pins.
-	pub const fn new(fingerprints: [&'static [u8; 32]; N]) -> Self {
-		Self { allowed_fingerprints: fingerprints, _digest: PhantomData }
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::crypto::hash::Sha3_512;
+	/// use tightbeam::crypto::sign::ecdsa::Secp256k1SigningKey;
+	/// use tightbeam::crypto::x509::policy::{CertificateValidation, FingerprintPinning};
+	/// use tightbeam::crypto::x509::utils::Fingerprint;
+	/// use tightbeam::random::OsRng;
+	/// use tightbeam::testing::{TestCertificate, TestKey};
+	///
+	/// let pinned = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+	/// let other = TestCertificate::self_signed(&Secp256k1SigningKey::random(&mut OsRng));
+	/// let pin = Fingerprint::<Sha3_512>::from_certificate(&pinned)?;
+	///
+	/// let pinning = FingerprintPinning::new([pin]);
+	/// assert!(pinning.evaluate(&other).is_err());
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	pub fn new(fingerprints: [Fingerprint<D>; N]) -> Self {
+		Self { allowed_fingerprints: fingerprints }
 	}
 }
 
 impl<D, const N: usize> CertificateValidation for FingerprintPinning<D, N>
 where
-	D: Digest<OutputSize = U32> + Send + Sync,
+	D: Digest,
 {
 	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
 		let fingerprint = Fingerprint::<D>::from_certificate(cert)?;
-		self.allowed_fingerprints
-			.iter()
-			.any(|fp| fp.as_slice() == fingerprint.as_slice())
-			.then_some(())
-			.ok_or(CertificateValidationError::CertificateNotPinned)
+		let pinned = self.allowed_fingerprints.contains(&fingerprint);
+		pinned.then_some(()).ok_or(CertificateValidationError::CertificateNotPinned)
 	}
 }
 
 /// A validator that denies certificate fingerprints in a const-generic array.
 ///
-/// Its constructor is `const`, so a static configuration can hold one.
-#[derive(Debug, Clone, Copy)]
-pub struct FingerprintDenylist<D, const N: usize> {
-	denied_fingerprints: [&'static [u8; 32]; N],
-	_digest: PhantomData<D>,
+/// Each entry is a [`Fingerprint`] under `D`, so an entry of another width
+/// fails where it is read, through [`Fingerprint::try_from`]. A list of raw
+/// octets would instead hold an entry that matches no certificate.
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam::crypto::hash::Sha3_256;
+/// use tightbeam::crypto::x509::error::CertificateValidationError;
+/// use tightbeam::crypto::x509::policy::{CertificateValidation, FingerprintDenylist};
+/// use tightbeam::crypto::x509::utils::Fingerprint;
+/// use tightbeam::testing::{TestCertificate, TestKey};
+///
+/// let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+/// let denied = Fingerprint::<Sha3_256>::from_certificate(&certificate)?;
+///
+/// let denylist = FingerprintDenylist::new([denied]);
+/// let refused = denylist.evaluate(&certificate);
+/// assert!(matches!(refused, Err(CertificateValidationError::CertificateDenied)));
+/// # Ok::<(), Box<dyn core::error::Error>>(())
+/// ```
+#[derive(Debug, Clone)]
+pub struct FingerprintDenylist<D: OutputSizeUser, const N: usize> {
+	denied_fingerprints: [Fingerprint<D>; N],
 }
 
-impl<D, const N: usize> FingerprintDenylist<D, N>
-where
-	D: Digest,
-{
+impl<D: OutputSizeUser, const N: usize> FingerprintDenylist<D, N> {
 	/// Create a validator that refuses a certificate whose fingerprint
 	/// `fingerprints` lists.
-	pub const fn new(fingerprints: [&'static [u8; 32]; N]) -> Self {
-		Self { denied_fingerprints: fingerprints, _digest: PhantomData }
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::crypto::hash::Sha3_512;
+	/// use tightbeam::crypto::sign::ecdsa::Secp256k1SigningKey;
+	/// use tightbeam::crypto::x509::policy::{CertificateValidation, FingerprintDenylist};
+	/// use tightbeam::crypto::x509::utils::Fingerprint;
+	/// use tightbeam::random::OsRng;
+	/// use tightbeam::testing::{TestCertificate, TestKey};
+	///
+	/// let denied = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+	/// let other = TestCertificate::self_signed(&Secp256k1SigningKey::random(&mut OsRng));
+	/// let entry = Fingerprint::<Sha3_512>::from_certificate(&denied)?;
+	///
+	/// let denylist = FingerprintDenylist::new([entry]);
+	/// denylist.evaluate(&other)?;
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	pub fn new(fingerprints: [Fingerprint<D>; N]) -> Self {
+		Self { denied_fingerprints: fingerprints }
 	}
 }
 
 impl<D, const N: usize> CertificateValidation for FingerprintDenylist<D, N>
 where
-	D: Digest<OutputSize = U32> + Send + Sync,
+	D: Digest,
 {
 	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
 		let fingerprint = Fingerprint::<D>::from_certificate(cert)?;
-		let is_denied = self
-			.denied_fingerprints
-			.iter()
-			.any(|fp| fp.as_slice() == fingerprint.as_slice());
+		let is_denied = self.denied_fingerprints.contains(&fingerprint);
 		if is_denied {
 			Err(CertificateValidationError::CertificateDenied)
 		} else {
@@ -302,16 +360,28 @@ where
 	}
 }
 
-/// A certificate pinning validator built at runtime.
+/// A validator that pins certificates by their fingerprints, in a list whose
+/// length the caller sets at runtime.
 ///
-/// It pins a set of certificates and compares fingerprints. A builder can
-/// create it from a certificate list it holds at runtime, where
+/// A builder can create it from the certificates it holds at runtime, where
 /// [`FingerprintPinning`] takes a fixed array.
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam::crypto::hash::Sha3_512;
+/// use tightbeam::crypto::x509::policy::{CertificateValidation, RuntimeCertificatePinning};
+/// use tightbeam::testing::{TestCertificate, TestKey};
+///
+/// let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+/// let pinning = RuntimeCertificatePinning::<Sha3_512>::from_certificates([certificate.clone()])?;
+/// pinning.evaluate(&certificate)?;
+/// # Ok::<(), Box<dyn core::error::Error>>(())
+/// ```
 #[cfg(feature = "std")]
 #[derive(Clone)]
-pub struct RuntimeCertificatePinning<D> {
+pub struct RuntimeCertificatePinning<D: OutputSizeUser> {
 	fingerprints: Vec<Fingerprint<D>>,
-	_digest: PhantomData<D>,
 }
 
 #[cfg(feature = "std")]
@@ -322,16 +392,17 @@ where
 	/// Create a validator that pins `certs`.
 	///
 	/// It computes the fingerprint of each certificate once, at construction.
-	pub fn from_certificates(certs: impl IntoIterator<Item = Certificate>) -> Result<Self, CertificateValidationError>
-	where
-		D: Digest<OutputSize = U32>,
-	{
+	///
+	/// # Errors
+	///
+	/// - [`CertificateValidationError::EncodingError`] -- a certificate fails to DER-encode.
+	pub fn from_certificates(certs: impl IntoIterator<Item = Certificate>) -> Result<Self, CertificateValidationError> {
 		let fingerprints = certs
 			.into_iter()
 			.map(|cert| Fingerprint::<D>::from_certificate(&cert))
 			.collect::<Result<Vec<_>, _>>()?;
 
-		Ok(Self { fingerprints, _digest: PhantomData })
+		Ok(Self { fingerprints })
 	}
 
 	/// Create a validator from fingerprints that
@@ -339,22 +410,19 @@ where
 	///
 	/// [`Fingerprint::from_certificate`]: crate::crypto::x509::utils::Fingerprint::from_certificate
 	pub fn from_fingerprints(fingerprints: impl IntoIterator<Item = Fingerprint<D>>) -> Self {
-		Self { fingerprints: fingerprints.into_iter().collect(), _digest: PhantomData }
+		Self { fingerprints: fingerprints.into_iter().collect() }
 	}
 }
 
 #[cfg(feature = "std")]
 impl<D> CertificateValidation for RuntimeCertificatePinning<D>
 where
-	D: Digest<OutputSize = U32> + Send + Sync,
+	D: Digest,
 {
 	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
 		let fingerprint = Fingerprint::<D>::from_certificate(cert)?;
-		self.fingerprints
-			.iter()
-			.any(|fp| fp.as_slice() == fingerprint.as_slice())
-			.then_some(())
-			.ok_or(CertificateValidationError::CertificateNotPinned)
+		let pinned = self.fingerprints.contains(&fingerprint);
+		pinned.then_some(()).ok_or(CertificateValidationError::CertificateNotPinned)
 	}
 }
 
@@ -363,7 +431,7 @@ where
 ///
 /// It checks the presented certificate alone. Path building, name chaining,
 /// and the `basicConstraints` and `keyUsage` checks of RFC 5280 §6.1 belong
-/// to the certification-path validation of `CertificateTrustStore`.
+/// to the certification-path validation of [`CertificateTrustStore`].
 ///
 /// - [`CertificateValidation::evaluate`] checks the validity period
 ///   (RFC 5280 §6.1.3(a)(2)) and requires the presented certificate to be a
@@ -379,16 +447,20 @@ where
 ///   does.
 ///
 /// See <https://datatracker.ietf.org/doc/html/rfc5280#section-6.1>.
+///
+/// [`CertificateTrustStore`]: crate::crypto::x509::store::CertificateTrustStore
 #[derive(Default, Clone)]
 pub struct DirectTrustValidator {
 	trust_chain: Vec<Certificate>,
 }
 
 impl DirectTrustValidator {
-	/// Add a trust chain to the validator.
+	/// Replace the trust anchors of the validator with the certificates of
+	/// `trust_chain`.
 	///
-	/// It accepts any iterator of [`Certificate`] values, and an empty chain
-	/// keeps the fail-closed default (no anchors).
+	/// An empty chain leaves the validator with no anchor, so
+	/// [`CertificateValidation::evaluate`] refuses every certificate, as under
+	/// `Default`.
 	pub fn with_trust_chain(mut self, trust_chain: impl IntoIterator<Item = Certificate>) -> Self {
 		self.trust_chain = trust_chain.into_iter().collect();
 		self
@@ -409,7 +481,7 @@ impl CertificateValidation for DirectTrustValidator {
 		// RFC 5280 §6.1.1 direct trust: the presented certificate must itself
 		// be a configured trust anchor, a path of one certificate. An empty
 		// anchor set therefore trusts nothing, so the validator fails closed
-		// instead of degrading to an expiry-only check (CWE-1188, insecure
+		// and never degrades to an expiry-only check (CWE-1188, insecure
 		// default). `ExpiryValidator` is the deliberate expiry-only check.
 		let cert_der = cert.to_der()?;
 		for anchor in &self.trust_chain {
@@ -450,8 +522,8 @@ impl SignatureVerification for DirectTrustValidator {
 		// tbsCertificate.signature field.
 		cert.ensure_signature_algorithm_consistency()?;
 
-		// RFC 5280 §6.1.3(a)(1): verify the signature using the issuer's key.
-		// A certificate signature is the key of no ledger, so its canonical
+		// RFC 5280 §6.1.3(a)(1): verify the signature with the issuer's key.
+		// No ledger uses a certificate signature as its key, so its canonical
 		// form drops here.
 		let message = cert.tbs_certificate.to_der()?;
 		let verified =
@@ -502,6 +574,50 @@ mod tests {
 	fn the_expiry_validator_refuses_an_expired_certificate() {
 		let refused = ExpiryValidator.evaluate(&TestCertificate::expired());
 		assert!(matches!(refused, Err(CertificateValidationError::Expired)));
+	}
+
+	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+	mod fingerprint_lists {
+		use crate::crypto::hash::{Sha3_256, Sha3_512};
+		use crate::crypto::x509::error::CertificateValidationError;
+		use crate::crypto::x509::policy::{CertificateValidation, FingerprintDenylist, FingerprintPinning};
+		use crate::crypto::x509::utils::Fingerprint;
+		use crate::error::ReceivedExpectedError;
+		use crate::testing::fixtures::{TestCertificate, TestKey};
+
+		/// The fingerprint reader refuses a denylist entry one octet short of
+		/// its digest's output, before any denylist holds it.
+		#[test]
+		fn a_31_octet_denylist_entry_is_refused_at_construction() {
+			let entry = Fingerprint::<Sha3_256>::try_from(&[0x5a; 31][..]);
+			let width = ReceivedExpectedError { received: 31, expected: 32 };
+			assert!(matches!(entry, Err(CertificateValidationError::FingerprintLength(found)) if found == width));
+		}
+
+		/// A denylist under SHA3-512 refuses a certificate by its 64-octet
+		/// fingerprint.
+		#[test]
+		fn a_sha3_512_denylist_refuses_the_certificate_it_lists() -> Result<(), CertificateValidationError> {
+			let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+			let denied = Fingerprint::<Sha3_512>::from_certificate(&certificate)?;
+
+			let refused = FingerprintDenylist::new([denied]).evaluate(&certificate);
+			assert!(matches!(refused, Err(CertificateValidationError::CertificateDenied)));
+			Ok(())
+		}
+
+		/// A pin under SHA3-512 refuses a certificate whose 64-octet
+		/// fingerprint it does not hold.
+		#[test]
+		fn a_sha3_512_pin_refuses_a_certificate_it_does_not_pin() -> Result<(), CertificateValidationError> {
+			let pinned = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+			let pin = Fingerprint::<Sha3_512>::from_certificate(&pinned)?;
+			let other = TestCertificate::with_cn_and_uri_sans(&TestKey::insecure_fixed_signing(), "Other", &[]);
+
+			let refused = FingerprintPinning::new([pin]).evaluate(&other);
+			assert!(matches!(refused, Err(CertificateValidationError::CertificateNotPinned)));
+			Ok(())
+		}
 	}
 
 	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
@@ -630,8 +746,8 @@ mod tests {
 			TestCertificate::self_signed(&TestKey::insecure_fixed_signing())
 		}
 
-		/// Run the out-of-the-box policy over `cert`, with the issuer key that
-		/// matches `signing_key`.
+		/// Run the default [`Secp256k1Policy`] over `cert`, with the issuer key
+		/// that matches `signing_key`.
 		fn verify(signing_key: &SigningKey, cert: &Certificate) -> Result<(), CertificateValidationError> {
 			let issuer_pub = signing_key.verifying_key().to_public_key_der()?;
 			let policy = Secp256k1Policy::default();
@@ -657,10 +773,10 @@ mod tests {
 			Ok(())
 		}
 
-		/// A default-constructed (anchorless) validator must fail closed:
-		/// accepting any in-date certificate would turn a forgotten
-		/// `with_trust_chain` into a silent authentication bypass
-		/// (CWE-1188). Expiry-only checking is `ExpiryValidator`'s job.
+		/// A validator that `Default` builds holds no anchor and must fail
+		/// closed. If it admitted every in-date certificate, a forgotten
+		/// `with_trust_chain` would become a silent authentication bypass
+		/// (CWE-1188). `ExpiryValidator` is the expiry-only check.
 		#[test]
 		fn without_anchor_fails_closed() {
 			assert!(matches!(
@@ -686,8 +802,8 @@ mod tests {
 		fn rejects_foreign_algorithm() {
 			let key = TestKey::insecure_fixed_signing();
 			let mut cert = TestCertificate::self_signed(&key);
-			// The identifiers agree on an algorithm that the out-of-the-box
-			// policy refuses.
+			// The identifiers agree on an algorithm that the default policy
+			// refuses.
 			cert.signature_algorithm.oid = SIGNER_ECDSA_WITH_SHA256;
 			cert.tbs_certificate.signature.oid = SIGNER_ECDSA_WITH_SHA256;
 			assert!(matches!(
@@ -710,8 +826,9 @@ mod tests {
 			TestCertificate::with_extension(test_cert(), extension)
 		}
 
-		/// An anchor that repeats an extension is refused, so the anchor
-		/// match does not stand in for the extension rules (RFC 5280 §4.2).
+		/// The validator refuses an anchor that repeats an extension, so the
+		/// anchor match does not stand in for the extension rules
+		/// (RFC 5280 §4.2).
 		#[test]
 		fn evaluate_refuses_an_anchor_that_repeats_an_extension() {
 			let cert = with_repeated("2.5.29.30");

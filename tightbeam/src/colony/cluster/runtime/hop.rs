@@ -21,8 +21,8 @@ use crate::cms::signed_data::SignerIdentifier;
 use crate::colony::bound_dial::{BoundDial, ExpectedSigner};
 use crate::colony::cluster::peer::FloodMember;
 use crate::colony::cluster::runtime::advertise::Advertiser;
-use crate::colony::cluster::runtime::bounds::{ClusterPool, ColonyDialProtocol};
-use crate::colony::cluster::{ClusterConfig, ClusterError, DialTarget, HiveEntry};
+use crate::colony::cluster::runtime::bounds::{ClusterPool, ColonyConfig, ColonyDialProtocol};
+use crate::colony::cluster::{ClusterError, DialTarget, HiveEntry};
 use crate::crypto::x509::Certificate;
 use crate::instrumentation::events::CLUSTER_DIAL_REFUSED;
 use crate::trace::TraceCollector;
@@ -78,8 +78,8 @@ impl<P: Protocol> HivePlane<P> {
 
 	/// The peer plane over this plane's pool, for a gateway that configures
 	/// no peer pool. It names each gateway that answers by `config`'s hive
-	/// trust, through [`ClusterConfig::peer_identity`].
-	pub(crate) fn peers(&self, config: Arc<ClusterConfig>) -> PeerPlane<P> {
+	/// trust, through [`ColonyConfig::peer_identity`].
+	pub(crate) fn peers(&self, config: ColonyConfig<P>) -> PeerPlane<P> {
 		PeerPlane::new(Arc::clone(&self.pool), config, Arc::clone(&self.trace))
 	}
 }
@@ -100,7 +100,7 @@ impl<P: Protocol> HivePlane<P> {
 ///   to whichever gateway answers. A direct advertisement dials this way.
 pub(crate) struct PeerPlane<P: Protocol> {
 	pool: Arc<ClusterPool<P>>,
-	config: Arc<ClusterConfig>,
+	config: ColonyConfig<P>,
 	/// The collector that records each refused hop.
 	trace: Arc<TraceCollector>,
 }
@@ -111,7 +111,7 @@ impl<P: Protocol> Clone for PeerPlane<P> {
 	fn clone(&self) -> Self {
 		Self {
 			pool: Arc::clone(&self.pool),
-			config: Arc::clone(&self.config),
+			config: self.config.clone(),
 			trace: Arc::clone(&self.trace),
 		}
 	}
@@ -119,9 +119,9 @@ impl<P: Protocol> Clone for PeerPlane<P> {
 
 impl<P: Protocol> PeerPlane<P> {
 	/// A plane that dials peer gateways on `pool`, names each gateway that
-	/// answers through [`ClusterConfig::peer_identity`] of `config`, and
+	/// answers through [`ColonyConfig::peer_identity`] of `config`, and
 	/// records each refused hop on `trace`.
-	pub(crate) fn new(pool: Arc<ClusterPool<P>>, config: Arc<ClusterConfig>, trace: Arc<TraceCollector>) -> Self {
+	pub(crate) fn new(pool: Arc<ClusterPool<P>>, config: ColonyConfig<P>, trace: Arc<TraceCollector>) -> Self {
 		Self { pool, config, trace }
 	}
 
@@ -137,7 +137,7 @@ impl<P: Protocol> PeerPlane<P> {
 	/// The one unbound dial on this plane's pool, which a direct
 	/// advertisement sends through.
 	pub(crate) fn advertiser(&self) -> Advertiser<P> {
-		Advertiser::new(Arc::clone(&self.pool), Arc::clone(&self.config))
+		Advertiser::new(Arc::clone(&self.pool), self.config.clone())
 	}
 }
 
@@ -181,7 +181,7 @@ pub(crate) struct Hop<'p, P: Protocol> {
 	/// the peer plane's pool for a gateway.
 	pool: &'p Arc<ClusterPool<P>>,
 	/// The target, and the identity its answer must prove.
-	dial: BoundDial<'p>,
+	dial: BoundDial<'p, P>,
 	/// The collector that records a refused dial.
 	trace: &'p TraceCollector,
 }
@@ -197,15 +197,15 @@ impl<P: ColonyDialProtocol> PeerPlane<P> {
 	///   handshake completes here, before the caller can send anything.
 	/// - `None` means a gateway outside the flood answered. That is an answer
 	///   about the address, where an `Err` is a failed dial.
-	/// - The proof is asked on every call, so a pooled connection to a gateway
-	///   the trust store has since dropped yields `None`.
+	/// - The method asks for the proof on every call, so a pooled connection
+	///   to a gateway the trust store has since dropped yields `None`.
 	/// - An answer outside the flood takes its connection out of the pool, so a
 	///   later dial of the address meets the party that answers it then.
 	///
 	/// # Errors
 	///
-	/// - [`ClusterError::Transport`] -- the dial or the handshake failed, or the
-	///   runtime fault model injects a fault at the eviction of an answer
+	/// - [`ClusterError::Transport`] -- the dial or the handshake failed, or
+	///   the runtime fault model injects a fault at the eviction of an answer
 	///   outside the flood.
 	pub(crate) async fn connect_member(
 		&self,
@@ -266,7 +266,7 @@ impl<P: ColonyDialProtocol> Hop<'_, P> {
 	///
 	/// # Errors
 	///
-	/// - Every error of [`BoundDial::connect`].
+	/// - [`ClusterError`] -- the errors of [`BoundDial::connect`].
 	/// - [`ClusterError::Frame`] -- `trace` refused the refusal event.
 	pub(crate) async fn connect(self) -> Result<PooledClient<P>, ClusterError> {
 		let target = self.dial.target().clone();
@@ -295,9 +295,10 @@ mod tests {
 	use super::*;
 	use crate::colony::cluster::peer::ColonyCertificate;
 	use crate::colony::cluster::runtime::advertise::SignedAdvertisement;
-	use crate::colony::cluster::{CertificateSpec, Cluster, ClusterGateway, ClusterTlsConfig, PeerAddress, SharedId};
+	use crate::colony::cluster::{
+		CertificateSpec, Cluster, ClusterConfig, ClusterGateway, ClusterTlsConfig, ColonyDigest, PeerAddress, SharedId,
+	};
 	use crate::colony::common::ColonyNamespace;
-	use crate::crypto::hash::Sha3_256;
 	use crate::crypto::key::Secp256k1KeyProvider;
 	use crate::crypto::policy::Secp256k1Policy;
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
@@ -310,7 +311,7 @@ mod tests {
 	use crate::transport::tcp::r#async::TokioListener;
 	use crate::urn::Urn;
 
-	type Gateway = ClusterGateway<TokioListener, Sha3_256>;
+	type Gateway = ClusterGateway<TokioListener>;
 	type TestResult = Result<(), Box<dyn core::error::Error>>;
 
 	/// A gateway certificate on the fixed scalar `seed`, beside its key, that
@@ -356,7 +357,7 @@ mod tests {
 	/// - Its hive trust holds the member and the stranger, so a handshake with either completes.
 	/// - The member carries the colony URN of the dialing gateway, and the stranger carries none.
 	struct Dialer {
-		config: Arc<ClusterConfig>,
+		config: ColonyConfig<TokioListener>,
 		pool: Arc<ClusterPool<TokioListener>>,
 		plane: HivePlane<TokioListener>,
 		member_certificate: Certificate,
@@ -383,14 +384,12 @@ mod tests {
 			let mut config = ClusterConfig::new(tls_of(&dialing).with_hive_trust(Some(hive_trust)));
 			config.pool_config = pool;
 
-			let pool_config = &config.pool_config;
-			let pools = pool_config.build_cluster_pools::<TokioListener>(&config.tls, &config.clock);
-			let pools = pools.expect("the hive pool builds");
+			let pools = config.tls.pools::<TokioListener>(&config.pool_config, &config.clock);
 			let trace = Arc::new(TraceCollector::default());
 			let plane = HivePlane::new(Arc::clone(&pools.hive), trace);
 
 			Self {
-				config: Arc::new(config),
+				config: ColonyConfig::new(config),
 				pool: pools.hive,
 				plane,
 				member_certificate: member.0.clone(),
@@ -409,7 +408,7 @@ mod tests {
 
 		/// The plane this gateway dials its peers on, which is its hive pool.
 		fn peers(&self) -> PeerPlane<TokioListener> {
-			self.plane.peers(Arc::clone(&self.config))
+			self.plane.peers(self.config.clone())
 		}
 
 		/// A servlet hop to `gateway`, bound to the signer that a registration
@@ -427,14 +426,14 @@ mod tests {
 
 		/// The slate key a route of the member carries.
 		fn member_name(&self) -> SharedId {
-			let name = self.member_certificate.fingerprint_id();
+			let name = self.member_certificate.fingerprint_id::<ColonyDigest<TokioListener>>();
 			name.expect("the member certificate has a fingerprint")
 		}
 
 		/// A signed advertisement of this gateway, of no types.
 		async fn advertisement(&self) -> SignedAdvertisement {
 			let types: Vec<Urn<'static>> = Vec::new();
-			let minted = self.config.mint_ad_frame::<Sha3_256>(b"127.0.0.1:1", types).await;
+			let minted = self.config.mint_ad_frame(b"127.0.0.1:1", types).await;
 			minted.expect("the dialing gateway signs its advertisement")
 		}
 	}
@@ -467,7 +466,6 @@ mod tests {
 	#[tokio::test]
 	async fn a_refused_hop_gives_back_its_slot() -> TestResult {
 		let [refused, admitted] = refuse_then_admit(Dialer::one_connection(false)).await;
-
 		assert!(matches!(refused, Err(ClusterError::PeerMismatch)));
 		assert!(admitted.is_ok());
 		Ok(())

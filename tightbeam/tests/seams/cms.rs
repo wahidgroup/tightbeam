@@ -1,5 +1,5 @@
-//! The CMS handshake under [`OutsideProvider`], a provider an outside crate
-//! defines that names no HPKE suite.
+//! The CMS handshake runs here under [`OutsideProvider`], a provider an
+//! outside crate defines that names no HPKE suite.
 //!
 //! The server holds two identities of one subject under one authority:
 //!
@@ -24,8 +24,8 @@ use tightbeam::transport::handshake::{
 };
 
 use super::{
-	outside_agreement_identity_of, outside_identity, outside_identity_of, outside_policy, run_legs, OutsideKem,
-	OutsideProvider, CONTENT, OUTSIDE_KDF,
+	outside_agreement_identity_of, outside_identity, outside_identity_of, run_legs, OutsideKem, OutsideProvider,
+	CONTENT, OUTSIDE_KDF,
 };
 
 /// A client of the CMS flow under the outside provider.
@@ -50,8 +50,7 @@ fn outside_pair(server: &TestCmsServer) -> CmsIdentityPair<OutsideKem> {
 fn outside_handshakes(server: &TestCmsServer, identity: SigningIdentity) -> (OutsideClient, OutsideServer) {
 	let settings = CmsClientSettings { trust: server.trust(), identity };
 	let client = ClientConfig::<Cms, OutsideProvider>::new(settings, KeyPurposes::HOUSE);
-	let mut client = client.expect("an outside client identity serves the client role");
-	client.profiles = outside_policy();
+	let client = client.expect("an outside client identity serves the client role");
 
 	let native = RunnableProfile::<OutsideProvider>::native().descriptor();
 	let profiles = SupportedProfiles::from(native);
@@ -59,14 +58,13 @@ fn outside_handshakes(server: &TestCmsServer, identity: SigningIdentity) -> (Out
 	let pair = outside_pair(server);
 	let purposes = KeyPurposes::HOUSE;
 	let server_config = ServerConfig::<Cms, OutsideProvider>::new(CmsServerSettings, pair, profiles, purposes);
-	let mut server_config = server_config.expect("an outside server pair serves the server role");
-	server_config.policy = outside_policy();
+	let server_config = server_config.expect("an outside server pair serves the server role");
 
 	(Handshake::client(client), Handshake::server(server_config))
 }
 
-/// A CMS server of fresh keys, whose certificates an outside crate's
-/// authority issued.
+/// A CMS server of fresh keys, whose certificates a fresh authority,
+/// `CN=outside server authority`, issued.
 fn outside_server() -> TestCmsServer {
 	let signing_key = SigningKey::random(&mut OsRng);
 	let key_agreement_key = SigningKey::random(&mut OsRng);
@@ -105,7 +103,7 @@ async fn the_cms_flow_agrees_on_the_outside_algorithms() -> Result<(), Box<dyn s
 }
 
 /// The client records the server's signing certificate as its peer, the one
-/// whose key signed the reply, apart from the key-agreement certificate the
+/// whose key signed the reply, rather than the key-agreement certificate the
 /// opening sealed to.
 #[tokio::test]
 async fn an_outside_client_records_the_signing_certificate() {

@@ -206,12 +206,7 @@ pub const MIN_KEY_SIZE: usize = 16;
 /// Minimum HKDF salt size in bytes when a non-empty salt is supplied.
 pub const MIN_SALT_SIZE: usize = 16;
 
-/// Compressed secp256k1 or P-256 public key size in SEC1 format.
-///
-/// The encoding is a `0x02` or `0x03` prefix byte plus 32 bytes.
-pub const EC_PUBKEY_COMPRESSED_SIZE: usize = 33;
-
-/// Uncompressed secp256k1 or P-256 public key size in SEC1 format.
+/// Uncompressed secp256k1 or P-256 public key size in SEC 1 format.
 ///
 /// The encoding is a `0x04` prefix byte plus 64 bytes.
 pub const EC_PUBKEY_UNCOMPRESSED_SIZE: usize = 65;
@@ -272,7 +267,7 @@ pub(crate) const fn rekey_record_limit(encrypted_envelope: usize) -> u64 {
 ///
 /// - Senders fail closed with `RekeyRequired` at their configured limit.
 /// - Receipt-bearing mux sessions renew in band first.
-/// - Other sessions drain via GoAway.
+/// - Other sessions drain through GoAway.
 /// - Receivers refuse a sequence number at or past this constant, at any ceiling.
 /// - Receivers refuse a record that takes the bytes one key opened past the renewal volume.
 /// - Both receive-side refusals are the crate's own renewal policy. RFC 9846 § 5.5 sets the sender's limit.
@@ -319,9 +314,9 @@ pub const DEFAULT_REKEY_DEADLINE_SECS: u64 = 30;
 
 /// Concurrent-connection cap for the `server!` async accept loop.
 ///
-/// The loop stops accepting while this many connection tasks are alive, so a
-/// connection flood queues in the listener backlog instead of pinning
-/// unbounded tasks and file descriptors.
+/// The loop pauses its accepts while this many connection tasks are alive, so
+/// a connection flood waits in the listener backlog rather than pin unbounded
+/// tasks and file descriptors.
 ///
 /// # Sources
 ///
@@ -409,7 +404,7 @@ pub const DEFAULT_FAULT_SEED: u64 = 0xDEADBEEF;
 
 /// Default backpressure threshold in basis points (90% = 9000 bps).
 ///
-/// When aggregate utilization exceeds this threshold, the hive signals
+/// When aggregate utilization reaches this threshold, the hive signals
 /// `TransitStatus::ResourceExhausted` to the cluster, so the cluster should
 /// route work elsewhere.
 pub const DEFAULT_BACKPRESSURE_THRESHOLD_BPS: u16 = 9000;
@@ -446,7 +441,7 @@ pub const DEFAULT_COMMAND_FRESHNESS_WINDOW_MS: u64 = 30_000;
 ///
 /// - Cancels of already-completed streams are free.
 /// - Each cancel that aborts a live handler draws on this budget.
-/// - Exhausting the budget ends the connection with a GoAway.
+/// - A connection that exhausts the budget ends with a GoAway.
 /// - Only authenticated peers reach this path, so the budget is generous.
 ///
 /// Tighten it per connection through `MuxTransport::with_cancel_budget`.
@@ -460,8 +455,8 @@ pub const DEFAULT_MUX_CANCEL_BUDGET: u32 = 1024;
 /// Ceiling on negotiated per-direction concurrent-stream caps.
 ///
 /// Handshake transport offers and accepts carry peer-chosen
-/// `max_peer_initiated_streams` values, and deriving [`MuxSettings`] clamps
-/// both directions to this ceiling.
+/// `max_peer_initiated_streams` values, and the derivation of [`MuxSettings`]
+/// clamps both directions to this ceiling.
 ///
 /// - An advertisement inflates bookkeeping bounds only up to useful concurrency.
 /// - Both endpoints apply the same clamp to the same advertised values.
@@ -643,7 +638,7 @@ pub(crate) const MAX_CMS_SET_LEN: usize = 32;
 /// Default ceiling for decompressed message bodies (16 MiB).
 ///
 /// Compressed frame bodies arrive under the transport's envelope ceiling, and
-/// zstd can inflate a body under that ceiling past this one. Capping the
+/// zstd can inflate a body under that ceiling past this one. A cap on the
 /// inflated size bounds the memory an attacker can force with a
 /// decompression bomb.
 ///
@@ -671,9 +666,9 @@ pub const MAX_MUX_REASSEMBLY_BYTES: usize = DEFAULT_MAX_DECOMPRESSED_LEN;
 ///
 /// [`MAX_MUX_REASSEMBLY_BYTES`] bounds a single stream. A peer that opens many
 /// streams multiplies it, so the connection carries this ceiling as well and
-/// every stream charges against it. A connection that legitimately
-/// reassembles concurrent streams stays inside four stream ceilings. Beyond
-/// that, the peer spends this endpoint's memory and makes no progress.
+/// every stream charges against it. A connection that reassembles concurrent
+/// streams in good faith stays inside four stream ceilings. Beyond that, the
+/// peer spends this endpoint's memory and makes no progress.
 ///
 /// # Sources
 ///
@@ -684,8 +679,8 @@ pub const MAX_MUX_CONNECTION_REASSEMBLY_BYTES: usize = 4 * MAX_MUX_REASSEMBLY_BY
 /// Ceiling on servlet types carried in one peer advertisement.
 ///
 /// A peer gateway advertisement enumerates the servlet types its colony
-/// exports. Bounding the count fail-closes an oversized advertisement
-/// before it installs unbounded peer routes.
+/// exports. The bound on the count refuses an oversized advertisement before
+/// it installs unbounded peer routes.
 ///
 /// Gossip meshes apply the same control-message flood bound to their
 /// advertisement path.
@@ -698,8 +693,8 @@ pub const MAX_ADVERTISED_TYPES: usize = 256;
 
 /// Ceiling on distinct peer gateways tracked in one servlet registry.
 ///
-/// Per-advertisement type caps alone leave trusted-peer registry growth
-/// unbounded across many signers.
+/// Per-advertisement type caps alone leave the registry free to grow without
+/// bound across many trusted signers.
 ///
 /// # Sources
 ///
@@ -798,8 +793,8 @@ pub const DEFAULT_MAX_HOPS: u8 = 1;
 /// Ceiling on the payload bytes carried in one gossip envelope.
 ///
 /// A gossip rumor floods the peer graph, so an oversized payload amplifies
-/// across every edge. Bounding the payload fail-closes the amplification
-/// dose before the rumor is recorded or forwarded again.
+/// across every edge. The bound refuses an oversized payload before a gateway
+/// records the rumor or forwards it again.
 ///
 /// # Sources
 ///
@@ -809,8 +804,8 @@ pub const MAX_GOSSIP_PAYLOAD_BYTES: usize = 64 * 1024;
 
 /// Ceiling on the initial time-to-live an origin gossip may request.
 ///
-/// The time-to-live is the hop radius of a flood, so capping it bounds the
-/// basic reproduction number of a single rumor, whatever value a publisher
+/// The time-to-live is the hop radius of a flood, so the cap bounds the basic
+/// reproduction number of a single rumor, whatever value a publisher
 /// requests.
 ///
 /// # Sources
@@ -824,7 +819,7 @@ pub const MAX_GOSSIP_TTL: u8 = 8;
 /// The journal retains recent rumors for deduplication and anti-entropy
 /// reconciliation.
 ///
-/// - Bounding the count keeps memory finite under a flood.
+/// - The bound on the count keeps memory finite under a flood.
 /// - The journal fails closed once the ceiling is reached.
 ///
 /// # Sources
@@ -835,7 +830,7 @@ pub const MAX_GOSSIP_LOG: usize = 4096;
 
 /// Ceiling on gossip rumors retained per signer in one in-memory journal.
 ///
-/// Partitioning the journal per signer isolates retention per identity.
+/// A partition of the journal per signer isolates retention per identity.
 /// One signer's distinct digests spend that signer's own retention, which
 /// leaves other signers' rumors recorded.
 ///
@@ -850,14 +845,14 @@ pub const MAX_GOSSIP_LOG_PER_SIGNER: usize = 256;
 /// A rumor whose digest was recorded within this window counts as already
 /// seen, which is the recovered or immune state of the epidemic model. The
 /// window must exceed the time a flood takes to traverse the peer graph, so
-/// late duplicates are still suppressed.
+/// the journal still suppresses a late duplicate.
 pub const DEFAULT_GOSSIP_SEEN_TTL_MS: u64 = 120_000;
 
 /// Default gossip retention window in milliseconds.
 ///
 /// Anti-entropy reconciliation can repair only a rumor that a peer still
 /// retains. Retention must be at least as long as the deduplication window,
-/// so a node that returns within the window can still be repaired.
+/// so reconciliation can still repair a node that returns within the window.
 pub const DEFAULT_GOSSIP_RETENTION_MS: u64 = 120_000;
 
 /// Default initial time-to-live an origin gossip requests.
@@ -885,8 +880,8 @@ pub const DEFAULT_GOSSIP_RATE_REFILL_MS: u64 = 250;
 
 /// Ceiling on distinct signers tracked by one in-memory admission store.
 ///
-/// Bounding tracked signers keeps memory finite when many identities
-/// publish. Admission fails closed once the ceiling is reached.
+/// The bound on tracked signers keeps memory finite when many identities
+/// publish. Admission fails closed once the store reaches the ceiling.
 ///
 /// # Sources
 ///
@@ -896,8 +891,8 @@ pub const MAX_GOSSIP_RATE_SIGNERS: usize = 4096;
 
 /// Ceiling on unverified candidates held in the peer discovery table.
 ///
-/// Peer-exchange hints are attacker-suppliable, so the new table is bounded
-/// before any hint is dialed.
+/// Peer-exchange hints are attacker-suppliable, so discovery bounds the new
+/// table before it dials any hint.
 ///
 /// # Sources
 ///
@@ -943,7 +938,7 @@ pub const MAX_PEX_SAMPLE: usize = 8;
 
 /// Ceiling on unverified candidates probed per advertise beat.
 ///
-/// Feeler dials verify candidates before promotion. Bounding them per beat
+/// Feeler dials verify candidates before promotion. A bound on them per beat
 /// keeps discovery traffic a small constant beside the anchor and tried
 /// dials.
 pub const PEER_PROBE_PER_BEAT: usize = 4;
@@ -962,12 +957,13 @@ pub const PEER_PROBE_BACKOFF_MS: u64 = 1_000;
 
 /// Ceiling on the wait between two feeler probes of one failed candidate.
 ///
-/// A candidate that came back is therefore probed again within this wait.
+/// Discovery therefore probes a recovered candidate again within this wait
+/// of its last failed probe.
 pub const PEER_PROBE_BACKOFF_MAX_MS: u64 = 60_000;
 
 /// Consecutive failed beat dials before a tried peer is evicted.
 ///
-/// Tried residents re-dial on every beat, so consecutive failures are the
+/// The beat re-dials every tried resident, so consecutive failures are the
 /// liveness clock.
 ///
 /// - The threshold tolerates a two-beat partition.

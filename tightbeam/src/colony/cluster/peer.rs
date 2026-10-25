@@ -1,4 +1,5 @@
-//! Peer-advertisement admission for the cluster gateway.
+//! The peer plane of a cluster gateway: hop budgets, peer-advertisement
+//! admission, relay trails, and the flood a gateway gossips in.
 
 use std::sync::Arc;
 
@@ -10,9 +11,9 @@ use crate::colony::common::ColonyResource;
 use crate::colony::common::IssuedAt;
 use crate::colony::common::{ClusterWorkRequest, ColonyNamespace, PeerAdvertisement};
 use crate::constants::{DEFAULT_HOP_BUDGET, MAX_ADVERTISED_TYPES};
-use crate::crypto::hash::Sha3_256;
-use crate::crypto::x509::store::{CertificateTrust, CertificateTrustStore};
-use crate::crypto::x509::utils::CertificateExt;
+use crate::crypto::hash::Digest;
+use crate::crypto::x509::store::CertificateTrust;
+use crate::crypto::x509::utils::{CertificateExt, Fingerprint};
 use crate::crypto::x509::Certificate;
 use crate::policy::TransitStatus;
 use crate::transport::multiplex::StreamRoute;
@@ -23,8 +24,8 @@ use crate::x509::ext::pkix::SubjectAltName;
 
 /// Forwards a work request or routed stream open may still spend.
 ///
-/// The wire carries a raw count, so the budget is parsed once at the
-/// gateway boundary through [`HopBudget::from_wire`], which clamps it to
+/// The wire carries a raw count, so the gateway parses the budget once at
+/// its boundary through [`HopBudget::from_wire`], which clamps it to
 /// the operator's [`PeerConfig::max_hops`]. Every downstream rule reads
 /// this value rather than the raw octet, so the operator's cap bounds the
 /// forwards a peer can spend (CWE-770).
@@ -81,15 +82,15 @@ impl HopBudget {
 
 	/// Whether a peer already spent part of this budget.
 	///
-	/// An origin request arrives carrying the sentinel, so anything below it
-	/// reached this gateway through at least one relay. The export boundary
-	/// reads this to tell a direct caller from a relayed one.
+	/// An origin request carries the sentinel, so anything below it reached
+	/// this gateway through at least one relay. The export boundary reads
+	/// this to tell a direct caller from a relayed one.
 	///
 	/// # Wire count
 	///
-	/// The answer is read from the wire count before the cap clamps it, because
-	/// a cap below the sentinel would otherwise make every origin request look
-	/// relayed.
+	/// [`Self::from_wire`] reads the answer from the wire count before the cap
+	/// clamps it, because a cap below the sentinel would otherwise make every
+	/// origin request look relayed.
 	#[must_use]
 	pub fn is_relayed(&self) -> bool {
 		self.relayed
@@ -103,8 +104,8 @@ impl HopBudget {
 
 	/// Whether the budget affords the two forwards a relay trail needs.
 	///
-	/// A relay trail spends one hop at the relay before the owner is
-	/// reached, so only a budget of two or more can select it.
+	/// A relay trail spends one hop at the relay before it reaches the owner,
+	/// so only a budget of two or more can select it.
 	#[must_use]
 	pub fn allows_relay_trail(&self) -> bool {
 		self.remaining >= 2
@@ -118,9 +119,9 @@ impl HopBudget {
 
 	/// Relayed stream route for one peer hop out of this budget.
 	///
-	/// The route reaches the same `target` with one forward spent. Building
-	/// it through the budget spends the hop, so a relay pays for every route
-	/// it stamps (CWE-834).
+	/// The route reaches the same `target` with one forward spent. A route
+	/// built through the budget spends the hop, so a relay pays for every
+	/// route it stamps (CWE-834).
 	#[must_use]
 	pub(crate) fn relayed_route(self, target: &Urn<'static>) -> StreamRoute {
 		StreamRoute::relayed_to(target.clone(), self.spend().wire())
@@ -190,7 +191,7 @@ impl AdmittedPeerAd {
 	/// The checks run in this order:
 	///
 	/// 1. The signer MUST resolve on the peer plane, and the slate keys by its
-	///    name under [`ClusterConfig::peer_identity`] rather than the claimed
+	///    name under [`TrustPlanes::peer_identity`] rather than the claimed
 	///    `gateway_addr`.
 	/// 2. This gateway MUST be in a flood, and the signer MUST be a member of it.
 	/// 3. [`PeerConfig::admit_claim`] MUST admit the claimed address, and the
@@ -198,6 +199,8 @@ impl AdmittedPeerAd {
 	///
 	/// Caps and local-route conflicts are registry policy under
 	/// [`super::ServletRegistry::reconcile_peer_slate`].
+	///
+	/// [`TrustPlanes::peer_identity`]: super::TrustPlanes::peer_identity
 	pub(crate) fn admit(
 		verified: &VerifiedControlFrame<'_>,
 		ad: &PeerAdvertisement,
@@ -233,7 +236,7 @@ impl AdmittedPeerAd {
 	}
 
 	/// Relay trails through `relay_id`, the gateway that relayed this
-	/// advertisement, with one trail per advertised type dialing
+	/// advertisement, with one trail per advertised type that dials
 	/// `relay_dial`, the relay's own admitted gateway socket.
 	///
 	/// Returns `None` when the relay is the origin itself or the slate is
@@ -241,7 +244,7 @@ impl AdmittedPeerAd {
 	///
 	/// # Failover
 	///
-	/// Routing then holds two trails per type: the direct trail dialing
+	/// Routing then holds two trails per type: the direct trail that dials
 	/// the origin, and a relay trail through the relaying peer.
 	/// Pheromone feedback can therefore fail over to the relay when
 	/// the origin is unreachable.
@@ -380,8 +383,8 @@ impl<'a> Flood<'a> {
 	/// The rule reads the certificate the store holds for the key of `cert`.
 	///
 	/// - With a peer plane, a frame signature verifies against that same
-	///   certificate, so a rumor is sent only where signed frames are admitted
-	///   (CWE-668).
+	///   certificate, so this gateway sends a rumor only to a gateway whose
+	///   signed frames it admits (CWE-668).
 	/// - With no peer plane the gateway publishes only: it sends on its hive
 	///   trust store and admits no peer frame.
 	///
@@ -404,7 +407,7 @@ impl ClusterConfig {
 	///
 	/// It returns `None` for a gateway whose certificate carries no colony
 	/// URN, which gossips nothing. The constructor of [`Flood`] is private to
-	/// this file, so a flood exists only for a gateway this method takes.
+	/// this file, so a flood exists only where this method builds one.
 	#[must_use]
 	pub(crate) fn flood(&self) -> Option<Flood<'_>> {
 		self.colony_urn.as_ref()?;
@@ -429,8 +432,8 @@ impl ColonyNamespace {
 	/// Colony URN a certificate asserts, when exactly one is present.
 	///
 	/// Membership binds to the URI SAN (RFC 5280 §4.2.1.6) rather than the
-	/// Subject DN. Non-URI SANs and URIs that fail colony validation in this
-	/// namespace are ignored.
+	/// Subject DN. The method skips non-URI SANs and URIs that fail colony
+	/// validation in this namespace.
 	///
 	/// The answer is `None` in each case below, so an ambiguous identity
 	/// fails closed (CWE-706):
@@ -467,19 +470,21 @@ impl ColonyNamespace {
 
 /// Peer identity derived from a certificate.
 pub(crate) trait ColonyCertificate {
-	/// Stable peer key derived from the certificate itself.
+	/// Stable peer key: the fingerprint of the certificate under digest `D`.
 	///
 	/// Slates and misbehavior scoring key on this fingerprint of the
-	/// certificate that [`ClusterConfig::peer_identity`] resolves, so one peer
+	/// certificate that [`TrustPlanes::peer_identity`] resolves, so one peer
 	/// keeps one identity across every `gateway_addr` it advertises. The
-	/// answer is `None` when the trust store yields no fingerprint, so an
+	/// answer is `None` when the certificate yields no fingerprint, so an
 	/// unidentifiable peer fails closed.
-	fn fingerprint_id(&self) -> Option<SharedId>;
+	///
+	/// [`TrustPlanes::peer_identity`]: super::TrustPlanes::peer_identity
+	fn fingerprint_id<D: Digest>(&self) -> Option<SharedId>;
 }
 
 impl ColonyCertificate for Certificate {
-	fn fingerprint_id(&self) -> Option<SharedId> {
-		let fingerprint = CertificateTrustStore::to_fingerprint::<Sha3_256>(self).ok()?;
+	fn fingerprint_id<D: Digest>(&self) -> Option<SharedId> {
+		let fingerprint = Fingerprint::<D>::from_certificate(self).ok()?;
 		Some(Arc::from(fingerprint.as_slice()))
 	}
 }
@@ -488,7 +493,22 @@ impl ColonyCertificate for Certificate {
 mod tests {
 	use super::super::RouteKind;
 	use super::*;
-	use crate::colony::cluster::PeerAddress;
+	use crate::colony::cluster::{ColonyDigest, PeerAddress};
+	use crate::testing::{unhex, TestCertificate, TestKey};
+	use crate::transport::tcp::r#async::TokioListener;
+
+	/// The SHA3-256 digest of the DER of the fixed test certificate, computed
+	/// with Python's `hashlib.sha3_256`.
+	const HOUSE_GATEWAY_ID: &str = "4829c7ab13bad53f37475fc6603ed6ec327e951129d6f4022f503e9c20bb3b99";
+
+	/// A gateway under the house provider goes by the SHA3-256 fingerprint of
+	/// its certificate, the digest its protocol's provider names.
+	#[test]
+	fn a_house_gateway_goes_by_its_sha3_256_fingerprint() {
+		let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+		let id = certificate.fingerprint_id::<ColonyDigest<TokioListener>>();
+		assert_eq!(id.as_deref(), Some(unhex(HOUSE_GATEWAY_ID).as_slice()));
+	}
 
 	/// A colony URN under another naming authority.
 	fn foreign_colony() -> Urn<'static> {
@@ -510,10 +530,9 @@ mod tests {
 	}
 
 	/// One socket spelled two ways is one entry, so an address that passes the
-	/// hint gate also passes the advertisement gate.
-	/// An ad spelling its socket verbosely installs routes under the
-	/// canonical key, so a later scoring or eviction lookup by that address
-	/// finds them.
+	/// hint gate also passes the advertisement gate. An ad that spells its
+	/// socket verbosely installs routes under the canonical key, so a later
+	/// scoring or eviction lookup by that address finds them.
 	#[test]
 	fn an_ad_spelling_its_socket_verbosely_routes_under_the_canonical_key() {
 		let verbose = address("[0:0:0:0:0:0:0:1]:9000");
@@ -535,7 +554,7 @@ mod tests {
 	}
 
 	/// Pheromone settings the slate tests read: the shipped defaults, so a
-	/// changed default shows up here rather than silently diverging.
+	/// changed default shows up here rather than diverge unseen.
 	fn test_pheromone() -> PheromoneConfig {
 		PheromoneConfig::default()
 	}
@@ -569,7 +588,7 @@ mod tests {
 		assert_eq!(hint.peer_id.as_deref(), Some(origin.as_ref()));
 	}
 
-	/// The fixture socket a relaying gateway is dialed at.
+	/// The fixture socket where peers dial a relaying gateway.
 	fn relay_dial() -> AdmittedDial {
 		AdmittedDial::fixture("127.0.0.1:9001")
 	}
@@ -689,7 +708,7 @@ mod tests {
 		use super::*;
 		use crate::crypto::policy::Secp256k1Policy;
 		use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
-		use crate::crypto::x509::store::{CertificateTrustBuilder, TrustBuilder};
+		use crate::crypto::x509::store::{CertificateTrustBuilder, CertificateTrustStore, TrustBuilder};
 		use crate::tb_cases;
 		use crate::testing::fixtures::{TestCertificate, TestKey};
 

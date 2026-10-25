@@ -95,6 +95,7 @@ use cms_server::*;
 /// A simple message that the tests encode and send.
 #[derive(Beamable, Clone, Debug, PartialEq, Sequence)]
 pub struct TestMessage {
+	/// The text the message carries.
 	pub content: String,
 }
 
@@ -106,21 +107,29 @@ impl TestMessage {
 	}
 }
 
+/// A message whose type requires a confidential frame.
 #[derive(Beamable, Clone, Debug, PartialEq, Sequence)]
 #[beam(confidential)]
 pub struct ConfidentialNote {
+	/// The text the note carries.
 	pub content: String,
 }
 
+/// A message of numeric profile 1, whose type requires a confidential and
+/// non-repudiable frame of version V1 or later.
 #[derive(Beamable, Clone, Debug, PartialEq, Sequence)]
 #[beam(profile = 1)]
 pub struct ConfidentialNonrepudiableNote {
+	/// The text the note carries.
 	pub content: String,
 }
 
+/// A message whose type requires a message integrity digest and a frame
+/// integrity digest.
 #[derive(Beamable, Clone, Debug, PartialEq, Sequence)]
 #[beam(message_integrity, frame_integrity)]
 pub struct IntegralNote {
+	/// The text the note carries.
 	pub content: String,
 }
 
@@ -164,6 +173,16 @@ mod cert {
 
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 use cert::*;
+
+#[cfg(feature = "colony")]
+mod rumor {
+	pub use crate::builder::{FrameBuilder, TypeBuilder};
+	pub use crate::colony::cluster::VerifiedRumor;
+	pub use crate::colony::common::GossipRumor;
+}
+
+#[cfg(feature = "colony")]
+use rumor::*;
 
 /// Returns the fixed test validity window, which runs from the epoch through a
 /// far-future UtcTime.
@@ -355,11 +374,18 @@ where
 /// intermediate signs a leaf.
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 pub struct TestCertificateChain {
+	/// The self-signed root, a certificate authority that signs the
+	/// intermediate.
 	pub root: Certificate,
+	/// The intermediate certificate authority, which the root signs.
 	pub intermediate: Certificate,
+	/// The end-entity certificate, which the intermediate signs.
 	pub leaf: Certificate,
+	/// The key of [`Self::root`], which signs the root and the intermediate.
 	pub root_key: SigningKey,
+	/// The key of [`Self::intermediate`], which signs the leaf.
 	pub intermediate_key: SigningKey,
+	/// The key of [`Self::leaf`].
 	pub leaf_key: SigningKey,
 }
 
@@ -413,9 +439,9 @@ fn sign_test_certificate(
 
 /// A generic builder test macro.
 ///
-/// The macro works like `test_case!` for builders. It provides a base
-/// builder instance, allows customization, and passes both the input message
-/// and the resulting frame to the assertions.
+/// The macro works like `test_case!` for builders. It builds a base builder
+/// from `version`, runs the `setup` closure on it, and passes both the input
+/// message and the result of `setup` to the assertions.
 ///
 /// The `message` parameter supports two forms:
 ///
@@ -485,8 +511,9 @@ macro_rules! test_builder {
 /// Match a [`Frame`] against an expected value in one of these forms:
 ///
 /// - A `Frame` or an `Arc<Frame>` compares `metadata.id`.
-/// - A `Result<Frame, E>` compares `metadata.id` of the `Ok` frame.
-/// - Any `T: Beamable + PartialEq` decodes `T` from `frame.message` and compares.
+/// - A `Result<Frame, E>` compares `metadata.id` of the `Ok` frame, and an `Err` matches no frame.
+/// - Any `T: Message + PartialEq` decodes `T` from `frame.message` and
+///   compares, and a failed decode matches no frame.
 pub trait ExpectedMatcher {
 	fn matches(&self, frame: &Frame) -> bool;
 }
@@ -610,7 +637,7 @@ impl TestFrame {
 		result.expect("Failed to create TightBeam message")
 	}
 
-	/// Build a V1 frame carrying a Sha3-256 frame integrity (FI) digest.
+	/// Build a V1 frame that carries a SHA3-256 frame integrity (FI) digest.
 	#[cfg(all(feature = "builder", feature = "digest", feature = "sha3"))]
 	pub fn with_integrity() -> Frame {
 		let message = TestMessage::sample(None);
@@ -986,10 +1013,10 @@ impl TestCertificate {
 	}
 
 	/// Builds a leaf `CN=<cn>` that the authority `CN=<issuer_cn>` signs with
-	/// `issuer_key`, carrying each of `uris` as a URI Subject Alternative Name.
+	/// `issuer_key`, with each of `uris` as a URI Subject Alternative Name.
 	///
-	/// A store that holds the authority validates this leaf by its chain. It
-	/// does not hold the leaf, so it resolves no signer for the leaf's key.
+	/// A store that holds the authority alone validates this leaf by its chain,
+	/// and it resolves no signer for the leaf's key.
 	///
 	/// # Errors
 	///
@@ -1213,8 +1240,8 @@ impl TestCertificate {
 	/// Create a valid certificate chain in which a root signs an intermediate
 	/// and the intermediate signs a leaf.
 	///
-	/// Every certificate has proper issuer and subject chaining and a valid
-	/// signature.
+	/// Each certificate names the subject of its signer as its issuer, and
+	/// each carries a valid signature.
 	///
 	/// # Security
 	///
@@ -1526,8 +1553,8 @@ impl TestCmsServer {
 	}
 
 	/// A certificate of the signing key that the authority issues under
-	/// `serial`, apart from [`Self::signing`] in its serial number alone, so
-	/// its `subjectKeyIdentifier` names the same key.
+	/// `serial`, which differs from [`Self::signing`] in its serial number
+	/// alone, so its `subjectKeyIdentifier` names the same key.
 	pub fn signing_twin(&self, serial: u8) -> Certificate {
 		let subject = self.signing.tbs_certificate.subject.to_owned();
 		self.issue_signing(&self.signing_key, subject, serial)
@@ -1609,6 +1636,39 @@ impl TestIdentity {
 	pub fn certified(key: SigningKey) -> CertifiedKey<SigningKey> {
 		let certificate = TestCertificate::self_signed(&key);
 		CertifiedKey::new(&certificate, key).expect("the test key matches its certificate")
+	}
+}
+
+/// Gossip rumors that the fixed test key signs, as a gateway's verification
+/// hands them to admission.
+#[cfg(feature = "colony")]
+pub struct TestRumor;
+
+#[cfg(feature = "colony")]
+impl TestRumor {
+	/// The application rumor of `payload`, issued at `order` and signed by
+	/// [`TestKey::insecure_fixed_signing`].
+	///
+	/// # Security
+	///
+	/// The key is public, so every signature it makes is forgeable.
+	pub fn application(order: u64, payload: impl Into<Vec<u8>>) -> Frame {
+		let body = GossipRumor::application(payload.into());
+		let signer = TestIdentity::certified(TestKey::insecure_fixed_signing());
+		let issued = FrameBuilder::from(Version::V1).with_id("rumor").with_order(order);
+
+		let built = issued.with_message(body).with_signer::<Secp256k1Signature, _>(signer).build();
+		built.expect("the fixed test key signs a rumor")
+	}
+
+	/// `rumor` beside its signature, as its verification under
+	/// [`TestIdentity::insecure_fixed`] returns it.
+	pub fn verified(rumor: Frame) -> VerifiedRumor {
+		let identity = TestIdentity::insecure_fixed();
+		let verifying = rumor.verify_under(identity.signing_certificate(), identity.policy());
+		let signature = verifying.expect("the fixed test key signed the rumor");
+
+		VerifiedRumor::new(rumor, signature)
 	}
 }
 

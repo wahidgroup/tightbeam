@@ -59,11 +59,6 @@ use crate::asn1::WireDer;
 use crate::cms::signed_data::SignedData;
 #[cfg(feature = "transport-cms")]
 use crate::constants::ECDH_SHARED_SECRET_SIZE;
-#[cfg(any(
-	feature = "transport-hpke",
-	all(feature = "transport-cms", feature = "transport-multiplex")
-))]
-use crate::constants::EC_PUBKEY_COMPRESSED_SIZE;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::constants::{
 	pairwise_prefix_free, prefix_free, MIN_SALT_ENTROPY_BYTES, TIGHTBEAM_ACK_KDF_INFO, TIGHTBEAM_ACK_KEY_ID_DOMAIN,
@@ -91,15 +86,17 @@ use crate::crypto::sign::elliptic_curve::ecdh::EphemeralSecret;
 	feature = "transport-hpke",
 	all(feature = "transport-cms", feature = "transport-multiplex")
 ))]
-use crate::crypto::sign::elliptic_curve::sec1::ToEncodedPoint;
+use crate::crypto::sign::elliptic_curve::sec1::{self, CompressedPointSize, ToEncodedPoint};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::crypto::sign::elliptic_curve::{CurveArithmetic, PublicKey, SecretKey};
+use crate::crypto::sign::elliptic_curve::sec1::{EncodedPoint, FromEncodedPoint};
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::crypto::sign::elliptic_curve::{CurveArithmetic, Error as EllipticCurveError, PublicKey, SecretKey};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::sign::CmsSigner;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::subtle::ConstantTimeEq;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::crypto::x509::{PeerCertificate, Signing};
+use crate::crypto::x509::{PeerCertificate, Sec1Point, Signing};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::der::asn1::{ObjectIdentifier, OctetStringRef};
 #[cfg(all(
@@ -316,8 +313,8 @@ impl HandshakeSecret {
 	/// tag   = HMAC-H(mac_c, transcript_hash)
 	/// ```
 	///
-	/// The client owns no static key-establishment key, so the key
-	/// confirmation of NIST SP 800-56A Rev. 3 § 5.9 is not claimed.
+	/// The client owns no static key-establishment key, so this tag falls
+	/// outside the key confirmation of NIST SP 800-56A Rev. 3 § 5.9.
 	///
 	/// # Errors
 	///
@@ -427,8 +424,8 @@ impl HandshakeSecret {
 	/// Verify that `received` is the key-confirmation tag of this secret over
 	/// `transcript_hash`, and hand the secret back as confirmed.
 	///
-	/// The secret is consumed, so a caller that holds a [`ConfirmedSecret`]
-	/// holds the only copy of the secret.
+	/// The method consumes the secret, so a caller that holds a
+	/// [`ConfirmedSecret`] holds the only copy of the secret.
 	///
 	/// # Errors
 	///
@@ -497,9 +494,9 @@ impl SecretSeal {
 	/// bare.
 	///
 	/// Every field around the client certificate in a closing has a fixed
-	/// width, so its length would be the length of the certificate. Padding to
-	/// a step with a floor gives the closings of a fleet whose certificates
-	/// come from one issuer one length.
+	/// width, so its length would be the length of the certificate. The
+	/// padding, to a step with a floor, gives the closings of a fleet whose
+	/// certificates come from one issuer one length.
 	const fn padding(self) -> Option<Padding> {
 		match self {
 			Self::Ack => None,
@@ -507,8 +504,8 @@ impl SecretSeal {
 		}
 	}
 
-	/// The error an envelope refusal of this purpose returns, carrying the
-	/// refusal.
+	/// The error that an envelope refusal of this purpose returns, which
+	/// carries the refusal.
 	pub(crate) fn refusal(self, error: EnvelopeError) -> HandshakeError {
 		match self {
 			Self::Ack => HandshakeError::ReceiptAckCipher(error),
@@ -516,9 +513,8 @@ impl SecretSeal {
 		}
 	}
 
-	/// The sealed envelope `der` carries, admitted by the CMS rules of the
-	/// admission walk and decoded once, for a [`Sealer`] of this purpose to
-	/// open.
+	/// The sealed envelope `der` carries, for a [`Sealer`] of this purpose to
+	/// open. The CMS rules of the admission walk admit it, and it decodes once.
 	///
 	/// # Errors
 	///
@@ -529,12 +525,17 @@ impl SecretSeal {
 		admitted.map_err(|error| self.refusal(EnvelopeError::Encoding(error)))
 	}
 
-	/// The plaintext as it is sealed.
+	/// The frame of `plaintext` that the seal of this purpose encrypts.
 	///
 	/// A purpose with no padding seals the plaintext bare, in the buffer it
 	/// moved in. A padded purpose seals a big-endian `u16` length, the
 	/// plaintext, and zero bytes up to its padded length, so the opener finds
 	/// the end of the plaintext from the prefix alone.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::SealedFrame`] -- the plaintext of a padded purpose
+	///   is longer than a `u16` length names, or its padded length overflows.
 	pub(crate) fn frame(self, plaintext: impl Into<Vec<u8>>) -> Result<ZeroizingBytes, HandshakeError> {
 		let plaintext = ZeroizingBytes::new(plaintext.into());
 		let Some(padding) = self.padding() else {
@@ -550,9 +551,10 @@ impl SecretSeal {
 		Ok(framed)
 	}
 
-	/// The plaintext inside an opened frame. A length past the end of the
-	/// frame, a non-zero byte in its padding, or a frame of another padded
-	/// length is refused, so only a frame [`Self::frame`] could write opens.
+	/// The plaintext inside an opened frame. The method refuses a length past
+	/// the end of the frame, a non-zero byte in its padding, or a frame of
+	/// another padded length, so only a frame that [`Self::frame`] could write
+	/// opens.
 	fn unframe(self, framed: &[u8]) -> Result<SecretSlice<u8>, HandshakeError> {
 		let Some(padding) = self.padding() else {
 			return Ok(SecretSlice::from(framed.to_vec()));
@@ -722,7 +724,9 @@ impl<P: HandshakeProvider> Sealer<P> {
 	///
 	/// # Errors
 	///
-	/// - The refusal of the purpose -- the attribute is absent, repeated, or names another transcript.
+	/// - The [`SecretSeal::refusal`] of
+	///   [`EnvelopeError::AuthenticatedAttribute`] -- the attribute is absent,
+	///   repeated, or names another transcript.
 	/// - [`HandshakeError::DerError`] -- the expected attribute fails to encode.
 	fn refuse_unbound(&self, auth_attrs: Option<&Attributes>) -> Result<(), HandshakeError> {
 		let expected = self.transcript_hash.attribute()?;
@@ -932,7 +936,7 @@ impl EpochSecret {
 	/// holder of this link who records the whole renewal still needs that
 	/// scalar to derive the next one.
 	///
-	/// - `local` is a single-use scalar, moved in. It is wiped before the
+	/// - `local` is a single-use scalar, moved in. Its drop wipes it before the
 	///   derivation runs, so it is gone before any later await of the caller.
 	/// - `peer` is a [`PeerPoint`], so it is a point of the curve other than
 	///   the identity. Each rekey caller admits it through [`PeerEphemeral`].
@@ -952,8 +956,8 @@ impl EpochSecret {
 	{
 		let shared = local.shared_secret(peer.as_public_key());
 
-		// The scalar served its one agreement, so its box drops here and the
-		// scalar is wiped in place before the derivation runs.
+		// The scalar served its one agreement, so its box drops here, which
+		// wipes the scalar in place before the derivation runs.
 		drop(local);
 
 		self.chained::<P>(&shared, salt)
@@ -978,23 +982,23 @@ impl EpochSecret {
 	}
 }
 
-/// Epoch state retained past handshake completion for in-band rekeying.
+/// The epoch state that outlives the handshake for an in-band rekey.
 ///
 /// [`Handshake::complete`](crate::transport::handshake::Handshake::complete)
 /// produces it alongside the session keys, for either role. The epoch secret
 /// seeds the rekey KDF chain, and the transcript hash is the chain root
 /// `hash_0`. The handshake secret itself drops at completion.
 pub struct EpochMaterials {
-	/// Current epoch secret, zeroized on drop and on rotation
+	/// The current epoch secret, zeroized on drop and on rotation
 	/// (RFC 9846 § 7.2). Only `transport::rekey` reads it, and a build can
 	/// include the handshake without the `transport-multiplex` consumers.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[allow(dead_code)]
 	pub(crate) secret: EpochSecret,
-	/// Epoch counter. It is 0 at handshake and increments on each rekey
+	/// The epoch counter. It is 0 at handshake and increments on each rekey
 	/// install.
 	pub(crate) epoch: u32,
-	/// Chained transcript hash. `hash_0` is the handshake transcript.
+	/// The chained transcript hash. `hash_0` is the handshake transcript.
 	pub(crate) transcript_hash: TranscriptHash,
 }
 
@@ -1029,7 +1033,7 @@ impl EpochMaterials {
 	/// The derivation uses the same `secret` and `salt` pair as the
 	/// directional traffic keys. The distinct label yields an independent
 	/// secret (RFC 5869 domain separation), so the traffic keys keep their
-	/// strength while it is retained.
+	/// strength while the session retains it.
 	///
 	/// # Errors
 	///
@@ -1066,14 +1070,14 @@ impl EpochMaterials {
 	/// # Errors
 	///
 	/// - [`HandshakeError::TranscriptDigestLength`] -- the output of `D` is not 32 to 64 bytes.
-	pub(crate) fn exchange_pin<D: Digest + AssociatedOid>(
+	pub(crate) fn exchange_pin<D: Digest + AssociatedOid, C: HandshakeCurve>(
 		&self,
 		request_der: impl AsRef<[u8]>,
 		server_random: &[u8; 32],
-		server_ephemeral: &[u8; EC_PUBKEY_COMPRESSED_SIZE],
+		server_ephemeral: &sec1::CompressedPoint<C>,
 	) -> Result<TranscriptHash, HandshakeError> {
 		let hash = self.transcript_hash.as_bytes();
-		let legs: [&[u8]; 4] = [hash, request_der.as_ref(), server_random, server_ephemeral];
+		let legs: [&[u8]; 4] = [hash, request_der.as_ref(), server_random, server_ephemeral.as_slice()];
 		Transcript::digest::<D>(legs.concat())
 	}
 
@@ -1106,23 +1110,27 @@ impl EpochMaterials {
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 const EPOCH_SECRET_SIZE: usize = 32;
 
-/// The compressed SEC1 encoding of an ephemeral public key.
+/// The compressed SEC 1 encoding of an ephemeral public key, at the width of
+/// that form on the key's curve (SEC 1 v2.0 §2.3.3).
 ///
-/// The HPKE transcript and the rekey pin take the point at this width, so an
-/// ephemeral of any other length fails before the signature check rather than
-/// hashing as a variable-length leg.
+/// The HPKE hello, the HPKE reply, and both rekey legs carry an ephemeral in
+/// this form. The rekey pin hashes it as a leg of the type's width, so the
+/// curve fixes the width of every point the pin covers.
 #[cfg(any(
 	feature = "transport-hpke",
 	all(feature = "transport-cms", feature = "transport-multiplex")
 ))]
 pub(crate) trait CompressedPoint {
-	/// The compressed SEC1 bytes of this point.
+	/// The curve of the point.
+	type Curve: HandshakeCurve;
+
+	/// The compressed SEC 1 octets of this point.
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError::OctetStringLengthError`] -- the curve's compressed
-	///   point is not [`EC_PUBKEY_COMPRESSED_SIZE`] bytes wide.
-	fn compressed_point(&self) -> Result<[u8; EC_PUBKEY_COMPRESSED_SIZE], HandshakeError>;
+	/// - [`HandshakeError::OctetStringLengthError`] -- the encoding differs
+	///   from the compressed width of the curve.
+	fn compressed_point(&self) -> Result<sec1::CompressedPoint<Self::Curve>, HandshakeError>;
 }
 
 #[cfg(any(
@@ -1130,13 +1138,14 @@ pub(crate) trait CompressedPoint {
 	all(feature = "transport-cms", feature = "transport-multiplex")
 ))]
 impl<C: HandshakeCurve> CompressedPoint for PublicKey<C> {
-	fn compressed_point(&self) -> Result<[u8; EC_PUBKEY_COMPRESSED_SIZE], HandshakeError> {
-		let point = self.to_encoded_point(true);
-		let bytes = point.as_bytes();
-		let sized = bytes
-			.try_into()
-			.map_err(|_| HandshakeError::OctetStringLengthError((bytes.len(), EC_PUBKEY_COMPRESSED_SIZE).into()))?;
-		Ok(sized)
+	type Curve = C;
+
+	fn compressed_point(&self) -> Result<sec1::CompressedPoint<C>, HandshakeError> {
+		let encoded = self.to_encoded_point(true);
+		let octets = encoded.as_bytes();
+		let point = sec1::CompressedPoint::<C>::from_exact_iter(octets.iter().copied());
+		let width = (octets.len(), CompressedPointSize::<C>::USIZE);
+		point.ok_or_else(|| HandshakeError::OctetStringLengthError(width.into()))
 	}
 }
 
@@ -1154,13 +1163,28 @@ pub struct PeerPoint<C: CurveArithmetic>(PublicKey<C>);
 impl<C: HandshakeCurve> PeerPoint<C> {
 	/// Parse `sec1` as a peer ephemeral. It is the one parse of an ephemeral
 	/// that the handshake secret agrees with, and [`PeerEphemeral`] runs it
-	/// before its comparison.
+	/// before its comparison. The first octet names the form of the point
+	/// (SEC 1 v2.0 §2.3.3), and the parse reads it by the rule of
+	/// [`Sec1Point::read`] before the curve decodes:
+	///
+	/// - The compressed and the uncompressed forms, the two that RFC 5480 §2.2 names, parse.
+	/// - The parse refuses the compact form `0x05` and the identity `0x00`.
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError::InvalidPublicKey`] -- `sec1` is not a point on the curve.
+	/// - [`HandshakeError::InvalidPublicKey`] -- `sec1` is no point on the
+	///   curve in a form RFC 5480 §2.2 names.
 	pub(crate) fn parse(sec1: impl AsRef<[u8]>) -> Result<Self, HandshakeError> {
-		let point = PublicKey::<C>::from_sec1_bytes(sec1.as_ref())?;
+		let octets = sec1.as_ref();
+		let named_form = Sec1Point::read(octets).is_some();
+		if !named_form {
+			return Err(EllipticCurveError.into());
+		}
+
+		let encoded = EncodedPoint::<C>::from_bytes(octets).map_err(|_| EllipticCurveError)?;
+		let decoded = PublicKey::<C>::from_encoded_point(&encoded);
+
+		let point = Option::from(decoded).ok_or(EllipticCurveError)?;
 		Ok(Self(point))
 	}
 }
@@ -1173,13 +1197,13 @@ impl<C: CurveArithmetic> PeerPoint<C> {
 	}
 }
 
-/// The static keys a peer's ephemeral is admitted against, when the peer
+/// The static keys that a peer's ephemeral must differ from, when the peer
 /// holds any.
 ///
 /// The parse refuses a malformed, off-curve, or identity point, so every
-/// scalar multiplication runs on a valid one. A point that collapses an ECDH
-/// agreement into one with a static key of the peer is refused as well: the
-/// key itself, or its negation, since ECDH keeps the x-coordinate alone.
+/// scalar multiplication runs on a valid one. The trait also refuses a point
+/// that collapses an ECDH agreement into one with a static key of the peer:
+/// the key itself, or its negation, because ECDH keeps the x-coordinate alone.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub(crate) trait PeerEphemeral<C>
 where
@@ -1194,7 +1218,8 @@ where
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError::InvalidPublicKey`] -- `sec1` is not a point on the curve.
+	/// - [`HandshakeError::InvalidPublicKey`] -- `sec1` is no point on the
+	///   curve in a form RFC 5480 §2.2 names.
 	fn distinct_ephemeral(&self, sec1: &[u8]) -> Result<Option<PeerPoint<C>>, HandshakeError> {
 		let point = PeerPoint::parse(sec1)?;
 		let distinct = self.distinct_from(point.as_public_key());
@@ -1205,7 +1230,8 @@ where
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError::InvalidPublicKey`] -- `sec1` is not a point on the curve.
+	/// - [`HandshakeError::InvalidPublicKey`] -- `sec1` is no point on the
+	///   curve in a form RFC 5480 §2.2 names.
 	/// - [`HandshakeError::ServerEphemeralIsStatic`] -- the point collapses into a static key of the server.
 	fn server_ephemeral(&self, sec1: &[u8]) -> Result<PeerPoint<C>, HandshakeError> {
 		let distinct = self.distinct_ephemeral(sec1)?;
@@ -1217,7 +1243,8 @@ where
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError::InvalidPublicKey`] -- `sec1` is not a point on the curve.
+	/// - [`HandshakeError::InvalidPublicKey`] -- `sec1` is no point on the
+	///   curve in a form RFC 5480 §2.2 names.
 	/// - [`HandshakeError::ClientEphemeralIsStatic`] -- the point collapses into the client's static key.
 	#[cfg(feature = "transport-multiplex")]
 	fn client_ephemeral(&self, sec1: &[u8]) -> Result<PeerPoint<C>, HandshakeError> {
@@ -1240,8 +1267,8 @@ impl<P: HandshakeProvider> PeerEphemeral<P::Curve> for PeerCertificate<Signing<P
 /// The ephemeral-ephemeral step runs it with the client's [`SecretKey`], or
 /// with the [`EphemeralSecret`] the server drew for one handshake.
 ///
-/// Every peer arrives as a parsed [`PublicKey`], so each point has passed
-/// `from_sec1_bytes` before it reaches a scalar multiplication.
+/// Every peer arrives as a [`PublicKey`], whose type holds a valid point of
+/// the curve, so each scalar multiplication runs on a valid point.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub(crate) trait HandshakeAgreement<C>
 where
@@ -1696,6 +1723,30 @@ mod tests {
 		Ok(())
 	}
 
+	/// The uncompressed form is one of the two forms RFC 5480 §2.2 names, so
+	/// a point in it parses as a peer point, as the CMS flow carries one.
+	#[test]
+	fn a_point_in_the_uncompressed_form_parses_as_a_peer_point() -> Result<(), HandshakeError> {
+		let key = static_key();
+		let point = key.to_encoded_point(false);
+
+		let parsed = PeerPoint::<Secp256k1>::parse(point.as_bytes())?;
+		assert_eq!(parsed.as_public_key(), &key);
+		Ok(())
+	}
+
+	/// RFC 5480 §2.2 names no compact form, so the parse refuses the compact
+	/// form `0x05` of a point the curve decodes from it.
+	#[test]
+	fn a_point_in_the_compact_form_is_refused_at_the_parse() {
+		let compressed = static_key().to_encoded_point(true);
+		let mut compact = compressed.as_bytes().to_vec();
+		compact[0] = 0x05;
+
+		let refused = PeerPoint::<Secp256k1>::parse(&compact);
+		assert!(matches!(refused, Err(HandshakeError::InvalidPublicKey(_))));
+	}
+
 	#[cfg(feature = "transport-multiplex")]
 	#[test]
 	fn a_client_ephemeral_equal_to_the_client_static_key_is_refused() {
@@ -1759,7 +1810,7 @@ mod tests {
 		assert_ne!(first.as_bytes(), second.as_bytes());
 	}
 
-	/// A base secret of any other length is refused at the parse.
+	/// The parse refuses a base secret of any other length.
 	#[test]
 	fn a_base_secret_of_another_length_is_refused() {
 		let short = BaseSecret::try_from(SecretSlice::from(vec![0x42u8; 31]));
@@ -1795,6 +1846,16 @@ mod tests {
 		Ok(())
 	}
 
+	/// The server ephemeral leg of the pin known answers: every octet `0x02`,
+	/// at the width of a compressed secp256k1 point. The pin hashes the leg as
+	/// it is, so the octets name no point.
+	#[cfg(feature = "transport-multiplex")]
+	fn pin_ephemeral_leg() -> sec1::CompressedPoint<Secp256k1> {
+		let mut leg = sec1::CompressedPoint::<Secp256k1>::default();
+		leg.fill(0x02);
+		leg
+	}
+
 	/// The rekey pin is SHA3-256 over the chain hash, the request, the server
 	/// random, and the server ephemeral, in that order.
 	///
@@ -1807,7 +1868,8 @@ mod tests {
 		let transcript_hash = ack_transcript();
 		let materials = EpochMaterials { secret, epoch: 0, transcript_hash };
 
-		let pin = materials.exchange_pin::<Sha3_256>(b"request der", &[0x21u8; 32], &[0x02u8; 33])?;
+		let leg = pin_ephemeral_leg();
+		let pin = materials.exchange_pin::<Sha3_256, Secp256k1>(b"request der", &[0x21u8; 32], &leg)?;
 		let expected = [
 			0x63, 0x36, 0x6b, 0x7a, 0x2d, 0xa7, 0xb4, 0x7b, 0xe9, 0xc3, 0x4c, 0xca, 0x39, 0x08, 0x11, 0x9f, 0x61, 0xc2,
 			0x58, 0x9d, 0xc7, 0x45, 0x84, 0x8b, 0x2a, 0xd8, 0x55, 0xc7, 0xa7, 0xdc, 0x83, 0xde,
@@ -1833,7 +1895,8 @@ mod tests {
 	#[cfg(feature = "transport-multiplex")]
 	#[test]
 	fn a_sha3_512_exchange_pin_matches_its_known_answer() -> Result<(), HandshakeError> {
-		let pin = wide_materials().exchange_pin::<Sha3_512>(b"request der", &[0x21u8; 32], &[0x02u8; 33])?;
+		let leg = pin_ephemeral_leg();
+		let pin = wide_materials().exchange_pin::<Sha3_512, Secp256k1>(b"request der", &[0x21u8; 32], &leg)?;
 		let expected = [
 			0x70, 0x3d, 0x40, 0x9e, 0x9c, 0xc2, 0x66, 0x79, 0xb2, 0x32, 0x39, 0xff, 0xc5, 0xc6, 0x7d, 0x1b, 0x48, 0x5f,
 			0x63, 0x58, 0x0f, 0x54, 0x29, 0xc3, 0xe8, 0x40, 0xaa, 0x55, 0xd7, 0x51, 0xc1, 0x06, 0x84, 0x77, 0x32, 0x90,
@@ -2113,8 +2176,8 @@ mod tests {
 		signer
 	}
 
-	/// A server Finished over a reply of two signers is refused, since the
-	/// reply has one signature to cover.
+	/// The server Finished refuses a reply of two signers, because the reply
+	/// has one signature to cover.
 	#[test]
 	fn a_server_finished_over_two_signers_is_refused() -> Result<(), Box<dyn core::error::Error>> {
 		let salt = KdfSalt::new(&[0x99u8; 32]);
@@ -2287,8 +2350,8 @@ mod tests {
 		Ok(())
 	}
 
-	/// A seal whose transcript hash attribute names another transcript is
-	/// refused before its content decrypts, though its `kekid` is the
+	/// The opener refuses a seal whose transcript hash attribute names another
+	/// transcript before its content decrypts, though its `kekid` is the
 	/// opener's.
 	#[tokio::test]
 	async fn a_seal_whose_transcript_attribute_differs_is_refused() -> Result<(), HandshakeError> {
@@ -2448,8 +2511,8 @@ mod tests {
 		Ok(())
 	}
 
-	/// A frame of its padded length whose padding holds a non-zero byte is
-	/// refused.
+	/// `unframe` refuses a frame of its padded length whose padding holds a
+	/// non-zero byte.
 	#[test]
 	fn a_frame_with_a_non_zero_pad_is_refused() {
 		let mut framed = vec![0x00u8; 1024];
@@ -2460,7 +2523,7 @@ mod tests {
 		assert!(matches!(refused, Err(HandshakeError::SealedFrame)));
 	}
 
-	/// A frame whose length runs past its end is refused.
+	/// `unframe` refuses a frame whose length runs past its end.
 	#[test]
 	fn a_frame_whose_length_runs_past_its_end_is_refused() {
 		let framed = [0x00, 0x09, 0xaa, 0x00];
@@ -2468,8 +2531,8 @@ mod tests {
 		assert!(matches!(refused, Err(HandshakeError::SealedFrame)));
 	}
 
-	/// A frame that holds its plaintext and zero bytes, but runs past its
-	/// padded length, is refused.
+	/// `unframe` refuses a frame that holds its plaintext and zero bytes but
+	/// runs past its padded length.
 	#[test]
 	fn a_frame_longer_than_its_padded_length_is_refused() {
 		let mut framed = vec![0x00u8; 1536];
@@ -2494,8 +2557,8 @@ mod tests {
 		Ok(())
 	}
 
-	/// A frame that holds its plaintext and zero bytes, but falls short of its
-	/// padded length, is refused.
+	/// `unframe` refuses a frame that holds its plaintext and zero bytes but
+	/// falls short of its padded length.
 	#[test]
 	fn a_frame_shorter_than_its_padded_length_is_refused() {
 		let framed = [0x00, 0x01, 0xaa, 0x00];
@@ -2503,7 +2566,7 @@ mod tests {
 		assert!(matches!(refused, Err(HandshakeError::SealedFrame)));
 	}
 
-	/// A closing past the `u16` length of the frame is refused at the seal.
+	/// The seal refuses a closing past the `u16` length of the frame.
 	#[test]
 	fn a_closing_past_the_frame_length_is_refused() {
 		let oversized = vec![0x01u8; usize::from(u16::MAX) + 1];

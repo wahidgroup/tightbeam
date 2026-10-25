@@ -37,14 +37,14 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::cms::signed_data::SignerIdentifier;
 use crate::constants::DEFAULT_BACKPRESSURE_THRESHOLD_BPS;
-use crate::crypto::profiles::DefaultCryptoProvider;
+use crate::crypto::profiles::CryptoProvider;
 use crate::crypto::sign::SigningIdentity;
 use crate::crypto::x509::error::CertificateValidationError;
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::crypto::x509::utils::CertificateExt;
 use crate::crypto::x509::KeyPurposes;
 use crate::trace::TraceCollector;
-use crate::transport::client::PoolConfig;
+use crate::transport::client::{ConnectionBuilder, ConnectionPoolBuilder, PoolConfig};
 use crate::transport::multiplex::{RequestSink, StreamBody};
 use crate::transport::policy::CoreRetryPolicy;
 use crate::transport::state::EncryptionConfig;
@@ -78,7 +78,7 @@ pub trait ServletBox: Send + Sync {
 	/// Stops the servlet and consumes the boxed instance.
 	fn stop_boxed(self: Box<Self>);
 
-	/// The `SignerIdentifier` that names the certificate the servlet presents
+	/// The [`SignerIdentifier`] that names the certificate the servlet presents
 	/// in its handshake (RFC 5652 §5.3), or [`None`] for a servlet that
 	/// presents no certificate.
 	///
@@ -137,8 +137,8 @@ pub trait ServletBox: Send + Sync {
 
 	/// Whether the servlet is healthy and responsive.
 	///
-	/// An implementation can check internal state, connectivity, or other
-	/// health indicators. The default implementation returns `true`.
+	/// An implementation may check its internal state or its connectivity.
+	/// The default implementation returns `true`.
 	fn is_healthy(&self) -> bool {
 		true
 	}
@@ -155,8 +155,9 @@ pub struct ServletRegistration {
 }
 
 impl ServletRegistration {
-	/// Where this registration's servlet sits: its instance URN, derived once
-	/// from the type and the address, the address, and its signer.
+	/// Where this registration's servlet sits, as its instance URN, its
+	/// address, and its signer. The instance URN derives once from the type
+	/// and the address.
 	///
 	/// # Errors
 	///
@@ -214,12 +215,12 @@ impl ServletPlacement {
 pub struct RefusedRegistration {
 	/// Why the registry refused the insert.
 	pub error: TightBeamError,
-	/// The registration the registry did not take.
+	/// The registration the registry refused, whose servlet still runs.
 	pub registration: ServletRegistration,
 }
 
 impl RefusedRegistration {
-	/// Stops the servlet the registry did not take and yields the refusal.
+	/// Stops the servlet of the refused registration and returns the refusal.
 	///
 	/// Every refused registration ends here, so the servlet stops the one
 	/// way [`ServletBox::stop_boxed`] names rather than through its drop.
@@ -263,8 +264,8 @@ pub trait ServletRegistry: Send + Sync {
 	/// The current servlet slate, one entry per registered instance.
 	///
 	/// The slate skips a registration whose address is not a valid instance
-	/// locator, or whose servlet names no signer, so such an entry costs its
-	/// own row and not the slate.
+	/// locator, or whose servlet names no signer, so such an entry drops its
+	/// own row and the rest of the slate stands.
 	fn slate(&self) -> Vec<ServletInfo> {
 		let mut list = Vec::new();
 		self.for_each(|_key, reg| list.extend(reg.servlet_info()));
@@ -288,7 +289,7 @@ pub trait ServletRegistry: Send + Sync {
 
 /// The shipped [`ServletRegistry`]: one `HashMap` behind a mutex.
 ///
-/// Every write under the lock is one `HashMap` insert, remove or drain,
+/// Every write under the lock is one `HashMap` insert, remove, or drain,
 /// so a thread that panicked while it held the guard left a whole map
 /// behind it. The registry therefore recovers a poisoned lock and keeps
 /// serving, and every method answers.
@@ -486,7 +487,7 @@ pub trait Hive: Sized + Send + Sync {
 	fn servlet_addresses(&self) -> Vec<(Urn<'static>, Vec<u8>)>;
 
 	/// Stops the hive, its control server, its scaling task, every connection
-	/// it is serving, and all registered servlets.
+	/// it serves, and all registered servlets.
 	///
 	/// The stop aborts connection handlers where they stand. Use
 	/// [`Hive::drain`] first to let in-flight requests finish.
@@ -502,7 +503,7 @@ pub trait Hive: Sized + Send + Sync {
 
 	/// Registers this hive with the cluster controller at `cluster_addr`.
 	///
-	/// The hive sends a [`RegisterHiveRequest`] with all servlet addresses.
+	/// The hive sends a [`RegisterHiveRequest`] that carries its servlet slate.
 	/// The cluster then routes work to the servlets and sends management
 	/// commands (heartbeat, spawn, and stop) to this hive's control server.
 	/// Call this after [`Hive::establish`].
@@ -511,6 +512,9 @@ pub trait Hive: Sized + Send + Sync {
 	///
 	/// - [`TightBeamError::NotEstablished`] -- the hive has no control address
 	///   to register, because it is not established or has no `hive_tls`.
+	/// - [`TightBeamError::MissingResponse`] -- the cluster answers with no frame.
+	/// - [`TightBeamError`] -- the dial, the frame's signature, the exchange,
+	///   or the decode of the answer fails.
 	fn register_with_cluster(
 		&self,
 		cluster_addr: &<Self::Protocol as Protocol>::Address,
@@ -535,7 +539,8 @@ pub trait Hive: Sized + Send + Sync {
 
 /// The TLS material for the hive's control-plane and servlet identity.
 ///
-/// [`HiveConfig`] holds it in an `Arc`, since its validators are trait objects.
+/// [`HiveConfig`] holds it in an `Arc`, because its validators are trait
+/// objects.
 #[non_exhaustive]
 pub struct HiveTlsConfig {
 	/// The certificate and handshake key this hive presents, from
@@ -551,8 +556,8 @@ pub struct HiveTlsConfig {
 }
 
 impl HiveTlsConfig {
-	/// Decodes `certificate` and binds it to the key that proves it, under the
-	/// house provider.
+	/// Decodes `certificate`, binds it to the key that proves it, and installs
+	/// the identity under [`KeyPurposes::HOUSE`].
 	///
 	/// A hive presents one identity everywhere: to dial a gateway, to dial a
 	/// sibling servlet, and to accept on its own control plane. One decode
@@ -635,10 +640,10 @@ impl HiveTlsConfig {
 	/// The encryption config of the control plane: this identity, the client
 	/// [`Self::validators`] and `command_trust`, and the key purposes
 	/// [`Self::from_identity`] installed.
-	pub(crate) fn accept_encryption(
+	pub(crate) fn accept_encryption<C: CryptoProvider>(
 		&self,
 		command_trust: Option<Arc<dyn CertificateValidation>>,
-	) -> TransportEncryptionConfig<DefaultCryptoProvider> {
+	) -> TransportEncryptionConfig<C> {
 		let encryption = TransportEncryptionConfig::new(self.identity.clone());
 		let validators = self.validators.iter().map(Arc::clone).chain(command_trust);
 
@@ -649,7 +654,7 @@ impl HiveTlsConfig {
 	/// Configures `encryption` to dial a gateway under this identity: it
 	/// presents the identity as its client certificate, and holds both sides
 	/// to the key purposes [`Self::from_identity`] installed.
-	pub(crate) fn outbound(&self, encryption: &mut EncryptionConfig<DefaultCryptoProvider>) {
+	pub(crate) fn outbound<C: CryptoProvider>(&self, encryption: &mut EncryptionConfig<C>) {
 		encryption.client_identity = Some(self.identity.clone());
 		encryption.key_purposes = self.key_purposes;
 	}
@@ -773,7 +778,7 @@ pub trait HiveContext: Send + Sync {
 	/// - The frame emits as-is, so a `nonrepudiation` signature that the
 	///   caller applied stays verifiable at the servlet.
 	/// - The reply is the servlet's complete envelope. Verify it with
-	///   [`Frame::verify`] before trusting the message body.
+	///   [`Frame::verify`] before you trust the message body.
 	/// - A servlet that answers with no frame resolves to [`TightBeamError::MissingResponse`].
 	fn call<'a>(&'a self, servlet_type: &'a Urn<'a>, frame: Frame) -> CallFuture<'a>;
 
@@ -816,7 +821,7 @@ pub struct HiveScalingConfig {
 }
 
 impl HiveScalingConfig {
-	/// Scaling thresholds that apply to `servlet_type`.
+	/// The scaling thresholds that apply to `servlet_type`.
 	///
 	/// A type with no entry in [`Self::overrides`] scales on
 	/// [`Self::default_scale`].
@@ -843,7 +848,7 @@ pub struct HiveControlConfig {
 	/// The longest wait for a graceful drain, after which the remaining
 	/// servlets stop.
 	pub drain_timeout: Duration,
-	/// The anti-entropy interval for re-announcing the servlet slate.
+	/// The anti-entropy interval of the servlet slate re-announce.
 	///
 	/// Every interval the hive re-announces its full servlet slate, freshly
 	/// signed, to every gateway it has registered with. [`None`] disables
@@ -942,12 +947,36 @@ impl HiveConfig {
 	/// against the peer its handshake proves, so the plane demands a client
 	/// certificate that the store validates, beside the
 	/// [`HiveTlsConfig::validators`].
-	pub(crate) fn control_encryption(&self) -> Option<TransportEncryptionConfig<DefaultCryptoProvider>> {
+	pub(crate) fn control_encryption<C: CryptoProvider>(&self) -> Option<TransportEncryptionConfig<C>> {
 		let hive_tls = self.hive_tls.as_ref()?;
 		let trust_store = self.trust_store.as_ref().map(Arc::clone);
 		let command_trust = trust_store.map(|store| store as Arc<dyn CertificateValidation>);
 
 		Some(hive_tls.accept_encryption(command_trust))
+	}
+
+	/// Configures `builder` for the hive's calls to its own servlets: each dial
+	/// validates the servlet's certificate with [`Self::trust_store`], when the
+	/// hive has one.
+	pub(crate) fn sibling_dials<P: Protocol>(&self, builder: ConnectionPoolBuilder<P>) -> ConnectionPoolBuilder<P> {
+		match self.trust_store.as_ref() {
+			Some(store) => builder.with_trust_store(Arc::clone(store)),
+			None => builder,
+		}
+	}
+
+	/// The encryption config of a dial to a gateway.
+	///
+	/// - The dial validates the gateway's certificate with [`Self::trust_store`], when the hive has one.
+	/// - It presents the identity of [`Self::hive_tls`], under its key purposes, when the hive has one.
+	pub(crate) fn gateway_dial<C: CryptoProvider>(&self) -> EncryptionConfig<C> {
+		let trust_store = self.trust_store.as_ref().map(Arc::clone);
+		let mut encryption = EncryptionConfig { trust_store, ..EncryptionConfig::unconfigured() };
+		if let Some(hive_tls) = &self.hive_tls {
+			hive_tls.outbound(&mut encryption);
+		}
+
+		encryption
 	}
 
 	/// The hive identity URN derived from the control address `hive_addr`.
@@ -1003,6 +1032,7 @@ mod tests {
 	use super::*;
 	use crate::crypto::key::Secp256k1KeyProvider;
 	use crate::crypto::policy::Secp256k1Policy;
+	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 	use crate::crypto::x509::error::CertificateValidationError::ExcludedKeyPurpose;
 	use crate::crypto::x509::store::{CertificateTrustBuilder, TrustBuilder};
@@ -1031,7 +1061,7 @@ mod tests {
 
 	// The identity signs the hive's registrations, so the install holds it
 	// to the signer purpose (RFC 5280 §4.2.1.12). A certificate that names
-	// the signer purpose, any purpose, or no purpose at all installs.
+	// the signer purpose, any purpose, or no purpose installs.
 	tb_cases! {
 		fn from_identity_admits_an_identity_for_the_signer(
 			purpose: Option<ObjectIdentifier>
@@ -1142,8 +1172,7 @@ mod tests {
 		}
 	}
 
-	/// Purposes that name the client purpose in the server role, which the
-	/// house purposes do not.
+	/// Key purposes that put the house client purpose in the server role.
 	const SWAPPED_SERVER: KeyPurposes = KeyPurposes { server: KeyPurposes::HOUSE.client, ..KeyPurposes::HOUSE };
 
 	// A hive with a trust store authenticates each command against the peer
@@ -1156,8 +1185,7 @@ mod tests {
 		let store: Arc<dyn CertificateTrust> = Arc::new(builder.build());
 		let config = HiveConfig { trust_store: Some(store), hive_tls: Some(Arc::new(tls)), ..Default::default() };
 
-		let accept = config.control_encryption();
-
+		let accept = config.control_encryption::<DefaultCryptoProvider>();
 		assert!(accept.is_some_and(|accept| accept.peer_authentication.requires_certificate()));
 		Ok(())
 	}
@@ -1167,9 +1195,7 @@ mod tests {
 	#[test]
 	fn the_control_plane_takes_the_configured_key_purposes() -> Result<(), TightBeamError> {
 		let tls = HiveTlsConfig::from_identity(identity_naming(None), Vec::new(), SWAPPED_SERVER)?;
-
-		let accept = tls.accept_encryption(None);
-
+		let accept = tls.accept_encryption::<DefaultCryptoProvider>(None);
 		assert_eq!(accept.key_purposes, SWAPPED_SERVER);
 		Ok(())
 	}
@@ -1179,7 +1205,7 @@ mod tests {
 	#[test]
 	fn a_gateway_dial_takes_the_configured_key_purposes() -> Result<(), TightBeamError> {
 		let tls = HiveTlsConfig::from_identity(identity_naming(None), Vec::new(), SWAPPED_SERVER)?;
-		let mut encryption = EncryptionConfig::unconfigured();
+		let mut encryption = EncryptionConfig::<DefaultCryptoProvider>::unconfigured();
 
 		tls.outbound(&mut encryption);
 
@@ -1197,7 +1223,6 @@ mod tests {
 		let spec = CertificateSpec::Built(Box::new(certificate));
 
 		let refused = HiveTlsConfig::new(spec, Arc::new(Secp256k1KeyProvider::from(key)), Vec::new());
-
 		let excluded = matches!(refused, Err(TightBeamError::CertificateValidationError(ExcludedKeyPurpose)));
 		assert!(excluded);
 		Ok(())

@@ -93,7 +93,7 @@ As in the HPKE flow, a passive observer reads the signing certificate. The openi
    - A budget-bearing session activates only after the countersignature verifies.
    - A refused settlement drops the handshake secret, so a replay of that message has nothing to complete.
 
-4. One `ProfilePolicy` negotiates the security profile. The server chooses from a `SupportedProfiles`, which cannot be empty (`NoSupportedProfiles`). The client refuses a reply that selects nothing (`InvalidProfileSelection`).
+4. One `ProfilePolicy` negotiates the security profile. The server chooses from a `SupportedProfiles`, which cannot be empty (`NoSupportedProfiles`). The client refuses a reply that selects nothing (`InvalidProfileSelection`). Each side holds the profile to the strength floor its provider names, `CryptoProvider::strength_floor`, and refuses a profile below it (`BelowStrengthFloor`).
 
 ## Wire containers
 
@@ -328,7 +328,7 @@ A handshake draws these ephemerals:
 | The client drops its private half | In `respond`, at the agreement                                    | In `respond`, at the agreement            |
 | The server drops its private half | In `reply`, at the agreement, before it encodes the reply         | In `reply`, at the agreement              |
 
-`PeerPoint::parse` parses every received ephemeral before any scalar multiplication. It refuses a malformed, off-curve, or identity point, and the agreement takes no other point type.
+`PeerPoint::parse` parses every received ephemeral before any scalar multiplication. It refuses a malformed, off-curve, or identity point, and a point in a form that RFC 5480 § 2.2 refuses, the compact form `0x05` among them. The agreement takes no other point type. The HPKE hello and the HPKE reply carry their ephemeral in the compressed SEC 1 form, at the width the curve of the provider gives that form (SEC 1 v2.0 § 2.3.3), and each reader refuses a point of another width (`OctetStringLengthError`).
 
 An ephemeral with the x-coordinate of its sender's static key would collapse the agreement into the static one, so each side refuses it:
 
@@ -373,6 +373,7 @@ Here `ee` is the ECDH output of the two rekey ephemerals, and `u32be(n)` is the 
 | The next epoch needs a rekey scalar                                | `EpochSecret::next` runs the agreement itself                                                                                            |
 | Both ephemerals are authenticated                                  | The server signs a receipt over `H(hash \|\| request \|\| server_random \|\| Se)`, the request carries `Ce`, and the client countersigns |
 | A peer ephemeral is a curve point, and never the peer's static key | `PeerEphemeral` yields a `PeerPoint`, the one point type `EpochSecret::next` takes                                                       |
+| `Ce` and `Se` travel compressed, at the width of the curve         | Each side reads a leg at the compressed width of the curve and parses it before the pin, and the server pins `Se` as it sends it         |
 | The server holds no rekey scalar across an await                   | It agrees and drops its scalar before it awaits its authorizer, and holds the derived secret until the acknowledgement                   |
 | The client holds its rekey scalar across no await of a step        | `EpochSecret::next` takes the boxed scalar by value before the client awaits its approver                                                |
 

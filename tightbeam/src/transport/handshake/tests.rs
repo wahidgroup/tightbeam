@@ -23,8 +23,7 @@ use crate::cms::content_info::ContentInfo as ContentInfoValue;
 use crate::cms::signed_data::SignedData;
 use crate::cms::signed_data::SignerIdentifier;
 use crate::constants::{
-	EC_PUBKEY_COMPRESSED_SIZE, TIGHTBEAM_ACK_KDF_INFO, TIGHTBEAM_ACK_KEY_ID_DOMAIN, TIGHTBEAM_C2S_KDF_INFO,
-	TIGHTBEAM_S2C_KDF_INFO,
+	TIGHTBEAM_ACK_KDF_INFO, TIGHTBEAM_ACK_KEY_ID_DOMAIN, TIGHTBEAM_C2S_KDF_INFO, TIGHTBEAM_S2C_KDF_INFO,
 };
 use crate::crypto::aead::{DirectionalCiphers, KeyInit, RecordDirection, RecvCipher, RuntimeAead};
 use crate::crypto::cms::{AuthEnvelopedData, Opener};
@@ -39,7 +38,7 @@ use crate::crypto::secret::SecretSlice;
 use crate::crypto::secret::ToInsecure;
 use crate::crypto::sign::ecdsa::k256::{Secp256k1, SecretKey};
 use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
-use crate::crypto::sign::elliptic_curve::sec1::ToEncodedPoint;
+use crate::crypto::sign::elliptic_curve::sec1::{CompressedPoint as Sec1CompressedPoint, ToEncodedPoint};
 use crate::crypto::sign::elliptic_curve::PublicKey;
 use crate::crypto::sign::{CanonicalSigner, CmsSigner, Signed, SignedContent, SigningIdentity};
 use crate::crypto::x509::attr::{Attribute, Attributes};
@@ -354,6 +353,7 @@ pub fn reissued(certificate: &Certificate, issuer_key: &Secp256k1SigningKey, ser
 	let signature: Secp256k1Signature = issuer_key.sign_canonical::<Sha3_256>(message).expect("the issuer key signs");
 	let signature = BitString::from_bytes(signature.as_bytes()).expect("a signature is a BIT STRING");
 	let signature_algorithm = certificate.signature_algorithm.to_owned();
+
 	Certificate { tbs_certificate, signature, signature_algorithm }
 }
 
@@ -378,6 +378,7 @@ pub fn presented_certificates(reply: &HandshakeMessage) -> Vec<Certificate> {
 		CertificateChoices::Certificate(certificate) => Some(certificate),
 		CertificateChoices::Other(_) => None,
 	};
+
 	choices.into_iter().filter_map(certificate).collect()
 }
 
@@ -386,6 +387,7 @@ pub fn create_expired_test_certificate() -> TestCertificate {
 	let mut expired = create_test_certificate();
 	let not_after = GeneralizedTime::from_unix_duration(Duration::from_secs(1));
 	let not_after = not_after.expect("one second after the epoch is a time");
+
 	expired.certificate.tbs_certificate.validity.not_after = Time::GeneralTime(not_after);
 	expired
 }
@@ -396,6 +398,7 @@ pub fn create_expired_test_certificate() -> TestCertificate {
 pub fn same_key_twin(identity: &TestCertificate) -> Certificate {
 	let mut twin = identity.certificate.to_owned();
 	let serial_number = SerialNumber::new(&[2]).expect("a serial number encodes");
+
 	twin.tbs_certificate.serial_number = serial_number;
 	twin
 }
@@ -411,6 +414,7 @@ pub fn create_issued_test_certificate(serial: impl AsRef<[u8]>) -> TestCertifica
 	let mut issued = create_test_certificate();
 	let issuer = RdnSequence::from_str("CN=tightbeam test issuer").expect("the issuer name parses");
 	let serial_number = SerialNumber::new(serial.as_ref()).expect("a test serial number encodes");
+
 	issued.certificate.tbs_certificate.issuer = issuer;
 	issued.certificate.tbs_certificate.serial_number = serial_number;
 	issued
@@ -460,25 +464,29 @@ fn create_test_certificate_inner(signing_key: &Secp256k1SigningKey) -> Result<Ce
 	})
 }
 
-/// A fresh server ephemeral public key as the compressed SEC1 point the
-/// `ServerHandshake` carries. The private half is discarded, so a client that
-/// completes against it derives keys nobody else holds.
+/// A fresh server ephemeral public key as the compressed SEC 1 point the
+/// `ServerHandshake` carries. The function discards the private half, so a
+/// client that completes against it derives keys nobody else holds.
 #[cfg(feature = "transport-hpke")]
-pub fn create_test_server_ephemeral() -> [u8; EC_PUBKEY_COMPRESSED_SIZE] {
+pub fn create_test_server_ephemeral() -> Sec1CompressedPoint<Secp256k1> {
 	let public_key = SecretKey::random(&mut OsRng).public_key();
-	public_key.compressed_point().expect("a compressed secp256k1 point is 33 bytes")
+	public_key.compressed_point().expect("a secp256k1 point compresses")
 }
 
-/// A 33-byte compressed encoding whose x-coordinate lies off secp256k1, so
-/// the SEC1 parser refuses it while its length passes every width check.
+/// A compressed encoding at the width of secp256k1 whose x-coordinate lies
+/// off the curve, so the SEC 1 parser refuses it while its length passes every
+/// width check.
 ///
 /// About half of all x-coordinates are off the curve, so the search ends after
 /// a few candidates.
-pub fn off_curve_point() -> [u8; EC_PUBKEY_COMPRESSED_SIZE] {
-	let mut candidate = [0u8; EC_PUBKEY_COMPRESSED_SIZE];
+pub fn off_curve_point() -> Sec1CompressedPoint<Secp256k1> {
+	let mut candidate = Sec1CompressedPoint::<Secp256k1>::default();
+	let last = candidate.len() - 1;
+
 	candidate[0] = 0x02;
+
 	for x in 1u8..=u8::MAX {
-		candidate[EC_PUBKEY_COMPRESSED_SIZE - 1] = x;
+		candidate[last] = x;
 		if PublicKey::<Secp256k1>::from_sec1_bytes(&candidate).is_err() {
 			return candidate;
 		}
@@ -498,7 +506,7 @@ pub fn negated(key: &PublicKey<Secp256k1>) -> PublicKey<Secp256k1> {
 /// parses as no point of the curve.
 pub fn put_off_curve_key(certificate: &mut Certificate) {
 	let off_curve = BitString::from_bytes(&off_curve_point());
-	let off_curve = off_curve.expect("33 bytes are a BIT STRING");
+	let off_curve = off_curve.expect("a compressed point is a BIT STRING");
 	certificate.tbs_certificate.subject_public_key_info.subject_public_key = off_curve;
 }
 
@@ -585,6 +593,7 @@ pub fn fixture_transcript<D: Digest + AssociatedOid>(output: impl AsRef<[u8]>) -
 pub fn fixture_confirmation() -> KeyConfirmation {
 	let secret = fixture_handshake_secret(0x42);
 	let transcript = fixture_transcript::<Sha3_256>(FIXTURE_CONFIRMED);
+
 	let derived = secret.confirmation::<DefaultCryptoProvider>(KdfSalt::new(&FIXTURE_CONFIRMED), &transcript);
 	derived.expect("a fixture secret derives a tag")
 }
@@ -622,6 +631,7 @@ impl Confirming {
 	pub fn closing_sealer(&self, base: Option<&BaseSecret>, ephemeral: &SecretKey) -> Sealer<DefaultCryptoProvider> {
 		let salt = KdfSalt::new(&self.salt);
 		let secret = self.secret(base, ephemeral);
+
 		let sealer = secret.sealer::<DefaultCryptoProvider>(SecretSeal::Closing, salt, &self.transcript_hash);
 		sealer.expect("the handshake secret derives a closing key")
 	}
@@ -632,6 +642,7 @@ impl Confirming {
 		let salt = KdfSalt::new(&self.salt);
 		let server_ephemeral = admitted(&self.server_ephemeral);
 		let agreement = agreement_of(&server_ephemeral, base);
+
 		let settled = agreement.settle(ephemeral, salt);
 		settled.expect("the agreement derives a handshake secret")
 	}
@@ -737,7 +748,7 @@ pub struct StaticKeyObserver {
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl StaticKeyObserver {
 	/// Give the observer `static_key`, the `base` it recovered with it when
-	/// the flow carries one, the two ephemeral public keys as SEC1 bytes, and
+	/// the flow carries one, the two ephemeral public keys as SEC 1 bytes, and
 	/// the protocol `salt`.
 	pub fn new(
 		static_key: &SecretKey,
@@ -801,6 +812,7 @@ impl StaticKeyObserver {
 		let content_type = envelope.auth_encrypted_content_info.content_type;
 		let salt = KdfSalt::new(&self.salt);
 		let mut attempts = Vec::new();
+
 		for secret in self.handshake_secrets()? {
 			let sealer = secret.sealer::<DefaultCryptoProvider>(purpose, salt, transcript_hash)?;
 			attempts.push(sealer.open(purpose.admit(sealed)?, content_type).await);
@@ -1034,7 +1046,7 @@ impl TransportAuthorizer for ChallengingAuthorizer {
 	}
 }
 
-/// Records the offers it is asked to grant, and grants each as
+/// Records the offers the server asks it to grant, and grants each as
 /// [`ChallengingAuthorizer`] does.
 #[derive(Default)]
 pub struct RecordingAuthorizer(Mutex<Vec<TransportOffer>>);
@@ -1349,7 +1361,7 @@ pub async fn mutual_run<F: TestFlow>(client_identity: &TestCertificate, key: Arc
 }
 
 /// Drive a client under `client` and a server under `server` through the
-/// three legs, recording each message as it is sent.
+/// three legs, and record each message as its sender sends it.
 pub async fn run<F: TestFlow>(client: TestClientConfig<F>, server: TestServerConfig<F>) -> Run<F> {
 	let mut client = Handshake::client(client);
 	let mut server = Handshake::server(server);

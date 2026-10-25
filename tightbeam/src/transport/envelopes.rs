@@ -29,7 +29,9 @@ use crate::transport::error::TransportError;
 #[cfg(feature = "transport-multiplex")]
 mod multiplex {
 	pub use crate::cms::signed_data::SignerInfo;
-	pub use crate::constants::{DEFAULT_HOP_BUDGET, EC_PUBKEY_COMPRESSED_SIZE};
+	pub use crate::constants::DEFAULT_HOP_BUDGET;
+	pub use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
+	pub use crate::crypto::sign::elliptic_curve::{AffinePoint, CurveArithmetic, FieldBytesSize, PublicKey};
 	pub use crate::crypto::sign::Signed;
 	pub use crate::der::asn1::OctetString;
 	pub use crate::der::Enumerated;
@@ -97,7 +99,7 @@ pub struct ResponsePackage {
 }
 
 impl ResponsePackage {
-	/// Terminal response for a unary or streaming service outcome.
+	/// The terminal response for a unary or streaming service outcome.
 	///
 	/// It is the inverse of [`Self::resolve`]: a success carries the frame, and
 	/// a failure carries its status alone. The two together are the whole
@@ -120,7 +122,7 @@ impl ResponsePackage {
 	///
 	/// # Errors
 	///
-	/// - [`TransportError`] -- for any status other than [`TransitStatus::Ok`].
+	/// - [`TransportError`] -- the responder reported a status other than [`TransitStatus::Ok`].
 	#[cfg(all(
 		feature = "transport-multiplex",
 		any(feature = "tokio", feature = "async-transport")
@@ -207,7 +209,7 @@ pub const MUX_APPLICATION_CODE_FLOOR: u32 = 0x1000;
 ///
 /// - A known TB-reserved code decodes to its named variant.
 /// - Every other code round-trips through [`CancelReason::Application`], so an
-///   unknown code never kills a connection.
+///   unknown code leaves the connection open.
 /// - `Application(code)` with a TB-reserved `code` canonicalizes to the named variant on decode.
 ///
 /// [rfc9113-6.4]: https://datatracker.ietf.org/doc/html/rfc9113#section-6.4
@@ -270,7 +272,7 @@ pub enum GoAwayReason {
 	/// [rfc9113-7]: https://datatracker.ietf.org/doc/html/rfc9113#section-7
 	EnhanceYourCalm,
 	/// The session budget is spent down to the drain headroom. The epoch's
-	/// negotiated data volume is exhausted, and the sender is draining.
+	/// negotiated data volume is exhausted, and the sender drains.
 	BudgetExhausted,
 	/// Settlement of the session agreement failed, or was revoked after
 	/// activation.
@@ -368,8 +370,8 @@ macro_rules! mux_chunk_package {
 	};
 }
 
-/// The interaction shape of a mux stream, which the initiating call stamps
-/// on the Open record.
+/// The interaction shape of a mux stream, which the call that opens the
+/// stream stamps on the Open record.
 ///
 /// It tells the responder whether the body reassembles into one [`Frame`]
 /// and which reply shape the initiator awaits, so dispatch reads the shape
@@ -381,14 +383,16 @@ pub enum MuxStreamKind {
 	/// The body reassembles into one frame, and the reply is a unary `End`.
 	#[default]
 	Unary = 0,
-	/// The body is consumed incrementally, and the reply is a unary `End`.
+	/// The responder consumes the body incrementally, and the reply is a
+	/// unary `End`.
 	Streaming = 1,
-	/// The body is consumed incrementally, and the reply streams back as
-	/// `Data*` records ahead of the closing trailer.
+	/// The responder consumes the body incrementally, and the reply streams
+	/// back as `Data*` records ahead of the closing trailer.
 	Duplex = 2,
 }
 
-/// Open a stream and carry its first payload chunk inline.
+/// The record that opens a stream and carries its first payload chunk
+/// inline.
 ///
 /// All streams share one grammar ([RFC 9113 § 8.1][rfc9113-8.1]):
 ///
@@ -468,7 +472,7 @@ impl MuxOpenPackage {
 		self.last
 	}
 
-	/// The interaction shape that the initiating call stamped on the stream.
+	/// The interaction shape that the opening call stamped on the stream.
 	pub fn kind(&self) -> MuxStreamKind {
 		self.kind
 	}
@@ -544,12 +548,12 @@ impl MuxEndPackage {
 	}
 }
 
-/// Grant absolute cumulative chunk credit on a stream, as QUIC
-/// MAX_STREAM_DATA does ([RFC 9000 § 4.1][rfc9000-4.1]).
+/// A grant of absolute cumulative chunk credit on a stream, as QUIC
+/// MAX_STREAM_DATA grants it ([RFC 9000 § 4.1][rfc9000-4.1]).
 ///
 /// `limit` is the absolute total chunk count that the sender may have emitted
-/// on the stream. Grants are idempotent and monotonic, so duplicated or
-/// reordered grants never corrupt the flow-control ledger.
+/// on the stream. Grants are idempotent and monotonic, so the flow-control
+/// ledger stays correct under duplicated or reordered grants.
 ///
 /// [rfc9000-4.1]: https://datatracker.ietf.org/doc/html/rfc9000#section-4.1
 #[cfg(feature = "transport-multiplex")]
@@ -578,7 +582,7 @@ impl MuxCreditPackage {
 	}
 }
 
-/// Cancel a single in-flight stream without tearing down the connection.
+/// The cancel of a single in-flight stream, which leaves the connection open.
 #[cfg(feature = "transport-multiplex")]
 #[derive(Sequence, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MuxCancelPackage {
@@ -639,8 +643,8 @@ impl MuxPingPackage {
 
 /// A graceful connection shutdown.
 ///
-/// Streams at or below `last_stream_id` drain to completion, and newer
-/// streams are rejected.
+/// Streams at or below `last_stream_id` drain to completion, and the
+/// receiver refuses newer streams.
 #[cfg(feature = "transport-multiplex")]
 #[derive(Sequence, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GoAwayPackage {
@@ -661,7 +665,7 @@ impl GoAwayPackage {
 		self.last_stream_id
 	}
 
-	/// Why the sender is shutting the connection down.
+	/// Why the sender shuts the connection down.
 	pub fn reason(&self) -> GoAwayReason {
 		GoAwayReason::from(self.code)
 	}
@@ -684,18 +688,39 @@ pub struct MuxRekeyRequestPackage {
 
 #[cfg(feature = "transport-multiplex")]
 impl MuxRekeyRequestPackage {
-	/// Build a request that carries `client_random` and the compressed SEC1
-	/// point `client_ephemeral`.
+	/// Build a request that carries `client_random` and `client_ephemeral` in
+	/// the compressed SEC 1 form, at the width of that form on the curve `C`
+	/// (SEC 1 v2.0 §2.3.3).
 	///
 	/// # Errors
 	///
 	/// - [`der::Error`] -- `client_random` is longer than the DER length cap.
-	pub fn new(
-		client_random: impl Into<Vec<u8>>,
-		client_ephemeral: &[u8; EC_PUBKEY_COMPRESSED_SIZE],
-	) -> DerResult<Self> {
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::crypto::k256::{PublicKey, SecretKey};
+	/// use tightbeam::random::OsRng;
+	/// use tightbeam::transport::envelopes::MuxRekeyRequestPackage;
+	///
+	/// let ephemeral = SecretKey::random(&mut OsRng).public_key();
+	/// let request = MuxRekeyRequestPackage::new([0x01; 32], &ephemeral)?;
+	///
+	/// // The request carries the point in its compressed form.
+	/// let carried = request.client_ephemeral();
+	/// assert_eq!(PublicKey::from_sec1_bytes(carried)?, ephemeral);
+	/// assert!(matches!(carried.first(), Some(0x02 | 0x03)));
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	pub fn new<C>(client_random: impl Into<Vec<u8>>, client_ephemeral: &PublicKey<C>) -> DerResult<Self>
+	where
+		C: CurveArithmetic,
+		AffinePoint<C>: FromEncodedPoint<C> + ToEncodedPoint<C>,
+		FieldBytesSize<C>: ModulusSize,
+	{
 		let client_random = OctetString::new(client_random)?;
-		let client_ephemeral = OctetString::new(client_ephemeral.as_slice())?;
+		let compressed = client_ephemeral.to_encoded_point(true);
+		let client_ephemeral = OctetString::new(compressed.as_bytes())?;
 		Ok(Self { client_random, client_ephemeral })
 	}
 
@@ -704,7 +729,7 @@ impl MuxRekeyRequestPackage {
 		self.client_random.as_bytes()
 	}
 
-	/// The client's rekey ephemeral public key, a compressed SEC1 point.
+	/// The client's rekey ephemeral public key, a compressed SEC 1 point.
 	pub fn client_ephemeral(&self) -> &[u8] {
 		self.client_ephemeral.as_bytes()
 	}
@@ -729,19 +754,43 @@ pub struct MuxRekeyResponsePackage {
 
 #[cfg(feature = "transport-multiplex")]
 impl MuxRekeyResponsePackage {
-	/// Build a response that carries `server_random`, the compressed SEC1
-	/// point `server_ephemeral`, and the optional `epoch_receipt`.
+	/// Build a response that carries `server_random`, `server_ephemeral` in
+	/// the compressed SEC 1 form, at the width of that form on the curve `C`
+	/// (SEC 1 v2.0 §2.3.3), and the optional `epoch_receipt`.
 	///
 	/// # Errors
 	///
 	/// - [`der::Error`] -- `server_random` is longer than the DER length cap.
-	pub fn new(
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::crypto::k256::{PublicKey, SecretKey};
+	/// use tightbeam::random::OsRng;
+	/// use tightbeam::transport::envelopes::MuxRekeyResponsePackage;
+	///
+	/// let ephemeral = SecretKey::random(&mut OsRng).public_key();
+	/// let response = MuxRekeyResponsePackage::new([2; 32], &ephemeral, None)?;
+	///
+	/// // The response carries the point in its compressed form.
+	/// let carried = response.server_ephemeral();
+	/// assert_eq!(PublicKey::from_sec1_bytes(carried)?, ephemeral);
+	/// assert!(matches!(carried.first(), Some(0x02 | 0x03)));
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	pub fn new<C>(
 		server_random: impl Into<Vec<u8>>,
-		server_ephemeral: &[u8; EC_PUBKEY_COMPRESSED_SIZE],
+		server_ephemeral: &PublicKey<C>,
 		epoch_receipt: Option<Signed<SignedData>>,
-	) -> DerResult<Self> {
+	) -> DerResult<Self>
+	where
+		C: CurveArithmetic,
+		AffinePoint<C>: FromEncodedPoint<C> + ToEncodedPoint<C>,
+		FieldBytesSize<C>: ModulusSize,
+	{
 		let server_random = OctetString::new(server_random)?;
-		let server_ephemeral = OctetString::new(server_ephemeral.as_slice())?;
+		let compressed = server_ephemeral.to_encoded_point(true);
+		let server_ephemeral = OctetString::new(compressed.as_bytes())?;
 		let epoch_receipt = epoch_receipt.map(Box::new);
 		Ok(Self { server_random, server_ephemeral, epoch_receipt })
 	}
@@ -751,7 +800,7 @@ impl MuxRekeyResponsePackage {
 		self.server_random.as_bytes()
 	}
 
-	/// The server's rekey ephemeral public key, a compressed SEC1 point.
+	/// The server's rekey ephemeral public key, a compressed SEC 1 point.
 	pub fn server_ephemeral(&self) -> &[u8] {
 		self.server_ephemeral.as_bytes()
 	}
@@ -806,8 +855,8 @@ impl EncodeValue for MuxRekeyDonePackage {
 	}
 }
 
-/// The package is an empty `SEQUENCE`, so a length past zero is refused
-/// (X.690 § 8.1.3).
+/// The package is an empty `SEQUENCE`, so the decoder refuses a length past
+/// zero (X.690 § 8.1.3).
 #[cfg(feature = "transport-multiplex")]
 impl<'a> DecodeValue<'a> for MuxRekeyDonePackage {
 	fn decode_value<R: Reader<'a>>(_reader: &mut R, header: Header) -> DerResult<Self> {
@@ -989,7 +1038,7 @@ impl<'a> ArrivingEnvelope<'a> {
 	///
 	/// # Errors
 	///
-	/// - The decode error -- the cleartext contents are no transport envelope.
+	/// - [`der::Error`] -- the cleartext contents are no transport envelope.
 	fn arrive(self) -> DerResult<Arrived<'a>> {
 		match self {
 			Self::Cleartext(contents) => Ok(Arrived::Cleartext(TransportEnvelope::from_der(contents)?)),
@@ -1005,7 +1054,7 @@ impl WireEnvelope {
 	///
 	/// # Errors
 	///
-	/// - The decode error -- `wire` is no wire envelope, or carries bytes past it.
+	/// - [`der::Error`] -- `wire` is no wire envelope, or carries bytes past it.
 	pub fn arrive(wire: &mut [u8]) -> DerResult<Arrived<'_>> {
 		Self::admit(wire)?.arrive()
 	}
@@ -1015,8 +1064,8 @@ impl WireEnvelope {
 	///
 	/// # Errors
 	///
-	/// - The decode error -- `wire` is no wire envelope, carries bytes past it,
-	///   or starts with another tag than either arm's.
+	/// - [`der::Error`] -- `wire` is no wire envelope, carries bytes past it,
+	///   or starts with a tag other than either arm's.
 	pub(crate) fn admit(wire: &mut (impl AsMut<[u8]> + ?Sized)) -> DerResult<ArrivingEnvelope<'_>> {
 		let wire = wire.as_mut();
 		let mut reader = SliceReader::new(wire)?;
@@ -1040,9 +1089,9 @@ impl WireEnvelope {
 /// Whether an envelope goes out as cleartext or as encrypted bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WireMode {
-	/// Emit raw `TransportEnvelope` bytes.
+	/// The sender emits raw `TransportEnvelope` bytes.
 	Cleartext,
-	/// Encrypt the encoded envelope before emission.
+	/// The sender encrypts the encoded envelope before emission.
 	Encrypted,
 }
 
@@ -1111,6 +1160,11 @@ mod tests {
 	use super::*;
 	use crate::testing::TestFrame;
 	use std::error::Error;
+
+	#[cfg(feature = "transport-multiplex")]
+	use crate::crypto::k256::Secp256k1;
+	#[cfg(feature = "transport-multiplex")]
+	use crate::testing::{unhex, TestKey};
 
 	struct PackageTestCase {
 		message_value: &'static str,
@@ -1201,8 +1255,8 @@ mod tests {
 		let original = RequestPackage::new(TestFrame::v0(None, None));
 		let mut encoded = original.to_der()?;
 
-		// Corrupt one byte after encoding. The length is encoded as a Uint at
-		// the start of the sequence.
+		// Corrupt one byte after encoding. The start of the encoding holds the
+		// length octets of the nested sequences.
 		if encoded.len() > 10 {
 			let corrupt_pos = 5;
 			encoded[corrupt_pos] = encoded[corrupt_pos].wrapping_add(1);
@@ -1404,10 +1458,53 @@ mod tests {
 		Ok(CmsSigner::signed_data(content, sample_signer_info()?, None)?)
 	}
 
+	/// The generator of secp256k1 (SEC 2 v2.0 §2.4.1), read from its
+	/// uncompressed form, as a point a rekey leg carries.
+	#[cfg(feature = "transport-multiplex")]
+	fn secp256k1_generator() -> PublicKey<Secp256k1> {
+		let point = PublicKey::from_sec1_bytes(&TestKey::SEC2_SECP256K1_G_UNCOMPRESSED);
+		point.expect("the generator of SEC 2 is a point of secp256k1")
+	}
+
+	/// The DER of a rekey request of 32 `0x01` octets of randomness and the
+	/// secp256k1 generator: a SEQUENCE of two OCTET STRINGs, the second the
+	/// 33-octet compressed point. An independent DER encoding (Python) gave
+	/// these octets.
+	#[cfg(feature = "transport-multiplex")]
+	const SECP256K1_REKEY_REQUEST: &str = "304504200101010101010101010101010101010101010101010101010101010101010101\
+		04210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+
+	/// The DER of a rekey response of 32 `0x02` octets of randomness, the
+	/// secp256k1 generator, and no receipt, which an independent DER encoding
+	/// (Python) gave.
+	#[cfg(feature = "transport-multiplex")]
+	const SECP256K1_REKEY_RESPONSE: &str = "304504200202020202020202020202020202020202020202020202020202020202020202\
+		04210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+
+	/// A rekey request of a secp256k1 point carries its compressed form,
+	/// whatever form the point was read from.
+	#[cfg(feature = "transport-multiplex")]
+	#[test]
+	fn a_secp256k1_rekey_request_matches_its_known_answer() -> Result<(), Box<dyn Error>> {
+		let request = MuxRekeyRequestPackage::new([0x01u8; 32], &secp256k1_generator())?;
+		assert_eq!(request.to_der()?, unhex(SECP256K1_REKEY_REQUEST));
+		Ok(())
+	}
+
+	/// A rekey response of a secp256k1 point carries its compressed form,
+	/// whatever form the point was read from.
+	#[cfg(feature = "transport-multiplex")]
+	#[test]
+	fn a_secp256k1_rekey_response_matches_its_known_answer() -> Result<(), Box<dyn Error>> {
+		let response = MuxRekeyResponsePackage::new([0x02u8; 32], &secp256k1_generator(), None)?;
+		assert_eq!(response.to_der()?, unhex(SECP256K1_REKEY_RESPONSE));
+		Ok(())
+	}
+
 	#[cfg(feature = "transport-multiplex")]
 	#[test]
 	fn test_mux_rekey_request_package_encode_decode() -> Result<(), Box<dyn Error>> {
-		let point = [0x02u8; EC_PUBKEY_COMPRESSED_SIZE];
+		let point = secp256k1_generator();
 		assert_round_trip([
 			MuxRekeyRequestPackage::new([0u8; 32], &point)?,
 			MuxRekeyRequestPackage::new([0xFF; 32], &point)?,
@@ -1418,7 +1515,7 @@ mod tests {
 	#[cfg(feature = "transport-multiplex")]
 	#[test]
 	fn test_mux_rekey_response_package_encode_decode() -> Result<(), Box<dyn Error>> {
-		let point = [0x03u8; EC_PUBKEY_COMPRESSED_SIZE];
+		let point = secp256k1_generator();
 		assert_round_trip([
 			MuxRekeyResponsePackage::new([7u8; 32], &point, Some(sample_signed_data()?))?,
 			MuxRekeyResponsePackage::new([9u8; 32], &point, None)?,
@@ -1534,13 +1631,12 @@ mod tests {
 			TransportEnvelope::from(GoAwayPackage::new(3, GoAwayReason::Shutdown)),
 			TransportEnvelope::from(MuxPingPackage::new(false, 7)),
 			{
-				let rekey_request = MuxRekeyRequestPackage::new([1u8; 32], &[0x02u8; EC_PUBKEY_COMPRESSED_SIZE])?;
+				let rekey_request = MuxRekeyRequestPackage::new([1u8; 32], &secp256k1_generator())?;
 				TransportEnvelope::from(rekey_request)
 			},
 			{
 				let signed = sample_signed_data()?;
-				let rekey_response =
-					MuxRekeyResponsePackage::new([2u8; 32], &[0x03u8; EC_PUBKEY_COMPRESSED_SIZE], Some(signed))?;
+				let rekey_response = MuxRekeyResponsePackage::new([2u8; 32], &secp256k1_generator(), Some(signed))?;
 				TransportEnvelope::from(rekey_response)
 			},
 			{
@@ -1604,8 +1700,9 @@ mod tests {
 		Ok(())
 	}
 
-	/// A wire envelope under a tag of neither arm is refused for its tag: a
-	/// transport envelope under the constructed context tag `[2]`, `0xA2`.
+	/// [`WireEnvelope::arrive`] refuses a wire envelope under a tag of neither
+	/// arm for its tag: a transport envelope under the constructed context tag
+	/// `[2]`, `0xA2`.
 	#[test]
 	fn a_wire_envelope_under_the_unknown_tag_2_is_refused() -> Result<(), Box<dyn Error>> {
 		let inner = TransportEnvelope::from(TestFrame::v0(None, None)).to_der()?;
@@ -1635,8 +1732,8 @@ mod tests {
 		Ok(())
 	}
 
-	/// A `RekeyDone` is an empty `SEQUENCE`, so one that claims five octets
-	/// and holds none is refused.
+	/// A `RekeyDone` is an empty `SEQUENCE`, so the decoder refuses one that
+	/// claims five octets and holds none.
 	#[cfg(feature = "transport-multiplex")]
 	#[test]
 	fn a_rekey_done_that_claims_contents_is_refused() {

@@ -1,5 +1,5 @@
-//! The helpers and fixtures that the integration tests for security threats
-//! share.
+//! This module holds the helpers and fixtures that the integration tests for
+//! security threats share.
 //!
 //! The module gives one protocol-agnostic interface over the handshake
 //! backends (HPKE, CMS), so each threat test runs against every backend from
@@ -22,7 +22,8 @@ use tightbeam::{
 		kdf::{Hkdf, HkdfSha3_256},
 		profiles::{
 			AeadProvider, Aes128Wrap, CryptoProvider, CurveProvider, DefaultCryptoProvider, DigestProvider,
-			KdfProvider, KeyWrapProvider, SecurityProfile, SecurityProfileDesc, SigningProvider,
+			KdfProvider, KeyWrapProvider, NoStrengthFloor, ProfileStrengthPolicy, SecurityProfile, SecurityProfileDesc,
+			SigningProvider,
 		},
 		secret::SecretSlice,
 		sign::ecdsa::{Secp256k1Signature, Secp256k1VerifyingKey},
@@ -31,7 +32,7 @@ use tightbeam::{
 	prelude::TightBeamSocketAddr,
 	testing::error::{FdrConfigError, TestingError},
 	transport::handshake::{
-		negotiation::{NoStrengthFloor, ProfilePolicy, ProfileStrengthPolicy, SecurityOffer},
+		negotiation::{ProfilePolicy, SecurityOffer},
 		Client, ClientFlow, ClientHandshakeProtocol, ClientHello, Handshake, HandshakeMessage, HandshakeProvider, Hpke,
 		Server, ServerFlow, ServerHandshake, ServerHandshakeProtocol,
 	},
@@ -70,7 +71,9 @@ impl SecurityProfile for Aes128Profile {
 	type KeyWrapOid = Aes128Wrap;
 }
 
-/// A crypto provider on AES-128-GCM, for a downgrade attack test.
+/// A crypto provider on AES-128-GCM, for a downgrade attack test. Its AEAD
+/// key is 128 bits, below the default floor, so it names [`NoStrengthFloor`]
+/// as its floor.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Aes128CryptoProvider {
 	profile: Aes128Profile,
@@ -108,6 +111,10 @@ impl CryptoProvider for Aes128CryptoProvider {
 	fn profile(&self) -> &Self::Profile {
 		&self.profile
 	}
+
+	fn strength_floor() -> &'static (dyn ProfileStrengthPolicy + Send + Sync) {
+		&NoStrengthFloor
+	}
 }
 
 /// The direction a handshake message travels in.
@@ -125,7 +132,7 @@ pub struct CapturedMessage {
 	pub step: usize,
 	/// The endpoint that sent the message.
 	pub direction: Direction,
-	/// The DER bytes of the message, exactly as its sender encoded them.
+	/// The DER bytes of the message, as its sender encoded them.
 	pub payload: Vec<u8>,
 }
 
@@ -323,7 +330,7 @@ pub enum HandshakeBackendKind {
 }
 
 impl HandshakeBackendKind {
-	/// The human-readable backend label, for logging and trace events.
+	/// The human-readable backend label, for logs and trace events.
 	#[allow(dead_code)]
 	pub fn label(self) -> &'static str {
 		match self {
@@ -437,17 +444,17 @@ impl Default for SecurityThreatHarness {
 }
 
 impl SecurityThreatHarness {
-	/// Hidden CSP event: a handshake session is about to be constructed.
+	/// Hidden CSP event: the harness is about to build a handshake session.
 	pub const HARNESS_SPAWN_SESSION: Urn<'static> = tightbeam::urn!("test", "event:security-harness/spawn-session");
-	/// Hidden CSP event: the HPKE backend is selected for the session.
+	/// Hidden CSP event: the harness selects the HPKE backend for the session.
 	pub const HARNESS_SPAWN_HPKE: Urn<'static> = tightbeam::urn!("test", "event:security-harness/spawn-hpke");
-	/// Hidden CSP event: the CMS backend is selected for the session.
+	/// Hidden CSP event: the harness selects the CMS backend for the session.
 	pub const HARNESS_SPAWN_CMS: Urn<'static> = tightbeam::urn!("test", "event:security-harness/spawn-cms");
-	/// Hidden CSP event: the weak-cipher spawn path is entered.
+	/// Hidden CSP event: the harness enters the weak-cipher spawn path.
 	pub const HARNESS_SPAWN_WEAK: Urn<'static> = tightbeam::urn!("test", "event:security-harness/spawn-weak");
-	/// Hidden CSP event: the weak HPKE backend is selected.
+	/// Hidden CSP event: the harness selects the weak HPKE backend.
 	pub const HARNESS_SPAWN_HPKE_WEAK: Urn<'static> = tightbeam::urn!("test", "event:security-harness/spawn-hpke-weak");
-	/// Hidden CSP event: the weak CMS backend is selected.
+	/// Hidden CSP event: the harness selects the weak CMS backend.
 	pub const HARNESS_SPAWN_CMS_WEAK: Urn<'static> = tightbeam::urn!("test", "event:security-harness/spawn-cms-weak");
 
 	/// Create a harness that records its hidden events into `trace`.
@@ -460,7 +467,7 @@ impl SecurityThreatHarness {
 		&self.materials
 	}
 
-	/// Emit a hidden event when a trace collector is configured.
+	/// Emit a hidden event when the harness holds a trace collector.
 	fn emit(&self, event: Urn<'static>) -> Result<(), TightBeamError> {
 		if let Some(ref trace) = self.trace {
 			trace.event(event)?;
@@ -508,7 +515,6 @@ impl SecurityThreatHarness {
 					&self.materials,
 					client_profiles,
 					server_profiles,
-					None,
 				)))
 			}
 			#[cfg(feature = "transport-cms")]
@@ -518,7 +524,6 @@ impl SecurityThreatHarness {
 					&self.materials,
 					client_profiles,
 					server_profiles,
-					None,
 				)))
 			}
 		}
@@ -527,10 +532,10 @@ impl SecurityThreatHarness {
 	/// Spawn a session of `kind` on the weak AES-128-GCM cipher, for a
 	/// downgrade test.
 	///
-	/// - [`Aes128CryptoProvider`] runs AES-128 at the cipher level as well as
-	///   naming it in the profile descriptor OIDs.
-	/// - The session is deliberately weak. It opts out of the default strength
-	///   floor with [`NoStrengthFloor`], so the downgrade harness can capture
+	/// - [`Aes128CryptoProvider`] runs AES-128 at the cipher level, and also
+	///   names it in the profile descriptor OIDs.
+	/// - The session is deliberately weak. Its provider names
+	///   [`NoStrengthFloor`] as its floor, so the downgrade harness can capture
 	///   the messages of an AES-128 session.
 	///
 	/// # Errors
@@ -546,7 +551,6 @@ impl SecurityThreatHarness {
 					&self.materials,
 					vec![weak_security_profile()],
 					vec![weak_security_profile()],
-					Some(Arc::new(NoStrengthFloor)),
 				)))
 			}
 			#[cfg(feature = "transport-cms")]
@@ -556,7 +560,6 @@ impl SecurityThreatHarness {
 					&self.materials,
 					vec![weak_security_profile()],
 					vec![weak_security_profile()],
-					Some(Arc::new(NoStrengthFloor)),
 				)))
 			}
 		}
@@ -608,14 +611,14 @@ fn captured_handshake(reply: &[u8]) -> Result<ServerHandshake, TightBeamError> {
 
 /// The two ephemerals a captured HPKE handshake carries in the clear: the
 /// client ephemeral `R` of the hello and the server ephemeral `E` of the
-/// reply, each as its compressed SEC1 bytes.
+/// reply, each as its compressed SEC 1 bytes.
 pub fn captured_ephemerals(hello: &[u8], reply: &[u8]) -> Result<(Vec<u8>, Vec<u8>), TightBeamError> {
 	let client_ephemeral = captured_hello(hello)?.client_ephemeral.into_bytes();
 	let server_ephemeral = captured_handshake(reply)?.server_ephemeral.into_bytes();
 	Ok((client_ephemeral, server_ephemeral))
 }
 
-/// The x-coordinate of the SEC1 point `sec1`, which an ECDH output on it
+/// The x-coordinate of the SEC 1 point `sec1`, which an ECDH output on it
 /// shares with its negation.
 pub fn x_coordinate(sec1: &[u8]) -> Result<Vec<u8>, TightBeamError> {
 	let point = k256::PublicKey::from_sec1_bytes(sec1).map_err(|_| expectation_failure("no point of secp256k1"))?;
@@ -696,7 +699,7 @@ impl StaticKeyObserver {
 	}
 }
 
-/// The ECDH output of `static_key` with the SEC1 point `peer`.
+/// The ECDH output of `static_key` with the SEC 1 point `peer`.
 fn static_agreement(static_key: &k256::SecretKey, peer: &[u8]) -> Result<Vec<u8>, TightBeamError> {
 	let peer = k256::PublicKey::from_sec1_bytes(peer).map_err(|_| expectation_failure("no point of secp256k1"))?;
 	let shared = k256::ecdh::diffie_hellman(static_key.to_nonzero_scalar(), peer.as_affine());
@@ -850,19 +853,15 @@ pub struct Session<F: SessionFlow<P>, P: HandshakeProvider> {
 
 impl<F: SessionFlow<P>, P: HandshakeProvider> Session<F, P> {
 	/// Create a session where the client offers `client_profiles` and the
-	/// server runs `server_profiles`.
-	///
-	/// `strength_policy` overrides both endpoints' default strength floor,
-	/// which a deliberately weak downgrade session needs.
+	/// server runs `server_profiles`, each endpoint under the floor of `P`.
 	fn with_profiles(
 		materials: &ServerMaterials,
 		client_profiles: impl IntoIterator<Item = SecurityProfileDesc>,
 		server_profiles: impl IntoIterator<Item = SecurityProfileDesc>,
-		strength_policy: Option<Arc<dyn ProfileStrengthPolicy + Send + Sync>>,
 	) -> Self {
 		let offer = SecurityOffer::new(client_profiles);
 		let server_profiles: Vec<SecurityProfileDesc> = server_profiles.into_iter().collect();
-		let policy = strength_policy.map(ProfilePolicy::with_floor).unwrap_or_default();
+		let policy = ProfilePolicy::new();
 
 		Self {
 			client: F::client(materials, offer, policy.clone()),

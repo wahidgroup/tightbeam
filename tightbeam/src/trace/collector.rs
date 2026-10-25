@@ -121,6 +121,9 @@ impl From<TbInstrumentationConfig> for TraceConfig {
 /// A builder that constructs and emits one trace event.
 ///
 /// The timing and the payload are optional calls that chain onto the builder.
+/// `V` is the value the event carries: `()` for an event from
+/// [`TraceCollector::event`], and [`EventValue`] for one from
+/// [`TraceCollector::event_with`].
 ///
 /// # Examples
 ///
@@ -139,11 +142,11 @@ impl From<TbInstrumentationConfig> for TraceConfig {
 /// # Ok(())
 /// # }
 /// ```
-pub struct EventBuilder<'a> {
+pub struct EventBuilder<'a, V: Into<EventValue> = ()> {
 	collector: &'a TraceCollector,
 	label: Cow<'static, str>,
 	tags: Option<Cow<'static, [&'static str]>>,
-	value: Option<EventValue>,
+	value: Option<V>,
 	#[cfg(any(feature = "instrument", feature = "logging"))]
 	duration_ns: Option<u64>,
 	#[cfg(feature = "instrument")]
@@ -153,12 +156,12 @@ pub struct EventBuilder<'a> {
 	emitted: Cell<bool>,
 }
 
-impl<'a> EventBuilder<'a> {
+impl<'a, V: Into<EventValue>> EventBuilder<'a, V> {
 	fn new(
 		collector: &'a TraceCollector,
 		label: Cow<'static, str>,
 		tags: Option<Cow<'static, [&'static str]>>,
-		value: Option<EventValue>,
+		value: Option<V>,
 	) -> Self {
 		Self {
 			collector,
@@ -184,19 +187,6 @@ impl<'a> EventBuilder<'a> {
 
 	#[cfg(not(any(feature = "instrument", feature = "logging")))]
 	pub fn with_timing(self, _duration: Duration) -> Self {
-		self
-	}
-
-	/// Adds payload data to the event.
-	#[cfg(feature = "instrument")]
-	pub fn with_payload(mut self, payload: &'a (impl AsRef<[u8]> + ?Sized)) -> Self {
-		let payload = payload.as_ref();
-		self.payload = Some(payload);
-		self
-	}
-
-	#[cfg(not(feature = "instrument"))]
-	pub fn with_payload(self, _payload: &'a (impl AsRef<[u8]> + ?Sized)) -> Self {
 		self
 	}
 
@@ -258,7 +248,7 @@ impl<'a> EventBuilder<'a> {
 		}
 
 		let label = core::mem::take(&mut self.label);
-		let value = self.value.take();
+		let value: Option<EventValue> = self.value.take().map(Into::into);
 
 		#[cfg(feature = "instrument")]
 		match &value {
@@ -273,6 +263,8 @@ impl<'a> EventBuilder<'a> {
 					.emit_internal(urn, Some(&label), self.payload, self.duration_ns, None);
 			}
 			Some(EventValue::Value(assertion_value)) => {
+				// An event with a value takes no payload, so the rendered
+				// value fills the one payload of the record.
 				let value_str = assertion_value.render();
 				self.collector.emit_internal(
 					events::ASSERT_PAYLOAD,
@@ -308,7 +300,40 @@ impl<'a> EventBuilder<'a> {
 	}
 }
 
-impl<'a> Drop for EventBuilder<'a> {
+impl<'a> EventBuilder<'a> {
+	/// Adds payload data to the event.
+	///
+	/// Only an event with no value takes a payload, because the instrument
+	/// record holds one payload, and an event with a value fills it with the
+	/// rendered value.
+	///
+	/// # Examples
+	///
+	/// ```compile_fail
+	/// # use tightbeam::error::TightBeamError;
+	/// # use tightbeam::trace::TraceCollector;
+	/// # use tightbeam::urn::Urn;
+	/// # const ROUTE_STEP: Urn<'static> = tightbeam::urn!("tightbeam", "event:route/step");
+	/// # fn example() -> Result<(), TightBeamError> {
+	/// # let trace = TraceCollector::default();
+	/// trace.event_with(ROUTE_STEP, &[], 3u64)?.with_payload(b"payload").emit();
+	/// # Ok(())
+	/// # }
+	/// ```
+	#[cfg(feature = "instrument")]
+	pub fn with_payload(mut self, payload: &'a (impl AsRef<[u8]> + ?Sized)) -> Self {
+		let payload = payload.as_ref();
+		self.payload = Some(payload);
+		self
+	}
+
+	#[cfg(not(feature = "instrument"))]
+	pub fn with_payload(self, _payload: &'a (impl AsRef<[u8]> + ?Sized)) -> Self {
+		self
+	}
+}
+
+impl<'a, V: Into<EventValue>> Drop for EventBuilder<'a, V> {
 	fn drop(&mut self) {
 		self.emit_internal();
 	}
@@ -684,7 +709,7 @@ impl TraceCollector {
 		label: impl IntoEventLabel,
 		tags: impl Into<Cow<'static, [&'static str]>>,
 		value: V,
-	) -> Result<EventBuilder<'_>, crate::TightBeamError>
+	) -> Result<EventBuilder<'_, EventValue>, crate::TightBeamError>
 	where
 		V: Into<EventValue>,
 	{
@@ -844,13 +869,7 @@ impl TraceCollector {
 		label: impl AsRef<str>,
 		payload: Option<&[u8]>,
 	) -> Result<(), crate::TightBeamError> {
-		let label = label.as_ref();
-		#[cfg(feature = "testing")]
-		self.event(&event)?.emit();
-
-		self.record_clock_origin();
-		self.emit_internal(event, Some(label), payload, None, self.state.clock.now_ns());
-		Ok(())
+		self.emit_event_with_value_and_evidence(event, label, (), payload)
 	}
 
 	/// Dual-writes a production control-plane event that carries a
@@ -881,14 +900,42 @@ impl TraceCollector {
 	where
 		V: Into<EventValue>,
 	{
+		self.emit_event_with_value_and_evidence(event, label, value, None)
+	}
+
+	/// Dual-writes a production control-plane event that carries a
+	/// spec-assertable value and evidence. The value reaches the assertion
+	/// for `equals!` checks. The label records why, and the payload records
+	/// who, as its SHA3-256 hash when payload capture is enabled.
+	///
+	/// # Errors
+	///
+	/// - The injected error, when the runtime fault model injects a fault at `event`.
+	#[cfg(any(feature = "instrument", feature = "colony"))]
+	pub(crate) fn emit_event_with_value_and_evidence<V>(
+		&self,
+		event: Urn<'static>,
+		label: impl AsRef<str>,
+		value: V,
+		payload: Option<&[u8]>,
+	) -> Result<(), crate::TightBeamError>
+	where
+		V: Into<EventValue>,
+	{
 		let label = label.as_ref();
 		#[cfg(feature = "testing")]
 		self.event_with(&event, &[], value)?.emit();
 		#[cfg(not(feature = "testing"))]
 		let _ = value;
 
-		self.record_clock_origin();
-		self.emit_internal(event, Some(label), None, None, self.state.clock.now_ns());
+		#[cfg(feature = "instrument")]
+		{
+			self.record_clock_origin();
+			self.emit_internal(event, Some(label), payload, None, self.state.clock.now_ns());
+		}
+		#[cfg(not(feature = "instrument"))]
+		let _ = (event, label, payload);
+
 		Ok(())
 	}
 
@@ -1368,6 +1415,30 @@ mod tests {
 
 			let seqs: Vec<u32> = collector.drain_events().iter().map(|e| e.seq).collect();
 			assert_eq!(seqs, vec![0, 1]);
+		}
+	}
+
+	/// The payload of an event reaches its instrument record.
+	#[cfg(feature = "instrument")]
+	mod payload {
+		use super::ALPHA;
+		use crate::crypto::hash::{Digest, Sha3_256};
+		use crate::instrumentation::TbInstrumentationConfig;
+		use crate::trace::{TraceCollector, TraceConfig};
+		use crate::TightBeamError;
+
+		/// An event with no value records the SHA3-256 hash of its payload.
+		#[test]
+		fn an_event_records_the_hash_of_its_payload() -> Result<(), TightBeamError> {
+			let config = TbInstrumentationConfig { enable_payloads: true, ..TbInstrumentationConfig::default() };
+			let collector = TraceCollector::from(TraceConfig::with_instrumentation(config));
+			collector.event(ALPHA)?.with_payload(b"evidence").emit();
+
+			let expected: [u8; 32] = Sha3_256::digest(b"evidence").into();
+			let recorded = collector.drain_events();
+			let evidence: Vec<Option<[u8; 32]>> = recorded.iter().map(|event| event.payload_hash).collect();
+			assert_eq!(evidence, [Some(expected)]);
+			Ok(())
 		}
 	}
 }

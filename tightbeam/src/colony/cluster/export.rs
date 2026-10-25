@@ -11,8 +11,8 @@
 //!   learn unexported types from ads or slate rumors.
 //! - **Enforcement**: the built-in allowlist, any configured
 //!   [`ExportGrant`], and any configured [`ExportGate`] evaluate unary
-//!   work and routed stream opens. A peer that guesses a type name is
-//!   still refused unless a grant opens that target.
+//!   work and routed stream opens. The gateway still refuses a peer that
+//!   guesses a type name, unless a grant opens that target.
 //!
 //! # Allowlist
 //!
@@ -47,16 +47,17 @@
 //! # Mutual TLS
 //!
 //! First-party recognition requires mutual TLS. The accept plane stores
-//! a session certificate only when `ClusterTlsConfig::client_validators`
+//! a session certificate only when [`ClusterTlsConfig::client_validators`]
 //! is configured. Without that configuration:
 //!
 //! - Every session is anonymous, so an export list also blocks unexported targets on the origin plane.
-//! - The gateway emits a startup posture warning when the accept loop starts.
+//! - The gateway emits a posture warning at startup.
 //!
 //! # Sources
 //!
 //! - CWE-285, improper authorization: <https://cwe.mitre.org/data/definitions/285.html>
 //!
+//! [`ClusterTlsConfig::client_validators`]: super::ClusterTlsConfig::client_validators
 //! [`ClusterConfigBuilder::with_export_grant`]: super::ClusterConfigBuilder::with_export_grant
 //! [`ClusterConfigBuilder::with_export_gate`]: super::ClusterConfigBuilder::with_export_gate
 
@@ -64,7 +65,9 @@ use core::str::from_utf8;
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 
-use super::ClusterConfig;
+use super::peer::ColonyCertificate;
+use super::{ClusterConfig, SharedId};
+use crate::crypto::hash::Digest;
 use crate::crypto::x509::store::CertificateTrust;
 use crate::crypto::x509::Certificate;
 use crate::policy::{SessionContext, TransitStatus};
@@ -74,8 +77,8 @@ use crate::urn::Urn;
 ///
 /// Install it through [`ClusterConfigBuilder::with_export_allowlist`] or the
 /// static helper [`ClusterConfigBuilder::with_exported_types`]. `None` on
-/// [`PeerConfig::exported_types`](super::PeerConfig) means every locally
-/// served type is exported.
+/// [`PeerConfig::exported_types`](super::PeerConfig) exports every type the
+/// gateway serves locally.
 ///
 /// # Planes
 ///
@@ -83,7 +86,7 @@ use crate::urn::Urn;
 ///   stream open, so a mutable list takes effect on the next request.
 /// - **Discoverability** calls [`ExportAllowlist::allows_canonical`] per
 ///   local servlet key on each advertise beat, so the slate tracks the
-///   same live membership without building an owned key set.
+///   same live membership with no owned key set.
 ///
 /// # Keys
 ///
@@ -103,7 +106,7 @@ pub trait ExportAllowlist: Send + Sync {
 	/// The provided method parses `key` and delegates to
 	/// [`ExportAllowlist::contains`], so the two views always agree.
 	/// The built-in lists override it with a cached-set lookup that
-	/// borrows `key`. A key that fails to parse is not exported.
+	/// borrows `key`. It answers `false` for a key that fails to parse.
 	fn allows_canonical(&self, key: &[u8]) -> bool {
 		let Ok(canonical) = from_utf8(key) else {
 			return false;
@@ -161,8 +164,8 @@ impl ExportMembership {
 /// An interior-mutable export list for tests and long-running fuzz harnesses.
 ///
 /// Mutations are visible to the next [`ExportAllowlist::contains`] and
-/// [`ExportAllowlist::allows_canonical`] call. Poisoned locks treat the
-/// list as empty so both planes stay fail-closed.
+/// [`ExportAllowlist::allows_canonical`] call. A poisoned lock reads as an
+/// empty list, so both planes stay fail-closed.
 #[derive(Default)]
 pub struct DynamicExportList {
 	membership: RwLock<ExportMembership>,
@@ -194,10 +197,10 @@ impl DynamicExportList {
 	/// Remove every entry equal to `target`.
 	pub fn remove(&self, target: &Urn<'_>) {
 		if let Ok(mut guard) = self.membership.write() {
-			// Keys are collected from the retained-out entries, not
-			// recomputed from `target`, so a stored entry that compares
-			// equal under a different canonical form still drops its
-			// own cached key.
+			// The loop collects keys from the entries it drops rather
+			// than recompute them from `target`, so a stored entry that
+			// compares equal under a different canonical form still
+			// drops its own cached key.
 			let mut dropped = Vec::new();
 			guard.types.retain(|allowed| {
 				if allowed == target {
@@ -230,7 +233,7 @@ impl ExportAllowlist for DynamicExportList {
 	}
 }
 
-/// A custom export gate for servlet targets crossing the gateway.
+/// A custom export gate for servlet targets that cross the gateway.
 ///
 /// Every configured gate must answer [`TransitStatus::Ok`], so gates
 /// compose as intersection with the allow sources (exported list, grants,
@@ -240,8 +243,8 @@ impl ExportAllowlist for DynamicExportList {
 ///
 /// The gateway evaluates it where the servlet target is known:
 ///
-/// - Unary work arm
-/// - Streaming and duplex open handlers
+/// - The unary work arm.
+/// - The streaming and duplex open handlers.
 pub trait ExportGate: Send + Sync {
 	/// Decide whether `session` may reach `target` on this gateway.
 	///
@@ -284,8 +287,9 @@ pub trait ExportGate: Send + Sync {
 /// # Discoverability
 ///
 /// The advertised slate lists exported types alone, because grants are
-/// per-session and ads are built per beat. A granted type is a private
-/// interface whose URN the grantee learns out of band.
+/// per session and each advertise beat builds one ad that every peer
+/// receives. A granted type is a private interface whose URN the grantee
+/// learns out of band.
 pub trait ExportGrant: Send + Sync {
 	/// Whether `session` is positively granted `target` on this gateway.
 	///
@@ -320,7 +324,9 @@ pub(crate) enum ExportDecision {
 /// It is a sealed composition that wire handlers derive from
 /// [`ClusterConfig`] through [`From`] alone. The unary work arm and the
 /// stream open handlers share one core through
-/// [`ClusterConfig::evaluate_export_gates`].
+/// [`ColonyConfig::evaluate_export_gates`].
+///
+/// [`ColonyConfig::evaluate_export_gates`]: super::ColonyConfig::evaluate_export_gates
 pub(crate) struct ExportPolicy<'a> {
 	exported: Option<&'a dyn ExportAllowlist>,
 	planes: TrustPlanes<'a>,
@@ -341,7 +347,7 @@ impl<'a> From<&'a ClusterConfig> for ExportPolicy<'a> {
 
 impl ExportPolicy<'_> {
 	/// Decides the boundary verdict on a resolved servlet target, after
-	/// `GatePolicy` has evaluated.
+	/// [`GatePolicy`](crate::policy::GatePolicy) has evaluated.
 	///
 	/// The allow sources compose as union, and the steps run in order:
 	///
@@ -401,8 +407,8 @@ pub enum Party {
 ///
 /// A gateway trusts its own hives on the first-party plane and federated
 /// peers on the peer plane. [`TrustPlanes`] borrows both stores as one
-/// unit so the precedence rule ("peer membership wins") lives in exactly
-/// one place, and a call site cannot transpose the two stores.
+/// unit, so the precedence rule ("peer membership wins") lives in one
+/// place and a call site cannot transpose the two stores.
 ///
 /// # Fail-closed
 ///
@@ -418,8 +424,8 @@ pub struct TrustPlanes<'a> {
 
 /// The named hive and peer trust-store borrows for [`TrustPlanes::new`].
 ///
-/// Named fields prevent swapping the two same-typed plane stores at the
-/// call site.
+/// The fields are named, so a call site cannot swap the two plane stores,
+/// which share one type.
 #[derive(Clone, Copy)]
 pub struct TrustPlaneStores<'a> {
 	/// The first-party (hive and client) trust plane.
@@ -440,8 +446,8 @@ impl<'a> TrustPlanes<'a> {
 	/// Prefer [`From`] on a [`ClusterTlsConfig`](super::ClusterTlsConfig), as
 	/// the enforcement path does, where one is available. This constructor
 	/// serves callers that hold the two stores directly, such as a test
-	/// harness. Pass planes through [`TrustPlaneStores`] so hive and peer
-	/// cannot be swapped by position.
+	/// harness. Pass planes through [`TrustPlaneStores`], so a caller cannot
+	/// swap hive and peer by position.
 	#[must_use]
 	pub fn new(stores: TrustPlaneStores<'a>) -> Self {
 		Self { hive: stores.hive, peer: stores.peer }
@@ -481,6 +487,54 @@ impl<'a> TrustPlanes<'a> {
 	#[must_use]
 	pub fn is_first_party(&self, cert: Option<&Certificate>) -> bool {
 		matches!(self.classify(cert), Party::FirstParty)
+	}
+
+	/// The store that verifies a frame `party` signs: the hive store for a
+	/// first party, the peer store for a peer, and [`None`] for an untrusted
+	/// party or a plane with no store.
+	pub(crate) fn store(&self, party: Party) -> Option<&'a dyn CertificateTrust> {
+		match party {
+			Party::FirstParty => self.hive,
+			Party::Peer => self.peer,
+			Party::Untrusted => None,
+		}
+	}
+
+	/// The store that names a peer gateway this gateway dials.
+	///
+	/// A configured peer plane names its peers. A gateway with no peer plane
+	/// dials its peers on the hive pool, so the hive store names them.
+	pub(crate) fn peer_dial(&self) -> Option<&'a dyn CertificateTrust> {
+		self.peer.or(self.hive)
+	}
+
+	/// The one name a peer gateway goes by: the fingerprint, under the colony
+	/// digest `D`, of the certificate that [`Self::peer_dial`] holds for the
+	/// key of `cert`.
+	///
+	/// - A route keys the gateway that signed its advertisement by it.
+	/// - A hop names the certificate its answer presents by it.
+	/// - The discovery table counts a signer by it.
+	/// - A gateway that rotated its certificate under one key keeps one name.
+	///
+	/// It is [`None`] with no such store, or for a key outside it.
+	pub(crate) fn peer_identity<D: Digest>(&self, cert: &Certificate) -> Option<SharedId> {
+		let trust = self.peer_dial()?;
+		let enrolled = trust.enrolled_certificate(cert)?;
+		enrolled.fingerprint_id::<D>()
+	}
+
+	/// The slate key of `cert`, the signer of a frame verified on the plane of
+	/// `party`, under the colony digest `D`.
+	///
+	/// - A peer goes by its name under [`Self::peer_identity`], the rule a hop
+	///   names its answer by, so a route keys the gateway a hop admits.
+	/// - A first party goes by the fingerprint of `cert` itself.
+	pub(crate) fn signer_id<D: Digest>(&self, party: Party, cert: &Certificate) -> Option<SharedId> {
+		match party {
+			Party::Peer => self.peer_identity::<D>(cert),
+			Party::FirstParty | Party::Untrusted => cert.fingerprint_id::<D>(),
+		}
 	}
 }
 

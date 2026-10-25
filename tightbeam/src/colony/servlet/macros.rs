@@ -33,7 +33,7 @@ macro_rules! __servlet_handlers {
 	}};
 }
 
-/// Define a named servlet: a struct that derefs to its runtime and implements
+/// Define a named servlet, a struct that derefs to its runtime and implements
 /// [`Servlet`] and [`ServletBox`].
 #[doc(hidden)]
 #[macro_export]
@@ -70,7 +70,7 @@ macro_rules! __servlet_define {
 				config: $crate::colony::servlet::ServletConfig<
 					$protocol,
 					$input,
-					$crate::crypto::profiles::DefaultCryptoProvider,
+					<$protocol as $crate::transport::Protocol>::CryptoProvider,
 					$env_config,
 				>,
 			) -> Result<Self, $crate::TightBeamError> {
@@ -98,7 +98,7 @@ macro_rules! __servlet_define {
 			type Conf = $crate::colony::servlet::ServletConfig<
 				$protocol,
 				$input,
-				$crate::crypto::profiles::DefaultCryptoProvider,
+				<$protocol as $crate::transport::Protocol>::CryptoProvider,
 				$env_config,
 			>;
 			type Address = <$protocol as $crate::transport::Protocol>::Address;
@@ -155,15 +155,15 @@ macro_rules! __servlet_define {
 	};
 }
 
-/// Create a containerized TightBeam servlet.
+/// Declares a containerized TightBeam servlet.
 ///
-/// The macro requires at least one handler arm. A kind with no arm refuses
-/// with `Unimplemented`.
+/// The macro requires at least one handler arm. The servlet refuses a
+/// request of a kind with no arm with `Unimplemented`.
 ///
 /// # Unary
 ///
 /// - `handle: |msg, frame, ctx|`: typed delivery, the default. The arm
-///   normalizes an encrypted or compressed body in place before decode.
+///   normalizes an encrypted or compressed body in place before the decode.
 /// - `handle: raw |frame, ctx|`: the caller owns the frame lifecycle.
 ///
 /// # Streaming (multiplexed)
@@ -180,7 +180,7 @@ macro_rules! __servlet_define {
 /// 2. Pass it to [`ServletRuntime::start`](crate::colony::servlet::ServletRuntime::start).
 #[macro_export]
 macro_rules! servlet {
-	// No handler arms: refuse at compile time.
+	// An invocation with no handler arm fails at compile time.
 	(
 		$(#[$meta:meta])*
 		$vis:vis $servlet_name:ident<$input:ty, EnvConfig = $env_config:ty>,

@@ -8,14 +8,14 @@ use std::collections::BTreeSet;
 
 use core::fmt::{self, Debug, Formatter};
 use core::hash::{Hash, Hasher};
-use core::marker::PhantomData;
 use core::time::Duration;
 
 use crate::asn1::admission::DerAdmission;
 use crate::cms::cert::IssuerAndSerialNumber;
 use crate::cms::enveloped_data::RecipientIdentifier;
 use crate::cms::signed_data::SignerIdentifier;
-use crate::crypto::hash::{Digest, U32};
+use crate::crypto::common::Output;
+use crate::crypto::hash::{Digest, OutputSizeUser};
 use crate::crypto::x509::error::CertificateValidationError;
 use crate::crypto::x509::ext::pkix::{
 	BasicConstraints, ExtendedKeyUsage, KeyUsage, KeyUsages, NameConstraints, SubjectAltName, SubjectKeyIdentifier,
@@ -25,6 +25,7 @@ use crate::der::asn1::{GeneralizedTime, ObjectIdentifier, OctetString, OctetStri
 use crate::der::oid::db::rfc5280::ANY_EXTENDED_KEY_USAGE;
 use crate::der::oid::AssociatedOid;
 use crate::der::{Decode, Encode, Reader, Writer};
+use crate::error::ReceivedExpectedError;
 use crate::x509::certificate::{CertificateInner, Profile};
 use crate::x509::serial_number::SerialNumber;
 
@@ -33,53 +34,74 @@ use crate::spki::SubjectPublicKeyInfoOwned;
 #[cfg(any(host_clock, feature = "time"))]
 use crate::utils::time::UnixMillis;
 
-/// A 32-byte certificate fingerprint bound to the digest that produced it.
+/// A certificate fingerprint bound to the digest that produced it, as wide
+/// as the output of that digest.
 ///
 /// [`Fingerprint::from_certificate`] digests the certificate DER under `D`.
-pub struct Fingerprint<D> {
-	bytes: [u8; 32],
-	_digest: PhantomData<fn() -> D>,
+/// [`Fingerprint::try_from`] reads a fingerprint an operator configured, and
+/// refuses one of another width, so a list under SHA-384 or SHA-512 names
+/// its entries at the width of its digest.
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam::crypto::hash::Sha3_256;
+/// use tightbeam::crypto::x509::error::CertificateValidationError;
+/// use tightbeam::crypto::x509::utils::Fingerprint;
+/// use tightbeam::testing::{TestCertificate, TestKey};
+///
+/// let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+/// let fingerprint = Fingerprint::<Sha3_256>::from_certificate(&certificate)?;
+///
+/// let configured = Fingerprint::<Sha3_256>::try_from(fingerprint.as_slice())?;
+/// assert_eq!(configured, fingerprint);
+///
+/// let short = Fingerprint::<Sha3_256>::try_from(&[0u8; 31][..]);
+/// assert!(matches!(short, Err(CertificateValidationError::FingerprintLength(_))));
+/// # Ok::<(), Box<dyn core::error::Error>>(())
+/// ```
+pub struct Fingerprint<D: OutputSizeUser> {
+	bytes: Output<D>,
 }
 
-impl<D> Copy for Fingerprint<D> {}
+/// A fingerprint copies wherever its digest output copies, which holds for
+/// the output of every digest.
+impl<D: OutputSizeUser> Copy for Fingerprint<D> where Output<D>: Copy {}
 
-impl<D> Clone for Fingerprint<D> {
+impl<D: OutputSizeUser> Clone for Fingerprint<D> {
 	fn clone(&self) -> Self {
-		*self
+		Self { bytes: self.bytes.clone() }
 	}
 }
 
-impl<D> Debug for Fingerprint<D> {
+impl<D: OutputSizeUser> Debug for Fingerprint<D> {
 	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
 		f.debug_struct("Fingerprint").field("bytes", &self.bytes).finish()
 	}
 }
 
-impl<D> PartialEq for Fingerprint<D> {
+impl<D: OutputSizeUser> PartialEq for Fingerprint<D> {
 	fn eq(&self, other: &Self) -> bool {
 		self.bytes == other.bytes
 	}
 }
 
-impl<D> Eq for Fingerprint<D> {}
+impl<D: OutputSizeUser> Eq for Fingerprint<D> {}
 
-impl<D> Hash for Fingerprint<D> {
+impl<D: OutputSizeUser> Hash for Fingerprint<D> {
 	fn hash<H: Hasher>(&self, state: &mut H) {
-		self.bytes.hash(state);
+		self.bytes.as_slice().hash(state);
 	}
 }
 
-impl<D> Fingerprint<D> {
+impl<D: OutputSizeUser> Fingerprint<D> {
 	/// Return the fingerprint bytes.
 	pub fn as_slice(&self) -> &[u8] {
 		&self.bytes
 	}
 }
 
-impl<D> Fingerprint<D>
-where
-	D: Digest<OutputSize = U32>,
-{
+impl<D: Digest> Fingerprint<D> {
 	/// Digest the certificate DER and bind the result to `D`.
 	///
 	/// The encoder writes the DER into the digest as it goes, so the encoding
@@ -92,8 +114,26 @@ where
 		let mut digest = DigestWriter(D::new());
 		cert.encode(&mut digest)?;
 
-		let bytes = digest.0.finalize().into();
-		Ok(Self { bytes, _digest: PhantomData })
+		let bytes = digest.0.finalize();
+		Ok(Self { bytes })
+	}
+}
+
+impl<D: OutputSizeUser> TryFrom<&[u8]> for Fingerprint<D> {
+	type Error = CertificateValidationError;
+
+	/// Read `bytes` as a fingerprint under `D`.
+	///
+	/// # Errors
+	///
+	/// - [`CertificateValidationError::FingerprintLength`] -- `bytes` differs
+	///   in width from the output of `D`, so it names no certificate.
+	fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
+		let width = ReceivedExpectedError { received: bytes.len(), expected: D::output_size() };
+		let read = Output::<D>::from_exact_iter(bytes.iter().copied());
+
+		let bytes = read.ok_or(CertificateValidationError::FingerprintLength(width))?;
+		Ok(Self { bytes })
 	}
 }
 
@@ -132,7 +172,8 @@ impl Skid {
 		Self(bytes)
 	}
 
-	/// Read a SKID that is already exactly 20 bytes.
+	/// Read `bytes` as a SKID, or return `None` unless they are exactly 20
+	/// octets.
 	pub fn parse(bytes: impl AsRef<[u8]>) -> Option<Self> {
 		let bytes: &[u8; 20] = bytes.as_ref().try_into().ok()?;
 		Some(Self(*bytes))
@@ -188,14 +229,15 @@ macro_rules! pem {
 
 /// The certificate checks this crate runs before it trusts a peer.
 ///
-/// `Certificate` is defined in `x509-cert`, so the checks are trait methods,
-/// and a caller still invokes each check on the certificate itself.
+/// The `x509-cert` crate defines `Certificate`, so the checks are trait
+/// methods, and a caller still calls each check on the certificate itself.
 pub trait CertificateExt {
 	/// Validate certificate expiry (`not_before <= now <= not_after`).
 	///
 	/// The method implements the validity-period check of RFC 5280 §6.1.3(a)(2)
 	/// over the `Validity` field (§4.1.2.5). It covers temporal validity only.
-	/// Signature and trust chains belong to the `CertificateValidation` trait.
+	/// Signature and trust chains belong to the
+	/// [`CertificateValidation`](super::policy::CertificateValidation) trait.
 	///
 	/// # Errors
 	///
@@ -298,7 +340,7 @@ pub trait CertificateExt {
 	/// Refuse this certificate unless its `keyUsage` extension is present and
 	/// asserts `usage` (RFC 5280 §4.2.1.3). For `keyAgreement`, the
 	/// extension must also leave out `decipherOnly`, which restricts the key
-	/// to deciphering.
+	/// to decipherment.
 	///
 	/// # Errors
 	///
@@ -344,8 +386,8 @@ pub trait CertificateExt {
 	///   certificate carries a `nameConstraints` extension.
 	fn ensure_no_name_constraints(&self) -> Result<(), CertificateValidationError>;
 
-	/// Refuse this certificate for a use whose `keyUsage` bit is `usage`.
-	/// Every use a certificate is admitted for runs these checks, in order:
+	/// Refuse this certificate for a use whose `keyUsage` bit is `usage`. Every
+	/// admission of a certificate for a use runs these checks, in order:
 	///
 	/// 1. No extension repeats, and every critical extension is processed (RFC 5280 §4.2).
 	/// 2. The `keyUsage` extension is present and admits `usage` (RFC 5280 §4.2.1.3).
@@ -364,8 +406,8 @@ pub trait CertificateExt {
 	///
 	/// # Errors
 	///
-	/// - [`CertificateValidationError::ExcludedKeyPurpose`] -- `extendedKeyUsage`
-	///   names neither `purpose` nor `anyExtendedKeyUsage`.
+	/// - [`CertificateValidationError::ExcludedKeyPurpose`] --
+	///   `extendedKeyUsage` names neither `purpose` nor `anyExtendedKeyUsage`.
 	/// - [`CertificateValidationError::DuplicateExtension`] -- the extension repeats.
 	/// - [`CertificateValidationError::EncodingError`] -- the extension value fails to decode.
 	fn require_purpose(&self, purpose: ObjectIdentifier) -> Result<(), CertificateValidationError>;
@@ -633,8 +675,9 @@ mod tests {
 		tlv(Tag::Sequence, &tlv(directory_name, &tlv(Tag::Sequence, &rdn)))
 	}
 
-	/// The one decoder of extension values admits the value before the name
-	/// in it decodes and sorts its RDN.
+	/// The one decoder of extension values runs the DER admission on the
+	/// value before the name in it decodes and sorts its RDN, so it refuses a
+	/// SET out of DER order.
 	#[test]
 	fn an_extension_of_a_descending_set_is_refused() {
 		let certificate = with_issuer_alt_name(descending_general_names());
@@ -793,8 +836,8 @@ mod tests {
 			assert!(cert.ensure_critical_extensions_processed().is_ok());
 		}
 
-		/// A certificate with two `keyUsage` extensions is refused
-		/// (RFC 5280 §4.2).
+		/// The uniqueness check refuses a certificate with two `keyUsage`
+		/// extensions (RFC 5280 §4.2).
 		#[test]
 		fn rejects_a_repeated_extension() {
 			let mut cert = both_uses();
@@ -835,8 +878,7 @@ mod tests {
 			);
 		}
 
-		/// A certificate whose `keyUsage` carries both bits is admitted for
-		/// each use.
+		/// Each use admits a certificate whose `keyUsage` carries both bits.
 		#[test]
 		fn a_certificate_with_both_bits_is_admitted_for_signing() {
 			assert!(both_uses().require_use(KeyUsages::DigitalSignature).is_ok());
@@ -847,8 +889,8 @@ mod tests {
 			assert!(both_uses().require_use(KeyUsages::KeyAgreement).is_ok());
 		}
 
-		/// A certificate whose `keyUsage` carries `keyAgreement` alone is
-		/// refused for signing.
+		/// The signing use refuses a certificate whose `keyUsage` carries
+		/// `keyAgreement` alone.
 		#[test]
 		fn a_key_agreement_certificate_is_refused_for_signing() {
 			let cert = TestCertificate::with_key_usage(both_uses(), KeyUsage(KeyUsages::KeyAgreement.into()));
@@ -859,8 +901,8 @@ mod tests {
 			));
 		}
 
-		/// A certificate whose `keyUsage` carries `digitalSignature` alone is
-		/// refused for key agreement.
+		/// The key agreement use refuses a certificate whose `keyUsage`
+		/// carries `digitalSignature` alone.
 		#[test]
 		fn a_signing_certificate_is_refused_for_key_agreement() {
 			let cert = TestCertificate::with_key_usage(both_uses(), KeyUsage(KeyUsages::DigitalSignature.into()));
@@ -902,7 +944,7 @@ mod tests {
 		}
 
 		/// The use refuses a repeated extension before it reads `keyUsage`,
-		/// so a certificate with no `keyUsage` is refused for the repeat.
+		/// so it refuses a certificate with no `keyUsage` for the repeat.
 		#[test]
 		fn a_use_refuses_a_repeated_extension() {
 			let extension = TestCertificate::opaque_extension("2.5.29.30", false);

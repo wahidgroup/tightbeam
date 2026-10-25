@@ -9,37 +9,38 @@
 use std::sync::Arc;
 
 use crate::cms::signed_data::SignerIdentifier;
-use crate::colony::cluster::{ClusterConfig, ClusterError, ColonyDialProtocol, DialTarget};
+use crate::colony::cluster::{ClusterError, ColonyConfig, ColonyDialProtocol, DialTarget};
 use crate::crypto::x509::utils::CertificateExt;
 use crate::crypto::x509::Certificate;
 use crate::transport::client::ConnectionPool;
-use crate::transport::PooledClient;
+use crate::transport::{PooledClient, Protocol};
 
-/// The identity a dial's answer must prove before any frame leaves.
+/// The identity a dial's answer must prove before any frame leaves, on a
+/// dial of protocol `P`.
 ///
 /// [`Self::admits`] is the one decision of a bound dial, so a plane admits
 /// the party that answers by its certificate alone (CWE-346).
-pub(crate) enum ExpectedSigner<'a> {
+pub(crate) enum ExpectedSigner<'a, P> {
 	/// A peer gateway, named by its slate key.
 	Gateway {
 		/// The slate key of the gateway that must answer.
 		gateway_id: &'a [u8],
-		/// The configuration whose [`ClusterConfig::peer_identity`] names the
+		/// The configuration whose [`ColonyConfig::peer_identity`] names the
 		/// gateway that answers.
-		config: &'a ClusterConfig,
+		config: &'a ColonyConfig<P>,
 	},
 	/// A hive, or a servlet of a hive, named by the [`SignerIdentifier`] its
 	/// registration carries.
 	Hive(Arc<SignerIdentifier>),
 }
 
-impl ExpectedSigner<'_> {
+impl<P: Protocol> ExpectedSigner<'_, P> {
 	/// Whether `answer`, the certificate the dialed party presented in its
 	/// handshake, is the identity this dial expects.
 	///
-	/// - [`ClusterConfig::peer_identity`] names a gateway's answer the way an
-	///   advertisement names its signer, so a gateway that rotated its
-	///   certificate under one key keeps its name.
+	/// - [`ColonyConfig::peer_identity`] names a gateway's answer under the
+	///   colony digest, the way an advertisement names its signer, so a
+	///   gateway that rotated its certificate under one key keeps its name.
 	/// - A hive's or a servlet's answer is the certificate its registration's
 	///   signer identifier names (RFC 5652 §5.3).
 	/// - It refuses an answer whose name fails to decode.
@@ -54,19 +55,19 @@ impl ExpectedSigner<'_> {
 	}
 }
 
-/// A dial target beside the identity its answer must prove.
+/// A dial target of protocol `P` beside the identity its answer must prove.
 ///
 /// [`Self::connect`] is the one dial of a target that a route or a
 /// registration names, so a frame leaves only toward the party named.
-pub(crate) struct BoundDial<'a> {
+pub(crate) struct BoundDial<'a, P> {
 	target: DialTarget,
-	expected: ExpectedSigner<'a>,
+	expected: ExpectedSigner<'a, P>,
 }
 
-impl<'a> BoundDial<'a> {
+impl<'a, P> BoundDial<'a, P> {
 	/// Binds `target` to the identity `expected` names, so [`Self::connect`]
 	/// admits only that answer.
-	pub(crate) fn new(target: DialTarget, expected: ExpectedSigner<'a>) -> Self {
+	pub(crate) fn new(target: DialTarget, expected: ExpectedSigner<'a, P>) -> Self {
 		Self { target, expected }
 	}
 
@@ -93,17 +94,18 @@ impl<'a> BoundDial<'a> {
 	/// - [`ClusterError::PeerMismatch`] -- the answer presented another party's certificate, or none.
 	/// - [`ClusterError::Transport`] -- the runtime fault model injects a fault
 	///   at the eviction of the refused connection.
-	pub(crate) async fn connect<P: ColonyDialProtocol>(
-		self,
-		pool: &Arc<ConnectionPool<P>>,
-	) -> Result<PooledClient<P>, ClusterError> {
+	pub(crate) async fn connect(self, pool: &Arc<ConnectionPool<P>>) -> Result<PooledClient<P>, ClusterError>
+	where
+		P: ColonyDialProtocol,
+	{
 		let address: P::Address = self.target.protocol_address()?;
 		let connected = pool.connect(address).await;
 		let mut client = connected.map_err(|_| ClusterError::ConnectFailed)?;
 		let handshake = client.complete_handshake().await;
 		handshake.map_err(|_| ClusterError::ConnectFailed)?;
 
-		let admitted = client.peer_certificate().is_some_and(|answer| self.expected.admits(answer));
+		let answer = client.peer_certificate();
+		let admitted = answer.is_some_and(|answer| self.expected.admits(answer));
 		if !admitted {
 			client.discard()?;
 			return Err(ClusterError::PeerMismatch);
@@ -119,6 +121,7 @@ mod tests {
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 	use crate::crypto::x509::error::CertificateValidationError;
 	use crate::testing::{TestCertificate, TestKey};
+	use crate::transport::TokioListener;
 
 	/// A hive identity's certificate on a key of its own.
 	fn other_certificate() -> Certificate {
@@ -137,7 +140,7 @@ mod tests {
 	#[test]
 	fn a_hive_dial_admits_the_registered_signer() -> Result<(), CertificateValidationError> {
 		let registered = registered_certificate();
-		let expected = ExpectedSigner::Hive(Arc::new(registered.signer_identifier()?));
+		let expected = ExpectedSigner::<TokioListener>::Hive(Arc::new(registered.signer_identifier()?));
 
 		let admitted = expected.admits(&registered);
 		assert!(admitted);
@@ -149,7 +152,7 @@ mod tests {
 	#[test]
 	fn a_hive_dial_refuses_another_identity() -> Result<(), CertificateValidationError> {
 		let registered = registered_certificate();
-		let expected = ExpectedSigner::Hive(Arc::new(registered.signer_identifier()?));
+		let expected = ExpectedSigner::<TokioListener>::Hive(Arc::new(registered.signer_identifier()?));
 
 		let admitted = expected.admits(&other_certificate());
 		assert!(!admitted);

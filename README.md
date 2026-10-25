@@ -1187,13 +1187,16 @@ Each provider role MUST use the algorithm its profile names. The `Profile` bound
 
 Its associated profile is `TightbeamProfile` ([§6.2](#62-security-profile-types)).
 
-Every part is replaceable, and the envelope, the recipients, and the handshake run the provider's algorithms and refuse any other. The handshake reads no HPKE suite, so a provider with these roles alone runs both handshake flows. An implementor brings its own algorithm as a type that implements the role's trait:
+Every part is replaceable, and the envelope, the recipients, the handshake, and the async TCP transport run the provider's algorithms and refuse any other. The async TCP transport runs every provider, so a call names its provider when no other type in the call names one, as `TokioListener::<DefaultCryptoProvider>::bind_cleartext(addr)` does. The handshake reads no HPKE suite, so a provider with these roles alone runs both handshake flows. An implementor brings its own algorithm as a type that implements the role's trait:
 
 - A signature type for `SigningProvider`.
 - A `ContentEncryption` cipher for `AeadProvider`. The cipher MUST leave the buffer of a refused seal or open as it was, because a frame seals and opens its body in its own buffer.
 - A `KeyWrapAlgorithm` for `KeyWrapProvider`.
 - A `KdfFunction` for `KdfProvider`.
+- A curve that meets `HandshakeCurve` for `CurveProvider`, such as `p256::NistP256`. The HPKE flow and the rekey carry its points in the compressed SEC 1 form, at the width of that form on the curve.
 - A `RecipientKem` for `CryptoProvider::Kem`.
+
+Each endpoint holds the profile of a handshake to the strength floor its provider names, `CryptoProvider::strength_floor`, and refuses a profile below it with `NegotiationError::BelowStrengthFloor` (CWE-757). The default floor, `DefaultStrengthFloor`, requires an AEAD key and a digest output of 256 bits or more ([NIST SP 800-57 Part 1 Rev. 5][nist-800-57] §5.6.1). A provider whose AEAD key or digest output is shorter, such as one on AES-128-GCM, overrides `strength_floor` with a floor that admits its profile, such as `NoStrengthFloor`, and every endpoint of that provider runs under that floor.
 
 ### 6.6 Cryptographic Requirements
 
@@ -1337,7 +1340,7 @@ let trust_store = CertificateTrustBuilder::from(Secp256k1Policy::default())
 
 ```rust,ignore
 let server = SigningIdentity::from_spec(SERVER_CERT, SERVER_KEY.to_provider::<Secp256k1>()?)?;
-let config = TransportEncryptionConfig::new(server.clone());
+let config = TransportEncryptionConfig::<DefaultCryptoProvider>::new(server.clone());
 frame.sign_with_provider(&server).await?;
 ```
 
@@ -1393,7 +1396,7 @@ A CMS server holds a signing identity and a key-agreement identity of one subjec
 ```rust,ignore
 // The server: the signing identity signs, and the key-agreement identity
 // opens the opening sealed to it.
-let config = TransportEncryptionConfig::new(signing_identity)
+let config = TransportEncryptionConfig::<DefaultCryptoProvider>::new(signing_identity)
     .with_key_agreement(KeyAgreementIdentity::new(agreement_cert, agreement_backend)?)?;
 
 // The client: the key-agreement certificate alone, admitted against the
@@ -3219,15 +3222,7 @@ cluster! {
 }
 ```
 
-The macro accepts an optional `digest` parameter for custom hash algorithms used in frame integrity verification:
-
-```rust,ignore
-cluster! {
-	pub MyCluster,
-	protocol: TokioListener,
-	digest: Blake3
-}
-```
+The gateway digests under the provider its protocol names, `<P as Protocol>::CryptoProvider`. That digest names each gateway by the fingerprint of its certificate, and it digests each gossip rumor and frame witness. Every gateway of one colony runs the same provider, so each one names a peer and digests a rumor alike.
 
 Runtime configuration is supplied to `Cluster::start`:
 

@@ -13,13 +13,12 @@ use crate::colony::hive::{
 	HashMapRegistry, HiveConfig, RegisterHiveRequest, RegisterHiveResponse, ServletAddressUpdateResponse,
 	ServletRegistry,
 };
-use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::decode;
 use crate::instrumentation::events::HIVE_REREGISTERED;
 use crate::policy::TransitStatus;
 use crate::runtime::rt;
 use crate::trace::TraceCollector;
-use crate::transport::state::{DialableEncryption, EncryptionConfig};
+use crate::transport::state::DialableEncryption;
 use crate::transport::{EndpointConfig, MessageEmitter, Protocol, TransportResult};
 use crate::urn::Urn;
 use crate::{Frame, Message, TightBeamError, Version};
@@ -36,7 +35,7 @@ use crate::{Frame, Message, TightBeamError, Version};
 /// # Poison recovery
 ///
 /// The gateway list changes by one push at a time, so a thread that
-/// panicked while holding its lock left a whole list behind it. The link
+/// panicked while it held the lock left a whole list behind it. The link
 /// therefore recovers a poisoned lock and keeps announcing.
 pub struct ClusterLink<P: Protocol> {
 	servlets: Arc<HashMapRegistry>,
@@ -61,14 +60,15 @@ where
 
 impl<P> ClusterLink<P>
 where
-	P: Protocol<CryptoProvider = DefaultCryptoProvider> + Send + Sync + 'static,
+	P: Protocol + Send + Sync + 'static,
 	P::Address: Clone + Copy + Send + Sync + 'static,
 	P::Stream: Send + 'static,
 	P::Error: Send + 'static,
 	P::Transport: MessageEmitter + Send + 'static,
 	TightBeamError: From<P::Error>,
 {
-	/// Binds the hive's slate and control address to its gateway list.
+	/// Binds the hive's slate, control address, and configuration to its
+	/// gateway list.
 	pub fn new(
 		servlets: Arc<HashMapRegistry>,
 		cluster_addrs: Arc<RwLock<Vec<P::Address>>>,
@@ -115,7 +115,14 @@ where
 		}
 	}
 
-	/// Sends one signed registration of the current slate to `gateway`.
+	/// Sends one registration of the current slate to `gateway`, signed when
+	/// hive TLS is configured.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError::MissingResponse`] -- the gateway answers with no frame.
+	/// - [`TightBeamError`] -- the dial, the frame's build or signature, the
+	///   exchange, or the decode of the answer fails.
 	pub async fn register(&self, gateway: P::Address) -> Result<RegisterHiveResponse, TightBeamError> {
 		let servlet_addresses = self.servlets.slate();
 		let request = ClusterRequest::RegisterHive(RegisterHiveRequest {
@@ -142,7 +149,7 @@ where
 
 	/// Runs the anti-entropy beat that re-announces the slate on an interval.
 	///
-	/// The beat ends once the hive drains: a hive that is going away stops
+	/// The beat ends once the hive drains: a hive on its way out stops
 	/// advertising itself, and the drain announces its emptied slate once.
 	pub fn spawn_reregister(&self, trace: Arc<TraceCollector>) -> rt::JoinHandle {
 		let link = self.clone();
@@ -208,27 +215,19 @@ where
 		});
 	}
 
-	/// Everything a cluster dial is built from.
+	/// The endpoint configuration of a cluster dial.
 	///
-	/// A hive dials the cluster, so it answers the dialer's question here
-	/// rather than at the first frame it tries to write. A hive identity with
-	/// no trust store would present that identity to whoever answered the
-	/// cluster address (CWE-295). A TLS-registered hive therefore never falls
-	/// back to cleartext for a scaling update (CWE-319).
-	fn endpoint(&self) -> TransportResult<EndpointConfig<DefaultCryptoProvider>> {
-		let mut encryption = EncryptionConfig::unconfigured();
-		if let Some(store) = &self.config.trust_store {
-			encryption.trust_store = Some(Arc::clone(store));
-		}
-		if let Some(hive_tls) = &self.config.hive_tls {
-			hive_tls.outbound(&mut encryption);
-		}
-
-		let encryption = DialableEncryption::new(encryption)?;
+	/// A hive dials the cluster, so [`DialableEncryption::new`] checks the
+	/// dialer rule here rather than at the first frame the dial writes. A hive
+	/// identity with no trust store would present that identity to whoever
+	/// answered the cluster address (CWE-295). A TLS-registered hive therefore
+	/// never falls back to cleartext for a scaling update (CWE-319).
+	fn endpoint(&self) -> TransportResult<EndpointConfig<P::CryptoProvider>> {
+		let encryption = DialableEncryption::new(self.config.gateway_dial())?;
 		Ok(EndpointConfig::new(encryption, Arc::clone(&self.config.clock)))
 	}
 
-	/// One transport to `gateway` under this hive's identity.
+	/// Opens one transport to `gateway` under this hive's identity.
 	async fn dial(&self, gateway: P::Address) -> Result<P::Transport, TightBeamError> {
 		let endpoint = self.endpoint()?;
 		let stream = P::connect(gateway).await?;
@@ -264,7 +263,8 @@ where
 		}
 	}
 
-	/// Sends `frame` to every gateway, returning whether any refused it.
+	/// Sends `frame` to every gateway and returns whether any gateway failed
+	/// to accept it.
 	async fn fanout_scaling_update(&self, gateways: impl AsRef<[P::Address]>, frame: &Frame) -> bool {
 		let mut any_failed = false;
 
@@ -279,11 +279,11 @@ where
 		any_failed
 	}
 
-	/// Sends `frame` to `gateway` under the notify retry policy, returning
+	/// Sends `frame` to `gateway` under the notify retry policy and returns
 	/// whether the gateway accepted it.
 	async fn emit_scaling_update_with_retry(&self, gateway: P::Address, frame: &Frame) -> bool {
-		// The provisioning does not change between attempts, and a refused
-		// dial is a configuration this loop cannot retry its way out of.
+		// The provisioning holds across attempts, so a refused endpoint is a
+		// configuration fault that no retry of this loop repairs.
 		let Ok(endpoint) = self.endpoint() else {
 			return false;
 		};

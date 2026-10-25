@@ -14,14 +14,14 @@
 //!
 //! # Export boundary
 //!
-//! [`ClusterConfig::evaluate_export_gates`] runs [`ExportPolicy`] where the
+//! [`ColonyConfig::evaluate_export_gates`] runs [`ExportPolicy`] where the
 //! servlet target is resolved: allowlist, then grants, then deny gates.
 //! [`HopBudget::is_relayed`] supplies the `relayed` flag. Verdict algebra and
 //! posture warnings live in [`crate::colony::cluster::export`].
 //!
 //! # Origin and freshness
 //!
-//! [`ClusterConfig::verify_hive`] and [`ClusterConfig::verify_peer`] verify one
+//! [`ColonyConfig::verify_hive`] and [`ColonyConfig::verify_peer`] verify one
 //! control frame and return [`VerifiedControlFrame`]. [`GatewayReplayGuard`]
 //! rejects stale or replayed signed control frames.
 //!
@@ -29,9 +29,11 @@
 
 use crate::colony::cluster::export::{ExportDecision, ExportPolicy, Party, TrustPlanes};
 use crate::colony::cluster::peer::ColonyCertificate;
+use crate::colony::cluster::runtime::bounds::{ColonyConfig, ColonyDigest};
 use crate::colony::cluster::runtime::gossip_tasks::{GossipOrigin, GossipPipelineCtx};
 use crate::colony::cluster::runtime::LoopFault;
 use crate::colony::cluster::{ClusterConfig, SharedId};
+use crate::crypto::hash::Digest;
 use crate::crypto::sign::VerifiedSignature;
 use crate::crypto::x509::store::TrustVerification;
 use crate::crypto::x509::Certificate;
@@ -58,17 +60,22 @@ struct ExportAudit<'a> {
 impl ExportAudit<'_> {
 	/// Emit `outcome` for this caller.
 	///
-	/// The event value carries the `relayed` flag. Where mutual TLS
-	/// captured a caller certificate, the payload is its fingerprint,
-	/// matching the peer-advertisement refusal convention. An anonymous
-	/// session emits the event alone.
-	fn record(&self, outcome: Urn<'static>) -> Result<(), TightBeamError> {
-		let fingerprint = self.session.peer_certificate().and_then(ColonyCertificate::fingerprint_id);
-		let event = self.trace.event_with(outcome, &[], self.relayed)?;
-		match fingerprint.as_ref() {
-			Some(id) => event.with_payload(id.as_ref()).emit(),
-			None => event.emit(),
-		}
+	/// The assertion value is the `relayed` flag, and the instrument record
+	/// names it as its label, `relayed` or `direct`. Where mutual TLS captured
+	/// a caller certificate, the record's payload is its fingerprint under the
+	/// colony's digest `D`. The record of an anonymous session carries the
+	/// label alone.
+	fn record<D: Digest>(&self, outcome: Urn<'static>) -> Result<(), TightBeamError> {
+		let caller = self.session.peer_certificate();
+		let fingerprint = caller.and_then(ColonyCertificate::fingerprint_id::<D>);
+		let evidence = fingerprint.as_deref();
+		let route = if self.relayed {
+			"relayed"
+		} else {
+			"direct"
+		};
+		let trace = self.trace;
+		trace.emit_event_with_value_and_evidence(outcome, route, self.relayed, evidence)?;
 
 		Ok(())
 	}
@@ -76,7 +83,7 @@ impl ExportAudit<'_> {
 
 /// The owned slate key created with [`VerifiedControlFrame`].
 ///
-/// Only [`ClusterConfig::verify_plane`] constructs this. Gossip may carry the
+/// Only [`ColonyConfig::verify_plane`] constructs this. Gossip may carry the
 /// id across `.await` without the borrowed certificate, and the newtype keeps
 /// it distinct from a bare [`SharedId`].
 #[derive(Clone, PartialEq, Eq)]
@@ -188,7 +195,7 @@ impl VerifyRefusal {
 
 /// One verified inbound control frame.
 ///
-/// Only [`ClusterConfig::verify_hive`] or [`ClusterConfig::verify_peer`]
+/// Only [`ColonyConfig::verify_hive`] or [`ColonyConfig::verify_peer`]
 /// creates one. The signature check runs once. [`Party`] comes from
 /// [`TrustPlanes::classify`] on the certificate that check resolved, so a
 /// later step reuses this verification and this signer lookup.
@@ -239,69 +246,6 @@ impl<'a> VerifiedControlFrame<'a> {
 }
 
 impl ClusterConfig {
-	/// Verify `frame` once on `required` and classify the resolved certificate.
-	///
-	/// Peer membership wins: a public key enrolled in `tls.peer_trust`
-	/// is [`Party::Peer`], so a hive-plane parse refuses it even when the
-	/// presented certificate object lives only in `hive_trust`. A missing
-	/// store or a failed signature refuses. A frame without a signature
-	/// is unauthenticated.
-	fn verify_plane<'a>(
-		&'a self,
-		frame: &'a Frame,
-		required: Party,
-	) -> Result<VerifiedControlFrame<'a>, VerifyRefusal> {
-		let store = match required {
-			Party::FirstParty => self.tls.hive_trust.as_deref(),
-			Party::Peer => self.tls.peer_trust.as_deref(),
-			Party::Untrusted => return Err(VerifyRefusal::NoStore),
-		};
-		let Some(trust) = store else {
-			return Err(VerifyRefusal::NoStore);
-		};
-		let (signer, signature) = match trust.verify_frame(frame) {
-			TrustVerification::Verified(signer, signature) => (signer, signature),
-			TrustVerification::MissingSignature => return Err(VerifyRefusal::Unsigned),
-			TrustVerification::UnknownSigner => return Err(VerifyRefusal::UnknownSigner),
-			TrustVerification::Invalid => return Err(VerifyRefusal::Forged),
-		};
-
-		let signer_cert = signer.certificate().as_ref();
-
-		let party = TrustPlanes::from(&self.tls).classify(Some(signer_cert));
-		if party != required {
-			return Err(VerifyRefusal::WrongPlane);
-		}
-
-		// A peer's slate key is its name under `Self::peer_identity`, the rule
-		// a hop names its answer by, so a route keys the gateway a hop admits.
-		let fingerprint = match party {
-			Party::Peer => self.peer_identity(signer_cert),
-			Party::FirstParty | Party::Untrusted => signer_cert.fingerprint_id(),
-		};
-
-		let fingerprint = fingerprint.map(VerifiedSignerId).ok_or(VerifyRefusal::Unidentifiable)?;
-		Ok(VerifiedControlFrame { frame, signer_cert, signature, party, fingerprint })
-	}
-
-	/// The slate key of the gateway that holds `cert`'s key, the one name a
-	/// peer gateway goes by: the fingerprint of the certificate that
-	/// [`ClusterTlsConfig::peer_dial_trust`] holds for that key.
-	///
-	/// - A route keys the gateway that signed its advertisement by it.
-	/// - A hop names the certificate its answer presents by it.
-	/// - The discovery table counts a signer by it.
-	/// - A gateway that rotated its certificate under one key keeps one name.
-	///
-	/// It is `None` with no such store, or for a key outside it.
-	///
-	/// [`ClusterTlsConfig::peer_dial_trust`]: crate::colony::cluster::ClusterTlsConfig::peer_dial_trust
-	pub(crate) fn peer_identity(&self, cert: &Certificate) -> Option<SharedId> {
-		let trust = self.tls.peer_dial_trust()?;
-		let enrolled = trust.enrolled_certificate(cert)?;
-		enrolled.fingerprint_id()
-	}
-
 	/// Run configured [`GatePolicy`] instances and leave the audit event to
 	/// the caller.
 	pub(crate) fn policies_allow(&self, frame: Option<&Frame>, session: &SessionContext) -> Result<(), TransitStatus> {
@@ -339,6 +283,51 @@ impl ClusterConfig {
 
 		Ok(status)
 	}
+}
+
+impl<P: Protocol> ColonyConfig<P> {
+	/// Verify `frame` once on `required` and classify the resolved certificate.
+	///
+	/// Peer membership wins: a public key enrolled in `tls.peer_trust`
+	/// is [`Party::Peer`], so a hive-plane parse refuses it even when the
+	/// presented certificate object lives only in `hive_trust`. A missing
+	/// store or a failed signature refuses. A frame without a signature
+	/// is unauthenticated.
+	fn verify_plane<'a>(
+		&'a self,
+		frame: &'a Frame,
+		required: Party,
+	) -> Result<VerifiedControlFrame<'a>, VerifyRefusal> {
+		let planes = TrustPlanes::from(&self.tls);
+		let Some(trust) = planes.store(required) else {
+			return Err(VerifyRefusal::NoStore);
+		};
+		let (signer, signature) = match trust.verify_frame(frame) {
+			TrustVerification::Verified(signer, signature) => (signer, signature),
+			TrustVerification::MissingSignature => return Err(VerifyRefusal::Unsigned),
+			TrustVerification::UnknownSigner => return Err(VerifyRefusal::UnknownSigner),
+			TrustVerification::Invalid => return Err(VerifyRefusal::Forged),
+		};
+
+		let signer_cert = signer.certificate().as_ref();
+
+		let party = planes.classify(Some(signer_cert));
+		if party != required {
+			return Err(VerifyRefusal::WrongPlane);
+		}
+
+		let fingerprint = planes.signer_id::<ColonyDigest<P>>(party, signer_cert);
+		let fingerprint = fingerprint.map(VerifiedSignerId).ok_or(VerifyRefusal::Unidentifiable)?;
+		Ok(VerifiedControlFrame { frame, signer_cert, signature, party, fingerprint })
+	}
+
+	/// The slate key of the gateway that holds `cert`'s key, under the colony
+	/// digest, by the rule of [`TrustPlanes::peer_identity`].
+	///
+	/// It is `None` with no peer dial store, or for a key outside it.
+	pub(crate) fn peer_identity(&self, cert: &Certificate) -> Option<SharedId> {
+		TrustPlanes::from(&self.tls).peer_identity::<ColonyDigest<P>>(cert)
+	}
 
 	/// Enforce the export boundary on a resolved servlet target.
 	///
@@ -348,7 +337,8 @@ impl ClusterConfig {
 	///
 	/// 1. Run [`ExportPolicy::verdict`] (allowlist, grants, then deny gates).
 	/// 2. Trace [`CLUSTER_EXPORT_REFUSED`] or [`CLUSTER_EXPORT_GRANTED`] with
-	///    the caller certificate fingerprint and the relayed flag.
+	///    the caller certificate fingerprint under the colony digest and the
+	///    relayed flag.
 	///
 	/// The granted event fires only when the full verdict passes, because a
 	/// grant overridden by a deny gate did not decide the outcome.
@@ -374,20 +364,16 @@ impl ClusterConfig {
 		relayed: bool,
 		trace: &TraceCollector,
 	) -> Result<TransitStatus, TightBeamError> {
+		let config: &ClusterConfig = self;
 		let audit = ExportAudit { trace, session, relayed };
-		match ExportPolicy::from(self).verdict(target, session, relayed) {
-			Ok(ExportDecision::Allowed) => Ok(TransitStatus::Ok),
-			Ok(ExportDecision::Granted) => {
-				audit.record(CLUSTER_EXPORT_GRANTED)?;
+		let (outcome, status) = match ExportPolicy::from(config).verdict(target, session, relayed) {
+			Ok(ExportDecision::Allowed) => return Ok(TransitStatus::Ok),
+			Ok(ExportDecision::Granted) => (CLUSTER_EXPORT_GRANTED, TransitStatus::Ok),
+			Err(status) => (CLUSTER_EXPORT_REFUSED, status),
+		};
 
-				Ok(TransitStatus::Ok)
-			}
-			Err(status) => {
-				audit.record(CLUSTER_EXPORT_REFUSED)?;
-
-				Ok(status)
-			}
-		}
+		audit.record::<ColonyDigest<P>>(outcome)?;
+		Ok(status)
 	}
 
 	/// Verify one hive-plane control frame.
@@ -434,10 +420,12 @@ mod tests {
 	use crate::crypto::policy::Secp256k1Policy;
 	use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
 	use crate::crypto::sign::PrehashSigner;
-	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, CertificateTrustStore, TrustBuilder};
+	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
+	use crate::crypto::x509::utils::Fingerprint;
 	use crate::crypto::x509::Certificate;
 	use crate::tb_cases;
 	use crate::testing::{TestCertificate, TestKey, TestMessage};
+	use crate::transport::TokioListener;
 	use crate::Version;
 
 	fn servlet(name: &(impl AsRef<str> + ?Sized)) -> Urn<'static> {
@@ -475,6 +463,12 @@ mod tests {
 		let mut config = exporting_config();
 		config.tls.peer_trust = Some(Arc::new(store));
 		config
+	}
+
+	/// `config` as the configuration of a house gateway, whose colony digest
+	/// is SHA3-256.
+	fn house(config: ClusterConfig) -> ColonyConfig<TokioListener> {
+		ColonyConfig::new(config)
 	}
 
 	struct GrantAll;
@@ -576,11 +570,11 @@ mod tests {
 		let key = peer_key();
 		let enrolled = TestCertificate::with_cn_and_uri_sans(&key, "enrolled", &["urn:tightbeam:colony:test"]);
 		let rotated = TestCertificate::with_cn_and_uri_sans(&key, "rotated", &["urn:tightbeam:colony:test"]);
-		let config = config_enrolling(&enrolled);
+		let config = house(config_enrolling(&enrolled));
 
 		let named = config.peer_identity(&rotated);
-		assert_eq!(named, enrolled.fingerprint_id());
-		assert_ne!(named, rotated.fingerprint_id());
+		assert_eq!(named, enrolled.fingerprint_id::<Sha3_256>());
+		assert_ne!(named, rotated.fingerprint_id::<Sha3_256>());
 	}
 
 	/// A certificate whose key the peer plane does not hold names no gateway,
@@ -589,7 +583,7 @@ mod tests {
 	fn peer_identity_names_no_gateway_for_an_unenrolled_key() {
 		let enrolled = TestCertificate::self_signed(&peer_key());
 		let stranger = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
-		let config = config_enrolling(&enrolled);
+		let config = house(config_enrolling(&enrolled));
 
 		let named = config.peer_identity(&stranger);
 		assert_eq!(named, None);
@@ -600,7 +594,7 @@ mod tests {
 		let mut config = exporting_config();
 		config.export_grants.push(Arc::new(GrantAll));
 
-		let verdict = config.evaluate_export_gates(
+		let verdict = house(config).evaluate_export_gates(
 			&servlet("ledger"),
 			&SessionContext::default(),
 			false,
@@ -616,7 +610,7 @@ mod tests {
 		config.export_grants.push(Arc::new(GrantAll));
 		config.export_gates.push(Arc::new(DenyAllGate));
 
-		let verdict = config.evaluate_export_gates(
+		let verdict = house(config).evaluate_export_gates(
 			&servlet("ledger"),
 			&SessionContext::default(),
 			false,
@@ -631,7 +625,7 @@ mod tests {
 		let mut config = exporting_config();
 		config.export_grants.push(Arc::new(IdentityGrant));
 
-		let verdict = config.evaluate_export_gates(
+		let verdict = house(config).evaluate_export_gates(
 			&servlet("ledger"),
 			&SessionContext::default(),
 			false,
@@ -646,7 +640,7 @@ mod tests {
 		let mut config = exporting_config();
 		config.export_grants.push(Arc::new(OriginOnlyGrant));
 
-		let verdict = config.evaluate_export_gates(
+		let verdict = house(config).evaluate_export_gates(
 			&servlet("ledger"),
 			&SessionContext::default(),
 			true,
@@ -661,7 +655,7 @@ mod tests {
 		let mut config = exporting_config();
 		config.export_grants.push(Arc::new(OriginOnlyGrant));
 
-		let verdict = config.evaluate_export_gates(
+		let verdict = house(config).evaluate_export_gates(
 			&servlet("ledger"),
 			&SessionContext::default(),
 			false,
@@ -676,7 +670,7 @@ mod tests {
 		let mut config = exporting_config();
 		config.export_gates.push(Arc::new(UnknownGate));
 
-		let verdict = config.evaluate_export_gates(
+		let verdict = house(config).evaluate_export_gates(
 			&servlet("ping"),
 			&SessionContext::default(),
 			false,
@@ -726,8 +720,9 @@ mod tests {
 		let frame = signed_control_frame(&peer_key());
 		let enrolled_key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
 
-		let config = config_enrolling(&TestCertificate::self_signed(&enrolled_key));
-		assert!(matches!(config.verify_peer(&frame), Err(VerifyRefusal::UnknownSigner)));
+		let config = house(config_enrolling(&TestCertificate::self_signed(&enrolled_key)));
+		let verified = config.verify_peer(&frame);
+		assert!(matches!(verified, Err(VerifyRefusal::UnknownSigner)));
 	}
 
 	#[test]
@@ -735,21 +730,23 @@ mod tests {
 		let forger: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
 		let frame = control_frame_claiming(&forger, &peer_key());
 
-		let config = config_enrolling(&TestCertificate::self_signed(&peer_key()));
+		let config = house(config_enrolling(&TestCertificate::self_signed(&peer_key())));
 		assert!(matches!(config.verify_peer(&frame), Err(VerifyRefusal::Forged)));
 	}
 
 	#[test]
 	fn peer_origin_names_a_frame_with_no_signature() {
 		let frame = unsigned_control_frame();
-		let config = config_enrolling(&TestCertificate::self_signed(&peer_key()));
+		let config = house(config_enrolling(&TestCertificate::self_signed(&peer_key())));
 		assert!(matches!(config.verify_peer(&frame), Err(VerifyRefusal::Unsigned)));
 	}
 
 	#[test]
 	fn peer_origin_names_a_plane_with_no_store() {
 		let frame = signed_control_frame(&peer_key());
-		assert!(matches!(exporting_config().verify_peer(&frame), Err(VerifyRefusal::NoStore)));
+		let config = house(exporting_config());
+		let verified = config.verify_peer(&frame);
+		assert!(matches!(verified, Err(VerifyRefusal::NoStore)));
 	}
 
 	#[test]
@@ -766,14 +763,15 @@ mod tests {
 		let mut config = exporting_config();
 		config.tls.hive_trust = Some(trust_of(&cert));
 
+		let config = house(config);
 		let verified = config.verify_hive(&frame);
 		assert!(matches!(
 			verified,
 			Ok(ref proof)
 				if proof.party() == Party::FirstParty
 					&& proof.frame().metadata().id() == frame.metadata().id()
-					&& CertificateTrustStore::to_fingerprint::<Sha3_256>(proof.signer_cert()).ok()
-						== CertificateTrustStore::to_fingerprint::<Sha3_256>(&cert).ok()
+					&& Fingerprint::<Sha3_256>::from_certificate(proof.signer_cert()).ok()
+						== Fingerprint::<Sha3_256>::from_certificate(&cert).ok()
 		));
 	}
 
@@ -786,7 +784,7 @@ mod tests {
 		let mut config = exporting_config();
 		config.tls.hive_trust = Some(trust_of(&cert));
 		config.tls.peer_trust = Some(trust_of(&cert));
-		assert!(matches!(config.verify_hive(&frame), Err(VerifyRefusal::WrongPlane)));
+		assert!(matches!(house(config).verify_hive(&frame), Err(VerifyRefusal::WrongPlane)));
 	}
 
 	#[test]
@@ -799,7 +797,7 @@ mod tests {
 		let mut config = exporting_config();
 		config.tls.hive_trust = Some(trust_of(&hive_cert));
 		config.tls.peer_trust = Some(trust_of(&peer_cert));
-		assert!(matches!(config.verify_hive(&frame), Err(VerifyRefusal::WrongPlane)));
+		assert!(matches!(house(config).verify_hive(&frame), Err(VerifyRefusal::WrongPlane)));
 	}
 
 	#[test]
@@ -811,6 +809,58 @@ mod tests {
 		let mut config = exporting_config();
 		config.tls.hive_trust = Some(trust_of(&cert));
 		config.tls.peer_trust = Some(trust_of(&cert));
+		let config = house(config);
 		assert!(matches!(config.verify_peer(&frame), Ok(verified) if verified.party() == Party::Peer));
+	}
+
+	/// The instrument records of an export refusal, read from a collector that
+	/// records the digest of each payload.
+	#[cfg(feature = "instrument")]
+	mod audit {
+		use super::*;
+		use crate::instrumentation::{TbEvent, TbInstrumentationConfig};
+		use crate::trace::TraceConfig;
+
+		/// The records of [`CLUSTER_EXPORT_REFUSED`] that a house gateway
+		/// leaves when it refuses "ledger" to `session`.
+		fn refusal_records(session: &SessionContext, relayed: bool) -> Result<Vec<TbEvent>, TightBeamError> {
+			let config = TbInstrumentationConfig { enable_payloads: true, ..TbInstrumentationConfig::default() };
+			let trace = TraceCollector::from(TraceConfig::with_instrumentation(config));
+			let gateway = house(exporting_config());
+			let verdict = gateway.evaluate_export_gates(&servlet("ledger"), session, relayed, &trace)?;
+			assert_eq!(verdict, TransitStatus::PermissionDenied);
+
+			let recorded = trace.drain_events();
+			let refusal = |event: &TbEvent| event.urn == CLUSTER_EXPORT_REFUSED;
+			Ok(recorded.into_iter().filter(refusal).collect())
+		}
+
+		/// A refusal of a certified caller records the caller's fingerprint
+		/// under the colony digest as its payload.
+		#[test]
+		fn a_refusal_records_the_fingerprint_of_its_caller() -> Result<(), TightBeamError> {
+			let certificate = TestCertificate::self_signed(&peer_key());
+			let fingerprint = Fingerprint::<Sha3_256>::from_certificate(&certificate)?;
+			let session = SessionContext::for_peer(Arc::new(certificate));
+
+			let expected: [u8; 32] = Sha3_256::digest(fingerprint.as_slice()).into();
+			let records = refusal_records(&session, false)?;
+			let evidence: Vec<Option<[u8; 32]>> = records.iter().map(|record| record.payload_hash).collect();
+			assert_eq!(evidence, [Some(expected)]);
+			Ok(())
+		}
+
+		tb_cases! {
+			fn a_refusal_names_the_route_of_its_caller((relayed, route): (bool, &str)) -> Result<(), TightBeamError> {
+				let records = refusal_records(&SessionContext::default(), relayed)?;
+				let labels: Vec<Option<String>> = records.into_iter().map(|record| record.label).collect();
+				assert_eq!(labels, [Some(route.to_string())]);
+				Ok(())
+			}
+			cases {
+				direct => (false, "direct"),
+				relayed => (true, "relayed"),
+			}
+		}
 	}
 }

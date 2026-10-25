@@ -130,6 +130,7 @@ zstd-safe = { version = "=7.2.4", default-features = false }
 
 # Dev dependencies
 husky-rs = { version = "=0.3.3" }
+p256 = { version = "=0.13.2", default-features = false, features = ["ecdsa", "ecdh", "pkcs8"] }
 paste = { version = "=1.0.15" }
 trybuild = { version = "=1.0.118", features = ["diff"] }
 

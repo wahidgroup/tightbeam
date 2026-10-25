@@ -1,11 +1,12 @@
-//! Cluster gateway runtime: accept loop, background tasks, and mux routing.
+//! The runtime of the cluster gateway: its accept loop, its background tasks,
+//! and its mux routing.
 //!
 //! [`ClusterGateway`] owns the listener, heartbeat, evaporation, and advertise
 //! tasks. [`GatewayMuxService`] serves each incoming connection: it routes
 //! unary control frames to dispatch and splices streamed or duplex opens by
 //! servlet target.
 //!
-//! Each sibling module owns one of the surfaces a request reaches: dispatch,
+//! Each surface a request reaches has a sibling module of its own: dispatch,
 //! registration, work, streaming, gossip, and heartbeat.
 
 mod advertise;
@@ -21,16 +22,17 @@ mod registration;
 mod streaming;
 mod verify;
 
-pub(crate) use bounds::ColonyDialProtocol;
+#[cfg(test)]
+pub(crate) use bounds::ColonyDigest;
+pub(crate) use bounds::{ColonyConfig, ColonyDialProtocol};
 pub(crate) use verify::{VerifiedControlFrame, VerifiedSignerId};
 mod work;
 
 use core::future::Future;
-use core::marker::PhantomData;
 use core::time::Duration;
 use std::sync::{Arc, Mutex};
 
-use self::bounds::{ClusterDigest, GatewayAcceptProtocol, GatewayColonyProtocol, GatewayRuntimeCtx};
+use self::bounds::{GatewayAcceptProtocol, GatewayColonyProtocol, GatewayRuntimeCtx};
 use self::freshness::GatewayReplayGuard;
 use self::heartbeat::HiveBeat;
 use self::hop::{HivePlane, PeerPlane};
@@ -41,7 +43,6 @@ use crate::colony::cluster::{
 };
 use crate::colony::common::{HeartbeatResult, TaskGroup};
 use crate::constants::{DEFAULT_AD_RUMOR_REFRESH_MS, DEFAULT_MAX_SERVER_CONNECTIONS};
-use crate::crypto::hash::Sha3_256;
 use crate::macros::server::{serve_connection_service, AcceptedConnection};
 use crate::policy::TransitStatus;
 use crate::runtime::rt;
@@ -69,7 +70,7 @@ use crate::instrumentation::events::{
 pub(crate) enum LoopFault {
 	/// The trace refused an event, or a task the loop awaited did not join.
 	Runtime(TightBeamError),
-	/// A registry, table or journal this loop reads is poisoned.
+	/// A registry, table, or journal this loop reads is poisoned.
 	Registry(ClusterError),
 }
 
@@ -107,7 +108,7 @@ impl From<ClusterError> for LoopFault {
 }
 
 impl ClusterConfig {
-	/// Emit one-time export-posture warnings when the gateway starts.
+	/// Emits each export-posture warning once, when the gateway starts.
 	///
 	/// Two configurations weaken the organization edge without an explicit
 	/// operator choice at request time, so the gateway surfaces each
@@ -146,28 +147,40 @@ impl ClusterConfig {
 	}
 }
 
-/// Running cluster gateway for protocol `P`, digest `D`, and edge protocol `E`.
+/// A running cluster gateway over the colony protocol `P` and the edge
+/// protocol `E`.
 ///
 /// The gateway owns the accept, heartbeat, evaporation, and advertise tasks for
 /// the colony bind address and, when configured, a second edge accept plane.
 /// Callers reach cluster state only through [`Cluster`] and
 /// [`ClusterHeartbeat`].
 ///
+/// # Digest
+///
+/// The gateway runs the digest of its provider, the
+/// [`DigestProvider::Digest`] of [`Protocol::CryptoProvider`]. It names each
+/// gateway by the fingerprint of its certificate under that digest, and it
+/// digests each rumor and frame witness under it. Every gateway of a colony
+/// runs one provider, so each one names a peer and digests a rumor alike.
+///
+/// [`DigestProvider::Digest`]: crate::crypto::profiles::DigestProvider::Digest
+///
 /// # Edge accept plane
 ///
 /// - `E` defaults to `P`, so a gateway without an edge declaration uses a single accept plane.
+/// - `E` runs the provider of `P`, because both planes present the one identity of the gateway.
 /// - When [`ClusterConfig::edge_bind_addr`] is set, the gateway binds a second
 ///   listener over `E` with the same TLS material.
 /// - A separate edge mux service serves edge connections, and its one route is `Work` submission.
 /// - Hives and peers use the colony plane at [`Cluster::addr`].
-pub struct ClusterGateway<P, D = Sha3_256, E = P>
+pub struct ClusterGateway<P, E = P>
 where
 	P: Protocol,
 	E: Protocol,
 {
 	registry: Arc<HiveRegistry>,
 	servlet_registry: Arc<ServletRegistry>,
-	config: Arc<ClusterConfig>,
+	config: ColonyConfig<P>,
 	/// The plane a heartbeat dials its hive on.
 	hive_plane: HivePlane<P>,
 	/// The colony accept plane task, which [`Cluster::join`] awaits together
@@ -181,15 +194,14 @@ where
 	addr: P::Address,
 	edge_addr: Option<E::Address>,
 	trace: Arc<TraceCollector>,
-	_digest: PhantomData<D>,
 }
 
-impl<P, D, E> ClusterGateway<P, D, E>
+impl<P, E> ClusterGateway<P, E>
 where
 	P: Protocol,
 	E: Protocol,
 {
-	/// Bound edge accept plane address, or `None` when
+	/// The bound address of the edge accept plane, or `None` when
 	/// [`ClusterConfig::edge_bind_addr`] is unset.
 	///
 	/// External clients dial this address. Hives register on
@@ -199,7 +211,7 @@ where
 	}
 }
 
-impl<P, D, E> ClusterGateway<P, D, E>
+impl<P, E> ClusterGateway<P, E>
 where
 	P: Protocol,
 	E: Protocol,
@@ -211,11 +223,10 @@ where
 	}
 }
 
-impl<P, D, E> Cluster for ClusterGateway<P, D, E>
+impl<P, E> Cluster for ClusterGateway<P, E>
 where
 	P: GatewayColonyProtocol,
-	E: GatewayAcceptProtocol,
-	D: ClusterDigest,
+	E: GatewayAcceptProtocol + Protocol<CryptoProvider = P::CryptoProvider>,
 {
 	type Protocol = P;
 	type Address = P::Address;
@@ -237,7 +248,7 @@ where
 			config
 		};
 
-		let config = Arc::new(config);
+		let config = ColonyConfig::<P>::new(config);
 
 		// The `colony` feature enables `x509`, so the gateway always serves
 		// TLS.
@@ -256,9 +267,9 @@ where
 			.with_ad_tombstone_window(control_window);
 
 		let servlet_registry = Arc::new(routes);
-		let pools = config.pool_config.build_cluster_pools::<P>(&config.tls, &config.clock)?;
+		let pools = config.tls.pools::<P>(&config.pool_config, &config.clock);
 		let hive_plane = HivePlane::new(pools.hive, Arc::clone(&trace));
-		let build_peer_plane = |peer_pool| PeerPlane::new(peer_pool, Arc::clone(&config), Arc::clone(&trace));
+		let build_peer_plane = |peer_pool| PeerPlane::new(peer_pool, config.clone(), Arc::clone(&trace));
 		let peer_plane = pools.peer.map(build_peer_plane);
 
 		let replay_guard_for_server = GatewayReplayGuard::new(control_window, Arc::clone(&config.clock));
@@ -267,7 +278,7 @@ where
 			registry: Arc::clone(&registry),
 			servlet_registry: Arc::clone(&servlet_registry),
 			admission: Arc::new(Mutex::new(())),
-			config: Arc::clone(&config),
+			config: config.clone(),
 			hive_plane: hive_plane.clone(),
 			peer_plane,
 			trace: Arc::clone(&trace),
@@ -295,20 +306,20 @@ where
 		// path reports it once for all accept planes.
 		config.warn_export_posture(&trace)?;
 
-		// The advertised address is decided before any task spawns, so a
-		// federating gateway on the wildcard address refuses to start and
+		// The gateway decides its advertised address before any task spawns,
+		// so a federating gateway on the wildcard address refuses to start and
 		// closes every listener it bound.
 		let gateway_bytes: Vec<u8> = addr.clone().into();
 		let gateway_addr = config.peer.advertised_address(gateway_bytes)?;
 
 		// Each field of the context is reference-counted, so a clone is cheap.
-		let server_handle = ctx.clone().serve_colony::<P::Listener, D>(listener);
+		let server_handle = ctx.clone().serve_colony::<P::Listener>(listener);
 
 		// The edge plane serves [`EdgeMuxService`], whose only route is work
 		// submission.
-		let edge_handle = edge_listener.map(|edge_listener| ctx.clone().serve_edge::<E::Listener, D>(edge_listener));
+		let edge_handle = edge_listener.map(|edge_listener| ctx.clone().serve_edge::<E::Listener>(edge_listener));
 
-		tasks.adopt(ctx.clone().spawn_heartbeat::<D>());
+		tasks.adopt(ctx.clone().spawn_heartbeat());
 
 		// Three missed refreshes retire a relay trail: one miss is churn, and
 		// three mean the refresh path died. The default interval floors the
@@ -319,7 +330,7 @@ where
 			.max(Duration::from_millis(DEFAULT_AD_RUMOR_REFRESH_MS));
 
 		tasks.adopt(ctx.clone().spawn_evaporation(relay_trail_ttl));
-		tasks.adopt(ctx.clone().spawn_advertise::<D>(gateway_addr));
+		tasks.adopt(ctx.clone().spawn_advertise(gateway_addr));
 
 		Ok(Self {
 			registry,
@@ -332,7 +343,6 @@ where
 			addr,
 			edge_addr,
 			trace,
-			_digest: PhantomData,
 		})
 	}
 
@@ -341,8 +351,8 @@ where
 	}
 
 	fn available_servlets(&self) -> Result<Vec<SharedId>, ClusterError> {
-		// Routes are the one home for which types this gateway serves, so
-		// a hive scaling an instance in or out is reflected here without a
+		// The routes are the one home of the types this gateway serves, so
+		// this list follows each instance a hive scales in or out, with no
 		// second index to keep current.
 		self.servlet_registry.local_servlets()
 	}
@@ -391,11 +401,10 @@ where
 	}
 }
 
-impl<P, D, E> ClusterHeartbeat for ClusterGateway<P, D, E>
+impl<P, E> ClusterHeartbeat for ClusterGateway<P, E>
 where
 	P: GatewayColonyProtocol,
-	E: GatewayAcceptProtocol,
-	D: ClusterDigest,
+	E: GatewayAcceptProtocol + Protocol<CryptoProvider = P::CryptoProvider>,
 {
 	fn registry(&self) -> &Arc<HiveRegistry> {
 		&self.registry
@@ -411,11 +420,11 @@ where
 			return Err(ClusterError::InvalidAddress(hive_id));
 		};
 
-		HiveBeat::new(&self.config, &self.hive_plane).send::<D>(&hive).await
+		HiveBeat::new(&self.config, &self.hive_plane).send(&hive).await
 	}
 }
 
-impl<P, D, E> Drop for ClusterGateway<P, D, E>
+impl<P, E> Drop for ClusterGateway<P, E>
 where
 	P: Protocol,
 	E: Protocol,
@@ -425,7 +434,7 @@ where
 	}
 }
 
-/// Gateway implementation of [`MuxService`] for the colony accept plane.
+/// The gateway's [`MuxService`] for the colony accept plane.
 ///
 /// Unary frames route through cluster dispatch. Streamed and duplex opens route
 /// by the target [`Urn`] on their [`CallContext`].
@@ -441,33 +450,30 @@ where
 ///
 /// Stream and duplex opens pass [`GatewayRuntimeCtx::guard_stream_open`], which
 /// applies the Work-arm boundary order before routing.
-struct GatewayMuxService<P, D>
+struct GatewayMuxService<P>
 where
 	P: Protocol,
 {
 	ctx: GatewayRuntimeCtx<P>,
-	_digest: PhantomData<D>,
 }
 
-/// Gateway implementation of [`MuxService`] for an edge accept plane.
+/// The gateway's [`MuxService`] for an edge accept plane.
 ///
 /// An edge plane serves external clients, so work submission is its only
 /// route. The type carries that boundary. Its unary arm narrows the envelope
 /// to a work request through [`GatewayRuntimeCtx::handle_edge_request`], and
 /// its stream and duplex arms refuse with `PermissionDenied`. Registration,
 /// peer advertisement, and gossip stay on the colony plane.
-struct EdgeMuxService<P, D>
+struct EdgeMuxService<P>
 where
 	P: Protocol,
 {
 	ctx: GatewayRuntimeCtx<P>,
-	_digest: PhantomData<D>,
 }
 
-impl<P, D> MuxService for GatewayMuxService<P, D>
+impl<P> MuxService for GatewayMuxService<P>
 where
 	P: GatewayColonyProtocol,
-	D: ClusterDigest,
 {
 	fn unary(
 		&self,
@@ -475,7 +481,7 @@ where
 		cx: CallContext,
 	) -> impl Future<Output = Result<Option<Frame>, TightBeamError>> + Send {
 		let ctx = self.ctx.clone();
-		async move { ctx.handle_request::<D>(frame, cx.into_session()).await }
+		async move { ctx.handle_request(frame, cx.into_session()).await }
 	}
 
 	fn streaming(
@@ -504,10 +510,9 @@ where
 	}
 }
 
-impl<P, D> MuxService for EdgeMuxService<P, D>
+impl<P> MuxService for EdgeMuxService<P>
 where
 	P: GatewayColonyProtocol,
-	D: ClusterDigest,
 {
 	fn unary(
 		&self,
@@ -537,14 +542,14 @@ where
 }
 
 impl<P: Protocol> GatewayRuntimeCtx<P> {
-	/// Boundary guard shared by the streaming and duplex open handlers.
+	/// The boundary guard that the streaming and duplex open handlers share.
 	///
 	/// An open passes the same boundary a unary request passes:
 	///
-	/// 1. [`ClusterConfig::evaluate_gates`] with no request frame.
+	/// 1. Run [`ClusterConfig::evaluate_gates`] with no request frame.
 	/// 2. Resolve the servlet target from the call context.
 	/// 3. Derive `relayed` from [`HopBudget::is_relayed`].
-	/// 4. [`ClusterConfig::evaluate_export_gates`] on that target and session.
+	/// 4. Run [`ColonyConfig::evaluate_export_gates`] on that target and session.
 	///
 	/// An unrouted open names no servlet type, so it fails with
 	/// `Unimplemented`.
@@ -561,7 +566,10 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 		let budget = HopBudget::from_wire(WireHopBudget::new(cx.hops_remaining()), self.config.peer.max_hops);
 		let is_relayed = budget.is_relayed();
 		let session = cx.session();
-		let export_status = self.config.evaluate_export_gates(&target, session, is_relayed, &self.trace)?;
+		let config = &self.config;
+		let trace = &self.trace;
+
+		let export_status = config.evaluate_export_gates(&target, session, is_relayed, trace)?;
 		if export_status != TransitStatus::Ok {
 			return Err(export_status.refusal());
 		}
@@ -575,15 +583,14 @@ impl<P: GatewayColonyProtocol> GatewayRuntimeCtx<P> {
 	///
 	/// `L` is the bound listener, which feeds the service over the colony pool
 	/// protocol `P`.
-	pub(crate) fn serve_colony<L, D>(self, listener: L) -> rt::JoinHandle
+	pub(crate) fn serve_colony<L>(self, listener: L) -> rt::JoinHandle
 	where
 		L: AsyncListenerTrait + Sync + 'static,
 		L::Transport: AcceptedConnection + PolicyConfig + MuxCapable + 'static,
-		D: ClusterDigest,
 	{
 		let mux_offer = self.config.pool_config.mux_offer.as_ref().map(Arc::clone);
 		let clock = Arc::clone(&self.config.clock);
-		let service = GatewayMuxService::<P, D> { ctx: self, _digest: PhantomData };
+		let service = GatewayMuxService::<P> { ctx: self };
 		Self::accept_into(listener, mux_offer, clock, service)
 	}
 
@@ -591,15 +598,14 @@ impl<P: GatewayColonyProtocol> GatewayRuntimeCtx<P> {
 	///
 	/// The service type restricts the plane to work submission, so the type
 	/// alone tells dispatch which plane a request arrived on.
-	pub(crate) fn serve_edge<L, D>(self, listener: L) -> rt::JoinHandle
+	pub(crate) fn serve_edge<L>(self, listener: L) -> rt::JoinHandle
 	where
 		L: AsyncListenerTrait + Sync + 'static,
 		L::Transport: AcceptedConnection + PolicyConfig + MuxCapable + 'static,
-		D: ClusterDigest,
 	{
 		let mux_offer = self.config.pool_config.mux_offer.as_ref().map(Arc::clone);
 		let clock = Arc::clone(&self.config.clock);
-		let service = EdgeMuxService::<P, D> { ctx: self, _digest: PhantomData };
+		let service = EdgeMuxService::<P> { ctx: self };
 		Self::accept_into(listener, mux_offer, clock, service)
 	}
 
@@ -622,8 +628,8 @@ impl<P: GatewayColonyProtocol> GatewayRuntimeCtx<P> {
 
 		let plane = AcceptPlane::new(DEFAULT_MAX_SERVER_CONNECTIONS, clock);
 		rt::spawn(plane.accept_on(listener, move |mut transport: L::Transport| {
-			// Clone the Arc so each accept shares the mux offer without
-			// copying authorization octets.
+			// Each accept clones the `Arc`, so it shares the mux offer and
+			// copies no authorization octet.
 			transport = transport.with_mux_offer(mux_offer.clone());
 
 			let service = Arc::clone(&service);
@@ -637,6 +643,7 @@ mod tests {
 	use super::*;
 	use crate::colony::cluster::ClusterTlsConfig;
 	use crate::crypto::key::Secp256k1KeyProvider;
+	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 	use crate::crypto::sign::SigningIdentity;
 	use crate::crypto::x509::KeyPurposes;
@@ -652,8 +659,7 @@ mod tests {
 		let configured = KeyPurposes { server: KeyPurposes::HOUSE.client, ..KeyPurposes::HOUSE };
 		let tls = ClusterTlsConfig::from_identity(identity, configured)?;
 
-		let accept = tls.accept_encryption();
-
+		let accept = tls.accept_encryption::<DefaultCryptoProvider>();
 		assert_eq!(accept.key_purposes, configured);
 		Ok(())
 	}

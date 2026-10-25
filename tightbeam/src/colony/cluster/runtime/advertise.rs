@@ -1,11 +1,11 @@
 //! The direct advertisement, the one gateway dial that admits whichever
 //! gateway answers.
 //!
-//! A direct advertisement is owed to every beat target, and the receiver
-//! decides whether to admit it.
+//! The gateway owes a direct advertisement to every beat target, and the
+//! receiver decides whether to admit it.
 //!
 //! - [`Advertiser`] holds the pool for that dial, and its unbound connect is private to this module.
-//! - The dial carries a [`SignedAdvertisement`] alone, which [`ClusterConfig::mint_ad_frame`] alone builds.
+//! - The dial carries a [`SignedAdvertisement`] alone, which [`ColonyConfig::mint_ad_frame`] alone builds.
 //! - The connection stays pooled only when the gateway that answered proves it is a flood member.
 //! - Every other dial of a route-named target goes through a [`BoundDial`],
 //!   and every gossip dial through a membership proof.
@@ -16,8 +16,8 @@ use std::sync::Arc;
 
 use crate::builder::frame::FrameBuilder;
 use crate::builder::TypeBuilder;
-use crate::colony::cluster::runtime::bounds::{ClusterDigest, ClusterPool, ColonyDialProtocol};
-use crate::colony::cluster::{ClusterConfig, ClusterError};
+use crate::colony::cluster::runtime::bounds::{ClusterPool, ColonyConfig, ColonyDialProtocol};
+use crate::colony::cluster::ClusterError;
 use crate::colony::common::{ClusterRequest, PeerAdvertisement, PeerAdvertisementResponse};
 use crate::decode;
 use crate::policy::TransitStatus;
@@ -28,7 +28,7 @@ use crate::{MessagePriority, Version};
 
 /// One signed peer advertisement of this gateway's slate.
 ///
-/// [`ClusterConfig::mint_ad_frame`] is the one constructor, so the unbound
+/// [`ColonyConfig::mint_ad_frame`] is the one constructor, so the unbound
 /// dial of [`Advertiser::advertise`] carries an advertisement this gateway
 /// signed, and that alone.
 pub(crate) struct SignedAdvertisement(Frame);
@@ -40,7 +40,7 @@ impl SignedAdvertisement {
 	}
 }
 
-impl ClusterConfig {
+impl<P: ColonyDialProtocol> ColonyConfig<P> {
 	/// Creates and signs one peer advertisement frame for the local slate.
 	///
 	/// One frame serves both delivery paths, so direct dials and gossip
@@ -49,8 +49,8 @@ impl ClusterConfig {
 	/// # Delivery paths
 	///
 	/// - A direct dial through [`Advertiser::advertise`].
-	/// - An advertisement rumor through [`ClusterConfig::mint_slate_rumor`].
-	pub(super) async fn mint_ad_frame<D: ClusterDigest>(
+	/// - An advertisement rumor through [`ColonyConfig::mint_slate_rumor`].
+	pub(super) async fn mint_ad_frame(
 		&self,
 		gateway_addr: impl AsRef<[u8]>,
 		types: impl IntoIterator<Item = Urn<'static>>,
@@ -64,13 +64,12 @@ impl ClusterConfig {
 			advertised_types: types,
 		});
 
-		let mut signed_frame = FrameBuilder::from(Version::V2)
+		let builder = FrameBuilder::from(Version::V2)
 			.with_id(b"peer-advertise")
 			.with_order(self.clock.unix().get())
 			.with_message(request)
-			.with_priority(MessagePriority::NetworkControl)
-			.with_witness_hasher::<D>()
-			.build()?;
+			.with_priority(MessagePriority::NetworkControl);
+		let mut signed_frame = self.witnessed(builder).build()?;
 
 		signed_frame.sign_with_provider(self.tls.identity()).await?;
 		Ok(SignedAdvertisement(signed_frame))
@@ -82,13 +81,13 @@ pub(crate) struct Advertiser<P: Protocol> {
 	pool: Arc<ClusterPool<P>>,
 	/// The configuration whose flood decides whether a connection stays
 	/// pooled.
-	config: Arc<ClusterConfig>,
+	config: ColonyConfig<P>,
 }
 
 impl<P: Protocol> Advertiser<P> {
-	/// An advertiser that dials on `pool`, and keeps pooled only a connection
+	/// An advertiser that dials on `pool` and keeps pooled only a connection
 	/// to a member of `config`'s flood.
-	pub(crate) fn new(pool: Arc<ClusterPool<P>>, config: Arc<ClusterConfig>) -> Self {
+	pub(crate) fn new(pool: Arc<ClusterPool<P>>, config: ColonyConfig<P>) -> Self {
 		Self { pool, config }
 	}
 }
@@ -100,6 +99,8 @@ impl<P: ColonyDialProtocol> Advertiser<P> {
 	/// - The caller signs one advertisement per beat and fans it out, so one signature serves every dial.
 	/// - The answer is unproven, so the connection stays pooled only when
 	///   [`ClusterConfig::flood_member`] proves the gateway that answered.
+	///
+	/// [`ClusterConfig::flood_member`]: crate::colony::cluster::ClusterConfig::flood_member
 	///
 	/// # Errors
 	///

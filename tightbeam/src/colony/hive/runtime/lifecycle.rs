@@ -20,13 +20,13 @@ use crate::colony::hive::{
 	ServletRegistry, SpawnerFn,
 };
 use crate::constants::DEFAULT_MAX_SERVER_CONNECTIONS;
-use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::macros::server::AcceptedConnection;
 use crate::policy::TransitStatus;
 use crate::runtime::rt;
 use crate::trace::TraceCollector;
 use crate::transport::accept::AcceptPlane;
 use crate::transport::client::{ConnectionBuilder, ConnectionPool};
+use crate::transport::handshake::HandshakeProvider;
 use crate::transport::multiplex::{MuxCapable, MuxConnector};
 use crate::transport::policy::PolicyConfig;
 use crate::transport::{
@@ -41,10 +41,10 @@ use crate::transport::state::EncryptedProtocolState;
 
 /// The accept plane a cluster reaches this hive on.
 ///
-/// Binding it needs the TLS identity that signs registrations. A cluster
-/// refuses an unsigned hive, so a hive with no identity never publishes
-/// this address, and an unauthenticated control listener would answer
-/// nobody but an attacker (CWE-306).
+/// The hive binds it only under the TLS identity that signs registrations.
+/// A cluster refuses an unsigned hive, so only a hive with an identity
+/// publishes this address, and an unauthenticated control listener would
+/// answer only an attacker (CWE-306).
 struct ControlPlane<P: Protocol> {
 	/// The accept loop, which [`Hive::join`] awaits.
 	handle: rt::JoinHandle,
@@ -60,7 +60,7 @@ struct ControlPlane<P: Protocol> {
 enum Lifecycle<P: Protocol> {
 	/// Servlet registration is open, and the control plane is unbound.
 	Provisional,
-	/// Servlets are running. `control` is present for a hive that holds a
+	/// The servlets run. `control` is present for a hive that holds a
 	/// TLS identity, and absent for one that can never join a cluster.
 	Established { control: Option<ControlPlane<P>> },
 }
@@ -102,8 +102,9 @@ pub struct HiveRuntime<P: Protocol> {
 }
 
 impl<P: Protocol> HiveRuntime<P> {
-	/// Aborts the hive's tasks and stops every registered servlet. Both
-	/// `stop` and `Drop` run it, so a dropped hive leaks no servlet.
+	/// Aborts the hive's tasks and its control plane, and stops every
+	/// registered servlet. Both `stop` and `Drop` run it, so a dropped hive
+	/// leaks no servlet.
 	fn release(&mut self) {
 		self.tasks.abort_all();
 		if let Lifecycle::Established { control } = &mut self.lifecycle {
@@ -150,7 +151,7 @@ impl<P: Protocol> HiveRuntime<P> {
 
 impl<P> HiveRuntime<P>
 where
-	P: Protocol + EncryptedProtocol<CryptoProvider = DefaultCryptoProvider> + Send + Sync + 'static,
+	P: Protocol + EncryptedProtocol<CryptoProvider: HandshakeProvider> + Send + Sync + 'static,
 	P::Address: Clone + Copy + Send + Sync + 'static,
 	P::Stream: Send + 'static,
 	P::Error: Send + 'static,
@@ -189,12 +190,7 @@ where
 
 impl<P> Hive for HiveRuntime<P>
 where
-	P: Protocol
-		+ PersistentConnection
-		+ EncryptedProtocol<CryptoProvider = DefaultCryptoProvider>
-		+ Send
-		+ Sync
-		+ 'static,
+	P: Protocol + PersistentConnection + EncryptedProtocol<CryptoProvider: HandshakeProvider> + Send + Sync + 'static,
 	P::Listener: AsyncListenerTrait + Sync + 'static,
 	<P::Listener as Protocol>::Transport: AcceptedConnection + PolicyConfig + MuxCapable + 'static,
 	P::Address: Hash + Eq + Clone + Copy + Send + Sync + FromStr + 'static,
@@ -219,13 +215,7 @@ where
 			.with_config(config.pool.clone())
 			.with_clock(Arc::clone(&config.clock));
 
-		// Intra-hive calls validate each servlet certificate with the hive's
-		// trust store, when the hive has one.
-		let pool_builder = match config.trust_store.as_ref() {
-			Some(store) => pool_builder.with_trust_store(Arc::clone(store)),
-			None => pool_builder,
-		};
-
+		let pool_builder = config.sibling_dials(pool_builder);
 		let servlet_pool = Arc::new(pool_builder.build());
 		let hive_context = Arc::new(HiveContextImpl::new(servlet_pool));
 
@@ -372,8 +362,8 @@ where
 
 		let cluster_addr = *cluster_addr;
 		let response = link.register(cluster_addr).await?;
-		// The hive remembers a gateway only after the gateway accepts, so a
-		// peer that refused stays unpolled.
+		// The hive remembers a gateway only after the gateway accepts, so the
+		// re-announce beat and the scaling fan-out skip a gateway that refused.
 		if response.status == TransitStatus::Ok {
 			link.remember(cluster_addr);
 		}
@@ -384,7 +374,7 @@ where
 	async fn drain(&self) -> Result<(), TightBeamError> {
 		self.drain.begin();
 
-		// Stop the beats before waiting on commands. A re-announce or a
+		// Stop the beats before the wait on commands. A re-announce or a
 		// scale-up that outlived the wait would reinstall the routes this
 		// drain withdraws (CWE-362).
 		self.tasks.abort_all();

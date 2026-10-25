@@ -1,4 +1,4 @@
-//! In-band epoch renewal (rekey) integration tests.
+//! The integration tests of in-band epoch renewal, the rekey.
 
 use core::time::Duration;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use tightbeam::at_least;
 use tightbeam::crypto::profiles::DefaultCryptoProvider;
-use tightbeam::crypto::sign::elliptic_curve::sec1::ToEncodedPoint;
 use tightbeam::crypto::x509::{KeyPurposes, PeerCertificate, Signing};
 use tightbeam::der::asn1::OctetString;
 use tightbeam::der::Encode;
@@ -75,23 +74,23 @@ pub(crate) const STALLED_RENEWAL_DRAINS_CLEAN: Urn<'static> =
 pub(crate) const TRAFFIC_STRADDLES_KEY_SWITCH: Urn<'static> =
 	tightbeam::urn!("test", "event:rekey/traffic-straddles-key-switch");
 
-/// Settlement challenge the authorizer binds into every epoch receipt.
+/// The settlement challenge the authorizer binds into every epoch receipt.
 const RENEWAL_CHALLENGE: &[u8] = b"epoch-invoice-7";
 
-/// Settlement answer the approver countersigns at each renewal.
+/// The settlement answer the approver countersigns at each renewal.
 const RENEWAL_RESPONSE: &[u8] = b"epoch-preimage-7";
 
-/// Application code for a renewal settle refusal.
+/// The application code of a renewal that the authorizer's `settle` refuses.
 const SETTLE_REFUSAL_CODE: u32 = MUX_APPLICATION_CODE_FLOOR + 31;
 
-/// Application code for a renewal approval refusal.
+/// The application code of a renewal that the approver refuses.
 const APPROVAL_REFUSAL_CODE: u32 = MUX_APPLICATION_CODE_FLOOR + 32;
 
-/// Budgets under which the fifth single-chunk emit tips the budget into the
-/// drain reserve (caps 1/1, 1 KiB chunk).
+/// The budgets under which the fifth single-chunk emit tips the budget into
+/// the drain reserve, with a stream cap of 1 on each side and a 1 KiB chunk.
 const RENEWAL_TRIGGER_BUDGETS: MuxBudgets = MuxBudgets { client_to_server: 10, server_to_client: 4096 };
 
-/// Budgets large enough that the record watermark drives the renewal.
+/// The budgets, large enough that the record watermark drives the renewal.
 const AMPLE_BUDGETS: MuxBudgets = MuxBudgets { client_to_server: 1_000_000, server_to_client: 1_000_000 };
 
 fn rekey_config() -> MuxEndpointConfig {
@@ -130,11 +129,8 @@ async fn await_matching_receipt(handle: &MuxHandle, expected: &StoredReceipt) ->
 /// fresh ephemeral point.
 fn rekey_request_envelope(seed: u8) -> Result<TransportEnvelope, TightBeamError> {
 	let ephemeral = k256::SecretKey::random(&mut rand_core::OsRng).public_key();
-	let encoded = ephemeral.to_encoded_point(true);
-	let point = encoded.as_bytes().try_into();
-	let point = point.map_err(|_| expectation_failure("a secp256k1 point compresses to 33 bytes"))?;
 
-	let package = MuxRekeyRequestPackage::new(vec![seed; 32], &point)?;
+	let package = MuxRekeyRequestPackage::new(vec![seed; 32], &ephemeral)?;
 	Ok(MuxEnvelope::RekeyRequest(package).into())
 }
 
@@ -168,8 +164,8 @@ async fn read_until_rekey_response(reader: &mut SplitReader) -> Result<(), Tight
 	.map_err(|_| expectation_failure("server must answer the renewal request before the read timeout"))?
 }
 
-/// Poses a settlement challenge on every renewal and counts the `settle`
-/// consultations.
+/// An authorizer that poses a settlement challenge on every renewal and
+/// counts the `settle` consultations.
 struct RenewalAuthorizer {
 	challenge: OctetString,
 	expected_response: OctetString,
@@ -229,8 +225,8 @@ impl TransportAuthorizer for RenewalAuthorizer {
 	}
 }
 
-/// Answers challenge-bearing receipts. Handshake receipts pass without an
-/// answer.
+/// An approver that answers challenge-bearing receipts. Handshake receipts
+/// pass without an answer.
 struct RenewalApprover {
 	response: OctetString,
 }
@@ -250,8 +246,8 @@ impl ReceiptApprover for RenewalApprover {
 	}
 }
 
-/// Approves the initial handshake receipt, then refuses every renewal
-/// with [`APPROVAL_REFUSAL_CODE`].
+/// An approver that approves the initial handshake receipt, then refuses
+/// every renewal with [`APPROVAL_REFUSAL_CODE`].
 #[derive(Default)]
 struct RenewalRefusingApprover {
 	calls: AtomicUsize,
@@ -355,7 +351,7 @@ tb_assert_spec! {
 }
 
 // The record watermark matches the chunked-traffic renewal, and every request
-// travels through open_stream against serve_streaming. The sink's per-push
+// travels through `open_stream` against `serve_streaming`. The sink's per-push
 // records and the drain-driven grants must both cross the epoch switch intact.
 tb_scenario! {
 	name: mux_rekey_renewal_survives_streaming_traffic,
@@ -873,7 +869,6 @@ async fn establish_purposed_session() -> Result<MutualTransports, TightBeamError
 #[tokio::test]
 async fn a_client_detaches_its_rekey_materials_under_the_server_purpose() -> Result<(), TightBeamError> {
 	let MutualTransports { mut client, .. } = establish_purposed_session().await?;
-
 	let rekey = MuxConnector::take_rekey(&mut client)?;
 	assert!(rekey.is_some());
 	Ok(())
@@ -884,7 +879,6 @@ async fn a_client_detaches_its_rekey_materials_under_the_server_purpose() -> Res
 #[tokio::test]
 async fn a_server_detaches_its_rekey_materials_under_the_client_purpose() -> Result<(), TightBeamError> {
 	let MutualTransports { mut server, .. } = establish_purposed_session().await?;
-
 	let rekey = MuxAcceptor::take_rekey(&mut server)?;
 	assert!(rekey.is_some());
 	Ok(())

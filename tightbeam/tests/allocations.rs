@@ -1,6 +1,5 @@
-//! The allocation counts of the reads the handshake and a key index make
-//! in place, under a counting allocator that this test binary alone
-//! installs.
+//! This test binary counts the allocations of the reads that the handshake
+//! and a key index make in place, under a counting allocator.
 //!
 //! - A lookup writes the canonical form of a key on the stack when that form
 //!   fits the stack buffer, which holds every named-curve key up to P-521.
@@ -8,6 +7,8 @@
 //!   value as the certificate holds it.
 //! - The built-in store validates a presented path from where its parts sit.
 //! - A signed `SignerInfo` encodes in place, as its inner value does.
+//! - A gossip rumor digest sits on the stack, so a rumor admits and a peer's
+//!   digest reads with no allocation for the digest.
 //!
 //! Only an allocation count shows these bounds, so the counting allocator
 //! lives in this test binary alone.
@@ -17,18 +18,24 @@
 #![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 
 use core::cell::Cell;
+use core::time::Duration;
 use std::alloc::{GlobalAlloc, Layout, System};
 
+use tightbeam::colony::cluster::{AdmittedGossip, GossipDigest};
+use tightbeam::colony::common::GossipRumor;
+use tightbeam::crypto::hash::Sha3_256;
 use tightbeam::crypto::policy::Secp256k1Policy;
 use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
 use tightbeam::crypto::x509::utils::CertificateExt;
 use tightbeam::crypto::x509::KeyIndex;
+use tightbeam::decode;
 use tightbeam::der::asn1::{BitString, ObjectIdentifier};
 use tightbeam::der::oid::db::rfc8410::ID_ED_25519;
 use tightbeam::der::Encode;
 use tightbeam::oids::{CURVE_NIST_P256, CURVE_NIST_P521};
 use tightbeam::spki::SubjectPublicKeyInfoOwned;
-use tightbeam::testing::fixtures::{TestCertificate, TestKey, TestSigner};
+use tightbeam::testing::fixtures::{TestCertificate, TestKey, TestRumor, TestSigner};
+use tightbeam::utils::time::UnixMillis;
 
 thread_local! {
 	/// The count of the allocations of this thread. A `Cell` of an integer
@@ -155,13 +162,16 @@ fn validations_of_the_fixed_path() -> (usize, usize) {
 	let store = builder.expect("the root is within its validity period").build();
 	let whole = [chain.intermediate.to_owned(), chain.leaf.to_owned()];
 	let issuers = [chain.intermediate];
-
 	let before = ALLOCATIONS.with(Cell::get);
+
 	store.verify_chain(&whole).expect("the path validates as one chain");
+
 	let between = ALLOCATIONS.with(Cell::get);
 	let presented = store.verify_presented(&issuers, &chain.leaf);
 	presented.expect("the path validates as presented");
+
 	let after = ALLOCATIONS.with(Cell::get);
+
 	(between - before, after - between)
 }
 
@@ -178,12 +188,14 @@ fn a_presented_path_validates_with_the_allocations_of_one_chain() {
 /// makes, through its `Signed` wrapper and as its inner `SignerInfo`.
 fn encodings_of_the_fixed_signer() -> (usize, usize) {
 	let signed = TestSigner::info();
-
 	let before = ALLOCATIONS.with(Cell::get);
 	signed.to_der().expect("the signed structure encodes");
+
 	let between = ALLOCATIONS.with(Cell::get);
 	signed.as_ref().to_der().expect("the inner structure encodes");
+
 	let after = ALLOCATIONS.with(Cell::get);
+
 	(between - before, after - between)
 }
 
@@ -193,4 +205,52 @@ fn encodings_of_the_fixed_signer() -> (usize, usize) {
 fn a_signed_signer_info_encodes_with_the_allocations_of_its_value() {
 	let (wrapped, inner) = encodings_of_the_fixed_signer();
 	assert_eq!(wrapped, inner);
+}
+
+/// The count of the allocations that a read of a 32-octet SHA3-256 rumor
+/// digest makes.
+fn allocations_of_a_digest_read() -> usize {
+	let bytes = [7u8; 32];
+
+	let before = ALLOCATIONS.with(Cell::get);
+	let digest = GossipDigest::read::<Sha3_256>(bytes);
+	let after = ALLOCATIONS.with(Cell::get);
+	digest.expect("32 octets read as a SHA3-256 digest");
+	after - before
+}
+
+/// A rumor digest that a peer names reads onto the stack.
+#[test]
+fn a_rumor_digest_reads_with_no_allocation() {
+	assert_eq!(allocations_of_a_digest_read(), 0);
+}
+
+/// The counts of the allocations that the admission of the fixed rumor makes,
+/// and that the two steps of it that own a buffer make: the decode of its body
+/// and the encoding of its to-be-signed frame.
+fn admissions_of_the_fixed_rumor() -> (usize, usize) {
+	let rumor = TestRumor::verified(TestRumor::application(1_000, [1, 2, 3]));
+	let frame = rumor.frame();
+	let now = UnixMillis::new(1_000);
+
+	let before = ALLOCATIONS.with(Cell::get);
+	let admitted = AdmittedGossip::admit::<Sha3_256>(&rumor, 0, Duration::from_secs(30), now);
+	let between = ALLOCATIONS.with(Cell::get);
+	let body = decode::<GossipRumor>(frame.message());
+	let tbs = frame.to_tbs();
+	let after = ALLOCATIONS.with(Cell::get);
+
+	admitted.expect("the fixed rumor is fresh and within its bounds");
+	body.expect("the fixed rumor's body decodes");
+	tbs.expect("the fixed rumor encodes");
+	(between - before, after - between)
+}
+
+/// A rumor admits with no allocation for its digest: the admission allocates
+/// what its body decode and its to-be-signed encoding allocate, and the digest
+/// it records sits on the stack.
+#[test]
+fn a_rumor_admits_with_no_allocation_for_its_digest() {
+	let (admission, parts) = admissions_of_the_fixed_rumor();
+	assert_eq!(admission, parts);
 }

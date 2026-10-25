@@ -1,4 +1,4 @@
-//! Async TCP transport.
+//! The async TCP transport.
 //!
 //! [`TcpTransport`] runs over any [`AsyncProtocolStream`], and [`TokioStream`]
 //! carries it over a tokio TCP socket. An established transport splits into
@@ -37,7 +37,7 @@ use crate::policy::GatePolicy;
 use crate::policy::TransitStatus;
 use crate::transport::envelopes::{ArrivingEnvelope, TransportEnvelope, WireEnvelope};
 use crate::transport::error::TransportFailure;
-use crate::transport::handshake::BoxedServerHandshake;
+use crate::transport::handshake::{BoxedServerHandshake, HandshakeProvider};
 use crate::transport::io::{EnvelopeSink, EnvelopeSource};
 use crate::transport::policy::RestartPolicy;
 use crate::transport::protocols::{AsyncProtocolStream, AsyncReadStream, AsyncWriteStream, SplittableStream};
@@ -166,10 +166,22 @@ impl From<TcpStream> for TokioStream {
 
 /// A tokio TCP listener that builds every accepted transport from one
 /// [`EndpointConfig`].
+///
+/// # Provider
+///
+/// In a type position, `TokioListener` alone names the house provider,
+/// [`DefaultCryptoProvider`]. In an expression, the compiler infers the
+/// provider `P` from the calls, so a call names `P` where no other type names
+/// it, in one of these shapes:
+///
+/// - `TokioListener::<DefaultCryptoProvider>::bind_cleartext(addr)`, for a listener a `server!` block serves,
+/// - `<TokioListener as EncryptedProtocol>::bind_with(addr, config)`, for a listener bound through the trait,
+/// - `TransportEncryptionConfig::<DefaultCryptoProvider>::new(identity)`, for a server configuration, and
+/// - `EncryptionConfig::<DefaultCryptoProvider>::unconfigured()`, for a provisioning built field by field.
 #[cfg(feature = "tokio")]
 pub struct TokioListener<P: CryptoProvider = DefaultCryptoProvider> {
 	listener: TcpListener,
-	/// The configuration that every accepted transport is built from.
+	/// The configuration the listener builds every accepted transport from.
 	config: EndpointConfig<P>,
 }
 
@@ -192,6 +204,24 @@ impl<P: CryptoProvider + Send + Sync + 'static> TokioListener<P> {
 	/// # Errors
 	///
 	/// - The I/O error of a bind that fails.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::crypto::profiles::DefaultCryptoProvider;
+	/// use tightbeam::transport::tcp::r#async::TokioListener;
+	///
+	/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+	/// # let runtime = tokio::runtime::Builder::new_current_thread().enable_io().build()?;
+	/// # runtime.block_on(async {
+	/// // No other type of this call names the provider, so the call names it.
+	/// let listener = TokioListener::<DefaultCryptoProvider>::bind_cleartext("127.0.0.1:0").await?;
+	/// assert!(listener.local_addr()?.ip().is_loopback());
+	/// # Ok::<(), std::io::Error>(())
+	/// # })?;
+	/// # Ok(())
+	/// # }
+	/// ```
 	pub async fn bind_cleartext(addr: impl AsRef<str>) -> Result<Self, IoError> {
 		let listener = TcpListener::bind(addr.as_ref()).await?;
 		let config = EndpointConfig::cleartext();
@@ -262,8 +292,13 @@ impl<P: CryptoProvider + Send + Sync + 'static> EncryptedProtocol for TokioListe
 	}
 }
 
+/// This impl covers every provider `P`, so a call names `P` where no other
+/// type names it, as [`TokioListener`] shows under `# Provider`.
 // `TcpTransport` takes the default of every `EncryptedMessageIO` method.
-impl<S: AsyncProtocolStream> EncryptedMessageIO for TcpTransport<S> where TransportError: From<S::Error> {}
+impl<S: AsyncProtocolStream, P: CryptoProvider + Send + Sync + 'static> EncryptedMessageIO for TcpTransport<S, P> where
+	TransportError: From<S::Error>
+{
+}
 
 impl<S: AsyncProtocolStream, P: CryptoProvider + Send + Sync> TcpTransport<S, P>
 where
@@ -329,13 +364,16 @@ pub type SplitMuxTransport<S> = MuxTransport<
 	TransportWriter<<S as SplittableStream>::WriteHalf>,
 >;
 
+/// This impl covers every provider `P`, so a call names `P` where no other
+/// type names it, as [`TokioListener`] shows under `# Provider`.
 #[cfg(all(
 	feature = "transport-multiplex",
 	any(feature = "transport-cms", feature = "transport-hpke")
 ))]
-impl<S> TcpTransport<S>
+impl<S, P> TcpTransport<S, P>
 where
 	S: SplittableStream,
+	P: HandshakeProvider,
 	TransportError: From<S::Error>,
 {
 	/// Consume a handshaken transport into its multiplexed plane.
@@ -347,7 +385,7 @@ where
 	/// # Role
 	///
 	/// The caller passes the endpoint role that it assembles. Unlike the
-	/// [`MuxConnector`] and `MuxAcceptor` pool traits, this method works for
+	/// [`MuxConnector`] and [`MuxAcceptor`] pool traits, this method works for
 	/// either role without the policy plane, so WebSocket transports, native
 	/// and wasm, assemble the same way.
 	///
@@ -355,7 +393,7 @@ where
 	///
 	/// - [`TransportError::InvalidState`] -- the peer did not negotiate
 	///   multiplexing, or the handshake has not completed.
-	/// - A rekey harvest or split failure from the underlying transport.
+	/// - The errors of [`Self::into_split`], and the error of a rekey context that fails to detach.
 	pub fn into_mux(mut self, role: MuxRole) -> TransportResult<SplitMuxTransport<S>> {
 		let Some(settings) = self.negotiated_mux() else {
 			return Err(TransportError::InvalidState);
@@ -386,13 +424,16 @@ where
 	}
 }
 
+/// This impl covers every provider `P`, so a call names `P` where no other
+/// type names it, as [`TokioListener`] shows under `# Provider`.
 #[cfg(all(
 	feature = "transport-multiplex",
 	any(feature = "transport-cms", feature = "transport-hpke")
 ))]
-impl<S> MuxConnector for TcpTransport<S>
+impl<S, P> MuxConnector for TcpTransport<S, P>
 where
 	S: SplittableStream,
+	P: HandshakeProvider,
 	S::ReadHalf: MaybeSend + 'static,
 	S::WriteHalf: MaybeSend + 'static,
 	TransportError: From<S::Error>,
@@ -417,13 +458,16 @@ where
 	}
 }
 
+/// This impl covers every provider `P`, so a call names `P` where no other
+/// type names it, as [`TokioListener`] shows under `# Provider`.
 #[cfg(all(
 	feature = "transport-multiplex",
 	any(feature = "transport-cms", feature = "transport-hpke")
 ))]
-impl<S> MuxAcceptor for TcpTransport<S>
+impl<S, P> MuxAcceptor for TcpTransport<S, P>
 where
 	S: SplittableStream,
+	P: HandshakeProvider,
 	S::ReadHalf: MaybeSend + 'static,
 	S::WriteHalf: MaybeSend + 'static,
 	TransportError: From<S::Error>,
@@ -493,7 +537,7 @@ impl SplitRecv {
 	/// transport envelope it carries: a cleartext envelope as it arrived, or
 	/// the content of a record this half's receive cipher opened in place.
 	///
-	/// An arrival of the other mode is refused before any decode.
+	/// The half refuses an arrival of the other mode before any decode.
 	///
 	/// # Errors
 	///
@@ -593,8 +637,8 @@ where
 		let wire_bytes = self.stream.read_frame(policy.cap()).await?;
 
 		// A record opens in the buffer it arrived in, so the buffer wipes when
-		// it drops. The outer tag names the mode, so the half refuses another
-		// mode than its own before any decode.
+		// it drops. The outer tag names the mode, so the half refuses a mode
+		// other than its own before any decode.
 		let mut wire_bytes = Zeroizing::new(wire_bytes);
 		let arriving = WireEnvelope::admit(&mut wire_bytes)?;
 		let contents = self.mode.admit(arriving)?;
@@ -765,14 +809,15 @@ where
 	///
 	/// - An established session moves its receive key into the
 	///   [`TransportReader`] and its send key into the [`TransportWriter`].
-	///   Directional keys make this a clean ownership transfer with no shared
-	///   mutable crypto state.
+	///   Directional keys make this a transfer of ownership, so the halves
+	///   share no mutable cryptographic state.
 	/// - A transport named cleartext splits into cleartext halves, which carry
 	///   NO confidentiality, integrity, replay, or deletion protection.
 	///
 	/// The operation deadline carries onto both halves and bounds every read
-	/// and write, as on the unsplit path. An idle or byte-dripping peer
-	/// surfaces as `DeadlineExceeded` instead of pinning the driver task.
+	/// and write, as on the unsplit path. A peer that goes idle, or sends a
+	/// byte at a time, ends the call with
+	/// [`TransportFailure::DeadlineExceeded`], so the driver task stays free.
 	///
 	/// # Errors
 	///
@@ -821,8 +866,8 @@ where
 
 #[cfg(feature = "tokio")]
 impl<P: CryptoProvider + Send + Sync + 'static> AsyncListenerTrait for TokioListener<P> {
-	/// This delegates to the inherent accept, so both entry points install
-	/// the full listener state.
+	/// It delegates to the inherent [`TokioListener::accept`], so both entry
+	/// points install the full listener state.
 	async fn accept(&self) -> Result<(Self::Transport, Self::Address), Self::Error> {
 		{
 			let (transport, peer_addr) = TokioListener::<P>::accept(self).await?;
@@ -835,7 +880,9 @@ impl<P: CryptoProvider + Send + Sync + 'static> AsyncListenerTrait for TokioList
 // implementations.
 crate::impl_tcp_common!(TcpTransport, AsyncProtocolStream);
 
-impl<S: AsyncProtocolStream> MessageIO for TcpTransport<S>
+/// This impl covers every provider `P`, so a call names `P` where no other
+/// type names it, as [`TokioListener`] shows under `# Provider`.
+impl<S: AsyncProtocolStream, P: CryptoProvider + Send + Sync + 'static> MessageIO for TcpTransport<S, P>
 where
 	TransportError: From<S::Error>,
 {
@@ -877,7 +924,9 @@ where
 	}
 }
 
-impl<S: AsyncProtocolStream> MessageCollector for TcpTransport<S>
+/// This impl covers every provider `P`, so a call names `P` where no other
+/// type names it, as [`TokioListener`] shows under `# Provider`.
+impl<S: AsyncProtocolStream, P: HandshakeProvider> MessageCollector for TcpTransport<S, P>
 where
 	TransportError: From<S::Error>,
 {
@@ -903,7 +952,9 @@ where
 	}
 }
 
-impl<S: AsyncProtocolStream> MessageEmitter for TcpTransport<S>
+/// This impl covers every provider `P`, so a call names `P` where no other
+/// type names it, as [`TokioListener`] shows under `# Provider`.
+impl<S: AsyncProtocolStream, P: HandshakeProvider> MessageEmitter for TcpTransport<S, P>
 where
 	TransportError: From<S::Error>,
 {
@@ -1213,7 +1264,7 @@ mod tests {
 			TransportLimits { operation_timeout: Duration::from_secs(1), ..TransportLimits::default() }
 		}
 
-		/// A cleartext half is bounded by the operation deadline like an
+		/// The operation deadline bounds a cleartext half as it bounds an
 		/// encrypted one, so a stalled peer cannot pin its task (CWE-400).
 		#[tokio::test(start_paused = true)]
 		async fn a_cleartext_reader_gives_up_at_the_operation_deadline() {
@@ -1421,15 +1472,15 @@ mod tests {
 		TcpTransport::new(TokioStream::from(stream), EndpointConfig::cleartext())
 	}
 
-	/// A CMS client holding a signing identity, and `trust_store` if one is
-	/// given.
+	/// A CMS client that holds a signing identity, and `trust_store` when the
+	/// caller gives one.
 	#[cfg(feature = "transport-cms")]
 	fn cms_test_client(stream: TcpStream, trust_store: Option<Arc<dyn CertificateTrust>>) -> TcpTransport<TokioStream> {
 		let identity = TestIdentity::insecure_fixed();
 
-		// Without a trust store the client names cleartext, which is the only
-		// way to build it, and the handshake it is then driven through must
-		// still refuse to run blind.
+		// Without a trust store, the dialer rule builds the client only when it
+		// names cleartext. The handshake the test then drives must still refuse
+		// to run blind.
 		let allow_cleartext = trust_store.is_none();
 		let encryption = EncryptionConfig {
 			trust_store,
@@ -1495,7 +1546,8 @@ mod tests {
 	async fn cms_server_without_key_agreement_identity_fails_closed() -> TransportResult<()> {
 		let (_listener, stream) = bind_and_connect().await?;
 		let server = TestCmsServer::generate("Test Server");
-		let endpoint = EndpointConfig::try_from(TransportEncryptionConfig::new(server.signing_identity()))?;
+		let config = TransportEncryptionConfig::<DefaultCryptoProvider>::new(server.signing_identity());
+		let endpoint = EndpointConfig::try_from(config)?;
 		let transport = TcpTransport::new(TokioStream::from(stream), endpoint);
 		let mut transport = transport.with_handshake_protocol(HandshakeProtocolKind::Cms);
 		let opening = HandshakeMessage::try_from(create_test_signed_data(b"opening"))?;
@@ -1513,7 +1565,8 @@ mod tests {
 		let (_listener, stream) = bind_and_connect().await?;
 		// Client validators provision the endpoint, which presents no identity.
 		let peer_authentication = PeerAuthentication::mutual([refusing_validator()]);
-		let encryption = EncryptionConfig { peer_authentication, ..EncryptionConfig::unconfigured() };
+		let unconfigured = EncryptionConfig::<DefaultCryptoProvider>::unconfigured();
+		let encryption = EncryptionConfig { peer_authentication, ..unconfigured };
 		let encryption = DialableEncryption::new(encryption)?;
 		let endpoint = EndpointConfig::new(encryption, Arc::new(SystemClock));
 		let mut transport = TcpTransport::new(TokioStream::from(stream), endpoint);
@@ -1610,7 +1663,7 @@ mod tests {
 	}
 
 	/// An HPKE client whose store holds the root alone admits a server whose
-	/// signing certificate an intermediate issued, since the endpoint's trust
+	/// signing certificate an intermediate issued, because the endpoint's trust
 	/// validates the path the reply presents to that root (RFC 5280 §6.1).
 	#[cfg(feature = "transport-hpke")]
 	#[tokio::test]
@@ -1800,10 +1853,10 @@ mod tests {
 		Ok(())
 	}
 
-	/// The gossip membership proof reads the peer certificate before any
-	/// request is disclosed (CWE-668), so the deferred single-flight handshake
-	/// must be drivable on its own. It populates the peer certificate and sends
-	/// no application frame, and a repeat does nothing.
+	/// The gossip membership proof reads the peer certificate before the
+	/// gateway discloses any request (CWE-668), so the deferred single-flight
+	/// handshake must run on its own. It populates the peer certificate and
+	/// sends no application frame, and a repeat does nothing.
 	#[cfg(feature = "transport-hpke")]
 	#[tokio::test]
 	async fn handshake_completes_alone_and_populates_peer_certificate() -> TransportResult<()> {

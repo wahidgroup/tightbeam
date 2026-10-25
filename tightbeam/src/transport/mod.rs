@@ -1,8 +1,8 @@
 //! Transport layer for the TightBeam protocol.
 
-// Cargo features express "any of" alone, so a protocol-less TCP transport
-// would compile without a handshake or message collection. Fail the build
-// early with a clear message.
+// A Cargo feature can require only all of a list, so `tcp` alone would
+// compile a transport with no handshake and no message collection. The build
+// fails here and names the protocol features to enable.
 #[cfg(all(
 	any(feature = "tcp", feature = "async-transport"),
 	not(any(feature = "transport-cms", feature = "transport-hpke"))
@@ -125,8 +125,8 @@ impl TransportLimits {
 	/// Returns the largest envelope this endpoint reads before parsing decides
 	/// which ceiling applies.
 	///
-	/// A reader cannot know whether the bytes are a cleartext or an encrypted
-	/// envelope until it has them, so it admits the larger ceiling and the
+	/// A reader learns whether the bytes are a cleartext or an encrypted
+	/// envelope only once it has them, so it admits the larger ceiling, and the
 	/// per-mode check runs once the wire form is known.
 	#[must_use]
 	pub fn max_envelope(&self) -> usize {
@@ -159,6 +159,12 @@ impl Default for TransportLimits {
 	}
 }
 
+/// The configuration of a server endpoint under provider `P`: the identity it
+/// presents, how it authenticates its client, the key purposes its handshakes
+/// admit, and the ceilings it enforces.
+///
+/// It converts into [`DialableEncryption`] through
+/// [`DialableEncryption::new`], the one guard of every provisioning.
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct TransportEncryptionConfig<P: CryptoProvider> {
@@ -181,11 +187,11 @@ impl<P: CryptoProvider> TryFrom<TransportEncryptionConfig<P>> for DialableEncryp
 
 	/// The one place a server's configuration becomes provisioning.
 	///
-	/// It answers through [`DialableEncryption::new`], the one guard of every
-	/// provisioning. A server presents a certificate, which answers for the
-	/// peer, so the dialer rule holds for every configuration of this shape,
-	/// and the identity is admitted for the server purpose once. `limits` is
-	/// not provisioning, so [`EndpointConfig`] carries it beside this value.
+	/// The conversion runs [`DialableEncryption::new`], the one guard of every
+	/// provisioning, which admits the identity for the server purpose once. A
+	/// server presents a certificate, which answers for the peer, so the dialer
+	/// rule holds for every configuration of this shape. [`EndpointConfig`]
+	/// carries `limits` beside this value, outside provisioning.
 	///
 	/// # Errors
 	///
@@ -209,7 +215,7 @@ impl<P: CryptoProvider> TryFrom<TransportEncryptionConfig<P>> for DialableEncryp
 ///
 /// Listeners, clients, and pools each build one of these, and every transport
 /// constructor takes it whole, so every transport holds all four. A clone
-/// bumps refcounts, so it shares each certificate with the original.
+/// copies `Arc` handles, so it shares each certificate with the original.
 pub struct EndpointConfig<P: CryptoProvider> {
 	pub(crate) encryption: DialableEncryption<P>,
 	pub(crate) negotiation: Negotiation,
@@ -274,7 +280,7 @@ impl<P: CryptoProvider> EndpointConfig<P> {
 		self
 	}
 
-	/// Return the provisioning this endpoint was given.
+	/// Return the provisioning this endpoint holds.
 	pub fn encryption(&self) -> &EncryptionConfig<P> {
 		self.encryption.encryption()
 	}
@@ -298,8 +304,8 @@ impl<P: CryptoProvider> Clone for EndpointConfig<P> {
 	}
 }
 
-/// A server endpoint on the operating system's clocks, enforcing the
-/// ceilings `config` names.
+/// Converts a server configuration into an endpoint on the operating system's
+/// clocks that enforces the ceilings `config` names.
 #[cfg(host_clock)]
 impl<P: CryptoProvider> TryFrom<TransportEncryptionConfig<P>> for EndpointConfig<P> {
 	type Error = TransportError;
@@ -339,8 +345,8 @@ impl<P: CryptoProvider> TransportEncryptionConfig<P> {
 	/// # Empty set
 	///
 	/// [`PeerAuthentication::mutual`] decides that an empty set demands
-	/// nothing, so an empty set leaves the endpoint where it was and never
-	/// turns mutual authentication off.
+	/// nothing, so an empty set leaves the endpoint where it was, and an
+	/// endpoint that demands mutual authentication keeps demanding it.
 	#[must_use]
 	pub fn with_client_validators(
 		mut self,
@@ -463,11 +469,12 @@ mod tests {
 		use std::sync::{mpsc, Arc};
 
 		use crate::asn1::Frame;
+		use crate::crypto::profiles::DefaultCryptoProvider;
 		use crate::transport::policy::RestartLinearBackoff;
 		use crate::transport::tcp::r#async::TokioListener;
 		use crate::transport::tcp::TightBeamSocketAddr;
 
-		let listener = TokioListener::bind_cleartext("127.0.0.1:0").await?;
+		let listener = TokioListener::<DefaultCryptoProvider>::bind_cleartext("127.0.0.1:0").await?;
 		let addr = TightBeamSocketAddr(listener.local_addr()?);
 
 		let (tx, rx) = mpsc::channel();
@@ -509,7 +516,7 @@ mod tests {
 		Ok(())
 	}
 
-	/// A builder that was told nothing about limits still has them.
+	/// A builder with no configured limits still enforces the defaults.
 	///
 	/// A default endpoint reads cleartext under a bound. Every other limit test
 	/// sets a ceiling explicitly, so only this test covers the default.
@@ -520,8 +527,8 @@ mod tests {
 		assert!(limits.encrypted_envelope > 0);
 		assert!(limits.handshake_wire > 0);
 
-		// A payload past the default ceiling is refused without the caller
-		// having configured anything.
+		// The builder refuses a payload past the default ceiling, though the
+		// caller configured nothing.
 		let oversized = "a".repeat(limits.cleartext_envelope + 1);
 		let frame = TestFrame::v0(Some(&oversized), None);
 		let result = builders::EnvelopeBuilder::request(frame).finish();
@@ -534,10 +541,10 @@ mod tests {
 	/// The encrypted ceiling measures the sealed wire form instead of the
 	/// plaintext.
 	///
-	/// With a ceiling set to exactly the plaintext length, the payload must
-	/// still be refused. The AEAD tag, the nonce, and the `WireEnvelope`
-	/// wrapper are all added after encoding, so a measurement before them would
-	/// let an oversized envelope reach the peer as a connection reset.
+	/// With a ceiling of exactly the plaintext length, the builder must still
+	/// refuse the payload. The AEAD tag, the nonce, and the `WireEnvelope`
+	/// wrapper all come after encoding, so a measurement before them would let
+	/// an oversized envelope reach the peer as a connection reset.
 	#[test]
 	fn encrypted_ceiling_measures_the_sealed_wire_form() -> Result<(), Box<dyn Error>> {
 		use crate::crypto::aead::{RecordDirection, RuntimeAead, SendCipher};

@@ -60,6 +60,11 @@ pub enum CertificateValidationError {
 	#[error("Certificate is denied")]
 	CertificateDenied,
 
+	/// A configured fingerprint differs in width from the output of its
+	/// digest, so it names no certificate.
+	#[error("Fingerprint length mismatch: {0}")]
+	FingerprintLength(crate::error::ReceivedExpectedError<usize, usize>),
+
 	/// The certificate encoding is invalid.
 	#[error("Invalid certificate encoding")]
 	InvalidCertificateEncoding,
@@ -68,8 +73,8 @@ pub enum CertificateValidationError {
 	#[error("Certificate not trusted")]
 	CertificateNotTrusted,
 
-	/// The certificate chain is invalid, because the issuer of a certificate
-	/// is another name than the subject of the certificate above it.
+	/// The certificate chain is invalid, because the issuer name of a
+	/// certificate differs from the subject name of the certificate above it.
 	#[error("Certificate chain broken at issuer {issuer} and subject {subject}")]
 	InvalidChain {
 		/// The issuer name of the lower certificate.
@@ -78,10 +83,11 @@ pub enum CertificateValidationError {
 		subject: String,
 	},
 
-	/// Two certificates of a presented path carry as subject the issuer name
-	/// of one certificate, so the path names no single issuer above it. A
-	/// self-issued certificate names itself as issuer, so a chain that sets
-	/// another certificate of its name above it holds two.
+	/// Two certificates of a presented path carry the issuer name of one
+	/// certificate as their subject, so the path names no single issuer above
+	/// that certificate. A self-issued certificate names itself as its issuer,
+	/// so a chain that sets another certificate of the same name above it
+	/// holds two.
 	#[error("Certificate path holds two issuers named {issuer}")]
 	AmbiguousIssuer {
 		/// The issuer name that two certificates carry.
@@ -136,9 +142,9 @@ pub enum CertificateValidationError {
 	#[error("Certificate keyUsage does not assert {0:?}")]
 	MissingKeyUsage(crate::crypto::x509::ext::pkix::KeyUsages),
 
-	/// The `keyUsage` extension asserts a bit that restricts the use away
-	/// from what the certificate is read for, as `decipherOnly` restricts
-	/// `keyAgreement` (RFC 5280 §4.2.1.3).
+	/// The `keyUsage` extension asserts a bit that narrows the use the
+	/// certificate is read for, as `decipherOnly` narrows `keyAgreement` to
+	/// decipherment (RFC 5280 §4.2.1.3).
 	#[error("Certificate keyUsage restricts the use with {0:?}")]
 	ExcludedKeyUsage(crate::crypto::x509::ext::pkix::KeyUsages),
 
