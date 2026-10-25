@@ -200,11 +200,14 @@ where
 	}
 
 	/// A breadth-first traversal with a per-state and a per-transition
-	/// callback, which the failure computation runs on.
+	/// callback, which the failure and divergence computations run on.
 	///
-	/// `on_state` returns `true` to skip the transitions of a state. The
-	/// returned `bool` is `true` when the traversal ran to exhaustion and
-	/// `false` when the queue or visited limit truncated it.
+	/// - `on_state` returns `true` to skip the transitions of a state.
+	/// - A state whose trace holds `max_depth` events is still visited, and
+	///   takes its hidden steps alone. The traversal therefore covers each trace
+	///   of at most `max_depth` events, as `compute_traces` does.
+	/// - The returned `bool` is `true` when the traversal ran to exhaustion, and
+	///   `false` when the queue limit, the visited limit, or the timeout cut it.
 	fn bfs_with_callbacks<T, FState, FTransition>(
 		&self,
 		process: &Process,
@@ -217,19 +220,17 @@ where
 		FState: FnMut(&mut T, State, &Trace, usize) -> bool,
 		FTransition: FnMut(&mut T, &mut VecDeque<(State, Trace, usize)>, State, Trace, usize, &Event, State),
 	{
+		let timeout_checker = TimeoutChecker::new(self.config.timeout_ms);
 		let mut queue = VecDeque::new();
 		let mut visited = HashSet::new();
 		let mut complete = true;
 		queue.push_back((process.initial, Vec::new(), 0usize));
 
 		while let Some((state, trace, depth)) = queue.pop_front() {
-			if queue.len() >= Self::max_queue_size() || visited.len() >= Self::max_visited() {
+			let at_a_limit = queue.len() >= Self::max_queue_size() || visited.len() >= Self::max_visited();
+			if at_a_limit || timeout_checker.is_expired() {
 				complete = false;
 				break;
-			}
-
-			if trace.len() >= max_depth {
-				continue;
 			}
 
 			let visit_key = (state, trace.clone());
@@ -243,7 +244,14 @@ where
 				continue;
 			}
 
+			// A hidden step keeps the trace's length, so a state at the bound
+			// still takes it.
+			let at_the_bound = trace.len() >= max_depth;
 			for action in process.enabled(state) {
+				if at_the_bound && !process.hidden.contains(&action.event) {
+					continue;
+				}
+
 				for next_state in process.step(state, &action.event) {
 					on_transition(&mut data, &mut queue, state, trace.clone(), depth, &action.event, next_state);
 				}
@@ -557,8 +565,9 @@ where
 	/// that the process reaches can diverge.
 	///
 	/// [`Process::divergent_states`] decides each state once, and the search
-	/// reads that answer at each state and trace it reaches, up to
-	/// `max_depth`.
+	/// reads that answer at each state and trace it reaches. It runs on
+	/// [`Self::bfs_with_callbacks`], so the divergences and the failures share
+	/// one depth bound, one set of limits, and one timeout.
 	fn compute_divergences(&mut self, process: &Process, max_depth: usize) -> (HashSet<Trace>, bool) {
 		let structure = process.structure_digest();
 		if let Some((cached, complete)) = self.cache.borrow().get_cached_divergences(structure) {
@@ -566,34 +575,27 @@ where
 		}
 
 		let divergent = process.divergent_states();
-		let mut divergences = HashSet::new();
-		let mut queue = VecDeque::from([(process.initial, Vec::new())]);
-		let mut visited = HashSet::new();
-
-		while let Some((state, trace)) = queue.pop_front() {
-			if trace.len() >= max_depth {
-				continue;
-			}
-			if !visited.insert((state, trace.clone())) {
-				continue;
-			}
-
-			if divergent.contains(state) {
-				divergences.insert(trace.clone());
-			}
-
-			for action in process.enabled(state) {
-				for next_state in process.step(state, &action.event) {
-					let (next_trace, _depth) = Self::process_transition(process, &action.event, trace.clone(), 0);
-					queue.push_back((next_state, next_trace));
+		let (divergences, complete) = self.bfs_with_callbacks(
+			process,
+			max_depth,
+			HashSet::new(),
+			|divergences, state, trace, _depth| {
+				if divergent.contains(state) {
+					divergences.insert(trace.clone());
 				}
-			}
-		}
+
+				false
+			},
+			|_divergences, queue, _state, trace, depth, event, next_state| {
+				let (next_trace, next_depth) = Self::process_transition(process, event, trace, depth);
+				queue.push_back((next_state, next_trace, next_depth));
+			},
+		);
 
 		let divergences_vec: Vec<Trace> = divergences.iter().cloned().collect();
-		self.cache.borrow_mut().cache_divergences(structure, divergences_vec, true);
+		self.cache.borrow_mut().cache_divergences(structure, divergences_vec, complete);
 
-		(divergences, true)
+		(divergences, complete)
 	}
 }
 
@@ -605,7 +607,7 @@ mod tests {
 	use std::sync::Arc;
 
 	use super::DefaultRefinementChecker;
-	use crate::testing::fdr::{DefaultCache, FdrConfig, RefinementChecker};
+	use crate::testing::fdr::{DefaultCache, FdrConfig, RefinementChecker, RefinementOutcome};
 	use crate::testing::specs::csp::{Event, Process, ProcessBuildError, State};
 
 	/// A process that can stop at `Idle`, where it still offers `a`, and at
@@ -638,10 +640,52 @@ mod tests {
 			.build()
 	}
 
+	/// A process that takes `a`, then spins on the hidden `t` at `S1`, so it
+	/// can diverge after one event.
+	fn spinning_after_a() -> Result<Process, ProcessBuildError> {
+		Process::builder("SpinningAfterA")
+			.initial_state(State("S0"))
+			.add_observable(Event("a"))
+			.add_hidden(Event("t"))
+			.add_transition(State("S0"), Event("a"), State("S1"))
+			.add_transition(State("S1"), Event("t"), State("S1"))
+			.build()
+	}
+
+	/// A process that takes `a`, then `b`, then spins on the hidden `t` at
+	/// `S2`, so it can diverge after two events.
+	fn spinning_after_a_b() -> Result<Process, ProcessBuildError> {
+		Process::builder("SpinningAfterAB")
+			.initial_state(State("S0"))
+			.add_observable(Event("a"))
+			.add_observable(Event("b"))
+			.add_hidden(Event("t"))
+			.add_transition(State("S0"), Event("a"), State("S1"))
+			.add_transition(State("S1"), Event("b"), State("S2"))
+			.add_transition(State("S2"), Event("t"), State("S2"))
+			.build()
+	}
+
+	/// A process that takes `a`, then stops at `S1`, which can diverge
+	/// nowhere.
+	fn stopping_after_a() -> Result<Process, ProcessBuildError> {
+		Process::builder("StoppingAfterA")
+			.initial_state(State("S0"))
+			.add_observable(Event("a"))
+			.add_transition(State("S0"), Event("a"), State("S1"))
+			.add_terminal(State("S1"))
+			.build()
+	}
+
 	/// The checker of `process` under the default configuration.
 	fn checker_of(process: &Process) -> DefaultRefinementChecker<'_, DefaultCache> {
+		checker_under(process, FdrConfig::default())
+	}
+
+	/// The checker of `process` under `config`.
+	fn checker_under(process: &Process, config: FdrConfig) -> DefaultRefinementChecker<'_, DefaultCache> {
 		let cache = Rc::new(RefCell::new(DefaultCache::new()));
-		DefaultRefinementChecker::new(process, Arc::new(FdrConfig::default()), cache)
+		DefaultRefinementChecker::new(process, Arc::new(config), cache)
 	}
 
 	#[test]
@@ -650,7 +694,6 @@ mod tests {
 		let mut checker = checker_of(&process);
 
 		let (divergences, _complete) = checker.compute_divergences(&process, 8);
-
 		let after_a = HashSet::from([vec![Event("a")]]);
 		assert_eq!(divergences, after_a, "`S1` and `S2` can spin after `a`");
 		Ok(())
@@ -662,9 +705,61 @@ mod tests {
 		let mut checker = checker_of(&process);
 
 		let (failures, _complete) = checker.compute_failures(&process, 8);
-
 		let refused_at_idle = (vec![], HashSet::from([Event("a"), Event("b")]));
 		assert!(failures.contains(&refused_at_idle), "the failures were {failures:?}");
+		Ok(())
+	}
+
+	#[test]
+	fn a_divergence_after_max_depth_events_is_a_divergence() -> Result<(), ProcessBuildError> {
+		let process = spinning_after_a()?;
+		let mut checker = checker_of(&process);
+
+		let (divergences, _complete) = checker.compute_divergences(&process, 1);
+		let after_a = HashSet::from([vec![Event("a")]]);
+		assert_eq!(divergences, after_a, "`S1` spins after one event, the bound");
+		Ok(())
+	}
+
+	#[test]
+	fn a_failure_after_max_depth_events_is_a_failure() -> Result<(), ProcessBuildError> {
+		let process = spinning()?;
+		let mut checker = checker_of(&process);
+
+		let (failures, _complete) = checker.compute_failures(&process, 2);
+		let refused_at_s3 = (vec![Event("a"), Event("b")], HashSet::from([Event("a"), Event("b")]));
+		assert!(failures.contains(&refused_at_s3), "the failures were {failures:?}");
+		Ok(())
+	}
+
+	#[test]
+	fn the_search_takes_no_observable_step_past_max_depth() -> Result<(), ProcessBuildError> {
+		let process = spinning_after_a_b()?;
+		let mut checker = checker_of(&process);
+
+		let (divergences, _complete) = checker.compute_divergences(&process, 1);
+		assert!(divergences.is_empty(), "`S2` lies two events deep, past the bound of one");
+		Ok(())
+	}
+
+	#[test]
+	fn divergence_refinement_refutes_a_divergence_at_the_depth_bound() -> Result<(), ProcessBuildError> {
+		let spec = stopping_after_a()?;
+		let subject = spinning_after_a()?;
+		let mut checker = checker_under(&spec, FdrConfig { max_depth: 1, ..Default::default() });
+
+		let outcome = checker.check_divergence_refinement(&spec, &subject);
+		assert_eq!(outcome, RefinementOutcome::Violated(vec![Event("a")]));
+		Ok(())
+	}
+
+	#[test]
+	fn a_divergence_search_past_its_timeout_is_incomplete() -> Result<(), ProcessBuildError> {
+		let process = spinning()?;
+		let mut checker = checker_under(&process, FdrConfig { timeout_ms: 0, ..Default::default() });
+
+		let (_divergences, complete) = checker.compute_divergences(&process, 8);
+		assert!(!complete, "a search that ran out of time claims no completeness");
 		Ok(())
 	}
 }
