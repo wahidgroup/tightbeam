@@ -90,6 +90,18 @@ impl Action {
 	pub fn is_hidden(&self) -> bool {
 		matches!(self.alphabet, Alphabet::Hidden)
 	}
+
+	/// Whether a search whose trace holds the events of `trace` takes this
+	/// action under a bound of `max_depth` observable events.
+	///
+	/// An observable action extends the trace, so a search takes it while the
+	/// trace holds fewer than `max_depth` events. A hidden action keeps the
+	/// trace's length, so a search takes it at the bound as well.
+	#[cfg(feature = "testing-fdr")]
+	pub(crate) fn keeps_within(&self, trace: impl AsRef<[Event]>, max_depth: usize) -> bool {
+		let below_the_bound = trace.as_ref().len() < max_depth;
+		below_the_bound || self.is_hidden()
+	}
 }
 
 /// Result of CSP process validation

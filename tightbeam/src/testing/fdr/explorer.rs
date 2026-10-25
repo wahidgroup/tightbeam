@@ -180,13 +180,15 @@ pub trait RefinementChecker {
 	/// Computes every failure of `process` up to `max_depth`.
 	///
 	/// The `bool` is true when the failure set is complete up to
-	/// `max_depth`, and false when a resource limit cut the search short.
+	/// `max_depth`, and false when a timeout or a resource limit cut the
+	/// search short.
 	fn compute_failures(&mut self, process: &Process, max_depth: usize) -> (Vec<Failure>, bool);
 
-	/// Computes every divergence of `process` up to `max_depth`.
+	/// Computes each trace of `process`, up to `max_depth` events, after which
+	/// a state that the process reaches can diverge.
 	///
-	/// The `bool` is true when the divergence set is complete up to
-	/// `max_depth`.
+	/// The `bool` is true when the set is complete up to `max_depth`, and false
+	/// when a timeout or a resource limit cut the search short.
 	fn compute_divergences(&mut self, process: &Process, max_depth: usize) -> (HashSet<Trace>, bool);
 
 	/// The refusal set that a failure of `process` records at `state`, or

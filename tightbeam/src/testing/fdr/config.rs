@@ -316,9 +316,10 @@ pub struct FdrConfig {
 	/// cycle of hidden events, whatever its length.
 	pub max_internal_run: usize,
 
-	/// The time budget, in milliseconds, of each trace search that the
-	/// refinement checker runs. A search that spends it stops with an
-	/// incomplete answer.
+	/// The time budget, in milliseconds, of each search that the refinement
+	/// checker runs: the trace, failure, and divergence searches of a process,
+	/// and the search of a spec for the traces of the impl. A search that
+	/// spends it stops with an incomplete answer.
 	pub timeout_ms: u64,
 
 	/// The specification processes for refinement checking. When the list

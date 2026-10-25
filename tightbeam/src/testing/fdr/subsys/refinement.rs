@@ -12,7 +12,7 @@ use std::time::Duration;
 use crate::testing::fdr::config::FdrConfig;
 use crate::testing::fdr::explorer::{MemoizationCache, RefinementChecker, RefinementOutcome};
 use crate::testing::fdr::verdict::{Failure, Trace};
-use crate::testing::specs::csp::{Event, Process, State};
+use crate::testing::specs::csp::{Action, Event, Process, State};
 use crate::utils::time::{Clock, MonotonicInstant, SystemClock};
 
 /// The result of a search for a single trace in a specification.
@@ -97,136 +97,46 @@ where
 		queue_len >= Self::max_queue_size() || visited_len >= Self::max_visited() || traces_count >= Self::max_traces()
 	}
 
-	/// Applies one transition to a trace. A τ-transition leaves the trace and
-	/// the depth as they are, and an observable event extends both.
-	fn process_transition(process: &Process, event: &Event, trace: Trace, depth: usize) -> (Trace, usize) {
-		if process.hidden.contains(event) {
-			(trace, depth)
+	/// Applies one step to a trace. A hidden step leaves the trace as it is,
+	/// and an observable step extends it by its event.
+	fn process_transition(trace: Trace, action: &Action) -> Trace {
+		if action.is_hidden() {
+			trace
 		} else {
 			let mut new_trace = trace;
-			new_trace.push(*event);
-			(new_trace, depth + 1)
+			new_trace.push(action.event);
+			new_trace
 		}
 	}
 
-	/// Extracts the trace of a linear process, which has a single
-	/// deterministic path.
+	/// A breadth-first traversal with a per-state callback, which the failure
+	/// and divergence computations run on.
 	///
-	/// Returns `None` when the process is not linear: it branches, cycles,
-	/// deadlocks, runs to `max_depth`, or passes 1000 visited states.
-	fn extract_linear_trace(process: &Process, max_depth: usize) -> Option<Trace> {
-		let mut trace = Vec::new();
-		let mut current_state = process.initial;
-		let mut visited_states = HashSet::new();
-		visited_states.insert(current_state);
-
-		loop {
-			if process.terminal.contains(&current_state) {
-				return Some(trace);
-			}
-
-			if trace.len() >= max_depth {
-				return None; // A walk at the depth limit is not linear.
-			}
-
-			// The depth limit counts observable events only, so this bound
-			// stops a long run of τ-transitions.
-			if visited_states.len() > 1000 {
-				return None; // A walk past 1000 states counts as not linear.
-			}
-
-			// Follow the τ-transitions (hidden events) first, one at a time,
-			// until the state enables none. They leave the trace as it is.
-			let mut has_tau_transitions = true;
-			while has_tau_transitions {
-				has_tau_transitions = false;
-				let current_enabled = process.enabled(current_state);
-				for action in &current_enabled {
-					if process.hidden.contains(&action.event) {
-						let next_states = process.step(current_state, &action.event);
-						if next_states.len() != 1 {
-							return None; // Two τ targets make a branch.
-						}
-						current_state = next_states[0];
-
-						if !visited_states.insert(current_state) {
-							return None; // A revisited state is a cycle.
-						}
-
-						has_tau_transitions = true;
-						break; // The scan starts again at the next state.
-					}
-				}
-
-				if process.terminal.contains(&current_state) {
-					return Some(trace);
-				}
-			}
-
-			// The state is stable here, so only observable actions remain.
-			let stable_enabled = process.enabled(current_state);
-			let observable_actions: Vec<_> = stable_enabled
-				.iter()
-				.filter(|action| !process.hidden.contains(&action.event))
-				.collect();
-
-			// A linear process enables at most one observable action.
-			if observable_actions.len() > 1 {
-				return None; // A branch on observable events is not linear.
-			}
-
-			if let Some(action) = observable_actions.first() {
-				let next_states = process.step(current_state, &action.event);
-
-				// A linear process has exactly one next state.
-				if next_states.len() != 1 {
-					return None; // A nondeterministic step is not linear.
-				}
-
-				trace.push(action.event);
-				current_state = next_states[0];
-
-				if !visited_states.insert(current_state) {
-					return None; // A revisited state is a cycle.
-				}
-			} else {
-				// The state enables no action, so it is terminal or a deadlock.
-				if process.terminal.contains(&current_state) {
-					return Some(trace);
-				}
-				return None; // A deadlock is not a linear trace.
-			}
-		}
-	}
-
-	/// A breadth-first traversal with a per-state and a per-transition
-	/// callback, which the failure and divergence computations run on.
-	///
-	/// - `on_state` returns `true` to skip the transitions of a state.
-	/// - A state whose trace holds `max_depth` events is still visited, and
-	///   takes its hidden steps alone. The traversal therefore covers each trace
-	///   of at most `max_depth` events, as `compute_traces` does.
-	/// - The returned `bool` is `true` when the traversal ran to exhaustion, and
-	///   `false` when the queue limit, the visited limit, or the timeout cut it.
-	fn bfs_with_callbacks<T, FState, FTransition>(
+	/// - `on_state` runs once at each pair of state and trace that the traversal reaches.
+	/// - A state takes each step that [`Action::keeps_within`] admits, so a
+	///   state whose trace holds `max_depth` events is visited and takes its
+	///   hidden steps alone. The traversal therefore covers each trace of at
+	///   most `max_depth` events.
+	/// - The returned `bool` is `true` when the traversal ran to exhaustion,
+	///   and `false` when the queue limit, the visited limit, or the timeout
+	///   cut it.
+	fn bfs_with_callbacks<T, FState>(
 		&self,
 		process: &Process,
 		max_depth: usize,
 		mut data: T,
 		mut on_state: FState,
-		mut on_transition: FTransition,
 	) -> (T, bool)
 	where
-		FState: FnMut(&mut T, State, &Trace, usize) -> bool,
-		FTransition: FnMut(&mut T, &mut VecDeque<(State, Trace, usize)>, State, Trace, usize, &Event, State),
+		FState: FnMut(&mut T, State, &Trace),
 	{
 		let timeout_checker = TimeoutChecker::new(self.config.timeout_ms);
 		let mut queue = VecDeque::new();
 		let mut visited = HashSet::new();
 		let mut complete = true;
-		queue.push_back((process.initial, Vec::new(), 0usize));
+		queue.push_back((process.initial, Vec::new()));
 
-		while let Some((state, trace, depth)) = queue.pop_front() {
+		while let Some((state, trace)) = queue.pop_front() {
 			let at_a_limit = queue.len() >= Self::max_queue_size() || visited.len() >= Self::max_visited();
 			if at_a_limit || timeout_checker.is_expired() {
 				complete = false;
@@ -239,21 +149,18 @@ where
 			}
 			visited.insert(visit_key);
 
-			let skip_transitions = on_state(&mut data, state, &trace, depth);
-			if skip_transitions {
-				continue;
-			}
+			on_state(&mut data, state, &trace);
 
 			// A hidden step keeps the trace's length, so a state at the bound
-			// still takes it.
-			let at_the_bound = trace.len() >= max_depth;
+			// takes it.
 			for action in process.enabled(state) {
-				if at_the_bound && !process.hidden.contains(&action.event) {
+				if !action.keeps_within(&trace, max_depth) {
 					continue;
 				}
 
 				for next_state in process.step(state, &action.event) {
-					on_transition(&mut data, &mut queue, state, trace.clone(), depth, &action.event, next_state);
+					let next_trace = Self::process_transition(trace.clone(), &action);
+					queue.push_back((next_state, next_trace));
 				}
 			}
 		}
@@ -324,7 +231,7 @@ where
 
 			let next_event = &target_trace[trace_idx];
 			for action in spec.enabled(state) {
-				if spec.hidden.contains(&action.event) {
+				if action.is_hidden() {
 					for next_state in spec.step(state, &action.event) {
 						queue.push_back((next_state, trace_idx));
 					}
@@ -423,6 +330,10 @@ where
 	/// Checks divergence refinement, where spec ⊑ impl means
 	/// divergences(impl) ⊆ divergences(spec).
 	///
+	/// A divergence after a trace makes each extension of that trace a
+	/// divergence (axiom D1), so the spec covers an impl divergence when it
+	/// diverges after a prefix of it, the whole trace included.
+	///
 	/// Reference: Roscoe (1998, 2010)
 	fn check_divergence_refinement(&mut self, spec: &Process, impl_process: &Process) -> RefinementOutcome<Trace> {
 		let (spec_divergences, spec_complete) = self.compute_divergences(spec, self.config.max_depth);
@@ -432,7 +343,9 @@ where
 		ordered.sort_unstable();
 
 		for impl_div in ordered {
-			if !spec_divergences.contains(impl_div) {
+			let mut prefixes = (0..=impl_div.len()).filter_map(|end| impl_div.get(..end));
+			let covered = prefixes.any(|prefix| spec_divergences.contains(prefix));
+			if !covered {
 				if !spec_complete {
 					return RefinementOutcome::Inconclusive;
 				}
@@ -450,17 +363,6 @@ where
 			return (cached.into_iter().collect(), complete);
 		}
 
-		// A linear process yields its one trace directly, which skips the
-		// search.
-		if let Some(linear_trace) = Self::extract_linear_trace(process, max_depth) {
-			let mut traces = HashSet::new();
-			traces.insert(linear_trace.clone());
-
-			self.cache.borrow_mut().cache_traces(structure, vec![linear_trace], true);
-
-			return (traces, true);
-		}
-
 		let timeout_checker = TimeoutChecker::new(self.config.timeout_ms);
 		let mut traces = HashSet::new();
 		traces.insert(Vec::new());
@@ -469,9 +371,9 @@ where
 		let mut queue = VecDeque::new();
 		let mut visited = HashSet::new();
 
-		queue.push_back((process.initial, Vec::new(), 0usize));
+		queue.push_back((process.initial, Vec::new()));
 
-		while let Some((state, trace, depth)) = queue.pop_front() {
+		while let Some((state, trace)) = queue.pop_front() {
 			if timeout_checker.is_expired() {
 				complete = false;
 				break;
@@ -480,10 +382,6 @@ where
 			if Self::check_limits(queue.len(), visited.len(), traces.len()) {
 				complete = false;
 				break;
-			}
-
-			if trace.len() >= max_depth {
-				continue;
 			}
 
 			let visit_key = (state, trace.clone());
@@ -495,6 +393,10 @@ where
 
 			let enabled_actions = process.enabled(state);
 			for action in enabled_actions {
+				if !action.keeps_within(&trace, max_depth) {
+					continue;
+				}
+
 				let next_states = process.step(state, &action.event);
 				for next_state in next_states {
 					if Self::check_limits(queue.len(), visited.len(), traces.len()) {
@@ -502,12 +404,12 @@ where
 						break;
 					}
 
-					let (new_trace, new_depth) = Self::process_transition(process, &action.event, trace.clone(), depth);
-					if !process.hidden.contains(&action.event) {
+					let new_trace = Self::process_transition(trace.clone(), &action);
+					if action.is_observable() {
 						traces.insert(new_trace.clone());
 					}
 
-					queue.push_back((next_state, new_trace, new_depth));
+					queue.push_back((next_state, new_trace));
 				}
 			}
 		}
@@ -527,34 +429,14 @@ where
 		// The search records a failure at a stable or accepting state alone,
 		// as `Process::failure_refusals` decides.
 		let failures = Vec::new();
-		let visited = HashSet::new();
-		let data = (failures, visited);
-		let ((failures, _), complete) = self.bfs_with_callbacks(
-			process,
-			max_depth,
-			data,
-			|(failures, visited), state, trace, _depth| {
-				let visit_key = (state, trace.clone());
-				if visited.contains(&visit_key) {
-					return true;
+		let (failures, complete) = self.bfs_with_callbacks(process, max_depth, failures, |failures, state, trace| {
+			if let Some(refusals) = self.compute_refusals(process, state) {
+				let failure = (trace.clone(), refusals);
+				if !failures.contains(&failure) {
+					failures.push(failure);
 				}
-
-				visited.insert(visit_key);
-
-				if let Some(refusals) = self.compute_refusals(process, state) {
-					let failure = (trace.clone(), refusals);
-					if !failures.contains(&failure) {
-						failures.push(failure);
-					}
-				}
-
-				false
-			},
-			|(_failures, _visited), queue, _state, trace, depth, event, next_state| {
-				let (new_trace, new_depth) = Self::process_transition(process, event, trace, depth);
-				queue.push_back((next_state, new_trace, new_depth));
-			},
-		);
+			}
+		});
 
 		self.cache.borrow_mut().cache_failures(structure, failures.clone(), complete);
 
@@ -565,9 +447,9 @@ where
 	/// that the process reaches can diverge.
 	///
 	/// [`Process::divergent_states`] decides each state once, and the search
-	/// reads that answer at each state and trace it reaches. It runs on the
-	/// traversal of the failures, so the divergences and the failures share one
-	/// depth bound, one set of limits, and one timeout.
+	/// reads that answer at each state and trace it reaches. The `bool` is
+	/// `true` when the set covers each trace of at most `max_depth` events, and
+	/// `false` when a timeout or a resource limit cut the search short.
 	fn compute_divergences(&mut self, process: &Process, max_depth: usize) -> (HashSet<Trace>, bool) {
 		let structure = process.structure_digest();
 		if let Some((cached, complete)) = self.cache.borrow().get_cached_divergences(structure) {
@@ -575,22 +457,12 @@ where
 		}
 
 		let divergent = process.divergent_states();
-		let (divergences, complete) = self.bfs_with_callbacks(
-			process,
-			max_depth,
-			HashSet::new(),
-			|divergences, state, trace, _depth| {
-				if divergent.contains(state) {
-					divergences.insert(trace.clone());
-				}
-
-				false
-			},
-			|_divergences, queue, _state, trace, depth, event, next_state| {
-				let (next_trace, next_depth) = Self::process_transition(process, event, trace, depth);
-				queue.push_back((next_state, next_trace, next_depth));
-			},
-		);
+		let found = HashSet::new();
+		let (divergences, complete) = self.bfs_with_callbacks(process, max_depth, found, |found, state, trace| {
+			if divergent.contains(state) {
+				found.insert(trace.clone());
+			}
+		});
 
 		let divergences_vec: Vec<Trace> = divergences.iter().cloned().collect();
 		self.cache.borrow_mut().cache_divergences(structure, divergences_vec, complete);
@@ -666,13 +538,103 @@ mod tests {
 			.build()
 	}
 
-	/// A process that takes `a`, then stops at `S1`, which can diverge
-	/// nowhere.
+	/// A process that takes `a`, then stops at the accepting `S1`.
 	fn stopping_after_a() -> Result<Process, ProcessBuildError> {
 		Process::builder("StoppingAfterA")
 			.initial_state(State("S0"))
 			.add_observable(Event("a"))
 			.add_transition(State("S0"), Event("a"), State("S1"))
+			.add_terminal(State("S1"))
+			.build()
+	}
+
+	/// A process that takes `a`, then the hidden `t` to the accepting `S2`.
+	fn settling_after_a() -> Result<Process, ProcessBuildError> {
+		Process::builder("SettlingAfterA")
+			.initial_state(State("S0"))
+			.add_observable(Event("a"))
+			.add_hidden(Event("t"))
+			.add_transition(State("S0"), Event("a"), State("S1"))
+			.add_transition(State("S1"), Event("t"), State("S2"))
+			.add_terminal(State("S2"))
+			.build()
+	}
+
+	/// A process that takes `a` or `b` at `S0` and comes back, so its traces
+	/// of at most 14 events number 32,767, past `MAX_VISITED`.
+	fn looping_on_a_and_b() -> Result<Process, ProcessBuildError> {
+		Process::builder("LoopingOnAAndB")
+			.initial_state(State("S0"))
+			.add_observable(Event("a"))
+			.add_observable(Event("b"))
+			.add_transition(State("S0"), Event("a"), State("S0"))
+			.add_transition(State("S0"), Event("b"), State("S0"))
+			.build()
+	}
+
+	/// A process over `a` and `b` that stops at its accepting initial state.
+	fn stopped() -> Result<Process, ProcessBuildError> {
+		Process::builder("Stopped")
+			.initial_state(State("S0"))
+			.add_observable(Event("a"))
+			.add_observable(Event("b"))
+			.add_terminal(State("S0"))
+			.build()
+	}
+
+	/// A process over `a` and `b` that takes `event` once, then stops at the
+	/// accepting `S1`.
+	fn once(event: Event) -> Result<Process, ProcessBuildError> {
+		Process::builder("Once")
+			.initial_state(State("S0"))
+			.add_observable(Event("a"))
+			.add_observable(Event("b"))
+			.add_transition(State("S0"), event, State("S1"))
+			.add_terminal(State("S1"))
+			.build()
+	}
+
+	/// A process whose `S0` offers `a` beside the hidden `t`, which leads to
+	/// `b`.
+	fn hidden_beside_a() -> Result<Process, ProcessBuildError> {
+		Process::builder("HiddenBesideA")
+			.initial_state(State("S0"))
+			.add_observable(Event("a"))
+			.add_observable(Event("b"))
+			.add_hidden(Event("t"))
+			.add_transition(State("S0"), Event("a"), State("S1"))
+			.add_transition(State("S0"), Event("t"), State("S2"))
+			.add_transition(State("S2"), Event("b"), State("S3"))
+			.add_terminal(State("S1"))
+			.add_terminal(State("S3"))
+			.build()
+	}
+
+	/// A process whose hidden `t` and `u` branch at `S0`, to `a` and to `b`.
+	fn two_hidden_branches() -> Result<Process, ProcessBuildError> {
+		Process::builder("TwoHiddenBranches")
+			.initial_state(State("S0"))
+			.add_observable(Event("a"))
+			.add_observable(Event("b"))
+			.add_hidden(Event("t"))
+			.add_hidden(Event("u"))
+			.add_transition(State("S0"), Event("t"), State("S1"))
+			.add_transition(State("S0"), Event("u"), State("S2"))
+			.add_transition(State("S1"), Event("a"), State("S3"))
+			.add_transition(State("S2"), Event("b"), State("S4"))
+			.add_terminal(State("S3"))
+			.add_terminal(State("S4"))
+			.build()
+	}
+
+	/// A process whose `e`, in the observable and in the hidden alphabet,
+	/// takes `S0` to the accepting `S1`.
+	fn e_in_both_alphabets() -> Result<Process, ProcessBuildError> {
+		Process::builder("EInBothAlphabets")
+			.initial_state(State("S0"))
+			.add_observable(Event("e"))
+			.add_hidden(Event("e"))
+			.add_transition(State("S0"), Event("e"), State("S1"))
 			.add_terminal(State("S1"))
 			.build()
 	}
@@ -743,6 +705,17 @@ mod tests {
 	}
 
 	#[test]
+	fn the_trace_search_takes_no_observable_step_past_max_depth() -> Result<(), ProcessBuildError> {
+		let process = spinning_after_a_b()?;
+		let mut checker = checker_of(&process);
+
+		let (traces, _complete) = checker.compute_traces(&process, 1);
+		let up_to_one_event = HashSet::from([vec![], vec![Event("a")]]);
+		assert_eq!(traces, up_to_one_event, "`b` lies two events deep, past the bound of one");
+		Ok(())
+	}
+
+	#[test]
 	fn divergence_refinement_refutes_a_divergence_at_the_depth_bound() -> Result<(), ProcessBuildError> {
 		let spec = stopping_after_a()?;
 		let subject = spinning_after_a()?;
@@ -760,6 +733,102 @@ mod tests {
 
 		let (_divergences, complete) = checker.compute_divergences(&process, 8);
 		assert!(!complete, "a search that ran out of time claims no completeness");
+		Ok(())
+	}
+
+	#[test]
+	fn a_failure_behind_a_hidden_step_at_max_depth_is_a_failure() -> Result<(), ProcessBuildError> {
+		let process = settling_after_a()?;
+		let mut checker = checker_of(&process);
+
+		let (failures, _complete) = checker.compute_failures(&process, 1);
+		let refused_at_s2 = (vec![Event("a")], HashSet::from([Event("a")]));
+		assert!(failures.contains(&refused_at_s2), "the failures were {failures:?}");
+		Ok(())
+	}
+
+	#[test]
+	fn a_divergence_search_past_its_timeout_caches_its_incompleteness() -> Result<(), ProcessBuildError> {
+		let process = spinning()?;
+		let mut checker = checker_under(&process, FdrConfig { timeout_ms: 0, ..Default::default() });
+		let (_divergences, _complete) = checker.compute_divergences(&process, 8);
+
+		let (_cached, complete) = checker.compute_divergences(&process, 8);
+		assert!(!complete, "the cache keeps the incompleteness of the first search");
+		Ok(())
+	}
+
+	#[test]
+	fn a_divergence_search_past_its_limits_is_incomplete() -> Result<(), ProcessBuildError> {
+		let process = looping_on_a_and_b()?;
+		let mut checker = checker_of(&process);
+
+		let (_divergences, complete) = checker.compute_divergences(&process, 14);
+		assert!(!complete, "32,767 pairs of state and trace pass the visited limit");
+		Ok(())
+	}
+
+	#[test]
+	fn trace_refinement_refutes_an_event_after_an_accepting_state() -> Result<(), ProcessBuildError> {
+		let spec = stopped()?;
+		let subject = accepting()?;
+		let mut checker = checker_of(&subject);
+
+		let outcome = checker.check_trace_refinement(&spec, &subject);
+		assert_eq!(outcome, RefinementOutcome::Violated(vec![Event("a")]));
+		Ok(())
+	}
+
+	#[test]
+	fn trace_refinement_refutes_an_event_beside_a_hidden_step() -> Result<(), ProcessBuildError> {
+		let spec = once(Event("b"))?;
+		let subject = hidden_beside_a()?;
+		let mut checker = checker_of(&subject);
+
+		let outcome = checker.check_trace_refinement(&spec, &subject);
+		assert_eq!(outcome, RefinementOutcome::Violated(vec![Event("a")]));
+		Ok(())
+	}
+
+	#[test]
+	fn trace_refinement_refutes_an_event_after_a_second_hidden_branch() -> Result<(), ProcessBuildError> {
+		let spec = once(Event("a"))?;
+		let subject = two_hidden_branches()?;
+		let mut checker = checker_of(&subject);
+
+		let outcome = checker.check_trace_refinement(&spec, &subject);
+		assert_eq!(outcome, RefinementOutcome::Violated(vec![Event("b")]));
+		Ok(())
+	}
+
+	#[test]
+	fn divergence_refinement_holds_for_an_extension_of_a_spec_divergence() -> Result<(), ProcessBuildError> {
+		let spec = spinning_after_a()?;
+		let subject = spinning_after_a_b()?;
+		let mut checker = checker_of(&spec);
+
+		let outcome = checker.check_divergence_refinement(&spec, &subject);
+		assert_eq!(outcome, RefinementOutcome::Holds { complete: true });
+		Ok(())
+	}
+
+	#[test]
+	fn the_observable_action_of_an_event_in_both_alphabets_extends_the_trace() -> Result<(), ProcessBuildError> {
+		let process = e_in_both_alphabets()?;
+		let mut checker = checker_of(&process);
+
+		let (traces, _complete) = checker.compute_traces(&process, 8);
+		assert!(traces.contains(&vec![Event("e")]), "the traces were {traces:?}");
+		Ok(())
+	}
+
+	#[test]
+	fn the_spec_search_matches_the_observable_action_of_an_event_in_both_alphabets() -> Result<(), ProcessBuildError> {
+		let process = e_in_both_alphabets()?;
+		let mut checker = checker_of(&process);
+
+		let outcome = checker.check_trace_refinement(&process, &process);
+		assert_eq!(outcome, RefinementOutcome::Holds { complete: true });
 		Ok(())
 	}
 }

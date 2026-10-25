@@ -158,19 +158,20 @@ impl<'a> DefaultExplorationEngine<'a> {
 				return SeedResult::Divergence(state.trace.clone(), state.process_state, run);
 			}
 
-			// Exploration cuts a trace off at the maximum depth.
+			// Exploration cuts a trace off at the maximum depth. An unstable
+			// state at the bound takes its hidden steps, so the walk reaches
+			// the failure behind them.
 			if state.trace.len() >= config.max_depth {
 				if state.trace.len() > longest_trace.len() {
 					longest_trace = state.trace.clone();
 				}
 
 				// A stable or accepting cut-off state records its refusals as a
-				// failure.
+				// failure, and the walk ends there.
 				if let Some(refusals) = process.failure_refusals(state.process_state) {
 					failures.push((state.trace.clone(), refusals));
+					continue;
 				}
-
-				continue;
 			}
 
 			// A run of hidden events past the limit is a divergence.
@@ -200,9 +201,9 @@ impl<'a> DefaultExplorationEngine<'a> {
 			// An action is enabled at these clocks when one of its edges has no
 			// guard or a guard that holds.
 			#[cfg(feature = "testing-timing")]
-			let actions = process.enabled_under(state.process_state, &state.clock_values);
+			let mut actions = process.enabled_under(state.process_state, &state.clock_values);
 			#[cfg(not(feature = "testing-timing"))]
-			let actions = process.enabled(state.process_state);
+			let mut actions = process.enabled(state.process_state);
 			if actions.is_empty() {
 				// A non-terminal state with no enabled action is a deadlock.
 				#[cfg(feature = "testing-fault")]
@@ -214,6 +215,14 @@ impl<'a> DefaultExplorationEngine<'a> {
 			// A stable state records its refusals before it takes an action.
 			if let Some(refusals) = process.failure_refusals(state.process_state) {
 				failures.push((state.trace.clone(), refusals));
+			}
+
+			// A state at the bound takes its hidden steps alone, as
+			// `Action::keeps_within` decides, and a state left with no step
+			// ends the walk.
+			actions.retain(|action| action.keeps_within(&state.trace, config.max_depth));
+			if actions.is_empty() {
+				continue;
 			}
 
 			// An injected fault makes the chosen event fail, so exploration
@@ -439,7 +448,7 @@ impl<'a> DefaultExplorationEngine<'a> {
 		let branches = targets.into_iter().map(|to| (state.branch(), to));
 
 		for (mut next_exploration, next_state) in branches {
-			if process.hidden.contains(&action.event) {
+			if action.is_hidden() {
 				// A hidden (τ) transition extends the run of hidden events.
 				next_exploration.record_hidden(action.event, next_state);
 			} else {
@@ -510,6 +519,34 @@ mod tests {
 			.build()
 	}
 
+	/// The process of `hiding` with `c` at `S1` as well, so `S1` enables a
+	/// hidden and an observable event, and `t` leads to the accepting `S2`.
+	fn hiding_beside_c() -> Result<Process, ProcessBuildError> {
+		Process::builder("HidingBesideC")
+			.initial_state(State("S0"))
+			.add_observable(Event("a"))
+			.add_observable(Event("c"))
+			.add_hidden(Event("t"))
+			.add_transition(State("S0"), Event("a"), State("S1"))
+			.add_transition(State("S1"), Event("t"), State("S2"))
+			.add_transition(State("S1"), Event("c"), State("S3"))
+			.add_terminal(State("S2"))
+			.add_terminal(State("S3"))
+			.build()
+	}
+
+	/// A process whose `e`, in the observable and in the hidden alphabet,
+	/// takes `S0` to the accepting `S1`.
+	fn e_in_both_alphabets() -> Result<Process, ProcessBuildError> {
+		Process::builder("EInBothAlphabets")
+			.initial_state(State("S0"))
+			.add_observable(Event("e"))
+			.add_hidden(Event("e"))
+			.add_transition(State("S0"), Event("e"), State("S1"))
+			.add_terminal(State("S1"))
+			.build()
+	}
+
 	/// The failures that one seed of `process` under `config` records.
 	fn failures_of(process: &Process, config: FdrConfig) -> Vec<Failure> {
 		let mut engine = DefaultExplorationEngine::new(process, Arc::new(config));
@@ -523,7 +560,6 @@ mod tests {
 		let process = hiding()?;
 
 		let failures = failures_of(&process, FdrConfig::default());
-
 		let expected: Vec<Failure> = vec![
 			(vec![], HashSet::from([Event("c")])),
 			(vec![Event("a")], HashSet::from([Event("a")])),
@@ -534,14 +570,40 @@ mod tests {
 	}
 
 	#[test]
-	fn an_unstable_cut_off_state_records_no_failure() -> Result<(), ProcessBuildError> {
+	fn the_walk_records_the_failure_behind_a_hidden_step_at_max_depth() -> Result<(), ProcessBuildError> {
 		let process = hiding()?;
 		let config = FdrConfig { max_depth: 1, ..Default::default() };
 
 		let failures = failures_of(&process, config);
+		let expected: Vec<Failure> = vec![
+			(vec![], HashSet::from([Event("c")])),
+			(vec![Event("a")], HashSet::from([Event("a")])),
+		];
+		assert_eq!(failures, expected, "`S1` takes the hidden `t` at the bound to the stable `S2`");
+		Ok(())
+	}
 
-		let expected: Vec<Failure> = vec![(vec![], HashSet::from([Event("c")]))];
-		assert_eq!(failures, expected, "the walk cuts `[a]` off at the unstable `S1`");
+	#[test]
+	fn the_walk_takes_no_observable_step_past_max_depth() -> Result<(), ProcessBuildError> {
+		let process = hiding_beside_c()?;
+		let config = FdrConfig { max_depth: 1, ..Default::default() };
+
+		let failures = failures_of(&process, config);
+		let expected: Vec<Failure> = vec![
+			(vec![], HashSet::from([Event("c")])),
+			(vec![Event("a")], HashSet::from([Event("a"), Event("c")])),
+		];
+		assert_eq!(failures, expected, "`S1` lies at the bound, so it takes `t` and leaves `c`");
+		Ok(())
+	}
+
+	#[test]
+	fn the_walk_extends_the_trace_by_the_alphabet_of_its_action() -> Result<(), ProcessBuildError> {
+		let process = e_in_both_alphabets()?;
+
+		let failures = failures_of(&process, FdrConfig::default());
+		let expected: Vec<Failure> = vec![(vec![Event("e")], HashSet::from([Event("e")]))];
+		assert_eq!(failures, expected, "seed 0 takes the observable action of `e`");
 		Ok(())
 	}
 }

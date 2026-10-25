@@ -817,6 +817,31 @@ mod tests {
 			.build()
 	}
 
+	/// A spec whose accepting `S0` spins on the hidden `t`, so it diverges at
+	/// once and its one trace is the empty trace.
+	fn spinning_at_once() -> Result<Process, ProcessBuildError> {
+		Process::builder("SpinningAtOnce")
+			.initial_state(State("S0"))
+			.add_observable(Event("b"))
+			.add_hidden(Event("t"))
+			.add_transition(State("S0"), Event("t"), State("S0"))
+			.add_terminal(State("S0"))
+			.build()
+	}
+
+	/// A subject whose accepting `Idle` offers `b`, which leads to a spin on
+	/// the hidden `t` at `D`.
+	fn spinning_after_b() -> Result<Process, ProcessBuildError> {
+		Process::builder("SpinningAfterB")
+			.initial_state(State("Idle"))
+			.add_observable(Event("b"))
+			.add_hidden(Event("t"))
+			.add_transition(State("Idle"), Event("b"), State("D"))
+			.add_transition(State("D"), Event("t"), State("D"))
+			.add_terminal(State("Idle"))
+			.build()
+	}
+
 	/// What an exploration of `subject` under `config` decided about
 	/// divergence freedom.
 	fn divergence_of(subject: &Process, config: FdrConfig) -> Decision {
@@ -940,6 +965,17 @@ mod tests {
 		Ok(())
 	}
 
+	#[test]
+	fn a_spec_that_diverges_at_once_refutes_an_event_that_it_lacks() -> Result<(), ProcessBuildError> {
+		let subject = spinning_after_b()?;
+		let config = FdrConfig { specs: vec![spinning_at_once()?], ..Default::default() };
+		let mut explorer = DefaultFdrExplorer::with_defaults(&subject, config);
+
+		let verdict = explorer.explore();
+		assert_eq!(verdict.outcome(), Decision::Refuted, "the spec has the empty trace alone");
+		Ok(())
+	}
+
 	#[cfg(feature = "testing-fault")]
 	#[test]
 	fn a_fault_run_describes_the_spec_runs_it_judged() -> Result<(), ProcessBuildError> {
@@ -950,7 +986,6 @@ mod tests {
 		let mut explorer = DefaultFdrExplorer::with_defaults(&subject, config);
 
 		let verdict = explorer.explore();
-
 		let statistics = (verdict.states_visited, verdict.traces_explored, verdict.seeds_completed);
 		assert_eq!(statistics, (2, 4, 4), "the spec visits `S0` and `S1` on each of four seeds");
 		Ok(())
