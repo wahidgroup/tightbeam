@@ -51,15 +51,15 @@ use crate::crypto::x509::KeyPurposes;
 use crate::transport::handshake::Cms;
 #[cfg(feature = "transport-hpke")]
 use crate::transport::handshake::Hpke;
-#[cfg(all(feature = "transport-cms", feature = "transport-multiplex"))]
+#[cfg(all(feature = "transport-cms", mux_rekey))]
 use crate::transport::handshake::SessionPeer;
 #[cfg(feature = "transport-hpke")]
 use crate::transport::handshake::{ClientConfig, HpkeClientSettings, LearnedTrust};
 #[cfg(feature = "transport-cms")]
 use crate::transport::handshake::{CmsServerSettings, ServerConfig, SupportedProfiles};
 
-/// The reply a fresh handshake of flow `F` produces, which no other handshake
-/// admits.
+/// The reply a fresh handshake of flow `F` produces, which every other
+/// handshake refuses.
 async fn stray_reply<F: TestFlow>() -> HandshakeMessage {
 	let (mut client, mut server) = pair::<F>(PeerAuthentication::Anonymous);
 	let opening = client.start().expect("a fresh client builds its opening");
@@ -184,7 +184,7 @@ async fn a_step_after_completion_is_refused<F: TestFlow>() -> Result<(), Box<dyn
 }
 
 /// Completion moves the handshake secret out, so a second completion has
-/// nothing to derive from and the accessors answer nothing.
+/// nothing to derive from and each accessor answers `None`.
 async fn completion_takes_what_the_handshake_agreed<F: TestFlow>() -> Result<(), Box<dyn Error>> {
 	let Parties { client, server, .. } = parties::<F>(mutual_with(ExpiryValidator));
 	let mut run = run(client, server).await;
@@ -226,8 +226,8 @@ async fn a_refused_reply_leaves_the_client_spent<F: TestFlow>() -> Result<(), Bo
 	Ok(())
 }
 
-/// A closing from another handshake is refused, and the server admits no
-/// step after the refusal: another handshake secret sealed it.
+/// The server refuses a closing that another handshake secret sealed, and it
+/// admits no step after the refusal.
 async fn a_refused_closing_leaves_the_server_spent<F: TestFlow>() -> Result<(), Box<dyn Error>> {
 	let (mut client, mut server) = pair::<F>(PeerAuthentication::Anonymous);
 	let other = established::<F>(PeerAuthentication::Anonymous).await;
@@ -285,9 +285,9 @@ async fn a_recorded_session_does_not_open_under_the_server_static_key<F: TestFlo
 	Ok(())
 }
 
-/// A mutual handshake carries no byte of the client identity in clear: not
-/// its certificate, its key identifier, its issuer and serial number, its key,
-/// or the signature of its client Finished.
+/// A mutual handshake carries no byte of the client identity in the clear.
+/// The wire holds no byte of its certificate, its key identifier, its issuer
+/// and serial number, its key, or the signature of its client Finished.
 async fn a_mutual_handshake_carries_no_byte_of_the_client_identity<F: TestFlow>() -> Result<(), Box<dyn Error>> {
 	let client_identity = create_issued_test_certificate([0x5a; 16]);
 	let recorder = Arc::new(RecordingProvider::new(client_identity.signing_key.to_owned()));
@@ -490,7 +490,7 @@ async fn budget_bearing_reply<F: TestFlow>(approver: &Arc<CountingApprover>) -> 
 }
 
 /// The client confirms the server Finished before it reads the receipt, so
-/// a reply whose Finished fails is refused before the approver runs, and the
+/// it refuses a reply whose Finished fails before the approver runs, and the
 /// approver sees no call.
 async fn a_reply_whose_server_finished_fails_never_reaches_the_approver<F: TestFlow>() -> Result<(), Box<dyn Error>> {
 	let approver = Arc::new(CountingApprover::default());
@@ -514,8 +514,8 @@ async fn an_honest_budget_bearing_reply_reaches_the_approver_once<F: TestFlow>()
 }
 
 /// The client confirms the server Finished before it verifies the receipt, so
-/// a reply whose Finished fails beside the receipt of another session is
-/// refused for its Finished.
+/// when a reply's Finished fails beside the receipt of another session, the
+/// client refuses the reply for its Finished.
 async fn a_forged_server_finished_is_refused_before_the_receipt_is_read<F: TestFlow>() -> Result<(), Box<dyn Error>> {
 	let approver = Arc::new(CountingApprover::default());
 	let (mut client, reply) = budget_bearing_reply::<F>(&approver).await;
@@ -528,8 +528,8 @@ async fn a_forged_server_finished_is_refused_before_the_receipt_is_read<F: TestF
 	Ok(())
 }
 
-/// A control of the test above: the receipt of another session beside an
-/// honest server Finished is refused by the receipt check.
+/// A control of the test above: the receipt check refuses the receipt of
+/// another session beside an honest server Finished.
 async fn a_reply_beside_the_receipt_of_another_session_is_refused<F: TestFlow>() -> Result<(), Box<dyn Error>> {
 	let approver = Arc::new(CountingApprover::default());
 	let (mut client, reply) = budget_bearing_reply::<F>(&approver).await;
@@ -592,8 +592,8 @@ async fn a_mutual_server_refuses_an_expired_certificate_its_pin_accepts<F: TestF
 	Ok(())
 }
 
-/// A mutual server reads the validity period before its validators, so an
-/// expired certificate that its pin also refuses is refused as expired.
+/// A mutual server reads the validity period before its validators, so it
+/// refuses an expired certificate that its pin also refuses as [`Expired`].
 async fn a_mutual_server_reads_the_validity_period_before_its_validators<F: TestFlow>() -> Result<(), Box<dyn Error>> {
 	let server_identity = create_test_server();
 	let client_identity = create_expired_test_certificate();
@@ -660,7 +660,7 @@ async fn multiplexing_negotiates_when_offered_and_enabled<F: TestFlow>() -> Resu
 }
 
 /// A session stays single-flight when the client offers multiplexing and the
-/// server does not enable it.
+/// server leaves it disabled.
 async fn an_offer_alone_stays_single_flight<F: TestFlow>() -> Result<(), Box<dyn Error>> {
 	let Parties { mut client, server, .. } = parties::<F>(PeerAuthentication::Anonymous);
 	client.transport_offer = Some(TransportOffer::mux(8));
@@ -672,7 +672,7 @@ async fn an_offer_alone_stays_single_flight<F: TestFlow>() -> Result<(), Box<dyn
 }
 
 /// A session stays single-flight when the server enables multiplexing and
-/// the client does not offer it.
+/// the client leaves it out of its offer.
 async fn a_local_advertisement_alone_stays_single_flight<F: TestFlow>() -> Result<(), Box<dyn Error>> {
 	let Parties { client, mut server, .. } = parties::<F>(PeerAuthentication::Anonymous);
 	server.transport = Some(TransportOffer::mux(4));
@@ -717,8 +717,8 @@ async fn a_reply_whose_intermediate_was_swapped_is_refused<F: TestFlow>() -> Res
 	Ok(())
 }
 
-/// A reply of nine certificates is refused before any certificate of it is
-/// read or any signature checked (CWE-770).
+/// The client refuses a reply of nine certificates before it reads any
+/// certificate of the reply or checks any signature (CWE-770).
 async fn a_reply_of_nine_certificates_is_refused<F: TestFlow>() -> Result<(), Box<dyn Error>> {
 	let (chained, mut client, mut server) = chained_pair::<F>();
 	let reply = server.reply(client.start()?).await?;
@@ -731,8 +731,8 @@ async fn a_reply_of_nine_certificates_is_refused<F: TestFlow>() -> Result<(), Bo
 	Ok(())
 }
 
-/// A reply whose issuers lead the walk back to a certificate of its path is
-/// refused before its signature is read.
+/// The client refuses a reply whose issuers lead the walk back to a
+/// certificate of its path, before it reads the reply's signature.
 async fn a_reply_whose_path_returns_to_itself_is_refused<F: TestFlow>() -> Result<(), Box<dyn Error>> {
 	let (chained, mut client, mut server) = chained_pair::<F>();
 	let reply = server.reply(client.start()?).await?;
@@ -746,9 +746,9 @@ async fn a_reply_whose_path_returns_to_itself_is_refused<F: TestFlow>() -> Resul
 	Ok(())
 }
 
-/// A reply that carries two certificates of the subject of the signing
-/// certificate's issuer is refused, since the walk cannot tell which one
-/// issued it.
+/// The client refuses a reply that carries two certificates of the subject
+/// of the signing certificate's issuer, because the walk cannot tell which
+/// one issued it.
 async fn a_reply_with_two_issuers_of_one_subject_is_refused<F: TestFlow>() -> Result<(), Box<dyn Error>> {
 	let (chained, mut client, mut server) = chained_pair::<F>();
 	let reply = server.reply(client.start()?).await?;
@@ -781,9 +781,9 @@ fn root_anchored_mutual<F: TestFlow>(
 }
 
 /// A mutual server whose store holds the root alone admits a client whose
-/// certificate an intermediate issued, since the client Finished presents
-/// the intermediate and the server validates that path to the root (RFC
-/// 5280 §6.1).
+/// certificate an intermediate issued, because the client Finished presents
+/// the intermediate and the server validates that path to the root
+/// (RFC 5280 §6.1).
 async fn a_root_only_server_admits_a_presented_intermediate<F: TestFlow>() -> Result<(), Box<dyn Error>> {
 	let chain = CertificateFixtures::insecure_fixed_chain()?;
 	let (client, server) = root_anchored_mutual::<F>(&chain, [chain.intermediate.to_owned()]);
@@ -796,7 +796,7 @@ async fn a_root_only_server_admits_a_presented_intermediate<F: TestFlow>() -> Re
 
 /// A mutual server whose store holds the root alone refuses a client whose
 /// Finished presents another authority of the intermediate's name in its
-/// place, since that path reaches no anchor of the store.
+/// place, because that path reaches no anchor of the store.
 async fn a_root_only_server_refuses_a_swapped_intermediate<F: TestFlow>() -> Result<(), Box<dyn Error>> {
 	let chain = CertificateFixtures::insecure_fixed_chain()?;
 	let impostor = CertificateFixtures::authority(&create_test_signing_key(), "Intermediate")?;
@@ -882,8 +882,8 @@ over_each_flow! {
 }
 
 /// A CMS client whose store holds the root alone admits a signing certificate
-/// under an intermediate the reply presents, since it validates the presented
-/// path to that root (RFC 5280 §6.1).
+/// under an intermediate the reply presents, because it validates the
+/// presented path to that root (RFC 5280 §6.1).
 #[cfg(feature = "transport-cms")]
 #[tokio::test]
 async fn a_cms_client_of_the_root_alone_admits_a_presented_intermediate() -> Result<(), Box<dyn Error>> {
@@ -905,7 +905,7 @@ fn root_anchored_hpke_client(chained: &ChainedTestServer) -> TestClient<Hpke> {
 }
 
 /// An HPKE client whose store holds the root alone completes a handshake with
-/// a server whose signing certificate an intermediate issued, since it
+/// a server whose signing certificate an intermediate issued, because it
 /// validates the path the reply presents to that root (RFC 5280 §6.1).
 #[cfg(feature = "transport-hpke")]
 #[tokio::test]
@@ -925,7 +925,7 @@ async fn an_hpke_client_of_the_root_alone_completes_under_a_presented_intermedia
 }
 
 /// An HPKE client whose store holds the root alone refuses a server that
-/// presents its signing certificate without the intermediate, since that
+/// presents its signing certificate without the intermediate, because that
 /// path stops below its anchor.
 #[cfg(feature = "transport-hpke")]
 #[tokio::test]
@@ -943,7 +943,7 @@ async fn an_hpke_client_of_the_root_alone_refuses_a_path_short_of_its_anchor() -
 
 /// A CMS client's session keeps the key-agreement certificate its opening
 /// sealed to, which a rekey compares the server ephemeral with.
-#[cfg(all(feature = "transport-cms", feature = "transport-multiplex"))]
+#[cfg(all(feature = "transport-cms", mux_rekey))]
 #[tokio::test]
 async fn a_cms_client_session_keeps_the_key_agreement_certificate() {
 	let established = established::<Cms>(PeerAuthentication::Anonymous).await;

@@ -46,9 +46,9 @@ use crate::urn::Urn;
 #[cfg(host_clock)]
 use crate::utils::time::SystemClock;
 
-/// Item gate for the pooled-mux path. Multiplexed pooling needs the mux
-/// engine, the service module's connector, and a tokio executor for the driver
-/// tasks.
+/// Gates each item it wraps behind the `pooled_mux` alias of `build.rs`.
+/// Multiplexed pooling needs the mux engine, the service module's connector,
+/// an encryption handshake, and a tokio executor for the driver tasks.
 macro_rules! pooled_mux {
 	($($item:item)*) => {
 		$(
@@ -95,8 +95,8 @@ pub trait ConnectionBuilder<P: Protocol>: Sized {
 	///
 	/// [`SigningIdentity::from_spec`] decodes a certificate specification
 	/// into one and checks the key against it, so the fallible step happens
-	/// once, before the builder. A clone of the identity bumps two refcounts
-	/// and copies the `sid`, so every dial shares one certificate.
+	/// once, before the builder. A clone of the identity clones its `Arc`
+	/// handles and copies the `sid`, so every dial shares one certificate.
 	///
 	/// [`SigningIdentity::from_spec`]: crate::crypto::sign::SigningIdentity::from_spec
 	fn with_client_identity(self, identity: SigningIdentity) -> Self;
@@ -119,9 +119,10 @@ pub struct PoolConfig {
 	pub max_connections: usize,
 	/// The multiplexing offer that pooled dials advertise.
 	///
-	/// When set, `connect` reuses one multiplexed connection per destination
-	/// until stream caps fill. The value is shared by refcount across dials.
-	/// The handshake still clones the offer once into the orchestrator.
+	/// When set, [`ConnectionPool::connect`] reuses one multiplexed connection
+	/// per destination until stream caps fill. Every dial shares the value
+	/// through its `Arc`, and the handshake clones the offer once into the
+	/// orchestrator.
 	pub mux_offer: Option<Arc<TransportOffer>>,
 }
 
@@ -174,7 +175,8 @@ impl<C: CryptoProvider> PoolTlsConfig<C> {
 enum PoolProvisioning<C: CryptoProvider> {
 	/// Provisioning that answered, which every dial clones.
 	Answered(DialableEncryption<C>),
-	/// Provisioning that was refused, which each dial answers again.
+	/// Provisioning that [`DialableEncryption::new`] refused, which each dial
+	/// answers again.
 	Refused(EncryptionConfig<C>),
 }
 
@@ -182,7 +184,8 @@ impl<C: CryptoProvider> PoolProvisioning<C> {
 	/// Returns the endpoint that one dial from this pool starts from, over this
 	/// provisioning and `clock`.
 	///
-	/// Cloning the answered provisioning bumps refcounts.
+	/// Each dial clones the answered provisioning, and that clone shares the
+	/// provisioning's `Arc` handles.
 	///
 	/// # Errors
 	///
@@ -190,8 +193,8 @@ impl<C: CryptoProvider> PoolProvisioning<C> {
 	///   authenticates no peer and did not name cleartext, or it sets a server
 	///   policy and holds no trust in a server, whether or not it names
 	///   cleartext.
-	/// - [`TransportError::HandshakeError`] -- the client identity names
-	///   another key purpose than the client's.
+	/// - [`TransportError::HandshakeError`] -- the client identity names a key
+	///   purpose other than the client's.
 	fn endpoint(&self, clock: &Arc<dyn Clock>) -> TransportResult<EndpointConfig<C>> {
 		let encryption = match self {
 			Self::Answered(answered) => answered.clone(),
@@ -244,8 +247,10 @@ impl<P: Protocol> Default for ConnectionPoolBuilder<P> {
 impl<P: Protocol> ConnectionPoolBuilder<P> {
 	/// Run this pool's connections without authenticating the peer.
 	///
-	/// Every dial carries the decision, so a pool with no trust store states it
-	/// once instead of each connection failing at its first write.
+	/// Every dial carries the decision. Without it, a pool that holds no trust
+	/// in a server fails each connect with
+	/// [`TransportError::PeerAuthenticationUnconfigured`] before it opens a
+	/// socket.
 	pub fn allow_cleartext(mut self) -> Self {
 		self.tls.encryption.allow_cleartext = true;
 		self
@@ -257,8 +262,8 @@ impl<P: Protocol> ConnectionPoolBuilder<P> {
 		self
 	}
 
-	/// Replace the clock that idle time, deadlines, and backoff are measured
-	/// against.
+	/// Replace the clock that the pool measures idle time, deadlines, and
+	/// backoff against.
 	pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
 		self.clock = clock;
 		self
@@ -274,9 +279,9 @@ impl<P: Protocol> ConnectionPoolBuilder<P> {
 		self
 	}
 
-	/// Provision the trust in the CMS server, built once over its pinned
-	/// key-agreement certificate and shared by every pooled connection: the
-	/// opening seals to it, and the trust's store admits the signing
+	/// Provision the trust in the CMS server, which the caller builds once over
+	/// its pinned key-agreement certificate and every pooled connection shares.
+	/// The opening seals to it, and the trust's store admits the signing
 	/// certificate the reply carries.
 	#[cfg(feature = "transport-cms")]
 	pub fn with_cms_server(mut self, trust: ProvisionedTrust) -> Self {
@@ -293,10 +298,10 @@ impl<P: Protocol> ConnectionPoolBuilder<P> {
 		self
 	}
 
-	/// Set the server policy of every pooled connection, which every
-	/// validator of `validators` runs on the identity certificate of the
-	/// server under either flow, as [`ClientConfig::with_server_policy`]
-	/// states. An empty set sets no policy.
+	/// Set the server policy of every pooled connection. Every validator of
+	/// `validators` runs on the identity certificate of the server under
+	/// either flow, as [`ClientConfig::with_server_policy`] states. An empty
+	/// set sets no policy.
 	///
 	/// # Examples
 	///
@@ -324,7 +329,7 @@ impl<P: Protocol> ConnectionPoolBuilder<P> {
 		self
 	}
 
-	/// Select the handshake protocol used by every pooled connection.
+	/// Select the handshake protocol that every pooled connection runs.
 	pub fn with_handshake_protocol(mut self, kind: HandshakeProtocolKind) -> Self {
 		self.negotiation.select_handshake(kind);
 		self
@@ -385,10 +390,10 @@ struct AvailableEntry<P: Protocol> {
 }
 
 pooled_mux! {
-	/// When a mux entry last carried traffic, read against the pool's clock.
+	/// Holds the instant a mux entry last carried traffic, on the pool's clock.
 	///
-	/// The entry and every lease drawn from it share one stamp, so an emit
-	/// through any lease keeps the entry from idling out.
+	/// The entry and every lease drawn from it share one stamp, so an emit or a
+	/// stream open through any lease keeps the entry from idling out.
 	struct ActivityStamp {
 		at: Mutex<MonotonicInstant>,
 		clock: Arc<dyn Clock>,
@@ -402,7 +407,7 @@ pooled_mux! {
 			Self { at, clock }
 		}
 
-		/// Record activity now.
+		/// Records activity at the clock's current instant.
 		fn touch(&self) {
 			*self.at.lock().unwrap_or_else(PoisonError::into_inner) = self.clock.monotonic();
 		}
@@ -419,24 +424,24 @@ pooled_mux! {
 	///
 	/// The handle is cloneable, so every caller shares the entry. The entry
 	/// leaves the pool when its reader ends, when it idles out, or when a
-	/// terminal failure evicts it.
+	/// terminal failure or a discard evicts it.
 	struct MuxEntry {
 		id: u64,
 		handle: MuxHandle,
-		/// Reader driver task used as the entry liveness witness.
+		/// Reader driver task that witnesses that the entry is live.
 		///
 		/// The task ends when the connection dies.
 		reader_task: rt::JoinHandle,
-		/// Shared activity stamp used by idle pruning for this mux entry.
+		/// Shared activity stamp that idle pruning reads for this mux entry.
 		///
 		/// The pool owns the clock reading, so each lease updates this stamp
-		/// when emit starts, outside the pool lock. An entry with pending
-		/// streams stays active even if the stamp is old.
+		/// when an emit or a stream open starts, outside the pool lock. An
+		/// entry with pending streams stays active even when the stamp is old.
 		last_used: Arc<ActivityStamp>,
 		/// Validated peer certificate pinned at the eager mux handshake.
 		///
-		/// The mux drivers consume the transport, so the certificate is
-		/// captured at dial. Every lease on this entry reads the peer
+		/// The mux drivers consume the transport, so the pool captures the
+		/// certificate at dial. Every lease on this entry reads the peer
 		/// identity from this shared handle.
 		peer_certificate: Option<Arc<Certificate>>,
 	}
@@ -468,10 +473,12 @@ impl<P: Protocol> Default for DestinationPool<P> {
 /// # Invariants
 ///
 /// - `total_connections` counts live connections and stays within
-///   `0..=config.max_connections`. It gains 1 when a socket is created.
-/// - Idle connections past `PoolConfig::idle_timeout` are pruned lazily.
+///   `0..=config.max_connections`. A dial adds 1 when it reserves a slot, and
+///   gives it back when it builds no connection.
+/// - Each acquire prunes the idle connections of its destination that passed
+///   [`PoolConfig::idle_timeout`], so pruning is lazy.
 /// - A poisoned pool map fails the acquiring call with
-///   `TransportFailure::Internal`, and eviction and the drop-time return skip
+///   [`TransportFailure::Internal`], and eviction and the drop-time return skip
 ///   their write. An activity stamp recovers from poison, because it holds
 ///   one instant.
 #[cfg(feature = "std")]
@@ -480,7 +487,7 @@ pub struct ConnectionPool<P: Protocol> {
 	pools: Arc<RwLock<HashMap<P::Address, DestinationPool<P>>>>,
 	/// Limits and multiplexing policy this pool enforces.
 	config: PoolConfig,
-	/// Clock that idle time, deadlines, and backoff are measured against.
+	/// Clock that the pool measures idle time, deadlines, and backoff against.
 	clock: Arc<dyn Clock>,
 	/// Shared timeout for all connections.
 	timeout: Option<Duration>,
@@ -501,8 +508,8 @@ pub struct ConnectionPool<P: Protocol> {
 
 #[cfg(feature = "std")]
 impl<P: Protocol> ConnectionPool<P> {
-	/// Decrement the live-connection count for a discarded connection,
-	/// saturating at zero so an accounting defect can never wrap the counter
+	/// Decrement the live-connection count for a discarded connection. The
+	/// count saturates at zero, so an accounting defect cannot wrap the counter
 	/// and wedge the pool into permanent refusal.
 	fn release_connection_count(&self) {
 		// An `Err` means the count already stands at zero, which is the floor
@@ -512,12 +519,12 @@ impl<P: Protocol> ConnectionPool<P> {
 			.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| current.checked_sub(1));
 	}
 
-	/// Returns everything that one dial from this pool is built from: the
+	/// Returns the endpoint that one dial from this pool starts from: the
 	/// shared provisioning, the negotiation input, the pool's clock, and its
 	/// instrumentation collector.
 	///
-	/// The endpoint is built before the dial opens a socket, so a pool that
-	/// answers the dialer rule with a refusal never connects.
+	/// A dial builds the endpoint before it opens a socket, so a pool whose
+	/// provisioning the dialer rule refuses never connects.
 	///
 	/// # Errors
 	///
@@ -544,7 +551,7 @@ impl<P: Protocol> ConnectionPool<P> {
 	///
 	/// # Errors
 	///
-	/// - The injected error, when the runtime fault model injects a fault at `event`.
+	/// - [`TransportError`] -- the error the runtime fault model injects at `event`.
 	#[cfg(feature = "instrument")]
 	fn emit_event(&self, event: Urn<'static>) -> TransportResult<()> {
 		let Some(trace) = self.trace.as_ref() else {
@@ -552,6 +559,26 @@ impl<P: Protocol> ConnectionPool<P> {
 		};
 
 		Ok(trace.emit_event(event)?)
+	}
+
+	/// Retire `evicted` connections that have left the pool: give back the
+	/// count of each, then record the eviction of each, so a fault at an event
+	/// finds the pool whole.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError`] -- the error the runtime fault model injects at an eviction.
+	fn retire(&self, evicted: usize) -> TransportResult<()> {
+		for _ in 0..evicted {
+			self.release_connection_count();
+		}
+
+		#[cfg(feature = "instrument")]
+		for _ in 0..evicted {
+			self.emit_event(events::POOL_EVICTED)?;
+		}
+
+		Ok(())
 	}
 }
 
@@ -561,7 +588,8 @@ where
 	P::Address: Hash + Eq + Clone + Send + Sync,
 	P::Transport: Send + Sync,
 {
-	/// Create a new connection pool builder on the default clock.
+	/// Create a new connection pool builder on the default clock,
+	/// [`SystemClock`].
 	#[cfg(host_clock)]
 	pub fn builder() -> ConnectionPoolBuilder<P> {
 		ConnectionPoolBuilder::default()
@@ -609,12 +637,9 @@ where
 					return Ok(Some(entry.client));
 				}
 
-				// A dead candidate is discarded here, so it leaves the live
-				// set.
-				self.release_connection_count();
-
-				#[cfg(feature = "instrument")]
-				self.emit_event(events::POOL_EVICTED)?;
+				// The pool discards a dead candidate here, so it leaves the
+				// live set.
+				self.retire(1)?;
 			}
 		}
 		Ok(None)
@@ -640,7 +665,7 @@ where
 		}
 
 		// A poisoned pool map must not leak the reservation, so give the
-		// counter back before surfacing the failure.
+		// counter back before the call returns the failure.
 		let mut pools = match self.write_pools() {
 			Ok(pools) => pools,
 			Err(err) => {
@@ -658,12 +683,12 @@ where
 	}
 
 	/// Prune the idle connections of `dest_pool` that passed the idle timeout
-	/// at `now`. Every expired mux entry leaves the pool before the events of
-	/// the prune record, so a fault at one leaves the pool whole.
+	/// at `now`. Every expired mux entry leaves the pool before the prune
+	/// records its events, so a fault at one leaves the pool whole.
 	///
 	/// # Errors
 	///
-	/// - The injected error, when the runtime fault model injects a fault at a prune.
+	/// - [`TransportError`] -- the error the runtime fault model injects at a prune.
 	fn prune_idle_locked(&self, dest_pool: &mut DestinationPool<P>, now: MonotonicInstant) -> TransportResult<()> {
 		let Some(timeout) = self.config.idle_timeout else {
 			return Ok(());
@@ -672,8 +697,8 @@ where
 		while let Some(entry) = dest_pool.available.front() {
 			if now.saturating_duration_since(entry.last_used) >= timeout {
 				dest_pool.available.pop_front();
-				// A pruned idle connection is closed, so it leaves the live
-				// set.
+				// The pop drops and closes the idle connection, so it leaves
+				// the live set.
 				self.release_connection_count();
 
 				#[cfg(feature = "instrument")]
@@ -683,8 +708,9 @@ where
 			}
 		}
 
-		// The pruner only reads the stamp that leases write at emit time,
-		// outside the pool lock (see `MuxEntry::last_used`).
+		// The pruner only reads the stamp that a lease writes when an emit or
+		// a stream open starts, outside the pool lock (see
+		// `MuxEntry::last_used`).
 		#[cfg(all(pooled_mux, feature = "instrument"))]
 		let live_before = dest_pool.mux.len();
 		#[cfg(pooled_mux)]
@@ -765,8 +791,14 @@ where
 		self.connect_single_flight(&destination).await
 	}
 
-	/// Lease a ready pooled connection to `addr` without dialing, or return
+	/// Lease a ready pooled connection to `addr` without a dial, or return
 	/// `None` when none is ready.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::OperationFailed`] with [`TransportFailure::Internal`] -- the pool map is poisoned.
+	/// - [`TransportError`] -- the error the runtime fault model injects at a
+	///   prune, an eviction, or the reuse.
 	pub fn try_acquire(self: &Arc<Self>, addr: &P::Address) -> TransportResult<Option<PooledClient<P>>>
 	where
 		P: PersistentConnection + Send + Sync,
@@ -789,8 +821,8 @@ pooled_mux! {
 			+ Send
 			+ Sync,
 	{
-		/// Connect to a destination, multiplexing when
-		/// [`PoolConfig::mux_offer`] is set and the peer accepts.
+		/// Connect to a destination, over a multiplexed connection when
+		/// [`PoolConfig::mux_offer`] is set and the peer accepts the offer.
 		pub async fn connect(
 			self: &Arc<Self>,
 			addr: impl Into<P::Address>,
@@ -812,7 +844,8 @@ pooled_mux! {
 		/// 2. An idle exclusive lease left when a peer declined multiplexing.
 		/// 3. A fresh dial.
 		///
-		/// Every mux-offering caller shares this path, so no tier is skipped.
+		/// Every caller that offers mux shares this path, so each one tries the
+		/// tiers in this order.
 		async fn acquire_mux(
 			self: &Arc<Self>,
 			addr: &P::Address,
@@ -837,8 +870,8 @@ pooled_mux! {
 			self.open_mux_connection(addr.clone(), offer).await
 		}
 
-		/// Open a fresh connection with a mux offer, falling back to an
-		/// exclusive lease when the peer declines multiplexing.
+		/// Open a fresh connection with a mux offer. When the peer declines the
+		/// offer, the connection pools as an exclusive lease.
 		async fn open_mux_connection(
 			self: &Arc<Self>,
 			addr: P::Address,
@@ -886,8 +919,8 @@ pooled_mux! {
 			let mux = MuxTransport::assemble(reader, writer, CONNECTOR_ROLE, settings, rekey);
 			let SpawnedMux { handle, responder, reader_task } = mux.spawn();
 
-			// Pool endpoints serve no peer-initiated streams, so dropping the
-			// responder refuses them.
+			// A pool endpoint serves only the streams it opens, so dropping the
+			// responder refuses every peer-initiated stream.
 			drop(responder);
 
 			let id = self.mux_ids.fetch_add(1, Ordering::Relaxed);
@@ -904,8 +937,8 @@ pooled_mux! {
 					}
 				};
 
-				// The handle clone is a refcount bump, so the pool entry and
-				// the lease co-own the connection.
+				// The handle clone shares the one connection, so the pool
+				// entry and the lease co-own it.
 				let dest_pool = pools.entry(addr.clone()).or_default();
 				dest_pool.mux.push(MuxEntry {
 					id,
@@ -922,7 +955,7 @@ pooled_mux! {
 			Ok(self.wrap_mux_client(lease, addr))
 		}
 
-		/// Round-robin a live mux entry for the destination.
+		/// Take a live mux entry for the destination in round-robin order.
 		///
 		/// It prunes idle entries, evicts entries whose reader driver ended,
 		/// and prefers entries with stream headroom over saturated ones.
@@ -939,23 +972,11 @@ pooled_mux! {
 
 			self.prune_idle_locked(dest_pool, self.clock.monotonic())?;
 
-			// Every dead entry leaves the pool before the events of the
-			// evictions record, so a fault at one leaves the pool whole.
-			#[cfg(feature = "instrument")]
+			// Every dead entry leaves the pool before the pool retires it.
 			let live_before = dest_pool.mux.len();
-			dest_pool.mux.retain(|entry| {
-				let alive = !entry.reader_task.is_finished();
-				if !alive {
-					// A dead mux connection is discarded here, so it leaves
-					// the live set.
-					self.release_connection_count();
-				}
-				alive
-			});
-			#[cfg(feature = "instrument")]
-			for _ in dest_pool.mux.len()..live_before {
-				self.emit_event(events::POOL_EVICTED)?;
-			}
+			dest_pool.mux.retain(|entry| !entry.reader_task.is_finished());
+			let evicted = live_before.saturating_sub(dest_pool.mux.len());
+			self.retire(evicted)?;
 
 			if dest_pool.mux.len() > 1 {
 				dest_pool.mux.rotate_left(1);
@@ -967,11 +988,11 @@ pooled_mux! {
 				// stream may finish before the caller emits.
 				MuxSelection::PreferHeadroom => dest_pool.mux.first(),
 				// Cap-exhaustion failover must not land back on a
-				// saturated entry, so it falls through to a fresh dial.
+				// saturated entry, so it falls through to the next tier.
 				MuxSelection::RequireHeadroom => None,
 			};
 
-			// The handle clone is a refcount bump, so the entry stays pooled
+			// The lease holds a clone of the handle, so the entry stays pooled
 			// for other callers.
 			let selected = with_headroom.or(fallback).map(MuxLease::from);
 
@@ -983,14 +1004,15 @@ pooled_mux! {
 			Ok(selected)
 		}
 
-		/// Remove a mux entry after a terminal failure (`ConnectionClosed`
-		/// or rekey `Draining`). The next connect re-establishes the
+		/// Remove a mux entry after a discard or a terminal failure, which is
+		/// [`TransportError::ConnectionClosed`] or
+		/// [`TransportError::Draining`]. The next connect re-establishes the
 		/// connection, and a poisoned pool map skips the eviction.
 		///
 		/// # Errors
 		///
-		/// - The injected error, when the runtime fault model injects a fault
-		///   at the eviction, which the entry has already left.
+		/// - [`TransportError`] -- the error the runtime fault model injects at
+		///   the eviction, which the entry has already left.
 		fn evict_mux(&self, addr: &P::Address, id: u64) -> TransportResult<()> {
 			let mut pools = match self.pools.write() {
 				Ok(pools) => pools,
@@ -1001,13 +1023,9 @@ pooled_mux! {
 
 				dest_pool.mux.retain(|entry| entry.id != id);
 
-				if dest_pool.mux.len() < live_before {
-					// An evicted mux connection leaves the live set.
-					self.release_connection_count();
-
-					#[cfg(feature = "instrument")]
-					self.emit_event(events::POOL_EVICTED)?;
-				}
+				// An evicted mux connection leaves the live set.
+				let evicted = live_before.saturating_sub(dest_pool.mux.len());
+				self.retire(evicted)?;
 			}
 			Ok(())
 		}
@@ -1026,9 +1044,9 @@ pooled_mux! {
 	struct MuxLease {
 		id: u64,
 		handle: MuxHandle,
-		/// Stamp shared with the pool entry. The lease stamps it on each emit,
-		/// so the pruner can read idle time without a clock in the mux core
-		/// (see [`MuxEntry::last_used`]).
+		/// Stamp shared with the pool entry. The lease stamps it on each emit
+		/// and stream open, so the pruner can read idle time without a clock in
+		/// the mux core (see [`MuxEntry::last_used`]).
 		last_used: Arc<ActivityStamp>,
 		/// Shared handle to the entry's pinned peer certificate (see
 		/// [`MuxEntry::peer_certificate`]).
@@ -1036,8 +1054,9 @@ pooled_mux! {
 	}
 
 	impl MuxLease {
-		/// Record activity for the pruner at emit start. While the stream is
-		/// in flight, `has_pending_streams` covers it.
+		/// Record activity for the pruner when an emit or a stream open starts.
+		/// While the stream is in flight, [`MuxHandle::has_pending_streams`]
+		/// covers it.
 		fn stamp(&self) {
 			self.last_used.touch();
 		}
@@ -1067,8 +1086,10 @@ pooled_mux! {
 
 /// A pooled client connection that returns to the pool on drop.
 ///
-/// Exclusive leases hold the connection alone. Multiplexed leases share
-/// one connection with every other caller and return nothing on drop.
+/// An exclusive lease holds the connection alone, and its drop returns a live
+/// connection to the pool. A multiplexed lease shares one connection with
+/// every other caller, and the pool entry keeps that connection when the lease
+/// drops.
 #[cfg(feature = "std")]
 pub struct PooledClient<P: Protocol + PersistentConnection>
 where
@@ -1163,17 +1184,17 @@ pooled_mux! {
 		/// Emit a message through the pooled connection, as a stream on the
 		/// shared mux connection or on the exclusive lease.
 		///
-		/// The mux lifecycle is handled per failure:
+		/// A mux failure takes one of two paths:
 		///
-		/// - `StreamsExhausted` (local stream cap full) moves the lease to a
-		///   pooled connection with stream headroom, or an additional one up to
-		///   `max_connections`, and retries there once.
+		/// - `StreamsExhausted` (the local stream cap is full) moves the lease
+		///   to a pooled connection with stream headroom, or an additional one
+		///   up to `max_connections`, and retries there once.
 		/// - `ConnectionClosed` or `Draining` (a rekey GoAway or an idle-prune
 		///   drain) evicts the entry so the next connect re-establishes it,
 		///   then reports the failure.
 		pub async fn emit(&mut self, frame: Frame, attempt: Option<usize>) -> TransportResult<Option<Frame>> {
-			// The handle clone is a refcount bump that releases the `self.mux`
-			// borrow before the failover arm takes `&mut self`.
+			// The local handle clone releases the `self.mux` borrow before the
+			// failover arm takes `&mut self`.
 			let (lease_id, handle) = match self.mux.as_ref() {
 				Some(lease) => {
 					lease.stamp();
@@ -1194,15 +1215,15 @@ pooled_mux! {
 			}
 		}
 
-		/// Warm the connection by completing its handshake without
-		/// emitting an application frame.
+		/// Warm the connection: complete its handshake before it carries an
+		/// application frame.
 		///
-		/// Callers that gate on peer identity before disclosing a request
-		/// drive this first so [`peer_certificate`](Self::peer_certificate)
-		/// is populated.
+		/// A caller that gates on peer identity before it discloses a request
+		/// calls this first, so [`peer_certificate`](Self::peer_certificate)
+		/// has an answer.
 		///
-		/// - A mux lease already handshook eagerly at dial, so it returns at once.
-		/// - A single-flight lease defers its handshake to the first [`emit`](Self::emit).
+		/// - A mux lease completed its handshake at dial, so it returns at once.
+		/// - An exclusive lease completes its handshake here, in place of the first [`emit`](Self::emit).
 		#[cfg(feature = "colony")]
 		pub(crate) async fn complete_handshake(&mut self) -> TransportResult<()> {
 			if self.mux.is_some() {
@@ -1224,8 +1245,8 @@ pooled_mux! {
 		///
 		/// # Errors
 		///
-		/// - The injected error, when the runtime fault model injects a fault
-		///   at the eviction, which the connection has already left.
+		/// - [`TransportError`] -- the error the runtime fault model injects at
+		///   the eviction, which the connection has already left.
 		#[cfg(feature = "colony")]
 		pub(crate) fn discard(mut self) -> TransportResult<()> {
 			if let Some(lease) = self.mux.take() {
@@ -1246,10 +1267,7 @@ pooled_mux! {
 				// Dropping the client closes its connection, so the connection
 				// leaves the live set.
 				drop(client);
-				self.pool.release_connection_count();
-
-				#[cfg(feature = "instrument")]
-				self.pool.emit_event(events::POOL_EVICTED)?;
+				self.pool.retire(1)?;
 			}
 
 			Ok(())
@@ -1257,13 +1275,13 @@ pooled_mux! {
 
 		/// Returns this lease's mux handle, with its activity recorded.
 		///
-		/// Every streaming entry point below needs the same two steps: refuse
-		/// an exclusive lease, then stamp the entry so the pruner counts the
-		/// lease as active.
+		/// Every stream-open method below needs the same two steps: refuse an
+		/// exclusive lease, then stamp the entry so the pruner counts the lease
+		/// as active.
 		///
 		/// # Errors
 		///
-		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and streaming needs the mux plane.
+		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and a stream needs the mux plane.
 		fn stamped_handle(&self) -> TransportResult<&MuxHandle> {
 			let lease = self.mux.as_ref().ok_or(TransportError::InvalidState)?;
 			lease.stamp();
@@ -1278,8 +1296,8 @@ pooled_mux! {
 		///
 		/// # Errors
 		///
-		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and streaming needs the mux plane.
-		/// - The errors of [`MuxHandle::open_stream`].
+		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and a stream needs the mux plane.
+		/// - [`TransportError`] -- the errors of [`MuxHandle::open_stream`].
 		pub fn open_stream(
 			&self,
 		) -> TransportResult<(RequestSink, impl Future<Output = TransportResult<Option<Frame>>> + MaybeSend)> {
@@ -1294,8 +1312,8 @@ pooled_mux! {
 		///
 		/// # Errors
 		///
-		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and streaming needs the mux plane.
-		/// - The errors of [`MuxHandle::open_stream`].
+		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and a stream needs the mux plane.
+		/// - [`TransportError`] -- the errors of [`MuxHandle::open_stream`].
 		pub fn open_stream_to(
 			&self,
 			target: impl Into<Urn<'static>>,
@@ -1303,7 +1321,7 @@ pooled_mux! {
 			self.stamped_handle()?.open_stream_to(target)
 		}
 
-		/// Open a streamed request carrying a fully formed [`StreamRoute`].
+		/// Open a streamed request that carries a fully formed [`StreamRoute`].
 		///
 		/// - [`StreamRoute::to`] builds the route for an origin open.
 		/// - [`StreamRoute::relayed_to`] builds the route that re-emits a spent hop budget.
@@ -1311,12 +1329,12 @@ pooled_mux! {
 		/// Prefer [`open_stream_to`](Self::open_stream_to) when the route is a
 		/// plain origin target. This method is otherwise identical to
 		/// [`open_stream`](Self::open_stream). Crate-internal callers pass a
-		/// fully formed route when the origin helpers are not enough.
+		/// fully formed route when it carries more than an origin target.
 		///
 		/// # Errors
 		///
-		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and streaming needs the mux plane.
-		/// - The errors of [`MuxHandle::open_stream`].
+		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and a stream needs the mux plane.
+		/// - [`TransportError`] -- the errors of [`MuxHandle::open_stream`].
 		#[cfg(feature = "colony")]
 		pub(crate) fn open_stream_with_route(
 			&self,
@@ -1331,8 +1349,8 @@ pooled_mux! {
 		///
 		/// # Errors
 		///
-		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and streaming needs the mux plane.
-		/// - The errors of [`MuxHandle::open_duplex`].
+		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and a stream needs the mux plane.
+		/// - [`TransportError`] -- the errors of [`MuxHandle::open_duplex`].
 		pub fn open_duplex(&self) -> TransportResult<(RequestSink, StreamBody)> {
 			self.stamped_handle()?.open_duplex()
 		}
@@ -1345,13 +1363,13 @@ pooled_mux! {
 		///
 		/// # Errors
 		///
-		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and streaming needs the mux plane.
-		/// - The errors of [`MuxHandle::open_duplex`].
+		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and a stream needs the mux plane.
+		/// - [`TransportError`] -- the errors of [`MuxHandle::open_duplex`].
 		pub fn open_duplex_to(&self, target: impl Into<Urn<'static>>) -> TransportResult<(RequestSink, StreamBody)> {
 			self.stamped_handle()?.open_duplex_to(target)
 		}
 
-		/// Open a duplex stream carrying a fully formed [`StreamRoute`].
+		/// Open a duplex stream that carries a fully formed [`StreamRoute`].
 		///
 		/// - [`StreamRoute::to`] builds the route for an origin open.
 		/// - [`StreamRoute::relayed_to`] builds the route that re-emits a spent hop budget.
@@ -1359,12 +1377,12 @@ pooled_mux! {
 		/// Prefer [`open_duplex_to`](Self::open_duplex_to) when the route is a
 		/// plain origin target. This method is otherwise identical to
 		/// [`open_duplex`](Self::open_duplex). Crate-internal callers pass a
-		/// fully formed route when the origin helpers are not enough.
+		/// fully formed route when it carries more than an origin target.
 		///
 		/// # Errors
 		///
-		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and streaming needs the mux plane.
-		/// - The errors of [`MuxHandle::open_duplex`].
+		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and a stream needs the mux plane.
+		/// - [`TransportError`] -- the errors of [`MuxHandle::open_duplex`].
 		#[cfg(feature = "colony")]
 		pub(crate) fn open_duplex_with_route(&self, route: StreamRoute) -> TransportResult<(RequestSink, StreamBody)> {
 			self.stamped_handle()?.open_duplex_with_route(route)
@@ -1384,7 +1402,7 @@ pooled_mux! {
 		/// - [`CertificateValidationError::CertificateNotPinned`] -- another peer answered the failover.
 		async fn emit_failover(&mut self, frame: Frame, attempt: Option<usize>) -> TransportResult<Option<Frame>> {
 			if self.pool.config.mux_offer.is_none() {
-				// A mux lease exists only when an offer is configured.
+				// A mux lease exists only when `PoolConfig::mux_offer` is set.
 				return Err(TransportError::OperationFailed(TransportFailure::StreamsExhausted));
 			}
 
@@ -1487,8 +1505,7 @@ where
 			return;
 		}
 
-		// The reserved connection never materialized, so it leaves the live
-		// set.
+		// The reserved slot holds no connection, so it leaves the live set.
 		self.pool.release_connection_count();
 	}
 }
@@ -1514,5 +1531,223 @@ mod tests {
 	fn test_pool_config_with_max_connections() {
 		let config = PoolConfig { max_connections: 16, ..PoolConfig::default() };
 		assert_eq!(config.max_connections, 16);
+	}
+
+	/// A fault the trace injects where a connection leaves the pool reaches the
+	/// caller, and the connection has left by then. Each case holds a pool of
+	/// one connection, so a connection that stayed would block the next dial.
+	#[cfg(all(
+		feature = "colony",
+		feature = "transport-cms",
+		feature = "instrument",
+		feature = "testing-fault"
+	))]
+	mod eviction_faults {
+		use super::*;
+		use crate::crypto::profiles::DefaultCryptoProvider;
+		use crate::testing::{FaultModel, TestCmsServer, TestFrame};
+		use crate::transport::multiplex::MuxAcceptor;
+		use crate::transport::tcp::TightBeamSocketAddr;
+		use crate::transport::{EncryptedProtocol, TokioListener, TransportEncryptionConfig};
+		use tokio::net::TcpListener;
+
+		/// Number of reads a wait on the pool state takes, one every
+		/// [`SETTLE_INTERVAL`] for 2 s.
+		const SETTLE_ATTEMPTS: u32 = 400;
+
+		/// Interval between the reads of a wait on the pool state.
+		const SETTLE_INTERVAL: Duration = Duration::from_millis(5);
+
+		/// The fault the trace injects at each eviction, an error distinct from
+		/// every answer of the eviction paths.
+		fn injected() -> TransportError {
+			TransportError::InvalidAddress
+		}
+
+		/// A collector whose trace injects [`injected`] at every eviction.
+		fn faulting_trace() -> TraceCollector {
+			let model = FaultModel::default().with_event_fault(events::POOL_EVICTED, injected, crate::bps!(10000));
+			TraceCollector::new().with_fault_model(model)
+		}
+
+		/// A pool of one connection from `builder`, which multiplexes under
+		/// `offer` when it is set and records into `trace`.
+		fn pool_of_one(
+			builder: ConnectionPoolBuilder<TokioListener>,
+			offer: Option<TransportOffer>,
+			trace: &TraceCollector,
+		) -> Arc<ConnectionPool<TokioListener>> {
+			let config = PoolConfig { max_connections: 1, mux_offer: offer.map(Arc::new), ..PoolConfig::default() };
+			Arc::new(builder.with_config(config).with_trace(trace.share()).build())
+		}
+
+		/// A cleartext pool of one exclusive connection, beside a listener that
+		/// takes its dials and serves nothing.
+		async fn exclusive_pool(trace: &TraceCollector) -> (Arc<ConnectionPool<TokioListener>>, TcpListener) {
+			let bound = TcpListener::bind("127.0.0.1:0").await;
+			let listener = bound.expect("a loopback port binds");
+			let builder = ConnectionPool::<TokioListener>::builder().allow_cleartext();
+			(pool_of_one(builder, None, trace), listener)
+		}
+
+		/// A multiplexed pool of one connection, beside the address of a test
+		/// server that hangs up on each dial once its mux negotiation ends.
+		async fn mux_pool(trace: &TraceCollector) -> (Arc<ConnectionPool<TokioListener>>, TightBeamSocketAddr) {
+			let server = TestCmsServer::generate("Pool Server");
+			let config = TransportEncryptionConfig::<DefaultCryptoProvider>::new(server.signing_identity());
+			let bind = TightBeamSocketAddr("127.0.0.1:0".parse().expect("a loopback address parses"));
+			let (listener, addr) = TokioListener::bind_with(bind, config).await.expect("the test server binds");
+			tokio::spawn(async move {
+				while let Ok((transport, _)) = listener.accept().await {
+					let mut transport = transport.with_mux_offer(Some(TransportOffer::mux(4)));
+					// The connection ends here whatever the negotiation
+					// answered, which is the hang-up the cases wait for.
+					let _ = transport.negotiate_mux().await;
+				}
+			});
+
+			let store: Arc<dyn CertificateTrust> = Arc::new(server.store());
+			let builder = ConnectionPool::<TokioListener>::builder().with_trust_store(store);
+			(pool_of_one(builder, Some(TransportOffer::mux(4)), trace), addr)
+		}
+
+		/// The address `listener` takes dials on.
+		fn address_of(listener: &TcpListener) -> TightBeamSocketAddr {
+			TightBeamSocketAddr(listener.local_addr().expect("a bound listener has an address"))
+		}
+
+		/// Polls `settled` every [`SETTLE_INTERVAL`] for up to
+		/// [`SETTLE_ATTEMPTS`] reads, and asserts that it held. The socket work
+		/// it waits on runs on other tasks.
+		async fn await_settled(mut settled: impl FnMut() -> bool) {
+			let mut attempts = 0;
+			while !settled() && attempts < SETTLE_ATTEMPTS {
+				tokio::time::sleep(SETTLE_INTERVAL).await;
+				attempts += 1;
+			}
+
+			assert!(settled(), "the pool state settles");
+		}
+
+		/// Whether the pool holds idle connections to `addr` and each one has
+		/// lost its peer.
+		fn idle_leases_dead(pool: &ConnectionPool<TokioListener>, addr: &TightBeamSocketAddr) -> bool {
+			let pools = pool.pools.read().expect("the pool map is unpoisoned");
+			pools.get(addr).is_some_and(|dest_pool| {
+				let idle = &dest_pool.available;
+				let dead = idle.iter().all(|entry| {
+					let transport = entry.client.transport();
+					!<TokioListener as PersistentConnection>::is_connected(transport)
+				});
+				!idle.is_empty() && dead
+			})
+		}
+
+		/// Whether the pool holds mux connections to `addr` and the reader of
+		/// each one has ended.
+		fn mux_connections_ended(pool: &ConnectionPool<TokioListener>, addr: &TightBeamSocketAddr) -> bool {
+			let pools = pool.pools.read().expect("the pool map is unpoisoned");
+			pools.get(addr).is_some_and(|dest_pool| {
+				let held = &dest_pool.mux;
+				!held.is_empty() && held.iter().all(|entry| entry.reader_task.is_finished())
+			})
+		}
+
+		/// Whether a connect to `addr` dials a connection of its own. In a pool
+		/// of one, it does only when the pool holds and counts no other.
+		///
+		/// # Errors
+		///
+		/// - [`TransportFailure::ResourceExhausted`] -- the pool still counts the connection that left.
+		/// - [`TransportError`] -- any other error of [`ConnectionPool::connect`].
+		async fn connects_fresh(
+			pool: &Arc<ConnectionPool<TokioListener>>,
+			addr: TightBeamSocketAddr,
+			trace: &TraceCollector,
+		) -> TransportResult<bool> {
+			let dials_before = trace.recorded(events::POOL_DIAL);
+			let _lease = pool.connect(addr).await?;
+			Ok(trace.recorded(events::POOL_DIAL) == dials_before + 1)
+		}
+
+		/// An idle exclusive connection whose peer reset it leaves the pool
+		/// when a connect finds it, before the fault at its eviction reaches
+		/// that connect.
+		#[tokio::test]
+		async fn a_fault_at_evicting_a_dead_idle_lease_reaches_the_connect() -> TransportResult<()> {
+			let trace = faulting_trace();
+			let (pool, listener) = exclusive_pool(&trace).await;
+			let addr = address_of(&listener);
+			let lease = pool.connect(addr).await?;
+			let (served, _) = listener.accept().await?;
+			drop(lease);
+			served.set_zero_linger()?;
+			drop(served);
+			await_settled(|| idle_leases_dead(&pool, &addr)).await;
+
+			let evicted = pool.connect(addr).await;
+			assert!(matches!(evicted, Err(TransportError::InvalidAddress)));
+			assert!(connects_fresh(&pool, addr, &trace).await?);
+			Ok(())
+		}
+
+		/// A mux connection whose reader ended leaves the pool when a connect
+		/// finds it, before the fault at its eviction reaches that connect.
+		#[tokio::test]
+		async fn a_fault_at_evicting_an_ended_mux_connection_reaches_the_connect() -> TransportResult<()> {
+			let trace = faulting_trace();
+			let (pool, addr) = mux_pool(&trace).await;
+			drop(pool.connect(addr).await?);
+			await_settled(|| mux_connections_ended(&pool, &addr)).await;
+
+			let evicted = pool.connect(addr).await;
+			assert!(matches!(evicted, Err(TransportError::InvalidAddress)));
+			assert!(connects_fresh(&pool, addr, &trace).await?);
+			Ok(())
+		}
+
+		/// An emit that meets a closed mux connection evicts it, and the fault
+		/// at the eviction reaches the emit after the connection left the pool.
+		#[tokio::test]
+		async fn a_fault_at_evicting_after_a_closed_emit_reaches_the_emit() -> TransportResult<()> {
+			let trace = faulting_trace();
+			let (pool, addr) = mux_pool(&trace).await;
+			let mut lease = pool.connect(addr).await?;
+			await_settled(|| mux_connections_ended(&pool, &addr)).await;
+
+			let emitted = lease.emit(TestFrame::v0(None, None), None).await;
+			assert!(matches!(emitted, Err(TransportError::InvalidAddress)));
+			assert!(connects_fresh(&pool, addr, &trace).await?);
+			Ok(())
+		}
+
+		/// A discarded mux lease evicts its connection, and the fault at the
+		/// eviction reaches the discard after the connection left the pool.
+		#[tokio::test]
+		async fn a_fault_at_discarding_a_mux_lease_reaches_the_discard() -> TransportResult<()> {
+			let trace = faulting_trace();
+			let (pool, addr) = mux_pool(&trace).await;
+			let lease = pool.connect(addr).await?;
+
+			let discarded = lease.discard();
+			assert!(matches!(discarded, Err(TransportError::InvalidAddress)));
+			assert!(connects_fresh(&pool, addr, &trace).await?);
+			Ok(())
+		}
+
+		/// A discarded exclusive lease closes its connection, and the fault at
+		/// the eviction reaches the discard after the connection left the pool.
+		#[tokio::test]
+		async fn a_fault_at_discarding_an_exclusive_lease_reaches_the_discard() -> TransportResult<()> {
+			let trace = faulting_trace();
+			let (pool, listener) = exclusive_pool(&trace).await;
+			let addr = address_of(&listener);
+			let lease = pool.connect(addr).await?;
+
+			let discarded = lease.discard();
+			assert!(matches!(discarded, Err(TransportError::InvalidAddress)));
+			assert!(connects_fresh(&pool, addr, &trace).await?);
+			Ok(())
+		}
 	}
 }

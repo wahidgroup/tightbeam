@@ -33,7 +33,7 @@ impl ChessMatchManager {
 	///
 	/// - [`ChessMoveError::InvalidMove`] -- the client's move is illegal on the authoritative board.
 	/// - [`ChessMoveError::TightBeam`] -- a state lock is poisoned, or
-	///   `TraceCollector::event` refuses an event.
+	///   [`TraceCollector::event`] refuses an event.
 	pub(crate) fn process_move(
 		&self,
 		move_req: &ChessMoveRequest,
@@ -77,9 +77,9 @@ impl ChessMatchManager {
 			to_col: move_req.to_col,
 		};
 
-		if !game_state.is_move_valid(&client_move, is_white_turn) {
+		if let Err(refusal) = game_state.check_move(&client_move, is_white_turn) {
 			trace.event(events::SERVER_MOVE_INVALID)?;
-			return Err(ChessMoveError::InvalidMove);
+			return Err(refusal);
 		}
 
 		trace.event(events::SERVER_MOVE_VALIDATED)?;
@@ -129,6 +129,11 @@ impl ChessMatchManager {
 	}
 
 	/// The current game state as a matrix, for the response.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError::MatrixError`] -- the game state lock is poisoned, or
+	///   the board does not convert to a matrix.
 	pub(crate) fn game_state_matrix(&self) -> Result<MatrixDyn, TightBeamError> {
 		let game_state = self
 			.game_state
@@ -185,7 +190,12 @@ pub(crate) enum GameStatusCode {
 
 // The servlet answers a refused move through this helper.
 
-/// Builds the `InvalidMove` response frame to the request `id` at `order`.
+/// Builds the `InvalidMove` response frame to the request `id`, at the order
+/// after `order`.
+///
+/// # Errors
+///
+/// - [`TightBeamError`] -- the errors of [`compose!`].
 pub(crate) fn create_invalid_move_response(id: impl Into<Vec<u8>>, order: u64) -> Result<Frame, TightBeamError> {
 	let id: Vec<u8> = id.into();
 	let response = ChessMoveResponse { game_status: GameStatusCode::InvalidMove };
@@ -267,9 +277,10 @@ mod tests {
 
 	/// The server's reply records the kind of the piece it moves.
 	///
-	/// In the start position of this harness a knight holds every legal move
-	/// of either side, so the client's move and the server's reply each record
-	/// a knight event.
+	/// The server plays the move at index `order % count` of its list of legal
+	/// moves, and the list holds the back row ahead of the pawns. At order 1
+	/// that is the knight move from b1 to a3, so the client's move and the
+	/// server's reply each record a knight event.
 	#[test]
 	fn the_server_move_records_its_piece_kind() -> Result<(), ChessMoveError> {
 		let manager = ChessMatchManager::default();

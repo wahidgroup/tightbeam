@@ -3,17 +3,18 @@
 use tightbeam::matrix::{Matrix, MatrixDyn, MatrixError, MatrixLike};
 use tightbeam::urn::Urn;
 
+use super::board::ChessMoveError;
 use super::constants::MAX_MOVES_TO_FIND;
 use super::piece;
 use super::r#move::ChessMove;
 
-/// Chess game state management
+/// The chess board of one game.
 ///
-/// Uses Matrix<8> (8x8 chess board)
-/// Move counting is handled at the protocol level (ChessMatchManager)
+/// A `Matrix<8>` holds the 8x8 board, one piece code for each square, and
+/// `ChessMatchManager` counts the moves at the protocol level.
 #[derive(Clone)]
 pub struct ChessGameState {
-	board: Matrix<8>, // 8x8 chess board
+	board: Matrix<8>, // Row 0 is White's back row.
 }
 
 impl Default for ChessGameState {
@@ -26,8 +27,7 @@ impl ChessGameState {
 	pub fn new() -> Self {
 		let mut board = Matrix::<8>::new();
 
-		// Initialize standard chess starting position
-		// White pieces (row 0-1)
+		// The standard starting position puts White on rows 0 and 1.
 		board.set(0, 0, piece::WHITE_ROOK.into());
 		board.set(0, 1, piece::WHITE_KNIGHT.into());
 		board.set(0, 2, piece::WHITE_BISHOP.into());
@@ -41,7 +41,7 @@ impl ChessGameState {
 			board.set(1, col, piece::WHITE_PAWN.into());
 		}
 
-		// Black pieces (row 6-7)
+		// Black starts on rows 6 and 7.
 		for col in 0..8 {
 			board.set(6, col, piece::BLACK_PAWN.into());
 		}
@@ -58,32 +58,30 @@ impl ChessGameState {
 		Self { board }
 	}
 
-	// ============================================================================
-	// MOVE GENERATION
-	// ============================================================================
+	// Move generation lists the legal moves of one side.
 
-	/// Generate all valid moves for current player
+	/// The first [`MAX_MOVES_TO_FIND`] legal moves of the side that
+	/// `is_white_turn` names, in board order.
 	pub(crate) fn to_valid_moves(&self, is_white_turn: bool) -> Vec<ChessMove> {
 		let mut moves = Vec::new();
-		// Iterate only through pieces that belong to current player
 		for from_row in 0..8 {
 			for from_col in 0..8 {
 				let Some(piece) = piece::Piece::from_u8(self.board.get(from_row, from_col)) else {
-					continue; // Empty square
+					continue; // The square is empty.
 				};
 
 				if piece.is_white() != is_white_turn {
-					continue; // Not current player's piece
+					continue; // The piece belongs to the other side.
 				}
 
-				// Generate candidate moves based on piece type
-				// Validate each candidate move (check check)
+				// A candidate move is legal when it leaves the king of the
+				// moving side out of check.
 				let candidates = self.to_piece_moves(from_row, from_col, piece);
 				for (to_row, to_col) in candidates {
 					let chess_move = ChessMove { from_row, from_col, to_row, to_col };
 					if !self.is_exposing_king(&chess_move, is_white_turn) {
 						moves.push(chess_move);
-						// Early exit if we have enough moves
+						// The cap bounds the cost of a fuzz run.
 						if moves.len() >= MAX_MOVES_TO_FIND {
 							return moves;
 						}
@@ -94,20 +92,21 @@ impl ChessGameState {
 		moves
 	}
 
-	/// Generate random valid move for current player
-	/// Returns None if no valid moves exist (checkmate/stalemate)
+	/// The legal move at index `seed % count` of [`Self::to_valid_moves`], or
+	/// `None` when the side has no legal move (checkmate or stalemate).
 	pub(crate) fn to_random_valid_move(&self, is_white_turn: bool, seed: u64) -> Option<ChessMove> {
 		let valid_moves = self.to_valid_moves(is_white_turn);
 		if valid_moves.is_empty() {
 			return None;
 		}
 
-		// Deterministic selection based on seed for reproducible fuzzing
+		// The seed picks the move, so a fuzz input replays the same game.
 		let index = (seed as usize) % valid_moves.len();
 		Some(valid_moves[index])
 	}
 
-	/// Generate candidate moves for a specific piece
+	/// The squares that `piece` on (`from_row`, `from_col`) can reach, before
+	/// the check test.
 	fn to_piece_moves(&self, from_row: u8, from_col: u8, piece: piece::Piece) -> Vec<(u8, u8)> {
 		let mut candidates = Vec::new();
 
@@ -116,11 +115,12 @@ impl ChessGameState {
 				let forward = piece.color.to_pawn_forward_direction();
 				let start_row = piece.color.to_pawn_start_row();
 
-				// Forward move(s)
+				// A pawn steps forward onto an empty square.
 				if let Some(forward_row) = Self::to_valid_coord(from_row as i8 + forward) {
 					if self.is_empty(forward_row, from_col) {
 						candidates.push((forward_row, from_col));
-						// Double move from start row
+						// From its start row, a pawn may step two squares when
+						// both are empty.
 						if from_row == start_row {
 							if let Some(double_row) = Self::to_valid_coord(from_row as i8 + forward * 2) {
 								if self.is_empty(double_row, from_col) {
@@ -131,7 +131,7 @@ impl ChessGameState {
 					}
 				}
 
-				// Diagonal captures
+				// A pawn captures one square diagonally forward.
 				for col_offset in [-1i8, 1i8] {
 					if let (Some(capture_row), Some(capture_col)) = (
 						Self::to_valid_coord(from_row as i8 + forward),
@@ -144,13 +144,13 @@ impl ChessGameState {
 				}
 			}
 			piece::PieceKind::Rook | piece::PieceKind::Bishop | piece::PieceKind::Queen => {
-				// Pieces that move along lines (rook, bishop, queen)
+				// A rook, a bishop, and a queen move along lines.
 				if let Some(directions) = piece.kind.as_move_directions() {
 					self.add_line_moves(&mut candidates, from_row, from_col, piece, directions);
 				}
 			}
 			piece::PieceKind::Knight => {
-				// Knight uses fixed offsets
+				// A knight jumps to fixed offsets.
 				if let Some(offsets) = piece.kind.as_move_offsets() {
 					for (row_offset, col_offset) in offsets.iter().copied() {
 						self.try_add_move(&mut candidates, from_row, from_col, row_offset, col_offset, piece);
@@ -158,7 +158,7 @@ impl ChessGameState {
 				}
 			}
 			piece::PieceKind::King => {
-				// 8 adjacent squares
+				// A king steps to one of the eight adjacent squares.
 				for row_offset in -1..=1 {
 					for col_offset in -1..=1 {
 						if row_offset == 0 && col_offset == 0 {
@@ -173,7 +173,8 @@ impl ChessGameState {
 		candidates
 	}
 
-	/// Convert i8 coordinate to valid u8 if in bounds [0, 8)
+	/// The coordinate `coord` as a `u8`, or `None` when it is off the board,
+	/// outside `0..8`.
 	fn to_valid_coord(coord: i8) -> Option<u8> {
 		if (0..8).contains(&coord) {
 			Some(coord as u8)
@@ -182,12 +183,13 @@ impl ChessGameState {
 		}
 	}
 
-	/// Check if square is empty
+	/// Whether the square is empty.
 	fn is_empty(&self, row: u8, col: u8) -> bool {
 		piece::Piece::from_u8(self.board.get(row, col)).is_none()
 	}
 
-	/// Check if square contains an opponent piece that can be captured
+	/// Whether the square holds a piece of the other side, which `piece` can
+	/// capture.
 	fn can_capture(&self, row: u8, col: u8, piece: piece::Piece) -> bool {
 		if let Some(dest_piece) = piece::Piece::from_u8(self.board.get(row, col)) {
 			dest_piece.color != piece.color
@@ -196,16 +198,18 @@ impl ChessGameState {
 		}
 	}
 
-	/// Check if square is valid for a move (empty or contains opponent piece)
+	/// Whether `piece` can move to the square, which is empty or holds a piece
+	/// of the other side.
 	fn can_move_to(&self, row: u8, col: u8, piece: piece::Piece) -> bool {
 		if let Some(dest_piece) = piece::Piece::from_u8(self.board.get(row, col)) {
 			dest_piece.color != piece.color
 		} else {
-			true // Empty square
+			true // The square is empty.
 		}
 	}
 
-	/// Try to add a move if coordinates are valid and square is moveable
+	/// Adds the square at the offset from (`from_row`, `from_col`) when it is
+	/// on the board and `piece` can move to it.
 	fn try_add_move(
 		&self,
 		candidates: &mut Vec<(u8, u8)>,
@@ -225,7 +229,8 @@ impl ChessGameState {
 		}
 	}
 
-	/// Add moves along a line (for rook, bishop, queen)
+	/// Adds every square along each of `directions` up to the first piece, and
+	/// the square of that piece when `piece` can capture it.
 	fn add_line_moves(
 		&self,
 		candidates: &mut Vec<(u8, u8)>,
@@ -244,54 +249,67 @@ impl ChessGameState {
 				current_col += col_step;
 
 				let Some(to_row) = Self::to_valid_coord(current_row) else {
-					break; // Out of bounds
+					break; // The line leaves the board.
 				};
 				let Some(to_col) = Self::to_valid_coord(current_col) else {
-					break; // Out of bounds
+					break; // The line leaves the board.
 				};
 
 				if self.is_empty(to_row, to_col) {
 					candidates.push((to_row, to_col));
 				} else {
-					// Can capture opponent piece, then stop
+					// A piece of the other side is a capture.
 					if self.can_capture(to_row, to_col, piece) {
 						candidates.push((to_row, to_col));
 					}
-					break; // Blocked by any piece
+					break; // Any piece ends the line.
 				}
 			}
 		}
 	}
 
-	// ============================================================================
-	// MOVE VALIDATION
-	// ============================================================================
+	// Move validation checks one requested move.
 
-	/// Check if move is valid for the given game state
+	/// Checks `chess_move` for the side that `is_white_turn` names, as
+	/// [`Self::is_move_valid`] decides it.
+	///
+	/// # Errors
+	///
+	/// - [`ChessMoveError::InvalidMove`] -- the move is illegal on this board.
+	pub(crate) fn check_move(&self, chess_move: &ChessMove, is_white_turn: bool) -> Result<(), ChessMoveError> {
+		if !self.is_move_valid(chess_move, is_white_turn) {
+			return Err(ChessMoveError::InvalidMove);
+		}
+
+		Ok(())
+	}
+
+	/// Whether `chess_move` is legal on this board for the side that
+	/// `is_white_turn` names.
 	pub(crate) fn is_move_valid(&self, chess_move: &ChessMove, is_white_turn: bool) -> bool {
-		// Basic validation: bounds checking
+		// Every coordinate must be on the board.
 		if chess_move.from_row >= 8 || chess_move.from_col >= 8 || chess_move.to_row >= 8 || chess_move.to_col >= 8 {
 			return false;
 		}
 
-		// Check if source square has a piece
+		// The source square must hold a piece.
 		let Some(piece) = piece::Piece::from_u8(self.board.get(chess_move.from_row, chess_move.from_col)) else {
 			return false;
 		};
 
-		// Check if it's the correct player's turn
+		// The piece must belong to the side to move.
 		if piece.is_white() != is_white_turn {
 			return false;
 		}
 
-		// Check if destination square is not occupied by own piece
+		// A move onto a piece of the same side is illegal.
 		if let Some(dest_piece) = piece::Piece::from_u8(self.board.get(chess_move.to_row, chess_move.to_col)) {
 			if dest_piece.color == piece.color {
-				return false; // Can't capture own piece
+				return false; // The square holds a piece of the same side.
 			}
 		}
 
-		// Piece-specific movement validation
+		// Each kind of piece moves by its own rule.
 		let row_diff = chess_move.to_row as i8 - chess_move.from_row as i8;
 		let col_diff = chess_move.to_col as i8 - chess_move.from_col as i8;
 		let row_diff_abs = row_diff.unsigned_abs();
@@ -299,47 +317,26 @@ impl ChessGameState {
 
 		let piece_valid = match piece.kind {
 			piece::PieceKind::Pawn => {
-				// Pawn moves forward only
-				if (piece.is_white() && row_diff >= 0) || (!piece.is_white() && row_diff <= 0) {
-					return false; // Must move forward
-				}
-
-				// Capture: diagonal forward by 1
-				if col_diff_abs == 1 && row_diff_abs == 1 {
-					return piece::Piece::from_u8(self.board.get(chess_move.to_row, chess_move.to_col)).is_some();
-					// Must capture
-				}
-
-				// Forward move: straight forward
-				if col_diff_abs == 0 {
-					if piece::Piece::from_u8(self.board.get(chess_move.to_row, chess_move.to_col)).is_some() {
-						return false; // Can't capture forward
-					}
-					// Can move 1 or 2 squares from start row
-					if chess_move.from_row == piece.color.to_pawn_start_row() {
-						row_diff_abs == 1 || row_diff_abs == 2
-					} else {
-						row_diff_abs == 1
-					}
-				} else {
-					false
-				}
+				// A pawn may make the moves that generation lists for it, so
+				// the two agree on its direction, its double step, and its
+				// capture.
+				let candidates = self.to_piece_moves(chess_move.from_row, chess_move.from_col, piece);
+				candidates.contains(&(chess_move.to_row, chess_move.to_col))
 			}
 			piece::PieceKind::Rook => {
-				// Rook moves horizontally or vertically only
+				// A rook moves along a row or a column, over empty squares.
 				if row_diff_abs == 0 || col_diff_abs == 0 {
-					// Check if path is clear
 					self.is_path_clear(chess_move.from_row, chess_move.from_col, chess_move.to_row, chess_move.to_col)
 				} else {
 					false
 				}
 			}
 			piece::PieceKind::Knight => {
-				// Knight moves in L-shape: 2 squares in one direction, 1 square perpendicular
+				// A knight moves two squares one way and one square across.
 				(row_diff_abs == 2 && col_diff_abs == 1) || (row_diff_abs == 1 && col_diff_abs == 2)
 			}
 			piece::PieceKind::Bishop => {
-				// Bishop moves diagonally only
+				// A bishop moves along a diagonal, over empty squares.
 				if row_diff_abs == col_diff_abs {
 					self.is_path_clear(chess_move.from_row, chess_move.from_col, chess_move.to_row, chess_move.to_col)
 				} else {
@@ -347,7 +344,8 @@ impl ChessGameState {
 				}
 			}
 			piece::PieceKind::Queen => {
-				// Queen moves horizontally, vertically, or diagonally
+				// A queen moves along a row, a column, or a diagonal, over
+				// empty squares.
 				if row_diff_abs == 0 || col_diff_abs == 0 || row_diff_abs == col_diff_abs {
 					self.is_path_clear(chess_move.from_row, chess_move.from_col, chess_move.to_row, chess_move.to_col)
 				} else {
@@ -355,7 +353,7 @@ impl ChessGameState {
 				}
 			}
 			piece::PieceKind::King => {
-				// King moves one square in any direction
+				// A king moves one square in any direction.
 				row_diff_abs <= 1 && col_diff_abs <= 1
 			}
 		};
@@ -364,53 +362,21 @@ impl ChessGameState {
 			return false;
 		}
 
-		// Check if move would expose king to check
+		// A move that leaves the king of the moving side in check is illegal.
 		!self.is_exposing_king(chess_move, is_white_turn)
 	}
 
-	/// Check if this move would expose the king to check
+	/// Whether `chess_move` leaves the king of the moving side in check.
 	fn is_exposing_king(&self, chess_move: &ChessMove, is_white_turn: bool) -> bool {
-		// Check if king would be in check after making this move
-		// We simulate the move by checking with modified square values
-		let Some(piece) = piece::Piece::from_u8(self.board.get(chess_move.from_row, chess_move.from_col)) else {
-			return false;
-		};
-		let piece_u8: u8 = piece.into();
-		let attacker_is_white = !is_white_turn;
+		// The board after the move decides, so a line that the move opens
+		// counts, and a piece that the move captures stops its attack.
+		let mut after = self.clone();
+		after.apply_move(chess_move);
 
-		// Find the king's position (may change if moving the king)
-		let king_pos = match self.find_king(is_white_turn) {
-			Some(pos) => pos,
-			None => return false, // No king found
-		};
-
-		// If moving the king, check the destination square
-		let target_row = if king_pos.0 == chess_move.from_row && king_pos.1 == chess_move.from_col {
-			chess_move.to_row
-		} else {
-			king_pos.0
-		};
-		let target_col = if king_pos.0 == chess_move.from_row && king_pos.1 == chess_move.from_col {
-			chess_move.to_col
-		} else {
-			king_pos.1
-		};
-
-		// Check if any opponent piece can attack the king's square
-		// Account for the temporary move: from square is empty, to square has the piece
-		self.can_attack_square_with_move(
-			target_row,
-			target_col,
-			attacker_is_white,
-			chess_move.from_row,
-			chess_move.from_col,
-			chess_move.to_row,
-			chess_move.to_col,
-			piece_u8,
-		)
+		after.is_in_check(is_white_turn)
 	}
 
-	/// Check if path is clear between two squares
+	/// Whether every square strictly between the two squares is empty.
 	fn is_path_clear(&self, from_row: u8, from_col: u8, to_row: u8, to_col: u8) -> bool {
 		let row_step = if to_row > from_row {
 			1
@@ -430,28 +396,28 @@ impl ChessGameState {
 		let mut current_row = from_row as i8 + row_step;
 		let mut current_col = from_col as i8 + col_step;
 		let mut iterations = 0;
-		const MAX_ITERATIONS: i32 = 8; // Maximum distance on 8x8 board
+		const MAX_ITERATIONS: i32 = 8; // A bound past the longest line on the board.
 
 		while (current_row != to_row as i8 || current_col != to_col as i8) && iterations < MAX_ITERATIONS {
 			iterations += 1;
 
-			// Use safe coordinate conversion to prevent out-of-bounds access
+			// The conversion keeps each read on the board.
 			let Some(cr) = Self::to_valid_coord(current_row) else {
-				return false; // Out of bounds - path not clear
+				return false; // A path off the board is blocked.
 			};
 			let Some(cc) = Self::to_valid_coord(current_col) else {
-				return false; // Out of bounds - path not clear
+				return false; // A path off the board is blocked.
 			};
 
 			if piece::Piece::from_u8(self.board.get(cr, cc)).is_some() {
-				return false; // Path blocked
+				return false; // A piece blocks the path.
 			}
 
 			current_row += row_step;
 			current_col += col_step;
 		}
 
-		// If loop terminated due to iteration limit, path is not clear
+		// A path that reaches the iteration bound is blocked.
 		if iterations >= MAX_ITERATIONS {
 			return false;
 		}
@@ -459,9 +425,9 @@ impl ChessGameState {
 		true
 	}
 
-	/// Check if a square can be attacked by opponent pieces
+	/// Whether a piece of the side that `attacker_is_white` names attacks the
+	/// target square.
 	pub(crate) fn can_attack_square(&self, target_row: u8, target_col: u8, attacker_is_white: bool) -> bool {
-		// Check if any piece of the attacker's color can attack the target square
 		for row in 0..8 {
 			for col in 0..8 {
 				let Some(piece) = piece::Piece::from_u8(self.board.get(row, col)) else {
@@ -469,10 +435,9 @@ impl ChessGameState {
 				};
 
 				if piece.is_white() != attacker_is_white {
-					continue; // Not attacker's piece
+					continue; // The piece belongs to the other side.
 				}
 
-				// Check if this piece can attack the target square
 				if self.can_piece_attack_square(row, col, target_row, target_col, piece) {
 					return true;
 				}
@@ -481,10 +446,12 @@ impl ChessGameState {
 		false
 	}
 
-	/// Check if a specific piece can attack a square
+	/// Whether `piece` on (`from_row`, `from_col`) attacks the square
+	/// (`to_row`, `to_col`).
 	fn can_piece_attack_square(&self, from_row: u8, from_col: u8, to_row: u8, to_col: u8, piece: piece::Piece) -> bool {
-		// Check if this specific piece can attack the target square
-		// This is similar to validate_move but doesn't check turn or destination occupancy
+		// Unlike `is_move_valid`, the test reads only the geometry and the
+		// path, so it holds for either side to move and any piece on the target
+		// square.
 		let row_diff = to_row as i8 - from_row as i8;
 		let col_diff = to_col as i8 - from_col as i8;
 		let row_diff_abs = row_diff.unsigned_abs();
@@ -492,13 +459,11 @@ impl ChessGameState {
 
 		match piece.kind {
 			piece::PieceKind::Pawn => {
-				// Pawns attack diagonally forward
-				row_diff_abs == 1
-					&& col_diff_abs == 1
-					&& ((piece.is_white() && row_diff < 0) || (!piece.is_white() && row_diff > 0))
+				// A pawn attacks one square diagonally forward.
+				row_diff_abs == 1 && col_diff_abs == 1 && row_diff == piece.color.to_pawn_forward_direction()
 			}
 			piece::PieceKind::Rook => {
-				// Rook attacks horizontally or vertically
+				// A rook attacks along a row or a column, over empty squares.
 				if (row_diff_abs == 0 || col_diff_abs == 0) && (row_diff_abs > 0 || col_diff_abs > 0) {
 					self.is_path_clear(from_row, from_col, to_row, to_col)
 				} else {
@@ -506,11 +471,11 @@ impl ChessGameState {
 				}
 			}
 			piece::PieceKind::Knight => {
-				// Knight attacks in L-shape
+				// A knight attacks two squares one way and one square across.
 				(row_diff_abs == 2 && col_diff_abs == 1) || (row_diff_abs == 1 && col_diff_abs == 2)
 			}
 			piece::PieceKind::Bishop => {
-				// Bishop attacks diagonally
+				// A bishop attacks along a diagonal, over empty squares.
 				if row_diff_abs == col_diff_abs && row_diff_abs > 0 {
 					self.is_path_clear(from_row, from_col, to_row, to_col)
 				} else {
@@ -518,7 +483,8 @@ impl ChessGameState {
 				}
 			}
 			piece::PieceKind::Queen => {
-				// Queen attacks horizontally, vertically, or diagonally
+				// A queen attacks along a row, a column, or a diagonal, over
+				// empty squares.
 				if (row_diff_abs == 0 || col_diff_abs == 0 || row_diff_abs == col_diff_abs)
 					&& (row_diff_abs > 0 || col_diff_abs > 0)
 				{
@@ -528,209 +494,49 @@ impl ChessGameState {
 				}
 			}
 			piece::PieceKind::King => {
-				// King attacks adjacent squares
+				// A king attacks the eight adjacent squares.
 				row_diff_abs <= 1 && col_diff_abs <= 1 && (row_diff_abs > 0 || col_diff_abs > 0)
 			}
 		}
 	}
 
-	/// Check if a square can be attacked, accounting for a temporary move
-	#[allow(clippy::too_many_arguments)]
-	fn can_attack_square_with_move(
-		&self,
-		target_row: u8,
-		target_col: u8,
-		attacker_is_white: bool,
-		move_from_row: u8,
-		move_from_col: u8,
-		move_to_row: u8,
-		move_to_col: u8,
-		moved_piece: u8,
-	) -> bool {
-		// Check all squares for attacker pieces, accounting for the temporary move
-		for row in 0..8 {
-			for col in 0..8 {
-				// Determine what piece is actually on this square (accounting for the move)
-				let piece_opt = if row == move_from_row && col == move_from_col {
-					None // Piece moved from here
-				} else if row == move_to_row && col == move_to_col {
-					piece::Piece::from_u8(moved_piece) // Piece moved here
-				} else {
-					piece::Piece::from_u8(self.board.get(row, col))
-				};
+	// Move application updates the board.
 
-				let Some(piece) = piece_opt else {
-					continue;
-				};
-
-				if piece.is_white() != attacker_is_white {
-					continue; // Not attacker's piece
-				}
-
-				// Check if this piece can attack the target square
-				// Account for the temporary move when checking path
-				if self.can_piece_attack_with_move(
-					row,
-					col,
-					piece,
-					target_row,
-					target_col,
-					move_from_row,
-					move_from_col,
-					move_to_row,
-					move_to_col,
-					moved_piece,
-				) {
-					return true;
-				}
-			}
-		}
-		false
-	}
-
-	/// Check if a piece can attack a square, accounting for a temporary move
-	#[allow(clippy::too_many_arguments)]
-	fn can_piece_attack_with_move(
-		&self,
-		from_row: u8,
-		from_col: u8,
-		piece: piece::Piece,
-		to_row: u8,
-		to_col: u8,
-		move_from_row: u8,
-		move_from_col: u8,
-		move_to_row: u8,
-		move_to_col: u8,
-		moved_piece: u8,
-	) -> bool {
-		// Use the same attack logic as can_attack_square, but account for the temporary move
-		if !self.can_piece_attack_square(from_row, from_col, to_row, to_col, piece) {
-			return false;
-		}
-
-		// Check if path is clear, accounting for the temporary move
-		self.is_path_clear_with_move(
-			from_row,
-			from_col,
-			to_row,
-			to_col,
-			move_from_row,
-			move_from_col,
-			move_to_row,
-			move_to_col,
-			moved_piece,
-		)
-	}
-
-	/// Check if path is clear, accounting for a temporary move
-	#[allow(clippy::too_many_arguments)]
-	fn is_path_clear_with_move(
-		&self,
-		from_row: u8,
-		from_col: u8,
-		to_row: u8,
-		to_col: u8,
-		move_from_row: u8,
-		move_from_col: u8,
-		move_to_row: u8,
-		move_to_col: u8,
-		moved_piece: u8,
-	) -> bool {
-		let row_step = if to_row > from_row {
-			1
-		} else if to_row < from_row {
-			-1
-		} else {
-			0
-		};
-		let col_step = if to_col > from_col {
-			1
-		} else if to_col < from_col {
-			-1
-		} else {
-			0
-		};
-
-		let mut current_row = from_row as i8 + row_step;
-		let mut current_col = from_col as i8 + col_step;
-		let mut iterations = 0;
-		const MAX_ITERATIONS: i32 = 8; // Maximum distance on 8x8 board
-
-		while (current_row != to_row as i8 || current_col != to_col as i8) && iterations < MAX_ITERATIONS {
-			iterations += 1;
-
-			// Use safe coordinate conversion to prevent out-of-bounds access
-			let Some(cr) = Self::to_valid_coord(current_row) else {
-				return false; // Out of bounds - path not clear
-			};
-			let Some(cc) = Self::to_valid_coord(current_col) else {
-				return false; // Out of bounds - path not clear
-			};
-
-			// Determine what piece is actually on this square (accounting for the move)
-			let piece_opt = if cr == move_from_row && cc == move_from_col {
-				None // Piece moved from here
-			} else if cr == move_to_row && cc == move_to_col {
-				piece::Piece::from_u8(moved_piece) // Piece moved here
-			} else {
-				piece::Piece::from_u8(self.board.get(cr, cc))
-			};
-
-			if piece_opt.is_some() {
-				return false; // Path blocked
-			}
-			current_row += row_step;
-			current_col += col_step;
-		}
-
-		// If loop terminated due to iteration limit, path is not clear
-		if iterations >= MAX_ITERATIONS {
-			return false;
-		}
-
-		true
-	}
-
-	// ============================================================================
-	// MOVE APPLICATION
-	// ============================================================================
-
-	/// Apply this move to the game state
+	/// Moves the piece on the source square of `chess_move` to its target
+	/// square and empties the source square.
 	pub(crate) fn apply_move(&mut self, chess_move: &ChessMove) {
 		let piece = self.board.get(chess_move.from_row, chess_move.from_col);
 		self.board_mut().set(chess_move.to_row, chess_move.to_col, piece);
-		self.board_mut().set(chess_move.from_row, chess_move.from_col, 0u8); // Empty square
+		self.board_mut().set(chess_move.from_row, chess_move.from_col, 0u8); // The source square empties.
 	}
 
-	// ============================================================================
-	// GAME STATE QUERIES
-	// ============================================================================
+	// Game state queries read check, checkmate, and stalemate.
 
-	/// Check if the current player's king is in check
+	/// Whether the king of the side that `is_white_turn` names is in check.
 	pub fn is_in_check(&self, is_white_turn: bool) -> bool {
-		// Find the king's position
 		let king_pos = match self.find_king(is_white_turn) {
 			Some(pos) => pos,
-			None => return false, // No king found (shouldn't happen in valid game)
+			None => return false, // A legal game holds both kings.
 		};
 
-		// Check if any opponent piece can attack the king's square
+		// A side is in check when a piece of the other side attacks its king.
 		self.can_attack_square(king_pos.0, king_pos.1, !is_white_turn)
 	}
 
-	/// Check if the current position is stalemate
+	/// Whether the side that `is_white_turn` names is in stalemate.
 	pub fn is_stalemate(&self, is_white_turn: bool) -> bool {
-		// Stalemate: no valid moves available AND king is NOT in check
+		// A side in stalemate has no legal move, and its king is out of check.
 		self.to_valid_moves(is_white_turn).is_empty() && !self.is_in_check(is_white_turn)
 	}
 
-	/// Check if the current position is checkmate
+	/// Whether the side that `is_white_turn` names is in checkmate.
 	pub fn is_checkmate(&self, is_white_turn: bool) -> bool {
-		// Checkmate: no valid moves available AND king IS in check
+		// A side in checkmate has no legal move, and its king is in check.
 		self.to_valid_moves(is_white_turn).is_empty() && self.is_in_check(is_white_turn)
 	}
 
-	/// Determine game status based on valid moves and check state
+	/// The game status of the side that `is_white_turn` names, from its legal
+	/// moves and its check.
 	pub(crate) fn determine_game_status(&self, is_white_turn: bool) -> super::board::GameStatusCode {
 		let valid_moves = self.to_valid_moves(is_white_turn);
 		let is_in_check = self.is_in_check(is_white_turn);
@@ -744,12 +550,10 @@ impl ChessGameState {
 		}
 	}
 
-	// ============================================================================
-	// STATE ACCESSORS AND MUTATORS
-	// ============================================================================
+	// Accessors read and write the board.
 
 	pub fn count_pieces(&self) -> usize {
-		// Count non-empty squares (excluding kings which are always present)
+		// The count skips both kings, which every legal game holds.
 		let mut count = 0;
 		for row in 0..8 {
 			for col in 0..8 {
@@ -763,7 +567,8 @@ impl ChessGameState {
 		count
 	}
 
-	/// Find the king's position for a given color
+	/// The square of the king of the side that `is_white` names, or `None` when
+	/// the board holds no such king.
 	pub(crate) fn find_king(&self, is_white: bool) -> Option<(u8, u8)> {
 		let king_piece = if is_white {
 			piece::WHITE_KING
@@ -790,16 +595,21 @@ impl ChessGameState {
 		&mut self.board
 	}
 
-	/// Get the piece kind event URN at a specific square
+	/// The kind event URN of the piece on the square, or `None` for an empty
+	/// square.
 	pub(crate) fn piece_kind_at(&self, row: u8, col: u8) -> Option<Urn<'static>> {
 		piece::Piece::from_u8(self.board.get(row, col)).map(|p| p.as_kind_event())
 	}
 
-	/// Update board state from matrix
+	/// Replaces the board with the piece codes of `matrix`.
+	///
+	/// # Errors
+	///
+	/// - [`tightbeam::TightBeamError::InvalidBody`] -- `matrix` is not 8x8.
 	#[allow(dead_code)]
 	pub(crate) fn update_board_from_matrix(&mut self, matrix: &MatrixDyn) -> Result<(), tightbeam::TightBeamError> {
-		// Require Matrix<8> format (8x8 chess board). The constructor already
-		// holds `data.len() == n * n`, so the dimension is the whole check.
+		// The board is 8x8, and the constructor of `MatrixDyn` already holds
+		// `data.len() == n * n`, so the dimension is the whole check.
 		if matrix.n() != 8 {
 			return Err(tightbeam::TightBeamError::InvalidBody);
 		}
@@ -826,5 +636,107 @@ impl TryFrom<&ChessGameState> for MatrixDyn {
 		}
 
 		Ok(matrix)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use tightbeam::tb_cases;
+
+	use super::*;
+
+	/// A board that holds `pieces` and nothing else.
+	fn position(pieces: &[(u8, u8, piece::Piece)]) -> ChessGameState {
+		let mut board = Matrix::<8>::new();
+		for &(row, col, piece) in pieces {
+			board.set(row, col, piece.into());
+		}
+
+		ChessGameState { board }
+	}
+
+	// A pawn on its start row opens one or two squares toward the other side.
+	tb_cases! {
+		fn a_pawn_opening_is_legal((opening, is_white_turn): (ChessMove, bool)) -> Result<(), ChessMoveError> {
+			ChessGameState::new().check_move(&opening, is_white_turn)?;
+			Ok(())
+		}
+		cases {
+			white_one_square => (ChessMove { from_row: 1, from_col: 4, to_row: 2, to_col: 4 }, true),
+			white_two_squares => (ChessMove { from_row: 1, from_col: 4, to_row: 3, to_col: 4 }, true),
+			black_one_square => (ChessMove { from_row: 6, from_col: 4, to_row: 5, to_col: 4 }, false),
+			black_two_squares => (ChessMove { from_row: 6, from_col: 4, to_row: 4, to_col: 4 }, false),
+		}
+	}
+
+	/// The double step of a pawn passes over an empty square, so a knight on
+	/// c3 blocks the pawn on c2.
+	#[test]
+	fn a_pawn_cannot_jump_a_piece() -> Result<(), ChessMoveError> {
+		let mut state = ChessGameState::new();
+		let knight_to_c3 = ChessMove { from_row: 0, from_col: 1, to_row: 2, to_col: 2 };
+		state.check_move(&knight_to_c3, true)?;
+		state.apply_move(&knight_to_c3);
+		let over_the_knight = ChessMove { from_row: 1, from_col: 2, to_row: 3, to_col: 2 };
+
+		let refusal = state.check_move(&over_the_knight, true);
+		assert!(matches!(refusal, Err(ChessMoveError::InvalidMove)));
+		Ok(())
+	}
+
+	/// A pawn that shields its king from a rook cannot leave the file to
+	/// capture, so a rook that steps onto the file pins it there.
+	#[test]
+	fn a_pinned_pawn_cannot_capture() -> Result<(), ChessMoveError> {
+		let mut state = position(&[
+			(0, 4, piece::WHITE_KING),
+			(1, 4, piece::WHITE_PAWN),
+			(2, 3, piece::BLACK_KNIGHT),
+			(7, 5, piece::BLACK_ROOK),
+			(7, 0, piece::BLACK_KING),
+		]);
+		let pin = ChessMove { from_row: 7, from_col: 5, to_row: 7, to_col: 4 };
+		state.check_move(&pin, false)?;
+		state.apply_move(&pin);
+		let capture = ChessMove { from_row: 1, from_col: 4, to_row: 2, to_col: 3 };
+
+		let refusal = state.check_move(&capture, true);
+		assert!(matches!(refusal, Err(ChessMoveError::InvalidMove)));
+		Ok(())
+	}
+
+	/// A knight's check holds whatever stands between, so a move that leaves
+	/// the king in it is illegal.
+	#[test]
+	fn a_move_that_ignores_a_knight_check_is_illegal() -> Result<(), ChessMoveError> {
+		let mut state = position(&[
+			(0, 0, piece::WHITE_ROOK),
+			(0, 4, piece::WHITE_KING),
+			(4, 2, piece::BLACK_KNIGHT),
+			(7, 7, piece::BLACK_KING),
+		]);
+		let check = ChessMove { from_row: 4, from_col: 2, to_row: 2, to_col: 3 };
+		state.check_move(&check, false)?;
+		state.apply_move(&check);
+		let rook_step = ChessMove { from_row: 0, from_col: 0, to_row: 1, to_col: 0 };
+
+		let refusal = state.check_move(&rook_step, true);
+		assert!(matches!(refusal, Err(ChessMoveError::InvalidMove)));
+		Ok(())
+	}
+
+	/// A black pawn attacks the two squares diagonally toward row 0, so the
+	/// white king cannot step onto either of them.
+	#[test]
+	fn a_king_cannot_step_into_a_pawn_attack() -> Result<(), ChessMoveError> {
+		let mut state = position(&[(0, 4, piece::WHITE_KING), (3, 4, piece::BLACK_PAWN), (7, 0, piece::BLACK_KING)]);
+		let advance = ChessMove { from_row: 3, from_col: 4, to_row: 2, to_col: 4 };
+		state.check_move(&advance, false)?;
+		state.apply_move(&advance);
+		let into_the_attack = ChessMove { from_row: 0, from_col: 4, to_row: 1, to_col: 3 };
+
+		let refusal = state.check_move(&into_the_attack, true);
+		assert!(matches!(refusal, Err(ChessMoveError::InvalidMove)));
+		Ok(())
 	}
 }

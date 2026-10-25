@@ -32,7 +32,7 @@ pub(crate) const EMIT_FAILS_CONNECTION_CLOSED: Urn<'static> =
 /// shutdown.
 pub(crate) const INFLIGHT_DRAINS_TO_ECHO: Urn<'static> =
 	tightbeam::urn!("test", "event:lifecycle/inflight-drains-to-echo");
-/// Records whether an emit after a peer GoAway is refused as draining.
+/// Records whether the handle refuses an emit after a peer GoAway as draining.
 pub(crate) const LATE_EMIT_REFUSED_DRAINING: Urn<'static> =
 	tightbeam::urn!("test", "event:lifecycle/late-emit-refused-draining");
 /// Records whether a stream grammar violation draws a `ProtocolError` GoAway.
@@ -51,7 +51,7 @@ pub(crate) const REKEY_CASE_HOLDS: Urn<'static> = tightbeam::urn!("test", "event
 /// Records whether cancel abuse ends the responder with a policy rejection.
 pub(crate) const RESPONDER_POLICY_REJECTION: Urn<'static> =
 	tightbeam::urn!("test", "event:lifecycle/responder-policy-rejection");
-/// Records whether cancel abuse ends `MuxAcceptor::serve` with a policy
+/// Records whether cancel abuse ends [`MuxAcceptor::serve`] with a policy
 /// rejection.
 pub(crate) const SERVE_POLICY_REJECTION: Urn<'static> =
 	tightbeam::urn!("test", "event:lifecycle/serve-policy-rejection");
@@ -116,7 +116,7 @@ tb_scenario! {
 			let frame_inflight = mux_frame("mux-inflight");
 			let inflight_task = spawn_emit(client.handle(), frame_inflight.to_owned());
 
-			ctx.started.notified().await;
+			ctx.started.wait("the in-flight emit must start the gated handler").await?;
 
 			let shutdown_future = kick_shutdown(client.handle()).await;
 			let late = client.handle().emit_on_stream(&mux_frame("mux-late")).await;
@@ -515,7 +515,7 @@ tb_scenario! {
 		exec: |SetupEnv { trace, .. }| async move {
 			let chunk = mux_frame("mux-violation").to_der()?;
 			let offenders: Vec<TransportEnvelope> = vec![
-				// A continuation chunk for a stream that was never opened.
+				// A continuation chunk for a stream with no open.
 				MuxDataPackage::new(1, true, chunk)?.into(),
 				// An open whose payload is not a frame.
 				MuxOpenPackage::new(1, true, MuxStreamKind::Unary, vec![0xDE, 0xAD])?.into(),

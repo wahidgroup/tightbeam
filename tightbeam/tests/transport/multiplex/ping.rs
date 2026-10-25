@@ -1,4 +1,4 @@
-//! Mux ping / ack control-plane scenarios.
+//! Mux scenarios for the ping and ack control plane.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -42,9 +42,9 @@ tb_assert_spec! {
 	}
 }
 
-// Ping resolves in both directions and never invokes the handler.
-// The server-to-client probe is acked with no responder serving the
-// client side, proving the ack terminates in the reader driver.
+// A ping resolves in both directions and never invokes the handler. The
+// client acks the server-to-client probe with no responder on the client
+// side, which proves that the reader driver answers it.
 tb_scenario! {
 	name: mux_ping_roundtrip,
 	spec: MuxPingRoundtripSpec,
@@ -68,7 +68,7 @@ tb_scenario! {
 				let acked = server.handle.ping().await.is_ok();
 				record_spawned_event(&trace, SERVER_PING_ACKED, acked);
 
-				ping.server_ping_done.notify_one();
+				ping.server_ping_done.raise();
 			});
 			Ok((task, addr))
 		},
@@ -76,7 +76,7 @@ tb_scenario! {
 			let client = connect_mux_client(addr, &ping.materials, 4, trace.share()).await?;
 			trace.event_with(CLIENT_PING_ACKED, &[], client.handle().ping().await.is_ok())?;
 
-			ping.server_ping_done.notified().await;
+			ping.server_ping_done.wait("the server ping must finish").await?;
 
 			let frame = mux_frame("mux-ping-alive");
 			let echoed = client.handle().emit_on_stream(&frame).await?;
@@ -104,8 +104,8 @@ tb_assert_spec! {
 	}
 }
 
-// A probe written on raw halves is answered with its ack, and an
-// unsolicited ack is discarded without tearing down the connection.
+// The mux client answers a probe written on raw halves with its ack, and it
+// discards an unsolicited ack and keeps the connection up.
 tb_scenario! {
 	name: mux_ping_wire_ack,
 	spec: MuxPingWireAckSpec,
@@ -149,7 +149,7 @@ tb_assert_spec! {
 	}
 }
 
-// Once GoAway is sent, new pings are refused as `Draining` while the
+// Once the client sends GoAway, it refuses new pings as `Draining`, and the
 // in-flight stream still drains to completion.
 tb_scenario! {
 	name: mux_ping_draining,
@@ -164,7 +164,7 @@ tb_scenario! {
 
 			let frame_inflight = mux_frame("mux-ping-inflight");
 			let inflight_task = spawn_emit(client.handle(), frame_inflight.to_owned());
-			ctx.started.notified().await;
+			ctx.started.wait("the in-flight emit must start the gated handler").await?;
 
 			let shutdown_future = kick_shutdown(client.handle()).await;
 			let refused = client.handle().ping().await;

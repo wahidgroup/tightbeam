@@ -4474,8 +4474,8 @@ tb_process_spec! {
 	states {
 		S0 => { "event1" => S1 },                  // State transitions
 		S1 => { "event2" => S2, "event3" => S3 },  // Nondeterministic branching
-		S2 => { "event4" [ guard!(clock1 < 10ms) ] => S3 },  // Timed transition with guard
-		S3 => { "event5" [ guard!(clock2 >= 5ms), reset: ["clock1"] ] => S4 },  // Guard with clock reset
+		S2 => { "event4" [ clock1 < 10ms ] => S3 },  // Timed transition with guard
+		S3 => { "event5" [ clock2 >= 5ms, reset: ["clock1"] ] => S4 },  // Guard with clock reset
 		S4 => {}                                  // Terminal state
 	}
 	terminal { S4 }                               // Valid end states
@@ -4551,10 +4551,16 @@ Process specs support four types of timing constraints via the `timing: { }` blo
 Process specs support timed automata semantics with clock variables and timing guards:
 
 - **Clock Variables**: `clocks: { "clock1", "clock2" }` - Named clocks that advance during execution
-- **Timing Guards**: `"event" [ guard!(clock1 < 10ms) ] => State` - Transitions enabled only when guard conditions are satisfied
-- **Clock Resets**: `"event" [ guard!(clock2 >= 5ms), reset: ["clock1"] ] => State` - Reset clocks when transition is taken
+- **Timing Guards**: `"event" [ clock1 < 10ms ] => State` - Transitions enabled only when guard conditions are satisfied
+- **Clock Resets**: `"event" [ clock2 >= 5ms, reset: ["clock1"] ] => State` - Clocks that reset to zero when the transition fires
 
 Guard expressions support: `<`, `<=`, `>`, `>=`, `==`, and ranges (`5ms <= x <= 10ms`).
+
+A guard takes effect only in a check that reads the clocks:
+
+- FDR exploration takes a guarded transition only where the clocks satisfy its guard. Exploration starts each clock unset, and a guard on an unset clock does not hold.
+- The CSP trace check of `tb_scenario!` and the FDR refinement checks ignore the clocks, so they accept a guarded event at any time.
+- Hiding, renaming, sequential composition, and the two choices keep each guard. A parallel composition (§12.3.6) refuses a process that has a timed transition.
 
 **Early Pruning and FDR Integration:**
 
@@ -4563,7 +4569,7 @@ Timing violations automatically prune traces during FDR exploration:
 - Per-event WCET violations prune immediately
 - Deadline violations prune when detected
 - Path-based WCET violations prune compositional violations
-- Timed transitions filter based on guard satisfaction
+- Exploration offers a guarded transition only where its guard holds, and a non-terminal state with nothing left to offer is a deadlock
 
 When `testing-schedulability` is also enabled, timing constraints and task periods are combined into task sets for Rate Monotonic or EDF analysis. See §12.2.9 for schedulability configuration in assertion specs.
 

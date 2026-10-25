@@ -44,10 +44,7 @@ use crate::transport::envelopes::TransportEnvelope;
 	any(feature = "transport-cms", feature = "transport-hpke")
 ))]
 use crate::transport::handshake::negotiation::TransportAuthorizer;
-#[cfg(all(
-	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-hpke")
-))]
+#[cfg(mux_rekey)]
 use crate::transport::handshake::negotiation::TransportOffer;
 #[cfg(all(
 	any(feature = "tcp", feature = "async-transport"),
@@ -58,17 +55,11 @@ use crate::transport::handshake::receipt::{ReceiptApprover, SessionObserver};
 use crate::transport::handshake::{BoxedServerHandshake, HandshakeMessage, ServerIdentity, ValidatorChain};
 #[cfg(feature = "transport-cms")]
 use crate::transport::handshake::{CmsIdentityPair, ProvisionedTrust};
-#[cfg(all(
-	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-hpke")
-))]
+#[cfg(mux_rekey)]
 use crate::transport::handshake::{EpochMaterials, HandshakeError, HandshakeProvider};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::io::CollectStep;
-#[cfg(all(
-	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-hpke")
-))]
+#[cfg(mux_rekey)]
 use crate::transport::rekey::{RekeyDriver, Renewal};
 
 mod dialable_encryption;
@@ -79,11 +70,11 @@ pub(crate) use dialable_encryption::Negotiation;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub(crate) use dialable_encryption::Endpoint;
 
-/// Which wire mode a session is entitled to write, and the state backing it.
+/// Which wire mode a session may write, and the state that backs it.
 ///
-/// The phase is stored instead of derived, and each arm carries what that phase
-/// needs. Session keys live in [`SessionPhase::Encrypted`], so a completed
-/// handshake and its keys always exist together.
+/// The session stores the phase instead of deriving it, and each arm carries
+/// what that phase needs. Session keys live in [`SessionPhase::Encrypted`], so
+/// a completed handshake and its keys always exist together.
 ///
 /// # Sources
 ///
@@ -102,8 +93,8 @@ pub enum SessionPhase {
 		initiated_at: MonotonicInstant,
 	},
 	/// The handshake completed. The phase carries everything it agreed, so a
-	/// session's keys travel with the terms that go with them, and leaving this
-	/// phase drops all of them together.
+	/// session's keys travel with the terms that go with them, and a move out
+	/// of this phase drops all of them together.
 	Encrypted(Box<EstablishedSession>),
 }
 
@@ -124,9 +115,9 @@ impl SessionPhase {
 
 	/// Whether this phase may write application traffic.
 	///
-	/// A pooled connection is leased only in a writable phase, so a peer that
+	/// The pool leases a connection only in a writable phase, so a peer that
 	/// stalls its handshake keeps that connection out of the pool. A phase
-	/// added later stays unwritable until it is named here.
+	/// added later stays unwritable until this method names it.
 	pub const fn is_writable(&self) -> bool {
 		matches!(self, Self::Cleartext | Self::Encrypted(_))
 	}
@@ -167,10 +158,10 @@ impl SessionPhase {
 		}
 	}
 
-	/// How a read in this phase is bounded, decided at `now` under `limits`.
+	/// The bounds of a read in this phase at `now`, under `limits`.
 	///
 	/// The phase owns the instant a handshake began, so it is the one place
-	/// the handshake deadline is derived from:
+	/// that derives the handshake deadline:
 	///
 	/// - A read while a handshake is pending faces an unauthenticated peer. It
 	///   admits `handshake_wire` and must finish by the handshake deadline,
@@ -178,7 +169,7 @@ impl SessionPhase {
 	///   no round has started.
 	/// - Any other read admits the larger envelope ceiling and must finish
 	///   within `operation_timeout` of `now`.
-	/// - A deadline past every reading never arrives, so it is absent.
+	/// - A deadline past every instant the clock can read never arrives, so the policy holds `None`.
 	///
 	/// # Examples
 	///
@@ -253,8 +244,8 @@ impl ReadPolicy {
 
 	/// The budget left at `now`, or `None` when no deadline bounds the read.
 	///
-	/// A read whose deadline has passed is refused here, before any byte is
-	/// awaited, so a reader that re-arms per stage and one that arms once
+	/// It refuses a read whose deadline has passed before the reader awaits
+	/// any byte, so a reader that re-arms per stage and one that arms once
 	/// both stop at the same instant.
 	///
 	/// # Errors
@@ -327,7 +318,7 @@ impl<P: CryptoProvider> SessionState<P> {
 		Self { encryption, negotiation, phase }
 	}
 
-	/// What this endpoint was provisioned with.
+	/// The provisioning this endpoint holds.
 	pub fn encryption(&self) -> &EncryptionConfig<P> {
 		self.encryption.encryption()
 	}
@@ -358,13 +349,13 @@ impl<P: CryptoProvider> SessionState<P> {
 		Endpoint::new(&self.encryption, &self.negotiation)
 	}
 
-	/// Where this session currently sits.
+	/// The phase this session sits in.
 	pub fn phase(&self) -> &SessionPhase {
 		&self.phase
 	}
 
-	/// Apply `event`, handing back the phase it replaced when the table
-	/// admitted it.
+	/// Apply `event`, and hand back the phase it replaced when the table
+	/// admits it.
 	///
 	/// - It is the one writer of the phase, and it is private, so the named moves below are the only events.
 	/// - A refused event leaves the session where it was and yields `None`.
@@ -398,8 +389,8 @@ impl<P: CryptoProvider> SessionState<P> {
 		self.apply(SessionEvent::BeginHandshake(now)).is_some()
 	}
 
-	/// Install everything a completed handshake agreed, with the send cipher
-	/// bounded by `encrypted_envelope`, this endpoint's encrypted-envelope
+	/// Install everything a completed handshake agreed, and bound the send
+	/// cipher by `encrypted_envelope`, this endpoint's encrypted-envelope
 	/// ceiling (RFC 9846 § 5.5). The receive cipher counts the bytes it opens.
 	///
 	/// The terms enter the phase together, so a session that reports itself
@@ -417,9 +408,9 @@ impl<P: CryptoProvider> SessionState<P> {
 	/// This is the circuit breaker. It reads the destination from the
 	/// provisioning this state holds, so no caller names it.
 	pub fn reset(&mut self) {
-		// The breaker is admitted from every phase and the session it drops
-		// is spent, so the replaced phase carries nothing a caller could act
-		// on.
+		// The table admits the breaker from every phase, and the session it
+		// drops is spent, so the replaced phase carries nothing a caller could
+		// act on.
 		let _dropped = self.apply(SessionEvent::Reset);
 	}
 
@@ -431,7 +422,7 @@ impl<P: CryptoProvider> SessionState<P> {
 	/// The outer tag names the wire mode, and the phase decides which mode it
 	/// admits, before a byte of the contents decodes:
 	///
-	/// - An envelope past the ceiling of its mode is refused, and the session stays where it was.
+	/// - The session refuses an envelope past the ceiling of its mode, and stays where it was.
 	/// - An established session admits records alone, and opens each under its receive cipher.
 	/// - Every other phase admits cleartext alone.
 	/// - A refused mode, and a record that fails to open, trip the circuit
@@ -439,15 +430,15 @@ impl<P: CryptoProvider> SessionState<P> {
 	///
 	/// # Errors
 	///
-	/// - The decode error -- `wire` is no wire envelope.
+	/// - [`TransportError::DerError`] -- `wire` is no wire envelope.
 	/// - [`TransportError::OperationFailed`] with
 	///   [`TransportFailure::SizeExceeded`] -- the envelope passes the ceiling
 	///   of its mode.
 	/// - [`TransportError::MissingEncryption`] -- cleartext arrived on an established session (CWE-319).
 	/// - [`TransportError::OperationFailed`] with
-	///   [`TransportFailure::EncryptionFailed`] -- a record arrived before the
-	///   session was established.
-	/// - The open failure of a record, such as
+	///   [`TransportFailure::EncryptionFailed`] -- a record arrived before a
+	///   handshake established the session.
+	/// - [`TransportError`] -- the errors of [`RecvCipher::open`], such as
 	///   [`TransportFailure::TamperDetected`] for a record out of sequence.
 	pub(crate) fn admit_arrival<'w>(
 		&mut self,
@@ -490,7 +481,7 @@ impl<P: CryptoProvider> SessionState<P> {
 	///
 	/// - [`TransportError::MissingEncryption`] -- an envelope other than a
 	///   handshake container arrived while a handshake was pending, and the
-	///   session was reset.
+	///   circuit breaker reset the session.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub(crate) fn collect(&mut self, envelope: TransportEnvelope) -> TransportResult<CollectStep> {
 		if !self.phase.is_handshake_pending() {
@@ -507,13 +498,13 @@ impl<P: CryptoProvider> SessionState<P> {
 		Ok(CollectStep::Handshake(message))
 	}
 
-	/// Detach the established session, returning this state to its start.
+	/// Detach the established session and return this state to its start.
 	///
 	/// A caller that splits the endpoint into halves uses it. The halves take
 	/// the keys, and the state they leave behind holds none. Only the async
 	/// transport splits, so the method exists where that transport does.
 	///
-	/// A session that holds no keys is left where it is, so a handshake in
+	/// It leaves a session that holds no keys where it is, so a handshake in
 	/// flight keeps the instant its deadline counts from.
 	#[cfg(any(feature = "tokio", feature = "async-transport"))]
 	pub(crate) fn take_established(&mut self) -> Option<Box<EstablishedSession>> {
@@ -527,21 +518,12 @@ impl<P: CryptoProvider> SessionState<P> {
 		}
 	}
 
-	/// Replace the multiplexing capability this endpoint offers.
+	/// Replace the budget-grant policy a server consults.
 	///
 	/// This setter and the ones below change negotiation input and leave the
 	/// peer authority and the identities alone, so the phase this state starts
 	/// in and the answer of [`DialableEncryption::new`] are independent of
 	/// them.
-	#[cfg(all(
-		feature = "transport-multiplex",
-		any(feature = "transport-cms", feature = "transport-hpke")
-	))]
-	pub(crate) fn offer_mux(&mut self, offer: Option<Arc<TransportOffer>>) {
-		self.negotiation.offer_mux(offer);
-	}
-
-	/// Replace the budget-grant policy a server consults.
 	#[cfg(all(
 		any(feature = "tcp", feature = "async-transport"),
 		any(feature = "transport-cms", feature = "transport-hpke")
@@ -559,7 +541,7 @@ impl<P: CryptoProvider> SessionState<P> {
 		self.negotiation.observe_sessions(observer);
 	}
 
-	/// Replace the approver consulted before countersigning a
+	/// Replace the approver a client consults before it countersigns a
 	/// challenge-bearing receipt.
 	#[cfg(all(
 		any(feature = "tcp", feature = "async-transport"),
@@ -579,16 +561,93 @@ impl<P: CryptoProvider> SessionState<P> {
 		self.negotiation.select_handshake(kind);
 	}
 
+	/// The session this endpoint established, if it has one.
+	pub fn established(&self) -> Option<&EstablishedSession> {
+		match &self.phase {
+			SessionPhase::Encrypted(session) => Some(session),
+			_ => None,
+		}
+	}
+
+	/// The send-direction cipher, which exists exactly while a session does.
+	///
+	/// # Errors
+	///
+	/// - [`TransportFailure::EncryptorUnavailable`] -- no handshake has installed keys on this session yet.
+	pub fn encryptor(&self) -> TransportResult<&SendCipher> {
+		let session = self
+			.established()
+			.ok_or(TransportError::OperationFailed(TransportFailure::EncryptorUnavailable))?;
+		Ok(session.keys().send())
+	}
+
+	/// The receive-direction cipher, which exists exactly while a session does.
+	///
+	/// # Errors
+	///
+	/// - [`TransportFailure::EncryptorUnavailable`] -- no handshake has installed keys on this session yet.
+	pub fn decryptor(&self) -> TransportResult<&RecvCipher> {
+		let session = self
+			.established()
+			.ok_or(TransportError::OperationFailed(TransportFailure::EncryptorUnavailable))?;
+		Ok(session.keys().recv())
+	}
+
+	/// The validated peer certificate: the client identity on a mutual-auth
+	/// server, and the trust-store-validated server identity on a client.
+	///
+	/// It comes from the established session, so it is present exactly while
+	/// that session is.
+	pub fn peer_certificate(&self) -> Option<&Certificate> {
+		self.established()?.peer()
+	}
+
+	/// A shared handle to the validated peer certificate.
+	pub fn peer_certificate_arc(&self) -> Option<Arc<Certificate>> {
+		self.established()?.peer_arc()
+	}
+
+	/// The peer the established session recorded, with the identity of its
+	/// key, as one record a session context shares.
+	pub(crate) fn session_peer(&self) -> Option<&Arc<SessionPeer>> {
+		self.established()?.session_peer()
+	}
+
+	/// The dual-signed session receipt of the established session.
+	pub fn receipt(&self) -> Option<&StoredReceipt> {
+		self.established()?.receipt()
+	}
+
+	/// A shared handle to the dual-signed session receipt.
+	pub fn receipt_arc(&self) -> Option<Arc<StoredReceipt>> {
+		self.established()?.receipt_arc()
+	}
+
+	/// Place a probe directly in `phase`, so a test of the table starts from
+	/// any phase and skips the moves that reach it.
+	#[cfg(test)]
+	pub(crate) fn at(encryption: EncryptionConfig<P>, phase: SessionPhase) -> Self {
+		let encryption = DialableEncryption::unchecked(encryption);
+		Self { encryption, negotiation: Negotiation::default(), phase }
+	}
+}
+
+#[cfg(mux_rekey)]
+impl<P: CryptoProvider> SessionState<P> {
+	/// Replace the multiplexing capability this endpoint offers.
+	///
+	/// It changes negotiation input alone, as [`Self::authorize_transport`]
+	/// does.
+	pub(crate) fn offer_mux(&mut self, offer: Option<Arc<TransportOffer>>) {
+		self.negotiation.offer_mux(offer);
+	}
+
 	/// Detach the epoch rekey materials the handshake left, once, for
 	/// [`Self::renew`] alone.
 	///
-	/// It is the only write into an installed session. Handing out the session
+	/// It is the only write into an installed session. A handle to the session
 	/// itself would let a caller swap the keys under a phase that already
 	/// reports the terms it agreed.
-	#[cfg(all(
-		feature = "transport-multiplex",
-		any(feature = "transport-cms", feature = "transport-hpke")
-	))]
 	fn take_epoch_materials(&mut self) -> Option<EpochMaterials> {
 		match &mut self.phase {
 			SessionPhase::Encrypted(session) => session.take_epoch(),
@@ -600,8 +659,8 @@ impl<P: CryptoProvider> SessionState<P> {
 	/// `renewal` reads from this session's endpoint, into its rekey driver and
 	/// the dual-signed receipt it rotates.
 	///
-	/// - `renewal` runs once the session holds a receipt and a peer, so the
-	///   terms are built only for a session that renews.
+	/// - `renewal` runs once the session holds a receipt and a peer, so it
+	///   builds the terms only for a session that renews.
 	/// - The session refuses before the epoch materials leave it, so a refused
 	///   session keeps its receipt, its peer, and its epoch.
 	///
@@ -615,10 +674,6 @@ impl<P: CryptoProvider> SessionState<P> {
 	///
 	/// - [`HandshakeError::CertificateValidationError`] -- the signing use or
 	///   the purpose of the peer's role refuses the peer's certificate.
-	#[cfg(all(
-		feature = "transport-multiplex",
-		any(feature = "transport-cms", feature = "transport-hpke")
-	))]
 	pub(crate) fn renew(
 		&mut self,
 		renewal: impl FnOnce(&Endpoint<'_, P>) -> Option<Renewal<P>>,
@@ -650,76 +705,6 @@ impl<P: CryptoProvider> SessionState<P> {
 		let reference = receipt.receipt().clone();
 		let driver = admitted.driver(epoch, reference);
 		Ok(Some((driver, receipt)))
-	}
-
-	/// The session this endpoint established, if it has one.
-	pub fn established(&self) -> Option<&EstablishedSession> {
-		match &self.phase {
-			SessionPhase::Encrypted(session) => Some(session),
-			_ => None,
-		}
-	}
-
-	/// Send-direction cipher, which exists exactly while a session does.
-	///
-	/// # Errors
-	///
-	/// - [`TransportFailure::EncryptorUnavailable`] -- no handshake has installed keys on this session yet.
-	pub fn encryptor(&self) -> TransportResult<&SendCipher> {
-		let session = self
-			.established()
-			.ok_or(TransportError::OperationFailed(TransportFailure::EncryptorUnavailable))?;
-		Ok(session.keys().send())
-	}
-
-	/// Receive-direction cipher, which exists exactly while a session does.
-	///
-	/// # Errors
-	///
-	/// - [`TransportFailure::EncryptorUnavailable`] -- no handshake has installed keys on this session yet.
-	pub fn decryptor(&self) -> TransportResult<&RecvCipher> {
-		let session = self
-			.established()
-			.ok_or(TransportError::OperationFailed(TransportFailure::EncryptorUnavailable))?;
-		Ok(session.keys().recv())
-	}
-
-	/// Validated peer certificate. It is the client identity on a mutual-auth
-	/// server, and the trust-store-validated server identity on a client.
-	///
-	/// It comes from the established session, so it is present exactly while
-	/// that session is.
-	pub fn peer_certificate(&self) -> Option<&Certificate> {
-		self.established()?.peer()
-	}
-
-	/// Shared handle to the validated peer certificate.
-	pub fn peer_certificate_arc(&self) -> Option<Arc<Certificate>> {
-		self.established()?.peer_arc()
-	}
-
-	/// The peer the established session recorded, with the identity of its
-	/// key, as one record a session context shares.
-	pub(crate) fn session_peer(&self) -> Option<&Arc<SessionPeer>> {
-		self.established()?.session_peer()
-	}
-
-	/// Dual-signed session receipt from the established session.
-	pub fn receipt(&self) -> Option<&StoredReceipt> {
-		self.established()?.receipt()
-	}
-
-	/// Shared handle to the dual-signed session receipt.
-	pub fn receipt_arc(&self) -> Option<Arc<StoredReceipt>> {
-		self.established()?.receipt_arc()
-	}
-
-	/// Place a probe directly in `phase`, so a test of the table starts from
-	/// any phase without walking the table to reach it.
-	#[cfg(test)]
-	pub(crate) fn at(encryption: EncryptionConfig<P>, phase: SessionPhase) -> Self {
-		let encryption = DialableEncryption::unchecked(encryption);
-		Self { encryption, negotiation: Negotiation::default(), phase }
 	}
 }
 
@@ -777,7 +762,7 @@ impl<P: CryptoProvider> ServerIdentities<P> {
 	///
 	/// # Errors
 	///
-	/// - The errors of [`CertificateExt::require_purpose`].
+	/// - [`CertificateValidationError`] -- the errors of [`CertificateExt::require_purpose`].
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub(crate) fn require_purpose(&self, purpose: ObjectIdentifier) -> Result<(), CertificateValidationError> {
 		match self {
@@ -801,17 +786,17 @@ impl<P: CryptoProvider> ServerIdentities<P> {
 	}
 }
 
-/// Everything an endpoint was provisioned with before any handshake runs.
+/// The provisioning an endpoint holds before any handshake runs.
 ///
-/// Provisioning is decided once, when the endpoint is built, so it travels as
-/// one value. A transport supplies it through a single accessor, so every
-/// field is present at once instead of each being asked for separately.
+/// A builder decides the provisioning once, when it builds the endpoint, so
+/// it travels as one value. A transport supplies it through a single
+/// accessor, so a caller gets every field in one call.
 #[non_exhaustive]
 #[derive(Clone)]
 pub struct EncryptionConfig<P: CryptoProvider> {
-	/// Trust store that validates the peer's certificate. `None` leaves the
-	/// peer identity to a lower layer, which [`Self::check_dial_permitted`]
-	/// requires the endpoint to have named.
+	/// The trust store that validates the peer's certificate. `None` leaves
+	/// the peer identity to a lower layer, so [`Self::check_dial_permitted`]
+	/// requires another peer authority or a named cleartext choice.
 	pub(crate) trust_store: Option<Arc<dyn CertificateTrust>>,
 	/// The identity this endpoint presents as a server: the certificate and
 	/// the key that signs its replies and its receipts, and for a CMS server
@@ -841,19 +826,19 @@ pub struct EncryptionConfig<P: CryptoProvider> {
 }
 
 impl<P: CryptoProvider> EncryptionConfig<P> {
-	/// Trust store that validates the peer's certificate.
+	/// The trust store that validates the peer's certificate.
 	pub fn trust_store(&self) -> Option<&Arc<dyn CertificateTrust>> {
 		self.trust_store.as_ref()
 	}
 
-	/// Local server certificate this endpoint presents, the one whose key
+	/// The server certificate this endpoint presents, the one whose key
 	/// signs its replies.
 	pub fn server_certificate(&self) -> Option<&Certificate> {
 		let identity = self.server_identity.as_ref();
 		identity.map(|identity| identity.signing().certificate())
 	}
 
-	/// Client certificate presented for mutual authentication.
+	/// The client certificate this endpoint presents to a mutual-auth server.
 	pub fn client_certificate(&self) -> Option<&Certificate> {
 		self.client_identity.as_ref().map(SigningIdentity::certificate)
 	}
@@ -861,21 +846,21 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 	/// Whether this endpoint is provisioned to encrypt, which is the same as
 	/// whether it can establish who its peer is.
 	///
-	/// Each of these means a handshake is expected and names a peer authority:
+	/// Each item names a peer authority, so the endpoint expects a handshake:
 	///
 	/// - A server certificate this endpoint presents.
 	/// - Mutual authentication a server demands of its client.
 	/// - A trust store a client checks the server certificate against.
 	/// - The trust in a CMS server a client provisioned, which holds its store.
 	///
-	/// A client certificate proves who this endpoint is, so it answers a
-	/// different question than the list above. A server policy narrows which
+	/// A client certificate proves who this endpoint is, and not who its
+	/// peer is, so the list above leaves it out. A server policy narrows which
 	/// server a trust admits, so the trust in a server answers for it here.
 	pub fn is_provisioned(&self) -> bool {
-		// Naming every field without `..` breaks the build on a new field until
-		// someone says whether it implies a handshake, so no new key material
-		// silently leaves the endpoint in `Cleartext` (CWE-311). The two trust
-		// fields are read in `trusts_a_server`, which names every field too.
+		// The pattern names every field without `..`, so a new field breaks the
+		// build until someone says whether it implies a handshake, and no new
+		// key material silently leaves the endpoint in `Cleartext` (CWE-311).
+		// `trusts_a_server` reads both trust fields and names every field too.
 		let Self {
 			server_identity,
 			trust_store: _,
@@ -898,9 +883,10 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 	/// trust in a CMS server, which [`Self::is_provisioned`] and the dialer
 	/// rule both read.
 	fn trusts_a_server(&self) -> bool {
-		// Naming every field without `..` breaks the build on a new field until
-		// someone says whether it is a trust in a server, so a new trust
-		// reaches the start phase and the dialer rule alike (CWE-311, CWE-295).
+		// The pattern names every field without `..`, so a new field breaks the
+		// build until someone says whether it is a trust in a server, and a new
+		// trust reaches the start phase and the dialer rule alike (CWE-311,
+		// CWE-295).
 		let Self {
 			trust_store,
 			#[cfg(feature = "transport-cms")]
@@ -928,12 +914,12 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 		self.client_identity.is_some()
 	}
 
-	/// Whether this endpoint may reach a peer it cannot authenticate.
+	/// Check whether this endpoint may reach a peer it cannot authenticate.
 	///
 	/// An endpoint that can establish nothing about its peer reaches whoever
-	/// answered (CWE-295), and naming cleartext is the only way to accept that.
-	/// Every transport is built from provisioning that passed this rule, so a
-	/// cleartext phase always carries a named choice.
+	/// answered (CWE-295), and a named cleartext choice is the one way to
+	/// accept that. Every transport holds provisioning that passed this rule,
+	/// so a cleartext phase always carries a named choice.
 	///
 	/// # Errors
 	///
@@ -963,15 +949,15 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 		policy && !self.trusts_a_server()
 	}
 
-	/// Refuse this provisioning when an identity it presents names another
-	/// key purpose than its role's (RFC 5280 §4.2.1.12). It runs once, where
-	/// the provisioning is answered.
+	/// Refuse this provisioning when an identity it presents names a key
+	/// purpose other than its role's (RFC 5280 §4.2.1.12). It runs once, in
+	/// [`DialableEncryption::new`].
 	///
 	/// # Errors
 	///
-	/// - The errors of [`CertificateExt::require_purpose`], for the server
-	///   identity under the server purpose or the client identity under the
-	///   client's.
+	/// - [`CertificateValidationError`] -- the errors of
+	///   [`CertificateExt::require_purpose`], for the server identity under
+	///   the server purpose or the client identity under the client's.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub(crate) fn admit_own_identities(&self) -> Result<(), CertificateValidationError> {
 		if let Some(identity) = &self.server_identity {
@@ -987,7 +973,7 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 	/// Provisioning with nothing installed, which a builder accumulates into.
 	///
 	/// It authenticates no peer and names no cleartext, so it becomes a
-	/// transport only after [`DialableEncryption::new`] accepts what was added.
+	/// transport only after [`DialableEncryption::new`] accepts the additions.
 	pub(crate) fn unconfigured() -> Self {
 		Self {
 			trust_store: None,
@@ -1006,14 +992,14 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 	}
 }
 
-/// An endpoint that accepts handshakes, and so keeps the orchestrator driving
-/// the one in flight.
+/// An endpoint that accepts handshakes, and so keeps the orchestrator that
+/// drives the one in flight.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub trait ServerHandshakeSlot: sealed::Sealed {
-	/// The orchestrator carrying this endpoint's in-flight server handshake.
+	/// The orchestrator that holds this endpoint's in-flight server handshake.
 	///
 	/// It is `None` before the first client message arrives, and again once
-	/// the handshake completes and its terms are installed.
+	/// the handshake completes and the endpoint installs its terms.
 	fn server_handshake_mut(&mut self) -> &mut Option<BoxedServerHandshake>;
 }
 
@@ -1046,7 +1032,7 @@ pub trait ServerHandshakeSlot: sealed::Sealed {
 /// }
 /// ```
 pub trait EncryptedProtocolState: sealed::Sealed {
-	/// Crypto provider bound to this transport.
+	/// The crypto provider bound to this transport.
 	type CryptoProvider: CryptoProvider + Send + Sync + 'static;
 
 	/// This endpoint's session state.
@@ -1054,14 +1040,14 @@ pub trait EncryptedProtocolState: sealed::Sealed {
 
 	/// Mutable access to this endpoint's session state.
 	///
-	/// The state guards its own phase, so a caller reaching this still places
-	/// the session only in a phase the transition table names.
+	/// The state guards its own phase, so a caller that reaches this still
+	/// places the session only in a phase the transition table names.
 	fn session_state_mut(&mut self) -> &mut SessionState<Self::CryptoProvider>;
 
 	/// Apply this session's wire mode to `builder`.
 	///
-	/// Every envelope this endpoint writes passes through here, so the wire
-	/// mode is decided once per session instead of once per call site.
+	/// Every envelope this endpoint writes passes through here, so the phase
+	/// decides the wire mode once per session instead of once per call site.
 	///
 	/// # Errors
 	///
@@ -1095,7 +1081,7 @@ pub trait EncryptedProtocolState: sealed::Sealed {
 		Ok(())
 	}
 
-	/// What this endpoint was provisioned with.
+	/// The provisioning this endpoint holds.
 	fn encryption(&self) -> &EncryptionConfig<Self::CryptoProvider> {
 		self.session_state().encryption()
 	}
@@ -1109,7 +1095,7 @@ pub trait EncryptedProtocolState: sealed::Sealed {
 		self.limits().handshake_timeout
 	}
 
-	/// Production instrumentation collector attached to this transport.
+	/// The production instrumentation collector attached to this transport.
 	#[cfg(feature = "instrument")]
 	fn to_trace_ref(&self) -> Option<&TraceCollector> {
 		None
@@ -1137,7 +1123,7 @@ mod tests {
 	#[cfg(feature = "testing")]
 	use crate::transport::handshake::SessionPeer;
 
-	/// Holds the phase the trait reads back.
+	/// A probe that holds the phase the trait reads back.
 	struct PhaseProbe {
 		state: SessionState<DefaultCryptoProvider>,
 		limits: TransportLimits,
@@ -1186,8 +1172,8 @@ mod tests {
 		SessionPhase::Handshaking { initiated_at: ManualClock::default().monotonic() }
 	}
 
-	/// A provisioned endpoint starts where a handshake is expected, and a
-	/// cleartext one only where cleartext was named (CWE-311).
+	/// A provisioned endpoint starts where it expects a handshake, and a
+	/// cleartext one only where its provisioning named cleartext (CWE-311).
 	#[test]
 	fn a_session_starts_where_its_provisioning_says() -> TransportResult<()> {
 		let provisioned = SessionState::new(DialableEncryption::new(provisioned_encryption())?);
@@ -1198,8 +1184,8 @@ mod tests {
 		Ok(())
 	}
 
-	/// A CMS client whose server trust is provisioned holds a peer authority,
-	/// so it starts where a handshake is expected even when it names
+	/// A CMS client with a provisioned server trust holds a peer authority,
+	/// so it starts where it expects a handshake, even when it names
 	/// cleartext (CWE-311).
 	#[cfg(all(feature = "transport-cms", feature = "testing"))]
 	#[test]
@@ -1249,7 +1235,7 @@ mod tests {
 	}
 
 	/// Every envelope path applies the wire mode here, so this refusal is the
-	/// one that keeps a stalled session from writing in the clear (CWE-311).
+	/// one guard against a cleartext write from a stalled session (CWE-311).
 	#[test]
 	fn pending_session_refuses_to_apply_a_wire_mode() {
 		let probe = PhaseProbe::provisioned(handshaking());
@@ -1263,8 +1249,8 @@ mod tests {
 		));
 	}
 
-	/// A provisioned session that is reset from any phase writes nothing in the
-	/// clear, including a reset that a caller triggers through the public
+	/// A provisioned session writes nothing in the clear after a reset from
+	/// any phase, including a reset that a caller triggers through the public
 	/// `reset` method.
 	#[test]
 	fn a_reset_provisioned_session_refuses_a_cleartext_write() -> TransportResult<()> {
@@ -1346,8 +1332,8 @@ mod tests {
 	}
 
 	/// A handshake read admits the handshake ceiling and counts its deadline
-	/// from the instant the first round recorded, so a later reading is left
-	/// the remainder and not a fresh allowance.
+	/// from the instant the first round recorded, so a later reading gets the
+	/// remainder and not a fresh allowance.
 	#[test]
 	fn a_handshake_read_counts_from_the_first_round() -> TransportResult<()> {
 		let clock = ManualClock::default();
@@ -1364,8 +1350,8 @@ mod tests {
 		Ok(())
 	}
 
-	/// A handshake read at or past its deadline is refused before any byte is
-	/// awaited.
+	/// The policy refuses a handshake read at or past its deadline before the
+	/// reader awaits any byte.
 	#[test]
 	fn a_handshake_read_past_its_deadline_is_refused() {
 		let clock = ManualClock::default();
@@ -1454,7 +1440,7 @@ mod tests {
 		assert_eq!(state.phase().initiated_at(), Some(started));
 	}
 
-	/// Restarting a handshake under a live session would drop its keys, so the
+	/// A handshake restart under a live session would drop its keys, so the
 	/// table refuses the move and the session survives it.
 	#[cfg(feature = "testing")]
 	#[test]
@@ -1564,7 +1550,7 @@ mod tests {
 		assert_eq!(state.handshake_protocol(), HandshakeProtocolKind::Cms);
 	}
 
-	/// A completed session carrying a peer identity, which authorization reads.
+	/// A completed session with a peer identity, which authorization reads.
 	#[cfg(feature = "testing")]
 	fn established_session() -> EstablishedSession {
 		session_of(fixture_certificate())

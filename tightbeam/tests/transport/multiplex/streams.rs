@@ -1,4 +1,5 @@
-//! Concurrent streams, caps, cancel, and server-initiated streams.
+//! Mux scenarios for concurrent streams, caps, cancel, and server-initiated
+//! streams.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -79,7 +80,8 @@ impl InterleavedContext {
 	}
 }
 
-// Two concurrent streams: server answers reverse order. Correlate by ID.
+// Two concurrent streams: the server answers in reverse order, and the client
+// correlates each reply by its stream ID.
 tb_scenario! {
 	name: mux_interleaved_out_of_order,
 	spec: MuxInterleavedSpec,
@@ -137,8 +139,8 @@ tb_process_spec! {
 	terminal { Done }
 }
 
-// Cap=1: second concurrent emit StreamsExhausted. Succeeds after the
-// held slot frees.
+// With a cap of 1, a second concurrent emit fails with `StreamsExhausted`, and
+// it succeeds once the held slot frees.
 tb_scenario! {
 	name: mux_cap_exhaustion,
 	config: ScenarioConfig::builder()
@@ -161,7 +163,7 @@ tb_scenario! {
 			let frame_held = mux_frame("mux-held");
 			let held_task = spawn_emit(client.handle(), frame_held.to_owned());
 
-			ctx.started.notified().await;
+			ctx.started.wait("the held emit must start the gated handler").await?;
 
 			let exhausted = client.handle().emit_on_stream(&mux_frame("mux-extra")).await;
 			trace.event_with(
@@ -195,7 +197,7 @@ tb_assert_spec! {
 	}
 }
 
-// Muxed envelope on a non-mux connection must be InvalidMessage.
+// A muxed envelope on a non-mux connection must fail as `InvalidMessage`.
 tb_scenario! {
 	name: mux_non_negotiated_rejected,
 	spec: MuxNonNegotiatedSpec,
@@ -253,7 +255,8 @@ tb_process_spec! {
 	terminal { Done }
 }
 
-// Drop unresolved emit: frees cap slot and aborts the server handler.
+// A drop of an unresolved emit frees its cap slot and aborts the server
+// handler.
 tb_scenario! {
 	name: mux_cancel_frees_slot_and_aborts_handler,
 	config: ScenarioConfig::builder()
@@ -269,7 +272,7 @@ tb_scenario! {
 			let client = connect_mux_client(addr, &ctx.materials, 1, trace.share()).await?;
 			let cancelled_task = spawn_emit(client.handle(), mux_frame("mux-cancelled"));
 
-			ctx.started.notified().await;
+			ctx.started.wait("the first handler must park before the cancel").await?;
 
 			abort_emit(cancelled_task).await;
 
@@ -320,7 +323,8 @@ tb_process_spec! {
 	terminal { Done }
 }
 
-// Stale response after cancel is discarded. Later streams stay healthy.
+// The client discards a stale response after a cancel, and later streams stay
+// healthy.
 tb_scenario! {
 	name: mux_cancel_response_race_discarded,
 	config: ScenarioConfig::builder()
@@ -366,9 +370,9 @@ tb_assert_spec! {
 	}
 }
 
-// Garbage End payloads must stay per-stream: a stale end (cancelled
-// stream) is discarded unread and a non-Ok trailer resolves its
-// stream without decoding. Neither may tear down the connection.
+// Garbage End payloads must stay per-stream: the client discards a stale end
+// (of a cancelled stream) unread, and a non-Ok trailer resolves its stream
+// without a decode. Neither may tear down the connection.
 tb_scenario! {
 	name: mux_end_garbage_payload_tolerated,
 	spec: MuxEndGarbageSpec,
@@ -377,7 +381,8 @@ tb_scenario! {
 			let mut link = establish_client_mux_server_raw(4, trace.share()).await?;
 			let garbage = vec![0xDE, 0xAD];
 
-			// Stale end: cancelled stream carrying garbage. Must be discarded.
+			// A stale end on a cancelled stream carries garbage, and the client
+			// must discard it.
 			let stale_task = spawn_emit(&link.client.handle, mux_frame("mux-stale-garbage"));
 			let stale_id = read_muxed_request_id(&mut link.server_reader).await?;
 
@@ -386,7 +391,8 @@ tb_scenario! {
 
 			write_muxed_end(&mut link.server_writer, stale_id, TransitStatus::Ok, garbage.to_owned()).await?;
 
-			// ResourceExhausted trailer carrying garbage. Must resolve per-stream as ResourceExhausted.
+			// A `ResourceExhausted` trailer that carries garbage must resolve
+			// its stream alone as `ResourceExhausted`.
 			let busy_task = spawn_emit(&link.client.handle, mux_frame("mux-busy-garbage"));
 			let busy_id = read_muxed_request_id(&mut link.server_reader).await?;
 
@@ -395,7 +401,7 @@ tb_scenario! {
 			let busy = join_task(busy_task, "busy emit task must not panic").await?;
 			trace.event_with(BUSY_GARBAGE_RESOLVES_AS_BUSY, &[], is_busy(&busy))?;
 
-			// Connection must remain healthy: a follow-up stream still echoes.
+			// The connection must stay up: a follow-up stream still echoes.
 			let followup_echoed = raw_echo_roundtrip(&mut link, &mux_frame("mux-after-garbage")).await?;
 			trace.event_with(FOLLOWUP_ECHOES_AFTER_GARBAGE, &[], followup_echoed)?;
 
@@ -414,7 +420,7 @@ tb_assert_spec! {
 	}
 }
 
-// Server initiates an even stream. Client `serve` echoes.
+// The server initiates an even stream, and the client's `serve` echoes it.
 tb_scenario! {
 	name: mux_server_initiated_roundtrip,
 	spec: MuxServerInitiatedSpec,
@@ -436,7 +442,7 @@ tb_scenario! {
 
 				record_spawned_event(&trace, SERVER_STREAM_ECHOED_BY_CLIENT, echoed);
 
-				ctx.done.notify_one();
+				ctx.done.raise();
 			});
 			Ok((task, addr))
 		},
@@ -445,8 +451,8 @@ tb_scenario! {
 			let _client_serve = spawn_immediate_echo(client.responder);
 
 			// Hold the client endpoint alive until the server-side emit
-			// resolved and recorded its event.
-			ctx.done.notified().await;
+			// resolves and records its event.
+			ctx.done.wait("the server-initiated emit must resolve").await?;
 			Ok(())
 		}
 	}

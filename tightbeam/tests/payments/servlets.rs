@@ -1,7 +1,8 @@
-//! Payment servlets.
+//! The servlets of the payment scenarios.
 //!
-//! The module defines servlets for authorization, capture, and key
-//! management.
+//! [`AuthorizationServlet`] approves a credit transfer, [`CaptureServlet`]
+//! settles a capture, and [`KeyManagerServlet`] serves its public key and
+//! opens a secret sealed to it.
 
 use std::sync::Arc;
 
@@ -18,8 +19,8 @@ use super::harness::{PaymentHarness, PAYMENT_TAG};
 
 use tightbeam::urn::Urn;
 
-/// The HPKE `info` the key manager opens a sealed secret under.
-const KEY_MANAGER_HPKE_INFO: &[u8] = b"tb/test/payments/hpke/v1";
+/// The HPKE `info` under which the key manager opens a sealed secret.
+pub(crate) const KEY_MANAGER_HPKE_INFO: &[u8] = b"tb/test/payments/hpke/v1";
 
 pub(crate) const AUTHORIZATION_APPROVED: Urn<'static> =
 	tightbeam::urn!("test", "event:servlets/authorization-approved");
@@ -47,10 +48,14 @@ use super::messages::{
 
 /// Calculates the message priority from the transaction amount.
 ///
-/// High-value transactions (over 100,000 quanta normalized to USD) get
-/// Expedited priority.
+/// The function normalizes the amount to USD-equivalent quanta and then
+/// picks the priority:
+///
+/// - A high-value amount over 100,000 quanta gets [`MessagePriority::Expedited`].
+/// - An amount over 10,000 quanta gets [`MessagePriority::LowLatency`].
+/// - Any other amount gets [`MessagePriority::Standard`].
 pub fn to_priority(amount: &MonetaryAmount) -> MessagePriority {
-	// Normalize to USD-equivalent quanta (rough approximation).
+	// Each arm converts the amount to USD-equivalent quanta at a rough rate.
 	let normalized = match &amount.currency {
 		b"JPY" => amount.value / 100,  // ~100 JPY = 1 USD
 		b"KRW" => amount.value / 1300, // ~1300 KRW = 1 USD
@@ -129,7 +134,8 @@ servlet! {
 			}?));
 		}
 
-		// previous_frame should link back to the authorization frame.
+		// A capture links back to its authorization frame through
+		// `previous_frame`, and this check reads only whether the link is set.
 		if frame.metadata().previous_frame().is_some() {
 			trace.event_with(CHAIN_VALID, &[PAYMENT_TAG], true)?;
 		} else {
@@ -156,13 +162,18 @@ servlet! {
 	}
 }
 
-/// Wrapper enum for KeyManager requests, either a public key fetch or a
+/// A request to [`KeyManagerServlet`], either a public key fetch or a
 /// decrypt.
+///
+/// Both requests encode as a SEQUENCE, so each alternative carries a context
+/// tag of its own, and the decoder tells the two apart.
 #[derive(tightbeam::Beamable, tightbeam::der::Choice, Clone, Debug, PartialEq, Eq)]
 pub enum KeyManagerRequest {
-	/// Request to get the public key.
+	/// A request for the public key of the key manager, under context tag 0.
+	#[asn1(context_specific = "0", constructed = "true")]
 	GetPublicKey(GetPublicKeyRequest),
-	/// Request to decrypt ciphertext.
+	/// A request to decrypt a sealed ciphertext, under context tag 1.
+	#[asn1(context_specific = "1", constructed = "true")]
 	Decrypt(DecryptRequest),
 }
 
@@ -219,11 +230,11 @@ mod tests {
 
 	#[test]
 	fn priority_jpy_normalized() {
-		// 1,000,100 JPY / 100 = 10,001 normalized (High, not Top)
+		// 1,000,100 JPY / 100 = 10,001 normalized: LowLatency, not Expedited.
 		let amount = MonetaryAmount::new(1_000_100, *b"JPY");
 		assert_eq!(to_priority(&amount), MessagePriority::LowLatency);
 
-		// 100,000,000 JPY / 100 = 1,000,000 normalized (Top)
+		// 100,000,000 JPY / 100 = 1,000,000 normalized: Expedited.
 		let amount_large = MonetaryAmount::new(100_000_000, *b"JPY");
 		assert_eq!(to_priority(&amount_large), MessagePriority::Expedited);
 	}

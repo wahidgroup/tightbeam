@@ -1,6 +1,7 @@
-//! Verification-spec macros (`tb_assert_spec!`) plus supporting builders.
-//! Provides label helpers, cardinality utilities, and the `BuiltAssertSpec`
-//! wrapper that implements `TBSpec`.
+//! The [`tb_assert_spec!`](crate::tb_assert_spec!) macro and the types behind
+//! it. The module holds the [`Cardinality`] helpers, the [`AssertSpecBuilder`],
+//! the [`BuiltAssertSpec`] that implements [`TBSpec`], and the [`AssertEncode`]
+//! payload encoding.
 
 use core::num::NonZeroU32;
 
@@ -19,9 +20,7 @@ use crate::policy::TransitStatus;
 use crate::testing::schedulability::{SchedulerType, TaskSet};
 use crate::Errorizable;
 
-// ---------------------------------------------------------------------------
-// Cardinality core
-// ---------------------------------------------------------------------------
+// The cardinality of a label.
 
 /// How many times a label may appear for a contract to hold.
 ///
@@ -54,9 +53,9 @@ impl Cardinality {
 	///
 	/// Testing suite functions MUST panic on error.
 	///
-	/// - When `max` is below `min`, which no count satisfies. In a constant
-	///   this is caught when the crate is built, not when it is checked, so
-	///   `cargo check` alone does not report it.
+	/// - `max` is below `min`, which no count satisfies. In a constant, the
+	///   compiler reports the panic when it builds the crate and not when it
+	///   checks it, so `cargo check` alone misses it.
 	pub const fn between(min: u32, max: u32) -> Self {
 		assert!(min <= max, "between! requires min <= max, or no count can satisfy it");
 		Self { min, max: Some(max) }
@@ -102,8 +101,9 @@ impl Cardinality {
 	}
 }
 
-/// Compile-time check that `tb_assert_spec!` version blocks strictly
-/// ascend. `latest()` selects the highest semantic version.
+/// Whether `versions` strictly ascend in semantic version order.
+/// `tb_assert_spec!` asserts it over its version blocks at compile time, and
+/// `latest()` selects the highest version.
 pub const fn versions_strictly_ascending(versions: &[(u16, u16, u16)]) -> bool {
 	let mut index = 1;
 	while index < versions.len() {
@@ -122,22 +122,23 @@ pub const fn versions_strictly_ascending(versions: &[(u16, u16, u16)]) -> bool {
 	true
 }
 
-// ---------------------------------------------------------------------------
-// Spec builder and concrete implementation
-// ---------------------------------------------------------------------------
+// The spec builder and the built spec.
 
-/// Error type for spec building operations
+/// The refusals of [`AssertSpecBuilder`].
 #[derive(Debug, Errorizable)]
 pub enum SpecBuildError {
+	/// The spec already holds an assertion on this label.
 	#[error("Duplicate label: {0}")]
 	DuplicateLabel(Urn<'static>),
+	/// The ordering names a label that no assertion holds.
 	#[error("Unknown ordering label: {0}")]
 	UnknownOrderingLabel(Urn<'static>),
+	/// The cardinality of this label has a maximum below its minimum.
 	#[error("Invalid range: {0}")]
 	InvalidRange(Urn<'static>),
 }
 
-/// Builder for programmatic spec construction
+/// The builder that `tb_assert_spec!` drives, which code may also call.
 #[derive(Debug, Clone)]
 pub struct AssertSpecBuilder {
 	id: &'static str,
@@ -276,16 +277,18 @@ impl AssertSpecBuilder {
 	}
 }
 
-/// Schedulability assertion for verification
+/// A schedulability assertion on a task set.
 #[cfg(feature = "testing-timing")]
 #[derive(Debug, Clone)]
 pub struct SchedulabilityAssertion {
-	/// Task set to check
+	/// The task set that the analysis checks.
 	pub task_set: TaskSet,
-	/// Whether the task set must be schedulable
+	/// Whether the task set must pass (`true`) or fail (`false`) the analysis.
 	pub must_be_schedulable: bool,
 }
 
+/// A spec that [`AssertSpecBuilder::build`] produced, with its contracts and
+/// its hash.
 #[derive(Debug, Clone)]
 pub struct BuiltAssertSpec {
 	inner: AssertSpecBuilder,
@@ -346,7 +349,7 @@ impl BuiltAssertSpec {
 	) -> [u8; 32] {
 		let contracts = contracts.as_ref();
 		let mut h = Sha3_256::new();
-		// Domain tag + version triple
+		// The domain tag, then the version triple.
 		h.update(b"TBSP");
 		h.update(version_major.to_be_bytes());
 		h.update(version_minor.to_be_bytes());
@@ -368,7 +371,7 @@ impl BuiltAssertSpec {
 			}
 			None => h.update([0u8]),
 		}
-		// Include tag_filter in hash if present
+		// A presence byte, then the tag filter when the spec has one.
 		if let Some(tags) = tag_filter {
 			h.update([1u8]);
 			h.update((tags.len() as u32).to_be_bytes());
@@ -380,14 +383,15 @@ impl BuiltAssertSpec {
 			h.update([0u8]);
 		}
 
-		// Normalize assertion order independent of insertion sequence
+		// The hash sorts the assertions by label, so two specs that differ only
+		// in insertion order hash the same.
 		let mut norm: Vec<(&str, u32, Option<u32>)> = Vec::with_capacity(contracts.len());
 		for c in contracts {
 			let AssertionLabel::Custom(lbl) = &c.label;
 			norm.push((lbl.as_ref(), c.cardinality.min, c.cardinality.max));
 		}
 
-		norm.sort_by(|a, b| a.0.cmp(b.0)); // label only
+		norm.sort_by(|a, b| a.0.cmp(b.0)); // The sort key is the label alone.
 
 		for (lbl, min, max) in norm {
 			h.update(lbl.as_bytes());
@@ -403,7 +407,8 @@ impl BuiltAssertSpec {
 		}
 		#[cfg(feature = "instrument")]
 		{
-			// Sort events for deterministic hashing (by string representation)
+			// The events hash in sorted URN order, so the hash is
+			// deterministic.
 			let mut sorted_events: Vec<String> = events.iter().map(|e| e.to_string()).collect();
 			sorted_events.sort();
 
@@ -414,12 +419,12 @@ impl BuiltAssertSpec {
 		#[cfg(feature = "testing-timing")]
 		{
 			if let Some(schedule) = schedulability {
-				h.update([1u8]); // Has schedulability
+				h.update([1u8]); // The spec has a schedulability assertion.
 				h.update([schedule.task_set.scheduler as u8]);
 				h.update([schedule.must_be_schedulable as u8]);
 				h.update((schedule.task_set.tasks.len() as u32).to_be_bytes());
 
-				// Hash task set: sort tasks by ID for deterministic hashing
+				// The tasks hash in ID order, so the hash is deterministic.
 				let mut tasks: Vec<_> = schedule.task_set.tasks.iter().collect();
 				tasks.sort_by(|a, b| a.id.cmp(&b.id));
 
@@ -430,7 +435,7 @@ impl BuiltAssertSpec {
 					h.update(task.wcet.as_nanos().to_be_bytes());
 				}
 			} else {
-				h.update([0u8]); // No schedulability
+				h.update([0u8]); // The spec has no schedulability assertion.
 			}
 		}
 		let out = h.finalize();
@@ -482,7 +487,12 @@ impl TBSpec for BuiltAssertSpec {
 
 #[cfg(feature = "testing-timing")]
 impl BuiltAssertSpec {
-	/// Check schedulability assertion
+	/// Checks the task set of `assertion` against its expected outcome.
+	///
+	/// # Errors
+	///
+	/// - [`SpecViolation::SchedulabilityViolation`] -- the outcome differs from `must_be_schedulable`.
+	/// - [`SpecViolation::SchedulabilityError`] -- the analysis fails.
 	fn check_schedulability(assertion: &SchedulabilityAssertion) -> Result<(), SpecViolation> {
 		let result = match assertion.task_set.scheduler {
 			SchedulerType::RateMonotonic => assertion.task_set.is_rm_schedulable(),
@@ -493,11 +503,11 @@ impl BuiltAssertSpec {
 			Ok(schedule_result) => {
 				let is_schedulable = schedule_result.is_schedulable;
 				if assertion.must_be_schedulable && !is_schedulable {
-					// Task set must be schedulable but isn't
+					// The task set must be schedulable and fails the analysis.
 					Err(SpecViolation::SchedulabilityViolation(schedule_result))
 				} else if !assertion.must_be_schedulable && is_schedulable {
-					// Task set must NOT be schedulable but is
-					// Create a synthetic violation for this case
+					// The task set must be unschedulable and passes the
+					// analysis, so a synthetic violation reports it.
 					let violation = crate::testing::schedulability::TaskViolationDetail {
 						task_id: "system".to_string(),
 						message: format!(
@@ -518,15 +528,14 @@ impl BuiltAssertSpec {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Payload encoding trait (AssertEncode) for tb_assert! ergonomic payloads
-// ---------------------------------------------------------------------------
-/// Trait converting payload values into a canonical byte representation.
-/// Numeric primitives are big-endian; &str/&\[u8\]/`Vec<u8>` zero-copy.
+// The payload encoding of `tb_assert!`.
+/// Converts a payload value into its canonical bytes. A numeric primitive
+/// encodes big-endian, and `str`, `&str`, `&[u8]`, `Vec<u8>`, and `[u8; 32]`
+/// lend their bytes without a copy.
 pub trait AssertEncode {
 	fn tb_payload_bytes(&self) -> Cow<'_, [u8]>;
 }
-// Unsigned primitives
+// An unsigned primitive encodes big-endian.
 impl AssertEncode for u8 {
 	fn tb_payload_bytes(&self) -> Cow<'_, [u8]> {
 		Cow::Owned(vec![*self])
@@ -547,7 +556,7 @@ impl AssertEncode for u64 {
 		Cow::Owned(self.to_be_bytes().to_vec())
 	}
 }
-// Signed primitives (cast)
+// A signed primitive encodes the big-endian bytes of its two's complement.
 impl AssertEncode for i8 {
 	fn tb_payload_bytes(&self) -> Cow<'_, [u8]> {
 		Cow::Owned(vec![*self as u8])
@@ -568,7 +577,7 @@ impl AssertEncode for i64 {
 		Cow::Owned((*self as u64).to_be_bytes().to_vec())
 	}
 }
-// usize/isize canonical to 64-bit
+// `usize` and `isize` widen to 64 bits, so every target encodes them alike.
 impl AssertEncode for usize {
 	fn tb_payload_bytes(&self) -> Cow<'_, [u8]> {
 		Cow::Owned((*self as u64).to_be_bytes().to_vec())
@@ -579,7 +588,7 @@ impl AssertEncode for isize {
 		Cow::Owned((*self as u64).to_be_bytes().to_vec())
 	}
 }
-// Text / bytes
+// Text and bytes lend their bytes without a copy.
 impl AssertEncode for &str {
 	fn tb_payload_bytes(&self) -> Cow<'_, [u8]> {
 		Cow::Borrowed(self.as_bytes())
@@ -610,11 +619,9 @@ pub fn __encode_payload<T: AssertEncode + ?Sized>(v: &T) -> Cow<'_, [u8]> {
 	T::tb_payload_bytes(v)
 }
 
-// ---------------------------------------------------------------------------
-// Helper macros
-// ---------------------------------------------------------------------------
+// The cardinality macros and the macros behind `tb_assert_spec!`.
 
-// Cardinality helper macros (thin wrappers over const fns)
+// The cardinality macros call the matching `Cardinality` constructor.
 #[macro_export]
 macro_rules! exactly {
 	($n:expr) => {
@@ -662,10 +669,9 @@ macro_rules! absent {
 	};
 }
 
-// Label declaration macro
-// Usage:
+// The hidden macros below carry the expansion of `tb_assert_spec!`.
 
-// Helper to build all specs (handles std vs non-std)
+// Builds every version of a spec once, in a `OnceLock`, and returns the slice.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __tb_assert_spec_build_all {
@@ -702,7 +708,8 @@ macro_rules! __tb_assert_spec_build_all {
 	}};
 }
 
-// Implementation helper to avoid nested repetition issues
+// Each version block expands in its own call, so the nested repetitions of a
+// block stay apart from the repetition over the blocks.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __tb_assert_spec_build_all_impl {
@@ -732,7 +739,8 @@ macro_rules! __tb_assert_spec_build_all_impl {
 	};
 }
 
-// Helper to handle events in __tb_assert_spec_build_all_impl (avoids nested repetition)
+// Passes one version block to the `@expand_events` arm, so the repetition of
+// its `events` list stays apart from the outer repetitions.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __tb_assert_spec_build_all_impl_with_events {
@@ -745,8 +753,8 @@ macro_rules! __tb_assert_spec_build_all_impl_with_events {
 		$(, tag_filter: [ $( $tag:expr ),* ])?
 		$(, schedulability: { $($schedule_content:tt)* })?
 	) => {{
-		// Use @expand_events which handles nested repetition correctly
-		// Description is handled separately in @build_with_events via $desc_opt parameter
+		// The `@expand_events` arm reads the event list. The `$desc_opt`
+		// parameter carries the description to `__tb_assert_spec_init_builder`.
 		$crate::__tb_assert_spec_build! {
 			@expand_events
 			$vec, $base, $desc_opt, $maj, $min, $patch, $mode, $gate,
@@ -760,39 +768,12 @@ macro_rules! __tb_assert_spec_build_all_impl_with_events {
 	}};
 }
 
-// Helper macro for common spec building logic (single implementation)
+// Builds the spec of one version block, with its events and schedulability.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __tb_assert_spec_build {
-	(
-		$vec:ident,
-		$base:ident,
-		$maj:literal, $min:literal, $patch:literal,
-		$mode:ident, $gate:expr,
-		assertions: [ $( $assertion:tt ),* $(,)? ],
-		$(
-			events: [ $($events_tt:tt)* ],
-		)?
-		$(tag_filter: [ $( $tag:expr ),* $(,)? ])?
-		$(, description: $desc:expr)?
-		$(, schedulability: { $($schedule_content:tt)* })?
-	) => {{
-		// Expand events token tree to avoid nested repetition issues
-		$crate::__tb_assert_spec_build! {
-			@expand_events
-			$vec, $base, $maj, $min, $patch, $mode, $gate,
-			assertions: [ $( $assertion ),* ],
-			$(
-				events_tt: [ $($events_tt)* ],
-			)?
-			$( tag_filter: [ $( $tag ),* $(,)? ])?
-			$(, description: $desc)?
-			$(, schedulability: { $($schedule_content)* })?
-		}
-	}};
-	// Expand events and build - separate arms for events vs no events
-	// Pattern with desc_opt parameter (from __tb_assert_spec_build_all_impl_with_events)
-	// Has events case
+	// The two `@expand_events` arms take a block with events and one without.
+	// This arm takes the block with events.
 	(@expand_events
 		$vec:ident, $base:ident, $desc_opt:expr, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:expr,
 		assertions: [ $( $assertion:tt ),* ],
@@ -809,7 +790,7 @@ macro_rules! __tb_assert_spec_build {
 			$(, schedulability: { $($schedule_content)* })?
 		}
 	};
-	// No events case
+	// This arm takes the block without events.
 	(@expand_events
 		$vec:ident, $base:ident, $desc_opt:expr, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:expr,
 		assertions: [ $( $assertion:tt ),* ],
@@ -825,48 +806,11 @@ macro_rules! __tb_assert_spec_build {
 			$(, schedulability: { $($schedule_content)* })?
 		}
 	};
-	// Legacy pattern without desc_opt (for backward compatibility)
-	(@expand_events
-		$vec:ident, $base:ident, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:expr,
-		assertions: [ $( $assertion:tt ),* ],
-		$(
-			events_tt: [ $($events_tt:tt)* ],
-		)?
-		$( tag_filter: [ $( $tag:expr ),* $(,)? ])?
-		$(, description: $desc:expr)?
-		$(, schedulability: { $($schedule_content:tt)* })?
-	) => {
-		$(
-			// Has events - expand events_tt here
-			$crate::__tb_assert_spec_build! {
-				@build_with_events_expanded
-				$vec, $base, None, $maj, $min, $patch, $mode, $gate,
-				assertions: [ $( $assertion ),* ],
-				events_tt: [ $($events_tt)* ],
-				$( tag_filter: [ $( $tag ),* $(,)? ])?
-				$(, description: $desc)?
-				$(, schedulability: { $($schedule_content)* })?
-			}
-		)?
-		$(
-			// No events case
-			$crate::__tb_assert_spec_build! {
-				@build_with_events
-				$vec, $base, None, $maj, $min, $patch, $mode, $gate,
-				assertions: [ $( $assertion ),* ],
-				events: [ ],
-				$( tag_filter: [ $( $tag ),* $(,)? ])?
-				$(, description: $desc)?
-				$(, schedulability: { $($schedule_content)* })?
-			}
-		)?
-	};
 	(@build_with_events_expanded
 		$vec:ident, $base:ident, $desc_opt:expr, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:expr,
 		assertions: [ $( $assertion:tt ),* ],
 		events_tt: [ $( $ev:expr ),* $(,)? ],
 		$( tag_filter: [ $( $tag:expr ),* $(,)? ])?
-		$(, description: $desc:expr)?
 		$(, schedulability: { $($schedule_content:tt)* })?
 	) => {{
 		$crate::__tb_assert_spec_build! {
@@ -875,27 +819,6 @@ macro_rules! __tb_assert_spec_build {
 			assertions: [ $( $assertion ),* ],
 			events: [ $( $ev ),* ],
 			$( tag_filter: [ $( $tag ),* $(,)? ])?
-			$(, description: $desc)?
-			$(, schedulability: { $($schedule_content)* })?
-		}
-	}};
-	// Legacy pattern without desc_opt (for backward compatibility)
-	(@build_with_events_expanded
-		$vec:ident, $base:ident, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:expr,
-		assertions: [ $( $assertion:tt ),* ],
-		events_tt: [ $($events_tt:tt)* ],
-		$( tag_filter: [ $( $tag:expr ),* $(,)? ])?
-		$(, description: $desc:expr)?
-		$(, schedulability: { $($schedule_content:tt)* })?
-	) => {{
-		// Recursively expand token tree to identifiers
-		$crate::__tb_assert_spec_build! {
-			@build_with_events_expanded
-			$vec, $base, None, $maj, $min, $patch, $mode, $gate,
-			assertions: [ $( $assertion ),* ],
-			events_tt: [ $($events_tt)* ],
-			$( tag_filter: [ $( $tag ),* $(,)? ])?
-			$(, description: $desc)?
 			$(, schedulability: { $($schedule_content)* })?
 		}
 	}};
@@ -904,13 +827,11 @@ macro_rules! __tb_assert_spec_build {
 		assertions: [ $( $assertion:tt ),* ],
 		events: [ $( $ev:expr ),* $(,)? ],
 		$( tag_filter: [ $( $tag:expr ),* $(,)? ])?
-		$(, description: $desc:expr)?
 		$(, schedulability: { $($schedule_content:tt)* })?
 	) => {{
 		let mut builder = $crate::__tb_assert_spec_init_builder!(
 			$base, $desc_opt, $maj, $min, $patch, $mode, $gate,
 			$(tag_filter: [ $( $tag ),* ])?
-			$(, description: $desc)?
 		);
 		$(
 			builder = $crate::__tb_assert_spec_add_assertion!(builder, $assertion);
@@ -927,36 +848,14 @@ macro_rules! __tb_assert_spec_build {
 		)?
 		$vec.push(builder.build());
 	}};
-	// Empty events case
-	(@expand_events
-		$vec:ident, $base:ident, $desc_opt:expr, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:expr,
-		assertions: [ $( $assertion:tt ),* ],
-		events_tt: [ ],
-		$( tag_filter: [ $( $tag:expr ),* $(,)? ])?
-		$(, description: $desc:expr)?
-		$(, schedulability: { $($schedule_content:tt)* })?
-	) => {{
-		let mut builder = $crate::__tb_assert_spec_init_builder!(
-			$base, $desc_opt, $maj, $min, $patch, $mode, $gate,
-			$(tag_filter: [ $( $tag ),* ])?
-			$(, description: $desc)?
-		);
-		$(
-			builder = $crate::__tb_assert_spec_add_assertion!(builder, $assertion);
-		)*
-		$(
-			$crate::__tb_assert_spec_parse_schedulability!(builder, $($schedule_content)*);
-		)?
-		$vec.push(builder.build());
-	}};
 }
 
 // Attaches a schedulability assertion to the spec under construction.
 //
-// The name is defined in every configuration and the body is what the
-// feature selects, so an expansion may call this without guarding the call
-// itself. A definition gated as a whole makes a missed guard a
-// name-resolution failure in one column of the feature matrix only.
+// Every configuration defines the name, and the feature selects the body, so an
+// expansion may call this without a guard of its own. A definition gated as a
+// whole makes a missed guard a name-resolution failure in one column of the
+// feature matrix only.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __tb_assert_spec_parse_schedulability {
@@ -982,31 +881,30 @@ macro_rules! __tb_assert_spec_parse_schedulability {
 	};
 }
 
-// Helper to add individual assertions (handles tags and values).
-// Labels are URN expressions only: raw strings and auto-generated ident
-// keys are rejected by the builder signature.
+// Adds one assertion with its optional value and tags. A label is a URN
+// expression, and the builder signature refuses a raw string or an ident key.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __tb_assert_spec_add_assertion {
-	// With value and tags - match equals! specifically
+	// An `equals!` value with tags.
 	($builder:expr, ($label:expr, $card:expr, equals!($value:expr), tags: [ $($tag:expr),* $(,)? ])) => {
 		$builder
 			.assertion_with_value($label, vec![ $($tag),* ], $card, Some($crate::testing::assertions::AssertionValue::from($value)))
 			.expect("duplicate label or invalid range")
 	};
-	// With value, no tags - match equals! specifically
+	// An `equals!` value without tags.
 	($builder:expr, ($label:expr, $card:expr, equals!($value:expr))) => {
 		$builder
 			.assertion_with_value($label, vec![], $card, Some($crate::testing::assertions::AssertionValue::from($value)))
 			.expect("duplicate label or invalid range")
 	};
-	// With tags, no value
+	// Tags without a value.
 	($builder:expr, ($label:expr, $card:expr, tags: [ $($tag:expr),* $(,)? ])) => {
 		$builder
 			.assertion($label, vec![ $($tag),* ], $card)
 			.expect("duplicate label or invalid range")
 	};
-	// No tags, no value (2-element tuple)
+	// A label and a cardinality alone, as a two-element tuple.
 	($builder:expr, ($label:expr, $card:expr)) => {
 		$builder
 			.assertion($label, vec![], $card)
@@ -1014,7 +912,8 @@ macro_rules! __tb_assert_spec_add_assertion {
 	};
 }
 
-// Multi-version macro ONLY (full semantic version required maj.min.patch)
+// The macro takes version blocks alone, each with a full semantic version
+// `V(major, minor, patch)`.
 #[macro_export]
 macro_rules! tb_assert_spec {
 	(
@@ -1050,9 +949,9 @@ macro_rules! tb_assert_spec {
 					desc_opt,
 					$(
 						$maj, $min, $patch, $mode,
-						// One decider for the expected gate: a block that omits
-						// `gate:` requires no decision, and every helper below
-						// couriers this value without reading it.
+						// One place decides the expected gate. A block that
+						// omits `gate:` requires no decision, and every helper
+						// below passes this value on without reading it.
 						::core::option::Option::None $( .or(Some($crate::policy::TransitStatus::$gate)) )?,
 						assertions: [ $( $assertion ),* ],
 						$(
@@ -1090,7 +989,8 @@ macro_rules! tb_assert_spec {
 	};
 }
 
-// Helper macro for common spec builder initialization (reduces duplication)
+// Starts the builder of one version block: its name, mode, version, gate, tag
+// filter, and description.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __tb_assert_spec_init_builder {
@@ -1103,7 +1003,6 @@ macro_rules! __tb_assert_spec_init_builder {
 		$mode:ident,
 		$gate:expr,
 		$(tag_filter: [ $($tag:expr),* $(,)? ])?
-		$(, description: $desc:expr)?
 	) => {{
 		let (maj, min, patch) = ($maj as u16, $min as u16, $patch as u16);
 		let mut builder = $crate::testing::macros::AssertSpecBuilder::new(
@@ -1114,12 +1013,7 @@ macro_rules! __tb_assert_spec_init_builder {
 		$(
 			builder = builder.tag_filter(vec![ $( $tag ),* ]);
 		)?
-		$(
-			if let Some(desc) = $desc {
-				builder = builder.description(desc);
-			}
-		)?
-		// Handle description from desc_opt parameter
+		// The description applies to every version block.
 		if let Some(desc) = $desc_opt {
 			builder = builder.description(desc);
 		}

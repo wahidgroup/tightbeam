@@ -1,7 +1,9 @@
-//! The payment gateway test scenario.
+//! The test scenarios of the payment gateway.
 //!
 //! One scenario sends a signed, hashed, and encrypted payment authorization
 //! through a cluster, a hive, and a servlet with bio-inspired ACO/ABC routing.
+//! A second scenario seals a card token to the key manager servlet, which
+//! opens it and refuses a tampered copy.
 
 #![cfg(all(
 	feature = "std",
@@ -25,12 +27,17 @@ use tightbeam::{
 		servlet::ServletConfig,
 		SubmitWork,
 	},
+	compose,
 	crypto::{
+		hpke::{HpkePublicKeyOps, HpkeSecp256k1Sha256Aes256Gcm},
 		key::{Aes256GcmKeyProvider, Secp256k1KeyProvider},
 		policy::Secp256k1Policy,
 		profiles::DefaultCryptoProvider,
 		sign::{
-			ecdsa::{Secp256k1Signature, Secp256k1SigningKey},
+			ecdsa::{
+				k256::{PublicKey, SecretKey},
+				Secp256k1Signature, Secp256k1SigningKey,
+			},
 			CertifiedKey,
 		},
 		x509::{
@@ -41,29 +48,47 @@ use tightbeam::{
 	decode,
 	instrumentation::events,
 	policy::TransitStatus,
+	random::OsRng,
 	tb_assert_spec, tb_scenario,
-	testing::SetupEnv,
+	testing::{ClientEnv, ServletEnv, SetupEnv},
 	transport::{
 		handshake::negotiation::TransportOffer, tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder,
+		TransportError,
 	},
 	urn::Urn,
-	TightBeamError, Version,
+	Frame, TightBeamError, Version,
 };
 
 use crate::common::hive::scenario_hive_config;
+use crate::common::security::expectation_failure;
 use crate::common::x509::create_test_cert_with_key;
 
 use super::cluster::PaymentGatewayCluster;
 use super::currency::MonetaryAmount;
 use super::hives::PaymentProcessorHive;
-use super::messages::{CreditTransferTransaction, PaymentIdentification, TransactionStatus};
-use super::servlets::{AuthorizationServlet, AUTHORIZATION_APPROVED, INTEGRITY_VERIFIED};
+use super::messages::{
+	CreditTransferTransaction, DecryptRequest, DecryptResponse, GetPublicKeyRequest, GetPublicKeyResponse,
+	PaymentIdentification, TransactionStatus,
+};
+use super::servlets::{
+	AuthorizationServlet, KeyManagerRequest, KeyManagerServlet, AUTHORIZATION_APPROVED, INTEGRITY_VERIFIED,
+	KEYMANAGER_DECRYPT_SUCCESS, KEYMANAGER_PUBKEY_SERVED, KEY_MANAGER_HPKE_INFO,
+};
 
 /// Client-observed work reply status (`TransitStatus` on the wire response).
 pub(crate) const WORK_STATUS: Urn<'static> = tightbeam::urn!("test", "event:scenarios/work-status");
 
 /// Client-observed approval decoded from inside the servlet's response frame.
 pub(crate) const CLIENT_AUTH_APPROVED: Urn<'static> = tightbeam::urn!("test", "event:scenarios/client-auth-approved");
+
+/// Client-observed plaintext of the key manager's reply to a sealed card token.
+pub(crate) const OPENED_CARD_TOKEN: Urn<'static> = tightbeam::urn!("test", "event:scenarios/opened-card-token");
+
+/// Client-observed status of the key manager's reply to a tampered card token.
+pub(crate) const TAMPERED_TOKEN_STATUS: Urn<'static> = tightbeam::urn!("test", "event:scenarios/tampered-token-status");
+
+/// The card token that the client seals to the key manager.
+const CARD_TOKEN: &str = "tok_4111_1111_1111_1111";
 
 /// The type URN that the payment scenario registers and targets.
 fn authorization_urn() -> Urn<'static> {
@@ -103,6 +128,14 @@ impl TestCerts {
 
 		Self { cluster_cert, cluster_key, cluster_trust, hive_cert, hive_key, hive_trust }
 	}
+
+	/// The certificate and the signing key that the hive and each servlet
+	/// present.
+	fn hive_identity(&self) -> (CertificateSpec, Arc<Secp256k1KeyProvider>) {
+		let certificate = CertificateSpec::Built(Box::new(self.hive_cert.to_owned()));
+		let key = Arc::new(Secp256k1KeyProvider::from(self.hive_key.to_owned()));
+		(certificate, key)
+	}
 }
 
 fn cluster_tls_config(certs: &TestCerts) -> ClusterTlsConfig {
@@ -115,16 +148,10 @@ fn cluster_tls_config(certs: &TestCerts) -> ClusterTlsConfig {
 }
 
 fn hive_tls_config(certs: &TestCerts) -> HiveConfig {
-	let hive_tls = Arc::new(
-		HiveTlsConfig::new(
-			CertificateSpec::Built(Box::new(certs.hive_cert.to_owned())),
-			Arc::new(Secp256k1KeyProvider::from(certs.hive_key.to_owned())),
-			vec![],
-		)
-		.expect("the hive TLS material must decode"),
-	);
+	let (certificate, key) = certs.hive_identity();
+	let hive_tls = HiveTlsConfig::new(certificate, key, vec![]).expect("the hive TLS material must decode");
 	HiveConfig {
-		hive_tls: Some(hive_tls),
+		hive_tls: Some(Arc::new(hive_tls)),
 		trust_store: Some(Arc::clone(&certs.cluster_trust)),
 		..scenario_hive_config()
 	}
@@ -133,13 +160,10 @@ fn hive_tls_config(certs: &TestCerts) -> HiveConfig {
 fn servlet_tls_config(
 	certs: &TestCerts,
 ) -> Result<ServletConfig<TokioListener, CreditTransferTransaction, DefaultCryptoProvider>, TightBeamError> {
+	let (certificate, key) = certs.hive_identity();
 	Ok(
 		ServletConfig::<TokioListener, CreditTransferTransaction, DefaultCryptoProvider>::builder()
-			.with_certificate(
-				CertificateSpec::Built(Box::new(certs.hive_cert.to_owned())),
-				Arc::new(Secp256k1KeyProvider::from(certs.hive_key.to_owned())),
-				vec![],
-			)?
+			.with_certificate(certificate, key, vec![])?
 			// The servlet offers mux as the cluster and the hive do, so work
 			// forwards negotiate mux.
 			.with_mux_offer(Some(TransportOffer::mux(8)))
@@ -245,20 +269,114 @@ tb_scenario! {
 			// One call on the public client surface wraps the work frame
 			// in the hop-local transport envelope and resolves the reply
 			// to the servlet's response frame. `ClusterWorkResponse::served`
-			// admits only an `Ok` gateway status, so reaching the next line
-			// pins the wire status the spec asserts.
+			// admits only an `Ok` gateway status, so the next line runs only
+			// under the wire status that the spec asserts.
 			let mut client = builder.connect(cluster_addr.to_owned()).await?;
 			let servlet_frame = client.submit_work_to(authorization_urn(), &inner).await?;
 			trace.event_with(WORK_STATUS, &[], TransitStatus::Ok)?;
 
-			// The gateway returns the servlet's complete response frame.
-			// Decoding the typed approval from inside it proves the
+			// The gateway returns the servlet's complete response frame. The
+			// typed approval decodes from inside it, which proves that the
 			// response envelope survived the route back to the client.
 			let status: TransactionStatus = decode(servlet_frame.message())?;
 			trace.event_with(CLIENT_AUTH_APPROVED, &[], status.status.is_success())?;
 
 			hive.stop();
 			cluster.stop();
+
+			Ok(())
+		}
+	}
+}
+
+/// The frame that carries `request` to the key manager under `id`.
+fn key_manager_frame(id: impl AsRef<[u8]>, request: KeyManagerRequest) -> Frame {
+	let frame = compose! {
+		V0: id: id.as_ref(),
+			message: request
+	};
+
+	frame.expect("a key manager request composes into a V0 frame")
+}
+
+/// `ciphertext` with the last octet of its AEAD tag flipped.
+fn with_flipped_tag(ciphertext: impl AsRef<[u8]>) -> Vec<u8> {
+	let mut tampered = ciphertext.as_ref().to_vec();
+	let last = tampered.last_mut().expect("an HPKE ciphertext ends with its AEAD tag");
+	*last ^= 0x01;
+
+	tampered
+}
+
+/// Resolves the reply to a request that the key manager must refuse into the
+/// transit status of the refusal.
+///
+/// A served reply and a failure with no transit status are errors, so a local
+/// transport fault cannot pass for the refusal.
+fn refusal_status(reply: Result<Option<Frame>, TransportError>) -> Result<TransitStatus, TightBeamError> {
+	match reply {
+		Err(error) => error.transit_status().ok_or_else(|| error.into()),
+		Ok(_) => Err(expectation_failure("the key manager served a tampered card token")),
+	}
+}
+
+tb_assert_spec! {
+	pub KeyManagerSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(KEYMANAGER_PUBKEY_SERVED, exactly!(1), equals!(true)),
+			(KEYMANAGER_DECRYPT_SUCCESS, exactly!(1), equals!(true)),
+			(OPENED_CARD_TOKEN, exactly!(1), equals!(CARD_TOKEN)),
+			(TAMPERED_TOKEN_STATUS, exactly!(1), equals!(TransitStatus::Internal))
+		]
+	}
+}
+
+// The client seals a card token to the public key that the key manager
+// serves, and the key manager opens it. A copy with one tag octet flipped
+// fails to open, so the handler fails and the client reads `Internal`.
+tb_scenario! {
+	name: key_manager_opens_a_sealed_card_token,
+	spec: KeyManagerSpec,
+	environment Servlet {
+		context: TestCerts::generate(),
+		start: |SetupEnv { trace, context: certs }| async move {
+			let hpke_key = Arc::new(SecretKey::random(&mut OsRng));
+			let (certificate, key) = certs.hive_identity();
+			let servlet_conf = ServletConfig::<TokioListener, KeyManagerRequest>::builder()
+				.with_certificate(certificate, key, vec![])?
+				.with_config(Arc::new(hpke_key))
+				.build();
+
+			KeyManagerServlet::start(Arc::new(trace), servlet_conf).await
+		},
+		setup: |ClientEnv { addr, context: certs, .. }| async move {
+			let builder = ClientBuilder::<TokioListener>::builder()
+				.with_trust_store(Arc::clone(&certs.hive_trust))
+				.build();
+			let client = builder.connect(addr).await?;
+			Ok(client)
+		},
+		client: |ServletEnv { trace, mut client, .. }| async move {
+			let key_request = KeyManagerRequest::GetPublicKey(GetPublicKeyRequest { _placeholder: None });
+			let key_reply = client.emit(key_manager_frame(b"key-manager-public-key", key_request), None).await?;
+			let key_frame = key_reply.ok_or(TightBeamError::MissingResponse)?;
+			let served: GetPublicKeyResponse = decode(key_frame.message())?;
+			let public_key = PublicKey::from_sec1_bytes(&served.public_key)?;
+			let sealed = public_key.seal::<HpkeSecp256k1Sha256Aes256Gcm>(KEY_MANAGER_HPKE_INFO, b"", CARD_TOKEN, None)?;
+			let ciphertext = sealed.to_bytes();
+			let tampered = with_flipped_tag(&ciphertext);
+
+			let open_request = KeyManagerRequest::Decrypt(DecryptRequest { ciphertext });
+			let open_reply = client.emit(key_manager_frame(b"key-manager-open", open_request), None).await?;
+			let open_frame = open_reply.ok_or(TightBeamError::MissingResponse)?;
+			let opened: DecryptResponse = decode(open_frame.message())?;
+			trace.event_with(OPENED_CARD_TOKEN, &[], String::from_utf8_lossy(&opened.plaintext).into_owned())?;
+
+			let tampered_request = KeyManagerRequest::Decrypt(DecryptRequest { ciphertext: tampered });
+			let tampered_reply = client.emit(key_manager_frame(b"key-manager-tampered", tampered_request), None).await;
+			trace.event_with(TAMPERED_TOKEN_STATUS, &[], refusal_status(tampered_reply)?)?;
 
 			Ok(())
 		}

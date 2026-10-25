@@ -1,4 +1,4 @@
-//! Transport error types and their conversions.
+//! The error types of the transport layer and their conversions.
 //!
 //! [`TransportError`] is the error every transport operation returns.
 //! [`TransportFailure`] names why an operation failed, and its peer-refusal
@@ -41,8 +41,9 @@ pub enum TransportFailure {
 	EncryptorUnavailable,
 	/// Random nonce generation failed.
 	NonceGenerationFailed,
-	/// The AEAD record limit was reached, because the send cipher halted or
-	/// the peer overran the volume bound. Reestablish the session to rekey.
+	/// The session reached the AEAD record limit, because the send cipher
+	/// halted or the peer overran the volume bound. Reestablish the session to
+	/// rekey.
 	RekeyRequired,
 	/// An inbound envelope broke the AEAD sequence by a replay, reorder, or
 	/// deletion on the connection (CWE-345).
@@ -63,15 +64,15 @@ pub enum TransportFailure {
 	/// The peer refused the call because the request is malformed regardless
 	/// of system state.
 	InvalidArgument,
-	/// The peer refused the call because it gave up waiting. A local deadline
-	/// that elapses also reports this variant.
+	/// The peer refused the call because the call's deadline elapsed. A local
+	/// deadline that elapses also reports this variant.
 	DeadlineExceeded,
 	/// The peer refused the call because the requested entity does not exist.
 	NotFound,
 	/// The peer refused the call because the entity already exists.
 	AlreadyExists,
-	/// The peer refused the call because the caller is identified but was
-	/// refused authorization.
+	/// The peer refused the call because it identified the caller but denied
+	/// it authorization.
 	PermissionDenied,
 	/// The peer refused the call because its capacity is exhausted. A retry
 	/// with backoff may succeed.
@@ -104,7 +105,9 @@ pub enum TransportFailure {
 #[derive(Debug, Errorizable)]
 #[non_exhaustive]
 pub enum TransportError {
-	/// The connection closed gracefully.
+	/// The connection closed. The reader reports it when the peer ends the
+	/// stream between two frames, and a mux handle reports it when its
+	/// connection failed or a driver ended.
 	#[error("Connection closed gracefully")]
 	ConnectionClosed,
 	/// The peer closed the connection before the handshake completed.
@@ -117,18 +120,19 @@ pub enum TransportError {
 	/// frame converts to this variant.
 	#[error("Send failed")]
 	SendFailed,
-	/// The operation requires encryption, and none was provided.
+	/// The operation requires encryption that the link, its configuration, or
+	/// the envelope that arrived lacks.
 	#[error("Encryption required but not provided")]
 	MissingEncryption,
 	/// This transport does not support the configured handshake protocol.
 	#[error("Handshake protocol not supported by this transport: {0:?}")]
 	UnsupportedHandshakeProtocol(HandshakeProtocolKind),
 	/// The CMS handshake requires the server's pinned key-agreement
-	/// certificate, and none is provisioned.
+	/// certificate, and the client configuration holds none.
 	#[error("Server certificate chain required but not provisioned")]
 	MissingServerCertificateChain,
 	/// A server of the CMS flow requires a key-agreement identity beside its
-	/// signing identity, and only the signing identity is provisioned.
+	/// signing identity, and its configuration holds only the signing identity.
 	#[error("Key-agreement identity required but not provisioned")]
 	MissingKeyAgreementIdentity,
 	/// The client holds no server trust, which is a trust store or a CMS
@@ -165,8 +169,8 @@ pub enum TransportError {
 	#[error("Invalid certificate: {0}")]
 	#[from]
 	InvalidCertificate(CertificateValidationError),
-	/// The message was not sent, and the frame travels with the error so a
-	/// restart policy can retry it.
+	/// The transport did not send the message, and the frame travels with the
+	/// error so a restart policy can retry it.
 	///
 	/// The display names only the failure and the frame's identity, through
 	/// the frame's own `Display`, because the body is application plaintext
@@ -217,6 +221,29 @@ impl From<TightBeamError> for TransportError {
 	}
 }
 
+impl TransportError {
+	/// The transit status this error carries: the status of the peer refusal
+	/// that [`TransportError::OperationFailed`] names, or `None` for a local
+	/// failure, which carries no wire status.
+	///
+	/// ```
+	/// use tightbeam::policy::TransitStatus;
+	/// use tightbeam::transport::TransportError;
+	///
+	/// let refusal = TransportError::from(TransitStatus::PermissionDenied);
+	/// assert_eq!(refusal.transit_status(), Some(TransitStatus::PermissionDenied));
+	/// assert_eq!(TransportError::InvalidMessage.transit_status(), None);
+	/// ```
+	#[must_use]
+	pub fn transit_status(&self) -> Option<TransitStatus> {
+		let Self::OperationFailed(failure) = self else {
+			return None;
+		};
+
+		TransitStatus::try_from(*failure).ok()
+	}
+}
+
 #[cfg(all(
 	feature = "transport-multiplex",
 	any(feature = "tokio", feature = "async-transport")
@@ -235,14 +262,10 @@ impl TransportError {
 	///   stays attributable.
 	#[must_use]
 	pub(crate) fn failure_status(&self) -> TransitStatus {
-		let Self::OperationFailed(failure) = self else {
-			return TransitStatus::Internal;
-		};
-
-		match TransitStatus::try_from(*failure) {
-			Ok(TransitStatus::Unavailable) => TransitStatus::Unknown,
-			Ok(status) => status,
-			Err(_) => TransitStatus::Internal,
+		match self.transit_status() {
+			Some(TransitStatus::Unavailable) => TransitStatus::Unknown,
+			Some(status) => status,
+			None => TransitStatus::Internal,
 		}
 	}
 }
@@ -361,7 +384,7 @@ impl From<k256::ecdsa::Error> for TransportError {
 }
 
 impl TransportError {
-	/// Wrap `frame` with the `failure` that kept it from sending.
+	/// Wrap the unsent `frame` with the `failure` that stopped its send.
 	pub fn from_failure(frame: Frame, failure: TransportFailure) -> Self {
 		TransportError::MessageNotSent(Box::new(frame), failure)
 	}
@@ -375,8 +398,8 @@ impl TransportError {
 		}
 	}
 
-	/// Borrow the unsent frame of a [`TransportError::MessageNotSent`] without
-	/// consuming the error.
+	/// Borrow the unsent frame of a [`TransportError::MessageNotSent`], and
+	/// keep the error whole.
 	pub fn frame(&self) -> Option<&Frame> {
 		match self {
 			TransportError::MessageNotSent(frame, _) => Some(frame),
@@ -384,8 +407,9 @@ impl TransportError {
 		}
 	}
 
-	/// Return the failure that kept a [`TransportError::MessageNotSent`] frame
-	/// from sending, or `None` for any other variant.
+	/// Return the failure that stopped the send of a
+	/// [`TransportError::MessageNotSent`] frame, or `None` for any other
+	/// variant.
 	pub fn failure_reason(&self) -> Option<&TransportFailure> {
 		match self {
 			TransportError::MessageNotSent(_, reason) => Some(reason),
@@ -399,7 +423,8 @@ impl TransportError {
 	///
 	/// - A send the transport reports as not sent, or a failed write.
 	/// - A local refusal before the write: a full stream table, a spent
-	///   budget, an unencodable frame, or a missing encryptor or nonce.
+	///   budget, an unencodable frame, a missing encryptor, or a failed nonce
+	///   generation.
 	/// - A peer's [`TransportFailure::Unavailable`], which a peer answers before its handler runs.
 	#[cfg(feature = "colony")]
 	#[must_use]

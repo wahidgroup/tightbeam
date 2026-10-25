@@ -1,7 +1,7 @@
-//! FDR exploration engine subsystem
+//! The engine subsystem of FDR.
 //!
-//! This module contains the core FdrExplorer struct that orchestrates
-//! exploration and refinement checking by delegating to pluggable subsystems.
+//! This module holds [`FdrExplorer`], which runs exploration and refinement
+//! checks through subsystems that a caller can replace.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -15,38 +15,38 @@ use super::exploration::DefaultExplorationEngine;
 use super::refinement::DefaultRefinementChecker;
 use crate::testing::fdr::config::FdrConfig;
 use crate::testing::fdr::explorer::{ExplorationCore, RefinementChecker, RefinementOutcome, SeedResult};
-use crate::testing::fdr::verdict::{Decision, Failure, FdrVerdict, Trace};
+use crate::testing::fdr::verdict::{Decision, FdrVerdict};
 use crate::testing::specs::csp::{Event, Process, State};
 
-/// FDR exploration engine (pluggable design)
+/// The FDR explorer, generic over its two subsystems.
 ///
-/// Generic over subsystem implementations:
-/// - `E`: Exploration engine (implements `ExplorationCore`)
-/// - `R`: Refinement checker (implements `RefinementChecker`)
+/// The type parameters name the subsystems:
+/// - `E` is the exploration engine, an [`ExplorationCore`].
+/// - `R` is the refinement checker, a [`RefinementChecker`].
 ///
-/// The refinement checker manages its own memoization cache internally.
+/// The refinement checker owns its memoization cache.
 pub struct FdrExplorer<'a, E, R>
 where
 	E: ExplorationCore,
 	R: RefinementChecker,
 {
-	/// Process being verified
+	/// The process under verification.
 	process: &'a Process,
 
-	/// Configuration
+	/// The FDR configuration, which the subsystems share.
 	config: Arc<FdrConfig>,
 
-	/// Exploration engine
+	/// The exploration engine, which runs each seed.
 	explorer: E,
 
-	/// Refinement checker
+	/// The refinement checker, which tests the process against each spec.
 	refinement: R,
 
-	/// Verdict accumulator
+	/// The verdict that the run accumulates.
 	verdict: FdrVerdict,
 }
 
-/// Default FDR explorer using default subsystem implementations
+/// The FDR explorer with the default exploration engine and refinement checker.
 pub type DefaultFdrExplorer<'a> =
 	FdrExplorer<'a, DefaultExplorationEngine<'a>, DefaultRefinementChecker<'a, DefaultCache>>;
 
@@ -55,9 +55,10 @@ where
 	E: ExplorationCore,
 	R: RefinementChecker,
 {
-	/// Create new FDR explorer with custom subsystems
+	/// An explorer of `process` under `config` with the given subsystems.
 	///
-	/// The cache is managed by the refinement checker, which receives it during construction.
+	/// The refinement checker owns the cache, which it receives at its
+	/// construction.
 	pub fn new(process: &'a Process, config: FdrConfig, explorer: E, refinement: R) -> Self {
 		Self {
 			process,
@@ -68,17 +69,18 @@ where
 		}
 	}
 
-	/// Create new FDR explorer with custom subsystems using `Arc<FdrConfig>`
+	/// An explorer of `process` under a shared `config` with the given
+	/// subsystems.
 	///
-	/// Use this when you've already created an `Arc<FdrConfig>` to share across subsystems.
+	/// Use it when the subsystems already share `config` through an [`Arc`].
 	pub fn new_with_arc(process: &'a Process, config: Arc<FdrConfig>, explorer: E, refinement: R) -> Self {
 		Self { process, config, explorer, refinement, verdict: FdrVerdict::default() }
 	}
 
-	/// Run Layer 3 and report what it decided.
+	/// Runs Layer 3 and reports what it decided.
 	///
-	/// Schedulability is decided on this one exit path, so a spec that misses
-	/// its deadlines cannot reach a consumer as a verdict that held.
+	/// This one exit path decides schedulability, so a spec that misses its
+	/// deadlines cannot reach a consumer as a verdict that held.
 	pub fn explore(&mut self) -> FdrVerdict {
 		let mut verdict = self.explore_modes();
 		verdict.schedulable = self.schedulability();
@@ -88,10 +90,10 @@ where
 
 	/// What schedulability analysis decided about the configured specs.
 	///
-	/// A spec declaring no schedulability block has no task set. An analysis
-	/// error refutes rather than leaving the question open: every
-	/// `SchedulabilityError` names a defect in the declared task set, such as
-	/// a period with no WCET.
+	/// A spec with no schedulability block has no task set. An analysis error
+	/// decides [`Decision::Refuted`] and not [`Decision::Unknown`], because
+	/// every `SchedulabilityError` names a defect in the declared task set,
+	/// such as a period with no WCET.
 	#[cfg(feature = "testing-schedulability")]
 	fn schedulability(&self) -> Decision {
 		let mut decision = Decision::NotAsserted;
@@ -107,7 +109,8 @@ where
 		decision
 	}
 
-	/// Where schedulability analysis does not compile in.
+	/// A build without `testing-schedulability` leaves schedulability
+	/// [`Decision::NotAsserted`].
 	#[cfg(not(feature = "testing-schedulability"))]
 	fn schedulability(&self) -> Decision {
 		Decision::NotAsserted
@@ -123,27 +126,27 @@ where
 		self.config.fault_model.is_none()
 	}
 
-	/// Where no fault model can be configured.
+	/// A build without `testing-fault` has no fault model, so every run asserts
+	/// freedom.
 	#[cfg(not(feature = "testing-fault"))]
 	fn asserts_freedom(&self) -> bool {
 		true
 	}
 
-	/// Run multi-seed exploration
+	/// Runs the exploration mode that the configuration selects.
 	fn explore_modes(&mut self) -> FdrVerdict {
-		// Mode 1: Specification robustness testing (fault model + specs)
-		// When fault_model is provided with specs, explore the spec WITH faults
+		// Mode 1: a fault model with specs explores each spec under faults.
 		#[cfg(feature = "testing-fault")]
 		if self.config.fault_model.is_some() && !self.config.specs.is_empty() {
-			// Explore the specification process with faults injected
-			// This tests if the SPEC correctly models error conditions
+			// The run tests whether each spec models the error conditions that
+			// the faults cause.
 			self.explore_specification_with_faults();
 			#[cfg(feature = "testing-fmea")]
 			self.generate_fmea_if_configured();
 			return self.verdict.clone();
 		}
 
-		// Mode 2: Refinement checking (specs without fault model)
+		// Mode 2: specs with no fault model run the refinement checks.
 		if !self.config.specs.is_empty() {
 			self.check_refinement();
 			#[cfg(feature = "testing-fmea")]
@@ -151,7 +154,7 @@ where
 			return self.verdict.clone();
 		}
 
-		// Mode 3: Single-process multi-seed exploration
+		// Mode 3: a run with no spec explores the process over every seed.
 		if self.asserts_freedom() {
 			self.verdict.divergence_free = Decision::Holds;
 			self.verdict.deadlock_free = Decision::Holds;
@@ -202,7 +205,7 @@ where
 		self.verdict.clone()
 	}
 
-	/// Update verdict based on seed result
+	/// Adds the result of `seed` to the verdict.
 	///
 	/// A seed that injected a fault feeds the error-recovery counters, which
 	/// FMEA detection ratings divide.
@@ -255,10 +258,10 @@ where
 		}
 	}
 
-	/// Explore every configured spec with fault injection
+	/// Explores every configured spec under fault injection, over every seed.
 	///
-	/// Every spec, not just `specs[0]`: stressing only the first silently
-	/// skips the rest.
+	/// A run that stressed only `specs[0]` would skip the rest without a
+	/// signal, so the loop covers every spec.
 	#[cfg(feature = "testing-fault")]
 	fn explore_specification_with_faults(&mut self) {
 		if self.config.specs.is_empty() {
@@ -316,7 +319,8 @@ where
 		self.check_determinism();
 	}
 
-	/// Generate FMEA report if configured
+	/// Builds the FMEA report when the FMEA configuration sets `auto_generate`
+	/// and the run injected a fault.
 	#[cfg(feature = "testing-fmea")]
 	fn generate_fmea_if_configured(&mut self) {
 		if let Some(ref fmea_config) = self.config.fmea_config {
@@ -329,11 +333,11 @@ where
 		}
 	}
 
-	/// Structural determinism check
+	/// Records whether the process is structurally deterministic.
 	///
-	/// No hidden actions and no multi-target `(state, event)` transition is
-	/// sufficient for CSP determinism (Roscoe 2010, §10.5). External choice is
-	/// deterministic and is not flagged.
+	/// A process with no hidden action and no multi-target `(state, event)`
+	/// transition is deterministic in CSP (Roscoe 2010, §10.5). External choice
+	/// is deterministic, so the check passes it.
 	fn check_determinism(&mut self) {
 		let mut states: Vec<State> = self.process.states.iter().copied().collect();
 		states.sort_unstable_by_key(|state| state.0);
@@ -352,20 +356,20 @@ where
 		self.verdict.determinism_witness = witness;
 	}
 
-	/// Check `process ⊑ spec` in the models the subject admits
+	/// Checks `process ⊑ spec` in the models that the subject admits.
 	///
-	/// Traces refinement is always asked. Failures and divergences are asked
-	/// only of a subject whose refusals are known, or the checker would grade
-	/// it on refusals it synthesized. Under `fail_fast`, each pass stops at
-	/// its first violation.
+	/// The check always asks traces refinement. It asks failures and
+	/// divergences only of a subject whose observation carries refusals, or the
+	/// checker would grade the subject on refusals it synthesized. Under
+	/// `fail_fast`, each pass stops at its first violation.
 	fn check_refinement(&mut self) {
 		if self.config.specs.is_empty() {
 			return;
 		}
 
-		// The spec list is read through a refcount rather than a copy: cloning
-		// `Vec<Process>` duplicates every state set and transition map that
-		// the checker only ever reads.
+		// The check reads the spec list through an `Arc` clone and not a copy,
+		// because a clone of `Vec<Process>` duplicates every state set and
+		// transition map that the checker only reads.
 		let config = Arc::clone(&self.config);
 		let specs = config.specs.as_slice();
 		self.verdict.unmodelled_events = self.unmodelled_events();
@@ -459,25 +463,16 @@ where
 
 		decision
 	}
-
-	/// Get traces explored (for compatibility)
-	pub fn traces(&self) -> Vec<Trace> {
-		self.explorer.traces()
-	}
-
-	/// Get failures collected (for compatibility)
-	pub fn failures(&self) -> Vec<Failure> {
-		self.explorer.failures()
-	}
 }
 
 impl<'a> DefaultFdrExplorer<'a> {
-	/// Create new FDR explorer with default subsystems
+	/// An explorer of `process` under `config` with the default subsystems.
 	///
-	/// This is a convenience constructor that uses the default implementations
-	/// of all subsystems. For custom subsystems, use `FdrExplorer::new` directly.
+	/// The default subsystems are [`DefaultExplorationEngine`] and
+	/// [`DefaultRefinementChecker`] over a [`DefaultCache`].
+	/// [`FdrExplorer::new`] takes other subsystems.
 	///
-	/// Accepts either owned `FdrConfig` or `Arc<FdrConfig>`.
+	/// `config` is an owned [`FdrConfig`] or an `Arc<FdrConfig>`.
 	pub fn with_defaults(process: &'a Process, config: impl Into<Arc<FdrConfig>>) -> Self {
 		let config = config.into();
 		let explorer_config = Arc::clone(&config);
@@ -492,9 +487,15 @@ impl<'a> DefaultFdrExplorer<'a> {
 
 #[cfg(test)]
 mod tests {
+	#[cfg(feature = "testing-timing")]
+	use core::time::Duration;
+
 	use super::Decision;
 	use crate::testing::fdr::{DefaultFdrExplorer, FdrConfig};
 	use crate::testing::specs::csp::{Event, Process, ProcessBuildError, State};
+
+	#[cfg(feature = "testing-timing")]
+	use crate::testing::timing::TimingGuard;
 
 	/// A spec that models `start` and nothing else.
 	fn narrow_spec() -> Result<Process, ProcessBuildError> {
@@ -503,6 +504,35 @@ mod tests {
 			.add_observable(Event("start"))
 			.add_transition(State("S0"), Event("start"), State("S1"))
 			.add_terminal(State("S1"))
+			.build()
+	}
+
+	/// A subject in which `arm` takes `S0` to `S1` when `clk` reads at most
+	/// 5 ms, and `S1` is not terminal and offers no event.
+	#[cfg(feature = "testing-timing")]
+	fn guarded_deadlock() -> Result<Process, ProcessBuildError> {
+		let guard = TimingGuard::ClockLessEqual("clk".to_string(), Duration::from_millis(5));
+
+		Process::builder("GuardedDeadlock")
+			.initial_state(State("S0"))
+			.add_observable(Event("arm"))
+			.add_timed_transition(State("S0"), Event("arm"), State("S1"), Some(guard), Vec::new())
+			.build()
+	}
+
+	/// A subject in which `start` takes `S0` to `S1` and resets `clk`, and
+	/// `arm` takes `S1` to the terminal `S2` when `clk` reads at most 5 ms.
+	#[cfg(feature = "testing-timing")]
+	fn reset_then_guard() -> Result<Process, ProcessBuildError> {
+		let guard = TimingGuard::ClockLessEqual("clk".to_string(), Duration::from_millis(5));
+
+		Process::builder("ResetThenGuard")
+			.initial_state(State("S0"))
+			.add_observable(Event("start"))
+			.add_observable(Event("arm"))
+			.add_timed_transition(State("S0"), Event("start"), State("S1"), None, ["clk".to_string()])
+			.add_timed_transition(State("S1"), Event("arm"), State("S2"), Some(guard), Vec::new())
+			.add_terminal(State("S2"))
 			.build()
 	}
 
@@ -531,6 +561,30 @@ mod tests {
 			Decision::Holds,
 			"`audit` is projected away, so it is coverage and not a counterexample"
 		);
+
+		Ok(())
+	}
+
+	#[cfg(feature = "testing-timing")]
+	#[test]
+	fn a_guarded_process_over_a_deadlock_is_not_deadlock_free() -> Result<(), ProcessBuildError> {
+		let subject = guarded_deadlock()?;
+		let mut explorer = DefaultFdrExplorer::with_defaults(&subject, FdrConfig::default());
+
+		let verdict = explorer.explore();
+		assert_eq!(verdict.deadlock_free, Decision::Refuted);
+
+		Ok(())
+	}
+
+	#[cfg(feature = "testing-timing")]
+	#[test]
+	fn a_reset_clock_lets_exploration_take_the_guard_behind_it() -> Result<(), ProcessBuildError> {
+		let subject = reset_then_guard()?;
+		let mut explorer = DefaultFdrExplorer::with_defaults(&subject, FdrConfig::default());
+
+		let verdict = explorer.explore();
+		assert_eq!(verdict.deadlock_free, Decision::Holds);
 
 		Ok(())
 	}

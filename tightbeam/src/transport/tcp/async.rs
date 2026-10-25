@@ -191,7 +191,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> TokioListener<P> {
 	///
 	/// # Errors
 	///
-	/// - The I/O error of a socket that reports no local address.
+	/// - [`std::io::Error`] -- the socket reports no local address.
 	pub fn local_addr(&self) -> Result<SocketAddr, IoError> {
 		self.listener.local_addr()
 	}
@@ -203,7 +203,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> TokioListener<P> {
 	///
 	/// # Errors
 	///
-	/// - The I/O error of a bind that fails.
+	/// - [`std::io::Error`] -- the bind fails.
 	///
 	/// # Examples
 	///
@@ -234,7 +234,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> TokioListener<P> {
 	///
 	/// # Errors
 	///
-	/// - The I/O error of an accept that fails.
+	/// - [`std::io::Error`] -- the accept fails.
 	pub async fn accept(&self) -> Result<(TcpTransport<TokioStream, P>, SocketAddr), IoError> {
 		let (stream, peer_addr) = self.listener.accept().await?;
 		let tokio_stream = TokioStream::from(stream);
@@ -393,7 +393,8 @@ where
 	///
 	/// - [`TransportError::InvalidState`] -- the peer did not negotiate
 	///   multiplexing, or the handshake has not completed.
-	/// - The errors of [`Self::into_split`], and the error of a rekey context that fails to detach.
+	/// - [`TransportError`] -- the errors of [`Self::into_split`], and of a
+	///   rekey context that fails to detach.
 	pub fn into_mux(mut self, role: MuxRole) -> TransportResult<SplitMuxTransport<S>> {
 		let Some(settings) = self.negotiated_mux() else {
 			return Err(TransportError::InvalidState);
@@ -517,8 +518,8 @@ where
 /// The wire mode a split receive half reads, with the cipher an encrypted
 /// session needs.
 enum SplitRecv {
-	/// The transport was named cleartext, so envelopes carry NO
-	/// confidentiality, integrity, replay, or deletion protection.
+	/// The endpoint named cleartext, so envelopes carry NO confidentiality,
+	/// integrity, replay, or deletion protection.
 	Cleartext,
 	/// The receive-direction cipher of the established session.
 	Encrypted(RecvCipher),
@@ -545,7 +546,7 @@ impl SplitRecv {
 	///   [`TransportFailure::EncryptionFailed`] -- a record arrived on a
 	///   cleartext half.
 	/// - [`TransportError::MissingEncryption`] -- a cleartext envelope arrived on an encrypted half.
-	/// - The open failure of a record.
+	/// - [`TransportError`] -- the errors of [`RecvCipher::open`].
 	fn admit<'w>(&self, arriving: ArrivingEnvelope<'w>) -> TransportResult<&'w [u8]> {
 		match (self, arriving) {
 			(Self::Cleartext, ArrivingEnvelope::Cleartext(contents)) => Ok(contents),
@@ -561,7 +562,7 @@ impl SplitRecv {
 /// The wire mode a split send half writes, with the cipher an encrypted
 /// session needs.
 enum SplitSend {
-	/// The transport was named cleartext.
+	/// The endpoint named cleartext.
 	Cleartext,
 	/// The send-direction cipher of the established session.
 	Encrypted(SendCipher),
@@ -598,8 +599,8 @@ where
 	/// `remaining_records` counts down ([RFC 9846 § 5.5][rfc9846-5.5]).
 	///
 	/// The value sets trigger policy only. Decryption refuses records at the
-	/// AES-GCM volume bounds whatever this value is. A cleartext half never
-	/// rekeys, so the limit does not apply to it.
+	/// AES-GCM volume bounds whatever this value is. The limit applies to an
+	/// encrypted half alone, because a cleartext half holds no key to renew.
 	///
 	/// [rfc9846-5.5]: https://datatracker.ietf.org/doc/html/rfc9846#section-5.5
 	pub fn with_rekey_limit(mut self, limit: u64) -> Self {
@@ -616,7 +617,7 @@ where
 	R: AsyncReadStream,
 	TransportError: From<R::Error>,
 {
-	/// Read one envelope in the wire mode this half was split in.
+	/// Read one envelope in the wire mode this half took from the split.
 	///
 	/// The operation deadline bounds the read in either mode, so a peer that
 	/// stops mid-frame cannot pin the reader task (CWE-400).
@@ -714,7 +715,8 @@ where
 	/// Override the send cipher's rekey record limit
 	/// ([RFC 9846 § 5.5][rfc9846-5.5]).
 	///
-	/// A cleartext half never rekeys, so the limit does not apply to it.
+	/// The limit applies to an encrypted half alone, because a cleartext half
+	/// holds no key to renew.
 	///
 	/// [rfc9846-5.5]: https://datatracker.ietf.org/doc/html/rfc9846#section-5.5
 	pub fn with_rekey_limit(mut self, limit: u64) -> Self {
@@ -731,8 +733,8 @@ where
 	W: AsyncWriteStream,
 	TransportError: From<W::Error>,
 {
-	/// Write one envelope in the wire mode this half was split in, bounded
-	/// by the operation deadline in either mode.
+	/// Write one envelope in the wire mode this half took from the split,
+	/// under the operation deadline in either mode.
 	async fn write_envelope(&mut self, envelope: TransportEnvelope) -> TransportResult<()> {
 		let builder = EnvelopeBuilder::transport(envelope).with_limits(self.limits);
 		let builder = match &self.mode {
@@ -1026,7 +1028,7 @@ mod tests {
 	use crate::transport::io::EncryptedMessageIO;
 	use crate::transport::state::{DialableEncryption, EncryptionConfig};
 	use crate::transport::{MessageCollector, MessageEmitter, TransportEncryptionConfig};
-	use crate::utils::time::SystemClock;
+	use crate::utils::time::{ManualClock, SystemClock};
 
 	#[cfg(feature = "transport-hpke")]
 	use crate::crypto::key::Secp256k1KeyProvider;
@@ -1282,6 +1284,34 @@ mod tests {
 				outcome,
 				Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded))
 			));
+		}
+
+		/// A split half sets its deadline one operation timeout past the
+		/// reading of its connection clock, so a stalled peer ends the read
+		/// once that timeout has passed on the runtime's timer, and no later.
+		#[tokio::test(start_paused = true)]
+		async fn a_split_reader_waits_out_exactly_the_operation_timeout() -> Result<(), TightBeamError> {
+			let clock = Arc::new(ManualClock::default());
+			clock.advance(Duration::from_secs(3600));
+			let limits = one_second_deadline();
+			let mut reader = TransportReader {
+				stream: StalledStream,
+				mode: SplitRecv::Cleartext,
+				limits,
+				clock,
+				#[cfg(feature = "instrument")]
+				trace: None,
+			};
+			let started = tokio::time::Instant::now();
+
+			let outcome = tokio::time::timeout(limits.operation_timeout * 2, reader.read_envelope()).await;
+			let expired = matches!(
+				outcome,
+				Ok(Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded)))
+			);
+			assert!(expired);
+			assert_eq!(started.elapsed(), limits.operation_timeout);
+			Ok(())
 		}
 
 		#[tokio::test(start_paused = true)]
@@ -1766,6 +1796,61 @@ mod tests {
 		let deadline = Duration::from_secs(5);
 		let joined = tokio::time::timeout(deadline, server_handle).await;
 		assert!(matches!(joined, Ok(Ok(Err(_)))));
+		Ok(())
+	}
+
+	/// A whole frame on the wire: a NULL under the cleartext tag.
+	const WAITING_FRAME: &[u8] = &[0xa0, 0x02, 0x05, 0x00];
+
+	/// A server transport over one end of a loopback connection, beside the
+	/// raw stream of its peer. The server reads its deadlines on `clock`, and
+	/// its handshake began at the clock's reading.
+	async fn handshaking_server(clock: &Arc<ManualClock>) -> (TcpTransport<TokioStream>, TcpStream) {
+		let bound = TcpListener::bind("127.0.0.1:0").await;
+		let listener = bound.expect("a loopback port binds");
+		let addr = listener.local_addr().expect("a bound listener has an address");
+		let peer = TcpStream::connect(addr).await.expect("the loopback listener takes the dial");
+		let (stream, _) = listener.accept().await.expect("the dial arrives");
+
+		let EncryptedTestServer { config, .. } = encrypted_test_server().expect("the test server provisions");
+		let endpoint = EndpointConfig::try_from(config).expect("a server identity answers the dialer rule");
+		let endpoint = endpoint.with_clock(Arc::clone(clock) as Arc<dyn Clock>);
+		let mut transport = TcpTransport::new(TokioStream::from(stream), endpoint);
+
+		let began = transport.state.begin_handshake(clock.monotonic());
+		assert!(began, "a provisioned server begins its handshake");
+		(transport, peer)
+	}
+
+	/// A read refuses once the handshake deadline has passed on the connection
+	/// clock, before it takes a byte, though a whole frame of the peer waits.
+	#[tokio::test]
+	async fn a_read_past_the_handshake_deadline_is_refused() -> TransportResult<()> {
+		let clock = Arc::new(ManualClock::default());
+		let (mut transport, mut peer) = handshaking_server(&clock).await;
+		peer.write_all(WAITING_FRAME).await?;
+		clock.advance(transport.limits.handshake_timeout);
+
+		let read = transport.read_envelope_bytes().await;
+		let refused = matches!(read, Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded)));
+		assert!(refused);
+		Ok(())
+	}
+
+	/// The server driver refuses a handshake message that arrives once the
+	/// handshake deadline has passed on the connection clock, before the
+	/// message runs.
+	#[cfg(feature = "transport-hpke")]
+	#[tokio::test]
+	async fn a_handshake_message_past_the_deadline_is_refused() -> TransportResult<()> {
+		let clock = Arc::new(ManualClock::default());
+		let (mut transport, _peer) = handshaking_server(&clock).await;
+		let message = HandshakeMessage::try_from(create_test_signed_data(b"late"))?;
+		clock.advance(transport.limits.handshake_timeout);
+
+		let driven = transport.perform_server_handshake(message).await;
+		let refused = matches!(driven, Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded)));
+		assert!(refused);
 		Ok(())
 	}
 

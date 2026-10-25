@@ -1,5 +1,5 @@
-//! Streaming consumer API: chunk-level dispatch over the unified
-//! stream wire.
+//! Scenarios for the streaming consumer API, which dispatches each chunk over
+//! the unified stream wire.
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::time::Duration;
@@ -22,8 +22,7 @@ use tightbeam::Frame;
 use tightbeam::TightBeamError;
 
 use super::common::*;
-use crate::common::security::expectation_failure;
-use crate::transport::support::await_ok;
+use crate::transport::support::{await_ok, await_within_deadline, HandlerSignal};
 
 /// Client endpoint and server responder over freshly established
 /// chunked transports: the setup every streaming scenario shares.
@@ -122,7 +121,7 @@ pub(crate) const UNARY_KIND_REFUSED_BY_STREAMING_SERVER: Urn<'static> =
 pub(crate) const UNARY_KIND_REFUSED_BY_DUPLEX_SERVER: Urn<'static> =
 	tightbeam::urn!("test", "event:streaming/unary-kind-refused-by-duplex-server");
 
-/// Whether a unary-kind emit is refused with `Unimplemented`.
+/// Whether the responder refuses a unary-kind emit with `Unimplemented`.
 async fn emit_refused_unimplemented(endpoint: &MuxEndpoint, label: impl AsRef<str>) -> bool {
 	let label = label.as_ref();
 	matches!(
@@ -171,7 +170,7 @@ tb_assert_spec! {
 	}
 }
 
-// Same strictness against a streaming-only responder.
+// Kind dispatch is as strict against a streaming-only responder.
 tb_scenario! {
 	name: mux_unary_kind_refused_by_streaming_server,
 	spec: MuxUnaryKindVsStreamingSpec,
@@ -190,25 +189,28 @@ tb_scenario! {
 	}
 }
 
-/// Fires its notify when dropped: observes handler unwinding whether
-/// the abort lands or the handler returns after its body severs.
-struct NotifyOnDrop(Arc<Notify>);
+/// Raises its signal on drop, so it observes the handler unwind whether the
+/// abort lands or the handler returns after its body severs.
+struct RaiseOnDrop(Arc<HandlerSignal>);
 
-impl Drop for NotifyOnDrop {
+impl Drop for RaiseOnDrop {
 	fn drop(&mut self) {
-		self.0.notify_one();
+		self.0.raise();
 	}
 }
 
-/// Handler that signals entry, then consumes the body until it ends,
-/// flagging its unwind through the drop guard.
-fn hanging_streaming_handler(started: Arc<Notify>, unwound: Arc<Notify>) -> impl Fn(StreamBody) -> HandlerFuture {
+/// Handler that signals entry, consumes the body until it ends, and flags its
+/// unwind through the drop guard.
+fn hanging_streaming_handler(
+	started: Arc<HandlerSignal>,
+	unwound: Arc<HandlerSignal>,
+) -> impl Fn(StreamBody) -> HandlerFuture {
 	move |mut body| {
 		let started = Arc::clone(&started);
 		let unwound = Arc::clone(&unwound);
 		Box::pin(async move {
-			let _guard = NotifyOnDrop(unwound);
-			started.notify_one();
+			let _guard = RaiseOnDrop(unwound);
+			started.raise();
 
 			let drained = drain_body(&mut body).await;
 			echo_reassembled(&drained.bytes)
@@ -232,28 +234,26 @@ tb_assert_spec! {
 	}
 }
 
-// Dropping the sink mid-stream cancels: the response resolves
-// Cancelled locally and the server discards the in-flight body,
-// unwinding its handler.
+// A drop of the sink mid-stream cancels the stream: the response resolves
+// `Cancelled` locally, and the server discards the in-flight body and unwinds
+// its handler.
 tb_scenario! {
 	name: mux_streaming_cancel_discards_inflight_body,
 	spec: MuxStreamingCancelSpec,
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
 			let (client_end, responder) = streaming_endpoints(&trace, chunked_offer(4)).await?;
-			let started = Arc::new(Notify::new());
-			let unwound = Arc::new(Notify::new());
+			let started = Arc::new(HandlerSignal::default());
+			let unwound = Arc::new(HandlerSignal::default());
 			let handler = hanging_streaming_handler(Arc::clone(&started), Arc::clone(&unwound));
 			let _serve = tokio::spawn(responder.serve_streaming(handler));
 
 			let (mut sink, response) = client_end.handle.open_stream()?;
 			// Pushes go out eagerly: the first one carries the open
-			// and starts the handler
+			// and starts the handler.
 			sink.push(b"first-chunk").await?;
 			sink.push(b"second-chunk").await?;
-			timeout(Duration::from_secs(5), started.notified())
-				.await
-				.map_err(|_| expectation_failure("handler must start before the cancel"))?;
+			started.wait("handler must start before the cancel").await?;
 
 			drop(sink);
 
@@ -264,7 +264,7 @@ tb_scenario! {
 				matches!(outcome, Err(TransportError::OperationFailed(TransportFailure::Cancelled))),
 			)?;
 
-			let handler_unwound = timeout(Duration::from_secs(5), unwound.notified()).await.is_ok();
+			let handler_unwound = unwound.raised().await;
 			trace.event_with(CANCEL_UNWINDS_HANDLER, &[], handler_unwound)?;
 
 			Ok(())
@@ -285,9 +285,9 @@ tb_assert_spec! {
 	}
 }
 
-// Dropping the duplex sink before close cancels the stream: the reply
-// body fails with Cancelled instead of waiting on a trailer that will
-// never arrive.
+// A drop of the duplex sink before close cancels the stream: the reply
+// body fails with `Cancelled` instead of a wait on a trailer that never
+// arrives.
 tb_scenario! {
 	name: mux_duplex_sink_drop_fails_reply_body,
 	spec: MuxDuplexCancelSpec,
@@ -303,8 +303,8 @@ tb_scenario! {
 
 			drop(sink);
 
-			// Echoed chunks may already sit ahead of the cancel event;
-			// drain to the terminal outcome
+			// Echoed chunks may already sit ahead of the cancel event, so
+			// drain to the terminal outcome.
 			let drained = drain_body(&mut reply).await;
 			trace.event_with(
 				DUPLEX_CANCEL_FAILS_REPLY,
@@ -320,14 +320,14 @@ tb_scenario! {
 	}
 }
 
-/// Handler that signals entry, parks until released, then consumes and
-/// echoes. The slow consumer is used for backpressure scenarios.
-fn gated_streaming_echo(started: Arc<Notify>, release: Arc<Notify>) -> impl Fn(StreamBody) -> HandlerFuture {
+/// Handler that signals entry, parks until its release, then consumes and
+/// echoes. The backpressure scenarios use it as the slow consumer.
+fn gated_streaming_echo(started: Arc<HandlerSignal>, release: Arc<Notify>) -> impl Fn(StreamBody) -> HandlerFuture {
 	move |mut body| {
 		let started = Arc::clone(&started);
 		let release = Arc::clone(&release);
 		Box::pin(async move {
-			started.notify_one();
+			started.raise();
 			release.notified().await;
 
 			let drained = drain_body(&mut body).await;
@@ -357,8 +357,8 @@ tb_assert_spec! {
 }
 
 // End-to-end backpressure: with one chunk of initial credit and a
-// parked consumer, the pushing side stalls; grants follow only from
-// consumer drain, so releasing the handler resumes the transfer.
+// parked consumer, the pushing side stalls. Grants follow only from the
+// consumer's drain, so the handler's release resumes the transfer.
 tb_scenario! {
 	name: mux_streaming_slow_consumer_stalls_then_resumes,
 	spec: MuxStreamingBackpressureSpec,
@@ -366,7 +366,7 @@ tb_scenario! {
 		exec: |SetupEnv { trace, .. }| async move {
 			let server_offer = chunked_offer(4).with_initial_stream_credit(1);
 			let (client_end, responder) = streaming_endpoints(&trace, server_offer).await?;
-			let started = Arc::new(Notify::new());
+			let started = Arc::new(HandlerSignal::default());
 			let release = Arc::new(Notify::new());
 			let handler = gated_streaming_echo(Arc::clone(&started), Arc::clone(&release));
 			let _serve = tokio::spawn(responder.serve_streaming(handler));
@@ -381,14 +381,12 @@ tb_scenario! {
 				response.await
 			});
 
-			timeout(Duration::from_secs(5), started.notified())
-				.await
-				.map_err(|_| expectation_failure("handler must start on the open chunk"))?;
+			started.wait("handler must start on the open chunk").await?;
 
-			// Sampling probe, not proof: a slow enough machine could
-			// keep a healthy transfer in flight past the window. The
-			// resume assertion below bounds the exposure - the
-			// transfer must still complete once the handler drains
+			// This sample is a probe, not proof: a slow enough machine
+			// could keep a healthy transfer in flight past the window. The
+			// resume assertion below bounds the exposure, because the
+			// transfer must still complete once the handler drains.
 			let stalled = timeout(Duration::from_millis(200), &mut transfer).await.is_err();
 			trace.event_with(PUSH_STALLS_WITHOUT_DRAIN, &[], stalled)?;
 
@@ -416,8 +414,8 @@ tb_assert_spec! {
 	}
 }
 
-// Eager pushes make duplex conversational: awaiting each echoed reply
-// between pushes must progress chunk for chunk instead of parking on a
+// Eager pushes make duplex conversational: an exchange that awaits each
+// echoed reply between pushes must progress chunk for chunk, not park on a
 // held-back record, and `close_with` flags the final chunk itself.
 tb_scenario! {
 	name: mux_duplex_ping_pong_awaits_reply_between_pushes,
@@ -444,9 +442,8 @@ tb_scenario! {
 				let terminal = reply.chunk().await?;
 				Ok::<_, TransportError>((matched, terminal.is_none()))
 			};
-			let (matched, ended_clean) = timeout(Duration::from_secs(5), exchange)
-				.await
-				.map_err(|_| expectation_failure("a chunk-for-chunk exchange must progress with eager pushes"))??;
+			let progressed = await_within_deadline(exchange, "a chunk-for-chunk exchange must progress with eager pushes");
+			let (matched, ended_clean) = progressed.await??;
 
 			trace.event_with(PING_PONG_REPLIES_MATCH, &[], matched)?;
 			trace.event_with(PING_PONG_ENDS_CLEAN, &[], ended_clean)?;
@@ -469,8 +466,8 @@ tb_assert_spec! {
 	}
 }
 
-// The collection sugar end to end: `close_with` carries the final
-// request chunk and `into_frame` reassembles the chunked reply.
+// This scenario runs the collection sugar end to end: `close_with` carries
+// the final request chunk, and `into_frame` reassembles the chunked reply.
 tb_scenario! {
 	name: mux_duplex_reply_collects_into_frame,
 	spec: MuxDuplexIntoFrameSpec,

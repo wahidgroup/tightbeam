@@ -1,10 +1,57 @@
-//! tb_process_spec! macro for defining CSP processes
+//! The [`tb_process_spec!`](crate::tb_process_spec!) macro, which defines a CSP
+//! process.
 
-/// Define a CSP Process with declarative syntax.
+/// Defines a CSP process with a declarative syntax.
+///
+/// Each state lists its transitions in three forms:
+///
+/// - `EVENT => STATE` is a plain transition.
+/// - `EVENT [ GUARD ] => STATE` is a transition that a timing guard enables.
+/// - `EVENT [ GUARD, reset: [CLOCK, ...] ] => STATE` also resets the clocks it names.
+///
+/// A guard follows these rules:
+///
+/// - `GUARD` is the input of [`guard!`](crate::guard!), such as `clk <= Duration::from_millis(5)`.
+/// - A guard needs the `testing-timing` feature.
+/// - A bracket after an event is its guard, so an event that is an index expression takes parentheses.
+/// - The CSP trace check reads no clock, so it accepts a guarded event at any time.
+/// - A guard binds in FDR exploration alone, as [`ProcessBuilder::add_timed_transition`] states.
+///
+/// [`ProcessBuilder::add_timed_transition`]: crate::testing::specs::csp::ProcessBuilder::add_timed_transition
+///
+/// # Examples
+///
+/// ```
+/// use core::time::Duration;
+///
+/// use tightbeam::testing::specs::csp::{Event, State};
+/// use tightbeam::urn::Urn;
+/// use tightbeam::{tb_process_spec, urn};
+///
+/// const REQUEST: Urn<'static> = urn!("test", "event:doc/request");
+/// const REPLY: Urn<'static> = urn!("test", "event:doc/reply");
+///
+/// tb_process_spec! {
+///     pub Exchange,
+///     events {
+///         observable { REQUEST, REPLY }
+///         hidden { }
+///     }
+///     states {
+///         Idle => { REQUEST => Busy },
+///         Busy => { REPLY [ wait <= Duration::from_millis(50), reset: ["wait"] ] => Idle }
+///     }
+///     terminal { Idle }
+/// }
+///
+/// let process = Exchange::process();
+/// assert_eq!(process.step(State("Busy"), &Event::from(REPLY)), [State("Idle")]);
+/// # Ok::<(), Box<dyn core::error::Error>>(())
+/// ```
 #[cfg(feature = "testing-csp")]
 #[macro_export]
 macro_rules! tb_process_spec {
-	// Pattern with timing block and optional terminal
+	// The entry arm forwards every optional block to the `@impl` arm.
 	(
 		$(#[$meta:meta])*
 		$vis:vis $name:ident,
@@ -13,7 +60,7 @@ macro_rules! tb_process_spec {
 			hidden { $($hid_event:expr),* $(,)? }
 		}
 		states {
-			$($from_state:ident => { $($event:expr => $to_state:ident),* $(,)? }),* $(,)?
+			$($from_state:ident => { $($transitions:tt)* }),* $(,)?
 		}
 		$(terminal { $($term_state:ident),* $(,)? })?
 		$(choice { $($choice_state:ident),* $(,)? })?
@@ -35,7 +82,7 @@ macro_rules! tb_process_spec {
 				hidden { $($hid_event),* }
 			}
 		states {
-			$($from_state => { $($event => $to_state),* }),*
+			$($from_state => { $($transitions)* }),*
 		}
 		$(terminal { $($term_state),* })?
 		$(choice { $($choice_state),* })?
@@ -49,7 +96,7 @@ macro_rules! tb_process_spec {
 		})?
 		}
 	};
-	// Implementation pattern with optional terminal
+	// The `@impl` arm emits the process type and its `process` builder.
 	(@impl
 		$(#[$meta:meta])*
 		$vis:vis $name:ident,
@@ -58,7 +105,7 @@ macro_rules! tb_process_spec {
 			hidden { $($hid_event:expr),* }
 		}
 		states {
-			$($from_state:ident => { $($event:expr => $to_state:ident),* $(,)? }),* $(,)?
+			$($from_state:ident => { $($transitions:tt)* }),* $(,)?
 		}
 		$(terminal { $($term_state:ident),* })?
 		$(choice { $($choice_state:ident),* })?
@@ -71,7 +118,7 @@ macro_rules! tb_process_spec {
 			$($schedulability_content:tt)*
 		})?
 	) => {
-		// Process struct at top level
+		// The process type sits in the scope of the invocation.
 		$(#[$meta])*
 		$vis struct $name;
 
@@ -89,56 +136,51 @@ macro_rules! tb_process_spec {
 
 				let mut builder = $crate::testing::specs::csp::Process::builder(stringify!($name));
 
-				// Collect all state names first (from_states)
+				// The from states keep their source order.
 				let state_names = vec![$(stringify!($from_state)),*];
 
-				// Get first state as initial state
+				// The first from state is the initial state.
 				let initial = State(state_names[0]);
 				builder = builder.initial_state(initial);
 
-				// Add all states explicitly (including those with no transitions)
+				// Every from state joins the process, even with no transition.
 				$(
 					builder = builder.add_state(State(stringify!($from_state)));
 				)*
 
-				// Add observable events
 				$(
 					builder = builder.add_observable($obs_event);
 				)*
 
-				// Add hidden events
 				$(
 					builder = builder.add_hidden($hid_event);
 				)*
 
-				// Add all transitions
+				// The `@transitions` arms expand the transitions of each state.
 				$(
-					$(
-						builder = builder.add_transition(
-							State(stringify!($from_state)),
-							$event,
-							State(stringify!($to_state))
-						);
-					)*
+					$crate::tb_process_spec! {
+						@transitions
+						builder,
+						$from_state,
+						[]
+						$($transitions)*
+					}
 			)*
 
-			// Add terminal states if present
 			$($(
 				builder = builder.add_terminal(State(stringify!($term_state)));
 			)*)?
 
-			// Add choice states if present
 				$($(
 					builder = builder.add_choice(State(stringify!($choice_state)));
 				)*)?
 
-				// Add description if present
 				$(
 					builder = builder.description($desc);
 				)?
 
 
-				// Build timing constraints if present
+				// Only a build with `testing-timing` applies a timing block.
 				$(
 					$crate::__tb_if_testing_timing! {
 						{
@@ -191,7 +233,8 @@ macro_rules! tb_process_spec {
 		}
 	};
 
-	// Generate module with States enum and Event helper
+	// The `@gen_module` arm emits a module with a `States` enum and an `Event`
+	// wrapper for fault injection.
 	(@gen_module
 		$name:ident,
 		observable_events: [ $($obs_event:expr),* ],
@@ -202,9 +245,9 @@ macro_rules! tb_process_spec {
 		$crate::paste::paste! {
 			#[allow(non_snake_case)]
 			mod [<$name:snake>] {
-				/// All states in this process (from states + terminal states)
-				/// Note: Some states may appear in both sets, resulting in duplicate enum variants.
-				/// This is intentional - terminal states with outgoing transitions are valid.
+				/// Every state of this process: the from states, then the
+				/// terminal states. A state in both lists becomes a duplicate
+				/// variant, which fails to compile.
 				#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 				#[allow(dead_code)]
 				pub enum States {
@@ -225,9 +268,9 @@ macro_rules! tb_process_spec {
 					}
 				}
 
-				/// Event wrapper for type-safe fault injection
+				/// A typed event label for fault injection.
 				///
-				/// Create events using string literals:
+				/// An event wraps a string literal:
 				/// ```ignore
 				/// use my_process::Event;
 				/// fault_model.with_fault(States::Idle, Event("connect"), ...);
@@ -244,7 +287,8 @@ macro_rules! tb_process_spec {
 		}
 	};
 
-	// Parse grouped timing syntax - unified pattern
+	// The `@parse_timing` arm reads the grouped `wcet`, `jitter`, and
+	// `deadline` blocks.
 	(@parse_timing
 		$constraints:ident,
 		$(wcet: { $($wcet_event:expr => $wcet_constraint:expr),* $(,)? })?
@@ -252,7 +296,6 @@ macro_rules! tb_process_spec {
 		$(, deadline: { $($deadline_start:expr => $deadline_end:expr, $deadline_params:expr),* $(,)? })?
 		$(,)?
 	) => {
-		// Parse WCET constraints
 		$($(
 			$constraints.add(
 				Event::from($wcet_event),
@@ -260,7 +303,6 @@ macro_rules! tb_process_spec {
 			);
 		)*)?
 
-		// Parse Jitter constraints
 		$($(
 			$constraints.add(
 				Event::from($jitter_event),
@@ -268,7 +310,6 @@ macro_rules! tb_process_spec {
 			);
 		)*)?
 
-		// Parse Deadline constraints
 		$($(
 			$crate::tb_process_spec! {
 				@parse_deadline
@@ -280,7 +321,7 @@ macro_rules! tb_process_spec {
 		)*)?
 	};
 
-	// Helper to parse a single deadline constraint
+	// The `@parse_deadline` arm builds one deadline from its `DeadlineParams`.
 	(@parse_deadline
 		$constraints:ident,
 		$deadline_start:expr,
@@ -305,10 +346,10 @@ macro_rules! tb_process_spec {
 		}
 	};
 
-	// Fallback: empty timing block
+	// An empty timing block leaves the constraints as they are.
 	(@parse_timing $constraints:ident,) => {};
 
-	// Parse schedulability block
+	// The `@parse_schedulability` arm sets the scheduler and the event periods.
 	(@parse_schedulability
 		$builder:ident,
 		scheduler: $scheduler:ident,
@@ -326,142 +367,295 @@ macro_rules! tb_process_spec {
 		}
 	};
 
-	// Fallback: empty schedulability block
+	// An empty schedulability block leaves the builder as it is.
 	(@parse_schedulability $builder:ident,) => {};
 
-	// Parse transitions from a state - handle multiple transitions
-	// Recursively parse each transition
-	(@parse_transitions
+	// The `@transitions` arms read the transitions of one state, in order.
+	//
+	// The bracket after an event holds its timing guard, so each guarded arm
+	// comes before the plain arm that reads the same tokens. The bracket after
+	// `$from` holds the event tokens read so far. An event that is a path, or
+	// a call on a path, matches whole, so a long state stays inside the
+	// recursion limit. Any other event is read one token at a time.
+	(@transitions
 		$builder:ident,
-		$from_state:expr,
-		$($transitions:tt)*
+		$from:ident,
+		[$($event:tt)+]
+		[ $($guard:tt)+ ] => $to:ident $(, $($rest:tt)*)?
 	) => {
 		$crate::tb_process_spec! {
-			@parse_transitions_inner
+			@guard
 			$builder,
-			$from_state,
-			$($transitions)*
+			$from,
+			[$($event)+],
+			$to,
+			[]
+			$($guard)+
+		}
+		$crate::tb_process_spec! {
+			@transitions
+			$builder,
+			$from,
+			[]
+			$($($rest)*)?
 		}
 	};
 
-	// Inner helper to parse transitions recursively
-	(@parse_transitions_inner
+	(@transitions
 		$builder:ident,
-		$from_state:expr,
-		$transition:tt $(, $($rest:tt),*)?
+		$from:ident,
+		[$($event:tt)+]
+		=> $to:ident $(, $($rest:tt)*)?
 	) => {
 		$crate::tb_process_spec! {
-			@parse_transition
+			@plain
 			$builder,
-			$from_state,
-			$transition
+			$from,
+			[$($event)+],
+			$to
 		}
-		$(
-			$crate::tb_process_spec! {
-				@parse_transitions_inner
-				$builder,
-				$from_state,
-				$($rest),*
-			}
-		)?
+		$crate::tb_process_spec! {
+			@transitions
+			$builder,
+			$from,
+			[]
+			$($($rest)*)?
+		}
 	};
-	// Fallback: empty transitions
-	(@parse_transitions_inner
+
+	(@transitions
 		$builder:ident,
-		$from_state:expr,
+		$from:ident,
+		[]
+		$($segment:ident)::+ $(( $($argument:tt)* ))? => $to:ident $(, $($rest:tt)*)?
+	) => {
+		$crate::tb_process_spec! {
+			@plain
+			$builder,
+			$from,
+			[$($segment)::+ $(( $($argument)* ))?],
+			$to
+		}
+		$crate::tb_process_spec! {
+			@transitions
+			$builder,
+			$from,
+			[]
+			$($($rest)*)?
+		}
+	};
+
+	(@transitions
+		$builder:ident,
+		$from:ident,
+		[]
 	) => {};
 
-	// Parse transition - simple case (backward compatible)
-	(@parse_transition
+	(@transitions
 		$builder:ident,
-		$from_state:expr,
-		$event:expr => $to_state:ident
-	) => {
-		$builder = $builder.add_transition($from_state, $event, $crate::testing::specs::csp::State(stringify!($to_state)));
-	};
-
-	// Parse transition - with timing guard
-	(@parse_transition
-		$builder:ident,
-		$from_state:expr,
-		$event:tt [ $guard_expr:tt ] => $to_state:ident
+		$from:ident,
+		[$($event:tt)*]
+		$next:tt $($rest:tt)*
 	) => {
 		$crate::tb_process_spec! {
-			@parse_timed_transition
+			@transitions
 			$builder,
-			$from_state,
-			$event,
-			$guard_expr,
-			$to_state,
+			$from,
+			[$($event)* $next]
+			$($rest)*
 		}
 	};
 
-	// Parse transition - with timing guard and clock resets
-	(@parse_transition
+	// The `@plain` arm adds one transition with no guard.
+	(@plain
 		$builder:ident,
-		$from_state:expr,
-		$event:tt [ $guard_expr:tt, reset: [ $($reset_clock:expr),* $(,)? ] ] => $to_state:ident
+		$from:ident,
+		[$($event:tt)+],
+		$to:ident
+	) => {
+		$builder = $builder.add_transition(
+			$crate::testing::specs::csp::State(stringify!($from)),
+			$($event)+,
+			$crate::testing::specs::csp::State(stringify!($to)),
+		);
+	};
+
+	// The `@guard` arms split a guard from its clock resets. `guard!` reads the
+	// guard, so the guard grammar has one home.
+	(@guard
+		$builder:ident,
+		$from:ident,
+		[$($event:tt)+],
+		$to:ident,
+		[$($guard:tt)+]
+		, reset: [ $($reset:expr),* $(,)? ]
 	) => {
 		$crate::tb_process_spec! {
-			@parse_timed_transition
+			@timed
 			$builder,
-			$from_state,
-			$event,
-			$guard_expr,
-			$to_state,
-			$( $reset_clock ),*
+			$from,
+			[$($event)+],
+			$to,
+			[$($guard)+],
+			[$($reset),*]
 		}
 	};
 
-	// Helper to parse timed transition (with optional clock resets)
-	(@parse_timed_transition
+	(@guard
 		$builder:ident,
-		$from_state:expr,
-		$event:tt,
-		$guard_expr:tt,
-		$to_state:ident,
-		$($reset_clock:expr),* $(,)?
+		$from:ident,
+		[$($event:tt)+],
+		$to:ident,
+		[$($guard:tt)+]
 	) => {
 		$crate::tb_process_spec! {
-			@parse_timed_transition_impl
+			@timed
 			$builder,
-			$from_state,
-			$event,
-			$guard_expr,
-			$to_state,
-			$($reset_clock),*
+			$from,
+			[$($event)+],
+			$to,
+			[$($guard)+],
+			[]
 		}
 	};
-	// Implementation helper for timed transition
-	(@parse_timed_transition_impl
+
+	(@guard
 		$builder:ident,
-		$from_state:expr,
-		$event:tt,
-		$guard_expr:tt,
-		$to_state:ident,
-		$( $reset_clock:expr ),* $(,)?
+		$from:ident,
+		[$($event:tt)+],
+		$to:ident,
+		[$($guard:tt)*]
+		$next:tt $($rest:tt)*
+	) => {
+		$crate::tb_process_spec! {
+			@guard
+			$builder,
+			$from,
+			[$($event)+],
+			$to,
+			[$($guard)* $next]
+			$($rest)*
+		}
+	};
+
+	// The `@timed` arm adds one transition that a timing guard enables.
+	//
+	// A build without `testing-timing` stops at the guard with a compile
+	// error, so a spec keeps every guard it states.
+	(@timed
+		$builder:ident,
+		$from:ident,
+		[$($event:tt)+],
+		$to:ident,
+		[$($guard:tt)+],
+		[$($reset:expr),*]
 	) => {
 		$crate::__tb_select_testing_timing! {
 			{
-				use $crate::testing::specs::csp::{Event, State};
-				use $crate::testing::timing::TimingGuard;
-				let guard: TimingGuard = $crate::guard!($guard_expr);
-				let reset_clocks: Vec<String> = vec![$( $reset_clock.to_string() ),*];
 				$builder = $builder.add_timed_transition(
-					$from_state,
-					Event::from($event),
-					State(stringify!($to_state)),
-					Some(guard),
-					reset_clocks,
+					$crate::testing::specs::csp::State(stringify!($from)),
+					$crate::testing::specs::csp::Event::from($($event)+),
+					$crate::testing::specs::csp::State(stringify!($to)),
+					::core::option::Option::Some($crate::guard!($($guard)+)),
+					[$(::std::string::String::from($reset)),*],
 				);
 			}
 			{
-				$builder = $builder.add_transition(
-					$from_state,
-					$event,
-					$crate::testing::specs::csp::State(stringify!($to_state)),
-				);
+				::core::compile_error!("a guarded transition needs the `testing-timing` feature");
 			}
 		}
 	};
+}
+
+#[cfg(all(test, feature = "testing-timing"))]
+mod tests {
+	use core::error::Error;
+	use core::time::Duration;
+	use std::collections::HashMap;
+
+	use crate::testing::specs::csp::{Event, State, Successor};
+	use crate::testing::timing::{TimedTransition, TimingGuard};
+	use crate::urn::Urn;
+
+	const ARM: Urn<'static> = crate::urn!("test", "event:process-spec/arm");
+	const FIRE: Urn<'static> = crate::urn!("test", "event:process-spec/fire");
+
+	crate::tb_process_spec! {
+		pub GuardedProcess,
+		events {
+			observable { ARM, FIRE }
+			hidden { }
+		}
+		states {
+			S0 => { ARM [ clk <= Duration::from_millis(5) ] => S1 },
+			S1 => { FIRE [ clk <= Duration::from_millis(5), reset: ["clk"] ] => S0 }
+		}
+		terminal { S0 }
+	}
+
+	/// The timed transition that `event` labels from `from`.
+	///
+	/// The plain arm records no timed transition, so the lookup fails where a
+	/// guarded form falls through to it.
+	fn timed_transition(from: &'static str, event: Urn<'static>) -> Result<TimedTransition, Box<dyn Error>> {
+		let key = (State(from), Event::from(event));
+		let mut table = GuardedProcess::process().timed_transitions.unwrap_or_default();
+		let transition = table.remove(&key).and_then(|transitions| transitions.into_iter().next());
+
+		transition.ok_or_else(|| "the guarded form recorded no timed transition".into())
+	}
+
+	/// The clock readings once `clk` has run `span`.
+	fn readings_after(span: Duration) -> HashMap<String, Duration> {
+		HashMap::from([("clk".to_string(), span)])
+	}
+
+	#[test]
+	fn a_guarded_event_expands_to_a_timed_transition() -> Result<(), Box<dyn Error>> {
+		let bound = TimingGuard::ClockLessEqual("clk".to_string(), Duration::from_millis(5));
+
+		let transition = timed_transition("S0", ARM)?;
+
+		assert_eq!(transition.guard, Some(bound));
+		assert_eq!(transition.to, State("S1"));
+		Ok(())
+	}
+
+	#[test]
+	fn a_guard_allows_its_edge_at_its_bound() -> Result<(), Box<dyn Error>> {
+		let process = GuardedProcess::process();
+		let readings = readings_after(Duration::from_millis(5));
+
+		let successors: Vec<Successor> = process.successors(State("S0"), &Event::from(ARM), &readings).collect();
+
+		assert_eq!(successors, [Successor { to: State("S1"), resets: &[] }]);
+		Ok(())
+	}
+
+	#[test]
+	fn a_guard_refuses_its_edge_past_its_bound() -> Result<(), Box<dyn Error>> {
+		let process = GuardedProcess::process();
+		let readings = readings_after(Duration::from_micros(5_001));
+
+		let successors: Vec<Successor> = process.successors(State("S0"), &Event::from(ARM), &readings).collect();
+
+		assert!(successors.is_empty());
+		Ok(())
+	}
+
+	#[test]
+	fn a_guard_with_resets_names_its_clocks() -> Result<(), Box<dyn Error>> {
+		let transition = timed_transition("S1", FIRE)?;
+
+		assert_eq!(transition.reset_clocks, ["clk"]);
+		Ok(())
+	}
+
+	#[test]
+	fn a_guarded_transition_is_an_edge_of_the_process() -> Result<(), Box<dyn Error>> {
+		let process = GuardedProcess::process();
+
+		assert_eq!(process.step(State("S0"), &Event::from(ARM)), [State("S1")]);
+		Ok(())
+	}
 }

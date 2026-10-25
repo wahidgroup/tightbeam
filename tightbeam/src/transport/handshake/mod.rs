@@ -215,6 +215,12 @@ pub use peer::PeerAuthentication;
 pub use schedule::EpochMaterials;
 pub(crate) use session_peer::SessionPeer;
 
+#[cfg(mux_rekey)]
+pub(crate) use self::{
+	peer::{AgreementCertificate, ServerKeys},
+	schedule::{EpochSecret, PeerEphemeral},
+	wire::HandshakeOctets,
+};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub use flow::{ClientFlow, ServerFlow};
 #[cfg(feature = "transport-cms")]
@@ -235,29 +241,10 @@ pub use peer::LearnedTrust;
 pub use peer::ProvisionedTrust;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub(crate) use peer::ValidatorChain;
-#[cfg(all(
-	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-hpke")
-))]
-pub(crate) use peer::{AgreementCertificate, ServerKeys};
-#[cfg(all(
-	test,
-	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-hpke")
-))]
+#[cfg(all(test, mux_rekey))]
 pub(crate) use schedule::CompressedPoint;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub use schedule::HandshakeSecret;
-#[cfg(all(
-	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-hpke")
-))]
-pub(crate) use schedule::{EpochSecret, PeerEphemeral};
-#[cfg(all(
-	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-hpke")
-))]
-pub(crate) use wire::HandshakeOctets;
 
 use crate::asn1::OctetString;
 use crate::cms::content_info::ContentInfo;
@@ -398,7 +385,8 @@ impl<P> HandshakeProvider for P where
 #[cfg(feature = "transport-cms")]
 #[derive(Clone)]
 pub enum CmsServerIdentity {
-	/// A bare server certificate, evaluated directly against the trust store.
+	/// A bare server certificate, which the client evaluates directly against
+	/// the trust store.
 	Certificate(Arc<Certificate>),
 	/// The server's chain, ordered root to leaf. Path validation runs over the
 	/// chain per [RFC 5280 §6.1][rfc5280-6.1], and the leaf identifies the
@@ -540,7 +528,7 @@ impl HandshakeMessage {
 		}
 	}
 
-	/// The DER bytes of the message, exactly as sent or received.
+	/// The DER bytes of the message, as the endpoint sent or received them.
 	pub fn der(&self) -> &[u8] {
 		match self {
 			Self::SignedData(signed) => signed.der(),
@@ -588,23 +576,21 @@ impl TryFrom<ContentInfo> for HandshakeMessage {
 /// installs the rest with them.
 #[non_exhaustive]
 pub struct EstablishedSession {
-	/// Role-mapped directional keys. Each side sends on one key and receives
-	/// on the other.
+	/// The role-mapped directional keys. Each side sends on one key and
+	/// receives on the other.
 	keys: SessionKeys,
-	/// Multiplexing terms when both sides negotiated them. `None` leaves the
-	/// session single-flight.
+	/// The multiplexing terms, when both sides negotiated them. `None` leaves
+	/// the session single-flight.
 	mux: Option<MuxSettings>,
-	/// Dual-signed receipt from a budget-bearing handshake.
+	/// The dual-signed receipt of a budget-bearing handshake.
 	receipt: Option<Arc<StoredReceipt>>,
 	/// The peer the handshake validated, one record that each session context
 	/// of a gate shares.
 	peer: Option<Arc<SessionPeer>>,
-	/// Epoch-0 rekey materials, present exactly while a rekey could use them.
+	/// The epoch-0 rekey materials, present exactly while a rekey could use
+	/// them.
 	/// The mux rekey reads them, so the field exists in a build with it.
-	#[cfg(all(
-		feature = "transport-multiplex",
-		any(feature = "transport-cms", feature = "transport-hpke")
-	))]
+	#[cfg(mux_rekey)]
 	epoch: Option<EpochMaterials>,
 }
 
@@ -627,10 +613,7 @@ impl EstablishedSession {
 			mux,
 			receipt,
 			peer,
-			#[cfg(all(
-				feature = "transport-multiplex",
-				any(feature = "transport-cms", feature = "transport-hpke")
-			))]
+			#[cfg(mux_rekey)]
 			epoch: None,
 		}
 	}
@@ -644,10 +627,7 @@ impl EstablishedSession {
 	///
 	/// - A session with a receipt and a peer keeps it.
 	/// - Every other session releases it at once.
-	#[cfg(all(
-		feature = "transport-multiplex",
-		any(feature = "transport-cms", feature = "transport-hpke")
-	))]
+	#[cfg(mux_rekey)]
 	fn with_epoch(self, epoch: EpochMaterials) -> Self {
 		let renewable = self.receipt.is_some() && self.peer.is_some();
 		let epoch = Some(epoch).filter(|_| renewable);
@@ -663,11 +643,7 @@ impl EstablishedSession {
 
 	/// This session with `epoch` under the rule of [`Self::with_epoch`], for
 	/// a test that holds the epoch a handshake derives.
-	#[cfg(all(
-		test,
-		feature = "transport-multiplex",
-		any(feature = "transport-cms", feature = "transport-hpke")
-	))]
+	#[cfg(all(test, mux_rekey))]
 	pub(crate) fn with_forged_epoch(self, epoch: EpochMaterials) -> Self {
 		self.with_epoch(epoch)
 	}
@@ -679,20 +655,13 @@ impl EstablishedSession {
 	}
 
 	/// Detach the epoch rekey materials, once.
-	#[cfg(all(
-		feature = "transport-multiplex",
-		any(feature = "transport-cms", feature = "transport-hpke")
-	))]
+	#[cfg(mux_rekey)]
 	pub(crate) fn take_epoch(&mut self) -> Option<EpochMaterials> {
 		self.epoch.take()
 	}
 
 	/// The epoch rekey materials the session still holds.
-	#[cfg(all(
-		test,
-		feature = "transport-multiplex",
-		any(feature = "transport-cms", feature = "transport-hpke")
-	))]
+	#[cfg(all(test, mux_rekey))]
 	pub(crate) fn epoch(&self) -> Option<&EpochMaterials> {
 		self.epoch.as_ref()
 	}
@@ -709,34 +678,36 @@ impl EstablishedSession {
 		self.keys
 	}
 
-	/// Role-mapped directional keys for this session.
+	/// The role-mapped directional keys of this session.
 	pub fn keys(&self) -> &SessionKeys {
 		&self.keys
 	}
 
-	/// Multiplexing terms both sides agreed, if any.
+	/// The multiplexing terms both sides agreed, if any.
 	pub fn mux(&self) -> Option<MuxSettings> {
 		self.mux
 	}
 
-	/// Dual-signed receipt from a budget-bearing handshake.
+	/// The dual-signed receipt of a budget-bearing handshake, if any.
 	pub fn receipt(&self) -> Option<&StoredReceipt> {
 		self.receipt.as_deref()
 	}
 
-	/// Peer certificate validated during mutual authentication.
+	/// The peer certificate the handshake validated. A server holds the
+	/// client's under mutual authentication, and a client holds the server's
+	/// signing certificate.
 	pub fn peer(&self) -> Option<&Certificate> {
 		let peer = self.peer.as_ref();
 		peer.map(|peer| peer.certificate().as_ref())
 	}
 
-	/// Shared handle to the validated peer certificate.
+	/// A shared handle to the certificate that [`Self::peer`] returns.
 	pub fn peer_arc(&self) -> Option<Arc<Certificate>> {
 		let peer = self.peer.as_ref();
 		peer.map(|peer| Arc::clone(peer.certificate()))
 	}
 
-	/// Shared handle to the dual-signed session receipt.
+	/// A shared handle to the dual-signed session receipt.
 	pub fn receipt_arc(&self) -> Option<Arc<StoredReceipt>> {
 		self.receipt.as_ref().map(Arc::clone)
 	}
@@ -751,7 +722,8 @@ impl EstablishedSession {
 /// where the single-threaded executor lets JS-backed signing providers
 /// participate.
 pub trait ClientHandshakeProtocol: MaybeSend {
-	/// Error the orchestrator returns, convertible into a [`TransportError`].
+	/// The error the orchestrator returns, which converts into a
+	/// [`TransportError`].
 	type Error: Into<TransportError> + Send;
 
 	/// Start the handshake and return the first message for the server.
@@ -772,14 +744,14 @@ pub trait ClientHandshakeProtocol: MaybeSend {
 	///
 	/// Call this after the client sends its last message. The client sends on
 	/// the client-to-server key and receives on the server-to-client key. The
-	/// cipher comes from the [`CryptoProvider`] associated type and the OID
-	/// from the negotiated security profile.
+	/// cipher comes from the [`CryptoProvider`] associated type, and the OID
+	/// comes from the negotiated security profile.
 	fn complete(self: Box<Self>) -> MaybeSendFuture<'static, CoreResult<EstablishedSession, Self::Error>>;
 
 	/// Whether the handshake reached the terminal state that completion enters.
 	fn is_complete(&self) -> bool;
 
-	/// Negotiated algorithm OIDs after profile negotiation, or `None` before
+	/// The algorithm OIDs that profile negotiation selected, or `None` before
 	/// the accept.
 	fn selected_profile(&self) -> Option<SecurityProfileDesc>;
 }
@@ -793,7 +765,8 @@ pub trait ClientHandshakeProtocol: MaybeSend {
 /// where the single-threaded executor lets JS-backed signing providers
 /// participate.
 pub trait ServerHandshakeProtocol: MaybeSend {
-	/// Error the orchestrator returns, convertible into a [`TransportError`].
+	/// The error the orchestrator returns, which converts into a
+	/// [`TransportError`].
 	type Error: Into<TransportError> + Send;
 
 	/// Handle a request from the client.
@@ -810,14 +783,14 @@ pub trait ServerHandshakeProtocol: MaybeSend {
 	///
 	/// Call this after [`Self::handle_request`] returns `None`. The server
 	/// sends on the server-to-client key and receives on the client-to-server
-	/// key. The cipher comes from the [`CryptoProvider`] associated type and
-	/// the OID from the negotiated security profile.
+	/// key. The cipher comes from the [`CryptoProvider`] associated type, and
+	/// the OID comes from the negotiated security profile.
 	fn complete(self: Box<Self>) -> MaybeSendFuture<'static, CoreResult<EstablishedSession, Self::Error>>;
 
 	/// Whether the handshake reached the terminal state that completion enters.
 	fn is_complete(&self) -> bool;
 
-	/// Negotiated algorithm OIDs after profile negotiation, or `None` before
+	/// The algorithm OIDs that profile negotiation selected, or `None` before
 	/// the accept.
 	fn selected_profile(&self) -> Option<SecurityProfileDesc>;
 }
@@ -876,7 +849,7 @@ impl HandshakeProtocolKind {
 	/// # Errors
 	///
 	/// - [`TransportError::UnsupportedHandshakeProtocol`] -- this build lacks the flow of this kind.
-	/// - The errors of [`FlowProvisioning::client_config`] for that flow.
+	/// - [`TransportError`] -- the errors of [`FlowProvisioning::client_config`] for that flow.
 	pub(crate) fn client_handshake<P, E>(self, provisioning: &E) -> Result<BoxedClientHandshake, TransportError>
 	where
 		P: HandshakeProvider,
@@ -902,7 +875,7 @@ impl HandshakeProtocolKind {
 	/// # Errors
 	///
 	/// - [`TransportError::UnsupportedHandshakeProtocol`] -- this build lacks the flow of this kind.
-	/// - The errors of [`FlowProvisioning::server_config`] for that flow.
+	/// - [`TransportError`] -- the errors of [`FlowProvisioning::server_config`] for that flow.
 	pub(crate) fn server_handshake<P, E>(self, provisioning: &E) -> Result<BoxedServerHandshake, TransportError>
 	where
 		P: HandshakeProvider,
@@ -935,14 +908,14 @@ pub(crate) trait FlowProvisioning<F: ClientFlow<P> + ServerFlow<P>, P: Handshake
 	///
 	/// # Errors
 	///
-	/// - The refusal of flow `F` when this provisioning lacks the trust or the identity its client takes.
+	/// - [`TransportError`] -- this provisioning lacks the trust or the identity the client of `F` takes.
 	fn client_config(&self) -> Result<ClientConfig<F, P>, TransportError>;
 
 	/// The configuration of a server handshake of flow `F`.
 	///
 	/// # Errors
 	///
-	/// - The refusal of flow `F` when this provisioning lacks the identity its server presents.
+	/// - [`TransportError`] -- this provisioning lacks the identity the server of `F` presents.
 	fn server_config(&self) -> Result<ServerConfig<F, P>, TransportError>;
 }
 

@@ -1,22 +1,20 @@
-//! Timing constraint checking during FDR exploration
+//! The timing checks of FDR exploration.
 //!
-//! This module provides functions to check timing constraints during CSP
-//! exploration, allowing early pruning of traces that violate timing
-//! requirements.
+//! The module adds checks to [`TimingConstraints`] that FDR exploration calls
+//! on each branch, so exploration prunes a trace that violates a timing
+//! constraint before the trace grows.
 
 use core::time::Duration;
 
-use std::collections::HashMap;
-
 use crate::testing::fdr::verdict::Trace;
 use crate::testing::specs::csp::Event;
-use crate::testing::timing::{TimedTransition, TimingConstraint, TimingConstraints, TimingGuard};
+use crate::testing::timing::{TimingConstraint, TimingConstraints};
 
 impl TimingConstraints {
-	/// Whether the current trace violates any timing constraint.
+	/// Whether `trace` violates a deadline or a path WCET constraint.
 	///
-	/// The exploration prunes on `true`, so a violating trace is cut before
-	/// its successors are generated.
+	/// Exploration prunes on `true`, so it cuts a violating trace before it
+	/// generates the successors.
 	pub fn violated_by(
 		&self,
 		trace: &Trace,
@@ -29,8 +27,8 @@ impl TimingConstraints {
 
 	/// Whether `event_wcet` exceeds the WCET constraint on `event`.
 	///
-	/// The exploration uses WCET as the worst-case time, so the looked-up
-	/// value is compared against the constraint directly.
+	/// Exploration takes the WCET as the time of the event, so it compares the
+	/// value that `wcet_of` looks up against the constraint.
 	pub fn wcet_violated(&self, event: &Event, event_wcet: Duration) -> bool {
 		let Some(TimingConstraint::Wcet(wcet_config)) = self.get(event) else {
 			return false;
@@ -39,11 +37,22 @@ impl TimingConstraints {
 		event_wcet > wcet_config.duration
 	}
 
-	/// Whether the time between any deadline's start and end event exceeds
-	/// that deadline's duration.
+	/// The WCET that `event` adds to the elapsed time of a path.
 	///
-	/// A deadline whose two events are not both in `event_times` has not
-	/// been exercised yet, so it cannot be violated.
+	/// An event with no WCET constraint, or with a jitter or a deadline
+	/// constraint, adds [`Duration::ZERO`].
+	pub(crate) fn wcet_of(&self, event: &Event) -> Duration {
+		let Some(TimingConstraint::Wcet(wcet_config)) = self.get(event) else {
+			return Duration::ZERO;
+		};
+
+		wcet_config.duration
+	}
+
+	/// Whether the time from the start event to the end event of a deadline
+	/// exceeds its duration.
+	///
+	/// A deadline holds while `event_times` lacks one of its two events.
 	fn deadline_violated(&self, event_times: impl AsRef<[(Event, Duration)]>) -> bool {
 		let event_times = event_times.as_ref();
 		self.deadlines().iter().any(|deadline| {
@@ -62,8 +71,8 @@ impl TimingConstraints {
 
 	/// Whether the cumulative WCET along a matching path exceeds its limit.
 	///
-	/// A path matches only on an exact event sequence, so a longer or
-	/// shorter trace leaves that path's limit unspent.
+	/// A path matches only a trace of its exact event sequence, so its limit
+	/// binds that trace alone.
 	fn path_wcet_violated(&self, trace: &Trace, elapsed_time: Duration) -> bool {
 		self.path_wcets().iter().any(|path_wcet| {
 			let matched =
@@ -74,45 +83,17 @@ impl TimingConstraints {
 	}
 }
 
-#[cfg(feature = "testing-timing")]
-impl TimingGuard {
-	/// Whether this guard holds for `clock_values`.
-	///
-	/// A clock the guard names but the map omits leaves the guard
-	/// unsatisfied, so an unstarted clock never enables a transition.
-	pub fn satisfied_by(&self, clock_values: &HashMap<String, Duration>) -> bool {
-		match self {
-			TimingGuard::ClockLessThan(name, duration) => clock_values.get(name).is_some_and(|v| *v < *duration),
-			TimingGuard::ClockLessEqual(name, duration) => clock_values.get(name).is_some_and(|v| *v <= *duration),
-			TimingGuard::ClockGreaterThan(name, duration) => clock_values.get(name).is_some_and(|v| *v > *duration),
-			TimingGuard::ClockGreaterEqual(name, duration) => clock_values.get(name).is_some_and(|v| *v >= *duration),
-			TimingGuard::ClockEquals(name, duration) => clock_values.get(name).is_some_and(|v| *v == *duration),
-			TimingGuard::ClockInRange(name, d1, d2) => clock_values.get(name).is_some_and(|v| *v >= *d1 && *v <= *d2),
-		}
-	}
-}
-
-#[cfg(feature = "testing-timing")]
-impl TimedTransition {
-	/// Whether this transition is enabled at `clock_values`.
-	///
-	/// A transition with no guard is always enabled.
-	pub fn guard_satisfied(&self, clock_values: &HashMap<String, Duration>) -> bool {
-		self.guard.as_ref().is_none_or(|guard| guard.satisfied_by(clock_values))
-	}
-}
-
 #[cfg(feature = "testing-schedulability")]
 impl crate::testing::specs::csp::Process {
-	/// Whether this process's task set fails schedulability analysis.
+	/// Whether the task set of this process fails schedulability analysis.
 	///
 	/// A process with no schedulability configuration has no task set to
 	/// analyse, so it reports no violation.
 	///
 	/// # Errors
 	///
-	/// - [`SchedulabilityError`](crate::testing::schedulability::SchedulabilityError)
-	///   from task-set generation or the analysis itself.
+	/// - [`SchedulabilityError`](crate::testing::schedulability::SchedulabilityError) --
+	///   task-set generation or the analysis fails.
 	pub fn schedulability_violated(&self) -> Result<bool, crate::testing::schedulability::SchedulabilityError> {
 		use crate::testing::schedulability::SchedulerType;
 
@@ -137,7 +118,7 @@ mod tests {
 	use crate::testing::error::TestingError;
 	use crate::testing::timing::{Deadline, DeadlineBuilder, PathWcet, WcetConfigBuilder};
 
-	/// Helper to create deadline constraint
+	/// A deadline of `ms` milliseconds from `start` to `end`.
 	fn create_deadline_constraint(ms: u64, start: &'static str, end: &'static str) -> Result<Deadline, TestingError> {
 		let duration = Duration::from_millis(ms);
 		let start_event = Event(start);
@@ -150,7 +131,7 @@ mod tests {
 			.build()
 	}
 
-	/// Test case for timing violation checking
+	/// One case of the timing violation table.
 	struct TimingViolationTestCase {
 		trace_events: &'static [&'static str],
 		elapsed_time_ms: u64,
@@ -164,7 +145,7 @@ mod tests {
 
 	const TIMING_VIOLATION_TEST_CASES: &[TimingViolationTestCase] = &[
 		TimingViolationTestCase {
-			// No violations: deadline satisfied
+			// The deadline holds.
 			trace_events: &["start", "end"],
 			elapsed_time_ms: 50,
 			event_times_ms: &[("start", 0), ("end", 50)],
@@ -175,7 +156,7 @@ mod tests {
 			expected_violation: false,
 		},
 		TimingViolationTestCase {
-			// Deadline violation: latency exceeds deadline
+			// The latency exceeds the deadline.
 			trace_events: &["start", "end"],
 			elapsed_time_ms: 150,
 			event_times_ms: &[("start", 0), ("end", 150)],
@@ -186,7 +167,7 @@ mod tests {
 			expected_violation: true,
 		},
 		TimingViolationTestCase {
-			// Path WCET violation: elapsed time exceeds path WCET
+			// The elapsed time exceeds the path WCET.
 			trace_events: &["start", "process", "end"],
 			elapsed_time_ms: 150,
 			event_times_ms: &[("start", 50), ("process", 100), ("end", 150)],
@@ -197,7 +178,7 @@ mod tests {
 			expected_violation: true,
 		},
 		TimingViolationTestCase {
-			// No violations: all constraints satisfied
+			// The deadline and the path WCET both hold.
 			trace_events: &["start", "process", "end"],
 			elapsed_time_ms: 50,
 			event_times_ms: &[("start", 0), ("process", 30), ("end", 50)],
@@ -209,7 +190,7 @@ mod tests {
 		},
 	];
 
-	/// Run timing violation test case
+	/// Runs one case of the table and checks its verdict.
 	fn run_timing_violation_test_case(case: &TimingViolationTestCase) -> Result<(), TestingError> {
 		let mut constraints = TimingConstraints::default();
 		let trace: Trace = case.trace_events.iter().map(|s| Event(s)).collect();
@@ -220,8 +201,8 @@ mod tests {
 			.map(|(s, ms)| (Event(s), Duration::from_millis(*ms)))
 			.collect();
 
-		// Note: WCET violations are checked per-event during exploration,
-		// not in this aggregate check. This test focuses on deadline and path WCET.
+		// Exploration checks each event against its WCET apart from this
+		// aggregate check, so the table covers the deadline and the path WCET.
 
 		if case.has_deadline {
 			let deadline = create_deadline_constraint(case.deadline_ms, "start", "end")?;
@@ -269,16 +250,27 @@ mod tests {
 		let wcet_config = WcetConfigBuilder::default().with_duration(duration).build()?;
 		constraints.add(Event("process"), TimingConstraint::Wcet(wcet_config));
 
-		// WCET within constraint: no violation
+		// A WCET at or under the constraint holds.
 		assert!(!constraints.wcet_violated(&Event("process"), Duration::from_millis(50)));
 		assert!(!constraints.wcet_violated(&Event("process"), Duration::from_millis(100)));
 
-		// WCET exceeds constraint: violation
+		// A WCET over the constraint is a violation.
 		assert!(constraints.wcet_violated(&Event("process"), Duration::from_millis(150)));
 
-		// Event without constraint: no violation
+		// An event with no constraint holds at any WCET.
 		assert!(!constraints.wcet_violated(&Event("other"), Duration::from_millis(1000)));
 
+		Ok(())
+	}
+
+	#[test]
+	fn an_event_adds_the_wcet_its_constraint_names() -> Result<(), Box<dyn core::error::Error>> {
+		let mut constraints = TimingConstraints::default();
+		let duration = Duration::from_millis(100);
+		let wcet_config = WcetConfigBuilder::default().with_duration(duration).build()?;
+		constraints.add(Event("process"), TimingConstraint::Wcet(wcet_config));
+
+		assert_eq!(constraints.wcet_of(&Event("process")), duration);
 		Ok(())
 	}
 }

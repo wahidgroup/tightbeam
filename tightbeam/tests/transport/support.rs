@@ -38,9 +38,13 @@ use tightbeam::Frame;
 use tightbeam::TightBeamError;
 
 #[cfg(feature = "transport-multiplex")]
+use core::future::IntoFuture;
+#[cfg(feature = "transport-multiplex")]
 use tightbeam::crypto::policy::Secp256k1Policy;
 #[cfg(feature = "transport-multiplex")]
 use tightbeam::transport::handshake::receipt::StoredReceipt;
+#[cfg(feature = "transport-multiplex")]
+use tokio::sync::Notify;
 
 #[cfg(feature = "transport-multiplex")]
 use crate::common::poll::poll_until;
@@ -54,13 +58,64 @@ const TRANSPORT_WAIT_ATTEMPTS: u32 = 400;
 #[cfg(feature = "transport-multiplex")]
 const TRANSPORT_WAIT_INTERVAL: Duration = Duration::from_millis(5);
 
+/// How long a scenario waits on its tokio clock for work on another task: a
+/// signal that a handler or a server task raises, or a task that it joins.
+#[cfg(feature = "transport-multiplex")]
+const SCENARIO_WAIT_DEADLINE: Duration = Duration::from_secs(5);
+
 /// Polls `ready` on the transport cadence and answers whether it held.
 #[cfg(feature = "transport-multiplex")]
 pub async fn await_transport(ready: impl FnMut() -> bool) -> bool {
 	poll_until(TRANSPORT_WAIT_ATTEMPTS, TRANSPORT_WAIT_INTERVAL, ready).await
 }
 
-/// Poll until epoch receipt differs from `previous`, and answer the new one.
+/// The output of `work` within [`SCENARIO_WAIT_DEADLINE`], or `None` once the
+/// deadline passes first.
+#[cfg(feature = "transport-multiplex")]
+async fn within_deadline<F: IntoFuture>(work: F) -> Option<F::Output> {
+	tokio::time::timeout(SCENARIO_WAIT_DEADLINE, work).await.ok()
+}
+
+/// Awaits `work` within [`SCENARIO_WAIT_DEADLINE`], and fails with
+/// `expectation` when the deadline passes first, so a stalled server ends its
+/// scenario at the deadline.
+#[cfg(feature = "transport-multiplex")]
+pub async fn await_within_deadline<F: IntoFuture>(
+	work: F,
+	expectation: &'static str,
+) -> Result<F::Output, TightBeamError> {
+	let finished = within_deadline(work).await;
+	finished.ok_or_else(|| expectation_failure(expectation))
+}
+
+/// A signal that a handler or a server task raises, which a scenario awaits
+/// only within [`SCENARIO_WAIT_DEADLINE`].
+#[cfg(feature = "transport-multiplex")]
+#[derive(Default)]
+pub struct HandlerSignal(Notify);
+
+#[cfg(feature = "transport-multiplex")]
+impl HandlerSignal {
+	/// Raises the signal for one wait. A raise before the wait stores a
+	/// permit, so the wait that follows returns at once.
+	pub fn raise(&self) {
+		self.0.notify_one();
+	}
+
+	/// Awaits the raise, and fails with `expectation` when the deadline
+	/// passes first.
+	pub async fn wait(&self, expectation: &'static str) -> Result<(), TightBeamError> {
+		await_within_deadline(self.0.notified(), expectation).await
+	}
+
+	/// Whether a task raises the signal before the deadline passes.
+	pub async fn raised(&self) -> bool {
+		within_deadline(self.0.notified()).await.is_some()
+	}
+}
+
+/// Poll until the epoch receipt differs from `previous`, and answer the new
+/// one, or `None` when the wait runs out.
 #[cfg(feature = "transport-multiplex")]
 pub async fn await_receipt_rotation<F>(current: F, previous: Option<&StoredReceipt>) -> Option<Arc<StoredReceipt>>
 where
@@ -76,8 +131,8 @@ where
 	settled.then_some(rotated).flatten()
 }
 
-/// Serve one single-flight request by echoing the accepted frame back,
-/// answering with the gate's status.
+/// Serve one single-flight request. The reply carries the gate's status, and
+/// the accepted frame back when that status is `Ok`.
 pub async fn respond_echo<T: MessageCollector + Send>(mut transport: T) -> Result<(), TransportError> {
 	let (request, status) = transport.collect_message().await?;
 	let message = match status {
@@ -94,14 +149,14 @@ pub fn mux_frame(label: impl AsRef<str>) -> Frame {
 	TestFrame::v0(Some(label), None)
 }
 
-/// A multiplexing offer advertising `cap` peer-initiated streams.
+/// A multiplexing offer that advertises `cap` peer-initiated streams.
 pub fn mux_offer(cap: u32) -> TransportOffer {
 	TransportOffer::mux(cap)
 }
 
 /// Record an event outcome from a spawned task, where no `Result` return
-/// exists for `?`. A recording failure panics the task, and the spec then
-/// surfaces it as the missing event.
+/// exists for `?`. A failure to record panics the task, and the spec then
+/// reports it as the missing event.
 pub fn record_spawned_event(trace: &TraceCollector, urn: Urn<'static>, value: bool) {
 	trace.event_with(urn, &[], value).expect("spawned task must record its event");
 }
@@ -218,9 +273,9 @@ pub struct MutualSessionHooks {
 /// Established mutual-auth transports plus peer identities for receipt
 /// verification.
 pub struct MutualTransports {
-	/// Established client transport.
+	/// Client transport whose handshake completed.
 	pub client: TcpTransport<TokioStream>,
-	/// Established server transport.
+	/// Server transport whose handshake completed.
 	pub server: TcpTransport<TokioStream>,
 	/// Certificate the server presented.
 	pub server_certificate: Arc<Certificate>,
@@ -273,7 +328,8 @@ pub async fn establish_mutual_transports_of(
 			transport = transport.with_trace(trace);
 		}
 
-		// HPKE is exactly two client messages: the hello and the closing.
+		// An HPKE handshake takes two client messages: the hello and the
+		// closing.
 		serve_one_handshake_message(&mut transport).await?;
 		serve_one_handshake_message(&mut transport).await?;
 		Ok::<_, TightBeamError>(transport)
@@ -318,7 +374,7 @@ pub async fn serve_one_handshake_message(transport: &mut TcpTransport<TokioStrea
 pub async fn accept_handshaken_split(listener: TokioListener) -> Result<SplitTransport<TokioStream>, TightBeamError> {
 	let (mut transport, _) = listener.accept().await?;
 
-	// HPKE is exactly two client messages: the hello and the closing.
+	// An HPKE handshake takes two client messages: the hello and the closing.
 	serve_one_handshake_message(&mut transport).await?;
 	serve_one_handshake_message(&mut transport).await?;
 
@@ -357,7 +413,7 @@ pub async fn connect_pinned_client(
 	Ok(adopted.into_transport())
 }
 
-/// A client builder that trusts exactly `server_certificate`.
+/// A client builder that trusts `server_certificate` alone.
 fn pinned_client(server_certificate: &Certificate) -> Result<ClientBuilder<TokioListener>, TightBeamError> {
 	let trust_store: Arc<dyn CertificateTrust> = Arc::new(
 		CertificateTrustBuilder::from(Secp256k1Policy::default())

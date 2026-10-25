@@ -1,12 +1,12 @@
-//! Cross-cluster streaming and duplex forwarding through the gateway splice.
+//! The scenarios that forward a stream or a duplex across the gateway splice.
 //!
-//! The stream-echo servlet lives only in cluster B. A client opens a
-//! routed stream against cluster A (`open_stream_to` or `open_duplex_to`),
-//! and A splices it to B's gateway with the hop budget spent. B then
-//! serves it locally. A cancel of the client stream propagates across
-//! the splice to the servlet.
+//! The stream-echo servlet lives only in cluster B. A client opens a routed
+//! stream against cluster A ([`PooledClient::open_stream_to`] or
+//! [`PooledClient::open_duplex_to`]), and A splices it to B's gateway with
+//! the hop budget spent. B then serves it locally. A cancel of the client
+//! stream propagates across the splice to the servlet.
 
-use tightbeam::transport::{PooledClient, Protocol};
+use tightbeam::transport::{PooledClient, Protocol, TransportError};
 use tightbeam::{compose, servlet};
 
 use super::common::*;
@@ -83,8 +83,8 @@ servlet! {
 	}
 }
 
-/// A hive that hosts one stream-echo servlet, muxed on both the servlet
-/// server and the hive-to-cluster pool.
+/// Starts a hive that hosts one stream-echo servlet, muxed on both the
+/// servlet server and the hive-to-cluster pool.
 pub async fn start_stream_hive(
 	trace: TraceCollector,
 	certs: Arc<ClusterTestCerts>,
@@ -107,8 +107,8 @@ fn mux_peering_conf(certs: &ClusterTestCerts) -> ClusterConfig {
 	with_mux_offer(peering_cluster_conf(certs))
 }
 
-/// [`advertising_cluster_conf`] with a mux offer, so the exporting
-/// gateway serves forwarded streams from its peer.
+/// [`advertising_cluster_conf`] with a mux offer, so the exporter serves
+/// forwarded streams from its peer.
 fn mux_advertising_conf(certs: &ClusterTestCerts, peer: impl Into<String>) -> ClusterConfig {
 	let peer: String = peer.into();
 	with_mux_offer(advertising_cluster_conf(certs, peer))
@@ -138,9 +138,9 @@ pub async fn pooled_cluster_client(
 	Ok(client)
 }
 
-/// Starts two peered gateways with the stream-echo hive registered in the
-/// exporter. It is the shared preamble for every splice scenario. It returns
-/// the importer, which the client dials, and then the exporter.
+/// Starts two peered gateways and registers the stream-echo hive in the
+/// exporter, the preamble that the forward and cancel scenarios share. It
+/// returns the importer, which the client dials, and then the exporter.
 async fn start_spliced_clusters(
 	trace: &TraceCollector,
 	certs: &Arc<ClusterTestCerts>,
@@ -331,17 +331,15 @@ tb_assert_spec! {
 	}
 }
 
-/// The wire status a refused open carries.
+/// The wire status that a refused open carries, or `None` for a served open
+/// or a failure with no wire status.
 ///
-/// A test that only asks whether the open failed passes on any
-/// refusal, including the `Unimplemented` a plane with no route would
-/// give. The Edge policy names `PermissionDenied`, so that is what the
-/// scenario records.
-fn refusal_status<T>(outcome: Result<T, tightbeam::transport::TransportError>) -> Option<TransitStatus> {
-	match outcome {
-		Err(tightbeam::transport::TransportError::OperationFailed(failure)) => TransitStatus::try_from(failure).ok(),
-		_ => None,
-	}
+/// A test that only asks whether the open failed passes on any refusal,
+/// including the `Unimplemented` that a plane with no route gives. Each
+/// scenario records the status it expects, such as the `PermissionDenied`
+/// that the edge policy names.
+fn refusal_status<T>(outcome: Result<T, TransportError>) -> Option<TransitStatus> {
+	outcome.err().and_then(|error| error.transit_status())
 }
 
 // The edge accept plane admits Work frames only. With a live stream servlet

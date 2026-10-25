@@ -40,7 +40,7 @@ use crate::transport::{EnvelopeBuilder, ProtocolStream};
 // The macro generates the `TcpTransport` struct and its common implementations.
 crate::impl_tcp_common!(TcpTransport, ProtocolStream);
 
-/// Slice sizes for deadline-bounded content reads. The stream timeout is
+/// The slice sizes of a deadline-bounded content read. The stream timeout is
 /// per-recv (SO_RCVTIMEO), so the read re-checks the absolute budget only
 /// between slices, and the worst-case overrun past the deadline is one slice
 /// of per-recv resets.
@@ -55,8 +55,8 @@ where
 	TransportError: From<S::Error>,
 {
 	/// Re-arm the stream's per-recv timeout with the budget `policy` leaves at
-	/// this instant, failing with `DeadlineExceeded` once the budget is
-	/// exhausted.
+	/// this instant, and fail with `DeadlineExceeded` once the budget is
+	/// spent.
 	fn arm_read_deadline(&mut self, policy: &ReadPolicy) -> TransportResult<()> {
 		let now = self.clock.monotonic();
 		let Some(remaining) = policy.remaining(now)? else {
@@ -89,7 +89,7 @@ where
 			#[cfg(feature = "std")]
 			self.arm_read_deadline(&policy)?;
 
-			// EOF before the tag is the peer closing between frames. EOF
+			// EOF before the tag means the peer closed between frames. EOF
 			// anywhere after it is a truncated frame.
 			let mut tag_byte = [0u8; 1];
 			self.stream
@@ -126,9 +126,10 @@ where
 			let header = FrameHeader::parse(prefix, length_octets)?.admit(policy.cap())?;
 			let content_length = header.content_len();
 
-			// With a deadline the read runs in slices and re-checks the budget
-			// between them, so a byte-dripping peer cannot stretch it through
-			// per-recv timeout resets. Without one, a single read suffices.
+			// With a deadline, the read runs in slices and re-checks the
+			// budget between them, so a peer that drips bytes cannot stretch
+			// it through per-recv timeout resets. Without a deadline, a
+			// single read suffices.
 			let mut content = vec![0u8; content_length];
 			#[cfg(feature = "std")]
 			{
@@ -255,14 +256,14 @@ where
 	}
 }
 
-// The EncryptedMessageIO impl uses the default operation methods.
+// The `EncryptedMessageIO` impl uses the default operation methods.
 impl<S: ProtocolStream> EncryptedMessageIO for TcpTransport<S> where TransportError: From<S::Error> {}
 
-/// TCP server over the abstract listener trait. Every accepted transport is
-/// built from one [`EndpointConfig`].
+/// A TCP server over the abstract listener trait. It builds every accepted
+/// transport from one [`EndpointConfig`].
 pub struct TcpListener<L: TcpListenerTrait, P: CryptoProvider = DefaultCryptoProvider> {
 	listener: L,
-	/// What every accepted transport is built from.
+	/// The configuration this listener builds every accepted transport from.
 	config: EndpointConfig<P>,
 }
 
@@ -344,7 +345,7 @@ mod tests {
 	#![allow(unused_imports)]
 	use std::io::Write;
 	use std::sync::atomic::{AtomicBool, Ordering};
-	use std::sync::mpsc;
+	use std::sync::mpsc::{self, RecvTimeoutError};
 	use std::thread;
 	use std::time::{Duration, Instant};
 
@@ -356,22 +357,95 @@ mod tests {
 	use crate::transport::policy::PolicyConfig;
 	use crate::transport::state::{DialableEncryption, EncryptionConfig};
 	use crate::transport::TransportLimits;
-	use crate::utils::time::SystemClock;
+	use crate::utils::time::{ManualClock, SystemClock};
+
+	/// How long a case waits for a read on another thread before it reports
+	/// the read as blocked.
+	const READ_GUARD: Duration = Duration::from_secs(5);
 
 	/// A server that validates client certificates, so its reads face an
 	/// unauthenticated peer under the handshake ceilings in `limits`.
 	fn validating_server(limits: TransportLimits) -> EndpointConfig<DefaultCryptoProvider> {
+		validating_server_on(limits, Arc::new(SystemClock))
+	}
+
+	/// The server of [`validating_server`], which reads its deadlines on
+	/// `clock`.
+	fn validating_server_on(limits: TransportLimits, clock: Arc<dyn Clock>) -> EndpointConfig<DefaultCryptoProvider> {
 		let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator);
 		let peer_authentication = PeerAuthentication::mutual([validator]);
 
 		let encryption = EncryptionConfig { peer_authentication, ..EncryptionConfig::unconfigured() };
 		let encryption = DialableEncryption::new(encryption).expect("mutual authentication answers for the peer");
-		EndpointConfig::new(encryption, Arc::new(SystemClock)).with_limits(limits)
+		EndpointConfig::new(encryption, clock).with_limits(limits)
+	}
+
+	/// A server over one end of a loopback connection, beside the stream of
+	/// its peer, which sends nothing. The server reads its deadlines on
+	/// `clock`, and its handshake began at the clock's reading.
+	fn handshaking_server(
+		limits: TransportLimits,
+		clock: &Arc<ManualClock>,
+	) -> (TcpTransport<NetTcpStream>, NetTcpStream) {
+		let listener = NetTcpListener::bind("127.0.0.1:0").expect("a loopback port binds");
+		let addr = listener.local_addr().expect("a bound listener has an address");
+		let peer = NetTcpStream::connect(addr).expect("the loopback listener takes the dial");
+		let (stream, _) = listener.accept().expect("the dial arrives");
+
+		let endpoint = validating_server_on(limits, Arc::clone(clock) as Arc<dyn Clock>);
+		let mut transport: TcpTransport<NetTcpStream> = TcpTransport::new(stream, endpoint);
+		let began = transport.state.begin_handshake(clock.monotonic());
+		assert!(began, "a provisioned server begins its handshake");
+
+		(transport, peer)
+	}
+
+	/// The outcome of one read of `transport` on a thread of its own, or
+	/// `None` while the read still blocks after `guard`.
+	///
+	/// # Panics
+	///
+	/// - The read thread ended with no outcome, as a panic in the read ends it.
+	fn read_within(mut transport: TcpTransport<NetTcpStream>, guard: Duration) -> Option<TransportResult<Vec<u8>>> {
+		let (sender, receiver) = mpsc::channel();
+		thread::spawn(move || {
+			let runtime = tokio::runtime::Builder::new_current_thread().build().expect("a runtime builds");
+			let outcome = runtime.block_on(transport.read_envelope_bytes());
+			// The receiver is gone once the case stopped waiting, and the case
+			// has then reported the blocked read.
+			let _ = sender.send(outcome);
+		});
+
+		match receiver.recv_timeout(guard) {
+			Ok(outcome) => Some(outcome),
+			Err(RecvTimeoutError::Timeout) => None,
+			Err(RecvTimeoutError::Disconnected) => panic!("the read thread ended without an outcome"),
+		}
+	}
+
+	/// A silent peer ends the read once the handshake budget left on the
+	/// connection clock runs out, though the handshake timeout counted from
+	/// this read would allow a minute.
+	#[test]
+	fn a_silent_peer_ends_the_read_with_the_budget_left_on_the_clock() -> TransportResult<()> {
+		let clock = Arc::new(ManualClock::default());
+		let limits = TransportLimits { handshake_timeout: Duration::from_secs(60), ..TransportLimits::default() };
+		let (transport, _peer) = handshaking_server(limits, &clock);
+		clock.advance(limits.handshake_timeout - Duration::from_millis(100));
+
+		let outcome = read_within(transport, READ_GUARD);
+		let timed_out = matches!(
+			&outcome,
+			Some(Err(TransportError::IoError(error))) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
+		);
+		assert!(timed_out);
+		Ok(())
 	}
 
 	/// A peer that drips bytes cannot stretch the read. A per-recv timeout
-	/// alone would let this read complete after about 6s of dripping, and the
-	/// absolute deadline aborts it at the first slice boundary past the budget.
+	/// alone would let this read complete after the whole drip of about 6s,
+	/// and the absolute deadline aborts it at the first slice boundary past
+	/// the budget.
 	#[tokio::test]
 	async fn handshake_read_deadline_bounds_byte_drip() -> TransportResult<()> {
 		let listener = NetTcpListener::bind("127.0.0.1:0")?;
@@ -418,8 +492,8 @@ mod tests {
 		Ok(())
 	}
 
-	// A header that declares more than the handshake cap is refused on the
-	// header alone, before any content is read or allocated (CWE-770).
+	// The server refuses a header that declares more than the handshake cap
+	// on the header alone, before it reads or allocates any content (CWE-770).
 	#[tokio::test]
 	async fn a_handshake_header_above_the_cap_is_refused() -> TransportResult<()> {
 		let listener = NetTcpListener::bind("127.0.0.1:0")?;

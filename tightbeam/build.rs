@@ -9,9 +9,9 @@ fn main() {
 	// gates in the library. AFL harnesses set it through RUSTFLAGS.
 	println!("cargo::rustc-check-cfg=cfg(fuzzing)");
 
-	// Names the compound predicates that gate whole subsystems, so the
-	// build graph has one definition instead of hand-copied clause lists
-	// that can drift independently.
+	// The aliases name the compound predicates that gate whole subsystems, so
+	// the build graph holds one definition of each predicate instead of copied
+	// clause lists that can drift apart.
 	cfg_aliases! {
 		// Pooled multiplexing needs the mux engine, the service module's
 		// connector, an encryption handshake, and a tokio executor for the
@@ -32,6 +32,16 @@ fn main() {
 			all(
 				feature = "std",
 				not(all(target_arch = "wasm32", target_os = "unknown"))
+			)
+		},
+		// The in-band rekey of a multiplexed session needs the mux engine and
+		// an encryption handshake. It runs in the mux driver, which an async
+		// runtime runs, and `tokio` turns on `async-transport`.
+		mux_rekey: {
+			all(
+				feature = "transport-multiplex",
+				feature = "async-transport",
+				any(feature = "transport-cms", feature = "transport-hpke")
 			)
 		},
 	}

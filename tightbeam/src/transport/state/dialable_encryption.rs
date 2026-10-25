@@ -1,7 +1,7 @@
 //! This module holds the provisioning a transport is built from, once it
 //! passes the dialer rule and the key-purpose check, and the negotiation input
-//! a session holds beside it. Each flow builds its configurations, and each mux
-//! role its renewal, from the two.
+//! a session holds beside it. Each flow builds its configurations from the
+//! two, and each mux role builds its renewal from them.
 //!
 //! The field of [`DialableEncryption`] is private to this module, so it keeps
 //! what the checks read. The fields of [`Negotiation`] are private too, so its
@@ -36,19 +36,15 @@ use crate::transport::handshake::{Cms, CmsClientSettings, CmsServerSettings};
 use crate::transport::handshake::{FlowProvisioning, Provisioning, ServerConfig, ServerFlow, SupportedProfiles};
 #[cfg(feature = "transport-hpke")]
 use crate::transport::handshake::{Hpke, HpkeClientSettings, HpkeServerSettings, LearnedTrust};
-#[cfg(all(
-	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-hpke")
-))]
+#[cfg(mux_rekey)]
 use crate::transport::rekey::Renewal;
 
 /// Provisioning that holds both facts [`Self::new`] checks: it answers the
 /// dialer rule of [`EncryptionConfig::check_dial_permitted`], and each identity
 /// it presents names the key purpose of its role (RFC 5280 §4.2.1.12).
 ///
-/// A transport is built only from this form, through the constructors of
-/// [`SessionState`], so every installed provisioning holds both facts as the
-/// checks read them.
+/// The constructors of [`SessionState`] take this form alone, so every
+/// installed provisioning holds both facts as the checks read them.
 ///
 /// [`SessionState`]: super::SessionState
 #[derive(Clone)]
@@ -64,7 +60,8 @@ impl<P: CryptoProvider> DialableEncryption<P> {
 	///   authenticates no peer and does not name cleartext, or it sets a server
 	///   policy and holds no trust in a server, whether or not it names
 	///   cleartext.
-	/// - [`TransportError::HandshakeError`] -- an identity names another key purpose than its role's.
+	/// - [`TransportError::HandshakeError`] -- an identity names a key purpose
+	///   other than its role's, or its extended key usage fails to decode.
 	pub fn new(encryption: EncryptionConfig<P>) -> TransportResult<Self> {
 		encryption.check_dial_permitted()?;
 		#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -89,7 +86,7 @@ impl<P: CryptoProvider> DialableEncryption<P> {
 		Self(encryption)
 	}
 
-	/// The provisioning this answer was given for.
+	/// The provisioning this value holds.
 	pub fn encryption(&self) -> &EncryptionConfig<P> {
 		&self.0
 	}
@@ -99,41 +96,38 @@ impl<P: CryptoProvider> DialableEncryption<P> {
 /// and the hooks that its handshakes and their rekeys consult.
 ///
 /// It sits beside the provisioning that [`DialableEncryption::new`] checks. A
-/// builder fills it, a session takes it whole where the session is built, and
+/// builder fills it, a session takes it whole when the session starts, and
 /// the setters of [`SessionState`] write it afterwards.
 ///
 /// [`SessionState`]: super::SessionState
 #[derive(Clone, Default)]
 pub(crate) struct Negotiation {
-	/// Local multiplexing capability advertised in the handshake.
+	/// The local multiplexing capability the handshake advertises.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	mux_offer: Option<Arc<TransportOffer>>,
-	/// Budget-grant policy between the client's offer and the server's accept.
-	/// `None` grants the local configuration ceiling.
+	/// The budget-grant policy between the client's offer and the server's
+	/// accept. `None` grants the local configuration ceiling.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	transport_authorizer: Option<Arc<dyn TransportAuthorizer>>,
-	/// Approver consulted for a challenge-bearing session receipt. `None`
-	/// fails closed when a challenge is present.
+	/// The approver a client consults for a challenge-bearing session receipt.
+	/// `None` fails closed when a challenge is present.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	receipt_approver: Option<Arc<dyn ReceiptApprover>>,
-	/// Observer that records budget-bearing handshake outcomes.
+	/// The observer that records budget-bearing handshake outcomes.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	session_observer: Option<Arc<dyn SessionObserver>>,
-	/// Handshake protocol used once encryption is provisioned.
+	/// The handshake protocol a provisioned endpoint runs.
 	handshake_protocol: HandshakeProtocolKind,
 }
 
 impl Negotiation {
-	/// Handshake protocol used once encryption is provisioned.
+	/// The handshake protocol a provisioned endpoint runs.
 	pub(super) fn handshake_protocol(&self) -> HandshakeProtocolKind {
 		self.handshake_protocol
 	}
 
 	/// Replace the multiplexing capability this endpoint offers.
-	#[cfg(all(
-		feature = "transport-multiplex",
-		any(feature = "transport-cms", feature = "transport-hpke")
-	))]
+	#[cfg(mux_rekey)]
 	pub(super) fn offer_mux(&mut self, offer: Option<Arc<TransportOffer>>) {
 		self.mux_offer = offer;
 	}
@@ -156,7 +150,7 @@ impl Negotiation {
 		self.session_observer = Some(observer);
 	}
 
-	/// Replace the approver consulted before countersigning a
+	/// Replace the approver a client consults before it countersigns a
 	/// challenge-bearing receipt.
 	#[cfg(all(feature = "std", any(feature = "transport-cms", feature = "transport-hpke")))]
 	pub(crate) fn approve_receipts(&mut self, approver: Arc<dyn ReceiptApprover>) {
@@ -194,7 +188,7 @@ impl<'a, P: CryptoProvider> Endpoint<'a, P> {
 	///
 	/// # Errors
 	///
-	/// - The errors of [`HandshakeProtocolKind::client_handshake`].
+	/// - [`TransportError`] -- the errors of [`HandshakeProtocolKind::client_handshake`].
 	pub(crate) fn client_handshake(&self) -> TransportResult<BoxedClientHandshake>
 	where
 		P: HandshakeProvider,
@@ -207,7 +201,7 @@ impl<'a, P: CryptoProvider> Endpoint<'a, P> {
 	///
 	/// # Errors
 	///
-	/// - The errors of [`HandshakeProtocolKind::server_handshake`].
+	/// - [`TransportError`] -- the errors of [`HandshakeProtocolKind::server_handshake`].
 	pub(crate) fn server_handshake(&self) -> TransportResult<BoxedServerHandshake>
 	where
 		P: HandshakeProvider,
@@ -258,9 +252,9 @@ impl<'a, P: CryptoProvider> Endpoint<'a, P> {
 	}
 
 	/// What the client role renews under: the client identity this endpoint
-	/// presented, the server purpose its peer was admitted under, and the
-	/// receipt approver, or `None` without a client identity.
-	#[cfg(feature = "transport-multiplex")]
+	/// presented, the server purpose the handshake admitted its peer under,
+	/// and the receipt approver, or `None` without a client identity.
+	#[cfg(mux_rekey)]
 	pub(crate) fn client_renewal(&self) -> Option<Renewal<P>> {
 		let encryption = &self.proof.0;
 		let identity = encryption.client_identity.clone()?;
@@ -270,10 +264,10 @@ impl<'a, P: CryptoProvider> Endpoint<'a, P> {
 	}
 
 	/// What the server role renews under: the signing identity this endpoint
-	/// presented, the client purpose its peer was admitted under, the transport
-	/// authorizer, and the session observer, or `None` without a server
-	/// identity.
-	#[cfg(feature = "transport-multiplex")]
+	/// presented, the client purpose the handshake admitted its peer under,
+	/// the transport authorizer, and the session observer, or `None` without
+	/// a server identity.
+	#[cfg(mux_rekey)]
 	pub(crate) fn server_renewal(&self) -> Option<Renewal<P>> {
 		let encryption = &self.proof.0;
 		let identity = encryption.server_identity.as_ref()?.signing().clone();

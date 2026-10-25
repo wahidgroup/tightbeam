@@ -1,11 +1,11 @@
-//! CSP Process Algebra Operations
+//! CSP process algebra operations.
 //!
-//! Implements core process algebra operations from CSP theory:
-//! - Hiding (P \ A)
-//! - Renaming (P [[ old <- new ]])
-//! - Sequential composition (P ; Q)
-//! - External choice (P [] Q)
-//! - Internal choice (P |~| Q)
+//! This module implements these operators of CSP theory on [`Process`]:
+//! - Hiding: `P \ A`.
+//! - Renaming: `P [[ old <- new ]]`.
+//! - Sequential composition: `P ; Q`.
+//! - External choice: `P [] Q`.
+//! - Internal choice: `P |~| Q`.
 
 use std::collections::{HashMap, HashSet};
 
@@ -13,8 +13,8 @@ use crate::testing::specs::composition::CompositionError;
 use crate::testing::specs::csp::{intern, Event, Process, ProcessBuilder, State};
 
 impl ProcessBuilder {
-	/// Add both operands' alphabets, preserving the observable and hidden
-	/// classification.
+	/// Add the alphabets of both operands, and keep each event in its
+	/// observable or hidden alphabet.
 	fn union_alphabets(self, p: &Process, q: &Process) -> Self {
 		let builder = p
 			.observable
@@ -41,34 +41,55 @@ impl ProcessBuilder {
 		process.terminal.iter().fold(self, |b, state| b.add_terminal(map_state(state)))
 	}
 
-	/// Copy every transition of `process`, mapping states through
-	/// `map_state` and events through `map_event`.
+	/// Copy every transition of `process`, with each state mapped through
+	/// `map_state` and each event through `map_event`.
+	///
+	/// A timed transition keeps its guard and its clock resets.
 	fn copy_transitions<S, E>(self, process: &Process, map_state: S, map_event: E) -> Self
 	where
 		S: Fn(&State) -> State,
 		E: Fn(Event) -> Event,
 	{
-		let map_state = &map_state;
-		let map_event = &map_event;
+		let enabled = process.states.iter().map(|state| (*state, process.enabled(*state)));
+		let offered = enabled.flat_map(|(state, actions)| actions.into_iter().map(move |action| (state, action.event)));
 
-		process
-			.states
-			.iter()
-			.flat_map(move |state| {
-				process.enabled(*state).into_iter().flat_map(move |action| {
-					process
-						.step(*state, &action.event)
-						.into_iter()
-						.map(move |target| (map_state(state), map_event(action.event), map_state(&target)))
-				})
-			})
-			.fold(self, |b, (from, event, to)| b.add_transition(from, event, to))
+		offered.fold(self, |builder, (state, event)| {
+			let copy = (map_state(&state), map_event(event));
+			builder.copy_edges(process, (state, event), copy, &map_state)
+		})
 	}
 
-	/// Prefixed copies of both operands: states, alphabets, transitions, and
-	/// terminals of `p` under `P_` and `q` under `Q_`. Shared scaffold of the
-	/// choice operators, which differ only in how their initial state wires
-	/// into the copies.
+	/// Copy the edges of `process` that `event` labels at `state`, as edges
+	/// that `as_event` labels at `from`, with each target mapped through
+	/// `map_target`.
+	///
+	/// A timed edge keeps its guard and its clock resets.
+	fn copy_edges<T>(
+		self,
+		process: &Process,
+		(state, event): (State, Event),
+		(from, as_event): (State, Event),
+		map_target: T,
+	) -> Self
+	where
+		T: Fn(&State) -> State,
+	{
+		let untimed = process.transitions.targets(state, &event).unwrap_or_default().iter();
+		let builder = untimed.fold(self, |b, target| b.add_transition(from, as_event, map_target(target)));
+
+		#[cfg(feature = "testing-timing")]
+		let builder = process.timed_edges(state, &event).iter().fold(builder, |b, edge| {
+			let resets = edge.reset_clocks.iter().cloned();
+			b.add_timed_transition(from, as_event, map_target(&edge.to), edge.guard.clone(), resets)
+		});
+
+		builder
+	}
+
+	/// Add prefixed copies of both operands: the states, alphabets,
+	/// transitions, and terminals of `p` under `P_` and of `q` under `Q_`.
+	/// Both choice operators build on these copies, and they differ only in
+	/// how their initial state connects to them.
 	fn prefixed_operands(self, p: &Process, q: &Process) -> Self {
 		self.copy_states(p, |state| State::prefixed(state, "P"))
 			.copy_states(q, |state| State::prefixed(state, "Q"))
@@ -79,34 +100,32 @@ impl ProcessBuilder {
 			.copy_terminals(q, |state| State::prefixed(state, "Q"))
 	}
 
-	/// Copy the transitions leaving `process`'s initial state so they
-	/// originate from `from` instead, targeting the prefixed copies
-	/// (external choice's first-event commitment).
+	/// Copy the transitions that leave the initial state of `process` so that
+	/// they start at `from` and reach the prefixed copies. An external choice
+	/// commits on its first event through these copies.
+	///
+	/// A timed transition keeps its guard and its clock resets.
 	fn fan_out_initial(self, process: &Process, from: State, prefix: impl AsRef<str>) -> Self {
 		let prefix = prefix.as_ref();
-		process
-			.enabled(process.initial)
-			.into_iter()
-			.flat_map(|action| {
-				process
-					.step(process.initial, &action.event)
-					.into_iter()
-					.map(move |target| (action.event, State::prefixed(&target, prefix)))
-			})
-			.fold(self, |b, (event, target)| b.add_transition(from, event, target))
+		let initial = process.initial;
+		let prefixed = |target: &State| State::prefixed(target, prefix);
+		process.enabled(initial).into_iter().fold(self, |builder, action| {
+			let fanned = (from, action.event);
+			builder.copy_edges(process, (initial, action.event), fanned, prefixed)
+		})
 	}
 }
 
 impl Process {
-	/// Hiding: P \ A
+	/// Hiding: `P \ A`, where `A` is `hidden_events`.
 	///
-	/// Make events in A hidden (internal τ-transitions).
-	/// Observable events become hidden events.
+	/// The observable events of `A` become hidden, so their transitions are
+	/// internal τ transitions.
 	///
 	/// ## Effect
-	/// - Events in A are removed from observable alphabet
-	/// - Events in A are added to hidden alphabet
-	/// - State space and transitions remain unchanged
+	/// - The observable alphabet loses the events of `A`.
+	/// - The hidden alphabet gains the observable events of `A`.
+	/// - The state space and the transitions stay the same.
 	pub fn hide(&self, hidden_events: HashSet<Event>) -> Result<Process, CompositionError> {
 		let name = intern(format!("({} \\ A)", self.name));
 		let builder = Process::builder(name)
@@ -130,13 +149,13 @@ impl Process {
 		Ok(builder.build()?)
 	}
 
-	/// Renaming: P [[ old <- new ]]
+	/// Renaming: `P [[ old <- new ]]`.
 	///
-	/// Rename events according to the mapping.
-	/// All occurrences of old events are replaced with new events.
+	/// Rename events according to `mapping`. Every occurrence of an old event,
+	/// in both alphabets and in every transition, becomes its new event.
 	///
 	/// ## Parameters
-	/// - `mapping`: HashMap from old event to new event
+	/// - `mapping`: the new event for each old event.
 	pub fn rename(&self, mapping: HashMap<Event, Event>) -> Result<Process, CompositionError> {
 		let name = intern(format!("({} [[r]])", self.name));
 		let builder = Process::builder(name)
@@ -156,18 +175,19 @@ impl Process {
 		Ok(builder.build()?)
 	}
 
-	/// Sequential composition: P ; Q
+	/// Sequential composition: `P ; Q`.
 	///
-	/// When P terminates (reaches a terminal state), start Q.
-	/// Terminal states of P are connected to initial state of Q.
+	/// When `P` reaches a terminal state, `Q` starts, so the terminal states of
+	/// `P` connect to the initial state of `Q`.
 	///
 	/// ## State Space
-	/// S = S_P ∪ S_Q (union, but P terminal states connect to Q initial)
+	/// `S = S_P ∪ S_Q`, where the states of `Q` carry the prefix `Q_`. Only the
+	/// terminal states of `Q` stay terminal.
 	///
 	/// ## Transitions
-	/// - All P transitions remain
-	/// - All Q transitions remain
-	/// - P terminal states have τ-transition to Q initial state
+	/// - Every transition of `P` remains.
+	/// - Every transition of `Q` remains.
+	/// - Each terminal state of `P` has a τ transition, `tau_seq`, to the initial state of `Q`.
 	pub fn sequential(p: &Process, q: &Process) -> Result<Process, CompositionError> {
 		let name = intern(format!("({} ; {})", p.name, q.name));
 		let builder = Process::builder(name).initial_state(p.initial).copy_states(p, |state| *state);
@@ -185,14 +205,15 @@ impl Process {
 		Ok(builder.build()?)
 	}
 
-	/// External choice: P [] Q
+	/// External choice: `P [] Q`.
 	///
-	/// Environment determines which process runs.
-	/// The first observable event determines the choice.
+	/// The first event decides which process runs. An observable first event
+	/// is the environment's choice, and a hidden first event of either operand
+	/// also commits the choice.
 	///
 	/// ## State Space
-	/// Initial state offers both P and Q initial states
-	/// After first event, committed to one process
+	/// The initial state offers the first events of both `P` and `Q`. After
+	/// the first event, the process is committed to one operand.
 	pub fn external_choice(p: &Process, q: &Process) -> Result<Process, CompositionError> {
 		let choice_initial = State("ExternalChoice_Initial");
 		let name = intern(format!("({} [] {})", p.name, q.name));
@@ -204,10 +225,11 @@ impl Process {
 		Ok(builder.build()?)
 	}
 
-	/// Internal choice: P |~| Q
+	/// Internal choice: `P |~| Q`.
 	///
-	/// Process non-deterministically chooses P or Q.
-	/// From initial state, there are two τ-transitions to P and Q initial states.
+	/// The process chooses `P` or `Q` nondeterministically. Two τ transitions,
+	/// `tau_choice_p` and `tau_choice_q`, lead from the initial state to the
+	/// initial states of `P` and `Q`.
 	pub fn internal_choice(p: &Process, q: &Process) -> Result<Process, CompositionError> {
 		let choice_initial = State("InternalChoice_Initial");
 		let name = intern(format!("({} |~| {})", p.name, q.name));
@@ -228,8 +250,9 @@ impl Process {
 }
 
 impl State {
-	/// Create a renamed copy of a state under an operand prefix, used by the
-	/// composition operators to keep operand state spaces disjoint
+	/// Create a renamed copy of a state under an operand prefix. The
+	/// composition operators use it to keep the state spaces of their operands
+	/// disjoint.
 	pub fn prefixed(s: &State, prefix: impl AsRef<str>) -> State {
 		let prefix = prefix.as_ref();
 		State(intern(format!("{}_{}", prefix, s.0)))
@@ -240,10 +263,18 @@ impl State {
 mod tests {
 	use std::borrow::Cow;
 
+	#[cfg(feature = "testing-timing")]
+	use core::time::Duration;
+
 	use super::*;
 	use crate::testing::assertions::{Assertion, AssertionLabel};
 	use crate::testing::specs::csp::{Event, Process, State};
 	use crate::trace::ConsumedTrace;
+
+	#[cfg(feature = "testing-timing")]
+	use crate::testing::specs::csp::ProcessBuildError;
+	#[cfg(feature = "testing-timing")]
+	use crate::testing::timing::TimingGuard;
 
 	fn trace_of(labels: &[&'static str]) -> ConsumedTrace {
 		let mut trace = ConsumedTrace::new();
@@ -353,6 +384,49 @@ mod tests {
 
 		let result = composed.validate_trace(&trace_of(&["a", "b", "a", "b"]));
 		assert!(result.valid);
+		Ok(())
+	}
+
+	/// A process in which `a` takes `s0` to the terminal `s1` where the
+	/// clocks satisfy `guard`.
+	#[cfg(feature = "testing-timing")]
+	fn guarded_process(guard: TimingGuard) -> Result<Process, ProcessBuildError> {
+		Process::builder("G")
+			.initial_state(State("s0"))
+			.add_observable(Event("a"))
+			.add_timed_transition(State("s0"), Event("a"), State("s1"), Some(guard), Vec::new())
+			.add_terminal(State("s1"))
+			.build()
+	}
+
+	/// The guards of the timed edges that `a` labels at `state`.
+	#[cfg(feature = "testing-timing")]
+	fn guards_of(process: &Process, state: State) -> Vec<Option<TimingGuard>> {
+		let edges = process.timed_edges(state, &Event("a"));
+		edges.iter().map(|edge| edge.guard.clone()).collect()
+	}
+
+	#[cfg(feature = "testing-timing")]
+	#[test]
+	fn hiding_keeps_the_guard_of_a_timed_transition() -> Result<(), Box<dyn core::error::Error>> {
+		let bound = TimingGuard::ClockLessEqual("clk".to_string(), Duration::from_millis(5));
+		let guarded = guarded_process(bound.clone())?;
+
+		let copy = guarded.hide(HashSet::new())?;
+
+		assert_eq!(guards_of(&copy, State("s0")), [Some(bound)]);
+		Ok(())
+	}
+
+	#[cfg(feature = "testing-timing")]
+	#[test]
+	fn an_external_choice_keeps_the_guard_of_a_first_event() -> Result<(), Box<dyn core::error::Error>> {
+		let bound = TimingGuard::ClockLessEqual("clk".to_string(), Duration::from_millis(5));
+		let guarded = guarded_process(bound.clone())?;
+
+		let choice = Process::external_choice(&guarded, &simple_process())?;
+
+		assert_eq!(guards_of(&choice, State("ExternalChoice_Initial")), [Some(bound)]);
 		Ok(())
 	}
 }

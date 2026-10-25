@@ -82,11 +82,10 @@ use crate::crypto::profiles::{CryptoProvider, KeyWrapAlgorithm};
 use crate::crypto::secret::SecretSlice;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::sign::elliptic_curve::ecdh::EphemeralSecret;
-#[cfg(any(
-	feature = "transport-hpke",
-	all(feature = "transport-cms", feature = "transport-multiplex")
-))]
-use crate::crypto::sign::elliptic_curve::sec1::{self, CompressedPointSize, ToEncodedPoint};
+#[cfg(any(feature = "transport-hpke", mux_rekey, test))]
+use crate::crypto::sign::elliptic_curve::sec1;
+#[cfg(any(feature = "transport-hpke", test))]
+use crate::crypto::sign::elliptic_curve::sec1::{CompressedPointSize, ToEncodedPoint};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::sign::elliptic_curve::sec1::{EncodedPoint, FromEncodedPoint};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -99,10 +98,7 @@ use crate::crypto::subtle::ConstantTimeEq;
 use crate::crypto::x509::{PeerCertificate, Sec1Point, Signing};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::der::asn1::{ObjectIdentifier, OctetStringRef};
-#[cfg(all(
-	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-hpke")
-))]
+#[cfg(mux_rekey)]
 use crate::der::oid::AssociatedOid;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::der::{DecodeValue, EncodeValue, FixedTag, Header, Length, Reader, Result as DerResult, Tag, Writer};
@@ -118,17 +114,11 @@ use crate::transport::handshake::flow::ServerConfirmed;
 use crate::transport::handshake::negotiation::{MuxSettings, RunnableProfile};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::peer::PeerIdentity;
-#[cfg(all(
-	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-hpke")
-))]
+#[cfg(mux_rekey)]
 use crate::transport::handshake::primitives::multi_input_kdf;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::primitives::transcript::DigestOutput;
-#[cfg(all(
-	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-hpke")
-))]
+#[cfg(mux_rekey)]
 use crate::transport::handshake::primitives::transcript::Transcript;
 #[cfg(feature = "transport-hpke")]
 use crate::transport::handshake::primitives::RandomsSalt;
@@ -157,7 +147,7 @@ use crate::ZeroizingBytes;
 #[cfg(feature = "transport-cms")]
 pub(crate) struct BaseSecret(ZeroizingArray<BASE_SECRET_SIZE>);
 
-/// Base secret length in bytes.
+/// The length of the base secret, in bytes.
 #[cfg(feature = "transport-cms")]
 const BASE_SECRET_SIZE: usize = 32;
 
@@ -212,7 +202,7 @@ impl TryFrom<SecretSlice<u8>> for BaseSecret {
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub struct HandshakeSecret(ZeroizingBytes);
 
-/// Handshake secret length in bytes.
+/// The length of the handshake secret, in bytes.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 const HANDSHAKE_SECRET_SIZE: usize = 32;
 
@@ -367,7 +357,7 @@ impl HandshakeSecret {
 	///
 	/// # Errors
 	///
-	/// - The errors of [`Self::server_confirmation`].
+	/// - [`HandshakeError`] -- the errors of [`Self::server_confirmation`].
 	/// - [`HandshakeError::KeyConfirmationFailed`] -- the tags differ, so the
 	///   server derived another handshake secret or MACed another transcript or
 	///   another signature.
@@ -449,7 +439,7 @@ impl HandshakeSecret {
 	}
 }
 
-/// Debug output redacts the handshake secret.
+/// The `Debug` output redacts the handshake secret.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl fmt::Debug for HandshakeSecret {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -551,10 +541,14 @@ impl SecretSeal {
 		Ok(framed)
 	}
 
-	/// The plaintext inside an opened frame. The method refuses a length past
-	/// the end of the frame, a non-zero byte in its padding, or a frame of
-	/// another padded length, so only a frame that [`Self::frame`] could write
-	/// opens.
+	/// The plaintext inside an opened frame. Only a frame that [`Self::frame`]
+	/// could write opens.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::SealedFrame`] -- the length runs past the end of the
+	///   frame, a padding byte is non-zero, or the frame length differs from
+	///   the padded length of its plaintext.
 	fn unframe(self, framed: &[u8]) -> Result<SecretSlice<u8>, HandshakeError> {
 		let Some(padding) = self.padding() else {
 			return Ok(SecretSlice::from(framed.to_vec()));
@@ -656,7 +650,8 @@ impl<P: HandshakeProvider> Sealer<P> {
 	///
 	/// - [`HandshakeError::ReceiptAckCipher`] -- the envelope refused to seal an acknowledgement.
 	/// - [`HandshakeError::SealedClosing`] -- the envelope refused to seal a closing.
-	/// - [`HandshakeError::SealedFrame`] -- the closing exceeds the frame.
+	/// - [`HandshakeError::SealedFrame`] -- the closing is longer than a `u16`
+	///   length names, or its padded length overflows.
 	/// - [`HandshakeError::DerError`] -- the transcript hash attribute fails to encode.
 	pub(crate) fn seal(
 		self,
@@ -683,8 +678,8 @@ impl<P: HandshakeProvider> Sealer<P> {
 	/// # Errors
 	///
 	/// - [`HandshakeError::ReceiptAckCipher`] -- an acknowledgement fails to
-	///   open, so it was sealed under another handshake secret or another
-	///   transcript, or altered in flight.
+	///   open, so its sealer held another handshake secret or another
+	///   transcript, or the acknowledgement changed in flight.
 	/// - [`HandshakeError::SealedClosing`] -- a closing fails to open.
 	/// - [`HandshakeError::SealedFrame`] -- the opened frame of a closing is malformed.
 	/// - [`HandshakeError::DerError`] -- the transcript hash attribute fails to encode.
@@ -907,23 +902,20 @@ impl TrafficSecret for HandshakeSecret {
 /// [`EpochMaterials::derive`], and each rotation derives the next link from
 /// the previous one and a fresh agreement through [`Self::next`]. Those two
 /// are its constructors.
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+#[cfg(mux_rekey)]
 pub(crate) struct EpochSecret(ZeroizingBytes);
 
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+#[cfg(mux_rekey)]
 impl sealed::Sealed for EpochSecret {}
 
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+#[cfg(mux_rekey)]
 impl TrafficSecret for EpochSecret {
 	fn as_bytes(&self) -> &[u8] {
 		&self.0
 	}
 }
 
-#[cfg(all(
-	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-hpke")
-))]
+#[cfg(mux_rekey)]
 impl EpochSecret {
 	/// The next link of the rekey KDF chain: this link and a fresh agreement
 	/// between `local` and `peer`, extracted under `salt` and the epoch label.
@@ -990,15 +982,14 @@ impl EpochSecret {
 /// `hash_0`. The handshake secret itself drops at completion.
 pub struct EpochMaterials {
 	/// The current epoch secret, zeroized on drop and on rotation
-	/// (RFC 9846 § 7.2). Only `transport::rekey` reads it, and a build can
-	/// include the handshake without the `transport-multiplex` consumers.
-	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-	#[allow(dead_code)]
+	/// (RFC 9846 § 7.2). The mux rekey reads it, so the field exists in a
+	/// build with it.
+	#[cfg(mux_rekey)]
 	pub(crate) secret: EpochSecret,
-	/// The epoch counter. It is 0 at handshake and increments on each rekey
-	/// install.
+	/// The epoch counter. It is 0 at the handshake and increments on each
+	/// rekey install.
 	pub(crate) epoch: u32,
-	/// The chained transcript hash. `hash_0` is the handshake transcript.
+	/// The chained transcript hash. `hash_0` is the handshake transcript hash.
 	pub(crate) transcript_hash: TranscriptHash,
 }
 
@@ -1015,7 +1006,7 @@ impl EpochMaterials {
 	}
 }
 
-/// Debug output redacts the epoch secret.
+/// The `Debug` output redacts the epoch secret.
 impl fmt::Debug for EpochMaterials {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.debug_struct("EpochMaterials")
@@ -1025,10 +1016,10 @@ impl fmt::Debug for EpochMaterials {
 	}
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+#[cfg(mux_rekey)]
 impl EpochMaterials {
-	/// Derive the epoch-0 secret from the handshake secret under the
-	/// dedicated epoch info label.
+	/// Derive the epoch-0 secret from the handshake secret under the epoch
+	/// info label.
 	///
 	/// The derivation uses the same `secret` and `salt` pair as the
 	/// directional traffic keys. The distinct label yields an independent
@@ -1049,15 +1040,12 @@ impl EpochMaterials {
 		let input_key = secret.as_bytes();
 		let kdf_salt = Some(salt.as_bytes());
 		let secret = P::Kdf::derive_dynamic_key(input_key, TIGHTBEAM_EPOCH_KDF_INFO, kdf_salt, EPOCH_SECRET_SIZE)?;
-		let materials = Self { secret: EpochSecret(secret), epoch: 0, transcript_hash };
+		let materials = Self { secret: EpochSecret(secret), epoch: HANDSHAKE_EPOCH, transcript_hash };
 		Ok(materials)
 	}
 }
 
-#[cfg(all(
-	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-hpke")
-))]
+#[cfg(mux_rekey)]
 impl EpochMaterials {
 	/// The pin an epoch receipt commits to:
 	/// `H(hash || request_der || server_random || server_ephemeral)`.
@@ -1106,9 +1094,15 @@ impl EpochMaterials {
 	}
 }
 
-/// Epoch secret length in bytes: one 256-bit KDF chain link.
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+/// The length of the epoch secret, in bytes: one 256-bit link of the KDF
+/// chain.
+#[cfg(mux_rekey)]
 const EPOCH_SECRET_SIZE: usize = 32;
+
+/// The epoch of the keys a handshake installs, which each rekey counts up
+/// from.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+const HANDSHAKE_EPOCH: u32 = 0;
 
 /// The compressed SEC 1 encoding of an ephemeral public key, at the width of
 /// that form on the key's curve (SEC 1 v2.0 §2.3.3).
@@ -1116,10 +1110,7 @@ const EPOCH_SECRET_SIZE: usize = 32;
 /// The HPKE hello, the HPKE reply, and both rekey legs carry an ephemeral in
 /// this form. The rekey pin hashes it as a leg of the type's width, so the
 /// curve fixes the width of every point the pin covers.
-#[cfg(any(
-	feature = "transport-hpke",
-	all(feature = "transport-cms", feature = "transport-multiplex")
-))]
+#[cfg(any(feature = "transport-hpke", test))]
 pub(crate) trait CompressedPoint {
 	/// The curve of the point.
 	type Curve: HandshakeCurve;
@@ -1133,10 +1124,7 @@ pub(crate) trait CompressedPoint {
 	fn compressed_point(&self) -> Result<sec1::CompressedPoint<Self::Curve>, HandshakeError>;
 }
 
-#[cfg(any(
-	feature = "transport-hpke",
-	all(feature = "transport-cms", feature = "transport-multiplex")
-))]
+#[cfg(any(feature = "transport-hpke", test))]
 impl<C: HandshakeCurve> CompressedPoint for PublicKey<C> {
 	type Curve = C;
 
@@ -1246,7 +1234,7 @@ where
 	/// - [`HandshakeError::InvalidPublicKey`] -- `sec1` is no point on the
 	///   curve in a form RFC 5480 §2.2 names.
 	/// - [`HandshakeError::ClientEphemeralIsStatic`] -- the point collapses into the client's static key.
-	#[cfg(feature = "transport-multiplex")]
+	#[cfg(mux_rekey)]
 	fn client_ephemeral(&self, sec1: &[u8]) -> Result<PeerPoint<C>, HandshakeError> {
 		let distinct = self.distinct_ephemeral(sec1)?;
 		distinct.ok_or(HandshakeError::ClientEphemeralIsStatic)
@@ -1303,8 +1291,8 @@ where
 /// The peer point, beside the base secret that follows its agreement output
 /// in the CMS flow, borrowed for one settlement.
 ///
-/// [`Self::hybrid`] builds one for the CMS flow and [`Self::ephemeral`] for
-/// the HPKE flow, and [`Self::settle`] is the one derivation of the
+/// [`Self::hybrid`] builds one for the CMS flow, [`Self::ephemeral`] builds
+/// one for the HPKE flow, and [`Self::settle`] is the one derivation of the
 /// [`HandshakeSecret`].
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub struct Agreement<'a, P: HandshakeProvider> {
@@ -1366,6 +1354,12 @@ impl DirectionalCiphers<RuntimeAead> {
 	/// rotation share. Each key is a key-encryption key of the size of the
 	/// provider's key wrap, the salt floor applies at every derivation, and the
 	/// [`TrafficSecret`] bound admits the handshake secret and its epoch chain.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::InsufficientSaltEntropy`] -- the salt is shorter than [`MIN_SALT_ENTROPY_BYTES`].
+	/// - [`HandshakeError::KdfError`] -- the KDF refused the key size.
+	/// - [`HandshakeError::KeyError`] -- the derived key is not the key size of the wrap of `P`.
 	pub(crate) fn derive<P, S>(secret: &S, salt: KdfSalt<'_>, epoch: u32) -> Result<Self, HandshakeError>
 	where
 		P: CryptoProvider<AeadCipher: ContentEncryption> + 'static,
@@ -1387,7 +1381,12 @@ impl DirectionalCiphers<RuntimeAead> {
 	}
 }
 
-/// Derive one direction's record key under the given KDF info label.
+/// Derive one direction's record key under the KDF info label `info`.
+///
+/// # Errors
+///
+/// - [`HandshakeError::KdfError`] -- the KDF refused `key_size`.
+/// - [`HandshakeError::KeyError`] -- the derived key is not the key size of the wrap of `P`.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 fn derive_labeled_key<P>(
 	input_key: &[u8],
@@ -1493,7 +1492,7 @@ impl<P: HandshakeProvider> Terms<P> {
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError::KdfError`] -- HKDF refused the length of the tag's key.
+	/// - [`HandshakeError`] -- the errors of [`HandshakeSecret::confirmation`].
 	pub(crate) fn confirmation(&self, secret: &HandshakeSecret) -> Result<KeyConfirmation, HandshakeError> {
 		secret.confirmation::<P>(self.kdf_salt(), self.transcript_hash())
 	}
@@ -1503,7 +1502,7 @@ impl<P: HandshakeProvider> Terms<P> {
 	///
 	/// # Errors
 	///
-	/// - The errors of [`HandshakeSecret::confirmed`].
+	/// - [`HandshakeError`] -- the errors of [`HandshakeSecret::confirmed`].
 	pub(crate) fn confirm(
 		&self,
 		secret: HandshakeSecret,
@@ -1517,7 +1516,7 @@ impl<P: HandshakeProvider> Terms<P> {
 	///
 	/// # Errors
 	///
-	/// - The errors of [`HandshakeSecret::server_confirmation`].
+	/// - [`HandshakeError`] -- the errors of [`HandshakeSecret::server_confirmation`].
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub(crate) fn server_confirmation(
 		&self,
@@ -1532,7 +1531,7 @@ impl<P: HandshakeProvider> Terms<P> {
 	///
 	/// # Errors
 	///
-	/// - The errors of [`HandshakeSecret::confirm_server`].
+	/// - [`HandshakeError`] -- the errors of [`HandshakeSecret::confirm_server`].
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub(crate) fn confirm_server(
 		&self,
@@ -1548,7 +1547,7 @@ impl<P: HandshakeProvider> Terms<P> {
 	///
 	/// # Errors
 	///
-	/// - The errors of [`HandshakeSecret::sealer`].
+	/// - [`HandshakeError`] -- the errors of [`HandshakeSecret::sealer`].
 	pub(crate) fn sealer(&self, secret: &HandshakeSecret, purpose: SecretSeal) -> Result<Sealer<P>, HandshakeError> {
 		secret.sealer::<P>(purpose, self.kdf_salt(), self.transcript_hash())
 	}
@@ -1619,26 +1618,27 @@ impl<P: HandshakeProvider> Agreed<P> {
 	/// under the protocol's salt.
 	///
 	/// - `keys` maps the directional ciphers to the keys of the calling role.
-	/// - A build with the mux rekey hands the epoch to the session.
+	/// - A build with the mux rekey derives the epoch and hands it to the session.
 	/// - The handshake secret drops when this returns.
 	///
 	/// # Errors
 	///
 	/// - [`HandshakeError::InsufficientSaltEntropy`] -- the salt is shorter than [`MIN_SALT_ENTROPY_BYTES`].
 	/// - [`HandshakeError::KdfError`] -- the KDF refused a key length.
-	/// - [`HandshakeError::InvalidKeyMaterialLength`] -- the cipher refused the derived key.
+	/// - [`HandshakeError::KeyError`] -- the derived key is not the key size of the wrap of `P`.
 	pub(crate) fn complete(
 		self,
 		keys: fn(DirectionalCiphers<RuntimeAead>) -> SessionKeys,
 	) -> Result<EstablishedSession, HandshakeError> {
 		let Self { terms, secret, receipt, peer } = self;
 		let salt = terms.kdf_salt();
+		#[cfg(mux_rekey)]
 		let epoch = EpochMaterials::derive::<P>(&secret, salt, terms.transcript_hash)?;
-		let ciphers = DirectionalCiphers::derive::<P, _>(&secret, salt, epoch.epoch)?;
+		let ciphers = DirectionalCiphers::derive::<P, _>(&secret, salt, HANDSHAKE_EPOCH)?;
 		let receipt = receipt.map(Arc::new);
 
 		let session = EstablishedSession::new(keys(ciphers), terms.mux, receipt, peer);
-		#[cfg(feature = "transport-multiplex")]
+		#[cfg(mux_rekey)]
 		let session = session.with_epoch(epoch);
 		Ok(session)
 	}
@@ -1711,7 +1711,7 @@ mod tests {
 		(peer, key)
 	}
 
-	/// The parse knows no static key, so any point of the curve parses as a
+	/// The parse reads the point alone, so any point of the curve parses as a
 	/// peer point.
 	#[test]
 	fn any_point_of_the_curve_parses_as_a_peer_point() -> Result<(), HandshakeError> {
@@ -1747,7 +1747,7 @@ mod tests {
 		assert!(matches!(refused, Err(HandshakeError::InvalidPublicKey(_))));
 	}
 
-	#[cfg(feature = "transport-multiplex")]
+	#[cfg(mux_rekey)]
 	#[test]
 	fn a_client_ephemeral_equal_to_the_client_static_key_is_refused() {
 		let (peer, static_key) = static_peer();
@@ -1757,7 +1757,7 @@ mod tests {
 		assert!(matches!(refused, Err(HandshakeError::ClientEphemeralIsStatic)));
 	}
 
-	#[cfg(feature = "transport-multiplex")]
+	#[cfg(mux_rekey)]
 	#[test]
 	fn a_client_ephemeral_other_than_the_static_key_is_admitted() -> Result<(), HandshakeError> {
 		let (peer, _static_key) = static_peer();
@@ -1771,7 +1771,7 @@ mod tests {
 
 	/// ECDH keeps the x-coordinate alone, so the negation of a static key
 	/// agrees to the secret the key itself agrees to.
-	#[cfg(feature = "transport-multiplex")]
+	#[cfg(mux_rekey)]
 	#[test]
 	fn the_negation_of_the_client_static_key_is_refused_as_its_ephemeral() {
 		let (peer, static_key) = static_peer();
@@ -1830,7 +1830,7 @@ mod tests {
 	///
 	/// Both endpoints derive this value, so the expected one is a literal that
 	/// no code of the crate computes.
-	#[cfg(feature = "transport-multiplex")]
+	#[cfg(mux_rekey)]
 	#[test]
 	fn the_epoch_chain_step_matches_its_known_answer() -> Result<(), HandshakeError> {
 		let epoch = EpochSecret(ZeroizingBytes::new(vec![0x42u8; 32]));
@@ -1849,7 +1849,7 @@ mod tests {
 	/// The server ephemeral leg of the pin known answers: every octet `0x02`,
 	/// at the width of a compressed secp256k1 point. The pin hashes the leg as
 	/// it is, so the octets name no point.
-	#[cfg(feature = "transport-multiplex")]
+	#[cfg(mux_rekey)]
 	fn pin_ephemeral_leg() -> sec1::CompressedPoint<Secp256k1> {
 		let mut leg = sec1::CompressedPoint::<Secp256k1>::default();
 		leg.fill(0x02);
@@ -1861,7 +1861,7 @@ mod tests {
 	///
 	/// The server signs this value and the client recomputes it, so the
 	/// expected one is a literal that no code of the crate computes.
-	#[cfg(feature = "transport-multiplex")]
+	#[cfg(mux_rekey)]
 	#[test]
 	fn the_exchange_pin_matches_its_known_answer() -> Result<(), HandshakeError> {
 		let secret = EpochSecret(ZeroizingBytes::new(vec![0x42u8; 32]));
@@ -1880,7 +1880,7 @@ mod tests {
 
 	/// The materials of an epoch whose chain hash is the 64 bytes of a
 	/// SHA3-512 transcript.
-	#[cfg(feature = "transport-multiplex")]
+	#[cfg(mux_rekey)]
 	fn wide_materials() -> EpochMaterials {
 		let secret = EpochSecret(ZeroizingBytes::new(vec![0x42u8; 32]));
 		let transcript_hash = fixture_transcript::<Sha3_512>([0x07u8; 64]);
@@ -1892,7 +1892,7 @@ mod tests {
 	///
 	/// The expected bytes come from an independent SHA3-512 (Python's
 	/// `hashlib`), so a chain hash cut to 32 bytes fails here.
-	#[cfg(feature = "transport-multiplex")]
+	#[cfg(mux_rekey)]
 	#[test]
 	fn a_sha3_512_exchange_pin_matches_its_known_answer() -> Result<(), HandshakeError> {
 		let leg = pin_ephemeral_leg();
@@ -1912,7 +1912,7 @@ mod tests {
 	///
 	/// The expected bytes come from an independent SHA3-512 (Python's
 	/// `hashlib`), so a chain hash cut to 32 bytes fails here.
-	#[cfg(feature = "transport-multiplex")]
+	#[cfg(mux_rekey)]
 	#[test]
 	fn a_sha3_512_chain_link_matches_its_known_answer() -> Result<(), HandshakeError> {
 		let link = wide_materials().advanced::<Sha3_512>(b"request der", b"response der", b"ack der")?;
@@ -2678,6 +2678,7 @@ mod tests {
 		assert_eq!(terms.kdf_salt().as_bytes(), [[0x01u8; 32], [0x02u8; 32]].concat());
 	}
 
+	#[cfg(mux_rekey)]
 	#[test]
 	fn test_derive_epoch_materials_shape() -> Result<(), HandshakeError> {
 		let salt = [0x99u8; 32];
@@ -2692,6 +2693,7 @@ mod tests {
 		Ok(())
 	}
 
+	#[cfg(mux_rekey)]
 	#[test]
 	fn test_derive_epoch_materials_is_deterministic() -> Result<(), HandshakeError> {
 		let salt = [0x99u8; 32];
@@ -2705,6 +2707,7 @@ mod tests {
 		Ok(())
 	}
 
+	#[cfg(mux_rekey)]
 	#[test]
 	fn test_derive_epoch_materials_separates_inputs() -> Result<(), HandshakeError> {
 		let salt = [0x99u8; 32];

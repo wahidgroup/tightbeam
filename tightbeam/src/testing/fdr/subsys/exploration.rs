@@ -1,14 +1,11 @@
 //! The exploration subsystem of FDR.
 //!
-//! The module holds the exploration engine and the helper functions of the
-//! FDR exploration loop. They handle state space traversal, seed management,
-//! and basic property verification.
+//! The module holds the exploration engine and the helper functions of the FDR
+//! exploration loop. They handle state space traversal, seed management, and
+//! the deadlock and divergence checks.
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
-
-#[cfg(feature = "testing-timing")]
-use core::time::Duration;
 
 use crate::testing::fdr::config::FdrConfig;
 use crate::testing::fdr::explorer::{ExplorationCore, ExplorationState, SeedResult, SeededRng};
@@ -18,7 +15,7 @@ use crate::testing::specs::csp::{Action, Event, Process, State};
 #[cfg(feature = "testing-fault")]
 use crate::testing::fdr::config::{FaultInjection, FaultModel, InjectedFaultRecord};
 #[cfg(feature = "testing-timing")]
-use crate::testing::timing::{TimingConstraint, TimingConstraints};
+use crate::testing::timing::TimingConstraints;
 
 /// The default exploration engine.
 pub struct DefaultExplorationEngine<'a> {
@@ -35,7 +32,7 @@ pub struct DefaultExplorationEngine<'a> {
 }
 
 impl<'a> DefaultExplorationEngine<'a> {
-	/// Create an exploration engine of `process` under `config`.
+	/// An exploration engine of `process` under `config`.
 	pub fn new(process: &'a Process, config: Arc<FdrConfig>) -> Self {
 		Self {
 			process,
@@ -46,27 +43,28 @@ impl<'a> DefaultExplorationEngine<'a> {
 		}
 	}
 
-	/// Get the seed results, for use by `FdrExplorer`.
+	/// The result of each seed that the engine recorded.
 	pub fn seed_results(&self) -> &[(u64, SeedResult)] {
 		&self.seed_results
 	}
 
-	/// Get the seed results mutably, for use by `FdrExplorer`.
+	/// A mutable view of the result of each seed that the engine recorded.
 	pub fn seed_results_mut(&mut self) -> &mut Vec<(u64, SeedResult)> {
 		&mut self.seed_results
 	}
 
-	/// Get the visited states, for use by `FdrExplorer`.
+	/// The states that exploration visited.
 	pub fn visited_states(&self) -> &HashSet<State> {
 		&self.visited_states
 	}
 
-	/// Get the visited states mutably, for use by `FdrExplorer`.
+	/// A mutable view of the states that exploration visited.
 	pub fn visited_states_mut(&mut self) -> &mut HashSet<State> {
 		&mut self.visited_states
 	}
 
-	/// Explore one seed, which runs its own schedule.
+	/// Explores one seed under its own RNG schedule, and adds its visited
+	/// states and its count of timing-pruned branches to the engine.
 	fn explore_seed_internal(&mut self, seed: u64) -> SeedResult {
 		let mut pruned = 0usize;
 		let result = Self::explore_seed_core(
@@ -109,9 +107,9 @@ impl<'a> DefaultExplorationEngine<'a> {
 
 	/// The exploration logic that the internal and the static forms share.
 	///
-	/// `timing_pruned` counts the branches dropped for WCET or deadline
-	/// violations, so model-level timing violations surface in the verdict
-	/// instead of silently vanishing from exploration.
+	/// `timing_pruned` counts the branches dropped for WCET, deadline, or path
+	/// WCET violations, so the verdict reports the model-level timing
+	/// violations that exploration pruned.
 	fn explore_seed_core<F>(
 		process: &Process,
 		config: &FdrConfig,
@@ -171,6 +169,11 @@ impl<'a> DefaultExplorationEngine<'a> {
 				continue;
 			}
 
+			// An action is enabled at these clocks when one of its edges has no
+			// guard or a guard that holds.
+			#[cfg(feature = "testing-timing")]
+			let actions = process.enabled_under(state.process_state, &state.clock_values);
+			#[cfg(not(feature = "testing-timing"))]
 			let actions = process.enabled(state.process_state);
 			if actions.is_empty() {
 				// A non-terminal state with no enabled action is a deadlock.
@@ -186,11 +189,10 @@ impl<'a> DefaultExplorationEngine<'a> {
 				failures.push((state.trace.clone(), refusals));
 			}
 
-			// Select the action, and retry past fault-suppressed transitions.
 			// An injected fault makes the chosen event fail, so exploration
-			// skips that transition and falls back to the remaining enabled
-			// actions. A state left with no usable action is a fault-induced
-			// deadlock (recovery failure).
+			// skips that transition and selects again from the remaining
+			// enabled actions. A state left with no usable action is a
+			// fault-induced deadlock (recovery failure).
 			#[cfg(feature = "testing-fault")]
 			let action = {
 				let mut candidates: Vec<&Action> = actions.iter().collect();
@@ -308,7 +310,7 @@ impl<'a> ExplorationCore for DefaultExplorationEngine<'a> {
 }
 
 impl<'a> DefaultExplorationEngine<'a> {
-	/// Compute the refusal set of `state`.
+	/// The refusal set of `state`.
 	///
 	/// The refusal set is every observable event minus the enabled observable
 	/// events. The set leaves out hidden events (τ-transitions), because a
@@ -335,7 +337,8 @@ impl<'a> DefaultExplorationEngine<'a> {
 			.collect()
 	}
 
-	/// Select the action at a choice point with the RNG.
+	/// Selects the action that exploration takes from `actions`, with the RNG
+	/// wherever more than one action is enabled.
 	#[cfg(not(feature = "testing-fault"))]
 	fn select_action_helper<'b>(
 		rng: &mut SeededRng,
@@ -356,7 +359,7 @@ impl<'a> DefaultExplorationEngine<'a> {
 		}
 	}
 
-	/// Select the action from a candidate list, in fault mode.
+	/// Selects the action from a candidate list, in fault mode.
 	///
 	/// It runs the policy of `select_action_helper` over the candidates that
 	/// remain after fault suppression removed the failing events.
@@ -374,7 +377,8 @@ impl<'a> DefaultExplorationEngine<'a> {
 		}
 	}
 
-	/// Check for a fault injection at the current (state, event) pair.
+	/// The fault record when the fault model holds an injection for this
+	/// `(state, event)` pair and the RNG draw fires it.
 	#[cfg(feature = "testing-fault")]
 	fn check_fault_injection(
 		fault_model: &FaultModel,
@@ -393,7 +397,7 @@ impl<'a> DefaultExplorationEngine<'a> {
 				let rng_value = rng.get_next();
 				if injection.should_inject(rng_value) {
 					let error = (injection.error_factory)();
-					// Only the rare injecting path clones the key.
+					// Only a path that injects a fault clones the key.
 					Some(InjectedFaultRecord {
 						csp_state: state_key_str.clone(),
 						event_label: event.0.to_string(),
@@ -406,11 +410,11 @@ impl<'a> DefaultExplorationEngine<'a> {
 			})
 	}
 
-	/// Execute a transition and enqueue the next states.
+	/// Executes a transition and queues the next states.
 	///
-	/// Exploration drops the branches that violate WCET or deadline
-	/// constraints, and each drop increments `timing_pruned`, so the verdict
-	/// records that timing-violating paths existed.
+	/// Exploration drops the branches that violate a WCET, deadline, or path
+	/// WCET constraint, and each drop increments `timing_pruned`, so the
+	/// verdict records that a path violated timing.
 	fn execute_transition_helper(
 		process: &Process,
 		state: &ExplorationState,
@@ -421,72 +425,22 @@ impl<'a> DefaultExplorationEngine<'a> {
 		#[cfg(not(feature = "testing-timing"))]
 		let _ = &timing_pruned;
 
+		// Each edge that the clocks allow is a branch, which resets the clocks
+		// that the edge names.
 		#[cfg(feature = "testing-timing")]
-		{
-			// Timed transitions, when present, check their timing guards.
-			if let Some(ref timed_transitions) = process.timed_transitions {
-				if let Some(transitions) = timed_transitions.get(&(state.process_state, action.event)) {
-					// A transition passes when the clocks satisfy its guard.
-					let valid_transitions: Vec<_> = transitions
-						.iter()
-						.filter(|tt| tt.guard_satisfied(&state.clock_values))
-						.collect();
+		let successors = process.successors(state.process_state, &action.event, &state.clock_values);
+		#[cfg(feature = "testing-timing")]
+		let branches = successors.map(|successor| {
+			let mut branch = state.branch();
+			branch.reset_clocks(successor.resets);
+			(branch, successor.to)
+		});
+		#[cfg(not(feature = "testing-timing"))]
+		let targets = process.step(state.process_state, &action.event);
+		#[cfg(not(feature = "testing-timing"))]
+		let branches = targets.into_iter().map(|to| (state.branch(), to));
 
-					if valid_transitions.is_empty() {
-						// With no satisfied guard, the branch prunes.
-						return;
-					}
-
-					for timed_trans in valid_transitions {
-						let mut next_exploration = state.branch();
-						let next_state = timed_trans.to;
-
-						// The transition resets the clocks it names.
-						next_exploration.reset_clocks(&timed_trans.reset_clocks);
-
-						if process.hidden.contains(&action.event) {
-							// This branch is a hidden (τ) transition.
-							next_exploration.record_hidden(action.event, next_state);
-						} else {
-							// This branch is an observable transition.
-							next_exploration.record_observable(action.event, next_state);
-
-							// Timing constraints add the WCET of the event.
-							if let Some(ref constraints) = process.timing_constraints {
-								let wcet = Self::lookup_wcet(&action.event, constraints);
-								if constraints.wcet_violated(&action.event, wcet) {
-									// A WCET violation prunes this branch.
-									*timing_pruned += 1;
-									continue;
-								}
-
-								next_exploration.update_timing(&action.event, wcet);
-								next_exploration.update_clocks(wcet);
-
-								// The deadline and path WCET checks run
-								// before the branch joins the queue.
-								if Self::check_timing_violations(&next_exploration, constraints) {
-									// A timing violation prunes this branch.
-									*timing_pruned += 1;
-									continue;
-								}
-							}
-						}
-
-						queue.push_back(next_exploration);
-					}
-
-					// The timed transitions handled the event, so the call
-					// skips the regular step below.
-					return;
-				}
-			}
-		}
-
-		// Regular transitions run when no timed transition exists or matches.
-		let next_states = process.step(state.process_state, &action.event);
-		for next_state in next_states {
-			let mut next_exploration = state.branch();
+		for (mut next_exploration, next_state) in branches {
 			if process.hidden.contains(&action.event) {
 				// This branch is a hidden (τ) transition.
 				next_exploration.record_hidden(action.event, next_state);
@@ -498,7 +452,7 @@ impl<'a> DefaultExplorationEngine<'a> {
 				#[cfg(feature = "testing-timing")]
 				{
 					if let Some(ref constraints) = process.timing_constraints {
-						let wcet = Self::lookup_wcet(&action.event, constraints);
+						let wcet = constraints.wcet_of(&action.event);
 						if constraints.wcet_violated(&action.event, wcet) {
 							// A WCET violation prunes this branch.
 							*timing_pruned += 1;
@@ -523,20 +477,7 @@ impl<'a> DefaultExplorationEngine<'a> {
 		}
 	}
 
-	/// Look up the WCET of `event` in the timing constraints.
-	#[cfg(feature = "testing-timing")]
-	fn lookup_wcet(event: &Event, constraints: &TimingConstraints) -> Duration {
-		if let Some(constraint) = constraints.get(event) {
-			match constraint {
-				TimingConstraint::Wcet(wcet_config) => wcet_config.duration,
-				_ => Duration::ZERO, // Jitter and deadlines add no WCET.
-			}
-		} else {
-			Duration::ZERO // An unconstrained event costs zero (conservative).
-		}
-	}
-
-	/// Check whether `state` violates the timing constraints.
+	/// Whether `state` violates the timing constraints.
 	#[cfg(feature = "testing-timing")]
 	fn check_timing_violations(state: &ExplorationState, constraints: &TimingConstraints) -> bool {
 		constraints.violated_by(&state.trace, state.elapsed_time, &state.event_times)

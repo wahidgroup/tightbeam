@@ -39,10 +39,7 @@ pub(crate) struct SessionPeer {
 	key: CanonicalKey,
 	/// The key-agreement certificate of a CMS server, whose key a rekey's
 	/// server ephemeral must differ from, as the handshake's did.
-	#[cfg(all(
-		feature = "transport-multiplex",
-		any(feature = "transport-cms", feature = "transport-hpke")
-	))]
+	#[cfg(mux_rekey)]
 	key_agreement: Option<Arc<Certificate>>,
 }
 
@@ -60,7 +57,7 @@ impl TryFrom<Arc<Certificate>> for SessionPeer {
 impl SessionPeer {
 	/// The peer of `certificate`, a certificate its signing use decoded: a
 	/// client, an HPKE server, or a CMS server's signing certificate, which a
-	/// multiplexing build pairs with its key-agreement certificate.
+	/// build with the mux rekey pairs with its key-agreement certificate.
 	///
 	/// - The signing use decoded the key with the parse of `P`, which the
 	///   [`Signing`] contract requires to refuse a point off the curve its key
@@ -71,7 +68,7 @@ impl SessionPeer {
 	///
 	/// # Errors
 	///
-	/// - The [`Self::recorded`] set.
+	/// - [`HandshakeError`] -- the errors of [`Self::recorded`].
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub(super) fn admitted<P: HandshakeProvider>(
 		certificate: &PeerCertificate<Signing<P>>,
@@ -84,8 +81,9 @@ impl SessionPeer {
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError::CertificateValidationError`] -- the key is an
-	///   `id-ecPublicKey` key that reads as no point under [`KeyCurves::HOUSE`].
+	/// - [`HandshakeError::CertificateValidationError`] -- the key reads as no
+	///   point under [`KeyCurves::HOUSE`]: an `id-ecPublicKey` key that reads
+	///   as its bits, or a key under `id-ecDH` or `id-ecMQV`.
 	/// - [`HandshakeError::DerError`] -- the DER encoder refuses the key.
 	#[cfg(any(test, feature = "transport-cms", feature = "transport-hpke"))]
 	fn recorded(certificate: Arc<Certificate>) -> Result<Self, HandshakeError> {
@@ -99,10 +97,7 @@ impl SessionPeer {
 		Ok(Self {
 			certificate,
 			key,
-			#[cfg(all(
-				feature = "transport-multiplex",
-				any(feature = "transport-cms", feature = "transport-hpke")
-			))]
+			#[cfg(mux_rekey)]
 			key_agreement: None,
 		})
 	}
@@ -110,10 +105,7 @@ impl SessionPeer {
 	/// This peer, the signing certificate of a CMS server, beside
 	/// `key_agreement`, the key-agreement certificate the admission paired
 	/// with it. It keeps the certificate and the key of this peer.
-	#[cfg(all(
-		feature = "transport-multiplex",
-		any(feature = "transport-cms", all(test, feature = "transport-hpke"))
-	))]
+	#[cfg(all(mux_rekey, any(feature = "transport-cms", test)))]
 	pub(super) fn with_key_agreement(self, key_agreement: Arc<Certificate>) -> Self {
 		Self { key_agreement: Some(key_agreement), ..self }
 	}
@@ -121,11 +113,11 @@ impl SessionPeer {
 	/// A CMS server of `certificate`, its signing certificate, beside
 	/// `key_agreement`, the key-agreement certificate paired with it, for a
 	/// test that builds a session.
-	#[cfg(all(
-		test,
-		feature = "transport-multiplex",
-		any(feature = "transport-cms", feature = "transport-hpke")
-	))]
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError`] -- the errors of [`Self::recorded`].
+	#[cfg(all(test, mux_rekey))]
 	pub(crate) fn paired(
 		certificate: Arc<Certificate>,
 		key_agreement: Arc<Certificate>,
@@ -145,11 +137,9 @@ impl SessionPeer {
 		&self.key
 	}
 
-	/// The key-agreement certificate of a CMS server.
-	#[cfg(all(
-		feature = "transport-multiplex",
-		any(feature = "transport-cms", feature = "transport-hpke")
-	))]
+	/// The key-agreement certificate the admission paired with a CMS server,
+	/// or `None` when it paired none.
+	#[cfg(mux_rekey)]
 	pub(crate) fn key_agreement(&self) -> Option<&Certificate> {
 		self.key_agreement.as_deref()
 	}

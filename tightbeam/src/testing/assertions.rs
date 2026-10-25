@@ -1,7 +1,8 @@
-//! Assertion contracts for the testing framework
+//! Assertion contracts for the testing framework.
 //!
-//! Runtime recording types live in `crate::trace`. This module re-exports them
-//! and provides `AssertionContract` for spec verification.
+//! The runtime recording types live in [`crate::trace`]. This module
+//! re-exports them and holds [`AssertionContract`], the requirement a spec
+//! checks against the recorded assertions.
 
 #[cfg(not(feature = "std"))]
 use alloc::{string::String, vec::Vec};
@@ -9,11 +10,16 @@ use alloc::{string::String, vec::Vec};
 use crate::testing::macros::Cardinality;
 pub use crate::trace::{Assertion, AssertionLabel, AssertionValue, IsNone, IsSome, Presence, RatioLimit};
 
+/// A count and value requirement that a spec places on one assertion label.
 #[derive(Clone, Debug)]
 pub struct AssertionContract {
+	/// The label an assertion must carry to count toward this contract.
 	pub label: AssertionLabel,
+	/// The tags a counted assertion must all carry, or `None` for any tags.
 	pub tag_filter: Option<Vec<&'static str>>,
+	/// The number of counted assertions that satisfies this contract.
 	pub cardinality: Cardinality,
+	/// The value every counted assertion must carry, or `None` for any value.
 	pub expected_value: Option<AssertionValue>,
 }
 
@@ -37,12 +43,12 @@ impl AssertionContract {
 		let matching: Vec<_> = assertions
 			.iter()
 			.filter(|a| {
-				// Match label (supports tightbeam URN shorthand)
+				// A label matches only by exact URN identity.
 				if !a.label.matches(&self.label) {
 					return false;
 				}
 
-				// Tag matching: if spec has tag_filter, assertion must have all those tags
+				// The assertion must carry every tag of the filter.
 				if let Some(ref filter_tags) = self.tag_filter {
 					for filter_tag in filter_tags {
 						if !a.tags.contains(filter_tag) {
@@ -55,14 +61,12 @@ impl AssertionContract {
 			})
 			.collect();
 
-		// Check cardinality
 		if !self.cardinality.is_satisfied_by(matching.len()) {
 			return false;
 		}
 
-		// Check value constraint if present
 		if let Some(ref expected) = self.expected_value {
-			// All matching assertions must have the expected value
+			// Every matching assertion must carry the expected value.
 			matching.iter().all(|a| a.value.as_ref() == Some(expected))
 		} else {
 			true
@@ -82,9 +86,4 @@ impl AssertionContract {
 			format!("{cardinality_desc}{tag_desc}")
 		}
 	}
-}
-
-// Re-export cardinality functions via nested module for legacy calls
-pub mod cardinality {
-	pub use crate::testing::macros::{absent, at_least, at_most, between, exactly, present};
 }

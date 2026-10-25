@@ -5,10 +5,10 @@
 //!
 //! - Processes communicate through events (message passing).
 //! - Observable events are visible, and hidden events (τ) are internal.
-//! - Nondeterministic choice allows several possible behaviors.
-//! - Labeled Transition Systems (LTS) represent process behavior.
+//! - A nondeterministic choice lets one event lead to more than one state.
+//! - A labeled transition system (LTS) represents the behavior of a process.
 //!
-//! Requires the `testing-csp` feature.
+//! The module requires the `testing-csp` feature.
 //!
 //! # Sources
 //!
@@ -19,7 +19,10 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
-#[cfg(feature = "testing-schedulability")]
+#[cfg(any(
+	feature = "testing-schedulability",
+	all(feature = "testing-timing", any(test, feature = "testing-fdr"))
+))]
 use core::time::Duration;
 
 use crate::der::{Decode, DecodeValue, EncodeValue, Tag, Tagged};
@@ -36,15 +39,15 @@ use crate::Errorizable;
 
 pub use super::lts::{Action, Alphabet, CspValidationResult, CspViolation, Event, State};
 
-/// Intern pool for CSP state/event names constructed at runtime.
+/// The intern pool for CSP state and event names built at runtime.
 ///
-/// The engine keys [`State`]/[`Event`] on `&'static str` for `Copy`
-/// ergonomics, so runtime-built names (product states, decoded events,
-/// owned assertion labels) must be promoted to `'static`. Interning
-/// deduplicates before leaking (CWE-401).
+/// The engine keys [`State`] and [`Event`] on `&'static str` so both stay
+/// `Copy`. A name built at runtime (a product state, a decoded event, or an
+/// owned assertion label) must therefore become `'static`. The pool
+/// deduplicates the names, so each distinct name leaks once (CWE-401).
 static INTERN_POOL: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
 
-/// Promote a runtime string to `&'static str` via the intern pool.
+/// Promotes a runtime string to `&'static str` through [`INTERN_POOL`].
 pub(crate) fn intern<S>(name: S) -> &'static str
 where
 	S: AsRef<str> + Into<String>,
@@ -73,9 +76,8 @@ impl From<&Urn<'_>> for Event {
 	}
 }
 
-// Manual ASN.1 encoding/decoding for Event
-// Encodes &'static str as UTF8String, decodes as String (which can be
-// converted to Event via From<String>)
+// An `Event` encodes as a DER UTF8String. The decoder interns the decoded
+// name, because `Event` holds a `&'static str`.
 impl Tagged for Event {
 	fn tag(&self) -> Tag {
 		Tag::Utf8String
@@ -84,13 +86,11 @@ impl Tagged for Event {
 
 impl EncodeValue for Event {
 	fn value_len(&self) -> crate::der::Result<Length> {
-		// Convert &'static str to String for encoding
 		let s: String = self.0.to_string();
 		s.value_len()
 	}
 
 	fn encode_value(&self, encoder: &mut impl Writer) -> crate::der::Result<()> {
-		// Convert &'static str to String for encoding
 		let s: String = self.0.to_string();
 		s.encode_value(encoder)
 	}
@@ -113,14 +113,17 @@ impl<'a> Decode<'a> for Event {
 /// A CSP transition: an event that takes one state to another.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transition {
+	/// The state the transition leaves.
 	pub from: State,
+	/// The action that labels the transition.
 	pub action: Action,
+	/// The state the transition enters.
 	pub to: State,
 }
 
 /// The transition relation, from a state and an event to its target states.
 ///
-/// A state and event may have several targets, which is nondeterminism.
+/// A state and event may have more than one target, which is nondeterminism.
 #[derive(Debug, Clone)]
 pub struct TransitionRelation {
 	/// Target states for each source state and event.
@@ -147,7 +150,7 @@ impl TransitionRelation {
 		self.transitions.get(&(from, *event)).map(|v| v.len() > 1).unwrap_or(false)
 	}
 
-	/// Iterate over all `((from, event), targets)` entries.
+	/// Iterate over every `((from, event), targets)` entry.
 	pub fn iter(&self) -> impl Iterator<Item = (&(State, Event), &Vec<State>)> {
 		self.transitions.iter()
 	}
@@ -162,7 +165,7 @@ impl Default for TransitionRelation {
 /// What a process is evidence of.
 ///
 /// The stable failures and failures-divergences models need the subject's
-/// refusals, which a specification states and a log does not.
+/// refusals, and only a specification states them.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum Observation {
 	/// A process written as a specification.
@@ -180,24 +183,24 @@ impl Observation {
 	}
 }
 
-/// CSP Process (Labeled Transition System)
+/// A CSP process, held as a labeled transition system (LTS).
 ///
-/// Represents a process as an LTS with:
-/// - Observable alphabet (external events)
-/// - Hidden alphabet (internal τ events)
-/// - Transition relation
-/// - Nondeterministic choice points
-/// - Timing constraints (optional, for real-time verification)
+/// The LTS has these parts:
+/// - An observable alphabet of external events.
+/// - A hidden alphabet of internal τ events.
+/// - A transition relation.
+/// - The nondeterministic choice points.
+/// - The timing constraints for real-time verification, when the process has them.
 ///
-/// `#[non_exhaustive]` because [`ProcessBuilder`] is the only construction
-/// that establishes the invariants between the fields.
+/// The type is `#[non_exhaustive]` because [`ProcessBuilder`] is the only
+/// construction that establishes the invariants between the fields.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Process {
-	/// Human-readable name
+	/// The human-readable name of the process.
 	pub name: &'static str,
 
-	/// What this process is evidence of, set where it is built
+	/// What this process is evidence of. The code that builds it sets it.
 	pub observation: Observation,
 
 	/// Whether a run that records no event in this alphabet is a violation.
@@ -207,56 +210,72 @@ pub struct Process {
 	/// unless a scenario states that doing nothing is the behavior it models.
 	pub requires_progress: bool,
 
-	/// Initial state
+	/// The state the process starts in.
 	pub initial: State,
 
-	/// All states
+	/// Every state of the process.
 	pub states: HashSet<State>,
 
-	/// Terminal states (STOP)
+	/// The terminal (accepting) states. One with no enabled action is a STOP.
 	pub terminal: HashSet<State>,
 
-	/// Nondeterministic choice points
+	/// The nondeterministic choice points, where one event may lead to more
+	/// than one state.
 	pub choice: HashSet<State>,
 
-	/// Observable alphabet (Σ)
+	/// The observable alphabet (Σ) of external events.
 	pub observable: HashSet<Event>,
 
-	/// Hidden alphabet (τ)
+	/// The hidden alphabet (τ) of internal events.
 	pub hidden: HashSet<Event>,
 
-	/// Transition relation
+	/// The transition relation of the untimed transitions.
 	pub transitions: TransitionRelation,
 
-	/// Optional description
+	/// The description of the process, when its spec gives one.
 	pub description: Option<&'static str>,
 
-	/// Timing constraints for real-time verification
+	/// The timing constraints that real-time verification checks.
 	#[cfg(feature = "testing-timing")]
 	pub timing_constraints: Option<TimingConstraints>,
 
-	/// Optional timed transitions with timing guards
+	/// The timed transitions, keyed by source state and event.
+	///
+	/// Each one is an edge of the process. Its guard decides where FDR
+	/// exploration takes it.
 	#[cfg(feature = "testing-timing")]
 	pub timed_transitions: Option<HashMap<(State, Event), Vec<TimedTransition>>>,
 
-	/// Period mapping for schedulability analysis
-	/// Combined with timing_constraints to form TaskSet
+	/// The scheduler and the period of each event for schedulability analysis.
+	/// [`Self::generate_task_set`] combines them with the timing constraints
+	/// into a [`TaskSet`].
 	#[cfg(feature = "testing-schedulability")]
 	pub schedulability_periods: Option<(SchedulerType, HashMap<Event, Duration>)>,
 }
 
+/// An edge that the clocks allow, and the clocks it resets.
+#[cfg(all(feature = "testing-timing", any(test, feature = "testing-fdr")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Successor<'a> {
+	/// The state the edge leads to.
+	pub(crate) to: State,
+
+	/// The clocks that the edge resets when it is taken.
+	pub(crate) resets: &'a [String],
+}
+
 impl Process {
-	/// Create new Process builder
+	/// Creates a [`ProcessBuilder`] for a process named `name`.
 	pub fn builder(name: &'static str) -> ProcessBuilder {
 		ProcessBuilder::new(name)
 	}
 
-	/// Get observable alphabet
+	/// Returns the observable alphabet (Σ).
 	pub fn observable_alphabet(&self) -> &HashSet<Event> {
 		&self.observable
 	}
 
-	/// Get hidden alphabet
+	/// Returns the hidden alphabet (τ).
 	pub fn hidden_alphabet(&self) -> &HashSet<Event> {
 		&self.hidden
 	}
@@ -290,28 +309,38 @@ impl Process {
 	}
 
 	/// The states that `event` takes `state` to.
+	///
+	/// A timed transition takes `state` to its target whatever the clocks
+	/// read.
 	pub fn step(&self, state: State, event: &Event) -> Vec<State> {
-		self.transitions.targets(state, event).map(|v| v.to_vec()).unwrap_or_default()
+		let untimed = self.transitions.targets(state, event).unwrap_or_default();
+
+		#[cfg(feature = "testing-timing")]
+		let timed = self.timed_edges(state, event).iter().map(|edge| edge.to);
+		#[cfg(not(feature = "testing-timing"))]
+		let timed = core::iter::empty();
+
+		untimed.iter().copied().chain(timed).collect()
 	}
 
-	/// Get enabled actions from state
+	/// Returns the actions that `state` enables.
 	///
-	/// Sorted by event name (observable before hidden on a name collision)
-	/// so violation reports and byte-driven exploration are reproducible
-	/// regardless of `HashSet` iteration order.
+	/// The actions are sorted by event name, observable before hidden on a
+	/// name collision, so violation reports and byte-driven exploration are
+	/// reproducible whatever the `HashSet` iteration order.
+	///
+	/// A timed transition enables its event whatever the clocks read.
 	pub fn enabled(&self, state: State) -> Vec<Action> {
 		let mut actions = Vec::new();
 
-		// Observable actions
 		for event in &self.observable {
-			if self.transitions.targets(state, event).is_some() {
+			if self.has_edge(state, event) {
 				actions.push(Action { event: *event, alphabet: Alphabet::Observable });
 			}
 		}
 
-		// Hidden actions
 		for event in &self.hidden {
-			if self.transitions.targets(state, event).is_some() {
+			if self.has_edge(state, event) {
 				actions.push(Action { event: *event, alphabet: Alphabet::Hidden });
 			}
 		}
@@ -320,24 +349,86 @@ impl Process {
 		actions
 	}
 
-	/// Check if state is terminal (STOP)
+	/// Whether `event` takes `state` to a state, whatever the clocks read.
+	fn has_edge(&self, state: State, event: &Event) -> bool {
+		#[cfg(feature = "testing-timing")]
+		let timed = !self.timed_edges(state, event).is_empty();
+		#[cfg(not(feature = "testing-timing"))]
+		let timed = false;
+
+		timed || self.transitions.targets(state, event).is_some()
+	}
+
+	/// The timed transitions that `event` labels at `state`.
+	#[cfg(feature = "testing-timing")]
+	pub(crate) fn timed_edges(&self, state: State, event: &Event) -> &[TimedTransition] {
+		let table = self.timed_transitions.as_ref();
+		let edges = table.and_then(|table| table.get(&(state, *event)));
+
+		edges.map(Vec::as_slice).unwrap_or_default()
+	}
+
+	/// Whether this process holds a timed transition.
+	#[cfg(feature = "testing-timing")]
+	pub(crate) fn has_timed_transitions(&self) -> bool {
+		self.timed_transitions.as_ref().is_some_and(|table| !table.is_empty())
+	}
+
+	/// The edges that `event` takes from `state` while the clocks read
+	/// `clocks`.
+	///
+	/// An untimed edge is always a successor, and it resets no clock. A timed
+	/// edge is a successor where `clocks` satisfy its guard, and it resets the
+	/// clocks it names.
+	#[cfg(all(feature = "testing-timing", any(test, feature = "testing-fdr")))]
+	pub(crate) fn successors<'a>(
+		&'a self,
+		state: State,
+		event: &Event,
+		clocks: &'a HashMap<String, Duration>,
+	) -> impl Iterator<Item = Successor<'a>> + 'a {
+		let untimed = self.transitions.targets(state, event).unwrap_or_default();
+		let untimed = untimed.iter().map(|to| Successor { to: *to, resets: &[] });
+		let edges = self.timed_edges(state, event);
+		let allowed = edges.iter().filter(move |edge| edge.guard_satisfied(clocks));
+		let timed = allowed.map(|edge| Successor { to: edge.to, resets: &edge.reset_clocks });
+
+		untimed.chain(timed)
+	}
+
+	/// The actions of `state` that have a successor while the clocks read
+	/// `clocks`.
+	///
+	/// A state whose every action a guard refuses offers no action, so FDR
+	/// exploration finds a deadlock there.
+	#[cfg(all(feature = "testing-timing", feature = "testing-fdr"))]
+	pub(crate) fn enabled_under(&self, state: State, clocks: &HashMap<String, Duration>) -> Vec<Action> {
+		let mut actions = self.enabled(state);
+		actions.retain(|action| self.successors(state, &action.event, clocks).next().is_some());
+
+		actions
+	}
+
+	/// Whether `state` is a terminal (accepting) state.
 	pub fn is_terminal(&self, state: State) -> bool {
 		self.terminal.contains(&state)
 	}
 
-	/// Check if state is nondeterministic choice point
+	/// Whether `state` is a declared nondeterministic choice point.
 	pub fn is_choice(&self, state: State) -> bool {
 		self.choice.contains(&state)
 	}
 
-	/// Structural digest over the LTS: initial state, sorted states,
-	/// terminals, choice points, alphabets, and transition triples.
+	/// A digest of the LTS structure: the initial state, the sorted states,
+	/// the terminals, the choice points, the alphabets, and the triples of the
+	/// untimed and the timed transitions.
 	///
-	/// - Two processes share a digest iff they have identical structure, so it is a sound
-	///   memoization key where `name` is not. Algebra operators such as `hide` and `rename` produce
-	///   constant names for structurally different results.
-	/// - The digest is stable only within one program run, because `DefaultHasher` seeds vary
-	///   across runs. Do not persist it.
+	/// - Two processes share a digest if and only if they have identical
+	///   structure, so the digest is a sound memoization key where `name` is
+	///   not. Algebra operators such as `hide` and `rename` give the same name
+	///   to structurally different results.
+	/// - The digest is stable only within one program run, because the
+	///   `DefaultHasher` seeds vary across runs. Do not persist it.
 	pub fn structure_digest(&self) -> u64 {
 		use core::hash::{Hash, Hasher};
 		use std::collections::hash_map::DefaultHasher;
@@ -360,27 +451,34 @@ impl Process {
 		sorted_names(self.observable.iter().map(|e| e.0)).hash(&mut hasher);
 		sorted_names(self.hidden.iter().map(|e| e.0)).hash(&mut hasher);
 
-		let mut triples: Vec<(&str, &str, &str)> = self
-			.transitions
-			.iter()
-			.flat_map(|((from, event), targets)| targets.iter().map(move |to| (from.0, event.0, to.0)))
-			.collect();
+		let untimed = self.transitions.iter();
+		let untimed = untimed.flat_map(|(key, targets)| targets.iter().map(move |to| (key, *to)));
+
+		#[cfg(feature = "testing-timing")]
+		let timed = self.timed_transitions.iter().flatten();
+		#[cfg(feature = "testing-timing")]
+		let timed = timed.flat_map(|(key, edges)| edges.iter().map(move |edge| (key, edge.to)));
+		#[cfg(not(feature = "testing-timing"))]
+		let timed = core::iter::empty();
+
+		let edges = untimed.chain(timed);
+		let mut triples: Vec<(&str, &str, &str)> = edges.map(|((from, event), to)| (from.0, event.0, to.0)).collect();
 		triples.sort_unstable();
 		triples.hash(&mut hasher);
 
 		hasher.finish()
 	}
 
-	/// Generate TaskSet from timing constraints and schedulability periods
+	/// Builds the [`TaskSet`] of the timing constraints and the schedulability
+	/// periods.
 	///
-	/// A process that declares no schedulability block has no task set, which
-	/// is what `Ok(None)` reports.
+	/// A process that declares no schedulability block has no task set, so
+	/// the call returns `Ok(None)`.
 	///
 	/// # Errors
 	///
-	/// - [`SchedulabilityError::EmptyTaskSet`] -- the process declares periods
-	///   and no execution times, so every task it names is unanalysable.
-	/// - [`SchedulabilityError`] from task-set generation itself.
+	/// - [`SchedulabilityError::EmptyTaskSet`] -- the process declares periods and no timing constraints.
+	/// - [`SchedulabilityError::MissingPeriod`] -- a WCET constraint names an event that has no period.
 	#[cfg(feature = "testing-schedulability")]
 	pub fn generate_task_set(&self) -> Result<Option<TaskSet>, SchedulabilityError> {
 		let Some((scheduler, periods)) = &self.schedulability_periods else {
@@ -396,29 +494,30 @@ impl Process {
 	}
 }
 
-/// Trait for CSP process specifications that can be validated against traces
+/// A CSP process specification that a trace can be validated against.
 pub trait ProcessSpec {
-	/// Validate a trace against this process specification
+	/// Validate a trace against this process specification.
 	fn validate_trace(&self, trace: &ConsumedTrace) -> CspValidationResult;
 
-	/// Get the underlying Process for FDR exploration
+	/// Returns the [`Process`] that FDR exploration walks.
 	///
-	/// Returns `Cow<Process>` to support both:
-	/// - Borrowed: For `Process` itself
-	/// - Owned: For CompositionSpec ZSTs that construct the process
+	/// The result is a `Cow` because a process comes from one of two sources:
+	/// - A [`Process`] lends itself as a borrowed process.
+	/// - A [`CompositionSpec`](super::composition::CompositionSpec) ZST builds an owned process.
 	fn to_process_cow(&self) -> Cow<'_, Process>;
 }
 
 impl Process {
 	/// Validate a consumed trace against this CSP process.
 	///
-	/// - A trace is a sequence over the observable alphabet, so each event is matched there, and τ
-	///   transitions are taken silently by τ-closure first. An event only enabled as hidden is
+	/// - A trace is a sequence over the observable alphabet, so the check
+	///   matches each event there after a τ-closure takes the τ transitions
+	///   silently. An event that only a hidden action enables is a
 	///   [`CspViolation::EventNotEnabled`].
-	/// - Candidate states are tracked as a set, so every branch of a nondeterministic choice is
-	///   followed at once.
-	/// - Multiple targets are legal only at a state registered through
-	///   [`ProcessBuilder::add_choice`]. Elsewhere they are
+	/// - The check tracks the candidate states as a set, so it follows every
+	///   branch of a nondeterministic choice at once.
+	/// - More than one target is legal only at a state that
+	///   [`ProcessBuilder::add_choice`] registers. Elsewhere it is a
 	///   [`CspViolation::NondeterministicChoice`].
 	pub fn validate_trace(&self, trace: &ConsumedTrace) -> CspValidationResult {
 		let mut violations = Vec::new();
@@ -426,7 +525,7 @@ impl Process {
 
 		// Project the trace onto this process's alphabet by exact URN
 		// identity, as Hoare's restriction `tr ↾ A` does. A label outside the
-		// alphabet is outside what this process specifies, not a violation.
+		// alphabet falls outside this specification, so the check drops it.
 		let events: Vec<Event> = trace
 			.assertions
 			.iter()
@@ -445,9 +544,10 @@ impl Process {
 			let closure = self.tau_closure(&current_states);
 			let action = Action { event: *event, alphabet: Alphabet::Observable };
 
-			// Termination check: every candidate is a true STOP - terminal
-			// with no enabled actions. Accepting states that still offer
-			// transitions (cyclic `terminal { Idle }` models) stay live.
+			// The run has terminated when every candidate is a true STOP, a
+			// terminal state with no enabled action. An accepting state that
+			// still offers a transition (a cyclic `terminal { Idle }` model)
+			// stays live.
 			if closure
 				.iter()
 				.all(|state| self.is_terminal(*state) && self.enabled(*state).is_empty())
@@ -459,7 +559,7 @@ impl Process {
 				continue;
 			}
 
-			// Step on the observable event from every candidate state
+			// Step on the observable event from each candidate that enables it.
 			let mut seen = HashSet::new();
 			let mut next_states = Vec::new();
 			for state in closure.iter().filter(|state| self.enabled(**state).contains(&action)) {
@@ -501,8 +601,9 @@ impl Process {
 		CspValidationResult { valid: violations.is_empty(), violations }
 	}
 
-	/// All states reachable from `states` via hidden (τ) transitions only,
-	/// including the input states. Worklist traversal, no recursion.
+	/// Every state that hidden (τ) transitions alone reach from `states`, with
+	/// the input states included. A worklist walks them, so a deep chain costs
+	/// no stack.
 	pub(crate) fn tau_closure(&self, states: impl AsRef<[State]>) -> Vec<State> {
 		let states = states.as_ref();
 		let mut closure: Vec<State> = states.to_vec();
@@ -523,8 +624,8 @@ impl Process {
 		closure
 	}
 
-	/// Union of enabled actions across a state set, deduplicated and sorted
-	/// for reproducible violation reports
+	/// The union of the actions that `states` enable, deduplicated and sorted
+	/// so violation reports are reproducible.
 	fn enabled_from_set(&self, states: impl AsRef<[State]>) -> Vec<Action> {
 		let states = states.as_ref();
 		let mut actions: Vec<Action> = Vec::new();
@@ -551,15 +652,15 @@ impl ProcessSpec for Process {
 	}
 }
 
-/// Error building a [`Process`] from a [`ProcessBuilder`]
+/// An error from building a [`Process`] with a [`ProcessBuilder`].
 #[derive(Errorizable, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessBuildError {
-	/// [`ProcessBuilder::initial_state`] was never called
+	/// No call to [`ProcessBuilder::initial_state`] set the initial state.
 	#[error("initial state not set")]
 	MissingInitialState,
 }
 
-/// Builder for CSP Process
+/// The builder of a CSP [`Process`].
 #[derive(Debug)]
 pub struct ProcessBuilder {
 	name: &'static str,
@@ -604,8 +705,8 @@ impl ProcessBuilder {
 
 	/// Accepts a run that records no event in this process's alphabet.
 	///
-	/// Only for a process whose modelled behavior is to do nothing. Every
-	/// other process rejects such a run, because a trace that takes no
+	/// Use it only for a process whose modelled behavior is to do nothing.
+	/// Every other process rejects such a run, because a trace that takes no
 	/// transition satisfies every process.
 	pub fn permits_no_progress(mut self) -> Self {
 		self.requires_progress = false;
@@ -662,6 +763,34 @@ impl ProcessBuilder {
 		self
 	}
 
+	/// Add a transition that `guard` enables, and that resets `reset_clocks`
+	/// when it is taken.
+	///
+	/// Where the guard binds depends on the check:
+	///
+	/// - [`Process::enabled`] and [`Process::step`] offer `event` at `from` whatever the clocks read.
+	/// - The CSP trace check and the refinement checks ignore the clocks and accept the event at any time.
+	/// - FDR exploration takes the transition only where the clocks satisfy the guard.
+	/// - Exploration starts each clock unset, and a guard on an unset clock does not hold.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use core::time::Duration;
+	///
+	/// use tightbeam::testing::specs::csp::{Event, Process, State};
+	/// use tightbeam::testing::timing::TimingGuard;
+	///
+	/// let guard = TimingGuard::ClockLessEqual("clk".to_string(), Duration::from_millis(5));
+	/// let process = Process::builder("Guarded")
+	///     .initial_state(State("S0"))
+	///     .add_observable(Event("arm"))
+	///     .add_timed_transition(State("S0"), Event("arm"), State("S1"), Some(guard), ["clk".to_string()])
+	///     .build()?;
+	///
+	/// assert_eq!(process.step(State("S0"), &Event("arm")), [State("S1")]);
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
 	#[cfg(feature = "testing-timing")]
 	pub fn add_timed_transition(
 		mut self,
@@ -672,6 +801,7 @@ impl ProcessBuilder {
 		reset_clocks: impl IntoIterator<Item = String>,
 	) -> Self {
 		let reset_clocks: Vec<String> = reset_clocks.into_iter().collect();
+		self = self.add_state(from).add_state(to);
 		if self.timed_transitions.is_none() {
 			self.timed_transitions = Some(HashMap::new());
 		}
@@ -753,8 +883,8 @@ mod tests {
 	#[cfg(all(feature = "tcp", feature = "tokio"))]
 	use crate::{exactly, servlet, tb_assert_spec, tb_process_spec, tb_scenario};
 
-	/// A spec that models `start` and `send` observably and `prepare`
-	/// internally, and says nothing about anything else.
+	/// A spec that models `start` and `send` as observable and `prepare` as
+	/// hidden, and leaves every other event out of both alphabets.
 	fn alphabet_spec() -> Result<Process, ProcessBuildError> {
 		Process::builder("AlphabetSpec")
 			.initial_state(State("S0"))
@@ -1012,22 +1142,52 @@ mod tests {
 		Ok(())
 	}
 
+	#[cfg(feature = "testing-timing")]
+	#[test]
+	fn the_structure_digest_covers_a_timed_transition() -> Result<(), ProcessBuildError> {
+		let without = Process::builder("Digest")
+			.initial_state(State("S0"))
+			.add_state(State("S1"))
+			.add_observable(Event("arm"))
+			.build()?;
+		let with = Process::builder("Digest")
+			.initial_state(State("S0"))
+			.add_observable(Event("arm"))
+			.add_timed_transition(State("S0"), Event("arm"), State("S1"), None, Vec::new())
+			.build()?;
+
+		assert_ne!(without.structure_digest(), with.structure_digest());
+		Ok(())
+	}
+
+	#[cfg(feature = "testing-timing")]
+	#[test]
+	fn a_timed_transition_adds_its_states() -> Result<(), ProcessBuildError> {
+		let process = Process::builder("States")
+			.initial_state(State("S0"))
+			.add_timed_transition(State("S1"), Event("arm"), State("S2"), None, Vec::new())
+			.build()?;
+
+		assert_eq!(process.states, HashSet::from([State("S0"), State("S1"), State("S2")]));
+		Ok(())
+	}
+
 	#[test]
 	fn handshake_process_example() -> Result<(), Box<dyn core::error::Error>> {
-		// CSP handshake with queued or direct send
+		// A CSP handshake that sends either directly or through a queue.
 		let proc = Process::builder("Handshake")
 			.initial_state(State("S0"))
-			// Observable alphabet
+			// Σ holds the four events an observer sees.
 			.add_observable(Event("start"))
 			.add_observable(Event("send"))
 			.add_observable(Event("ack"))
 			.add_observable(Event("fail"))
-			// Hidden alphabet (τ)
+			// τ holds the four internal steps.
 			.add_hidden(Event("serialize"))
 			.add_hidden(Event("encrypt"))
 			.add_hidden(Event("queue"))
 			.add_hidden(Event("dispatch"))
-			// Transitions
+			// S1 branches to a direct send (S1s) or a queued send (S1q).
 			.add_transition(State("S0"), Event("start"), State("S1"))
 			.add_transition(State("S1"), Event("serialize"), State("S1s"))
 			.add_transition(State("S1"), Event("queue"), State("S1q"))
@@ -1037,45 +1197,39 @@ mod tests {
 			.add_transition(State("S1d"), Event("send"), State("S2"))
 			.add_transition(State("S2"), Event("ack"), State("S3"))
 			.add_transition(State("S2"), Event("fail"), State("S3f"))
-			// Terminal states (STOP)
+			// S3 is the success STOP and S3f the failure STOP.
 			.add_terminal(State("S3"))
 			.add_terminal(State("S3f"))
-			// Nondeterministic choice
+			// S1 is a declared choice point, so both branches are legal.
 			.add_choice(State("S1"))
 			.description("Queued or direct send")
 			.build()?;
 
-		// Verify initial state
 		assert_eq!(proc.initial, State("S0"));
 
-		// Verify nondeterministic choice at S1
 		assert!(proc.is_choice(State("S1")));
 		let s1_enabled = proc.enabled(State("S1"));
 		assert_eq!(s1_enabled.len(), 2); // serialize, queue
 
-		// Verify observable alphabet
 		assert_eq!(proc.observable_alphabet().len(), 4);
 		assert!(proc.observable_alphabet().contains(&Event("start")));
 		assert!(proc.observable_alphabet().contains(&Event("send")));
 		assert!(proc.observable_alphabet().contains(&Event("ack")));
 		assert!(proc.observable_alphabet().contains(&Event("fail")));
 
-		// Verify hidden alphabet
 		assert_eq!(proc.hidden_alphabet().len(), 4);
 
-		// Verify terminal states
 		assert!(proc.is_terminal(State("S3")));
 		assert!(proc.is_terminal(State("S3f")));
 
 		Ok(())
 	}
 
-	// Test CSP process spec integration with assert spec and ServiceClient
-	// environment
+	// `tb_process_spec!` builds the handshake process, and each numbered step
+	// checks one part of the LTS it yields.
 	#[test]
 	fn test_csp_process_spec_structure() {
-		// Define CSP process using tb_process_spec! macro
-		// This models the theoretical state machine behavior
+		// The process is a model of the handshake state machine.
 		tb_process_spec! {
 			pub ComprehensiveHandshake,
 			events {
@@ -1138,7 +1292,7 @@ mod tests {
 
 		// 6. Nondeterministic choice points (□).
 		assert_eq!(proc.choice.len(), 1);
-		assert!(proc.is_choice(State("S1"))); // S1 has choice: serialize OR queue
+		assert!(proc.is_choice(State("S1"))); // S1 chooses serialize or queue
 
 		// 7. Transition relation: observable transitions.
 		let s0_start = proc.step(State("S0"), &Event("start"));
@@ -1179,24 +1333,24 @@ mod tests {
 		assert_eq!(s1q_dispatch[0], State("S1d"));
 
 		// 9. Enabled actions at each state.
-		// S0: only "start" observable
+		// S0 enables only the observable `start`.
 		let s0_enabled = proc.enabled(State("S0"));
 		assert_eq!(s0_enabled.len(), 1);
 		assert!(s0_enabled.iter().any(|a| a.event.0 == "start" && a.is_observable()));
 
-		// S1: "serialize" and "queue" hidden (nondeterministic)
+		// S1 offers a nondeterministic choice of hidden `serialize` or `queue`.
 		let s1_enabled = proc.enabled(State("S1"));
 		assert_eq!(s1_enabled.len(), 2);
 		assert!(s1_enabled.iter().any(|a| a.event.0 == "serialize" && a.is_hidden()));
 		assert!(s1_enabled.iter().any(|a| a.event.0 == "queue" && a.is_hidden()));
 
-		// S2: "ack" and "fail" observable (nondeterministic outcome)
+		// S2 enables the observable `ack` and `fail`, one for each outcome.
 		let s2_enabled = proc.enabled(State("S2"));
 		assert_eq!(s2_enabled.len(), 2);
 		assert!(s2_enabled.iter().any(|a| a.event.0 == "ack" && a.is_observable()));
 		assert!(s2_enabled.iter().any(|a| a.event.0 == "fail" && a.is_observable()));
 
-		// S3: terminal, no enabled actions
+		// S3 is terminal and enables no action.
 		let s3_enabled = proc.enabled(State("S3"));
 		assert_eq!(s3_enabled.len(), 0);
 
@@ -1279,7 +1433,8 @@ mod tests {
 	const STEP1: Urn<'static> = crate::urn!("test", "event:csp/step1");
 	const STEP2: Urn<'static> = crate::urn!("test", "event:csp/step2");
 
-	// Integration test with tb_scenario! for Bare environment
+	// The scenario runs the flow in the Bare environment and checks the trace
+	// against both specs.
 	tb_assert_spec! {
 		pub SimpleBareFlowSpec,
 		V(1,0,0): {
@@ -1322,7 +1477,7 @@ mod tests {
 	const RECEIVED: Urn<'static> = crate::urn!("test", "event:csp/received");
 	const RESPONDED: Urn<'static> = crate::urn!("test", "event:csp/responded");
 
-	// Define the assertion spec (what to validate at runtime)
+	// The assertion spec counts the events that the run must record.
 	tb_assert_spec! {
 		pub ClientServerFlowSpec,
 		V(1,0,0): {
@@ -1334,8 +1489,8 @@ mod tests {
 		},
 	}
 
-	// Define the CSP process spec (theoretical state machine model)
-	// Models the client-server request-response flow with assertions
+	// The CSP process models the client and server events of one
+	// request-response flow.
 	tb_process_spec! {
 		pub ClientServerFlowProc,
 		events {
@@ -1377,7 +1532,7 @@ mod tests {
 					protocol TokioListener: listener,
 					assertions: trace.share(),
 					handle: |frame, trace| async move {
-						// Server-side assertions
+						// The server records both events of the request.
 						trace.event(RECEIVED)?;
 						trace.event(RESPONDED)?;
 						Ok(Some(frame))
@@ -1390,7 +1545,7 @@ mod tests {
 				let stream = <TokioListener as Protocol>::connect(addr).await?;
 				let mut client = <TokioListener as Protocol>::create_transport(stream, EndpointConfig::cleartext());
 
-				// Client-side assertion before sending
+				// The client records its first event before it sends.
 				trace.event(RESPONDED)?;
 
 				let test_message = TestMessage::sample(None);
@@ -1400,7 +1555,7 @@ mod tests {
 
 				let _response = client.emit(test_frame, None).await?;
 
-				// Client-side assertion after receiving
+				// The client records its second event after the reply arrives.
 				trace.event(RECEIVED)?;
 
 				Ok(())
@@ -1408,21 +1563,22 @@ mod tests {
 		}
 	}
 
-	// Define servlet at module scope for testing
+	// The servlet scenario below starts this servlet.
 	#[cfg(all(feature = "testing-csp", feature = "tcp", feature = "tokio"))]
 	servlet! {
 		pub TestServletForScenario<crate::testing::fixtures::TestMessage, EnvConfig = ()>,
 		protocol: TokioListener,
 		handle: |_msg, frame, ctx| async move {
 			let trace = ctx.trace();
-			// Server-side assertions
+			// The server records both events of the request.
 			trace.event(RECEIVED)?;
 			trace.event(RESPONDED)?;
 			Ok(Some(frame))
 		}
 	}
 
-	// Test using the new Servlet environment
+	// The scenario serves the flow from the servlet in the ServiceClient
+	// environment.
 	#[cfg(all(feature = "testing-csp", feature = "tcp", feature = "tokio"))]
 	tb_scenario! {
 		name: test_servlet_environment_integration,
@@ -1445,7 +1601,7 @@ mod tests {
 				let stream = <TokioListener as Protocol>::connect(addr).await?;
 				let mut client = <TokioListener as Protocol>::create_transport(stream, EndpointConfig::cleartext());
 
-				// Client-side assertion before sending
+				// The client records its first event before it sends.
 				trace.event(RESPONDED)?;
 
 				let test_message = TestMessage::sample(None);
@@ -1455,7 +1611,7 @@ mod tests {
 
 				let _response = client.emit(test_frame, None).await?;
 
-				// Client-side assertion after receiving
+				// The client records its second event after the reply arrives.
 				trace.event(RECEIVED)?;
 
 				Ok(())

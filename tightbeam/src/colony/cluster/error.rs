@@ -1,4 +1,4 @@
-//! Cluster gateway error types.
+//! The error types of a cluster gateway.
 
 use core::net::AddrParseError;
 
@@ -21,7 +21,7 @@ pub enum ClusterError {
 	#[error("Peer address does not parse")]
 	InvalidPeerAddress,
 
-	/// A federating gateway bound the wildcard address and configured no
+	/// A gateway that federates bound the wildcard address and configured no
 	/// advertise address, so every peer would refuse its advertisement.
 	#[error("A wildcard bind needs an advertise address to federate")]
 	AdvertiseAddressRequired,
@@ -34,14 +34,15 @@ pub enum ClusterError {
 	#[error("No hives available for servlet type: {:#?}")]
 	NoHivesAvailable(Vec<u8>),
 
-	/// The connection to the selected hive, servlet, or peer gateway could not
-	/// be established.
+	/// The gateway could not connect to the selected hive, servlet, or peer
+	/// gateway, because the dial or the handshake failed, or a peer route met
+	/// a gateway with no peer plane.
 	#[error("Connect failed")]
 	ConnectFailed,
 
 	/// The party that answered a bound dial presented no certificate, or one
-	/// its route or its registration does not name, so the dial ended before
-	/// any frame was sent to it.
+	/// its route or its registration does not name, so the gateway ended the
+	/// dial before it sent any frame to that party.
 	#[error("Peer identity mismatch")]
 	PeerMismatch,
 
@@ -68,8 +69,8 @@ pub enum ClusterError {
 	#[error("Registration failed")]
 	RegistrationFailed,
 
-	/// An address is not one the protocol can dial, a servlet locator names
-	/// another address than the one beside it, or a heartbeat names an address
+	/// An address is not one the protocol can dial, a servlet locator names an
+	/// address other than the one beside it, or a heartbeat names an address
 	/// that no hive registered.
 	#[error("Invalid address: {:#?}")]
 	InvalidAddress(Vec<u8>),
@@ -79,8 +80,8 @@ pub enum ClusterError {
 	#[error("Servlet not owned by hive")]
 	ServletNotOwned,
 
-	/// A servlet address update named a locator to remove that is not
-	/// registered.
+	/// A servlet address update named a locator to remove, and the registry
+	/// routes nothing at its key.
 	#[error("Servlet address not found")]
 	ServletNotFound,
 
@@ -98,13 +99,14 @@ pub enum ClusterError {
 	#[error("Peer slate exceeds caps")]
 	PeerCapExceeded,
 
-	/// The peer advertisement is older than the newest one applied for its
-	/// bucket.
+	/// The peer advertisement is older than the newest one the gateway applied
+	/// for its bucket.
 	#[error("Peer advertisement is stale")]
 	StalePeerAd,
 
-	/// The gossip journal refused a record because a capacity bound was
-	/// reached.
+	/// The gossip journal refused a record because the journal reached its
+	/// capacity, or the record's signer reached its cap for records of that
+	/// kind.
 	#[error("Gossip journal at capacity")]
 	GossipJournalAtCapacity,
 
@@ -150,7 +152,7 @@ impl ClusterError {
 	#[must_use]
 	pub(crate) fn forward_status(&self) -> TransitStatus {
 		let answered = match self {
-			ClusterError::Transport(TransportError::OperationFailed(failure)) => TransitStatus::try_from(*failure).ok(),
+			ClusterError::Transport(error) => error.transit_status(),
 			_ => None,
 		};
 

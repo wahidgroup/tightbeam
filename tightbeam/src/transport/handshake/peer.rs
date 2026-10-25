@@ -45,10 +45,7 @@ use crate::crypto::x509::utils::CertificateExt;
 use crate::crypto::x509::{AgreementPoint, PeerCertificate, Signing};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::der::asn1::ObjectIdentifier;
-#[cfg(any(
-	feature = "transport-cms",
-	all(feature = "transport-hpke", feature = "transport-multiplex")
-))]
+#[cfg(any(feature = "transport-cms", mux_rekey))]
 use crate::der::referenced::OwnedToRef;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::error::HandshakeError;
@@ -56,10 +53,7 @@ use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::flow::Offer;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::schedule::{PeerEphemeral, Terms};
-#[cfg(any(
-	feature = "transport-cms",
-	all(feature = "transport-hpke", feature = "transport-multiplex")
-))]
+#[cfg(any(feature = "transport-cms", mux_rekey))]
 use crate::transport::handshake::HandshakeCurve;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::HandshakeProvider;
@@ -159,8 +153,8 @@ mod chain {
 			let Some((identity, issuers)) = offer.presented() else {
 				return Ok(());
 			};
-			// A validator may accept a certificate without reading its validity
-			// period, as a pin does, so the chain reads it first.
+			// A validator may accept a certificate and leave its validity
+			// period unread, as a pin does, so the chain reads it first.
 			let certificate = identity.certificate();
 			certificate.validate_expiry()?;
 			for validator in self.0.iter() {
@@ -463,8 +457,8 @@ mod pair {
 	/// A signing certificate a reply names, as its trust admitted it under
 	/// the server's purpose, beside what the trust's validator returned.
 	///
-	/// [`Self::admit`] is its one constructor, so a server is built only from
-	/// a certificate its trust admitted.
+	/// [`Self::admit`] is its one constructor, so every server this module
+	/// builds holds a certificate its trust admitted.
 	pub(super) struct AdmittedSigning<P: HandshakeProvider, V> {
 		/// The certificate whose key signs the reply.
 		signing: PeerCertificate<Signing<P>>,
@@ -476,7 +470,7 @@ mod pair {
 		/// Admit `named`, the signing certificate a reply names, under
 		/// `purpose`. Both trusts admit the reply's signer here, in this order:
 		///
-		/// 1. The validity period, which a validator may accept a certificate without reading, as a pin does.
+		/// 1. The validity period, which a validator may leave unread, as a pin does.
 		/// 2. The signing use under `purpose`, which decodes the key that a validator then reads.
 		/// 3. `validate`, because a validity check alone authenticates nobody (CWE-295).
 		///
@@ -516,7 +510,7 @@ mod pair {
 		signing: PeerCertificate<Signing<P>>,
 		/// The key-agreement certificate, shared with the trust that pins it,
 		/// which the session keeps for a rekey.
-		#[cfg(feature = "transport-multiplex")]
+		#[cfg(mux_rekey)]
 		key_agreement: Arc<Certificate>,
 		/// The key of the key-agreement certificate as a point of the
 		/// handshake curve, or `None` for a key of another curve.
@@ -549,18 +543,18 @@ mod pair {
 
 			Ok(Self {
 				signing,
-				#[cfg(feature = "transport-multiplex")]
+				#[cfg(mux_rekey)]
 				key_agreement: certificate,
 				point,
 			})
 		}
 
 		/// The certificates of this pair as the session records them: the
-		/// signing certificate, and in a build with `transport-multiplex` the
-		/// key-agreement certificate beside it, for a rekey.
+		/// signing certificate, and in a build with the mux rekey the
+		/// key-agreement certificate beside it, for that rekey.
 		fn peer(&self) -> Result<SessionPeer, HandshakeError> {
 			let peer = SessionPeer::admitted(&self.signing)?;
-			#[cfg(feature = "transport-multiplex")]
+			#[cfg(mux_rekey)]
 			let peer = peer.with_key_agreement(Arc::clone(&self.key_agreement));
 			Ok(peer)
 		}
@@ -599,20 +593,14 @@ impl<P: HandshakeProvider> PeerEphemeral<P::Curve> for ServerKeys<'_, P> {
 
 /// A certificate read as a key of the handshake curve, the form an agreement
 /// compares it in.
-#[cfg(any(
-	feature = "transport-cms",
-	all(feature = "transport-hpke", feature = "transport-multiplex")
-))]
+#[cfg(any(feature = "transport-cms", mux_rekey))]
 pub(crate) trait AgreementCertificate {
 	/// The key of this certificate as a point of the curve `C`, or `None` for
 	/// a key of another curve.
 	fn agreement_point<C: HandshakeCurve>(&self) -> Option<PublicKey<C>>;
 }
 
-#[cfg(any(
-	feature = "transport-cms",
-	all(feature = "transport-hpke", feature = "transport-multiplex")
-))]
+#[cfg(any(feature = "transport-cms", mux_rekey))]
 impl AgreementCertificate for Certificate {
 	fn agreement_point<C: HandshakeCurve>(&self) -> Option<PublicKey<C>> {
 		// A key of another curve is no point of the handshake curve and
@@ -693,7 +681,7 @@ impl CmsServerIdentity {
 	///
 	/// - A bare certificate must be within its validity period, because a
 	///   store's [`evaluate`](CertificateValidation::evaluate) may accept one
-	///   without reading it, and the store then names its anchor.
+	///   and leave that period unread, and the store then names its anchor.
 	/// - The store path-validates a chain ([RFC 5280 §6.1][rfc5280-6.1]) and
 	///   owns the validity period of each certificate in it. Its leaf
 	///   identifies the server, and [`CertificateTrust::verify_chain`] returns
@@ -732,8 +720,8 @@ pub struct ProvisionedTrust {
 	/// The server's key-agreement certificate, a leaf or a chain.
 	key_agreement: CmsServerIdentity,
 	/// The store that runs path validation and revocation on both of the
-	/// server's certificates, role-blind. The server policy reads the
-	/// key-agreement certificate at its own leg.
+	/// server's certificates alike, whatever the role of each. The server
+	/// policy reads the key-agreement certificate at its own leg.
 	store: Arc<dyn CertificateTrust>,
 }
 
@@ -1149,7 +1137,7 @@ mod tests {
 		type HouseKeyAgreement = ProvisionedKeyAgreement<DefaultCryptoProvider>;
 
 		/// The key-agreement certificate `trust` admits under `admission` for a
-		/// client of the house provider. `ProvisionedTrust` admits under any
+		/// client of the house provider. [`ProvisionedTrust`] admits under any
 		/// provider, so the call names the one it admits under.
 		fn admit_provisioned(
 			trust: &ProvisionedTrust,
@@ -1322,7 +1310,7 @@ mod tests {
 
 		/// The admitted pair keeps the key-agreement certificate the opening
 		/// sealed to, so the session holds it for a rekey.
-		#[cfg(feature = "transport-multiplex")]
+		#[cfg(mux_rekey)]
 		#[test]
 		fn a_paired_server_keeps_its_key_agreement_certificate() {
 			let server = fresh_server();
@@ -1350,8 +1338,8 @@ mod tests {
 			assert!(matches!(refused, Err(HandshakeError::CertificateValidationError(_))));
 		}
 
-		/// A store may accept a bare certificate without reading its validity
-		/// period, so the trust refuses an expired one itself.
+		/// A store may accept a bare certificate and leave its validity period
+		/// unread, so the trust refuses an expired one itself.
 		#[test]
 		fn a_pinned_certificate_past_its_validity_is_refused() {
 			let server = fresh_server();
@@ -1529,8 +1517,8 @@ mod tests {
 			assert!(matches!(refused, Err(HandshakeError::CertificateValidationError(_))));
 		}
 
-		/// A store that revokes the leaf of a pinned chain after the trust was
-		/// built refuses it at the next opening.
+		/// A store that revokes the leaf of a pinned chain after the test
+		/// builds the trust refuses it at the next opening.
 		#[test]
 		fn a_pinned_chain_whose_leaf_is_revoked_after_the_trust_is_refused() -> Result<(), Box<dyn Error>> {
 			let server = fresh_server();
@@ -1639,8 +1627,8 @@ mod tests {
 			assert!(matches!(refused, Err(HandshakeError::MissingServerCertificate)));
 		}
 
-		/// A store that revokes the signing certificate after the trust was
-		/// built refuses it at the next reply.
+		/// A store that revokes the signing certificate after the test builds
+		/// the trust refuses it at the next reply.
 		#[test]
 		fn a_signing_certificate_revoked_after_the_trust_is_refused() -> Result<(), Box<dyn Error>> {
 			let server = fresh_server();
@@ -1687,8 +1675,8 @@ mod tests {
 			assert!(admitted.is_ok());
 		}
 
-		/// The trust admits its pinned certificate against the store when it
-		/// is built, so it refuses a revoked one there.
+		/// The trust admits its pinned certificate against the store at its
+		/// construction, so it refuses a revoked one there.
 		#[test]
 		fn a_revoked_pinned_certificate_is_refused() -> Result<(), Box<dyn Error>> {
 			let server = fresh_server();

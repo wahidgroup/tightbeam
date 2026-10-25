@@ -1,4 +1,5 @@
-//! Mux chunking, credit, budgets, flow violations, authorizers.
+//! Mux scenarios for chunking, credit, budgets, flow violations, and
+//! authorizers.
 
 use core::time::Duration;
 use std::sync::Arc;
@@ -26,8 +27,9 @@ use tightbeam::{Frame, TightBeamError};
 
 use crate::common::security::{expectation_failure, ServerMaterials};
 use crate::transport::support::{
-	await_ok, bind_encrypted_listener, bind_encrypted_listener_with_timeout, connect_pinned_client,
-	establish_mutual_transports, join_task, mux_frame, mux_offer, serve_one_handshake_message, MutualSessionHooks,
+	await_ok, await_within_deadline, bind_encrypted_listener, bind_encrypted_listener_with_timeout,
+	connect_pinned_client, establish_mutual_transports, join_task, mux_frame, mux_offer, serve_one_handshake_message,
+	MutualSessionHooks,
 };
 
 use super::common::*;
@@ -230,7 +232,8 @@ tb_process_spec! {
 	terminal { Done }
 }
 
-// Zero budget: data emits fail fast; ping/shutdown still work.
+// Under a zero budget, a data emit fails at once, and a ping and the shutdown
+// still work.
 tb_scenario! {
 	name: mux_zero_budget_refuses_data_drains_clean,
 	config: ScenarioConfig::builder()
@@ -278,7 +281,8 @@ tb_assert_spec! {
 	}
 }
 
-// Caps 1/1, 1 KiB chunk: reserve = 5 credits; grant 6 exhausts on first emit.
+// With caps of 1/1 and a 1 KiB chunk, the reserve is 5 credits, so a grant of 6
+// runs out on the first emit.
 tb_scenario! {
 	name: mux_budget_exhaustion_drains,
 	spec: MuxBudgetExhaustionSpec,
@@ -300,7 +304,8 @@ tb_scenario! {
 				is_echo(echoed, &frame),
 			)?;
 
-			// Stimulus only: the refusal itself emits `events::MUX_EMIT_DRAINING`.
+			// The late emit is a stimulus alone: its refusal emits
+			// `events::MUX_EMIT_DRAINING`.
 			let _late = pair.client.handle.emit_on_stream(&mux_frame("mux-budget-late")).await;
 
 			trace.event_with(
@@ -357,7 +362,8 @@ async fn credit_overrun_rejected(trace: TraceCollector) -> Result<bool, TightBea
 	protocol_error_goaway_after(link, envelopes).await
 }
 
-// Five partial opens exceeds cap 4 ([RFC 9113 § 5.1.2](https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.2)).
+// Five partial opens exceed the concurrent stream cap of 4 (RFC 9113 § 5.1.2,
+// <https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.2>).
 async fn reassembly_flood_rejected(trace: TraceCollector) -> Result<bool, TightBeamError> {
 	let client_offer = chunked_offer(4);
 	let server_offer = chunked_offer(4);
@@ -486,7 +492,8 @@ tb_assert_spec! {
 	}
 }
 
-// Refusal before accept enters transcript: fail closed both sides.
+// The authorizer refuses before the accept enters the transcript, so both sides
+// fail closed.
 tb_scenario! {
 	name: mux_authorizer_refusal_fails_closed,
 	spec: MuxAuthorizerRefusalSpec,
@@ -542,7 +549,8 @@ tb_assert_spec! {
 	}
 }
 
-// Hung authorizer: handshake deadline -> DeadlineExceeded.
+// The handshake deadline bounds a hung authorizer, and the server fails with
+// `DeadlineExceeded`.
 tb_scenario! {
 	name: mux_hung_authorizer_bounded_by_handshake_deadline,
 	spec: MuxAuthorizerDeadlineSpec,
@@ -569,9 +577,8 @@ tb_scenario! {
 			let client_task = tokio::spawn(async move { client.perform_client_handshake().await });
 
 			let server_join = join_task(server_task, "server handshake task must not panic");
-			let server_result = timeout(Duration::from_secs(5), server_join)
-				.await
-				.map_err(|_| expectation_failure("hung authorizer must not stall the server past the deadline"))??;
+			let server_bounded = await_within_deadline(server_join, "hung authorizer must not stall the server past the deadline");
+			let server_result = server_bounded.await??;
 			trace.event_with(
 				SERVER_BOUNDS_HUNG_AUTHORIZER,
 				&[],
@@ -584,9 +591,8 @@ tb_scenario! {
 			)?;
 
 			let client_join = join_task(client_task, "client handshake task must not panic");
-			let client_result = timeout(Duration::from_secs(5), client_join)
-				.await
-				.map_err(|_| expectation_failure("client must fail closed once the server abandons the handshake"))??;
+			let client_bounded = await_within_deadline(client_join, "client must fail closed once the server abandons the handshake");
+			let client_result = client_bounded.await??;
 			trace.event_with(CLIENT_FAILS_CLOSED, &[], client_result.is_err())?;
 
 			Ok(())
@@ -608,7 +614,9 @@ tb_assert_spec! {
 	}
 }
 
-// limit=18: 15 response records + reserve 5 (caps 1/1, chunk 1024); headroom for GoAway.
+// The rekey limit of 18 records is below the 15 response records plus the
+// reserve of 5 (caps 1/1, chunk 1024), so the transfer crosses the drain floor,
+// and the reserve keeps headroom for the GoAway.
 tb_scenario! {
 	name: mux_rekey_drain_with_inflight_chunked_transfer,
 	spec: MuxRekeyChunkedDrainSpec,
@@ -631,7 +639,8 @@ tb_scenario! {
 				await_goaway_reason(&pair.client.handle, GoAwayReason::Shutdown).await,
 			)?;
 
-			// Stimulus only: the refusal itself emits `events::MUX_EMIT_DRAINING`.
+			// The late emit is a stimulus alone: its refusal emits
+			// `events::MUX_EMIT_DRAINING`.
 			let _late = pair.client.handle.emit_on_stream(&mux_frame("mux-rekey-late")).await;
 
 			Ok(())

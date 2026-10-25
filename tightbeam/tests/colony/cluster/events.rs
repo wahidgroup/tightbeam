@@ -1,4 +1,4 @@
-//! Client-side cluster scenario event markers.
+//! The event markers that the client records in the cluster scenarios.
 //!
 //! These URNs record facts that only the client observes, such as a completed
 //! client send or a probe that fired. Scenarios assert gateway decisions
@@ -79,6 +79,8 @@ pub(crate) const GOSSIP_PENDING_NO_INGRESS: Urn<'static> =
 	tightbeam::urn!("test", "event:cluster/gossip-pending-no-ingress");
 pub(crate) const PEER_TABLE_FLOOD_ADMITTED: Urn<'static> =
 	tightbeam::urn!("test", "event:cluster/peer-table-flood-admitted");
+pub(crate) const PEER_TABLE_FLOOD_PROMOTED: Urn<'static> =
+	tightbeam::urn!("test", "event:cluster/peer-table-flood-promoted");
 pub(crate) const PEER_TABLE_ANCHOR_RETAINED: Urn<'static> =
 	tightbeam::urn!("test", "event:cluster/peer-table-anchor-retained");
 pub(crate) const PEER_TABLE_TARGETS_BOUNDED: Urn<'static> =

@@ -60,8 +60,8 @@ use crate::common::security::{
 	pinning_trust_store, random_signing_key, test_certificate, PayingApprover, ServerMaterials,
 };
 use crate::transport::support::{
-	await_ok, await_receipt_rotation, bind_encrypted_listener, bind_mutual_listener, mux_frame, mux_offer,
-	record_spawned_event,
+	await_ok, await_receipt_rotation, await_within_deadline, bind_encrypted_listener, bind_mutual_listener, mux_frame,
+	mux_offer, record_spawned_event, HandlerSignal,
 };
 
 pub(crate) const CAPPED_FAILOVER_REUSES_POOLED_HEADROOM: Urn<'static> =
@@ -260,8 +260,8 @@ impl MuxService for MixedService {
 	}
 }
 
-/// Idle pruning for a test pool: the timeout, and the clock it is judged
-/// against.
+/// Idle pruning for a test pool: the timeout, and the clock the pool judges
+/// it against.
 struct IdlePrune {
 	timeout: Duration,
 	clock: Arc<dyn Clock>,
@@ -443,8 +443,8 @@ tb_assert_spec! {
 	}
 }
 
-// Stream kinds exist so unary, streaming, and duplex interactions run
-// concurrently on one pooled connection against one service.
+// Unary, streaming, and duplex interactions run concurrently on one pooled
+// connection against one service.
 tb_scenario! {
 	name: pooled_mixed_kinds_share_one_connection,
 	spec: PooledMixedKindsSpec,
@@ -505,7 +505,7 @@ tb_assert_spec! {
 }
 
 // A kind the service does not implement refuses its stream with
-// `Unimplemented` while leaving the connection serving other streams.
+// `Unimplemented`, and the connection still serves other streams.
 tb_scenario! {
 	name: unserved_kind_answers_unimplemented,
 	spec: UnservedKindSpec,
@@ -612,7 +612,7 @@ tb_scenario! {
 
 struct GatedContext {
 	materials: ServerMaterials,
-	started: Notify,
+	started: HandlerSignal,
 	release: Notify,
 }
 
@@ -620,7 +620,7 @@ impl GatedContext {
 	fn generate() -> Self {
 		Self {
 			materials: ServerMaterials::generate(),
-			started: Notify::new(),
+			started: HandlerSignal::default(),
 			release: Notify::new(),
 		}
 	}
@@ -641,7 +641,7 @@ async fn start_gated_echo_server(
 			let first = Arc::clone(&first);
 			async move {
 				if first.swap(false, Ordering::SeqCst) {
-					ctx.started.notify_one();
+					ctx.started.raise();
 					ctx.release.notified().await;
 				}
 
@@ -653,10 +653,13 @@ async fn start_gated_echo_server(
 	Ok((handle, addr))
 }
 
-async fn spawn_held_emit(ctx: &GatedContext, mut lease: PooledClient<TokioListener>) -> EmitTask {
+async fn spawn_held_emit(
+	ctx: &GatedContext,
+	mut lease: PooledClient<TokioListener>,
+) -> Result<EmitTask, TightBeamError> {
 	let held_task = tokio::spawn(async move { lease.emit(mux_frame("mux-held"), None).await });
-	ctx.started.notified().await;
-	held_task
+	ctx.started.wait("the held emit must start the gated handler").await?;
+	Ok(held_task)
 }
 
 async fn release_held_emit(ctx: &GatedContext, held_task: EmitTask) -> Result<bool, TightBeamError> {
@@ -691,7 +694,7 @@ tb_scenario! {
 
 			let held_lease = pool.connect(addr).await?;
 			let mut second_lease = pool.connect(addr).await?;
-			let held_task = spawn_held_emit(&ctx, held_lease).await;
+			let held_task = spawn_held_emit(&ctx, held_lease).await?;
 
 			let failed_over = echo_roundtrip(&mut second_lease, "mux-second").await?;
 			trace.event_with(OVERFLOW_EMIT_ECHOES_ON_SECOND_CONNECTION, &[], failed_over)?;
@@ -718,7 +721,7 @@ impl IdentityFlipContext {
 		let second_key = random_signing_key();
 
 		// A distinct CN, so the trust store validates the second certificate
-		// as its own anchor rather than chaining it under the first subject.
+		// as its own anchor, not as a child of the first subject.
 		let second_certificate = TestCertificate::with_cn_and_uri_sans(&second_key, "pool-mux-second-identity", &[]);
 		let second = TestIdentity::presenting(second_certificate, &second_key);
 		Self { gate: GatedContext::generate(), second }
@@ -752,7 +755,7 @@ impl IdentityFlipContext {
 }
 
 /// Serves one accepted connection as a mux echo server with a stream cap of
-/// `cap`, running `before_echo` ahead of each echo.
+/// `cap`, and runs `before_echo` ahead of each echo.
 ///
 /// The driver tasks run detached, so the connection outlives the listener
 /// that accepted it.
@@ -790,9 +793,9 @@ where
 
 /// Starts the first identity on a fresh address with a stream cap of 1.
 ///
-/// The acceptor serves exactly one connection, whose first frame is held on
-/// the gate, and then ends. Ending drops the listener, so the address is free
-/// for the second identity while the accepted connection stays up.
+/// The acceptor serves one connection, whose first frame the gate holds, and
+/// then ends. Its end drops the listener, so the address is free for the
+/// second identity while the accepted connection stays up.
 async fn start_first_identity_server(
 	ctx: &Arc<IdentityFlipContext>,
 ) -> Result<(JoinHandle<()>, TightBeamSocketAddr), TightBeamError> {
@@ -809,7 +812,7 @@ async fn start_first_identity_server(
 			let first = Arc::clone(&first);
 			async move {
 				if first.swap(false, Ordering::SeqCst) {
-					ctx.gate.started.notify_one();
+					ctx.gate.started.raise();
 					ctx.gate.release.notified().await;
 				}
 			}
@@ -823,8 +826,8 @@ async fn start_first_identity_server(
 	Ok((acceptor, addr))
 }
 
-/// Binds `addr` under `encryption`, retrying while the listener that held
-/// the port is still closing.
+/// Binds `addr` under `encryption`, and retries every 20 ms, up to 100 times,
+/// while the listener that held the port releases it.
 async fn rebind_under(
 	addr: TightBeamSocketAddr,
 	encryption: impl Fn() -> TransportEncryptionConfig<tightbeam::crypto::profiles::DefaultCryptoProvider>,
@@ -881,15 +884,15 @@ tb_assert_spec! {
 	}
 }
 
-// A lease pins the identity its connection handshook with.
+// A lease pins the identity of the handshake on its connection.
 //
 // The cap-full connection makes an emit fail over to a fresh dial, and another
 // trusted identity now answers the address.
 //
 // - The emit returns an error and the frame stays with the caller.
-// - The lease keeps refusing: its second emit fails over onto the pooled
-//   connection of the other identity, which is why two failovers and two
-//   reuses are recorded against two dials.
+// - The lease refuses again: its second emit fails over onto the pooled
+//   connection of the other identity, so the pool records two failovers and
+//   two reuses against two dials.
 // - The second identity records every frame it serves, so the spec reads that it served none.
 tb_scenario! {
 	name: pooled_mux_failover_refuses_another_identity,
@@ -902,7 +905,7 @@ tb_scenario! {
 			let held_lease = pool.connect(addr).await?;
 			let mut pinned_lease = pool.connect(addr).await?;
 			let pinned_first = pinned_lease.peer_certificate() == Some(&*ctx.gate.materials.certificate);
-			let held_task = spawn_held_emit(&ctx.gate, held_lease).await;
+			let held_task = spawn_held_emit(&ctx.gate, held_lease).await?;
 			let _second_server = start_second_identity_server(&ctx, addr, trace.share()).await?;
 
 			let refused = pinned_lease.emit(mux_frame("mux-after-pin"), None).await;
@@ -935,8 +938,8 @@ tb_assert_spec! {
 	}
 }
 
-// At `max_connections`, failover reuses headroom instead of dialing, which
-// would fail with ResourceExhausted.
+// At `max_connections`, failover reuses headroom instead of a dial, which
+// would fail with `ResourceExhausted`.
 tb_scenario! {
 	name: pooled_mux_failover_reuses_pooled_headroom,
 	spec: MuxFailoverReuseSpec,
@@ -950,7 +953,7 @@ tb_scenario! {
 			let held_lease = pool.connect(addr).await?;
 			let mut fill_lease = pool.connect(addr).await?;
 			let mut reuse_lease = pool.connect(addr).await?;
-			let held_task = spawn_held_emit(&ctx, held_lease).await;
+			let held_task = spawn_held_emit(&ctx, held_lease).await?;
 
 			// Once connection one saturates, failover dials connection two.
 			let filled = echo_roundtrip(&mut fill_lease, "mux-fill").await?;
@@ -992,7 +995,7 @@ tb_scenario! {
 
 			let held_lease = pool.connect(addr).await?;
 			let mut second_lease = pool.connect(addr).await?;
-			let held_task = spawn_held_emit(&ctx, held_lease).await;
+			let held_task = spawn_held_emit(&ctx, held_lease).await?;
 
 			let refused = second_lease.emit(mux_frame("mux-refused"), None).await;
 			trace.event_with(
@@ -1056,8 +1059,8 @@ tb_assert_spec! {
 	}
 }
 
-// With a cap of 1, the pool reuses the idle exclusive connection instead
-// of dialing, which would fail with ResourceExhausted.
+// With `max_connections` at 1, the pool reuses the idle exclusive connection
+// instead of a dial, which would fail with `ResourceExhausted`.
 tb_scenario! {
 	name: pooled_mux_declined_reuses_idle_exclusive_lease,
 	spec: MuxDeclinedIdleReuseSpec,
@@ -1324,9 +1327,11 @@ async fn accept_cap_queues_second_connection() -> Result<(), TightBeamError> {
 	drop(held);
 
 	let mut fresh = single_flight_client(&materials, addr).await?;
-	let released = tokio::time::timeout(Duration::from_secs(5), fresh.emit(mux_frame("after-release"), None)).await;
+	let fresh_emit = fresh.emit(mux_frame("after-release"), None);
+	let bounded = await_within_deadline(fresh_emit, "the fresh emit must resolve once the permit frees");
+	let released = bounded.await?;
 	assert!(
-		matches!(released, Ok(Ok(Some(_)))),
+		matches!(released, Ok(Some(_))),
 		"a new connection should be served once the held permit releases"
 	);
 	Ok(())
@@ -1460,8 +1465,8 @@ tb_assert_spec! {
 	}
 }
 
-// Collector gates must refuse streaming before the service body runs,
-// matching unary dispatch.
+// Collector gates must refuse streaming before the service body runs, as
+// they do for unary dispatch.
 tb_scenario! {
 	name: mux_serve_gate_rejects_streaming_without_handler,
 	spec: MuxStreamGateSpec,
@@ -1508,8 +1513,8 @@ tb_assert_spec! {
 	}
 }
 
-// Collector gates must refuse duplex before the service body runs,
-// matching unary dispatch.
+// Collector gates must refuse duplex before the service body runs, as they
+// do for unary dispatch.
 tb_scenario! {
 	name: mux_serve_gate_rejects_duplex_without_handler,
 	spec: MuxDuplexGateSpec,
@@ -1556,7 +1561,7 @@ tb_assert_spec! {
 	}
 }
 
-// A bracketed gate list composes: the first refusing gate decides, so a
+// A bracketed gate list composes: the first gate that refuses decides, so a
 // trailing permissive gate must not silently displace the deny gate.
 tb_scenario! {
 	name: mux_serve_gate_list_composes_first_refusal,

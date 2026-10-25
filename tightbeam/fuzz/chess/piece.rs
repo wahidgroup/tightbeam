@@ -2,12 +2,12 @@ use tightbeam::urn::Urn;
 
 use super::events;
 
-/// Chess piece representation
+/// The kind of a chess piece, whose value is the board code of the white piece.
 ///
-/// Pieces are stored as u8 in the board (0-12):
-/// - 0 = empty square
-/// - 1-6 = white pieces (pawn=1, rook=2, knight=3, bishop=4, queen=5, king=6)
-/// - 7-12 = black pieces (pawn=7, rook=8, knight=9, bishop=10, queen=11, king=12)
+/// The board stores each square as a `u8` code from 0 to 12:
+/// - 0 is an empty square.
+/// - 1 to 6 are the white pieces: pawn 1, rook 2, knight 3, bishop 4, queen 5, king 6.
+/// - 7 to 12 are the black pieces: pawn 7, rook 8, knight 9, bishop 10, queen 11, king 12.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PieceKind {
@@ -19,6 +19,7 @@ pub enum PieceKind {
 	King = 6,
 }
 
+/// The side of a piece, whose value is its offset in the board code.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Color {
@@ -26,24 +27,28 @@ pub enum Color {
 	Black = 6,
 }
 
+/// A chess piece, whose board code is the sum of its kind and its color.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Piece {
+	/// The kind of the piece, which decides how it moves.
 	pub kind: PieceKind,
+	/// The side that owns the piece.
 	pub color: Color,
 }
 
 impl Piece {
-	/// Create a white piece
+	/// The white piece of `kind`.
 	pub const fn as_white(kind: PieceKind) -> Self {
 		Self { kind, color: Color::White }
 	}
 
-	/// Create a black piece
+	/// The black piece of `kind`.
 	pub const fn as_black(kind: PieceKind) -> Self {
 		Self { kind, color: Color::Black }
 	}
 
-	/// Convert u8 to `Option<Piece>` (0 = empty, 1-12 = pieces)
+	/// The piece that the board code `value` names, or `None` for an empty
+	/// square or a code past 12.
 	pub const fn from_u8(value: u8) -> Option<Self> {
 		match value {
 			0 => None,
@@ -70,7 +75,7 @@ impl From<Piece> for u8 {
 	}
 }
 
-// Convenience constants for common pieces
+// The twelve pieces, one constant for each kind and color.
 pub const WHITE_PAWN: Piece = Piece::as_white(PieceKind::Pawn);
 pub const WHITE_ROOK: Piece = Piece::as_white(PieceKind::Rook);
 pub const WHITE_KNIGHT: Piece = Piece::as_white(PieceKind::Knight);
@@ -85,22 +90,21 @@ pub const BLACK_BISHOP: Piece = Piece::as_black(PieceKind::Bishop);
 pub const BLACK_QUEEN: Piece = Piece::as_black(PieceKind::Queen);
 pub const BLACK_KING: Piece = Piece::as_black(PieceKind::King);
 
-// ============================================================================
-// PIECE-SPECIFIC MOVE PATTERNS
-// ============================================================================
+// The move patterns of each kind of piece.
 
-/// Rook move directions: horizontal and vertical
+/// The four directions of a rook move, along a row or a column.
 pub const ROOK_DIRECTIONS: &[(i8, i8)] = &[(0, 1), (0, -1), (1, 0), (-1, 0)];
-/// Bishop move directions: diagonal
+/// The four directions of a bishop move, along a diagonal.
 pub const BISHOP_DIRECTIONS: &[(i8, i8)] = &[(1, 1), (1, -1), (-1, 1), (-1, -1)];
-/// Queen move directions: all 8 directions (rook + bishop)
+/// The eight directions of a queen move, which are the rook and the bishop
+/// directions together.
 pub const QUEEN_DIRECTIONS: &[(i8, i8)] = &[(0, 1), (0, -1), (1, 0), (-1, 0), (1, 1), (1, -1), (-1, 1), (-1, -1)];
-/// Knight move offsets: 8 L-shaped moves
+/// The eight L-shaped offsets of a knight move.
 pub const KNIGHT_OFFSETS: &[(i8, i8)] = &[(2, 1), (2, -1), (-2, 1), (-2, -1), (1, 2), (1, -2), (-1, 2), (-1, -2)];
 
 impl PieceKind {
-	/// Get move directions for pieces that move along lines (rook, bishop, queen)
-	/// Returns None for pieces that don't use line moves (pawn, knight, king)
+	/// The directions of a piece that moves along lines (rook, bishop, queen),
+	/// or `None` for a pawn, a knight, or a king.
 	pub fn as_move_directions(&self) -> Option<&'static [(i8, i8)]> {
 		match self {
 			PieceKind::Rook => Some(ROOK_DIRECTIONS),
@@ -110,8 +114,7 @@ impl PieceKind {
 		}
 	}
 
-	/// Get move offsets for pieces with fixed move patterns (knight)
-	/// Returns None for pieces that don't use fixed offsets
+	/// The fixed offsets of a knight move, or `None` for any other kind.
 	pub fn as_move_offsets(&self) -> Option<&'static [(i8, i8)]> {
 		match self {
 			PieceKind::Knight => Some(KNIGHT_OFFSETS),
@@ -119,7 +122,7 @@ impl PieceKind {
 		}
 	}
 
-	/// Get the event URN for this piece kind
+	/// The event URN that a move of this kind records.
 	pub fn as_kind_event(&self) -> Urn<'static> {
 		match self {
 			PieceKind::Pawn => events::PAWN_MOVE,
@@ -133,7 +136,7 @@ impl PieceKind {
 }
 
 impl Color {
-	/// Get the starting row for a pawn of this color
+	/// The start row of a pawn of this color.
 	pub fn to_pawn_start_row(self) -> u8 {
 		match self {
 			Color::White => 1,
@@ -141,23 +144,25 @@ impl Color {
 		}
 	}
 
-	/// Get the forward direction for a pawn of this color (row offset per move)
-	/// White pawns move up (negative), black pawns move down (positive)
+	/// The row offset of one forward step of a pawn of this color.
+	///
+	/// White starts on rows 0 and 1, so its pawns move toward row 7 (positive).
+	/// Black starts on rows 6 and 7, so its pawns move toward row 0 (negative).
 	pub fn to_pawn_forward_direction(self) -> i8 {
 		match self {
-			Color::White => -1,
-			Color::Black => 1,
+			Color::White => 1,
+			Color::Black => -1,
 		}
 	}
 }
 
 impl Piece {
-	/// Check if this piece is white
+	/// Whether this piece is white.
 	pub fn is_white(&self) -> bool {
 		matches!(self.color, Color::White)
 	}
 
-	/// Get the starting row for a pawn (only valid for pawns)
+	/// The start row of this piece, or `None` when it is not a pawn.
 	pub fn to_pawn_start_row(self) -> Option<u8> {
 		match self.kind {
 			PieceKind::Pawn => Some(self.color.to_pawn_start_row()),
@@ -165,7 +170,8 @@ impl Piece {
 		}
 	}
 
-	/// Get the forward direction for a pawn (only valid for pawns)
+	/// The row offset of one forward step of this piece, or `None` when it is
+	/// not a pawn.
 	pub fn to_pawn_forward_direction(self) -> Option<i8> {
 		match self.kind {
 			PieceKind::Pawn => Some(self.color.to_pawn_forward_direction()),
@@ -173,7 +179,7 @@ impl Piece {
 		}
 	}
 
-	/// Get the event URN for this piece
+	/// The event URN that a move of this piece records.
 	pub fn as_kind_event(&self) -> Urn<'static> {
 		self.kind.as_kind_event()
 	}

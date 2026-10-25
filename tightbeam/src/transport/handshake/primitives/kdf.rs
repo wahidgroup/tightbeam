@@ -18,7 +18,7 @@ use crate::transport::handshake::error::HandshakeError;
 use crate::zeroize::Zeroizing;
 use crate::ZeroizingBytes;
 
-/// Per-session randomness mixed into the KDF extract step.
+/// The per-session randomness mixed into the KDF extract step.
 ///
 /// HKDF takes a salt and a label, and both arrive as bytes. A caller that
 /// holds them as two slices can exchange them and still compile, so each
@@ -50,18 +50,12 @@ impl<'a> KdfSalt<'a> {
 ///
 /// The HPKE handshake derives under it, and every rekey epoch derives under
 /// the fresh pair its exchange drew, so the layout has one home.
-#[cfg(any(
-	feature = "transport-hpke",
-	all(feature = "transport-multiplex", feature = "transport-cms")
-))]
+#[cfg(any(feature = "transport-hpke", mux_rekey))]
 pub(crate) struct RandomsSalt(Zeroizing<[u8; 64]>);
 
-#[cfg(any(
-	feature = "transport-hpke",
-	all(feature = "transport-multiplex", feature = "transport-cms")
-))]
+#[cfg(any(feature = "transport-hpke", mux_rekey))]
 impl RandomsSalt {
-	/// Lay `client_random` ahead of `server_random`.
+	/// Lays `client_random` ahead of `server_random`.
 	pub(crate) fn new(client_random: &[u8; 32], server_random: &[u8; 32]) -> Self {
 		let mut salt = Zeroizing::new([0u8; 64]);
 		let randoms = client_random.iter().chain(server_random);
@@ -71,19 +65,18 @@ impl RandomsSalt {
 		Self(salt)
 	}
 
-	/// This salt for one derivation.
+	/// This salt as the [`KdfSalt`] of one derivation.
 	#[must_use]
 	pub(crate) fn as_kdf_salt(&self) -> KdfSalt<'_> {
 		KdfSalt::new(self.0.as_slice())
 	}
 }
 
-/// Domain separator bound into the KDF expand step.
+/// The domain separator bound into the KDF expand step.
 ///
 /// Two derivations that share input key material stay independent when their
-/// labels differ, so the label is what makes one derivation safe beside
-/// another. It is a distinct type from [`KdfSalt`] for the reason that type
-/// states.
+/// labels differ. It is a distinct type from [`KdfSalt`] for the reason that
+/// type states.
 ///
 /// # Sources
 ///
@@ -107,11 +100,11 @@ impl<'a> KdfInfo<'a> {
 
 /// One stage of [`kdf_chain`]: the input key material and its label.
 ///
-/// The pair travels as a named struct so a stage list cannot silently swap
-/// the two byte slices it holds.
+/// The pair travels as a named struct, so a stage list names the role of
+/// each of its two byte slices, and a swap of the two shows in the source.
 #[derive(Clone, Copy)]
 pub struct KdfStage<'a> {
-	/// Input key material this stage extracts from.
+	/// The input key material that this stage extracts from.
 	pub input: &'a [u8],
 	/// The label that separates this stage from every other.
 	pub info: KdfInfo<'a>,
@@ -131,8 +124,9 @@ impl fmt::Debug for KdfStage<'_> {
 /// Multi-input HKDF: the provider KDF over the length-prefixed concatenation
 /// of the secrets.
 ///
-/// Each input is prefixed with its length as a big-endian `u32`, so a
-/// concatenation is unambiguous (for example "ab"+"cd" against "abc"+"d").
+/// This function prefixes each input with its length as a big-endian `u32`,
+/// so the concatenation is unambiguous (for example "ab"+"cd" against
+/// "abc"+"d").
 ///
 /// # Errors
 ///
@@ -158,10 +152,10 @@ pub fn multi_input_kdf<P: CryptoProvider>(
 /// Concatenates the inputs, each behind its length prefix, into one wiping
 /// buffer.
 ///
-/// [`multi_input_kdf`] states the framing. The buffer holds secret material
-/// and is reserved at its final length before the first byte lands, so it is
-/// allocated once and a reallocation cannot free an unwiped copy on the way
-/// (CWE-226).
+/// [`multi_input_kdf`] states the framing. The buffer holds secret material,
+/// so this function reserves it at its final length before the first byte
+/// lands. The buffer then allocates once, and no reallocation frees an
+/// unwiped copy on the way (CWE-226).
 ///
 /// # Errors
 ///
@@ -275,10 +269,11 @@ mod tests {
 		assert!(result.is_ok());
 	}
 
-	/// The combined buffer is allocated once at its final length, so no
-	/// reallocation frees an unwiped copy of the inputs (CWE-226). A buffer
-	/// grown by `extend_from_slice` from an empty `Vec` would over-allocate to
-	/// the next power of two, so its capacity would exceed its length.
+	/// [`length_prefixed_inputs`] allocates the combined buffer once at its
+	/// final length, so no reallocation frees an unwiped copy of the inputs
+	/// (CWE-226). A buffer grown by `extend_from_slice` from an empty `Vec`
+	/// would over-allocate to the next power of two, so its capacity would
+	/// exceed its length.
 	#[test]
 	fn the_combined_kdf_buffer_is_allocated_once() -> Result<(), Box<dyn core::error::Error>> {
 		let first = [0u8; 10];

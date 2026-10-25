@@ -37,10 +37,7 @@ pub mod accept;
 pub(crate) mod framing;
 #[cfg(feature = "transport-multiplex")]
 pub mod multiplex;
-#[cfg(all(
-	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-hpke")
-))]
+#[cfg(mux_rekey)]
 pub(crate) mod rekey;
 #[cfg(any(feature = "tcp", feature = "async-transport"))]
 pub mod tcp;
@@ -106,7 +103,7 @@ use crate::utils::time::SystemClock;
 /// Each field is a plain `usize` or `Duration` rather than an `Option`, so a
 /// transport that forgot to configure a limit is unrepresentable.
 ///
-/// [`Default`] is the only place these values are chosen.
+/// [`Default`] is the one place that chooses these values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TransportLimits {
 	/// Ceiling in bytes for a cleartext envelope on the wire.
@@ -127,7 +124,7 @@ impl TransportLimits {
 	///
 	/// A reader learns whether the bytes are a cleartext or an encrypted
 	/// envelope only once it has them, so it admits the larger ceiling, and the
-	/// per-mode check runs once the wire form is known.
+	/// per-mode check runs once the reader knows the wire form.
 	#[must_use]
 	pub fn max_envelope(&self) -> usize {
 		if self.encrypted_envelope > self.cleartext_envelope {
@@ -195,7 +192,7 @@ impl<P: CryptoProvider> TryFrom<TransportEncryptionConfig<P>> for DialableEncryp
 	///
 	/// # Errors
 	///
-	/// - The errors of [`DialableEncryption::new`].
+	/// - [`TransportError`] -- the errors of [`DialableEncryption::new`].
 	fn try_from(config: TransportEncryptionConfig<P>) -> TransportResult<Self> {
 		let encryption = EncryptionConfig {
 			server_identity: Some(config.identity),
@@ -312,7 +309,7 @@ impl<P: CryptoProvider> TryFrom<TransportEncryptionConfig<P>> for EndpointConfig
 
 	/// # Errors
 	///
-	/// - The errors of the [`DialableEncryption`] conversion.
+	/// - [`TransportError`] -- the errors of the [`DialableEncryption`] conversion.
 	fn try_from(config: TransportEncryptionConfig<P>) -> TransportResult<Self> {
 		let limits = config.limits;
 		let encryption = DialableEncryption::try_from(config)?;
