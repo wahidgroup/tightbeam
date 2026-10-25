@@ -368,8 +368,8 @@ mod tests {
 
 		let labels = recorded(&process, FdrConfig::default(), settings, REFUSAL_SNAPSHOT)?;
 
-		let refused = ["Accepting.Idle: {a, b}"];
-		assert_eq!(labels, refused, "the process can stop at `Idle`");
+		let refused = ["Accepting.Done: {a, b}", "Accepting.Idle: {a, b}"];
+		assert_eq!(labels, refused, "the process can stop at `Idle` and at `Done`");
 		Ok(())
 	}
 

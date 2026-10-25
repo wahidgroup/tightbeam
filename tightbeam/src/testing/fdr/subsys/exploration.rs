@@ -183,19 +183,11 @@ impl<'a> DefaultExplorationEngine<'a> {
 				return SeedResult::Divergence(state.trace.clone(), state.process_state, run);
 			}
 
-			// A terminal state ends the trace successfully.
-			if process.is_terminal(state.process_state) {
-				if state.trace.len() > longest_trace.len() {
-					longest_trace = state.trace.clone();
-				}
-
-				// A process that can terminate here can refuse every observable
-				// event.
-				if let Some(refusals) = process.failure_refusals(state.process_state) {
-					failures.push((state.trace.clone(), refusals));
-				}
-
-				continue;
+			// An accepting state can end the trace successfully, and the walk
+			// goes on through each action it enables.
+			let accepting = process.is_terminal(state.process_state);
+			if accepting && state.trace.len() > longest_trace.len() {
+				longest_trace = state.trace.clone();
 			}
 
 			// An action is enabled at these clocks when one of its edges has no
@@ -204,15 +196,16 @@ impl<'a> DefaultExplorationEngine<'a> {
 			let mut actions = process.enabled_under(state.process_state, &state.clock_values);
 			#[cfg(not(feature = "testing-timing"))]
 			let mut actions = process.enabled(state.process_state);
-			if actions.is_empty() {
-				// A non-terminal state with no enabled action is a deadlock.
+			if actions.is_empty() && !accepting {
+				// A state that can neither terminate nor act is a deadlock.
 				#[cfg(feature = "testing-fault")]
 				return SeedResult::Deadlock(state.trace.clone(), state.process_state, injected_faults);
 				#[cfg(not(feature = "testing-fault"))]
 				return SeedResult::Deadlock(state.trace.clone(), state.process_state);
 			}
 
-			// A stable state records its refusals before it takes an action.
+			// A stable or accepting state records its refusals before it takes
+			// an action.
 			if let Some(refusals) = process.failure_refusals(state.process_state) {
 				failures.push((state.trace.clone(), refusals));
 			}

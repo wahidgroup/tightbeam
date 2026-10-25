@@ -842,6 +842,17 @@ mod tests {
 			.build()
 	}
 
+	/// A subject whose accepting `Idle` offers `b`, which leads to `D`, a
+	/// state that can neither terminate nor act.
+	fn stuck_after_b() -> Result<Process, ProcessBuildError> {
+		Process::builder("StuckAfterB")
+			.initial_state(State("Idle"))
+			.add_observable(Event("b"))
+			.add_transition(State("Idle"), Event("b"), State("D"))
+			.add_terminal(State("Idle"))
+			.build()
+	}
+
 	/// What an exploration of `subject` under `config` decided about
 	/// divergence freedom.
 	fn divergence_of(subject: &Process, config: FdrConfig) -> Decision {
@@ -962,6 +973,27 @@ mod tests {
 
 		let run = verdict.divergence_witness.map(|(_seed, run)| run);
 		assert_eq!(run, Some(vec![Event("t"), Event("u")]), "`a` ends the run of `p`");
+		Ok(())
+	}
+
+	#[test]
+	fn a_hidden_cycle_behind_an_accepting_state_refutes_divergence_freedom() -> Result<(), ProcessBuildError> {
+		let subject = spinning_after_b()?;
+
+		let decided = divergence_of(&subject, FdrConfig::default());
+
+		assert_eq!(decided, Decision::Refuted, "the accepting `Idle` offers `b` into the spin");
+		Ok(())
+	}
+
+	#[test]
+	fn a_deadlock_behind_an_accepting_state_refutes_deadlock_freedom() -> Result<(), ProcessBuildError> {
+		let subject = stuck_after_b()?;
+		let mut explorer = DefaultFdrExplorer::with_defaults(&subject, FdrConfig::default());
+
+		let decided = explorer.explore().deadlock_free;
+
+		assert_eq!(decided, Decision::Refuted, "`b` leads from the accepting `Idle` to `D`");
 		Ok(())
 	}
 
