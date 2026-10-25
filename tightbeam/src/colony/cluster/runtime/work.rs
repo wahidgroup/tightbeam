@@ -9,7 +9,7 @@ use crate::colony::cluster::servlet_registry::RoutePlane;
 use crate::colony::cluster::{
 	ClusterConfig, ClusterError, ClusterWorkResponse, DialTarget, HopBudget, RouteKind, ServletEntry, ServletRegistry,
 };
-use crate::colony::common::{reply_frame, ClusterRequest, ClusterWorkRequest, ServletTypeKey};
+use crate::colony::common::{ClusterRequest, ClusterWorkRequest, ReplyForm, ServletTypeKey};
 use crate::decode;
 use crate::encode;
 use crate::instrumentation::events::{
@@ -52,7 +52,8 @@ impl RouteChoice {
 	///
 	/// # Errors
 	///
-	/// - Every error of [`RoutePlane::hop`].
+	/// - [`ClusterError::ConnectFailed`] -- a peer route meets a gateway with no
+	///   peer plane, as in [`RoutePlane::hop`].
 	pub(crate) fn hop<'p, P: Protocol>(
 		&'p self,
 		hive: &'p HivePlane<P>,
@@ -154,7 +155,7 @@ impl RoutePlane {
 	}
 }
 
-/// Decoded outcome of one answered forward.
+/// The decoded outcome of one answered forward.
 ///
 /// The response buffer moves in and decodes exactly once, so the
 /// failover check and the settle share one parse.
@@ -193,7 +194,7 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 		status: TransitStatus,
 	) -> Result<Option<Frame>, TightBeamError> {
 		self.servlet_registry.work_trail_weaken(route_key, &self.config, &self.trace)?;
-		reply_frame(frame.metadata().id(), ClusterWorkResponse::err(status))
+		ReplyForm::Plain.reply(frame.metadata().id(), ClusterWorkResponse::err(status))
 	}
 }
 
@@ -219,8 +220,8 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 		choice.plane.deliver(hop, servlet_type, payload, budget, frame_cache).await
 	}
 
-	/// Settles an answered forward by reinforcing or weakening the trail and
-	/// replying to the caller with one envelope.
+	/// Settles an answered forward: it reinforces or weakens the trail and
+	/// replies to the caller with one envelope.
 	fn settle_forward(
 		&self,
 		frame: &Frame,
@@ -231,7 +232,7 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 			ForwardOutcome::Local(response_payload) => {
 				self.servlet_registry
 					.work_trail_ok(&choice.route_key, &self.config, &self.trace)?;
-				reply_frame(frame.metadata().id(), ClusterWorkResponse::ok(response_payload))
+				ReplyForm::Plain.reply(frame.metadata().id(), ClusterWorkResponse::ok(response_payload))
 			}
 			ForwardOutcome::Peer(peer_response) => {
 				// Relay the peer's own envelope so the client sees one
@@ -246,7 +247,7 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 						.work_trail_weaken(&choice.route_key, &self.config, &self.trace)?;
 				}
 
-				reply_frame(frame.metadata().id(), peer_response)
+				ReplyForm::Plain.reply(frame.metadata().id(), peer_response)
 			}
 			// The peer read the frame before it garbled the reply, so the
 			// frame may have run, and the caller hears that its outcome is
@@ -271,7 +272,8 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 		// before it consults the registry.
 		let Some(type_key) = self.config.namespace.servlet_type_key(&request.servlet_type) else {
 			self.trace.event(CLUSTER_WORK_REFUSED)?;
-			return reply_frame(frame.metadata().id(), ClusterWorkResponse::err(TransitStatus::PermissionDenied));
+			let refusal = ClusterWorkResponse::err(TransitStatus::PermissionDenied);
+			return ReplyForm::Plain.reply(frame.metadata().id(), refusal);
 		};
 
 		// The payload must decode as the client's end-to-end frame. Bytes
@@ -284,7 +286,8 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 			Ok(client_frame) => client_frame,
 			Err(_) => {
 				self.trace.event(CLUSTER_WORK_REFUSED)?;
-				return reply_frame(frame.metadata().id(), ClusterWorkResponse::err(TransitStatus::InvalidArgument));
+				let refusal = ClusterWorkResponse::err(TransitStatus::InvalidArgument);
+				return ReplyForm::Plain.reply(frame.metadata().id(), refusal);
 			}
 		};
 
@@ -295,7 +298,7 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 
 		// At most two selections run: the pheromone-chosen trail and, after
 		// an outcome that proves the frame never ran, one bounded retry on
-		// the next-best trail excluding the failed route key.
+		// the next-best trail, with the failed route key excluded.
 		loop {
 			let choice = match self
 				.servlet_registry
@@ -309,7 +312,8 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 					if excluded.is_none() {
 						self.trace.event(CLUSTER_WORK_UNAVAILABLE)?;
 					}
-					return reply_frame(frame.metadata().id(), ClusterWorkResponse::err(TransitStatus::Unavailable));
+					let refusal = ClusterWorkResponse::err(TransitStatus::Unavailable);
+					return ReplyForm::Plain.reply(frame.metadata().id(), refusal);
 				}
 			};
 
@@ -325,7 +329,7 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 				.forward_attempt(&choice, &servlet_type, attempt_payload, budget, &mut frame_cache)
 				.await;
 
-			// The outcome feeds the pheromone scores, steering future
+			// The outcome feeds the pheromone scores, which steer future
 			// selection toward instances that answer and away from ones
 			// that fail.
 			match forward_result {
@@ -384,10 +388,10 @@ impl ServletRegistry {
 	/// - A relay trail spends one hop at the relay before the owner is reached,
 	///   so it selects only when the budget affords at least two forwards.
 	///
-	/// `exclude` removes one just-failed route key so a bounded retry picks the
-	/// next-best trail. `None` means no entry serves the type, the balancer
-	/// declined, or the route registry is poisoned. The caller answers each
-	/// case as [`TransitStatus::Unavailable`].
+	/// `exclude` removes the route key of the failed attempt, so a bounded
+	/// retry picks the next-best trail. `None` means no entry serves the type,
+	/// the balancer declined, or the route registry is poisoned. The caller
+	/// answers each case as [`TransitStatus::Unavailable`].
 	pub(crate) fn select_route(
 		&self,
 		config: &ClusterConfig,
@@ -419,7 +423,7 @@ impl ServletRegistry {
 		}
 
 		// An out-of-range balancer answer degrades to `Unavailable` instead of
-		// panicking the request path (see [`ClusterConfig::pick_instance`]).
+		// a panic on the request path (see [`ClusterConfig::pick_instance`]).
 		let selected_entry = config.pick_instance(&entries)?;
 		Some(RouteChoice::of(selected_entry))
 	}
@@ -428,14 +432,15 @@ impl ServletRegistry {
 	///
 	/// # Errors
 	///
-	/// - Propagates the trace fault the `testing-fault` feature injects.
+	/// - [`TightBeamError`] -- the trace refused the routing event, the fault
+	///   the `testing-fault` feature injects.
 	pub(crate) fn work_trail_ok(
 		&self,
 		route_key: &Arc<[u8]>,
 		config: &ClusterConfig,
 		trace: &TraceCollector,
 	) -> Result<(), TightBeamError> {
-		// Scoring is feedback on a request that already holds its answer, so
+		// A score is feedback on a request that already holds its answer, so
 		// a registry fault leaves the trail unscored and the reply stands.
 		let _ = self.reinforce(route_key, config.pheromone.reinforcement_boost);
 		trace.event(CLUSTER_WORK_ROUTED)?;
@@ -447,14 +452,15 @@ impl ServletRegistry {
 	///
 	/// # Errors
 	///
-	/// - Propagates the trace fault the `testing-fault` feature injects.
+	/// - [`TightBeamError`] -- the trace refused the failure event, the fault
+	///   the `testing-fault` feature injects.
 	pub(crate) fn work_trail_weaken(
 		&self,
 		route_key: &Arc<[u8]>,
 		config: &ClusterConfig,
 		trace: &TraceCollector,
 	) -> Result<(), TightBeamError> {
-		// Scoring is feedback on a request that already holds its answer, so
+		// A score is feedback on a request that already holds its answer, so
 		// a registry fault leaves the trail unscored and the reply stands.
 		let _ = self.weaken_with_penalty(route_key, config.pheromone.weakening_penalty);
 		trace.event(CLUSTER_WORK_FAILED)?;
@@ -612,9 +618,9 @@ mod tests {
 		assert_eq!(work.hops_remaining, 0);
 	}
 
-	// This test pins the on-wire budget. A missing decrement in
-	// `HopBudget::relayed_work` fails here even when integration
-	// topologies mask it with a clamp.
+	// This test pins the on-wire budget. If `HopBudget::relayed_work` skips
+	// its decrement, this test fails even when integration topologies mask
+	// it with a clamp.
 	#[test]
 	fn relayed_envelope_carries_the_decremented_budget_on_the_wire() -> Result<(), TightBeamError> {
 		let relayed = HopBudget::for_test(2).relayed_work(ping_type(), vec![7]);
@@ -625,7 +631,7 @@ mod tests {
 		Ok(())
 	}
 
-	/// Balancer double that answers with an out-of-range index.
+	/// A balancer double that answers with an out-of-range index.
 	struct RogueBalancer;
 
 	impl LoadBalancer for RogueBalancer {
@@ -634,7 +640,7 @@ mod tests {
 		}
 	}
 
-	/// Balancer double that always picks the first candidate.
+	/// A balancer double that always picks the first candidate.
 	struct FirstBalancer;
 
 	impl LoadBalancer for FirstBalancer {
@@ -678,7 +684,7 @@ mod tests {
 		let entries = vec![Arc::new(peer_entry(b"first", "192.0.2.1:9001"))];
 		let config = config_balancing_with(Arc::new(FirstBalancer));
 		let picked = config.pick_instance(&entries);
-		assert!(matches!(picked, Some(entry) if entry.dial_target().route_bytes().as_ref() == b"192.0.2.1:9001"));
+		assert!(matches!(picked, Some(entry) if entry.dial_target().as_bytes() == b"192.0.2.1:9001"));
 	}
 
 	#[test]

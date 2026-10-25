@@ -9,8 +9,8 @@
 //! - [`SigningKeyProvider`] signs a prehash.
 //! - [`DiffieHellman`] runs the agreement that a DHKEM decapsulation asks of its key holder.
 //!
-//! A concrete implementation such as [`EcdsaKeyProvider`] handles the
-//! algorithm-specific encoding and decoding.
+//! A concrete implementation such as [`EcdsaKeyProvider`] writes the encodings
+//! of its algorithm: the DER of its public key and of its signature.
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
@@ -65,7 +65,7 @@ mod encryption {
 	pub use crate::asn1::{AuthEnvelopedData, ObjectIdentifier};
 	pub use crate::crypto::aead::{AeadAlgorithm, CheckedContent, Decryptor, Encryptor};
 	pub use crate::crypto::cms::ContentEncryption;
-	pub(crate) use crate::crypto::cms::Kek;
+	pub(crate) use crate::crypto::cms::OwnedKek;
 	pub use crate::crypto::profiles::{CryptoProvider, KeyWrapAlgorithm};
 	pub use crate::oids::DATA;
 	pub use crate::random::CryptoRngCore;
@@ -108,15 +108,24 @@ pub enum KeyError {
 	#[error("Signature error: {0}")]
 	SignatureError(SignatureError),
 
-	/// The key material offered to AES key wrap is shorter than the wrap's
-	/// minimum or not a whole number of 64-bit blocks (RFC 3394 § 2).
+	/// A key-encryption key of another size than the key of its wrap
+	/// ([`KeyWrapAlgorithm::KekSize`]).
+	///
+	/// [`KeyWrapAlgorithm::KekSize`]: crate::crypto::profiles::KeyWrapAlgorithm::KekSize
+	#[cfg(feature = "aead")]
+	#[error("Key-encryption key length mismatch: {0}")]
+	KekLength(crate::error::ReceivedExpectedError<usize, usize>),
+
+	/// A length a key wrap refuses: a key shorter than the wrap's minimum or
+	/// not a whole number of 64-bit blocks (RFC 3394 § 2), or a buffer of
+	/// another size than the unwrapped key.
 	#[cfg(feature = "aead")]
 	#[error("Key wrap length mismatch: {0}")]
 	WrapLength(crate::error::ReceivedExpectedError<usize, usize>),
 
-	/// An AES key wrap or unwrap failed. On unwrap this is the integrity check
-	/// of RFC 3394 § 2.2.2, so the wrapped key or the KEK is not the one that
-	/// produced it.
+	/// An AES key wrap or unwrap failed. On unwrap it marks a failed integrity
+	/// check (RFC 3394 § 2.2.2), so the wrapped key was altered or another KEK
+	/// wrapped it.
 	#[cfg(feature = "aead")]
 	#[error("AES key wrap operation failed: {0}")]
 	WrapFailed(crate::crypto::aead::aes_kw::Error),
@@ -133,8 +142,9 @@ crate::impl_from!(#[cfg(feature = "signature")] SignatureError => KeyError::Sign
 
 /// A signing key given as raw bytes or as a key provider.
 ///
-/// Both forms suit configuration in const contexts, such as the `servlet!`
-/// macro.
+/// [`SigningKeySpec::Bytes`] suits configuration in a const context, such as a
+/// `const` item, and [`SigningKeySpec::Provider`] holds a backend built at run
+/// time.
 #[cfg(feature = "signature")]
 #[derive(Clone)]
 pub enum SigningKeySpec {
@@ -164,7 +174,7 @@ impl SigningKeySpec {
 	///
 	/// - [`SigningKeySpec::Bytes`] builds an ECDSA signing key from the raw
 	///   bytes and wraps it in an [`EcdsaKeyProvider`].
-	/// - [`SigningKeySpec::Provider`] returns a clone of the existing provider handle.
+	/// - [`SigningKeySpec::Provider`] returns a clone of the provider handle it holds.
 	///
 	/// # Type Parameters
 	///
@@ -213,9 +223,9 @@ impl SigningKeySpec {
 ///
 /// # Threading
 ///
-/// `Send`/`Sync` are required on every target except `wasm32`, where the
-/// single-threaded executor lets JavaScript-backed providers (WebAuthn,
-/// wallets, remote KMS bridges) implement the trait.
+/// The trait requires `Send` and `Sync` on every target except `wasm32`, where
+/// the single-threaded executor lets JavaScript-backed providers (WebAuthn,
+/// wallets, remote KMS bridges) implement it.
 #[cfg(feature = "signature")]
 pub trait KeyBackend: MaybeSend + MaybeSync + Debug {
 	/// Returns the algorithm identifier for this key.
@@ -223,9 +233,10 @@ pub trait KeyBackend: MaybeSend + MaybeSync + Debug {
 
 	/// Returns the public key as a DER SubjectPublicKeyInfo.
 	///
-	/// The public key is read in place, so an identity checks it against its
-	/// certificate when it is built, and a remote backend fetches it once when
-	/// the backend is built.
+	/// The read of the public key is synchronous, unlike a private-key
+	/// operation, so an identity checks it against its certificate when the
+	/// identity is built. A remote backend fetches it once, when the backend
+	/// is built.
 	///
 	/// # Errors
 	///
@@ -286,9 +297,9 @@ impl<T: SigningKeyProvider + ?Sized> SigningKeyProvider for Arc<T> {
 /// The one operation a DHKEM asks of the holder of its recipient key: the
 /// Diffie-Hellman agreement on the curve `C` (RFC 9180 §4.1).
 ///
-/// The house [`EcdsaKeyProvider`] implements it, and a KMS implements it
-/// without revealing the scalar. The result is a [`SecretSlice`], so the
-/// shared secret zeroizes on drop (CWE-212).
+/// The house [`EcdsaKeyProvider`] implements it, and a KMS implements it and
+/// keeps the scalar inside its boundary. The result is a [`SecretSlice`], so
+/// the shared secret zeroizes on drop (CWE-212).
 #[cfg(all(feature = "signature", feature = "ecdh"))]
 pub trait DiffieHellman<C: CurveArithmetic>: KeyBackend {
 	/// The x-coordinate of the product of this backend's scalar and `peer`.
@@ -307,8 +318,8 @@ impl<C: CurveArithmetic, T: DiffieHellman<C> + ?Sized> DiffieHellman<C> for Arc<
 	}
 }
 
-/// An ECDSA key provider that signs, and runs ECDH key agreement under
-/// `ecdh`.
+/// An ECDSA key provider that signs, and runs ECDH key agreement under the
+/// `ecdh` feature.
 ///
 /// It wraps an ECDSA signing key on any curve `C`. It is the recommended
 /// provider for the TightBeam transport handshakes.
@@ -427,7 +438,8 @@ where
 	}
 }
 
-/// The ECDSA key provider on secp256k1, with ECDH.
+/// The ECDSA key provider on secp256k1, which also runs ECDH under the `ecdh`
+/// feature.
 #[cfg(feature = "signature")]
 pub type Secp256k1KeyProvider = EcdsaKeyProvider<Secp256k1>;
 
@@ -435,14 +447,14 @@ pub type Secp256k1KeyProvider = EcdsaKeyProvider<Secp256k1>;
 /// `KEKRecipientInfo` names (RFC 5652 §6.2.3).
 ///
 /// An implementation encrypts and decrypts a content-encryption key under its
-/// KEK without exposing the KEK, so a Hardware Security Module (HSM), a Key
-/// Management Service (KMS), or a secure enclave can hold it.
+/// KEK and keeps the KEK inside its boundary, so a Hardware Security Module
+/// (HSM), a Key Management Service (KMS), or a secure enclave can hold it.
 ///
 /// # Security Properties
 ///
 /// - **Key encapsulation**: the KEK stays inside the provider boundary.
 /// - **Uniform interface**: in-memory and remote backends use identical APIs.
-/// - **Async by default**: every operation is async, so a remote backend fits the same API.
+/// - **Async by default**: encryption and decryption are async, so a remote backend fits the same API.
 /// - **Algorithm agnostic**: the backend names its own key-encryption algorithm.
 #[cfg(feature = "aead")]
 pub trait EncryptingKeyProvider: Send + Sync + Debug {
@@ -573,7 +585,7 @@ impl<T: EncryptingKeyProvider + ?Sized> EncryptingKeyProvider for Arc<T> {
 /// - It seals and opens a frame as an [`Encryptor`] and a [`Decryptor`], under one `KEKRecipientInfo`.
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 pub struct InMemoryEncryptingKeyProvider<P: CryptoProvider> {
-	kek: Kek<P::KeyWrap>,
+	kek: OwnedKek<P::KeyWrap>,
 	key_identifier: Vec<u8>,
 }
 
@@ -584,9 +596,10 @@ impl<P: CryptoProvider> InMemoryEncryptingKeyProvider<P> {
 	///
 	/// # Errors
 	///
-	/// - [`KeyError::WrapLength`] -- `kek` is another size than the wrap's key.
+	/// - [`KeyError::KekLength`] -- `kek` is another size than the wrap's key.
 	pub fn new(kek: impl Into<crate::ZeroizingBytes>, key_identifier: impl Into<Vec<u8>>) -> Result<Self, KeyError> {
-		let kek = Kek::new(kek)?;
+		let bytes = kek.into();
+		let kek = OwnedKek::try_from(bytes.as_slice())?;
 		let key_identifier = key_identifier.into();
 		Ok(Self { kek, key_identifier })
 	}
@@ -617,7 +630,8 @@ impl<P: CryptoProvider> EncryptingKeyProvider for InMemoryEncryptingKeyProvider<
 	}
 
 	fn encrypt(&self, content_key: &[u8]) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, KeyError>> + Send + '_>> {
-		let wrapped = P::KeyWrap::wrap(&self.kek, content_key);
+		let kek = self.kek.kek();
+		let wrapped = P::KeyWrap::wrap(&kek, content_key);
 		Box::pin(async move { wrapped })
 	}
 
@@ -625,7 +639,8 @@ impl<P: CryptoProvider> EncryptingKeyProvider for InMemoryEncryptingKeyProvider<
 		&self,
 		encrypted_key: &[u8],
 	) -> Pin<Box<dyn Future<Output = Result<SecretSlice<u8>, KeyError>> + Send + '_>> {
-		let unwrapped = P::KeyWrap::unwrap(&self.kek, encrypted_key);
+		let kek = self.kek.kek();
+		let unwrapped = P::KeyWrap::unwrap(&kek, encrypted_key);
 		let content_key = unwrapped.map(|mut key| SecretSlice::from(core::mem::take(&mut *key)));
 		Box::pin(async move { content_key })
 	}
@@ -637,7 +652,8 @@ impl<P: CryptoProvider> EncryptingKeyProvider for InMemoryEncryptingKeyProvider<
 		encrypted_key: &'a [u8],
 		content_key: &'a mut [u8],
 	) -> Pin<Box<dyn Future<Output = Result<(), KeyError>> + Send + 'a>> {
-		let unwrapped = P::KeyWrap::unwrap_into(&self.kek, encrypted_key, content_key);
+		let kek = self.kek.kek();
+		let unwrapped = P::KeyWrap::unwrap_into(&kek, encrypted_key, content_key);
 		Box::pin(async move { unwrapped })
 	}
 }
@@ -656,7 +672,8 @@ where
 		rng: Option<&mut dyn CryptoRngCore>,
 	) -> Result<AuthEnvelopedData, TightBeamError> {
 		let content_type = content_type.unwrap_or(DATA);
-		let sealed = AuthEnvelopedData::seal_kek::<P>(&self.kek, &self.key_identifier, content_type, content, [], rng);
+		let kek = self.kek.kek();
+		let sealed = AuthEnvelopedData::seal_kek::<P>(&kek, &self.key_identifier, content_type, content, [], rng);
 		Ok(sealed?)
 	}
 }
@@ -673,7 +690,8 @@ where
 	}
 
 	fn open<'a>(&'a self, content: CheckedContent<'a>) -> MaybeSendFuture<'a, Result<(), TightBeamError>> {
-		let opened = content.open_kek::<P>(&self.kek, &self.key_identifier);
+		let kek = self.kek.kek();
+		let opened = content.open_kek::<P>(&kek, &self.key_identifier);
 		Box::pin(core::future::ready(opened))
 	}
 }
@@ -702,6 +720,8 @@ mod tests {
 	use crate::crypto::sign::ecdsa::k256::ecdsa::SigningKey;
 	use crate::crypto::sign::ecdsa::Secp256k1Signature;
 	use crate::crypto::sign::PrehashVerifier;
+	#[cfg(all(feature = "aead", feature = "kdf", feature = "ecdh", feature = "aes-gcm"))]
+	use crate::testing::unhex;
 
 	fn prehash(data: impl AsRef<[u8]>) -> Vec<u8> {
 		let data = data.as_ref();
@@ -767,7 +787,7 @@ mod tests {
 		let shared1 = provider1.agree(&public2).await?.to_insecure();
 		let shared2 = provider2.agree(&public1).await?.to_insecure();
 		assert_eq!(shared1, shared2);
-		assert_eq!(shared1.len(), 32); // secp256k1 shared secret is 32 bytes
+		assert_eq!(shared1.len(), 32); // A secp256k1 shared secret is 32 bytes.
 		Ok(())
 	}
 
@@ -812,9 +832,8 @@ mod tests {
 		assert!(matches!(refused, Err(KeyError::KeyLengthError(_))));
 	}
 
-	/// The `Debug` of a raw key spec prints its length only, so a `servlet!`
-	/// user that logs its configuration keeps the signing key out of the log
-	/// (CWE-532).
+	/// The `Debug` of a raw key spec prints its length only, so a caller that
+	/// logs its configuration keeps the signing key out of the log (CWE-532).
 	#[test]
 	fn signing_key_spec_debug_omits_the_key_bytes() {
 		let spec = SigningKeySpec::Bytes(&[0xABu8; 32]);
@@ -823,7 +842,7 @@ mod tests {
 		assert!(rendered.contains("32"));
 	}
 
-	/// The content key the house provider wraps in the tests of its open.
+	/// The content key the house provider wraps in its `decrypt_into` tests.
 	#[cfg(all(feature = "aead", feature = "kdf", feature = "ecdh", feature = "aes-gcm"))]
 	const CONTENT_KEY: [u8; 32] = [0xC3u8; 32];
 
@@ -832,6 +851,49 @@ mod tests {
 	fn house_holder() -> Aes256GcmKeyProvider {
 		let holder = Aes256GcmKeyProvider::new(vec![0x5Au8; 32], b"tb/test/kek/v1".to_vec());
 		holder.expect("a 32-octet KEK is the size of the house wrap's key")
+	}
+
+	/// The RFC 3394 §4.6 key-encryption key, `000102...1f`.
+	#[cfg(all(feature = "aead", feature = "kdf", feature = "ecdh", feature = "aes-gcm"))]
+	const RFC_3394_KEK: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+
+	/// The RFC 3394 §4.6 key data, 256 bits.
+	#[cfg(all(feature = "aead", feature = "kdf", feature = "ecdh", feature = "aes-gcm"))]
+	const RFC_3394_KEY_DATA: &str = "00112233445566778899aabbccddeeff000102030405060708090a0b0c0d0e0f";
+
+	/// The RFC 3394 §4.6 ciphertext: the key data under the KEK.
+	#[cfg(all(feature = "aead", feature = "kdf", feature = "ecdh", feature = "aes-gcm"))]
+	const RFC_3394_4_6: &str = "28c9f404c4b810f4cbccb35cfb87f8263f5786e2d80ed326cbc7f0e71a99f43bfb988b9b7a02dd21";
+
+	/// The house provider of the RFC 3394 §4.6 key-encryption key.
+	#[cfg(all(feature = "aead", feature = "kdf", feature = "ecdh", feature = "aes-gcm"))]
+	fn rfc_3394_holder() -> Aes256GcmKeyProvider {
+		let holder = Aes256GcmKeyProvider::new(unhex(RFC_3394_KEK), b"tb/test/kek/v1".to_vec());
+		holder.expect("the RFC 3394 §4.6 KEK is the size of the house wrap's key")
+	}
+
+	/// The house provider wraps under the key it holds as RFC 3394 §4.6 wraps
+	/// 256 bits of key data under a 256-bit KEK.
+	#[cfg(all(feature = "aead", feature = "kdf", feature = "ecdh", feature = "aes-gcm"))]
+	#[tokio::test]
+	async fn the_house_provider_wraps_as_rfc_3394_4_6() -> Result<(), KeyError> {
+		let key_data = unhex(RFC_3394_KEY_DATA);
+		let wrapped = rfc_3394_holder().encrypt(&key_data).await?;
+		assert_eq!(wrapped, unhex(RFC_3394_4_6));
+		Ok(())
+	}
+
+	/// The house provider unwraps under the key it holds as RFC 3394 §4.6
+	/// unwraps 256 bits of key data under a 256-bit KEK.
+	#[cfg(all(feature = "aead", feature = "kdf", feature = "ecdh", feature = "aes-gcm"))]
+	#[tokio::test]
+	async fn the_house_provider_unwraps_rfc_3394_4_6() -> Result<(), KeyError> {
+		let wrapped = unhex(RFC_3394_4_6);
+		let mut key = [0u8; 32];
+
+		rfc_3394_holder().decrypt_into(&wrapped, &mut key).await?;
+		assert_eq!(key.as_slice(), unhex(RFC_3394_KEY_DATA).as_slice());
+		Ok(())
 	}
 
 	/// The house provider unwraps into the caller's buffer the content key it

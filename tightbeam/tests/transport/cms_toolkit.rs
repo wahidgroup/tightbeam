@@ -1,11 +1,11 @@
 //! Integration tests for the public CMS toolkit.
 //!
 //! The tests exercise the toolkit end to end through public interfaces
-//! only, including the failure paths a consumer relies on:
+//! only, with the failure paths a consumer relies on:
 //!
 //! - the content key wrapped to a `KEMRecipientInfo` and unwrapped by its holder,
-//! - `AuthEnvelopedData` sealing and opening under a `KEKRecipientInfo`, and
-//! - `SignedData` signing and verification.
+//! - the seal and the open of an `AuthEnvelopedData` under a `KEKRecipientInfo`, and
+//! - the signature and the verification of a `SignedData`.
 
 #![cfg(all(
 	feature = "transport-cms",
@@ -19,7 +19,7 @@
 use tightbeam::asn1::Any;
 use tightbeam::cms::signed_data::SignedData;
 use tightbeam::crypto::cms::{AuthEnvelopedData, KemRecipientInfo, Opener, Recipient};
-use tightbeam::crypto::profiles::DefaultCryptoProvider;
+use tightbeam::crypto::profiles::{DefaultCryptoProvider, Kek};
 use tightbeam::crypto::secret::ToInsecure;
 use tightbeam::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
 use tightbeam::crypto::sign::{CmsSigner, Signed, SignedContent};
@@ -51,7 +51,7 @@ pub(crate) const WRONG_KEY_REJECTED: Urn<'static> = tightbeam::urn!("test", "eve
 /// The house provider, whose algorithms the envelope scenarios run.
 type House = DefaultCryptoProvider;
 
-/// OID for the test-only authenticated attribute carried through the envelope.
+/// The OID of the test-only authenticated attribute that the envelope carries.
 const TOOLKIT_ATTR: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.1");
 
 /// The purpose label that leads the `ukm` of the KEM scenario.
@@ -152,7 +152,8 @@ tb_scenario! {
 			let attr = Attribute::try_from(HandshakeAttribute::new_single(TOOLKIT_ATTR, attr_value)?)?;
 
 			let plaintext = b"cms toolkit sealed payload";
-			let recipient = Recipient::Kek { kek: &TOOLKIT_KEK, key_identifier: TOOLKIT_KEK_ID };
+			let kek = Kek::try_from(TOOLKIT_KEK.as_slice())?;
+			let recipient = Recipient::Kek { kek, key_identifier: TOOLKIT_KEK_ID };
 			let envelope = AuthEnvelopedData::seal::<House>(recipient, DATA, plaintext, [attr], None)?;
 
 			trace.event(ENVELOPE_SEALED)?;
@@ -163,7 +164,7 @@ tb_scenario! {
 
 			trace.event(WIRE_ROUNDTRIP)?;
 
-			let opener = Opener::Kek { kek: &TOOLKIT_KEK, key_identifier: TOOLKIT_KEK_ID };
+			let opener = Opener::Kek { kek, key_identifier: TOOLKIT_KEK_ID };
 			let received = AuthEnvelopedData::from_der(&arrived)?;
 			let recovered = received.open::<House>(&arrived, &opener, DATA).await?.to_insecure();
 			assert_eq!(&recovered[..], plaintext.as_slice(), "recipient must recover the sealed plaintext");

@@ -1,8 +1,8 @@
-//! Servlet route registry with pheromone scoring and trial-based abandonment.
+//! Servlet route registry with pheromone scores and trial-based abandonment.
 //!
 //! - Pheromone rises on successful work and decays on a timer.
-//! - Trial count rises on failure, and entries abandon past a limit.
-//! - Local hive routes and peer-learned routes share the same scoring tables.
+//! - Trial count rises on failure, and the registry abandons an entry when its count reaches the limit.
+//! - Local hive routes and peer-learned routes share the same score tables.
 
 mod config;
 mod entry;
@@ -30,13 +30,13 @@ pub use config::{
 	PeerCaps, PheromoneConfig, DEFAULT_ABANDONMENT_LIMIT, DEFAULT_EVAPORATION_INTERVAL_SECS,
 	DEFAULT_EVAPORATION_RATE_BPS, DEFAULT_INITIAL_PHEROMONE, DEFAULT_REINFORCEMENT_BOOST, DEFAULT_WEAKENING_PENALTY,
 };
-pub use entry::{DialTarget, LocalRoute, PeerRoute, PeerRouteInfo, RelayRoute, RouteKind, ServletEntry};
+pub use entry::{DialTarget, PeerRoute, PeerRouteInfo, RelayRoute, RouteKind, ServletEntry};
 
 /// One route as the registry holds it: the entry and when it was placed.
 ///
-/// The install instant belongs to the placement, so an entry has one
-/// exactly while the map holds it. A replacement is a fresh placement and
-/// ages from it.
+/// The install instant belongs to the placement, so an entry has one exactly
+/// while the map holds it. A replacement is a fresh placement and ages from
+/// it.
 struct Installed {
 	entry: Arc<ServletEntry>,
 	at: MonotonicInstant,
@@ -72,7 +72,7 @@ struct Bucket<'a> {
 ///
 /// A route key appears in `entries` and in exactly the index rows its
 /// entry declares. One lock covers all three, so a slate swap is atomic
-/// and a reader sees index rows naming entries the map still holds
+/// and a reader sees index rows that name entries the map still holds
 /// (CWE-362).
 #[derive(Default)]
 pub(super) struct Routes {
@@ -148,14 +148,14 @@ impl Routes {
 		}
 	}
 
-	/// Stores `entry`, replacing a route its owner already holds at its key.
+	/// Stores `entry` in place of a route its owner already holds at its key.
 	///
 	/// A replaced peer route keeps its pheromone and trial state, so a
-	/// re-advertisement leaves a route's earned standing in place.
+	/// re-advertisement keeps the score a route earned.
 	///
 	/// # Errors
 	///
-	/// - [`ClusterError::ServletNotOwned`] -- another owner holds the key or socket.
+	/// - [`ClusterError::ServletNotOwned`] -- another owner holds a local route's key or socket.
 	/// - [`ClusterError::PeerSlateConflict`] -- another owner holds a peer route's key or socket.
 	#[cfg(test)]
 	pub(super) fn insert(&mut self, entry: ServletEntry, now: MonotonicInstant) -> Result<(), ClusterError> {
@@ -226,8 +226,9 @@ impl Routes {
 	/// # Errors
 	///
 	/// - [`ClusterError::ServletNotOwned`] -- another owner holds a key or
-	///   socket a local slate claims, or a route under the bucket.
-	/// - [`ClusterError::PeerSlateConflict`] -- another owner holds a key or socket a peer slate claims.
+	///   socket a local slate claims, or a route under a hive's bucket.
+	/// - [`ClusterError::PeerSlateConflict`] -- another owner holds a key or
+	///   socket a peer slate claims, or a route under a peer's bucket.
 	fn reconcile(
 		&mut self,
 		bucket: Bucket<'_>,
@@ -267,8 +268,8 @@ impl Routes {
 
 	/// Removes every route in `bucket` that `bucket.owner` holds.
 	///
-	/// A retiring owner takes only its own routes with it, so a route another
-	/// owner landed under the same bucket bytes stays.
+	/// An owner that retires takes only its own routes with it, so a route
+	/// another owner landed under the same bucket bytes stays.
 	fn remove_owned(&mut self, bucket: Bucket<'_>) -> Vec<Arc<ServletEntry>> {
 		let owned: Vec<SharedId> = self
 			.addresses_in_bucket(bucket.id)
@@ -301,7 +302,7 @@ impl Routes {
 		self.by_bucket.get(bucket).map_or(&[], Vec::as_slice)
 	}
 
-	/// Whether admitting `new_slate_len` routes for `bucket` would pass one
+	/// Whether a slate of `new_slate_len` routes for `bucket` would pass one
 	/// of the caps `caps` sets for its kind.
 	fn slate_exceeds_caps(&self, bucket: impl AsRef<[u8]>, new_slate_len: usize, caps: KindCaps) -> bool {
 		let KindCaps { kind: count_kind, max_identities, max_routes } = caps;
@@ -345,6 +346,12 @@ impl Routes {
 	/// Every step reads and writes under that one guard, so concurrent
 	/// advertisements for one bucket apply in a single order and the ledger
 	/// always names the slate installed (CWE-294, CWE-367).
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::StalePeerAd`] -- the slate is older than the bucket's last applied order.
+	/// - [`ClusterError::PeerCapExceeded`] -- the slate would pass one of the kind's caps.
+	/// - [`ClusterError::PeerSlateConflict`] -- another owner holds a key, a socket, or a swept route.
 	fn admit_peer_ad(
 		&mut self,
 		bucket: Bucket<'_>,
@@ -438,7 +445,7 @@ impl Routes {
 		self.ad_orders.insert(bucket, order);
 
 		// The closure borrows `by_bucket` apart from `ad_orders`, so the ledger
-		// prunes against the live index without copying its keys.
+		// prunes against the live index and reads its keys in place.
 		let Tombstone { window, now } = tombstone;
 		let by_bucket = &self.by_bucket;
 		self.ad_orders
@@ -460,7 +467,8 @@ impl Routes {
 	///
 	/// # Errors
 	///
-	/// - [`ClusterError::ServletNotOwned`] -- an address belongs to another owner.
+	/// - [`ClusterError::ServletNotOwned`] -- another owner holds an added or
+	///   removed address, or dials the endpoint an added address names.
 	/// - [`ClusterError::ServletNotFound`] -- a removal names an absent address.
 	pub(super) fn apply_address_update(
 		&mut self,
@@ -529,7 +537,7 @@ pub struct ServletRegistry {
 	pub(super) ad_tombstone_window: Duration,
 	/// The clock that measures tombstones, route installs, and relay-trail age.
 	pub(super) clock: Arc<dyn Clock>,
-	/// Scoring and lifecycle configuration.
+	/// Pheromone score and lifecycle configuration.
 	pub(super) config: PheromoneConfig,
 }
 

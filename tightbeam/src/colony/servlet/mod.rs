@@ -22,9 +22,7 @@ pub mod macros;
 pub mod runtime;
 pub mod tracking;
 
-pub use config::{
-	AcceptState, Cleartext, NoAcceptState, ServletAccept, ServletConfig, ServletConfigBuilder, WithCertificate,
-};
+pub use config::{AcceptState, Cleartext, NoAcceptState, ServletConfig, ServletConfigBuilder, WithCertificate};
 pub use context::{ServletContext, WorkerBox, WorkerBoxStartFuture};
 pub use runtime::ServletRuntime;
 pub use service::{RuntimeServletConf, Servlet, ServletConf, ServletFuture, ServletHandlers, ServletService};

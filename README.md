@@ -2583,7 +2583,7 @@ Access and session verdicts (`GATE_ACCEPT`/`GATE_REJECT` with the refusing statu
 2. Enable `enable_payloads` in the instrumentation configuration if peer identity (SPKI SHA3-256) must appear on gate verdicts.
 3. Provide a durable `EventSink`. The default sink is a bounded in-memory buffer. It drops the oldest events under pressure. Sequence-number gaps in exported evidence reveal where truncation occurred.
 
-Event timestamps are nanoseconds since collector construction. Once per collector, `TRACE_CLOCK_ORIGIN` records that construction time as Unix-epoch nanoseconds. Offline tools can map relative timestamps to absolute times.
+Event timestamps count nanoseconds on the collector's clock since its origin. The origin is the reading the collector takes of a clock when it adopts that clock, at construction for the system clock or in `TraceCollector::with_clock`. Once per origin, `TRACE_CLOCK_ORIGIN` records the origin as Unix-epoch nanoseconds, at the millisecond precision of the clock. Offline tools can map relative timestamps to absolute times.
 
 ## 9. Network Theory
 
@@ -3569,7 +3569,7 @@ The colony URN comes from the gateway certificate. Read it with `ClusterConfig::
 
 Clusters can be tested using `environment Cluster`:
 
-A scenario that depends on elapsed time installs a `ManualClock` (`tightbeam::utils::time`, feature `testing`) and advances it instead of sleeping. Pass the clock to each owner: `ClusterConfig::clock`, `HiveConfig::clock`, `ServletConfigBuilder::with_clock`, or `ConnectionPoolBuilder::new`. A mux writer adopts the clock of the connection it was split from, and `MuxTransport::with_clock` replaces it on a transport assembled by hand.
+A scenario that depends on elapsed time installs a `ManualClock` (`tightbeam::utils::time`, feature `testing`) and advances it in place of a sleep. Pass the clock to each owner: `ClusterConfig::clock`, `HiveConfig::clock`, `ServletConfigBuilder::with_clock`, `ConnectionPoolBuilder::new`, or `TraceCollector::with_clock` (feature `instrument`). A mux writer adopts the clock of the connection it splits from.
 
 An advance wakes sleeping beats, but their work runs on separate tasks. Poll `TraceCollector::recorded` for the expected event, and advance again if it has not landed.
 
@@ -3704,7 +3704,7 @@ Requirements:
 - `label` MAY carry a human-readable or numeric annotation (for example the Unix-epoch nanoseconds on `TRACE_CLOCK_ORIGIN`).
 - `payload_hash` MAY be present only when payloads are enabled and the emit site captures one.
 - `duration_ns` MAY appear on exit or boundary events and MUST be a monotonic span length in nanoseconds.
-- `timestamp_ns` MAY appear as nanoseconds since collector construction. `TRACE_CLOCK_ORIGIN` records the construction time once as Unix-epoch nanoseconds so absolute times are reconstructible offline (see [§8.8.1](#881-audit-trail-deployment-requirements)).
+- `timestamp_ns` MAY appear as nanoseconds on the collector's clock since its origin. `TRACE_CLOCK_ORIGIN` records each origin once as Unix-epoch nanoseconds, so an offline tool can reconstruct absolute times (see [§8.8.1](#881-audit-trail-deployment-requirements)).
 - `flags` MUST be a bitset (for example ASSERT_FAIL, HIDDEN, DIVERGENCE, OVERFLOW).
 - `extras` MAY carry a bounded byte sketch for extended metrics.
 

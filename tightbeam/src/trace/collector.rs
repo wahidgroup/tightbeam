@@ -3,15 +3,15 @@ use core::time::Duration;
 
 use std::borrow::Cow;
 use std::sync::Arc;
-#[cfg(all(feature = "instrument", not(target_family = "wasm")))]
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+#[cfg(feature = "instrument")]
+use std::sync::{Once, RwLock};
 
 use core::fmt;
 #[cfg(any(test, feature = "testing", feature = "instrument", feature = "testing-fault"))]
 use std::sync::Mutex;
 #[cfg(feature = "testing-fault")]
 use std::sync::OnceLock;
-#[cfg(any(test, feature = "testing"))]
+#[cfg(any(test, feature = "testing", feature = "instrument"))]
 use std::sync::PoisonError;
 
 use crate::trace::{AssertionValue, TraceConfigBuilder};
@@ -31,6 +31,10 @@ use crate::testing::fdr::{FaultModel, StrategyDraw};
 use crate::trace::logging::LogRecord;
 #[cfg(any(test, feature = "testing"))]
 use crate::trace::{Assertion, AssertionLabel};
+#[cfg(all(feature = "instrument", host_clock))]
+use crate::utils::time::SystemClock;
+#[cfg(feature = "instrument")]
+use crate::utils::time::{Clock, MonotonicInstant, UnixMillis};
 #[cfg(any(test, feature = "testing"))]
 use crate::Frame;
 
@@ -192,8 +196,8 @@ impl<'a, V: Into<EventValue>> EventBuilder<'a, V> {
 
 	/// Sets the log level for this event.
 	///
-	/// With a log level set, the event also goes to the configured log
-	/// backend, when one is configured.
+	/// With a log level set, the event also goes to the log backend, when a
+	/// backend is configured and its filter admits the level.
 	#[cfg(feature = "logging")]
 	pub fn with_log_level(mut self, level: super::logging::LogLevel) -> Self {
 		self.log_level = Some(level);
@@ -206,7 +210,7 @@ impl<'a, V: Into<EventValue>> EventBuilder<'a, V> {
 	}
 
 	/// Emits the event to the assertion log and to instrumentation, when each
-	/// is enabled. Dropping the builder emits the event too.
+	/// is enabled. The builder also emits the event on drop.
 	pub fn emit(mut self) {
 		self.emit_internal();
 	}
@@ -239,9 +243,9 @@ impl<'a, V: Into<EventValue>> EventBuilder<'a, V> {
 					};
 
 					// The trace is the evidence and the log is a convenience,
-					// so a backend that refuses a record must not stop the
-					// event from being collected. Nothing above this reads a
-					// logging outcome.
+					// so the event reaches the trace even when the backend
+					// refuses the log record. Nothing above this reads the
+					// outcome of the log write.
 					let _unlogged = logger_config.backend.emit(&record);
 				}
 			}
@@ -365,60 +369,112 @@ impl Default for SinkHandle {
 	}
 }
 
-/// A monotonic trace clock whose event timestamps count nanoseconds since the
-/// collector's construction. The construction time origin is recorded once
-/// (`TRACE_CLOCK_ORIGIN`), so absolute times are reconstructible without a
-/// per-event syscall.
+/// A clock beside the readings it gave when a collector adopted it, and
+/// whether an event recorded them.
+#[cfg(feature = "instrument")]
+#[derive(Debug)]
+struct TraceOrigin {
+	/// The clock each event offset reads.
+	clock: Arc<dyn Clock>,
+	/// The monotonic reading each offset counts from.
+	monotonic: MonotonicInstant,
+	/// The Unix time of the same instant, in milliseconds.
+	unix: UnixMillis,
+	/// Completes once the first event on this origin has recorded it, and
+	/// holds each other event on the origin until then.
+	recorded: Once,
+}
+
+#[cfg(feature = "instrument")]
+impl TraceOrigin {
+	/// The origin that `clock` reads now, which the first event on it records.
+	fn of(clock: Arc<dyn Clock>) -> Self {
+		let monotonic = clock.monotonic();
+		let unix = clock.unix();
+		Self { clock, monotonic, unix, recorded: Once::new() }
+	}
+
+	/// The nanoseconds on the clock since the origin, saturated to the range of
+	/// a `u64`.
+	fn offset_ns(&self) -> u64 {
+		let since = self.clock.monotonic().saturating_duration_since(self.monotonic);
+		u64::try_from(since.as_nanos()).unwrap_or(u64::MAX)
+	}
+
+	/// The origin as Unix-epoch nanoseconds, at the millisecond precision of
+	/// the clock.
+	fn unix_ns(&self) -> u128 {
+		u128::from(self.unix.get()).saturating_mul(1_000_000)
+	}
+}
+
+/// The trace clock, whose event timestamps count nanoseconds on the clock a
+/// collector adopted since the origin it took from that clock. The collector
+/// records each origin once (`TRACE_CLOCK_ORIGIN`), before the first event that
+/// counts from it, so one Unix reading per origin gives the absolute time of
+/// every event.
 ///
-/// `wasm` targets have no monotonic `Instant`, so there the clock is inert
-/// and events carry no timestamps.
+/// - A collector adopts [`SystemClock`] where the host has one, and
+///   [`TraceCollector::with_clock`] adopts another.
+/// - A build with no host clock stamps its events once a clock is adopted.
 #[cfg(feature = "instrument")]
 #[derive(Debug)]
 struct TraceClock {
-	#[cfg(not(target_family = "wasm"))]
-	origin: Instant,
-	#[cfg(not(target_family = "wasm"))]
-	origin_unix_ns: u128,
-	origin_recorded: core::sync::atomic::AtomicBool,
+	/// The adopted clock with its origin.
+	origin: RwLock<Option<TraceOrigin>>,
 }
 
 #[cfg(feature = "instrument")]
 impl Default for TraceClock {
 	fn default() -> Self {
-		Self {
-			#[cfg(not(target_family = "wasm"))]
-			origin: Instant::now(),
-			// A system clock set before the epoch reads as origin zero, so
-			// collector construction still succeeds.
-			#[cfg(not(target_family = "wasm"))]
-			origin_unix_ns: SystemTime::now()
-				.duration_since(UNIX_EPOCH)
-				.map(|since| since.as_nanos())
-				.unwrap_or_default(),
-			origin_recorded: core::sync::atomic::AtomicBool::new(false),
-		}
+		#[cfg(host_clock)]
+		let origin = Some(TraceOrigin::of(Arc::new(SystemClock)));
+		#[cfg(not(host_clock))]
+		let origin = None;
+		Self { origin: RwLock::new(origin) }
 	}
 }
 
 #[cfg(feature = "instrument")]
 impl TraceClock {
-	fn now_ns(&self) -> Option<u64> {
-		#[cfg(not(target_family = "wasm"))]
-		{
-			Some(self.origin.elapsed().as_nanos() as u64)
-		}
-		#[cfg(target_family = "wasm")]
-		{
-			None
-		}
+	/// Adopt `clock` with a new origin, which the next event records.
+	///
+	/// A write under the lock replaces the origin whole, so a poisoned lock
+	/// takes the new origin too.
+	fn adopt(&self, clock: Arc<dyn Clock>) {
+		let origin = TraceOrigin::of(clock);
+		let mut slot = self.origin.write().unwrap_or_else(PoisonError::into_inner);
+		*slot = Some(origin);
+	}
+
+	/// Stamp one event on the adopted clock under one read guard.
+	///
+	/// - `record` receives the origin as Unix-epoch nanoseconds when the event is the first on it.
+	/// - `emit` then receives the nanoseconds on the clock since the origin, or `None` with no clock adopted.
+	///
+	/// An adoption takes the write lock, so it lands before the origin record
+	/// or after the event. Each other event on the origin waits for its
+	/// record, so every event counts from an origin the trace recorded before
+	/// it.
+	fn stamp(&self, record: impl FnOnce(u128), emit: impl FnOnce(Option<u64>)) {
+		let guard = self.origin.read().unwrap_or_else(PoisonError::into_inner);
+		let Some(origin) = guard.as_ref() else {
+			emit(None);
+			return;
+		};
+
+		// A record that panicked leaves the origin unrecorded, so the next
+		// event on it records it.
+		origin.recorded.call_once_force(|_| record(origin.unix_ns()));
+		emit(Some(origin.offset_ns()));
 	}
 }
 
 /// The runtime fault model of a collector, beside the draw state of its
 /// injection strategy.
 ///
-/// [`Self::new`] starts the strategy at its beginning, so one model injects
-/// the same faults on each run.
+/// [`Self::new`] starts the strategy from its initial state, so one model
+/// injects the same faults on each run.
 #[cfg(feature = "testing-fault")]
 #[derive(Debug)]
 struct RuntimeFaults {
@@ -438,8 +494,8 @@ impl RuntimeFaults {
 
 	/// Draws the fault the model injects at this record of `label`, or `None`.
 	///
-	/// The label stays the `Cow` that the count keys, as the check that calls
-	/// this states.
+	/// The label stays the `Cow` that the count keys, as
+	/// [`TraceCollector::check_runtime_fault_injection`] states.
 	#[allow(clippy::ptr_arg)]
 	fn draw(&mut self, label: &Cow<'static, str>) -> Option<crate::TightBeamError> {
 		let injection = self.model.runtime_injection(label)?;
@@ -530,7 +586,7 @@ impl TraceState {
 	#[cfg(feature = "testing-fuzz")]
 	fn with_oracle(oracle: crate::testing::fuzz::FuzzContext) -> Self {
 		Self {
-			// The testing-fuzz feature implies testing, so the field exists
+			// The `testing-fuzz` feature implies `testing`, so the field exists
 			// here.
 			assertions: Mutex::new(Vec::new()),
 			#[cfg(feature = "instrument")]
@@ -557,7 +613,7 @@ impl Default for TraceCollector {
 }
 
 impl TraceCollector {
-	/// Creates a new, empty trace collector with the default config.
+	/// Creates an empty trace collector with the default config.
 	pub fn new() -> Self {
 		Self::default()
 	}
@@ -573,11 +629,11 @@ impl TraceCollector {
 		Self { state: Arc::new(TraceState::with_config(config, sink)) }
 	}
 
-	/// Configures the logging backend for this trace collector.
+	/// Configures the log backend of this trace collector.
 	///
-	/// An event reaches the log backend through `.with_log_level()`. When the
-	/// logger config has a default level, that level applies to every event
-	/// without an explicit one.
+	/// An event reaches the log backend through
+	/// [`EventBuilder::with_log_level`]. When the logger config has a default
+	/// level, that level applies to every event without an explicit one.
 	///
 	/// The config applies only while this handle is the sole owner of its
 	/// state, so call this before [`TraceCollector::share`].
@@ -589,8 +645,44 @@ impl TraceCollector {
 		self
 	}
 
-	/// Creates a trace collector that steps `oracle` live as each event is
-	/// recorded.
+	/// Adopts `clock` as the clock this collector stamps its events on, with
+	/// an origin it reads from `clock` now.
+	///
+	/// - Every handle that shares the state reads the clock.
+	/// - The next event records the origin as
+	///   [`TRACE_CLOCK_ORIGIN`](events::TRACE_CLOCK_ORIGIN), in Unix-epoch
+	///   nanoseconds at the millisecond precision of the clock.
+	/// - The `timestamp_ns` of each event counts nanoseconds on the clock from the origin.
+	/// - [`Default`] adopts [`SystemClock`] where the host has one.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::trace::TraceCollector;
+	/// use tightbeam::utils::time::{Clock, SystemClock};
+	///
+	/// const POOL_DIAL: tightbeam::urn::Urn<'static> = tightbeam::urn!("tightbeam", "event:pool/dial");
+	///
+	/// let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+	/// let trace = TraceCollector::new().with_clock(clock);
+	/// trace.emit_event(POOL_DIAL)?;
+	///
+	/// // The event carries its timestamp on the clock.
+	/// let events = trace.drain_events();
+	/// let dial = events.iter().find(|event| event.urn == POOL_DIAL);
+	/// assert!(dial.is_some_and(|event| event.timestamp_ns.is_some()));
+	/// # Ok::<(), tightbeam::TightBeamError>(())
+	/// ```
+	#[cfg(feature = "instrument")]
+	pub fn with_clock(self, clock: Arc<dyn Clock>) -> Self {
+		self.state.clock.adopt(clock);
+		self
+	}
+
+	/// Creates a trace collector that steps `oracle` live as it records each
+	/// event.
 	#[cfg(feature = "testing-fuzz")]
 	pub(crate) fn with_fuzz_context(oracle: crate::testing::fuzz::FuzzContext) -> Self {
 		Self { state: Arc::new(TraceState::with_oracle(oracle)) }
@@ -643,7 +735,7 @@ impl TraceCollector {
 	/// # Errors
 	///
 	/// - The injection point's error, when the model injects a fault.
-	/// - A lock error, when the fault-state lock is poisoned.
+	/// - [`crate::TightBeamError::LockPoisoned`] -- the fault-state lock is poisoned.
 	///
 	/// # Why `&Cow<'static, str>` instead of `&str`
 	///
@@ -651,8 +743,8 @@ impl TraceCollector {
 	/// because the zero-copy counters need the `Cow` itself:
 	///
 	/// - The fault injection counters key a `HashMap<Cow<'static, str>, u32>` by the label.
-	/// - `Cow::clone()` on `Cow::Borrowed` costs nothing, because it copies the pointer.
-	/// - Taking `&str` would force a `Cow::Borrowed(label)` construction.
+	/// - `Cow::clone()` on `Cow::Borrowed` copies only the pointer.
+	/// - A `&str` parameter would force a `Cow::Borrowed(label)` construction.
 	/// - Static labels stay allocation-free, and dynamic labels still work.
 	#[allow(clippy::ptr_arg)]
 	#[cfg(feature = "testing-fault")]
@@ -672,6 +764,7 @@ impl TraceCollector {
 	/// # Errors
 	///
 	/// - The injected error, when the runtime fault model injects a fault at `label`.
+	/// - [`crate::TightBeamError::LockPoisoned`] -- the fault-state lock is poisoned.
 	pub fn event(&self, label: impl IntoEventLabel) -> Result<EventBuilder<'_>, crate::TightBeamError> {
 		let label_cow = label.into_label();
 
@@ -687,6 +780,7 @@ impl TraceCollector {
 	/// # Errors
 	///
 	/// - The injected error, when the runtime fault model injects a fault at `label`.
+	/// - [`crate::TightBeamError::LockPoisoned`] -- the fault-state lock is poisoned.
 	///
 	/// # Zero-allocation option
 	///
@@ -726,11 +820,11 @@ impl TraceCollector {
 	///
 	/// - Labels are full URN renderings, and their identity matches
 	///   [`crate::testing::specs::csp::Event`] through the shared intern pool,
-	///   so structure-aware and simple harnesses both step without alias
-	///   tables.
-	/// - The step result is discarded, because a label that is disabled or
-	///   outside the process alphabet fails the step, and end-of-run CSP
-	///   validation owns hard acceptance.
+	///   so structure-aware and simple harnesses both step on the label as
+	///   rendered.
+	/// - The dispatch discards the step result, because a label that is
+	///   disabled or outside the process alphabet fails the step, and
+	///   end-of-run CSP validation owns hard acceptance.
 	#[cfg(feature = "testing-fuzz")]
 	fn dispatch_csp_event(&self, label: impl AsRef<str>) {
 		let label = label.as_ref();
@@ -773,8 +867,8 @@ impl TraceCollector {
 		};
 
 		// The sink owns retention: events dropped by a bounded sink still
-		// consume a sequence number, so gaps in `seq` reveal exactly where
-		// truncation occurred.
+		// consume a sequence number, so gaps in `seq` reveal where truncation
+		// occurred.
 		self.state.sink.0.emit(TbEvent {
 			seq: self.next_seq(),
 			urn,
@@ -796,24 +890,17 @@ impl TraceCollector {
 		self.emit_with_payload(event_urn, label.as_ref(), None);
 	}
 
-	/// Records the trace clock's time origin once per collector, so
-	/// relative `timestamp_ns` values reconstruct to absolute times.
+	/// Emits `urn` stamped on the adopted clock. The first event on an origin
+	/// records that origin first, so relative `timestamp_ns` values
+	/// reconstruct to absolute times.
 	#[cfg(feature = "instrument")]
-	fn record_clock_origin(&self) {
-		use core::sync::atomic::Ordering;
-
-		if self.state.clock.origin_recorded.swap(true, Ordering::Relaxed) {
-			return;
-		}
-
-		#[cfg(not(target_family = "wasm"))]
-		self.emit_internal(
-			crate::instrumentation::events::TRACE_CLOCK_ORIGIN,
-			Some(&self.state.clock.origin_unix_ns.to_string()),
-			None,
-			None,
-			Some(0),
-		);
+	fn emit_stamped(&self, urn: Urn<'static>, label: Option<&str>, payload: Option<&[u8]>) {
+		let record = |origin_unix_ns: u128| {
+			let origin = origin_unix_ns.to_string();
+			self.emit_internal(events::TRACE_CLOCK_ORIGIN, Some(&origin), None, None, Some(0));
+		};
+		let emit = |timestamp_ns| self.emit_internal(urn, label, payload, None, timestamp_ns);
+		self.state.clock.stamp(record, emit);
 	}
 
 	/// Dual-writes a production control-plane event. The URN goes into the
@@ -824,6 +911,7 @@ impl TraceCollector {
 	/// # Errors
 	///
 	/// - The injected error, when the runtime fault model injects a fault at `event`.
+	/// - [`crate::TightBeamError::LockPoisoned`] -- the fault-state lock is poisoned.
 	///
 	/// # Examples
 	///
@@ -839,19 +927,19 @@ impl TraceCollector {
 		#[cfg(feature = "testing")]
 		self.event(&event)?.emit();
 
-		self.record_clock_origin();
-		self.emit_internal(event, None, None, None, self.state.clock.now_ns());
+		self.emit_stamped(event, None, None);
 		Ok(())
 	}
 
 	/// Dual-writes a production control-plane event that carries evidence.
-	/// The label records why, such as the refusing status. The payload
+	/// The label records why, such as the refusal status. The payload
 	/// records who, such as the peer's SPKI DER, as its SHA3-256 hash when
 	/// payload capture is enabled.
 	///
 	/// # Errors
 	///
 	/// - The injected error, when the runtime fault model injects a fault at `event`.
+	/// - [`crate::TightBeamError::LockPoisoned`] -- the fault-state lock is poisoned.
 	///
 	/// # Examples
 	///
@@ -880,6 +968,7 @@ impl TraceCollector {
 	/// # Errors
 	///
 	/// - The injected error, when the runtime fault model injects a fault at `event`.
+	/// - [`crate::TightBeamError::LockPoisoned`] -- the fault-state lock is poisoned.
 	///
 	/// # Examples
 	///
@@ -911,6 +1000,7 @@ impl TraceCollector {
 	/// # Errors
 	///
 	/// - The injected error, when the runtime fault model injects a fault at `event`.
+	/// - [`crate::TightBeamError::LockPoisoned`] -- the fault-state lock is poisoned.
 	#[cfg(any(feature = "instrument", feature = "colony"))]
 	pub(crate) fn emit_event_with_value_and_evidence<V>(
 		&self,
@@ -929,10 +1019,7 @@ impl TraceCollector {
 		let _ = value;
 
 		#[cfg(feature = "instrument")]
-		{
-			self.record_clock_origin();
-			self.emit_internal(event, Some(label), payload, None, self.state.clock.now_ns());
-		}
+		self.emit_stamped(event, Some(label), payload);
 		#[cfg(not(feature = "instrument"))]
 		let _ = (event, label, payload);
 
@@ -959,11 +1046,12 @@ impl TraceCollector {
 		self.emit_internal(event_urn, Some(label.as_ref()), None, None, Some(timestamp.as_nanos() as u64));
 	}
 
-	/// Counts the recorded events that carry `label`, without draining them.
+	/// Counts the recorded events that carry `label`, and leaves them recorded.
 	///
-	/// A test waiting on a background task polls this, so the wait ends on
-	/// the event it expects rather than on elapsed time. Recording only
-	/// appends, so a poisoned lock holds a whole list and is read as is.
+	/// A test that waits on a background task polls this, so the wait ends on
+	/// the event it expects rather than on elapsed time. An event record only
+	/// appends to the list, so a poisoned lock holds a whole list, and the
+	/// count reads it as is.
 	#[cfg(any(test, feature = "testing"))]
 	pub fn recorded(&self, label: impl IntoEventLabel) -> usize {
 		let label = AssertionLabel::Custom(label.into_label());
@@ -1267,7 +1355,7 @@ mod tests {
 			Ok(())
 		}
 
-		/// A collector that injects every fault at [`ALPHA`].
+		/// A collector that injects a fault at every record of [`ALPHA`].
 		fn faulting_at_alpha() -> TraceCollector {
 			let model = FaultModel::default().with_event_fault(ALPHA, closed, crate::bps!(10000));
 			TraceCollector::new().with_fault_model(model)
@@ -1415,6 +1503,152 @@ mod tests {
 
 			let seqs: Vec<u32> = collector.drain_events().iter().map(|e| e.seq).collect();
 			assert_eq!(seqs, vec![0, 1]);
+		}
+	}
+
+	/// The trace clock reads the clock its collector adopts.
+	#[cfg(feature = "instrument")]
+	mod clock {
+		use core::time::Duration;
+		use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
+
+		use super::super::TraceState;
+		use crate::instrumentation::{events, EventSink, TbEvent};
+		use crate::trace::{TraceCollector, TraceConfig};
+		use crate::utils::time::{Clock, ManualClock};
+		use crate::TightBeamError;
+
+		/// A manual clock an hour past its start, so its readings differ from
+		/// those of the system clock.
+		fn advanced_clock() -> Arc<ManualClock> {
+			let clock = Arc::new(ManualClock::default());
+			clock.advance(Duration::from_secs(3600));
+			clock
+		}
+
+		/// Notes, as each event stamped on the trace clock lands in its sink,
+		/// whether a collector could adopt a clock at that moment.
+		#[derive(Default)]
+		struct AdoptionProbe {
+			/// The state whose trace clock an adoption would take.
+			state: OnceLock<Weak<TraceState>>,
+			/// One answer for each event, in the order the events landed.
+			adoptable: Mutex<Vec<bool>>,
+		}
+
+		impl AdoptionProbe {
+			/// Note whether the write lock that an adoption takes is free now.
+			fn note(&self) {
+				let state = self.state.get().and_then(Weak::upgrade);
+				let state = state.expect("the probe watches a live collector");
+				let attempt = state.clock.origin.try_write();
+				let free = attempt.is_ok();
+				drop(attempt);
+
+				let mut adoptable = self.adoptable.lock().unwrap_or_else(PoisonError::into_inner);
+				adoptable.push(free);
+			}
+
+			/// The answers noted so far.
+			fn noted(&self) -> Vec<bool> {
+				let adoptable = self.adoptable.lock().unwrap_or_else(PoisonError::into_inner);
+				adoptable.clone()
+			}
+		}
+
+		/// The sink of a probed collector, which notes each event it receives
+		/// that carries a timestamp.
+		struct ProbingSink(Arc<AdoptionProbe>);
+
+		impl EventSink for ProbingSink {
+			fn emit(&self, event: TbEvent) {
+				if event.timestamp_ns.is_some() {
+					self.0.note();
+				}
+			}
+
+			fn drain(&self) -> Vec<TbEvent> {
+				Vec::new()
+			}
+
+			fn overflowed(&self) -> bool {
+				false
+			}
+		}
+
+		/// A collector on an advanced clock whose sink notes for `probe`.
+		fn probed_collector(probe: &Arc<AdoptionProbe>) -> TraceCollector {
+			let sink = ProbingSink(Arc::clone(probe));
+			let config = TraceConfig::builder().with_sink(sink).build();
+			let trace = TraceCollector::from(config).with_clock(advanced_clock() as Arc<dyn Clock>);
+			let watched = probe.state.set(Arc::downgrade(&trace.state));
+			watched.expect("a probe watches one collector");
+			trace
+		}
+
+		/// A collector records as its origin the reading of the clock it
+		/// adopts, in Unix-epoch nanoseconds at the clock's millisecond
+		/// precision.
+		#[test]
+		fn a_collector_stamps_its_origin_at_the_reading_of_its_clock() -> Result<(), TightBeamError> {
+			let clock = advanced_clock();
+			let expected = (u128::from(clock.unix().get()) * 1_000_000).to_string();
+			let trace = TraceCollector::new().with_clock(Arc::clone(&clock) as Arc<dyn Clock>);
+			trace.emit_event(events::START)?;
+
+			let recorded = trace.drain_events();
+			let origin = recorded.iter().find(|event| event.urn == events::TRACE_CLOCK_ORIGIN);
+			let label = origin.and_then(|event| event.label.as_deref());
+			assert_eq!(label, Some(expected.as_str()));
+			Ok(())
+		}
+
+		/// The timestamp of an event is the span the adopted clock moved since
+		/// the origin.
+		#[test]
+		fn an_event_stamps_the_span_its_clock_moved() -> Result<(), TightBeamError> {
+			let clock = advanced_clock();
+			let trace = TraceCollector::new().with_clock(Arc::clone(&clock) as Arc<dyn Clock>);
+			clock.advance(Duration::from_secs(5));
+			trace.emit_event(events::START)?;
+
+			let recorded = trace.drain_events();
+			let event = recorded.iter().find(|event| event.urn == events::START);
+			let stamp = event.and_then(|event| event.timestamp_ns);
+			assert_eq!(stamp, Some(5_000_000_000));
+			Ok(())
+		}
+
+		/// Each origin a collector adopts is recorded once, before the first
+		/// event that counts from it.
+		#[test]
+		fn each_adopted_origin_is_recorded_before_its_events() -> Result<(), TightBeamError> {
+			let trace = TraceCollector::new().with_clock(advanced_clock() as Arc<dyn Clock>);
+			trace.emit_event(events::START)?;
+			trace.emit_event(events::START)?;
+			let trace = trace.with_clock(advanced_clock() as Arc<dyn Clock>);
+			trace.emit_event(events::END)?;
+
+			let recorded = trace.drain_events();
+			let stamped = recorded.iter().filter(|event| event.timestamp_ns.is_some());
+			let urns: Vec<_> = stamped.map(|event| &event.urn).collect();
+			let origin = &events::TRACE_CLOCK_ORIGIN;
+			assert_eq!(urns, [origin, &events::START, &events::START, origin, &events::END]);
+			Ok(())
+		}
+
+		/// An event and the record of its origin land while the trace clock is
+		/// held, so an adoption on another handle lands before the record or
+		/// after the event.
+		#[test]
+		fn an_event_and_its_origin_record_land_before_an_adoption() -> Result<(), TightBeamError> {
+			let probe = Arc::new(AdoptionProbe::default());
+			let trace = probed_collector(&probe);
+			trace.emit_event(events::START)?;
+
+			let adoptable = probe.noted();
+			assert_eq!(adoptable, [false, false]);
+			Ok(())
 		}
 	}
 

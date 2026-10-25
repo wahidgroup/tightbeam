@@ -23,8 +23,6 @@ use crate::transport::multiplex::MuxRole;
 use crate::runtime::rt;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::multiplex::MuxRekeyContext;
-#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
-use crate::utils::time::Clock;
 
 /// Multiplexed transport assembled from split envelope halves and
 /// [`MuxSettings`].
@@ -54,6 +52,7 @@ where
 	///   as invalid.
 	/// - On cleartext halves there is no negotiation, so both endpoints MUST
 	///   agree on the same settings out of band ([`MuxSettings::symmetric`]).
+	/// - The renewal deadline runs on the clock of `writer` ([`EnvelopeSink::clock`]), its endpoint's clock.
 	///
 	/// [`negotiated_mux`]: crate::transport::TcpTransport::negotiated_mux
 	pub fn new(reader: R, writer: W, role: MuxRole, settings: MuxSettings) -> Self {
@@ -91,8 +90,8 @@ where
 	/// half `context` holds, so its stream IDs and its rekey exchange share one
 	/// role.
 	///
-	/// `settings` follow [`Self::new`]. The handshake artifact seeds the
-	/// handle receipt accessor, and each completed renewal overwrites it.
+	/// The receipt in `context` seeds [`MuxHandle::session_receipt`], and each
+	/// completed renewal overwrites it. `settings` follow [`Self::new`].
 	///
 	/// # Exchange halves
 	///
@@ -105,9 +104,9 @@ where
 	///
 	/// The renewal deadline (`with_renewal_deadline`, tokio-only) bounds how
 	/// long a peer that never answers a renewal can park this endpoint's data
-	/// at the hard floor. A build without tokio has no timer here, so the
-	/// embedding application MUST bound parked emits itself by wrapping emit
-	/// futures in its own timeout. A cancelled emit frees its stream slot.
+	/// at the hard floor. A build without tokio has no timer here, so the host
+	/// application MUST bound parked emits itself, with its own timeout around
+	/// each emit future. A cancelled emit frees its stream slot.
 	///
 	/// # Examples
 	///
@@ -171,20 +170,8 @@ where
 		self
 	}
 
-	/// Replace the clock the renewal deadline is measured and waited on.
-	///
-	/// The writer adopts the clock of the link it writes to
-	/// ([`EnvelopeSink::clock`]), so an endpoint needs no call here. A test
-	/// installs a [`ManualClock`](crate::utils::time::ManualClock) and
-	/// advances it to the deadline instead of waiting it out.
-	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
-	#[must_use]
-	pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
-		self.writer.set_clock(clock);
-		self
-	}
-
-	/// Override the peer cancel budget (CVE-2023-44487 hardening).
+	/// Override the peer cancel budget, which hardens the connection against
+	/// CVE-2023-44487 Rapid Reset.
 	pub fn with_cancel_budget(mut self, budget: u32) -> Self {
 		self.responder.set_cancel_budget(budget);
 		self
@@ -202,8 +189,8 @@ where
 		self
 	}
 
-	/// Clone the client handle without decomposing the transport
-	/// (`Arc` + channel refcount bumps).
+	/// Clone the client handle and leave the transport whole. The clone raises
+	/// the reference counts of an `Arc` and a channel.
 	pub fn handle(&self) -> MuxHandle {
 		self.handle.clone()
 	}
@@ -258,12 +245,12 @@ where
 	}
 }
 
-/// A running mux plane, with both drivers spawned and ready to emit and serve.
+/// A live mux plane, with both drivers spawned and ready to emit and serve.
 ///
 /// [`MuxTransport::spawn`] produces it.
 #[cfg(feature = "tokio")]
 pub struct SpawnedMux {
-	/// Client-side handle for emitting on streams.
+	/// Client-side handle that emits on streams.
 	pub handle: MuxHandle,
 	/// Server-side dispatcher for peer-initiated streams.
 	pub responder: MuxResponder,

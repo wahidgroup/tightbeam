@@ -5,10 +5,12 @@
 //!   fits the stack buffer, which holds every named-curve key up to P-521.
 //! - A `sid` of the key-identifier form names a certificate by the extension
 //!   value as the certificate holds it.
+//! - The built-in store finds a canonical key, the form a session holds of its peer, in its key index.
 //! - The built-in store validates a presented path from where its parts sit.
 //! - A signed `SignerInfo` encodes in place, as its inner value does.
 //! - A gossip rumor digest sits on the stack, so a rumor admits and a peer's
 //!   digest reads with no allocation for the digest.
+//! - A want list borrows the advertised entries it drops.
 //!
 //! Only an allocation count shows these bounds, so the counting allocator
 //! lives in this test binary alone.
@@ -21,13 +23,13 @@ use core::cell::Cell;
 use core::time::Duration;
 use std::alloc::{GlobalAlloc, Layout, System};
 
-use tightbeam::colony::cluster::{AdmittedGossip, GossipDigest};
+use tightbeam::colony::cluster::{AdmittedGossip, GossipDigest, WantList};
 use tightbeam::colony::common::GossipRumor;
 use tightbeam::crypto::hash::Sha3_256;
 use tightbeam::crypto::policy::Secp256k1Policy;
 use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
 use tightbeam::crypto::x509::utils::CertificateExt;
-use tightbeam::crypto::x509::KeyIndex;
+use tightbeam::crypto::x509::{CanonicalKey, KeyIndex};
 use tightbeam::decode;
 use tightbeam::der::asn1::{BitString, ObjectIdentifier};
 use tightbeam::der::oid::db::rfc8410::ID_ED_25519;
@@ -131,6 +133,30 @@ fn a_lookup_of_the_rfc6979_p521_key_allocates_nothing() {
 fn a_lookup_past_the_stack_bound_allocates() {
 	let lookup = lookup_of(&long_key());
 	assert!(matches!(lookup, (true, allocations) if allocations > 0));
+}
+
+/// Whether a store of the house certificate of the fixed key finds the
+/// canonical form of that key, beside the count of the allocations that the
+/// lookup makes.
+fn canonical_lookup_on_the_house_store() -> (bool, usize) {
+	let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+	let key = CanonicalKey::of(&certificate.tbs_certificate.subject_public_key_info);
+	let key = key.expect("a house key has a canonical form");
+	let builder = CertificateTrustBuilder::from(Secp256k1Policy::default()).with_certificate(certificate);
+	let store = builder.expect("the fixed certificate enrols").build();
+
+	let before = ALLOCATIONS.with(Cell::get);
+	let found = store.find_by_canonical_key(&key).is_some();
+	let after = ALLOCATIONS.with(Cell::get);
+	(found, after - before)
+}
+
+/// The house store finds the canonical key a session holds in its key index
+/// with no decode, so the lookup of a session classification allocates
+/// nothing.
+#[test]
+fn a_canonical_key_lookup_on_the_house_store_allocates_nothing() {
+	assert_eq!(canonical_lookup_on_the_house_store(), (true, 0));
 }
 
 /// Whether the `sid` of the house certificate of the fixed key names that
@@ -253,4 +279,31 @@ fn admissions_of_the_fixed_rumor() -> (usize, usize) {
 fn a_rumor_admits_with_no_allocation_for_its_digest() {
 	let (admission, parts) = admissions_of_the_fixed_rumor();
 	assert_eq!(admission, parts);
+}
+
+/// The SHA3-256 rumor digest whose leading octets spell `index`.
+fn digest_of(index: u32) -> GossipDigest {
+	let mut bytes = [0u8; 32];
+	bytes[..4].copy_from_slice(&index.to_be_bytes());
+	GossipDigest::read::<Sha3_256>(bytes).expect("32 octets read as a SHA3-256 digest")
+}
+
+/// Whether a want list against 4,096 advertised entries that the replier
+/// holds in full wants nothing, beside the count of the allocations that the
+/// list makes.
+fn want_list_against_held_entries() -> (bool, usize) {
+	let held: Vec<GossipDigest> = (0..4_096).map(digest_of).collect();
+	let advertised: Vec<Vec<u8>> = held.iter().map(|digest| digest.as_bytes().to_vec()).collect();
+
+	let before = ALLOCATIONS.with(Cell::get);
+	let want = WantList::against::<Sha3_256>(&advertised, &held);
+	let after = ALLOCATIONS.with(Cell::get);
+	(want.digests().is_empty(), after - before)
+}
+
+/// A want list against entries the replier holds in full allocates its held
+/// set alone, and borrows the advertised entries it drops.
+#[test]
+fn a_want_list_against_held_entries_allocates_the_held_set_alone() {
+	assert_eq!(want_list_against_held_entries(), (true, 1));
 }

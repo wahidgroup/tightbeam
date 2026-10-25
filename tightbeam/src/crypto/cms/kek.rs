@@ -2,65 +2,61 @@
 //! that wraps the content key under a key-encryption key (KEK) both ends
 //! hold, under the key wrap of a provider.
 //!
-//! [`Kek`] holds an in-memory KEK, checked against the size of its wrap once
-//! where it is made. The record keys of a session and the in-memory frame key
-//! hold one each.
+//! [`OwnedKek`] holds an in-memory KEK, which passed the one length check of
+//! [`Kek`] where it is made. The record keys of a session, the in-memory
+//! frame key, and the handshake sealer hold one each.
 
 #[cfg(not(feature = "std"))]
-use alloc::vec::Vec;
-
-use core::marker::PhantomData;
-use core::ops::Deref;
+use alloc::{boxed::Box, vec::Vec};
 
 use crate::cms::content_info::CmsVersion;
 use crate::cms::enveloped_data::{KekIdentifier, KekRecipientInfo, RecipientInfo, RecipientInfos};
 use crate::crypto::aead::Key;
 use crate::crypto::cms::EnvelopeError;
-use crate::crypto::common::typenum::Unsigned;
+use crate::crypto::common::generic_array::GenericArray;
 use crate::crypto::key::KeyError;
-use crate::crypto::profiles::KeyWrapAlgorithm;
+use crate::crypto::profiles::{Kek, KeyWrapAlgorithm};
 use crate::der::asn1::OctetString;
 use crate::der::oid::AssociatedOid;
 use crate::spki::AlgorithmIdentifierOwned;
 use crate::zeroize::Zeroizing;
-use crate::ZeroizingBytes;
 
 /// A content key of the cipher `A`, on the stack and wiped where it drops.
 pub(super) type ContentKey<A> = Zeroizing<Key<A>>;
 
-/// A key-encryption key of the size of the key wrap `W`, wiped where it
-/// drops.
+/// A key-encryption key of the size of the key wrap `W`, held on the heap and
+/// wiped where it drops.
 ///
-/// [`Self::new`] is the one size check, so every wrap and unwrap under it
-/// receives a key of its size.
-pub(crate) struct Kek<W> {
-	bytes: ZeroizingBytes,
-	wrap: PhantomData<fn() -> W>,
+/// [`TryFrom`] on a slice copies a key that passed the one length check of
+/// [`Kek`], and [`Self::kek`] lends it to each wrap and unwrap under `W`.
+pub(crate) struct OwnedKek<W: KeyWrapAlgorithm> {
+	/// The key on the heap, so a move of the holder moves a pointer alone.
+	key: Box<Zeroizing<GenericArray<u8, W::KekSize>>>,
 }
 
-impl<W: KeyWrapAlgorithm> Kek<W> {
-	/// Hold `bytes` as a key-encryption key of `W`.
-	///
-	/// # Errors
-	///
-	/// - [`KeyError::WrapLength`] -- `bytes` is another size than the key of `W`.
-	pub(crate) fn new(bytes: impl Into<ZeroizingBytes>) -> Result<Self, KeyError> {
-		let bytes = bytes.into();
-		let expected = <W::KekSize as Unsigned>::USIZE;
-		if bytes.len() != expected {
-			return Err(KeyError::WrapLength((bytes.len(), expected).into()));
-		}
-
-		Ok(Self { bytes, wrap: PhantomData })
+impl<W: KeyWrapAlgorithm> OwnedKek<W> {
+	/// The key, lent to a wrap or an unwrap under `W`.
+	pub(crate) fn kek(&self) -> Kek<'_, W> {
+		Kek::from(&**self.key)
 	}
 }
 
-/// The wrap reads the key as the octets it takes.
-impl<W> Deref for Kek<W> {
-	type Target = [u8];
+/// The one length check of [`Kek`], then one copy of the key.
+impl<W: KeyWrapAlgorithm> TryFrom<&[u8]> for OwnedKek<W> {
+	type Error = KeyError;
 
-	fn deref(&self) -> &[u8] {
-		&self.bytes
+	/// Hold a copy of the key that `key` holds.
+	///
+	/// # Errors
+	///
+	/// - [`KeyError::KekLength`] -- `key` is another length than [`KeyWrapAlgorithm::KekSize`].
+	fn try_from(key: &[u8]) -> Result<Self, KeyError> {
+		let kek = Kek::<W>::try_from(key)?;
+
+		// The buffer is on the heap before the key is copied into it.
+		let mut key = Box::new(Zeroizing::new(GenericArray::default()));
+		key.iter_mut().zip(kek.as_array()).for_each(|(slot, octet)| *slot = *octet);
+		Ok(Self { key })
 	}
 }
 
@@ -70,54 +66,54 @@ pub(super) fn wrap_algorithm<W: KeyWrapAlgorithm>() -> AlgorithmIdentifierOwned 
 	AlgorithmIdentifierOwned { oid: <W::Oid as AssociatedOid>::OID, parameters: None }
 }
 
-/// Wrap `content_key` under `kek` with `W`, as the `KEKRecipientInfo` that
-/// `key_identifier` names.
-///
-/// # Errors
-///
-/// - [`EnvelopeError::Key`] -- the wrap refused `kek` or the content key.
-/// - [`EnvelopeError::Encoding`] -- the identifier or the encrypted key fails to encode.
-pub(super) fn wrap_kek<W: KeyWrapAlgorithm>(
-	kek: &[u8],
-	key_identifier: &[u8],
-	content_key: &[u8],
-) -> Result<RecipientInfo, EnvelopeError> {
-	let encrypted_key = W::wrap(kek, content_key)?;
-	kek_info(key_identifier, wrap_algorithm::<W>(), encrypted_key)
-}
+/// The behavior of a key-encryption key in a `KEKRecipientInfo`.
+impl<W: KeyWrapAlgorithm> Kek<'_, W> {
+	/// Wrap `content_key` under this key with `W`, as the `KEKRecipientInfo`
+	/// that `key_identifier` names.
+	///
+	/// # Errors
+	///
+	/// - [`EnvelopeError::Key`] -- the wrap refused the content key.
+	/// - [`EnvelopeError::Encoding`] -- the identifier or the encrypted key fails to encode.
+	pub(super) fn recipient_info(
+		&self,
+		key_identifier: &[u8],
+		content_key: &[u8],
+	) -> Result<RecipientInfo, EnvelopeError> {
+		let encrypted_key = W::wrap(self, content_key)?;
+		kek_info(key_identifier, wrap_algorithm::<W>(), encrypted_key)
+	}
 
-/// Unwrap the content key of the one `KEKRecipientInfo` of `recipient_infos`
-/// into `content_key`, under `kek` and the wrap `W`, once it names the key
-/// `key_identifier` names.
-///
-/// # Errors
-///
-/// - The [`named_kek`] set, under the key-encryption algorithm of `W`.
-/// - [`EnvelopeError::KeyUnwrap`] -- the wrapped content key fails its integrity check, or is another size.
-pub(super) fn unwrap_kek<W: KeyWrapAlgorithm>(
-	kek: &[u8],
-	key_identifier: &[u8],
-	recipient_infos: &RecipientInfos,
-	content_key: &mut [u8],
-) -> Result<(), EnvelopeError> {
-	let encrypted_key = named_kek(recipient_infos, key_identifier, &wrap_algorithm::<W>())?;
-	unwrap_key::<W>(kek, encrypted_key, content_key)
-}
+	/// Unwrap the content key of the one `KEKRecipientInfo` of
+	/// `recipient_infos` into `content_key`, under this key and the wrap `W`,
+	/// once it names the key `key_identifier` names.
+	///
+	/// # Errors
+	///
+	/// - The errors of [`named_kek`], under the key-encryption algorithm of `W`.
+	/// - [`EnvelopeError::KeyUnwrap`] -- the wrapped content key fails its
+	///   integrity check, or is another size.
+	pub(super) fn unwrap_named(
+		&self,
+		key_identifier: &[u8],
+		recipient_infos: &RecipientInfos,
+		content_key: &mut [u8],
+	) -> Result<(), EnvelopeError> {
+		let encrypted_key = named_kek(recipient_infos, key_identifier, &wrap_algorithm::<W>())?;
+		self.unwrap_content_key(encrypted_key, content_key)
+	}
 
-/// Unwrap `wrapped` under `kek` with the wrap `W` into `content_key`, which
-/// takes the key whole.
-///
-/// # Errors
-///
-/// - [`EnvelopeError::KeyUnwrap`] -- `wrapped` fails the integrity check, or a length.
-pub(super) fn unwrap_key<W: KeyWrapAlgorithm>(
-	kek: &[u8],
-	wrapped: &[u8],
-	content_key: &mut [u8],
-) -> Result<(), EnvelopeError> {
-	// A length or an integrity failure both leave the key wrapped, which is
-	// the one refusal of RFC 3394 §2.2.3.
-	W::unwrap_into(kek, wrapped, content_key).map_err(|_| EnvelopeError::KeyUnwrap)
+	/// Unwrap `wrapped` under this key with the wrap `W` into `content_key`,
+	/// which takes the key whole.
+	///
+	/// # Errors
+	///
+	/// - [`EnvelopeError::KeyUnwrap`] -- `wrapped` fails the integrity check, or a length.
+	pub(super) fn unwrap_content_key(&self, wrapped: &[u8], content_key: &mut [u8]) -> Result<(), EnvelopeError> {
+		// A length or an integrity failure both leave the key wrapped, which is
+		// the one refusal of RFC 3394 §2.2.3.
+		W::unwrap_into(self, wrapped, content_key).map_err(|_| EnvelopeError::KeyUnwrap)
+	}
 }
 
 /// The `KEKRecipientInfo` (RFC 5652 §6.2.3, version 4) of a content key
@@ -149,7 +145,7 @@ pub(super) fn kek_info(
 ///
 /// - [`EnvelopeError::RecipientKind`] -- another number of recipients, or a recipient of another kind.
 /// - [`EnvelopeError::RecipientVersion`] -- the version is not 4.
-/// - [`EnvelopeError::KeyIdentifier`] -- the `kekid` names another key.
+/// - [`EnvelopeError::KeyIdentifier`] -- the `kekid` names another key, or carries a `date` or an `other`.
 /// - [`EnvelopeError::RecipientAlgorithm`] -- the key-encryption algorithm is another than `key_enc_alg`.
 pub(super) fn named_kek<'r>(
 	recipient_infos: &'r RecipientInfos,

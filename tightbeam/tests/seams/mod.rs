@@ -20,7 +20,7 @@
 //! - [`hpke`] and [`cms`] run both handshakes, under a provider that names no HPKE suite.
 //! - [`kem`] brings a KEM whose private-key operation is not Diffie-Hellman.
 //! - [`curves`] brings the decoder of a curve, which refuses its off-curve encodings at each reader of keys.
-//! - [`colony`] runs two gateways, a hive, and its servlet, each signing and verifying under the provider.
+//! - [`colony`] runs two gateways, a hive, and its servlet, which each sign and verify under the provider.
 //! - [`floor`] holds the strength floor of a provider at the TCP transport, and refuses a mixed pair.
 //! - [`curve`] brings a provider on P-256, which runs both handshakes and a renewal on the curve of its own.
 
@@ -46,6 +46,7 @@ use std::sync::Arc;
 use tightbeam::asn1::GcmParameters;
 use tightbeam::builder::frame::FrameBuilder;
 use tightbeam::builder::TypeBuilder;
+use tightbeam::crypto::aead::aes_kw::KekAes256;
 use tightbeam::crypto::aead::{
 	AeadAlgorithm, AeadCore, AeadInPlace, Aes128Gcm, Aes128GcmOid, Error as AeadError, Key, KeyInit, KeySizeUser,
 	Nonce, Tag,
@@ -65,7 +66,7 @@ use tightbeam::crypto::key::{DiffieHellman, KeyBackend, KeyError, Secp256k1KeyPr
 use tightbeam::crypto::policy::ProviderPolicy;
 use tightbeam::crypto::profiles::{
 	AeadProvider, Aes128Wrap, Aes256Wrap, CryptoProvider, CurveProvider, DefaultCryptoProvider, DigestProvider,
-	KdfProvider, KeyWrapAlgorithm, KeyWrapProvider, NoStrengthFloor, ProfileStrengthPolicy, SecurityProfile,
+	KdfProvider, Kek, KeyWrapAlgorithm, KeyWrapProvider, NoStrengthFloor, ProfileStrengthPolicy, SecurityProfile,
 	SigningProvider,
 };
 use tightbeam::crypto::secret::{SecretSlice, ToInsecure};
@@ -345,20 +346,23 @@ impl ContentEncryption for OutsideGcm {
 	}
 }
 
-/// A key wrap an outside crate brings with `wrap` and `unwrap` alone, over
-/// the house AES-256 key wrap, so the provided `unwrap_into` serves it.
+/// A key wrap an outside crate brings with `wrap` and `unwrap` alone, which
+/// runs AES-256 key wrap (RFC 3394) on the typed key it receives, so the
+/// provided `unwrap_into` serves it.
 struct OutsideWrap;
 
 impl KeyWrapAlgorithm for OutsideWrap {
 	type Oid = Aes256Wrap;
 	type KekSize = U32;
 
-	fn wrap(kek: &[u8], key: &[u8]) -> Result<Vec<u8>, KeyError> {
-		Aes256Wrap::wrap(kek, key)
+	fn wrap(kek: &Kek<'_, Self>, key: &[u8]) -> Result<Vec<u8>, KeyError> {
+		let wrapped = KekAes256::new(kek.as_array()).wrap_vec(key);
+		wrapped.map_err(KeyError::WrapFailed)
 	}
 
-	fn unwrap(kek: &[u8], wrapped: &[u8]) -> Result<ZeroizingBytes, KeyError> {
-		Aes256Wrap::unwrap(kek, wrapped)
+	fn unwrap(kek: &Kek<'_, Self>, wrapped: &[u8]) -> Result<ZeroizingBytes, KeyError> {
+		let unwrapped = KekAes256::new(kek.as_array()).unwrap_vec(wrapped);
+		unwrapped.map(Zeroizing::new).map_err(KeyError::WrapFailed)
 	}
 }
 
@@ -371,23 +375,40 @@ const RFC_3394_KEY_DATA: &str = "00112233445566778899aabbccddeeff";
 /// The RFC 3394 §4.3 ciphertext: the key data under the KEK.
 const RFC_3394_4_3: &str = "64e8c3f9ce0f5ba263e9777905818a2a93c8191e7d6e8ae7";
 
+/// An outside wrap reads the typed key it receives, and wraps as RFC 3394
+/// §4.3 does.
+#[test]
+fn an_outside_wrap_wraps_as_rfc_3394_4_3() -> Result<(), KeyError> {
+	let kek = unhex(RFC_3394_KEK);
+	let kek = Kek::<OutsideWrap>::try_from(kek.as_slice())?;
+
+	let wrapped = OutsideWrap::wrap(&kek, &unhex(RFC_3394_KEY_DATA))?;
+	assert_eq!(wrapped, unhex(RFC_3394_4_3));
+	Ok(())
+}
+
 /// The provided `unwrap_into` of an outside wrap copies the key its
 /// `unwrap` returns into the caller's buffer.
 #[test]
 fn an_outside_wrap_unwraps_into_a_buffer_of_its_key_size() -> Result<(), KeyError> {
+	let kek = unhex(RFC_3394_KEK);
+	let kek = Kek::<OutsideWrap>::try_from(kek.as_slice())?;
 	let mut key = [0u8; 16];
-	OutsideWrap::unwrap_into(&unhex(RFC_3394_KEK), &unhex(RFC_3394_4_3), &mut key)?;
+	OutsideWrap::unwrap_into(&kek, &unhex(RFC_3394_4_3), &mut key)?;
 	assert_eq!(key.as_slice(), unhex(RFC_3394_KEY_DATA).as_slice());
 	Ok(())
 }
 
 /// The provided `unwrap_into` refuses a buffer whose size differs from the key.
 #[test]
-fn an_outside_wrap_refuses_a_buffer_of_another_size() {
+fn an_outside_wrap_refuses_a_buffer_of_another_size() -> Result<(), KeyError> {
+	let kek = unhex(RFC_3394_KEK);
+	let kek = Kek::<OutsideWrap>::try_from(kek.as_slice())?;
 	let mut key = [0u8; 32];
-	let refused = OutsideWrap::unwrap_into(&unhex(RFC_3394_KEK), &unhex(RFC_3394_4_3), &mut key);
+	let refused = OutsideWrap::unwrap_into(&kek, &unhex(RFC_3394_4_3), &mut key);
 	let expected = ReceivedExpectedError { received: 32, expected: 16 };
 	assert!(matches!(refused, Err(KeyError::WrapLength(found)) if found == expected));
+	Ok(())
 }
 
 /// A provider an outside crate defines: its own signature, KDF, KEM, and
@@ -596,7 +617,7 @@ where
 }
 
 /// [`CONTENT`] sealed under [`OutsideProvider`] to `recipient`.
-fn outside_sealed(recipient: Recipient<'_, OutsideKem>) -> AuthEnvelopedData {
+fn outside_sealed(recipient: Recipient<'_, OutsideProvider>) -> AuthEnvelopedData {
 	let sealed = AuthEnvelopedData::seal::<OutsideProvider>(recipient, DATA, CONTENT, [], None);
 	sealed.expect("the content seals under the outside provider")
 }
@@ -683,8 +704,9 @@ fn the_key_agreement_use_refuses_a_compact_point_for_an_outside_kem() -> Result<
 #[tokio::test]
 async fn an_outside_provider_opens_its_kek_seal() -> Result<(), Box<dyn std::error::Error>> {
 	let kek = [0x24u8; 16];
-	let sealed = outside_sealed(Recipient::Kek { kek: &kek, key_identifier: b"outside" });
-	let opener = Opener::Kek { kek: &kek, key_identifier: b"outside" };
+	let kek = Kek::try_from(kek.as_slice())?;
+	let sealed = outside_sealed(Recipient::Kek { kek, key_identifier: b"outside" });
+	let opener = Opener::Kek { kek, key_identifier: b"outside" };
 	let arrived = sealed.to_der()?;
 
 	let opened = sealed.open::<OutsideProvider>(arrived, &opener, DATA).await?;
@@ -735,12 +757,16 @@ async fn an_outside_identity_refuses_a_high_s() -> Result<(), Box<dyn std::error
 	Ok(())
 }
 
-/// The house provider refuses an outside seal, whose cipher is not its own.
+/// The house provider refuses an outside seal, whose cipher is not its own,
+/// before its key runs.
 #[tokio::test]
 async fn the_house_provider_refuses_an_outside_seal() -> Result<(), Box<dyn std::error::Error>> {
-	let kek = [0x24u8; 16];
-	let sealed = outside_sealed(Recipient::Kek { kek: &kek, key_identifier: b"outside" });
-	let opener = Opener::Kek { kek: &kek, key_identifier: b"outside" };
+	let outside_kek = [0x24u8; 16];
+	let outside_kek = Kek::try_from(outside_kek.as_slice())?;
+	let sealed = outside_sealed(Recipient::Kek { kek: outside_kek, key_identifier: b"outside" });
+	let house_kek = [0x24u8; 32];
+	let house_kek = Kek::try_from(house_kek.as_slice())?;
+	let opener = Opener::Kek { kek: house_kek, key_identifier: b"outside" };
 	let arrived = sealed.to_der()?;
 
 	let refused = sealed.open::<DefaultCryptoProvider>(arrived, &opener, DATA).await;

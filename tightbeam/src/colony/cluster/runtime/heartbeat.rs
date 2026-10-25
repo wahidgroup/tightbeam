@@ -14,10 +14,7 @@ use crate::colony::cluster::runtime::bounds::{ColonyConfig, ColonyDialProtocol, 
 use crate::colony::cluster::runtime::hop::HivePlane;
 use crate::colony::cluster::runtime::LoopFault;
 use crate::colony::cluster::{ClusterError, HeartbeatEvent, HiveEntry};
-use crate::colony::common::{
-	ClusterCommand, ClusterCommandKind, ClusterCommandOutcome, ClusterCommandResponse, ClusterStatus, HeartbeatParams,
-	HeartbeatResult,
-};
+use crate::colony::common::{ClusterCommand, ClusterCommandResponse, ClusterStatus, HeartbeatParams, HeartbeatResult};
 use crate::decode;
 use crate::instrumentation::events::{CLUSTER_HIVE_EVICTED, CLUSTER_RELAY_TRAIL_PRUNED};
 use crate::policy::TransitStatus;
@@ -58,14 +55,13 @@ impl<P: ColonyDialProtocol> HiveBeat<P> {
 	/// - [`ClusterError::InvalidAddress`] -- the hive's address does not parse
 	///   as an address of this protocol.
 	/// - [`ClusterError::ConnectFailed`] -- the dial or the handshake failed.
-	/// - [`ClusterError::NoResponse`] -- the hive closed without answering.
+	/// - [`ClusterError::NoResponse`] -- the hive closed before it answered.
 	/// - [`ClusterError::MalformedResponse`] -- the answer carried no heartbeat result.
 	/// - [`ClusterError::Transport`] -- the emit failed.
 	/// - [`ClusterError::Frame`] -- the frame failed to build, sign, or decode,
 	///   or the trace refused the event of a refused dial.
 	pub(crate) async fn send(self, hive: &HiveEntry) -> Result<HeartbeatResult, ClusterError> {
-		let probe = ClusterCommandKind::Heartbeat(HeartbeatParams { cluster_status: ClusterStatus::Healthy });
-		let cmd = ClusterCommand::from(probe);
+		let cmd = ClusterCommand::Heartbeat(HeartbeatParams { cluster_status: ClusterStatus::Healthy });
 
 		// Priority is a V2+ metadata field. A V1 frame that composes it fails
 		// at build time, so every heartbeat would count as a send failure.
@@ -83,9 +79,9 @@ impl<P: ColonyDialProtocol> HiveBeat<P> {
 		let response = client.emit(signed_frame, None).await?.ok_or(ClusterError::NoResponse)?;
 
 		let cmd_response: ClusterCommandResponse = decode(response.message())?;
-		match cmd_response.into_choice() {
-			Ok(ClusterCommandOutcome::Heartbeat(result)) => Ok(result),
-			Ok(ClusterCommandOutcome::Manage(_)) | Err(_) => Err(ClusterError::MalformedResponse),
+		match cmd_response {
+			ClusterCommandResponse::Heartbeat(result) => Ok(result),
+			ClusterCommandResponse::Manage(_) => Err(ClusterError::MalformedResponse),
 		}
 	}
 }

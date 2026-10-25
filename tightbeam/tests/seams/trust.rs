@@ -11,9 +11,12 @@
 //!   reads the crate's default `verify_presented` over its `verify_chain`.
 //! - A mutual server admits its client through it, which reads the crate's
 //!   default `evaluate_presented` over its `evaluate`.
+//! - A session's canonical key finds its pin through the crate's default `find_by_canonical_key`.
 //!
 //! It reads a key by its [`CanonicalKey`], the rule that the contract of
-//! [`CertificateTrust`] names.
+//! [`CertificateTrust`] names. [`IndexedTrust`] finds the same pins through a
+//! [`KeyIndex`] of its own, so a session's canonical key finds its pin with no
+//! decode, as the built-in store finds it.
 
 use std::sync::Arc;
 
@@ -27,7 +30,8 @@ use tightbeam::crypto::x509::error::CertificateValidationError;
 use tightbeam::crypto::x509::policy::CertificateValidation;
 use tightbeam::crypto::x509::store::{CertificateTrust, TrustVerification};
 use tightbeam::crypto::x509::utils::CertificateExt;
-use tightbeam::crypto::x509::{CanonicalKey, ErasedSigning, KeyPurposes, PeerCertificate};
+use tightbeam::crypto::x509::{CanonicalKey, ErasedSigning, KeyIndex, KeyPurposes, PeerCertificate};
+use tightbeam::der::Error as DerError;
 use tightbeam::spki::SubjectPublicKeyInfoOwned;
 use tightbeam::testing::{TestCertificate, TestIdentity, TestKey, TestMessage};
 use tightbeam::x509::Certificate;
@@ -180,6 +184,92 @@ fn an_outside_trust_finds_a_pinned_key_in_its_compressed_form() {
 
 	let enrolled = trust.enrolled_certificate(&compressed);
 	assert_eq!(enrolled, Some(&pinned));
+}
+
+/// The crate's default lookup by canonical key decodes the key and asks the
+/// outside store, so the canonical form of a pinned key finds its pin.
+#[test]
+fn an_outside_trust_answers_a_canonical_key_through_the_default() -> Result<(), DerError> {
+	let pinned = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+	let compressed = TestCertificate::with_compressed_key(pinned.to_owned());
+	let trust = PinningTrust::of(vec![pinned.to_owned()]);
+	let key = CanonicalKey::of(&compressed.tbs_certificate.subject_public_key_info)?;
+
+	let found = trust.find_by_canonical_key(&key);
+	assert_eq!(found, Some(&pinned));
+	Ok(())
+}
+
+/// A store that keeps the pin of a [`PinningTrust`] in a [`KeyIndex`] of its
+/// own, and finds a key there as the built-in store finds it.
+#[derive(Debug)]
+struct IndexedTrust {
+	/// The store that answers each lookup by certificate.
+	pins: PinningTrust,
+	/// The pin under the canonical form of its key.
+	keys: KeyIndex<Certificate>,
+}
+
+impl IndexedTrust {
+	/// A store that pins `pinned` and indexes its key.
+	fn of(pinned: Certificate) -> Self {
+		let mut keys = KeyIndex::default();
+		let indexed = keys.insert(&pinned.tbs_certificate.subject_public_key_info, pinned.to_owned());
+		indexed.expect("the canonical form of a fixture key encodes");
+		let pins = PinningTrust::of(vec![pinned]);
+		Self { pins, keys }
+	}
+}
+
+impl CertificateValidation for IndexedTrust {
+	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
+		self.pins.evaluate(cert)
+	}
+}
+
+impl CertificateTrust for IndexedTrust {
+	fn is_trusted(&self, cert: &Certificate) -> bool {
+		self.pins.is_trusted(cert)
+	}
+
+	fn verify_chain(&self, chain: &[Certificate]) -> Result<Arc<Certificate>, CertificateValidationError> {
+		self.pins.verify_chain(chain)
+	}
+
+	fn trust_anchor(&self, cert: &Certificate) -> Result<Arc<Certificate>, CertificateValidationError> {
+		self.pins.trust_anchor(cert)
+	}
+
+	fn find_by_signer_identifier(&self, sid: &SignerIdentifier) -> Option<&PeerCertificate<ErasedSigning>> {
+		self.pins.find_by_signer_identifier(sid)
+	}
+
+	fn find_by_public_key(&self, spki: &SubjectPublicKeyInfoOwned) -> Option<&Certificate> {
+		self.keys.find(spki)
+	}
+
+	/// The index finds `key` by its DER as it stands, with no decode.
+	fn find_by_canonical_key(&self, key: &CanonicalKey) -> Option<&Certificate> {
+		self.keys.get(key)
+	}
+
+	fn to_policy_ref(&self) -> &dyn VerificationPolicy {
+		self.pins.to_policy_ref()
+	}
+}
+
+/// An outside store built on the crate's key index finds a session's
+/// canonical key in that index, as the built-in store does.
+#[test]
+fn an_outside_trust_finds_a_canonical_key_in_its_key_index() -> Result<(), DerError> {
+	let pinned = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+	let compressed = TestCertificate::with_compressed_key(pinned.to_owned());
+	let trust = IndexedTrust::of(pinned.to_owned());
+	let key = CanonicalKey::of(&compressed.tbs_certificate.subject_public_key_info)?;
+
+	let found = trust.find_by_canonical_key(&key);
+	assert_eq!(found, Some(&pinned));
+	Ok(())
 }
 
 /// The key whose point is the generator of secp256k1, whose y-coordinate is

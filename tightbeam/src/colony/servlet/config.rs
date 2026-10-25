@@ -29,7 +29,7 @@ use crate::transport::TransportEncryptionConfig;
 /// the advertisement exists only where a handshake exists. The encrypted arm
 /// carries it, so a cleartext servlet that advertises multiplexing is
 /// unrepresentable rather than silently ignored.
-pub enum ServletAccept<C: CryptoProvider> {
+pub(crate) enum ServletAccept<C: CryptoProvider> {
 	/// The servlet accepts cleartext connections without multiplexing.
 	Cleartext,
 	/// The servlet presents a certificate and may advertise multiplexing.
@@ -93,14 +93,18 @@ where
 }
 
 pub(crate) mod sealed {
-	use super::{CryptoProvider, ServletAccept};
+	use super::{CryptoProvider, Message, Protocol, ServletConfig, ServletConfigBuilder};
 
 	/// Closes [`AcceptState`](super::AcceptState) to the two states this
 	/// module defines, so no outside type can claim a third, and keeps the
 	/// accept shape itself off the public surface.
-	pub trait Sealed<C: CryptoProvider> {
-		/// The accept shape this state builds.
-		fn into_accept(self) -> ServletAccept<C>;
+	pub trait Sealed<C: CryptoProvider>: Sized {
+		/// Finishes `builder`, which holds this state, into a configuration
+		/// that accepts the way this state names.
+		fn finish<P, M, Env>(builder: ServletConfigBuilder<P, M, C, Env, Self>) -> ServletConfig<P, M, C, Env>
+		where
+			P: Protocol,
+			M: Message;
 	}
 }
 
@@ -109,7 +113,7 @@ pub(crate) mod sealed {
 ///
 /// The state carries the accept material itself, so the builder holds the
 /// certificate and the mux offer in exactly one place, and
-/// [`ServletConfigBuilder::build`] reads the state rather than re-deriving it.
+/// [`ServletConfigBuilder::build`] reads the material from that place.
 pub trait AcceptState<C: CryptoProvider>: sealed::Sealed<C> {}
 
 /// The state of a fresh builder, before it names a certificate or cleartext.
@@ -132,14 +136,25 @@ pub struct WithCertificate<C: CryptoProvider> {
 }
 
 impl<C: CryptoProvider> sealed::Sealed<C> for Cleartext {
-	fn into_accept(self) -> ServletAccept<C> {
-		ServletAccept::Cleartext
+	fn finish<P, M, Env>(builder: ServletConfigBuilder<P, M, C, Env, Self>) -> ServletConfig<P, M, C, Env>
+	where
+		P: Protocol,
+		M: Message,
+	{
+		builder.into_config(|Self| ServletAccept::Cleartext)
 	}
 }
 
 impl<C: CryptoProvider> sealed::Sealed<C> for WithCertificate<C> {
-	fn into_accept(self) -> ServletAccept<C> {
-		ServletAccept::Encrypted { encryption: Box::new(self.encryption), mux_offer: self.mux_offer }
+	fn finish<P, M, Env>(builder: ServletConfigBuilder<P, M, C, Env, Self>) -> ServletConfig<P, M, C, Env>
+	where
+		P: Protocol,
+		M: Message,
+	{
+		builder.into_config(|Self { encryption, mux_offer }| ServletAccept::Encrypted {
+			encryption: Box::new(encryption),
+			mux_offer,
+		})
 	}
 }
 
@@ -423,17 +438,30 @@ where
 
 	/// Finishes the builder into a [`ServletConfig`].
 	///
-	/// The accept state carries the certificate and the offer, so this
-	/// reads the state rather than re-deriving which one the builder is in.
+	/// The accept state carries the certificate and the offer, so the type of
+	/// that state picks the accept shape this builds.
 	pub fn build(self) -> ServletConfig<P, M, C, Env>
 	where
 		A: AcceptState<C>,
 	{
+		A::finish(self)
+	}
+}
+
+impl<P, M, C, Env, A> ServletConfigBuilder<P, M, C, Env, A>
+where
+	P: Protocol,
+	M: Message,
+	C: CryptoProvider,
+{
+	/// The configuration this builder holds, which accepts by the shape that
+	/// `accept` makes of the builder's state.
+	fn into_config(self, accept: impl FnOnce(A) -> ServletAccept<C>) -> ServletConfig<P, M, C, Env> {
 		ServletConfig {
 			_protocol: PhantomData,
 			_message: PhantomData,
 			_crypto: PhantomData,
-			accept: sealed::Sealed::into_accept(self.accept),
+			accept: accept(self.accept),
 			servlet_config: self.servlet_config,
 			hive_context: self.hive_context,
 			workers: self.workers,

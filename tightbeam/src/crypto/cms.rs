@@ -85,7 +85,7 @@ pub(in crate::crypto) use envelope::Detached;
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 pub use error::EnvelopeError;
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
-pub(crate) use kek::Kek;
+pub(crate) use kek::OwnedKek;
 #[cfg(all(feature = "hpke", feature = "signature"))]
 pub use recipient::{
 	BareKemKey, Encapsulation, KemKeyHolder, KemRecipient, KeyAgreementIdentity, Opener, Recipient, RecipientKem,

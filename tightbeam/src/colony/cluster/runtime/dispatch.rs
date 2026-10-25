@@ -16,7 +16,7 @@
 
 use crate::colony::cluster::runtime::bounds::{ColonyDialProtocol, GatewayRuntimeCtx};
 use crate::colony::cluster::{ClusterWorkRequest, ClusterWorkResponse, HopBudget, WireHopBudget};
-use crate::colony::common::{reply_frame, ClusterRequest};
+use crate::colony::common::{ClusterRequest, ReplyForm};
 use crate::decode;
 use crate::policy::{SessionContext, TransitStatus};
 use crate::Frame;
@@ -38,8 +38,8 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 	/// Gate policies run first. Export gates run on the work arm only,
 	/// after the servlet target is known from the decoded envelope.
 	///
-	/// - `frame`: admitted unary control frame
-	/// - `session`: caller identity facts for the connection
+	/// - `frame`: the admitted unary control frame
+	/// - `session`: the caller identity facts for the connection
 	pub(crate) async fn handle_request(
 		self,
 		frame: Frame,
@@ -48,7 +48,7 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 		let cluster_request = match self.admit_request(&frame, &session)? {
 			RequestAdmission::Admitted(request) => request,
 			RequestAdmission::Refused(status) => {
-				return reply_frame(frame.metadata().id(), ClusterWorkResponse::err(status));
+				return ReplyForm::Plain.reply(frame.metadata().id(), ClusterWorkResponse::err(status));
 			}
 		};
 
@@ -78,10 +78,10 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 			RequestAdmission::Admitted(ClusterRequest::Work(request)) => request,
 			RequestAdmission::Admitted(_) => {
 				let refusal = ClusterWorkResponse::err(TransitStatus::PermissionDenied);
-				return reply_frame(frame.metadata().id(), refusal);
+				return ReplyForm::Plain.reply(frame.metadata().id(), refusal);
 			}
 			RequestAdmission::Refused(status) => {
-				return reply_frame(frame.metadata().id(), ClusterWorkResponse::err(status));
+				return ReplyForm::Plain.reply(frame.metadata().id(), ClusterWorkResponse::err(status));
 			}
 		};
 
@@ -123,7 +123,7 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 
 		let export_status = config.evaluate_export_gates(target, &session, relayed, &self.trace)?;
 		if export_status != TransitStatus::Ok {
-			return reply_frame(frame.metadata().id(), ClusterWorkResponse::err(export_status));
+			return ReplyForm::Plain.reply(frame.metadata().id(), ClusterWorkResponse::err(export_status));
 		}
 
 		self.handle_work(frame, request, budget).await

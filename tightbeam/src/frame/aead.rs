@@ -22,8 +22,8 @@ use crate::oids::DATA;
 use crate::version::GatedField;
 
 impl Frame {
-	/// Decrypt the message body with `decryptor` and return the plaintext
-	/// bytes, consuming the frame.
+	/// Consume the frame, decrypt its message body with `decryptor`, and return
+	/// the plaintext bytes.
 	///
 	/// # Plaintext
 	///
@@ -37,9 +37,9 @@ impl Frame {
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError::MissingEncryptionInfo`] when the metadata holds no
+	/// - [`TightBeamError::MissingEncryptionInfo`] -- the metadata holds no
 	///   encryption info, as V0 metadata does.
-	/// - Decryption errors from [`DecryptContent::decrypt_content`].
+	/// - The errors of [`DecryptContent::decrypt_content`].
 	pub async fn decrypt_bytes(mut self, decryptor: &(impl Decryptor + ?Sized)) -> Result<SecretSlice<u8>> {
 		let sealed = self
 			.metadata
@@ -63,11 +63,11 @@ impl Frame {
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError::MissingEncryptionInfo`] when the metadata holds no
+	/// - [`TightBeamError::MissingEncryptionInfo`] -- the metadata holds no
 	///   encryption info, as V0 metadata does.
-	/// - [`TightBeamError::MissingInflator`] when the body is compressed with no inflator.
-	/// - Decryption or decompression errors from the underlying implementations.
-	/// - [`TightBeamError::SerializationError`] when the cleartext fails to decode as `T`.
+	/// - [`TightBeamError::MissingInflator`] -- the body is compressed and `inflator` is `None`.
+	/// - The errors of [`DecryptContent::decrypt_content`] and [`Inflator::decompress`].
+	/// - [`TightBeamError::SerializationError`] -- the cleartext fails to decode as `T`.
 	pub async fn decrypt<T>(
 		mut self,
 		decryptor: &(impl Decryptor + ?Sized),
@@ -80,22 +80,22 @@ impl Frame {
 		crate::decode::<T>(&self.message)
 	}
 
-	/// Decrypt the message body in place, turning an encrypted frame into
-	/// its cleartext equivalent. On any error the frame is unchanged.
+	/// Decrypt the message body in place, so an encrypted frame becomes its
+	/// cleartext equivalent. On any error the frame is unchanged.
 	///
 	/// # Verify first
 	///
 	/// Frame-level `integrity` and `nonrepudiation` cover the encrypted body,
 	/// and this method leaves them untouched. Verify them *before* the call
 	/// ([`Frame::verify_frame_integrity`], [`Frame::verify`]), because they
-	/// stop matching afterwards. The message commitment in `metadata.integrity`
+	/// fail on the cleartext. The message commitment in `metadata.integrity`
 	/// is the check that survives decryption ([`Frame::verify_commitment_of`]).
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError::MissingEncryptionInfo`] when the frame is not encrypted.
-	/// - [`TightBeamError::MissingInflator`] when the body is compressed with no inflator.
-	/// - Decryption or decompression errors from the underlying implementations.
+	/// - [`TightBeamError::MissingEncryptionInfo`] -- the frame is not encrypted.
+	/// - [`TightBeamError::MissingInflator`] -- the body is compressed and `inflator` is `None`.
+	/// - The errors of [`DecryptContent::decrypt_content`] and [`Inflator::decompress`].
 	pub async fn decrypt_in_place(
 		&mut self,
 		decryptor: &(impl Decryptor + ?Sized),
@@ -139,16 +139,17 @@ impl Frame {
 	/// encrypted by the key-encryption key an async key provider holds.
 	///
 	/// Use it when an [`EncryptingKeyProvider`], such as an HSM or a KMS, holds
-	/// the key-encryption key. On any error the frame is unchanged. On success
-	/// the method stores:
+	/// the key-encryption key. A refusal of the version or of the seal leaves
+	/// the frame unchanged. On success the method stores:
 	///
 	/// - The envelope in the `confidentiality` field, its recipient named by the provider's key identifier.
 	/// - The encrypted bytes in the `message` field, detached from the envelope (RFC 5652 §6.1).
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError::UnsupportedVersion`] when the frame version predates confidentiality.
-	/// - [`TightBeamError::EnvelopeError`] when the provider or the envelope refuses to seal.
+	/// - [`TightBeamError::UnsupportedVersion`] -- the frame version predates confidentiality.
+	/// - [`TightBeamError::EnvelopeError`] -- the provider or the envelope refuses to seal.
+	/// - [`TightBeamError::SerializationError`] -- the sealed envelope fails to encode.
 	#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 	pub async fn encrypt_with_provider<P>(&mut self, provider: &(impl EncryptingKeyProvider + ?Sized)) -> Result<()>
 	where
@@ -179,9 +180,9 @@ impl Frame {
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError::MissingEncryptionInfo`] when the frame is not encrypted.
-	/// - [`TightBeamError::EnvelopeError`] when the envelope names another key
-	///   or another algorithm than the provider's and `P`'s, or fails to open.
+	/// - [`TightBeamError::MissingEncryptionInfo`] -- the frame is not encrypted.
+	/// - [`TightBeamError::EnvelopeError`] -- the envelope names another key or
+	///   another algorithm than the provider's and `P`'s, or fails to open.
 	#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 	pub async fn decrypt_with_provider<P>(&mut self, provider: &(impl EncryptingKeyProvider + ?Sized)) -> Result<()>
 	where
@@ -295,7 +296,7 @@ mod tests {
 		fn an_in_memory_kek_of_another_size_is_refused() {
 			let refused = Aes256GcmKeyProvider::new(vec![0x33; 16], b"tb/test/kek/v1".to_vec());
 			let expected = ReceivedExpectedError { received: 16, expected: 32 };
-			assert!(matches!(refused, Err(KeyError::WrapLength(found)) if found == expected));
+			assert!(matches!(refused, Err(KeyError::KekLength(found)) if found == expected));
 		}
 
 		/// The ciphertext travels in the message, so the envelope in the
@@ -494,7 +495,7 @@ mod tests {
 			Ok(())
 		}
 
-		/// A key holder that refuses every key it is given.
+		/// A key holder that refuses every key it receives.
 		#[derive(Debug)]
 		struct RefusingHolder;
 
@@ -536,8 +537,8 @@ mod tests {
 			Ok(())
 		}
 
-		/// A body that fails its tag is refused by the provider's open, which
-		/// runs in the body's own buffer and leaves the frame as it arrived.
+		/// The provider's open refuses a body that fails its tag, and the open
+		/// runs in the body's own buffer, so it leaves the frame as it arrived.
 		#[tokio::test]
 		async fn a_provider_open_of_a_body_that_fails_its_tag_leaves_the_frame() -> Result<()> {
 			let message = TestMessage::sample(None);
@@ -570,8 +571,8 @@ mod tests {
 			Ok(())
 		}
 
-		// A frame that names another algorithm is refused before the provider
-		// decrypts it.
+		// `decrypt_with_provider` refuses a frame that names another algorithm
+		// before the provider decrypts it.
 		#[tokio::test]
 		async fn a_provider_refuses_a_frame_that_names_another_algorithm() -> Result<()> {
 			let message = TestMessage::sample(None);

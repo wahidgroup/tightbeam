@@ -10,8 +10,8 @@
 //!
 //! A drift from the live wire is the detection signal, not a defect:
 //!
-//! - Wire allowed and shadow denied fires `SHADOW_VIOLATION`.
-//! - Wire denied and shadow allowed fires `SHADOW_TOO_CLOSED`.
+//! - When the wire allows and the shadow denies, the oracle fires `SHADOW_VIOLATION`.
+//! - When the wire denies and the shadow allows, the oracle fires `SHADOW_TOO_CLOSED`.
 //!
 //! # Composition
 //!
@@ -23,14 +23,14 @@
 //! 2. ACL deny gate
 //! 3. Export allowlist
 //! 4. ACL grant on origin requests only
-//! 5. First-party origin via [`TrustPlanes`]
+//! 5. First-party origin through [`TrustPlanes`]
 //!
 //! # Peer advertisement
 //!
 //! [`GatewayShadow::predict_peer_ad`] models the pre-decode gate and the
-//! fixed peer-trust set only. The harness keeps the other stages passing on
-//! the positive path by construction (monotonic `control_order`,
-//! single-type slates):
+//! fixed peer-trust set only. The harness builds its inputs so that the other
+//! stages pass on the positive path (monotonic `control_order`, single-type
+//! slates):
 //!
 //! - Frame-signature checks.
 //! - Freshness and replay guards.
@@ -42,7 +42,7 @@
 
 use std::sync::Arc;
 
-use tightbeam::colony::cluster::{DynamicExportList, ExportAllowlist, TrustPlaneStores, TrustPlanes};
+use tightbeam::colony::cluster::{DynamicExportList, ExportAllowlist, Party, TrustPlaneStores, TrustPlanes};
 use tightbeam::crypto::x509::store::CertificateTrust;
 use tightbeam::crypto::x509::{CanonicalKey, Certificate};
 use tightbeam::urn::Urn;
@@ -118,7 +118,8 @@ impl GatewayShadow {
 			hive: Some(self.hive_trust.as_ref()),
 			peer: Some(self.peer_trust.as_ref()),
 		});
-		if !attempt.relayed && planes.is_first_party(attempt.caller_cert) {
+		let first_party = matches!(planes.classify(attempt.caller_cert), Party::FirstParty);
+		if !attempt.relayed && first_party {
 			return Prediction::Allow;
 		}
 
@@ -128,7 +129,7 @@ impl GatewayShadow {
 	/// Predict whether a signed peer advertisement from `signer` admits.
 	///
 	/// It covers the pre-decode gate and peer-trust membership only. The
-	/// harness construction keeps the other wire stages non-refusing (see the
+	/// harness builds its inputs so that the other wire stages pass (see the
 	/// module header).
 	pub fn predict_peer_ad(&self, signer: &Certificate) -> Prediction {
 		if self.policy_gate.is_rejecting() {

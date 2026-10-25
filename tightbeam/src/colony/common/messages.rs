@@ -7,17 +7,17 @@
 //!   cluster to a hive, and [`ClusterCommandResponse`] answers it.
 //! - [`ReplyShape`] decides the alternative and the priority of a command's reply.
 
-use super::{reply_frame, reply_frame_with_priority};
 use crate::asn1::Frame;
+use crate::builder::TypeBuilder;
 use crate::cms::signed_data::SignerIdentifier;
 use crate::constants::DEFAULT_HOP_BUDGET;
-use crate::der::{Choice, Enumerated, Sequence, TagNumber};
+use crate::der::{Choice, Enumerated, Sequence};
 use crate::policy::TransitStatus;
 use crate::urn::Urn;
 use crate::utils::time::UnixMillis;
 use crate::utils::{decode, encode, BasisPoints};
 use crate::wire::wire_sequence;
-use crate::{Beamable, Errorizable, MessagePriority, TightBeamError};
+use crate::{Beamable, Message, MessagePriority, TightBeamError, Version};
 
 /// The work request envelope for cluster routing.
 ///
@@ -65,8 +65,8 @@ impl ClusterWorkRequest {
 		Ok(Self { servlet_type, payload: encode(frame)?, hops_remaining: DEFAULT_HOP_BUDGET })
 	}
 
-	/// Re-emits the work toward a peer with the remaining relay budget. A `0`
-	/// budget is the terminal hop, so the receiver serves locally only.
+	/// Re-emits the work toward a peer with the relay budget that remains. A
+	/// `0` budget is the terminal hop, so the receiver serves locally only.
 	#[must_use]
 	pub fn into_relayed(mut self, hops_remaining: u8) -> Self {
 		self.hops_remaining = hops_remaining;
@@ -283,16 +283,17 @@ pub struct ServletAddressUpdateResponse {
 
 /// A peer gateway's advertisement of the servlet types its colony exports.
 ///
-/// A gateway sends it to a peer gateway, so the receiving colony learns
-/// which types the peer serves and forwards work there. It carries type URNs
-/// alone, without instance addresses. Peers reach the gateway at
+/// A gateway sends it to a peer gateway, so the colony that receives it
+/// learns which types the peer serves and forwards work there. It carries
+/// type URNs alone, without instance addresses. Peers reach the gateway at
 /// `gateway_addr`, which resolves the whole peer colony rather than a single
 /// servlet.
 #[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct PeerAdvertisement {
-	/// The address that peers dial to reach the advertising gateway.
+	/// The address that peers dial to reach the gateway that sends this
+	/// advertisement.
 	pub gateway_addr: Vec<u8>,
-	/// The servlet type URNs that the advertising colony exports.
+	/// The servlet type URNs that the sender's colony exports.
 	pub advertised_types: Vec<Urn<'static>>,
 }
 
@@ -305,7 +306,7 @@ pub struct PeerAdvertisementResponse {
 	pub status: TransitStatus,
 }
 
-/// How a receiving gateway consumes an admitted rumor payload.
+/// How the gateway that receives an admitted rumor consumes its payload.
 ///
 /// The kind travels inside the signed rumor body, so a relay cannot
 /// reinterpret an application payload as routing control.
@@ -316,19 +317,20 @@ pub enum GossipRumorKind {
 	#[default]
 	Application = 0,
 	/// The bytes of an origin-signed peer advertisement frame, which the
-	/// receiving gateway applies to its peer routing state for transitive
-	/// discovery.
+	/// gateway that receives the rumor applies to its peer routing state for
+	/// transitive discovery.
 	PeerAdvertisement = 1,
 }
 
-/// The signed content of one gossip rumor, which is its opaque payload.
+/// The signed content of one gossip rumor: its opaque payload and the kind
+/// that names how a gateway consumes it.
 ///
 /// # Roles
 ///
 /// This one structure serves both gossip roles:
 ///
 /// - A publisher sends it as [`ClusterRequest::PublishGossip`] to request a flood.
-/// - The accepting origin gateway embeds the identical DER bytes as the
+/// - The origin gateway that accepts it embeds the identical DER bytes as the
 ///   `message` of a rumor [`Frame`] it signs with its cluster key, so the
 ///   payload is bound under the origin signature at every later hop. The
 ///   signature covers the version, the metadata, and the message (§5.7.5).
@@ -340,22 +342,24 @@ pub enum GossipRumorKind {
 /// rumor names no destination and its bytes carry no scope, because unsigned
 /// scope bytes would be weaker than the certificate binding (CWE-345).
 ///
-/// Local delivery follows the receiving gateway's policy: the optional
-/// ingress servlet receives the origin-signed frame that carries this body.
+/// Local delivery follows the policy of the receiver: the optional ingress
+/// servlet receives the origin-signed frame that carries this body.
 ///
 /// # Frame fields
 ///
 /// - The rumor frame's `metadata.id` is the rumor identity, and its
 ///   `metadata.order` is the issue time in unix milliseconds (§5.7.1 permits
-///   a time-based order). The origin gateway copies both from the publish frame.
-/// - Hop state such as the remaining flood radius MUST stay outside the rumor
-///   frame. It travels in the `metadata.lifetime` of the outer relay frame,
-///   which each relay rebuilds and re-signs.
+///   a time-based order). The origin gateway copies both from the publish
+///   frame.
+/// - Hop state such as the flood radius that remains MUST stay outside the
+///   rumor frame. It travels in the `metadata.lifetime` of the outer relay
+///   frame, which each relay rebuilds and re-signs.
 #[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct GossipRumor {
-	/// The opaque application payload, delivered through the ingress policy.
+	/// The opaque payload: an application payload for the ingress policy, or
+	/// the bytes of a peer advertisement frame, as `kind` names.
 	pub payload: Vec<u8>,
-	/// How the receiving gateway consumes `payload`. The common
+	/// How the gateway that receives the rumor consumes `payload`. The common
 	/// application kind is the DER DEFAULT, so the encoding omits it.
 	pub kind: GossipRumorKind,
 }
@@ -384,9 +388,9 @@ pub struct GossipResponse {
 	/// rumor, delivered it, and considered it for a reflood.
 	///
 	/// On a relayed rumor, `Unauthenticated` means the receiver's trust does
-	/// not hold the rumor's origin, and it tells the sender to stop offering
-	/// that origin to this receiver. A frame with no signature answers the
-	/// same status.
+	/// not hold the rumor's origin, and it tells the sender to withhold that
+	/// origin from this receiver. A frame with no signature answers the same
+	/// status.
 	pub status: TransitStatus,
 }
 
@@ -404,7 +408,7 @@ impl GossipResponse {
 }
 
 /// A summary of the rumors a gateway retains, sent so a peer can pull the
-/// missing ones.
+/// ones it lacks.
 ///
 /// This is the anti-entropy backstop to the best-effort flood. Reconciliation
 /// is an unordered set difference over content digests, with no cursor. A
@@ -501,8 +505,8 @@ pub struct ServletInfo {
 	pub servlet_id: Urn<'static>,
 	/// The address that reaches the servlet.
 	pub address: Vec<u8>,
-	/// The `SignerIdentifier` that names the certificate the servlet presents
-	/// in its handshake (RFC 5652 §5.3), encoded as its own DER.
+	/// The [`SignerIdentifier`] that names the certificate the servlet
+	/// presents in its handshake (RFC 5652 §5.3), encoded as its own DER.
 	///
 	/// A gateway that dials the servlet admits only the certificate this
 	/// signer names, so a party that answers at the address under another
@@ -528,50 +532,68 @@ impl ServletInfo {
 	}
 }
 
-/// Why a CHOICE-shaped product named no single alternative.
+/// The hive management request, an ASN.1 CHOICE.
 ///
-/// DER CHOICE admits exactly one alternative. These products spell a choice
-/// as tagged optional fields, so the encoding can carry none or more than one,
-/// and a reader refuses both rather than guess.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Errorizable)]
-pub enum ChoiceRefusal {
-	/// The product sets no alternative.
-	#[error("the product named no alternative")]
-	NoneSet,
-	/// The product sets more than one alternative.
-	#[error("the product named more than one alternative")]
-	ManySet,
-}
-
-/// The single request a [`HiveManagementRequest`] names.
-#[derive(Debug, Clone, PartialEq)]
+/// The context-specific tag names the one request the value carries, and the
+/// encoding is the chosen alternative alone (X.690 § 8.13), so a request
+/// names exactly one alternative.
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam::colony::common::{HiveManagement, ListServletsParams};
+/// use tightbeam::{decode, encode};
+///
+/// let list = HiveManagement::List(ListServletsParams { filter: None });
+///
+/// let encoded = encode(&list)?;
+/// assert_eq!(encoded, [0xa1, 0x02, 0x30, 0x00]);
+/// assert_eq!(decode::<HiveManagement>(&encoded)?, list);
+/// # Ok::<(), Box<dyn core::error::Error>>(())
+/// ```
+#[derive(Debug, Beamable, Choice, Clone, PartialEq)]
 pub enum HiveManagement {
-	/// Spawn one servlet instance.
+	/// Spawn one servlet instance [context 0].
+	#[asn1(context_specific = "0", constructed = "true")]
 	Spawn(SpawnServletParams),
-	/// List the active servlets.
+	/// List the active servlets [context 1].
+	#[asn1(context_specific = "1", constructed = "true")]
 	List(ListServletsParams),
-	/// Stop one servlet instance.
+	/// Stop one servlet instance [context 2].
+	#[asn1(context_specific = "2", constructed = "true")]
 	Stop(StopServletParams),
 }
 
-/// The single result a [`HiveManagementResponse`] names.
-#[derive(Debug, Clone, PartialEq)]
+/// The hive management response, an ASN.1 CHOICE.
+///
+/// The context-specific tag names the one result the value carries, and the
+/// encoding is the chosen alternative alone (X.690 § 8.13). A result answers
+/// in the alternative of its request.
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam::colony::common::HiveManagementOutcome;
+/// use tightbeam::{decode, encode};
+///
+/// let stopped = HiveManagementOutcome::stop_ok();
+///
+/// let encoded = encode(&stopped)?;
+/// assert_eq!(encoded, [0xa2, 0x05, 0x30, 0x03, 0x0a, 0x01, 0x00]);
+/// assert_eq!(decode::<HiveManagementOutcome>(&encoded)?, stopped);
+/// # Ok::<(), Box<dyn core::error::Error>>(())
+/// ```
+#[derive(Debug, Beamable, Choice, Clone, PartialEq)]
 pub enum HiveManagementOutcome {
-	/// The result of a spawn.
+	/// The result of a spawn [context 0].
+	#[asn1(context_specific = "0", constructed = "true")]
 	Spawn(SpawnServletResult),
-	/// The result of a list.
+	/// The result of a list [context 1].
+	#[asn1(context_specific = "1", constructed = "true")]
 	List(ListServletsResult),
-	/// The result of a stop.
+	/// The result of a stop [context 2].
+	#[asn1(context_specific = "2", constructed = "true")]
 	Stop(StopServletResult),
-}
-
-/// The single command a [`ClusterCommand`] names.
-#[derive(Debug, Clone, PartialEq)]
-pub enum ClusterCommandKind {
-	/// A liveness probe.
-	Heartbeat(HeartbeatParams),
-	/// A management request.
-	Manage(HiveManagement),
 }
 
 /// The management alternative that answers a manage command.
@@ -614,8 +636,17 @@ impl HiveManagement {
 	}
 }
 
-impl ClusterCommandKind {
+impl ClusterCommand {
 	/// The shape a reply to this command must use.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::colony::common::{ClusterCommand, ClusterStatus, HeartbeatParams, ReplyShape};
+	///
+	/// let heartbeat = ClusterCommand::Heartbeat(HeartbeatParams { cluster_status: ClusterStatus::Healthy });
+	/// assert_eq!(heartbeat.reply_shape(), ReplyShape::Heartbeat);
+	/// ```
 	#[must_use]
 	pub fn reply_shape(&self) -> ReplyShape {
 		match self {
@@ -623,39 +654,67 @@ impl ClusterCommandKind {
 			Self::Manage(manage) => ReplyShape::Manage(manage.reply_shape()),
 		}
 	}
+
+	/// Whether a hive under drain or backpressure refuses this command.
+	///
+	/// The reply shape of the command decides it, and the priority of the
+	/// reply reads the same answer, so a command that survives load is the
+	/// command whose reply leads the queue.
+	pub(crate) fn yields_to_load(&self) -> bool {
+		self.reply_shape().yields_to_load()
+	}
 }
 
 impl ReplyShape {
 	/// The shape a reply to `body` must use.
 	///
-	/// A body that named no single alternative has no shape of its own, so
+	/// A body that does not decode as a command has no shape of its own, so
 	/// its reply uses the stop alternative. That alternative carries only a
 	/// status, which is the one thing a refusal of an unreadable command can
 	/// report.
 	#[must_use]
-	pub fn of(body: Option<&ClusterCommandKind>) -> Self {
-		body.map_or(Self::Manage(ManageShape::Stop), ClusterCommandKind::reply_shape)
+	pub fn of(body: Option<&ClusterCommand>) -> Self {
+		body.map_or(Self::Manage(ManageShape::Stop), ClusterCommand::reply_shape)
 	}
 
-	/// Answers the frame `id` with `response` in this shape.
+	/// Whether a command answered in this shape yields to load.
 	///
-	/// This is the one place that decides how a reply travels. A heartbeat
-	/// reply travels on a V2 frame at [`MessagePriority::NetworkControl`], so
-	/// a health check answered under load still leads the queue. A management
-	/// reply travels on a V0 frame at the default priority.
+	/// A liveness command, the heartbeat, survives drain and backpressure,
+	/// and its reply leads the queue, so a health check answered under load
+	/// still reports. A management command yields to both.
+	fn yields_to_load(self) -> bool {
+		match self {
+			Self::Heartbeat => false,
+			Self::Manage(_) => true,
+		}
+	}
+
+	/// The form a reply in this shape travels in.
+	///
+	/// The reply to a command that survives load travels at
+	/// [`MessagePriority::NetworkControl`]. The reply to a command that yields
+	/// to load travels at the default priority.
+	fn form(self) -> ReplyForm {
+		if self.yields_to_load() {
+			ReplyForm::Plain
+		} else {
+			ReplyForm::Prioritized(MessagePriority::NetworkControl)
+		}
+	}
+
+	/// Answers the frame `id` with `response` in this shape, at the priority
+	/// the shape names.
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError::BuildError`] -- the reply frame did not build.
+	/// - [`TightBeamError::SerializationError`] -- `response` does not encode.
+	/// - [`TightBeamError::BuildError`] -- the reply metadata fails validation.
 	pub fn reply(
 		self,
 		id: impl AsRef<[u8]>,
 		response: ClusterCommandResponse,
 	) -> Result<Option<Frame>, TightBeamError> {
-		match self {
-			Self::Heartbeat => reply_frame_with_priority(id, MessagePriority::NetworkControl, response),
-			Self::Manage(_) => reply_frame(id, response),
-		}
+		self.form().reply(id, response)
 	}
 
 	/// Refuses the frame `id` with `status` in this shape.
@@ -666,37 +725,43 @@ impl ReplyShape {
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError::BuildError`] -- the reply frame did not build.
+	/// - [`TightBeamError::SerializationError`] -- the refusal body does not encode.
+	/// - [`TightBeamError::BuildError`] -- the reply metadata fails validation.
 	pub fn refuse(self, id: impl AsRef<[u8]>, status: TransitStatus) -> Result<Option<Frame>, TightBeamError> {
 		self.reply(id, ClusterCommandResponse::refusal(self, status))
 	}
 }
 
-/// The single answer a [`ClusterCommandResponse`] names.
-#[derive(Debug, Clone, PartialEq)]
-pub enum ClusterCommandOutcome {
-	/// The answer to a liveness probe.
-	Heartbeat(HeartbeatResult),
-	/// The answer to a management request.
-	Manage(HiveManagementOutcome),
-}
-
-/// The hive management request, a CHOICE spelled as tagged optional fields.
+/// How a colony reply frame travels.
 ///
-/// Context-specific tags tell the request types apart. A request sets exactly
-/// one field, and [`HiveManagementRequest::into_choice`] refuses a request
-/// that sets none or more than one.
-#[derive(Debug, Beamable, Clone, PartialEq)]
-pub struct HiveManagementRequest {
-	/// A request to spawn a new servlet instance [context 0].
-	pub spawn: Option<SpawnServletParams>,
-	/// A request to list all active servlets [context 1].
-	pub list: Option<ListServletsParams>,
-	/// A request to stop a specific servlet instance [context 2].
-	pub stop: Option<StopServletParams>,
+/// A reply echoes the id of its request at order 0. Its priority decides its
+/// version, because a V2 frame is the first to carry a priority field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplyForm {
+	/// A V0 frame at the default priority.
+	Plain,
+	/// A V2 frame at the priority it names.
+	Prioritized(MessagePriority),
 }
 
-wire_sequence!(HiveManagementRequest { spawn: ctx(TagNumber::N0), list: ctx(TagNumber::N1), stop: ctx(TagNumber::N2) });
+impl ReplyForm {
+	/// Answers the frame `id` with `message` in this form.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError`] -- the frame builder refuses the frame, such as when `message` fails to encode.
+	pub(crate) fn reply<M: Message>(self, id: impl AsRef<[u8]>, message: M) -> Result<Option<Frame>, TightBeamError> {
+		let frame = match self {
+			Self::Plain => Version::V0.compose().with_id(id).with_order(0).with_message(message).build()?,
+			Self::Prioritized(priority) => {
+				let prioritized = Version::V2.compose().with_priority(priority);
+				prioritized.with_id(id).with_order(0).with_message(message).build()?
+			}
+		};
+
+		Ok(Some(frame))
+	}
+}
 
 /// The parameters of a request that spawns a new servlet.
 #[derive(Debug, Beamable, Clone, PartialEq)]
@@ -725,27 +790,6 @@ pub struct StopServletParams {
 	/// The instance URN of the servlet to stop.
 	pub servlet_id: Urn<'static>,
 }
-
-/// The hive management response, a CHOICE spelled as tagged optional fields.
-///
-/// Context-specific tags tell the response types apart. A response sets
-/// exactly one field, and [`HiveManagementResponse::into_choice`] refuses a
-/// response that sets none or more than one.
-#[derive(Debug, Beamable, Clone, PartialEq)]
-pub struct HiveManagementResponse {
-	/// The answer to a spawn request [context 0].
-	pub spawn: Option<SpawnServletResult>,
-	/// The answer to a list request [context 1].
-	pub list: Option<ListServletsResult>,
-	/// The answer to a stop request [context 2].
-	pub stop: Option<StopServletResult>,
-}
-
-wire_sequence!(HiveManagementResponse {
-	spawn: ctx(TagNumber::N0),
-	list: ctx(TagNumber::N1),
-	stop: ctx(TagNumber::N2),
-});
 
 /// The result of a spawn request.
 #[derive(Debug, Beamable, Clone, PartialEq)]
@@ -777,42 +821,65 @@ pub struct StopServletResult {
 	pub status: TransitStatus,
 }
 
-impl HiveManagementResponse {
+impl HiveManagementOutcome {
 	/// Creates an `Ok` spawn result that names the new servlet's address and
 	/// instance URN.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::colony::common::{ColonyNamespace, HiveManagementOutcome};
+	/// use tightbeam::policy::TransitStatus;
+	///
+	/// let worker = ColonyNamespace::default().servlet("worker")?;
+	/// let instance = worker.servlet_instance("127.0.0.1:8080")?;
+	///
+	/// let spawned = HiveManagementOutcome::spawn_ok("127.0.0.1:8080", instance);
+	/// assert!(matches!(spawned, HiveManagementOutcome::Spawn(result) if result.status == TransitStatus::Ok));
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
 	#[inline]
 	pub fn spawn_ok(address: impl Into<Vec<u8>>, servlet_id: Urn<'static>) -> Self {
 		let address: Vec<u8> = address.into();
-		Self {
-			spawn: Some(SpawnServletResult {
-				status: TransitStatus::Ok,
-				servlet_address: Some(address),
-				servlet_id: Some(servlet_id),
-			}),
-			list: None,
-			stop: None,
-		}
+		let result = SpawnServletResult {
+			status: TransitStatus::Ok,
+			servlet_address: Some(address),
+			servlet_id: Some(servlet_id),
+		};
+
+		Self::Spawn(result)
 	}
 
 	/// Creates an `Ok` list result that carries the hive's active `servlets`.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::colony::common::HiveManagementOutcome;
+	///
+	/// let listed = HiveManagementOutcome::list_ok([]);
+	/// assert!(matches!(listed, HiveManagementOutcome::List(result) if result.servlets.is_empty()));
+	/// ```
 	#[inline]
 	pub fn list_ok(servlets: impl IntoIterator<Item = ServletInfo>) -> Self {
 		let servlets: Vec<ServletInfo> = servlets.into_iter().collect();
-		Self {
-			spawn: None,
-			list: Some(ListServletsResult { status: TransitStatus::Ok, servlets }),
-			stop: None,
-		}
+		Self::List(ListServletsResult { status: TransitStatus::Ok, servlets })
 	}
 
 	/// Creates an `Ok` stop result.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::colony::common::HiveManagementOutcome;
+	/// use tightbeam::policy::TransitStatus;
+	///
+	/// let stopped = HiveManagementOutcome::stop_ok();
+	/// assert!(matches!(stopped, HiveManagementOutcome::Stop(result) if result.status == TransitStatus::Ok));
+	/// ```
 	#[inline]
 	pub fn stop_ok() -> Self {
-		Self {
-			spawn: None,
-			list: None,
-			stop: Some(StopServletResult { status: TransitStatus::Ok }),
-		}
+		Self::Stop(StopServletResult { status: TransitStatus::Ok })
 	}
 
 	/// Refuses a management request with `status` in the alternative that
@@ -820,20 +887,22 @@ impl HiveManagementResponse {
 	///
 	/// A spawn refusal names no address and no instance, and a list refusal
 	/// names no servlets, so the sender reads the status and nothing else.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::colony::common::{HiveManagementOutcome, ManageShape};
+	/// use tightbeam::policy::TransitStatus;
+	///
+	/// let refused = HiveManagementOutcome::refusal(ManageShape::Spawn, TransitStatus::Unavailable);
+	/// assert!(matches!(refused, HiveManagementOutcome::Spawn(result) if result.servlet_id.is_none()));
+	/// ```
 	#[must_use]
 	pub fn refusal(shape: ManageShape, status: TransitStatus) -> Self {
 		match shape {
-			ManageShape::Spawn => Self {
-				spawn: Some(SpawnServletResult { status, servlet_address: None, servlet_id: None }),
-				list: None,
-				stop: None,
-			},
-			ManageShape::List => Self {
-				spawn: None,
-				list: Some(ListServletsResult { status, servlets: Vec::new() }),
-				stop: None,
-			},
-			ManageShape::Stop => Self { spawn: None, list: None, stop: Some(StopServletResult { status }) },
+			ManageShape::Spawn => Self::Spawn(SpawnServletResult { status, servlet_address: None, servlet_id: None }),
+			ManageShape::List => Self::List(ListServletsResult { status, servlets: Vec::new() }),
+			ManageShape::Stop => Self::Stop(StopServletResult { status }),
 		}
 	}
 }
@@ -853,14 +922,16 @@ pub enum ClusterStatus {
 	Degraded = 1,
 	/// The cluster is overloaded, with high utilization.
 	Overloaded = 2,
-	/// The cluster is draining in preparation for shutdown.
+	/// The cluster drains before it shuts down.
 	Draining = 3,
 }
 
-/// The cluster command message, a CHOICE spelled as tagged optional fields.
+/// The cluster command message, an ASN.1 CHOICE.
 ///
-/// It carries commands from the cluster to a hive. Context-specific tags
-/// discriminate the CHOICE, and a message sets exactly one field.
+/// It carries one command from the cluster to a hive. The context-specific
+/// tag names the command, and the encoding is the chosen alternative alone
+/// (X.690 § 8.13). The management alternative tags its own CHOICE
+/// explicitly, as X.680 § 31.2.9 requires of a tagged CHOICE.
 ///
 /// # Security
 ///
@@ -870,17 +941,30 @@ pub enum ClusterStatus {
 /// - Freshness binds to `Frame.metadata.order` (unix milliseconds), so hives
 ///   reject commands outside their freshness window and replays of
 ///   already-seen signatures within it (CWE-294).
-#[derive(Debug, Beamable, Clone, PartialEq)]
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam::colony::common::{ClusterCommand, ClusterStatus, HeartbeatParams};
+/// use tightbeam::{decode, encode};
+///
+/// let heartbeat = ClusterCommand::Heartbeat(HeartbeatParams { cluster_status: ClusterStatus::Healthy });
+///
+/// let encoded = encode(&heartbeat)?;
+/// assert_eq!(encoded, [0xa0, 0x05, 0x30, 0x03, 0x0a, 0x01, 0x00]);
+/// assert_eq!(decode::<ClusterCommand>(&encoded)?, heartbeat);
+/// # Ok::<(), Box<dyn core::error::Error>>(())
+/// ```
+#[derive(Debug, Beamable, Choice, Clone, PartialEq)]
 #[beam(frame_integrity)]
-pub struct ClusterCommand {
+pub enum ClusterCommand {
 	/// A heartbeat request [context 0].
-	pub heartbeat: Option<HeartbeatParams>,
-
+	#[asn1(context_specific = "0", constructed = "true")]
+	Heartbeat(HeartbeatParams),
 	/// A hive management request [context 1].
-	pub manage: Option<HiveManagementRequest>,
+	#[asn1(context_specific = "1", constructed = "true")]
+	Manage(HiveManagement),
 }
-
-wire_sequence!(ClusterCommand { heartbeat: ctx(TagNumber::N0), manage: ctx(TagNumber::N1) });
 
 /// The parameters of a heartbeat.
 ///
@@ -892,141 +976,53 @@ pub struct HeartbeatParams {
 	pub cluster_status: ClusterStatus,
 }
 
-/// The cluster command response, a CHOICE spelled as tagged optional fields.
+/// The cluster command response, an ASN.1 CHOICE.
 ///
-/// A hive answers a cluster command with it. Context-specific tags
-/// discriminate the CHOICE, and a response sets exactly one field.
-#[derive(Debug, Beamable, Clone, PartialEq)]
-pub struct ClusterCommandResponse {
+/// A hive answers a cluster command with it, in the alternative of the
+/// command. The context-specific tag names the answer, and the encoding is the
+/// chosen alternative alone (X.690 § 8.13).
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam::colony::common::{ClusterCommandResponse, HiveManagementOutcome};
+/// use tightbeam::{decode, encode};
+///
+/// let stopped = ClusterCommandResponse::Manage(HiveManagementOutcome::stop_ok());
+///
+/// let encoded = encode(&stopped)?;
+/// assert_eq!(encoded, [0xa1, 0x07, 0xa2, 0x05, 0x30, 0x03, 0x0a, 0x01, 0x00]);
+/// assert_eq!(decode::<ClusterCommandResponse>(&encoded)?, stopped);
+/// # Ok::<(), Box<dyn core::error::Error>>(())
+/// ```
+#[derive(Debug, Beamable, Choice, Clone, PartialEq)]
+pub enum ClusterCommandResponse {
 	/// The heartbeat answer [context 0].
-	pub heartbeat: Option<HeartbeatResult>,
-
+	#[asn1(context_specific = "0", constructed = "true")]
+	Heartbeat(HeartbeatResult),
 	/// The management answer [context 1].
-	pub manage: Option<HiveManagementResponse>,
-}
-
-wire_sequence!(ClusterCommandResponse { heartbeat: ctx(TagNumber::N0), manage: ctx(TagNumber::N1) });
-
-impl From<HiveManagement> for HiveManagementRequest {
-	/// Spells one management alternative as the tagged-optional product that
-	/// the encoding carries.
-	///
-	/// This is the send-side counterpart of
-	/// [`HiveManagementRequest::into_choice`]: a request built here names
-	/// exactly one alternative, so every sender keeps the rule by
-	/// construction.
-	fn from(request: HiveManagement) -> Self {
-		match request {
-			HiveManagement::Spawn(spawn) => Self { spawn: Some(spawn), list: None, stop: None },
-			HiveManagement::List(list) => Self { spawn: None, list: Some(list), stop: None },
-			HiveManagement::Stop(stop) => Self { spawn: None, list: None, stop: Some(stop) },
-		}
-	}
-}
-
-impl From<ClusterCommandKind> for ClusterCommand {
-	/// Spells one command alternative as the tagged-optional product that
-	/// the encoding carries.
-	fn from(command: ClusterCommandKind) -> Self {
-		match command {
-			ClusterCommandKind::Heartbeat(heartbeat) => Self { heartbeat: Some(heartbeat), manage: None },
-			ClusterCommandKind::Manage(manage) => Self { heartbeat: None, manage: Some(manage.into()) },
-		}
-	}
-}
-
-impl HiveManagementRequest {
-	/// Consumes this product for the one request it names.
-	///
-	/// # Errors
-	///
-	/// - [`ChoiceRefusal::NoneSet`] -- the product names no request.
-	/// - [`ChoiceRefusal::ManySet`] -- the product names more than one request.
-	pub fn into_choice(self) -> Result<HiveManagement, ChoiceRefusal> {
-		match (self.spawn, self.list, self.stop) {
-			(Some(spawn), None, None) => Ok(HiveManagement::Spawn(spawn)),
-			(None, Some(list), None) => Ok(HiveManagement::List(list)),
-			(None, None, Some(stop)) => Ok(HiveManagement::Stop(stop)),
-			(None, None, None) => Err(ChoiceRefusal::NoneSet),
-			_ => Err(ChoiceRefusal::ManySet),
-		}
-	}
-}
-
-impl HiveManagementResponse {
-	/// Consumes this product for the one result it names.
-	///
-	/// # Errors
-	///
-	/// - [`ChoiceRefusal::NoneSet`] -- the product names no result.
-	/// - [`ChoiceRefusal::ManySet`] -- the product names more than one result.
-	pub fn into_choice(self) -> Result<HiveManagementOutcome, ChoiceRefusal> {
-		match (self.spawn, self.list, self.stop) {
-			(Some(spawn), None, None) => Ok(HiveManagementOutcome::Spawn(spawn)),
-			(None, Some(list), None) => Ok(HiveManagementOutcome::List(list)),
-			(None, None, Some(stop)) => Ok(HiveManagementOutcome::Stop(stop)),
-			(None, None, None) => Err(ChoiceRefusal::NoneSet),
-			_ => Err(ChoiceRefusal::ManySet),
-		}
-	}
+	#[asn1(context_specific = "1", constructed = "true")]
+	Manage(HiveManagementOutcome),
 }
 
 impl ClusterCommand {
-	/// The one command `frame` carries, decoded and proved in one step.
+	/// The one command `frame` carries, or [`None`] for a body that does not
+	/// decode as one.
 	///
-	/// [`None`] covers a body that does not decode as a command and a body
-	/// that names no single alternative. Both are the sender's own fault,
-	/// so a refusal reads its reply shape from this answer through
-	/// [`ReplyShape::of`].
+	/// A body that is no command is the sender's own fault, so a refusal reads
+	/// its reply shape from this answer through [`ReplyShape::of`].
 	#[must_use]
-	pub(crate) fn choice_of(frame: &Frame) -> Option<ClusterCommandKind> {
-		let command = decode::<Self>(frame.message()).ok()?;
-		command.into_choice().ok()
-	}
-
-	/// Consumes this product for the one command it names.
-	///
-	/// A management command proves its own alternative here as well, so a
-	/// dispatcher matches an exhaustive body instead of the fields.
-	///
-	/// # Errors
-	///
-	/// - [`ChoiceRefusal::NoneSet`] -- the product names no command.
-	/// - [`ChoiceRefusal::ManySet`] -- the product names both commands, or its
-	///   management request names more than one.
-	pub fn into_choice(self) -> Result<ClusterCommandKind, ChoiceRefusal> {
-		match (self.heartbeat, self.manage) {
-			(Some(heartbeat), None) => Ok(ClusterCommandKind::Heartbeat(heartbeat)),
-			(None, Some(manage)) => Ok(ClusterCommandKind::Manage(manage.into_choice()?)),
-			(None, None) => Err(ChoiceRefusal::NoneSet),
-			(Some(_), Some(_)) => Err(ChoiceRefusal::ManySet),
-		}
-	}
-}
-
-impl ClusterCommandResponse {
-	/// Consumes this product for the one answer it names.
-	///
-	/// # Errors
-	///
-	/// - [`ChoiceRefusal::NoneSet`] -- the product names no answer.
-	/// - [`ChoiceRefusal::ManySet`] -- the product names both answers, or its
-	///   management response names more than one.
-	pub fn into_choice(self) -> Result<ClusterCommandOutcome, ChoiceRefusal> {
-		match (self.heartbeat, self.manage) {
-			(Some(heartbeat), None) => Ok(ClusterCommandOutcome::Heartbeat(heartbeat)),
-			(None, Some(manage)) => Ok(ClusterCommandOutcome::Manage(manage.into_choice()?)),
-			(None, None) => Err(ChoiceRefusal::NoneSet),
-			(Some(_), Some(_)) => Err(ChoiceRefusal::ManySet),
-		}
+	pub(crate) fn choice_of(frame: &Frame) -> Option<Self> {
+		decode::<Self>(frame.message()).ok()
 	}
 }
 
 /// The heartbeat answer, with the hive's health status.
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
 pub struct HeartbeatResult {
-	/// The overall status: `Ok` when the hive is healthy, and
-	/// `ResourceExhausted` when it is at capacity.
+	/// The overall status: `Ok` when the hive is healthy, `ResourceExhausted`
+	/// when it is at capacity, and the refusal status when the hive refuses
+	/// the heartbeat.
 	pub status: TransitStatus,
 	/// The current aggregate utilization across all servlets.
 	pub utilization: BasisPoints,
@@ -1037,18 +1033,20 @@ pub struct HeartbeatResult {
 impl ClusterCommandResponse {
 	/// Answers a heartbeat with the hive's status, utilization, and servlet
 	/// count.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::colony::common::ClusterCommandResponse;
+	/// use tightbeam::policy::TransitStatus;
+	/// use tightbeam::utils::BasisPoints;
+	///
+	/// let alive = ClusterCommandResponse::heartbeat(TransitStatus::Ok, BasisPoints::default(), 2);
+	/// assert!(matches!(alive, ClusterCommandResponse::Heartbeat(result) if result.active_servlets == 2));
+	/// ```
 	#[inline]
 	pub fn heartbeat(status: TransitStatus, utilization: BasisPoints, active_servlets: u32) -> Self {
-		Self {
-			heartbeat: Some(HeartbeatResult { status, utilization, active_servlets }),
-			manage: None,
-		}
-	}
-
-	/// Wraps a management response in the manage alternative.
-	#[inline]
-	pub fn manage(response: HiveManagementResponse) -> Self {
-		Self { heartbeat: None, manage: Some(response) }
+		Self::Heartbeat(HeartbeatResult { status, utilization, active_servlets })
 	}
 
 	/// Refuses a command with `status` in the alternative that `shape` names.
@@ -1056,12 +1054,22 @@ impl ClusterCommandResponse {
 	/// This is the one refusal constructor, so a refusal answers in the
 	/// alternative its sender decodes. A heartbeat refusal reports no
 	/// capacity, and a management refusal is
-	/// [`HiveManagementResponse::refusal`] in its own alternative.
+	/// [`HiveManagementOutcome::refusal`] in its own alternative.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::colony::common::{ClusterCommandResponse, ReplyShape};
+	/// use tightbeam::policy::TransitStatus;
+	///
+	/// let refused = ClusterCommandResponse::refusal(ReplyShape::Heartbeat, TransitStatus::PermissionDenied);
+	/// assert!(matches!(refused, ClusterCommandResponse::Heartbeat(result) if result.active_servlets == 0));
+	/// ```
 	#[must_use]
 	pub fn refusal(shape: ReplyShape, status: TransitStatus) -> Self {
 		match shape {
 			ReplyShape::Heartbeat => Self::heartbeat(status, BasisPoints::default(), 0),
-			ReplyShape::Manage(manage) => Self::manage(HiveManagementResponse::refusal(manage, status)),
+			ReplyShape::Manage(manage) => Self::Manage(HiveManagementOutcome::refusal(manage, status)),
 		}
 	}
 }
@@ -1090,7 +1098,7 @@ mod tests {
 	use crate::asn1::Version;
 	use crate::builder::{FrameBuilder, TypeBuilder};
 	use crate::colony::common::ColonyNamespace;
-	use crate::der::{Decode, ErrorKind, Tag};
+	use crate::der::{Decode, ErrorKind, Tag, TagNumber};
 	use crate::error::Result;
 	use crate::tb_cases;
 
@@ -1130,21 +1138,38 @@ mod tests {
 		Frame::v0(b"command-1", body)
 	}
 
+	/// The parameters of a heartbeat from a healthy cluster.
+	fn healthy() -> HeartbeatParams {
+		HeartbeatParams { cluster_status: ClusterStatus::Healthy }
+	}
+
+	/// The DER of a heartbeat command from a healthy cluster: the `[0]`
+	/// alternative around `HeartbeatParams`, a SEQUENCE of one ENUMERATED 0.
+	const HEARTBEAT_COMMAND: [u8; 7] = [0xa0, 0x05, 0x30, 0x03, 0x0a, 0x01, 0x00];
+
+	/// The DER of a list request: the `[1]` alternative around
+	/// `ListServletsParams`, an empty SEQUENCE.
+	const LIST_REQUEST: [u8; 4] = [0xa1, 0x02, 0x30, 0x00];
+
+	/// The DER of an `Ok` stop result: the `[2]` alternative around
+	/// `StopServletResult`, a SEQUENCE of one ENUMERATED 0.
+	const STOP_OUTCOME: [u8; 7] = [0xa2, 0x05, 0x30, 0x03, 0x0a, 0x01, 0x00];
+
 	#[test]
 	fn choice_of_reads_the_one_command_a_frame_carries() {
-		let heartbeat = HeartbeatParams { cluster_status: ClusterStatus::Healthy };
-		let frame = command_frame(&ClusterCommand::from(ClusterCommandKind::Heartbeat(heartbeat.clone())));
+		let frame = command_frame(&ClusterCommand::Heartbeat(healthy()));
 
 		let choice = ClusterCommand::choice_of(&frame);
 
-		assert_eq!(choice, Some(ClusterCommandKind::Heartbeat(heartbeat)));
+		assert_eq!(choice, Some(ClusterCommand::Heartbeat(healthy())));
 	}
 
+	/// A CHOICE value is one alternative, so a body that spells a second
+	/// alternative after the first holds trailing data and names no command.
 	#[test]
 	fn choice_of_refuses_a_body_that_names_two_commands() {
-		let heartbeat = HeartbeatParams { cluster_status: ClusterStatus::Healthy };
-		let manage = HiveManagementRequest { spawn: None, list: None, stop: None };
-		let frame = command_frame(&ClusterCommand { heartbeat: Some(heartbeat), manage: Some(manage) });
+		let two = [HEARTBEAT_COMMAND.as_slice(), [0xa1, 0x04].as_slice(), LIST_REQUEST.as_slice()].concat();
+		let frame = Frame::v0(b"command-1", two);
 
 		let choice = ClusterCommand::choice_of(&frame);
 
@@ -1250,33 +1275,177 @@ mod tests {
 		round_trip(ClusterRequest::PublishGossip(GossipRumor::application(vec![0x02, 0x01, 0x2A])))
 	}
 
-	/// The decoder refuses a command whose `[0]` repeats ahead of `[1]`,
-	/// rather than read it as one heartbeat with the repeats skipped
-	/// (X.690 § 8.9.2).
+	/// A command encodes as its chosen alternative, an EXPLICIT context tag
+	/// around the alternative's own encoding (X.690 § 8.13, § 8.14).
 	#[test]
-	fn a_command_that_repeats_a_context_field_is_refused() {
-		let repeated = [
-			0x30, 0x12, 0xa0, 0x05, 0x30, 0x03, 0x0a, 0x01, 0x00, 0xa0, 0x05, 0x30, 0x03, 0x0a, 0x01, 0x00, 0xa0, 0x02,
-			0x05, 0x00,
-		];
+	fn a_heartbeat_command_round_trips_through_its_known_answer() -> Result<()> {
+		let command = ClusterCommand::Heartbeat(healthy());
 
-		let refused = <ClusterCommand as Decode>::from_der(&repeated);
-		let heartbeat = Tag::ContextSpecific { constructed: true, number: TagNumber::N0 };
-		let manage = Tag::ContextSpecific { constructed: true, number: TagNumber::N1 };
-		let misplaced = ErrorKind::TagUnexpected { expected: Some(manage), actual: heartbeat };
-		assert_eq!(refused.map_err(|error| error.kind()), Err(misplaced));
+		let encoded = encode(&command)?;
+		let decoded: ClusterCommand = decode(&encoded)?;
+		assert_eq!(encoded, HEARTBEAT_COMMAND);
+		assert_eq!(decoded, command);
+		Ok(())
 	}
 
-	/// The tagged fields of a command encode as EXPLICIT context fields
-	/// (X.690 § 8.14).
+	/// The management alternative tags the management CHOICE explicitly, so
+	/// its encoding nests the request's own tag (X.680 § 31.2.9).
 	#[test]
-	fn a_heartbeat_command_encodes_its_known_answer() -> Result<()> {
-		let heartbeat = HeartbeatParams { cluster_status: ClusterStatus::Healthy };
-		let command = ClusterCommand::from(ClusterCommandKind::Heartbeat(heartbeat));
+	fn a_manage_command_round_trips_through_its_known_answer() -> Result<()> {
+		let command = ClusterCommand::Manage(HiveManagement::List(ListServletsParams { filter: None }));
 
-		let encoded = crate::encode(&command)?;
-		assert_eq!(encoded, [0x30, 0x07, 0xa0, 0x05, 0x30, 0x03, 0x0a, 0x01, 0x00]);
+		let encoded = encode(&command)?;
+		let decoded: ClusterCommand = decode(&encoded)?;
+		assert_eq!(encoded, [[0xa1, 0x04].as_slice(), LIST_REQUEST.as_slice()].concat());
+		assert_eq!(decoded, command);
 		Ok(())
+	}
+
+	#[test]
+	fn a_management_request_round_trips_through_its_known_answer() -> Result<()> {
+		let request = HiveManagement::List(ListServletsParams { filter: None });
+
+		let encoded = encode(&request)?;
+		let decoded: HiveManagement = decode(&encoded)?;
+		assert_eq!(encoded, LIST_REQUEST);
+		assert_eq!(decoded, request);
+		Ok(())
+	}
+
+	#[test]
+	fn a_management_outcome_round_trips_through_its_known_answer() -> Result<()> {
+		let outcome = HiveManagementOutcome::stop_ok();
+
+		let encoded = encode(&outcome)?;
+		let decoded: HiveManagementOutcome = decode(&encoded)?;
+		assert_eq!(encoded, STOP_OUTCOME);
+		assert_eq!(decoded, outcome);
+		Ok(())
+	}
+
+	/// `HeartbeatResult` is a SEQUENCE of an ENUMERATED status and two
+	/// INTEGER fields, the utilization and the servlet count.
+	#[test]
+	fn a_heartbeat_response_round_trips_through_its_known_answer() -> Result<()> {
+		let response = ClusterCommandResponse::heartbeat(TransitStatus::Ok, BasisPoints::default(), 0);
+
+		let encoded = encode(&response)?;
+		let decoded: ClusterCommandResponse = decode(&encoded)?;
+
+		let result = [0x30, 0x09, 0x0a, 0x01, 0x00, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00];
+		assert_eq!(encoded, [[0xa0, 0x0b].as_slice(), result.as_slice()].concat());
+		assert_eq!(decoded, response);
+		Ok(())
+	}
+
+	#[test]
+	fn a_manage_response_round_trips_through_its_known_answer() -> Result<()> {
+		let response = ClusterCommandResponse::Manage(HiveManagementOutcome::stop_ok());
+
+		let encoded = encode(&response)?;
+		let decoded: ClusterCommandResponse = decode(&encoded)?;
+		assert_eq!(encoded, [[0xa1, 0x07].as_slice(), STOP_OUTCOME.as_slice()].concat());
+		assert_eq!(decoded, response);
+		Ok(())
+	}
+
+	/// The kind of error a decode of `bytes` as `T` meets.
+	fn decode_refusal<'a, T: Decode<'a>>(bytes: &'a [u8]) -> Option<ErrorKind> {
+		T::from_der(bytes).err().map(|error| error.kind())
+	}
+
+	/// The refusal a CHOICE decoder gives a SEQUENCE where it reads an
+	/// alternative tag.
+	fn sequence_refused() -> Option<ErrorKind> {
+		Some(ErrorKind::TagUnexpected { expected: None, actual: Tag::Sequence })
+	}
+
+	// A command spelled as a SEQUENCE of OPTIONAL `[0]` and `[1]` fields
+	// decodes as no command, whether it names none, one, or both of them.
+	tb_cases! {
+		fn a_command_of_the_sequence_shape_fails_to_decode(sequence: Vec<u8>) {
+			assert_eq!(decode_refusal::<ClusterCommand>(&sequence), sequence_refused());
+		}
+		cases {
+			naming_none => vec![0x30, 0x00],
+			naming_the_heartbeat => [[0x30, 0x07].as_slice(), HEARTBEAT_COMMAND.as_slice()].concat(),
+			naming_both => [
+				[0x30, 0x0f].as_slice(),
+				HEARTBEAT_COMMAND.as_slice(),
+				[0xa1, 0x06, 0x30, 0x04].as_slice(),
+				LIST_REQUEST.as_slice(),
+			]
+			.concat(),
+		}
+	}
+
+	/// A management request spelled as a SEQUENCE of OPTIONAL `[0]`, `[1]`,
+	/// and `[2]` fields decodes as no request.
+	#[test]
+	fn a_management_request_of_the_sequence_shape_fails_to_decode() {
+		let sequence = [[0x30, 0x04].as_slice(), LIST_REQUEST.as_slice()].concat();
+		let refused = decode_refusal::<HiveManagement>(&sequence);
+		assert_eq!(refused, sequence_refused());
+	}
+
+	/// A manage command that wraps a management request spelled as a SEQUENCE
+	/// fails inside the `[1]` alternative.
+	#[test]
+	fn a_manage_command_around_the_sequence_shape_fails_to_decode() {
+		let sequence = [[0xa1, 0x06, 0x30, 0x04].as_slice(), LIST_REQUEST.as_slice()].concat();
+		let refused = decode_refusal::<ClusterCommand>(&sequence);
+		assert_eq!(refused, sequence_refused());
+	}
+
+	/// A management outcome spelled as a SEQUENCE decodes as no outcome.
+	#[test]
+	fn a_management_outcome_of_the_sequence_shape_fails_to_decode() {
+		let sequence = [[0x30, 0x07].as_slice(), STOP_OUTCOME.as_slice()].concat();
+		let refused = decode_refusal::<HiveManagementOutcome>(&sequence);
+		assert_eq!(refused, sequence_refused());
+	}
+
+	/// A response spelled as a SEQUENCE around a management SEQUENCE decodes
+	/// as no response.
+	#[test]
+	fn a_response_of_the_sequence_shape_fails_to_decode() {
+		let sequence = [[0x30, 0x0b, 0xa1, 0x09, 0x30, 0x07].as_slice(), STOP_OUTCOME.as_slice()].concat();
+		let refused = decode_refusal::<ClusterCommandResponse>(&sequence);
+		assert_eq!(refused, sequence_refused());
+	}
+
+	/// The refusal a CHOICE decoder gives the constructed context tag
+	/// `[number]` where none of its alternatives carries that tag.
+	fn unknown_alternative(number: TagNumber) -> Option<ErrorKind> {
+		let actual = Tag::ContextSpecific { constructed: true, number };
+		Some(ErrorKind::TagUnexpected { expected: None, actual })
+	}
+
+	// A command that names an alternative its CHOICE does not define decodes
+	// as no command, at the top and inside the `[1]` management alternative
+	// (X.690 § 8.13).
+	tb_cases! {
+		fn a_command_of_an_unknown_alternative_fails_to_decode((body, number): (Vec<u8>, TagNumber)) {
+			assert_eq!(decode_refusal::<ClusterCommand>(&body), unknown_alternative(number));
+		}
+		cases {
+			at_the_command => (vec![0xa2, 0x05, 0x30, 0x03, 0x0a, 0x01, 0x00], TagNumber::N2),
+			inside_the_management_alternative => (vec![0xa1, 0x04, 0xa3, 0x02, 0x30, 0x00], TagNumber::N3),
+		}
+	}
+
+	// A field after the one value an alternative holds is trailing data,
+	// inside the EXPLICIT `[0]` tag and inside `HeartbeatParams` alike
+	// (X.690 § 8.14).
+	tb_cases! {
+		fn a_command_with_a_trailing_field_fails_to_decode(body: Vec<u8>) {
+			let refused = decode_refusal::<ClusterCommand>(&body);
+			assert!(matches!(refused, Some(ErrorKind::TrailingData { .. })));
+		}
+		cases {
+			inside_the_heartbeat_alternative => vec![0xa0, 0x07, 0x30, 0x03, 0x0a, 0x01, 0x00, 0x05, 0x00],
+			inside_the_heartbeat_parameters => vec![0xa0, 0x07, 0x30, 0x05, 0x0a, 0x01, 0x00, 0x05, 0x00],
+		}
 	}
 
 	#[test]
@@ -1297,6 +1466,7 @@ mod tests {
 			want: vec![vec![0xAAu8; 32]],
 			pex: vec![PeerGossip { peer_id: vec![1, 2, 3], gateway_addr: b"127.0.0.1:9100".to_vec() }],
 		};
+
 		let encoded = crate::encode(&original)?;
 		let decoded: GossipWant = crate::decode(&encoded)?;
 		assert_eq!(original, decoded);
@@ -1320,85 +1490,33 @@ mod tests {
 		Ok(())
 	}
 
-	fn stop_request() -> HiveManagementRequest {
-		HiveManagementRequest {
-			spawn: None,
-			list: None,
-			stop: Some(StopServletParams {
-				servlet_id: ping_type()
-					.servlet_instance("127.0.0.1:9001")
-					.expect("a servlet type URN yields an instance URN"),
-			}),
-		}
-	}
-
-	#[test]
-	fn a_command_naming_no_alternative_is_refused() {
-		let empty = ClusterCommand { heartbeat: None, manage: None };
-		assert_eq!(empty.into_choice(), Err(ChoiceRefusal::NoneSet));
-	}
-
-	#[test]
-	fn a_command_naming_both_alternatives_is_refused() {
-		let both = ClusterCommand {
-			heartbeat: Some(HeartbeatParams { cluster_status: ClusterStatus::Healthy }),
-			manage: Some(stop_request()),
-		};
-		assert_eq!(both.into_choice(), Err(ChoiceRefusal::ManySet));
-	}
-
-	#[test]
-	fn a_management_request_naming_several_alternatives_is_refused() {
-		let mut several = stop_request();
-		several.list = Some(ListServletsParams { filter: None });
-		let command = ClusterCommand { heartbeat: None, manage: Some(several) };
-		assert_eq!(command.into_choice(), Err(ChoiceRefusal::ManySet));
-	}
-
-	/// Every alternative survives the trip out to the tagged product and
-	/// back, so the send side and the receive side agree on which field
-	/// names which command.
-	#[test]
-	fn a_command_round_trips_through_its_choice() {
-		let alternatives = [
-			ClusterCommandKind::Heartbeat(HeartbeatParams { cluster_status: ClusterStatus::Healthy }),
-			ClusterCommandKind::Manage(HiveManagement::Spawn(SpawnServletParams {
-				servlet_type: ping_type(),
-				config: None,
-			})),
-			ClusterCommandKind::Manage(HiveManagement::List(ListServletsParams { filter: None })),
-			ClusterCommandKind::Manage(HiveManagement::Stop(StopServletParams {
-				servlet_id: ping_type()
-					.servlet_instance("127.0.0.1:9001")
-					.expect("a servlet type URN yields an instance URN"),
-			})),
-		];
-
-		for alternative in alternatives {
-			let wire = ClusterCommand::from(alternative.clone());
-			assert_eq!(wire.into_choice(), Ok(alternative));
-		}
-	}
-
 	/// The shape a sender would read `response` in, with the status it
 	/// carries.
-	fn answered_shape(
-		response: ClusterCommandResponse,
-	) -> core::result::Result<(ReplyShape, TransitStatus), ChoiceRefusal> {
-		let answered = match response.into_choice()? {
-			ClusterCommandOutcome::Heartbeat(heartbeat) => (ReplyShape::Heartbeat, heartbeat.status),
-			ClusterCommandOutcome::Manage(HiveManagementOutcome::Spawn(spawn)) => {
+	fn answered_shape(response: ClusterCommandResponse) -> (ReplyShape, TransitStatus) {
+		match response {
+			ClusterCommandResponse::Heartbeat(heartbeat) => (ReplyShape::Heartbeat, heartbeat.status),
+			ClusterCommandResponse::Manage(HiveManagementOutcome::Spawn(spawn)) => {
 				(ReplyShape::Manage(ManageShape::Spawn), spawn.status)
 			}
-			ClusterCommandOutcome::Manage(HiveManagementOutcome::List(list)) => {
+			ClusterCommandResponse::Manage(HiveManagementOutcome::List(list)) => {
 				(ReplyShape::Manage(ManageShape::List), list.status)
 			}
-			ClusterCommandOutcome::Manage(HiveManagementOutcome::Stop(stop)) => {
+			ClusterCommandResponse::Manage(HiveManagementOutcome::Stop(stop)) => {
 				(ReplyShape::Manage(ManageShape::Stop), stop.status)
 			}
-		};
+		}
+	}
 
-		Ok(answered)
+	// A liveness command survives drain and backpressure, and a management
+	// command yields to both.
+	tb_cases! {
+		fn a_command_yields_to_load_by_its_kind((command, yields): (ClusterCommand, bool)) {
+			assert_eq!(command.yields_to_load(), yields);
+		}
+		cases {
+			heartbeat => (ClusterCommand::Heartbeat(healthy()), false),
+			manage => (ClusterCommand::Manage(HiveManagement::List(ListServletsParams { filter: None })), true),
+		}
 	}
 
 	// A refusal answers in the one alternative its shape names, so the
@@ -1406,10 +1524,8 @@ mod tests {
 	tb_cases! {
 		fn a_refusal_answers_in_the_alternative_its_shape_names(shape: ReplyShape) {
 			let status = TransitStatus::ResourceExhausted;
-
 			let refusal = ClusterCommandResponse::refusal(shape, status);
-
-			assert_eq!(answered_shape(refusal), Ok((shape, status)));
+			assert_eq!(answered_shape(refusal), (shape, status));
 		}
 		cases {
 			heartbeat => ReplyShape::Heartbeat,
@@ -1422,33 +1538,31 @@ mod tests {
 	// A command names its own alternative, so a refusal of it answers
 	// where the sender reads its result.
 	tb_cases! {
-		fn a_command_names_its_own_alternative((command, shape): (ClusterCommandKind, ReplyShape)) {
+		fn a_command_names_its_own_alternative((command, shape): (ClusterCommand, ReplyShape)) {
 			assert_eq!(ReplyShape::of(Some(&command)), shape);
 		}
+
 		cases {
-			heartbeat => (
-				ClusterCommandKind::Heartbeat(HeartbeatParams { cluster_status: ClusterStatus::Healthy }),
-				ReplyShape::Heartbeat,
-			),
+			heartbeat => (ClusterCommand::Heartbeat(healthy()), ReplyShape::Heartbeat),
 			spawn => (
-				ClusterCommandKind::Manage(HiveManagement::Spawn(SpawnServletParams {
+				ClusterCommand::Manage(HiveManagement::Spawn(SpawnServletParams {
 					servlet_type: ping_type(),
 					config: None,
 				})),
 				ReplyShape::Manage(ManageShape::Spawn),
 			),
 			list => (
-				ClusterCommandKind::Manage(HiveManagement::List(ListServletsParams { filter: None })),
+				ClusterCommand::Manage(HiveManagement::List(ListServletsParams { filter: None })),
 				ReplyShape::Manage(ManageShape::List),
 			),
 			stop => (
-				ClusterCommandKind::Manage(HiveManagement::Stop(StopServletParams { servlet_id: ping_instance() })),
+				ClusterCommand::Manage(HiveManagement::Stop(StopServletParams { servlet_id: ping_instance() })),
 				ReplyShape::Manage(ManageShape::Stop),
 			),
 		}
 	}
 
-	/// The reply to a body that named no single alternative uses the stop
+	/// The reply to a body that decodes as no command uses the stop
 	/// alternative, which carries only the status a refusal has to report.
 	#[test]
 	fn an_unreadable_command_is_answered_in_the_stop_alternative() {
@@ -1460,7 +1574,6 @@ mod tests {
 	#[test]
 	fn a_heartbeat_reply_travels_at_network_control_priority() -> Result<()> {
 		let response = ClusterCommandResponse::heartbeat(TransitStatus::Ok, BasisPoints::default(), 0);
-
 		let reply = ReplyShape::Heartbeat
 			.reply(b"hb", response)?
 			.ok_or(TightBeamError::MissingResponse)?;
@@ -1472,11 +1585,10 @@ mod tests {
 	/// A management reply travels on a V0 frame, which has no priority field.
 	#[test]
 	fn a_manage_reply_travels_at_the_default_priority() -> Result<()> {
-		let response = ClusterCommandResponse::manage(HiveManagementResponse::stop_ok());
+		let response = ClusterCommandResponse::Manage(HiveManagementOutcome::stop_ok());
 
 		let reply = ReplyShape::Manage(ManageShape::Stop).reply(b"stop", response)?;
 		let reply = reply.ok_or(TightBeamError::MissingResponse)?;
-
 		assert_eq!(reply.metadata().priority(), None);
 		Ok(())
 	}

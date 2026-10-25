@@ -1,14 +1,15 @@
-//! Job macro for creating reusable frame composition functions
+//! Reusable frame composition functions, which the `job!` macro defines.
 //!
-//! Jobs are stateless units of work that transform input into output.
-//! They can be sync or async and return a Result<T, TightBeamError>.
+//! A job is a stateless unit of work that transforms an input into an
+//! output. A job is sync or async, and its output is typically
+//! `Result<T, TightBeamError>`.
 //!
 //! # Traits
 //!
-//! - [`Job`] - Marker trait for synchronous jobs
-//! - [`AsyncJob`] - Marker trait for asynchronous jobs
+//! - [`Job`] is the trait of a synchronous job.
+//! - [`AsyncJob`] is the trait of an asynchronous job.
 //!
-//! # Example
+//! # Examples
 //!
 //! ```ignore
 //! use tightbeam::{job, TightBeamError};
@@ -25,34 +26,40 @@
 //! let result = AddNumbers::run((1, 2))?;
 //! ```
 
-/// Marker trait for synchronous job types.
+/// The trait of a synchronous job type.
 ///
-/// Jobs are stateless units of work (zero-sized types) with a static `run` method.
-/// This trait is automatically implemented by the `job!` macro for sync jobs.
+/// A job is a stateless unit of work, a zero-sized type with a static `run`
+/// method. The `job!` macro implements this trait for a sync job.
 pub trait Job {
-	/// The input type for this job
+	/// The input type of this job.
 	type Input;
-	/// The output type for this job (typically `Result<T, TightBeamError>`)
+	/// The output type of this job, typically `Result<T, TightBeamError>`.
 	type Output;
 
-	/// Execute the job with the given input
+	/// Runs the job on `input`.
 	fn run(input: Self::Input) -> Self::Output;
 }
 
-/// Marker trait for asynchronous job types.
+/// The trait of an asynchronous job type.
 ///
-/// Async jobs are stateless units of work with an async `run` method.
-/// This trait is automatically implemented by the `job!` macro for async jobs.
+/// An async job is a stateless unit of work with an async `run` method. The
+/// `job!` macro implements this trait for an async job.
 pub trait AsyncJob {
-	/// The input type for this job
+	/// The input type of this job.
 	type Input;
-	/// The output type for this job (typically `Result<T, TightBeamError>`)
+	/// The output type of this job, typically `Result<T, TightBeamError>`.
 	type Output;
 
-	/// Execute the job asynchronously with the given input
+	/// Runs the job on `input` asynchronously.
 	fn run(input: Self::Input) -> impl core::future::Future<Output = Self::Output> + Send;
 }
 
+/// Defines a `#[test]` function `name` that binds the value of `job` to the
+/// parameter of `assertions` and runs the `assertions` block, which returns
+/// `Result<(), Box<dyn Error>>`.
+///
+/// An `async move` block defines a `#[tokio::test]` function instead, which
+/// exists in a build of this crate with the `tokio` feature.
 #[macro_export]
 macro_rules! test_job {
 	(
@@ -82,10 +89,16 @@ macro_rules! test_job {
 	};
 }
 
+/// Defines a job: a unit struct `name` with an inherent `run` function, and an
+/// implementation of `Job` for `fn run` or of `AsyncJob` for `async fn run`.
+///
+/// The parameter of `run` is a tuple pattern with its tuple type, or no
+/// parameter at all. The attributes and docs ahead of `name` go onto the
+/// struct.
 #[macro_export]
 macro_rules! job {
-	// Sync job with tuple-destructured parameter (implements Job trait)
-	// Pattern: fn run((a, b, c): (A, B, C)) -> ...
+	// A sync job with a tuple-destructured parameter implements `Job`. The arm
+	// matches `fn run((a, b, c): (A, B, C)) -> R`.
 	(
 		$(#[$meta:meta])*
 		name: $job_name:ident,
@@ -109,7 +122,7 @@ macro_rules! job {
 		}
 	};
 
-	// Sync job with no parameters (implements Job trait with Input = ())
+	// A sync job with no parameters implements `Job` with `Input = ()`.
 	(
 		$(#[$meta:meta])*
 		name: $job_name:ident,
@@ -133,7 +146,7 @@ macro_rules! job {
 		}
 	};
 
-	// Async job with tuple-destructured parameter (implements AsyncJob trait)
+	// An async job with a tuple-destructured parameter implements `AsyncJob`.
 	(
 		$(#[$meta:meta])*
 		name: $job_name:ident,
@@ -157,7 +170,7 @@ macro_rules! job {
 		}
 	};
 
-	// Async job with no parameters
+	// An async job with no parameters implements `AsyncJob` with `Input = ()`.
 	(
 		$(#[$meta:meta])*
 		name: $job_name:ident,
@@ -166,7 +179,7 @@ macro_rules! job {
 		$(#[$meta])*
 		pub struct $job_name;
 
-		impl $crate::utils::job::AsyncJob for $job_name {
+		impl $crate::utils::task::AsyncJob for $job_name {
 			type Input = ();
 			type Output = $return_ty;
 
@@ -176,7 +189,7 @@ macro_rules! job {
 		impl $job_name {
 			#[inline]
 			pub async fn run() -> $return_ty {
-				<Self as $crate::utils::job::AsyncJob>::run(()).await
+				<Self as $crate::utils::task::AsyncJob>::run(()).await
 			}
 		}
 	};
@@ -188,7 +201,7 @@ mod tests {
 	#[cfg(feature = "colony")]
 	use crate::colony::common::{ColonyNamespace, HiveManagement};
 	#[cfg(feature = "colony")]
-	use crate::colony::hive::{HiveManagementRequest, ListServletsParams, SpawnServletParams, StopServletParams};
+	use crate::colony::hive::{ListServletsParams, SpawnServletParams, StopServletParams};
 	#[cfg(any(feature = "colony", feature = "tokio"))]
 	use crate::error::Result;
 	#[cfg(feature = "colony")]
@@ -196,58 +209,46 @@ mod tests {
 	#[cfg(any(feature = "colony", feature = "tokio"))]
 	use crate::Frame;
 
-	// Sync job with tuple input - implements Job trait
+	// A sync job with a tuple input, which implements `Job`.
 	#[cfg(feature = "colony")]
 	job! {
 		name: SpawnServletJob,
 		fn run((servlet_type, config): (Urn<'static>, Option<Vec<u8>>)) -> Result<Frame> {
 			compose! {
 				V0: id: "spawn-req",
-					message: HiveManagementRequest {
-						spawn: Some(SpawnServletParams {
-							servlet_type,
-							config,
-						}),
-						list: None,
-						stop: None,
-					}
+					message: HiveManagement::Spawn(SpawnServletParams {
+						servlet_type,
+						config,
+					})
 			}
 		}
 	}
 
-	// Sync job with no params - implements Job trait with Input = ()
+	// A sync job with no parameters, which implements `Job` with `Input = ()`.
 	#[cfg(feature = "colony")]
 	job! {
 		name: ListServletsJob,
 		fn run() -> Result<Frame> {
 			compose! {
 				V0: id: "list-req",
-					message: HiveManagementRequest {
-						spawn: None,
-						list: Some(ListServletsParams { filter: None }),
-						stop: None,
-					}
+					message: HiveManagement::List(ListServletsParams { filter: None })
 			}
 		}
 	}
 
-	// Sync job with single tuple input
+	// A sync job with a one-element tuple input.
 	#[cfg(feature = "colony")]
 	job! {
 		name: StopServletJob,
 		fn run((servlet_id,): (Urn<'static>,)) -> Result<Frame> {
 			compose! {
 				V0: id: "stop-req",
-					message: HiveManagementRequest {
-						spawn: None,
-						list: None,
-						stop: Some(StopServletParams { servlet_id }),
-					}
+					message: HiveManagement::Stop(StopServletParams { servlet_id })
 			}
 		}
 	}
 
-	// Async job with tuple input - implements AsyncJob trait
+	// An async job with a tuple input, which implements `AsyncJob`.
 	#[cfg(feature = "tokio")]
 	job! {
 		name: AsyncCalculationJob,
@@ -256,6 +257,19 @@ mod tests {
 			compose! {
 				V0: id: "calc-result",
 					message: crate::testing::TestMessage { content: result.to_string() }
+			}
+		}
+	}
+
+	// An async job with no parameters, which implements `AsyncJob` with
+	// `Input = ()`.
+	#[cfg(feature = "tokio")]
+	job! {
+		name: AsyncPingJob,
+		async fn run() -> Result<Frame> {
+			compose! {
+				V0: id: "async-ping",
+					message: crate::testing::TestMessage { content: "pong".to_string() }
 			}
 		}
 	}
@@ -282,8 +296,8 @@ mod tests {
 			let frame = frame.unwrap_or_else(|e| panic!("Error: {e:?}"));
 			assert_eq!(frame.metadata().id(), b"spawn-req");
 
-			let request: HiveManagementRequest = crate::decode(frame.message())?;
-			let Ok(HiveManagement::Spawn(spawn)) = request.into_choice() else {
+			let request: HiveManagement = crate::decode(frame.message())?;
+			let HiveManagement::Spawn(spawn) = request else {
 				return Err(crate::testing::error::TestingError::InvariantViolated.into());
 			};
 			assert_eq!(spawn.servlet_type, worker_type());
@@ -299,8 +313,8 @@ mod tests {
 			let frame = frame.unwrap_or_else(|e| panic!("Error: {e:?}"));
 			assert_eq!(frame.metadata().id(), b"list-req");
 
-			let request: HiveManagementRequest = crate::decode(frame.message())?;
-			if !matches!(request.into_choice(), Ok(HiveManagement::List(_))) {
+			let request: HiveManagement = crate::decode(frame.message())?;
+			if !matches!(request, HiveManagement::List(_)) {
 				return Err(crate::testing::error::TestingError::InvariantViolated.into());
 			}
 			Ok(())
@@ -315,8 +329,8 @@ mod tests {
 			let frame = frame.unwrap_or_else(|e| panic!("Error: {e:?}"));
 			assert_eq!(frame.metadata().id(), b"stop-req");
 
-			let request: HiveManagementRequest = crate::decode(frame.message())?;
-			let Ok(HiveManagement::Stop(stop)) = request.into_choice() else {
+			let request: HiveManagement = crate::decode(frame.message())?;
+			let HiveManagement::Stop(stop) = request else {
 				return Err(crate::testing::error::TestingError::InvariantViolated.into());
 			};
 			assert_eq!(stop.servlet_id, worker_instance());
@@ -334,6 +348,20 @@ mod tests {
 
 			let result: crate::testing::TestMessage = crate::decode(frame.message())?;
 			assert_eq!(result.content, "42");
+			Ok(())
+		}
+	}
+
+	#[cfg(feature = "tokio")]
+	test_job! {
+		name: test_async_job_with_no_parameters,
+		job: AsyncPingJob::run(),
+		assertions: |frame| async move {
+			let frame = frame.await?;
+			assert_eq!(frame.metadata().id(), b"async-ping");
+
+			let result: crate::testing::TestMessage = crate::decode(frame.message())?;
+			assert_eq!(result.content, "pong");
 			Ok(())
 		}
 	}

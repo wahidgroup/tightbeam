@@ -32,7 +32,6 @@ use tightbeam::transport::{
 	TransportFailure,
 };
 use tightbeam::utils::marker::MaybeSendFuture;
-use tightbeam::utils::time::Clock;
 use tightbeam::{Frame, TightBeamError};
 use tokio::net::TcpStream;
 use tokio::sync::Notify;
@@ -51,7 +50,7 @@ pub type SplitReader = TransportReader<TokioReadHalf>;
 pub type SplitWriter = TransportWriter<TokioWriteHalf>;
 /// Spawned emit that resolves to the reply frame or the emit error.
 pub type EmitTask = JoinHandle<Result<Option<Frame>, TransportError>>;
-/// Spawned responder loop that resolves when serving ends.
+/// Spawned responder loop that resolves when its serve call returns.
 pub type ServeTask = JoinHandle<Result<(), TransportError>>;
 /// Boxed unary or streaming handler future that answers with a response.
 pub type HandlerFuture = Pin<Box<dyn Future<Output = ResponsePackage> + Send>>;
@@ -72,7 +71,7 @@ pub fn chunked_offer(cap: u32) -> TransportOffer {
 	mux_offer(cap).with_chunk_payload_size(1024)
 }
 
-/// The ID of the client-initiated stream at `index`, counting from zero.
+/// The ID of the client-initiated stream at the zero-based `index`.
 pub fn client_stream_id(index: u32) -> u32 {
 	index * 2 + 1
 }
@@ -82,7 +81,7 @@ pub fn client_stream_id(index: u32) -> u32 {
 ///
 /// # Errors
 ///
-/// - [`TightBeamError`] -- the bind, connect, or handshake failure of either side.
+/// - [`TightBeamError`] -- the bind, connect, or handshake failure of either side, or a panicked server task.
 pub async fn establish_transports(
 	client_offer: Option<TransportOffer>,
 	server_offer: Option<TransportOffer>,
@@ -122,7 +121,7 @@ pub struct MuxEndpoint {
 	pub _reader_task: JoinHandle<()>,
 }
 
-/// Per-endpoint limits for hardening scenarios.
+/// Per-endpoint limits for the scenarios that harden an endpoint.
 #[derive(Default)]
 pub struct MuxEndpointConfig {
 	/// Send-cipher rekey record limit override for the writer half.
@@ -135,12 +134,10 @@ pub struct MuxEndpointConfig {
 	pub rekey: bool,
 	/// Time budget override for one renewal exchange.
 	pub renewal_deadline: Option<Duration>,
-	/// The clock the renewal deadline runs on, for a scenario that advances
-	/// it instead of waiting.
-	pub clock: Option<Arc<dyn Clock>>,
 }
 
-/// Shared tail of encrypted and cleartext endpoint constructors.
+/// Apply the optional cancel budget and spawn the drivers, the shared tail of
+/// the encrypted and cleartext endpoint constructors.
 pub fn spawn_mux_tasks<R, W>(mut mux: MuxTransport<R, W>, cancel_budget: Option<u32>) -> (MuxEndpoint, MuxResponder)
 where
 	R: EnvelopeSource + Send + 'static,
@@ -195,9 +192,6 @@ pub fn spawn_mux_endpoint_with(
 	if let Some(deadline) = config.renewal_deadline {
 		mux = mux.with_renewal_deadline(deadline);
 	}
-	if let Some(clock) = config.clock {
-		mux = mux.with_clock(clock);
-	}
 
 	let endpoint_pair = spawn_mux_tasks(mux, config.cancel_budget);
 	Ok(endpoint_pair)
@@ -239,7 +233,7 @@ pub fn spawn_cleartext_mux_endpoint(
 ///
 /// # Errors
 ///
-/// - [`TightBeamError`] -- the bind, connect, or accept failure.
+/// - [`TightBeamError`] -- the bind, connect, or accept failure, or a panicked accept task.
 pub async fn establish_cleartext_transports(
 ) -> Result<(TcpTransport<TokioStream>, TcpTransport<TokioStream>), TightBeamError> {
 	let listener = TokioListener::<DefaultCryptoProvider>::bind_cleartext("127.0.0.1:0").await?;
@@ -562,7 +556,7 @@ pub async fn drain_body(body: &mut StreamBody) -> DrainedBody {
 	}
 }
 
-/// Whether a counting handler observed a chunked (multi-record) body.
+/// Whether a handler that counts chunks observed a chunked (multi-record) body.
 pub fn saw_multiple_chunks(counter: &AtomicUsize) -> bool {
 	counter.load(Ordering::SeqCst) > 1
 }
@@ -597,7 +591,8 @@ pub fn streaming_echo_handler(chunks_seen: Arc<AtomicUsize>) -> impl Fn(StreamBo
 
 /// Push a payload through a request sink as two chunks, and then close it.
 ///
-/// This is the smallest sequence that exercises the held-back `last` framing.
+/// This is the smallest sequence that sends more than one data chunk before
+/// the empty `last`-flagged record of the close.
 ///
 /// # Errors
 ///
@@ -724,7 +719,8 @@ pub struct AbortContext {
 	pub materials: ServerMaterials,
 	/// The signal the first handler raises when it starts.
 	pub started: HandlerSignal,
-	/// Stays unsignalled, so the first handler parks until a cancel aborts it.
+	/// A notifier that stays unsignalled, so the first handler parks until a
+	/// cancel aborts it.
 	pub never: Notify,
 	/// The flag the drop witness sets when a cancel aborts the parked handler.
 	pub aborted: AtomicBool,
@@ -927,7 +923,7 @@ pub fn is_muxed_response(envelope: &TransportEnvelope, stream_id: u32) -> bool {
 	)
 }
 
-/// Poll `shutdown` once so the handle sends GoAway and the allocator halts,
+/// Poll `shutdown` once so the handle sends a GoAway and the allocator halts,
 /// then return the pinned future for the caller to await the drain.
 pub async fn kick_shutdown(
 	handle: &MuxHandle,
@@ -977,7 +973,7 @@ pub fn is_invalid_message<T>(result: &Result<T, TransportError>) -> bool {
 	matches!(result, Err(TransportError::InvalidMessage))
 }
 
-/// Whether serving ended on a policy rejection.
+/// Whether the serve loop ended on a policy rejection.
 pub fn is_policy_rejection(result: &Result<(), TransportError>) -> bool {
 	matches!(result, Err(TransportError::OperationFailed(TransportFailure::PolicyRejection)))
 }

@@ -171,9 +171,9 @@ fn org_key(org: &OrgNode) -> Option<&CanonicalKey> {
 fn mutate_export(trace: &TraceCollector, org: &OrgNode, selector: u8) -> Result<(), TightBeamError> {
 	let target = target_urn(selector);
 	if selector & 1 == 0 {
-		org.exports.insert(target);
+		org.exports.insert(target)?;
 	} else {
-		org.exports.remove(&target);
+		org.exports.remove(&target)?;
 	}
 
 	trace.event(events::EXPORT_MUTATED)?;

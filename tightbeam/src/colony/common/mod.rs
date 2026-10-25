@@ -1,22 +1,18 @@
-//! This module holds the shared colony types: load balancers, pheromone
-//! metrics, control-plane helpers, and the scaling utilities that the cluster
-//! and the hive use.
+//! The shared colony types that the cluster and the hive use: load
+//! balancers, pheromone metrics, control-plane helpers, the protocol
+//! messages, the colony URNs, and the scaling utilities.
 
 pub mod messages;
 pub mod scaling;
 pub mod urn;
 
 use core::future::Future;
-use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use crate::builder::TypeBuilder;
 use crate::constants::{SPLITMIX64_GAMMA, SPLITMIX64_MIX_1, SPLITMIX64_MIX_2};
 use crate::random::generate_nonce;
-use crate::utils::BasisPoints;
-use crate::{Frame, Message, MessagePriority, TightBeamError, Version};
 
 use crate::runtime::rt;
 
@@ -24,10 +20,10 @@ pub use messages::*;
 pub use scaling::*;
 pub use urn::{ColonyNamespace, ColonyResource, ServletTypeKey, COLONY_NID};
 
-/// Pheromone signal one servlet instance carries into a balancing round.
+/// The pheromone signal one servlet instance carries into a balancing round.
 #[derive(Debug, Clone)]
 pub struct InstanceMetrics {
-	/// Opaque instance handle for the balancing round, which holds the
+	/// The instance handle for the balancing round, which holds the
 	/// canonical instance-URN bytes. Balancers treat these bytes as opaque.
 	///
 	/// The key is owned on purpose. A borrowed key would put a lifetime
@@ -35,32 +31,33 @@ pub struct InstanceMetrics {
 	/// Canonical instance-URN bytes are short, so the per-round copy is
 	/// bounded and cheaper than that API cost.
 	pub instance_key: Vec<u8>,
-	/// Stigmergic trail strength in `0..=`[`MAX_PHEROMONE`], where a higher
-	/// value is a stronger trail.
+	/// The stigmergic trail strength in `0..=`[`MAX_PHEROMONE`], where a
+	/// higher value is a stronger trail.
 	///
 	/// The registry raises it on a successful forward and lowers it on
-	/// failure or evaporation. Balancers use it as the sole selection signal.
+	/// failure or evaporation. [`StochasticForager`] and [`PowerOfTwoChoices`]
+	/// select on it alone, and [`RoundRobin`] ignores it.
 	pub pheromone: u64,
 }
 
-/// Upper bound of the pheromone scale, in basis points.
+/// The upper bound of the pheromone scale, in basis points.
 ///
 /// The registry cap and every balancer that reads the signal share this bound.
 pub const MAX_PHEROMONE: u64 = 10_000;
 
-/// Default [`StochasticForager`] exploration floor.
+/// The default exploration floor of a [`StochasticForager`].
 ///
 /// It is the baseline weight every live instance keeps, so a cold instance
 /// stays selectable.
 pub const DEFAULT_EXPLORATION_FLOOR: u64 = MAX_PHEROMONE / 20;
 
-/// Default [`StochasticForager`] repellency threshold.
+/// The default repellency threshold of a [`StochasticForager`].
 ///
-/// It is the trail strength past which extra pheromone stops attracting and
-/// begins to repel. See the [`StochasticForager`] sources.
+/// It is the trail strength past which extra pheromone repels rather than
+/// attracts. See the [`StochasticForager`] sources.
 pub const DEFAULT_REPELLENCY_THRESHOLD: u64 = (MAX_PHEROMONE * 4) / 5;
 
-/// Strategy that selects one instance among candidates of a servlet type.
+/// A strategy that selects one instance among candidates of a servlet type.
 ///
 /// The trait is object-safe, so
 /// [`ClusterConfig`](crate::colony::cluster::ClusterConfig) can hold
@@ -79,7 +76,7 @@ static BALANCER_SEED_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 ///
 /// The sequence alone already gives each balancer its own stream, so an
 /// entropy source that fails leaves the streams distinct. The entropy only
-/// keeps two gateways that started together from choosing alike, and a
+/// separates the streams of two gateways that started together, and a
 /// balancer needs no secret.
 fn fresh_seed() -> u64 {
 	let sequence = BALANCER_SEED_SEQUENCE.fetch_add(SPLITMIX64_GAMMA, Ordering::Relaxed);
@@ -103,7 +100,8 @@ fn splitmix64_next(state: &AtomicU64) -> u64 {
 	z ^ (z >> 31)
 }
 
-/// Default balancer: stochastic, pheromone-proportional instance selection.
+/// The default balancer, with stochastic, pheromone-proportional instance
+/// selection.
 ///
 /// The forager draws each instance with a probability proportional to its
 /// foraging weight, which follows the stigmergic model the registry keeps. A
@@ -123,7 +121,7 @@ fn splitmix64_next(state: &AtomicU64) -> u64 {
 /// - [`DEFAULT_EXPLORATION_FLOOR`]: the floor is the baseline weight every
 ///   live instance keeps regardless of pheromone.
 /// - [`DEFAULT_REPELLENCY_THRESHOLD`]: the threshold is the pheromone value
-///   past which additional pheromone stops attracting and begins to repel.
+///   past which additional pheromone repels rather than attracts.
 ///
 /// # Examples
 ///
@@ -142,8 +140,9 @@ fn splitmix64_next(state: &AtomicU64) -> u64 {
 ///   stigmergy: [doi:10.1613/jair.530](https://doi.org/10.1613/jair.530)
 /// - Nakrani & Tovey (2004), honey-bee dynamic server allocation:
 ///   [doi:10.1177/105971230401200308](https://doi.org/10.1177/105971230401200308)
-/// - Saran et al. (2007), termite trail pheromone that turns repellent above
-///   ~10 pg/cm: [doi:10.1007/s10886-006-9229-2](https://doi.org/10.1007/s10886-006-9229-2)
+/// - Saran et al. (2007), termite trail pheromone that turns repellent
+///   above ~10 pg/cm:
+///   [doi:10.1007/s10886-006-9229-2](https://doi.org/10.1007/s10886-006-9229-2)
 #[derive(Debug, Clone)]
 pub struct StochasticForager {
 	exploration_floor: u64,
@@ -281,8 +280,8 @@ impl LoadBalancer for PowerOfTwoChoices {
 	}
 }
 
-/// Round-robin balancer that cycles through instances in order and ignores
-/// pheromone.
+/// A round-robin balancer that cycles through instances in order and
+/// ignores pheromone.
 #[derive(Debug, Clone, Default)]
 pub struct RoundRobin {
 	counter: Arc<AtomicU64>,
@@ -299,73 +298,15 @@ impl LoadBalancer for RoundRobin {
 	}
 }
 
-/// Mean utilization across a hive's servlet instances, in basis points.
-///
-/// - `total_utilization` is the sum of per-instance basis points.
-/// - `instance_count` is the number of instances in that sum.
-///
-/// A hive with zero instances returns [`BasisPoints::MAX`] so backpressure
-/// and heartbeats report saturation. Per-type scaling still sees the zero
-/// count and can spawn. A mean past the range of [`BasisPoints`] saturates.
-///
-/// # Examples
-///
-/// ```
-/// # use tightbeam::colony::common::aggregate_utilization;
-/// # use tightbeam::utils::BasisPoints;
-/// assert_eq!(aggregate_utilization(20_000, 4).get(), 5_000);
-/// assert_eq!(aggregate_utilization(131_072, 2), BasisPoints::MAX);
-/// ```
-pub fn aggregate_utilization(total_utilization: u64, instance_count: usize) -> BasisPoints {
-	match NonZeroU64::new(instance_count as u64) {
-		None => BasisPoints::MAX,
-		Some(n) => BasisPoints::saturating_from(total_utilization / n),
-	}
-}
-
-/// Builds a V0 response frame that echoes the request id.
-///
-/// # Errors
-///
-/// - [`TightBeamError`] -- the frame builder refuses the frame, such as when `message` fails to encode.
-pub fn reply_frame<M: Message>(id: impl AsRef<[u8]>, message: M) -> Result<Option<Frame>, TightBeamError> {
-	let frame = Version::V0.compose().with_id(id).with_order(0).with_message(message).build()?;
-
-	Ok(Some(frame))
-}
-
-/// Builds a V2 response frame with an explicit priority.
-///
-/// Heartbeat replies use `NetworkControl` so monitoring stays distinct
-/// from work traffic.
-///
-/// # Errors
-///
-/// - [`TightBeamError`] -- the frame builder refuses the frame, such as when `message` fails to encode.
-pub fn reply_frame_with_priority<M: Message>(
-	id: impl AsRef<[u8]>,
-	priority: MessagePriority,
-	message: M,
-) -> Result<Option<Frame>, TightBeamError> {
-	let frame = Version::V2
-		.compose()
-		.with_id(id)
-		.with_order(0)
-		.with_priority(priority)
-		.with_message(message)
-		.build()?;
-
-	Ok(Some(frame))
-}
-
 /// Whether a runtime has entered drain.
 ///
-/// Drain is one fact that three readers share. Every reader holds the same
-/// handle, so their decisions agree:
+/// Every clone of the handle shares one flag, so its readers agree:
 ///
-/// - The control plane refuses new manage work.
-/// - The scaling loop stops changing the slate.
-/// - The re-announce loop stops advertising a hive that is going away.
+/// - The hive control plane refuses each command that yields to load.
+/// - [`Hive::is_draining`](crate::colony::hive::Hive::is_draining) reports the flag.
+///
+/// The hive drain aborts the scaling loop and the re-announce loop through the
+/// runtime's [`TaskGroup`] before it waits on commands in flight.
 ///
 /// Drain is terminal. A runtime that has entered it stays in it.
 #[derive(Clone, Default)]
@@ -386,9 +327,9 @@ impl DrainMode {
 
 /// The background tasks one runtime started.
 ///
-/// A runtime keeps one group and puts every task it spawns in it, so stopping
-/// the runtime stops that work with a single call. The handle is shared, so a
-/// context handed to a request handler can adopt work the handler starts.
+/// A runtime keeps one group and puts every task it spawns in it, so one call
+/// stops that work when the runtime stops. The handle is shared, so a context
+/// handed to a request handler can adopt work the handler starts.
 ///
 /// # Single spawn path
 ///
@@ -398,7 +339,7 @@ impl DrainMode {
 #[derive(Clone, Default)]
 pub struct TaskGroup(Arc<Mutex<TaskGroupState>>);
 
-/// Running handles, and whether the group has stopped.
+/// The handles of the tasks that run, and whether the group has stopped.
 #[derive(Default)]
 struct TaskGroupState {
 	running: Vec<rt::JoinHandle>,
@@ -409,7 +350,7 @@ impl TaskGroup {
 	/// Takes ownership of `handle`, and releases each handle whose task ended.
 	///
 	/// A stopped group aborts `handle` on arrival, so work that starts while
-	/// the runtime is stopping ends with the stop (CWE-772). The sweep bounds
+	/// the runtime stops ends with the stop (CWE-772). The sweep bounds
 	/// the group by the tasks that still run, which keeps a runtime that
 	/// spawns per request at the size of its live work.
 	pub fn adopt(&self, handle: rt::JoinHandle) {
@@ -434,7 +375,7 @@ impl TaskGroup {
 	/// Stops the group and aborts every task it still owns.
 	///
 	/// A stop is terminal: a later [`TaskGroup::spawn`] aborts on
-	/// arrival, which keeps the stop reaching every task the group starts.
+	/// arrival, so the stop reaches every task the group starts.
 	pub fn abort_all(&self) {
 		let mut state = self.state();
 		state.stopped = true;
@@ -600,29 +541,6 @@ mod tests {
 		assert_eq!(seen.len(), dead.len());
 	}
 
-	/// Each case is a `(total_utilization, instance_count, expected_bps)` row.
-	const AGGREGATE_CASES: &[(u64, usize, u16)] = &[
-		(0, 0, 10000),     // With no instances, the hive reports saturation so work routes elsewhere.
-		(0, 4, 0),         // Every instance is idle.
-		(20000, 4, 5000),  // The instances share one uniform mean.
-		(10000, 2, 5000),  // One loaded type and one idle type average to half.
-		(40000, 4, 10000), // Every instance is fully loaded.
-	];
-
-	#[test]
-	fn aggregate_utilization_means_across_all_instances() {
-		for &(total, count, expected) in AGGREGATE_CASES {
-			assert_eq!(super::aggregate_utilization(total, count).get(), expected);
-		}
-	}
-
-	// A mean of 65,536 basis points is past the `u16` range, and it reads as
-	// saturation.
-	#[test]
-	fn a_mean_past_the_u16_range_reads_as_saturation() {
-		assert_eq!(super::aggregate_utilization(131_072, 2), super::BasisPoints::MAX);
-	}
-
 	#[test]
 	fn a_fresh_runtime_is_not_draining() {
 		assert!(!DrainMode::default().is_draining());
@@ -657,7 +575,7 @@ mod tests {
 	/// and then finishes was never stopped.
 	const LONG_RUN: Duration = Duration::from_secs(30);
 
-	/// The pause between two beats of the running task.
+	/// The pause between two beats of the task under test.
 	const BEAT: Duration = Duration::from_millis(5);
 
 	/// Moves the paused test clock forward by `span` and lets every task it
@@ -728,8 +646,8 @@ mod tests {
 		assert!(!FINISHED.load(Ordering::SeqCst));
 	}
 
-	/// A poisoned lock carries no damaged state, so a live group keeps
-	/// running the work it adopts.
+	/// A poisoned lock carries no damaged state, so a live group still runs
+	/// the work it adopts.
 	#[tokio::test(start_paused = true)]
 	async fn a_poisoned_group_runs_the_work_it_adopts() {
 		static FINISHED: AtomicBool = AtomicBool::new(false);

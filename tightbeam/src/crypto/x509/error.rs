@@ -27,7 +27,7 @@ pub enum CertificateValidationError {
 	#[error("Certificate has empty signature")]
 	EmptySignature,
 
-	/// The timestamp provided for validation is invalid.
+	/// The validation timestamp is invalid, or the build has no clock.
 	#[error("Invalid timestamp")]
 	InvalidTimestamp,
 
@@ -108,8 +108,8 @@ pub enum CertificateValidationError {
 
 	/// Two certificates with different fingerprints have the same SKID.
 	///
-	/// The error carries the colliding key identifier, so the operator can
-	/// find the store entry.
+	/// The error carries the key identifier of the collision, so the operator
+	/// can find the store entry.
 	#[error("SKID collision: two certificates share key identifier {skid}")]
 	SkidCollision {
 		/// The key identifier both certificates carry, in hex.
@@ -121,18 +121,23 @@ pub enum CertificateValidationError {
 	/// [`CertificateTrust`](super::store::CertificateTrust#contract) contract.
 	///
 	/// The error carries the SubjectPublicKeyInfo DER of the refused
-	/// certificate in hex, so the operator can find that certificate.
-	#[error("Public key collision: SubjectPublicKeyInfo {public_key} holds the key of another certificate")]
+	/// certificate in hex, and the serial number and issuer of the held one,
+	/// so the operator can find both certificates.
+	#[error("Public key collision: SubjectPublicKeyInfo {public_key} holds the key of the certificate of {holder}")]
 	PublicKeyCollision {
 		/// The SubjectPublicKeyInfo DER of the second certificate, in hex.
 		public_key: String,
+		/// The serial number in hex and the issuer of the certificate that
+		/// holds the key, the pair that names one certificate (RFC 5280
+		/// §4.1.2.2).
+		holder: String,
 	},
 
 	/// The issuer certificate is not a CA (RFC 5280 §6.1.4(k)).
 	#[error("Issuer certificate is not a CA")]
 	IssuerNotCa,
 
-	/// The issuer keyUsage extension does not assert keyCertSign
+	/// The `keyUsage` extension of the issuer does not assert `keyCertSign`
 	/// (RFC 5280 §6.1.4(n)).
 	#[error("Issuer keyUsage does not permit certificate signing")]
 	MissingKeyCertSign,

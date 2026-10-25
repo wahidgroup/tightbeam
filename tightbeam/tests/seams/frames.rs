@@ -29,6 +29,8 @@ use tightbeam::crypto::aead::{
 use tightbeam::crypto::cms::{
 	AuthEnvelopedData, BareKemKey, EnvelopeError, KemRecipient, KemRecipientInfo, Opener, Recipient,
 };
+use tightbeam::crypto::common::generic_array::GenericArray;
+use tightbeam::crypto::common::typenum::U16;
 use tightbeam::crypto::hkdf::InvalidLength;
 use tightbeam::crypto::hpke::{
 	HkdfSha256, HpkeDecryptor, HpkeEncryptor, HpkeKdf, HpkePublicKeyOps, HpkeSecretKeyOps, HpkeSuite,
@@ -38,6 +40,7 @@ use tightbeam::crypto::k256::sha2::Sha512;
 use tightbeam::crypto::k256::SecretKey;
 use tightbeam::crypto::kdf::{Hkdf, KdfError};
 use tightbeam::crypto::key::{EncryptingKeyProvider, InMemoryEncryptingKeyProvider, KeyError};
+use tightbeam::crypto::profiles::Kek;
 use tightbeam::crypto::secret::{SecretSlice, ToInsecure};
 use tightbeam::der::asn1::ObjectIdentifier;
 use tightbeam::der::{Decode, Encode};
@@ -127,7 +130,7 @@ fn a_frame_sealed_to_the_outside_kem_names_the_outside_algorithms() -> Result<()
 	Ok(())
 }
 
-/// A bare key whose outside backend holds another key is refused.
+/// `BareKemKey::new` refuses an outside backend that holds another key.
 #[test]
 fn a_bare_kem_key_refuses_an_outside_backend_of_another_key() {
 	let (public, _) = outside_backend();
@@ -169,9 +172,9 @@ fn with_body_tampered(frame: &Frame) -> Frame {
 	Frame::from_der(&der).expect("the tampered frame decodes")
 }
 
-/// A frame under the outside cipher whose body fails its tag is refused, and
-/// the outside cipher, which opened the body in its own buffer, leaves it as
-/// it arrived.
+/// `Frame::decrypt_in_place` refuses a frame under the outside cipher whose
+/// body fails its tag, and the outside cipher, which opened the body in its own
+/// buffer, leaves it as it arrived.
 #[tokio::test]
 async fn a_refused_frame_under_the_outside_cipher_keeps_its_ciphertext() -> Result<(), TightBeamError> {
 	let message = TestMessage::sample(Some("outside refused frame"));
@@ -315,9 +318,11 @@ async fn an_outside_kek_holder_names_its_key_and_algorithm() -> Result<(), Tight
 
 /// A frame cipher an outside crate writes against the public envelope API:
 /// it seals a frame to its own key-encryption key under the outside
-/// provider, and opens it under the same key.
+/// provider, and opens it under the same key. The array type of the key holds
+/// the key size of the wrap, so the cipher lends a [`Kek`] with no length
+/// check.
 struct OutsideFrameCipher {
-	kek: [u8; 16],
+	kek: GenericArray<u8, U16>,
 }
 
 impl Encryptor<Aes128GcmOid> for OutsideFrameCipher {
@@ -327,7 +332,8 @@ impl Encryptor<Aes128GcmOid> for OutsideFrameCipher {
 		content_type: Option<ObjectIdentifier>,
 		rng: Option<&mut dyn CryptoRngCore>,
 	) -> Result<AuthEnvelopedData, TightBeamError> {
-		let recipient = Recipient::Kek { kek: &self.kek, key_identifier: OUTSIDE_KEY_IDENTIFIER };
+		let kek = Kek::from(&self.kek);
+		let recipient = Recipient::Kek { kek, key_identifier: OUTSIDE_KEY_IDENTIFIER };
 		let content_type = content_type.unwrap_or(DATA);
 		let sealed = AuthEnvelopedData::seal::<OutsideProvider>(recipient, content_type, content, [], rng);
 		Ok(sealed?)
@@ -341,7 +347,8 @@ impl Decryptor for OutsideFrameCipher {
 
 	fn open<'a>(&'a self, content: CheckedContent<'a>) -> MaybeSendFuture<'a, Result<(), TightBeamError>> {
 		Box::pin(async move {
-			let opener = Opener::Kek { kek: &self.kek, key_identifier: OUTSIDE_KEY_IDENTIFIER };
+			let kek = Kek::from(&self.kek);
+			let opener = Opener::Kek { kek, key_identifier: OUTSIDE_KEY_IDENTIFIER };
 			content.open::<OutsideProvider>(&opener).await
 		})
 	}
@@ -351,10 +358,10 @@ impl Decryptor for OutsideFrameCipher {
 #[tokio::test]
 async fn an_outside_frame_cipher_seals_and_opens_a_frame() -> Result<(), TightBeamError> {
 	let message = TestMessage::sample(Some("outside cipher"));
-	let cipher = OutsideFrameCipher { kek: [0x52; 16] };
+	let cipher = OutsideFrameCipher { kek: [0x52; 16].into() };
 	let frame = compose! { V1: id: "outside-cipher", order: 1u64, message: message.clone(), confidentiality: cipher }?;
 
-	let opened: TestMessage = frame.decrypt(&OutsideFrameCipher { kek: [0x52; 16] }, None).await?;
+	let opened: TestMessage = frame.decrypt(&OutsideFrameCipher { kek: [0x52; 16].into() }, None).await?;
 	assert_eq!(opened, message);
 	Ok(())
 }
@@ -406,7 +413,7 @@ impl Decryptor for OutsidePartsDecryptor {
 #[tokio::test]
 async fn an_outside_decryptor_opens_a_frame_from_its_parts() -> Result<(), TightBeamError> {
 	let message = TestMessage::sample(Some("outside parts"));
-	let cipher = OutsideFrameCipher { kek: [0x52; 16] };
+	let cipher = OutsideFrameCipher { kek: [0x52; 16].into() };
 	let frame = compose! { V1: id: "outside-parts", order: 1u64, message: message.clone(), confidentiality: cipher }?;
 
 	let opened: TestMessage = frame.decrypt(&OutsidePartsDecryptor { kek: [0x52; 16] }, None).await?;

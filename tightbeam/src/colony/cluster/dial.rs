@@ -9,8 +9,7 @@
 //!
 //! # Sources
 //!
-//! - CWE-918, server-side request forgery:
-//!   <https://cwe.mitre.org/data/definitions/918.html>
+//! - CWE-918, server-side request forgery: <https://cwe.mitre.org/data/definitions/918.html>
 
 use core::fmt;
 use core::str::FromStr;
@@ -42,7 +41,7 @@ impl AdmittedDial {
 		self.0
 	}
 
-	/// The admitted socket as the dialing protocol's address type.
+	/// The admitted socket as the address type of the protocol that dials it.
 	///
 	/// This delegates to [`DialTarget::protocol_address`], the one place a
 	/// dial becomes a protocol address.
@@ -51,7 +50,7 @@ impl AdmittedDial {
 	///
 	/// - [`ClusterError::InvalidAddress`] -- the protocol does not address by socket.
 	pub fn protocol_address<A: FromStr>(&self) -> Result<A, ClusterError> {
-		DialTarget::from(*self).protocol_address()
+		DialTarget::of_claimed(*self).protocol_address()
 	}
 }
 
@@ -92,17 +91,17 @@ impl PeerConfig {
 	/// This is the one decider for every claimed dial. Two refusals hold on
 	/// every plane, and the allowlist decides the rest, in order:
 	///
-	/// - An unspecified address ([`PeerAddress::is_unspecified`]) is refused,
-	///   because a connect to it lands on this host's loopback even when the
-	///   allowlist names it (CWE-706).
-	/// - An address that names no unicast peer ([`PeerAddress::is_unicast`]) is
-	///   refused, because a dial to it can only spend a probe (CWE-770).
-	/// - An allowlist, when set, decides alone. Without one, every other address is admitted.
+	/// 1. An unspecified address ([`PeerAddress::is_unspecified`]) is refused,
+	///    because a connect to it lands on this host's loopback even when the
+	///    allowlist names it (CWE-706).
+	/// 2. An address that names no unicast peer ([`PeerAddress::is_unicast`])
+	///    is refused, because a dial to it can only spend a probe (CWE-770).
+	/// 3. An allowlist, when set, decides alone. Without one, every other address is admitted.
 	///
 	/// # Errors
 	///
 	/// - [`DialRefusal::Unspecified`] -- the address is `0.0.0.0` or `[::]`.
-	/// - [`DialRefusal::NotUnicast`] -- the address is multicast, broadcast, or reserved.
+	/// - [`DialRefusal::NotUnicast`] -- the address is multicast, broadcast, reserved, or in `0.0.0.0/8`.
 	/// - [`DialRefusal::OffAllowlist`] -- the allowlist is set and omits the address.
 	pub fn admit_dial(&self, claimed: impl Into<PeerAddress>) -> Result<AdmittedDial, DialRefusal> {
 		let claimed: PeerAddress = claimed.into();
@@ -186,10 +185,10 @@ impl PeerConfig {
 	/// The address this gateway advertises to peers, given the address it
 	/// bound.
 	///
-	/// An advertise address the operator configured wins. Otherwise the bound
-	/// address is advertised as it is, unless this gateway beats and the
-	/// bound address is unspecified: every peer refuses that claim, so the
-	/// gateway refuses to start instead of federating silently.
+	/// An advertise address the operator configured wins. Otherwise the
+	/// gateway advertises the bound address as it is. A gateway that beats
+	/// from an unspecified bound address refuses to start instead, because
+	/// every peer refuses that claim and the federation would fail unseen.
 	///
 	/// # Errors
 	///

@@ -4,7 +4,7 @@
 //! - A [`ServletService`] written without the macro uses the same entry point.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::cms::signed_data::SignerIdentifier;
 use crate::colony::hive::{HiveContext, ServletBox};
@@ -70,7 +70,9 @@ where
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError`] -- the listener fails to bind, or a worker fails to start.
+	/// - [`TightBeamError::TransportError`] -- the protocol forms no default
+	///   bind address, or the listener fails to bind.
+	/// - [`TightBeamError`] -- a worker fails to start, as the worker reports it.
 	pub async fn start<M, C, Env, S>(
 		trace: Arc<TraceCollector>,
 		servlet_conf: ServletConfig<P, M, C, Env>,
@@ -163,17 +165,18 @@ impl<P: Protocol> ServletRuntime<P> {
 		Arc::clone(&self.addr_bytes)
 	}
 
-	/// Borrows the address bytes without bumping the reference count.
+	/// Borrows the address bytes and leaves the reference count unchanged.
 	pub fn addr_bytes_ref(&self) -> &[u8] {
 		&self.addr_bytes
 	}
 
-	/// Replaces the live trace collector behind the shared handle. A
-	/// poisoned handle keeps its old collector.
+	/// Replaces the live trace collector behind the shared handle.
+	///
+	/// The handle holds one whole collector, so a lock that a holder poisoned
+	/// in a panic holds no torn state, and the replacement goes in.
 	pub fn set_trace(&self, trace: Arc<TraceCollector>) {
-		if let Ok(mut guard) = self.trace_handle.lock() {
-			*guard = trace;
-		}
+		let mut guard = self.trace_handle.lock().unwrap_or_else(PoisonError::into_inner);
+		*guard = trace;
 	}
 
 	/// Aborts the accept loop.
@@ -250,5 +253,48 @@ where
 
 	async fn join(self) -> Result<(), rt::JoinError> {
 		ServletRuntime::join(self).await
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::panic::{catch_unwind, AssertUnwindSafe};
+
+	use super::*;
+	use crate::transport::TokioListener;
+
+	/// A runtime whose trace handle a holder poisoned with a panic while it
+	/// held the lock.
+	fn poisoned_runtime() -> ServletRuntime<TokioListener> {
+		let addr = "127.0.0.1:0".parse().expect("a socket spelling parses");
+		let trace_handle = Arc::new(Mutex::new(Arc::new(TraceCollector::default())));
+		let runtime = ServletRuntime {
+			server_handle: None,
+			addr,
+			addr_bytes: Arc::from(&b"127.0.0.1:0"[..]),
+			signer: None,
+			trace_handle,
+		};
+		let panicked = catch_unwind(AssertUnwindSafe(|| {
+			let _held = runtime.trace_handle.lock().expect("the lock is live until this panic");
+			panic!("poison the trace handle");
+		}));
+
+		assert!(panicked.is_err());
+		assert!(runtime.trace_handle.is_poisoned());
+		runtime
+	}
+
+	/// A replacement on a poisoned handle installs the new collector, because
+	/// the handle holds one whole value.
+	#[test]
+	fn a_poisoned_trace_handle_takes_the_replacement() {
+		let runtime = poisoned_runtime();
+		let trace = Arc::new(TraceCollector::default());
+
+		runtime.set_trace(Arc::clone(&trace));
+
+		let held = runtime.trace_handle.lock().unwrap_or_else(PoisonError::into_inner);
+		assert!(Arc::ptr_eq(&held, &trace));
 	}
 }

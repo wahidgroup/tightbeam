@@ -8,8 +8,7 @@
 //!
 //! Wahid Group, LLC holds IANA PEN 64586, so its arc is `1.3.6.1.4.1.64586`.
 //!
-//! - `.1` holds the handshake and session attributes, which are the transport
-//!   handshake attribute OIDs of the FULL_CMS profile.
+//! - `.1` holds the handshake, session, and record attributes, content types, and profiles.
 //! - `.1.100` is reserved, because published releases gave it to another key exchange profile.
 //! - `.2` holds the algorithms, such as zstd and DHKEM over secp256k1.
 //! - `.2.2` is reserved, because published releases gave it to an HPKE suite.
@@ -317,7 +316,7 @@ pub const BINARY_FIELD_CURVES: [ObjectIdentifier; 18] = [
 	ObjectIdentifier::new_unwrap("1.3.132.0.39"),
 ];
 
-/// X25519, which is Curve25519 for ECDH. It is used with Ed25519 signatures.
+/// X25519, which is Curve25519 for ECDH. It pairs with Ed25519 signatures.
 ///
 /// # Sources
 ///
@@ -330,7 +329,8 @@ pub const CURVE_X25519: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.101
 ///
 /// # Sources
 ///
-/// - FIPS 203, Module-Lattice-Based Key-Encapsulation Mechanism Standard
+/// - FIPS 203, Module-Lattice-Based Key-Encapsulation Mechanism Standard:
+///   <https://csrc.nist.gov/pubs/fips/203/final>
 /// - NIST Computer Security Objects Register, algorithm registration:
 ///   <https://csrc.nist.gov/projects/computer-security-objects-register/algorithm-registration>
 /// - RFC 9935, ML-KEM algorithm identifiers: <https://datatracker.ietf.org/doc/html/rfc9935>
@@ -342,8 +342,8 @@ pub const HANDSHAKE_PROTOCOL_VERSION: ObjectIdentifier = ObjectIdentifier::new_u
 /// The handshake attribute that carries the algorithm profile.
 pub const HANDSHAKE_ALGORITHM_PROFILE: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.2");
 
-/// The handshake attribute that carries the client nonce.
-pub const HANDSHAKE_CLIENT_NONCE: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.3");
+// 1.3.6.1.4.1.64586.1.3 is reserved for the client nonce attribute. A new
+// attribute takes a new arc, so each arc keeps one meaning.
 
 /// The handshake attribute that carries the selected version.
 pub const HANDSHAKE_SELECT_VERSION: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.4");
@@ -351,8 +351,7 @@ pub const HANDSHAKE_SELECT_VERSION: ObjectIdentifier = ObjectIdentifier::new_unw
 /// The handshake attribute that carries the selected algorithm.
 pub const HANDSHAKE_SELECT_ALGORITHM: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.5");
 
-/// The handshake attribute that carries the server nonce.
-pub const HANDSHAKE_SERVER_NONCE: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.6");
+// 1.3.6.1.4.1.64586.1.6 is reserved for the server nonce attribute.
 
 /// The handshake attribute that carries an abort alert.
 pub const HANDSHAKE_ABORT_ALERT: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.7");
@@ -360,11 +359,9 @@ pub const HANDSHAKE_ABORT_ALERT: ObjectIdentifier = ObjectIdentifier::new_unwrap
 /// The handshake attribute that carries the transcript hash.
 pub const HANDSHAKE_TRANSCRIPT_HASH: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.8");
 
-/// The handshake attribute that carries the supported curves.
-pub const HANDSHAKE_SUPPORTED_CURVES: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.9");
-
-/// The handshake attribute that carries the selected curve.
-pub const HANDSHAKE_SELECTED_CURVE: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.10");
+// 1.3.6.1.4.1.64586.1.9 is reserved for the supported curves attribute, and
+// 1.3.6.1.4.1.64586.1.10 for the selected curve attribute. A profile names
+// its curve.
 
 /// The handshake attribute that carries the security offer.
 pub const HANDSHAKE_SECURITY_OFFER: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.11");
@@ -393,10 +390,10 @@ pub const HANDSHAKE_TRANSPORT_ACCEPT: ObjectIdentifier = ObjectIdentifier::new_u
 // Receipt signatures travel as SignerInfos inside the receipt SignedData
 // artifact.
 
-/// Session receipt acknowledgement OID. The value is an OCTET STRING holding
-/// the DER of an `AuthEnvelopedData`, under a key derived from the handshake
-/// secret, that seals the client's receipt `SignerInfo` (countersignature plus
-/// confidential settlement answer).
+/// Session receipt acknowledgement OID. The value is an OCTET STRING that
+/// holds the DER of an `AuthEnvelopedData`. The envelope seals the client's
+/// receipt `SignerInfo` (countersignature plus confidential settlement
+/// answer) under a key derived from the handshake secret.
 pub const RECEIPT_ACK: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.18");
 
 /// Session receipt artifact OID (CMS attribute carriage). The value is
@@ -408,13 +405,13 @@ pub const SESSION_RECEIPT: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.
 /// SignedData artifact.
 pub const SESSION_RECEIPT_CONTENT: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.20");
 
-/// Signed attribute binding a receipt `SignerInfo` to its role
-/// (INTEGER: 0 server, 1 client) so one party's signature cannot be
+/// Signed attribute that binds a receipt `SignerInfo` to its role
+/// (INTEGER: 0 server, 1 client), so one party's signature cannot be
 /// spliced into the other role (CWE-347).
 pub const RECEIPT_ROLE: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.21");
 
-/// Signed attribute carrying the client's settlement answer (OCTET STRING)
-/// inside its receipt `SignerInfo`, binding the answer to the countersignature
+/// Signed attribute that carries the client's settlement answer (OCTET STRING)
+/// inside its receipt `SignerInfo`, so the countersignature covers the answer
 /// the standard CMS way.
 pub const RECEIPT_ANSWER: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.22");
 
@@ -461,13 +458,28 @@ pub const ATTR_MESSAGE_DIGEST: ObjectIdentifier = ObjectIdentifier::new_unwrap("
 /// [rfc6211-2]: https://datatracker.ietf.org/doc/html/rfc6211#section-2
 pub const ATTR_CMS_ALGORITHM_PROTECTION: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.52");
 
+/// The arcs of the private arc that no constant takes, each reserved for the
+/// meaning a published release gave it, so each arc keeps one meaning.
+#[cfg(test)]
+const RESERVED_ARCS: [ObjectIdentifier; 9] = [
+	ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.3"),
+	ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.6"),
+	ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.9"),
+	ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.10"),
+	ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.13"),
+	ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.14"),
+	ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.17"),
+	ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.100"),
+	ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.2.2"),
+];
+
 #[cfg(test)]
 mod tests {
 	use super::*;
 
-	/// The test pins every OID constant to its dotted-decimal value, so an
-	/// accidental edit cannot silently change an identifier that peers
-	/// exchange.
+	/// The test pins each OID constant of its table to its dotted-decimal
+	/// value, so an accidental edit cannot silently change an identifier that
+	/// peers exchange.
 	#[test]
 	fn oid_values_are_pinned() {
 		let pinned: &[(ObjectIdentifier, &str)] = &[
@@ -502,14 +514,10 @@ mod tests {
 			(KEM_ML_KEM_1024, "2.16.840.1.101.3.4.4.3"),
 			(HANDSHAKE_PROTOCOL_VERSION, "1.3.6.1.4.1.64586.1.1"),
 			(HANDSHAKE_ALGORITHM_PROFILE, "1.3.6.1.4.1.64586.1.2"),
-			(HANDSHAKE_CLIENT_NONCE, "1.3.6.1.4.1.64586.1.3"),
 			(HANDSHAKE_SELECT_VERSION, "1.3.6.1.4.1.64586.1.4"),
 			(HANDSHAKE_SELECT_ALGORITHM, "1.3.6.1.4.1.64586.1.5"),
-			(HANDSHAKE_SERVER_NONCE, "1.3.6.1.4.1.64586.1.6"),
 			(HANDSHAKE_ABORT_ALERT, "1.3.6.1.4.1.64586.1.7"),
 			(HANDSHAKE_TRANSCRIPT_HASH, "1.3.6.1.4.1.64586.1.8"),
-			(HANDSHAKE_SUPPORTED_CURVES, "1.3.6.1.4.1.64586.1.9"),
-			(HANDSHAKE_SELECTED_CURVE, "1.3.6.1.4.1.64586.1.10"),
 			(HANDSHAKE_SECURITY_OFFER, "1.3.6.1.4.1.64586.1.11"),
 			(HANDSHAKE_SECURITY_ACCEPT, "1.3.6.1.4.1.64586.1.12"),
 			(HANDSHAKE_PROFILE_HPKE_GCM, "1.3.6.1.4.1.64586.1.101"),
@@ -533,5 +541,9 @@ mod tests {
 		for (oid, expected) in pinned {
 			assert_eq!(*oid, ObjectIdentifier::new_unwrap(expected));
 		}
+		// Each reserved arc stays apart from the constants, so each arc keeps
+		// one meaning.
+		let reused = pinned.iter().filter(|(oid, _)| RESERVED_ARCS.contains(oid)).count();
+		assert_eq!(reused, 0);
 	}
 }

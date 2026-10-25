@@ -7,11 +7,11 @@ use crate::colony::cluster::peer::AdmittedPeerAd;
 use crate::colony::cluster::runtime::bounds::{ColonyConfig, ColonyDialProtocol, ColonyDigest, GatewayRuntimeCtx};
 use crate::colony::cluster::runtime::gossip_tasks::{GossipOrigin, GossipPipelineCtx};
 use crate::colony::cluster::runtime::refuse::Refusal;
-use crate::colony::cluster::{gossip_want, GossipDigest, RouteKind};
 use crate::colony::cluster::{ClusterConfig, ClusterError, PeerCaps, ServletRegistry, VerifiedRumor};
+use crate::colony::cluster::{GossipDigest, RouteKind, WantList};
 use crate::colony::common::PeerGossip;
 use crate::colony::common::{
-	reply_frame, GossipReconciliation, GossipRumor, GossipWant, PeerAdvertisement, PeerAdvertisementResponse,
+	GossipReconciliation, GossipRumor, GossipWant, PeerAdvertisement, PeerAdvertisementResponse, ReplyForm,
 };
 use crate::constants::MAX_PEX_SAMPLE;
 use crate::constants::{MAX_GOSSIP_LOG, MAX_GOSSIP_TTL};
@@ -74,7 +74,7 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 
 		self.trace.event(CLUSTER_PEER_ADVERTISED)?;
 
-		reply_frame(frame.metadata().id(), PeerAdvertisementResponse { status: TransitStatus::Ok })
+		ReplyForm::Plain.reply(frame.metadata().id(), PeerAdvertisementResponse { status: TransitStatus::Ok })
 	}
 }
 
@@ -82,9 +82,9 @@ impl<P: ColonyDialProtocol> GossipPipelineCtx<P> {
 	/// Admit a peer-relayed origin-signed rumor and continue the flood.
 	pub(crate) async fn relay(self, frame: Frame, rumor: Box<Frame>) -> Result<Option<Frame>, TightBeamError> {
 		let rumor = *rumor;
-		// The flood is scoped (CWE-668), so the relaying peer MUST be a member
-		// of it. A peer outside it is a policy refusal, so the relay's score
-		// stays as it is.
+		// The flood is scoped (CWE-668), so the relay peer MUST be a member of
+		// it. A peer outside it is a policy refusal, so the relay's score stays
+		// as it is.
 		let Some(flood) = self.config.flood() else {
 			return Refusal::to(&frame, &self.trace).gossip(TransitStatus::PermissionDenied);
 		};
@@ -102,7 +102,7 @@ impl<P: ColonyDialProtocol> GossipPipelineCtx<P> {
 			}
 		};
 
-		// The outer `lifetime` is hop-authenticated, so a missing TTL is relay
+		// The outer `lifetime` is hop-authenticated, so an absent TTL is relay
 		// misbehavior and scores the relay.
 		let hop_ttl = match frame.metadata().lifetime() {
 			Some(hop_ttl) => hop_ttl,
@@ -131,7 +131,7 @@ impl<P: ColonyDialProtocol> GossipPipelineCtx<P> {
 		let rumor = VerifiedRumor::new(rumor, signature);
 
 		// Freshness for a relayed rumor is its issue time, which `admit`
-		// checks against the seen TTL (seen-ttl) rather than the control
+		// checks against the seen window (`seen_ttl`) rather than the control
 		// window.
 		self.run(GossipOrigin::Relay, frame, rumor, hop_ttl, Some(relay_id), Some(rumor_signer))
 			.await
@@ -181,7 +181,7 @@ impl<P: ColonyDialProtocol> GossipPipelineCtx<P> {
 			return Refusal::to(&frame, &self.trace).gossip(TransitStatus::Unavailable);
 		};
 
-		// A local peer-ad apply names the signer that this signing step
+		// A local peer-ad apply names the signer that the signature above
 		// proved. A hive-plane publish floods even when peer trust holds no
 		// anchor for this gateway, and the signer is then `None`.
 		let rumor_signer = kind.origin_signer(|| {
@@ -231,13 +231,13 @@ impl ClusterConfig {
 
 		// A route outlives an expel, so the table says which advertised sockets
 		// it still holds, and the sample shares those alone.
-		let advertised = direct.clone().filter_map(|entry| entry.dial_target().socket());
+		let advertised = direct.clone().filter_map(|entry| entry.dial_target().as_socket().copied());
 		let held = self.peer.table.held_among(advertised)?;
 		let routes = direct
-			.filter(|entry| entry.dial_target().socket().is_some_and(|socket| held.contains(&socket)))
+			.filter(|entry| entry.dial_target().as_socket().is_some_and(|socket| held.contains(socket)))
 			.map(|entry| PeerGossip {
 				peer_id: entry.owner_id().to_vec(),
-				gateway_addr: entry.dial_target().route_bytes().to_vec(),
+				gateway_addr: entry.dial_target().as_bytes().to_vec(),
 			});
 
 		// The sample holds at most `MAX_PEX_SAMPLE` entries, so a linear scan
@@ -259,9 +259,9 @@ impl ClusterConfig {
 impl<P: Protocol> ColonyConfig<P> {
 	/// The digests of a peer's `advertised` list that this gateway lacks
 	/// beside its `held` digests, under the colony digest, by the rule of
-	/// [`gossip_want`].
-	fn gossip_want(&self, advertised: impl AsRef<[Vec<u8>]>, held: impl AsRef<[GossipDigest]>) -> Vec<Vec<u8>> {
-		gossip_want::<ColonyDigest<P>>(advertised, held)
+	/// [`WantList::against`].
+	fn want_against(&self, advertised: impl AsRef<[Vec<u8>]>, held: impl AsRef<[GossipDigest]>) -> WantList {
+		WantList::against::<ColonyDigest<P>>(advertised, held)
 	}
 }
 
@@ -301,15 +301,15 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 			return Refusal::to(&frame, &self.trace).reconcile();
 		};
 
-		let want = self.config.gossip_want(&reconciliation.held, &held);
+		let want = self.config.want_against(&reconciliation.held, &held).into_wire();
 
 		// The reply carries the peer-exchange sample, the GossipSub v1.1 PX
 		// piggyback shape. A seed-bootstrapped requester discovers the
-		// colony graph on its existing beat with no extra round trip.
+		// colony graph on the beat it already runs, with no extra round trip.
 		let Ok(pex) = self.config.pex_sample(&self.servlet_registry) else {
 			return Refusal::to(&frame, &self.trace).reconcile();
 		};
 
-		reply_frame(frame.metadata().id(), GossipWant { want, pex })
+		ReplyForm::Plain.reply(frame.metadata().id(), GossipWant { want, pex })
 	}
 }

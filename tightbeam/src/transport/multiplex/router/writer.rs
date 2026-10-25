@@ -65,7 +65,9 @@ where
 	commands: mpsc::Receiver<Outbound>,
 	shared: Arc<MuxShared>,
 	/// Records reserved for the drain before the send cipher halts.
-	/// See [`MuxSettings::drain_reserve_records`] for the bound derivation.
+	/// [`MuxSettings::drain_reserve_records`] derives the bound.
+	///
+	/// [`MuxSettings::drain_reserve_records`]: super::super::MuxSettings::drain_reserve_records
 	drain_headroom: u64,
 	/// Client half of the rekey exchange, shared with the reader driver. The
 	/// writer only calls `try_lock` on it, for the synchronous
@@ -85,11 +87,8 @@ where
 	/// default is [`DEFAULT_REKEY_DEADLINE_SECS`].
 	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
 	renewal_deadline: Duration,
-	/// The clock the renewal deadline is stamped on and waited out on. It is
-	/// the clock of the link the driver writes to, unless
-	/// [`MuxTransport::with_clock`] replaced it.
-	///
-	/// [`MuxTransport::with_clock`]: super::transport::MuxTransport::with_clock
+	/// The clock the renewal deadline is stamped on and waited out on, the
+	/// clock of the link the driver writes to.
 	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
 	clock: Arc<dyn Clock>,
 }
@@ -112,11 +111,11 @@ impl<W> MuxWriterDriver<W>
 where
 	W: EnvelopeSink,
 {
-	/// Assemble the writer driver over the receiving end of the outbound queue.
+	/// Assemble the writer driver over the receiver of the outbound queue.
 	///
-	/// This is the single construction point, so a new field has exactly one
-	/// home. The driver adopts the clock of the link it writes to, so the
-	/// renewal deadline runs on the clock the endpoint reads.
+	/// This is the single construction point, so each field takes its initial
+	/// value in one place. The driver adopts the clock of the link it writes
+	/// to, so the renewal deadline runs on the clock the endpoint reads.
 	///
 	/// - `drain_headroom`: the records reserved for the drain before the send cipher halts.
 	pub fn new(writer: W, commands: mpsc::Receiver<Outbound>, shared: Arc<MuxShared>, drain_headroom: u64) -> Self {
@@ -156,17 +155,13 @@ where
 		self.renewal_deadline = deadline;
 	}
 
-	/// Replace the clock the renewal deadline runs on.
-	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
-	pub fn set_clock(&mut self, clock: Arc<dyn Clock>) {
-		self.clock = clock;
-	}
-
 	/// Run the driver until shutdown or write failure.
 	///
 	/// # Errors
 	///
 	/// - The first write or send-cipher install failure from the [`EnvelopeSink`].
+	/// - The injected error, when the runtime fault model injects a fault at the
+	///   event of a renewal request or a GoAway.
 	pub async fn drive(mut self) -> TransportResult<()> {
 		loop {
 			match self.next_step().await {
@@ -195,8 +190,9 @@ where
 	///
 	/// With a renewal in flight and a timer available, the renewal deadline
 	/// bounds the wait, so a peer that never answers parks the connection only
-	/// until that deadline. The wait runs on the driver's clock, so a test that
-	/// installed a manual clock reaches the deadline by advancing it.
+	/// until that deadline. The wait runs on the clock of the link, so a test
+	/// whose link carries a manual clock advances that clock to reach the
+	/// deadline.
 	async fn next_step(&mut self) -> WriterStep {
 		#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
 		if let Some(deadline) = self.renewal_deadline() {
@@ -222,7 +218,7 @@ where
 
 	/// Poll for the next unit of work in a fixed order:
 	///
-	/// 1. A queued command.
+	/// 1. A queued command, or the end of the queue.
 	/// 2. When the queue is momentarily empty, a held `RekeyAck` whose owed chunks have quiesced.
 	///
 	/// The order guarantees that every data envelope enqueued before the
@@ -244,7 +240,7 @@ where
 
 	/// Deadline of the in-flight renewal, stamped on first observation from
 	/// the driver's clock and cleared when the exchange concludes. A deadline
-	/// past every reading of the clock never arrives, so it is `None`.
+	/// past every instant the clock can return never arrives, so it is `None`.
 	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
 	fn renewal_deadline(&mut self) -> Option<MonotonicInstant> {
 		if self.exchange.is_none() || self.shared.rekey_phase() == RekeyPhase::Idle {
@@ -332,8 +328,9 @@ where
 	///
 	/// - A client with rekey materials opens an in-band renewal at a headroom
 	///   above the drain threshold, with [`DEFAULT_REKEY_RENEWAL_ALLOWANCE`]
-	///   records of slack for the exchange legs.
-	/// - A session without rekey materials drains via GoAway while enough
+	///   records of slack for the exchange legs. At the drain threshold, with
+	///   the renewal still in flight, it parks data chunks at the hard floor.
+	/// - A session without rekey materials drains through a GoAway while enough
 	///   records remain to answer in-flight peer streams and flush
 	///   registered-but-unsent chunks. The caller then reestablishes the
 	///   session.
@@ -341,6 +338,8 @@ where
 	/// # Sources
 	///
 	/// - RFC 9846 § 5.5, AEAD limits: <https://datatracker.ietf.org/doc/html/rfc9846#section-5.5>
+	///
+	/// [`DEFAULT_REKEY_RENEWAL_ALLOWANCE`]: crate::constants::DEFAULT_REKEY_RENEWAL_ALLOWANCE
 	async fn enforce_rekey_limit(&mut self) -> TransportResult<()> {
 		let drain_floor = self.drain_headroom.saturating_add(self.shared.unsent_chunks());
 		let remaining = self.writer.remaining_records();
@@ -395,8 +394,8 @@ impl MuxShared {
 	///
 	/// The readiness check and the phase transition happen while this call
 	/// holds the exchange, so concurrent triggers collapse to a single
-	/// `RekeyRequest`. A contended exchange means a renewal is already in
-	/// progress, so opening is moot and the call returns `None`.
+	/// `RekeyRequest`. A contended exchange means that a renewal is already in
+	/// progress, so the call returns `None`.
 	///
 	/// # Errors
 	///
@@ -433,6 +432,7 @@ mod tests {
 
 	use futures::channel::{mpsc, oneshot};
 	use futures::lock::Mutex as FuturesMutex;
+	use tokio::time;
 
 	use super::super::testing::{client_shared, noop_cx};
 	use super::super::transport::MuxTransport;
@@ -466,7 +466,7 @@ mod tests {
 		}
 	}
 
-	/// A sink split from a connection that reads `self.0`.
+	/// A sink split from a connection that reads the manual clock `self.0`.
 	struct ClockedSink(Arc<ManualClock>);
 
 	impl EnvelopeSink for ClockedSink {
@@ -557,21 +557,19 @@ mod tests {
 		assert!(matches!(after, Poll::Ready(WriterStep::RenewalExpired)));
 	}
 
-	/// A clock set on the transport replaces the one the writer adopted from
-	/// its link, so a caller that assembles a transport by hand names the
-	/// clock its renewal deadline runs on.
+	/// A transport assembled by hand runs its renewal deadline on the clock
+	/// of the link its writer writes to.
 	#[test]
-	fn a_transport_clock_replaces_the_one_the_link_carries() {
+	fn a_transport_runs_the_clock_of_its_link() {
 		let link_clock = Arc::new(ManualClock::default());
-		let replacement = Arc::new(ManualClock::default());
-		replacement.advance(Duration::from_secs(3600));
+		link_clock.advance(Duration::from_secs(3600));
 
 		let settings = MuxSettings::symmetric(4);
-		let mux = MuxTransport::new(IdleSource, ClockedSink(link_clock), MuxRole::Client, settings);
-		let mux = mux.with_clock(Arc::clone(&replacement) as Arc<dyn Clock>);
+		let sink = ClockedSink(Arc::clone(&link_clock));
+		let mux = MuxTransport::new(IdleSource, sink, MuxRole::Client, settings);
 
 		let (_handle, _reader, writer, _responder) = mux.into_parts();
-		assert_eq!(writer.clock.monotonic(), replacement.monotonic());
+		assert_eq!(writer.clock.monotonic(), link_clock.monotonic());
 	}
 
 	/// Whether the writer of a transport that `with_rekey` assembles from
@@ -591,7 +589,7 @@ mod tests {
 
 	/// A transport assembled from a client's rekey context holds its
 	/// key-switch marker until its owed chunks quiesce, as the client role
-	/// does, since the context alone decides the role.
+	/// does, because the context alone decides the role.
 	#[tokio::test]
 	async fn a_client_rekey_context_assembles_a_client_transport() -> Result<(), Box<dyn std::error::Error>> {
 		let (mut client, mut server) = rekey_pair()?;
@@ -610,23 +608,22 @@ mod tests {
 		Ok(())
 	}
 
-	/// The renewal deadline is stamped and waited out on the driver's clock,
-	/// so a stalled exchange expires when that clock reaches the deadline and
-	/// not before.
-	#[test]
-	fn a_stalled_renewal_expires_on_the_drivers_clock() {
+	/// A stalled exchange waits while the clock of the link stays short of
+	/// the renewal deadline, though the timer of the runtime has passed it.
+	#[tokio::test(start_paused = true)]
+	async fn a_stalled_renewal_waits_short_of_its_deadline() {
 		let clock = Arc::new(ManualClock::default());
-		let (mut driver, _queue) = stalled_driver(OpenSink, Duration::from_secs(30));
-		driver.set_clock(Arc::clone(&clock) as Arc<dyn Clock>);
-
+		let sink = ClockedSink(Arc::clone(&clock));
+		let (mut driver, _queue) = stalled_driver(sink, Duration::from_secs(30));
 		let mut step = Box::pin(driver.next_step());
 		let mut cx = noop_cx();
-		let before = step.as_mut().poll(&mut cx);
+		let started = step.as_mut().poll(&mut cx);
 
-		clock.advance(Duration::from_secs(30));
+		clock.advance(Duration::from_secs(29));
+		time::advance(Duration::from_secs(30)).await;
 
-		let after = step.as_mut().poll(&mut cx);
-		assert!(before.is_pending());
-		assert!(matches!(after, Poll::Ready(WriterStep::RenewalExpired)));
+		let polled = step.as_mut().poll(&mut cx);
+		assert!(started.is_pending());
+		assert!(polled.is_pending());
 	}
 }

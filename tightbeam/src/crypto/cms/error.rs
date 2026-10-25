@@ -5,7 +5,7 @@ use crate::der::asn1::ObjectIdentifier;
 use crate::error::ReceivedExpectedError;
 use crate::Errorizable;
 
-/// Errors from sealing or opening an
+/// Errors of a seal or an open of an
 /// [`AuthEnvelopedData`](super::AuthEnvelopedData).
 ///
 /// An opener refuses with one of these before any byte of the content is
@@ -30,7 +30,8 @@ pub enum EnvelopeError {
 	TagLength(ReceivedExpectedError<usize, usize>),
 
 	/// The authenticated attributes carry no content-type attribute, carry
-	/// it twice, or carry another number of values in it (RFC 5083 §2.1).
+	/// it twice, or carry another number of values in it (RFC 5083 §2.1). On
+	/// a seal, the caller's attributes carry a content-type attribute.
 	#[error("The authenticated attributes carry no single content-type attribute")]
 	ContentTypeAttribute,
 
@@ -71,12 +72,12 @@ pub enum EnvelopeError {
 	RecipientIdentifier,
 
 	/// The KEM, the KDF, or the key wrap differs from the provider's, or
-	/// carries parameters, or the provider's profile names no key wrap of AES.
+	/// carries parameters.
 	#[error("The recipient names an algorithm other than the provider's")]
 	RecipientAlgorithm,
 
-	/// `kekLength`, or a key-encryption key, is another length than the key
-	/// size of the provider's wrap (RFC 9629 §3).
+	/// `kekLength` is another length than the key size of the provider's wrap
+	/// (RFC 9629 §3).
 	#[error("kekLength differs from the key wrap: {0:?}")]
 	KekLength(ReceivedExpectedError<usize, usize>),
 
@@ -85,11 +86,12 @@ pub enum EnvelopeError {
 	#[error("The user keying material differs from the opener's purpose")]
 	Ukm,
 
-	/// The `kekid` names another key than the opener's.
+	/// The `kekid` names another key than the opener's, or carries a `date`
+	/// or an `other` field.
 	#[error("The key identifier names another key")]
 	KeyIdentifier,
 
-	/// The `kemct` is not an uncompressed point on secp256k1.
+	/// The `kemct` is not an uncompressed point on the curve of the KEM.
 	#[error("The KEM ciphertext is no uncompressed point on the curve")]
 	KemPoint,
 
@@ -111,7 +113,9 @@ pub enum EnvelopeError {
 	#[error("The random source failed")]
 	Random,
 
-	/// The key provider failed the agreement of the recipient.
+	/// A key operation failed: the agreement or the public key of a backend,
+	/// the key wrap of the content key, a holder's encryption or decryption of
+	/// the content key, or the length of a key-encryption key.
 	#[error("Key provider error: {0}")]
 	Key(crate::crypto::key::KeyError),
 

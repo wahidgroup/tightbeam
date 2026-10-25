@@ -272,8 +272,8 @@ impl<P: ColonyDialProtocol> Hop<'_, P> {
 		let target = self.dial.target().clone();
 		let connected = self.dial.connect(self.pool).await;
 		if matches!(connected, Err(ClusterError::PeerMismatch)) {
-			let refused = target.route_bytes();
-			self.trace.event(CLUSTER_DIAL_REFUSED)?.with_payload(&refused).emit();
+			let refused = target.as_bytes();
+			self.trace.event(CLUSTER_DIAL_REFUSED)?.with_payload(refused).emit();
 		}
 
 		connected
@@ -296,7 +296,7 @@ mod tests {
 	use crate::colony::cluster::peer::ColonyCertificate;
 	use crate::colony::cluster::runtime::advertise::SignedAdvertisement;
 	use crate::colony::cluster::{
-		CertificateSpec, Cluster, ClusterConfig, ClusterGateway, ClusterTlsConfig, ColonyDigest, PeerAddress, SharedId,
+		AdmittedDial, CertificateSpec, Cluster, ClusterConfig, ClusterGateway, ClusterTlsConfig, ColonyDigest, SharedId,
 	};
 	use crate::colony::common::ColonyNamespace;
 	use crate::crypto::key::Secp256k1KeyProvider;
@@ -340,9 +340,11 @@ mod tests {
 		Gateway::start(trace, config).await.expect("a gateway binds a loopback port")
 	}
 
-	/// The dial target of the socket `gateway` listens on.
+	/// The dial target of the socket `gateway` listens on, as a peer would
+	/// claim it.
 	fn target_of(gateway: &Gateway) -> DialTarget {
-		DialTarget::Socket(PeerAddress::from(gateway.addr().0))
+		let socket = gateway.addr().0.to_string();
+		DialTarget::of_claimed(AdmittedDial::fixture(socket))
 	}
 
 	/// The signer identifier a registration that names `certificate` carries.
@@ -355,7 +357,7 @@ mod tests {
 	/// and the two gateways it can reach there.
 	///
 	/// - Its hive trust holds the member and the stranger, so a handshake with either completes.
-	/// - The member carries the colony URN of the dialing gateway, and the stranger carries none.
+	/// - The member carries the colony URN of the dialer, and the stranger carries none.
 	struct Dialer {
 		config: ColonyConfig<TokioListener>,
 		pool: Arc<ClusterPool<TokioListener>>,
@@ -367,8 +369,8 @@ mod tests {
 	}
 
 	impl Dialer {
-		/// Starts the member and the stranger, and builds the dialing
-		/// gateway's hive pool on `pool`.
+		/// Starts the member and the stranger, and builds the dialer's hive
+		/// pool from the `pool` configuration.
 		async fn start(pool: PoolConfig) -> Self {
 			let colony = ColonyNamespace::default().colony("main");
 			let colony = colony.expect("a static colony name mints").to_string();
@@ -399,8 +401,8 @@ mod tests {
 			}
 		}
 
-		/// A hive pool that holds one connection, which it offers for
-		/// multiplexing when `multiplexed` holds.
+		/// The configuration of a hive pool that holds one connection, which it
+		/// offers for multiplexing when `multiplexed` holds.
 		fn one_connection(multiplexed: bool) -> PoolConfig {
 			let mux_offer = multiplexed.then(|| Arc::new(TransportOffer::mux(8)));
 			PoolConfig { idle_timeout: None, max_connections: 1, mux_offer }
@@ -430,7 +432,7 @@ mod tests {
 			name.expect("the member certificate has a fingerprint")
 		}
 
-		/// A signed advertisement of this gateway, of no types.
+		/// A signed advertisement of this gateway that advertises no types.
 		async fn advertisement(&self) -> SignedAdvertisement {
 			let types: Vec<Urn<'static>> = Vec::new();
 			let minted = self.config.mint_ad_frame(b"127.0.0.1:1", types).await;

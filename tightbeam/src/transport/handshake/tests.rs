@@ -1,6 +1,6 @@
 //! Shared test utilities for handshake protocol tests.
 //!
-//! The module holds the fixtures, helper functions, and data structures that
+//! The module holds the fixtures, the functions, and the data structures that
 //! every handshake test module shares, so each setup has one home.
 #![allow(unused)]
 
@@ -33,7 +33,7 @@ use crate::crypto::kdf::{EcdhSecret, KdfFunction};
 use crate::crypto::key::{KeyBackend, KeyError, Secp256k1KeyProvider, SigningKeyProvider};
 use crate::crypto::policy::Secp256k1Policy;
 use crate::crypto::policy::VerificationPolicy;
-use crate::crypto::profiles::{AeadProvider, DefaultCryptoProvider, KdfProvider, SecurityProfileDesc};
+use crate::crypto::profiles::{AeadProvider, DefaultCryptoProvider, KdfProvider, Kek, SecurityProfileDesc};
 use crate::crypto::secret::SecretSlice;
 use crate::crypto::secret::ToInsecure;
 use crate::crypto::sign::ecdsa::k256::{Secp256k1, SecretKey};
@@ -822,9 +822,10 @@ impl StaticKeyObserver {
 			return Ok(attempts);
 		};
 
-		let kek = self.pre_change_kek(base, purpose.label())?;
+		let derived = self.pre_change_kek(base, purpose.label())?;
+		let kek = Kek::try_from(derived.as_slice())?;
 		let key_identifier = [purpose.domain(), transcript_hash.as_bytes()].concat();
-		let opener = Opener::Kek { kek: kek.as_slice(), key_identifier: &key_identifier };
+		let opener = Opener::Kek { kek, key_identifier: &key_identifier };
 		let opened = envelope.open::<DefaultCryptoProvider>(sealed, &opener, content_type).await;
 
 		attempts.push(opened.map_err(|error| purpose.refusal(error)));
@@ -878,7 +879,7 @@ pub fn create_ecdsa_sha3_256_signature_alg() -> AlgorithmIdentifierOwned {
 	AlgorithmIdentifierOwned { oid: SIGNER_ECDSA_WITH_SHA3_256, parameters: None }
 }
 
-/// A SignedData over `content` of type `id-data` by a fresh test key.
+/// A `SignedData` over `content` of type `id-data` by a fresh test key.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub fn create_test_signed_data(content: impl AsRef<[u8]>) -> SignedData {
 	let signing_key = TestIdentity::certified(create_test_signing_key());
@@ -1011,10 +1012,10 @@ pub fn mutual_with(validator: impl CertificateValidation + 'static) -> PeerAuthe
 /// The budgets a budget-bearing test session requests.
 pub const TEST_BUDGETS: MuxBudgets = MuxBudgets { client_to_server: 64, server_to_client: 128 };
 
-/// The settlement challenge a challenging test authorizer issues.
+/// The settlement challenge that [`ChallengingAuthorizer`] issues.
 pub const TEST_CHALLENGE: &[u8] = b"test settlement challenge";
 
-/// The bearer settlement answer a paying test approver gives.
+/// The bearer settlement answer that [`PayingApprover`] gives.
 pub const TEST_ANSWER: &[u8] = b"test bearer settlement answer";
 
 /// A budget-bearing transport offer with the test budgets.
@@ -1191,7 +1192,7 @@ pub struct Recovered {
 	pub base: Option<Vec<u8>>,
 }
 
-/// A flow the handshake tests run over, with the provisioning of its two
+/// A flow the handshake tests run over, and the configurations of its two
 /// endpoints.
 pub trait TestFlow: ClientFlow<DefaultCryptoProvider> + ServerFlow<DefaultCryptoProvider> {
 	/// The attempts [`StaticKeyObserver::record_attempts`] makes on a session
@@ -1294,7 +1295,7 @@ impl TestFlow for Cms {
 	}
 
 	/// The key-agreement key opens the opening, and the observer holds it as
-	/// the static key a recording meets later.
+	/// the static key that a recorded session meets later.
 	async fn recover(run: &Run<Self>, server_identity: &TestServerIdentity) -> Recovered {
 		let opening = run.opening.to_owned().auth_enveloped();
 		let opening = opening.expect("a CMS opening is an AuthEnvelopedData");

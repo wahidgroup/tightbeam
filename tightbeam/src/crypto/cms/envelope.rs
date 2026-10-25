@@ -18,7 +18,7 @@ use crate::crypto::cms::{AttributesExt, AuthEnvelopedData, EnvelopeError};
 use crate::crypto::common::generic_array::GenericArray;
 use crate::crypto::common::typenum::Unsigned;
 use crate::crypto::key::EncryptingKeyProvider;
-use crate::crypto::profiles::CryptoProvider;
+use crate::crypto::profiles::{CryptoProvider, Kek};
 use crate::der::asn1::{ObjectIdentifier, OctetString, OctetStringRef, SetOfVec};
 use crate::der::oid::AssociatedOid;
 use crate::der::{
@@ -57,6 +57,7 @@ pub trait ContentEncryption: AeadAlgorithm + AeadInPlace + KeyInit {
 	/// # Errors
 	///
 	/// - [`EnvelopeError::Encoding`] -- the parameters fail to encode.
+	/// - [`EnvelopeError::TagLength`] -- the parameters cannot name the cipher's tag length.
 	fn parameters(nonce: &Nonce<Self>) -> Result<Any, EnvelopeError>;
 
 	/// The nonce `parameters` carry, once they are this cipher's parameters.
@@ -95,6 +96,7 @@ impl ContentEncryption for Aes128Gcm {
 ///
 /// # Errors
 ///
+/// - [`EnvelopeError::TagLength`] -- `aes-ICVlen` cannot hold the tag length of `A`.
 /// - [`EnvelopeError::Encoding`] -- the parameters fail to encode.
 fn gcm_parameters<A: AeadCore>(nonce: &Nonce<A>) -> Result<Any, EnvelopeError> {
 	let aes_icv_len =
@@ -128,7 +130,7 @@ impl AuthEnvelopedData {
 	/// Seal `content`, of type `content_type`, to `recipient` under the
 	/// algorithms of `P`: its AEAD, its KDF, its key wrap, and its KEM.
 	///
-	/// - Each seal draws a fresh content key and nonce from `rng`, or from the OS source without one.
+	/// - Each seal draws a fresh content key and a nonce from `rng`, or from `OsRng` when `rng` is `None`.
 	/// - The authenticated attributes, the content type and `auth_attrs`, are the associated data in DER.
 	/// - The cipher encrypts `content` in place, so a `Vec` that moves in becomes the `encryptedContent`.
 	///
@@ -137,11 +139,32 @@ impl AuthEnvelopedData {
 	/// - [`EnvelopeError::ContentTypeAttribute`] -- `auth_attrs` carries a content-type attribute.
 	/// - [`EnvelopeError::Random`] -- the random source failed.
 	/// - The errors of `Recipient::wrap`: the recipient key, its name, the wrap, or a derivation failed.
+	/// - [`EnvelopeError::TagLength`] -- the parameters cannot name the cipher's tag length.
 	/// - [`EnvelopeError::Encryption`] -- the cipher refused the content.
 	/// - [`EnvelopeError::Encoding`] -- an attribute or a parameter fails to encode.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::cms::enveloped_data::RecipientInfo;
+	/// use tightbeam::crypto::cms::{AuthEnvelopedData, Recipient};
+	/// use tightbeam::crypto::profiles::{DefaultCryptoProvider, Kek};
+	/// use tightbeam::oids::DATA;
+	///
+	/// // A fixed key serves an example alone. A real holder keeps a key of its own.
+	/// let key = [0x5au8; 32];
+	/// let kek = Kek::try_from(key.as_slice())?;
+	/// let key_identifier: &[u8] = b"example-kek";
+	/// let recipient: Recipient<'_, DefaultCryptoProvider> = Recipient::Kek { kek, key_identifier };
+	///
+	/// // The envelope wraps the content key for its one recipient.
+	/// let sealed = AuthEnvelopedData::seal(recipient, DATA, b"content".to_vec(), [], None)?;
+	/// assert!(matches!(sealed.recipient_infos.0.as_slice(), [RecipientInfo::Kekri(_)]));
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
 	#[cfg(all(feature = "hpke", feature = "signature"))]
 	pub fn seal<P>(
-		recipient: Recipient<'_, P::Kem>,
+		recipient: Recipient<'_, P>,
 		content_type: ObjectIdentifier,
 		content: impl Into<Vec<u8>>,
 		auth_attrs: impl IntoIterator<Item = Attribute>,
@@ -150,7 +173,7 @@ impl AuthEnvelopedData {
 	where
 		P: CryptoProvider<AeadCipher: ContentEncryption>,
 	{
-		let wrap = |content_key: &[u8], rng: &mut dyn CryptoRngCore| recipient.wrap::<P>(content_key, rng);
+		let wrap = |content_key: &[u8], rng: &mut dyn CryptoRngCore| recipient.wrap(content_key, rng);
 		Self::sealed::<P::AeadCipher>(content_type, content, auth_attrs, rng, wrap)
 	}
 
@@ -162,7 +185,7 @@ impl AuthEnvelopedData {
 	///
 	/// - The errors of [`Self::seal`], with the wrap of `P` as the recipient.
 	pub(crate) fn seal_kek<P>(
-		kek: &[u8],
+		kek: &Kek<'_, P::KeyWrap>,
 		key_identifier: &[u8],
 		content_type: ObjectIdentifier,
 		content: impl Into<Vec<u8>>,
@@ -172,9 +195,7 @@ impl AuthEnvelopedData {
 	where
 		P: CryptoProvider<AeadCipher: ContentEncryption>,
 	{
-		let wrap = |content_key: &[u8], _: &mut dyn CryptoRngCore| {
-			kek::wrap_kek::<P::KeyWrap>(kek, key_identifier, content_key)
-		};
+		let wrap = |content_key: &[u8], _: &mut dyn CryptoRngCore| kek.recipient_info(key_identifier, content_key);
 		Self::sealed::<P::AeadCipher>(content_type, content, auth_attrs, rng, wrap)
 	}
 
@@ -261,11 +282,40 @@ impl AuthEnvelopedData {
 	/// - The errors of [`Opener`]: the recipient differs from the opener, or its key fails to unwrap.
 	/// - [`EnvelopeError::KeyUnwrap`] -- the content key is no key of the cipher.
 	/// - [`EnvelopeError::Authentication`] -- the tag fails.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::crypto::cms::{AuthEnvelopedData, Opener, Recipient};
+	/// use tightbeam::crypto::profiles::{DefaultCryptoProvider, Kek};
+	/// use tightbeam::crypto::secret::ToInsecure;
+	/// use tightbeam::der::Encode;
+	/// use tightbeam::oids::DATA;
+	///
+	/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+	/// # let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+	/// # runtime.block_on(async {
+	/// // A fixed key serves an example alone. Both ends hold the same KEK.
+	/// let key = [0x5au8; 32];
+	/// let kek = Kek::try_from(key.as_slice())?;
+	/// let key_identifier: &[u8] = b"example-kek";
+	/// let recipient: Recipient<'_, DefaultCryptoProvider> = Recipient::Kek { kek, key_identifier };
+	/// let sealed = AuthEnvelopedData::seal(recipient, DATA, b"content".to_vec(), [], None)?;
+	/// let arrived = sealed.to_der()?;
+	///
+	/// let opener: Opener<'_, DefaultCryptoProvider> = Opener::Kek { kek, key_identifier };
+	/// let opened = sealed.open(arrived, &opener, DATA).await?;
+	/// assert_eq!(opened.to_insecure().as_slice(), b"content");
+	/// # Ok::<(), Box<dyn std::error::Error>>(())
+	/// # })?;
+	/// # Ok(())
+	/// # }
+	/// ```
 	#[cfg(all(feature = "hpke", feature = "signature"))]
 	pub async fn open<P>(
 		mut self,
 		arrived: impl AsRef<[u8]>,
-		opener: &Opener<'_, P::Kem>,
+		opener: &Opener<'_, P>,
 		content_type: ObjectIdentifier,
 	) -> Result<SecretSlice<u8>, EnvelopeError>
 	where
@@ -290,7 +340,7 @@ impl AuthEnvelopedData {
 		&self,
 		arrived: &[u8],
 		content: &mut [u8],
-		opener: &Opener<'_, P::Kem>,
+		opener: &Opener<'_, P>,
 		content_type: ObjectIdentifier,
 	) -> Result<(), EnvelopeError>
 	where
@@ -302,7 +352,7 @@ impl AuthEnvelopedData {
 
 		// 2. Unwrap the content key onto the stack, then decrypt the content in place under it.
 		let mut content_key = ContentKey::<P::AeadCipher>::default();
-		opener.unwrap::<P>(&self.recipient_infos, &mut content_key).await?;
+		opener.unwrap(&self.recipient_infos, &mut content_key).await?;
 		opening.decrypt(&<P::AeadCipher as KeyInit>::new(&content_key), content)
 	}
 
@@ -321,7 +371,7 @@ impl AuthEnvelopedData {
 		&self,
 		arrived: &[u8],
 		content: &mut [u8],
-		kek: &[u8],
+		kek: &Kek<'_, P::KeyWrap>,
 		key_identifier: &[u8],
 		content_type: ObjectIdentifier,
 	) -> Result<(), EnvelopeError>
@@ -334,7 +384,7 @@ impl AuthEnvelopedData {
 
 		// 2. Unwrap the content key onto the stack, then decrypt the content in place under it.
 		let mut content_key = ContentKey::<P::AeadCipher>::default();
-		kek::unwrap_kek::<P::KeyWrap>(kek, key_identifier, &self.recipient_infos, &mut content_key)?;
+		kek.unwrap_named(key_identifier, &self.recipient_infos, &mut content_key)?;
 		opening.decrypt(&<P::AeadCipher as KeyInit>::new(&content_key), content)
 	}
 
@@ -670,6 +720,7 @@ impl<A: ContentEncryption> Draw<A> {
 	///
 	/// - [`EnvelopeError::ContentTypeAttribute`] -- `auth_attrs` carries a content-type attribute.
 	/// - [`EnvelopeError::Encoding`] -- a field fails to encode, or `content` is past a DER length.
+	/// - [`EnvelopeError::TagLength`] -- the parameters cannot name the cipher's tag length.
 	/// - [`EnvelopeError::Encryption`] -- the cipher refused the content.
 	fn seal_in_place(
 		self,
@@ -760,14 +811,18 @@ impl<'a> Detached<'a> {
 	/// # Errors
 	///
 	/// - The errors of [`AuthEnvelopedData::open_detached_kek`] that follow the attributes.
-	pub(in crate::crypto) fn open_kek<P>(self, kek: &[u8], key_identifier: &[u8]) -> Result<&'a [u8], EnvelopeError>
+	pub(in crate::crypto) fn open_kek<P>(
+		self,
+		kek: &Kek<'_, P::KeyWrap>,
+		key_identifier: &[u8],
+	) -> Result<&'a [u8], EnvelopeError>
 	where
 		P: CryptoProvider<AeadCipher: ContentEncryption>,
 	{
 		let Self { envelope, associated_data, content } = self;
 		let opening = envelope.opening::<P::AeadCipher>(associated_data)?;
 		let mut content_key = ContentKey::<P::AeadCipher>::default();
-		kek::unwrap_kek::<P::KeyWrap>(kek, key_identifier, &envelope.recipient_infos, &mut content_key)?;
+		kek.unwrap_named(key_identifier, &envelope.recipient_infos, &mut content_key)?;
 		opening.decrypt(&<P::AeadCipher as KeyInit>::new(&content_key), &mut *content)?;
 		Ok(content)
 	}
@@ -775,8 +830,8 @@ impl<'a> Detached<'a> {
 
 /// The syntax of [`AuthEnvelopedData`] with the encrypted content and the
 /// authenticated attributes borrowed from the buffer they arrived in. The
-/// `originatorInfo` and the `unauthAttrs` stay as they arrived, and each other
-/// field decodes as the field of the owned type does.
+/// `originatorInfo`, the `recipientInfos`, and the `unauthAttrs` stay as they
+/// arrived, and each other field decodes as the field of the owned type does.
 #[derive(Sequence)]
 struct ArrivedEnvelope<'a> {
 	version: CmsVersion,

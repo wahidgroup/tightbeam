@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use super::ClusterError;
 use crate::colony::cluster::registry::SharedId;
-use crate::colony::cluster::servlet_registry::entry::{LocalRoute, PeerRoute, ServletEntry};
+use crate::colony::cluster::servlet_registry::entry::{DialTarget, LocalRoute, PeerRoute, ServletEntry};
 use crate::colony::cluster::{AdmittedDial, ClusterConfig};
 use crate::colony::common::ServletInfo;
 use crate::constants::{MAX_PEER_GATEWAYS, MAX_PEER_ROUTES, MAX_RELAY_BUCKETS, MAX_RELAY_ROUTES};
@@ -14,25 +14,25 @@ use crate::utils::BasisPoints;
 pub const DEFAULT_EVAPORATION_RATE_BPS: u16 = 1000;
 /// Default seconds between evaporation cycles.
 pub const DEFAULT_EVAPORATION_INTERVAL_SECS: u64 = 30;
-/// Default starting pheromone level for a new entry.
+/// Default initial pheromone level of a new entry.
 pub const DEFAULT_INITIAL_PHEROMONE: u64 = 5000;
-/// Default consecutive failures before the registry abandons a route.
+/// Default consecutive-failure count at which the registry abandons a route.
 pub const DEFAULT_ABANDONMENT_LIMIT: u32 = 5;
-/// Default reinforcement boost (500 = 5% pheromone increase on success).
+/// Default reinforcement boost on success (500 = 5% of the pheromone cap).
 pub const DEFAULT_REINFORCEMENT_BOOST: u64 = 500;
 /// Default weakening penalty. At 0, a failure only adds to the trial count.
 pub const DEFAULT_WEAKENING_PENALTY: u64 = 0;
 
-/// Configuration for pheromone-based servlet tracking.
+/// Pheromone and abandonment settings for servlet routes.
 #[derive(Debug, Clone)]
 pub struct PheromoneConfig {
 	/// Decay rate per evaporation cycle in basis points (1000 = 10%).
 	pub evaporation_rate: BasisPoints,
 	/// The interval between evaporation cycles.
 	pub evaporation_interval: Duration,
-	/// Starting pheromone level for new entries.
+	/// Initial pheromone level of a new entry.
 	pub initial_pheromone: u64,
-	/// Maximum consecutive failures before abandonment.
+	/// Count of consecutive failures at which the registry abandons an entry.
 	pub abandonment_limit: u32,
 	/// Pheromone boost on a successful request.
 	pub reinforcement_boost: u64,
@@ -86,7 +86,9 @@ impl ClusterConfig {
 	///
 	/// # Errors
 	///
-	/// - [`ClusterError::InvalidAddress`] -- a locator names another address than the one beside it.
+	/// - [`ClusterError::InvalidAddress`] -- a servlet URN names no servlet
+	///   instance of this namespace, or its locator names another address than
+	///   the one beside it.
 	pub(crate) fn servlet_slate(
 		&self,
 		servlets: impl AsRef<[ServletInfo]>,
@@ -121,6 +123,7 @@ impl PheromoneConfig {
 	///
 	/// `dial` is the admitted gateway socket that every entry stores, so every
 	/// type this peer advertises resolves to the one gateway that owns it.
+	/// The entries share one rendering of that socket.
 	pub(crate) fn peer_slate(
 		&self,
 		peer_hive_id: &SharedId,
@@ -128,18 +131,16 @@ impl PheromoneConfig {
 		types: impl AsRef<[Urn<'static>]>,
 	) -> Vec<ServletEntry> {
 		let types = types.as_ref();
+		let target = DialTarget::of_claimed(dial);
 		types
 			.iter()
 			.map(|urn| {
-				ServletEntry::peer(
-					PeerRoute {
-						peer_id: Arc::clone(peer_hive_id),
-						servlet_type: Arc::from(urn.type_canonical_bytes().as_slice()),
-						dial,
-					},
-					self.initial_pheromone,
-					self.abandonment_limit,
-				)
+				let route = PeerRoute {
+					peer_id: Arc::clone(peer_hive_id),
+					servlet_type: Arc::from(urn.type_canonical_bytes().as_slice()),
+					dial,
+				};
+				ServletEntry::peer_sharing(route, &target, self.initial_pheromone, self.abandonment_limit)
 			})
 			.collect()
 	}
@@ -160,16 +161,16 @@ impl Default for PheromoneConfig {
 
 /// Storage caps for peer-learned routes (CWE-770).
 ///
-/// The named fields keep a caller from silently transposing adjacent
-/// limits. Direct slates and relay trails hold separate budgets, so
+/// The fields are named, so a caller cannot transpose two adjacent limits
+/// unseen. Direct slates and relay trails hold separate budgets, so
 /// direct-gateway admission keeps its headroom under relay fan-in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerCaps {
-	/// Maximum distinct peer gateways holding installed direct slates.
+	/// Maximum distinct peer gateways that hold an installed direct slate.
 	pub max_gateways: usize,
 	/// Maximum stored direct peer routes across all gateways.
 	pub max_routes: usize,
-	/// Maximum distinct `(origin, relay)` buckets holding relay trails.
+	/// Maximum distinct `(origin, relay)` buckets that hold relay trails.
 	pub max_relay_buckets: usize,
 	/// Maximum stored relay-trail routes across all buckets.
 	pub max_relay_routes: usize,

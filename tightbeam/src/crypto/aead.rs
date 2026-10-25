@@ -38,9 +38,9 @@ use crate::constants::{
 #[cfg(all(feature = "hpke", feature = "signature"))]
 use crate::crypto::cms::Opener;
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
-use crate::crypto::cms::{AttributesExt, ContentEncryption, Detached, EnvelopeError, Kek};
+use crate::crypto::cms::{AttributesExt, ContentEncryption, Detached, EnvelopeError, OwnedKek};
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
-use crate::crypto::profiles::CryptoProvider;
+use crate::crypto::profiles::{CryptoProvider, Kek};
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 use crate::der::asn1::SetOfVec;
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
@@ -123,7 +123,7 @@ trait RecordOps: Send + Sync {
 /// algorithms of the provider `P`.
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 struct RecordKey<P: CryptoProvider> {
-	kek: Kek<P::KeyWrap>,
+	kek: OwnedKek<P::KeyWrap>,
 	provider: PhantomData<fn() -> P>,
 }
 
@@ -138,11 +138,13 @@ where
 		key_identifier: &[u8],
 		sequence: Attribute,
 	) -> Result<AuthEnvelopedData, EnvelopeError> {
-		AuthEnvelopedData::seal_kek::<P>(&self.kek, key_identifier, RECORD_CONTENT_TYPE, content, [sequence], None)
+		let kek = self.kek.kek();
+		AuthEnvelopedData::seal_kek::<P>(&kek, key_identifier, RECORD_CONTENT_TYPE, content, [sequence], None)
 	}
 
 	fn open<'a>(&self, record: Detached<'a>, key_identifier: &[u8]) -> Result<&'a [u8], EnvelopeError> {
-		record.open_kek::<P>(&self.kek, key_identifier)
+		let kek = self.kek.kek();
+		record.open_kek::<P>(&kek, key_identifier)
 	}
 }
 
@@ -215,7 +217,8 @@ impl RuntimeAead {
 	where
 		P: CryptoProvider<AeadCipher: ContentEncryption> + 'static,
 	{
-		let kek = Kek::<P::KeyWrap>::new(kek)?;
+		let bytes = kek.into();
+		let kek = OwnedKek::<P::KeyWrap>::try_from(bytes.as_slice())?;
 		let oid = <<P::AeadCipher as AeadAlgorithm>::Oid as AssociatedOid>::OID;
 		let key = Box::new(RecordKey::<P> { kek, provider: PhantomData });
 		Ok(Self { key, oid })
@@ -329,8 +332,39 @@ impl<'a> CheckedContent<'a> {
 	/// # Errors
 	///
 	/// - The errors of [`AuthEnvelopedData::open`], for the content outside the envelope.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::crypto::aead::{CheckedContent, Decryptor};
+	/// use tightbeam::crypto::cms::Opener;
+	/// use tightbeam::crypto::profiles::{DefaultCryptoProvider, Kek};
+	/// use tightbeam::der::asn1::ObjectIdentifier;
+	/// use tightbeam::oids::AES_256_GCM;
+	/// use tightbeam::utils::marker::MaybeSendFuture;
+	/// use tightbeam::TightBeamError;
+	///
+	/// /// A frame decryptor that opens each frame under a KEK it holds.
+	/// struct KekDecryptor {
+	///     kek: [u8; 32],
+	/// }
+	///
+	/// impl Decryptor for KekDecryptor {
+	///     fn algorithm_oid(&self) -> ObjectIdentifier {
+	///         AES_256_GCM
+	///     }
+	///
+	///     fn open<'a>(&'a self, content: CheckedContent<'a>) -> MaybeSendFuture<'a, Result<(), TightBeamError>> {
+	///         Box::pin(async move {
+	///             let kek = Kek::try_from(self.kek.as_slice())?;
+	///             let opener = Opener::Kek { kek, key_identifier: b"example-kek" };
+	///             content.open::<DefaultCryptoProvider>(&opener).await
+	///         })
+	///     }
+	/// }
+	/// ```
 	#[cfg(all(feature = "hpke", feature = "signature"))]
-	pub async fn open<P>(self, opener: &Opener<'_, P::Kem>) -> TbResult<()>
+	pub async fn open<P>(self, opener: &Opener<'_, P>) -> TbResult<()>
 	where
 		P: CryptoProvider<AeadCipher: ContentEncryption>,
 	{
@@ -347,7 +381,7 @@ impl<'a> CheckedContent<'a> {
 	///
 	/// - The errors of [`AuthEnvelopedData::open`], with `kek` as the opener.
 	#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
-	pub(crate) fn open_kek<P>(self, kek: &[u8], key_identifier: &[u8]) -> TbResult<()>
+	pub(crate) fn open_kek<P>(self, kek: &Kek<'_, P::KeyWrap>, key_identifier: &[u8]) -> TbResult<()>
 	where
 		P: CryptoProvider<AeadCipher: ContentEncryption>,
 	{
@@ -371,7 +405,7 @@ pub trait Decryptor {
 	/// the buffer holds the plaintext once the open returns.
 	///
 	/// A refused open MUST leave the buffer as it was, so a frame that lends
-	/// its body keeps it. The house decryptors keep this, since every check
+	/// its body keeps it. The house decryptors keep this, because every check
 	/// runs before the cipher, and the cipher keeps it ([`ContentEncryption`]).
 	///
 	/// # Errors
@@ -578,6 +612,7 @@ impl SendCipher {
 	/// - [`TightBeamError::RekeyRequired`] -- the cipher is at the record limit.
 	///   Reestablish the session for fresh keys.
 	/// - [`TightBeamError::NonceExhausted`] -- the 64-bit sequence space is spent.
+	/// - [`TightBeamError::SerializationError`] -- the position attribute fails to encode.
 	/// - [`TightBeamError::EnvelopeError`] -- the envelope refuses to seal.
 	pub fn encrypt_next(&self, payload: impl Into<Vec<u8>>) -> TbResult<AuthEnvelopedData> {
 		// The failed update leaves the counter parked at the limit, so
@@ -657,10 +692,10 @@ impl SendCipher {
 /// # Envelope ceiling
 ///
 /// Each peer sets its own encrypted-envelope ceiling, so the byte bound counts
-/// what the key opened instead of assuming the peer's record size:
+/// what the key opened instead of an assumed record size of the peer:
 ///
 /// - An honest sender's record limit times its own ceiling is at most the volume, so it is never refused.
-/// - The cipher refuses a peer that ignores its send clamp once its records carry the volume.
+/// - The cipher refuses the record of a peer that ignores its send clamp once the bytes pass the volume.
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 pub struct RecvCipher {
 	aead: RuntimeAead,
@@ -677,15 +712,15 @@ pub struct RecvCipher {
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Progress {
-	/// The exact sequence number that the next record must carry.
+	/// The sequence number that the next record must carry.
 	counter: u64,
-	/// Ciphertext bytes the key has opened, which the volume bound caps.
+	/// The ciphertext bytes the key has opened, which the volume bound caps.
 	opened_bytes: u64,
 }
 
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 impl Progress {
-	/// Bits of the packed word that hold the counter. The opened bytes take
+	/// The bits of the packed word that hold the counter. The opened bytes take
 	/// the rest.
 	const COUNTER_BITS: u32 = 24;
 
@@ -760,8 +795,8 @@ impl RecvCipher {
 	/// threshold.
 	///
 	/// The count tracks the peer's send sequence on the ordered channel, so a
-	/// rekey initiator watches the receive direction with no new protocol
-	/// field.
+	/// rekey initiator watches the receive direction through the record
+	/// sequence alone.
 	pub fn remaining_records(&self) -> u64 {
 		let progress = Progress::unpack(self.progress.load(Ordering::Relaxed));
 		self.rekey_limit.saturating_sub(progress.counter)
@@ -776,7 +811,9 @@ impl RecvCipher {
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError::EnvelopeError`] -- the record is no envelope this key opens, or its tag fails.
+	/// - [`TightBeamError::EnvelopeError`] -- the record is no envelope this key
+	///   opens, carries no single position, or its tag fails.
+	/// - [`TightBeamError::SerializationError`] -- the position the record carries is no `RecordSequence`.
 	/// - [`TightBeamError::RecordEpoch`] -- the record carries another epoch.
 	/// - [`TightBeamError::NonceReplayed`] -- the record carries another sequence number than the next.
 	/// - [`TightBeamError::RekeyRequired`] -- at either renewal bound.
@@ -830,7 +867,7 @@ impl RecvCipher {
 	}
 
 	/// A client-to-server cipher of epoch 0 that has already read `counter`
-	/// records carrying `opened_bytes` bytes.
+	/// records, which held `opened_bytes` bytes in all.
 	#[cfg(test)]
 	fn with_progress(aead: RuntimeAead, counter: u64, opened_bytes: u64) -> Self {
 		let progress = Progress { counter, opened_bytes };
@@ -853,7 +890,7 @@ impl RecvCipher {
 
 /// Directional record keys derived at handshake completion or at a renewal.
 ///
-/// Field names use the canonical client-to-server and server-to-client
+/// The field names use the canonical client-to-server and server-to-client
 /// directions. [`SessionKeys`] maps them into send and receive sides, and
 /// names each key's records by the direction of its field.
 pub struct DirectionalCiphers<C> {
@@ -866,7 +903,8 @@ pub struct DirectionalCiphers<C> {
 	pub epoch: u32,
 }
 
-/// Role-mapped directional session keys produced by handshake completion.
+/// Role-mapped directional session keys, built at handshake completion or at
+/// a renewal.
 ///
 /// The handshake derives one client-to-server and one server-to-client key
 /// (RFC 9846 §7.3 precedent). Each endpoint sends on its own direction and
@@ -980,8 +1018,9 @@ mod tests {
 	/// [`PLAINTEXT`], with `attributes` beside the content type, as its DER.
 	fn record_with(attributes: impl IntoIterator<Item = Attribute>) -> Vec<u8> {
 		let key_identifier = RecordDirection::ClientToServer.key_identifier(0);
+		let kek = Kek::try_from(TEST_KEK.as_slice()).expect("the test KEK is the size of the house wrap's key");
 		let record = AuthEnvelopedData::seal_kek::<DefaultCryptoProvider>(
-			&TEST_KEK,
+			&kek,
 			&key_identifier,
 			DATA,
 			PLAINTEXT,
@@ -1013,8 +1052,8 @@ mod tests {
 		[&record[..at], swapped.as_slice(), &record[at + in_order.len()..]].concat()
 	}
 
-	/// The values in the descending `unauthAttrs` of a forged record: sixty
-	/// thousand, a 240 KB record.
+	/// The number of values in the descending `unauthAttrs` of a forged record:
+	/// sixty thousand, a 240 KB record.
 	const FORGED_VALUES_LEN: u16 = 60_000;
 
 	/// The fields of the `AuthEnvelopedData` of `record`, after its header.
@@ -1425,7 +1464,7 @@ mod tests {
 	fn a_record_key_of_another_size_is_refused() {
 		let refused = RuntimeAead::new::<DefaultCryptoProvider>(vec![0x42u8; 16]);
 		let expected = ReceivedExpectedError { received: 16, expected: 32 };
-		assert!(matches!(refused, Err(TightBeamError::KeyError(KeyError::WrapLength(found))) if found == expected));
+		assert!(matches!(refused, Err(TightBeamError::KeyError(KeyError::KekLength(found))) if found == expected));
 	}
 
 	#[test]
@@ -1471,7 +1510,7 @@ mod tests {
 	}
 
 	/// A ceiling below the default leaves the default limit in place, and a
-	/// zero ceiling counts as one byte instead of dividing by zero.
+	/// zero ceiling counts as one byte, so the limit never divides by zero.
 	#[test]
 	fn send_cipher_keeps_its_limit_for_a_lowered_or_empty_ceiling() {
 		let halved = test_sender(0).with_envelope_ceiling(DEFAULT_MAX_ENCRYPTED_ENVELOPE / 2);

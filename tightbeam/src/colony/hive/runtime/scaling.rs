@@ -1,14 +1,13 @@
 //! The hive auto-scaling loop decides a scale per servlet type and fans each
 //! change out to the cluster.
 
+use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU16, Ordering};
 use core::time::Duration;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
-use crate::colony::common::{
-	aggregate_utilization, ScalingDecision, ScalingMetrics, ServletChange, ServletScaleConfig, TaskGroup,
-};
+use crate::colony::common::{ScalingDecision, ScalingMetrics, ServletChange, ServletScaleConfig, TaskGroup};
 use crate::colony::hive::runtime::{ClusterLink, HiveContextImpl, HiveInstances};
 use crate::colony::hive::{HashMapRegistry, HiveConfig, ServletRegistration, ServletRegistry, SpawnerFn};
 use crate::constants::UNKNOWN_SERVLET_UTILIZATION_BPS;
@@ -143,8 +142,17 @@ impl TypeLoad {
 	}
 
 	/// The mean utilization across the counted instances.
+	///
+	/// A load of no instances reads as [`BasisPoints::MAX`], so backpressure
+	/// and heartbeats report saturation while per-type scaling still sees the
+	/// zero count and can spawn. A mean past the range of [`BasisPoints`]
+	/// saturates.
 	fn utilization(&self) -> BasisPoints {
-		aggregate_utilization(self.utilization_sum, self.instances)
+		let instances = u64::try_from(self.instances).unwrap_or(u64::MAX);
+		match NonZeroU64::new(instances) {
+			None => BasisPoints::MAX,
+			Some(count) => BasisPoints::saturating_from(self.utilization_sum / count),
+		}
 	}
 }
 
@@ -182,7 +190,7 @@ impl Cooldowns {
 	}
 }
 
-/// One running scaling loop's resolved handles.
+/// The resolved handles of one live scaling loop.
 ///
 /// [`ScalingLoop`] names what the hive supplies. This names what the loop
 /// body works with once [`ScalingLoop::spawn`] derives the hive URN and binds
@@ -212,8 +220,9 @@ where
 	/// Whether local scaling must hold off.
 	///
 	/// A hive that derived its own URN attributes a scale change to itself.
-	/// Without that identity a watching gateway would keep a slate this
-	/// hive has moved past, so scaling waits until the gateway list empties.
+	/// Without that identity, a gateway that watches this hive would keep a
+	/// slate the hive has moved past, so scaling waits until the gateway list
+	/// empties.
 	fn scale_blocked(&self) -> bool {
 		self.hive_urn.is_none() && self.link.as_ref().is_some_and(|link| link.has_gateways())
 	}
@@ -358,5 +367,32 @@ mod tests {
 			one_millisecond_short => (COOLDOWN.saturating_sub(Duration::from_millis(1)), true),
 			at_the_cooldown => (COOLDOWN, false),
 		}
+	}
+
+	// A load reads as the mean of its instances' basis points. Each case is
+	// an `(instances, utilization_sum, expected_bps)` row.
+	tb_cases! {
+		fn aggregate_utilization_means_across_all_instances((instances, utilization_sum, expected): (usize, u64, u16)) {
+			let load = TypeLoad { instances, utilization_sum };
+
+			assert_eq!(load.utilization().get(), expected);
+		}
+
+		cases {
+			with_no_instances_saturates => (0, 0, 10_000),
+			with_every_instance_idle => (4, 0, 0),
+			with_one_uniform_mean => (4, 20_000, 5_000),
+			with_one_loaded_type_and_one_idle => (2, 10_000, 5_000),
+			with_every_instance_fully_loaded => (4, 40_000, 10_000),
+		}
+	}
+
+	// A mean of 65,536 basis points is past the `u16` range, and it reads as
+	// saturation.
+	#[test]
+	fn a_mean_past_the_u16_range_reads_as_saturation() {
+		let load = TypeLoad { instances: 2, utilization_sum: 131_072 };
+
+		assert_eq!(load.utilization(), BasisPoints::MAX);
 	}
 }

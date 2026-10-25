@@ -8,7 +8,7 @@
 //!
 //! The parts of the rule:
 //!
-//! - [`CurvePoints`] decodes the points of one curve, and only refuses.
+//! - [`CurvePoints`] decodes the points of one curve, and its one effect is to refuse an off-curve encoding.
 //! - [`KeyCurves`] holds the decoders of a reader.
 //! - [`CanonicalKey`] holds one identity in its canonical form.
 //! - [`KeyIndex`] finds a key in either SEC 1 form of its point.
@@ -70,9 +70,9 @@ pub(crate) struct Sec1Point<'a> {
 }
 
 impl<'a> Sec1Point<'a> {
-	/// Read `point`, whose first octet names its form. It returns `None` for a
-	/// form that RFC 5480 §2.2 refuses or for an uncompressed point of uneven
-	/// halves.
+	/// Read `point`, whose first octet names its form. It returns `None` for an
+	/// empty point, for a form that RFC 5480 §2.2 refuses, or for an
+	/// uncompressed point whose halves are uneven or empty.
 	pub(crate) fn read(point: &'a [u8]) -> Option<Self> {
 		let (form, coordinates) = point.split_first()?;
 		match form {
@@ -567,6 +567,34 @@ impl<V> KeyIndex<V> {
 		found.ok().flatten()
 	}
 
+	/// The value indexed under `key`, a canonical form, found by its DER as it
+	/// stands with no decode.
+	///
+	/// `key` reads under [`KeyCurves::HOUSE`], so an index under other curves
+	/// finds each key whose canonical form the two readers share.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::crypto::x509::{CanonicalKey, KeyIndex};
+	/// use tightbeam::testing::fixtures::{TestCertificate, TestKey};
+	///
+	/// let uncompressed = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+	/// let compressed = TestCertificate::with_compressed_key(uncompressed.clone());
+	///
+	/// // A session holds the canonical form of the key it proved.
+	/// let mut index = KeyIndex::default();
+	/// index.insert(&uncompressed.tbs_certificate.subject_public_key_info, "enrolled")?;
+	/// let key = CanonicalKey::of(&compressed.tbs_certificate.subject_public_key_info)?;
+	///
+	/// assert_eq!(index.get(&key), Some(&"enrolled"));
+	/// # Ok::<(), tightbeam::der::Error>(())
+	/// ```
+	#[must_use]
+	pub fn get(&self, key: &CanonicalKey) -> Option<&V> {
+		self.keys.get(key.as_der())
+	}
+
 	/// Index `value` under the key that `spki` holds, and return the value
 	/// that key held before, if any.
 	///
@@ -872,8 +900,8 @@ mod tests {
 		[&[form][..], coordinates].concat()
 	}
 
-	/// The octets of the point of the fixed key in the compact form, the
-	/// octet `0x05` before the x-coordinate alone.
+	/// The SubjectPublicKeyInfo of the fixed key with its point in the compact
+	/// form, the octet `0x05` before the x-coordinate alone.
 	fn compact() -> SubjectPublicKeyInfoOwned {
 		let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
 		let certificate = TestCertificate::with_compact_key(certificate);

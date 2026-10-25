@@ -1,4 +1,4 @@
-//! Application-facing message transmission, which sends and receives frames.
+//! Application message transmission: the traits that send and receive frames.
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
@@ -177,7 +177,9 @@ where
 /// Base emitter trait, which sends TightBeam messages with gate and restart
 /// policies.
 pub trait MessageEmitter: MessageIO {
+	/// Gate policy that every outbound message passes before a send.
 	type EmitterGate: GatePolicy + ?Sized;
+	/// Restart policy that decides whether a failed send goes out again.
 	type RestartPolicy: RestartPolicy + ?Sized;
 
 	/// The restart policy that [`Self::emit`] consults after a failed send.
@@ -190,7 +192,7 @@ pub trait MessageEmitter: MessageIO {
 	///
 	/// # Returns
 	///
-	/// - `status`: the TransitStatus from the response.
+	/// - `status`: the [`TransitStatus`] of the response.
 	/// - `response`: the optional response frame from the server.
 	/// - `original`: the original frame when the server rejected it, for a
 	///   retry, or `None` when the frame was sent or consumed.
@@ -213,8 +215,9 @@ pub trait MessageEmitter: MessageIO {
 	}
 }
 
-/// Default [`MessageEmitter::emit`] body as a free function so the returned
-/// future can carry [`MaybeSend`] without an AFIT default-method capture.
+/// Run the default [`MessageEmitter::emit`] body. It is a free function so the
+/// returned future can carry [`MaybeSend`] without an AFIT default-method
+/// capture.
 async fn emit_with_retry<T: MessageEmitter + MaybeSend + ?Sized>(
 	emitter: &mut T,
 	message: Frame,
@@ -278,26 +281,32 @@ async fn emit_with_retry<T: MessageEmitter + MaybeSend + ?Sized>(
 	}
 }
 
-/// Every capability a message collector must already have.
-///
-/// Every collector exposes an audit trail ([`GateAudit`]) for gate-verdict
-/// recording. The blanket impl satisfies the requirement, so implementers
-/// reach it through [`MessageCollector`] alone.
-pub trait CollectorRequirements: MessageIO + GateAudit {}
-
-impl<T: MessageIO + GateAudit> CollectorRequirements for T {}
-
 /// Message collector trait, which receives TightBeam messages.
-pub trait MessageCollector: CollectorRequirements {
+///
+/// Every collector is a [`GateAudit`] plane, so its audit trail records each
+/// gate verdict.
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam::policy::TransitStatus;
+/// use tightbeam::transport::{MessageCollector, TransportResult};
+///
+/// /// Read one message, and whether the gate of the collector admitted it.
+/// async fn admitted<C: MessageCollector + Send>(collector: &mut C) -> TransportResult<bool> {
+///     let (_frame, status) = collector.collect_message().await?;
+///     Ok(status == TransitStatus::Ok)
+/// }
+/// ```
+pub trait MessageCollector: MessageIO + GateAudit {
 	/// Gate policy consulted for every collected message.
 	type CollectorGate: GatePolicy + ?Sized;
 
 	/// The gate policy that every collected message passes through.
 	fn collector_gate(&self) -> &Self::CollectorGate;
 
-	/// Read and validate one message, leaving the response to the caller.
-	///
-	/// The method returns the message and the gate evaluation status.
+	/// Read and validate one message, and return it with the status of its gate
+	/// evaluation. The caller sends the response.
 	fn collect_message(&mut self) -> impl Future<Output = TransportResult<(Arc<Frame>, TransitStatus)>> + MaybeSend
 	where
 		Self: MaybeSend,
@@ -312,9 +321,9 @@ pub trait MessageCollector: CollectorRequirements {
 		}
 	}
 
-	/// Collect the next message, and tell a graceful close from an error.
+	/// Collect the next message, and tell a close at EOF from an error.
 	///
-	/// - `Ok(None)` means that the connection closed gracefully (EOF).
+	/// - `Ok(None)` means that the connection closed at EOF.
 	/// - `Err` means that the connection failed unexpectedly.
 	fn try_collect_message(
 		&mut self,
@@ -325,7 +334,7 @@ pub trait MessageCollector: CollectorRequirements {
 		async move {
 			let decoded_envelope = match self.try_read_decoded_envelope().await? {
 				Some(envelope) => envelope,
-				None => return Ok(None), // The connection closed gracefully.
+				None => return Ok(None), // The connection closed at EOF.
 			};
 
 			// A cleartext connection carries no peer identity, so it gets the
@@ -346,7 +355,8 @@ pub trait MessageCollector: CollectorRequirements {
 	where
 		Self: MaybeSend;
 
-	/// The X.509 `collect_message` with encryption and handshake support.
+	/// The X.509 form of [`Self::collect_message`] over an encrypted session,
+	/// which serves each handshake request that arrives before the message.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[allow(async_fn_in_trait)]
 	async fn collect_message_with_encryption<P>(&mut self) -> TransportResult<(Arc<Frame>, TransitStatus)>
@@ -367,8 +377,8 @@ pub trait MessageCollector: CollectorRequirements {
 }
 
 /// Extract the application request from a collected envelope and gate it
-/// with the session's peer context, recording the verdict through
-/// `gate_inbound`.
+/// with the session's peer context. [`GateInbound::gate_inbound`] records the
+/// verdict.
 fn gate_collected_envelope<T>(
 	transport: &T,
 	envelope: TransportEnvelope,
@@ -546,7 +556,7 @@ mod tests {
 
 		/// The SHA3-256 digest of the evidence that a gate refusal of
 		/// `session` records, under a collector that records the digest of
-		/// each evidence.
+		/// every evidence payload.
 		fn rejection_evidence(session: &SessionContext) -> Option<[u8; 32]> {
 			let config = TbInstrumentationConfig { enable_payloads: true, ..TbInstrumentationConfig::default() };
 			let audit = AuditProbe(TraceCollector::from(TraceConfig::with_instrumentation(config)));

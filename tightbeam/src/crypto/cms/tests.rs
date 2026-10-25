@@ -2,18 +2,20 @@ use std::sync::{Arc, Mutex};
 
 use crate::cms::content_info::CmsVersion;
 use crate::cms::enveloped_data::{
-	KekIdentifier, KekRecipientInfo, OtherRecipientInfo, RecipientIdentifier, RecipientInfo,
+	KekIdentifier, KekRecipientInfo, OtherRecipientInfo, RecipientIdentifier, RecipientInfo, RecipientInfos,
 };
+use crate::crypto::cms::kek;
 use crate::crypto::cms::{
 	AuthEnvelopedData, BareKemKey, CmsOriForKemOtherInfo, EnvelopeError, GcmParameters, KemKeyHolder, KemRecipient,
 	KemRecipientInfo, KeyAgreementIdentity, Opener, Recipient,
 };
+use crate::crypto::common::typenum::Unsigned;
 use crate::crypto::hpke::DhKemSecp256k1;
 use crate::crypto::k256::elliptic_curve::sec1::ToEncodedPoint;
 use crate::crypto::k256::{PublicKey, Secp256k1};
 use crate::crypto::kdf::HkdfSha3_256;
 use crate::crypto::key::{DiffieHellman, KeyBackend, KeyError, Secp256k1KeyProvider};
-use crate::crypto::profiles::{Aes128Wrap, Aes192Wrap, Aes256Wrap, DefaultCryptoProvider, KeyWrapAlgorithm};
+use crate::crypto::profiles::{Aes128Wrap, Aes192Wrap, Aes256Wrap, DefaultCryptoProvider, Kek, KeyWrapAlgorithm};
 use crate::crypto::secret::{SecretSlice, ToInsecure};
 use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 use crate::crypto::x509::error::CertificateValidationError;
@@ -63,9 +65,15 @@ const UKM_LABEL: &[u8] = b"tb/test/ukm/v1";
 /// B.1.1, which the KEM known answer seals to.
 const PUBLISHED_RECIPIENT_SECRET: &str = "a795c287c132154a8b96dc81dc8b4e2f02bbbad78dab0567b59db1d1540751f6";
 
+/// [`KEK`] as the key-encryption key of the house wrap.
+fn house_kek() -> Kek<'static, Aes256Wrap> {
+	let kek = Kek::try_from(KEK.as_slice());
+	kek.expect("the test KEK is the key size of AES-256 key wrap")
+}
+
 /// The holder of [`KEK`], as the recipient of a seal.
-fn kek_recipient_of() -> Recipient<'static, HouseKem> {
-	Recipient::Kek { kek: &KEK, key_identifier: KEY_IDENTIFIER }
+fn kek_recipient_of() -> Recipient<'static, House> {
+	Recipient::Kek { kek: house_kek(), key_identifier: KEY_IDENTIFIER }
 }
 
 /// [`CONTENT`] sealed as `id-data` to the holder of [`KEK`].
@@ -83,8 +91,8 @@ fn kek_sealed_from_seed() -> AuthEnvelopedData {
 }
 
 /// The opener of the holder of [`KEK`].
-fn kek_opener() -> Opener<'static, HouseKem> {
-	Opener::Kek { kek: &KEK, key_identifier: KEY_IDENTIFIER }
+fn kek_opener() -> Opener<'static, House> {
+	Opener::Kek { kek: house_kek(), key_identifier: KEY_IDENTIFIER }
 }
 
 /// The house backend of `key`, as the trait object the house KEM decapsulates
@@ -134,14 +142,14 @@ fn kem_sealed_from_seed() -> AuthEnvelopedData {
 }
 
 /// The opener of `identity` under [`UKM_LABEL`].
-fn kem_opener(identity: &HouseIdentity) -> Opener<'_, HouseKem> {
+fn kem_opener(identity: &HouseIdentity) -> Opener<'_, House> {
 	Opener::Kem { identity, ukm_label: UKM_LABEL }
 }
 
 /// Open `envelope` as it encodes, as a reader that received its DER does.
 async fn opened(
 	envelope: AuthEnvelopedData,
-	opener: &Opener<'_, HouseKem>,
+	opener: &Opener<'_, House>,
 	content_type: ObjectIdentifier,
 ) -> Result<SecretSlice<u8>, EnvelopeError> {
 	let arrived = envelope.to_der()?;
@@ -562,11 +570,18 @@ fn the_kem_kek_matches_its_known_answer() -> Result<(), EnvelopeError> {
 	Ok(())
 }
 
-/// The first `size` octets of the RFC 3394 §4 KEK, `000102...1f`.
-fn rfc_3394_kek(size: usize) -> Vec<u8> {
-	let mut kek = unhex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
-	kek.truncate(size);
-	kek
+/// The RFC 3394 §4 KEK, `000102...1f`, whose first octets key each AES wrap.
+static RFC_3394_KEK: [u8; 32] = [
+	0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12,
+	0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+];
+
+/// The first octets of the RFC 3394 §4 KEK, as many as the wrap `W` takes.
+fn rfc_3394_kek<W: KeyWrapAlgorithm>() -> Kek<'static, W> {
+	let size = <W::KekSize as Unsigned>::USIZE;
+	let octets = RFC_3394_KEK.get(..size);
+	let octets = octets.expect("the RFC 3394 KEK holds the key of each AES wrap");
+	Kek::try_from(octets).expect("the leading octets are the key size of the wrap")
 }
 
 /// The first `size` octets of the RFC 3394 §4 key data, `00112233...0f`.
@@ -596,42 +611,42 @@ const RFC_3394_4_6: &str = "28c9f404c4b810f4cbccb35cfb87f8263f5786e2d80ed326cbc7
 
 #[test]
 fn aes_128_key_wrap_matches_rfc_3394_4_1() -> Result<(), KeyError> {
-	let wrapped = Aes128Wrap::wrap(&rfc_3394_kek(16), &rfc_3394_key_data(16))?;
+	let wrapped = Aes128Wrap::wrap(&rfc_3394_kek(), &rfc_3394_key_data(16))?;
 	assert_eq!(wrapped, unhex(RFC_3394_4_1));
 	Ok(())
 }
 
 #[test]
 fn aes_128_key_unwrap_matches_rfc_3394_4_1() -> Result<(), KeyError> {
-	let unwrapped = Aes128Wrap::unwrap(&rfc_3394_kek(16), &unhex(RFC_3394_4_1))?;
+	let unwrapped = Aes128Wrap::unwrap(&rfc_3394_kek(), &unhex(RFC_3394_4_1))?;
 	assert_eq!(unwrapped, rfc_3394_key_data(16));
 	Ok(())
 }
 
 #[test]
 fn aes_192_key_wrap_matches_rfc_3394_4_2() -> Result<(), KeyError> {
-	let wrapped = Aes192Wrap::wrap(&rfc_3394_kek(24), &rfc_3394_key_data(16))?;
+	let wrapped = Aes192Wrap::wrap(&rfc_3394_kek(), &rfc_3394_key_data(16))?;
 	assert_eq!(wrapped, unhex(RFC_3394_4_2));
 	Ok(())
 }
 
 #[test]
 fn aes_192_key_unwrap_matches_rfc_3394_4_2() -> Result<(), KeyError> {
-	let unwrapped = Aes192Wrap::unwrap(&rfc_3394_kek(24), &unhex(RFC_3394_4_2))?;
+	let unwrapped = Aes192Wrap::unwrap(&rfc_3394_kek(), &unhex(RFC_3394_4_2))?;
 	assert_eq!(unwrapped, rfc_3394_key_data(16));
 	Ok(())
 }
 
 #[test]
 fn aes_256_key_wrap_matches_rfc_3394_4_3() -> Result<(), KeyError> {
-	let wrapped = Aes256Wrap::wrap(&rfc_3394_kek(32), &rfc_3394_key_data(16))?;
+	let wrapped = Aes256Wrap::wrap(&rfc_3394_kek(), &rfc_3394_key_data(16))?;
 	assert_eq!(wrapped, unhex(RFC_3394_4_3));
 	Ok(())
 }
 
 #[test]
 fn aes_256_key_unwrap_matches_rfc_3394_4_3() -> Result<(), KeyError> {
-	let unwrapped = Aes256Wrap::unwrap(&rfc_3394_kek(32), &unhex(RFC_3394_4_3))?;
+	let unwrapped = Aes256Wrap::unwrap(&rfc_3394_kek(), &unhex(RFC_3394_4_3))?;
 	assert_eq!(unwrapped, rfc_3394_key_data(16));
 	Ok(())
 }
@@ -641,7 +656,7 @@ fn aes_256_key_unwrap_matches_rfc_3394_4_3() -> Result<(), KeyError> {
 #[test]
 fn aes_256_key_unwrap_into_matches_rfc_3394_4_3() -> Result<(), KeyError> {
 	let mut key = Zeroizing::new([0u8; 16]);
-	Aes256Wrap::unwrap_into(&rfc_3394_kek(32), &unhex(RFC_3394_4_3), &mut *key)?;
+	Aes256Wrap::unwrap_into(&rfc_3394_kek(), &unhex(RFC_3394_4_3), &mut *key)?;
 	assert_eq!(key.as_slice(), rfc_3394_key_data(16).as_slice());
 	Ok(())
 }
@@ -651,48 +666,48 @@ fn aes_256_key_unwrap_into_matches_rfc_3394_4_3() -> Result<(), KeyError> {
 #[test]
 fn the_house_unwrap_into_refuses_a_buffer_of_another_size() {
 	let mut key = [0u8; 32];
-	let refused = Aes256Wrap::unwrap_into(&rfc_3394_kek(32), &unhex(RFC_3394_4_3), &mut key);
+	let refused = Aes256Wrap::unwrap_into(&rfc_3394_kek(), &unhex(RFC_3394_4_3), &mut key);
 	assert!(matches!(refused, Err(KeyError::WrapLength(sizes)) if (sizes.received, sizes.expected) == (32, 16)));
 }
 
 #[test]
 fn aes_192_key_wrap_matches_rfc_3394_4_4() -> Result<(), KeyError> {
-	let wrapped = Aes192Wrap::wrap(&rfc_3394_kek(24), &rfc_3394_key_data(24))?;
+	let wrapped = Aes192Wrap::wrap(&rfc_3394_kek(), &rfc_3394_key_data(24))?;
 	assert_eq!(wrapped, unhex(RFC_3394_4_4));
 	Ok(())
 }
 
 #[test]
 fn aes_192_key_unwrap_matches_rfc_3394_4_4() -> Result<(), KeyError> {
-	let unwrapped = Aes192Wrap::unwrap(&rfc_3394_kek(24), &unhex(RFC_3394_4_4))?;
+	let unwrapped = Aes192Wrap::unwrap(&rfc_3394_kek(), &unhex(RFC_3394_4_4))?;
 	assert_eq!(unwrapped, rfc_3394_key_data(24));
 	Ok(())
 }
 
 #[test]
 fn aes_256_key_wrap_matches_rfc_3394_4_5() -> Result<(), KeyError> {
-	let wrapped = Aes256Wrap::wrap(&rfc_3394_kek(32), &rfc_3394_key_data(24))?;
+	let wrapped = Aes256Wrap::wrap(&rfc_3394_kek(), &rfc_3394_key_data(24))?;
 	assert_eq!(wrapped, unhex(RFC_3394_4_5));
 	Ok(())
 }
 
 #[test]
 fn aes_256_key_unwrap_matches_rfc_3394_4_5() -> Result<(), KeyError> {
-	let unwrapped = Aes256Wrap::unwrap(&rfc_3394_kek(32), &unhex(RFC_3394_4_5))?;
+	let unwrapped = Aes256Wrap::unwrap(&rfc_3394_kek(), &unhex(RFC_3394_4_5))?;
 	assert_eq!(unwrapped, rfc_3394_key_data(24));
 	Ok(())
 }
 
 #[test]
 fn aes_256_key_wrap_matches_rfc_3394_4_6() -> Result<(), KeyError> {
-	let wrapped = Aes256Wrap::wrap(&rfc_3394_kek(32), &rfc_3394_key_data(32))?;
+	let wrapped = Aes256Wrap::wrap(&rfc_3394_kek(), &rfc_3394_key_data(32))?;
 	assert_eq!(wrapped, unhex(RFC_3394_4_6));
 	Ok(())
 }
 
 #[test]
 fn aes_256_key_unwrap_matches_rfc_3394_4_6() -> Result<(), KeyError> {
-	let unwrapped = Aes256Wrap::unwrap(&rfc_3394_kek(32), &unhex(RFC_3394_4_6))?;
+	let unwrapped = Aes256Wrap::unwrap(&rfc_3394_kek(), &unhex(RFC_3394_4_6))?;
 	assert_eq!(unwrapped, rfc_3394_key_data(32));
 	Ok(())
 }
@@ -719,7 +734,7 @@ fn aes_256_key_wrap_names_its_identifier() {
 /// refused.
 #[test]
 fn a_wrap_of_one_block_is_refused() {
-	let refused = Aes256Wrap::wrap(&rfc_3394_kek(32), &[0x00; 8]);
+	let refused = Aes256Wrap::wrap(&rfc_3394_kek(), &[0x00; 8]);
 	assert!(matches!(refused, Err(KeyError::WrapLength(_))));
 }
 
@@ -727,8 +742,60 @@ fn a_wrap_of_one_block_is_refused() {
 /// the floor of RFC 3394 §2, so it is refused.
 #[test]
 fn an_unwrap_of_two_blocks_is_refused() {
-	let refused = Aes256Wrap::unwrap(&rfc_3394_kek(32), &[0x00; 16]);
+	let refused = Aes256Wrap::unwrap(&rfc_3394_kek(), &[0x00; 16]);
 	assert!(matches!(refused, Err(KeyError::WrapLength(_))));
+}
+
+/// A key one octet short of the 32 octets of AES-256 key wrap is no KEK of
+/// that wrap.
+#[test]
+fn a_kek_one_octet_short_is_refused() {
+	let refused = Kek::<Aes256Wrap>::try_from(&KEK[..31]);
+	assert!(matches!(refused, Err(KeyError::KekLength(sizes)) if (sizes.received, sizes.expected) == (31, 32)));
+}
+
+/// A key one octet past the 32 octets of AES-256 key wrap is no KEK of that
+/// wrap.
+#[test]
+fn a_kek_one_octet_long_is_refused() {
+	let long = [0x11u8; 33];
+	let refused = Kek::<Aes256Wrap>::try_from(long.as_slice());
+	assert!(matches!(refused, Err(KeyError::KekLength(sizes)) if (sizes.received, sizes.expected) == (33, 32)));
+}
+
+/// The `KEKRecipientInfo` that `info` is.
+fn kek_info_of(info: RecipientInfo) -> KekRecipientInfo {
+	let kek = match info {
+		RecipientInfo::Kekri(kek) => Some(kek),
+		_ => None,
+	};
+	kek.expect("a KEK recipient writes a KEKRecipientInfo")
+}
+
+/// A `Kek` recipient wraps the content key under the key it holds, as RFC
+/// 3394 §4.6 wraps 256 bits of key data under a 256-bit KEK.
+#[test]
+fn a_kek_recipient_wraps_as_rfc_3394_4_6() -> Result<(), EnvelopeError> {
+	let recipient: Recipient<'_, House> = Recipient::Kek { kek: rfc_3394_kek(), key_identifier: KEY_IDENTIFIER };
+	let info = recipient.wrap(&rfc_3394_key_data(32), &mut OsRng)?;
+	let wrapped = kek_info_of(info);
+	assert_eq!(wrapped.encrypted_key.as_bytes(), unhex(RFC_3394_4_6).as_slice());
+	Ok(())
+}
+
+/// A `Kek` opener unwraps the content key under the key it holds, as RFC
+/// 3394 §4.6 unwraps 256 bits of key data under a 256-bit KEK.
+#[tokio::test]
+async fn a_kek_opener_unwraps_rfc_3394_4_6() -> Result<(), EnvelopeError> {
+	let wrap = kek::wrap_algorithm::<Aes256Wrap>();
+	let info = kek::kek_info(KEY_IDENTIFIER, wrap, unhex(RFC_3394_4_6))?;
+	let infos = RecipientInfos(SetOfVec::try_from(vec![info])?);
+	let opener: Opener<'_, House> = Opener::Kek { kek: rfc_3394_kek(), key_identifier: KEY_IDENTIFIER };
+	let mut key = Zeroizing::new([0u8; 32]);
+
+	opener.unwrap(&infos, &mut *key).await?;
+	assert_eq!(key.as_slice(), rfc_3394_key_data(32).as_slice());
+	Ok(())
 }
 
 #[test]
@@ -896,7 +963,7 @@ async fn a_ukm_with_another_random_fails_the_key_unwrap() {
 /// A KEK seal of another purpose names another key, and is refused.
 #[tokio::test]
 async fn a_kek_seal_of_another_purpose_is_refused() {
-	let opener = Opener::Kek { kek: &KEK, key_identifier: b"tb/test/other/v1" };
+	let opener = Opener::Kek { kek: house_kek(), key_identifier: b"tb/test/other/v1" };
 	let refused = opened(kek_sealed(), &opener, DATA).await;
 	assert!(matches!(refused, Err(EnvelopeError::KeyIdentifier)));
 }
@@ -1182,8 +1249,8 @@ fn a_key_agreement_identity_refuses_a_backend_of_another_key() {
 }
 
 /// A key-agreement identity pairs a backend with a certificate that holds
-/// the backend's point in the compressed SEC 1 form, since both forms name
-/// one key (RFC 5480 §2.2).
+/// the backend's point in the compressed SEC 1 form, because both forms
+/// name one key (RFC 5480 §2.2).
 #[test]
 fn a_key_agreement_identity_admits_its_key_in_the_compressed_form() -> Result<(), EnvelopeError> {
 	let key = Secp256k1SigningKey::random(&mut OsRng);

@@ -22,8 +22,8 @@ use tightbeam::{
 		kdf::{Hkdf, HkdfSha3_256},
 		profiles::{
 			AeadProvider, Aes128Wrap, CryptoProvider, CurveProvider, DefaultCryptoProvider, DigestProvider,
-			KdfProvider, KeyWrapProvider, NoStrengthFloor, ProfileStrengthPolicy, SecurityProfile, SecurityProfileDesc,
-			SigningProvider,
+			KdfProvider, Kek, KeyWrapProvider, NoStrengthFloor, ProfileStrengthPolicy, SecurityProfile,
+			SecurityProfileDesc, SigningProvider,
 		},
 		secret::SecretSlice,
 		sign::ecdsa::{Secp256k1Signature, Secp256k1VerifyingKey},
@@ -120,7 +120,9 @@ impl CryptoProvider for Aes128CryptoProvider {
 /// The direction a handshake message travels in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
+	/// The client sends the message to the server.
 	ClientToServer,
+	/// The server sends the message to the client.
 	ServerToClient,
 }
 
@@ -324,7 +326,9 @@ pub const BACKEND_COUNT_U32: u32 = BACKEND_COUNT as u32;
 /// The handshake backends the harness can run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HandshakeBackendKind {
+	/// The HPKE handshake.
 	Hpke,
+	/// The CMS handshake.
 	#[cfg(feature = "transport-cms")]
 	Cms,
 }
@@ -480,7 +484,8 @@ impl SecurityThreatHarness {
 	///
 	/// # Errors
 	///
-	/// - The errors of [`Self::spawn_with_profiles`].
+	/// - [`TightBeamError`] -- the trace collector refused a hidden event, as in
+	///   [`Self::spawn_with_profiles`].
 	pub fn spawn(&self, kind: HandshakeBackendKind) -> Result<Box<dyn HandshakeProtocol>, TightBeamError> {
 		let client_profiles = vec![default_security_profile()];
 		let server_profiles = vec![default_security_profile()];
@@ -690,6 +695,7 @@ impl StaticKeyObserver {
 			let envelope = AuthEnvelopedData::from_der(&self.closing)?;
 			let content_type = envelope.auth_encrypted_content_info.content_type;
 			let key_identifier = kek_identifier(&envelope)?;
+			let kek = Kek::try_from(kek.as_slice())?;
 			let opener = Opener::Kek { kek, key_identifier: &key_identifier };
 			let attempt = envelope.open::<DefaultCryptoProvider>(&self.closing, &opener, content_type);
 			attempts.push(attempt.await);

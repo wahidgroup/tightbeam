@@ -1,13 +1,13 @@
-//! Wall-clock instants as protocol values, and the clock that reads them.
+//! Unix-time instants as protocol values, and the clock that reads them.
 //!
 //! Freshness, replay, retention and lease decisions compare an instant
 //! against a window. The window is a [`Duration`]. The instant arrives on the
 //! wire as unix milliseconds, and a bare `u64` there lets a call site pass an
 //! instant where a window belongs and still compile. [`UnixMillis`] gives the
-//! instant its own type, so the two cannot be exchanged.
+//! instant its own type, so a call site cannot exchange the two.
 //!
 //! A runtime reads the time through a [`Clock`], so a test names the instant
-//! a decision sees instead of sleeping until it arrives.
+//! a decision sees and does not sleep until it arrives.
 //!
 //! # Sources
 //!
@@ -35,8 +35,8 @@ impl UnixMillis {
 	/// The current instant from the system clock.
 	///
 	/// A clock set before the unix epoch reads as the epoch itself, so a
-	/// comparison against this value stays defined. Present where
-	/// [`SystemClock`] is.
+	/// comparison against this value stays defined. It exists where
+	/// [`SystemClock`] exists.
 	#[cfg(host_clock)]
 	#[must_use]
 	pub fn now() -> Self {
@@ -57,8 +57,8 @@ impl UnixMillis {
 		Self::from_unix_nanos(reading.unix_timestamp_nanos())
 	}
 
-	/// The instant `nanos` after the unix epoch, reading a time before the
-	/// epoch as the epoch.
+	/// The instant `nanos` after the unix epoch, where a time before the epoch
+	/// reads as the epoch.
 	#[cfg(any(test, all(feature = "time", not(host_clock))))]
 	fn from_unix_nanos(nanos: i128) -> Self {
 		let millis = nanos / 1_000_000;
@@ -66,7 +66,7 @@ impl UnixMillis {
 		Self(u64::try_from(millis).unwrap_or_default())
 	}
 
-	/// The instant a system time names, reading a time before the epoch as
+	/// The instant a system time names, where a time before the epoch reads as
 	/// the epoch.
 	#[cfg(host_clock)]
 	fn from_system(time: std::time::SystemTime) -> Self {
@@ -166,7 +166,7 @@ impl MonotonicInstant {
 ///
 /// Each member answers a different question:
 ///
-/// - [`Clock::unix`] is the wall clock, which freshness and replay compare against the time a peer stated.
+/// - [`Clock::unix`] reads unix time, which freshness and replay compare against the time a peer stated.
 /// - [`Clock::monotonic`] never steps backwards, so leases, idle timeouts and
 ///   handshake deadlines measure from it.
 /// - [`Clock::sleep`] waits on the same clock, so a restart backoff is
@@ -174,10 +174,10 @@ impl MonotonicInstant {
 ///
 /// [`SystemClock`] is the default where the standard library's clocks work.
 /// Elsewhere the embedding runtime installs a clock that reads its host. A
-/// test installs a [`ManualClock`] and advances it, so a decision sees
-/// exactly the instant the test names.
+/// test installs a [`ManualClock`] and advances it, so a decision sees the
+/// instant the test names.
 pub trait Clock: MaybeSend + MaybeSync + core::fmt::Debug {
-	/// The current wall-clock instant.
+	/// The current instant in unix time.
 	fn unix(&self) -> UnixMillis;
 
 	/// The current monotonic instant.
@@ -189,9 +189,9 @@ pub trait Clock: MaybeSend + MaybeSync + core::fmt::Debug {
 
 /// The operating system's clocks.
 ///
-/// Absent on `wasm32-unknown-unknown`, where the standard library's clocks
-/// panic when read, so a build for that target cannot name it and installs a
-/// [`Clock`] that reads the host instead.
+/// The type needs `std` and is absent on `wasm32-unknown-unknown`, where the
+/// standard library's clocks panic when read, so a build for that target cannot
+/// name it and installs a [`Clock`] that reads the host instead.
 #[cfg(host_clock)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemClock;
@@ -207,17 +207,14 @@ impl Clock for SystemClock {
 	}
 
 	/// A tokio build yields the worker so other tasks keep running. A build
-	/// without a reactor parks the calling thread, which is the only timer it
-	/// has.
+	/// without a reactor parks the calling thread on the first poll, which is
+	/// the only timer it has, so the call to `sleep` returns at once.
 	fn sleep(&self, span: Duration) -> MaybeSendFuture<'_, ()> {
 		#[cfg(feature = "tokio")]
 		let wait: MaybeSendFuture<'_, ()> = Box::pin(tokio::time::sleep(span));
 
 		#[cfg(not(feature = "tokio"))]
-		let wait: MaybeSendFuture<'_, ()> = {
-			std::thread::sleep(span);
-			Box::pin(core::future::ready(()))
-		};
+		let wait: MaybeSendFuture<'_, ()> = Box::pin(async move { std::thread::sleep(span) });
 
 		wait
 	}
@@ -228,8 +225,8 @@ impl Clock for SystemClock {
 /// Both readings start at the system clock's and move together, so a peer
 /// that still reads the system clock agrees with this one until the first
 /// [`ManualClock::advance`]. A sleep resolves once an advance carries the
-/// clock past its span, so a loop sleeping on this clock waits for the test
-/// rather than spinning.
+/// clock to the end of its span, so a loop that sleeps on this clock waits for
+/// the test and does not spin.
 #[cfg(all(host_clock, any(test, feature = "testing")))]
 #[derive(Debug)]
 pub struct ManualClock {
@@ -238,7 +235,7 @@ pub struct ManualClock {
 	state: std::sync::Mutex<ManualState>,
 }
 
-/// How far a [`ManualClock`] has moved, and the sleeps waiting on it.
+/// How far a [`ManualClock`] has moved, and the sleeps that wait on it.
 #[cfg(all(host_clock, any(test, feature = "testing")))]
 #[derive(Debug, Default)]
 struct ManualState {
@@ -248,7 +245,7 @@ struct ManualState {
 
 #[cfg(all(host_clock, any(test, feature = "testing")))]
 impl ManualClock {
-	/// Move both readings forward by `span`, waking every sleep it ends.
+	/// Move both readings forward by `span`, and wake every sleep it ends.
 	pub fn advance(&self, span: Duration) {
 		let sleepers = {
 			let mut state = self.lock();
@@ -256,8 +253,8 @@ impl ManualClock {
 			core::mem::take(&mut state.sleepers)
 		};
 
-		// Woken outside the lock, so a sleeper that polls at once finds it
-		// free.
+		// The sleepers wake outside the lock, so a sleeper that polls at once
+		// finds the lock free.
 		sleepers.into_iter().for_each(core::task::Waker::wake);
 	}
 
@@ -338,8 +335,8 @@ mod tests {
 		assert_eq!(later.saturating_since(earlier), Duration::ZERO);
 	}
 
-	// The arm that reads the `time` crate runs on no host, so its one
-	// conversion is pinned here.
+	// The arm that reads the `time` crate runs on no host, so this test pins
+	// its one conversion.
 	#[test]
 	fn a_reading_in_nanoseconds_becomes_whole_milliseconds() {
 		assert_eq!(UnixMillis::from_unix_nanos(1_500_000), UnixMillis::new(1));
@@ -368,8 +365,8 @@ mod tests {
 		);
 	}
 
-	/// A sleep on a manual clock waits for the test, so a loop sleeping on
-	/// it never spins, and resolves once an advance covers its span.
+	/// A sleep on a manual clock waits for the test and resolves once an
+	/// advance covers its span, so a loop that sleeps on it never spins.
 	#[test]
 	fn a_manual_clock_sleep_resolves_once_advanced_past_its_span() {
 		let clock = ManualClock::default();

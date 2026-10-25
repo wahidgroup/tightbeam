@@ -12,16 +12,16 @@ use crate::seams::outside_identity_of;
 use core::sync::atomic::AtomicUsize;
 use std::sync::PoisonError;
 use tightbeam::colony::cluster::{PeerRecord, PeerStore};
-use tightbeam::colony::common::{reply_frame, PeerGossip};
+use tightbeam::colony::common::PeerGossip;
 use tightbeam::constants::MAX_PEX_SAMPLE;
 use tightbeam::crypto::x509::KeyPurposes;
 use tightbeam::prelude::TightBeamSocketAddr;
-use tightbeam::server;
 use tightbeam::testing::TestFrame;
 use tightbeam::transport::{EncryptedProtocol, TransportEncryptionConfig};
 use tightbeam::utils::time::{Clock, ManualClock};
+use tightbeam::{compose, server};
 
-/// A peering conf that refloods to `peers`.
+/// A peering configuration that refloods to `peers`.
 ///
 /// It returns the journal handle, so scenarios can poll flood convergence
 /// through the public journal trait.
@@ -358,7 +358,7 @@ tb_scenario! {
 			hive_b.register_with_cluster(gateway_b.addr()).await?;
 			hive_c.register_with_cluster(gateway_c.addr()).await?;
 
-			// The test resends one signed publish frame byte-identical. The
+			// The test sends one signed publish frame twice, byte for byte. The
 			// origin gateway re-creates the same rumor, with the same id,
 			// order, and body, and the journal absorbs the second as a
 			// Duplicate.
@@ -408,7 +408,7 @@ tb_assert_spec! {
 // reflood at B.
 //
 // - The publish starts at ttl 2 and arrives at C with ttl 0.
-// - The rumor spends the hop budget exactly.
+// - The rumor spends its whole hop budget.
 // - The chain delivers once per cluster with no duplicate.
 tb_scenario! {
 	name: cluster_gossip_relays_across_partial_topology,
@@ -852,14 +852,21 @@ impl GossipJournal for CountingJournal {
 		signer: &[u8],
 		digest: GossipDigest,
 		rumor: &Frame,
+		issued_at: UnixMillis,
 		now: UnixMillis,
 	) -> Result<Admission, ClusterError> {
 		self.records.fetch_add(1, Ordering::SeqCst);
-		self.inner.record(signer, digest, rumor, now)
+		self.inner.record(signer, digest, rumor, issued_at, now)
 	}
 
-	fn witness(&self, signer: &[u8], digest: GossipDigest, now: UnixMillis) -> Result<Admission, ClusterError> {
-		self.inner.witness(signer, digest, now)
+	fn witness(
+		&self,
+		signer: &[u8],
+		digest: GossipDigest,
+		issued_at: UnixMillis,
+		now: UnixMillis,
+	) -> Result<Admission, ClusterError> {
+		self.inner.witness(signer, digest, issued_at, now)
 	}
 
 	fn seen(&self, digest: &GossipDigest, now: UnixMillis) -> Result<bool, ClusterError> {
@@ -991,13 +998,13 @@ tb_assert_spec! {
 // The gateway clamps the freshness window (seen_ttl) to the journal's
 // retention horizon at start.
 //
-// The conf asks for an hour-wide window over a one-second journal.
+// The configuration asks for an hour-wide window over a one-second journal.
 // After the journal prunes the entry, the gateway refuses a byte-identical
 // replay as stale rather than re-admit it as New. The scenario issues the
 // rumor at the reading of the gateway's manual clock, which it alone moves.
 //
-// - Without the clamp the replay reads as "fresh".
-// - It records again and delivers the same rumor to local servlets twice.
+// Without the clamp, the replay reads as "fresh", so the gateway records it
+// again and delivers the same rumor to local servlets twice.
 //
 // Sources:
 //
@@ -1066,10 +1073,10 @@ tb_assert_spec! {
 //
 // A two-token bucket with a slow refill admits rumor A.
 //
-// - It absorbs two byte-identical echoes of A for free.
-// - It keeps the token to admit rumor B.
-// - If duplicates spent tokens, the echoes would drain the bucket.
-// - The bucket would then refuse B with ResourceExhausted.
+// - The gateway absorbs two byte-identical echoes of A for free.
+// - The bucket keeps its second token to admit rumor B.
+// - If duplicates spent tokens, the echoes would drain the bucket, and the
+//   bucket would then refuse B with ResourceExhausted.
 //
 // Relay echo traffic is normal, so it spends no rate token.
 tb_scenario! {
@@ -1122,8 +1129,7 @@ tb_scenario! {
 // The gateway drives an injected journal through the trait alone.
 //
 // - One origin publish records once and acks once on local delivery.
-// - Counts are final when the publish returns.
-// - Record and ack precede the reply.
+// - Record and ack precede the reply, so the counts are final when the publish returns.
 tb_scenario! {
 	name: cluster_gossip_uses_injected_journal,
 	spec: ClusterGossipJournalSeamSpec,
@@ -1185,13 +1191,20 @@ impl GossipJournal for HeldJournal {
 		signer: &[u8],
 		digest: GossipDigest,
 		rumor: &Frame,
+		issued_at: UnixMillis,
 		now: UnixMillis,
 	) -> Result<Admission, ClusterError> {
-		self.inner.record(signer, digest, rumor, now)
+		self.inner.record(signer, digest, rumor, issued_at, now)
 	}
 
-	fn witness(&self, signer: &[u8], digest: GossipDigest, now: UnixMillis) -> Result<Admission, ClusterError> {
-		self.inner.witness(signer, digest, now)
+	fn witness(
+		&self,
+		signer: &[u8],
+		digest: GossipDigest,
+		issued_at: UnixMillis,
+		now: UnixMillis,
+	) -> Result<Admission, ClusterError> {
+		self.inner.witness(signer, digest, issued_at, now)
 	}
 
 	fn seen(&self, digest: &GossipDigest, now: UnixMillis) -> Result<bool, ClusterError> {
@@ -1386,12 +1399,19 @@ impl GossipJournal for AmnesiacJournal {
 		_signer: &[u8],
 		_digest: GossipDigest,
 		_rumor: &Frame,
+		_issued_at: UnixMillis,
 		_now: UnixMillis,
 	) -> Result<Admission, ClusterError> {
 		Ok(Admission::New)
 	}
 
-	fn witness(&self, _signer: &[u8], _digest: GossipDigest, _now: UnixMillis) -> Result<Admission, ClusterError> {
+	fn witness(
+		&self,
+		_signer: &[u8],
+		_digest: GossipDigest,
+		_issued_at: UnixMillis,
+		_now: UnixMillis,
+	) -> Result<Admission, ClusterError> {
 		Ok(Admission::New)
 	}
 
@@ -1456,12 +1476,10 @@ tb_assert_spec! {
 // B acknowledges every repair push with `Ok` and retains nothing. Each
 // reconciliation round therefore re-wants a digest A already saw acknowledged.
 //
-// - A's beat reads the reappearance as a drop signal.
-// - It weakens B's advertised work route once per round.
-// - It abandons the route past the limit.
+// - A's beat reads the reappearance as a drop signal and weakens B's advertised work route once per round.
+// - A's beat abandons the route when its trial count reaches the limit.
 // - The rumor still converges to honest C through the same beat.
-// - The flood to B still runs off the static peer list.
-// - Only work routing drops the grey hole.
+// - The flood to B still runs off the static peer list, so only work routing drops the grey hole.
 tb_scenario! {
 	name: cluster_gossip_abandons_grey_hole_peer,
 	spec: ClusterGossipGreyHoleSpec,
@@ -1544,8 +1562,7 @@ tb_assert_spec! {
 // A trusted peer forwards an origin-signed rumor whose content it altered,
 // which breaks the origin signature.
 //
-// - The gateway refuses it with PermissionDenied.
-// - It weakens the relay's advertised routes.
+// - The gateway refuses it with PermissionDenied and weakens the relay's advertised routes.
 // - An honest relay verifies a rumor before it forwards it.
 tb_scenario! {
 	name: cluster_gossip_weakens_tampered_relay,
@@ -1710,9 +1727,9 @@ tb_assert_spec! {
 // a clock only this test moves. Each origin costs the bridge one refusal at the
 // edge, by repair for the first and by reflood for the second.
 //
-// - The first origin's rumor waits in the journal, and the first beat's repair pushes it. The edge refuses.
+// - The first beat's repair pushes the first origin's rumor from the journal, and the edge refuses it.
 // - A second rumor of that origin refloods to nobody, because the refusal stands.
-// - The second origin's rumor refloods at once. The edge refuses.
+// - The second origin's rumor refloods at once, and the edge refuses it.
 // - Three more beats push neither origin again, although the edge still lacks all three rumors.
 tb_scenario! {
 	name: cluster_gossip_refused_origin_is_offered_to_that_target_once,
@@ -1808,8 +1825,8 @@ tb_assert_spec! {
 // A neighbor colony is inside the flood, and a trusted stranger is outside it.
 //
 // A trusted peer of colony "other" federates work routes (the advertisement
-// installs) and gossips. The gateway refuses a trusted identity with no colony
-// URN with PermissionDenied.
+// installs) and gossips. The gateway answers PermissionDenied to a trusted
+// identity with no colony URN.
 //
 // - Admitted: a rumor of colony "main" that the neighbor relays.
 // - Admitted: a rumor the neighbor signed itself.
@@ -1817,8 +1834,7 @@ tb_assert_spec! {
 // - Refused: a rumor of colony "main" that the stranger relays.
 // - Refused: a rumor the stranger signed and the neighbor relays.
 // - Each refusal is policy, so it weakens no route.
-// - The abandonment limit is 1, so one weaken event would evict the advertised route.
-// - The route survives.
+// - The advertised route survives, although the abandonment limit of 1 lets one weaken event evict it.
 tb_scenario! {
 	name: cluster_gossip_admits_neighbor_colony_and_refuses_stranger,
 	spec: ClusterGossipNeighborColonySpec,
@@ -2010,10 +2026,9 @@ tb_assert_spec! {
 }
 
 // A gateway whose own certificate carries no colony URN SAN is not a
-// colony member.
+// colony member, so it cannot scope the flood.
 //
-// - It refuses origin publishes PermissionDenied even from a trusted hive-plane signer.
-// - It cannot scope the flood.
+// - It refuses origin publishes with PermissionDenied, even from a trusted hive-plane signer.
 tb_scenario! {
 	name: cluster_gossip_non_member_gateway_refuses_publish,
 	spec: ClusterGossipNonMemberSpec,
@@ -2601,8 +2616,8 @@ tb_assert_spec! {
 // - S's beat verifies its anchor P and shares P over PEX.
 // - X learns P, feeler-probes it, proves its flood membership, and promotes it (CLUSTER_PEER_DISCOVERED).
 // - X's advertisement teaches P to dial back, and P promotes X the same way.
-// - A rumor that P publishes at ttl 0 moves by repair alone.
-// - It reaches X's ingress only across those two discovered edges.
+// - A rumor that P publishes at ttl 0 moves by repair alone, so it reaches X's
+//   ingress only across those two discovered edges.
 tb_scenario! {
 	name: cluster_peer_discovery_bootstraps_from_seed,
 	spec: ClusterPeerDiscoverySpec,
@@ -3174,7 +3189,10 @@ async fn start_reconcile_server(
 				orders.store(frame.metadata().order(), Ordering::SeqCst);
 				rounds.fetch_add(1, Ordering::SeqCst);
 
-				reply_frame(frame.metadata().id(), GossipWant { want: Vec::new(), pex })
+				Ok(Some(compose! {
+					V0: id: frame.metadata().id(),
+						message: GossipWant { want: Vec::new(), pex }
+				}?))
 			}
 		}
 	};
@@ -3275,8 +3293,8 @@ impl PeerStore for RecordingPeerStore {
 /// The beat of [`recording_conf`], on its manual clock.
 const RECORDING_BEAT: Duration = Duration::from_millis(100);
 
-/// A gateway conf on `clock` whose peer table persists to `store`, with
-/// `peers` as its peer trust and a beat every [`RECORDING_BEAT`] of the
+/// A gateway configuration on `clock` whose peer table persists to `store`,
+/// with `peers` as its peer trust and a beat every [`RECORDING_BEAT`] of the
 /// clock.
 fn recording_conf(
 	certs: &ClusterTestCerts,
@@ -3553,13 +3571,20 @@ impl GossipJournal for FaultSwitchJournal {
 		signer: &[u8],
 		digest: GossipDigest,
 		rumor: &Frame,
+		issued_at: UnixMillis,
 		now: UnixMillis,
 	) -> Result<Admission, ClusterError> {
-		self.inner.record(signer, digest, rumor, now)
+		self.inner.record(signer, digest, rumor, issued_at, now)
 	}
 
-	fn witness(&self, signer: &[u8], digest: GossipDigest, now: UnixMillis) -> Result<Admission, ClusterError> {
-		self.inner.witness(signer, digest, now)
+	fn witness(
+		&self,
+		signer: &[u8],
+		digest: GossipDigest,
+		issued_at: UnixMillis,
+		now: UnixMillis,
+	) -> Result<Admission, ClusterError> {
+		self.inner.witness(signer, digest, issued_at, now)
 	}
 
 	fn seen(&self, digest: &GossipDigest, now: UnixMillis) -> Result<bool, ClusterError> {

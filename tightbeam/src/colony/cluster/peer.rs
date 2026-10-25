@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use super::runtime::VerifiedControlFrame;
 use super::{
-	AdmittedDial, ClusterConfig, Party, PeerConfig, PeerHint, PheromoneConfig, RelayRoute, ServletEntry, SharedId,
+	AdmittedDial, ClusterConfig, DialTarget, Party, PeerConfig, PeerHint, PheromoneConfig, RelayRoute, ServletEntry,
+	SharedId,
 };
 use crate::colony::common::ColonyResource;
 use crate::colony::common::IssuedAt;
@@ -74,7 +75,7 @@ impl HopBudget {
 		Self { remaining: hops.min(max_hops), relayed: hops != DEFAULT_HOP_BUDGET }
 	}
 
-	/// Spends one forward, saturating at zero.
+	/// Spends one forward and stops at zero.
 	#[must_use]
 	pub fn spend(self) -> Self {
 		Self { remaining: self.remaining.saturating_sub(1), relayed: self.relayed }
@@ -138,7 +139,8 @@ impl HopBudget {
 		ClusterWorkRequest { servlet_type, payload, hops_remaining: self.spend().wire() }
 	}
 
-	/// A budget clamped to the default cap, for tests that pick a wire count.
+	/// A budget under a cap of the sentinel [`DEFAULT_HOP_BUDGET`], so the wire
+	/// count a test picks passes unclamped.
 	#[cfg(test)]
 	pub(crate) fn for_test(wire: u8) -> Self {
 		Self::from_wire(WireHopBudget::new(wire), DEFAULT_HOP_BUDGET)
@@ -155,7 +157,7 @@ pub struct AdmittedPeerAd {
 	/// Claimed gateway socket every slate entry dials, parsed and admitted
 	/// once.
 	///
-	/// The slate entries carry this same value, so a scoring lookup and a
+	/// The slate entries carry this same value, so a score lookup and a
 	/// stored route agree on one socket, and the discovery hint carries the
 	/// proof the dial policy admitted it.
 	pub(super) dial: AdmittedDial,
@@ -171,8 +173,8 @@ pub struct AdmittedPeerAd {
 /// The slate reconciles under the composite `origin NUL relay` bucket,
 /// so a relay trail outlives a replacement of the origin's direct slate. An
 /// empty direct advertisement removes it with the direct routes. A trail also
-/// leaves when the relay it dials is evicted, and an idle trail decays away by
-/// staleness pruning.
+/// leaves when the relay it dials is evicted, and the stale-trail prune drops
+/// an idle trail.
 pub struct RelayTrail {
 	/// The composite `origin NUL relay` bucket this slate reconciles under.
 	pub(super) bucket: SharedId,
@@ -186,7 +188,7 @@ pub struct RelayTrail {
 }
 
 impl AdmittedPeerAd {
-	/// Admits a wire advertisement, failing closed with a refusal status.
+	/// Admits a wire advertisement, or fails closed with a refusal status.
 	///
 	/// The checks run in this order:
 	///
@@ -199,6 +201,10 @@ impl AdmittedPeerAd {
 	///
 	/// Caps and local-route conflicts are registry policy under
 	/// [`super::ServletRegistry::reconcile_peer_slate`].
+	///
+	/// # Errors
+	///
+	/// - [`TransitStatus::PermissionDenied`] -- a check above refuses the advertisement.
 	///
 	/// [`TrustPlanes::peer_identity`]: super::TrustPlanes::peer_identity
 	pub(crate) fn admit(
@@ -218,7 +224,7 @@ impl AdmittedPeerAd {
 		let peer_hive_id = verified.fingerprint().into_shared();
 
 		// Federation is a colony operation, so both this gateway and the
-		// advertising peer must carry a valid colony URN SAN. A certificate
+		// advertiser must carry a valid colony URN SAN. A certificate
 		// without one still serves general transport and work, but it grants
 		// no membership.
 		let Some(flood) = conf.flood() else {
@@ -244,17 +250,17 @@ impl AdmittedPeerAd {
 	///
 	/// # Failover
 	///
-	/// Routing then holds two trails per type: the direct trail that dials
-	/// the origin, and a relay trail through the relaying peer.
-	/// Pheromone feedback can therefore fail over to the relay when
-	/// the origin is unreachable.
+	/// The route registry then holds two trails per type: the direct trail
+	/// that dials the origin, and a relay trail through the peer that relayed
+	/// the advertisement. Pheromone feedback can therefore fail over to the
+	/// relay when the origin is unreachable.
 	///
 	/// # Bucket
 	///
 	/// The trails reconcile under their own `origin NUL relay` bucket
 	/// (`ServletRegistry::reconcile_relay_trail`), so a replacement of the
 	/// origin's direct slate leaves the fallback in place. An empty direct
-	/// advertisement removes both.
+	/// advertisement removes the direct routes and the fallback together.
 	#[must_use]
 	pub fn relay_trail(
 		&self,
@@ -269,21 +275,21 @@ impl AdmittedPeerAd {
 			return None;
 		}
 
+		// The trails dial one relay socket, so they share one rendering of it.
 		let bucket = ServletEntry::relay_bucket(&self.peer_hive_id, relay_id);
+		let target = DialTarget::of_claimed(relay_dial);
+		let PheromoneConfig { initial_pheromone, abandonment_limit, .. } = *pheromone;
 		let slate: Vec<ServletEntry> = self
 			.slate
 			.iter()
 			.map(|entry| {
-				ServletEntry::peer_relay(
-					RelayRoute {
-						origin_id: Arc::clone(&self.peer_hive_id),
-						relay_id: Arc::clone(relay_id),
-						servlet_type: Arc::clone(entry.servlet_type()),
-						dial: relay_dial,
-					},
-					pheromone.initial_pheromone,
-					pheromone.abandonment_limit,
-				)
+				let route = RelayRoute {
+					origin_id: Arc::clone(&self.peer_hive_id),
+					relay_id: Arc::clone(relay_id),
+					servlet_type: Arc::clone(entry.servlet_type()),
+					dial: relay_dial,
+				};
+				ServletEntry::peer_relay_sharing(route, &target, initial_pheromone, abandonment_limit)
 			})
 			.collect();
 
@@ -309,7 +315,7 @@ impl AdmittedPeerAd {
 	}
 }
 
-/// Wire-level advertisement checks, which run without the registry lock.
+/// Wire-level advertisement checks, which run outside the registry lock.
 fn peer_advertisement_wire_ok(
 	gateway_addr: impl AsRef<[u8]>,
 	types: impl AsRef<[Urn<'static>]>,
@@ -355,7 +361,9 @@ fn peer_advertisement_wire_ok(
 /// - A certificate authority in the store admits no gateway, because the
 ///   store must hold the certificate of each key that signs a frame.
 /// - A gateway with no peer plane dials its peers on the hive pool, so its
-///   hive trust store is the list (`ClusterTlsConfig::peer_dial_trust`).
+///   hive trust store is the list ([`ClusterTlsConfig::peer_dial_trust`]).
+///
+/// [`ClusterTlsConfig::peer_dial_trust`]: super::ClusterTlsConfig::peer_dial_trust
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Flood<'a> {
 	namespace: &'a ColonyNamespace,
@@ -472,7 +480,7 @@ impl ColonyNamespace {
 pub(crate) trait ColonyCertificate {
 	/// Stable peer key: the fingerprint of the certificate under digest `D`.
 	///
-	/// Slates and misbehavior scoring key on this fingerprint of the
+	/// Slates and misbehavior scores key on this fingerprint of the
 	/// certificate that [`TrustPlanes::peer_identity`] resolves, so one peer
 	/// keeps one identity across every `gateway_addr` it advertises. The
 	/// answer is `None` when the certificate yields no fingerprint, so an
@@ -532,7 +540,7 @@ mod tests {
 	/// One socket spelled two ways is one entry, so an address that passes the
 	/// hint gate also passes the advertisement gate. An ad that spells its
 	/// socket verbosely installs routes under the canonical key, so a later
-	/// scoring or eviction lookup by that address finds them.
+	/// score or eviction lookup by that address finds them.
 	#[test]
 	fn an_ad_spelling_its_socket_verbosely_routes_under_the_canonical_key() {
 		let verbose = address("[0:0:0:0:0:0:0:1]:9000");
@@ -565,7 +573,7 @@ mod tests {
 		let slate = test_pheromone().peer_slate(&hive, AdmittedDial::fixture("127.0.0.1:9000"), &[ping_type()]);
 		assert_eq!(slate.len(), 1);
 		assert_eq!(slate[0].route_kind(), RouteKind::Peer);
-		assert_eq!(slate[0].dial_target().route_bytes().as_ref(), b"127.0.0.1:9000");
+		assert_eq!(slate[0].dial_target().as_bytes(), b"127.0.0.1:9000");
 		assert_eq!(slate[0].owner_id().as_ref(), hive.as_ref());
 		assert_eq!(slate[0].route_key()[0], 1);
 		assert_eq!(slate[0].route_key()[32], 0);
@@ -588,7 +596,7 @@ mod tests {
 		assert_eq!(hint.peer_id.as_deref(), Some(origin.as_ref()));
 	}
 
-	/// The fixture socket where peers dial a relaying gateway.
+	/// The fixture socket at which peers dial the relay gateway.
 	fn relay_dial() -> AdmittedDial {
 		AdmittedDial::fixture("127.0.0.1:9001")
 	}
@@ -628,7 +636,7 @@ mod tests {
 		assert_eq!(trail.slate[0].bucket().as_ref(), expected_bucket.as_slice());
 		assert_eq!(trail.slate[0].owner_id().as_ref(), origin.as_ref());
 		assert_eq!(trail.slate[0].relay_id().map(|id| id.as_ref()), Some(relay.as_ref()));
-		assert_eq!(trail.slate[0].dial_target().route_bytes().as_ref(), b"127.0.0.1:9001");
+		assert_eq!(trail.slate[0].dial_target().as_bytes(), b"127.0.0.1:9001");
 	}
 
 	#[test]

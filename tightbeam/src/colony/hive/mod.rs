@@ -7,7 +7,7 @@
 //! - [`HiveConfig`] carries the scaling, control-plane, and identity settings.
 //! - [`HiveContext`] carries calls between sibling servlets in one hive.
 //! - [`ServletRegistry`] stores the registered servlets.
-//! - [`gates`] holds the admission gates for cluster commands.
+//! - [`gates`] holds the hive's admission gates: cluster command security, backpressure, and the peer list.
 
 pub mod error;
 pub mod gates;
@@ -17,7 +17,7 @@ pub use runtime::{HiveContextImpl, HiveRuntime};
 
 pub use crate::colony::common::{
 	ActivateServletRequest, ActivateServletResponse, ClusterCommand, ClusterCommandResponse, ClusterStatus,
-	ColonyNamespace, ColonyResource, HeartbeatParams, HeartbeatResult, HiveManagementRequest, HiveManagementResponse,
+	ColonyNamespace, ColonyResource, HeartbeatParams, HeartbeatResult, HiveManagement, HiveManagementOutcome,
 	InstanceMetrics, ListServletsParams, ListServletsResult, LoadBalancer, PowerOfTwoChoices, RegisterHiveRequest,
 	RegisterHiveResponse, RoundRobin, ScaleConfigRefusal, ScaleCooldowns, ScalingDecision, ScalingMetrics,
 	ServletAddressUpdate, ServletAddressUpdateResponse, ServletInfo, ServletScaleConfig, SpawnServletParams,
@@ -58,8 +58,8 @@ pub use crate::crypto::x509::store::CertificateTrust;
 
 /// The spawner that a hive calls to add one servlet instance on a scale-up.
 ///
-/// The spawner receives the hive's trace collector and resolves to a new,
-/// running instance of its servlet type.
+/// The spawner receives the hive's trace collector and resolves to a new
+/// instance of its servlet type that already runs.
 pub type SpawnerFn = Arc<
 	dyn Fn(Arc<TraceCollector>) -> Pin<Box<dyn Future<Output = Result<Box<dyn ServletBox>, TightBeamError>> + Send>>
 		+ Send
@@ -146,7 +146,7 @@ pub trait ServletBox: Send + Sync {
 
 /// A registered servlet with its spawner function for auto-scaling.
 pub struct ServletRegistration {
-	/// The running servlet instance that the hive registry stores.
+	/// The live servlet instance that the hive registry stores.
 	pub servlet: Box<dyn ServletBox>,
 	/// The closure that creates another instance of this servlet type.
 	pub spawner: SpawnerFn,
@@ -287,12 +287,12 @@ pub trait ServletRegistry: Send + Sync {
 	fn keys(&self) -> Vec<Vec<u8>>;
 }
 
-/// The shipped [`ServletRegistry`]: one `HashMap` behind a mutex.
+/// The shipped [`ServletRegistry`]: one [`HashMap`] behind a mutex.
 ///
 /// Every write under the lock is one `HashMap` insert, remove, or drain,
 /// so a thread that panicked while it held the guard left a whole map
-/// behind it. The registry therefore recovers a poisoned lock and keeps
-/// serving, and every method answers.
+/// behind it. The registry therefore recovers a poisoned lock and continues
+/// to serve, so every method answers.
 pub struct HashMapRegistry {
 	inner: Mutex<HashMap<Vec<u8>, ServletRegistration>>,
 }
@@ -520,7 +520,7 @@ pub trait Hive: Sized + Send + Sync {
 		cluster_addr: &<Self::Protocol as Protocol>::Address,
 	) -> impl Future<Output = Result<RegisterHiveResponse, TightBeamError>> + Send;
 
-	/// Drains the hive for a graceful shutdown.
+	/// Drains the in-flight commands of the hive, then stops its servlets.
 	///
 	/// The hive refuses every new command except the heartbeat and stops its
 	/// background beats. It then waits until no command is in flight, so an
@@ -845,8 +845,8 @@ impl Default for HiveScalingConfig {
 pub struct HiveControlConfig {
 	/// The utilization threshold that trips manage-path backpressure.
 	pub backpressure_threshold: BasisPoints,
-	/// The longest wait for a graceful drain, after which the remaining
-	/// servlets stop.
+	/// The longest wait of a drain for in-flight commands, after which the
+	/// registered servlets stop.
 	pub drain_timeout: Duration,
 	/// The anti-entropy interval of the servlet slate re-announce.
 	///

@@ -14,7 +14,8 @@ use crate::cms::signed_data::SignerIdentifier;
 use crate::crypto::policy::VerificationPolicy;
 use crate::crypto::x509::error::CertificateValidationError;
 use crate::crypto::x509::policy::CertificateValidation;
-use crate::crypto::x509::{Certificate, ErasedSigning, PeerCertificate};
+use crate::crypto::x509::{CanonicalKey, Certificate, ErasedSigning, PeerCertificate};
+use crate::der::Decode;
 use crate::spki::SubjectPublicKeyInfoOwned;
 
 #[cfg(feature = "signature")]
@@ -315,6 +316,45 @@ pub trait CertificateTrust: CertificateValidation + Debug + Send + Sync {
 	/// [contract](CertificateTrust#contract).
 	fn find_by_public_key(&self, spki: &SubjectPublicKeyInfoOwned) -> Option<&Certificate>;
 
+	/// Find a certificate by `key`, the canonical form of its key, which is
+	/// the form a session holds of the peer it proved.
+	///
+	/// - The default decodes the DER of `key` and calls [`Self::find_by_public_key`].
+	/// - The built-in store finds `key` in its key index with no decode, so it
+	///   answers at most what the default answers.
+	/// - Under a store whose [`KeyCurves`] differ from [`KeyCurves::HOUSE`],
+	///   the canonical form of an encoding off its curve depends on the curves
+	///   that read it, so the built-in store can find no certificate where the
+	///   default finds one. That narrower answer fails closed, because a key
+	///   that names no certificate gets no trust.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::crypto::policy::Secp256k1Policy;
+	/// use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
+	/// use tightbeam::crypto::x509::CanonicalKey;
+	/// use tightbeam::testing::fixtures::{TestCertificate, TestKey};
+	///
+	/// let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+	/// let builder = CertificateTrustBuilder::from(Secp256k1Policy::default());
+	/// let store = builder.with_certificate(certificate.clone())?.build();
+	///
+	/// // The canonical form of the key names its certificate.
+	/// let key = CanonicalKey::of(&certificate.tbs_certificate.subject_public_key_info)?;
+	/// assert_eq!(store.find_by_canonical_key(&key), Some(&certificate));
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	///
+	/// [`KeyCurves`]: crate::crypto::x509::KeyCurves
+	/// [`KeyCurves::HOUSE`]: crate::crypto::x509::KeyCurves::HOUSE
+	fn find_by_canonical_key(&self, key: &CanonicalKey) -> Option<&Certificate> {
+		// The DER of a canonical key is an encoding the crate wrote, and a key
+		// whose DER fails to decode names no certificate.
+		let spki = SubjectPublicKeyInfoOwned::from_der(key.as_der()).ok()?;
+		self.find_by_public_key(&spki)
+	}
+
 	/// Verify a certificate chain with partial RFC 5280 §6.1 path validation,
 	/// and return the trust anchor at which its path ends.
 	///
@@ -332,9 +372,9 @@ pub trait CertificateTrust: CertificateValidation + Debug + Send + Sync {
 	/// 2. Expiry validation for all certificates (RFC 5280 §6.1.3(a)(2)).
 	/// 3. Rejection of unprocessed critical extensions (RFC 5280 §4.2, §6.1.3(f)).
 	/// 4. Issuer and subject DN chaining (RFC 5280 §6.1.3(a)(4)).
-	/// 5. Cryptographic signature verification (RFC 5280 §6.1.3(a)(1)).
-	/// 6. Issuer `basicConstraints.cA`, `keyUsage.keyCertSign`, and
-	///    `pathLenConstraint` (RFC 5280 §6.1.4(k),(l),(m),(n)).
+	/// 5. Issuer `basicConstraints.cA` and `keyUsage.keyCertSign` (RFC 5280 §6.1.4(k),(n)).
+	/// 6. Cryptographic signature verification (RFC 5280 §6.1.3(a)(1)).
+	/// 7. Issuer `pathLenConstraint` (RFC 5280 §6.1.4(l),(m)).
 	///
 	/// # Scope
 	///
@@ -515,9 +555,9 @@ pub trait CertificateTrust: CertificateValidation + Debug + Send + Sync {
 
 /// A builder of trust stores.
 ///
-/// The builder validates structural correctness, which is expiry and issuer and
-/// subject chaining, on each add. The built store runs cryptographic
-/// verification at run time.
+/// The builder validates structural correctness: expiry on each add, and issuer
+/// and subject chaining on each chain it adds. The built store runs
+/// cryptographic verification at run time.
 pub trait TrustBuilder: Sized {
 	/// The trust store type that this builder produces.
 	type Store: CertificateTrust;
@@ -642,6 +682,15 @@ struct HeldCertificate {
 
 #[cfg(feature = "std")]
 impl HeldCertificate {
+	/// The serial number in hex and the issuer of this certificate, the pair
+	/// that names one certificate (RFC 5280 §4.1.2.2), as a collision error
+	/// names the holder of a key.
+	fn holder(&self) -> String {
+		let tbs = &self.certificate.tbs_certificate;
+		let serial = to_hex(tbs.serial_number.as_bytes());
+		format!("serial number {serial} of issuer {}", tbs.issuer)
+	}
+
 	/// The certification path of this certificate, which `held` holds under
 	/// `fingerprint`: the issuers the walk finds among `held`, anchor first,
 	/// then this certificate.
@@ -908,8 +957,8 @@ impl CertificateTrustStore {
 	/// 8. Revocation through the configured [`RevocationChecker`] ([RFC 5280 §6.1.3(a)(3)][rfc5280-6.1.3]).
 	/// 9. `pathLenConstraint` ([RFC 5280 §6.1.4(l),(m)][rfc5280-6.1.4]).
 	///
-	/// Trust anchoring is the caller's responsibility. This routine validates
-	/// path structure and cryptography only.
+	/// The caller checks the trust anchor. This routine validates path
+	/// structure and cryptography only.
 	///
 	/// # Stricter than RFC 5280
 	///
@@ -925,9 +974,10 @@ impl CertificateTrustStore {
 	/// - Self-issued intermediates count against `pathLenConstraint`, although
 	///   §6.1.4(l) exempts them, because key rollover here re-issues the trust
 	///   store instead of cross-signing.
-	/// - The trust anchor itself is subject to checks 1, 2, 3, 4, 6, 8, and 9,
-	///   although §6.1.1(d) treats it as exempt input. An expired, revoked, or
-	///   non-CA pinned root fails closed.
+	/// - The trust anchor itself is subject to checks 1, 2, 3, 4, 8, and 9, and
+	///   to check 6 when it issues the next certificate of the path, although
+	///   §6.1.1(d) treats it as exempt input. An expired or revoked pinned root
+	///   fails closed, and so does a non-CA root that issues a certificate.
 	/// - Name chaining is DER byte equality instead of the case-insensitive
 	///   match of §7.1. Both encoders are in-house, and a binary comparison
 	///   leaves no canonicalization ambiguity.
@@ -965,8 +1015,8 @@ impl CertificateTrustStore {
 
 		// A sliding window checks each issuer and subject pair.
 		path.iter().zip(path.iter().skip(1)).try_for_each(|(issuer, cert)| {
-			// RFC 5280 §6.1.3(a)(4): the issuer DN must equal the preceding
-			// certificate's subject DN.
+			// RFC 5280 §6.1.3(a)(4): the issuer DN must equal the subject DN of
+			// the certificate before it.
 			if cert.tbs_certificate.issuer != issuer.tbs_certificate.subject {
 				return Err(CertificateValidationError::InvalidChain {
 					issuer: cert.tbs_certificate.issuer.to_string(),
@@ -1022,11 +1072,18 @@ impl CertificateTrustStore {
 	/// revocation checker admits, beside each issuer above it that the store
 	/// holds, as path validation checks them.
 	///
-	/// Each lookup consults the checker, so a certificate it revokes after the
-	/// build stops answering lookups at once.
+	/// Each lookup consults the checker, so a lookup finds no certificate the
+	/// checker revokes, even one it revokes after the build.
 	fn admits(&self, fingerprint: &Sha3Fingerprint) -> bool {
 		let path = self.paths.get(fingerprint);
 		path.is_some_and(|path| self.check_revocation(path).is_ok())
+	}
+
+	/// The certificate this store holds under `fingerprint`, while
+	/// [`Self::admits`] admits it.
+	fn admitted(&self, fingerprint: &Sha3Fingerprint) -> Option<&Certificate> {
+		let held = self.certificates.get(fingerprint)?;
+		self.admits(fingerprint).then_some(held.certificate.as_ref())
 	}
 }
 
@@ -1190,8 +1247,19 @@ impl CertificateTrust for CertificateTrustStore {
 	/// certificate and each issuer above it.
 	fn find_by_public_key(&self, spki: &SubjectPublicKeyInfoOwned) -> Option<&Certificate> {
 		let fingerprint = self.key_index.find(spki)?;
-		let held = self.certificates.get(fingerprint)?;
-		self.admits(fingerprint).then_some(held.certificate.as_ref())
+		self.admitted(fingerprint)
+	}
+
+	/// The store finds `key` in its key index as it stands, with no decode,
+	/// while its revocation checker admits the certificate and each issuer
+	/// above it.
+	///
+	/// A key that a handshake admits is a valid point or a key of another
+	/// algorithm, whose canonical form is one under every [`KeyCurves`], so
+	/// the store answers it as [`Self::find_by_public_key`] does.
+	fn find_by_canonical_key(&self, key: &CanonicalKey) -> Option<&Certificate> {
+		let fingerprint = self.key_index.get(key)?;
+		self.admitted(fingerprint)
 	}
 
 	fn to_policy_ref(&self) -> &dyn VerificationPolicy {
@@ -1201,9 +1269,9 @@ impl CertificateTrust for CertificateTrustStore {
 
 /// The builder of a [`CertificateTrustStore`].
 ///
-/// It validates expiry, issuer and subject chaining, and key identifiers on
-/// each add. The resulting store runs cryptographic verification at run time.
-/// It indexes each certificate twice:
+/// It validates expiry and key identifiers on each add, and issuer and subject
+/// chaining on each chain it adds. The built store runs cryptographic
+/// verification at run time. It indexes each certificate twice:
 ///
 /// - By its `subjectKeyIdentifier` value, which a `sid` resolves through (RFC 5652 §5.3).
 /// - By the identity of its key, which plane membership reads.
@@ -1316,9 +1384,13 @@ impl CertificateTrustBuilder {
 		}
 
 		let key_holder = self.key_index.find(spki);
-		if key_holder.is_some_and(|holder| *holder != fp) {
+		if let Some(holder) = key_holder.filter(|holder| **holder != fp) {
 			let public_key = to_hex(&spki.to_der()?);
-			return Err(CertificateValidationError::PublicKeyCollision { public_key });
+			// The key index and the held certificates gain each entry in one
+			// add, so the index names a held certificate.
+			let held = self.certificates.get(holder);
+			let holder = held.map(HeldCertificate::holder).unwrap_or_default();
+			return Err(CertificateValidationError::PublicKeyCollision { public_key, holder });
 		}
 
 		// The index is the one write that can fail, so it runs first. The
@@ -1423,6 +1495,7 @@ mod tests {
 	use crate::crypto::policy::Secp256k1Policy;
 	use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey, SigningKey};
 	use crate::crypto::sign::{CmsSigner, SignedContent, SigningIdentity};
+	use crate::crypto::x509::error::CertificateValidationError::PublicKeyCollision;
 	use crate::der::asn1::{ObjectIdentifier, OctetString};
 	use crate::der::oid::AssociatedOid;
 	use crate::der::Decode;
@@ -1536,7 +1609,8 @@ mod tests {
 		// The issuer walk lets a store of the root and the intermediate trust
 		// the leaf.
 		(StoreCerts::RootAndIntermediate, EvalTarget::Leaf, true),
-		// The root alone cannot verify the leaf without the intermediate.
+		// A store of the root alone holds no issuer of the leaf, so the walk
+		// reaches no anchor.
 		(StoreCerts::Root, EvalTarget::Leaf, false),
 		// An empty store trusts nothing.
 		(StoreCerts::None, EvalTarget::Leaf, false),
@@ -1764,7 +1838,7 @@ mod tests {
 	/// Cases for the RFC 5280 §6.1.4 path constraints.
 	///
 	/// Each case replaces the root's extensions, then expects `verify_chain` to
-	/// reject the otherwise-valid chain with the mapped error.
+	/// reject the otherwise-valid chain with the error that the case names.
 	const ISSUER_CONSTRAINT_CASES: &[(bool, bool, Option<u8>, CertificateValidationError)] = &[
 		(false, true, None, CertificateValidationError::IssuerNotCa),
 		(true, false, None, CertificateValidationError::MissingKeyCertSign),
@@ -2359,6 +2433,27 @@ mod tests {
 		let builder = CertificateTrustBuilder::from(Secp256k1Policy::default()).with_certificate(first)?;
 		let refused = builder.with_certificate(second);
 		assert!(matches!(refused, Err(CertificateValidationError::PublicKeyCollision { .. })));
+		Ok(())
+	}
+
+	/// A key collision names the certificate that holds the key by its serial
+	/// number and its issuer (RFC 5280 §4.1.2.2).
+	#[test]
+	fn a_key_collision_names_the_holder_by_serial_and_issuer() -> TestResult {
+		let key = TestKey::insecure_fixed_signing();
+		let mut first = TestCertificate::self_signed(&key);
+		first.tbs_certificate.issuer = Name::from_str("CN=held")?;
+		let mut second = TestCertificate::self_signed(&key);
+		second.tbs_certificate.extensions = None;
+		second.tbs_certificate.serial_number = SerialNumber::new(&[0x2a])?;
+		second.tbs_certificate.issuer = Name::from_str("CN=refused")?;
+
+		let builder = CertificateTrustBuilder::from(Secp256k1Policy::default()).with_certificate(first)?;
+		let refused = builder.with_certificate(second);
+
+		let expected = "serial number 01 of issuer CN=held";
+		let names_holder = matches!(refused, Err(PublicKeyCollision { holder, .. }) if holder == expected);
+		assert!(names_holder);
 		Ok(())
 	}
 

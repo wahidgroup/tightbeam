@@ -9,14 +9,41 @@ use crate::utils::BasisPoints;
 
 /// The endpoint a route dials, parsed once where the route is built.
 ///
-/// Two targets are equal when they name one endpoint, so two spellings of
-/// one socket compare equal wherever routes are compared (CWE-706).
-/// [`Self::route_bytes`] derives the rendering a dial or a gossip entry
-/// carries from the endpoint on demand, so every rendering agrees with it.
+/// Its representation is private, so every target comes from an address a
+/// hive registered or from a socket a peer claimed that the dial policy
+/// admitted. Two targets are equal when they name one endpoint, so two
+/// spellings of one socket compare equal wherever routes are compared
+/// (CWE-706).
+///
+/// # Examples
+///
+/// A peer route dials the gateway socket its dial policy admitted:
+///
+/// ```
+/// use core::net::SocketAddr;
+/// use std::sync::Arc;
+///
+/// use tightbeam::colony::cluster::{PeerConfig, PeerRoute, ServletEntry};
+///
+/// let socket: SocketAddr = "192.0.2.7:9000".parse()?;
+/// let dial = PeerConfig::default().admit_dial(socket)?;
+/// let route = PeerRoute { peer_id: Arc::from(&b"peer"[..]), servlet_type: Arc::from(&b"ping"[..]), dial };
+/// let entry = ServletEntry::peer(route, 100, 3);
+///
+/// let target = entry.dial_target();
+/// assert_eq!(target.as_socket().map(|socket| socket.socket()), Some(socket));
+/// assert_eq!(target.as_bytes(), b"192.0.2.7:9000");
+/// # Ok::<(), Box<dyn core::error::Error>>(())
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DialTarget {
-	/// A socket, claimed by a peer gateway or registered by a hive.
-	Socket(PeerAddress),
+pub struct DialTarget(Endpoint);
+
+/// What a [`DialTarget`] names, beside the bytes it renders as.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Endpoint {
+	/// A socket, claimed by a peer gateway or registered by a hive, with its
+	/// canonical rendering.
+	Socket { address: PeerAddress, rendering: SharedId },
 	/// A servlet or control address a hive registered that names no socket,
 	/// such as an address of a protocol with its own address scheme. It
 	/// compares by its bytes.
@@ -28,28 +55,106 @@ impl DialTarget {
 	/// control plane.
 	///
 	/// An address that spells a socket becomes that socket, so it compares
-	/// with a claimed peer socket. Any other address is a name the dialing
-	/// protocol resolves, kept as the hive wrote it.
+	/// with a claimed peer socket. Any other address is a name the protocol
+	/// resolves when it dials, kept as the hive wrote it.
 	pub(in crate::colony) fn of_registered(address: &SharedId) -> Self {
 		match PeerAddress::try_from(address.as_ref()) {
-			Ok(socket) => Self::Socket(socket),
-			Err(NotASocket) => Self::Named(Arc::clone(address)),
+			Ok(socket) => Self::of_socket(socket),
+			Err(NotASocket) => Self(Endpoint::Named(Arc::clone(address))),
+		}
+	}
+
+	/// A socket a peer gateway claimed, which this gateway's dial policy
+	/// admitted as `dial`.
+	pub(crate) fn of_claimed(dial: AdmittedDial) -> Self {
+		Self::of_socket(dial.address())
+	}
+
+	/// The target of `dial`, which shares the rendering of this target when
+	/// this target names the socket `dial` admitted.
+	///
+	/// The entries of one slate dial one socket, so they share one rendering
+	/// of it. A target of another socket renders `dial` on its own, so an
+	/// entry always dials the socket its own proof admitted.
+	fn sharing(&self, dial: AdmittedDial) -> Self {
+		let address = dial.address();
+		if self.as_socket() == Some(&address) {
+			return self.clone();
+		}
+
+		Self::of_socket(address)
+	}
+
+	/// The target of `address`, rendered through
+	/// [`PeerAddress::route_bytes`], the one home for the spelling.
+	fn of_socket(address: PeerAddress) -> Self {
+		let rendering = address.route_bytes();
+		Self(Endpoint::Socket { address, rendering })
+	}
+
+	/// The socket this target names, when it names one.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use core::net::SocketAddr;
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::colony::cluster::{PeerConfig, PeerRoute, ServletEntry};
+	///
+	/// let socket: SocketAddr = "192.0.2.7:9000".parse()?;
+	/// let dial = PeerConfig::default().admit_dial(socket)?;
+	/// let route = PeerRoute { peer_id: Arc::from(&b"peer"[..]), servlet_type: Arc::from(&b"ping"[..]), dial };
+	/// let entry = ServletEntry::peer(route, 100, 3);
+	///
+	/// let named = entry.dial_target().as_socket().ok_or("a peer route dials a socket")?;
+	/// assert_eq!(named.socket(), socket);
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	#[must_use]
+	pub fn as_socket(&self) -> Option<&PeerAddress> {
+		match &self.0 {
+			Endpoint::Socket { address, .. } => Some(address),
+			Endpoint::Named(_) => None,
 		}
 	}
 
 	/// The bytes a caller gossips or displays this target by.
 	///
-	/// A socket renders through [`PeerAddress::route_bytes`], the one home
-	/// for the spelling, and a name renders as the hive wrote it.
+	/// The target derives them from its endpoint where it is built, so they
+	/// agree with the endpoint. A socket renders through
+	/// [`PeerAddress::route_bytes`], and a name renders as the hive wrote it.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use core::net::SocketAddr;
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::colony::cluster::{PeerConfig, PeerRoute, ServletEntry};
+	///
+	/// let socket: SocketAddr = "[2001:db8::7]:9000".parse()?;
+	/// let dial = PeerConfig::default().admit_dial(socket)?;
+	/// let route = PeerRoute { peer_id: Arc::from(&b"peer"[..]), servlet_type: Arc::from(&b"ping"[..]), dial };
+	/// let entry = ServletEntry::peer(route, 100, 3);
+	///
+	/// assert_eq!(entry.dial_target().as_bytes(), b"[2001:db8::7]:9000");
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
 	#[must_use]
-	pub fn route_bytes(&self) -> SharedId {
-		match self {
-			Self::Socket(socket) => socket.route_bytes(),
-			Self::Named(name) => Arc::clone(name),
+	pub fn as_bytes(&self) -> &[u8] {
+		self.rendering()
+	}
+
+	/// The rendering as the shared bytes a route record holds.
+	fn rendering(&self) -> &SharedId {
+		match &self.0 {
+			Endpoint::Socket { rendering, .. } => rendering,
+			Endpoint::Named(name) => name,
 		}
 	}
 
-	/// This target as the dialing protocol's address type.
+	/// This target as the address type of the protocol that dials it.
 	///
 	/// This is the one place a dial becomes a protocol address:
 	///
@@ -62,10 +167,29 @@ impl DialTarget {
 	///
 	/// # Errors
 	///
-	/// - [`ClusterError::InvalidAddress`] -- the protocol does not address by this rendering.
+	/// - [`ClusterError::InvalidAddress`] -- the rendering is not UTF-8, or the
+	///   protocol does not address by it.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use core::net::SocketAddr;
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::colony::cluster::{PeerConfig, PeerRoute, ServletEntry};
+	///
+	/// let socket: SocketAddr = "192.0.2.7:9000".parse()?;
+	/// let dial = PeerConfig::default().admit_dial(socket)?;
+	/// let route = PeerRoute { peer_id: Arc::from(&b"peer"[..]), servlet_type: Arc::from(&b"ping"[..]), dial };
+	/// let entry = ServletEntry::peer(route, 100, 3);
+	///
+	/// let address: SocketAddr = entry.dial_target().protocol_address()?;
+	/// assert_eq!(address, socket);
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
 	pub fn protocol_address<A: FromStr>(&self) -> Result<A, ClusterError> {
-		let rendered = self.route_bytes();
-		let text = from_utf8(&rendered).map_err(|_| ClusterError::InvalidAddress(rendered.to_vec()))?;
+		let rendered = self.as_bytes();
+		let text = from_utf8(rendered).map_err(|_| ClusterError::InvalidAddress(rendered.to_vec()))?;
 		text.parse().map_err(|_| ClusterError::InvalidAddress(rendered.to_vec()))
 	}
 
@@ -75,8 +199,8 @@ impl DialTarget {
 	/// is unspecified, because a listener on the wildcard answers a connect
 	/// to any of the host's addresses on that port.
 	pub(super) fn same_endpoint(&self, other: &Self) -> bool {
-		let wildcard_on_one_port = match (self, other) {
-			(Self::Socket(this), Self::Socket(that)) => {
+		let wildcard_on_one_port = match (self.as_socket(), other.as_socket()) {
+			(Some(this), Some(that)) => {
 				let either_unspecified = this.is_unspecified() || that.is_unspecified();
 				either_unspecified && this.socket().port() == that.socket().port()
 			}
@@ -85,37 +209,22 @@ impl DialTarget {
 
 		self == other || wildcard_on_one_port
 	}
-
-	/// The socket this target names, when it names one.
-	#[must_use]
-	pub fn socket(&self) -> Option<PeerAddress> {
-		match self {
-			Self::Socket(socket) => Some(*socket),
-			Self::Named(_) => None,
-		}
-	}
-}
-
-impl From<AdmittedDial> for DialTarget {
-	fn from(dial: AdmittedDial) -> Self {
-		Self::Socket(dial.address())
-	}
 }
 
 /// How the load balancer reaches an entry.
 ///
-/// All kinds share the same pheromone scoring tables.
+/// All kinds share the same pheromone score tables.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RouteKind {
 	/// The route resolves to a servlet this gateway owns.
 	#[default]
 	Local,
-	/// The route resolves to a peer gateway that owns the servlet, reached
-	/// by forwarding.
+	/// The route resolves to a peer gateway that owns the servlet, and one
+	/// forward reaches it.
 	Peer,
-	/// The route resolves to a relaying peer gateway that must forward once
-	/// more to reach the owner, so selection requires a relay budget of at
-	/// least two.
+	/// The route resolves to a relay peer gateway that must forward once more
+	/// to reach the owner, so selection requires a relay budget of at least
+	/// two.
 	PeerRelay,
 }
 
@@ -148,7 +257,7 @@ pub(crate) enum RoutePlane {
 /// The fields are private, so the route-key discipline holds by
 /// construction:
 ///
-/// - [`ServletEntry::local`] keys by the servlet address it dials.
+/// - A local entry, which a hive's registration builds, keys by the servlet address it dials.
 /// - [`ServletEntry::peer`] keys by `peer_id NUL servlet_type`.
 /// - [`ServletEntry::peer_relay`] keys by `origin NUL relay NUL type`.
 #[derive(Debug)]
@@ -160,11 +269,11 @@ pub struct ServletEntry {
 	/// atomically. Local entries bucket by hive, peer entries by origin, and
 	/// relay entries by the composite `origin NUL relay`.
 	bucket: SharedId,
-	/// The owning identity, which is the local hive address or the
+	/// The identity that owns the route: the local hive address, or the
 	/// certificate fingerprint of the origin gateway that advertised the
 	/// type.
 	owner_id: SharedId,
-	/// The certificate fingerprint of the relaying gateway this entry dials,
+	/// The certificate fingerprint of the relay gateway this entry dials,
 	/// when the route is a relay trail.
 	relay_id: Option<SharedId>,
 	/// The endpoint that a forward dials. A local entry dials the endpoint
@@ -223,7 +332,7 @@ pub struct PeerRouteInfo {
 	/// The gateway socket this route dials, in its canonical spelling: the
 	/// origin's for a direct route and the relay's for a relay trail.
 	pub dial_addr: SharedId,
-	/// The certificate fingerprint that identifies the advertising peer.
+	/// The certificate fingerprint of the peer that advertised the type.
 	pub peer_id: SharedId,
 }
 
@@ -241,8 +350,11 @@ struct PeerIdentity {
 /// The fields are named rather than positional because three are
 /// [`SharedId`]. A caller that transposed a pair would install a route that
 /// dials the wrong place, and no check would refuse it.
+///
+/// The type is crate-private, so a local route comes from a hive's
+/// registration alone, after its signature check.
 #[derive(Debug, Clone)]
-pub struct LocalRoute {
+pub(crate) struct LocalRoute {
 	/// The address that reaches the servlet instance.
 	pub address: SharedId,
 	/// The bare servlet type this route answers.
@@ -256,8 +368,9 @@ pub struct LocalRoute {
 
 /// The three identities a peer route names.
 ///
-/// The fields are named for the same reason as those of [`LocalRoute`].
-/// The dial is an [`AdmittedDial`], so a peer route exists only for a
+/// The fields are named rather than positional because two are
+/// [`SharedId`], and a transposed pair would install a route under the wrong
+/// peer. The dial is an [`AdmittedDial`], so a peer route exists only for a
 /// gateway socket the dial policy admitted (CWE-918).
 #[derive(Debug, Clone)]
 pub struct PeerRoute {
@@ -271,7 +384,7 @@ pub struct PeerRoute {
 
 /// The four identities a relay trail names.
 ///
-/// The fields are named for the same reason as those of [`LocalRoute`], and
+/// The fields are named for the same reason as those of [`PeerRoute`], and
 /// the dial is admitted for the same reason as that of [`PeerRoute`].
 #[derive(Debug, Clone)]
 pub struct RelayRoute {
@@ -293,7 +406,7 @@ impl ServletEntry {
 	/// - A dial of the entry admits only the certificate `signer` names, so a
 	///   party that answers at the address under another identity receives no
 	///   frame (CWE-346).
-	pub fn local(route: LocalRoute, initial_pheromone: u64, abandonment_limit: u32) -> Self {
+	pub(crate) fn local(route: LocalRoute, initial_pheromone: u64, abandonment_limit: u32) -> Self {
 		let LocalRoute { address, servlet_type, hive_id, signer } = route;
 		let dial = DialTarget::of_registered(&address);
 
@@ -314,6 +427,18 @@ impl ServletEntry {
 
 	/// Creates a peer route whose key is `peer_id NUL servlet_type`.
 	pub fn peer(route: PeerRoute, initial_pheromone: u64, abandonment_limit: u32) -> Self {
+		let target = DialTarget::of_claimed(route.dial);
+		Self::peer_sharing(route, &target, initial_pheromone, abandonment_limit)
+	}
+
+	/// [`Self::peer`] for an entry of a slate whose entries share `target`,
+	/// the one rendering of the socket they dial.
+	pub(crate) fn peer_sharing(
+		route: PeerRoute,
+		target: &DialTarget,
+		initial_pheromone: u64,
+		abandonment_limit: u32,
+	) -> Self {
 		let PeerRoute { peer_id, servlet_type, dial } = route;
 		let identity = PeerIdentity {
 			bucket: Arc::clone(&peer_id),
@@ -322,11 +447,12 @@ impl ServletEntry {
 			route_kind: RouteKind::Peer,
 		};
 
+		let dial = target.sharing(dial);
 		Self::peer_kind(identity, servlet_type, dial, initial_pheromone, abandonment_limit)
 	}
 
 	/// Creates a relay trail for `origin_id`'s type. The trail dials the
-	/// relaying gateway `relay_id` instead of the origin.
+	/// relay gateway `relay_id` instead of the origin.
 	///
 	/// The entry buckets under the composite [`Self::relay_bucket`], so the
 	/// key is `origin NUL relay NUL servlet_type`. Three rules follow:
@@ -338,6 +464,18 @@ impl ServletEntry {
 	/// - A forward through this trail spends a hop at the relay, so selection
 	///   requires a budget that lets the relay forward once more.
 	pub fn peer_relay(route: RelayRoute, initial_pheromone: u64, abandonment_limit: u32) -> Self {
+		let target = DialTarget::of_claimed(route.dial);
+		Self::peer_relay_sharing(route, &target, initial_pheromone, abandonment_limit)
+	}
+
+	/// [`Self::peer_relay`] for an entry of a trail whose entries share
+	/// `target`, the one rendering of the relay socket they dial.
+	pub(crate) fn peer_relay_sharing(
+		route: RelayRoute,
+		target: &DialTarget,
+		initial_pheromone: u64,
+		abandonment_limit: u32,
+	) -> Self {
 		let RelayRoute { origin_id, relay_id, servlet_type, dial } = route;
 		let identity = PeerIdentity {
 			bucket: Self::relay_bucket(&origin_id, &relay_id),
@@ -346,6 +484,7 @@ impl ServletEntry {
 			route_kind: RouteKind::PeerRelay,
 		};
 
+		let dial = target.sharing(dial);
 		Self::peer_kind(identity, servlet_type, dial, initial_pheromone, abandonment_limit)
 	}
 
@@ -368,7 +507,7 @@ impl ServletEntry {
 	fn peer_kind(
 		identity: PeerIdentity,
 		servlet_type: SharedId,
-		dial: AdmittedDial,
+		dial: DialTarget,
 		initial_pheromone: u64,
 		abandonment_limit: u32,
 	) -> Self {
@@ -387,7 +526,7 @@ impl ServletEntry {
 			bucket,
 			owner_id,
 			relay_id,
-			dial: DialTarget::from(dial),
+			dial,
 			plane,
 			route_kind,
 			pheromone: AtomicU64::new(initial_pheromone),
@@ -409,8 +548,8 @@ impl ServletEntry {
 		&self.dial
 	}
 
-	/// Returns the owning identity, which is the local hive address or the
-	/// certificate fingerprint of the origin gateway that advertised the
+	/// Returns the identity that owns the route: the local hive address, or
+	/// the certificate fingerprint of the origin gateway that advertised the
 	/// type.
 	#[must_use]
 	pub fn owner_id(&self) -> &SharedId {
@@ -428,7 +567,7 @@ impl ServletEntry {
 		Owner { id: &self.owner_id, kind: self.route_kind }
 	}
 
-	/// Returns the certificate fingerprint of the relaying gateway this entry
+	/// Returns the certificate fingerprint of the relay gateway this entry
 	/// dials. It is `None` for local and direct peer routes.
 	#[must_use]
 	pub fn relay_id(&self) -> Option<&SharedId> {
@@ -436,8 +575,8 @@ impl ServletEntry {
 	}
 
 	/// The plane this entry dials on, and the party that must answer: the
-	/// signer the servlet's registration names for a local route, the
-	/// advertising gateway for a direct route, and the relay for a relay
+	/// signer the servlet's registration names for a local route, the gateway
+	/// that advertised the type for a direct route, and the relay for a relay
 	/// trail.
 	pub(crate) fn plane(&self) -> RoutePlane {
 		self.plane.clone()
@@ -458,7 +597,7 @@ impl ServletEntry {
 	/// Whether this entry is a peer route that dials `gateway`, either a
 	/// direct route to it or a relay trail through it.
 	pub(super) fn is_peer_route_to(&self, gateway: PeerAddress) -> bool {
-		self.route_kind.is_peer() && self.dial.socket() == Some(gateway)
+		self.route_kind.is_peer() && self.dial.as_socket() == Some(&gateway)
 	}
 
 	/// The count of consecutive failures toward abandonment.
@@ -470,8 +609,8 @@ impl ServletEntry {
 	/// The operator view of the peer route fields, when this entry is
 	/// peer-routed.
 	///
-	/// [`PeerRouteInfo::peer_id`] is the advertising origin for relay trails
-	/// too. The relay hop stays on [`ServletEntry::relay_id`].
+	/// [`PeerRouteInfo::peer_id`] is the origin that advertised the type, for
+	/// relay trails too. The relay hop stays on [`ServletEntry::relay_id`].
 	#[must_use]
 	pub fn peer_route_info(&self) -> Option<PeerRouteInfo> {
 		match self.route_kind {
@@ -479,7 +618,7 @@ impl ServletEntry {
 			RouteKind::Peer | RouteKind::PeerRelay => Some(PeerRouteInfo {
 				route_key: Arc::clone(&self.route_key),
 				servlet_type: Arc::clone(&self.servlet_type),
-				dial_addr: self.dial.route_bytes(),
+				dial_addr: Arc::clone(self.dial.rendering()),
 				peer_id: Arc::clone(&self.owner_id),
 			}),
 		}
@@ -506,8 +645,8 @@ impl ServletEntry {
 	/// Raises the pheromone after a successful request and clears the
 	/// failure streak.
 	///
-	/// One `fetch_update` keeps concurrent evaporation from discarding the
-	/// reinforcement.
+	/// One `fetch_update` applies the reinforcement, so a concurrent
+	/// evaporation cannot discard it.
 	pub fn reinforce(&self, quality: u64) {
 		let _ = self.pheromone.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
 			Some(current.saturating_add(quality).min(MAX_PHEROMONE))

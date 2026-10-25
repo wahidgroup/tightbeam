@@ -2,7 +2,7 @@
 //! and its mux routing.
 //!
 //! [`ClusterGateway`] owns the listener, heartbeat, evaporation, and advertise
-//! tasks. [`GatewayMuxService`] serves each incoming connection: it routes
+//! tasks. [`GatewayMuxService`] serves each inbound connection: it routes
 //! unary control frames to dispatch and splices streamed or duplex opens by
 //! servlet target.
 //!
@@ -25,6 +25,7 @@ mod verify;
 #[cfg(test)]
 pub(crate) use bounds::ColonyDigest;
 pub(crate) use bounds::{ColonyConfig, ColonyDialProtocol};
+pub use freshness::FreshnessWindow;
 pub(crate) use verify::{VerifiedControlFrame, VerifiedSignerId};
 mod work;
 
@@ -36,6 +37,7 @@ use self::bounds::{GatewayAcceptProtocol, GatewayColonyProtocol, GatewayRuntimeC
 use self::freshness::GatewayReplayGuard;
 use self::heartbeat::HiveBeat;
 use self::hop::{HivePlane, PeerPlane};
+use crate::colony::cluster::export::ExportScope;
 use crate::colony::cluster::peer::WireHopBudget;
 use crate::colony::cluster::{
 	Cluster, ClusterConfig, ClusterError, ClusterHeartbeat, HeartbeatConfig, HiveRegistry, HopBudget, PeerRouteInfo,
@@ -128,18 +130,15 @@ impl ClusterConfig {
 	///   <https://csrc.nist.gov/projects/risk-management/sp800-53-controls/release-search#/control?version=5.1&number=CM-6>
 	fn warn_export_posture(&self, trace: &TraceCollector) -> Result<(), TightBeamError> {
 		let federation_active = self.tls.peer_trust.is_some() || !self.peer.peers.is_empty();
-		match self.peer.exported_types.as_ref() {
-			None => {
-				if federation_active {
-					trace.event(CLUSTER_EXPORT_UNBOUNDED)?.emit();
-				}
+		if ExportScope::from(&self.peer).is_unbounded() {
+			if federation_active {
+				trace.event(CLUSTER_EXPORT_UNBOUNDED)?.emit();
 			}
-			Some(_) => {
-				let requires_certificate = self.tls.peer_authentication().requires_certificate();
-				let identity_captured = requires_certificate && self.tls.hive_trust.is_some();
-				if !identity_captured {
-					trace.event(CLUSTER_EXPORT_IDENTITY_UNAVAILABLE)?.emit();
-				}
+		} else {
+			let requires_certificate = self.tls.peer_authentication().requires_certificate();
+			let identity_captured = requires_certificate && self.tls.hive_trust.is_some();
+			if !identity_captured {
+				trace.event(CLUSTER_EXPORT_IDENTITY_UNAVAILABLE)?.emit();
 			}
 		}
 
@@ -147,8 +146,8 @@ impl ClusterConfig {
 	}
 }
 
-/// A running cluster gateway over the colony protocol `P` and the edge
-/// protocol `E`.
+/// A live cluster gateway over the colony protocol `P` and the edge protocol
+/// `E`.
 ///
 /// The gateway owns the accept, heartbeat, evaporation, and advertise tasks for
 /// the colony bind address and, when configured, a second edge accept plane.
@@ -307,8 +306,8 @@ where
 		config.warn_export_posture(&trace)?;
 
 		// The gateway decides its advertised address before any task spawns,
-		// so a federating gateway on the wildcard address refuses to start and
-		// closes every listener it bound.
+		// so a gateway that federates on the wildcard address refuses to start
+		// and closes every listener it bound.
 		let gateway_bytes: Vec<u8> = addr.clone().into();
 		let gateway_addr = config.peer.advertised_address(gateway_bytes)?;
 
