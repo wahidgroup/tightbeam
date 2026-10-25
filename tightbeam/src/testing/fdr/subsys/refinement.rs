@@ -565,9 +565,9 @@ where
 	/// that the process reaches can diverge.
 	///
 	/// [`Process::divergent_states`] decides each state once, and the search
-	/// reads that answer at each state and trace it reaches. It runs on
-	/// [`Self::bfs_with_callbacks`], so the divergences and the failures share
-	/// one depth bound, one set of limits, and one timeout.
+	/// reads that answer at each state and trace it reaches. It runs on the
+	/// traversal of the failures, so the divergences and the failures share one
+	/// depth bound, one set of limits, and one timeout.
 	fn compute_divergences(&mut self, process: &Process, max_depth: usize) -> (HashSet<Trace>, bool) {
 		let structure = process.structure_digest();
 		if let Some((cached, complete)) = self.cache.borrow().get_cached_divergences(structure) {
