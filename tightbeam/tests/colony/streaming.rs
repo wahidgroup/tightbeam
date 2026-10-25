@@ -21,8 +21,10 @@ use tightbeam::{
 	},
 	decode,
 	der::Sequence,
-	exactly, hive, servlet, tb_assert_spec, tb_scenario,
-	testing::{ClientEnv, HiveEnv, ServletEnv, SetupEnv},
+	exactly, hive,
+	instrumentation::events,
+	servlet, tb_assert_spec, tb_scenario,
+	testing::{fixtures::TestTrace, ClientEnv, HiveEnv, ServletEnv, SetupEnv},
 	trace::TraceCollector,
 	transport::{
 		client::{ConnectionBuilder, ConnectionPool, PoolConfig},
@@ -233,7 +235,7 @@ tb_assert_spec! {
 }
 
 // A servlet without a unary arm serves streams and refuses unary emits
-// with `Unimplemented` while the connection keeps serving.
+// with `Unimplemented` while the connection continues to serve.
 tb_scenario! {
 	name: stream_only_servlet_refuses_unary,
 	spec: StreamOnlyServletSpec,
@@ -580,4 +582,68 @@ tb_scenario! {
 			Ok(())
 		}
 	}
+}
+
+/// The steps of one unary request that a servlet serves over a multiplexed
+/// connection, with its gate verdict, in the order the request takes them.
+const SERVLET_STEPS: [Urn<'static>; 5] = [
+	events::ROUTE_STEP,
+	events::POLICY_EVAL,
+	events::GATE_ACCEPT,
+	events::HANDLER_ENTER,
+	events::HANDLER_EXIT,
+];
+
+/// The [`SERVLET_STEPS`] that the servlet's own trace records, in order, as it
+/// serves one unary request, under a trace whose config sets
+/// `enable_internal_detail` to `detail`. The client records into a trace of
+/// its own.
+async fn servlet_trail(detail: bool) -> Result<Vec<Urn<'static>>, TightBeamError> {
+	let servlet_trace = Arc::new(TestTrace::with_detail(detail));
+	let materials = ServerMaterials::generate();
+	let conf = streaming_servlet_conf(&materials)?;
+	let servlet = StreamingEchoServlet::start(Arc::clone(&servlet_trace), conf).await?;
+
+	let mut lease = pooled_lease(&TraceCollector::new(), &materials, servlet.addr().to_owned()).await?;
+	lease.emit(reply_frame("servlet-trail")?, None).await?;
+	servlet.stop();
+
+	Ok(TestTrace::trail(&servlet_trace, &SERVLET_STEPS))
+}
+
+/// A servlet's trace records the gate verdict of each request it serves, and,
+/// when its config sets the detail flag, the route step, the policy step, and
+/// the span of the handler around that verdict.
+#[tokio::test]
+async fn a_servlet_records_the_steps_of_its_requests_on_its_own_trace() -> Result<(), TightBeamError> {
+	let trails = [servlet_trail(true).await?, servlet_trail(false).await?];
+	assert_eq!(trails, [SERVLET_STEPS.to_vec(), vec![events::GATE_ACCEPT]]);
+	Ok(())
+}
+
+/// The gate verdicts, and the count of unary handler events, that `replaced`
+/// records as a servlet serves one request after `set_trace` installs
+/// `replaced` in place of the trace the servlet started with.
+async fn replaced_trace_records() -> Result<(Vec<Urn<'static>>, usize), TightBeamError> {
+	let materials = ServerMaterials::generate();
+	let conf = streaming_servlet_conf(&materials)?;
+	let servlet = StreamingEchoServlet::start(Arc::new(TraceCollector::new()), conf).await?;
+	let replaced = Arc::new(TraceCollector::new());
+	servlet.set_trace(Arc::clone(&replaced));
+
+	let mut lease = pooled_lease(&TraceCollector::new(), &materials, servlet.addr().to_owned()).await?;
+	lease.emit(reply_frame("replaced-trace")?, None).await?;
+	servlet.stop();
+
+	let handled = replaced.recorded(SERVLET_UNARY_HANDLED);
+	Ok((TestTrace::trail(&replaced, &[events::GATE_ACCEPT]), handled))
+}
+
+/// A servlet records each request that it serves after `set_trace` into the
+/// trace that the call installs: the gate verdict of the connection, and the
+/// event of the handler.
+#[tokio::test]
+async fn a_replaced_trace_records_the_requests_after_the_replacement() -> Result<(), TightBeamError> {
+	assert_eq!(replaced_trace_records().await?, (vec![events::GATE_ACCEPT], 1));
+	Ok(())
 }

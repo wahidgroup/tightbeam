@@ -59,9 +59,9 @@ pub fn to_priority(amount: &MonetaryAmount) -> MessagePriority {
 	let normalized = match &amount.currency {
 		b"JPY" => amount.value / 100,  // ~100 JPY = 1 USD
 		b"KRW" => amount.value / 1300, // ~1300 KRW = 1 USD
-		b"BHD" => amount.value * 26,   // 1 BHD = ~2.65 USD (but in fils, so * 10 * 2.65)
+		b"BHD" => amount.value * 26,   // 1 BHD = ~2.65 USD, counted in fils as * 10 * 2.65
 		b"KWD" => amount.value * 32,   // 1 KWD = ~3.25 USD
-		_ => amount.value,             // Default: assume 2-decimal currency like USD
+		_ => amount.value,             // Any other currency counts as 2-decimal, like USD
 	};
 
 	if normalized > 100_000 {
@@ -77,7 +77,7 @@ servlet! {
 	pub AuthorizationServlet<CreditTransferTransaction, EnvConfig = ()>,
 	protocol: TokioListener,
 	handle: |req, frame, ctx| async move {
-		let trace = ctx.trace();
+		let trace = &ctx.trace();
 		let harness = PaymentHarness::new(Arc::clone(trace));
 
 		if let Some(cached) = harness.check_dedup_cache(&frame)? {
@@ -124,7 +124,7 @@ servlet! {
 	pub CaptureServlet<CaptureTransaction, EnvConfig = ()>,
 	protocol: TokioListener,
 	handle: |req, frame, ctx| async move {
-		let trace = ctx.trace();
+		let trace = &ctx.trace();
 		let harness = PaymentHarness::new(Arc::clone(trace));
 
 		if let Some(cached) = harness.check_dedup_cache(&frame)? {

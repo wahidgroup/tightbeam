@@ -8,22 +8,28 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, sync::Arc};
 #[cfg(feature = "std")]
+use core::pin::pin;
+#[cfg(feature = "std")]
 use std::sync::Arc;
 
 use crate::policy::SessionContext;
 use crate::Frame;
 
-#[cfg(feature = "tokio")]
+#[cfg(feature = "std")]
 use crate::policy::TransitStatus;
+#[cfg(feature = "std")]
+use crate::transport::messaging::{GateAudit, HandlerAudit};
 #[cfg(pooled_mux)]
 use crate::transport::multiplex::MuxAcceptor;
 #[cfg(pooled_mux)]
 use crate::transport::multiplex::{CallContext, MuxService, ReplySink, StreamBody, StreamRoute};
-#[cfg(all(feature = "tokio", feature = "x509"))]
+#[cfg(feature = "std")]
 use crate::transport::state::EncryptedProtocolState;
 #[cfg(feature = "tokio")]
 use crate::transport::MessageCollector;
-#[cfg(feature = "tokio")]
+#[cfg(feature = "std")]
+use crate::utils::marker::MaybeSend;
+#[cfg(feature = "std")]
 use crate::TightBeamError;
 
 #[cfg(feature = "tokio")]
@@ -32,8 +38,8 @@ use self::server_runtime::rt::{ErrorSender, OkSender};
 #[doc(hidden)]
 pub type HandlerFuture = Pin<Box<dyn Future<Output = Result<Option<Frame>, crate::TightBeamError>> + Send>>;
 
-/// Connection-scoped handler: every invocation carries the session's
-/// authenticated peer context alongside the frame.
+/// A connection-scoped handler, which receives the session's authenticated
+/// peer context beside each frame.
 ///
 /// The wrapped closure arrives through [`SharedHandler::from`] or
 /// [`SharedHandler::from_context_blind`], so every value of this type
@@ -92,8 +98,7 @@ where
 /// - Mux negotiation serves the takeover.
 /// - Handshake state serves session capture.
 ///
-/// A blanket impl satisfies the trait, so a caller reaches it through the
-/// supertraits.
+/// A blanket impl covers every type that implements the supertraits.
 #[cfg(pooled_mux)]
 #[doc(hidden)]
 pub trait AcceptedConnection: MessageCollector + MuxAcceptor + EncryptedProtocolState + Send {}
@@ -108,7 +113,7 @@ pub trait AcceptedConnection: MessageCollector + EncryptedProtocolState + Send {
 #[cfg(all(feature = "tokio", not(pooled_mux), feature = "x509"))]
 impl<T: MessageCollector + EncryptedProtocolState + Send> AcceptedConnection for T {}
 
-/// Adapter that runs a [`SharedHandler`] as a unary-only service.
+/// An adapter that runs a [`SharedHandler`] as a unary-only service.
 ///
 /// The closure grammar of `server!` serves unary interactions, and the
 /// streaming kinds answer `Unimplemented` through the [`MuxService`]
@@ -128,9 +133,9 @@ impl MuxService for SharedHandlerService {
 }
 
 /// Report a service failure to the error channel and return the opaque
-/// `Internal` failure in its place, so the peer sees `Internal` once the
-/// channel holds the original error. When the server has no error channel, the
-/// original error returns unchanged.
+/// `Internal` failure in its place, so the original error goes to the
+/// application and the peer sees `Internal`. When the server has no error
+/// channel, the original error returns unchanged.
 #[cfg(pooled_mux)]
 async fn report_failure(errors: &mut Option<ErrorSender>, err: TightBeamError) -> TightBeamError {
 	match errors.as_mut() {
@@ -291,12 +296,12 @@ pub async fn serve_connection<T>(
 	}
 }
 
-/// Single-flight request and response loop over one connection.
+/// The single-flight request and response loop over one connection.
 ///
-/// Each turn collects a frame, answers it through `respond`, and sends the
-/// reply. A handler failure answers `Internal` so the peer can tell it
-/// apart from an accepted empty reply. The original error goes to the
-/// channel.
+/// Each turn collects a frame, answers it through
+/// [`SingleFlightAnswer::of`], and sends the reply. The error of a failed
+/// handler goes to the channel, and so does a collect or send failure, which
+/// also ends the loop.
 #[cfg(feature = "tokio")]
 async fn serve_single_flight<T, F, Fut>(
 	mut transport: T,
@@ -306,13 +311,13 @@ async fn serve_single_flight<T, F, Fut>(
 ) where
 	T: AcceptedConnection,
 	F: Fn(Frame, SessionContext) -> Fut,
-	Fut: Future<Output = Result<Option<Frame>, TightBeamError>>,
+	Fut: Future<Output = Result<Option<Frame>, TightBeamError>> + MaybeSend,
 {
 	// The session context fills after the first collected frame,
 	// because the lazy handshake is complete by then.
 	let mut session_slot: Option<SessionContext> = None;
 	loop {
-		let (frame, status) = match transport.collect_message().await {
+		let collected = match transport.collect_message().await {
 			Ok(result) => result,
 			Err(err) => {
 				if let Some(tx) = error_tx.as_mut() {
@@ -324,26 +329,13 @@ async fn serve_single_flight<T, F, Fut>(
 			}
 		};
 
-		// Prefer moving the frame out of the Arc. Deep-copy only when
-		// the inbound path still holds a shared reference.
-		let frame_owned = Arc::try_unwrap(frame).unwrap_or_else(|arc| (*arc).clone());
-		let (status, response) = if status == TransitStatus::Ok {
-			let session = session_slot.get_or_insert_with(|| capture_session(&transport)).clone();
-			match respond(frame_owned, session).await {
-				Ok(response) => (status, response),
-				Err(err) => {
-					if let Some(tx) = error_tx.as_mut() {
-						// The error channel belongs to the application, and a
-						// receiver that is gone wants no report.
-						let _ = tx.send(err.into()).await;
-					}
-
-					(TransitStatus::Internal, None)
-				}
-			}
-		} else {
-			(status, None)
-		};
+		let answer = SingleFlightAnswer::of(&mut transport, &mut session_slot, collected, &respond);
+		let SingleFlightAnswer { status, response, failure } = answer.await;
+		if let (Some(err), Some(tx)) = (failure, error_tx.as_mut()) {
+			// The error channel belongs to the application, and a receiver
+			// that is gone wants no report.
+			let _ = tx.send(err.into()).await;
+		}
 
 		match transport.send_response(status, response).await {
 			Ok(()) => {
@@ -365,9 +357,69 @@ async fn serve_single_flight<T, F, Fut>(
 	}
 }
 
-#[cfg(all(feature = "tokio", feature = "x509"))]
-fn capture_session<T: EncryptedProtocolState>(transport: &T) -> SessionContext {
-	SessionContext::capture(transport)
+/// The answer that one single-flight turn sends for a frame it collected, and
+/// the error of a handler that failed.
+///
+/// The async loop and the blocking `server!` loop answer each frame through
+/// [`SingleFlightAnswer::of`], the one home of a turn's decisions. The
+/// blocking loop expands in the caller's crate, so the type is public and
+/// hidden from the documented surface.
+#[cfg(feature = "std")]
+#[doc(hidden)]
+pub struct SingleFlightAnswer {
+	/// The status that the turn sends.
+	pub status: TransitStatus,
+	/// The frame that the turn sends with the status.
+	pub response: Option<Frame>,
+	/// The error of a handler that failed, which the turn answers with
+	/// [`TransitStatus::Internal`].
+	pub failure: Option<TightBeamError>,
+}
+
+#[cfg(feature = "std")]
+impl SingleFlightAnswer {
+	/// Answers `collected`, a frame and the status that a single-flight
+	/// connection collected it under.
+	///
+	/// - An admitted frame runs through `respond`, in the handler span of the
+	///   audit trail of `transport`, with the session that `session` holds.
+	///   The first admitted frame captures that session, because the lazy
+	///   handshake is complete by then.
+	/// - A handler that fails answers [`TransitStatus::Internal`], so the peer
+	///   can tell it apart from an accepted empty reply, and the answer keeps
+	///   its error.
+	/// - A refused frame answers its own status.
+	///
+	/// The handler future stays pinned in the turn, so the span wraps it by
+	/// reference and the turn moves it no further.
+	pub async fn of<T, F, Fut>(
+		transport: &mut T,
+		session: &mut Option<SessionContext>,
+		collected: (Arc<Frame>, TransitStatus),
+		respond: F,
+	) -> Self
+	where
+		T: EncryptedProtocolState + GateAudit,
+		F: FnOnce(Frame, SessionContext) -> Fut,
+		Fut: Future<Output = Result<Option<Frame>, TightBeamError>> + MaybeSend,
+	{
+		let (frame, status) = collected;
+		if status != TransitStatus::Ok {
+			return Self { status, response: None, failure: None };
+		}
+
+		// Move the frame out of the Arc, and deep-copy it only when the
+		// inbound path still holds a shared reference.
+		let frame = Arc::try_unwrap(frame).unwrap_or_else(|shared| (*shared).clone());
+		let session = session.get_or_insert_with(|| SessionContext::capture(&*transport)).clone();
+		let handled = pin!(respond(frame, session));
+		let spanned = transport.run_handler(handled);
+
+		match spanned.await {
+			Ok(response) => Self { status, response, failure: None },
+			Err(failure) => Self { status: TransitStatus::Internal, response: None, failure: Some(failure) },
+		}
+	}
 }
 
 #[cfg(feature = "tokio")]
@@ -713,26 +765,28 @@ pub mod server_runtime {
 	/// Runtime primitives, re-exported from the unified runtime.
 	pub mod rt {
 		pub use crate::runtime::rt::*;
-		/// Accept-loop connection plane for the async `server!` expansion. It
-		/// exists for the macro expansion and sits outside the public surface.
+		/// The accept-loop connection plane of the async `server!` expansion,
+		/// which serves the expansion and sits outside the documented surface.
 		#[cfg(feature = "tokio")]
 		pub use crate::transport::accept::AcceptPlane;
 
 		use crate::transport::error::TransportError;
 
-		/// Sender half of the error notification channel.
+		/// The sender half of the error notification channel.
 		pub type ErrorSender = crate::runtime::rt::Sender<TransportError>;
 
-		/// Sender half of the success notification channel.
+		/// The sender half of the success notification channel.
 		pub type OkSender = crate::runtime::rt::Sender<()>;
 
-		/// Return `None` for the optional error channel.
+		/// Returns `None`, the error channel of an expansion that names no
+		/// channels.
 		#[allow(dead_code)]
 		pub fn empty_error_channel() -> Option<ErrorSender> {
 			None
 		}
 
-		/// Return `None` for the optional success channel.
+		/// Returns `None`, the success channel of an expansion that names no
+		/// channels.
 		#[allow(dead_code)]
 		pub fn empty_ok_channel() -> Option<OkSender> {
 			None
@@ -746,11 +800,12 @@ pub mod server_runtime {
 /// # Policies
 ///
 /// - `name: [ expr, .. ]` calls `name(expr)` on every accepted transport.
-/// - Each expression is evaluated once per accepted connection, inside the
-///   accept loop, so every connection receives its own value.
+/// - The accept loop evaluates each expression once per accepted
+///   connection, so every connection receives its own value.
 /// - An expression that shares one value across connections clones it, as
 ///   `with_trace: [ trace.share() ]` does.
-/// - `max_connections: [ n ]` sets the accept plane's connection cap instead.
+/// - `max_connections: [ n ]` sets the connection cap of the async accept
+///   plane instead. The sync loop ignores it.
 #[macro_export]
 macro_rules! server {
 	(@apply_policy $transport:ident, $policy_name:ident, [ $( $policy_expr:expr ),* $(,)? ]) => {{
@@ -759,14 +814,14 @@ macro_rules! server {
 		)*
 	}};
 
-	// `max_connections` is an accept-loop knob. `@extract_max_connections`
-	// consumes it, so applying it to a transport does nothing.
+	// `max_connections` is an accept-loop knob that `@extract_max_connections`
+	// consumes, so this arm returns the transport as it is.
 	(@apply_one_policy $transport:ident, max_connections, $policy_expr:expr) => {{
 		$transport
 	}};
 
-	// Fold the policy list down to the accept-loop concurrency cap:
-	// a `max_connections: [ n ]` entry wins, otherwise the default.
+	// Fold the policy list down to the accept-loop concurrency cap. The first
+	// `max_connections: [ n ]` entry wins, and the default applies otherwise.
 	(@extract_max_connections) => {
 		$crate::constants::DEFAULT_MAX_SERVER_CONNECTIONS
 	};
@@ -782,9 +837,10 @@ macro_rules! server {
 		$transport.$other($policy_expr)
 	}};
 
-	// Fire-and-forget loop: the sync path has no error channel, so transport
-	// and handler failures terminate or skip the affected connection without
-	// reporting. Use the tokio path when operators need error visibility.
+	// This arm is a fire-and-forget loop. The sync path holds no error channel,
+	// so the loop drops each failure: a transport failure ends its connection,
+	// an accept failure ends the loop, and a failed handler answers `Internal`.
+	// Use the tokio path when operators need to see errors.
 	(@sync_loop_body $protocol:path, $listener:ident, $handler:ident, $($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?) => {{
 		loop {
 			match $listener.accept() {
@@ -804,32 +860,24 @@ macro_rules! server {
 						// then.
 						let mut __session_slot = ::core::option::Option::None;
 						loop {
-							let (frame, status) = match $crate::macros::server::server_runtime::rt::block_on(__transport.collect_message()) {
+							let __collected = match $crate::macros::server::server_runtime::rt::block_on(__transport.collect_message()) {
 								Ok(result) => result,
 								Err(_err) => {
 									break;
 								}
 							};
 
-							// Move the frame out of the Arc for the handler.
-							// The clone runs only when the Arc has more than
-							// one owner.
-							let frame_owned = ::std::sync::Arc::try_unwrap(frame)
-								.unwrap_or_else(|arc| (*arc).clone());
-							let (status, response) = if status == $crate::policy::TransitStatus::Ok {
-								let __session = ::core::clone::Clone::clone(
-									__session_slot.get_or_insert_with(|| $crate::policy::SessionContext::capture(&__transport)),
-								);
-								match $crate::macros::server::server_runtime::rt::block_on(__handler_clone.call(frame_owned, __session)) {
-									Ok(opt) => (status, opt),
-									// A handler failure answers a distinct
-									// status so the peer can tell it apart from
-									// an accepted empty reply.
-									Err(_err) => ($crate::policy::TransitStatus::Internal, ::core::option::Option::None),
-								}
-							} else {
-								(status, ::core::option::Option::None)
-							};
+							let __answer = $crate::macros::server::SingleFlightAnswer::of(
+								&mut __transport,
+								&mut __session_slot,
+								__collected,
+								|frame, session| __handler_clone.call(frame, session),
+							);
+							// The loop has no error channel, so it drops the
+							// error of a failed handler, and the `Internal`
+							// answer tells the peer.
+							let $crate::macros::server::SingleFlightAnswer { status, response, .. } =
+								$crate::macros::server::server_runtime::rt::block_on(__answer);
 
 							match $crate::macros::server::server_runtime::rt::block_on(__transport.send_response(status, response)) {
 								Ok(()) => continue,
@@ -871,8 +919,8 @@ macro_rules! server {
 				}
 			},
 			move |__accept_error| {
-				// The listener error converts here, so the loop reports it
-				// without holding a protocol error across an await.
+				// The listener error converts here, before the await, so the
+				// async block holds only the reported error across it.
 				let __reported = ::core::convert::Into::into(__accept_error);
 				let __channel = __accept_errors.clone();
 				async move {
@@ -1051,9 +1099,9 @@ macro_rules! server {
 		)
 	}};
 
-	// Service forms: `service:` takes a `MuxService` value, so one server
-	// answers unary, streaming, and duplex interactions without separate
-	// declarations. These forms require the pooled multiplexing feature set.
+	// Service forms: `service:` takes a `MuxService` value, so one declaration
+	// serves unary, streaming, and duplex interactions. These forms require the
+	// pooled multiplexing feature set.
 	(protocol $protocol:path: $listener:expr, service: $service:expr) => {{
 		$crate::__tightbeam_server_protocol_service_handle!(
 			$protocol,
@@ -1113,4 +1161,60 @@ macro_rules! server {
 	(async $($rest:tt)*) => {
 		$crate::server!(protocol $($rest)*)
 	};
+}
+
+#[cfg(all(test, feature = "tokio"))]
+mod tests {
+	use core::future::ready;
+	use core::sync::atomic::{AtomicBool, Ordering};
+
+	use tokio::net::{TcpListener, TcpStream};
+
+	use super::*;
+	use crate::testing::TestFrame;
+	use crate::transport::tcp::r#async::{TcpTransport, TokioStream};
+	use crate::transport::{EndpointConfig, TransportResult};
+
+	/// A cleartext transport over a loopback connection, beside the listener
+	/// that holds the other end open.
+	async fn loopback_transport() -> TransportResult<(TcpListener, TcpTransport<TokioStream>)> {
+		let listener = TcpListener::bind("127.0.0.1:0").await?;
+		let stream = TcpStream::connect(listener.local_addr()?).await?;
+		let transport = TcpTransport::new(TokioStream::from(stream), EndpointConfig::cleartext());
+
+		Ok((listener, transport))
+	}
+
+	/// Run one turn on a frame collected under `status` with a handler that
+	/// fails, and return the status the turn answers with and whether the
+	/// handler ran.
+	async fn failing_turn(status: TransitStatus) -> TransportResult<(TransitStatus, bool)> {
+		let (_listener, mut transport) = loopback_transport().await?;
+		let ran = AtomicBool::new(false);
+		let failing = |_frame, _session| {
+			ran.store(true, Ordering::SeqCst);
+			ready(Err::<Option<Frame>, _>(TightBeamError::MissingResponse))
+		};
+
+		let collected = (Arc::new(TestFrame::v0(None, None)), status);
+		let answer = SingleFlightAnswer::of(&mut transport, &mut None, collected, failing).await;
+		Ok((answer.status, ran.load(Ordering::SeqCst)))
+	}
+
+	/// A turn answers a refused frame with the status that refused it, before
+	/// any handler runs.
+	#[tokio::test]
+	async fn a_turn_answers_a_refused_frame_with_its_status() -> TransportResult<()> {
+		let refused = TransitStatus::PermissionDenied;
+		assert_eq!(failing_turn(refused).await?, (refused, false));
+		Ok(())
+	}
+
+	/// A turn answers an admitted frame whose handler fails with `Internal`,
+	/// so the peer can tell it apart from an accepted empty reply.
+	#[tokio::test]
+	async fn a_turn_answers_a_failed_handler_with_internal() -> TransportResult<()> {
+		assert_eq!(failing_turn(TransitStatus::Ok).await?, (TransitStatus::Internal, true));
+		Ok(())
+	}
 }

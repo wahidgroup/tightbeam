@@ -1,9 +1,11 @@
-//! One `tb_scenario!` body, compiled under two tightbeam feature selections.
+//! This crate compiles one `tb_scenario!` body under two tightbeam feature
+//! selections.
 //!
-//! `narrow` enables `testing` alone; `wide` adds `testing-csp`, `testing-fdr`
-//! and `instrument`. Restoring a `#[cfg(feature = ...)]` to
-//! [`SpecViolation::CspProcessViolation`] or `EventOrderViolationDetail` stops
-//! `narrow` from building.
+//! `narrow` enables `testing` alone, and `wide` adds `testing-csp`,
+//! `testing-fdr`, `testing-timing`, and `instrument`. A
+//! `#[cfg(feature = ...)]` on [`SpecViolation::CspProcessViolation`] or
+//! [`EventOrderViolationDetail`] stops `narrow` from building, and so does a
+//! `#[cfg]` on `ScenarioVerdict::exploration`, which the observer reads.
 
 use tightbeam::testing::specs::{EventOrderViolationDetail, SpecViolation};
 use tightbeam::testing::TestHooks;
@@ -11,7 +13,7 @@ use tightbeam::testing::TestHooks;
 /// Names the verification layer that produced a violation.
 ///
 /// Each arm binds its variant's payload, so both payload types must resolve
-/// under whichever selection compiled this.
+/// under whichever selection compiles this crate.
 pub fn layer_of(violation: &SpecViolation) -> String {
 	match violation {
 		SpecViolation::CspProcessViolation(violations) => {
@@ -25,10 +27,12 @@ pub fn layer_of(violation: &SpecViolation) -> String {
 	}
 }
 
-/// Installs an observer that reads every violation the run produced.
+/// Returns hooks whose `on_fail` observer reads every violation of the run
+/// and the trace of the Layer 3 exploration.
 pub fn observing_hooks() -> TestHooks {
-	TestHooks::on_fail(|_context, violations| {
+	TestHooks::on_fail(|context, violations| {
 		let _layers: Vec<String> = violations.iter().map(layer_of).collect();
+		let _explored = context.verdict().exploration().map(|exploration| exploration.assertions.len());
 	})
 }
 
@@ -43,8 +47,8 @@ mod tests {
 
 	const SCENARIO_RAN: Urn<'static> = tightbeam::urn!("test", "event:consumer-expansion/scenario-ran");
 
-	// `narrow` compiles without a CSP or refinement layer, so the assertion
-	// layer is the one verifier both selections share.
+	// `narrow` compiles the assertion layer alone, so that layer is the one
+	// verifier both selections share.
 	tightbeam::tb_assert_spec! {
 		pub ScenarioRanSpec,
 		V(1,0,0): {
@@ -55,10 +59,11 @@ mod tests {
 		}
 	}
 
-	// Neither selection enables `testing-timing`, so this spec is the proof
-	// that the schedulability block expands to nothing rather than to a name
-	// the consumer cannot resolve. The `task_set:` expression is dropped with
-	// the block, which is why it may name a feature-gated type.
+	// `narrow` leaves `testing-timing` off and `wide` turns it on. Under
+	// `narrow`, this spec proves that the schedulability block expands to
+	// nothing, so it leaves no name for the consumer to resolve. The macro
+	// drops the `task_set:` expression with the block, so that expression may
+	// name a type behind `testing-timing`.
 	tightbeam::tb_assert_spec! {
 		pub ScheduleBlockSpec,
 		V(1,0,0): {

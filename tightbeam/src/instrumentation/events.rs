@@ -1,7 +1,7 @@
 //! Each constant here names one tightbeam instrumentation event by its URN.
 //!
 //! The single system-wide inventory assigns one URN per emit site or event
-//! kind. Domain-scoped NSS segments keep identities from colliding across
+//! kind. Domain-scoped NSS segments keep identities distinct across
 //! subsystems.
 //!
 //! # Format
@@ -45,13 +45,92 @@ pub const ASSERT_LABEL: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:assert/
 pub const ASSERT_PAYLOAD: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:assert/payload");
 
 // Handler events
+/// Marks the entry into the application handler of one call that a
+/// collector gate admitted, on a connection that an async or a blocking
+/// `server!`, a servlet, a hive, or a gateway serves. The connection's audit
+/// trail records it, with the label `handler_enter`, when its config sets
+/// [`enable_internal_detail`].
+///
+/// - A call that runs to its end closes at [`HANDLER_EXIT`].
+/// - A call that the peer cancels on a mux stream closes at [`MUX_STREAM_CANCELLED`].
+///
+/// ```
+/// use tightbeam::instrumentation::events::HANDLER_ENTER;
+///
+/// assert_eq!(HANDLER_ENTER.to_string(), "urn:tightbeam:event:handler/enter");
+/// ```
+///
+/// [`enable_internal_detail`]: super::TbInstrumentationConfig::enable_internal_detail
 pub const HANDLER_ENTER: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:handler/enter");
+/// Marks the exit from the application handler of one call that a collector
+/// gate admitted, whatever the handler returned, on a connection that an async
+/// or a blocking `server!`, a servlet, a hive, or a gateway serves. The
+/// connection's audit trail records it, with the label `handler_exit`, when
+/// its config sets [`enable_internal_detail`].
+///
+/// - The exit closes each call that runs to its end.
+/// - A call that the peer cancels on a mux stream closes at [`MUX_STREAM_CANCELLED`] in place of its exit.
+/// - A call that a shutdown aborts ends at its [`HANDLER_ENTER`].
+///
+/// ```
+/// use tightbeam::instrumentation::events::HANDLER_EXIT;
+///
+/// assert_eq!(HANDLER_EXIT.to_string(), "urn:tightbeam:event:handler/exit");
+/// ```
+///
+/// [`enable_internal_detail`]: super::TbInstrumentationConfig::enable_internal_detail
 pub const HANDLER_EXIT: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:handler/exit");
 
 // Processing events
+/// Marks a frame body that a servlet decrypted for typed delivery. The decrypt
+/// also inflates a body that the sender compressed before encryption. The
+/// servlet's trace records it, with the label `crypto_step`, when its config
+/// sets [`enable_internal_detail`].
+///
+/// ```
+/// use tightbeam::instrumentation::events::CRYPTO_STEP;
+///
+/// assert_eq!(CRYPTO_STEP.to_string(), "urn:tightbeam:event:crypto/step");
+/// ```
+///
+/// [`enable_internal_detail`]: super::TbInstrumentationConfig::enable_internal_detail
 pub const CRYPTO_STEP: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:crypto/step");
+/// Marks a compressed cleartext frame body that a servlet inflated for typed
+/// delivery. The servlet's trace records it, with the label `compress_step`,
+/// when its config sets [`enable_internal_detail`].
+///
+/// ```
+/// use tightbeam::instrumentation::events::COMPRESS_STEP;
+///
+/// assert_eq!(COMPRESS_STEP.to_string(), "urn:tightbeam:event:compress/step");
+/// ```
+///
+/// [`enable_internal_detail`]: super::TbInstrumentationConfig::enable_internal_detail
 pub const COMPRESS_STEP: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:compress/step");
+/// Marks one peer stream that the mux responder routes to the dispatch method
+/// of its kind. The connection's audit trail records it, with the label
+/// `route_step`, when its config sets [`enable_internal_detail`].
+///
+/// ```
+/// use tightbeam::instrumentation::events::ROUTE_STEP;
+///
+/// assert_eq!(ROUTE_STEP.to_string(), "urn:tightbeam:event:route/step");
+/// ```
+///
+/// [`enable_internal_detail`]: super::TbInstrumentationConfig::enable_internal_detail
 pub const ROUTE_STEP: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:route/step");
+/// Marks the evaluation of one inbound call by a collector gate, ahead of the
+/// [`GATE_ACCEPT`] or [`GATE_REJECT`] of its verdict. The connection's audit
+/// trail records it, with the label `policy_eval`, when its config sets
+/// [`enable_internal_detail`].
+///
+/// ```
+/// use tightbeam::instrumentation::events::POLICY_EVAL;
+///
+/// assert_eq!(POLICY_EVAL.to_string(), "urn:tightbeam:event:policy/eval");
+/// ```
+///
+/// [`enable_internal_detail`]: super::TbInstrumentationConfig::enable_internal_detail
 pub const POLICY_EVAL: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:policy/eval");
 
 // Process events
@@ -63,8 +142,51 @@ pub const SEED_START: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:fdr/seed-
 pub const SEED_END: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:fdr/seed-end");
 pub const STATE_EXPAND: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:fdr/state-expand");
 pub const STATE_PRUNE: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:fdr/state-prune");
+/// Marks a state where a seed of FDR exploration diverged: a run of hidden
+/// events from it reaches a cycle of hidden events, or passes
+/// `max_internal_run`.
+///
+/// - The label names the process, the state, and the hidden events of the run
+///   in CSPM notation, such as `Spin.S1: <t, u>`.
+/// - An exploration records it where the config of its trace sets [`divergence_heuristics`].
+///
+/// ```
+/// use tightbeam::instrumentation::events::DIVERGENCE_DETECT;
+///
+/// assert_eq!(DIVERGENCE_DETECT.to_string(), "urn:tightbeam:event:fdr/divergence-detect");
+/// ```
+///
+/// [`divergence_heuristics`]: super::TbInstrumentationConfig::divergence_heuristics
 pub const DIVERGENCE_DETECT: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:fdr/divergence-detect");
+/// Marks the refusal set of one stable or accepting state of an FDR
+/// exploration, as the CSP failures model defines it. The label names the
+/// process, the state, and the set in CSPM notation, such as
+/// `Spin.S2: {a, b}`.
+///
+/// - A stable state enables no hidden event, and refuses each observable event it does not offer.
+/// - A process that can terminate at an accepting state refuses every observable event there.
+/// - An exploration records the event where the config of its trace sets [`sample_refusals`].
+///
+/// ```
+/// use tightbeam::instrumentation::events::REFUSAL_SNAPSHOT;
+///
+/// assert_eq!(REFUSAL_SNAPSHOT.to_string(), "urn:tightbeam:event:fdr/refusal-snapshot");
+/// ```
+///
+/// [`sample_refusals`]: super::TbInstrumentationConfig::sample_refusals
 pub const REFUSAL_SNAPSHOT: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:fdr/refusal-snapshot");
+/// Marks the observable events that one state of an FDR exploration offers.
+/// The label names the process, the state, and the set in CSPM notation, such
+/// as `Spin.S0: {a, b}`. An exploration records it where the config of its
+/// trace sets [`sample_enabled_sets`].
+///
+/// ```
+/// use tightbeam::instrumentation::events::ENABLED_SET_SAMPLE;
+///
+/// assert_eq!(ENABLED_SET_SAMPLE.to_string(), "urn:tightbeam:event:fdr/enabled-set-sample");
+/// ```
+///
+/// [`sample_enabled_sets`]: super::TbInstrumentationConfig::sample_enabled_sets
 pub const ENABLED_SET_SAMPLE: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:fdr/enabled-set-sample");
 
 // Timing events
@@ -93,6 +215,17 @@ pub const MUX_EMIT_DRAINING: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:mu
 pub const MUX_GOAWAY_SENT: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:mux/goaway-sent");
 pub const MUX_GOAWAY_RECV: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:mux/goaway-recv");
 pub const MUX_CANCEL_BUDGET: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:mux/cancel-budget");
+/// Marks a peer cancel that the mux responder honours with an abort of the
+/// stream's handler, so the call ends here in place of its [`HANDLER_EXIT`].
+/// The connection's audit trail records it, and each one draws on the cancel
+/// budget of the connection.
+///
+/// ```
+/// use tightbeam::instrumentation::events::MUX_STREAM_CANCELLED;
+///
+/// assert_eq!(MUX_STREAM_CANCELLED.to_string(), "urn:tightbeam:event:mux/stream-cancelled");
+/// ```
+pub const MUX_STREAM_CANCELLED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:mux/stream-cancelled");
 pub const MUX_PROTOCOL_ERROR: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:mux/protocol-error");
 pub const MUX_INTERNAL_ERROR: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:mux/internal-error");
 pub const MUX_STREAMS_EXHAUSTED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:mux/streams-exhausted");
@@ -150,8 +283,8 @@ pub const CLUSTER_HIVE_EVICTED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event
 pub const CLUSTER_DIAL_REFUSED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:cluster/dial-refused");
 /// Marks a gateway loop that ended because a registry, table, or journal
 /// lock it read is poisoned. The payload names the fault. A poisoned std
-/// lock never clears, and the loop's task returns nothing its owner reads,
-/// so this event is the one place the end is visible.
+/// lock stays poisoned, and the loop's task returns `()` to its owner, so
+/// this event is the one place the end is visible.
 pub const CLUSTER_LOOP_POISONED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:cluster/loop-poisoned");
 
 // Cluster export events
@@ -201,8 +334,8 @@ pub const CLUSTER_GOSSIP_REFLOOD_FAILED: Urn<'static> =
 pub const CLUSTER_GOSSIP_FANOUT_UNREACHED: Urn<'static> =
 	crate::urn!(TIGHTBEAM_NID, "event:cluster/gossip-fanout-unreached");
 /// Marks a relayed rumor whose origin this gateway's peer trust does not
-/// hold. The rumor is dropped, and the relay pays one rate token and no
-/// score.
+/// hold. The gateway drops the rumor, and the relay pays one rate token and
+/// no score.
 pub const CLUSTER_GOSSIP_ORIGIN_UNKNOWN: Urn<'static> =
 	crate::urn!(TIGHTBEAM_NID, "event:cluster/gossip-origin-unknown");
 /// Marks a peer that answered a rumor's origin as outside its trust, so this

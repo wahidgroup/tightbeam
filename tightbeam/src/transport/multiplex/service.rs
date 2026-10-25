@@ -1,10 +1,11 @@
-//! Library-side mux serving orchestration.
+//! The library side of a served mux connection: the [`MuxService`] trait,
+//! its call context, and the adapter that gates each call.
 //!
-//! The `server!` async accept loop hands each connection to
-//! [`MuxAcceptor::serve`] after policy application and negotiation
-//! ([`MuxAcceptor::negotiate_mux`]). That method runs the whole mux plane
-//! (gated halves, drivers, responder) with the caller's [`MuxService`] behind
-//! the transport's collector gate.
+//! The `server!` async accept loop applies its policies and negotiates
+//! multiplexing ([`MuxAcceptor::negotiate_mux`]), then hands each connection
+//! that negotiated it to [`MuxAcceptor::serve`]. That method runs the whole
+//! mux plane (gated halves, drivers, responder) with the caller's
+//! [`MuxService`] behind the transport's collector gate.
 //!
 //! [`MuxAcceptor::negotiate_mux`]: crate::transport::multiplex::MuxAcceptor::negotiate_mux
 //! [`MuxAcceptor::serve`]: crate::transport::multiplex::MuxAcceptor::serve
@@ -16,7 +17,7 @@ use crate::policy::GatePolicy;
 use crate::policy::SessionContext;
 use crate::policy::TransitStatus;
 use crate::transport::envelopes::ResponsePackage;
-use crate::transport::messaging::GateInbound;
+use crate::transport::messaging::{GateInbound, HandlerAudit};
 use crate::transport::multiplex::{MuxDispatch, MuxHandle, ReplySink, StreamBody, StreamRoute};
 use crate::transport::TransportResult;
 use crate::urn::Urn;
@@ -33,8 +34,8 @@ use crate::{Frame, TightBeamError};
 ///
 /// # Routing
 ///
-/// A unary open is unrouted, so [`CallContext::target`] is `None`: a unary
-/// frame states its addressing in its payload, and no initiator routes one.
+/// A unary frame states its addressing in its payload, so the initiator
+/// opens a unary stream unrouted and [`CallContext::target`] is `None`.
 /// Streaming and duplex opens carry the route a gateway reads to dispatch
 /// locally or splice to a peer.
 pub struct CallContext {
@@ -46,7 +47,7 @@ impl CallContext {
 	/// Bundle a live session with the stream's route.
 	///
 	/// The constructor is public so that an external [`MuxService`]
-	/// implementation can build a context in its own tests. The serving path
+	/// implementation can build a context in its own tests. The serve path
 	/// assembles one per dispatch. An unrouted call takes
 	/// `StreamRoute::default()`.
 	pub fn new(session: SessionContext, route: StreamRoute) -> Self {
@@ -74,9 +75,9 @@ impl CallContext {
 		self.route.target()
 	}
 
-	/// Relay budget left on this open: the number of gateway forwards
-	/// the stream may still spend. A `0` stream is served locally and
-	/// never re-forwarded.
+	/// The relay budget left on this open: the number of gateway forwards
+	/// the stream may still spend. The gateway that holds a stream at `0`
+	/// serves it locally.
 	pub fn hops_remaining(&self) -> u8 {
 		self.route.hops_remaining()
 	}
@@ -84,17 +85,17 @@ impl CallContext {
 
 /// The interactions one served connection answers.
 ///
-/// Each initiating client call stamps its interaction kind on the stream's
-/// Open record, and [`MuxAcceptor::serve`] routes every peer stream to the
-/// matching method here. One connection serves unary, streaming, and duplex
+/// Each client call stamps its interaction kind on the Open record of its
+/// stream, and [`MuxAcceptor::serve`] routes every peer stream to the method
+/// of that kind here. One connection serves unary, streaming, and duplex
 /// interactions concurrently, so the handler's shape is the only thing an
 /// application decides.
 ///
 /// # Call context
 ///
 /// Every method receives a [`CallContext`]: the live session plus the
-/// stream's route, so a handler reads peer identity and dispatch target
-/// through one parameter.
+/// stream's route, so a handler reads the peer identity and the dispatch
+/// target through one parameter.
 ///
 /// [`MuxAcceptor::serve`]: crate::transport::multiplex::MuxAcceptor::serve
 pub trait MuxService: Send + Sync + 'static {
@@ -137,8 +138,8 @@ pub trait MuxService: Send + Sync + 'static {
 		async { Err(TightBeamError::unimplemented()) }
 	}
 
-	/// Consume request chunks while pushing reply chunks (full duplex
-	/// on one stream). The collector gate has already run at dispatch
+	/// Consume request chunks and push reply chunks at the same time, in full
+	/// duplex on one stream. The collector gate has already run at dispatch
 	/// with no request frame (`None`). See [`GatePolicy`].
 	///
 	/// # Errors
@@ -159,10 +160,10 @@ pub trait MuxService: Send + Sync + 'static {
 	}
 }
 
-/// A frame-in/frame-out closure is a unary-only [`MuxService`]:
-/// streaming and duplex streams answer [`TransitStatus::Unimplemented`].
-/// The closure keeps the bare [`SessionContext`] grammar, and a unary
-/// open carries no route to expose.
+/// A closure from a request frame to a reply frame is a unary-only
+/// [`MuxService`], so its streaming and duplex streams answer
+/// [`TransitStatus::Unimplemented`]. The closure takes the bare
+/// [`SessionContext`], because a unary open is unrouted.
 impl<F, Fut> MuxService for F
 where
 	F: Fn(Frame, SessionContext) -> Fut + Send + Sync + 'static,
@@ -180,7 +181,8 @@ where
 /// A [`MuxDispatch`] adapter that runs a [`MuxService`] behind the transport's
 /// collector gate. A call that the gate refuses answers with the gate's status
 /// and stops short of the service, and every invocation sees the live session
-/// receipt.
+/// receipt. The connection's trail records each service call as a handler
+/// span.
 pub(crate) struct GatedService<S> {
 	service: Arc<S>,
 	gate: Box<dyn GatePolicy>,
@@ -204,7 +206,11 @@ impl<S> GatedService<S> {
 	///
 	/// # Errors
 	///
-	/// - The fault the trace injects at the event of the verdict.
+	/// - The injected error, when the runtime fault model injects a fault at
+	///   the event of the evaluation or the verdict.
+	/// - [`TransportError::InvalidMessage`] -- the fault-state lock of the trace is poisoned.
+	///
+	/// [`TransportError::InvalidMessage`]: crate::transport::TransportError::InvalidMessage
 	fn verdict(&self, frame: Option<&Frame>, session: &SessionContext) -> TransportResult<TransitStatus> {
 		Ok(self.handle.gate_inbound(self.gate.as_ref(), frame, session)?)
 	}
@@ -212,11 +218,13 @@ impl<S> GatedService<S> {
 
 impl<S: MuxService> MuxDispatch for GatedService<S> {
 	fn unary(&self, frame: Arc<Frame>) -> impl Future<Output = TransportResult<ResponsePackage>> + MaybeSend {
-		// Gates are synchronous, so the call evaluates and audits at
-		// dispatch, and only the service and its inputs enter the task.
+		// Gates are synchronous, so the call evaluates the gate and audits the
+		// verdict at dispatch. The service, its inputs, and the handle whose
+		// trail records the handler span enter the task.
 		let session = self.session();
 		let verdict = self.verdict(Some(frame.as_ref()), &session);
 		let service = Arc::clone(&self.service);
+		let handle = &self.handle;
 		async move {
 			let status = verdict?;
 			if status != TransitStatus::Ok {
@@ -225,7 +233,8 @@ impl<S: MuxService> MuxDispatch for GatedService<S> {
 
 			let request = Arc::try_unwrap(frame).unwrap_or_else(|shared| (*shared).clone());
 			let cx = CallContext::new(session, StreamRoute::local());
-			Ok(ResponsePackage::from_outcome(service.unary(request, cx).await))
+			let outcome = handle.run_handler(service.unary(request, cx)).await;
+			Ok(ResponsePackage::from_outcome(outcome))
 		}
 	}
 
@@ -237,6 +246,7 @@ impl<S: MuxService> MuxDispatch for GatedService<S> {
 		let session = self.session();
 		let verdict = self.verdict(None, &session);
 		let service = Arc::clone(&self.service);
+		let handle = &self.handle;
 		async move {
 			let status = verdict?;
 			if status != TransitStatus::Ok {
@@ -244,7 +254,8 @@ impl<S: MuxService> MuxDispatch for GatedService<S> {
 			}
 
 			let cx = CallContext::new(session, route);
-			Ok(ResponsePackage::from_outcome(service.streaming(body, cx).await))
+			let outcome = handle.run_handler(service.streaming(body, cx)).await;
+			Ok(ResponsePackage::from_outcome(outcome))
 		}
 	}
 
@@ -257,6 +268,7 @@ impl<S: MuxService> MuxDispatch for GatedService<S> {
 		let session = self.session();
 		let verdict = self.verdict(None, &session);
 		let service = Arc::clone(&self.service);
+		let handle = &self.handle;
 		async move {
 			let status = verdict?;
 			if status != TransitStatus::Ok {
@@ -264,7 +276,7 @@ impl<S: MuxService> MuxDispatch for GatedService<S> {
 			}
 
 			let cx = CallContext::new(session, route);
-			let status = match service.duplex(body, reply, cx).await {
+			let status = match handle.run_handler(service.duplex(body, reply, cx)).await {
 				Ok(()) => TransitStatus::Ok,
 				Err(error) => error.failure_status(),
 			};

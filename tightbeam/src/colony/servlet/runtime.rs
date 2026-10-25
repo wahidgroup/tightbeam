@@ -1,10 +1,10 @@
-//! Protocol-generic servlet accept-loop state.
+//! The state of a servlet accept loop, generic over its protocol.
 //!
 //! - `servlet!` builds [`crate::colony::servlet::ServletHandlers`] and calls [`ServletRuntime::start`].
 //! - A [`ServletService`] written without the macro uses the same entry point.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 
 use crate::cms::signed_data::SignerIdentifier;
 use crate::colony::hive::{HiveContext, ServletBox};
@@ -16,8 +16,8 @@ use crate::crypto::aead::Decryptor;
 use crate::macros::server::{serve_connection_service, AcceptedConnection};
 use crate::policy::GatePolicy;
 use crate::runtime::rt;
-use crate::trace::TraceCollector;
-use crate::transport::accept::AcceptPlane;
+use crate::trace::{TraceCollector, TraceHandle};
+use crate::transport::accept::{AcceptPlane, ConnectionTerms};
 use crate::transport::handshake::negotiation::TransportOffer;
 use crate::transport::multiplex::MuxCapable;
 use crate::transport::policy::{CollectorGateConfig, PolicyConfig};
@@ -46,7 +46,7 @@ pub(crate) struct ServletRuntimeParts<Env> {
 	pub(crate) clock: Arc<dyn Clock>,
 }
 
-/// A running accept loop and its bound address for protocol `P`.
+/// A live accept loop and its bound address for protocol `P`.
 ///
 /// - The runtime owns the accept-loop task handle and a replaceable trace handle.
 /// - The runtime retains the address bytes as [`Arc<[u8]>`] for hive registration and scaling.
@@ -56,7 +56,7 @@ pub struct ServletRuntime<P: Protocol> {
 	addr_bytes: Arc<[u8]>,
 	/// The signer of the certificate the listener presents, recorded at start.
 	signer: Option<SignerIdentifier>,
-	trace_handle: Arc<Mutex<Arc<TraceCollector>>>,
+	trace_handle: TraceHandle,
 }
 
 impl<P> ServletRuntime<P>
@@ -67,6 +67,17 @@ where
 {
 	/// Binds the listener, starts the workers, builds the servlet context,
 	/// and spawns the accept loop.
+	///
+	/// The loop attaches the servlet's trace to each connection it accepts,
+	/// before the handshake.
+	///
+	/// # Warning
+	///
+	/// The trace records every connection, a peer that never authenticates
+	/// included. The default `BoundedMemorySink` drops each event past
+	/// `max_events`, the servlet's own included, so a long-lived servlet needs
+	/// an `EventSink` that forwards each event, or a reader that drains the
+	/// trace.
 	///
 	/// # Errors
 	///
@@ -123,31 +134,31 @@ where
 			started_workers.insert(name, started);
 		}
 
+		let trace_handle = TraceHandle::new(trace);
 		let servlet_context = Arc::new(
-			ServletContext::new(Arc::clone(&trace), env_config, started_workers, hive_context)
+			ServletContext::sharing_trace(trace_handle.clone(), env_config, started_workers, hive_context)
 				.with_message_decryptor(message_decryptor)
 				.with_message_inflator(message_inflator),
 		);
 
 		let service = Arc::new(ContextService::new(service, servlet_context));
 		let plane = AcceptPlane::new(DEFAULT_MAX_SERVER_CONNECTIONS, clock);
+		let terms = ConnectionTerms::new(trace_handle.clone(), mux_offer);
 
 		// The gates go on each connection before it dispatches, so a peer the
 		// collector gates refuse never reaches a handler.
-		let accept_loop = plane.accept_on(listener, move |mut transport: <P::Listener as Protocol>::Transport| {
+		let serve = move |mut transport: <P::Listener as Protocol>::Transport| {
 			for gate in &collector_gates {
 				transport = transport.with_collector_gate(Arc::clone(gate));
 			}
 
-			transport = transport.with_mux_offer(mux_offer.clone());
-
 			let service = Arc::clone(&service);
 			async move { serve_connection_service(transport, service, None, None).await }
-		});
+		};
+		let accept_loop = plane.accept_owned(listener, terms, serve);
 
 		let server_handle = rt::spawn(accept_loop);
 		let addr_bytes: Arc<[u8]> = Arc::from(addr.clone().into());
-		let trace_handle = Arc::new(Mutex::new(trace));
 
 		let runtime = Self { server_handle: Some(server_handle), addr, addr_bytes, signer, trace_handle };
 		Ok(runtime)
@@ -170,13 +181,33 @@ impl<P: Protocol> ServletRuntime<P> {
 		&self.addr_bytes
 	}
 
-	/// Replaces the live trace collector behind the shared handle.
+	/// Replaces the live trace of this servlet with `trace`.
+	///
+	/// - Each connection that the servlet accepts after the call records into `trace`.
+	/// - Each handler that reads [`ServletContext::trace`] after the call records into `trace`.
+	/// - A connection accepted before the call, and each worker, keep the trace they started with.
 	///
 	/// The handle holds one whole collector, so a lock that a holder poisoned
 	/// in a panic holds no torn state, and the replacement goes in.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::colony::servlet::ServletRuntime;
+	/// use tightbeam::trace::TraceCollector;
+	/// use tightbeam::transport::tcp::r#async::TokioListener;
+	///
+	/// /// Gives the connections that `runtime` accepts from here on a fresh trace.
+	/// fn rotate(runtime: &ServletRuntime<TokioListener>) -> Arc<TraceCollector> {
+	///     let trace = Arc::new(TraceCollector::default());
+	///     runtime.set_trace(Arc::clone(&trace));
+	///     trace
+	/// }
+	/// ```
 	pub fn set_trace(&self, trace: Arc<TraceCollector>) {
-		let mut guard = self.trace_handle.lock().unwrap_or_else(PoisonError::into_inner);
-		*guard = trace;
+		self.trace_handle.replace(trace);
 	}
 
 	/// Aborts the accept loop.
@@ -253,48 +284,5 @@ where
 
 	async fn join(self) -> Result<(), rt::JoinError> {
 		ServletRuntime::join(self).await
-	}
-}
-
-#[cfg(test)]
-mod tests {
-	use std::panic::{catch_unwind, AssertUnwindSafe};
-
-	use super::*;
-	use crate::transport::TokioListener;
-
-	/// A runtime whose trace handle a holder poisoned with a panic while it
-	/// held the lock.
-	fn poisoned_runtime() -> ServletRuntime<TokioListener> {
-		let addr = "127.0.0.1:0".parse().expect("a socket spelling parses");
-		let trace_handle = Arc::new(Mutex::new(Arc::new(TraceCollector::default())));
-		let runtime = ServletRuntime {
-			server_handle: None,
-			addr,
-			addr_bytes: Arc::from(&b"127.0.0.1:0"[..]),
-			signer: None,
-			trace_handle,
-		};
-		let panicked = catch_unwind(AssertUnwindSafe(|| {
-			let _held = runtime.trace_handle.lock().expect("the lock is live until this panic");
-			panic!("poison the trace handle");
-		}));
-
-		assert!(panicked.is_err());
-		assert!(runtime.trace_handle.is_poisoned());
-		runtime
-	}
-
-	/// A replacement on a poisoned handle installs the new collector, because
-	/// the handle holds one whole value.
-	#[test]
-	fn a_poisoned_trace_handle_takes_the_replacement() {
-		let runtime = poisoned_runtime();
-		let trace = Arc::new(TraceCollector::default());
-
-		runtime.set_trace(Arc::clone(&trace));
-
-		let held = runtime.trace_handle.lock().unwrap_or_else(PoisonError::into_inner);
-		assert!(Arc::ptr_eq(&held, &trace));
 	}
 }

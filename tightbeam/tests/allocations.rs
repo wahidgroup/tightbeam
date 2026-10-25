@@ -11,6 +11,11 @@
 //! - A gossip rumor digest sits on the stack, so a rumor admits and a peer's
 //!   digest reads with no allocation for the digest.
 //! - A want list borrows the advertised entries it drops.
+//! - With the internal events off, the typed delivery of a servlet allocates what its inflate allocates.
+//! - With the internal events off, a single-flight turn that answers an admitted frame allocates nothing.
+//! - A record that a full sink drops allocates the assertion of the testing layer alone.
+//! - FDR exploration of a process with no hidden event allocates the same at any hidden run bound.
+//! - A state with no hidden step answers its stability and its divergence with no allocation.
 //!
 //! Only an allocation count shows these bounds, so the counting allocator
 //! lives in this test binary alone.
@@ -20,13 +25,22 @@
 #![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 
 use core::cell::Cell;
+use core::future::{ready, Future};
+use core::pin::pin;
+use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use tightbeam::colony::cluster::{AdmittedGossip, GossipDigest, WantList};
 use tightbeam::colony::common::GossipRumor;
+use tightbeam::colony::servlet::ServletContext;
+use tightbeam::compress::ZstdCompression;
+use tightbeam::core::Inflator;
 use tightbeam::crypto::hash::Sha3_256;
 use tightbeam::crypto::policy::Secp256k1Policy;
+use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
 use tightbeam::crypto::x509::utils::CertificateExt;
 use tightbeam::crypto::x509::{CanonicalKey, KeyIndex};
@@ -34,10 +48,20 @@ use tightbeam::decode;
 use tightbeam::der::asn1::{BitString, ObjectIdentifier};
 use tightbeam::der::oid::db::rfc8410::ID_ED_25519;
 use tightbeam::der::Encode;
+use tightbeam::instrumentation::{events, TbInstrumentationConfig};
+use tightbeam::macros::server::SingleFlightAnswer;
 use tightbeam::oids::{CURVE_NIST_P256, CURVE_NIST_P521};
+use tightbeam::policy::TransitStatus;
 use tightbeam::spki::SubjectPublicKeyInfoOwned;
+use tightbeam::testing::fdr::{DefaultFdrExplorer, FdrConfig};
 use tightbeam::testing::fixtures::{TestCertificate, TestKey, TestRumor, TestSigner};
+use tightbeam::testing::specs::csp::{Event, Process, ProcessBuildError, State};
+use tightbeam::testing::{TestFrame, TestMessage};
+use tightbeam::trace::{TraceCollector, TraceConfig};
+use tightbeam::transport::tcp::r#async::{TcpTransport, TokioStream};
+use tightbeam::transport::EndpointConfig;
 use tightbeam::utils::time::UnixMillis;
+use tightbeam::{compose, Frame, TightBeamError};
 
 thread_local! {
 	/// The count of the allocations of this thread. A `Cell` of an integer
@@ -306,4 +330,218 @@ fn want_list_against_held_entries() -> (bool, usize) {
 #[test]
 fn a_want_list_against_held_entries_allocates_the_held_set_alone() {
 	assert_eq!(want_list_against_held_entries(), (true, 1));
+}
+
+/// An inflator that hands a body back as it arrived, so each inflate makes
+/// the one allocation of the buffer it returns.
+struct CopyInflator;
+
+impl Inflator for CopyInflator {
+	fn decompress(&self, data: &[u8]) -> tightbeam::error::Result<Vec<u8>> {
+		Ok(data.to_vec())
+	}
+}
+
+/// A cleartext frame whose body `zstd` compressed.
+fn compressed_frame() -> Result<Frame, TightBeamError> {
+	let message = TestMessage::sample(None);
+	compose! { V0: id: "detail-off", order: 1u64, message: message, compactness: ZstdCompression::default() }
+}
+
+/// The counts of the allocations that the inflate of a compressed frame makes,
+/// by itself and through the typed delivery of a servlet whose trace config
+/// leaves `enable_internal_detail` off.
+fn inflations_with_the_detail_off() -> Result<(usize, usize), TightBeamError> {
+	let inflator: Arc<dyn Inflator + Send + Sync> = Arc::new(CopyInflator);
+	let ctx = ServletContext::new(Arc::new(TraceCollector::new()), Arc::new(()), HashMap::new(), None);
+	let ctx = ctx.with_message_inflator(Some(inflator));
+	let mut alone = compressed_frame()?;
+	let mut delivered = compressed_frame()?;
+	let mut cx = Context::from_waker(Waker::noop());
+
+	let before = ALLOCATIONS.with(Cell::get);
+	let inflated = alone.inflate_in_place(&CopyInflator);
+	let between = ALLOCATIONS.with(Cell::get);
+	let delivery = pin!(delivered.prepare_typed(&ctx)).poll(&mut cx);
+	let after = ALLOCATIONS.with(Cell::get);
+
+	inflated?;
+
+	let Poll::Ready(prepared) = delivery else {
+		panic!("the inflate of a typed delivery completes on its first poll");
+	};
+
+	prepared?;
+
+	Ok((between - before, after - between))
+}
+
+/// The internal events cost no allocation while they are off: the typed
+/// delivery of a compressed frame allocates what its inflate allocates, and
+/// the internal event at the inflate allocates nothing.
+#[test]
+fn a_typed_delivery_with_the_detail_off_allocates_what_its_inflate_allocates() -> Result<(), TightBeamError> {
+	let (inflate, delivery) = inflations_with_the_detail_off()?;
+	assert_eq!(delivery, inflate);
+	Ok(())
+}
+
+/// A cleartext transport over a loopback connection, whose trace leaves
+/// `enable_internal_detail` off.
+async fn loopback_transport() -> Result<TcpTransport<TokioStream>, TightBeamError> {
+	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+	let stream = tokio::net::TcpStream::connect(listener.local_addr()?).await?;
+	let config = EndpointConfig::<DefaultCryptoProvider>::cleartext();
+
+	Ok(TcpTransport::new(TokioStream::from(stream), config).with_trace(TraceCollector::new()))
+}
+
+/// The count of the allocations that a single-flight turn makes as it answers
+/// one admitted frame with a handler that allocates nothing, on a connection
+/// whose trace leaves `enable_internal_detail` off.
+fn single_flight_turn_with_the_detail_off() -> Result<usize, TightBeamError> {
+	let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+	let mut transport = runtime.block_on(loopback_transport())?;
+	let collected = (Arc::new(TestFrame::v0(None, None)), TransitStatus::Ok);
+	let echo = |frame: Frame, _session| ready(Ok::<_, TightBeamError>(Some(frame)));
+	let mut session = None;
+	let mut cx = Context::from_waker(Waker::noop());
+
+	let before = ALLOCATIONS.with(Cell::get);
+	let turn = pin!(SingleFlightAnswer::of(&mut transport, &mut session, collected, echo)).poll(&mut cx);
+	let after = ALLOCATIONS.with(Cell::get);
+
+	let Poll::Ready(answer) = turn else {
+		panic!("a turn whose handler is ready completes on its first poll");
+	};
+	if let Some(failure) = answer.failure {
+		return Err(failure);
+	}
+
+	Ok(after - before)
+}
+
+/// The handler span costs no allocation while the internal events are off: a
+/// single-flight turn that answers an admitted frame, with a handler that
+/// allocates nothing, allocates nothing.
+#[test]
+fn a_single_flight_turn_with_the_detail_off_allocates_nothing() -> Result<(), TightBeamError> {
+	assert_eq!(single_flight_turn_with_the_detail_off()?, 0);
+	Ok(())
+}
+
+/// The counts of the allocations that a record with evidence and a bare
+/// assertion each make on a trace whose sink holds no event, after one
+/// warm-up record of each.
+fn records_on_a_full_sink() -> Result<(usize, usize), TightBeamError> {
+	let config = TbInstrumentationConfig { max_events: 0, ..Default::default() };
+	let trace = TraceCollector::from(TraceConfig::with_instrumentation(config));
+	trace.emit_event_with_evidence(events::GATE_ACCEPT, "Ok", None)?;
+	trace.event(&events::GATE_ACCEPT)?.emit();
+
+	let before = ALLOCATIONS.with(Cell::get);
+	let evidenced = trace.emit_event_with_evidence(events::GATE_ACCEPT, "Ok", None);
+	let between = ALLOCATIONS.with(Cell::get);
+	let asserted = trace.event(&events::GATE_ACCEPT).map(|builder| builder.emit());
+	let after = ALLOCATIONS.with(Cell::get);
+
+	evidenced?;
+	asserted?;
+	Ok((between - before, after - between))
+}
+
+/// An event that a full sink drops costs no allocation of its own: a record
+/// with evidence allocates what a bare assertion allocates, the assertion of
+/// the testing layer alone.
+#[test]
+fn a_record_that_a_full_sink_drops_allocates_its_assertion_alone() -> Result<(), TightBeamError> {
+	let (evidenced, asserted) = records_on_a_full_sink()?;
+	assert_eq!(evidenced, asserted);
+	Ok(())
+}
+
+/// A process with no hidden event, whose `ping` and `pong` take `S0` to `S1`
+/// and back.
+fn ring() -> Result<Process, ProcessBuildError> {
+	Process::builder("Ring")
+		.initial_state(State("S0"))
+		.add_observable(Event("ping"))
+		.add_observable(Event("pong"))
+		.add_transition(State("S0"), Event("ping"), State("S1"))
+		.add_transition(State("S1"), Event("pong"), State("S0"))
+		.build()
+}
+
+/// The count of the allocations that one seed of `process` makes with
+/// `max_internal_run` at `bound`.
+fn allocations_of_one_seed(process: &Process, bound: usize) -> usize {
+	let config = FdrConfig { seeds: 1, max_internal_run: bound, ..Default::default() };
+	let mut explorer = DefaultFdrExplorer::with_defaults(process, config);
+	// A first exploration fills the lazy state of the thread, which the count
+	// leaves out.
+	explorer.explore();
+
+	let before = ALLOCATIONS.with(Cell::get);
+	explorer.explore();
+
+	let after = ALLOCATIONS.with(Cell::get);
+	after - before
+}
+
+/// The hidden run bound sets no work on a process with no hidden event, so
+/// its exploration allocates the same at any bound.
+#[test]
+fn a_process_with_no_hidden_event_allocates_the_same_at_any_hidden_run_bound() -> Result<(), ProcessBuildError> {
+	let process = ring()?;
+	let at_zero = allocations_of_one_seed(&process, 0);
+	let at_thirty_two = allocations_of_one_seed(&process, 32);
+	assert_eq!(at_zero, at_thirty_two);
+	Ok(())
+}
+
+/// The divergent states of a process with no hidden event cost no
+/// allocation.
+#[test]
+fn a_process_with_no_hidden_event_computes_its_divergent_states_with_no_allocation() -> Result<(), ProcessBuildError> {
+	let process = ring()?;
+
+	let before = ALLOCATIONS.with(Cell::get);
+	let divergent = process.divergent_states();
+	let after = ALLOCATIONS.with(Cell::get);
+
+	assert_eq!((divergent.contains(State("S0")), after - before), (false, 0));
+	Ok(())
+}
+
+/// A process whose observable `ping` takes `S0` to `S1`, and whose hidden
+/// `tick` takes `S1` back to `S0`, so `S0` has no hidden step.
+fn ticking() -> Result<Process, ProcessBuildError> {
+	Process::builder("Ticking")
+		.initial_state(State("S0"))
+		.add_observable(Event("ping"))
+		.add_hidden(Event("tick"))
+		.add_transition(State("S0"), Event("ping"), State("S1"))
+		.add_transition(State("S1"), Event("tick"), State("S0"))
+		.build()
+}
+
+/// Whether `S0` of `ticking` is stable and has no divergence witness, beside
+/// the count of the allocations that the two answers make.
+fn answers_at_a_state_with_no_hidden_step() -> Result<(bool, bool, usize), ProcessBuildError> {
+	let process = ticking()?;
+	let divergent = process.divergent_states();
+
+	let before = ALLOCATIONS.with(Cell::get);
+	let stable = process.is_stable(State("S0"));
+	let witness = divergent.witness(State("S0"));
+	let after = ALLOCATIONS.with(Cell::get);
+	Ok((stable, witness.is_none(), after - before))
+}
+
+/// A state with no hidden step answers whether it is stable and whether it
+/// diverges with no allocation.
+#[test]
+fn a_state_with_no_hidden_step_answers_with_no_allocation() -> Result<(), ProcessBuildError> {
+	assert_eq!(answers_at_a_state_with_no_hidden_step()?, (true, true, 0));
+	Ok(())
 }

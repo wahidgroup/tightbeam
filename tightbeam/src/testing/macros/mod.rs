@@ -1,18 +1,20 @@
 //! The testing macro layer: the `tb_scenario!` entry point and its helpers.
 //!
-//! - Layer 1 (Assertions): `verification_spec`
-//! - Layer 2 (CSP): `process_spec`
-//! - Layer 3 (FDR): `tb_scenario!` runs it
+//! - Layer 1 (assertions) has its macro in `verification_spec`.
+//! - Layer 2 (CSP) has its macro in `process_spec`.
+//! - Layer 3 (FDR) runs inside `tb_scenario!`.
 
-// The ProcessSpec macro of Layer 2 (CSP).
+// The `tb_process_spec!` macro of Layer 2 (CSP).
 pub mod process_spec;
-// The CompositionSpec macro of Layer 2 (CSP composition).
+// The `tb_compose_spec!` macro of Layer 2 (CSP composition).
 pub mod compose_spec;
-// The opt-in gen states macro for fault injection.
+// The opt-in `tb_gen_process_types!` macro, which generates the state and
+// event types of a process for fault injection.
 pub mod gen_states;
-// The timing-constraint helper macros of Layer 3 (timing).
+// The timing-constraint macros that `tb_process_spec!` and `tb_assert_spec!`
+// use.
 pub mod timing_spec;
-// The VerificationSpec macro of Layer 1 (assertions).
+// The `tb_assert_spec!` macro of Layer 1 (assertions).
 pub mod verification_spec;
 
 pub use timing_spec::DeadlineParams;
@@ -77,9 +79,9 @@ where
 
 /// Hands one fuzz input to a raw target.
 ///
-/// The function is named so the closure's argument type is checked at the
-/// definition rather than inside the `afl::fuzz!` expansion, where a mismatch
-/// reports against the macro.
+/// A named function lets the compiler check the closure's argument type at
+/// the definition. Inside the `afl::fuzz!` expansion, a mismatch would report
+/// against the macro.
 #[doc(hidden)]
 pub fn __tb_call_raw_fuzz<F: FnOnce(&[u8])>(target: F, data: impl AsRef<[u8]>) {
 	let data = data.as_ref();
@@ -109,7 +111,7 @@ where
 }
 
 /// Binds the configuration a scenario runs, or fails the test with the reason
-/// it was refused.
+/// for the refusal.
 ///
 /// `tb_scenario!` binds a configuration in each environment arm. This is the
 /// one place that decides what a refusal does, so every arm shares its
@@ -126,10 +128,10 @@ macro_rules! __tb_accept_config {
 }
 
 /// Binds the configuration of a guided fuzz run, whose CSP process comes from
-/// the `csp:` key alone, or fails the run with the reason it was refused.
+/// the `csp:` key alone, or fails the run with the reason for the refusal.
 ///
-/// The oracle and the CSP layer then read one process, and a configuration
-/// that names a second one is refused.
+/// The oracle and the CSP layer then read one process, because
+/// `ScenarioConfig::guided_by` refuses a configuration that names another.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __tb_accept_guided_config {
@@ -143,10 +145,10 @@ macro_rules! __tb_accept_guided_config {
 /// The scenario entry point, which verifies an AssertSpec (and optionally CSP
 /// and FDR) under a selectable execution environment.
 ///
-/// Closures take one parameter, a struct from [`crate::testing::env`] in
-/// every environment but Pipeline: `trace` is a [`TraceCollector`] share (a
-/// [`FuzzTraceCollector`] share under `fuzz: afl`) and `context` is `Arc<C>`
-/// (unit when `context:` is omitted). Name it `env`, or destructure it.
+/// Each closure takes one parameter, a struct from [`crate::testing::env`] in
+/// every environment but Pipeline. Its `trace` shares a [`TraceCollector`] (a
+/// [`FuzzTraceCollector`] under `fuzz: afl`), and its `context` is `Arc<C>`
+/// (`Arc<()>` without `context:`). Name it `env`, or destructure it.
 ///
 /// # Environments
 ///
@@ -172,19 +174,20 @@ macro_rules! __tb_accept_guided_config {
 /// # Top-level keys
 ///
 /// - `name:` names the test function, and a scenario with `fuzz: afl` omits it.
-/// - `spec:` takes an AssertSpec type (its latest version), or `config:` takes a ScenarioConfig.
+/// - `spec:` takes an AssertSpec type and grades with its latest version, or
+///   `config:` takes the result of [`ScenarioConfigBuilder::build`].
 /// - The optional `fuzz: afl` makes the scenario an AFL target (Bare, Servlet,
-///   Hive, or Cluster). Every environment wraps `afl::fuzz!` and passes a
-///   [`FuzzTraceCollector`] into the same runner the named test uses, so each
-///   AFL iteration verifies its specs and its CSP process. The key needs the
-///   `testing-fuzz` feature and `csp:`, the one process that steers the
-///   oracle and grades the CSP layer. A `config:` that names a process too is
-///   refused when the run starts, and a scenario with an environment and no
-///   `csp:` fails to compile.
+///   Hive, or Cluster). Each of those environments wraps `afl::fuzz!` and
+///   passes a [`FuzzTraceCollector`] into the same runner the named test uses,
+///   so each AFL iteration verifies its specs and its CSP process. The key
+///   needs the `testing-fuzz` feature and `csp:`, the one process that steers
+///   the oracle and grades the CSP layer. A `config:` that also names a
+///   process fails the run when it starts, and a scenario with an environment
+///   and no `csp:` fails to compile.
 ///
 /// # Environment-block keys
 ///
-/// - `context:` is a fixture, evaluated once per test and shared as `Arc<C>`.
+/// - `context:` is a fixture that the test evaluates once and shares as `Arc<C>`.
 ///
 /// [`SetupEnv`]: crate::testing::env::SetupEnv
 /// [`ClientEnv`]: crate::testing::env::ClientEnv
@@ -195,6 +198,7 @@ macro_rules! __tb_accept_guided_config {
 /// [`TraceCollector`]: crate::trace::TraceCollector
 /// [`FuzzTraceCollector`]: crate::testing::fuzz::FuzzTraceCollector
 /// [`PipelineBuilder`]: crate::utils::task::PipelineBuilder
+/// [`ScenarioConfigBuilder::build`]: crate::testing::ScenarioConfigBuilder::build
 /// [`TokioListener`]: crate::transport::tcp::async::TokioListener
 #[macro_export]
 macro_rules! tb_scenario {
@@ -219,8 +223,8 @@ macro_rules! tb_scenario {
 		$crate::tb_scenario! {
 			fuzz: afl,
 			csp: $csp_type,
-			// The guided arms take the process from `csp:` alone, for the
-			// oracle and for the CSP layer both.
+			// The guided arms take the process from `csp:` alone, and both the
+			// oracle and the CSP layer read it.
 			config: $crate::testing::ScenarioConfig::builder()
 				.with_spec(<$spec>::latest())
 				.build(),
@@ -230,10 +234,9 @@ macro_rules! tb_scenario {
 
 	// The fuzz variant that feeds raw bytes into a decoder.
 	//
-	// The variant runs the body alone, with no oracle and no scenario. A
-	// decoder's contract is that arbitrary bytes produce a typed error, so the
-	// property under test is that the body returns at all, and there is no
-	// trace to grade.
+	// The variant passes each input straight to the body, outside an oracle
+	// and a scenario. A decoder's contract is that arbitrary bytes produce a
+	// typed error, so the one property under test is that the body returns.
 	(
 		fuzz: afl,
 		raw: $body:expr
@@ -249,9 +252,9 @@ macro_rules! tb_scenario {
 			}
 			{
 				fn main() {
-					// Smoke build: the target still has to compile and run
-					// once, so a decoder that cannot handle an empty input is
-					// caught without AFL.
+					// Smoke build: the target still compiles and runs once, so
+					// this main, which needs no AFL, catches a decoder that
+					// fails on an empty input.
 					$crate::testing::macros::__tb_call_raw_fuzz($body, &[]);
 				}
 			}
@@ -262,7 +265,7 @@ macro_rules! tb_scenario {
 	// compile.
 	//
 	// A guided run reads its input through the CSP process that `csp:` names,
-	// so a scenario with an environment under `fuzz: afl` names one.
+	// so a scenario with an environment under `fuzz: afl` needs one.
 	(
 		fuzz: afl,
 		$(spec: $spec:ty,)?
@@ -274,23 +277,30 @@ macro_rules! tb_scenario {
 		);
 	};
 
-	// The helper that grades a finished scenario.
+	// The internal arm that grades a finished scenario.
 	(@grade $config:expr, $trace:expr, $exec_result:expr) => {
 		// An AFL iteration whose input ran out drove a prefix of a run, not a
-		// violation. Grading it would report every short mutation as a finding.
+		// violation. A grade of that prefix would report every short mutation
+		// as a finding.
 		if $exec_result.as_ref().err().is_some_and(|error| error.is_fuzz_input_exhausted()) {
 			return;
 		}
 
 		let collector = ::core::convert::AsRef::<$crate::trace::TraceCollector>::as_ref(&$trace);
-		let hook_ctx = $crate::testing::HookContext::build(&$config, collector, $exec_result);
+		let built = $crate::testing::HookContext::build(&$config, collector, $exec_result);
+		// A refused exploration event leaves the scenario ungraded, so the
+		// test fails on the error rather than on a verdict.
+		let hook_ctx = match built {
+			::core::result::Result::Ok(hook_ctx) => hook_ctx,
+			::core::result::Result::Err(error) => ::core::panic!("Scenario verification failed: {}", error),
+		};
 		$crate::tb_scenario!(@verify_and_call_hooks $config, hook_ctx);
 	};
 
-	// The helper that reads the verdict and calls the hooks.
+	// The internal arm that reads the verdict and calls the hooks.
 	(@verify_and_call_hooks $config:expr, $hook_ctx:expr) => {
-		// The verdict is read once, here. Every layer reached it through
-		// `ScenarioVerdict::from_layers`, and the body's own result reached it
+		// This arm reads the verdict once. Every layer reaches it through
+		// `ScenarioVerdict::explored`, and the body's own result reaches it
 		// through Layer 1.
 		match $hook_ctx.outcome() {
 			Err(violations) => {
@@ -396,8 +406,8 @@ macro_rules! tb_scenario {
 	// The internal Tokio AFL mains.
 	//
 	// The Servlet, Hive, and Cluster `fuzz: afl` arms use them. Each AFL
-	// iteration builds a `FuzzTraceCollector::new` (over empty bytes in the
-	// smoke main) and forwards into the matching `@run_*` body. The AFL main
+	// iteration builds a `FuzzTraceCollector`, over empty bytes in the smoke
+	// main, and forwards into the matching `@run_*` body. The AFL main
 	// creates its Tokio runtime inside the fuzz closure, so no worker thread
 	// is live before AFL's forkserver handoff.
 	(@afl_async
@@ -810,13 +820,14 @@ macro_rules! tb_scenario {
 		$crate::tb_scenario!(@grade config, trace, exec_result);
 	}};
 
-	// The internal Servlet client setup that connects by default.
+	// The internal setup of the default Servlet client, for a block with no
+	// `setup:` key.
 	(@servlet_client $trace:expr, $context:expr, $addr:expr) => {{
 		use $crate::transport::tcp::r#async::TokioListener;
 		use $crate::transport::{ClientBuilder, ConnectionBuilder};
 
 		// The default servlet scenario provisions no trust store, so the
-		// scenario runs in the clear and says so.
+		// scenario runs in the clear, and `allow_cleartext` says so.
 		let builder = ClientBuilder::<TokioListener>::builder().allow_cleartext().build();
 		builder
 			.connect($addr)
@@ -924,8 +935,8 @@ macro_rules! tb_scenario {
 	}};
 
 	// The internal runner of the Cluster environment.
-	// `start` returns the cluster. The optional `hives` returns futures that
-	// `tb_scenario!` awaits and registers. `client` owns the cluster for
+	// `start` returns the cluster, the optional `hives` returns futures that
+	// `tb_scenario!` awaits and registers, and `client` owns the cluster for
 	// registry assertions and the consuming `stop`.
 	//
 	// The caller supplies `trace`: named tests pass `config.trace()`, and AFL
@@ -958,8 +969,8 @@ macro_rules! tb_scenario {
 		.await
 		.expect("Failed to start cluster");
 
-		// Type-erased as consuming closures, so the list has one type
-		// whether or not the scenario starts hives.
+		// Each hive stop is type-erased as a consuming closure, so the list
+		// has one type whether or not the scenario starts hives.
 		#[allow(unused_mut)]
 		let mut hive_stops: Vec<$crate::testing::Teardown> = Vec::new();
 		$(
@@ -998,8 +1009,9 @@ macro_rules! tb_scenario {
 	}};
 
 	// The internal runner of the Hive environment.
-	// It runs as Cluster does, without registration: `start` returns the hive
-	// and `client` owns it. The caller supplies `trace`, as for `@run_cluster`.
+	// It runs as Cluster does and skips the registration: `start` returns the
+	// hive and `client` owns it. The caller supplies `trace`, as for
+	// `@run_cluster`.
 	(@run_hive
 		config: $config:expr,
 		trace: $trace:expr,
@@ -1069,10 +1081,10 @@ crate::__tb_if_test! {
 			}
 
 			// Layer 2 CSP failures must travel the same failure path as Layer 1
-			// assertion failures: on_fail runs before the panic, so logging and
-			// cleanup hooks observe the regression.
+			// assertion failures: `on_fail` runs before the panic, so logging
+			// and cleanup hooks observe the regression.
 			#[test]
-			fn csp_failure_invokes_on_fail_before_panicking() {
+			fn csp_failure_invokes_on_fail_before_panicking() -> Result<(), crate::TightBeamError> {
 				let failed = Arc::new(AtomicBool::new(false));
 				let observed = Arc::clone(&failed);
 				let hooks = TestHooks::on_fail(move |_context, _violations| {
@@ -1083,13 +1095,14 @@ crate::__tb_if_test! {
 					ScenarioConfig::builder().with_csp(AlwaysInvalidSpec).with_hooks(hooks).build()
 				);
 				let trace = config.trace();
-				let hook_ctx = HookContext::build(&config, &trace, Ok::<(), crate::TightBeamError>(()));
+				let hook_ctx = HookContext::build(&config, &trace, Ok::<(), crate::TightBeamError>(()))?;
 				let outcome = catch_unwind(AssertUnwindSafe(|| {
 					crate::tb_scenario!(@verify_and_call_hooks config, hook_ctx);
 				}));
 
 				assert!(outcome.is_err());
 				assert!(failed.load(Ordering::SeqCst));
+				Ok(())
 			}
 		}
 	}

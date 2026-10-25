@@ -22,8 +22,8 @@ use crate::colony::hive::{
 use crate::macros::server::{serve_connection, AcceptedConnection, SharedHandler};
 use crate::policy::{GatePolicy, SessionContext, TransitStatus};
 use crate::runtime::rt;
-use crate::trace::TraceCollector;
-use crate::transport::accept::AcceptPlane;
+use crate::trace::{TraceCollector, TraceHandle};
+use crate::transport::accept::{AcceptPlane, ConnectionTerms};
 use crate::transport::handshake::negotiation::TransportOffer;
 use crate::transport::multiplex::MuxCapable;
 use crate::transport::policy::PolicyConfig;
@@ -37,7 +37,7 @@ use crate::{Frame, TightBeamError};
 /// A drain waits on this: a control connection idles between commands by
 /// design, so an open connection counts as work only while it holds a
 /// command. The last guard to drop wakes every waiter, so a drain ends the
-/// moment the hive falls idle rather than on a poll.
+/// moment the hive falls idle.
 #[derive(Clone, Default)]
 pub struct InFlight(Arc<InFlightState>);
 
@@ -71,8 +71,9 @@ impl InFlight {
 
 	/// Resolves once no command is in flight.
 	///
-	/// The notification is registered before the count is read, so a guard
-	/// that drops between the read and the await still wakes this waiter.
+	/// The method registers the notification before it reads the count, so
+	/// a guard that drops between the read and the await still wakes this
+	/// waiter.
 	pub async fn idle(&self) {
 		loop {
 			let notified = self.0.idle.notified();
@@ -86,9 +87,8 @@ impl InFlight {
 
 	/// Waits for the hive to fall idle, or for `timeout` to pass on `clock`.
 	///
-	/// The two are raced rather than polled, so a hive on a clock that
-	/// only a test advances still settles the moment its last command
-	/// finishes.
+	/// The method races the two waits, so a hive on a clock that only a test
+	/// advances still settles the moment its last command finishes.
 	pub async fn settle(&self, clock: &dyn Clock, timeout: Duration) -> Settled {
 		let idle = pin!(self.idle());
 		let expired = pin!(clock.sleep(timeout));
@@ -129,11 +129,11 @@ pub struct HiveControlCtx<P: Protocol> {
 	pub drain: DrainMode,
 	/// The count of commands in flight, which a drain waits on to reach zero.
 	pub in_flight: InFlight,
-	/// The intra-hive routing context, which [`HiveInstances`] updates as
-	/// instances are inserted or removed.
+	/// The intra-hive routing context, which [`HiveInstances`] updates as it
+	/// inserts or removes instances.
 	pub hive_context: Arc<HiveContextImpl<P>>,
 	/// The one admission gate for cluster commands. It is [`None`] when the
-	/// hive has no trust store, and then every command is refused.
+	/// hive has no trust store, and then the hive refuses every command.
 	pub security: Option<ClusterSecurityGate>,
 }
 
@@ -148,13 +148,22 @@ where
 	/// Serves the hive control plane on `listener` through `plane`.
 	///
 	/// Each accepted connection dispatches through
-	/// [`HiveControlCtx::handle_command`] against this context.
+	/// [`HiveControlCtx::handle_command`] against this context, and records
+	/// into the trace of this context from before its handshake.
+	///
+	/// # Warning
+	///
+	/// The trace records every connection, a peer that never authenticates
+	/// included. The default `BoundedMemorySink` drops each event past
+	/// `max_events`, the hive's own included, so a long-lived hive needs an
+	/// `EventSink` that forwards each event, or a reader that drains the trace.
 	pub fn serve(
 		self,
 		listener: P::Listener,
 		plane: AcceptPlane,
 		mux_offer: Option<Arc<TransportOffer>>,
 	) -> rt::JoinHandle {
+		let terms = ConnectionTerms::new(TraceHandle::new(Arc::clone(&self.trace)), mux_offer);
 		let ctx = Arc::new(self);
 		let handler = SharedHandler::from(move |frame: Frame, session| {
 			let ctx = Arc::clone(&ctx);
@@ -162,9 +171,7 @@ where
 		});
 
 		rt::spawn(
-			plane.accept_on(listener, move |mut transport: <P::Listener as Protocol>::Transport| {
-				transport = transport.with_mux_offer(mux_offer.clone());
-
+			plane.accept_owned(listener, terms, move |transport: <P::Listener as Protocol>::Transport| {
 				let handler = handler.clone();
 				async move { serve_connection(transport, handler, None, None).await }
 			}),
@@ -341,8 +348,8 @@ mod tests {
 		Arc::clone(clock) as Arc<dyn Clock>
 	}
 
-	/// `settle` bounded by [`HANG_GUARD`], so a test whose wait never ends
-	/// fails rather than hangs.
+	/// `settle` bounded by [`HANG_GUARD`], so a wait that never ends fails its
+	/// test.
 	async fn bounded(settle: impl Future<Output = Settled>) -> Result<Settled, TightBeamError> {
 		tokio::time::timeout(HANG_GUARD, settle)
 			.await
@@ -367,9 +374,9 @@ mod tests {
 		Ok(())
 	}
 
-	/// The wait ends the moment the last command finishes, with the hive
-	/// clock never advanced, so a drain on a manual clock does not hang on
-	/// a poll.
+	/// The wait ends the moment the last command finishes, while the hive
+	/// clock stands still, so a drain on a manual clock settles on the drop of
+	/// its last guard.
 	#[tokio::test]
 	async fn a_settle_ends_when_the_last_command_finishes() -> Result<(), TightBeamError> {
 		let in_flight = InFlight::default();

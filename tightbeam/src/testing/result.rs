@@ -1,8 +1,9 @@
-//! Scenario verdict and the unified scenario result
+//! The verdict of each verification layer, and the result of a finished
+//! scenario.
 //!
 //! Layer 1 grades the trace and the body's own result against the assertion
-//! specs, Layer 2 grades the trace against the CSP process, and Layer 3
-//! against the refinement model.
+//! specs, Layer 2 grades the trace against the CSP process, and Layer 3 grades
+//! it against the refinement model.
 
 use core::fmt::{Display, Formatter};
 
@@ -14,43 +15,77 @@ use crate::trace::ConsumedTrace;
 
 /// What one verification layer reported about a run.
 ///
-/// A refutation meets an expected-violation expectation. An undecided check
-/// does not, which is why they are separate.
+/// A refutation meets an expected-violation expectation and an undecided
+/// check does not, so the two are separate variants.
 enum Reported {
-	/// Found nothing to object to, or did not run.
+	/// The layer accepted the run, or the configuration skipped the layer.
 	Accepted,
-	/// Rejected the run, with the violation it found.
+	/// The layer rejected the run, with the violation it found.
 	Rejected(SpecViolation),
-	/// Stopped before deciding, with the report that says so.
+	/// The layer stopped before it decided, with the report that says so.
 	Undecided(SpecViolation),
 }
 
 /// What each verification layer decided about one scenario.
 ///
-/// The one decider for a scenario's pass or fail: [`ScenarioVerdict::outcome`]
-/// grades every layer together, so no call site derives it again. A layer the
-/// configuration did not run contributes nothing.
+/// [`ScenarioVerdict::outcome`] is the one decider of a scenario's pass or
+/// fail. It grades every layer together, so every call site reads the same
+/// answer. A layer that the configuration skipped counts as accepted.
 #[derive(Debug)]
 pub struct ScenarioVerdict {
 	layer1: Result<(), SpecViolation>,
 	layer2: Option<CspValidationResult>,
-	layer3: Option<FdrVerdict>,
+	/// The Layer 3 verdict with its exploration, in a box, so a verdict with
+	/// no Layer 3 stays small.
+	layer3: Option<Box<Layer3>>,
+}
+
+/// What Layer 3 decided, and the events that its exploration recorded into a
+/// trace of its own.
+#[derive(Debug)]
+pub(crate) struct Layer3 {
+	/// What the FDR model decided.
+	verdict: FdrVerdict,
+	/// The events that the exploration recorded, apart from the trace of the
+	/// run.
+	exploration: ConsumedTrace,
+}
+
+impl Layer3 {
+	/// Pairs the verdict of Layer 3 with the events that its exploration
+	/// recorded.
+	pub(crate) fn new(verdict: FdrVerdict, exploration: ConsumedTrace) -> Self {
+		Self { verdict, exploration }
+	}
 }
 
 impl ScenarioVerdict {
 	/// Assembles a verdict from what each layer produced.
 	///
-	/// The signature holds in every feature configuration. A layer the
-	/// configuration did not run passes `None`.
+	/// The signature holds in every feature configuration. The caller passes
+	/// `None` for a layer that the configuration skipped, and a Layer 3 verdict
+	/// from here carries an empty exploration.
 	pub fn from_layers(
 		layer1: Result<(), SpecViolation>,
 		layer2: Option<CspValidationResult>,
 		layer3: Option<FdrVerdict>,
 	) -> Self {
-		Self { layer1, layer2, layer3 }
+		let unexplored = |verdict| Layer3::new(verdict, ConsumedTrace::new());
+		Self::explored(layer1, layer2, layer3.map(unexplored))
 	}
 
-	/// The Layer 1 violation, when the assertion specs rejected the trace.
+	/// Assembles a verdict from what each layer produced, where Layer 3 also
+	/// carries the events that its exploration recorded.
+	pub(crate) fn explored(
+		layer1: Result<(), SpecViolation>,
+		layer2: Option<CspValidationResult>,
+		layer3: Option<Layer3>,
+	) -> Self {
+		Self { layer1, layer2, layer3: layer3.map(Box::new) }
+	}
+
+	/// The Layer 1 violation, when Layer 1 rejected the trace or the body's own
+	/// result.
 	pub fn spec(&self) -> Option<&SpecViolation> {
 		self.layer1.as_ref().err()
 	}
@@ -62,16 +97,58 @@ impl ScenarioVerdict {
 
 	/// The Layer 3 verdict, when the configuration named an FDR model.
 	pub fn fdr(&self) -> Option<&FdrVerdict> {
-		self.layer3.as_ref()
+		let layer3 = self.layer3.as_deref();
+		layer3.map(|layer3| &layer3.verdict)
+	}
+
+	/// The exploration events of Layer 3, when the configuration named an FDR
+	/// model.
+	///
+	/// - A trace of their own holds the events, apart from the trace of the run.
+	/// - The scenario's trace sets the instrumentation settings, and
+	///   `FdrExplorer::explore_into` records the events they ask for.
+	/// - The `overflowed` field of the trace reads `true` when its sink dropped events.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::instrumentation::events::ENABLED_SET_SAMPLE;
+	/// use tightbeam::instrumentation::TbInstrumentationConfig;
+	/// use tightbeam::testing::fdr::FdrConfig;
+	/// use tightbeam::testing::specs::csp::{Event, Process, State};
+	/// use tightbeam::testing::ScenarioConfig;
+	/// use tightbeam::trace::{ConsumedTrace, TraceCollector, TraceConfig};
+	///
+	/// let process = Process::builder("Send")
+	///     .initial_state(State("S0"))
+	///     .add_observable(Event("send"))
+	///     .add_transition(State("S0"), Event("send"), State("S1"))
+	///     .add_terminal(State("S1"))
+	///     .build()?;
+	///
+	/// let settings = TbInstrumentationConfig { sample_enabled_sets: true, ..Default::default() };
+	/// let trace = TraceCollector::from(TraceConfig::with_instrumentation(settings));
+	/// let builder = ScenarioConfig::builder().with_csp(process).with_fdr(FdrConfig::default());
+	/// let config = builder.with_trace(trace).build()?;
+	///
+	/// let verdict = config.verify(&ConsumedTrace::new(), Ok(()))?;
+	/// let exploration = verdict.exploration();
+	/// let samples = exploration.map(|exploration| exploration.count_event_urn(ENABLED_SET_SAMPLE));
+	/// assert_eq!(samples, Some(2));
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	pub fn exploration(&self) -> Option<&ConsumedTrace> {
+		let layer3 = self.layer3.as_deref();
+		layer3.map(|layer3| &layer3.exploration)
 	}
 
 	/// Grades the scenario against what it expected.
 	///
 	/// [`Expect::Pass`] holds when every layer accepted.
-	/// [`Expect::Violation`] holds when the named layer rejects and every
-	/// other accepts, so a negative test fails both on a missing rejection and
-	/// on one from a different layer. A layer that could not decide meets no
-	/// expectation and is reported whatever the scenario expected.
+	/// [`Expect::Violation`] holds when the named layer rejects and every other
+	/// accepts, so a negative test fails both on a missing rejection and on one
+	/// from a different layer. A layer that could not decide meets no
+	/// expectation, and the grading reports it whatever the scenario expected.
 	///
 	/// # Errors
 	///
@@ -102,7 +179,7 @@ impl ScenarioVerdict {
 		}
 	}
 
-	/// What `layer` reported. A layer that did not run accepts.
+	/// What `layer` reported. A layer that the configuration skipped accepts.
 	fn reported(&self, layer: Layer) -> Reported {
 		match layer {
 			Layer::Assertion => match self.layer1.as_ref().err() {
@@ -121,7 +198,7 @@ impl ScenarioVerdict {
 				Reported::Rejected(SpecViolation::CspProcessViolation(result.violations.clone()))
 			}
 			Layer::Refinement => {
-				let Some(verdict) = self.layer3.as_ref() else {
+				let Some(verdict) = self.fdr() else {
 					return Reported::Accepted;
 				};
 
@@ -141,8 +218,8 @@ impl Default for ScenarioVerdict {
 	}
 }
 
-/// A finished scenario: its trace, the specs it was graded against, and the
-/// [`ScenarioVerdict`] every layer contributed to.
+/// A finished scenario: its trace, the assertion specs that graded it, and the
+/// [`ScenarioVerdict`] that every layer contributed to.
 #[derive(Debug)]
 pub struct ScenarioResult {
 	trace: ConsumedTrace,
@@ -153,7 +230,7 @@ pub struct ScenarioResult {
 }
 
 impl ScenarioResult {
-	/// Create a scenario result from Layer 1 (spec) verification only
+	/// Builds a scenario result from the Layer 1 result alone.
 	pub fn from_spec_result(result: Result<(), SpecViolation>) -> Self {
 		Self {
 			trace: ConsumedTrace::new(),
@@ -169,12 +246,12 @@ impl ScenarioResult {
 		&self.trace
 	}
 
-	/// The single assertion spec, for the `single_spec` variant.
+	/// The single assertion spec of the result, when it holds one.
 	pub fn assert_spec(&self) -> Option<&BuiltAssertSpec> {
 		self.assert_spec.as_ref()
 	}
 
-	/// Every assertion spec, for the `multi_specs` variant.
+	/// Every assertion spec that the result holds.
 	pub fn assert_specs(&self) -> &[BuiltAssertSpec] {
 		&self.assert_specs
 	}
@@ -186,8 +263,8 @@ impl ScenarioResult {
 
 	/// Whether the run decided what the scenario expected.
 	///
-	/// Derived on each read, so a result cannot report a pass its layers do
-	/// not support.
+	/// The result derives the answer on each read, so it reports a pass only
+	/// when its layers support one.
 	pub fn passed(&self) -> bool {
 		self.outcome().is_ok()
 	}

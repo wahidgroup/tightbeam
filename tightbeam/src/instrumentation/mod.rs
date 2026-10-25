@@ -1,16 +1,16 @@
 //! Instrumentation subsystem.
 //!
-//! Implements the normative event taxonomy and evidence artifact hashing
-//! defined for the tightbeam protocol.
+//! This module implements the normative event taxonomy and the hash of the
+//! evidence artifact that the tightbeam protocol defines.
 //!
-//! Feature gating contract:
+//! The feature flags set this contract:
 //! - The module and the [`events`] URN inventory are available whenever
-//!   `std` is enabled, so callers can label trace records without opting
-//!   into TbEvent.
-//! - When `instrument` is disabled, the emit APIs are stubs that do nothing.
+//!   `std` is enabled, so callers can label trace records whether or not
+//!   they opt into TbEvent.
+//! - When `instrument` is disabled, the emit APIs are stubs that discard each event.
 //! - When `instrument` is enabled, emission MUST be amortized O(1) and overflow MUST set a flag.
 //!
-//! Evidence hashing uses SHA3-256 over a stable length-prefixed byte
+//! The evidence hash uses SHA3-256 over a stable length-prefixed byte
 //! layout. `TbEvent` and `EvidenceArtifact` themselves encode as DER.
 
 #![allow(clippy::module_name_repetitions)]
@@ -66,34 +66,51 @@ pub mod stub {
 		/// Whether the trace records the internal events: the handler entry and
 		/// exit, and the crypto, compress, route, and policy steps.
 		///
+		/// Each event fires at the step its constant names: [`HANDLER_ENTER`],
+		/// [`HANDLER_EXIT`], [`CRYPTO_STEP`], [`COMPRESS_STEP`],
+		/// [`ROUTE_STEP`], and [`POLICY_EVAL`].
+		///
 		/// # Warning
 		///
-		/// No code reads this flag yet, so either value gives the same trace.
+		/// A build without `instrument` emits no event, so either value gives
+		/// the same trace.
+		///
+		/// [`HANDLER_ENTER`]: super::events::HANDLER_ENTER
+		/// [`HANDLER_EXIT`]: super::events::HANDLER_EXIT
+		/// [`CRYPTO_STEP`]: super::events::CRYPTO_STEP
+		/// [`COMPRESS_STEP`]: super::events::COMPRESS_STEP
+		/// [`ROUTE_STEP`]: super::events::ROUTE_STEP
+		/// [`POLICY_EVAL`]: super::events::POLICY_EVAL
 		pub enable_internal_detail: bool,
-		/// Whether the FDR exploration records a sample of the enabled event
-		/// set of each state, as an [`ENABLED_SET_SAMPLE`] event.
+		/// Whether FDR exploration records, for each state it visits, the
+		/// observable events that state offers, as an [`ENABLED_SET_SAMPLE`]
+		/// event.
 		///
 		/// # Warning
 		///
-		/// No code reads this flag yet, so either value gives the same trace.
+		/// A build without `instrument` emits no event, so either value gives
+		/// the same trace.
 		///
 		/// [`ENABLED_SET_SAMPLE`]: super::events::ENABLED_SET_SAMPLE
 		pub sample_enabled_sets: bool,
-		/// Whether the FDR exploration records a snapshot of the refusals of
-		/// each state, as a [`REFUSAL_SNAPSHOT`] event.
+		/// Whether FDR exploration records, for each stable or accepting state
+		/// it visits, the refusal set of that state, as a [`REFUSAL_SNAPSHOT`]
+		/// event.
 		///
 		/// # Warning
 		///
-		/// No code reads this flag yet, so either value gives the same trace.
+		/// A build without `instrument` emits no event, so either value gives
+		/// the same trace.
 		///
 		/// [`REFUSAL_SNAPSHOT`]: super::events::REFUSAL_SNAPSHOT
 		pub sample_refusals: bool,
-		/// Whether the FDR exploration runs its divergence heuristics and
-		/// records each divergence it finds, as a [`DIVERGENCE_DETECT`] event.
+		/// Whether FDR exploration records the hidden run of each divergence it
+		/// finds, as a [`DIVERGENCE_DETECT`] event.
 		///
 		/// # Warning
 		///
-		/// No code reads this flag yet, so either value gives the same trace.
+		/// A build without `instrument` emits no event, so either value gives
+		/// the same trace.
 		///
 		/// [`DIVERGENCE_DETECT`]: super::events::DIVERGENCE_DETECT
 		pub divergence_heuristics: bool,
@@ -135,7 +152,7 @@ pub mod stub {
 pub mod active {
 	use core::sync::atomic::{AtomicBool, Ordering};
 
-	use std::sync::Mutex;
+	use std::sync::{Mutex, PoisonError};
 
 	use crate::crypto::hash::{Digest, Sha3_256};
 	use crate::der::asn1::{ContextSpecific, ContextSpecificRef, OctetString, OctetStringRef};
@@ -157,7 +174,8 @@ pub mod active {
 		/// The elapsed time of the instrumented operation, a span length.
 		pub duration_ns: Option<u64>,
 		/// The instant the event occurred, relative to the trace clock origin.
-		/// It is a point in time, which deadline start and end matching reads.
+		/// It is a point in time, which a deadline check reads to pair a start
+		/// with its end.
 		pub timestamp_ns: Option<u64>,
 		/// The event flags.
 		pub flags: u32,
@@ -165,7 +183,7 @@ pub mod active {
 		pub extras: Option<Vec<u8>>,
 	}
 
-	/// Context-specific tag numbers for `TbEvent` optional fields.
+	/// The context-specific tag numbers of the optional fields of `TbEvent`.
 	///
 	/// Every OPTIONAL field carries an EXPLICIT context tag so adjacent
 	/// optionals of the same universal type (`duration_ns` and `timestamp_ns`,
@@ -185,8 +203,8 @@ pub mod active {
 		ContextSpecific { tag_number, tag_mode: TagMode::Explicit, value }
 	}
 
-	/// The borrowing form of `tagged` for encode-only paths, so wrapping the
-	/// value in a context-specific tag needs no clone.
+	/// The borrowed form of `tagged` for a path that only encodes, so the
+	/// context-specific tag wraps the value with no clone.
 	fn tagged_ref<T>(tag_number: TagNumber, value: &T) -> ContextSpecificRef<'_, T> {
 		ContextSpecificRef { tag_number, tag_mode: TagMode::Explicit, value }
 	}
@@ -260,8 +278,9 @@ pub mod active {
 			reader: &mut R,
 			header: crate::der::Header,
 		) -> crate::der::Result<Self> {
-			// Bounds the body to the declared length, so a nested event cannot
-			// read past its own. `sequence` would also demand a second tag.
+			// `read_nested` bounds the body to the declared length, so a nested
+			// event cannot read past its own. `sequence` would also demand a
+			// second tag.
 			reader.read_nested(header.length, |reader| {
 				let seq_val = u32::decode(reader)?;
 				let urn_decoded = Urn::decode(reader)?;
@@ -322,34 +341,56 @@ pub mod active {
 		/// Whether the trace records the internal events: the handler entry and
 		/// exit, and the crypto, compress, route, and policy steps.
 		///
-		/// # Warning
+		/// Each event fires at the step its constant names: [`HANDLER_ENTER`],
+		/// [`HANDLER_EXIT`], [`CRYPTO_STEP`], [`COMPRESS_STEP`],
+		/// [`ROUTE_STEP`], and [`POLICY_EVAL`].
 		///
-		/// No code reads this flag yet, so either value gives the same trace.
+		/// [`HANDLER_ENTER`]: super::events::HANDLER_ENTER
+		/// [`HANDLER_EXIT`]: super::events::HANDLER_EXIT
+		/// [`CRYPTO_STEP`]: super::events::CRYPTO_STEP
+		/// [`COMPRESS_STEP`]: super::events::COMPRESS_STEP
+		/// [`ROUTE_STEP`]: super::events::ROUTE_STEP
+		/// [`POLICY_EVAL`]: super::events::POLICY_EVAL
 		pub enable_internal_detail: bool,
-		/// Whether the FDR exploration records a sample of the enabled event
-		/// set of each state, as an [`ENABLED_SET_SAMPLE`] event.
+		/// Whether `FdrExplorer::explore_into` records, for each state it
+		/// visits, the observable events that state offers, as an
+		/// [`ENABLED_SET_SAMPLE`] event.
+		///
+		/// A scenario records these events into the trace that
+		/// `ScenarioVerdict::exploration` returns.
 		///
 		/// # Warning
 		///
-		/// No code reads this flag yet, so either value gives the same trace.
+		/// Each visited state adds events to the trace, so a large exploration
+		/// can pass `max_events`, and the default sink then drops the later
+		/// events. The `overflowed` field of the scenario's exploration trace
+		/// then reads `true`.
 		///
 		/// [`ENABLED_SET_SAMPLE`]: super::events::ENABLED_SET_SAMPLE
 		pub sample_enabled_sets: bool,
-		/// Whether the FDR exploration records a snapshot of the refusals of
-		/// each state, as a [`REFUSAL_SNAPSHOT`] event.
+		/// Whether `FdrExplorer::explore_into` records, for each stable or
+		/// accepting state it visits, the refusal set of that state, as a
+		/// [`REFUSAL_SNAPSHOT`] event.
+		///
+		/// A scenario records these events into the trace that
+		/// `ScenarioVerdict::exploration` returns.
 		///
 		/// # Warning
 		///
-		/// No code reads this flag yet, so either value gives the same trace.
+		/// Each visited state adds events to the trace, so a large exploration
+		/// can pass `max_events`, and the default sink then drops the later
+		/// events. The `overflowed` field of the scenario's exploration trace
+		/// then reads `true`.
 		///
 		/// [`REFUSAL_SNAPSHOT`]: super::events::REFUSAL_SNAPSHOT
 		pub sample_refusals: bool,
-		/// Whether the FDR exploration runs its divergence heuristics and
-		/// records each divergence it finds, as a [`DIVERGENCE_DETECT`] event.
+		/// Whether `FdrExplorer::explore_into` records the hidden run of each
+		/// divergence it finds, as a [`DIVERGENCE_DETECT`] event.
 		///
-		/// # Warning
-		///
-		/// No code reads this flag yet, so either value gives the same trace.
+		/// - A state diverges when a hidden run from it reaches a cycle of hidden
+		///   events, or passes `max_internal_run`. Every exploration runs this
+		///   check, and a divergence refutes `divergence_free`.
+		/// - A scenario records these events into the trace that `ScenarioVerdict::exploration` returns.
 		///
 		/// [`DIVERGENCE_DETECT`]: super::events::DIVERGENCE_DETECT
 		pub divergence_heuristics: bool,
@@ -373,7 +414,7 @@ pub mod active {
 		}
 	}
 
-	/// Event retention policy for a
+	/// The event retention policy of a
 	/// [`TraceCollector`](crate::trace::TraceCollector), which delivers every
 	/// emitted [`TbEvent`] to exactly one sink.
 	///
@@ -381,33 +422,61 @@ pub mod active {
 	///   the collector MUST use [`BoundedMemorySink`] sized by `max_events`.
 	/// - Implementations MAY forward to an exporter, spill to disk, or retain unbounded history.
 	///
-	/// [`Self::emit`] runs on the hot control-plane path: implementations
-	/// MUST be amortized O(1) and MUST NOT block on I/O (buffer and defer).
+	/// [`Self::emit`] and [`Self::retains`] run on the hot path of the control
+	/// plane, so an implementation MUST be amortized O(1) and MUST NOT block on
+	/// I/O. To meet this, a sink buffers its I/O and defers it.
 	pub trait EventSink: Send + Sync {
 		/// Retain or forward one event.
 		fn emit(&self, event: TbEvent);
 
 		/// Remove and return all retained events, ordered by [`TbEvent::seq`].
 		///
-		/// Feeds spec verification and [`EvidenceArtifact::finalize`].
-		/// Forward-only sinks that retain nothing MUST return an empty vector.
+		/// The drained events feed spec verification and
+		/// [`EvidenceArtifact::finalize`]. Forward-only sinks that retain
+		/// nothing MUST return an empty vector.
 		fn drain(&self) -> Vec<TbEvent>;
 
-		/// A sticky latch that reads `true` once any event was dropped since
-		/// creation.
+		/// A sticky latch that reads `true` once the sink has dropped any event
+		/// since its creation.
 		///
-		/// Feeds the `overflow` field of [`EvidenceArtifact::finalize`].
-		/// Evidence from a truncated trace MUST NOT claim completeness.
+		/// The latch feeds the `overflow` field of
+		/// [`EvidenceArtifact::finalize`]. Evidence from a truncated trace
+		/// MUST NOT claim completeness.
 		fn overflowed(&self) -> bool;
+
+		/// Whether this sink keeps the next event that it receives.
+		///
+		/// The collector asks before it builds an event, after it takes the
+		/// sequence number of the event, so an event that the sink drops costs
+		/// no allocation. A sink that answers `false` drops that event, so
+		/// [`Self::overflowed`] MUST read `true` after the answer. The default
+		/// keeps every event.
+		///
+		/// # Examples
+		///
+		/// ```
+		/// use tightbeam::instrumentation::{BoundedMemorySink, EventSink};
+		///
+		/// let full = BoundedMemorySink::new(0);
+		///
+		/// assert!(!full.retains());
+		/// assert!(full.overflowed());
+		/// ```
+		fn retains(&self) -> bool {
+			true
+		}
 	}
 
 	/// The default [`EventSink`], a bounded in-memory buffer with a sticky
 	/// overflow latch.
 	///
-	/// The sink drops each event past `max_events`, so the newest are lost and
-	/// the oldest kept, and it sets the latch. [`EventSink::drain`] frees
-	/// capacity but MUST NOT clear the latch. Dropped events still consume
-	/// collector sequence numbers, so gaps in [`TbEvent::seq`] mark truncation.
+	/// - The sink drops each event past `max_events`, so it keeps the oldest
+	///   events and loses the newest, and it sets the latch.
+	/// - [`EventSink::retains`] answers from the same bound, so the collector
+	///   builds no event that the sink drops.
+	/// - [`EventSink::drain`] frees capacity but MUST NOT clear the latch.
+	/// - Dropped events still consume collector sequence numbers, so gaps in
+	///   [`TbEvent::seq`] mark truncation.
 	#[derive(Debug)]
 	pub struct BoundedMemorySink {
 		max_events: u32,
@@ -419,6 +488,17 @@ pub mod active {
 		pub fn new(max_events: u32) -> Self {
 			Self { max_events, events: Mutex::new(Vec::new()), overflow: AtomicBool::new(false) }
 		}
+
+		/// Whether a sink that holds `held` events drops the next one, which
+		/// sets the latch.
+		fn drops_next(&self, held: usize) -> bool {
+			let full = (held as u32) >= self.max_events;
+			if full {
+				self.overflow.store(true, Ordering::Relaxed);
+			}
+
+			full
+		}
 	}
 
 	impl Default for BoundedMemorySink {
@@ -429,12 +509,11 @@ pub mod active {
 
 	impl EventSink for BoundedMemorySink {
 		fn emit(&self, event: TbEvent) {
-			// Capacity check and push happen under one lock acquisition so
-			// concurrent emitters cannot overshoot `max_events` between the
-			// check and the insert.
+			// The capacity check and the push happen under one lock
+			// acquisition, so concurrent emitters cannot overshoot
+			// `max_events` between the check and the insert.
 			if let Ok(mut events) = self.events.lock() {
-				if (events.len() as u32) >= self.max_events {
-					self.overflow.store(true, Ordering::Relaxed);
+				if self.drops_next(events.len()) {
 					return;
 				}
 
@@ -452,6 +531,14 @@ pub mod active {
 
 		fn overflowed(&self) -> bool {
 			self.overflow.load(Ordering::Relaxed)
+		}
+
+		// The answer reads the length under the lock that `emit` takes. A
+		// lock that a holder poisoned holds a whole list, because `emit` and
+		// `drain` change it in one step each.
+		fn retains(&self) -> bool {
+			let events = self.events.lock().unwrap_or_else(PoisonError::into_inner);
+			!self.drops_next(events.len())
 		}
 	}
 
@@ -548,10 +635,10 @@ mod tests {
 	use crate::der::{Decode, Encode, Tag};
 	use crate::error::Result;
 
-	/// One `TbEvent` SEQUENCE carrying `hash` as its payload-hash field.
+	/// One `TbEvent` SEQUENCE that carries `hash` as its payload-hash field.
 	///
-	/// The fields are laid out as `encode_value` writes them, so the only
-	/// thing the caller varies is the hash length.
+	/// The builder lays out the fields as `encode_value` writes them, so the
+	/// caller varies the hash length alone.
 	fn event_with_payload_hash(hash: impl AsRef<[u8]>) -> Vec<u8> {
 		let hash = hash.as_ref();
 		let octets = OctetString::new(hash).expect("test hashes wrap in an OctetString");
@@ -562,8 +649,8 @@ mod tests {
 		body.extend(tagged_hash.to_der().expect("a tagged octet string encodes"));
 		body.extend(0u32.to_der().expect("a flag word encodes"));
 
-		// `Any` writes the SEQUENCE header, so this builder does not
-		// depend on the body staying inside the short-form length.
+		// `Any` writes the SEQUENCE header, so this builder holds for a body of
+		// any length, short-form or long-form.
 		Any::new(Tag::Sequence, body)
 			.expect("the field encodings above are a well-formed SEQUENCE body")
 			.to_der()
@@ -594,8 +681,8 @@ mod tests {
 		assert_eq!(decoded.extras, event.extras);
 	}
 
-	/// The same fields, wrapped in a SEQUENCE header that declares `declared`
-	/// bytes of body rather than the body's real length.
+	/// The same fields under a SEQUENCE header that declares `declared` bytes
+	/// of body, whatever the real length of the body.
 	fn event_with_declared_length(declared: usize) -> Vec<u8> {
 		let honest = event_with_payload_hash([7u8; 32]);
 		let body = &honest[2..];
@@ -697,5 +784,16 @@ mod tests {
 		sink.emit(sample_event(1));
 		sink.drain();
 		assert!(sink.overflowed());
+	}
+
+	/// A full bounded sink refuses the next event, and the refusal sets its
+	/// overflow latch.
+	#[test]
+	fn bounded_sink_refuses_the_next_event_when_full_and_latches() {
+		let sink = BoundedMemorySink::new(1);
+		let first = sink.retains();
+		sink.emit(sample_event(0));
+
+		assert_eq!([first, sink.retains(), sink.overflowed()], [true, false, true]);
 	}
 }

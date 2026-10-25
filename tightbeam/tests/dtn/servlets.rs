@@ -2,10 +2,10 @@
 //!
 //! This module contains the servlet definitions for the 4-tier DTN
 //! architecture:
-//! - Mission Control: Receives telemetry, sends commands, validates ACKs
-//! - Earth Relay Satellite: Forwards messages between Mission Control and Mars Relay
-//! - Mars Relay Satellite: Forwards messages between Earth Relay and Rover
-//! - Rover: Executes commands, sends telemetry and ACKs
+//! - Mission Control receives telemetry, sends commands, and validates ACKs.
+//! - The Earth Relay Satellite forwards messages between Mission Control and the Mars Relay.
+//! - The Mars Relay Satellite forwards messages between the Earth Relay and the Rover.
+//! - The Rover executes commands and sends telemetry and ACKs.
 
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -54,7 +54,7 @@ use crate::dtn::{
 
 /// Behavior every node on the DTN path shares.
 trait DtnNode {
-	// Abstract methods (each servlet config implements)
+	// Each servlet config implements these required methods.
 	fn node_name(&self) -> &str;
 	fn signing_key(&self) -> &Secp256k1SigningKey;
 	fn signers(&self) -> Vec<&FrameSigner>;
@@ -62,7 +62,8 @@ trait DtnNode {
 	fn chain_processor(&self) -> &Arc<ChainProcessor>;
 	fn frame_builder(&self) -> &Arc<FrameBuilderHelper>;
 
-	/// Default trait methods (reusable across all nodes)
+	/// Whether a signer of this node verifies the signature of `frame`, by a
+	/// default method that every node shares.
 	fn verify_signature(&self, frame: &Frame) -> Result<bool, TightBeamError> {
 		if frame.nonrepudiation().is_none() {
 			return Ok(false);
@@ -77,7 +78,8 @@ trait DtnNode {
 		Ok(false)
 	}
 
-	/// Helper: Decrypt relay message
+	/// Decrypts the relay message of `frame`, or decodes it when the frame is
+	/// cleartext.
 	async fn decrypt_relay_message(&self, frame: Frame) -> Result<RelayMessage, TightBeamError> {
 		if frame.metadata().confidentiality().is_some() {
 			let zstd = ZstdCompression::default();
@@ -93,7 +95,8 @@ trait DtnNode {
 		}
 	}
 
-	/// Send frame using pre-configured connection pool
+	/// Sends `frame` to `addr` through the preconfigured `pool` and returns the
+	/// reply.
 	async fn send_frame(
 		&self,
 		pool: &Arc<ConnectionPool<TokioListener>>,
@@ -165,30 +168,30 @@ pub struct MissionControlServletConfig {
 }
 
 servlet! {
-	/// Mission Control receives telemetry and sends commands to Rover via
-	/// relays
+	/// Mission Control receives telemetry and sends commands to the Rover
+	/// through the relays.
 	pub MissionControlServlet<RelayMessage, EnvConfig = MissionControlServletConfig>,
 	protocol: TokioListener,
 	handle: raw |frame, ctx| async move {
-		let trace = ctx.trace();
+		let trace = &ctx.trace();
 		let config: &MissionControlServletConfig = ctx.env_config();
 		let frame_order = frame.metadata().order();
 
-		// Verify signature using trait method
+		// The node refuses a frame that no known signer signed.
 		if !config.verify_signature(&frame)? {
 			return Err(TightBeamError::MissingSignature);
 		}
 
-		// Process frame (persist, order, validate chain)
+		// The chain processor persists the frame, orders it, and validates
+		// the chain.
 		match config.chain_processor.process_incoming(&frame)? {
 			ProcessResult::Processed(ordered_frames) => {
 				for ordered_frame in ordered_frames {
-					// Decrypt and decode using trait method
 					let relay_message = config.decrypt_relay_message(ordered_frame).await?;
 					match relay_message {
 						RelayMessage::Telemetry(telemetry) => {
-							// WORKER: Handle telemetry analysis and command
-							// decision
+							// The telemetry worker analyzes the telemetry
+							// and decides on the next command.
 							let request = TelemetryHandlerRequest { telemetry };
 							let result = ctx.relay::<MissionControlTelemetryHandlerWorker>(Arc::new(request)).await??;
 							if result.should_send_command {
@@ -218,12 +221,12 @@ servlet! {
 							}
 						},
 						RelayMessage::CommandAck(ack) => {
-							// WORKER: Handle ACK processing
+							// The ACK worker processes the command ACK.
 							let request = CommandAckHandlerRequest { ack };
 							ctx.relay::<CommandAckHandlerWorker>(Arc::new(request)).await??;
 						},
 						RelayMessage::FrameRequest(request) => {
-							// WORKER: Decide what to do with frame request
+							// The frame request worker picks the action.
 							let node_name = config.node_name().to_string();
 							let worker_request = FrameRequestHandlerRequest { request, node_name };
 							let result = ctx.relay::<FrameRequestHandlerWorker>(Arc::new(worker_request)).await??;
@@ -243,13 +246,14 @@ servlet! {
 									return Ok(Some(response_frame));
 								},
 								_ => {
-									// NoAction or Cascade (but MC can't
-									// cascade)
+									// NoAction and Cascade remain, and Mission
+									// Control has no hop to cascade to.
 								}
 							}
 						},
 						RelayMessage::FrameResponse(response) => {
-							// WORKER: Process frame response and validate chain
+							// The frame response worker processes the
+							// response and validates the chain.
 							let request = FrameResponseHandlerRequest {
 								response,
 								node_name: config.node_name().to_string(),
@@ -258,19 +262,19 @@ servlet! {
 							ctx.relay::<FrameResponseHandlerWorker>(Arc::new(request)).await??;
 						},
 						RelayMessage::Command(_) => {
-							// Invalid message type
+							// A command travels toward the Rover, so
+							// Mission Control refuses one.
 							return Err(TightBeamError::InvalidBody);
 						}
 					}
 				}
 
-				// Return stateless ACK
 				let stateless_ack = config.frame_builder.build_stateless_ack_frame(frame_order)?;
 				Ok(Some(stateless_ack))
 			},
 			ProcessResult::Buffered => Ok(None),
 			ProcessResult::ChainGap { current_head, missing_hash } => {
-				// Use trait method with pooled client
+				// The node asks the Earth Relay for the missing frames.
 				config.handle_chain_gap(
 					current_head,
 					missing_hash,
@@ -327,13 +331,15 @@ pub struct EarthRelaySatelliteServletConfig {
 }
 
 servlet! {
-	/// Earth Relay forwards messages between Mission Control and Mars Relay
+	/// The Earth Relay forwards messages between Mission Control and the Mars
+	/// Relay.
 	pub EarthRelaySatelliteServlet<RelayMessage, EnvConfig = EarthRelaySatelliteServletConfig>,
 	protocol: TokioListener,
 	handle: raw |frame, ctx| async move {
-		let trace = ctx.trace();
+		let trace = &ctx.trace();
 		let config: &EarthRelaySatelliteServletConfig = ctx.env_config();
-		// Verify signature and determine source
+		// The signer names the source: Mission Control, or the Rover
+		// through the Mars Relay.
 		let from_mission_control = if frame.nonrepudiation().is_some() {
 			if frame.verify(&config.mission_control_signer).is_ok() {
 				true
@@ -346,9 +352,8 @@ servlet! {
 			return Err(TightBeamError::MissingSignature);
 		};
 
-		// Get frame order before processing
+		// The ACK needs the order after `frame` moves into a send.
 		let frame_order = frame.metadata().order();
-		// Process frame through Earth Relay's chain
 		let process_result = match config.chain_processor.process_incoming(&frame) {
 			Ok(result) => {
 				result
@@ -360,13 +365,14 @@ servlet! {
 
 		match process_result {
 			ProcessResult::Processed(ordered_frames) => {
-				// Check if any processed frames are gap recovery messages
+				// The relay reads the first ordered frame alone. A gap
+				// recovery message gets its answer here, and any other
+				// message routes by its source.
 				if let Some(ordered_frame) = ordered_frames.into_iter().next() {
-					// Decrypt and decode to check message type
 					let relay_message = config.decrypt_relay_message(ordered_frame).await?;
 					match relay_message {
 						RelayMessage::FrameRequest(request) => {
-							// WORKER: Decide what to do with frame request
+							// The frame request worker picks the action.
 							let node_name = config.node_name().to_string();
 							let worker_request = FrameRequestHandlerRequest { request: request.to_owned(), node_name };
 							let result = ctx.relay::<FrameRequestHandlerWorker>(Arc::new(worker_request)).await??;
@@ -386,14 +392,15 @@ servlet! {
 									return Ok(Some(response_frame));
 								},
 								FrameRequestAction::Cascade(_) => {
-									// Servlet builds and sends cascade frame
+									// The relay builds the cascade frame and
+									// sends it onward.
 									let (cascade_pool, cascade_addr) = if from_mission_control {
-										// Request from MC, cascade to Mars
-										// Relay
+										// A request from Mission Control
+										// cascades to the Mars Relay.
 										(&config.mars_relay_pool, config.mars_relay_addr)
 									} else {
-										// Request from Mars, cascade to MC
-										// (rare but possible)
+										// A rare request from the Mars side
+										// cascades to Mission Control.
 										match *config.mission_control_addr.read()? {
 											Some(mc_addr) => (&config.mission_control_pool, mc_addr),
 											None => return Ok(None),
@@ -417,7 +424,8 @@ servlet! {
 							}
 						},
 						RelayMessage::FrameResponse(response) => {
-							// WORKER: Process frame response and validate chain
+							// The frame response worker processes the
+							// response and validates the chain.
 							let worker_request = FrameResponseHandlerRequest {
 								response,
 								node_name: config.node_name().to_string(),
@@ -425,14 +433,14 @@ servlet! {
 
 							ctx.relay::<FrameResponseHandlerWorker>(Arc::new(worker_request)).await??;
 
-							// Servlet builds ACK
 							let stateless_ack = config.frame_builder.build_stateless_ack_frame(frame_order)?;
 							return Ok(Some(stateless_ack));
 						},
 						_ => {
-							// Regular message - route based on source
+							// Any other message routes by its source.
 							if from_mission_control {
-								// Forward to Mars Relay using cached client
+								// A frame from Mission Control goes on to
+								// the Mars Relay through the pooled client.
 								trace.event(EARTH_RELAY_RECEIVE_FROM_MC)?;
 								trace.event(EARTH_RELAY_FORWARD_TO_MARS)?;
 
@@ -442,12 +450,11 @@ servlet! {
 									frame,
 								).await?;
 
-								// Return stateless ACK to Mission Control
 								let stateless_ack = config.frame_builder.build_stateless_ack_frame(frame_order)?;
 								return Ok(Some(stateless_ack));
 							} else {
-								// Determine message type from frame ID
-								// (relay-telem-NNN vs relay-ack-NNN)
+								// The frame ID names the message type:
+								// `relay-telem-NNN` or `relay-ack-NNN`.
 								let is_telemetry = frame.metadata().id().starts_with(b"relay-telem");
 								if is_telemetry {
 									trace.event(EARTH_RELAY_RECEIVE_TELEMETRY_FROM_MARS)?;
@@ -457,18 +464,18 @@ servlet! {
 									trace.event(EARTH_RELAY_FORWARD_ACK_TO_MC)?;
 								}
 
-								// Get Mission Control address (wait if not set
-								// yet)
+								// Mission Control can publish its address
+								// late, so the relay waits for it.
 								let mc_addr = wait_for_address(&config.mission_control_addr).await?;
 
-								// Use pooled client
 								config.send_frame(
 									&config.mission_control_pool,
 									mc_addr,
 									frame,
 								).await?;
 
-								// Fire-and-forget (no response to Mars Relay)
+								// The forward is fire-and-forget, so the
+								// Mars Relay gets `None` as its reply.
 								return Ok(None);
 							}
 						}
@@ -479,7 +486,7 @@ servlet! {
 			},
 			ProcessResult::Buffered => Ok(None),
 			ProcessResult::ChainGap { current_head, missing_hash } => {
-				// Use trait method with pooled client
+				// The relay asks the Mars Relay for the missing frames.
 				config.handle_chain_gap(
 					current_head,
 					missing_hash,
@@ -536,14 +543,14 @@ pub struct MarsRelaySatelliteServletConfig {
 }
 
 servlet! {
-	/// Mars Relay forwards messages between Earth Relay and Rover
+	/// The Mars Relay forwards messages between the Earth Relay and the Rover.
 	pub MarsRelaySatelliteServlet<RelayMessage, EnvConfig = MarsRelaySatelliteServletConfig>,
 	protocol: TokioListener,
 	handle: raw |frame, ctx| async move {
-		let trace = ctx.trace();
+		let trace = &ctx.trace();
 		let config: &MarsRelaySatelliteServletConfig = ctx.env_config();
-		// Verify signature and determine source Earth Relay forwards messages,
-		// so could be from Mission Control or Rover
+		// The signer names the source: the Rover, or Mission Control
+		// through the Earth Relay, which forwards its frames.
 		let from_rover = if frame.nonrepudiation().is_some() {
 			if frame.verify(&config.rover_signer).is_ok() {
 				true
@@ -556,18 +563,17 @@ servlet! {
 			return Err(TightBeamError::MissingSignature);
 		};
 
-		// Get frame order before processing
+		// The ACK needs the order after `frame` moves into a send.
 		let frame_order = frame.metadata().order();
-		// Process frame through Mars Relay's chain
 		match config.chain_processor.process_incoming(&frame)? {
 			ProcessResult::Processed(ordered_frames) => {
-				// Check if any processed frames are gap recovery messages
+				// A gap recovery message among the ordered frames gets its
+				// answer here.
 				for ordered_frame in ordered_frames {
-					// Decrypt and decode to check message type
 					let relay_message = config.decrypt_relay_message(ordered_frame).await?;
 					match relay_message {
 						RelayMessage::FrameRequest(request) => {
-							// WORKER: Decide what to do with frame request
+							// The frame request worker picks the action.
 							let node_name = config.node_name().to_string();
 							let worker_request = FrameRequestHandlerRequest { request: request.to_owned(), node_name };
 							let result = ctx.relay::<FrameRequestHandlerWorker>(Arc::new(worker_request)).await??;
@@ -587,16 +593,18 @@ servlet! {
 									return Ok(Some(response_frame));
 								},
 								FrameRequestAction::Cascade(_) => {
-									// Servlet builds and sends cascade frame
+									// The relay builds the cascade frame and
+									// sends it onward.
 									let (cascade_pool, cascade_addr) = if from_rover {
-										// Request from Rover, cascade to Earth
-										// Relay
+										// A request from the Rover cascades
+										// to the Earth Relay.
 										match *config.earth_relay_addr.read()? {
 											Some(earth_addr) => (&config.earth_relay_pool, earth_addr),
 											None => return Ok(None),
 										}
 									} else {
-										// Request from Earth, cascade to Rover
+										// A request from the Earth Relay
+										// cascades to the Rover.
 										(&config.rover_pool, config.rover_addr)
 									};
 
@@ -618,7 +626,8 @@ servlet! {
 							}
 						},
 						RelayMessage::FrameResponse(response) => {
-							// WORKER: Process frame response and validate chain
+							// The frame response worker processes the
+							// response and validates the chain.
 							let worker_request = FrameResponseHandlerRequest {
 								response,
 								node_name: config.node_name().to_string(),
@@ -626,20 +635,19 @@ servlet! {
 
 							ctx.relay::<FrameResponseHandlerWorker>(Arc::new(worker_request)).await??;
 
-							// Servlet builds ACK
 							let stateless_ack = config.frame_builder.build_stateless_ack_frame(frame_order)?;
 							return Ok(Some(stateless_ack));
 						},
 						_ => {
-							// Regular message - route based on source
-							// Fall through to routing logic below
+							// Any other message routes by its source
+							// after the loop.
 						}
 					}
 				}
 
 				if from_rover {
-					// Determine message type from frame ID (relay-telem-NNN vs
-					// relay-ack-NNN)
+					// The frame ID names the message type: `relay-telem-NNN` or
+					// `relay-ack-NNN`.
 					let is_telemetry = frame.metadata().id().starts_with(b"relay-telem");
 					if is_telemetry {
 						trace.event(MARS_RELAY_RECEIVE_TELEMETRY_FROM_ROVER)?;
@@ -649,59 +657,59 @@ servlet! {
 						trace.event(MARS_RELAY_FORWARD_ACK_TO_EARTH)?;
 					}
 
-					// Get Earth Relay address (wait if not set yet)
+					// The Earth Relay can publish its address late, so the
+					// relay waits for it.
 					let earth_addr = wait_for_address(&config.earth_relay_addr).await?;
 
-					// Use pooled client
 					config.send_frame(
 						&config.earth_relay_pool,
 						earth_addr,
 						frame,
 					).await?;
 
-					// Return stateless ACK to Rover
 					let stateless_ack = config.frame_builder.build_stateless_ack_frame(frame_order)?;
 					Ok(Some(stateless_ack))
 				} else {
-					// Forward to Rover using cached client
+					// A frame from the Earth Relay goes on to the Rover through
+					// the pooled client.
 					trace.event(MARS_RELAY_RECEIVE_FROM_EARTH)?;
 					trace.event(MARS_RELAY_FORWARD_TO_ROVER)?;
 
 					let response = config.send_frame(&config.rover_pool, config.rover_addr, frame).await?;
 					if let Some(ack_frame) = response {
-						// Process Rover's ACK into chain and forward to Earth
-						// Relay
+						// The Rover's ACK enters the chain of this relay and
+						// goes on to the Earth Relay.
 						config.chain_processor.process_incoming(&ack_frame)?;
 
-						// Emit trace event for receiving ACK from Rover
-						// (stateful ACK for command)
+						// These events record the stateful ACK of the command
+						// that the Rover sent.
 						trace.event(MARS_RELAY_RECEIVE_ACK_FROM_ROVER)?;
 						trace.event(MARS_RELAY_FORWARD_ACK_TO_EARTH)?;
 
-						// Forward ACK to Earth Relay using cached client
 						let earth_addr = wait_for_address(&config.earth_relay_addr).await?;
 						config.send_frame(&config.earth_relay_pool, earth_addr, ack_frame).await?;
 					}
 
-					// Fire-and-forget (no response to Earth Relay)
+					// The forward is fire-and-forget, so the Earth Relay gets
+					// `None` as its reply.
 					Ok(None)
 				}
 			},
 			ProcessResult::Buffered => Ok(None),
 			ProcessResult::ChainGap { current_head, missing_hash } => {
-				// Determine upstream based on gap source
+				// The side of the gap picks the upstream.
 				let (upstream_pool, upstream_addr) = if from_rover {
-					// Gap from Rover direction, cascade to Earth Relay
+					// A gap on the Rover side cascades to the Earth Relay.
 					match *config.earth_relay_addr.read()? {
 						Some(earth_addr) => (&config.earth_relay_pool, earth_addr),
-						None => return Ok(None), // Earth address not available yet
+						None => return Ok(None), // The Earth Relay address is still unset
 					}
 				} else {
-					// Gap from Earth direction, cascade to Rover
+					// A gap on the Earth side cascades to the Rover.
 					(&config.rover_pool, config.rover_addr)
 				};
 
-				// Use trait method with pooled client
+				// The relay asks that upstream for the missing frames.
 				config.handle_chain_gap(
 					current_head,
 					missing_hash,
@@ -758,13 +766,13 @@ pub struct RoverServletConfig {
 }
 
 servlet! {
-	/// Mars Rover executes commands and sends telemetry
+	/// The Mars Rover executes commands and sends telemetry.
 	pub RoverServlet<RelayMessage, EnvConfig = RoverServletConfig>,
 	protocol: TokioListener,
 	handle: raw |frame, ctx| async move {
-		let trace = ctx.trace();
+		let trace = &ctx.trace();
 		let config: &RoverServletConfig = ctx.env_config();
-		// Verify signature
+		// A signed frame must verify under Mission Control or the Mars Relay.
 		if frame.nonrepudiation().is_some()
 			&& frame.verify(&config.mission_control_signer).is_err()
 			&& frame.verify(&config.mars_relay_signer).is_err()
@@ -772,18 +780,18 @@ servlet! {
 			return Err(TightBeamError::MissingSignature);
 		}
 
-		// Get command order before consuming frame
+		// The ACK needs the order of the command after the decrypt consumes
+		// `frame`.
 		let command_order = frame.metadata().order();
-		// Process frame through Rover's chain
 		match config.chain_processor.process_incoming(&frame)? {
 			ProcessResult::Processed(_) => {
-				// Processing accepted
+				// The chain accepted the frame, so the Rover reads its message.
 			},
 			ProcessResult::Buffered => {
 				return Ok(None);
 			},
 			ProcessResult::ChainGap { current_head, missing_hash } => {
-				// Use trait method with pooled client
+				// The Rover asks the Mars Relay for the missing frames.
 				config.handle_chain_gap(
 					current_head,
 					missing_hash,
@@ -796,7 +804,6 @@ servlet! {
 			},
 		}
 
-		// Decrypt and decode RelayMessage
 		let relay_message = config.decrypt_relay_message(frame).await?;
 		match relay_message {
 			RelayMessage::Command(command) => {
@@ -820,7 +827,7 @@ servlet! {
 				Ok(Some(ack_frame))
 			},
 		RelayMessage::FrameRequest(request) => {
-			// WORKER: Decide what to do with frame request
+			// The frame request worker picks the action.
 			let node_name = config.node_name().to_string();
 			let worker_request = FrameRequestHandlerRequest { request, node_name };
 			let result = ctx.relay::<FrameRequestHandlerWorker>(Arc::new(worker_request)).await??;
@@ -840,13 +847,14 @@ servlet! {
 					Ok(Some(response_frame))
 				},
 				_ => {
-					// Rover is origin - cannot cascade
+					// The Rover is the origin, so it has no hop to cascade to.
 					Ok(None)
 				}
 			}
 		},
 		RelayMessage::FrameResponse(response) => {
-			// WORKER: Process frame response and validate chain
+			// The frame response worker processes the response and
+			// validates the chain.
 			let worker_request = FrameResponseHandlerRequest {
 				response,
 				node_name: config.node_name().to_string(),
@@ -854,7 +862,6 @@ servlet! {
 
 			ctx.relay::<FrameResponseHandlerWorker>(Arc::new(worker_request)).await??;
 
-			// Servlet builds ACK
 			let stateless_ack = config.frame_builder.build_stateless_ack_frame(command_order)?;
 			Ok(Some(stateless_ack))
 		},

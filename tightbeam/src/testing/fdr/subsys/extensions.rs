@@ -1,8 +1,8 @@
-//! Extension Trait for ConsumedTrace with FDR Analysis
+//! The FDR analysis of a [`ConsumedTrace`], as an extension trait.
 //!
-//! Provides FDR-specific analysis capabilities for execution traces.
-//! This module is FDR-specific: trace-to-process conversion is used for refinement checking
-//! (comparing trace_process ⊑ spec_process), not for general CSP validation.
+//! [`FdrTraceExt`] analyzes one execution trace for FDR. Its conversion of the
+//! trace to a process serves refinement checking alone, which compares
+//! `spec_process ⊑ trace_process`.
 
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -12,98 +12,112 @@ use crate::policy::TransitStatus;
 use crate::testing::assertions::AssertionLabel;
 use crate::testing::fdr::verdict::AcceptanceSet;
 use crate::testing::specs::csp::{intern, Event, Observation, Process, State, TransitionRelation};
-use crate::trace::ConsumedTrace;
+use crate::trace::{ConsumedTrace, InternalEvent};
 
-/// State labels used in FDR trace analysis
+/// The state label of a trace before its gate decides.
 pub const INITIAL: &str = "initial";
+/// The state label of a trace after its gate accepts.
 pub const GATE_ACCEPT: &str = "gate_accept";
+/// The state label of a trace while its handler runs.
 pub const HANDLER: &str = "handler";
+/// The state label of a trace after its gate rejects.
 pub const GATE_REJECT: &str = "gate_reject";
+/// The state label of a trace after its response or its rejection.
 pub const TERMINAL: &str = "terminal";
 
-/// Mode for converting trace to CSP process (FDR-specific)
+/// The events that a trace keeps when it converts to a CSP process for FDR.
 ///
-/// Controls which events are included when converting a `ConsumedTrace` to a
-/// `Process` for FDR refinement checking. This is distinct from
-/// `InstrumentationMode` which controls runtime capture; this controls
-/// post-processing selection.
+/// The mode selects the events of a [`ConsumedTrace`] that join the
+/// [`Process`] of FDR refinement checking, from the events that the trace
+/// captured under its [`TbInstrumentationConfig`].
 ///
-/// Note: Requires `enable_internal_detail: true` in
-/// `InstrumentationMode::Custom` to capture hidden events for
-/// `FullInstrumentation` mode.
+/// `FullInstrumentation` reads the hidden events, which a trace captures
+/// when its [`TbInstrumentationConfig`] sets `enable_internal_detail`.
+///
+/// [`TbInstrumentationConfig`]: crate::instrumentation::TbInstrumentationConfig
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TraceProcessMode {
-	/// Only include assertion events (default, backward compatible)
+	/// The assertion events alone, which [`FdrTraceExt::to_process`] selects.
 	AssertionsOnly,
-	/// Include assertions + observable instrumentation events
+	/// The assertions and the observable instrumentation events.
 	///
-	/// Observable events: GateAccept, GateReject, RequestRecv, ResponseSend, AssertLabel
-	/// Useful when your CSP spec models the full protocol flow including gate decisions
+	/// The observable events are `gate/accept`, `gate/reject`,
+	/// `transport/request-recv`, `transport/response-send`, and `assert/label`.
+	/// The mode suits a CSP spec that models the full protocol flow, gate
+	/// decisions included.
 	#[cfg(feature = "instrument")]
 	WithObservableInstrumentation,
-	/// Include all events: assertions + observable + hidden instrumentation
+	/// The assertions and the observable and hidden instrumentation events.
 	///
-	/// Hidden events: HandlerEnter, HandlerExit, CryptoStep, CompressStep, RouteStep, PolicyEval
-	/// Requires `enable_internal_detail: true` in instrumentation config
+	/// The hidden events are the internal events `handler/enter`,
+	/// `handler/exit`, `crypto/step`, `compress/step`, `route/step`, and
+	/// `policy/eval`, and each `process/hidden` event. A trace captures the
+	/// internal events only when its instrumentation sets
+	/// `enable_internal_detail: true`.
 	#[cfg(feature = "instrument")]
 	FullInstrumentation,
 }
 
-/// Extension trait for ConsumedTrace with FDR analysis
+/// An extension trait that adds FDR analysis to a [`ConsumedTrace`].
 ///
 /// Each method reads the trace alone. Layer 1 grades what the scenario body
 /// returned, in [`ScenarioConfig::verify`].
 ///
 /// [`ScenarioConfig::verify`]: crate::testing::ScenarioConfig::verify
 pub trait FdrTraceExt {
-	/// Check if CSP trace is valid
+	/// Whether the trace is valid, which requires a run whose gate accepted to
+	/// record an assertion or a response.
 	fn csp_valid(&self) -> bool;
 
-	/// Check if terminated in valid terminal state
+	/// Whether the run ended in a valid terminal state.
 	fn terminated_in_valid_state(&self) -> bool;
 
-	/// Get acceptance set after current trace
+	/// The acceptance set at the state `state_label`, or `None` for a label
+	/// outside [`INITIAL`], [`GATE_ACCEPT`], [`HANDLER`], [`GATE_REJECT`], and
+	/// [`TERMINAL`].
 	fn acceptance_at(&self, state_label: impl AsRef<str>) -> Option<AcceptanceSet>;
 
-	/// Check if process can refuse event after state
+	/// Whether the process can refuse the event `event_label` at the state
+	/// `state_label`.
 	fn can_refuse_after(&self, state_label: impl AsRef<str>, event_label: impl AsRef<str>) -> bool;
 
-	/// Count assertion by label (convenience)
+	/// The count of the assertions whose label is `label`.
 	fn assertion_count(&self, label: impl AsRef<str>) -> usize;
 
-	/// Project trace to observable events only
+	/// The labels of the observable instrumentation events of the trace.
 	#[cfg(feature = "instrument")]
 	fn project_to_observable(&self) -> Vec<String>;
 
-	/// Project trace to hidden events only
+	/// The labels of the hidden instrumentation events of the trace.
 	#[cfg(feature = "instrument")]
 	fn project_to_hidden(&self) -> Vec<String>;
 
-	/// Export trace as CSPM
+	/// Writes the observable events of the trace to `writer` as the CSPM
+	/// sequence `Trace`, which is empty in a build without `instrument`.
 	fn export_cspm<W: Write>(&self, writer: &mut W) -> std::io::Result<()>;
 
-	/// Convert ConsumedTrace to CSP Process for FDR refinement checking
+	/// Converts the trace to a CSP process of its assertion events, for FDR
+	/// refinement checking.
 	///
-	/// Creates a linear process model representing the execution trace. This is used for
-	/// refinement checking: `trace_process ⊑ spec_process`.
+	/// The process is a linear model of the execution trace, which refinement
+	/// checking compares as `spec_process ⊑ trace_process`.
 	///
-	/// By default, only includes assertion events. Use `to_process_with_mode()` to include
-	/// instrumentation events (requires `instrument` feature).
+	/// [`Self::to_process_with_mode`] adds the instrumentation events under the
+	/// `instrument` feature.
 	fn to_process(&self) -> Process {
 		self.to_process_with_mode(TraceProcessMode::AssertionsOnly)
 	}
 
-	/// Convert ConsumedTrace to CSP Process with specified event inclusion mode
+	/// Converts the trace to a CSP process of the events that `mode` selects.
 	///
-	/// See `TraceProcessMode` for available modes. Note that `FullInstrumentation` requires
-	/// `enable_internal_detail: true` in the instrumentation configuration.
+	/// [`TraceProcessMode`] lists the modes and the events that each one reads.
 	fn to_process_with_mode(&self, mode: TraceProcessMode) -> Process;
 }
 
 impl FdrTraceExt for ConsumedTrace {
 	fn csp_valid(&self) -> bool {
-		// A gate that accepted should have something to show for it. A run
-		// with no gate decision took no gate, so there is nothing to test.
+		// A run whose gate accepted is valid when it shows an assertion or a
+		// response. A run with no gate decision took no gate, so it passes.
 		if matches!(self.gate_decision, Some(TransitStatus::Ok))
 			&& self.assertions.is_empty()
 			&& self.response.is_none()
@@ -116,45 +130,44 @@ impl FdrTraceExt for ConsumedTrace {
 
 	fn terminated_in_valid_state(&self) -> bool {
 		match self.gate_decision {
-			// Accepted, so the handler should have run.
+			// An accepted run ends validly when the handler left a response
+			// or an assertion.
 			Some(TransitStatus::Ok) => self.response.is_some() || !self.assertions.is_empty(),
 			// A gate that reached no decision did not terminate.
 			Some(TransitStatus::Unknown) => false,
 			// Every other status is a rejection, which is terminal.
 			Some(_) => true,
-			// No gate was taken, so the gate has nothing to say about it.
+			// A run that took no gate passes, because the check reads the
+			// gate decision alone.
 			None => true,
 		}
 	}
 
 	fn acceptance_at(&self, state_label: impl AsRef<str>) -> Option<AcceptanceSet> {
 		let state_label = state_label.as_ref();
-		// Compute acceptance set based on trace structure at given state
-		// State labels in ConsumedTrace context:
-		// - "initial": before gate
-		// - "gate_accept": after gate accepts
-		// - "handler": during handler execution
-		// - "terminal": after response/rejection
+		// The state label alone decides the acceptance set, whatever events
+		// the trace recorded.
 		let mut acceptance = AcceptanceSet::new();
 		match state_label {
 			INITIAL => {
-				// At initial state, we can accept request frame
+				// Before the gate decides, the state accepts the request.
 				acceptance.insert(Event("request"));
 			}
 			GATE_ACCEPT => {
-				// After gate accepts, handler can process
-				acceptance.insert(Event("handler_enter"));
+				// After the gate accepts, the state accepts the handler entry.
+				acceptance.insert(Event(InternalEvent::HandlerEnter.label()));
 			}
 			HANDLER => {
-				// During handler, can do internal operations or exit
-				acceptance.insert(Event("handler_exit"));
+				// While the handler runs, the state accepts the handler exit
+				// and the response.
+				acceptance.insert(Event(InternalEvent::HandlerExit.label()));
 				acceptance.insert(Event("response"));
 			}
 			GATE_REJECT | TERMINAL => {
-				// Rejection/terminal states accept nothing
+				// A rejected or terminal state has an empty acceptance set.
 			}
 			_ => {
-				// Unknown state label
+				// An unknown state label has no acceptance set.
 				return None;
 			}
 		}
@@ -165,12 +178,12 @@ impl FdrTraceExt for ConsumedTrace {
 	fn can_refuse_after(&self, state_label: impl AsRef<str>, event_label: impl AsRef<str>) -> bool {
 		let state_label = state_label.as_ref();
 		let event_label = event_label.as_ref();
-		// Event can be refused if it's not in the acceptance set at that state
+		// A state refuses each event outside its acceptance set.
 		if let Some(acceptance) = self.acceptance_at(state_label) {
-			// Check if the event label matches any in the acceptance set
 			!acceptance.iter().any(|e| e.0 == event_label)
 		} else {
-			// Unknown state: conservatively assume can refuse
+			// An unknown state label refuses every event, which is the
+			// conservative answer.
 			true
 		}
 	}
@@ -206,15 +219,7 @@ impl FdrTraceExt for ConsumedTrace {
 
 		self.instrument_events
 			.iter()
-			.filter(|e| {
-				e.urn == events::HANDLER_ENTER
-					|| e.urn == events::HANDLER_EXIT
-					|| e.urn == events::CRYPTO_STEP
-					|| e.urn == events::COMPRESS_STEP
-					|| e.urn == events::ROUTE_STEP
-					|| e.urn == events::POLICY_EVAL
-					|| e.urn == events::PROCESS_HIDDEN
-			})
+			.filter(|e| InternalEvent::of(&e.urn).is_some() || e.urn == events::PROCESS_HIDDEN)
 			.filter_map(|e| e.label.as_ref().map(|s| s.to_string()))
 			.collect()
 	}
@@ -238,11 +243,11 @@ impl FdrTraceExt for ConsumedTrace {
 		Ok(())
 	}
 
-	/// Convert ConsumedTrace to CSP Process for FDR refinement checking
+	/// Converts the trace to a CSP process of the events that `mode` selects,
+	/// for FDR refinement checking.
 	///
-	/// Creates a linear process model representing the execution trace.
-	/// Creates a strictly linear, acyclic chain to avoid infinite BFS exploration.
-	/// The trace process represents a single execution path.
+	/// The process models the one execution path of the trace as a linear,
+	/// acyclic chain of states, so BFS exploration of it ends.
 	fn to_process_with_mode(&self, mode: TraceProcessMode) -> Process {
 		let mut states = HashSet::new();
 		let mut terminal = HashSet::new();
@@ -257,7 +262,7 @@ impl FdrTraceExt for ConsumedTrace {
 		states.insert(s_terminal);
 		terminal.insert(s_terminal);
 
-		// Collect events based on mode
+		// An event of the trace, with the sequence number that orders it.
 		#[derive(Clone)]
 		enum TraceEvent {
 			Assertion {
@@ -278,7 +283,7 @@ impl FdrTraceExt for ConsumedTrace {
 
 		let mut events: Vec<TraceEvent> = Vec::new();
 
-		// Always include assertions
+		// Every mode includes the assertions.
 		for assertion in &self.assertions {
 			let AssertionLabel::Custom(label) = &assertion.label;
 			let static_label: &'static str = match label {
@@ -289,15 +294,16 @@ impl FdrTraceExt for ConsumedTrace {
 			events.push(TraceEvent::Assertion { seq: assertion.seq, label: static_label });
 		}
 
-		// Include instrumentation events based on mode
+		// The mode selects the instrumentation events that join the
+		// assertions.
 		#[cfg(feature = "instrument")]
 		{
 			match mode {
 				TraceProcessMode::AssertionsOnly => {
-					// No instrumentation events
+					// This mode takes the assertions alone.
 				}
 				TraceProcessMode::WithObservableInstrumentation | TraceProcessMode::FullInstrumentation => {
-					// Include observable instrumentation events
+					// Both modes take the observable instrumentation events.
 					use crate::instrumentation::events;
 					for event in &self.instrument_events {
 						if event.urn == events::GATE_ACCEPT
@@ -318,17 +324,11 @@ impl FdrTraceExt for ConsumedTrace {
 			}
 
 			if matches!(mode, TraceProcessMode::FullInstrumentation) {
-				// Include hidden instrumentation events
+				// `FullInstrumentation` also takes the hidden instrumentation
+				// events.
 				use crate::instrumentation::events;
 				for event in &self.instrument_events {
-					if event.urn == events::HANDLER_ENTER
-						|| event.urn == events::HANDLER_EXIT
-						|| event.urn == events::CRYPTO_STEP
-						|| event.urn == events::COMPRESS_STEP
-						|| event.urn == events::ROUTE_STEP
-						|| event.urn == events::POLICY_EVAL
-						|| event.urn == events::PROCESS_HIDDEN
-					{
+					if InternalEvent::of(&event.urn).is_some() || event.urn == events::PROCESS_HIDDEN {
 						if let Some(label) = &event.label {
 							events.push(TraceEvent::HiddenInstrumentation { seq: event.seq, label: label.clone() });
 						}
@@ -337,7 +337,10 @@ impl FdrTraceExt for ConsumedTrace {
 			}
 		}
 
-		// Sort events by sequence number to preserve execution order
+		// The events sort by sequence number, so each kind keeps its recorded
+		// order. An assertion counts the assertions before it, and an
+		// instrumentation event counts the instrumentation events before it,
+		// so the two kinds interleave by those two counts.
 		events.sort_by(|a, b| {
 			let seq_a = match a {
 				TraceEvent::Assertion { seq, .. } => *seq as u64,
@@ -353,7 +356,7 @@ impl FdrTraceExt for ConsumedTrace {
 			seq_a.cmp(&seq_b)
 		});
 
-		// Build transitions from sorted events
+		// Each event takes one state of the chain to the next.
 		if !events.is_empty() {
 			let mut from_state = s_initial;
 			for (idx, event) in events.iter().enumerate() {
@@ -365,14 +368,16 @@ impl FdrTraceExt for ConsumedTrace {
 					TraceEvent::HiddenInstrumentation { label, .. } => (Event(intern(label.as_str())), true),
 				};
 
-				// Add to appropriate alphabet
+				// A hidden instrumentation event joins the hidden alphabet, and
+				// every other event joins the observable alphabet.
 				if is_hidden {
 					hidden.insert(event);
 				} else {
 					observable.insert(event);
 				}
 
-				// Add transition: last event goes to terminal, others use intermediate states
+				// The last event reaches the terminal state, and each earlier
+				// event reaches an intermediate state of its own.
 				let to_state = if idx == events.len() - 1 {
 					s_terminal
 				} else {
@@ -387,8 +392,8 @@ impl FdrTraceExt for ConsumedTrace {
 			}
 		}
 
-		// If no events, the process is just initial -> terminal with no events
-		// This represents SKIP/STOP - a process that can do nothing
+		// A trace with no event leaves the initial state with no transition,
+		// and that state is not terminal, so the process is STOP.
 
 		let description = match mode {
 			TraceProcessMode::AssertionsOnly => "Process derived from ConsumedTrace (assertion events only)",
@@ -409,7 +414,7 @@ impl FdrTraceExt for ConsumedTrace {
 			initial: s_initial,
 			states,
 			terminal,
-			choice: HashSet::new(), // No nondeterminism in a single trace
+			choice: HashSet::new(), // A single trace follows one path.
 			observable,
 			hidden,
 			transitions,
@@ -424,20 +429,21 @@ impl FdrTraceExt for ConsumedTrace {
 	}
 }
 
-// Convenience implementation on ConsumedTrace for FDR refinement checking
+// The inherent forms of the two conversions, which a caller reaches with
+// `ConsumedTrace` alone in scope.
 impl ConsumedTrace {
-	/// Convert this trace to a CSP Process for FDR refinement checking
+	/// Converts this trace to a CSP process of its assertion events, for FDR
+	/// refinement checking.
 	///
-	/// This is a convenience wrapper around `FdrTraceExt::to_process()`.
-	/// See `FdrTraceExt` trait for details.
+	/// It calls [`FdrTraceExt::to_process`], which documents the conversion.
 	pub fn to_process(&self) -> Process {
 		<Self as FdrTraceExt>::to_process(self)
 	}
 
-	/// Convert this trace to a CSP Process with specified event inclusion mode
+	/// Converts this trace to a CSP process of the events that `mode` selects.
 	///
-	/// This is a convenience wrapper around `FdrTraceExt::to_process_with_mode()`.
-	/// See `FdrTraceExt` trait for details.
+	/// It calls [`FdrTraceExt::to_process_with_mode`], which documents the
+	/// conversion.
 	pub fn to_process_with_mode(&self, mode: TraceProcessMode) -> Process {
 		<Self as FdrTraceExt>::to_process_with_mode(self, mode)
 	}

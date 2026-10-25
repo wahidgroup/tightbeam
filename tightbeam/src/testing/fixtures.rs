@@ -184,6 +184,16 @@ mod rumor {
 #[cfg(feature = "colony")]
 use rumor::*;
 
+#[cfg(feature = "instrument")]
+mod instrumented {
+	pub use crate::instrumentation::TbInstrumentationConfig;
+	pub use crate::trace::{TraceCollector, TraceConfig};
+	pub use crate::urn::Urn;
+}
+
+#[cfg(feature = "instrument")]
+use instrumented::*;
+
 /// Returns the fixed test validity window, which runs from the epoch through a
 /// far-future UtcTime.
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
@@ -261,7 +271,7 @@ fn test_key_identifiers(subject_key: &SigningKey, issuer_key: &SigningKey) -> Ve
 }
 
 /// The `keyUsage` of an end-entity test certificate: `digitalSignature` and
-/// `keyAgreement`, so the certificate is admitted for each use (RFC 5280
+/// `keyAgreement`, so a verifier admits the certificate for each use (RFC 5280
 /// §4.2.1.3, RFC 5480 §3).
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 fn test_end_entity_key_usage() -> Extension {
@@ -666,8 +676,8 @@ impl TestFrame {
 	/// Returns `frame` decoded again after the first copy of `original` in its
 	/// DER becomes `forged`.
 	///
-	/// A test models tampering in transit this way, because no method rewrites
-	/// a digested or signed field in place. The two byte strings MUST have one
+	/// A test models a tamper in transit this way, because the frame API holds
+	/// each digested or signed field fixed. The two byte strings MUST have one
 	/// length, so every DER length octet stays valid.
 	pub fn tamper(frame: &Frame, original: impl AsRef<[u8]>, forged: impl AsRef<[u8]>) -> Frame {
 		let original = original.as_ref();
@@ -770,7 +780,7 @@ impl TestP256Points {
 	/// The Montgomery parameters of the field.
 	const FIELD: DynResidueParams<{ U256::LIMBS }> = DynResidueParams::new(&Self::PRIME);
 
-	/// `octets` as an element of the field, or `None` when they are no
+	/// `octets` as an element of the field, or `None` when they are not a
 	/// 32-octet integer below p (SEC 1 v2.0 §2.3.6).
 	fn element(octets: &[u8]) -> Option<DynResidue<{ U256::LIMBS }>> {
 		let octets: [u8; 32] = octets.try_into().ok()?;
@@ -1079,7 +1089,7 @@ impl TestCertificate {
 
 	/// `certificate` with the second-lowest bit of the y-coordinate of its
 	/// uncompressed secp256k1 point flipped. The encoding keeps x and the y
-	/// parity of the point, and it is no point of the curve:
+	/// parity of the point, and it lies off the curve:
 	///
 	/// - On the curve, x pairs with y and with p - y alone (SEC 1 v2.0 §2.3.4).
 	/// - p - y has the other parity, and the flipped y is neither of the two.
@@ -1166,7 +1176,7 @@ impl TestCertificate {
 		certificate
 	}
 
-	/// `certificate` with no extension of `oid`.
+	/// `certificate` with every extension of `oid` removed.
 	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 	pub fn without_extension(mut certificate: Certificate, oid: ObjectIdentifier) -> Certificate {
 		let extensions = certificate.tbs_certificate.extensions.get_or_insert_with(Vec::new);
@@ -1186,8 +1196,7 @@ impl TestCertificate {
 	}
 
 	/// An extension of `oid` with an empty value, critical when `critical`
-	/// holds, for the RFC 5280 §4.2 checks of an extension the crate does not
-	/// read.
+	/// holds, for the RFC 5280 §4.2 checks of an unrecognized extension.
 	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 	pub fn opaque_extension(oid: impl AsRef<str>, critical: bool) -> Extension {
 		let extn_id = ObjectIdentifier::new(oid.as_ref()).expect("a test OID parses");
@@ -1330,7 +1339,7 @@ impl TestCertificate {
 		Ok(TestCertificateChain { root, intermediate, leaf, root_key, intermediate_key, leaf_key })
 	}
 
-	/// Create an expired test certificate for validation testing.
+	/// Create an expired test certificate for the validation tests.
 	///
 	/// This certificate from ssl.com expired on August 17, 2019, so it
 	/// exercises the expiry validation logic.
@@ -1395,8 +1404,8 @@ impl TestSigner {
 	}
 }
 
-/// Reads on the signed attributes of a `SignerInfo`, which the signed
-/// structure tests share.
+/// Readers of the signed attributes of a `SignerInfo`, which the tests of
+/// signed structures share.
 #[cfg(feature = "signature")]
 pub struct TestAttributes;
 
@@ -1669,6 +1678,54 @@ impl TestRumor {
 		let signature = verifying.expect("the fixed test key signed the rumor");
 
 		VerifiedRumor::new(rumor, signature)
+	}
+}
+
+/// Traces for the tests of the internal events, and the trail a test reads
+/// back from one.
+#[cfg(feature = "instrument")]
+pub struct TestTrace;
+
+#[cfg(feature = "instrument")]
+impl TestTrace {
+	/// A trace whose config sets `enable_internal_detail` to `detail` and
+	/// keeps every other setting at its default.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::instrumentation::events;
+	/// use tightbeam::testing::fixtures::TestTrace;
+	///
+	/// let trace = TestTrace::with_detail(false);
+	/// trace.emit(events::GATE_ACCEPT, "Ok");
+	///
+	/// assert_eq!(TestTrace::trail(&trace, &[events::GATE_ACCEPT]), [events::GATE_ACCEPT]);
+	/// ```
+	pub fn with_detail(detail: bool) -> TraceCollector {
+		let config = TbInstrumentationConfig { enable_internal_detail: detail, ..Default::default() };
+		TraceCollector::from(TraceConfig::with_instrumentation(config))
+	}
+
+	/// Drains `trace`, and returns the URNs among `kept` that it recorded, in
+	/// the order it recorded them.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::instrumentation::events;
+	/// use tightbeam::testing::fixtures::TestTrace;
+	///
+	/// let trace = TestTrace::with_detail(true);
+	/// trace.emit(events::POLICY_EVAL, "policy_eval");
+	/// trace.emit(events::GATE_ACCEPT, "Ok");
+	///
+	/// assert_eq!(TestTrace::trail(&trace, &[events::GATE_ACCEPT]), [events::GATE_ACCEPT]);
+	/// ```
+	pub fn trail(trace: &TraceCollector, kept: &[Urn<'static>]) -> Vec<Urn<'static>> {
+		let recorded = trace.drain_events();
+		let urns = recorded.into_iter().map(|event| event.urn);
+		urns.filter(|urn| kept.contains(urn)).collect()
 	}
 }
 

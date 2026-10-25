@@ -75,10 +75,12 @@ impl StrategyDraw {
 	/// - The count spreads the injections over the records of each label, so
 	///   runs repeat for DO-178C and IEC 61508: 3000 bps (30%) injects on
 	///   records 4, 7, and 10 of 10.
-	/// - The generator draws as FDR exploration does.
+	/// - The generator draws one value per record and reads it through
+	///   [`FaultInjection::should_inject`], as FDR exploration does.
 	///
-	/// The label stays the `Cow` that the count keys, as the check that calls
-	/// this states.
+	/// `label` stays the `Cow` that the count keys on, so a static label clones
+	/// as a pointer copy, as `TraceCollector::check_runtime_fault_injection`
+	/// states.
 	#[allow(clippy::ptr_arg)]
 	pub(crate) fn injects(&mut self, label: &Cow<'static, str>, injection: &FaultInjection) -> bool {
 		let probability = u64::from(injection.probability_bps.get());
@@ -111,7 +113,7 @@ enum InjectionKey<'a> {
 pub(crate) struct FaultInjection {
 	pub(crate) error_factory: Arc<dyn Fn() -> TightBeamError + Send + Sync>,
 	/// The injection probability in basis points (0 to 10000, where 10000 is
-	/// 100%), which the `BasisPoints` type validates at compile time.
+	/// 100%), a range that the `BasisPoints` type holds by construction.
 	pub(crate) probability_bps: BasisPoints,
 }
 
@@ -196,7 +198,7 @@ impl From<InjectionStrategy> for FaultModel {
 
 #[cfg(feature = "testing-fault")]
 impl FaultModel {
-	/// Inject a fault at a process state and an event, typed through the
+	/// Injects a fault at a process state and an event, typed through the
 	/// `ProcessState` and `ProcessEvent` traits.
 	///
 	/// The fault fires at that (process state, event) pair with the probability
@@ -215,7 +217,7 @@ impl FaultModel {
 		self.with_point(key, error_fn, probability_bps)
 	}
 
-	/// Inject a fault at each runtime record of `event`, in every process
+	/// Injects a fault at each runtime record of `event`, in every process
 	/// state, with the probability `probability_bps` in basis points.
 	///
 	/// A collector injects the fault once [`TraceCollector::with_fault_model`]
@@ -251,7 +253,7 @@ impl FaultModel {
 		self.with_point(key, error_fn, probability_bps)
 	}
 
-	/// Insert the injection point at `key`, whose error `error_fn` builds.
+	/// Inserts the injection point at `key`, whose error `error_fn` builds.
 	fn with_point<F, Err>(mut self, key: InjectionKey<'static>, error_fn: F, probability_bps: BasisPoints) -> Self
 	where
 		F: Fn() -> Err + Send + Sync + 'static,
@@ -265,7 +267,8 @@ impl FaultModel {
 	/// The injection point of a runtime record of the event `label`, as
 	/// [`Self::with_event_fault`] keys it.
 	///
-	/// The lookup key borrows `label`, so the point borrows it too.
+	/// The lookup key borrows `label`, so the returned point shares its
+	/// lifetime.
 	pub(crate) fn runtime_injection<'a>(&'a self, label: &'a str) -> Option<&'a FaultInjection> {
 		let key = InjectionKey::Event(Cow::Borrowed(label));
 		self.injection_points.get(&key)
@@ -274,7 +277,8 @@ impl FaultModel {
 	/// The injection point of the event `event` in the process state `state`,
 	/// named `Process.State`, as [`Self::with_fault`] keys it.
 	///
-	/// The lookup key borrows both names, so the point borrows them too.
+	/// The lookup key borrows both names, so the returned point shares their
+	/// lifetime.
 	pub(crate) fn state_injection<'a>(&'a self, state: &'a str, event: &'a str) -> Option<&'a FaultInjection> {
 		let key = InjectionKey::State { state: Cow::Borrowed(state), event: Cow::Borrowed(event) };
 		self.injection_points.get(&key)
@@ -286,7 +290,7 @@ impl FaultModel {
 		self.injection_strategy.draw(self.seed)
 	}
 
-	/// Set the seed of the random strategy's generator, so a run repeats.
+	/// Sets the seed of the random strategy's generator, so a run repeats.
 	pub fn with_seed(mut self, seed: u64) -> Self {
 		self.seed = seed;
 		self
@@ -303,36 +307,40 @@ pub struct FdrConfig {
 	/// The number of exploration seeds, each of which runs another schedule.
 	pub seeds: u32,
 
-	/// The maximum trace depth, where exploration cuts a trace off.
+	/// The longest trace, in observable events, that exploration and the
+	/// refinement checks follow before they cut it off.
 	pub max_depth: usize,
 
-	/// The maximum run of consecutive τ-transitions, past which exploration
-	/// detects a divergence.
+	/// The most hidden events in one run that exploration takes. A longer
+	/// run is a divergence, and so is a run of hidden events that reaches a
+	/// cycle of hidden events, whatever its length.
 	pub max_internal_run: usize,
 
-	/// The timeout of each seed, in milliseconds.
+	/// The time budget, in milliseconds, of each trace search that the
+	/// refinement checker runs. A search that spends it stops with an
+	/// incomplete answer.
 	pub timeout_ms: u64,
 
-	/// The additional processes for refinement checking. When the list holds a
-	/// process, exploration checks specs\[0\] ⊑ main_process.
+	/// The specification processes for refinement checking. When the list
+	/// holds a process, the explorer checks spec ⊑ subject for each spec.
 	pub specs: Vec<Process>,
 
-	/// Whether refinement checks stop at the first violation (fast-fail mode).
-	/// When true (the default), the check returns at the first counter-example.
-	/// When false, it checks every spec and collects every violation.
+	/// Whether each refinement pass stops at its first violation (fast-fail
+	/// mode). When true (the default), a pass returns at the first
+	/// counterexample. When false, a pass checks every spec, and the verdict
+	/// keeps the witness of the last violation.
 	pub fail_fast: bool,
 
-	/// The number of schedulers (m), for resource constraint modeling. When m
-	/// is below n (`process_count`), some traces become impossible. `Some(_)`
-	/// turns scheduler modeling on, and `None` turns it off. When set, both
-	/// `scheduler_count` and `process_count` must be `Some(_)`.
+	/// The number of schedulers (m) of the resource constraint model, where m
+	/// below n (`process_count`) makes some traces impossible. Both fields
+	/// must be `Some(_)`, or both `None`. Only
+	/// [`FdrConfig::validate_scheduler_model`] reads the pair.
 	#[cfg(feature = "testing-fault")]
 	pub scheduler_count: Option<u32>,
 
-	/// The number of concurrent processes (n), for resource constraint
-	/// modeling. `Some(_)` turns scheduler modeling on, and `None` turns it
-	/// off. When set, both `scheduler_count` and `process_count` must be
-	/// `Some(_)`.
+	/// The number of concurrent processes (n) of the resource constraint
+	/// model. Both fields must be `Some(_)`, or both `None`. Only
+	/// [`FdrConfig::validate_scheduler_model`] reads the pair.
 	#[cfg(feature = "testing-fault")]
 	pub process_count: Option<u32>,
 
@@ -372,17 +380,17 @@ impl Default for FdrConfig {
 }
 
 impl FdrConfig {
-	/// Validate the constraints of the scheduler model, with a detailed error
-	/// message for each.
+	/// Validates the constraints of the scheduler model, with an error that
+	/// names the field and the rule for each.
 	///
 	/// It checks these rules:
 	/// - `scheduler_count` and `process_count` must both be `Some(_)` or both be `None`.
 	/// - When set, `scheduler_count` must not exceed `process_count`.
 	/// - When set, `scheduler_count` and `process_count` must each be above 0.
 	///
-	/// ## Returns
-	/// - `Ok(())` when every check passes.
-	/// - `Err(TestingError)` when a check fails.
+	/// ## Errors
+	/// - [`TestingError::InvalidFdrConfig`] -- the first rule above that fails,
+	///   which its `field` and `reason` name.
 	#[cfg(feature = "testing-fault")]
 	pub fn validate_scheduler_model(&self) -> Result<(), TestingError> {
 		match (self.scheduler_count, self.process_count) {
@@ -415,16 +423,17 @@ impl FdrConfig {
 		}
 	}
 
-	/// Validate all constraints (scheduler model).
+	/// Validates every constraint of the configuration.
 	///
-	/// This is a convenience method that calls `validate_scheduler_model()`.
+	/// The scheduler model holds the only constraints, so this returns the
+	/// result of [`FdrConfig::validate_scheduler_model`].
 	#[cfg(feature = "testing-fault")]
 	pub fn validate(&self) -> Result<(), TestingError> {
 		self.validate_scheduler_model()
 	}
 
-	/// Validate all constraints. Every configuration passes when the
-	/// `testing-fault` feature is off.
+	/// Validates every constraint of the configuration. Every configuration
+	/// passes when the `testing-fault` feature is off.
 	#[cfg(not(feature = "testing-fault"))]
 	pub fn validate(&self) -> Result<(), TestingError> {
 		Ok(())
@@ -435,7 +444,7 @@ impl FdrConfig {
 #[cfg(feature = "testing-fault")]
 #[derive(Debug, Clone, PartialEq)]
 pub struct InjectedFaultRecord {
-	/// The CSP state of the injection, as `process.state`.
+	/// The CSP state of the injection, as `Process.State`.
 	pub csp_state: String,
 	/// The label of the event at which the fault fired.
 	pub event_label: String,
@@ -515,7 +524,7 @@ mod tests {
 			}
 		}
 
-		/// Look up the injection registered under a `Process.State` key and
+		/// Looks up the injection registered under a `Process.State` key and
 		/// event label.
 		fn injection<'a>(model: &'a FaultModel, state: &'static str, event: &'static str) -> &'a FaultInjection {
 			model

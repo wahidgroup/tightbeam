@@ -1,8 +1,8 @@
 //! One dial target on a gateway trust plane.
 //!
 //! Every outbound gateway hop pairs a plane with the address to dial on
-//! it. [`Hop`] holds that pair, so the plane a payload travels on is
-//! chosen once at construction rather than re-paired at each call.
+//! it. [`Hop`] holds that pair, so a hop fixes the plane of its payload once,
+//! at construction.
 //!
 //! - A servlet hop dials through [`HivePlane::servlet`], which binds the hop
 //!   to the signer the servlet's registration names.
@@ -432,7 +432,7 @@ mod tests {
 			name.expect("the member certificate has a fingerprint")
 		}
 
-		/// A signed advertisement of this gateway that advertises no types.
+		/// A signed advertisement of this gateway with an empty type list.
 		async fn advertisement(&self) -> SignedAdvertisement {
 			let types: Vec<Urn<'static>> = Vec::new();
 			let minted = self.config.mint_ad_frame(b"127.0.0.1:1", types).await;
@@ -484,7 +484,7 @@ mod tests {
 	}
 
 	// A refused multiplexed answer drains and closes the connection that every
-	// lease of it shares, so a lease that holds it sends nothing further.
+	// lease of it shares, so the next emit of a lease that holds it fails.
 	#[tokio::test]
 	async fn a_refused_multiplexed_answer_drains_its_connection() -> TestResult {
 		let dialer = Dialer::start(Dialer::one_connection(true)).await;
@@ -524,6 +524,24 @@ mod tests {
 		let pooled = dialer.pool.try_acquire(dialer.stranger.addr())?;
 
 		assert!(pooled.is_none());
+		Ok(())
+	}
+
+	// A gateway records on its own trace the gate verdict of each request its
+	// colony plane answers.
+	#[cfg(feature = "instrument")]
+	#[tokio::test]
+	async fn a_gateway_records_the_gate_verdicts_of_its_colony_plane_on_its_own_trace() -> TestResult {
+		use crate::instrumentation::events;
+		use crate::testing::fixtures::TestTrace;
+
+		let dialer = Dialer::start(PoolConfig::default()).await;
+		let advertisement = dialer.advertisement().await;
+		let advertiser = dialer.peers().advertiser();
+		advertiser.advertise(*dialer.member.addr(), &advertisement).await?;
+
+		let verdicts = TestTrace::trail(&dialer.member.trace(), &[events::GATE_ACCEPT, events::GATE_REJECT]);
+		assert_eq!(verdicts, [events::GATE_ACCEPT]);
 		Ok(())
 	}
 

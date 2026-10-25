@@ -1,4 +1,4 @@
-//! Sync (`std`-without-`tokio`) `server!` accept-loop coverage.
+//! Tests of the sync `server!` accept loop, on `std` without `tokio`.
 
 use std::net::{SocketAddr, TcpListener as NetTcpListener, TcpStream as NetTcpStream};
 use std::thread;
@@ -7,11 +7,13 @@ use std::time::Duration;
 use tightbeam::instrumentation::events;
 use tightbeam::runtime::rt;
 use tightbeam::server;
+use tightbeam::testing::fixtures::TestTrace;
 use tightbeam::testing::TestFrame;
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::tcp::sync::{TcpListener, TcpTransport};
 use tightbeam::transport::tcp::TightBeamSocketAddr;
 use tightbeam::transport::{EndpointConfig, MessageEmitter, TransportResult};
+use tightbeam::urn::Urn;
 use tightbeam::Frame;
 
 /// Emits a frame labelled `label` over `stream` and returns it with the
@@ -24,7 +26,7 @@ fn echo(stream: NetTcpStream, label: &str) -> (Frame, Option<Frame>) {
 	(frame, echoed)
 }
 
-/// Drains `trace` and counts the `GATE_ACCEPT` events it had recorded.
+/// Drains `trace` and counts the `GATE_ACCEPT` events it recorded.
 fn gate_accepts(trace: &TraceCollector) -> usize {
 	trace
 		.drain_events()
@@ -164,5 +166,40 @@ fn sync_server_protocol_bind_applies_policies() -> TransportResult<()> {
 	let (frame, echoed) = echo(NetTcpStream::connect(addr)?, "sync-protocol-bind-audit");
 	assert_eq!(echoed, Some(frame), "audited protocol bind exchange should still echo");
 	assert_eq!(gate_accepts(&trace), 1, "one accepted frame should record one GATE_ACCEPT");
+	Ok(())
+}
+
+/// The handler events that one call to a blocking `server!` records on the
+/// trail of its connection, in order, under a trace whose config sets
+/// `enable_internal_detail` to `detail`.
+fn blocking_handler_span(detail: bool) -> TransportResult<Vec<Urn<'static>>> {
+	let listener = NetTcpListener::bind("127.0.0.1:0")?;
+	let addr = listener.local_addr()?;
+	let trace = TestTrace::with_detail(detail);
+	let audit = trace.share();
+
+	thread::spawn(move || {
+		let server = TcpListener::from_listener_cleartext(listener);
+		server! {
+			TcpListener: server,
+			policies: { with_trace: [ audit.share() ] },
+			handle: |frame: Frame| async move { Ok(Some(frame)) }
+		}
+	});
+
+	// The loop records the exit of its handler before it sends the answer,
+	// so the answer orders the span ahead of the drain below.
+	echo(NetTcpStream::connect(addr)?, "sync-handler-span");
+
+	Ok(TestTrace::trail(&trace, &[events::HANDLER_ENTER, events::HANDLER_EXIT]))
+}
+
+/// A blocking `server!` records the span of its handler when the trace config
+/// sets the detail flag, and leaves the trail empty when the config clears it.
+#[test]
+fn sync_server_records_its_handler_span_under_the_detail_flag_alone() -> TransportResult<()> {
+	let detailed = blocking_handler_span(true)?;
+	let plain = blocking_handler_span(false)?;
+	assert_eq!([detailed, plain], [vec![events::HANDLER_ENTER, events::HANDLER_EXIT], vec![]]);
 	Ok(())
 }

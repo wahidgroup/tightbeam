@@ -287,11 +287,10 @@ impl GatePolicy for AdaptiveGate {
 			return TransitStatus::Ok;
 		};
 
-		// Throttle Standard-or-lower priority frames on first encounter
-		// Subsequent attempts (same order) will be accepted
+		// The gate throttles a frame of `HighThroughput` or lower priority at
+		// its first attempt and admits each later attempt of the same order.
 		let priority = frame.metadata().priority().unwrap_or(MessagePriority::Standard);
 		if priority <= MessagePriority::HighThroughput && self.stats.mark_throttled(frame.metadata().order()) {
-			// Emit trace event for test verification
 			self.trace
 				.event_with(THROTTLE_ENGAGED, &[QUEUE_TAG], true)
 				.expect("the spec grades the throttle, so losing it would pass a stale run");
@@ -349,10 +348,10 @@ servlet! {
 	QueueServlet<WorkOrder, EnvConfig = BackPressureStats>,
 	protocol: TokioListener,
 	handle: |_msg, frame, ctx| async move {
-		let trace = ctx.trace();
+		let trace = &ctx.trace();
 
-		// Process the frame - collector gate handles back-pressure
-		// automatically
+		// The collector gate applies back pressure ahead of the handler, so the
+		// handler records the frame alone.
 		let harness = QueueHarness::new(Arc::clone(trace));
 		harness.handle(&frame)?;
 
@@ -426,16 +425,16 @@ tb_scenario! {
 				trace.event_with(ADAPTIVE_BEHAVIOR, &[QUEUE_TAG], spec.order)?;
 
 				if index == 1 {
-					// For the second frame, emit it then immediately replay it
-					// Server will throttle on first attempt, restart policy
-					// will retry
+					// The client emits the second frame and then replays it
+					// at once. The server throttles the first attempt, and
+					// the restart policy retries it.
 					client.emit(frame.to_owned(), None).await?;
 					trace.event_with(REPLAY_ATTEMPT, &[QUEUE_TAG], frame.metadata().order())?;
 					client.emit(frame, None).await?;
 				} else {
-					// Server-side adaptive gate will throttle Normal+ priority
-					// frames Restart policy will automatically retry throttled
-					// frames
+					// The adaptive gate of the server throttles a frame of
+					// `HighThroughput` or lower priority, and the restart
+					// policy retries each throttled frame.
 					client.emit(frame, None).await?;
 				}
 			}

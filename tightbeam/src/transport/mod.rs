@@ -1,4 +1,4 @@
-//! Transport layer for the TightBeam protocol.
+//! The transport layer of the TightBeam protocol.
 
 // A Cargo feature can require only all of a list, so `tcp` alone would
 // compile a transport with no handshake and no message collection. The build
@@ -70,7 +70,7 @@ pub use tcp::r#async::TokioListener;
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 pub use tcp::r#async::{TransportReader, TransportWriter};
 
-/// Transport-agnostic result type.
+/// The transport-agnostic result type.
 pub type TransportResult<T> = Result<T, TransportError>;
 
 use crate::constants::{
@@ -100,27 +100,27 @@ use crate::utils::time::SystemClock;
 
 /// Every ceiling a transport enforces, in one value.
 ///
-/// Each field is a plain `usize` or `Duration` rather than an `Option`, so a
-/// transport that forgot to configure a limit is unrepresentable.
+/// Each field is a plain `usize` or `Duration`, so every transport holds a
+/// value for every limit, and an unset limit is unrepresentable.
 ///
 /// [`Default`] is the one place that chooses these values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TransportLimits {
-	/// Ceiling in bytes for a cleartext envelope on the wire.
+	/// The ceiling in bytes of a cleartext envelope on the wire.
 	pub cleartext_envelope: usize,
-	/// Ceiling in bytes for an encrypted envelope on the wire.
+	/// The ceiling in bytes of an encrypted envelope on the wire.
 	pub encrypted_envelope: usize,
-	/// Ceiling in bytes for one handshake-phase message on the wire.
+	/// The ceiling in bytes of one handshake-phase message on the wire.
 	pub handshake_wire: usize,
-	/// Deadline for a single read or write on the transport.
+	/// The deadline of a single read or write on the transport.
 	pub operation_timeout: Duration,
-	/// Deadline for the whole handshake exchange.
+	/// The deadline of the whole handshake exchange.
 	pub handshake_timeout: Duration,
 }
 
 impl TransportLimits {
-	/// Returns the largest envelope this endpoint reads before parsing decides
-	/// which ceiling applies.
+	/// Returns the largest envelope this endpoint reads before the parse
+	/// decides which ceiling applies.
 	///
 	/// A reader learns whether the bytes are a cleartext or an encrypted
 	/// envelope only once it has them, so it admits the larger ceiling, and the
@@ -168,7 +168,7 @@ pub struct TransportEncryptionConfig<P: CryptoProvider> {
 	/// The certificate this endpoint presents during the handshake, with the
 	/// key that signs for it, and for a CMS server its key-agreement identity.
 	pub(crate) identity: ServerIdentities<P>,
-	/// How this server authenticates its client.
+	/// The rule by which this server authenticates its client.
 	pub(crate) peer_authentication: PeerAuthentication,
 	/// The key purpose of each role the server's handshakes admit.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -206,9 +206,9 @@ impl<P: CryptoProvider> TryFrom<TransportEncryptionConfig<P>> for DialableEncryp
 	}
 }
 
-/// Everything a transport is built from: provisioning that answered the
-/// dialer rule, its negotiation input, the ceilings it enforces, and the clock
-/// it measures against.
+/// The inputs of a transport: the provisioning that answered the dialer rule,
+/// its negotiation input, the ceilings it enforces, and the clock it measures
+/// against.
 ///
 /// Listeners, clients, and pools each build one of these, and every transport
 /// constructor takes it whole, so every transport holds all four. A clone
@@ -336,14 +336,14 @@ impl<P: CryptoProvider> TransportEncryptionConfig<P> {
 	/// Name the validators that authenticate the client.
 	///
 	/// `validators` accepts any iterator of shared [`CertificateValidation`]
-	/// values. Naming validators demands mutual authentication, and the set
-	/// replaces any set named before.
+	/// values. A non-empty set demands mutual authentication, and it replaces
+	/// any set named before.
 	///
 	/// # Empty set
 	///
 	/// [`PeerAuthentication::mutual`] decides that an empty set demands
-	/// nothing, so an empty set leaves the endpoint where it was, and an
-	/// endpoint that demands mutual authentication keeps demanding it.
+	/// nothing, so an empty set leaves the endpoint as it is, and an
+	/// endpoint that demands mutual authentication still demands it.
 	#[must_use]
 	pub fn with_client_validators(
 		mut self,
@@ -416,7 +416,7 @@ mod tests {
 	use std::error::Error;
 
 	/// An empty validator set demands nothing, so it leaves an endpoint that
-	/// already demands mutual authentication where it was.
+	/// already demands mutual authentication as it is.
 	#[cfg(feature = "testing")]
 	#[test]
 	fn an_empty_validator_set_keeps_the_configured_authentication() {
@@ -513,6 +513,59 @@ mod tests {
 		Ok(())
 	}
 
+	/// The handler events that one call to a cleartext server records on the
+	/// trail of its connection, in order, under a trace whose config sets
+	/// `enable_internal_detail` to `detail`.
+	#[cfg(all(feature = "tokio", feature = "instrument"))]
+	async fn single_flight_handler_span(detail: bool) -> TransportResult<Vec<crate::urn::Urn<'static>>> {
+		use crate::asn1::Frame;
+		use crate::crypto::profiles::DefaultCryptoProvider;
+		use crate::instrumentation::events;
+		use crate::testing::fixtures::TestTrace;
+		use crate::transport::policy::RestartLinearBackoff;
+		use crate::transport::tcp::r#async::TokioListener;
+		use crate::transport::tcp::TightBeamSocketAddr;
+
+		let trace = TestTrace::with_detail(detail);
+		let served = trace.share();
+		let listener = TokioListener::<DefaultCryptoProvider>::bind_cleartext("127.0.0.1:0").await?;
+		let addr = TightBeamSocketAddr(listener.local_addr()?);
+
+		let server_handle = crate::server! {
+			protocol TokioListener: listener,
+			policies: { with_trace: [ served.share() ] },
+			handle: |frame: Frame| async move { Ok(Some(frame)) }
+		};
+
+		let mut client = crate::client! {
+			connect TokioListener: addr,
+			cleartext,
+			policies: {
+				restart_policy: RestartLinearBackoff::default(),
+			}
+		};
+
+		// The server records the exit of its handler before it sends the
+		// answer, so the answer orders the span ahead of the drain below.
+		client.emit(TestFrame::v0(None, None), None).await?;
+		server_handle.abort();
+
+		Ok(TestTrace::trail(&trace, &[events::HANDLER_ENTER, events::HANDLER_EXIT]))
+	}
+
+	/// A single-flight call records the span of its handler when, and only
+	/// when, the trace config sets the detail flag.
+	#[cfg(all(feature = "tokio", feature = "instrument"))]
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn a_single_flight_call_records_its_handler_span_under_the_detail_flag_alone() -> TransportResult<()> {
+		use crate::instrumentation::events;
+
+		let detailed = single_flight_handler_span(true).await?;
+		let plain = single_flight_handler_span(false).await?;
+		assert_eq!([detailed, plain], [vec![events::HANDLER_ENTER, events::HANDLER_EXIT], vec![]]);
+		Ok(())
+	}
+
 	/// A builder with no configured limits still enforces the defaults.
 	///
 	/// A default endpoint reads cleartext under a bound. Every other limit test
@@ -540,8 +593,8 @@ mod tests {
 	///
 	/// With a ceiling of exactly the plaintext length, the builder must still
 	/// refuse the payload. The AEAD tag, the nonce, and the `WireEnvelope`
-	/// wrapper all come after encoding, so a measurement before them would let
-	/// an oversized envelope reach the peer as a connection reset.
+	/// wrapper all come after the encode, so a measurement before them would
+	/// let an oversized envelope reach the peer as a connection reset.
 	#[test]
 	fn encrypted_ceiling_measures_the_sealed_wire_form() -> Result<(), Box<dyn Error>> {
 		use crate::crypto::aead::{RecordDirection, RuntimeAead, SendCipher};

@@ -1,11 +1,19 @@
-//! FDR integration tests using canonical CSP examples
+//! The FDR integration tests, built on canonical CSP examples.
 //!
-//! These tests validate the FDR refinement checking implementation using
-//! well-known CSP examples from the FDR Manual:
-//! - Tennis Game Scoring System (state transitions, trace refinement)
-//! - Dining Philosophers (deadlock detection)
-//! - Trace Analysis (FdrTraceExt methods demonstration)
+//! These tests check FDR refinement checking against well-known CSP examples
+//! from the FDR Manual:
+//! - Tennis Game Scoring System: state transitions and trace refinement.
+//! - Dining Philosophers: deadlock detection.
+//! - Trace Analysis: the methods of `FdrTraceExt`.
+//!
+//! The `exploration` suite builds an exploration engine, and the `refinement`
+//! suite builds a refinement checker, through the public API alone, as an
+//! outside crate must.
 
 mod diners;
+mod refinement;
 mod tennis;
 mod trace_analysis;
+
+#[cfg(feature = "instrument")]
+mod exploration;

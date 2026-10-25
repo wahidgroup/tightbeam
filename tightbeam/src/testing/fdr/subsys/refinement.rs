@@ -63,7 +63,7 @@ impl<'a, M> DefaultRefinementChecker<'a, M>
 where
 	M: MemoizationCache,
 {
-	/// Create a refinement checker over `process` that shares `cache`.
+	/// Creates a refinement checker over `process` that shares `cache`.
 	pub fn new(process: &'a Process, config: Arc<FdrConfig>, cache: Rc<RefCell<M>>) -> Self {
 		Self { config, process, cache }
 	}
@@ -97,15 +97,8 @@ where
 		queue_len >= Self::max_queue_size() || visited_len >= Self::max_visited() || traces_count >= Self::max_traces()
 	}
 
-	/// Returns whether `state` is stable, which means that it enables no
-	/// τ-transition.
-	fn is_stable_state(process: &Process, state: State) -> bool {
-		let enabled_actions = process.enabled(state);
-		!enabled_actions.iter().any(|action| process.hidden.contains(&action.event))
-	}
-
-	/// Apply one transition to a trace. A τ-transition leaves the trace and the
-	/// depth as they are, and an observable event extends both.
+	/// Applies one transition to a trace. A τ-transition leaves the trace and
+	/// the depth as they are, and an observable event extends both.
 	fn process_transition(process: &Process, event: &Event, trace: Trace, depth: usize) -> (Trace, usize) {
 		if process.hidden.contains(event) {
 			(trace, depth)
@@ -116,11 +109,11 @@ where
 		}
 	}
 
-	/// Extract the trace of a linear process, which has a single deterministic
-	/// path.
+	/// Extracts the trace of a linear process, which has a single
+	/// deterministic path.
 	///
 	/// Returns `None` when the process is not linear: it branches, cycles,
-	/// deadlocks, or runs past `max_depth`.
+	/// deadlocks, runs to `max_depth`, or passes 1000 visited states.
 	fn extract_linear_trace(process: &Process, max_depth: usize) -> Option<Trace> {
 		let mut trace = Vec::new();
 		let mut current_state = process.initial;
@@ -133,13 +126,13 @@ where
 			}
 
 			if trace.len() >= max_depth {
-				return None; // Not linear if we hit depth limit
+				return None; // A walk at the depth limit is not linear.
 			}
 
 			// The depth limit counts observable events only, so this bound
 			// stops a long run of τ-transitions.
 			if visited_states.len() > 1000 {
-				return None; // Likely not linear if we've visited many states
+				return None; // A walk past 1000 states counts as not linear.
 			}
 
 			// Follow the τ-transitions (hidden events) first, one at a time,
@@ -152,16 +145,16 @@ where
 					if process.hidden.contains(&action.event) {
 						let next_states = process.step(current_state, &action.event);
 						if next_states.len() != 1 {
-							return None; // Non-deterministic τ-transition
+							return None; // Two τ targets make a branch.
 						}
 						current_state = next_states[0];
 
 						if !visited_states.insert(current_state) {
-							return None; // Cycle detected
+							return None; // A revisited state is a cycle.
 						}
 
 						has_tau_transitions = true;
-						break; // Restart check from new state
+						break; // The scan starts again at the next state.
 					}
 				}
 
@@ -179,7 +172,7 @@ where
 
 			// A linear process enables at most one observable action.
 			if observable_actions.len() > 1 {
-				return None; // Not linear - has branching in observable events
+				return None; // A branch on observable events is not linear.
 			}
 
 			if let Some(action) = observable_actions.first() {
@@ -187,21 +180,21 @@ where
 
 				// A linear process has exactly one next state.
 				if next_states.len() != 1 {
-					return None; // Not linear - has non-determinism
+					return None; // A nondeterministic step is not linear.
 				}
 
 				trace.push(action.event);
 				current_state = next_states[0];
 
 				if !visited_states.insert(current_state) {
-					return None; // Cycle detected - not a simple linear trace
+					return None; // A revisited state is a cycle.
 				}
 			} else {
 				// The state enables no action, so it is terminal or a deadlock.
 				if process.terminal.contains(&current_state) {
 					return Some(trace);
 				}
-				return None; // Deadlock - not a valid linear trace
+				return None; // A deadlock is not a linear trace.
 			}
 		}
 	}
@@ -260,13 +253,6 @@ where
 		(data, complete)
 	}
 
-	/// Returns whether a τ-transition to `next_state` revisits a state that
-	/// this run of τ-transitions has seen at `trace`.
-	fn has_tau_cycle(&self, tau_states_seen: &HashSet<(State, Trace)>, next_state: State, trace: &Trace) -> bool {
-		let next_key = (next_state, trace.clone());
-		tau_states_seen.contains(&next_key)
-	}
-
 	/// Returns whether the specification failures hold a failure with the trace
 	/// `impl_trace` whose refusal set contains `impl_refusal` (impl_refusal ⊆
 	/// spec_refusal).
@@ -284,7 +270,8 @@ where
 		false
 	}
 
-	/// Search for a specific trace in a spec without computing all traces.
+	/// Searches for one trace in a spec, which costs less than a computation
+	/// of every trace of the spec.
 	///
 	/// The search is a BFS over `(state, matched-prefix-length)` pairs:
 	///
@@ -349,19 +336,21 @@ impl<'a, M> RefinementChecker for DefaultRefinementChecker<'a, M>
 where
 	M: MemoizationCache,
 {
-	/// Check trace refinement, where impl ⊑ spec means traces(impl) ⊆
+	/// Checks trace refinement, where spec ⊑ impl means traces(impl) ⊆
 	/// traces(spec).
 	///
-	/// Every impl trace is checked, because a check of only the longest trace
-	/// misses forbidden events on sibling branches of a branching impl.
+	/// The check reads every impl trace, because a check of the longest trace
+	/// alone misses the forbidden events on the sibling branches of an impl
+	/// that branches.
 	///
 	/// Reference: Roscoe (1998, 2010)
 	fn check_trace_refinement(&mut self, spec: &Process, impl_process: &Process) -> RefinementOutcome<Trace> {
 		let (impl_traces, impl_complete) = self.compute_traces(impl_process, self.config.max_depth);
 
-		// Each trace is projected onto the spec's observable alphabet, because
-		// an implementation recorded from a running system also carries the
-		// steps that the spec models internally. See `Process::project`.
+		// The check projects each trace onto the observable alphabet of the
+		// spec, because an implementation recorded from a running system also
+		// carries the steps that the spec models internally. See
+		// `Process::project`.
 		let projected: HashSet<Trace> = impl_traces.iter().map(|trace| spec.project(trace)).collect();
 
 		// Sorted iteration keeps the reported witness deterministic
@@ -398,7 +387,7 @@ where
 		RefinementOutcome::Holds { complete: impl_complete }
 	}
 
-	/// Check failures refinement, where impl ⊑ spec means failures(impl) ⊆
+	/// Checks failures refinement, where spec ⊑ impl means failures(impl) ⊆
 	/// failures(spec).
 	///
 	/// For each impl failure (trace, impl_refusal), the spec must hold a
@@ -423,8 +412,8 @@ where
 		RefinementOutcome::Holds { complete: spec_complete && impl_complete }
 	}
 
-	/// Check divergence refinement, where impl ⊑ spec means divergences(impl) ⊆
-	/// divergences(spec).
+	/// Checks divergence refinement, where spec ⊑ impl means
+	/// divergences(impl) ⊆ divergences(spec).
 	///
 	/// Reference: Roscoe (1998, 2010)
 	fn check_divergence_refinement(&mut self, spec: &Process, impl_process: &Process) -> RefinementOutcome<Trace> {
@@ -527,9 +516,8 @@ where
 			return (cached, complete);
 		}
 
-		// Failures are recorded at stable states only, which enable no
-		// τ-transition.
-		// Reference: Roscoe (1998, 2010)
+		// The search records a failure at a stable or accepting state alone,
+		// as `Process::failure_refusals` decides.
 		let failures = Vec::new();
 		let visited = HashSet::new();
 		let data = (failures, visited);
@@ -545,8 +533,7 @@ where
 
 				visited.insert(visit_key);
 
-				if Self::is_stable_state(process, state) {
-					let refusals = self.compute_refusals(process, state);
+				if let Some(refusals) = self.compute_refusals(process, state) {
 					let failure = (trace.clone(), refusals);
 					if !failures.contains(&failure) {
 						failures.push(failure);
@@ -566,53 +553,41 @@ where
 		(failures, complete)
 	}
 
+	/// Computes the divergences of `process`, each trace after which a state
+	/// that the process reaches can diverge.
+	///
+	/// [`Process::divergent_states`] decides each state once, and the search
+	/// reads that answer at each state and trace it reaches, up to
+	/// `max_depth`.
 	fn compute_divergences(&mut self, process: &Process, max_depth: usize) -> (HashSet<Trace>, bool) {
 		let structure = process.structure_digest();
 		if let Some((cached, complete)) = self.cache.borrow().get_cached_divergences(structure) {
 			return (cached.into_iter().collect(), complete);
 		}
 
+		let divergent = process.divergent_states();
 		let mut divergences = HashSet::new();
-		let mut queue = VecDeque::new();
-		let mut initial_tau_seen = HashSet::new();
+		let mut queue = VecDeque::from([(process.initial, Vec::new())]);
+		let mut visited = HashSet::new();
 
-		initial_tau_seen.insert((process.initial, Vec::new()));
-		queue.push_back((process.initial, Vec::new(), initial_tau_seen));
-
-		let mut global_visited = HashSet::new();
-		while let Some((state, trace, tau_states_seen)) = queue.pop_front() {
+		while let Some((state, trace)) = queue.pop_front() {
 			if trace.len() >= max_depth {
 				continue;
 			}
-
-			let visit_key = (state, trace.clone());
-			if global_visited.contains(&visit_key) {
+			if !visited.insert((state, trace.clone())) {
 				continue;
+			}
+
+			if divergent.contains(state) {
+				divergences.insert(trace.clone());
 			}
 
 			for action in process.enabled(state) {
 				for next_state in process.step(state, &action.event) {
-					if process.hidden.contains(&action.event) {
-						if self.has_tau_cycle(&tau_states_seen, next_state, &trace) {
-							divergences.insert(trace.clone());
-							continue;
-						}
-
-						let mut new_tau_seen = tau_states_seen.clone();
-						new_tau_seen.insert((next_state, trace.clone()));
-						queue.push_back((next_state, trace.clone(), new_tau_seen));
-					} else {
-						let mut new_trace = trace.clone();
-						new_trace.push(action.event);
-
-						let mut new_tau_seen = HashSet::new();
-						new_tau_seen.insert((next_state, new_trace.clone()));
-						queue.push_back((next_state, new_trace, new_tau_seen));
-					}
+					let (next_trace, _depth) = Self::process_transition(process, &action.event, trace.clone(), 0);
+					queue.push_back((next_state, next_trace));
 				}
 			}
-
-			global_visited.insert(visit_key);
 		}
 
 		let divergences_vec: Vec<Trace> = divergences.iter().cloned().collect();
@@ -620,29 +595,76 @@ where
 
 		(divergences, true)
 	}
+}
 
-	/// Compute the refusal set of a stable state, which is every observable
-	/// event minus the enabled events.
-	///
-	/// Reference: Roscoe (1998, 2010)
-	fn compute_refusals(&self, process: &Process, state: State) -> HashSet<Event> {
-		let enabled_events: HashSet<Event> = process
-			.enabled(state)
-			.iter()
-			.filter_map(|action| {
-				if !process.hidden.contains(&action.event) {
-					Some(action.event)
-				} else {
-					None
-				}
-			})
-			.collect();
+#[cfg(test)]
+mod tests {
+	use std::cell::RefCell;
+	use std::collections::HashSet;
+	use std::rc::Rc;
+	use std::sync::Arc;
 
-		process
-			.observable
-			.iter()
-			.filter(|&event| !enabled_events.contains(event))
-			.cloned()
-			.collect()
+	use super::DefaultRefinementChecker;
+	use crate::testing::fdr::{DefaultCache, FdrConfig, RefinementChecker};
+	use crate::testing::specs::csp::{Event, Process, ProcessBuildError, State};
+
+	/// A process that can stop at `Idle`, where it still offers `a`, and at
+	/// `Done`, which `a` leads to.
+	fn accepting() -> Result<Process, ProcessBuildError> {
+		Process::builder("Accepting")
+			.initial_state(State("Idle"))
+			.add_observable(Event("a"))
+			.add_observable(Event("b"))
+			.add_transition(State("Idle"), Event("a"), State("Done"))
+			.add_terminal(State("Idle"))
+			.add_terminal(State("Done"))
+			.build()
+	}
+
+	/// A process whose hidden `t` and `u` take `S1` to `S2` and back, with the
+	/// observable exit `b` at `S2`, so it can diverge after `a`.
+	fn spinning() -> Result<Process, ProcessBuildError> {
+		Process::builder("Spinning")
+			.initial_state(State("S0"))
+			.add_observable(Event("a"))
+			.add_observable(Event("b"))
+			.add_hidden(Event("t"))
+			.add_hidden(Event("u"))
+			.add_transition(State("S0"), Event("a"), State("S1"))
+			.add_transition(State("S1"), Event("t"), State("S2"))
+			.add_transition(State("S2"), Event("u"), State("S1"))
+			.add_transition(State("S2"), Event("b"), State("S3"))
+			.add_terminal(State("S3"))
+			.build()
+	}
+
+	/// The checker of `process` under the default configuration.
+	fn checker_of(process: &Process) -> DefaultRefinementChecker<'_, DefaultCache> {
+		let cache = Rc::new(RefCell::new(DefaultCache::new()));
+		DefaultRefinementChecker::new(process, Arc::new(FdrConfig::default()), cache)
+	}
+
+	#[test]
+	fn a_reachable_hidden_cycle_makes_its_trace_a_divergence() -> Result<(), ProcessBuildError> {
+		let process = spinning()?;
+		let mut checker = checker_of(&process);
+
+		let (divergences, _complete) = checker.compute_divergences(&process, 8);
+
+		let after_a = HashSet::from([vec![Event("a")]]);
+		assert_eq!(divergences, after_a, "`S1` and `S2` can spin after `a`");
+		Ok(())
+	}
+
+	#[test]
+	fn an_accepting_state_fails_with_every_observable_event() -> Result<(), ProcessBuildError> {
+		let process = accepting()?;
+		let mut checker = checker_of(&process);
+
+		let (failures, _complete) = checker.compute_failures(&process, 8);
+
+		let refused_at_idle = (vec![], HashSet::from([Event("a"), Event("b")]));
+		assert!(failures.contains(&refused_at_idle), "the failures were {failures:?}");
+		Ok(())
 	}
 }

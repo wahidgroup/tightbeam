@@ -31,10 +31,11 @@ use tightbeam::{
 	decode,
 	der::Sequence,
 	exactly, hive,
+	instrumentation::{events, TbInstrumentationConfig},
 	policy::TransitStatus,
 	servlet, tb_assert_spec, tb_scenario,
-	testing::{HiveEnv, SetupEnv, TestCertificate, TestDigest, TestIdentity, TestKey},
-	trace::TraceCollector,
+	testing::{fixtures::TestTrace, HiveEnv, SetupEnv, TestCertificate, TestDigest, TestIdentity, TestKey},
+	trace::{TraceCollector, TraceConfig},
 	transport::{
 		handshake::negotiation::TransportOffer, tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder,
 		GenericClient, Protocol,
@@ -44,6 +45,7 @@ use tightbeam::{
 	Beamable, Frame, Message, TightBeamError, Version,
 };
 
+use crate::common::poll::poll_until;
 use crate::common::security::{expectation_failure, pinning_trust_store, ServerMaterials};
 use crate::common::x509::{create_test_cert_with_key, signing_identity};
 
@@ -293,8 +295,9 @@ fn spawn_command_frame(id: impl AsRef<[u8]>, servlet_type: impl AsRef<str>) -> R
 	command_frame(id, manage_cmd)
 }
 
-/// A signer that the hive trust store pins. `start` builds the trust store
-/// from the certificate. The client signs command frames under the identity.
+/// A signer that the hive trust store pins: `start` builds the trust store
+/// from the certificate, and the client signs command frames under the
+/// identity.
 struct TrustedSignerContext {
 	certificate: Certificate,
 	identity: SigningIdentity,
@@ -303,10 +306,10 @@ struct TrustedSignerContext {
 impl TrustedSignerContext {
 	/// The control-plane TLS this signer's hive presents.
 	///
-	/// The validator chain is what makes the accept side request and keep
-	/// the caller certificate. The security gate keys its per-signer
-	/// breaker on the peer the handshake proves, so a control plane that
-	/// proves no peer has no budget to key on.
+	/// The validator chain makes the accept side request and keep the caller
+	/// certificate. The security gate keys its per-signer breaker on the peer
+	/// the handshake proves, so a control plane that proves no peer has no
+	/// budget to key on.
 	fn control_tls(&self) -> HiveTlsConfig {
 		let anchor = DirectTrustValidator::default().with_trust_chain([self.certificate.to_owned()]);
 
@@ -519,13 +522,11 @@ tb_scenario! {
 			let response = emit_command(&mut client, unsigned_stop).await?;
 			trace.event_with(UNSIGNED_MANAGE_MANAGE_SHAPE, &[], manage_stop_shape_status(response)?)?;
 
-			// A signed heartbeat must be accepted end to end.
+			// The hive must accept a signed heartbeat end to end.
 			let signed_heartbeat = signed_heartbeat_frame(&signer.identity, b"hb-signed").await?;
 			let response = emit_command(&mut client, signed_heartbeat).await?;
 			trace.event_with(SIGNED_HEARTBEAT_ACCEPTED, &[], heartbeat_shape_status(response, false)?)?;
 
-			// A signed manage command during drain must come back
-			// Unavailable in the manage CHOICE.
 			hive.drain().await?;
 
 			// The hive answers a signed heartbeat during drain, because a
@@ -535,6 +536,8 @@ tb_scenario! {
 			let response = emit_command(&mut client, signed_heartbeat).await?;
 			trace.event_with(DRAINING_HEARTBEAT_ACCEPTED, &[], heartbeat_shape_status(response, false)?)?;
 
+			// A signed manage command during drain must come back
+			// Unavailable in the manage CHOICE.
 			let signed_stop = signed_stop_frame(&signer.identity, b"manage-draining").await?;
 			let response = emit_command(&mut client, signed_stop).await?;
 			trace.event_with(DRAINING_MANAGE_MANAGE_SHAPE, &[], manage_stop_shape_status(response)?)?;
@@ -586,9 +589,9 @@ tb_assert_spec! {
 	}
 }
 
-// Backpressure ResourceExhausted must also come back in the sender's CHOICE.
-// Only manage commands hit the gate (heartbeats are exempt), so the
-// ResourceExhausted verdict must use the manage shape.
+// A backpressure refusal of ResourceExhausted must also come back in the
+// sender's CHOICE. Only manage commands hit the gate (heartbeats are exempt),
+// so the ResourceExhausted verdict must use the manage shape.
 tb_scenario! {
 	name: hive_backpressure_reply_shape,
 	spec: HiveBackpressureShapeSpec,
@@ -688,8 +691,8 @@ tb_assert_spec! {
 // spelled as a SEQUENCE decodes as no command, whether it names none of its
 // fields, one, or both. Each must draw a refusal the sender can decode. A
 // silent hive would hang the cluster until its own timeout and count as a
-// lost hive. A PermissionDenied answer would tell a correctly authorized
-// sender its credentials were the problem.
+// lost hive. A PermissionDenied answer would tell an authorized sender its
+// credentials were the problem.
 tb_scenario! {
 	name: hive_refuses_a_command_of_the_sequence_shape,
 	spec: HiveSequenceShapeRefusalSpec,
@@ -1124,4 +1127,86 @@ tb_scenario! {
 			Ok(())
 		}
 	}
+}
+
+/// The gate verdicts that a hive's own trace records as its control plane
+/// answers one heartbeat. The client dials with a default endpoint, so the
+/// trace holds the events of the hive alone.
+async fn hive_gate_verdicts() -> Result<Vec<Urn<'static>>, TightBeamError> {
+	let trace = TraceCollector::new();
+	let signer = trusted_signer("CN=Hive Trail Cluster");
+	let hive = start_trusted_hive(&trace, &signer, HiveConfig::default()).await?;
+	let mut client = connect_hive(&hive, &signer).await?;
+	emit_command(&mut client, command_frame(b"hb-trail", heartbeat_command())?).await?;
+	hive.stop();
+
+	Ok(TestTrace::trail(&trace, &[events::GATE_ACCEPT, events::GATE_REJECT]))
+}
+
+/// A hive's trace records the gate verdict of each command its control plane
+/// answers.
+#[tokio::test]
+async fn a_hive_records_the_gate_verdicts_of_its_control_plane_on_its_own_trace() -> Result<(), TightBeamError> {
+	assert_eq!(hive_gate_verdicts().await?, [events::GATE_ACCEPT]);
+	Ok(())
+}
+
+/// The count of peers that fail the handshake of a hive's control plane, and
+/// the bound of the hive's trace, in the test of that bound.
+const REFUSED_PEERS: usize = 4;
+
+/// Dials `hive` as `stranger`, a signer whose certificate the hive does not
+/// pin, and sends one heartbeat. The client trusts the certificate of
+/// `signer`, which the hive presents.
+async fn dial_as_stranger(
+	hive: &HiveX509Test,
+	signer: &TrustedSignerContext,
+	stranger: &TrustedSignerContext,
+) -> Result<ClusterCommandResponse, TightBeamError> {
+	let client = ClientBuilder::<TokioListener>::builder()
+		.with_trust_store(pinning_trust_store(&signer.certificate)?)
+		.with_client_identity(stranger.identity.clone())
+		.build();
+
+	let addr = hive.addr().ok_or(TightBeamError::NotEstablished)?;
+	let mut client = client.connect(addr.to_owned()).await?;
+	emit_command(&mut client, command_frame(b"hb-stranger", heartbeat_command())?).await
+}
+
+/// The events of its own that a hive's trace keeps, and its overflow latch,
+/// after [`REFUSED_PEERS`] strangers fail the handshake of its control plane
+/// and the hive then records an event of its own. The trace holds
+/// [`REFUSED_PEERS`] events.
+async fn hive_trace_after_refused_peers() -> Result<(Vec<Urn<'static>>, bool), TightBeamError> {
+	let config = TbInstrumentationConfig { max_events: REFUSED_PEERS as u32, ..Default::default() };
+	let trace = TraceCollector::from(TraceConfig::with_instrumentation(config));
+	let signer = trusted_signer("CN=Hive Bound Cluster");
+	let stranger = trusted_signer("CN=Hive Bound Stranger");
+	let hive = start_trusted_hive(&trace, &signer, HiveConfig::default()).await?;
+	// The start records into the trace, so a drain gives every slot to the
+	// strangers. A drain keeps the latch.
+	let _started = trace.drain_events();
+
+	for _ in 0..REFUSED_PEERS {
+		// The hive refuses the certificate of the stranger, so the heartbeat
+		// fails, and the test reads the refusal from the trace instead.
+		let _refused = dial_as_stranger(&hive, &signer, &stranger).await;
+	}
+
+	// A wait that runs out leaves the trace short of the strangers, so the
+	// assertion then reads the event of the hive in the trace.
+	let refused = || trace.recorded(events::SESSION_CERT_REJECTED) >= REFUSED_PEERS;
+	poll_until(50, Duration::from_millis(100), refused).await;
+	trace.emit_event(events::HIVE_REREGISTERED)?;
+	hive.stop();
+
+	Ok((TestTrace::trail(&trace, &[events::HIVE_REREGISTERED]), trace.overflowed()))
+}
+
+/// Peers that never authenticate fill a hive's bounded trace, so the default
+/// sink drops the next event of the hive's own and sets its overflow latch.
+#[tokio::test]
+async fn refused_peers_fill_the_trace_of_a_hive_ahead_of_its_own_events() -> Result<(), TightBeamError> {
+	assert_eq!(hive_trace_after_refused_peers().await?, (vec![], true));
+	Ok(())
 }

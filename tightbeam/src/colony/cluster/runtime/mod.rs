@@ -48,9 +48,8 @@ use crate::constants::{DEFAULT_AD_RUMOR_REFRESH_MS, DEFAULT_MAX_SERVER_CONNECTIO
 use crate::macros::server::{serve_connection_service, AcceptedConnection};
 use crate::policy::TransitStatus;
 use crate::runtime::rt;
-use crate::trace::TraceCollector;
-use crate::transport::accept::AcceptPlane;
-use crate::transport::handshake::negotiation::TransportOffer;
+use crate::trace::{TraceCollector, TraceHandle};
+use crate::transport::accept::{AcceptPlane, ConnectionTerms};
 use crate::transport::multiplex::{CallContext, MuxCapable, MuxService, ReplySink, StreamBody};
 use crate::transport::policy::PolicyConfig;
 use crate::transport::{AsyncListenerTrait, Protocol, TransportError};
@@ -351,8 +350,7 @@ where
 
 	fn available_servlets(&self) -> Result<Vec<SharedId>, ClusterError> {
 		// The routes are the one home of the types this gateway serves, so
-		// this list follows each instance a hive scales in or out, with no
-		// second index to keep current.
+		// this list follows each instance a hive scales in or out.
 		self.servlet_registry.local_servlets()
 	}
 
@@ -440,15 +438,15 @@ where
 ///
 /// # Routing
 ///
-/// - `Local` trail: dial the servlet on the hive plane.
-/// - `Peer` trail: splice the stream to the peer gateway (see
+/// - `Local` trail: the service dials the servlet on the hive plane.
+/// - `Peer` trail: the service splices the stream to the peer gateway (see
 ///   [`GatewayRuntimeCtx::splice_streaming`] and
 ///   [`GatewayRuntimeCtx::splice_duplex`]).
 ///
 /// # Export boundary
 ///
 /// Stream and duplex opens pass [`GatewayRuntimeCtx::guard_stream_open`], which
-/// applies the Work-arm boundary order before routing.
+/// applies the boundary order of the Work arm before the open routes.
 struct GatewayMuxService<P>
 where
 	P: Protocol,
@@ -587,10 +585,10 @@ impl<P: GatewayColonyProtocol> GatewayRuntimeCtx<P> {
 		L: AsyncListenerTrait + Sync + 'static,
 		L::Transport: AcceptedConnection + PolicyConfig + MuxCapable + 'static,
 	{
-		let mux_offer = self.config.pool_config.mux_offer.as_ref().map(Arc::clone);
+		let terms = self.connection_terms();
 		let clock = Arc::clone(&self.config.clock);
 		let service = GatewayMuxService::<P> { ctx: self };
-		Self::accept_into(listener, mux_offer, clock, service)
+		Self::accept_into(listener, terms, clock, service)
 	}
 
 	/// Serves an edge accept plane through [`EdgeMuxService`].
@@ -602,22 +600,34 @@ impl<P: GatewayColonyProtocol> GatewayRuntimeCtx<P> {
 		L: AsyncListenerTrait + Sync + 'static,
 		L::Transport: AcceptedConnection + PolicyConfig + MuxCapable + 'static,
 	{
-		let mux_offer = self.config.pool_config.mux_offer.as_ref().map(Arc::clone);
+		let terms = self.connection_terms();
 		let clock = Arc::clone(&self.config.clock);
 		let service = EdgeMuxService::<P> { ctx: self };
-		Self::accept_into(listener, mux_offer, clock, service)
+		Self::accept_into(listener, terms, clock, service)
+	}
+
+	/// The terms that the gateway sets on each connection it serves: its own
+	/// trace, and the mux offer of its pool config.
+	fn connection_terms(&self) -> ConnectionTerms {
+		let mux_offer = self.config.pool_config.mux_offer.as_ref().map(Arc::clone);
+		let trace = TraceHandle::new(Arc::clone(&self.trace));
+		ConnectionTerms::new(trace, mux_offer)
 	}
 
 	/// Accepts on `listener` and dispatches every connection through `service`.
 	///
-	/// Each admitted transport shares one mux offer by reference count, and
-	/// accept retries wait on `clock`, the gateway's own.
-	fn accept_into<L, S>(
-		listener: L,
-		mux_offer: Option<Arc<TransportOffer>>,
-		clock: Arc<dyn Clock>,
-		service: S,
-	) -> rt::JoinHandle
+	/// Each admitted transport takes `terms`, the gateway's trace and mux
+	/// offer, before its handshake. Accept retries wait on `clock`, the
+	/// gateway's own.
+	///
+	/// # Warning
+	///
+	/// The trace records every connection, a peer that never authenticates
+	/// included. The default `BoundedMemorySink` drops each event past
+	/// `max_events`, the gateway's own refusals included, so a long-lived
+	/// gateway needs an `EventSink` that forwards each event, or a reader that
+	/// drains the trace.
+	fn accept_into<L, S>(listener: L, terms: ConnectionTerms, clock: Arc<dyn Clock>, service: S) -> rt::JoinHandle
 	where
 		L: AsyncListenerTrait + Sync + 'static,
 		L::Transport: AcceptedConnection + PolicyConfig + MuxCapable + 'static,
@@ -626,11 +636,7 @@ impl<P: GatewayColonyProtocol> GatewayRuntimeCtx<P> {
 		let service = Arc::new(service);
 
 		let plane = AcceptPlane::new(DEFAULT_MAX_SERVER_CONNECTIONS, clock);
-		rt::spawn(plane.accept_on(listener, move |mut transport: L::Transport| {
-			// Each accept clones the `Arc`, so it shares the mux offer and
-			// copies no authorization octet.
-			transport = transport.with_mux_offer(mux_offer.clone());
-
+		rt::spawn(plane.accept_owned(listener, terms, move |transport: L::Transport| {
 			let service = Arc::clone(&service);
 			async move { serve_connection_service(transport, service, None, None).await }
 		}))

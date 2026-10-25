@@ -1,5 +1,5 @@
 //! Responder loop that dispatches peer-initiated streams to their handlers
-//! and sends the terminal response of each stream.
+//! and sends the terminal record of each stream.
 
 use core::future::{poll_fn, Future};
 use core::pin::Pin;
@@ -48,23 +48,24 @@ enum ResponderEvent {
 enum StreamWork {
 	/// A unary-kind stream, reassembled into its frame.
 	Frame(Arc<Frame>),
-	/// An incremental body that carries the kind the initiator stamped on the
-	/// stream.
+	/// An incremental body, with the kind and the route that the initiator
+	/// stamped on the stream.
 	Body(MuxStreamKind, Box<StreamBody>, StreamRoute),
 }
 
-/// Kind-routed handler set for one connection's peer streams.
+/// The kind-routed handler set for the peer streams of one connection.
 ///
-/// The initiating call stamps each stream's kind on its Open record
-/// ([`MuxStreamKind`]) and the responder routes it to the matching method here.
-/// Every default answers [`TransitStatus::Unimplemented`], so a kind outside
-/// the service refuses its own stream and the connection keeps serving.
+/// The initiator stamps the kind of each stream on its Open record
+/// ([`MuxStreamKind`]), and the responder routes the stream to the method here
+/// that matches the kind. Every default answers
+/// [`TransitStatus::Unimplemented`], so a kind outside the service refuses its
+/// own stream and the connection continues to serve.
 ///
 /// # A failed stream
 ///
 /// Each method answers its own stream, and an `Err` refuses that stream
 /// alone. The responder answers it with the status of the error, records
-/// `MUX_INTERNAL_ERROR`, and keeps serving the other streams of the
+/// `MUX_INTERNAL_ERROR`, and continues to serve the other streams of the
 /// connection:
 ///
 /// - [`TransportError::OperationFailed`] keeps the status its failure
@@ -121,9 +122,9 @@ pub trait MuxDispatch {
 
 	/// Consume a streamed request body and answer with the terminal response.
 	///
-	/// Consuming chunks replenishes the peer's stream credit, so a slow
-	/// handler parks the sender with end-to-end backpressure. `route` carries
-	/// the grpc-style dispatch target stamped on the Open.
+	/// Each chunk the handler consumes replenishes the peer's stream credit, so
+	/// a slow handler parks the sender with end-to-end backpressure. `route`
+	/// carries the grpc-style dispatch target stamped on the Open.
 	///
 	/// # Errors
 	///
@@ -138,8 +139,8 @@ pub trait MuxDispatch {
 		ready(Ok(ResponsePackage::new(TransitStatus::Unimplemented, None)))
 	}
 
-	/// Consume request chunks while pushing reply chunks, in full duplex on one
-	/// stream.
+	/// Consume request chunks and push reply chunks at the same time, in full
+	/// duplex on one stream.
 	///
 	/// The returned status closes the stream as its `End` trailer. `route`
 	/// carries the grpc-style dispatch target stamped on the Open.
@@ -160,8 +161,8 @@ pub trait MuxDispatch {
 }
 
 impl MuxResponder {
-	/// Wait for the next responder event, preferring handler completions over
-	/// new inbound work so a finished stream releases its slot before the loop
+	/// Wait for the next responder event. Handler completions come before new
+	/// inbound work, so a finished stream releases its slot before the loop
 	/// admits another.
 	async fn next_event<Fut>(
 		&mut self,
@@ -256,9 +257,9 @@ where
 
 /// Box the future of a dispatch method.
 ///
-/// Erasing the `impl Future` opaque type sidesteps the over-strict `Send`
-/// proof that rustc applies to a future that borrows from an `Arc` it lives
-/// beside.
+/// The box erases the `impl Future` opaque type, which sidesteps the
+/// over-strict `Send` proof that rustc applies to a future that borrows from
+/// an `Arc` it lives beside.
 ///
 /// # Sources
 ///
@@ -270,21 +271,25 @@ fn boxed<'a, T>(future: impl Future<Output = T> + MaybeSend + 'a) -> MaybeSendFu
 impl MuxLink {
 	/// Run the full lifecycle of one peer stream.
 	///
-	/// The work goes to the [`MuxDispatch`] method that matches its kind. The
-	/// terminal record of the stream, a response or a trailer, then goes out.
-	/// A method that fails answers its own stream through
-	/// [`Self::refuse_failed`], so the failure ends no other stream.
+	/// The work goes to the [`MuxDispatch`] method that matches its kind, a
+	/// route step the connection's trail records. The terminal record of the
+	/// stream, a response or a trailer, then goes out. A method that fails
+	/// answers its own stream through [`Self::refuse_failed`], so the failure
+	/// ends that stream alone.
 	///
 	/// # Errors
 	///
 	/// - The [`send_response`](Self::send_response) and [`send_end_trailer`](Self::send_end_trailer) sets.
 	/// - The [`refuse_failed`](Self::refuse_failed) set.
+	/// - The injected error, when the runtime fault model injects a fault at the route step.
 	async fn dispatch_stream<D: MuxDispatch>(
 		self,
 		dispatch: Arc<D>,
 		stream_id: u32,
 		work: StreamWork,
 	) -> TransportResult<()> {
+		self.shared().note_route_step()?;
+
 		match work {
 			StreamWork::Frame(frame) => {
 				let response = match boxed(dispatch.unary(frame)).await {
@@ -309,8 +314,8 @@ impl MuxLink {
 				self.send_end_trailer(stream_id, status).await
 			}
 			// Unreachable by construction, because the reader reassembles
-			// unary-kind streams into frames. The arm answers `Internal`
-			// instead of asserting.
+			// unary-kind streams into frames. The arm records the fault and
+			// answers `Internal` in place of an assertion.
 			StreamWork::Body(MuxStreamKind::Unary, _, _) => {
 				self.shared().note_internal_error()?;
 				let refusal = ResponsePackage::new(TransitStatus::Internal, None);
@@ -344,16 +349,21 @@ impl MuxLink {
 /// # Caps and cancels
 ///
 /// - Cap exhaustion answers with [`TransitStatus::ResourceExhausted`] on the
-///   responder's own queue slot, so a peer flooding past its cap buffers at
-///   most one refusal.
-/// - A peer cancel aborts the in-flight handler (or its response send) and sends no response.
-/// - Cancels of in-flight handlers draw on a per-connection budget
-///   (CVE-2023-44487 "Rapid Reset" hardening). A peer that opens streams
-///   only to cancel them exhausts the budget and draws a best-effort GoAway.
+///   responder's own queue slot, so a peer that floods past its cap buffers
+///   at most one refusal.
+/// - A peer cancel aborts the in-flight handler (or its response send) and
+///   records [`MUX_STREAM_CANCELLED`] on the connection's trail. The cancel
+///   is the last record of the stream on the wire.
+/// - Cancels of in-flight handlers draw on a per-connection budget, which
+///   hardens the connection against CVE-2023-44487 "Rapid Reset". A peer that
+///   opens streams only to cancel them exhausts the budget and draws a
+///   best-effort GoAway.
 ///
 /// # Sources
 ///
 /// - CVE-2023-44487, HTTP/2 Rapid Reset: <https://nvd.nist.gov/vuln/detail/CVE-2023-44487>
+///
+/// [`MUX_STREAM_CANCELLED`]: crate::instrumentation::events::MUX_STREAM_CANCELLED
 pub struct MuxResponder {
 	inbound: mpsc::Receiver<InboundEvent>,
 	link: MuxLink,
@@ -374,9 +384,9 @@ impl MuxResponder {
 		self.cancel_budget = budget;
 	}
 
-	/// Run the responder until the connection ends, routing each peer stream to
-	/// the `dispatch` method that matches the kind the initiating call stamped
-	/// on it.
+	/// Run the responder until the connection ends, and route each peer stream
+	/// to the `dispatch` method that matches the kind the initiator stamped on
+	/// it.
 	///
 	/// - Unary-kind streams arrive reassembled into their frame.
 	/// - Streaming and duplex kinds arrive as incremental [`StreamBody`]
@@ -390,9 +400,15 @@ impl MuxResponder {
 	/// - [`TransportError::ConnectionClosed`] -- the writer driver is gone.
 	/// - [`TransportError::OperationFailed`] with
 	///   [`TransportFailure::PolicyRejection`] -- the peer exhausted the cancel
-	///   budget, and the responder queued a best-effort GoAway with
+	///   budget, and the responder tried to queue a GoAway with
 	///   [`GoAwayReason::EnhanceYourCalm`].
+	/// - The encode failure of a response or a trailer that does not serialize.
+	/// - The injected error, when the runtime fault model injects a fault at the route step of a stream.
 	/// - The injected error, when the runtime fault model injects a fault at the record of a failed stream.
+	/// - The injected error, when the runtime fault model injects a fault at the record of a peer cancel.
+	/// - The injected error, when the runtime fault model injects a fault at
+	///   the cancel-budget event or at the event of the GoAway, in place of the
+	///   `PolicyRejection`.
 	///
 	/// # Examples
 	///
@@ -430,8 +446,8 @@ impl MuxResponder {
 		.await
 	}
 
-	/// Run the responder until the connection ends, dispatching each unary-kind
-	/// frame to `handler`.
+	/// Run the responder until the connection ends, and dispatch each
+	/// unary-kind frame to `handler`.
 	///
 	/// This is sugar on [`serve_with`](Self::serve_with) over a unary-only
 	/// service, so streaming and duplex streams answer
@@ -448,7 +464,7 @@ impl MuxResponder {
 		self.serve_with(UnaryFn(handler)).await
 	}
 
-	/// Run the responder until the connection ends, dispatching each
+	/// Run the responder until the connection ends, and dispatch each
 	/// streaming-kind stream to `handler` as an incremental [`StreamBody`].
 	///
 	/// This is sugar on [`serve_with`](Self::serve_with) over a streaming-only
@@ -466,9 +482,9 @@ impl MuxResponder {
 		self.serve_with(StreamingFn(handler)).await
 	}
 
-	/// Run the responder until the connection ends, dispatching each
-	/// duplex-kind stream to `handler` as an incremental [`StreamBody`] paired
-	/// with a [`ReplySink`] for streaming the reply.
+	/// Run the responder until the connection ends, and dispatch each
+	/// duplex-kind stream to `handler` as an incremental [`StreamBody`], paired
+	/// with a [`ReplySink`] that streams the reply.
 	///
 	/// This is sugar on [`serve_with`](Self::serve_with) over a duplex-only
 	/// service, so unary and streaming streams answer
@@ -523,6 +539,10 @@ impl MuxResponder {
 				ResponderEvent::Cancelled(stream_id) => {
 					if let Some(handle) = in_flight.remove(&stream_id) {
 						handle.abort();
+						// The abort ends the handler span short of its exit,
+						// so the trail records the cancel in its place.
+						#[cfg(feature = "instrument")]
+						self.link.shared().emit_event(events::MUX_STREAM_CANCELLED)?;
 
 						let Some(remaining) = self.cancel_budget.checked_sub(1) else {
 							return Err(self.refuse_cancel_abuse(last_stream_id));
@@ -534,9 +554,9 @@ impl MuxResponder {
 				ResponderEvent::Stream(stream_id, work) => {
 					last_stream_id = stream_id;
 
-					// The loop refuses a request at the concurrency cap without
-					// waiting on the queue, so it keeps running on a full
-					// outbound queue, and `refuse_at_cap` bounds the backlog.
+					// The refusal at the concurrency cap is synchronous, so a
+					// full outbound queue leaves the loop free to run, and
+					// `refuse_at_cap` bounds the backlog.
 					if in_flight.len() >= cap_as_usize(self.peer_cap) {
 						self.link.refuse_at_cap(stream_id)?;
 						continue;
@@ -562,9 +582,10 @@ impl MuxResponder {
 	/// End the connection with a best-effort GoAway after too many cancels of
 	/// in-flight handlers, which hardens it against CVE-2023-44487.
 	///
-	/// `try_send` keeps the courtesy notice from parking the responder on a
-	/// full outbound queue, because the connection is torn down either way. A
-	/// fault the trace injects at either event is the error that ends it.
+	/// The courtesy notice goes out through `try_send`, so a full outbound
+	/// queue drops the notice and the responder moves on, because the
+	/// connection ends either way. A fault the trace injects at either event is
+	/// the error that ends it.
 	fn refuse_cancel_abuse(&mut self, last_stream_id: u32) -> TransportError {
 		#[cfg(feature = "instrument")]
 		if let Err(fault) = self.link.shared().emit_event(events::MUX_CANCEL_BUDGET) {
@@ -599,7 +620,7 @@ mod tests {
 		responder: MuxResponder,
 		inbound: mpsc::Sender<InboundEvent>,
 		wire: mpsc::Receiver<Outbound>,
-		/// Holds the filler that saturates the queue's buffer.
+		/// The filler sender, whose queued message saturates the buffer.
 		_filler: mpsc::Sender<Outbound>,
 	}
 
@@ -618,8 +639,8 @@ mod tests {
 	}
 
 	impl ResponderFixture {
-		/// Deliver one unary request per id in `stream_ids`, as a peer
-		/// flooding opens does.
+		/// Deliver one unary request per id in `stream_ids`, as a peer that
+		/// floods opens does.
 		fn flood(&mut self, stream_ids: &[u32]) {
 			let frame = Arc::new(TestFrame::v0(None, None));
 			for stream_id in stream_ids {
@@ -676,7 +697,7 @@ mod tests {
 			(MuxResponder::new(inbound_receiver, link, 4), service, wire)
 		}
 
-		/// The status each stream on `wire` was answered with, by stream ID.
+		/// The status that answers each stream on `wire`, by stream ID.
 		fn answered(wire: &mut mpsc::Receiver<Outbound>) -> Vec<(u32, TransitStatus)> {
 			let mut answered = Vec::new();
 			while let Ok(command) = wire.try_recv() {
@@ -702,6 +723,174 @@ mod tests {
 		}
 	}
 
+	/// Tests of the internal events that a responder records into the trail of
+	/// its connection.
+	#[cfg(feature = "instrument")]
+	mod internal_detail {
+		use super::*;
+		use crate::testing::fixtures::TestTrace;
+		use crate::trace::TraceCollector;
+		use crate::urn::Urn;
+
+		#[cfg(pooled_mux)]
+		use super::super::super::testing::body_fixture;
+		#[cfg(pooled_mux)]
+		use crate::policy::{AcceptAllGate, SessionContext};
+		#[cfg(pooled_mux)]
+		use crate::transport::multiplex::service::GatedService;
+		#[cfg(pooled_mux)]
+		use crate::transport::multiplex::{MuxDispatch, MuxHandle, MuxService};
+		#[cfg(pooled_mux)]
+		use crate::TightBeamError;
+
+		/// A server-role responder whose connection records into `trace`, the
+		/// link it answers on, and the receiver of its outbound queue. The
+		/// events of `inbound` wait on the inbound queue, which then closes.
+		fn responder_with(
+			trace: &TraceCollector,
+			inbound: Vec<InboundEvent>,
+		) -> (MuxResponder, MuxLink, mpsc::Receiver<Outbound>) {
+			let mut shared = MuxShared::new(MuxRole::Server, &MuxSettings::symmetric(4));
+			shared.trace = Some(trace.share());
+
+			let (outbound, wire) = mpsc::channel(4);
+			let (link, _drained) = MuxLink::new(Arc::new(shared), outbound);
+			let (mut sender, inbound_receiver) = mpsc::channel(inbound.len());
+			for event in inbound {
+				sender.try_send(event).expect("the inbound channel has room for every event");
+			}
+
+			(MuxResponder::new(inbound_receiver, link.clone(), 4), link, wire)
+		}
+
+		/// [`responder_with`] with one unary request on stream 1.
+		fn responder_with_one_request(trace: &TraceCollector) -> (MuxResponder, MuxLink, mpsc::Receiver<Outbound>) {
+			let request = InboundEvent::Request(1, Arc::new(TestFrame::v0(None, None)));
+			responder_with(trace, vec![request])
+		}
+
+		/// The route steps that one served unary request records under the
+		/// detail flag `detail`.
+		async fn route_trail(detail: bool) -> TransportResult<Vec<Urn<'static>>> {
+			let trace = TestTrace::with_detail(detail);
+			let (responder, _link, _wire) = responder_with_one_request(&trace);
+			let echo = |frame: Arc<Frame>| ready(ResponsePackage::new(TransitStatus::Ok, Some(Frame::clone(&frame))));
+			responder.serve(echo).await?;
+
+			Ok(TestTrace::trail(&trace, &[events::ROUTE_STEP]))
+		}
+
+		/// A responder records the route step of a peer stream when, and only
+		/// when, the trace config sets the detail flag.
+		#[tokio::test]
+		async fn a_peer_stream_records_its_route_step_under_the_detail_flag_alone() -> TransportResult<()> {
+			let trails = [route_trail(true).await?, route_trail(false).await?];
+			assert_eq!(trails, [vec![events::ROUTE_STEP], vec![]]);
+			Ok(())
+		}
+
+		/// The steps of one gated request, with its verdict, in the order the
+		/// request takes them.
+		#[cfg(pooled_mux)]
+		const GATED_STEPS: [Urn<'static>; 5] = [
+			events::ROUTE_STEP,
+			events::POLICY_EVAL,
+			events::GATE_ACCEPT,
+			events::HANDLER_ENTER,
+			events::HANDLER_EXIT,
+		];
+
+		/// The span of one handler that runs to its end.
+		#[cfg(pooled_mux)]
+		const HANDLER_SPAN: [Urn<'static>; 2] = [events::HANDLER_ENTER, events::HANDLER_EXIT];
+
+		/// `service` behind an accept-all gate on the connection that `link`
+		/// serves.
+		#[cfg(pooled_mux)]
+		fn gated(service: impl MuxService, link: MuxLink) -> GatedService<impl MuxService> {
+			let gate = Box::new(AcceptAllGate);
+			GatedService::new(service, gate, SessionContext::default(), MuxHandle::new(link))
+		}
+
+		/// An echo service, which serves unary calls and answers each
+		/// streaming kind with the refusal of its default method.
+		#[cfg(pooled_mux)]
+		fn echo() -> impl MuxService {
+			|frame: Frame, _session: SessionContext| ready(Ok::<_, TightBeamError>(Some(frame)))
+		}
+
+		/// The [`GATED_STEPS`] that one gated unary request records, in order,
+		/// under the detail flag `detail`.
+		#[cfg(pooled_mux)]
+		async fn gated_trail(detail: bool) -> TransportResult<Vec<Urn<'static>>> {
+			let trace = TestTrace::with_detail(detail);
+			let (responder, link, _wire) = responder_with_one_request(&trace);
+			responder.serve_with(gated(echo(), link)).await?;
+
+			Ok(TestTrace::trail(&trace, &GATED_STEPS))
+		}
+
+		/// A gated request records its route step, its policy step, its
+		/// verdict, and the span of its handler, in that order, when the trace
+		/// config sets the detail flag, and its verdict alone when the config
+		/// clears it.
+		#[cfg(pooled_mux)]
+		#[tokio::test]
+		async fn a_gated_request_records_its_steps_in_order_under_the_detail_flag_alone() -> TransportResult<()> {
+			let trails = [gated_trail(true).await?, gated_trail(false).await?];
+			assert_eq!(trails, [GATED_STEPS.to_vec(), vec![events::GATE_ACCEPT]]);
+			Ok(())
+		}
+
+		/// A gated streaming call runs its handler inside the span of the
+		/// handler. The echo service refuses the streaming kind, and the
+		/// refusal runs inside the span too.
+		#[cfg(pooled_mux)]
+		#[tokio::test]
+		async fn a_streaming_call_records_its_handler_span() -> TransportResult<()> {
+			let trace = TestTrace::with_detail(true);
+			let (_responder, link, _wire) = responder_with(&trace, Vec::new());
+			let (body, _forwarder, _notes) = body_fixture(1, 4);
+			let _refused = MuxDispatch::streaming(&gated(echo(), link), body, StreamRoute::local()).await?;
+
+			assert_eq!(TestTrace::trail(&trace, &HANDLER_SPAN), HANDLER_SPAN);
+			Ok(())
+		}
+
+		/// A gated duplex call runs its handler inside the span of the handler.
+		/// The echo service refuses the duplex kind, and the refusal runs
+		/// inside the span too.
+		#[cfg(pooled_mux)]
+		#[tokio::test]
+		async fn a_duplex_call_records_its_handler_span() -> TransportResult<()> {
+			let trace = TestTrace::with_detail(true);
+			let (_responder, link, _wire) = responder_with(&trace, Vec::new());
+			let (body, _forwarder, _notes) = body_fixture(1, 4);
+			let reply = ReplySink::new(1, link.clone());
+			let _refused = MuxDispatch::duplex(&gated(echo(), link), body, reply, StreamRoute::local()).await?;
+
+			assert_eq!(TestTrace::trail(&trace, &HANDLER_SPAN), HANDLER_SPAN);
+			Ok(())
+		}
+
+		/// A peer cancel of a stream whose handler still runs closes the span
+		/// of that handler with the record of the cancel.
+		#[cfg(pooled_mux)]
+		#[tokio::test]
+		async fn a_peer_cancel_closes_the_handler_span_with_its_record() -> TransportResult<()> {
+			let trace = TestTrace::with_detail(true);
+			let request = InboundEvent::Request(1, Arc::new(TestFrame::v0(None, None)));
+			let (responder, link, _wire) = responder_with(&trace, vec![request, InboundEvent::Cancel(1)]);
+			let stalled = |_frame: Frame, _session: SessionContext| pending::<Result<Option<Frame>, TightBeamError>>();
+			responder.serve_with(gated(stalled, link)).await?;
+
+			let kept = [events::HANDLER_ENTER, events::HANDLER_EXIT, events::MUX_STREAM_CANCELLED];
+			let cancelled = [events::HANDLER_ENTER, events::MUX_STREAM_CANCELLED];
+			assert_eq!(TestTrace::trail(&trace, &kept), cancelled);
+			Ok(())
+		}
+	}
+
 	fn is_cap_refusal(command: &Outbound) -> bool {
 		matches!(
 			command,
@@ -710,10 +899,10 @@ mod tests {
 		)
 	}
 
-	/// A peer past the cap it was advertised opens streams at zero cost to
-	/// itself, so a refusal that took a fresh queue slot per open would let
-	/// a stalled writer hold one trailer per open (CWE-770). Refusals share
-	/// the responder link's one slot, and the rest are dropped.
+	/// A peer past the cap that this endpoint advertised opens streams at zero
+	/// cost to itself, so a refusal that took a fresh queue slot per open would
+	/// let a stalled writer hold one trailer per open (CWE-770). Refusals share
+	/// the responder link's one slot, and the responder drops the rest.
 	#[test]
 	fn test_refusals_at_cap_stop_at_the_link_slot() {
 		let mut fixture = responder_with_full_queue(1);

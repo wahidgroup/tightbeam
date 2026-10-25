@@ -1,7 +1,7 @@
 //! The configuration that a `tb_scenario!` test runs.
 //!
 //! The builder takes owned values and `build()` wraps them in `Arc`, so the
-//! macro and the servlets share by refcount rather than by copy.
+//! macro and the servlets share each value through a reference count.
 
 #[cfg(all(not(feature = "std"), feature = "testing-csp"))]
 use alloc::boxed::Box;
@@ -11,15 +11,14 @@ use alloc::{sync::Arc, vec::Vec};
 use std::{sync::Arc, vec::Vec};
 
 use crate::error::TightBeamError;
-use crate::testing::fdr::FdrVerdict;
 use crate::testing::macros::{BuiltAssertSpec, TraceCollector};
-use crate::testing::result::ScenarioVerdict;
+use crate::testing::result::{Layer3, ScenarioVerdict};
 use crate::testing::specs::{CspValidationResult, Layer, SpecViolation, TBSpec, Violations};
 use crate::trace::ConsumedTrace;
 use crate::Errorizable;
 
 #[cfg(feature = "testing-fdr")]
-use crate::testing::fdr::{DefaultFdrExplorer, FdrConfig};
+use crate::testing::fdr::{DefaultFdrExplorer, FdrConfig, FdrVerdict};
 #[cfg(feature = "testing-csp")]
 use crate::testing::specs::csp::ProcessSpec;
 #[cfg(feature = "testing-timing")]
@@ -28,7 +27,7 @@ use crate::testing::timing::TimingConstraints;
 /// What a scenario expects its verification layers to decide.
 ///
 /// A negative test names the one layer it expects to reject the run, so the
-/// expectation is graded rather than tolerated.
+/// grading checks which layer rejected it.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Expect {
 	/// Every configured layer accepts the run.
@@ -64,7 +63,7 @@ pub enum ScenarioConfigError {
 }
 
 /// The configuration of a `tb_scenario!` test, whose fields sit behind `Arc`
-/// so a clone shares them rather than copying them.
+/// so a clone shares them through a reference count.
 #[derive(Clone)]
 pub struct ScenarioConfig {
 	specs: Arc<Vec<&'static BuiltAssertSpec>>,
@@ -84,7 +83,8 @@ impl ScenarioConfig {
 		ScenarioConfigBuilder::default()
 	}
 
-	// The accessors below return borrows of the shared fields.
+	// Each accessor below returns a borrow of its shared field. `trace` returns
+	// a clone of the `Arc` instead, and `expect` returns a copy.
 
 	pub fn specs(&self) -> &[&'static BuiltAssertSpec] {
 		&self.specs
@@ -173,8 +173,39 @@ impl ScenarioConfig {
 	/// Runs every verifier this configuration carries over a finished scenario.
 	///
 	/// The signature holds in every feature configuration, so a `tb_scenario!`
-	/// expansion states one call whatever the consumer selected.
-	pub fn verify(&self, trace: &ConsumedTrace, execution: Result<(), TightBeamError>) -> ScenarioVerdict {
+	/// expansion states one call whatever the consumer selected. Layer 3
+	/// records its exploration events into a trace of its own, which
+	/// [`ScenarioVerdict::exploration`] returns.
+	///
+	/// # Errors
+	///
+	/// - The error of the first exploration event that the exploration trace refused.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::fdr::FdrConfig;
+	/// use tightbeam::testing::specs::csp::{Event, Process, State};
+	/// use tightbeam::testing::ScenarioConfig;
+	/// use tightbeam::trace::ConsumedTrace;
+	///
+	/// let process = Process::builder("Send")
+	///     .initial_state(State("S0"))
+	///     .add_observable(Event("send"))
+	///     .add_transition(State("S0"), Event("send"), State("S1"))
+	///     .add_terminal(State("S1"))
+	///     .build()?;
+	///
+	/// let config = ScenarioConfig::builder().with_csp(process).with_fdr(FdrConfig::default()).build()?;
+	/// let verdict = config.verify(&ConsumedTrace::new(), Ok(()))?;
+	/// assert!(verdict.fdr().is_some());
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	pub fn verify(
+		&self,
+		trace: &ConsumedTrace,
+		execution: Result<(), TightBeamError>,
+	) -> Result<ScenarioVerdict, TightBeamError> {
 		let mut layer1: Result<(), SpecViolation> = match &execution {
 			Err(error) if self.specs().is_empty() => Err(SpecViolation::ExecutionFailed(format!("{error:?}"))),
 			_ => Ok(()),
@@ -193,29 +224,63 @@ impl ScenarioConfig {
 		let layer2: Option<CspValidationResult> = None;
 
 		#[cfg(feature = "testing-fdr")]
-		let layer3: Option<FdrVerdict> = self.explore(trace);
+		let layer3 = self.explore(trace)?;
 		#[cfg(not(feature = "testing-fdr"))]
-		let layer3: Option<FdrVerdict> = None;
+		let layer3: Option<Layer3> = None;
 
-		ScenarioVerdict::from_layers(layer1, layer2, layer3)
+		let verdict = ScenarioVerdict::explored(layer1, layer2, layer3);
+		Ok(verdict)
 	}
 
-	/// Grades the scenario against the FDR configuration it names.
+	/// Grades the scenario against its FDR configuration, or returns `None`
+	/// when it names none.
+	///
+	/// The verdict comes with the events that exploration recorded into a
+	/// trace of its own. That trace takes the instrumentation settings and the
+	/// clock of the scenario's trace, so the events of the model stay apart
+	/// from the events of the run.
+	///
+	/// # Errors
+	///
+	/// - The error of the first exploration event that the exploration trace refused.
+	#[cfg(feature = "testing-fdr")]
+	fn explore(&self, trace: &ConsumedTrace) -> Result<Option<Layer3>, TightBeamError> {
+		let Some(fdr_cfg) = self.fdr() else {
+			return Ok(None);
+		};
+
+		let exploration = self.trace.sibling();
+		let verdict = self.explore_recorded(fdr_cfg, trace, &exploration)?;
+		let mut recorded = ConsumedTrace::new();
+		recorded.populate_from_collector(&exploration);
+
+		Ok(Some(Layer3::new(verdict, recorded)))
+	}
+
+	/// Grades the scenario against `fdr_cfg`, and records the exploration
+	/// events into `exploration`.
 	///
 	/// With a CSP spec, the spec model answers deadlock and divergence freedom.
 	/// When the FDR configuration also names specs, the recorded trace answers
 	/// refinement against them, and the two verdicts merge. Without a CSP spec,
 	/// the function grades the trace alone.
+	///
+	/// # Errors
+	///
+	/// - The error of the first exploration event that `exploration` refused.
 	#[cfg(feature = "testing-fdr")]
-	fn explore(&self, trace: &ConsumedTrace) -> Option<FdrVerdict> {
-		let fdr_cfg = self.fdr()?;
-
+	fn explore_recorded(
+		&self,
+		fdr_cfg: &Arc<FdrConfig>,
+		trace: &ConsumedTrace,
+		exploration: &TraceCollector,
+	) -> Result<FdrVerdict, TightBeamError> {
 		let Some(csp_spec) = self.csp() else {
 			let trace_process = trace.to_process();
 			let trace_cfg = Arc::clone(fdr_cfg);
 			let mut explorer = DefaultFdrExplorer::with_defaults(&trace_process, trace_cfg);
 
-			return Some(explorer.explore());
+			return explorer.explore_into(exploration);
 		};
 
 		// An empty spec list puts the explorer in state-space exploration mode.
@@ -225,17 +290,17 @@ impl ScenarioConfig {
 
 		let exploration_cfg = Arc::new(exploration_cfg);
 		let mut explorer = DefaultFdrExplorer::with_defaults(&spec_process_cow, exploration_cfg);
-		let verdict = explorer.explore();
+		let verdict = explorer.explore_into(exploration)?;
 		if fdr_cfg.specs.is_empty() {
-			return Some(verdict);
+			return Ok(verdict);
 		}
 
 		let trace_process = trace.to_process();
 		let trace_cfg = Arc::clone(fdr_cfg);
 		let mut trace_explorer = DefaultFdrExplorer::with_defaults(&trace_process, trace_cfg);
-		let trace_verdict = trace_explorer.explore();
+		let trace_verdict = trace_explorer.explore_into(exploration)?;
 
-		Some(verdict.with_refinement_from(trace_verdict))
+		Ok(verdict.with_refinement_from(trace_verdict))
 	}
 
 	/// The timing constraints that the first FDR spec declares, if any.
@@ -270,8 +335,8 @@ impl Default for ScenarioConfig {
 	}
 }
 
-/// The builder of a `ScenarioConfig`, which takes owned values and wraps them
-/// in `Arc` on build.
+/// The builder of a [`ScenarioConfig`], which takes owned values and wraps
+/// them in `Arc` when it builds.
 #[derive(Default)]
 pub struct ScenarioConfigBuilder {
 	specs: Vec<&'static BuiltAssertSpec>,
@@ -320,8 +385,8 @@ impl ScenarioConfigBuilder {
 		self
 	}
 
-	/// What the scenario expects its layers to decide. Without this call, the
-	/// scenario expects every layer to accept.
+	/// Sets what the scenario expects its layers to decide. The default,
+	/// [`Expect::Pass`], expects every layer to accept.
 	pub fn with_expect(mut self, expect: Expect) -> Self {
 		self.expect = expect;
 		self
@@ -346,7 +411,7 @@ impl ScenarioConfigBuilder {
 		}
 	}
 
-	/// Consumes the builder and wraps collected fields in `Arc`.
+	/// Consumes the builder and wraps the collected fields in `Arc`.
 	///
 	/// # Errors
 	///
@@ -379,11 +444,11 @@ impl ScenarioConfigBuilder {
 	}
 }
 
-/// What a hook observes: the recorded trace, the spec it was graded against,
-/// and the [`ScenarioVerdict`] every layer contributed to.
+/// What a hook observes: the recorded trace, the first assertion spec, and
+/// the [`ScenarioVerdict`] that every layer contributed to.
 ///
-/// Fields are private because the verdict is assembled once, in
-/// [`HookContext::build`], and an observer only reads it.
+/// The fields are private because [`HookContext::build`] assembles the
+/// verdict once, and an observer only reads it.
 pub struct HookContext {
 	assert_spec: Option<&'static BuiltAssertSpec>,
 	trace: ConsumedTrace,
@@ -400,15 +465,43 @@ impl HookContext {
 	/// Assembles the observer's view of a finished scenario.
 	///
 	/// [`ScenarioConfig::verify`] grades the consumed trace, so the context
-	/// carries the one verdict the scenario is decided by.
-	pub fn build(config: &ScenarioConfig, trace: &TraceCollector, execution: Result<(), TightBeamError>) -> Self {
+	/// carries the one verdict that decides the scenario.
+	///
+	/// # Errors
+	///
+	/// - The error of the first exploration event that the exploration trace refused.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::fdr::FdrConfig;
+	/// use tightbeam::testing::specs::csp::{Event, Process, State};
+	/// use tightbeam::testing::{HookContext, ScenarioConfig};
+	///
+	/// let process = Process::builder("Send")
+	///     .initial_state(State("S0"))
+	///     .add_observable(Event("send"))
+	///     .add_transition(State("S0"), Event("send"), State("S1"))
+	///     .add_terminal(State("S1"))
+	///     .build()?;
+	///
+	/// let config = ScenarioConfig::builder().with_csp(process).with_fdr(FdrConfig::default()).build()?;
+	/// let context = HookContext::build(&config, &config.trace(), Ok(()))?;
+	/// assert!(context.verdict().exploration().is_some());
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	pub fn build(
+		config: &ScenarioConfig,
+		trace: &TraceCollector,
+		execution: Result<(), TightBeamError>,
+	) -> Result<Self, TightBeamError> {
 		let mut consumed_trace = ConsumedTrace::new();
 		consumed_trace.populate_from_collector(trace);
 
-		let verdict = config.verify(&consumed_trace, execution);
+		let verdict = config.verify(&consumed_trace, execution)?;
 		let outcome = verdict.outcome(config.expect());
 
-		Self {
+		let context = Self {
 			assert_spec: config.specs().first().copied(),
 			trace: consumed_trace,
 			verdict,
@@ -417,10 +510,12 @@ impl HookContext {
 			process: config.csp().map(Arc::clone),
 			#[cfg(feature = "testing-timing")]
 			timing_constraints: config.spec_timing_constraints(),
-		}
+		};
+
+		Ok(context)
 	}
 
-	/// The first assertion spec the scenario was graded against.
+	/// The first assertion spec of the configuration.
 	pub fn assert_spec(&self) -> Option<&'static BuiltAssertSpec> {
 		self.assert_spec
 	}
@@ -438,19 +533,19 @@ impl HookContext {
 	/// What the scenario decided, folded across every layer and measured
 	/// against what the scenario expected.
 	///
-	/// Computed once in [`HookContext::build`], so the observer and the
-	/// harness read the same answer rather than each folding the verdict.
+	/// [`HookContext::build`] computes it once, so the observer and the
+	/// harness read the same answer.
 	pub fn outcome(&self) -> Result<(), &Violations> {
 		self.outcome.as_ref().map(|&()| ())
 	}
 
-	/// The CSP process the scenario was validated against.
+	/// The CSP process that Layer 2 validated the trace against.
 	#[cfg(feature = "testing-csp")]
 	pub fn process(&self) -> Option<&Arc<dyn ProcessSpec + Send + Sync>> {
 		self.process.as_ref()
 	}
 
-	/// The timing constraints the scenario was verified against.
+	/// The timing constraints that the first FDR spec declares.
 	#[cfg(feature = "testing-timing")]
 	pub fn timing_constraints(&self) -> Option<&Arc<TimingConstraints>> {
 		self.timing_constraints.as_ref()
@@ -463,12 +558,13 @@ pub type AcceptedObserver = Arc<dyn Fn(&HookContext) + Send + Sync>;
 
 /// Reads a scenario some layer rejected, with the violations it produced.
 ///
-/// The two observers take different arguments on purpose: filling the slots
-/// in the wrong order is then a compile error rather than a hook that never
-/// runs.
+/// The two observers take different arguments, so code that fills the slots
+/// in the wrong order fails to compile, where equal arguments would leave a
+/// hook that never runs.
 pub type RejectedObserver = Arc<dyn Fn(&HookContext, &Violations) + Send + Sync>;
 
-/// What a scenario runs after it is graded, before it panics on a rejection.
+/// What a scenario runs after the harness grades it and before the harness
+/// panics on a rejection.
 #[derive(Default)]
 pub struct TestHooks {
 	on_pass: Option<AcceptedObserver>,
@@ -476,12 +572,13 @@ pub struct TestHooks {
 }
 
 impl TestHooks {
-	/// Observes a scenario every layer accepted.
+	/// Builds hooks that observe a scenario every layer accepted.
 	pub fn on_pass(observer: impl Fn(&HookContext) + Send + Sync + 'static) -> Self {
 		Self { on_pass: Some(Arc::new(observer)), on_fail: None }
 	}
 
-	/// Observes a scenario some layer rejected, before the harness panics.
+	/// Builds hooks that observe a scenario some layer rejected, before the
+	/// harness panics.
 	pub fn on_fail(observer: impl Fn(&HookContext, &Violations) + Send + Sync + 'static) -> Self {
 		Self { on_pass: None, on_fail: Some(Arc::new(observer)) }
 	}
@@ -533,9 +630,9 @@ mod tests {
 	}
 
 	#[test]
-	fn an_error_mode_spec_passes_a_body_that_errored() -> Result<(), ScenarioConfigError> {
+	fn an_error_mode_spec_passes_a_body_that_errored() -> Result<(), Box<dyn core::error::Error>> {
 		let config = ScenarioConfig::builder().with_spec(ErrorBodySpec::latest()).build()?;
-		let verdict = config.verify(&ConsumedTrace::new(), Err(TightBeamError::RecvTimeoutError));
+		let verdict = config.verify(&ConsumedTrace::new(), Err(TightBeamError::RecvTimeoutError))?;
 		assert_eq!(verdict.outcome(Expect::Pass), Ok(()));
 		Ok(())
 	}
@@ -548,8 +645,8 @@ mod tests {
 		use crate::testing::specs::csp::{CspValidationResult, Process, ProcessSpec, State};
 		use crate::trace::ConsumedTrace;
 
-		/// A CSP layer that accepts every trace. Its only job here is to make
-		/// [`Layer::Csp`] a layer the configuration runs.
+		/// A CSP layer that accepts every trace. It exists to make
+		/// [`Layer::Csp`] a layer that the configuration runs.
 		struct AcceptsEveryTrace;
 
 		impl ProcessSpec for AcceptsEveryTrace {
@@ -599,11 +696,167 @@ mod tests {
 		}
 
 		#[test]
-		fn a_body_error_with_no_spec_fails_layer1() -> Result<(), ScenarioConfigError> {
+		fn a_body_error_with_no_spec_fails_layer1() -> Result<(), Box<dyn core::error::Error>> {
 			let config = ScenarioConfig::builder().with_csp(AcceptsEveryTrace).build()?;
-			let verdict = config.verify(&ConsumedTrace::new(), Err(TightBeamError::RecvTimeoutError));
+			let verdict = config.verify(&ConsumedTrace::new(), Err(TightBeamError::RecvTimeoutError))?;
 			let expected = SpecViolation::ExecutionFailed(format!("{:?}", TightBeamError::RecvTimeoutError));
 			assert_eq!(verdict.spec(), Some(&expected));
+			Ok(())
+		}
+	}
+
+	/// A scenario records its FDR exploration into a trace of its own.
+	#[cfg(all(feature = "testing-fdr", feature = "instrument"))]
+	mod exploration {
+		use std::sync::{Arc, Mutex, PoisonError};
+
+		use crate::instrumentation::events::{DIVERGENCE_DETECT, ENABLED_SET_SAMPLE, REFUSAL_SNAPSHOT};
+		use crate::instrumentation::{EventSink, TbEvent, TbInstrumentationConfig};
+		use crate::testing::config::{Expect, HookContext, ScenarioConfig, TestHooks};
+		use crate::testing::fdr::FdrConfig;
+		use crate::testing::specs::csp::{Process, State};
+		use crate::testing::specs::Layer;
+		use crate::testing::SetupEnv;
+		use crate::trace::{ConsumedTrace, TraceCollector, TraceConfig};
+		use crate::urn::Urn;
+
+		const SEND: Urn<'static> = crate::urn!("test", "event:exploration/send");
+		const DONE: Urn<'static> = crate::urn!("test", "event:exploration/done");
+		const SPIN: Urn<'static> = crate::urn!("test", "event:exploration/spin");
+
+		/// The three exploration events.
+		const EXPLORATION_EVENTS: [Urn<'static>; 3] = [ENABLED_SET_SAMPLE, REFUSAL_SNAPSHOT, DIVERGENCE_DETECT];
+
+		/// Instrumentation settings that ask for every exploration event.
+		fn every_flag() -> TbInstrumentationConfig {
+			TbInstrumentationConfig {
+				sample_enabled_sets: true,
+				sample_refusals: true,
+				divergence_heuristics: true,
+				..Default::default()
+			}
+		}
+
+		/// A process that sends at `S0`, and spins on the hidden `SPIN` between
+		/// `S1` and `S2` until it is done, so each seed diverges at `S1`.
+		fn spinning() -> Process {
+			Process::builder("Spinning")
+				.initial_state(State("S0"))
+				.add_observable(SEND)
+				.add_observable(DONE)
+				.add_hidden(SPIN)
+				.add_transition(State("S0"), SEND, State("S1"))
+				.add_transition(State("S1"), SPIN, State("S2"))
+				.add_transition(State("S2"), SPIN, State("S1"))
+				.add_transition(State("S1"), DONE, State("S3"))
+				.add_terminal(State("S3"))
+				.build()
+				.expect("the spinning process names its initial state")
+		}
+
+		/// The labels of the `urn` events in `trace`. The list is empty when
+		/// `trace` is `None`.
+		fn labels(trace: Option<&ConsumedTrace>, urn: Urn<'static>) -> Vec<String> {
+			let events = trace.into_iter().flat_map(|trace| trace.instrument_events.iter());
+			let named = events.filter(|event| event.urn == urn);
+			named.filter_map(|event| event.label.clone()).collect()
+		}
+
+		/// The URNs a [`ReceivingSink`] received, in order.
+		#[derive(Default)]
+		struct Received(Mutex<Vec<Urn<'static>>>);
+
+		impl Received {
+			/// Keeps `urn` after the URNs received so far.
+			fn keep(&self, urn: Urn<'static>) {
+				let mut urns = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+				urns.push(urn);
+			}
+
+			/// The URNs received so far.
+			fn urns(&self) -> Vec<Urn<'static>> {
+				let urns = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+				urns.clone()
+			}
+		}
+
+		/// A sink that keeps the URN of each event it receives.
+		struct ReceivingSink(Arc<Received>);
+
+		impl EventSink for ReceivingSink {
+			fn emit(&self, event: TbEvent) {
+				self.0.keep(event.urn);
+			}
+
+			fn drain(&self) -> Vec<TbEvent> {
+				Vec::new()
+			}
+
+			fn overflowed(&self) -> bool {
+				false
+			}
+		}
+
+		crate::tb_scenario! {
+			name: a_scenario_records_each_exploration_event_its_trace_asks_for,
+			config: ScenarioConfig::builder()
+				.with_csp(spinning())
+				.with_fdr(FdrConfig::default())
+				.with_trace(TraceCollector::from(TraceConfig::with_instrumentation(every_flag())))
+				.with_expect(Expect::Violation(Layer::Refinement))
+				.with_hooks(TestHooks::on_pass(|context| {
+					let exploration = context.verdict().exploration();
+					let offers = [
+						"Spinning.S0: {urn:test:event:exploration/send}",
+						"Spinning.S1: {urn:test:event:exploration/done}",
+					];
+					let refusals = ["Spinning.S0: {urn:test:event:exploration/done}"];
+					let cycle = ["Spinning.S1: <urn:test:event:exploration/spin, urn:test:event:exploration/spin>"];
+					assert_eq!(labels(exploration, ENABLED_SET_SAMPLE), offers);
+					assert_eq!(labels(exploration, REFUSAL_SNAPSHOT), refusals);
+					assert_eq!(labels(exploration, DIVERGENCE_DETECT), cycle);
+				}))
+				.build(),
+			environment Bare {
+				exec: |SetupEnv { trace, .. }| {
+					trace.event(SEND)?;
+					trace.event(DONE)?;
+					Ok(())
+				}
+			}
+		}
+
+		#[test]
+		fn the_trace_of_the_run_receives_no_exploration_event() -> Result<(), Box<dyn core::error::Error>> {
+			let received = Arc::new(Received::default());
+			let sink = ReceivingSink(Arc::clone(&received));
+			let instrumented = TraceConfig::builder().with_instrumentation(every_flag());
+			let settings = instrumented.with_sink(sink).build();
+			let builder = ScenarioConfig::builder().with_csp(spinning()).with_fdr(FdrConfig::default());
+			let config = builder.with_trace(TraceCollector::from(settings)).build()?;
+
+			let context = HookContext::build(&config, &config.trace(), Ok(()))?;
+
+			let urns = received.urns();
+			let leaked: Vec<_> = urns.iter().filter(|urn| EXPLORATION_EVENTS.contains(urn)).collect();
+			let exploration = context.verdict().exploration();
+			let explored = exploration.map(|exploration| exploration.count_event_urn(DIVERGENCE_DETECT));
+			assert_eq!(explored, Some(1), "the exploration trace holds the divergence");
+			assert!(leaked.is_empty(), "the trace of the run received {leaked:?}");
+			Ok(())
+		}
+
+		#[test]
+		fn a_truncated_exploration_says_so() -> Result<(), Box<dyn core::error::Error>> {
+			let settings = TbInstrumentationConfig { max_events: 2, ..every_flag() };
+			let trace = TraceCollector::from(TraceConfig::with_instrumentation(settings));
+			let builder = ScenarioConfig::builder().with_csp(spinning()).with_fdr(FdrConfig::default());
+			let config = builder.with_trace(trace).build()?;
+
+			let verdict = config.verify(&ConsumedTrace::new(), Ok(()))?;
+
+			let overflowed = verdict.exploration().map(|exploration| exploration.overflowed);
+			assert_eq!(overflowed, Some(true), "the sink holds two events");
 			Ok(())
 		}
 	}

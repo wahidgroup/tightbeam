@@ -106,7 +106,7 @@ impl ChessMatchManager {
 			};
 
 			// `apply_move` empties the source square, so the lookup of the
-			// moving piece runs before the move.
+			// piece that moves runs before the move.
 			let server_piece = game_state.piece_kind_at(server_move.from_row, server_move.from_col);
 			game_state.apply_move(&server_move);
 
@@ -218,7 +218,7 @@ servlet! {
 	pub ChessEngineServlet<ChessMoveRequest, EnvConfig = ChessEngineServletConfig>,
 	protocol: TokioListener,
 	handle: raw |message, ctx| async move {
-		let trace = ctx.trace();
+		let trace = &ctx.trace();
 		let config: &ChessEngineServletConfig = ctx.env_config();
 		let message_id = message.metadata().id().to_vec();
 		let invalid_move = |trace: Arc<TraceCollector>, id: Vec<u8>, order: u64|
@@ -239,7 +239,6 @@ servlet! {
 		};
 
 		// The frame order counts the moves and increases with each request.
-		// The manager validates the move, applies it, and decides the status.
 		let move_count = message.metadata().order();
 		let game_status = match config.manager.process_move(&move_req, move_count, trace) {
 			Ok(status) => status,

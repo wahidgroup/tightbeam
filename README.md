@@ -3683,7 +3683,19 @@ urn:tightbeam:event:<domain>/<event-name>
 
 Domains include `core`, `gate`, `transport`, `connection`, `assert`, `mux`, `pool`, `session`, `hive`, and `cluster`. The `process` and `fdr` domains need the `testing-csp` and `testing-fdr` features. `tightbeam::instrumentation::events` lists every event.
 
-`enable_internal_detail` is reserved for internal events (`handler`, `crypto`, `route`, and similar), which the crate does not emit. Accept and refuse events always fire.
+`enable_internal_detail` turns on the internal events `handler/enter`, `handler/exit`, `policy/eval`, `route/step`, `crypto/step`, and `compress/step`. The doc of each constant in `tightbeam::instrumentation::events` names the step where it fires. Accept and refuse events always fire, and so does `mux/stream-cancelled`, which closes a call that the peer cancels on a mux stream in place of its `handler/exit`.
+
+> Warning: A servlet, a hive, and a gateway record every connection they accept into their own trace, from before the handshake, so their trace also holds the handshake refusal of a peer that never authenticates. The default `BoundedMemorySink` keeps the first `max_events` events, drops each later one, the owner's own refusals included, and sets its overflow latch. A long-lived owner needs an `EventSink` that forwards each event, or a reader that drains the trace.
+
+`FdrExplorer::explore_into` records the `fdr` exploration events that three flags ask for, one per state of each explored process, in the order of the state names. A scenario explores into a trace of its own, under the instrumentation settings and the clock of the scenario's trace. `ScenarioVerdict::exploration` returns that trace, so the exploration events stay apart from the trace of the run. The `overflowed` field of that trace reads `true` when its sink dropped events. Each label names the process, the state, and the events in CSPM notation.
+
+| Flag | Event | Label |
+| --- | --- | --- |
+| `sample_enabled_sets` | `fdr/enabled-set-sample` | At each state a seed visited, the observable events the state offers, such as `Spin.S0: {a, b}` |
+| `sample_refusals` | `fdr/refusal-snapshot` | At each visited stable or accepting state, the observable events it refuses as the CSP failures model defines them, such as `Spin.S2: {a, b}`. An accepting state refuses every observable event |
+| `divergence_heuristics` | `fdr/divergence-detect` | At each state where a seed diverged, the hidden events of a run from the state to a cycle of hidden events and once around it, such as `Spin.S1: <t, u>` |
+
+A state diverges when a run of hidden events from it reaches a cycle of hidden events. Every exploration decides that exactly, whatever the flags say and whatever the length of the run. A run of more than `max_internal_run` hidden events also counts as a divergence. Each `divergence-detect` event names a state where a seed refuted `divergence_free`.
 
 > Note: `TightbeamUrnSpec` (`urn:tightbeam:instrumentation:<resource_type>/<resource_id>`) is a separate helper for application/test labeling. Production control-plane events use the `event:<domain>/<name>` inventory above. See [§11.1.1](#1111-urns).
 
@@ -4673,7 +4685,7 @@ Refinement checking applies Failures-Divergences Refinement (FDR) from CSP theor
 
 - **Trace Refinement (⊑T)**: All observed traces ∈ spec traces
 - **Failures Refinement (⊑F)**: No invalid refusals at choice points
-- **Divergence Freedom**: No internal-only loops exceeding threshold
+- **Divergence Freedom**: No visited state reaches a cycle of hidden events through a run of hidden events, and no run of hidden events passes `max_internal_run`
 - **Determinism**: Branching only at declared nondeterministic states
 
 **Requirements**: Layer 3 requires `testing-fdr` feature flag. Refinement checking requires the `specs` field in `FdrConfig` to be populated with specification processes.
@@ -4705,7 +4717,7 @@ fdr: FdrConfig {
 
 - `seeds`: Number of different scheduler strategies to explore
 - `max_depth`: Maximum length of observable trace
-- `max_internal_run`: Consecutive hidden events before divergence detection
+- `max_internal_run`: The most hidden events in one run. A longer run is a divergence, and so is a run that reaches a cycle of hidden events, whatever its length
 - `timeout_ms`: Timeout for each seed exploration
 - `specs`: Specification processes for refinement checking (empty vector = exploration mode)
 - `fail_fast`: Stop on first refinement violation (default: true)
@@ -4861,7 +4873,7 @@ pub struct FdrVerdict {
 
 **Stable Failures Model**: Extends trace verification by checking what events a process can _refuse_ after each trace. A stable state is one where no internal progress (τ-transitions) can occur. At choice points, the implementation must not refuse events the specification accepts, preventing incorrect nondeterminism.
 
-**Failures-Divergences Model**: Adds divergence detection to identify processes that can make infinite internal progress without external interaction. A divergence is a τ-loop where the process never becomes stable. The `max_internal_run` parameter bounds consecutive hidden events to detect such livelocks.
+**Failures-Divergences Model**: Adds divergence detection to identify processes that can make infinite internal progress without external interaction. A state diverges when a run of hidden events from it reaches a cycle of hidden events (a τ-loop), so the process can stay unstable forever. Exploration decides exactly whether each state it visits diverges, and the `max_internal_run` parameter also counts a run of more hidden events than it allows as a divergence.
 
 #### 12.5.2 Observable vs. Hidden Events
 

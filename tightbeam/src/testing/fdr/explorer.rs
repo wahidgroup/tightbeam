@@ -1,9 +1,9 @@
-//! Trait-based architecture for FDR exploration
+//! The traits of the FDR explorer and the types that they exchange.
 //!
-//! This module defines the core traits that separate concerns in the FDR exploration engine:
-//! - `ExplorationCore`: Core exploration logic and state management
-//! - `RefinementChecker`: Refinement checking algorithms (trace, failures, divergence)
-//! - `MemoizationCache`: Caching layer for expensive computations
+//! Each trait is one subsystem, which an outside crate can replace:
+//! - [`ExplorationCore`] explores the seeds of a process and keeps their results.
+//! - [`RefinementChecker`] runs the trace, failures, and divergence refinement checks.
+//! - [`MemoizationCache`] keeps the computed sets of a process for the refinement checker.
 
 use std::collections::HashSet;
 
@@ -19,231 +19,337 @@ use crate::testing::specs::csp::{Event, Process, State};
 #[cfg(feature = "testing-fault")]
 use crate::testing::fdr::config::InjectedFaultRecord;
 
-/// Core exploration functionality
+/// The exploration engine of the FDR explorer.
 ///
-/// Handles the fundamental exploration mechanics: state space traversal,
-/// seed management, determinism checking, and basic property verification.
+/// An engine traverses the state space of its process one seed at a time,
+/// finds the deadlocks and divergences that each seed reaches, and keeps the
+/// results.
 pub trait ExplorationCore {
-	/// Get the process being explored
+	/// The process under exploration.
 	fn process(&self) -> &Process;
 
-	/// Get the current configuration
+	/// The FDR configuration of the exploration.
 	fn config(&self) -> &FdrConfig;
 
-	/// Explore a single seed and return the result
+	/// Explores the schedule of `seed` and returns its result.
 	fn explore_seed(&mut self, seed: u64) -> SeedResult;
 
-	/// Get traces explored so far
+	/// The traces that the recorded seeds explored.
 	fn traces(&self) -> Vec<Trace>;
 
-	/// Get failures collected so far
+	/// The failures that the recorded seeds collected.
 	fn failures(&self) -> Vec<Failure>;
 
-	/// Get statistics about exploration
-	fn states_visited(&self) -> usize;
+	/// The states that exploration visited.
+	///
+	/// When `FdrExplorer` explores its subject, it counts this set as
+	/// `FdrVerdict::states_visited`, and the exploration events of
+	/// `FdrExplorer::explore_into` cover each of its states.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::testing::fdr::{DefaultExplorationEngine, ExplorationCore, FdrConfig};
+	/// use tightbeam::testing::specs::csp::{Event, Process, State};
+	///
+	/// let process = Process::builder("Send")
+	///     .initial_state(State("S0"))
+	///     .add_observable(Event("send"))
+	///     .add_transition(State("S0"), Event("send"), State("S1"))
+	///     .add_terminal(State("S1"))
+	///     .build()?;
+	///
+	/// let mut engine = DefaultExplorationEngine::new(&process, Arc::new(FdrConfig::default()));
+	/// let result = engine.explore_seed(0);
+	/// engine.add_seed_result(0, result);
+	/// assert_eq!(engine.visited_states().len(), 2);
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	fn visited_states(&self) -> &HashSet<State>;
 
-	/// Get number of seeds completed
+	/// The number of seed results that the engine holds.
 	fn seeds_completed(&self) -> u32;
 
-	/// Accumulate timing-pruned branch count (for parallel aggregation)
+	/// Adds the count of branches that a parallel seed pruned for timing. The
+	/// default drops the count.
 	fn add_timing_pruned(&mut self, _count: usize) {}
 
-	/// Add a seed result (for use when aggregating parallel results)
+	/// Records the result of a seed that ran outside the engine, such as a
+	/// parallel seed.
 	fn add_seed_result(&mut self, seed: u64, result: SeedResult);
 
-	/// Update visited states (for use when aggregating parallel results)
+	/// Adds the states that a seed outside the engine visited, such as a
+	/// parallel seed.
 	fn update_visited_states(&mut self, visited: &HashSet<State>);
 
-	/// Number of exploration branches pruned for timing violations
+	/// The number of exploration branches pruned for timing violations.
 	///
-	/// Timed exploration drops branches whose WCET/deadline constraints fail.
+	/// Timed exploration drops each branch that fails a WCET, deadline, or path
+	/// WCET constraint.
 	fn timing_pruned(&self) -> usize {
 		0
 	}
 
-	/// Compute refusal set at a given state
+	/// The refusal set that a failure of `process` records at `state`, or
+	/// `None` at an unstable state.
 	///
-	/// Refusal set = all observable events minus enabled observable events.
-	/// Hidden events (τ-transitions) are filtered out as they cannot be refused.
-	/// Reference: Roscoe (1998, 2010)
-	fn compute_refusals(&self, process: &Process, state: State) -> HashSet<Event> {
-		use std::collections::HashSet;
-		// Only consider observable events (filter out hidden τ-transitions)
-		let enabled_events: HashSet<Event> = process
-			.enabled(state)
-			.iter()
-			.filter_map(|action| {
-				if !process.hidden.contains(&action.event) {
-					Some(action.event)
-				} else {
-					None
-				}
-			})
-			.collect();
-
-		// Refusal set = all observable events minus enabled observable events
-		process
-			.observable
-			.iter()
-			.filter(|&event| !enabled_events.contains(event))
-			.cloned()
-			.collect()
+	/// The default reads [`Process::failure_refusals`], the one home of the
+	/// rule.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::collections::HashSet;
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::testing::fdr::{DefaultExplorationEngine, ExplorationCore, FdrConfig};
+	/// use tightbeam::testing::specs::csp::{Event, Process, State};
+	///
+	/// let process = Process::builder("Send")
+	///     .initial_state(State("S0"))
+	///     .add_observable(Event("send"))
+	///     .add_transition(State("S0"), Event("send"), State("S1"))
+	///     .add_terminal(State("S1"))
+	///     .build()?;
+	///
+	/// let engine = DefaultExplorationEngine::new(&process, Arc::new(FdrConfig::default()));
+	/// let refused = engine.compute_refusals(&process, State("S1"));
+	/// assert_eq!(refused, Some(HashSet::from([Event("send")])));
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	fn compute_refusals(&self, process: &Process, state: State) -> Option<HashSet<Event>> {
+		process.failure_refusals(state)
 	}
 }
 
-/// Outcome of a single refinement check
+/// The outcome of one refinement check.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RefinementOutcome<W> {
-	/// Refinement holds for everything explored. `complete` is false when
-	/// resource bounds truncated the explored set (bounded-verification
-	/// claim only).
+	/// Refinement holds for everything that the check explored. `complete` is
+	/// false when a timeout or a resource bound cut the explored sets short,
+	/// so the claim holds only within the bounds.
 	Holds {
-		/// Whether the underlying trace/failure sets were computed without
-		/// hitting resource limits
+		/// Whether the check computed each of its sets in full, before a
+		/// timeout or a resource limit.
 		complete: bool,
 	},
-	/// Refinement violated; witness is the offending trace/failure
+	/// Refinement fails, and the witness is the trace or failure at fault.
 	Violated(W),
-	/// Timeout or resource limits prevented deciding the relation
+	/// A timeout or a resource limit stopped the check before it decided the
+	/// relation.
 	Inconclusive,
 }
 
-/// Refinement checking algorithms
+/// The refinement checker of the FDR explorer.
 ///
-/// Implements the three main refinement checks:
+/// A checker runs the three refinement checks:
 /// - Trace refinement: traces(Impl) ⊆ traces(Spec)
 /// - Failures refinement: failures(Impl) ⊆ failures(Spec)
 /// - Divergence refinement: divergences(Impl) ⊆ divergences(Spec)
 pub trait RefinementChecker {
-	/// Maximum number of traces to compute before early termination
-	/// Prevents exponential explosion for large specs
+	/// The most traces that one trace computation holds before it stops
+	/// early, which bounds the exponential trace set of a large spec.
 	const MAX_TRACES: usize = 5000;
 
-	/// Maximum queue size in BFS exploration before early termination
-	/// Prevents memory exhaustion for large state spaces
+	/// The largest breadth-first queue that a search holds before it stops
+	/// early, which bounds its memory on a large state space.
 	const MAX_QUEUE_SIZE: usize = 10000;
 
-	/// Maximum visited states before early termination
-	/// Prevents excessive memory usage during exploration
+	/// The most visited states that a search holds before it stops early,
+	/// which bounds its memory use.
 	const MAX_VISITED: usize = 20000;
 
-	/// Check trace refinement: traces(impl_process) ⊆ traces(spec_process)
+	/// Checks trace refinement, traces(impl_process) ⊆ traces(spec).
 	fn check_trace_refinement(&mut self, spec: &Process, impl_process: &Process) -> RefinementOutcome<Trace>;
 
-	/// Check failures refinement: failures(impl_process) ⊆ failures(spec_process)
+	/// Checks failures refinement, failures(impl_process) ⊆ failures(spec).
 	fn check_failures_refinement(&mut self, spec: &Process, impl_process: &Process) -> RefinementOutcome<Failure>;
 
-	/// Check divergence refinement: divergences(impl_process) ⊆ divergences(spec_process)
+	/// Checks divergence refinement, divergences(impl_process) ⊆
+	/// divergences(spec).
 	fn check_divergence_refinement(&mut self, spec: &Process, impl_process: &Process) -> RefinementOutcome<Trace>;
 
-	/// Compute all traces of a process up to max_depth
+	/// Computes every trace of `process` up to `max_depth`.
 	///
-	/// The `bool` is true when the trace set is complete up to `max_depth`
-	/// (no timeout or resource limit truncated the exploration).
+	/// The `bool` is true when the trace set is complete up to `max_depth`,
+	/// and false when a timeout or a resource limit cut the search short.
 	fn compute_traces(&mut self, process: &Process, max_depth: usize) -> (HashSet<Trace>, bool);
 
-	/// Compute all failures of a process up to max_depth
+	/// Computes every failure of `process` up to `max_depth`.
 	///
 	/// The `bool` is true when the failure set is complete up to
-	/// `max_depth` (no resource limit truncated the exploration).
+	/// `max_depth`, and false when a resource limit cut the search short.
 	fn compute_failures(&mut self, process: &Process, max_depth: usize) -> (Vec<Failure>, bool);
 
-	/// Compute all divergences of a process up to max_depth
+	/// Computes every divergence of `process` up to `max_depth`.
 	///
 	/// The `bool` is true when the divergence set is complete up to
 	/// `max_depth`.
 	fn compute_divergences(&mut self, process: &Process, max_depth: usize) -> (HashSet<Trace>, bool);
 
-	/// Compute refusal set at a given state
-	fn compute_refusals(&self, process: &Process, state: State) -> HashSet<Event>;
+	/// The refusal set that a failure of `process` records at `state`, or
+	/// `None` at an unstable state.
+	///
+	/// The default reads [`Process::failure_refusals`], the one home of the
+	/// rule, so an outside checker holds no copy of it.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::cell::RefCell;
+	/// use std::collections::HashSet;
+	/// use std::rc::Rc;
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::testing::fdr::{DefaultCache, DefaultRefinementChecker, FdrConfig, RefinementChecker};
+	/// use tightbeam::testing::specs::csp::{Event, Process, State};
+	///
+	/// let process = Process::builder("Send")
+	///     .initial_state(State("S0"))
+	///     .add_observable(Event("send"))
+	///     .add_observable(Event("stop"))
+	///     .add_transition(State("S0"), Event("send"), State("S1"))
+	///     .add_terminal(State("S1"))
+	///     .build()?;
+	///
+	/// let cache = Rc::new(RefCell::new(DefaultCache::new()));
+	/// let checker = DefaultRefinementChecker::new(&process, Arc::new(FdrConfig::default()), cache);
+	/// let refused = checker.compute_refusals(&process, State("S0"));
+	/// assert_eq!(refused, Some(HashSet::from([Event("stop")])));
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	fn compute_refusals(&self, process: &Process, state: State) -> Option<HashSet<Event>> {
+		process.failure_refusals(state)
+	}
 }
 
-/// Memoization cache for expensive computations
+/// A memoization cache of the trace, failure, and divergence sets.
 ///
-/// Caches results of trace/failure/divergence computations to avoid
-/// redundant work when checking multiple refinements.
+/// The refinement checker computes each set of a process once and reads it
+/// from the cache for each later refinement check.
 ///
-/// Keys are structural digests ([`Process::structure_digest`]), not
-/// process names: algebra operators (`hide`, `rename`) produce constant
-/// names for structurally different results, so name keys collide and
-/// silently serve wrong verdicts.
+/// Each key is a structure digest ([`Process::structure_digest`]), because
+/// algebra operators (`hide`, `rename`) give one name to structurally
+/// different results, so a name key would collide and serve a wrong verdict.
 pub trait MemoizationCache {
-	/// Get cached traces for a process structure, or None if not cached
+	/// The cached traces of the process with the digest `structure`, and
+	/// whether the set is complete, or `None` when the cache holds none.
 	fn get_cached_traces(&self, structure: u64) -> Option<(Vec<Trace>, bool)>;
 
-	/// Cache traces for a process structure
+	/// Stores the traces of the process with the digest `structure`, and
+	/// whether the set is `complete`.
 	fn cache_traces(&mut self, structure: u64, traces: impl IntoIterator<Item = Trace>, complete: bool);
 
-	/// Get cached failures for a process structure, or None if not cached
+	/// The cached failures of the process with the digest `structure`, and
+	/// whether the set is complete, or `None` when the cache holds none.
 	fn get_cached_failures(&self, structure: u64) -> Option<(Vec<Failure>, bool)>;
 
-	/// Cache failures for a process structure
+	/// Stores the failures of the process with the digest `structure`, and
+	/// whether the set is `complete`.
 	fn cache_failures(&mut self, structure: u64, failures: impl IntoIterator<Item = Failure>, complete: bool);
 
-	/// Get cached divergences for a process structure, or None if not cached
+	/// The cached divergences of the process with the digest `structure`, and
+	/// whether the set is complete, or `None` when the cache holds none.
 	fn get_cached_divergences(&self, structure: u64) -> Option<(Vec<Trace>, bool)>;
 
-	/// Cache divergences for a process structure
+	/// Stores the divergences of the process with the digest `structure`, and
+	/// whether the set is `complete`.
 	fn cache_divergences(&mut self, structure: u64, divergences: impl IntoIterator<Item = Trace>, complete: bool);
 }
 
-/// Result of exploring a single seed
+/// The result of one seed of exploration.
 ///
-/// With `testing-fault`, every variant carries the fault records injected
-/// during the seed so recovery statistics can attribute failures after a
-/// fault (see `FdrVerdict::error_recovery_failed`).
+/// With `testing-fault`, every variant carries the records of the faults that
+/// the seed injected, so the recovery counters can attribute a failure to a
+/// fault, as `FdrVerdict::error_recovery_failed` states.
 #[derive(Debug, Clone)]
 pub enum SeedResult {
-	/// Exploration completed successfully
+	/// The seed explored to its end, with its longest trace, the failures it
+	/// collected, and the faults it injected.
 	#[cfg(feature = "testing-fault")]
 	Success(Trace, Vec<Failure>, Vec<InjectedFaultRecord>),
+	/// The seed explored to its end, with its longest trace and the failures
+	/// it collected.
 	#[cfg(not(feature = "testing-fault"))]
 	Success(Trace, Vec<Failure>),
-	/// Divergence detected (τ-loop)
+	/// The seed diverged at a state, with the trace that reached the state,
+	/// the state, the hidden events of the run that diverges from it, and the
+	/// faults the seed injected.
 	#[cfg(feature = "testing-fault")]
-	Divergence(Trace, Vec<Event>, Vec<InjectedFaultRecord>),
+	Divergence(Trace, State, Vec<Event>, Vec<InjectedFaultRecord>),
+	/// The seed diverged at a state, with the trace that reached the state,
+	/// the state, and the hidden events of the run that diverges from it.
 	#[cfg(not(feature = "testing-fault"))]
-	Divergence(Trace, Vec<Event>),
-	/// Deadlock detected (unexpected STOP)
+	Divergence(Trace, State, Vec<Event>),
+	/// The seed deadlocked, an unexpected STOP, with the trace that reached the
+	/// state, the state, and the faults the seed injected.
 	#[cfg(feature = "testing-fault")]
 	Deadlock(Trace, State, Vec<InjectedFaultRecord>),
+	/// The seed deadlocked, an unexpected STOP, with the trace that reached the
+	/// state and the state.
 	#[cfg(not(feature = "testing-fault"))]
 	Deadlock(Trace, State),
 }
 
-/// Exploration state during BFS traversal
+impl SeedResult {
+	/// The state where this seed diverged, paired with the hidden events of the
+	/// run that diverges from it.
+	pub(crate) fn divergence(&self) -> Option<(State, &[Event])> {
+		match self {
+			#[cfg(feature = "testing-fault")]
+			Self::Divergence(_trace, state, run, _faults) => Some((*state, run)),
+			#[cfg(not(feature = "testing-fault"))]
+			Self::Divergence(_trace, state, run) => Some((*state, run)),
+			_ => None,
+		}
+	}
+
+	/// Whether this seed ran to its end with neither a divergence nor a
+	/// deadlock.
+	#[cfg(feature = "testing-fault")]
+	pub(crate) fn succeeded(&self) -> bool {
+		matches!(self, Self::Success(..))
+	}
+}
+
+/// The state of one branch of a seed's exploration, which the seed's queue
+/// holds.
 #[derive(Debug, Clone)]
 pub struct ExplorationState {
-	/// Current process state
+	/// The process state that the branch has reached.
 	pub process_state: State,
 
-	/// Trace so far (observable events only)
+	/// The observable events of the branch so far.
 	pub trace: Trace,
 
-	/// Consecutive τ-transitions counter
+	/// The length of the current run of hidden (τ) events, which an observable
+	/// event resets.
 	pub internal_run: usize,
 
-	/// Path through state space (for divergence witness)
+	/// Every state that the branch has passed through, from the initial state.
 	pub state_path: Vec<State>,
 
-	/// Hidden events executed (for divergence witness)
+	/// Every hidden event that the branch has taken, across its runs.
 	pub hidden_events: Vec<Event>,
 
-	/// Cumulative elapsed time (worst-case using WCET)
+	/// The elapsed time of the branch, the sum of the worst-case execution
+	/// time (WCET) of each observable event.
 	#[cfg(feature = "testing-timing")]
 	pub elapsed_time: Duration,
 
-	/// Event timestamps: (event, cumulative_time_when_event_occurred)
+	/// Each observable event of the branch, with the elapsed time after it.
 	#[cfg(feature = "testing-timing")]
 	pub event_times: Vec<(Event, Duration)>,
 
-	/// Clock values (for timed CSP)
+	/// The value of each clock of timed CSP, by clock name.
 	#[cfg(feature = "testing-timing")]
 	pub clock_values: HashMap<String, Duration>,
 }
 
 impl ExplorationState {
-	/// Create initial exploration state
+	/// The exploration state at the start of a seed, at `process_state`.
 	pub fn initial(process_state: State) -> Self {
 		Self {
 			process_state,
@@ -260,24 +366,26 @@ impl ExplorationState {
 		}
 	}
 
-	/// Clone state for branch exploration
+	/// A copy of this state for a new branch.
 	pub fn branch(&self) -> Self {
 		self.clone()
 	}
 
-	/// Record observable event
+	/// Takes the observable `event` to `next_state`, which ends the current
+	/// run of hidden events.
 	pub fn record_observable(&mut self, event: Event, next_state: State) {
 		self.trace.push(event);
 		self.process_state = next_state;
 		self.state_path.push(next_state);
-		self.internal_run = 0; // Reset τ counter
+		self.internal_run = 0;
 		#[cfg(feature = "testing-timing")]
 		{
-			// Timing will be updated by caller after WCET lookup
+			// The caller adds the WCET of the event through `update_timing`.
 		}
 	}
 
-	/// Record hidden (τ) event
+	/// Takes the hidden (τ) `event` to `next_state`, which extends the current
+	/// run of hidden events.
 	pub fn record_hidden(&mut self, event: Event, next_state: State) {
 		self.hidden_events.push(event);
 		self.process_state = next_state;
@@ -285,19 +393,26 @@ impl ExplorationState {
 		self.internal_run += 1;
 		#[cfg(feature = "testing-timing")]
 		{
-			// Hidden events don't contribute to timing (or use zero time)
+			// A hidden event takes zero time, so the timing stays as it is.
 		}
 	}
 
-	/// Update timing after recording an observable event
-	/// Called after WCET lookup to add event time
+	/// The hidden events of the current run, which the last observable event
+	/// started. A divergence past `max_internal_run` reports this run.
+	pub fn current_run(&self) -> &[Event] {
+		let start = self.hidden_events.len().saturating_sub(self.internal_run);
+		self.hidden_events.get(start..).unwrap_or_default()
+	}
+
+	/// Adds `wcet`, the WCET of the observable `event`, to the elapsed time,
+	/// and records the event at the new elapsed time.
 	#[cfg(feature = "testing-timing")]
 	pub fn update_timing(&mut self, event: &Event, wcet: Duration) {
 		self.elapsed_time += wcet;
 		self.event_times.push((*event, self.elapsed_time));
 	}
 
-	/// Advance all clocks by elapsed time
+	/// Advances every clock by `elapsed`, up to the largest duration.
 	#[cfg(feature = "testing-timing")]
 	pub fn update_clocks(&mut self, elapsed: Duration) {
 		for clock_value in self.clock_values.values_mut() {
@@ -305,7 +420,7 @@ impl ExplorationState {
 		}
 	}
 
-	/// Reset specific clocks to zero
+	/// Sets each clock in `clock_names` to zero.
 	#[cfg(feature = "testing-timing")]
 	pub fn reset_clocks(&mut self, clock_names: impl AsRef<[String]>) {
 		let clock_names = clock_names.as_ref();
@@ -315,21 +430,23 @@ impl ExplorationState {
 	}
 }
 
-/// Seeded RNG for deterministic choice selection at nondeterministic points
+/// A seeded random number generator, which makes the choices of one seed, so
+/// each seed repeats its schedule.
 #[derive(Debug, Clone)]
 pub struct SeededRng {
 	state: u64,
 }
 
 impl SeededRng {
-	/// Create new seeded RNG
+	/// A generator that starts from `seed`.
 	pub fn new(seed: u64) -> Self {
 		Self { state: seed.wrapping_add(1) }
 	}
 
-	/// Generate next pseudo-random number (LCG algorithm)
+	/// The next pseudo-random number of the linear congruential generator.
 	pub fn get_next(&mut self) -> u64 {
-		// Linear Congruential Generator constants from Numerical Recipes
+		// The multiplier and the increment are the LCG constants of Numerical
+		// Recipes.
 		self.state = self
 			.state
 			.wrapping_mul(crate::constants::LCG_MULTIPLIER)
@@ -337,7 +454,8 @@ impl SeededRng {
 		self.state
 	}
 
-	/// Choose an item from slice using current RNG state
+	/// An item of `items` that the next draw picks, or `None` when `items` is
+	/// empty.
 	pub fn choose<'a, T>(&mut self, items: &'a (impl AsRef<[T]> + ?Sized)) -> Option<&'a T> {
 		let items = items.as_ref();
 		if items.is_empty() {
@@ -353,7 +471,7 @@ impl SeededRng {
 mod tests {
 	use super::*;
 
-	// Tests for SeededRng
+	// These tests cover `SeededRng`.
 	mod seeded_rng {
 		use super::*;
 
@@ -385,7 +503,7 @@ mod tests {
 		}
 	}
 
-	// Tests for ExplorationState
+	// These tests cover `ExplorationState`.
 	mod exploration_state {
 		use super::*;
 		use crate::testing::specs::csp::{Event, State};
@@ -410,7 +528,7 @@ mod tests {
 			exp_state.record_observable(event, state2);
 			assert_eq!(exp_state.process_state, state2);
 			assert_eq!(exp_state.trace, vec![event]);
-			assert_eq!(exp_state.internal_run, 0); // Reset after observable
+			assert_eq!(exp_state.internal_run, 0); // An observable event ends the run.
 			assert_eq!(exp_state.state_path.len(), 2);
 		}
 
@@ -422,10 +540,24 @@ mod tests {
 			let mut exp_state = ExplorationState::initial(state1);
 			exp_state.record_hidden(event, state2);
 			assert_eq!(exp_state.process_state, state2);
-			assert!(exp_state.trace.is_empty()); // Hidden events don't go in trace
-			assert_eq!(exp_state.internal_run, 1); // Incremented
+			assert!(exp_state.trace.is_empty()); // The trace holds observable events alone.
+			assert_eq!(exp_state.internal_run, 1); // The hidden event extends the run.
 			assert_eq!(exp_state.hidden_events, vec![event]);
 			assert_eq!(exp_state.state_path.len(), 2);
+		}
+
+		#[test]
+		fn an_observable_event_starts_a_new_hidden_run() {
+			let (state1, state2) = (State("S1"), State("S2"));
+			let (tau, evt, tick) = (Event("tau"), Event("evt"), Event("tick"));
+
+			let mut exp_state = ExplorationState::initial(state1);
+			exp_state.record_hidden(tau, state2);
+			exp_state.record_observable(evt, state1);
+			exp_state.record_hidden(tick, state2);
+
+			assert_eq!(exp_state.current_run(), [tick]);
+			assert_eq!(exp_state.hidden_events, vec![tau, tick]);
 		}
 
 		#[test]
@@ -434,14 +566,15 @@ mod tests {
 			let tau = Event("tau");
 			let mut exp_state = ExplorationState::initial(state);
 
-			// Simulate τ-loop: many hidden transitions
+			// A τ-loop takes the same hidden event 35 times, past the default
+			// `max_internal_run` of 32.
 			for _ in 0..35 {
 				exp_state.record_hidden(tau, state);
 			}
 
 			assert!(exp_state.internal_run > 32);
 			assert_eq!(exp_state.hidden_events.len(), 35);
-			assert!(exp_state.trace.is_empty()); // Observable trace stays empty
+			assert!(exp_state.trace.is_empty()); // The observable trace stays empty.
 		}
 
 		#[cfg(feature = "testing-timing")]
@@ -458,7 +591,7 @@ mod tests {
 			assert_eq!(exp_state.event_times[0].0, event);
 			assert_eq!(exp_state.event_times[0].1, Duration::from_millis(10));
 
-			// Add another event
+			// A second event adds its WCET to the elapsed time of the first.
 			let event2 = Event("evt2");
 			exp_state.record_observable(event2, state);
 			exp_state.update_timing(&event2, Duration::from_millis(5));

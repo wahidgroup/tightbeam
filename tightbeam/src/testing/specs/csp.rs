@@ -16,7 +16,7 @@
 //!   <https://www.cs.cmu.edu/~crary/819-f09/Hoare78.pdf>
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
 #[cfg(any(
@@ -123,10 +123,10 @@ pub struct Transition {
 
 /// The transition relation, from a state and an event to its target states.
 ///
-/// A state and event may have more than one target, which is nondeterminism.
+/// More than one target for a state and an event is nondeterminism.
 #[derive(Debug, Clone)]
 pub struct TransitionRelation {
-	/// Target states for each source state and event.
+	/// The target states of each source state and event.
 	transitions: HashMap<(State, Event), Vec<State>>,
 }
 
@@ -135,7 +135,7 @@ impl TransitionRelation {
 		Self { transitions: HashMap::new() }
 	}
 
-	/// Add a transition that takes `from` to `to` on `event`.
+	/// Adds a transition that takes `from` to `to` on `event`.
 	pub fn add(&mut self, from: State, event: Event, to: State) {
 		self.transitions.entry((from, event)).or_default().push(to);
 	}
@@ -150,7 +150,7 @@ impl TransitionRelation {
 		self.transitions.get(&(from, *event)).map(|v| v.len() > 1).unwrap_or(false)
 	}
 
-	/// Iterate over every `((from, event), targets)` entry.
+	/// Iterates over every `((from, event), targets)` entry.
 	pub fn iter(&self) -> impl Iterator<Item = (&(State, Event), &Vec<State>)> {
 		self.transitions.iter()
 	}
@@ -200,14 +200,16 @@ pub struct Process {
 	/// The human-readable name of the process.
 	pub name: &'static str,
 
-	/// What this process is evidence of. The code that builds it sets it.
+	/// What this process is evidence of. The code that builds the process sets
+	/// this field.
 	pub observation: Observation,
 
 	/// Whether a run that records no event in this alphabet is a violation.
 	///
 	/// A trace that takes no transition satisfies every process, so the
-	/// check would hold whatever the run did. Processes require progress
-	/// unless a scenario states that doing nothing is the behavior it models.
+	/// check would hold whatever the run did. A process requires progress,
+	/// and [`ProcessBuilder::permits_no_progress`] lifts that rule for a
+	/// process that models a run with no event.
 	pub requires_progress: bool,
 
 	/// The state the process starts in.
@@ -239,9 +241,9 @@ pub struct Process {
 	#[cfg(feature = "testing-timing")]
 	pub timing_constraints: Option<TimingConstraints>,
 
-	/// The timed transitions, keyed by source state and event.
+	/// The timed transitions, keyed by the source state and the event.
 	///
-	/// Each one is an edge of the process. Its guard decides where FDR
+	/// Each one is an edge of the process. Its guard decides when FDR
 	/// exploration takes it.
 	#[cfg(feature = "testing-timing")]
 	pub timed_transitions: Option<HashMap<(State, Event), Vec<TimedTransition>>>,
@@ -280,12 +282,12 @@ impl Process {
 		&self.hidden
 	}
 
-	/// `trace` restricted to this process's observable alphabet.
+	/// The projection of `trace` onto this process's observable alphabet.
 	///
 	/// `traces(P \ X) = { s ↾ (Σ ∖ X) | s ∈ traces(P) }`. A recording also
 	/// holds the steps this process models internally, so it is projected
-	/// before it is compared. Traces model only: hiding is not sound in `F`
-	/// or `FD`.
+	/// before it is compared. The projection holds in the traces model only,
+	/// because hiding is not sound in `F` or `FD`.
 	pub fn project(&self, trace: impl AsRef<[Event]>) -> Vec<Event> {
 		let trace = trace.as_ref();
 		trace.iter().filter(|event| self.observable.contains(event)).copied().collect()
@@ -294,8 +296,8 @@ impl Process {
 	/// The events `other` makes observable that this process models in
 	/// neither alphabet, sorted by name.
 	///
-	/// This process neither permits nor forbids them, so they are model
-	/// coverage rather than a violation.
+	/// This process neither permits nor forbids them, so they count as model
+	/// coverage and not as a violation.
 	#[cfg(any(test, feature = "testing-fdr"))]
 	pub(crate) fn unmodelled(&self, other: &Self) -> Vec<Event> {
 		let mut found: Vec<Event> = other
@@ -378,7 +380,7 @@ impl Process {
 	/// `clocks`.
 	///
 	/// An untimed edge is always a successor, and it resets no clock. A timed
-	/// edge is a successor where `clocks` satisfy its guard, and it resets the
+	/// edge is a successor when `clocks` satisfy its guard, and it resets the
 	/// clocks it names.
 	#[cfg(all(feature = "testing-timing", any(test, feature = "testing-fdr")))]
 	pub(crate) fn successors<'a>(
@@ -419,16 +421,173 @@ impl Process {
 		self.choice.contains(&state)
 	}
 
+	/// Whether `state` is stable, which means that it enables no hidden
+	/// action.
+	///
+	/// The hidden actions of [`Self::enabled`] are the events of the hidden
+	/// alphabet that have an edge from `state`, so the answer reads that
+	/// alphabet in place, with no allocation.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::specs::csp::{Event, Process, State};
+	///
+	/// let process = Process::builder("Settle")
+	///     .initial_state(State("S0"))
+	///     .add_observable(Event("done"))
+	///     .add_hidden(Event("settle"))
+	///     .add_transition(State("S0"), Event("settle"), State("S1"))
+	///     .add_transition(State("S1"), Event("done"), State("S2"))
+	///     .add_terminal(State("S2"))
+	///     .build()?;
+	///
+	/// assert!(!process.is_stable(State("S0")));
+	/// assert!(process.is_stable(State("S1")));
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	pub fn is_stable(&self, state: State) -> bool {
+		let has_step = |event: &Event| self.has_edge(state, event);
+		!self.hidden.iter().any(has_step)
+	}
+
+	/// The observable events that `state` offers, which are the events of the
+	/// observable actions of [`Self::enabled`].
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::collections::HashSet;
+	///
+	/// use tightbeam::testing::specs::csp::{Event, Process, State};
+	///
+	/// let process = Process::builder("Choose")
+	///     .initial_state(State("S0"))
+	///     .add_observable(Event("a"))
+	///     .add_observable(Event("b"))
+	///     .add_hidden(Event("t"))
+	///     .add_transition(State("S0"), Event("a"), State("S1"))
+	///     .add_transition(State("S0"), Event("t"), State("S1"))
+	///     .add_terminal(State("S1"))
+	///     .build()?;
+	///
+	/// assert_eq!(process.offers(State("S0")), HashSet::from([Event("a")]));
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	pub fn offers(&self, state: State) -> HashSet<Event> {
+		let enabled_actions = self.enabled(state);
+		let observable = enabled_actions.into_iter().filter(Action::is_observable);
+		observable.map(|action| action.event).collect()
+	}
+
+	/// The refusal set that the failures model records at `state`.
+	///
+	/// - At an accepting state, where the process can terminate, the set is every observable event.
+	/// - At another stable state, the set is each observable event that `state` does not offer.
+	/// - At an unstable state, the answer is `None`, as the state can take a hidden action before it refuses.
+	///
+	/// A process that can terminate after a trace `s` has the failure `(s, Σ)`,
+	/// because it can refuse every event but its termination (axiom F4 of A.W.
+	/// Roscoe, *The Theory and Practice of Concurrency*, 2005 revision,
+	/// §8.3.1, which the stable failures model of §8.4 keeps).
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::collections::HashSet;
+	///
+	/// use tightbeam::testing::specs::csp::{Event, Process, State};
+	///
+	/// let process = Process::builder("Accepting")
+	///     .initial_state(State("Idle"))
+	///     .add_observable(Event("a"))
+	///     .add_observable(Event("b"))
+	///     .add_hidden(Event("t"))
+	///     .add_transition(State("Idle"), Event("a"), State("Busy"))
+	///     .add_transition(State("Busy"), Event("b"), State("Wait"))
+	///     .add_transition(State("Wait"), Event("t"), State("Idle"))
+	///     .add_terminal(State("Idle"))
+	///     .build()?;
+	///
+	/// let every_event = HashSet::from([Event("a"), Event("b")]);
+	/// assert_eq!(process.failure_refusals(State("Idle")), Some(every_event));
+	/// assert_eq!(process.failure_refusals(State("Busy")), Some(HashSet::from([Event("a")])));
+	/// assert_eq!(process.failure_refusals(State("Wait")), None);
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	pub fn failure_refusals(&self, state: State) -> Option<HashSet<Event>> {
+		if self.is_terminal(state) {
+			return Some(self.observable.clone());
+		}
+		if !self.is_stable(state) {
+			return None;
+		}
+
+		let offers = self.offers(state);
+		let refused = self.observable.difference(&offers).copied().collect();
+		Some(refused)
+	}
+
+	/// The states of this process that can diverge.
+	///
+	/// A state diverges when a run of hidden events from it reaches a cycle of
+	/// hidden events, so the process can perform hidden events forever after
+	/// the trace that led to it (A.W. Roscoe, *The Theory and Practice of
+	/// Concurrency*, 2005 revision, §8.3.1). One pass over the graph of hidden
+	/// steps computes the answer:
+	///
+	/// 1. Tarjan's algorithm, with a stack of its own, finds the strongly connected components.
+	/// 2. A state with a hidden step inside its own component lies on a cycle of hidden events.
+	/// 3. A search back along the hidden steps marks each state that reaches such a state.
+	///
+	/// - On a finite process the answer is exact, needs no bound on the run, and holds under any event names.
+	/// - A timed hidden transition is a step whatever the clocks read, as [`Self::step`] reads it.
+	/// - A process with no hidden event computes the answer with no allocation.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::specs::csp::{Event, Process, State};
+	///
+	/// let process = Process::builder("Lasso")
+	///     .initial_state(State("S0"))
+	///     .add_observable(Event("b"))
+	///     .add_hidden(Event("p"))
+	///     .add_hidden(Event("t"))
+	///     .add_hidden(Event("u"))
+	///     .add_transition(State("S0"), Event("p"), State("S1"))
+	///     .add_transition(State("S1"), Event("t"), State("S2"))
+	///     .add_transition(State("S2"), Event("u"), State("S1"))
+	///     .add_transition(State("S2"), Event("b"), State("S3"))
+	///     .add_terminal(State("S3"))
+	///     .build()?;
+	///
+	/// let divergent = process.divergent_states();
+	/// assert_eq!(divergent.witness(State("S0")), Some(vec![Event("p"), Event("t"), Event("u")]));
+	/// assert!(!divergent.contains(State("S3")));
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	pub fn divergent_states(&self) -> DivergentStates {
+		if self.hidden.is_empty() {
+			return DivergentStates::default();
+		}
+
+		let graph = HiddenGraph::of(self);
+		graph.divergent_states()
+	}
+
 	/// A digest of the LTS structure: the initial state, the sorted states,
 	/// the terminals, the choice points, the alphabets, and the triples of the
 	/// untimed and the timed transitions.
 	///
-	/// - Two processes share a digest if and only if they have identical
-	///   structure, so the digest is a sound memoization key where `name` is
-	///   not. Algebra operators such as `hide` and `rename` give the same name
-	///   to structurally different results.
-	/// - The digest is stable only within one program run, because the
-	///   `DefaultHasher` seeds vary across runs. Do not persist it.
+	/// - Two processes with identical structure share a digest, and two that
+	///   differ share one only on a 64-bit hash collision. The digest is
+	///   therefore a memoization key where `name` is not, because algebra
+	///   operators such as `hide` and `rename` give the same name to
+	///   structurally different results.
+	/// - The digest is stable only within one Rust release, because the
+	///   standard library leaves the algorithm of `DefaultHasher` unspecified
+	///   across releases. Do not persist it.
 	pub fn structure_digest(&self) -> u64 {
 		use core::hash::{Hash, Hasher};
 		use std::collections::hash_map::DefaultHasher;
@@ -494,9 +653,385 @@ impl Process {
 	}
 }
 
+/// The states of a process that can diverge, as [`Process::divergent_states`]
+/// computes them.
+///
+/// Each divergent state holds one hidden step to a divergent state, toward a
+/// cycle of hidden events or along one. A run that takes these steps
+/// from a divergent state stays among the divergent states, so it reaches a
+/// state it passed, and that run is the witness of the divergence.
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam::testing::specs::csp::{Event, Process, State};
+///
+/// let process = Process::builder("Spin")
+///     .initial_state(State("S0"))
+///     .add_observable(Event("a"))
+///     .add_hidden(Event("t"))
+///     .add_transition(State("S0"), Event("a"), State("S1"))
+///     .add_transition(State("S1"), Event("t"), State("S1"))
+///     .build()?;
+///
+/// let divergent = process.divergent_states();
+/// assert!(divergent.contains(State("S1")));
+/// assert_eq!(divergent.witness(State("S0")), None);
+/// # Ok::<(), Box<dyn core::error::Error>>(())
+/// ```
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DivergentStates {
+	/// The hidden step that each divergent state takes in its witness, as the
+	/// event and the state it reaches.
+	steps: HashMap<State, (Event, State)>,
+}
+
+impl DivergentStates {
+	/// Whether `state` can diverge.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::specs::csp::{Event, Process, State};
+	///
+	/// let process = Process::builder("Spin")
+	///     .initial_state(State("S0"))
+	///     .add_hidden(Event("t"))
+	///     .add_transition(State("S0"), Event("t"), State("S0"))
+	///     .build()?;
+	///
+	/// assert!(process.divergent_states().contains(State("S0")));
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	pub fn contains(&self, state: State) -> bool {
+		self.steps.contains_key(&state)
+	}
+
+	/// The witness that `state` can diverge, or `None` when it cannot.
+	///
+	/// The witness holds the hidden events of a run from `state` to a cycle of
+	/// hidden events and once around it. A state that cannot diverge answers
+	/// with no allocation.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::specs::csp::{Event, Process, State};
+	///
+	/// let process = Process::builder("Spin")
+	///     .initial_state(State("S0"))
+	///     .add_hidden(Event("t"))
+	///     .add_hidden(Event("u"))
+	///     .add_transition(State("S0"), Event("t"), State("S1"))
+	///     .add_transition(State("S1"), Event("u"), State("S0"))
+	///     .build()?;
+	///
+	/// let witness = process.divergent_states().witness(State("S1"));
+	/// assert_eq!(witness, Some(vec![Event("u"), Event("t")]));
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	pub fn witness(&self, state: State) -> Option<Vec<Event>> {
+		let walk = self.walk(state)?;
+		Some(walk.events)
+	}
+
+	/// The states of the cycle that the witness of `state` goes around, in the
+	/// order the run passes them, or `None` when `state` cannot diverge.
+	pub(crate) fn cycle(&self, state: State) -> Option<Vec<State>> {
+		let Walk { mut passed, repeated, .. } = self.walk(state)?;
+		let start = passed.iter().position(|passed| *passed == repeated)?;
+		Some(passed.split_off(start))
+	}
+
+	/// The run of the witness of `state`, up to the first state it passes a
+	/// second time.
+	fn walk(&self, state: State) -> Option<Walk> {
+		let mut step = self.steps.get(&state)?;
+		let mut walk = Walk { events: Vec::new(), passed: vec![state], repeated: state };
+		loop {
+			let (event, to) = *step;
+			walk.events.push(event);
+			if walk.passed.contains(&to) {
+				walk.repeated = to;
+				return Some(walk);
+			}
+
+			// Each divergent state steps to a divergent state, so `to` holds a
+			// step of its own.
+			walk.passed.push(to);
+			step = self.steps.get(&to)?;
+		}
+	}
+}
+
+/// A run along the witness steps of [`DivergentStates`].
+struct Walk {
+	/// The hidden events of the run, in order.
+	events: Vec<Event>,
+	/// The states the run passed, from its start, in order.
+	passed: Vec<State>,
+	/// The state that the run passed a second time, where it ends.
+	repeated: State,
+}
+
+/// The hidden steps of a process, over the indices of its states.
+struct HiddenGraph {
+	/// Each state of the process, sorted by name, then each state that a
+	/// hidden step reaches outside that set.
+	states: Vec<State>,
+	/// The hidden steps of each state in `states`, as the event and the index
+	/// of the state it reaches, in the order of [`Process::enabled`] and
+	/// [`Process::step`].
+	steps: Vec<Vec<(Event, usize)>>,
+}
+
+impl HiddenGraph {
+	/// The hidden steps of `process`.
+	fn of(process: &Process) -> Self {
+		let mut states: Vec<State> = process.states.iter().copied().collect();
+		states.sort_unstable();
+		let mut index: HashMap<State, usize> = states.iter().copied().zip(0..).collect();
+		let mut graph = Self { states, steps: Vec::new() };
+
+		while let Some(&state) = graph.states.get(graph.steps.len()) {
+			let mut steps = Vec::new();
+			let enabled_actions = process.enabled(state);
+			for action in enabled_actions.into_iter().filter(Action::is_hidden) {
+				for to in process.step(state, &action.event) {
+					let at = graph.index_of(&mut index, to);
+					steps.push((action.event, at));
+				}
+			}
+
+			graph.steps.push(steps);
+		}
+
+		graph
+	}
+
+	/// The index of `state` in `states`, which `state` joins when it is new.
+	fn index_of(&mut self, index: &mut HashMap<State, usize>, state: State) -> usize {
+		let next = self.states.len();
+		let at = *index.entry(state).or_insert(next);
+		if at == next {
+			self.states.push(state);
+		}
+
+		at
+	}
+
+	/// The states that can diverge, each with the hidden step of its witness.
+	fn divergent_states(&self) -> DivergentStates {
+		let components = self.components();
+		let mut chosen: Vec<Option<(Event, usize)>> = vec![None; self.states.len()];
+		let mut found = VecDeque::new();
+
+		// 1. A state with a hidden step inside its own component lies on a
+		// cycle, and that step keeps its run on the cycle.
+		for (from, steps) in self.steps.iter().enumerate() {
+			let component = components.get(from).copied().flatten();
+			let inside = |to: usize| component.is_some() && components.get(to).copied().flatten() == component;
+			let cycle_step = steps.iter().find(|(_event, to)| inside(*to));
+			if let (Some(step), Some(slot)) = (cycle_step, chosen.get_mut(from)) {
+				*slot = Some(*step);
+				found.push_back(from);
+			}
+		}
+
+		// 2. A search back along the hidden steps gives each state that
+		// reaches a cycle its first step toward the nearest one.
+		let entering = self.entering();
+		while let Some(to) = found.pop_front() {
+			for &(from, event) in entering.get(to).into_iter().flatten() {
+				let Some(slot) = chosen.get_mut(from) else {
+					continue;
+				};
+
+				if slot.is_none() {
+					*slot = Some((event, to));
+					found.push_back(from);
+				}
+			}
+		}
+
+		// 3. The steps name their states.
+		let indexed = chosen.into_iter().enumerate();
+		let named = indexed.filter_map(|(from, step)| self.named(from, step?));
+		DivergentStates { steps: named.collect() }
+	}
+
+	/// The hidden steps that enter each state, as the index of the state they
+	/// leave and the event.
+	fn entering(&self) -> Vec<Vec<(usize, Event)>> {
+		let mut entering = vec![Vec::new(); self.states.len()];
+		for (from, steps) in self.steps.iter().enumerate() {
+			for &(event, to) in steps {
+				if let Some(into) = entering.get_mut(to) {
+					into.push((from, event));
+				}
+			}
+		}
+
+		entering
+	}
+
+	/// The step `(event, to)` from the state at `from`, with each state by
+	/// its name.
+	fn named(&self, from: usize, (event, to): (Event, usize)) -> Option<(State, (Event, State))> {
+		let from = self.states.get(from)?;
+		let to = self.states.get(to)?;
+		Some((*from, (event, *to)))
+	}
+
+	/// The strongly connected component of each state, numbered in the order
+	/// that Tarjan's algorithm closes them.
+	fn components(&self) -> Vec<Option<usize>> {
+		let count = self.states.len();
+		let mut search = Tarjan::new(count);
+		for root in 0..count {
+			search.search_from(self, root);
+		}
+
+		search.components
+	}
+}
+
+/// Tarjan's search for the strongly connected components of a
+/// [`HiddenGraph`].
+///
+/// The depth-first search holds each state it descends into, with the next of
+/// its steps to try, on a stack of its own, so the call stack keeps one depth
+/// however long a run of hidden steps grows.
+struct Tarjan {
+	/// The order in which the search reached each state, once it has.
+	order: Vec<Option<usize>>,
+	/// The lowest order that each state reaches through the states on `open`.
+	low: Vec<usize>,
+	/// The reached states whose component is still open, in the order reached.
+	open: Vec<usize>,
+	/// Whether each state is on `open`.
+	on_open: Vec<bool>,
+	/// The component of each state, once its component closes.
+	components: Vec<Option<usize>>,
+	/// The count of the states the search reached.
+	reached: usize,
+	/// The count of the components the search closed.
+	closed: usize,
+}
+
+impl Tarjan {
+	/// A search over `count` states that has reached none.
+	fn new(count: usize) -> Self {
+		Self {
+			order: vec![None; count],
+			low: vec![0; count],
+			open: Vec::new(),
+			on_open: vec![false; count],
+			components: vec![None; count],
+			reached: 0,
+			closed: 0,
+		}
+	}
+
+	/// Searches the states that `root` reaches, unless an earlier search
+	/// reached `root`.
+	fn search_from(&mut self, graph: &HiddenGraph, root: usize) {
+		if self.order.get(root).copied().flatten().is_some() {
+			return;
+		}
+
+		self.reach(root);
+		let mut calls = vec![(root, 0usize)];
+		while let Some(&(state, next)) = calls.last() {
+			let step = graph.steps.get(state).and_then(|steps| steps.get(next));
+			let Some(&(_event, to)) = step else {
+				calls.pop();
+				let parent = calls.last().map(|&(parent, _next)| parent);
+				self.finish(state, parent);
+				continue;
+			};
+
+			if let Some((_state, next)) = calls.last_mut() {
+				*next = next.saturating_add(1);
+			}
+
+			match self.order.get(to).copied().flatten() {
+				None => {
+					self.reach(to);
+					calls.push((to, 0));
+				}
+				Some(order) if self.is_open(to) => self.lower(state, order),
+				Some(_) => {}
+			}
+		}
+	}
+
+	/// Gives `state` the next order, and opens it.
+	fn reach(&mut self, state: usize) {
+		let reached = self.reached;
+		if let Some(order) = self.order.get_mut(state) {
+			*order = Some(reached);
+		}
+		if let Some(low) = self.low.get_mut(state) {
+			*low = reached;
+		}
+		if let Some(on_open) = self.on_open.get_mut(state) {
+			*on_open = true;
+		}
+
+		self.open.push(state);
+		self.reached = reached.saturating_add(1);
+	}
+
+	/// Whether `state` is on `open`.
+	fn is_open(&self, state: usize) -> bool {
+		self.on_open.get(state).copied().unwrap_or(false)
+	}
+
+	/// Lowers the low order of `state` to `order`, when `order` is lower.
+	fn lower(&mut self, state: usize, order: usize) {
+		if let Some(low) = self.low.get_mut(state) {
+			*low = order.min(*low);
+		}
+	}
+
+	/// Leaves `state` once the search tried each of its steps.
+	///
+	/// The parent of `state` takes its low order. A state whose low order is
+	/// its own order is the root of a component, which closes over the states
+	/// above it on `open`.
+	fn finish(&mut self, state: usize, parent: Option<usize>) {
+		let Some(low) = self.low.get(state).copied() else {
+			return;
+		};
+		if let Some(parent) = parent {
+			self.lower(parent, low);
+		}
+
+		let order = self.order.get(state).copied().flatten();
+		if order != Some(low) {
+			return;
+		}
+
+		while let Some(member) = self.open.pop() {
+			if let Some(on_open) = self.on_open.get_mut(member) {
+				*on_open = false;
+			}
+			if let Some(component) = self.components.get_mut(member) {
+				*component = Some(self.closed);
+			}
+			if member == state {
+				break;
+			}
+		}
+
+		self.closed = self.closed.saturating_add(1);
+	}
+}
+
 /// A CSP process specification that a trace can be validated against.
 pub trait ProcessSpec {
-	/// Validate a trace against this process specification.
+	/// Validates a trace against this process specification.
 	fn validate_trace(&self, trace: &ConsumedTrace) -> CspValidationResult;
 
 	/// Returns the [`Process`] that FDR exploration walks.
@@ -508,7 +1043,7 @@ pub trait ProcessSpec {
 }
 
 impl Process {
-	/// Validate a consumed trace against this CSP process.
+	/// Validates a consumed trace against this CSP process.
 	///
 	/// - A trace is a sequence over the observable alphabet, so the check
 	///   matches each event there after a τ-closure takes the τ transitions
@@ -523,9 +1058,9 @@ impl Process {
 		let mut violations = Vec::new();
 		let mut current_states = vec![self.initial];
 
-		// Project the trace onto this process's alphabet by exact URN
-		// identity, as Hoare's restriction `tr ↾ A` does. A label outside the
-		// alphabet falls outside this specification, so the check drops it.
+		// The filter projects the trace onto this process's alphabet by exact
+		// URN identity, as Hoare's restriction `tr ↾ A` does. A label outside
+		// the alphabet falls outside this specification, so the check drops it.
 		let events: Vec<Event> = trace
 			.assertions
 			.iter()
@@ -559,7 +1094,8 @@ impl Process {
 				continue;
 			}
 
-			// Step on the observable event from each candidate that enables it.
+			// Each candidate that enables the event steps on it, so the check
+			// follows every branch of a choice at once.
 			let mut seen = HashSet::new();
 			let mut next_states = Vec::new();
 			for state in closure.iter().filter(|state| self.enabled(**state).contains(&action)) {
@@ -652,7 +1188,7 @@ impl ProcessSpec for Process {
 	}
 }
 
-/// An error from building a [`Process`] with a [`ProcessBuilder`].
+/// An error that [`ProcessBuilder::build`] returns for a [`Process`].
 #[derive(Errorizable, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessBuildError {
 	/// No call to [`ProcessBuilder::initial_state`] set the initial state.
@@ -763,14 +1299,14 @@ impl ProcessBuilder {
 		self
 	}
 
-	/// Add a transition that `guard` enables, and that resets `reset_clocks`
+	/// Adds a transition that `guard` enables, and that resets `reset_clocks`
 	/// when it is taken.
 	///
 	/// Where the guard binds depends on the check:
 	///
 	/// - [`Process::enabled`] and [`Process::step`] offer `event` at `from` whatever the clocks read.
 	/// - The CSP trace check and the refinement checks ignore the clocks and accept the event at any time.
-	/// - FDR exploration takes the transition only where the clocks satisfy the guard.
+	/// - FDR exploration takes the transition only when the clocks satisfy the guard.
 	/// - Exploration starts each clock unset, and a guard on an unset clock does not hold.
 	///
 	/// # Examples
@@ -1197,7 +1733,7 @@ mod tests {
 			.add_transition(State("S1d"), Event("send"), State("S2"))
 			.add_transition(State("S2"), Event("ack"), State("S3"))
 			.add_transition(State("S2"), Event("fail"), State("S3f"))
-			// S3 is the success STOP and S3f the failure STOP.
+			// S3 is the success STOP, and S3f is the failure STOP.
 			.add_terminal(State("S3"))
 			.add_terminal(State("S3f"))
 			// S1 is a declared choice point, so both branches are legal.
@@ -1209,7 +1745,7 @@ mod tests {
 
 		assert!(proc.is_choice(State("S1")));
 		let s1_enabled = proc.enabled(State("S1"));
-		assert_eq!(s1_enabled.len(), 2); // serialize, queue
+		assert_eq!(s1_enabled.len(), 2); // S1 enables serialize and queue.
 
 		assert_eq!(proc.observable_alphabet().len(), 4);
 		assert!(proc.observable_alphabet().contains(&Event("start")));
@@ -1287,10 +1823,10 @@ mod tests {
 
 		// 5. Terminal states (STOP).
 		assert_eq!(proc.terminal.len(), 2);
-		assert!(proc.is_terminal(State("S3"))); // Success terminal
-		assert!(proc.is_terminal(State("S3f"))); // Failure terminal
+		assert!(proc.is_terminal(State("S3"))); // S3 is the success STOP.
+		assert!(proc.is_terminal(State("S3f"))); // S3f is the failure STOP.
 
-		// 6. Nondeterministic choice points (□).
+		// 6. Nondeterministic choice points (⊓).
 		assert_eq!(proc.choice.len(), 1);
 		assert!(proc.is_choice(State("S1"))); // S1 chooses serialize or queue
 
@@ -1411,7 +1947,7 @@ mod tests {
 		// 13. An invalid transition yields no successor states.
 		assert_eq!(proc.step(State("S0"), &Event("send")).len(), 0);
 		assert_eq!(proc.step(State("S1"), &Event("ack")).len(), 0);
-		assert_eq!(proc.step(State("S3"), &Event("start")).len(), 0); // Terminal has no transitions
+		assert_eq!(proc.step(State("S3"), &Event("start")).len(), 0); // S3 is terminal.
 
 		// 14. Each event classifies as observable or hidden.
 		for action in proc.enabled(State("S0")) {

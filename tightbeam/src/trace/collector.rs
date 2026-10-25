@@ -60,6 +60,89 @@ impl IntoEventLabel for &Urn<'_> {
 	}
 }
 
+/// An internal event: a step inside the request path, which a trace records
+/// when its config sets [`enable_internal_detail`].
+///
+/// The set is closed, so [`TraceCollector::emit_internal_event`], the one
+/// reader of the flag, gates these events alone. Each variant maps to its URN
+/// in [`events`] and to its label, the name the event taxonomy gives the step.
+///
+/// [`enable_internal_detail`]: crate::instrumentation::TbInstrumentationConfig::enable_internal_detail
+// The emit sites sit in the transport, the mux, and the servlet, and `colony`
+// turns on all of them. A build without `colony` leaves out some sites, and a
+// build without `instrument` reads the labels alone, so some variants and the
+// reader have no caller there.
+#[cfg(any(feature = "instrument", feature = "testing-fdr"))]
+#[cfg_attr(not(all(feature = "colony", feature = "instrument")), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InternalEvent {
+	/// The entry into the application handler of an admitted call.
+	HandlerEnter,
+	/// The exit from the application handler of an admitted call.
+	HandlerExit,
+	/// A frame body that a servlet decrypted for typed delivery.
+	CryptoStep,
+	/// A cleartext frame body that a servlet inflated for typed delivery.
+	CompressStep,
+	/// A peer stream that the mux responder routed to the method of its kind.
+	RouteStep,
+	/// A collector gate that evaluated one inbound call.
+	PolicyEval,
+}
+
+// As on `InternalEvent`, a build without `colony` or `instrument` leaves out
+// some callers.
+#[cfg(any(feature = "instrument", feature = "testing-fdr"))]
+#[cfg_attr(not(all(feature = "colony", feature = "instrument")), allow(dead_code))]
+impl InternalEvent {
+	/// Every internal event, which [`Self::of`] reads as the closed set.
+	#[cfg(all(feature = "instrument", feature = "testing-fdr"))]
+	const ALL: [Self; 6] = [
+		Self::HandlerEnter,
+		Self::HandlerExit,
+		Self::CryptoStep,
+		Self::CompressStep,
+		Self::RouteStep,
+		Self::PolicyEval,
+	];
+
+	/// The internal event that `urn` names, or [`None`] when `urn` names an
+	/// event outside the set.
+	///
+	/// The trace analysis of FDR reads it to project a trace onto its hidden
+	/// steps, so an event that the flag gates is a hidden step there too.
+	#[cfg(all(feature = "instrument", feature = "testing-fdr"))]
+	pub(crate) fn of(urn: &Urn<'_>) -> Option<Self> {
+		Self::ALL.into_iter().find(|event| event.urn() == *urn)
+	}
+
+	/// The URN of this event in the inventory.
+	#[cfg(feature = "instrument")]
+	fn urn(self) -> Urn<'static> {
+		match self {
+			Self::HandlerEnter => events::HANDLER_ENTER,
+			Self::HandlerExit => events::HANDLER_EXIT,
+			Self::CryptoStep => events::CRYPTO_STEP,
+			Self::CompressStep => events::COMPRESS_STEP,
+			Self::RouteStep => events::ROUTE_STEP,
+			Self::PolicyEval => events::POLICY_EVAL,
+		}
+	}
+
+	/// The label of this event, which the trace analysis of FDR reads as the
+	/// name of a hidden step and offers in its acceptance sets.
+	pub(crate) const fn label(self) -> &'static str {
+		match self {
+			Self::HandlerEnter => "handler_enter",
+			Self::HandlerExit => "handler_exit",
+			Self::CryptoStep => "crypto_step",
+			Self::CompressStep => "compress_step",
+			Self::RouteStep => "route_step",
+			Self::PolicyEval => "policy_eval",
+		}
+	}
+}
+
 /// Configuration for trace collection.
 #[derive(Default)]
 pub struct TraceConfig {
@@ -196,8 +279,8 @@ impl<'a, V: Into<EventValue>> EventBuilder<'a, V> {
 
 	/// Sets the log level for this event.
 	///
-	/// With a log level set, the event also goes to the log backend, when a
-	/// backend is configured and its filter admits the level.
+	/// With a log level set, the event also goes to the log backend, when the
+	/// collector has one and its filter admits the level.
 	#[cfg(feature = "logging")]
 	pub fn with_log_level(mut self, level: super::logging::LogLevel) -> Self {
 		self.log_level = Some(level);
@@ -244,8 +327,8 @@ impl<'a, V: Into<EventValue>> EventBuilder<'a, V> {
 
 					// The trace is the evidence and the log is a convenience,
 					// so the event reaches the trace even when the backend
-					// refuses the log record. Nothing above this reads the
-					// outcome of the log write.
+					// refuses the log record. The outcome of the log write
+					// stops here, because `emit` and the drop return `()`.
 					let _unlogged = logger_config.backend.emit(&record);
 				}
 			}
@@ -410,13 +493,15 @@ impl TraceOrigin {
 
 /// The trace clock, whose event timestamps count nanoseconds on the clock a
 /// collector adopted since the origin it took from that clock. The collector
-/// records each origin once (`TRACE_CLOCK_ORIGIN`), before the first event that
-/// counts from it, so one Unix reading per origin gives the absolute time of
-/// every event.
+/// records each origin once ([`TRACE_CLOCK_ORIGIN`]), before the first event
+/// that counts from it, so one Unix reading per origin gives the absolute time
+/// of every event.
 ///
 /// - A collector adopts [`SystemClock`] where the host has one, and
 ///   [`TraceCollector::with_clock`] adopts another.
 /// - A build with no host clock stamps its events once a clock is adopted.
+///
+/// [`TRACE_CLOCK_ORIGIN`]: events::TRACE_CLOCK_ORIGIN
 #[cfg(feature = "instrument")]
 #[derive(Debug)]
 struct TraceClock {
@@ -437,6 +522,13 @@ impl Default for TraceClock {
 
 #[cfg(feature = "instrument")]
 impl TraceClock {
+	/// The clock that this trace clock adopted, if any.
+	#[cfg(feature = "testing-fdr")]
+	fn clock(&self) -> Option<Arc<dyn Clock>> {
+		let guard = self.origin.read().unwrap_or_else(PoisonError::into_inner);
+		guard.as_ref().map(|origin| Arc::clone(&origin.clock))
+	}
+
 	/// Adopt `clock` with a new origin, which the next event records.
 	///
 	/// A write under the lock replaces the origin whole, so a poisoned lock
@@ -612,6 +704,23 @@ impl Default for TraceCollector {
 	}
 }
 
+/// The exploration events that the instrumentation settings of a trace ask
+/// FDR exploration to record. [`TraceCollector::exploration_asks`] copies
+/// these three flags out of the settings.
+#[cfg(all(feature = "instrument", feature = "testing-fdr"))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ExplorationAsks {
+	/// Whether each visited state records the observable events it offers, as
+	/// [`TbInstrumentationConfig::sample_enabled_sets`] asks.
+	pub(crate) enabled_sets: bool,
+	/// Whether each visited stable or accepting state records its refusal set,
+	/// as [`TbInstrumentationConfig::sample_refusals`] asks.
+	pub(crate) refusals: bool,
+	/// Whether each state where a seed diverged records the run of the
+	/// divergence, as [`TbInstrumentationConfig::divergence_heuristics`] asks.
+	pub(crate) divergences: bool,
+}
+
 impl TraceCollector {
 	/// Creates an empty trace collector with the default config.
 	pub fn new() -> Self {
@@ -627,6 +736,38 @@ impl TraceCollector {
 	#[cfg(feature = "instrument")]
 	fn with_config(config: TbInstrumentationConfig, sink: Option<Arc<dyn EventSink>>) -> Self {
 		Self { state: Arc::new(TraceState::with_config(config, sink)) }
+	}
+
+	/// The exploration events that the instrumentation settings of this
+	/// collector ask for.
+	#[cfg(all(feature = "instrument", feature = "testing-fdr"))]
+	pub(crate) fn exploration_asks(&self) -> ExplorationAsks {
+		let settings = &self.state.config;
+		ExplorationAsks {
+			enabled_sets: settings.sample_enabled_sets,
+			refusals: settings.sample_refusals,
+			divergences: settings.divergence_heuristics,
+		}
+	}
+
+	/// A collector with a state and a default sink of its own, under the
+	/// instrumentation settings and the clock of this one.
+	#[cfg(all(feature = "instrument", feature = "testing-fdr"))]
+	pub(crate) fn sibling(&self) -> Self {
+		let sibling = Self::with_config(self.state.config, None);
+		let clock = self.state.clock.clock();
+		if let Some(clock) = clock {
+			sibling.state.clock.adopt(clock);
+		}
+
+		sibling
+	}
+
+	/// A collector with a state of its own, which a build without
+	/// `instrument` gives the default settings.
+	#[cfg(all(not(feature = "instrument"), feature = "testing-fdr"))]
+	pub(crate) fn sibling(&self) -> Self {
+		Self::default()
 	}
 
 	/// Configures the log backend of this trace collector.
@@ -759,7 +900,7 @@ impl TraceCollector {
 	}
 
 	/// Records an event with no tags or value, and returns an
-	/// [`EventBuilder`] for optional chaining.
+	/// [`EventBuilder`] that chains the optional calls.
 	///
 	/// # Errors
 	///
@@ -775,7 +916,7 @@ impl TraceCollector {
 	}
 
 	/// Records an event with explicit tags and an optional value, and returns
-	/// an [`EventBuilder`] for optional chaining.
+	/// an [`EventBuilder`] that chains the optional calls.
 	///
 	/// # Errors
 	///
@@ -858,6 +999,16 @@ impl TraceCollector {
 		duration_ns: Option<u64>,
 		timestamp_ns: Option<u64>,
 	) {
+		// The sink owns retention: events dropped by a bounded sink still
+		// consume a sequence number, so gaps in `seq` reveal where truncation
+		// occurred. This method asks the sink before it builds the event, so an
+		// event that the sink drops costs no allocation.
+		let seq = self.next_seq();
+		let sink = &self.state.sink.0;
+		if !sink.retains() {
+			return;
+		}
+
 		let cfg = self.state.config;
 
 		let payload_hash = if cfg.enable_payloads {
@@ -866,11 +1017,8 @@ impl TraceCollector {
 			None
 		};
 
-		// The sink owns retention: events dropped by a bounded sink still
-		// consume a sequence number, so gaps in `seq` reveal where truncation
-		// occurred.
-		self.state.sink.0.emit(TbEvent {
-			seq: self.next_seq(),
+		sink.emit(TbEvent {
+			seq,
 			urn,
 			label: label.map(|l| l.to_string()),
 			payload_hash,
@@ -904,9 +1052,8 @@ impl TraceCollector {
 	}
 
 	/// Dual-writes a production control-plane event. The URN goes into the
-	/// instrument log, and the same URN becomes the assertion label for spec
-	/// assertions and CSP alphabets when the testing layer observes the
-	/// trace.
+	/// instrument log, and under the `testing` feature the same URN becomes
+	/// the assertion label for spec assertions and CSP alphabets.
 	///
 	/// # Errors
 	///
@@ -992,6 +1139,32 @@ impl TraceCollector {
 		self.emit_event_with_value_and_evidence(event, label, value, None)
 	}
 
+	/// Dual-writes `event`, an internal event, when the config of this trace
+	/// sets [`enable_internal_detail`].
+	///
+	/// This method is the one reader of the flag. With the flag off it returns
+	/// at its first branch, before any allocation, so an emit site costs that
+	/// branch alone. With the flag on, the event carries its label and the
+	/// trace clock stamp, as [`Self::emit_event_with_evidence`] writes it.
+	///
+	/// # Errors
+	///
+	/// - The injected error, when the runtime fault model injects a fault at `event`.
+	/// - [`crate::TightBeamError::LockPoisoned`] -- the fault-state lock is poisoned.
+	///
+	/// [`enable_internal_detail`]: TbInstrumentationConfig::enable_internal_detail
+	// As on `InternalEvent`, a build without `colony` leaves out some callers.
+	#[cfg(feature = "instrument")]
+	#[cfg_attr(not(feature = "colony"), allow(dead_code))]
+	#[inline]
+	pub(crate) fn emit_internal_event(&self, event: InternalEvent) -> Result<(), crate::TightBeamError> {
+		if !self.state.config.enable_internal_detail {
+			return Ok(());
+		}
+
+		self.emit_event_with_evidence(event.urn(), event.label(), None)
+	}
+
 	/// Dual-writes a production control-plane event that carries a
 	/// spec-assertable value and evidence. The value reaches the assertion
 	/// for `equals!` checks. The label records why, and the payload records
@@ -1039,8 +1212,8 @@ impl TraceCollector {
 	/// Emits an event stamped with a point-in-time instant relative to the
 	/// trace clock origin, such as a deadline start or end marker.
 	///
-	/// Durations and timestamps are distinct `TbEvent` fields. A duration is
-	/// a span length, and a timestamp is when the event occurred.
+	/// Durations and timestamps are distinct fields of [`TbEvent`]. A duration
+	/// is a span length, and a timestamp is when the event occurred.
 	#[cfg(feature = "instrument")]
 	pub fn emit_with_timestamp(&self, event_urn: Urn<'static>, label: impl AsRef<str>, timestamp: Duration) {
 		self.emit_internal(event_urn, Some(label.as_ref()), None, None, Some(timestamp.as_nanos() as u64));
@@ -1141,6 +1314,10 @@ pub struct ConsumedTrace {
 	/// The instrumentation events the run emitted.
 	#[cfg(feature = "instrument")]
 	pub instrument_events: Vec<TbEvent>,
+	/// Whether the sink of a collector that this trace drained dropped events,
+	/// so [`Self::instrument_events`] holds a truncated record.
+	#[cfg(feature = "instrument")]
+	pub overflowed: bool,
 	/// The gate's decision, when the run passed through a gate.
 	#[cfg(feature = "policy")]
 	pub gate_decision: Option<TransitStatus>,
@@ -1156,17 +1333,40 @@ impl ConsumedTrace {
 			response: None,
 			#[cfg(feature = "instrument")]
 			instrument_events: Vec::new(),
+			#[cfg(feature = "instrument")]
+			overflowed: false,
 			#[cfg(feature = "policy")]
 			gate_decision: None,
 		}
 	}
 
 	/// Moves the collector's assertions and events into this trace.
+	///
+	/// The overflow latch of the collector's sink comes along, so a trace that
+	/// drained a truncated record says so in [`Self::overflowed`].
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::instrumentation::{events, TbInstrumentationConfig};
+	/// use tightbeam::trace::{ConsumedTrace, TraceCollector, TraceConfig};
+	///
+	/// let config = TbInstrumentationConfig { max_events: 1, ..Default::default() };
+	/// let collector = TraceCollector::from(TraceConfig::with_instrumentation(config));
+	/// collector.emit(events::GATE_ACCEPT, "Ok");
+	/// collector.emit(events::GATE_ACCEPT, "Ok");
+	///
+	/// let mut consumed = ConsumedTrace::new();
+	/// consumed.populate_from_collector(&collector);
+	///
+	/// assert!(consumed.overflowed);
+	/// ```
 	pub fn populate_from_collector(&mut self, collector: &TraceCollector) {
 		self.assertions.extend(collector.drain_assertions());
 		#[cfg(feature = "instrument")]
 		{
 			self.instrument_events.extend(collector.drain_events());
+			self.overflowed |= collector.overflowed();
 		}
 	}
 
@@ -1403,7 +1603,7 @@ mod tests {
 	#[cfg(feature = "instrument")]
 	mod overflow {
 		use crate::instrumentation::{events, TbInstrumentationConfig};
-		use crate::trace::{TraceCollector, TraceConfig};
+		use crate::trace::{ConsumedTrace, TraceCollector, TraceConfig};
 
 		fn collector_with_max_events(max_events: u32) -> TraceCollector {
 			let config = TbInstrumentationConfig { max_events, ..Default::default() };
@@ -1431,6 +1631,37 @@ mod tests {
 
 			assert!(collector.overflowed());
 			assert_eq!(collector.drain_events().len(), 2);
+		}
+
+		/// An event that a full sink drops still takes its sequence number, so
+		/// the gap marks where the sink cut the record.
+		#[test]
+		fn a_dropped_event_still_takes_its_sequence_number() {
+			let collector = collector_with_max_events(1);
+			collector.emit(events::START, "kept");
+			collector.emit(events::END, "dropped");
+			let before = collector.drain_events();
+			collector.emit(events::END, "after the drain");
+
+			let after = collector.drain_events();
+			let seqs = [before, after].map(|kept| kept.iter().map(|event| event.seq).collect::<Vec<u32>>());
+			assert_eq!(seqs, [vec![0], vec![2]]);
+		}
+
+		/// A consumed trace carries the overflow latch of the collector it
+		/// drained, so a truncated record says so.
+		#[test]
+		fn a_consumed_trace_carries_the_overflow_latch_of_its_collector() {
+			let latched = [1, 2].map(|max_events| {
+				let collector = collector_with_max_events(max_events);
+				collector.emit(events::START, "first");
+				collector.emit(events::END, "second");
+
+				let mut consumed = ConsumedTrace::new();
+				consumed.populate_from_collector(&collector);
+				consumed.overflowed
+			});
+			assert_eq!(latched, [true, false]);
 		}
 	}
 
@@ -1619,7 +1850,7 @@ mod tests {
 			Ok(())
 		}
 
-		/// Each origin a collector adopts is recorded once, before the first
+		/// A collector records each origin it adopts once, before the first
 		/// event that counts from it.
 		#[test]
 		fn each_adopted_origin_is_recorded_before_its_events() -> Result<(), TightBeamError> {
@@ -1637,9 +1868,9 @@ mod tests {
 			Ok(())
 		}
 
-		/// An event and the record of its origin land while the trace clock is
-		/// held, so an adoption on another handle lands before the record or
-		/// after the event.
+		/// An event and the record of its origin land under one read guard of
+		/// the trace clock, so an adoption on another handle lands before the
+		/// record or after the event.
 		#[test]
 		fn an_event_and_its_origin_record_land_before_an_adoption() -> Result<(), TightBeamError> {
 			let probe = Arc::new(AdoptionProbe::default());
@@ -1673,6 +1904,63 @@ mod tests {
 			let evidence: Vec<Option<[u8; 32]>> = recorded.iter().map(|event| event.payload_hash).collect();
 			assert_eq!(evidence, [Some(expected)]);
 			Ok(())
+		}
+	}
+
+	/// The flag of the trace config gates each internal event.
+	#[cfg(feature = "instrument")]
+	mod internal {
+		use super::super::InternalEvent;
+		use crate::instrumentation::events;
+		use crate::testing::fixtures::TestTrace;
+		use crate::urn::Urn;
+		use crate::TightBeamError;
+
+		/// The URN and the label of each event that one handler entry records
+		/// under a trace whose config sets `enable_internal_detail` to
+		/// `detail`.
+		fn recorded_entries(detail: bool) -> Result<Vec<(Urn<'static>, Option<String>)>, TightBeamError> {
+			let trace = TestTrace::with_detail(detail);
+			trace.emit_internal_event(InternalEvent::HandlerEnter)?;
+
+			let recorded = trace.drain_events();
+			let entries = recorded.into_iter().filter(|event| event.urn == events::HANDLER_ENTER);
+			Ok(entries.map(|event| (event.urn, event.label)).collect())
+		}
+
+		/// An internal event records its URN and its label when the trace
+		/// config sets the detail flag, and nothing when it clears the flag.
+		#[test]
+		fn an_internal_event_records_under_the_detail_flag_alone() -> Result<(), TightBeamError> {
+			let entry = (events::HANDLER_ENTER, Some("handler_enter".to_owned()));
+			assert_eq!([recorded_entries(true)?, recorded_entries(false)?], [vec![entry], vec![]]);
+			Ok(())
+		}
+
+		/// The URN of each internal event names that event, and the URN of an
+		/// event outside the set names none.
+		#[cfg(feature = "testing-fdr")]
+		#[test]
+		fn the_urn_of_an_event_names_it_in_the_internal_set() {
+			let urns = [
+				events::HANDLER_ENTER,
+				events::HANDLER_EXIT,
+				events::CRYPTO_STEP,
+				events::COMPRESS_STEP,
+				events::ROUTE_STEP,
+				events::POLICY_EVAL,
+				events::GATE_ACCEPT,
+			];
+			let expected = [
+				Some(InternalEvent::HandlerEnter),
+				Some(InternalEvent::HandlerExit),
+				Some(InternalEvent::CryptoStep),
+				Some(InternalEvent::CompressStep),
+				Some(InternalEvent::RouteStep),
+				Some(InternalEvent::PolicyEval),
+				None,
+			];
+			assert_eq!(urns.map(|urn| InternalEvent::of(&urn)), expected);
 		}
 	}
 }
