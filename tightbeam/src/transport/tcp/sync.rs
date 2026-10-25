@@ -18,7 +18,7 @@ use crate::crypto::aead::{RecvCipher, SendCipher};
 use crate::der::Encode;
 use crate::transport::error::TransportFailure;
 use crate::transport::framing::{FrameHeader, HeaderPrefix, LengthForm};
-use crate::transport::handshake::BoxedServerHandshake;
+use crate::transport::handshake::{BoxedServerHandshake, HandshakeProvider};
 use crate::transport::state::{EncryptedProtocolState, ReadPolicy};
 use crate::transport::tcp::{TcpListenerTrait, TightBeamSocketAddr};
 use crate::transport::{
@@ -54,8 +54,8 @@ impl<S: ProtocolStream, P: CryptoProvider> TcpTransport<S, P>
 where
 	TransportError: From<S::Error>,
 {
-	/// Re-arm the stream's per-recv timeout with the budget `policy` leaves at
-	/// this instant, and fail with `DeadlineExceeded` once the budget is
+	/// Re-arms the stream's per-recv timeout with the budget `policy` leaves at
+	/// this instant, and fails with `DeadlineExceeded` once the budget is
 	/// spent.
 	fn arm_read_deadline(&mut self, policy: &ReadPolicy) -> TransportResult<()> {
 		let now = self.clock.monotonic();
@@ -68,7 +68,9 @@ where
 	}
 }
 
-impl<S: ProtocolStream> MessageIO for TcpTransport<S>
+/// This impl covers every provider `P`, so a call names `P` where no other
+/// type names it, as [`TcpListener`] shows under `# Provider`.
+impl<S: ProtocolStream, P: CryptoProvider + Send + Sync + 'static> MessageIO for TcpTransport<S, P>
 where
 	TransportError: From<S::Error>,
 {
@@ -126,10 +128,9 @@ where
 			let header = FrameHeader::parse(prefix, length_octets)?.admit(policy.cap())?;
 			let content_length = header.content_len();
 
-			// With a deadline, the read runs in slices and re-checks the
-			// budget between them, so a peer that drips bytes cannot stretch
-			// it through per-recv timeout resets. Without a deadline, a
-			// single read suffices.
+			// With a deadline, the read runs in slices, so a peer that drips
+			// bytes cannot stretch the budget through per-recv timeout resets.
+			// Without a deadline, one read suffices.
 			let mut content = vec![0u8; content_length];
 			#[cfg(feature = "std")]
 			{
@@ -182,7 +183,9 @@ where
 	}
 }
 
-impl<S: ProtocolStream> MessageCollector for TcpTransport<S>
+/// This impl covers every provider `P`, so a call names `P` where no other
+/// type names it, as [`TcpListener`] shows under `# Provider`.
+impl<S: ProtocolStream, P: HandshakeProvider> MessageCollector for TcpTransport<S, P>
 where
 	TransportError: From<S::Error>,
 {
@@ -207,7 +210,9 @@ where
 	}
 }
 
-impl<S: ProtocolStream> MessageEmitter for TcpTransport<S>
+/// This impl covers every provider `P`, so a call names `P` where no other
+/// type names it, as [`TcpListener`] shows under `# Provider`.
+impl<S: ProtocolStream, P: HandshakeProvider> MessageEmitter for TcpTransport<S, P>
 where
 	TransportError: From<S::Error>,
 {
@@ -222,7 +227,7 @@ where
 		&self.emitter_gate
 	}
 
-	/// Run the protocol-specific send and receive with the handshake and the
+	/// Runs the protocol-specific send and receive with the handshake and the
 	/// timeout.
 	async fn perform_send_receive(
 		&mut self,
@@ -256,15 +261,54 @@ where
 	}
 }
 
-// The `EncryptedMessageIO` impl uses the default operation methods.
-impl<S: ProtocolStream> EncryptedMessageIO for TcpTransport<S> where TransportError: From<S::Error> {}
+/// This impl covers every provider `P`, so a call names `P` where no other
+/// type names it, as [`TcpListener`] shows under `# Provider`. It runs the
+/// default operation methods.
+impl<S: ProtocolStream, P: CryptoProvider + Send + Sync + 'static> EncryptedMessageIO for TcpTransport<S, P> where
+	TransportError: From<S::Error>
+{
+}
 
 /// A TCP server over the abstract listener trait. It builds every accepted
 /// transport from one [`EndpointConfig`].
+///
+/// # Provider
+///
+/// In a type position, `TcpListener<L>` names the house provider,
+/// [`DefaultCryptoProvider`]. In an expression, the compiler infers the
+/// provider `P` from the calls, so a call names `P` where no other type names
+/// it, in one of these shapes:
+///
+/// - `TcpListener::<_, DefaultCryptoProvider>`, for a listener that a `server!` block serves, and
+/// - `EndpointConfig::<DefaultCryptoProvider>::cleartext()`, for a transport built over a stream.
+///
+/// # Examples
+///
+/// ```
+/// use std::net::TcpListener as NetTcpListener;
+///
+/// use tightbeam::crypto::profiles::DefaultCryptoProvider;
+/// use tightbeam::transport::tcp::sync::TcpListener;
+///
+/// let bound = NetTcpListener::bind("127.0.0.1:0")?;
+/// // No other type of this call names the provider, so the call names it.
+/// let _listener = TcpListener::<_, DefaultCryptoProvider>::from_listener_cleartext(bound);
+/// # Ok::<(), Box<dyn core::error::Error>>(())
+/// ```
 pub struct TcpListener<L: TcpListenerTrait, P: CryptoProvider = DefaultCryptoProvider> {
 	listener: L,
 	/// The configuration this listener builds every accepted transport from.
 	config: EndpointConfig<P>,
+}
+
+#[cfg(all(feature = "std", feature = "tcp"))]
+impl TcpListenerTrait for NetTcpListener {
+	type Stream = NetTcpStream;
+	type Error = IoError;
+
+	fn accept(&self) -> Result<(NetTcpStream, SocketAddr), IoError> {
+		NetTcpListener::accept(self)
+	}
 }
 
 #[cfg(feature = "std")]
@@ -303,9 +347,8 @@ impl<L: TcpListenerTrait, P: CryptoProvider + Send + Sync + 'static> TcpListener
 where
 	TransportError: From<L::Error>,
 	TransportError: From<<L::Stream as ProtocolStream>::Error>,
-	L::Stream: ProtocolStream,
 {
-	/// Serve `listener` in the clear.
+	/// Serves `listener` in the clear.
 	///
 	/// Accepted transports carry no confidentiality, integrity, or peer
 	/// authentication. See [`EndpointConfig::cleartext`].
@@ -315,7 +358,37 @@ where
 		Self { listener, config }
 	}
 
-	/// Accept one connection as a transport built from this listener's
+	/// Serves `listener` under the transport encryption `config`, so each
+	/// accepted transport runs the server handshake of the provider `P`.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError`] -- the errors of [`DialableEncryption::new`] on the identity of `config`.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::net::TcpListener as NetTcpListener;
+	///
+	/// use tightbeam::crypto::profiles::DefaultCryptoProvider;
+	/// use tightbeam::testing::{TestIdentity, TestKey};
+	/// use tightbeam::transport::tcp::sync::TcpListener;
+	/// use tightbeam::transport::TransportEncryptionConfig;
+	///
+	/// let identity = TestIdentity::of(&TestKey::insecure_fixed_signing());
+	/// let config = TransportEncryptionConfig::<DefaultCryptoProvider>::new(identity);
+	/// let bound = NetTcpListener::bind("127.0.0.1:0")?;
+	/// let _listener = TcpListener::from_listener_with(bound, config)?;
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	///
+	/// [`DialableEncryption::new`]: crate::transport::state::DialableEncryption::new
+	pub fn from_listener_with(listener: L, config: TransportEncryptionConfig<P>) -> TransportResult<Self> {
+		let config = EndpointConfig::try_from(config)?;
+		Ok(Self { listener, config })
+	}
+
+	/// Accepts one connection as a transport built from this listener's
 	/// configuration.
 	pub fn accept(&self) -> TransportResult<TcpTransport<L::Stream, P>> {
 		let (stream, _) = self.listener.accept()?;
@@ -334,9 +407,9 @@ impl<P: CryptoProvider + Send + Sync + 'static> EncryptedProtocol for TcpListene
 	) -> Result<(Self::Listener, <Self as Protocol>::Address), <Self as Protocol>::Error> {
 		let listener = NetTcpListener::bind(addr.0)?;
 		let bound_addr = listener.local_addr()?;
-		let config = EndpointConfig::try_from(config).map_err(std::io::Error::other)?;
+		let listener = Self::from_listener_with(listener, config).map_err(std::io::Error::other)?;
 
-		Ok((TcpListener { listener, config }, TightBeamSocketAddr(bound_addr)))
+		Ok((listener, TightBeamSocketAddr(bound_addr)))
 	}
 }
 
@@ -479,8 +552,8 @@ mod tests {
 			}
 		});
 
-		// A panicked server thread surfaces as an I/O error rather than a
-		// re-panic. The closure itself only fails through `?`.
+		// A panicked server thread surfaces as an I/O error in place of a
+		// second panic. The closure itself only fails through `?`.
 		let (result, elapsed) = server_handle
 			.join()
 			.map_err(|_| TransportError::IoError(IoError::from(ErrorKind::Other)))??;

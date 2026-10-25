@@ -5,8 +5,9 @@ use std::sync::Arc;
 
 use crate::colony::cluster::runtime::bounds::GatewayRuntimeCtx;
 use crate::colony::cluster::DialTarget;
-use crate::colony::common::{RegisterHiveRequest, ReplyForm, ServletAddressUpdate};
-use crate::colony::hive::{RegisterHiveResponse, ServletAddressUpdateResponse};
+use crate::colony::protocol::{
+	RegisterHiveRequest, RegisterHiveResponse, ReplyForm, ServletAddressUpdate, ServletAddressUpdateResponse,
+};
 use crate::crypto::sign::VerifiedSignature;
 use crate::instrumentation::events::{
 	CLUSTER_HIVE_REGISTERED, CLUSTER_REGISTER_REFUSED, CLUSTER_UPDATE_ACCEPTED, CLUSTER_UPDATE_REFUSED,
@@ -38,22 +39,21 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 
 		// The heartbeat dials the control address, so a hive whose address the
 		// protocol cannot parse would register, get no heartbeat, and leave by
-		// silent eviction. The check runs before the membership step installs
-		// it.
+		// silent eviction. This check refuses it before the membership install.
 		let hive_addr: Arc<[u8]> = request.hive_addr.clone().into();
 		if DialTarget::of_registered(&hive_addr).protocol_address::<P::Address>().is_err() {
 			return self.refuse_register(&frame, TransitStatus::PermissionDenied);
 		}
 
 		// A hive registered with no signer is claimable by the next signer
-		// that names it, so a frame that names none refuses here rather than
-		// install an unbound entry (CWE-639).
+		// that names it, so the gateway refuses a frame that names none rather
+		// than install an unbound entry (CWE-639).
 		let Some(signer) = frame.nonrepudiation().map(|info| Arc::new(info.sid.clone())) else {
 			return self.refuse_register(&frame, TransitStatus::PermissionDenied);
 		};
 
-		// The slate constructor owns the locator rule, so a servlet that
-		// advertises one address under another's identity refuses here.
+		// The slate constructor owns the locator rule, so the gateway refuses a
+		// servlet that advertises one address under another's identity.
 		let Ok(slate) = self.config.servlet_slate(&request.servlet_addresses, &hive_addr) else {
 			return self.refuse_register(&frame, TransitStatus::PermissionDenied);
 		};
@@ -95,14 +95,14 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 		};
 
 		// A hive registered with no signer is claimable by the next signer
-		// that names it, so an unsigned update refuses here rather than
-		// reach the bind check (CWE-639).
+		// that names it, so the gateway refuses an unsigned update here rather
+		// than let it reach the bind check (CWE-639).
 		let Some(signer) = frame.nonrepudiation().map(|info| &info.sid) else {
 			return self.refuse_update_release(&frame, &signature, TransitStatus::PermissionDenied);
 		};
 
 		// The signer bind and the route write are one membership step, so
-		// a retirement cannot land between them (CWE-362).
+		// a retirement lands before or after both (CWE-362).
 		match self.membership().update_addresses(signer, added, &removed) {
 			Ok(()) => {
 				self.trace.event(CLUSTER_UPDATE_ACCEPTED)?;

@@ -24,9 +24,9 @@ use tightbeam::{
 	cluster,
 	colony::{
 		cluster::{Cluster, ClusterConfig, ClusterTlsConfig},
-		common::ColonyNamespace,
 		hive::{Hive, HiveConfig, HiveTlsConfig},
 		servlet::ServletConfig,
+		urn::ColonyNamespace,
 		SubmitWork,
 	},
 	compose,
@@ -116,7 +116,10 @@ fn laser_certs() -> GatewayCerts {
 	GatewayCerts::generate("CN=Laser Gateway")
 }
 
-/// The restart scenario's certificates and the clock its hive beats on.
+/// The restart scenario's certificates and the clock its hive beats on. The
+/// hive and both gateways share the clock, and only the test moves it, so
+/// the replacement routes only after the test lets one interval pass, and the
+/// frames the beat signs stay fresh at the gateway.
 struct LaserRestartCtx {
 	certs: Arc<GatewayCerts>,
 	clock: Arc<ManualClock>,
@@ -190,7 +193,7 @@ async fn start_laser_hive(
 	Ok(hive)
 }
 
-/// Submits one beam work request through a gateway via
+/// Submits one beam work request through a gateway with
 /// [`SubmitWork::submit_work_to`] and returns the servlet's response frame.
 ///
 /// The typed request travels as the client's complete signed frame, so the
@@ -232,8 +235,9 @@ fn refusal_status(outcome: Result<Frame, TightBeamError>) -> Result<TransitStatu
 /// [`REGISTRATION_ROUNDS`] pass.
 ///
 /// The scenario runtime runs on one thread, so each yield lets the hive's
-/// beat and the gateway's handler make progress without a wait on the
-/// operating system's clock. Branching lives here, not in the scenarios.
+/// beat and the gateway's handler make progress, and the wait counts
+/// scheduler rounds in place of the operating system's clock. Branching
+/// lives here, not in the scenarios.
 async fn wait_for_hives(cluster: &LaserCluster, hives: usize) -> Result<(), TightBeamError> {
 	for _ in 0..REGISTRATION_ROUNDS {
 		if cluster.hive_count()? >= hives {
@@ -339,10 +343,9 @@ tb_assert_spec! {
 	}
 }
 
-// A laser tightbeam reaches the cluster gateway and routes to a hive servlet.
-//
-// - The path runs from the client through the cluster and hive control to the servlet.
-// - Every link uses the in-memory laser protocol, encrypted and multiplexed.
+// A laser tightbeam runs from the client through the cluster gateway and the
+// hive control plane to a hive servlet, and every link runs the in-memory
+// laser protocol, encrypted and multiplexed.
 tb_scenario! {
 	name: cluster_routes_work_over_laser_protocol,
 	spec: LaserRoutingSpec,
@@ -390,14 +393,9 @@ tb_assert_spec! {
 	}
 }
 
-// The gateway registry is soft state.
-//
-// - A replacement gateway starts empty on the same stable address.
-// - The hive's anti-entropy beat re-registers within one interval.
-// - Work routes again with no operator, no consensus, and no persistence.
-// - The hive and both gateways share a clock only this test moves, so the
-//   replacement routes only after the test lets one interval pass, and the
-//   frames the beat signs stay fresh at the gateway.
+// The gateway registry is soft state. A replacement gateway starts empty on
+// the same address, the hive's anti-entropy beat re-registers within one
+// interval, and work routes again with no operator, consensus, or persistence.
 tb_scenario! {
 	name: cluster_recovers_hive_after_gateway_restart,
 	spec: LaserGatewayRestartSpec,
@@ -433,7 +431,7 @@ tb_scenario! {
 			};
 
 			// An empty registry refuses the type as unavailable. Any other
-			// failure fails the scenario instead of passing for that refusal.
+			// failure fails the scenario rather than pass for that refusal.
 			let unrouted = emit_beam_work(&ctx.certs, replacement.addr()).await;
 			let refused = refusal_status(unrouted)?;
 			trace.event_with(LASER_UNROUTED_BEFORE_BEAT, &[], refused)?;

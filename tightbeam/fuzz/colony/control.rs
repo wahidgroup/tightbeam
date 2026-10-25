@@ -1,11 +1,12 @@
-//! Signed control-plane helpers for one-shot peer advertisement.
+//! This module signs control-plane requests and sends one-shot peer
+//! advertisements.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use tightbeam::builder::TypeBuilder;
-use tightbeam::colony::cluster::{Cluster, ClusterRequest};
-use tightbeam::colony::common::{PeerAdvertisement, PeerAdvertisementResponse};
+use tightbeam::colony::cluster::Cluster;
+use tightbeam::colony::protocol::{ClusterRequest, PeerAdvertisement, PeerAdvertisementResponse};
 use tightbeam::crypto::key::Secp256k1KeyProvider;
 use tightbeam::crypto::sign::ecdsa::Secp256k1SigningKey;
 use tightbeam::crypto::sign::SigningIdentity;
@@ -31,7 +32,7 @@ pub(crate) const CONTROL_ORDER_BASE: u64 = 1_700_000_000_000;
 
 const CLIENT_IO_TIMEOUT: Duration = Duration::from_millis(2000);
 
-/// Sign a cluster control request with a deterministic order.
+/// Signs a cluster control request with a deterministic order.
 pub(crate) async fn signed_control_frame(
 	key: &Secp256k1SigningKey,
 	id: impl AsRef<[u8]>,
@@ -71,8 +72,7 @@ async fn connect_as(
 /// Sends one signed advertisement and classifies the answer.
 ///
 /// - The dial validates the receiver's server certificate with the receiver's own trust.
-/// - A connect failure classifies as [`AuthzClass::InfraFail`], which matches
-///   the work-path absorption rule.
+/// - A connect failure classifies as [`AuthzClass::InfraFail`], which matches the work-path absorption rule.
 /// - The caller emits the `PEER_AD_OK` and `PEER_AD_DENIED` outcome events
 ///   through `record_authz_oracle`, so every advertise path emits them exactly
 ///   once beside the shadow comparison.
@@ -120,7 +120,7 @@ async fn emit_advertise(
 	}
 }
 
-/// Emit a signed advertisement of `types` from `advertiser` into `receiver`.
+/// Emits a signed advertisement of `types` from `advertiser` into `receiver`.
 pub(crate) async fn advertise_peer_types(
 	trace: &TraceCollector,
 	advertiser: &OrgNode,
@@ -133,7 +133,8 @@ pub(crate) async fn advertise_peer_types(
 	emit_advertise(trace, advertiser, receiver, gateway_addr, types, order).await
 }
 
-/// Advertise a caller-chosen dial address (dead decoy or live peer).
+/// Advertises a dial address that the caller chooses, a dead decoy or a live
+/// peer.
 pub(crate) async fn advertise_peer_at(
 	trace: &TraceCollector,
 	signer: &OrgNode,

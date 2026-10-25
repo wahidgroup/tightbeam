@@ -32,11 +32,12 @@ use crate::colony::cluster::{
 	Admission, AdmittedGossip, FreshnessWindow, GossipDigest, PeerCaps, PeerHint, RouteKind, VerifiedRumor, WantList,
 };
 use crate::colony::cluster::{AdmittedDial, ClusterConfig, ClusterError, PeerAddress, ServletRegistry};
-use crate::colony::common::IssuedAt;
-use crate::colony::common::{
+use crate::colony::protocol::IssuedAt;
+use crate::colony::protocol::ReplyForm;
+use crate::colony::protocol::{
 	ClusterRequest, GossipReconciliation, GossipResponse, GossipRumor, GossipWant, PeerGossip,
 };
-use crate::colony::common::{ReplyForm, TaskGroup};
+use crate::colony::TaskGroup;
 use crate::constants::{MAX_ADVERTISED_TYPES, MAX_GOSSIP_LOG, MAX_GOSSIP_TTL, MAX_PEX_SAMPLE};
 use crate::decode;
 use crate::encode;
@@ -696,10 +697,7 @@ impl<P: ColonyDialProtocol> FloodBeat<P> {
 		};
 		let Some(mut client) = answered else {
 			// An answer from outside the flood is definitive, so a learned
-			// address leaves both learned tables at once. A configured anchor
-			// keeps its slot, so each beat still advertises to it. The routes
-			// stay, because that gateway may serve work by direct peering and
-			// each forward is bound to the gateway its route names.
+			// address leaves both learned tables at once.
 			self.expel(peer)?;
 
 			return Ok(Round::Settled);
@@ -756,6 +754,10 @@ impl<P: ColonyDialProtocol> FloodBeat<P> {
 	/// table, and records it as [`CLUSTER_PEER_EXPELLED`] with the address as
 	/// its payload.
 	///
+	/// - The routes of `peer` stay, because that gateway may serve work by
+	///   direct peering, and each forward binds to its route's gateway.
+	/// - A configured anchor keeps its slot, so each beat still advertises to it.
+	///
 	/// A poisoned table is this gateway's fault, so it ends the caller's loop,
 	/// and every peer's score stands.
 	///
@@ -785,10 +787,9 @@ impl<P: ColonyDialProtocol> FloodBeat<P> {
 		now: UnixMillis,
 	) -> Result<(), ClusterError> {
 		let round: Result<(), ClusterError> = async {
-			// A pooled connection keeps its handshake certificate after the
-			// peer dies, so promotion waits for the reply. The membership
-			// proof alone would reset the failure count every beat and hold a
-			// dead peer.
+			// A pooled connection keeps a dead peer's handshake certificate, so
+			// promotion waits for the reply. Promotion on the membership proof
+			// alone would reset the failure count each beat and hold the peer.
 			let answer = client.peer_certificate();
 			let peer_id = answer.and_then(|answer| self.config.peer_identity(answer));
 			if self.config.peer.table.promote(peer, peer_id.as_deref(), now)? {
@@ -801,8 +802,8 @@ impl<P: ColonyDialProtocol> FloodBeat<P> {
 			let GossipWant { want, pex } = reply;
 
 			// PEX entries are unverified hints: the allowlist gates them, the
-			// capped new table holds them, and a later feeler probe that proves
-			// membership is the only path to a dial target (CWE-345).
+			// capped `new` table holds them, and a later feeler probe that
+			// proves membership is the only path to a dial target (CWE-345).
 			let hints = self.config.admissible_pex_hints(pex);
 			self.config.peer.table.learn(hints, now)?;
 
@@ -1120,7 +1121,7 @@ impl<P: ColonyDialProtocol> GossipPipelineCtx<P> {
 		};
 
 		// Drop known duplicates before rate admission so the bucket spends on
-		// new rumors only.
+		// unseen rumors only.
 		let now = self.config.clock.unix();
 		match self.config.gossip.journal.seen(admitted.digest(), now) {
 			Ok(true) => {
@@ -1192,10 +1193,9 @@ impl<P: ColonyDialProtocol> GossipPipelineCtx<P> {
 		match (flood, hop_ttl.checked_sub(1)) {
 			(Some(flood), Some(next_ttl)) if has_targets => {
 				tasks.spawn(async move {
-					// This task is detached, so its outcome has no caller. A
-					// delivery fault is already on the trace, and this task
-					// records a poisoned table here, which is where a reader
-					// looks.
+					// The detached task has no caller. Its reflood traces
+					// unreached hops, and the task records a poisoned table
+					// here, where a reader looks.
 					if let Err(fault) = flood.reflood(rumor, next_ttl).await {
 						fault.record(&flood.trace);
 					}
@@ -1274,7 +1274,7 @@ impl<P: ColonyDialProtocol> GossipPipelineCtx<P> {
 		});
 
 		// The learned origin is also a discovery hint, as a direct
-		// advertiser is. It waits in the capped new table until this
+		// advertiser is. It waits in the capped `new` table until this
 		// gateway's own probe proves it a flood member.
 		let hint = admitted.discovery_hint();
 		let learned_at = self.config.clock.unix();
@@ -1361,8 +1361,8 @@ impl<P: ColonyDialProtocol> GossipPipelineCtx<P> {
 	}
 }
 
-// A relay score reads the registry and the trace alone, so it needs none of
-// the dial bounds the pipeline's own impl carries.
+// A relay score reads the registry and the trace alone, so this impl bounds
+// `P` by `Protocol` and leaves the dial bounds to the pipeline's own impl.
 impl<P: Protocol> GossipPipelineCtx<P> {
 	/// Scores a relay peer that sent invalid input.
 	///
@@ -1415,7 +1415,7 @@ impl<P: Protocol> GossipPipelineCtx<P> {
 /// 1. [`Self::take_due`] claims a publish slot and blocks re-entry while the task runs.
 /// 2. The task that holds the claim creates and refloods the rumor.
 /// 3. [`Self::commit`] records the baseline after a rumor went out.
-/// 4. [`Self::abort`] releases a failed claim with the old baseline intact, so the next beat retries.
+/// 4. [`Self::abort`] releases a failed claim with the committed baseline intact, so the next beat retries.
 ///
 /// [`DEFAULT_AD_RUMOR_REFRESH_MS`]: crate::constants::DEFAULT_AD_RUMOR_REFRESH_MS
 struct AdPublishState {
@@ -1567,11 +1567,8 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 						None => (slate, None),
 					};
 
-					// One advertisement carries the slate on the direct dials
-					// and in the rumor, so a receiver reads one order for the
-					// beat whichever copy lands first. An advertisement that
-					// fails to build skips this beat's advertisements, and the
-					// next beat builds another.
+					// An advertisement that fails to build skips this beat's
+					// advertisements, and the next beat builds another.
 					let mut advertisement = None;
 					if !targets.is_empty() || publishing.is_some() {
 						let minted = config.mint_ad_frame(gateway_addr.as_ref(), ad_slate).await;
@@ -1632,7 +1629,7 @@ mod tests {
 
 	use super::*;
 	use crate::colony::cluster::{CertificateSpec, Cluster, ClusterGateway, ClusterTlsConfig, PeerConfig};
-	use crate::colony::common::ColonyNamespace;
+	use crate::colony::urn::ColonyNamespace;
 	use crate::crypto::hash::Sha3_256;
 	use crate::crypto::key::Secp256k1KeyProvider;
 	use crate::crypto::policy::Secp256k1Policy;
@@ -2035,10 +2032,9 @@ mod tests {
 		}
 	}
 
-	// A gateway's name in the discovery table is the certificate the member
-	// enrolls for its key, so one gateway that presents a second certificate
-	// of that key at another address takes no second slot under the signer
-	// cap (CWE-770).
+	// The discovery table names a gateway by the certificate the member
+	// enrolls for its key, so a second certificate of that key at another
+	// address takes no second slot under the signer cap (CWE-770).
 	#[tokio::test]
 	async fn a_rotated_certificate_counts_as_the_signer_its_key_enrolls() -> Result<(), TightBeamError> {
 		let rotation = SignerRotation::start().await;

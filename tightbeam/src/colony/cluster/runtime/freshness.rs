@@ -1,4 +1,4 @@
-//! Freshness admission for signed gateway control frames.
+//! The freshness admission of signed gateway control frames.
 //!
 //! - [`FreshnessWindow`] is the one rule for whether a stated instant is
 //!   fresh. The rumor seen window, the control window, the hive's replay
@@ -13,8 +13,8 @@
 use core::time::Duration;
 use std::sync::Arc;
 
-use crate::colony::common::IssuedAt;
 use crate::colony::hive::ReplayGuard;
+use crate::colony::protocol::IssuedAt;
 use crate::crypto::sign::VerifiedSignature;
 use crate::policy::TransitStatus;
 use crate::utils::time::{Clock, UnixMillis};
@@ -71,8 +71,8 @@ impl FreshnessWindow {
 	/// Whether `order`, a stated issue time, lies inside this window of `now`.
 	///
 	/// Both are instants, and the comparison reads the magnitude of their
-	/// difference, so an exchange of the two changes no answer. They therefore
-	/// stay separate parameters rather than one carrier.
+	/// difference, so an exchange of the two changes no answer, and two plain
+	/// parameters carry them.
 	///
 	/// # Examples
 	///

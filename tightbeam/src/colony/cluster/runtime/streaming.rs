@@ -31,7 +31,7 @@ use crate::transport::PooledClient;
 use crate::urn::Urn;
 use crate::{Frame, TightBeamError};
 
-/// The dialing plan a splice follows once a route is chosen.
+/// The dial plan a splice follows once a route is chosen.
 ///
 /// - `choice` names the endpoint to open on and the pheromone key the outcome reinforces or weakens.
 /// - `route` is stamped on that open.
@@ -58,11 +58,11 @@ impl SplicePlan {
 }
 
 impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
-	/// Choose a route for `target` and turn it into a dialing plan.
+	/// Choose a route for `target` and turn it into a dial plan.
 	///
 	/// `budget` is the clamp the stream gate already applied, and a peer
-	/// re-emit spends one hop from it. `exclude` removes one just-failed
-	/// route key so a bounded retry picks the next-best trail.
+	/// re-emit spends one hop from it. `exclude` removes the route key of a
+	/// failed dial, so a bounded retry picks the next-best trail.
 	///
 	/// # Errors
 	///
@@ -88,10 +88,9 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 	}
 
 	/// Plan and dial the splice route, with one bounded retry on a failed
-	/// dial. The failed trail weakens immediately, and the next-best
-	/// trail, excluding the failed route key, gets a single chance.
-	/// A retry at the dial step is safe because the splice has consumed no
-	/// body chunk yet.
+	/// dial. The failed trail weakens immediately, and the next-best trail
+	/// other than the failed route key gets a single chance. A retry at the
+	/// dial step is safe because the splice has consumed no body chunk yet.
 	async fn connect_splice(
 		&self,
 		target: &Urn<'static>,
@@ -141,7 +140,7 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 	/// Splice a streamed request: relay the client body to the route, then
 	/// answer with the route's unary reply.
 	///
-	/// Returns the servlet's reply frame unchanged, since the stream reply is
+	/// Returns the servlet's reply frame unchanged, because the stream reply is
 	/// the servlet's own frame end to end. Unary work, by contrast, wraps its
 	/// reply in a `ClusterWorkResponse` envelope.
 	///
@@ -230,7 +229,7 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::colony::common::ColonyNamespace;
+	use crate::colony::urn::ColonyNamespace;
 
 	fn stream_type() -> Urn<'static> {
 		ColonyNamespace::default()
@@ -238,10 +237,9 @@ mod tests {
 			.expect("test names satisfy the mint grammar")
 	}
 
-	// This test pins the stream-path budget. A missing decrement in
-	// `HopBudget::relayed_route` fails here even when integration
-	// topologies mask it with a clamp. The mux handle tests pin the
-	// route-to-Open stamping.
+	// A missing decrement in `HopBudget::relayed_route` fails here even when
+	// integration topologies mask it with a clamp. The mux handle tests pin
+	// the stamp of the route on the Open.
 	#[test]
 	fn relayed_route_stamps_a_decremented_budget() {
 		let route = HopBudget::for_test(2).relayed_route(&stream_type());

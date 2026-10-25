@@ -13,7 +13,7 @@ use crate::colony::cluster::runtime::freshness::GatewayReplayGuard;
 use crate::colony::cluster::runtime::gossip_tasks::PeerLedgers;
 use crate::colony::cluster::runtime::hop::{HivePlane, PeerPlane};
 use crate::colony::cluster::{ClusterConfig, HiveRegistry, ServletRegistry};
-use crate::colony::common::TaskGroup;
+use crate::colony::TaskGroup;
 use crate::crypto::profiles::DigestProvider;
 use crate::macros::server::AcceptedConnection;
 use crate::trace::TraceCollector;

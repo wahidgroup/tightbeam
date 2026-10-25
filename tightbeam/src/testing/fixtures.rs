@@ -178,7 +178,7 @@ use cert::*;
 mod rumor {
 	pub use crate::builder::{FrameBuilder, TypeBuilder};
 	pub use crate::colony::cluster::VerifiedRumor;
-	pub use crate::colony::common::GossipRumor;
+	pub use crate::colony::protocol::GossipRumor;
 }
 
 #[cfg(feature = "colony")]
@@ -322,8 +322,8 @@ fn test_certificate_with_extensions(signing_key: &SigningKey, extensions: Option
 }
 
 /// Builds a placeholder-signed test certificate with `name` as both the subject
-/// and the issuer, a fixed serial, its key identifier, and caller-chosen
-/// extensions after it.
+/// and the issuer, a fixed serial, its key identifier, the end-entity
+/// `keyUsage`, and caller-chosen extensions after them.
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 fn test_certificate_named(
 	signing_key: &SigningKey,
@@ -1570,9 +1570,9 @@ impl TestCmsServer {
 	}
 
 	/// The pair of this server after its authority issues its signing
-	/// certificate again, to the same subject, for the key whose scalar is
-	/// thirty-two `0x07` octets, beside that certificate. The key-agreement
-	/// certificate stays the one a client pins.
+	/// certificate again to the same subject, beside that certificate. The
+	/// reissued certificate holds the key whose scalar is thirty-two `0x07`
+	/// octets, and the key-agreement certificate stays the one a client pins.
 	pub fn rotated_pair(&self) -> (CmsIdentityPair<DhKemSecp256k1>, Certificate) {
 		let key = SigningKey::from_slice(&[0x07; 32]).expect("seven is a secp256k1 scalar");
 		let subject = self.signing.tbs_certificate.subject.to_owned();

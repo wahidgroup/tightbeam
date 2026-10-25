@@ -19,7 +19,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use super::{ClusterError, DialTarget, NotASocket, PeerAddress, PeerConfig, PeerHint, SharedId};
-use crate::colony::common::PeerGossip;
+use crate::colony::protocol::PeerGossip;
 use crate::Errorizable;
 
 /// A dial address this gateway's dial policy admitted.

@@ -7,9 +7,10 @@ use crate::colony::cluster::runtime::bounds::{ColonyDialProtocol, GatewayRuntime
 use crate::colony::cluster::runtime::hop::{HivePlane, Hop, PeerPlane};
 use crate::colony::cluster::servlet_registry::RoutePlane;
 use crate::colony::cluster::{
-	ClusterConfig, ClusterError, ClusterWorkResponse, DialTarget, HopBudget, RouteKind, ServletEntry, ServletRegistry,
+	ClusterConfig, ClusterError, DialTarget, HopBudget, RouteKind, ServletEntry, ServletRegistry,
 };
-use crate::colony::common::{ClusterRequest, ClusterWorkRequest, ReplyForm, ServletTypeKey};
+use crate::colony::protocol::{ClusterRequest, ClusterWorkRequest, ClusterWorkResponse, ReplyForm};
+use crate::colony::urn::ServletTypeKey;
 use crate::decode;
 use crate::encode;
 use crate::instrumentation::events::{
@@ -186,7 +187,7 @@ impl ForwardOutcome {
 }
 
 impl<P: Protocol> GatewayRuntimeCtx<P> {
-	/// Weaken the trail that failed and answer the caller with `status`.
+	/// Weakens the trail that failed and answers the caller with `status`.
 	fn work_trail_fail(
 		&self,
 		route_key: &Arc<[u8]>,
@@ -199,7 +200,7 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 }
 
 impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
-	/// Forward along one selected route, as the client's frame to a local
+	/// Forwards along one selected route, as the client's frame to a local
 	/// servlet or as a budget-decremented Work envelope to a peer gateway.
 	///
 	/// `frame_cache` holds the frame the admission check already decoded from
@@ -235,8 +236,8 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 				ReplyForm::Plain.reply(frame.metadata().id(), ClusterWorkResponse::ok(response_payload))
 			}
 			ForwardOutcome::Peer(peer_response) => {
-				// Relay the peer's own envelope so the client sees one
-				// envelope end to end.
+				// The gateway relays the peer's own envelope, so the client
+				// sees one envelope end to end.
 				self.trace.event(CLUSTER_WORK_FORWARDED)?;
 
 				if peer_response.status == TransitStatus::Ok {
@@ -276,12 +277,10 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 			return ReplyForm::Plain.reply(frame.metadata().id(), refusal);
 		};
 
-		// The payload must decode as the client's end-to-end frame. Bytes
-		// that do not are a permanent caller fault, so the refusal precedes
-		// route selection, and one malformed request never weakens a healthy
-		// pheromone trail, burns the bounded failover retry, or misreports
-		// as a retryable infrastructure fault. The first local forward
-		// re-emits the decoded frame as-is.
+		// The payload must decode as the client's end-to-end frame. Other bytes
+		// are a permanent caller fault, refused before route selection, so one
+		// malformed request never weakens a healthy trail, burns the failover
+		// retry, or misreports as a retryable infrastructure fault.
 		let client_frame: Frame = match decode(&request.payload) {
 			Ok(client_frame) => client_frame,
 			Err(_) => {
@@ -336,10 +335,9 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 				Ok(response_payload) => {
 					let outcome = choice.plane.classify(response_payload);
 
-					// A live peer that reports it cannot serve the type
-					// joins the same bounded failover as a fault before the
-					// write, so the trail weakens and the next-best one gets
-					// the retry.
+					// A live peer that cannot serve the type takes the same
+					// bounded failover as a fault before the write, so the
+					// trail weakens and the next-best one gets the retry.
 					if outcome.proves_undelivered() && excluded.is_none() {
 						if let Some(retry) = retry_payload {
 							self.servlet_registry
@@ -378,7 +376,7 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 }
 
 impl ServletRegistry {
-	/// Select one route for `type_key` over its live pheromone trails.
+	/// Selects one route for `type_key` over its live pheromone trails.
 	///
 	/// The relay budget bounds which trail kinds are eligible:
 	///
@@ -428,7 +426,7 @@ impl ServletRegistry {
 		Some(RouteChoice::of(selected_entry))
 	}
 
-	/// Reinforce a trail that answered, and record the routing event.
+	/// Reinforces a trail that answered, and records the routing event.
 	///
 	/// # Errors
 	///
@@ -448,7 +446,7 @@ impl ServletRegistry {
 		Ok(())
 	}
 
-	/// Weaken a trail that failed, and record the failure event.
+	/// Weakens a trail that failed, and records the failure event.
 	///
 	/// # Errors
 	///
@@ -476,7 +474,9 @@ mod tests {
 		AdmittedDial, PeerRoute, RelayRoute, ServletEntry, SharedId, DEFAULT_ABANDONMENT_LIMIT,
 		DEFAULT_INITIAL_PHEROMONE,
 	};
-	use crate::colony::common::{ColonyNamespace, InstanceMetrics, LoadBalancer, ServletInfo};
+	use crate::colony::cluster::{InstanceMetrics, LoadBalancer};
+	use crate::colony::protocol::ServletInfo;
+	use crate::colony::urn::ColonyNamespace;
 	use crate::constants::{DEFAULT_HOP_BUDGET, DEFAULT_MAX_HOPS};
 
 	use crate::colony::cluster::{CertificateSpec, ClusterTlsConfig, PheromoneConfig};
@@ -712,9 +712,9 @@ mod tests {
 		assert!(HopBudget::from_wire(WireHopBudget::new(2), 4).is_relayed());
 	}
 
-	// The relayed fact comes from the wire count rather than the clamped
-	// one. A cap below the origin sentinel would otherwise mark every direct
-	// caller relayed and refuse it at the export boundary.
+	// The relayed fact reads the wire count, because the clamped count under a
+	// cap below the origin sentinel would mark every direct caller relayed and
+	// refuse it at the export boundary.
 	#[test]
 	fn a_clamped_origin_budget_still_reads_as_direct() {
 		assert!(!HopBudget::from_wire(WireHopBudget::new(DEFAULT_HOP_BUDGET), DEFAULT_MAX_HOPS).is_relayed());

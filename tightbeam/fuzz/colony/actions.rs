@@ -1,10 +1,11 @@
-//! Oracle-driven action loop for the colony AFL harness.
+//! The oracle-driven action loop of the colony AFL harness.
 
 use core::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tightbeam::colony::cluster::{Cluster, ClusterRequest, ClusterWorkRequest, ClusterWorkResponse};
+use tightbeam::colony::cluster::Cluster;
+use tightbeam::colony::protocol::{ClusterRequest, ClusterWorkRequest, ClusterWorkResponse};
 use tightbeam::compose;
 use tightbeam::crypto::key::Secp256k1KeyProvider;
 use tightbeam::crypto::sign::SigningIdentity;
@@ -122,7 +123,7 @@ fn ijon_action(opcode: u8, selector: u8) {
 	}
 }
 
-/// IJON code for a shadow prediction. `Unmodeled` gets a neutral value,
+/// The IJON code of a shadow prediction. `Unmodeled` gets a neutral value,
 /// so the coverage map keeps those runs apart from both oracle
 /// directions.
 fn prediction_code(predicted: Prediction) -> u32 {
@@ -636,10 +637,9 @@ async fn cross_org_work(
 	let target = servlet_urn("peer-ping");
 	let relayed = selector & 0x80 != 0;
 
-	// Model the full cross-org path per hop. Alpha is the dial org, and
-	// only the downstream orgs (beta and gamma) serve peer-ping, so the
-	// request relays to them with the dial org's gateway certificate as
-	// caller and `relayed = true`. A mixed composition yields `Unmodeled`.
+	// One hop per org composes the prediction. Alpha dials, and only the
+	// downstream orgs, beta and gamma, serve peer-ping, so the request relays
+	// to them with alpha's gateway certificate as caller and `relayed = true`.
 	let dial_hop = shadow_predict(&topo.alpha, &target, Some(&topo.alpha.certs), relayed);
 	let beta_hop = shadow_predict(&topo.beta, &target, Some(&topo.alpha.certs), true);
 	let gamma_hop = shadow_predict(&topo.gamma, &target, Some(&topo.alpha.certs), true);
@@ -827,8 +827,8 @@ async fn hostile_foreign_work(
 	let target = target_urn(selector);
 
 	// The accept plane has validators, so it captures the possession-verified
-	// foreign identity, and the boundary classifies that certificate and not
-	// an anonymous session. The prediction uses that identity too.
+	// foreign identity, and the boundary classifies the session by that
+	// certificate. The prediction uses that identity too.
 	let predicted = shadow_predict(pick_org_ref(topo, dial_idx), &target, Some(&identity), false);
 	let request = ClusterWorkRequest::new(target, &inner_ping_frame()?)?;
 

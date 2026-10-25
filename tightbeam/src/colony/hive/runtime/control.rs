@@ -10,14 +10,14 @@ use std::sync::Arc;
 use futures::future::{select, Either};
 use tokio::sync::Notify;
 
-use crate::colony::common::{
-	ClusterCommand, ClusterCommandResponse, DrainMode, HiveManagement, HiveManagementOutcome, SpawnServletParams,
-	StopServletParams,
-};
 use crate::colony::hive::gates::{AdmitRefusal, AdmittedCommand, CommandRefusal};
-use crate::colony::hive::runtime::{HiveContextImpl, HiveInstances, InsertRefusal};
+use crate::colony::hive::runtime::{DrainMode, HiveContextImpl, HiveInstances, InsertRefusal};
 use crate::colony::hive::{
 	BackpressureGate, ClusterSecurityGate, HashMapRegistry, ServletRegistration, ServletRegistry, SpawnerFn,
+};
+use crate::colony::protocol::{
+	ClusterCommand, ClusterCommandResponse, HiveManagement, HiveManagementOutcome, SpawnServletParams,
+	StopServletParams,
 };
 use crate::macros::server::{serve_connection, AcceptedConnection, SharedHandler};
 use crate::policy::{GatePolicy, SessionContext, TransitStatus};

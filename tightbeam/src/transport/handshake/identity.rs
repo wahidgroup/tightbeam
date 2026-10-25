@@ -6,11 +6,11 @@
 //! - A CMS server holds a [`CmsIdentityPair`]: a signing identity and the
 //!   key-agreement identity its opening seals to.
 //!
-//! A `dyn SigningKeyProvider` is no `dyn DiffieHellman`, so the compiler
-//! refuses a signing handle where a key-agreement handle belongs. A backend
-//! of both serves one identity per key, because the pair refuses one key in
-//! both identities (NIST SP 800-56A Rev. 3 §5.6.3.2, SP 800-57 Part 1 Rev. 5
-//! §5.2).
+//! `dyn SigningKeyProvider` and `dyn DiffieHellman` are two types, so the
+//! compiler refuses a signing handle where a key-agreement handle belongs. A
+//! backend of both serves one identity per key, because the pair refuses one
+//! key in both identities (NIST SP 800-56A Rev. 3 §5.6.3.2, SP 800-57 Part 1
+//! Rev. 5 §5.2).
 
 #[cfg(feature = "transport-cms")]
 use core::fmt;
@@ -19,7 +19,7 @@ use crate::crypto::sign::SigningIdentity;
 use crate::crypto::x509::error::CertificateValidationError;
 use crate::crypto::x509::utils::CertificateExt;
 use crate::der::asn1::ObjectIdentifier;
-use crate::utils::marker::{MaybeSend, MaybeSync};
+use crate::transport::handshake::{sealed, ServerIdentity};
 
 #[cfg(feature = "transport-cms")]
 use crate::crypto::cms::{KeyAgreementIdentity, RecipientKem};
@@ -32,20 +32,7 @@ use crate::x509::ext::pkix::SubjectAltName;
 #[cfg(feature = "transport-cms")]
 use crate::x509::Certificate;
 
-/// The identity a handshake server holds, which hands the orchestrator the
-/// half that signs the reply and its receipt.
-pub trait ServerIdentity: MaybeSend + MaybeSync + 'static {
-	/// The identity that signs the reply and the session receipt.
-	fn signing(&self) -> &SigningIdentity;
-
-	/// Refuse this identity for the server role unless each of its
-	/// certificates admits the key purpose `purpose` (RFC 5280 §4.2.1.12).
-	///
-	/// # Errors
-	///
-	/// - The [`CertificateExt::require_purpose`] set.
-	fn require_purpose(&self, purpose: ObjectIdentifier) -> Result<(), CertificateValidationError>;
-}
+impl sealed::Sealed for SigningIdentity {}
 
 /// The server of the HPKE flow signs with its one identity, and its secret
 /// derives from the two ephemerals alone.
@@ -74,8 +61,8 @@ pub struct CmsIdentityPair<K: RecipientKem> {
 impl<K: RecipientKem> CmsIdentityPair<K> {
 	/// Pair `signing` with `key_agreement`, the two identities of one server.
 	///
-	/// Each identity admitted its certificate for its own use when it was
-	/// built, so the pair checks what binds the two.
+	/// Each identity admits its certificate for its own use when it is built,
+	/// so the pair checks what binds the two.
 	///
 	/// # Errors
 	///
@@ -110,7 +97,7 @@ impl<K: RecipientKem> CmsIdentityPair<K> {
 	///
 	/// # Errors
 	///
-	/// - The [`CertificateExt::require_purpose`] set.
+	/// - The errors of [`CertificateExt::require_purpose`].
 	pub(crate) fn require_purpose(&self, purpose: ObjectIdentifier) -> Result<(), CertificateValidationError> {
 		self.signing.certificate().require_purpose(purpose)?;
 		self.key_agreement.certificate().require_purpose(purpose)
@@ -194,6 +181,9 @@ impl<K: RecipientKem> fmt::Debug for CmsIdentityPair<K> {
 			.finish()
 	}
 }
+
+#[cfg(feature = "transport-cms")]
+impl<K: RecipientKem> sealed::Sealed for CmsIdentityPair<K> {}
 
 #[cfg(feature = "transport-cms")]
 impl<K: RecipientKem<PrivateKey: 'static> + 'static> ServerIdentity for CmsIdentityPair<K> {
@@ -292,8 +282,8 @@ mod tests {
 	}
 
 	/// The signing and key-agreement certificates of a server of an empty
-	/// subject, which the `subjectAltName` of `signing` and of
-	/// `key_agreement` name.
+	/// subject, whose `subjectAltName` names the URI `signing` and the URI
+	/// `key_agreement`, in that order.
 	fn unnamed_pair(signing: &str, key_agreement: &str) -> (Certificate, Certificate) {
 		let server = TestCmsServer::named(RdnSequence::default());
 		let signing = TestCertificate::with_extension(server.signing, naming(signing));

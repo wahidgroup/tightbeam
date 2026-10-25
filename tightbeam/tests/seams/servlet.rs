@@ -1,5 +1,5 @@
-//! A servlet an outside crate registers through a [`ServletBox`] of its own,
-//! which names the signer the servlet answers under.
+//! An outside crate registers a servlet here through a [`ServletBox`] of its
+//! own, which names the signer the servlet answers under.
 //!
 //! A hive carries that signer in its registration, and the gateway's dial of
 //! the servlet admits only the certificate it names (CWE-346).
@@ -19,9 +19,9 @@ use std::sync::Arc;
 use tightbeam::builder::TypeBuilder;
 use tightbeam::cms::signed_data::SignerIdentifier;
 use tightbeam::colony::cluster::{ClusterConfig, ClusterTlsConfig};
-use tightbeam::colony::common::ColonyNamespace;
 use tightbeam::colony::hive::{Hive, HiveConfig, HiveTlsConfig, ServletBox};
 use tightbeam::colony::servlet::ServletConfig;
+use tightbeam::colony::urn::ColonyNamespace;
 use tightbeam::colony::SubmitWork;
 use tightbeam::crypto::key::Secp256k1KeyProvider;
 use tightbeam::crypto::x509::utils::CertificateExt;
@@ -89,7 +89,7 @@ impl ServletBox for OutsideServlet {
 }
 
 /// The signer that names `certificate` (RFC 5652 §5.3).
-fn signer_of(certificate: &Certificate) -> SignerIdentifier {
+pub(super) fn signer_of(certificate: &Certificate) -> SignerIdentifier {
 	certificate.signer_identifier().expect("a fixture certificate names its key")
 }
 
@@ -101,7 +101,7 @@ fn echo_urn() -> Urn<'static> {
 }
 
 /// The certificate and key of `certs`, as a specification and a provider.
-fn identity_of(certs: &GatewayCerts) -> (CertificateSpec, Arc<Secp256k1KeyProvider>) {
+pub(super) fn identity_of(certs: &GatewayCerts) -> (CertificateSpec, Arc<Secp256k1KeyProvider>) {
 	let spec = CertificateSpec::Built(Box::new(certs.cert.to_owned()));
 	let provider = Arc::new(Secp256k1KeyProvider::from(certs.key.to_owned()));
 
@@ -109,7 +109,7 @@ fn identity_of(certs: &GatewayCerts) -> (CertificateSpec, Arc<Secp256k1KeyProvid
 }
 
 /// A gateway under `certs`, whose hive trust holds the same identity.
-fn seam_cluster_conf(certs: &GatewayCerts) -> ClusterConfig {
+pub(super) fn seam_cluster_conf(certs: &GatewayCerts) -> ClusterConfig {
 	let (spec, provider) = identity_of(certs);
 	let tls = ClusterTlsConfig::new(spec, provider).expect("the seam certificate decodes");
 

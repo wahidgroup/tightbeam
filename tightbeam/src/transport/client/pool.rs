@@ -14,7 +14,7 @@ use crate::crypto::profiles::CryptoProvider;
 use crate::crypto::sign::SigningIdentity;
 use crate::crypto::x509::store::CertificateTrust;
 use crate::crypto::x509::Certificate;
-use crate::transport::client::GenericClient;
+use crate::transport::client::{ConnectionBuilder, GenericClient};
 use crate::transport::error::{TransportError, TransportFailure};
 use crate::transport::handshake::negotiation::TransportOffer;
 use crate::transport::handshake::HandshakeProtocolKind;
@@ -75,36 +75,6 @@ pooled_mux! {
 	use crate::transport::multiplex::StreamRoute;
 }
 
-/// Shared builder surface for direct clients and connection pools.
-///
-/// [`crate::transport::client::ClientBuilder`] and [`ConnectionPoolBuilder`]
-/// both implement this trait, so callers configure timeouts and identity the
-/// same way.
-pub trait ConnectionBuilder<P: Protocol>: Sized {
-	/// The client or pool that [`ConnectionBuilder::build`] produces.
-	type Output;
-
-	/// Cap how long a connect or I/O wait may block.
-	fn with_timeout(self, timeout: Duration) -> Self;
-
-	/// Set the trust anchors that validate the peer certificate.
-	fn with_trust_store(self, store: Arc<dyn CertificateTrust>) -> Self;
-
-	/// Set the client certificate and the key that proves it, for mutual
-	/// authentication.
-	///
-	/// [`SigningIdentity::from_spec`] decodes a certificate specification
-	/// into one and checks the key against it, so the fallible step happens
-	/// once, before the builder. A clone of the identity clones its `Arc`
-	/// handles and copies the `sid`, so every dial shares one certificate.
-	///
-	/// [`SigningIdentity::from_spec`]: crate::crypto::sign::SigningIdentity::from_spec
-	fn with_client_identity(self, identity: SigningIdentity) -> Self;
-
-	/// Finish configuration and produce the client or pool.
-	fn build(self) -> Self::Output;
-}
-
 /// Limits and multiplexing policy for a [`ConnectionPool`].
 #[derive(Clone, Debug)]
 pub struct PoolConfig {
@@ -133,7 +103,7 @@ impl Default for PoolConfig {
 }
 
 #[derive(Clone)]
-/// Shared TLS assets that every pooled connection reuses.
+/// Shared encryption provisioning that every pooled connection reuses.
 struct PoolTlsConfig<C: CryptoProvider> {
 	/// Every dial from this pool starts with this provisioning.
 	encryption: EncryptionConfig<C>,
@@ -245,7 +215,7 @@ impl<P: Protocol> Default for ConnectionPoolBuilder<P> {
 }
 
 impl<P: Protocol> ConnectionPoolBuilder<P> {
-	/// Run this pool's connections without authenticating the peer.
+	/// Run this pool's connections with no peer authentication.
 	///
 	/// Every dial carries the decision. Without it, a pool that holds no trust
 	/// in a server fails each connect with
@@ -348,6 +318,9 @@ impl<P: Protocol> ConnectionPoolBuilder<P> {
 }
 
 #[cfg(feature = "std")]
+impl<P: Protocol> super::sealed::Sealed for ConnectionPoolBuilder<P> {}
+
+#[cfg(feature = "std")]
 impl<P: Protocol> ConnectionBuilder<P> for ConnectionPoolBuilder<P> {
 	type Output = ConnectionPool<P>;
 
@@ -393,7 +366,7 @@ pooled_mux! {
 	/// Holds the instant a mux entry last carried traffic, on the pool's clock.
 	///
 	/// The entry and every lease drawn from it share one stamp, so an emit or a
-	/// stream open through any lease keeps the entry from idling out.
+	/// stream open through any lease resets the idle time of the entry.
 	struct ActivityStamp {
 		at: Mutex<MonotonicInstant>,
 		clock: Arc<dyn Clock>,
@@ -496,7 +469,8 @@ pub struct ConnectionPool<P: Protocol> {
 	/// Monotonic IDs that correlate mux pool entries with their leases.
 	#[cfg(pooled_mux)]
 	mux_ids: AtomicU64,
-	/// Shared TLS assets reused across pooled connections, answered once.
+	/// Shared encryption provisioning that every pooled connection reuses,
+	/// answered once.
 	tls: PoolProvisioning<P::CryptoProvider>,
 	/// The negotiation input every dial from this pool starts with.
 	negotiation: Negotiation,
@@ -723,9 +697,8 @@ where
 			let expired = now.saturating_duration_since(last_used) >= timeout;
 			if expired {
 				// GoAway precedes the close (RFC 9113 § 6.8), so the reader
-				// task ends on the resulting EOF. A racing stream observes
-				// `Draining`, or `ConnectionClosed` once that reader has ended,
-				// and `PooledClient::emit` maps both to eviction.
+				// task ends on its EOF. A racing stream sees `Draining`, or
+				// `ConnectionClosed` once the reader ends.
 				let handle = entry.handle.clone();
 				rt::spawn(async move {
 					// The drain runs detached from the prune that spawned it.
@@ -919,8 +892,8 @@ pooled_mux! {
 			let mux = MuxTransport::assemble(reader, writer, CONNECTOR_ROLE, settings, rekey);
 			let SpawnedMux { handle, responder, reader_task } = mux.spawn();
 
-			// A pool endpoint serves only the streams it opens, so dropping the
-			// responder refuses every peer-initiated stream.
+			// A pool endpoint serves only the streams it opens, so the drop of
+			// the responder refuses every peer-initiated stream.
 			drop(responder);
 
 			let id = self.mux_ids.fetch_add(1, Ordering::Relaxed);
@@ -1045,8 +1018,8 @@ pooled_mux! {
 		id: u64,
 		handle: MuxHandle,
 		/// Stamp shared with the pool entry. The lease stamps it on each emit
-		/// and stream open, so the pruner can read idle time without a clock in
-		/// the mux core (see [`MuxEntry::last_used`]).
+		/// and stream open, so the pruner reads idle time from the pool's clock
+		/// outside the mux core (see [`MuxEntry::last_used`]).
 		last_used: Arc<ActivityStamp>,
 		/// Shared handle to the entry's pinned peer certificate (see
 		/// [`MuxEntry::peer_certificate`]).
@@ -1117,8 +1090,8 @@ where
 		self.client.as_mut().ok_or(TransportError::InvalidState)
 	}
 
-	/// Returns the validated TLS peer certificate that this connection's
-	/// handshake pinned.
+	/// Returns the validated peer certificate that this connection's handshake
+	/// pinned.
 	///
 	/// A mux lease answers from the certificate pinned at its eager dial
 	/// handshake. An exclusive lease reads its transport, so the answer
@@ -1264,8 +1237,8 @@ pooled_mux! {
 			}
 
 			if let Some(client) = self.client.take() {
-				// Dropping the client closes its connection, so the connection
-				// leaves the live set.
+				// The drop of the client closes its connection, so the
+				// connection leaves the live set.
 				drop(client);
 				self.pool.retire(1)?;
 			}

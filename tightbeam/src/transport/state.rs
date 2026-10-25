@@ -57,8 +57,6 @@ use crate::transport::handshake::{BoxedServerHandshake, HandshakeMessage, Server
 use crate::transport::handshake::{CmsIdentityPair, ProvisionedTrust};
 #[cfg(mux_rekey)]
 use crate::transport::handshake::{EpochMaterials, HandshakeError, HandshakeProvider};
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::transport::io::CollectStep;
 #[cfg(mux_rekey)]
 use crate::transport::rekey::{RekeyDriver, Renewal};
 
@@ -639,6 +637,17 @@ impl<P: CryptoProvider> SessionState<P> {
 	}
 }
 
+/// The outcome of one protocol-agnostic collector step.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+pub enum CollectStep {
+	/// The step read a cleartext handshake container for the server-side
+	/// dispatcher, decoded once with the bytes it arrived as.
+	Handshake(HandshakeMessage),
+	/// The step read an application envelope, decrypted, or in cleartext
+	/// where the session admits cleartext.
+	Envelope(TransportEnvelope),
+}
+
 #[cfg(mux_rekey)]
 impl<P: CryptoProvider> SessionState<P> {
 	/// Replace the multiplexing capability this endpoint offers.
@@ -865,10 +874,9 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 	/// list above leaves it out. A server policy narrows which server a trust
 	/// admits, so the trust in a server answers for it here.
 	pub fn is_provisioned(&self) -> bool {
-		// The pattern names every field without `..`, so a new field breaks the
-		// build until someone says whether it implies a handshake, and no new
-		// key material silently leaves the endpoint in `Cleartext` (CWE-311).
-		// `trusts_a_server` reads both trust fields and names every field too.
+		// The pattern names every field without `..`, so an added field breaks
+		// the build until someone says whether it implies a handshake, and key
+		// material cannot leave the endpoint in `Cleartext` unseen (CWE-311).
 		let Self {
 			server_identity,
 			trust_store: _,
@@ -891,10 +899,9 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 	/// trust in a CMS server, which [`Self::is_provisioned`] and the dialer
 	/// rule both read.
 	fn trusts_a_server(&self) -> bool {
-		// The pattern names every field without `..`, so a new field breaks the
-		// build until someone says whether it is a trust in a server, and a new
-		// trust reaches the start phase and the dialer rule alike (CWE-311,
-		// CWE-295).
+		// The pattern names every field without `..`, so an added field breaks
+		// the build until someone says whether it trusts a server. The start
+		// phase and the dialer rule then read every trust (CWE-311, CWE-295).
 		let Self {
 			trust_store,
 			#[cfg(feature = "transport-cms")]
@@ -1290,7 +1297,7 @@ mod tests {
 	}
 
 	/// A provisioned session writes nothing in the clear after a reset from
-	/// any phase, including a reset that a caller triggers through the public
+	/// any phase, even a reset that a caller triggers through the public
 	/// `reset` method.
 	#[test]
 	fn a_reset_provisioned_session_refuses_a_cleartext_write() -> TransportResult<()> {
@@ -1439,8 +1446,8 @@ mod tests {
 	}
 
 	/// An admitted event hands back the phase it replaced, whole, so the
-	/// instant a handshake recorded leaves through the table and not through
-	/// a second writer of the phase.
+	/// instant a handshake recorded leaves through the table, which is the one
+	/// writer of the phase.
 	#[test]
 	fn an_admitted_event_hands_back_the_phase_it_replaced() {
 		let clock = ManualClock::default();

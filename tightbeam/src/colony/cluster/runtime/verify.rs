@@ -9,15 +9,15 @@
 //! # Gate policies
 //!
 //! [`ClusterConfig::evaluate_gates`] runs configured [`GatePolicy`] instances
-//! before the request envelope is decoded. Stream opens carry no request frame,
-//! so they pass `None` for the frame argument.
+//! before the gateway decodes the request envelope. Stream opens carry no
+//! request frame, so they pass `None` for the frame argument.
 //!
 //! # Export boundary
 //!
 //! [`ColonyConfig::evaluate_export_gates`] runs [`ExportPolicy`] where the
-//! servlet target is resolved: allowlist, then grants, then deny gates.
-//! [`HopBudget::is_relayed`] supplies the `relayed` flag. Verdict algebra and
-//! posture warnings live in [`crate::colony::cluster::export`].
+//! gateway resolves the servlet target: allowlist, then grants, then deny
+//! gates. [`HopBudget::is_relayed`] supplies the `relayed` flag. Verdict
+//! algebra and posture warnings live in [`crate::colony::cluster::export`].
 //!
 //! # Origin and freshness
 //!
@@ -26,6 +26,7 @@
 //! rejects stale or replayed signed control frames.
 //!
 //! [`GatewayReplayGuard`]: super::freshness::GatewayReplayGuard
+//! [`HopBudget::is_relayed`]: crate::colony::cluster::HopBudget::is_relayed
 
 use crate::colony::cluster::export::{ExportDecision, ExportPolicy, Party, TrustPlanes};
 use crate::colony::cluster::peer::ColonyCertificate;
@@ -49,8 +50,8 @@ use crate::TightBeamError;
 
 /// One caller under export-boundary audit.
 ///
-/// A refusal and a deciding grant describe the same caller, so they share
-/// one enrichment convention rather than each assembling its own.
+/// A refusal and a grant that decides the outcome describe the same caller,
+/// so they share one enrichment convention.
 struct ExportAudit<'a> {
 	trace: &'a TraceCollector,
 	session: &'a SessionContext,
@@ -152,8 +153,9 @@ impl VerifyRefusal {
 	///   relay's own rate bucket, so a relay that sends rumors under made-up
 	///   origins is bounded by the budget its own rumors draw on (CWE-770).
 	/// - With a token it answers [`TransitStatus::Unauthenticated`], which
-	///   tells the relay to stop offering that origin here. With the bucket
-	///   empty it answers [`TransitStatus::ResourceExhausted`].
+	///   tells the relay to stop its offers of that origin here. With the
+	///   bucket empty it answers [`TransitStatus::ResourceExhausted`]. A
+	///   backend fault of the admission answers [`TransitStatus::Unavailable`].
 	/// - Every other refusal is a rumor the relay should have refused itself, so the relay is scored.
 	/// - `frame` is the relay's own signed frame, whose signer keys that
 	///   bucket. A frame that names no signer has no bucket to spend, so it is
@@ -260,7 +262,8 @@ impl ClusterConfig {
 		Ok(())
 	}
 
-	/// Run collector gate policies before decoding the request envelope.
+	/// Run collector gate policies before the gateway decodes the request
+	/// envelope.
 	///
 	/// Each configured policy must return [`TransitStatus::Ok`], so the first
 	/// refusal short-circuits dispatch.
@@ -357,6 +360,8 @@ impl<P: Protocol> ColonyConfig<P> {
 	///
 	/// - CWE-285, improper authorization: <https://cwe.mitre.org/data/definitions/285.html>
 	/// - ISO/IEC 27001:2022 A.8.15, logging: <https://www.iso.org/standard/82875.html>
+	///
+	/// [`HopBudget::is_relayed`]: crate::colony::cluster::HopBudget::is_relayed
 	pub(crate) fn evaluate_export_gates(
 		&self,
 		target: &Urn<'_>,
@@ -414,7 +419,7 @@ mod tests {
 	use crate::colony::cluster::{
 		CertificateSpec, ClusterTlsConfig, ExportGate, ExportGrant, StaticExportList, TrustPlanes,
 	};
-	use crate::colony::common::ColonyNamespace;
+	use crate::colony::urn::ColonyNamespace;
 	use crate::crypto::hash::Sha3_256;
 	use crate::crypto::key::Secp256k1KeyProvider;
 	use crate::crypto::policy::Secp256k1Policy;

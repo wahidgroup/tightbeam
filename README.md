@@ -1187,16 +1187,25 @@ Each provider role MUST use the algorithm its profile names. The `Profile` bound
 
 Its associated profile is `TightbeamProfile` ([§6.2](#62-security-profile-types)).
 
-Every part is replaceable, and the envelope, the recipients, the handshake, and the async TCP transport run the provider's algorithms and refuse any other. The async TCP transport runs every provider, so a call names its provider when no other type in the call names one, as `TokioListener::<DefaultCryptoProvider>::bind_cleartext(addr)` does. The handshake reads no HPKE suite, so a provider with these roles alone runs both handshake flows. An implementor brings its own algorithm as a type that implements the role's trait:
+Every part is replaceable, and the envelope, the recipients, the handshake, and the TCP transport run the provider's algorithms and refuse any other:
+- The TCP transport runs every provider, async and blocking. A call names its provider when no other type in the call names one:
+  - `TokioListener::<DefaultCryptoProvider>::bind_cleartext(addr)` binds an async listener.
+  - `TcpListener::<_, DefaultCryptoProvider>::from_listener_cleartext(listener)` wraps a blocking one.
+- The handshake reads no HPKE suite, so a provider with these roles alone runs both handshake flows.
 
+An implementor brings its own algorithm as a type that implements the role's trait:
 - A signature type for `SigningProvider`.
 - A `ContentEncryption` cipher for `AeadProvider`. The cipher MUST leave the buffer of a refused seal or open as it was, because a frame seals and opens its body in its own buffer.
 - A `KeyWrapAlgorithm` for `KeyWrapProvider`.
 - A `KdfFunction` for `KdfProvider`.
-- A curve that meets `HandshakeCurve` for `CurveProvider`, such as `p256::NistP256`. The HPKE flow and the rekey carry its points in the compressed SEC 1 form, at the width of that form on the curve.
+- A curve that meets `HandshakeCurve` for `CurveProvider`, such as `p256::NistP256`, `p384::NistP384`, or `p521::NistP521`:
+  - Each agreement yields a shared secret as wide as the field of the curve.
+  - The HPKE flow and the rekey carry its points in the compressed SEC 1 form, at the width of that form on the curve.
 - A `RecipientKem` for `CryptoProvider::Kem`.
 
-Each endpoint holds the profile of a handshake to the strength floor its provider names, `CryptoProvider::strength_floor`, and refuses a profile below it with `NegotiationError::BelowStrengthFloor` (CWE-757). The default floor, `DefaultStrengthFloor`, requires an AEAD key and a digest output of 256 bits or more ([NIST SP 800-57 Part 1 Rev. 5][nist-800-57] §5.6.1). A provider whose AEAD key or digest output is shorter, such as one on AES-128-GCM, overrides `strength_floor` with a floor that admits its profile, such as `NoStrengthFloor`, and every endpoint of that provider runs under that floor.
+Each endpoint holds the profile of a handshake to the strength floor its provider names, `CryptoProvider::strength_floor`, and refuses a profile below it with `NegotiationError::BelowStrengthFloor` (CWE-757):
+- The default floor, `DefaultStrengthFloor`, requires an AEAD key, a digest output, and a key-agreement curve field of 256 bits or more ([NIST SP 800-57 Part 1 Rev. 5][nist-800-57] §5.6.1). A provider on P-192 or P-224 falls below it.
+- A provider whose AEAD key, digest output, or curve field is shorter, such as one on AES-128-GCM, overrides `strength_floor` with a floor that admits its profile, such as `NoStrengthFloor`. Every endpoint of that provider runs under that floor.
 
 ### 6.6 Cryptographic Requirements
 

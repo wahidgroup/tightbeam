@@ -1,7 +1,7 @@
-//! Shared fixtures for colony cluster integration tests.
+//! The shared fixtures of the colony cluster integration tests.
 //!
 //! Certificate identities, TLS configs, trace recorders, and peering
-//! preamble helpers live here so scenario modules stay assertion-focused.
+//! preambles live here, so scenario modules stay assertion-focused.
 //!
 //! # Certificates
 //!
@@ -61,19 +61,18 @@ pub use tightbeam::{
 	builder::TypeBuilder,
 	colony::{
 		cluster::{
-			Admission, AdmittedDial, Cluster, ClusterConfig, ClusterError, ClusterRequest, ClusterTlsConfig,
-			ClusterWorkRequest, ClusterWorkResponse, GossipAdmission, GossipConfig, GossipDigest, GossipJournal,
-			HeartbeatConfig, LocalClaim, MemoryGossipJournal, PeerAddress, PeerHint, PeerTable, TokenBucketAdmission,
+			Admission, AdmittedDial, Cluster, ClusterConfig, ClusterError, ClusterTlsConfig, GossipAdmission,
+			GossipConfig, GossipDigest, GossipJournal, HeartbeatConfig, InstanceMetrics, LoadBalancer, LocalClaim,
+			MemoryGossipJournal, PeerAddress, PeerHint, PeerTable, RoundRobin, StochasticForager, TokenBucketAdmission,
 		},
-		common::{
-			ColonyNamespace, GossipReconciliation, GossipResponse, GossipRumor, GossipWant, InstanceMetrics,
-			LoadBalancer, PeerAdvertisement, PeerAdvertisementResponse, RoundRobin, ServletTypeKey, StochasticForager,
-		},
-		hive::{
-			Hive, HiveConfig, HiveTlsConfig, RegisterHiveRequest, RegisterHiveResponse, ServletAddressUpdate,
-			ServletAddressUpdateResponse, ServletBox, ServletInfo,
+		hive::{Hive, HiveConfig, HiveTlsConfig, ServletBox},
+		protocol::{
+			ClusterRequest, ClusterWorkRequest, ClusterWorkResponse, GossipReconciliation, GossipResponse, GossipRumor,
+			GossipWant, PeerAdvertisement, PeerAdvertisementResponse, RegisterHiveRequest, RegisterHiveResponse,
+			ServletAddressUpdate, ServletAddressUpdateResponse, ServletInfo,
 		},
 		servlet::{ServletConfig, ServletConfigBuilder, WithCertificate},
+		urn::{ColonyNamespace, ServletTypeKey},
 		SubmitWork,
 	},
 	constants::{
@@ -114,10 +113,10 @@ pub use crate::common::poll::poll_until;
 use crate::common::security::expectation_failure;
 pub use crate::common::x509::{combined_trust, combined_validator, signing_identity, GatewayCerts};
 
-/// Address the simulated peer gateway advertises itself at.
+/// The address that the simulated peer gateway advertises itself at.
 pub(crate) const PEER_GATEWAY_ADDR: &[u8] = b"127.0.0.1:9000";
 
-/// Failed forwards a peer trail tolerates before abandonment in the
+/// The failed forwards that a peer trail tolerates before abandonment in the
 /// infection-containment scenarios. The limit stays small, so the gate stays
 /// fast. The containment specs assert exactly this many `CLUSTER_WORK_FAILED`
 /// events before selection drops the peer.
@@ -455,7 +454,7 @@ pub async fn emit_frame(client: &mut GenericClient<TokioListener>, frame: Frame)
 	client.emit(frame, None).await?.ok_or(TightBeamError::MissingResponse)
 }
 
-/// Gate policy that denies every request, for scenarios that prove the
+/// A gate policy that denies every request, for scenarios that prove the
 /// gateway enforces `with_gate_policy` on unary work and stream opens.
 pub struct RejectAllPolicy;
 
@@ -466,7 +465,7 @@ impl GatePolicy for RejectAllPolicy {
 }
 
 /// Converts a count into a trace value. A fixture cannot produce a count past
-/// `u64`, so the conversion saturates rather than wraps.
+/// `u64`, so the conversion saturates.
 pub fn count_u64(count: usize) -> u64 {
 	u64::try_from(count).unwrap_or(u64::MAX)
 }
@@ -505,7 +504,7 @@ pub async fn sign_frame(mut frame: Frame, key: &Secp256k1SigningKey) -> Result<F
 	Ok(frame)
 }
 
-/// Deterministic signing key for end-to-end work envelopes.
+/// The deterministic signing key of end-to-end work envelopes.
 ///
 /// The client and the probe servlet both derive it, so each side can
 /// cryptographically verify the other's frame signature without key
@@ -519,7 +518,7 @@ pub fn probe_signing_key() -> Secp256k1SigningKey {
 ///
 /// Every fixture certificate of a key carries that key's identifier, so the
 /// self-signed one is the signer any frame of `key` names. A verified
-/// signature proves byte fidelity end to end, and the helper adapts
+/// signature proves byte fidelity end to end, and the function adapts
 /// [`Frame::verify`] to a boolean for trace events.
 pub fn frame_signature_verifies(frame: &Frame, key: &Secp256k1SigningKey) -> bool {
 	let certificate = TestCertificate::self_signed(key);
@@ -614,9 +613,8 @@ pub fn servlet_urn(name: &(impl AsRef<str> + ?Sized)) -> Urn<'static> {
 /// The gossip ingress key for `name`, created the way the builder creates
 /// it.
 ///
-/// [`GossipConfig::ingress`] holds a route key rather than a URN, so a
-/// fixture names its ingress through the same namespace check production
-/// passes.
+/// [`GossipConfig::ingress`] holds a route key, so a fixture names its
+/// ingress through the same namespace check that production passes.
 pub fn servlet_ingress(name: &(impl AsRef<str> + ?Sized)) -> ServletTypeKey {
 	let urn = servlet_urn(name);
 	colony_ns().servlet_type_key(&urn).expect("test names mint a bare servlet type")
@@ -703,8 +701,8 @@ pub fn servlet_info_mismatched(
 /// advertisement, or the attempts run out.
 ///
 /// The routes alone can come from a slate rumor first, so the wait also holds
-/// for [`wait_for_direct_advertisement`]. The branching lives here, not in
-/// scenarios.
+/// for [`wait_for_direct_advertisement`]. The branching lives here, so
+/// scenarios stay assertion-focused.
 pub async fn wait_for_peer_types(
 	trace: &TraceCollector,
 	cluster: &ClusterGateway,
@@ -855,16 +853,16 @@ pub fn start_scenario_rumor_hive(
 	start_rumor_hive(trace, hive_plane_certs(certs), certs.key.to_owned())
 }
 
-/// A cluster conf with an optional mux offer for both the gateway server and
-/// the cluster-to-hive pool.
+/// A cluster configuration with an optional mux offer for both the gateway
+/// server and the cluster-to-hive pool.
 pub fn routing_cluster_conf(certs: &ClusterTestCerts, mux_offer: Option<TransportOffer>) -> ClusterConfig {
 	let mut conf = ClusterConfig::new(cluster_tls_config(certs));
 	conf.pool_config.mux_offer = mux_offer.map(Arc::new);
 	conf
 }
 
-/// A muxed gateway conf whose hive trust holds the fixture identity and
-/// `impostor`, so a servlet that serves under `impostor` completes the
+/// A muxed gateway configuration whose hive trust holds the fixture identity
+/// and `impostor`, so a servlet that serves under `impostor` completes the
 /// handshake, and only the dial's signer binding tells it from the servlet a
 /// registration names.
 pub fn impostor_trusting_conf(certs: &ClusterTestCerts, impostor: &ClusterTestCerts) -> ClusterConfig {
@@ -874,8 +872,8 @@ pub fn impostor_trusting_conf(certs: &ClusterTestCerts, impostor: &ClusterTestCe
 	with_mux_offer(ClusterConfig::new(tls))
 }
 
-/// Adds the standard eight-stream mux offer to a cluster conf, so the
-/// gateway serves routed streams and its pools open them.
+/// Adds the standard eight-stream mux offer to a cluster configuration, so
+/// the gateway serves routed streams and its pools open them.
 pub fn with_mux_offer(mut conf: ClusterConfig) -> ClusterConfig {
 	conf.pool_config.mux_offer = Some(Arc::new(TransportOffer::mux(8)));
 	conf
@@ -973,7 +971,7 @@ pub fn work_refusal_status(result: Result<Frame, TightBeamError>) -> Result<Tran
 /// `WORK_STATUS` and the absent servlet frame as `WORK_PAYLOAD`.
 ///
 /// A refusal resolved through [`SubmitWork::submit_work_to`] delivers no
-/// servlet frame to the caller, so the helper records payload presence as
+/// servlet frame to the caller, so the function records payload presence as
 /// zero.
 pub fn record_work_refusal(
 	trace: &TraceCollector,
@@ -1015,7 +1013,7 @@ pub async fn emit_ping_work(
 
 /// Emits ping work with a spent relay budget, as a hop-exhaustion probe.
 ///
-/// This helper composes the wire envelope itself, because the pre-spent
+/// This function composes the wire envelope itself, because the pre-spent
 /// `hops_remaining` field is the wire shape under test, and
 /// [`SubmitWork::submit_work_to`] cannot produce it.
 pub async fn emit_relayed_ping_work(
@@ -1048,16 +1046,16 @@ pub fn foreign_realm_instance(addr: &(impl AsRef<str> + ?Sized)) -> Urn<'static>
 		.expect("a servlet type URN yields an instance URN")
 }
 
-/// A gateway conf that accepts peer advertisements.
+/// A gateway configuration that accepts peer advertisements.
 ///
-/// `peer_trust` anchors the advertising gateway's certificate. The conf sets
-/// no `peers`, so this gateway only receives.
+/// `peer_trust` anchors the advertising gateway's certificate. The
+/// configuration sets no `peers`, so this gateway only receives.
 pub fn peering_cluster_conf(certs: &ClusterTestCerts) -> ClusterConfig {
 	peering_cluster_conf_with_trust(certs, Arc::clone(&certs.trust))
 }
 
-/// Builds a conf like [`peering_cluster_conf`], but with an explicit peer
-/// trust store.
+/// Builds a configuration like [`peering_cluster_conf`], but with an explicit
+/// peer trust store.
 ///
 /// Scenarios use it when more than one peer identity must verify, including
 /// federation peer-exclusion layouts and export split-plane scenarios.
@@ -1089,18 +1087,18 @@ pub fn peering_with_dial_allowlist(
 		.build()
 }
 
-/// An importer conf whose peer trails abandon after a few failed forwards.
-/// The limit is small, so containment scenarios stay fast. The specs pin
-/// [`CONTAINMENT_ABANDON_LIMIT`] failures before routing stops.
+/// An importer configuration whose peer trails abandon after a few failed
+/// forwards. The limit is small, so containment scenarios stay fast. The
+/// specs pin [`CONTAINMENT_ABANDON_LIMIT`] failures before routing stops.
 pub fn containment_cluster_conf(certs: &ClusterTestCerts) -> ClusterConfig {
 	let mut conf = peering_cluster_conf(certs);
 	conf.pheromone.abandonment_limit = CONTAINMENT_ABANDON_LIMIT;
 	conf
 }
 
-/// Builds a conf like [`peering_cluster_conf`], but one that dials `peers` as
-/// beat anchors. Peers must pass through the builder, because the discovery
-/// table derives its un-evictable anchor set at build.
+/// Builds a configuration like [`peering_cluster_conf`], but one that dials
+/// `peers` as beat anchors. Peers must pass through the builder, because the
+/// discovery table derives its un-evictable anchor set at build.
 pub fn peering_cluster_conf_with_peers(
 	certs: &ClusterTestCerts,
 	peers: impl IntoIterator<Item = String>,
@@ -1113,8 +1111,8 @@ pub fn peering_cluster_conf_with_peers(
 		.build()
 }
 
-/// A gateway conf that advertises to `peer` on a fast beat. The conf sets no
-/// slate, so each beat snapshots the hive registry.
+/// A gateway configuration that advertises to `peer` on a fast beat. The
+/// configuration sets no slate, so each beat snapshots the hive registry.
 pub fn advertising_cluster_conf(certs: &ClusterTestCerts, peer: impl Into<String>) -> ClusterConfig {
 	let peer: String = peer.into();
 	ClusterConfig::builder(cluster_tls_config(certs))

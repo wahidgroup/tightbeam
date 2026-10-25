@@ -1,16 +1,17 @@
-//! Anchored bounded peer table with pluggable persistence.
+//! An anchored, bounded peer table with pluggable persistence.
 //!
-//! This module holds discovery state for the peer beat. The design follows
-//! Bitcoin's address manager as analyzed against eclipse attacks.
+//! This module holds the discovery state of the peer beat. The design
+//! follows Bitcoin's address manager, as the eclipse-attack analysis below
+//! reads it.
 //!
-//! - Configured anchors hold their slots for the table's life and are always dialed.
-//! - Learned peers are bucketed by address prefix with per-bucket caps.
-//!   One network position therefore holds at most its own bucket's
-//!   share of the table (CWE-770).
+//! - Configured anchors hold their slots for the table's life, and the beat always dials them.
+//! - The table buckets learned peers by address prefix, with a cap on each
+//!   bucket, so one network position holds at most its own bucket's share
+//!   of the table (CWE-770).
 //! - An unverified hint enters the `new` table only. A probe dial whose
 //!   handshake certificate proves flood membership promotes the peer to
 //!   `tried`. Only anchors and `tried` peers are beat targets.
-//! - A `tried` resident that fails consecutive beats is evicted, so a
+//! - The table evicts a `tried` resident that fails consecutive beats, so a
 //!   bucket slot follows liveness. Discovery refills the table.
 //!
 //! [`PeerStore`] is the persistence interface beneath [`PeerTable`]. The table
@@ -22,8 +23,8 @@
 //! - Heilman, Kendler, Zohar & Goldberg (2015), eclipse attacks on
 //!   Bitcoin's peer-to-peer network (new/tried tables, feeler probes,
 //!   and per-group capacity), USENIX Security '15 and ePrint 2015/263:
-//!   <https://www.usenix.org/conference/usenixsecurity15/technical-sessions/presentation/heilman>
-//!   <https://eprint.iacr.org/2015/263>
+//!   - <https://www.usenix.org/conference/usenixsecurity15/technical-sessions/presentation/heilman>
+//!   - <https://eprint.iacr.org/2015/263>
 //! - CWE-770, allocation of resources without limits or throttling:
 //!   <https://cwe.mitre.org/data/definitions/770.html>
 
@@ -52,10 +53,10 @@ use crate::utils::time::UnixMillis;
 /// Every constructor stores the socket a dual-stack host dials, so two
 /// spellings of one socket are one address (CWE-706):
 ///
-/// - An IPv4-mapped IPv6 address such as `[::ffff:192.0.2.1]:9000` is stored as its IPv4 socket.
-/// - An IPv6 flow label names no endpoint, so it is stored as zero.
+/// - An IPv4-mapped IPv6 address such as `[::ffff:192.0.2.1]:9000` becomes its IPv4 socket.
+/// - An IPv6 flow label names no endpoint, so the constructor stores it as zero.
 /// - An IPv6 scope id picks an interface for a link-local or multicast
-///   destination alone, so it is stored as zero for every other address.
+///   destination alone, so the constructor stores zero for every other address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PeerAddress(SocketAddr);
 
@@ -111,8 +112,8 @@ impl PeerAddress {
 		self.0
 	}
 
-	/// The IPv6 scope id the kernel reads for `ip`, which is the one it was
-	/// given for a link-local or multicast destination and zero otherwise.
+	/// The IPv6 scope id the kernel reads for `ip`, which is `scope_id` for a
+	/// link-local or multicast destination and zero otherwise.
 	fn kernel_scope_id(ip: &Ipv6Addr, scope_id: u32) -> u32 {
 		if ip.is_unicast_link_local() || ip.is_multicast() {
 			scope_id
@@ -148,7 +149,7 @@ impl FromStr for PeerAddress {
 	}
 }
 
-/// Bytes that are not the UTF-8 spelling of a socket address.
+/// The error for bytes that are not the UTF-8 spelling of a socket address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NotASocket;
 
@@ -188,16 +189,16 @@ impl PeerAddress {
 	}
 }
 
-/// Network locality bucket of one peer address.
+/// The network locality bucket of one peer address.
 ///
-/// IPv4 groups by a /16 prefix and IPv6 by a /32 prefix. Table capacity is
-/// spent per prefix, so one bucket bounds an attacker inside one prefix. See
-/// the module-level sources for the eclipse analysis.
+/// IPv4 groups by a /16 prefix and IPv6 by a /32 prefix. The table spends
+/// capacity per prefix, so one bucket bounds an attacker inside one prefix.
+/// See the module-level sources for the eclipse analysis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum AddressGroup {
-	/// IPv4 /16 prefix formed from the first two octets.
+	/// The IPv4 /16 prefix, formed from the first two octets.
 	V4([u8; 2]),
-	/// IPv6 /32 prefix formed from the first four octets.
+	/// The IPv6 /32 prefix, formed from the first four octets.
 	V6([u8; 4]),
 }
 
@@ -222,15 +223,16 @@ impl From<IpAddr> for AddressGroup {
 /// a hint carries has passed the dial policy before the table sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerHint {
-	/// Gateway socket claimed by the sharer, admitted by the dial policy.
+	/// The gateway socket the sharer claimed, which the dial policy admitted.
 	pub dial: AdmittedDial,
-	/// Peer certificate fingerprint last seen with this address, when known.
+	/// The peer certificate fingerprint last seen with this address, when the
+	/// sharer knows it.
 	///
 	/// The value is advisory until a probe verifies the peer.
 	pub peer_id: Option<Vec<u8>>,
 }
 
-/// One learned peer as stored by a [`PeerStore`] driver.
+/// One learned peer, as a [`PeerStore`] driver stores it.
 ///
 /// Every field is public and the struct is exhaustive, so a driver outside
 /// this crate builds the records it hydrates:
@@ -260,10 +262,10 @@ pub struct PeerHint {
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerRecord {
-	/// Gateway address for this peer, which hydration passes through the dial
-	/// policy before the table dials it.
+	/// The gateway address of this peer, which hydration passes through the
+	/// dial policy before the table dials it.
 	pub gateway_addr: PeerAddress,
-	/// Peer certificate fingerprint from the last verified probe.
+	/// The peer certificate fingerprint from the last verified probe.
 	pub peer_id: Option<Vec<u8>>,
 	/// Whether a probe has verified this peer as a flood member.
 	pub tried: bool,
@@ -271,7 +273,7 @@ pub struct PeerRecord {
 	pub last_probe: UnixMillis,
 }
 
-/// Persistence driver beneath [`PeerTable`].
+/// The persistence driver beneath [`PeerTable`].
 ///
 /// A driver only loads and saves learned records. The table owns every eclipse
 /// invariant:
@@ -296,8 +298,8 @@ pub trait PeerStore: Send + Sync {
 	fn persist(&self, records: &[PeerRecord]) -> Result<(), ClusterError>;
 }
 
-/// In-memory driver that hydrates an empty set and discards every snapshot,
-/// so discovery state lives for the process lifetime only.
+/// An in-memory driver that hydrates an empty set and discards every
+/// snapshot, so discovery state lives for the process lifetime only.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MemoryPeerStore;
 
@@ -311,7 +313,7 @@ impl PeerStore for MemoryPeerStore {
 	}
 }
 
-/// Anchored bounded peer discovery table.
+/// An anchored, bounded peer discovery table.
 ///
 /// Interior mutability lets the advertise beat, reconcile rounds, and
 /// reflood tasks share one instance through configuration.
@@ -319,7 +321,7 @@ pub struct PeerTable {
 	anchors: Vec<AdmittedDial>,
 	state: GuardedTable,
 	store: Arc<dyn PeerStore>,
-	/// Newest generation written, and the gate that orders driver writes.
+	/// The newest generation written, and the gate that orders driver writes.
 	///
 	/// This is separate from `state`, so a slow driver delays the next
 	/// write rather than the routing reads that take the table lock
@@ -360,9 +362,9 @@ impl PeerTable {
 	/// - A signer cap the operator set since the last run binds the persisted peers the same way.
 	/// - A driver fault degrades to an anchors-only start, which is safe because discovery refills the table.
 	///
-	/// The config builder is the caller, because [`PeerConfig::table`] is
-	/// derived from the config it is built from and a table built elsewhere
-	/// would be detached from it.
+	/// The config builder is the caller, because it derives
+	/// [`PeerConfig::table`] from its own config, and a table from another
+	/// caller would be detached from that config.
 	#[must_use]
 	pub(in crate::colony::cluster) fn new(peer: &PeerConfig, store: Arc<dyn PeerStore>) -> Self {
 		let anchors: Vec<AdmittedDial> = peer.peers().to_vec();
@@ -405,7 +407,7 @@ impl PeerTable {
 	///
 	/// ```
 	/// use tightbeam::colony::cluster::{PeerConfig, PeerTable};
-	/// use tightbeam::colony::common::PeerGossip;
+	/// use tightbeam::colony::protocol::PeerGossip;
 	/// use tightbeam::utils::time::UnixMillis;
 	///
 	/// let gossip = PeerGossip { peer_id: Vec::new(), gateway_addr: b"10.0.0.1:9000".to_vec() };
@@ -429,8 +431,8 @@ impl PeerTable {
 	/// Record a verified probe of `addr` and promote it into tried.
 	///
 	/// Verification is the caller's proof of flood membership on the probe
-	/// dial handshake. Returns `true` only on a promotion into tried, so the
-	/// caller can emit one discovery event per peer.
+	/// dial handshake. It returns `true` only on a promotion into tried, so
+	/// the caller can emit one discovery event per peer.
 	///
 	/// # Test before evict
 	///
@@ -440,8 +442,8 @@ impl PeerTable {
 	///
 	/// # Signer change
 	///
-	/// A resident that answers as another signer is admitted again under that
-	/// signer, so the cap counts the slot. A signer at its cap sends the
+	/// The table admits a resident that answers as another signer again under
+	/// that signer, so the cap counts the slot. A signer at its cap sends the
 	/// address back to new, and one below its cap keeps the slot with no new
 	/// discovery.
 	///
@@ -454,9 +456,10 @@ impl PeerTable {
 
 	/// Record a failed probe on its candidate, which stays in the new table.
 	///
-	/// A peer keeps sharing an address this gateway cannot reach or does not
-	/// trust. Erasing the candidate would let the next hint re-admit it at the
-	/// front of the probe queue, so the failure stays on the entry instead:
+	/// A peer shares an address again in later exchanges, even one this
+	/// gateway fails to reach or to trust. A table that erased the candidate
+	/// would let the next hint re-admit it at the front of the probe queue, so
+	/// the failure stays on the entry:
 	///
 	/// - [`Self::learn`] drops a hint for an address the table already holds.
 	/// - [`Self::probe_sample`] skips the candidate until its wait has passed.
@@ -477,10 +480,10 @@ impl PeerTable {
 		})
 	}
 
-	/// Drop a candidate this gateway can never probe.
+	/// Drop a candidate whose address fails to convert to a protocol address.
 	///
-	/// A candidate the dialing protocol cannot address is this gateway's own
-	/// limit and permanent, so it leaves the new table. A failed probe goes to
+	/// That limit is this gateway's own and permanent, so the candidate
+	/// leaves the new table. A failed probe goes to
 	/// [`Self::record_probe_failure`], a tried resident leaves through
 	/// repeated beat failures in [`Self::record_failure`], and relay scoring
 	/// handles misbehavior.
@@ -498,11 +501,11 @@ impl PeerTable {
 	/// Record a failed beat dial of a tried peer.
 	///
 	/// Residents re-verify on every beat, so consecutive failures measure
-	/// liveness. The call returns whether the peer was evicted, so the caller
+	/// liveness. The call returns whether it evicted the peer, so the caller
 	/// can emit one event per reclaimed peer and withdraw the routes that dial
 	/// the address.
 	///
-	/// - Failures reaching [`MAX_PEER_TRIED_FAILURES`] evict the entry.
+	/// - The failure that reaches [`MAX_PEER_TRIED_FAILURES`] evicts the entry.
 	/// - Eviction frees the prefix bucket slot for a live candidate.
 	/// - The threshold tolerates a transient partition.
 	/// - A verified probe resets the count.
@@ -514,8 +517,8 @@ impl PeerTable {
 	/// - Heilman, Kendler, Zohar & Goldberg (2015), eclipse attacks on
 	///   Bitcoin's peer-to-peer network (feeler probes / tried eviction),
 	///   USENIX Security '15 and ePrint 2015/263:
-	///   <https://www.usenix.org/conference/usenixsecurity15/technical-sessions/presentation/heilman>
-	///   <https://eprint.iacr.org/2015/263>
+	///   - <https://www.usenix.org/conference/usenixsecurity15/technical-sessions/presentation/heilman>
+	///   - <https://eprint.iacr.org/2015/263>
 	///
 	/// # Errors
 	///
@@ -536,7 +539,7 @@ impl PeerTable {
 	/// question at once, where a failed dial may be transient.
 	///
 	/// - A learned address leaves the beat targets at once, ahead of the failure threshold.
-	/// - A re-keyed peer therefore stops receiving advertisements.
+	/// - The beat therefore ends its advertisements to a re-keyed peer.
 	/// - A configured anchor keeps its slot and leaves the peer exchange sample.
 	/// - A learned address leaves that sample too, although its routes stay.
 	///
@@ -559,7 +562,8 @@ impl PeerTable {
 		self.state.poison();
 	}
 
-	/// Dial targets for the advertise/reconcile beat and gossip reflood.
+	/// The dial targets of the advertise and reconcile beat and the gossip
+	/// reflood.
 	///
 	/// - Anchors always lead the set, then verified tried peers.
 	/// - A `new` entry joins the set once a probe proved it a flood member.
@@ -582,19 +586,19 @@ impl PeerTable {
 		Ok(targets)
 	}
 
-	/// Bounded feeler sample of unverified candidates for this beat.
+	/// A bounded feeler sample of unverified candidates for this beat.
 	///
-	/// Sampling round-robins across prefix buckets so each prefix draws its
-	/// own share of probe capacity. Each bucket prefers the candidate with the
-	/// fewest failed probes, then its least recently probed one. Sampled
-	/// candidates are stamped with `now` so later beats rotate through the
-	/// backlog.
+	/// The sample goes round-robin across prefix buckets, so each prefix draws
+	/// its own share of probe capacity. Each bucket prefers the candidate with
+	/// the fewest failed probes, then its least recently probed one. The method
+	/// stamps each sampled candidate with `now`, so later beats rotate through
+	/// the backlog.
 	///
 	/// - Each draw starts at the prefix after the one the last draw ended on.
-	///   Every prefix is therefore reached when more prefixes hold a candidate
-	///   than one beat probes (CWE-770).
-	/// - A candidate that failed a probe is skipped until its wait has passed,
-	///   and its prefix yields the slot meanwhile
+	///   The walk therefore reaches every prefix when more prefixes hold a
+	///   candidate than one beat probes (CWE-770).
+	/// - The sample skips a candidate that failed a probe until its wait has
+	///   passed, and its prefix yields the slot meanwhile
 	///   ([`PEER_PROBE_BACKOFF_MS`](crate::constants::PEER_PROBE_BACKOFF_MS)).
 	///
 	/// # Errors
@@ -607,7 +611,7 @@ impl PeerTable {
 		self.with_table(|state| (state.probe_sample(now), false))
 	}
 
-	/// Diversity-bucketed sample of verified peers to share over PEX.
+	/// A diversity-bucketed sample of verified peers to share over PEX.
 	///
 	/// - The shareable set is tried peers plus probe-verified anchors.
 	/// - A draw goes round-robin across prefix buckets up to `cap`, so the
@@ -615,8 +619,8 @@ impl PeerTable {
 	/// - Each draw starts at the prefix after the one the last draw ended on,
 	///   so successive replies walk every prefix.
 	///
-	/// Only probe-verified peers are shared. Forwarding an unverified hint
-	/// would launder it with this gateway's reputation.
+	/// The sample holds probe-verified peers alone, because a forwarded
+	/// unverified hint would launder it with this gateway's reputation.
 	///
 	/// # Errors
 	///
@@ -645,7 +649,7 @@ impl PeerTable {
 		self.state.read(|state| state.held_among(advertised))
 	}
 
-	/// Current learned sizes as `(new, tried)` for operators and tests.
+	/// The current learned sizes, as `(new, tried)`, for operators and tests.
 	///
 	/// # Errors
 	///
@@ -695,8 +699,8 @@ impl PeerTable {
 	/// # Writes
 	///
 	/// - Every mutation routes through here, so the decision to write lives in one place.
-	/// - The guard is released before the pluggable driver runs, so a driver
-	///   that blocks delays no other caller (CWE-667).
+	/// - The method releases the guard before the pluggable driver runs, so a
+	///   driver that blocks delays no other caller (CWE-667).
 	/// - The in-memory table stays authoritative, so the beat proceeds through
 	///   a driver write fault, and the next mutation retries the write.
 	///
@@ -715,10 +719,10 @@ impl PeerTable {
 	/// Writes `records` when `generation` is newer than what the driver holds.
 	///
 	/// The gate serialises driver writes, so concurrent mutations reach the
-	/// driver in generation order. A snapshot a newer generation already
-	/// superseded is dropped, which keeps an evicted peer from returning on
-	/// the next hydrate. The gate guards one integer, which no panic can
-	/// half-write, so a poisoned gate is recovered rather than skipped.
+	/// driver in generation order. The method drops a snapshot that a newer
+	/// generation already superseded, so an evicted peer stays out of the next
+	/// hydrate. The gate guards one integer, which no panic can half-write, so
+	/// the method recovers a poisoned gate and writes.
 	fn persist_at(&self, generation: u64, records: impl AsRef<[PeerRecord]>) {
 		let records = records.as_ref();
 		let mut persisted = self.persisted.lock().unwrap_or_else(PoisonError::into_inner);
@@ -728,8 +732,8 @@ impl PeerTable {
 		}
 
 		// Persistence is advisory: the in-memory table stays authoritative
-		// and the next mutation writes again, so a driver fault is not the
-		// beat's to fail on.
+		// and the next mutation writes again, so the beat proceeds through a
+		// driver fault.
 		let _ = self.store.persist(records);
 		*persisted = generation;
 	}
@@ -902,7 +906,7 @@ mod tests {
 
 	#[test]
 	// A hint always carries an address the dial policy admitted, so a duplicate
-	// is the one refusal left for learning to apply here.
+	// is the one refusal left for `learn` to apply here.
 	fn learn_drops_duplicate_hints() -> Result<(), ClusterError> {
 		let table = PeerTable::default();
 		let admitted = table.learn(vec![hint("10.0.0.1:9000"), hint("10.0.0.1:9000")], UnixMillis::default())?;
@@ -977,7 +981,7 @@ mod tests {
 		table_capping_signers_over(cap, Arc::new(MemoryPeerStore))
 	}
 
-	/// [`table_capping_signers`] hydrated from `store`.
+	/// Builds the table of [`table_capping_signers`], hydrated from `store`.
 	fn table_capping_signers_over(cap: usize, store: Arc<dyn PeerStore>) -> PeerTable {
 		let peer = PeerConfig { tried_per_signer: NonZeroUsize::new(cap), ..Default::default() };
 		PeerTable::new(&peer, store)
@@ -1037,8 +1041,8 @@ mod tests {
 		Ok(())
 	}
 
-	// A resident whose certificate was reissued answers as a signer the table
-	// has not counted. It keeps its slot, and it is no new discovery.
+	// A resident with a reissued certificate answers as a signer outside the
+	// table's count. It keeps its slot, and it is no new discovery.
 	#[test]
 	fn a_resident_keeps_its_slot_under_a_signer_below_its_cap() -> Result<(), ClusterError> {
 		let table = table_capping_signers(1);
@@ -1220,8 +1224,8 @@ mod tests {
 		Ok(())
 	}
 
-	// The failed address is admitted again at the end, which it could be only
-	// if the newcomer took its slot.
+	// The table admits the failed address again at the end, which it can do
+	// only if the newcomer took its slot.
 	#[test]
 	fn a_full_bucket_gives_the_slot_of_a_failed_candidate_to_a_newcomer() -> Result<(), ClusterError> {
 		let table = table_with_a_full_bucket();
@@ -1328,7 +1332,7 @@ mod tests {
 		}
 	}
 
-	// The candidate is skipped one millisecond before its wait ends.
+	// The sample skips the candidate one millisecond before its wait ends.
 	#[test]
 	fn probe_sample_skips_a_failed_candidate_until_its_wait_has_passed() -> Result<(), ClusterError> {
 		let table = PeerTable::default();
@@ -1372,7 +1376,7 @@ mod tests {
 		}
 	}
 
-	// The last probe is stamped after `now`, as a backward clock step leaves
+	// The last probe stamp lies after `now`, as a backward clock step leaves
 	// it.
 	#[test]
 	fn a_backward_clock_step_does_not_hold_a_failed_candidate_out() {
@@ -1380,8 +1384,8 @@ mod tests {
 		assert!(entry.probe_due(UnixMillis::new(1_000_000 - PEER_PROBE_BACKOFF_MS)));
 	}
 
-	// The anchor is configured and no beat has verified it, so the table does
-	// not hold it. The last address was never learned.
+	// The anchor is configured and no beat has verified it, so the table holds
+	// no entry for it. The table never learned the last address.
 	#[test]
 	fn held_among_keeps_what_the_table_holds_and_drops_what_it_expelled() -> Result<(), ClusterError> {
 		let table = table_with_anchor("127.0.0.1:9000");
@@ -1456,8 +1460,8 @@ mod tests {
 		Ok(())
 	}
 
-	// A record the current dial policy refuses is dropped on hydration, so a
-	// policy the operator tightened between runs binds the persisted peers too.
+	// Hydration drops a record the current dial policy refuses, so a policy
+	// the operator tightened between runs binds the persisted peers too.
 	#[test]
 	fn hydrate_drops_records_the_dial_policy_refuses() -> Result<(), ClusterError> {
 		let seed = vec![record("192.0.2.7:9000", true), record("10.0.0.1:9000", true)];
@@ -1481,8 +1485,8 @@ mod tests {
 		Ok(())
 	}
 
-	/// A driver that stalls its first write until released, and records the
-	/// row count each snapshot carried.
+	/// A driver that stalls its first write until the test releases it, and
+	/// records the row count each snapshot carried.
 	#[derive(Debug, Default)]
 	struct StallingStore {
 		widths: Mutex<Vec<usize>>,
@@ -1558,10 +1562,11 @@ mod tests {
 		Ok(())
 	}
 
-	/// A driver that reaches back into the table while it is being written.
+	/// A driver that reaches back into the table while the table writes to
+	/// it.
 	///
-	/// The write runs after the table guard is released, so this re-entry
-	/// reads the table it was called from (CWE-667).
+	/// The write runs after the table releases its guard, so this re-entry
+	/// reads the table that called it (CWE-667).
 	struct ReentrantStore {
 		table: Mutex<Option<Arc<PeerTable>>>,
 		observed: AtomicUsize,

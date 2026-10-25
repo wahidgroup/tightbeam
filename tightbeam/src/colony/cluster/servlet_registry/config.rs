@@ -5,38 +5,38 @@ use super::ClusterError;
 use crate::colony::cluster::registry::SharedId;
 use crate::colony::cluster::servlet_registry::entry::{DialTarget, LocalRoute, PeerRoute, ServletEntry};
 use crate::colony::cluster::{AdmittedDial, ClusterConfig};
-use crate::colony::common::ServletInfo;
+use crate::colony::protocol::ServletInfo;
 use crate::constants::{MAX_PEER_GATEWAYS, MAX_PEER_ROUTES, MAX_RELAY_BUCKETS, MAX_RELAY_ROUTES};
 use crate::urn::Urn;
 use crate::utils::BasisPoints;
 
-/// Default decay per evaporation cycle in basis points (1000 = 10%).
+/// The default decay per evaporation cycle, in basis points (1000 = 10%).
 pub const DEFAULT_EVAPORATION_RATE_BPS: u16 = 1000;
-/// Default seconds between evaporation cycles.
+/// The default number of seconds between evaporation cycles.
 pub const DEFAULT_EVAPORATION_INTERVAL_SECS: u64 = 30;
-/// Default initial pheromone level of a new entry.
+/// The default initial pheromone level of a new entry.
 pub const DEFAULT_INITIAL_PHEROMONE: u64 = 5000;
-/// Default consecutive-failure count at which the registry abandons a route.
+/// The default count of consecutive failures that abandons a route.
 pub const DEFAULT_ABANDONMENT_LIMIT: u32 = 5;
-/// Default reinforcement boost on success (500 = 5% of the pheromone cap).
+/// The default pheromone boost on a success (500 = 5% of the pheromone cap).
 pub const DEFAULT_REINFORCEMENT_BOOST: u64 = 500;
-/// Default weakening penalty. At 0, a failure only adds to the trial count.
+/// The default weakening penalty. At 0, a failure only counts as a trial.
 pub const DEFAULT_WEAKENING_PENALTY: u64 = 0;
 
-/// Pheromone and abandonment settings for servlet routes.
+/// The pheromone and abandonment settings of servlet routes.
 #[derive(Debug, Clone)]
 pub struct PheromoneConfig {
-	/// Decay rate per evaporation cycle in basis points (1000 = 10%).
+	/// The decay rate per evaporation cycle, in basis points (1000 = 10%).
 	pub evaporation_rate: BasisPoints,
 	/// The interval between evaporation cycles.
 	pub evaporation_interval: Duration,
-	/// Initial pheromone level of a new entry.
+	/// The initial pheromone level of a new entry.
 	pub initial_pheromone: u64,
-	/// Count of consecutive failures at which the registry abandons an entry.
+	/// The count of consecutive failures that abandons an entry.
 	pub abandonment_limit: u32,
-	/// Pheromone boost on a successful request.
+	/// The pheromone boost on a successful request.
 	pub reinforcement_boost: u64,
-	/// Pheromone penalty on a failed request.
+	/// The pheromone penalty on a failed request.
 	pub weakening_penalty: u64,
 }
 
@@ -159,20 +159,20 @@ impl Default for PheromoneConfig {
 	}
 }
 
-/// Storage caps for peer-learned routes (CWE-770).
+/// The storage caps of peer-learned routes (CWE-770).
 ///
 /// The fields are named, so a caller cannot transpose two adjacent limits
 /// unseen. Direct slates and relay trails hold separate budgets, so
 /// direct-gateway admission keeps its headroom under relay fan-in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerCaps {
-	/// Maximum distinct peer gateways that hold an installed direct slate.
+	/// The maximum count of peer gateways that hold an installed direct slate.
 	pub max_gateways: usize,
-	/// Maximum stored direct peer routes across all gateways.
+	/// The maximum count of direct peer routes stored across all gateways.
 	pub max_routes: usize,
-	/// Maximum distinct `(origin, relay)` buckets that hold relay trails.
+	/// The maximum count of `(origin, relay)` buckets that hold relay trails.
 	pub max_relay_buckets: usize,
-	/// Maximum stored relay-trail routes across all buckets.
+	/// The maximum count of relay-trail routes stored across all buckets.
 	pub max_relay_routes: usize,
 }
 

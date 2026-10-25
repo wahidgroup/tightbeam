@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use super::{ClusterError, PheromoneConfig, RouteKind, ServletEntry, ServletRegistry, SharedId};
 use crate::colony::cluster::PeerAddress;
-use crate::colony::common::ServletTypeKey;
+use crate::colony::urn::ServletTypeKey;
 
 impl ServletRegistry {
 	/// Returns the live routes for a servlet type as shared [`Arc`] handles,
@@ -169,7 +169,7 @@ impl ServletRegistry {
 	}
 
 	/// Weakens every live peer route that dials `gateway`, relay trails
-	/// included, and returns how many it weakened. A misbehaving gateway
+	/// included, and returns how many it weakened. Misbehavior at one gateway
 	/// therefore weakens every trail through it.
 	///
 	/// # Errors
@@ -240,7 +240,7 @@ impl ServletRegistry {
 		Ok(count)
 	}
 
-	/// Returns the pheromone scoring and lifecycle configuration.
+	/// Returns the configuration of the pheromone scores and the lifecycle.
 	pub fn config(&self) -> &PheromoneConfig {
 		&self.config
 	}

@@ -1,13 +1,13 @@
-//! Key derivation functions (KDF).
+//! The key derivation functions (KDF).
 //!
-//! This module provides HKDF key derivation per [RFC 5869][rfc5869], with
+//! The module derives keys through HKDF per [RFC 5869][rfc5869], with
 //! SHA3-256 as the default hash. It serves as a general-purpose KDF and as the
 //! KDF of ECIES constructions that require distinct encryption and MAC keys.
 //!
 //! # Properties
 //!
 //! - The default provider is HKDF ([RFC 5869][rfc5869]) with SHA3-256.
-//! - Derivation is deterministic and domain-separated by the `info` parameter ([RFC 5869 §3.2][rfc5869-3.2]).
+//! - Derivation is deterministic, and the `info` parameter separates domains ([RFC 5869 §3.2][rfc5869-3.2]).
 //! - Key material stays in buffers that wipe on drop. The keys and outputs
 //!   are `Zeroizing` and `ZeroizingArray` buffers. HKDF and X9.63 hash
 //!   through the core of the digest with a buffer of their own, so the
@@ -15,7 +15,8 @@
 //!   wipe as well. The digest core wipes its own state, as the contract of
 //!   [`DigestProvider::Digest`] asks and the house SHA3 cores hold.
 //! - Input validation covers the shared secret, which [`EcdhSecret`] fixes at
-//!   32 bytes, and the output length, which each provider bounds.
+//!   the field width of its curve, and the output length, which each provider
+//!   bounds.
 //!
 //! # Providers
 //!
@@ -73,23 +74,23 @@ pub use crate::crypto::hkdf::Hkdf;
 pub(crate) use zeroizing::ZeroizingHmac;
 pub(crate) use zeroizing::{ZeroizingHash, ZeroizingHkdf};
 
-use crate::constants::{ECDH_SHARED_SECRET_SIZE, MAX_HKDF_OUTPUT_SIZE, MIN_KEY_SIZE};
+use crate::constants::{MAX_HKDF_OUTPUT_SIZE, MIN_KEY_SIZE};
 use crate::crypto::hash::{Digest, Sha3_256};
 use crate::crypto::hkdf::InvalidLength;
 use crate::crypto::secret::{Secret, SecretSlice};
 use crate::der::asn1::ObjectIdentifier;
 use crate::der::oid::AssociatedOid;
+use crate::error::ReceivedExpectedError;
 use crate::oids::HKDF_SHA3_256;
 use crate::zeroize::Zeroizing;
 use crate::Errorizable;
 use crate::{ZeroizingArray, ZeroizingBytes};
+use elliptic_curve::{Curve, FieldBytes};
 
-#[cfg(any(feature = "ecdh", feature = "hpke"))]
-use crate::crypto::common::typenum::U32;
 #[cfg(any(feature = "ecdh", feature = "hpke"))]
 use elliptic_curve::ecdh::{diffie_hellman, SharedSecret};
 #[cfg(any(feature = "ecdh", feature = "hpke"))]
-use elliptic_curve::{Curve, CurveArithmetic, PublicKey, SecretKey};
+use elliptic_curve::{CurveArithmetic, PublicKey, SecretKey};
 
 /// The result of a KDF operation.
 pub type Result<T> = ::core::result::Result<T, KdfError>;
@@ -118,7 +119,7 @@ pub trait KdfFunction {
 	fn derive_dynamic_key(ikm: &[u8], info: &[u8], salt: Option<&[u8]>, key_size: usize) -> Result<ZeroizingBytes>;
 }
 
-/// Dual-key derivation through any [`KdfFunction`].
+/// The dual-key derivation through any [`KdfFunction`].
 ///
 /// The blanket implementation is the only one, so a KDF identifier names one
 /// dual-key output whichever type implements it.
@@ -128,11 +129,11 @@ pub trait DualKeyKdf: KdfFunction {
 	/// ECIES standards such as [SECG SEC 1 v2.0 §5.1][sec1-5.1],
 	/// [IEEE Std 1363a-2004][ieee1363a], and [ISO/IEC 18033-2:2006][iso18033]
 	/// require distinct symmetric keys for encryption and for message
-	/// authentication, so no key is reused across primitives. One construction
-	/// serves every KDF:
+	/// authentication, so each primitive holds a key of its own. One
+	/// construction serves every KDF:
 	///
 	/// 1. Expand `2 * N` bytes once through [`KdfFunction::derive_dynamic_key`].
-	/// 2. Split the output into two non-overlapping keys ([SECG SEC 1 v2.0 §5.1.3][sec1-5.1.3]).
+	/// 2. Split the output into two disjoint keys ([SECG SEC 1 v2.0 §5.1.3][sec1-5.1.3]).
 	///
 	/// # Errors
 	///
@@ -281,58 +282,107 @@ pub enum KdfError {
 	#[error("Key derivation failed: {0}")]
 	DerivationFailed(InvalidLength),
 
-	/// The shared secret is not 32 bytes. The field holds the received length.
-	#[error("Invalid shared secret length: expected 32 bytes, got {0}")]
-	InvalidSharedSecretLength(usize),
+	/// The shared secret is not as wide as the field of its curve. The field
+	/// holds the received and the expected length.
+	#[error("Invalid shared secret length: {0}")]
+	InvalidSharedSecretLength(ReceivedExpectedError<usize, usize>),
 }
 
-/// An ECDH shared secret on a 256-bit curve.
+/// An ECDH shared secret on the curve `C`: the x-coordinate of the product of
+/// a scalar and a peer point (SEC 1 v2.0 §3.3.1).
 ///
-/// The length is part of the type, so a derivation that takes one relies on
-/// the type for its length check. It wipes on drop like every [`Secret`].
-pub type EcdhSecret = Secret<[u8; ECDH_SHARED_SECRET_SIZE]>;
+/// It is as wide as the field of `C`, the `Ndh` of RFC 9180 §4.1: 32 bytes on
+/// secp256k1 and P-256, 48 on P-384, and 66 on P-521. The curve is part of the
+/// type, so a derivation that takes one relies on the type for its width. It
+/// wipes on drop like every [`Secret`].
+///
+/// # Examples
+///
+/// ```
+/// use p384::{NistP384, SecretKey};
+/// use tightbeam::crypto::kdf::EcdhSecret;
+/// use tightbeam::random::OsRng;
+///
+/// let local = SecretKey::random(&mut OsRng);
+/// let peer = SecretKey::random(&mut OsRng).public_key();
+///
+/// let shared = EcdhSecret::<NistP384>::agree(&local, &peer);
+/// assert_eq!(shared.with(|x_coordinate| x_coordinate.len()), 48);
+/// ```
+#[derive(Debug)]
+pub struct EcdhSecret<C: Curve>(Secret<FieldBytes<C>>);
 
-impl TryFrom<SecretSlice<u8>> for EcdhSecret {
+impl<C: Curve> TryFrom<SecretSlice<u8>> for EcdhSecret<C> {
 	type Error = KdfError;
 
 	/// # Errors
 	///
-	/// - [`KdfError::InvalidSharedSecretLength`] -- the secret is not [`ECDH_SHARED_SECRET_SIZE`] bytes.
+	/// - [`KdfError::InvalidSharedSecretLength`] -- the secret is not as wide as the field of `C`.
 	fn try_from(secret: SecretSlice<u8>) -> Result<Self> {
-		secret.with(|bytes| sized_shared_secret(bytes))
+		secret.with(|bytes| Self::sized(bytes))
 	}
 }
 
-/// Move a curve shared secret into the fixed-width type the key schedule
-/// takes. The curve's field is exactly as wide as that type. The curve secret
-/// wipes when it drops.
+/// Move a curve shared secret into the type the key schedule takes, at the
+/// width of the field of `C`. The curve secret wipes when it drops.
 #[cfg(any(feature = "ecdh", feature = "hpke"))]
-impl<C> From<SharedSecret<C>> for EcdhSecret
-where
-	C: Curve<FieldBytesSize = U32>,
-{
+impl<C: Curve> From<SharedSecret<C>> for EcdhSecret<C> {
 	fn from(shared: SharedSecret<C>) -> Self {
-		// The bound fixes the field at 32 bytes, which is the one width whose
-		// bytes borrow as this array.
-		let x_coordinate: &[u8; ECDH_SHARED_SECRET_SIZE] = shared.raw_secret_bytes().as_ref();
-		Self::copy_of(x_coordinate)
+		Self::copy_of(shared.raw_secret_bytes())
 	}
 }
 
-impl EcdhSecret {
-	/// A secret that holds a copy of `bytes`.
+impl<C: Curve> EcdhSecret<C> {
+	/// Lend the secret to `f` for the length of the call, so a derivation
+	/// reads it with no owned copy.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::crypto::k256::Secp256k1;
+	/// use tightbeam::crypto::kdf::EcdhSecret;
+	/// use tightbeam::crypto::secret::SecretSlice;
+	///
+	/// let shared = EcdhSecret::<Secp256k1>::try_from(SecretSlice::from(vec![0x11; 32]))?;
+	/// assert!(shared.with(|x_coordinate| x_coordinate.iter().all(|&octet| octet == 0x11)));
+	/// # Ok::<(), tightbeam::crypto::kdf::KdfError>(())
+	/// ```
+	pub fn with<R>(&self, f: impl FnOnce(&FieldBytes<C>) -> R) -> R {
+		self.0.with(f)
+	}
+
+	/// Returns a secret that holds a copy of `bytes`.
 	///
 	/// The bytes land in the wiping buffer directly, so no plain array of the
-	/// shared secret exists on the way (CWE-226). Every conversion into this
-	/// type copies here.
-	fn copy_of(bytes: &[u8; ECDH_SHARED_SECRET_SIZE]) -> Self {
-		let mut sized = ZeroizingArray::new([0u8; ECDH_SHARED_SECRET_SIZE]);
+	/// shared secret exists on the way (CWE-226). Every conversion from a curve
+	/// [`SharedSecret`] copies here, and the output of a provider copies in
+	/// [`Self::sized`].
+	#[cfg(any(test, feature = "ecdh", feature = "hpke"))]
+	fn copy_of(bytes: &FieldBytes<C>) -> Self {
+		let mut sized = Zeroizing::new(FieldBytes::<C>::default());
 		sized.copy_from_slice(bytes);
-		Secret::from(sized)
+		Self(Secret::from(sized))
 	}
 
-	/// A second owner of this secret, for a holder that derives from it more
-	/// than once.
+	/// Check the length of `bytes` against the field of `C`, then copy them
+	/// into the wiping buffer of the secret (CWE-226).
+	///
+	/// # Errors
+	///
+	/// - [`KdfError::InvalidSharedSecretLength`] -- `bytes` is not as wide as the field of `C`.
+	fn sized(bytes: &[u8]) -> Result<Self> {
+		let mut sized = Zeroizing::new(FieldBytes::<C>::default());
+		if bytes.len() != sized.len() {
+			let width = ReceivedExpectedError { received: bytes.len(), expected: sized.len() };
+			return Err(KdfError::InvalidSharedSecretLength(width));
+		}
+
+		sized.copy_from_slice(bytes);
+		Ok(Self(Secret::from(sized)))
+	}
+
+	/// Returns a second owner of this secret, for a holder that derives from
+	/// it more than once.
 	#[cfg(test)]
 	pub(crate) fn duplicate(&self) -> Self {
 		self.with(Self::copy_of)
@@ -345,27 +395,36 @@ impl EcdhSecret {
 	/// which keeps its scalar private, and a `SigningKeyProvider`, whose key
 	/// may live outside the process. Each of them converts its output into
 	/// this type.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use p521::{NistP521, SecretKey};
+	/// use tightbeam::crypto::kdf::EcdhSecret;
+	/// use tightbeam::random::OsRng;
+	///
+	/// let alice = SecretKey::random(&mut OsRng);
+	/// let bob = SecretKey::random(&mut OsRng);
+	///
+	/// let by_alice = EcdhSecret::<NistP521>::agree(&alice, &bob.public_key());
+	/// let by_bob = EcdhSecret::<NistP521>::agree(&bob, &alice.public_key());
+	/// assert_eq!(by_alice.with(|x| x.to_vec()), by_bob.with(|x| x.to_vec()));
+	/// ```
 	#[cfg(any(feature = "ecdh", feature = "hpke"))]
-	pub fn agree<C>(secret: &SecretKey<C>, peer: &PublicKey<C>) -> Self
+	pub fn agree(secret: &SecretKey<C>, peer: &PublicKey<C>) -> Self
 	where
-		C: CurveArithmetic + Curve<FieldBytesSize = U32>,
+		C: CurveArithmetic,
 	{
 		let shared = diffie_hellman(secret.to_nonzero_scalar(), peer.as_affine());
 		Self::from(shared)
 	}
 }
 
-/// Check the length of `bytes`, then copy them into the fixed-width secret.
-fn sized_shared_secret(bytes: &[u8]) -> Result<EcdhSecret> {
-	let sized = <&[u8; ECDH_SHARED_SECRET_SIZE]>::try_from(bytes);
-	let sized = sized.map_err(|_| KdfError::InvalidSharedSecretLength(bytes.len()))?;
-
-	Ok(EcdhSecret::copy_of(sized))
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::crypto::k256::Secp256k1;
+	use p521::NistP521;
 
 	#[track_caller]
 	fn assert_key_length(key: &[u8], expected_len: usize) {
@@ -406,14 +465,20 @@ mod tests {
 	const INFO_V2: &[u8] = b"protocol-v2";
 	const SALT: &[u8] = b"random_salt_value";
 
-	// `EcdhSecret` refuses a shared secret of the wrong length, so every
-	// derivation runs on exactly 32 bytes.
+	// `EcdhSecret` refuses a shared secret of another width than the field of
+	// its curve, so every derivation runs on exactly that width: 32 bytes on
+	// secp256k1, and 66 on P-521.
 	#[test]
 	fn a_shared_secret_of_the_wrong_length_is_refused() {
-		let short = EcdhSecret::try_from(SecretSlice::from(b"short".to_vec()));
-		let long = EcdhSecret::try_from(SecretSlice::from(b"shared_secret_that_is_too_long____".to_vec()));
-		assert!(matches!(short, Err(KdfError::InvalidSharedSecretLength(5))));
-		assert!(matches!(long, Err(KdfError::InvalidSharedSecretLength(34))));
+		let short = EcdhSecret::<Secp256k1>::try_from(SecretSlice::from(b"short".to_vec()));
+		let long = EcdhSecret::<Secp256k1>::try_from(SecretSlice::from(b"shared_secret_that_is_too_long____".to_vec()));
+		let narrow = EcdhSecret::<NistP521>::try_from(SecretSlice::from(vec![0x11; 32]));
+		let short_width = ReceivedExpectedError { received: 5, expected: 32 };
+		let long_width = ReceivedExpectedError { received: 34, expected: 32 };
+		let narrow_width = ReceivedExpectedError { received: 32, expected: 66 };
+		assert!(matches!(short, Err(KdfError::InvalidSharedSecretLength(width)) if width == short_width));
+		assert!(matches!(long, Err(KdfError::InvalidSharedSecretLength(width)) if width == long_width));
+		assert!(matches!(narrow, Err(KdfError::InvalidSharedSecretLength(width)) if width == narrow_width));
 	}
 
 	// General-purpose HKDF derives 16, 32, and 64-byte keys. The same inputs
@@ -498,8 +563,8 @@ mod tests {
 		assert!(matches!(x963_below_min, Err(KdfError::DerivationFailed(_))));
 	}
 
-	// A SharedInfo longer than 256 bytes must derive without a panic, so no
-	// fixed 256-byte buffer holds it.
+	// A SharedInfo longer than 256 bytes must derive without the panic that a
+	// fixed 256-byte buffer would raise.
 	#[test]
 	fn test_x963_dual_keys_large_shared_info() -> crate::error::Result<()> {
 		let large_info = vec![0xABu8; 300];

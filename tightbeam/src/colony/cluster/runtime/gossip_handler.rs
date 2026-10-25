@@ -9,8 +9,8 @@ use crate::colony::cluster::runtime::gossip_tasks::{GossipOrigin, GossipPipeline
 use crate::colony::cluster::runtime::refuse::Refusal;
 use crate::colony::cluster::{ClusterConfig, ClusterError, PeerCaps, ServletRegistry, VerifiedRumor};
 use crate::colony::cluster::{GossipDigest, RouteKind, WantList};
-use crate::colony::common::PeerGossip;
-use crate::colony::common::{
+use crate::colony::protocol::PeerGossip;
+use crate::colony::protocol::{
 	GossipReconciliation, GossipRumor, GossipWant, PeerAdvertisement, PeerAdvertisementResponse, ReplyForm,
 };
 use crate::constants::MAX_PEX_SAMPLE;
@@ -23,7 +23,7 @@ use crate::TightBeamError;
 use crate::Version;
 
 impl<P: Protocol> GatewayRuntimeCtx<P> {
-	/// Admit one directly dialed peer advertisement and reconcile its slate.
+	/// Admits one directly dialed peer advertisement and reconciles its slate.
 	pub(crate) async fn handle_peer_ad(
 		&self,
 		frame: Frame,
@@ -52,9 +52,8 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 		};
 
 		// A verified advertiser is also a discovery hint, so the beat graph
-		// runs in both directions and this gateway's own probe dials a
-		// seed-bootstrapped node. The hint sits in the capped new table until
-		// that probe proves the address answers as a flood member.
+		// runs in both directions, and this gateway's own probe dials a
+		// seed-bootstrapped node.
 		let hint = admitted.discovery_hint();
 		let learned_at = self.config.clock.unix();
 		if self.config.peer.table.learn([hint], learned_at).is_err() {
@@ -79,7 +78,7 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 }
 
 impl<P: ColonyDialProtocol> GossipPipelineCtx<P> {
-	/// Admit a peer-relayed origin-signed rumor and continue the flood.
+	/// Admits a peer-relayed origin-signed rumor and continues the flood.
 	pub(crate) async fn relay(self, frame: Frame, rumor: Box<Frame>) -> Result<Option<Frame>, TightBeamError> {
 		let rumor = *rumor;
 		// The flood is scoped (CWE-668), so the relay peer MUST be a member of
@@ -130,8 +129,8 @@ impl<P: ColonyDialProtocol> GossipPipelineCtx<P> {
 		};
 		let rumor = VerifiedRumor::new(rumor, signature);
 
-		// Freshness for a relayed rumor is its issue time, which `admit`
-		// checks against the seen window (`seen_ttl`) rather than the control
+		// The freshness of a relayed rumor is its issue time, which `admit`
+		// checks against the seen window (`seen_ttl`) in place of the control
 		// window.
 		self.run(GossipOrigin::Relay, frame, rumor, hop_ttl, Some(relay_id), Some(rumor_signer))
 			.await
@@ -222,10 +221,9 @@ impl ClusterConfig {
 			gateway_addr: record.gateway_addr.to_string().into_bytes(),
 		});
 
-		// Registry entries are borrowed, so the wire message copies them once.
-		// Only direct routes qualify, because a relay trail pairs the origin's
-		// identity with the relay's dial address, and that pair names no
-		// dialable peer.
+		// The wire message copies each borrowed entry once. Only direct routes
+		// qualify, because a relay trail pairs the origin's identity with the
+		// relay's dial address, a pair that names no dialable peer.
 		let peer_entries = servlet_registry.peer_entries()?;
 		let direct = peer_entries.iter().filter(|entry| entry.route_kind() == RouteKind::Peer);
 
@@ -266,7 +264,7 @@ impl<P: Protocol> ColonyConfig<P> {
 }
 
 impl<P: Protocol> GatewayRuntimeCtx<P> {
-	/// Answer one anti-entropy reconcile round from a flood member.
+	/// Answers one anti-entropy reconcile round from a flood member.
 	///
 	/// The reply names the digests this gateway still needs, beside a
 	/// peer-exchange sample.

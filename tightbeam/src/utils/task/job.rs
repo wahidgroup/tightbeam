@@ -1,4 +1,4 @@
-//! Reusable frame composition functions, which the `job!` macro defines.
+//! The reusable frame composition functions that the `job!` macro defines.
 //!
 //! A job is a stateless unit of work that transforms an input into an
 //! output. A job is sync or async, and its output is typically
@@ -199,9 +199,9 @@ macro_rules! job {
 #[cfg(test)]
 mod tests {
 	#[cfg(feature = "colony")]
-	use crate::colony::common::{ColonyNamespace, HiveManagement};
+	use crate::colony::protocol::{HiveManagement, ListServletsParams, SpawnServletParams, StopServletParams};
 	#[cfg(feature = "colony")]
-	use crate::colony::hive::{ListServletsParams, SpawnServletParams, StopServletParams};
+	use crate::colony::urn::ColonyNamespace;
 	#[cfg(any(feature = "colony", feature = "tokio"))]
 	use crate::error::Result;
 	#[cfg(feature = "colony")]

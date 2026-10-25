@@ -24,6 +24,7 @@ use std::vec::Vec;
 use crate::constants::{
 	DEFAULT_MUX_CHUNK_SIZE, DEFAULT_MUX_CREDIT_UNIT, DEFAULT_MUX_STREAM_CREDIT, MAX_MUX_STREAM_CAP,
 };
+use crate::crypto::common::typenum::Unsigned;
 use crate::crypto::common::KeySizeUser;
 use crate::crypto::hash::Digest;
 use crate::crypto::profiles::{CryptoProvider, ProfileStrength, SecurityProfileDesc};
@@ -34,6 +35,7 @@ use crate::transport::handshake::receipt::SessionReceipt;
 use crate::utils::marker::{MaybeSend, MaybeSendFuture, MaybeSync};
 use crate::Beamable;
 use crate::Errorizable;
+use elliptic_curve::FieldBytesSize;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::constants::{MAX_MUX_CHUNK_SIZE, MAX_MUX_SESSION_BUDGET, MAX_MUX_STREAM_CREDIT, MIN_MUX_CHUNK_SIZE};
@@ -155,7 +157,8 @@ pub struct TransportOffer {
 	/// Largest inbound chunk payload the sender of this struct accepts.
 	///
 	/// The receiver clamps it to `MIN_MUX_CHUNK_SIZE..=MAX_MUX_CHUNK_SIZE`.
-	/// Chunking is always on, so no value opts out of it.
+	/// Chunking is always on, so every value, zero included, clamps into that
+	/// range.
 	pub chunk_payload_size: u32,
 	/// Bytes per session-budget credit that the client proposes. The value in
 	/// the [`TransportAccept`] wins.
@@ -325,8 +328,8 @@ impl MuxSettings {
 		}
 	}
 
-	/// Static records this endpoint reserves so a graceful drain can finish
-	/// after the GoAway fires.
+	/// Static records this endpoint reserves so the drain can finish after the
+	/// GoAway fires.
 	///
 	/// When a limit check trips, the connection can still owe these records:
 	///
@@ -336,8 +339,8 @@ impl MuxSettings {
 	/// - The GoAway itself, exactly 1.
 	///
 	/// The total is `2 * (local_cap + peer_cap) + 1`. A hostile peer that
-	/// keeps opening streams after the GoAway draws refusal cancels beyond any
-	/// bound, and it only exhausts the cipher of its own dying connection.
+	/// opens more streams after the GoAway draws refusal cancels beyond any
+	/// bound, and it exhausts only the cipher of its own draining connection.
 	///
 	/// # Sources
 	///
@@ -386,7 +389,8 @@ fn clamp_stream_cap(cap: u32) -> u32 {
 /// `MIN_MUX_CHUNK_SIZE..=MAX_MUX_CHUNK_SIZE`.
 ///
 /// The floor bounds the records a tiny advertisement could consume
-/// (CWE-770). Chunking is the only send path, so no value opts out.
+/// (CWE-770). Chunking is the only send path, so every value clamps into the
+/// range.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 fn clamp_chunk_size(size: u32) -> u32 {
 	size.clamp(MIN_MUX_CHUNK_SIZE, MAX_MUX_CHUNK_SIZE)
@@ -450,9 +454,9 @@ impl<'a> TransportNegotiation<'a> {
 			return None;
 		}
 
-		// This is the single clamp point for the grant, so the accept equals
-		// what the transport enforces and what the session receipt attests
-		// (SSOT, CWE-770).
+		// The grant clamps here, before the accept carries it, so the accept
+		// equals what the transport enforces and what the session receipt
+		// attests (SSOT, CWE-770).
 		let granted_budgets = match (offer.requested_budgets, local.requested_budgets) {
 			(Some(requested), Some(ceiling)) => Some(requested.min(ceiling).clamped()),
 			_ => None,
@@ -878,13 +882,13 @@ pub enum NegotiationError {
 	#[error("Transport authorization refused: code {code}")]
 	AuthorizationRefused { code: u32 },
 
-	/// The authorizer issued a settlement challenge without granting
-	/// budgets, so no receipt exists to carry it.
+	/// The authorizer issued a settlement challenge with no budget grant, so
+	/// no receipt exists to carry it.
 	#[error("Settlement challenge issued without budget grant")]
 	ChallengeWithoutBudgets,
 
 	/// The peer granted budgets beyond [`MAX_MUX_SESSION_BUDGET`], and the
-	/// client refuses the grant instead of clamping it.
+	/// client refuses the grant rather than clamp it.
 	#[error("Granted budgets exceed the session budget cap")]
 	BudgetBeyondCap,
 
@@ -940,12 +944,13 @@ impl<P: CryptoProvider> RunnableProfile<P> {
 	}
 
 	/// The strength a [`ProfileStrengthPolicy`] judges, read from the
-	/// provider's cipher and digest types.
+	/// provider's cipher, digest, and curve types.
 	pub fn strength(&self) -> ProfileStrength {
 		ProfileStrength {
 			descriptor: self.descriptor,
 			aead_key_bytes: <P::AeadCipher as KeySizeUser>::key_size(),
 			digest_bytes: <P::Digest as Digest>::output_size(),
+			curve_field_bytes: FieldBytesSize::<P::Curve>::USIZE,
 		}
 	}
 }
@@ -1005,8 +1010,8 @@ impl StrengthFloor {
 		Self(Some(policy))
 	}
 
-	/// The policy this floor applies under the provider `P`: the policy it
-	/// was built with, or the floor `P` names.
+	/// The policy this floor applies under the provider `P`: its own policy,
+	/// or the floor `P` names.
 	pub(crate) fn policy<P: CryptoProvider>(&self) -> &dyn ProfileStrengthPolicy {
 		match &self.0 {
 			Some(policy) => policy.as_ref(),
@@ -1982,6 +1987,16 @@ mod tests {
 	fn the_default_floor_refuses_a_128_bit_aead_key() {
 		let strength = RunnableProfile::<DefaultCryptoProvider>::native().strength();
 		let weak = ProfileStrength { aead_key_bytes: 16, ..strength };
+		assert!(DefaultStrengthFloor.meets_floor(&strength));
+		assert!(!DefaultStrengthFloor.meets_floor(&weak));
+	}
+
+	/// A 24-byte field is the field of P-192, whose agreement holds 80 bits
+	/// of strength (NIST SP 800-57 Part 1 Rev. 5 Table 2).
+	#[test]
+	fn the_default_floor_refuses_a_192_bit_curve_field() {
+		let strength = RunnableProfile::<DefaultCryptoProvider>::native().strength();
+		let weak = ProfileStrength { curve_field_bytes: 24, ..strength };
 		assert!(DefaultStrengthFloor.meets_floor(&strength));
 		assert!(!DefaultStrengthFloor.meets_floor(&weak));
 	}

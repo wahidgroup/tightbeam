@@ -1,4 +1,4 @@
-//! Export boundary for federated peers.
+//! The export boundary for federated peers.
 //!
 //! A gateway serves first-party callers (its own clients and hives) and
 //! external peer gateways from other organizations. The export boundary
@@ -128,7 +128,7 @@ pub struct StaticExportList {
 }
 
 impl StaticExportList {
-	/// Build an allowlist from the given servlet type URNs.
+	/// Builds an allowlist from the given servlet type URNs.
 	pub fn new(types: impl IntoIterator<Item = Urn<'static>>) -> Self {
 		let types: Vec<Urn<'static>> = types.into_iter().collect();
 		let keys = types.iter().map(Urn::canonical_bytes).collect();
@@ -175,12 +175,12 @@ pub struct DynamicExportList {
 }
 
 impl DynamicExportList {
-	/// Build a mutable allowlist from the given servlet type URNs.
+	/// Builds a mutable allowlist from the given servlet type URNs.
 	pub fn new(types: impl IntoIterator<Item = Urn<'static>>) -> Self {
 		Self { membership: RwLock::new(ExportMembership::new(types)) }
 	}
 
-	/// Replace the export membership with `types`.
+	/// Replaces the export membership with `types`.
 	///
 	/// # Errors
 	///
@@ -190,7 +190,7 @@ impl DynamicExportList {
 	///
 	/// ```
 	/// use tightbeam::colony::cluster::{DynamicExportList, ExportAllowlist};
-	/// use tightbeam::colony::common::ColonyNamespace;
+	/// use tightbeam::colony::urn::ColonyNamespace;
 	///
 	/// let ping = ColonyNamespace::default().servlet("ping")?;
 	/// let list = DynamicExportList::default();
@@ -200,8 +200,8 @@ impl DynamicExportList {
 	/// # Ok::<(), Box<dyn core::error::Error>>(())
 	/// ```
 	pub fn set(&self, types: impl IntoIterator<Item = Urn<'static>>) -> Result<(), ClusterError> {
-		// The membership is built from the caller's iterator before the lock
-		// is taken, so the lock guards the swap of a finished value alone.
+		// The membership comes from the caller's iterator before the lock, so
+		// the lock guards the swap of a finished value alone.
 		let membership = ExportMembership::new(types);
 
 		let mut guard = self.membership.write()?;
@@ -210,7 +210,7 @@ impl DynamicExportList {
 		Ok(())
 	}
 
-	/// Insert `target` when it is not already listed.
+	/// Inserts `target` when the list lacks it.
 	///
 	/// # Errors
 	///
@@ -220,7 +220,7 @@ impl DynamicExportList {
 	///
 	/// ```
 	/// use tightbeam::colony::cluster::{DynamicExportList, ExportAllowlist};
-	/// use tightbeam::colony::common::ColonyNamespace;
+	/// use tightbeam::colony::urn::ColonyNamespace;
 	///
 	/// let ping = ColonyNamespace::default().servlet("ping")?;
 	/// let list = DynamicExportList::default();
@@ -239,7 +239,7 @@ impl DynamicExportList {
 		Ok(())
 	}
 
-	/// Remove every entry equal to `target`.
+	/// Removes every entry equal to `target`.
 	///
 	/// # Errors
 	///
@@ -249,7 +249,7 @@ impl DynamicExportList {
 	///
 	/// ```
 	/// use tightbeam::colony::cluster::{DynamicExportList, ExportAllowlist};
-	/// use tightbeam::colony::common::ColonyNamespace;
+	/// use tightbeam::colony::urn::ColonyNamespace;
 	///
 	/// let ping = ColonyNamespace::default().servlet("ping")?;
 	/// let list = DynamicExportList::new([ping.clone()]);
@@ -261,9 +261,9 @@ impl DynamicExportList {
 	pub fn remove(&self, target: &Urn<'_>) -> Result<(), ClusterError> {
 		let mut guard = self.membership.write()?;
 
-		// The loop collects keys from the entries it drops rather than
-		// recompute them from `target`, so a stored entry that compares equal
-		// under a different canonical form still drops its own cached key.
+		// The loop collects the keys of the entries it drops, so a stored entry
+		// that compares equal under another canonical form still drops its own
+		// cached key.
 		let mut dropped = Vec::new();
 		guard.types.retain(|allowed| {
 			if allowed == target {
@@ -310,7 +310,7 @@ impl ExportAllowlist for DynamicExportList {
 /// - The unary work arm.
 /// - The streaming and duplex open handlers.
 pub trait ExportGate: Send + Sync {
-	/// Decide whether `session` may reach `target` on this gateway.
+	/// Decides whether `session` may reach `target` on this gateway.
 	///
 	/// - `target`: servlet type under enforcement
 	/// - `session`: caller identity facts (see
@@ -320,9 +320,8 @@ pub trait ExportGate: Send + Sync {
 	/// - `planes`: the two federation trust planes, for gates that reuse
 	///   the first-party classifier through
 	///   [`TrustPlanes::classify_session`] beside their own rules
-	/// - `relayed`: `true` when the request already spent relay budget
-	///   and therefore entered through a peer gateway rather than a
-	///   direct client
+	/// - `relayed`: `true` when the request already spent relay budget and
+	///   therefore entered through a peer gateway
 	fn evaluate(
 		&self,
 		target: &Urn<'_>,
@@ -569,7 +568,7 @@ impl<'a> From<&'a super::ClusterTlsConfig> for TrustPlanes<'a> {
 }
 
 impl<'a> TrustPlanes<'a> {
-	/// Pair a hive-plane and a peer-plane trust store.
+	/// Pairs a hive-plane and a peer-plane trust store.
 	///
 	/// Prefer [`From`] on a [`ClusterTlsConfig`](super::ClusterTlsConfig), as
 	/// the enforcement path does, where one is available. This constructor
@@ -581,7 +580,7 @@ impl<'a> TrustPlanes<'a> {
 		Self { hive: stores.hive, peer: stores.peer }
 	}
 
-	/// Classify `cert` against the two planes.
+	/// Classifies `cert` against the two planes.
 	///
 	/// Peer membership wins and is public-key identity: a caller whose
 	/// key is enrolled in `peer_trust` is [`Party::Peer`], even when the
@@ -596,7 +595,7 @@ impl<'a> TrustPlanes<'a> {
 		self.classify_by(|trust| trust.trusts_public_key(cert))
 	}
 
-	/// Classify the peer a session proved by the canonical key the session
+	/// Classifies the peer a session proved by the canonical key the session
 	/// holds, under the precedence of [`TrustPlanes::classify`]. The house
 	/// store finds the key with no decode.
 	///
@@ -686,7 +685,7 @@ impl<'a> TrustPlanes<'a> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::colony::common::ColonyNamespace;
+	use crate::colony::urn::ColonyNamespace;
 	use crate::crypto::policy::Secp256k1Policy;
 	use crate::crypto::x509::store::{CertificateTrustBuilder, TrustBuilder};
 	use crate::testing::{TestCertificate, TestKey};

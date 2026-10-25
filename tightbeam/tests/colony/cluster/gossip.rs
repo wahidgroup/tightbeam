@@ -12,7 +12,7 @@ use crate::seams::outside_identity_of;
 use core::sync::atomic::AtomicUsize;
 use std::sync::PoisonError;
 use tightbeam::colony::cluster::{PeerRecord, PeerStore};
-use tightbeam::colony::common::PeerGossip;
+use tightbeam::colony::protocol::PeerGossip;
 use tightbeam::constants::MAX_PEX_SAMPLE;
 use tightbeam::crypto::x509::KeyPurposes;
 use tightbeam::prelude::TightBeamSocketAddr;
@@ -76,10 +76,11 @@ pub async fn hive_publish_gossip_at(
 
 /// A payload-only rumor body.
 ///
-/// The flood scope and each receiving gateway decide where the rumor goes.
+/// The flood scope and each gateway that receives the rumor decide where it
+/// goes.
 ///
-/// - Flood scope is the namespace, and the origin certificate's colony URN proves membership.
-/// - Local delivery is the receiving gateway's ingress policy.
+/// - The flood scope is the namespace, and the origin certificate's colony URN proves membership.
+/// - Local delivery is the ingress policy of the gateway that receives the rumor.
 /// - The outer frame's `metadata.lifetime` carries the hop radius, and the body carries none.
 pub fn rumor_body(payload: impl Into<Vec<u8>>) -> GossipRumor {
 	let payload: Vec<u8> = payload.into();
@@ -197,8 +198,8 @@ impl RumorRelay<'_> {
 		self.send_with_hops(trace, connect_certs, cluster, label, 0).await
 	}
 
-	/// [`Self::send`] in an envelope with `hop_ttl` hops left, so the gateway
-	/// that receives the rumor floods it on.
+	/// Relays the rumor as [`Self::send`] does, in an envelope with `hop_ttl`
+	/// hops left, so the gateway that receives the rumor floods it on.
 	async fn send_with_hops(
 		self,
 		trace: &TraceCollector,
@@ -294,8 +295,8 @@ pub async fn wait_for_gossip_converged(
 /// Polls until the journal holds exactly `count` rumors that await local
 /// delivery, or the attempts run out.
 ///
-/// A rumor accepted before the ingress servlet registers stays pending for
-/// the beat to retry.
+/// A rumor that the gateway accepts before the ingress servlet registers
+/// stays pending for the beat to retry.
 async fn wait_for_pending_local(
 	journal: &Arc<MemoryGossipJournal>,
 	count: usize,
@@ -331,7 +332,7 @@ tb_assert_spec! {
 // ping servlet exactly once (ACCEPTED = 3).
 //
 // - The journal absorbs a second publish of the byte-identical rumor as one DUPLICATE.
-// - The gateway answers the duplicate Ok and delivers it nowhere a second time.
+// - The gateway answers the duplicate Ok, and ACCEPTED stays at three.
 // - The duplicate fires before its reply, so the count needs no poll.
 tb_scenario! {
 	name: cluster_gossip_floods_every_cluster_once,
@@ -358,10 +359,9 @@ tb_scenario! {
 			hive_b.register_with_cluster(gateway_b.addr()).await?;
 			hive_c.register_with_cluster(gateway_c.addr()).await?;
 
-			// The test sends one signed publish frame twice, byte for byte. The
-			// origin gateway re-creates the same rumor, with the same id,
-			// order, and body, and the journal absorbs the second as a
-			// Duplicate.
+			// The test sends this signed publish frame twice, byte for byte, so
+			// the origin gateway re-creates one rumor with the same id, order,
+			// and body, and the journal absorbs the second as a Duplicate.
 			let frame = hive_publish_gossip(
 				&certs,
 				b"flood-rumor",
@@ -407,8 +407,7 @@ tb_assert_spec! {
 // outside A's peer list. The rumor therefore reaches C only through the
 // reflood at B.
 //
-// - The publish starts at ttl 2 and arrives at C with ttl 0.
-// - The rumor spends its whole hop budget.
+// - The publish starts at ttl 2 and arrives at C with ttl 0, its whole hop budget spent.
 // - The chain delivers once per cluster with no duplicate.
 tb_scenario! {
 	name: cluster_gossip_relays_across_partial_topology,
@@ -475,13 +474,12 @@ tb_assert_spec! {
 
 // A rumor propagates on hive trust alone.
 //
-// A configures a peer but no `peer_trust`, so it builds no peer pool. The
-// reflood falls back to the hive pool, the same preference the advertise beat
-// uses.
+// A configures a peer but no `peer_trust`, so it builds no peer pool, and its
+// reflood falls back to the hive pool, as the advertise beat does.
 //
 // - The rumor reaches B.
 // - B verifies A's relay on its own peer plane.
-// - The publish starts at ttl 1: each cluster delivers once and B refloods nowhere.
+// - The publish starts at ttl 1, so each cluster delivers once and the hop budget ends at B.
 tb_scenario! {
 	name: cluster_gossip_refloods_under_hive_trust_only,
 	spec: ClusterGossipHiveTrustOnlySpec,
@@ -637,8 +635,8 @@ tb_assert_spec! {
 
 // The trust planes stay apart, and admission bounds the rumor size.
 //
-// - A hive-plane signer must not relay peer gossip.
-// - A peer-plane signer must not publish origin gossip.
+// - The gateway refuses peer gossip that a hive-plane signer relays.
+// - The gateway refuses origin gossip that a peer-plane signer publishes.
 // - Admission refuses an oversized rumor even on the correct plane.
 // - The gateway delivers nothing and records nothing for reflood.
 tb_scenario! {
@@ -835,7 +833,8 @@ tb_scenario! {
 	}
 }
 
-/// A counting [`GossipJournal`] that wraps the in-memory default.
+/// A [`GossipJournal`] that counts records and acks and wraps the in-memory
+/// default.
 ///
 /// The counters show that the gateway records and acks through the injected
 /// trait object. A durable backend swaps in the same way.
@@ -998,13 +997,10 @@ tb_assert_spec! {
 // The gateway clamps the freshness window (seen_ttl) to the journal's
 // retention horizon at start.
 //
-// The configuration asks for an hour-wide window over a one-second journal.
-// After the journal prunes the entry, the gateway refuses a byte-identical
-// replay as stale rather than re-admit it as New. The scenario issues the
-// rumor at the reading of the gateway's manual clock, which it alone moves.
-//
-// Without the clamp, the replay reads as "fresh", so the gateway records it
-// again and delivers the same rumor to local servlets twice.
+// - The configuration asks for an hour-wide window over a one-second journal.
+// - The scenario issues the rumor at the reading of the gateway's manual clock, which it alone moves.
+// - After the journal prunes the entry, the gateway refuses a byte-identical replay as stale.
+// - Without the clamp the replay reads as fresh, so the gateway records it as New and delivers it twice.
 //
 // Sources:
 //
@@ -1075,10 +1071,7 @@ tb_assert_spec! {
 //
 // - The gateway absorbs two byte-identical echoes of A for free.
 // - The bucket keeps its second token to admit rumor B.
-// - If duplicates spent tokens, the echoes would drain the bucket, and the
-//   bucket would then refuse B with ResourceExhausted.
-//
-// Relay echo traffic is normal, so it spends no rate token.
+// - If duplicates spent tokens, the echoes would drain the bucket, and B would draw ResourceExhausted.
 tb_scenario! {
 	name: cluster_gossip_duplicates_spend_no_tokens,
 	spec: ClusterGossipDuplicateFreeSpec,
@@ -1173,7 +1166,7 @@ tb_scenario! {
 ///
 /// That is what the reconcile beat sees while an admission is mid-delivery,
 /// and what the admission sees while the beat is mid-delivery. Either way the
-/// second caller must not deliver.
+/// second caller skips the delivery.
 struct HeldJournal {
 	inner: MemoryGossipJournal,
 	acks: AtomicU64,
@@ -1257,9 +1250,8 @@ tb_assert_spec! {
 // A rumor that another task already claimed gets no second delivery.
 //
 // The delivery path must take the claim before the ingress round trip. A
-// path that skipped the claim would deliver this rumor, ack it, and trace
-// CLUSTER_GOSSIP_ACCEPTED, which is the at-least-once behavior the claim
-// exists to remove (CWE-362).
+// path that skipped it would deliver the rumor, ack it, and trace ACCEPTED,
+// the at-least-once behavior the claim exists to remove (CWE-362).
 tb_scenario! {
 	name: cluster_gossip_held_claim_is_not_delivered_twice,
 	spec: ClusterGossipHeldClaimSpec,
@@ -1319,12 +1311,12 @@ tb_assert_spec! {
 
 // The gateway scores a relay whose rumors admission refuses.
 //
-// A trusted peer that relays rumors refused at admission (here an over-TTL
+// A trusted peer that relays rumors that admission refuses (here an over-TTL
 // flood request) weakens its own advertised work routes.
 //
 // - Each refusal weakens the trail by one trial until the gateway abandons it.
 // - `peer_routes` then leaves it out.
-// - The fourth refusal scores nothing once the trail is gone.
+// - The fourth refusal finds the trail gone, so RELAY_WEAKENED stays at three.
 // - An honest relay from the same signer still delivers.
 // - Work-route abandonment leaves the flood untouched.
 tb_scenario! {
@@ -1345,8 +1337,8 @@ tb_scenario! {
 			install_ping_peer(&trace, &certs, &gateway).await?;
 
 			// The loop sends one more relay than the abandonment budget. Each
-			// relay carries a valid origin-signed rumor, so the refusal is the
-			// over-radius hop lifetime and not an unverifiable origin.
+			// relay carries a valid origin-signed rumor, so the over-radius hop
+			// lifetime alone draws the refusal.
 			for i in 0..=CONTAINMENT_ABANDON_LIMIT {
 				let rumor_id = [b'r', i as u8];
 				let rumor = mint_origin_rumor(
@@ -1448,8 +1440,8 @@ impl GossipJournal for AmnesiacJournal {
 	}
 
 	// The grey hole claims the default retention while it retains nothing. A
-	// misbehaving journal lies, and the start-time seen-ttl clamp defends
-	// against honest misconfiguration alone.
+	// faulty journal can lie, so the start-time seen-ttl clamp defends against
+	// honest misconfiguration alone.
 	fn retention(&self) -> Duration {
 		Duration::from_millis(DEFAULT_GOSSIP_RETENTION_MS)
 	}
@@ -1524,7 +1516,7 @@ tb_scenario! {
 			send_gossip_frame(&trace, &certs, &gateway_a, frame).await?;
 
 			// Honest convergence comes first: A holds its own publish, and the
-			// beat repairs C. B never converges, by design.
+			// beat repairs C. B stays unconverged by design.
 			let converged =
 				wait_for_gossip_converged(&[journal_a, journal_c], 1, 50, Duration::from_millis(100)).await;
 			trace.event_with(GOSSIP_CONVERGED, &[], u64::from(converged))?;
@@ -1614,13 +1606,13 @@ tb_assert_spec! {
 
 // An origin outside this gateway's trust is the edge of a subnet.
 //
-// A trusted peer relays two rumors whose origin the gateway does not hold. The
-// relay's own rate bucket holds one token.
+// A trusted peer relays two rumors whose origin lies outside the gateway's
+// trust. The relay's own rate bucket holds one token.
 //
 // - The first rumor draws Unauthenticated, which tells the relay to stop its offers of that origin.
 // - The drop spends the relay's one token, so the second answers ResourceExhausted.
 // - The token came from the relay's own bucket, so the gateway limits the relay's own rumor too.
-// - The gateway never scores the relay, so its routes stay (PEER_ROUTES_AFTER_UNKNOWN_ORIGIN).
+// - The gateway leaves the relay unscored, so its routes stay (PEER_ROUTES_AFTER_UNKNOWN_ORIGIN).
 tb_scenario! {
 	name: cluster_gossip_unknown_origin_costs_the_relay_a_token_and_no_score,
 	spec: ClusterGossipUnknownOriginSpec,
@@ -1686,7 +1678,7 @@ fn partial_trust_ctx() -> PartialTrustCtx {
 	}
 }
 
-/// Places one rumor of `origin` at `cluster`, relayed by the origin itself
+/// Places one rumor of `origin` at `cluster`, which the origin itself relays
 /// with `hop_ttl` hops left, and records the status as `GOSSIP_RELAY_STATUS`.
 async fn place_origin_rumor(
 	trace: &TraceCollector,
@@ -1723,12 +1715,12 @@ tb_assert_spec! {
 
 // A target that refuses an origin gets that origin once.
 //
-// The bridge holds rumors of two origins the edge does not trust, and beats on
-// a clock only this test moves. Each origin costs the bridge one refusal at the
-// edge, by repair for the first and by reflood for the second.
+// The bridge holds rumors of two origins outside the edge's trust and beats on
+// a clock only this test moves. Each origin costs one refusal at the edge, by
+// repair for the first and by reflood for the second.
 //
 // - The first beat's repair pushes the first origin's rumor from the journal, and the edge refuses it.
-// - A second rumor of that origin refloods to nobody, because the refusal stands.
+// - The bridge withholds a second rumor of that origin from the edge, because the refusal stands.
 // - The second origin's rumor refloods at once, and the edge refuses it.
 // - Three more beats push neither origin again, although the edge still lacks all three rumors.
 tb_scenario! {
@@ -1774,7 +1766,7 @@ tb_scenario! {
 ///
 /// - One trusted peer identity carries the colony URN of "other", so it is inside the flood.
 /// - Another carries no SAN, so it is outside every flood.
-/// - Both use random keys, so the three identities never share a subject key id (see [`gossip_plane_ctx`]).
+/// - Both use random keys, so the three identities have distinct subject key ids (see [`gossip_plane_ctx`]).
 struct NeighborColonyCtx {
 	gateway: ClusterTestCerts,
 	neighbor_key: Secp256k1SigningKey,
@@ -1824,8 +1816,8 @@ tb_assert_spec! {
 
 // A neighbor colony is inside the flood, and a trusted stranger is outside it.
 //
-// A trusted peer of colony "other" federates work routes (the advertisement
-// installs) and gossips. The gateway answers PermissionDenied to a trusted
+// A trusted peer of colony "other" gossips and federates the work routes its
+// advertisement installs. The gateway answers PermissionDenied to a trusted
 // identity with no colony URN.
 //
 // - Admitted: a rumor of colony "main" that the neighbor relays.
@@ -1921,7 +1913,7 @@ tb_scenario! {
 /// It holds one origin identity and two relay identities, all members of
 /// the gateway's colony.
 ///
-/// - Every identity uses a random key, so no two share a subject key id (see [`gossip_plane_ctx`]).
+/// - Every identity uses a random key, so each has its own subject key id (see [`gossip_plane_ctx`]).
 struct RelayFanoutCtx {
 	gateway: ClusterTestCerts,
 	origin_key: Secp256k1SigningKey,
@@ -1967,13 +1959,13 @@ tb_assert_spec! {
 	}
 }
 
-// Rate admission keys on the rumor's origin, not the peer that relays it.
+// Rate admission keys on the rumor's origin, whichever peer relays it.
 //
 // A one-token bucket admits the origin's first rumor through relay A.
 //
 // - It refuses the same origin's second rumor through relay B with ResourceExhausted.
-// - An origin whose flood fans out through many relays gets no extra budget.
-// - The refusal is local policy, so the gateway never weakens relay B's routes.
+// - An origin whose flood fans out through many relays spends one budget across them.
+// - The refusal is local policy, so the gateway leaves relay B's routes as they are.
 tb_scenario! {
 	name: cluster_gossip_relays_share_origin_budget,
 	spec: ClusterGossipOriginBudgetSpec,
@@ -2025,8 +2017,8 @@ tb_assert_spec! {
 	}
 }
 
-// A gateway whose own certificate carries no colony URN SAN is not a
-// colony member, so it cannot scope the flood.
+// A gateway whose own certificate carries no colony URN SAN is outside every
+// colony, so it has no flood scope.
 //
 // - It refuses origin publishes with PermissionDenied, even from a trusted hive-plane signer.
 tb_scenario! {
@@ -2159,11 +2151,10 @@ tb_assert_spec! {
 
 // A peer enrolled while the gateway runs joins the flood at once.
 //
-// The gateway's peer trust holds the gateway alone. A neighbor relays its own
-// rumor, the operator then enrolls the neighbor, and the neighbor relays
-// another.
+// The gateway's peer trust holds the gateway alone. A neighbor relays one
+// rumor of its own before the operator enrolls it and one after.
 //
-// - The gateway refuses the first relay, because the store does not hold the signer.
+// - The gateway refuses the first relay, because the signer is outside the store.
 // - The gateway admits the second with no restart, because every frame reads the store.
 tb_scenario! {
 	name: cluster_gossip_admits_a_peer_enrolled_while_the_gateway_runs,
@@ -2209,10 +2200,9 @@ tb_assert_spec! {
 // A peer removed from trust while the gateway runs leaves the flood at once,
 // in both directions.
 //
-// The gateway holds a neighbor as a verified target, and no beat runs. One
-// published rumor reaches the neighbor over a pooled connection. The operator
-// then removes the neighbor from peer trust, and the scenario publishes a
-// second rumor.
+// The gateway, with no beat, holds the neighbor as a verified target and
+// sends it one published rumor over a pooled connection. The operator then
+// removes the neighbor from peer trust, and the scenario publishes another.
 //
 // - The second rumor stays unsent, although the connection is still open (GOSSIP_HELD_AFTER_REMOVAL).
 // - The neighbor leaves the targets, as any gateway outside the flood does (PEER_EXPEL_TARGET_DROPPED).
@@ -2322,10 +2312,9 @@ tb_assert_spec! {
 
 // A certificate authority in peer trust admits no gateway to the flood.
 //
-// The gateway's peer trust holds its own certificate and an authority. A second
-// gateway presents a certificate that authority issued, with a colony URN of
-// the namespace. The gateway holds its address as a verified target, and no
-// beat runs.
+// The gateway's peer trust holds its own certificate and an authority, which
+// issued a second gateway's certificate with a colony URN of the namespace.
+// The gateway holds that address as a verified target, and no beat runs.
 //
 // - The dial completes, because the handshake validates the chain (CLUSTER_GOSSIP_FANOUT_UNREACHED).
 // - The gateway sends no rumor, because the store holds no certificate for the leaf's key.
@@ -2449,7 +2438,7 @@ tb_assert_spec! {
 // ingress servlet before it answers the publish.
 //
 // - The servlet decodes a `GossipRumor` from the frame's message, so it reads the payload and the kind.
-// - The frame's signature verifies under the publishing gateway's key (GOSSIP_INGRESS_SIGNED_BY_GATEWAY).
+// - The frame's signature verifies under the origin gateway's key (GOSSIP_INGRESS_SIGNED_BY_GATEWAY).
 tb_scenario! {
 	name: cluster_gossip_ingress_receives_the_origin_signed_rumor,
 	spec: ClusterGossipIngressOriginSpec,
@@ -2488,11 +2477,9 @@ tb_assert_spec! {
 	}
 }
 
-// The ingress delivery reaches the ingress servlet only under the identity
-// its registration names. The gateway's hive trust holds both identities, so
-// the handshake completes, and the dial's binding alone refuses the answer
-// (CWE-346). The rumor stays in the retry set, and the binding refuses each
-// retry the same way.
+// The ingress delivery reaches only the servlet identity its registration
+// names. Hive trust holds the impostor too, so the handshake completes, and the
+// dial's binding alone refuses the answer and each retry (CWE-346).
 tb_scenario! {
 	name: cluster_gossip_ingress_refuses_a_servlet_answering_under_another_identity,
 	spec: ClusterGossipIngressImpostorSpec,
@@ -2556,7 +2543,7 @@ tb_assert_spec! {
 // With no configured ingress the gateway journals and refloods only.
 //
 // - The gateway answers the publish Ok and retains it (held = 1).
-// - The gateway acks the record at once, so it never enters the pending retry set.
+// - The gateway acks the record at once, so it stays out of the pending retry set.
 // - The gateway reports no local delivery (ACCEPTED = 0).
 // - The journal settles before the publish reply returns, so the probes need no poll.
 tb_scenario! {
@@ -2694,16 +2681,16 @@ tb_assert_spec! {
 //
 // - Admission stops at the per-prefix cap.
 // - Promotion into tried stops at the per-prefix cap.
-// - The configured anchor keeps its leading dial slot.
+// - The configured anchor keeps its first dial slot.
 // - The target set stays bounded.
-// - The attacker can never steer the beat wholly onto its own addresses.
+// - The beat always keeps a target outside the attacker's addresses.
 //
 // Sources:
 //
-// - Heilman, Kendler, Zohar & Goldberg (2015), eclipse attacks on
-//   Bitcoin's peer-to-peer network, USENIX Security '15
-//   (https://www.usenix.org/conference/usenixsecurity15/technical-sessions/presentation/heilman),
-//   and ePrint 2015/263 (https://eprint.iacr.org/2015/263)
+// - Heilman, Kendler, Zohar & Goldberg (2015), eclipse attacks on Bitcoin's
+//   peer-to-peer network, at USENIX Security '15 and as ePrint 2015/263:
+//   - <https://www.usenix.org/conference/usenixsecurity15/technical-sessions/presentation/heilman>
+//   - <https://eprint.iacr.org/2015/263>
 // - CWE-770, allocation of resources without limits or throttling:
 //   <https://cwe.mitre.org/data/definitions/770.html>
 tb_scenario! {
@@ -2960,7 +2947,7 @@ tb_assert_spec! {
 // holds that address as an unverified candidate while the routes already dial
 // it. The feeler probe finds a certificate that carries no colony URN there.
 //
-// - The probe expels the candidate, so it holds no bucket slot and never joins the beat targets.
+// - The probe expels the candidate, so it holds no bucket slot and stays off the beat targets.
 // - The routes that dial the address stay (PEER_ROUTES_AFTER_EXPEL).
 tb_scenario! {
 	name: cluster_candidate_that_answers_outside_the_flood_keeps_its_routes,
@@ -3016,8 +3003,8 @@ tb_assert_spec! {
 // An anchor that answers from outside the flood keeps its slot and the routes
 // that dial it.
 //
-// An operator configured the anchor, so no learned table holds its address.
-// A slate arrives under the local colony's key and claims that address. The
+// An operator configured the anchor, so its address sits outside the learned
+// table. A slate under the local colony's key claims that address, and the
 // anchor answers each beat with a certificate that carries no colony URN.
 //
 // - The anchor refuses one advertisement per beat, so two refusals are two beats that dialed it.
@@ -3080,7 +3067,7 @@ tb_assert_spec! {
 // no colony URN.
 //
 // - The hop sends no rumor, and the address leaves the targets at once (PEER_EXPEL_TARGET_DROPPED).
-// - The answer is no failed dial, so nothing counts as unreached (CLUSTER_GOSSIP_FANOUT_UNREACHED).
+// - The dial completes, so the unreached count stays at zero (CLUSTER_GOSSIP_FANOUT_UNREACHED).
 tb_scenario! {
 	name: cluster_reflood_drops_a_target_that_answers_outside_the_flood,
 	spec: ClusterRefloodExpelSpec,
@@ -3218,13 +3205,13 @@ tb_assert_spec! {
 	}
 }
 
-// An oversized reconcile reply is misbehavior, not a completed round.
+// An oversized reconcile reply is misbehavior, and its round fails.
 //
 // The rogue holds a valid same-colony certificate, so it passes the
 // handshake and the membership proof. Its reply exceeds MAX_PEX_SAMPLE, and
 // only the reply volume abuses the protocol.
 //
-// - The prober never promotes the candidate (CLUSTER_PEER_DISCOVERED exactly 0).
+// - The prober keeps the candidate unpromoted (CLUSTER_PEER_DISCOVERED exactly 0).
 // - The failed round stays on the candidate, which keeps its slot until a newcomer needs it.
 // - A second probe reaches it, which only a kept candidate can receive (PEER_ABUSE_CANDIDATE_HELD_BACK).
 tb_scenario! {
@@ -3483,10 +3470,9 @@ tb_assert_spec! {
 // The beat evicts a verified tried peer that goes dark (liveness).
 //
 // The prober learns the member as a hint, feeler-probes it, proves its flood
-// membership, and promotes it into tried (CLUSTER_PEER_DISCOVERED). The
-// member then advertises one type, so the prober routes to it
-// (PEER_ROUTES_AFTER is 1).
+// membership, and promotes it into tried (CLUSTER_PEER_DISCOVERED).
 //
+// - The member advertises one type, so the prober routes to it (PEER_ROUTES_AFTER is 1).
 // - The member then stops.
 // - Idle pool leases expire fast, so every beat makes a fresh dial, which the
 //   dropped listener refuses as a dead remote process would.
@@ -3494,7 +3480,7 @@ tb_assert_spec! {
 // - The failure threshold evicts the entry exactly once (CLUSTER_PEER_EVICTED).
 // - The beat stops its dials to the dead address.
 // - The eviction withdraws the member's routes (PEER_EVICT_ROUTES_WITHDRAWN).
-// - A dead peer cannot hold a prefix bucket slot forever.
+// - A dead peer releases its prefix bucket slot.
 tb_scenario! {
 	name: cluster_beat_evicts_dark_tried_peer,
 	spec: ClusterPeerEvictionSpec,
@@ -3635,15 +3621,15 @@ tb_assert_spec! {
 	}
 }
 
-// The beat charges a local journal fault to this gateway, not to a peer that
-// answers.
+// The beat charges a local journal fault to this gateway and leaves the peer
+// that answers unscored.
 //
 // The prober promotes the live member into tried, then its own journal
 // fails `held_digests` at the start of every reconcile round.
 //
 // - Each beat skips the round rather than record a dial failure.
-// - The failure count never reaches the eviction threshold.
-// - The member stays a beat target (no CLUSTER_PEER_EVICTED).
+// - The failure count stays below the eviction threshold.
+// - The member stays a beat target (CLUSTER_PEER_EVICTED exactly 0).
 tb_scenario! {
 	name: cluster_local_journal_fault_retains_answering_peer,
 	spec: ClusterLocalFaultSpec,
@@ -3722,7 +3708,7 @@ tb_assert_spec! {
 // policy, so the rumor reaches its fan-out.
 //
 // - The fan-out traces the dead anchor as unreached (OUTSIDE_RUMOR_FANNED_OUT).
-// - No publish fails (CLUSTER_PEER_AD_PUBLISH_FAILED).
+// - Every publish succeeds (CLUSTER_PEER_AD_PUBLISH_FAILED exactly 0).
 tb_scenario! {
 	name: cluster_outside_identity_originates_its_rumor,
 	spec: ClusterOutsideOriginSpec,

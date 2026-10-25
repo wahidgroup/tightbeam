@@ -123,7 +123,7 @@ use crate::transport::handshake::flow::OpeningContent;
 #[cfg(feature = "transport-cms")]
 use cms::*;
 
-/// Create a default test security profile for handshake tests.
+/// The default test profile, the one [`DefaultCryptoProvider`] runs.
 pub fn create_default_test_profile() -> SecurityProfileDesc {
 	RunnableProfile::<DefaultCryptoProvider>::native().descriptor()
 }
@@ -239,7 +239,7 @@ impl TestServerIdentity {
 }
 
 /// A revocation checker that revokes one certificate once [`Self::revoke`]
-/// runs, as a store whose verdict on a certificate changes after a trust was
+/// runs, as a store whose verdict on a certificate changes after a trust is
 /// built. Each clone shares the one switch.
 #[derive(Debug, Clone)]
 pub struct LaterRevocation {
@@ -520,11 +520,11 @@ pub fn contains_window(haystack: impl AsRef<[u8]>, needle: impl AsRef<[u8]>) -> 
 /// fixture or an observer runs the production derivation over the value it
 /// picked.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-struct FixedAgreement<'a>(&'a EcdhSecret);
+struct FixedAgreement<'a>(&'a EcdhSecret<Secp256k1>);
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl HandshakeAgreement<Secp256k1> for FixedAgreement<'_> {
-	fn shared_secret(&self, _peer: &PublicKey<Secp256k1>) -> EcdhSecret {
+	fn shared_secret(&self, _peer: &PublicKey<Secp256k1>) -> EcdhSecret<Secp256k1> {
 		self.0.duplicate()
 	}
 }
@@ -542,7 +542,7 @@ fn admitted(point: &PublicKey<Secp256k1>) -> PeerPoint<Secp256k1> {
 /// carries one, under `salt`, through the production derivation.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub fn derive_handshake_secret(
-	shared: &EcdhSecret,
+	shared: &EcdhSecret<Secp256k1>,
 	base: Option<&BaseSecret>,
 	salt: KdfSalt<'_>,
 ) -> Result<HandshakeSecret, HandshakeError> {
@@ -565,12 +565,20 @@ fn agreement_of<'a>(
 	}
 }
 
+/// An ephemeral-ephemeral secret on secp256k1 of 32 `fill` bytes, in place
+/// of an ECDH output.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+pub fn fixture_agreement(fill: u8) -> EcdhSecret<Secp256k1> {
+	let octets = SecretSlice::from(vec![fill; 32]);
+	EcdhSecret::try_from(octets).expect("32 bytes make a secp256k1 shared secret")
+}
+
 /// A handshake secret derived from a fixture ephemeral-ephemeral secret, a
 /// fixture base secret of `fill` bytes, and a fixture salt.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub fn fixture_handshake_secret(fill: u8) -> HandshakeSecret {
 	let base = BaseSecret::try_from(SecretSlice::from(vec![fill; 32])).expect("32 bytes make a base secret");
-	let shared = EcdhSecret::from([0x11u8; 32]);
+	let shared = fixture_agreement(0x11);
 	derive_handshake_secret(&shared, Some(&base), KdfSalt::new(&[0x99u8; 32]))
 		.expect("fixture inputs derive a handshake secret")
 }
@@ -742,7 +750,7 @@ pub type SealAttempts = Vec<Result<SecretSlice<u8>, HandshakeError>>;
 pub struct StaticKeyObserver {
 	base: Option<BaseSecret>,
 	salt: Vec<u8>,
-	candidates: Vec<EcdhSecret>,
+	candidates: Vec<EcdhSecret<Secp256k1>>,
 }
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -760,7 +768,7 @@ impl StaticKeyObserver {
 		let client_ephemeral = PublicKey::<Secp256k1>::from_sec1_bytes(client_ephemeral)?;
 		let server_ephemeral = PublicKey::<Secp256k1>::from_sec1_bytes(server_ephemeral)?;
 		let candidates = vec![
-			EcdhSecret::from([0u8; 32]),
+			fixture_agreement(0x00),
 			static_key.shared_secret(&client_ephemeral),
 			static_key.shared_secret(&server_ephemeral),
 			x_coordinate(&client_ephemeral)?,
@@ -857,7 +865,7 @@ impl StaticKeyObserver {
 }
 
 /// The x-coordinate of `point` in the place of an ECDH output.
-fn x_coordinate(point: &PublicKey<Secp256k1>) -> Result<EcdhSecret, Box<dyn Error>> {
+fn x_coordinate(point: &PublicKey<Secp256k1>) -> Result<EcdhSecret<Secp256k1>, Box<dyn Error>> {
 	let encoded = point.to_encoded_point(false);
 	let x = encoded.x().ok_or("an affine point has an x-coordinate")?;
 	Ok(EcdhSecret::try_from(SecretSlice::from(x.to_vec()))?)
@@ -1325,8 +1333,8 @@ impl TestFlow for Cms {
 	}
 }
 
-/// The three messages of one handshake as they were sent, with both endpoints
-/// after the closing.
+/// The three messages of one handshake as their senders sent them, with both
+/// endpoints after the closing.
 pub struct Run<F: TestFlow> {
 	/// The opening, as the client sent it.
 	pub opening: HandshakeMessage,

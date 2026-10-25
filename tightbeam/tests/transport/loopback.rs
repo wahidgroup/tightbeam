@@ -1,4 +1,4 @@
-//! Loopback end-to-end tests for handshake orchestrators.
+//! The loopback end-to-end tests of the handshake orchestrators.
 //!
 //! The tests drive the HPKE and CMS client and server orchestrators against
 //! each other entirely through the `ClientHandshakeProtocol` and
@@ -104,8 +104,8 @@ fn security_offer(profile: SecurityProfileDesc) -> SecurityOffer {
 /// Probe both directions and return whether the plaintexts match the
 /// probes.
 ///
-/// Each direction has its own key and record sequence, and each record its
-/// own content key.
+/// Each direction has its own key and record sequence, and each record has
+/// its own content key.
 fn bidirectional_roundtrip_ok(client_keys: &SessionKeys, server_keys: &SessionKeys) -> Result<bool, TightBeamError> {
 	let c2s_probe = b"client->server probe";
 	let mut c2s_record = client_keys.send().encrypt_next(c2s_probe)?.to_der()?;
@@ -135,13 +135,12 @@ async fn emit_session_ready<C, S>(
 where
 	C: ClientHandshakeProtocol,
 	S: ServerHandshakeProtocol,
-	TightBeamError: From<C::Error> + From<S::Error>,
 {
 	let (complete_event, roundtrip_event, profile_event) = events;
 
-	// Completing consumes each orchestrator, so both machines are read while
-	// they still exist. `complete()` makes the final transition itself, so the
-	// pair is mid-flight here and the event records that transition happening.
+	// `complete()` consumes each orchestrator and makes its final transition,
+	// so the test reads both machines first. The pair is mid-flight here, and
+	// the event records the transition that `complete()` makes.
 	let pending_before_completion = !ClientHandshakeProtocol::is_complete(client.as_ref())
 		&& !ServerHandshakeProtocol::is_complete(server.as_ref());
 
@@ -177,7 +176,7 @@ fn require_terminal(reply: Option<HandshakeMessage>, msg: &'static str) -> Resul
 	Ok(())
 }
 
-/// HPKE loopback through the orchestrator trait surface.
+/// Runs the HPKE loopback through the orchestrator trait surface.
 #[cfg(feature = "transport-hpke")]
 async fn hpke_loopback(trace: &TraceCollector, materials: &ServerMaterials) -> Result<(), TightBeamError> {
 	let profile = default_security_profile();
@@ -207,7 +206,7 @@ async fn hpke_loopback(trace: &TraceCollector, materials: &ServerMaterials) -> R
 	emit_session_ready(Box::new(client), Box::new(server), profile, trace, events).await
 }
 
-/// Build a CMS client/server pair sharing the fixture server identity.
+/// Build a CMS client/server pair that shares the fixture server identity.
 #[cfg(feature = "transport-cms")]
 #[allow(clippy::type_complexity)]
 fn build_cms_pair(
@@ -243,7 +242,7 @@ async fn drive_cms_pair(
 	require_terminal(no_reply, "CMS server must not reply to ClientFinished")
 }
 
-/// CMS loopback through the orchestrator trait surface.
+/// Runs the CMS loopback through the orchestrator trait surface.
 ///
 /// Both sides derive a working AEAD from the handshake secret, and the client
 /// learns the negotiated profile from the server-Finished `SecurityAccept`

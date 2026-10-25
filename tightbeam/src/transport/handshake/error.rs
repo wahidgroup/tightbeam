@@ -340,6 +340,7 @@ mod tests {
 	use crate::crypto::cms::EnvelopeError;
 	use crate::crypto::kdf::KdfError;
 	use crate::crypto::sign::{elliptic_curve, SignerError};
+	use crate::error::ReceivedExpectedError;
 	use crate::TightBeamError;
 
 	#[test]
@@ -380,13 +381,23 @@ mod tests {
 		Ok(())
 	}
 
+	/// The widths that a shared-secret length error of the KDF holds, or
+	/// `None` for every other error.
+	fn held_width(error: HandshakeError) -> Option<ReceivedExpectedError<usize, usize>> {
+		match error {
+			HandshakeError::KdfError(KdfError::InvalidSharedSecretLength(held)) => Some(held),
+			_ => None,
+		}
+	}
+
 	/// A key derivation failure has a handshake counterpart, so it keeps its
 	/// kind.
 	#[test]
 	fn a_key_derivation_failure_converts_to_its_counterpart() {
-		let error = HandshakeError::from(TightBeamError::KeyDerivationError(KdfError::InvalidSharedSecretLength(16)));
-		let kept = matches!(error, HandshakeError::KdfError(KdfError::InvalidSharedSecretLength(16)));
-		assert!(kept);
+		let width = ReceivedExpectedError { received: 16, expected: 32 };
+		let failure = KdfError::InvalidSharedSecretLength(width.clone());
+		let error = HandshakeError::from(TightBeamError::KeyDerivationError(failure));
+		assert_eq!(held_width(error), Some(width));
 	}
 
 	/// A signature that fails to encode is a signature the handshake refuses.

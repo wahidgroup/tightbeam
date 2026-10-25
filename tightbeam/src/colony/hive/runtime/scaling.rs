@@ -7,9 +7,13 @@ use core::time::Duration;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
-use crate::colony::common::{ScalingDecision, ScalingMetrics, ServletChange, ServletScaleConfig, TaskGroup};
 use crate::colony::hive::runtime::{ClusterLink, HiveContextImpl, HiveInstances};
-use crate::colony::hive::{HashMapRegistry, HiveConfig, ServletRegistration, ServletRegistry, SpawnerFn};
+use crate::colony::hive::{
+	HashMapRegistry, HiveConfig, ScalingDecision, ScalingMetrics, ServletRegistration, ServletRegistry,
+	ServletScaleConfig, SpawnerFn,
+};
+use crate::colony::protocol::ServletChange;
+use crate::colony::TaskGroup;
 use crate::constants::UNKNOWN_SERVLET_UTILIZATION_BPS;
 use crate::runtime::rt;
 use crate::trace::TraceCollector;

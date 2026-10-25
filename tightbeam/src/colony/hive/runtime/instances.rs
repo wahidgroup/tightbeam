@@ -11,7 +11,7 @@ use crate::{Errorizable, TightBeamError};
 
 /// Why [`HiveInstances::insert`] registered no servlet.
 ///
-/// Either way the servlet has already been stopped through
+/// Either way, the insert already stopped the servlet through
 /// [`ServletBox::stop_boxed`], so the caller only chooses its answer. The
 /// cause travels as the error's source.
 ///
@@ -19,12 +19,12 @@ use crate::{Errorizable, TightBeamError};
 #[derive(Debug, Errorizable)]
 pub enum InsertRefusal {
 	/// The servlet's address is not a valid instance locator, so no URN
-	/// names it. The servlet keeps producing that address, so a retry
-	/// changes nothing.
+	/// names it. The servlet keeps that address, so a retry changes
+	/// nothing.
 	#[error("the servlet's address is not a valid instance locator: {0}")]
 	#[source]
 	Unnameable(TightBeamError),
-	/// The registry did not take the registration.
+	/// The registry refused the registration.
 	#[error("the servlet registry refused the registration: {0}")]
 	#[source]
 	Registry(TightBeamError),
@@ -32,11 +32,11 @@ pub enum InsertRefusal {
 
 /// One hive's servlet instances together with the routes that reach them.
 ///
-/// An instance exists in the registry and in the routing context. Binding
-/// them in one view means an insert or a removal touches both in one fixed
-/// order, so a route only ever names a running instance. The two sit behind
-/// separate locks, so the pair is eventually consistent: each step lands on
-/// its own lock, and nothing compensates a later step.
+/// An instance exists in the registry and in the routing context. This view
+/// binds the two, so an insert or a removal touches both in one fixed order
+/// and a route names only a live instance. The two sit behind separate
+/// locks, so the pair is eventually consistent: each step commits on its own
+/// lock and stays committed whatever a later step does.
 pub struct HiveInstances<'a, R: ServletRegistry, P: Protocol> {
 	servlets: &'a R,
 	routes: &'a HiveContextImpl<P>,
@@ -52,16 +52,16 @@ impl<'a, R: ServletRegistry, P: Protocol> HiveInstances<'a, R, P> {
 	///
 	/// Returns where the servlet sits, which callers notify the cluster with.
 	/// A servlet that names no signer gets no route, because a sibling's dial
-	/// admits a servlet's answer by that signer alone (CWE-346). A
-	/// registration that does not land stops its servlet through
-	/// [`ServletBox::stop_boxed`], whichever step refused it.
+	/// admits a servlet's answer by that signer alone (CWE-346). A refused
+	/// registration stops its servlet through [`ServletBox::stop_boxed`],
+	/// whichever step refused it.
 	///
 	/// [`ServletBox::stop_boxed`]: crate::colony::hive::ServletBox::stop_boxed
 	///
 	/// # Errors
 	///
 	/// - [`InsertRefusal::Unnameable`] -- the servlet's address is not a valid instance locator.
-	/// - [`InsertRefusal::Registry`] -- the registry did not take the registration. No route is added.
+	/// - [`InsertRefusal::Registry`] -- the registry refused the registration, so the insert adds no route.
 	pub(crate) fn insert(&self, registration: ServletRegistration) -> Result<ServletPlacement, InsertRefusal> {
 		let placement = match registration.placement() {
 			Ok(placement) => placement,
@@ -98,7 +98,7 @@ impl<'a, R: ServletRegistry, P: Protocol> HiveInstances<'a, R, P> {
 	pub fn remove(&self, key: impl AsRef<[u8]>) -> Option<(Urn<'static>, Arc<[u8]>)> {
 		let key = key.as_ref();
 
-		// 1. The registry gives the instance up, so no new registration lands on a key that is leaving.
+		// 1. The registry gives the instance up, so no new registration lands on the key while it leaves.
 		let ServletRegistration { servlet, servlet_type, .. } = self.servlets.remove(key)?;
 		let removed_type = servlet_type.canonical_bytes();
 		let removed_addr = servlet.addr_bytes();
@@ -121,8 +121,9 @@ mod tests {
 
 	use super::*;
 	use crate::cms::signed_data::SignerIdentifier;
-	use crate::colony::common::ColonyNamespace;
-	use crate::colony::hive::{HashMapRegistry, HiveContext, ServletBox, ServletInfo, SpawnerFn};
+	use crate::colony::hive::{HashMapRegistry, HiveContext, ServletBox, SpawnerFn};
+	use crate::colony::protocol::ServletInfo;
+	use crate::colony::urn::ColonyNamespace;
 	use crate::router::RouterError;
 	use crate::testing::TestMessage;
 	use crate::transport::client::{ConnectionBuilder, ConnectionPool};
@@ -131,9 +132,9 @@ mod tests {
 
 	/// A [`ServletBox`] whose stop is observable.
 	///
-	/// The shipped servlet runtime stops by aborting its accept task, which
-	/// gives a test nothing to read, so no real servlet can prove that the
-	/// stop call was made. This probe records the call instead.
+	/// The shipped servlet runtime stops when it aborts its accept task,
+	/// which leaves a test nothing to read, so only a double can prove that
+	/// the hive called the stop. This probe records the call.
 	struct StopProbe {
 		stopped: Arc<AtomicBool>,
 		signer: Option<SignerIdentifier>,
@@ -154,7 +155,7 @@ mod tests {
 	}
 
 	/// A [`ServletBox`] that reads the hive's routes for its own type at the
-	/// instant it is stopped.
+	/// instant the hive stops it.
 	///
 	/// The order of a removal is observable only from inside the stop, so
 	/// this probe records whether a route still named its type then.
@@ -239,8 +240,8 @@ mod tests {
 		}
 	}
 
-	/// The spawner every probe registration carries. The insert under test
-	/// reads no spawner, so it is the registered type's own probe factory.
+	/// Returns the spawner every probe registration carries. The insert under
+	/// test reads no spawner, so this one spawns a plain [`StopProbe`].
 	fn probe_spawner() -> SpawnerFn {
 		Arc::new(|_| {
 			let probe = StopProbe { stopped: Arc::default(), signer: None };
@@ -248,8 +249,8 @@ mod tests {
 		})
 	}
 
-	/// A registration of one [`StopProbe`] under `servlet_type` that names
-	/// `signer`.
+	/// Builds a registration of one [`StopProbe`] under `servlet_type` that
+	/// names `signer`.
 	fn probe_registration(
 		servlet_type: Urn<'static>,
 		stopped: &Arc<AtomicBool>,
@@ -260,8 +261,8 @@ mod tests {
 		ServletRegistration { servlet: Box::new(probe), spawner: probe_spawner(), servlet_type }
 	}
 
-	/// A registration of one [`RouteProbe`] under `servlet_type`, watching
-	/// `routes` for that type when it stops.
+	/// Builds a registration of one [`RouteProbe`] under `servlet_type`. The
+	/// probe reads `routes` for that type when it stops.
 	fn route_probe_registration(
 		routes: &Arc<HiveContextImpl<TokioListener>>,
 		servlet_type: &Urn<'static>,
@@ -278,12 +279,12 @@ mod tests {
 		ServletRegistration { servlet: Box::new(probe), spawner, servlet_type: servlet_type.clone() }
 	}
 
-	/// Empty routes over a pool nothing dials.
+	/// Builds empty routes over a fresh pool, which the tests leave idle.
 	fn routes() -> HiveContextImpl<TokioListener> {
 		HiveContextImpl::new(Arc::new(ConnectionPool::<TokioListener>::builder().build()))
 	}
 
-	/// A frame to call a sibling with.
+	/// Builds a frame to call a sibling with.
 	fn call_frame() -> Frame {
 		let message = encode(&TestMessage { content: "ping".into() }).expect("a test message encodes");
 

@@ -1,8 +1,7 @@
 //! Colony resource naming: URN vocabulary, minting, and validation.
 //!
-//! Every colony resource is named by an RFC 8141 URN with a fixed
-//! positional grammar (the ARN model: typed segments, empty allowed,
-//! grammar validated before the resource is looked up):
+//! An RFC 8141 URN names each colony resource, in a fixed positional
+//! grammar of typed segments after the ARN model:
 //!
 //! ```text
 //! urn:{nid}:{realm}:{resource-type}:{resource-id}
@@ -24,14 +23,13 @@
 //! ```
 //!
 //! A [`ColonyNamespace`] is the minting and validation authority for one
-//! deployment. Gateways validate inbound URNs against their own
-//! namespace, so a segment registers and routes inside its own
-//! authority and realm: wrong authority, wrong realm, or malformed grammar is
-//! refused at the boundary.
+//! deployment. A gateway validates each inbound URN against its own
+//! namespace, so a segment registers and routes inside its own authority
+//! and realm.
 
 use std::borrow::Cow;
 
-use crate::colony::common::ServletInfo;
+use crate::colony::protocol::ServletInfo;
 use crate::urn::{Urn, UrnValidationError};
 use crate::TightBeamError;
 
@@ -62,20 +60,20 @@ impl Default for ColonyNamespace {
 pub enum ColonyResource<'a> {
 	/// A servlet type, optionally narrowed to one instance.
 	Servlet {
-		/// Servlet type name.
+		/// The name of the servlet type.
 		name: &'a str,
 		/// Instance tail (the locator after `/`), when present.
 		instance: Option<&'a str>,
 	},
 	/// A hive identity.
 	Hive {
-		/// The registration locator the identity was minted from.
+		/// The registration locator the identity is minted from.
 		addr: &'a str,
 	},
 	/// A colony membership identity, carried in a certificate's URI
 	/// Subject Alternative Name (RFC 5280 §4.2.1.6).
 	Colony {
-		/// Colony name.
+		/// The name of the colony.
 		name: &'a str,
 	},
 }
@@ -101,13 +99,13 @@ impl ColonyNamespace {
 		Ok(Self { nid, realm })
 	}
 
-	/// Mint the URN naming a servlet type.
+	/// Mint the URN that names a servlet type.
 	///
-	/// A name containing `/` or `:` is refused: a `/` would parse back
+	/// A name with a `/` or a `:` is refused, because a `/` would parse back
 	/// as an instance tail and a `:` as an extra positional segment, so
-	/// [`ColonyNamespace::validate`] would reinterpret the minted URN as
-	/// naming a different resource. An empty name is refused for the
-	/// same reason validation refuses an empty `resource-id`.
+	/// [`ColonyNamespace::validate`] would read the minted URN as a different
+	/// resource. An empty name is refused for the same reason validation
+	/// refuses an empty `resource-id`.
 	pub fn servlet(&self, name: impl AsRef<str>) -> Result<Urn<'static>, UrnValidationError> {
 		let name = name.as_ref();
 		Self::validate_single_segment_name(name)?;
@@ -115,7 +113,7 @@ impl ColonyNamespace {
 		self.mint(SERVLET_SEGMENT, name)
 	}
 
-	/// Mint the URN naming a colony.
+	/// Mint the URN that names a colony.
 	///
 	/// A colony URN travels in a certificate's URI Subject Alternative
 	/// Name (RFC 5280 §4.2.1.6) and asserts colony membership for
@@ -145,12 +143,11 @@ impl ColonyNamespace {
 		Ok(())
 	}
 
-	/// Mint the URN identifying a hive by its registration locator.
+	/// Mint the URN that identifies a hive by its registration locator.
 	///
-	/// An empty locator is refused: validation requires a nonempty
-	/// `resource-id`. `:` and `/` are
-	/// allowed because locators carry them (`host:port`, URL paths) and
-	/// the hive `resource-id` is the whole remaining tail.
+	/// An empty locator is refused, because validation requires a nonempty
+	/// `resource-id`. A locator may carry `:` and `/` (`host:port`, URL
+	/// paths), because the hive `resource-id` is the whole remaining tail.
 	pub fn hive(&self, addr: impl AsRef<str>) -> Result<Urn<'static>, UrnValidationError> {
 		let addr = addr.as_ref();
 		if addr.is_empty() {
@@ -162,9 +159,9 @@ impl ColonyNamespace {
 
 	/// Mint the hive URN for a locator carried as bytes.
 	///
-	/// [`None`] where the bytes are not UTF-8 or the locator is refused by
-	/// [`Self::hive`]. Wire and configuration both hand the locator over as
-	/// bytes, so both reach the URN through one decode.
+	/// It returns [`None`] when the bytes are not UTF-8 or [`Self::hive`]
+	/// refuses the locator. Wire and configuration both hand the locator over
+	/// as bytes, so both reach the URN through one decode.
 	pub(crate) fn hive_from_bytes(&self, addr: impl AsRef<[u8]>) -> Option<Urn<'static>> {
 		let addr = addr.as_ref();
 		let addr = core::str::from_utf8(addr).ok()?;
@@ -194,11 +191,13 @@ impl ColonyNamespace {
 		}
 	}
 
+	/// Mint `urn:{nid}:{realm}:{resource_type}:{id}` under this namespace.
+	///
 	/// # Errors
 	///
 	/// - Whatever [`Urn::from_parts`] refuses. A namespace built through its
-	///   own constructor cannot produce one, but the namespace's parts are
-	///   not carried in a type that says so.
+	///   own constructor never causes a refusal, but no type carries that proof
+	///   for the namespace's parts.
 	fn mint(&self, resource_type: impl AsRef<str>, id: impl AsRef<str>) -> Result<Urn<'static>, UrnValidationError> {
 		let resource_type = resource_type.as_ref();
 		let id = id.as_ref();
@@ -208,14 +207,20 @@ impl ColonyNamespace {
 
 	/// Validate a URN against this namespace and parse its resource.
 	///
-	/// Grammar is checked before any registry is consulted: authority
-	/// mismatch, realm mismatch, unknown resource type, and missing
-	/// segments are each refused with a distinct error.
+	/// The grammar check runs before any registry lookup. Every comparison is
+	/// exact and case-sensitive, which is stricter than RFC 8141 § 3.1 (NID
+	/// equivalence there is case-insensitive), so registry keys derived from
+	/// canonical bytes stay valid with no case folding anywhere.
 	///
-	/// All comparisons are exact and case-sensitive. This is stricter
-	/// than RFC 8141 § 3.1, which makes NID equivalence case-insensitive;
-	/// exact matching keeps registry keys derived from canonical bytes
-	/// valid without case folding anywhere.
+	/// # Errors
+	///
+	/// - [`UrnValidationError::NidMismatch`] -- the authority differs from this namespace's NID.
+	/// - [`UrnValidationError::RealmMismatch`] -- the realm differs from this namespace's realm.
+	/// - [`UrnValidationError::RequiredFieldMissing`] -- the resource type or
+	///   the resource id is absent, or the resource id, the servlet name, or
+	///   the instance tail after a `/` is empty.
+	/// - [`UrnValidationError::InvalidFormat`] -- the resource type is outside
+	///   the vocabulary, or a colony name carries `/` or `:`.
 	pub fn validate<'a>(&self, urn: &'a Urn<'a>) -> Result<ColonyResource<'a>, UrnValidationError> {
 		if urn.nid() != self.nid.as_ref() {
 			return Err(UrnValidationError::NidMismatch);
@@ -252,8 +257,8 @@ impl ColonyNamespace {
 				Ok(ColonyResource::Servlet { name, instance })
 			}
 			HIVE_SEGMENT => Ok(ColonyResource::Hive { addr: id }),
-			// A colony name is one segment, so an id carrying `/` or an extra
-			// `:` names something outside the mintable grammar.
+			// A colony name is one segment, so an id with a `/` or an extra `:`
+			// names something outside the mintable grammar.
 			COLONY_SEGMENT => {
 				Self::validate_single_segment_name(id)?;
 				Ok(ColonyResource::Colony { name: id })
@@ -265,23 +270,27 @@ impl ColonyNamespace {
 
 impl Urn<'_> {
 	/// Mint the instance URN under a servlet type: the type's URN with a
-	/// `/{addr}` tail. Authority and realm are inherited from the type, so
-	/// no namespace handle is needed.
+	/// `/{addr}` tail. The instance inherits the authority and realm of the
+	/// type, so the call needs no namespace handle.
+	///
 	/// # Errors
 	///
-	/// - Whatever [`Urn::from_parts`] refuses. This URN's own parts already
-	///   satisfy it, so only a caller holding one built before this rule
-	///   existed can see an error here.
+	/// - Whatever [`Urn::from_parts`] refuses. Every checked constructor
+	///   already satisfies it, so only a URN built through
+	///   `Urn::new_unchecked` outside [`urn!`](crate::urn!) can see an error.
 	pub fn servlet_instance(&self, addr: impl AsRef<str>) -> Result<Urn<'static>, UrnValidationError> {
 		let nss = format!("{}/{}", self.nss(), addr.as_ref());
 		Urn::from_parts(self.nid(), nss)
 	}
 
-	/// Servlet-type URN with the instance locator as the resource-id tail.
+	/// Mint the instance URN under a servlet type from a locator carried as
+	/// bytes, which become the `resource-id` tail.
 	///
 	/// # Errors
 	///
-	/// - [`UrnValidationError::InvalidFormat`] -- `addr_bytes` is not UTF-8.
+	/// - [`TightBeamError::UrnValidationError`] -- `addr_bytes` is not UTF-8
+	///   ([`UrnValidationError::InvalidFormat`]), or
+	///   [`Self::servlet_instance`] refuses the URN.
 	pub fn instance_urn(&self, addr_bytes: impl AsRef<[u8]>) -> Result<Urn<'static>, TightBeamError> {
 		let addr = core::str::from_utf8(addr_bytes.as_ref()).map_err(|_| {
 			TightBeamError::UrnValidationError(UrnValidationError::InvalidFormat {
@@ -313,10 +322,10 @@ impl Urn<'_> {
 		canonical.into_bytes()
 	}
 
-	/// Byte prefix matching every instance key under a servlet type: the
-	/// type's canonical bytes plus the tail delimiter. The delimiter keeps
-	/// one type's prefix from matching another type's keys (`beam` matches
-	/// `beam/...` alone, leaving `beam2/...` to its own type).
+	/// Byte prefix of every instance key under a servlet type: the type's
+	/// canonical bytes plus the tail delimiter. The delimiter keeps the prefix
+	/// of one type off the keys of another, so `beam` matches `beam/...` alone
+	/// and `beam2/...` stays with its own type.
 	pub fn type_prefix_bytes(&self) -> Vec<u8> {
 		let mut prefix = self.type_canonical_bytes();
 		prefix.push(b'/');
@@ -360,8 +369,8 @@ impl AsRef<[u8]> for ServletTypeKey {
 impl ColonyNamespace {
 	/// The route key for `urn`, when it is a bare servlet type here.
 	///
-	/// [`None`] for an instance locator, a foreign authority, or another
-	/// realm, none of which name a routable servlet type.
+	/// It returns [`None`] for an instance locator, a foreign authority, or
+	/// another realm, none of which name a routable servlet type.
 	#[must_use]
 	pub fn servlet_type_key(&self, urn: &Urn<'_>) -> Option<ServletTypeKey> {
 		match self.validate(urn) {
@@ -394,8 +403,6 @@ mod tests {
 		namespace.servlet(name).expect("test names satisfy the mint grammar")
 	}
 
-	// Route selection keys on the minted value, so an instance locator or a
-	// foreign realm never yields one.
 	/// An instance locator in this namespace, which names a servlet but is
 	/// not a bare type.
 	fn instance_of(bare: &Urn<'static>) -> Urn<'static> {

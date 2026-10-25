@@ -8,7 +8,7 @@ use core::time::Duration;
 
 use futures::channel::mpsc;
 
-use super::flow::{cap_as_usize, CreditGrantor};
+use super::flow::cap_as_usize;
 use super::handle::MuxHandle;
 use super::link::MuxLink;
 use super::reader::MuxReaderDriver;
@@ -17,7 +17,7 @@ use super::shared::MuxShared;
 use super::writer::MuxWriterDriver;
 use crate::transport::handshake::negotiation::MuxSettings;
 use crate::transport::io::{EnvelopeSink, EnvelopeSource};
-use crate::transport::multiplex::MuxRole;
+use crate::transport::multiplex::{CreditGrantor, MuxRole};
 
 #[cfg(feature = "tokio")]
 use crate::runtime::rt;
@@ -63,8 +63,8 @@ where
 		let (inbound_sender, inbound_receiver) = mpsc::channel(inbound_capacity);
 
 		// Instrumentation inherits the connection collector that the halves
-		// carried across the split, so the mux plane takes no collector of its
-		// own.
+		// carried across the split, so the mux plane records into the collector
+		// of its connection.
 		#[cfg(not(feature = "instrument"))]
 		let shared = MuxShared::new(role, &settings);
 		#[cfg(feature = "instrument")]

@@ -83,7 +83,7 @@ impl CryptoProvider for FlooredOutsideProvider {
 
 /// A listener under `P` on a loopback port, whose transports present
 /// `identity`, and the address it binds.
-async fn listener_under<P: HandshakeProvider>(identity: SigningIdentity) -> (TokioListener<P>, SocketAddr) {
+pub(super) async fn listener_under<P: HandshakeProvider>(identity: SigningIdentity) -> (TokioListener<P>, SocketAddr) {
 	let config = TransportEncryptionConfig::<P>::new(identity);
 	let bind = "127.0.0.1:0".parse::<TightBeamSocketAddr>().expect("a loopback address parses");
 	let bound = TokioListener::<P>::bind_with(bind, config).await;
@@ -93,7 +93,7 @@ async fn listener_under<P: HandshakeProvider>(identity: SigningIdentity) -> (Tok
 
 /// A client transport under `P`, connected to `addr`, that trusts the
 /// certificate of `server` alone.
-async fn client_under<P: HandshakeProvider>(
+pub(super) async fn client_under<P: HandshakeProvider>(
 	addr: SocketAddr,
 	server: &SigningIdentity,
 ) -> TcpTransport<TokioStream, P> {

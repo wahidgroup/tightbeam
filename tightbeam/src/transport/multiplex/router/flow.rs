@@ -3,7 +3,7 @@
 use core::num::{NonZeroU64, NonZeroUsize};
 
 use crate::constants::DEFAULT_MUX_STREAM_CREDIT;
-use crate::transport::multiplex::StreamId;
+use crate::transport::multiplex::{CreditGrantor, StreamId};
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::constants::DEFAULT_REKEY_RENEWAL_ALLOWANCE;
@@ -19,9 +19,9 @@ pub fn len_as_u64(len: usize) -> u64 {
 /// Bytes carried per mux chunk.
 ///
 /// A payload length and a chunk size are both byte counts, so a call site
-/// holding them loose can exchange them and still compile while the credit
-/// arithmetic silently inverts. The chunk size travels as its own type.
-/// The floor of one applies once here rather than at every call.
+/// that holds them loose can swap them and still compile while the credit
+/// arithmetic silently inverts. The chunk size therefore travels as its own
+/// type, which applies the floor of one once for every call site.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ChunkSize(NonZeroUsize);
 
@@ -75,27 +75,6 @@ impl ChunkSize {
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub fn renewal_floor(drain_floor: u64) -> u64 {
 	drain_floor.saturating_add(DEFAULT_REKEY_RENEWAL_ALLOWANCE)
-}
-
-/// Receiver-side stream credit policy, which decides when to raise a
-/// stream's absolute cumulative chunk limit (QUIC MAX_STREAM_DATA,
-/// [RFC 9000 § 4.1](https://datatracker.ietf.org/doc/html/rfc9000#section-4.1)).
-///
-/// The receiver's granted limit bounds per-stream reassembly memory
-/// at `limit * chunk size`. Withholding grants applies backpressure
-/// to the sender, which parks until the limit rises.
-///
-/// # Batching
-///
-/// Every grant travels as one `MuxCredit` envelope, a control-plane AEAD record
-/// outside the session budget. Implementations SHOULD batch grants rather than
-/// raise the limit per chunk, or a long transfer spends the cipher's record
-/// limit on control traffic.
-pub trait CreditGrantor: Send + Sync {
-	/// New absolute chunk limit for a stream that has accepted
-	/// `received` chunks under `limit`, or `None` to leave the limit
-	/// unchanged. Values at or below `limit` are discarded.
-	fn replenish(&self, stream_id: StreamId, received: u64, limit: u64) -> Option<u64>;
 }
 
 /// Default grantor, which replenishes a fixed chunk window in batches.

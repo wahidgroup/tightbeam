@@ -332,7 +332,6 @@ mod tests {
 		let settings = TbInstrumentationConfig { sample_enabled_sets: true, ..Default::default() };
 
 		let labels = recorded(&process, FdrConfig::default(), settings, ENABLED_SET_SAMPLE)?;
-
 		let offers = ["Offering.S0: {a, b}", "Offering.S1: {}", "Offering.S2: {c}", "Offering.S3: {}"];
 		assert_eq!(labels, offers);
 		Ok(())
@@ -344,7 +343,6 @@ mod tests {
 		let settings = TbInstrumentationConfig { sample_enabled_sets: false, ..every_flag() };
 
 		let labels = recorded(&process, FdrConfig::default(), settings, ENABLED_SET_SAMPLE)?;
-
 		assert!(labels.is_empty(), "the trace asked for no enabled set, and recorded {labels:?}");
 		Ok(())
 	}
@@ -355,7 +353,6 @@ mod tests {
 		let settings = TbInstrumentationConfig { sample_refusals: true, ..Default::default() };
 
 		let labels = recorded(&process, FdrConfig::default(), settings, REFUSAL_SNAPSHOT)?;
-
 		let stable = ["Offering.S0: {c}", "Offering.S2: {a, b}", "Offering.S3: {a, b, c}"];
 		assert_eq!(labels, stable, "`S1` enables the hidden `t`");
 		Ok(())
@@ -367,7 +364,6 @@ mod tests {
 		let settings = TbInstrumentationConfig { sample_refusals: true, ..Default::default() };
 
 		let labels = recorded(&process, FdrConfig::default(), settings, REFUSAL_SNAPSHOT)?;
-
 		let refused = ["Accepting.Done: {a, b}", "Accepting.Idle: {a, b}"];
 		assert_eq!(labels, refused, "the process can stop at `Idle` and at `Done`");
 		Ok(())
@@ -379,7 +375,6 @@ mod tests {
 		let settings = TbInstrumentationConfig { sample_refusals: false, ..every_flag() };
 
 		let labels = recorded(&process, FdrConfig::default(), settings, REFUSAL_SNAPSHOT)?;
-
 		assert!(labels.is_empty(), "the trace asked for no refusals, and recorded {labels:?}");
 		Ok(())
 	}
@@ -390,7 +385,6 @@ mod tests {
 		let settings = TbInstrumentationConfig { divergence_heuristics: true, ..Default::default() };
 
 		let labels = recorded(&process, FdrConfig::default(), settings, DIVERGENCE_DETECT)?;
-
 		assert_eq!(labels, ["Diverging.S1: <t, u>"], "the diamond at `S3` closes no cycle");
 		Ok(())
 	}
@@ -401,7 +395,6 @@ mod tests {
 		let settings = TbInstrumentationConfig { divergence_heuristics: true, ..Default::default() };
 
 		let labels = recorded(&process, FdrConfig::default(), settings, DIVERGENCE_DETECT)?;
-
 		assert_eq!(labels, ["Turning.S2: <u, t>"], "the run takes `u` first");
 		Ok(())
 	}
@@ -424,7 +417,6 @@ mod tests {
 		let settings = TbInstrumentationConfig { divergence_heuristics: true, ..Default::default() };
 
 		let labels = recorded(&process, config, settings, DIVERGENCE_DETECT)?;
-
 		let divergence = ["Diverging.S1: <t, u>"];
 		assert_eq!(labels, divergence, "the cycle of two hidden events needs no bound");
 		Ok(())
@@ -440,7 +432,6 @@ mod tests {
 		let settings = TbInstrumentationConfig { sample_enabled_sets: true, ..Default::default() };
 
 		let labels = recorded(&subject, config, settings, ENABLED_SET_SAMPLE)?;
-
 		assert_eq!(labels, ["Sending.Idle: {send}", "Sending.Sent: {}"]);
 		Ok(())
 	}
@@ -453,11 +444,10 @@ mod tests {
 		let fault_model = Some(FaultModel::default());
 		let config = FdrConfig { specs, fault_model, ..Default::default() };
 		let settings = TbInstrumentationConfig { sample_enabled_sets: true, ..Default::default() };
-
-		let labels = recorded(&subject, config, settings, ENABLED_SET_SAMPLE)?;
-
 		let sending = ["Sending.Idle: {send}", "Sending.Sent: {}"];
 		let receiving = ["Receiving.Idle: {recv}", "Receiving.Sent: {}"];
+
+		let labels = recorded(&subject, config, settings, ENABLED_SET_SAMPLE)?;
 		let named = [sending, receiving].concat();
 		assert_eq!(labels, named, "the two specs share the names of their states");
 		Ok(())
@@ -474,7 +464,6 @@ mod tests {
 		let mut explorer = DefaultFdrExplorer::with_defaults(&process, FdrConfig::default());
 
 		let explored = explorer.explore_into(&trace);
-
 		assert!(matches!(explored, Err(TightBeamError::ChannelClosed)));
 		Ok(())
 	}
@@ -493,7 +482,6 @@ mod tests {
 		let mut explorer = DefaultFdrExplorer::with_defaults(&subject, config);
 
 		let explored = explorer.explore_into(&trace);
-
 		assert!(matches!(explored, Err(TightBeamError::ChannelClosed)));
 		Ok(())
 	}

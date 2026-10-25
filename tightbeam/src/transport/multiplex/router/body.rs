@@ -26,50 +26,50 @@ use crate::transport::TransportFailure;
 #[cfg(feature = "colony")]
 use super::sink::RequestSink;
 
-/// Chunk-level event the reader forwards to a [`StreamBody`].
+/// A chunk-level event that the reader forwards to a [`StreamBody`].
 pub enum BodyEvent {
 	/// One body chunk, in wire order.
 	Chunk(Vec<u8>),
-	/// Clean `last`-flagged end of the body.
+	/// The clean, `last`-flagged end of the body.
 	End,
 	/// The stream resolved without a clean end, through a non-Ok trailer, a
 	/// cancel, or a drain.
 	Failed(TransportError),
 }
 
-/// Consumption report from a [`StreamBody`] back to the reader.
+/// A consumption report from a [`StreamBody`] back to the reader.
 ///
 /// The reader uses [`consumed`](Self::consumed) as its input to credit
 /// replenishment.
 pub struct DrainNote {
-	/// Stream whose body drained the chunks.
+	/// The stream whose body drained the chunks.
 	pub stream_id: u32,
-	/// Absolute count of chunks the handler has drained. Like every ledger
-	/// position in the credit design, it is monotonic and idempotent.
+	/// The absolute count of chunks that the handler has drained. Like every
+	/// ledger position in the credit design, it is monotonic and idempotent.
 	pub consumed: u64,
 }
 
-/// Incremental stream body, which carries one of two streams:
+/// An incremental stream body, which carries one of two streams:
 ///
 /// - A peer request under [`MuxResponder::serve_streaming`] or [`MuxResponder::serve_duplex`].
 /// - The streamed reply of a duplex stream opened locally with [`MuxHandle::open_duplex`].
 ///
-/// Chunks arrive in wire order as the peer sends them. Consuming a chunk
+/// Chunks arrive in wire order as the peer sends them. Each consumed chunk
 /// reports drain progress to the reader, which replenishes the peer's stream
 /// credit through the connection's [`CreditGrantor`]. A slow consumer
 /// therefore parks the sender.
 ///
 /// # Drop
 ///
-/// - Dropping a handler-side request body discards the remaining chunks. The
-///   responder still owes the terminal record.
-/// - Dropping a duplex reply body before its terminal event cancels the
+/// - A handler-side request body that drops discards its remaining chunks.
+///   The responder still owes the terminal record.
+/// - A duplex reply body that drops before its terminal event cancels the
 ///   stream, which releases the cap slot on both endpoints.
 ///
 /// [`MuxResponder::serve_streaming`]: super::responder::MuxResponder::serve_streaming
 /// [`MuxResponder::serve_duplex`]: super::responder::MuxResponder::serve_duplex
 /// [`MuxHandle::open_duplex`]: super::handle::MuxHandle::open_duplex
-/// [`CreditGrantor`]: super::flow::CreditGrantor
+/// [`CreditGrantor`]: crate::transport::multiplex::CreditGrantor
 pub struct StreamBody {
 	/// The stream's identity. A peer-initiated body holds it from birth, and a
 	/// locally-opened duplex reply receives it at the first push.
@@ -82,8 +82,9 @@ pub struct StreamBody {
 	unreported: bool,
 	consumed: u64,
 	finished: bool,
-	/// Armed only on locally-initiated duplex replies: abandoning the reply
-	/// must reclaim the stream like abandoning a response future does.
+	/// The drop guard, armed on a locally-initiated duplex reply alone, because
+	/// an abandoned reply must reclaim its stream as an abandoned response
+	/// future does.
 	guard: Option<CancelOnDrop>,
 	/// The reassembly budget of the connection, which a collect of the body
 	/// charges as the unary reassembly of the reader does.
@@ -91,10 +92,10 @@ pub struct StreamBody {
 }
 
 impl StreamBody {
-	/// Assemble a body and the forwarder that feeds it, for one streaming
+	/// Assembles a body and the forwarder that feeds it, for one streaming
 	/// request.
 	///
-	/// Channel capacity covers the grant window plus the `End` marker. The
+	/// The channel capacity covers the grant window plus the `End` marker. The
 	/// reader clamps streaming grants to `consumed + window`, so a conforming
 	/// peer always fits in the channel. A collect of the body charges
 	/// `budget`, the reassembly budget of the connection.
@@ -121,10 +122,10 @@ impl StreamBody {
 		(body, forwarder)
 	}
 
-	/// Feed every chunk of this body into `sink`, then close the sink so
+	/// Feeds every chunk of this body into `sink`, then closes the sink so
 	/// its stream ends.
 	///
-	/// Consuming each chunk replenishes the peer's credit, so a slow
+	/// Each consumed chunk replenishes the peer's credit, so a slow
 	/// downstream parks the upstream (end-to-end backpressure).
 	///
 	/// # Errors
@@ -139,14 +140,14 @@ impl StreamBody {
 		sink.close().await
 	}
 
-	/// Arm the drop guard: dropping this body before its terminal
-	/// event cancels the stream on both endpoints.
+	/// Arms the drop guard, so a drop of this body before its terminal event
+	/// cancels the stream on both endpoints.
 	pub fn arm_guard(&mut self, guard: CancelOnDrop) {
 		self.guard = Some(guard);
 	}
 
-	/// Wait for the next body chunk, or `Ok(None)` once the peer's `last`
-	/// chunk has been consumed.
+	/// Waits for the next body chunk, and answers `Ok(None)` once this body
+	/// consumed the peer's `last` chunk.
 	///
 	/// The terminal state is sticky. After `Ok(None)` or an error, every later
 	/// call returns `Ok(None)`.
@@ -155,16 +156,16 @@ impl StreamBody {
 	///
 	/// - [`TransportError::ConnectionClosed`] -- the stream died before its `last` chunk.
 	/// - [`TransportError::Draining`] -- a GoAway ended the stream before the peer served it.
-	/// - `OperationFailed(Cancelled)` -- the stream was cancelled, by its own sink or by the peer.
+	/// - `OperationFailed(Cancelled)` -- its own sink or the peer cancelled the stream.
 	/// - The trailer's [`TransitStatus`](crate::policy::TransitStatus) mapped
 	///   to its transport error, on a duplex reply that ended non-Ok.
 	pub async fn chunk(&mut self) -> TransportResult<Option<Vec<u8>>> {
 		poll_fn(|cx| self.poll_chunk(cx)).await
 	}
 
-	/// Collect the remaining chunks into one buffer, consuming the
-	/// body. Drain reports flow per chunk exactly as with
-	/// [`chunk`](Self::chunk), so credit replenishment is identical.
+	/// Collects the remaining chunks into one buffer and consumes the body.
+	/// Drain reports flow per chunk exactly as with [`chunk`](Self::chunk), so
+	/// credit replenishment is identical.
 	///
 	/// The chunks reassemble under the bounds of a unary reassembly, so a peer
 	/// stream reassembles to one bound on either path (CWE-770).
@@ -206,8 +207,8 @@ impl StreamBody {
 		Ok(collected.into_bytes())
 	}
 
-	/// Collect the remaining chunks and decode them as one DER
-	/// [`Frame`], consuming the body.
+	/// Collects the remaining chunks, decodes them as one DER [`Frame`], and
+	/// consumes the body.
 	///
 	/// # Errors
 	///
@@ -236,7 +237,7 @@ impl StreamBody {
 		Frame::from_der(&bytes).map_err(TransportError::DerError)
 	}
 
-	/// Poll core shared by [`chunk`](Self::chunk) and the [`Stream`] impl.
+	/// The poll core that [`chunk`](Self::chunk) and the [`Stream`] impl share.
 	fn poll_chunk(&mut self, cx: &mut Context<'_>) -> Poll<TransportResult<Option<Vec<u8>>>> {
 		if self.finished {
 			return Poll::Ready(Ok(None));
@@ -269,7 +270,7 @@ impl StreamBody {
 		}
 	}
 
-	/// Report the current consumption count to the reader once the channel
+	/// Reports the current consumption count to the reader once the channel
 	/// admits it.
 	///
 	/// A full channel keeps the count owed and parks this body's waker on the
@@ -299,7 +300,7 @@ impl StreamBody {
 		}
 	}
 
-	/// Mark the body terminal and disarm its drop guard, because a resolved
+	/// Marks the body terminal and disarms its drop guard, because a resolved
 	/// stream has nothing left to cancel.
 	fn finish(&mut self) {
 		self.finished = true;
@@ -309,7 +310,7 @@ impl StreamBody {
 	}
 }
 
-/// Chunk-at-a-time [`Stream`] view of the body.
+/// A chunk-at-a-time [`Stream`] view of the body.
 ///
 /// `Ok` items are body chunks, and a single `Err` item surfaces the terminal
 /// failure. The stream fuses to `None` after that item and after the clean
@@ -328,26 +329,26 @@ impl Stream for StreamBody {
 	}
 }
 
-/// Reader-side ledger of a streaming request, which forwards chunks into the
-/// body channel instead of a reassembly buffer.
+/// The reader-side ledger of a streaming request, which forwards chunks into
+/// the body channel in place of a reassembly buffer.
 pub struct ForwardedStream {
 	events: mpsc::Sender<BodyEvent>,
-	/// Count of chunks accepted so far.
+	/// The count of chunks accepted so far.
 	received: u64,
-	/// Absolute cumulative chunk limit granted to the sender.
+	/// The absolute cumulative chunk limit granted to the sender.
 	limit: u64,
-	/// Grant ceiling above the consumed watermark. The body channel absorbs
+	/// The grant ceiling above the consumed watermark. The body channel absorbs
 	/// at most this many undrained chunks.
 	window: u64,
 }
 
 impl ForwardedStream {
-	/// Current `(limit, window)` pair for grant arithmetic.
+	/// The current `(limit, window)` pair of the grant arithmetic.
 	pub fn limits(&self) -> (u64, u64) {
 		(self.limit, self.window)
 	}
 
-	/// Raise the granted limit.
+	/// Raises the granted limit.
 	///
 	/// Grants are absolute and monotonic, so the call ignores a stale lower
 	/// value.
@@ -360,8 +361,8 @@ impl ForwardedStream {
 		self.limit = self.limit.max(limit);
 	}
 
-	/// Account one arriving chunk against the granted limit, returning `false`
-	/// when the chunk would pass the limit.
+	/// Accounts one arriving chunk against the granted limit, and returns
+	/// `false` when the chunk would pass the limit.
 	pub fn accept_chunk(&mut self) -> bool {
 		if self.received >= self.limit {
 			return false;
@@ -372,18 +373,18 @@ impl ForwardedStream {
 		true
 	}
 
-	/// Forward a body event, returning `false` on failure.
+	/// Forwards a body event, and returns `false` on a failure.
 	///
-	/// Grants are clamped to channel capacity, so a full channel is
-	/// unreachable for a conforming peer and overflow reports as a failure
+	/// The reader clamps grants to the channel capacity, so a full channel is
+	/// unreachable for a conforming peer, and an overflow reports as a failure
 	/// like a disconnect. A dropped body closes the channel, which is also a
 	/// failure because consumed credit stays consumed.
 	pub fn forward(&mut self, event: BodyEvent) -> bool {
 		self.events.try_send(event).is_ok()
 	}
 
-	/// Account and forward one payload chunk, returning `false` on a credit
-	/// overrun or an overflowing channel.
+	/// Accounts and forwards one payload chunk, and returns `false` on a credit
+	/// overrun or a full channel.
 	///
 	/// An empty payload, such as a bare trailer or an empty body, consumes its
 	/// credit and forwards no chunk event. The consumer therefore sees data or
@@ -400,8 +401,8 @@ impl ForwardedStream {
 		self.forward(BodyEvent::Chunk(payload.to_vec()))
 	}
 
-	/// Whether the consuming body has been dropped (refused at the
-	/// cap or abandoned by its handler).
+	/// Whether the body that consumes this stream dropped, refused at the cap
+	/// or abandoned by its handler.
 	pub fn severed(&self) -> bool {
 		self.events.is_closed()
 	}
@@ -485,8 +486,8 @@ mod tests {
 		assert!(matches!(notes.try_recv(), Ok(DrainNote { stream_id: 7, consumed: 1 })));
 		assert!(notes.try_recv().is_err());
 
-		// Draining the slot wakes the body, whose next poll reports its
-		// current count ahead of waiting on chunks.
+		// The drained slot wakes the body, whose next poll reports its current
+		// count before it waits on chunks.
 		assert!(flag.woken());
 		assert!(matches!(body.poll_chunk(&mut cx), Poll::Pending));
 		assert!(matches!(notes.try_recv(), Ok(DrainNote { stream_id: 7, consumed: 3 })));
@@ -519,8 +520,8 @@ mod tests {
 		assert!(!forwarder.accept_chunk());
 	}
 
-	// A dropped body closes the channel, so forward must report failure.
-	// Treating Closed like success would keep credit draining.
+	// A dropped body closes the channel, so forward must report failure. A
+	// forward that treated `Closed` as a success would keep credit draining.
 	#[test]
 	fn test_forward_reports_failure_when_body_dropped() {
 		let (body, mut forwarder, _notes) = body_fixture(7, 4);

@@ -14,12 +14,13 @@ use tightbeam::cms::signed_data::SignerIdentifier;
 use tightbeam::{
 	builder::{frame::FrameBuilder, CheckDigestOid, TypeBuilder},
 	colony::{
-		common::{
-			ClusterCommand, ClusterCommandResponse, ClusterStatus, ColonyNamespace, HeartbeatParams, HiveManagement,
+		hive::{Hive, HiveConfig, HiveTlsConfig, ServletBox},
+		protocol::{
+			ClusterCommand, ClusterCommandResponse, ClusterStatus, HeartbeatParams, HiveManagement,
 			HiveManagementOutcome, SpawnServletParams, StopServletParams,
 		},
-		hive::{Hive, HiveConfig, HiveTlsConfig, ServletBox},
 		servlet::ServletConfig,
+		urn::ColonyNamespace,
 	},
 	compose,
 	crypto::{
@@ -430,7 +431,7 @@ async fn signed_stop_frame(identity: &SigningIdentity, id: impl AsRef<[u8]>) -> 
 }
 
 /// Signs `command`, a body spelled as a SEQUENCE, which the CHOICE decoder
-/// cannot read.
+/// rejects.
 async fn signed_sequence_command_frame(
 	identity: &SigningIdentity,
 	id: impl AsRef<[u8]>,
@@ -492,10 +493,9 @@ tb_assert_spec! {
 	}
 }
 
-// Security rejects must come back in the CHOICE the sender expects.
-// A heartbeat rejected in the manage shape decodes as MalformedResponse
-// on the cluster and counts toward eviction, so it would sever a control
-// plane whose breaker would otherwise recover after cooldown.
+// Security rejects must come back in the CHOICE the sender expects. The
+// cluster counts a heartbeat refused in the manage shape, a MalformedResponse,
+// toward eviction and would sever a plane its breaker recovers after cooldown.
 tb_scenario! {
 	name: hive_gate_reply_shapes,
 	spec: HiveGateShapeSpec,
@@ -687,12 +687,9 @@ tb_assert_spec! {
 	}
 }
 
-// A command is a CHOICE, which encodes as its one alternative, so a body
-// spelled as a SEQUENCE decodes as no command, whether it names none of its
-// fields, one, or both. Each must draw a refusal the sender can decode. A
-// silent hive would hang the cluster until its own timeout and count as a
-// lost hive. A PermissionDenied answer would tell an authorized sender its
-// credentials were the problem.
+// Each SEQUENCE body, with none, one, or both fields, must draw a refusal the
+// sender can decode. Silence would hang the cluster until its timeout, which
+// counts the hive as lost. PermissionDenied would blame authorized credentials.
 tb_scenario! {
 	name: hive_refuses_a_command_of_the_sequence_shape,
 	spec: HiveSequenceShapeRefusalSpec,
@@ -802,9 +799,8 @@ tb_assert_spec! {
 }
 
 // A drain refusal holds for every resubmission, so it keeps the replay slot
-// spent. The hive refuses the same signed frame, submitted again, as a replay
-// (PermissionDenied) rather than answer it as a fresh drain refusal
-// (Unavailable), so a captured frame buys its holder nothing.
+// spent. The same frame sent again draws PermissionDenied as a replay, not
+// Unavailable as a drain refusal, so a captured frame buys its holder nothing.
 tb_scenario! {
 	name: hive_permanent_refusal_keeps_the_replay_slot,
 	spec: HivePermanentRefusalKeepsSlotSpec,
@@ -1082,12 +1078,9 @@ tb_assert_spec! {
 	}
 }
 
-// The caller composes and signs a typed command frame and submits it
-// through `HiveContext::call`. The presence probes only witness that an
-// id, a signature block, and a previous-frame digest exist, so they
-// cannot prove byte fidelity. The two SIG_VALID assertions carry that
-// proof, because each signature verifies only over the exact bytes the
-// other side signed.
+// The presence probes witness only that an id, a signature block, and a
+// previous-frame digest exist. The two SIG_VALID assertions prove byte
+// fidelity, because a signature verifies only over the bytes its signer signed.
 tb_scenario! {
 	name: hive_context_call_delivers_signed_frame,
 	spec: HiveCallFrameDeliverySpec,

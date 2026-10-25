@@ -16,7 +16,6 @@ extern crate alloc;
 
 #[cfg(not(feature = "std"))]
 use alloc::sync::Arc;
-use core::time::Duration;
 #[cfg(feature = "std")]
 use std::sync::Arc;
 
@@ -30,6 +29,8 @@ pub mod messaging;
 pub mod policy;
 pub mod protocols;
 pub mod state;
+
+mod limits;
 
 #[cfg(feature = "tokio")]
 pub mod accept;
@@ -47,8 +48,9 @@ pub use builders::EnvelopeBuilder;
 pub use client::GenericClient;
 pub use client::{ClientBuilder, ClientPolicies};
 pub use envelopes::{Arrived, RequestPackage, ResponsePackage, TransportEnvelope, WireEnvelope, WireMode};
-pub use error::{TransportError, TransportFailure};
+pub use error::{Result as TransportResult, TransportError, TransportFailure};
 pub use io::{EncryptedMessageIO, EnvelopeSink, EnvelopeSource, MessageIO};
+pub use limits::TransportLimits;
 pub use messaging::GateAudit;
 pub use messaging::MessageEmitter;
 pub use messaging::{MessageCollector, Transport};
@@ -70,13 +72,6 @@ pub use tcp::r#async::TokioListener;
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 pub use tcp::r#async::{TransportReader, TransportWriter};
 
-/// The transport-agnostic result type.
-pub type TransportResult<T> = Result<T, TransportError>;
-
-use crate::constants::{
-	DEFAULT_HANDSHAKE_MAX_WIRE, DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_MAX_CLEARTEXT_ENVELOPE,
-	DEFAULT_MAX_ENCRYPTED_ENVELOPE, DEFAULT_OPERATION_TIMEOUT,
-};
 use crate::crypto::profiles::CryptoProvider;
 use crate::crypto::sign::SigningIdentity;
 use crate::crypto::x509::policy::CertificateValidation;
@@ -97,64 +92,6 @@ use crate::trace::TraceCollector;
 use crate::transport::handshake::{CmsIdentityPair, HandshakeError};
 #[cfg(host_clock)]
 use crate::utils::time::SystemClock;
-
-/// Every ceiling a transport enforces, in one value.
-///
-/// Each field is a plain `usize` or `Duration`, so every transport holds a
-/// value for every limit, and an unset limit is unrepresentable.
-///
-/// [`Default`] is the one place that chooses these values.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TransportLimits {
-	/// The ceiling in bytes of a cleartext envelope on the wire.
-	pub cleartext_envelope: usize,
-	/// The ceiling in bytes of an encrypted envelope on the wire.
-	pub encrypted_envelope: usize,
-	/// The ceiling in bytes of one handshake-phase message on the wire.
-	pub handshake_wire: usize,
-	/// The deadline of a single read or write on the transport.
-	pub operation_timeout: Duration,
-	/// The deadline of the whole handshake exchange.
-	pub handshake_timeout: Duration,
-}
-
-impl TransportLimits {
-	/// Returns the largest envelope this endpoint reads before the parse
-	/// decides which ceiling applies.
-	///
-	/// A reader learns whether the bytes are a cleartext or an encrypted
-	/// envelope only once it has them, so it admits the larger ceiling, and the
-	/// per-mode check runs once the reader knows the wire form.
-	#[must_use]
-	pub fn max_envelope(&self) -> usize {
-		if self.encrypted_envelope > self.cleartext_envelope {
-			self.encrypted_envelope
-		} else {
-			self.cleartext_envelope
-		}
-	}
-
-	/// The ceiling in bytes of a wire envelope of `mode`. A write and a read
-	/// both take their ceiling from here.
-	pub(crate) const fn envelope_ceiling(&self, mode: WireMode) -> usize {
-		match mode {
-			WireMode::Cleartext => self.cleartext_envelope,
-			WireMode::Encrypted => self.encrypted_envelope,
-		}
-	}
-}
-
-impl Default for TransportLimits {
-	fn default() -> Self {
-		Self {
-			cleartext_envelope: DEFAULT_MAX_CLEARTEXT_ENVELOPE,
-			encrypted_envelope: DEFAULT_MAX_ENCRYPTED_ENVELOPE,
-			handshake_wire: DEFAULT_HANDSHAKE_MAX_WIRE,
-			operation_timeout: DEFAULT_OPERATION_TIMEOUT,
-			handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
-		}
-	}
-}
 
 /// The configuration of a server endpoint under provider `P`: the identity it
 /// presents, how it authenticates its client, the key purposes its handshakes
@@ -463,6 +400,7 @@ mod tests {
 	#[cfg(feature = "tokio")]
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 	async fn test_server_and_client_macros() -> TransportResult<()> {
+		use core::time::Duration;
 		use std::sync::{mpsc, Arc};
 
 		use crate::asn1::Frame;

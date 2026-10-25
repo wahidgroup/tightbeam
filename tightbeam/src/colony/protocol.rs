@@ -285,9 +285,8 @@ pub struct ServletAddressUpdateResponse {
 ///
 /// A gateway sends it to a peer gateway, so the colony that receives it
 /// learns which types the peer serves and forwards work there. It carries
-/// type URNs alone, without instance addresses. Peers reach the gateway at
-/// `gateway_addr`, which resolves the whole peer colony rather than a single
-/// servlet.
+/// type URNs alone, and peers reach the gateway at `gateway_addr`, one
+/// address for the whole peer colony.
 #[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct PeerAdvertisement {
 	/// The address that peers dial to reach the gateway that sends this
@@ -411,9 +410,8 @@ impl GossipResponse {
 /// ones it lacks.
 ///
 /// This is the anti-entropy backstop to the best-effort flood. Reconciliation
-/// is an unordered set difference over content digests, with no cursor. A
-/// receiver drops a wrong-length entry rather than treat it as a digest
-/// (CWE-20).
+/// is a stateless, unordered set difference over content digests. A receiver
+/// drops a wrong-length entry rather than treat it as a digest (CWE-20).
 #[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct GossipReconciliation {
 	/// The content digests the sender retains.
@@ -541,7 +539,7 @@ impl ServletInfo {
 /// # Examples
 ///
 /// ```
-/// use tightbeam::colony::common::{HiveManagement, ListServletsParams};
+/// use tightbeam::colony::protocol::{HiveManagement, ListServletsParams};
 /// use tightbeam::{decode, encode};
 ///
 /// let list = HiveManagement::List(ListServletsParams { filter: None });
@@ -573,7 +571,7 @@ pub enum HiveManagement {
 /// # Examples
 ///
 /// ```
-/// use tightbeam::colony::common::HiveManagementOutcome;
+/// use tightbeam::colony::protocol::HiveManagementOutcome;
 /// use tightbeam::{decode, encode};
 ///
 /// let stopped = HiveManagementOutcome::stop_ok();
@@ -642,7 +640,7 @@ impl ClusterCommand {
 	/// # Examples
 	///
 	/// ```
-	/// use tightbeam::colony::common::{ClusterCommand, ClusterStatus, HeartbeatParams, ReplyShape};
+	/// use tightbeam::colony::protocol::{ClusterCommand, ClusterStatus, HeartbeatParams, ReplyShape};
 	///
 	/// let heartbeat = ClusterCommand::Heartbeat(HeartbeatParams { cluster_status: ClusterStatus::Healthy });
 	/// assert_eq!(heartbeat.reply_shape(), ReplyShape::Heartbeat);
@@ -828,7 +826,8 @@ impl HiveManagementOutcome {
 	/// # Examples
 	///
 	/// ```
-	/// use tightbeam::colony::common::{ColonyNamespace, HiveManagementOutcome};
+	/// use tightbeam::colony::protocol::HiveManagementOutcome;
+	/// use tightbeam::colony::urn::ColonyNamespace;
 	/// use tightbeam::policy::TransitStatus;
 	///
 	/// let worker = ColonyNamespace::default().servlet("worker")?;
@@ -855,7 +854,7 @@ impl HiveManagementOutcome {
 	/// # Examples
 	///
 	/// ```
-	/// use tightbeam::colony::common::HiveManagementOutcome;
+	/// use tightbeam::colony::protocol::HiveManagementOutcome;
 	///
 	/// let listed = HiveManagementOutcome::list_ok([]);
 	/// assert!(matches!(listed, HiveManagementOutcome::List(result) if result.servlets.is_empty()));
@@ -871,7 +870,7 @@ impl HiveManagementOutcome {
 	/// # Examples
 	///
 	/// ```
-	/// use tightbeam::colony::common::HiveManagementOutcome;
+	/// use tightbeam::colony::protocol::HiveManagementOutcome;
 	/// use tightbeam::policy::TransitStatus;
 	///
 	/// let stopped = HiveManagementOutcome::stop_ok();
@@ -891,7 +890,7 @@ impl HiveManagementOutcome {
 	/// # Examples
 	///
 	/// ```
-	/// use tightbeam::colony::common::{HiveManagementOutcome, ManageShape};
+	/// use tightbeam::colony::protocol::{HiveManagementOutcome, ManageShape};
 	/// use tightbeam::policy::TransitStatus;
 	///
 	/// let refused = HiveManagementOutcome::refusal(ManageShape::Spawn, TransitStatus::Unavailable);
@@ -945,7 +944,7 @@ pub enum ClusterStatus {
 /// # Examples
 ///
 /// ```
-/// use tightbeam::colony::common::{ClusterCommand, ClusterStatus, HeartbeatParams};
+/// use tightbeam::colony::protocol::{ClusterCommand, ClusterStatus, HeartbeatParams};
 /// use tightbeam::{decode, encode};
 ///
 /// let heartbeat = ClusterCommand::Heartbeat(HeartbeatParams { cluster_status: ClusterStatus::Healthy });
@@ -985,7 +984,7 @@ pub struct HeartbeatParams {
 /// # Examples
 ///
 /// ```
-/// use tightbeam::colony::common::{ClusterCommandResponse, HiveManagementOutcome};
+/// use tightbeam::colony::protocol::{ClusterCommandResponse, HiveManagementOutcome};
 /// use tightbeam::{decode, encode};
 ///
 /// let stopped = ClusterCommandResponse::Manage(HiveManagementOutcome::stop_ok());
@@ -1037,7 +1036,7 @@ impl ClusterCommandResponse {
 	/// # Examples
 	///
 	/// ```
-	/// use tightbeam::colony::common::ClusterCommandResponse;
+	/// use tightbeam::colony::protocol::ClusterCommandResponse;
 	/// use tightbeam::policy::TransitStatus;
 	/// use tightbeam::utils::BasisPoints;
 	///
@@ -1059,7 +1058,7 @@ impl ClusterCommandResponse {
 	/// # Examples
 	///
 	/// ```
-	/// use tightbeam::colony::common::{ClusterCommandResponse, ReplyShape};
+	/// use tightbeam::colony::protocol::{ClusterCommandResponse, ReplyShape};
 	/// use tightbeam::policy::TransitStatus;
 	///
 	/// let refused = ClusterCommandResponse::refusal(ReplyShape::Heartbeat, TransitStatus::PermissionDenied);
@@ -1082,7 +1081,7 @@ impl ClusterCommandResponse {
 /// place that reads it, so every freshness and replay decision compares the
 /// same instant.
 pub(crate) trait IssuedAt {
-	/// The instant this frame says it was issued.
+	/// The issue time this frame states.
 	fn issued_at(&self) -> UnixMillis;
 }
 
@@ -1097,7 +1096,7 @@ mod tests {
 	use super::*;
 	use crate::asn1::Version;
 	use crate::builder::{FrameBuilder, TypeBuilder};
-	use crate::colony::common::ColonyNamespace;
+	use crate::colony::urn::ColonyNamespace;
 	use crate::der::{Decode, ErrorKind, Tag, TagNumber};
 	use crate::error::Result;
 	use crate::tb_cases;

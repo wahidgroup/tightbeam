@@ -121,7 +121,9 @@
 //! - The digest algorithm, such as SHA3-256.
 //! - The AEAD cipher, such as AES-256-GCM.
 //! - The signature algorithm, such as ECDSA-with-SHA3-256.
-//! - The key wrapping algorithm, for CMS.
+//! - The KDF, such as HKDF-SHA3-256.
+//! - The key-agreement curve, such as secp256k1.
+//! - The key-wrap algorithm, such as AES-256 key wrap.
 //!
 //! One policy, [`negotiation::ProfilePolicy`], makes both decisions in both
 //! protocols:
@@ -210,7 +212,6 @@ pub mod receipt;
 pub use crate::crypto::aead::DirectionalCiphers;
 pub use attributes::HandshakeAttribute;
 pub use error::HandshakeError;
-pub use identity::ServerIdentity;
 pub use peer::PeerAuthentication;
 pub use schedule::EpochMaterials;
 pub(crate) use session_peer::SessionPeer;
@@ -252,14 +253,16 @@ use crate::cms::signed_data::SignedData;
 use crate::crypto::aead::SessionKeys;
 use crate::crypto::cms::AuthEnvelopedData;
 use crate::crypto::profiles::SecurityProfileDesc;
+use crate::crypto::sign::SigningIdentity;
+use crate::crypto::x509::error::CertificateValidationError;
+use crate::der::asn1::ObjectIdentifier;
 use crate::der::{Enumerated, Sequence};
-use crate::transport::error::TransportError;
 use crate::transport::handshake::negotiation::{
 	MuxSettings, SecurityAccept, SecurityOffer, TransportAccept, TransportOffer,
 };
 use crate::transport::handshake::receipt::StoredReceipt;
 use crate::transport::wire_der::WireDer;
-use crate::utils::marker::{MaybeSend, MaybeSendFuture};
+use crate::utils::marker::{MaybeSend, MaybeSendFuture, MaybeSync};
 use crate::x509::Certificate;
 use crate::Beamable;
 
@@ -272,9 +275,8 @@ use crate::crypto::profiles::CryptoProvider;
 mod transport {
 	pub use crate::crypto::aead::KeyInit;
 	pub use crate::crypto::cms::RecipientKem;
-	pub use crate::crypto::common::typenum::U32;
-	pub use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
-	pub use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
+	pub use crate::crypto::hpke::DhKemCurve;
+	pub use crate::crypto::sign::elliptic_curve::{AffinePoint, PublicKey};
 	pub use crate::crypto::sign::Verifier;
 	pub use crate::der::oid::AssociatedOid;
 	pub use crate::spki::{EncodePublicKey, Error as SpkiError, SubjectPublicKeyInfoRef};
@@ -283,33 +285,34 @@ mod transport {
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use transport::*;
 
-/// A curve both handshake protocols run on.
+/// A curve both handshake protocols run on: a [`DhKemCurve`] that names its
+/// OID. Every curve that meets the bounds is a handshake curve, such as
+/// secp256k1, P-256, P-384, or P-521.
 ///
-/// The field is 32 bytes wide, so a shared secret is 32 bytes by type. A point
-/// of the HPKE flow or of a rekey travels in its compressed SEC 1 form, at
-/// the width the curve gives that form (SEC 1 v2.0 §2.3.3). Every curve that
-/// meets the bounds is a handshake curve.
+/// - A shared secret is the x-coordinate of an agreement, as wide as the field (SEC 1 v2.0 §3.3.1).
+/// - A point of the HPKE flow or of a rekey travels in its compressed SEC 1 form (SEC 1 v2.0 §2.3.3).
+/// - The field sets the strength of every session key, so
+///   [`DefaultStrengthFloor`] refuses a field under 256 bits.
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam::transport::handshake::HandshakeCurve;
+///
+/// fn runs_a_handshake<C: HandshakeCurve>() {}
+///
+/// runs_a_handshake::<tightbeam::crypto::k256::Secp256k1>();
+/// runs_a_handshake::<p256::NistP256>();
+/// runs_a_handshake::<p384::NistP384>();
+/// runs_a_handshake::<p521::NistP521>();
+/// ```
+///
+/// [`DefaultStrengthFloor`]: crate::crypto::profiles::DefaultStrengthFloor
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-pub trait HandshakeCurve:
-	Curve<FieldBytesSize = U32>
-	+ CurveArithmetic<AffinePoint: FromEncodedPoint<Self> + ToEncodedPoint<Self>>
-	+ AssociatedOid
-	+ Send
-	+ Sync
-	+ 'static
-{
-}
+pub trait HandshakeCurve: DhKemCurve + AssociatedOid + Send + Sync + 'static {}
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-impl<C> HandshakeCurve for C where
-	C: Curve<FieldBytesSize = U32>
-		+ CurveArithmetic<AffinePoint: FromEncodedPoint<C> + ToEncodedPoint<C>>
-		+ AssociatedOid
-		+ Send
-		+ Sync
-		+ 'static
-{
-}
+impl<C> HandshakeCurve for C where C: DhKemCurve + AssociatedOid + Send + Sync + 'static {}
 
 /// A [`CryptoProvider`] the handshake layer runs on.
 ///
@@ -397,7 +400,7 @@ pub enum CmsServerIdentity {
 }
 
 /// A CMS server's chain, ordered root to leaf, with its leaf held apart, so
-/// each admission lends the leaf without a copy.
+/// each admission borrows the one stored leaf.
 ///
 /// [`Self::new`] is the one constructor, so every chain holds a leaf.
 #[cfg(feature = "transport-cms")]
@@ -464,9 +467,9 @@ pub enum HandshakeAlert {
 	/// The MAC or signature over the Finished transcript hash failed
 	/// verification.
 	FinishedIntegrityFail = 5,
-	// Code 6 is reserved for the retired settlement-rejected alert, and MUST
-	// NOT be reused. The next alert takes 7, so archived captures never
-	// decode a stale meaning.
+	// Code 6 stays reserved for the settlement-rejected alert that archived
+	// captures may carry, and MUST NOT be reused. The next alert takes 7, so an
+	// archived capture never decodes to a stale meaning.
 }
 
 /// A handshake message travels in one of three CMS containers (RFC 5652).
@@ -588,8 +591,7 @@ pub struct EstablishedSession {
 	/// of a gate shares.
 	peer: Option<Arc<SessionPeer>>,
 	/// The epoch-0 rekey materials, present exactly while a rekey could use
-	/// them.
-	/// The mux rekey reads them, so the field exists in a build with it.
+	/// them. The mux rekey reads them, so the field exists in a build with it.
 	#[cfg(mux_rekey)]
 	epoch: Option<EpochMaterials>,
 }
@@ -721,14 +723,17 @@ impl EstablishedSession {
 /// The [`MaybeSend`] bound requires `Send` on every target except `wasm32`,
 /// where the single-threaded executor lets JS-backed signing providers
 /// participate.
+///
+/// # Outside implementations
+///
+/// An outside orchestrator wraps a house [`Handshake`] and completes through
+/// it. [`Self::complete`] returns an [`EstablishedSession`], which a house
+/// handshake alone builds, so every session key comes from the key schedule
+/// of this crate.
 pub trait ClientHandshakeProtocol: MaybeSend {
-	/// The error the orchestrator returns, which converts into a
-	/// [`TransportError`].
-	type Error: Into<TransportError> + Send;
-
 	/// Start the handshake and return the first message for the server.
 	#[allow(clippy::type_complexity)]
-	fn start<'a>(&'a mut self) -> MaybeSendFuture<'a, CoreResult<HandshakeMessage, Self::Error>>;
+	fn start<'a>(&'a mut self) -> MaybeSendFuture<'a, CoreResult<HandshakeMessage, HandshakeError>>;
 
 	/// Handle a response from the server.
 	///
@@ -738,7 +743,7 @@ pub trait ClientHandshakeProtocol: MaybeSend {
 	fn handle_response<'a>(
 		&'a mut self,
 		msg: HandshakeMessage,
-	) -> MaybeSendFuture<'a, CoreResult<Option<HandshakeMessage>, Self::Error>>;
+	) -> MaybeSendFuture<'a, CoreResult<Option<HandshakeMessage>, HandshakeError>>;
 
 	/// Complete the handshake and take everything it agreed.
 	///
@@ -746,7 +751,7 @@ pub trait ClientHandshakeProtocol: MaybeSend {
 	/// the client-to-server key and receives on the server-to-client key. The
 	/// cipher comes from the [`CryptoProvider`] associated type, and the OID
 	/// comes from the negotiated security profile.
-	fn complete(self: Box<Self>) -> MaybeSendFuture<'static, CoreResult<EstablishedSession, Self::Error>>;
+	fn complete(self: Box<Self>) -> MaybeSendFuture<'static, CoreResult<EstablishedSession, HandshakeError>>;
 
 	/// Whether the handshake reached the terminal state that completion enters.
 	fn is_complete(&self) -> bool;
@@ -764,20 +769,23 @@ pub trait ClientHandshakeProtocol: MaybeSend {
 /// The [`MaybeSend`] bound requires `Send` on every target except `wasm32`,
 /// where the single-threaded executor lets JS-backed signing providers
 /// participate.
+///
+/// # Outside implementations
+///
+/// An outside orchestrator wraps a house [`Handshake`] and completes through
+/// it. [`Self::complete`] returns an [`EstablishedSession`], which a house
+/// handshake alone builds, so every session key comes from the key schedule
+/// of this crate.
 pub trait ServerHandshakeProtocol: MaybeSend {
-	/// The error the orchestrator returns, which converts into a
-	/// [`TransportError`].
-	type Error: Into<TransportError> + Send;
-
 	/// Handle a request from the client.
 	///
 	/// A multi-round handshake calls this once per client message. It returns
-	/// `Some` when the server owes a response, and `None` when the message was
-	/// the last one. Each step accepts one container and refuses the others.
+	/// `Some` when the server owes a response, and `None` for the client's last
+	/// message. Each step accepts one container and refuses the others.
 	fn handle_request<'a>(
 		&'a mut self,
 		msg: HandshakeMessage,
-	) -> MaybeSendFuture<'a, CoreResult<Option<HandshakeMessage>, Self::Error>>;
+	) -> MaybeSendFuture<'a, CoreResult<Option<HandshakeMessage>, HandshakeError>>;
 
 	/// Complete the handshake and take everything it agreed.
 	///
@@ -785,7 +793,7 @@ pub trait ServerHandshakeProtocol: MaybeSend {
 	/// sends on the server-to-client key and receives on the client-to-server
 	/// key. The cipher comes from the [`CryptoProvider`] associated type, and
 	/// the OID comes from the negotiated security profile.
-	fn complete(self: Box<Self>) -> MaybeSendFuture<'static, CoreResult<EstablishedSession, Self::Error>>;
+	fn complete(self: Box<Self>) -> MaybeSendFuture<'static, CoreResult<EstablishedSession, HandshakeError>>;
 
 	/// Whether the handshake reached the terminal state that completion enters.
 	fn is_complete(&self) -> bool;
@@ -795,6 +803,52 @@ pub trait ServerHandshakeProtocol: MaybeSend {
 	fn selected_profile(&self) -> Option<SecurityProfileDesc>;
 }
 
+/// The identity a handshake server holds, which hands the orchestrator the
+/// half that signs the reply and its receipt.
+///
+/// Each flow of this crate names the identity type it runs with, and the
+/// flows are sealed, so this trait is sealed too, and an identity of another
+/// type fails to compile:
+///
+/// ```compile_fail,E0277
+/// use tightbeam::crypto::sign::SigningIdentity;
+/// use tightbeam::crypto::x509::error::CertificateValidationError;
+/// use tightbeam::der::asn1::ObjectIdentifier;
+/// use tightbeam::transport::handshake::ServerIdentity;
+///
+/// struct Forged(SigningIdentity);
+///
+/// impl ServerIdentity for Forged {
+///     fn signing(&self) -> &SigningIdentity {
+///         &self.0
+///     }
+///
+///     fn require_purpose(&self, _purpose: ObjectIdentifier) -> Result<(), CertificateValidationError> {
+///         Ok(())
+///     }
+/// }
+/// ```
+pub trait ServerIdentity: sealed::Sealed + MaybeSend + MaybeSync + 'static {
+	/// The identity that signs the reply and the session receipt.
+	fn signing(&self) -> &SigningIdentity;
+
+	/// Refuse this identity for the server role unless each of its
+	/// certificates admits the key purpose `purpose` (RFC 5280 §4.2.1.12).
+	///
+	/// # Errors
+	///
+	/// - The errors of [`CertificateExt::require_purpose`].
+	///
+	/// [`CertificateExt::require_purpose`]: crate::crypto::x509::utils::CertificateExt::require_purpose
+	fn require_purpose(&self, purpose: ObjectIdentifier) -> Result<(), CertificateValidationError>;
+}
+
+mod sealed {
+	/// The seal of [`ServerIdentity`](super::ServerIdentity), implemented by
+	/// the identity of each flow alone.
+	pub trait Sealed {}
+}
+
 /// A boxed client handshake orchestrator.
 ///
 /// The object is `Send` on every target except `wasm32`, where JS-backed
@@ -802,11 +856,11 @@ pub trait ServerHandshakeProtocol: MaybeSend {
 /// carry the non-auto [`MaybeSend`] bound, so a `cfg` on the target picks
 /// the auto-trait list.
 #[cfg(not(target_arch = "wasm32"))]
-pub type BoxedClientHandshake = Box<dyn ClientHandshakeProtocol<Error = HandshakeError> + Send + 'static>;
+pub type BoxedClientHandshake = Box<dyn ClientHandshakeProtocol + Send + 'static>;
 
 /// A boxed client handshake orchestrator for `wasm32`, which relaxes `Send`.
 #[cfg(target_arch = "wasm32")]
-pub type BoxedClientHandshake = Box<dyn ClientHandshakeProtocol<Error = HandshakeError> + 'static>;
+pub type BoxedClientHandshake = Box<dyn ClientHandshakeProtocol + 'static>;
 
 /// A boxed server handshake orchestrator.
 ///
@@ -815,12 +869,12 @@ pub type BoxedClientHandshake = Box<dyn ClientHandshakeProtocol<Error = Handshak
 /// cannot carry the non-auto [`MaybeSend`] bound, so a `cfg` on the target
 /// picks the auto-trait list.
 #[cfg(not(target_arch = "wasm32"))]
-pub type BoxedServerHandshake = Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send + Sync + 'static>;
+pub type BoxedServerHandshake = Box<dyn ServerHandshakeProtocol + Send + Sync + 'static>;
 
 /// A boxed server handshake orchestrator for `wasm32`, which relaxes
 /// `Send + Sync`.
 #[cfg(target_arch = "wasm32")]
-pub type BoxedServerHandshake = Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + 'static>;
+pub type BoxedServerHandshake = Box<dyn ServerHandshakeProtocol + 'static>;
 
 /// The handshake protocol an endpoint runs, HPKE or CMS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -841,102 +895,6 @@ pub enum HandshakeProtocolKind {
 	Cms,
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-impl HandshakeProtocolKind {
-	/// The client handshake of the flow this kind names, which `provisioning`
-	/// configures alone.
-	///
-	/// # Errors
-	///
-	/// - [`TransportError::UnsupportedHandshakeProtocol`] -- this build lacks the flow of this kind.
-	/// - [`TransportError`] -- the errors of [`FlowProvisioning::client_config`] for that flow.
-	pub(crate) fn client_handshake<P, E>(self, provisioning: &E) -> Result<BoxedClientHandshake, TransportError>
-	where
-		P: HandshakeProvider,
-		E: Provisioning<P>,
-	{
-		let handshake: BoxedClientHandshake = match self {
-			#[cfg(feature = "transport-hpke")]
-			Self::Hpke => Box::new(Handshake::client(FlowProvisioning::<Hpke, P>::client_config(provisioning)?)),
-
-			#[cfg(feature = "transport-cms")]
-			Self::Cms => Box::new(Handshake::client(FlowProvisioning::<Cms, P>::client_config(provisioning)?)),
-
-			#[cfg(not(all(feature = "transport-cms", feature = "transport-hpke")))]
-			unsupported => return Err(TransportError::UnsupportedHandshakeProtocol(unsupported)),
-		};
-
-		Ok(handshake)
-	}
-
-	/// The server handshake of the flow this kind names, which `provisioning`
-	/// configures alone.
-	///
-	/// # Errors
-	///
-	/// - [`TransportError::UnsupportedHandshakeProtocol`] -- this build lacks the flow of this kind.
-	/// - [`TransportError`] -- the errors of [`FlowProvisioning::server_config`] for that flow.
-	pub(crate) fn server_handshake<P, E>(self, provisioning: &E) -> Result<BoxedServerHandshake, TransportError>
-	where
-		P: HandshakeProvider,
-		E: Provisioning<P>,
-	{
-		let handshake: BoxedServerHandshake = match self {
-			#[cfg(feature = "transport-hpke")]
-			Self::Hpke => Box::new(Handshake::server(FlowProvisioning::<Hpke, P>::server_config(provisioning)?)),
-
-			#[cfg(feature = "transport-cms")]
-			Self::Cms => Box::new(Handshake::server(FlowProvisioning::<Cms, P>::server_config(provisioning)?)),
-
-			#[cfg(not(all(feature = "transport-cms", feature = "transport-hpke")))]
-			unsupported => return Err(TransportError::UnsupportedHandshakeProtocol(unsupported)),
-		};
-
-		Ok(handshake)
-	}
-}
-
-/// The provisioning of an endpoint, which builds both configurations of flow
-/// `F` from what it holds alone.
-///
-/// Each flow is one implementation, which reads the trust and the identity
-/// that its configurations take and refuses a provisioning that lacks a
-/// required one. [`HandshakeProtocolKind`] picks the flow.
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-pub(crate) trait FlowProvisioning<F: ClientFlow<P> + ServerFlow<P>, P: HandshakeProvider> {
-	/// The configuration of a client handshake of flow `F`.
-	///
-	/// # Errors
-	///
-	/// - [`TransportError`] -- this provisioning lacks the trust or the identity the client of `F` takes.
-	fn client_config(&self) -> Result<ClientConfig<F, P>, TransportError>;
-
-	/// The configuration of a server handshake of flow `F`.
-	///
-	/// # Errors
-	///
-	/// - [`TransportError`] -- this provisioning lacks the identity the server of `F` presents.
-	fn server_config(&self) -> Result<ServerConfig<F, P>, TransportError>;
-}
-
-/// The provisioning of an endpoint, which builds each flow this build
-/// compiles. It is the bound of the flow choice of [`HandshakeProtocolKind`].
-#[cfg(all(feature = "transport-cms", feature = "transport-hpke"))]
-pub(crate) trait Provisioning<P: HandshakeProvider>:
-	FlowProvisioning<Hpke, P> + FlowProvisioning<Cms, P>
-{
-}
-
-/// The provisioning of an endpoint, which builds the HPKE flow, the one flow
-/// this build compiles.
-#[cfg(all(feature = "transport-hpke", not(feature = "transport-cms")))]
-pub(crate) trait Provisioning<P: HandshakeProvider>: FlowProvisioning<Hpke, P> {}
-
-/// The provisioning of an endpoint, which builds the CMS flow, the one flow
-/// this build compiles.
-#[cfg(all(feature = "transport-cms", not(feature = "transport-hpke")))]
-pub(crate) trait Provisioning<P: HandshakeProvider>: FlowProvisioning<Cms, P> {}
-
 /// The HPKE hello, the opening of the client, bound into the transcript.
 ///
 /// It travels as the OCTET STRING of a `ContentInfo` of type `id-data`
@@ -954,7 +912,7 @@ pub struct ClientHello {
 	#[asn1(optional = "true")]
 	pub security_offer: Option<SecurityOffer>,
 	/// The transport capability offer for multiplexing. The context tag keeps
-	/// it distinct from the preceding optional SEQUENCE.
+	/// it distinct from the optional SEQUENCE before it.
 	#[asn1(context_specific = "0", optional = "true")]
 	pub transport_offer: Option<TransportOffer>,
 }
@@ -963,8 +921,8 @@ pub struct ClientHello {
 /// under [`HANDSHAKE_REPLY_CONTENT`](crate::oids::HANDSHAKE_REPLY_CONTENT).
 ///
 /// The `SignedData` carries the server's certificate in `certificates`, and
-/// its `SignerInfo` names it. The transcript binds this content as it was
-/// sent, beside the hello and that certificate.
+/// its `SignerInfo` names it. The transcript binds this content as the server
+/// sent it, beside the hello and that certificate.
 #[derive(Beamable, Sequence, Debug, Clone, PartialEq)]
 pub struct ServerHandshake {
 	/// A 32-byte anti-replay nonce that the key derivation mixes in.

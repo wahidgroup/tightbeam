@@ -7,6 +7,9 @@
 //! what the checks read. The fields of [`Negotiation`] are private too, so its
 //! methods alone write them.
 
+#[cfg(all(not(feature = "std"), any(feature = "transport-cms", feature = "transport-hpke")))]
+use alloc::boxed::Box;
+
 use super::EncryptionConfig;
 use crate::crypto::profiles::CryptoProvider;
 use crate::transport::handshake::HandshakeProtocolKind;
@@ -33,15 +36,16 @@ use crate::transport::handshake::{ClientConfig, ClientFlow, HandshakeProvider};
 #[cfg(feature = "transport-cms")]
 use crate::transport::handshake::{Cms, CmsClientSettings, CmsServerSettings};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::transport::handshake::{FlowProvisioning, Provisioning, ServerConfig, ServerFlow, SupportedProfiles};
+use crate::transport::handshake::{Handshake, ServerConfig, ServerFlow, SupportedProfiles};
 #[cfg(feature = "transport-hpke")]
 use crate::transport::handshake::{Hpke, HpkeClientSettings, HpkeServerSettings, LearnedTrust};
 #[cfg(mux_rekey)]
 use crate::transport::rekey::Renewal;
 
-/// Provisioning that holds both facts [`Self::new`] checks: it answers the
-/// dialer rule of [`EncryptionConfig::check_dial_permitted`], and each identity
-/// it presents names the key purpose of its role (RFC 5280 §4.2.1.12).
+/// The provisioning that holds both facts that [`Self::new`] checks:
+///
+/// - It answers the dialer rule of [`EncryptionConfig::check_dial_permitted`].
+/// - Each identity it presents names the key purpose of its role (RFC 5280 §4.2.1.12).
 ///
 /// The constructors of [`SessionState`] take this form alone, so every
 /// installed provisioning holds both facts as the checks read them.
@@ -51,7 +55,7 @@ use crate::transport::rekey::Renewal;
 pub struct DialableEncryption<P: CryptoProvider>(EncryptionConfig<P>);
 
 impl<P: CryptoProvider> DialableEncryption<P> {
-	/// Check `encryption` against the dialer rule, and each identity it
+	/// Checks `encryption` against the dialer rule, and each identity it
 	/// presents against the key purpose of its role.
 	///
 	/// # Errors
@@ -69,7 +73,7 @@ impl<P: CryptoProvider> DialableEncryption<P> {
 		Ok(Self(encryption))
 	}
 
-	/// Name cleartext as a choice, with no peer authority and no encryption.
+	/// Names cleartext as a choice, with no peer authority and no encryption.
 	///
 	/// Frames travel with no confidentiality, integrity, or peer
 	/// authentication, which suits a loopback fixture or a link a lower layer
@@ -126,13 +130,13 @@ impl Negotiation {
 		self.handshake_protocol
 	}
 
-	/// Replace the multiplexing capability this endpoint offers.
+	/// Replaces the multiplexing capability this endpoint offers.
 	#[cfg(mux_rekey)]
 	pub(super) fn offer_mux(&mut self, offer: Option<Arc<TransportOffer>>) {
 		self.mux_offer = offer;
 	}
 
-	/// Replace the budget-grant policy a server consults.
+	/// Replaces the budget-grant policy a server consults.
 	#[cfg(all(
 		any(feature = "tcp", feature = "async-transport"),
 		any(feature = "transport-cms", feature = "transport-hpke")
@@ -141,7 +145,7 @@ impl Negotiation {
 		self.transport_authorizer = Some(authorizer);
 	}
 
-	/// Replace the observer of budget-bearing handshake outcomes.
+	/// Replaces the observer of budget-bearing handshake outcomes.
 	#[cfg(all(
 		any(feature = "tcp", feature = "async-transport"),
 		any(feature = "transport-cms", feature = "transport-hpke")
@@ -150,14 +154,14 @@ impl Negotiation {
 		self.session_observer = Some(observer);
 	}
 
-	/// Replace the approver a client consults before it countersigns a
+	/// Replaces the approver a client consults before it countersigns a
 	/// challenge-bearing receipt.
 	#[cfg(all(feature = "std", any(feature = "transport-cms", feature = "transport-hpke")))]
 	pub(crate) fn approve_receipts(&mut self, approver: Arc<dyn ReceiptApprover>) {
 		self.receipt_approver = Some(approver);
 	}
 
-	/// Replace the handshake protocol a provisioned endpoint runs.
+	/// Replaces the handshake protocol a provisioned endpoint runs.
 	pub(crate) fn select_handshake(&mut self, kind: HandshakeProtocolKind) {
 		self.handshake_protocol = kind;
 	}
@@ -277,6 +281,102 @@ impl<'a, P: CryptoProvider> Endpoint<'a, P> {
 		Some(Renewal::server(identity, encryption.key_purposes.client, authorizer, observer))
 	}
 }
+
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+impl HandshakeProtocolKind {
+	/// The client handshake of the flow this kind names, which `provisioning`
+	/// configures alone.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::UnsupportedHandshakeProtocol`] -- this build lacks the flow of this kind.
+	/// - [`TransportError`] -- the errors of [`FlowProvisioning::client_config`] for that flow.
+	pub(crate) fn client_handshake<P, E>(self, provisioning: &E) -> Result<BoxedClientHandshake, TransportError>
+	where
+		P: HandshakeProvider,
+		E: Provisioning<P>,
+	{
+		let handshake: BoxedClientHandshake = match self {
+			#[cfg(feature = "transport-hpke")]
+			Self::Hpke => Box::new(Handshake::client(FlowProvisioning::<Hpke, P>::client_config(provisioning)?)),
+
+			#[cfg(feature = "transport-cms")]
+			Self::Cms => Box::new(Handshake::client(FlowProvisioning::<Cms, P>::client_config(provisioning)?)),
+
+			#[cfg(not(all(feature = "transport-cms", feature = "transport-hpke")))]
+			unsupported => return Err(TransportError::UnsupportedHandshakeProtocol(unsupported)),
+		};
+
+		Ok(handshake)
+	}
+
+	/// The server handshake of the flow this kind names, which `provisioning`
+	/// configures alone.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::UnsupportedHandshakeProtocol`] -- this build lacks the flow of this kind.
+	/// - [`TransportError`] -- the errors of [`FlowProvisioning::server_config`] for that flow.
+	pub(crate) fn server_handshake<P, E>(self, provisioning: &E) -> Result<BoxedServerHandshake, TransportError>
+	where
+		P: HandshakeProvider,
+		E: Provisioning<P>,
+	{
+		let handshake: BoxedServerHandshake = match self {
+			#[cfg(feature = "transport-hpke")]
+			Self::Hpke => Box::new(Handshake::server(FlowProvisioning::<Hpke, P>::server_config(provisioning)?)),
+
+			#[cfg(feature = "transport-cms")]
+			Self::Cms => Box::new(Handshake::server(FlowProvisioning::<Cms, P>::server_config(provisioning)?)),
+
+			#[cfg(not(all(feature = "transport-cms", feature = "transport-hpke")))]
+			unsupported => return Err(TransportError::UnsupportedHandshakeProtocol(unsupported)),
+		};
+
+		Ok(handshake)
+	}
+}
+
+/// The provisioning of an endpoint, which builds both configurations of flow
+/// `F` from what it holds alone.
+///
+/// Each flow is one implementation, which reads the trust and the identity
+/// that its configurations take and refuses a provisioning that lacks a
+/// required one. [`HandshakeProtocolKind`] picks the flow.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+pub(crate) trait FlowProvisioning<F: ClientFlow<P> + ServerFlow<P>, P: HandshakeProvider> {
+	/// The configuration of a client handshake of flow `F`.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError`] -- this provisioning lacks the trust or the identity the client of `F` takes.
+	fn client_config(&self) -> Result<ClientConfig<F, P>, TransportError>;
+
+	/// The configuration of a server handshake of flow `F`.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError`] -- this provisioning lacks the identity the server of `F` presents.
+	fn server_config(&self) -> Result<ServerConfig<F, P>, TransportError>;
+}
+
+/// The provisioning of an endpoint, which builds each flow this build
+/// compiles. It is the bound of the flow choice of [`HandshakeProtocolKind`].
+#[cfg(all(feature = "transport-cms", feature = "transport-hpke"))]
+pub(crate) trait Provisioning<P: HandshakeProvider>:
+	FlowProvisioning<Hpke, P> + FlowProvisioning<Cms, P>
+{
+}
+
+/// The provisioning of an endpoint, which builds the HPKE flow, the one flow
+/// this build compiles.
+#[cfg(all(feature = "transport-hpke", not(feature = "transport-cms")))]
+pub(crate) trait Provisioning<P: HandshakeProvider>: FlowProvisioning<Hpke, P> {}
+
+/// The provisioning of an endpoint, which builds the CMS flow, the one flow
+/// this build compiles.
+#[cfg(all(feature = "transport-cms", not(feature = "transport-hpke")))]
+pub(crate) trait Provisioning<P: HandshakeProvider>: FlowProvisioning<Cms, P> {}
 
 /// The HPKE flow learns its server from the reply, so its client takes the
 /// trust store to validate the path the reply presents, beside the client

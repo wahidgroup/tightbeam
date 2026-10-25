@@ -14,7 +14,9 @@ use crate::colony::cluster::runtime::bounds::{ColonyConfig, ColonyDialProtocol, 
 use crate::colony::cluster::runtime::hop::HivePlane;
 use crate::colony::cluster::runtime::LoopFault;
 use crate::colony::cluster::{ClusterError, HeartbeatEvent, HiveEntry};
-use crate::colony::common::{ClusterCommand, ClusterCommandResponse, ClusterStatus, HeartbeatParams, HeartbeatResult};
+use crate::colony::protocol::{
+	ClusterCommand, ClusterCommandResponse, ClusterStatus, HeartbeatParams, HeartbeatResult,
+};
 use crate::decode;
 use crate::instrumentation::events::{CLUSTER_HIVE_EVICTED, CLUSTER_RELAY_TRAIL_PRUNED};
 use crate::policy::TransitStatus;
@@ -91,7 +93,8 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 	///
 	/// A dial fault is this hive's answer and settles as a failed beat, so
 	/// every other hive in the interval still settles and the next interval
-	/// retries this one. A registry fault is the loop's to end on.
+	/// retries this one. A registry fault returns to the loop, which ends on
+	/// it.
 	async fn beat_hive(self, hive: HiveEntry) -> Result<(), LoopFault> {
 		let result = HiveBeat::new(&self.config, &self.hive_plane).send(&hive).await;
 		self.settle_heartbeat(hive.address, result)
@@ -101,8 +104,8 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 	///
 	/// - A live answer refreshes the hive's lease and utilization.
 	/// - A dead or refused answer counts one failure. At the configured
-	///   `max_failures` the hive unregisters, its servlet routes drop, and the
-	///   eviction traces as [`CLUSTER_HIVE_EVICTED`].
+	///   `max_failures`, the gateway retires the hive with its servlet routes
+	///   and traces the eviction as [`CLUSTER_HIVE_EVICTED`].
 	/// - The configured heartbeat callback fires for both outcomes.
 	///
 	/// # Errors
@@ -237,10 +240,9 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 					servlet_registry.evaporate()?;
 					servlet_registry.remove_abandoned()?;
 
-					// Relay trails refresh through relayed rumors, so age is
-					// the lifecycle bound that retires an unpicked one. A
-					// retired fallback traces with its count, which keeps a
-					// route that vanished diagnosable (ISO 27001 A.8.15).
+					// Relay trails refresh through relayed rumors, so age
+					// retires an unpicked fallback. The traced count keeps
+					// a vanished route diagnosable (ISO 27001 A.8.15).
 					let pruned = servlet_registry.prune_stale_relay_trails(relay_trail_ttl)?;
 					if pruned > 0 {
 						let count = u64::try_from(pruned).unwrap_or(u64::MAX);

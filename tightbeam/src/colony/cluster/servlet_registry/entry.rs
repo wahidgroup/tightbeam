@@ -3,8 +3,8 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::cms::signed_data::SignerIdentifier;
+use crate::colony::cluster::MAX_PHEROMONE;
 use crate::colony::cluster::{AdmittedDial, ClusterError, NotASocket, PeerAddress, SharedId};
-use crate::colony::common::MAX_PHEROMONE;
 use crate::utils::BasisPoints;
 
 /// The endpoint a route dials, parsed once where the route is built.
@@ -158,9 +158,9 @@ impl DialTarget {
 	///
 	/// This is the one place a dial becomes a protocol address:
 	///
-	/// - The protocol's [`FromStr`] is its only constructor, so the rendering
-	///   is parsed here, once per dial, from the same bytes every other reader
-	///   of this target sees.
+	/// - The protocol's [`FromStr`] is its only constructor, so this method
+	///   parses the rendering once per dial, from the same bytes every other
+	///   reader of this target sees.
 	/// - A protocol may address by something other than a socket, as the laser
 	///   test protocol does by airspace slot, and then a socket target does
 	///   not parse.
@@ -322,7 +322,7 @@ impl<'a> Owner<'a> {
 	}
 }
 
-/// Operator view of one learned peer route.
+/// The operator view of one learned peer route.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerRouteInfo {
 	/// The registry key, which is also the pheromone trail identity.
@@ -431,8 +431,8 @@ impl ServletEntry {
 		Self::peer_sharing(route, &target, initial_pheromone, abandonment_limit)
 	}
 
-	/// [`Self::peer`] for an entry of a slate whose entries share `target`,
-	/// the one rendering of the socket they dial.
+	/// Creates the route of [`Self::peer`] for an entry of a slate whose
+	/// entries share `target`, the one rendering of the socket they dial.
 	pub(crate) fn peer_sharing(
 		route: PeerRoute,
 		target: &DialTarget,
@@ -468,8 +468,8 @@ impl ServletEntry {
 		Self::peer_relay_sharing(route, &target, initial_pheromone, abandonment_limit)
 	}
 
-	/// [`Self::peer_relay`] for an entry of a trail whose entries share
-	/// `target`, the one rendering of the relay socket they dial.
+	/// Creates the trail of [`Self::peer_relay`] for an entry of a trail whose
+	/// entries share `target`, the one rendering of the relay socket they dial.
 	pub(crate) fn peer_relay_sharing(
 		route: RelayRoute,
 		target: &DialTarget,
@@ -582,13 +582,13 @@ impl ServletEntry {
 		self.plane.clone()
 	}
 
-	/// The servlet type key bytes that the type index looks up.
+	/// The key bytes of the servlet type, which the type index looks up.
 	#[must_use]
 	pub fn servlet_type(&self) -> &SharedId {
 		&self.servlet_type
 	}
 
-	/// Whether this entry is local or peer-routed.
+	/// The kind of this route: local, direct peer, or peer relay.
 	#[must_use]
 	pub fn route_kind(&self) -> RouteKind {
 		self.route_kind

@@ -29,12 +29,12 @@ use std::sync::Arc;
 
 use tightbeam::builder::TypeBuilder;
 use tightbeam::colony::cluster::{
-	Cluster, ClusterConfig, ClusterHeartbeat, ClusterRequest, ClusterTlsConfig, GossipConfig, GossipJournal,
-	MemoryGossipJournal,
+	Cluster, ClusterConfig, ClusterHeartbeat, ClusterTlsConfig, GossipConfig, GossipJournal, MemoryGossipJournal,
 };
-use tightbeam::colony::common::{ColonyNamespace, GossipRumor};
 use tightbeam::colony::hive::{Hive, HiveConfig, HiveTlsConfig};
+use tightbeam::colony::protocol::{ClusterRequest, GossipRumor};
 use tightbeam::colony::servlet::ServletConfig;
+use tightbeam::colony::urn::ColonyNamespace;
 use tightbeam::colony::SubmitWork;
 use tightbeam::crypto::hash::Sha3_512;
 use tightbeam::crypto::k256::ecdsa::SigningKey;
@@ -238,7 +238,7 @@ async fn start_outside_hive(trace: TraceCollector, colony: Arc<OutsideColony>) -
 	Ok(hive)
 }
 
-/// The running parties of an outside colony, with the hive registered at the
+/// The started parties of an outside colony, with the hive registered at the
 /// advertiser.
 struct RegisteredColony {
 	/// The gateway that learns the advertiser's route.

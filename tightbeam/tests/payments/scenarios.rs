@@ -22,9 +22,9 @@ use tightbeam::{
 	builder::TypeBuilder,
 	colony::{
 		cluster::{Cluster, ClusterConfig, ClusterTlsConfig},
-		common::ColonyNamespace,
 		hive::{Hive, HiveConfig, HiveTlsConfig},
 		servlet::ServletConfig,
+		urn::ColonyNamespace,
 		SubmitWork,
 	},
 	compose,
@@ -266,11 +266,9 @@ tb_scenario! {
 				.with_trust_store(Arc::clone(&certs.cluster_trust))
 				.build();
 
-			// One call on the public client surface wraps the work frame
-			// in the hop-local transport envelope and resolves the reply
-			// to the servlet's response frame. `ClusterWorkResponse::served`
-			// admits only an `Ok` gateway status, so the next line runs only
-			// under the wire status that the spec asserts.
+			// `submit_work_to` returns the servlet's frame under an `Ok`
+			// gateway status alone (`ClusterWorkResponse::served`), so the
+			// event after it records the wire status that the spec asserts.
 			let mut client = builder.connect(cluster_addr.to_owned()).await?;
 			let servlet_frame = client.submit_work_to(authorization_urn(), &inner).await?;
 			trace.event_with(WORK_STATUS, &[], TransitStatus::Ok)?;

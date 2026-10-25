@@ -3,20 +3,22 @@
 //! [`GatewayRuntimeCtx::handle_request`] evaluates gate policies, decodes the
 //! request envelope, and dispatches by [`ClusterRequest`] variant.
 //! [`GatewayRuntimeCtx::handle_edge_request`] is the same path for an edge
-//! accept plane, where the envelope narrows to a work request. Export gates
-//! run only on the work arm, where the servlet target is known after decode.
+//! accept plane, where the envelope narrows to a work request.
 //!
 //! # Evaluation order
 //!
-//! 1. Run `evaluate_gates` on the request frame and the session.
+//! 1. Run [`evaluate_gates`] on the request frame and the session.
 //! 2. Decode [`ClusterRequest`] from the frame body.
-//! 3. On [`ClusterRequest::Work`], run `evaluate_export_gates` with
+//! 3. On [`ClusterRequest::Work`], run [`evaluate_export_gates`] with
 //!    [`HopBudget::is_relayed`] before [`GatewayRuntimeCtx::handle_work`].
 //! 4. Route every other variant to its handler, such as registration or gossip.
+//!
+//! [`evaluate_gates`]: crate::colony::cluster::ClusterConfig::evaluate_gates
+//! [`evaluate_export_gates`]: crate::colony::cluster::ColonyConfig::evaluate_export_gates
 
 use crate::colony::cluster::runtime::bounds::{ColonyDialProtocol, GatewayRuntimeCtx};
-use crate::colony::cluster::{ClusterWorkRequest, ClusterWorkResponse, HopBudget, WireHopBudget};
-use crate::colony::common::{ClusterRequest, ReplyForm};
+use crate::colony::cluster::{HopBudget, WireHopBudget};
+use crate::colony::protocol::{ClusterRequest, ClusterWorkRequest, ClusterWorkResponse, ReplyForm};
 use crate::decode;
 use crate::policy::{SessionContext, TransitStatus};
 use crate::Frame;
@@ -35,8 +37,8 @@ enum RequestAdmission {
 impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 	/// Route one unary gateway request from frame decode through dispatch.
 	///
-	/// Gate policies run first. Export gates run on the work arm only,
-	/// after the servlet target is known from the decoded envelope.
+	/// Gate policies run first, and export gates run on the work arm only,
+	/// once the decoded envelope names the servlet target.
 	///
 	/// - `frame`: the admitted unary control frame
 	/// - `session`: the caller identity facts for the connection
@@ -91,8 +93,7 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 	/// Gate and decode one unary control frame.
 	///
 	/// This is the one parse of the request envelope. A refused gate and an
-	/// undecodable envelope both answer with the status the caller replies
-	/// with.
+	/// undecodable envelope both give the status the caller replies with.
 	fn admit_request(&self, frame: &Frame, session: &SessionContext) -> Result<RequestAdmission, TightBeamError> {
 		let gate_status = self.config.evaluate_gates(Some(frame), session, &self.trace)?;
 		if gate_status != TransitStatus::Ok {
@@ -108,8 +109,8 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 
 	/// Export-gate and route one work request.
 	///
-	/// The target and the relayed flag are known after decode, so export gates
-	/// run here rather than beside the transport gates.
+	/// The decode names the target and the relayed flag, so export gates run
+	/// here rather than beside the transport gates.
 	async fn handle_work_request(
 		self,
 		frame: Frame,

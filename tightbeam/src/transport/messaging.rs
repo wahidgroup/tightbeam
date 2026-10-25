@@ -1,4 +1,4 @@
-//! Application message transmission: the traits that send and receive frames.
+//! The traits that send and receive application frames.
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
@@ -23,7 +23,7 @@ use crate::transport::TransportResult;
 use crate::utils::marker::MaybeSend;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::transport::io::CollectStep;
+use crate::transport::state::CollectStep;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 mod x509 {
@@ -58,8 +58,8 @@ pub trait GateAudit {
 /// The trait is a crate-private extension, so the public [`GateAudit`] keeps
 /// its one method and stays usable as a trait object.
 pub(crate) trait GateInbound: GateAudit {
-	/// Gate one inbound request with the session's authenticated context and
-	/// record the verdict into the connection audit trail (`GATE_ACCEPT` or
+	/// Gates one inbound request with the session's authenticated context and
+	/// records the verdict into the connection audit trail (`GATE_ACCEPT` or
 	/// `GATE_REJECT`).
 	///
 	/// # Emission point
@@ -124,7 +124,7 @@ impl<A: GateAudit + ?Sized> GateInbound for A {}
 /// crate-private extension, as [`GateInbound`] is.
 #[cfg(feature = "std")]
 pub(crate) trait HandlerAudit: GateAudit {
-	/// Run `handler`, the application handler of one call that this plane
+	/// Runs `handler`, the application handler of one call that this plane
 	/// admitted, between the internal events `HANDLER_ENTER` and
 	/// `HANDLER_EXIT` of the plane's audit trail.
 	///
@@ -201,7 +201,7 @@ impl From<Frame> for Letter {
 	}
 }
 
-/// Run one restart-policy evaluation over a failed send.
+/// Runs one restart-policy evaluation over a failed send.
 ///
 /// - `Ok` carries the frame to resend and the delay to observe first.
 /// - `Err` carries the terminal error.
@@ -217,7 +217,7 @@ where
 {
 	match error {
 		TransportError::MessageNotSent(boxed_frame, ref failure) => {
-			// Pass the box to the policy, so the frame stays in its single
+			// The policy takes the box, so the frame stays in its single
 			// allocation.
 			match policy.evaluate(boxed_frame, failure, attempt) {
 				RetryAction::Retry { .. } if attempt == usize::MAX => Err(TransportError::MaxRetriesExceeded),
@@ -243,7 +243,7 @@ pub trait MessageEmitter: MessageIO {
 	/// The gate policy that [`Self::emit`] evaluates before each send.
 	fn to_emitter_gate_policy_ref(&self) -> &Self::EmitterGate;
 
-	/// Run the protocol-specific send and receive operation.
+	/// Runs the protocol-specific send and receive operation.
 	///
 	/// # Returns
 	///
@@ -257,7 +257,7 @@ pub trait MessageEmitter: MessageIO {
 		message: Frame,
 	) -> impl Future<Output = TransportResult<(TransitStatus, Option<Frame>, Option<Frame>)>> + MaybeSend;
 
-	/// Send a TightBeam message through the emitter gate, and retry a failed
+	/// Sends a TightBeam message through the emitter gate, and retries a failed
 	/// send as the restart policy decides.
 	fn emit(
 		&mut self,
@@ -271,8 +271,8 @@ pub trait MessageEmitter: MessageIO {
 	}
 }
 
-/// Run the default [`MessageEmitter::emit`] body. It is a free function, so the
-/// returned future can carry [`MaybeSend`] without the capture of an AFIT
+/// Runs the default [`MessageEmitter::emit`] body. It is a free function, so
+/// the returned future can carry [`MaybeSend`] without the capture of an AFIT
 /// default method.
 async fn emit_with_retry<T: MessageEmitter + MaybeSend + ?Sized>(
 	emitter: &mut T,
@@ -308,7 +308,7 @@ async fn emit_with_retry<T: MessageEmitter + MaybeSend + ?Sized>(
 
 		let result: TransportResult<&Frame> = if status != TransitStatus::Ok {
 			if let Some(msg) = original_message {
-				// The server rejected the frame, so return it for a retry.
+				// The server rejected the frame, so it goes back for a retry.
 				match TransportFailure::try_from(status) {
 					Ok(failure) => Err(TransportError::from_failure(msg, failure)),
 					Err(error) => Err(error),
@@ -362,8 +362,8 @@ pub trait MessageCollector: MessageIO + GateAudit {
 	/// The gate policy that every collected message passes through.
 	fn collector_gate(&self) -> &Self::CollectorGate;
 
-	/// Read and validate one message, and return it with the status of its gate
-	/// evaluation. The caller sends the response.
+	/// Reads and validates one message, and returns it with the status of its
+	/// gate evaluation. The caller sends the response.
 	fn collect_message(&mut self) -> impl Future<Output = TransportResult<(Arc<Frame>, TransitStatus)>> + MaybeSend
 	where
 		Self: MaybeSend,
@@ -378,7 +378,7 @@ pub trait MessageCollector: MessageIO + GateAudit {
 		}
 	}
 
-	/// Collect the next message, and tell a close at EOF from an error.
+	/// Collects the next message, and tells a close at EOF from an error.
 	///
 	/// - `Ok(None)` means that the connection closed at EOF.
 	/// - `Err` means that the connection failed unexpectedly.
@@ -402,7 +402,7 @@ pub trait MessageCollector: MessageIO + GateAudit {
 		}
 	}
 
-	/// Send a response for one collected message, in the wire mode the session
+	/// Sends a response for one collected message, in the wire mode the session
 	/// phase decides.
 	fn send_response(
 		&mut self,
@@ -433,7 +433,7 @@ pub trait MessageCollector: MessageIO + GateAudit {
 	}
 }
 
-/// Extract the application request from a collected envelope and gate it
+/// Extracts the application request from a collected envelope and gates it
 /// with the session's peer context. [`GateInbound::gate_inbound`] records the
 /// verdict.
 fn gate_collected_envelope<T>(

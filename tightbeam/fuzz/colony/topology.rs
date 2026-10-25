@@ -4,7 +4,7 @@
 //! address. The Cluster scenario `start` returns this topology as the owned
 //! program, and the client dials any org gateway for work and CSR. Advertise
 //! beats stay disabled, so routes install only through one-shot
-//! [`tightbeam::colony::cluster::ClusterRequest::AdvertisePeer`] actions.
+//! [`tightbeam::colony::protocol::ClusterRequest::AdvertisePeer`] actions.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -47,7 +47,8 @@ cluster! {
 
 /// One organization's gateway, hive, and mutable ACL handles.
 pub(crate) struct OrgNode {
-	/// The short org label used in traces and CSR issuer naming.
+	/// The short org label, which names the colony of the CSR issuer and of
+	/// the CSR requests the oracle sends.
 	pub name: &'static str,
 	/// The deterministic gateway identity for this organization.
 	pub certs: Arc<ClusterTestCerts>,
@@ -63,8 +64,9 @@ pub(crate) struct OrgNode {
 	pub hive: ColonyFuzzHive,
 	/// The CSR issuer handle, when this org serves CSR.
 	pub csr_issuer: Option<Arc<CsrIssuer>>,
-	/// Independent oracle over harness-owned state. Drift against the
-	/// live wire is the detection mechanism, never a source of truth.
+	/// Independent oracle over harness-owned state. The oracle compares its
+	/// prediction with the live wire, and a drift between the two flags a
+	/// defect.
 	pub shadow: GatewayShadow,
 	/// The soft-state instance counter for lifecycle opcodes after establish.
 	pub soft_instances: usize,
@@ -104,7 +106,7 @@ impl ColonyTopology {
 		let gamma_urn = colony_urn("gamma");
 
 		// The seeds are fixed and distinct, because identical inputs MUST
-		// create identical SPKIs.
+		// create identical SPKIs, and each org needs its own key.
 		let (cert_a, key_a) = colony_identity("Alpha Gateway", &alpha_urn, 1);
 		let (cert_b, key_b) = colony_identity("Beta Gateway", &beta_urn, 2);
 		let (cert_c, key_c) = colony_identity("Gamma Gateway", &gamma_urn, 3);
@@ -115,7 +117,7 @@ impl ColonyTopology {
 
 		let decoy_pin = Arc::new(Mutex::new(None));
 		// Full-mesh peer trust lets one-shot ads and foreign-identity dials
-		// reach the export and gate planes instead of dying at TLS.
+		// pass TLS and reach the export and gate planes.
 		let alpha_peers = combined_trust(&[beta_certs.cert.as_ref(), gamma_certs.cert.as_ref()]);
 		let beta_peers = combined_trust(&[alpha_certs.cert.as_ref(), gamma_certs.cert.as_ref()]);
 		let gamma_peers = combined_trust(&[alpha_certs.cert.as_ref(), beta_certs.cert.as_ref()]);
@@ -183,7 +185,7 @@ pub(crate) fn gateway_bundle(cert: Certificate, key: Secp256k1SigningKey) -> Gat
 	GatewayCerts::new(cert, key, trust)
 }
 
-/// Per-org boot knobs for [`boot_org`].
+/// Per-org boot options for [`boot_org`].
 struct BootOrg {
 	name: &'static str,
 	own: Arc<ClusterTestCerts>,
@@ -226,7 +228,7 @@ async fn boot_org(trace: &TraceCollector, cfg: BootOrg) -> Result<OrgNode, Tight
 
 	// `advertise_interval` stays `None`, so the gossip beat never races the
 	// action loop. Local export and ACL enforcement still cover the boundary,
-	// and live discovery races belong in integration tests.
+	// and the integration tests own the live discovery races.
 	let mut builder = ClusterConfig::builder(tls)
 		.with_export_allowlist(Arc::clone(&exports) as Arc<dyn ExportAllowlist>)
 		.with_export_grant(Arc::clone(&export_grant))
@@ -245,10 +247,9 @@ async fn boot_org(trace: &TraceCollector, cfg: BootOrg) -> Result<OrgNode, Tight
 	if !peers.is_empty() {
 		builder = match builder.with_peers(peers) {
 			Ok(builder) => builder,
-			// A topology that cannot dial its own peers is a harness
-			// construction bug, and the refusal names which entry is
-			// wrong. Flattening it into the crate error would throw that
-			// away, and the two error hierarchies do not convert.
+			// A peer entry that names no socket is a harness bug. The panic
+			// keeps the refusal, which names the wrong entry, and the refusal
+			// has no conversion into `TightBeamError`.
 			Err(refusal) => panic!("fuzz topology peers must name sockets: {refusal}"),
 		};
 	}

@@ -1,4 +1,4 @@
-//! Streaming and duplex interactions through the colony stack.
+//! Tests of the streaming and duplex interactions through the colony stack.
 //!
 //! The `servlet!` stream and duplex arms serve over one multiplexed
 //! connection, and the pooled client consumes them alongside unary
@@ -10,9 +10,9 @@ use tightbeam::{
 	cms::signed_data::SignerIdentifier,
 	colony::{
 		cluster::ClusterError,
-		common::ColonyNamespace,
 		hive::{Hive, HiveConfig, ServletBox},
 		servlet::ServletConfig,
+		urn::ColonyNamespace,
 	},
 	compose,
 	crypto::{
@@ -111,9 +111,9 @@ fn streaming_servlet_conf(
 		.build())
 }
 
-/// Builds a pooled mux lease with pinned server trust, shared by every
-/// scenario in this file. The servlets here install no client validators,
-/// so the handshake authenticates the server only.
+/// Builds a pooled mux lease with pinned server trust, which every scenario
+/// in this file shares. The servlets here install no client validators, so
+/// the handshake authenticates the server only.
 async fn pooled_lease(
 	trace: &tightbeam::trace::TraceCollector,
 	materials: &ServerMaterials,
@@ -152,7 +152,7 @@ tb_assert_spec! {
 }
 
 // All three interaction kinds reach one servlet over one pooled mux
-// connection. The handler arm's shape is the only thing the servlet decides.
+// connection. The servlet chooses the shape of its handler arms alone.
 tb_scenario! {
 	name: servlet_serves_unary_stream_and_duplex,
 	spec: ColonyStreamingSpec,
@@ -234,8 +234,8 @@ tb_assert_spec! {
 	}
 }
 
-// A servlet without a unary arm serves streams and refuses unary emits
-// with `Unimplemented` while the connection continues to serve.
+// A servlet with a `stream:` arm alone serves streams and refuses unary
+// emits with `Unimplemented` while the connection continues to serve.
 tb_scenario! {
 	name: stream_only_servlet_refuses_unary,
 	spec: StreamOnlyServletSpec,
@@ -290,8 +290,9 @@ fn stream_echo_urn() -> Urn<'static> {
 		.expect("test names satisfy the mint grammar")
 }
 
-/// Starts an established hive with one `StreamingEchoServlet` sibling.
-/// The intra-hive pool pins the servlet certificate and offers mux.
+/// Starts an established hive with one `StreamingEchoServlet` sibling. The
+/// intra-hive pool pins the servlet certificate through
+/// `HiveConfig::trust_store` and offers mux.
 async fn start_streaming_hive(
 	trace: TraceCollector,
 	materials: &ServerMaterials,
@@ -323,11 +324,9 @@ tb_assert_spec! {
 	}
 }
 
-// `HiveContext::open_stream` drives a real sibling servlet. The hive's
-// intra-hive pool validates the servlet certificate through
-// `HiveConfig::trust_store` and negotiates mux. The streamed body's
-// unary reply comes back as the servlet's complete reply frame, the
-// same shape as `call`.
+// `HiveContext::open_stream` drives a real sibling servlet through the
+// intra-hive pool. The unary reply to the streamed body comes back as the
+// complete reply frame of the servlet, the same shape as `call`.
 tb_scenario! {
 	name: hive_context_streams_to_sibling_servlet,
 	spec: HiveStreamingSpec,
@@ -488,9 +487,8 @@ tb_assert_spec! {
 }
 
 // A sibling call reaches a servlet only under the identity its registration
-// names. The hive pool trusts both identities, so the handshake completes,
-// and the dial's binding alone refuses the call before the frame leaves
-// (CWE-346).
+// names. The hive pool trusts both identities, so the handshake completes and
+// the dial's binding alone refuses the call before the frame leaves (CWE-346).
 tb_scenario! {
 	name: hive_context_call_refuses_a_sibling_answering_under_another_identity,
 	spec: HiveImpostorCallSpec,

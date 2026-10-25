@@ -8,9 +8,10 @@ use super::{
 	AdmittedDial, ClusterConfig, DialTarget, Party, PeerConfig, PeerHint, PheromoneConfig, RelayRoute, ServletEntry,
 	SharedId,
 };
-use crate::colony::common::ColonyResource;
-use crate::colony::common::IssuedAt;
-use crate::colony::common::{ClusterWorkRequest, ColonyNamespace, PeerAdvertisement};
+use crate::colony::protocol::IssuedAt;
+use crate::colony::protocol::{ClusterWorkRequest, PeerAdvertisement};
+use crate::colony::urn::ColonyNamespace;
+use crate::colony::urn::ColonyResource;
 use crate::constants::{DEFAULT_HOP_BUDGET, MAX_ADVERTISED_TYPES};
 use crate::crypto::hash::Digest;
 use crate::crypto::x509::store::CertificateTrust;
@@ -23,18 +24,18 @@ use crate::utils::time::UnixMillis;
 use crate::x509::ext::pkix::name::GeneralName;
 use crate::x509::ext::pkix::SubjectAltName;
 
-/// Forwards a work request or routed stream open may still spend.
+/// The forwards that a work request or a routed stream open may still spend.
 ///
 /// The wire carries a raw count, so the gateway parses the budget once at
 /// its boundary through [`HopBudget::from_wire`], which clamps it to
 /// the operator's [`PeerConfig::max_hops`]. Every downstream rule reads
-/// this value rather than the raw octet, so the operator's cap bounds the
-/// forwards a peer can spend (CWE-770).
+/// this clamped value, so the operator's cap bounds the forwards a peer can
+/// spend (CWE-770).
 ///
 /// [`PeerConfig::max_hops`]: super::PeerConfig::max_hops
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HopBudget {
-	/// Forwards this gateway may still spend, under the operator's cap.
+	/// The forwards this gateway may still spend, under the operator's cap.
 	remaining: u8,
 	/// Whether the sender already spent part of the budget.
 	relayed: bool,
@@ -67,8 +68,7 @@ impl HopBudget {
 	/// An origin request carries the sentinel budget, so the clamp also
 	/// stamps the origin with the local cap. The wire value decides
 	/// whether a peer already relayed the request, so it arrives as its
-	/// own type rather than as one of two bare octets a call site could
-	/// exchange (CWE-639).
+	/// own type, and a call site cannot exchange it with the cap (CWE-639).
 	#[must_use]
 	pub fn from_wire(wire: WireHopBudget, max_hops: u8) -> Self {
 		let hops = wire.get();
@@ -118,7 +118,7 @@ impl HopBudget {
 		self.remaining
 	}
 
-	/// Relayed stream route for one peer hop out of this budget.
+	/// The relayed stream route of one peer hop out of this budget.
 	///
 	/// The route reaches the same `target` with one forward spent. A route
 	/// built through the budget spends the hop, so a relay pays for every
@@ -128,7 +128,7 @@ impl HopBudget {
 		StreamRoute::relayed_to(target.clone(), self.spend().wire())
 	}
 
-	/// Relayed work envelope for one peer hop out of this budget.
+	/// The relayed work envelope of one peer hop out of this budget.
 	///
 	/// Unary work spends its hop here, as a routed stream spends it in
 	/// [`Self::relayed_route`]. `payload` is already the client's encoded frame
@@ -147,28 +147,28 @@ impl HopBudget {
 	}
 }
 
-/// Peer advertisement that passed signer resolution and wire checks.
+/// A peer advertisement that passed signer resolution and the wire checks.
 ///
 /// The registry receives this type only after those checks, so the signer
 /// identity and the claimed dial address each arrive in their own field.
 pub struct AdmittedPeerAd {
-	/// Fingerprint of the signer certificate, which keys the slate.
+	/// The fingerprint of the signer certificate, which keys the slate.
 	pub(super) peer_hive_id: SharedId,
-	/// Claimed gateway socket every slate entry dials, parsed and admitted
-	/// once.
+	/// The claimed gateway socket that every slate entry dials, parsed and
+	/// admitted once.
 	///
 	/// The slate entries carry this same value, so a score lookup and a
 	/// stored route agree on one socket, and the discovery hint carries the
 	/// proof the dial policy admitted it.
 	pub(super) dial: AdmittedDial,
-	/// Peer-routed entries keyed by `peer_hive_id NUL type`.
+	/// The peer-routed entries, keyed by `peer_hive_id NUL type`.
 	pub(super) slate: Vec<ServletEntry>,
-	/// Issue order of the signed advertisement frame. Reconciliation
+	/// The issue order of the signed advertisement frame. Reconciliation
 	/// refuses an order older than the newest applied (CWE-294).
 	pub(super) order: UnixMillis,
 }
 
-/// Fallback trails for one admitted advertisement through one relay.
+/// The fallback trails of one admitted advertisement through one relay.
 ///
 /// The slate reconciles under the composite `origin NUL relay` bucket,
 /// so a relay trail outlives a replacement of the origin's direct slate. An
@@ -181,9 +181,9 @@ pub struct RelayTrail {
 	/// The origin whose types the trails reach, and the owner of every
 	/// route in the bucket.
 	pub(super) origin: SharedId,
-	/// Relay-routed entries keyed by `bucket NUL type`.
+	/// The relay-routed entries, keyed by `bucket NUL type`.
 	pub(super) slate: Vec<ServletEntry>,
-	/// Issue order of the advertisement the trails derive from.
+	/// The issue order of the advertisement that the trails derive from.
 	pub(super) order: UnixMillis,
 }
 
@@ -193,8 +193,8 @@ impl AdmittedPeerAd {
 	/// The checks run in this order:
 	///
 	/// 1. The signer MUST resolve on the peer plane, and the slate keys by its
-	///    name under [`TrustPlanes::peer_identity`] rather than the claimed
-	///    `gateway_addr`.
+	///    name under [`TrustPlanes::peer_identity`], whatever `gateway_addr` it
+	///    claims.
 	/// 2. This gateway MUST be in a flood, and the signer MUST be a member of it.
 	/// 3. [`PeerConfig::admit_claim`] MUST admit the claimed address, and the
 	///    advertised types MUST be bare servlet types within the type cap.
@@ -223,10 +223,9 @@ impl AdmittedPeerAd {
 		let signer_cert = verified.signer_cert();
 		let peer_hive_id = verified.fingerprint().into_shared();
 
-		// Federation is a colony operation, so both this gateway and the
-		// advertiser must carry a valid colony URN SAN. A certificate
-		// without one still serves general transport and work, but it grants
-		// no membership.
+		// Federation is a colony operation, so this gateway and the advertiser
+		// must both carry a valid colony URN SAN. A certificate without one
+		// still serves general transport and work, and grants no membership.
 		let Some(flood) = conf.flood() else {
 			return Err(TransitStatus::PermissionDenied);
 		};
@@ -241,7 +240,7 @@ impl AdmittedPeerAd {
 		Ok(Self { peer_hive_id, dial, slate, order: frame.issued_at() })
 	}
 
-	/// Relay trails through `relay_id`, the gateway that relayed this
+	/// The relay trails through `relay_id`, the gateway that relayed this
 	/// advertisement, with one trail per advertised type that dials
 	/// `relay_dial`, the relay's own admitted gateway socket.
 	///
@@ -296,8 +295,8 @@ impl AdmittedPeerAd {
 		Some(RelayTrail { bucket, origin: Arc::clone(&self.peer_hive_id), slate, order: self.order })
 	}
 
-	/// Discovery hint from this admitted advertisement: the verified
-	/// signer's admitted dial address plus its certificate fingerprint.
+	/// The discovery hint of this admitted advertisement: the verified
+	/// signer's admitted dial address and its certificate fingerprint.
 	///
 	/// The hint owns its fields because it outlives this borrowed
 	/// advertisement inside the peer table. Every admitted advertiser is a
@@ -315,7 +314,7 @@ impl AdmittedPeerAd {
 	}
 }
 
-/// Wire-level advertisement checks, which run outside the registry lock.
+/// Runs the wire-level advertisement checks, outside the registry lock.
 fn peer_advertisement_wire_ok(
 	gateway_addr: impl AsRef<[u8]>,
 	types: impl AsRef<[Urn<'static>]>,
@@ -372,7 +371,7 @@ pub(crate) struct Flood<'a> {
 	peer_trust: Option<&'a dyn CertificateTrust>,
 }
 
-/// Proof that a certificate belongs to a [`Flood`].
+/// The proof that a certificate belongs to a [`Flood`].
 ///
 /// [`Flood::member`] is the only constructor, so a value of this type means
 /// the membership rule ran on a certificate.
@@ -437,11 +436,11 @@ impl ClusterConfig {
 }
 
 impl ColonyNamespace {
-	/// Colony URN a certificate asserts, when exactly one is present.
+	/// The colony URN a certificate asserts, when exactly one is present.
 	///
-	/// Membership binds to the URI SAN (RFC 5280 §4.2.1.6) rather than the
-	/// Subject DN. The method skips non-URI SANs and URIs that fail colony
-	/// validation in this namespace.
+	/// Membership binds to the URI SAN (RFC 5280 §4.2.1.6) alone. The method
+	/// skips non-URI SANs and URIs that fail colony validation in this
+	/// namespace.
 	///
 	/// The answer is `None` in each case below, so an ambiguous identity
 	/// fails closed (CWE-706):
@@ -476,9 +475,9 @@ impl ColonyNamespace {
 	}
 }
 
-/// Peer identity derived from a certificate.
+/// The peer identity of a certificate.
 pub(crate) trait ColonyCertificate {
-	/// Stable peer key: the fingerprint of the certificate under digest `D`.
+	/// Returns the stable peer key, the certificate's fingerprint under `D`.
 	///
 	/// Slates and misbehavior scores key on this fingerprint of the
 	/// certificate that [`TrustPlanes::peer_identity`] resolves, so one peer
@@ -561,8 +560,8 @@ mod tests {
 		assert!(!ns.all_bare_servlet_types(&[instance]));
 	}
 
-	/// Pheromone settings the slate tests read: the shipped defaults, so a
-	/// changed default shows up here rather than diverge unseen.
+	/// The pheromone settings the slate tests read: the shipped defaults, so a
+	/// changed default shows up in these tests.
 	fn test_pheromone() -> PheromoneConfig {
 		PheromoneConfig::default()
 	}

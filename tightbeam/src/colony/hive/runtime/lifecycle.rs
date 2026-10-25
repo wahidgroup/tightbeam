@@ -8,17 +8,18 @@ use core::future::Future;
 use core::hash::Hash;
 use core::pin::Pin;
 use core::str::FromStr;
-use core::sync::atomic::AtomicU16;
+use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
-use crate::colony::common::{ColonyResource, DrainMode, TaskGroup};
 use crate::colony::hive::runtime::control::{InFlight, Settled};
 use crate::colony::hive::runtime::{ClusterLink, HiveContextImpl, HiveControlCtx, ScalingLoop};
 use crate::colony::hive::{
-	HashMapRegistry, Hive, HiveConfig, HiveContext, RegisterHiveResponse, ServletBox, ServletRegistration,
-	ServletRegistry, SpawnerFn,
+	HashMapRegistry, Hive, HiveConfig, HiveContext, ServletBox, ServletRegistration, ServletRegistry, SpawnerFn,
 };
+use crate::colony::protocol::RegisterHiveResponse;
+use crate::colony::urn::ColonyResource;
+use crate::colony::TaskGroup;
 use crate::constants::DEFAULT_MAX_SERVER_CONNECTIONS;
 use crate::macros::server::AcceptedConnection;
 use crate::policy::TransitStatus;
@@ -54,9 +55,9 @@ struct ControlPlane<P: Protocol> {
 
 /// Where a hive sits in its lifecycle.
 ///
-/// Servlet registration closes when the hive establishes, so the two
-/// phases hold different things rather than one nullable handle that
-/// every guard has to read the same way.
+/// Servlet registration closes when the hive establishes, so each phase
+/// holds its own state, in place of one nullable handle that every guard has
+/// to read the same way.
 enum Lifecycle<P: Protocol> {
 	/// Servlet registration is open, and the control plane is unbound.
 	Provisional,
@@ -77,6 +78,33 @@ impl<P: Protocol> Lifecycle<P> {
 	/// Whether servlet registration is still open.
 	fn is_provisional(&self) -> bool {
 		matches!(self, Self::Provisional)
+	}
+}
+
+/// Whether a runtime has entered drain.
+///
+/// Every clone of the handle shares one flag, so its readers agree:
+///
+/// - The hive control plane refuses each command that yields to load.
+/// - [`Hive::is_draining`] reports the flag.
+///
+/// The hive drain aborts the scaling loop and the re-announce loop through the
+/// runtime's [`TaskGroup`] before it waits on commands in flight.
+///
+/// Drain is terminal. A runtime that has entered it stays in it.
+#[derive(Clone, Default)]
+pub struct DrainMode(Arc<AtomicBool>);
+
+impl DrainMode {
+	/// Enters drain.
+	pub fn begin(&self) {
+		self.0.store(true, Ordering::Release);
+	}
+
+	/// Returns `true` once drain has begun.
+	#[must_use]
+	pub fn is_draining(&self) -> bool {
+		self.0.load(Ordering::Acquire)
 	}
 }
 
@@ -374,12 +402,12 @@ where
 	async fn drain(&self) -> Result<(), TightBeamError> {
 		self.drain.begin();
 
-		// Stop the beats before the wait on commands. A re-announce or a
-		// scale-up that outlived the wait would reinstall the routes this
+		// The beats stop before the wait on commands, because a re-announce or
+		// a scale-up that outlived the wait would reinstall the routes this
 		// drain withdraws (CWE-362).
 		self.tasks.abort_all();
 
-		// Wait on commands, not on open connections: a control connection
+		// The wait counts commands in flight, because a control connection
 		// idles between commands by design. The timeout is the backstop for
 		// work that outlasts it.
 		let drain_timeout = self.config.control.drain_timeout;
@@ -393,8 +421,8 @@ where
 			.into_iter()
 			.for_each(|(_, reg)| reg.servlet.stop_boxed());
 
-		// Announce the emptied slate so gateways retire this hive's routes at
-		// once, ahead of the heartbeat that would eventually miss.
+		// The emptied slate goes out at once, so gateways retire this hive's
+		// routes ahead of the heartbeat that would eventually miss.
 		if let Some(link) = self.cluster_link() {
 			link.announce_slate().await;
 		}
@@ -410,5 +438,23 @@ where
 impl<P: Protocol> Drop for HiveRuntime<P> {
 	fn drop(&mut self) {
 		self.release();
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::DrainMode;
+
+	#[test]
+	fn a_fresh_runtime_is_not_draining() {
+		assert!(!DrainMode::default().is_draining());
+	}
+
+	#[test]
+	fn every_holder_of_the_handle_sees_the_drain() {
+		let mode = DrainMode::default();
+		let reader = mode.clone();
+		mode.begin();
+		assert!(reader.is_draining());
 	}
 }

@@ -92,7 +92,7 @@ pub trait PhaseView<P: HandshakeProvider>: sealed::Sealed + MaybeSend + MaybeSyn
 	/// What the handshake agreed, from the last leg to completion.
 	fn agreed(&self) -> Option<&Agreed<P>>;
 
-	/// Take what the handshake agreed, or hand the phase back unchanged.
+	/// Takes what the handshake agreed, or hands the phase back unchanged.
 	fn take_agreed(self) -> Result<Agreed<P>, Self>;
 }
 
@@ -104,7 +104,8 @@ pub trait Role<F: HandshakeFlow, P: HandshakeProvider>: sealed::Sealed + MaybeSe
 	/// What this role is provisioned with.
 	type Config: MaybeSend + MaybeSync;
 
-	/// Map the directional ciphers to the keys this role sends and receives on.
+	/// Maps the directional ciphers to the keys that this role sends and
+	/// receives on.
 	fn session_keys(ciphers: DirectionalCiphers<RuntimeAead>) -> SessionKeys;
 }
 
@@ -141,8 +142,8 @@ pub struct ClientConfig<F: ClientFlow<P>, P: HandshakeProvider> {
 	/// The key purpose of each role: the server's certificates carry the
 	/// server's, and the client's own identity the client's.
 	key_purposes: KeyPurposes,
-	/// The approver consulted before a session receipt is countersigned.
-	/// Without one a challenge-bearing receipt fails closed.
+	/// The approver that the client consults before it countersigns a session
+	/// receipt. Without one a challenge-bearing receipt fails closed.
 	pub receipt_approver: Option<Arc<dyn ReceiptApprover>>,
 	/// The server policy, which [`Self::with_server_policy`] sets, or `None`
 	/// for a client that sets none.
@@ -208,7 +209,7 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> ClientConfig<F, P> {
 		&self.key_purposes
 	}
 
-	/// Set the server policy, which every validator of `validators` runs on
+	/// Sets the server policy, which every validator of `validators` runs on
 	/// the identity certificate of the server once its trust admits it:
 	///
 	/// - CMS: the pinned key-agreement certificate, before the opening seals to it.
@@ -558,7 +559,7 @@ pub struct Handshake<R: Role<F, P>, F: HandshakeFlow, P: HandshakeProvider> {
 }
 
 impl<R: Role<F, P>, F: HandshakeFlow, P: HandshakeProvider> Handshake<R, F, P> {
-	/// Take the phase, and leave the handshake spent until a step stores the
+	/// Takes the phase, and leaves the handshake spent until a step stores the
 	/// next one.
 	///
 	/// This is the one place a phase leaves the handshake. A step holds what
@@ -568,7 +569,7 @@ impl<R: Role<F, P>, F: HandshakeFlow, P: HandshakeProvider> Handshake<R, F, P> {
 		mem::replace(&mut self.phase, R::Phase::spent())
 	}
 
-	/// Take what `select` picks out of the phase, for a step that runs in one
+	/// Takes what `select` picks out of the phase, for a step that runs in one
 	/// phase alone.
 	///
 	/// A phase that `select` hands back returns to the handshake unchanged,
@@ -587,7 +588,7 @@ impl<R: Role<F, P>, F: HandshakeFlow, P: HandshakeProvider> Handshake<R, F, P> {
 		}
 	}
 
-	/// Complete the handshake and take everything it agreed.
+	/// Completes the handshake and takes everything it agreed.
 	///
 	/// The handshake secret moves out, so one handshake derives one session.
 	///
@@ -656,16 +657,16 @@ struct BoundClosing<'a, P: HandshakeProvider> {
 }
 
 impl<F: ClientFlow<P>, P: HandshakeProvider> Handshake<Client, F, P> {
-	/// Create a client handshake under `config`, in [`HandshakePhase::Idle`]
+	/// Creates a client handshake under `config`, in [`HandshakePhase::Idle`]
 	/// until [`Self::start`] builds the opening.
 	pub fn client(config: ClientConfig<F, P>) -> Self {
 		Self { config, phase: ClientPhase::Idle, _markers: PhantomData }
 	}
 
-	/// Build the opening, the first message for the server.
+	/// Builds the opening, the first message for the server.
 	///
-	/// A provisioned server identity is admitted, under the server policy,
-	/// before anything is encrypted to it.
+	/// The client admits a provisioned server identity, under the server
+	/// policy, before it encrypts anything to it.
 	///
 	/// # Errors
 	///
@@ -703,7 +704,7 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> Handshake<Client, F, P> {
 		Ok(message)
 	}
 
-	/// Process the reply of the server, and build the closing, the last
+	/// Processes the reply of the server, and builds the closing, the last
 	/// message of the client.
 	///
 	/// # Errors
@@ -801,12 +802,11 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> Handshake<Client, F, P> {
 		}
 
 		// 9. Derive the handshake secret, and verify the server Finished under
-		//    it, before the receipt is read and before any part of the closing
-		//    exists. The Finished proves that the holder of the handshake
-		//    secret stood behind the reply's signature, so a certificate the
-		//    store admits for the server's name, which this server never sent,
-		//    reaches neither the receipt check nor the approver (RFC 9846
-		//    §4.5.3). The receipt check takes the confirmation as its proof.
+		//    it before the receipt is read and before any part of the closing
+		//    exists. The Finished proves that the holder of the secret stood
+		//    behind the reply's signature (RFC 9846 §4.5.3), so a certificate
+		//    the store admits for the server's name, which this server never
+		//    sent, reaches neither the receipt check nor the approver.
 		let secret = pending.agree(&server_ephemeral, terms.kdf_salt())?;
 		let confirmed = ServerConfirmed::confirm(&reply, verified, secret, &terms)?;
 
@@ -841,7 +841,7 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> Handshake<Client, F, P> {
 		Ok(closing)
 	}
 
-	/// Seal the countersignature, and build the closing up to its client
+	/// Seals the countersignature, and builds the closing up to its client
 	/// Finished, under the secret of a server whose Finished verified.
 	///
 	/// The function is synchronous, so it runs inside one poll, and it takes
@@ -880,16 +880,16 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> Handshake<Client, F, P> {
 }
 
 impl<F: ServerFlow<P>, P: HandshakeProvider> Handshake<Server, F, P> {
-	/// Create a server handshake under `config`, in [`HandshakePhase::Idle`]
+	/// Creates a server handshake under `config`, in [`HandshakePhase::Idle`]
 	/// until [`Self::reply`] reads the opening.
 	pub fn server(config: ServerConfig<F, P>) -> Self {
 		Self { config, phase: ServerPhase::Idle, _markers: PhantomData }
 	}
 
-	/// Process the opening of the client, and build the reply.
+	/// Processes the opening of the client, and builds the reply.
 	///
-	/// The per-handshake ephemeral is drawn here. Its public half enters the
-	/// signed transcript, and its private half serves one agreement.
+	/// The server draws the per-handshake ephemeral here. Its public half
+	/// enters the signed transcript, and its private half serves one agreement.
 	///
 	/// # Errors
 	///
@@ -980,8 +980,8 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> Handshake<Server, F, P> {
 		Ok(reply)
 	}
 
-	/// Process the closing of the client: open it, confirm the handshake
-	/// secret, admit the client, and settle the session receipt.
+	/// Processes the closing of the client: it opens the closing, confirms the
+	/// handshake secret, admits the client, and settles the session receipt.
 	///
 	/// The phase leaves the handshake before any byte of the closing is read,
 	/// so a refused closing drops the server ephemeral and the handshake
@@ -1071,23 +1071,21 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> Handshake<Server, F, P> {
 }
 
 impl<F: ClientFlow<P>, P: HandshakeProvider> ClientHandshakeProtocol for Handshake<Client, F, P> {
-	type Error = HandshakeError;
-
-	fn start<'a>(&'a mut self) -> MaybeSendFuture<'a, Result<HandshakeMessage, Self::Error>> {
+	fn start<'a>(&'a mut self) -> MaybeSendFuture<'a, Result<HandshakeMessage, HandshakeError>> {
 		Box::pin(async move { Handshake::start(self) })
 	}
 
 	fn handle_response<'a>(
 		&'a mut self,
 		msg: HandshakeMessage,
-	) -> MaybeSendFuture<'a, Result<Option<HandshakeMessage>, Self::Error>> {
+	) -> MaybeSendFuture<'a, Result<Option<HandshakeMessage>, HandshakeError>> {
 		Box::pin(async move {
 			let closing = self.respond(msg).await?;
 			Ok(Some(closing))
 		})
 	}
 
-	fn complete(self: Box<Self>) -> MaybeSendFuture<'static, Result<EstablishedSession, Self::Error>> {
+	fn complete(self: Box<Self>) -> MaybeSendFuture<'static, Result<EstablishedSession, HandshakeError>> {
 		Box::pin(async move {
 			let mut handshake = self;
 			Handshake::complete(&mut handshake)
@@ -1104,12 +1102,10 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> ClientHandshakeProtocol for Handsha
 }
 
 impl<F: ServerFlow<P>, P: HandshakeProvider> ServerHandshakeProtocol for Handshake<Server, F, P> {
-	type Error = HandshakeError;
-
 	fn handle_request<'a>(
 		&'a mut self,
 		msg: HandshakeMessage,
-	) -> MaybeSendFuture<'a, Result<Option<HandshakeMessage>, Self::Error>> {
+	) -> MaybeSendFuture<'a, Result<Option<HandshakeMessage>, HandshakeError>> {
 		Box::pin(async move {
 			// The first message is the opening, which is owed a reply. Every
 			// later one is read as the closing, which ends the exchange.
@@ -1123,7 +1119,7 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> ServerHandshakeProtocol for Handsha
 		})
 	}
 
-	fn complete(self: Box<Self>) -> MaybeSendFuture<'static, Result<EstablishedSession, Self::Error>> {
+	fn complete(self: Box<Self>) -> MaybeSendFuture<'static, Result<EstablishedSession, HandshakeError>> {
 		Box::pin(async move {
 			let mut handshake = self;
 			Handshake::complete(&mut handshake)

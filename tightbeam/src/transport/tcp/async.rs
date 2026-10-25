@@ -187,7 +187,7 @@ pub struct TokioListener<P: CryptoProvider = DefaultCryptoProvider> {
 
 #[cfg(feature = "tokio")]
 impl<P: CryptoProvider + Send + Sync + 'static> TokioListener<P> {
-	/// Return the local address that the listener is bound to.
+	/// Returns the local address that the listener is bound to.
 	///
 	/// # Errors
 	///
@@ -196,7 +196,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> TokioListener<P> {
 		self.listener.local_addr()
 	}
 
-	/// Bind a cleartext listener on `addr`.
+	/// Binds a cleartext listener on `addr`.
 	///
 	/// Accepted transports carry no confidentiality, integrity, or peer
 	/// authentication. See [`EndpointConfig::cleartext`].
@@ -229,7 +229,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> TokioListener<P> {
 		Ok(Self { listener, config })
 	}
 
-	/// Accept one connection as a transport built from this listener's
+	/// Accepts one connection as a transport built from this listener's
 	/// configuration.
 	///
 	/// # Errors
@@ -293,8 +293,8 @@ impl<P: CryptoProvider + Send + Sync + 'static> EncryptedProtocol for TokioListe
 }
 
 /// This impl covers every provider `P`, so a call names `P` where no other
-/// type names it, as [`TokioListener`] shows under `# Provider`.
-// `TcpTransport` takes the default of every `EncryptedMessageIO` method.
+/// type names it, as [`TokioListener`] shows under `# Provider`. It takes the
+/// default of every `EncryptedMessageIO` method.
 impl<S: AsyncProtocolStream, P: CryptoProvider + Send + Sync + 'static> EncryptedMessageIO for TcpTransport<S, P> where
 	TransportError: From<S::Error>
 {
@@ -304,7 +304,7 @@ impl<S: AsyncProtocolStream, P: CryptoProvider + Send + Sync> TcpTransport<S, P>
 where
 	TransportError: From<S::Error>,
 {
-	/// Report whether the underlying stream still appears connected.
+	/// Reports whether the underlying stream still appears connected.
 	///
 	/// External protocols need this liveness hook to implement
 	/// [`PersistentConnection`] for pooled connections, and the stream itself
@@ -323,9 +323,9 @@ mod mux {
 		IntoMuxOffer, MuxCapable, MuxConnector, MuxRekeyContext, MuxRole, MuxTransport,
 	};
 
-	pub(crate) use crate::transport::io::CollectStep;
 	pub use crate::transport::multiplex::{GatedHalves, MuxAcceptor};
 	pub(crate) use crate::transport::multiplex::{ACCEPTOR_ROLE, CONNECTOR_ROLE};
+	pub(crate) use crate::transport::state::CollectStep;
 }
 
 #[cfg(all(
@@ -345,7 +345,7 @@ impl<S: AsyncProtocolStream, P: CryptoProvider + Send + Sync> TcpTransport<S, P>
 where
 	TransportError: From<S::Error>,
 {
-	/// Set the local mux advertisement, which the handshake transcript binds.
+	/// Sets the local mux advertisement, which the handshake transcript binds.
 	///
 	/// A `None` offer advertises nothing.
 	pub fn with_mux_offer(mut self, offer: impl IntoMuxOffer) -> Self {
@@ -376,7 +376,7 @@ where
 	P: HandshakeProvider,
 	TransportError: From<S::Error>,
 {
-	/// Consume a handshaken transport into its multiplexed plane.
+	/// Consumes a handshaken transport into its multiplexed plane.
 	///
 	/// - The negotiated settings drive the assembly.
 	/// - The in-band rekey context attaches when the session carries a dual-signed receipt.
@@ -534,7 +534,7 @@ impl SplitRecv {
 		}
 	}
 
-	/// Admit `arriving` in the mode of this half, and return the DER of the
+	/// Admits `arriving` in the mode of this half, and returns the DER of the
 	/// transport envelope it carries: a cleartext envelope as it arrived, or
 	/// the content of a record this half's receive cipher opened in place.
 	///
@@ -595,7 +595,7 @@ where
 	R: AsyncReadStream,
 	TransportError: From<R::Error>,
 {
-	/// Override the receive-direction renewal threshold that
+	/// Overrides the receive-direction renewal threshold that
 	/// `remaining_records` counts down ([RFC 9846 § 5.5][rfc9846-5.5]).
 	///
 	/// The value sets trigger policy only. Decryption refuses records at the
@@ -617,7 +617,7 @@ where
 	R: AsyncReadStream,
 	TransportError: From<R::Error>,
 {
-	/// Read one envelope in the wire mode this half took from the split.
+	/// Reads one envelope in the wire mode this half took from the split.
 	///
 	/// The operation deadline bounds the read in either mode, so a peer that
 	/// stops mid-frame cannot pin the reader task (CWE-400).
@@ -648,7 +648,7 @@ where
 		Ok(envelope)
 	}
 
-	/// Return the number of records still readable before the receive cipher
+	/// Returns the number of records still readable before the receive cipher
 	/// demands a rekey. A cleartext half never demands one, so it reports
 	/// `u64::MAX`.
 	fn remaining_records(&self) -> u64 {
@@ -658,7 +658,7 @@ where
 		}
 	}
 
-	/// Swap in the new epoch's receive cipher.
+	/// Swaps in the new epoch's receive cipher.
 	///
 	/// The fresh counter resets the sequence discipline, because counter
 	/// nonces restart only with a fresh key (NIST SP 800-38D § 8.2.1). The
@@ -712,7 +712,7 @@ where
 	W: AsyncWriteStream,
 	TransportError: From<W::Error>,
 {
-	/// Override the send cipher's rekey record limit
+	/// Overrides the send cipher's rekey record limit
 	/// ([RFC 9846 § 5.5][rfc9846-5.5]).
 	///
 	/// The limit applies to an encrypted half alone, because a cleartext half
@@ -733,7 +733,7 @@ where
 	W: AsyncWriteStream,
 	TransportError: From<W::Error>,
 {
-	/// Write one envelope in the wire mode this half took from the split,
+	/// Writes one envelope in the wire mode this half took from the split,
 	/// under the operation deadline in either mode.
 	async fn write_envelope(&mut self, envelope: TransportEnvelope) -> TransportResult<()> {
 		let builder = EnvelopeBuilder::transport(envelope).with_limits(self.limits);
@@ -754,7 +754,7 @@ where
 		Ok(())
 	}
 
-	/// Return the number of records still writable before the send cipher
+	/// Returns the number of records still writable before the send cipher
 	/// demands a rekey. A cleartext half never demands one, so it reports
 	/// `u64::MAX`.
 	fn remaining_records(&self) -> u64 {
@@ -764,7 +764,7 @@ where
 		}
 	}
 
-	/// Swap in the new epoch's send cipher.
+	/// Swaps in the new epoch's send cipher.
 	///
 	/// The fresh counter resets the sequence discipline, because counter
 	/// nonces restart only with a fresh key (NIST SP 800-38D § 8.2.1). The
@@ -806,7 +806,7 @@ where
 	P: CryptoProvider + Send + Sync + 'static,
 	TransportError: From<S::Error>,
 {
-	/// Split the transport into exclusive read and write halves in the wire
+	/// Splits the transport into exclusive read and write halves in the wire
 	/// mode its session holds.
 	///
 	/// - An established session moves its receive key into the
@@ -971,7 +971,7 @@ where
 		&self.emitter_gate
 	}
 
-	/// Complete the handshake, then run one emit cycle under the operation
+	/// Completes the handshake, then runs one emit cycle under the operation
 	/// deadline.
 	async fn perform_send_receive(
 		&mut self,
@@ -1049,10 +1049,10 @@ mod tests {
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	use crate::transport::handshake::ValidatorChain;
 
-	/// Serve one single-flight request.
+	/// Serves one single-flight request.
 	///
-	/// The helper collects the request, applies `reply` to an accepted frame,
-	/// and answers with the gate's status.
+	/// The function collects the request, applies `reply` to an accepted
+	/// frame, and answers with the gate's status.
 	async fn respond_with<T, F>(transport: &mut T, reply: F) -> TransportResult<()>
 	where
 		T: MessageCollector + Send,
@@ -1158,8 +1158,8 @@ mod tests {
 			}
 		}
 
-		/// Limits at twice the default encrypted-envelope ceiling, where a key
-		/// admits half the default record volume.
+		/// The limits at twice the default encrypted-envelope ceiling, where a
+		/// key admits half the default record volume.
 		fn doubled_ceiling() -> TransportLimits {
 			let encrypted_envelope = 2 * DEFAULT_MAX_ENCRYPTED_ENVELOPE;
 			TransportLimits { encrypted_envelope, ..TransportLimits::default() }

@@ -12,11 +12,11 @@ use super::{
 };
 use crate::cms::signed_data::SignerIdentifier;
 use crate::colony::cluster::peer::{AdmittedPeerAd, RelayTrail};
+use crate::colony::cluster::MAX_PHEROMONE;
 use crate::colony::cluster::{AdmittedDial, PeerAddress};
-use crate::colony::common::ColonyNamespace;
-use crate::colony::common::ServletInfo;
-use crate::colony::common::ServletTypeKey;
-use crate::colony::common::MAX_PHEROMONE;
+use crate::colony::protocol::ServletInfo;
+use crate::colony::urn::ColonyNamespace;
+use crate::colony::urn::ServletTypeKey;
 use crate::tb_cases;
 use crate::urn::Urn;
 use crate::utils::basis_points::BasisPointsOutOfRange;
@@ -286,8 +286,8 @@ fn weaken_entry_times(entry: &ServletEntry, times: u32) {
 	}
 }
 
-// Every failure counts one trial, and the entry abandons at the limit,
-// not before it.
+// Every failure counts one trial, and the entry abandons on the failure
+// that reaches the limit.
 tb_cases! {
 	fn entry_trials_count_toward_the_limit((weakened, expected_trials, abandoned): (u32, u32, bool)) {
 		let entry = test_entry(5000, 3);
@@ -468,9 +468,9 @@ fn local_servlets_dedups_and_excludes_peer_routes() -> Result<(), ClusterError> 
 	Ok(())
 }
 
-/// Two hives that serve one type both yield routes, and the type is named
-/// once. The type index lives in this registry alone, so it answers the
-/// fan-out the balancer picks from.
+/// Two hives that serve one type both yield routes, and `local_servlets`
+/// names the type once. The type index lives in this registry alone, so it
+/// answers the fan-out the balancer picks from.
 #[test]
 fn two_hives_serving_one_type_both_yield_routes() -> Result<(), ClusterError> {
 	let registry = registry();
@@ -577,7 +577,7 @@ fn peer_at_the_gateway_socket() -> AdmittedPeerAd {
 	admitted(b"gw", b"127.0.0.1:9000", vec![peer_entry(b"calc", b"gw")])
 }
 
-// A peer may not advertise a socket a local servlet is dialed at.
+// A peer may not advertise a socket at which the gateway dials a local servlet.
 #[test]
 fn a_peer_cannot_dial_a_local_servlets_socket() -> Result<(), ClusterError> {
 	let registry = registry();
@@ -589,9 +589,9 @@ fn a_peer_cannot_dial_a_local_servlets_socket() -> Result<(), ClusterError> {
 	Ok(())
 }
 
-// A hive may not register a servlet at a socket a peer gateway is dialed
-// at. It is the same collision as the reverse order, judged by the one
-// decider on the dial axis.
+// A hive may not register a servlet at a socket at which the gateway dials a
+// peer gateway. It is the collision of the reverse order, and the one decider
+// on the dial axis judges it.
 #[test]
 fn a_hive_cannot_register_a_peer_gateways_socket() -> Result<(), ClusterError> {
 	let registry = registry();
@@ -914,9 +914,9 @@ fn equal_ad_order_reconciles_idempotently() -> Result<(), ClusterError> {
 	Ok(())
 }
 
-// A withdrawal leaves a tombstone in the order ledger, so a replayed
-// older advertisement inside the freshness window leaves the withdrawal in
-// place rather than reinstall routes the origin already withdrew.
+// A withdrawal leaves a tombstone in the order ledger, so the registry
+// refuses a replayed older advertisement inside the freshness window, and the
+// routes the origin withdrew stay withdrawn.
 #[test]
 fn withdrawal_tombstone_refuses_older_ad_reinstall() -> Result<(), ClusterError> {
 	// The unbounded window pins the retain rule itself: the outcome
@@ -1066,8 +1066,8 @@ fn rounds_with_one_plane_holding_the_bucket(rounds: usize) -> usize {
 	(0..rounds)
 		.filter(|_| {
 			let registry = registry();
-			// Either racer may be the one refused, so neither outcome is
-			// read here. What the bucket holds afterwards is the observable.
+			// Either racer may be the one refused, so the test discards both
+			// outcomes and reads what the bucket holds afterwards.
 			thread::scope(|scope| {
 				scope.spawn(|| {
 					let slate = hive_slate(b"gw", vec![named_entry(b"gw", b"calc", b"gw")]);
@@ -1096,9 +1096,9 @@ fn racing_slates_for_one_bucket_leave_it_to_one_plane() {
 	assert_eq!(settled, rounds);
 }
 
-// A peer advertisement whose bucket bytes equal a hive id is refused
-// once that hive's routes sit under the bucket: the hive and the peer are
-// different owners even when their bytes agree (CWE-639).
+// The registry refuses a peer advertisement whose bucket bytes equal a hive
+// id once that hive's routes sit under the bucket, because the hive and the
+// peer are different owners even when their bytes agree (CWE-639).
 #[test]
 fn a_peer_cannot_advertise_under_a_hives_bucket() -> Result<(), ClusterError> {
 	let registry = registry();

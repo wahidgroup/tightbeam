@@ -55,8 +55,6 @@ use alloc::vec::Vec;
 use crate::asn1::WireDer;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::cms::signed_data::SignedData;
-#[cfg(feature = "transport-cms")]
-use crate::constants::ECDH_SHARED_SECRET_SIZE;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::constants::{
 	pairwise_prefix_free, prefix_free, MIN_SALT_ENTROPY_BYTES, TIGHTBEAM_ACK_KDF_INFO, TIGHTBEAM_ACK_KEY_ID_DOMAIN,
@@ -206,35 +204,53 @@ pub struct HandshakeSecret(ZeroizingBytes);
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 const HANDSHAKE_SECRET_SIZE: usize = 32;
 
-/// Length in bytes of the hybrid shared secret `ee || base`.
+/// The size in octets of the stack buffer of the hybrid secret `ee || base`:
+/// the 66 octets of the P-521 field, the widest named prime curve, and the 32
+/// of the base secret.
 #[cfg(feature = "transport-cms")]
-const HYBRID_SECRET_SIZE: usize = ECDH_SHARED_SECRET_SIZE + BASE_SECRET_SIZE;
+const HYBRID_INLINE_SIZE: usize = 66 + BASE_SECRET_SIZE;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl HandshakeSecret {
 	/// Derive the CMS handshake secret from the hybrid shared secret
-	/// `Z′ = ee || base`, extracted under `salt`.
+	/// `Z′ = ee || base`, extracted under `salt` (NIST SP 800-56C Rev. 2 § 2).
 	///
-	/// `ee` is the ephemeral-ephemeral ECDH output, the shared secret `Z` of
-	/// the key-establishment scheme, and `base` is the auxiliary secret `T`
-	/// that follows it (NIST SP 800-56C Rev. 2 § 2). Each part has a fixed
-	/// width, so the plain concatenation is unambiguous.
+	/// - `ee` is the ephemeral-ephemeral ECDH output, the shared secret `Z`, as wide as the curve's field.
+	/// - `base` is the auxiliary secret `T` that follows it, 32 bytes.
+	///
+	/// Each part has a fixed width for one provider, so the plain
+	/// concatenation is unambiguous.
 	///
 	/// # Errors
 	///
+	/// - [`HandshakeError::IntegerOutOfRange`] -- the width of `ee || base` passes `usize`.
 	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the derivation.
 	#[cfg(feature = "transport-cms")]
-	fn hybrid<P>(ee: &EcdhSecret, base: &BaseSecret, salt: KdfSalt<'_>) -> Result<Self, HandshakeError>
+	fn hybrid<P>(ee: &EcdhSecret<P::Curve>, base: &BaseSecret, salt: KdfSalt<'_>) -> Result<Self, HandshakeError>
 	where
 		P: CryptoProvider,
 	{
-		// The copy lands directly in a `ZeroizingArray` (CWE-226).
-		let mut hybrid = ZeroizingArray::new([0u8; HYBRID_SECRET_SIZE]);
-		let (shared, auxiliary) = hybrid.split_at_mut(ECDH_SHARED_SECRET_SIZE);
-		ee.with(|ee| shared.copy_from_slice(ee));
-		auxiliary.copy_from_slice(base.as_bytes());
+		ee.with(|ee| {
+			let sum = ee.len().checked_add(BASE_SECRET_SIZE);
+			let width = sum.ok_or(HandshakeError::IntegerOutOfRange)?;
+			let octets = ee.iter().chain(base.as_bytes());
 
-		Self::extract::<P>(hybrid.as_slice(), salt)
+			// Each buffer wipes on drop (CWE-226). The hybrid secret of a named
+			// curve up to P-521 fits the stack buffer, and a wider one goes on
+			// the heap at its final capacity.
+			let mut inline = ZeroizingArray::new([0u8; HYBRID_INLINE_SIZE]);
+			match inline.get_mut(..width) {
+				Some(hybrid) => {
+					hybrid.iter_mut().zip(octets).for_each(|(slot, octet)| *slot = *octet);
+					Self::extract::<P>(hybrid, salt)
+				}
+				None => {
+					let mut hybrid = ZeroizingBytes::new(Vec::with_capacity(width));
+					hybrid.extend(octets);
+					Self::extract::<P>(&hybrid, salt)
+				}
+			}
+		})
 	}
 
 	/// Derive the HPKE handshake secret from the shared secret `Z = ee` alone,
@@ -247,7 +263,7 @@ impl HandshakeSecret {
 	/// # Errors
 	///
 	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the derivation.
-	fn ephemeral<P>(ee: &EcdhSecret, salt: KdfSalt<'_>) -> Result<Self, HandshakeError>
+	fn ephemeral<P>(ee: &EcdhSecret<P::Curve>, salt: KdfSalt<'_>) -> Result<Self, HandshakeError>
 	where
 		P: CryptoProvider,
 	{
@@ -486,9 +502,9 @@ impl SecretSeal {
 	/// bare.
 	///
 	/// Every field around the client certificate in a closing has a fixed
-	/// width, so its length would be the length of the certificate. The
-	/// padding, to a step with a floor, gives the closings of a fleet whose
-	/// certificates come from one issuer one length.
+	/// width, so an unpadded closing would reveal the length of the
+	/// certificate. The padding, to a step with a floor, gives one length to
+	/// the closings of a fleet whose certificates come from one issuer.
 	const fn padding(self) -> Option<Padding> {
 		match self {
 			Self::Ack => None,
@@ -609,11 +625,9 @@ impl Padding {
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 const _: () = assert!(prefix_free(SecretSeal::Ack.label(), SecretSeal::Closing.label()));
 
-// When the negotiated digest is the hash of the profile's KDF, each `MacKey`
-// expands from the PRK that the traffic, epoch, acknowledgement, and closing
-// keys extract from the handshake secret under the protocol salt. Every label
-// must then differ from every other (RFC 5869 § 3.2), which
-// `pairwise_prefix_free` implies.
+// When the negotiated digest is the KDF's hash, every key named below expands
+// from one PRK of the handshake secret under the protocol salt, so the labels
+// must differ pairwise (RFC 5869 § 3.2), which `pairwise_prefix_free` implies.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 const _: () = assert!(pairwise_prefix_free(&[
 	TIGHTBEAM_CLIENT_FINISHED_KEY_INFO,
@@ -757,10 +771,11 @@ impl ConfirmedSecret {
 
 /// The proof that an endpoint derived the handshake secret of one transcript.
 ///
-/// [`HandshakeSecret::confirmation`] derives the tag an endpoint sends or
-/// expects, as wide as the output of the negotiated digest. A received tag
-/// decodes as an OCTET STRING of a digest output width, from 32 to 64 bytes,
-/// and a tag of another digest's width fails the comparison.
+/// [`HandshakeSecret::confirmation`] derives the client tag, and
+/// [`HandshakeSecret::server_confirmation`] derives the server Finished, each
+/// as wide as the output of the negotiated digest. A received tag decodes as
+/// an OCTET STRING of a digest output width, from 32 to 64 bytes, and a tag of
+/// another digest's width fails the comparison.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 #[derive(Clone, Copy)]
 pub struct KeyConfirmation(DigestOutput);
@@ -848,8 +863,8 @@ impl FinishedRole {
 	/// digest `D` of `certificate`, the certificate it carries
 	/// (RFC 9846 § 4.5.2).
 	///
-	/// The CMS transcript binds the server's certificate as it was sent, so the
-	/// server Finished binds the role and the transcript alone.
+	/// The CMS transcript binds the server's certificate as the server sent it,
+	/// so the server Finished binds the role and the transcript alone.
 	///
 	/// # Errors
 	///
@@ -922,8 +937,10 @@ impl EpochSecret {
 	/// between `local` and `peer`, extracted under `salt` and the epoch label.
 	///
 	/// ```text
-	/// epoch_next = HKDF(u32be(32) || epoch || u32be(32) || ee, salt, "tb/session/kdf/epoch/v1")
+	/// epoch_next = HKDF(u32be(32) || epoch || u32be(Ndh) || ee, salt, "tb/session/kdf/epoch/v1")
 	/// ```
+	///
+	/// `Ndh` is the width of `ee`, the field width of the curve of `P`.
 	///
 	/// The agreement runs here, so every later link takes a rekey scalar. A
 	/// holder of this link who records the whole renewal still needs that
@@ -959,11 +976,11 @@ impl EpochSecret {
 	/// The chain step over the agreement output `shared`: the framed pair of
 	/// this link and `shared`, extracted under `salt` and the epoch label.
 	///
-	/// [`Self::next`] is its one caller, and it holds the formula alone, so
-	/// a known-answer test pins the formula with no scalar.
-	fn chained<P>(&self, shared: &EcdhSecret, salt: KdfSalt<'_>) -> Result<Self, HandshakeError>
+	/// [`Self::next`] is its one caller outside the tests. The step holds the
+	/// formula alone, so a known-answer test pins the formula with no scalar.
+	fn chained<P>(&self, shared: &EcdhSecret<P::Curve>, salt: KdfSalt<'_>) -> Result<Self, HandshakeError>
 	where
-		P: HandshakeProvider,
+		P: CryptoProvider,
 	{
 		let label = KdfInfo::new(TIGHTBEAM_EPOCH_KDF_INFO);
 		let secret = shared.with(|shared| {
@@ -1150,11 +1167,10 @@ pub struct PeerPoint<C: CurveArithmetic>(PublicKey<C>);
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl<C: HandshakeCurve> PeerPoint<C> {
-	/// Parse `sec1` as a peer ephemeral. It is the one parse of an ephemeral
-	/// that the handshake secret agrees with, and [`PeerEphemeral`] runs it
-	/// before its comparison. The first octet names the form of the point
-	/// (SEC 1 v2.0 §2.3.3), and the parse reads it by the rule of
-	/// [`Sec1Point::read`] before the curve decodes:
+	/// Parse `sec1` as a peer ephemeral. It is the one parse of every ephemeral
+	/// an agreement takes, and [`PeerEphemeral`] runs it before its comparison.
+	/// The first octet names the form (SEC 1 v2.0 §2.3.3), and the parse reads
+	/// it by the rule of [`Sec1Point::read`] before the curve decodes a point:
 	///
 	/// - The compressed and the uncompressed forms, the two that RFC 5480 §2.2 names, parse.
 	/// - The parse refuses the compact form `0x05` and the identity `0x00`.
@@ -1251,10 +1267,11 @@ impl<P: HandshakeProvider> PeerEphemeral<P::Curve> for PeerCertificate<Signing<P
 	}
 }
 
-/// ECDH key agreement on the handshake plane.
+/// ECDH key agreement of a handshake and of a rekey.
 ///
-/// The ephemeral-ephemeral step runs it with the client's [`SecretKey`], or
-/// with the [`EphemeralSecret`] the server drew for one handshake.
+/// The ephemeral-ephemeral step of a handshake runs it with the client's
+/// [`SecretKey`], or with the [`EphemeralSecret`] the server drew for that
+/// handshake. A rekey runs it with the [`EphemeralSecret`] of one renewal.
 ///
 /// Every peer arrives as a [`PublicKey`], whose type holds a valid point of
 /// the curve, so each scalar multiplication runs on a valid point.
@@ -1263,10 +1280,9 @@ pub(crate) trait HandshakeAgreement<C>
 where
 	C: HandshakeCurve,
 {
-	/// ECDH with `peer`, as the shared secret the key schedule takes. A
-	/// handshake curve fixes that secret at 32 bytes, which is the width of
-	/// [`EcdhSecret`].
-	fn shared_secret(&self, peer: &PublicKey<C>) -> EcdhSecret;
+	/// ECDH with `peer`, as the shared secret the key schedule takes, at the
+	/// field width of `C` that [`EcdhSecret`] holds.
+	fn shared_secret(&self, peer: &PublicKey<C>) -> EcdhSecret<C>;
 }
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -1274,7 +1290,7 @@ impl<C> HandshakeAgreement<C> for EphemeralSecret<C>
 where
 	C: HandshakeCurve,
 {
-	fn shared_secret(&self, peer: &PublicKey<C>) -> EcdhSecret {
+	fn shared_secret(&self, peer: &PublicKey<C>) -> EcdhSecret<C> {
 		EcdhSecret::from(self.diffie_hellman(peer))
 	}
 }
@@ -1284,7 +1300,7 @@ impl<C> HandshakeAgreement<C> for SecretKey<C>
 where
 	C: HandshakeCurve,
 {
-	fn shared_secret(&self, peer: &PublicKey<C>) -> EcdhSecret {
+	fn shared_secret(&self, peer: &PublicKey<C>) -> EcdhSecret<C> {
 		EcdhSecret::agree(self, peer)
 	}
 }
@@ -1438,7 +1454,7 @@ impl Salt {
 
 /// What both sides hold once negotiation is done.
 ///
-/// The fields are fixed together at the leg that seals the transcript, so a
+/// The handshake fixes every field at the leg that seals the transcript, so a
 /// handshake that holds terms holds all of them.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub struct Terms<P: HandshakeProvider> {
@@ -1654,7 +1670,6 @@ mod tests {
 	use crate::crypto::aead::{RecordDirection, RecvCipher, SendCipher};
 	use crate::crypto::hash::{Sha3_256, Sha3_512};
 	use crate::crypto::profiles::DefaultCryptoProvider;
-	use crate::crypto::secret::ToInsecure;
 	use crate::crypto::sign::ecdsa::k256::Secp256k1;
 	use crate::crypto::x509::KeyPurposes;
 	use crate::der::asn1::{OctetString, SetOfVec};
@@ -1663,18 +1678,44 @@ mod tests {
 	use crate::random::OsRng;
 	use crate::testing::{Aes256Sha3_512Provider, EnvelopeRecipient, TestCertificate, TestKey};
 	use crate::transport::handshake::tests::{
-		create_test_certificate, create_test_signed_data, fixture_transcript, negated,
+		create_test_certificate, create_test_signed_data, fixture_agreement, fixture_transcript, negated,
 	};
 
-	/// A base secret of `fill` bytes.
+	#[cfg(mux_rekey)]
+	use crate::crypto::aead::{Aes256Gcm, Aes256GcmOid};
+	#[cfg(mux_rekey)]
+	use crate::crypto::hpke::DhKemSecp256k1;
+	#[cfg(mux_rekey)]
+	use crate::crypto::kdf::HkdfSha3_256;
+	#[cfg(mux_rekey)]
+	use crate::crypto::profiles::{
+		AeadProvider, Aes256Wrap, CurveProvider, DigestProvider, KdfProvider, KeyWrapProvider, SecurityProfile,
+		SigningProvider,
+	};
+	#[cfg(mux_rekey)]
+	use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1VerifyingKey};
+	#[cfg(mux_rekey)]
+	use crate::crypto::sign::elliptic_curve::{Curve, NonZeroScalar, Scalar};
+	#[cfg(mux_rekey)]
+	use crate::testing::unhex;
+	#[cfg(mux_rekey)]
+	use core::marker::PhantomData;
+	#[cfg(mux_rekey)]
+	use p256::NistP256;
+	#[cfg(mux_rekey)]
+	use p384::NistP384;
+	#[cfg(mux_rekey)]
+	use p521::NistP521;
+
+	/// A base secret of 32 bytes, each `fill`.
 	fn base_secret(fill: u8) -> BaseSecret {
 		BaseSecret::try_from(SecretSlice::from(vec![fill; 32])).expect("32 bytes make a base secret")
 	}
 
-	/// The handshake secret of fixture inputs `shared` and `base` under
+	/// The handshake secret of the fixture inputs `shared` and `base` under
 	/// `salt`.
 	fn handshake_secret(shared: u8, base: u8, salt: &[u8]) -> HandshakeSecret {
-		let shared = EcdhSecret::from([shared; 32]);
+		let shared = fixture_agreement(shared);
 		let base = base_secret(base);
 		let secret = HandshakeSecret::hybrid::<DefaultCryptoProvider>(&shared, &base, KdfSalt::new(salt));
 		secret.expect("fixture inputs derive a handshake secret")
@@ -1821,7 +1862,7 @@ mod tests {
 		));
 	}
 
-	/// The transcript hash a fixture acknowledgement is sealed over.
+	/// The transcript hash that a fixture seals its acknowledgement over.
 	fn ack_transcript() -> TranscriptHash {
 		fixture_transcript::<Sha3_256>([0x07u8; 32])
 	}
@@ -1835,7 +1876,7 @@ mod tests {
 	#[test]
 	fn the_epoch_chain_step_matches_its_known_answer() -> Result<(), HandshakeError> {
 		let epoch = EpochSecret(ZeroizingBytes::new(vec![0x42u8; 32]));
-		let shared = EcdhSecret::from([0x11u8; 32]);
+		let shared = fixture_agreement(0x11);
 		let salt = [0x99u8; 64];
 
 		let next = epoch.chained::<DefaultCryptoProvider>(&shared, KdfSalt::new(&salt))?;
@@ -1934,7 +1975,7 @@ mod tests {
 	/// `hashlib`), so a base secret mixed into the HPKE input fails here.
 	#[test]
 	fn the_ephemeral_handshake_secret_matches_its_known_answer() -> Result<(), HandshakeError> {
-		let shared = EcdhSecret::from([0x11u8; 32]);
+		let shared = fixture_agreement(0x11);
 
 		let secret = HandshakeSecret::ephemeral::<DefaultCryptoProvider>(&shared, KdfSalt::new(&[0x99u8; 32]))?;
 		let expected = [
@@ -2465,7 +2506,7 @@ mod tests {
 		Ok(())
 	}
 
-	/// A closing opens to the plaintext it sealed, without its frame.
+	/// The open of a closing strips the frame and returns the plaintext.
 	#[tokio::test]
 	async fn a_sealed_closing_opens_to_its_plaintext() -> Result<(), HandshakeError> {
 		let secret = fixed_secret();
@@ -2546,7 +2587,7 @@ mod tests {
 	}
 
 	/// A closing whose length prefix carries its frame past the floor opens to
-	/// the plaintext it sealed.
+	/// its plaintext.
 	#[tokio::test]
 	async fn a_closing_whose_prefix_crosses_the_floor_opens() -> Result<(), HandshakeError> {
 		let secret = fixed_secret();
@@ -2740,8 +2781,240 @@ mod tests {
 		let ephemeral_public = ephemeral.public_key();
 		let fixed_public = fixed.public_key();
 
-		let from_ephemeral = ephemeral.shared_secret(&fixed_public).to_insecure();
-		let from_static = fixed.shared_secret(&ephemeral_public).to_insecure();
+		let from_ephemeral = ephemeral.shared_secret(&fixed_public).with(|x_coordinate| *x_coordinate);
+		let from_static = fixed.shared_secret(&ephemeral_public).with(|x_coordinate| *x_coordinate);
 		assert_eq!(from_ephemeral, from_static);
+	}
+
+	/// The house profile on the curve `C`: the house digest, AEAD, signature,
+	/// KDF, and key wrap.
+	#[cfg(mux_rekey)]
+	#[derive(Debug, Default, Clone, Copy)]
+	struct HouseProfileOn<C>(PhantomData<C>);
+
+	#[cfg(mux_rekey)]
+	impl<C: AssociatedOid> SecurityProfile for HouseProfileOn<C> {
+		type Digest = Sha3_256;
+		type AeadOid = Aes256GcmOid;
+		type SignatureAlg = Secp256k1Signature;
+		type Kdf = HkdfSha3_256;
+		type Curve = C;
+		type KeyWrapOid = Aes256Wrap;
+	}
+
+	/// The house provider on the curve `C`, so the schedule derives from an
+	/// agreement on `C` under the house KDF.
+	#[cfg(mux_rekey)]
+	#[derive(Debug, Default, Clone, Copy)]
+	struct HouseOn<C> {
+		profile: HouseProfileOn<C>,
+	}
+
+	#[cfg(mux_rekey)]
+	impl<C> DigestProvider for HouseOn<C> {
+		type Digest = Sha3_256;
+	}
+
+	#[cfg(mux_rekey)]
+	impl<C> AeadProvider for HouseOn<C> {
+		type AeadCipher = Aes256Gcm;
+	}
+
+	#[cfg(mux_rekey)]
+	impl<C> KeyWrapProvider for HouseOn<C> {
+		type KeyWrap = Aes256Wrap;
+	}
+
+	#[cfg(mux_rekey)]
+	impl<C> SigningProvider for HouseOn<C> {
+		type Signature = Secp256k1Signature;
+		type VerifyingKey = Secp256k1VerifyingKey;
+	}
+
+	#[cfg(mux_rekey)]
+	impl<C> KdfProvider for HouseOn<C> {
+		type Kdf = HkdfSha3_256;
+	}
+
+	#[cfg(mux_rekey)]
+	impl<C: Curve + CurveArithmetic + AssociatedOid> CurveProvider for HouseOn<C> {
+		type Curve = C;
+	}
+
+	#[cfg(mux_rekey)]
+	impl<C: Curve + CurveArithmetic + AssociatedOid + Default + Copy> CryptoProvider for HouseOn<C> {
+		type Profile = HouseProfileOn<C>;
+		type Kem = DhKemSecp256k1;
+
+		fn profile(&self) -> &Self::Profile {
+			&self.profile
+		}
+	}
+
+	/// The secret key of the small scalar `value` on the curve `C`.
+	#[cfg(mux_rekey)]
+	fn small_scalar<C: CurveArithmetic>(value: u64) -> SecretKey<C> {
+		let scalar: Option<NonZeroScalar<C>> = NonZeroScalar::new(Scalar::<C>::from(value)).into();
+		let scalar = scalar.expect("a small nonzero value is a scalar of every curve");
+		SecretKey::from(scalar)
+	}
+
+	/// The known answers of one curve, as hex: the agreement of the scalar 2
+	/// with the point of the scalar 3, which is the x-coordinate of 6G, and
+	/// what the schedule derives from it.
+	#[cfg(mux_rekey)]
+	struct AgreementVector {
+		agreement: &'static str,
+		hpke: &'static str,
+		cms: &'static str,
+		rekey: &'static str,
+	}
+
+	/// The known answers on secp256k1.
+	#[cfg(mux_rekey)]
+	const SECP256K1_AGREEMENT: AgreementVector = AgreementVector {
+		agreement: "fff97bd5755eeea420453a14355235d382f6472f8568a18b2f057a1460297556",
+		hpke: "b50f5d5d3b69e72242449f9fb0b528e51425800771e2aab5f7e83f01c9905042",
+		cms: "43e546f3ed7a3363f3b70e12deea471d49f2fbeafc7d7c360ef0b156a1c853ad",
+		rekey: "0472a313d531959ac8b9306af7f0b18bdba9a9d6a7f6ae052232d874992f6741",
+	};
+
+	/// The known answers on P-256.
+	#[cfg(mux_rekey)]
+	const P256_AGREEMENT: AgreementVector = AgreementVector {
+		agreement: "b01a172a76a4602c92d3242cb897dde3024c740debb215b4c6b0aae93c2291a9",
+		hpke: "92bd0ff885f671ed5c87c673c046c2ce076bbddd0f5fc8513d96646d1b0693bc",
+		cms: "96b6ea4f3ed40dc7434aa76c5c7c2c036eaa3f1cae47c19a1df424cee0d0781b",
+		rekey: "442869a4ed8b7566a6446039fb93b56777bb4ea39deb0844a62d512b24a4d6fd",
+	};
+
+	/// The known answers on P-384, whose agreement is 48 bytes.
+	#[cfg(mux_rekey)]
+	const P384_AGREEMENT: AgreementVector = AgreementVector {
+		agreement: "627be1acd064d2b2226fe0d26f2d15d3c33ebcbb7f0f5da51cbd41f262573830\
+			21317d7202ff30e50937f0854e35c5df",
+		hpke: "ceb7a075c0c23ff64bbb934fe387d29b7733cc20bd40d14c82a35c56c7afebe3",
+		cms: "3133dc2fdf9d210a086098ab6bb686b2123a3762dc32f658fbf23bdc4cc069d9",
+		rekey: "5449b832f46338219d8ce8eca678bb6667bf79de510f4815b19d1ad76e52854c",
+	};
+
+	/// The known answers on P-521, whose agreement is 66 bytes.
+	#[cfg(mux_rekey)]
+	const P521_AGREEMENT: AgreementVector = AgreementVector {
+		agreement: "01ee4569d6cdb59219532eff34f94480d195623d30977fd71cf3981506ade4ab\
+			01525fbcca16153f7394e0727a239531be8c2f66e95657f380ae23731bedf79206b9",
+		hpke: "088e3032a39e88ae4538d9a44ac7d9d3ab7b2985cfbbbff124b0530e6e05fb49",
+		cms: "b63acaaecd27c0909268fe7ea91061bee89d1636142ae3ccaffb7b676fdb9333",
+		rekey: "9c6fc77432c39cf194171077e90586b61ac3d636c265acaa94dc7f7a88238e24",
+	};
+
+	/// What the schedule makes of one agreement: the agreement itself, the
+	/// HPKE and the CMS handshake secrets, and the next rekey link.
+	#[cfg(mux_rekey)]
+	#[derive(Debug, PartialEq)]
+	struct Scheduled {
+		agreement: Vec<u8>,
+		hpke: Vec<u8>,
+		cms: Vec<u8>,
+		rekey: Vec<u8>,
+	}
+
+	#[cfg(mux_rekey)]
+	impl Scheduled {
+		/// What `vector` publishes.
+		fn published(vector: &AgreementVector) -> Self {
+			Self {
+				agreement: unhex(vector.agreement),
+				hpke: unhex(vector.hpke),
+				cms: unhex(vector.cms),
+				rekey: unhex(vector.rekey),
+			}
+		}
+
+		/// What the house schedule on `C` derives from the agreement of the
+		/// scalar 2 with the point of the scalar 3: the HPKE secret, the CMS
+		/// secret over the base secret `0x42` × 32, and the rekey link that
+		/// follows the epoch secret `0x42` × 32.
+		fn on<C>() -> Result<Self, HandshakeError>
+		where
+			C: HandshakeCurve + Default + Copy,
+		{
+			let local = small_scalar::<C>(2);
+			let peer = small_scalar::<C>(3).public_key();
+			let agreement = local.shared_secret(&peer);
+			let salt = KdfSalt::new(&[0x99u8; 32]);
+
+			let hpke = HandshakeSecret::ephemeral::<HouseOn<C>>(&agreement, salt)?;
+			let cms = HandshakeSecret::hybrid::<HouseOn<C>>(&agreement, &base_secret(0x42), salt)?;
+			let epoch = EpochSecret(ZeroizingBytes::new(vec![0x42u8; 32]));
+			let rekey = epoch.chained::<HouseOn<C>>(&agreement, KdfSalt::new(&[0x99u8; 64]))?;
+			Ok(Self {
+				agreement: agreement.with(|x_coordinate| x_coordinate.to_vec()),
+				hpke: hpke.as_bytes().to_vec(),
+				cms: cms.as_bytes().to_vec(),
+				rekey: rekey.0.to_vec(),
+			})
+		}
+	}
+
+	/// On secp256k1 the agreement is 32 bytes, and the schedule derives the
+	/// known answers of [`SECP256K1_AGREEMENT`].
+	///
+	/// The expected bytes come from an independent ECDH and HKDF (Python's
+	/// `cryptography`, `hmac`, and `hashlib`).
+	#[cfg(mux_rekey)]
+	#[test]
+	fn a_secp256k1_agreement_derives_its_known_answers() -> Result<(), HandshakeError> {
+		let scheduled = Scheduled::on::<Secp256k1>()?;
+		assert_eq!(scheduled, Scheduled::published(&SECP256K1_AGREEMENT));
+		Ok(())
+	}
+
+	/// On P-256 the agreement is 32 bytes, and the schedule derives the known
+	/// answers of [`P256_AGREEMENT`].
+	///
+	/// The expected bytes come from an independent ECDH and HKDF (Python's
+	/// `cryptography`, `hmac`, and `hashlib`).
+	#[cfg(mux_rekey)]
+	#[test]
+	fn a_p256_agreement_derives_its_known_answers() -> Result<(), HandshakeError> {
+		let scheduled = Scheduled::on::<NistP256>()?;
+		assert_eq!(scheduled, Scheduled::published(&P256_AGREEMENT));
+		Ok(())
+	}
+
+	/// On P-384 the agreement is the whole 48-byte x-coordinate, and each
+	/// derivation takes all of it: the CMS secret extracts from 80 bytes.
+	///
+	/// The expected bytes come from an independent ECDH and HKDF (Python's
+	/// `cryptography`, `hmac`, and `hashlib`).
+	#[cfg(mux_rekey)]
+	#[test]
+	fn a_p384_agreement_derives_its_known_answers() -> Result<(), HandshakeError> {
+		let scheduled = Scheduled::on::<NistP384>()?;
+		assert_eq!(scheduled, Scheduled::published(&P384_AGREEMENT));
+		Ok(())
+	}
+
+	/// On P-521 the agreement is the whole 66-byte x-coordinate, and each
+	/// derivation takes all of it: the CMS secret extracts from 98 bytes.
+	///
+	/// The expected bytes come from an independent ECDH and HKDF (Python's
+	/// `cryptography`, `hmac`, and `hashlib`).
+	#[cfg(mux_rekey)]
+	#[test]
+	fn a_p521_agreement_derives_its_known_answers() -> Result<(), HandshakeError> {
+		let scheduled = Scheduled::on::<NistP521>()?;
+		assert_eq!(scheduled, Scheduled::published(&P521_AGREEMENT));
+		Ok(())
+	}
+
+	/// A profile on P-521 reports the 66-byte field of its curve in
+	/// [`RunnableProfile::strength`], which the strength floor reads.
+	#[cfg(mux_rekey)]
+	#[test]
+	fn a_p521_profile_reports_the_field_width_of_its_curve() {
+		let strength = RunnableProfile::<HouseOn<NistP521>>::native().strength();
+		assert_eq!(strength.curve_field_bytes, 66);
 	}
 }

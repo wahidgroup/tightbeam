@@ -43,7 +43,8 @@ use crate::colony::cluster::{
 	Cluster, ClusterConfig, ClusterError, ClusterHeartbeat, HeartbeatConfig, HiveRegistry, HopBudget, PeerRouteInfo,
 	ServletRegistry, SharedId,
 };
-use crate::colony::common::{HeartbeatResult, TaskGroup};
+use crate::colony::protocol::HeartbeatResult;
+use crate::colony::TaskGroup;
 use crate::constants::{DEFAULT_AD_RUMOR_REFRESH_MS, DEFAULT_MAX_SERVER_CONNECTIONS};
 use crate::macros::server::{serve_connection_service, AcceptedConnection};
 use crate::policy::TransitStatus;

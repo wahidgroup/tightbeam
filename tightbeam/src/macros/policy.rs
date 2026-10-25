@@ -1,22 +1,15 @@
-/// Declare one or more policy types, each with the body that evaluates it.
+/// Declares one or more policy types, each with the body that evaluates it.
 ///
 /// A declaration names the policy trait, an optional visibility, the type
-/// name, the configuration the trait takes, and the evaluation body. The
-/// generated type is a unit struct that derives [`Default`], so a caller names
-/// it wherever a policy value is expected.
+/// name, and the evaluation body. The generated type is a unit struct that
+/// derives [`Default`], so a caller names it wherever a policy value is
+/// expected.
 ///
 /// | Declaration form | Traits the expansion implements |
 /// | --- | --- |
-/// | `GatePolicy: $vis $Name` followed by `\|frame, session\|`, `\|frame\|`, or no closure | [`crate::policy::GatePolicy`] |
-/// | `ReceptorPolicy<$msg>: $vis $Name` followed by `\|message\|` or no closure | [`crate::policy::ReceptorPolicy`] over `$msg` |
-/// | `RestartPolicy: $vis $Name ($max, $delay)` followed by `\|frame, failure, attempt\|` | [`crate::transport::policy::CoreRetryPolicy`] and [`crate::transport::policy::RestartPolicy`] |
-///
-/// # Restart configuration
-///
-/// `$max` becomes `max_attempts` and `$delay` the per-attempt step of
-/// `delay_ms`, both of which belong to [`crate::transport::policy::CoreRetryPolicy`].
-/// A `RestartPolicy` arm MAY write `($max)` alone for a zero delay, or omit
-/// the pair for one attempt and no delay.
+/// | `GatePolicy: $vis $Name` followed by `\|frame, session\|`, `\|frame\|`, or no closure | [`GatePolicy`] |
+/// | `ReceptorPolicy<$msg>: $vis $Name` followed by `\|message\|` or no closure | [`ReceptorPolicy`] over `$msg` |
+/// | `RestartPolicy: $vis $Name` followed by `\|frame, failure, attempt\|` | [`RestartPolicy`] |
 ///
 /// # Visibility
 ///
@@ -37,6 +30,10 @@
 /// let verdict = OpenGate.evaluate(None, &SessionContext::default());
 /// assert_eq!(verdict, TransitStatus::Ok);
 /// ```
+///
+/// [`GatePolicy`]: crate::policy::GatePolicy
+/// [`ReceptorPolicy`]: crate::policy::ReceptorPolicy
+/// [`RestartPolicy`]: crate::transport::policy::RestartPolicy
 #[macro_export]
 macro_rules! policy {
 	() => {};
@@ -117,43 +114,9 @@ macro_rules! policy {
 
 		$crate::policy! { $($rest)* }
 	};
-	// RestartPolicy with config: (max_attempts, delay_ms)
-	(RestartPolicy: $vis:vis $name:ident ($max:expr, $delay:expr) | $frame_arg:ident, $failure_arg:ident, $attempt_arg:ident | { $($body:tt)* } $($rest:tt)*) => {
-		#[derive(Default)]
-		$vis struct $name;
-
-		impl $crate::transport::policy::CoreRetryPolicy for $name {
-			fn max_attempts(&self) -> usize { $max }
-			fn delay_ms(&self, attempt: usize) -> u64 { ($delay as u64).saturating_mul(attempt as u64 + 1) }
-		}
-
-		impl $crate::transport::policy::RestartPolicy for $name {
-			#[allow(unused_variables)]
-			fn evaluate(
-				&self,
-				$frame_arg: Box<$crate::Frame>,
-				$failure_arg: &$crate::transport::error::TransportFailure,
-				$attempt_arg: usize,
-			) -> $crate::transport::policy::RetryAction {
-				$($body)*
-			}
-		}
-
-		$crate::policy! { $($rest)* }
-	};
-	// RestartPolicy with max_attempts only: (max_attempts)
-	(RestartPolicy: $vis:vis $name:ident ($max:expr) | $frame_arg:ident, $failure_arg:ident, $attempt_arg:ident | { $($body:tt)* } $($rest:tt)*) => {
-		$crate::policy! { RestartPolicy: $vis $name ($max, 0) | $frame_arg, $failure_arg, $attempt_arg | { $($body)* } $($rest)* }
-	};
-	// RestartPolicy default: max_attempts = 1, delay = 0
 	(RestartPolicy: $vis:vis $name:ident | $frame_arg:ident, $failure_arg:ident, $attempt_arg:ident | { $($body:tt)* } $($rest:tt)*) => {
 		#[derive(Default)]
 		$vis struct $name;
-
-		impl $crate::transport::policy::CoreRetryPolicy for $name {
-			fn max_attempts(&self) -> usize { 1 }
-			fn delay_ms(&self, _attempt: usize) -> u64 { 0 }
-		}
 
 		impl $crate::transport::policy::RestartPolicy for $name {
 			#[allow(unused_variables)]
@@ -177,7 +140,8 @@ mod tests {
 
 	use crate::der::Sequence;
 	use crate::policy::{GatePolicy, ReceptorPolicy, SessionContext, TransitStatus};
-	use crate::transport::policy::RetryAction;
+	use crate::transport::error::TransportFailure;
+	use crate::transport::policy::{RestartPolicy, RetryAction};
 	use crate::Beamable;
 
 	#[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
@@ -193,8 +157,8 @@ mod tests {
 		GatePolicy: TestGateAccept |_frame| {
 			TransitStatus::Ok
 		}
-		// Session-aware arm: identity gates key on the connection's
-		// authenticated peer context.
+		// The session-aware arm serves identity gates, which key on the
+		// connection's authenticated peer context.
 		GatePolicy: TestGateSessionAware |_frame, session| {
 			if session.peer_certificate().is_some() {
 				TransitStatus::Ok
@@ -202,9 +166,8 @@ mod tests {
 				TransitStatus::Unauthenticated
 			}
 		}
-		// Implicit-argument arms: macro hygiene hides the generated binding
-		// from the caller's body, so these arms serve input-independent
-		// policies only.
+		// Macro hygiene hides the binding of an implicit-argument arm from the
+		// caller's body, so these arms serve input-independent policies only.
 		GatePolicy: TestGateImplicitArg {
 			TransitStatus::Ok
 		}
@@ -224,14 +187,11 @@ mod tests {
 		ReceptorPolicy<DummyMessage>: TestReceptorImplicitArg {
 			TransitStatus::Ok
 		}
-		RestartPolicy: TestRestart |frame, _failure, _attempt| {
-			RetryAction::Retry { frame, delay: core::time::Duration::ZERO }
-		}
-		RestartPolicy: pub(crate) TestRestartMaxOnly (2) |frame, _failure, _attempt| {
-			RetryAction::Retry { frame, delay: core::time::Duration::ZERO }
-		}
-		RestartPolicy: TestRestartConfigured (3, 250) |frame, _failure, _attempt| {
-			RetryAction::Retry { frame, delay: core::time::Duration::ZERO }
+		RestartPolicy: pub(crate) TestRestart |frame, _failure, attempt| {
+			match attempt {
+				0 => RetryAction::Retry { frame, delay: core::time::Duration::ZERO },
+				_ => RetryAction::NoRetry,
+			}
 		}
 	}
 
@@ -290,15 +250,19 @@ mod tests {
 		Ok(())
 	}
 
+	/// The restart arm evaluates its body with the attempt the transport
+	/// passes, so the second attempt stops where the first retries.
 	#[test]
-	fn test_restart_policy_retry_configuration() {
-		use crate::transport::policy::CoreRetryPolicy;
+	fn test_restart_policy_evaluates_its_body() -> Result<(), crate::TightBeamError> {
+		let frame = compose! {
+			V0: id: b"test", message: DummyMessage { value: 42 }
+		}?;
+		let failure = TransportFailure::Unavailable;
 
-		assert_eq!(TestRestart.max_attempts(), 1);
-		assert_eq!(TestRestart.delay_ms(0), 0);
-		assert_eq!(TestRestartMaxOnly.max_attempts(), 2);
-		assert_eq!(TestRestartMaxOnly.delay_ms(1), 0);
-		assert_eq!(TestRestartConfigured.max_attempts(), 3);
-		assert_eq!(TestRestartConfigured.delay_ms(1), 500);
+		let first = TestRestart.evaluate(Box::new(frame.clone()), &failure, 0);
+		let second = TestRestart.evaluate(Box::new(frame.clone()), &failure, 1);
+		let retried = RetryAction::Retry { frame: Box::new(frame), delay: core::time::Duration::ZERO };
+		assert_eq!((first, second), (retried, RetryAction::NoRetry));
+		Ok(())
 	}
 }

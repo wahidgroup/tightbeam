@@ -17,14 +17,39 @@ use tightbeam::transport::handshake::{
 	Client, ClientConfig, Handshake, Hpke, HpkeClientSettings, HpkeServerSettings, LearnedTrust, PeerAuthentication,
 	Server, ServerConfig, SupportedProfiles,
 };
+use tightbeam::x509::Certificate;
 
 use super::{outside_identity, run_legs, OutsideProvider, CONTENT, OUTSIDE_KDF};
 
 /// A client of the HPKE flow under the outside provider.
-type OutsideClient = Handshake<Client, Hpke, OutsideProvider>;
+pub(super) type OutsideClient = Handshake<Client, Hpke, OutsideProvider>;
 
 /// A server of the HPKE flow under the outside provider.
-type OutsideServer = Handshake<Server, Hpke, OutsideProvider>;
+pub(super) type OutsideServer = Handshake<Server, Hpke, OutsideProvider>;
+
+/// A client under the outside provider that pins `server`, the certificate
+/// of its server, and presents `identity`.
+pub(super) fn outside_client(server: &Certificate, identity: Option<SigningIdentity>) -> OutsideClient {
+	let pinned = DirectTrustValidator::default().with_trust_chain([server.to_owned()]);
+	let mut settings = HpkeClientSettings::new(LearnedTrust::new(pinned));
+	settings.identity = identity;
+	let client = ClientConfig::<Hpke, OutsideProvider>::new(settings, KeyPurposes::HOUSE);
+	let client = client.expect("an outside client identity serves the client role");
+	Handshake::client(client)
+}
+
+/// A server under the outside provider that holds `server` and
+/// authenticates its client under `peer_authentication`.
+pub(super) fn outside_server(server: SigningIdentity, peer_authentication: PeerAuthentication) -> OutsideServer {
+	let native = RunnableProfile::<OutsideProvider>::native().descriptor();
+	let profiles = SupportedProfiles::from(native);
+	let server_settings = HpkeServerSettings::new();
+	let purposes = KeyPurposes::HOUSE;
+	let server_config = ServerConfig::<Hpke, OutsideProvider>::new(server_settings, server, profiles, purposes);
+	let mut server_config = server_config.expect("an outside server identity serves the server role");
+	server_config.peer_authentication = peer_authentication;
+	Handshake::server(server_config)
+}
 
 /// A client that pins the certificate of `server` and presents `identity`,
 /// beside a server that holds `server` and authenticates its client under
@@ -34,20 +59,8 @@ fn outside_pair(
 	identity: Option<SigningIdentity>,
 	peer_authentication: PeerAuthentication,
 ) -> (OutsideClient, OutsideServer) {
-	let pinned = DirectTrustValidator::default().with_trust_chain([server.certificate().to_owned()]);
-	let mut settings = HpkeClientSettings::new(LearnedTrust::new(pinned));
-	settings.identity = identity;
-	let client = ClientConfig::<Hpke, OutsideProvider>::new(settings, KeyPurposes::HOUSE);
-	let client = client.expect("an outside client identity serves the client role");
-
-	let native = RunnableProfile::<OutsideProvider>::native().descriptor();
-	let profiles = SupportedProfiles::from(native);
-	let server_settings = HpkeServerSettings::new();
-	let purposes = KeyPurposes::HOUSE;
-	let server_config = ServerConfig::<Hpke, OutsideProvider>::new(server_settings, server, profiles, purposes);
-	let mut server_config = server_config.expect("an outside server identity serves the server role");
-	server_config.peer_authentication = peer_authentication;
-	(Handshake::client(client), Handshake::server(server_config))
+	let client = outside_client(server.certificate(), identity);
+	(client, outside_server(server, peer_authentication))
 }
 
 /// The HPKE flow runs under a provider with no HPKE suite, and the client's

@@ -1,41 +1,8 @@
-//! The wire envelope of a handshake message, as the handshake drivers send it.
-//!
-//! Both handshake protocols carry their messages in the CMS containers of
-//! [`TransportEnvelope`]. HPKE sends its hello as a `ContentInfo` of type
-//! `id-data` and its reply as a `SignedData`, and the CMS handshake opens with
-//! an `AuthEnvelopedData`. Both close with an `AuthEnvelopedData`.
-
-use crate::transport::envelopes::TransportEnvelope;
-use crate::transport::error::TransportError;
-use crate::transport::handshake::HandshakeMessage;
+//! The fixed-width views of a DER `OctetString` that a handshake message
+//! carries on the wire, such as a nonce or a compressed curve point.
 
 #[cfg(any(feature = "transport-hpke", mux_rekey))]
 pub use octets::HandshakeOctets;
-
-impl From<HandshakeMessage> for TransportEnvelope {
-	fn from(message: HandshakeMessage) -> Self {
-		match message {
-			HandshakeMessage::SignedData(signed) => Self::SignedData(signed),
-			HandshakeMessage::AuthEnvelopedData(enveloped) => Self::AuthEnvelopedData(enveloped),
-			HandshakeMessage::Data(data) => Self::Data(data),
-		}
-	}
-}
-
-impl TryFrom<TransportEnvelope> for HandshakeMessage {
-	type Error = TransportError;
-
-	/// Handshake messages travel in one of the three handshake containers, so
-	/// this conversion refuses any other envelope on the handshake path.
-	fn try_from(envelope: TransportEnvelope) -> Result<Self, Self::Error> {
-		match envelope {
-			TransportEnvelope::SignedData(signed) => Ok(Self::SignedData(signed)),
-			TransportEnvelope::AuthEnvelopedData(enveloped) => Ok(Self::AuthEnvelopedData(enveloped)),
-			TransportEnvelope::Data(data) => Ok(Self::Data(data)),
-			_ => Err(TransportError::InvalidMessage),
-		}
-	}
-}
 
 /// The fixed-width views of a DER `OctetString` that the HPKE handshake and
 /// the mux rekey read.

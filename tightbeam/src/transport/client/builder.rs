@@ -37,8 +37,7 @@ use crate::transport::ConnectionBuilder;
 use crate::utils::time::SystemClock;
 
 use crate::transport::policy::{
-	CollectorGateConfig, CoreRetryPolicy, EmitterGateConfig, PolicyConfig, RestartConfig, RestartPolicy, RetryAction,
-	TimeoutConfig,
+	CollectorGateConfig, EmitterGateConfig, PolicyConfig, RestartConfig, RestartPolicy, RetryAction, TimeoutConfig,
 };
 
 #[derive(Default)]
@@ -54,16 +53,6 @@ pub struct DynRestart(
 	/// The policy every restart decision delegates to.
 	pub Box<dyn RestartPolicy + Send + Sync>,
 );
-
-impl CoreRetryPolicy for DynRestart {
-	fn max_attempts(&self) -> usize {
-		self.0.max_attempts()
-	}
-
-	fn delay_ms(&self, attempt: usize) -> u64 {
-		self.0.delay_ms(attempt)
-	}
-}
 
 impl RestartPolicy for DynRestart {
 	fn evaluate(&self, frame: Box<Frame>, failure: &TransportFailure, attempt: usize) -> RetryAction {
@@ -137,7 +126,7 @@ impl ClientPolicies {
 
 pub struct ClientBuilder<P: Protocol> {
 	policies: ClientPolicies,
-	/// Provisioning this builder accumulates, handed to the transport whole.
+	/// The provisioning this builder gathers and hands to the transport whole.
 	encryption: EncryptionConfig<P::CryptoProvider>,
 	/// The negotiation input this builder accumulates, which the transport
 	/// starts with.
@@ -200,7 +189,7 @@ impl<P: Protocol> ClientBuilder<P> {
 		self
 	}
 
-	/// Provision the trust in the CMS server, built once over its pinned
+	/// Provisions the trust in the CMS server, built once over its pinned
 	/// key-agreement certificate: the opening seals to it, and the trust's
 	/// store admits the signing certificate the reply carries.
 	#[cfg(feature = "transport-cms")]
@@ -209,7 +198,7 @@ impl<P: Protocol> ClientBuilder<P> {
 		self
 	}
 
-	/// Set the key purpose of each role: the purpose the server's
+	/// Sets the key purpose of each role: the purpose the server's
 	/// certificates carry, and the purpose the client identity carries. The
 	/// default is [`KeyPurposes::HOUSE`].
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -218,7 +207,7 @@ impl<P: Protocol> ClientBuilder<P> {
 		self
 	}
 
-	/// Set the server policy, which every validator of `validators` runs on
+	/// Sets the server policy, which every validator of `validators` runs on
 	/// the identity certificate of the server under either flow, as
 	/// [`ClientConfig::with_server_policy`] states. An empty set sets no
 	/// policy.
@@ -249,19 +238,19 @@ impl<P: Protocol> ClientBuilder<P> {
 		self
 	}
 
-	/// Select the handshake protocol used when encryption is enabled.
+	/// Selects the handshake protocol that runs when encryption is enabled.
 	pub fn with_handshake_protocol(mut self, kind: HandshakeProtocolKind) -> Self {
 		self.negotiation.select_handshake(kind);
 		self
 	}
 
-	/// Run this client without authenticating the server.
+	/// Runs this client with no authentication of the server.
 	///
 	/// A client with no trust store verifies nobody, so [`Self::connect`] and
 	/// [`Self::adopt`] refuse it until this names that as the intent. Frames
-	/// then travel in the clear and any peer answering the address is
-	/// accepted, which suits a loopback fixture or a link a lower layer
-	/// already secures.
+	/// then travel in the clear, and the client accepts any peer that answers
+	/// the address, which suits a loopback fixture or a link that a lower
+	/// layer already secures.
 	pub fn allow_cleartext(mut self) -> Self {
 		self.encryption.allow_cleartext = true;
 		self
@@ -292,7 +281,7 @@ where
 	P::Transport: MessageEmitter + MessageCollector + PolicyConfig,
 	P::Address: Send,
 {
-	/// Connect and configure the client.
+	/// Connects and configures the client.
 	///
 	/// The dialer rule answers before the connection opens, so a refused
 	/// client never reaches the address.
@@ -314,7 +303,7 @@ where
 		Ok(GenericClient::from_transport(configured))
 	}
 
-	/// Configure a client over a stream the caller already opened.
+	/// Configures a client over a stream that the caller already opened.
 	///
 	/// The stream answers the same dialer rule as [`Self::connect`], so a
 	/// client adopted this way is as authenticated as one this builder dialed.
@@ -333,6 +322,9 @@ where
 		Ok(GenericClient::from_transport(configured))
 	}
 }
+
+#[cfg(feature = "std")]
+impl<P: Protocol> super::sealed::Sealed for ClientBuilder<P> {}
 
 #[cfg(feature = "std")]
 impl<P: Protocol + Send> ConnectionBuilder<P> for ClientBuilder<P>
@@ -421,8 +413,8 @@ mod tests {
 		Ok(())
 	}
 
-	/// Naming cleartext is what lets the same client through, so it reaches
-	/// the address and fails there instead.
+	/// A client that names cleartext passes the same rule, so it reaches the
+	/// address and fails there instead.
 	#[tokio::test]
 	async fn naming_cleartext_admits_the_same_client() {
 		let admitted = ClientBuilder::<TokioListener>::builder()

@@ -4,17 +4,17 @@
 //! - **Handshake protocol.** Domain separation labels for cryptographic
 //!   operations. They are the canonical constants for every handshake
 //!   operation.
-//! - **Cryptographic.** HKDF, key, and salt sizes, elliptic curve key sizes,
-//!   and the AES-GCM sizes and rekey limits.
+//! - **Cryptographic.** HKDF, key, and salt sizes, and the AES-GCM sizes and rekey limits.
 //! - **Accept loops.** The connection cap and retry delay of the servlet, hive, gateway, and `server!` loops.
 //! - **Testing and verification.** Generator constants and seeds for
 //!   deterministic exploration and fault injection.
 //! - **Configuration.** Backpressure, mux, envelope, timeout, colony, gossip, and peer discovery bounds.
 
 /// KDF info string for the handshake secret (HKDF), which both protocols
-/// extract under the protocol salt: the CMS flow from the ephemeral-ephemeral
-/// ECDH output followed by the client's base secret, and the HPKE flow from
-/// that output alone.
+/// extract under the protocol salt:
+///
+/// - The CMS flow extracts it from the ephemeral-ephemeral ECDH output followed by the client's base secret.
+/// - The HPKE flow extracts it from that output alone.
 pub const TIGHTBEAM_SESSION_KDF_INFO: &[u8] = b"tb/session/kdf/v1";
 
 /// KDF info string for the key that seals the receipt acknowledgement (HKDF).
@@ -206,14 +206,6 @@ pub const MIN_KEY_SIZE: usize = 16;
 
 /// Minimum size in bytes of a non-empty blinding salt of a message commitment.
 pub const MIN_SALT_SIZE: usize = 16;
-
-/// Uncompressed secp256k1 or P-256 public key size in SEC 1 format.
-///
-/// The encoding is a `0x04` prefix byte plus 64 bytes.
-pub const EC_PUBKEY_UNCOMPRESSED_SIZE: usize = 65;
-
-/// ECDH shared secret size for 256-bit curves (secp256k1, P-256, X25519).
-pub const ECDH_SHARED_SECRET_SIZE: usize = 32;
 
 /// AES-GCM nonce size (96 bits).
 ///
@@ -897,7 +889,7 @@ pub const MAX_GOSSIP_RATE_SIGNERS: usize = 4096;
 
 /// Ceiling on unverified candidates held in the peer discovery table.
 ///
-/// Peer-exchange hints are attacker-suppliable, so discovery bounds the new
+/// Peer-exchange hints are attacker-suppliable, so discovery bounds the `new`
 /// table before it dials any hint.
 ///
 /// # Sources

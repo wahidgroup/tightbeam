@@ -1,4 +1,4 @@
-//! Refusal replies for gossip and peer-ad control frames.
+//! The refusal replies to gossip and peer-ad control frames.
 //!
 //! A refusal answers one inbound frame and records it against the same
 //! collector that saw the frame arrive. [`Refusal`] holds that pair, so
@@ -6,7 +6,7 @@
 
 use crate::colony::cluster::runtime::freshness::GatewayReplayGuard;
 use crate::colony::cluster::runtime::LoopFault;
-use crate::colony::common::{GossipResponse, GossipWant, PeerAdvertisementResponse, ReplyForm};
+use crate::colony::protocol::{GossipResponse, GossipWant, PeerAdvertisementResponse, ReplyForm};
 use crate::crypto::sign::VerifiedSignature;
 use crate::instrumentation::events::{CLUSTER_GOSSIP_REFUSED, CLUSTER_PEER_ADVERTISE_REFUSED};
 use crate::policy::TransitStatus;
@@ -68,7 +68,7 @@ impl<'f> Refusal<'f> {
 	/// Answers a gossip rumor whose handling hit a fault of this gateway's.
 	///
 	/// A poisoned registry, table, or journal is this gateway's fault, so it
-	/// answers [`TransitStatus::Unavailable`] rather than a verdict on the
+	/// answers [`TransitStatus::Unavailable`] in place of a verdict on the
 	/// rumor. A runtime fault, such as the trace's own refusal, propagates
 	/// unchanged.
 	pub(crate) fn gossip_fault(self, fault: LoopFault) -> Result<Option<Frame>, TightBeamError> {

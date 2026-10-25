@@ -1,9 +1,10 @@
-//! Tests of the sync `server!` accept loop, on `std` without `tokio`.
+//! These tests run the sync `server!` accept loop on `std`, without `tokio`.
 
 use std::net::{SocketAddr, TcpListener as NetTcpListener, TcpStream as NetTcpStream};
 use std::thread;
 use std::time::Duration;
 
+use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::instrumentation::events;
 use tightbeam::runtime::rt;
 use tightbeam::server;
@@ -19,7 +20,7 @@ use tightbeam::Frame;
 /// Emits a frame labelled `label` over `stream` and returns it with the
 /// server's reply.
 fn echo(stream: NetTcpStream, label: &str) -> (Frame, Option<Frame>) {
-	let mut client = TcpTransport::new(stream, EndpointConfig::cleartext());
+	let mut client = TcpTransport::new(stream, EndpointConfig::<DefaultCryptoProvider>::cleartext());
 
 	let frame = TestFrame::v0(Some(label), None);
 	let echoed = rt::block_on(client.emit(frame.to_owned(), None)).expect("the server answers the frame");
@@ -43,7 +44,7 @@ fn sync_server_echoes_over_std_tcp() -> TransportResult<()> {
 	let addr = listener.local_addr()?;
 
 	thread::spawn(move || {
-		let server = TcpListener::from_listener_cleartext(listener);
+		let server = TcpListener::<_, DefaultCryptoProvider>::from_listener_cleartext(listener);
 		server! {
 			TcpListener: server,
 			handle: |frame: Frame| async move { Ok(Some(frame)) }
@@ -65,7 +66,7 @@ fn sync_server_audits_gate_verdicts() -> TransportResult<()> {
 	let audit = trace.share();
 
 	thread::spawn(move || {
-		let server = TcpListener::from_listener_cleartext(listener);
+		let server = TcpListener::<_, DefaultCryptoProvider>::from_listener_cleartext(listener);
 		server! {
 			TcpListener: server,
 			policies: { with_trace: [ audit.share() ] },
@@ -169,8 +170,8 @@ fn sync_server_protocol_bind_applies_policies() -> TransportResult<()> {
 	Ok(())
 }
 
-/// The handler events that one call to a blocking `server!` records on the
-/// trail of its connection, in order, under a trace whose config sets
+/// Returns the handler events that one call to a blocking `server!` records
+/// on the trail of its connection, in order, under a trace whose config sets
 /// `enable_internal_detail` to `detail`.
 fn blocking_handler_span(detail: bool) -> TransportResult<Vec<Urn<'static>>> {
 	let listener = NetTcpListener::bind("127.0.0.1:0")?;
@@ -179,7 +180,7 @@ fn blocking_handler_span(detail: bool) -> TransportResult<Vec<Urn<'static>>> {
 	let audit = trace.share();
 
 	thread::spawn(move || {
-		let server = TcpListener::from_listener_cleartext(listener);
+		let server = TcpListener::<_, DefaultCryptoProvider>::from_listener_cleartext(listener);
 		server! {
 			TcpListener: server,
 			policies: { with_trace: [ audit.share() ] },

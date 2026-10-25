@@ -8,7 +8,7 @@
 //!
 //! An [`HpkeSuite`] names the three algorithms of [RFC 9180 §7][rfc9180-7]:
 //!
-//! - The KEM is a DHKEM on a curve with a 32-byte field, with a KDF of its own.
+//! - The KEM is a DHKEM on a [`DhKemCurve`] of any field width, with a KDF of its own.
 //! - The KDF runs the key schedule.
 //! - The AEAD seals the message.
 //!
@@ -82,13 +82,14 @@ use alloc::vec::Vec;
 #[cfg(all(feature = "std", feature = "x509", feature = "signature", feature = "ecdh"))]
 use std::sync::Arc;
 
-use crate::constants::EC_PUBKEY_UNCOMPRESSED_SIZE;
 use crate::crypto::aead::{Aead, AeadCore, Aes128Gcm, Aes256Gcm, KeyInit, Nonce, Payload};
-use crate::crypto::common::typenum::{Unsigned, U32};
+use crate::crypto::common::typenum::Unsigned;
 use crate::crypto::common::KeySizeUser;
 use crate::crypto::hkdf::InvalidLength;
-use crate::crypto::k256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
-use crate::crypto::k256::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey, SecretKey};
+use crate::crypto::k256::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint, UncompressedPointSize};
+use crate::crypto::k256::elliptic_curve::{
+	Curve, CurveArithmetic, Error as EllipticCurveError, PrimeCurve, PublicKey, SecretKey,
+};
 use crate::crypto::k256::sha2::Sha256;
 use crate::crypto::k256::Secp256k1;
 use crate::crypto::kdf::{EcdhSecret, KdfError, ZeroizingHkdf};
@@ -235,6 +236,97 @@ impl HpkeAead for Aes256Gcm {
 	const AEAD_ID: u16 = AEAD_AES_256_GCM;
 }
 
+/// A curve a DHKEM runs on ([RFC 9180 §4.1][rfc9180-4.1]): a curve of prime
+/// order whose points encode in SEC 1 form. Every curve that meets the bounds
+/// is a DHKEM curve.
+///
+/// - `Ndh`, the width of a DH output, is the width of the field ([RFC 9180 §4.1][rfc9180-4.1]).
+/// - `Nenc`, the width of an encapsulated key, is the width of an
+///   uncompressed point ([RFC 9180 §7.1][rfc9180-7.1]).
+/// - The order is prime, so the agreement of a nonzero scalar and a point
+///   other than the identity is a point other than the identity, as
+///   [RFC 9180 §7.1.4][rfc9180-7.1.4] requires of a DH output.
+///
+/// | Curve | `Ndh` | `Nenc` |
+/// | --- | --- | --- |
+/// | secp256k1, P-256 | 32 | 65 |
+/// | P-384 | 48 | 97 |
+/// | P-521 | 66 | 133 |
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam::crypto::hpke::DhKemCurve;
+///
+/// fn runs_a_dhkem<C: DhKemCurve>() {}
+///
+/// runs_a_dhkem::<tightbeam::crypto::k256::Secp256k1>();
+/// runs_a_dhkem::<p256::NistP256>();
+/// runs_a_dhkem::<p384::NistP384>();
+/// runs_a_dhkem::<p521::NistP521>();
+/// ```
+///
+/// [rfc9180-4.1]: https://datatracker.ietf.org/doc/html/rfc9180#section-4.1
+/// [rfc9180-7.1]: https://datatracker.ietf.org/doc/html/rfc9180#section-7.1
+/// [rfc9180-7.1.4]: https://datatracker.ietf.org/doc/html/rfc9180#section-7.1.4
+pub trait DhKemCurve:
+	PrimeCurve
+	+ Curve<FieldBytesSize: ModulusSize>
+	+ CurveArithmetic<AffinePoint: FromEncodedPoint<Self> + ToEncodedPoint<Self>>
+{
+	/// Parse `enc`, an encapsulated key, which is the uncompressed SEC 1 form
+	/// of a point on this curve, `Nenc` bytes (`DeserializePublicKey`,
+	/// [RFC 9180 §7.1.1][rfc9180-7.1.1]).
+	///
+	/// The point is in the range of the field, on the curve, and other than
+	/// the identity ([RFC 9180 §7.1.4][rfc9180-7.1.4]), so every DH that
+	/// follows runs on a validated key.
+	///
+	/// # Errors
+	///
+	/// - [`Error`](EllipticCurveError) -- `enc` is another form or width, or no point on this curve.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use p384::elliptic_curve::sec1::ToEncodedPoint;
+	/// use p384::{NistP384, SecretKey};
+	/// use tightbeam::crypto::hpke::DhKemCurve;
+	/// use tightbeam::random::OsRng;
+	///
+	/// let point = SecretKey::random(&mut OsRng).public_key();
+	///
+	/// // `enc` is the 97 octets of an uncompressed P-384 point.
+	/// let enc = point.to_encoded_point(false);
+	/// assert_eq!(NistP384::encapsulated_key(enc.as_bytes())?, point);
+	///
+	/// // The compressed form of the same point is another encoding.
+	/// let compressed = point.to_encoded_point(true);
+	/// assert!(NistP384::encapsulated_key(compressed.as_bytes()).is_err());
+	/// # Ok::<(), p384::elliptic_curve::Error>(())
+	/// ```
+	///
+	/// [rfc9180-7.1.1]: https://datatracker.ietf.org/doc/html/rfc9180#section-7.1.1
+	/// [rfc9180-7.1.4]: https://datatracker.ietf.org/doc/html/rfc9180#section-7.1.4
+	fn encapsulated_key(enc: impl AsRef<[u8]>) -> core::result::Result<PublicKey<Self>, EllipticCurveError> {
+		let enc = enc.as_ref();
+		let enc_size = UncompressedPointSize::<Self>::USIZE;
+		let uncompressed = enc.len() == enc_size && enc.first() == Some(&0x04);
+		if !uncompressed {
+			return Err(EllipticCurveError);
+		}
+
+		PublicKey::from_sec1_bytes(enc)
+	}
+}
+
+impl<C> DhKemCurve for C where
+	C: PrimeCurve
+		+ Curve<FieldBytesSize: ModulusSize>
+		+ CurveArithmetic<AffinePoint: FromEncodedPoint<C> + ToEncodedPoint<C>>
+{
+}
+
 /// An HPKE ciphersuite: a DHKEM, a KDF, and an AEAD
 /// ([RFC 9180 §7][rfc9180-7]).
 ///
@@ -244,10 +336,8 @@ impl HpkeAead for Aes256Gcm {
 ///
 /// [rfc9180-7]: https://datatracker.ietf.org/doc/html/rfc9180#section-7
 pub trait HpkeSuite {
-	/// The curve of the DHKEM. Its field is 32 bytes wide, so a DH output is
-	/// 32 bytes and an encapsulated key is 65.
-	type Curve: Curve<FieldBytesSize = U32>
-		+ CurveArithmetic<AffinePoint: FromEncodedPoint<Self::Curve> + ToEncodedPoint<Self::Curve>>;
+	/// The curve of the DHKEM, which fixes `Ndh` and `Nenc`.
+	type Curve: DhKemCurve;
 
 	/// The KDF of the DHKEM, which derives the KEM shared secret. `Nsecret`
 	/// is its `Nh`.
@@ -272,8 +362,7 @@ pub struct DhKemSuite<C, K, A, const KEM_ID: u16>(PhantomData<(C, K, A)>);
 
 impl<C, K, A, const KEM_ID: u16> HpkeSuite for DhKemSuite<C, K, A, KEM_ID>
 where
-	C: Curve<FieldBytesSize = U32> + CurveArithmetic,
-	AffinePoint<C>: FromEncodedPoint<C> + ToEncodedPoint<C>,
+	C: DhKemCurve,
 	K: HpkeKdf,
 	A: HpkeAead,
 {
@@ -447,7 +536,7 @@ impl<S: HpkeSuite> KeySchedule<S> {
 ///
 /// The encoding is `enc || ct`:
 ///
-/// - `enc` is the sender's ephemeral public key in uncompressed SEC1 form, 65 bytes.
+/// - `enc` is the sender's ephemeral public key in uncompressed SEC1 form, `Nenc` bytes on the curve of `S`.
 /// - `ct` ends with the AEAD tag.
 ///
 /// [`Self::from_bytes`] admits a point on the curve and a ciphertext that
@@ -463,22 +552,44 @@ pub struct HpkeMessage<S: HpkeSuite> {
 }
 
 impl<S: HpkeSuite> HpkeMessage<S> {
-	/// Parse a message from its encoding, `enc || ct`.
+	/// Parse a message from its encoding, `enc || ct`, where `enc` takes the
+	/// `Nenc` bytes of the curve of `S` ([`DhKemCurve`]).
 	///
 	/// # Errors
 	///
 	/// - [`HpkeError::InvalidCiphertext`] -- `bytes` is shorter than an encapsulated key and an AEAD tag.
-	/// - [`HpkeError::InvalidPublicKey`] -- `enc` fails SEC1 decoding, or it is off the curve.
+	/// - [`HpkeError::InvalidPublicKey`] -- `enc` is no uncompressed point on the curve of `S`.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use p256::{NistP256, SecretKey};
+	/// use tightbeam::crypto::aead::Aes128Gcm;
+	/// use tightbeam::crypto::hpke::{DhKemSuite, HkdfSha256, HpkeMessage, HpkePublicKeyOps};
+	/// use tightbeam::random::OsRng;
+	///
+	/// // RFC 9180 A.3: DHKEM(P-256, HKDF-SHA256), HKDF-SHA256, AES-128-GCM.
+	/// type P256Suite = DhKemSuite<NistP256, HkdfSha256, Aes128Gcm, 0x0010>;
+	///
+	/// let recipient = SecretKey::random(&mut OsRng).public_key();
+	/// let wire = recipient.seal::<P256Suite>(b"info", b"aad", b"plaintext", None)?.to_bytes();
+	///
+	/// // `enc` is the 65 octets of an uncompressed P-256 point.
+	/// let parsed = HpkeMessage::<P256Suite>::from_bytes(&wire)?;
+	/// assert_eq!(parsed.ciphertext(), &wire[65..]);
+	/// # Ok::<(), tightbeam::crypto::hpke::HpkeError>(())
+	/// ```
 	pub fn from_bytes(bytes: impl AsRef<[u8]>) -> Result<Self> {
 		let bytes = bytes.as_ref();
 		let tag_size = <S::Aead as AeadCore>::TagSize::USIZE;
-		let split = bytes.split_first_chunk::<EC_PUBKEY_UNCOMPRESSED_SIZE>();
+		let enc_size = UncompressedPointSize::<S::Curve>::USIZE;
+		let split = bytes.split_at_checked(enc_size);
 		let (enc, ciphertext) = split.ok_or(HpkeError::InvalidCiphertext)?;
 		if ciphertext.len() < tag_size {
 			return Err(HpkeError::InvalidCiphertext);
 		}
 
-		let parsed = PublicKey::<S::Curve>::from_sec1_bytes(enc);
+		let parsed = S::Curve::encapsulated_key(enc);
 		let encapsulated_key = parsed.map_err(HpkeError::InvalidPublicKey)?;
 		Ok(Self { encapsulated_key, ciphertext: ciphertext.to_vec() })
 	}
@@ -506,9 +617,9 @@ impl<S: HpkeSuite> HpkeMessage<S> {
 	/// Seal `plaintext` to `recipient` under `ephemeral` (`Encap`, then
 	/// `Seal` at sequence number zero).
 	///
-	/// The ephemeral is taken by value and dropped here, so it serves this one
-	/// message ([RFC 9180 §9.2.3][rfc9180-9.2.3]). The nonce of a single-shot
-	/// context is fixed by the key schedule, so a second message under one
+	/// This function takes the ephemeral by value and drops it, so it serves
+	/// this one message ([RFC 9180 §9.2.3][rfc9180-9.2.3]). The key schedule
+	/// fixes the nonce of a single-shot context, so a second message under one
 	/// ephemeral would repeat it.
 	///
 	/// [rfc9180-9.2.3]: https://datatracker.ietf.org/doc/html/rfc9180#section-9.2.3
@@ -521,7 +632,7 @@ impl<S: HpkeSuite> HpkeMessage<S> {
 	) -> Result<Self> {
 		let encapsulated_key = ephemeral.public_key();
 		let dh = EcdhSecret::agree(&ephemeral, recipient);
-		let shared_secret = dh.kem_shared_secret::<S::Curve, S::KemKdf>(S::KEM_ID, &encapsulated_key, recipient)?;
+		let shared_secret = dh.kem_shared_secret::<S::KemKdf>(S::KEM_ID, &encapsulated_key, recipient)?;
 
 		let schedule = KeySchedule::<S>::derive(&shared_secret, info)?;
 		let ciphertext = schedule.seal(aad, plaintext)?;
@@ -529,7 +640,7 @@ impl<S: HpkeSuite> HpkeMessage<S> {
 	}
 }
 
-/// HPKE sealing to a recipient public key.
+/// A recipient public key that HPKE seals to.
 pub trait HpkePublicKeyOps {
 	/// The curve of this key.
 	type Curve;
@@ -563,8 +674,7 @@ pub trait HpkePublicKeyOps {
 
 impl<C> HpkePublicKeyOps for PublicKey<C>
 where
-	C: Curve<FieldBytesSize = U32> + CurveArithmetic,
-	AffinePoint<C>: FromEncodedPoint<C> + ToEncodedPoint<C>,
+	C: DhKemCurve,
 {
 	type Curve = C;
 
@@ -585,7 +695,7 @@ where
 	}
 }
 
-/// HPKE opening with the recipient secret key.
+/// A recipient secret key that opens an HPKE message.
 pub trait HpkeSecretKeyOps {
 	/// The curve of this key.
 	type Curve;
@@ -612,8 +722,7 @@ pub trait HpkeSecretKeyOps {
 
 impl<C> HpkeSecretKeyOps for SecretKey<C>
 where
-	C: Curve<FieldBytesSize = U32> + CurveArithmetic,
-	AffinePoint<C>: FromEncodedPoint<C> + ToEncodedPoint<C>,
+	C: DhKemCurve,
 {
 	type Curve = C;
 
@@ -631,26 +740,24 @@ where
 	}
 }
 
-impl EcdhSecret {
+impl<C> EcdhSecret<C>
+where
+	C: DhKemCurve,
+{
 	/// The KEM shared secret of this DH output, which is
 	/// `ExtractAndExpand(dh, kem_context)` with `kem_context = enc || pkRm`
 	/// ([RFC 9180 §4.1][rfc9180-4.1]).
 	///
 	/// The context binds the encapsulated key and the recipient key, so a
-	/// message opens under the one recipient key it was sealed to.
+	/// message opens under the one recipient key the sender sealed it to.
 	///
 	/// [rfc9180-4.1]: https://datatracker.ietf.org/doc/html/rfc9180#section-4.1
-	fn kem_shared_secret<C, K>(
+	fn kem_shared_secret<K: HpkeKdf>(
 		self,
 		kem_id: u16,
 		encapsulated_key: &PublicKey<C>,
 		recipient: &PublicKey<C>,
-	) -> Result<ZeroizingBytes>
-	where
-		C: Curve<FieldBytesSize = U32> + CurveArithmetic,
-		AffinePoint<C>: FromEncodedPoint<C> + ToEncodedPoint<C>,
-		K: HpkeKdf,
-	{
+	) -> Result<ZeroizingBytes> {
 		let labeled = Labeled::<K>::kem(kem_id);
 		let enc = encapsulated_key.to_encoded_point(false);
 		let recipient = recipient.to_encoded_point(false);
@@ -671,24 +778,45 @@ impl EcdhSecret {
 	///    for example from `DiffieHellman::agree` of a key backend.
 	/// 3. Open the message here.
 	///
-	/// - `recipient`: the public key the message was sealed to, which the KEM context binds.
+	/// - `recipient`: the public key the sender sealed the message to, which the KEM context binds.
 	///
 	/// # Errors
 	///
 	/// - [`HpkeError::Kdf`] -- a KDF refused a derivation, or the AEAD refused the derived key.
 	/// - [`HpkeError::DecryptionFailed`] -- the AEAD refused the ciphertext.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::crypto::hpke::{HpkePublicKeyOps, HpkeSecp256k1Sha256Aes256Gcm};
+	/// use tightbeam::crypto::k256::SecretKey;
+	/// use tightbeam::crypto::kdf::EcdhSecret;
+	/// use tightbeam::crypto::secret::ToInsecure;
+	/// use tightbeam::random::OsRng;
+	///
+	/// type Suite = HpkeSecp256k1Sha256Aes256Gcm;
+	///
+	/// let recipient = SecretKey::random(&mut OsRng);
+	/// let sealed = recipient.public_key().seal::<Suite>(b"info", b"", b"plaintext", None)?;
+	///
+	/// // The holder of the recipient key runs this agreement.
+	/// let dh = EcdhSecret::agree(&recipient, sealed.encapsulated_key());
+	/// let opened = dh.open(&recipient.public_key(), &sealed, b"info", b"")?;
+	/// assert_eq!(opened.to_insecure().as_slice(), b"plaintext");
+	/// # Ok::<(), tightbeam::crypto::hpke::HpkeError>(())
+	/// ```
 	pub fn open<S>(
 		self,
-		recipient: &PublicKey<S::Curve>,
+		recipient: &PublicKey<C>,
 		message: &HpkeMessage<S>,
 		info: impl AsRef<[u8]>,
 		aad: impl AsRef<[u8]>,
 	) -> Result<SecretSlice<u8>>
 	where
-		S: HpkeSuite,
+		S: HpkeSuite<Curve = C>,
 	{
 		let encapsulated_key = message.encapsulated_key();
-		let shared_secret = self.kem_shared_secret::<S::Curve, S::KemKdf>(S::KEM_ID, encapsulated_key, recipient)?;
+		let shared_secret = self.kem_shared_secret::<S::KemKdf>(S::KEM_ID, encapsulated_key, recipient)?;
 		let schedule = KeySchedule::<S>::derive(&shared_secret, info.as_ref())?;
 		schedule.open(aad.as_ref(), message.ciphertext())
 	}
@@ -711,8 +839,7 @@ pub type DhKemSecp256k1 = DhKem<Secp256k1, HkdfSha256, KEM_DHKEM_SECP256K1_HKDF_
 
 impl<C, K, const KEM_ID: u16> DhKem<C, K, KEM_ID>
 where
-	C: Curve<FieldBytesSize = U32> + CurveArithmetic,
-	AffinePoint<C>: FromEncodedPoint<C> + ToEncodedPoint<C>,
+	C: DhKemCurve,
 	K: HpkeKdf,
 {
 	/// The identifier of the DHKEM in the HPKE KEM registry, which its
@@ -730,6 +857,25 @@ where
 	/// # Errors
 	///
 	/// - [`HpkeError::Kdf`] -- the KDF refused a derivation.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use p256::{NistP256, SecretKey};
+	/// use tightbeam::crypto::hpke::{DhKem, HkdfSha256};
+	/// use tightbeam::random::OsRng;
+	///
+	/// // DHKEM(P-256, HKDF-SHA256), the KEM `0x0010` of RFC 9180 §7.1.
+	/// type DhKemP256 = DhKem<NistP256, HkdfSha256, 0x0010>;
+	///
+	/// let recipient = SecretKey::random(&mut OsRng).public_key();
+	/// let (shared_secret, encapsulated_key) = DhKemP256::encap(&recipient, None)?;
+	///
+	/// // `Nsecret` is the `Nh` of HKDF-SHA256, and `enc` is a fresh ephemeral.
+	/// assert_eq!(shared_secret.len(), 32);
+	/// assert_ne!(encapsulated_key, recipient);
+	/// # Ok::<(), tightbeam::crypto::hpke::HpkeError>(())
+	/// ```
 	pub fn encap(
 		recipient: &PublicKey<C>,
 		rng: Option<&mut dyn CryptoRngCore>,
@@ -744,21 +890,45 @@ where
 	fn encap_with(ephemeral: SecretKey<C>, recipient: &PublicKey<C>) -> Result<(ZeroizingBytes, PublicKey<C>)> {
 		let encapsulated_key = ephemeral.public_key();
 		let dh = EcdhSecret::agree(&ephemeral, recipient);
-		let shared_secret = dh.kem_shared_secret::<C, K>(KEM_ID, &encapsulated_key, recipient)?;
+		let shared_secret = dh.kem_shared_secret::<K>(KEM_ID, &encapsulated_key, recipient)?;
 		Ok((shared_secret, encapsulated_key))
 	}
 
 	/// `Decap(enc, skR)` from `dh`, the `DH(skR, pkE)` output that the holder
 	/// of the recipient key computed, so the key can stay behind a provider.
 	///
-	/// `recipient` is the public key `encapsulated_key` was sealed to, which
-	/// the KEM context binds.
+	/// `recipient` is the public key that `encapsulated_key` encapsulates to,
+	/// which the KEM context binds.
 	///
 	/// # Errors
 	///
 	/// - [`HpkeError::Kdf`] -- the KDF refused a derivation.
-	pub fn decap(dh: EcdhSecret, encapsulated_key: &PublicKey<C>, recipient: &PublicKey<C>) -> Result<ZeroizingBytes> {
-		dh.kem_shared_secret::<C, K>(KEM_ID, encapsulated_key, recipient)
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use p256::{NistP256, SecretKey};
+	/// use tightbeam::crypto::hpke::{DhKem, HkdfSha256};
+	/// use tightbeam::crypto::kdf::EcdhSecret;
+	/// use tightbeam::random::OsRng;
+	///
+	/// type DhKemP256 = DhKem<NistP256, HkdfSha256, 0x0010>;
+	///
+	/// let recipient = SecretKey::random(&mut OsRng);
+	/// let (sent, encapsulated_key) = DhKemP256::encap(&recipient.public_key(), None)?;
+	///
+	/// // The holder of the recipient key runs `DH(skR, pkE)`.
+	/// let dh = EcdhSecret::agree(&recipient, &encapsulated_key);
+	/// let received = DhKemP256::decap(dh, &encapsulated_key, &recipient.public_key())?;
+	/// assert_eq!(received, sent);
+	/// # Ok::<(), tightbeam::crypto::hpke::HpkeError>(())
+	/// ```
+	pub fn decap(
+		dh: EcdhSecret<C>,
+		encapsulated_key: &PublicKey<C>,
+		recipient: &PublicKey<C>,
+	) -> Result<ZeroizingBytes> {
+		dh.kem_shared_secret::<K>(KEM_ID, encapsulated_key, recipient)
 	}
 }
 
@@ -769,8 +939,7 @@ where
 #[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
 impl<C, K, const KEM_ID: u16> DhKem<C, K, KEM_ID>
 where
-	C: Curve<FieldBytesSize = U32> + CurveArithmetic,
-	AffinePoint<C>: FromEncodedPoint<C> + ToEncodedPoint<C>,
+	C: DhKemCurve,
 	K: HpkeKdf,
 {
 	/// `Encap(pkR)` to `recipient`, with `enc` in uncompressed SEC1 form as
@@ -783,6 +952,22 @@ where
 	/// # Errors
 	///
 	/// - [`EnvelopeError::Kem`] -- the KEM failed a derivation.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::crypto::hpke::DhKemSecp256k1;
+	/// use tightbeam::crypto::k256::SecretKey;
+	/// use tightbeam::random::OsRng;
+	///
+	/// let recipient = SecretKey::random(&mut OsRng).public_key();
+	/// let encapsulation = DhKemSecp256k1::encap_to(&recipient, &mut OsRng)?;
+	///
+	/// // The `kemct` is `enc`, an uncompressed secp256k1 point of 65 octets.
+	/// assert_eq!(encapsulation.kemct.len(), 65);
+	/// assert_eq!(encapsulation.kemct.first(), Some(&0x04));
+	/// # Ok::<(), tightbeam::crypto::cms::EnvelopeError>(())
+	/// ```
 	pub fn encap_to(
 		recipient: &PublicKey<C>,
 		rng: &mut dyn CryptoRngCore,
@@ -804,35 +989,46 @@ where
 	///
 	/// - [`EnvelopeError::KemPoint`] -- `kemct` is no uncompressed point on `C`.
 	/// - [`EnvelopeError::Key`] -- the backend failed the agreement.
-	/// - [`EnvelopeError::Kdf`] -- the agreement is not 32 octets.
+	/// - [`EnvelopeError::Kdf`] -- the agreement is not as wide as the field of `C`.
 	/// - [`EnvelopeError::Kem`] -- the KEM failed a derivation.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::crypto::hpke::DhKemSecp256k1;
+	/// use tightbeam::crypto::k256::SecretKey;
+	/// use tightbeam::crypto::key::Secp256k1KeyProvider;
+	/// use tightbeam::crypto::sign::ecdsa::Secp256k1SigningKey;
+	/// use tightbeam::random::OsRng;
+	///
+	/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+	/// # let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+	/// # runtime.block_on(async {
+	/// // The backend holds the private half of the recipient key.
+	/// let secret = SecretKey::random(&mut OsRng);
+	/// let recipient = secret.public_key();
+	/// let backend = Secp256k1KeyProvider::from(Secp256k1SigningKey::from(&secret));
+	///
+	/// let sent = DhKemSecp256k1::encap_to(&recipient, &mut OsRng)?;
+	/// let received = DhKemSecp256k1::decap_through(&backend, &recipient, &sent.kemct).await?;
+	/// assert_eq!(received, sent.shared_secret);
+	/// # Ok::<(), tightbeam::crypto::cms::EnvelopeError>(())
+	/// # })?;
+	/// # Ok(())
+	/// # }
+	/// ```
 	pub fn decap_through<'a>(
 		key: &'a (impl DiffieHellman<C> + ?Sized),
 		recipient: &'a PublicKey<C>,
 		kemct: &'a [u8],
 	) -> MaybeSendFuture<'a, core::result::Result<ZeroizingBytes, EnvelopeError>> {
 		Box::pin(async move {
-			let encapsulated_key = Self::encapsulated_key(kemct)?;
+			let parsed = C::encapsulated_key(kemct);
+			let encapsulated_key = parsed.map_err(|_| EnvelopeError::KemPoint)?;
 			let agreed = key.agree(&encapsulated_key).await?;
 			let dh = EcdhSecret::try_from(agreed)?;
 			Ok(Self::decap(dh, &encapsulated_key, recipient)?)
 		})
-	}
-
-	/// `kemct` as DHKEM's `enc`: the uncompressed SEC1 form of a point on `C`,
-	/// 65 octets (RFC 9180 §7.1.1, draft-wahby-cfrg-hpke-kem-secp256k1 §3.1).
-	///
-	/// # Errors
-	///
-	/// - [`EnvelopeError::KemPoint`] -- `kemct` is another form or no point on `C`.
-	fn encapsulated_key(kemct: &[u8]) -> core::result::Result<PublicKey<C>, EnvelopeError> {
-		let uncompressed = kemct.len() == EC_PUBKEY_UNCOMPRESSED_SIZE && kemct.first() == Some(&0x04);
-		if !uncompressed {
-			return Err(EnvelopeError::KemPoint);
-		}
-
-		let point = PublicKey::from_sec1_bytes(kemct);
-		point.map_err(|_| EnvelopeError::KemPoint)
 	}
 }
 
@@ -1031,6 +1227,9 @@ mod tests {
 	/// The house suite.
 	type Suite = HpkeSecp256k1Sha256Aes256Gcm;
 
+	/// `Nenc` of the house KEM, the width of an uncompressed secp256k1 point.
+	const HOUSE_NENC: usize = UncompressedPointSize::<Secp256k1>::USIZE;
+
 	const INFO: &[u8] = b"tb/hpke/test";
 
 	/// HKDF-SHA512, the KDF `0x0003` of RFC 9180 Table 3, which two of the
@@ -1061,8 +1260,8 @@ mod tests {
 	/// DHKEM(secp256k1, HKDF-SHA256), HKDF-SHA256, AES-256-GCM.
 	type RegisteredAes256 = DhKemSuite<Secp256k1, HkdfSha256, Aes256Gcm, KEM_DHKEM_SECP256K1_HKDF_SHA256>;
 
-	/// HKDF-SHA256 under another KEM identifier, and `LEN_SHIFT` bytes away
-	/// from a 12-byte request, as a relabeled or a faulty provider KDF is.
+	/// HKDF-SHA256 that answers a 12-byte request `LEN_SHIFT` bytes away from
+	/// it, as a faulty provider KDF does.
 	struct AlteredKdf<const KEM_SHIFT: u16, const LEN_SHIFT: i8>;
 
 	impl<const KEM_SHIFT: u16, const LEN_SHIFT: i8> HpkeKdf for AlteredKdf<KEM_SHIFT, LEN_SHIFT> {
@@ -1251,7 +1450,7 @@ mod tests {
 		}
 
 		fn from_dh<S>(
-			dh: EcdhSecret,
+			dh: EcdhSecret<Secp256k1>,
 			encapsulated_key: &PublicKey<Secp256k1>,
 			recipient: &PublicKey<Secp256k1>,
 			vector: &Vector,
@@ -1259,7 +1458,7 @@ mod tests {
 		where
 			S: HpkeSuite<Curve = Secp256k1>,
 		{
-			let shared_secret = dh.kem_shared_secret::<Secp256k1, S::KemKdf>(S::KEM_ID, encapsulated_key, recipient)?;
+			let shared_secret = dh.kem_shared_secret::<S::KemKdf>(S::KEM_ID, encapsulated_key, recipient)?;
 			let schedule = KeySchedule::<S>::derive(&shared_secret, &unhex(vector.info))?;
 			Ok(Self {
 				shared_secret: shared_secret.to_vec(),
@@ -1373,7 +1572,8 @@ mod tests {
 	///
 	/// The key schedule reads the identifier of a KEM and the shared secret
 	/// it produced, and the Appendix A vectors publish both. Their KEMs run
-	/// on X25519, P-256, and P-521, so this type stands in for the curve.
+	/// on X25519, P-256, and P-521, so this type stands in for the KEM, and
+	/// [`RfcSuite`] names secp256k1 in place of its curve.
 	struct KemOf<const ID: u16, K>(PhantomData<K>);
 
 	impl<const ID: u16, K: HpkeKdf> HpkeKdf for KemOf<ID, K> {
@@ -1654,8 +1854,8 @@ mod tests {
 		Ok(())
 	}
 
-	/// The key schedule binds `info`, so a message opens under the context it
-	/// was sealed in.
+	/// The key schedule binds `info`, so a message opens under the context the
+	/// sender sealed it in.
 	#[test]
 	fn a_message_opens_under_its_info_alone() -> Result<()> {
 		let (secret, public) = keypair();
@@ -1721,9 +1921,9 @@ mod tests {
 	#[test]
 	fn a_tampered_message_fails_to_open() -> Result<()> {
 		let untouched = opened_after(|_| ())?;
-		let last_byte_flipped = opened_after(|wire| wire[EC_PUBKEY_UNCOMPRESSED_SIZE + 29] ^= 0xFF);
-		let first_byte_flipped = opened_after(|wire| wire[EC_PUBKEY_UNCOMPRESSED_SIZE] ^= 0xFF);
-		let one_byte_short = opened_after(|wire| wire.truncate(EC_PUBKEY_UNCOMPRESSED_SIZE + 29));
+		let last_byte_flipped = opened_after(|wire| wire[HOUSE_NENC + 29] ^= 0xFF);
+		let first_byte_flipped = opened_after(|wire| wire[HOUSE_NENC] ^= 0xFF);
+		let one_byte_short = opened_after(|wire| wire.truncate(HOUSE_NENC + 29));
 		let key_tag_flipped = opened_after(|wire| wire[0] ^= 0xFF);
 
 		assert_eq!(&untouched.to_insecure()[..], b"Sensitive data");
@@ -1746,7 +1946,7 @@ mod tests {
 	fn a_message_too_short_for_a_key_and_a_tag_is_refused() -> Result<()> {
 		let enc = unhex(AES_256_GCM_VECTOR.ephemeral_public);
 
-		let short_key = HpkeMessage::<Suite>::from_bytes(&enc[..EC_PUBKEY_UNCOMPRESSED_SIZE - 1]);
+		let short_key = HpkeMessage::<Suite>::from_bytes(&enc[..HOUSE_NENC - 1]);
 		let short_tag = HpkeMessage::<Suite>::from_bytes(wire_of(&enc, 15));
 		let bare_tag = HpkeMessage::<Suite>::from_bytes(wire_of(&enc, 16))?;
 		assert!(matches!(short_key, Err(HpkeError::InvalidCiphertext)));
@@ -1760,7 +1960,7 @@ mod tests {
 	#[test]
 	fn an_encapsulated_key_that_is_no_point_is_refused() {
 		let mut off_curve = unhex(AES_256_GCM_VECTOR.ephemeral_public);
-		off_curve[EC_PUBKEY_UNCOMPRESSED_SIZE - 1] ^= 0x01;
+		off_curve[HOUSE_NENC - 1] ^= 0x01;
 		let mut compressed_tag = unhex(AES_256_GCM_VECTOR.ephemeral_public);
 		compressed_tag[0] = 0x02;
 
@@ -1841,7 +2041,7 @@ mod tests {
 	}
 
 	/// A cipher whose key is wider than one KDF block keys and round-trips,
-	/// because the key is derived at the cipher's own size.
+	/// because the key schedule derives the key at the cipher's own size.
 	#[test]
 	fn a_key_wider_than_32_bytes_round_trips() -> Result<()> {
 		type Wide = DhKemSuite<Secp256k1, HkdfSha256, WideKeyCipher, KEM_DHKEM_SECP256K1_HKDF_SHA256>;
@@ -1934,7 +2134,7 @@ mod tests {
 		const ID_SIGNED_DATA: crate::der::asn1::ObjectIdentifier =
 			crate::der::asn1::ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.2");
 
-		/// A fresh secp256k1 key, its public point, and its house backend.
+		/// The public point and the house backend of a fresh secp256k1 key.
 		fn key_with_backend() -> (PublicKey<Secp256k1>, Arc<dyn DiffieHellman<Secp256k1>>) {
 			let key = Secp256k1SigningKey::random(&mut OsRng);
 			let public = PublicKey::from(key.verifying_key());

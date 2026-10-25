@@ -16,7 +16,7 @@
 //! - [`MuxHandle`] is the cloneable client handle.
 //!   [`MuxHandle::emit_on_stream`] allocates a stream, sends the request, and
 //!   awaits the correlated response. [`MuxHandle::ping`] probes connection
-//!   liveness without a stream or a call to the peer's handler.
+//!   liveness off the stream table and outside the peer's handler.
 //! - [`MuxResponder`] serves peer-initiated streams with a caller-supplied
 //!   handler, and enforces the advertised concurrency cap.
 //!
@@ -27,7 +27,7 @@
 //! - [`MuxHandle::open_stream`] and [`MuxHandle::open_duplex`] push request chunks through a [`RequestSink`].
 //! - Each call that opens a stream stamps its interaction kind on the stream's
 //!   Open record ([`MuxStreamKind`]).
-//! - [`MuxResponder::serve_with`] routes every peer stream to the matching [`MuxDispatch`] method.
+//! - [`MuxResponder::serve_with`] routes every peer stream to the [`MuxDispatch`] method of its kind.
 //!
 //! # Stream IDs
 //!
@@ -53,12 +53,15 @@ mod service;
 use core::future::Future;
 use std::sync::Arc;
 
+#[cfg(any(feature = "tokio", feature = "async-transport"))]
+use futures::future::ready;
+
 #[cfg(feature = "tokio")]
 pub use router::SpawnedMux;
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 pub use router::{
-	BufferedGrantor, CreditGrantor, MuxDispatch, MuxHandle, MuxReaderDriver, MuxResponder, MuxTransport,
-	MuxWriterDriver, ReplySink, RequestSink, StreamBody,
+	BufferedGrantor, MuxHandle, MuxReaderDriver, MuxResponder, MuxTransport, MuxWriterDriver, ReplySink, RequestSink,
+	StreamBody,
 };
 #[cfg(pooled_mux)]
 pub use service::{CallContext, MuxService};
@@ -74,6 +77,10 @@ use crate::Frame;
 
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 use crate::constants::DEFAULT_HOP_BUDGET;
+#[cfg(any(feature = "tokio", feature = "async-transport"))]
+use crate::policy::TransitStatus;
+#[cfg(any(feature = "tokio", feature = "async-transport"))]
+use crate::transport::envelopes::ResponsePackage;
 #[cfg(mux_rekey)]
 use crate::transport::handshake::receipt::StoredReceipt;
 #[cfg(mux_rekey)]
@@ -92,7 +99,8 @@ use service::GatedService;
 /// Accept loops and pools store [`Arc<TransportOffer>`], so each connection
 /// clones the `Arc` instead of a deep copy of the authorization octets.
 pub trait IntoMuxOffer {
-	/// Shared offer for transport storage, or `None` to advertise nothing.
+	/// Returns the shared offer for transport storage, or `None` to advertise
+	/// nothing.
 	fn into_mux_offer(self) -> Option<Arc<TransportOffer>>;
 }
 
@@ -122,7 +130,7 @@ impl IntoMuxOffer for Arc<TransportOffer> {
 
 impl IntoMuxOffer for &Arc<TransportOffer> {
 	fn into_mux_offer(self) -> Option<Arc<TransportOffer>> {
-		// Share one advertisement across accept and dial sites.
+		// The clone shares one advertisement across accept and dial sites.
 		Some(Arc::clone(self))
 	}
 }
@@ -133,11 +141,11 @@ impl IntoMuxOffer for Option<&Arc<TransportOffer>> {
 	}
 }
 
-/// Grpc-style route carried on a stream's Open record.
+/// The gRPC-style route that the Open record of a stream carries.
 ///
 /// The route selects the responder's dispatch target and carries the relay
-/// budget. The target is a servlet [`Urn`], which serves a stream as `:path`
-/// serves an HTTP request.
+/// budget. The target is a servlet [`Urn`], which names the handler of a
+/// stream as `:path` names the target of an HTTP request.
 ///
 /// - Initiators stamp a route through the typed [`MuxHandle::open_stream_to`]
 ///   and [`MuxHandle::open_duplex_to`] entry points, which name a servlet type
@@ -168,8 +176,8 @@ impl StreamRoute {
 		Self::default()
 	}
 
-	/// Route to a servlet type with the origin sentinel budget, which defers
-	/// the hop cap to the first gateway's `max_hops` policy.
+	/// Builds a route to a servlet type with the origin sentinel budget, which
+	/// defers the hop cap to the first gateway's `max_hops` policy.
 	///
 	/// A gateway reads the target to dispatch locally or splice to a peer. A
 	/// caller that needs no raw [`StreamRoute`] should prefer one of these:
@@ -180,12 +188,12 @@ impl StreamRoute {
 		Self { target: Some(target), hops_remaining: DEFAULT_HOP_BUDGET }
 	}
 
-	/// Route to a servlet type with an explicit remaining relay budget.
+	/// Builds a route to a servlet type with a given remaining relay budget.
 	///
 	/// A gateway stamps this route when it re-emits a client stream to a peer
 	/// gateway with the budget decremented. A gateway serves an open with a
-	/// `0` budget locally and never forwards it again. An origin open uses
-	/// [`Self::to`].
+	/// `0` budget locally, so the relay of that open ends there. An origin open
+	/// uses [`Self::to`].
 	#[cfg(feature = "colony")]
 	pub fn relayed_to(target: Urn<'static>, hops_remaining: u8) -> Self {
 		// The sentinel encodes an origin open. A relayed route must stay
@@ -203,21 +211,21 @@ impl StreamRoute {
 		(self.target, self.hops_remaining)
 	}
 
-	/// Grpc-style dispatch target, or `None` for an unrouted stream
+	/// Returns the gRPC-style dispatch target, or `None` for an unrouted stream
 	/// whose responder address is already resolved.
 	pub fn target(&self) -> Option<&Urn<'static>> {
 		self.target.as_ref()
 	}
 
-	/// Relay budget left on this open, which is the number of gateway forwards
-	/// the stream may still spend. A gateway serves a `0` stream locally and
-	/// never forwards it again.
+	/// Returns the relay budget left on this open, which is the number of
+	/// gateway forwards the stream may still spend. A gateway serves a stream
+	/// at `0` locally, so its relay ends there.
 	pub fn hops_remaining(&self) -> u8 {
 		self.hops_remaining
 	}
 }
 
-/// Stream identifier within one multiplexed connection.
+/// The stream identifier within one multiplexed connection.
 ///
 /// Odd IDs are client-initiated, even IDs are server-initiated, and ID 0 is
 /// reserved ([RFC 9113 § 5.1.1][rfc9113-5.1.1]).
@@ -232,23 +240,24 @@ impl StreamId {
 		Self(id)
 	}
 
-	/// Wire-encoded identifier for framing and role checks.
+	/// Returns the wire-encoded identifier for framing and role checks.
 	pub const fn value(&self) -> u32 {
 		self.0
 	}
 
-	/// True when this ID is odd (client-allocated).
+	/// Returns `true` when this ID is odd (client-allocated).
 	pub const fn is_client_initiated(&self) -> bool {
 		self.0 % 2 == 1
 	}
 
-	/// True when this ID is even (server-allocated), including reserved ID 0.
+	/// Returns `true` when this ID is even, which covers the server-allocated
+	/// IDs and the reserved ID 0.
 	pub const fn is_server_initiated(&self) -> bool {
 		self.0.is_multiple_of(2)
 	}
 }
 
-/// Stream state for multiplexed transports.
+/// The state of a stream on a multiplexed transport.
 ///
 /// Streams in `Open`, `HalfClosedLocal`, or `HalfClosedRemote` count toward
 /// the peer-advertised concurrency cap, and `Idle` and `Closed` streams are
@@ -261,19 +270,19 @@ pub enum StreamState {
 	Idle,
 	/// Both sides may send. The stream counts toward the concurrency cap.
 	Open,
-	/// Local send is closed. The stream still counts toward the
-	/// concurrency cap.
+	/// The local side has closed its send half. The stream still counts
+	/// toward the concurrency cap.
 	HalfClosedLocal,
-	/// Remote send is closed. The stream still counts toward the
-	/// concurrency cap.
+	/// The remote side has closed its send half. The stream still counts
+	/// toward the concurrency cap.
 	HalfClosedRemote,
 	/// The stream is fully closed, so it is exempt from the concurrency cap.
 	Closed,
 }
 
-/// Endpoint role on a multiplexed connection, which fixes whether its stream
-/// IDs are odd or even. A client allocates odd IDs and a server allocates even
-/// IDs, by the HTTP/2 convention.
+/// The endpoint role on a multiplexed connection, which fixes whether its
+/// stream IDs are odd or even. A client allocates odd IDs and a server
+/// allocates even IDs, by the HTTP/2 convention.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MuxRole {
 	/// The handshake initiator, which allocates odd stream IDs.
@@ -291,8 +300,8 @@ impl MuxRole {
 		}
 	}
 
-	/// Whether this role is the initiator of `stream_id` (ID 0 belongs to
-	/// no role).
+	/// Whether this role is the initiator of `stream_id`. Both roles answer
+	/// `false` for the reserved ID 0.
 	const fn initiates(self, stream_id: u32) -> bool {
 		match self {
 			MuxRole::Client => !stream_id.is_multiple_of(2),
@@ -330,9 +339,9 @@ impl MuxRole {
 
 #[cfg(mux_rekey)]
 impl MuxRole {
-	/// What this role renews under on `endpoint`: the identity it presented in
-	/// the handshake and the hooks of its half of the rekey exchange, or
-	/// `None` when the endpoint holds no identity of this role.
+	/// Returns what this role renews under on `endpoint`: the identity it
+	/// presented in the handshake and the hooks of its half of the rekey
+	/// exchange, or `None` when the endpoint holds no identity of this role.
 	fn renewal<P: HandshakeProvider>(self, endpoint: &Endpoint<'_, P>) -> Option<Renewal<P>> {
 		match self {
 			MuxRole::Client => endpoint.client_renewal(),
@@ -341,24 +350,26 @@ impl MuxRole {
 	}
 }
 
-/// Concurrent request/response streams over one connection.
+/// A protocol that runs concurrent request/response streams over one
+/// connection.
 ///
-/// Cap and cancel contracts match [`MuxHandle`]. This trait lets a caller stay
-/// generic over the concrete handle type. The only cancel surface is a drop of
-/// the emit future, which cancels its stream.
+/// The cap and cancel contracts match those of [`MuxHandle`]. This trait lets
+/// a caller stay generic over the concrete handle type. The one cancel surface
+/// is a drop of the emit future, which cancels its stream.
 pub trait MultiplexedProtocol {
-	/// Peer-advertised cap on concurrent locally-initiated streams
+	/// Returns the peer-advertised cap on concurrent locally-initiated streams
 	/// (HTTP/2 `SETTINGS_MAX_CONCURRENT_STREAMS`).
 	fn max_concurrent_streams(&self) -> u32;
 
 	/// Open a stream, send `frame`, and await the correlated response.
 	///
-	/// Dropping the future before it resolves cancels the stream and frees
+	/// A drop of the future before it resolves cancels the stream and frees
 	/// its concurrency slot.
 	fn emit_on_stream(&self, frame: &Frame) -> impl Future<Output = TransportResult<Option<Frame>>> + MaybeSend;
 }
 
-/// Mux capability advertisement, bound into the handshake transcript.
+/// The mux capability advertisement, which the handshake binds into its
+/// transcript.
 ///
 /// Only a transport that can attach the mux plane after negotiation implements
 /// this trait. The plane takes split envelope halves and spawned drivers, so
@@ -372,12 +383,12 @@ pub trait MuxCapable: Sized {
 	/// through [`IntoMuxOffer`] on the inherent transport helpers.
 	fn with_mux_offer(self, offer: Option<Arc<TransportOffer>>) -> Self;
 
-	/// Negotiated multiplexing settings from a completed handshake.
+	/// Returns the negotiated multiplexing settings of a completed handshake.
 	/// `None` means the connection is single-flight.
 	fn negotiated_mux(&self) -> Option<MuxSettings>;
 }
 
-/// In-band rekey context taken from a completed receipt-bearing handshake.
+/// The in-band rekey context of a completed receipt-bearing handshake.
 ///
 /// With an async runtime, it holds the role-fixed exchange half and the epoch-0
 /// dual-signed receipt that the exchange rotates. An unmetered session carries
@@ -390,9 +401,9 @@ pub struct MuxRekeyContext {
 	pub(crate) driver: RekeyDriver,
 	#[cfg(mux_rekey)]
 	pub(crate) receipt: Arc<StoredReceipt>,
-	/// Leaves the type with no value in a build without an async runtime: a
-	/// rekey runs only in a mux driver, and a mux driver runs only on that
-	/// runtime.
+	/// Makes the type uninhabited in a build without an async runtime,
+	/// because a rekey runs only in a mux driver and a mux driver runs only on
+	/// that runtime.
 	#[cfg(not(mux_rekey))]
 	_unbuilt: core::convert::Infallible,
 }
@@ -438,7 +449,8 @@ impl MuxRekeyContext {
 // here and `multiplex` alone depends on `rekey`.
 #[cfg(mux_rekey)]
 impl RekeyDriver {
-	/// The mux role of this half, which a transport assembled with it takes.
+	/// Returns the mux role of this half, which the transport assembled with
+	/// it takes.
 	const fn role(&self) -> MuxRole {
 		match self {
 			RekeyDriver::Client(_) => MuxRole::Client,
@@ -457,20 +469,20 @@ pub(crate) const CONNECTOR_ROLE: MuxRole = MuxRole::Client;
 #[cfg(mux_rekey)]
 pub(crate) const ACCEPTOR_ROLE: MuxRole = MuxRole::Server;
 
-/// Client-side mux connection setup.
+/// The client-side setup of a mux connection.
 ///
 /// The trait abstracts the concrete transport, so the connection pool stays
 /// generic over [`Protocol`](crate::transport::Protocol).
 pub trait MuxConnector: MuxCapable {
-	/// Envelope read half that the split yields.
+	/// The envelope read half that the split yields.
 	type EnvelopeReader: EnvelopeSource + MaybeSend + 'static;
-	/// Envelope write half that the split yields.
+	/// The envelope write half that the split yields.
 	type EnvelopeWriter: EnvelopeSink + MaybeSend + 'static;
 
 	/// Drive the client handshake to completion.
 	///
-	/// The call does nothing on a transport without encryption material, which
-	/// then never negotiates mux.
+	/// On a transport without encryption material the call returns `Ok(())`
+	/// at once, and [`MuxCapable::negotiated_mux`] stays `None`.
 	fn complete_client_handshake(&mut self) -> impl Future<Output = TransportResult<()>> + MaybeSend;
 
 	/// Detach the client half of the in-band rekey context from a completed
@@ -481,7 +493,8 @@ pub trait MuxConnector: MuxCapable {
 		Ok(None)
 	}
 
-	/// Validated peer certificate pinned by a completed client handshake.
+	/// Returns the validated peer certificate that a completed client
+	/// handshake pinned.
 	///
 	/// [`MuxConnector::into_envelope_halves`] consumes the transport, so
 	/// the connection pool reads peer identity here first and shares it
@@ -493,18 +506,19 @@ pub trait MuxConnector: MuxCapable {
 	fn into_envelope_halves(self) -> TransportResult<(Self::EnvelopeReader, Self::EnvelopeWriter)>;
 }
 
-/// Collector gate plus envelope halves of a consumed [`MuxAcceptor`].
+/// The collector gate and the envelope halves of a consumed [`MuxAcceptor`].
 pub type GatedHalves<T> = (
 	Box<dyn GatePolicy>,
 	(<T as MuxAcceptor>::EnvelopeReader, <T as MuxAcceptor>::EnvelopeWriter),
 );
 
-/// Server-side counterpart of [`MuxConnector`], which negotiates multiplexing
-/// during the accept and then hands the connection to the mux plane.
+/// The server-side counterpart of [`MuxConnector`], which negotiates
+/// multiplexing during the accept and then hands the connection to the mux
+/// plane.
 pub trait MuxAcceptor: MuxCapable {
-	/// Envelope read half that the split yields.
+	/// The envelope read half that the split yields.
 	type EnvelopeReader: EnvelopeSource + MaybeSend + 'static;
-	/// Envelope write half that the split yields.
+	/// The envelope write half that the split yields.
 	type EnvelopeWriter: EnvelopeSink + MaybeSend + 'static;
 
 	/// Drive the server-side handshake to completion and report the
@@ -520,8 +534,8 @@ pub trait MuxAcceptor: MuxCapable {
 		Ok(None)
 	}
 
-	/// Authenticated peer context of the completed handshake, snapshotted
-	/// before the transport splits. The default is empty.
+	/// Returns the authenticated peer context of the completed handshake, which
+	/// the transport snapshots before it splits. The default is empty.
 	fn session_context(&self) -> SessionContext {
 		SessionContext::default()
 	}
@@ -529,7 +543,7 @@ pub trait MuxAcceptor: MuxCapable {
 	/// Consume the transport into its collector gate plus envelope halves.
 	///
 	/// The gate moves to the mux responder and the transport ceases to exist,
-	/// so a live collector holds its real gate and never a placeholder.
+	/// so a live collector always holds its real gate.
 	fn into_gated_halves(self) -> TransportResult<GatedHalves<Self>>;
 
 	/// Consume the transport into its raw envelope halves alone, for the mux
@@ -607,8 +621,8 @@ pub trait MuxAcceptor: MuxCapable {
 	}
 }
 
-/// Streaming extension of [`MultiplexedProtocol`], which adds chunked request
-/// bodies and duplex replies over individual mux streams.
+/// The streaming extension of [`MultiplexedProtocol`], which adds chunked
+/// request bodies and duplex replies over individual mux streams.
 ///
 /// The extension is a separate trait because the concrete sink and body types
 /// live in the router plane, and so that a unary caller depends on the base
@@ -625,6 +639,143 @@ pub trait StreamingProtocol: MultiplexedProtocol {
 	/// Open a duplex stream. The caller pushes request chunks through the sink
 	/// while the peer's reply arrives incrementally through the body.
 	fn open_duplex(&self) -> TransportResult<(RequestSink, StreamBody)>;
+}
+
+/// The receiver-side stream credit policy, which decides when to raise a
+/// stream's absolute cumulative chunk limit (QUIC MAX_STREAM_DATA,
+/// [RFC 9000 § 4.1][rfc9000-4.1]).
+///
+/// The receiver's granted limit bounds per-stream reassembly memory
+/// at `limit * chunk size`. A receiver that withholds grants applies
+/// backpressure to the sender, which parks until the limit rises.
+///
+/// # Batching
+///
+/// Every grant travels as one `MuxCredit` envelope, a control-plane AEAD record
+/// outside the session budget. Implementations SHOULD batch grants rather than
+/// raise the limit per chunk, or a long transfer spends the cipher's record
+/// limit on control traffic.
+///
+/// [rfc9000-4.1]: https://datatracker.ietf.org/doc/html/rfc9000#section-4.1
+#[cfg(any(feature = "tokio", feature = "async-transport"))]
+pub trait CreditGrantor: Send + Sync {
+	/// Returns the new absolute chunk limit for a stream that has accepted
+	/// `received` chunks under `limit`, or `None` to leave the limit
+	/// unchanged. The reader discards a value at or below `limit`.
+	fn replenish(&self, stream_id: StreamId, received: u64, limit: u64) -> Option<u64>;
+}
+
+/// The kind-routed handler set for the peer streams of one connection.
+///
+/// The initiator stamps the kind of each stream on its Open record
+/// ([`MuxStreamKind`]), and the responder routes the stream to the method here
+/// that matches the kind. Every default answers
+/// [`TransitStatus::Unimplemented`], so a kind outside the service refuses its
+/// own stream and the connection continues to serve.
+///
+/// # A failed stream
+///
+/// Each method answers its own stream, and an `Err` refuses that stream
+/// alone. The responder answers it with the status of the error, records
+/// `MUX_INTERNAL_ERROR`, and continues to serve the other streams of the
+/// connection:
+///
+/// - [`TransportError::OperationFailed`] keeps the status its failure
+///   carries, apart from `Unavailable`, which reads `Unknown`.
+/// - Any other error reads [`TransitStatus::Internal`].
+///
+/// A method that answers a refusal with a status of its own returns it in
+/// `Ok`.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::Arc;
+///
+/// use tightbeam::policy::TransitStatus;
+/// use tightbeam::transport::multiplex::{MuxDispatch, StreamBody, StreamRoute};
+/// use tightbeam::transport::{ResponsePackage, TransportError, TransportFailure, TransportResult};
+/// use tightbeam::Frame;
+///
+/// /// Echoes each unary frame and each streamed frame, and refuses duplex
+/// /// streams by the default.
+/// struct Echo;
+///
+/// impl MuxDispatch for Echo {
+///     async fn unary(&self, frame: Arc<Frame>) -> TransportResult<ResponsePackage> {
+///         Ok(ResponsePackage::new(TransitStatus::Ok, Some(Frame::clone(&frame))))
+///     }
+///
+///     /// A body past the reassembly ceiling is the peer's to shrink, so it
+///     /// reads `ResourceExhausted`. Any other failure refuses the stream
+///     /// with the status of its error.
+///     async fn streaming(&self, body: StreamBody, _route: StreamRoute) -> TransportResult<ResponsePackage> {
+///         match body.into_frame().await {
+///             Ok(frame) => Ok(ResponsePackage::new(TransitStatus::Ok, Some(frame))),
+///             Err(TransportError::OperationFailed(TransportFailure::SizeExceeded)) => {
+///                 Ok(ResponsePackage::new(TransitStatus::ResourceExhausted, None))
+///             }
+///             Err(other) => Err(other),
+///         }
+///     }
+/// }
+/// ```
+///
+/// [`MuxStreamKind`]: crate::transport::envelopes::MuxStreamKind
+/// [`TransportError::OperationFailed`]: crate::transport::error::TransportError::OperationFailed
+#[cfg(any(feature = "tokio", feature = "async-transport"))]
+pub trait MuxDispatch {
+	/// Answer one unary request with its terminal response.
+	///
+	/// # Errors
+	///
+	/// - Any error, which refuses this stream alone with the status the trait doc names.
+	fn unary(&self, frame: Arc<Frame>) -> impl Future<Output = TransportResult<ResponsePackage>> + MaybeSend {
+		// The default refuses the request, so the frame goes unread.
+		let _ = frame;
+		ready(Ok(ResponsePackage::new(TransitStatus::Unimplemented, None)))
+	}
+
+	/// Consume a streamed request body and answer with the terminal response.
+	///
+	/// Each chunk the handler consumes replenishes the peer's stream credit, so
+	/// a slow handler parks the sender with end-to-end backpressure. `route`
+	/// carries the gRPC-style dispatch target that the initiator stamped on
+	/// the Open.
+	///
+	/// # Errors
+	///
+	/// - Any error, which refuses this stream alone with the status the trait doc names.
+	fn streaming(
+		&self,
+		body: StreamBody,
+		route: StreamRoute,
+	) -> impl Future<Output = TransportResult<ResponsePackage>> + MaybeSend {
+		// The default refuses the stream, so the body and route go unread.
+		let _ = (body, route);
+		ready(Ok(ResponsePackage::new(TransitStatus::Unimplemented, None)))
+	}
+
+	/// Consume request chunks and push reply chunks at the same time, in full
+	/// duplex on one stream.
+	///
+	/// The returned status closes the stream as its `End` trailer. `route`
+	/// carries the gRPC-style dispatch target that the initiator stamped on
+	/// the Open.
+	///
+	/// # Errors
+	///
+	/// - Any error, which closes this stream alone with the status the trait doc names.
+	fn duplex(
+		&self,
+		body: StreamBody,
+		reply: ReplySink,
+		route: StreamRoute,
+	) -> impl Future<Output = TransportResult<TransitStatus>> + MaybeSend {
+		// The default refuses the stream, so body, reply, and route go unread.
+		let _ = (body, reply, route);
+		ready(Ok(TransitStatus::Unimplemented))
+	}
 }
 
 #[cfg(all(test, feature = "colony"))]

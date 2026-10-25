@@ -1,12 +1,11 @@
 //! The cluster framework, whose gateways route work to registered hives.
 //!
 //! A gateway keeps hive and servlet registries, selects routes, and
-//! forwards [`ClusterWorkRequest`] payloads. Hives register and announce
-//! their servlet types at runtime.
+//! forwards [`ClusterWorkRequest`] payloads.
 //!
 //! # Work routing
 //!
-//! - Hives register and announce servlet types.
+//! - Hives register at runtime and announce their servlet types.
 //! - Clients send work with a servlet type and a payload.
 //! - The gateway selects a route and forwards the payload.
 //!
@@ -30,7 +29,10 @@
 //!
 //! Rumor floods across the colonies use the gossip subsystem ([`GossipConfig`],
 //! [`GossipJournal`]) for deduplication, retention, and anti-entropy repair.
+//!
+//! [`ClusterWorkRequest`]: crate::colony::protocol::ClusterWorkRequest
 
+mod balance;
 mod dial;
 mod runtime;
 
@@ -47,6 +49,10 @@ pub(crate) mod peer;
 pub(crate) mod gossip;
 pub(crate) mod peer_table;
 
+pub use balance::{
+	InstanceMetrics, LoadBalancer, PowerOfTwoChoices, RoundRobin, StochasticForager, DEFAULT_EXPLORATION_FLOOR,
+	DEFAULT_REPELLENCY_THRESHOLD, MAX_PHEROMONE,
+};
 pub use builder::{ClusterConfigBuilder, HeartbeatConfigBuilder};
 pub use dial::{AdmittedDial, DialRefusal};
 pub use error::ClusterError;
@@ -96,28 +102,29 @@ use crate::urn::Urn;
 use crate::utils::time::Clock;
 use crate::TightBeamError;
 
-use super::common::{ColonyNamespace, ColonyResource, InstanceMetrics, LoadBalancer, ServletAddressUpdate};
+use super::protocol::ServletAddressUpdate;
+use super::urn::{ColonyNamespace, ColonyResource};
 
 pub(crate) const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 5;
 pub(crate) const DEFAULT_HEARTBEAT_TIMEOUT_SECS: u64 = 15;
 pub(crate) const DEFAULT_MAX_CONCURRENT: usize = 10;
 pub(crate) const DEFAULT_MAX_FAILURES: u32 = 3;
 
-/// Heartbeat cadence, eviction timeout, and failure tolerance.
+/// The heartbeat cadence, eviction timeout, and failure tolerance.
 ///
 /// The heartbeat loop retries a failed heartbeat on the next `interval`
 /// cycle, and eviction counts against `max_failures` rather than a separate
 /// retry policy.
 pub struct HeartbeatConfig {
-	/// Time between heartbeat cycles.
+	/// The time between heartbeat cycles.
 	pub interval: Duration,
-	/// Age after which a silent hive is evicted.
+	/// The age past which the hive registry evicts a silent hive.
 	pub timeout: Duration,
-	/// Cap on concurrent heartbeat dials per cycle.
+	/// The cap on concurrent heartbeat dials in one cycle.
 	pub max_concurrent: usize,
-	/// Consecutive failures that unregister a hive.
+	/// The count of consecutive failures that unregisters a hive.
 	pub max_failures: u32,
-	/// Optional per-result callback, for a monitor or a test.
+	/// The callback for each heartbeat result, for a monitor or a test.
 	pub on_heartbeat: Option<HeartbeatCallback>,
 }
 
@@ -146,31 +153,33 @@ impl core::fmt::Debug for HeartbeatConfig {
 }
 
 impl HeartbeatConfig {
-	/// Attach a callback invoked after each heartbeat result.
+	/// Attach a callback that the heartbeat loop calls after each heartbeat
+	/// result.
 	pub fn with_callback(mut self, callback: HeartbeatCallback) -> Self {
 		self.on_heartbeat = Some(callback);
 		self
 	}
 }
 
-/// Outcome of one hive heartbeat, for a monitor or a test.
+/// The outcome of one hive heartbeat, for a monitor or a test.
 #[derive(Debug, Clone)]
 pub struct HeartbeatEvent {
 	/// The hive control address the heartbeat dialed.
 	pub hive_addr: Arc<[u8]>,
 	/// Whether the hive answered within policy.
 	pub success: bool,
-	/// Utilization the hive reported, when it answered with a heartbeat result.
+	/// The utilization the hive reported, when it answered with a heartbeat
+	/// result.
 	pub utilization: Option<crate::utils::BasisPoints>,
 }
 
-/// Callback invoked after each heartbeat result.
+/// The callback the heartbeat loop calls after each heartbeat result.
 ///
 /// The callback MUST be `Send + Sync` because the loop may invoke it from
 /// concurrent tasks.
 pub type HeartbeatCallback = Arc<dyn Fn(HeartbeatEvent) + Send + Sync>;
 
-/// TLS material for the gateway accept loop and the hive and peer dials.
+/// The TLS material for the gateway accept loop and the hive and peer dials.
 #[non_exhaustive]
 pub struct ClusterTlsConfig {
 	/// The gateway certificate and handshake key, from [`Self::new`] or
@@ -190,9 +199,9 @@ pub struct ClusterTlsConfig {
 	/// certificate, such as a denylist, belongs in the store's
 	/// [`RevocationChecker`](crate::crypto::x509::store::RevocationChecker).
 	pub validators: Vec<Arc<dyn CertificateValidation>>,
-	/// Client-certificate validators for inbound mutual TLS.
+	/// The client-certificate validators for inbound mutual TLS.
 	pub client_validators: Vec<Arc<dyn CertificateValidation>>,
-	/// Trust store for the hive plane.
+	/// The trust store for the hive plane.
 	///
 	/// The store fills three roles:
 	///
@@ -202,7 +211,7 @@ pub struct ClusterTlsConfig {
 	///   holds the caller's public key and `peer_trust` does not (see
 	///   [`TrustPlanes`]).
 	pub hive_trust: Option<Arc<dyn crate::crypto::x509::store::CertificateTrust>>,
-	/// Trust anchor for peer-gateway advertisements and relayed gossip.
+	/// The trust anchor for peer-gateway advertisements and relayed gossip.
 	///
 	/// The store is separate from `hive_trust`, so a peer certificate cannot
 	/// register as a hive and a hive certificate cannot forge a peer ad.
@@ -415,16 +424,17 @@ impl core::fmt::Debug for ClusterTlsConfig {
 	}
 }
 
-/// Peer-federation dial list, advertise beat and address, and the policy that
-/// admits the dial addresses peers claim.
+/// The peer-federation dial list, the advertise beat and address, and the
+/// policy that admits the dial addresses peers claim.
 ///
 /// Trust anchors stay on [`ClusterTlsConfig::peer_trust`]. Export
 /// discoverability and enforcement share [`PeerConfig::exported_types`].
 #[derive(Clone)]
 pub struct PeerConfig {
-	/// Peer gateway addresses dialed to advertise exported types.
+	/// The peer gateway addresses this gateway dials to advertise exported
+	/// types.
 	///
-	/// - Each gateway picks its own dial targets, so partial or asymmetric federation graphs are expected.
+	/// - Each gateway picks its own dial targets, so a federation graph may be partial or asymmetric.
 	/// - An empty list sets no anchor, so the beat advertises only to the learned peers its probes proved.
 	/// - Each beat snapshots the local servlet registry as the slate, so peers
 	///   learn the types this gateway serves at that beat.
@@ -434,7 +444,7 @@ pub struct PeerConfig {
 	/// [`ClusterConfigBuilder::with_peers`], which parses each entry, and
 	/// read it with [`PeerConfig::peers`].
 	peers: Vec<AdmittedDial>,
-	/// Cadence of the re-advertise beat, where `None` disables the beat.
+	/// The cadence of the re-advertise beat, where `None` disables the beat.
 	pub advertise_interval: Option<Duration>,
 	/// The socket this gateway advertises as its own, when the operator set
 	/// one.
@@ -459,9 +469,9 @@ pub struct PeerConfig {
 	/// - The config builder rebuilds it, so anchors always derive from
 	///   `peers` and the injected [`PeerStore`] rehydrates learned peers
 	///   through the capped admission path.
-	/// - The field is private because it is derived. Read it with [`PeerConfig::table`].
+	/// - The field is private because the builder derives it. Read it with [`PeerConfig::table`].
 	table: Arc<PeerTable>,
-	/// Cap on the relay budget this gateway honors on inbound work and
+	/// The cap on the relay budget this gateway honors on inbound work and
 	/// routed stream opens.
 	///
 	/// The effective budget is `min(wire value, max_hops)`. An origin
@@ -472,20 +482,20 @@ pub struct PeerConfig {
 	/// - `0` disables forwarding.
 	/// - `2` enables relay-trail fallback.
 	pub max_hops: u8,
-	/// Cap on the tried entries one signer may hold in the discovery table,
-	/// where `None` sets no cap.
+	/// The cap on the tried entries one signer may hold in the discovery
+	/// table, where `None` sets no cap.
 	///
 	/// - The prefix buckets bound a network position, and this bounds an identity (CWE-770).
 	/// - One enrolled certificate that answers at many addresses takes at most this many beat-target slots.
-	/// - It is off by default, so an implementor whose trust store admits
-	///   parties it does not control turns it on.
+	/// - It is off by default, and an implementor whose trust store admits
+	///   parties outside its control turns it on.
 	/// - A signer is one certificate, counted by fingerprint. A party that
 	///   enrolls more than one certificate holds this many entries under each.
 	/// - The field is private because the builder copies it into the table at
-	///   build, so a later write changes nothing. Set it with
+	///   build, and the table reads that copy alone. Set it with
 	///   [`ClusterConfigBuilder::with_tried_per_signer`].
 	tried_per_signer: Option<NonZeroUsize>,
-	/// Advertisement-rumor refresh interval, as configured.
+	/// The advertisement-rumor refresh interval, as the operator configured it.
 	///
 	/// The beat floods the slate rumor when the slate or flood target set
 	/// changed, plus one refresh on this interval.
@@ -494,7 +504,7 @@ pub struct PeerConfig {
 	/// wants. Set it with [`ClusterConfigBuilder::with_rumor_refresh`] and
 	/// read the effective interval with [`ClusterConfig::rumor_refresh`].
 	rumor_refresh: Duration,
-	/// Servlet types disclosed to and reachable by external peers.
+	/// The servlet types that external peers may discover and reach.
 	///
 	/// `None` exports every locally served type. `Some` restricts both
 	/// planes of the export boundary through an [`ExportAllowlist`]:
@@ -514,7 +524,8 @@ pub struct PeerConfig {
 }
 
 impl PeerConfig {
-	/// Peer gateway addresses this plane dials to advertise exported types.
+	/// The peer gateway addresses this plane dials to advertise exported
+	/// types.
 	///
 	/// These are the table's un-evictable anchors, admitted as operator
 	/// configuration.
@@ -529,15 +540,17 @@ impl PeerConfig {
 		&self.table
 	}
 
-	/// Dial addresses inbound peer ads may claim, when restricted.
+	/// The dial addresses inbound peer ads may claim, when the operator
+	/// restricts them.
 	#[must_use]
 	pub fn peer_dial_allowlist(&self) -> Option<&Arc<HashSet<PeerAddress>>> {
 		self.peer_dial_allowlist.as_ref()
 	}
 }
 
-/// The default peer plane has no peers, no beat, and no allowlist. It
-/// advertises the bound address and holds the single-forward relay cap.
+/// The default peer plane starts with an empty peer list, the beat off, and
+/// an open dial allowlist. It advertises the bound address and holds the
+/// single-forward relay cap.
 impl Default for PeerConfig {
 	fn default() -> Self {
 		Self {
@@ -572,52 +585,53 @@ impl core::fmt::Debug for PeerConfig {
 	}
 }
 
-/// Runtime configuration for a cluster gateway.
+/// The runtime configuration of a cluster gateway.
 ///
-/// Build one with [`ClusterConfigBuilder`] or
-/// [`ClusterConfig::new`]. The load balancer defaults to
-/// [`StochasticForager`](crate::colony::common::StochasticForager).
+/// Build one with [`ClusterConfigBuilder`] or [`ClusterConfig::new`]. The
+/// load balancer defaults to [`StochasticForager`].
 pub struct ClusterConfig {
-	/// Naming scope for inbound resource URNs.
+	/// The naming scope of inbound resource URNs.
 	///
 	/// The gateway refuses a register, update, or work request that names a
 	/// foreign authority or realm.
 	pub namespace: ColonyNamespace,
-	/// Strategy that selects among candidate servlet instances.
+	/// The strategy that selects among candidate servlet instances.
 	pub load_balancer: Arc<dyn LoadBalancer>,
-	/// Hive health probes and eviction policy.
+	/// The hive health probes and eviction policy.
 	pub heartbeat: HeartbeatConfig,
-	/// Route score policy: reinforcement, weakening, and evaporation.
+	/// The route score policy: reinforcement, weakening, and evaporation.
 	pub pheromone: PheromoneConfig,
-	/// Gate policies the gateway evaluates before it decodes a request.
+	/// The gate policies the gateway evaluates before it decodes a request.
 	pub policies: Vec<Arc<dyn GatePolicy + Send + Sync>>,
-	/// Custom export gates, which the gateway evaluates where it knows the
+	/// The custom export gates, which the gateway evaluates where it knows the
 	/// servlet target.
 	///
-	/// All gates must pass, so they compose as intersection with the allow
+	/// All gates must pass, so they compose as an intersection with the allow
 	/// sources (exported list, grants, and the first-party origin rule).
 	pub export_gates: Vec<Arc<dyn ExportGate>>,
-	/// Positive export grants, which the gateway evaluates when the built-in
-	/// allowlist refuses a target.
+	/// The positive export grants, which the gateway evaluates when the
+	/// built-in allowlist refuses a target.
 	///
-	/// Allow sources compose as union: exported, granted, or first-party
+	/// Allow sources compose as a union: exported, granted, or first-party
 	/// origin. Deny gates still override a grant. The advertised slate lists
 	/// exported types alone, so a granted type stays off it.
 	pub export_grants: Vec<Arc<dyn ExportGrant>>,
-	/// Outbound connection pool settings for hive and peer dials. The pools
-	/// read [`ClusterConfig::clock`].
+	/// The outbound connection pool settings for hive and peer dials. The
+	/// pools read [`ClusterConfig::clock`].
 	pub pool_config: PoolConfig,
-	/// Freshness window for signed hive control frames.
+	/// The freshness window for signed hive control frames.
 	///
 	/// The gateway refuses a stale or replayed registration or update frame
 	/// (CWE-294).
 	pub control_freshness_window: Duration,
-	/// Gateway bind address, parsed through the protocol address `FromStr`.
+	/// The gateway bind address, which the gateway parses through the
+	/// protocol address `FromStr`.
 	///
 	/// `None` binds the protocol default. A stable address lets hives
 	/// re-register across gateway restarts on the same configuration.
 	pub bind_addr: Option<String>,
-	/// Edge accept plane bind address, parsed by the edge address `FromStr`.
+	/// The bind address of the edge accept plane, which the gateway parses
+	/// through the edge address `FromStr`.
 	///
 	/// - `None` disables the edge plane.
 	/// - `Some` binds a second listener with the same TLS material for external
@@ -627,9 +641,10 @@ pub struct ClusterConfig {
 	///   control plane.
 	/// - Hives still register on `bind_addr`.
 	pub edge_bind_addr: Option<String>,
-	/// Peer-federation dial list, advertise beat and address, and dial policy.
+	/// The peer-federation dial list, advertise beat and address, and dial
+	/// policy.
 	pub peer: PeerConfig,
-	/// Gossip freshness, origin TTL, ingress, journal, and admission.
+	/// The gossip freshness, origin TTL, ingress, journal, and admission.
 	///
 	/// Startup clamps [`GossipConfig::seen_ttl`] to the journal's retention. A
 	/// journal keeps a digest while the issue time its rumor states lies inside
@@ -639,7 +654,7 @@ pub struct ClusterConfig {
 	/// this gateway reads. It defaults to
 	/// [`SystemClock`](crate::utils::time::SystemClock).
 	pub clock: Arc<dyn Clock>,
-	/// Colony URN from the gateway certificate URI SAN.
+	/// The colony URN from the URI SAN of the gateway certificate.
 	///
 	/// `None` means the gateway is not a colony member, so it is in no flood
 	/// ([`ClusterConfig::flood`]):
@@ -652,16 +667,16 @@ pub struct ClusterConfig {
 	/// [`ClusterConfig::bind_colony_membership`] derives it, last at
 	/// startup, and [`ClusterConfig::colony_urn`] reads it.
 	colony_urn: Option<Urn<'static>>,
-	/// TLS material for the accept planes and the outbound dials.
+	/// The TLS material for the accept planes and the outbound dials.
 	pub tls: ClusterTlsConfig,
 }
 
-/// Parsed address-update delta: the hive's added routes, owned by that
+/// A parsed address-update delta: the hive's added routes, owned by that
 /// hive, and the locators it removes.
 pub(crate) type ParsedAddressUpdate<'a> = (HiveSlate, Vec<&'a [u8]>);
 
 impl ClusterConfig {
-	/// Effective advertisement-rumor refresh interval.
+	/// The effective advertisement-rumor refresh interval.
 	///
 	/// A refresh slower than the gossip freshness window would re-publish
 	/// rumors that peers refuse as stale, so this method clamps the configured
@@ -725,7 +740,7 @@ impl ClusterConfig {
 		Self::builder(tls).build()
 	}
 
-	/// Colony URN from the gateway certificate URI SAN.
+	/// The colony URN from the URI SAN of the gateway certificate.
 	///
 	/// It returns `None` when this gateway is not a colony member.
 	#[must_use]
@@ -773,18 +788,16 @@ impl core::fmt::Debug for ClusterConfig {
 	}
 }
 
-pub use crate::colony::common::{ClusterRequest, ClusterWorkRequest, ClusterWorkResponse};
-
 /// The trait a cluster gateway implements.
 ///
 /// Gateways route work to registered hives by servlet type. Hives
 /// register at runtime, and the gateway learns servlet types from those
 /// registrations.
 pub trait Cluster: Sized + Send + Sync {
-	/// Protocol this gateway serves.
+	/// The protocol this gateway serves.
 	type Protocol: Protocol;
 
-	/// Bound address type for this gateway.
+	/// The bound address type of this gateway.
 	type Address: TightBeamAddress;
 
 	/// Bind, spawn the accept and background loops, and return the gateway
@@ -805,21 +818,22 @@ pub trait Cluster: Sized + Send + Sync {
 	/// The address the gateway listens on.
 	fn addr(&self) -> &Self::Address;
 
-	/// Servlet types available from registered local hives.
+	/// The servlet types that registered local hives offer.
 	///
 	/// # Errors
 	///
 	/// - [`ClusterError::LockPoisoned`] -- the route registry is poisoned.
 	fn available_servlets(&self) -> Result<Vec<SharedId>, ClusterError>;
 
-	/// Servlet types reachable through the routes learned from peer gateways.
+	/// The servlet types reachable through the routes learned from peer
+	/// gateways.
 	///
 	/// # Errors
 	///
 	/// - [`ClusterError::LockPoisoned`] -- the route registry is poisoned.
 	fn peer_servlets(&self) -> Result<Vec<SharedId>, ClusterError>;
 
-	/// Learned peer routes, each with its dial address and peer identity.
+	/// The learned peer routes, each with its dial address and peer identity.
 	///
 	/// # Errors
 	///
@@ -833,7 +847,7 @@ pub trait Cluster: Sized + Send + Sync {
 	/// - [`ClusterError::LockPoisoned`] -- the hive registry is poisoned.
 	fn hive_count(&self) -> Result<usize, ClusterError>;
 
-	/// Shared trace collector for this gateway.
+	/// The shared trace collector of this gateway.
 	fn trace(&self) -> Arc<TraceCollector>;
 
 	/// Abort the accept and background tasks.
@@ -841,24 +855,24 @@ pub trait Cluster: Sized + Send + Sync {
 
 	/// Wait until the accept loops finish.
 	///
-	/// Awaits the colony accept task and, when bound, the edge accept task.
+	/// It awaits the colony accept task and, when bound, the edge accept task.
 	///
 	/// # Errors
 	///
-	/// - [`JoinError`](crate::runtime::rt::JoinError) -- an accept task panicked or was aborted.
+	/// - [`JoinError`](crate::runtime::rt::JoinError) -- an accept task panicked, or an abort cancelled it.
 	fn join(self) -> impl Future<Output = Result<(), crate::runtime::rt::JoinError>> + Send;
 }
 
-/// Heartbeat surface of a cluster gateway.
+/// The heartbeat surface of a cluster gateway.
 ///
-/// The trait is split from [`Cluster`], so work-only consumers depend on the
-/// work surface alone. [`ClusterGateway`] implements both traits for every
+/// The trait sits apart from [`Cluster`], so work-only consumers depend on
+/// the work surface alone. [`ClusterGateway`] implements both traits for every
 /// alias.
 pub trait ClusterHeartbeat: Cluster {
-	/// Shared hive registry.
+	/// The shared hive registry.
 	fn registry(&self) -> &Arc<HiveRegistry>;
 
-	/// Heartbeat interval, timeout, and failure policy.
+	/// The heartbeat interval, timeout, and failure policy.
 	fn heartbeat_config(&self) -> &HeartbeatConfig;
 
 	/// Send one signed heartbeat to the hive registered at `addr`, through the
@@ -884,15 +898,15 @@ pub trait ClusterHeartbeat: Cluster {
 	fn send_heartbeat(
 		&self,
 		addr: Self::Address,
-	) -> impl Future<Output = Result<super::common::HeartbeatResult, ClusterError>> + Send;
+	) -> impl Future<Output = Result<super::protocol::HeartbeatResult, ClusterError>> + Send;
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
 	use crate::cms::signed_data::SignerIdentifier;
-	use crate::colony::common::{ColonyNamespace, RegisterHiveRequest};
-	use crate::colony::hive::ServletInfo;
+	use crate::colony::protocol::{ClusterWorkResponse, RegisterHiveRequest, ServletInfo};
+	use crate::colony::urn::ColonyNamespace;
 	use crate::crypto::key::Secp256k1KeyProvider;
 	use crate::crypto::policy::Secp256k1Policy;
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
@@ -988,10 +1002,9 @@ mod tests {
 	/// A client purpose of an implementor's own, outside the house purposes.
 	const OWN_CLIENT: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.3.13");
 
-	// An outbound pool holds the gateway's identity to the client purpose its
-	// TLS config names. The pool answers that at the dial, before any
-	// handshake, so a dial under an identity of the implementor's own client
-	// purpose returns its lease.
+	// An outbound pool checks the gateway's identity against the client
+	// purpose of its TLS config at the dial, before any handshake, so a dial
+	// under the implementor's own client purpose returns its lease.
 	#[tokio::test]
 	async fn the_outbound_pool_takes_the_configured_key_purposes() -> Result<(), Box<dyn core::error::Error>> {
 		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();

@@ -1,4 +1,4 @@
-//! Intra-hive routing context backed by a servlet connection pool.
+//! The intra-hive routing context, backed by a servlet connection pool.
 
 use std::collections::HashMap;
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -24,12 +24,12 @@ struct Sibling {
 }
 
 impl Sibling {
-	/// Connects to this sibling on `pool`, once the party that answered
-	/// proved to hold the certificate [`Self::signer`] names (CWE-346).
+	/// Connects to this sibling on `pool`, once the party that answers proves
+	/// it holds the certificate [`Self::signer`] names (CWE-346).
 	///
 	/// # Errors
 	///
-	/// - The [`BoundDial::connect`] set, as [`TightBeamError::ClusterError`].
+	/// - The errors of [`BoundDial::connect`], as [`TightBeamError::ClusterError`].
 	async fn connect<P: ColonyDialProtocol>(
 		self,
 		pool: &Arc<ConnectionPool<P>>,
@@ -48,17 +48,17 @@ type SiblingMap = HashMap<Vec<u8>, Sibling>;
 ///
 /// # One lock
 ///
-/// The index is derived from the instances, so both live behind one lock
-/// and under one owner. A reader sees an index that names an address the
-/// instance map still holds, and no caller can order two acquisitions
-/// against another caller (CWE-362).
+/// The index derives from the instances, so both live behind one lock and
+/// under one owner. A reader sees an index that names an address the
+/// instance map still holds, and every caller takes the same single lock,
+/// which rules out a lock-order deadlock between two callers (CWE-362).
 ///
 /// # Poison recovery
 ///
 /// Every write under the lock is a `HashMap` insert or remove, which
-/// completes or aborts the process, so a thread that panicked while
-/// holding the guard left whole maps behind it. The owner therefore
-/// recovers a poisoned lock and keeps routing.
+/// completes or aborts the process, so a thread that panicked while it held
+/// the guard left whole maps behind it. The owner therefore recovers a
+/// poisoned lock, and the routes stay in service.
 #[derive(Default)]
 struct Routes {
 	instances: SiblingMap,
@@ -66,7 +66,8 @@ struct Routes {
 }
 
 impl Routes {
-	/// The first instance registered for a type owns the index entry.
+	/// Inserts `sibling` under `key`. The first instance registered for a type
+	/// owns the index entry.
 	///
 	/// `sibling` moves into the instance map. The index takes extra [`Arc`]
 	/// handles only for a new type, so it shares the address and the signer.
@@ -78,7 +79,7 @@ impl Routes {
 	}
 
 	/// Drops an instance and promotes a sibling of the same type into the
-	/// index when the departing instance held it.
+	/// index when the dropped instance held it.
 	fn remove(
 		&mut self,
 		key: impl AsRef<[u8]>,
@@ -119,8 +120,8 @@ impl Routes {
 ///
 /// Each route names the signer its sibling answers under, and every call
 /// dials bound to that signer, so a party that answers at a sibling's address
-/// under another identity receives no frame (CWE-346). A servlet that names
-/// no signer has no route.
+/// under another identity receives no frame (CWE-346). A route exists only
+/// for a servlet that names a signer.
 pub struct HiveContextImpl<P: Protocol> {
 	routes: Arc<RwLock<Routes>>,
 	pool: Arc<ConnectionPool<P>>,
@@ -132,13 +133,14 @@ impl<P: Protocol> HiveContextImpl<P> {
 		Self { routes: Arc::new(RwLock::new(Routes::default())), pool }
 	}
 
-	/// The routes for writing, recovered from a poisoned lock because every
-	/// write under the guard leaves whole maps.
+	/// Takes the write lock of the routes. It recovers a poisoned lock,
+	/// because every write under the guard leaves whole maps.
 	fn routes_mut(&self) -> RwLockWriteGuard<'_, Routes> {
 		self.routes.write().unwrap_or_else(PoisonError::into_inner)
 	}
 
-	/// The routes for reading, recovered the same way.
+	/// Takes the read lock of the routes and recovers a poisoned lock the
+	/// same way.
 	fn routes(&self) -> RwLockReadGuard<'_, Routes> {
 		self.routes.read().unwrap_or_else(PoisonError::into_inner)
 	}
@@ -184,7 +186,7 @@ impl<P: Protocol> HiveContextImpl<P> {
 	}
 
 	/// Drops the route under `key` and re-indexes `type_urn` on a sibling
-	/// when the departing instance held the index.
+	/// when the dropped instance held the index.
 	pub fn remove_route(
 		&self,
 		key: impl AsRef<[u8]>,
@@ -198,7 +200,7 @@ impl<P: Protocol> HiveContextImpl<P> {
 		self.routes_mut().remove(key, &type_prefix, type_bytes, removed_addr);
 	}
 
-	/// Whether a route for `servlet_type` is installed, for a test that
+	/// Returns whether a route for `servlet_type` exists, for a test that
 	/// reads the routes at an instant the hive picks.
 	#[cfg(test)]
 	pub(crate) fn resolves(&self, servlet_type: &Urn<'_>) -> bool {
@@ -226,11 +228,11 @@ impl<P: Protocol> HiveContextImpl<P> {
 		});
 	}
 
-	/// The sibling this hive routes `servlet_type` to.
+	/// Returns the sibling this hive routes `servlet_type` to.
 	///
 	/// # Errors
 	///
-	/// - [`RouterError::UnknownRoute`] -- no instance of the type is routed.
+	/// - [`RouterError::UnknownRoute`] -- the hive routes no instance of the type.
 	fn sibling(&self, servlet_type: &Urn<'_>) -> Result<Sibling, TightBeamError> {
 		let type_key = servlet_type.canonical_bytes();
 		let routed = self.routes().resolve(&type_key);
@@ -244,8 +246,8 @@ impl<P: ColonyDialProtocol> HiveContext for HiveContextImpl<P> {
 		Box::pin(async move {
 			let sibling = self.sibling(servlet_type)?;
 			let mut pooled_conn = sibling.connect(&self.pool).await?;
-			// The caller's frame emits as-is so an applied nonrepudiation
-			// signature stays verifiable at the servlet.
+			// The context emits the caller's frame as-is, so an applied
+			// nonrepudiation signature stays verifiable at the servlet.
 			let response = pooled_conn.emit(frame, None).await?;
 			response.ok_or(TightBeamError::MissingResponse)
 		})
@@ -283,8 +285,9 @@ impl<P: ColonyDialProtocol> HiveContext for HiveContextImpl<P> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::colony::common::ColonyNamespace;
-	use crate::colony::hive::{ServletBox, ServletInfo, ServletRegistration, SpawnerFn};
+	use crate::colony::hive::{ServletBox, ServletRegistration, SpawnerFn};
+	use crate::colony::protocol::ServletInfo;
+	use crate::colony::urn::ColonyNamespace;
 	use crate::tb_cases;
 	use crate::transport::client::ConnectionBuilder;
 	use crate::transport::TokioListener;
@@ -299,8 +302,8 @@ mod tests {
 		Arc::from(bytes.as_bytes())
 	}
 
-	/// The sibling at `bytes`, which answers under the fixture servlet's
-	/// signer.
+	/// Builds the sibling at `bytes`, which answers under the fixture
+	/// servlet's signer.
 	fn sibling(bytes: &'static str) -> Sibling {
 		Sibling { address: addr(bytes), signer: Arc::new(ServletInfo::fixture_signer()) }
 	}
@@ -401,19 +404,19 @@ mod tests {
 		}
 	}
 
-	/// The type the seeded registry holds.
+	/// Returns the type the seeded registry holds.
 	fn echo_type() -> Urn<'static> {
 		let namespace = ColonyNamespace::default();
 		namespace.servlet("echo").expect("test names satisfy the mint grammar")
 	}
 
-	/// The spawner of a [`SignerProbe`] that names no signer.
+	/// Returns the spawner of a [`SignerProbe`] that names no signer.
 	fn probe_spawner() -> SpawnerFn {
 		Arc::new(|_| Box::pin(async { Ok(Box::new(SignerProbe { signer: None }) as Box<dyn ServletBox>) }))
 	}
 
-	/// A registry holding one [`SignerProbe`] of [`echo_type`] that names
-	/// `signer`.
+	/// Builds a registry that holds one [`SignerProbe`] of [`echo_type`] that
+	/// names `signer`.
 	fn registry_holding(signer: Option<SignerIdentifier>) -> HashMapRegistry {
 		let servlet_type = echo_type();
 		let key = servlet_type.instance_urn(b"127.0.0.1:7005");

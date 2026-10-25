@@ -302,7 +302,7 @@ server  = HMAC-H(mac_s, transcript_hash || SignerInfo.signature)
 
 | Input  | What it is                                                                                                 |
 | ------ | ---------------------------------------------------------------------------------------------------------- |
-| `ee`   | The ECDH output of the client's ephemeral and the server's ephemeral                                       |
+| `ee`   | The ECDH output of the client's ephemeral and the server's ephemeral, as wide as the field of the curve    |
 | `base` | The 32-byte base secret that the CMS client seals to the key-agreement certificate. The HPKE flow has none |
 | `S`    | The salt: `client_random \|\| server_random` for HPKE, the transcript hash for CMS                         |
 | `HKDF` | The profile's KDF, extract then expand under its own hash: HKDF-SHA3-256 in the default profile            |
@@ -310,7 +310,9 @@ server  = HMAC-H(mac_s, transcript_hash || SignerInfo.signature)
 
 Each input follows a standard:
 
-- CMS: `ee || base` is the hybrid secret `Z′ = Z || T` of NIST SP 800-56C Rev. 2 § 2: the shared secret, then an auxiliary secret whose format both ends fix in advance. Both parts are 32 bytes, so the plain concatenation is unambiguous.
+- CMS: `ee || base` is the hybrid secret `Z′ = Z || T` of NIST SP 800-56C Rev. 2 § 2: the shared secret, then an auxiliary secret whose format both ends fix in advance. Both widths are fixed, so the plain concatenation is unambiguous:
+  - The curve fixes the width of `ee`: 32 bytes on secp256k1 and P-256, 48 on P-384, and 66 on P-521.
+  - `base` is 32 bytes.
 - HPKE: the flow takes `ee` alone, as TLS 1.3 takes its ECDHE secret (RFC 9846 § 7.1).
 
 ### Ephemeral keys
@@ -363,10 +365,13 @@ The traffic keys, the receipt acknowledgement, the closing, and every rekey epoc
 Each renewal runs a fresh agreement. The client sends an ephemeral `Ce` on the request, and the server sends `Se` on the response:
 
 ```text
-epoch_next = HKDF(u32be(32) || epoch || u32be(32) || ee, salt = client_random || server_random, info = "tb/session/kdf/epoch/v1")
+epoch_next = HKDF(u32be(32) || epoch || u32be(Ndh) || ee, salt = client_random || server_random, info = "tb/session/kdf/epoch/v1")
 ```
 
-Here `ee` is the ECDH output of the two rekey ephemerals, and `u32be(n)` is the 4-byte big-endian length of the input after it. A holder of one epoch secret lacks `ee`, so it derives nothing of the next epoch.
+A holder of one epoch secret lacks `ee`, so it derives nothing of the next epoch. The formula names three terms:
+- `ee` is the ECDH output of the two rekey ephemerals.
+- `Ndh` is the width of `ee`, the field width of the curve (RFC 9180 § 4.1).
+- `u32be(n)` is the 4-byte big-endian length of the input after it.
 
 | Rule                                                               | Enforced by                                                                                                                              |
 | ------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------- |

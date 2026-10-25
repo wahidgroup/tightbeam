@@ -20,11 +20,17 @@ use crate::der::{
 use crate::policy::TransitStatus;
 use crate::Beamable;
 
-#[cfg(all(
-	feature = "transport-multiplex",
-	any(feature = "tokio", feature = "async-transport")
+#[cfg(any(
+	feature = "transport-cms",
+	feature = "transport-hpke",
+	all(
+		feature = "transport-multiplex",
+		any(feature = "tokio", feature = "async-transport")
+	)
 ))]
 use crate::transport::error::TransportError;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::transport::handshake::HandshakeMessage;
 
 #[cfg(feature = "transport-multiplex")]
 mod multiplex {
@@ -252,7 +258,7 @@ impl From<u32> for CancelReason {
 	}
 }
 
-/// The reason the connection is shutting down
+/// The reason the connection shuts down
 /// ([RFC 9113 § 6.8][rfc9113-6.8]).
 ///
 /// The open u32 code space follows the rules of [`CancelReason`].
@@ -375,7 +381,7 @@ macro_rules! mux_chunk_package {
 ///
 /// It tells the responder whether the body reassembles into one [`Frame`]
 /// and which reply shape the initiator awaits, so dispatch reads the shape
-/// from the record instead of guessing it.
+/// from the record.
 #[cfg(feature = "transport-multiplex")]
 #[derive(Enumerated, Default, Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -641,7 +647,7 @@ impl MuxPingPackage {
 	}
 }
 
-/// A graceful connection shutdown.
+/// An orderly connection shutdown.
 ///
 /// Streams at or below `last_stream_id` drain to completion, and the
 /// receiver refuses newer streams.
@@ -874,8 +880,8 @@ impl FixedTag for MuxRekeyDonePackage {
 
 /// Every multiplexing message, nested under one [`TransportEnvelope`] arm.
 ///
-/// The nesting lets the mux plane evolve with no change to the top-level
-/// envelope grammar, and only mux code matches a mux variant.
+/// The nesting lets the mux plane evolve while the top-level envelope grammar
+/// stays fixed, and only mux code matches a mux variant.
 #[cfg(feature = "transport-multiplex")]
 #[derive(Choice, Clone, Debug, PartialEq)]
 pub enum MuxEnvelope {
@@ -894,7 +900,7 @@ pub enum MuxEnvelope {
 	/// Cancels one stream and leaves the connection open.
 	#[asn1(context_specific = "4", constructed = "true")]
 	Cancel(MuxCancelPackage),
-	/// Starts a graceful connection shutdown.
+	/// Starts an orderly connection shutdown.
 	#[asn1(context_specific = "5", constructed = "true")]
 	GoAway(GoAwayPackage),
 	/// A liveness probe or its answer.
@@ -925,10 +931,9 @@ pub enum TransportEnvelope {
 	/// The response to a single-flight request.
 	#[asn1(context_specific = "1", constructed = "true")]
 	Response(ResponsePackage),
-	// Tag 2 is reserved for the retired `EnvelopedData` container, tag 5 for
-	// the retired `EncryptedData` container, and tag 6 for the retired HPKE
-	// key exchange. None is reused, so an archived capture never decodes a
-	// stale meaning.
+	// Tags 2, 5, and 6 stay reserved, in that order, for the retired
+	// `EnvelopedData` and `EncryptedData` containers and the retired HPKE key
+	// exchange, so an archived capture never decodes a stale meaning.
 	/// A signed handshake container, kept with the bytes that carried it.
 	#[asn1(context_specific = "3", constructed = "true")]
 	SignedData(Box<WireDer<SignedData>>),
@@ -1146,6 +1151,33 @@ impl_mux_envelope_from! {
 	MuxRekeyResponsePackage => RekeyResponse,
 	MuxRekeyAckPackage => RekeyAck,
 	MuxRekeyDonePackage => RekeyDone,
+}
+
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+impl From<HandshakeMessage> for TransportEnvelope {
+	fn from(message: HandshakeMessage) -> Self {
+		match message {
+			HandshakeMessage::SignedData(signed) => Self::SignedData(signed),
+			HandshakeMessage::AuthEnvelopedData(enveloped) => Self::AuthEnvelopedData(enveloped),
+			HandshakeMessage::Data(data) => Self::Data(data),
+		}
+	}
+}
+
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+impl TryFrom<TransportEnvelope> for HandshakeMessage {
+	type Error = TransportError;
+
+	/// Handshake messages travel in one of the three handshake containers, so
+	/// this conversion refuses any other envelope on the handshake path.
+	fn try_from(envelope: TransportEnvelope) -> Result<Self, Self::Error> {
+		match envelope {
+			TransportEnvelope::SignedData(signed) => Ok(Self::SignedData(signed)),
+			TransportEnvelope::AuthEnvelopedData(enveloped) => Ok(Self::AuthEnvelopedData(enveloped)),
+			TransportEnvelope::Data(data) => Ok(Self::Data(data)),
+			_ => Err(TransportError::InvalidMessage),
+		}
+	}
 }
 
 impl TransportEnvelope {
@@ -1700,9 +1732,9 @@ mod tests {
 		Ok(())
 	}
 
-	/// [`WireEnvelope::arrive`] refuses a wire envelope under a tag of neither
-	/// arm for its tag: a transport envelope under the constructed context tag
-	/// `[2]`, `0xA2`.
+	/// [`WireEnvelope::arrive`] refuses a wire envelope whose tag names neither
+	/// arm: here a transport envelope under the constructed context tag `[2]`,
+	/// `0xA2`.
 	#[test]
 	fn a_wire_envelope_under_the_unknown_tag_2_is_refused() -> Result<(), Box<dyn Error>> {
 		let inner = TransportEnvelope::from(TestFrame::v0(None, None)).to_der()?;
@@ -1715,8 +1747,8 @@ mod tests {
 		Ok(())
 	}
 
-	/// The wire envelope is the whole read, so an octet past an encrypted
-	/// one refuses it before the record reaches a key.
+	/// The wire envelope is the whole read, so the reader refuses an encrypted
+	/// one with an octet past it before the record reaches a key.
 	#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 	#[test]
 	fn an_encrypted_wire_envelope_with_a_trailing_octet_is_refused() -> Result<(), Box<dyn Error>> {

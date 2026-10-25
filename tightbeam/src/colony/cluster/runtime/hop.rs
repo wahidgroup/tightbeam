@@ -85,7 +85,7 @@ impl<P: Protocol> HivePlane<P> {
 }
 
 /// The plane this gateway dials peer gateways on: the peer pool, or the hive
-/// pool when no peer trust is configured.
+/// pool when the gateway configures no peer trust.
 ///
 /// An advertisement binds its signer to the socket it claims. The pool is
 /// private, and the plane offers three ways to it:
@@ -234,7 +234,7 @@ impl<P: ColonyDialProtocol> Hop<'_, P> {
 	/// - The reply frame returns encoded whole so the client can verify the servlet's envelope the same way.
 	/// - An origin-signed gossip rumor reaches an ingress servlet through this path too, for the same reason.
 	///
-	/// [`ClusterWorkRequest::payload`]: crate::colony::common::ClusterWorkRequest::payload
+	/// [`ClusterWorkRequest::payload`]: crate::colony::protocol::ClusterWorkRequest::payload
 	pub(crate) async fn deliver_frame(self, frame: Frame) -> Result<Vec<u8>, ClusterError> {
 		let response = self.emit(frame).await?;
 		Ok(encode(&response)?)
@@ -247,7 +247,7 @@ impl<P: ColonyDialProtocol> Hop<'_, P> {
 	/// [`ClusterRequest::Work`] envelope toward a peer gateway. Every other
 	/// path carries an end-to-end frame.
 	///
-	/// [`ClusterRequest::Work`]: crate::colony::common::ClusterRequest::Work
+	/// [`ClusterRequest::Work`]: crate::colony::protocol::ClusterRequest::Work
 	pub(crate) async fn deliver_envelope(self, message: impl Into<Vec<u8>>) -> Result<Vec<u8>, ClusterError> {
 		let message: Vec<u8> = message.into();
 		let frame = Frame::v0(b"work-forward", message);
@@ -298,7 +298,7 @@ mod tests {
 	use crate::colony::cluster::{
 		AdmittedDial, CertificateSpec, Cluster, ClusterConfig, ClusterGateway, ClusterTlsConfig, ColonyDigest, SharedId,
 	};
-	use crate::colony::common::ColonyNamespace;
+	use crate::colony::urn::ColonyNamespace;
 	use crate::crypto::key::Secp256k1KeyProvider;
 	use crate::crypto::policy::Secp256k1Policy;
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;

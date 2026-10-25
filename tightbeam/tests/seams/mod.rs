@@ -22,8 +22,19 @@
 //! - [`curves`] brings the decoder of a curve, which refuses its off-curve encodings at each reader of keys.
 //! - [`colony`] runs two gateways, a hive, and its servlet, which each sign and verify under the provider.
 //! - [`floor`] holds the strength floor of a provider at the TCP transport, and refuses a mixed pair.
-//! - [`curve`] brings a provider on P-256, which runs both handshakes and a renewal on the curve of its own.
+//! - [`blocking`] runs a handshake and one exchange over the blocking TCP transport.
+//! - [`curve`] brings providers on P-256, P-384, and P-521, which run both handshakes and a renewal.
+//!
+//! Other suites bring a part of the transport or of the colony:
+//!
+//! - [`handshake`] brings a client and a server orchestrator, which the TCP transport drives.
+//! - [`listener`] brings a blocking listener backend, which the house TCP listener serves.
+//! - [`mux`] brings a dispatch and a credit grantor, which the multiplexed transport runs.
+//! - [`restart`] brings a restart policy and a jitter strategy, which a transport and a house backoff run.
+//! - [`retry`] brings the retry policy of the scaling updates of a hive.
 
+#[cfg(all(feature = "transport-hpke", feature = "tcp"))]
+mod blocking;
 #[cfg(feature = "transport-cms")]
 mod cms;
 mod colony;
@@ -33,11 +44,18 @@ mod curves;
 #[cfg(all(feature = "transport-hpke", feature = "tcp", feature = "tokio"))]
 mod floor;
 mod frames;
+#[cfg(all(feature = "transport-hpke", feature = "tcp", feature = "tokio"))]
+mod handshake;
 #[cfg(feature = "transport-hpke")]
 mod hpke;
 mod kem;
+#[cfg(all(feature = "transport-hpke", feature = "tcp"))]
+mod listener;
 #[cfg(all(feature = "transport-multiplex", feature = "tcp", feature = "tokio"))]
 mod mux;
+#[cfg(all(feature = "tcp", feature = "tokio"))]
+mod restart;
+mod retry;
 mod servlet;
 mod trust;
 
@@ -282,7 +300,7 @@ impl SecurityProfile for OutsideProfile {
 /// AES-128-GCM as an outside crate brings it: a cipher type of its own over
 /// the house cipher, with its own [`ContentEncryption`] under
 /// `GCMParameters`. It seals and opens in place through the house cipher, so
-/// a refused buffer stays as it was.
+/// a refused buffer keeps its contents.
 struct OutsideGcm(Aes128Gcm);
 
 impl KeySizeUser for OutsideGcm {

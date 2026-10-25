@@ -1,5 +1,5 @@
-//! Security profiles and the cryptographic providers that run them, bound
-//! through associated types.
+//! The security profiles and the cryptographic providers that run them,
+//! bound through associated types.
 
 #[cfg(all(not(feature = "std"), any(feature = "digest", feature = "signature")))]
 use alloc::boxed::Box;
@@ -131,7 +131,7 @@ macro_rules! impl_aes_key_wrap {
 	};
 }
 
-/// Negotiation descriptor that holds only the OID set of a security profile.
+/// The negotiation descriptor that holds only the OIDs of a security profile.
 ///
 /// Every field is an `Option`, and `None` means that the side that built it
 /// has the feature of the algorithm disabled, which is `aead` for `key_wrap`.
@@ -142,17 +142,17 @@ macro_rules! impl_aes_key_wrap {
 /// The AEAD OID names the cipher, and the cipher type fixes the key length.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Beamable)]
 pub struct SecurityProfileDesc {
-	/// OID of the digest algorithm that the profile negotiates.
+	/// The OID of the digest algorithm that the profile negotiates.
 	pub digest: Option<ObjectIdentifier>,
-	/// OID of the AEAD algorithm that the profile negotiates.
+	/// The OID of the AEAD algorithm that the profile negotiates.
 	pub aead: Option<ObjectIdentifier>,
-	/// OID of the signature algorithm that the profile negotiates.
+	/// The OID of the signature algorithm that the profile negotiates.
 	pub signature: Option<ObjectIdentifier>,
-	/// OID of the key derivation function that the profile negotiates.
+	/// The OID of the key derivation function that the profile negotiates.
 	pub kdf: Option<ObjectIdentifier>,
-	/// OID of the elliptic curve for key agreement.
+	/// The OID of the elliptic curve for key agreement.
 	pub curve: Option<ObjectIdentifier>,
-	/// OID of the key-wrap algorithm that the profile negotiates.
+	/// The OID of the key-wrap algorithm that the profile negotiates.
 	pub key_wrap: Option<ObjectIdentifier>,
 }
 
@@ -206,13 +206,16 @@ impl<P: SecurityProfile> From<&P> for SecurityProfileDesc {
 pub struct ProfileStrength {
 	/// The descriptor of the runnable profile.
 	pub descriptor: SecurityProfileDesc,
-	/// Key length in bytes of the provider's AEAD cipher.
+	/// The key length in bytes of the provider's AEAD cipher.
 	pub aead_key_bytes: usize,
-	/// Output length in bytes of the provider's digest.
+	/// The output length in bytes of the provider's digest.
 	pub digest_bytes: usize,
+	/// The field width in bytes of the provider's key-agreement curve, which
+	/// bounds the strength of every session key.
+	pub curve_field_bytes: usize,
 }
 
-/// Minimum-strength filter a handshake endpoint applies to profiles.
+/// The minimum-strength filter that a handshake endpoint applies to profiles.
 ///
 /// The policy blocks downgrade (CWE-757), so an endpoint refuses a mutually
 /// supported weak profile unless the policy admits it.
@@ -228,6 +231,7 @@ pub trait ProfileStrengthPolicy {
 ///
 /// - The AEAD key size is at least 256 bits.
 /// - The digest output is at least 256 bits.
+/// - The field of the key-agreement curve is at least 256 bits, so P-192 and P-224 fall below the floor.
 ///
 /// # Examples
 ///
@@ -235,25 +239,27 @@ pub trait ProfileStrengthPolicy {
 /// use tightbeam::crypto::profiles::{DefaultCryptoProvider, DefaultStrengthFloor, ProfileStrengthPolicy};
 /// use tightbeam::transport::handshake::negotiation::RunnableProfile;
 ///
-/// // The house profile runs AES-256-GCM and SHA3-256.
+/// // The house profile runs AES-256-GCM, SHA3-256, and secp256k1.
 /// let strength = RunnableProfile::<DefaultCryptoProvider>::native().strength();
 /// assert!(DefaultStrengthFloor.meets_floor(&strength));
 /// ```
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DefaultStrengthFloor;
 
-/// Minimum AEAD key and digest output length in bytes, 256 bits each.
+/// The minimum length in bytes of the AEAD key, the digest output, and the
+/// curve field, 256 bits each.
 const DEFAULT_FLOOR_BYTES: usize = 32;
 
 impl ProfileStrengthPolicy for DefaultStrengthFloor {
 	fn meets_floor(&self, strength: &ProfileStrength) -> bool {
 		let aead_ok = strength.aead_key_bytes >= DEFAULT_FLOOR_BYTES;
 		let digest_ok = strength.digest_bytes >= DEFAULT_FLOOR_BYTES;
-		aead_ok && digest_ok
+		let curve_ok = strength.curve_field_bytes >= DEFAULT_FLOOR_BYTES;
+		aead_ok && digest_ok && curve_ok
 	}
 }
 
-/// Strength policy that admits every profile.
+/// The strength policy that admits every profile.
 ///
 /// This policy is the explicit opt-out of the minimum-strength floor. A
 /// provider whose profile falls below [`DefaultStrengthFloor`] names this
@@ -279,7 +285,7 @@ impl ProfileStrengthPolicy for NoStrengthFloor {
 	}
 }
 
-/// Metadata trait that declares only the algorithm identifiers (OIDs) of a
+/// The metadata trait that declares only the algorithm identifiers (OIDs) of a
 /// negotiated security profile. Concrete key types and implementations live
 /// on [`CryptoProvider`].
 ///
@@ -321,7 +327,7 @@ pub trait SecurityProfile {
 	type KeyWrapOid: AssociatedOid;
 }
 
-/// Provider role for digest operations.
+/// The provider role for digest operations.
 ///
 /// The role isolates digest operations from the full provider, so a bound
 /// names only the digest and a test can target the digest alone. The digest
@@ -350,7 +356,7 @@ pub trait DigestProvider {
 	}
 }
 
-/// Provider role for AEAD encryption and decryption.
+/// The provider role for AEAD encryption and decryption.
 ///
 /// The role separates AEAD operations from the other crypto primitives. The
 /// cipher type names its own algorithm identifier through [`AeadAlgorithm`].
@@ -407,8 +413,8 @@ pub trait KeyWrapAlgorithm {
 	/// ```
 	fn wrap(kek: &Kek<'_, Self>, key: &[u8]) -> Result<Vec<u8>, KeyError>;
 
-	/// Unwrap `wrapped` under `kek`, whose integrity check refuses a key
-	/// wrapped under another KEK or altered in flight (RFC 3394 §2.2.3).
+	/// Unwrap `wrapped` under `kek`. The integrity check of the unwrap refuses
+	/// a key wrapped under another KEK or altered in flight (RFC 3394 §2.2.3).
 	///
 	/// # Errors
 	///
@@ -551,14 +557,14 @@ impl<'a, W: KeyWrapAlgorithm + ?Sized> TryFrom<&'a [u8]> for Kek<'a, W> {
 	///
 	/// # Errors
 	///
-	/// - [`KeyError::KekLength`] -- `key` is another length than [`KeyWrapAlgorithm::KekSize`].
+	/// - [`KeyError::KekLength`] -- the length of `key` differs from [`KeyWrapAlgorithm::KekSize`].
 	fn try_from(key: &'a [u8]) -> Result<Self, KeyError> {
 		let expected = <W::KekSize as Unsigned>::USIZE;
 		if key.len() != expected {
 			return Err(KeyError::KekLength((key.len(), expected).into()));
 		}
 
-		// The check above refuses each other length, so the length that
+		// The check above refuses every other length, so the length that
 		// `from_slice` asserts holds here.
 		Ok(Self::from(GenericArray::from_slice(key)))
 	}
@@ -583,7 +589,7 @@ impl<W: KeyWrapAlgorithm + ?Sized> fmt::Debug for Kek<'_, W> {
 	}
 }
 
-/// Provider role for the key wrap of a content key.
+/// The provider role for the key wrap of a content key.
 ///
 /// The role names the wrap an envelope's recipient uses, and the wrap names
 /// the identifier the profile negotiates.
@@ -615,7 +621,7 @@ impl_aes_key_wrap!(Aes192Wrap, AES_192_WRAP, aes::Aes192, U24);
 #[cfg(feature = "aead")]
 impl_aes_key_wrap!(Aes256Wrap, AES_256_WRAP, aes::Aes256, U32);
 
-/// Provider role for signature generation and verification.
+/// The provider role for signature generation and verification.
 ///
 /// The role isolates signature operations, so a type that only signs carries
 /// fewer generic bounds.
@@ -638,7 +644,7 @@ pub trait SigningProvider {
 	}
 }
 
-/// Provider role for key derivation.
+/// The provider role for key derivation.
 ///
 /// The role separates KDF operations such as HKDF, so trait bounds stay
 /// narrow. The KDF type names the algorithm identifier a peer negotiates for
@@ -650,7 +656,7 @@ pub trait KdfProvider {
 	type Kdf: KdfFunction + AssociatedOid;
 }
 
-/// Provider role for elliptic curve operations.
+/// The provider role for elliptic curve operations.
 ///
 /// The role isolates curve-specific operations such as ECDH and key
 /// generation. The curve type names the algorithm identifier a peer
@@ -662,7 +668,7 @@ pub trait CurveProvider {
 	type Curve: Curve + CurveArithmetic + AssociatedOid;
 }
 
-/// Provider role for Key Encapsulation Mechanism (KEM) operations.
+/// The provider role for Key Encapsulation Mechanism (KEM) operations.
 ///
 /// The role supports post-quantum and hybrid key agreement through the
 /// RustCrypto `kem` traits. An application can supply a KEM implementation
@@ -735,9 +741,10 @@ pub trait CryptoProvider:
 	/// The strength floor every handshake of this provider holds its profile
 	/// to, on each endpoint that runs the provider.
 	///
-	/// - The default is [`DefaultStrengthFloor`]: an AEAD key and a digest output of 256 bits or more.
-	/// - A provider whose AEAD key or digest output is shorter runs a handshake
-	///   only under a floor that admits its profile, such as
+	/// - The default is [`DefaultStrengthFloor`]: an AEAD key, a digest
+	///   output, and a curve field of 256 bits or more.
+	/// - A provider whose AEAD key, digest output, or curve field is shorter
+	///   runs a handshake only under a floor that admits its profile, such as
 	///   [`NoStrengthFloor`], so it names that floor here (CWE-757).
 	///
 	/// # Examples
@@ -770,7 +777,7 @@ pub trait CryptoProvider:
 pub type AeadKeySize<P> = <<P as AeadProvider>::AeadCipher as KeySizeUser>::KeySize;
 
 /// The profile [`DefaultCryptoProvider`] runs: SHA3-256, AES-256-GCM, ECDSA
-/// over secp256k1, HKDF-SHA3-256, and AES-256 key wrap.
+/// and ECDH over secp256k1, HKDF-SHA3-256, and AES-256 key wrap.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TightbeamProfile;
 

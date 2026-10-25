@@ -1,30 +1,18 @@
-//! The shared colony types that the cluster and the hive use: load
-//! balancers, pheromone metrics, control-plane helpers, the protocol
-//! messages, the colony URNs, and the scaling utilities.
+//! The load balancers that pick the servlet instance a gateway forwards work
+//! to, and the pheromone signal they read.
 
-pub mod messages;
-pub mod scaling;
-pub mod urn;
+use core::sync::atomic::{AtomicU64, Ordering};
 
-use core::future::Future;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::Arc;
 
 use crate::constants::{SPLITMIX64_GAMMA, SPLITMIX64_MIX_1, SPLITMIX64_MIX_2};
 use crate::random::generate_nonce;
 
-use crate::runtime::rt;
-
-pub use messages::*;
-pub use scaling::*;
-pub use urn::{ColonyNamespace, ColonyResource, ServletTypeKey, COLONY_NID};
-
 /// The pheromone signal one servlet instance carries into a balancing round.
 #[derive(Debug, Clone)]
 pub struct InstanceMetrics {
-	/// The instance handle for the balancing round, which holds the
-	/// canonical instance-URN bytes. Balancers treat these bytes as opaque.
+	/// The key that names the instance in the balancing round, which holds
+	/// the canonical instance-URN bytes. Balancers treat these bytes as opaque.
 	///
 	/// The key is owned on purpose. A borrowed key would put a lifetime
 	/// on the public [`LoadBalancer`] trait and every implementor.
@@ -126,7 +114,7 @@ fn splitmix64_next(state: &AtomicU64) -> u64 {
 /// # Examples
 ///
 /// ```
-/// # use tightbeam::colony::common::StochasticForager;
+/// # use tightbeam::colony::cluster::StochasticForager;
 /// let forager = StochasticForager::default()
 ///     .with_exploration_floor(250)
 ///     .with_repellency_threshold(9_000);
@@ -139,10 +127,12 @@ fn splitmix64_next(state: &AtomicU64) -> u64 {
 /// - Di Caro & Dorigo (1998), AntNet, which routes by stochastic (not argmax)
 ///   stigmergy: [doi:10.1613/jair.530](https://doi.org/10.1613/jair.530)
 /// - Nakrani & Tovey (2004), honey-bee dynamic server allocation:
-///   [doi:10.1177/105971230401200308](https://doi.org/10.1177/105971230401200308)
+///   [doi:10.1177/105971230401200308][nakrani-2004]
 /// - Saran et al. (2007), termite trail pheromone that turns repellent
 ///   above ~10 pg/cm:
 ///   [doi:10.1007/s10886-006-9229-2](https://doi.org/10.1007/s10886-006-9229-2)
+///
+/// [nakrani-2004]: https://doi.org/10.1177/105971230401200308
 #[derive(Debug, Clone)]
 pub struct StochasticForager {
 	exploration_floor: u64,
@@ -298,110 +288,13 @@ impl LoadBalancer for RoundRobin {
 	}
 }
 
-/// Whether a runtime has entered drain.
-///
-/// Every clone of the handle shares one flag, so its readers agree:
-///
-/// - The hive control plane refuses each command that yields to load.
-/// - [`Hive::is_draining`](crate::colony::hive::Hive::is_draining) reports the flag.
-///
-/// The hive drain aborts the scaling loop and the re-announce loop through the
-/// runtime's [`TaskGroup`] before it waits on commands in flight.
-///
-/// Drain is terminal. A runtime that has entered it stays in it.
-#[derive(Clone, Default)]
-pub struct DrainMode(Arc<AtomicBool>);
-
-impl DrainMode {
-	/// Enters drain.
-	pub fn begin(&self) {
-		self.0.store(true, Ordering::Release);
-	}
-
-	/// Returns `true` once drain has begun.
-	#[must_use]
-	pub fn is_draining(&self) -> bool {
-		self.0.load(Ordering::Acquire)
-	}
-}
-
-/// The background tasks one runtime started.
-///
-/// A runtime keeps one group and puts every task it spawns in it, so one call
-/// stops that work when the runtime stops. The handle is shared, so a context
-/// handed to a request handler can adopt work the handler starts.
-///
-/// # Single spawn path
-///
-/// A task spawned outside the group runs past the stop that was meant to
-/// end it (CWE-772), which is why the group is the only spawn path these
-/// runtimes offer.
-#[derive(Clone, Default)]
-pub struct TaskGroup(Arc<Mutex<TaskGroupState>>);
-
-/// The handles of the tasks that run, and whether the group has stopped.
-#[derive(Default)]
-struct TaskGroupState {
-	running: Vec<rt::JoinHandle>,
-	stopped: bool,
-}
-
-impl TaskGroup {
-	/// Takes ownership of `handle`, and releases each handle whose task ended.
-	///
-	/// A stopped group aborts `handle` on arrival, so work that starts while
-	/// the runtime stops ends with the stop (CWE-772). The sweep bounds
-	/// the group by the tasks that still run, which keeps a runtime that
-	/// spawns per request at the size of its live work.
-	pub fn adopt(&self, handle: rt::JoinHandle) {
-		let mut state = self.state();
-		if state.stopped {
-			rt::abort(&handle);
-			return;
-		}
-
-		state.running.retain(|task| !task.is_finished());
-		state.running.push(handle);
-	}
-
-	/// Runs `task` under this group's ownership.
-	pub fn spawn<F>(&self, task: F)
-	where
-		F: Future<Output = ()> + Send + 'static,
-	{
-		self.adopt(rt::spawn(task));
-	}
-
-	/// Stops the group and aborts every task it still owns.
-	///
-	/// A stop is terminal: a later [`TaskGroup::spawn`] aborts on
-	/// arrival, so the stop reaches every task the group starts.
-	pub fn abort_all(&self) {
-		let mut state = self.state();
-		state.stopped = true;
-		for task in state.running.drain(..) {
-			rt::abort(&task);
-		}
-	}
-
-	/// The group state, recovered from a poisoned lock because every write
-	/// under the guard leaves a whole handle list and a whole flag.
-	fn state(&self) -> MutexGuard<'_, TaskGroupState> {
-		self.0.lock().unwrap_or_else(PoisonError::into_inner)
-	}
-}
-
 #[cfg(test)]
 mod tests {
-	use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-	use core::time::Duration;
-
 	use std::collections::HashSet;
-	use std::panic::{catch_unwind, AssertUnwindSafe};
 
 	use super::{
-		DrainMode, InstanceMetrics, LoadBalancer, PowerOfTwoChoices, RoundRobin, StochasticForager, TaskGroup,
-		DEFAULT_EXPLORATION_FLOOR, DEFAULT_REPELLENCY_THRESHOLD, MAX_PHEROMONE,
+		InstanceMetrics, LoadBalancer, PowerOfTwoChoices, RoundRobin, StochasticForager, DEFAULT_EXPLORATION_FLOOR,
+		DEFAULT_REPELLENCY_THRESHOLD, MAX_PHEROMONE,
 	};
 
 	fn pool(pheromones: impl AsRef<[u64]>) -> Vec<InstanceMetrics> {
@@ -539,157 +432,5 @@ mod tests {
 		let dead = pool([0, 0, 0]);
 		let seen: HashSet<usize> = (0..256).filter_map(|_| tuned.select(&dead)).collect();
 		assert_eq!(seen.len(), dead.len());
-	}
-
-	#[test]
-	fn a_fresh_runtime_is_not_draining() {
-		assert!(!DrainMode::default().is_draining());
-	}
-
-	#[test]
-	fn every_holder_of_the_handle_sees_the_drain() {
-		let mode = DrainMode::default();
-		let reader = mode.clone();
-		mode.begin();
-		assert!(reader.is_draining());
-	}
-
-	/// Counts the handles the group still holds.
-	fn owned(group: &TaskGroup) -> usize {
-		group.0.lock().expect("task group lock").running.len()
-	}
-
-	/// Poisons the group lock, as a task that panics while it holds the
-	/// guard would.
-	fn poison(group: &TaskGroup) {
-		let panicked = catch_unwind(AssertUnwindSafe(|| {
-			let _held = group.0.lock().expect("the lock is live until this panic");
-			panic!("poison the task group lock");
-		}));
-
-		assert!(panicked.is_err());
-		assert!(group.0.is_poisoned());
-	}
-
-	/// A span longer than any test moves its clock. A task that sleeps it out
-	/// and then finishes was never stopped.
-	const LONG_RUN: Duration = Duration::from_secs(30);
-
-	/// The pause between two beats of the task under test.
-	const BEAT: Duration = Duration::from_millis(5);
-
-	/// Moves the paused test clock forward by `span` and lets every task it
-	/// woke run.
-	///
-	/// The test runtime runs on one thread, so the yield hands that thread to
-	/// each task the advance made ready before the test reads what it did.
-	async fn advance_past(span: Duration) {
-		tokio::time::advance(span).await;
-		tokio::task::yield_now().await;
-	}
-
-	#[tokio::test(start_paused = true)]
-	async fn stopping_a_group_aborts_the_work_it_owns() {
-		static FINISHED: AtomicBool = AtomicBool::new(false);
-
-		let group = TaskGroup::default();
-		group.spawn(async {
-			tokio::time::sleep(LONG_RUN).await;
-			FINISHED.store(true, Ordering::SeqCst);
-		});
-
-		tokio::task::yield_now().await;
-		group.abort_all();
-		advance_past(LONG_RUN * 2).await;
-		assert!(!FINISHED.load(Ordering::SeqCst));
-	}
-
-	/// The group that owns a beat ends it even past the beat's own checks,
-	/// so work cannot outlast the stop that withdrew its routes (CWE-362).
-	#[tokio::test(start_paused = true)]
-	async fn a_running_task_ends_when_its_group_stops() {
-		static BEATS: AtomicUsize = AtomicUsize::new(0);
-
-		let group = TaskGroup::default();
-		group.spawn(async {
-			loop {
-				BEATS.fetch_add(1, Ordering::SeqCst);
-				tokio::time::sleep(BEAT).await;
-			}
-		});
-
-		tokio::task::yield_now().await;
-		group.abort_all();
-		let settled = BEATS.load(Ordering::SeqCst);
-		assert_ne!(settled, 0);
-
-		advance_past(BEAT * 8).await;
-		assert_eq!(BEATS.load(Ordering::SeqCst), settled);
-	}
-
-	/// A poisoned lock still holds every handle the group adopted, so the stop
-	/// reaches them all (CWE-772).
-	#[tokio::test(start_paused = true)]
-	async fn stopping_a_poisoned_group_aborts_the_work_it_owns() {
-		static FINISHED: AtomicBool = AtomicBool::new(false);
-
-		let group = TaskGroup::default();
-		group.spawn(async {
-			tokio::time::sleep(LONG_RUN).await;
-			FINISHED.store(true, Ordering::SeqCst);
-		});
-		tokio::task::yield_now().await;
-		poison(&group);
-
-		group.abort_all();
-		advance_past(LONG_RUN * 2).await;
-		assert!(!FINISHED.load(Ordering::SeqCst));
-	}
-
-	/// A poisoned lock carries no damaged state, so a live group still runs
-	/// the work it adopts.
-	#[tokio::test(start_paused = true)]
-	async fn a_poisoned_group_runs_the_work_it_adopts() {
-		static FINISHED: AtomicBool = AtomicBool::new(false);
-
-		let group = TaskGroup::default();
-		poison(&group);
-
-		group.spawn(async {
-			tokio::time::sleep(BEAT).await;
-			FINISHED.store(true, Ordering::SeqCst);
-		});
-		tokio::task::yield_now().await;
-
-		advance_past(BEAT * 8).await;
-		assert!(FINISHED.load(Ordering::SeqCst));
-	}
-
-	#[tokio::test(start_paused = true)]
-	async fn work_started_after_the_stop_does_not_outlive_it() {
-		static FINISHED: AtomicBool = AtomicBool::new(false);
-
-		let group = TaskGroup::default();
-		group.abort_all();
-		group.spawn(async {
-			tokio::time::sleep(BEAT).await;
-			FINISHED.store(true, Ordering::SeqCst);
-		});
-
-		advance_past(BEAT * 8).await;
-		assert!(!FINISHED.load(Ordering::SeqCst));
-		assert_eq!(owned(&group), 0);
-	}
-
-	/// The test runtime runs on one thread, so the yield runs the empty task
-	/// to its end before the second spawn sweeps the group.
-	#[tokio::test]
-	async fn a_finished_task_leaves_the_group_on_the_next_spawn() {
-		let group = TaskGroup::default();
-		group.spawn(async {});
-		tokio::task::yield_now().await;
-
-		group.spawn(core::future::pending());
-		assert_eq!(owned(&group), 1);
 	}
 }

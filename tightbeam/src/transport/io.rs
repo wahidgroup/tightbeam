@@ -60,7 +60,7 @@ mod deadline {
 use deadline::*;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::transport::state::ServerHandshakeSlot;
+use crate::transport::state::{CollectStep, ServerHandshakeSlot};
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 mod handshake {
@@ -276,17 +276,6 @@ pub trait MessageIO {
 			}
 		}
 	}
-}
-
-/// The outcome of one protocol-agnostic collector step.
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-pub enum CollectStep {
-	/// The step read a cleartext handshake container for the server-side
-	/// dispatcher, decoded once with the bytes it arrived as.
-	Handshake(HandshakeMessage),
-	/// The step read an application envelope, decrypted, or in cleartext
-	/// where the session admits cleartext.
-	Envelope(TransportEnvelope),
 }
 
 /// Message I/O with session encryption and the handshake drivers.
@@ -623,10 +612,9 @@ pub trait EncryptedMessageIO: MessageIO {
 				return Err(TransportError::InvalidMessage);
 			}
 
-			// The driver attempts the transition first, so it writes the
-			// response only after the session accepts the move. A write ahead
-			// of the refusal would send a handshake response on a session that
-			// already agreed one.
+			// The driver writes the response only after the session accepts the
+			// move, because a write ahead of a refusal would send a handshake
+			// response on a session that already agreed one.
 			let now = self.clock().monotonic();
 			if !self.session_state_mut().begin_handshake(now) {
 				return Err(TransportError::InvalidState);

@@ -8,7 +8,7 @@
 //! - The dial carries a [`SignedAdvertisement`] alone, which [`ColonyConfig::mint_ad_frame`] alone builds.
 //! - The connection stays pooled only when the gateway that answered proves it is a flood member.
 //! - Every other dial of a route-named target goes through a [`BoundDial`],
-//!   and every gossip dial through a membership proof.
+//!   and every gossip dial goes through a membership proof.
 //!
 //! [`BoundDial`]: crate::colony::bound_dial::BoundDial
 
@@ -18,7 +18,7 @@ use crate::builder::frame::FrameBuilder;
 use crate::builder::TypeBuilder;
 use crate::colony::cluster::runtime::bounds::{ClusterPool, ColonyConfig, ColonyDialProtocol};
 use crate::colony::cluster::ClusterError;
-use crate::colony::common::{ClusterRequest, PeerAdvertisement, PeerAdvertisementResponse};
+use crate::colony::protocol::{ClusterRequest, PeerAdvertisement, PeerAdvertisementResponse};
 use crate::decode;
 use crate::policy::TransitStatus;
 use crate::transport::{PooledClient, Protocol};
@@ -44,7 +44,7 @@ impl<P: ColonyDialProtocol> ColonyConfig<P> {
 	/// Creates and signs one peer advertisement frame for the local slate.
 	///
 	/// One frame serves both delivery paths, so direct dials and gossip
-	/// rumors carry the same signer-binds-to-address unit.
+	/// rumors carry the same unit, which binds the signer to the address.
 	///
 	/// # Delivery paths
 	///
@@ -107,7 +107,7 @@ impl<P: ColonyDialProtocol> Advertiser<P> {
 	/// - [`ClusterError::Transport`] -- the dial or the emit failed, or the
 	///   runtime fault model injects a fault at the eviction of an unproven
 	///   answer.
-	/// - [`ClusterError::NoResponse`] -- the gateway closed without answering.
+	/// - [`ClusterError::NoResponse`] -- the gateway closed before it answered.
 	/// - [`ClusterError::Frame`] -- the answer does not decode.
 	pub(crate) async fn advertise(
 		&self,

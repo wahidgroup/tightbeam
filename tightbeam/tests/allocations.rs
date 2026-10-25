@@ -34,7 +34,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use tightbeam::colony::cluster::{AdmittedGossip, GossipDigest, WantList};
-use tightbeam::colony::common::GossipRumor;
+use tightbeam::colony::protocol::GossipRumor;
 use tightbeam::colony::servlet::ServletContext;
 use tightbeam::compress::ZstdCompression;
 use tightbeam::core::Inflator;

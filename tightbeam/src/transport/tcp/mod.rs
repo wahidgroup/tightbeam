@@ -28,7 +28,7 @@ use std::net::{TcpListener, TcpStream};
 #[cfg(feature = "std")]
 use crate::transport::TightBeamAddress;
 #[cfg(feature = "tcp")]
-use crate::transport::{tcp::sync::TcpTransport, Protocol, ProtocolStream};
+use crate::transport::{tcp::sync::TcpTransport, Protocol, ProtocolStream, TransportError};
 
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 pub mod r#async;
@@ -37,8 +37,53 @@ pub mod sync;
 
 /// The blocking TCP listener trait, which a networking backend implements to
 /// accept a stream and the address of its peer.
+///
+/// The house [`TcpListener`](sync::TcpListener) accepts on the backend and
+/// builds each transport from the stream the backend returns.
+///
+/// # Examples
+///
+/// ```
+/// use std::io::Error as IoError;
+/// use std::net::{SocketAddr, TcpListener as NetTcpListener, TcpStream as NetTcpStream};
+///
+/// use tightbeam::crypto::profiles::DefaultCryptoProvider;
+/// use tightbeam::testing::{TestIdentity, TestKey};
+/// use tightbeam::transport::tcp::sync::TcpListener;
+/// use tightbeam::transport::tcp::TcpListenerTrait;
+/// use tightbeam::transport::TransportEncryptionConfig;
+///
+/// /// A backend that accepts on a socket it bound itself.
+/// struct Backend(NetTcpListener);
+///
+/// impl TcpListenerTrait for Backend {
+///     type Stream = NetTcpStream;
+///     type Error = IoError;
+///
+///     fn accept(&self) -> Result<(NetTcpStream, SocketAddr), IoError> {
+///         self.0.accept()
+///     }
+/// }
+///
+/// let backend = Backend(NetTcpListener::bind("127.0.0.1:0")?);
+/// let identity = TestIdentity::of(&TestKey::insecure_fixed_signing());
+/// let config = TransportEncryptionConfig::<DefaultCryptoProvider>::new(identity);
+/// let _listener = TcpListener::from_listener_with(backend, config)?;
+/// # Ok::<(), Box<dyn core::error::Error>>(())
+/// ```
 #[cfg(feature = "tcp")]
-pub trait TcpListenerTrait: Protocol + Send {
+pub trait TcpListenerTrait: Send {
+	/// The stream of one accepted connection.
+	type Stream: ProtocolStream;
+	/// The error the listener reports, convertible into a [`TransportError`].
+	type Error: Into<TransportError>;
+
+	/// Accepts one connection, and returns its stream and the address of its
+	/// peer.
+	///
+	/// # Errors
+	///
+	/// - `Self::Error` -- the listener accepts no connection.
 	fn accept(&self) -> Result<(Self::Stream, SocketAddr), Self::Error>;
 }
 
@@ -84,13 +129,6 @@ impl Protocol for TcpListener {
 }
 
 // The `EncryptedProtocol` impl of sync TCP sits on the wrapper in `sync.rs`.
-
-#[cfg(all(feature = "std", feature = "tcp"))]
-impl TcpListenerTrait for TcpListener {
-	fn accept(&self) -> Result<(Self::Stream, SocketAddr), Self::Error> {
-		TcpListener::accept(self)
-	}
-}
 
 #[cfg(all(feature = "std", feature = "tcp"))]
 impl ProtocolStream for TcpStream {
@@ -197,7 +235,7 @@ macro_rules! impl_tcp_common {
 		where
 			TransportError: From<S::Error>,
 		{
-			/// Build a transport over `stream` from `config`.
+			/// Builds a transport over `stream` from `config`.
 			///
 			/// This is the one constructor. The configuration's provisioning
 			/// already answered the dialer rule, so the session starts where
@@ -246,7 +284,7 @@ macro_rules! impl_tcp_common {
 				self.state.receipt()
 			}
 
-			/// Override the budget-grant policy that the server consults
+			/// Overrides the budget-grant policy that the server consults
 			/// between the client's transport offer and its accept. By
 			/// default, the server grants the ceiling of its local
 			/// configuration.
@@ -259,7 +297,7 @@ macro_rules! impl_tcp_common {
 				self
 			}
 
-			/// Set the observer of session outcomes for the budget-bearing
+			/// Sets the observer of session outcomes for the budget-bearing
 			/// handshakes that this endpoint serves.
 			#[must_use]
 			pub fn with_session_observer(
@@ -270,7 +308,7 @@ macro_rules! impl_tcp_common {
 				self
 			}
 
-			/// Set the approver that this endpoint consults before it
+			/// Sets the approver that this endpoint consults before it
 			/// countersigns a challenge-bearing receipt.
 			#[must_use]
 			pub fn with_receipt_approver(
@@ -281,7 +319,7 @@ macro_rules! impl_tcp_common {
 				self
 			}
 
-			/// Set the handshake protocol that this endpoint runs once
+			/// Sets the handshake protocol that this endpoint runs once
 			/// provisioned.
 			#[must_use]
 			pub fn with_handshake_protocol(
@@ -292,7 +330,7 @@ macro_rules! impl_tcp_common {
 				self
 			}
 
-			/// Attach the connection's instrumentation collector.
+			/// Attaches the connection's instrumentation collector.
 			#[cfg(feature = "instrument")]
 			#[must_use]
 			pub fn with_trace(mut self, trace: $crate::trace::TraceCollector) -> Self {

@@ -1,6 +1,6 @@
-//! Reader driver that routes inbound envelopes, reassembles chunked payloads
-//! under granted credit, and buffers control-plane replies so the read loop
-//! keeps running while the writer queue is full.
+//! The reader driver, which routes inbound envelopes, reassembles chunked
+//! payloads under granted credit, and buffers control-plane replies so the
+//! read loop keeps running while the writer queue is full.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -10,7 +10,7 @@ use futures::future::{select, Either};
 use futures::{pin_mut, SinkExt, StreamExt};
 
 use super::body::{BodyEvent, DrainNote, ForwardedStream, StreamBody};
-use super::flow::{cap_as_usize, BufferedGrantor, ChunkSize, CreditGrantor};
+use super::flow::{cap_as_usize, BufferedGrantor, ChunkSize};
 use super::link::MuxLink;
 use super::outbound::Outbound;
 use super::reassembly::{Reassembly, ReassemblyBudget};
@@ -23,7 +23,7 @@ use crate::transport::envelopes::{
 };
 use crate::transport::handshake::negotiation::MuxSettings;
 use crate::transport::io::EnvelopeSource;
-use crate::transport::multiplex::{StreamId, StreamRoute};
+use crate::transport::multiplex::{CreditGrantor, StreamId, StreamRoute};
 use crate::transport::{TransportError, TransportResult};
 use crate::Frame;
 
@@ -47,7 +47,8 @@ use crate::transport::handshake::HandshakeError;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::rekey::{EpochInstall, RekeyDriver, RequestAnswer, ServerAckOutcome};
 
-/// Cap on the ping acks the reader buffers while the writer queue is full.
+/// The cap on the ping acks that the reader buffers while the writer queue is
+/// full.
 ///
 /// Probes beyond this backlog draw no ack, so a ping flood against a
 /// saturated connection extracts nothing.
@@ -57,7 +58,7 @@ use crate::transport::rekey::{EpochInstall, RekeyDriver, RequestAnswer, ServerAc
 /// - CVE-2019-9512, HTTP/2 Ping Flood: <https://nvd.nist.gov/vuln/detail/CVE-2019-9512>
 const MAX_PENDING_PING_ACKS: usize = 4;
 
-/// Peer-initiated event routed from the reader to the responder.
+/// A peer-initiated event that the reader routes to the responder.
 pub enum InboundEvent {
 	/// A unary-kind stream, reassembled into its message frame.
 	Request(u32, Arc<Frame>),
@@ -72,7 +73,7 @@ pub enum InboundEvent {
 	Cancel(u32),
 }
 
-/// Map the code of a settlement or approval refusal to its GoAway reason.
+/// Maps the code of a settlement or approval refusal to its GoAway reason.
 ///
 /// Application codes at or above [`MUX_APPLICATION_CODE_FLOOR`] pass through,
 /// and every other code is a settlement failure.
@@ -85,15 +86,16 @@ fn refusal_reason(code: u32) -> GoAwayReason {
 	GoAwayReason::SettlementFailed
 }
 
-/// Receiver-side state of one inbound stream direction: the credit it was
+/// The receiver-side state of one inbound stream direction: the credit it was
 /// granted, and the bytes it reassembled.
 struct RecvStream {
-	/// Chunks concatenated in arrival order, under the stream and connection
-	/// ceilings. The AEAD channel already proves order and completeness.
+	/// The chunks, concatenated in arrival order under the stream and
+	/// connection ceilings. The AEAD channel already proves order and
+	/// completeness.
 	bytes: Reassembly,
-	/// Count of chunks accepted so far.
+	/// The count of chunks accepted so far.
 	received: u64,
-	/// Absolute cumulative chunk limit granted to the sender.
+	/// The absolute cumulative chunk limit granted to the sender.
 	limit: u64,
 }
 
@@ -102,7 +104,7 @@ impl RecvStream {
 		Self { bytes: Reassembly::new(budget), received: 0, limit }
 	}
 
-	/// Account one accepted chunk against the granted limit and buffer it.
+	/// Accounts one accepted chunk against the granted limit and buffers it.
 	///
 	/// Returns `false` when the sender overran its credit, the hard reassembly
 	/// byte ceiling, or the connection ceiling.
@@ -134,35 +136,35 @@ where
 	link: MuxLink,
 	inbound: mpsc::Sender<InboundEvent>,
 	grantor: Arc<dyn CreditGrantor>,
-	/// Concurrent peer-initiated streams accepted, as advertised locally. The
-	/// cap bounds `peer_reassembly`, so partial opens hold no state beyond it,
-	/// under the stream accounting of [RFC 9113 § 5.1.2][rfc9113-5.1.2].
+	/// The concurrent peer-initiated streams accepted, as advertised locally.
+	/// The cap bounds `peer_reassembly`, so partial opens hold no state beyond
+	/// it, under the stream accounting of [RFC 9113 § 5.1.2][rfc9113-5.1.2].
 	///
 	/// [rfc9113-5.1.2]: https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.2
 	peer_cap: u32,
-	/// Largest chunk payload accepted inbound, as advertised locally.
+	/// The largest chunk payload accepted inbound, as advertised locally.
 	recv_chunk_size: ChunkSize,
-	/// Initial chunk limit granted to each inbound stream direction.
+	/// The initial chunk limit granted to each inbound stream direction.
 	initial_recv_credit: u64,
-	/// Credits the peer may still spend inbound, or `None` when the session is
-	/// unmetered.
+	/// The credits that the peer may still spend inbound, or `None` when the
+	/// session is unmetered.
 	recv_budget: Option<u64>,
-	/// Reassembly of peer-initiated request streams.
+	/// The reassembly of peer-initiated request streams.
 	peer_reassembly: HashMap<u32, RecvStream>,
-	/// Streaming peer-initiated requests, whose chunks forward to the
+	/// The streaming peer-initiated requests, whose chunks forward to the
 	/// handler's [`StreamBody`] instead of reassembling. The map holds only
 	/// peer-initiated stream IDs, and locally-initiated duplex replies live in
 	/// the shared `duplex_recv` registry.
 	peer_bodies: HashMap<u32, ForwardedStream>,
-	/// Reassembly of responses to locally-initiated streams.
+	/// The reassembly of responses to locally-initiated streams.
 	local_reassembly: HashMap<u32, RecvStream>,
-	/// Consumption reports from live stream bodies, one channel slot per
+	/// The consumption reports from live stream bodies, one channel slot per
 	/// body. A body whose slot is taken reports its current count once the
 	/// slot frees ([`StreamBody`]), so a stalled read loop holds at most one
 	/// note per live body.
 	drained: mpsc::Receiver<DrainNote>,
-	/// Control commands buffered while the writer queue is full, so the read
-	/// loop keeps running. [RFC 9113 § 5.2.2][rfc9113-5.2.2] warns of the
+	/// The control commands buffered while the writer queue is full, so the
+	/// read loop keeps running. [RFC 9113 § 5.2.2][rfc9113-5.2.2] warns of the
 	/// deadlock a parked reader causes.
 	///
 	/// The buffer is bounded:
@@ -173,29 +175,29 @@ where
 	///
 	/// [rfc9113-5.2.2]: https://datatracker.ietf.org/doc/html/rfc9113#section-5.2.2
 	pending_control: VecDeque<Outbound>,
-	/// Role-fixed rekey exchange. `None` keeps every rekey leg an
+	/// The role-fixed rekey exchange. `None` keeps every rekey leg an
 	/// unsolicited protocol violation.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	rekey: Option<RekeyDriver>,
-	/// Client epoch state held between the `RekeyAck` and the server's
+	/// The client epoch state held between the `RekeyAck` and the server's
 	/// `RekeyDone`. The receive cipher installs and the receipt rotates only at
 	/// the `RekeyDone` boundary.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pending_install: Option<PendingDone>,
-	/// Negotiated inbound budget, restored at each epoch boundary.
+	/// The negotiated inbound budget, restored at each epoch boundary.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	initial_recv_budget: Option<u64>,
-	/// Receive-direction records left at which the client opens a renewal. The
-	/// figure tracks the peer's send counter.
+	/// The receive-direction records left at which the client opens a renewal.
+	/// The figure tracks the peer's send counter.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	renewal_floor: u64,
-	/// Receive-direction records left at the last epoch install, for the
+	/// The receive-direction records left at the last epoch install, for the
 	/// server's minimum-spend flood bound.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	epoch_recv_baseline: u64,
 }
 
-/// Client epoch state parked between `RekeyAck` and `RekeyDone`.
+/// The client epoch state parked between `RekeyAck` and `RekeyDone`.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 struct PendingDone {
 	recv_cipher: RecvCipher,
@@ -213,11 +215,11 @@ enum ReaderEvent {
 }
 
 impl ReaderEvent {
-	/// Read one drain report off the note stream.
+	/// Reads one drain report off the note stream.
 	///
 	/// The driver holds a feedback sender for the body channel, so the note
-	/// stream outlives every body. [`None`] therefore means the flush
-	/// completed rather than that a body ended.
+	/// stream outlives every body, and [`None`] therefore means that the flush
+	/// completed.
 	fn drained(note: Option<DrainNote>) -> Self {
 		match note {
 			Some(note) => Self::Drained(note),
@@ -245,7 +247,7 @@ impl<R> MuxReaderDriver<R>
 where
 	R: EnvelopeSource,
 {
-	/// Assemble the reader driver over its shared state and channels.
+	/// Assembles the reader driver over its shared state and channels.
 	///
 	/// This is the single construction point, so a new field has exactly one
 	/// home.
@@ -283,12 +285,12 @@ where
 		}
 	}
 
-	/// Override the receiver-side stream credit policy.
+	/// Overrides the receiver-side stream credit policy.
 	pub fn set_grantor(&mut self, grantor: Arc<dyn CreditGrantor>) {
 		self.grantor = grantor;
 	}
 
-	/// Attach in-band rekey in three steps:
+	/// Attaches in-band rekey in three steps:
 	///
 	/// 1. Seed the receipt accessor from the handshake artifact.
 	/// 2. Stamp the epoch baseline from the remaining records of the receive cipher.
@@ -301,7 +303,7 @@ where
 		self.rekey = Some(driver);
 	}
 
-	/// Run the driver until the connection ends. Pending streams observe the
+	/// Runs the driver until the connection ends. Pending streams observe the
 	/// failure.
 	///
 	/// # Errors
@@ -314,8 +316,8 @@ where
 		self.route_envelopes().await
 	}
 
-	/// Route inbound envelopes to their pending streams or handlers,
-	/// interleaving body-drain reports into credit replenishment.
+	/// Routes inbound envelopes to their pending streams or handlers, and
+	/// interleaves body-drain reports into credit replenishment.
 	async fn route_envelopes(&mut self) -> TransportResult<()> {
 		loop {
 			match self.next_event().await? {
@@ -334,7 +336,7 @@ where
 		}
 	}
 
-	/// Route one inbound mux envelope.
+	/// Routes one inbound mux envelope.
 	async fn route_mux(&mut self, mux: MuxEnvelope) -> TransportResult<()> {
 		match mux {
 			MuxEnvelope::End(package) => self.route_end(package),
@@ -375,11 +377,11 @@ where
 		}
 	}
 
-	/// Open a renewal from the receive direction.
+	/// Opens a renewal from the receive direction.
 	///
 	/// The client's receive counter tracks the server's send counter on the
-	/// ordered channel, so approaching the record limit here opens a renewal
-	/// without any wire addition.
+	/// ordered channel, so a renewal opens here as the record limit nears, with
+	/// no wire addition.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	fn watch_recv_records(&mut self) -> TransportResult<()> {
 		if self.reader.remaining_records() > self.renewal_floor {
@@ -395,14 +397,14 @@ where
 		self.queue_control(request)
 	}
 
-	/// Drain gracefully on a settlement or approval refusal, preserving the
-	/// connection long enough for owed traffic and the recorded evidence to
-	/// survive the disagreement.
+	/// Drains on a settlement or approval refusal, and keeps the connection up
+	/// long enough for owed traffic and the recorded evidence to survive the
+	/// disagreement.
 	///
 	/// # Backpressure
 	///
 	/// This runs on the read loop, so the GoAway buffers through
-	/// [`Self::queue_command`] rather than awaiting a full outbound queue.
+	/// [`Self::queue_command`], and the loop awaits no full outbound queue.
 	/// Reads must continue under write backpressure, or mutually saturated
 	/// peers deadlock (RFC 9113 §5.2).
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -423,7 +425,7 @@ where
 		Ok(())
 	}
 
-	/// On the server leg, issue the epoch receipt for a renewal request.
+	/// Routes a renewal request on the server leg and issues its epoch receipt.
 	///
 	/// The rekey-flood bound (CWE-400) makes a request a protocol violation in
 	/// two cases:
@@ -463,7 +465,7 @@ where
 		}
 	}
 
-	/// Client leg of the rekey exchange, in order:
+	/// Routes the response on the client leg of the rekey exchange, in order:
 	///
 	/// 1. Park new c2s admissions.
 	/// 2. Verify and countersign the epoch receipt.
@@ -473,8 +475,8 @@ where
 	/// The receive-side install waits for `RekeyDone`.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	async fn route_rekey_response(&mut self, package: MuxRekeyResponsePackage) -> TransportResult<()> {
-		// Admitting the response parks new c2s admissions before the driver
-		// verifies it, so no admission can debit the old epoch once the
+		// The admission of the response parks new c2s admissions before the
+		// driver verifies it, so no admission can debit the old epoch once the
 		// ack is in motion.
 		if !self.link.shared().admit_rekey_response() {
 			return Err(self.protocol_violation());
@@ -513,7 +515,8 @@ where
 		}
 	}
 
-	/// On the server leg, settle the countersignature and switch epochs.
+	/// Routes the `RekeyAck` on the server leg: it settles the countersignature
+	/// and switches epochs.
 	///
 	/// The receive cipher installs even on a settlement refusal, because the
 	/// client switched its send direction at the `RekeyAck` boundary and the
@@ -558,7 +561,7 @@ where
 		self.queue_command(install)
 	}
 
-	/// Client leg, on which `RekeyDone` activates the new epoch.
+	/// Routes the `RekeyDone` of the client leg, which activates the new epoch.
 	///
 	/// The receive cipher installs, budgets reset, the receipt rotates, and
 	/// parked admissions resume.
@@ -583,7 +586,7 @@ where
 		Ok(())
 	}
 
-	/// Activate the terms of a fresh epoch.
+	/// Activates the terms of a fresh epoch.
 	///
 	/// Both budgets reset to the negotiated figures, and the dual-signed
 	/// receipt rotates. The credit-match invariant keeps epoch terms equal to
@@ -604,7 +607,7 @@ where
 		Ok(())
 	}
 
-	/// Enforce the advertised chunk ceiling and debit the inbound session
+	/// Enforces the advertised chunk ceiling and debits the inbound session
 	/// budget for one chunk.
 	///
 	/// Both overruns are protocol violations, because the sender knows the
@@ -627,7 +630,7 @@ where
 		Ok(())
 	}
 
-	/// Await the next unit of read-loop work: an inbound envelope, a
+	/// Awaits the next unit of read-loop work: an inbound envelope, a
 	/// body-drain report, or a completed control flush. The read races the
 	/// flush and the drain reports, and the first one ready wins.
 	async fn next_event(&mut self) -> TransportResult<ReaderEvent> {
@@ -657,7 +660,7 @@ where
 		}
 	}
 
-	/// Replenish a streaming stream's credit from consumer progress.
+	/// Replenishes a streaming stream's credit from consumer progress.
 	///
 	/// Whether this endpoint initiated the stream picks the ledger:
 	/// peer-initiated request bodies live in `peer_bodies`, and
@@ -701,8 +704,8 @@ where
 		self.queue_credit(note.stream_id, new_limit)
 	}
 
-	/// Hand a control command to the writer, buffering on a full
-	/// queue instead of parking the read loop.
+	/// Hands a control command to the writer, and buffers it on a full queue,
+	/// so the read loop keeps running.
 	fn queue_command(&mut self, command: Outbound) -> TransportResult<()> {
 		if !self.pending_control.is_empty() {
 			self.pending_control.push_back(command);
@@ -719,13 +722,13 @@ where
 		}
 	}
 
-	/// Hand a control envelope to the writer, buffering on a full
-	/// queue instead of parking the read loop.
+	/// Hands a control envelope to the writer, and buffers it on a full queue,
+	/// so the read loop keeps running.
 	fn queue_control(&mut self, envelope: TransportEnvelope) -> TransportResult<()> {
 		self.queue_command(Outbound::Envelope(envelope))
 	}
 
-	/// Queue a credit grant, superseding any buffered grant for the same
+	/// Queues a credit grant, which supersedes any buffered grant for the same
 	/// stream, because `Credit` is an absolute limit and only the newest
 	/// matters.
 	fn queue_credit(&mut self, stream_id: u32, new_limit: u64) -> TransportResult<()> {
@@ -733,7 +736,7 @@ where
 		self.queue_control(MuxCreditPackage::new(stream_id, new_limit).into())
 	}
 
-	/// Drop any buffered grant for `stream_id` when the stream closes.
+	/// Drops any buffered grant for `stream_id` when the stream closes.
 	///
 	/// Stream IDs never recur, so a leftover grant is dead weight that would
 	/// accumulate across stream churn under writer backpressure.
@@ -741,8 +744,8 @@ where
 		self.pending_control.retain(|envelope| !envelope.is_credit_grant_for(stream_id));
 	}
 
-	/// Queue `envelope` while fewer than `cap` buffered commands satisfy
-	/// `in_class`, and drop it otherwise.
+	/// Queues `envelope` while fewer than `cap` buffered commands satisfy
+	/// `in_class`, and drops it otherwise.
 	///
 	/// A peer that provokes one class of control faster than a stalled
 	/// writer drains it buys no memory past the cap (CWE-770).
@@ -760,13 +763,13 @@ where
 		self.queue_control(envelope)
 	}
 
-	/// Queue a ping ack. Probes beyond [`MAX_PENDING_PING_ACKS`] draw no ack.
+	/// Queues a ping ack. Probes beyond [`MAX_PENDING_PING_ACKS`] draw no ack.
 	fn queue_ping_ack(&mut self, package: MuxPingPackage) -> TransportResult<()> {
 		self.queue_capped(package.into(), Outbound::is_ping_ack, MAX_PENDING_PING_ACKS)
 	}
 
-	/// Consult the grantor and queue a credit grant when it raises
-	/// the stream's limit.
+	/// Consults the grantor and queues a credit grant when it raises the
+	/// stream's limit.
 	fn maybe_grant(&mut self, stream_id: u32, stream: &mut RecvStream) -> TransportResult<()> {
 		// Grants stop once the byte ceiling is full, because raising the chunk
 		// window admits no payload past it.
@@ -787,7 +790,7 @@ where
 		self.queue_credit(stream_id, new_limit)
 	}
 
-	/// Decode a reassembled stream payload into its message frame.
+	/// Decodes a reassembled stream payload into its message frame.
 	///
 	/// An empty payload is a message-less trailer. The frame decoder rejects a
 	/// frame that carries a field its version forbids, and this router answers
@@ -806,7 +809,7 @@ where
 		Ok(Some(frame))
 	}
 
-	/// Resolve a locally-initiated stream from its `End` trailer.
+	/// Resolves a locally-initiated stream from its `End` trailer.
 	fn route_end(&mut self, package: MuxEndPackage) -> TransportResult<()> {
 		let stream_id = package.stream_id();
 		if !self.link.shared().role().initiates(stream_id) {
@@ -816,7 +819,7 @@ where
 		self.evict_credit(stream_id);
 
 		// The sender debited its ledgers for this record whether or not the
-		// stream is still pending, so account it either way.
+		// stream is still pending, so the reader accounts it either way.
 		if !package.payload().is_empty() {
 			self.charge_inbound_chunk(package.payload())?;
 		}
@@ -828,9 +831,9 @@ where
 			return self.finish_duplex_body(forwarder, &package);
 		}
 
-		// Resolve before decoding. The reader discards a stale end without
-		// inspecting its payload, and a non-Ok trailer contributes no frame, so
-		// garbage bytes on either cannot tear down the connection.
+		// The stream resolves before the decode. The reader discards a stale
+		// end with its payload unread, and a non-Ok trailer contributes no
+		// frame, so garbage bytes on either cannot tear down the connection.
 		let Some(sender) = self.link.shared().remove_pending(stream_id) else {
 			self.local_reassembly.remove(&stream_id);
 			return Ok(());
@@ -853,8 +856,8 @@ where
 		Ok(())
 	}
 
-	/// Close a duplex reply body from its `End` trailer: forward the
-	/// final inline chunk when present, then the terminal event.
+	/// Closes a duplex reply body from its `End` trailer: it forwards the final
+	/// inline chunk when present, then the terminal event.
 	fn finish_duplex_body(&mut self, mut forwarder: ForwardedStream, package: &MuxEndPackage) -> TransportResult<()> {
 		if !package.payload().is_empty() && !forwarder.accept_and_forward(package.payload()) {
 			return Err(self.protocol_violation());
@@ -871,7 +874,7 @@ where
 		Ok(())
 	}
 
-	/// Register a peer open, then accept it or refuse it past the GoAway
+	/// Registers a peer open, then accepts it or refuses it past the GoAway
 	/// watermark.
 	async fn route_open(&mut self, package: MuxOpenPackage) -> TransportResult<()> {
 		let stream_id = package.stream_id();
@@ -882,7 +885,7 @@ where
 		}
 	}
 
-	/// Accept a peer open, routed by the kind the initiating call stamped on
+	/// Accepts a peer open, routed by the kind the initiating call stamped on
 	/// the record.
 	///
 	/// Unary streams reassemble into one frame, while streaming and duplex
@@ -894,8 +897,8 @@ where
 		}
 	}
 
-	/// Accept a unary-kind open by dispatching a whole-frame open, or by
-	/// parking the first chunk under the peer-initiated reassembly cap.
+	/// Accepts a unary-kind open: it dispatches a whole-frame open, or parks
+	/// the first chunk under the peer-initiated reassembly cap.
 	async fn accept_unary_open(&mut self, stream_id: u32, package: MuxOpenPackage) -> TransportResult<()> {
 		self.charge_inbound_chunk(package.payload())?;
 		if package.last() {
@@ -918,14 +921,14 @@ where
 		Ok(())
 	}
 
-	/// Count the streams the peer holds open across both consumption paths, so
+	/// Counts the streams the peer holds open across both consumption paths, so
 	/// mixed kinds share one flood bound.
 	fn live_peer_streams(&self) -> usize {
 		self.peer_bodies.len().saturating_add(self.peer_reassembly.len())
 	}
 
-	/// Accept a streaming-kind or duplex-kind open, whose chunks forward to the
-	/// handler's [`StreamBody`] as they arrive instead of reassembling.
+	/// Accepts a streaming-kind or duplex-kind open, whose chunks forward to
+	/// the handler's [`StreamBody`] as they arrive instead of reassembling.
 	///
 	/// The initial grant window doubles as the body channel bound, and further
 	/// grants follow consumer drain through [`Self::grant_streaming`].
@@ -961,8 +964,8 @@ where
 		self.dispatch_stream_open(stream_id, kind, body, route).await
 	}
 
-	/// Hand a fresh streaming body to the responder, refusing the
-	/// stream when no responder serves this connection.
+	/// Hands a fresh streaming body to the responder, and refuses the stream
+	/// when no responder serves this connection.
 	async fn dispatch_stream_open(
 		&mut self,
 		stream_id: u32,
@@ -979,7 +982,7 @@ where
 		Ok(())
 	}
 
-	/// Refuse an open past this endpoint's GoAway watermark.
+	/// Refuses an open past this endpoint's GoAway watermark.
 	///
 	/// The chunk still crossed the wire under the sender's ledgers, so the
 	/// reader debits it inbound.
@@ -993,7 +996,7 @@ where
 		Ok(())
 	}
 
-	/// Route a `Data` record by the side that initiated its stream.
+	/// Routes a `Data` record by the side that initiated its stream.
 	async fn route_data(&mut self, package: MuxDataPackage) -> TransportResult<()> {
 		let stream_id = package.stream_id();
 
@@ -1014,7 +1017,7 @@ where
 		Err(self.protocol_violation())
 	}
 
-	/// Append `payload` into `stream` or fail closed on credit overrun.
+	/// Appends `payload` into `stream`, or fails closed on a credit overrun.
 	fn accept_chunk_or_violate(
 		&mut self,
 		mut stream: RecvStream,
@@ -1028,15 +1031,15 @@ where
 		Ok(stream)
 	}
 
-	/// Detach a locally-initiated stream's reassembly, starting a
-	/// fresh one at the initial credit on its first chunk.
+	/// Detaches a locally-initiated stream's reassembly, and starts a fresh one
+	/// at the initial credit on its first chunk.
 	fn take_local_reassembly(&mut self, stream_id: u32) -> RecvStream {
 		self.local_reassembly
 			.remove(&stream_id)
 			.unwrap_or_else(|| RecvStream::new(self.initial_recv_credit, self.link.shared().reassembly_budget()))
 	}
 
-	/// Accept a non-final chunk and raise credit when the grantor asks.
+	/// Accepts a non-final chunk and raises credit when the grantor asks.
 	///
 	/// The caller parks the returned stream in the right reassembly map.
 	fn park_reassembly(
@@ -1052,7 +1055,7 @@ where
 		Ok(stream)
 	}
 
-	/// Route a continuation chunk of a peer-initiated request.
+	/// Routes a continuation chunk of a peer-initiated request.
 	async fn route_request_data(&mut self, package: MuxDataPackage) -> TransportResult<()> {
 		let stream_id = package.stream_id();
 		self.charge_inbound_chunk(package.payload())?;
@@ -1085,13 +1088,13 @@ where
 		Ok(())
 	}
 
-	/// Forward one streaming request chunk into its body channel.
+	/// Forwards one streaming request chunk into its body channel.
 	///
-	/// - Overrunning the granted limit is a violation, as in reassembly.
+	/// - An overrun of the granted limit is a violation, as in reassembly.
 	/// - A dropped body, refused at the cap or abandoned by its handler, evicts
 	///   the forwarder. The stream's remaining flushes then route through the
-	///   tolerated refused-stream path instead of being copied into a dead
-	///   channel, and consumed credit stays consumed, with no refund.
+	///   tolerated refused-stream path in place of a copy into a dead channel,
+	///   and consumed credit stays consumed, with no refund.
 	fn forward_request_chunk(&mut self, package: &MuxDataPackage) -> TransportResult<()> {
 		let stream_id = package.stream_id();
 		let Some(stream) = self.peer_bodies.get_mut(&stream_id) else {
@@ -1120,7 +1123,7 @@ where
 		Ok(())
 	}
 
-	/// Route a continuation chunk of a response to a locally-initiated stream.
+	/// Routes a continuation chunk of a response to a locally-initiated stream.
 	///
 	/// The responder grammar terminates with `End`, so a `Data(last)` record
 	/// is a protocol violation.
@@ -1155,7 +1158,7 @@ where
 		Ok(())
 	}
 
-	/// Decode a fully reassembled request and hand it to the responder.
+	/// Decodes a fully reassembled request and hands it to the responder.
 	async fn dispatch_request(&mut self, stream_id: u32, payload: impl AsRef<[u8]>) -> TransportResult<()> {
 		let payload = payload.as_ref();
 		let frame = match self.decode_stream_frame(payload)? {
@@ -1173,7 +1176,7 @@ where
 		Ok(())
 	}
 
-	/// Tear down a stream the peer cancelled, on either side of the
+	/// Tears down a stream the peer cancelled, on either side of the
 	/// connection.
 	async fn route_cancel(&mut self, package: MuxCancelPackage) -> TransportResult<()> {
 		let stream_id = package.stream_id();
@@ -1195,9 +1198,9 @@ where
 			return Ok(());
 		}
 		if self.link.shared().role().peer().initiates(stream_id) {
-			// The peer withdrew its own request. Drop any partial reassembly or
-			// streaming body, release the response ledger, and abort the
-			// handler. The dropped sender ends the body.
+			// The peer withdrew its own request, so the reader drops any
+			// partial reassembly or streaming body, releases the response
+			// ledger, and aborts the handler. The dropped sender ends the body.
 			self.peer_reassembly.remove(&stream_id);
 			self.peer_bodies.remove(&stream_id);
 			self.evict_credit(stream_id);
@@ -1212,7 +1215,7 @@ where
 		Err(self.protocol_violation())
 	}
 
-	/// Answer a peer probe with its ack.
+	/// Answers a peer probe with its ack.
 	///
 	/// Pings terminate at the reader, ahead of the responder and the
 	/// application handler.
@@ -1238,7 +1241,7 @@ where
 		self.queue_ping_ack(MuxPingPackage::new(true, package.opaque()))
 	}
 
-	/// Refuse a peer-initiated stream with a `Rejected` cancel.
+	/// Refuses a peer-initiated stream with a `Rejected` cancel.
 	///
 	/// The cancel goes through the control buffer, because a refusal lost to a
 	/// full writer queue would leave a conforming peer's stream pending
@@ -1259,7 +1262,7 @@ where
 		self.queue_capped(package.into(), Outbound::is_refusal, cap_as_usize(self.peer_cap))
 	}
 
-	/// Send a best-effort `ProtocolError` GoAway and return the error that
+	/// Sends a best-effort `ProtocolError` GoAway and returns the error that
 	/// fails the driver. A fault the trace injects at either event is that
 	/// error.
 	fn protocol_violation(&mut self) -> TransportError {
@@ -1324,7 +1327,7 @@ mod tests {
 		assert_eq!(budget.used(), connection_ceiling);
 	}
 
-	// Dropping a stream returns its bytes, so a long-lived connection that
+	// A dropped stream returns its bytes, so a long-lived connection that
 	// opens and closes streams does not exhaust the budget.
 	#[test]
 	fn dropping_a_stream_returns_its_bytes() {
@@ -1366,7 +1369,7 @@ mod tests {
 		assert!(accepted > 0);
 	}
 
-	/// Envelope source that yields a fixed sequence and then stays pending
+	/// An envelope source that yields a fixed sequence and then stays pending
 	/// forever.
 	struct ScriptedSource {
 		envelopes: VecDeque<TransportEnvelope>,
@@ -1389,7 +1392,7 @@ mod tests {
 		}
 	}
 
-	/// Grantor that raises the limit on every consultation.
+	/// A grantor that raises the limit on every consultation.
 	struct AlwaysGrant;
 
 	impl CreditGrantor for AlwaysGrant {
@@ -1398,19 +1401,19 @@ mod tests {
 		}
 	}
 
-	/// Reader driver under test, with the far ends of its channels.
+	/// The reader driver under test, with the far ends of its channels.
 	struct ReaderFixture {
-		/// Driver over the scripted source.
+		/// The driver over the scripted source.
 		driver: MuxReaderDriver<ScriptedSource>,
-		/// Receiving end of the full outbound queue.
+		/// The receiving end of the full outbound queue.
 		outbound: mpsc::Receiver<Outbound>,
-		/// Receiving end of the inbound channel, held to keep it open.
+		/// The receiving end of the inbound channel, held to keep it open.
 		inbound: mpsc::Receiver<InboundEvent>,
-		/// Count of envelopes the source has delivered.
+		/// The count of envelopes that the source has delivered.
 		delivered: Arc<AtomicUsize>,
 	}
 
-	/// Reader driver over a scripted source whose outbound queue is already
+	/// A reader driver over a scripted source whose outbound queue is already
 	/// full, with its single slot taken by a filler envelope.
 	fn reader_with_full_queue(envelopes: impl IntoIterator<Item = TransportEnvelope>) -> ReaderFixture {
 		let envelopes: Vec<TransportEnvelope> = envelopes.into_iter().collect();
@@ -1439,7 +1442,8 @@ mod tests {
 		ReaderFixture { driver, outbound: outbound_receiver, inbound: inbound_receiver, delivered }
 	}
 
-	/// Fixture unary open package for stream 1 carrying a four-byte payload.
+	/// A fixture unary open package for stream 1 that carries a four-byte
+	/// payload.
 	fn open_package() -> MuxOpenPackage {
 		MuxOpenPackage::new(1, false, MuxStreamKind::Unary, vec![0u8; 4]).expect("fixture payload fits an open package")
 	}
@@ -1552,7 +1556,7 @@ mod tests {
 
 	// Stream IDs never repeat, so per-stream coalescing alone lets grants for
 	// dead streams pile up under churn while the writer stays backpressured.
-	// Closing a stream must drop its buffered grant.
+	// A stream that closes must drop its buffered grant.
 	#[test]
 	fn test_buffered_grant_evicted_when_stream_closes() -> TransportResult<()> {
 		let mut fixture = reader_with_full_queue(Vec::new());
@@ -1575,7 +1579,7 @@ mod tests {
 		Ok(())
 	}
 
-	/// Grantor that always answers with an unbounded raise.
+	/// A grantor that always answers with an unbounded raise.
 	struct GreedyGrant;
 
 	impl CreditGrantor for GreedyGrant {
@@ -1656,7 +1660,7 @@ mod tests {
 		assert!(fixture.driver.peer_bodies.is_empty());
 	}
 
-	/// Refuse every stream in `stream_ids` on the fixture's driver, as a
+	/// Refuses every stream in `stream_ids` on the fixture's driver, as a
 	/// flood of opens past the cap would.
 	fn refuse_streams(fixture: &mut ReaderFixture, stream_ids: &[u32]) {
 		for stream_id in stream_ids {

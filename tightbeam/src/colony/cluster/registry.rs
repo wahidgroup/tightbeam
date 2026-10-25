@@ -10,7 +10,7 @@ use super::error::ClusterError;
 use crate::cms::signed_data::SignerIdentifier;
 use crate::colony::bound_dial::{BoundDial, ExpectedSigner};
 use crate::colony::cluster::servlet_registry::{DialTarget, HiveSlate, ServletRegistry};
-use crate::colony::common::RegisterHiveRequest;
+use crate::colony::protocol::RegisterHiveRequest;
 use crate::utils::time::{Clock, MonotonicInstant};
 use crate::utils::BasisPoints;
 
@@ -179,7 +179,7 @@ impl Members {
 ///
 /// A move under the member lock can leave a half-written table if the code
 /// under the guard panics, so every method propagates
-/// [`ClusterError::LockPoisoned`] rather than reading around it. A poisoned
+/// [`ClusterError::LockPoisoned`] rather than read around it. A poisoned
 /// std lock never clears, so the caller that sees it is the one that ends.
 pub struct HiveRegistry {
 	members: RwLock<Members>,
@@ -245,11 +245,11 @@ impl HiveRegistry {
 	///
 	/// # Signer check
 	///
-	/// The restored entry passes the same signer check its registration
-	/// passed, under one guard, so this mutator offers no way around the
-	/// binding [`HiveRegistry::register`] enforces (CWE-639). A restore that
-	/// the check refuses leaves the id unregistered, the same state that a
-	/// refused registration leaves.
+	/// The restored entry passes the signer check of its registration under one
+	/// guard, so this mutator offers no way around the binding
+	/// [`HiveRegistry::register`] enforces (CWE-639). The check refuses only
+	/// while another signer holds the id, and a refusal leaves the table as it
+	/// is, as a refused registration does.
 	///
 	/// # Errors
 	///
@@ -419,7 +419,7 @@ impl HiveRegistry {
 /// [`ServletRegistry`]. The pair enters and leaves together, so admission and
 /// retirement are operations here rather than a sequence each caller repeats.
 /// A retirement of the hive entry alone would leave routes that point at a
-/// hive the colony stopped beating.
+/// retired hive.
 pub(crate) struct ColonyMembership<'a> {
 	hives: &'a HiveRegistry,
 	servlets: &'a ServletRegistry,
@@ -440,7 +440,7 @@ impl<'a> ColonyMembership<'a> {
 	/// Holds the admission path for one whole membership move.
 	///
 	/// The guarded value is `()`, so a poisoned lock carries no damaged
-	/// state and this method recovers the guard instead of refusing the
+	/// state and this method recovers the guard rather than refuse the
 	/// caller.
 	fn hold_admission(&self) -> MutexGuard<'_, ()> {
 		self.admission.lock().unwrap_or_else(PoisonError::into_inner)
@@ -553,8 +553,8 @@ mod tests {
 	use super::*;
 	use crate::colony::cluster::servlet_registry::PheromoneConfig;
 	use crate::colony::cluster::{CertificateSpec, ClusterConfig, ClusterTlsConfig};
-	use crate::colony::common::ColonyNamespace;
-	use crate::colony::hive::ServletInfo;
+	use crate::colony::protocol::ServletInfo;
+	use crate::colony::urn::ColonyNamespace;
 	use crate::crypto::key::Secp256k1KeyProvider;
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 	use crate::der::asn1::OctetString;

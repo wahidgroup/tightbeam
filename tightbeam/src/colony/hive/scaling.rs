@@ -1,6 +1,7 @@
-//! Scaling configuration and decision types
+//! Scaling configuration and decision types.
 //!
-//! Types for auto-scaling servlet instances based on utilization metrics.
+//! A hive scales the instances of each servlet type on these utilization
+//! metrics.
 
 use core::time::Duration;
 
@@ -8,12 +9,12 @@ use crate::urn::Urn;
 use crate::utils::BasisPoints;
 use crate::Errorizable;
 
-/// Default scale-up cooldown (30 seconds)
+/// The default wait after a scale-up, 30 seconds.
 const DEFAULT_SCALE_UP_COOLDOWN: Duration = Duration::from_secs(30);
-/// Default scale-down cooldown (60 seconds)
+/// The default wait after a scale-down, 60 seconds.
 const DEFAULT_SCALE_DOWN_COOLDOWN: Duration = Duration::from_secs(60);
 
-/// Why a scaling configuration was refused.
+/// The reason [`ServletScaleConfig::new`] refuses a scaling configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Errorizable)]
 pub enum ScaleConfigRefusal {
 	/// The instance bounds name an empty or inverted range.
@@ -25,13 +26,12 @@ pub enum ScaleConfigRefusal {
 	OverlappingThresholds,
 }
 
-/// Per-servlet-type scaling configuration.
+/// The scaling configuration of one servlet type.
 ///
-/// The fields are read-only because their legal combinations are not
-/// independent: bounds that exclude every instance count, and thresholds
-/// that overlap, describe a scaler that oscillates. [`Self::new`] is the
-/// one place those pairs are checked, so a config that exists is one the
-/// scaler can act on.
+/// The fields are read-only because their legal values depend on each
+/// other. Bounds that exclude every instance count, and thresholds that
+/// overlap, describe a scaler that oscillates. [`Self::new`] checks those
+/// pairs in one place, so a config that exists is one the scaler can act on.
 #[derive(Debug, Clone, Copy)]
 pub struct ServletScaleConfig {
 	min_instances: usize,
@@ -43,14 +43,14 @@ pub struct ServletScaleConfig {
 }
 
 impl ServletScaleConfig {
-	/// Scaling thresholds for one servlet type.
+	/// Builds the scaling configuration of one servlet type.
 	///
 	/// Cooldowns keep their defaults: 30 seconds after a scale-up, 60
 	/// after a scale-down. Set them with [`Self::with_cooldowns`].
 	///
-	/// The bounds and the thresholds stay positional, unlike the cooldowns
-	/// [`ScaleCooldowns`] carries: transposing either pair here is refused
-	/// below, so the mistake is loud. A swapped cooldown pair is not.
+	/// The bounds and the thresholds stay positional, because a transposed
+	/// pair fails the checks below and the mistake is loud. A swapped cooldown
+	/// pair passes every check, so [`ScaleCooldowns`] names the cooldowns.
 	///
 	/// # Errors
 	///
@@ -82,8 +82,8 @@ impl ServletScaleConfig {
 
 	/// Replace the cooldowns that follow each scaling action.
 	///
-	/// The pair is named rather than positional, because two adjacent
-	/// durations a caller can swap is a swap nothing would catch.
+	/// The pair carries names because a swap of two positional durations
+	/// passes every check.
 	#[must_use]
 	pub fn with_cooldowns(mut self, cooldowns: ScaleCooldowns) -> Self {
 		self.scale_up_cooldown = cooldowns.after_scale_up;
@@ -91,37 +91,37 @@ impl ServletScaleConfig {
 		self
 	}
 
-	/// Fewest instances the scaler leaves running.
+	/// The fewest instances the scaler leaves running.
 	#[must_use]
 	pub fn min_instances(&self) -> usize {
 		self.min_instances
 	}
 
-	/// Most instances the scaler spawns.
+	/// The most instances the scaler spawns.
 	#[must_use]
 	pub fn max_instances(&self) -> usize {
 		self.max_instances
 	}
 
-	/// Utilization above which one more instance is spawned.
+	/// The utilization above which the scaler spawns one more instance.
 	#[must_use]
 	pub fn scale_up_threshold(&self) -> BasisPoints {
 		self.scale_up_threshold
 	}
 
-	/// Utilization below which one idle instance is stopped.
+	/// The utilization below which the scaler stops one idle instance.
 	#[must_use]
 	pub fn scale_down_threshold(&self) -> BasisPoints {
 		self.scale_down_threshold
 	}
 
-	/// Wait after a scale-up before the next one.
+	/// The wait after a scale-up before the next one.
 	#[must_use]
 	pub fn scale_up_cooldown(&self) -> Duration {
 		self.scale_up_cooldown
 	}
 
-	/// Wait after a scale-down before the next one.
+	/// The wait after a scale-down before the next one.
 	#[must_use]
 	pub fn scale_down_cooldown(&self) -> Duration {
 		self.scale_down_cooldown
@@ -130,13 +130,13 @@ impl ServletScaleConfig {
 
 /// The wait after each scaling action before the next one of its kind.
 ///
-/// The scale-down wait is normally the longer of the two, because removing
-/// an instance under variable load is what thrashes.
+/// The scale-down wait is normally the longer of the two, because the
+/// removal of an instance under variable load is what thrashes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScaleCooldowns {
-	/// Wait after a scale-up before the next scale-up.
+	/// The wait after a scale-up before the next scale-up.
 	pub after_scale_up: Duration,
-	/// Wait after a scale-down before the next scale-down.
+	/// The wait after a scale-down before the next scale-down.
 	pub after_scale_down: Duration,
 }
 
@@ -152,9 +152,9 @@ impl Default for ScaleCooldowns {
 impl ServletScaleConfig {
 	/// The bounds and thresholds a servlet scales on when none are set.
 	///
-	/// Built through [`Self::new`] in a const block, so a default that
-	/// stopped satisfying the pair checks would fail to compile rather
-	/// than ship as a second, unchecked home for these values.
+	/// The const block builds it through [`Self::new`], so a default that
+	/// fails the pair checks fails to compile rather than ship as a second,
+	/// unchecked home for these values.
 	pub const DEFAULT: Self = match Self::new(1, 10, crate::bps!(8000), crate::bps!(2000)) {
 		Ok(config) => config,
 		Err(_) => panic!("the default scale config must satisfy its own checks"),
@@ -167,34 +167,35 @@ impl Default for ServletScaleConfig {
 	}
 }
 
-/// Input message to the scaling worker
+/// One reading of a servlet type that the hive scaling loop decides on.
 #[derive(Debug, Clone)]
 pub struct ScalingMetrics {
-	/// Type URN of the servlet being evaluated
+	/// The type URN of the servlet under evaluation.
 	pub servlet_type: Urn<'static>,
-	/// Current utilization in basis points (0-10000)
+	/// The current utilization in basis points, from 0 to 10000.
 	pub utilization: BasisPoints,
-	/// Current instance count
+	/// The current instance count of the type.
 	pub current_instances: usize,
-	/// Scaling configuration for this type
+	/// The scaling configuration of this type.
 	pub config: ServletScaleConfig,
 }
 
-/// Output decision from the scaling worker
+/// The decision [`ScalingMetrics::decide`] returns for one servlet type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalingDecision {
-	/// No action needed
+	/// Keep the current instance count.
 	Hold,
-	/// Spawn one additional instance
+	/// Spawn one more instance.
 	ScaleUp,
-	/// Stop one idle instance
+	/// Stop one idle instance.
 	ScaleDown,
 }
 
 impl ScalingMetrics {
-	/// Whether this reading calls for scaling up, down, or holding.
+	/// Decides whether this reading calls for a scale-up, a scale-down, or a
+	/// hold.
 	///
-	/// The decision reads nothing but these metrics, so it lives on them.
+	/// The decision reads these metrics alone, so it lives on them.
 	#[must_use]
 	pub fn decide(&self) -> ScalingDecision {
 		let utilization = self.utilization.get();
@@ -240,8 +241,9 @@ mod tests {
 		assert!(matches!(refusal, Err(ScaleConfigRefusal::OverlappingThresholds)));
 	}
 
-	/// The bound is `min > max`, so a range of exactly one instance is
-	/// admitted: a servlet that never scales is a legal configuration.
+	/// The bound is `min > max`, so a range that holds one instance count is
+	/// admitted: a servlet with a fixed instance count is a legal
+	/// configuration.
 	#[test]
 	fn a_single_instance_range_is_admitted() -> Result<(), ScaleConfigRefusal> {
 		let config = ServletScaleConfig::new(2, 2, crate::bps!(8000), crate::bps!(2000))?;
@@ -250,8 +252,8 @@ mod tests {
 		Ok(())
 	}
 
-	/// Cooldowns arrive as a named pair, so the two durations cannot be
-	/// swapped at the call site.
+	/// Cooldowns arrive as a named pair, so each duration lands on the
+	/// cooldown that the call site names.
 	#[test]
 	fn cooldowns_land_where_they_are_named() -> Result<(), ScaleConfigRefusal> {
 		let config =
