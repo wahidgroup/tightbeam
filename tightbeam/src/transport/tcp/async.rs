@@ -6,23 +6,24 @@
 use std::sync::Arc;
 
 #[cfg(feature = "tokio")]
-use std::io::Error as IoError;
-
-#[cfg(feature = "tokio")]
 mod tokio_rt {
+	pub use std::io::Error as IoError;
 	pub use std::io::ErrorKind;
 	pub use std::net::SocketAddr;
 
-	pub use crate::transport::protocols::PersistentConnection;
-	pub use crate::transport::tcp::TightBeamSocketAddr;
-	pub use crate::transport::{AsyncListenerTrait, Protocol};
 	pub use tokio::io::{AsyncReadExt, AsyncWriteExt};
 	pub use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 	pub use tokio::net::{TcpListener, TcpStream};
 	pub use tokio::time::timeout;
 
 	pub use crate::crypto::profiles::DefaultCryptoProvider;
+	pub use crate::transport::error::TransportFailure;
+	pub use crate::transport::protocols::PersistentConnection;
+	pub use crate::transport::protocols::{AsyncByteRead, AsyncByteStream, AsyncByteWrite};
+	pub use crate::transport::tcp::TightBeamSocketAddr;
 	pub use crate::transport::EncryptedProtocol;
+	pub use crate::transport::{AsyncListenerTrait, Protocol};
+	pub use crate::transport::{EndpointConfig, TransportEncryptionConfig};
 }
 
 #[cfg(feature = "tokio")]
@@ -36,7 +37,7 @@ use crate::der::Encode;
 use crate::policy::GatePolicy;
 use crate::policy::TransitStatus;
 use crate::transport::envelopes::{TransportEnvelope, WireEnvelope};
-use crate::transport::error::{ArrivalCause, ArrivalRefusal, TransportFailure};
+use crate::transport::error::{ArrivalCause, ArrivalRefusal};
 use crate::transport::handshake::{BoxedServerHandshake, HandshakeProvider};
 use crate::transport::io::{EnvelopeSink, EnvelopeSource};
 use crate::transport::policy::RestartPolicy;
@@ -56,37 +57,29 @@ use crate::Frame;
 	feature = "transport-multiplex",
 	any(feature = "transport-cms", feature = "transport-hpke")
 ))]
-use crate::policy::SessionContext;
+mod mux_imports {
+	pub use crate::policy::SessionContext;
+	pub use crate::transport::handshake::negotiation::MuxSettings;
+	pub use crate::transport::handshake::negotiation::TransportOffer;
+	pub use crate::utils::marker::MaybeSend;
+	pub use crate::x509::Certificate;
+}
+
+#[cfg(all(
+	feature = "transport-multiplex",
+	any(feature = "transport-cms", feature = "transport-hpke")
+))]
+use mux_imports::*;
+
 #[cfg(feature = "instrument")]
-use crate::trace::TraceCollector;
-#[cfg(all(
-	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-hpke")
-))]
-use crate::transport::handshake::negotiation::MuxSettings;
-#[cfg(all(
-	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-hpke")
-))]
-use crate::transport::handshake::negotiation::TransportOffer;
+mod instrument_imports {
+	pub use crate::trace::TraceCollector;
+	pub(crate) use crate::transport::handshake::SessionPeer;
+	pub(crate) use crate::transport::io::TransportRefusal;
+}
+
 #[cfg(feature = "instrument")]
-use crate::transport::handshake::SessionPeer;
-#[cfg(feature = "instrument")]
-use crate::transport::io::TransportRefusal;
-#[cfg(feature = "tokio")]
-use crate::transport::protocols::{AsyncByteRead, AsyncByteStream, AsyncByteWrite};
-#[cfg(feature = "tokio")]
-use crate::transport::{EndpointConfig, TransportEncryptionConfig};
-#[cfg(all(
-	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-hpke")
-))]
-use crate::utils::marker::MaybeSend;
-#[cfg(all(
-	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-hpke")
-))]
-use crate::x509::Certificate;
+use instrument_imports::*;
 
 /// A tokio TCP stream that carries DER-framed envelopes through the
 /// byte-level traits.
@@ -649,9 +642,9 @@ where
 		let mut wire_bytes = Zeroizing::new(read.map_err(|error| self.refuse(error))?);
 		let arriving =
 			WireEnvelope::admit(&mut wire_bytes).map_err(|error| self.refuse(TransportError::DerError(error)))?;
+
 		let contents = arriving.admit_under(self.mode.cipher()).map_err(|cause| self.refuse(cause))?;
 		let envelope = TransportEnvelope::from_der(contents);
-
 		envelope.map_err(|error| self.refuse(TransportError::DerError(error)))
 	}
 
@@ -681,10 +674,8 @@ where
 	/// [`TRANSPORT_ENVELOPE_REFUSED`]: crate::instrumentation::events::TRANSPORT_ENVELOPE_REFUSED
 	async fn read_envelope(&mut self) -> TransportResult<TransportEnvelope> {
 		let read = self.read_in_mode().await;
-
 		#[cfg(feature = "instrument")]
 		let read = TransportRefusal::audit_read(read, self.trace.as_ref());
-
 		Ok(read?)
 	}
 
@@ -1459,7 +1450,6 @@ mod tests {
 		#[tokio::test]
 		async fn an_encrypted_half_refuses_cleartext_before_it_decodes() {
 			let mut reader = reading(SplitRecv::Encrypted(test_receiver()), UNDECODABLE_CLEARTEXT);
-
 			let outcome = reader.read_envelope().await;
 			assert!(matches!(outcome, Err(TransportError::MissingEncryption)));
 		}
