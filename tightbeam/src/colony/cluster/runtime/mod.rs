@@ -46,8 +46,9 @@ use crate::colony::cluster::{
 use crate::colony::protocol::HeartbeatResult;
 use crate::colony::TaskGroup;
 use crate::constants::{DEFAULT_AD_RUMOR_REFRESH_MS, DEFAULT_MAX_SERVER_CONNECTIONS};
+use crate::crypto::x509::CanonicalKey;
 use crate::macros::server::{serve_connection_service, AcceptedConnection};
-use crate::policy::TransitStatus;
+use crate::policy::{SessionContext, TransitStatus};
 use crate::runtime::rt;
 use crate::trace::{TraceCollector, TraceHandle};
 use crate::transport::accept::{AcceptPlane, ConnectionTerms};
@@ -60,19 +61,21 @@ use crate::Frame;
 use crate::TightBeamError;
 
 use crate::instrumentation::events::{
-	CLUSTER_EXPORT_IDENTITY_UNAVAILABLE, CLUSTER_EXPORT_UNBOUNDED, CLUSTER_LOOP_POISONED,
+	CLUSTER_EDGE_REFUSED, CLUSTER_EXPORT_IDENTITY_UNAVAILABLE, CLUSTER_EXPORT_UNBOUNDED, CLUSTER_LOOP_POISONED,
 };
 
 /// Why one background loop of the gateway ended.
 ///
 /// Every loop reads registries and tables and records to the trace, and
 /// either can refuse. The two variants keep the refusals apart, so the exit
-/// records a poisoned lock by name and lets a trace fault end the loop
-/// silently, which is the effect a `testing-fault` injection observes.
+/// records a local fault by name and lets a trace fault end the loop silently,
+/// which is the effect a `testing-fault` injection observes.
 pub(crate) enum LoopFault {
 	/// The trace refused an event, or a task the loop awaited did not join.
 	Runtime(TightBeamError),
-	/// A registry, table, or journal this loop reads is poisoned.
+	/// A local fault: a registry, table, or journal this loop reads is
+	/// poisoned or failed, or a local step of the loop failed, such as the
+	/// build, the signature, or the send of a repair.
 	Registry(ClusterError),
 }
 
@@ -89,10 +92,7 @@ impl LoopFault {
 
 		// A trace that refuses this record has refused the loop already,
 		// so nothing else can carry the fault.
-		let fault = error.to_string();
-		let recorded = trace
-			.event(CLUSTER_LOOP_POISONED)
-			.map(|event| event.with_payload(&fault).emit());
+		let recorded = trace.emit_marker_with_evidence(CLUSTER_LOOP_POISONED, || Some(error.to_string()));
 		drop(recorded);
 	}
 }
@@ -132,13 +132,13 @@ impl ClusterConfig {
 		let federation_active = self.tls.peer_trust.is_some() || !self.peer.peers.is_empty();
 		if ExportScope::from(&self.peer).is_unbounded() {
 			if federation_active {
-				trace.event(CLUSTER_EXPORT_UNBOUNDED)?.emit();
+				trace.emit_marker(CLUSTER_EXPORT_UNBOUNDED)?;
 			}
 		} else {
 			let requires_certificate = self.tls.peer_authentication().requires_certificate();
 			let identity_captured = requires_certificate && self.tls.hive_trust.is_some();
 			if !identity_captured {
-				trace.event(CLUSTER_EXPORT_IDENTITY_UNAVAILABLE)?.emit();
+				trace.emit_marker(CLUSTER_EXPORT_IDENTITY_UNAVAILABLE)?;
 			}
 		}
 
@@ -266,7 +266,7 @@ where
 			.with_ad_tombstone_window(control_window);
 
 		let servlet_registry = Arc::new(routes);
-		let pools = config.tls.pools::<P>(&config.pool_config, &config.clock);
+		let pools = config.tls.pools::<P>(&config.pool_config, &config.clock, &trace);
 		let hive_plane = HivePlane::new(pools.hive, Arc::clone(&trace));
 		let build_peer_plane = |peer_pool| PeerPlane::new(peer_pool, config.clone(), Arc::clone(&trace));
 		let peer_plane = pools.peer.map(build_peer_plane);
@@ -287,8 +287,8 @@ where
 		};
 
 		// Bind every configured accept plane before any accept loop spawns.
-		// An edge parse or bind failure then returns `Err` while the colony
-		// listener is still local, so a failed start spawns no accept task.
+		// An edge parse or bind failure then returns `Err` before the colony
+		// listener leaves here, so a failed start spawns no accept task.
 		let (edge_listener, edge_addr) = match config.edge_bind_addr.as_deref() {
 			Some(raw) => {
 				let edge_bind: E::Address = raw.parse().map_err(|_| TransportError::InvalidMessage)?;
@@ -301,15 +301,16 @@ where
 			None => (None, None),
 		};
 
-		// Export posture is colony-wide configuration, so the one startup
-		// path reports it once for all accept planes.
-		config.warn_export_posture(&trace)?;
-
 		// The gateway decides its advertised address before any task spawns,
 		// so a gateway that federates on the wildcard address refuses to start
 		// and closes every listener it bound.
 		let gateway_bytes: Vec<u8> = addr.clone().into();
 		let gateway_addr = config.peer.advertised_address(gateway_bytes)?;
+
+		// Export posture is colony-wide configuration, so the one startup
+		// path reports it once for all accept planes, and only for a gateway
+		// that starts.
+		config.warn_export_posture(&trace)?;
 
 		// Each field of the context is reference-counted, so a clone is cheap.
 		let server_handle = ctx.clone().serve_colony::<P::Listener>(listener);
@@ -524,22 +525,56 @@ where
 	fn streaming(
 		&self,
 		_body: StreamBody,
-		_cx: CallContext,
+		cx: CallContext,
 	) -> impl Future<Output = Result<Option<Frame>, TightBeamError>> + Send {
-		core::future::ready(Err(TransitStatus::PermissionDenied.refusal()))
+		let refused = self.ctx.refuse_edge_open("streaming", &cx);
+		core::future::ready(Err(refused))
 	}
 
 	fn duplex(
 		&self,
 		_body: StreamBody,
 		_reply: ReplySink,
-		_cx: CallContext,
+		cx: CallContext,
 	) -> impl Future<Output = Result<(), TightBeamError>> + Send {
-		core::future::ready(Err(TransitStatus::PermissionDenied.refusal()))
+		let refused = self.ctx.refuse_edge_open("duplex", &cx);
+		core::future::ready(Err(refused))
 	}
 }
 
 impl<P: Protocol> GatewayRuntimeCtx<P> {
+	/// Records a call that the edge plane refuses, and returns the status that
+	/// the caller reads.
+	///
+	/// The edge plane serves work submission alone, so it answers every other
+	/// call with [`TransitStatus::PermissionDenied`] and records
+	/// [`CLUSTER_EDGE_REFUSED`].
+	///
+	/// - `call` names the kind of the call: `unary`, `streaming`, or `duplex`.
+	/// - `session` names who called, by the canonical key that the handshake
+	///   of the session proved. A frame's signer is a claim that the edge
+	///   plane does not verify, so the record never names it (CWE-345).
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError`] -- the trace refused the event, the fault the `testing-fault` feature injects.
+	fn refuse_edge_call(&self, call: &str, session: &SessionContext) -> Result<TransitStatus, TightBeamError> {
+		let status = TransitStatus::PermissionDenied;
+		let caller = session.peer_key().map(CanonicalKey::as_der);
+		let trace = &self.trace;
+		trace.emit_event_with_value_and_evidence(CLUSTER_EDGE_REFUSED, call, status, caller)?;
+
+		Ok(status)
+	}
+
+	/// Refuses a stream that the edge plane opened, through
+	/// [`Self::refuse_edge_call`], and returns the failure that ends the
+	/// stream: the refusal, or the fault of a trace that refused the event.
+	fn refuse_edge_open(&self, call: &str, cx: &CallContext) -> TightBeamError {
+		let refused = self.refuse_edge_call(call, cx.session());
+		refused.map_or_else(|fault| fault, TransitStatus::refusal)
+	}
+
 	/// The boundary guard that the streaming and duplex open handlers share.
 	///
 	/// An open passes the same boundary a unary request passes:

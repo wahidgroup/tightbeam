@@ -184,9 +184,55 @@ impl ForwardOutcome {
 			Self::Peer(peer_response) => peer_response.status == TransitStatus::Unavailable,
 		}
 	}
+
+	/// The status this forward settles with.
+	///
+	/// - A local servlet's reply is `Ok`.
+	/// - A peer gateway's answer carries its own status.
+	/// - A garbled reply is `Unknown`: the peer read the frame before it
+	///   garbled the reply, so the frame may have run, and the caller hears
+	///   that its outcome is unknown.
+	fn status(&self) -> TransitStatus {
+		match self {
+			Self::Local(_) => TransitStatus::Ok,
+			Self::Peer(peer_response) => peer_response.status,
+			Self::PeerGarbled => TransitStatus::Unknown,
+		}
+	}
 }
 
 impl<P: Protocol> GatewayRuntimeCtx<P> {
+	/// Records a work request or a stream splice that the gateway refuses
+	/// with `status` before it selects a route, and returns that status.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError`] -- the trace refused the event, the fault the `testing-fault` feature injects.
+	pub(crate) fn refuse_work(&self, status: TransitStatus) -> Result<TransitStatus, TightBeamError> {
+		let trace = &self.trace;
+		trace.emit_event_with_value_and_evidence(CLUSTER_WORK_REFUSED, status.as_str(), status, None)?;
+		Ok(status)
+	}
+
+	/// Records a work request or a stream splice whose servlet type has no
+	/// live trail at its first route selection.
+	///
+	/// - `retry_of` is the route key that a failed first selection excludes, or `None` for the first one.
+	/// - The event fires for the first selection alone, because a retry that
+	///   finds no second trail already traced its failure on the trail it
+	///   weakened.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError`] -- the trace refused the event, the fault the `testing-fault` feature injects.
+	pub(crate) fn record_no_trail(&self, retry_of: Option<&[u8]>) -> Result<(), TightBeamError> {
+		if retry_of.is_some() {
+			return Ok(());
+		}
+
+		self.trace.emit_marker(CLUSTER_WORK_UNAVAILABLE)
+	}
+
 	/// Weakens the trail that failed and answers the caller with `status`.
 	fn work_trail_fail(
 		&self,
@@ -194,7 +240,8 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 		frame: &Frame,
 		status: TransitStatus,
 	) -> Result<Option<Frame>, TightBeamError> {
-		self.servlet_registry.work_trail_weaken(route_key, &self.config, &self.trace)?;
+		let registry = &self.servlet_registry;
+		registry.work_trail_weaken(route_key, status, &self.config, &self.trace)?;
 		ReplyForm::Plain.reply(frame.metadata().id(), ClusterWorkResponse::err(status))
 	}
 }
@@ -229,6 +276,7 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 		choice: &RouteChoice,
 		outcome: ForwardOutcome,
 	) -> Result<Option<Frame>, TightBeamError> {
+		let status = outcome.status();
 		match outcome {
 			ForwardOutcome::Local(response_payload) => {
 				self.servlet_registry
@@ -238,22 +286,19 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 			ForwardOutcome::Peer(peer_response) => {
 				// The gateway relays the peer's own envelope, so the client
 				// sees one envelope end to end.
-				self.trace.event(CLUSTER_WORK_FORWARDED)?;
+				let trace = &self.trace;
+				trace.emit_marker(CLUSTER_WORK_FORWARDED)?;
 
-				if peer_response.status == TransitStatus::Ok {
-					self.servlet_registry
-						.work_trail_ok(&choice.route_key, &self.config, &self.trace)?;
+				let registry = &self.servlet_registry;
+				if status == TransitStatus::Ok {
+					registry.work_trail_ok(&choice.route_key, &self.config, &self.trace)?;
 				} else {
-					self.servlet_registry
-						.work_trail_weaken(&choice.route_key, &self.config, &self.trace)?;
+					registry.work_trail_weaken(&choice.route_key, status, &self.config, &self.trace)?;
 				}
 
 				ReplyForm::Plain.reply(frame.metadata().id(), peer_response)
 			}
-			// The peer read the frame before it garbled the reply, so the
-			// frame may have run, and the caller hears that its outcome is
-			// unknown.
-			ForwardOutcome::PeerGarbled => self.work_trail_fail(&choice.route_key, frame, TransitStatus::Unknown),
+			ForwardOutcome::PeerGarbled => self.work_trail_fail(&choice.route_key, frame, status),
 		}
 	}
 
@@ -272,8 +317,8 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 		// namespace. The gateway refuses foreign authorities and realms
 		// before it consults the registry.
 		let Some(type_key) = self.config.namespace.servlet_type_key(&request.servlet_type) else {
-			self.trace.event(CLUSTER_WORK_REFUSED)?;
-			let refusal = ClusterWorkResponse::err(TransitStatus::PermissionDenied);
+			let status = self.refuse_work(TransitStatus::PermissionDenied)?;
+			let refusal = ClusterWorkResponse::err(status);
 			return ReplyForm::Plain.reply(frame.metadata().id(), refusal);
 		};
 
@@ -284,8 +329,8 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 		let client_frame: Frame = match decode(&request.payload) {
 			Ok(client_frame) => client_frame,
 			Err(_) => {
-				self.trace.event(CLUSTER_WORK_REFUSED)?;
-				let refusal = ClusterWorkResponse::err(TransitStatus::InvalidArgument);
+				let status = self.refuse_work(TransitStatus::InvalidArgument)?;
+				let refusal = ClusterWorkResponse::err(status);
 				return ReplyForm::Plain.reply(frame.metadata().id(), refusal);
 			}
 		};
@@ -305,12 +350,8 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 			{
 				Some(choice) => choice,
 				None => {
-					// The unavailable event marks a type with no live trail
-					// at all. An exhausted retry already traced its failure
-					// on the weakened trail.
-					if excluded.is_none() {
-						self.trace.event(CLUSTER_WORK_UNAVAILABLE)?;
-					}
+					self.record_no_trail(excluded.as_deref())?;
+
 					let refusal = ClusterWorkResponse::err(TransitStatus::Unavailable);
 					return ReplyForm::Plain.reply(frame.metadata().id(), refusal);
 				}
@@ -340,8 +381,9 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 					// trail weakens and the next-best one gets the retry.
 					if outcome.proves_undelivered() && excluded.is_none() {
 						if let Some(retry) = retry_payload {
-							self.servlet_registry
-								.work_trail_weaken(&choice.route_key, &self.config, &self.trace)?;
+							let status = outcome.status();
+							let registry = &self.servlet_registry;
+							registry.work_trail_weaken(&choice.route_key, status, &self.config, &self.trace)?;
 
 							excluded = Some(choice.route_key);
 							attempt_payload = retry;
@@ -355,13 +397,12 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 					let status = error.forward_status();
 
 					// A trail that proved the frame never ran weakens at once,
-					// and the next-best trail gets the single retry. A frame
-					// that may have run goes back to the caller as a failure,
-					// so it runs at most once.
+					// and a frame that may have run goes back to the caller as
+					// a failure, so it runs at most once.
 					if error.proves_undelivered() && excluded.is_none() {
 						if let Some(retry) = retry_payload {
-							self.servlet_registry
-								.work_trail_weaken(&choice.route_key, &self.config, &self.trace)?;
+							let registry = &self.servlet_registry;
+							registry.work_trail_weaken(&choice.route_key, status, &self.config, &self.trace)?;
 							excluded = Some(choice.route_key);
 							attempt_payload = retry;
 							continue;
@@ -382,7 +423,7 @@ impl ServletRegistry {
 	///
 	/// - `hops_remaining == 0` selects `Local` only.
 	/// - A live budget selects `Local` and `Peer`, so pheromone prefers
-	///   nearby nests and can still fail over across the colony.
+	///   nearby nests and can also fail over across the colony.
 	/// - A relay trail spends one hop at the relay before the owner is reached,
 	///   so it selects only when the budget affords at least two forwards.
 	///
@@ -441,12 +482,12 @@ impl ServletRegistry {
 		// A score is feedback on a request that already holds its answer, so
 		// a registry fault leaves the trail unscored and the reply stands.
 		let _ = self.reinforce(route_key, config.pheromone.reinforcement_boost);
-		trace.event(CLUSTER_WORK_ROUTED)?;
-
+		trace.emit_marker(CLUSTER_WORK_ROUTED)?;
 		Ok(())
 	}
 
-	/// Weakens a trail that failed, and records the failure event.
+	/// Weakens a trail that failed with `status`, and records the failure
+	/// event.
 	///
 	/// # Errors
 	///
@@ -455,13 +496,14 @@ impl ServletRegistry {
 	pub(crate) fn work_trail_weaken(
 		&self,
 		route_key: &Arc<[u8]>,
+		status: TransitStatus,
 		config: &ClusterConfig,
 		trace: &TraceCollector,
 	) -> Result<(), TightBeamError> {
 		// A score is feedback on a request that already holds its answer, so
 		// a registry fault leaves the trail unscored and the reply stands.
 		let _ = self.weaken_with_penalty(route_key, config.pheromone.weakening_penalty);
-		trace.event(CLUSTER_WORK_FAILED)?;
+		trace.emit_event_with_value_and_evidence(CLUSTER_WORK_FAILED, status.as_str(), status, None)?;
 		Ok(())
 	}
 }
@@ -590,7 +632,6 @@ mod tests {
 	#[test]
 	fn forward_outcome_garbled_peer_reply_never_fails_over() {
 		let outcome = peer_plane().classify(b"not-a-response".to_vec());
-
 		assert!(matches!(outcome, ForwardOutcome::PeerGarbled));
 		assert!(!outcome.proves_undelivered());
 	}
@@ -666,7 +707,6 @@ mod tests {
 	#[test]
 	fn a_local_splice_opens_a_local_route() {
 		let route = local_plane().stream_route::<TokioListener>(&ping_type(), HopBudget::for_test(2), None);
-
 		assert_eq!(route, Ok(StreamRoute::local()));
 	}
 
@@ -675,7 +715,6 @@ mod tests {
 	#[test]
 	fn a_peer_splice_with_no_peer_plane_is_unavailable() {
 		let route = peer_plane().stream_route::<TokioListener>(&ping_type(), HopBudget::for_test(2), None);
-
 		assert_eq!(route, Err(TransitStatus::Unavailable));
 	}
 
@@ -738,6 +777,7 @@ mod tests {
 		let below = registry.select_route(&config, &type_key, HopBudget::for_test(1), None);
 		let at_gate = registry.select_route(&config, &type_key, HopBudget::for_test(2), None);
 		assert!(below.is_none());
+
 		let relay = RoutePlane::Peer { gateway_id: SharedId::from(b"relay".as_slice()) };
 		assert_eq!(at_gate.map(|choice| choice.plane), Some(relay));
 		Ok(())

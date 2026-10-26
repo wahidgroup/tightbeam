@@ -1,16 +1,24 @@
-//! Bounded connection acceptance.
+//! The bounded acceptance of connections.
 //!
-//! [`AcceptPlane`] is the crate's accept loop. The servlet, hive, gateway,
-//! and async `server!` planes each drive one, so one type states the
-//! connection cap, the permit lifetime, the handler task set, and the accept
-//! retry pace. The servlet, hive, and gateway planes also set the trace and
-//! the mux offer of their owner on each connection here.
+//! One plane type states the connection cap, the permit lifetime, and the
+//! accept retry pace of each kind of accept loop:
+//!
+//! - [`AcceptPlane`] serves the servlet, hive, gateway, and async `server!` planes, a task per connection.
+//! - [`BlockingAcceptPlane`] serves the blocking `server!`, a thread per connection.
+//!
+//! The servlet, hive, and gateway planes also set the trace and the mux offer
+//! of their owner on each connection here.
 
+#[cfg(feature = "tokio")]
 use core::future::Future;
-use std::sync::Arc;
+use core::num::NonZeroUsize;
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::thread;
 
 use crate::constants::DEFAULT_ACCEPT_RETRY_DELAY;
+#[cfg(feature = "tokio")]
 use crate::transport::protocols::AsyncListenerTrait;
+#[cfg(feature = "tokio")]
 use crate::utils::time::Clock;
 
 #[cfg(feature = "colony")]
@@ -29,6 +37,7 @@ use crate::transport::state::EncryptedProtocolState;
 /// descriptors by the cap (CWE-400). The plane owns the handler task set,
 /// so a drop of the plane aborts those handlers and an aborted accept task
 /// ends the connections it started (CWE-772).
+#[cfg(feature = "tokio")]
 pub struct AcceptPlane {
 	permits: Arc<tokio::sync::Semaphore>,
 	connections: tokio::task::JoinSet<()>,
@@ -36,18 +45,32 @@ pub struct AcceptPlane {
 	clock: Arc<dyn Clock>,
 }
 
+#[cfg(feature = "tokio")]
 impl AcceptPlane {
 	/// Creates a plane that admits `max_connections` live handlers and paces
 	/// accept retries on `clock`.
 	///
 	/// [`DEFAULT_MAX_SERVER_CONNECTIONS`] is the cap every accept plane uses
-	/// unless a policy names its own.
+	/// unless a policy names its own. The cap is a [`NonZeroUsize`], so the
+	/// plane admits its first connection.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::constants::DEFAULT_MAX_SERVER_CONNECTIONS;
+	/// use tightbeam::transport::accept::AcceptPlane;
+	/// use tightbeam::utils::time::SystemClock;
+	///
+	/// let _plane = AcceptPlane::new(DEFAULT_MAX_SERVER_CONNECTIONS, Arc::new(SystemClock));
+	/// ```
 	///
 	/// [`DEFAULT_MAX_SERVER_CONNECTIONS`]: crate::constants::DEFAULT_MAX_SERVER_CONNECTIONS
 	#[must_use]
-	pub fn new(max_connections: usize, clock: Arc<dyn Clock>) -> Self {
+	pub fn new(max_connections: NonZeroUsize, clock: Arc<dyn Clock>) -> Self {
 		Self {
-			permits: Arc::new(tokio::sync::Semaphore::new(max_connections)),
+			permits: Arc::new(tokio::sync::Semaphore::new(max_connections.get())),
 			connections: tokio::task::JoinSet::new(),
 			clock,
 		}
@@ -152,6 +175,171 @@ impl AcceptPlane {
 	}
 }
 
+/// A plane that accepts connections on a blocking listener under a fixed
+/// cap, and serves each connection it admits on a thread of its own.
+///
+/// - One permit per live connection caps the threads, so a flood queues in the listener backlog (CWE-770).
+/// - A failed accept, or a thread that the system refuses to start, waits out the accept retry delay.
+///
+/// # Sources
+///
+/// - CWE-770, resource allocation without limits: <https://cwe.mitre.org/data/definitions/770.html>
+pub struct BlockingAcceptPlane {
+	permits: Arc<Permits>,
+}
+
+impl BlockingAcceptPlane {
+	/// Creates a plane that admits `max_connections` live handlers.
+	///
+	/// [`DEFAULT_MAX_SERVER_CONNECTIONS`] is the cap that the blocking
+	/// `server!` uses unless a policy names its own. The cap is a
+	/// [`NonZeroUsize`], so the plane admits its first connection.
+	///
+	/// [`DEFAULT_MAX_SERVER_CONNECTIONS`]: crate::constants::DEFAULT_MAX_SERVER_CONNECTIONS
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::constants::DEFAULT_MAX_SERVER_CONNECTIONS;
+	/// use tightbeam::transport::accept::BlockingAcceptPlane;
+	///
+	/// let _plane = BlockingAcceptPlane::new(DEFAULT_MAX_SERVER_CONNECTIONS);
+	/// ```
+	#[must_use]
+	pub fn new(max_connections: NonZeroUsize) -> Self {
+		Self { permits: Arc::new(Permits::new(max_connections)) }
+	}
+
+	/// Accepts through `accept` for as long as the calling thread runs, and
+	/// runs the work that `handler` builds for each admitted connection on a
+	/// thread of its own.
+	///
+	/// - `handler` runs on the accepting thread, before the thread of the connection starts.
+	/// - One slot stays taken from before each accept until the work of that connection ends.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::net::{SocketAddr, TcpListener, TcpStream};
+	/// use std::num::NonZeroUsize;
+	/// use std::sync::mpsc;
+	/// use std::thread;
+	///
+	/// use tightbeam::transport::accept::BlockingAcceptPlane;
+	///
+	/// let listener = TcpListener::bind("127.0.0.1:0")?;
+	/// let addr = listener.local_addr()?;
+	/// let (served, seen) = mpsc::channel();
+	///
+	/// // The plane accepts for as long as its thread runs.
+	/// thread::spawn(move || {
+	///     let report = move |(_stream, peer): (TcpStream, SocketAddr)| {
+	///         let served = served.clone();
+	///         move || {
+	///             // The receiver outlives the one report of the example.
+	///             let _ = served.send(peer);
+	///         }
+	///     };
+	///     BlockingAcceptPlane::new(NonZeroUsize::MIN).accept_on(|| listener.accept(), report);
+	/// });
+	///
+	/// let client = TcpStream::connect(addr)?;
+	/// assert_eq!(seen.recv()?, client.local_addr()?);
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	pub fn accept_on<T, E, A, H, W>(self, mut accept: A, mut handler: H)
+	where
+		A: FnMut() -> Result<T, E>,
+		H: FnMut(T) -> W,
+		W: FnOnce() + Send + 'static,
+	{
+		loop {
+			let permit = self.permits.acquire();
+
+			// A failed accept costs the plane its retry delay alone: the slot
+			// frees before the delay, and the listener's error drops here.
+			let Ok(connection) = accept() else {
+				drop(permit);
+				Self::absorb_failure();
+				continue;
+			};
+
+			let work = handler(connection);
+			if Self::serve(permit, work).is_err() {
+				Self::absorb_failure();
+			}
+		}
+	}
+
+	/// Runs `work` on a thread of its own that holds `permit`, so the slot
+	/// frees on every exit path of the work.
+	///
+	/// # Errors
+	///
+	/// - The I/O error of a thread that the system refuses to start. The work
+	///   drops unrun with its permit, which ends its connection and frees its
+	///   slot.
+	fn serve(permit: Permit, work: impl FnOnce() + Send + 'static) -> std::io::Result<()> {
+		let started = thread::Builder::new().spawn(move || {
+			let _permit = permit;
+			work();
+		});
+
+		// The thread runs detached, and it ends with its connection.
+		let _detached = started?;
+		Ok(())
+	}
+
+	/// Waits out one failed accept or one refused thread, as
+	/// [`AcceptPlane`] waits out a failed accept.
+	fn absorb_failure() {
+		thread::sleep(DEFAULT_ACCEPT_RETRY_DELAY);
+	}
+}
+
+/// The free connection slots of a [`BlockingAcceptPlane`], and the condition
+/// that a full plane waits on.
+///
+/// Each write sets the whole count in one saturating step, so a poisoned lock
+/// holds a whole count, and each reader reads through the poison.
+struct Permits {
+	free: Mutex<usize>,
+	freed: Condvar,
+}
+
+impl Permits {
+	/// Creates `slots` free slots.
+	fn new(slots: NonZeroUsize) -> Self {
+		Self { free: Mutex::new(slots.get()), freed: Condvar::new() }
+	}
+
+	/// Waits for a free slot, and takes it.
+	fn acquire(self: &Arc<Self>) -> Permit {
+		let free = self.free.lock().unwrap_or_else(PoisonError::into_inner);
+		let waited = self.freed.wait_while(free, |free| *free == 0);
+		let mut free = waited.unwrap_or_else(PoisonError::into_inner);
+		*free = free.saturating_sub(1);
+
+		Permit(Arc::clone(self))
+	}
+
+	/// Gives one slot back, and wakes one waiter.
+	fn release(&self) {
+		let mut free = self.free.lock().unwrap_or_else(PoisonError::into_inner);
+		*free = free.saturating_add(1);
+		self.freed.notify_one();
+	}
+}
+
+/// One taken slot of [`Permits`], which its drop gives back.
+struct Permit(Arc<Permits>);
+
+impl Drop for Permit {
+	fn drop(&mut self) {
+		self.0.release();
+	}
+}
+
 /// The terms that an owner sets on each connection it serves: its trace, and
 /// its mux offer.
 ///
@@ -194,7 +382,7 @@ impl ConnectionTerms {
 	}
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tokio"))]
 mod tests {
 	use core::future::Future;
 	use core::pin::pin;
@@ -205,8 +393,9 @@ mod tests {
 	use super::*;
 	use crate::utils::time::ManualClock;
 
-	fn plane(max_connections: usize) -> AcceptPlane {
-		AcceptPlane::new(max_connections, Arc::new(ManualClock::default()))
+	/// A plane of one slot, on a clock that the test moves.
+	fn plane() -> AcceptPlane {
+		AcceptPlane::new(NonZeroUsize::MIN, Arc::new(ManualClock::default()))
 	}
 
 	/// Serves `handler` on a slot that the test knows the plane has free.
@@ -220,7 +409,7 @@ mod tests {
 	#[tokio::test]
 	async fn a_failed_accept_waits_on_the_planes_clock() {
 		let clock = Arc::new(ManualClock::default());
-		let plane = AcceptPlane::new(1, Arc::clone(&clock) as Arc<dyn Clock>);
+		let plane = AcceptPlane::new(NonZeroUsize::MIN, Arc::clone(&clock) as Arc<dyn Clock>);
 		let mut context = Context::from_waker(Waker::noop());
 		let mut wait = pin!(plane.absorb_failure());
 		assert!(wait.as_mut().poll(&mut context).is_pending());
@@ -231,7 +420,7 @@ mod tests {
 
 	#[tokio::test(start_paused = true)]
 	async fn a_full_plane_admits_no_further_connection() {
-		let mut plane = plane(1);
+		let mut plane = plane();
 		let _held = plane.reserve().await;
 		let blocked = tokio::time::timeout(Duration::from_secs(1), plane.reserve()).await;
 		assert!(blocked.is_err());
@@ -239,7 +428,7 @@ mod tests {
 
 	#[tokio::test(start_paused = true)]
 	async fn a_finished_connection_returns_its_slot() {
-		let mut plane = plane(1);
+		let mut plane = plane();
 		serve_on_free_slot(&mut plane, async {}).await;
 		tokio::task::yield_now().await;
 
@@ -251,7 +440,7 @@ mod tests {
 	async fn dropping_the_plane_aborts_its_connections() {
 		static FINISHED: AtomicBool = AtomicBool::new(false);
 
-		let mut plane = plane(1);
+		let mut plane = plane();
 		serve_on_free_slot(&mut plane, async {
 			tokio::time::sleep(Duration::from_secs(30)).await;
 			FINISHED.store(true, Ordering::SeqCst);

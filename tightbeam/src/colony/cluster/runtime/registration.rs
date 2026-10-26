@@ -18,7 +18,7 @@ use crate::Frame;
 use crate::TightBeamError;
 
 impl<P: Protocol> GatewayRuntimeCtx<P> {
-	/// Admit one hive registration and install its servlet slate.
+	/// Admits one hive registration and installs its servlet slate.
 	pub(crate) async fn handle_register(
 		&self,
 		frame: Frame,
@@ -32,7 +32,8 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 			Err(status) => return self.refuse_register(&frame, status),
 		};
 
-		// Admit only a hive address that yields an exact hive identity URN.
+		// The gateway admits only a hive address that yields an exact hive
+		// identity URN.
 		let Some(hive_identity) = self.config.namespace.hive_from_bytes(&request.hive_addr) else {
 			return self.refuse_register(&frame, TransitStatus::PermissionDenied);
 		};
@@ -46,8 +47,8 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 		}
 
 		// A hive registered with no signer is claimable by the next signer
-		// that names it, so the gateway refuses a frame that names none rather
-		// than install an unbound entry (CWE-639).
+		// that names it, so the gateway refuses a frame that names none and
+		// installs no unbound entry (CWE-639).
 		let Some(signer) = frame.nonrepudiation().map(|info| Arc::new(info.sid.clone())) else {
 			return self.refuse_register(&frame, TransitStatus::PermissionDenied);
 		};
@@ -61,12 +62,10 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 		// The membership step installs the hive entry and its full slate
 		// atomically, or rolls both back. A re-registration replaces the
 		// prior rows.
-		let registered = self.membership().admit(request, signer, slate);
-		let counted = registered.and_then(|()| self.registry.len());
-		match counted {
+		match self.membership().admit(request, signer, slate) {
 			Ok(hive_count) => {
-				let hive_count = u64::try_from(hive_count).unwrap_or(u64::MAX);
-				self.trace.event_with(CLUSTER_HIVE_REGISTERED, &[], hive_count)?;
+				let trace = &self.trace;
+				trace.emit_event_with_value_and_evidence(CLUSTER_HIVE_REGISTERED, "", hive_count, None)?;
 
 				let response = RegisterHiveResponse { status: TransitStatus::Ok, hive_id: Some(hive_identity) };
 				ReplyForm::Plain.reply(frame.metadata().id(), response)
@@ -79,7 +78,7 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 		}
 	}
 
-	/// Apply one hive's servlet address additions and removals.
+	/// Applies one hive's servlet address additions and removals.
 	pub(crate) async fn handle_address_update(
 		&self,
 		frame: Frame,
@@ -95,8 +94,8 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 		};
 
 		// A hive registered with no signer is claimable by the next signer
-		// that names it, so the gateway refuses an unsigned update here rather
-		// than let it reach the bind check (CWE-639).
+		// that names it, so the gateway refuses an unsigned update here, before
+		// the bind check (CWE-639).
 		let Some(signer) = frame.nonrepudiation().map(|info| &info.sid) else {
 			return self.refuse_update_release(&frame, &signature, TransitStatus::PermissionDenied);
 		};
@@ -105,7 +104,8 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 		// a retirement lands before or after both (CWE-362).
 		match self.membership().update_addresses(signer, added, &removed) {
 			Ok(()) => {
-				self.trace.event(CLUSTER_UPDATE_ACCEPTED)?;
+				let trace = &self.trace;
+				trace.emit_marker(CLUSTER_UPDATE_ACCEPTED)?;
 
 				let response = ServletAddressUpdateResponse { status: TransitStatus::Ok };
 				ReplyForm::Plain.reply(frame.metadata().id(), response)
@@ -133,15 +133,16 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 		Ok(signature)
 	}
 
-	/// Answer a registration with `status` and no hive identity.
+	/// Answers a registration with `status` and no hive identity.
 	fn refuse_register(&self, frame: &Frame, status: TransitStatus) -> Result<Option<Frame>, TightBeamError> {
-		self.trace.event(CLUSTER_REGISTER_REFUSED)?;
+		let trace = &self.trace;
+		trace.emit_event_with_value_and_evidence(CLUSTER_REGISTER_REFUSED, status.as_str(), status, None)?;
 
 		let response = RegisterHiveResponse { status, hive_id: None };
 		ReplyForm::Plain.reply(frame.metadata().id(), response)
 	}
 
-	/// Refuse a registration and free the replay slot its `signature` spent,
+	/// Refuses a registration and frees the replay slot its `signature` spent,
 	/// so the hive can retry the same signed frame.
 	fn refuse_register_release(
 		&self,
@@ -153,15 +154,16 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 		self.refuse_register(frame, status)
 	}
 
-	/// Answer an address update with `status`.
+	/// Answers an address update with `status`.
 	fn refuse_update(&self, frame: &Frame, status: TransitStatus) -> Result<Option<Frame>, TightBeamError> {
-		self.trace.event(CLUSTER_UPDATE_REFUSED)?;
+		let trace = &self.trace;
+		trace.emit_event_with_value_and_evidence(CLUSTER_UPDATE_REFUSED, status.as_str(), (), None)?;
 
 		let response = ServletAddressUpdateResponse { status };
 		ReplyForm::Plain.reply(frame.metadata().id(), response)
 	}
 
-	/// Refuse an address update and free the replay slot its `signature`
+	/// Refuses an address update and frees the replay slot its `signature`
 	/// spent, so the hive can resend the same signed update.
 	fn refuse_update_release(
 		&self,

@@ -4,7 +4,7 @@
 #[cfg(not(feature = "std"))]
 use alloc::{vec, vec::Vec};
 
-use core::ops::Range;
+use core::ops::{Range, RangeInclusive};
 
 use aead::{AeadCore, AeadInPlace, Key, KeyInit, Nonce, Tag};
 
@@ -46,7 +46,7 @@ use crate::crypto::secret::SecretSlice;
 ///
 /// # Buffers
 ///
-/// A refused seal or open MUST leave its buffer as it was, so a frame that
+/// A refused seal or open MUST leave its buffer unchanged, so a frame that
 /// lends its body to either keeps it on a refusal. The house AES-128-GCM and
 /// AES-256-GCM keep this: `aes-gcm` 0.10.3 checks the lengths before it
 /// applies the keystream (`lib.rs:273`, `lib.rs:294`), and the tag before it
@@ -91,16 +91,27 @@ impl ContentEncryption for Aes128Gcm {
 	}
 }
 
+/// The tag lengths in octets that `aes-ICVlen` names (RFC 5084 §3.2).
+const GCM_ICV_LENGTHS: RangeInclusive<u8> = 12..=16;
+
 /// The `GCMParameters` of a seal of `A` under `nonce`, which name the tag
 /// length of `A` in `aes-ICVlen`.
 ///
 /// # Errors
 ///
-/// - [`EnvelopeError::TagLength`] -- `aes-ICVlen` cannot hold the tag length of `A`.
+/// - [`EnvelopeError::TagLength`] -- `aes-ICVlen` cannot name the tag length
+///   of `A`. The error expects the nearest length that the field names.
 /// - [`EnvelopeError::Encoding`] -- the parameters fail to encode.
 fn gcm_parameters<A: AeadCore>(nonce: &Nonce<A>) -> Result<Any, EnvelopeError> {
-	let aes_icv_len =
-		u8::try_from(A::TagSize::USIZE).map_err(|_| EnvelopeError::TagLength((A::TagSize::USIZE, 16).into()))?;
+	let tag_length = A::TagSize::USIZE;
+	let named = u8::try_from(tag_length).ok().filter(|length| GCM_ICV_LENGTHS.contains(length));
+	let Some(aes_icv_len) = named else {
+		let shortest = usize::from(*GCM_ICV_LENGTHS.start());
+		let longest = usize::from(*GCM_ICV_LENGTHS.end());
+		let nearest = tag_length.max(shortest).min(longest);
+		return Err(EnvelopeError::TagLength((tag_length, nearest).into()));
+	};
+
 	let parameters = GcmParametersRef { aes_nonce: OctetStringRef::new(nonce.as_slice())?, aes_icv_len };
 	Ok(Any::encode_from(&parameters)?)
 }
@@ -127,7 +138,7 @@ fn gcm_nonce<A: AeadCore>(parameters: Option<&Any>) -> Result<Nonce<A>, Envelope
 }
 
 impl AuthEnvelopedData {
-	/// Seal `content`, of type `content_type`, to `recipient` under the
+	/// Seals `content`, of type `content_type`, to `recipient` under the
 	/// algorithms of `P`: its AEAD, its KDF, its key wrap, and its KEM.
 	///
 	/// - Each seal draws a fresh content key and a nonce from `rng`, or from `OsRng` when `rng` is `None`.
@@ -141,7 +152,8 @@ impl AuthEnvelopedData {
 	/// - The errors of `Recipient::wrap`: the recipient key, its name, the wrap, or a derivation failed.
 	/// - [`EnvelopeError::TagLength`] -- the parameters cannot name the cipher's tag length.
 	/// - [`EnvelopeError::Encryption`] -- the cipher refused the content.
-	/// - [`EnvelopeError::Encoding`] -- an attribute or a parameter fails to encode.
+	/// - [`EnvelopeError::Encoding`] -- an attribute or a parameter fails to
+	///   encode, or the envelope is past a DER length.
 	///
 	/// # Examples
 	///
@@ -177,7 +189,7 @@ impl AuthEnvelopedData {
 		Self::sealed::<P::AeadCipher>(content_type, content, auth_attrs, rng, wrap)
 	}
 
-	/// Seal `content`, of type `content_type`, under the AEAD of `P` to `kek`,
+	/// Seals `content`, of type `content_type`, under the AEAD of `P` to `kek`,
 	/// through a `KEKRecipientInfo` that `key_identifier` names, under the
 	/// key wrap of `P`.
 	///
@@ -199,7 +211,7 @@ impl AuthEnvelopedData {
 		Self::sealed::<P::AeadCipher>(content_type, content, auth_attrs, rng, wrap)
 	}
 
-	/// Seal `content` under the cipher `A`, with the content key that `wrap`
+	/// Seals `content` under the cipher `A`, with the content key that `wrap`
 	/// wraps for the one recipient.
 	///
 	/// # Errors
@@ -227,13 +239,13 @@ impl AuthEnvelopedData {
 		draw.seal(recipient_info, content_type, content, auth_attrs)
 	}
 
-	/// Seal `content` in place, of type `content_type`, under the AEAD of `P`
+	/// Seals `content` in place, of type `content_type`, under the AEAD of `P`
 	/// to the KEK `holder` holds, through a `KEKRecipientInfo` that names the
 	/// holder's `kekid` and algorithm (RFC 5652 §6.2.3). The envelope carries
 	/// the content detached, and the content key and nonce come from `OsRng`.
 	///
 	/// Every step that can fail runs before the content encrypts, so a refused
-	/// seal leaves `content` as it was.
+	/// seal leaves `content` unchanged.
 	///
 	/// # Errors
 	///
@@ -259,7 +271,7 @@ impl AuthEnvelopedData {
 		draw.seal_in_place(recipient_info, content_type, content, [])
 	}
 
-	/// Open the content, which must be of type `content_type`, with `opener`
+	/// Opens the content, which must be of type `content_type`, with `opener`
 	/// under the algorithms of `P`, in the buffer the ciphertext arrived in.
 	///
 	/// `arrived` is the encoding `self` decoded from. This checks every field
@@ -327,10 +339,10 @@ impl AuthEnvelopedData {
 		Ok(SecretSlice::from(core::mem::take(&mut *content)))
 	}
 
-	/// Open `content` in place, the encrypted content of this envelope, which
+	/// Opens `content` in place, the encrypted content of this envelope, which
 	/// carries it detached, with `opener` under the algorithms of `P`.
 	/// `arrived` is the encoding `self` decoded from. A refused open leaves
-	/// `content` as it was.
+	/// `content` unchanged.
 	///
 	/// # Errors
 	///
@@ -356,10 +368,10 @@ impl AuthEnvelopedData {
 		opening.decrypt(&<P::AeadCipher as KeyInit>::new(&content_key), content)
 	}
 
-	/// Open `content` in place, the encrypted content of this envelope, which
+	/// Opens `content` in place, the encrypted content of this envelope, which
 	/// carries it detached, under the AEAD of `P` and `kek`, which
 	/// `key_identifier` names. `arrived` is the encoding `self` decoded from.
-	/// A refused open leaves `content` as it was.
+	/// A refused open leaves `content` unchanged.
 	///
 	/// # Errors
 	///
@@ -388,10 +400,10 @@ impl AuthEnvelopedData {
 		opening.decrypt(&<P::AeadCipher as KeyInit>::new(&content_key), content)
 	}
 
-	/// Open `content` in place, the encrypted content of this envelope, which
+	/// Opens `content` in place, the encrypted content of this envelope, which
 	/// carries it detached, under the AEAD of `P` and the key-encryption key
 	/// `holder` holds. `arrived` is the encoding `self` decoded from. A
-	/// refused open leaves `content` as it was.
+	/// refused open leaves `content` unchanged.
 	///
 	/// # Errors
 	///
@@ -423,7 +435,7 @@ impl AuthEnvelopedData {
 		opening.decrypt(&<P::AeadCipher as KeyInit>::new(&content_key), content)
 	}
 
-	/// The encrypted content of this envelope, taken out into a buffer that
+	/// Takes the encrypted content out of this envelope into a buffer that
 	/// wipes, so it decrypts in place beside the envelope, as a frame carries
 	/// it (RFC 5652 §6.1).
 	///
@@ -436,7 +448,7 @@ impl AuthEnvelopedData {
 		Ok(Zeroizing::new(content.into_bytes()))
 	}
 
-	/// Hold this envelope, whose encoding is `arrived`, to the cipher `A`, to
+	/// Holds this envelope, whose encoding is `arrived`, to the cipher `A`, to
 	/// DER attributes, and to the content type `content_type`.
 	///
 	/// # Errors
@@ -456,8 +468,8 @@ impl AuthEnvelopedData {
 	/// arrived, as the set the envelope holds.
 	///
 	/// A record names one recipient, the key of its direction and epoch, so
-	/// this refuses a set of another count before `der` sorts it, and the set
-	/// of one that this builds sorts nothing.
+	/// this refuses a set of another count before `der` sorts it. The set of
+	/// one that this builds is in DER order by construction.
 	///
 	/// # Errors
 	///
@@ -515,7 +527,7 @@ impl AuthEnvelopedData {
 		Ok(Opening { nonce, tag, associated_data })
 	}
 
-	/// Decode the envelope `record` holds, of type `content_type`, with its
+	/// Decodes the envelope `record` holds, of type `content_type`, with its
 	/// encrypted content left in place, so the content opens in the buffer it
 	/// arrived in. Every other field decodes as [`Decode`] decodes it, and the
 	/// encrypted content stays in `record` alone.
@@ -672,7 +684,7 @@ struct Draw<A: AeadCore + KeyInit> {
 }
 
 impl<A: ContentEncryption> Draw<A> {
-	/// Draw a content key of the size of `A` and a nonce from `rng`.
+	/// Draws a content key of the size of `A` and a nonce from `rng`.
 	///
 	/// # Errors
 	///
@@ -687,7 +699,7 @@ impl<A: ContentEncryption> Draw<A> {
 		Ok(Self { content_key, nonce })
 	}
 
-	/// Seal `content`, of type `content_type`, under this content key for
+	/// Seals `content`, of type `content_type`, under this content key for
 	/// `recipient_info`, the recipient that holds it wrapped. A `Vec` that
 	/// moves in becomes the `encryptedContent`.
 	///
@@ -708,18 +720,19 @@ impl<A: ContentEncryption> Draw<A> {
 		Ok(sealed)
 	}
 
-	/// Seal `content` in place, of type `content_type`, under this content
+	/// Seals `content` in place, of type `content_type`, under this content
 	/// key for `recipient_info`, the recipient that holds it wrapped. The
 	/// envelope carries the content detached.
 	///
 	/// Every step that can fail runs before the content encrypts, and the
-	/// cipher leaves a refused buffer as it was ([`ContentEncryption`]), so a
-	/// refused seal leaves `content` as it was.
+	/// cipher leaves a refused buffer unchanged ([`ContentEncryption`]), so a
+	/// refused seal leaves `content` unchanged.
 	///
 	/// # Errors
 	///
 	/// - [`EnvelopeError::ContentTypeAttribute`] -- `auth_attrs` carries a content-type attribute.
-	/// - [`EnvelopeError::Encoding`] -- a field fails to encode, or `content` is past a DER length.
+	/// - [`EnvelopeError::Encoding`] -- a field fails to encode, or `content`
+	///   or the envelope is past a DER length.
 	/// - [`EnvelopeError::TagLength`] -- the parameters cannot name the cipher's tag length.
 	/// - [`EnvelopeError::Encryption`] -- the cipher refused the content.
 	fn seal_in_place(
@@ -729,37 +742,45 @@ impl<A: ContentEncryption> Draw<A> {
 		content: &mut [u8],
 		auth_attrs: impl IntoIterator<Item = Attribute>,
 	) -> Result<AuthEnvelopedData, EnvelopeError> {
-		// 1. Build every field the content leaves as it is: the recipient, the
-		//    attributes with the content type ahead of the caller's, their DER
-		//    as the associated data, and the parameters.
+		// 1. Build each field the content leaves as is, with the content type
+		//    first among the attributes and their DER as the associated data.
+		//    A zero tag of the cipher's length holds the tag's place in `mac`.
 		let recipient_infos = RecipientInfos(SetOfVec::try_from(vec![recipient_info])?);
 		let auth_attrs = authenticated_attributes(content_type, auth_attrs)?;
 		let associated_data = auth_attrs.to_der()?;
 		let parameters = Some(A::parameters(&self.nonce)?);
 
-		// 2. Hold the content and the tag to DER lengths, so each octet string
-		//    forms once the content has encrypted.
-		Length::try_from(content.len())?;
-		Length::try_from(A::TagSize::USIZE)?;
-
-		// 3. Encrypt in place, with the tag detached into `mac`.
-		let cipher = A::new(&self.content_key);
-		let tag = cipher.encrypt_in_place_detached(&self.nonce, &associated_data, content);
-		let tag = tag.map_err(|_| EnvelopeError::Encryption)?;
-
 		let oid = <A::Oid as AssociatedOid>::OID;
 		let content_enc_alg = AlgorithmIdentifierOwned { oid, parameters };
 		let auth_encrypted_content_info =
 			EncryptedContentInfo { content_type, content_enc_alg, encrypted_content: None };
-		Ok(AuthEnvelopedData {
+		let mut sealed = AuthEnvelopedData {
 			version: CmsVersion::V0,
 			originator_info: None,
 			recipient_infos,
 			auth_encrypted_content_info,
 			auth_attrs: Some(auth_attrs),
-			mac: OctetString::new(tag.as_slice())?,
+			mac: OctetString::new(Tag::<A>::default().as_slice())?,
 			unauth_attrs: None,
-		})
+		};
+
+		// 2. Hold the content and the envelope to DER lengths, so the content's
+		//    octet string forms, and the envelope with its tag encodes, once
+		//    the content has encrypted.
+		Length::try_from(content.len())?;
+		sealed.encoded_len()?;
+
+		// 3. Encrypt in place, with the tag detached.
+		let cipher = A::new(&self.content_key);
+		let tag = cipher.encrypt_in_place_detached(&self.nonce, &associated_data, content);
+		let tag = tag.map_err(|_| EnvelopeError::Encryption)?;
+
+		// 4. Write the tag over the zeros that held its place, in the buffer the length check measured.
+		let mut mac = core::mem::replace(&mut sealed.mac, OctetString::new(Vec::new())?).into_bytes();
+		mac.iter_mut().zip(tag.as_slice()).for_each(|(slot, octet)| *slot = *octet);
+		sealed.mac = OctetString::new(mac)?;
+
+		Ok(sealed)
 	}
 }
 
@@ -772,7 +793,7 @@ struct Opening<A: AeadCore> {
 }
 
 impl<A: ContentEncryption> Opening<A> {
-	/// Decrypt `content` in place under `cipher`, keyed with the content key.
+	/// Decrypts `content` in place under `cipher`, keyed with the content key.
 	/// A content that returns has passed its tag, and a refused one is as it
 	/// arrived ([`ContentEncryption`]).
 	///
@@ -785,9 +806,9 @@ impl<A: ContentEncryption> Opening<A> {
 	}
 }
 
-/// An envelope whose encrypted content stayed in the buffer it arrived in,
-/// from [`AuthEnvelopedData::detach`], with the associated data its
-/// attributes were admitted as.
+/// An envelope whose encrypted content stays in the buffer it arrived in,
+/// from [`AuthEnvelopedData::detach`], with the associated data of its
+/// admitted attributes.
 pub(in crate::crypto) struct Detached<'a> {
 	envelope: AuthEnvelopedData,
 	associated_data: Vec<u8>,
@@ -805,8 +826,8 @@ impl<'a> Detached<'a> {
 		self.content.len()
 	}
 
-	/// Open the content in the buffer it arrived in, under the AEAD of `P` and
-	/// `kek`, which `key_identifier` names, and return it decrypted.
+	/// Opens the content in the buffer it arrived in, under the AEAD of `P` and
+	/// `kek`, which `key_identifier` names, and returns it decrypted.
 	///
 	/// # Errors
 	///
@@ -862,8 +883,8 @@ struct ArrivedEnvelope<'a> {
 }
 
 /// The syntax of [`AuthEnvelopedData`] borrowed whole from the buffer it
-/// arrived in, so an envelope decoded once reads its arrived attributes with
-/// no allocation. Each other field is its element as it arrived.
+/// arrived in, so an envelope decoded once reads its arrived attributes in
+/// place. Each other field is its element as it arrived.
 #[derive(Sequence)]
 struct ArrivedEnvelopeRef<'a> {
 	version: AnyRef<'a>,
@@ -893,7 +914,7 @@ struct ArrivedEnvelopeRef<'a> {
 	unauth_attrs: Option<AnyRef<'a>>,
 }
 
-/// `EncryptedContentInfo` (RFC 5652 §6.1) with the encrypted content
+/// The `EncryptedContentInfo` (RFC 5652 §6.1), with the encrypted content
 /// borrowed from the buffer it arrived in.
 #[derive(Sequence)]
 struct ArrivedContentInfo<'a> {
@@ -989,4 +1010,52 @@ fn content_type_of(attributes: &Attributes) -> Result<ObjectIdentifier, Envelope
 	};
 
 	Ok(value.decode_as::<ObjectIdentifier>()?)
+}
+
+#[cfg(test)]
+mod tests {
+	use aead::{AeadCore, Nonce};
+
+	use super::gcm_parameters;
+	use crate::crypto::cms::EnvelopeError;
+	use crate::crypto::common::typenum::{U0, U12, U32, U8};
+	use crate::error::ReceivedExpectedError;
+
+	/// An AEAD with an 8-octet tag, shorter than any tag `aes-ICVlen` names
+	/// (RFC 5084 §3.2).
+	struct ShortTagCipher;
+
+	impl AeadCore for ShortTagCipher {
+		type NonceSize = U12;
+		type TagSize = U8;
+		type CiphertextOverhead = U0;
+	}
+
+	/// An AEAD with a 32-octet tag, longer than any tag `aes-ICVlen` names
+	/// (RFC 5084 §3.2).
+	struct LongTagCipher;
+
+	impl AeadCore for LongTagCipher {
+		type NonceSize = U12;
+		type TagSize = U32;
+		type CiphertextOverhead = U0;
+	}
+
+	/// A tag shorter than any `aes-ICVlen` refuses the parameters, and the
+	/// error expects 12, the nearest length the field names.
+	#[test]
+	fn a_tag_shorter_than_any_icv_length_expects_the_nearest_one() {
+		let refused = gcm_parameters::<ShortTagCipher>(&Nonce::<ShortTagCipher>::default());
+		let expected = ReceivedExpectedError { received: 8, expected: 12 };
+		assert!(matches!(refused, Err(EnvelopeError::TagLength(found)) if found == expected));
+	}
+
+	/// A tag longer than any `aes-ICVlen` refuses the parameters, and the
+	/// error expects 16, the nearest length the field names.
+	#[test]
+	fn a_tag_longer_than_any_icv_length_expects_the_nearest_one() {
+		let refused = gcm_parameters::<LongTagCipher>(&Nonce::<LongTagCipher>::default());
+		let expected = ReceivedExpectedError { received: 32, expected: 16 };
+		assert!(matches!(refused, Err(EnvelopeError::TagLength(found)) if found == expected));
+	}
 }

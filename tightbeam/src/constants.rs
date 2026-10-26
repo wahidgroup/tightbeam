@@ -305,19 +305,22 @@ pub const DEFAULT_REKEY_MIN_SPEND_RECORDS: u64 = 4;
 /// converges on the GoAway drain path.
 pub const DEFAULT_REKEY_DEADLINE_SECS: u64 = 30;
 
-/// Concurrent-connection cap of each async accept loop.
+/// Concurrent-connection cap of each accept loop, async or blocking.
 ///
 /// The servlet, hive, and gateway planes take it as their cap, and the
 /// `server!` macro takes it unless a `max_connections` policy names another.
 ///
-/// The loop pauses its accepts while this many connection tasks are alive, so
+/// The loop pauses its accepts while this many connections are alive, so
 /// a connection flood waits in the listener backlog rather than pin unbounded
 /// tasks and file descriptors.
 ///
 /// # Sources
 ///
 /// - CWE-400, uncontrolled resource consumption: <https://cwe.mitre.org/data/definitions/400.html>
-pub const DEFAULT_MAX_SERVER_CONNECTIONS: usize = 1024;
+pub const DEFAULT_MAX_SERVER_CONNECTIONS: core::num::NonZeroUsize = match core::num::NonZeroUsize::new(1024) {
+	Some(cap) => cap,
+	None => core::num::NonZeroUsize::MIN,
+};
 
 /// Delay between accept retries after a failed accept.
 ///
@@ -533,7 +536,7 @@ pub const DEFAULT_MUX_STREAM_CREDIT: u64 = 64;
 ///
 /// - Every data chunk debits at least one credit and consumes exactly one record.
 /// - Control envelopes (credit grants, cancels, pings, GoAway) pass outside the
-///   budget but still consume AEAD records.
+///   budget, and they consume AEAD records too.
 /// - The default grantor grants credit in batches, so control traffic stays at
 ///   `O(data chunks / window)` records, inside the other half.
 /// - The bound holds at the default ceiling. At a raised one the record limit can fall below the budget.
@@ -649,7 +652,7 @@ pub const DEFAULT_MAX_DECOMPRESSED_LEN: usize = 16 * 1024 * 1024;
 /// Hard ceiling on the bytes one mux stream reassembles: a unary reassembly
 /// buffer, or the body that `StreamBody::into_bytes` collects.
 ///
-/// Credit grants may raise the chunk window, and accepted payload bytes still
+/// Credit grants may raise the chunk window, while accepted payload bytes
 /// stay within this bound. The value equals
 /// [`DEFAULT_MAX_DECOMPRESSED_LEN`].
 ///
@@ -736,7 +739,7 @@ pub const MAX_RELAY_ROUTES: usize = 1024;
 
 /// Origin sentinel for the relay budget on work and routed stream opens.
 ///
-/// The budget is the number of gateway forwards a request may still spend.
+/// The budget is the number of gateway forwards a request has left to spend.
 /// Each peer hop decrements it, and `0` serves locally only.
 ///
 /// - An origin stamps `u8::MAX`, which means "forward as far as policy allows".
@@ -843,14 +846,14 @@ pub const MAX_GOSSIP_LOG_PER_SIGNER: usize = 256;
 /// fresh. The journal keeps its digest while it is fresh, so a replay counts
 /// as already seen, which is the recovered or immune state of the epidemic
 /// model. The window must exceed the time a flood takes to traverse the peer
-/// graph, so the journal still suppresses a late duplicate.
+/// graph, so the journal suppresses even a late duplicate.
 pub const DEFAULT_GOSSIP_SEEN_TTL_MS: u64 = 120_000;
 
 /// Default gossip retention window in milliseconds.
 ///
-/// Anti-entropy reconciliation can repair only a rumor that a peer still
-/// retains. Retention must be at least as long as the deduplication window,
-/// so reconciliation can still repair a node that returns within the window.
+/// Anti-entropy reconciliation can repair only a rumor that a peer retains.
+/// Retention must be at least as long as the deduplication window, so
+/// reconciliation can repair a node that returns within the window.
 pub const DEFAULT_GOSSIP_RETENTION_MS: u64 = 120_000;
 
 /// Default initial time-to-live an origin gossip requests.

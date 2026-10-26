@@ -18,7 +18,7 @@
 //! - Protocol-specific reliability, where tightbeam uses the metadata built into each frame.
 //!
 //! The test shows that tightbeam's first-principles design (`I(t) ∈ (0,1)`)
-//! handles delay-tolerant scenarios with no extra infrastructure.
+//! serves delay-tolerant scenarios with no extra infrastructure.
 
 use std::time::Duration;
 
@@ -31,17 +31,13 @@ use tightbeam::TightBeamError;
 use crate::dtn::delay::DelaySimulator;
 use crate::dtn::storage::{DtnPayload, FrameStore, StorageRoot};
 
-/// A payload that Earth addresses to Mars, carrying `content`.
+/// A payload that Earth addresses to Mars, which carries `content`.
 fn earth_payload(content: impl AsRef<[u8]>) -> DtnPayload {
-	DtnPayload {
-		content: content.as_ref().to_vec(),
-		source_node: "Earth".to_string(),
-		dest_node: "Mars".to_string(),
-		hop_count: 0,
-	}
+	let payload = DtnPayload::new(content.as_ref(), "Earth", "Mars", 0);
+	payload.expect("a short payload fits an OCTET STRING")
 }
 
-/// Multi-hop DTN test from Earth to Mars through a relay.
+/// A multi-hop DTN test from Earth to Mars through a relay.
 #[tokio::test(start_paused = true)]
 async fn dtn_multi_hop_earth_to_mars() -> Result<(), TightBeamError> {
 	// Each node stores its frames in a directory of its own.
@@ -112,7 +108,7 @@ async fn dtn_multi_hop_earth_to_mars() -> Result<(), TightBeamError> {
 	assert!(mars_verdict.broken_links.is_empty(), "No broken links expected");
 
 	let final_payload = DtnPayload::from_der(mars_frame1.message())?;
-	assert_eq!(final_payload.content, b"Hello Mars from Earth!");
+	assert_eq!(final_payload.content.as_bytes(), b"Hello Mars from Earth!");
 	assert_eq!(final_payload.source_node, "Earth");
 	assert_eq!(final_payload.dest_node, "Mars");
 	assert_eq!(final_payload.hop_count, 1);

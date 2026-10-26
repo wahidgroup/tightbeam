@@ -1,5 +1,6 @@
-//! Multiplex transport test fixtures.
+//! The fixtures of the multiplex transport tests.
 
+use core::error::Error;
 use core::future::{pending, poll_fn, Future, Pending};
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
@@ -11,6 +12,8 @@ use std::sync::Arc;
 use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::der::{Decode, Encode};
 use tightbeam::policy::{SessionContext, TransitStatus};
+use tightbeam::testing::macros::BuiltAssertSpec;
+use tightbeam::testing::{HookContext, ScenarioConfig, Violations};
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::envelopes::{
 	CancelReason, GoAwayPackage, GoAwayReason, MuxCancelPackage, MuxEndPackage, MuxEnvelope, MuxOpenPackage,
@@ -40,24 +43,24 @@ use tokio::time::timeout;
 
 use crate::common::security::{expectation_failure, ServerMaterials};
 use crate::transport::support::{
-	await_ok, await_transport, bind_encrypted_listener, connect_pinned_client, join_task, mux_frame, mux_offer,
+	await_ok, bind_encrypted_listener, connect_pinned_client, join_task, mux_frame, mux_offer,
 	serve_one_handshake_message, HandlerSignal,
 };
 
-/// Receive half of a split TCP test transport.
+/// The receive half of a split TCP test transport.
 pub type SplitReader = TransportReader<TokioReadHalf>;
-/// Send half of a split TCP test transport.
+/// The send half of a split TCP test transport.
 pub type SplitWriter = TransportWriter<TokioWriteHalf>;
-/// Spawned emit that resolves to the reply frame or the emit error.
+/// A spawned emit that resolves to the reply frame or the emit error.
 pub type EmitTask = JoinHandle<Result<Option<Frame>, TransportError>>;
-/// Spawned responder loop that resolves when its serve call returns.
+/// A spawned responder loop that resolves when its serve call returns.
 pub type ServeTask = JoinHandle<Result<(), TransportError>>;
-/// Boxed unary or streaming handler future that answers with a response.
+/// A boxed unary or streaming handler future that answers with a response.
 pub type HandlerFuture = Pin<Box<dyn Future<Output = ResponsePackage> + Send>>;
-/// Boxed duplex handler future that answers with the trailer status.
+/// A boxed duplex handler future that answers with the trailer status.
 pub type StatusFuture = Pin<Box<dyn Future<Output = TransitStatus> + Send>>;
 
-/// Frame labeled `label` whose encoding spans many mux chunks.
+/// A frame labeled `label` whose encoding spans many mux chunks.
 pub fn large_mux_frame(label: impl AsRef<str>) -> Frame {
 	let label = label.as_ref();
 	// The padding sizes the encoded frame to roughly fifteen 1024-byte chunks,
@@ -66,7 +69,7 @@ pub fn large_mux_frame(label: impl AsRef<str>) -> Frame {
 	mux_frame(format!("{label}-{padding}"))
 }
 
-/// Mux offer at `cap` streams with a 1024-byte chunk payload size.
+/// A mux offer of `cap` streams with a chunk payload size of 1024 bytes.
 pub fn chunked_offer(cap: u32) -> TransportOffer {
 	mux_offer(cap).with_chunk_payload_size(1024)
 }
@@ -115,24 +118,24 @@ pub async fn establish_transports(
 
 /// A spawned mux endpoint.
 pub struct MuxEndpoint {
-	/// Handle that opens and emits on streams.
+	/// The handle that opens streams and emits on them.
 	pub handle: MuxHandle,
-	/// Reader driver task, held so it runs for the endpoint's lifetime.
+	/// The reader driver task, which runs until the connection ends.
 	pub _reader_task: JoinHandle<()>,
 }
 
 /// Per-endpoint limits for the scenarios that harden an endpoint.
 #[derive(Default)]
 pub struct MuxEndpointConfig {
-	/// Send-cipher rekey record limit override for the writer half.
+	/// An override of the rekey record limit of the writer half.
 	pub rekey_limit: Option<u64>,
-	/// Peer cancel budget override for the responder.
+	/// An override of the responder's budget for peer cancels.
 	pub cancel_budget: Option<u32>,
-	/// Receiver-side credit policy override.
+	/// An override of the credit policy on the receive side.
 	pub grantor: Option<Arc<dyn CreditGrantor>>,
 	/// Whether to attach the in-band rekey context.
 	pub rekey: bool,
-	/// Time budget override for one renewal exchange.
+	/// An override of the time budget for one renewal exchange.
 	pub renewal_deadline: Option<Duration>,
 }
 
@@ -306,16 +309,16 @@ where
 
 /// A connected mux client with its negotiated settings.
 pub struct MuxClient {
-	/// Spawned client endpoint.
+	/// The spawned client endpoint.
 	pub endpoint: MuxEndpoint,
-	/// Responder for peer-initiated streams on the client.
+	/// The responder for the streams that the peer opens on the client.
 	pub responder: MuxResponder,
-	/// Settings the handshake negotiated.
+	/// The settings that the handshake negotiated.
 	pub settings: MuxSettings,
 }
 
 impl MuxClient {
-	/// Handle of the client endpoint.
+	/// The handle of the client endpoint.
 	pub fn handle(&self) -> &MuxHandle {
 		&self.endpoint.handle
 	}
@@ -348,13 +351,13 @@ pub async fn connect_mux_client(
 	Ok(MuxClient { endpoint, responder, settings })
 }
 
-/// Muxed client against raw server halves, so the test owns the wire order.
+/// A muxed client against raw server halves, so the test owns the wire order.
 pub struct ClientMuxServerRaw {
-	/// Muxed client endpoint.
+	/// The muxed client endpoint.
 	pub client: MuxEndpoint,
-	/// Raw receive half of the server.
+	/// The raw receive half of the server.
 	pub server_reader: SplitReader,
-	/// Raw send half of the server.
+	/// The raw send half of the server.
 	pub server_writer: SplitWriter,
 }
 
@@ -403,16 +406,16 @@ pub async fn raw_echo_roundtrip(link: &mut ClientMuxServerRaw, frame: &Frame) ->
 	Ok(is_echo(echoed, frame))
 }
 
-/// Muxed server against raw client halves, so the test drives requests on the
-/// wire.
+/// A muxed server against raw client halves, so the test drives requests on
+/// the wire.
 pub struct ServerMuxClientRaw {
-	/// Muxed server endpoint.
+	/// The muxed server endpoint.
 	pub server: MuxEndpoint,
-	/// Responder that serves the client's streams.
+	/// The responder that serves the client's streams.
 	pub responder: MuxResponder,
-	/// Raw receive half of the client.
+	/// The raw receive half of the client.
 	pub client_reader: SplitReader,
-	/// Raw send half of the client.
+	/// The raw send half of the client.
 	pub client_writer: SplitWriter,
 }
 
@@ -463,11 +466,11 @@ pub async fn establish_server_mux_client_raw(
 
 /// Two muxed endpoints with an echo responder that serves the server side.
 pub struct MuxPair {
-	/// Muxed client endpoint.
+	/// The muxed client endpoint.
 	pub client: MuxEndpoint,
-	/// Muxed server endpoint.
+	/// The muxed server endpoint.
 	pub server: MuxEndpoint,
-	/// Echo responder task, held so it serves for the pair's lifetime.
+	/// The echo responder task, which serves until the connection ends.
 	pub _server_serve: ServeTask,
 }
 
@@ -530,13 +533,13 @@ pub fn echo_response(frame: &Arc<Frame>) -> ResponsePackage {
 	ResponsePackage::new(TransitStatus::Ok, Some(Frame::clone(frame)))
 }
 
-/// Terminal outcome of a fully drained [`StreamBody`].
+/// The terminal outcome of a fully drained [`StreamBody`].
 pub struct DrainedBody {
-	/// Every chunk's bytes, in arrival order.
+	/// The bytes of every chunk, in arrival order.
 	pub bytes: Vec<u8>,
-	/// Chunks consumed before the terminal event.
+	/// The count of chunks that the drain consumes before the terminal event.
 	pub chunks: usize,
-	/// The failure that ended the body, `None` on a clean end.
+	/// The failure that ends the body, or `None` on a clean end.
 	pub failure: Option<TransportError>,
 }
 
@@ -561,7 +564,7 @@ pub fn saw_multiple_chunks(counter: &AtomicUsize) -> bool {
 	counter.load(Ordering::SeqCst) > 1
 }
 
-/// Echo of a body reassembled from streamed chunks.
+/// The echo of a body reassembled from streamed chunks.
 pub fn echo_reassembled(buffer: impl AsRef<[u8]>) -> ResponsePackage {
 	let buffer = buffer.as_ref();
 	match Frame::from_der(buffer) {
@@ -570,7 +573,7 @@ pub fn echo_reassembled(buffer: impl AsRef<[u8]>) -> ResponsePackage {
 	}
 }
 
-/// Streaming echo handler that consumes the body chunk by chunk, counts
+/// A streaming echo handler that consumes the body chunk by chunk, counts
 /// arrivals, and then echoes the reassembled frame.
 pub fn streaming_echo_handler(chunks_seen: Arc<AtomicUsize>) -> impl Fn(StreamBody) -> HandlerFuture {
 	move |mut body| {
@@ -605,8 +608,8 @@ pub async fn push_split(mut sink: RequestSink, payload: impl AsRef<[u8]>) -> Res
 	sink.close().await
 }
 
-/// Duplex echo handler that streams every request chunk straight back, counts
-/// arrivals, and ends the reply with the trailer status.
+/// A duplex echo handler that streams every request chunk straight back,
+/// counts arrivals, and ends the reply with the trailer status.
 pub fn duplex_echo_handler(chunks_seen: Arc<AtomicUsize>) -> impl Fn(StreamBody, ReplySink) -> StatusFuture {
 	move |mut body, mut reply| {
 		let counter = Arc::clone(&chunks_seen);
@@ -627,7 +630,7 @@ pub fn duplex_echo_handler(chunks_seen: Arc<AtomicUsize>) -> impl Fn(StreamBody,
 	}
 }
 
-/// Echo handler that raises `started` and waits for `release` before it
+/// An echo handler that raises `started` and waits for `release` before it
 /// answers.
 pub fn gated_echo_handler(started: Arc<HandlerSignal>, release: Arc<Notify>) -> impl Fn(Arc<Frame>) -> HandlerFuture {
 	move |frame| {
@@ -653,7 +656,7 @@ pub fn spawn_gated_echo(responder: MuxResponder) -> (Arc<HandlerSignal>, Arc<Not
 
 /// Server materials and the signals a gated echo handler waits on.
 pub struct GatedMuxContext {
-	/// Server certificate and key for the encrypted listener.
+	/// The server certificate and key for the encrypted listener.
 	pub materials: ServerMaterials,
 	/// The signal a handler raises when it starts.
 	pub started: HandlerSignal,
@@ -662,7 +665,7 @@ pub struct GatedMuxContext {
 }
 
 impl GatedMuxContext {
-	/// Fresh materials, an unraised signal, and an unsignalled notifier.
+	/// Build fresh materials, an unraised signal, and an unsignalled notifier.
 	pub fn generate() -> Self {
 		Self {
 			materials: ServerMaterials::generate(),
@@ -672,7 +675,7 @@ impl GatedMuxContext {
 	}
 }
 
-/// Echo handler that raises `ctx.started` and waits for `ctx.release`
+/// An echo handler that raises `ctx.started` and waits for `ctx.release`
 /// before it answers.
 pub fn gated_echo(ctx: Arc<GatedMuxContext>) -> impl Fn(Arc<Frame>) -> HandlerFuture {
 	move |frame| {
@@ -685,7 +688,7 @@ pub fn gated_echo(ctx: Arc<GatedMuxContext>) -> impl Fn(Arc<Frame>) -> HandlerFu
 	}
 }
 
-/// Echo handler that answers at once.
+/// An echo handler that answers at once.
 pub fn immediate_echo_handler() -> impl Fn(Arc<Frame>) -> core::future::Ready<ResponsePackage> {
 	|frame| core::future::ready(echo_response(&frame))
 }
@@ -695,7 +698,7 @@ pub fn spawn_immediate_echo(responder: MuxResponder) -> ServeTask {
 	tokio::spawn(responder.serve(immediate_echo_handler()))
 }
 
-/// Echo handler that holds `held_frame` until a different frame arrives,
+/// An echo handler that holds `held_frame` until a different frame arrives,
 /// which releases the hold.
 pub fn order_forcing_echo(held_frame: Frame, gate: Arc<Notify>) -> impl Fn(Arc<Frame>) -> HandlerFuture {
 	move |frame: Arc<Frame>| {
@@ -713,9 +716,9 @@ pub fn order_forcing_echo(held_frame: Frame, gate: Arc<Notify>) -> impl Fn(Arc<F
 	}
 }
 
-/// Cancel-abort fixture. Its drop witness records the handler abort.
+/// The cancel-abort fixture, whose drop witness records the handler abort.
 pub struct AbortContext {
-	/// Server certificate and key for the encrypted listener.
+	/// The server certificate and key for the encrypted listener.
 	pub materials: ServerMaterials,
 	/// The signal the first handler raises when it starts.
 	pub started: HandlerSignal,
@@ -724,13 +727,13 @@ pub struct AbortContext {
 	pub never: Notify,
 	/// The flag the drop witness sets when a cancel aborts the parked handler.
 	pub aborted: AtomicBool,
-	/// Count of handler calls.
+	/// The count of handler calls.
 	pub calls: AtomicU32,
 }
 
 impl AbortContext {
-	/// Fresh materials, an unraised signal, an unsignalled notifier, and zeroed
-	/// counters.
+	/// Build fresh materials, an unraised signal, an unsignalled notifier, and
+	/// zeroed counters.
 	pub fn generate() -> Self {
 		Self {
 			materials: ServerMaterials::generate(),
@@ -742,7 +745,7 @@ impl AbortContext {
 	}
 }
 
-/// Echo handler whose first call parks forever under a drop witness, and
+/// An echo handler whose first call parks forever under a drop witness, and
 /// whose later calls echo at once.
 pub fn first_parks_then_echo(ctx: Arc<AbortContext>) -> impl Fn(Arc<Frame>) -> HandlerFuture {
 	move |frame: Arc<Frame>| {
@@ -931,7 +934,7 @@ pub async fn kick_shutdown(
 	let mut shutdown_future = Box::pin(handle.shutdown());
 	poll_fn(|cx| {
 		// One poll sends the GoAway and halts the allocator. The caller awaits
-		// the drain on the returned future.
+		// the drain on the returned future, so this poll's result goes unused.
 		let _ = shutdown_future.as_mut().poll(cx);
 		Poll::Ready(())
 	})
@@ -1033,13 +1036,7 @@ pub async fn read_until_goaway(reader: &mut SplitReader, reason: GoAwayReason) -
 	.map_err(|_| expectation_failure("GoAway must arrive before the read timeout"))?
 }
 
-/// Poll [`MuxHandle::goaway_reason`] until it reports `reason` or the wait
-/// times out.
-pub async fn await_goaway_reason(handle: &MuxHandle, reason: GoAwayReason) -> bool {
-	await_transport(|| handle.goaway_reason() == Some(reason)).await
-}
-
-/// Receiver policy that keeps every stream's limit at the initial credit
+/// A receiver policy that keeps every stream's limit at the initial credit
 /// window, which pins the sender there.
 pub struct NeverGrant;
 
@@ -1049,7 +1046,7 @@ impl CreditGrantor for NeverGrant {
 	}
 }
 
-/// Authorizer that grants half of each requested budget direction.
+/// An authorizer that grants half of each requested budget direction.
 pub struct HalvingAuthorizer;
 
 impl TransportAuthorizer for HalvingAuthorizer {
@@ -1068,10 +1065,10 @@ impl TransportAuthorizer for HalvingAuthorizer {
 	}
 }
 
-/// Application refusal code carried by [`RefusingAuthorizer`].
+/// The application refusal code that [`RefusingAuthorizer`] carries.
 pub const REFUSAL_CODE: u32 = MUX_APPLICATION_CODE_FLOOR;
 
-/// Authorizer that refuses every offer with [`REFUSAL_CODE`].
+/// An authorizer that refuses every offer with [`REFUSAL_CODE`].
 pub struct RefusingAuthorizer;
 
 impl TransportAuthorizer for RefusingAuthorizer {
@@ -1083,8 +1080,8 @@ impl TransportAuthorizer for RefusingAuthorizer {
 	}
 }
 
-/// Authorizer whose backend hangs forever, which simulates a hung authorization
-/// service on the unauthenticated handshake path.
+/// An authorizer whose backend hangs forever, which simulates a hung
+/// authorization service on the unauthenticated handshake path.
 pub struct HangingAuthorizer;
 
 impl TransportAuthorizer for HangingAuthorizer {
@@ -1113,8 +1110,8 @@ pub fn is_goaway(envelope: &TransportEnvelope, reason: GoAwayReason, last_stream
 	}
 }
 
-/// Drop witness that records the abort of an in-flight handler, because its
-/// flag flips only on cancellation.
+/// A drop witness that records the abort of an in-flight handler. The call it
+/// guards parks forever, so only a cancel drops it.
 pub struct DropWitness(pub Arc<AbortContext>);
 
 impl Drop for DropWitness {
@@ -1126,16 +1123,16 @@ impl Drop for DropWitness {
 /// One rekey headroom case, where
 /// `drain_headroom = 2 * (local_cap + peer_cap) + 1`.
 pub struct RekeyCase {
-	/// Streams the server may initiate.
+	/// The count of streams that the server may initiate.
 	pub server_local_cap: u32,
-	/// Peer-initiated streams the server accepts.
+	/// The count of peer-initiated streams that the server accepts.
 	pub server_peer_cap: u32,
-	/// Send-cipher rekey record limit under test.
+	/// The rekey record limit of the send cipher under test.
 	pub rekey_limit: u64,
 }
 
 impl RekeyCase {
-	/// The drain headroom in records for this case.
+	/// The drain headroom of this case, in records.
 	pub fn headroom(&self) -> u64 {
 		u64::from(self.server_local_cap)
 			.saturating_add(u64::from(self.server_peer_cap))
@@ -1143,7 +1140,8 @@ impl RekeyCase {
 			.saturating_add(1)
 	}
 
-	/// Responses the server sends before the drain floor forces its GoAway.
+	/// The count of responses that the server sends before the drain floor
+	/// forces its GoAway.
 	///
 	/// # Panics
 	///
@@ -1158,9 +1156,8 @@ impl RekeyCase {
 /// One Rapid Reset pair past the budget draws GoAway(EnhanceYourCalm) and a
 /// PolicyRejection.
 ///
-/// The run checks the wire answer inline, which is the reason and the abuse
-/// watermark, and returns whether the responder reported a policy
-/// rejection.
+/// The run asserts the reason and the abuse watermark of the GoAway inline,
+/// and returns whether the responder reports a policy rejection.
 ///
 /// # Errors
 ///
@@ -1180,9 +1177,9 @@ where
 	run_cancel_abuse_against(client_reader, client_writer, serve_task, cancel_budget).await
 }
 
-/// Cancel abuse against an endpoint that already serves, whose handlers park
-/// forever, so every cancel aborts a live handler. The responder and the
-/// [`MuxAcceptor::serve`] paths share it.
+/// Run cancel abuse against a serving endpoint whose handlers park forever,
+/// so every cancel aborts a live handler. The responder path and the
+/// [`MuxAcceptor::serve`] path share it.
 ///
 /// # Errors
 ///
@@ -1222,45 +1219,62 @@ where
 	Ok(is_policy_rejection(&refused))
 }
 
-/// Unary `MuxService` closure whose handlers stay pending, so every peer cancel
-/// aborts a live handler.
+/// A unary `MuxService` closure whose handlers stay pending, so every peer
+/// cancel aborts a live handler.
 pub fn parked_unary_service() -> impl Fn(Frame, SessionContext) -> Pending<Result<Option<Frame>, TightBeamError>> {
 	|_frame, _session| pending()
 }
 
-/// Server materials and the signal a server-initiated stream test waits on.
-pub struct ServerInitContext {
-	/// Server certificate and key for the encrypted listener.
-	pub materials: ServerMaterials,
-	/// The signal the server task raises once its emit resolves.
-	pub done: HandlerSignal,
-}
-
-impl ServerInitContext {
-	/// Fresh materials and an unraised signal.
-	pub fn generate() -> Self {
-		Self { materials: ServerMaterials::generate(), done: HandlerSignal::default() }
-	}
-}
-
-/// Ping fixture, whose `handler_calls` count proves pings bypass the
-/// responder.
+/// The ping fixture, whose flag carries the outcome of the server's ping to
+/// the client's task.
 pub struct PingContext {
-	/// Server certificate and key for the encrypted listener.
+	/// The server certificate and key for the encrypted listener.
 	pub materials: ServerMaterials,
-	/// Count of calls the unary handler received.
-	pub handler_calls: AtomicU32,
 	/// The signal the server task raises once its own ping resolves.
 	pub server_ping_done: HandlerSignal,
+	/// Whether the client acked the server's ping, which the server task
+	/// stores before it raises `server_ping_done`.
+	pub server_ping_acked: AtomicBool,
 }
 
 impl PingContext {
-	/// Fresh materials, a zeroed counter, and an unraised signal.
+	/// Build fresh materials, an unraised signal, and a cleared ack flag.
 	pub fn generate() -> Self {
 		Self {
 			materials: ServerMaterials::generate(),
-			handler_calls: AtomicU32::new(0),
 			server_ping_done: HandlerSignal::default(),
+			server_ping_acked: AtomicBool::new(false),
 		}
 	}
+}
+
+/// Runs one case of a case table on a runtime of its own, and grades what the
+/// trace of the case recorded against `spec`, as `tb_scenario!` grades a
+/// scenario.
+///
+/// `case` drives the endpoints with a share of the trace, and the grade takes
+/// the result of `case` beside the trace.
+///
+/// # Errors
+///
+/// - [`ScenarioConfigError`] -- `spec` builds no configuration.
+/// - [`std::io::Error`] -- the runtime of the case fails to build.
+/// - [`TightBeamError`] -- the grade refuses an exploration event.
+/// - [`Violations`] -- the grade finds a violation.
+///
+/// [`ScenarioConfigError`]: tightbeam::testing::ScenarioConfigError
+pub fn grade_case<F, Fut>(spec: &'static BuiltAssertSpec, case: F) -> Result<(), Box<dyn Error>>
+where
+	F: FnOnce(TraceCollector) -> Fut,
+	Fut: Future<Output = Result<(), TightBeamError>>,
+{
+	let config = ScenarioConfig::builder().with_spec(spec).build()?;
+	let trace = config.trace();
+	let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+
+	let outcome = runtime.block_on(case(trace.share()));
+	let graded = HookContext::build(&config, &trace, outcome)?;
+	graded.outcome().map_err(Violations::clone)?;
+
+	Ok(())
 }

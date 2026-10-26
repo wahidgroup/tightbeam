@@ -17,13 +17,9 @@ use tightbeam::{
 		profiles::{DefaultCryptoProvider, SecurityProfileDesc},
 	},
 	der::Encode,
-	exactly, tb_assert_spec, tb_scenario,
-	testing::SetupEnv,
-	trace::TraceCollector,
 	transport::handshake::{
 		ClientHandshakeProtocol, EstablishedSession, Handshake, HandshakeMessage, ServerHandshakeProtocol,
 	},
-	urn::Urn,
 	TightBeamError,
 };
 
@@ -39,69 +35,12 @@ use crate::common::security::cms_handshake_pair;
 #[cfg(feature = "transport-hpke")]
 use crate::common::security::{hpke_client_config, hpke_server_config, pinning_validator};
 
-pub(crate) const LOOPBACK_CMS_COMPLETE: Urn<'static> = tightbeam::urn!("test", "event:loopback/loopback-cms-complete");
-pub(crate) const LOOPBACK_CMS_PROFILE_AGREED: Urn<'static> =
-	tightbeam::urn!("test", "event:loopback/loopback-cms-profile-agreed");
-pub(crate) const LOOPBACK_CMS_ROUNDTRIP: Urn<'static> =
-	tightbeam::urn!("test", "event:loopback/loopback-cms-roundtrip");
-pub(crate) const LOOPBACK_CMS_UNIQUE_KEYS: Urn<'static> =
-	tightbeam::urn!("test", "event:loopback/loopback-cms-unique-keys");
-pub(crate) const LOOPBACK_HPKE_COMPLETE: Urn<'static> =
-	tightbeam::urn!("test", "event:loopback/loopback-hpke-complete");
-pub(crate) const LOOPBACK_HPKE_PROFILE_AGREED: Urn<'static> =
-	tightbeam::urn!("test", "event:loopback/loopback-hpke-profile-agreed");
-pub(crate) const LOOPBACK_HPKE_ROUNDTRIP: Urn<'static> =
-	tightbeam::urn!("test", "event:loopback/loopback-hpke-roundtrip");
-
-/// The number of CMS loopback passes, which is 0 with the feature disabled.
-const CMS_RUNS: u32 = cfg!(feature = "transport-cms") as u32;
-
-/// The number of HPKE loopback passes, which is 0 with the feature disabled.
-const HPKE_RUNS: u32 = cfg!(feature = "transport-hpke") as u32;
-
-tb_assert_spec! {
-	pub HandshakeLoopbackSpec,
-	V(1,0,0): {
-		mode: Accept,
-		assertions: [
-			(LOOPBACK_HPKE_COMPLETE, exactly!(HPKE_RUNS), equals!(true)),
-			(LOOPBACK_HPKE_ROUNDTRIP, exactly!(HPKE_RUNS), equals!(true)),
-			(LOOPBACK_HPKE_PROFILE_AGREED, exactly!(HPKE_RUNS), equals!(true)),
-			(LOOPBACK_CMS_COMPLETE, exactly!(CMS_RUNS), equals!(true)),
-			(LOOPBACK_CMS_ROUNDTRIP, exactly!(CMS_RUNS), equals!(true)),
-			(LOOPBACK_CMS_PROFILE_AGREED, exactly!(CMS_RUNS), equals!(true)),
-			(LOOPBACK_CMS_UNIQUE_KEYS, exactly!(CMS_RUNS), equals!(true))
-		]
-	}
-}
-
-tb_scenario! {
-	name: handshake_loopback,
-	spec: HandshakeLoopbackSpec,
-	environment Bare {
-		exec: |SetupEnv { trace, .. }| async move {
-			let materials = ServerMaterials::generate();
-
-			#[cfg(feature = "transport-hpke")]
-			hpke_loopback(&trace, &materials).await?;
-
-			#[cfg(feature = "transport-cms")]
-			{
-				cms_loopback(&trace, &materials).await?;
-				cms_unique_traffic_keys(&trace, &materials).await?;
-			}
-
-			Ok(())
-		}
-	}
-}
-
 #[cfg(feature = "transport-hpke")]
 fn security_offer(profile: SecurityProfileDesc) -> SecurityOffer {
 	SecurityOffer::new(vec![profile])
 }
 
-/// Probe both directions and return whether the plaintexts match the
+/// Probes both directions and returns whether the plaintexts match the
 /// probes.
 ///
 /// Each direction has its own key and record sequence, and each record has
@@ -120,27 +59,25 @@ fn bidirectional_roundtrip_ok(client_keys: &SessionKeys, server_keys: &SessionKe
 	Ok(c2s_ok && s2c_ok)
 }
 
-/// Complete both peers, prove AEAD key agreement, and record the negotiated
-/// profile.
-///
-/// The function emits the three named booleans that `HandshakeLoopbackSpec`
-/// verifies with `equals!(true)`.
-async fn emit_session_ready<C, S>(
-	client: Box<C>,
-	server: Box<S>,
-	profile: SecurityProfileDesc,
-	trace: &TraceCollector,
-	events: (Urn<'static>, Urn<'static>, Urn<'static>),
-) -> Result<(), TightBeamError>
+/// What a pair of handshake machines showed as it completed.
+struct Completion {
+	/// Whether both machines were mid-flight before `complete()`.
+	pending_before_completion: bool,
+	/// Whether the session keys of each peer open the records of the other.
+	keys_interoperate: bool,
+	/// The profile that the client and the server selected.
+	profiles: (Option<SecurityProfileDesc>, Option<SecurityProfileDesc>),
+}
+
+/// Completes both peers, and returns the [`Completion`] that they showed.
+async fn complete_pair<C, S>(client: Box<C>, server: Box<S>) -> Result<Completion, TightBeamError>
 where
 	C: ClientHandshakeProtocol,
 	S: ServerHandshakeProtocol,
 {
-	let (complete_event, roundtrip_event, profile_event) = events;
-
 	// `complete()` consumes each orchestrator and makes its final transition,
 	// so the test reads both machines first. The pair is mid-flight here, and
-	// the event records the transition that `complete()` makes.
+	// the caller checks the transition that `complete()` makes.
 	let pending_before_completion = !ClientHandshakeProtocol::is_complete(client.as_ref())
 		&& !ServerHandshakeProtocol::is_complete(server.as_ref());
 
@@ -149,25 +86,24 @@ where
 
 	let client_session = ClientHandshakeProtocol::complete(client).await?;
 	let server_session = ServerHandshakeProtocol::complete(server).await?;
-	trace.event_with(complete_event, &[], pending_before_completion)?;
+	let keys_interoperate = bidirectional_roundtrip_ok(client_session.keys(), server_session.keys())?;
 
-	let roundtrip = bidirectional_roundtrip_ok(client_session.keys(), server_session.keys())?;
-	trace.event_with(roundtrip_event, &[], roundtrip)?;
-
-	let profile_agreed = client_profile == Some(profile) && server_profile == Some(profile);
-	trace.event_with(profile_event, &[], profile_agreed)?;
-
-	Ok(())
+	Ok(Completion {
+		pending_before_completion,
+		keys_interoperate,
+		profiles: (client_profile, server_profile),
+	})
 }
 
-/// Require a handshake reply and convert a missing reply into an
-/// expectation failure.
+/// Returns the handshake reply, or an expectation failure with `msg` when the
+/// step drew none.
 fn require_reply(reply: Option<HandshakeMessage>, msg: &'static str) -> Result<HandshakeMessage, TightBeamError> {
 	let message = reply.ok_or_else(|| expectation_failure(msg))?;
 	Ok(message)
 }
 
-/// Require that a protocol step produce no further reply.
+/// Passes when a protocol step draws no reply, and returns an expectation
+/// failure with `msg` otherwise.
 fn require_terminal(reply: Option<HandshakeMessage>, msg: &'static str) -> Result<(), TightBeamError> {
 	if reply.is_some() {
 		return Err(expectation_failure(msg));
@@ -178,7 +114,9 @@ fn require_terminal(reply: Option<HandshakeMessage>, msg: &'static str) -> Resul
 
 /// Runs the HPKE loopback through the orchestrator trait surface.
 #[cfg(feature = "transport-hpke")]
-async fn hpke_loopback(trace: &TraceCollector, materials: &ServerMaterials) -> Result<(), TightBeamError> {
+#[tokio::test]
+async fn hpke_loopback() -> Result<(), TightBeamError> {
+	let materials = ServerMaterials::generate();
 	let profile = default_security_profile();
 	let offer = security_offer(profile);
 	let validator = pinning_validator(&materials.certificate);
@@ -187,7 +125,7 @@ async fn hpke_loopback(trace: &TraceCollector, materials: &ServerMaterials) -> R
 	config.security_offer = Some(offer);
 
 	let mut client = Handshake::client(config);
-	let server_config = hpke_server_config::<DefaultCryptoProvider>(materials, [profile]);
+	let server_config = hpke_server_config::<DefaultCryptoProvider>(&materials, [profile]);
 	let mut server = Handshake::server(server_config);
 
 	// The flow is the hello, then the signed reply, then the closing, which
@@ -202,11 +140,24 @@ async fn hpke_loopback(trace: &TraceCollector, materials: &ServerMaterials) -> R
 	let no_reply = server.handle_request(closing).await?;
 	require_terminal(no_reply, "HPKE server must not reply to the closing")?;
 
-	let events = (LOOPBACK_HPKE_COMPLETE, LOOPBACK_HPKE_ROUNDTRIP, LOOPBACK_HPKE_PROFILE_AGREED);
-	emit_session_ready(Box::new(client), Box::new(server), profile, trace, events).await
+	let completion = complete_pair(Box::new(client), Box::new(server)).await?;
+	assert!(
+		completion.pending_before_completion,
+		"both HPKE machines must be mid-flight before complete()"
+	);
+	assert!(
+		completion.keys_interoperate,
+		"the HPKE session keys must open each other's records"
+	);
+	assert_eq!(
+		completion.profiles,
+		(Some(profile), Some(profile)),
+		"both HPKE machines must select the offered profile"
+	);
+	Ok(())
 }
 
-/// Build a CMS client/server pair that shares the fixture server identity.
+/// Builds a CMS client and server pair that shares the fixture server identity.
 #[cfg(feature = "transport-cms")]
 #[allow(clippy::type_complexity)]
 fn build_cms_pair(
@@ -223,7 +174,7 @@ fn build_cms_pair(
 	Ok((Handshake::client(pair.client), Handshake::server(pair.server)))
 }
 
-/// Drive a CMS pair through its three legs. The flow is the opening, then
+/// Drives a CMS pair through its three legs. The flow is the opening, then
 /// ServerFinished, then the closing with the ClientFinished, which draws no
 /// reply.
 #[cfg(feature = "transport-cms")]
@@ -248,16 +199,31 @@ async fn drive_cms_pair(
 /// learns the negotiated profile from the server-Finished `SecurityAccept`
 /// attribute and can `complete()`.
 #[cfg(feature = "transport-cms")]
-async fn cms_loopback(trace: &TraceCollector, materials: &ServerMaterials) -> Result<(), TightBeamError> {
+#[tokio::test]
+async fn cms_loopback() -> Result<(), TightBeamError> {
+	let materials = ServerMaterials::generate();
 	let profile = default_security_profile();
-	let (mut client, mut server) = build_cms_pair(materials)?;
+	let (mut client, mut server) = build_cms_pair(&materials)?;
 	drive_cms_pair(&mut client, &mut server).await?;
 
-	let events = (LOOPBACK_CMS_COMPLETE, LOOPBACK_CMS_ROUNDTRIP, LOOPBACK_CMS_PROFILE_AGREED);
-	emit_session_ready(Box::new(client), Box::new(server), profile, trace, events).await
+	let completion = complete_pair(Box::new(client), Box::new(server)).await?;
+	assert!(
+		completion.pending_before_completion,
+		"both CMS machines must be mid-flight before complete()"
+	);
+	assert!(
+		completion.keys_interoperate,
+		"the CMS session keys must open each other's records"
+	);
+	assert_eq!(
+		completion.profiles,
+		(Some(profile), Some(profile)),
+		"both CMS machines must select the offered profile"
+	);
+	Ok(())
 }
 
-/// Complete one CMS handshake against the fixture server and hand back both
+/// Completes one CMS handshake against the fixture server, and returns both
 /// sessions.
 #[cfg(feature = "transport-cms")]
 async fn established_cms_pair(
@@ -274,16 +240,18 @@ async fn established_cms_pair(
 /// CMS traffic keys must be fresh per handshake (CWE-321): a record of one
 /// session does not open on another session against the same server.
 #[cfg(feature = "transport-cms")]
-async fn cms_unique_traffic_keys(trace: &TraceCollector, materials: &ServerMaterials) -> Result<(), TightBeamError> {
-	let (client_a, _server_a) = established_cms_pair(materials).await?;
-	let (_client_b, server_b) = established_cms_pair(materials).await?;
+#[tokio::test]
+async fn cms_unique_traffic_keys() -> Result<(), TightBeamError> {
+	let materials = ServerMaterials::generate();
+	let (client_a, _server_a) = established_cms_pair(&materials).await?;
+	let (_client_b, server_b) = established_cms_pair(&materials).await?;
 
 	let probe = b"same probe under two sessions";
 	let record_a = client_a.keys().send().encrypt_next(probe)?;
 
 	let mut arrived_a = record_a.to_der()?;
 	let isolated = server_b.keys().recv().open(&mut arrived_a).is_err();
-	trace.event_with(LOOPBACK_CMS_UNIQUE_KEYS, &[], isolated)?;
+	assert!(isolated, "a CMS record of one session must not open under another (CWE-321)");
 
 	Ok(())
 }

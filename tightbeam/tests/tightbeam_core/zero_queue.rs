@@ -1,5 +1,3 @@
-#![allow(unused_imports)]
-
 use core::time::Duration;
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
@@ -8,32 +6,25 @@ use tightbeam::asn1::{DigestInfo, MessagePriority};
 use tightbeam::builder::{FrameBuilder, TypeBuilder};
 use tightbeam::colony::servlet::{Servlet, ServletConfig};
 use tightbeam::crypto::hash::Sha3_256;
-use tightbeam::der::ValueOrd;
+use tightbeam::instrumentation::events;
 use tightbeam::policy::{GatePolicy, SessionContext, TransitStatus};
 use tightbeam::prelude::*;
-use tightbeam::testing::ScenarioConfig;
 use tightbeam::trace::TraceCollector;
-use tightbeam::transport::policy::{RestartLinearBackoff, RestartPolicy, RetryAction};
+use tightbeam::transport::policy::RestartLinearBackoff;
 use tightbeam::transport::tcp::r#async::TokioListener;
-use tightbeam::transport::tcp::TightBeamSocketAddr;
 use tightbeam::transport::ClientBuilder;
 use tightbeam::transport::ConnectionBuilder;
-use tightbeam::transport::{MessageEmitter, Protocol, TransportResult};
 use tightbeam::Beamable;
-use tightbeam::{at_least, between, exactly, present, server, servlet, tb_assert_spec, tb_scenario};
+use tightbeam::{exactly, servlet, tb_assert_spec, tb_scenario};
 use tightbeam::{utils, Frame, TightBeamError, Version};
 
 use tightbeam::urn::Urn;
 
-pub(crate) const ADAPTIVE_BEHAVIOR: Urn<'static> = tightbeam::urn!("test", "event:zero-queue/adaptive-behavior");
 pub(crate) const CHAIN_VALID: Urn<'static> = tightbeam::urn!("test", "event:zero-queue/chain-valid");
 pub(crate) const DEDUP_KEPT: Urn<'static> = tightbeam::urn!("test", "event:zero-queue/dedup-kept");
 pub(crate) const DEDUP_SKIPPED: Urn<'static> = tightbeam::urn!("test", "event:zero-queue/dedup-skipped");
-pub(crate) const EMIT_WORK: Urn<'static> = tightbeam::urn!("test", "event:zero-queue/emit-work");
 pub(crate) const LAG_TIP: Urn<'static> = tightbeam::urn!("test", "event:zero-queue/lag-tip");
-pub(crate) const THROTTLE_ENGAGED: Urn<'static> = tightbeam::urn!("test", "event:zero-queue/throttle-engaged");
 pub(crate) const PRIORITY_RESPECTED: Urn<'static> = tightbeam::urn!("test", "event:zero-queue/priority-respected");
-pub(crate) const REPLAY_ATTEMPT: Urn<'static> = tightbeam::urn!("test", "event:zero-queue/replay-attempt");
 pub(crate) const RESPONSE_READY: Urn<'static> = tightbeam::urn!("test", "event:zero-queue/response-ready");
 pub(crate) const WORKER_COMMIT: Urn<'static> = tightbeam::urn!("test", "event:zero-queue/worker-commit");
 pub(crate) const WORKER_FAN_OUT_0: Urn<'static> = tightbeam::urn!("test", "event:zero-queue/worker-fan-out-0");
@@ -75,153 +66,107 @@ impl WorkId {
 	}
 }
 
-#[derive(Clone)]
-struct WorkFrameSpec {
-	order: u64,
-	payload: Vec<u8>,
-	priority: MessagePriority,
-}
-
-impl WorkFrameSpec {
-	fn to_message(&self) -> WorkOrder {
-		WorkOrder::new(&self.payload)
-	}
-}
-
-struct WorkBatch {
+/// The client side of one chain of work frames.
+///
+/// Each frame takes the next order and links to the digest of the body of the
+/// frame before it.
+struct WorkChain {
 	work_id: WorkId,
 	next_order: u64,
-	entries: Vec<WorkFrameSpec>,
+	tip: Option<DigestInfo>,
 }
 
-impl WorkBatch {
-	fn new(work_id: WorkId, start_order: u64) -> Self {
-		Self { work_id, next_order: start_order, entries: Vec::new() }
+impl WorkChain {
+	fn new(work_id: WorkId) -> Self {
+		Self { work_id, next_order: 1, tip: None }
 	}
 
-	fn push(&mut self, payload: impl AsRef<[u8]>, priority: MessagePriority) {
-		let payload = payload.as_ref();
-		let entry = WorkFrameSpec { order: self.next_order, payload: payload.to_vec(), priority };
+	/// The next frame of the chain, which carries `payload` at `priority`.
+	fn next(&mut self, payload: impl AsRef<[u8]>, priority: MessagePriority) -> Frame {
+		let mut builder = FrameBuilder::<WorkOrder>::from(Version::V2)
+			.with_id(self.work_id.as_bytes())
+			.with_order(self.next_order)
+			.with_message(WorkOrder::new(payload))
+			.with_priority(priority);
+
+		if let Some(parent) = self.tip.take() {
+			builder = builder.with_previous_hash(parent);
+		}
+
+		builder = builder.with_message_hasher::<Sha3_256>([]);
+
+		let frame = builder.build().expect("a work frame builds");
+		let digest = utils::digest::<Sha3_256>(frame.message()).expect("SHA3-256 digests a work body");
+
 		self.next_order += 1;
-		self.entries.push(entry);
-	}
+		self.tip = Some(digest);
 
-	fn entries(&self) -> &[WorkFrameSpec] {
-		&self.entries
-	}
-
-	fn work_id(&self) -> &WorkId {
-		&self.work_id
+		frame
 	}
 }
 
-fn build_frame(
-	work_id: &WorkId,
-	spec: &WorkFrameSpec,
-	previous_hash: Option<DigestInfo>,
-) -> Result<(Frame, DigestInfo), TightBeamError> {
-	let mut builder = FrameBuilder::<WorkOrder>::from(Version::V2)
-		.with_id(work_id.as_bytes())
-		.with_order(spec.order)
-		.with_message(spec.to_message())
-		.with_priority(spec.priority);
-
-	if let Some(parent) = previous_hash {
-		builder = builder.with_previous_hash(parent);
-	}
-
-	builder = builder.with_message_hasher::<Sha3_256>([]);
-
-	let frame = builder.build()?;
-	let digest = utils::digest::<Sha3_256>(frame.message())?;
-	Ok((frame, digest))
-}
-
-#[derive(Clone)]
+#[derive(Default)]
 struct ChainState {
-	trace: Arc<TraceCollector>,
-	state: Arc<Mutex<ChainInner>>,
+	state: Mutex<ChainInner>,
 }
 
+#[derive(Default)]
 struct ChainInner {
 	last_order: Option<u64>,
 	last_digest: Option<DigestInfo>,
 }
 
 impl ChainState {
-	fn new(trace: Arc<TraceCollector>) -> Self {
-		Self {
-			trace,
-			state: Arc::new(Mutex::new(ChainInner { last_order: None, last_digest: None })),
-		}
-	}
-
-	fn record(&self, frame: &Frame) -> Result<(), TightBeamError> {
+	/// Records `frame` as the next link of the chain, and returns whether it
+	/// links to the tip.
+	fn record(&self, frame: &Frame, trace: &TraceCollector) -> Result<bool, TightBeamError> {
 		let mut guard = self.state.lock().expect("chain state mutex not poisoned");
-		let expected = guard.last_digest.to_owned();
-		let actual = frame.metadata().previous_frame();
-		let prev_ok = match (expected.as_ref(), actual) {
-			(None, None) => true,
-			(Some(expected_digest), Some(actual_digest)) => expected_digest.value_cmp(actual_digest).is_ok(),
-			(None, Some(_)) | (Some(_), None) => false,
-		};
+		let parent = frame.metadata().previous_frame();
+		let prev_ok = guard.last_digest.as_ref() == parent;
 
 		let order_ok = guard.last_order.is_none_or(|prev| frame.metadata().order() > prev);
 		let valid = prev_ok && order_ok;
 
-		self.trace.event_with(CHAIN_VALID, &[QUEUE_TAG], valid)?;
+		trace.event_with(CHAIN_VALID, &[QUEUE_TAG], valid)?;
 
 		if valid {
 			guard.last_order = Some(frame.metadata().order());
 			let digest = utils::digest::<Sha3_256>(frame.message())?;
 			guard.last_digest = Some(digest);
 
-			self.trace.event_with(LAG_TIP, &[QUEUE_TAG], 0u64)?;
+			trace.event_with(LAG_TIP, &[QUEUE_TAG], ())?;
 		}
 
-		Ok(())
+		Ok(valid)
 	}
 }
 
-type SeenSet = Arc<Mutex<BTreeSet<(Vec<u8>, u64)>>>;
-
-#[derive(Clone)]
+#[derive(Default)]
 struct DedupBook {
-	trace: Arc<TraceCollector>,
-	seen: SeenSet,
+	seen: Mutex<BTreeSet<(Vec<u8>, u64)>>,
 }
 
 impl DedupBook {
-	fn new(trace: Arc<TraceCollector>) -> Self {
-		Self { trace, seen: Arc::new(Mutex::new(BTreeSet::new())) }
-	}
-
-	fn record(&self, frame: &Frame) -> Result<bool, TightBeamError> {
+	fn record(&self, frame: &Frame, trace: &TraceCollector) -> Result<bool, TightBeamError> {
 		let key = (frame.metadata().id().to_owned(), frame.metadata().order());
 		let mut guard = self.seen.lock().expect("seen-set mutex not poisoned");
 
 		let inserted = guard.insert(key);
 		if inserted {
-			self.trace.event_with(DEDUP_KEPT, &[QUEUE_TAG], true)?;
+			trace.event_with(DEDUP_KEPT, &[QUEUE_TAG], ())?;
 		} else {
-			self.trace.event_with(DEDUP_SKIPPED, &[QUEUE_TAG], true)?;
+			trace.event_with(DEDUP_SKIPPED, &[QUEUE_TAG], ())?;
 		}
 
 		Ok(inserted)
 	}
 }
 
-#[derive(Clone)]
-struct PriorityLedger {
-	trace: Arc<TraceCollector>,
-}
+#[derive(Default)]
+struct PriorityLedger;
 
 impl PriorityLedger {
-	fn new(trace: Arc<TraceCollector>) -> Self {
-		Self { trace }
-	}
-
-	fn assign(&self, frame: &Frame) -> Result<u8, TightBeamError> {
+	fn assign(&self, frame: &Frame, trace: &TraceCollector) -> Result<u8, TightBeamError> {
 		let priority = frame.metadata().priority().unwrap_or(MessagePriority::Standard);
 		let worker = if priority >= MessagePriority::LowLatency {
 			0
@@ -239,7 +184,7 @@ impl PriorityLedger {
 			WORKER_FAN_OUT_1
 		};
 
-		self.trace.event_with(label, vec![QUEUE_TAG, tag], worker)?;
+		trace.event_with(label, vec![QUEUE_TAG, tag], worker)?;
 
 		let respected = if priority >= MessagePriority::LowLatency {
 			worker == 0
@@ -247,7 +192,7 @@ impl PriorityLedger {
 			worker == 1
 		};
 
-		self.trace.event_with(PRIORITY_RESPECTED, &[QUEUE_TAG], respected)?;
+		trace.event_with(PRIORITY_RESPECTED, &[QUEUE_TAG], respected)?;
 		Ok(worker)
 	}
 }
@@ -272,12 +217,11 @@ impl BackPressureStats {
 #[derive(Clone)]
 struct AdaptiveGate {
 	stats: Arc<BackPressureStats>,
-	trace: Arc<TraceCollector>,
 }
 
 impl AdaptiveGate {
-	fn new(stats: Arc<BackPressureStats>, trace: Arc<TraceCollector>) -> Self {
-		Self { stats, trace }
+	fn new(stats: Arc<BackPressureStats>) -> Self {
+		Self { stats }
 	}
 }
 
@@ -291,10 +235,6 @@ impl GatePolicy for AdaptiveGate {
 		// its first attempt and admits each later attempt of the same order.
 		let priority = frame.metadata().priority().unwrap_or(MessagePriority::Standard);
 		if priority <= MessagePriority::HighThroughput && self.stats.mark_throttled(frame.metadata().order()) {
-			self.trace
-				.event_with(THROTTLE_ENGAGED, &[QUEUE_TAG], true)
-				.expect("the spec grades the throttle, so losing it would pass a stale run");
-
 			TransitStatus::ResourceExhausted
 		} else {
 			TransitStatus::Ok
@@ -302,58 +242,41 @@ impl GatePolicy for AdaptiveGate {
 	}
 }
 
-#[derive(Clone)]
+/// The state of the queue-free application, which every call of the servlet
+/// shares.
+#[derive(Default)]
 struct QueueHarness {
-	trace: Arc<TraceCollector>,
 	chain: ChainState,
 	dedup: DedupBook,
 	priority: PriorityLedger,
 }
 
 impl QueueHarness {
-	fn new(trace: Arc<TraceCollector>) -> Self {
-		Self {
-			chain: ChainState::new(Arc::clone(&trace)),
-			dedup: DedupBook::new(Arc::clone(&trace)),
-			priority: PriorityLedger::new(Arc::clone(&trace)),
-			trace,
-		}
-	}
-
-	fn handle(&self, frame: &Frame) -> Result<(), TightBeamError> {
-		if !self.dedup.record(frame)? {
+	fn handle(&self, frame: &Frame, trace: &TraceCollector) -> Result<(), TightBeamError> {
+		if !self.dedup.record(frame, trace)? {
 			return Ok(());
 		}
 
-		self.chain.record(frame)?;
+		self.chain.record(frame, trace)?;
 
-		let worker = self.priority.assign(frame)?;
+		let worker = self.priority.assign(frame, trace)?;
 
-		self.trace.event_with(WORKER_COMMIT, &[QUEUE_TAG], worker as u64)?;
-		self.trace.event_with(RESPONSE_READY, &[QUEUE_TAG], frame.metadata().order())?;
+		trace.event_with(WORKER_COMMIT, &[QUEUE_TAG], worker as u64)?;
+		trace.event_with(RESPONSE_READY, &[QUEUE_TAG], frame.metadata().order())?;
 		Ok(())
 	}
 }
 
-fn default_batch() -> WorkBatch {
-	let mut batch = WorkBatch::new(WorkId::new("queue-free::work"), 1);
-	batch.push(b"critical-order", MessagePriority::Expedited);
-	batch.push(b"normal-scan", MessagePriority::Standard);
-	batch.push(b"high-followup", MessagePriority::LowLatency);
-
-	batch
-}
-
 servlet! {
-	QueueServlet<WorkOrder, EnvConfig = BackPressureStats>,
+	QueueServlet<WorkOrder, EnvConfig = QueueHarness>,
 	protocol: TokioListener,
 	handle: |_msg, frame, ctx| async move {
 		let trace = &ctx.trace();
 
 		// The collector gate applies back pressure ahead of the handler, so the
 		// handler records the frame alone.
-		let harness = QueueHarness::new(Arc::clone(trace));
-		harness.handle(&frame)?;
+		let harness: &QueueHarness = ctx.env_config();
+		harness.handle(&frame, trace)?;
 
 		Ok(None)
 	}
@@ -363,14 +286,18 @@ tb_assert_spec! {
 	pub QueueFreeSpec,
 	V(1,0,0): {
 		mode: Accept,
-		tag_filter: [QUEUE_TAG],
 		assertions: [
-			(LAG_TIP, present!(), equals!(0u64)),
-			(PRIORITY_RESPECTED, at_least!(1), equals!(true)),
-			(WORKER_FAN_OUT_0, at_least!(1), equals!(0u8), tags: [WORKER_0_TAG]),
-			(WORKER_FAN_OUT_1, at_least!(1), equals!(1u8), tags: [WORKER_1_TAG]),
-			(THROTTLE_ENGAGED, present!(), equals!(true)),
-			(ADAPTIVE_BEHAVIOR, at_least!(1))
+			(events::GATE_ACCEPT, exactly!(4), equals!(TransitStatus::Ok)),
+			(events::GATE_REJECT, exactly!(1), equals!(TransitStatus::ResourceExhausted)),
+			(DEDUP_KEPT, exactly!(3)),
+			(DEDUP_SKIPPED, exactly!(1)),
+			(CHAIN_VALID, exactly!(3), equals!(true)),
+			(LAG_TIP, exactly!(3)),
+			(PRIORITY_RESPECTED, exactly!(3), equals!(true)),
+			(WORKER_FAN_OUT_0, exactly!(2), equals!(0u8), tags: [WORKER_0_TAG]),
+			(WORKER_FAN_OUT_1, exactly!(1), equals!(1u8), tags: [WORKER_1_TAG]),
+			(WORKER_COMMIT, exactly!(3)),
+			(RESPONSE_READY, exactly!(3))
 		]
 	}
 }
@@ -382,10 +309,10 @@ tb_scenario! {
 		start: |env| async move {
 			let trace = Arc::new(env.trace);
 			let stats = Arc::new(BackPressureStats::default());
-			let adaptive_gate = AdaptiveGate::new(Arc::clone(&stats), Arc::clone(&trace));
+			let adaptive_gate = AdaptiveGate::new(stats);
 
 			let servlet_conf = ServletConfig::<TokioListener, WorkOrder>::builder()
-				.with_config(Arc::clone(&stats))
+				.with_config(Arc::new(QueueHarness::default()))
 				.with_collector_gate(adaptive_gate)
 				.allow_cleartext()
 				.build();
@@ -393,8 +320,8 @@ tb_scenario! {
 			QueueServlet::start(Arc::clone(&trace), servlet_conf).await
 		},
 		setup: |env| async move {
-			// The servlet under test carries no encryption, so this link is
-			// cleartext and the scenario exercises back pressure over it.
+			// The servlet under test allows cleartext, so this link is
+			// cleartext, and the scenario exercises back pressure over it.
 			let restart_policy = RestartLinearBackoff::new(3, Duration::from_millis(50), 1, None);
 			let builder = ClientBuilder::<TokioListener>::builder()
 				.allow_cleartext()
@@ -405,41 +332,42 @@ tb_scenario! {
 			Ok(client)
 		},
 		client: |env| async move {
-			let trace = Arc::new(env.trace);
 			let mut client = env.client;
+			let mut chain = WorkChain::new(WorkId::new("queue-free::work"));
+			let critical = chain.next(b"critical-order", MessagePriority::Expedited);
+			let scan = chain.next(b"normal-scan", MessagePriority::Standard);
+			let followup = chain.next(b"high-followup", MessagePriority::LowLatency);
 
-			let batch = default_batch();
-			let mut prev_hash: Option<DigestInfo> = None;
-			for (index, spec) in batch.entries().iter().enumerate() {
-				trace.event_with(EMIT_WORK, &[QUEUE_TAG], spec.order)?;
-				let (frame, digest) = match build_frame(batch.work_id(), spec, prev_hash) {
-					Ok(result) => result,
-					Err(err) => {
-						eprintln!("build_frame error for order {}: {err:?}", spec.order);
-						return Err(err);
-					}
-				};
+			client.emit(critical, None).await?;
 
-				prev_hash = Some(digest);
+			// The adaptive gate throttles the scan's first attempt, and the
+			// restart policy retries it. The client replays the scan at once,
+			// and the dedup book of the servlet skips the replay.
+			client.emit(scan.to_owned(), None).await?;
+			client.emit(scan, None).await?;
 
-				trace.event_with(ADAPTIVE_BEHAVIOR, &[QUEUE_TAG], spec.order)?;
-
-				if index == 1 {
-					// The client emits the second frame and then replays it
-					// at once. The server throttles the first attempt, and
-					// the restart policy retries it.
-					client.emit(frame.to_owned(), None).await?;
-					trace.event_with(REPLAY_ATTEMPT, &[QUEUE_TAG], frame.metadata().order())?;
-					client.emit(frame, None).await?;
-				} else {
-					// The adaptive gate of the server throttles a frame of
-					// `HighThroughput` or lower priority, and the restart
-					// policy retries each throttled frame.
-					client.emit(frame, None).await?;
-				}
-			}
+			client.emit(followup, None).await?;
 
 			Ok(())
 		}
 	}
+}
+
+/// A chain refuses a frame that links to a parent other than its tip, though
+/// the order of the frame follows the tip.
+#[test]
+fn a_frame_linked_to_another_parent_breaks_the_chain() -> Result<(), TightBeamError> {
+	let trace = TraceCollector::default();
+	let chain = ChainState::default();
+	let mut ours = WorkChain::new(WorkId::new("queue-free::ours"));
+	let mut theirs = WorkChain::new(WorkId::new("queue-free::theirs"));
+	let first = ours.next(b"first", MessagePriority::Standard);
+	theirs.next(b"their-first", MessagePriority::Standard);
+	let linked_to_theirs = theirs.next(b"second", MessagePriority::Standard);
+	chain.record(&first, &trace)?;
+
+	let valid = chain.record(&linked_to_theirs, &trace)?;
+
+	assert!(!valid, "the chain admitted a frame that links to another parent");
+	Ok(())
 }

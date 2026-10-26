@@ -8,7 +8,7 @@
 //! - **CMS-based**: X.509 PKI on both endpoints, with signed and authenticated-enveloped data.
 //!
 //! Both protocols establish authenticated, encrypted sessions and negotiate
-//! the cryptographic algorithms between client and server.
+//! the cryptographic algorithms between the client and the server.
 //!
 //! # Protocol Capabilities
 //!
@@ -63,7 +63,7 @@
 //! private keys drop at the step that consumes them. A recording plus a later
 //! copy of the server's static keys recovers the CMS base secret alone, which
 //! the key-agreement key opens, and no HPKE secret. These need the ECDH
-//! output, which needs a private key neither side kept:
+//! output, which needs a private key that neither side retains:
 //!
 //! - the traffic keys and the rekey epochs,
 //! - the sealed receipt acknowledgement, and
@@ -175,7 +175,7 @@
 //! ```
 //!
 //! - A step outside its phase returns [`HandshakeError::InvalidState`] and leaves the phase unchanged.
-//! - A step that began and failed leaves the handshake [`HandshakePhase::Spent`], which admits no step.
+//! - A step that fails after it begins leaves the handshake [`HandshakePhase::Spent`], which admits no step.
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
@@ -211,6 +211,11 @@ pub mod receipt;
 
 pub use crate::crypto::aead::DirectionalCiphers;
 pub use attributes::HandshakeAttribute;
+#[cfg(all(
+	feature = "instrument",
+	any(feature = "transport-cms", feature = "transport-hpke")
+))]
+pub(crate) use error::HandshakeAudit;
 pub use error::HandshakeError;
 pub use peer::PeerAuthentication;
 pub use schedule::EpochMaterials;
@@ -414,7 +419,8 @@ pub struct CmsServerChain {
 
 #[cfg(feature = "transport-cms")]
 impl CmsServerChain {
-	/// The chain `path`, ordered root to leaf. This call copies its leaf once.
+	/// Builds the chain from `path`, ordered root to leaf, and copies its leaf
+	/// once.
 	///
 	/// # Errors
 	///
@@ -572,7 +578,7 @@ impl TryFrom<ContentInfo> for HandshakeMessage {
 	}
 }
 
-/// What a completed handshake agreed, handed over in one value.
+/// The terms a completed handshake agreed, handed over in one value.
 ///
 /// A handshake settles the keys and the terms that go with them at the same
 /// moment, so they travel together and a transport that installs the keys
@@ -597,7 +603,7 @@ pub struct EstablishedSession {
 }
 
 impl EstablishedSession {
-	/// Assemble what one handshake agreed, with no epoch materials.
+	/// Assembles what one handshake agreed, with no epoch materials.
 	///
 	/// It is private to the handshake, whose completion records only a peer
 	/// that an admission built.
@@ -620,8 +626,8 @@ impl EstablishedSession {
 		}
 	}
 
-	/// This session with `epoch`, the epoch-0 rekey materials, kept exactly
-	/// while a rekey could use them.
+	/// Returns this session with `epoch`, the epoch-0 rekey materials, which
+	/// it keeps exactly while a rekey could use them.
 	///
 	/// Epoch materials serve a rekey alone, and a rekey re-signs against the
 	/// session receipt and the peer identity. A session renews only when it
@@ -636,15 +642,16 @@ impl EstablishedSession {
 		Self { epoch, ..self }
 	}
 
-	/// A session of `keys`, `receipt`, and `peer`, for a test that holds the
-	/// parts a handshake agrees.
+	/// Builds a session of `keys`, `receipt`, and `peer`, for a test that holds
+	/// the parts a handshake agrees.
 	#[cfg(test)]
 	pub(crate) fn forged(keys: SessionKeys, receipt: Option<Arc<StoredReceipt>>, peer: Option<SessionPeer>) -> Self {
 		Self::new(keys, None, receipt, peer)
 	}
 
-	/// This session with `epoch` under the rule of [`Self::with_epoch`], for
-	/// a test that holds the epoch a handshake derives.
+	/// Returns this session with `epoch` under the rule of
+	/// [`Self::with_epoch`], for a test that holds the epoch a handshake
+	/// derives.
 	#[cfg(all(test, mux_rekey))]
 	pub(crate) fn with_forged_epoch(self, epoch: EpochMaterials) -> Self {
 		self.with_epoch(epoch)
@@ -656,20 +663,27 @@ impl EstablishedSession {
 		self.peer.as_ref()
 	}
 
-	/// Detach the epoch rekey materials, once.
+	/// The peer that the handshake validated, taken from a session that drops
+	/// with the call.
+	pub(crate) fn into_session_peer(self) -> Option<Arc<SessionPeer>> {
+		self.peer
+	}
+
+	/// Detaches the epoch rekey materials, once.
 	#[cfg(mux_rekey)]
 	pub(crate) fn take_epoch(&mut self) -> Option<EpochMaterials> {
 		self.epoch.take()
 	}
 
-	/// The epoch rekey materials the session still holds.
+	/// The epoch rekey materials that the session holds.
 	#[cfg(all(test, mux_rekey))]
 	pub(crate) fn epoch(&self) -> Option<&EpochMaterials> {
 		self.epoch.as_ref()
 	}
 
-	/// Bound the send cipher by the encrypted-envelope ceiling the transport
-	/// installs this session under ([`SessionKeys::with_envelope_ceiling`]).
+	/// Bounds the send cipher by the encrypted-envelope ceiling that the
+	/// transport installs this session under
+	/// ([`SessionKeys::with_envelope_ceiling`]).
 	pub(crate) fn with_envelope_ceiling(mut self, encrypted_envelope: usize) -> Self {
 		self.keys = self.keys.with_envelope_ceiling(encrypted_envelope);
 		self
@@ -731,11 +745,11 @@ impl EstablishedSession {
 /// handshake alone builds, so every session key comes from the key schedule
 /// of this crate.
 pub trait ClientHandshakeProtocol: MaybeSend {
-	/// Start the handshake and return the first message for the server.
+	/// Starts the handshake and returns the first message for the server.
 	#[allow(clippy::type_complexity)]
 	fn start<'a>(&'a mut self) -> MaybeSendFuture<'a, CoreResult<HandshakeMessage, HandshakeError>>;
 
-	/// Handle a response from the server.
+	/// Handles a response from the server.
 	///
 	/// Returns `Some` when the client owes the server another message, and
 	/// `None` once it has sent its last. Each step accepts one container and
@@ -745,7 +759,7 @@ pub trait ClientHandshakeProtocol: MaybeSend {
 		msg: HandshakeMessage,
 	) -> MaybeSendFuture<'a, CoreResult<Option<HandshakeMessage>, HandshakeError>>;
 
-	/// Complete the handshake and take everything it agreed.
+	/// Completes the handshake and takes everything it agreed.
 	///
 	/// Call this after the client sends its last message. The client sends on
 	/// the client-to-server key and receives on the server-to-client key. The
@@ -777,7 +791,7 @@ pub trait ClientHandshakeProtocol: MaybeSend {
 /// handshake alone builds, so every session key comes from the key schedule
 /// of this crate.
 pub trait ServerHandshakeProtocol: MaybeSend {
-	/// Handle a request from the client.
+	/// Handles a request from the client.
 	///
 	/// A multi-round handshake calls this once per client message. It returns
 	/// `Some` when the server owes a response, and `None` for the client's last
@@ -787,7 +801,7 @@ pub trait ServerHandshakeProtocol: MaybeSend {
 		msg: HandshakeMessage,
 	) -> MaybeSendFuture<'a, CoreResult<Option<HandshakeMessage>, HandshakeError>>;
 
-	/// Complete the handshake and take everything it agreed.
+	/// Completes the handshake and takes everything it agreed.
 	///
 	/// Call this after [`Self::handle_request`] returns `None`. The server
 	/// sends on the server-to-client key and receives on the client-to-server
@@ -832,7 +846,7 @@ pub trait ServerIdentity: sealed::Sealed + MaybeSend + MaybeSync + 'static {
 	/// The identity that signs the reply and the session receipt.
 	fn signing(&self) -> &SigningIdentity;
 
-	/// Refuse this identity for the server role unless each of its
+	/// Refuses this identity for the server role unless each of its
 	/// certificates admits the key purpose `purpose` (RFC 5280 §4.2.1.12).
 	///
 	/// # Errors
@@ -844,8 +858,8 @@ pub trait ServerIdentity: sealed::Sealed + MaybeSend + MaybeSync + 'static {
 }
 
 mod sealed {
-	/// The seal of [`ServerIdentity`](super::ServerIdentity), implemented by
-	/// the identity of each flow alone.
+	/// The seal of [`ServerIdentity`](super::ServerIdentity), which the
+	/// identity of each flow alone implements.
 	pub trait Sealed {}
 }
 
@@ -941,7 +955,7 @@ pub struct ServerHandshake {
 	/// closing.
 	pub client_cert_required: bool,
 	/// The transport capability accept for multiplexing, which the server sends
-	/// only when the client offered multiplexing and the server enabled it
+	/// only when the client offers multiplexing and the server enables it
 	/// locally. It travels with the bytes the server encoded.
 	#[asn1(context_specific = "0", optional = "true")]
 	pub transport_accept: Option<WireDer<TransportAccept>>,

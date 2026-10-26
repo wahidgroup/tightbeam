@@ -1,12 +1,15 @@
 //! The request handlers for a peer ad, a gossip relay, a publish, and a
 //! reconcile round.
 
+use std::sync::Arc;
+
 use crate::builder::frame::FrameBuilder;
 use crate::builder::TypeBuilder;
 use crate::colony::cluster::peer::AdmittedPeerAd;
 use crate::colony::cluster::runtime::bounds::{ColonyConfig, ColonyDialProtocol, ColonyDigest, GatewayRuntimeCtx};
-use crate::colony::cluster::runtime::gossip_tasks::{GossipOrigin, GossipPipelineCtx};
+use crate::colony::cluster::runtime::gossip_tasks::{GossipOrigin, GossipPipelineCtx, HintSource};
 use crate::colony::cluster::runtime::refuse::Refusal;
+use crate::colony::cluster::runtime::LoopFault;
 use crate::colony::cluster::{ClusterConfig, ClusterError, PeerCaps, ServletRegistry, VerifiedRumor};
 use crate::colony::cluster::{GossipDigest, RouteKind, WantList};
 use crate::colony::protocol::PeerGossip;
@@ -15,7 +18,7 @@ use crate::colony::protocol::{
 };
 use crate::constants::MAX_PEX_SAMPLE;
 use crate::constants::{MAX_GOSSIP_LOG, MAX_GOSSIP_TTL};
-use crate::instrumentation::events::CLUSTER_PEER_ADVERTISED;
+use crate::instrumentation::events::{CLUSTER_PEER_ADVERTISED, CLUSTER_RECONCILE_ANSWERED};
 use crate::policy::TransitStatus;
 use crate::transport::Protocol;
 use crate::Frame;
@@ -24,6 +27,9 @@ use crate::Version;
 
 impl<P: Protocol> GatewayRuntimeCtx<P> {
 	/// Admits one directly dialed peer advertisement and reconciles its slate.
+	///
+	/// It records the hint it learns from the advertiser, the routes the slate
+	/// installs and withdraws, and the admission, each before the reply.
 	pub(crate) async fn handle_peer_ad(
 		&self,
 		frame: Frame,
@@ -54,24 +60,35 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 		// A verified advertiser is also a discovery hint, so the beat graph
 		// runs in both directions, and this gateway's own probe dials a
 		// seed-bootstrapped node.
+		let advertiser = Arc::clone(&admitted.peer_hive_id);
 		let hint = admitted.discovery_hint();
 		let learned_at = self.config.clock.unix();
-		if self.config.peer.table.learn([hint], learned_at).is_err() {
-			let unavailable = TransitStatus::Unavailable;
-			return Refusal::to(&frame, &self.trace).peer_ad_release(&self.replay_guard, signature, unavailable);
+		let source = HintSource::Advertiser(advertiser.as_ref());
+		match self.config.learn_hints(&self.trace, source, [hint], learned_at) {
+			Ok(()) => {}
+			Err(LoopFault::Registry(_)) => {
+				let unavailable = TransitStatus::Unavailable;
+				return Refusal::to(&frame, &self.trace).peer_ad_release(&self.replay_guard, signature, unavailable);
+			}
+			Err(LoopFault::Runtime(error)) => return Err(error),
 		}
 
-		if let Err(error) = self.servlet_registry.reconcile_peer_slate(admitted, PeerCaps::default()) {
-			let status = match error {
-				ClusterError::PeerSlateConflict | ClusterError::PeerCapExceeded | ClusterError::StalePeerAd => {
+		// The advertiser reads `PermissionDenied` for a slate it got wrong, and
+		// `Unavailable` for a registry this gateway cannot write.
+		let change = match self.servlet_registry.reconcile_peer_slate(admitted, PeerCaps::default()) {
+			Ok(change) => change,
+			Err(error) => {
+				let status = if error.blames_the_advertiser() {
 					TransitStatus::PermissionDenied
-				}
-				_ => TransitStatus::Unavailable,
-			};
-			return Refusal::to(&frame, &self.trace).peer_ad_release(&self.replay_guard, signature, status);
-		}
+				} else {
+					TransitStatus::Unavailable
+				};
+				return Refusal::to(&frame, &self.trace).peer_ad_release(&self.replay_guard, signature, status);
+			}
+		};
 
-		self.trace.event(CLUSTER_PEER_ADVERTISED)?;
+		change.record_direct(&self.trace, advertiser.as_ref())?;
+		self.trace.emit_marker(CLUSTER_PEER_ADVERTISED)?;
 
 		ReplyForm::Plain.reply(frame.metadata().id(), PeerAdvertisementResponse { status: TransitStatus::Ok })
 	}
@@ -90,16 +107,18 @@ impl<P: ColonyDialProtocol> GossipPipelineCtx<P> {
 
 		let relay_id = match self.config.verify_peer(&frame) {
 			Ok(verified) => {
+				let relay_id = verified.fingerprint();
 				if let Err(status) = flood.member(verified.signer_cert()) {
-					return Refusal::to(&frame, &self.trace).gossip(status);
+					return Refusal::to(&frame, &self.trace).by(&relay_id).gossip(status);
 				}
 
-				verified.fingerprint()
+				relay_id
 			}
 			Err(refusal) => {
 				return Refusal::to(&frame, &self.trace).gossip(refusal.into());
 			}
 		};
+		let refusal = Refusal::to(&frame, &self.trace).by(&relay_id);
 
 		// The outer `lifetime` is hop-authenticated, so an absent TTL is relay
 		// misbehavior and scores the relay.
@@ -107,7 +126,7 @@ impl<P: ColonyDialProtocol> GossipPipelineCtx<P> {
 			Some(hop_ttl) => hop_ttl,
 			None => {
 				let scored = self.weaken_invalid_relay(GossipOrigin::Relay, Some(&relay_id));
-				return Refusal::to(&frame, &self.trace).gossip_scored(scored, TransitStatus::PermissionDenied);
+				return refusal.gossip_scored(scored, TransitStatus::PermissionDenied);
 			}
 		};
 
@@ -117,14 +136,14 @@ impl<P: ColonyDialProtocol> GossipPipelineCtx<P> {
 		let (rumor_signer, signature) = match self.config.verify_peer(&rumor) {
 			Ok(verified) => {
 				if let Err(status) = flood.member(verified.signer_cert()) {
-					return Refusal::to(&frame, &self.trace).gossip(status);
+					return refusal.gossip(status);
 				}
 
 				(verified.fingerprint(), verified.into_signature())
 			}
-			Err(refusal) => {
-				let settled = refusal.settle_origin(&self, &frame, &relay_id);
-				return Refusal::to(&frame, &self.trace).gossip_settled(settled);
+			Err(origin_refusal) => {
+				let settled = origin_refusal.settle_origin(&self, &frame, &relay_id);
+				return refusal.gossip_settled(settled);
 			}
 		};
 		let rumor = VerifiedRumor::new(rumor, signature);
@@ -132,20 +151,22 @@ impl<P: ColonyDialProtocol> GossipPipelineCtx<P> {
 		// The freshness of a relayed rumor is its issue time, which `admit`
 		// checks against the seen window (`seen_ttl`) in place of the control
 		// window.
-		self.run(GossipOrigin::Relay, frame, rumor, hop_ttl, Some(relay_id), Some(rumor_signer))
+		self.run(GossipOrigin::Relay, frame, rumor, hop_ttl, relay_id, Some(rumor_signer))
 			.await
 	}
 
 	/// Signs and floods origin gossip from a local hive-plane publisher.
 	pub(crate) async fn publish(self, frame: Frame, body: GossipRumor) -> Result<Option<Frame>, TightBeamError> {
-		if let Err(refusal) = self.config.verify_hive(&frame) {
-			return Refusal::to(&frame, &self.trace).gossip(refusal.into());
-		}
+		let publisher = match self.config.verify_hive(&frame) {
+			Ok(verified) => verified.fingerprint(),
+			Err(refusal) => return Refusal::to(&frame, &self.trace).gossip(refusal.into()),
+		};
+		let refusal = Refusal::to(&frame, &self.trace).by(&publisher);
 
 		// An origin rumor travels in this gateway's flood, so a gateway in no
 		// flood has nowhere to publish.
 		if self.config.flood().is_none() {
-			return Refusal::to(&frame, &self.trace).gossip(TransitStatus::PermissionDenied);
+			return refusal.gossip(TransitStatus::PermissionDenied);
 		}
 
 		// The handler clamps the hop radius outside the rumor body, so the
@@ -165,19 +186,19 @@ impl<P: ColonyDialProtocol> GossipPipelineCtx<P> {
 		let mut rumor = match rumor {
 			Ok(rumor) => rumor,
 			Err(_) => {
-				return Refusal::to(&frame, &self.trace).gossip(TransitStatus::Unavailable);
+				return refusal.gossip(TransitStatus::Unavailable);
 			}
 		};
 
 		let signing = rumor.sign_with_provider(self.config.tls.identity()).await;
 		if signing.is_err() {
-			return Refusal::to(&frame, &self.trace).gossip(TransitStatus::Unavailable);
+			return refusal.gossip(TransitStatus::Unavailable);
 		}
 
 		// The rumor's digest covers its signature, so `verify_own` verifies
 		// the signature this gateway made and pairs the two.
 		let Ok(rumor) = self.config.tls.verify_own(rumor) else {
-			return Refusal::to(&frame, &self.trace).gossip(TransitStatus::Unavailable);
+			return refusal.gossip(TransitStatus::Unavailable);
 		};
 
 		// A local peer-ad apply names the signer that the signature above
@@ -188,7 +209,8 @@ impl<P: ColonyDialProtocol> GossipPipelineCtx<P> {
 			verified.map(|verified| verified.fingerprint()).ok()
 		});
 
-		self.run(GossipOrigin::Origin, frame, rumor, hop_ttl, None, rumor_signer).await
+		self.run(GossipOrigin::Origin, frame, rumor, hop_ttl, publisher, rumor_signer)
+			.await
 	}
 }
 
@@ -203,8 +225,8 @@ impl ClusterConfig {
 	/// - Both sources name flood members: a probe proved each table entry, and
 	///   a member's signed advertisement installed each route.
 	/// - A route outlives an expel, so the sample shares a route's address
-	///   only while the peer table still holds it.
-	/// - The receiver still treats every entry as an unverified hint until its own probe proves membership.
+	///   only while the peer table holds it.
+	/// - The receiver treats every entry as an unverified hint until its own probe proves membership.
 	///
 	/// # Sources
 	///
@@ -228,7 +250,7 @@ impl ClusterConfig {
 		let direct = peer_entries.iter().filter(|entry| entry.route_kind() == RouteKind::Peer);
 
 		// A route outlives an expel, so the table says which advertised sockets
-		// it still holds, and the sample shares those alone.
+		// it holds, and the sample shares those alone.
 		let advertised = direct.clone().filter_map(|entry| entry.dial_target().as_socket().copied());
 		let held = self.peer.table.held_among(advertised)?;
 		let routes = direct
@@ -266,37 +288,48 @@ impl<P: Protocol> ColonyConfig<P> {
 impl<P: Protocol> GatewayRuntimeCtx<P> {
 	/// Answers one anti-entropy reconcile round from a flood member.
 	///
-	/// The reply names the digests this gateway still needs, beside a
-	/// peer-exchange sample.
+	/// The reply names the digests this gateway lacks, beside a
+	/// peer-exchange sample. An answered round records
+	/// [`CLUSTER_RECONCILE_ANSWERED`] with the count of digests it wants, and a
+	/// refused round records `CLUSTER_GOSSIP_REFUSED` with the status its cause
+	/// implies.
 	pub(crate) async fn handle_reconcile(
 		&self,
 		frame: Frame,
 		reconciliation: GossipReconciliation,
 	) -> Result<Option<Frame>, TightBeamError> {
+		// A gateway in no flood has no rumors to reconcile, so it refuses as it
+		// refuses a relay.
 		let Some(flood) = self.config.flood() else {
-			return Refusal::to(&frame, &self.trace).reconcile();
+			return Refusal::to(&frame, &self.trace).reconcile(TransitStatus::PermissionDenied);
 		};
-		let Ok(verified) = self.config.verify_peer(&frame) else {
-			return Refusal::to(&frame, &self.trace).reconcile();
+		let verified = match self.config.verify_peer(&frame) {
+			Ok(verified) => verified,
+			Err(refusal) => return Refusal::to(&frame, &self.trace).reconcile(refusal.into()),
 		};
-		if flood.member(verified.signer_cert()).is_err() {
-			return Refusal::to(&frame, &self.trace).reconcile();
+
+		let requester = verified.fingerprint();
+		let refusal = Refusal::to(&frame, &self.trace).by(&requester);
+		if let Err(status) = flood.member(verified.signer_cert()) {
+			return refusal.reconcile(status);
 		}
 
 		let freshness_status = self.replay_guard.admits(&frame, verified.signature());
 		if freshness_status != TransitStatus::Ok {
-			return Refusal::to(&frame, &self.trace).reconcile();
+			return refusal.reconcile(freshness_status);
 		}
 
 		// The handler caps the held digest list at journal capacity (CWE-770).
+		// A requester that follows the protocol holds no more, so a longer
+		// list is malformed whatever this gateway holds.
 		if reconciliation.held.len() > MAX_GOSSIP_LOG {
-			return Refusal::to(&frame, &self.trace).reconcile();
+			return refusal.reconcile(TransitStatus::InvalidArgument);
 		}
 
 		// A journal, table, or registry this gateway cannot read refuses the
 		// round, so the requester repairs from a member that can answer.
 		let Ok(held) = self.config.gossip.journal.held_digests(self.config.clock.unix()) else {
-			return Refusal::to(&frame, &self.trace).reconcile();
+			return refusal.reconcile(TransitStatus::Unavailable);
 		};
 
 		let want = self.config.want_against(&reconciliation.held, &held).into_wire();
@@ -305,8 +338,13 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 		// piggyback shape. A seed-bootstrapped requester discovers the
 		// colony graph on the beat it already runs, with no extra round trip.
 		let Ok(pex) = self.config.pex_sample(&self.servlet_registry) else {
-			return Refusal::to(&frame, &self.trace).reconcile();
+			return refusal.reconcile(TransitStatus::Unavailable);
 		};
+
+		let wanted = want.len();
+		let payload = Some(requester.as_shared().as_ref());
+		self.trace
+			.emit_event_with_value_and_evidence(CLUSTER_RECONCILE_ANSWERED, "", wanted, payload)?;
 
 		ReplyForm::Plain.reply(frame.metadata().id(), GossipWant { want, pex })
 	}

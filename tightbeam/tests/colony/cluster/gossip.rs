@@ -9,22 +9,22 @@
 use super::common::*;
 use super::federation::{drive_until_advertised, federation_conf, flood_ad_rumor};
 use crate::seams::outside_identity_of;
-use core::sync::atomic::AtomicUsize;
 use std::sync::PoisonError;
 use tightbeam::colony::cluster::{PeerRecord, PeerStore};
 use tightbeam::colony::protocol::PeerGossip;
-use tightbeam::constants::MAX_PEX_SAMPLE;
+use tightbeam::constants::{MAX_PEER_TRIED_FAILURES, MAX_PEX_SAMPLE};
 use tightbeam::crypto::x509::KeyPurposes;
 use tightbeam::prelude::TightBeamSocketAddr;
 use tightbeam::testing::TestFrame;
+use tightbeam::trace::IntoEventLabel;
 use tightbeam::transport::{EncryptedProtocol, TransportEncryptionConfig};
 use tightbeam::utils::time::{Clock, ManualClock};
 use tightbeam::{compose, server};
 
 /// A peering configuration that refloods to `peers`.
 ///
-/// It returns the journal handle, so scenarios can poll flood convergence
-/// through the public journal trait.
+/// It returns the journal handle, so a scenario can read the journal through
+/// the public journal trait.
 ///
 /// The hive plane refuses a signer that `peer_trust` also holds, so the
 /// hive trust splits off the hive-plane identity (see
@@ -127,94 +127,78 @@ async fn signed_relay_gossip(
 	Ok(signed)
 }
 
-/// Emits one signed gossip frame and records the decoded status on the
-/// trace as `GOSSIP_PUBLISH_STATUS`.
+/// Emits one signed gossip frame and returns the status of the gateway's
+/// reply.
+///
+/// The gateway also records its verdict as an event on the scenario trace,
+/// so the spec pins the gateway's side.
 pub async fn send_gossip_frame(
-	trace: &TraceCollector,
 	connect_certs: &ClusterTestCerts,
 	cluster: &ClusterGateway,
 	frame: Frame,
-) -> Result<(), TightBeamError> {
-	send_gossip_frame_as(trace, connect_certs, cluster, frame, GOSSIP_PUBLISH_STATUS).await
-}
-
-/// Emits one signed gossip frame and records the decoded status under
-/// `marker`, so one scenario can tell its publish outcomes apart.
-async fn send_gossip_frame_as(
-	trace: &TraceCollector,
-	connect_certs: &ClusterTestCerts,
-	cluster: &ClusterGateway,
-	frame: Frame,
-	marker: Urn<'static>,
-) -> Result<(), TightBeamError> {
+) -> Result<TransitStatus, TightBeamError> {
 	let mut client = connect_cluster(connect_certs, cluster.addr()).await?;
 	let response: GossipResponse = decode(&emit_frame(&mut client, frame).await?.message())?;
-	trace.event_with(marker, &[], response.status)?;
-	Ok(())
+	Ok(response.status)
 }
 
-/// Relays one ping application rumor to `cluster` and records the status.
+/// Relays one ping application rumor to `cluster`.
 ///
 /// `origin_key` signs the rumor, and `relay_key` signs the zero-hop relay
-/// envelope that wraps it. The trace records the decoded status as
-/// `GOSSIP_RELAY_STATUS`. Frame ids derive from `label`, so each call floods
+/// envelope that wraps it. Frame ids derive from `label`, so each call floods
 /// a distinct digest.
 pub async fn relay_application_rumor(
-	trace: &TraceCollector,
 	connect_certs: &ClusterTestCerts,
 	cluster: &ClusterGateway,
 	origin_key: &Secp256k1SigningKey,
 	relay_key: &Secp256k1SigningKey,
 	label: impl AsRef<str>,
-) -> Result<(), TightBeamError> {
-	let relay = RumorRelay { origin_key, relay_key, marker: GOSSIP_RELAY_STATUS };
-	relay.send(trace, connect_certs, cluster, label).await
+) -> Result<TransitStatus, TightBeamError> {
+	let relay = RumorRelay { origin_key, relay_key };
+	relay.send(connect_certs, cluster, label).await
 }
 
-/// One relayed ping application rumor: who signed it, who relays it, and the
-/// event under which the trace records its status.
-///
-/// A scenario whose relays end differently gives each its own marker.
+/// One relayed ping application rumor: who signed it, and who relays it.
 pub struct RumorRelay<'k> {
 	/// The key that signs the origin rumor.
 	pub origin_key: &'k Secp256k1SigningKey,
 	/// The key that signs the relay envelope around the rumor.
 	pub relay_key: &'k Secp256k1SigningKey,
-	/// The event under which the trace records the decoded relay status.
-	pub marker: Urn<'static>,
 }
 
 impl RumorRelay<'_> {
-	/// Relays the rumor to `cluster` in a zero-hop envelope and records the
-	/// decoded status. Frame ids derive from `label`, so each call floods a
-	/// distinct digest.
+	/// Relays the rumor to `cluster` in a zero-hop envelope, and returns the
+	/// status of the gateway's reply. Frame ids derive from `label`, so each
+	/// call floods a distinct digest.
+	///
+	/// The gateway also records its verdict as an event on the scenario
+	/// trace, so the spec pins the gateway's side.
 	pub async fn send(
 		self,
-		trace: &TraceCollector,
 		connect_certs: &ClusterTestCerts,
 		cluster: &ClusterGateway,
 		label: impl AsRef<str>,
-	) -> Result<(), TightBeamError> {
-		self.send_with_hops(trace, connect_certs, cluster, label, 0).await
+	) -> Result<TransitStatus, TightBeamError> {
+		self.status_with_hops(connect_certs, cluster, label, 0).await
 	}
 
-	/// Relays the rumor as [`Self::send`] does, in an envelope with `hop_ttl`
-	/// hops left, so the gateway that receives the rumor floods it on.
-	async fn send_with_hops(
+	/// Relays the rumor as [`Self::send`] does, in an envelope with
+	/// `hop_ttl` hops left, so the gateway that receives the rumor floods it
+	/// on.
+	async fn status_with_hops(
 		self,
-		trace: &TraceCollector,
 		connect_certs: &ClusterTestCerts,
 		cluster: &ClusterGateway,
 		label: impl AsRef<str>,
 		hop_ttl: u64,
-	) -> Result<(), TightBeamError> {
+	) -> Result<TransitStatus, TightBeamError> {
 		let label = label.as_ref();
 		let inner_id = format!("{label}-inner");
 		let relay_id = format!("{label}-relay");
 		let body = rumor_body(encode(&PingRequest { value: 21 })?);
 		let rumor = mint_origin_rumor(self.origin_key, inner_id.as_bytes(), body).await?;
 		let frame = signed_relay_gossip(self.relay_key, relay_id.as_bytes(), rumor, hop_ttl).await?;
-		send_gossip_frame_as(trace, connect_certs, cluster, frame, self.marker).await
+		send_gossip_frame(connect_certs, cluster, frame).await
 	}
 }
 
@@ -239,20 +223,6 @@ async fn signed_reconcile_gossip(
 	Ok(signed)
 }
 
-/// Emits one signed reconcile frame and records the want-list size under
-/// `marker`. A refused reconciliation answers with an empty want.
-async fn send_reconcile_frame_as(
-	trace: &TraceCollector,
-	connect_certs: &ClusterTestCerts,
-	cluster: &ClusterGateway,
-	frame: Frame,
-	marker: Urn<'static>,
-) -> Result<(), TightBeamError> {
-	let response = reconcile_reply(connect_certs, cluster, frame).await?;
-	trace.event_with(marker, &[], response.want.len() as u64)?;
-	Ok(())
-}
-
 /// Emits one signed reconcile frame and returns the decoded reply.
 async fn reconcile_reply(
 	connect_certs: &ClusterTestCerts,
@@ -262,34 +232,6 @@ async fn reconcile_reply(
 	let mut client = connect_cluster(connect_certs, cluster.addr()).await?;
 	let reply: GossipWant = decode(&emit_frame(&mut client, frame).await?.message())?;
 	Ok(reply)
-}
-
-/// One convergence probe over the public journal interface: every journal
-/// holds exactly `held` rumors, and none awaits local delivery.
-fn gossip_converged(journals: impl AsRef<[Arc<MemoryGossipJournal>]>, held: usize) -> bool {
-	let journals = journals.as_ref();
-	let now = UnixMillis::now();
-	journals.iter().all(|journal| {
-		let held_now = journal.held_digests(now).is_ok_and(|digests| digests.len() == held);
-		// A delivery in flight counts as undelivered, so convergence
-		// waits for the local ingress round trip rather than the claim.
-		let all_delivered = journal.undelivered_local(now).is_ok_and(|count| count == 0);
-		held_now && all_delivered
-	})
-}
-
-/// Polls until every journal converges, or the attempts run out.
-///
-/// Refloods run detached from the publish reply, so only a poll can observe
-/// convergence.
-pub async fn wait_for_gossip_converged(
-	journals: impl AsRef<[Arc<MemoryGossipJournal>]>,
-	held: usize,
-	attempts: u32,
-	interval: Duration,
-) -> bool {
-	let journals = journals.as_ref();
-	poll_until(attempts, interval, || gossip_converged(journals, held)).await
 }
 
 /// Polls until the journal holds exactly `count` rumors that await local
@@ -311,29 +253,33 @@ async fn wait_for_pending_local(
 	poll_until(attempts, interval, pending).await
 }
 
+/// Polls until `trace` holds at least `count` records of `event`, or
+/// `attempts` polls 100 ms apart run out.
+///
+/// The event marks a decision that a reflood, a beat, or a probe makes on
+/// another task. The spec judges the count, so the wait answers nothing.
+async fn wait_for_recorded(trace: &TraceCollector, event: impl IntoEventLabel + Clone, count: usize, attempts: u32) {
+	let recorded = || trace.recorded(event.clone()) >= count;
+	poll_until(attempts, Duration::from_millis(100), recorded).await;
+}
+
 tb_assert_spec! {
 	pub ClusterGossipFloodSpec,
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(3), equals!(1u64)),
-			(GOSSIP_PUBLISH_STATUS, exactly!(2), equals!(TransitStatus::Ok)),
-			(GOSSIP_CONVERGED, exactly!(1), equals!(1u64)),
-			(events::CLUSTER_GOSSIP_ACCEPTED, exactly!(3)),
+			(events::CLUSTER_GOSSIP_ADMITTED, exactly!(3)),
+			(events::CLUSTER_GOSSIP_DELIVERED, exactly!(3)),
 			(events::CLUSTER_GOSSIP_DUPLICATE, exactly!(1)),
 			(events::CLUSTER_GOSSIP_REFUSED, exactly!(0))
 		]
 	}
 }
 
-// A rumor floods a fan-out.
-//
-// A refloods to B and C. Every cluster delivers the rumor to its local
-// ping servlet exactly once (ACCEPTED = 3).
-//
-// - The journal absorbs a second publish of the byte-identical rumor as one DUPLICATE.
-// - The gateway answers the duplicate Ok, and ACCEPTED stays at three.
-// - The duplicate fires before its reply, so the count needs no poll.
+// A rumor floods a fan-out: A refloods to B and C, and each cluster admits
+// the rumor and delivers it to its local ping servlet once. The DUPLICATE of
+// the second publish fires before its Ok reply, so the count needs no poll.
 tb_scenario! {
 	name: cluster_gossip_floods_every_cluster_once,
 	spec: ClusterGossipFloodSpec,
@@ -343,14 +289,14 @@ tb_scenario! {
 			start_scenario_rumor_hive(trace, &certs)
 		},
 		client: |HiveEnv { trace, context: certs, hive }| async move {
-			let (conf_c, journal_c) = gossip_cluster_conf(&certs, vec![]);
+			let (conf_c, _journal_c) = gossip_cluster_conf(&certs, vec![]);
 			let gateway_c = start_cluster(&trace, conf_c).await?;
 
-			let (conf_b, journal_b) = gossip_cluster_conf(&certs, vec![]);
+			let (conf_b, _journal_b) = gossip_cluster_conf(&certs, vec![]);
 			let gateway_b = start_cluster(&trace, conf_b).await?;
 
 			let peers_a = vec![gateway_b.addr().to_string(), gateway_c.addr().to_string()];
-			let (conf_a, journal_a) = gossip_cluster_conf(&certs, peers_a);
+			let (conf_a, _journal_a) = gossip_cluster_conf(&certs, peers_a);
 			let gateway_a = start_cluster(&trace, conf_a).await?;
 
 			let hive_b = start_scenario_rumor_hive(trace.share(), &certs).await?;
@@ -369,13 +315,15 @@ tb_scenario! {
 				4,
 			)
 			.await?;
-			send_gossip_frame(&trace, &certs, &gateway_a, frame.clone()).await?;
+			let replied = send_gossip_frame(&certs, &gateway_a, frame.clone()).await?;
+			assert_eq!(replied, TransitStatus::Ok, "the gateway admits the rumor");
 
-			let journals = [journal_a, journal_b, journal_c];
-			let converged = wait_for_gossip_converged(&journals, 1, 50, Duration::from_millis(100)).await;
-			trace.event_with(GOSSIP_CONVERGED, &[], u64::from(converged))?;
+			// Each cluster tries its local delivery ahead of the admission, so
+			// the wait for the third admission also waits out each delivery.
+			wait_for_recorded(&trace, events::CLUSTER_GOSSIP_ADMITTED, 3, 50).await;
 
-			send_gossip_frame(&trace, &certs, &gateway_a, frame).await?;
+			let replied = send_gossip_frame(&certs, &gateway_a, frame).await?;
+			assert_eq!(replied, TransitStatus::Ok, "the gateway admits the rumor");
 
 			gateway_a.stop();
 			gateway_b.stop();
@@ -394,21 +342,17 @@ tb_assert_spec! {
 		mode: Accept,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(3), equals!(1u64)),
-			(GOSSIP_PUBLISH_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
-			(GOSSIP_CONVERGED, exactly!(1), equals!(1u64)),
-			(events::CLUSTER_GOSSIP_ACCEPTED, exactly!(3)),
+			(events::CLUSTER_GOSSIP_ADMITTED, exactly!(3)),
+			(events::CLUSTER_GOSSIP_DELIVERED, exactly!(3)),
 			(events::CLUSTER_GOSSIP_DUPLICATE, exactly!(0)),
 			(events::CLUSTER_GOSSIP_REFUSED, exactly!(0))
 		]
 	}
 }
 
-// A rumor crosses a partial topology: A peers to B, B peers to C, and C is
-// outside A's peer list. The rumor therefore reaches C only through the
-// reflood at B.
-//
-// - The publish starts at ttl 2 and arrives at C with ttl 0, its whole hop budget spent.
-// - The chain delivers once per cluster with no duplicate.
+// A rumor crosses a partial topology: A peers to B alone, and B peers to C,
+// so the rumor reaches C only through the reflood at B. The publish leaves
+// at ttl 2 and reaches C at ttl 0, its whole hop budget spent.
 tb_scenario! {
 	name: cluster_gossip_relays_across_partial_topology,
 	spec: ClusterGossipChainSpec,
@@ -418,13 +362,13 @@ tb_scenario! {
 			start_scenario_rumor_hive(trace, &certs)
 		},
 		client: |HiveEnv { trace, context: certs, hive }| async move {
-			let (conf_c, journal_c) = gossip_cluster_conf(&certs, vec![]);
+			let (conf_c, _journal_c) = gossip_cluster_conf(&certs, vec![]);
 			let gateway_c = start_cluster(&trace, conf_c).await?;
 
-			let (conf_b, journal_b) = gossip_cluster_conf(&certs, vec![gateway_c.addr().to_string()]);
+			let (conf_b, _journal_b) = gossip_cluster_conf(&certs, vec![gateway_c.addr().to_string()]);
 			let gateway_b = start_cluster(&trace, conf_b).await?;
 
-			let (conf_a, journal_a) = gossip_cluster_conf(&certs, vec![gateway_b.addr().to_string()]);
+			let (conf_a, _journal_a) = gossip_cluster_conf(&certs, vec![gateway_b.addr().to_string()]);
 			let gateway_a = start_cluster(&trace, conf_a).await?;
 
 			let hive_b = start_scenario_rumor_hive(trace.share(), &certs).await?;
@@ -440,11 +384,9 @@ tb_scenario! {
 				2,
 			)
 			.await?;
-			send_gossip_frame(&trace, &certs, &gateway_a, frame).await?;
-
-			let journals = [journal_a, journal_b, journal_c];
-			let converged = wait_for_gossip_converged(&journals, 1, 50, Duration::from_millis(100)).await;
-			trace.event_with(GOSSIP_CONVERGED, &[], u64::from(converged))?;
+			let replied = send_gossip_frame(&certs, &gateway_a, frame).await?;
+			assert_eq!(replied, TransitStatus::Ok, "the gateway admits the rumor");
+			wait_for_recorded(&trace, events::CLUSTER_GOSSIP_ADMITTED, 3, 50).await;
 
 			gateway_a.stop();
 			gateway_b.stop();
@@ -463,23 +405,17 @@ tb_assert_spec! {
 		mode: Accept,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(2), equals!(1u64)),
-			(GOSSIP_PUBLISH_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
-			(GOSSIP_CONVERGED, exactly!(1), equals!(1u64)),
-			(events::CLUSTER_GOSSIP_ACCEPTED, exactly!(2)),
+			(events::CLUSTER_GOSSIP_ADMITTED, exactly!(2)),
+			(events::CLUSTER_GOSSIP_DELIVERED, exactly!(2)),
 			(events::CLUSTER_GOSSIP_DUPLICATE, exactly!(0)),
 			(events::CLUSTER_GOSSIP_REFUSED, exactly!(0))
 		]
 	}
 }
 
-// A rumor propagates on hive trust alone.
-//
-// A configures a peer but no `peer_trust`, so it builds no peer pool, and its
-// reflood falls back to the hive pool, as the advertise beat does.
-//
-// - The rumor reaches B.
-// - B verifies A's relay on its own peer plane.
-// - The publish starts at ttl 1, so each cluster delivers once and the hop budget ends at B.
+// A rumor propagates on hive trust alone: A has no `peer_trust`, so it builds
+// no peer pool and refloods over the hive pool, as the advertise beat does. B
+// verifies the relay on its peer plane, where the ttl-1 publish's hops end.
 tb_scenario! {
 	name: cluster_gossip_refloods_under_hive_trust_only,
 	spec: ClusterGossipHiveTrustOnlySpec,
@@ -489,9 +425,9 @@ tb_scenario! {
 			start_scenario_rumor_hive(trace, &certs)
 		},
 		client: |HiveEnv { trace, context: certs, hive }| async move {
-			let (conf_b, journal_b) = gossip_cluster_conf(&certs, vec![]);
+			let (conf_b, _journal_b) = gossip_cluster_conf(&certs, vec![]);
 			let gateway_b = start_cluster(&trace, conf_b).await?;
-			let (mut conf_a, journal_a) = gossip_cluster_conf(&certs, vec![gateway_b.addr().to_string()]);
+			let (mut conf_a, _journal_a) = gossip_cluster_conf(&certs, vec![gateway_b.addr().to_string()]);
 
 			conf_a.tls.peer_trust = None;
 
@@ -508,11 +444,9 @@ tb_scenario! {
 				1,
 			)
 			.await?;
-			send_gossip_frame(&trace, &certs, &gateway_a, frame).await?;
-
-			let journals = [journal_a, journal_b];
-			let converged = wait_for_gossip_converged(&journals, 1, 50, Duration::from_millis(100)).await;
-			trace.event_with(GOSSIP_CONVERGED, &[], u64::from(converged))?;
+			let replied = send_gossip_frame(&certs, &gateway_a, frame).await?;
+			assert_eq!(replied, TransitStatus::Ok, "the gateway admits the rumor");
+			wait_for_recorded(&trace, events::CLUSTER_GOSSIP_ADMITTED, 2, 50).await;
 
 			gateway_a.stop();
 			gateway_b.stop();
@@ -529,22 +463,17 @@ tb_assert_spec! {
 		mode: Accept,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(2), equals!(1u64)),
-			(GOSSIP_PUBLISH_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
-			(GOSSIP_CONVERGED, exactly!(1), equals!(1u64)),
-			(GOSSIP_CLAMP_LEAKED, exactly!(1), equals!(0u64)),
-			(events::CLUSTER_GOSSIP_ACCEPTED, exactly!(1)),
+			(events::CLUSTER_GOSSIP_ADMITTED, exactly!(1), equals!(0u64)),
+			(events::CLUSTER_GOSSIP_DELIVERED, exactly!(1)),
 			(events::CLUSTER_GOSSIP_DUPLICATE, exactly!(0)),
 			(events::CLUSTER_GOSSIP_REFUSED, exactly!(0))
 		]
 	}
 }
 
-// The operator's configured gossip ttl caps the hop radius an origin
-// publish may request.
-//
-// - With ttl 0 configured, the gateway clamps a publish that requests the protocol maximum.
-// - The gateway delivers it locally, and the journal of B, the configured peer, stays empty.
-// - A leaked reflood would raise ACCEPTED past one.
+// The configured gossip ttl caps the hops of an origin publish: at 0, the
+// gateway admits a publish that asks for the maximum with 0 hops left, starts
+// no reflood to B, and delivers before it answers, so no count needs a poll.
 tb_scenario! {
 	name: cluster_gossip_origin_clamps_configured_ttl,
 	spec: ClusterGossipTtlClampSpec,
@@ -554,13 +483,13 @@ tb_scenario! {
 			start_scenario_rumor_hive(trace, &certs)
 		},
 		client: |HiveEnv { trace, context: certs, hive }| async move {
-			let (conf_b, journal_b) = gossip_cluster_conf(&certs, vec![]);
+			let (conf_b, _journal_b) = gossip_cluster_conf(&certs, vec![]);
 			let gateway_b = start_cluster(&trace, conf_b).await?;
 
-			let (mut conf_a, journal_a) = gossip_cluster_conf(&certs, vec![gateway_b.addr().to_string()]);
+			let (mut conf_a, _journal_a) = gossip_cluster_conf(&certs, vec![gateway_b.addr().to_string()]);
 			conf_a.gossip.ttl = 0;
-			let gateway_a = start_cluster(&trace, conf_a).await?;
 
+			let gateway_a = start_cluster(&trace, conf_a).await?;
 			let hive_b = start_scenario_rumor_hive(trace.share(), &certs).await?;
 			hive.register_with_cluster(gateway_a.addr()).await?;
 			hive_b.register_with_cluster(gateway_b.addr()).await?;
@@ -572,15 +501,8 @@ tb_scenario! {
 				u64::from(MAX_GOSSIP_TTL),
 			)
 			.await?;
-			send_gossip_frame(&trace, &certs, &gateway_a, frame).await?;
-
-			let converged = wait_for_gossip_converged(&[journal_a], 1, 50, Duration::from_millis(100)).await;
-			trace.event_with(GOSSIP_CONVERGED, &[], u64::from(converged))?;
-
-			// A leaked reflood would land within this window, so a correct
-			// clamp leaves B's journal empty for the whole wait.
-			let leaked = wait_for_gossip_converged(&[journal_b], 1, 3, Duration::from_millis(100)).await;
-			trace.event_with(GOSSIP_CLAMP_LEAKED, &[], u64::from(leaked))?;
+			let replied = send_gossip_frame(&certs, &gateway_a, frame).await?;
+			assert_eq!(replied, TransitStatus::Ok, "the gateway admits the rumor");
 
 			gateway_a.stop();
 			gateway_b.stop();
@@ -626,19 +548,15 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(GOSSIP_PUBLISH_STATUS, exactly!(3), equals!(TransitStatus::PermissionDenied)),
-			(events::CLUSTER_GOSSIP_REFUSED, exactly!(3)),
-			(events::CLUSTER_GOSSIP_ACCEPTED, exactly!(0))
+			(events::CLUSTER_GOSSIP_REFUSED, exactly!(3), equals!(TransitStatus::PermissionDenied)),
+			(events::CLUSTER_GOSSIP_DELIVERED, exactly!(0))
 		]
 	}
 }
 
-// The trust planes stay apart, and admission bounds the rumor size.
-//
-// - The gateway refuses peer gossip that a hive-plane signer relays.
-// - The gateway refuses origin gossip that a peer-plane signer publishes.
-// - Admission refuses an oversized rumor even on the correct plane.
-// - The gateway delivers nothing and records nothing for reflood.
+// The trust planes stay apart, and admission bounds the rumor size: the
+// gateway refuses a hive-plane relay, a peer-plane publish, and an oversized
+// rumor on the correct plane, so none of them reaches delivery or the journal.
 tb_scenario! {
 	name: cluster_gossip_refuses_wrong_plane_and_oversized,
 	spec: ClusterGossipPlaneSpec,
@@ -661,7 +579,8 @@ tb_scenario! {
 			)
 			.await?;
 			let frame = signed_relay_gossip(&ctx.gateway.key, b"cross-plane-relay", dummy, 2).await?;
-			send_gossip_frame(&trace, &ctx.gateway, &cluster, frame).await?;
+			let replied = send_gossip_frame(&ctx.gateway, &cluster, frame).await?;
+			assert_eq!(replied, TransitStatus::PermissionDenied, "peer trust refuses a relay that a hive-plane signer signs");
 
 			let frame = signed_publish_gossip(
 				&ctx.peer_key,
@@ -670,7 +589,8 @@ tb_scenario! {
 				2,
 			)
 			.await?;
-			send_gossip_frame(&trace, &ctx.gateway, &cluster, frame).await?;
+			let replied = send_gossip_frame(&ctx.gateway, &cluster, frame).await?;
+			assert_eq!(replied, TransitStatus::PermissionDenied, "hive trust refuses a publish that a peer-plane signer signs");
 
 			// The oversized rumor crosses a pooled mux link, the same chunked
 			// path that reflood uses, to reach admission. The payload bound
@@ -698,7 +618,7 @@ tb_scenario! {
 
 			let reply = mux_client.emit(frame, None).await?.ok_or(TightBeamError::MissingResponse)?;
 			let response: GossipResponse = decode(reply.message())?;
-			trace.event_with(GOSSIP_PUBLISH_STATUS, &[], response.status)?;
+			assert_eq!(response.status, TransitStatus::PermissionDenied, "admission refuses an oversized rumor");
 
 			cluster.stop();
 			Ok(())
@@ -712,19 +632,17 @@ tb_assert_spec! {
 		mode: Accept,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(2), equals!(1u64)),
-			(GOSSIP_PUBLISH_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
-			(GOSSIP_CONVERGED, exactly!(1), equals!(1u64)),
-			(events::CLUSTER_GOSSIP_ACCEPTED, exactly!(2)),
+			(events::CLUSTER_GOSSIP_ADMITTED, at_least!(2)),
+			(events::CLUSTER_GOSSIP_DELIVERED, exactly!(2)),
 			(events::CLUSTER_GOSSIP_DUPLICATE, exactly!(0)),
 			(events::CLUSTER_GOSSIP_REFUSED, exactly!(0))
 		]
 	}
 }
 
-// Anti-entropy repairs a rumor over the beat.
-//
-// - Publisher F starts the rumor at ttl 0, so it moves by reconcile alone.
-// - Receiver R learns the rumor only when F's beat reconciles digests and pushes it.
+// Anti-entropy repairs a rumor over the beat. Publisher F starts the rumor at
+// ttl 0, so R learns it only when F's beat reconciles digests and pushes it.
+// R also admits the slate rumors of F's beat, so ADMITTED is a lower bound.
 tb_scenario! {
 	name: cluster_gossip_repairs_missing_peer_over_beat,
 	spec: ClusterGossipReconcileRepairSpec,
@@ -734,12 +652,13 @@ tb_scenario! {
 			start_scenario_rumor_hive(trace, &certs)
 		},
 		client: |HiveEnv { trace, context: certs, hive }| async move {
-			let (conf_r, journal_r) = gossip_cluster_conf(&certs, vec![]);
+			let (conf_r, _journal_r) = gossip_cluster_conf(&certs, vec![]);
 			let gateway_r = start_cluster(&trace, conf_r).await?;
 			let hive_r = start_scenario_rumor_hive(trace.share(), &certs).await?;
 
-			let (mut conf_f, journal_f) = gossip_cluster_conf(&certs, vec![gateway_r.addr().to_string()]);
+			let (mut conf_f, _journal_f) = gossip_cluster_conf(&certs, vec![gateway_r.addr().to_string()]);
 			conf_f.peer.advertise_interval = Some(Duration::from_millis(100));
+
 			let gateway_f = start_cluster(&trace, conf_f).await?;
 
 			hive_r.register_with_cluster(gateway_r.addr()).await?;
@@ -752,10 +671,14 @@ tb_scenario! {
 				0,
 			)
 			.await?;
-			send_gossip_frame(&trace, &certs, &gateway_f, frame).await?;
+			let replied = send_gossip_frame(&certs, &gateway_f, frame).await?;
+			assert_eq!(replied, TransitStatus::Ok, "the gateway admits the rumor");
 
-			let converged = wait_for_gossip_converged(&[journal_f, journal_r], 1, 50, Duration::from_millis(100)).await;
-			trace.event_with(GOSSIP_CONVERGED, &[], u64::from(converged))?;
+			// The repair reaches R on a beat. R also admits the slate rumors of
+			// the beat, so the second delivery marks the repair, and the
+			// admission count has its own wait.
+			wait_for_recorded(&trace, events::CLUSTER_GOSSIP_DELIVERED, 2, 50).await;
+			wait_for_recorded(&trace, events::CLUSTER_GOSSIP_ADMITTED, 2, 50).await;
 
 			gateway_f.stop();
 			gateway_r.stop();
@@ -772,22 +695,17 @@ tb_assert_spec! {
 		mode: Accept,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(2), equals!(1u64)),
-			(GOSSIP_PUBLISH_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
-			(GOSSIP_PENDING_BEFORE_REGISTER, exactly!(1), equals!(1u64)),
-			(GOSSIP_CONVERGED, exactly!(1), equals!(1u64)),
-			(events::CLUSTER_GOSSIP_ACCEPTED, exactly!(2)),
+			(events::CLUSTER_GOSSIP_ADMITTED, exactly!(2)),
+			(events::CLUSTER_GOSSIP_DELIVERED, exactly!(2)),
 			(events::CLUSTER_GOSSIP_DUPLICATE, exactly!(0)),
 			(events::CLUSTER_GOSSIP_REFUSED, exactly!(0))
 		]
 	}
 }
 
-// The beat retries a local delivery.
-//
-// The rumor reaches R before R's ping servlet registers, so it stays pending.
-//
-// - After registration, R's beat delivers from the pending set and acks.
-// - R has no peers, so the beat runs solely for the `pending_local` retry.
+// The beat retries a local delivery. The rumor reaches R before R's ping
+// servlet registers, so R admits it and holds it pending. R has no peers, so
+// its beat runs for the `pending_local` retry alone, which delivers and acks.
 tb_scenario! {
 	name: cluster_gossip_retries_pending_local_delivery,
 	spec: ClusterGossipRetrySpec,
@@ -801,7 +719,7 @@ tb_scenario! {
 			conf_r.peer.advertise_interval = Some(Duration::from_millis(100));
 			let gateway_r = start_cluster(&trace, conf_r).await?;
 
-			let (conf_f, journal_f) = gossip_cluster_conf(&certs, vec![gateway_r.addr().to_string()]);
+			let (conf_f, _journal_f) = gossip_cluster_conf(&certs, vec![gateway_r.addr().to_string()]);
 			let gateway_f = start_cluster(&trace, conf_f).await?;
 
 			hive.register_with_cluster(gateway_f.addr()).await?;
@@ -813,16 +731,17 @@ tb_scenario! {
 				1,
 			)
 			.await?;
-			send_gossip_frame(&trace, &certs, &gateway_f, frame).await?;
+			let replied = send_gossip_frame(&certs, &gateway_f, frame).await?;
+			assert_eq!(replied, TransitStatus::Ok, "the gateway admits the rumor");
+			wait_for_recorded(&trace, events::CLUSTER_GOSSIP_ADMITTED, 2, 50).await;
 
 			let pending = wait_for_pending_local(&journal_r, 1, 50, Duration::from_millis(100)).await;
-			trace.event_with(GOSSIP_PENDING_BEFORE_REGISTER, &[], u64::from(pending))?;
+			assert!(pending, "the rumor waits in R's journal for its ingress");
 
 			let hive_r = start_scenario_rumor_hive(trace.share(), &certs).await?;
 			hive_r.register_with_cluster(gateway_r.addr()).await?;
 
-			let converged = wait_for_gossip_converged(&[journal_f, journal_r], 1, 50, Duration::from_millis(100)).await;
-			trace.event_with(GOSSIP_CONVERGED, &[], u64::from(converged))?;
+			wait_for_recorded(&trace, events::CLUSTER_GOSSIP_DELIVERED, 2, 50).await;
 
 			gateway_f.stop();
 			gateway_r.stop();
@@ -908,10 +827,8 @@ tb_assert_spec! {
 		mode: Accept,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
-			(GOSSIP_PUBLISH_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
-			(events::CLUSTER_GOSSIP_ACCEPTED, exactly!(1)),
-			(JOURNAL_RECORDS, exactly!(1), equals!(1u64)),
-			(JOURNAL_ACKS, exactly!(1), equals!(1u64))
+			(events::CLUSTER_GOSSIP_ADMITTED, exactly!(1)),
+			(events::CLUSTER_GOSSIP_DELIVERED, exactly!(1))
 		]
 	}
 }
@@ -922,10 +839,9 @@ tb_assert_spec! {
 		mode: Accept,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
-			(GOSSIP_PUBLISH_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
-			(GOSSIP_LIMITED_STATUS, exactly!(1), equals!(TransitStatus::ResourceExhausted)),
-			(events::CLUSTER_GOSSIP_ACCEPTED, exactly!(1)),
-			(events::CLUSTER_GOSSIP_REFUSED, exactly!(1)),
+			(events::CLUSTER_GOSSIP_ADMITTED, exactly!(1)),
+			(events::CLUSTER_GOSSIP_REFUSED, exactly!(1), equals!(TransitStatus::ResourceExhausted)),
+			(events::CLUSTER_GOSSIP_DELIVERED, exactly!(1)),
 			(events::CLUSTER_GOSSIP_DUPLICATE, exactly!(0))
 		]
 	}
@@ -951,6 +867,7 @@ tb_scenario! {
 				ingress: Some(servlet_ingress("rumor")),
 				..Default::default()
 			};
+
 			let gateway = start_cluster(&trace, conf).await?;
 			hive.register_with_cluster(gateway.addr()).await?;
 
@@ -961,7 +878,8 @@ tb_scenario! {
 				0,
 			)
 			.await?;
-			send_gossip_frame(&trace, &certs, &gateway, frame).await?;
+			let replied = send_gossip_frame(&certs, &gateway, frame).await?;
+			assert_eq!(replied, TransitStatus::Ok, "the gateway admits the rumor");
 
 			let frame = hive_publish_gossip(
 				&certs,
@@ -970,7 +888,8 @@ tb_scenario! {
 				0,
 			)
 			.await?;
-			send_gossip_frame_as(&trace, &certs, &gateway, frame, GOSSIP_LIMITED_STATUS).await?;
+			let replied = send_gossip_frame(&certs, &gateway, frame).await?;
+			assert_eq!(replied, TransitStatus::ResourceExhausted, "the second rumor passes the signer's rate");
 
 			gateway.stop();
 			hive.stop();
@@ -985,21 +904,18 @@ tb_assert_spec! {
 		mode: Accept,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
-			(GOSSIP_PUBLISH_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
-			(GOSSIP_REPLAY_STATUS, exactly!(1), equals!(TransitStatus::PermissionDenied)),
-			(events::CLUSTER_GOSSIP_ACCEPTED, exactly!(1)),
-			(events::CLUSTER_GOSSIP_REFUSED, exactly!(1)),
+			(events::CLUSTER_GOSSIP_ADMITTED, exactly!(1)),
+			(events::CLUSTER_GOSSIP_REFUSED, exactly!(1), equals!(TransitStatus::PermissionDenied)),
+			(events::CLUSTER_GOSSIP_DELIVERED, exactly!(1)),
 			(events::CLUSTER_GOSSIP_DUPLICATE, exactly!(0))
 		]
 	}
 }
 
 // The gateway clamps the freshness window (seen_ttl) to the journal's
-// retention horizon at start.
+// retention horizon at start, so it refuses a replay after the prune as stale.
 //
-// - The configuration asks for an hour-wide window over a one-second journal.
 // - The scenario issues the rumor at the reading of the gateway's manual clock, which it alone moves.
-// - After the journal prunes the entry, the gateway refuses a byte-identical replay as stale.
 // - Without the clamp the replay reads as fresh, so the gateway records it as New and delivers it twice.
 //
 // Sources:
@@ -1036,13 +952,15 @@ tb_scenario! {
 				clock.unix(),
 			)
 			.await?;
-			send_gossip_frame(&trace, &certs, &gateway, frame.clone()).await?;
+			let replied = send_gossip_frame(&certs, &gateway, frame.clone()).await?;
+			assert_eq!(replied, TransitStatus::Ok, "the gateway admits the rumor");
 
 			// The clock moves past the one-second retention, so the journal
 			// has pruned the entry and only the clamped freshness window can
 			// refuse it.
 			clock.advance(Duration::from_secs(2));
-			send_gossip_frame_as(&trace, &certs, &gateway, frame, GOSSIP_REPLAY_STATUS).await?;
+			let replied = send_gossip_frame(&certs, &gateway, frame).await?;
+			assert_eq!(replied, TransitStatus::PermissionDenied, "the gateway refuses the replay as stale");
 
 			gateway.stop();
 			hive.stop();
@@ -1057,21 +975,17 @@ tb_assert_spec! {
 		mode: Accept,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
-			(GOSSIP_PUBLISH_STATUS, exactly!(4), equals!(TransitStatus::Ok)),
+			(events::CLUSTER_GOSSIP_ADMITTED, exactly!(2)),
 			(events::CLUSTER_GOSSIP_DUPLICATE, exactly!(2)),
-			(events::CLUSTER_GOSSIP_ACCEPTED, exactly!(2)),
+			(events::CLUSTER_GOSSIP_DELIVERED, exactly!(2)),
 			(events::CLUSTER_GOSSIP_REFUSED, exactly!(0))
 		]
 	}
 }
 
-// Duplicates leave rate tokens unspent.
-//
-// A two-token bucket with a slow refill admits rumor A.
-//
-// - The gateway absorbs two byte-identical echoes of A for free.
-// - The bucket keeps its second token to admit rumor B.
-// - If duplicates spent tokens, the echoes would drain the bucket, and B would draw ResourceExhausted.
+// Duplicates leave rate tokens unspent. A two-token bucket with a slow refill
+// admits rumor A, keeps its second token through two byte-identical echoes of
+// A, and admits B, which would draw ResourceExhausted if echoes spent tokens.
 tb_scenario! {
 	name: cluster_gossip_duplicates_spend_no_tokens,
 	spec: ClusterGossipDuplicateFreeSpec,
@@ -1099,9 +1013,13 @@ tb_scenario! {
 				0,
 			)
 			.await?;
-			send_gossip_frame(&trace, &certs, &gateway, first.clone()).await?;
-			send_gossip_frame(&trace, &certs, &gateway, first.clone()).await?;
-			send_gossip_frame(&trace, &certs, &gateway, first).await?;
+
+			let replied = send_gossip_frame(&certs, &gateway, first.clone()).await?;
+			assert_eq!(replied, TransitStatus::Ok, "the gateway admits the rumor");
+			let replied = send_gossip_frame(&certs, &gateway, first.clone()).await?;
+			assert_eq!(replied, TransitStatus::Ok, "the gateway admits the rumor");
+			let replied = send_gossip_frame(&certs, &gateway, first).await?;
+			assert_eq!(replied, TransitStatus::Ok, "the gateway admits the rumor");
 
 			let second = hive_publish_gossip(
 				&certs,
@@ -1110,7 +1028,8 @@ tb_scenario! {
 				0,
 			)
 			.await?;
-			send_gossip_frame(&trace, &certs, &gateway, second).await?;
+			let replied = send_gossip_frame(&certs, &gateway, second).await?;
+			assert_eq!(replied, TransitStatus::Ok, "the gateway admits the rumor");
 
 			gateway.stop();
 			hive.stop();
@@ -1119,10 +1038,9 @@ tb_scenario! {
 	}
 }
 
-// The gateway drives an injected journal through the trait alone.
-//
-// - One origin publish records once and acks once on local delivery.
-// - Record and ack precede the reply, so the counts are final when the publish returns.
+// The gateway drives an injected journal through the trait alone. It records
+// the origin publish and acks its local delivery before the reply, so the
+// counts are final when the publish returns.
 tb_scenario! {
 	name: cluster_gossip_uses_injected_journal,
 	spec: ClusterGossipJournalSeamSpec,
@@ -1150,10 +1068,13 @@ tb_scenario! {
 				0,
 			)
 			.await?;
-			send_gossip_frame(&trace, &certs, &gateway, frame).await?;
+			let replied = send_gossip_frame(&certs, &gateway, frame).await?;
+			assert_eq!(replied, TransitStatus::Ok, "the gateway admits the rumor");
 
-			trace.event_with(JOURNAL_RECORDS, &[], journal.records.load(Ordering::SeqCst))?;
-			trace.event_with(JOURNAL_ACKS, &[], journal.acks.load(Ordering::SeqCst))?;
+			let records = journal.records.load(Ordering::SeqCst);
+			assert_eq!(records, 1, "the gateway records the publish through the injected journal");
+			let acks = journal.acks.load(Ordering::SeqCst);
+			assert_eq!(acks, 1, "the gateway acks the delivered rumor through the injected journal");
 
 			gateway.stop();
 			hive.stop();
@@ -1240,18 +1161,15 @@ tb_assert_spec! {
 		mode: Accept,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
-			(GOSSIP_PUBLISH_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
-			(events::CLUSTER_GOSSIP_ACCEPTED, exactly!(0)),
-			(JOURNAL_ACKS, exactly!(1), equals!(0u64))
+			(events::CLUSTER_GOSSIP_ADMITTED, exactly!(1)),
+			(events::CLUSTER_GOSSIP_DELIVERED, exactly!(0))
 		]
 	}
 }
 
-// A rumor that another task already claimed gets no second delivery.
-//
-// The delivery path must take the claim before the ingress round trip. A
-// path that skipped it would deliver the rumor, ack it, and trace ACCEPTED,
-// the at-least-once behavior the claim exists to remove (CWE-362).
+// A rumor that another task claimed gets no second delivery. The delivery path
+// must take the claim before the ingress round trip, or it would deliver, ack,
+// and trace DELIVERED, the at-least-once behavior the claim removes (CWE-362).
 tb_scenario! {
 	name: cluster_gossip_held_claim_is_not_delivered_twice,
 	spec: ClusterGossipHeldClaimSpec,
@@ -1280,9 +1198,11 @@ tb_scenario! {
 				0,
 			)
 			.await?;
-			send_gossip_frame(&trace, &certs, &gateway, frame).await?;
+			let replied = send_gossip_frame(&certs, &gateway, frame).await?;
+			assert_eq!(replied, TransitStatus::Ok, "the gateway admits the rumor");
 
-			trace.event_with(JOURNAL_ACKS, &[], journal.acks.load(Ordering::SeqCst))?;
+			let acks = journal.acks.load(Ordering::SeqCst);
+			assert_eq!(acks, 0, "a rumor that another task claimed gets no ack");
 
 			gateway.stop();
 			hive.stop();
@@ -1297,28 +1217,20 @@ tb_assert_spec! {
 		mode: Accept,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
-			(PEER_AD_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
-			(PEER_ROUTES_AFTER, exactly!(1), equals!(1u64)),
-			(GOSSIP_RELAY_STATUS, exactly!(4), equals!(TransitStatus::PermissionDenied)),
-			(events::CLUSTER_GOSSIP_REFUSED, exactly!(4)),
+			(events::CLUSTER_PEER_ADVERTISED, exactly!(1)),
+			(events::CLUSTER_PEER_ADVERTISE_REFUSED, absent!()),
+			(events::CLUSTER_GOSSIP_REFUSED, exactly!(4), equals!(TransitStatus::PermissionDenied)),
 			(events::CLUSTER_GOSSIP_RELAY_WEAKENED, exactly!(3)),
-			(GOSSIP_ROUTES_AFTER_SCORING, exactly!(1), equals!(0u64)),
-			(GOSSIP_PUBLISH_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
-			(events::CLUSTER_GOSSIP_ACCEPTED, exactly!(1))
+			(events::CLUSTER_PEER_ROUTE_ABANDONED, exactly!(1), equals!(1u64)),
+			(events::CLUSTER_GOSSIP_ADMITTED, exactly!(1)),
+			(events::CLUSTER_GOSSIP_DELIVERED, exactly!(1))
 		]
 	}
 }
 
-// The gateway scores a relay whose rumors admission refuses.
-//
-// A trusted peer that relays rumors that admission refuses (here an over-TTL
-// flood request) weakens its own advertised work routes.
-//
-// - Each refusal weakens the trail by one trial until the gateway abandons it.
-// - `peer_routes` then leaves it out.
-// - The fourth refusal finds the trail gone, so RELAY_WEAKENED stays at three.
-// - An honest relay from the same signer still delivers.
-// - Work-route abandonment leaves the flood untouched.
+// Each over-TTL relay that admission refuses weakens the relay's work route by
+// one trial until the gateway abandons it, so the fourth finds it gone. The
+// abandonment spares the flood, and the signer's honest relay delivers.
 tb_scenario! {
 	name: cluster_gossip_abandons_invalid_relay_routes,
 	spec: ClusterGossipInvalidRelaySpec,
@@ -1334,31 +1246,17 @@ tb_scenario! {
 
 			let gateway = start_cluster(&trace, conf).await?;
 			hive.register_with_cluster(gateway.addr()).await?;
-			install_ping_peer(&trace, &certs, &gateway).await?;
 
-			// The loop sends one more relay than the abandonment budget. Each
-			// relay carries a valid origin-signed rumor, so the over-radius hop
-			// lifetime alone draws the refusal.
-			for i in 0..=CONTAINMENT_ABANDON_LIMIT {
-				let rumor_id = [b'r', i as u8];
-				let rumor = mint_origin_rumor(
-					&certs.key,
-					&rumor_id,
-					rumor_body(encode(&PingRequest { value: i })?),
-				)
-				.await?;
-				let id = [b'b', b'a', b'd', i as u8];
-				let frame = signed_relay_gossip(
-					&certs.key,
-					&id,
-					rumor,
-					u64::from(MAX_GOSSIP_TTL) + 1,
-				)
-				.await?;
-				send_gossip_frame_as(&trace, &certs, &gateway, frame, GOSSIP_RELAY_STATUS).await?;
-			}
+			let ad_reply = install_ping_peer(&certs, &gateway).await?;
+			assert_eq!(ad_reply, TransitStatus::Ok, "the gateway admits the advertisement");
+			assert_eq!(gateway.peer_servlets()?.len(), 1, "the advertisement installs the relay's ping route");
 
-			trace.event_with(GOSSIP_ROUTES_AFTER_SCORING, &[], gateway.peer_routes()?.len() as u64)?;
+			// The scenario sends one more relay than the abandonment budget.
+			// Each relay carries a valid origin-signed rumor, so the
+			// over-radius hop lifetime alone draws the refusal.
+			let refused = over_radius_relays(&certs, &gateway, CONTAINMENT_ABANDON_LIMIT + 1).await?;
+			let expected = [TransitStatus::PermissionDenied; CONTAINMENT_ABANDON_LIMIT as usize + 1];
+			assert_eq!(refused, expected, "the gateway refuses each over-radius relay");
 
 			let honest = mint_origin_rumor(
 				&certs.key,
@@ -1367,13 +1265,35 @@ tb_scenario! {
 			)
 			.await?;
 			let frame = signed_relay_gossip(&certs.key, b"honest-relay", honest, 0).await?;
-			send_gossip_frame(&trace, &certs, &gateway, frame).await?;
+			let replied = send_gossip_frame(&certs, &gateway, frame).await?;
+			assert_eq!(replied, TransitStatus::Ok, "the gateway admits the rumor");
 
 			gateway.stop();
 			hive.stop();
 			Ok(())
 		}
 	}
+}
+
+/// Relays `count` valid origin-signed rumors to `gateway`, each in an envelope
+/// one hop past the radius cap, and returns the status of each reply.
+async fn over_radius_relays(
+	certs: &ClusterTestCerts,
+	gateway: &ClusterGateway,
+	count: u32,
+) -> Result<Vec<TransitStatus>, TightBeamError> {
+	let mut statuses = Vec::new();
+	for index in 0..count {
+		let index_octet = u8::try_from(index).expect("a fixture count fits a u8");
+		let rumor_id = [b'r', index_octet];
+		let rumor =
+			mint_origin_rumor(&certs.key, &rumor_id, rumor_body(encode(&PingRequest { value: index })?)).await?;
+		let id = [b'b', b'a', b'd', index_octet];
+		let frame = signed_relay_gossip(&certs.key, &id, rumor, u64::from(MAX_GOSSIP_TTL) + 1).await?;
+		statuses.push(send_gossip_frame(certs, gateway, frame).await?);
+	}
+
+	Ok(statuses)
 }
 
 /// A grey-hole [`GossipJournal`].
@@ -1453,25 +1373,21 @@ tb_assert_spec! {
 		mode: Accept,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(2), equals!(1u64)),
-			(PEER_AD_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
-			(GOSSIP_PUBLISH_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
-			(GOSSIP_CONVERGED, exactly!(1), equals!(1u64)),
+			(events::CLUSTER_GOSSIP_ADMITTED, at_least!(2)),
 			(events::CLUSTER_GOSSIP_DROP_SIGNAL, at_least!(3)),
-			(GOSSIP_GREY_HOLE_CONTAINED, exactly!(1), equals!(1u64)),
-			(events::CLUSTER_GOSSIP_ACCEPTED, exactly!(2))
+			(events::CLUSTER_PEER_ROUTE_ABANDONED, exactly!(1), equals!(1u64)),
+			(events::CLUSTER_GOSSIP_DELIVERED, exactly!(2))
 		]
 	}
 }
 
-// The beat contains a grey hole.
+// The beat contains a grey hole. B acknowledges every repair push with `Ok`
+// and retains nothing, so each round re-wants a digest A saw acknowledged.
 //
-// B acknowledges every repair push with `Ok` and retains nothing. Each
-// reconciliation round therefore re-wants a digest A already saw acknowledged.
-//
-// - A's beat reads the reappearance as a drop signal and weakens B's advertised work route once per round.
-// - A's beat abandons the route when its trial count reaches the limit.
-// - The rumor still converges to honest C through the same beat.
-// - The flood to B still runs off the static peer list, so only work routing drops the grey hole.
+// - A's beat reads each reappearance as a drop signal and weakens B's work route until it abandons it.
+// - The same beat carries the rumor to honest C (DELIVERED at A and C).
+// - B and C admit the slate rumors of A's beat, and B admits each repair again, so ADMITTED is a lower bound.
+// - The flood to B runs off the static peer list, so only work routing drops the grey hole.
 tb_scenario! {
 	name: cluster_gossip_abandons_grey_hole_peer,
 	spec: ClusterGossipGreyHoleSpec,
@@ -1481,7 +1397,7 @@ tb_scenario! {
 			start_scenario_rumor_hive(trace, &certs)
 		},
 		client: |HiveEnv { trace, context: certs, hive }| async move {
-			let (conf_c, journal_c) = gossip_cluster_conf(&certs, vec![]);
+			let (conf_c, _journal_c) = gossip_cluster_conf(&certs, vec![]);
 			let gateway_c = start_cluster(&trace, conf_c).await?;
 			let hive_c = start_scenario_rumor_hive(trace.share(), &certs).await?;
 			hive_c.register_with_cluster(gateway_c.addr()).await?;
@@ -1491,10 +1407,10 @@ tb_scenario! {
 				journal: Arc::new(AmnesiacJournal) as Arc<dyn GossipJournal>,
 				..Default::default()
 			};
-			let gateway_b = start_cluster(&trace, conf_b).await?;
 
+			let gateway_b = start_cluster(&trace, conf_b).await?;
 			let peers_a = vec![gateway_b.addr().to_string(), gateway_c.addr().to_string()];
-			let (mut conf_a, journal_a) = gossip_cluster_conf(&certs, peers_a);
+			let (mut conf_a, _journal_a) = gossip_cluster_conf(&certs, peers_a);
 			conf_a.peer.advertise_interval = Some(Duration::from_millis(100));
 			conf_a.pheromone.abandonment_limit = CONTAINMENT_ABANDON_LIMIT;
 
@@ -1504,7 +1420,9 @@ tb_scenario! {
 			// B advertises a ping route dialed at the same address A
 			// reconciles with, so the drop signals have a trail to weaken.
 			let dial = gateway_b.addr().to_string();
-			advertise_peer(&trace, &certs, &gateway_a, dial.as_bytes(), vec![servlet_urn("ping")]).await?;
+			let ad_reply = advertise_peer(&certs, &gateway_a, dial.as_bytes(), vec![servlet_urn("ping")]).await?;
+			assert_eq!(ad_reply, TransitStatus::Ok, "the gateway admits the advertisement");
+			assert_eq!(gateway_a.peer_servlets()?.len(), 1, "B's advertisement installs its ping route at A");
 
 			let frame = hive_publish_gossip(
 				&certs,
@@ -1513,16 +1431,13 @@ tb_scenario! {
 				0,
 			)
 			.await?;
-			send_gossip_frame(&trace, &certs, &gateway_a, frame).await?;
+			let replied = send_gossip_frame(&certs, &gateway_a, frame).await?;
+			assert_eq!(replied, TransitStatus::Ok, "the gateway admits the rumor");
 
-			// Honest convergence comes first: A holds its own publish, and the
-			// beat repairs C. B stays unconverged by design.
-			let converged =
-				wait_for_gossip_converged(&[journal_a, journal_c], 1, 50, Duration::from_millis(100)).await;
-			trace.event_with(GOSSIP_CONVERGED, &[], u64::from(converged))?;
-
-			let contained = wait_for_no_peer_routes(&gateway_a, 100, Duration::from_millis(100)).await;
-			trace.event_with(GOSSIP_GREY_HOLE_CONTAINED, &[], u64::from(contained))?;
+			// Honest delivery comes first: A delivers its own publish, and the
+			// beat repairs C. B delivers nothing by design.
+			wait_for_recorded(&trace, events::CLUSTER_GOSSIP_DELIVERED, 2, 50).await;
+			wait_for_recorded(&trace, events::CLUSTER_PEER_ROUTE_ABANDONED, 1, 100).await;
 
 			gateway_a.stop();
 			gateway_b.stop();
@@ -1539,23 +1454,18 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(PEER_AD_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
-			(PEER_ROUTES_AFTER, exactly!(1), equals!(1u64)),
-			(GOSSIP_RELAY_STATUS, exactly!(1), equals!(TransitStatus::PermissionDenied)),
-			(events::CLUSTER_GOSSIP_REFUSED, exactly!(1)),
+			(events::CLUSTER_PEER_ADVERTISED, exactly!(1)),
+			(events::CLUSTER_PEER_ADVERTISE_REFUSED, absent!()),
+			(events::CLUSTER_GOSSIP_REFUSED, exactly!(1), equals!(TransitStatus::PermissionDenied)),
 			(events::CLUSTER_GOSSIP_RELAY_WEAKENED, exactly!(1)),
-			(events::CLUSTER_GOSSIP_ACCEPTED, exactly!(0))
+			(events::CLUSTER_GOSSIP_DELIVERED, exactly!(0))
 		]
 	}
 }
 
-// The gateway scores a relay that tampers with a rumor.
-//
-// A trusted peer forwards an origin-signed rumor whose content it altered,
-// which breaks the origin signature.
-//
-// - The gateway refuses it with PermissionDenied and weakens the relay's advertised routes.
-// - An honest relay verifies a rumor before it forwards it.
+// A trusted peer that alters an origin-signed rumor breaks its signature, so
+// the gateway refuses it with PermissionDenied and weakens the relay's
+// advertised routes. An honest relay verifies a rumor before it forwards it.
 tb_scenario! {
 	name: cluster_gossip_weakens_tampered_relay,
 	spec: ClusterGossipTamperedRelaySpec,
@@ -1564,8 +1474,10 @@ tb_scenario! {
 		start: |SetupEnv { trace, context: certs }| async move {
 			start_cluster(&trace, containment_cluster_conf(&certs)).await
 		},
-		client: |ClusterEnv { trace, context: certs, cluster }| async move {
-			install_ping_peer(&trace, &certs, &cluster).await?;
+		client: |ClusterEnv { context: certs, cluster, .. }| async move {
+			let ad_reply = install_ping_peer(&certs, &cluster).await?;
+			assert_eq!(ad_reply, TransitStatus::Ok, "the gateway admits the advertisement");
+			assert_eq!(cluster.peer_servlets()?.len(), 1, "the advertisement installs the relay's ping route");
 
 			let signed_body = encode(&rumor_body(encode(&PingRequest { value: 21 })?))?;
 			let forged_body = encode(&rumor_body(encode(&PingRequest { value: 99 })?))?;
@@ -1578,7 +1490,8 @@ tb_scenario! {
 
 			let rumor = TestFrame::tamper(&signed, &signed_body, &forged_body);
 			let frame = signed_relay_gossip(&certs.key, b"tamper-relay", rumor, 0).await?;
-			send_gossip_frame_as(&trace, &certs, &cluster, frame, GOSSIP_RELAY_STATUS).await?;
+			let replied = send_gossip_frame(&certs, &cluster, frame).await?;
+			assert_eq!(replied, TransitStatus::PermissionDenied, "the gateway refuses the tampered rumor");
 
 			cluster.stop();
 			Ok(())
@@ -1591,28 +1504,23 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(PEER_AD_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
-			(PEER_ROUTES_AFTER, exactly!(1), equals!(1u64)),
-			(GOSSIP_RELAY_STATUS, exactly!(1), equals!(TransitStatus::Unauthenticated)),
-			(GOSSIP_LIMITED_STATUS, exactly!(2), equals!(TransitStatus::ResourceExhausted)),
+			(events::CLUSTER_PEER_ADVERTISED, exactly!(1)),
+			(events::CLUSTER_PEER_ADVERTISE_REFUSED, absent!()),
 			(events::CLUSTER_GOSSIP_ORIGIN_UNKNOWN, exactly!(1)),
 			(events::CLUSTER_GOSSIP_REFUSED, exactly!(3)),
 			(events::CLUSTER_GOSSIP_RELAY_WEAKENED, exactly!(0)),
-			(events::CLUSTER_GOSSIP_ACCEPTED, exactly!(0)),
-			(PEER_ROUTES_AFTER_UNKNOWN_ORIGIN, exactly!(1), equals!(1u64))
+			(events::CLUSTER_GOSSIP_DELIVERED, exactly!(0))
 		]
 	}
 }
 
-// An origin outside this gateway's trust is the edge of a subnet.
+// An origin outside this gateway's trust is the edge of a subnet. A trusted
+// relay with a one-token bucket offers two rumors of such an origin.
 //
-// A trusted peer relays two rumors whose origin lies outside the gateway's
-// trust. The relay's own rate bucket holds one token.
-//
-// - The first rumor draws Unauthenticated, which tells the relay to stop its offers of that origin.
-// - The drop spends the relay's one token, so the second answers ResourceExhausted.
-// - The token came from the relay's own bucket, so the gateway limits the relay's own rumor too.
-// - The gateway leaves the relay unscored, so its routes stay (PEER_ROUTES_AFTER_UNKNOWN_ORIGIN).
+// - The first draws Unauthenticated, which tells the relay to stop its offers of that origin.
+// - The drop spends the relay's token, so the second and the relay's own rumor draw ResourceExhausted.
+// - The gateway leaves the relay unscored (RELAY_WEAKENED exactly 0), so its routes stay.
+// - The three refusals carry two statuses, so the spec counts them and the body asserts each status.
 tb_scenario! {
 	name: cluster_gossip_unknown_origin_costs_the_relay_a_token_and_no_score,
 	spec: ClusterGossipUnknownOriginSpec,
@@ -1624,20 +1532,25 @@ tb_scenario! {
 			conf.gossip.admission = Arc::new(one_token) as Arc<dyn GossipAdmission>;
 			start_cluster(&trace, conf).await
 		},
-		client: |ClusterEnv { trace, context: certs, cluster }| async move {
-			install_ping_peer(&trace, &certs, &cluster).await?;
+		client: |ClusterEnv { context: certs, cluster, .. }| async move {
+			let ad_reply = install_ping_peer(&certs, &cluster).await?;
+			assert_eq!(ad_reply, TransitStatus::Ok, "the gateway admits the advertisement");
+			assert_eq!(cluster.peer_servlets()?.len(), 1, "the advertisement installs the relay's ping route");
 			let (_unenrolled, outsider_key) = member_identity("Origin Outside Trust");
 
-			relay_application_rumor(&trace, &certs, &cluster, &outsider_key, &certs.key, "outsider-1").await?;
-
 			let relay = &certs.key;
-			let limited = RumorRelay { origin_key: &outsider_key, relay_key: relay, marker: GOSSIP_LIMITED_STATUS };
-			limited.send(&trace, &certs, &cluster, "outsider-2").await?;
-			let own = RumorRelay { origin_key: relay, relay_key: relay, marker: GOSSIP_LIMITED_STATUS };
-			own.send(&trace, &certs, &cluster, "relay-own").await?;
+			let outsider = RumorRelay { origin_key: &outsider_key, relay_key: relay };
+			let status = outsider.send(&certs, &cluster, "outsider-1").await?;
+			assert_eq!(status, TransitStatus::Unauthenticated, "the gateway answers an origin outside its trust");
 
-			let routes = cluster.peer_routes()?.len();
-			trace.event_with(PEER_ROUTES_AFTER_UNKNOWN_ORIGIN, &[], count_u64(routes))?;
+			let limited = RumorRelay { origin_key: &outsider_key, relay_key: relay };
+			let status = limited.send(&certs, &cluster, "outsider-2").await?;
+			assert_eq!(status, TransitStatus::ResourceExhausted, "the drop spent the relay's one token");
+
+			let own = RumorRelay { origin_key: relay, relay_key: relay };
+			let status = own.send(&certs, &cluster, "relay-own").await?;
+			assert_eq!(status, TransitStatus::ResourceExhausted, "the relay's own rumor draws on the same bucket");
+			assert_eq!(cluster.peer_routes()?.len(), 1, "the relay's route survives the refusals");
 
 			cluster.stop();
 			Ok(())
@@ -1679,23 +1592,23 @@ fn partial_trust_ctx() -> PartialTrustCtx {
 }
 
 /// Places one rumor of `origin` at `cluster`, which the origin itself relays
-/// with `hop_ttl` hops left, and records the status as `GOSSIP_RELAY_STATUS`.
+/// with `hop_ttl` hops left, and returns the status of the reply.
 async fn place_origin_rumor(
-	trace: &TraceCollector,
 	connect_certs: &ClusterTestCerts,
 	cluster: &ClusterGateway,
 	origin: &Secp256k1SigningKey,
 	label: impl AsRef<str>,
 	hop_ttl: u64,
-) -> Result<(), TightBeamError> {
-	let relay = RumorRelay { origin_key: origin, relay_key: origin, marker: GOSSIP_RELAY_STATUS };
-	relay.send_with_hops(trace, connect_certs, cluster, label, hop_ttl).await
+) -> Result<TransitStatus, TightBeamError> {
+	let relay = RumorRelay { origin_key: origin, relay_key: origin };
+	relay.status_with_hops(connect_certs, cluster, label, hop_ttl).await
 }
 
 /// Polls until a peer has refused `count` origins, or five seconds pass.
-pub async fn wait_for_refused_origins(trace: &TraceCollector, count: usize) -> bool {
-	let refused = || trace.recorded(events::CLUSTER_GOSSIP_ORIGIN_REFUSED_BY_PEER) >= count;
-	poll_until(50, Duration::from_millis(100), refused).await
+///
+/// The spec judges the count, so the wait answers nothing.
+pub async fn wait_for_refused_origins(trace: &TraceCollector, count: usize) {
+	wait_for_recorded(trace, events::CLUSTER_GOSSIP_ORIGIN_REFUSED_BY_PEER, count, 50).await;
 }
 
 tb_assert_spec! {
@@ -1703,8 +1616,7 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(GOSSIP_RELAY_STATUS, exactly!(3), equals!(TransitStatus::Ok)),
-			(GOSSIP_ORIGIN_SETTLED, exactly!(2), equals!(true)),
+			(events::CLUSTER_GOSSIP_ADMITTED, at_least!(3)),
 			(events::CLUSTER_GOSSIP_ORIGIN_UNKNOWN, exactly!(2)),
 			(events::CLUSTER_GOSSIP_ORIGIN_REFUSED_BY_PEER, exactly!(2)),
 			(events::CLUSTER_GOSSIP_RELAY_WEAKENED, exactly!(0)),
@@ -1713,16 +1625,15 @@ tb_assert_spec! {
 	}
 }
 
-// A target that refuses an origin gets that origin once.
-//
-// The bridge holds rumors of two origins outside the edge's trust and beats on
-// a clock only this test moves. Each origin costs one refusal at the edge, by
-// repair for the first and by reflood for the second.
+// A target that refuses an origin gets that origin once. The bridge holds
+// rumors of two origins outside the edge's trust, and only this test moves
+// the clock of its beat.
 //
 // - The first beat's repair pushes the first origin's rumor from the journal, and the edge refuses it.
 // - The bridge withholds a second rumor of that origin from the edge, because the refusal stands.
 // - The second origin's rumor refloods at once, and the edge refuses it.
-// - Three more beats push neither origin again, although the edge still lacks all three rumors.
+// - Three more beats push neither origin again, although the edge lacks all three rumors.
+// - The edge also admits the slate rumors of the bridge's beat, so ADMITTED is a lower bound.
 tb_scenario! {
 	name: cluster_gossip_refused_origin_is_offered_to_that_target_once,
 	spec: ClusterGossipRefusedOriginSpec,
@@ -1738,17 +1649,19 @@ tb_scenario! {
 			let peers_of_bridge = Arc::clone(&ctx.peers_of_bridge);
 			let mut bridge_conf = federation_conf(&ctx.bridge, peers_of_bridge, vec![cluster.addr().to_string()], 1);
 			bridge_conf.clock = Arc::clone(&clock) as Arc<dyn Clock>;
+
 			let bridge = start_cluster(&trace, bridge_conf).await?;
-
-			place_origin_rumor(&trace, &ctx.bridge, &bridge, &ctx.first_origin, "first-origin-held", 0).await?;
+			let held = place_origin_rumor(&ctx.bridge, &bridge, &ctx.first_origin, "first-origin-held", 0).await?;
+			assert_eq!(held, TransitStatus::Ok, "the bridge admits the first origin's rumor");
 			drive_until_advertised(&clock, &trace, 1).await;
-			let repair_settled = wait_for_refused_origins(&trace, 1).await;
-			trace.event_with(GOSSIP_ORIGIN_SETTLED, &[], repair_settled)?;
+			wait_for_refused_origins(&trace, 1).await;
 
-			place_origin_rumor(&trace, &ctx.bridge, &bridge, &ctx.first_origin, "first-origin-again", 1).await?;
-			place_origin_rumor(&trace, &ctx.bridge, &bridge, &ctx.second_origin, "second-origin", 1).await?;
-			let reflood_settled = wait_for_refused_origins(&trace, 2).await;
-			trace.event_with(GOSSIP_ORIGIN_SETTLED, &[], reflood_settled)?;
+			let again = place_origin_rumor(&ctx.bridge, &bridge, &ctx.first_origin, "first-origin-again", 1).await?;
+			assert_eq!(again, TransitStatus::Ok, "the bridge admits a second rumor of the first origin");
+
+			let second = place_origin_rumor(&ctx.bridge, &bridge, &ctx.second_origin, "second-origin", 1).await?;
+			assert_eq!(second, TransitStatus::Ok, "the bridge admits the second origin's rumor");
+			wait_for_refused_origins(&trace, 2).await;
 
 			let beats_so_far = trace.recorded(events::CLUSTER_PEER_ADVERTISED);
 			drive_until_advertised(&clock, &trace, beats_so_far + 3).await;
@@ -1794,7 +1707,6 @@ fn neighbor_colony_ctx() -> NeighborColonyCtx {
 	let neighbor = neighbor_colony_certs();
 	let stranger = stranger_gateway_certs();
 	let peer_trust = combined_trust(&[&gateway.cert, &neighbor.cert, &stranger.cert]);
-
 	NeighborColonyCtx { gateway, neighbor_key: neighbor.key, stranger_key: stranger.key, peer_trust }
 }
 
@@ -1803,30 +1715,24 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(PEER_AD_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
-			(PEER_ROUTES_AFTER, exactly!(1), equals!(1u64)),
-			(GOSSIP_RELAY_STATUS, exactly!(2), equals!(TransitStatus::Ok)),
-			(GOSSIP_STRANGER_STATUS, exactly!(3), equals!(TransitStatus::PermissionDenied)),
-			(events::CLUSTER_GOSSIP_REFUSED, exactly!(3)),
+			(events::CLUSTER_PEER_ADVERTISED, exactly!(1)),
+			(events::CLUSTER_PEER_ADVERTISE_REFUSED, absent!()),
+			(events::CLUSTER_GOSSIP_ADMITTED, exactly!(2)),
+			(events::CLUSTER_GOSSIP_REFUSED, exactly!(3), equals!(TransitStatus::PermissionDenied)),
 			(events::CLUSTER_GOSSIP_RELAY_WEAKENED, exactly!(0)),
-			(GOSSIP_ROUTES_AFTER_SCORING, exactly!(1), equals!(1u64))
+			(events::CLUSTER_PEER_ROUTE_ABANDONED, exactly!(0))
 		]
 	}
 }
 
 // A neighbor colony is inside the flood, and a trusted stranger is outside it.
+// The neighbor of colony "other" gossips and federates the work routes that
+// its advertisement installs, and the stranger, a trusted identity with no
+// colony URN, draws PermissionDenied.
 //
-// A trusted peer of colony "other" gossips and federates the work routes its
-// advertisement installs. The gateway answers PermissionDenied to a trusted
-// identity with no colony URN.
-//
-// - Admitted: a rumor of colony "main" that the neighbor relays.
-// - Admitted: a rumor the neighbor signed itself.
-// - Refused: a rumor the stranger both signed and relays.
-// - Refused: a rumor of colony "main" that the stranger relays.
-// - Refused: a rumor the stranger signed and the neighbor relays.
-// - Each refusal is policy, so it weakens no route.
-// - The advertised route survives, although the abandonment limit of 1 lets one weaken event evict it.
+// - Admitted: a rumor of colony "main" that the neighbor relays, and a rumor the neighbor signed itself.
+// - Refused: a rumor that the stranger signs, relays, or both.
+// - Each refusal is policy and weakens no route, so the route survives an abandonment limit of 1.
 tb_scenario! {
 	name: cluster_gossip_admits_neighbor_colony_and_refuses_stranger,
 	spec: ClusterGossipNeighborColonySpec,
@@ -1837,9 +1743,8 @@ tb_scenario! {
 			conf.pheromone.abandonment_limit = 1;
 			start_cluster(&trace, conf).await
 		},
-		client: |ClusterEnv { trace, context: ctx, cluster }| async move {
-			advertise_peer_signed(
-				&trace,
+		client: |ClusterEnv { context: ctx, cluster, .. }| async move {
+			let ad_reply = advertise_peer_signed(
 				&ctx.gateway,
 				&ctx.neighbor_key,
 				&cluster,
@@ -1847,23 +1752,30 @@ tb_scenario! {
 				vec![servlet_urn("ping")],
 			)
 			.await?;
+			assert_eq!(ad_reply, TransitStatus::Ok, "the gateway admits the advertisement");
+			assert_eq!(cluster.peer_servlets()?.len(), 1, "the neighbor's advertisement installs its ping route");
 
 			let own_origin = &ctx.gateway.key;
 			let neighbor = &ctx.neighbor_key;
-			relay_application_rumor(&trace, &ctx.gateway, &cluster, own_origin, neighbor, "main-origin").await?;
-			relay_application_rumor(&trace, &ctx.gateway, &cluster, neighbor, neighbor, "other-origin").await?;
+			let replied = relay_application_rumor(&ctx.gateway, &cluster, own_origin, neighbor, "main-origin").await?;
+			assert_eq!(replied, TransitStatus::Ok, "the gateway admits the rumor");
+
+			let replied = relay_application_rumor(&ctx.gateway, &cluster, neighbor, neighbor, "other-origin").await?;
+			assert_eq!(replied, TransitStatus::Ok, "the gateway admits the rumor");
 
 			let stranger = &ctx.stranger_key;
-			let marker = GOSSIP_STRANGER_STATUS;
-			let all_stranger = RumorRelay { origin_key: stranger, relay_key: stranger, marker: marker.clone() };
-			all_stranger.send(&trace, &ctx.gateway, &cluster, "stranger").await?;
-			let stranger_relays = RumorRelay { origin_key: own_origin, relay_key: stranger, marker: marker.clone() };
-			stranger_relays.send(&trace, &ctx.gateway, &cluster, "stranger-relays").await?;
-			let stranger_signed = RumorRelay { origin_key: stranger, relay_key: neighbor, marker };
-			stranger_signed.send(&trace, &ctx.gateway, &cluster, "stranger-signed").await?;
+			let all_stranger = RumorRelay { origin_key: stranger, relay_key: stranger };
+			let replied = all_stranger.send(&ctx.gateway, &cluster, "stranger").await?;
+			assert_eq!(replied, TransitStatus::PermissionDenied, "the gateway refuses a stranger's own rumor");
 
-			let routes = cluster.peer_routes()?.len();
-			trace.event_with(GOSSIP_ROUTES_AFTER_SCORING, &[], count_u64(routes))?;
+			let stranger_relays = RumorRelay { origin_key: own_origin, relay_key: stranger };
+			let replied = stranger_relays.send(&ctx.gateway, &cluster, "stranger-relays").await?;
+			assert_eq!(replied, TransitStatus::PermissionDenied, "the gateway refuses a stranger's relay");
+
+			let stranger_signed = RumorRelay { origin_key: stranger, relay_key: neighbor };
+			let replied = stranger_signed.send(&ctx.gateway, &cluster, "stranger-signed").await?;
+			assert_eq!(replied, TransitStatus::PermissionDenied, "the gateway refuses a stranger's origin");
+			assert_eq!(cluster.peer_routes()?.len(), 1, "the advertised route survives the refusals");
 
 			cluster.stop();
 			Ok(())
@@ -1876,18 +1788,14 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(PEER_AD_STATUS, exactly!(1), equals!(TransitStatus::PermissionDenied)),
-			(PEER_ROUTES_AFTER, exactly!(1), equals!(0u64)),
-			(events::CLUSTER_PEER_ADVERTISE_REFUSED, exactly!(1))
+			(events::CLUSTER_PEER_ADVERTISE_REFUSED, exactly!(1), equals!(TransitStatus::PermissionDenied))
 		]
 	}
 }
 
-// A trusted identity with no colony URN federates nothing.
-//
-// Peer trust admits the stranger, so its advertisement verifies. The stranger
-// is outside the flood, so admission refuses the advertisement and installs no
-// route.
+// A trusted identity with no colony URN federates nothing. Peer trust admits
+// the stranger, so its advertisement verifies, and admission refuses it
+// because the stranger is outside the flood.
 tb_scenario! {
 	name: cluster_refuses_an_advertisement_from_a_stranger,
 	spec: ClusterStrangerAdvertisementSpec,
@@ -1897,10 +1805,12 @@ tb_scenario! {
 			let conf = peering_cluster_conf_with_trust(&ctx.gateway, Arc::clone(&ctx.peer_trust));
 			start_cluster(&trace, conf).await
 		},
-		client: |ClusterEnv { trace, context: ctx, cluster }| async move {
+		client: |ClusterEnv { context: ctx, cluster, .. }| async move {
 			let stranger = &ctx.stranger_key;
 			let types = vec![servlet_urn("ping")];
-			advertise_peer_signed(&trace, &ctx.gateway, stranger, &cluster, PEER_GATEWAY_ADDR, types).await?;
+			let ad_reply = advertise_peer_signed(&ctx.gateway, stranger, &cluster, PEER_GATEWAY_ADDR, types).await?;
+			assert_eq!(ad_reply, TransitStatus::PermissionDenied, "the gateway refuses a stranger's advertisement");
+			assert_eq!(cluster.peer_servlets()?.len(), 0, "a refused advertisement installs no route");
 
 			cluster.stop();
 			Ok(())
@@ -1950,22 +1860,17 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(GOSSIP_RELAY_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
-			(GOSSIP_LIMITED_STATUS, exactly!(1), equals!(TransitStatus::ResourceExhausted)),
-			(events::CLUSTER_GOSSIP_REFUSED, exactly!(1)),
+			(events::CLUSTER_GOSSIP_ADMITTED, exactly!(1)),
+			(events::CLUSTER_GOSSIP_REFUSED, exactly!(1), equals!(TransitStatus::ResourceExhausted)),
 			(events::CLUSTER_GOSSIP_RELAY_WEAKENED, exactly!(0)),
 			(events::CLUSTER_GOSSIP_DUPLICATE, exactly!(0))
 		]
 	}
 }
 
-// Rate admission keys on the rumor's origin, whichever peer relays it.
-//
-// A one-token bucket admits the origin's first rumor through relay A.
-//
-// - It refuses the same origin's second rumor through relay B with ResourceExhausted.
-// - An origin whose flood fans out through many relays spends one budget across them.
-// - The refusal is local policy, so the gateway leaves relay B's routes as they are.
+// Rate admission keys on the rumor's origin, whichever peer relays it: a
+// one-token bucket admits the first rumor through relay A and refuses the
+// second through relay B. The refusal is local policy, so B's routes stay.
 tb_scenario! {
 	name: cluster_gossip_relays_share_origin_budget,
 	spec: ClusterGossipOriginBudgetSpec,
@@ -1980,15 +1885,17 @@ tb_scenario! {
 			};
 			start_cluster(&trace, conf).await
 		},
-		client: |ClusterEnv { trace, context: ctx, cluster }| async move {
+		client: |ClusterEnv { context: ctx, cluster, .. }| async move {
 			let first = mint_origin_rumor(
 				&ctx.origin_key,
 				b"budget-rumor-1",
 				rumor_body(encode(&PingRequest { value: 21 })?),
 			)
 			.await?;
+
 			let frame = signed_relay_gossip(&ctx.relay_a_key, b"budget-relay-1", first, 0).await?;
-			send_gossip_frame_as(&trace, &ctx.gateway, &cluster, frame, GOSSIP_RELAY_STATUS).await?;
+			let replied = send_gossip_frame(&ctx.gateway, &cluster, frame).await?;
+			assert_eq!(replied, TransitStatus::Ok, "the gateway admits the rumor");
 
 			let second = mint_origin_rumor(
 				&ctx.origin_key,
@@ -1996,8 +1903,10 @@ tb_scenario! {
 				rumor_body(encode(&PingRequest { value: 22 })?),
 			)
 			.await?;
+
 			let frame = signed_relay_gossip(&ctx.relay_b_key, b"budget-relay-2", second, 0).await?;
-			send_gossip_frame_as(&trace, &ctx.gateway, &cluster, frame, GOSSIP_LIMITED_STATUS).await?;
+			let replied = send_gossip_frame(&ctx.gateway, &cluster, frame).await?;
+			assert_eq!(replied, TransitStatus::ResourceExhausted, "the origin's one token is spent through relay A");
 
 			cluster.stop();
 			Ok(())
@@ -2010,17 +1919,15 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(GOSSIP_PUBLISH_STATUS, exactly!(1), equals!(TransitStatus::PermissionDenied)),
-			(events::CLUSTER_GOSSIP_REFUSED, exactly!(1)),
-			(events::CLUSTER_GOSSIP_ACCEPTED, exactly!(0))
+			(events::CLUSTER_GOSSIP_REFUSED, exactly!(1), equals!(TransitStatus::PermissionDenied)),
+			(events::CLUSTER_GOSSIP_DELIVERED, exactly!(0))
 		]
 	}
 }
 
 // A gateway whose own certificate carries no colony URN SAN is outside every
-// colony, so it has no flood scope.
-//
-// - It refuses origin publishes with PermissionDenied, even from a trusted hive-plane signer.
+// colony, so it has no flood scope and refuses an origin publish with
+// PermissionDenied, even from a trusted hive-plane signer.
 tb_scenario! {
 	name: cluster_gossip_non_member_gateway_refuses_publish,
 	spec: ClusterGossipNonMemberSpec,
@@ -2034,7 +1941,7 @@ tb_scenario! {
 
 			start_cluster(&trace, conf).await
 		},
-		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+		client: |ClusterEnv { context: certs, cluster, .. }| async move {
 			let frame = hive_publish_gossip(
 				&certs,
 				b"non-member-rumor",
@@ -2042,7 +1949,9 @@ tb_scenario! {
 				0,
 			)
 			.await?;
-			send_gossip_frame(&trace, &certs, &cluster, frame).await?;
+
+			let replied = send_gossip_frame(&certs, &cluster, frame).await?;
+			assert_eq!(replied, TransitStatus::PermissionDenied, "a gateway outside every colony refuses the publish");
 
 			cluster.stop();
 			Ok(())
@@ -2055,22 +1964,15 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(GOSSIP_RECONCILE_MEMBER_WANT, exactly!(1), equals!(1u64)),
-			(GOSSIP_RECONCILE_NEIGHBOR_WANT, exactly!(1), equals!(1u64)),
-			(GOSSIP_RECONCILE_STRANGER_WANT, exactly!(1), equals!(0u64)),
-			(events::CLUSTER_GOSSIP_REFUSED, exactly!(1))
+			(events::CLUSTER_RECONCILE_ANSWERED, exactly!(2), equals!(1u64)),
+			(events::CLUSTER_GOSSIP_REFUSED, exactly!(1), equals!(TransitStatus::PermissionDenied))
 		]
 	}
 }
 
-// Flood membership gates reconciliation, the same scope the flood uses.
-//
-// A want list names local rumor state, and the follow-up repair push carries
-// rumor bytes.
-//
-// - A gateway of colony "main" receives the want list for a digest this gateway lacks.
-// - A gateway of colony "other" receives it too, because it is inside the flood.
-// - A trusted peer with no colony SAN gets an empty want, and the refusal fires one REFUSED event.
+// Flood membership gates reconciliation, because a want list names local
+// rumor state and the repair push carries rumor bytes. Members of "main" and
+// "other" get the want, and a trusted peer with no colony SAN gets it empty.
 tb_scenario! {
 	name: cluster_gossip_reconcile_requires_flood_membership,
 	spec: ClusterGossipReconcileMembershipSpec,
@@ -2080,17 +1982,20 @@ tb_scenario! {
 			let conf = peering_cluster_conf_with_trust(&ctx.gateway, Arc::clone(&ctx.peer_trust));
 			start_cluster(&trace, conf).await
 		},
-		client: |ClusterEnv { trace, context: ctx, cluster }| async move {
+		client: |ClusterEnv { trace: _, context: ctx, cluster }| async move {
 			let held = vec![vec![0xABu8; 32]];
 
 			let frame = signed_reconcile_gossip(&ctx.gateway.key, b"member-reconcile", held.clone()).await?;
-			send_reconcile_frame_as(&trace, &ctx.gateway, &cluster, frame, GOSSIP_RECONCILE_MEMBER_WANT).await?;
+			let member = reconcile_reply(&ctx.gateway, &cluster, frame).await?;
+			assert_eq!(member.want.len(), 1, "a member of colony main learns the digest the gateway lacks");
 
 			let frame = signed_reconcile_gossip(&ctx.neighbor_key, b"neighbor-reconcile", held.clone()).await?;
-			send_reconcile_frame_as(&trace, &ctx.gateway, &cluster, frame, GOSSIP_RECONCILE_NEIGHBOR_WANT).await?;
+			let neighbor = reconcile_reply(&ctx.gateway, &cluster, frame).await?;
+			assert_eq!(neighbor.want.len(), 1, "a member of colony other learns the digest the gateway lacks");
 
 			let frame = signed_reconcile_gossip(&ctx.stranger_key, b"stranger-reconcile", held).await?;
-			send_reconcile_frame_as(&trace, &ctx.gateway, &cluster, frame, GOSSIP_RECONCILE_STRANGER_WANT).await?;
+			let stranger = reconcile_reply(&ctx.gateway, &cluster, frame).await?;
+			assert!(stranger.want.is_empty(), "a peer outside the flood gets an empty want");
 
 			cluster.stop();
 			Ok(())
@@ -2142,20 +2047,15 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(GOSSIP_STATUS_BEFORE_SWITCH, exactly!(1), equals!(TransitStatus::PermissionDenied)),
-			(GOSSIP_STATUS_AFTER_SWITCH, exactly!(1), equals!(TransitStatus::Ok)),
-			(events::CLUSTER_GOSSIP_REFUSED, exactly!(1))
+			(events::CLUSTER_GOSSIP_REFUSED, exactly!(1), equals!(TransitStatus::PermissionDenied)),
+			(events::CLUSTER_GOSSIP_ADMITTED, exactly!(1))
 		]
 	}
 }
 
-// A peer enrolled while the gateway runs joins the flood at once.
-//
-// The gateway's peer trust holds the gateway alone. A neighbor relays one
-// rumor of its own before the operator enrolls it and one after.
-//
-// - The gateway refuses the first relay, because the signer is outside the store.
-// - The gateway admits the second with no restart, because every frame reads the store.
+// A peer enrolled while the gateway runs joins the flood at once, because
+// every frame reads the store. The gateway refuses the neighbor's rumor before
+// the operator enrolls it and admits the one after, with no restart.
 tb_scenario! {
 	name: cluster_gossip_admits_a_peer_enrolled_while_the_gateway_runs,
 	spec: ClusterTrustEnrolledAtRunTimeSpec,
@@ -2164,17 +2064,17 @@ tb_scenario! {
 		start: |SetupEnv { trace, context: ctx }| async move {
 			start_cluster(&trace, run_time_trust_conf(&ctx)).await
 		},
-		client: |ClusterEnv { trace, context: ctx, cluster }| async move {
+		client: |ClusterEnv { context: ctx, cluster, .. }| async move {
 			let neighbor = &ctx.neighbor.key;
-			let marker = GOSSIP_STATUS_BEFORE_SWITCH;
-			let before = RumorRelay { origin_key: neighbor, relay_key: neighbor, marker };
-			before.send(&trace, &ctx.local, &cluster, "before-enrollment").await?;
+			let before = RumorRelay { origin_key: neighbor, relay_key: neighbor };
+			let refused = before.send(&ctx.local, &cluster, "before-enrollment").await?;
+			assert_eq!(refused, TransitStatus::PermissionDenied, "the gateway refuses a signer outside its trust");
 
 			ctx.trust.switch();
 
-			let marker = GOSSIP_STATUS_AFTER_SWITCH;
-			let after = RumorRelay { origin_key: neighbor, relay_key: neighbor, marker };
-			after.send(&trace, &ctx.local, &cluster, "after-enrollment").await?;
+			let after = RumorRelay { origin_key: neighbor, relay_key: neighbor };
+			let admitted = after.send(&ctx.local, &cluster, "after-enrollment").await?;
+			assert_eq!(admitted, TransitStatus::Ok, "the gateway admits the signer it enrolled");
 
 			cluster.stop();
 			Ok(())
@@ -2187,40 +2087,32 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(PEER_EXPEL_ADDRESS_VERIFIED, exactly!(1), equals!(true)),
-			(GOSSIP_PUBLISH_STATUS, exactly!(2), equals!(TransitStatus::Ok)),
-			(GOSSIP_CONVERGED, exactly!(1), equals!(1u64)),
-			(PEER_EXPEL_TARGET_DROPPED, exactly!(1), equals!(true)),
-			(GOSSIP_HELD_AFTER_REMOVAL, exactly!(1), equals!(1u64)),
-			(GOSSIP_STATUS_AFTER_SWITCH, exactly!(1), equals!(TransitStatus::PermissionDenied))
+			(events::CLUSTER_GOSSIP_ADMITTED, exactly!(3)),
+			(events::CLUSTER_PEER_EXPELLED, exactly!(1)),
+			(events::CLUSTER_GOSSIP_REFUSED, exactly!(1), equals!(TransitStatus::PermissionDenied))
 		]
 	}
 }
 
 // A peer removed from trust while the gateway runs leaves the flood at once,
-// in both directions.
+// in both directions. The gateway, with no beat, sends the neighbor one rumor
+// over a pooled connection, and then the operator removes the neighbor.
 //
-// The gateway, with no beat, holds the neighbor as a verified target and
-// sends it one published rumor over a pooled connection. The operator then
-// removes the neighbor from peer trust, and the scenario publishes another.
-//
-// - The second rumor stays unsent, although the connection is still open (GOSSIP_HELD_AFTER_REMOVAL).
-// - The neighbor leaves the targets, as any gateway outside the flood does (PEER_EXPEL_TARGET_DROPPED).
-// - The gateway refuses a rumor the neighbor relays (GOSSIP_STATUS_AFTER_SWITCH).
+// - The gateway admits both rumors, and the neighbor admits the first alone, so ADMITTED counts three.
+// - The second rumor stays unsent, although the pooled connection is open.
+// - The neighbor leaves the targets as any gateway outside the flood does, and the gateway refuses its relay.
 tb_scenario! {
 	name: cluster_gossip_stops_at_a_peer_removed_from_trust_while_the_gateway_runs,
 	spec: ClusterTrustRemovedAtRunTimeSpec,
 	environment Bare {
 		context: trust_ctx_removing_the_neighbor(),
 		exec: |SetupEnv { trace, context: ctx }| async move {
-			let journal_of_neighbor = Arc::new(MemoryGossipJournal::default());
 			let neighbor_trust = combined_trust(&[&ctx.local.cert, &ctx.neighbor.cert]);
 			let neighbor_tls = cluster_tls_config_with_trust(&ctx.neighbor, None)
 				.with_hive_trust(Arc::clone(&neighbor_trust))
 				.with_peer_trust(neighbor_trust);
 
-			let mut neighbor_conf = ClusterConfig::new(neighbor_tls);
-			neighbor_conf.gossip.journal = Arc::clone(&journal_of_neighbor) as Arc<dyn GossipJournal>;
+			let neighbor_conf = ClusterConfig::new(neighbor_tls);
 
 			let neighbor = start_cluster(&trace, neighbor_conf).await?;
 			let conf = run_time_trust_conf(&ctx);
@@ -2229,32 +2121,26 @@ tb_scenario! {
 			let gateway = start_cluster(&trace, conf).await?;
 
 			let verified = table.promote(neighbor_addr, None, UnixMillis::now())?;
-			trace.event_with(PEER_EXPEL_ADDRESS_VERIFIED, &[], verified)?;
+			assert!(verified, "the table holds the neighbor as a verified target");
 
 			let body = rumor_body(encode(&PingRequest { value: 21 })?);
 			let frame = hive_publish_gossip(&ctx.local, b"before-removal", body, 1).await?;
-			send_gossip_frame(&trace, &ctx.local, &gateway, frame).await?;
-
-			let journals = [Arc::clone(&journal_of_neighbor)];
-			let converged = wait_for_gossip_converged(journals, 1, 50, Duration::from_millis(100)).await;
-			trace.event_with(GOSSIP_CONVERGED, &[], u64::from(converged))?;
+			let replied = send_gossip_frame(&ctx.local, &gateway, frame).await?;
+			assert_eq!(replied, TransitStatus::Ok, "the gateway admits the rumor");
+			wait_for_recorded(&trace, events::CLUSTER_GOSSIP_ADMITTED, 2, 50).await;
 
 			ctx.trust.switch();
 
 			let body = rumor_body(encode(&PingRequest { value: 22 })?);
 			let frame = hive_publish_gossip(&ctx.local, b"after-removal", body, 1).await?;
-			send_gossip_frame(&trace, &ctx.local, &gateway, frame).await?;
-
-			let dropped = wait_for_target_dropped(&table, neighbor_addr, 50, Duration::from_millis(100)).await;
-			trace.event_with(PEER_EXPEL_TARGET_DROPPED, &[], dropped)?;
-
-			let held = journal_of_neighbor.held_digests(UnixMillis::now())?.len();
-			trace.event_with(GOSSIP_HELD_AFTER_REMOVAL, &[], count_u64(held))?;
+			let replied = send_gossip_frame(&ctx.local, &gateway, frame).await?;
+			assert_eq!(replied, TransitStatus::Ok, "the gateway admits the rumor");
+			wait_for_recorded(&trace, events::CLUSTER_PEER_EXPELLED, 1, 50).await;
 
 			let neighbor_key = &ctx.neighbor.key;
-			let marker = GOSSIP_STATUS_AFTER_SWITCH;
-			let refused = RumorRelay { origin_key: neighbor_key, relay_key: neighbor_key, marker };
-			refused.send(&trace, &ctx.local, &gateway, "neighbor-after-removal").await?;
+			let refused = RumorRelay { origin_key: neighbor_key, relay_key: neighbor_key };
+			let replied = refused.send(&ctx.local, &gateway, "neighbor-after-removal").await?;
+			assert_eq!(replied, TransitStatus::PermissionDenied, "the gateway refuses a signer it removed");
 
 			gateway.stop();
 			neighbor.stop();
@@ -2300,24 +2186,20 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(PEER_EXPEL_ADDRESS_VERIFIED, exactly!(1), equals!(true)),
-			(GOSSIP_PUBLISH_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
-			(PEER_EXPEL_TARGET_DROPPED, exactly!(1), equals!(true)),
+			(events::CLUSTER_GOSSIP_ADMITTED, exactly!(1)),
+			(events::CLUSTER_PEER_EXPELLED, exactly!(1)),
 			(events::CLUSTER_GOSSIP_FANOUT_UNREACHED, exactly!(0)),
-			(GOSSIP_HELD_BY_AUTHORITY_LEAF, exactly!(1), equals!(0u64)),
-			(GOSSIP_RELAY_STATUS, exactly!(1), equals!(TransitStatus::PermissionDenied))
+			(events::CLUSTER_GOSSIP_REFUSED, exactly!(1), equals!(TransitStatus::PermissionDenied))
 		]
 	}
 }
 
-// A certificate authority in peer trust admits no gateway to the flood.
+// With no beat, a certificate authority in peer trust admits no gateway to the
+// flood.
 //
-// The gateway's peer trust holds its own certificate and an authority, which
-// issued a second gateway's certificate with a colony URN of the namespace.
-// The gateway holds that address as a verified target, and no beat runs.
-//
-// - The dial completes, because the handshake validates the chain (CLUSTER_GOSSIP_FANOUT_UNREACHED).
-// - The gateway sends no rumor, because the store holds no certificate for the leaf's key.
+// - The dial completes, because the handshake validates the chain (FANOUT_UNREACHED exactly 0).
+// - The store holds no certificate for the leaf's key, so the gateway sends no rumor and expels the leaf.
+// - The publishing gateway alone admits the rumor (ADMITTED = 1).
 // - The gateway refuses a rumor the leaf relays for the same reason, so both directions agree.
 tb_scenario! {
 	name: cluster_gossip_admits_no_gateway_through_a_certificate_authority,
@@ -2325,14 +2207,12 @@ tb_scenario! {
 	environment Bare {
 		context: authority_trust_ctx(),
 		exec: |SetupEnv { trace, context: ctx }| async move {
-			let journal_of_leaf = Arc::new(MemoryGossipJournal::default());
 			let leaf_trust = Arc::clone(&ctx.leaf.trust);
 			let leaf_tls = cluster_tls_config_with_trust(&ctx.leaf, None)
 				.with_hive_trust(Arc::clone(&leaf_trust))
 				.with_peer_trust(leaf_trust);
 
-			let mut leaf_conf = ClusterConfig::new(leaf_tls);
-			leaf_conf.gossip.journal = Arc::clone(&journal_of_leaf) as Arc<dyn GossipJournal>;
+			let leaf_conf = ClusterConfig::new(leaf_tls);
 
 			let leaf = start_cluster(&trace, leaf_conf).await?;
 			let tls = cluster_tls_config(&ctx.local).with_peer_trust(Arc::clone(&ctx.peer_trust));
@@ -2344,20 +2224,17 @@ tb_scenario! {
 			let gateway = start_cluster(&trace, conf).await?;
 
 			let verified = table.promote(leaf_addr, None, UnixMillis::now())?;
-			trace.event_with(PEER_EXPEL_ADDRESS_VERIFIED, &[], verified)?;
+			assert!(verified, "the table holds the leaf as a verified target");
 
 			let body = rumor_body(encode(&PingRequest { value: 21 })?);
 			let frame = hive_publish_gossip(&ctx.local, b"authority-rumor", body, 1).await?;
-			send_gossip_frame(&trace, &ctx.local, &gateway, frame).await?;
-
-			let dropped = wait_for_target_dropped(&table, leaf_addr, 50, Duration::from_millis(100)).await;
-			trace.event_with(PEER_EXPEL_TARGET_DROPPED, &[], dropped)?;
-
-			let held = journal_of_leaf.held_digests(UnixMillis::now())?.len();
-			trace.event_with(GOSSIP_HELD_BY_AUTHORITY_LEAF, &[], count_u64(held))?;
+			let replied = send_gossip_frame(&ctx.local, &gateway, frame).await?;
+			assert_eq!(replied, TransitStatus::Ok, "the gateway admits the rumor");
+			wait_for_recorded(&trace, events::CLUSTER_PEER_EXPELLED, 1, 50).await;
 
 			let leaf_key = &ctx.leaf.key;
-			relay_application_rumor(&trace, &ctx.local, &gateway, leaf_key, leaf_key, "authority-leaf").await?;
+			let replied = relay_application_rumor(&ctx.local, &gateway, leaf_key, leaf_key, "authority-leaf").await?;
+			assert_eq!(replied, TransitStatus::PermissionDenied, "the gateway refuses a rumor the leaf relays");
 
 			gateway.stop();
 			leaf.stop();
@@ -2371,23 +2248,15 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(PEER_AD_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
-			(PEER_ROUTES_AFTER, exactly!(1), equals!(1u64)),
-			(PEX_SHARED_BEFORE_EXPEL, exactly!(1), equals!(1u64)),
-			(PEX_SHARED_AFTER_EXPEL, exactly!(1), equals!(0u64)),
-			(PEER_ROUTES_AFTER_EXPEL, exactly!(1), equals!(1u64))
+			(events::CLUSTER_PEER_ADVERTISED, exactly!(1)),
+			(events::CLUSTER_PEER_ADVERTISE_REFUSED, absent!())
 		]
 	}
 }
 
-// Peer exchange withholds an address that the table expelled.
-//
-// A member's advertisement installs a route and teaches the table its address.
-// No beat runs, so the address stays a candidate until the scenario expels it,
-// as a probe does when a gateway outside the flood answers there.
-//
-// - While the table holds the address, a reconcile reply shares it (PEX_SHARED_BEFORE_EXPEL).
-// - After the expel the reply shares nothing, although the route stays (PEER_ROUTES_AFTER_EXPEL).
+// Peer exchange withholds an address that the table expelled. The advertised
+// address stays a candidate with no beat until the scenario expels it, as a
+// probe does on an answer from outside the flood. The body asserts each reply.
 tb_scenario! {
 	name: cluster_peer_exchange_drops_an_address_the_table_expelled,
 	spec: ClusterPexExpelledAddressSpec,
@@ -2398,20 +2267,22 @@ tb_scenario! {
 			let table = Arc::clone(conf.peer.table());
 			let advertised = dial_admitted_by(&conf, String::from_utf8_lossy(PEER_GATEWAY_ADDR));
 			let gateway = start_cluster(&trace, conf).await?;
-			install_ping_peer(&trace, &certs, &gateway).await?;
+			let ad_reply = install_ping_peer(&certs, &gateway).await?;
+			assert_eq!(ad_reply, TransitStatus::Ok, "the gateway admits the advertisement");
+			assert_eq!(gateway.peer_servlets()?.len(), 1, "the member's advertisement installs its ping route");
 
 			let frame = signed_reconcile_gossip(&certs.key, b"pex-before-expel", vec![]).await?;
 			let before = reconcile_reply(&certs, &gateway, frame).await?;
-			trace.event_with(PEX_SHARED_BEFORE_EXPEL, &[], count_u64(before.pex.len()))?;
+			assert_eq!(before.pex.len(), 1, "a reconcile reply shares the address the table holds");
 
 			table.expel(advertised)?;
 
 			let frame = signed_reconcile_gossip(&certs.key, b"pex-after-expel", vec![]).await?;
 			let after = reconcile_reply(&certs, &gateway, frame).await?;
-			trace.event_with(PEX_SHARED_AFTER_EXPEL, &[], count_u64(after.pex.len()))?;
+			assert!(after.pex.is_empty(), "a reconcile reply withholds an address the table expelled");
 
 			let routes = gateway.peer_routes()?.len();
-			trace.event_with(PEER_ROUTES_AFTER_EXPEL, &[], count_u64(routes))?;
+			assert_eq!(routes, 1, "the route that dials the expelled address stays");
 
 			gateway.stop();
 			Ok(())
@@ -2425,20 +2296,16 @@ tb_assert_spec! {
 		mode: Accept,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
-			(GOSSIP_PUBLISH_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
+			(events::CLUSTER_GOSSIP_ADMITTED, exactly!(1)),
 			(GOSSIP_INGRESS_SIGNED_BY_GATEWAY, exactly!(1), equals!(true)),
-			(events::CLUSTER_GOSSIP_ACCEPTED, exactly!(1))
+			(events::CLUSTER_GOSSIP_DELIVERED, exactly!(1))
 		]
 	}
 }
 
-// The ingress servlet receives the rumor as its origin signed it.
-//
-// A hive publishes, and the gateway signs the rumor and delivers it to the
-// ingress servlet before it answers the publish.
-//
-// - The servlet decodes a `GossipRumor` from the frame's message, so it reads the payload and the kind.
-// - The frame's signature verifies under the origin gateway's key (GOSSIP_INGRESS_SIGNED_BY_GATEWAY).
+// The ingress servlet receives the rumor as its origin gateway signed it,
+// before the gateway answers the publish. The frame's message decodes as a
+// `GossipRumor`, and the frame's signature verifies under the gateway's key.
 tb_scenario! {
 	name: cluster_gossip_ingress_receives_the_origin_signed_rumor,
 	spec: ClusterGossipIngressOriginSpec,
@@ -2454,7 +2321,8 @@ tb_scenario! {
 
 			let body = rumor_body(encode(&PingRequest { value: 21 })?);
 			let frame = hive_publish_gossip(&certs, b"ingress-origin-rumor", body, 0).await?;
-			send_gossip_frame(&trace, &certs, &gateway, frame).await?;
+			let replied = send_gossip_frame(&certs, &gateway, frame).await?;
+			assert_eq!(replied, TransitStatus::Ok, "the gateway admits the rumor");
 
 			gateway.stop();
 			hive.stop();
@@ -2468,11 +2336,11 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(REGISTER_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
-			(GOSSIP_PUBLISH_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
+			(events::CLUSTER_GOSSIP_ADMITTED, exactly!(1)),
 			(events::CLUSTER_DIAL_REFUSED, at_least!(1)),
 			(GOSSIP_INGRESS_SIGNED_BY_GATEWAY, exactly!(0)),
-			(events::CLUSTER_GOSSIP_ACCEPTED, exactly!(0))
+			(events::CLUSTER_GOSSIP_DELIVERED, exactly!(0))
 		]
 	}
 }
@@ -2501,11 +2369,12 @@ tb_scenario! {
 			let servlets = [servlet_info_signed_by("rumor", impostor.addr().to_string(), signer)];
 			let registered =
 				register_signed_hive_serving(&mut control, &hive_plane.key, b"impostor", hive_addr, servlets).await?;
-			trace.event_with(REGISTER_STATUS, &[], registered.status)?;
+			assert_eq!(registered.status, TransitStatus::Ok, "the gateway registers the hive that names the servlet");
 
 			let body = rumor_body(encode(&PingRequest { value: 21 })?);
 			let frame = hive_publish_gossip(&certs, b"ingress-impostor-rumor", body, 0).await?;
-			send_gossip_frame(&trace, &certs, &gateway, frame).await?;
+			let replied = send_gossip_frame(&certs, &gateway, frame).await?;
+			assert_eq!(replied, TransitStatus::Ok, "the gateway admits the rumor");
 
 			gateway.stop();
 			impostor.stop();
@@ -2516,8 +2385,8 @@ tb_scenario! {
 
 /// The fixture for the ingress-None delivery policy.
 ///
-/// The scenario needs the journal handle to observe retention and the retry
-/// set from outside.
+/// The scenario needs the journal handle to observe the retry set from
+/// outside.
 struct IngressNoneCtx {
 	certs: ClusterTestCerts,
 	journal: Arc<MemoryGossipJournal>,
@@ -2532,20 +2401,15 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(GOSSIP_PUBLISH_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
-			(events::CLUSTER_GOSSIP_ACCEPTED, exactly!(0)),
-			(GOSSIP_HELD_NO_INGRESS, exactly!(1), equals!(1u64)),
-			(GOSSIP_PENDING_NO_INGRESS, exactly!(1), equals!(1u64))
+			(events::CLUSTER_GOSSIP_ADMITTED, exactly!(1)),
+			(events::CLUSTER_GOSSIP_DELIVERED, exactly!(0))
 		]
 	}
 }
 
-// With no configured ingress the gateway journals and refloods only.
-//
-// - The gateway answers the publish Ok and retains it (held = 1).
-// - The gateway acks the record at once, so it stays out of the pending retry set.
-// - The gateway reports no local delivery (ACCEPTED = 0).
-// - The journal settles before the publish reply returns, so the probes need no poll.
+// With no ingress, the gateway journals and refloods only. It admits a publish
+// once the journal retains it and acks the record at once, off the pending
+// retry set, before the reply, so the probe needs no poll.
 tb_scenario! {
 	name: cluster_gossip_ingress_none_acks_on_record,
 	spec: ClusterGossipIngressNoneSpec,
@@ -2561,7 +2425,7 @@ tb_scenario! {
 			};
 			start_cluster(&trace, conf).await
 		},
-		client: |ClusterEnv { trace, context: ctx, cluster }| async move {
+		client: |ClusterEnv { context: ctx, cluster, .. }| async move {
 			let frame = hive_publish_gossip(
 				&ctx.certs,
 				b"ingress-none-rumor",
@@ -2569,13 +2433,11 @@ tb_scenario! {
 				0,
 			)
 			.await?;
-			send_gossip_frame(&trace, &ctx.certs, &cluster, frame).await?;
+			let replied = send_gossip_frame(&ctx.certs, &cluster, frame).await?;
+			assert_eq!(replied, TransitStatus::Ok, "the gateway admits the rumor");
 
-			let now = UnixMillis::now();
-			let held_one = ctx.journal.held_digests(now).is_ok_and(|digests| digests.len() == 1);
-			let none_pending = ctx.journal.pending_local(now).is_ok_and(|rumors| rumors.is_empty());
-			trace.event_with(GOSSIP_HELD_NO_INGRESS, &[], u64::from(held_one))?;
-			trace.event_with(GOSSIP_PENDING_NO_INGRESS, &[], u64::from(none_pending))?;
+			let pending = ctx.journal.pending_local(UnixMillis::now())?;
+			assert!(pending.is_empty(), "with no ingress the gateway acks the record at once");
 
 			cluster.stop();
 			Ok(())
@@ -2589,22 +2451,22 @@ tb_assert_spec! {
 		mode: Accept,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, at_least!(2), equals!(1u64)),
-			(GOSSIP_PUBLISH_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
+			(events::CLUSTER_GOSSIP_ADMITTED, at_least!(2)),
 			(events::CLUSTER_PEER_DISCOVERED, at_least!(2)),
-			(GOSSIP_CONVERGED, exactly!(1), equals!(1u64))
+			(events::CLUSTER_GOSSIP_DELIVERED, exactly!(2))
 		]
 	}
 }
 
-// The beat discovers peers from one seed through peer exchange.
-//
-// X anchors only seed S, S anchors publisher P, and P anchors nobody.
+// The beat discovers peers from one seed through peer exchange: X anchors seed
+// S alone, and S anchors publisher P.
 //
 // - S's beat verifies its anchor P and shares P over PEX.
 // - X learns P, feeler-probes it, proves its flood membership, and promotes it (CLUSTER_PEER_DISCOVERED).
 // - X's advertisement teaches P to dial back, and P promotes X the same way.
 // - A rumor that P publishes at ttl 0 moves by repair alone, so it reaches X's
-//   ingress only across those two discovered edges.
+//   ingress only across those two discovered edges (DELIVERED at P and X).
+// - Each gateway also admits the slate rumors of the others' beats, so ADMITTED is a lower bound.
 tb_scenario! {
 	name: cluster_peer_discovery_bootstraps_from_seed,
 	spec: ClusterPeerDiscoverySpec,
@@ -2614,7 +2476,7 @@ tb_scenario! {
 			start_scenario_rumor_hive(trace, &certs)
 		},
 		client: |HiveEnv { trace, context: certs, hive }| async move {
-			let (mut conf_p, journal_p) = gossip_cluster_conf(&certs, vec![]);
+			let (mut conf_p, _journal_p) = gossip_cluster_conf(&certs, vec![]);
 			conf_p.peer.advertise_interval = Some(Duration::from_millis(100));
 			let gateway_p = start_cluster(&trace, conf_p).await?;
 
@@ -2623,7 +2485,7 @@ tb_scenario! {
 			let table_s = Arc::clone(conf_s.peer.table());
 			let gateway_s = start_cluster(&trace, conf_s).await?;
 
-			let (mut conf_x, journal_x) = gossip_cluster_conf(&certs, vec![gateway_s.addr().to_string()]);
+			let (mut conf_x, _journal_x) = gossip_cluster_conf(&certs, vec![gateway_s.addr().to_string()]);
 			conf_x.peer.advertise_interval = Some(Duration::from_millis(100));
 			let table_x = Arc::clone(conf_x.peer.table());
 			let gateway_x = start_cluster(&trace, conf_x).await?;
@@ -2639,15 +2501,13 @@ tb_scenario! {
 				0,
 			)
 			.await?;
-			send_gossip_frame(&trace, &certs, &gateway_p, frame).await?;
-
-			let converged =
-				wait_for_gossip_converged(&[journal_p, journal_x], 1, 100, Duration::from_millis(100)).await;
-			trace.event_with(GOSSIP_CONVERGED, &[], u64::from(converged))?;
+			let replied = send_gossip_frame(&certs, &gateway_p, frame).await?;
+			assert_eq!(replied, TransitStatus::Ok, "the gateway admits the rumor");
+			wait_for_recorded(&trace, events::CLUSTER_GOSSIP_DELIVERED, 2, 100).await;
 
 			// The spec counts promotions, and each one is a beat apart from
-			// convergence. Wait for the beats this scenario is about before
-			// the scenario takes the gateways away from them.
+			// the delivery at X. Wait for the beats this scenario is about
+			// before the scenario takes the gateways away from them.
 			wait_for_promoted(&table_s, 1, 100, Duration::from_millis(100)).await;
 			wait_for_promoted(&table_x, 1, 100, Duration::from_millis(100)).await;
 
@@ -2661,70 +2521,53 @@ tb_scenario! {
 	}
 }
 
-tb_assert_spec! {
-	pub ClusterPeerEclipseBoundSpec,
-	V(1,0,0): {
-		mode: Accept,
-		assertions: [
-			(PEER_TABLE_FLOOD_ADMITTED, exactly!(1), equals!(MAX_PEER_BUCKET as u64)),
-			(PEER_TABLE_FLOOD_PROMOTED, exactly!(1), equals!(MAX_PEER_BUCKET as u64)),
-			(PEER_TABLE_ANCHOR_RETAINED, exactly!(1), equals!(true)),
-			(PEER_TABLE_TARGETS_BOUNDED, exactly!(1), equals!(true))
-		]
-	}
-}
+/// The discovery table bounds an eclipse attack.
+///
+/// An attacker inside one /16 prefix floods hints past the bucket cap and
+/// even passes every probe.
+///
+/// - Admission stops at the per-prefix cap.
+/// - Promotion into tried stops at the per-prefix cap.
+/// - The configured anchor keeps its first dial slot.
+/// - The target set stays bounded.
+/// - The beat always keeps a target outside the attacker's addresses.
+///
+/// # Sources
+///
+/// - Heilman, Kendler, Zohar & Goldberg (2015), eclipse attacks on Bitcoin's
+///   peer-to-peer network, at USENIX Security '15 and as ePrint 2015/263:
+///   - <https://www.usenix.org/conference/usenixsecurity15/technical-sessions/presentation/heilman>
+///   - <https://eprint.iacr.org/2015/263>
+/// - CWE-770, allocation of resources without limits or throttling:
+///   <https://cwe.mitre.org/data/definitions/770.html>
+#[test]
+fn cluster_peer_table_bounds_eclipse_flood() -> Result<(), TightBeamError> {
+	let certs = cluster_certs();
+	let anchor = peer_addr("127.0.0.1:9000");
+	let conf = peering_cluster_conf_with_peers(&certs, vec![anchor.to_string()]);
+	let table = Arc::clone(conf.peer.table());
+	let flood: Vec<PeerHint> = (0..MAX_PEER_BUCKET + 8)
+		.map(|host| PeerHint {
+			dial: dial_admitted_by(&conf, format!("10.66.0.{}:9000", host + 1)),
+			peer_id: None,
+		})
+		.collect();
 
-// The discovery table bounds an eclipse attack.
-//
-// An attacker inside one /16 prefix floods hints past the bucket cap and
-// even passes every probe.
-//
-// - Admission stops at the per-prefix cap.
-// - Promotion into tried stops at the per-prefix cap.
-// - The configured anchor keeps its first dial slot.
-// - The target set stays bounded.
-// - The beat always keeps a target outside the attacker's addresses.
-//
-// Sources:
-//
-// - Heilman, Kendler, Zohar & Goldberg (2015), eclipse attacks on Bitcoin's
-//   peer-to-peer network, at USENIX Security '15 and as ePrint 2015/263:
-//   - <https://www.usenix.org/conference/usenixsecurity15/technical-sessions/presentation/heilman>
-//   - <https://eprint.iacr.org/2015/263>
-// - CWE-770, allocation of resources without limits or throttling:
-//   <https://cwe.mitre.org/data/definitions/770.html>
-tb_scenario! {
-	name: cluster_peer_table_bounds_eclipse_flood,
-	spec: ClusterPeerEclipseBoundSpec,
-	environment Bare {
-		context: cluster_certs(),
-		exec: |SetupEnv { trace, context: certs }| {
-			let anchor = peer_addr("127.0.0.1:9000");
-			let conf = peering_cluster_conf_with_peers(&certs, vec![anchor.to_string()]);
-			let table = Arc::clone(conf.peer.table());
-			let flood: Vec<PeerHint> = (0..MAX_PEER_BUCKET + 8)
-				.map(|host| PeerHint {
-					dial: dial_admitted_by(&conf, format!("10.66.0.{}:9000", host + 1)),
-					peer_id: None,
-				})
-				.collect();
+	let admitted = table.learn(flood.clone(), UnixMillis::now())?;
+	assert_eq!(admitted, MAX_PEER_BUCKET, "admission stops at the per-prefix cap");
 
-			let admitted = table.learn(flood.clone(), UnixMillis::now()).unwrap_or_default();
-			trace.event_with(PEER_TABLE_FLOOD_ADMITTED, &[], admitted as u64)?;
+	// A full tried bucket answers a promotion with `Ok(false)`, so the
+	// count stops at the per-prefix cap.
+	let answers = flood.iter().map(|hint| table.promote(hint.dial, None, UnixMillis::now()));
+	let promotions: Vec<bool> = answers.collect::<Result<_, _>>()?;
+	let promoted = promotions.into_iter().filter(|promotion| *promotion).count();
+	assert_eq!(promoted, MAX_PEER_BUCKET, "promotion into tried stops at the per-prefix cap");
 
-			// A full tried bucket answers a promotion with `Ok(false)`, so the
-			// count stops at the per-prefix cap.
-			let answers = flood.iter().map(|hint| table.promote(hint.dial, None, UnixMillis::now()));
-			let promotions: Vec<bool> = answers.collect::<Result<_, _>>()?;
-			let promoted = promotions.into_iter().filter(|promotion| *promotion).count();
-			trace.event_with(PEER_TABLE_FLOOD_PROMOTED, &[], promoted as u64)?;
-
-			let targets = table.target_set().unwrap_or_default();
-			trace.event_with(PEER_TABLE_ANCHOR_RETAINED, &[], targets.first().map(AdmittedDial::address) == Some(anchor))?;
-			trace.event_with(PEER_TABLE_TARGETS_BOUNDED, &[], targets.len() <= MAX_PEER_BUCKET + 1)?;
-			Ok(())
-		}
-	}
+	let targets = table.target_set()?;
+	let first = targets.first().map(AdmittedDial::address);
+	assert_eq!(first, Some(anchor), "the configured anchor keeps the first dial slot");
+	assert!(targets.len() <= MAX_PEER_BUCKET + 1, "the target set stays bounded");
+	Ok(())
 }
 
 /// The fixture for the feeler-probe membership proof.
@@ -2788,37 +2631,22 @@ fn probing_cluster_conf(ctx: &NeighborGatewayCtx) -> ClusterConfig {
 	fast_probing_conf(&ctx.local, Arc::clone(&ctx.shared_trust))
 }
 
-/// Polls until the discovery table holds no new-bucket candidates, or the
-/// attempts run out.
-///
-/// Feeler probes run on the advertise beat's cadence, so only a poll can
-/// observe their outcome.
-async fn wait_for_new_candidates_drained(table: &PeerTable, attempts: u32, interval: Duration) -> bool {
-	let drained = || table.learned().is_ok_and(|(new_count, _)| new_count == 0);
-	poll_until(attempts, interval, drained).await
-}
-
 tb_assert_spec! {
 	pub ClusterPeerMembershipProbeSpec,
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(PEER_PROBE_HINTS_ADMITTED, exactly!(1), equals!(3u64)),
 			(events::CLUSTER_PEER_DISCOVERED, exactly!(2)),
-			(PEER_PROBE_MEMBER_PROMOTED, exactly!(1), equals!(true)),
-			(PEER_PROBE_NEIGHBOR_PROMOTED, exactly!(1), equals!(true)),
-			(PEER_PROBE_STRANGER_REFUSED, exactly!(1), equals!(true))
+			(events::CLUSTER_PEER_EXPELLED, exactly!(1))
 		]
 	}
 }
 
-// Feeler probes promote on flood membership.
+// Feeler probes promote on flood membership. Three hints name gateways of
+// colonies "main" and "other" and a TLS-trusted stranger with no colony URN,
+// and all three probes complete the handshake.
 //
-// Three learned hints name a gateway of colony "main", a gateway of colony
-// "other", and a TLS-trusted gateway whose certificate carries no colony URN.
-// All three probes complete the handshake.
-//
-// - Both colonies prove membership and join the beat targets (CLUSTER_PEER_DISCOVERED exactly twice).
+// - Both colonies prove membership and join the beat targets.
 // - The stranger leaves the new table through expel, so it holds no bucket slot and stays off the targets.
 //
 // Sources:
@@ -2851,13 +2679,15 @@ tb_scenario! {
 			];
 
 			let admitted = table.learn(hints, UnixMillis::now())?;
-			trace.event_with(PEER_PROBE_HINTS_ADMITTED, &[], count_u64(admitted))?;
+			assert_eq!(admitted, 3, "the table admits the three hints the probes start from");
 
-			let drained = wait_for_new_candidates_drained(&table, 50, Duration::from_millis(100)).await;
+			wait_for_recorded(&trace, events::CLUSTER_PEER_DISCOVERED, 2, 50).await;
+			wait_for_recorded(&trace, events::CLUSTER_PEER_EXPELLED, 1, 50).await;
+
 			let targets = table.target_set()?;
-			trace.event_with(PEER_PROBE_MEMBER_PROMOTED, &[], targets.contains(&member_addr))?;
-			trace.event_with(PEER_PROBE_NEIGHBOR_PROMOTED, &[], targets.contains(&neighbor_addr))?;
-			trace.event_with(PEER_PROBE_STRANGER_REFUSED, &[], drained && !targets.contains(&stranger_addr))?;
+			let joined = [member_addr, neighbor_addr].map(|addr| targets.contains(&addr));
+			assert_eq!(joined, [true, true], "both colonies join the beat targets");
+			assert!(!targets.contains(&stranger_addr), "the stranger stays off the beat targets");
 
 			prober.stop();
 			neighbor.stop();
@@ -2873,26 +2703,18 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(PEER_ROUTES_AFTER, exactly!(1), equals!(1u64)),
-			(PEER_EXPEL_ADDRESS_VERIFIED, exactly!(1), equals!(true)),
-			(PEER_EXPEL_TARGET_DROPPED, exactly!(1), equals!(true)),
 			(events::CLUSTER_PEER_EVICTED, exactly!(0)),
-			(events::CLUSTER_PEER_EXPELLED, at_least!(1)),
-			(PEER_ROUTES_AFTER_EXPEL, exactly!(1), equals!(1u64))
+			(events::CLUSTER_PEER_EXPELLED, at_least!(1))
 		]
 	}
 }
 
 // A verified peer that answers from outside the flood leaves the beat targets
-// and keeps its routes.
+// and keeps its routes. Its slate arrives under the local colony's key, and it
+// answers the next beat with a certificate that carries no colony URN.
 //
-// A slate arrives under the local colony's key from an address, and the table
-// holds that address as verified. The address answers the next beat with a
-// certificate that carries no colony URN.
-//
-// - The beat expels the address at its first answer, ahead of the failure threshold (CLUSTER_PEER_EVICTED).
-// - The expulsion is on the record (CLUSTER_PEER_EXPELLED), once or more,
-//   because a feeler probe can expel the address before the table verifies it.
+// - The beat expels the address at its first answer, ahead of the failure threshold (EVICTED exactly 0).
+// - A feeler probe can expel the address before the table verifies it, so EXPELLED counts once or more.
 // - The routes that dial the address stay: membership decides gossip, and the hop binding decides work.
 tb_scenario! {
 	name: cluster_peer_that_leaves_the_flood_leaves_the_targets_and_keeps_its_routes,
@@ -2909,16 +2731,23 @@ tb_scenario! {
 			let prober = start_cluster(&trace, prober_conf).await?;
 
 			// The slate gives the address routes to keep.
-			advertise_peer(&trace, &ctx.local, &prober, cluster.addr().to_string(), vec![servlet_urn("ping")]).await?;
+			let ad_reply = advertise_peer(&ctx.local, &prober, cluster.addr().to_string(), vec![servlet_urn("ping")]).await?;
+			assert_eq!(ad_reply, TransitStatus::Ok, "the gateway admits the advertisement");
+			assert_eq!(prober.peer_servlets()?.len(), 1, "the slate installs the ping route");
 
 			let verified = table.promote(outside_addr, None, UnixMillis::now())?;
-			trace.event_with(PEER_EXPEL_ADDRESS_VERIFIED, &[], verified)?;
+			assert!(verified, "the table holds the address as a verified target");
 
-			let dropped = wait_for_target_dropped(&table, outside_addr, 50, Duration::from_millis(100)).await;
-			trace.event_with(PEER_EXPEL_TARGET_DROPPED, &[], dropped)?;
+			// A feeler probe can expel the address ahead of the promotion, so
+			// the wait counts the expulsions that follow it.
+			let expelled = trace.recorded(events::CLUSTER_PEER_EXPELLED);
+			wait_for_recorded(&trace, events::CLUSTER_PEER_EXPELLED, expelled + 1, 50).await;
+
+			let targets = table.target_set()?;
+			assert!(!targets.contains(&outside_addr), "the beat drops the expelled address from its targets");
 
 			let routes = prober.peer_routes()?.len();
-			trace.event_with(PEER_ROUTES_AFTER_EXPEL, &[], count_u64(routes))?;
+			assert_eq!(routes, 1, "the routes that dial an expelled address stay");
 
 			prober.stop();
 			cluster.stop();
@@ -2932,23 +2761,15 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(PEER_ROUTES_AFTER, exactly!(1), equals!(1u64)),
-			(PEER_PROBE_STRANGER_REFUSED, exactly!(1), equals!(true)),
-			(events::CLUSTER_PEER_DISCOVERED, exactly!(0)),
-			(PEER_ROUTES_AFTER_EXPEL, exactly!(1), equals!(1u64))
+			(events::CLUSTER_PEER_EXPELLED, exactly!(1)),
+			(events::CLUSTER_PEER_DISCOVERED, exactly!(0))
 		]
 	}
 }
 
-// An unverified candidate that answers from outside the flood leaves the new
-// table and keeps its routes.
-//
-// A slate arrives under the local colony's key from an address, so the table
-// holds that address as an unverified candidate while the routes already dial
-// it. The feeler probe finds a certificate that carries no colony URN there.
-//
-// - The probe expels the candidate, so it holds no bucket slot and stays off the beat targets.
-// - The routes that dial the address stay (PEER_ROUTES_AFTER_EXPEL).
+// An unverified candidate that answers from outside the flood keeps its routes.
+// Its slate under the local colony's key installs them, and the feeler probe
+// finds no colony URN there, so it expels the candidate from the new table.
 tb_scenario! {
 	name: cluster_candidate_that_answers_outside_the_flood_keeps_its_routes,
 	spec: ClusterOutsideCandidateSpec,
@@ -2959,18 +2780,16 @@ tb_scenario! {
 		},
 		client: |ClusterEnv { trace, context: ctx, cluster }| async move {
 			let prober_conf = probing_cluster_conf(&ctx);
-			let table = Arc::clone(prober_conf.peer.table());
-			let outside_addr = dial_admitted_by(&prober_conf, cluster.addr().to_string());
 			let prober = start_cluster(&trace, prober_conf).await?;
 
-			advertise_peer(&trace, &ctx.local, &prober, cluster.addr().to_string(), vec![servlet_urn("ping")]).await?;
+			let ad_reply = advertise_peer(&ctx.local, &prober, cluster.addr().to_string(), vec![servlet_urn("ping")]).await?;
+			assert_eq!(ad_reply, TransitStatus::Ok, "the gateway admits the advertisement");
+			assert_eq!(prober.peer_servlets()?.len(), 1, "the slate installs the ping route");
 
-			let drained = wait_for_new_candidates_drained(&table, 50, Duration::from_millis(100)).await;
-			let targets = table.target_set()?;
-			trace.event_with(PEER_PROBE_STRANGER_REFUSED, &[], drained && !targets.contains(&outside_addr))?;
+			wait_for_recorded(&trace, events::CLUSTER_PEER_EXPELLED, 1, 50).await;
 
 			let routes = prober.peer_routes()?.len();
-			trace.event_with(PEER_ROUTES_AFTER_EXPEL, &[], count_u64(routes))?;
+			assert_eq!(routes, 1, "the routes that dial an expelled candidate stay");
 
 			prober.stop();
 			cluster.stop();
@@ -2979,37 +2798,20 @@ tb_scenario! {
 	}
 }
 
-/// Polls until the gateways refuse `count` advertisements, or five seconds
-/// pass.
-async fn wait_for_refused_advertisements(trace: &TraceCollector, count: usize) -> bool {
-	let refused = || trace.recorded(events::CLUSTER_PEER_ADVERTISE_REFUSED) >= count;
-	poll_until(50, Duration::from_millis(100), refused).await
-}
-
 tb_assert_spec! {
 	pub ClusterOutsideAnchorSpec,
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(PEER_ROUTES_AFTER, exactly!(1), equals!(1u64)),
-			(PEER_ANCHOR_BEATS_ANSWERED, exactly!(1), equals!(true)),
-			(PEER_ANCHOR_STILL_TARGET, exactly!(1), equals!(true)),
-			(events::CLUSTER_PEER_EVICTED, exactly!(0)),
-			(PEER_ROUTES_AFTER_BEATS, exactly!(1), equals!(1u64))
+			(events::CLUSTER_PEER_ADVERTISE_REFUSED, at_least!(2)),
+			(events::CLUSTER_PEER_EVICTED, exactly!(0))
 		]
 	}
 }
 
-// An anchor that answers from outside the flood keeps its slot and the routes
-// that dial it.
-//
-// An operator configured the anchor, so its address sits outside the learned
-// table. A slate under the local colony's key claims that address, and the
-// anchor answers each beat with a certificate that carries no colony URN.
-//
-// - The anchor refuses one advertisement per beat, so two refusals are two beats that dialed it.
-// - The anchor stays a beat target, because an operator configured it (PEER_ANCHOR_STILL_TARGET).
-// - The routes that dial the anchor stay (PEER_ROUTES_AFTER_BEATS).
+// An anchor that answers from outside the flood keeps its slot and routes,
+// because operator configuration puts it outside the learned table. Its
+// certificate carries no colony URN, so it refuses each beat's advertisement.
 tb_scenario! {
 	name: cluster_anchor_that_answers_outside_the_flood_keeps_its_slot_and_its_routes,
 	spec: ClusterOutsideAnchorSpec,
@@ -3025,19 +2827,23 @@ tb_scenario! {
 			let anchor_addr = dial_admitted_by(&prober_conf, &anchor);
 			let prober = start_cluster(&trace, prober_conf).await?;
 
-			advertise_peer(&trace, &ctx.local, &prober, &anchor, vec![servlet_urn("ping")]).await?;
+			let ad_reply = advertise_peer(&ctx.local, &prober, &anchor, vec![servlet_urn("ping")]).await?;
+			assert_eq!(ad_reply, TransitStatus::Ok, "the gateway admits the advertisement");
+			assert_eq!(prober.peer_servlets()?.len(), 1, "the slate installs the ping route");
 
 			// The count starts after the routes exist, so both beats ran over
 			// them.
 			let refused_so_far = trace.recorded(events::CLUSTER_PEER_ADVERTISE_REFUSED);
-			let beats_answered = wait_for_refused_advertisements(&trace, refused_so_far + 2).await;
-			trace.event_with(PEER_ANCHOR_BEATS_ANSWERED, &[], beats_answered)?;
+			wait_for_recorded(&trace, events::CLUSTER_PEER_ADVERTISE_REFUSED, refused_so_far + 2, 50).await;
+
+			let refused = trace.recorded(events::CLUSTER_PEER_ADVERTISE_REFUSED);
+			assert!(refused >= refused_so_far + 2, "two beats dial the anchor over the installed routes");
 
 			let targets = table.target_set()?;
-			trace.event_with(PEER_ANCHOR_STILL_TARGET, &[], targets.contains(&anchor_addr))?;
+			assert!(targets.contains(&anchor_addr), "a configured anchor keeps its beat slot");
 
 			let routes = prober.peer_routes()?.len();
-			trace.event_with(PEER_ROUTES_AFTER_BEATS, &[], count_u64(routes))?;
+			assert_eq!(routes, 1, "the routes that dial the anchor outlive its beats");
 
 			prober.stop();
 			cluster.stop();
@@ -3051,23 +2857,17 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(PEER_EXPEL_ADDRESS_VERIFIED, exactly!(1), equals!(true)),
-			(GOSSIP_PUBLISH_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
-			(PEER_EXPEL_TARGET_DROPPED, exactly!(1), equals!(true)),
+			(events::CLUSTER_GOSSIP_ADMITTED, exactly!(1)),
+			(events::CLUSTER_PEER_EXPELLED, exactly!(1)),
 			(events::CLUSTER_PEER_EVICTED, exactly!(0)),
 			(events::CLUSTER_GOSSIP_FANOUT_UNREACHED, exactly!(0))
 		]
 	}
 }
 
-// A reflood drops a target that answers from outside the flood.
-//
-// The table holds an address as verified, and no beat runs. A hive publishes a
-// rumor, and the address answers the reflood with a certificate that carries
-// no colony URN.
-//
-// - The hop sends no rumor, and the address leaves the targets at once (PEER_EXPEL_TARGET_DROPPED).
-// - The dial completes, so the unreached count stays at zero (CLUSTER_GOSSIP_FANOUT_UNREACHED).
+// A reflood drops a verified target that answers with no colony URN: the hop
+// sends no rumor, and the address leaves the targets at once. The dial
+// completes, so the unreached count (FANOUT_UNREACHED) stays at zero.
 tb_scenario! {
 	name: cluster_reflood_drops_a_target_that_answers_outside_the_flood,
 	spec: ClusterRefloodExpelSpec,
@@ -3081,19 +2881,19 @@ tb_scenario! {
 			let mut publisher_conf = probing_cluster_conf(&ctx);
 			publisher_conf.peer.advertise_interval = None;
 			publisher_conf.tls.hive_trust = Some(split_hive_trust(&ctx.local));
+
 			let table = Arc::clone(publisher_conf.peer.table());
 			let outside_addr = dial_admitted_by(&publisher_conf, cluster.addr().to_string());
 			let publisher = start_cluster(&trace, publisher_conf).await?;
 
 			let verified = table.promote(outside_addr, None, UnixMillis::now())?;
-			trace.event_with(PEER_EXPEL_ADDRESS_VERIFIED, &[], verified)?;
+			assert!(verified, "the table holds the address as a verified target");
 
 			let body = rumor_body(encode(&PingRequest { value: 21 })?);
 			let frame = hive_publish_gossip(&ctx.local, b"reflood-expel-rumor", body, 1).await?;
-			send_gossip_frame(&trace, &ctx.local, &publisher, frame).await?;
-
-			let dropped = wait_for_target_dropped(&table, outside_addr, 50, Duration::from_millis(100)).await;
-			trace.event_with(PEER_EXPEL_TARGET_DROPPED, &[], dropped)?;
+			let replied = send_gossip_frame(&ctx.local, &publisher, frame).await?;
+			assert_eq!(replied, TransitStatus::Ok, "the gateway admits the rumor");
+			wait_for_recorded(&trace, events::CLUSTER_PEER_EXPELLED, 1, 50).await;
 
 			publisher.stop();
 			cluster.stop();
@@ -3126,15 +2926,6 @@ pub async fn wait_for_promoted(table: &PeerTable, count: usize, attempts: u32, i
 	poll_until(attempts, interval, promoted).await
 }
 
-/// Polls until `addr` leaves the beat targets, or the attempts run out.
-///
-/// Eviction runs on the advertise beat's cadence, so only a poll can observe
-/// the outcome.
-async fn wait_for_target_dropped(table: &PeerTable, addr: AdmittedDial, attempts: u32, interval: Duration) -> bool {
-	let dropped = || table.target_set().is_ok_and(|targets| !targets.contains(&addr));
-	poll_until(attempts, interval, dropped).await
-}
-
 /// A live gateway that answers every reconcile round with one fixed
 /// peer-exchange sample.
 struct ReconcileReplier {
@@ -3142,8 +2933,6 @@ struct ReconcileReplier {
 	task: tokio::task::JoinHandle<()>,
 	/// The address the gateway answers at.
 	addr: String,
-	/// How many reconcile rounds the gateway has answered.
-	answered: Arc<AtomicUsize>,
 	/// The order of the last round the gateway answered, which the prober
 	/// stamps from its clock when the round starts.
 	last_order: Arc<AtomicU64>,
@@ -3162,19 +2951,15 @@ async fn start_reconcile_server(
 	let bind_addr = "127.0.0.1:0".parse::<TightBeamSocketAddr>()?;
 	let (listener, addr) = <TokioListener as EncryptedProtocol>::bind_with(bind_addr, config).await?;
 
-	let answered = Arc::new(AtomicUsize::new(0));
 	let last_order = Arc::new(AtomicU64::new(0));
-	let rounds = Arc::clone(&answered);
 	let orders = Arc::clone(&last_order);
 	let task = server! {
 		protocol TokioListener: listener,
 		handle: move |frame: Frame| {
-			let rounds = Arc::clone(&rounds);
 			let orders = Arc::clone(&orders);
 			let pex = pex.clone();
 			async move {
 				orders.store(frame.metadata().order(), Ordering::SeqCst);
-				rounds.fetch_add(1, Ordering::SeqCst);
 
 				Ok(Some(compose! {
 					V0: id: frame.metadata().id(),
@@ -3184,14 +2969,7 @@ async fn start_reconcile_server(
 		}
 	};
 
-	Ok(ReconcileReplier { task, addr: addr.to_string(), answered, last_order })
-}
-
-/// Polls until `replier` has answered `rounds` reconcile rounds, or five
-/// seconds pass.
-async fn wait_for_answered_rounds(replier: &ReconcileReplier, rounds: usize) -> bool {
-	let answered = || replier.answered.load(Ordering::SeqCst) >= rounds;
-	poll_until(50, Duration::from_millis(100), answered).await
+	Ok(ReconcileReplier { task, addr: addr.to_string(), last_order })
 }
 
 tb_assert_spec! {
@@ -3200,20 +2978,17 @@ tb_assert_spec! {
 		mode: Accept,
 		assertions: [
 			(events::CLUSTER_PEER_DISCOVERED, exactly!(0)),
-			(PEER_ABUSE_CANDIDATE_HELD_BACK, exactly!(1), equals!(true))
+			(events::CLUSTER_RECONCILE_FAILED, at_least!(2), equals!(true))
 		]
 	}
 }
 
-// An oversized reconcile reply is misbehavior, and its round fails.
+// An oversized reconcile reply is misbehavior, and its round fails. The rogue
+// passes the handshake and the membership proof on a valid same-colony
+// certificate, so its reply past MAX_PEX_SAMPLE is its one abuse.
 //
-// The rogue holds a valid same-colony certificate, so it passes the
-// handshake and the membership proof. Its reply exceeds MAX_PEX_SAMPLE, and
-// only the reply volume abuses the protocol.
-//
-// - The prober keeps the candidate unpromoted (CLUSTER_PEER_DISCOVERED exactly 0).
-// - The failed round stays on the candidate, which keeps its slot until a newcomer needs it.
-// - A second probe reaches it, which only a kept candidate can receive (PEER_ABUSE_CANDIDATE_HELD_BACK).
+// - The prober keeps the candidate unpromoted and charges it at each failed probe.
+// - The candidate keeps its slot until a newcomer needs it, so a second probe reaches it.
 tb_scenario! {
 	name: cluster_feeler_keeps_an_abusive_candidate_unpromoted,
 	spec: ClusterOversizedReplySpec,
@@ -3232,12 +3007,9 @@ tb_scenario! {
 			let prober = start_cluster(&trace, prober_conf).await?;
 
 			let admitted = table.learn(vec![PeerHint { dial: rogue_addr, peer_id: None }], UnixMillis::now())?;
+			assert_eq!(admitted, 1, "the table admits the rogue as a candidate");
 
-			let probed_twice = wait_for_answered_rounds(&rogue, 2).await;
-			let targets = table.target_set()?;
-			let held = table.learned()? == (1, 0);
-			let held_back = admitted == 1 && probed_twice && held && !targets.contains(&rogue_addr);
-			trace.event_with(PEER_ABUSE_CANDIDATE_HELD_BACK, &[], held_back)?;
+			wait_for_recorded(&trace, events::CLUSTER_RECONCILE_FAILED, 2, 50).await;
 
 			rogue.task.abort();
 			prober.stop();
@@ -3303,7 +3075,6 @@ fn recording_conf(
 /// stamp it holds then.
 async fn wait_for_stamp(store: &RecordingPeerStore, addr: AdmittedDial) -> Option<UnixMillis> {
 	poll_until(50, Duration::from_millis(100), || store.stamp_of(addr).is_some()).await;
-
 	store.stamp_of(addr)
 }
 
@@ -3324,54 +3095,46 @@ async fn beat_until_learned(clock: &ManualClock, store: &RecordingPeerStore, add
 	.await
 }
 
-tb_assert_spec! {
-	pub ClusterRelearnedHintStampSpec,
-	V(1,0,0): {
-		mode: Accept,
-		assertions: [
-			(PEER_RELEARNED_HINT_STAMPED, exactly!(1), equals!(true))
-		]
-	}
-}
+/// A hint that a peer-exchange reply teaches again carries the reading of the
+/// gateway's clock at the round that taught it.
+///
+/// - The prober learns the shared address and drops it, so the reply teaches it again.
+/// - The manual clock moves one beat at a time until the prober's store holds the address.
+/// - The replier records the round's order, which the prober stamps from its clock.
+/// - The persisted stamp of the address equals that reading.
+#[tokio::test]
+async fn cluster_relearned_hint_takes_the_clock_reading() -> Result<(), TightBeamError> {
+	let certs = cluster_certs();
+	let trace = TraceCollector::new();
+	let shared = PeerGossip { peer_id: Vec::new(), gateway_addr: b"10.66.0.1:9000".to_vec() };
+	let replier = start_reconcile_server(&certs, vec![shared]).await?;
 
-// A hint that a peer-exchange reply teaches again carries the reading of the
-// gateway's clock at the round that taught it.
-//
-// - The prober learns the shared address and drops it, so the reply teaches it again.
-// - The manual clock moves one beat at a time until the prober's store holds the address.
-// - The replier records the round's order, which the prober stamps from its clock.
-// - The persisted stamp of the address equals that reading (PEER_RELEARNED_HINT_STAMPED).
-tb_scenario! {
-	name: cluster_relearned_hint_takes_the_clock_reading,
-	spec: ClusterRelearnedHintStampSpec,
-	environment Bare {
-		context: cluster_certs(),
-		exec: |SetupEnv { trace, context: certs }| async move {
-			let shared = PeerGossip { peer_id: Vec::new(), gateway_addr: b"10.66.0.1:9000".to_vec() };
-			let replier = start_reconcile_server(&certs, vec![shared]).await?;
+	let clock = Arc::new(ManualClock::default());
+	let store = Arc::new(RecordingPeerStore::default());
+	let prober_conf = recording_conf(&certs, Arc::clone(&certs.trust), &clock, &store);
 
-			let clock = Arc::new(ManualClock::default());
-			let store = Arc::new(RecordingPeerStore::default());
-			let prober_conf = recording_conf(&certs, Arc::clone(&certs.trust), &clock, &store);
+	let table = Arc::clone(prober_conf.peer.table());
+	let shared_addr = dial_admitted_by(&prober_conf, "10.66.0.1:9000");
+	let replier_addr = dial_admitted_by(&prober_conf, &replier.addr);
+	table.learn(vec![PeerHint { dial: shared_addr, peer_id: None }], clock.unix())?;
+	table.discard(shared_addr)?;
+	table.learn(vec![PeerHint { dial: replier_addr, peer_id: None }], clock.unix())?;
 
-			let table = Arc::clone(prober_conf.peer.table());
-			let shared_addr = dial_admitted_by(&prober_conf, "10.66.0.1:9000");
-			let replier_addr = dial_admitted_by(&prober_conf, &replier.addr);
-			table.learn(vec![PeerHint { dial: shared_addr, peer_id: None }], clock.unix())?;
-			table.discard(shared_addr)?;
-			table.learn(vec![PeerHint { dial: replier_addr, peer_id: None }], clock.unix())?;
-			let prober = start_cluster(&trace, prober_conf).await?;
+	let prober = start_cluster(&trace, prober_conf).await?;
+	let relearned = beat_until_learned(&clock, &store, shared_addr).await;
+	assert!(relearned, "the prober learns the shared address again");
 
-			let relearned = beat_until_learned(&clock, &store, shared_addr).await;
-			let round_reading = UnixMillis::new(replier.last_order.load(Ordering::SeqCst));
-			let stamped = relearned && store.stamp_of(shared_addr) == Some(round_reading);
-			trace.event_with(PEER_RELEARNED_HINT_STAMPED, &[], stamped)?;
+	let round_reading = UnixMillis::new(replier.last_order.load(Ordering::SeqCst));
+	let stamp = store.stamp_of(shared_addr);
+	assert_eq!(
+		stamp,
+		Some(round_reading),
+		"the relearned hint carries the round's clock reading"
+	);
 
-			replier.task.abort();
-			prober.stop();
-			Ok(())
-		}
-	}
+	replier.task.abort();
+	prober.stop();
+	Ok(())
 }
 
 tb_assert_spec! {
@@ -3379,14 +3142,15 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(PEER_AD_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
-			(ADVERTISER_HINT_STAMPED, exactly!(1), equals!(true))
+			(events::CLUSTER_PEER_ADVERTISED, exactly!(1)),
+			(events::CLUSTER_PEER_ADVERTISE_REFUSED, absent!())
 		]
 	}
 }
 
-// A verified advertiser joins the table as a hint stamped with the reading
-// of the gateway's clock when its advertisement arrived.
+// A verified advertiser joins the table as a hint stamped with the gateway's
+// clock reading at the advertisement's arrival. The manual clock starts at the
+// system clock, so the body asserts the stamp in the test's peer store.
 tb_scenario! {
 	name: cluster_advertiser_hint_takes_the_clock_reading,
 	spec: ClusterAdvertiserHintStampSpec,
@@ -3399,9 +3163,11 @@ tb_scenario! {
 			let advertiser = dial_admitted_by(&conf, String::from_utf8_lossy(PEER_GATEWAY_ADDR));
 			let gateway = start_cluster(&trace, conf).await?;
 
-			install_ping_peer(&trace, &certs, &gateway).await?;
-			let stamped = wait_for_stamp(&store, advertiser).await == Some(clock.unix());
-			trace.event_with(ADVERTISER_HINT_STAMPED, &[], stamped)?;
+			let ad_reply = install_ping_peer(&certs, &gateway).await?;
+			assert_eq!(ad_reply, TransitStatus::Ok, "the gateway admits the advertisement");
+
+			let stamp = wait_for_stamp(&store, advertiser).await;
+			assert_eq!(stamp, Some(clock.unix()), "the advertiser hint carries the clock reading");
 
 			gateway.stop();
 			Ok(())
@@ -3417,14 +3183,14 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(PEER_AD_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
-			(ORIGIN_HINT_STAMPED, exactly!(1), equals!(true))
+			(events::CLUSTER_PEER_AD_LEARNED, exactly!(1))
 		]
 	}
 }
 
 // The origin of a relayed advertisement rumor joins the table as a hint
-// stamped with the reading of the gateway's clock when the rumor arrived.
+// stamped with the gateway's clock reading at the rumor's arrival. The stamp
+// sits in the test's peer store, so the body asserts it.
 tb_scenario! {
 	name: cluster_rumored_origin_hint_takes_the_clock_reading,
 	spec: ClusterOriginHintStampSpec,
@@ -3441,10 +3207,10 @@ tb_scenario! {
 
 			let types = vec![servlet_urn("ping")];
 			let status = flood_ad_rumor(&certs, &origin_key, &gateway, ORIGIN_GATEWAY_ADDR, types, 0, b"origin").await?;
-			trace.event_with(PEER_AD_STATUS, &[], status)?;
+			assert_eq!(status, TransitStatus::Ok, "the gateway admits the relayed advertisement rumor");
 
-			let stamped = wait_for_stamp(&store, origin).await == Some(clock.unix());
-			trace.event_with(ORIGIN_HINT_STAMPED, &[], stamped)?;
+			let stamp = wait_for_stamp(&store, origin).await;
+			assert_eq!(stamp, Some(clock.unix()), "the rumored origin hint carries the clock reading");
 
 			gateway.stop();
 			Ok(())
@@ -3458,29 +3224,19 @@ tb_assert_spec! {
 		mode: Accept,
 		assertions: [
 			(events::CLUSTER_PEER_DISCOVERED, exactly!(1)),
-			(PEER_EVICT_MEMBER_PROMOTED, exactly!(1), equals!(true)),
-			(PEER_ROUTES_AFTER, exactly!(1), equals!(1u64)),
 			(events::CLUSTER_PEER_EVICTED, exactly!(1)),
-			(PEER_EVICT_TARGET_DROPPED, exactly!(1), equals!(true)),
-			(PEER_EVICT_ROUTES_WITHDRAWN, exactly!(1), equals!(true))
+			(events::CLUSTER_PEER_ROUTES_WITHDRAWN, exactly!(1), equals!(1u64))
 		]
 	}
 }
 
-// The beat evicts a verified tried peer that goes dark (liveness).
+// The beat evicts a verified tried peer that goes dark (liveness). A feeler
+// probe proves the member's flood membership and promotes it into tried, the
+// prober routes to its one advertised type, and then the member stops.
 //
-// The prober learns the member as a hint, feeler-probes it, proves its flood
-// membership, and promotes it into tried (CLUSTER_PEER_DISCOVERED).
-//
-// - The member advertises one type, so the prober routes to it (PEER_ROUTES_AFTER is 1).
-// - The member then stops.
-// - Idle pool leases expire fast, so every beat makes a fresh dial, which the
-//   dropped listener refuses as a dead remote process would.
-// - Each later beat fails its reconcile.
-// - The failure threshold evicts the entry exactly once (CLUSTER_PEER_EVICTED).
-// - The beat stops its dials to the dead address.
-// - The eviction withdraws the member's routes (PEER_EVICT_ROUTES_WITHDRAWN).
-// - A dead peer releases its prefix bucket slot.
+// - Each later beat fails its reconcile: the dropped listener refuses its fresh dial as a dead remote would.
+// - The failure threshold evicts the entry once, and the beat stops its dials to the dead address.
+// - The eviction withdraws the member's one route first, and the dead peer releases its prefix bucket slot.
 tb_scenario! {
 	name: cluster_beat_evicts_dark_tried_peer,
 	spec: ClusterPeerEvictionSpec,
@@ -3503,21 +3259,18 @@ tb_scenario! {
 			// The scenario reads what the probe does with the hint. A hint the
 			// table refused shows as the missing outcome below.
 			let _ = table.learn(vec![PeerHint { dial: member_addr, peer_id: None }], UnixMillis::now());
-
-			let drained = wait_for_new_candidates_drained(&table, 50, Duration::from_millis(100)).await;
-			let targets = table.target_set().unwrap_or_default();
-			trace.event_with(PEER_EVICT_MEMBER_PROMOTED, &[], drained && targets.contains(&member_addr))?;
+			wait_for_recorded(&trace, events::CLUSTER_PEER_DISCOVERED, 1, 50).await;
 
 			// The member's slate gives the eviction routes to withdraw.
-			advertise_peer(&trace, &certs, &prober, cluster.addr().to_string(), vec![servlet_urn("ping")]).await?;
+			let ad_reply = advertise_peer(&certs, &prober, cluster.addr().to_string(), vec![servlet_urn("ping")]).await?;
+			assert_eq!(ad_reply, TransitStatus::Ok, "the gateway admits the advertisement");
+			assert_eq!(prober.peer_servlets()?.len(), 1, "the member's slate installs its ping route");
 
 			cluster.stop();
 
-			let dropped = wait_for_target_dropped(&table, member_addr, 50, Duration::from_millis(100)).await;
-			trace.event_with(PEER_EVICT_TARGET_DROPPED, &[], dropped)?;
-
-			let withdrawn = wait_for_no_peer_routes(&prober, 50, Duration::from_millis(100)).await;
-			trace.event_with(PEER_EVICT_ROUTES_WITHDRAWN, &[], withdrawn)?;
+			// The routes leave ahead of the eviction event, so one wait covers
+			// both counts.
+			wait_for_recorded(&trace, events::CLUSTER_PEER_EVICTED, 1, 50).await;
 
 			prober.stop();
 			Ok(())
@@ -3529,8 +3282,8 @@ tb_scenario! {
 /// faulty, then fails [`GossipJournal::held_digests`] and
 /// [`GossipJournal::fetch`].
 ///
-/// The switch models a storage fault that appears on a live gateway whose
-/// peers still answer.
+/// The switch models a storage fault that appears on a live gateway while its
+/// peers answer.
 #[derive(Default)]
 struct FaultSwitchJournal {
 	inner: MemoryGossipJournal,
@@ -3614,22 +3367,15 @@ tb_assert_spec! {
 		mode: Accept,
 		assertions: [
 			(events::CLUSTER_PEER_DISCOVERED, exactly!(1)),
-			(PEER_LOCAL_FAULT_MEMBER_PROMOTED, exactly!(1), equals!(true)),
-			(PEER_LOCAL_FAULT_MEMBER_RETAINED, exactly!(1), equals!(true)),
+			(events::CLUSTER_RECONCILE_FAILED, at_least!(MAX_PEER_TRIED_FAILURES as u32 + 1), equals!(false)),
 			(events::CLUSTER_PEER_EVICTED, exactly!(0))
 		]
 	}
 }
 
-// The beat charges a local journal fault to this gateway and leaves the peer
-// that answers unscored.
-//
-// The prober promotes the live member into tried, then its own journal
-// fails `held_digests` at the start of every reconcile round.
-//
-// - Each beat skips the round rather than record a dial failure.
-// - The failure count stays below the eviction threshold.
-// - The member stays a beat target (CLUSTER_PEER_EVICTED exactly 0).
+// A local journal fault on the prober fails `held_digests` at the start of
+// each round. The beat charges the fault to this gateway and skips the round
+// rather than record a dial failure, so the member stays a beat target.
 tb_scenario! {
 	name: cluster_local_journal_fault_retains_answering_peer,
 	spec: ClusterLocalFaultSpec,
@@ -3650,17 +3396,14 @@ tb_scenario! {
 			// The scenario reads what the probe does with the hint. A hint the
 			// table refused shows as the missing outcome below.
 			let _ = table.learn(vec![PeerHint { dial: member_addr, peer_id: None }], UnixMillis::now());
-
-			let drained = wait_for_new_candidates_drained(&table, 50, Duration::from_millis(100)).await;
-			let targets = table.target_set().unwrap_or_default();
-			trace.event_with(PEER_LOCAL_FAULT_MEMBER_PROMOTED, &[], drained && targets.contains(&member_addr))?;
+			wait_for_recorded(&trace, events::CLUSTER_PEER_DISCOVERED, 1, 50).await;
 
 			journal.fail_now();
 
-			// The poll window spans about 15 beats at the fast cadence, five
-			// times `MAX_PEER_TRIED_FAILURES`, so a scored fault would show.
-			let dropped = wait_for_target_dropped(&table, member_addr, 15, Duration::from_millis(100)).await;
-			trace.event_with(PEER_LOCAL_FAULT_MEMBER_RETAINED, &[], !dropped)?;
+			// A beat settles each round before the next one starts, so the
+			// round past `MAX_PEER_TRIED_FAILURES` follows the one a scored
+			// fault would evict at.
+			wait_for_recorded(&trace, events::CLUSTER_RECONCILE_FAILED, MAX_PEER_TRIED_FAILURES + 1, 50).await;
 
 			prober.stop();
 			cluster.stop();
@@ -3697,28 +3440,22 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(OUTSIDE_RUMOR_FANNED_OUT, exactly!(1), equals!(true)),
+			(events::CLUSTER_GOSSIP_FANOUT_UNREACHED, at_least!(1)),
 			(events::CLUSTER_PEER_AD_PUBLISH_FAILED, exactly!(0))
 		]
 	}
 }
 
 // A gateway whose identity signs under an outside provider originates its
-// slate rumor. The gateway verifies its own signature under the identity's
-// policy, so the rumor reaches its fan-out.
-//
-// - The fan-out traces the dead anchor as unreached (OUTSIDE_RUMOR_FANNED_OUT).
-// - Every publish succeeds (CLUSTER_PEER_AD_PUBLISH_FAILED exactly 0).
+// slate rumor. It verifies its own signature under the identity's policy, so
+// the rumor reaches its fan-out, which traces the dead anchor as unreached.
 tb_scenario! {
 	name: cluster_outside_identity_originates_its_rumor,
 	spec: ClusterOutsideOriginSpec,
 	environment Bare {
 		exec: |SetupEnv { trace, context: _ }| async move {
 			let gateway = start_cluster(&trace, outside_origin_conf()).await?;
-
-			let fanned_out = || trace.recorded(events::CLUSTER_GOSSIP_FANOUT_UNREACHED) >= 1;
-			let fanned_out = poll_until(50, Duration::from_millis(100), fanned_out).await;
-			trace.event_with(OUTSIDE_RUMOR_FANNED_OUT, &[], fanned_out)?;
+			wait_for_recorded(&trace, events::CLUSTER_GOSSIP_FANOUT_UNREACHED, 1, 50).await;
 
 			gateway.stop();
 			Ok(())

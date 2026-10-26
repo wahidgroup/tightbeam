@@ -103,7 +103,7 @@ pub type Result<T> = ::core::result::Result<T, KdfError>;
 /// derivation ends (NIST SP 800-56C Rev. 2 §5.1). The house providers hold
 /// it through hashes whose buffers wipe on drop.
 pub trait KdfFunction {
-	/// Derive a key whose size is known only at run time.
+	/// Derives a key whose size is known only at run time.
 	///
 	/// A negotiated security profile sets the key size, so a const generic
 	/// cannot carry it. Each provider uses its own digest algorithm.
@@ -124,7 +124,7 @@ pub trait KdfFunction {
 /// The blanket implementation is the only one, so a KDF identifier names one
 /// dual-key output whichever type implements it.
 pub trait DualKeyKdf: KdfFunction {
-	/// Derive an ECIES encryption key and MAC key of `N` bytes each.
+	/// Derives an ECIES encryption key and MAC key of `N` bytes each.
 	///
 	/// ECIES standards such as [SECG SEC 1 v2.0 §5.1][sec1-5.1],
 	/// [IEEE Std 1363a-2004][ieee1363a], and [ISO/IEC 18033-2:2006][iso18033]
@@ -195,7 +195,7 @@ impl AssociatedOid for HkdfSha3_256 {
 	const OID: ObjectIdentifier = HKDF_SHA3_256;
 }
 
-/// Reject a key size below [`MIN_KEY_SIZE`], which is too weak for
+/// Rejects a key size below [`MIN_KEY_SIZE`], which is too weak for
 /// cryptographic use.
 ///
 /// The X9.63 provider and the dual-key derivation share this check, so the
@@ -209,7 +209,7 @@ fn assert_min_key_size(key_size: usize) -> Result<()> {
 	Ok(())
 }
 
-/// Reject a key size outside `[MIN_KEY_SIZE, MAX_HKDF_OUTPUT_SIZE]`.
+/// Rejects a key size outside `[MIN_KEY_SIZE, MAX_HKDF_OUTPUT_SIZE]`.
 ///
 /// This is the HKDF counterpart of [`assert_min_key_size`]. The crate policy
 /// [`MAX_HKDF_OUTPUT_SIZE`] also caps HKDF output.
@@ -241,10 +241,11 @@ impl KdfFunction for X963Sha3_256 {
 	fn derive_dynamic_key(ikm: &[u8], info: &[u8], _salt: Option<&[u8]>, key_size: usize) -> Result<ZeroizingBytes> {
 		assert_min_key_size(key_size)?;
 
-		let mut out = vec![0u8; key_size];
+		// The output wipes from its first derived byte, so a refused expansion
+		// wipes its partial output when it drops.
+		let mut out = Zeroizing::new(vec![0u8; key_size]);
 		Self::expand(&mut out, ikm, info)?;
-
-		Ok(Zeroizing::new(out))
+		Ok(out)
 	}
 }
 
@@ -277,12 +278,12 @@ impl X963Sha3_256 {
 /// An error from a KDF operation.
 #[derive(Errorizable, Debug, Clone)]
 pub enum KdfError {
-	/// Key derivation failed. The output length is out of range, or HKDF
-	/// expansion failed.
+	/// A key derivation failure: the output length is out of range, or the
+	/// HKDF expansion fails.
 	#[error("Key derivation failed: {0}")]
 	DerivationFailed(InvalidLength),
 
-	/// The shared secret is not as wide as the field of its curve. The field
+	/// The shared secret is not as wide as the field of its curve. The variant
 	/// holds the received and the expected length.
 	#[error("Invalid shared secret length: {0}")]
 	InvalidSharedSecretLength(ReceivedExpectedError<usize, usize>),
@@ -323,7 +324,7 @@ impl<C: Curve> TryFrom<SecretSlice<u8>> for EcdhSecret<C> {
 	}
 }
 
-/// Move a curve shared secret into the type the key schedule takes, at the
+/// Moves a curve shared secret into the type the key schedule takes, at the
 /// width of the field of `C`. The curve secret wipes when it drops.
 #[cfg(any(feature = "ecdh", feature = "hpke"))]
 impl<C: Curve> From<SharedSecret<C>> for EcdhSecret<C> {
@@ -333,7 +334,7 @@ impl<C: Curve> From<SharedSecret<C>> for EcdhSecret<C> {
 }
 
 impl<C: Curve> EcdhSecret<C> {
-	/// Lend the secret to `f` for the length of the call, so a derivation
+	/// Lends the secret to `f` for the length of the call, so a derivation
 	/// reads it with no owned copy.
 	///
 	/// # Examples
@@ -364,7 +365,7 @@ impl<C: Curve> EcdhSecret<C> {
 		Self(Secret::from(sized))
 	}
 
-	/// Check the length of `bytes` against the field of `C`, then copy them
+	/// Checks the length of `bytes` against the field of `C`, then copies them
 	/// into the wiping buffer of the secret (CWE-226).
 	///
 	/// # Errors
@@ -388,7 +389,7 @@ impl<C: Curve> EcdhSecret<C> {
 		self.with(Self::copy_of)
 	}
 
-	/// Run ECDH between `secret` and the peer's point `peer`.
+	/// Runs ECDH between `secret` and the peer's point `peer`.
 	///
 	/// HPKE and the handshake agreement of a held key both multiply here. Two
 	/// other holders of a scalar multiply on their own: an `EphemeralSecret`,
@@ -563,8 +564,8 @@ mod tests {
 		assert!(matches!(x963_below_min, Err(KdfError::DerivationFailed(_))));
 	}
 
-	// A SharedInfo longer than 256 bytes must derive without the panic that a
-	// fixed 256-byte buffer would raise.
+	// A SharedInfo longer than 256 bytes must derive a key pair without a
+	// panic, so no fixed 256-byte buffer bounds the info.
 	#[test]
 	fn test_x963_dual_keys_large_shared_info() -> crate::error::Result<()> {
 		let large_info = vec![0xABu8; 300];

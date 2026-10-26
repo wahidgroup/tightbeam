@@ -1,7 +1,7 @@
 //! The [`tb_assert_spec!`](crate::tb_assert_spec!) macro and the types behind
-//! it. The module holds the [`Cardinality`] helpers, the [`AssertSpecBuilder`],
-//! the [`BuiltAssertSpec`] that implements [`TBSpec`], and the [`AssertEncode`]
-//! payload encoding.
+//! it. The module holds [`Cardinality`] and its macros, the
+//! [`AssertSpecBuilder`], the [`BuiltAssertSpec`] that implements [`TBSpec`],
+//! and the [`AssertEncode`] payload encoding.
 
 use core::num::NonZeroU32;
 
@@ -836,13 +836,18 @@ macro_rules! __tb_assert_spec_build {
 		$(
 			builder = $crate::__tb_assert_spec_add_assertion!(builder, $assertion);
 		)*
-		$crate::__tb_if_instrument! {
-			{
-				$(
+		// A build without `instrument` stops at a required event, so a spec
+		// keeps every event it orders. A spec with no event names none.
+		$(
+			$crate::__tb_select_instrument! {
+				{
 					builder = builder.required_events(::core::slice::from_ref(&$ev));
-				)*
+				}
+				{
+					::core::compile_error!("the `events:` list of `tb_assert_spec!` needs the `instrument` feature");
+				}
 			}
-		};
+		)*
 		$(
 			$crate::__tb_assert_spec_parse_schedulability!(builder, $($schedule_content)*);
 		)?
@@ -855,7 +860,8 @@ macro_rules! __tb_assert_spec_build {
 // Every configuration defines the name, and the feature selects the body, so an
 // expansion may call this without a guard of its own. A definition gated as a
 // whole makes a missed guard a name-resolution failure in one column of the
-// feature matrix only.
+// feature matrix only. A build without `testing-timing` stops at the block, so
+// a spec keeps every schedulability assertion it states.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __tb_assert_spec_parse_schedulability {
@@ -865,19 +871,26 @@ macro_rules! __tb_assert_spec_parse_schedulability {
 		scheduler: $scheduler:ident,
 		must_be_schedulable: $must_be:expr,
 	) => {
-		$crate::__tb_if_testing_timing! {{
-			use $crate::testing::schedulability::SchedulerType;
-			let task_set_with_scheduler = {
-				let mut ts = $task_set.clone();
-				ts.scheduler = SchedulerType::$scheduler;
-				ts
-			};
-			let assertion = $crate::testing::macros::SchedulabilityAssertion {
-				task_set: task_set_with_scheduler,
-				must_be_schedulable: $must_be,
-			};
-			$builder = $builder.schedulability(assertion);
-		}}
+		$crate::__tb_select_testing_timing! {
+			{
+				{
+					use $crate::testing::schedulability::SchedulerType;
+					let task_set_with_scheduler = {
+						let mut ts = $task_set.clone();
+						ts.scheduler = SchedulerType::$scheduler;
+						ts
+					};
+					let assertion = $crate::testing::macros::SchedulabilityAssertion {
+						task_set: task_set_with_scheduler,
+						must_be_schedulable: $must_be,
+					};
+					$builder = $builder.schedulability(assertion);
+				}
+			}
+			{
+				::core::compile_error!("the `schedulability:` block of `tb_assert_spec!` needs the `testing-timing` feature");
+			}
+		}
 	};
 }
 
@@ -950,7 +963,7 @@ macro_rules! tb_assert_spec {
 					$(
 						$maj, $min, $patch, $mode,
 						// One place decides the expected gate. A block that
-						// omits `gate:` requires no decision, and every helper
+						// omits `gate:` requires no decision, and every macro
 						// below passes this value on without reading it.
 						::core::option::Option::None $( .or(Some($crate::policy::TransitStatus::$gate)) )?,
 						assertions: [ $( $assertion ),* ],

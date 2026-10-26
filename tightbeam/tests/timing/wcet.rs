@@ -1,10 +1,9 @@
-//! WCET constraint integration tests
+//! The integration tests of WCET constraints.
 
 #![cfg(all(feature = "testing-timing", feature = "testing-fdr", feature = "instrument"))]
 
 use std::time::Duration;
 
-use tightbeam::builder::TypeBuilder;
 use tightbeam::instrumentation::TbInstrumentationConfig;
 use tightbeam::testing::fdr::FdrConfig;
 use tightbeam::testing::specs::csp::Process;
@@ -41,7 +40,7 @@ tb_assert_spec! {
 	},
 }
 
-/// Helper to build FDR config for timing tests
+/// The FDR configuration of the timing tests, with `specs` as its specs.
 fn build_timing_fdr_config(specs: impl IntoIterator<Item = Process>) -> FdrConfig {
 	let specs: Vec<Process> = specs.into_iter().collect();
 	FdrConfig {
@@ -55,13 +54,12 @@ fn build_timing_fdr_config(specs: impl IntoIterator<Item = Process>) -> FdrConfi
 	}
 }
 
-// Test 1: WCET constraint satisfied (within limit)
-// This test verifies that:
-// 1. Timing constraints are properly defined on the process
-// 2. Instrumentation events are captured correctly
-// 3. Timing verification can be run and passes for durations within constraint
-// Note: This test focuses on verifying the infrastructure works correctly.
-// The actual timing verification would be called during FDR exploration or in hooks.
+// Test 1: a duration within the WCET passes. The test checks that:
+// 1. The process declares its timing constraints.
+// 2. The trace records the instrumentation events.
+// 3. Timing verification runs and passes a duration within the constraint.
+// FDR exploration or a hook calls the timing verification, and this test
+// calls it from its pass hook to check the timing infrastructure.
 tb_scenario! {
 	name: test_wcet_constraint_passing,
 	config: ScenarioConfig::builder()
@@ -77,33 +75,31 @@ tb_scenario! {
 			max_events: 1024,
 		}).into())
 		.with_hooks(TestHooks::on_pass(|context| {
-				// Verify timing constraints exist on process
 				let process = SimpleWcetProcess::process();
 				let constraints = process
 					.timing_constraints
 					.as_ref()
 					.expect("the spec under test declares WCET constraints");
 
-				// Verify timing constraints against trace
 				let timing_result = constraints
 					.verify_with_process(context.trace(), Some(&process))
 					.expect("verifying a declared constraint against the recorded trace");
-				// Verify no violations (within constraint: 5ms < 10ms)
+				// 5 ms sits within the 10 ms WCET, so the check passes.
 				assert!(timing_result.passed, "Timing verification should pass for duration within constraint. Violations: {:?}", timing_result.wcet_violations);
 				assert!(timing_result.wcet_violations.is_empty(), "No WCET violations expected");
 			}))
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
-			// Emit timing event with duration within WCET constraint (5ms < 10ms)
+			// The event takes 5 ms, within the 10 ms WCET.
 			trace.event(PROCESS)?.with_timing(Duration::from_nanos(5_000_000));
 			Ok(())
 		}
 	}
 }
 
-// Test 2: WCET constraint boundary case (exactly at limit)
-// Tests that durations exactly equal to the constraint are acceptable
+// Test 2: a duration equal to the WCET satisfies the constraint, because the
+// bound is inclusive.
 tb_scenario! {
 	name: test_wcet_constraint_at_limit,
 	config: ScenarioConfig::builder()
@@ -119,18 +115,16 @@ tb_scenario! {
 			max_events: 1024,
 		}).into())
 		.with_hooks(TestHooks::on_pass(|context| {
-				// Verify timing constraints exist on process
 				let process = SimpleWcetProcess::process();
 				let constraints = process
 					.timing_constraints
 					.as_ref()
 					.expect("the spec under test declares WCET constraints");
 
-				// Verify timing constraints against trace
 				let timing_result = constraints
 					.verify_with_process(context.trace(), Some(&process))
 					.expect("verifying a declared constraint against the recorded trace");
-				// Verify no violations (at limit: 10ms == 10ms, should pass)
+				// 10 ms equals the 10 ms WCET, so the check passes.
 				assert!(timing_result.passed, "Timing verification should pass for duration at constraint limit");
 				assert!(timing_result.wcet_violations.is_empty(), "No WCET violations expected at limit");
 			}))
@@ -143,9 +137,8 @@ tb_scenario! {
 	}
 }
 
-// Test 3: WCET constraint violation (exceeds limit)
-// This test verifies that timing violations are properly detected when
-// observed durations exceed the WCET constraint.
+// Test 3: a duration past the WCET violates the constraint, so the timing
+// check reports one violation with the observed duration.
 tb_scenario! {
 	name: test_wcet_constraint_violation,
 	config: ScenarioConfig::builder()

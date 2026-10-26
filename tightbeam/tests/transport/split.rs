@@ -5,7 +5,8 @@
 	feature = "transport-policy",
 	feature = "tcp",
 	feature = "tokio",
-	feature = "testing"
+	feature = "testing",
+	feature = "instrument"
 ))]
 
 use std::sync::Arc;
@@ -14,32 +15,24 @@ use tokio::net::TcpStream;
 
 use tightbeam::crypto::policy::Secp256k1Policy;
 use tightbeam::crypto::profiles::DefaultCryptoProvider;
-use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
+use tightbeam::crypto::x509::store::{CertificateTrustBuilder, TrustBuilder};
 use tightbeam::exactly;
+use tightbeam::instrumentation::events;
 use tightbeam::policy::TransitStatus;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_scenario;
 use tightbeam::testing::{SetupEnv, TestFrame};
 use tightbeam::transport::tcp::r#async::{TokioListener, TokioStream};
 use tightbeam::transport::{
-	ClientBuilder, EnvelopeSink, EnvelopeSource, ResponsePackage, TransportEnvelope, TransportError, TransportFailure,
+	ClientBuilder, EncryptedMessageIO, EnvelopeSink, EnvelopeSource, ResponsePackage, TransportEnvelope,
+	TransportError, TransportFailure,
 };
-use tightbeam::urn::Urn;
 use tightbeam::{Frame, TightBeamError};
 
-use super::support::{accept_handshaken_split, await_ok, bind_encrypted_listener, connect_handshaken_split};
+use super::support::{
+	accept_handshaken_split, await_ok, bind_encrypted_listener, connect_handshaken_split, connect_pinned_client,
+};
 use crate::common::security::{expectation_failure, ServerMaterials};
-
-pub(crate) const FIRST_RECORD_ARRIVES: Urn<'static> = tightbeam::urn!("test", "event:split/first-record-arrives");
-pub(crate) const FRAME_ECHOED: Urn<'static> = tightbeam::urn!("test", "event:split/frame-echoed");
-pub(crate) const INTO_SPLIT_REPORTS_INVALID_STATE: Urn<'static> =
-	tightbeam::urn!("test", "event:split/into-split-reports-invalid-state");
-pub(crate) const SECOND_RECORD_STILL_ARRIVES: Urn<'static> =
-	tightbeam::urn!("test", "event:split/second-record-still-arrives");
-pub(crate) const SECOND_WRITE_DEMANDS_REKEY: Urn<'static> =
-	tightbeam::urn!("test", "event:split/second-write-demands-rekey");
-pub(crate) const STATUS_OK: Urn<'static> = tightbeam::urn!("test", "event:split/status-ok");
-pub(crate) const THRESHOLD_REACHES_ZERO: Urn<'static> = tightbeam::urn!("test", "event:split/threshold-reaches-zero");
 
 fn request_frame() -> Frame {
 	TestFrame::v0(None, None)
@@ -49,93 +42,74 @@ fn request_envelope() -> TransportEnvelope {
 	TransportEnvelope::new_request(request_frame())
 }
 
-tb_assert_spec! {
-	pub SplitEncryptedRoundtripSpec,
-	V(1,0,0): {
-		mode: Accept,
-		assertions: [
-			(STATUS_OK, exactly!(1), equals!(true)),
-			(FRAME_ECHOED, exactly!(1), equals!(true))
-		]
-	}
+/// The response package that `envelope` carries.
+fn response_of(envelope: TransportEnvelope) -> ResponsePackage {
+	let TransportEnvelope::Response(package) = envelope else {
+		panic!("the client must receive a response envelope");
+	};
+
+	package
 }
 
-tb_scenario! {
-	name: split_encrypted_roundtrip,
-	spec: SplitEncryptedRoundtripSpec,
-	environment Bare {
-		exec: |SetupEnv { trace, .. }| async move {
-			let materials = ServerMaterials::generate();
-			let (listener, addr) = bind_encrypted_listener(&materials).await?;
+/// The frame of the request that `envelope` carries.
+fn request_of(envelope: TransportEnvelope) -> Frame {
+	let TransportEnvelope::Request(package) = envelope else {
+		panic!("the server must receive a request envelope");
+	};
 
-			let server_handle = tokio::spawn(async move {
-				let (mut reader, mut writer) = accept_handshaken_split(listener).await?;
-
-				let request = reader.read_envelope().await?;
-				let frame = match request {
-					TransportEnvelope::Request(pkg) => Frame::clone(pkg.message()),
-					_ => return Err(expectation_failure("server must receive a request envelope")),
-				};
-
-				let response = ResponsePackage::new(TransitStatus::Ok, Some(frame));
-				writer.write_envelope(TransportEnvelope::from(response)).await?;
-
-				Ok::<(), TightBeamError>(())
-			});
-
-			let (mut reader, mut writer) = connect_handshaken_split(addr, &materials.certificate).await?;
-			let sent = request_frame();
-			writer.write_envelope(TransportEnvelope::new_request(sent.to_owned())).await?;
-
-			let response = reader.read_envelope().await?;
-			let package = match response {
-				TransportEnvelope::Response(pkg) => pkg,
-				_ => return Err(expectation_failure("client must receive a response envelope")),
-			};
-
-			let echoed = package
-				.message()
-				.map(|arc| Frame::clone(arc))
-				.ok_or_else(|| expectation_failure("echo response must carry the request frame"))?;
-
-			await_ok(server_handle, "server task must not panic").await?;
-
-			trace.event_with( STATUS_OK, &[], package.status() == TransitStatus::Ok)?;
-			trace.event_with(FRAME_ECHOED, &[], echoed == sent)?;
-			Ok(())
-		}
-	}
+	Frame::clone(package.message())
 }
 
-tb_assert_spec! {
-	pub SplitRejectsPreHandshakeSpec,
-	V(1,0,0): {
-		mode: Accept,
-		assertions: [
-			(INTO_SPLIT_REPORTS_INVALID_STATE, exactly!(1), equals!(true))
-		]
-	}
+/// An encrypted split session carries a request to the server and the
+/// server's echo back, under status `Ok`.
+#[tokio::test]
+async fn split_encrypted_roundtrip() -> Result<(), TightBeamError> {
+	let materials = ServerMaterials::generate();
+	let (listener, addr) = bind_encrypted_listener(&materials).await?;
+
+	let server_handle = tokio::spawn(async move {
+		let (mut reader, mut writer) = accept_handshaken_split(listener).await?;
+
+		let frame = request_of(reader.read_envelope().await?);
+
+		let response = ResponsePackage::new(TransitStatus::Ok, Some(frame));
+		writer.write_envelope(TransportEnvelope::from(response)).await?;
+
+		Ok::<(), TightBeamError>(())
+	});
+
+	let (mut reader, mut writer) = connect_handshaken_split(addr, &materials.certificate).await?;
+	let sent = request_frame();
+	writer.write_envelope(TransportEnvelope::new_request(sent.to_owned())).await?;
+
+	let package = response_of(reader.read_envelope().await?);
+	let echoed = package
+		.message()
+		.map(|arc| Frame::clone(arc))
+		.ok_or_else(|| expectation_failure("echo response must carry the request frame"))?;
+
+	await_ok(server_handle, "server task must not panic").await?;
+
+	assert_eq!(package.status(), TransitStatus::Ok, "the echo must carry status Ok");
+	assert_eq!(echoed, sent, "the server must echo the request frame");
+	Ok(())
 }
 
-tb_scenario! {
-	name: split_rejects_pre_handshake,
-	spec: SplitRejectsPreHandshakeSpec,
-	environment Bare {
-		exec: |SetupEnv { trace, .. }| async move {
-			// A provisioned client whose handshake has not run, so it holds no
-			// keys to split.
-			let listener = TokioListener::<DefaultCryptoProvider>::bind_cleartext("127.0.0.1:0").await?;
-			let listen_addr = listener.local_addr()?;
-			let client_stream = TcpStream::connect(listen_addr).await?;
-			let trust_store: Arc<dyn CertificateTrust> = Arc::new(CertificateTrustBuilder::from(Secp256k1Policy::default()).build());
-			let client = ClientBuilder::<TokioListener>::builder().with_trust_store(trust_store);
-			let transport = client.adopt(TokioStream::from(client_stream))?.into_transport();
+/// A provisioned client whose handshake has not run holds no keys to split,
+/// so it refuses the split.
+#[tokio::test]
+async fn split_rejects_pre_handshake() -> Result<(), TightBeamError> {
+	let listener = TokioListener::<DefaultCryptoProvider>::bind_cleartext("127.0.0.1:0").await?;
+	let listen_addr = listener.local_addr()?;
+	let client_stream = TcpStream::connect(listen_addr).await?;
+	let data = CertificateTrustBuilder::from(Secp256k1Policy::default()).build();
+	let client = ClientBuilder::<TokioListener>::builder().with_trust_store(Arc::new(data));
+	let transport = client.adopt(TokioStream::from(client_stream))?.into_transport();
 
-			let into_split = transport.into_split();
-			trace.event_with( INTO_SPLIT_REPORTS_INVALID_STATE, &[], matches!(into_split, Err(TransportError::InvalidState)))?;
-			Ok(())
-		}
-	}
+	let into_split = transport.into_split();
+	let refused = matches!(into_split, Err(TransportError::InvalidState));
+	assert!(refused, "a provisioned transport must refuse to split");
+	Ok(())
 }
 
 tb_assert_spec! {
@@ -143,12 +117,13 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(SECOND_WRITE_DEMANDS_REKEY, exactly!(1), equals!(true))
+			(events::TRANSPORT_REKEY_REQUIRED, exactly!(1), equals!(1u64))
 		]
 	}
 }
 
-// RFC 9846 § 5.5: fail closed with RekeyRequired, never reuse key.
+// RFC 9846 § 5.5: a writer at the record limit of its key fails closed with
+// `RekeyRequired`.
 tb_scenario! {
 	name: split_write_rekey_limit_fails_closed,
 	spec: SplitWriteRekeyLimitSpec,
@@ -160,72 +135,63 @@ tb_scenario! {
 			let server_handle = tokio::spawn(async move {
 				let (mut reader, _writer) = accept_handshaken_split(listener).await?;
 
-				let within_limit = reader.read_envelope().await?;
-				let arrived = matches!(within_limit, TransportEnvelope::Request(_));
-				if !arrived {
-					return Err(expectation_failure("the write inside the record limit must still arrive"));
-				}
+				let within_limit = request_of(reader.read_envelope().await?);
+				assert_eq!(within_limit.message(), request_frame().message(), "the write inside the record limit must still arrive");
 
 				Ok::<(), TightBeamError>(())
 			});
 
-			let (_reader, writer) = connect_handshaken_split(addr, &materials.certificate).await?;
+			// The client carries the scenario trace from its first handshake
+			// message, and its writer half takes the trace at the split.
+			let client = connect_pinned_client(addr, &materials.certificate).await?;
+			let mut client = client.with_trace(trace.share());
+			client.perform_client_handshake().await?;
+
+			let (_reader, writer) = client.into_split()?;
 
 			let mut writer = writer.with_rekey_limit(1);
 			writer.write_envelope(request_envelope()).await?;
 
-			// Limit spent; second write must fail before bytes leave.
+			// The first write spends the limit, so the second fails before its
+			// bytes leave.
 			let limited = writer.write_envelope(request_envelope()).await;
 			await_ok(server_handle, "server task must not panic").await?;
 
-			trace.event_with( SECOND_WRITE_DEMANDS_REKEY, &[], matches!(limited, Err(TransportError::MessageNotSent(_, TransportFailure::RekeyRequired))))?;
+			let demands_rekey = matches!(limited, Err(TransportError::MessageNotSent(_, TransportFailure::RekeyRequired)));
+			assert!(demands_rekey, "the write past the record limit must demand a rekey");
 			Ok(())
 		}
 	}
 }
 
-tb_assert_spec! {
-	pub SplitReadRekeyLimitSpec,
-	V(1,0,0): {
-		mode: Accept,
-		assertions: [
-			(FIRST_RECORD_ARRIVES, exactly!(1), equals!(true)),
-			(THRESHOLD_REACHES_ZERO, exactly!(1), equals!(true)),
-			(SECOND_RECORD_STILL_ARRIVES, exactly!(1), equals!(true))
-		]
-	}
-}
+/// The read threshold of a split half triggers a renewal, and the AES-GCM
+/// volume bound is the refusal bound, so the reader decrypts a record past
+/// the threshold.
+#[tokio::test]
+async fn split_read_rekey_threshold_never_refuses() -> Result<(), TightBeamError> {
+	let materials = ServerMaterials::generate();
+	let (listener, addr) = bind_encrypted_listener(&materials).await?;
+	let server_handle = tokio::spawn(async move {
+		let (_reader, mut writer) = accept_handshaken_split(listener).await?;
 
-// Reader limit is renewal threshold, not refusal bound (AES-GCM volume bound refuses).
-tb_scenario! {
-	name: split_read_rekey_threshold_never_refuses,
-	spec: SplitReadRekeyLimitSpec,
-	environment Bare {
-		exec: |SetupEnv { trace, .. }| async move {
-			let materials = ServerMaterials::generate();
-			let (listener, addr) = bind_encrypted_listener(&materials).await?;
-			let server_handle = tokio::spawn(async move {
-				let (_reader, mut writer) = accept_handshaken_split(listener).await?;
+		writer.write_envelope(request_envelope()).await?;
+		writer.write_envelope(request_envelope()).await?;
 
-				writer.write_envelope(request_envelope()).await?;
-				writer.write_envelope(request_envelope()).await?;
+		Ok::<(), TightBeamError>(())
+	});
 
-				Ok::<(), TightBeamError>(())
-			});
+	let (reader, _writer) = connect_handshaken_split(addr, &materials.certificate).await?;
+	let mut reader = reader.with_rekey_limit(1);
 
-			let (reader, _writer) = connect_handshaken_split(addr, &materials.certificate).await?;
-			let mut reader = reader.with_rekey_limit(1);
+	let within_limit = reader.read_envelope().await?;
+	let arrived = matches!(within_limit, TransportEnvelope::Request(_));
+	assert!(arrived, "the record inside the threshold must arrive");
+	assert_eq!(reader.remaining_records(), 0, "one record must spend a threshold of one");
 
-			let within_limit = reader.read_envelope().await?;
-			trace.event_with( FIRST_RECORD_ARRIVES, &[], matches!(within_limit, TransportEnvelope::Request(_)))?;
-			trace.event_with( THRESHOLD_REACHES_ZERO, &[], reader.remaining_records() == 0)?;
+	let past_threshold = reader.read_envelope().await;
+	await_ok(server_handle, "server task must not panic").await?;
 
-			// Counter past threshold: reader still decrypts.
-			let past_threshold = reader.read_envelope().await;
-			await_ok(server_handle, "server task must not panic").await?;
-
-			trace.event_with( SECOND_RECORD_STILL_ARRIVES, &[], matches!(past_threshold, Ok(TransportEnvelope::Request(_))))?;
-			Ok(())
-		}
-	}
+	let decrypted = matches!(past_threshold, Ok(TransportEnvelope::Request(_)));
+	assert!(decrypted, "a reader past its threshold must still decrypt");
+	Ok(())
 }

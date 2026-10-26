@@ -4,7 +4,7 @@ use tightbeam::asn1::Frame;
 use tightbeam::der::Enumerated;
 use tightbeam::der::Sequence;
 use tightbeam::error::TightBeamError;
-use tightbeam::matrix::{MatrixDyn, MatrixError};
+use tightbeam::matrix::MatrixDyn;
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::{compose, decode, servlet, Beamable, Errorizable};
@@ -66,16 +66,11 @@ impl ChessMatchManager {
 
 		*last_order = move_count;
 
-		// An even order is White's turn.
-		let is_white_turn = *last_order % 2 == 0;
+		// An odd order is White's turn, so White moves first.
+		let is_white_turn = *last_order % 2 == 1;
 		drop(last_order);
 
-		let client_move = ChessMove {
-			from_row: move_req.from_row,
-			from_col: move_req.from_col,
-			to_row: move_req.to_row,
-			to_col: move_req.to_col,
-		};
+		let client_move = ChessMove::from(move_req);
 
 		if let Err(refusal) = game_state.check_move(&client_move, is_white_turn) {
 			trace.event(events::SERVER_MOVE_INVALID)?;
@@ -132,14 +127,10 @@ impl ChessMatchManager {
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError::MatrixError`] -- the game state lock is poisoned, or
-	///   the board does not convert to a matrix.
+	/// - [`TightBeamError::LockPoisoned`] -- the game state lock is poisoned.
+	/// - [`TightBeamError::MatrixError`] -- the board does not convert to a matrix.
 	pub(crate) fn game_state_matrix(&self) -> Result<MatrixDyn, TightBeamError> {
-		let game_state = self
-			.game_state
-			.lock()
-			.map_err(|_| TightBeamError::MatrixError(MatrixError::InvalidN(0)))?;
-
+		let game_state = self.game_state.lock().map_err(|_| TightBeamError::LockPoisoned)?;
 		Ok(MatrixDyn::try_from(&*game_state)?)
 	}
 }
@@ -168,6 +159,9 @@ pub(crate) struct ChessMoveRequest {
 	pub(crate) from_col: u8,
 	pub(crate) to_row: u8,
 	pub(crate) to_col: u8,
+	/// The white board code of the piece that a pawn on the last row becomes,
+	/// or 0 for a move with no promotion.
+	pub(crate) promotion: u8,
 }
 
 /// The chess move response of the server.
@@ -188,7 +182,7 @@ pub(crate) enum GameStatusCode {
 	InvalidMove = 3,
 }
 
-// The servlet answers a refused move through this helper.
+// The servlet answers a refused move through this function.
 
 /// Builds the `InvalidMove` response frame to the request `id`, at the order
 /// after `order`.
@@ -271,24 +265,91 @@ servlet! {
 mod tests {
 	use super::*;
 
+	/// The white knight move from b1 to c3.
+	const KNIGHT_TO_C3: ChessMoveRequest =
+		ChessMoveRequest { from_row: 0, from_col: 1, to_row: 2, to_col: 2, promotion: 0 };
+
 	/// The black knight move from b8 to c6.
-	const KNIGHT_TO_C6: ChessMoveRequest = ChessMoveRequest { from_row: 7, from_col: 1, to_row: 5, to_col: 2 };
+	const KNIGHT_TO_C6: ChessMoveRequest =
+		ChessMoveRequest { from_row: 7, from_col: 1, to_row: 5, to_col: 2, promotion: 0 };
 
 	/// The server's reply records the kind of the piece it moves.
 	///
 	/// The server plays the move at index `order % count` of its list of legal
-	/// moves, and the list holds the back row ahead of the pawns. At order 1
-	/// that is the knight move from b1 to a3, so the client's move and the
-	/// server's reply each record a knight event.
+	/// moves, and the list for Black holds its pawns ahead of its back row. At
+	/// order 1 that is the pawn move from a7 to a5, the one pawn move of the
+	/// exchange.
 	#[test]
 	fn the_server_move_records_its_piece_kind() -> Result<(), ChessMoveError> {
 		let manager = ChessMatchManager::default();
 		let trace = TraceCollector::new();
 
-		manager.process_move(&KNIGHT_TO_C6, 1, &trace)?;
+		manager.process_move(&KNIGHT_TO_C3, 1, &trace)?;
 
-		assert_eq!(trace.recorded(events::KNIGHT_MOVE), 2);
+		assert_eq!(trace.recorded(events::PAWN_MOVE), 1);
 		Ok(())
+	}
+
+	/// White moves first, so a black move at the first order is invalid.
+	#[test]
+	fn black_cannot_move_first() {
+		let manager = ChessMatchManager::default();
+		let trace = TraceCollector::new();
+
+		let refusal = manager.process_move(&KNIGHT_TO_C6, 1, &trace);
+		assert!(matches!(refusal, Err(ChessMoveError::InvalidMove)));
+	}
+
+	/// A manager whose game lock a thread poisoned when it panicked.
+	fn poisoned_manager() -> ChessMatchManager {
+		let manager = ChessMatchManager::default();
+		let game_state = Arc::clone(&manager.game_state);
+		let holder = std::thread::spawn(move || {
+			let _held = game_state.lock();
+			panic!("the holder panics while it holds the game lock");
+		});
+		holder.join().expect_err("the holder thread panics");
+
+		manager
+	}
+
+	/// The game matrix of a poisoned game lock fails as `LockPoisoned`.
+	#[test]
+	fn a_poisoned_game_lock_fails_as_lock_poisoned() {
+		let manager = poisoned_manager();
+		let matrix = manager.game_state_matrix();
+		assert!(matches!(matrix, Err(TightBeamError::LockPoisoned)));
+	}
+
+	/// Plays the moves of `seed` on a new game, as the fuzz client sends them:
+	/// one move of four bytes at each odd order, and the server answers each.
+	fn play_seed(seed: &[u8]) -> Result<(), ChessMoveError> {
+		let manager = ChessMatchManager::default();
+		let trace = TraceCollector::new();
+		for (index, bytes) in seed.chunks_exact(4).enumerate() {
+			let chess_move = ChessMove::from((bytes[0], bytes[1], bytes[2], bytes[3]));
+			let order = 1 + 2 * index as u64;
+			manager.process_move(&chess_move.to_request(), order, &trace)?;
+		}
+
+		Ok(())
+	}
+
+	// Each canonical seed plays legal moves for White from the start of a
+	// game.
+	tightbeam::tb_cases! {
+		fn a_seed_plays_legal_white_moves(seed: &[u8]) -> Result<(), ChessMoveError> {
+			play_seed(seed)?;
+			Ok(())
+		}
+		cases {
+			pawn => include_bytes!("seeds/basic/seed_pawn.txt"),
+			knight => include_bytes!("seeds/basic/seed_knight.txt"),
+			bishop => include_bytes!("seeds/basic/seed_bishop.txt"),
+			rook => include_bytes!("seeds/basic/seed_rook.txt"),
+			queen => include_bytes!("seeds/basic/seed_queen.txt"),
+			king => include_bytes!("seeds/basic/seed_king.txt"),
+		}
 	}
 
 	/// A client move from an empty square fails as an invalid move.
@@ -296,10 +357,9 @@ mod tests {
 	fn an_illegal_client_move_is_an_invalid_move() {
 		let manager = ChessMatchManager::default();
 		let trace = TraceCollector::new();
-		let from_an_empty_square = ChessMoveRequest { from_row: 4, from_col: 4, to_row: 5, to_col: 4 };
+		let from_an_empty_square = ChessMoveRequest { from_row: 4, from_col: 4, to_row: 5, to_col: 4, promotion: 0 };
 
 		let refusal = manager.process_move(&from_an_empty_square, 1, &trace);
-
 		assert!(matches!(refusal, Err(ChessMoveError::InvalidMove)));
 	}
 }

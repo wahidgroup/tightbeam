@@ -4,7 +4,7 @@
 //! The settlement answer a client attaches to its receipt
 //! countersignature is a bearer secret (for example a payment preimage):
 //! whoever observes it can claim the settlement. If the answer travels in
-//! the client Finished in clear, a passive network observer steals it.
+//! the client Finished in the clear, a passive network observer steals it.
 //!
 //! ## Attack
 //! An observer captures the sealed client Finished and scans it for the
@@ -28,6 +28,7 @@ use std::sync::Arc;
 
 use tightbeam::asn1::OctetString;
 use tightbeam::exactly;
+use tightbeam::instrumentation::events;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_scenario;
 use tightbeam::testing::SetupEnv;
@@ -35,24 +36,12 @@ use tightbeam::transport::handshake::negotiation::{
 	AuthorizationGrant, AuthorizationRefusal, MuxBudgets, TransportAuthorizer, TransportOffer,
 };
 use tightbeam::transport::handshake::receipt::SessionReceipt;
-use tightbeam::urn::Urn;
 use tightbeam::utils::marker::MaybeSendFuture;
 use tightbeam::TightBeamError;
 
-use crate::common::security::{
-	cms_mutual_budget_pair, contains_window, CmsSessionHooks, PayingApprover, ServerMaterials,
-};
-
-pub(crate) const RECEIPTS_MATCH_ACROSS_ENDPOINTS: Urn<'static> =
-	tightbeam::urn!("test", "event:receipt-confidentiality/receipts-match-across-endpoints");
-pub(crate) const RESPONSE_CONFIDENTIAL_ON_WIRE: Urn<'static> =
-	tightbeam::urn!("test", "event:receipt-confidentiality/response-confidential-on-wire");
-pub(crate) const SERVER_RECOVERS_PLAINTEXT_ANSWER: Urn<'static> =
-	tightbeam::urn!("test", "event:receipt-confidentiality/server-recovers-plaintext-answer");
-pub(crate) const SETTLED_SESSION_ACTIVATES: Urn<'static> =
-	tightbeam::urn!("test", "event:receipt-confidentiality/settled-session-activates");
-pub(crate) const SETTLED_WITH_PLAINTEXT_ONCE: Urn<'static> =
-	tightbeam::urn!("test", "event:receipt-confidentiality/settled-with-plaintext-once");
+use crate::common::security::{contains_window, ClientMaterials, PayingApprover, ServerMaterials};
+use crate::security::common::HandshakeBackendKind;
+use crate::security::live::{LiveHandshake, ReceiptHooks, CLOSING_FRAME};
 
 const CHALLENGE: &[u8] = b"cms-conf-invoice";
 const RESPONSE: &[u8] = b"cms-conf-preimage";
@@ -99,11 +88,7 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(RESPONSE_CONFIDENTIAL_ON_WIRE, exactly!(1), equals!(true)),
-			(SETTLED_WITH_PLAINTEXT_ONCE, exactly!(1), equals!(true)),
-			(SERVER_RECOVERS_PLAINTEXT_ANSWER, exactly!(1), equals!(true)),
-			(RECEIPTS_MATCH_ACROSS_ENDPOINTS, exactly!(1), equals!(true)),
-			(SETTLED_SESSION_ACTIVATES, exactly!(1), equals!(true))
+			(events::SESSION_HANDSHAKE_COMPLETE, exactly!(1))
 		]
 	}
 }
@@ -117,67 +102,51 @@ tb_scenario! {
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
 			let materials = ServerMaterials::generate();
+			let identity = ClientMaterials::generate().identity();
 			let authorizer = Arc::new(SettlingAuthorizer {
 				challenge: OctetString::new(CHALLENGE)?,
 				expected_response: OctetString::new(RESPONSE)?,
 				settle_calls: AtomicU32::new(0),
 			});
-			let hooks = CmsSessionHooks {
+			let hooks = ReceiptHooks {
 				authorizer: Some(Arc::clone(&authorizer) as Arc<dyn TransportAuthorizer>),
 				approver: Some(Arc::new(PayingApprover::answering(RESPONSE)?)),
-				..CmsSessionHooks::default()
+				observer: None,
 			};
 
-			let pair = cms_mutual_budget_pair(&materials, REQUEST, hooks)?;
-			let (mut client, mut server) = (pair.client, pair.server);
-
-			let reply = server.reply(client.start()?).await?;
-			let client_finished = client.respond(reply).await?;
-			server.finish(client_finished.to_owned()).await?;
+			let kind = HandshakeBackendKind::Cms;
+			let handshake = LiveHandshake::budget_bearing(kind, materials, identity, REQUEST, hooks);
+			let outcome = handshake.audit_server(&trace).run().await?;
 
 			// The plaintext answer MUST stay out of the client Finished bytes
 			// on the wire, because it travels sealed under the handshake
 			// secret.
-			let response_leaked = contains_window(client_finished.der(), RESPONSE);
-			trace.event_with(
-				RESPONSE_CONFIDENTIAL_ON_WIRE,
-				&[],
-				!response_leaked,
-			)?;
+			let client_finished = outcome.relay.frame(CLOSING_FRAME)?;
+			assert!(
+				!contains_window(&client_finished, RESPONSE),
+				"the settlement answer crossed the wire in the clear"
+			);
 
-			// Settlement fired exactly once and saw the decrypted
-			// plaintext (the settle hook refuses anything else).
+			// Settlement fires exactly once and sees the decrypted
+			// plaintext, because the settle hook refuses anything else.
 			let settle_calls = authorizer.settle_calls.load(Ordering::SeqCst);
-			trace.event_with(
-				SETTLED_WITH_PLAINTEXT_ONCE,
-				&[],
-				settle_calls == 1,
-			)?;
+			assert_eq!(settle_calls, 1, "settle ran other than once");
 
 			// Both endpoints retain the identical dual-signed receipt,
 			// including the plaintext answer recovered from the sealed
 			// acknowledgement.
+			let (client, server) = outcome.established()?;
 			let client_receipt = client.session_receipt();
 			let server_receipt = server.session_receipt();
 			let expected_answer = OctetString::new(RESPONSE)?;
 			let answer_recovered =
 				server_receipt.is_some_and(|stored| stored.ancillary_response() == Some(&expected_answer));
 
-			trace.event_with(
-				SERVER_RECOVERS_PLAINTEXT_ANSWER,
-				&[],
-				answer_recovered,
-			)?;
-
-			let receipts_match = client_receipt.is_some() && client_receipt == server_receipt;
-			trace.event_with(
-				RECEIPTS_MATCH_ACROSS_ENDPOINTS,
-				&[],
-				receipts_match,
-			)?;
-
-			let activated = server.complete().is_ok();
-			trace.event_with(SETTLED_SESSION_ACTIVATES, &[], activated)?;
+			assert!(answer_recovered, "the server receipt lost the settlement answer");
+			assert!(
+				client_receipt.is_some() && client_receipt == server_receipt,
+				"the endpoints hold different receipts"
+			);
 
 			Ok::<(), TightBeamError>(())
 		}

@@ -1,7 +1,7 @@
-//! Outbound command plane.
+//! The outbound command plane.
 //!
 //! [`MuxWriterDriver`] serializes every envelope. The GoAway and renewal
-//! helpers on [`MuxShared`] feed its queue.
+//! methods of [`MuxShared`] feed its queue.
 
 use core::future::poll_fn;
 use core::pin::Pin;
@@ -52,7 +52,7 @@ enum WriterStep {
 	Closed,
 }
 
-/// Writer driver, the single serialization point for the connection.
+/// The writer driver, the single serialization point of the connection.
 ///
 /// The driver drains the outbound queue and writes each envelope through the
 /// [`EnvelopeSink`], encrypted or in cleartext. Spawn
@@ -64,27 +64,27 @@ where
 	writer: W,
 	commands: mpsc::Receiver<Outbound>,
 	shared: Arc<MuxShared>,
-	/// Records reserved for the drain before the send cipher halts.
+	/// The records reserved for the drain before the send cipher halts.
 	/// [`MuxSettings::drain_reserve_records`] derives the bound.
 	///
 	/// [`MuxSettings::drain_reserve_records`]: super::super::MuxSettings::drain_reserve_records
 	drain_headroom: u64,
-	/// Client half of the rekey exchange, shared with the reader driver. The
-	/// writer only calls `try_lock` on it, for the synchronous
+	/// The client half of the rekey exchange, shared with the reader driver.
+	/// The writer only calls `try_lock` on it, for the synchronous
 	/// [`ClientRekeyExchange::start_renewal`].
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	exchange: Option<Arc<FuturesMutex<Box<dyn ClientRekeyExchange>>>>,
-	/// `RekeyAck` held back until owed c2s chunks quiesce, with the fresh send
-	/// cipher it switches to. The ack must trail every old-epoch data chunk on
-	/// the wire.
+	/// The `RekeyAck` held back until owed c2s chunks quiesce, with the fresh
+	/// send cipher it switches to. The ack must trail every old-epoch data
+	/// chunk on the wire.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pending_ack: Option<(TransportEnvelope, Box<SendCipher>)>,
 	/// The instant the driver first observed the in-flight renewal, which
 	/// starts the deadline that bounds a stalled exchange.
 	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
 	renewal_started: Option<MonotonicInstant>,
-	/// Time budget for one renewal exchange before the connection drains. The
-	/// default is [`DEFAULT_REKEY_DEADLINE_SECS`].
+	/// The time budget of one renewal exchange before the connection drains.
+	/// The default is [`DEFAULT_REKEY_DEADLINE_SECS`].
 	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
 	renewal_deadline: Duration,
 	/// The clock the renewal deadline is stamped on and waited out on, the
@@ -111,7 +111,7 @@ impl<W> MuxWriterDriver<W>
 where
 	W: EnvelopeSink,
 {
-	/// Assemble the writer driver over the receiver of the outbound queue.
+	/// Assembles the writer driver over the receiver of the outbound queue.
 	///
 	/// This is the single construction point, so each field takes its initial
 	/// value in one place. The driver adopts the clock of the link it writes
@@ -140,7 +140,7 @@ where
 		}
 	}
 
-	/// Attach the shared handle to the client half of the rekey exchange, the
+	/// Attaches the shared handle to the client half of the rekey exchange, the
 	/// half [`RekeyDriver::renewal_opener`] yields, or `None` for a server.
 	///
 	/// [`RekeyDriver::renewal_opener`]: crate::transport::rekey::RekeyDriver::renewal_opener
@@ -149,13 +149,13 @@ where
 		self.exchange = exchange;
 	}
 
-	/// Override the time budget for one renewal exchange.
+	/// Overrides the time budget of one renewal exchange.
 	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
 	pub fn set_renewal_deadline(&mut self, deadline: Duration) {
 		self.renewal_deadline = deadline;
 	}
 
-	/// Run the driver until shutdown or write failure.
+	/// Runs the driver until shutdown or a write failure.
 	///
 	/// # Errors
 	///
@@ -186,7 +186,7 @@ where
 		Ok(())
 	}
 
-	/// Wait for the next unit of work.
+	/// Waits for the next unit of work.
 	///
 	/// With a renewal in flight and a timer available, the renewal deadline
 	/// bounds the wait, so a peer that never answers parks the connection only
@@ -216,7 +216,7 @@ where
 		poll_fn(|cx| self.poll_step(cx)).await
 	}
 
-	/// Poll for the next unit of work in a fixed order:
+	/// Polls for the next unit of work in a fixed order:
 	///
 	/// 1. A queued command, or the end of the queue.
 	/// 2. When the queue is momentarily empty, a held `RekeyAck` whose owed chunks have quiesced.
@@ -238,7 +238,7 @@ where
 		Poll::Pending
 	}
 
-	/// Deadline of the in-flight renewal, stamped on first observation from
+	/// The deadline of the in-flight renewal, stamped on first observation from
 	/// the driver's clock and cleared when the exchange concludes. A deadline
 	/// past every instant the clock can return never arrives, so it is `None`.
 	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
@@ -252,7 +252,7 @@ where
 		started.checked_add(self.renewal_deadline)
 	}
 
-	/// Write the key-switch marker and install the fresh send cipher at the
+	/// Writes the key-switch marker and installs the fresh send cipher at the
 	/// exact wire boundary.
 	///
 	/// The server's `RekeyDone` writes immediately, while the client's
@@ -268,8 +268,8 @@ where
 		self.writer.install_send_cipher(*cipher)
 	}
 
-	/// Write the held `RekeyAck` once owed chunks have quiesced, and switch the
-	/// send direction to the fresh epoch cipher.
+	/// Writes the held `RekeyAck` once owed chunks have quiesced, and switches
+	/// the send direction to the fresh epoch cipher.
 	///
 	/// The record counter resets together with the fresh key.
 	///
@@ -290,8 +290,8 @@ where
 		Ok(())
 	}
 
-	/// Open a renewal on the handle-side budget trigger when none is in flight.
-	/// The phase check deduplicates concurrent triggers.
+	/// Opens a renewal on the handle-side budget trigger when none is in
+	/// flight. The phase check deduplicates concurrent triggers.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	async fn try_open_renewal(&mut self) -> TransportResult<()> {
 		let Some(exchange) = self.exchange.as_ref() else {
@@ -304,12 +304,23 @@ where
 		self.writer.write_envelope(request).await
 	}
 
-	/// Drain with a GoAway after the renewal deadline elapses, and wake parked
-	/// admissions and chunks so owed traffic can flush.
+	/// Drains with a GoAway after the renewal deadline elapses, and wakes
+	/// parked admissions and chunks so owed traffic can flush. The connection's
+	/// trail records the expired renewal as `MUX_REKEY_EXPIRED`, ahead of the
+	/// GoAway.
+	///
+	/// # Errors
+	///
+	/// - The write failure of the GoAway.
+	/// - The injected error, when the runtime fault model injects a fault at
+	///   the record of the expired renewal or at the event of the GoAway.
 	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
 	async fn fail_renewal(&mut self) -> TransportResult<()> {
 		self.pending_ack = None;
 		self.renewal_started = None;
+
+		#[cfg(feature = "instrument")]
+		self.shared.emit_event(events::MUX_REKEY_EXPIRED)?;
 
 		if let Some(package) = self.shared.goaway_package(GoAwayReason::Shutdown) {
 			let envelope = TransportEnvelope::from(package);
@@ -324,12 +335,12 @@ where
 		Ok(())
 	}
 
-	/// Act before the send cipher reaches its record limit.
+	/// Acts before the send cipher reaches its record limit.
 	///
 	/// - A client with rekey materials opens an in-band renewal at a headroom
 	///   above the drain threshold, with [`DEFAULT_REKEY_RENEWAL_ALLOWANCE`]
 	///   records of slack for the exchange legs. At the drain threshold, with
-	///   the renewal still in flight, it parks data chunks at the hard floor.
+	///   the renewal in flight, it parks data chunks at the hard floor.
 	/// - A session without rekey materials drains through a GoAway while enough
 	///   records remain to answer in-flight peer streams and flush
 	///   registered-but-unsent chunks. The caller then reestablishes the
@@ -379,7 +390,7 @@ where
 }
 
 impl MuxShared {
-	/// Halt the allocator and build the GoAway, once per connection.
+	/// Halts the allocator and builds the GoAway, once per connection.
 	///
 	/// Returns `None` when shutdown already began. The caller records
 	/// `MUX_GOAWAY_SENT` once it queued or wrote the package, so a fault the
@@ -390,7 +401,7 @@ impl MuxShared {
 		Some(GoAwayPackage::new(last_peer, reason))
 	}
 
-	/// Open a renewal exactly once and return its `RekeyRequest` envelope.
+	/// Opens a renewal exactly once and returns its `RekeyRequest` envelope.
 	///
 	/// The readiness check and the phase transition happen while this call
 	/// holds the exchange, so concurrent triggers collapse to a single

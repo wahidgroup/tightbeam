@@ -389,10 +389,17 @@ where
 	}
 
 	/// Accepts one connection as a transport built from this listener's
-	/// configuration.
+	/// configuration, which names the address it accepted the connection
+	/// from.
 	pub fn accept(&self) -> TransportResult<TcpTransport<L::Stream, P>> {
-		let (stream, _) = self.listener.accept()?;
+		let (stream, peer) = self.listener.accept()?;
 		let transport = TcpTransport::new(stream, self.config.clone());
+
+		#[cfg(feature = "instrument")]
+		let transport = transport.accepted_from_peer(peer);
+		#[cfg(not(feature = "instrument"))]
+		let _ = peer;
+
 		Ok(transport)
 	}
 }
@@ -474,18 +481,18 @@ mod tests {
 	}
 
 	/// The outcome of one read of `transport` on a thread of its own, or
-	/// `None` while the read still blocks after `guard`.
+	/// `None` when the read blocks past `guard`.
 	///
 	/// # Panics
 	///
-	/// - The read thread ended with no outcome, as a panic in the read ends it.
+	/// - The read thread ends with no outcome, which a panic in the read causes.
 	fn read_within(mut transport: TcpTransport<NetTcpStream>, guard: Duration) -> Option<TransportResult<Vec<u8>>> {
 		let (sender, receiver) = mpsc::channel();
 		thread::spawn(move || {
 			let runtime = tokio::runtime::Builder::new_current_thread().build().expect("a runtime builds");
 			let outcome = runtime.block_on(transport.read_envelope_bytes());
-			// The receiver is gone once the case stopped waiting, and the case
-			// has then reported the blocked read.
+			// The receiver is gone once the guard runs out, and the case then
+			// reports the read as blocked.
 			let _ = sender.send(outcome);
 		});
 

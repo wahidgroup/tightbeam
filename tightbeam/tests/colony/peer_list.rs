@@ -1,13 +1,12 @@
 //! Peer-list gate integration tests.
 //!
-//! [`PeerListGate`] keys on the connection's mutually-authenticated peer
+//! [`PeerListGate`] keys on the connection's mutually authenticated peer
 //! identity: the collector gate on a mux server bars or admits a client
-//! by the SPKI DER of its validated certificate, without the handler
-//! ever seeing a refused frame.
+//! by the SPKI DER of its validated certificate, so a refused frame stops
+//! ahead of the handler.
 
 #![cfg(all(feature = "tcp", feature = "testing", feature = "instrument"))]
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tightbeam::colony::hive::PeerListGate;
@@ -15,13 +14,13 @@ use tightbeam::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
 use tightbeam::crypto::sign::SigningIdentity;
 use tightbeam::crypto::x509::CertificateSpec;
 use tightbeam::der::Encode;
-use tightbeam::exactly;
 use tightbeam::instrumentation::events;
 use tightbeam::prelude::TightBeamSocketAddr;
 use tightbeam::server;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_scenario;
-use tightbeam::testing::{ClientEnv, SetupEnv, TestFrame};
+use tightbeam::testing::fixtures::TestTrace;
+use tightbeam::testing::{ClientEnv, ScenarioConfig, SetupEnv, TestFrame};
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::handshake::negotiation::TransportOffer;
 use tightbeam::transport::policy::CollectorGateConfig;
@@ -29,27 +28,20 @@ use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::{
 	ConnectionBuilder, ConnectionPool, PoolConfig, PooledClient, TransportError, TransportFailure,
 };
-use tightbeam::urn::Urn;
 use tightbeam::x509::Certificate;
+use tightbeam::{absent, exactly};
 use tightbeam::{Frame, TightBeamError};
 use tokio::task::JoinHandle;
 
 use crate::common::security::{pinning_trust_store, random_signing_key, test_certificate, ServerMaterials};
 use crate::transport::support::bind_mutual_listener;
 
-pub(crate) const ALLOW_LIST_ADMITS_THE_PEER: Urn<'static> =
-	tightbeam::urn!("test", "event:peer-list/allow-list-admits-the-peer");
-pub(crate) const DENY_LIST_BARS_THE_DOOR: Urn<'static> =
-	tightbeam::urn!("test", "event:peer-list/deny-list-bars-the-door");
-pub(crate) const HANDLER_NEVER_INVOKED: Urn<'static> = tightbeam::urn!("test", "event:peer-list/handler-never-invoked");
-
-/// A mutual-auth doorman fixture: the server materials, the client identity
-/// the gate lists, and whether any frame got past the door.
+/// A mutual-auth doorman fixture: the server materials and the client
+/// identity the gate lists.
 struct DoormanContext {
 	materials: ServerMaterials,
 	client_certificate: Arc<Certificate>,
 	client_provider: Arc<dyn SigningKeyProvider>,
-	handler_invoked: AtomicBool,
 }
 
 impl DoormanContext {
@@ -57,12 +49,7 @@ impl DoormanContext {
 		let signing_key = random_signing_key();
 		let client_certificate = Arc::new(test_certificate(&signing_key));
 		let client_provider: Arc<dyn SigningKeyProvider> = Arc::new(Secp256k1KeyProvider::from(signing_key));
-		Self {
-			materials: ServerMaterials::generate(),
-			client_certificate,
-			client_provider,
-			handler_invoked: AtomicBool::new(false),
-		}
+		Self { materials: ServerMaterials::generate(), client_certificate, client_provider }
 	}
 
 	/// The client's account key: the SPKI DER the peer-list gate
@@ -81,7 +68,6 @@ async fn start_doorman_server(
 ) -> Result<(JoinHandle<()>, TightBeamSocketAddr), TightBeamError> {
 	let (listener, addr) = bind_mutual_listener(&ctx.materials, &ctx.client_certificate).await?;
 	let addr = TightBeamSocketAddr(addr);
-	let door = Arc::clone(ctx);
 	let trace = trace.share();
 	let handle = server! {
 		protocol TokioListener: listener,
@@ -91,13 +77,7 @@ async fn start_doorman_server(
 			// Policy expressions re-evaluate per accepted connection.
 			with_collector_gate: [ gate.clone() ]
 		},
-		handle: move |frame: Frame| {
-			let door = Arc::clone(&door);
-			async move {
-				door.handler_invoked.store(true, Ordering::SeqCst);
-				Ok(Some(frame))
-			}
-		}
+		handle: move |frame: Frame| async move { Ok(Some(frame)) }
 	};
 
 	Ok((handle, addr))
@@ -136,6 +116,9 @@ async fn knock(lease: &mut PooledClient<TokioListener>) -> Result<bool, TightBea
 	Ok(reply == Some(frame))
 }
 
+// The trace sets the detail flag, so the one policy step of the gate shows
+// that the server records on the trace, and `absent!()` on the handler span
+// reads the refusal of the gate.
 tb_assert_spec! {
 	pub PeerDenyListSpec,
 	V(1,0,0): {
@@ -143,18 +126,21 @@ tb_assert_spec! {
 		assertions: [
 			(events::POOL_DIAL, exactly!(1)),
 			(events::GATE_REJECT, exactly!(1)),
-			(DENY_LIST_BARS_THE_DOOR, exactly!(1), equals!(true)),
-			(HANDLER_NEVER_INVOKED, exactly!(1), equals!(true))
+			(events::POLICY_EVAL, exactly!(1)),
+			(events::HANDLER_ENTER, absent!())
 		]
 	}
 }
 
-// A black-listed public key completes the mutual handshake, but the door
+// A deny-listed public key completes the mutual handshake, but the door
 // gate matches the session's peer identity and refuses every frame
 // before the handler sees one.
 tb_scenario! {
 	name: peer_deny_listed_client_is_barred,
-	spec: PeerDenyListSpec,
+	config: ScenarioConfig::builder()
+		.with_spec(PeerDenyListSpec::latest())
+		.with_trace(TestTrace::with_detail(true))
+		.build(),
 	environment ServiceClient {
 		context: DoormanContext::generate(),
 		server: |SetupEnv { context: ctx, trace }| async move {
@@ -166,16 +152,8 @@ tb_scenario! {
 			let mut lease = pool.connect(addr).await?;
 
 			let outcome = lease.emit(TestFrame::v0(Some("door-knock"), None), None).await;
-			trace.event_with(
-				DENY_LIST_BARS_THE_DOOR,
-				&[],
-				matches!(
-					outcome,
-					Err(TransportError::OperationFailed(TransportFailure::PermissionDenied))
-				),
-			)?;
-
-			trace.event_with(HANDLER_NEVER_INVOKED, &[], !ctx.handler_invoked.load(Ordering::SeqCst))?;
+			let barred = matches!(outcome, Err(TransportError::OperationFailed(TransportFailure::PermissionDenied)));
+			assert!(barred, "the deny list bars the client");
 			Ok(())
 		}
 	}
@@ -187,13 +165,12 @@ tb_assert_spec! {
 		mode: Accept,
 		assertions: [
 			(events::POOL_DIAL, exactly!(1)),
-			(events::GATE_ACCEPT, exactly!(1)),
-			(ALLOW_LIST_ADMITS_THE_PEER, exactly!(1), equals!(true))
+			(events::GATE_ACCEPT, exactly!(1))
 		]
 	}
 }
 
-// The same gate in allow mode admits the listed key: the white list
+// The same gate in allow mode admits the listed key: the allow list
 // proves the gate keys on the session identity, not on frames.
 tb_scenario! {
 	name: peer_allow_listed_client_is_admitted,
@@ -209,7 +186,7 @@ tb_scenario! {
 			let mut lease = pool.connect(addr).await?;
 
 			let echoed = knock(&mut lease).await?;
-			trace.event_with(ALLOW_LIST_ADMITS_THE_PEER, &[], echoed)?;
+			assert!(echoed, "the allow-listed client's knock echoes");
 			Ok(())
 		}
 	}

@@ -1,15 +1,15 @@
-//! Errors of the authenticated envelope and its recipients.
+//! The errors of the authenticated envelope and its recipients.
 
 use crate::cms::content_info::CmsVersion;
 use crate::der::asn1::ObjectIdentifier;
 use crate::error::ReceivedExpectedError;
 use crate::Errorizable;
 
-/// Errors of a seal or an open of an
+/// The errors of a seal or an open of an
 /// [`AuthEnvelopedData`](super::AuthEnvelopedData).
 ///
-/// An opener refuses with one of these before any byte of the content is
-/// released, and every refusal of the tag, the wrapped key, or a field of the
+/// An opener refuses with one of these before it releases any byte of the
+/// content, and every refusal of the tag, the wrapped key, or a field of the
 /// recipient leaves the content closed.
 #[derive(Errorizable, Debug)]
 #[non_exhaustive]
@@ -25,14 +25,16 @@ pub enum EnvelopeError {
 	ContentEncryptionAlgorithm,
 
 	/// The tag length the parameters name, such as `aes-ICVlen`, or the
-	/// length of `mac`, is another than the cipher's (RFC 5084 §3.2).
+	/// length of `mac`, is another than the cipher's (RFC 5084 §3.2). On a
+	/// seal, `aes-ICVlen` cannot name the cipher's tag length, and the error
+	/// expects the nearest length that the field names.
 	#[error("Tag length differs: {0:?}")]
 	TagLength(ReceivedExpectedError<usize, usize>),
 
 	/// The authenticated attributes carry no content-type attribute, carry
 	/// it twice, or carry another number of values in it (RFC 5083 §2.1). On
 	/// a seal, the caller's attributes carry a content-type attribute.
-	#[error("The authenticated attributes carry no single content-type attribute")]
+	#[error("The authenticated attributes carry no single content-type attribute, or a seal's caller supplied one")]
 	ContentTypeAttribute,
 
 	/// The content type differs from the one the opener expects, or the
@@ -142,6 +144,55 @@ pub enum EnvelopeError {
 	/// A structure or an attribute failed to encode or decode.
 	#[error("CMS encoding error: {0}")]
 	Encoding(crate::der::Error),
+}
+
+// Only the audit record of a refused handshake names a refusal, so the name
+// takes the gate of that record.
+#[cfg(all(
+	feature = "instrument",
+	any(feature = "transport-cms", feature = "transport-hpke")
+))]
+impl EnvelopeError {
+	crate::macros::names::refusal_names! {
+		[
+			/// Returns the label of a handshake whose sealed closing fails to
+			/// open for this refusal: `sealed-closing/` and the stable
+			/// kebab-case name of the refusal.
+			///
+			/// The name leaves out the fields a refusal carries, so one
+			/// refusal reads as one label whatever envelope it names.
+			fn sealed_closing_label = "sealed-closing/";
+		]
+		{
+			Self::Version(_) => "version",
+			Self::ContentEncryptionAlgorithm => "content-encryption-algorithm",
+			Self::TagLength(_) => "tag-length",
+			Self::ContentTypeAttribute => "content-type-attribute",
+			Self::ContentType(_) => "content-type",
+			Self::AuthenticatedAttribute => "authenticated-attribute",
+			Self::AuthAttributesNotDer => "auth-attributes-not-der",
+			Self::MissingContent => "missing-content",
+			Self::RecipientKind => "recipient-kind",
+			Self::RecipientVersion(_) => "recipient-version",
+			Self::RecipientIdentifier => "recipient-identifier",
+			Self::RecipientAlgorithm => "recipient-algorithm",
+			Self::KekLength(_) => "kek-length",
+			Self::Ukm => "ukm",
+			Self::KeyIdentifier => "key-identifier",
+			Self::KemPoint => "kem-point",
+			Self::KeyUnwrap => "key-unwrap",
+			Self::Authentication => "authentication",
+			Self::Encryption => "encryption",
+			Self::Random => "random",
+			Self::Key(_) => "key",
+			#[cfg(feature = "hpke")]
+			Self::Kem(_) => "kem",
+			Self::Kdf(_) => "kdf",
+			Self::Certificate(_) => "certificate",
+			Self::KeyMismatch => "key-mismatch",
+			Self::Encoding(_) => "encoding",
+		}
+	}
 }
 
 crate::impl_from!(crate::crypto::key::KeyError => EnvelopeError::Key);

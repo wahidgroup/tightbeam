@@ -1,7 +1,7 @@
 //! The intra-hive routing context, backed by a servlet connection pool.
 
 use std::collections::HashMap;
-use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::cms::signed_data::SignerIdentifier;
 use crate::colony::bound_dial::{BoundDial, ExpectedSigner};
@@ -10,6 +10,7 @@ use crate::colony::hive::{
 	CallFuture, DuplexOpenFuture, HashMapRegistry, HiveContext, ServletRegistry, StreamOpenFuture, StreamResponseFuture,
 };
 use crate::router::RouterError;
+use crate::trace::TraceCollector;
 use crate::transport::client::ConnectionPool;
 use crate::transport::{PooledClient, Protocol};
 use crate::urn::Urn;
@@ -24,34 +25,41 @@ struct Sibling {
 }
 
 impl Sibling {
-	/// Connects to this sibling on `pool`, once the party that answers proves
-	/// it holds the certificate [`Self::signer`] names (CWE-346).
+	/// Connects to this sibling on the pool of `plane`, once the party that
+	/// answers proves it holds the certificate [`Self::signer`] names
+	/// (CWE-346). A refused answer records its refusal on the trace of `plane`.
 	///
 	/// # Errors
 	///
 	/// - The errors of [`BoundDial::connect`], as [`TightBeamError::ClusterError`].
-	async fn connect<P: ColonyDialProtocol>(
-		self,
-		pool: &Arc<ConnectionPool<P>>,
-	) -> Result<PooledClient<P>, TightBeamError> {
+	async fn connect<P: ColonyDialProtocol>(self, plane: &SiblingPlane<P>) -> Result<PooledClient<P>, TightBeamError> {
 		let target = DialTarget::of_registered(&self.address);
 		let dial = BoundDial::new(target, ExpectedSigner::Hive(self.signer));
-
-		Ok(dial.connect(pool).await?)
+		Ok(dial.connect(&plane.pool, &plane.trace).await?)
 	}
+}
+
+/// The pool that sibling calls dial on, beside the trace that records each
+/// dial it refuses.
+///
+/// A hive sets a whole plane when it establishes, so a call reads the pool
+/// and the trace of one hive state.
+struct SiblingPlane<P: Protocol> {
+	pool: Arc<ConnectionPool<P>>,
+	trace: Arc<TraceCollector>,
 }
 
 /// Maps an instance key or a type key to the sibling it routes to.
 type SiblingMap = HashMap<Vec<u8>, Sibling>;
 
-/// Instance routes and the type index they produce.
+/// The instance routes and the type index they produce.
 ///
 /// # One lock
 ///
 /// The index derives from the instances, so both live behind one lock and
-/// under one owner. A reader sees an index that names an address the
-/// instance map still holds, and every caller takes the same single lock,
-/// which rules out a lock-order deadlock between two callers (CWE-362).
+/// under one owner. A reader sees an index that names only addresses the
+/// instance map holds, and every caller takes the same single lock, which
+/// rules out a lock-order deadlock between two callers (CWE-362).
 ///
 /// # Poison recovery
 ///
@@ -66,15 +74,26 @@ struct Routes {
 }
 
 impl Routes {
-	/// Inserts `sibling` under `key`. The first instance registered for a type
-	/// owns the index entry.
+	/// Inserts `sibling` under `key`.
+	///
+	/// - The first instance registered for a type owns the index entry.
+	/// - A sibling that replaces the indexed instance takes the entry over.
+	///   An instance key names the type and the address, so within one type
+	///   the indexed instance is the one at the indexed address.
 	///
 	/// `sibling` moves into the instance map. The index takes extra [`Arc`]
-	/// handles only for a new type, so it shares the address and the signer.
+	/// handles only for an entry it takes, so it shares the address and the
+	/// signer.
 	fn insert(&mut self, key: impl Into<Vec<u8>>, sibling: Sibling, type_bytes: impl AsRef<[u8]>) {
 		let key: Vec<u8> = key.into();
 		let type_bytes = type_bytes.as_ref();
-		self.by_type.entry(type_bytes.to_vec()).or_insert_with(|| sibling.clone());
+		match self.by_type.get_mut(type_bytes) {
+			Some(indexed) if indexed.address == sibling.address => *indexed = sibling.clone(),
+			Some(_) => {}
+			None => {
+				self.by_type.insert(type_bytes.to_vec(), sibling.clone());
+			}
+		}
 		self.instances.insert(key, sibling);
 	}
 
@@ -122,15 +141,88 @@ impl Routes {
 /// dials bound to that signer, so a party that answers at a sibling's address
 /// under another identity receives no frame (CWE-346). A route exists only
 /// for a servlet that names a signer.
+///
+/// # Planes
+///
+/// A call dials on the provisional plane, the pool that [`Self::new`] takes
+/// and the trace that [`Self::with_trace`] names, until the hive that holds
+/// the context establishes. The established hive sets a plane of its own
+/// once, and each later call dials on it. A call reads its plane with no
+/// lock, and a call already in flight finishes on the plane it started on.
 pub struct HiveContextImpl<P: Protocol> {
 	routes: Arc<RwLock<Routes>>,
-	pool: Arc<ConnectionPool<P>>,
+	/// The pool and the trace that each sibling call uses until the hive
+	/// establishes.
+	provisional: SiblingPlane<P>,
+	/// The pool and the trace of the established hive. A hive establishes
+	/// once, so the slot takes its value once.
+	established: OnceLock<SiblingPlane<P>>,
 }
 
 impl<P: Protocol> HiveContextImpl<P> {
 	/// Creates empty routes bound to the hive servlet pool.
+	///
+	/// The context records each refused dial on a trace of its own until
+	/// [`Self::with_trace`] names another, or the hive that holds it
+	/// establishes.
 	pub fn new(pool: Arc<ConnectionPool<P>>) -> Self {
-		Self { routes: Arc::new(RwLock::new(Routes::default())), pool }
+		let trace = Arc::new(TraceCollector::default());
+		let provisional = SiblingPlane { pool, trace };
+
+		Self {
+			routes: Arc::new(RwLock::new(Routes::default())),
+			provisional,
+			established: OnceLock::new(),
+		}
+	}
+
+	/// Records each sibling dial that this context refuses into `trace`, until
+	/// the hive that holds the context establishes with a trace of its own.
+	///
+	/// A builder of the context gives it the trace it reads, so the pool and
+	/// the refusals of one plane can record into one trace.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::colony::hive::HiveContextImpl;
+	/// use tightbeam::trace::TraceCollector;
+	/// use tightbeam::transport::client::{ConnectionBuilder, ConnectionPool};
+	/// use tightbeam::transport::tcp::r#async::TokioListener;
+	///
+	/// let trace = TraceCollector::default();
+	/// let pool = Arc::new(ConnectionPool::<TokioListener>::builder().build());
+	/// let routes = HiveContextImpl::new(pool).with_trace(trace.share());
+	/// ```
+	#[must_use]
+	pub fn with_trace(mut self, trace: impl Into<Arc<TraceCollector>>) -> Self {
+		self.provisional.trace = trace.into();
+		self
+	}
+
+	/// The plane that a sibling call starts on: the established one once the
+	/// hive establishes, and the provisional one before.
+	fn plane(&self) -> &SiblingPlane<P> {
+		self.established.get().unwrap_or(&self.provisional)
+	}
+
+	/// Sets the plane that each later sibling call dials on to `pool` and
+	/// `trace`, for the hive that establishes.
+	///
+	/// A call already in flight finishes on the plane it started on.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError::AlreadyEstablished`] -- the hive set its plane already.
+	pub(crate) fn establish_plane(
+		&self,
+		pool: Arc<ConnectionPool<P>>,
+		trace: Arc<TraceCollector>,
+	) -> Result<(), TightBeamError> {
+		let plane = SiblingPlane { pool, trace };
+		self.established.set(plane).map_err(|_| TightBeamError::AlreadyEstablished)
 	}
 
 	/// Takes the write lock of the routes. It recovers a poisoned lock,
@@ -146,7 +238,8 @@ impl<P: Protocol> HiveContextImpl<P> {
 	}
 
 	/// Routes `key` to the sibling at `addr` that answers under `signer`, and
-	/// indexes `type_bytes` on it when the type has no route yet.
+	/// indexes `type_bytes` on it when the type has no route yet or its route
+	/// names `addr`.
 	///
 	/// A call through the route admits only the certificate `signer` names
 	/// (RFC 5652 §5.3).
@@ -245,7 +338,7 @@ impl<P: ColonyDialProtocol> HiveContext for HiveContextImpl<P> {
 	fn call<'a>(&'a self, servlet_type: &'a Urn<'a>, frame: Frame) -> CallFuture<'a> {
 		Box::pin(async move {
 			let sibling = self.sibling(servlet_type)?;
-			let mut pooled_conn = sibling.connect(&self.pool).await?;
+			let mut pooled_conn = sibling.connect(self.plane()).await?;
 			// The context emits the caller's frame as-is, so an applied
 			// nonrepudiation signature stays verifiable at the servlet.
 			let response = pooled_conn.emit(frame, None).await?;
@@ -256,7 +349,7 @@ impl<P: ColonyDialProtocol> HiveContext for HiveContextImpl<P> {
 	fn open_stream<'a>(&'a self, servlet_type: &'a Urn<'a>) -> StreamOpenFuture<'a> {
 		Box::pin(async move {
 			let sibling = self.sibling(servlet_type)?;
-			let pooled_conn = sibling.connect(&self.pool).await?;
+			let pooled_conn = sibling.connect(self.plane()).await?;
 			let (sink, response) = pooled_conn.open_stream()?;
 
 			// The lease returns to the pool here, and the sink and the response
@@ -274,7 +367,7 @@ impl<P: ColonyDialProtocol> HiveContext for HiveContextImpl<P> {
 	fn open_duplex<'a>(&'a self, servlet_type: &'a Urn<'a>) -> DuplexOpenFuture<'a> {
 		Box::pin(async move {
 			let sibling = self.sibling(servlet_type)?;
-			let pooled_conn = sibling.connect(&self.pool).await?;
+			let pooled_conn = sibling.connect(self.plane()).await?;
 
 			let duplex = pooled_conn.open_duplex()?;
 			Ok(duplex)
@@ -288,7 +381,10 @@ mod tests {
 	use crate::colony::hive::{ServletBox, ServletRegistration, SpawnerFn};
 	use crate::colony::protocol::ServletInfo;
 	use crate::colony::urn::ColonyNamespace;
+	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
+	use crate::crypto::x509::utils::CertificateExt;
 	use crate::tb_cases;
+	use crate::testing::TestCertificate;
 	use crate::transport::client::ConnectionBuilder;
 	use crate::transport::TokioListener;
 	use std::sync::mpsc;
@@ -319,6 +415,25 @@ mod tests {
 		routes.insert(instance("a"), sibling("10.0.0.1"), TYPE);
 		routes.insert(instance("b"), sibling("10.0.0.2"), TYPE);
 		assert_eq!(routes.resolve(TYPE), Some(sibling("10.0.0.1")));
+	}
+
+	/// A sibling that answers under a second key, at `bytes`.
+	fn resigned_sibling(bytes: &'static str) -> Sibling {
+		let key = Secp256k1SigningKey::from_bytes(&[7; 32].into()).expect("the fixture scalar is a valid key");
+		let certificate = TestCertificate::self_signed(&key);
+		let signer = certificate.signer_identifier().expect("the fixture certificate names its key");
+
+		Sibling { address: addr(bytes), signer: Arc::new(signer) }
+	}
+
+	// An instance that replaces the indexed one at its address takes the type
+	// over, so a call dials bound to the signer that answers there.
+	#[test]
+	fn a_replacement_of_the_indexed_instance_takes_the_index() {
+		let mut routes = Routes::default();
+		routes.insert(instance("a"), sibling("10.0.0.1"), TYPE);
+		routes.insert(instance("a"), resigned_sibling("10.0.0.1"), TYPE);
+		assert_eq!(routes.resolve(TYPE), Some(resigned_sibling("10.0.0.1")));
 	}
 
 	#[test]

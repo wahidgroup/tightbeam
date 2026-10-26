@@ -16,8 +16,8 @@
 //!   hyphens, with a letter first and a letter or digit last.
 //! - **NSS**: the Namespace-Specific String, whose structure the namespace specification defines.
 //!
-//! Note: this implementation leaves out the optional r-component,
-//! q-component, and f-component of RFC 8141.
+//! The implementation covers the NID and the NSS. The optional r-component,
+//! q-component, and f-component of RFC 8141 are out of its scope.
 //!
 //! # Examples
 //!
@@ -96,7 +96,7 @@ pub struct Urn<'a> {
 }
 
 impl<'a> Urn<'a> {
-	/// A URN from static parts, with no checks.
+	/// Builds a URN from static parts and skips every check.
 	///
 	/// It exists for [`urn!`](crate::urn!), which validates both parts in a
 	/// `const` block before it calls this function, and it has to be `pub`
@@ -106,7 +106,7 @@ impl<'a> Urn<'a> {
 		Urn { nid: Cow::Borrowed(nid), nss: Cow::Borrowed(nss) }
 	}
 
-	/// Build a URN from parts known only at run time.
+	/// Builds a URN from parts known only at run time.
 	///
 	/// [`urn!`](crate::urn!) is the compile-time path for literals. This one
 	/// applies the same rules to values a caller assembles.
@@ -134,13 +134,13 @@ impl<'a> Urn<'a> {
 		&self.nss
 	}
 
-	/// Verify this URN against the spec `S`.
+	/// Verifies this URN against the spec `S`.
 	///
 	/// # Errors
 	///
 	/// - [`UrnValidationError::NidMismatch`] -- the NID differs from `S::NID`.
-	/// - The errors of `validate_nid` -- the NID has an invalid format.
-	/// - The errors of `S::validate` -- the NSS structure breaks the spec's requirements.
+	/// - The errors of [`Urn::validate_nid`] -- the NID has an invalid format.
+	/// - The errors of [`UrnSpec::validate`] -- the NSS structure breaks the spec's requirements.
 	pub fn verify<S: UrnSpec>(&self) -> Result<(), UrnValidationError> {
 		if self.nid.as_ref() != S::NID {
 			return Err(UrnValidationError::NidMismatch);
@@ -154,7 +154,7 @@ impl<'a> Urn<'a> {
 		S::validate(&builder as &dyn UrnComponents)
 	}
 
-	/// Validate the NID against RFC 8141 § 2.1.
+	/// Validates the NID against RFC 8141 § 2.1.
 	/// See: `<https://datatracker.ietf.org/doc/html/rfc8141#section-2.1>`
 	///
 	/// The NID production of RFC 8141 § 2 is
@@ -209,7 +209,7 @@ impl<'a> Urn<'a> {
 		Ok(())
 	}
 
-	/// Validate a Namespace-Specific String.
+	/// Validates a Namespace-Specific String.
 	///
 	/// RFC 8141 § 2 requires at least one NSS character: `urn:nid:` names
 	/// nothing, and an empty NSS would collide with every other empty one.
@@ -237,7 +237,7 @@ impl<'a> Urn<'a> {
 		Ok(Urn { nid, nss })
 	}
 
-	/// Convert the URN to an owned version with the `'static` lifetime.
+	/// Converts the URN into an owned version with the `'static` lifetime.
 	///
 	/// The borrowed strings become owned strings, so the URN can outlive the
 	/// data it borrowed, as with `Cow::into_owned()`.
@@ -253,8 +253,8 @@ impl<'a> fmt::Display for Urn<'a> {
 	}
 }
 
-// Parsing always produces owned data: the input string may not outlive
-// the URN, so both components are copied into `'static` Cows.
+// The parser always returns owned data. The URN can outlive the input
+// string, so the parser copies both components into `'static` Cows.
 impl FromStr for Urn<'static> {
 	type Err = UrnValidationError;
 
@@ -287,9 +287,9 @@ impl<'a> EncodeValue for Urn<'a> {
 	}
 }
 
-// Decoding always produces owned data, so the decoded URN is `'static`
-// regardless of the reader's lifetime. This is what lets derived
-// `Sequence` types carry `Urn<'static>` fields directly.
+// The decoder always returns owned data, so the decoded URN is `'static`
+// for any lifetime of the reader, and a derived `Sequence` type can carry a
+// `Urn<'static>` field directly.
 impl<'a> DecodeValue<'a> for Urn<'static> {
 	fn decode_value<R: crate::der::Reader<'a>>(
 		reader: &mut R,
@@ -339,53 +339,52 @@ mod tests {
 		assert_eq!(outcomes, NID_CASES);
 	}
 
-	#[test]
-	fn test_urn_from_str_round_trips_display() -> Result<(), UrnValidationError> {
-		// (input, nid, nss)
-		let cases: &[(&str, &str, &str)] = &[
-			("urn:tightbeam:servlet:prod:ping", "tightbeam", "servlet:prod:ping"),
-			(
-				"urn:test:event:cluster/peer-advertised",
-				"test",
-				"event:cluster/peer-advertised",
-			),
-			("urn:my-ns:a", "my-ns", "a"),
-		];
-
-		for (input, nid, nss) in cases {
+	// Each case is (input, nid, nss).
+	crate::tb_cases! {
+		fn test_urn_from_str_round_trips_display((input, nid, nss): (&str, &str, &str))
+			-> Result<(), UrnValidationError>
+		{
 			let urn: Urn<'static> = input.parse()?;
-			assert_eq!(urn.nid, *nid);
-			assert_eq!(urn.nss, *nss);
-			assert_eq!(urn.to_string(), *input);
+			assert_eq!(urn.nid, nid);
+			assert_eq!(urn.nss, nss);
+			assert_eq!(urn.to_string(), input);
+			Ok(())
 		}
-
-		Ok(())
+		cases {
+			servlet => ("urn:tightbeam:servlet:prod:ping", "tightbeam", "servlet:prod:ping"),
+			event => ("urn:test:event:cluster/peer-advertised", "test", "event:cluster/peer-advertised"),
+			hyphenated_nid => ("urn:my-ns:a", "my-ns", "a"),
+		}
 	}
 
-	#[test]
-	fn test_urn_from_str_rejects_malformed() {
-		let cases: &[&str] = &["", "urn:", "urn:onlynid", "urn:nid:", "no-prefix:nid:nss", "urn:1bad:nss"];
-		for input in cases {
+	crate::tb_cases! {
+		fn test_urn_from_str_rejects_malformed(input: &str) {
 			assert!(input.parse::<Urn<'static>>().is_err());
 		}
+		cases {
+			empty => "",
+			scheme_alone => "urn:",
+			nid_alone => "urn:onlynid",
+			empty_nss => "urn:nid:",
+			no_scheme => "no-prefix:nid:nss",
+			digit_first_nid => "urn:1bad:nss",
+		}
 	}
 
-	#[test]
-	fn test_urn_to_owned() {
-		// (nid, nss)
-		let test_cases: &[(&str, &str)] = &[
-			("tightbeam", "test:resource"),
-			("example", "path/to/resource"),
-			("test", "simple"),
-		];
-
-		for (nid, nss) in test_cases {
-			let urn = Urn { nid: Cow::Borrowed(*nid), nss: Cow::Borrowed(*nss) };
+	// Each case is (nid, nss).
+	crate::tb_cases! {
+		fn test_urn_to_owned((nid, nss): (&str, &str)) {
+			let urn = Urn { nid: Cow::Borrowed(nid), nss: Cow::Borrowed(nss) };
 			let owned_urn = urn.into_owned();
 			assert!(matches!(owned_urn.nid, Cow::Owned(_)));
 			assert!(matches!(owned_urn.nss, Cow::Owned(_)));
-			assert_eq!(owned_urn.nid, *nid);
-			assert_eq!(owned_urn.nss, *nss);
+			assert_eq!(owned_urn.nid, nid);
+			assert_eq!(owned_urn.nss, nss);
+		}
+		cases {
+			tightbeam => ("tightbeam", "test:resource"),
+			path => ("example", "path/to/resource"),
+			simple => ("test", "simple"),
 		}
 	}
 }

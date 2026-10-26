@@ -19,80 +19,26 @@
 //! - CAPEC-94: Adversary in the Middle (AiTM) <https://capec.mitre.org/data/definitions/94.html>
 //! - RFC 5280 §6: Certification Path Validation
 
-use std::sync::Arc;
-
-use tightbeam::{
-	crypto::x509::{
-		error::CertificateValidationError,
-		policy::{CertificateValidation, DirectTrustValidator},
-	},
-	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
-	testing::{ScenarioConfig, SetupEnv},
-	trace::TraceCollector,
-	urn::Urn,
-	TightBeamError,
+use tightbeam::crypto::x509::{
+	error::CertificateValidationError,
+	policy::{CertificateValidation, DirectTrustValidator},
 };
 
-use crate::common::security::{deterministic_signing_key, expectation_failure, random_signing_key, test_certificate};
+use crate::common::security::{deterministic_signing_key, random_signing_key, test_certificate};
 
-pub(crate) const UNTRUSTED_CERT_REJECTED: Urn<'static> =
-	tightbeam::urn!("test", "event:certificate-trust/untrusted-cert-rejected");
+/// Direct trust refuses a self-signed, unexpired certificate that is no
+/// configured anchor.
+#[test]
+fn certificate_trust() {
+	let trusted_cert = test_certificate(&deterministic_signing_key());
 
-tb_assert_spec! {
-	pub CertificateTrustSpec,
-	V(1,0,0): {
-		mode: Accept,
-		assertions: [
-			(UNTRUSTED_CERT_REJECTED, exactly!(1u32), equals!(true))
-		]
-	}
-}
+	// An attacker holds an unrelated, self-signed, unexpired certificate.
+	let attacker_cert = test_certificate(&random_signing_key());
+	let validator = DirectTrustValidator::default().with_trust_chain(vec![trusted_cert]);
+	let verdict = validator.evaluate(&attacker_cert);
 
-tb_process_spec! {
-	pub CertificateTrustProcess,
-	events {
-		observable { UNTRUSTED_CERT_REJECTED }
-		hidden { }
-	}
-	states {
-		Idle => { UNTRUSTED_CERT_REJECTED => Done },
-		Done => { }
-	}
-	terminal { Done }
-	annotations { description: "Certificate trust: DirectTrustValidator must enforce its trust anchor" }
-}
-
-tb_scenario! {
-	name: certificate_trust,
-	config: ScenarioConfig::builder()
-		.with_spec(CertificateTrustSpec::latest())
-		.with_csp(CertificateTrustProcess)
-		.build(),
-	environment Bare {
-		exec: |SetupEnv { trace, .. }| async move {
-			CertificateTrustScenario::run((trace.into(),)).await
-		}
-	}
-}
-
-job! {
-	name: CertificateTrustScenario,
-	async fn run((trace,): (Arc<TraceCollector>,)) -> Result<(), TightBeamError> {
-		let trusted_cert = test_certificate(&deterministic_signing_key());
-
-		// An attacker holds an unrelated, self-signed, unexpired certificate.
-		let attacker_cert = test_certificate(&random_signing_key());
-		let validator = DirectTrustValidator::default().with_trust_chain(vec![trusted_cert]);
-		match validator.evaluate(&attacker_cert) {
-			Err(error) => {
-				// The certificate is no configured anchor, so direct trust
-				// refuses it.
-				let untrusted = matches!(error, CertificateValidationError::CertificateNotTrusted);
-				trace.event_with(UNTRUSTED_CERT_REJECTED, &[], untrusted)?;
-			}
-			Ok(()) => return Err(expectation_failure("certificate outside the trust chain was accepted")),
-		}
-
-		Ok(())
-	}
+	assert!(
+		matches!(verdict, Err(CertificateValidationError::CertificateNotTrusted)),
+		"direct trust admitted a certificate outside its anchors"
+	);
 }

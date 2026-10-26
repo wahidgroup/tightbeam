@@ -1,4 +1,4 @@
-//! Work routing through the cluster gateway.
+//! The tests of work routing through the cluster gateway.
 
 use std::net::Ipv4Addr;
 
@@ -10,7 +10,11 @@ use tokio::task::JoinHandle;
 use tightbeam::colony::hive::{HiveContext, HiveContextImpl};
 use tightbeam::crypto::x509::policy::{CertificateValidation, DirectTrustValidator};
 use tightbeam::testing::TestDigest;
+use tightbeam::transport::TransportError;
 use tightbeam::{cluster, servlet};
+
+#[cfg(feature = "instrument")]
+use tightbeam::testing::fixtures::TestTrace;
 
 use super::common::*;
 use super::federation::{federation_conf, wait_for_type_routes};
@@ -21,8 +25,6 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(WORK_SENT, exactly!(1)),
-			(WORK_ECHOED, exactly!(1), equals!(42u64)),
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(events::CLUSTER_WORK_ROUTED, exactly!(1))
 		]
@@ -38,8 +40,9 @@ tb_scenario! {
 			start_cluster(&trace, routing_cluster_conf(&certs, Some(TransportOffer::mux(8)))).await
 		},
 		hives: |SetupEnv { trace, context: certs }| vec![start_ping_hive(trace, certs, Some(TransportOffer::mux(8)))],
-		client: |ClusterEnv { trace, context: certs, cluster }| async move {
-			record_ping_echo(&trace, &certs, &cluster).await?;
+		client: |ClusterEnv { context: certs, cluster, .. }| async move {
+			let echo = submit_ping(&certs, &cluster).await?;
+			assert_eq!(echo.doubled, 42, "the ping servlet doubles the request");
 			cluster.stop();
 			Ok(())
 		}
@@ -57,8 +60,9 @@ tb_scenario! {
 			start_cluster(&trace, routing_cluster_conf(&certs, None)).await
 		},
 		hives: |SetupEnv { trace, context: certs }| vec![start_ping_hive(trace, certs, None)],
-		client: |ClusterEnv { trace, context: certs, cluster }| async move {
-			record_ping_echo(&trace, &certs, &cluster).await?;
+		client: |ClusterEnv { context: certs, cluster, .. }| async move {
+			let echo = submit_ping(&certs, &cluster).await?;
+			assert_eq!(echo.doubled, 42, "the ping servlet doubles the request");
 			cluster.stop();
 			Ok(())
 		}
@@ -71,18 +75,16 @@ tb_assert_spec! {
 		mode: Accept,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
-			(WORK_SENT, exactly!(1)),
 			(events::CLUSTER_WORK_ROUTED, exactly!(0)),
-			(WORK_STATUS, exactly!(1), equals!(TransitStatus::Unavailable)),
-			(WORK_PAYLOAD, exactly!(1), equals!(0u64))
+			(events::CLUSTER_WORK_FAILED, exactly!(1), equals!(TransitStatus::Unavailable)),
+			(events::CLUSTER_WORK_UNAVAILABLE, absent!())
 		]
 	}
 }
 
-// The gateway runs `ClusterTlsConfig::validators` as the server policy of
-// each dial to its hive, so a policy that admits no certificate leaves the
-// work unrouted. `cluster_work_routing_single_flight` routes the same work
-// with no policy.
+// The gateway runs `ClusterTlsConfig::validators` as the server policy of each
+// dial to its hive, so a policy that admits no certificate leaves the work
+// unrouted. `cluster_work_routing_single_flight` routes it with no policy.
 tb_scenario! {
 	name: cluster_server_policy_runs_on_the_dial_to_its_hive,
 	spec: ClusterServerPolicySpec,
@@ -95,12 +97,11 @@ tb_scenario! {
 			start_cluster(&trace, conf).await
 		},
 		hives: |SetupEnv { trace, context: certs }| vec![start_ping_hive(trace, certs, None)],
-		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+		client: |ClusterEnv { context: certs, cluster, .. }| async move {
 			let mut client = connect_cluster(&certs, cluster.addr()).await?;
-			trace.event(WORK_SENT)?;
 
 			let refused_work = emit_ping_work(&mut client, &certs.key, b"server-policy-work").await;
-			record_work_refusal(&trace, refused_work)?;
+			check_work_refusal(refused_work, TransitStatus::Unavailable)?;
 
 			cluster.stop();
 			Ok(())
@@ -113,20 +114,16 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(MULTI_REGISTER_STATUS, exactly!(2), equals!(TransitStatus::Ok)),
-			(WORK_SENT, exactly!(2)),
-			(WORK_ECHOED, exactly!(2), equals!(42u64)),
 			(events::CLUSTER_HIVE_REGISTERED, at_least!(2), equals!(1u64)),
+			(events::CLUSTER_REGISTER_REFUSED, absent!()),
 			(events::CLUSTER_WORK_ROUTED, exactly!(2))
 		]
 	}
 }
 
-// One hive registers with two independent gateways. Registration fans out,
-// each gateway converges on its own registry (both count exactly this one
-// hive), and each routes work to the same servlet slate. Gateway redundancy
-// needs no consensus, because every registry is soft state the hive keeps
-// fresh.
+// One hive registers with two independent gateways, and each gateway counts
+// exactly this hive and routes work to the same servlet slate. The hive keeps
+// each registry fresh as soft state, so the redundancy needs no consensus.
 tb_scenario! {
 	name: cluster_hive_serves_two_gateways,
 	spec: ClusterMultiGatewaySpec,
@@ -137,14 +134,13 @@ tb_scenario! {
 			let first = start_cluster(&trace, routing_cluster_conf(&certs, Some(TransportOffer::mux(8)))).await?;
 			let second = start_cluster(&trace, routing_cluster_conf(&certs, Some(TransportOffer::mux(8)))).await?;
 
-			let registered = hive.register_with_cluster(first.addr()).await?;
-			trace.event_with(MULTI_REGISTER_STATUS, &[], registered.status)?;
+			hive.register_with_cluster(first.addr()).await?;
+			hive.register_with_cluster(second.addr()).await?;
 
-			let registered = hive.register_with_cluster(second.addr()).await?;
-			trace.event_with(MULTI_REGISTER_STATUS, &[], registered.status)?;
-
-			record_ping_echo(&trace, &certs, &first).await?;
-			record_ping_echo(&trace, &certs, &second).await?;
+			let first_echo = submit_ping(&certs, &first).await?;
+			let second_echo = submit_ping(&certs, &second).await?;
+			assert_eq!(first_echo.doubled, 42, "the first gateway routes to the servlet");
+			assert_eq!(second_echo.doubled, 42, "the second gateway routes to the servlet");
 
 			first.stop();
 			second.stop();
@@ -159,18 +155,14 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(WORK_SENT, exactly!(1)),
-			(events::CLUSTER_WORK_REFUSED, exactly!(1)),
-			(WORK_STATUS, exactly!(1), equals!(TransitStatus::PermissionDenied)),
-			(WORK_PAYLOAD, exactly!(1), equals!(0u64))
+			(events::CLUSTER_WORK_REFUSED, exactly!(1), equals!(TransitStatus::PermissionDenied))
 		]
 	}
 }
 
-// The scenarios below prove end-to-end frame delivery. The frame a
-// servlet handler receives for cluster-routed work is the frame the
-// client created, and the frame the client receives back is the frame
-// the servlet responded with.
+// The scenarios below prove end-to-end delivery of cluster-routed work. The
+// servlet handler receives the frame the client created, and the client
+// receives the frame the servlet responded with.
 
 servlet! {
 	/// Records what the handler observes about the frame it receives for
@@ -188,10 +180,9 @@ servlet! {
 	handle: |req, frame, ctx| async move {
 		let trace = ctx.trace();
 
-		// The SIGNED and PREVIOUS probes witness presence only. Byte
-		// fidelity rests on SIG_VALID, whose signature covers the
-		// frame's to-be-signed bytes, so no change may weaken SIG_VALID
-		// on the assumption that the presence probes cover fidelity.
+		// The SIGNED and PREVIOUS probes witness presence only. Byte fidelity
+		// rests on SIG_VALID alone, whose signature check covers the frame's
+		// to-be-signed bytes, so no change may weaken that probe.
 		let sig_valid = frame_signature_verifies(&frame, &probe_signing_key());
 
 		trace.event_with(PROBE_FRAME_CLIENT_ID, &[], u32::from(frame.metadata().id() == b"client-signed-work"))?;
@@ -225,17 +216,49 @@ async fn start_probe_hive(
 	Ok(hive)
 }
 
-/// Run the full-frame delivery contract from the client side against
-/// `gateway`: send the standard signed contract frame and record every
-/// client-observable property of the servlet's response envelope.
+/// What the client observes of one full-frame delivery: the frame it sent,
+/// and the servlet's response frame that the gateway relays back.
+#[derive(Debug, PartialEq)]
+struct FrameContract {
+	/// Whether the client frame carries its signature.
+	sent_signed: bool,
+	/// Whether the client frame links its previous frame.
+	sent_linked: bool,
+	/// The id of the response frame.
+	reply_id: Vec<u8>,
+	/// Whether the response frame keeps the servlet's signature.
+	reply_signed: bool,
+	/// Whether that signature verifies over the received bytes.
+	reply_verifies: bool,
+	/// The value that the ping servlet answered.
+	doubled: u32,
+}
+
+impl FrameContract {
+	/// The delivery the contract promises: a signed client frame that links
+	/// its previous frame, and the servlet's own signed frame, which doubles
+	/// the request.
+	fn held() -> Self {
+		Self {
+			sent_signed: true,
+			sent_linked: true,
+			reply_id: b"probe-response".to_vec(),
+			reply_signed: true,
+			reply_verifies: true,
+			doubled: 42,
+		}
+	}
+}
+
+/// Sends the standard signed contract frame to `gateway` from the client
+/// side, and returns every client-observable property of the delivery.
 ///
 /// The local-delivery and peer-hop scenarios share it, so both routes prove
 /// the identical contract.
-async fn record_frame_contract(
-	trace: &TraceCollector,
+async fn submit_contract_frame(
 	certs: &ClusterTestCerts,
 	gateway: &ClusterGateway,
-) -> Result<(), TightBeamError> {
+) -> Result<FrameContract, TightBeamError> {
 	let unsigned = Version::V2
 		.compose()
 		.with_id(b"client-signed-work")
@@ -245,41 +268,23 @@ async fn record_frame_contract(
 		.build()?;
 
 	let inner = sign_frame(unsigned, &probe_signing_key()).await?;
-
-	trace.event_with(CLIENT_WORK_SIGNED, &[], u32::from(inner.nonrepudiation().is_some()))?;
-	trace.event_with(
-		CLIENT_WORK_PREVIOUS,
-		&[],
-		u32::from(inner.metadata().previous_frame().is_some()),
-	)?;
+	let sent_signed = inner.nonrepudiation().is_some();
+	let sent_linked = inner.metadata().previous_frame().is_some();
 
 	let mut client = connect_cluster(certs, gateway.addr()).await?;
-	trace.event(WORK_SENT)?;
 
-	// The public client surface under test: one method call wraps the
-	// work frame in the hop-local transport envelope and resolves the
-	// gateway's reply down to the servlet's response frame.
+	// The public client surface under test is this one call. It wraps the work
+	// frame in the hop-local transport envelope and resolves the gateway's
+	// reply down to the servlet's response frame.
 	let servlet_frame = client.submit_work_to(servlet_urn("ping"), &inner).await?;
 
-	trace.event_with(
-		CLIENT_GOT_SERVLET_ID,
-		&[],
-		u32::from(servlet_frame.metadata().id() == b"probe-response"),
-	)?;
-	trace.event_with(
-		CLIENT_GOT_SERVLET_SIGNED,
-		&[],
-		u32::from(servlet_frame.nonrepudiation().is_some()),
-	)?;
-	trace.event_with(
-		CLIENT_GOT_SERVLET_SIG_VALID,
-		&[],
-		u32::from(frame_signature_verifies(&servlet_frame, &probe_signing_key())),
-	)?;
+	let reply_id = servlet_frame.metadata().id().to_vec();
+	let reply_signed = servlet_frame.nonrepudiation().is_some();
+	let reply_verifies = frame_signature_verifies(&servlet_frame, &probe_signing_key());
 
 	let ping_response: PingResponse = decode(servlet_frame.message())?;
-	trace.event_with(WORK_ECHOED, &[], u64::from(ping_response.doubled))?;
-	Ok(())
+	let doubled = ping_response.doubled;
+	Ok(FrameContract { sent_signed, sent_linked, reply_id, reply_signed, reply_verifies, doubled })
 }
 
 tb_assert_spec! {
@@ -287,28 +292,18 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(WORK_SENT, exactly!(1)),
-			(CLIENT_WORK_SIGNED, exactly!(1), equals!(1u32)),
-			(CLIENT_WORK_PREVIOUS, exactly!(1), equals!(1u32)),
 			(events::CLUSTER_WORK_ROUTED, exactly!(1)),
 			(PROBE_FRAME_CLIENT_ID, exactly!(1), equals!(1u32)),
 			(PROBE_FRAME_SIGNED, exactly!(1), equals!(1u32)),
 			(PROBE_FRAME_PREVIOUS, exactly!(1), equals!(1u32)),
-			(PROBE_FRAME_SIG_VALID, exactly!(1), equals!(1u32)),
-			(CLIENT_GOT_SERVLET_ID, exactly!(1), equals!(1u32)),
-			(CLIENT_GOT_SERVLET_SIGNED, exactly!(1), equals!(1u32)),
-			(CLIENT_GOT_SERVLET_SIG_VALID, exactly!(1), equals!(1u32)),
-			(WORK_ECHOED, exactly!(1), equals!(42u64))
+			(PROBE_FRAME_SIG_VALID, exactly!(1), equals!(1u32))
 		]
 	}
 }
 
-// The client nests its complete signed frame in the work payload and
-// submits it as unary work. The presence probes only witness that an id,
-// a signature block, and a previous-frame digest exist, so they cannot
-// prove byte fidelity. The two SIG_VALID assertions carry that proof,
-// because each signature verifies only over the exact bytes the other
-// side signed.
+// The client nests its complete signed frame in the work payload and submits
+// it as unary work. The servlet's SIG_VALID probe and the client's reply check
+// prove byte fidelity, because a signature verifies only over the signed bytes.
 tb_scenario! {
 	name: cluster_work_delivers_client_frame,
 	spec: ClusterClientFrameDeliverySpec,
@@ -318,8 +313,9 @@ tb_scenario! {
 			start_cluster(&trace, routing_cluster_conf(&certs, None)).await
 		},
 		hives: |SetupEnv { trace, context: certs }| vec![start_probe_hive(trace, certs)],
-		client: |ClusterEnv { trace, context: certs, cluster }| async move {
-			record_frame_contract(&trace, &certs, &cluster).await?;
+		client: |ClusterEnv { context: certs, cluster, .. }| async move {
+			let contract = submit_contract_frame(&certs, &cluster).await?;
+			assert_eq!(contract, FrameContract::held());
 
 			cluster.stop();
 			Ok(())
@@ -338,16 +334,13 @@ tb_scenario! {
 			start_cluster(&trace, routing_cluster_conf(&certs, None)).await
 		},
 		hives: |SetupEnv { trace, context: certs }| vec![start_ping_hive(trace, certs, None)],
-		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+		client: |ClusterEnv { context: certs, cluster, .. }| async move {
 			let inner = signed_work_frame(&certs.key, b"instance-work").await?;
 			let mut client = connect_cluster(&certs, cluster.addr()).await?;
 
-			trace.event(WORK_SENT)?;
-
-			let refused_work = client
-				.submit_work_to(servlet_urn("ping").servlet_instance("127.0.0.1:9999").expect("a servlet type URN yields an instance URN"), &inner)
-				.await;
-			record_work_refusal(&trace, refused_work)?;
+			let instance = servlet_urn("ping").servlet_instance("127.0.0.1:9999")?;
+			let refused_work = client.submit_work_to(instance, &inner).await;
+			check_work_refusal(refused_work, TransitStatus::PermissionDenied)?;
 
 			cluster.stop();
 
@@ -357,9 +350,10 @@ tb_scenario! {
 }
 
 // Peer-hop frame delivery: the same end-to-end contract must hold when a
-// peer forward, not a local route, reaches the serving gateway.
+// peer forward, not a local route, reaches the gateway that serves the work.
 
-/// Two member gateways with distinct identities.
+/// The certificates and peer trust of two member gateways with distinct
+/// identities.
 ///
 /// Gateway B hosts the probe hive and anchors gateway A, so A learns
 /// B's ping route from B's advertisement beat and forwards work to it.
@@ -391,31 +385,21 @@ tb_assert_spec! {
 		mode: Accept,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
-			(PEER_ROUTES_AFTER_INSTALLS, exactly!(1), equals!(1u64)),
-			(WORK_SENT, exactly!(1)),
-			(CLIENT_WORK_SIGNED, exactly!(1), equals!(1u32)),
-			(CLIENT_WORK_PREVIOUS, exactly!(1), equals!(1u32)),
 			(events::CLUSTER_WORK_FORWARDED, exactly!(1)),
 			(events::CLUSTER_WORK_ROUTED, exactly!(2)),
 			(PROBE_FRAME_CLIENT_ID, exactly!(1), equals!(1u32)),
 			(PROBE_FRAME_SIGNED, exactly!(1), equals!(1u32)),
 			(PROBE_FRAME_PREVIOUS, exactly!(1), equals!(1u32)),
-			(PROBE_FRAME_SIG_VALID, exactly!(1), equals!(1u32)),
-			(CLIENT_GOT_SERVLET_ID, exactly!(1), equals!(1u32)),
-			(CLIENT_GOT_SERVLET_SIGNED, exactly!(1), equals!(1u32)),
-			(CLIENT_GOT_SERVLET_SIG_VALID, exactly!(1), equals!(1u32)),
-			(WORK_ECHOED, exactly!(1), equals!(42u64))
+			(PROBE_FRAME_SIG_VALID, exactly!(1), equals!(1u32))
 		]
 	}
 }
 
-// Envelope preservation across a gateway relay: A holds no local ping
-// route, so the work crosses the peer plane to B before B delivers the
-// client's frame to the probe servlet. Every PROBE_FRAME_* and
-// CLIENT_GOT_SERVLET_* assertion from the local contract must hold
-// unchanged, including cryptographic signature verification in both
-// directions. CLUSTER_WORK_FORWARDED pins the peer hop and the two
-// CLUSTER_WORK_ROUTED events pin one reinforced trail per gateway.
+// The client's frames keep their envelopes across a gateway relay:
+// - A holds only B's ping route, so the work crosses the peer plane before B hands it to the probe servlet.
+// - Every PROBE_FRAME_* assertion and client check of the local contract must hold, both signatures included.
+// - CLUSTER_WORK_FORWARDED pins the peer hop.
+// - The two CLUSTER_WORK_ROUTED events pin one reinforced trail per gateway.
 tb_scenario! {
 	name: cluster_peer_hop_preserves_end_to_end_frames,
 	spec: ClusterPeerHopFrameDeliverySpec,
@@ -436,9 +420,10 @@ tb_scenario! {
 			hive.register_with_cluster(gateway_b.addr()).await?;
 
 			let learned = wait_for_type_routes(&gateway_a, "ping", 1, 100, Duration::from_millis(100)).await;
-			trace.event_with(PEER_ROUTES_AFTER_INSTALLS, &[], learned as u64)?;
+			assert_eq!(learned, 1, "gateway A learns B's ping route");
 
-			record_frame_contract(&trace, &ctx.a, &gateway_a).await?;
+			let contract = submit_contract_frame(&ctx.a, &gateway_a).await?;
+			assert_eq!(contract, FrameContract::held());
 
 			gateway_b.stop();
 			gateway_a.stop();
@@ -453,24 +438,20 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(WORK_SENT, exactly!(2)),
-			(events::CLUSTER_WORK_REFUSED, exactly!(1)),
-			(WORK_STATUS, exactly!(1), equals!(TransitStatus::InvalidArgument)),
-			(WORK_PAYLOAD, exactly!(1), equals!(0u64)),
+			(events::CLUSTER_WORK_REFUSED, exactly!(1), equals!(TransitStatus::InvalidArgument)),
 			(events::CLUSTER_WORK_FAILED, exactly!(0)),
 			(events::CLUSTER_WORK_UNAVAILABLE, exactly!(0)),
-			(events::CLUSTER_WORK_ROUTED, exactly!(1)),
-			(WORK_ECHOED, exactly!(1), equals!(42u64))
+			(events::CLUSTER_WORK_ROUTED, exactly!(1))
 		]
 	}
 }
 
-// A work payload that does not decode as a frame is a permanent caller
-// fault. The gateway must refuse it as InvalidArgument at admission,
-// before route selection. Zero CLUSTER_WORK_FAILED proves that the gateway
-// weakened no healthy pheromone trail and burned no failover retry. The
-// follow-up valid work then echoes through the same trail, which proves the
-// route stayed serviceable.
+// A work payload that fails to decode as a frame is a permanent caller fault,
+// so the gateway must refuse it as InvalidArgument at admission, before route
+// selection.
+// - Zero CLUSTER_WORK_FAILED proves the gateway weakened no healthy pheromone
+//   trail and burned no failover retry.
+// - The valid work that follows echoes through the same trail, which proves the route stays serviceable.
 tb_scenario! {
 	name: cluster_refuses_malformed_work_payload,
 	spec: ClusterMalformedWorkSpec,
@@ -480,7 +461,7 @@ tb_scenario! {
 			start_cluster(&trace, routing_cluster_conf(&certs, None)).await
 		},
 		hives: |SetupEnv { trace, context: certs }| vec![start_ping_hive(trace, certs, None)],
-		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+		client: |ClusterEnv { context: certs, cluster, .. }| async move {
 			// The test composes the dual wrap by hand because the malformed
 			// `Work` payload is itself the wire shape under test.
 			let malformed = ClusterWorkRequest {
@@ -497,13 +478,12 @@ tb_scenario! {
 
 			let mut client = connect_cluster(&certs, cluster.addr()).await?;
 
-			trace.event(WORK_SENT)?;
-
 			let response_frame = emit_frame(&mut client, frame).await?;
 			let work_response: ClusterWorkResponse = decode(response_frame.message())?;
-			record_work_status(&trace, &work_response)?;
+			check_refused_reply(&work_response)?;
 
-			record_ping_echo(&trace, &certs, &cluster).await?;
+			let echo = submit_ping(&certs, &cluster).await?;
+			assert_eq!(echo.doubled, 42, "a well-formed request still routes");
 
 			cluster.stop();
 
@@ -528,20 +508,17 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(WORK_SENT, exactly!(1)),
-			(WORK_ECHOED, exactly!(1), equals!(42u64)),
-			(EDGE_CONTROL_STATUS, exactly!(1), equals!(TransitStatus::PermissionDenied)),
+			(events::CLUSTER_EDGE_REFUSED, exactly!(1), equals!(TransitStatus::PermissionDenied)),
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(events::CLUSTER_WORK_ROUTED, exactly!(1))
 		]
 	}
 }
 
-// The edge accept plane is a work-only surface on its own listener. Work
-// submitted at the edge address routes to the servlet exactly like colony
-// work, while the edge refuses a validly signed hive registration on the same
-// connection with PermissionDenied. The hive keeps registering through
-// the colony plane (CLUSTER_HIVE_REGISTERED stays 1).
+// The edge accept plane is a work-only surface on its own listener:
+// - Work at the edge address routes to the servlet as colony work does.
+// - The edge refuses a validly signed hive registration on the same connection with PermissionDenied.
+// - The hive registers through the colony plane alone, so CLUSTER_HIVE_REGISTERED stays 1.
 tb_scenario! {
 	name: cluster_edge_plane_admits_work_only,
 	spec: ClusterEdgePlaneSpec,
@@ -553,20 +530,17 @@ tb_scenario! {
 			EdgeClusterGateway::start(Arc::new(trace.share()), conf).await
 		},
 		hives: |SetupEnv { trace, context: certs }| vec![start_ping_hive(trace, certs, Some(TransportOffer::mux(8)))],
-		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+		client: |ClusterEnv { context: certs, cluster, .. }| async move {
 			let Some(edge_addr) = cluster.edge_addr() else {
 				return Err(expectation_failure("edge plane did not bind"));
 			};
 
 			let inner = signed_work_frame(&certs.key, b"edge-work").await?;
 
-			trace.event(WORK_SENT)?;
-
 			let mut client = connect_cluster(&certs, edge_addr).await?;
 			let servlet_frame = client.submit_work_to(servlet_urn("ping"), &inner).await?;
 			let ping_response = decode_ping_echo(&servlet_frame)?;
-
-			trace.event_with(WORK_ECHOED, &[], u64::from(ping_response.doubled))?;
+			assert_eq!(ping_response.doubled, 42, "the ping servlet doubles the request");
 
 			let signed = signed_control_frame(
 				&certs,
@@ -577,8 +551,7 @@ tb_scenario! {
 
 			let response_frame = emit_frame(&mut client, signed).await?;
 			let refusal: ClusterWorkResponse = decode(response_frame.message())?;
-
-			trace.event_with(EDGE_CONTROL_STATUS, &[], refusal.status)?;
+			assert_eq!(refusal.status, TransitStatus::PermissionDenied, "the edge refuses a registration");
 
 			cluster.stop();
 
@@ -587,37 +560,76 @@ tb_scenario! {
 	}
 }
 
-tb_assert_spec! {
-	pub ClusterEdgeBindFailureSpec,
-	V(1,0,0): {
-		mode: Accept,
-		assertions: [
-			(EDGE_START_FAILED, exactly!(1), equals!(true))
-		]
-	}
+/// The digest of each payload that `trace` recorded for `event`, in the order
+/// the trace recorded them.
+#[cfg(feature = "instrument")]
+fn payload_digests(trace: &TraceCollector, event: Urn<'static>) -> Vec<Option<[u8; 32]>> {
+	let recorded = trace.drain_events().into_iter();
+	recorded
+		.filter(|record| record.urn == event)
+		.map(|record| record.payload_hash)
+		.collect()
+}
+
+// The edge plane names the caller of a refused unary call by the key that its
+// session proved. Two refusals on one session name one caller, though each
+// frame claims a signer of its own (CWE-345).
+#[cfg(feature = "instrument")]
+#[tokio::test]
+async fn cluster_edge_refusal_names_the_session_and_not_the_frame_signer() -> Result<(), TightBeamError> {
+	use tightbeam::instrumentation::TbInstrumentationConfig;
+	use tightbeam::trace::TraceConfig;
+
+	let certs = cluster_certs();
+	let config = TbInstrumentationConfig { enable_payloads: true, ..TbInstrumentationConfig::default() };
+	let trace = TraceCollector::from(TraceConfig::with_instrumentation(config));
+	let mut tls = cluster_tls_config(&certs);
+	tls.client_validators = vec![combined_validator(&[&certs.cert])];
+
+	let mut conf = ClusterConfig::new(tls);
+	conf.edge_bind_addr = Some("127.0.0.1:0".into());
+
+	let cluster = EdgeClusterGateway::start(Arc::new(trace.share()), conf).await?;
+	let edge_addr = cluster
+		.edge_addr()
+		.ok_or_else(|| expectation_failure("edge plane did not bind"))?;
+
+	let identity = signing_identity(certs.cert.to_owned(), certs.key.to_owned());
+	let builder = ClientBuilder::<TokioListener>::builder().with_trust_store(Arc::clone(&certs.trust));
+	let mut client = builder
+		.with_client_identity(identity)
+		.build()
+		.connect(edge_addr.to_owned())
+		.await?;
+
+	let own = signed_control_frame_with(&certs.key, b"edge-own", registration_request(b"127.0.0.1:65001")).await?;
+	let claimed = registration_request(b"127.0.0.1:65002");
+	let claimed = signed_control_frame_with(&probe_signing_key(), b"edge-claimed", claimed).await?;
+
+	emit_frame(&mut client, own).await?;
+	emit_frame(&mut client, claimed).await?;
+	cluster.stop();
+
+	let callers = payload_digests(&trace, events::CLUSTER_EDGE_REFUSED);
+	let session = callers.first().copied().flatten();
+	assert!(session.is_some());
+	assert_eq!(callers, [session, session]);
+	Ok(())
 }
 
 // A configured edge plane that cannot parse its bind address fails
-// Cluster::start closed: the call returns Err and no accept loop stays
-// running (bind-then-spawn owns both listeners before spawn).
-tb_scenario! {
-	name: cluster_edge_bind_failure_fails_start,
-	spec: ClusterEdgeBindFailureSpec,
-	environment Bare {
-		context: cluster_certs(),
-		exec: |SetupEnv { trace, context: certs }| async move {
-			let mut conf = routing_cluster_conf(&certs, Some(TransportOffer::mux(8)));
-			conf.edge_bind_addr = Some("not-a-socket-addr".into());
+// Cluster::start closed: the call returns Err and no accept loop outlives it
+// (bind-then-spawn owns both listeners before spawn).
+#[tokio::test]
+async fn cluster_edge_bind_failure_fails_start() -> Result<(), TightBeamError> {
+	let certs = cluster_certs();
+	let mut conf = routing_cluster_conf(&certs, Some(TransportOffer::mux(8)));
+	conf.edge_bind_addr = Some("not-a-socket-addr".into());
 
-			let failed = EdgeClusterGateway::start(Arc::new(trace.share()), conf)
-				.await
-				.is_err();
-
-			trace.event_with(EDGE_START_FAILED, &[], failed)?;
-
-			Ok(())
-		}
-	}
+	let started = EdgeClusterGateway::start(Arc::new(TraceCollector::new()), conf).await;
+	let unparsed = matches!(started, Err(TightBeamError::TransportError(TransportError::InvalidMessage)));
+	assert!(unparsed, "an unparsable edge bind address fails Cluster::start");
+	Ok(())
 }
 
 servlet! {
@@ -633,13 +645,11 @@ servlet! {
 }
 
 servlet! {
-	/// The second instance of a two-instance type. It records each frame it
-	/// receives and echoes the ping.
+	/// The second instance of a two-instance type. It echoes the ping, so a
+	/// forward that reached it routes.
 	SecondInstanceServlet<PingRequest, EnvConfig = ()>,
 	protocol: TokioListener,
-	handle: |req, frame, ctx| async move {
-		ctx.trace().event(SECOND_INSTANCE_RECEIVED)?;
-
+	handle: |req, frame, _ctx| async move {
 		let response = Version::V0.compose()
 			.with_id(frame.metadata().id())
 			.with_message(PingResponse { doubled: req.value * 2 })
@@ -682,7 +692,7 @@ impl RefusingPort {
 		Self { _held: held, address }
 	}
 
-	/// The held port's address, in the spelling a hive registers.
+	/// Returns the held port's address, in the spelling a hive registers.
 	fn address(&self) -> &str {
 		&self.address
 	}
@@ -704,13 +714,13 @@ async fn gateway_trying_first(
 	let builder = ClusterConfig::builder(cluster_tls_config(certs));
 	let mut conf = builder.with_load_balancer(balancer).build();
 	conf.pool_config.mux_offer = mux_offer.map(Arc::new);
+
 	let cluster = start_cluster(trace, conf).await?;
 
 	let mut client = connect_cluster(certs, cluster.addr()).await?;
 	let hive_addr = b"127.0.0.1:65030";
 	let servlets = [servlet_info(certs, "ping", first), servlet_info(certs, "ping", second)];
-	let registered = register_signed_hive_serving(&mut client, &certs.key, b"two", hive_addr, servlets).await?;
-	trace.event_with(REGISTER_STATUS, &[], registered.status)?;
+	register_signed_hive_serving(&mut client, &certs.key, b"two", hive_addr, servlets).await?;
 
 	Ok((cluster, client))
 }
@@ -720,19 +730,17 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(REGISTER_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(FIRST_INSTANCE_RECEIVED, exactly!(1)),
-			(SECOND_INSTANCE_RECEIVED, exactly!(0)),
-			(WORK_STATUS, exactly!(1), equals!(TransitStatus::Unknown)),
-			(WORK_PAYLOAD, exactly!(1), equals!(0u64))
+			(events::CLUSTER_WORK_ROUTED, absent!()),
+			(events::CLUSTER_WORK_FAILED, exactly!(1), equals!(TransitStatus::Unknown))
 		]
 	}
 }
 
-// A signed client command runs at most once. The first instance reads the
-// frame and answers with no frame, so the frame may have run there. The
-// gateway keeps it on the first instance and answers the client that the
-// outcome is unknown.
+// A signed client command runs at most once. The frame may have run at the
+// first instance, so the gateway keeps it there and answers the client that
+// the outcome is unknown.
 tb_scenario! {
 	name: cluster_work_never_retries_a_frame_the_first_instance_read,
 	spec: ClusterNoRetryAfterDeliverySpec,
@@ -746,7 +754,7 @@ tb_scenario! {
 			let (cluster, mut client) = gateway_trying_first(&trace, &certs, &first_addr, &second_addr, None).await?;
 
 			let refused = emit_ping_work(&mut client, &certs.key, b"read-once").await;
-			record_work_refusal(&trace, refused)?;
+			check_work_refusal(refused, TransitStatus::Unknown)?;
 
 			cluster.stop();
 			first.stop();
@@ -761,9 +769,9 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(REGISTER_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
-			(SECOND_INSTANCE_RECEIVED, exactly!(1)),
-			(WORK_ECHOED, exactly!(1), equals!(42u64))
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
+			(events::CLUSTER_WORK_FAILED, exactly!(1), equals!(TransitStatus::Unavailable)),
+			(events::CLUSTER_WORK_ROUTED, exactly!(1))
 		]
 	}
 }
@@ -784,7 +792,7 @@ tb_scenario! {
 
 			let echoed = emit_ping_work(&mut client, &certs.key, b"refused-first").await?;
 			let ping = decode_ping_echo(&echoed)?;
-			trace.event_with(WORK_ECHOED, &[], u64::from(ping.doubled))?;
+			assert_eq!(ping.doubled, 42, "the second instance doubles the request");
 
 			cluster.stop();
 			second.stop();
@@ -847,7 +855,7 @@ impl OversizedReplyRelay {
 		Self { address, task }
 	}
 
-	/// The relay's address, in the spelling a hive registers.
+	/// Returns the relay's address, in the spelling a hive registers.
 	fn address(&self) -> &str {
 		&self.address
 	}
@@ -934,7 +942,7 @@ tb_scenario! {
 			let (cluster, mut client) = gateway_trying_first(&trace, &certs, first_addr, &second_addr, None).await?;
 
 			let refused = emit_ping_work(&mut client, &certs.key, b"oversized-reply").await;
-			record_work_refusal(&trace, refused)?;
+			check_work_refusal(refused, TransitStatus::Unknown)?;
 
 			cluster.stop();
 			first.stop();
@@ -983,15 +991,16 @@ servlet! {
 
 /// The routes a servlet under the [`cluster_certs`] identity calls its
 /// siblings through: one route to the sibling of type `sibling` at
-/// `address`, which answers under that identity too.
-fn sibling_routes(certs: &ClusterTestCerts, address: impl AsRef<str>) -> Arc<dyn HiveContext> {
+/// `address`, which answers under that identity too. A dial that the routes
+/// refuse records on `trace`.
+fn sibling_routes(trace: &TraceCollector, certs: &ClusterTestCerts, address: impl AsRef<str>) -> Arc<dyn HiveContext> {
 	let address = address.as_ref();
 	let mux_offer = Some(Arc::new(TransportOffer::mux(8)));
 	let config = PoolConfig { idle_timeout: None, max_connections: 2, mux_offer };
 	let pool = ConnectionPool::<TokioListener>::builder().with_config(config);
 	let pool = pool.with_trust_store(Arc::clone(&certs.trust)).build();
 
-	let routes = HiveContextImpl::new(Arc::new(pool));
+	let routes = HiveContextImpl::new(Arc::new(pool)).with_trace(trace.share());
 	let sibling_type = servlet_urn("sibling");
 	let instance = sibling_type.servlet_instance(address);
 	let instance = instance.expect("a servlet type URN yields an instance URN");
@@ -1008,20 +1017,18 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(REGISTER_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(FIRST_INSTANCE_RECEIVED, exactly!(1)),
 			(SIBLING_RECEIVED, exactly!(0)),
-			(SECOND_INSTANCE_RECEIVED, exactly!(0)),
-			(WORK_STATUS, exactly!(1), equals!(TransitStatus::Unknown)),
-			(WORK_PAYLOAD, exactly!(1), equals!(0u64))
+			(events::CLUSTER_WORK_ROUTED, absent!()),
+			(events::CLUSTER_WORK_FAILED, exactly!(1), equals!(TransitStatus::Unknown))
 		]
 	}
 }
 
 // A handler that ran and failed answers `Unknown`, though its failure carries
-// the `Unavailable` a sibling's gate refused it with. A gateway retries only
-// the `Unavailable` a gate answers before any handler runs, so it keeps the
-// frame on the first instance.
+// a sibling gate's `Unavailable`. A gateway retries only the `Unavailable` of
+// a gate before any handler runs, so it keeps the frame on the first instance.
 tb_scenario! {
 	name: cluster_work_never_retries_a_frame_whose_handler_relayed_unavailable,
 	spec: ClusterNoRetryAfterHandlerFailureSpec,
@@ -1031,7 +1038,7 @@ tb_scenario! {
 			let sibling_builder = servlet_tls_builder(&certs)?.with_collector_gate(DrainingGate);
 			let sibling_conf = sibling_builder.with_config(Arc::new(())).build();
 			let sibling = DrainingSiblingServlet::start(Arc::new(trace.share()), sibling_conf).await?;
-			let siblings = sibling_routes(&certs, sibling.addr().to_string());
+			let siblings = sibling_routes(&trace, &certs, sibling.addr().to_string());
 			let first_conf = servlet_tls_builder(&certs)?.with_hive_context(siblings).with_config(Arc::new(())).build();
 			let first = SiblingCallingServlet::start(Arc::new(trace.share()), first_conf).await?;
 			let second = SecondInstanceServlet::start(Arc::new(trace.share()), servlet_tls_config(&certs)?).await?;
@@ -1041,7 +1048,7 @@ tb_scenario! {
 			let (cluster, mut client) = gateway_trying_first(&trace, &certs, &first_addr, &second_addr, mux).await?;
 
 			let refused = emit_ping_work(&mut client, &certs.key, b"relayed-unavailable").await;
-			record_work_refusal(&trace, refused)?;
+			check_work_refusal(refused, TransitStatus::Unknown)?;
 
 			cluster.stop();
 			first.stop();
@@ -1054,13 +1061,10 @@ tb_scenario! {
 
 servlet! {
 	/// A servlet that answers at a registered address under an identity the
-	/// registration does not name. It records each frame it receives and
-	/// echoes the ping.
+	/// registration does not name. It echoes the ping.
 	ImpostorServlet<PingRequest, EnvConfig = ()>,
 	protocol: TokioListener,
-	handle: |req, frame, ctx| async move {
-		ctx.trace().event(IMPOSTOR_RECEIVED)?;
-
+	handle: |req, frame, _ctx| async move {
 		let response = Version::V0.compose()
 			.with_id(frame.metadata().id())
 			.with_message(PingResponse { doubled: req.value * 2 })
@@ -1074,19 +1078,18 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(REGISTER_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(events::CLUSTER_DIAL_REFUSED, exactly!(1)),
-			(IMPOSTOR_RECEIVED, exactly!(0)),
-			(WORK_STATUS, exactly!(1), equals!(TransitStatus::Unavailable)),
-			(WORK_PAYLOAD, exactly!(1), equals!(0u64))
+			(events::CLUSTER_WORK_FAILED, exactly!(1), equals!(TransitStatus::Unavailable)),
+			(events::CLUSTER_WORK_UNAVAILABLE, absent!())
 		]
 	}
 }
 
 // A work forward reaches a servlet only under the identity its registration
-// names. The gateway's hive trust holds both identities, so the handshake
-// completes, and the dial's binding alone refuses the answer (CWE-346). The
-// refusal proves the frame never left, so the client hears `Unavailable`.
+// names (CWE-346):
+// - The gateway's hive trust holds both identities, so the handshake completes.
+// - Only the dial's binding refuses the answer, so the frame never leaves and the client hears `Unavailable`.
 tb_scenario! {
 	name: cluster_work_refuses_a_servlet_answering_under_another_identity,
 	spec: ClusterWorkImpostorSpec,
@@ -1101,16 +1104,123 @@ tb_scenario! {
 			let mut client = connect_cluster(&certs, cluster.addr()).await?;
 			let hive_addr = b"127.0.0.1:65033";
 			let servlets = [servlet_info(&certs, "ping", impostor.addr().to_string())];
-			let registered =
-				register_signed_hive_serving(&mut client, &certs.key, b"impostor", hive_addr, servlets).await?;
-			trace.event_with(REGISTER_STATUS, &[], registered.status)?;
+			register_signed_hive_serving(&mut client, &certs.key, b"impostor", hive_addr, servlets).await?;
 
 			let refused = emit_ping_work(&mut client, &certs.key, b"impostor-work").await;
-			record_work_refusal(&trace, refused)?;
+			check_work_refusal(refused, TransitStatus::Unavailable)?;
 
 			cluster.stop();
 			impostor.stop();
 			Ok(())
 		}
 	}
+}
+
+// A sibling dial that another identity answers records its refusal on the
+// trace that the context's builder named, so a builder outside the crate
+// reads the refusals of the context it built.
+#[tokio::test]
+async fn a_sibling_context_records_a_refused_dial_on_the_trace_it_was_given() -> Result<(), TightBeamError> {
+	let certs = cluster_certs();
+	let impostor_certs = stranger_gateway_certs();
+	let trace = TraceCollector::default();
+	let impostor_conf = servlet_tls_config(&impostor_certs)?;
+	let impostor = ImpostorServlet::start(Arc::new(TraceCollector::default()), impostor_conf).await?;
+	let trust = combined_trust(&[&certs.cert, &impostor_certs.cert]);
+	let pool = ConnectionPool::<TokioListener>::builder().with_trust_store(trust).build();
+	let routes = HiveContextImpl::new(Arc::new(pool)).with_trace(trace.share());
+	let sibling_type = servlet_urn("sibling");
+	let address = impostor.addr().to_string();
+	let instance = sibling_type.servlet_instance(&address)?;
+	let route_address: Arc<[u8]> = Arc::from(address.as_bytes());
+	routes.add_route(
+		instance.canonical_bytes(),
+		route_address,
+		signer_of(&certs.cert),
+		sibling_type.canonical_bytes(),
+	);
+
+	let frame = signed_work_frame(&certs.key, b"sibling-call").await?;
+	let refused = routes.call(&sibling_type, frame).await;
+	impostor.stop();
+
+	let mismatched = matches!(refused, Err(TightBeamError::ClusterError(ref error)) if matches!(**error, ClusterError::PeerMismatch));
+	assert!(mismatched);
+	assert_eq!(trace.recorded(events::CLUSTER_DIAL_REFUSED), 1);
+	Ok(())
+}
+
+tb_assert_spec! {
+	pub ClusterAbandonedPeerRouteSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(events::CLUSTER_PEER_ADVERTISED, exactly!(1)),
+			(events::CLUSTER_WORK_FAILED, exactly!(1), equals!(TransitStatus::Unavailable)),
+			(events::CLUSTER_PEER_ROUTES_WITHDRAWN, exactly!(1), equals!(1u64))
+		]
+	}
+}
+
+// A peer route abandons at its first failed forward, because its limit is
+// one, and the next evaporation sweep withdraws it. The sweep runs every
+// 50ms, so the withdrawal lands inside the scenario.
+tb_scenario! {
+	name: cluster_evaporation_withdraws_an_abandoned_peer_route,
+	spec: ClusterAbandonedPeerRouteSpec,
+	environment Cluster {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| async move {
+			let mut conf = peering_cluster_conf(&certs);
+			conf.pheromone.abandonment_limit = 1;
+			conf.pheromone.evaporation_interval = Duration::from_millis(50);
+			start_cluster(&trace, conf).await
+		},
+		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+			let ad_reply = install_ping_peer(&certs, &cluster).await?;
+			assert_eq!(ad_reply, TransitStatus::Ok, "the gateway admits the advertisement");
+
+			let mut client = connect_cluster(&certs, cluster.addr()).await?;
+			let refused = emit_ping_work(&mut client, &certs.key, b"dead-peer-work").await;
+			check_work_refusal(refused, TransitStatus::Unavailable)?;
+
+			let withdrawn = || trace.recorded(events::CLUSTER_PEER_ROUTES_WITHDRAWN) >= 1;
+			poll_until(50, Duration::from_millis(50), withdrawn).await;
+			assert!(cluster.peer_routes()?.is_empty(), "the sweep withdraws the abandoned peer route");
+
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
+/// The dials that a gateway's own trace records as it routes one work
+/// request to the servlet of a hive. The hive and the client record into
+/// traces of their own, and the gateway's heartbeat waits an hour, so the
+/// gateway's trace holds the dials of its hive pool alone.
+#[cfg(feature = "instrument")]
+async fn gateway_work_dials() -> Result<Vec<Urn<'static>>, TightBeamError> {
+	let certs = Arc::new(cluster_certs());
+	let mut conf = routing_cluster_conf(&certs, None);
+	conf.heartbeat.interval = Duration::from_secs(3_600);
+	let gateway_trace = TraceCollector::new();
+	let cluster = start_cluster(&gateway_trace, conf).await?;
+	let hive = start_ping_hive(TraceCollector::new(), Arc::clone(&certs), None).await?;
+	hive.register_with_cluster(cluster.addr()).await?;
+
+	// The trail of the gateway's dials is the observation, so the echo goes
+	// unread.
+	let _echo = submit_ping(&certs, &cluster).await?;
+	hive.stop();
+	cluster.stop();
+
+	Ok(TestTrace::trail(&gateway_trace, &[events::POOL_DIAL]))
+}
+
+/// A gateway records each dial of its hive pool on its own trace.
+#[cfg(feature = "instrument")]
+#[tokio::test]
+async fn a_gateway_records_the_dials_of_its_hive_pool_on_its_own_trace() -> Result<(), TightBeamError> {
+	assert_eq!(gateway_work_dials().await?, [events::POOL_DIAL]);
+	Ok(())
 }

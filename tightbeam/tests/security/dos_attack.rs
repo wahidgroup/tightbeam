@@ -28,21 +28,21 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
 use tightbeam::{
-	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
+	exactly,
+	instrumentation::events,
+	job, tb_assert_spec, tb_process_spec, tb_scenario,
 	testing::{ScenarioConfig, SetupEnv},
 	trace::TraceCollector,
-	transport::{MessageIO, TransportError, TransportFailure},
+	transport::EncryptedMessageIO,
 	urn::Urn,
 	TightBeamError,
 };
 
-use crate::security::common::{expectation_failure, HandshakeBackendKind, ServerMaterials, BACKEND_COUNT_U32};
+use crate::security::common::{expectation_failure, HandshakeBackendKind, ServerMaterials};
 
 pub(crate) const DOS_GENERATE_OVERSIZED: Urn<'static> =
 	tightbeam::urn!("test", "event:dos-attack/dos-generate-oversized");
 pub(crate) const DOS_INJECT_OVERSIZED: Urn<'static> = tightbeam::urn!("test", "event:dos-attack/dos-inject-oversized");
-pub(crate) const DOS_OVERSIZED_REJECTED: Urn<'static> =
-	tightbeam::urn!("test", "event:dos-attack/dos-oversized-rejected");
 
 /// The size ceiling of a handshake message (16 KiB) in the transport layer.
 const HANDSHAKE_MAX_SIZE: usize = 16 * 1024;
@@ -52,9 +52,9 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(DOS_GENERATE_OVERSIZED, exactly!(BACKEND_COUNT_U32)),
-			(DOS_INJECT_OVERSIZED, exactly!(BACKEND_COUNT_U32)),
-			(DOS_OVERSIZED_REJECTED, exactly!(BACKEND_COUNT_U32), equals!(true))
+			(DOS_GENERATE_OVERSIZED, exactly!(1)),
+			(DOS_INJECT_OVERSIZED, exactly!(1)),
+			(events::TRANSPORT_ENVELOPE_REFUSED, exactly!(1), equals!("SizeExceeded"))
 		]
 	}
 }
@@ -66,28 +66,42 @@ tb_process_spec! {
 
 			DOS_GENERATE_OVERSIZED,
 			DOS_INJECT_OVERSIZED,
-			DOS_OVERSIZED_REJECTED
+			events::TRANSPORT_ENVELOPE_REFUSED
 		}
 		hidden { }
 	}
 	states {
 		Idle => { DOS_GENERATE_OVERSIZED => OversizedReady },
 		OversizedReady => { DOS_INJECT_OVERSIZED => Injected },
-		Injected => { DOS_OVERSIZED_REJECTED => Idle }
+		Injected => { events::TRANSPORT_ENVELOPE_REFUSED => Idle }
 	}
 	terminal { Idle }
 	annotations { description: "DoS attack: oversized handshake message rejection" }
 }
 
 tb_scenario! {
-	name: dos_attack,
+	name: dos_attack_hpke,
 	config: ScenarioConfig::builder()
 		.with_spec(DosAttackSpec::latest())
 		.with_csp(DosAttackProcess)
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
-			DosAttackScenario::run((trace.into(),)).await
+			DosAttackScenario::run((trace.into(), HandshakeBackendKind::Hpke)).await
+		}
+	}
+}
+
+#[cfg(feature = "transport-cms")]
+tb_scenario! {
+	name: dos_attack_cms,
+	config: ScenarioConfig::builder()
+		.with_spec(DosAttackSpec::latest())
+		.with_csp(DosAttackProcess)
+		.build(),
+	environment Bare {
+		exec: |SetupEnv { trace, .. }| async move {
+			DosAttackScenario::run((trace.into(), HandshakeBackendKind::Cms)).await
 		}
 	}
 }
@@ -101,7 +115,7 @@ fn oversized_message() -> Vec<u8> {
 	[header.as_slice(), &vec![0u8; length]].concat()
 }
 
-/// Send `message` to the server at `addr` in one burst, as a peer before its
+/// Sends `message` to the server at `addr` in one burst, as a peer before its
 /// first handshake round.
 async fn send(addr: SocketAddr, message: Vec<u8>) -> Result<(), TightBeamError> {
 	let mut stream = TcpStream::connect(addr).await?;
@@ -111,31 +125,30 @@ async fn send(addr: SocketAddr, message: Vec<u8>) -> Result<(), TightBeamError> 
 
 job! {
 	name: DosAttackScenario,
-	async fn run((trace,): (Arc<TraceCollector>,)) -> Result<(), TightBeamError> {
+	async fn run((trace, kind): (Arc<TraceCollector>, HandshakeBackendKind)) -> Result<(), TightBeamError> {
 		let materials = ServerMaterials::generate();
 
-		for kind in HandshakeBackendKind::all() {
-			// 1. Generate a handshake message one octet past the cap.
-			let oversized = oversized_message();
+		// 1. Generate a handshake message one octet past the cap.
+		let oversized = oversized_message();
 
-			trace.event(DOS_GENERATE_OVERSIZED)?;
+		trace.event(DOS_GENERATE_OVERSIZED)?;
 
-			// 2. Send it to a server of the backend, which reads it before any
-			//    handshake round, under the handshake ceiling.
-			let (listener, addr) = kind.bind_listener(&materials).await?;
-			let sender = tokio::spawn(send(addr, oversized));
-			let (mut server, _) = listener.accept().await?;
+		// 2. Send it to a server of the backend, which reads it before any
+		//    handshake round, under the handshake ceiling, and files its
+		//    refusal in the scenario trace.
+		let (listener, addr) = kind.bind_listener(&materials).await?;
+		let sender = tokio::spawn(send(addr, oversized));
+		let (server, _) = listener.accept().await?;
+		let mut server = server.with_trace(trace.share());
 
-			trace.event(DOS_INJECT_OVERSIZED)?;
+		trace.event(DOS_INJECT_OVERSIZED)?;
 
-			// 3. The cap refuses the message on its header, by its size.
-			let read = server.read_envelope_bytes().await;
-			let refused = matches!(read, Err(TransportError::OperationFailed(TransportFailure::SizeExceeded)));
-			trace.event_with(DOS_OVERSIZED_REJECTED, &[], refused)?;
+		// 3. The cap refuses the message on its header, by its size.
+		let read = server.collect_step().await;
+		assert!(read.is_err(), "the server read a handshake message past its ceiling");
 
-			// 4. The sender wrote the whole message while the server held the connection.
-			sender.await.map_err(|_| expectation_failure("the sender panicked"))??;
-		}
+		// 4. The sender wrote the whole message while the server held the connection.
+		sender.await.map_err(|_| expectation_failure("the sender panicked"))??;
 
 		Ok(())
 	}

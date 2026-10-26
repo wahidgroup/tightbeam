@@ -9,6 +9,8 @@ use crate::testing::specs::lts::{Event, State};
 
 #[cfg(feature = "testing-fault")]
 use crate::testing::fdr::config::InjectedFaultRecord;
+#[cfg(feature = "testing-fdr")]
+use crate::testing::fdr::explorer::SeedResult;
 #[cfg(feature = "testing-fmea")]
 use crate::testing::fmea::FmeaReport;
 
@@ -27,9 +29,9 @@ pub type AcceptanceSet = HashSet<Event>;
 
 /// What one Layer 3 assertion decided.
 ///
-/// A check that ran out of budget gets its own value. Folding it into either
-/// answer claims a proof that the check never finished, or reports a defect
-/// with no witness.
+/// A check that ran out of budget gets its own value. Either answer in its
+/// place would claim a proof that the check never finished, or report a
+/// defect with no witness.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum Decision {
 	/// The run left the assertion out, or the subject cannot answer it.
@@ -100,8 +102,8 @@ pub struct FdrVerdict {
 	/// Deadlock freedom, the absence of an unexpected STOP state.
 	///
 	/// A run under fault injection leaves it unasserted, because that run
-	/// measures what the faults cause. [`FdrVerdict::deadlock_witness`] still
-	/// records a deadlock.
+	/// measures what the faults cause. Such a run records a deadlock in
+	/// [`FdrVerdict::deadlock_witness`] alone.
 	pub deadlock_free: Decision,
 
 	/// Schedulability, which holds when the task set of every configured spec
@@ -315,6 +317,60 @@ impl FdrVerdict {
 		self.schedulable = schedulable;
 
 		self
+	}
+
+	/// Adds the result of `seed` to this verdict.
+	///
+	/// A seed that injected a fault feeds the error-recovery counters, which
+	/// FMEA detection ratings divide.
+	#[cfg(feature = "testing-fdr")]
+	pub(crate) fn add_seed(&mut self, seed: u64, result: &SeedResult) {
+		match result {
+			#[cfg(feature = "testing-fault")]
+			SeedResult::Divergence(_trace, _state, hidden, faults) => {
+				self.divergence_free = self.divergence_free.refute();
+				self.divergence_witness = Some((seed, hidden.clone()));
+				self.failing_seed = Some(seed);
+				if !faults.is_empty() {
+					self.error_recovery_failed += 1;
+				}
+				self.faults_injected.extend(faults.clone());
+			}
+			#[cfg(not(feature = "testing-fault"))]
+			SeedResult::Divergence(_trace, _state, hidden) => {
+				self.divergence_free = self.divergence_free.refute();
+				self.divergence_witness = Some((seed, hidden.clone()));
+				self.failing_seed = Some(seed);
+			}
+			#[cfg(feature = "testing-fault")]
+			SeedResult::Deadlock(trace, state, faults) => {
+				self.deadlock_free = self.deadlock_free.refute();
+				self.deadlock_witness = Some((seed, trace.clone(), *state));
+				self.failing_seed = Some(seed);
+				if !faults.is_empty() {
+					self.error_recovery_failed += 1;
+				}
+				self.faults_injected.extend(faults.clone());
+			}
+			#[cfg(not(feature = "testing-fault"))]
+			SeedResult::Deadlock(trace, state) => {
+				self.deadlock_free = self.deadlock_free.refute();
+				self.deadlock_witness = Some((seed, trace.clone(), *state));
+				self.failing_seed = Some(seed);
+			}
+			#[cfg(feature = "testing-fault")]
+			SeedResult::Success(_trace, _failures, faults) => {
+				self.seeds_completed += 1;
+				if !faults.is_empty() {
+					self.error_recovery_successful += 1;
+				}
+				self.faults_injected.extend(faults.clone());
+			}
+			#[cfg(not(feature = "testing-fault"))]
+			SeedResult::Success(..) => {
+				self.seeds_completed += 1;
+			}
+		}
 	}
 
 	/// What Layer 3 decided, over every assertion it made.

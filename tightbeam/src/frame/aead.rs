@@ -28,10 +28,10 @@ impl Frame {
 	/// # Plaintext
 	///
 	/// The plaintext comes back as a [`SecretSlice`] that zeroizes on drop.
-	/// When the frame was compressed, these bytes are still compressed, and the
-	/// caller decompresses them separately. A caller who must own the bytes
-	/// takes them through [`ToInsecure::to_insecure`], a buffer that still
-	/// wipes.
+	/// The bytes of a compressed frame come back compressed, and the caller
+	/// decompresses them separately. A caller who must own the bytes takes
+	/// them through [`ToInsecure::to_insecure`], a buffer that also wipes on
+	/// drop.
 	///
 	/// [`ToInsecure::to_insecure`]: crate::crypto::secret::ToInsecure::to_insecure
 	///
@@ -123,7 +123,7 @@ impl Frame {
 				self.message = inflator.decompress(&compressed)?;
 			}
 			// The body opens in the buffer it arrived in, and a refused open
-			// leaves that buffer as it was (`Decryptor::open`).
+			// leaves that buffer unchanged (`Decryptor::open`).
 			None => {
 				let opened = decryptor.decrypt_content(sealed.value(), sealed.der(), &mut self.message);
 				opened.await?;
@@ -135,12 +135,12 @@ impl Frame {
 		Ok(())
 	}
 
-	/// Encrypt the message body under the AEAD of `P`, with the content key
-	/// encrypted by the key-encryption key an async key provider holds.
+	/// Encrypt the message body under the AEAD of `P`, and the content key
+	/// under the key-encryption key that an async key provider holds.
 	///
 	/// Use it when an [`EncryptingKeyProvider`], such as an HSM or a KMS, holds
-	/// the key-encryption key. A refusal of the version or of the seal leaves
-	/// the frame unchanged. On success the method stores:
+	/// the key-encryption key. On any error the frame is unchanged. On success
+	/// the method stores:
 	///
 	/// - The envelope in the `confidentiality` field, its recipient named by the provider's key identifier.
 	/// - The encrypted bytes in the `message` field, detached from the envelope (RFC 5652 §6.1).
@@ -149,7 +149,6 @@ impl Frame {
 	///
 	/// - [`TightBeamError::UnsupportedVersion`] -- the frame version predates confidentiality.
 	/// - [`TightBeamError::EnvelopeError`] -- the provider or the envelope refuses to seal.
-	/// - [`TightBeamError::SerializationError`] -- the sealed envelope fails to encode.
 	#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 	pub async fn encrypt_with_provider<P>(&mut self, provider: &(impl EncryptingKeyProvider + ?Sized)) -> Result<()>
 	where
@@ -157,10 +156,9 @@ impl Frame {
 	{
 		self.ensure_allows(GatedField::Confidentiality)?;
 
-		// The body seals in place, and every step of the seal that can fail
-		// runs before the body encrypts, so a refused seal leaves the frame
-		// unchanged. The envelope carries the body detached, so its encoding
-		// is its fields alone, far inside a DER length.
+		// Each step of the seal that can fail runs before the body encrypts in
+		// place, so a refused seal leaves the frame unchanged. The DER length
+		// check is one, so the envelope that the seal returns encodes.
 		let envelope = AuthEnvelopedData::seal_to_holder::<P>(provider, DATA, &mut self.message).await?;
 		self.metadata.confidentiality = Some(WireDer::new(envelope)?);
 
@@ -168,7 +166,8 @@ impl Frame {
 	}
 
 	/// Decrypt the message body under the AEAD of `P`, with the content key
-	/// decrypted by the key-encryption key an async key provider holds.
+	/// that an async key provider decrypts under the key-encryption key it
+	/// holds.
 	///
 	/// Use it when an [`EncryptingKeyProvider`], such as an HSM or a KMS, holds
 	/// the key-encryption key. On any error the frame is unchanged. On success
@@ -198,7 +197,7 @@ impl Frame {
 		let content_type = envelope.auth_encrypted_content_info.content_type;
 
 		// The body opens in the buffer it arrived in, and a refused open
-		// leaves that buffer as it was, so the frame is unchanged.
+		// leaves that buffer, and so the frame, unchanged.
 		let opened = envelope.open_with_holder::<P>(sealed.der(), &mut self.message, provider, content_type);
 		opened.await?;
 		self.metadata.confidentiality = None;
@@ -226,8 +225,8 @@ mod tests {
 	use crate::testing::{TestKey, TestMessage};
 	use crate::{Frame, TightBeamError};
 
-	/// `frame` with the first octet of its encrypted body flipped, so the body
-	/// fails its tag.
+	/// Returns `frame` with the first octet of its encrypted body flipped, so
+	/// the body fails its tag.
 	fn tampered(mut frame: Frame) -> Frame {
 		let octet = frame.message.first_mut().expect("the frame carries an encrypted body");
 		*octet ^= 0x01;
@@ -257,7 +256,8 @@ mod tests {
 			}
 		}
 
-		/// Compression parameters that mark a body as zstd-compressed.
+		/// Returns the compression parameters that mark a body as
+		/// zstd-compressed.
 		fn zstd_compactness() -> CompressedData {
 			let compression_alg = AlgorithmIdentifier { oid: COMPRESSION_ZSTD, parameters: None };
 			let encap_content_info = EncapsulatedContentInfo { econtent_type: DATA, econtent: None };
@@ -324,8 +324,8 @@ mod tests {
 			Ok(())
 		}
 
-		/// A body that fails its tag is refused, and the open, which ran in the
-		/// body's own buffer, leaves the frame as it arrived.
+		/// `decrypt_in_place` refuses a body that fails its tag, and the open
+		/// runs in the body's own buffer, so it leaves the frame as it arrived.
 		#[tokio::test]
 		async fn a_body_that_fails_its_tag_leaves_the_frame() -> Result<()> {
 			let (_, cipher) = TestKey::insecure_fixed_cipher();
@@ -424,6 +424,7 @@ mod tests {
 		use crate::crypto::key::{Aes256GcmKeyProvider, EncryptingKeyProvider, KeyError};
 		use crate::crypto::profiles::DefaultCryptoProvider;
 		use crate::crypto::secret::SecretSlice;
+		use crate::der::Length;
 		use crate::oids::AES_256_WRAP;
 		use crate::spki::AlgorithmIdentifierOwned;
 
@@ -470,7 +471,8 @@ mod tests {
 			Ok(())
 		}
 
-		/// The `kekid.keyIdentifier` of the one `KEKRecipientInfo` of `frame`.
+		/// Returns the `kekid.keyIdentifier` of the one `KEKRecipientInfo` of
+		/// `frame`.
 		fn key_identifier_of(frame: &Frame) -> Vec<u8> {
 			use crate::cms::enveloped_data::RecipientInfo;
 
@@ -534,6 +536,51 @@ mod tests {
 			let result = frame.encrypt_with_provider::<DefaultCryptoProvider>(&RefusingHolder).await;
 			assert!(matches!(result, Err(TightBeamError::EnvelopeError(EnvelopeError::Key(_)))));
 			assert_eq!(frame, original);
+			Ok(())
+		}
+
+		/// A key holder whose encrypted key fills a DER length, so the
+		/// `KEKRecipientInfo` that carries the key runs past one. An outside
+		/// holder returns a key of any length, and this one stands for it.
+		#[derive(Debug)]
+		struct OversizedHolder;
+
+		impl EncryptingKeyProvider for OversizedHolder {
+			fn algorithm(&self) -> AlgorithmIdentifierOwned {
+				AlgorithmIdentifierOwned { oid: AES_256_WRAP, parameters: None }
+			}
+
+			fn key_identifier(&self) -> &[u8] {
+				KEY_IDENTIFIER
+			}
+
+			fn encrypt(
+				&self,
+				_content_key: &[u8],
+			) -> Pin<Box<dyn Future<Output = core::result::Result<Vec<u8>, KeyError>> + Send + '_>> {
+				let longest = usize::try_from(Length::MAX).expect("a DER length fits a usize");
+				Box::pin(ready(Ok(vec![0u8; longest])))
+			}
+
+			fn decrypt(
+				&self,
+				encrypted_key: &[u8],
+			) -> Pin<Box<dyn Future<Output = core::result::Result<SecretSlice<u8>, KeyError>> + Send + '_>> {
+				Box::pin(ready(Err(KeyError::WrapLength((encrypted_key.len(), 0).into()))))
+			}
+		}
+
+		/// An envelope past a DER length refuses the seal before the body
+		/// encrypts, so the frame keeps its body.
+		#[tokio::test]
+		async fn a_seal_whose_envelope_is_past_a_der_length_leaves_the_frame() -> Result<()> {
+			let message = TestMessage::sample(None);
+			let mut frame = compose! { V1: id: "test-oversized-seal", order: 1u64, message: message }?;
+			let original = frame.clone();
+
+			let result = frame.encrypt_with_provider::<DefaultCryptoProvider>(&OversizedHolder).await;
+			assert_eq!(frame, original);
+			assert!(matches!(result, Err(TightBeamError::EnvelopeError(EnvelopeError::Encoding(_)))));
 			Ok(())
 		}
 

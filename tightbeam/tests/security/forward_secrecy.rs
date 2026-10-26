@@ -39,8 +39,6 @@ use crate::security::common::{
 	captured_ephemerals, expectation_failure, x_coordinate, HandshakeBackendKind, SecurityThreatHarness,
 };
 
-pub(crate) const FS_ALL_EPHEMERAL_UNIQUE: Urn<'static> =
-	tightbeam::urn!("test", "event:forward-secrecy/fs-all-ephemeral-unique");
 pub(crate) const FS_CAPTURE_HANDSHAKE: Urn<'static> =
 	tightbeam::urn!("test", "event:forward-secrecy/fs-capture-handshake");
 pub(crate) const FS_EXTRACT_EPHEMERAL: Urn<'static> =
@@ -55,8 +53,7 @@ tb_assert_spec! {
 		mode: Accept,
 		assertions: [
 			(FS_CAPTURE_HANDSHAKE, exactly!(HANDSHAKE_COUNT as u32)),
-			(FS_EXTRACT_EPHEMERAL, exactly!(HANDSHAKE_COUNT as u32)),
-			(FS_ALL_EPHEMERAL_UNIQUE, exactly!(1u32), equals!(true))
+			(FS_EXTRACT_EPHEMERAL, exactly!(HANDSHAKE_COUNT as u32))
 		]
 	}
 }
@@ -68,7 +65,6 @@ tb_process_spec! {
 
 			FS_CAPTURE_HANDSHAKE,
 			FS_EXTRACT_EPHEMERAL,
-			FS_ALL_EPHEMERAL_UNIQUE,
 			SecurityThreatHarness::HARNESS_SPAWN_SESSION,
 			SecurityThreatHarness::HARNESS_SPAWN_HPKE
 		}
@@ -79,13 +75,9 @@ tb_process_spec! {
 		Spawning => { SecurityThreatHarness::HARNESS_SPAWN_HPKE => SessionReady },
 		SessionReady => { FS_CAPTURE_HANDSHAKE => Captured },
 		Captured => { FS_EXTRACT_EPHEMERAL => Extracted },
-		Extracted => {
-			SecurityThreatHarness::HARNESS_SPAWN_SESSION => Spawning,
-			FS_ALL_EPHEMERAL_UNIQUE => Complete
-		},
-		Complete => { }
+		Extracted => { SecurityThreatHarness::HARNESS_SPAWN_SESSION => Spawning }
 	}
-	terminal { Complete }
+	terminal { Extracted }
 	annotations { description: "Forward Secrecy: Ephemeral key uniqueness verification" }
 }
 
@@ -141,7 +133,11 @@ job! {
 		let static_coordinate = x_coordinate(static_key.as_bytes())?;
 		let distinct: BTreeSet<Vec<u8>> = coordinates.into_iter().chain([static_coordinate]).collect();
 
-		trace.event_with(FS_ALL_EPHEMERAL_UNIQUE, &[], distinct.len() == 2 * HANDSHAKE_COUNT + 1)?;
+		assert_eq!(
+			distinct.len(),
+			2 * HANDSHAKE_COUNT + 1,
+			"an ephemeral repeats across handshakes or shares the x-coordinate of the static key"
+		);
 
 		Ok(())
 	}

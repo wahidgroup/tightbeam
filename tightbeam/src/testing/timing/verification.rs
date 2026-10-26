@@ -1,4 +1,4 @@
-//! Timing verification logic
+//! The timing verification of a trace against its timing constraints.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -15,36 +15,37 @@ use super::constraints::{TimingConstraint, TimingConstraints};
 use super::deadline::Deadline;
 use super::violations::{DeadlineMiss, JitterViolation, PathWcetViolation, TimingSlackViolation, TimingViolation};
 
-/// Timing verification result (DER-encodable core)
+/// The DER-encodable result of a timing verification.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Sequence)]
 pub struct TimingVerificationResult {
-	/// Whether all timing constraints were satisfied
+	/// Whether the trace meets every timing constraint.
 	pub passed: bool,
-	/// WCET violations found
+	/// The WCET violations in the trace.
 	pub wcet_violations: Vec<TimingViolation>,
-	/// Deadline misses found
+	/// The deadline misses in the trace.
 	pub deadline_misses: Vec<DeadlineMiss>,
-	/// Jitter violations found
+	/// The jitter violations in the trace.
 	pub jitter_violations: Vec<JitterViolation>,
-	/// Slack violations found
+	/// The slack violations in the trace.
 	pub slack_violations: Vec<TimingSlackViolation>,
-	/// Path WCET violations found
+	/// The path WCET violations in the trace.
 	pub path_wcet_violations: Vec<PathWcetViolation>,
 }
 
 impl TimingConstraints {
-	/// Verify timing constraints against trace
+	/// Verifies `trace` against the timing constraints of this collection.
 	///
-	/// Checks observed durations from instrumentation events against timing
-	/// constraints defined in this collection.
+	/// The check reads the observed durations from the instrumentation events
+	/// of the trace.
 	pub fn verify(&self, trace: &ConsumedTrace) -> Result<TimingVerificationResult, TestingError> {
 		self.verify_with_process(trace, None)
 	}
 
-	/// Verify timing constraints against trace with optional CSP process
+	/// Verifies `trace` against the timing constraints of this collection,
+	/// with the CSP `process` when one is given.
 	///
-	/// If a process is provided, path-based WCET constraints are also verified.
-	/// Otherwise, only event-based constraints (WCET, deadlines, jitter) are checked.
+	/// A process adds the path WCET constraints to the check. Without one, the
+	/// check covers the event constraints alone: WCET, deadlines, and jitter.
 	pub fn verify_with_process(
 		&self,
 		trace: &ConsumedTrace,
@@ -58,7 +59,6 @@ impl TimingConstraints {
 		Self::verify_deadline_constraints(self, &events_by_label, &mut result);
 		Self::verify_jitter_constraints(self, &events_by_label, &mut result);
 
-		// Verify path-based WCET if process is provided
 		if let Some(process) = process {
 			Self::verify_path_wcet_constraints(self, trace, process, &mut result);
 		}
@@ -66,8 +66,8 @@ impl TimingConstraints {
 		Ok(result)
 	}
 
-	/// Extract timing events from trace
-	/// Looks for events with timing URNs or timing fields set
+	/// The timing events of `trace`: each event with a timing URN, or with a
+	/// duration or a timestamp set.
 	fn extract_timing_events(trace: &ConsumedTrace) -> Vec<&TbEvent> {
 		#[cfg(feature = "instrument")]
 		{
@@ -89,7 +89,7 @@ impl TimingConstraints {
 		}
 	}
 
-	/// Group events by label for efficient lookup
+	/// Groups `events` by label, and skips an event with no label.
 	fn group_events_by_label<'a>(events: &'a [&TbEvent]) -> HashMap<String, Vec<&'a TbEvent>> {
 		let mut grouped: HashMap<String, Vec<&'a TbEvent>> = HashMap::new();
 		for event in events {
@@ -101,7 +101,9 @@ impl TimingConstraints {
 		grouped
 	}
 
-	/// Verify WCET constraints
+	/// Verifies each WCET constraint against the `TIMING_WCET` samples of its
+	/// event. A constraint with a percentile tests that percentile of the
+	/// samples, and any other constraint tests each sample.
 	fn verify_wcet_constraints(
 		constraints: &TimingConstraints,
 		events_by_label: &HashMap<String, Vec<&TbEvent>>,
@@ -112,16 +114,14 @@ impl TimingConstraints {
 				let wcet_ns = wcet_config.duration.as_nanos() as u64;
 				let event_label = event.0;
 				if let Some(events) = events_by_label.get(event_label) {
-					// Filter for timing-wcet URN only
-					// Events with duration but different URNs
+					// The samples are the `TIMING_WCET` events, because another
+					// timing event can carry a duration too.
 					let wcet_events: Vec<&TbEvent> =
 						events.iter().filter(|e| e.urn == events::TIMING_WCET).copied().collect();
 
-					// If percentile is specified, use statistical analysis
 					if let Some(percentile) = wcet_config.percentile {
 						Self::verify_percentile_wcet(wcet_config, percentile, &wcet_events, event, wcet_ns, result);
 					} else {
-						// Standard max-based WCET verification
 						Self::report_wcet_violations(event, wcet_ns, &wcet_events, result);
 					}
 				}
@@ -129,7 +129,8 @@ impl TimingConstraints {
 		}
 	}
 
-	/// Verify percentile-based WCET constraints
+	/// Verifies a percentile WCET constraint over `events`, and reports each
+	/// sample past the bound when the percentile of the samples exceeds it.
 	fn verify_percentile_wcet(
 		wcet_config: &crate::testing::timing::WcetConfig,
 		percentile: Percentile,
@@ -138,39 +139,34 @@ impl TimingConstraints {
 		wcet_ns: u64,
 		result: &mut TimingVerificationResult,
 	) {
-		// Extract durations from events
 		let durations: Vec<u64> = events.iter().filter_map(|ev| ev.duration_ns).collect();
 
 		if durations.is_empty() {
 			return;
 		}
 
-		// Use configured analyzer or default
 		let analyzer: Arc<dyn StatisticalAnalyzer> = wcet_config
 			.analyzer
 			.clone()
 			.unwrap_or_else(|| Arc::new(DefaultStatisticalAnalyzer));
 
-		// Perform statistical analysis
 		let measures = match analyzer.analyze(&durations) {
 			Ok(m) => m,
 			Err(_) => return, // Skip if analysis fails
 		};
 
-		// Get percentile value
 		let percentile_value = match measures.percentiles.iter().find(|pv| pv.percentile == percentile) {
 			Some(pv) => pv.value,
 			None => return, // Percentile not available
 		};
 
-		// Check if percentile value exceeds WCET
 		if percentile_value > wcet_ns {
-			// Report violation for all events that exceeded WCET
 			Self::report_wcet_violations(event, wcet_ns, events, result);
 		}
 	}
 
-	/// Report WCET violations for events that exceed the WCET threshold
+	/// Records a violation for each event whose duration exceeds `wcet_ns`,
+	/// and marks the result failed.
 	fn report_wcet_violations(event: &Event, wcet_ns: u64, events: &[&TbEvent], result: &mut TimingVerificationResult) {
 		for ev in events.iter() {
 			if let Some(observed_ns) = ev.duration_ns {
@@ -187,7 +183,8 @@ impl TimingConstraints {
 		}
 	}
 
-	/// Verify deadline constraints (explicit start/end event pairs)
+	/// Verifies each deadline constraint against the pairs of its start and
+	/// end events.
 	fn verify_deadline_constraints(
 		constraints: &TimingConstraints,
 		events_by_label: &HashMap<String, Vec<&TbEvent>>,
@@ -224,7 +221,8 @@ impl TimingConstraints {
 		}
 	}
 
-	/// Check deadline pairs and slack constraints
+	/// Checks each start event, with the first end event after it, against
+	/// the deadline and its minimum slack.
 	fn check_deadline_pairs(
 		deadline: &Deadline,
 		deadline_ns: u64,
@@ -253,7 +251,7 @@ impl TimingConstraints {
 		}
 	}
 
-	/// Find the next end event after a start event
+	/// The first end event whose timestamp follows `start_ns`.
 	fn find_matching_end_event<'a>(start_ns: u64, end_events: &'a [&TbEvent]) -> Option<&'a TbEvent> {
 		end_events
 			.iter()
@@ -261,7 +259,7 @@ impl TimingConstraints {
 			.copied()
 	}
 
-	/// Check if deadline was violated
+	/// Records a deadline miss when `latency_ns` exceeds `deadline_ns`.
 	fn check_deadline_violation(
 		deadline: &Deadline,
 		deadline_ns: u64,
@@ -283,7 +281,8 @@ impl TimingConstraints {
 		}
 	}
 
-	/// Check if slack constraint was violated
+	/// Records a slack violation when the time left under the deadline falls
+	/// short of its minimum slack.
 	fn check_slack_violation(
 		deadline: &Deadline,
 		deadline_ns: u64,
@@ -311,7 +310,7 @@ impl TimingConstraints {
 		}
 	}
 
-	/// Verify jitter constraints
+	/// Verifies each jitter constraint whose event has at least two samples.
 	fn verify_jitter_constraints(
 		constraints: &TimingConstraints,
 		events_by_label: &HashMap<String, Vec<&TbEvent>>,
@@ -330,7 +329,8 @@ impl TimingConstraints {
 		}
 	}
 
-	/// Check if jitter constraint was violated
+	/// Records a jitter violation when the jitter of the sample durations
+	/// exceeds `max_jitter_ns`. The calculator defaults to `MinMaxJitter`.
 	fn check_jitter_violation(
 		event: &Event,
 		max_jitter_ns: u64,
@@ -355,51 +355,47 @@ impl TimingConstraints {
 		}
 	}
 
-	/// Verify path-based WCET constraints
+	/// Verifies each path WCET constraint against the execution paths of
+	/// `trace` through `process`.
 	fn verify_path_wcet_constraints(
 		constraints: &TimingConstraints,
 		trace: &ConsumedTrace,
 		process: &Process,
 		result: &mut TimingVerificationResult,
 	) {
-		// Extract execution paths from trace
-		// For each path-based WCET constraint
 		let execution_paths = trace.execution_paths(process);
 		for path_wcet in constraints.path_wcets() {
-			// Find matching execution paths
 			let max_duration_ns = path_wcet.max_duration_ns();
 			for exec_path in &execution_paths {
-				if exec_path.matches_pattern(&path_wcet.path) {
-					// Check if path duration exceeds constraint
-					if exec_path.total_duration > max_duration_ns {
-						result.passed = false;
-						result.path_wcet_violations.push(PathWcetViolation {
-							path: exec_path.events.clone(),
-							max_path_duration_ns: max_duration_ns,
-							observed_path_duration_ns: exec_path.total_duration,
-							seqs: {
-								// Extract sequence numbers from trace events
-								#[cfg(feature = "instrument")]
-								{
-									trace
-										.instrument_events
-										.iter()
-										.filter(|ev| {
-											ev.label
-												.as_ref()
-												.map(|l| exec_path.events.iter().any(|e| e.0 == l.as_str()))
-												== Some(true)
-										})
-										.map(|ev| ev.seq)
-										.collect()
-								}
-								#[cfg(not(feature = "instrument"))]
-								{
-									Vec::new()
-								}
-							},
-						});
-					}
+				let on_path = exec_path.matches_pattern(&path_wcet.path);
+				let over_budget = exec_path.total_duration > max_duration_ns;
+				if on_path && over_budget {
+					result.passed = false;
+					result.path_wcet_violations.push(PathWcetViolation {
+						path: exec_path.events.clone(),
+						max_path_duration_ns: max_duration_ns,
+						observed_path_duration_ns: exec_path.total_duration,
+						seqs: {
+							// The sequence numbers of the trace events
+							// whose label lies on the path.
+							#[cfg(feature = "instrument")]
+							{
+								trace
+									.instrument_events
+									.iter()
+									.filter(|ev| {
+										ev.label.as_ref().map(|l| exec_path.events.iter().any(|e| e.0 == l.as_str()))
+											== Some(true)
+									})
+									.map(|ev| ev.seq)
+									.collect()
+							}
+							#[cfg(not(feature = "instrument"))]
+							{
+								Vec::new()
+							}
+						},
+					});
 				}
 			}
 		}
@@ -418,235 +414,41 @@ mod tests {
 	use crate::testing::timing::{DeadlineBuilder, PathWcet, WcetConfig, WcetConfigBuilder};
 	use crate::urn::Urn;
 
-	// ========================================================================
-	// Test Case Data Structures
-	// ========================================================================
+	// The case types of the table-driven tests.
 
-	/// Test case for WCET constraint verification
+	/// One case of the WCET constraint table.
 	struct WcetTestCase {
 		constraint_ms: u64,
-		events: &'static [(Urn<'static>, &'static str, u64)], // (event_urn, label, value_ns)
+		events: Vec<(Urn<'static>, &'static str, u64)>, // (event_urn, label, value_ns)
 		expected_passed: bool,
 		expected_violations: usize,
 	}
 
-	/// Test case for deadline constraint verification
+	/// One case of the deadline constraint table.
 	struct DeadlineTestCase {
 		deadline_ms: u64,
 		start_event: &'static str,
 		end_event: &'static str,
 		min_slack_ms: Option<u64>,
-		events: &'static [(Urn<'static>, &'static str, u64)], // (event_urn, label, value_ns)
+		events: Vec<(Urn<'static>, &'static str, u64)>, // (event_urn, label, value_ns)
 		expected_passed: bool,
 		expected_deadline_misses: usize,
 		expected_slack_violations: usize,
 	}
 
-	/// Test case for jitter constraint verification
+	/// One case of the jitter constraint table.
 	struct JitterTestCase {
 		max_jitter_ms: u64,
 		event_label: &'static str,
-		events: &'static [(Urn<'static>, &'static str, u64)], // (event_urn, label, value_ns)
+		events: Vec<(Urn<'static>, &'static str, u64)>, // (event_urn, label, value_ns)
 		expected_passed: bool,
 		expected_violations: usize,
 	}
 
-	// ========================================================================
-	// Test Case Data
-	// ========================================================================
+	// The functions that build the timing events, traces, and verdicts.
 
-	const WCET_TEST_CASES: &[WcetTestCase] = &[
-		WcetTestCase {
-			constraint_ms: 100,
-			events: &[(events::TIMING_WCET, "process", 50_000_000)],
-			expected_passed: true,
-			expected_violations: 0,
-		},
-		WcetTestCase {
-			constraint_ms: 100,
-			events: &[(events::TIMING_WCET, "process", 150_000_000)],
-			expected_passed: false,
-			expected_violations: 1,
-		},
-		WcetTestCase {
-			constraint_ms: 100,
-			events: &[
-				(events::TIMING_WCET, "process", 50_000_000),
-				(events::TIMING_WCET, "process", 150_000_000),
-				(events::TIMING_WCET, "process", 80_000_000),
-			],
-			expected_passed: false,
-			expected_violations: 1,
-		},
-		WcetTestCase { constraint_ms: 100, events: &[], expected_passed: true, expected_violations: 0 },
-		WcetTestCase {
-			constraint_ms: 100,
-			events: &[(events::TIMING_WCET, "process", 100_000_000)],
-			expected_passed: true,
-			expected_violations: 0,
-		},
-		WcetTestCase {
-			constraint_ms: 100,
-			events: &[(events::TIMING_DEADLINE, "process", 150_000_000)],
-			expected_passed: true,
-			expected_violations: 0,
-		},
-	];
-
-	const DEADLINE_TEST_CASES: &[DeadlineTestCase] = &[
-		DeadlineTestCase {
-			deadline_ms: 100,
-			start_event: "start",
-			end_event: "end",
-			min_slack_ms: None,
-			events: &[
-				(events::TIMING_DEADLINE, "start", 0),
-				(events::TIMING_DEADLINE, "end", 50_000_000),
-			],
-			expected_passed: true,
-			expected_deadline_misses: 0,
-			expected_slack_violations: 0,
-		},
-		DeadlineTestCase {
-			deadline_ms: 100,
-			start_event: "start",
-			end_event: "end",
-			min_slack_ms: None,
-			events: &[
-				(events::TIMING_DEADLINE, "start", 0),
-				(events::TIMING_DEADLINE, "end", 150_000_000),
-			],
-			expected_passed: false,
-			expected_deadline_misses: 1,
-			expected_slack_violations: 0,
-		},
-		DeadlineTestCase {
-			deadline_ms: 100,
-			start_event: "start",
-			end_event: "end",
-			min_slack_ms: None,
-			events: &[
-				(events::TIMING_DEADLINE, "start", 0),
-				(events::TIMING_DEADLINE, "end", 50_000_000),
-				(events::TIMING_DEADLINE, "start", 200_000_000),
-				(events::TIMING_DEADLINE, "end", 350_000_000),
-			],
-			expected_passed: false,
-			expected_deadline_misses: 1,
-			expected_slack_violations: 0,
-		},
-		DeadlineTestCase {
-			deadline_ms: 100,
-			start_event: "start",
-			end_event: "end",
-			min_slack_ms: None,
-			events: &[(events::TIMING_DEADLINE, "end", 50_000_000)],
-			expected_passed: true,
-			expected_deadline_misses: 0,
-			expected_slack_violations: 0,
-		},
-		DeadlineTestCase {
-			deadline_ms: 100,
-			start_event: "start",
-			end_event: "end",
-			min_slack_ms: None,
-			events: &[(events::TIMING_DEADLINE, "start", 0)],
-			expected_passed: true,
-			expected_deadline_misses: 0,
-			expected_slack_violations: 0,
-		},
-		DeadlineTestCase {
-			deadline_ms: 100,
-			start_event: "start",
-			end_event: "end",
-			min_slack_ms: None,
-			events: &[
-				(events::TIMING_DEADLINE, "start", 0),
-				(events::TIMING_DEADLINE, "end", 100_000_000),
-			],
-			expected_passed: true,
-			expected_deadline_misses: 0,
-			expected_slack_violations: 0,
-		},
-		DeadlineTestCase {
-			deadline_ms: 100,
-			start_event: "start",
-			end_event: "end",
-			min_slack_ms: Some(20),
-			events: &[
-				(events::TIMING_DEADLINE, "start", 0),
-				(events::TIMING_DEADLINE, "end", 50_000_000),
-			],
-			expected_passed: true,
-			expected_deadline_misses: 0,
-			expected_slack_violations: 0,
-		},
-		DeadlineTestCase {
-			deadline_ms: 100,
-			start_event: "start",
-			end_event: "end",
-			min_slack_ms: Some(20),
-			events: &[
-				(events::TIMING_DEADLINE, "start", 0),
-				(events::TIMING_DEADLINE, "end", 85_000_000),
-			],
-			expected_passed: false,
-			expected_deadline_misses: 0,
-			expected_slack_violations: 1,
-		},
-		DeadlineTestCase {
-			deadline_ms: 100,
-			start_event: "start",
-			end_event: "end",
-			min_slack_ms: Some(20),
-			events: &[
-				(events::TIMING_DEADLINE, "start", 0),
-				(events::TIMING_DEADLINE, "end", 150_000_000),
-			],
-			expected_passed: false,
-			expected_deadline_misses: 1,
-			expected_slack_violations: 1,
-		},
-	];
-
-	const JITTER_TEST_CASES: &[JitterTestCase] = &[
-		JitterTestCase {
-			max_jitter_ms: 50,
-			event_label: "process",
-			events: &[
-				(events::TIMING_JITTER, "process", 10_000_000),
-				(events::TIMING_JITTER, "process", 12_000_000),
-				(events::TIMING_JITTER, "process", 11_000_000),
-			],
-			expected_passed: true,
-			expected_violations: 0,
-		},
-		JitterTestCase {
-			max_jitter_ms: 50,
-			event_label: "process",
-			events: &[
-				(events::TIMING_JITTER, "process", 10_000_000),
-				(events::TIMING_JITTER, "process", 70_000_000),
-				(events::TIMING_JITTER, "process", 15_000_000),
-			],
-			expected_passed: false,
-			expected_violations: 1,
-		},
-		JitterTestCase {
-			max_jitter_ms: 50,
-			event_label: "process",
-			events: &[(events::TIMING_JITTER, "process", 10_000_000)],
-			expected_passed: true,
-			expected_violations: 0,
-		},
-	];
-
-	// ========================================================================
-	// Test Helpers
-	// ========================================================================
-
-	/// Create a timing event; deadline markers carry the value as a
-	/// timestamp, every other timing URN carries it as a duration
+	/// Creates a timing event. A deadline marker carries `value_ns` as a
+	/// timestamp, and every other timing URN carries it as a duration.
 	fn timing_event(event_urn: Urn<'static>, label: impl AsRef<str>, value_ns: u64, seq: u32) -> TbEvent {
 		let label = label.as_ref();
 		let is_deadline = event_urn == events::TIMING_DEADLINE;
@@ -670,7 +472,8 @@ mod tests {
 		}
 	}
 
-	/// Create a trace with timing events
+	/// Creates a trace whose instrumentation events are `events`, or an empty
+	/// trace in a build without `instrument`.
 	fn trace_with_events(events: impl IntoIterator<Item = TbEvent>) -> ConsumedTrace {
 		let events: Vec<TbEvent> = events.into_iter().collect();
 		let mut trace = ConsumedTrace::new();
@@ -681,13 +484,13 @@ mod tests {
 		trace
 	}
 
-	/// Create empty trace
+	/// Creates an empty trace.
 	fn empty_trace() -> ConsumedTrace {
 		ConsumedTrace::new()
 	}
 
-	/// Build events from test case data
-	fn build_events(events: &'static [(Urn<'static>, &'static str, u64)]) -> Vec<TbEvent> {
+	/// Builds the timing events of a case, each numbered by its index.
+	fn build_events(events: &[(Urn<'static>, &'static str, u64)]) -> Vec<TbEvent> {
 		events
 			.iter()
 			.enumerate()
@@ -695,10 +498,11 @@ mod tests {
 			.collect()
 	}
 
-	/// Common verification pattern: setup constraints, create trace, verify, assert
+	/// Verifies the events of a case against the constraints that `setup`
+	/// adds.
 	fn verify_constraints<F>(
 		setup: F,
-		events: &'static [(Urn<'static>, &'static str, u64)],
+		events: &[(Urn<'static>, &'static str, u64)],
 	) -> Result<TimingVerificationResult, TestingError>
 	where
 		F: FnOnce(&mut TimingConstraints) -> Result<(), TestingError>,
@@ -710,113 +514,288 @@ mod tests {
 		constraints.verify(&trace)
 	}
 
-	/// Run WCET test case
-	fn run_wcet_test_case(case: &WcetTestCase) -> Result<(), TestingError> {
-		let result = verify_constraints(
-			|constraints| {
-				let duration = Duration::from_millis(case.constraint_ms);
-				let wcet_config = WcetConfigBuilder::default().with_duration(duration).build()?;
-				constraints.add(Event("process"), TimingConstraint::Wcet(wcet_config));
-				Ok(())
+	impl WcetTestCase {
+		/// The verdict of a WCET bound of `constraint_ms` on `process` over the
+		/// events of the case.
+		fn verified(&self) -> Result<TimingVerificationResult, TestingError> {
+			verify_constraints(
+				|constraints| {
+					let duration = Duration::from_millis(self.constraint_ms);
+					let wcet_config = WcetConfigBuilder::default().with_duration(duration).build()?;
+					constraints.add(Event("process"), TimingConstraint::Wcet(wcet_config));
+					Ok(())
+				},
+				&self.events,
+			)
+		}
+	}
+
+	impl DeadlineTestCase {
+		/// The verdict of the deadline of the case over its events.
+		fn verified(&self) -> Result<TimingVerificationResult, TestingError> {
+			verify_constraints(
+				|constraints| {
+					let duration = Duration::from_millis(self.deadline_ms);
+					let start_event = Event(self.start_event);
+					let end_event = Event(self.end_event);
+					let mut builder = DeadlineBuilder::default()
+						.with_duration(duration)
+						.with_start_event(start_event)
+						.with_end_event(end_event);
+
+					if let Some(slack_ms) = self.min_slack_ms {
+						let min_slack = Duration::from_millis(slack_ms);
+						builder = builder.with_min_slack(min_slack);
+					}
+
+					constraints.add_deadline(builder.build()?);
+					Ok(())
+				},
+				&self.events,
+			)
+		}
+	}
+
+	impl JitterTestCase {
+		/// The verdict of the jitter bound of the case over its events.
+		fn verified(&self) -> Result<TimingVerificationResult, TestingError> {
+			verify_constraints(
+				|constraints| {
+					let dur = Duration::from_millis(self.max_jitter_ms);
+					constraints.add(Event(self.event_label), TimingConstraint::Jitter(dur, None));
+					Ok(())
+				},
+				&self.events,
+			)
+		}
+	}
+
+	// The table-driven tests of each constraint kind.
+
+	// A WCET bound of 100 ms on `process` holds for each sample at or under
+	// it, and a timing event of another kind is no WCET sample.
+	crate::tb_cases! {
+		fn wcet_constraint(case: WcetTestCase) -> Result<(), TestingError> {
+			let result = case.verified()?;
+
+			assert_eq!(result.passed, case.expected_passed);
+			assert_eq!(result.wcet_violations.len(), case.expected_violations);
+			Ok(())
+		}
+
+		cases {
+			within_the_bound => WcetTestCase {
+				constraint_ms: 100,
+				events: vec![(events::TIMING_WCET, "process", 50_000_000)],
+				expected_passed: true,
+				expected_violations: 0,
 			},
-			case.events,
-		)?;
-
-		if result.passed != case.expected_passed {
-			eprintln!("WCET Test Case Failed:");
-			eprintln!("  constraint_ms: {}", case.constraint_ms);
-			eprintln!(
-				"  events: {:?}",
-				case.events
-					.iter()
-					.map(|(urn, label, dur)| (urn, label, dur))
-					.collect::<Vec<_>>()
-			);
-			eprintln!("  expected_passed: {}", case.expected_passed);
-			eprintln!("  actual_passed: {}", result.passed);
-			eprintln!("  wcet_violations: {}", result.wcet_violations.len());
-		}
-		assert_eq!(result.passed, case.expected_passed);
-		assert_eq!(result.wcet_violations.len(), case.expected_violations);
-		Ok(())
-	}
-
-	/// Run deadline test case
-	fn run_deadline_test_case(case: &DeadlineTestCase) -> Result<(), TestingError> {
-		let result = verify_constraints(
-			|constraints| {
-				let duration = Duration::from_millis(case.deadline_ms);
-				let start_event = Event(case.start_event);
-				let end_event = Event(case.end_event);
-				let mut builder = DeadlineBuilder::default()
-					.with_duration(duration)
-					.with_start_event(start_event)
-					.with_end_event(end_event);
-
-				if let Some(slack_ms) = case.min_slack_ms {
-					let min_slack = Duration::from_millis(slack_ms);
-					builder = builder.with_min_slack(min_slack);
-				}
-
-				constraints.add_deadline(builder.build()?);
-				Ok(())
+			past_the_bound => WcetTestCase {
+				constraint_ms: 100,
+				events: vec![(events::TIMING_WCET, "process", 150_000_000)],
+				expected_passed: false,
+				expected_violations: 1,
 			},
-			case.events,
-		)?;
-
-		assert_eq!(result.passed, case.expected_passed);
-		assert_eq!(result.deadline_misses.len(), case.expected_deadline_misses);
-		assert_eq!(result.slack_violations.len(), case.expected_slack_violations);
-		Ok(())
-	}
-
-	/// Run jitter test case
-	fn run_jitter_test_case(case: &JitterTestCase) -> Result<(), TestingError> {
-		let result = verify_constraints(
-			|constraints| {
-				let dur = Duration::from_millis(case.max_jitter_ms);
-				constraints.add(Event(case.event_label), TimingConstraint::Jitter(dur, None));
-				Ok(())
+			one_sample_past_the_bound => WcetTestCase {
+				constraint_ms: 100,
+				events: vec![
+					(events::TIMING_WCET, "process", 50_000_000),
+					(events::TIMING_WCET, "process", 150_000_000),
+					(events::TIMING_WCET, "process", 80_000_000),
+				],
+				expected_passed: false,
+				expected_violations: 1,
 			},
-			case.events,
-		)?;
-
-		assert_eq!(result.passed, case.expected_passed);
-		assert_eq!(result.jitter_violations.len(), case.expected_violations);
-		Ok(())
-	}
-
-	// ========================================================================
-	// Data-Driven Tests
-	// ========================================================================
-
-	#[test]
-	fn test_wcet_constraints() -> Result<(), TestingError> {
-		for case in WCET_TEST_CASES {
-			run_wcet_test_case(case)?;
+			no_sample => WcetTestCase { constraint_ms: 100, events: Vec::new(), expected_passed: true, expected_violations: 0 },
+			at_the_bound => WcetTestCase {
+				constraint_ms: 100,
+				events: vec![(events::TIMING_WCET, "process", 100_000_000)],
+				expected_passed: true,
+				expected_violations: 0,
+			},
+			a_deadline_event => WcetTestCase {
+				constraint_ms: 100,
+				events: vec![(events::TIMING_DEADLINE, "process", 150_000_000)],
+				expected_passed: true,
+				expected_violations: 0,
+			},
 		}
-		Ok(())
 	}
 
-	#[test]
-	fn test_deadline_constraints() -> Result<(), TestingError> {
-		for case in DEADLINE_TEST_CASES {
-			run_deadline_test_case(case)?;
+	// A deadline of 100 ms from `start` to `end` counts each window past it,
+	// and a minimum slack counts each window that ends too close to it.
+	crate::tb_cases! {
+		fn deadline_constraint(case: DeadlineTestCase) -> Result<(), TestingError> {
+			let result = case.verified()?;
+
+			assert_eq!(result.passed, case.expected_passed);
+			assert_eq!(result.deadline_misses.len(), case.expected_deadline_misses);
+			assert_eq!(result.slack_violations.len(), case.expected_slack_violations);
+			Ok(())
 		}
-		Ok(())
-	}
 
-	#[test]
-	fn test_jitter_constraints() -> Result<(), TestingError> {
-		for case in JITTER_TEST_CASES {
-			run_jitter_test_case(case)?;
+		cases {
+			end_within_the_deadline => DeadlineTestCase {
+				deadline_ms: 100,
+				start_event: "start",
+				end_event: "end",
+				min_slack_ms: None,
+				events: vec![
+					(events::TIMING_DEADLINE, "start", 0),
+					(events::TIMING_DEADLINE, "end", 50_000_000),
+				],
+				expected_passed: true,
+				expected_deadline_misses: 0,
+				expected_slack_violations: 0,
+			},
+			end_past_the_deadline => DeadlineTestCase {
+				deadline_ms: 100,
+				start_event: "start",
+				end_event: "end",
+				min_slack_ms: None,
+				events: vec![
+					(events::TIMING_DEADLINE, "start", 0),
+					(events::TIMING_DEADLINE, "end", 150_000_000),
+				],
+				expected_passed: false,
+				expected_deadline_misses: 1,
+				expected_slack_violations: 0,
+			},
+			second_window_past_the_deadline => DeadlineTestCase {
+				deadline_ms: 100,
+				start_event: "start",
+				end_event: "end",
+				min_slack_ms: None,
+				events: vec![
+					(events::TIMING_DEADLINE, "start", 0),
+					(events::TIMING_DEADLINE, "end", 50_000_000),
+					(events::TIMING_DEADLINE, "start", 200_000_000),
+					(events::TIMING_DEADLINE, "end", 350_000_000),
+				],
+				expected_passed: false,
+				expected_deadline_misses: 1,
+				expected_slack_violations: 0,
+			},
+			end_with_no_start => DeadlineTestCase {
+				deadline_ms: 100,
+				start_event: "start",
+				end_event: "end",
+				min_slack_ms: None,
+				events: vec![(events::TIMING_DEADLINE, "end", 50_000_000)],
+				expected_passed: true,
+				expected_deadline_misses: 0,
+				expected_slack_violations: 0,
+			},
+			start_with_no_end => DeadlineTestCase {
+				deadline_ms: 100,
+				start_event: "start",
+				end_event: "end",
+				min_slack_ms: None,
+				events: vec![(events::TIMING_DEADLINE, "start", 0)],
+				expected_passed: true,
+				expected_deadline_misses: 0,
+				expected_slack_violations: 0,
+			},
+			end_at_the_deadline => DeadlineTestCase {
+				deadline_ms: 100,
+				start_event: "start",
+				end_event: "end",
+				min_slack_ms: None,
+				events: vec![
+					(events::TIMING_DEADLINE, "start", 0),
+					(events::TIMING_DEADLINE, "end", 100_000_000),
+				],
+				expected_passed: true,
+				expected_deadline_misses: 0,
+				expected_slack_violations: 0,
+			},
+			slack_kept => DeadlineTestCase {
+				deadline_ms: 100,
+				start_event: "start",
+				end_event: "end",
+				min_slack_ms: Some(20),
+				events: vec![
+					(events::TIMING_DEADLINE, "start", 0),
+					(events::TIMING_DEADLINE, "end", 50_000_000),
+				],
+				expected_passed: true,
+				expected_deadline_misses: 0,
+				expected_slack_violations: 0,
+			},
+			slack_short => DeadlineTestCase {
+				deadline_ms: 100,
+				start_event: "start",
+				end_event: "end",
+				min_slack_ms: Some(20),
+				events: vec![
+					(events::TIMING_DEADLINE, "start", 0),
+					(events::TIMING_DEADLINE, "end", 85_000_000),
+				],
+				expected_passed: false,
+				expected_deadline_misses: 0,
+				expected_slack_violations: 1,
+			},
+			past_the_deadline_and_short_of_slack => DeadlineTestCase {
+				deadline_ms: 100,
+				start_event: "start",
+				end_event: "end",
+				min_slack_ms: Some(20),
+				events: vec![
+					(events::TIMING_DEADLINE, "start", 0),
+					(events::TIMING_DEADLINE, "end", 150_000_000),
+				],
+				expected_passed: false,
+				expected_deadline_misses: 1,
+				expected_slack_violations: 1,
+			},
 		}
-		Ok(())
 	}
 
-	// ========================================================================
-	// Special Cases
-	// ========================================================================
+	// A jitter bound of 50 ms on `process` counts a spread of samples past it,
+	// and one sample has no spread.
+	crate::tb_cases! {
+		fn jitter_constraint(case: JitterTestCase) -> Result<(), TestingError> {
+			let result = case.verified()?;
+
+			assert_eq!(result.passed, case.expected_passed);
+			assert_eq!(result.jitter_violations.len(), case.expected_violations);
+			Ok(())
+		}
+
+		cases {
+			spread_within_the_bound => JitterTestCase {
+				max_jitter_ms: 50,
+				event_label: "process",
+				events: vec![
+					(events::TIMING_JITTER, "process", 10_000_000),
+					(events::TIMING_JITTER, "process", 12_000_000),
+					(events::TIMING_JITTER, "process", 11_000_000),
+				],
+				expected_passed: true,
+				expected_violations: 0,
+			},
+			spread_past_the_bound => JitterTestCase {
+				max_jitter_ms: 50,
+				event_label: "process",
+				events: vec![
+					(events::TIMING_JITTER, "process", 10_000_000),
+					(events::TIMING_JITTER, "process", 70_000_000),
+					(events::TIMING_JITTER, "process", 15_000_000),
+				],
+				expected_passed: false,
+				expected_violations: 1,
+			},
+			one_sample => JitterTestCase {
+				max_jitter_ms: 50,
+				event_label: "process",
+				events: vec![(events::TIMING_JITTER, "process", 10_000_000)],
+				expected_passed: true,
+				expected_violations: 0,
+			},
+		}
+	}
+
+	// The special case of a WCET event with no duration.
 
 	#[test]
 	fn test_wcet_no_duration() -> Result<(), TestingError> {
@@ -846,17 +825,15 @@ mod tests {
 		Ok(())
 	}
 
-	// ========================================================================
-	// Combined Constraint Tests
-	// ========================================================================
+	// The tests of WCET, jitter, and deadline constraints together.
 
-	/// Helper to create WCET config
+	/// Creates a WCET configuration of `ms` milliseconds.
 	fn create_wcet_config(ms: u64) -> Result<WcetConfig, TestingError> {
 		let duration = Duration::from_millis(ms);
 		WcetConfigBuilder::default().with_duration(duration).build()
 	}
 
-	/// Helper to create deadline
+	/// Creates a deadline of `ms` milliseconds from `start` to `end`.
 	fn create_deadline(ms: u64, start: &'static str, end: &'static str) -> Result<Deadline, TestingError> {
 		let duration = Duration::from_millis(ms);
 		let start_event = Event(start);
@@ -869,7 +846,8 @@ mod tests {
 			.build()
 	}
 
-	/// Setup combined constraints (WCET, jitter, deadline)
+	/// Adds a 100 ms WCET bound on `process`, a 50 ms jitter bound on
+	/// `request`, and a 200 ms deadline from `start` to `end`.
 	fn setup_combined_constraints(constraints: &mut TimingConstraints) -> Result<(), TestingError> {
 		constraints.add(Event("process"), TimingConstraint::Wcet(create_wcet_config(100)?));
 		constraints.add(Event("request"), TimingConstraint::Jitter(Duration::from_millis(50), None));
@@ -919,9 +897,7 @@ mod tests {
 		Ok(())
 	}
 
-	// ========================================================================
-	// Edge Cases
-	// ========================================================================
+	// The edge cases: no constraint, no event, and a custom jitter calculator.
 
 	#[test]
 	fn test_empty_constraints() -> Result<(), TestingError> {
@@ -952,24 +928,23 @@ mod tests {
 		let calc = Arc::new(VarianceJitter);
 		constraints.add(Event("process"), TimingConstraint::Jitter(dur, Some(calc)));
 
-		// Durations: [10ms, 20ms, 15ms] - variance-based jitter
+		// The durations [10ms, 20ms, 15ms] feed the variance-based jitter.
 		let trace = trace_with_events(vec![
 			timing_event(events::TIMING_JITTER, "process", 10_000_000, 0),
 			timing_event(events::TIMING_JITTER, "process", 20_000_000, 1),
 			timing_event(events::TIMING_JITTER, "process", 15_000_000, 2),
 		]);
 
-		// Result depends on variance calculation - just verify it doesn't panic
+		// The result depends on the variance calculation, so the test checks
+		// that the verification returns and reports at most one violation.
 		let result = constraints.verify(&trace)?;
 		assert!(result.jitter_violations.len() <= 1);
 		Ok(())
 	}
 
-	// ========================================================================
-	// Path-Based WCET Tests
-	// ========================================================================
+	// The tests of path WCET constraints.
 
-	/// Helper to create a simple test process: start -> process -> end
+	/// Creates a test process that takes `start`, then `process`, then `end`.
 	fn create_path_test_process() -> Result<Process, ProcessBuildError> {
 		Process::builder("test")
 			.initial_state(State("s0"))
@@ -983,7 +958,8 @@ mod tests {
 			.build()
 	}
 
-	/// Helper to create path WCET constraint for test path
+	/// Creates a path WCET constraint of `max_duration_ms` on the path of
+	/// `start`, `process`, and `end`.
 	fn create_test_path_wcet(max_duration_ms: u64) -> PathWcet {
 		PathWcet::new(
 			vec![Event("start"), Event("process"), Event("end")],
@@ -991,77 +967,78 @@ mod tests {
 		)
 	}
 
-	/// Path WCET test case
+	/// One case of the path WCET table.
 	struct PathWcetTestCase {
 		start_duration_ns: u64,
 		process_duration_ns: u64,
 		end_duration_ns: u64,
 		max_duration_ms: u64,
 		expected_passed: bool,
-		expected_violations: usize,
-		expected_observed_ns: Option<u64>,
+		/// The observed and the maximum path duration of each violation, in
+		/// nanoseconds.
+		expected_violations: &'static [(u64, u64)],
 	}
 
-	const PATH_WCET_TEST_CASES: &[PathWcetTestCase] = &[
-		PathWcetTestCase {
+	impl PathWcetTestCase {
+		/// The verdict of a path WCET bound of `max_duration_ms` over the
+		/// `start`, `process`, and `end` samples of the case.
+		fn verified(&self) -> Result<TimingVerificationResult, Box<dyn core::error::Error>> {
+			let process = create_path_test_process()?;
+			let mut constraints = TimingConstraints::default();
+			constraints.add_path_wcet(create_test_path_wcet(self.max_duration_ms));
+
+			let trace = trace_with_events(vec![
+				timing_event(events::TIMING_WCET, "start", self.start_duration_ns, 0),
+				timing_event(events::TIMING_WCET, "process", self.process_duration_ns, 1),
+				timing_event(events::TIMING_WCET, "end", self.end_duration_ns, 2),
+			]);
+
+			let result = constraints.verify_with_process(&trace, Some(&process))?;
+			Ok(result)
+		}
+	}
+
+	// A path bound of 50 ms holds for the sum of the three samples of the path.
+	crate::tb_cases! {
+		fn path_wcet_constraint(case: PathWcetTestCase) -> Result<(), Box<dyn core::error::Error>> {
+			let result = case.verified()?;
+
+			let violations: Vec<(u64, u64)> = result
+				.path_wcet_violations
+				.iter()
+				.map(|violation| (violation.observed_path_duration_ns, violation.max_path_duration_ns))
+				.collect();
+			assert_eq!(result.passed, case.expected_passed);
+			assert_eq!(violations, case.expected_violations);
+			Ok(())
+		}
+
+		cases {
 			// Total: 10ms + 20ms + 5ms = 35ms < 50ms (pass)
-			start_duration_ns: 10_000_000,
-			process_duration_ns: 20_000_000,
-			end_duration_ns: 5_000_000,
-			max_duration_ms: 50,
-			expected_passed: true,
-			expected_violations: 0,
-			expected_observed_ns: None,
-		},
-		PathWcetTestCase {
+			within_the_bound => PathWcetTestCase {
+				start_duration_ns: 10_000_000,
+				process_duration_ns: 20_000_000,
+				end_duration_ns: 5_000_000,
+				max_duration_ms: 50,
+				expected_passed: true,
+				expected_violations: &[],
+			},
 			// Total: 10ms + 30ms + 15ms = 55ms > 50ms (violation)
-			start_duration_ns: 10_000_000,
-			process_duration_ns: 30_000_000,
-			end_duration_ns: 15_000_000,
-			max_duration_ms: 50,
-			expected_passed: false,
-			expected_violations: 1,
-			expected_observed_ns: Some(55_000_000),
-		},
-	];
-
-	/// Run path WCET test case
-	fn run_path_wcet_test_case(case: &PathWcetTestCase) -> Result<(), Box<dyn core::error::Error>> {
-		let process = create_path_test_process()?;
-		let mut constraints = TimingConstraints::default();
-		constraints.add_path_wcet(create_test_path_wcet(case.max_duration_ms));
-
-		let trace = trace_with_events(vec![
-			timing_event(events::TIMING_WCET, "start", case.start_duration_ns, 0),
-			timing_event(events::TIMING_WCET, "process", case.process_duration_ns, 1),
-			timing_event(events::TIMING_WCET, "end", case.end_duration_ns, 2),
-		]);
-
-		let result = constraints.verify_with_process(&trace, Some(&process))?;
-		assert_eq!(result.passed, case.expected_passed);
-		assert_eq!(result.path_wcet_violations.len(), case.expected_violations);
-
-		if let Some(expected_observed_ns) = case.expected_observed_ns {
-			assert_eq!(result.path_wcet_violations[0].observed_path_duration_ns, expected_observed_ns);
-			assert_eq!(
-				result.path_wcet_violations[0].max_path_duration_ns,
-				case.max_duration_ms * 1_000_000
-			);
+			past_the_bound => PathWcetTestCase {
+				start_duration_ns: 10_000_000,
+				process_duration_ns: 30_000_000,
+				end_duration_ns: 15_000_000,
+				max_duration_ms: 50,
+				expected_passed: false,
+				expected_violations: &[(55_000_000, 50_000_000)],
+			},
 		}
-		Ok(())
-	}
-
-	#[test]
-	fn test_path_wcet_constraints() -> Result<(), Box<dyn core::error::Error>> {
-		for case in PATH_WCET_TEST_CASES {
-			run_path_wcet_test_case(case)?;
-		}
-		Ok(())
 	}
 
 	#[test]
 	fn test_path_wcet_no_process() -> Result<(), TestingError> {
-		// Path-based WCET should not be verified if no process is provided
+		// A verification without a process leaves the path WCET constraints
+		// unchecked.
 		let mut constraints = TimingConstraints::default();
 		constraints.add_path_wcet(create_test_path_wcet(50));
 
@@ -1071,7 +1048,6 @@ mod tests {
 			timing_event(events::TIMING_WCET, "end", 15_000_000, 2),
 		]);
 
-		// Without process, path WCET is not checked
 		let result = constraints.verify(&trace)?;
 		assert!(result.passed);
 		assert!(result.path_wcet_violations.is_empty());

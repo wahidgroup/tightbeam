@@ -14,7 +14,7 @@
 //!
 //! ## Tightbeam DTN Approach
 //!
-//! Tightbeam reaches delay tolerance through its first-principles design:
+//! Tightbeam reaches delay tolerance through these parts of its design:
 //! - **Cryptographic Chain**: The `previous_frame` hash chain gives end-to-end verification.
 //! - **Self-Verifying Messages**: The destination verifies each message itself, with no custody transfer.
 //! - **No Trusted Intermediaries**: Relays stay untrusted, and cryptography proves integrity.
@@ -50,7 +50,9 @@ pub mod faults;
 pub mod frame_builder;
 pub mod jobs;
 pub mod messages;
+pub mod nodes;
 pub mod ordering;
+pub mod routing;
 pub mod servlets;
 pub mod storage;
 pub mod ultimate;

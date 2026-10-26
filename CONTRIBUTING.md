@@ -4,7 +4,7 @@ The key words "MUST", "MUST NOT", "SHOULD", "SHOULD NOT", and "MAY" in this docu
 
 ## Getting Started
 
-Contributors MUST have the Rust toolchain (via [rustup](https://rustup.rs); see `rust-toolchain.toml`), Git, and Make.
+Contributors MUST have the Rust toolchain that `rust-toolchain.toml` pins (install it with [rustup](https://rustup.rs)), Git, Make, and Python 3.
 
 ```bash
 make setup
@@ -14,19 +14,19 @@ make ci
 
 Use `make help` for the full command list. Apply fixes with `make lint fix=1`.
 
-Git hooks live in `.husky/` and are installed automatically by [husky-rs](https://crates.io/crates/husky-rs) (which sets `core.hooksPath`) the first time `cargo test` builds dev-dependencies. Set `NO_HUSKY_HOOKS=1` to skip installation (CI does this).
+Git hooks live in `.husky/`. [husky-rs](https://crates.io/crates/husky-rs) installs them and sets `core.hooksPath` the first time `cargo test` builds the dev-dependencies. Set `NO_HUSKY_HOOKS=1` to skip the installation, as CI does.
 
-- `commit-msg` - enforces the commit header format (see [Title](#title))
-- `pre-push` - runs `make lint-code` (rustfmt and clippy) and verifies commit signatures. CI runs the full `make lint`, which adds the rustdoc build and the spellcheck. Commits MUST be signed before push.
+- `commit-msg` enforces the commit header format (see [Title](#title))
+- `pre-push` runs `make lint-code` (rustfmt and clippy) and verifies commit signatures. CI runs the full `make lint`, which adds the rustdoc build, the spellcheck, and the check that the production imports among the `transport` modules hold no cycle. Contributors MUST sign each commit before a push.
 
 ### Code Style
 
 Contributors MUST:
 
-- Use hard tabs everywhere except YAML (2 spaces), enforced by EditorConfig
-- Pass `make lint` (and preferably `make ci`) before opening a PR
-- Rust: no `unwrap` / `expect` / `panic` in production code; enum error types, no string-based errors; prefer `From` / `TryFrom` and `?`
-- Keep test-support Rust code behind the `testing` cargo feature; it MUST NOT compile into a default build
+- Use hard tabs everywhere except YAML (2 spaces), as EditorConfig enforces
+- Pass `make lint` (and preferably `make ci`) before they open a PR
+- Rust: keep `unwrap`, `expect`, and `panic` out of production code, use enum error types in place of string-based errors, and prefer `From`, `TryFrom`, and `?`
+- Keep test-support Rust code behind the `testing` cargo feature. Test-support code MUST NOT compile into a default build
 
 ### Useful targets
 
@@ -37,12 +37,17 @@ make build features="std,tcp,tokio"    # feature-gated build
 make test no-default=1 features="testing"
 make fuzz-test                         # short AFL smoke run
 make doc                               # cargo doc --all-features
+make bench                             # record, frame, and replay-guard benches
+make coverage                          # line coverage report in target/coverage/html
+make miri                              # decode and zeroize tests under Miri (nightly)
+make loom                              # loom models of the multiplexer atomics
+make check-semver baseline=master      # public API against a git ref
 make release version=v0.9.1            # see make help
 ```
 
 ## Pull Requests
 
-All pull requests MUST conform to the title, body, and metadata specifications below. The `PR Checks` workflow (`Title`, `Body`, `Metadata` jobs) blocks merge on non-compliance.
+All pull requests MUST conform to the title, body, and metadata specifications below. The `PR Checks` workflow (`Title`, `Body`, `Metadata` jobs) blocks the merge of a PR that does not conform.
 
 ### Title
 
@@ -64,7 +69,7 @@ The type MUST be lowercase and one of:
 | `style`    | Formatting, whitespace, no logic change                 | -      |
 | `refactor` | Code change that neither fixes a bug nor adds a feature | -      |
 | `perf`     | Performance improvement                                 | PATCH  |
-| `test`     | Adding or correcting tests                              | -      |
+| `test`     | New or corrected tests                                  | -      |
 | `build`    | Build system or dependency changes                      | -      |
 | `ci`       | CI configuration changes                                | -      |
 | `chore`    | Maintenance, no production code change                  | -      |
@@ -72,7 +77,7 @@ The type MUST be lowercase and one of:
 
 #### Scope
 
-The scope is OPTIONAL, MUST be lowercase (`[a-z0-9/-]+`), and identifies the affected area. Recommended scopes:
+The scope is OPTIONAL, MUST be lowercase (`[a-z0-9/-]+`), and identifies the affected area. The recommended scopes are:
 
 - Crate: `tightbeam`, `tightbeam-derive`
 - Layer: `transport`, `crypto`, `colony`, `builder`, `asn1`, `docs`
@@ -110,7 +115,7 @@ The PR body MUST contain these five sections, each with non-empty content:
 
 The PR template at `.github/PULL_REQUEST_TEMPLATE.md` auto-populates these sections. Release PRs (head branch `process/v*`) are exempt from body validation.
 
-Testing section SHOULD cite `make ci` (or the relevant `make` targets) when behavior changes.
+The `## Testing` section SHOULD cite `make ci` (or the relevant `make` targets) when behavior changes.
 
 ### Metadata
 
@@ -123,30 +128,30 @@ Each PR MUST have:
 
 ### Bug Reports
 
-When reporting bugs, you MUST include:
+A bug report MUST include:
 
-- Clear description of the issue
-- Steps to reproduce
-- Expected vs actual behavior
-- Environment details (OS, Rust version, features used)
-- Minimal test case if possible
+- A clear description of the issue
+- The steps to reproduce it
+- The expected behavior and the actual behavior
+- The environment (OS, Rust version, and the features in use)
+- A minimal test case, when possible
 
 ### Feature Requests
 
 For new features, contributors MUST:
 
-1. Check if a TIP (tightbeam improvement proposal) is needed
+1. Check whether the feature needs a TIP (tightbeam improvement proposal)
 2. Discuss the feature in an issue first
 3. Consider backwards compatibility
 4. Provide use cases and rationale
-5. Utilize RustCrypto crates for cryptographic implementations
+5. Use RustCrypto crates for cryptographic implementations
 
 ### Documentation
 
 Contributors MUST:
 
-- Update relevant documentation for any changes
-- Ensure examples compile and work correctly
+- Update the documentation that a change affects
+- Make sure that every example compiles and runs
 - Update ASN.1 specifications for protocol changes
 
 ### Security
@@ -155,15 +160,15 @@ For security-related contributions, contributors MUST follow [SECURITY.md](SECUR
 
 ## Releasing
 
-The workspace is versioned from `[workspace.package]` in `Cargo.toml`. Maintainers release with:
+The workspace takes its version from `[workspace.package]` in `Cargo.toml`. Maintainers release with:
 
 ```bash
 make release version=vX.Y.Z
 ```
 
-Use `dry-run=1`, `allow-staged=1`, or `yank=1` as documented in `make help`.
+Use `dry-run=1`, `allow-staged=1`, or `yank=1` as `make help` documents.
 
-A release bumps the workspace version, opens a release pull request, and on merge creates a signed `releases/v*` tag that publishes to crates.io (`tightbeam-derive` is published first when its version is ahead of crates.io). Bump `tightbeam-derive`'s own package version in the same PR when the derive crate itself changes. The release workflow runs the deploy guard `check-yanked.sh`, which refuses yanked versions.
+A release bumps the workspace version, opens a release pull request, and on merge creates a signed `releases/v*` tag that publishes to crates.io (the release publishes `tightbeam-derive` first when its version is ahead of crates.io). Bump `tightbeam-derive`'s own package version in the same PR when the derive crate itself changes. The release workflow runs the deploy guard `check-yanked.sh`, which refuses yanked versions.
 
 To publish or yank `tightbeam-derive` without a workspace release, bump its version in a normal PR and run `make release-derive version=vX.Y.Z` (with `yank=1` / `dry-run=1` as needed). This pushes a signed `releases/derive/v*` tag that the release workflow verifies and publishes.
 
@@ -172,11 +177,10 @@ To publish or yank `tightbeam-derive` without a workspace release, bump its vers
 For significant changes, contributors MUST follow the TIP process:
 
 1. Read [TIP-1](tips/tip-0001.md) for guidelines
-2. Draft your TIP in `tips/` directory
-3. Submit as a pull request for discussion
+2. Draft your TIP in the `tips/` directory
+3. Submit it as a pull request for discussion
 4. Build consensus through community feedback
 
 ## License
 
-By contributing, you agree that your contributions will be licensed under the
-same dual MIT/Apache-2.0 license as the project.
+By contributing, you agree that your contributions will be licensed under the same dual MIT/Apache-2.0 license as the project.

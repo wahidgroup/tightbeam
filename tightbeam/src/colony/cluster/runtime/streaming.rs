@@ -10,7 +10,7 @@
 //! - A `Peer` route re-emits the stream to the peer gateway on the peer plane
 //!   with [`StreamRoute::relayed_to`] and the relay budget decremented.
 //!
-//! A spent budget is therefore served locally only.
+//! A stream whose budget is spent therefore reaches a local servlet only.
 //!
 //! [`ServletRegistry::select_route`]: crate::colony::cluster::ServletRegistry::select_route
 //! [`MuxService`]: crate::transport::multiplex::MuxService
@@ -31,10 +31,10 @@ use crate::transport::PooledClient;
 use crate::urn::Urn;
 use crate::{Frame, TightBeamError};
 
-/// The dial plan a splice follows once a route is chosen.
+/// The dial plan a splice follows once the registry selects its route.
 ///
 /// - `choice` names the endpoint to open on and the pheromone key the outcome reinforces or weakens.
-/// - `route` is stamped on that open.
+/// - `route` is the stream route that open carries.
 struct SplicePlan {
 	choice: RouteChoice,
 	route: StreamRoute,
@@ -49,8 +49,8 @@ impl SplicePlan {
 		&self,
 		hive: &HivePlane<P>,
 		peers: Option<&PeerPlane<P>>,
-	) -> Result<PooledClient<P>, TightBeamError> {
-		let unavailable = |_| TransitStatus::Unavailable.refusal();
+	) -> Result<PooledClient<P>, TransitStatus> {
+		let unavailable = |_| TransitStatus::Unavailable;
 		let hop = self.choice.hop(hive, peers).map_err(unavailable)?;
 
 		hop.connect().await.map_err(unavailable)
@@ -58,83 +58,98 @@ impl SplicePlan {
 }
 
 impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
-	/// Choose a route for `target` and turn it into a dial plan.
+	/// Choose a route for `target` and turn it into a dial plan, or the
+	/// status that refuses the splice before any dial.
 	///
 	/// `budget` is the clamp the stream gate already applied, and a peer
 	/// re-emit spends one hop from it. `exclude` removes the route key of a
 	/// failed dial, so a bounded retry picks the next-best trail.
 	///
-	/// # Errors
-	///
-	/// Both refusals precede any dial.
-	///
 	/// - [`TransitStatus::PermissionDenied`] -- the target is not bare, or it names a foreign realm.
 	/// - [`TransitStatus::Unavailable`] -- no live trail exists, or a peer route has no peer plane.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError`] -- the trace refused the event of a refusal.
 	fn plan_splice(
 		&self,
 		target: &Urn<'static>,
 		budget: HopBudget,
 		exclude: Option<&[u8]>,
-	) -> Result<SplicePlan, TransitStatus> {
+	) -> Result<Result<SplicePlan, TransitStatus>, TightBeamError> {
 		let Some(type_key) = self.config.namespace.servlet_type_key(target) else {
-			return Err(TransitStatus::PermissionDenied);
+			let status = self.refuse_work(TransitStatus::PermissionDenied)?;
+			return Ok(Err(status));
 		};
 
 		let selected = self.servlet_registry.select_route(&self.config, &type_key, budget, exclude);
-		let choice = selected.ok_or(TransitStatus::Unavailable)?;
-		let route = choice.plane.stream_route(target, budget, self.peer_plane.as_ref())?;
+		let Some(choice) = selected else {
+			self.record_no_trail(exclude)?;
 
-		Ok(SplicePlan { choice, route })
+			return Ok(Err(TransitStatus::Unavailable));
+		};
+
+		let route = choice.plane.stream_route(target, budget, self.peer_plane.as_ref());
+		let planned = route.map(|route| SplicePlan { choice, route });
+		Ok(planned)
 	}
 
 	/// Plan and dial the splice route, with one bounded retry on a failed
 	/// dial. The failed trail weakens immediately, and the next-best trail
 	/// other than the failed route key gets a single chance. A retry at the
-	/// dial step is safe because the splice has consumed no body chunk yet.
+	/// dial step is safe because the splice reads the body only after a dial
+	/// succeeds.
 	async fn connect_splice(
 		&self,
 		target: &Urn<'static>,
 		budget: HopBudget,
 	) -> Result<(SplicePlan, PooledClient<P>), TightBeamError> {
-		let plan = self.plan_splice(target, budget, None).map_err(TransitStatus::refusal)?;
-		let dial_error = match plan.dial(&self.hive_plane, self.peer_plane.as_ref()).await {
+		let plan = self.plan_splice(target, budget, None)?.map_err(TransitStatus::refusal)?;
+		let dial_status = match plan.dial(&self.hive_plane, self.peer_plane.as_ref()).await {
 			Ok(client) => {
 				return Ok((plan, client));
 			}
-			Err(error) => error,
+			Err(status) => status,
 		};
 
-		self.servlet_registry
-			.work_trail_weaken(&plan.choice.route_key, &self.config, &self.trace)?;
+		let registry = &self.servlet_registry;
+		registry.work_trail_weaken(&plan.choice.route_key, dial_status, &self.config, &self.trace)?;
 
 		// With no alternative trail, the caller gets the original dial failure.
-		let Ok(retry_plan) = self.plan_splice(target, budget, Some(&plan.choice.route_key)) else {
-			return Err(dial_error);
+		let Ok(retry_plan) = self.plan_splice(target, budget, Some(&plan.choice.route_key))? else {
+			return Err(dial_status.refusal());
 		};
 
 		match retry_plan.dial(&self.hive_plane, self.peer_plane.as_ref()).await {
 			Ok(client) => Ok((retry_plan, client)),
-			Err(error) => {
-				self.servlet_registry
-					.work_trail_weaken(&retry_plan.choice.route_key, &self.config, &self.trace)?;
-				Err(error)
+			Err(status) => {
+				registry.work_trail_weaken(&retry_plan.choice.route_key, status, &self.config, &self.trace)?;
+				Err(status.refusal())
 			}
 		}
 	}
 
 	/// Reinforce or weaken the chosen trail by the splice outcome, the
-	/// same feedback unary work applies. A peer splice that answered also
-	/// fires [`CLUSTER_WORK_FORWARDED`].
-	fn record_outcome(&self, succeeded: bool, route_key: &Arc<[u8]>, is_peer: bool) -> Result<(), TightBeamError> {
-		if !succeeded {
-			return self.servlet_registry.work_trail_weaken(route_key, &self.config, &self.trace);
+	/// same feedback unary work applies. `failure` is the status of a splice
+	/// that failed, and a peer splice that answered also fires
+	/// [`CLUSTER_WORK_FORWARDED`].
+	fn record_outcome(
+		&self,
+		failure: Option<TransitStatus>,
+		route_key: &Arc<[u8]>,
+		is_peer: bool,
+	) -> Result<(), TightBeamError> {
+		let registry = &self.servlet_registry;
+		if let Some(status) = failure {
+			return registry.work_trail_weaken(route_key, status, &self.config, &self.trace);
 		}
 
 		if is_peer {
-			self.trace.event(CLUSTER_WORK_FORWARDED)?;
+			let trace = &self.trace;
+			trace.emit_marker(CLUSTER_WORK_FORWARDED)?;
 		}
 
-		self.servlet_registry.work_trail_ok(route_key, &self.config, &self.trace)
+		registry.work_trail_ok(route_key, &self.config, &self.trace)
 	}
 
 	/// Splice a streamed request: relay the client body to the route, then
@@ -172,7 +187,8 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 		}
 		.await;
 
-		self.record_outcome(reply.is_ok(), &route_key, is_peer)?;
+		let failure = reply.as_ref().err().map(TightBeamError::failure_status);
+		self.record_outcome(failure, &route_key, is_peer)?;
 
 		reply
 	}
@@ -181,10 +197,11 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 	/// route's reply chunks back, with both directions concurrent.
 	///
 	/// A dropped handler drops the peer sink and the body, and a client
-	/// cancel aborts the handler. Their [`CancelOnDrop`] guards then
-	/// cancel the peer stream, so a cancel propagates across the splice.
+	/// cancel aborts the handler. The peer sink's drop and the cancel guard of
+	/// the peer [`StreamBody`] then cancel the peer stream, so a cancel
+	/// propagates across the splice.
 	///
-	/// [`CancelOnDrop`]: crate::transport::multiplex::MuxHandle
+	/// [`StreamBody`]: crate::transport::multiplex::StreamBody
 	///
 	/// # Errors
 	///
@@ -220,7 +237,8 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 		}
 		.await;
 
-		self.record_outcome(spliced.is_ok(), &route_key, is_peer)?;
+		let failure = spliced.as_ref().err().map(TightBeamError::failure_status);
+		self.record_outcome(failure, &route_key, is_peer)?;
 
 		spliced
 	}

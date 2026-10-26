@@ -33,46 +33,6 @@ use crate::transport::support::{
 use super::common::*;
 
 use tightbeam::instrumentation::events;
-use tightbeam::urn::Urn;
-
-pub(crate) const CHAINED_RECEIPT_VERIFIES_AGAINST_ORIGINAL_CERTS: Urn<'static> =
-	tightbeam::urn!("test", "event:rekey/chained-receipt-verifies-against-original-certs");
-pub(crate) const CLEARTEXT_HARVEST_YIELDS_NOTHING: Urn<'static> =
-	tightbeam::urn!("test", "event:rekey/cleartext-harvest-yields-nothing");
-pub(crate) const CONSECUTIVE_EPOCHS_ROTATE_DISTINCT_RECEIPTS: Urn<'static> =
-	tightbeam::urn!("test", "event:rekey/consecutive-epochs-rotate-distinct-receipts");
-pub(crate) const DUPLICATE_REQUEST_VIOLATES_PROTOCOL: Urn<'static> =
-	tightbeam::urn!("test", "event:rekey/duplicate-request-violates-protocol");
-pub(crate) const EMITS_SURVIVE_BUDGET_WATERMARK: Urn<'static> =
-	tightbeam::urn!("test", "event:rekey/emits-survive-budget-watermark");
-pub(crate) const EMITS_SURVIVE_SETTLED_RENEWAL: Urn<'static> =
-	tightbeam::urn!("test", "event:rekey/emits-survive-settled-renewal");
-pub(crate) const EMITS_SURVIVE_TWO_RENEWALS: Urn<'static> =
-	tightbeam::urn!("test", "event:rekey/emits-survive-two-renewals");
-pub(crate) const ENDPOINTS_AGREE_ON_EPOCH_RECEIPT: Urn<'static> =
-	tightbeam::urn!("test", "event:rekey/endpoints-agree-on-epoch-receipt");
-pub(crate) const EPOCH_RECEIPT_ROTATES: Urn<'static> = tightbeam::urn!("test", "event:rekey/epoch-receipt-rotates");
-pub(crate) const FIRST_REQUEST_ANSWERED: Urn<'static> = tightbeam::urn!("test", "event:rekey/first-request-answered");
-pub(crate) const PREMATURE_REQUEST_VIOLATES_PROTOCOL: Urn<'static> =
-	tightbeam::urn!("test", "event:rekey/premature-request-violates-protocol");
-pub(crate) const RECEIPTLESS_DRAIN_KEEPS_TODAYS_PATH: Urn<'static> =
-	tightbeam::urn!("test", "event:rekey/receiptless-drain-keeps-todays-path");
-pub(crate) const RECEIPTLESS_SESSION_HAS_NO_EPOCH_RECEIPT: Urn<'static> =
-	tightbeam::urn!("test", "event:rekey/receiptless-session-has-no-epoch-receipt");
-pub(crate) const RECEIPTLESS_TRANSFER_SURVIVES_DRAIN: Urn<'static> =
-	tightbeam::urn!("test", "event:rekey/receiptless-transfer-survives-drain");
-pub(crate) const REFUSAL_CODE_REACHES_CLIENT: Urn<'static> =
-	tightbeam::urn!("test", "event:rekey/refusal-code-reaches-client");
-pub(crate) const REFUSAL_CODE_REACHES_SERVER: Urn<'static> =
-	tightbeam::urn!("test", "event:rekey/refusal-code-reaches-server");
-pub(crate) const RENEWAL_REQUEST_REACHES_SERVER: Urn<'static> =
-	tightbeam::urn!("test", "event:rekey/renewal-request-reaches-server");
-pub(crate) const SETTLE_HOOK_FIRES_ON_RENEWAL: Urn<'static> =
-	tightbeam::urn!("test", "event:rekey/settle-hook-fires-on-renewal");
-pub(crate) const STALLED_RENEWAL_DRAINS_CLEAN: Urn<'static> =
-	tightbeam::urn!("test", "event:rekey/stalled-renewal-drains-clean");
-pub(crate) const TRAFFIC_STRADDLES_KEY_SWITCH: Urn<'static> =
-	tightbeam::urn!("test", "event:rekey/traffic-straddles-key-switch");
 
 /// The settlement challenge the authorizer binds into every epoch receipt.
 const RENEWAL_CHALLENGE: &[u8] = b"epoch-invoice-7";
@@ -114,6 +74,61 @@ async fn emit_series(handle: &MuxHandle, label: impl AsRef<str>, count: usize) -
 	}
 
 	Ok(true)
+}
+
+/// Emit `count` chunked frames labeled from `label`, one after another, and
+/// report whether each one echoed.
+///
+/// # Errors
+///
+/// - [`TightBeamError`] -- the failure of an emit.
+async fn emit_large_series(handle: &MuxHandle, label: impl AsRef<str>, count: usize) -> Result<bool, TightBeamError> {
+	let label = label.as_ref();
+	let mut all_echoed = true;
+	for index in 0..count {
+		let frame = large_mux_frame(format!("{label}-{index}"));
+		let echoed = handle.emit_on_stream(&frame).await?;
+		all_echoed = all_echoed && is_echo(echoed, &frame);
+	}
+
+	Ok(all_echoed)
+}
+
+/// Stream `count` chunked frames labeled from `label` through `open_stream`,
+/// one after another, and report whether each one echoed.
+///
+/// # Errors
+///
+/// - [`TightBeamError`] -- the encode, open, push, or response failure of a stream.
+async fn stream_large_series(handle: &MuxHandle, label: impl AsRef<str>, count: usize) -> Result<bool, TightBeamError> {
+	let label = label.as_ref();
+	let mut all_echoed = true;
+	for index in 0..count {
+		let frame = large_mux_frame(format!("{label}-{index}"));
+		let payload = frame.to_der()?;
+		let (sink, response) = handle.open_stream()?;
+		push_split(sink, &payload).await?;
+
+		let echoed = response.await?;
+		all_echoed = all_echoed && is_echo(echoed, &frame);
+	}
+
+	Ok(all_echoed)
+}
+
+/// Write `count` single-chunk requests from the raw client, one per fresh
+/// stream, so the server sees the records a renewal must spend first.
+///
+/// # Errors
+///
+/// - [`TightBeamError`] -- the encode or write failure of a request.
+async fn spend_records(writer: &mut SplitWriter, count: u32) -> Result<(), TightBeamError> {
+	for index in 0..count {
+		let stream_id = client_stream_id(index);
+		write_muxed_request(writer, stream_id, mux_frame("rekey-spend")).await?;
+	}
+
+	Ok(())
 }
 
 /// Poll until the epoch receipt differs from `previous`, bounded by a timeout.
@@ -279,10 +294,7 @@ tb_assert_spec! {
 			(events::MUX_REKEY_RECEIPT_COUNTERSIGNED, exactly!(1)),
 			(events::MUX_REKEY_RENEWED, exactly!(2)),
 			(events::MUX_REKEY_REFUSED, exactly!(0)),
-			(events::MUX_REKEY_VERIFY_FAILED, exactly!(0)),
-			(EMITS_SURVIVE_BUDGET_WATERMARK, exactly!(1), equals!(true)),
-			(EPOCH_RECEIPT_ROTATES, exactly!(1), equals!(true)),
-			(ENDPOINTS_AGREE_ON_EPOCH_RECEIPT, exactly!(1), equals!(true))
+			(events::MUX_REKEY_VERIFY_FAILED, exactly!(0))
 		]
 	}
 }
@@ -300,17 +312,15 @@ tb_scenario! {
 			let pair = spawn_echo_pair_with(session.client, session.server, rekey_config(), rekey_config(), trace.share())?;
 
 			let all_echoed = emit_series(&pair.client.handle, "rekey-budget", 8).await?;
-			trace.event_with(EMITS_SURVIVE_BUDGET_WATERMARK, &[], all_echoed)?;
+			assert!(all_echoed, "every emit must echo across the budget renewal");
 
 			let rotated = await_rotation(&pair.client.handle, initial.as_ref()).await;
-			trace.event_with(EPOCH_RECEIPT_ROTATES, &[], rotated.is_some())?;
-
 			let epoch_receipt = rotated.ok_or_else(|| expectation_failure("client must rotate the epoch receipt"))?;
-			trace.event_with(
-				ENDPOINTS_AGREE_ON_EPOCH_RECEIPT,
-				&[],
-				await_matching_receipt(&pair.server.handle, &epoch_receipt).await,
-			)?;
+			let agreed = await_matching_receipt(&pair.server.handle, &epoch_receipt).await;
+			assert!(agreed, "both endpoints must hold the same epoch receipt");
+
+			let renewed = await_transport(|| trace.recorded(events::MUX_REKEY_RENEWED) >= 2).await;
+			assert!(renewed, "both endpoints must record the renewal");
 
 			Ok(())
 		}
@@ -325,17 +335,10 @@ tb_assert_spec! {
 			(events::MUX_REKEY_REQUESTED, at_least!(1)),
 			(events::MUX_REKEY_RECEIPT_ISSUED, at_least!(1)),
 			(events::MUX_REKEY_RECEIPT_COUNTERSIGNED, at_least!(1)),
-			(events::MUX_REKEY_RENEWED, at_least!(2)),
-			(TRAFFIC_STRADDLES_KEY_SWITCH, exactly!(1), equals!(true)),
-			(EPOCH_RECEIPT_ROTATES, exactly!(1), equals!(true))
+			(events::MUX_REKEY_RENEWED, at_least!(2))
 		]
 	}
 }
-
-pub(crate) const STREAMED_TRAFFIC_STRADDLES_KEY_SWITCH: Urn<'static> =
-	tightbeam::urn!("test", "event:rekey/streamed-traffic-straddles-key-switch");
-pub(crate) const STREAMING_EPOCH_RECEIPT_ROTATES: Urn<'static> =
-	tightbeam::urn!("test", "event:rekey/streaming-epoch-receipt-rotates");
 
 tb_assert_spec! {
 	pub MuxRekeyStreamingRenewalSpec,
@@ -343,9 +346,7 @@ tb_assert_spec! {
 		mode: Accept,
 		assertions: [
 			(events::MUX_REKEY_REQUESTED, at_least!(1)),
-			(events::MUX_REKEY_RENEWED, at_least!(2)),
-			(STREAMED_TRAFFIC_STRADDLES_KEY_SWITCH, exactly!(1), equals!(true)),
-			(STREAMING_EPOCH_RECEIPT_ROTATES, exactly!(1), equals!(true))
+			(events::MUX_REKEY_RENEWED, at_least!(2))
 		]
 	}
 }
@@ -361,8 +362,6 @@ tb_scenario! {
 			let client_offer = chunked_offer(4).with_budgets(AMPLE_BUDGETS);
 			let server_offer = chunked_offer(4).with_budgets(AMPLE_BUDGETS);
 			let session = establish_mutual_transports(client_offer, server_offer, MutualSessionHooks::default()).await?;
-			let handshake_receipt = session.client.session_receipt();
-			let initial = handshake_receipt.map(|receipt| receipt.to_owned());
 
 			let client_config = MuxEndpointConfig { rekey_limit: Some(100), ..rekey_config() };
 			let client_transport = session.client.with_trace(trace.share());
@@ -373,21 +372,11 @@ tb_scenario! {
 			let chunks_seen = Arc::new(AtomicUsize::new(0));
 			let _serve = tokio::spawn(responder.serve_streaming(streaming_echo_handler(Arc::clone(&chunks_seen))));
 
-			let mut all_echoed = true;
-			for index in 0..20 {
-				let frame = large_mux_frame(format!("rekey-streaming-{index}"));
-				let payload = frame.to_der()?;
-				let (sink, response) = client_end.handle.open_stream()?;
-				push_split(sink, &payload).await?;
+			let all_echoed = stream_large_series(&client_end.handle, "rekey-streaming", 20).await?;
+			assert!(all_echoed, "streamed traffic must echo across the key switch");
 
-				let echoed = response.await?;
-				all_echoed = all_echoed && is_echo(echoed, &frame);
-			}
-
-			trace.event_with(STREAMED_TRAFFIC_STRADDLES_KEY_SWITCH, &[], all_echoed)?;
-
-			let rotated = await_rotation(&client_end.handle, initial.as_ref()).await;
-			trace.event_with(STREAMING_EPOCH_RECEIPT_ROTATES, &[], rotated.is_some())?;
+			let renewed = await_transport(|| trace.recorded(events::MUX_REKEY_RENEWED) >= 2).await;
+			assert!(renewed, "both endpoints must record the renewal");
 
 			Ok(())
 		}
@@ -404,24 +393,16 @@ tb_scenario! {
 			let client_offer = chunked_offer(4).with_budgets(AMPLE_BUDGETS);
 			let server_offer = chunked_offer(4).with_budgets(AMPLE_BUDGETS);
 			let session = establish_mutual_transports(client_offer, server_offer, MutualSessionHooks::default()).await?;
-			let handshake_receipt = session.client.session_receipt();
-			let initial = handshake_receipt.map(|receipt| receipt.to_owned());
 
 			let client_config = MuxEndpointConfig { rekey_limit: Some(100), ..rekey_config() };
 			let pair =
 				spawn_echo_pair_with(session.client, session.server, client_config, rekey_config(), trace.share())?;
 
-			let mut all_echoed = true;
-			for index in 0..20 {
-				let frame = large_mux_frame(format!("rekey-record-{index}"));
-				let echoed = pair.client.handle.emit_on_stream(&frame).await?;
-				all_echoed = all_echoed && is_echo(echoed, &frame);
-			}
+			let all_echoed = emit_large_series(&pair.client.handle, "rekey-record", 20).await?;
+			assert!(all_echoed, "chunked traffic must echo across the key switch");
 
-			trace.event_with(TRAFFIC_STRADDLES_KEY_SWITCH, &[], all_echoed)?;
-
-			let rotated = await_rotation(&pair.client.handle, initial.as_ref()).await;
-			trace.event_with(EPOCH_RECEIPT_ROTATES, &[], rotated.is_some())?;
+			let renewed = await_transport(|| trace.recorded(events::MUX_REKEY_RENEWED) >= 2).await;
+			assert!(renewed, "both endpoints must record the renewal");
 
 			Ok(())
 		}
@@ -437,10 +418,7 @@ tb_assert_spec! {
 			(events::MUX_REKEY_RECEIPT_ISSUED, exactly!(2)),
 			(events::MUX_REKEY_RECEIPT_COUNTERSIGNED, exactly!(2)),
 			(events::MUX_REKEY_RENEWED, exactly!(4)),
-			(events::MUX_REKEY_REFUSED, exactly!(0)),
-			(EMITS_SURVIVE_TWO_RENEWALS, exactly!(1), equals!(true)),
-			(CONSECUTIVE_EPOCHS_ROTATE_DISTINCT_RECEIPTS, exactly!(1), equals!(true)),
-			(CHAINED_RECEIPT_VERIFIES_AGAINST_ORIGINAL_CERTS, exactly!(1), equals!(true))
+			(events::MUX_REKEY_REFUSED, exactly!(0))
 		]
 	}
 }
@@ -461,28 +439,20 @@ tb_scenario! {
 
 			let first_batch = emit_series(&pair.client.handle, "rekey-chain-a", 5).await?;
 			let first = await_rotation(&pair.client.handle, initial.as_ref()).await;
+			let first = first.ok_or_else(|| expectation_failure("first renewal must rotate the receipt"))?;
 			let second_batch = emit_series(&pair.client.handle, "rekey-chain-b", 5).await?;
-			let second = await_rotation(&pair.client.handle, first.as_deref()).await;
+			let second = await_rotation(&pair.client.handle, Some(&*first)).await;
+			let second = second.ok_or_else(|| expectation_failure("second renewal must rotate the receipt"))?;
+			assert!(first_batch && second_batch, "every emit must echo across both renewals");
 
-			trace.event_with(EMITS_SURVIVE_TWO_RENEWALS, &[], first_batch && second_batch)?;
+			let distinct = initial.as_ref() != Some(&*second);
+			assert!(distinct, "two renewals must rotate to a receipt distinct from the handshake receipt");
 
-			let distinct = {
-				let first_rotated = first.is_some();
-				let second_rotated = second.is_some();
-				let epochs_differ = initial.as_ref() != second.as_deref();
-				first_rotated && second_rotated && epochs_differ
-			};
+			let verdict = second.verify(&server_certificate, &client_certificate);
+			assert!(verdict.is_ok(), "the second epoch receipt must verify against the handshake certificates");
 
-			trace.event_with(CONSECUTIVE_EPOCHS_ROTATE_DISTINCT_RECEIPTS, &[], distinct)?;
-
-			let latest = second.ok_or_else(|| expectation_failure("second renewal must rotate the receipt"))?;
-			let verdict = latest.verify(&server_certificate, &client_certificate);
-
-			trace.event_with(
-				CHAINED_RECEIPT_VERIFIES_AGAINST_ORIGINAL_CERTS,
-				&[],
-				verdict.is_ok(),
-			)?;
+			let renewed = await_transport(|| trace.recorded(events::MUX_REKEY_RENEWED) >= 4).await;
+			assert!(renewed, "both endpoints must record both renewals");
 
 			Ok(())
 		}
@@ -499,10 +469,7 @@ tb_assert_spec! {
 			(events::MUX_REKEY_RECEIPT_COUNTERSIGNED, exactly!(1)),
 			(events::MUX_REKEY_RENEWED, exactly!(2)),
 			(events::MUX_REKEY_REFUSED, exactly!(0)),
-			(events::MUX_REKEY_VERIFY_FAILED, exactly!(0)),
-			(EMITS_SURVIVE_SETTLED_RENEWAL, exactly!(1), equals!(true)),
-			(SETTLE_HOOK_FIRES_ON_RENEWAL, exactly!(1), equals!(true)),
-			(EPOCH_RECEIPT_ROTATES, exactly!(1), equals!(true))
+			(events::MUX_REKEY_VERIFY_FAILED, exactly!(0))
 		]
 	}
 }
@@ -522,20 +489,14 @@ tb_scenario! {
 				trace: None,
 			};
 			let session = establish_renewal_session(hooks).await?;
-			let handshake_receipt = session.client.session_receipt();
-			let initial = handshake_receipt.map(|receipt| receipt.to_owned());
 			let pair = spawn_echo_pair_with(session.client, session.server, rekey_config(), rekey_config(), trace.share())?;
 
 			let all_echoed = emit_series(&pair.client.handle, "rekey-settle", 8).await?;
-			trace.event_with(EMITS_SURVIVE_SETTLED_RENEWAL, &[], all_echoed)?;
+			assert!(all_echoed, "every emit must echo across the settled renewal");
 
-			let rotated = await_rotation(&pair.client.handle, initial.as_ref()).await;
-			trace.event_with(
-				SETTLE_HOOK_FIRES_ON_RENEWAL,
-				&[],
-				renewal_authorizer.settle_calls() >= 1,
-			)?;
-			trace.event_with(EPOCH_RECEIPT_ROTATES, &[], rotated.is_some())?;
+			let renewed = await_transport(|| trace.recorded(events::MUX_REKEY_RENEWED) >= 2).await;
+			assert!(renewed, "both endpoints must record the renewal");
+			assert!(renewal_authorizer.settle_calls() >= 1, "the authorizer must settle the challenged renewal");
 
 			Ok(())
 		}
@@ -553,13 +514,13 @@ tb_assert_spec! {
 			(events::MUX_REKEY_REFUSED, exactly!(1)),
 			(events::MUX_REKEY_RENEWED, exactly!(0)),
 			(events::MUX_EMIT_DRAINING, exactly!(1)),
-			(REFUSAL_CODE_REACHES_CLIENT, exactly!(1), equals!(true))
+			(events::MUX_GOAWAY_RECV, exactly!(1), equals!(u32::from(GoAwayReason::Application(SETTLE_REFUSAL_CODE))))
 		]
 	}
 }
 
-// The client switched at the Ack. The server installs the receive cipher, then
-// drains with a refusal code.
+// The client switches at the Ack. The server installs the receive cipher, then
+// drains with the settlement refusal code.
 tb_scenario! {
 	name: mux_rekey_settlement_refusal_drains,
 	spec: MuxRekeySettleRefusalSpec,
@@ -578,11 +539,8 @@ tb_scenario! {
 			let pair = spawn_echo_pair_with(session.client, session.server, rekey_config(), rekey_config(), trace.share())?;
 
 			let _renewal_trigger = emit_series(&pair.client.handle, "rekey-refused-settle", 5).await?;
-			trace.event_with(
-				REFUSAL_CODE_REACHES_CLIENT,
-				&[],
-				await_goaway_reason(&pair.client.handle, GoAwayReason::Application(SETTLE_REFUSAL_CODE)).await,
-			)?;
+			let received = await_transport(|| trace.recorded(events::MUX_GOAWAY_RECV) > 0).await;
+			assert!(received, "the client must receive the GoAway that carries the settlement refusal");
 
 			// The late emit is a stimulus alone. Its refusal emits
 			// `events::MUX_EMIT_DRAINING`.
@@ -604,7 +562,7 @@ tb_assert_spec! {
 			(events::MUX_REKEY_REFUSED, exactly!(1)),
 			(events::MUX_REKEY_RENEWED, exactly!(0)),
 			(events::MUX_EMIT_DRAINING, exactly!(1)),
-			(REFUSAL_CODE_REACHES_SERVER, exactly!(1), equals!(true))
+			(events::MUX_GOAWAY_RECV, exactly!(1), equals!(u32::from(GoAwayReason::Application(APPROVAL_REFUSAL_CODE))))
 		]
 	}
 }
@@ -626,11 +584,8 @@ tb_scenario! {
 			let pair = spawn_echo_pair_with(session.client, session.server, rekey_config(), rekey_config(), trace.share())?;
 
 			let _renewal_trigger = emit_series(&pair.client.handle, "rekey-refused-approval", 5).await?;
-			trace.event_with(
-				REFUSAL_CODE_REACHES_SERVER,
-				&[],
-				await_goaway_reason(&pair.server.handle, GoAwayReason::Application(APPROVAL_REFUSAL_CODE)).await,
-			)?;
+			let received = await_transport(|| trace.recorded(events::MUX_GOAWAY_RECV) > 0).await;
+			assert!(received, "the server must receive the GoAway that carries the approval refusal");
 
 			// The late emit is a stimulus alone. Its refusal emits
 			// `events::MUX_EMIT_DRAINING`.
@@ -647,9 +602,9 @@ tb_assert_spec! {
 		mode: Accept,
 		assertions: [
 			(events::MUX_PROTOCOL_ERROR, exactly!(1)),
+			(events::MUX_GOAWAY_SENT, exactly!(1), equals!(u32::from(GoAwayReason::ProtocolError))),
 			(events::MUX_REKEY_RECEIPT_ISSUED, exactly!(0)),
-			(events::MUX_REKEY_RENEWED, exactly!(0)),
-			(PREMATURE_REQUEST_VIOLATES_PROTOCOL, exactly!(1), equals!(true))
+			(events::MUX_REKEY_RENEWED, exactly!(0))
 		]
 	}
 }
@@ -668,11 +623,8 @@ tb_scenario! {
 			let _server_serve = spawn_immediate_echo(link.responder);
 
 			link.client_writer.write_envelope(rekey_request_envelope(7)?).await?;
-			trace.event_with(
-				PREMATURE_REQUEST_VIOLATES_PROTOCOL,
-				&[],
-				read_until_goaway(&mut link.client_reader, GoAwayReason::ProtocolError).await?,
-			)?;
+			let violated = read_until_goaway(&mut link.client_reader, GoAwayReason::ProtocolError).await?;
+			assert!(violated, "a request below the minimum spend must draw a ProtocolError GoAway");
 
 			Ok(())
 		}
@@ -685,11 +637,10 @@ tb_assert_spec! {
 		mode: Accept,
 		assertions: [
 			(events::MUX_PROTOCOL_ERROR, exactly!(1)),
+			(events::MUX_GOAWAY_SENT, exactly!(1), equals!(u32::from(GoAwayReason::ProtocolError))),
 			(events::MUX_REKEY_RECEIPT_ISSUED, exactly!(1)),
 			(events::MUX_REKEY_RENEWED, exactly!(0)),
-			(events::MUX_REKEY_VERIFY_FAILED, exactly!(0)),
-			(FIRST_REQUEST_ANSWERED, exactly!(1), equals!(true)),
-			(DUPLICATE_REQUEST_VIOLATES_PROTOCOL, exactly!(1), equals!(true))
+			(events::MUX_REKEY_VERIFY_FAILED, exactly!(0))
 		]
 	}
 }
@@ -708,22 +659,14 @@ tb_scenario! {
 			let _server_serve = spawn_immediate_echo(link.responder);
 
 			// The server answers a first request only after the minimum spend.
-			for index in 0..4u32 {
-				let stream_id = client_stream_id(index);
-				write_muxed_request(&mut link.client_writer, stream_id, mux_frame("rekey-spend")).await?;
-			}
+			spend_records(&mut link.client_writer, 4).await?;
 
 			link.client_writer.write_envelope(rekey_request_envelope(7)?).await?;
-
-			let answered = read_until_rekey_response(&mut link.client_reader).await;
-			trace.event_with(FIRST_REQUEST_ANSWERED, &[], answered.is_ok())?;
+			read_until_rekey_response(&mut link.client_reader).await?;
 
 			link.client_writer.write_envelope(rekey_request_envelope(9)?).await?;
-			trace.event_with(
-				DUPLICATE_REQUEST_VIOLATES_PROTOCOL,
-				&[],
-				read_until_goaway(&mut link.client_reader, GoAwayReason::ProtocolError).await?,
-			)?;
+			let violated = read_until_goaway(&mut link.client_reader, GoAwayReason::ProtocolError).await?;
+			assert!(violated, "a duplicate request must draw a ProtocolError GoAway");
 
 			Ok(())
 		}
@@ -737,9 +680,8 @@ tb_assert_spec! {
 		assertions: [
 			(events::MUX_REKEY_REQUESTED, exactly!(1)),
 			(events::MUX_REKEY_RENEWED, exactly!(0)),
-			(events::MUX_GOAWAY_SENT, exactly!(1)),
-			(RENEWAL_REQUEST_REACHES_SERVER, exactly!(1), equals!(true)),
-			(STALLED_RENEWAL_DRAINS_CLEAN, exactly!(1), equals!(true))
+			(events::MUX_REKEY_EXPIRED, exactly!(1)),
+			(events::MUX_GOAWAY_SENT, exactly!(1), equals!(u32::from(GoAwayReason::Shutdown)))
 		]
 	}
 }
@@ -768,13 +710,12 @@ tb_scenario! {
 
 			let emit_task = spawn_emit(&client_end.handle, mux_frame("rekey-timeout"));
 			read_until_rekey_request(&mut server_reader).await?;
-			trace.event_with(RENEWAL_REQUEST_REACHES_SERVER, &[], true)?;
 
-			trace.event_with(
-				STALLED_RENEWAL_DRAINS_CLEAN,
-				&[],
-				read_until_goaway(&mut server_reader, GoAwayReason::Shutdown).await?,
-			)?;
+			let drained = read_until_goaway(&mut server_reader, GoAwayReason::Shutdown).await?;
+			assert!(drained, "the stalled renewal must drain with a Shutdown GoAway");
+
+			let recorded = await_transport(|| trace.recorded(events::MUX_GOAWAY_SENT) > 0).await;
+			assert!(recorded, "the client must record the GoAway of the expired renewal");
 
 			abort_emit(emit_task).await;
 			Ok(())
@@ -792,12 +733,8 @@ tb_assert_spec! {
 			(events::MUX_REKEY_RECEIPT_COUNTERSIGNED, exactly!(0)),
 			(events::MUX_REKEY_RENEWED, exactly!(0)),
 			(events::MUX_GOAWAY_SENT, exactly!(1)),
-			(events::MUX_GOAWAY_RECV, exactly!(1)),
-			(events::MUX_EMIT_DRAINING, exactly!(1)),
-			(CLEARTEXT_HARVEST_YIELDS_NOTHING, exactly!(1), equals!(true)),
-			(RECEIPTLESS_SESSION_HAS_NO_EPOCH_RECEIPT, exactly!(1), equals!(true)),
-			(RECEIPTLESS_TRANSFER_SURVIVES_DRAIN, exactly!(1), equals!(true)),
-			(RECEIPTLESS_DRAIN_KEEPS_TODAYS_PATH, exactly!(1), equals!(true))
+			(events::MUX_GOAWAY_RECV, exactly!(1), equals!(u32::from(GoAwayReason::Shutdown))),
+			(events::MUX_EMIT_DRAINING, exactly!(1))
 		]
 	}
 }
@@ -813,34 +750,20 @@ tb_scenario! {
 			let client_harvest = MuxConnector::take_rekey(&mut cleartext_client)?;
 			let server_harvest = MuxAcceptor::take_rekey(&mut cleartext_server)?;
 			let harvest_empty = client_harvest.is_none() && server_harvest.is_none();
-			trace.event_with(
-				CLEARTEXT_HARVEST_YIELDS_NOTHING,
-				&[],
-				harvest_empty,
-			)?;
+			assert!(harvest_empty, "a cleartext link must yield no rekey materials");
 
 			let (client, server) = establish_transports(Some(chunked_offer(1)), Some(chunked_offer(1))).await?;
 			let server_config = MuxEndpointConfig { rekey_limit: Some(18), ..rekey_config() };
 			let pair = spawn_echo_pair_with(client, server, rekey_config(), server_config, trace.share())?;
-			trace.event_with(
-				RECEIPTLESS_SESSION_HAS_NO_EPOCH_RECEIPT,
-				&[],
-				pair.client.handle.session_receipt().is_none(),
-			)?;
+			let receiptless = pair.client.handle.session_receipt().is_none();
+			assert!(receiptless, "a receiptless session must expose no epoch receipt");
 
 			let frame = large_mux_frame("rekey-inert");
 			let echoed = pair.client.handle.emit_on_stream(&frame).await?;
-			trace.event_with(
-				RECEIPTLESS_TRANSFER_SURVIVES_DRAIN,
-				&[],
-				is_echo(echoed, &frame),
-			)?;
+			assert!(is_echo(echoed, &frame), "the chunked transfer must echo across the drain");
 
-			trace.event_with(
-				RECEIPTLESS_DRAIN_KEEPS_TODAYS_PATH,
-				&[],
-				await_goaway_reason(&pair.client.handle, GoAwayReason::Shutdown).await,
-			)?;
+			let received = await_transport(|| trace.recorded(events::MUX_GOAWAY_RECV) > 0).await;
+			assert!(received, "the client must receive the drain GoAway of the server");
 
 			// The late emit is a stimulus alone. Its refusal emits
 			// `events::MUX_EMIT_DRAINING`.

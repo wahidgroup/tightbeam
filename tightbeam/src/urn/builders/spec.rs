@@ -150,13 +150,13 @@ pub struct UrnSpecBuilder {
 	nid: &'static str,
 	/// The field configurations, in order.
 	fields: Vec<FieldConfig>,
-	/// The NSS format.
+	/// The format that joins the field values into the NSS.
 	nss_format: NssFormat,
 }
 
 impl UrnSpecBuilder {
-	/// Set whether the field named `name` is required, create the field when
-	/// it is absent, and apply `edit` to it.
+	/// Sets whether the field named `name` is required, creates the field when
+	/// it is absent, and applies `edit` to it.
 	fn edit_field(&mut self, name: &'static str, required: bool, edit: impl FnOnce(&mut FieldConfig)) {
 		let existing = self.fields.iter_mut().find(|f| f.name == name);
 		match existing {
@@ -172,26 +172,26 @@ impl UrnSpecBuilder {
 		}
 	}
 
-	/// Add a required field named `name`, or make an existing one required.
+	/// Adds a required field named `name`, or makes an existing one required.
 	pub fn field_required(mut self, name: &'static str) -> Self {
 		self.edit_field(name, true, |_| {});
 		self
 	}
 
-	/// Add an optional field named `name`, or make an existing one optional.
+	/// Adds an optional field named `name`, or makes an existing one optional.
 	pub fn field_optional(mut self, name: &'static str) -> Self {
 		self.edit_field(name, false, |_| {});
 		self
 	}
 
-	/// Add a const constraint to the field named `name`, which also makes it
+	/// Adds a const constraint to the field named `name`, which also makes it
 	/// required.
 	pub fn field_const(mut self, name: &'static str, value: &'static str) -> Self {
 		self.edit_field(name, true, |field| field.constraints.push(Constraint::Const(value)));
 		self
 	}
 
-	/// Add a oneof constraint to the field named `name`, which also makes it
+	/// Adds a oneof constraint to the field named `name`, which also makes it
 	/// required.
 	pub fn field_oneof(mut self, name: &'static str, options: &'static [&'static str]) -> Self {
 		let constraint = Constraint::OneOf(Cow::Borrowed(options));
@@ -199,13 +199,15 @@ impl UrnSpecBuilder {
 		self
 	}
 
-	/// Set the pattern of the field named `name`, which also makes it required.
+	/// Sets the pattern of the field named `name`, which also makes it
+	/// required.
 	pub fn field_pattern(mut self, name: &'static str, pattern: Pattern) -> Self {
 		self.edit_field(name, true, |field| field.pattern = Some(pattern));
 		self
 	}
 
-	/// Set the NSS separator of the field named `name`, when that field exists.
+	/// Sets the NSS separator of the field named `name`, when that field
+	/// exists.
 	pub fn field_nss_separator(mut self, name: &'static str, separator: &'static str) -> Self {
 		if let Some(field) = self.fields.iter_mut().find(|f| f.name == name) {
 			field.nss_separator = Some(separator);
@@ -214,13 +216,13 @@ impl UrnSpecBuilder {
 		self
 	}
 
-	/// Set a custom NSS format string, such as "{}:{}/{}".
+	/// Sets a custom NSS format string, such as "{}:{}/{}".
 	pub fn nss_format(mut self, format: impl AsRef<str>) -> Self {
 		self.nss_format = NssFormat::Custom(format.as_ref().to_string());
 		self
 	}
 
-	/// Validate `components` against this spec.
+	/// Validates `components` against this spec.
 	pub fn validate<'a>(&self, components: &dyn UrnComponents<'a>) -> Result<(), UrnValidationError> {
 		for field in &self.fields {
 			if field.required && components.get_component(field.name).is_none() {
@@ -247,7 +249,7 @@ impl UrnSpecBuilder {
 		Ok(())
 	}
 
-	/// Build the NSS from `components` with this spec's format.
+	/// Builds the NSS from `components` with this spec's format.
 	pub fn build_nss<'a>(&self, components: &dyn UrnComponents<'a>) -> Result<String, UrnValidationError> {
 		match &self.nss_format {
 			NssFormat::Join(default_separator) => {
@@ -333,53 +335,57 @@ mod tests {
 
 	use super::*;
 
-	#[test]
-	fn test_pattern_matches() {
-		let test_cases: &[(Pattern, &[&str], &[&str])] = &[
-			(
+	/// The values of `valid` that `admits` refuses, beside the values of
+	/// `invalid` that it admits, so one case reports every value it misreads.
+	fn misread<'v>(
+		admits: impl Fn(&str) -> bool,
+		valid: &[&'v str],
+		invalid: &[&'v str],
+	) -> (Vec<&'v str>, Vec<&'v str>) {
+		let refused = valid.iter().copied().filter(|value| !admits(value)).collect();
+		let admitted = invalid.iter().copied().filter(|value| admits(value)).collect();
+		(refused, admitted)
+	}
+
+	/// One pattern, the values it admits, and the values it refuses.
+	type PatternCase = (Pattern, &'static [&'static str], &'static [&'static str]);
+
+	crate::tb_cases! {
+		fn test_pattern_matches((pattern, valid, invalid): PatternCase) {
+			let misses = misread(|value| pattern.matches(value), valid, invalid);
+
+			assert_eq!(misses, (Vec::new(), Vec::new()), "Pattern {pattern:?} misreads these values");
+		}
+		cases {
+			alpha => (
 				Pattern::Alpha,
 				&["abc", "XYZ", "Hello", "WORLD"],
 				&["abc123", "123", "abc-xyz", "a1b", "space here"],
 			),
-			(Pattern::Numeric, &["123", "0", "999", "42"], &["abc", "12a", "1-2", "12.5"]),
-			(
+			numeric => (Pattern::Numeric, &["123", "0", "999", "42"], &["abc", "12a", "1-2", "12.5"]),
+			alpha_numeric => (
 				Pattern::AlphaNumeric,
 				&["abc123", "XYZ999", "Hello42", "WORLD0", "abc", "123"],
 				&["abc-xyz", "space here", "12.5", "a_b"],
 			),
-			(
+			alpha_numeric_hyphen => (
 				Pattern::AlphaNumericHyphen,
 				&["abc-123", "xyz-y", "test-case", "kebab-case-id", "abc", "123"],
 				&["abc_xyz", "space here", "12.5"],
 			),
-		];
-
-		for (pattern, valid_values, invalid_values) in test_cases {
-			for value in *valid_values {
-				assert!(pattern.matches(value), "Pattern {pattern:?} should match '{value}'");
-			}
-			for value in *invalid_values {
-				assert!(!pattern.matches(value), "Pattern {pattern:?} should not match '{value}'");
-			}
 		}
 	}
 
-	#[test]
-	fn test_pattern_str() {
-		// One case for each `Pattern` variant.
-		let test_cases: &[(Pattern, &str)] = &[
-			(Pattern::Alpha, "^[a-zA-Z]+$"),
-			(Pattern::Numeric, "^[0-9]+$"),
-			(Pattern::AlphaNumeric, "^[a-zA-Z0-9]+$"),
-			(Pattern::AlphaNumericHyphen, "^[a-zA-Z0-9-]+$"),
-		];
-
-		for (pattern, expected) in test_cases {
-			assert_eq!(
-				pattern.pattern_str(),
-				*expected,
-				"Pattern {pattern:?} should have pattern_str '{expected}'"
-			);
+	// One case for each `Pattern` variant.
+	crate::tb_cases! {
+		fn test_pattern_str((pattern, expected): (Pattern, &str)) {
+			assert_eq!(pattern.pattern_str(), expected, "Pattern {pattern:?} should have pattern_str '{expected}'");
+		}
+		cases {
+			alpha => (Pattern::Alpha, "^[a-zA-Z]+$"),
+			numeric => (Pattern::Numeric, "^[0-9]+$"),
+			alpha_numeric => (Pattern::AlphaNumeric, "^[a-zA-Z0-9]+$"),
+			alpha_numeric_hyphen => (Pattern::AlphaNumericHyphen, "^[a-zA-Z0-9-]+$"),
 		}
 	}
 
@@ -398,7 +404,7 @@ mod tests {
 	}
 
 	impl BracketRegex {
-		/// Read `regex`, which must have the `^[class]q$` form.
+		/// Reads `regex`, which must have the `^[class]q$` form.
 		fn parse(regex: &str) -> Self {
 			let body = regex
 				.strip_prefix("^[")
@@ -470,46 +476,31 @@ mod tests {
 		assert_eq!(disagreements, Vec::<&str>::new());
 	}
 
-	#[test]
-	fn test_constraint_matches() {
-		let const_test_cases: &[(&str, &[&str], &[&str])] =
-			&[("expected", &["expected"], &["unexpected", "Expected", "EXPECTED", ""])];
+	// The cases cover both `Constraint` variants. Each is the constraint,
+	// the values it admits, and the values it refuses.
+	crate::tb_cases! {
+		fn test_constraint_matches((constraint, valid, invalid): (Constraint, &[&str], &[&str])) {
+			let misses = misread(|value| constraint.matches(value), valid, invalid);
 
-		for (const_value, valid_values, invalid_values) in const_test_cases {
-			let constraint = Constraint::Const(const_value);
-			for value in *valid_values {
-				assert!(constraint.matches(value), "Const({const_value:?}) should match '{value}'");
-			}
-			for value in *invalid_values {
-				assert!(!constraint.matches(value), "Const({const_value:?}) should not match '{value}'");
-			}
+			assert_eq!(misses, (Vec::new(), Vec::new()), "{constraint:?} misreads these values");
 		}
-
-		// Each `OneOf` case is (options, valid_values, invalid_values).
-		let oneof_test_cases: &[(&[&str], &[&str], &[&str])] = &[
-			(
-				&["option1", "option2", "option3"],
+		cases {
+			const_value => (
+				Constraint::Const("expected"),
+				&["expected"],
+				&["unexpected", "Expected", "EXPECTED", ""],
+			),
+			one_of_options => (
+				Constraint::OneOf(Cow::Borrowed(&["option1", "option2", "option3"])),
 				&["option1", "option2", "option3"],
 				&["option4", "Option1", "OPTION1", ""],
 			),
-			(&["a", "b", "c"], &["a", "b", "c"], &["d", "A", "ab", ""]),
-		];
-
-		for (options, valid_values, invalid_values) in oneof_test_cases {
-			let constraint = Constraint::OneOf(Cow::Borrowed(*options));
-			for value in *valid_values {
-				assert!(constraint.matches(value), "OneOf({options:?}) should match '{value}'");
-			}
-			for value in *invalid_values {
-				assert!(!constraint.matches(value), "OneOf({options:?}) should not match '{value}'");
-			}
+			one_of_letters => (
+				Constraint::OneOf(Cow::Borrowed(&["a", "b", "c"])),
+				&["a", "b", "c"],
+				&["d", "A", "ab", ""],
+			),
 		}
-
-		// The cases cover both `Constraint` variants.
-		let tested_const = !const_test_cases.is_empty();
-		let tested_oneof = !oneof_test_cases.is_empty();
-		assert!(tested_const, "Const variant must be tested");
-		assert!(tested_oneof, "OneOf variant must be tested");
 	}
 
 	#[test]

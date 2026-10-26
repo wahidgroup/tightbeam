@@ -10,7 +10,7 @@ use std::sync::Arc;
 use futures::future::{select, Either};
 use tokio::sync::Notify;
 
-use crate::colony::hive::gates::{AdmitRefusal, AdmittedCommand, CommandRefusal};
+use crate::colony::hive::gates::{AdmitRefusal, AdmittedCommand, CommandRefusal, RefusalAudit};
 use crate::colony::hive::runtime::{DrainMode, HiveContextImpl, HiveInstances, InsertRefusal};
 use crate::colony::hive::{
 	BackpressureGate, ClusterSecurityGate, HashMapRegistry, ServletRegistration, ServletRegistry, SpawnerFn,
@@ -53,7 +53,7 @@ struct InFlightState {
 pub enum Settled {
 	/// Every command in flight finished.
 	Idle,
-	/// The timeout passed on the hive clock with commands still in flight.
+	/// The timeout passed on the hive clock with commands in flight.
 	TimedOut,
 }
 
@@ -72,8 +72,7 @@ impl InFlight {
 	/// Resolves once no command is in flight.
 	///
 	/// The method registers the notification before it reads the count, so
-	/// a guard that drops between the read and the await still wakes this
-	/// waiter.
+	/// a guard that drops between the read and the await wakes this waiter.
 	pub async fn idle(&self) {
 		loop {
 			let notified = self.0.idle.notified();
@@ -88,7 +87,7 @@ impl InFlight {
 	/// Waits for the hive to fall idle, or for `timeout` to pass on `clock`.
 	///
 	/// The method races the two waits, so a hive on a clock that only a test
-	/// advances still settles the moment its last command finishes.
+	/// advances settles the moment its last command finishes.
 	pub async fn settle(&self, clock: &dyn Clock, timeout: Duration) -> Settled {
 		let idle = pin!(self.idle());
 		let expired = pin!(clock.sleep(timeout));
@@ -101,7 +100,7 @@ impl InFlight {
 }
 
 /// One command's share of the [`InFlight`] count. The guard releases it on
-/// drop, so an early return still settles the drain.
+/// drop, so an early return also settles the drain.
 pub struct InFlightGuard(Arc<InFlightState>);
 
 impl Drop for InFlightGuard {
@@ -186,10 +185,17 @@ where
 {
 	/// Authenticates, gates, and dispatches one cluster command frame.
 	///
+	/// Each refusal reply records [`HIVE_COMMAND_REFUSED`] on the trace of
+	/// this context, with the canonical key of the peer of `session` as its
+	/// payload.
+	///
 	/// # Errors
 	///
 	/// - [`TightBeamError::SerializationError`] -- the reply body does not encode.
 	/// - [`TightBeamError::BuildError`] -- the reply metadata fails validation.
+	/// - The injected error, when the runtime fault model injects a fault at the refusal event.
+	///
+	/// [`HIVE_COMMAND_REFUSED`]: crate::instrumentation::events::HIVE_COMMAND_REFUSED
 	pub async fn handle_command(
 		self: Arc<Self>,
 		frame: Frame,
@@ -197,6 +203,7 @@ where
 	) -> Result<Option<Frame>, TightBeamError> {
 		let ctx = self;
 		let _in_flight = ctx.in_flight.enter();
+		let audit = RefusalAudit::new(&ctx.trace, &session);
 
 		// Security admission runs before drain, so drain state answers
 		// authenticated peers only. A refusal answers in the alternative the
@@ -204,7 +211,7 @@ where
 		// `ClusterError::MalformedResponse` and can evict the hive.
 		let admitted = match ctx.admit(frame, &session) {
 			Ok(admitted) => admitted,
-			Err(refusal) => return refusal.reply(),
+			Err(refusal) => return refusal.reply(&audit),
 		};
 
 		// The command decides whether it yields to load. A draining hive
@@ -212,26 +219,31 @@ where
 		// alternative the command names.
 		let yields = admitted.body().yields_to_load();
 		if ctx.drain.is_draining() && yields {
-			return admitted.refuse(CommandRefusal::Draining);
+			return admitted.refuse(CommandRefusal::Draining, &audit);
 		}
 
 		// A command that survives load, the heartbeat, skips backpressure, so
-		// a health check still answers. The exemption follows admission, so an
-		// unauthenticated peer gets no bypass.
+		// a health check answers under load. The exemption follows admission,
+		// so an unauthenticated peer gets no bypass.
 		if yields && ctx.under_backpressure(&admitted, &session) {
-			return admitted.refuse(CommandRefusal::Backpressure);
+			return admitted.refuse(CommandRefusal::Backpressure, &audit);
 		}
 
-		ctx.dispatch(admitted).await
+		ctx.dispatch(admitted, &audit).await
 	}
 
-	/// Answers one admitted command in the shape its body names.
-	async fn dispatch(self: Arc<Self>, admitted: AdmittedCommand) -> Result<Option<Frame>, TightBeamError> {
+	/// Answers one admitted command in the shape its body names, and records
+	/// each refusal on `audit`.
+	async fn dispatch(
+		&self,
+		admitted: AdmittedCommand,
+		audit: &RefusalAudit<'_>,
+	) -> Result<Option<Frame>, TightBeamError> {
 		match admitted.body() {
 			ClusterCommand::Heartbeat(_) => self.heartbeat_reply(&admitted),
-			ClusterCommand::Manage(HiveManagement::Spawn(spawn)) => self.manage_spawn(spawn, &admitted).await,
+			ClusterCommand::Manage(HiveManagement::Spawn(spawn)) => self.manage_spawn(spawn, &admitted, audit).await,
 			ClusterCommand::Manage(HiveManagement::List(_)) => self.manage_list(&admitted),
-			ClusterCommand::Manage(HiveManagement::Stop(stop)) => self.manage_stop(stop, &admitted),
+			ClusterCommand::Manage(HiveManagement::Stop(stop)) => self.manage_stop(stop, &admitted, audit),
 		}
 	}
 }
@@ -245,7 +257,7 @@ impl<P: Protocol> HiveControlCtx<P> {
 		gate.admit(frame, session)
 	}
 
-	/// Whether the backpressure gate refuses `admitted` right now.
+	/// Whether the backpressure gate refuses `admitted` at the present load.
 	fn under_backpressure(&self, admitted: &AdmittedCommand, session: &SessionContext) -> bool {
 		let verdict = GatePolicy::evaluate(&self.backpressure, Some(admitted.frame()), session);
 
@@ -267,6 +279,7 @@ impl<P: Protocol> HiveControlCtx<P> {
 		&self,
 		spawn: &SpawnServletParams,
 		admitted: &AdmittedCommand,
+		audit: &RefusalAudit<'_>,
 	) -> Result<Option<Frame>, TightBeamError>
 	where
 		P: Protocol + Send + Sync + 'static,
@@ -274,19 +287,19 @@ impl<P: Protocol> HiveControlCtx<P> {
 	{
 		let servlet_type = spawn.servlet_type.clone();
 		let Some(spawner) = self.spawners.get(&servlet_type) else {
-			return admitted.refuse(CommandRefusal::UnknownServletType);
+			return admitted.refuse(CommandRefusal::UnknownServletType, audit);
 		};
 
 		let Ok(new_servlet) = spawner(Arc::clone(&self.trace)).await else {
-			return admitted.refuse(CommandRefusal::SpawnFailed);
+			return admitted.refuse(CommandRefusal::SpawnFailed, audit);
 		};
 
 		let registration = ServletRegistration { servlet: new_servlet, spawner: Arc::clone(spawner), servlet_type };
 		let instances = HiveInstances::new(self.servlets.as_ref(), &self.hive_context);
 		let placed = match instances.insert(registration) {
 			Ok(placed) => placed,
-			Err(InsertRefusal::Unnameable(_)) => return admitted.refuse(CommandRefusal::UnnameableInstance),
-			Err(InsertRefusal::Registry(_)) => return admitted.refuse(CommandRefusal::RegistryFault),
+			Err(InsertRefusal::Unnameable(_)) => return admitted.refuse(CommandRefusal::UnnameableInstance, audit),
+			Err(InsertRefusal::Registry(_)) => return admitted.refuse(CommandRefusal::RegistryFault, audit),
 		};
 
 		// The manage response owns its address bytes, so this copy is needed.
@@ -306,14 +319,19 @@ impl<P: Protocol> HiveControlCtx<P> {
 		admitted.reply(ClusterCommandResponse::Manage(response))
 	}
 
-	fn manage_stop(&self, stop: &StopServletParams, admitted: &AdmittedCommand) -> Result<Option<Frame>, TightBeamError>
+	fn manage_stop(
+		&self,
+		stop: &StopServletParams,
+		admitted: &AdmittedCommand,
+		audit: &RefusalAudit<'_>,
+	) -> Result<Option<Frame>, TightBeamError>
 	where
 		P: Protocol,
 	{
 		let id_bytes = stop.servlet_id.canonical_bytes();
 		let instances = HiveInstances::new(self.servlets.as_ref(), &self.hive_context);
 		if instances.remove(&id_bytes).is_none() {
-			return admitted.refuse(CommandRefusal::UnknownInstance);
+			return admitted.refuse(CommandRefusal::UnknownInstance, audit);
 		}
 
 		let response = ClusterCommandResponse::Manage(HiveManagementOutcome::stop_ok());
@@ -343,12 +361,12 @@ mod tests {
 		Arc::new(ManualClock::default())
 	}
 
-	/// `clock` as the erased handle a settle reads.
+	/// Returns `clock` as the erased handle that a settle reads.
 	fn erased(clock: &Arc<ManualClock>) -> Arc<dyn Clock> {
 		Arc::clone(clock) as Arc<dyn Clock>
 	}
 
-	/// `settle` bounded by [`HANG_GUARD`], so a wait that never ends fails its
+	/// Bounds `settle` by [`HANG_GUARD`], so a wait that never ends fails its
 	/// test.
 	async fn bounded(settle: impl Future<Output = Settled>) -> Result<Settled, TightBeamError> {
 		tokio::time::timeout(HANG_GUARD, settle)
@@ -392,8 +410,8 @@ mod tests {
 		Ok(())
 	}
 
-	/// The timeout fires on the hive clock while a command is still in
-	/// flight, so the drain's backstop holds on a manual clock too.
+	/// The timeout fires on the hive clock while a command is in flight, so
+	/// the drain's backstop holds on a manual clock too.
 	#[tokio::test]
 	async fn a_settle_times_out_on_the_hive_clock() -> Result<(), TightBeamError> {
 		let in_flight = InFlight::default();

@@ -418,6 +418,7 @@ echo ""
 
 # A run without --keep-output starts from an empty output directory.
 echo "[*] Preparing seed inputs..."
+rm -rf "$FUZZ_IN"
 mkdir -p "$FUZZ_IN"
 if [ "$KEEP_OUTPUT" = false ]; then
     rm -rf "$FUZZ_OUT"
@@ -427,8 +428,10 @@ mkdir -p "$FUZZ_OUT"
 # The seeds come from the version-controlled seed directory. AFL refuses an
 # empty input directory, so a minimal seed stands in when that holds none.
 if [ -d "$SEED_DIR" ]; then
-    # A seed file ends in .txt, .bin, or .dat.
-    find "$SEED_DIR" -type f \( -name "*.txt" -o -name "*.bin" -o -name "*.dat" \) -exec cp {} "$FUZZ_IN/" \;
+    mapfile -t SEEDS < <("$SCRIPT_DIR/fuzz-run.sh" --seeds "$SEED_DIR")
+    if [ "${#SEEDS[@]}" -gt 0 ]; then
+        cp "${SEEDS[@]}" "$FUZZ_IN/"
+    fi
     SEED_COUNT=$(find "$FUZZ_IN" -type f | wc -l)
     if [ "$SEED_COUNT" -gt 0 ]; then
         echo "[+] Copied $SEED_COUNT seed files from $SEED_DIR"

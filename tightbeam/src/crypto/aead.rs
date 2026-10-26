@@ -162,7 +162,7 @@ pub enum RecordDirection {
 
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 impl RecordDirection {
-	/// The octet of this direction in a record's `kekid`.
+	/// Returns the octet of this direction in a record's `kekid`.
 	const fn octet(self) -> u8 {
 		match self {
 			Self::ClientToServer => 0x00,
@@ -170,9 +170,9 @@ impl RecordDirection {
 		}
 	}
 
-	/// The `kekid.keyIdentifier` of every record of this direction's key of
-	/// `epoch`: the record domain, this direction's octet, and the epoch in
-	/// big-endian order.
+	/// Returns the `kekid.keyIdentifier` of every record of this direction's
+	/// key of `epoch`: the record domain, this direction's octet, and the
+	/// epoch in big-endian order.
 	fn key_identifier(self, epoch: u32) -> Vec<u8> {
 		[TIGHTBEAM_RECORD_KEY_ID_DOMAIN, &[self.octet()], &epoch.to_be_bytes()].concat()
 	}
@@ -224,7 +224,8 @@ impl RuntimeAead {
 		Ok(Self { key, oid })
 	}
 
-	/// The content-encryption algorithm OID this key seals records under.
+	/// Returns the content-encryption algorithm OID that this key seals
+	/// records under.
 	pub fn algorithm_oid(&self) -> ObjectIdentifier {
 		self.oid
 	}
@@ -319,15 +320,16 @@ impl<'a> CheckedContent<'a> {
 		Ok(Self { envelope, arrived, content })
 	}
 
-	/// The envelope, the encoding it arrived as, which an open holds its
-	/// authenticated attributes to, and the buffer of the encrypted content.
+	/// Returns the envelope, the encoding it arrived as, and the buffer of the
+	/// encrypted content. An open holds the authenticated attributes to that
+	/// encoding.
 	pub fn into_parts(self) -> (&'a AuthEnvelopedData, &'a [u8], &'a mut [u8]) {
 		(self.envelope, self.arrived, self.content)
 	}
 
 	/// Open the content in its buffer with `opener` under the algorithms of
 	/// `P`, as the type the envelope's attributes authenticate. A refused open
-	/// leaves the buffer as it was.
+	/// leaves the buffer unchanged.
 	///
 	/// # Errors
 	///
@@ -375,7 +377,7 @@ impl<'a> CheckedContent<'a> {
 
 	/// Open the content in its buffer under the AEAD of `P` and `kek`, which
 	/// `key_identifier` names, as the type the envelope's attributes
-	/// authenticate. A refused open leaves the buffer as it was.
+	/// authenticate. A refused open leaves the buffer unchanged.
 	///
 	/// # Errors
 	///
@@ -404,7 +406,7 @@ pub trait Decryptor {
 	/// Open content that names this decryptor's algorithm in its buffer, so
 	/// the buffer holds the plaintext once the open returns.
 	///
-	/// A refused open MUST leave the buffer as it was, so a frame that lends
+	/// A refused open MUST leave the buffer unchanged, so a frame that lends
 	/// its body keeps it. The house decryptors keep this, because every check
 	/// runs before the cipher, and the cipher keeps it ([`ContentEncryption`]).
 	///
@@ -425,7 +427,7 @@ impl<D: Decryptor + ?Sized> Decryptor for Arc<D> {
 	}
 }
 
-/// Decryption of [`AuthEnvelopedData`] through any [`Decryptor`].
+/// The decryption of [`AuthEnvelopedData`] through any [`Decryptor`].
 ///
 /// The blanket implementation is the only one, so every decryptor refuses an
 /// envelope that names another algorithm.
@@ -436,7 +438,7 @@ pub trait DecryptContent {
 	///
 	/// This refuses an envelope that names an algorithm other than
 	/// [`Decryptor::algorithm_oid`] before any decryption, and a refused
-	/// decryption leaves `content` as it was.
+	/// decryption leaves `content` unchanged.
 	///
 	/// # Errors
 	///
@@ -485,7 +487,8 @@ pub(crate) struct RecordSequence {
 
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 impl RecordSequence {
-	/// This position as the authenticated attribute [`RECORD_SEQUENCE`].
+	/// Returns this position as the authenticated attribute
+	/// [`RECORD_SEQUENCE`].
 	///
 	/// # Errors
 	///
@@ -495,7 +498,8 @@ impl RecordSequence {
 		Ok(Attribute { oid: RECORD_SEQUENCE, values })
 	}
 
-	/// The one position the authenticated attributes of `envelope` carry.
+	/// Returns the one position that the authenticated attributes of
+	/// `envelope` carry.
 	///
 	/// # Errors
 	///
@@ -516,7 +520,7 @@ impl RecordSequence {
 }
 
 /// A send-direction record cipher: each record is an `AuthEnvelopedData`
-/// whose fresh content key is wrapped under this direction's key, and whose
+/// that wraps a fresh content key under this direction's key, and whose
 /// authenticated attributes carry its epoch and its sequence number.
 ///
 /// Each encryption consumes the next sequence number, so a receiver refuses a
@@ -527,14 +531,14 @@ impl RecordSequence {
 /// Each record draws its own content key and nonce (RFC 5084 §3.2), so the
 /// AES-GCM bound of one key binds one record. The sequence space of the
 /// counter and the key-wrap invocations under one key are the bounds that
-/// remain, and the record limit of RFC 9846 §5.5 stays the renewal trigger.
+/// remain, and the record limit of RFC 9846 §5.5 is the renewal trigger.
 ///
 /// - The record limit is the volume of 2^24 full-size TLS records divided by the encrypted-envelope ceiling.
 /// - It is [`DEFAULT_REKEY_RECORD_LIMIT`] at the default ceiling, and lower at a raised one
 ///   ([`Self::with_envelope_ceiling`]).
 /// - Encryption fails closed with [`TightBeamError::RekeyRequired`] at the limit.
 /// - A receipt-bearing multiplexed session renews its keys in band before the limit.
-/// - Every other session must be reestablished for fresh directional keys.
+/// - The caller must reestablish every other session for fresh directional keys.
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 pub struct SendCipher {
 	aead: RuntimeAead,
@@ -585,18 +589,19 @@ impl SendCipher {
 		self
 	}
 
-	/// The record limit at which this cipher halts.
+	/// Returns the record limit at which this cipher halts.
 	pub fn rekey_limit(&self) -> u64 {
 		self.rekey_limit
 	}
 
-	/// The content-encryption algorithm OID this cipher seals under.
+	/// Returns the content-encryption algorithm OID that this cipher seals
+	/// under.
 	pub fn algorithm_oid(&self) -> ObjectIdentifier {
 		self.aead.algorithm_oid()
 	}
 
-	/// The number of records this cipher can still encrypt before the rekey
-	/// limit halts it.
+	/// Returns the number of records left to encrypt before the rekey limit
+	/// halts this cipher.
 	pub fn remaining_records(&self) -> u64 {
 		let used = self.counter.load(Ordering::Relaxed);
 		self.rekey_limit.saturating_sub(used)
@@ -640,8 +645,8 @@ impl SendCipher {
 		self.aead.seal(payload.into(), &self.key_identifier, attribute)
 	}
 
-	/// A client-to-server cipher of epoch 0 that has spent `counter` sequence
-	/// numbers.
+	/// Builds a client-to-server cipher of epoch 0 that has spent `counter`
+	/// sequence numbers.
 	#[cfg(test)]
 	fn with_counter(aead: RuntimeAead, counter: u64) -> Self {
 		let key_identifier = RecordDirection::ClientToServer.key_identifier(0);
@@ -655,10 +660,37 @@ impl SendCipher {
 		}
 	}
 
-	/// The `kekid` every record of this cipher names.
+	/// Returns the `kekid` that every record of this cipher names.
 	#[cfg(test)]
 	fn key_identifier(&self) -> &[u8] {
 		&self.key_identifier
+	}
+
+	/// Seals `payload` as a record of this cipher's epoch at `sequence`, in
+	/// place of the next number, as an on-path party shapes a record that a
+	/// receiver refuses before its tag check.
+	///
+	/// # Errors
+	///
+	/// - The errors of [`Self::encrypt_next`] other than the record limit.
+	#[cfg(test)]
+	pub(crate) fn seal_at(&self, payload: impl Into<Vec<u8>>, sequence: u64) -> TbResult<AuthEnvelopedData> {
+		let attribute = RecordSequence { epoch: self.epoch, sequence }.attribute()?;
+		self.aead.seal(payload.into(), &self.key_identifier, attribute)
+	}
+
+	/// Seals `payload` as a record whose position attribute holds `position`
+	/// in place of a `RecordSequence`.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError::SerializationError`] -- the attribute fails to encode.
+	/// - [`TightBeamError::EnvelopeError`] -- the envelope refuses to seal.
+	#[cfg(test)]
+	pub(crate) fn seal_with_position(&self, payload: impl Into<Vec<u8>>, position: Any) -> TbResult<AuthEnvelopedData> {
+		let values = SetOfVec::try_from([position])?;
+		let attribute = Attribute { oid: RECORD_SEQUENCE, values };
+		self.aead.seal(payload.into(), &self.key_identifier, attribute)
 	}
 }
 
@@ -694,7 +726,7 @@ impl SendCipher {
 /// Each peer sets its own encrypted-envelope ceiling, so the byte bound counts
 /// what the key opened instead of an assumed record size of the peer:
 ///
-/// - An honest sender's record limit times its own ceiling is at most the volume, so it is never refused.
+/// - An honest sender's record limit times its own ceiling is at most the volume, so the bound admits it.
 /// - The cipher refuses the record of a peer that ignores its send clamp once the bytes pass the volume.
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 pub struct RecvCipher {
@@ -724,12 +756,12 @@ impl Progress {
 	/// the rest.
 	const COUNTER_BITS: u32 = 24;
 
-	/// Both facts in one word: the opened bytes above the counter.
+	/// Packs both facts into one word, with the opened bytes above the counter.
 	const fn pack(self) -> u64 {
 		(self.opened_bytes << Self::COUNTER_BITS) | self.counter
 	}
 
-	/// The facts a packed word holds.
+	/// Unpacks the facts that a packed word holds.
 	const fn unpack(word: u64) -> Self {
 		let counter = word & ((1 << Self::COUNTER_BITS) - 1);
 		let opened_bytes = word >> Self::COUNTER_BITS;
@@ -773,25 +805,25 @@ impl RecvCipher {
 	///
 	/// The threshold drives the receive-direction renewal and drain triggers.
 	/// Decryption refuses records at the renewal bounds whatever this value
-	/// is, so a threshold below the peer's send limit still admits every
-	/// legitimate record.
+	/// is, so every legitimate record opens under a threshold below the
+	/// peer's send limit too.
 	pub fn with_rekey_limit(mut self, limit: u64) -> Self {
 		self.rekey_limit = limit;
 		self
 	}
 
-	/// The renewal-trigger threshold that [`Self::remaining_records`] counts
-	/// down from.
+	/// Returns the renewal-trigger threshold that [`Self::remaining_records`]
+	/// counts down from.
 	pub fn rekey_limit(&self) -> u64 {
 		self.rekey_limit
 	}
 
-	/// The content-encryption algorithm OID this cipher opens.
+	/// Returns the content-encryption algorithm OID that this cipher opens.
 	pub fn algorithm_oid(&self) -> ObjectIdentifier {
 		self.aead.algorithm_oid()
 	}
 
-	/// The number of records still readable under the renewal-trigger
+	/// Returns the number of records left to read under the renewal-trigger
 	/// threshold.
 	///
 	/// The count tracks the peer's send sequence on the ordered channel, so a
@@ -807,7 +839,7 @@ impl RecvCipher {
 	///
 	/// This checks the epoch and the sequence number the record carries before
 	/// the content key unwraps, and advances the sequence once the tag passes.
-	/// A refused record leaves the sequence where it was.
+	/// A refused record leaves the sequence unchanged.
 	///
 	/// # Errors
 	///
@@ -816,7 +848,7 @@ impl RecvCipher {
 	/// - [`TightBeamError::SerializationError`] -- the position the record carries is no `RecordSequence`.
 	/// - [`TightBeamError::RecordEpoch`] -- the record carries another epoch.
 	/// - [`TightBeamError::NonceReplayed`] -- the record carries another sequence number than the next.
-	/// - [`TightBeamError::RekeyRequired`] -- at either renewal bound.
+	/// - [`TightBeamError::RekeyRequired`] -- the record meets either renewal bound.
 	pub fn open<'a>(&self, record: &'a mut [u8]) -> TbResult<&'a [u8]> {
 		// 1. Decode the record with its content left where it arrived, and read the position it claims.
 		let record = AuthEnvelopedData::detach(record, RECORD_CONTENT_TYPE)?;
@@ -866,7 +898,7 @@ impl RecvCipher {
 		Self::with_progress(aead, counter, 0)
 	}
 
-	/// A client-to-server cipher of epoch 0 that has already read `counter`
+	/// Builds a client-to-server cipher of epoch 0 that has read `counter`
 	/// records, which held `opened_bytes` bytes in all.
 	#[cfg(test)]
 	fn with_progress(aead: RuntimeAead, counter: u64, opened_bytes: u64) -> Self {
@@ -881,14 +913,14 @@ impl RecvCipher {
 		}
 	}
 
-	/// The `kekid` every record this cipher opens must name.
+	/// Returns the `kekid` that every record this cipher opens must name.
 	#[cfg(test)]
 	fn key_identifier(&self) -> &[u8] {
 		&self.key_identifier
 	}
 }
 
-/// Directional record keys derived at handshake completion or at a renewal.
+/// The directional record keys that a handshake or a renewal derives.
 ///
 /// The field names use the canonical client-to-server and server-to-client
 /// directions. [`SessionKeys`] maps them into send and receive sides, and
@@ -903,8 +935,8 @@ pub struct DirectionalCiphers<C> {
 	pub epoch: u32,
 }
 
-/// Role-mapped directional session keys, built at handshake completion or at
-/// a renewal.
+/// The directional session keys of one endpoint, mapped onto its role at
+/// handshake completion or at a renewal.
 ///
 /// The handshake derives one client-to-server and one server-to-client key
 /// (RFC 9846 §7.3 precedent). Each endpoint sends on its own direction and
@@ -918,8 +950,8 @@ pub struct SessionKeys {
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 impl SessionKeys {
 	/// Map directional keys for the client role, which sends
-	/// client-to-server. Both ciphers take the keys' epoch, and each the
-	/// direction of its field.
+	/// client-to-server. Both ciphers take the keys' epoch, and each takes
+	/// the direction of its field.
 	pub fn for_client(ciphers: DirectionalCiphers<RuntimeAead>) -> Self {
 		let DirectionalCiphers { client_to_server, server_to_client, epoch } = ciphers;
 		Self {
@@ -929,8 +961,8 @@ impl SessionKeys {
 	}
 
 	/// Map directional keys for the server role, which sends
-	/// server-to-client. Both ciphers take the keys' epoch, and each the
-	/// direction of its field.
+	/// server-to-client. Both ciphers take the keys' epoch, and each takes
+	/// the direction of its field.
 	pub fn for_server(ciphers: DirectionalCiphers<RuntimeAead>) -> Self {
 		let DirectionalCiphers { client_to_server, server_to_client, epoch } = ciphers;
 		Self {
@@ -942,19 +974,20 @@ impl SessionKeys {
 	/// Bound the send cipher by the encrypted-envelope ceiling the session
 	/// runs under ([`SendCipher::with_envelope_ceiling`]).
 	///
-	/// The receive cipher needs no ceiling. It counts the bytes it opens, so
-	/// its bound holds for whatever envelopes the peer sends ([`RecvCipher`]).
+	/// The ceiling bounds the send cipher alone. The receive cipher counts the
+	/// bytes it opens, so its bound holds for whatever envelopes the peer
+	/// sends ([`RecvCipher`]).
 	pub fn with_envelope_ceiling(mut self, encrypted_envelope: usize) -> Self {
 		self.send = self.send.with_envelope_ceiling(encrypted_envelope);
 		self
 	}
 
-	/// The send-direction cipher.
+	/// Returns the send-direction cipher.
 	pub fn send(&self) -> &SendCipher {
 		&self.send
 	}
 
-	/// The receive-direction cipher.
+	/// Returns the receive-direction cipher.
 	pub fn recv(&self) -> &RecvCipher {
 		&self.recv
 	}
@@ -1004,18 +1037,19 @@ mod tests {
 		RuntimeAead::new::<DefaultCryptoProvider>(TEST_KEK.to_vec()).expect("32 octets is the AES-256 wrap key")
 	}
 
-	/// A client-to-server send cipher of [`TEST_KEK`] at `epoch`.
+	/// Builds a client-to-server send cipher of [`TEST_KEK`] at `epoch`.
 	fn test_sender(epoch: u32) -> SendCipher {
 		SendCipher::new(test_runtime(), epoch, RecordDirection::ClientToServer)
 	}
 
-	/// A client-to-server receive cipher of [`TEST_KEK`] at `epoch`.
+	/// Builds a client-to-server receive cipher of [`TEST_KEK`] at `epoch`.
 	fn test_receiver(epoch: u32) -> RecvCipher {
 		RecvCipher::new(test_runtime(), epoch, RecordDirection::ClientToServer)
 	}
 
-	/// A client-to-server record of epoch 0 under [`TEST_KEK`] over
-	/// [`PLAINTEXT`], with `attributes` beside the content type, as its DER.
+	/// Seals [`PLAINTEXT`] as a client-to-server record of epoch 0 under
+	/// [`TEST_KEK`], with `attributes` beside the content type, and returns
+	/// its DER.
 	fn record_with(attributes: impl IntoIterator<Item = Attribute>) -> Vec<u8> {
 		let key_identifier = RecordDirection::ClientToServer.key_identifier(0);
 		let kek = Kek::try_from(TEST_KEK.as_slice()).expect("the test KEK is the size of the house wrap's key");
@@ -1030,13 +1064,13 @@ mod tests {
 		record.expect("the record seals").to_der().expect("the record encodes")
 	}
 
-	/// The position attribute of epoch 0 and `sequence`.
+	/// Returns the position attribute of epoch 0 and `sequence`.
 	fn position_attribute(sequence: u64) -> Attribute {
 		RecordSequence { epoch: 0, sequence }.attribute().expect("the position encodes")
 	}
 
-	/// `record` with the two attributes of its `authAttrs` in the reverse of
-	/// their DER order, and every other octet as it was.
+	/// Returns `record` with the two attributes of its `authAttrs` in the
+	/// reverse of their DER order, and every other octet unchanged.
 	fn with_attributes_swapped(record: &[u8]) -> Vec<u8> {
 		let envelope = AuthEnvelopedData::from_der(record).expect("the record decodes");
 		let attributes = envelope.auth_attrs.expect("a record authenticates its attributes").into_vec();
@@ -1056,7 +1090,8 @@ mod tests {
 	/// sixty thousand, a 240 KB record.
 	const FORGED_VALUES_LEN: u16 = 60_000;
 
-	/// The fields of the `AuthEnvelopedData` of `record`, after its header.
+	/// Returns the fields of the `AuthEnvelopedData` of `record`, after its
+	/// header.
 	fn fields_of(record: &[u8]) -> &[u8] {
 		let mut reader = SliceReader::new(record).expect("a record fits a DER length");
 		Header::decode(&mut reader).expect("a record starts with a header");
@@ -1064,13 +1099,13 @@ mod tests {
 		record.get(header_len..).expect("the header lies inside the record")
 	}
 
-	/// `record` with `element` after its last field.
+	/// Returns `record` with `element` after its last field.
 	fn with_trailing(record: &[u8], element: &[u8]) -> Vec<u8> {
 		tlv(DerTag::Sequence, &[fields_of(record), element].concat())
 	}
 
-	/// `record` with a second recipient beside its first, which differs from
-	/// it in one octet, in the DER order of the two.
+	/// Returns `record` with a second recipient beside its first, which
+	/// differs from it in one octet, in the DER order of the two.
 	fn with_two_recipients(record: &[u8]) -> Vec<u8> {
 		let (version, rest) = fields_of(record).split_at(3);
 		let mut reader = SliceReader::new(rest).expect("a record fits a DER length");
@@ -1088,14 +1123,15 @@ mod tests {
 		tlv(DerTag::Sequence, &[version, recipients.as_slice(), after].concat())
 	}
 
-	/// `record` with an empty `[0] originatorInfo` after its version, where
-	/// RFC 5083 §2.1 places the field.
+	/// Returns `record` with an empty `[0] originatorInfo` after its version,
+	/// where RFC 5083 §2.1 places the field.
 	fn with_originator_info(record: &[u8]) -> Vec<u8> {
 		let (version, rest) = fields_of(record).split_at(3);
 		tlv(DerTag::Sequence, &[version, &[0xa0, 0x00], rest].concat())
 	}
 
-	/// `record` with its tag changed in its last octet, the last of `mac`.
+	/// Returns `record` with its tag changed in its last octet, the last of
+	/// `mac`.
 	fn with_forged_tag(record: &[u8]) -> Vec<u8> {
 		let mut forged = record.to_vec();
 		let last = forged.last_mut().expect("a record ends with its tag");
@@ -1103,8 +1139,8 @@ mod tests {
 		forged
 	}
 
-	/// An `[2] unauthAttrs` of one attribute whose `count` values arrive in
-	/// descending order.
+	/// Builds an `[2] unauthAttrs` of one attribute whose `count` values
+	/// arrive in descending order.
 	fn unauth_attrs(count: u16) -> Vec<u8> {
 		let oid = Oid::new_unwrap("1.2.3.4").to_der().expect("a test OID encodes");
 		let values = tlv(DerTag::Set, &descending_values(count));
@@ -1112,8 +1148,8 @@ mod tests {
 		tlv(DerTag::ContextSpecific { constructed: true, number: TagNumber::N2 }, &attribute)
 	}
 
-	/// The kind of the DER error that refused a record, or `None` for another
-	/// outcome.
+	/// Returns the kind of the DER error that refused a record, or `None` for
+	/// another outcome.
 	fn encoding_refusal(outcome: TbResult<&[u8]>) -> Option<ErrorKind> {
 		match outcome {
 			Err(TightBeamError::EnvelopeError(EnvelopeError::Encoding(error))) => Some(error.kind()),
@@ -1121,25 +1157,26 @@ mod tests {
 		}
 	}
 
-	/// A record `sender` seals over [`PLAINTEXT`], as its DER.
+	/// Seals [`PLAINTEXT`] as the next record of `sender` and returns its DER.
 	fn record_of(sender: &SendCipher) -> Vec<u8> {
 		let record = sender.encrypt_next(PLAINTEXT).expect("the sender seals a record");
 		record.to_der().expect("the record encodes")
 	}
 
-	/// A record of epoch 0 at `sequence`, which no sender below the record
-	/// limit seals.
+	/// Forges a record of epoch 0 at `sequence`, which only a sender past the
+	/// record limit would seal.
 	fn record_at(sequence: u64) -> Vec<u8> {
 		record_with([position_attribute(sequence)])
 	}
 
-	/// The position the authenticated attributes of `record` carry.
+	/// Returns the position that the authenticated attributes of `record`
+	/// carry.
 	fn position_of(record: &[u8]) -> RecordSequence {
 		let envelope = AuthEnvelopedData::from_der(record).expect("the record decodes");
 		RecordSequence::carried_by(&envelope).expect("the record carries a position")
 	}
 
-	/// The `kekid` and the wrapped content key of `record`.
+	/// Returns the `kekid` and the wrapped content key of `record`.
 	fn recipient_of(record: &[u8]) -> (Vec<u8>, Vec<u8>) {
 		let envelope = AuthEnvelopedData::from_der(record).expect("the record decodes");
 		let recipient = envelope.recipient_infos.0.as_slice().first().cloned();
@@ -1153,8 +1190,8 @@ mod tests {
 		(key_identifier, kek.encrypted_key.as_bytes().to_vec())
 	}
 
-	/// `record` with the position its authenticated attributes carry
-	/// rewritten to `position`, and every other field as it was.
+	/// Returns `record` with the position its authenticated attributes carry
+	/// rewritten to `position`, and every other field unchanged.
 	fn relabelled(record: &[u8], position: RecordSequence) -> Vec<u8> {
 		let mut envelope = AuthEnvelopedData::from_der(record).expect("the record decodes");
 		let attribute = position.attribute().expect("the position encodes");
@@ -1377,8 +1414,8 @@ mod tests {
 		assert!(matches!(refused, Err(TightBeamError::NonceReplayed(found)) if found == expected));
 	}
 
-	/// A refusal leaves the sequence where it was, so the legitimate order
-	/// still opens after it.
+	/// A refusal leaves the sequence unchanged, so the legitimate order opens
+	/// after it.
 	#[test]
 	fn a_refused_record_leaves_the_sequence() -> TbResult<()> {
 		let sender = test_sender(0);
@@ -1498,7 +1535,7 @@ mod tests {
 	}
 
 	/// A raised envelope ceiling admits fewer records per key, and a limit
-	/// configured afterwards still clamps to that lower bound.
+	/// configured afterwards clamps to that lower bound as well.
 	#[test]
 	fn send_cipher_lowers_its_limit_for_a_raised_envelope_ceiling() {
 		let doubled = DEFAULT_MAX_ENCRYPTED_ENVELOPE * 2;
@@ -1622,8 +1659,8 @@ mod tests {
 		Ok(())
 	}
 
-	/// Directional record keys of the default provider from two fixed KEKs,
-	/// at `epoch`.
+	/// Builds the directional record keys of the default provider from two
+	/// fixed KEKs, at `epoch`.
 	fn directional(epoch: u32) -> DirectionalCiphers<RuntimeAead> {
 		let key = |fill: u8| RuntimeAead::new::<DefaultCryptoProvider>(vec![fill; 32]).expect("a 32-octet KEK");
 		DirectionalCiphers { client_to_server: key(0x11), server_to_client: key(0x22), epoch }
@@ -1682,8 +1719,8 @@ mod tests {
 		Ok(())
 	}
 
-	/// The direction octet of the `kekid` of each cipher of `keys`, the send
-	/// cipher's first. The octet follows the record domain.
+	/// Returns the direction octet of the `kekid` of each cipher of `keys`,
+	/// the send cipher's first. The octet follows the record domain.
 	fn direction_octets(keys: &SessionKeys) -> (u8, u8) {
 		let octet = |key_identifier: &[u8]| {
 			let rest = key_identifier.strip_prefix(TIGHTBEAM_RECORD_KEY_ID_DOMAIN);

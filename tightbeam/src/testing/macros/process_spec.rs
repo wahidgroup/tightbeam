@@ -12,10 +12,14 @@
 /// A guard follows these rules:
 ///
 /// - `GUARD` is the input of [`guard!`](crate::guard!), such as `clk <= Duration::from_millis(5)`.
-/// - A guard needs the `testing-timing` feature.
+/// - A guard or a reset names its clock as an identifier that the `clocks: { CLOCK, ... }` block declares.
 /// - A bracket after an event is its guard, so an event that is an index expression takes parentheses.
-/// - The CSP trace check reads no clock, so it accepts a guarded event at any time.
+/// - The CSP trace check reads the event order alone, so it accepts a guarded event at any time.
 /// - A guard binds in FDR exploration alone, as [`ProcessBuilder::add_timed_transition`] states.
+///
+/// The `clocks:` and `timing` blocks and a guard need the `testing-timing`
+/// feature, and the `schedulability` block needs `testing-schedulability`.
+/// A build without the feature that a block needs fails to compile.
 ///
 /// [`ProcessBuilder::add_timed_transition`]: crate::testing::specs::csp::ProcessBuilder::add_timed_transition
 ///
@@ -39,9 +43,10 @@
 ///     }
 ///     states {
 ///         Idle => { REQUEST => Busy },
-///         Busy => { REPLY [ wait <= Duration::from_millis(50), reset: ["wait"] ] => Idle }
+///         Busy => { REPLY [ wait <= Duration::from_millis(50), reset: [wait] ] => Idle }
 ///     }
 ///     terminal { Idle }
+///     clocks: { wait }
 /// }
 ///
 /// let process = Exchange::process();
@@ -65,7 +70,7 @@ macro_rules! tb_process_spec {
 		$(terminal { $($term_state:ident),* $(,)? })?
 		$(choice { $($choice_state:ident),* $(,)? })?
 		$(annotations { description: $desc:expr })?
-		$(clocks: { $($clock_name:expr),* $(,)? })?
+		$(clocks: { $($clock:ident),* $(,)? })?
 		$(timing {
 			$($timing_content:tt)*
 		})?
@@ -87,10 +92,10 @@ macro_rules! tb_process_spec {
 		$(terminal { $($term_state),* })?
 		$(choice { $($choice_state),* })?
 		$(annotations { description: $desc })?
+		$(clocks: { $($clock),* })?
 		$(timing {
 			$($timing_content)*
 		})?
-		$(clocks: { $($clock_name:expr),* $(,)? })?
 		$(schedulability {
 			$($schedulability_content)*
 		})?
@@ -110,7 +115,7 @@ macro_rules! tb_process_spec {
 		$(terminal { $($term_state:ident),* })?
 		$(choice { $($choice_state:ident),* })?
 		$(annotations { description: $desc:expr })?
-		$(clocks: { $($clock_name:expr),* $(,)? })?
+		$(clocks: { $($clock:ident),* })?
 		$(timing {
 			$($timing_content:tt)*
 		})?
@@ -156,6 +161,21 @@ macro_rules! tb_process_spec {
 					builder = builder.add_hidden($hid_event);
 				)*
 
+				// A build without `testing-timing` stops at the `clocks:`
+				// block, so a spec keeps every clock it declares.
+				$(
+					$crate::__tb_select_testing_timing! {
+						{
+							$(
+								builder = builder.clock(stringify!($clock));
+							)*
+						}
+						{
+							::core::compile_error!("the `clocks:` block of `tb_process_spec!` needs the `testing-timing` feature");
+						}
+					}
+				)?
+
 				// The `@transitions` arms expand the transitions of each state.
 				$(
 					$crate::tb_process_spec! {
@@ -180,40 +200,56 @@ macro_rules! tb_process_spec {
 				)?
 
 
-				// Only a build with `testing-timing` applies a timing block.
+				// A build without `testing-timing` stops at the timing block,
+				// so a spec keeps every timing constraint it states.
 				$(
-					$crate::__tb_if_testing_timing! {
+					$crate::__tb_select_testing_timing! {
 						{
-							use $crate::testing::specs::csp::Event;
-							use $crate::testing::timing::{DeadlineBuilder, TimingConstraints};
-							use $crate::testing::macros::DeadlineParams;
-							let mut timing_constraints = TimingConstraints::default();
+							{
+								use $crate::builder::TypeBuilder as _;
+								use $crate::testing::specs::csp::Event;
+								use $crate::testing::timing::{DeadlineBuilder, TimingConstraints};
+								use $crate::testing::macros::DeadlineParams;
+								let mut timing_constraints = TimingConstraints::default();
 
-							$crate::tb_process_spec! {
-								@parse_timing
-								timing_constraints,
-								$($timing_content)*
+								$crate::tb_process_spec! {
+									@parse_timing
+									timing_constraints,
+									$($timing_content)*
+								}
+
+								builder = builder.timing_constraints(timing_constraints);
 							}
-
-							builder = builder.timing_constraints(timing_constraints);
 						}
-					};
+						{
+							::core::compile_error!("the `timing` block of `tb_process_spec!` needs the `testing-timing` feature");
+						}
+					}
 				)?
 
+				// A build without `testing-schedulability` stops at the
+				// schedulability block, so a spec keeps every period it states.
 				$(
-					$crate::__tb_if_testing_schedulability! {
+					$crate::__tb_select_testing_schedulability! {
 						{
-							use $crate::testing::specs::csp::Event;
-							use std::collections::HashMap;
-							use core::time::Duration;
+							{
+								use $crate::testing::specs::csp::Event;
+								use std::collections::HashMap;
+								use core::time::Duration;
 
-							$crate::tb_process_spec! {
-								@parse_schedulability
-								builder,
-								$($schedulability_content)*
+								$crate::tb_process_spec! {
+									@parse_schedulability
+									builder,
+									$($schedulability_content)*
+								}
 							}
 						}
-					};
+						{
+							::core::compile_error!(
+								"the `schedulability` block of `tb_process_spec!` needs the `testing-schedulability` feature"
+							);
+						}
+					}
 				)?
 
 				builder.build().expect("Failed to build Process")
@@ -370,13 +406,13 @@ macro_rules! tb_process_spec {
 	// An empty schedulability block leaves the builder as it is.
 	(@parse_schedulability $builder:ident,) => {};
 
-	// The `@transitions` arms read the transitions of one state, in order.
+	// The `@transitions` arms read the transitions of one state, in order:
 	//
-	// The bracket after an event holds its timing guard, so each guarded arm
-	// comes before the plain arm that reads the same tokens. The bracket after
-	// `$from` holds the event tokens read so far. An event that is a path, or
-	// a call on a path, matches whole, so a long state stays inside the
-	// recursion limit. Any other event is read one token at a time.
+	// - The bracket after `$from` holds the event tokens read so far.
+	// - The bracket after an event holds its timing guard, so each guarded arm
+	//   precedes the plain arm that reads the same tokens.
+	// - A path event, or a call on a path, matches whole, so a long state stays inside the recursion limit.
+	// - The last arm reads any other event one token at a time.
 	(@transitions
 		$builder:ident,
 		$from:ident,
@@ -481,14 +517,15 @@ macro_rules! tb_process_spec {
 	};
 
 	// The `@guard` arms split a guard from its clock resets. `guard!` reads the
-	// guard, so the guard grammar has one home.
+	// guard, so the guard grammar has one home. A reset names its clock as an
+	// identifier, as the guard does.
 	(@guard
 		$builder:ident,
 		$from:ident,
 		[$($event:tt)+],
 		$to:ident,
 		[$($guard:tt)+]
-		, reset: [ $($reset:expr),* $(,)? ]
+		, reset: [ $($reset:ident),* $(,)? ]
 	) => {
 		$crate::tb_process_spec! {
 			@timed
@@ -538,26 +575,25 @@ macro_rules! tb_process_spec {
 		}
 	};
 
-	// The `@timed` arm adds one transition that a timing guard enables.
-	//
-	// A build without `testing-timing` stops at the guard with a compile
-	// error, so a spec keeps every guard it states.
+	// The `@timed` arm adds one transition that a timing guard enables. A build
+	// without `testing-timing` stops at the guard with a compile error, so a
+	// spec keeps every guard it states.
 	(@timed
 		$builder:ident,
 		$from:ident,
 		[$($event:tt)+],
 		$to:ident,
 		[$($guard:tt)+],
-		[$($reset:expr),*]
+		[$($reset:ident),*]
 	) => {
 		$crate::__tb_select_testing_timing! {
 			{
 				$builder = $builder.add_timed_transition(
 					$crate::testing::specs::csp::State(stringify!($from)),
-					$crate::testing::specs::csp::Event::from($($event)+),
+					$($event)+,
 					$crate::testing::specs::csp::State(stringify!($to)),
 					::core::option::Option::Some($crate::guard!($($guard)+)),
-					[$(::std::string::String::from($reset)),*],
+					[$(::std::string::String::from(stringify!($reset))),*],
 				);
 			}
 			{
@@ -567,19 +603,43 @@ macro_rules! tb_process_spec {
 	};
 }
 
-#[cfg(all(test, feature = "testing-timing"))]
+#[cfg(all(test, feature = "testing-csp"))]
 mod tests {
 	use core::error::Error;
+	use std::borrow::Cow;
+
+	#[cfg(feature = "testing-timing")]
 	use core::time::Duration;
+	#[cfg(feature = "testing-timing")]
 	use std::collections::HashMap;
 
-	use crate::testing::specs::csp::{Event, State, Successor};
-	use crate::testing::timing::{TimedTransition, TimingGuard};
+	use crate::testing::assertions::{Assertion, AssertionLabel};
+	use crate::testing::specs::csp::ProcessSpec;
+	use crate::trace::ConsumedTrace;
 	use crate::urn::Urn;
+
+	#[cfg(feature = "testing-timing")]
+	use crate::testing::specs::csp::{Event, State, Successor};
+	#[cfg(feature = "testing-timing")]
+	use crate::testing::timing::{TimedTransition, TimingGuard};
 
 	const ARM: Urn<'static> = crate::urn!("test", "event:process-spec/arm");
 	const FIRE: Urn<'static> = crate::urn!("test", "event:process-spec/fire");
 
+	crate::tb_process_spec! {
+		pub PlainProcess,
+		events {
+			observable { ARM, FIRE }
+			hidden { }
+		}
+		states {
+			S0 => { ARM => S1 },
+			S1 => { FIRE => S0 }
+		}
+		terminal { S0 }
+	}
+
+	#[cfg(feature = "testing-timing")]
 	crate::tb_process_spec! {
 		pub GuardedProcess,
 		events {
@@ -588,74 +648,123 @@ mod tests {
 		}
 		states {
 			S0 => { ARM [ clk <= Duration::from_millis(5) ] => S1 },
-			S1 => { FIRE [ clk <= Duration::from_millis(5), reset: ["clk"] ] => S0 }
+			S1 => { FIRE [ clk <= Duration::from_millis(5), reset: [clk] ] => S0 }
 		}
 		terminal { S0 }
+		clocks: { clk }
+	}
+
+	/// A trace that records each of `events` once, in order.
+	fn trace_of(events: &[Urn<'static>]) -> ConsumedTrace {
+		let mut trace = ConsumedTrace::new();
+		for (seq, event) in events.iter().enumerate() {
+			let label = AssertionLabel::Custom(Cow::Owned(event.to_string()));
+			trace.assertions.push(Assertion::new(seq, label, Vec::new(), None));
+		}
+
+		trace
 	}
 
 	/// The timed transition that `event` labels from `from`.
 	///
 	/// The plain arm records no timed transition, so the lookup fails where a
 	/// guarded form falls through to it.
+	#[cfg(feature = "testing-timing")]
 	fn timed_transition(from: &'static str, event: Urn<'static>) -> Result<TimedTransition, Box<dyn Error>> {
 		let key = (State(from), Event::from(event));
 		let mut table = GuardedProcess::process().timed_transitions.unwrap_or_default();
-		let transition = table.remove(&key).and_then(|transitions| transitions.into_iter().next());
 
+		let transition = table.remove(&key).and_then(|transitions| transitions.into_iter().next());
 		transition.ok_or_else(|| "the guarded form recorded no timed transition".into())
 	}
 
 	/// The clock readings once `clk` has run `span`.
+	#[cfg(feature = "testing-timing")]
 	fn readings_after(span: Duration) -> HashMap<String, Duration> {
 		HashMap::from([("clk".to_string(), span)])
 	}
 
 	#[test]
+	fn a_spec_accepts_a_trace_that_its_process_allows() -> Result<(), Box<dyn Error>> {
+		let trace = trace_of(&[ARM, FIRE]);
+		let result = PlainProcess.validate_trace(&trace);
+		assert!(result.valid, "{:?}", result.violations);
+		Ok(())
+	}
+
+	#[test]
+	fn a_spec_rejects_an_event_that_its_state_does_not_enable() -> Result<(), Box<dyn Error>> {
+		let trace = trace_of(&[FIRE]);
+		let result = PlainProcess.validate_trace(&trace);
+		assert!(!result.valid);
+		Ok(())
+	}
+
+	#[cfg(feature = "testing-timing")]
+	#[test]
 	fn a_guarded_event_expands_to_a_timed_transition() -> Result<(), Box<dyn Error>> {
 		let bound = TimingGuard::ClockLessEqual("clk".to_string(), Duration::from_millis(5));
-
 		let transition = timed_transition("S0", ARM)?;
-
 		assert_eq!(transition.guard, Some(bound));
 		assert_eq!(transition.to, State("S1"));
 		Ok(())
 	}
 
+	#[cfg(feature = "testing-timing")]
 	#[test]
 	fn a_guard_allows_its_edge_at_its_bound() -> Result<(), Box<dyn Error>> {
 		let process = GuardedProcess::process();
 		let readings = readings_after(Duration::from_millis(5));
 
 		let successors: Vec<Successor> = process.successors(State("S0"), &Event::from(ARM), &readings).collect();
-
 		assert_eq!(successors, [Successor { to: State("S1"), resets: &[] }]);
 		Ok(())
 	}
 
+	#[cfg(feature = "testing-timing")]
 	#[test]
 	fn a_guard_refuses_its_edge_past_its_bound() -> Result<(), Box<dyn Error>> {
 		let process = GuardedProcess::process();
 		let readings = readings_after(Duration::from_micros(5_001));
 
 		let successors: Vec<Successor> = process.successors(State("S0"), &Event::from(ARM), &readings).collect();
-
 		assert!(successors.is_empty());
 		Ok(())
 	}
 
+	#[cfg(feature = "testing-timing")]
 	#[test]
 	fn a_guard_with_resets_names_its_clocks() -> Result<(), Box<dyn Error>> {
 		let transition = timed_transition("S1", FIRE)?;
-
 		assert_eq!(transition.reset_clocks, ["clk"]);
 		Ok(())
 	}
 
+	#[cfg(feature = "testing-timing")]
 	#[test]
 	fn a_guarded_transition_is_an_edge_of_the_process() -> Result<(), Box<dyn Error>> {
 		let process = GuardedProcess::process();
-
 		assert_eq!(process.step(State("S0"), &Event::from(ARM)), [State("S1")]);
+		Ok(())
+	}
+
+	#[cfg(feature = "testing-timing")]
+	#[test]
+	fn a_declared_clock_starts_at_zero() -> Result<(), Box<dyn Error>> {
+		let process = GuardedProcess::process();
+		let clocks = process.initial_clocks();
+		assert_eq!(clocks, HashMap::from([("clk".to_string(), Duration::ZERO)]));
+		Ok(())
+	}
+
+	#[cfg(feature = "testing-timing")]
+	#[test]
+	fn a_guard_allows_its_edge_when_a_run_starts() -> Result<(), Box<dyn Error>> {
+		let process = GuardedProcess::process();
+		let readings = process.initial_clocks();
+
+		let successors: Vec<Successor> = process.successors(State("S0"), &Event::from(ARM), &readings).collect();
+		assert_eq!(successors, [Successor { to: State("S1"), resets: &[] }]);
 		Ok(())
 	}
 }

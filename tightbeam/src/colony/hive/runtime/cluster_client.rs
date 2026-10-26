@@ -2,7 +2,8 @@
 //!
 //! [`ClusterLink`] carries registration, the anti-entropy re-announce, and
 //! the scaling fan-out. All three share one control frame shape, signed when
-//! hive TLS is configured, and the same transport identity rules.
+//! hive TLS is configured, the same transport identity rules, and the hive's
+//! trace.
 
 use core::time::Duration;
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -17,8 +18,10 @@ use crate::decode;
 use crate::instrumentation::events::HIVE_REREGISTERED;
 use crate::policy::TransitStatus;
 use crate::runtime::rt;
-use crate::trace::TraceCollector;
-use crate::transport::state::DialableEncryption;
+use crate::trace::{TraceCollector, TraceHandle};
+use crate::transport::accept::ConnectionTerms;
+use crate::transport::multiplex::MuxCapable;
+use crate::transport::state::{DialableEncryption, EncryptedProtocolState};
 use crate::transport::{EndpointConfig, MessageEmitter, Protocol, TransportResult};
 use crate::urn::Urn;
 use crate::{Frame, Message, TightBeamError, Version};
@@ -37,11 +40,24 @@ use crate::{Frame, Message, TightBeamError, Version};
 /// The gateway list changes by one push at a time, so a thread that
 /// panicked while it held the lock left a whole list behind it. The link
 /// therefore recovers a poisoned lock, and the announcements go on.
+///
+/// # Warning
+///
+/// Each transport the link dials records into the hive's trace, so the trace
+/// holds the session of each dial, a session that the gateway fails
+/// included. The default `BoundedMemorySink` drops each event past
+/// `max_events`, the hive's own included, so a long-lived hive needs an
+/// `EventSink` that forwards each event, or a reader that drains the trace.
 pub struct ClusterLink<P: Protocol> {
 	servlets: Arc<HashMapRegistry>,
 	cluster_addrs: Arc<RwLock<Vec<P::Address>>>,
 	hive_addr: P::Address,
 	config: Arc<HiveConfig>,
+	/// The hive's trace, which the re-announce beat records into.
+	trace: Arc<TraceCollector>,
+	/// The terms the link sets on each transport it dials: the hive's trace,
+	/// and no mux offer, because each control exchange is one request.
+	terms: ConnectionTerms,
 }
 
 impl<P: Protocol> Clone for ClusterLink<P>
@@ -54,6 +70,8 @@ where
 			cluster_addrs: Arc::clone(&self.cluster_addrs),
 			hive_addr: self.hive_addr.clone(),
 			config: Arc::clone(&self.config),
+			trace: Arc::clone(&self.trace),
+			terms: self.terms.clone(),
 		}
 	}
 }
@@ -64,18 +82,22 @@ where
 	P::Address: Clone + Copy + Send + Sync + 'static,
 	P::Stream: Send + 'static,
 	P::Error: Send + 'static,
-	P::Transport: MessageEmitter + Send + 'static,
+	P::Transport: MessageEmitter + MuxCapable + EncryptedProtocolState + Send + 'static,
 	TightBeamError: From<P::Error>,
 {
-	/// Binds the hive's slate, control address, and configuration to its
-	/// gateway list.
+	/// Binds the hive's slate, control address, configuration, and trace to
+	/// its gateway list.
 	pub fn new(
 		servlets: Arc<HashMapRegistry>,
 		cluster_addrs: Arc<RwLock<Vec<P::Address>>>,
 		hive_addr: P::Address,
 		config: Arc<HiveConfig>,
+		trace: Arc<TraceCollector>,
 	) -> Self {
-		Self { servlets, cluster_addrs, hive_addr, config }
+		let handle = TraceHandle::new(Arc::clone(&trace));
+		let terms = ConnectionTerms::new(handle, None);
+
+		Self { servlets, cluster_addrs, hive_addr, config, trace, terms }
 	}
 
 	/// Takes the read lock of the gateway list. It recovers a poisoned lock,
@@ -100,7 +122,7 @@ where
 		!self.addrs().is_empty()
 	}
 
-	/// Records `gateway` as one this hive is registered with.
+	/// Records `gateway` as a gateway that accepted this hive.
 	///
 	/// Registration is idempotent, so the list holds one row per gateway and
 	/// each beat of [`ClusterLink::spawn_reregister`] dials each gateway once.
@@ -152,8 +174,9 @@ where
 	///
 	/// The beat ends once the hive drains, so the hive stops its
 	/// advertisements, and the drain announces its emptied slate once.
-	pub fn spawn_reregister(&self, trace: Arc<TraceCollector>) -> rt::JoinHandle {
+	pub fn spawn_reregister(&self) -> rt::JoinHandle {
 		let link = self.clone();
+		let trace = Arc::clone(&self.trace);
 		rt::spawn(async move {
 			let Some(interval) = link.config.control.reregister_interval else {
 				return;
@@ -167,7 +190,14 @@ where
 					for gateway in link.gateways() {
 						let outcome = link.register(gateway).await;
 						let status = outcome.map(|response| response.status).unwrap_or(TransitStatus::Unavailable);
-						trace.event_with(HIVE_REREGISTERED, &[], status)?;
+						let label = status.as_str();
+						let evidence = || -> Option<Vec<u8>> { Some(gateway.into()) };
+						trace.emit_event_with_value_and_rendered_evidence(
+							HIVE_REREGISTERED,
+							label,
+							status,
+							evidence,
+						)?;
 					}
 				}
 			}
@@ -231,8 +261,21 @@ where
 	/// Opens one transport to `gateway` under this hive's identity.
 	async fn dial(&self, gateway: P::Address) -> Result<P::Transport, TightBeamError> {
 		let endpoint = self.endpoint()?;
+		let transport = self.connect(gateway, endpoint).await?;
+		Ok(transport)
+	}
+
+	/// Connects to `gateway` under `endpoint`, and sets the link's terms on
+	/// the transport before its handshake. Every dial of the link connects
+	/// here, and the transport takes the endpoint that the caller gives.
+	async fn connect(
+		&self,
+		gateway: P::Address,
+		endpoint: EndpointConfig<P::CryptoProvider>,
+	) -> Result<P::Transport, P::Error> {
 		let stream = P::connect(gateway).await?;
-		Ok(P::create_transport(stream, endpoint))
+		let transport = P::create_transport(stream, endpoint);
+		Ok(self.terms.apply(transport))
 	}
 
 	/// Builds a hive-to-cluster control frame, signed when hive TLS is
@@ -292,14 +335,13 @@ where
 
 		let max_attempts = self.config.control.notify_retry.max_attempts();
 		for attempt in 0..=max_attempts {
-			let Ok(stream) = P::connect(gateway).await else {
+			let Ok(mut transport) = self.connect(gateway, endpoint.clone()).await else {
 				self.retry_delay(attempt).await;
 				continue;
 			};
 
 			// A transport-level answer is not acceptance, so the body MUST
 			// carry `TransitStatus::Ok`.
-			let mut transport = P::create_transport(stream, endpoint.clone());
 			match transport.emit(frame.clone(), None).await {
 				Ok(Some(response)) => {
 					let decoded = decode::<ServletAddressUpdateResponse>(response.message());

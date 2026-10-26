@@ -19,10 +19,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
-#[cfg(any(
-	feature = "testing-schedulability",
-	all(feature = "testing-timing", any(test, feature = "testing-fdr"))
-))]
+#[cfg(feature = "testing-timing")]
 use core::time::Duration;
 
 use crate::der::{Decode, DecodeValue, EncodeValue, Tag, Tagged};
@@ -154,6 +151,14 @@ impl TransitionRelation {
 	pub fn iter(&self) -> impl Iterator<Item = (&(State, Event), &Vec<State>)> {
 		self.transitions.iter()
 	}
+
+	/// Keeps the transitions of each event that `keep` accepts.
+	pub(crate) fn retain<K>(&mut self, keep: K)
+	where
+		K: Fn(&Event) -> bool,
+	{
+		self.transitions.retain(|(_, event), _| keep(event));
+	}
 }
 
 impl Default for TransitionRelation {
@@ -255,6 +260,34 @@ pub struct Process {
 	pub schedulability_periods: Option<(SchedulerType, HashMap<Event, Duration>)>,
 }
 
+/// The parts of a process that a search of its traces, failures, and
+/// divergences reads, as [`Process::search_structure`] states them.
+///
+/// - Each part is in sorted order, so two processes with equal parts have equal structures.
+/// - The name stays out, because the algebra operators (`hide`, `rename`) give
+///   one name to processes of different structure.
+/// - A guard and its resets stay out, because the search takes a timed edge
+///   whatever the clocks read, as [`Process::step`] reads it.
+#[cfg(feature = "testing-fdr")]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct SearchStructure {
+	/// The state the search starts from.
+	initial: State,
+	/// Every state of the process.
+	states: Vec<State>,
+	/// The accepting states, where a run can terminate.
+	terminal: Vec<State>,
+	/// The declared nondeterministic choice points.
+	choice: Vec<State>,
+	/// The events of the observable alphabet (Σ).
+	observable: Vec<Event>,
+	/// The events of the hidden alphabet (τ).
+	hidden: Vec<Event>,
+	/// Each transition, untimed or timed, as its source, its event, and its
+	/// target.
+	transitions: Vec<(State, Event, State)>,
+}
+
 /// An edge that the clocks allow, and the clocks it resets.
 #[cfg(all(feature = "testing-timing", any(test, feature = "testing-fdr")))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,7 +295,7 @@ pub(crate) struct Successor<'a> {
 	/// The state the edge leads to.
 	pub(crate) to: State,
 
-	/// The clocks that the edge resets when it is taken.
+	/// The clocks that the edge resets when a run takes it.
 	pub(crate) resets: &'a [String],
 }
 
@@ -285,9 +318,9 @@ impl Process {
 	/// The projection of `trace` onto this process's observable alphabet.
 	///
 	/// `traces(P \ X) = { s ↾ (Σ ∖ X) | s ∈ traces(P) }`. A recording also
-	/// holds the steps this process models internally, so it is projected
-	/// before it is compared. The projection holds in the traces model only,
-	/// because hiding is not sound in `F` or `FD`.
+	/// holds the steps this process models internally, so the refinement check
+	/// projects it before the comparison. The projection holds in the traces
+	/// model only, because hiding is not sound in `F` or `FD`.
 	pub fn project(&self, trace: impl AsRef<[Event]>) -> Vec<Event> {
 		let trace = trace.as_ref();
 		trace.iter().filter(|event| self.observable.contains(event)).copied().collect()
@@ -374,6 +407,40 @@ impl Process {
 	#[cfg(feature = "testing-timing")]
 	pub(crate) fn has_timed_transitions(&self) -> bool {
 		self.timed_transitions.as_ref().is_some_and(|table| !table.is_empty())
+	}
+
+	/// The clock readings when a run starts: each clock that a guard or a
+	/// reset of this process names reads zero.
+	///
+	/// A run of a timed automaton starts with every clock at zero (R. Alur and
+	/// D.L. Dill, "A theory of timed automata", Theoretical Computer Science
+	/// 126, 1994), and a reset sets a clock back to zero.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use core::time::Duration;
+	///
+	/// use tightbeam::testing::specs::csp::{Event, Process, State};
+	/// use tightbeam::testing::timing::TimingGuard;
+	///
+	/// let guard = TimingGuard::ClockLessEqual("clk".to_string(), Duration::from_millis(5));
+	/// let process = Process::builder("Guarded")
+	///     .initial_state(State("S0"))
+	///     .clock("clk")
+	///     .add_observable(Event("arm"))
+	///     .add_timed_transition(State("S0"), Event("arm"), State("S1"), Some(guard), Vec::new())
+	///     .build()?;
+	///
+	/// assert_eq!(process.initial_clocks().get("clk"), Some(&Duration::ZERO));
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	#[cfg(feature = "testing-timing")]
+	pub fn initial_clocks(&self) -> HashMap<String, Duration> {
+		let edges = self.timed_transitions.iter().flat_map(HashMap::values).flatten();
+		let named = edges.flat_map(TimedTransition::clocks);
+
+		named.map(|clock| (clock.to_string(), Duration::ZERO)).collect()
 	}
 
 	/// The edges that `event` takes from `state` while the clocks read
@@ -576,58 +643,6 @@ impl Process {
 		graph.divergent_states()
 	}
 
-	/// A digest of the LTS structure: the initial state, the sorted states,
-	/// the terminals, the choice points, the alphabets, and the triples of the
-	/// untimed and the timed transitions.
-	///
-	/// - Two processes with identical structure share a digest, and two that
-	///   differ share one only on a 64-bit hash collision. The digest is
-	///   therefore a memoization key where `name` is not, because algebra
-	///   operators such as `hide` and `rename` give the same name to
-	///   structurally different results.
-	/// - The digest is stable only within one Rust release, because the
-	///   standard library leaves the algorithm of `DefaultHasher` unspecified
-	///   across releases. Do not persist it.
-	pub fn structure_digest(&self) -> u64 {
-		use core::hash::{Hash, Hasher};
-		use std::collections::hash_map::DefaultHasher;
-
-		fn sorted_names<'a, I>(items: I) -> Vec<&'a str>
-		where
-			I: Iterator<Item = &'a str>,
-		{
-			let mut names: Vec<&str> = items.collect();
-			names.sort_unstable();
-			names
-		}
-
-		let mut hasher = DefaultHasher::new();
-		self.initial.0.hash(&mut hasher);
-
-		sorted_names(self.states.iter().map(|s| s.0)).hash(&mut hasher);
-		sorted_names(self.terminal.iter().map(|s| s.0)).hash(&mut hasher);
-		sorted_names(self.choice.iter().map(|s| s.0)).hash(&mut hasher);
-		sorted_names(self.observable.iter().map(|e| e.0)).hash(&mut hasher);
-		sorted_names(self.hidden.iter().map(|e| e.0)).hash(&mut hasher);
-
-		let untimed = self.transitions.iter();
-		let untimed = untimed.flat_map(|(key, targets)| targets.iter().map(move |to| (key, *to)));
-
-		#[cfg(feature = "testing-timing")]
-		let timed = self.timed_transitions.iter().flatten();
-		#[cfg(feature = "testing-timing")]
-		let timed = timed.flat_map(|(key, edges)| edges.iter().map(move |edge| (key, edge.to)));
-		#[cfg(not(feature = "testing-timing"))]
-		let timed = core::iter::empty();
-
-		let edges = untimed.chain(timed);
-		let mut triples: Vec<(&str, &str, &str)> = edges.map(|((from, event), to)| (from.0, event.0, to.0)).collect();
-		triples.sort_unstable();
-		triples.hash(&mut hasher);
-
-		hasher.finish()
-	}
-
 	/// Builds the [`TaskSet`] of the timing constraints and the schedulability
 	/// periods.
 	///
@@ -650,6 +665,46 @@ impl Process {
 		let task_set = timing.to_task_set(periods, *scheduler)?;
 
 		Ok(Some(task_set))
+	}
+}
+
+#[cfg(feature = "testing-fdr")]
+impl Process {
+	/// The structure of this process that a search of its traces, failures,
+	/// and divergences reads.
+	///
+	/// Two processes with equal structures have the same sets at each depth
+	/// bound, so the memoization cache of the refinement check keys on it.
+	pub(crate) fn search_structure(&self) -> SearchStructure {
+		/// The members of `set`, sorted.
+		fn sorted<T: Copy + Ord>(set: &HashSet<T>) -> Vec<T> {
+			let mut members: Vec<T> = set.iter().copied().collect();
+			members.sort_unstable();
+			members
+		}
+
+		let untimed = self.transitions.iter();
+		let untimed = untimed.flat_map(|((from, event), targets)| targets.iter().map(move |to| (*from, *event, *to)));
+
+		#[cfg(feature = "testing-timing")]
+		let timed = self.timed_transitions.iter().flatten();
+		#[cfg(feature = "testing-timing")]
+		let timed = timed.flat_map(|((from, event), edges)| edges.iter().map(move |edge| (*from, *event, edge.to)));
+		#[cfg(not(feature = "testing-timing"))]
+		let timed = core::iter::empty();
+
+		let mut transitions: Vec<(State, Event, State)> = untimed.chain(timed).collect();
+		transitions.sort_unstable();
+
+		SearchStructure {
+			initial: self.initial,
+			states: sorted(&self.states),
+			terminal: sorted(&self.terminal),
+			choice: sorted(&self.choice),
+			observable: sorted(&self.observable),
+			hidden: sorted(&self.hidden),
+			transitions,
+		}
 	}
 }
 
@@ -809,7 +864,8 @@ impl HiddenGraph {
 		graph
 	}
 
-	/// The index of `state` in `states`, which `state` joins when it is new.
+	/// The index of `state` in `states`, which `state` joins on its first
+	/// visit.
 	fn index_of(&mut self, index: &mut HashMap<State, usize>, state: State) -> usize {
 		let next = self.states.len();
 		let at = *index.entry(state).or_insert(next);
@@ -854,7 +910,7 @@ impl HiddenGraph {
 			}
 		}
 
-		// 3. The steps name their states.
+		// 3. Each chosen step trades the indices of its states for their names.
 		let indexed = chosen.into_iter().enumerate();
 		let named = indexed.filter_map(|(from, step)| self.named(from, step?));
 		DivergentStates { steps: named.collect() }
@@ -907,7 +963,7 @@ struct Tarjan {
 	order: Vec<Option<usize>>,
 	/// The lowest order that each state reaches through the states on `open`.
 	low: Vec<usize>,
-	/// The reached states whose component is still open, in the order reached.
+	/// The reached states whose component is open, in the order reached.
 	open: Vec<usize>,
 	/// Whether each state is on `open`.
 	on_open: Vec<bool>,
@@ -1029,9 +1085,10 @@ impl Tarjan {
 	}
 }
 
-/// A CSP process specification that a trace can be validated against.
+/// A CSP process specification that checks a recorded trace.
 pub trait ProcessSpec {
-	/// Validates a trace against this process specification.
+	/// Checks `trace` against this process specification, and returns each
+	/// violation.
 	fn validate_trace(&self, trace: &ConsumedTrace) -> CspValidationResult;
 
 	/// Returns the [`Process`] that FDR exploration walks.
@@ -1079,10 +1136,9 @@ impl Process {
 			let closure = self.tau_closure(&current_states);
 			let action = Action { event: *event, alphabet: Alphabet::Observable };
 
-			// The run has terminated when every candidate is a true STOP, a
-			// terminal state with no enabled action. An accepting state that
-			// still offers a transition (a cyclic `terminal { Idle }` model)
-			// stays live.
+			// The run has terminated when every candidate is a STOP, a terminal
+			// state with no enabled action. An accepting state that enables an
+			// action stays live, as in a cyclic `terminal { Idle }` model.
 			if closure
 				.iter()
 				.all(|state| self.is_terminal(*state) && self.enabled(*state).is_empty())
@@ -1094,8 +1150,6 @@ impl Process {
 				continue;
 			}
 
-			// Each candidate that enables the event steps on it, so the check
-			// follows every branch of a choice at once.
 			let mut seen = HashSet::new();
 			let mut next_states = Vec::new();
 			for state in closure.iter().filter(|state| self.enabled(**state).contains(&action)) {
@@ -1189,11 +1243,19 @@ impl ProcessSpec for Process {
 }
 
 /// An error that [`ProcessBuilder::build`] returns for a [`Process`].
-#[derive(Errorizable, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Errorizable, Debug, Clone, PartialEq, Eq)]
 pub enum ProcessBuildError {
 	/// No call to [`ProcessBuilder::initial_state`] set the initial state.
 	#[error("initial state not set")]
 	MissingInitialState,
+
+	/// A guard or a reset names a clock that no call to
+	/// [`ProcessBuilder::clock`] declares.
+	#[error("the clock {clock} is not declared")]
+	UndeclaredClock {
+		/// The name of the undeclared clock.
+		clock: String,
+	},
 }
 
 /// The builder of a CSP [`Process`].
@@ -1213,6 +1275,8 @@ pub struct ProcessBuilder {
 	timing_constraints: Option<TimingConstraints>,
 	#[cfg(feature = "testing-timing")]
 	timed_transitions: Option<HashMap<(State, Event), Vec<TimedTransition>>>,
+	#[cfg(feature = "testing-timing")]
+	clocks: HashSet<String>,
 	#[cfg(feature = "testing-schedulability")]
 	schedulability_periods: Option<(SchedulerType, HashMap<Event, Duration>)>,
 }
@@ -1234,6 +1298,8 @@ impl ProcessBuilder {
 			timing_constraints: None,
 			#[cfg(feature = "testing-timing")]
 			timed_transitions: None,
+			#[cfg(feature = "testing-timing")]
+			clocks: HashSet::new(),
 			#[cfg(feature = "testing-schedulability")]
 			schedulability_periods: None,
 		}
@@ -1299,15 +1365,12 @@ impl ProcessBuilder {
 		self
 	}
 
-	/// Adds a transition that `guard` enables, and that resets `reset_clocks`
-	/// when it is taken.
+	/// Declares the clock `name`, which a guard or a reset of this process may
+	/// name.
 	///
-	/// Where the guard binds depends on the check:
-	///
-	/// - [`Process::enabled`] and [`Process::step`] offer `event` at `from` whatever the clocks read.
-	/// - The CSP trace check and the refinement checks ignore the clocks and accept the event at any time.
-	/// - FDR exploration takes the transition only when the clocks satisfy the guard.
-	/// - Exploration starts each clock unset, and a guard on an unset clock does not hold.
+	/// [`Self::build`] refuses a guard or a reset that names a clock with no
+	/// declaration, so a misspelt clock name fails the build. A run starts
+	/// each clock at zero, as [`Process::initial_clocks`] states.
 	///
 	/// # Examples
 	///
@@ -1320,6 +1383,45 @@ impl ProcessBuilder {
 	/// let guard = TimingGuard::ClockLessEqual("clk".to_string(), Duration::from_millis(5));
 	/// let process = Process::builder("Guarded")
 	///     .initial_state(State("S0"))
+	///     .clock("clk")
+	///     .add_observable(Event("arm"))
+	///     .add_timed_transition(State("S0"), Event("arm"), State("S1"), Some(guard), Vec::new())
+	///     .build()?;
+	///
+	/// assert_eq!(process.initial_clocks().len(), 1);
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	#[cfg(feature = "testing-timing")]
+	pub fn clock(mut self, name: impl Into<String>) -> Self {
+		self.clocks.insert(name.into());
+		self
+	}
+
+	/// Adds a transition that `guard` enables, and that resets `reset_clocks`
+	/// when a run takes it.
+	///
+	/// Where the guard binds depends on the check:
+	///
+	/// - [`Process::enabled`] and [`Process::step`] offer `event` at `from` whatever the clocks read.
+	/// - The CSP trace check and the refinement checks ignore the clocks and accept the event at any time.
+	/// - FDR exploration takes the transition only when the clocks satisfy the guard.
+	/// - Exploration starts each clock at zero, as [`Process::initial_clocks`] states.
+	///
+	/// Each clock that `guard` or `reset_clocks` names needs a [`Self::clock`]
+	/// declaration, or [`Self::build`] refuses the process.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use core::time::Duration;
+	///
+	/// use tightbeam::testing::specs::csp::{Event, Process, State};
+	/// use tightbeam::testing::timing::TimingGuard;
+	///
+	/// let guard = TimingGuard::ClockLessEqual("clk".to_string(), Duration::from_millis(5));
+	/// let process = Process::builder("Guarded")
+	///     .initial_state(State("S0"))
+	///     .clock("clk")
 	///     .add_observable(Event("arm"))
 	///     .add_timed_transition(State("S0"), Event("arm"), State("S1"), Some(guard), ["clk".to_string()])
 	///     .build()?;
@@ -1331,11 +1433,12 @@ impl ProcessBuilder {
 	pub fn add_timed_transition(
 		mut self,
 		from: State,
-		event: Event,
+		event: impl Into<Event>,
 		to: State,
 		guard: Option<TimingGuard>,
 		reset_clocks: impl IntoIterator<Item = String>,
 	) -> Self {
+		let event = event.into();
 		let reset_clocks: Vec<String> = reset_clocks.into_iter().collect();
 		self = self.add_state(from).add_state(to);
 		if self.timed_transitions.is_none() {
@@ -1377,6 +1480,10 @@ impl ProcessBuilder {
 
 	pub fn build(self) -> Result<Process, ProcessBuildError> {
 		let initial = self.initial.ok_or(ProcessBuildError::MissingInitialState)?;
+		#[cfg(feature = "testing-timing")]
+		if let Some(clock) = self.undeclared_clock() {
+			return Err(ProcessBuildError::UndeclaredClock { clock: clock.to_string() });
+		}
 
 		Ok(Process {
 			name: self.name,
@@ -1398,6 +1505,16 @@ impl ProcessBuilder {
 			schedulability_periods: self.schedulability_periods,
 		})
 	}
+
+	/// The first clock, in name order, that a timed transition names and no
+	/// call to [`Self::clock`] declares.
+	#[cfg(feature = "testing-timing")]
+	fn undeclared_clock(&self) -> Option<&str> {
+		let edges = self.timed_transitions.iter().flat_map(HashMap::values).flatten();
+		let named = edges.flat_map(TimedTransition::clocks);
+
+		named.filter(|clock| !self.clocks.contains(*clock)).min()
+	}
 }
 
 #[cfg(test)]
@@ -1418,6 +1535,9 @@ mod tests {
 
 	#[cfg(all(feature = "tcp", feature = "tokio"))]
 	use crate::{exactly, servlet, tb_assert_spec, tb_process_spec, tb_scenario};
+
+	#[cfg(feature = "testing-timing")]
+	const ARM: Urn<'static> = crate::urn!("test", "event:csp/arm");
 
 	/// A spec that models `start` and `send` as observable and `prepare` as
 	/// hidden, and leaves every other event out of both alphabets.
@@ -1680,31 +1800,71 @@ mod tests {
 
 	#[cfg(feature = "testing-timing")]
 	#[test]
-	fn the_structure_digest_covers_a_timed_transition() -> Result<(), ProcessBuildError> {
-		let without = Process::builder("Digest")
-			.initial_state(State("S0"))
-			.add_state(State("S1"))
-			.add_observable(Event("arm"))
-			.build()?;
-		let with = Process::builder("Digest")
-			.initial_state(State("S0"))
-			.add_observable(Event("arm"))
-			.add_timed_transition(State("S0"), Event("arm"), State("S1"), None, Vec::new())
-			.build()?;
-
-		assert_ne!(without.structure_digest(), with.structure_digest());
-		Ok(())
-	}
-
-	#[cfg(feature = "testing-timing")]
-	#[test]
 	fn a_timed_transition_adds_its_states() -> Result<(), ProcessBuildError> {
 		let process = Process::builder("States")
 			.initial_state(State("S0"))
 			.add_timed_transition(State("S1"), Event("arm"), State("S2"), None, Vec::new())
 			.build()?;
-
 		assert_eq!(process.states, HashSet::from([State("S0"), State("S1"), State("S2")]));
+		Ok(())
+	}
+
+	/// A process that declares the clock `declared`, in which `arm` takes
+	/// `S0` to `S1` while `clk` reads at most 5 ms, and `fire` takes `S1`
+	/// back to `S0` and resets the clock `reset`.
+	#[cfg(feature = "testing-timing")]
+	fn clocked(declared: &str, reset: &str) -> Result<Process, ProcessBuildError> {
+		let guard = TimingGuard::ClockLessEqual("clk".to_string(), Duration::from_millis(5));
+		Process::builder("Clocked")
+			.initial_state(State("S0"))
+			.clock(declared)
+			.add_observable(Event("arm"))
+			.add_observable(Event("fire"))
+			.add_timed_transition(State("S0"), Event("arm"), State("S1"), Some(guard), Vec::new())
+			.add_timed_transition(State("S1"), Event("fire"), State("S0"), None, [reset.to_string()])
+			.build()
+	}
+
+	#[cfg(feature = "testing-timing")]
+	#[test]
+	fn a_guard_on_an_undeclared_clock_is_refused() -> Result<(), Box<dyn core::error::Error>> {
+		let refused = clocked("other", "other");
+		assert_eq!(
+			refused.err(),
+			Some(ProcessBuildError::UndeclaredClock { clock: "clk".to_string() })
+		);
+		Ok(())
+	}
+
+	#[cfg(feature = "testing-timing")]
+	#[test]
+	fn a_misspelt_reset_is_refused() -> Result<(), Box<dyn core::error::Error>> {
+		let refused = clocked("clk", "clck");
+		assert_eq!(
+			refused.err(),
+			Some(ProcessBuildError::UndeclaredClock { clock: "clck".to_string() })
+		);
+		Ok(())
+	}
+
+	#[cfg(feature = "testing-timing")]
+	#[test]
+	fn every_clock_that_a_process_names_starts_at_zero() -> Result<(), Box<dyn core::error::Error>> {
+		let process = clocked("clk", "clk")?;
+		let clocks = process.initial_clocks();
+		assert_eq!(clocks, HashMap::from([("clk".to_string(), Duration::ZERO)]));
+		Ok(())
+	}
+
+	#[cfg(feature = "testing-timing")]
+	#[test]
+	fn a_timed_transition_takes_an_event_in_any_form() -> Result<(), Box<dyn core::error::Error>> {
+		let process = Process::builder("Urn")
+			.initial_state(State("S0"))
+			.add_observable(ARM)
+			.add_timed_transition(State("S0"), ARM, State("S1"), None, Vec::new())
+			.build()?;
+		assert_eq!(process.step(State("S0"), &Event::from(ARM)), [State("S1")]);
 		Ok(())
 	}
 
@@ -1790,12 +1950,12 @@ mod tests {
 
 		let proc = ComprehensiveHandshake::process();
 
-		// 1. Basic process properties.
+		// 1. The name, the description, and the initial state.
 		assert_eq!(proc.name, "ComprehensiveHandshake");
 		assert_eq!(proc.description, Some("Comprehensive handshake with queued or direct send"));
 		assert_eq!(proc.initial, State("S0"));
 
-		// 2. State space.
+		// 2. The state space.
 		assert_eq!(proc.states.len(), 9); // S0, S1, S1s, S1e, S1q, S1d, S2, S3, S3f
 		assert!(proc.states.contains(&State("S0")));
 		assert!(proc.states.contains(&State("S1")));
@@ -1807,30 +1967,30 @@ mod tests {
 		assert!(proc.states.contains(&State("S3")));
 		assert!(proc.states.contains(&State("S3f")));
 
-		// 3. Observable alphabet (Σ).
+		// 3. The observable alphabet (Σ).
 		assert_eq!(proc.observable_alphabet().len(), 4);
 		assert!(proc.observable_alphabet().contains(&Event("start")));
 		assert!(proc.observable_alphabet().contains(&Event("send")));
 		assert!(proc.observable_alphabet().contains(&Event("ack")));
 		assert!(proc.observable_alphabet().contains(&Event("fail")));
 
-		// 4. Hidden alphabet (τ).
+		// 4. The hidden alphabet (τ).
 		assert_eq!(proc.hidden_alphabet().len(), 4);
 		assert!(proc.hidden_alphabet().contains(&Event("serialize")));
 		assert!(proc.hidden_alphabet().contains(&Event("encrypt")));
 		assert!(proc.hidden_alphabet().contains(&Event("queue")));
 		assert!(proc.hidden_alphabet().contains(&Event("dispatch")));
 
-		// 5. Terminal states (STOP).
+		// 5. The terminal states (STOP).
 		assert_eq!(proc.terminal.len(), 2);
 		assert!(proc.is_terminal(State("S3"))); // S3 is the success STOP.
 		assert!(proc.is_terminal(State("S3f"))); // S3f is the failure STOP.
 
-		// 6. Nondeterministic choice points (⊓).
+		// 6. The nondeterministic choice points (⊓).
 		assert_eq!(proc.choice.len(), 1);
 		assert!(proc.is_choice(State("S1"))); // S1 chooses serialize or queue
 
-		// 7. Transition relation: observable transitions.
+		// 7. The observable transitions of the transition relation.
 		let s0_start = proc.step(State("S0"), &Event("start"));
 		assert_eq!(s0_start.len(), 1);
 		assert_eq!(s0_start[0], State("S1"));
@@ -1851,7 +2011,7 @@ mod tests {
 		assert_eq!(s2_fail.len(), 1);
 		assert_eq!(s2_fail[0], State("S3f"));
 
-		// 8. Transition relation: hidden (τ) transitions.
+		// 8. The hidden (τ) transitions of the transition relation.
 		let s1_serialize = proc.step(State("S1"), &Event("serialize"));
 		assert_eq!(s1_serialize.len(), 1);
 		assert_eq!(s1_serialize[0], State("S1s"));
@@ -1868,7 +2028,7 @@ mod tests {
 		assert_eq!(s1q_dispatch.len(), 1);
 		assert_eq!(s1q_dispatch[0], State("S1d"));
 
-		// 9. Enabled actions at each state.
+		// 9. The enabled actions at each state.
 		// S0 enables only the observable `start`.
 		let s0_enabled = proc.enabled(State("S0"));
 		assert_eq!(s0_enabled.len(), 1);
@@ -1890,7 +2050,7 @@ mod tests {
 		let s3_enabled = proc.enabled(State("S3"));
 		assert_eq!(s3_enabled.len(), 0);
 
-		// 10. Trace execution: success path (direct).
+		// 10. A trace along the direct success path.
 		let mut current = proc.initial;
 
 		current = proc.step(current, &Event("start"))[0];
@@ -1910,7 +2070,7 @@ mod tests {
 		assert_eq!(current, State("S3"));
 		assert!(proc.is_terminal(current));
 
-		// 11. Trace execution: success path (queued).
+		// 11. A trace along the queued success path.
 		let mut current = proc.initial;
 
 		current = proc.step(current, &Event("start"))[0];
@@ -1929,7 +2089,7 @@ mod tests {
 		assert_eq!(current, State("S3"));
 		assert!(proc.is_terminal(current));
 
-		// 12. Trace execution: failure path.
+		// 12. A trace along the failure path.
 		let mut current = proc.initial;
 
 		current = proc.step(current, &Event("start"))[0];

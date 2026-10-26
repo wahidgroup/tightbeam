@@ -49,12 +49,6 @@ use crate::security::common::{
 
 pub(crate) const CONF_CAPTURE_HANDSHAKE: Urn<'static> =
 	tightbeam::urn!("test", "event:confidentiality/conf-capture-handshake");
-pub(crate) const CONF_CIPHERTEXTS_DIFFER: Urn<'static> =
-	tightbeam::urn!("test", "event:confidentiality/conf-ciphertexts-differ");
-pub(crate) const CONF_SEALED_UNDER_KEK: Urn<'static> =
-	tightbeam::urn!("test", "event:confidentiality/conf-sealed-under-kek");
-pub(crate) const CONF_STATIC_KEY_OPENS_NOTHING: Urn<'static> =
-	tightbeam::urn!("test", "event:confidentiality/conf-static-key-opens-nothing");
 
 /// The DER of the message at `step` of a captured handshake.
 fn message_of(captured: &CapturedHandshake, step: usize) -> Result<&[u8], TightBeamError> {
@@ -76,10 +70,7 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(CONF_CAPTURE_HANDSHAKE, exactly!(1u32)),
-			(CONF_SEALED_UNDER_KEK, exactly!(1u32), equals!(true)),
-			(CONF_STATIC_KEY_OPENS_NOTHING, exactly!(1u32), equals!(true)),
-			(CONF_CIPHERTEXTS_DIFFER, exactly!(1u32), equals!(true))
+			(CONF_CAPTURE_HANDSHAKE, exactly!(2u32))
 		]
 	}
 }
@@ -89,9 +80,6 @@ tb_process_spec! {
 	events {
 		observable {
 			CONF_CAPTURE_HANDSHAKE,
-			CONF_SEALED_UNDER_KEK,
-			CONF_STATIC_KEY_OPENS_NOTHING,
-			CONF_CIPHERTEXTS_DIFFER,
 			SecurityThreatHarness::HARNESS_SPAWN_SESSION,
 			SecurityThreatHarness::HARNESS_SPAWN_HPKE
 		}
@@ -100,15 +88,10 @@ tb_process_spec! {
 	states {
 		Idle => { SecurityThreatHarness::HARNESS_SPAWN_SESSION => Spawning },
 		Spawning => { SecurityThreatHarness::HARNESS_SPAWN_HPKE => SessionReady },
-		SessionReady => {
-			CONF_CAPTURE_HANDSHAKE => Captured,
-			CONF_CIPHERTEXTS_DIFFER => Idle
-		},
-		Captured => { CONF_SEALED_UNDER_KEK => Sealed },
-		Sealed => { CONF_STATIC_KEY_OPENS_NOTHING => StaticKeyRefused },
-		StaticKeyRefused => { SecurityThreatHarness::HARNESS_SPAWN_SESSION => Spawning }
+		SessionReady => { CONF_CAPTURE_HANDSHAKE => Captured },
+		Captured => { SecurityThreatHarness::HARNESS_SPAWN_SESSION => Spawning }
 	}
-	terminal { Idle }
+	terminal { Captured }
 	annotations { description: "Confidentiality: the HPKE closing opens under no key the server's static key yields" }
 }
 
@@ -139,15 +122,14 @@ job! {
 
 		trace.event(CONF_CAPTURE_HANDSHAKE)?;
 
-		// Step 2: The closing is sealed under a key both endpoints derive, and
-		// to no server key.
+		// Step 2: The client seals the closing under a key both endpoints
+		// derive, and to no server key.
 		let closing = message_of(&captured, 2)?;
-		trace.event_with(CONF_SEALED_UNDER_KEK, &[], sealed_under_kek(closing)?)?;
+		assert!(sealed_under_kek(closing)?, "the closing names a recipient other than one KEKRecipientInfo");
 
-		// Step 3: The server's static key, with the hello and the reply, yields
-		// no closing key. Each candidate passes the key identifier and fails
-		// the integrity check of the key wrap, so the observer reached the
-		// recipient and lacked its key.
+		// Step 3: Each closing key from the server's static key, the hello, and
+		// the reply passes the key identifier and fails the key-wrap integrity
+		// check, so the observer reaches the recipient and lacks its key.
 		let static_key = harness.materials().secret_key();
 		let (hello, reply) = (message_of(&captured, 0)?, message_of(&captured, 1)?);
 		let observer = StaticKeyObserver::new(hello, reply, closing, static_key)?;
@@ -155,15 +137,17 @@ job! {
 		let unwrap_refused = attempts.iter().all(|attempt| matches!(attempt, Err(EnvelopeError::KeyUnwrap)));
 		let refused = attempts.len() == STATIC_KEY_CANDIDATES && unwrap_refused;
 
-		trace.event_with(CONF_STATIC_KEY_OPENS_NOTHING, &[], refused)?;
+		assert!(refused, "a closing key that the server's static key yields opened the closing");
 
 		// Step 4: Two handshakes seal two closings, each under a fresh content
 		// key and nonce.
 		let mut session2 = harness.spawn(kind)?;
 		let captured2 = session2.capture_full().await?;
-		let closing2 = message_of(&captured2, 2)?;
 
-		trace.event_with(CONF_CIPHERTEXTS_DIFFER, &[], closing != closing2)?;
+		trace.event(CONF_CAPTURE_HANDSHAKE)?;
+
+		let closing2 = message_of(&captured2, 2)?;
+		assert_ne!(closing, closing2, "two handshakes sealed byte-equal closings");
 
 		Ok(())
 	}
@@ -171,7 +155,7 @@ job! {
 
 /// The observer's closing key over `ee` = `0x11` × 32 and the salt `0x99` ×
 /// 32 matches an independent HKDF-SHA3-256 (Python's `hmac` and `hashlib`).
-/// Its handshake secret on the way is the crate's known answer of the
+/// Its intermediate handshake secret is the crate's known answer of the
 /// ephemeral handshake secret, so the observer runs the flow's own schedule.
 #[test]
 fn the_observer_closing_key_matches_its_known_answer() -> Result<(), TightBeamError> {

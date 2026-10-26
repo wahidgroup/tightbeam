@@ -29,9 +29,9 @@
 //!
 //! **Open** ([`HpkeSecretKeyOps::open`]) computes `dh = DH(skR, pkE)`, runs
 //! steps 3 and 4, and opens `ct` with `AEAD.Open`. [`EcdhSecret::open`] starts
-//! from a `dh` that a key provider computed.
+//! from a `dh` that a key provider computes.
 //!
-//! Every derivation is labeled with `"HPKE-v1"` and a `suite_id`
+//! Every derivation carries the label `"HPKE-v1"` and a `suite_id`
 //! ([RFC 9180 §4][rfc9180-4]). The KEM binds its own identifier, and the key
 //! schedule binds all three, so two suites derive unrelated keys from one `dh`.
 //!
@@ -191,8 +191,8 @@ pub trait HpkeKdf {
 ///
 /// The pseudorandom key, each output block, and each input that the hash
 /// buffers wipe on drop. The SHA-256 core of `sha2` 0.10.9 holds its
-/// chaining state in plain words with private fields, so that state drops as
-/// it is.
+/// chaining state in plain words with private fields, so that state drops
+/// unwiped.
 ///
 /// [rfc5869]: https://datatracker.ietf.org/doc/html/rfc5869
 pub struct HkdfSha256;
@@ -274,7 +274,7 @@ pub trait DhKemCurve:
 	+ Curve<FieldBytesSize: ModulusSize>
 	+ CurveArithmetic<AffinePoint: FromEncodedPoint<Self> + ToEncodedPoint<Self>>
 {
-	/// Parse `enc`, an encapsulated key, which is the uncompressed SEC 1 form
+	/// Parses `enc`, an encapsulated key, which is the uncompressed SEC 1 form
 	/// of a point on this curve, `Nenc` bytes (`DeserializePublicKey`,
 	/// [RFC 9180 §7.1.1][rfc9180-7.1.1]).
 	///
@@ -394,15 +394,15 @@ pub enum HpkeError {
 	#[error("Invalid HPKE secret key: {0}")]
 	InvalidSecretKey(crate::crypto::k256::elliptic_curve::Error),
 
-	/// The AEAD failed to seal.
+	/// The AEAD fails to seal.
 	#[error("HPKE seal failed: {0}")]
 	EncryptionFailed(crate::crypto::aead::Error),
 
-	/// The AEAD failed to open or to verify the tag.
+	/// The AEAD fails to open the message or to verify the tag.
 	#[error("HPKE open failed: {0}")]
 	DecryptionFailed(crate::crypto::aead::Error),
 
-	/// A KDF refused a derivation, or the AEAD refused the derived key.
+	/// A KDF refuses a derivation, or the AEAD refuses the derived key.
 	#[error("HPKE key derivation failed: {0}")]
 	Kdf(KdfError),
 }
@@ -414,9 +414,9 @@ pub type Result<T> = core::result::Result<T, HpkeError>;
 
 /// The labeled derivations of one scope ([RFC 9180 §4][rfc9180-4]).
 ///
-/// Each derivation binds the `suite_id` of its scope, so the KEM and the key
-/// schedule of one suite are separated from each other and from every other
-/// suite.
+/// Each derivation binds the `suite_id` of its scope, so the `suite_id`
+/// separates the KEM and the key schedule of one suite from each other and
+/// from every other suite.
 ///
 /// [rfc9180-4]: https://datatracker.ietf.org/doc/html/rfc9180#section-4
 struct Labeled<K> {
@@ -466,7 +466,7 @@ impl<K: HpkeKdf> Labeled<K> {
 		let okm = K::expand(prk, &labeled_info, len)?;
 
 		// The length is the geometry of the cipher or of the KEM, so a KDF
-		// that returns another length fails here rather than at the cipher.
+		// that returns another length fails here, before the cipher reads it.
 		if okm.len() != len {
 			return Err(HpkeError::Kdf(KdfError::DerivationFailed(InvalidLength)));
 		}
@@ -552,7 +552,7 @@ pub struct HpkeMessage<S: HpkeSuite> {
 }
 
 impl<S: HpkeSuite> HpkeMessage<S> {
-	/// Parse a message from its encoding, `enc || ct`, where `enc` takes the
+	/// Parses a message from its encoding, `enc || ct`, where `enc` takes the
 	/// `Nenc` bytes of the curve of `S` ([`DhKemCurve`]).
 	///
 	/// # Errors
@@ -594,7 +594,7 @@ impl<S: HpkeSuite> HpkeMessage<S> {
 		Ok(Self { encapsulated_key, ciphertext: ciphertext.to_vec() })
 	}
 
-	/// Encode the message as `enc || ct`.
+	/// Encodes the message as `enc || ct`.
 	pub fn to_bytes(&self) -> Vec<u8> {
 		let enc = self.encapsulated_key.to_encoded_point(false);
 		[enc.as_bytes(), &self.ciphertext].concat()
@@ -614,7 +614,7 @@ impl<S: HpkeSuite> HpkeMessage<S> {
 		&self.ciphertext
 	}
 
-	/// Seal `plaintext` to `recipient` under `ephemeral` (`Encap`, then
+	/// Seals `plaintext` to `recipient` under `ephemeral` (`Encap`, then
 	/// `Seal` at sequence number zero).
 	///
 	/// This function takes the ephemeral by value and drops it, so it serves
@@ -645,11 +645,11 @@ pub trait HpkePublicKeyOps {
 	/// The curve of this key.
 	type Curve;
 
-	/// Seal `plaintext` to this key under a fresh ephemeral (`SealBase`,
+	/// Seals `plaintext` to this key under a fresh ephemeral (`SealBase`,
 	/// [RFC 9180 §6.1][rfc9180-6.1]).
 	///
-	/// - `info`: application context that the key schedule binds.
-	/// - `aad`: associated data that the AEAD authenticates and leaves in the clear.
+	/// - `info`: the application context that the key schedule binds.
+	/// - `aad`: the associated data that the AEAD authenticates and leaves in the clear.
 	/// - `rng`: the cryptographically secure RNG that draws the ephemeral. `None` uses [`OsRng`].
 	///
 	/// The ephemeral fixes the key and the nonce, so an RNG that repeats its
@@ -657,8 +657,8 @@ pub trait HpkePublicKeyOps {
 	///
 	/// # Errors
 	///
-	/// - [`HpkeError::Kdf`] -- a KDF refused a derivation, or the AEAD refused the derived key.
-	/// - [`HpkeError::EncryptionFailed`] -- the AEAD refused the plaintext.
+	/// - [`HpkeError::Kdf`] -- a KDF refuses a derivation, or the AEAD refuses the derived key.
+	/// - [`HpkeError::EncryptionFailed`] -- the AEAD refuses the plaintext.
 	///
 	/// [rfc9180-6.1]: https://datatracker.ietf.org/doc/html/rfc9180#section-6.1
 	fn seal<S>(
@@ -700,7 +700,7 @@ pub trait HpkeSecretKeyOps {
 	/// The curve of this key.
 	type Curve;
 
-	/// Open `message` with this key as the recipient (`OpenBase`,
+	/// Opens `message` with this key as the recipient (`OpenBase`,
 	/// [RFC 9180 §6.1][rfc9180-6.1]).
 	///
 	/// `info` and `aad` MUST equal the values the sender sealed under.
@@ -767,7 +767,7 @@ where
 		labeled.expand(&eae_prk, b"shared_secret", &kem_context, K::EXTRACT_SIZE)
 	}
 
-	/// Open an HPKE `message` with this precomputed `DH(skR, pkE)` output.
+	/// Opens an HPKE `message` with this precomputed `DH(skR, pkE)` output.
 	///
 	/// This splits the DH step out of [`HpkeSecretKeyOps::open`], so the
 	/// recipient private key can live behind an external boundary such as an
@@ -782,8 +782,8 @@ where
 	///
 	/// # Errors
 	///
-	/// - [`HpkeError::Kdf`] -- a KDF refused a derivation, or the AEAD refused the derived key.
-	/// - [`HpkeError::DecryptionFailed`] -- the AEAD refused the ciphertext.
+	/// - [`HpkeError::Kdf`] -- a KDF refuses a derivation, or the AEAD refuses the derived key.
+	/// - [`HpkeError::DecryptionFailed`] -- the AEAD refuses the ciphertext.
 	///
 	/// # Examples
 	///
@@ -848,7 +848,7 @@ where
 	/// [rfc9180-4.1]: https://datatracker.ietf.org/doc/html/rfc9180#section-4.1
 	pub const KEM_ID: u16 = KEM_ID;
 
-	/// `Encap(pkR)`: draw a fresh ephemeral, and return the shared secret
+	/// `Encap(pkR)`: draws a fresh ephemeral and returns the shared secret
 	/// beside `enc`, the public half of that ephemeral.
 	///
 	/// `rng` draws the ephemeral, and `None` draws it from the OS source. The
@@ -856,7 +856,7 @@ where
 	///
 	/// # Errors
 	///
-	/// - [`HpkeError::Kdf`] -- the KDF refused a derivation.
+	/// - [`HpkeError::Kdf`] -- the KDF refuses a derivation.
 	///
 	/// # Examples
 	///
@@ -895,14 +895,14 @@ where
 	}
 
 	/// `Decap(enc, skR)` from `dh`, the `DH(skR, pkE)` output that the holder
-	/// of the recipient key computed, so the key can stay behind a provider.
+	/// of the recipient key computes, so the key can stay behind a provider.
 	///
 	/// `recipient` is the public key that `encapsulated_key` encapsulates to,
 	/// which the KEM context binds.
 	///
 	/// # Errors
 	///
-	/// - [`HpkeError::Kdf`] -- the KDF refused a derivation.
+	/// - [`HpkeError::Kdf`] -- the KDF refuses a derivation.
 	///
 	/// # Examples
 	///
@@ -951,7 +951,7 @@ where
 	///
 	/// # Errors
 	///
-	/// - [`EnvelopeError::Kem`] -- the KEM failed a derivation.
+	/// - [`EnvelopeError::Kem`] -- the KEM fails a derivation.
 	///
 	/// # Examples
 	///
@@ -978,8 +978,8 @@ where
 	}
 
 	/// `Decap(kemct, skR)` through `key`, the backend that holds the private
-	/// half of `recipient`. This parses the point first, and then the backend
-	/// runs `DH(skR, pkE)`.
+	/// half of `recipient`. The function parses the point first, and then the
+	/// backend runs `DH(skR, pkE)`.
 	///
 	/// `C`, `K`, and `KEM_ID` together name one KEM, so an implementor pairs a
 	/// `KEM_ID` with the KDF its registration names, as `0x0016` names
@@ -988,9 +988,9 @@ where
 	/// # Errors
 	///
 	/// - [`EnvelopeError::KemPoint`] -- `kemct` is no uncompressed point on `C`.
-	/// - [`EnvelopeError::Key`] -- the backend failed the agreement.
+	/// - [`EnvelopeError::Key`] -- the backend fails the agreement.
 	/// - [`EnvelopeError::Kdf`] -- the agreement is not as wide as the field of `C`.
-	/// - [`EnvelopeError::Kem`] -- the KEM failed a derivation.
+	/// - [`EnvelopeError::Kem`] -- the KEM fails a derivation.
 	///
 	/// # Examples
 	///
@@ -1093,8 +1093,8 @@ impl core::convert::TryFrom<SecretSlice<u8>> for crate::crypto::k256::SecretKey 
 
 impl From<&crate::crypto::k256::SecretKey> for SecretSlice<u8> {
 	fn from(secret_key: &crate::crypto::k256::SecretKey) -> Self {
-		// The scalar leaves the key as a plain array, so this wipes it once the
-		// wiping buffer holds its copy (CWE-226).
+		// The scalar leaves the key as a plain array, so the conversion wipes
+		// the array once the wiping buffer holds its copy (CWE-226).
 		let mut scalar = secret_key.to_bytes();
 		let bytes = Secret::from(scalar.to_vec());
 		scalar.as_mut_slice().zeroize();
@@ -1149,7 +1149,7 @@ pub struct HpkeEncryptor<P: CryptoProvider> {
 
 #[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
 impl<P: CryptoProvider> HpkeEncryptor<P> {
-	/// Create an encryptor that seals to `recipient`, the recipient key and
+	/// Creates an encryptor that seals to `recipient`, the recipient key and
 	/// the `rid` that names it.
 	pub fn new(recipient: KemRecipient<P::Kem>) -> Self {
 		Self { recipient }
@@ -1189,7 +1189,7 @@ pub struct HpkeDecryptor<P: CryptoProvider> {
 
 #[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
 impl<P: CryptoProvider> HpkeDecryptor<P> {
-	/// Create a decryptor that opens through `holder`.
+	/// Creates a decryptor that opens through `holder`.
 	pub fn new(holder: impl KemKeyHolder<P::Kem> + 'static) -> Self {
 		Self { holder: Arc::new(holder) }
 	}
@@ -1262,9 +1262,9 @@ mod tests {
 
 	/// HKDF-SHA256 that answers a 12-byte request `LEN_SHIFT` bytes away from
 	/// it, as a faulty provider KDF does.
-	struct AlteredKdf<const KEM_SHIFT: u16, const LEN_SHIFT: i8>;
+	struct AlteredKdf<const LEN_SHIFT: i8>;
 
-	impl<const KEM_SHIFT: u16, const LEN_SHIFT: i8> HpkeKdf for AlteredKdf<KEM_SHIFT, LEN_SHIFT> {
+	impl<const LEN_SHIFT: i8> HpkeKdf for AlteredKdf<LEN_SHIFT> {
 		const KDF_ID: u16 = KDF_HKDF_SHA256;
 		const EXTRACT_SIZE: usize = 32;
 
@@ -1345,7 +1345,7 @@ mod tests {
 
 	/// What [`AES_256_GCM_VECTOR`] seals [`KNOWN_PLAINTEXT`] to under
 	/// [`KNOWN_AAD`], from an independent implementation of RFC 9180 that
-	/// reproduced both published vectors, and an independent AES-GCM.
+	/// reproduces both published vectors, and an independent AES-GCM.
 	const REGISTERED_CIPHERTEXT: &str = "e0080fb223a2a45fe65407abafefade00abf2e6b11b7428df396d117";
 
 	impl Vector {
@@ -1546,7 +1546,7 @@ mod tests {
 
 	/// The sealed bytes are the encapsulated key the vector publishes and the
 	/// ciphertext an independent AES-GCM produces under the derived key and
-	/// nonce, so the cipher is keyed and nonced as the schedule derived.
+	/// nonce, so the cipher runs on the key and the nonce the schedule derives.
 	#[test]
 	fn a_sealed_message_matches_its_known_answer() -> Result<()> {
 		let registered = AES_256_GCM_VECTOR.sealed::<RegisteredAes256>()?.to_bytes();
@@ -1571,7 +1571,7 @@ mod tests {
 	/// A KEM of RFC 9180 Table 2, by its identifier `ID` and its KDF `K`.
 	///
 	/// The key schedule reads the identifier of a KEM and the shared secret
-	/// it produced, and the Appendix A vectors publish both. Their KEMs run
+	/// it produces, and the Appendix A vectors publish both. Their KEMs run
 	/// on X25519, P-256, and P-521, so this type stands in for the KEM, and
 	/// [`RfcSuite`] names secp256k1 in place of its curve.
 	struct KemOf<const ID: u16, K>(PhantomData<K>);
@@ -1907,7 +1907,7 @@ mod tests {
 		Ok(())
 	}
 
-	/// What a recipient reads from a sealed message after `tamper` changed its
+	/// What a recipient reads from a sealed message after `tamper` changes its
 	/// encoding.
 	fn opened_after(tamper: fn(&mut Vec<u8>)) -> Result<SecretSlice<u8>> {
 		let (secret, public) = keypair();
@@ -2058,8 +2058,8 @@ mod tests {
 	/// alone.
 	#[test]
 	fn a_kdf_output_of_another_length_is_refused() {
-		type Overlong = DhKemSuite<Secp256k1, AlteredKdf<0, 1>, Aes256Gcm, KEM_DHKEM_SECP256K1_HKDF_SHA256>;
-		type Short = DhKemSuite<Secp256k1, AlteredKdf<0, -1>, Aes256Gcm, KEM_DHKEM_SECP256K1_HKDF_SHA256>;
+		type Overlong = DhKemSuite<Secp256k1, AlteredKdf<1>, Aes256Gcm, KEM_DHKEM_SECP256K1_HKDF_SHA256>;
+		type Short = DhKemSuite<Secp256k1, AlteredKdf<-1>, Aes256Gcm, KEM_DHKEM_SECP256K1_HKDF_SHA256>;
 		let (_, public) = keypair();
 
 		let overlong = public.seal::<Overlong>(INFO, b"", b"plaintext", None);
@@ -2084,7 +2084,7 @@ mod tests {
 		assert!(matches!(past_the_frame, Err(HpkeError::Kdf(_))));
 	}
 
-	/// Seal a fixed plaintext to `public` with the ephemeral drawn from
+	/// Seals a fixed plaintext to `public` with the ephemeral drawn from
 	/// `stream`.
 	fn sealed_from(public: &PublicKey<Secp256k1>, mut stream: SeededStream) -> Result<Vec<u8>> {
 		let sealed = public.seal::<Suite>(INFO, b"", b"seeded", Some(&mut stream))?;

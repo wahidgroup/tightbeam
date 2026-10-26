@@ -6,7 +6,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::constants::{SPLITMIX64_GAMMA, SPLITMIX64_MIX_1, SPLITMIX64_MIX_2};
-use crate::random::generate_nonce;
+use crate::random::{generate_nonce, placement_entropy};
 
 /// The pheromone signal one servlet instance carries into a balancing round.
 #[derive(Debug, Clone)]
@@ -14,10 +14,10 @@ pub struct InstanceMetrics {
 	/// The key that names the instance in the balancing round, which holds
 	/// the canonical instance-URN bytes. Balancers treat these bytes as opaque.
 	///
-	/// The key is owned on purpose. A borrowed key would put a lifetime
-	/// on the public [`LoadBalancer`] trait and every implementor.
-	/// Canonical instance-URN bytes are short, so the per-round copy is
-	/// bounded and cheaper than that API cost.
+	/// The key is owned because a borrowed key would put a lifetime on the
+	/// public [`LoadBalancer`] trait and every implementor. Canonical
+	/// instance-URN bytes are short, so the per-round copy is bounded and
+	/// cheaper than that API cost.
 	pub instance_key: Vec<u8>,
 	/// The stigmergic trail strength in `0..=`[`MAX_PHEROMONE`], where a
 	/// higher value is a stronger trail.
@@ -68,7 +68,18 @@ static BALANCER_SEED_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// balancer needs no secret.
 fn fresh_seed() -> u64 {
 	let sequence = BALANCER_SEED_SEQUENCE.fetch_add(SPLITMIX64_GAMMA, Ordering::Relaxed);
-	let entropy = generate_nonce::<8>(None).map_or(0, u64::from_le_bytes);
+	let drawn = generate_nonce::<8>(None).ok();
+	seed_of(sequence, drawn)
+}
+
+/// The seed at `sequence`, where `drawn` holds eight octets of the random
+/// source, or `None` when the source refused the draw.
+///
+/// A refused draw takes [`placement_entropy`] in place of the octets, so
+/// gateways that lose the source together seed apart. That entropy holds one
+/// value per process, so the sequence keeps the seeds of one process distinct.
+fn seed_of(sequence: u64, drawn: Option<[u8; 8]>) -> u64 {
+	let entropy = drawn.map_or_else(placement_entropy, u64::from_le_bytes);
 	sequence ^ entropy
 }
 
@@ -226,7 +237,8 @@ impl LoadBalancer for StochasticForager {
 /// stronger trail.
 ///
 /// - The probe spreads concurrent routers across the pool.
-/// - The probe still favors instances with a stronger pheromone trail.
+/// - The probe also favors instances with a stronger pheromone trail.
+/// - A tie keeps the first of the two draws, so equal trails share the load.
 ///
 /// # Sources
 ///
@@ -249,7 +261,6 @@ impl LoadBalancer for PowerOfTwoChoices {
 		match candidates {
 			[] => None,
 			[_] => Some(0),
-			[first, second] => Some(usize::from(second.pheromone > first.pheromone)),
 			all => {
 				// One 64-bit draw splits into a uniform distinct pair: `second`
 				// comes from `[0, n-1)` and shifts past `first`.
@@ -293,8 +304,8 @@ mod tests {
 	use std::collections::HashSet;
 
 	use super::{
-		InstanceMetrics, LoadBalancer, PowerOfTwoChoices, RoundRobin, StochasticForager, DEFAULT_EXPLORATION_FLOOR,
-		DEFAULT_REPELLENCY_THRESHOLD, MAX_PHEROMONE,
+		seed_of, InstanceMetrics, LoadBalancer, PowerOfTwoChoices, RoundRobin, StochasticForager,
+		DEFAULT_EXPLORATION_FLOOR, DEFAULT_REPELLENCY_THRESHOLD, MAX_PHEROMONE,
 	};
 
 	fn pool(pheromones: impl AsRef<[u64]>) -> Vec<InstanceMetrics> {
@@ -389,6 +400,14 @@ mod tests {
 	}
 
 	#[test]
+	fn p2c_spreads_two_equal_trails_across_both() {
+		let balancer = PowerOfTwoChoices::default();
+		let counts = histogram(&balancer, uniform(2), 256);
+		let both_drawn = counts.iter().all(|&count| count > 0);
+		assert!(both_drawn, "equal trails must spread, got {counts:?}");
+	}
+
+	#[test]
 	fn p2c_covers_all_indices_under_equal_trails() {
 		let balancer = PowerOfTwoChoices::default();
 		let candidates = uniform(8);
@@ -432,5 +451,13 @@ mod tests {
 		let dead = pool([0, 0, 0]);
 		let seen: HashSet<usize> = (0..256).filter_map(|_| tuned.select(&dead)).collect();
 		assert_eq!(seen.len(), dead.len());
+	}
+
+	// Every process starts its sequence at 0, so a seed that the bare sequence
+	// decides gives the first balancer of every gateway the same stream.
+	#[test]
+	fn a_refused_draw_seeds_apart_from_the_sequence_every_process_repeats() {
+		let seed = seed_of(0, None);
+		assert_ne!(seed, 0, "the seed of a refused draw carries the placement of this process");
 	}
 }

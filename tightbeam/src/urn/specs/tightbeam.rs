@@ -1,7 +1,7 @@
-//! Tightbeam URN specifications
+//! The URN specification of the `tightbeam` namespace.
 //!
-//! Defines URN specs for tightbeam namespaces like instrumentation, testing,
-//! etc.
+//! [`TightbeamUrnSpec`] validates the instrumentation URNs of the namespace,
+//! such as `urn:tightbeam:instrumentation:trace/<id>`.
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
@@ -13,9 +13,10 @@ use crate::urn::builders::spec::Pattern;
 use crate::urn::UrnValidationError;
 
 crate::urn_spec! {
-	/// TightbeamUrnSpec URN specification
+	/// The URN specification of the tightbeam instrumentation namespace.
 	///
-	/// Format: `urn:tightbeam:instrumentation:<resource_type>/<resource_id>`
+	/// Its format is
+	/// `urn:tightbeam:instrumentation:<resource_type>/<resource_id>`.
 	pub TightbeamUrnSpec,
 	nid: "tightbeam",
 	nss_structure {
@@ -25,7 +26,7 @@ crate::urn_spec! {
 	},
 	nss_format: "{}:{}/{}",
 	transform: |components| {
-		// Normalize resource_type to lowercase
+		// The transform lowercases a resource type to meet the `values` list.
 		for (key, value) in components.iter_mut() {
 			if key == "resource_type" {
 				*value = value.to_lowercase().into();
@@ -37,12 +38,9 @@ crate::urn_spec! {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::urn::{Urn, UrnBuilder};
+	use crate::urn::UrnBuilder;
 
-	#[cfg(feature = "testing")]
-	use crate::{exactly, tb_assert_spec, tb_scenario, testing::SetupEnv};
-
-	// Macro to reduce repetition in tightbeam URN tests
+	// This macro builds the URN of one case and checks its NID, NSS, and text.
 	macro_rules! build_tightbeam_urn {
 		(values: [$($k:literal = $v:literal),+], nss: $expected_nss:literal, urn: $expected_urn:literal) => {{
 			let urn = UrnBuilder::from(TightbeamUrnSpec)
@@ -101,22 +99,26 @@ mod tests {
 		Ok(())
 	}
 
-	#[test]
-	fn test_tightbeam_instrumentation_all_resource_types() -> Result<(), UrnValidationError> {
-		let resource_types = &["trace", "event", "seed", "verdict"];
-		let resource_id = "test-123";
-		for resource_type in resource_types {
+	// Each resource type that the spec admits renders into the URN.
+	crate::tb_cases! {
+		fn test_tightbeam_instrumentation_all_resource_types(
+			(resource_type, expected): (&str, &str)
+		) -> Result<(), UrnValidationError> {
 			let urn = UrnBuilder::from(TightbeamUrnSpec)
 				.set("category", "instrumentation")
-				.set("resource_type", *resource_type)
-				.set("resource_id", resource_id)
+				.set("resource_type", resource_type)
+				.set("resource_id", "test-123")
 				.build()?;
-			assert_eq!(
-				urn.to_string(),
-				format!("urn:tightbeam:instrumentation:{resource_type}/{resource_id}")
-			);
+
+			assert_eq!(urn.to_string(), expected);
+			Ok(())
 		}
-		Ok(())
+		cases {
+			trace => ("trace", "urn:tightbeam:instrumentation:trace/test-123"),
+			event => ("event", "urn:tightbeam:instrumentation:event/test-123"),
+			seed => ("seed", "urn:tightbeam:instrumentation:seed/test-123"),
+			verdict => ("verdict", "urn:tightbeam:instrumentation:verdict/test-123"),
+		}
 	}
 
 	#[test]
@@ -128,65 +130,37 @@ mod tests {
 
 	#[test]
 	fn test_tightbeam_instrumentation_invalid_field_values() {
-		// Constraint violations
+		// A value outside the const or the listed values fails its constraint.
 		invalid_field!(values: ["category" = "testing", "resource_type" = "trace", "resource_id" = "123"], field: "category");
 		invalid_field!(values: ["category" = "invalid", "resource_type" = "trace", "resource_id" = "123"], field: "category");
 		invalid_field!(values: ["category" = "instrumentation", "resource_type" = "invalid", "resource_id" = "123"], field: "resource_type");
 		invalid_field!(values: ["category" = "instrumentation", "resource_type" = "unknown", "resource_id" = "123"], field: "resource_type");
 
-		// Pattern violations
+		// A value with a character outside the pattern fails it.
 		invalid_field!(values: ["category" = "instrumentation", "resource_type" = "trace", "resource_id" = "invalid_chars!"], field: "resource_id");
 		invalid_field!(values: ["category" = "instrumentation", "resource_type" = "trace", "resource_id" = "space here"], field: "resource_id");
 		invalid_field!(values: ["category" = "instrumentation", "resource_type" = "trace", "resource_id" = "underscore_here"], field: "resource_id");
 	}
 
-	#[test]
-	fn test_tightbeam_instrumentation_transform_lowercase() -> Result<(), UrnValidationError> {
-		// Test that uppercase resource_type gets normalized to lowercase
-		let test_cases: &[(&str, &str)] =
-			&[("TRACE", "trace"), ("Event", "event"), ("SEED", "seed"), ("VeRdIcT", "verdict")];
-
-		for (input, expected) in test_cases {
+	// The spec normalizes a resource type in any case to lowercase.
+	crate::tb_cases! {
+		fn test_tightbeam_instrumentation_transform_lowercase(
+			(input, expected): (&str, &str)
+		) -> Result<(), UrnValidationError> {
 			let urn = UrnBuilder::from(TightbeamUrnSpec)
 				.set("category", "instrumentation")
-				.set("resource_type", *input)
+				.set("resource_type", input)
 				.set("resource_id", "test-123")
 				.build()?;
-			assert_eq!(urn.to_string(), format!("urn:tightbeam:instrumentation:{expected}/test-123"));
+
+			assert_eq!(urn.to_string(), expected);
+			Ok(())
 		}
-		Ok(())
-	}
-
-	#[cfg(feature = "testing")]
-	const URN_STRING: Urn<'static> = crate::urn!("test", "event:urn-spec/urn-string");
-
-	#[cfg(feature = "testing")]
-	tb_assert_spec! {
-		pub TightbeamUrnSpecSpec,
-		V(1,0,0): {
-			mode: Accept,
-			assertions: [
-				(URN_STRING, exactly!(1), equals!("urn:tightbeam:instrumentation:trace/abc-123"))
-			]
-		}
-	}
-
-	#[cfg(feature = "testing")]
-	tb_scenario! {
-		name: test_tightbeam_urn_with_spec,
-		spec: TightbeamUrnSpecSpec,
-		environment Bare {
-			exec: |SetupEnv { trace, .. }| {
-				let urn = UrnBuilder::from(TightbeamUrnSpec)
-					.set("category", "instrumentation")
-					.set("resource_type", "trace")
-					.set("resource_id", "abc-123")
-					.build()?;
-
-				trace.event_with(URN_STRING, &[], urn.to_string())?;
-
-				Ok(())
-			}
+		cases {
+			trace_upper => ("TRACE", "urn:tightbeam:instrumentation:trace/test-123"),
+			event_title => ("Event", "urn:tightbeam:instrumentation:event/test-123"),
+			seed_upper => ("SEED", "urn:tightbeam:instrumentation:seed/test-123"),
+			verdict_mixed => ("VeRdIcT", "urn:tightbeam:instrumentation:verdict/test-123"),
 		}
 	}
 }

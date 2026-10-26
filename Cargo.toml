@@ -31,6 +31,7 @@ cargo-hack = "0.6.45"
 cargo-semver-checks = "0.50.0"
 typos-cli = "1.49.0"
 cargo-afl = "0.18.2"
+cargo-llvm-cov = "0.9.1"
 
 [workspace.lints.rust]
 # Catch dead imports under cfg-gated paths that `--all-features` never compiles.

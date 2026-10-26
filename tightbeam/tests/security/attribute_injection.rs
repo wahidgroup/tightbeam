@@ -3,7 +3,7 @@
 //! ## Weakness
 //! The client Finished travels sealed as an `AuthEnvelopedData`, whose
 //! unauthenticated attributes (RFC 5083 § 2.1) no key covers. An intermediary
-//! can add attributes there without invalidating the message.
+//! can add attributes there, and the message stays valid.
 //!
 //! If the server read a handshake attribute from beside the seal, an injected
 //! value would steer what the server consumes, such as a forged receipt
@@ -16,9 +16,9 @@
 //! ## Expected control
 //! The server reads every handshake attribute of the client Finished from
 //! inside the seal, where the handshake secret authenticates it. Beside the
-//! seal, it reads only an abort alert. The forged value is therefore never
-//! consumed, the closing settles on the client's own countersignature, and the
-//! session activates.
+//! seal, it reads only an abort alert. The server therefore never consumes the
+//! forged value, the closing settles on the client's own countersignature, and
+//! the session activates.
 //!
 //! Inside the seal, every handshake attribute is single-use, so a client that
 //! sends a duplicate fails closed. The CMS flow tests cover that case.
@@ -35,26 +35,24 @@
 
 use std::sync::Arc;
 
+use tightbeam::absent;
 use tightbeam::asn1::{Any, OctetString};
 use tightbeam::crypto::cms::AuthEnvelopedData;
 use tightbeam::der::asn1::SetOfVec;
 use tightbeam::exactly;
+use tightbeam::instrumentation::events;
 use tightbeam::oids::RECEIPT_ACK;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_scenario;
 use tightbeam::testing::SetupEnv;
 use tightbeam::transport::handshake::negotiation::MuxBudgets;
 use tightbeam::transport::handshake::HandshakeMessage;
-use tightbeam::urn::Urn;
 use tightbeam::x509::attr::{Attribute, Attributes};
 use tightbeam::TightBeamError;
 
-pub(crate) const INJECTED_ATTRIBUTE_NEVER_CONSUMED: Urn<'static> =
-	tightbeam::urn!("test", "event:attribute-injection/injected-attribute-never-consumed");
-pub(crate) const SESSION_SETTLES_ON_THE_SEALED_ACK: Urn<'static> =
-	tightbeam::urn!("test", "event:attribute-injection/session-settles-on-the-sealed-ack");
-
-use crate::common::security::{cms_mutual_budget_pair, CmsSessionHooks, GrantingAuthorizer, ServerMaterials};
+use crate::common::security::{ClientMaterials, GrantingAuthorizer, ServerMaterials};
+use crate::security::common::HandshakeBackendKind;
+use crate::security::live::{AttackStep, FrameEdit, LiveHandshake, ReceiptHooks, CLOSING_FRAME};
 
 const REQUEST: MuxBudgets = MuxBudgets { client_to_server: 64, server_to_client: 128 };
 
@@ -71,51 +69,46 @@ fn inject_receipt_ack(sealed_finished: &AuthEnvelopedData) -> Result<AuthEnvelop
 	Ok(AuthEnvelopedData { unauth_attrs: Some(attrs), ..sealed_finished.to_owned() })
 }
 
+/// `closing`, the client Finished, with the forged acknowledgement injected
+/// beside its seal.
+fn injected(closing: HandshakeMessage) -> Result<HandshakeMessage, TightBeamError> {
+	let sealed_finished = closing.auth_enveloped()?;
+	let injected = inject_receipt_ack(sealed_finished.value())?;
+	Ok(HandshakeMessage::try_from(injected)?)
+}
+
 tb_assert_spec! {
 	pub AttributeInjectionSpec,
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(INJECTED_ATTRIBUTE_NEVER_CONSUMED, exactly!(1), equals!(true)),
-			(SESSION_SETTLES_ON_THE_SEALED_ACK, exactly!(1), equals!(true))
+			(events::SESSION_HANDSHAKE_COMPLETE, exactly!(1)),
+			(events::SESSION_CERT_REJECTED, absent!()),
+			(events::SESSION_RECEIPT_SETTLED, exactly!(1))
 		]
 	}
 }
 
-// No key covers an unauthenticated attribute, so the injected acknowledgement
-// travels beside the seal unchanged. The server reads the acknowledgement only
-// from inside the seal, so the closing settles on the client's own
-// acknowledgement.
+// The injected acknowledgement travels beside the seal unchanged, and the
+// closing settles on the client's own acknowledgement.
 tb_scenario! {
 	name: cms_injected_receipt_attribute_is_never_consumed,
 	spec: AttributeInjectionSpec,
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
 			let materials = ServerMaterials::generate();
-			let hooks = CmsSessionHooks {
+			let identity = ClientMaterials::generate().identity();
+			let hooks = ReceiptHooks {
 				authorizer: Some(Arc::new(GrantingAuthorizer::challenge_free())),
-				..CmsSessionHooks::default()
+				..ReceiptHooks::default()
 			};
 
-			let pair = cms_mutual_budget_pair(&materials, REQUEST, hooks)?;
-			let (mut client, mut server) = (pair.client, pair.server);
-
-			let reply = server.reply(client.start()?).await?;
-
 			// The MITM injects the forged acknowledgement on the wire.
-			let sealed_finished = client.respond(reply).await?.auth_enveloped()?;
-			let injected = inject_receipt_ack(sealed_finished.value())?;
-
-			let closing = server.finish(HandshakeMessage::try_from(injected)?).await;
-			trace.event_with(
-				INJECTED_ATTRIBUTE_NEVER_CONSUMED,
-				&[],
-				closing.is_ok(),
-			)?;
-
-			let activation = server.complete();
-			let settled = activation.is_ok_and(|session| session.receipt().is_some());
-			trace.event_with(SESSION_SETTLES_ON_THE_SEALED_ACK, &[], settled)?;
+			let injection = AttackStep::new(CLOSING_FRAME, FrameEdit::Rewrite(Box::new(injected)));
+			let kind = HandshakeBackendKind::Cms;
+			let handshake = LiveHandshake::budget_bearing(kind, materials, identity, REQUEST, hooks);
+			let outcome = handshake.audit_server(&trace).with_step(injection).run().await?;
+			let (_client, _server) = outcome.established()?;
 
 			Ok::<(), TightBeamError>(())
 		}

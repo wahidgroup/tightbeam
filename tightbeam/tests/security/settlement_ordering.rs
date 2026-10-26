@@ -38,11 +38,12 @@
 //! 5. Admit the client identity.
 //! 6. Open the countersignature under the handshake secret, verify it, and call `settle`.
 //!
-//! The scenario proves the observable end-to-end property with three events:
+//! The scenario proves the observable end-to-end property with three checks:
 //!
-//! - The plaintext settlement answer is absent from the DER of the closing.
+//! - The plaintext settlement answer is absent from the frame of the closing.
 //! - The server refuses the corrupted closing at step 2 with
-//!   [`HandshakeError::SealedClosing`] of `EnvelopeError::Authentication`.
+//!   [`HandshakeError::SealedClosing`] of `EnvelopeError::Authentication`,
+//!   which its audit trail records.
 //! - The authorizer's `settle` hook records zero calls.
 //!
 //! Layer 1 catches the corruption, so the property holds independent of the
@@ -59,29 +60,17 @@
 
 use std::sync::Arc;
 
-use tightbeam::crypto::cms::EnvelopeError::Authentication;
-use tightbeam::crypto::profiles::DefaultCryptoProvider;
-use tightbeam::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
 use tightbeam::exactly;
+use tightbeam::instrumentation::events;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_scenario;
 use tightbeam::testing::SetupEnv;
-use tightbeam::transport::handshake::negotiation::{MuxBudgets, SecurityOffer, TransportOffer};
-use tightbeam::transport::handshake::{Handshake, HandshakeError, HandshakeMessage, PeerAuthentication};
-use tightbeam::urn::Urn;
+use tightbeam::transport::handshake::negotiation::MuxBudgets;
 use tightbeam::TightBeamError;
 
-pub(crate) const CORRUPTED_CLOSING_REJECTED: Urn<'static> =
-	tightbeam::urn!("test", "event:settlement-ordering/corrupted-closing-rejected");
-pub(crate) const RESPONSE_CONFIDENTIAL_ON_WIRE: Urn<'static> =
-	tightbeam::urn!("test", "event:settlement-ordering/response-confidential-on-wire");
-pub(crate) const SETTLE_NEVER_FIRED: Urn<'static> =
-	tightbeam::urn!("test", "event:settlement-ordering/settle-never-fired");
-
-use crate::common::security::{
-	contains_window, default_security_profile, flip_sealed_content, hpke_client_config_presenting, hpke_server_config,
-	pinning_validator, ClientMaterials, PayingApprover, ServerMaterials, SettleSpyAuthorizer,
-};
+use crate::common::security::{contains_window, ClientMaterials, PayingApprover, ServerMaterials, SettleSpyAuthorizer};
+use crate::security::common::HandshakeBackendKind;
+use crate::security::live::{AttackStep, FrameEdit, LiveHandshake, ReceiptHooks, CLOSING_FRAME};
 
 const CHALLENGE: &[u8] = b"settle-ordering-invoice";
 const RESPONSE: &[u8] = b"settle-ordering-preimage";
@@ -92,9 +81,7 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(RESPONSE_CONFIDENTIAL_ON_WIRE, exactly!(1), equals!(true)),
-			(CORRUPTED_CLOSING_REJECTED, exactly!(1), equals!(true)),
-			(SETTLE_NEVER_FIRED, exactly!(1), equals!(true))
+			(events::SESSION_CERT_REJECTED, exactly!(1), equals!("sealed-closing/authentication"))
 		]
 	}
 }
@@ -108,52 +95,31 @@ tb_scenario! {
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
 			let materials = ServerMaterials::generate();
-			let profile = default_security_profile();
-			let client_materials = ClientMaterials::deterministic();
-			let client_identity = client_materials.identity();
-
-			let validator = pinning_validator(&materials.certificate);
-			let mut config = hpke_client_config_presenting::<DefaultCryptoProvider>(validator, client_identity);
-			config.security_offer = Some(SecurityOffer::new(vec![profile]));
-			config.transport_offer = Some(TransportOffer::mux(4).with_budgets(REQUEST));
-			config.receipt_approver = Some(Arc::new(PayingApprover::answering(RESPONSE)?));
-
-			let mut client = Handshake::client(config);
+			let identity = ClientMaterials::deterministic().identity();
 			let authorizer = Arc::new(SettleSpyAuthorizer::challenging(CHALLENGE)?);
-			let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator);
-			let mut server_config = hpke_server_config::<DefaultCryptoProvider>(&materials, [profile]);
-			server_config.peer_authentication = PeerAuthentication::mutual([validator]);
-			server_config.transport = Some(TransportOffer::mux(4));
-			server_config.transport_authorizer = Some(Arc::clone(&authorizer) as _);
+			let hooks = ReceiptHooks {
+				authorizer: Some(Arc::clone(&authorizer) as _),
+				approver: Some(Arc::new(PayingApprover::answering(RESPONSE)?)),
+				observer: None,
+			};
 
-			let mut server = Handshake::server(server_config);
-			let reply = server.reply(client.start()?).await?;
-			let closing = client.respond(reply).await?;
+			// The relay corrupts the middle byte of the encrypted content,
+			// which carries the sealed receipt countersignature. The tag of the
+			// closing then fails, so `finish` refuses the closing before the
+			// key confirmation, the admission, and the settlement side effect.
+			let corrupt = AttackStep::new(CLOSING_FRAME, FrameEdit::flip_sealed_content());
+			let kind = HandshakeBackendKind::Hpke;
+			let handshake = LiveHandshake::budget_bearing(kind, materials, identity, REQUEST, hooks);
+			let outcome = handshake.audit_server(&trace).with_step(corrupt).run().await?;
+
+			outcome.refused_by_server("server accepted a corrupted closing")?;
+			assert_eq!(authorizer.settle_calls(), 0, "settle ran before the server refused the closing");
 
 			// The paying party's settlement answer travels sealed inside the
 			// closing, so for confidentiality the plaintext RESPONSE must never
-			// appear in the DER of the closing.
-			let response_leaked = contains_window(closing.der(), RESPONSE);
-			trace.event_with(
-				RESPONSE_CONFIDENTIAL_ON_WIRE,
-				&[],
-				!response_leaked,
-			)?;
-
-			// Corrupt the middle byte of the encrypted content. The content
-			// carries the sealed receipt countersignature, so the server must
-			// open it before it can settle, and that open must fail.
-			let sealed = closing.auth_enveloped()?;
-			let corrupted = flip_sealed_content(sealed.value())?;
-
-			// The closing is authenticated encryption, so its tag fails, and
-			// `finish` refuses the closing before the key confirmation, the
-			// admission, and the settlement side effect.
-			let closing_result = server.finish(HandshakeMessage::try_from(corrupted)?).await;
-			let rejected = matches!(closing_result, Err(HandshakeError::SealedClosing(Authentication)));
-
-			trace.event_with(CORRUPTED_CLOSING_REJECTED, &[], rejected)?;
-			trace.event_with(SETTLE_NEVER_FIRED, &[], authorizer.settle_calls() == 0)?;
+			// appear in the frame of the closing.
+			let closing = outcome.relay.frame(CLOSING_FRAME)?;
+			assert!(!contains_window(&closing, RESPONSE), "the settlement answer crossed the wire in the clear");
 
 			Ok::<(), TightBeamError>(())
 		}

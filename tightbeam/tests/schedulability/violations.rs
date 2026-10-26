@@ -1,8 +1,7 @@
-//! Schedulability violation tests
+//! The tests of schedulability violations.
 
 use core::time::Duration;
 
-use tightbeam::builder::TypeBuilder;
 use tightbeam::testing::fdr::FdrConfig;
 use tightbeam::testing::{Expect, Layer, ScenarioConfig, SetupEnv};
 use tightbeam::urn::Urn;
@@ -11,8 +10,8 @@ use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario, wcet};
 pub(crate) const TASK1: Urn<'static> = tightbeam::urn!("test", "event:violations/task1");
 pub(crate) const TASK2: Urn<'static> = tightbeam::urn!("test", "event:violations/task2");
 
-// Every scenario in this file releases TASK1 once. TASK2 is released by the
-// two-task processes only, so it is not part of the shared contract.
+// Every scenario in this file releases TASK1 once. Only the two-task
+// processes release TASK2, so it is not part of the shared contract.
 tb_assert_spec! {
 	pub SchedulabilityViolationSpec,
 	V(1,0,0): {
@@ -23,8 +22,8 @@ tb_assert_spec! {
 	}
 }
 
-// Define a process that is NOT schedulable under RMA
-// This should be caught during FDR exploration
+// The task set of this process is not schedulable under RMA, and FDR
+// exploration must catch the miss.
 tb_process_spec! {
 	pub RmaNotSchedulableProcess,
 	events {
@@ -78,7 +77,7 @@ tb_scenario! {
 	}
 }
 
-// Define a process with EDF that exceeds utilization bound
+// The task set of this process exceeds the utilization bound of EDF.
 tb_process_spec! {
 	pub EdfNotSchedulableProcess,
 	events {
@@ -131,7 +130,8 @@ tb_scenario! {
 	}
 }
 
-// Test process without timing constraints (should handle gracefully)
+// This process names a period for TASK1 and no `timing` block, so its task
+// set has no WCET.
 tb_process_spec! {
 	pub ProcessWithoutTiming,
 	events {

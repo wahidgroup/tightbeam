@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Idempotent development-environment setup: Rust toolchain components,
-# cargo-audit, typos, and cargo-afl. A content hash of the manifests is
-# stamped under .make/ so unchanged re-runs are skipped.
+# Idempotent development-environment setup: the pinned Rust toolchain with
+# its components, and every tool pinned under [workspace.metadata.tools]. A
+# content hash of the manifests is stamped under .make/ so unchanged re-runs
+# are skipped.
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TOOL_VERSION="$ROOT/scripts/tool-version.sh"

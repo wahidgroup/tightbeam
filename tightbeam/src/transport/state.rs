@@ -17,8 +17,8 @@ use crate::crypto::profiles::CryptoProvider;
 use crate::crypto::sign::SigningIdentity;
 use crate::crypto::x509::store::CertificateTrust;
 use crate::transport::builders::EnvelopeBuilder;
-use crate::transport::envelopes::{ArrivingEnvelope, WireEnvelope, WireMode};
-use crate::transport::error::{TransportError, TransportFailure};
+use crate::transport::envelopes::{WireEnvelope, WireMode};
+use crate::transport::error::{ArrivalCause, ArrivalRefusal, TransportError, TransportFailure};
 use crate::transport::handshake::receipt::StoredReceipt;
 use crate::transport::handshake::{EstablishedSession, SessionPeer};
 use crate::transport::handshake::{HandshakeProtocolKind, PeerAuthentication};
@@ -68,7 +68,7 @@ pub(crate) use dialable_encryption::Negotiation;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub(crate) use dialable_encryption::Endpoint;
 
-/// Which wire mode a session may write, and the state that backs it.
+/// The wire mode a session may write, and the state that backs it.
 ///
 /// The session stores the phase as its own field, and each arm carries what
 /// that phase needs. Session keys live in [`SessionPhase::Encrypted`], so
@@ -78,28 +78,28 @@ pub(crate) use dialable_encryption::Endpoint;
 ///
 /// - CWE-311, missing encryption of sensitive data: <https://cwe.mitre.org/data/definitions/311.html>
 pub enum SessionPhase {
-	/// The endpoint named cleartext in place of encryption provisioning, so
+	/// The endpoint names cleartext in place of encryption provisioning, so
 	/// frames travel in the clear as a configured choice.
 	Cleartext,
 	/// Encryption is provisioned, and the session awaits the first handshake
 	/// round. A write in this phase fails with
 	/// [`TransportFailure::EncryptorUnavailable`].
 	Provisioned,
-	/// A handshake is in flight, measured against `initiated_at`.
+	/// A handshake is in flight, and its deadline counts from `initiated_at`.
 	Handshaking {
 		/// The instant the handshake began, on the endpoint's clock. The
 		/// handshake deadline counts from it.
 		initiated_at: MonotonicInstant,
 	},
-	/// The handshake completed. The phase carries everything it agreed, so a
+	/// The handshake is complete. The phase carries everything it agreed, so a
 	/// session's keys travel with the terms that go with them, and a move out
 	/// of this phase drops all of them together.
 	Encrypted(Box<EstablishedSession>),
 }
 
 impl SessionPhase {
-	/// The phase an endpoint provisioned with `encryption` starts in, and
-	/// returns to when its session breaks.
+	/// Returns the start phase of an endpoint provisioned with `encryption`,
+	/// which is also the phase it returns to when its session breaks.
 	///
 	/// It is the one place that pairs provisioning with a phase. An endpoint
 	/// that holds encryption material starts in `Provisioned`, because
@@ -149,7 +149,7 @@ impl SessionPhase {
 		matches!(self, Self::Provisioned | Self::Handshaking { .. })
 	}
 
-	/// When the in-flight handshake began, if one is in flight.
+	/// The instant the in-flight handshake began, if one is in flight.
 	pub const fn initiated_at(&self) -> Option<MonotonicInstant> {
 		match self {
 			Self::Handshaking { initiated_at } => Some(*initiated_at),
@@ -278,11 +278,12 @@ pub(crate) mod sealed {
 	pub trait Sealed {}
 }
 
-/// What can happen to a session, which is the alphabet the phase table reads.
+/// The events that can happen to a session, which form the alphabet the phase
+/// table reads.
 pub(crate) enum SessionEvent {
 	/// A handshake round starts at the given reading.
 	BeginHandshake(MonotonicInstant),
-	/// A handshake completed and hands over everything it agreed.
+	/// A completed handshake hands over everything it agreed.
 	Install(Box<EstablishedSession>),
 	/// The circuit breaker drops any session and returns to the start.
 	Reset,
@@ -305,7 +306,7 @@ impl<P: CryptoProvider> SessionState<P> {
 	/// A session for `encryption`, at the phase that provisioning starts in.
 	///
 	/// [`DialableEncryption`] guarantees the endpoint either holds a peer
-	/// authority or named cleartext, so the start is `Provisioned` or a
+	/// authority or names cleartext, so the start is `Provisioned` or a
 	/// chosen `Cleartext`.
 	pub fn new(encryption: DialableEncryption<P>) -> Self {
 		Self::negotiating(encryption, Negotiation::default())
@@ -355,7 +356,7 @@ impl<P: CryptoProvider> SessionState<P> {
 		&self.phase
 	}
 
-	/// Apply `event`, and hand back the phase it replaced when the table
+	/// Applies `event`, and hands back the phase it replaced when the table
 	/// admits it.
 	///
 	/// - It is the one writer of the phase, and it is private, so the named moves below are the only events.
@@ -379,8 +380,8 @@ impl<P: CryptoProvider> SessionState<P> {
 		Some(replaced)
 	}
 
-	/// Record a handshake round at `now`, and report whether the phase table
-	/// admitted it.
+	/// Records a handshake round at `now`, and reports whether the phase table
+	/// admits it.
 	///
 	/// The first round starts the deadline. A later round keeps the instant
 	/// the first one recorded, so a slow peer cannot stretch the handshake by
@@ -390,7 +391,7 @@ impl<P: CryptoProvider> SessionState<P> {
 		self.apply(SessionEvent::BeginHandshake(now)).is_some()
 	}
 
-	/// Install everything a completed handshake agreed, and bound the send
+	/// Installs everything a completed handshake agreed, and bounds the send
 	/// cipher by `encrypted_envelope`, this endpoint's encrypted-envelope
 	/// ceiling (RFC 9846 § 5.5). The receive cipher counts the bytes it opens.
 	///
@@ -403,7 +404,7 @@ impl<P: CryptoProvider> SessionState<P> {
 		self.apply(SessionEvent::Install(Box::new(bounded))).is_some()
 	}
 
-	/// Drop any session and return to the phase this endpoint's provisioning
+	/// Drops any session and returns to the phase this endpoint's provisioning
 	/// starts in.
 	///
 	/// This is the circuit breaker. It reads the destination from the
@@ -415,8 +416,8 @@ impl<P: CryptoProvider> SessionState<P> {
 		let _dropped = self.apply(SessionEvent::Reset);
 	}
 
-	/// Admit `wire`, the DER of one wire envelope that arrived on this
-	/// session, under `limits`, and return the DER of the transport envelope
+	/// Admits `wire`, the DER of one wire envelope that arrived on this
+	/// session, under `limits`, and returns the DER of the transport envelope
 	/// it carries.
 	///
 	/// It is the receive twin of [`EncryptedProtocolState::apply_wire_mode`].
@@ -427,50 +428,61 @@ impl<P: CryptoProvider> SessionState<P> {
 	/// - An established session admits records alone, and opens each under its receive cipher.
 	/// - Every other phase admits cleartext alone.
 	/// - A refused mode, and a record that fails to open, trip the circuit
-	///   breaker, so the session resets before the error returns.
+	///   breaker, so the session resets before the error returns. The refusal
+	///   then holds the peer of the session that the breaker dropped.
 	///
 	/// # Errors
+	///
+	/// Each refusal names the peer of the session, and reads as the
+	/// [`TransportError`] it converts into:
 	///
 	/// - [`TransportError::DerError`] -- `wire` is no wire envelope.
 	/// - [`TransportError::OperationFailed`] with
 	///   [`TransportFailure::SizeExceeded`] -- the envelope passes the ceiling
 	///   of its mode.
-	/// - [`TransportError::MissingEncryption`] -- cleartext arrived on an established session (CWE-319).
-	/// - [`TransportError::OperationFailed`] with
-	///   [`TransportFailure::EncryptionFailed`] -- a record arrived before a
-	///   handshake established the session.
-	/// - [`TransportError`] -- the errors of [`RecvCipher::open`], such as
-	///   [`TransportFailure::TamperDetected`] for a record out of sequence.
+	/// - The refusals of [`ArrivingEnvelope::admit_under`], under the receive
+	///   cipher of an established session.
+	///
+	/// [`ArrivingEnvelope::admit_under`]: crate::transport::envelopes::ArrivingEnvelope::admit_under
 	pub(crate) fn admit_arrival<'w>(
 		&mut self,
 		wire: &'w mut (impl AsMut<[u8]> + ?Sized),
 		limits: &TransportLimits,
-	) -> TransportResult<&'w [u8]> {
+	) -> Result<&'w [u8], ArrivalRefusal> {
 		let wire = wire.as_mut();
 		let wire_len = wire.len();
-		let arriving = WireEnvelope::admit(wire)?;
+		let arriving = WireEnvelope::admit(wire).map_err(|error| self.refuse(TransportError::from(error)))?;
 		if wire_len > limits.envelope_ceiling(arriving.mode()) {
-			return Err(TransportError::OperationFailed(TransportFailure::SizeExceeded));
+			let oversize = TransportError::OperationFailed(TransportFailure::SizeExceeded);
+			return Err(self.refuse(oversize));
 		}
 
-		let admitted = match (&self.phase, arriving) {
-			(SessionPhase::Encrypted(session), ArrivingEnvelope::Encrypted(record)) => {
-				session.keys().recv().open(record).map_err(TransportError::from)
-			}
-			(SessionPhase::Encrypted(_), ArrivingEnvelope::Cleartext(_)) => Err(TransportError::MissingEncryption),
-			(_, ArrivingEnvelope::Cleartext(contents)) => Ok(contents),
-			(_, ArrivingEnvelope::Encrypted(_)) => {
-				Err(TransportError::OperationFailed(TransportFailure::EncryptionFailed))
-			}
-		};
-		if admitted.is_err() {
-			self.reset();
-		}
+		let recv = self.established().map(|session| session.keys().recv());
+		let admitted = arriving.admit_under(recv);
 
-		admitted
+		admitted.map_err(|cause| self.trip(cause))
 	}
 
-	/// Classify `envelope`, which [`Self::admit_arrival`] admitted, as one
+	/// The refusal of an arrival for `cause`, with the peer of this session,
+	/// which keeps its phase.
+	pub(crate) fn refuse(&self, cause: impl Into<ArrivalCause>) -> ArrivalRefusal {
+		ArrivalRefusal::new(cause, self.session_peer())
+	}
+
+	/// Trips the circuit breaker for an arrival refused for `cause`, and
+	/// returns the refusal with the peer of the session that the breaker
+	/// dropped.
+	fn trip(&mut self, cause: ArrivalCause) -> ArrivalRefusal {
+		let dropped = self.apply(SessionEvent::Reset);
+		let peer = match dropped {
+			Some(SessionPhase::Encrypted(session)) => session.into_session_peer(),
+			_ => None,
+		};
+
+		ArrivalRefusal::of_dropped(cause, peer)
+	}
+
+	/// Classifies `envelope`, which [`Self::admit_arrival`] admitted, as one
 	/// step of the inbound collector.
 	///
 	/// While a handshake is pending, the one cleartext this session admits is
@@ -499,7 +511,7 @@ impl<P: CryptoProvider> SessionState<P> {
 		Ok(CollectStep::Handshake(message))
 	}
 
-	/// Detach the established session and return this state to its start.
+	/// Detaches the established session and returns this state to its start.
 	///
 	/// A caller that splits the endpoint into halves uses it. The halves take
 	/// the keys, and the state they leave behind holds none. Only the async
@@ -519,7 +531,7 @@ impl<P: CryptoProvider> SessionState<P> {
 		}
 	}
 
-	/// Replace the budget-grant policy a server consults.
+	/// Replaces the budget-grant policy a server consults.
 	///
 	/// This setter and the ones below change negotiation input and leave the
 	/// peer authority and the identities alone, so the phase this state starts
@@ -533,7 +545,7 @@ impl<P: CryptoProvider> SessionState<P> {
 		self.negotiation.authorize_transport(authorizer);
 	}
 
-	/// Replace the observer of budget-bearing handshake outcomes.
+	/// Replaces the observer of budget-bearing handshake outcomes.
 	#[cfg(all(
 		any(feature = "tcp", feature = "async-transport"),
 		any(feature = "transport-cms", feature = "transport-hpke")
@@ -542,7 +554,7 @@ impl<P: CryptoProvider> SessionState<P> {
 		self.negotiation.observe_sessions(observer);
 	}
 
-	/// Replace the approver a client consults before it countersigns a
+	/// Replaces the approver a client consults before it countersigns a
 	/// challenge-bearing receipt.
 	#[cfg(all(
 		any(feature = "tcp", feature = "async-transport"),
@@ -552,7 +564,7 @@ impl<P: CryptoProvider> SessionState<P> {
 		self.negotiation.approve_receipts(approver);
 	}
 
-	/// Replace the handshake protocol a provisioned endpoint runs.
+	/// Replaces the handshake protocol a provisioned endpoint runs.
 	///
 	/// The protocol decides how a handshake runs, and provisioning decides
 	/// whether one is expected, so the phase this state starts in is
@@ -628,8 +640,8 @@ impl<P: CryptoProvider> SessionState<P> {
 		self.established()?.receipt_arc()
 	}
 
-	/// Place a probe directly in `phase`, so a test of the table starts from
-	/// any phase and skips the moves that reach it.
+	/// Builds a state that sits directly in `phase`, so a test of the table
+	/// starts from any phase and skips the moves that reach it.
 	#[cfg(test)]
 	pub(crate) fn at(encryption: EncryptionConfig<P>, phase: SessionPhase) -> Self {
 		let encryption = DialableEncryption::unchecked(encryption);
@@ -640,17 +652,17 @@ impl<P: CryptoProvider> SessionState<P> {
 /// The outcome of one protocol-agnostic collector step.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub enum CollectStep {
-	/// The step read a cleartext handshake container for the server-side
+	/// The step reads a cleartext handshake container for the server-side
 	/// dispatcher, decoded once with the bytes it arrived as.
 	Handshake(HandshakeMessage),
-	/// The step read an application envelope, decrypted, or in cleartext
+	/// The step reads an application envelope, decrypted, or in cleartext
 	/// where the session admits cleartext.
 	Envelope(TransportEnvelope),
 }
 
 #[cfg(mux_rekey)]
 impl<P: CryptoProvider> SessionState<P> {
-	/// Replace the multiplexing capability this endpoint offers.
+	/// Replaces the multiplexing capability this endpoint offers.
 	///
 	/// It changes negotiation input alone, as [`Self::authorize_transport`]
 	/// does.
@@ -658,7 +670,7 @@ impl<P: CryptoProvider> SessionState<P> {
 		self.negotiation.offer_mux(offer);
 	}
 
-	/// Detach the epoch rekey materials the handshake left, once, for
+	/// Detaches the epoch rekey materials the handshake left, once, for
 	/// [`Self::renew`] alone.
 	///
 	/// It is the only write into an installed session. A handle to the session
@@ -671,7 +683,7 @@ impl<P: CryptoProvider> SessionState<P> {
 		}
 	}
 
-	/// Renew the established session under the terms of one mux role, which
+	/// Renews the established session under the terms of one mux role, which
 	/// `renewal` reads from this session's endpoint, into its rekey driver and
 	/// the dual-signed receipt it rotates.
 	///
@@ -773,7 +785,7 @@ impl<P: CryptoProvider> ServerIdentities<P> {
 		}
 	}
 
-	/// Refuse these identities for the server role unless each certificate
+	/// Refuses these identities for the server role unless each certificate
 	/// admits the key purpose `purpose` (RFC 5280 §4.2.1.12).
 	///
 	/// # Errors
@@ -929,17 +941,17 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 		self.client_identity.is_some()
 	}
 
-	/// Check whether this endpoint may reach a peer it cannot authenticate.
+	/// Checks whether this endpoint may reach a peer it cannot authenticate.
 	///
 	/// An endpoint that can establish nothing about its peer reaches whoever
-	/// answered (CWE-295), and a named cleartext choice is the one way to
+	/// answers (CWE-295), and a named cleartext choice is the one way to
 	/// accept that. Every transport holds provisioning that passed this rule,
 	/// so a cleartext phase always carries a named choice.
 	///
 	/// # Errors
 	///
 	/// - [`TransportError::PeerAuthenticationUnconfigured`] -- the endpoint
-	///   authenticates no peer and did not name cleartext, or it sets a server
+	///   authenticates no peer and names no cleartext, or it sets a server
 	///   policy and holds no trust in a server, whether or not it names
 	///   cleartext, because the policy runs on the server a trust admits.
 	pub fn check_dial_permitted(&self) -> TransportResult<()> {
@@ -964,7 +976,7 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 		policy && !self.trusts_a_server()
 	}
 
-	/// Refuse this provisioning when an identity it presents names a key
+	/// Refuses this provisioning when an identity it presents names a key
 	/// purpose other than its role's (RFC 5280 §4.2.1.12). It runs once, in
 	/// [`DialableEncryption::new`].
 	///
@@ -1018,7 +1030,7 @@ pub trait ServerHandshakeSlot: sealed::Sealed {
 	fn server_handshake_mut(&mut self) -> &mut Option<BoxedServerHandshake>;
 }
 
-/// State accessors for encrypted transports, separate from I/O.
+/// The state accessors of an encrypted transport, separate from I/O.
 ///
 /// The trait is sealed: only this crate's transports implement it, so the
 /// session ciphers it hands out come from a handshake this crate ran.
@@ -1055,11 +1067,11 @@ pub trait EncryptedProtocolState: sealed::Sealed {
 
 	/// Mutable access to this endpoint's session state.
 	///
-	/// The state guards its own phase, so a caller that reaches this still
-	/// places the session only in a phase the transition table names.
+	/// The state guards its own phase, so a caller that reaches this places
+	/// the session only in a phase that the transition table names.
 	fn session_state_mut(&mut self) -> &mut SessionState<Self::CryptoProvider>;
 
-	/// Apply this session's wire mode to `builder`.
+	/// Applies this session's wire mode to `builder`.
 	///
 	/// Every envelope this endpoint writes passes through here, so the phase
 	/// decides the wire mode once per session instead of once per call site.
@@ -1082,12 +1094,13 @@ pub trait EncryptedProtocolState: sealed::Sealed {
 		}
 	}
 
-	/// Install the session a completed handshake agreed under this endpoint's
-	/// encrypted-envelope ceiling ([`SessionState::install_session`]).
+	/// Installs the session that a completed handshake agreed, under this
+	/// endpoint's encrypted-envelope ceiling
+	/// ([`SessionState::install_session`]).
 	///
 	/// # Errors
 	///
-	/// - [`TransportError::InvalidState`] -- the phase refused the install.
+	/// - [`TransportError::InvalidState`] -- the phase refuses the install.
 	fn install_established(&mut self, session: EstablishedSession) -> TransportResult<()> {
 		let encrypted_envelope = self.limits().encrypted_envelope;
 		if !self.session_state_mut().install_session(session, encrypted_envelope) {
@@ -1117,7 +1130,7 @@ pub trait EncryptedProtocolState: sealed::Sealed {
 		None
 	}
 
-	/// Attach `trace` as the production instrumentation collector of this
+	/// Attaches `trace` as the production instrumentation collector of this
 	/// transport, the trail [`Self::to_trace_ref`] reads.
 	///
 	/// An accept loop that owns a collector attaches it to each transport it
@@ -1140,6 +1153,26 @@ pub trait EncryptedProtocolState: sealed::Sealed {
 	fn with_trace(self, trace: TraceCollector) -> Self
 	where
 		Self: Sized;
+
+	/// The address of the peer that a listener accepted this endpoint from,
+	/// which the record of the acceptance names, or `None` for an endpoint
+	/// that a listener did not accept.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::transport::state::EncryptedProtocolState;
+	/// use tightbeam::transport::tcp::r#async::{TcpTransport, TokioStream};
+	///
+	/// /// Whether a listener accepted `transport`.
+	/// fn was_accepted(transport: &TcpTransport<TokioStream>) -> bool {
+	///     transport.accepted_from().is_some()
+	/// }
+	/// ```
+	#[cfg(feature = "instrument")]
+	fn accepted_from(&self) -> Option<core::net::SocketAddr> {
+		None
+	}
 }
 
 #[cfg(test)]
@@ -1220,7 +1253,7 @@ mod tests {
 	}
 
 	/// A provisioned endpoint starts where it expects a handshake, and a
-	/// cleartext one only where its provisioning named cleartext (CWE-311).
+	/// cleartext one only where its provisioning names cleartext (CWE-311).
 	#[test]
 	fn a_session_starts_where_its_provisioning_says() -> TransportResult<()> {
 		let provisioned = SessionState::new(DialableEncryption::new(provisioned_encryption())?);
@@ -1380,7 +1413,7 @@ mod tests {
 
 	/// A handshake read admits the handshake ceiling and counts its deadline
 	/// from the instant the first round recorded, so a later reading gets the
-	/// remainder and not a fresh allowance.
+	/// remainder of the one allowance.
 	#[test]
 	fn a_handshake_read_counts_from_the_first_round() -> TransportResult<()> {
 		let clock = ManualClock::default();
@@ -1417,7 +1450,8 @@ mod tests {
 	}
 
 	/// A read before the first handshake round faces an unauthenticated peer
-	/// too, so it takes the handshake ceiling and the full allowance from now.
+	/// too, so it takes the handshake ceiling and the full allowance from the
+	/// reading it starts at.
 	#[test]
 	fn a_provisioned_read_gets_the_full_handshake_allowance() -> TransportResult<()> {
 		let clock = ManualClock::default();
@@ -1474,7 +1508,7 @@ mod tests {
 	}
 
 	/// A handshake in flight holds no keys, so `take_established` leaves it in
-	/// place, and the deadline still counts from the instant it recorded.
+	/// place, and its deadline counts from the instant that it recorded.
 	#[cfg(any(feature = "tokio", feature = "async-transport"))]
 	#[test]
 	fn detaching_a_pending_handshake_leaves_its_deadline_in_place() {

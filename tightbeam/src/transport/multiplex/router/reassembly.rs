@@ -6,13 +6,17 @@
 //!
 //! [`StreamBody`]: super::body::StreamBody
 
+#[cfg(not(all(test, tightbeam_loom)))]
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+
+#[cfg(all(test, tightbeam_loom))]
+use loom::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::constants::{MAX_MUX_CONNECTION_REASSEMBLY_BYTES, MAX_MUX_REASSEMBLY_BYTES};
 use crate::transport::{TransportError, TransportFailure, TransportResult};
 
-/// Reassembly bytes buffered across every stream on one connection.
+/// The reassembly bytes that every stream on one connection buffers.
 ///
 /// A per-stream ceiling multiplies by the number of streams a peer opens, so
 /// the connection holds this shared counter and every [`Reassembly`] charges
@@ -57,7 +61,7 @@ impl ReassemblyBudget {
 		self.used.fetch_sub(bytes, Ordering::Relaxed);
 	}
 
-	/// The bytes the streams of the connection hold.
+	/// Returns the bytes that the streams of the connection hold.
 	#[cfg(test)]
 	pub(crate) fn used(&self) -> usize {
 		self.used.load(Ordering::Relaxed)
@@ -73,11 +77,12 @@ impl ReassemblyBudget {
 pub(crate) struct Reassembly {
 	/// The chunks concatenated in arrival order.
 	buffer: Vec<u8>,
-	/// Hard byte ceiling on `buffer`, fixed whatever credit the reader grants.
+	/// The hard byte ceiling on `buffer`, fixed whatever credit the reader
+	/// grants.
 	max_bytes: usize,
-	/// Connection-wide ceiling the bytes of this stream are charged against.
+	/// The connection-wide ceiling that this stream charges its bytes against.
 	///
-	/// The reassembly holds the budget rather than taking it per call, so the
+	/// The reassembly holds the budget instead of a borrow per call, so the
 	/// [`Drop`] below returns the bytes whichever path discards it.
 	budget: Arc<ReassemblyBudget>,
 }
@@ -93,25 +98,25 @@ impl Drop for Reassembly {
 }
 
 impl Reassembly {
-	/// An empty reassembly under [`MAX_MUX_REASSEMBLY_BYTES`], charged against
-	/// `budget`.
+	/// Creates an empty reassembly under [`MAX_MUX_REASSEMBLY_BYTES`], charged
+	/// against `budget`.
 	pub(crate) fn new(budget: Arc<ReassemblyBudget>) -> Self {
 		Self::with_ceiling(MAX_MUX_REASSEMBLY_BYTES, budget)
 	}
 
-	/// An empty reassembly under a ceiling of `max_bytes`, charged against
-	/// `budget`.
+	/// Creates an empty reassembly under a ceiling of `max_bytes`, charged
+	/// against `budget`.
 	pub(crate) fn with_ceiling(max_bytes: usize, budget: Arc<ReassemblyBudget>) -> Self {
 		Self { buffer: Vec::new(), max_bytes, budget }
 	}
 
 	/// Append `payload` under the stream ceiling and the connection ceiling.
 	///
-	/// It charges the connection ceiling before it holds the bytes, so a peer
-	/// that spreads its payload across many streams is refused at the same
-	/// total as one stream that reaches its own ceiling. The capacity grows by
-	/// doubling up to the stream ceiling, so the buffer holds no more than the
-	/// ceiling admits (CWE-770).
+	/// It charges the connection ceiling before it holds the bytes, so the
+	/// budget refuses a peer that spreads its payload across many streams once
+	/// their total passes the connection ceiling, as the stream ceiling refuses
+	/// one stream. The capacity doubles up to the stream ceiling, so the buffer
+	/// holds at most what the ceiling admits (CWE-770).
 	///
 	/// # Errors
 	///
@@ -138,7 +143,7 @@ impl Reassembly {
 		Ok(())
 	}
 
-	/// The bytes reassembled so far.
+	/// Returns the bytes reassembled so far.
 	pub(crate) fn as_slice(&self) -> &[u8] {
 		&self.buffer
 	}
@@ -165,8 +170,8 @@ mod tests {
 	/// The stream ceiling of the reassemblies under test.
 	const CEILING: usize = 100;
 
-	/// The capacity grows toward the stream ceiling and stops there, where
-	/// the doubling of a plain `Vec` would pass it.
+	/// The capacity grows toward the stream ceiling and stops there, where a
+	/// plain `Vec` would double past it.
 	#[test]
 	fn a_reassembly_holds_no_capacity_past_its_ceiling() -> TransportResult<()> {
 		let mut reassembly = Reassembly::with_ceiling(CEILING, Arc::new(ReassemblyBudget::default()));
@@ -179,8 +184,8 @@ mod tests {
 		Ok(())
 	}
 
-	/// A payload past the stream ceiling is refused, though the connection
-	/// has room.
+	/// The reassembly refuses a payload past the stream ceiling, though the
+	/// connection has room.
 	#[test]
 	fn a_payload_past_the_stream_ceiling_is_refused() {
 		let mut reassembly = Reassembly::with_ceiling(CEILING, Arc::new(ReassemblyBudget::default()));
@@ -201,5 +206,73 @@ mod tests {
 		let _bytes = reassembly.into_bytes();
 		assert_eq!(budget.used(), 0);
 		Ok(())
+	}
+}
+
+/// The loom models of the connection budget, whose charge and release race on
+/// one counter from the reader task and the stream bodies.
+#[cfg(all(test, tightbeam_loom))]
+mod loom_models {
+	use loom::thread::{self, JoinHandle};
+
+	use super::*;
+
+	/// The stream ceiling of the reassemblies under test, past every payload.
+	const CEILING: usize = 100;
+
+	/// Appends `len` octets to a new reassembly charged against `budget`, and
+	/// returns the reassembly, which holds its charge, and whether the
+	/// reassembly admitted the append.
+	fn append(budget: &Arc<ReassemblyBudget>, len: usize) -> (Reassembly, bool) {
+		let mut reassembly = Reassembly::with_ceiling(CEILING, Arc::clone(budget));
+		let admitted = reassembly.append(vec![0u8; len]).is_ok();
+		(reassembly, admitted)
+	}
+
+	/// Runs [`append`] on a new thread.
+	fn spawn_append(budget: &Arc<ReassemblyBudget>, len: usize) -> JoinHandle<(Reassembly, bool)> {
+		let budget = Arc::clone(budget);
+		thread::spawn(move || append(&budget, len))
+	}
+
+	/// Drops `reassembly` on a new thread, which returns its bytes to the
+	/// budget.
+	fn spawn_drop(reassembly: Reassembly) -> JoinHandle<()> {
+		thread::spawn(move || drop(reassembly))
+	}
+
+	/// Waits for `handle` and returns the output of its thread.
+	fn joined<T>(handle: JoinHandle<T>) -> T {
+		handle.join().expect("the model thread finishes")
+	}
+
+	/// Two appends that together pass the connection ceiling race, and the
+	/// budget admits one of them and holds its bytes alone.
+	#[test]
+	fn two_racing_appends_past_the_ceiling_admit_one() {
+		loom::model(|| {
+			let budget = Arc::new(ReassemblyBudget::with_ceiling(8));
+			let racer = spawn_append(&budget, 5);
+			let (_here, admitted_here) = append(&budget, 5);
+			let (_there, admitted_there) = joined(racer);
+
+			assert_ne!(admitted_here, admitted_there);
+			assert_eq!(budget.used(), 5);
+		});
+	}
+
+	/// A reassembly that drops while another appends returns its bytes, and
+	/// the charge of the append stays whole.
+	#[test]
+	fn a_release_racing_an_append_keeps_the_charge_of_the_append() {
+		loom::model(|| {
+			let budget = Arc::new(ReassemblyBudget::with_ceiling(10));
+			let (held, _) = append(&budget, 5);
+			let releasing = spawn_drop(held);
+			let (_kept, admitted) = append(&budget, 5);
+			joined(releasing);
+
+			assert_eq!((admitted, budget.used()), (true, 5));
+		});
 	}
 }

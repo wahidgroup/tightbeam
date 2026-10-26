@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use crate::builder::frame::FrameBuilder;
 use crate::builder::TypeBuilder;
+use crate::colony::cluster::registry::FailureCount;
 use crate::colony::cluster::runtime::bounds::{ColonyConfig, ColonyDialProtocol, GatewayRuntimeCtx};
 use crate::colony::cluster::runtime::hop::HivePlane;
 use crate::colony::cluster::runtime::LoopFault;
@@ -18,7 +19,9 @@ use crate::colony::protocol::{
 	ClusterCommand, ClusterCommandResponse, ClusterStatus, HeartbeatParams, HeartbeatResult,
 };
 use crate::decode;
-use crate::instrumentation::events::{CLUSTER_HIVE_EVICTED, CLUSTER_RELAY_TRAIL_PRUNED};
+use crate::instrumentation::events::{
+	CLUSTER_HEARTBEAT_FAILED, CLUSTER_HIVE_EVICTED, CLUSTER_PEER_ROUTES_WITHDRAWN, CLUSTER_RELAY_TRAIL_PRUNED,
+};
 use crate::policy::TransitStatus;
 use crate::runtime::rt;
 use crate::transport::Protocol;
@@ -92,7 +95,7 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 	/// Dials one hive and settles the answer against its address.
 	///
 	/// A dial fault is this hive's answer and settles as a failed beat, so
-	/// every other hive in the interval still settles and the next interval
+	/// every other hive in the interval settles as well, and the next interval
 	/// retries this one. A registry fault returns to the loop, which ends on
 	/// it.
 	async fn beat_hive(self, hive: HiveEntry) -> Result<(), LoopFault> {
@@ -103,40 +106,49 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 	/// Settles one heartbeat outcome against the registries.
 	///
 	/// - A live answer refreshes the hive's lease and utilization.
-	/// - A dead or refused answer counts one failure. At the configured
-	///   `max_failures`, the gateway retires the hive with its servlet routes
-	///   and traces the eviction as [`CLUSTER_HIVE_EVICTED`].
+	/// - A dead or refused answer counts one failure and traces it as
+	///   [`CLUSTER_HEARTBEAT_FAILED`]. The membership retires the hive with
+	///   its servlet routes at the configured `max_failures`, and the gateway
+	///   traces the retirement as [`CLUSTER_HIVE_EVICTED`] with the count of
+	///   hives that it left.
 	/// - The configured heartbeat callback fires for both outcomes.
 	///
 	/// # Errors
 	///
 	/// - [`LoopFault::Registry`] -- a registry lock is poisoned, which ends the beat.
-	/// - [`LoopFault::Runtime`] -- the trace refused the eviction event.
+	/// - [`LoopFault::Runtime`] -- the trace refused the failure or the eviction event.
 	fn settle_heartbeat(
 		&self,
 		hive_addr: Arc<[u8]>,
 		result: Result<HeartbeatResult, ClusterError>,
 	) -> Result<(), LoopFault> {
-		let alive = matches!(
-			&result,
-			Ok(hb) if matches!(
-				hb.status,
-				TransitStatus::Ok | TransitStatus::ResourceExhausted
-			)
-		);
+		// A live answer carries the hive's utilization. A failure carries the
+		// status the hive answered, or the status that a dial or an exchange
+		// fault forwards as.
+		let verdict = match &result {
+			Ok(hb) => match hb.status {
+				TransitStatus::Ok | TransitStatus::ResourceExhausted => Ok(hb.utilization),
+				status => Err(status),
+			},
+			Err(error) => Err(error.forward_status()),
+		};
 
-		self.report_heartbeat(&hive_addr, &result, alive);
+		self.report_heartbeat(&hive_addr, &result, verdict.is_ok());
 
-		match (alive, result) {
-			(true, Ok(hb)) => {
-				self.registry.touch(&hive_addr, hb.utilization)?;
+		match verdict {
+			Ok(utilization) => {
+				self.registry.touch(&hive_addr, utilization)?;
 			}
-			_ => {
+			Err(status) => {
 				let max_failures = self.config.heartbeat.max_failures;
-				let failures = self.registry.increment_failure(&hive_addr)?;
-				if failures >= max_failures {
-					self.membership().retire(&hive_addr)?;
-					self.trace.event(CLUSTER_HIVE_EVICTED)?;
+				let counted = self.membership().count_failure(&hive_addr, max_failures)?;
+				let trace = &self.trace;
+				let label = status.as_str();
+				let evidence = Some(hive_addr.as_ref());
+				trace.emit_event_with_value_and_evidence(CLUSTER_HEARTBEAT_FAILED, label, status, evidence)?;
+
+				if let FailureCount::Retired { remaining } = counted {
+					trace.emit_event_with_value_and_evidence(CLUSTER_HIVE_EVICTED, "", remaining, evidence)?;
 				}
 			}
 		}
@@ -204,7 +216,9 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 					// Each hive that lost its lease gets its own event that
 					// names it, so an expiry stays attributable after the fact.
 					for retired in beat_ctx.membership().retire_stale()? {
-						trace.event(CLUSTER_HIVE_EVICTED)?.with_payload(&retired.address).emit();
+						let remaining = retired.remaining;
+						let evidence = Some(retired.entry.address.as_ref());
+						trace.emit_event_with_value_and_evidence(CLUSTER_HIVE_EVICTED, "", remaining, evidence)?;
 					}
 
 					config.clock.sleep(config.heartbeat.interval).await;
@@ -238,15 +252,20 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 				loop {
 					clock.sleep(evaporation_interval).await;
 					servlet_registry.evaporate()?;
-					servlet_registry.remove_abandoned()?;
+
+					// The sweep drops each route at its abandonment limit, and
+					// the traced count of the peer routes among them keeps a
+					// vanished peer route diagnosable (ISO 27001 A.8.15).
+					if let Some(count) = servlet_registry.remove_abandoned()? {
+						let cause = "evaporated";
+						trace.emit_event_with_value_and_evidence(CLUSTER_PEER_ROUTES_WITHDRAWN, cause, count, None)?;
+					}
 
 					// Relay trails refresh through relayed rumors, so age
 					// retires an unpicked fallback. The traced count keeps
 					// a vanished route diagnosable (ISO 27001 A.8.15).
-					let pruned = servlet_registry.prune_stale_relay_trails(relay_trail_ttl)?;
-					if pruned > 0 {
-						let count = u64::try_from(pruned).unwrap_or(u64::MAX);
-						trace.event_with(CLUSTER_RELAY_TRAIL_PRUNED, &[], count)?;
+					if let Some(pruned) = servlet_registry.prune_stale_relay_trails(relay_trail_ttl)? {
+						trace.emit_event_with_value_and_evidence(CLUSTER_RELAY_TRAIL_PRUNED, "", pruned, None)?;
 					}
 				}
 			}

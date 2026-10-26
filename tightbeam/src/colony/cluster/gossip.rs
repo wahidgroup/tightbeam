@@ -20,7 +20,7 @@
 //!
 //! # Admission path
 //!
-//! [`AdmittedGossip`] is the only path from a wire rumor to delivery. The
+//! [`AdmittedGossip`] is the only path from a received rumor to delivery. The
 //! [`GossipJournal`] stores digests for deduplication and retention, and
 //! [`MemoryGossipJournal`] is its in-memory default.
 
@@ -455,9 +455,19 @@ pub(crate) trait RumorConsumer {
 
 /// The rules that differ by the kind of a rumor.
 ///
-/// Each one is a method here, so a new kind states its journal, its
+/// Each one is a method here, so a new kind states its name, its journal, its
 /// consumption, its retry, and the signer it names in this one place.
 impl GossipRumorKind {
+	/// The name of this kind, which the audit event of an admitted rumor
+	/// carries as its label.
+	#[must_use]
+	pub(crate) const fn label(self) -> &'static str {
+		match self {
+			Self::Application => "application",
+			Self::PeerAdvertisement => "peer-advertisement",
+		}
+	}
+
 	/// Journal one admitted rumor of this kind under `digest`, against the
 	/// budget of `signer`.
 	///
@@ -488,7 +498,7 @@ impl GossipRumorKind {
 	/// Consume one admitted rumor of this kind through `consumer`.
 	///
 	/// - An application rumor goes to the local ingress. The ingress takes a
-	///   copy of `rumor`, because the reflood still carries it.
+	///   copy of `rumor`, because the reflood also carries it.
 	/// - An advertisement rumor applies the advertisement its `payload`
 	///   carries to the routing state, as gateway routing control.
 	///
@@ -543,7 +553,7 @@ impl GossipRumorKind {
 	}
 }
 
-/// Per-signer rate admission that gates the gossip pipeline.
+/// The per-signer rate admission that gates the gossip pipeline.
 ///
 /// The gateway consults it after signature verification and before journal
 /// record or reflood, so the gateway refuses an over-limit signer before it
@@ -600,14 +610,17 @@ impl TokenBucketAdmission {
 	/// Builds an admission from `burst`, `refill_interval`, and a
 	/// tracked-signer ceiling of `capacity`.
 	///
-	/// The interval counts in whole milliseconds, and an interval under one
-	/// millisecond refills once per millisecond.
+	/// The interval counts in whole milliseconds. An interval under one
+	/// millisecond refills once per millisecond, and an interval past
+	/// `u64::MAX` milliseconds saturates there (CWE-197).
 	#[must_use]
 	pub fn with_limits(burst: u32, refill_interval: Duration, capacity: usize) -> Self {
+		let whole_ms = u64::try_from(refill_interval.as_millis()).unwrap_or(u64::MAX);
+
 		Self {
 			buckets: Mutex::new(HashMap::new()),
 			burst,
-			refill_interval: Duration::from_millis((refill_interval.as_millis() as u64).max(1)),
+			refill_interval: Duration::from_millis(whole_ms.max(1)),
 			capacity,
 		}
 	}
@@ -687,7 +700,7 @@ impl GossipAdmission for TokenBucketAdmission {
 /// A journal keeps each entry while the issue time its rumor states lies
 /// inside [`GossipJournal::retention`] of the clock, by the rule of
 /// [`FreshnessWindow::admits`]. Admission judges that same instant, so every
-/// rumor still fresh has its digest, and its replay reads as a duplicate
+/// fresh rumor has its digest, and its replay reads as a duplicate
 /// (CWE-294).
 pub trait GossipJournal: Send + Sync {
 	/// Deduplicate and retain one origin-signed rumor in a single step.
@@ -756,7 +769,7 @@ pub trait GossipJournal: Send + Sync {
 	/// - [`ClusterError`] -- a backend fault, such as a poisoned lock.
 	fn seen(&self, digest: &GossipDigest, now: UnixMillis) -> Result<bool, ClusterError>;
 
-	/// The digests of retained rumors still inside the retention window, for
+	/// The digests of retained rumors inside the retention window, for
 	/// reconciliation summaries.
 	///
 	/// # Errors
@@ -827,7 +840,7 @@ struct JournalEntry {
 /// What the journal keeps behind a deduplicated digest.
 ///
 /// A retained rumor serves anti-entropy repair and local delivery retry.
-/// A witnessed digest serves deduplication alone and holds no bytes. The
+/// A witnessed digest serves deduplication alone, so its body is empty. The
 /// retained rumor is boxed, so a witnessed entry costs one pointer rather
 /// than a full inline [`Frame`].
 enum JournalBody {
@@ -840,16 +853,16 @@ enum JournalBody {
 pub enum LocalClaim {
 	/// This caller holds the delivery and answers for its outcome.
 	Taken,
-	/// Another task holds it, or it is already delivered.
+	/// Another task holds the delivery, or the delivery is complete.
 	Held,
 	/// The journal retains no rumor for this digest, so nothing retries it
 	/// and the caller delivers without a claim.
 	Untracked,
 }
 
-/// One local delivery in progress, released when this guard drops.
+/// One local delivery in progress, whose claim this guard releases on drop.
 ///
-/// A claim taken by hand leaks when the delivery future is dropped: a
+/// A claim a caller takes by hand leaks when its delivery future drops: a
 /// cancelled task or a disconnected caller leaves the rumor claimed by no
 /// live task, and no retry ever offers it again. A guard that owns the claim
 /// removes that path, because a dropped future drops the guard.
@@ -869,7 +882,7 @@ pub struct LocalClaimGuard<'a> {
 
 impl<'a> LocalClaimGuard<'a> {
 	/// Claim `digest` for one delivery, or [`None`] when another task holds
-	/// it or it is already delivered.
+	/// it or its delivery is complete.
 	///
 	/// # Errors
 	///
@@ -926,7 +939,7 @@ enum LocalDelivery {
 	Pending,
 	/// One task holds the rumor for its delivery.
 	Claimed,
-	/// The rumor is delivered, so the retry set drops it for good.
+	/// The rumor's delivery is complete, so the retry set drops it for good.
 	Delivered,
 }
 
@@ -997,10 +1010,9 @@ impl MemoryGossipJournal {
 		}
 	}
 
-	/// The count of retained rumors still pending or claimed for local
-	/// delivery.
+	/// The count of retained rumors pending or claimed for local delivery.
 	///
-	/// Zero means every retained rumor is delivered.
+	/// Zero means the delivery of every retained rumor is complete.
 	/// [`GossipJournal::pending_local`] leaves out a claimed rumor, which is in
 	/// flight and leaves the retry set before its delivery ends, so a
 	/// convergence assertion reads this count instead.
@@ -1097,7 +1109,7 @@ impl GossipConfig {
 	///
 	/// Admission and anti-entropy repair both judge through it. A journal
 	/// retains for its own horizon, which can reach past this window, so a
-	/// journal can still fetch a rumor past its issue window.
+	/// fetch can return a rumor past its issue window.
 	pub(crate) fn seen_window(&self) -> FreshnessWindow {
 		FreshnessWindow::new(self.seen_ttl)
 	}
@@ -1244,8 +1256,11 @@ impl GossipJournal for MemoryGossipJournal {
 		Ok(pending)
 	}
 
-	fn claim_local(&self, digest: &GossipDigest, _now: UnixMillis) -> Result<LocalClaim, ClusterError> {
+	fn claim_local(&self, digest: &GossipDigest, now: UnixMillis) -> Result<LocalClaim, ClusterError> {
 		let mut entries = self.entries.lock()?;
+
+		Self::prune(&mut entries, self.retention, now);
+
 		let Some(entry) = entries.get_mut(digest) else {
 			return Ok(LocalClaim::Untracked);
 		};
@@ -1566,6 +1581,20 @@ mod tests {
 		Ok(())
 	}
 
+	// A claim prunes as every read does, so a rumor past retention reads as
+	// untracked rather than as a claim on an entry the next read drops.
+	#[test]
+	fn a_claim_past_retention_finds_no_rumor() -> Result<(), ClusterError> {
+		let journal = MemoryGossipJournal::new(WINDOW);
+		let frame = TestRumor::application(1_000, vec![1, 2, 3]);
+		let digest = digest(&frame);
+
+		journal.record(b"signer-a", digest, &frame, T0, T0)?;
+
+		assert_eq!(journal.claim_local(&digest, UnixMillis::new(90_000))?, LocalClaim::Untracked);
+		Ok(())
+	}
+
 	/// Claim `digest` for one delivery, which an unclaimed rumor always
 	/// admits.
 	fn claim<'a>(journal: &'a MemoryGossipJournal, digest: &'a GossipDigest) -> LocalClaimGuard<'a> {
@@ -1763,7 +1792,21 @@ mod tests {
 		Ok(())
 	}
 
-	// A rumor issued 900 ms ahead of the clock in a 1 s window is still fresh
+	/// A refill interval one millisecond past `u64::MAX` milliseconds, whose
+	/// low 64 bits read as one millisecond.
+	const WRAPPING_INTERVAL: Duration = Duration::new(18_446_744_073_709_551, 617_000_000);
+
+	// An interval past the `u64` range of milliseconds saturates, so a spent
+	// bucket stays spent (CWE-197).
+	#[test]
+	fn admission_saturates_an_interval_past_the_u64_range() -> Result<(), ClusterError> {
+		let admission = TokenBucketAdmission::with_limits(1, WRAPPING_INTERVAL, 1);
+		assert!(admission.allow(b"signer", T0)?);
+		assert!(!admission.allow(b"signer", UnixMillis::new(2_000))?);
+		Ok(())
+	}
+
+	// A rumor issued 900 ms ahead of the clock in a 1 s window stays fresh
 	// 1.1 s after the journal first takes it, so the journal keeps its digest
 	// and a replay of either kind is a duplicate (CWE-294).
 	tb_cases! {
@@ -1773,8 +1816,8 @@ mod tests {
 			let rumor_digest = digest(&rumor);
 
 			kind.journal(&journal, b"signer-a", rumor_digest, &rumor, UnixMillis::new(1_000))?;
-			let replayed = kind.journal(&journal, b"signer-a", rumor_digest, &rumor, UnixMillis::new(2_100))?;
 
+			let replayed = kind.journal(&journal, b"signer-a", rumor_digest, &rumor, UnixMillis::new(2_100))?;
 			assert_eq!(replayed, Admission::Duplicate);
 			Ok(())
 		}

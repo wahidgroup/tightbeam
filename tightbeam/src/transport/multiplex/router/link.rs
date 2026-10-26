@@ -25,13 +25,12 @@ use crate::instrumentation::events;
 /// A connection's shared state and the outbound queue that serves it.
 ///
 /// Every send path needs both handles, and they belong to one connection.
-/// Pairing them in one owner keeps a queue from serving the state of a
-/// different connection.
+/// One owner of both keeps each queue on the state of its own connection.
 pub(crate) struct MuxLink {
 	shared: Arc<MuxShared>,
 	outbound: mpsc::Sender<Outbound>,
-	/// Consumption reports from stream bodies back to the reader's credit
-	/// replenishment. The channel carries no buffer of its own, so every
+	/// The sender of consumption reports from stream bodies to the reader's
+	/// credit replenishment. The channel has a zero-length buffer, so every
 	/// body reports through the one slot its own sender clone owns.
 	drain_feedback: mpsc::Sender<DrainNote>,
 }
@@ -58,10 +57,10 @@ impl MuxLink {
 	/// The drain channel has a zero-length buffer, so its capacity is one slot
 	/// per live sender.
 	///
-	/// - Live bodies bound the outstanding notes, so a reader that stops
-	///   draining cannot be made to hold more (CWE-770).
-	/// - A body whose slot is taken reports its current count once the slot
-	///   frees ([`StreamBody`](super::body::StreamBody)).
+	/// - Live bodies bound the outstanding notes, so a reader that stops its
+	///   drain holds at most one note per live body (CWE-770).
+	/// - A body whose slot holds an unread note reports its current count once
+	///   the slot frees ([`StreamBody`](super::body::StreamBody)).
 	pub(crate) fn new(shared: Arc<MuxShared>, outbound: mpsc::Sender<Outbound>) -> (Self, mpsc::Receiver<DrainNote>) {
 		let (drain_feedback, drained) = mpsc::channel(0);
 		let link = Self { shared, outbound, drain_feedback };
@@ -69,7 +68,7 @@ impl MuxLink {
 		(link, drained)
 	}
 
-	/// Connection state behind this link.
+	/// The connection state behind this link.
 	pub(crate) fn shared(&self) -> &Arc<MuxShared> {
 		&self.shared
 	}
@@ -77,8 +76,8 @@ impl MuxLink {
 	/// A fresh sender over the same queue.
 	///
 	/// A `futures::mpsc` channel admits `buffer + senders` items, so every
-	/// clone carries a slot of its own. A send that must not be lost to
-	/// backpressure takes a clone to claim that slot.
+	/// clone carries a slot of its own. A send that backpressure must not drop
+	/// takes a clone to claim that slot.
 	///
 	/// # Sources
 	///
@@ -88,7 +87,7 @@ impl MuxLink {
 		self.outbound.clone()
 	}
 
-	/// Drain-note sender for a stream body on this connection.
+	/// A drain-note sender for a stream body on this connection.
 	///
 	/// Each clone carries its own guaranteed slot, so every body reports
 	/// through its own capacity.
@@ -96,11 +95,11 @@ impl MuxLink {
 		self.drain_feedback.clone()
 	}
 
-	/// Hand `command` to the writer on this link's own sender without
-	/// waiting.
+	/// Hand `command` to the writer on this link's own sender without a
+	/// wait.
 	///
 	/// The link's sender keeps its slot across calls, so a full queue
-	/// refuses the command instead of admitting it through a fresh slot.
+	/// refuses the command, which a fresh slot would admit.
 	///
 	/// # Errors
 	///
@@ -110,16 +109,16 @@ impl MuxLink {
 	}
 
 	/// Refuse a peer stream at the concurrency cap with a payload-free
-	/// `ResourceExhausted` trailer on this link's own sender, without
-	/// waiting.
+	/// `ResourceExhausted` trailer on this link's own sender, without a
+	/// wait.
 	///
 	/// # Resource bound
 	///
 	/// - The sender keeps its slot across calls, so a stalled writer admits
-	///   one refusal and every later one is dropped instead of queued.
-	/// - Only a peer that opens past the cap it was advertised reaches this
+	///   one refusal, and the link drops each later one rather than queue it.
+	/// - Only a peer that opens past the cap this side advertises reaches this
 	///   path, so its excess opens buy no memory here (CWE-770).
-	/// - Nothing was registered for the stream, so there is no ledger to release.
+	/// - The refusal comes before the stream registers, so the call leaves the ledgers as they are.
 	///
 	/// # Errors
 	///
@@ -129,8 +128,8 @@ impl MuxLink {
 		let package = MuxEndPackage::new(stream_id, TransitStatus::ResourceExhausted, Vec::new())?;
 		match self.outbound.try_send(Outbound::Envelope(package.into())) {
 			Ok(()) => Ok(()),
-			// An earlier refusal still holds the slot: this peer is past its
-			// cap, so the refusal is the one thing a stalled writer may drop.
+			// An earlier refusal holds the slot, and this peer is past its cap,
+			// so the refusal is the one record that a stalled writer may drop.
 			Err(refused) if refused.is_full() => Ok(()),
 			Err(_) => Err(TransportError::ConnectionClosed),
 		}
@@ -139,7 +138,7 @@ impl MuxLink {
 	/// Drain buffered control into the writer queue.
 	///
 	/// The drain is cancellation-safe, because a command leaves the buffer only
-	/// after its slot is reserved.
+	/// after the drain reserves its slot.
 	///
 	/// # Errors
 	///
@@ -162,8 +161,8 @@ impl MuxLink {
 		Ok(())
 	}
 
-	/// Send a response on a peer-initiated stream, chunking when it exceeds the
-	/// peer's advertised receive size.
+	/// Send a response on a peer-initiated stream, in chunks when it exceeds
+	/// the peer's advertised receive size.
 	///
 	/// - Full chunks travel as `Data(last = false)`, and the final chunk
 	///   travels inline in the `End` trailer (responder grammar).
@@ -174,6 +173,7 @@ impl MuxLink {
 	///
 	/// - [`TransportError::ConnectionClosed`] -- a driver of the connection ended before the response left.
 	/// - The encode failure of a response frame that does not serialize.
+	/// - The injected error, when the runtime fault model injects a fault at the record of a budget refusal.
 	pub(crate) async fn send_response(&self, stream_id: u32, response: ResponsePackage) -> TransportResult<()> {
 		let mut status = response.status();
 		let mut payload = match response.message() {
@@ -185,12 +185,13 @@ impl MuxLink {
 		match self.shared.admit_debit(credits, true).await {
 			Ok(BudgetStanding::Healthy) => {}
 			Ok(BudgetStanding::Exhausting) => self.drain_budget(credits).await?,
-			// Even the drain reserve cannot carry the payload, so refuse the
-			// stream for free instead of tearing the connection down.
-			Err(_) => {
+			// Even the drain reserve cannot carry the payload, so the call
+			// refuses the stream for free and keeps the connection up.
+			Err(TransportError::OperationFailed(TransportFailure::BudgetExhausted)) => {
 				status = TransitStatus::ResourceExhausted;
 				payload = Vec::new();
 			}
+			Err(fault) => return Err(fault),
 		}
 
 		if payload.is_empty() {
@@ -214,8 +215,8 @@ impl MuxLink {
 
 			match self.send_data_envelope(stream_id, envelope).await {
 				Ok(()) => {}
-				// The peer cancelled the stream and removed its ledger
-				// mid-send, so the receiver discards what already went out.
+				// A peer cancel removes the stream's ledger mid-send, and the
+				// receiver discards the chunks that went out.
 				Err(TransportError::OperationFailed(TransportFailure::Cancelled)) => return Ok(()),
 				Err(err) => {
 					self.shared.finish_send_stream(stream_id);
@@ -248,8 +249,8 @@ impl MuxLink {
 		sent.map_err(|_| TransportError::ConnectionClosed)
 	}
 
-	/// Local teardown for an abandoned locally-initiated stream, shared by
-	/// drop guards, abandoned sinks, and explicit close.
+	/// Tear down an abandoned locally-initiated stream on this side. Drop
+	/// guards, abandoned sinks, and an explicit close share the call.
 	///
 	/// # Delivery
 	///
@@ -258,13 +259,13 @@ impl MuxLink {
 	/// own timeout.
 	pub(crate) fn enqueue_stream_cancel(&self, stream_id: u32) {
 		if let Some(mut forwarder) = self.shared.take_duplex(stream_id) {
-			// A reply body already dropped has no reader for the failure, and
-			// the stream is torn down either way.
+			// A reply body that has dropped has no reader for the failure, and
+			// this call tears the stream down either way.
 			let _ = forwarder.forward(BodyEvent::Failed(CancelReason::Cancelled.cancel_error()));
 		}
 		if let Some(sender) = self.shared.remove_pending(stream_id) {
-			// The initiator may already have dropped its future, which is one
-			// of the ways a stream is abandoned.
+			// The initiator may have dropped its future, which is one way to
+			// abandon a stream.
 			let _ = sender.send(StreamOutcome::Cancelled(CancelReason::Cancelled));
 			let package = MuxCancelPackage::new(stream_id, CancelReason::Cancelled);
 			// A full or closed queue drops the notice, and the peer then frees
@@ -297,7 +298,7 @@ impl MuxLink {
 	}
 
 	/// Send a stream's Open record through the atomic open of
-	/// [`StreamReservation::poll_open`], returning the assigned stream ID.
+	/// [`StreamReservation::poll_open`], and return the stream ID it assigns.
 	///
 	/// The send reserves a writer-queue slot, then assigns the stream ID and
 	/// enqueues in one critical section, so Opens reach the wire in ID order.
@@ -323,8 +324,8 @@ impl MuxLink {
 	/// Queue a GoAway with `reason` and halt the allocator, exactly once per
 	/// connection.
 	///
-	/// Graceful shutdown and the budget drain share this path. The GoAway is
-	/// recorded once it is queued, so a fault the trace injects at the record
+	/// Graceful shutdown and the budget drain share this path. The call records
+	/// the GoAway once it queues it, so a fault the trace injects at the record
 	/// leaves the GoAway on its way.
 	///
 	/// # Errors
@@ -349,7 +350,7 @@ impl MuxLink {
 
 	/// Announce the drain that a debit of `credits` from the reserve reached.
 	///
-	/// The debit stands once the drain recorded its GoAway. A drain that fails
+	/// The debit stands once the drain records its GoAway. A drain that fails
 	/// returns the credits to the budget, because the payload they meter does
 	/// not leave.
 	///
@@ -442,8 +443,8 @@ mod tests {
 		matches!(command, Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::GoAway(_))))
 	}
 
-	/// The GoAway is recorded once it is queued, so a fault the trace injects
-	/// at the record leaves the GoAway on its way to the peer
+	/// The link records the GoAway once it queues it, so a fault the trace
+	/// injects at the record leaves the GoAway on its way to the peer
 	/// (RFC 9113 § 6.8).
 	#[test]
 	fn a_fault_at_the_goaway_record_leaves_the_goaway_queued() {

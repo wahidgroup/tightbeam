@@ -6,14 +6,18 @@
 use alloc::boxed::Box;
 
 #[cfg(feature = "std")]
+use core::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "std")]
 use core::time::Duration;
+#[cfg(feature = "std")]
+use std::hash::{DefaultHasher, Hash, Hasher};
 
 use crate::transport::error::TransportFailure;
 use crate::transport::policy::{CoreRetryPolicy, RestartPolicy, RetryAction};
 use crate::Frame;
 
 #[cfg(feature = "std")]
-use crate::random::generate_nonce;
+use crate::random::{generate_nonce, placement_entropy};
 #[cfg(feature = "std")]
 use crate::transport::policy::JitterStrategy;
 
@@ -39,10 +43,25 @@ pub struct DecorrelatedJitter;
 #[cfg(feature = "std")]
 impl JitterStrategy for DecorrelatedJitter {
 	fn apply(&self, base_delay: u64) -> u64 {
-		// The draw comes from the random source, because jitter exists to
-		// spread peers apart and a clock reading would move every peer
-		// together. A source that fails seeds the draw with the base delay.
-		let seed = generate_nonce::<8>(None).map_or(base_delay, u64::from_le_bytes);
+		// The draw comes from the random source, because jitter spreads peers
+		// apart and a clock reading would move every peer together. A refused
+		// draw drops its error, because `draw` then seeds from `refused_seed`.
+		let drawn = generate_nonce::<8>(None).ok();
+		Self::draw(base_delay, drawn)
+	}
+}
+
+/// The count of the draws that the random source refused in this process.
+#[cfg(feature = "std")]
+static REFUSED_DRAWS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "std")]
+impl DecorrelatedJitter {
+	/// The delay inside the window of `base_delay` that `drawn`, eight octets
+	/// of the random source, picks. A draw that the source refused, `None`,
+	/// picks with the seed of [`Self::refused_seed`].
+	fn draw(base_delay: u64, drawn: Option<[u8; 8]>) -> u64 {
+		let seed = drawn.map_or_else(Self::refused_seed, u64::from_le_bytes);
 
 		let (min, range) = decorrelated_bounds(base_delay);
 		let Some(offset) = seed.checked_rem(range) else {
@@ -50,6 +69,20 @@ impl JitterStrategy for DecorrelatedJitter {
 		};
 
 		min.saturating_add(offset)
+	}
+
+	/// The seed of a draw that the random source refused: the hash of the
+	/// [`placement_entropy`] of this process and of the count of
+	/// [`REFUSED_DRAWS`].
+	///
+	/// The placement differs between processes, so peers that lose the source
+	/// together seed apart, and the count moves each later seed of one process.
+	fn refused_seed() -> u64 {
+		let refused = REFUSED_DRAWS.fetch_add(1, Ordering::Relaxed);
+		let mut hasher = DefaultHasher::new();
+		(placement_entropy(), refused).hash(&mut hasher);
+
+		hasher.finish()
 	}
 }
 
@@ -217,25 +250,30 @@ mod tests {
 
 	use super::*;
 
-	/// Returns the distinct delays that a run of `draws` jitter draws yields
-	/// over `base`.
-	fn drawn_delays(base: u64, draws: usize) -> BTreeSet<u64> {
-		let jitter = DecorrelatedJitter;
-		(0..draws).map(|_| jitter.apply(base)).collect()
+	/// Returns the distinct delays that a run of `draws` draws of `jitter`
+	/// yields over `base`.
+	fn drawn_delays(jitter: fn(u64) -> u64, base: u64, draws: usize) -> BTreeSet<u64> {
+		(0..draws).map(|_| jitter(base)).collect()
 	}
 
-	/// Jitter exists to spread peers apart, so a run of draws over one base
-	/// yields more than one delay, and each sits inside the decorrelated
-	/// window. A draw that ignored the random source would yield one value.
-	#[test]
-	fn jitter_spreads_its_draws_inside_the_window() {
-		let base = 3_000_000;
-		let (min, range) = decorrelated_bounds(base);
+	// A run of draws over one base yields more than one delay, each inside the
+	// decorrelated window, whether the random source serves each draw or
+	// refuses it. A draw that ignored its seed would yield one value.
+	crate::tb_cases! {
+		fn jitter_spreads_its_draws_inside_the_window(jitter: fn(u64) -> u64) {
+			let base = 3_000_000;
+			let (min, range) = decorrelated_bounds(base);
 
-		let delays = drawn_delays(base, 32);
-		let (lowest, highest) = (delays.first().copied(), delays.last().copied());
-		assert!(delays.len() > 1);
-		assert!(lowest >= Some(min));
-		assert!(highest < Some(min + range));
+			let delays = drawn_delays(jitter, base, 32);
+			let (lowest, highest) = (delays.first().copied(), delays.last().copied());
+			assert!(delays.len() > 1);
+			assert!(lowest >= Some(min));
+			assert!(highest < Some(min + range));
+		}
+
+		cases {
+			from_the_random_source => |base| DecorrelatedJitter.apply(base),
+			with_the_source_refused => |base| DecorrelatedJitter::draw(base, None),
+		}
 	}
 }

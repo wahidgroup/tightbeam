@@ -13,8 +13,8 @@ keywords.workspace = true
 categories.workspace = true
 description = "A secure, high-performance messaging protocol library"
 
-# The test tree and the fuzz corpus serve development
-exclude = ["tests/**", "fuzz/**"]
+# The test tree, the benches, and the fuzz corpus serve development
+exclude = ["tests/**", "benches/**", "fuzz/**"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -72,9 +72,11 @@ afl = { workspace = true, optional = true }
 proptest = { workspace = true, optional = true }
 
 [dev-dependencies]
+# The dev feature set leaves `rayon` off, so `cargo test` runs the suite with
+# the sequential FDR walk and `--all-features` runs it with the parallel one.
+# `make test-all` runs both.
 tightbeam-rs = { path = ".", features = [
 	"full",
-	"rayon",
 	"zstd",
 	"testing",
 	"testing-csp",
@@ -90,6 +92,11 @@ p384 = { workspace = true }
 p521 = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 trybuild = { workspace = true }
+
+# `make loom` builds the library tests under `--cfg tightbeam_loom`, where the
+# atomics of the multiplexer's hand-built protocols come from `loom`.
+[target.'cfg(tightbeam_loom)'.dev-dependencies]
+loom = "=0.7.2"
 
 [features]
 default = ["std", "builder"]
@@ -338,6 +345,15 @@ name = "fuzz_colony"
 path = "fuzz/colony/mod.rs"
 # IJON annotations steer the colony state search
 required-features = ["full", "testing-fuzz", "testing-fuzz-ijon"]
+
+# Benches, one binary each, that `make bench` runs.
+[[bench]]
+name = "seal_open"
+harness = false
+
+[[bench]]
+name = "replay_guard"
+harness = false
 
 [build-dependencies]
 cfg_aliases = "=0.2.2"

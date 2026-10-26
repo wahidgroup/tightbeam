@@ -53,7 +53,7 @@ use tightbeam::transport::{ClientBuilder, ConnectionBuilder, GenericClient, Prot
 use tightbeam::urn::Urn;
 use tightbeam::utils::time::UnixMillis;
 use tightbeam::x509::Certificate;
-use tightbeam::{at_least, cluster, decode, exactly, hive, servlet, tb_assert_spec, tb_scenario, urn};
+use tightbeam::{absent, at_least, cluster, decode, exactly, hive, servlet, tb_assert_spec, tb_scenario, urn};
 use tightbeam::{Frame, TightBeamError, Version};
 
 use super::{outside_identity_of, OutsideProvider};
@@ -61,11 +61,6 @@ use crate::common::hive::scenario_hive_config;
 use crate::common::poll::poll_until;
 
 const OUTSIDE_ECHO_RAN: Urn<'static> = urn!("test", "event:seams/outside-echo-ran");
-const OUTSIDE_WORK_ECHOED: Urn<'static> = urn!("test", "event:seams/outside-work-echoed");
-const OUTSIDE_HEARTBEAT_ANSWERED: Urn<'static> = urn!("test", "event:seams/outside-heartbeat-answered");
-const OUTSIDE_RUMOR_DIGEST_WIDTH: Urn<'static> = urn!("test", "event:seams/outside-rumor-digest-width");
-const OUTSIDE_GATEWAY_NAMED: Urn<'static> = urn!("test", "event:seams/outside-gateway-named");
-const OUTSIDE_SIBLING_ECHOED: Urn<'static> = urn!("test", "event:seams/outside-sibling-echoed");
 
 /// The content the client's work frame carries and the servlet echoes.
 const OUTSIDE_CONTENT: &str = "forwarded under an outside provider";
@@ -331,7 +326,8 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(OUTSIDE_HEARTBEAT_ANSWERED, exactly!(1), equals!(TransitStatus::Ok)),
+			(events::HIVE_ESTABLISHED, exactly!(1)),
+			(events::HIVE_COMMAND_REFUSED, absent!()),
 			(events::CLUSTER_DIAL_REFUSED, exactly!(0))
 		]
 	}
@@ -350,7 +346,7 @@ tb_scenario! {
 			let hive_addr = registered.hive.addr().copied().ok_or(TightBeamError::NotEstablished)?;
 
 			let beat = registered.advertiser.send_heartbeat(hive_addr).await?;
-			trace.event_with(OUTSIDE_HEARTBEAT_ANSWERED, &[], beat.status)?;
+			assert_eq!(beat.status, TransitStatus::Ok, "the hive answers the outside heartbeat");
 
 			registered.stop();
 			Ok(())
@@ -393,7 +389,7 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(OUTSIDE_GATEWAY_NAMED, exactly!(1), equals!(true)),
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(1)),
 			(events::CLUSTER_DIAL_REFUSED, exactly!(0))
 		]
 	}
@@ -413,9 +409,12 @@ tb_scenario! {
 
 			let routes = registered.receiver.peer_routes()?;
 			let fingerprint = Fingerprint::<Sha3_512>::from_certificate(&colony.advertiser.certificate)?;
-			let route = routes.first();
-			let named = route.is_some_and(|route| route.peer_id.as_ref() == fingerprint.as_slice());
-			trace.event_with(OUTSIDE_GATEWAY_NAMED, &[], named)?;
+			let named = routes.first().map(|route| route.peer_id.as_ref());
+			assert_eq!(
+				named,
+				Some(fingerprint.as_slice()),
+				"the route names the advertiser by its SHA3-512 fingerprint"
+			);
 
 			registered.stop();
 			Ok(())
@@ -428,7 +427,7 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(OUTSIDE_RUMOR_DIGEST_WIDTH, exactly!(1), equals!(64u64)),
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(1)),
 			(events::CLUSTER_DIAL_REFUSED, exactly!(0))
 		]
 	}
@@ -452,7 +451,7 @@ tb_scenario! {
 			// reply goes unread.
 			let _reply = publisher.emit(publish, None).await?;
 			let width = held_digest_width(&registered.journal).await;
-			trace.event_with(OUTSIDE_RUMOR_DIGEST_WIDTH, &[], width)?;
+			assert_eq!(width, 64, "the receiver keeps the rumor under its SHA3-512 digest");
 
 			registered.stop();
 			Ok(())
@@ -467,7 +466,6 @@ tb_assert_spec! {
 		assertions: [
 			(events::CLUSTER_WORK_FORWARDED, exactly!(1)),
 			(OUTSIDE_ECHO_RAN, exactly!(1)),
-			(OUTSIDE_WORK_ECHOED, exactly!(1), equals!(true)),
 			(events::CLUSTER_DIAL_REFUSED, exactly!(0))
 		]
 	}
@@ -485,13 +483,14 @@ tb_scenario! {
 		client: |HiveEnv { trace, context: colony, hive }| async move {
 			let registered = RegisteredColony::start(&trace, &colony, hive).await;
 			await_route(&registered.receiver).await;
-			let mut client = colony.receiver.client(registered.receiver.addr()).await;
 
+			let mut client = colony.receiver.client(registered.receiver.addr()).await;
 			let message = TestMessage { content: OUTSIDE_CONTENT.into() };
 			let work = Version::V0.compose().with_id(b"outside-work").with_message(message).build()?;
 			let echoed = client.submit_work_to(echo_urn(), &work).await?;
+
 			let content: TestMessage = decode(echoed.message())?;
-			trace.event_with(OUTSIDE_WORK_ECHOED, &[], content.content == OUTSIDE_CONTENT)?;
+			assert_eq!(content.content, OUTSIDE_CONTENT, "the forwarded work echoes");
 
 			registered.stop();
 			Ok(())
@@ -505,7 +504,7 @@ tb_assert_spec! {
 		mode: Accept,
 		assertions: [
 			(OUTSIDE_ECHO_RAN, exactly!(1)),
-			(OUTSIDE_SIBLING_ECHOED, exactly!(1), equals!(true))
+			(events::CLUSTER_DIAL_REFUSED, exactly!(0))
 		]
 	}
 }
@@ -518,13 +517,13 @@ tb_scenario! {
 	environment Hive {
 		context: OutsideColony::generate(),
 		start: |SetupEnv { trace, context: colony }| start_outside_hive(trace, colony),
-		client: |HiveEnv { trace, hive, .. }| async move {
+		client: |HiveEnv { hive, .. }| async move {
 			let message = TestMessage { content: OUTSIDE_CONTENT.into() };
 			let call = Version::V0.compose().with_id(b"outside-call").with_message(message).build()?;
 
 			let echoed = hive.context().call(&echo_urn(), call).await?;
 			let content: TestMessage = decode(echoed.message())?;
-			trace.event_with(OUTSIDE_SIBLING_ECHOED, &[], content.content == OUTSIDE_CONTENT)?;
+			assert_eq!(content.content, OUTSIDE_CONTENT, "the hive's context call echoes");
 
 			hive.stop();
 			Ok(())

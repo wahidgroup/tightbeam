@@ -8,6 +8,7 @@ set -euo pipefail
 #   fuzz-run.sh                  the run to analyze, as an absolute path
 #   fuzz-run.sh --target PATH    the target name owning a crash or hang file
 #   fuzz-run.sh --bin-dir        the directory the fuzz binaries build into
+#   fuzz-run.sh --seeds DIR      each seed file of the corpus DIR, one per line
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$ROOT/built/fuzz/out"
@@ -17,6 +18,18 @@ if [ "${1:-}" = "--bin-dir" ]; then
 	# CARGO_TARGET_DIR and build.target-dir.
 	TARGET_DIR="$(cargo metadata --manifest-path "$ROOT/Cargo.toml" --no-deps --format-version 1 | jq -r .target_directory)"
 	printf '%s\n' "$TARGET_DIR/debug"
+	exit 0
+fi
+
+if [ "${1:-}" = "--seeds" ]; then
+	if [ "$#" -ne 2 ]; then
+		echo "usage: $(basename "$0") --seeds <corpus-dir>" >&2
+		exit 2
+	fi
+
+	# A seed file ends in .txt, .bin, or .dat, so the README of a corpus
+	# stays out of the AFL input directory.
+	find "$2" -type f \( -name '*.txt' -o -name '*.bin' -o -name '*.dat' \) | sort
 	exit 0
 fi
 

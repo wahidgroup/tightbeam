@@ -1,4 +1,6 @@
 use core::cell::Cell;
+#[cfg(feature = "instrument")]
+use core::sync::atomic::{AtomicU32, Ordering};
 use core::time::Duration;
 
 use std::borrow::Cow;
@@ -7,7 +9,7 @@ use std::sync::Arc;
 use std::sync::{Once, RwLock};
 
 use core::fmt;
-#[cfg(any(test, feature = "testing", feature = "instrument", feature = "testing-fault"))]
+#[cfg(any(test, feature = "testing", feature = "testing-fault"))]
 use std::sync::Mutex;
 #[cfg(feature = "testing-fault")]
 use std::sync::OnceLock;
@@ -143,7 +145,7 @@ impl InternalEvent {
 	}
 }
 
-/// Configuration for trace collection.
+/// The configuration of trace collection.
 #[derive(Default)]
 pub struct TraceConfig {
 	/// The instrumentation settings. `None` uses the default settings.
@@ -346,20 +348,16 @@ impl<'a, V: Into<EventValue>> EventBuilder<'a, V> {
 					events::ASSERT_LABEL
 				};
 
+				let payload = self.payload;
 				self.collector
-					.emit_internal(urn, Some(&label), self.payload, self.duration_ns, None);
+					.emit_internal(urn, Some(&label), || payload, self.duration_ns, None);
 			}
 			Some(EventValue::Value(assertion_value)) => {
 				// An event with a value takes no payload, so the rendered
 				// value fills the one payload of the record.
-				let value_str = assertion_value.render();
-				self.collector.emit_internal(
-					events::ASSERT_PAYLOAD,
-					Some(&label),
-					Some(value_str.as_bytes()),
-					self.duration_ns,
-					None,
-				);
+				let rendered = || Some(assertion_value.render());
+				self.collector
+					.emit_internal(events::ASSERT_PAYLOAD, Some(&label), rendered, self.duration_ns, None);
 			}
 		}
 
@@ -368,7 +366,11 @@ impl<'a, V: Into<EventValue>> EventBuilder<'a, V> {
 
 		#[cfg(any(test, feature = "testing"))]
 		{
-			let seq = self.collector.state.assertions.lock().map(|a| a.len()).unwrap_or(0);
+			// One lock gives the assertion its sequence number and its place
+			// in the list. A record only appends, so a poisoned lock holds a
+			// whole list, and the record reads through the poison.
+			let mut assertions = self.collector.state.assertions.lock().unwrap_or_else(PoisonError::into_inner);
+			let seq = assertions.len();
 			let tags = self.tags.take().map(|t| t.into_owned()).unwrap_or_default();
 			let assertion = match value {
 				Some(EventValue::None) | None => Assertion::new(seq, AssertionLabel::Custom(label), tags, None),
@@ -377,9 +379,7 @@ impl<'a, V: Into<EventValue>> EventBuilder<'a, V> {
 				}
 			};
 
-			if let Ok(mut assertions) = self.collector.state.assertions.lock() {
-				assertions.push(assertion);
-			}
+			assertions.push(assertion);
 		}
 
 		#[cfg(not(any(test, feature = "testing")))]
@@ -470,7 +470,8 @@ struct TraceOrigin {
 
 #[cfg(feature = "instrument")]
 impl TraceOrigin {
-	/// The origin that `clock` reads now, which the first event on it records.
+	/// The origin that `clock` reads at the call, which its first event
+	/// records.
 	fn of(clock: Arc<dyn Clock>) -> Self {
 		let monotonic = clock.monotonic();
 		let unix = clock.unix();
@@ -529,7 +530,7 @@ impl TraceClock {
 		guard.as_ref().map(|origin| Arc::clone(&origin.clock))
 	}
 
-	/// Adopt `clock` with a new origin, which the next event records.
+	/// Adopts `clock` with a new origin, which the next event records.
 	///
 	/// A write under the lock replaces the origin whole, so a poisoned lock
 	/// takes the new origin too.
@@ -539,7 +540,7 @@ impl TraceClock {
 		*slot = Some(origin);
 	}
 
-	/// Stamp one event on the adopted clock under one read guard.
+	/// Stamps one event on the adopted clock under one read guard.
 	///
 	/// - `record` receives the origin as Unix-epoch nanoseconds when the event is the first on it.
 	/// - `emit` then receives the nanoseconds on the clock since the origin, or `None` with no clock adopted.
@@ -605,7 +606,7 @@ impl Default for RuntimeFaults {
 	}
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct TraceState {
 	#[cfg(any(test, feature = "testing"))]
 	assertions: Mutex<Vec<Assertion>>,
@@ -616,8 +617,10 @@ struct TraceState {
 	sink: SinkHandle,
 	#[cfg(feature = "instrument")]
 	config: TbInstrumentationConfig,
+	/// The sequence number of the next event. One atomic add gives each event
+	/// its own number.
 	#[cfg(feature = "instrument")]
-	seq: Mutex<u32>,
+	seq: AtomicU32,
 	#[cfg(feature = "instrument")]
 	clock: TraceClock,
 	#[cfg(feature = "testing-fuzz")]
@@ -631,29 +634,6 @@ struct TraceState {
 	logger_config: Option<super::logging::LoggerConfig>,
 }
 
-impl Default for TraceState {
-	fn default() -> Self {
-		Self {
-			#[cfg(any(test, feature = "testing"))]
-			assertions: Mutex::new(Vec::new()),
-			#[cfg(feature = "instrument")]
-			sink: SinkHandle::default(),
-			#[cfg(feature = "instrument")]
-			config: TbInstrumentationConfig::default(),
-			#[cfg(feature = "instrument")]
-			seq: Mutex::new(0),
-			#[cfg(feature = "instrument")]
-			clock: TraceClock::default(),
-			#[cfg(feature = "testing-fuzz")]
-			oracle: None,
-			#[cfg(feature = "testing-fault")]
-			runtime_faults: OnceLock::new(),
-			#[cfg(feature = "logging")]
-			logger_config: None,
-		}
-	}
-}
-
 impl TraceState {
 	#[cfg(feature = "instrument")]
 	fn with_config(config: TbInstrumentationConfig, sink: Option<Arc<dyn EventSink>>) -> Self {
@@ -664,7 +644,7 @@ impl TraceState {
 			assertions: Mutex::new(Vec::new()),
 			sink,
 			config,
-			seq: Mutex::new(0),
+			seq: AtomicU32::new(0),
 			clock: TraceClock::default(),
 			#[cfg(feature = "testing-fuzz")]
 			oracle: None,
@@ -686,7 +666,7 @@ impl TraceState {
 			#[cfg(feature = "instrument")]
 			config: TbInstrumentationConfig::default(),
 			#[cfg(feature = "instrument")]
-			seq: Mutex::new(0),
+			seq: AtomicU32::new(0),
 			#[cfg(feature = "instrument")]
 			clock: TraceClock::default(),
 			oracle: Some(oracle),
@@ -787,7 +767,7 @@ impl TraceCollector {
 	}
 
 	/// Adopts `clock` as the clock this collector stamps its events on, with
-	/// an origin it reads from `clock` now.
+	/// an origin it reads from `clock` at the call.
 	///
 	/// - Every handle that shares the state reads the clock.
 	/// - The next event records the origin as
@@ -876,7 +856,6 @@ impl TraceCollector {
 	/// # Errors
 	///
 	/// - The injection point's error, when the model injects a fault.
-	/// - [`crate::TightBeamError::LockPoisoned`] -- the fault-state lock is poisoned.
 	///
 	/// # Why `&Cow<'static, str>` instead of `&str`
 	///
@@ -886,7 +865,7 @@ impl TraceCollector {
 	/// - The fault injection counters key a `HashMap<Cow<'static, str>, u32>` by the label.
 	/// - `Cow::clone()` on `Cow::Borrowed` copies only the pointer.
 	/// - A `&str` parameter would force a `Cow::Borrowed(label)` construction.
-	/// - Static labels stay allocation-free, and dynamic labels still work.
+	/// - Static labels stay allocation-free, and dynamic labels work too.
 	#[allow(clippy::ptr_arg)]
 	#[cfg(feature = "testing-fault")]
 	fn check_runtime_fault_injection(&self, label_cow: &Cow<'static, str>) -> Result<(), crate::TightBeamError> {
@@ -894,7 +873,9 @@ impl TraceCollector {
 			return Ok(());
 		};
 
-		let mut faults = slot.lock()?;
+		// A panic under the lock leaves a whole model, as `with_fault_model`
+		// states, so the draw reads through a poisoned lock.
+		let mut faults = slot.lock().unwrap_or_else(PoisonError::into_inner);
 		let fault = faults.draw(label_cow);
 		fault.map_or(Ok(()), Err)
 	}
@@ -905,7 +886,6 @@ impl TraceCollector {
 	/// # Errors
 	///
 	/// - The injected error, when the runtime fault model injects a fault at `label`.
-	/// - [`crate::TightBeamError::LockPoisoned`] -- the fault-state lock is poisoned.
 	pub fn event(&self, label: impl IntoEventLabel) -> Result<EventBuilder<'_>, crate::TightBeamError> {
 		let label_cow = label.into_label();
 
@@ -921,7 +901,6 @@ impl TraceCollector {
 	/// # Errors
 	///
 	/// - The injected error, when the runtime fault model injects a fault at `label`.
-	/// - [`crate::TightBeamError::LockPoisoned`] -- the fault-state lock is poisoned.
 	///
 	/// # Zero-allocation option
 	///
@@ -979,28 +958,28 @@ impl TraceCollector {
 		let _ = oracle.step_event(&event);
 	}
 
+	/// Takes the sequence number of the next event, which wraps past
+	/// `u32::MAX`. Each event needs a number of its own and no order against
+	/// other memory, so the add is `Relaxed`.
 	#[cfg(feature = "instrument")]
 	fn next_seq(&self) -> u32 {
-		if let Ok(mut seq) = self.state.seq.lock() {
-			let current = *seq;
-			*seq = current.wrapping_add(1);
-			current
-		} else {
-			0
-		}
+		self.state.seq.fetch_add(1, Ordering::Relaxed)
 	}
 
+	/// Writes one event to the sink. `evidence` renders the payload of the
+	/// event, and it runs only when the sink retains the event and the config
+	/// keeps payloads, so a payload that the trace drops renders nothing.
 	#[cfg(feature = "instrument")]
-	fn emit_internal(
+	fn emit_internal<E: AsRef<[u8]>>(
 		&self,
 		urn: Urn<'static>,
 		label: Option<&str>,
-		payload: Option<&[u8]>,
+		evidence: impl FnOnce() -> Option<E>,
 		duration_ns: Option<u64>,
 		timestamp_ns: Option<u64>,
 	) {
-		// The sink owns retention: events dropped by a bounded sink still
-		// consume a sequence number, so gaps in `seq` reveal where truncation
+		// The sink owns retention: an event that a bounded sink drops consumes
+		// a sequence number too, so gaps in `seq` reveal where truncation
 		// occurred. This method asks the sink before it builds the event, so an
 		// event that the sink drops costs no allocation.
 		let seq = self.next_seq();
@@ -1012,7 +991,7 @@ impl TraceCollector {
 		let cfg = self.state.config;
 
 		let payload_hash = if cfg.enable_payloads {
-			payload.map(hash_payload)
+			evidence().map(hash_payload)
 		} else {
 			None
 		};
@@ -1042,12 +1021,17 @@ impl TraceCollector {
 	/// records that origin first, so relative `timestamp_ns` values
 	/// reconstruct to absolute times.
 	#[cfg(feature = "instrument")]
-	fn emit_stamped(&self, urn: Urn<'static>, label: Option<&str>, payload: Option<&[u8]>) {
+	fn emit_stamped<E: AsRef<[u8]>>(
+		&self,
+		urn: Urn<'static>,
+		label: Option<&str>,
+		evidence: impl FnOnce() -> Option<E>,
+	) {
 		let record = |origin_unix_ns: u128| {
 			let origin = origin_unix_ns.to_string();
-			self.emit_internal(events::TRACE_CLOCK_ORIGIN, Some(&origin), None, None, Some(0));
+			self.emit_internal(events::TRACE_CLOCK_ORIGIN, Some(&origin), no_evidence, None, Some(0));
 		};
-		let emit = |timestamp_ns| self.emit_internal(urn, label, payload, None, timestamp_ns);
+		let emit = |timestamp_ns| self.emit_internal(urn, label, evidence, None, timestamp_ns);
 		self.state.clock.stamp(record, emit);
 	}
 
@@ -1058,7 +1042,6 @@ impl TraceCollector {
 	/// # Errors
 	///
 	/// - The injected error, when the runtime fault model injects a fault at `event`.
-	/// - [`crate::TightBeamError::LockPoisoned`] -- the fault-state lock is poisoned.
 	///
 	/// # Examples
 	///
@@ -1074,7 +1057,27 @@ impl TraceCollector {
 		#[cfg(feature = "testing")]
 		self.event(&event)?.emit();
 
-		self.emit_stamped(event, None, None);
+		self.emit_stamped(event, None, no_evidence);
+		Ok(())
+	}
+
+	/// Dual-writes `event` with no label and no value, and with the payload
+	/// that `evidence` renders as its evidence. The trace runs `evidence` only
+	/// when its sink retains the event and its config keeps payloads.
+	///
+	/// # Errors
+	///
+	/// - The injected error, when the runtime fault model injects a fault at `event`.
+	#[cfg(all(feature = "instrument", feature = "tokio"))]
+	pub(crate) fn emit_event_with_rendered_evidence<E: AsRef<[u8]>>(
+		&self,
+		event: Urn<'static>,
+		evidence: impl FnOnce() -> Option<E>,
+	) -> Result<(), crate::TightBeamError> {
+		#[cfg(feature = "testing")]
+		self.event(&event)?.emit();
+
+		self.emit_stamped(event, None, evidence);
 		Ok(())
 	}
 
@@ -1086,7 +1089,6 @@ impl TraceCollector {
 	/// # Errors
 	///
 	/// - The injected error, when the runtime fault model injects a fault at `event`.
-	/// - [`crate::TightBeamError::LockPoisoned`] -- the fault-state lock is poisoned.
 	///
 	/// # Examples
 	///
@@ -1115,7 +1117,6 @@ impl TraceCollector {
 	/// # Errors
 	///
 	/// - The injected error, when the runtime fault model injects a fault at `event`.
-	/// - [`crate::TightBeamError::LockPoisoned`] -- the fault-state lock is poisoned.
 	///
 	/// # Examples
 	///
@@ -1150,7 +1151,6 @@ impl TraceCollector {
 	/// # Errors
 	///
 	/// - The injected error, when the runtime fault model injects a fault at `event`.
-	/// - [`crate::TightBeamError::LockPoisoned`] -- the fault-state lock is poisoned.
 	///
 	/// [`enable_internal_detail`]: TbInstrumentationConfig::enable_internal_detail
 	// As on `InternalEvent`, a build without `colony` leaves out some callers.
@@ -1173,7 +1173,6 @@ impl TraceCollector {
 	/// # Errors
 	///
 	/// - The injected error, when the runtime fault model injects a fault at `event`.
-	/// - [`crate::TightBeamError::LockPoisoned`] -- the fault-state lock is poisoned.
 	#[cfg(any(feature = "instrument", feature = "colony"))]
 	pub(crate) fn emit_event_with_value_and_evidence<V>(
 		&self,
@@ -1185,6 +1184,32 @@ impl TraceCollector {
 	where
 		V: Into<EventValue>,
 	{
+		self.emit_event_with_value_and_rendered_evidence(event, label, value, || payload)
+	}
+
+	/// Dual-writes `event` with `value`, and with the payload that `evidence`
+	/// renders as its evidence, as [`Self::emit_event_with_value_and_evidence`]
+	/// writes a payload in hand.
+	///
+	/// The trace runs `evidence` only when its sink retains the event and its
+	/// config keeps payloads, so an emit site whose payload the trace drops
+	/// renders nothing.
+	///
+	/// # Errors
+	///
+	/// - The injected error, when the runtime fault model injects a fault at `event`.
+	#[cfg(any(feature = "instrument", feature = "colony"))]
+	pub(crate) fn emit_event_with_value_and_rendered_evidence<V, E>(
+		&self,
+		event: Urn<'static>,
+		label: impl AsRef<str>,
+		value: V,
+		evidence: impl FnOnce() -> Option<E>,
+	) -> Result<(), crate::TightBeamError>
+	where
+		V: Into<EventValue>,
+		E: AsRef<[u8]>,
+	{
 		let label = label.as_ref();
 		#[cfg(feature = "testing")]
 		self.event_with(&event, &[], value)?.emit();
@@ -1192,21 +1217,56 @@ impl TraceCollector {
 		let _ = value;
 
 		#[cfg(feature = "instrument")]
-		self.emit_stamped(event, Some(label), payload);
+		self.emit_stamped(event, Some(label), evidence);
 		#[cfg(not(feature = "instrument"))]
-		let _ = (event, label, payload);
+		let _ = (event, label, evidence);
 
 		Ok(())
 	}
 
+	/// Dual-writes `event`, a colony event that carries no label, no value,
+	/// and no payload, through [`Self::emit_event_with_value_and_evidence`].
+	///
+	/// # Errors
+	///
+	/// - The injected error, when the runtime fault model injects a fault at `event`.
+	#[cfg(feature = "colony")]
+	pub(crate) fn emit_marker(&self, event: Urn<'static>) -> Result<(), crate::TightBeamError> {
+		self.emit_event_with_value_and_evidence(event, "", (), None)
+	}
+
+	/// Dual-writes `event`, a colony event whose payload records who and
+	/// that carries no label and no value, through
+	/// [`Self::emit_event_with_value_and_rendered_evidence`]. The trace runs
+	/// `evidence` only when its sink retains the event and its config keeps
+	/// payloads.
+	///
+	/// # Errors
+	///
+	/// - The injected error, when the runtime fault model injects a fault at `event`.
+	#[cfg(feature = "colony")]
+	pub(crate) fn emit_marker_with_evidence<E: AsRef<[u8]>>(
+		&self,
+		event: Urn<'static>,
+		evidence: impl FnOnce() -> Option<E>,
+	) -> Result<(), crate::TightBeamError> {
+		self.emit_event_with_value_and_rendered_evidence(event, "", (), evidence)
+	}
+
 	#[cfg(feature = "instrument")]
 	pub fn emit_with_payload(&self, event_urn: Urn<'static>, label: impl AsRef<str>, payload: Option<&[u8]>) {
-		self.emit_internal(event_urn, Some(label.as_ref()), payload, None, None);
+		self.emit_internal(event_urn, Some(label.as_ref()), || payload, None, None);
 	}
 
 	#[cfg(feature = "instrument")]
 	pub fn emit_with_timing(&self, event_urn: Urn<'static>, label: impl AsRef<str>, duration: Duration) {
-		self.emit_internal(event_urn, Some(label.as_ref()), None, Some(duration.as_nanos() as u64), None);
+		self.emit_internal(
+			event_urn,
+			Some(label.as_ref()),
+			no_evidence,
+			Some(duration.as_nanos() as u64),
+			None,
+		);
 	}
 
 	/// Emits an event stamped with a point-in-time instant relative to the
@@ -1216,7 +1276,13 @@ impl TraceCollector {
 	/// is a span length, and a timestamp is when the event occurred.
 	#[cfg(feature = "instrument")]
 	pub fn emit_with_timestamp(&self, event_urn: Urn<'static>, label: impl AsRef<str>, timestamp: Duration) {
-		self.emit_internal(event_urn, Some(label.as_ref()), None, None, Some(timestamp.as_nanos() as u64));
+		self.emit_internal(
+			event_urn,
+			Some(label.as_ref()),
+			no_evidence,
+			None,
+			Some(timestamp.as_nanos() as u64),
+		);
 	}
 
 	/// Counts the recorded events that carry `label`, and leaves them recorded.
@@ -1233,13 +1299,13 @@ impl TraceCollector {
 	}
 
 	/// Drains the recorded assertions into a vector.
+	///
+	/// A record only appends to the list, so a poisoned lock holds a whole
+	/// list, and the drain takes it as is.
 	#[cfg(any(test, feature = "testing"))]
 	pub fn drain_assertions(&self) -> Vec<Assertion> {
-		if let Ok(mut assertions) = self.state.assertions.lock() {
-			assertions.drain(..).collect()
-		} else {
-			Vec::new()
-		}
+		let mut assertions = self.state.assertions.lock().unwrap_or_else(PoisonError::into_inner);
+		core::mem::take(&mut *assertions)
 	}
 
 	/// Drains the retained events from the configured sink.
@@ -1286,13 +1352,19 @@ impl From<TraceConfig> for TraceCollector {
 	}
 }
 
+/// The render of an event that carries no evidence.
+#[cfg(feature = "instrument")]
+fn no_evidence() -> Option<&'static [u8]> {
+	None
+}
+
 #[cfg(feature = "instrument")]
 fn hash_payload(payload: impl AsRef<[u8]>) -> [u8; 32] {
 	let payload = payload.as_ref();
 	let mut hasher = Sha3_256::new();
 	hasher.update(payload);
-	let out = hasher.finalize();
 
+	let out = hasher.finalize();
 	let mut arr = [0u8; 32];
 	arr.copy_from_slice(&out);
 	arr
@@ -1493,8 +1565,78 @@ mod tests {
 		}
 	}
 
+	/// The render of the evidence of an event, which the trace runs only when
+	/// it keeps the payload.
+	#[cfg(feature = "instrument")]
+	mod evidence {
+		use core::cell::Cell;
+
+		use super::ALPHA;
+		use crate::instrumentation::TbInstrumentationConfig;
+		use crate::trace::{TraceCollector, TraceConfig};
+		use crate::TightBeamError;
+
+		// A trace whose config keeps payloads renders the evidence of an emit,
+		// and a trace whose config drops them renders nothing.
+		crate::tb_cases! {
+			fn an_emit_renders_its_evidence_when_the_trace_keeps_payloads((enable_payloads, rendered): (bool, bool))
+				-> Result<(), TightBeamError>
+			{
+				let config = TbInstrumentationConfig { enable_payloads, ..TbInstrumentationConfig::default() };
+				let trace = TraceCollector::from(TraceConfig::with_instrumentation(config));
+				let ran = Cell::new(false);
+				let evidence = || {
+					ran.set(true);
+					Some(b"evidence")
+				};
+
+				trace.emit_event_with_value_and_rendered_evidence(ALPHA, "label", (), evidence)?;
+				assert_eq!(ran.get(), rendered);
+				Ok(())
+			}
+			cases {
+				kept => (true, true),
+				dropped => (false, false),
+			}
+		}
+	}
+
+	mod poison {
+		use std::panic::{catch_unwind, AssertUnwindSafe};
+
+		use super::ALPHA;
+		use crate::trace::TraceCollector;
+		use crate::TightBeamError;
+
+		/// Poisons the assertions lock of `collector`, as a panic while a
+		/// record holds the lock would.
+		fn poison_assertions(collector: &TraceCollector) {
+			let panicked = catch_unwind(AssertUnwindSafe(|| {
+				let _held = collector.state.assertions.lock();
+				panic!("poison the assertions lock");
+			}));
+
+			assert!(panicked.is_err());
+			assert!(collector.state.assertions.is_poisoned());
+		}
+
+		/// Each write leaves the assertion list whole, so an event that records
+		/// after a panic poisoned the lock drains too.
+		#[test]
+		fn an_event_recorded_after_a_poisoning_panic_drains() -> Result<(), TightBeamError> {
+			let collector = TraceCollector::new();
+			poison_assertions(&collector);
+
+			collector.event(ALPHA)?.emit();
+			assert_eq!(collector.drain_assertions().len(), 1);
+			Ok(())
+		}
+	}
+
 	#[cfg(feature = "testing-fault")]
 	mod faults {
+		use std::panic::{catch_unwind, AssertUnwindSafe};
+
 		use super::{ALPHA, BETA};
 		use crate::testing::fdr::{FaultModel, InjectionStrategy};
 		use crate::trace::TraceCollector;
@@ -1555,6 +1697,35 @@ mod tests {
 			Ok(())
 		}
 
+		/// An error factory that panics, so the draw that calls it panics while
+		/// it holds the fault-state lock.
+		fn panicking() -> TightBeamError {
+			panic!("the error factory panics under the fault-state lock")
+		}
+
+		/// Poisons the fault-state lock of `collector`, as a draw whose error
+		/// factory panics under the lock does.
+		fn poison_fault_state(collector: &TraceCollector) {
+			let model = FaultModel::default().with_event_fault(ALPHA, panicking, crate::bps!(10000));
+			let faulting = collector.share().with_fault_model(model);
+
+			let panicked = catch_unwind(AssertUnwindSafe(|| faulting.event(ALPHA)));
+			assert!(panicked.is_err());
+			assert!(collector.state.runtime_faults.get().is_some_and(|faults| faults.is_poisoned()));
+		}
+
+		/// A panic under the fault-state lock leaves a whole model, so a model
+		/// installed after it injects at its own label.
+		#[test]
+		fn a_model_installed_after_a_panic_under_the_lock_injects() {
+			let collector = TraceCollector::new();
+			poison_fault_state(&collector);
+
+			let model = FaultModel::default().with_event_fault(BETA, closed, crate::bps!(10000));
+			let collector = collector.with_fault_model(model);
+			assert!(matches!(collector.event(BETA), Err(TightBeamError::ChannelClosed)));
+		}
+
 		/// A collector that injects a fault at every record of [`ALPHA`].
 		fn faulting_at_alpha() -> TraceCollector {
 			let model = FaultModel::default().with_event_fault(ALPHA, closed, crate::bps!(10000));
@@ -1613,10 +1784,8 @@ mod tests {
 		#[test]
 		fn events_within_bound_do_not_overflow() {
 			let collector = collector_with_max_events(2);
-
 			collector.emit(events::START, "first");
 			collector.emit(events::END, "second");
-
 			assert!(!collector.overflowed());
 			assert_eq!(collector.drain_events().len(), 2);
 		}
@@ -1624,23 +1793,23 @@ mod tests {
 		#[test]
 		fn events_past_bound_are_dropped_and_flagged() {
 			let collector = collector_with_max_events(2);
-
 			collector.emit(events::START, "first");
 			collector.emit(events::END, "second");
 			collector.emit(events::END, "third");
-
 			assert!(collector.overflowed());
 			assert_eq!(collector.drain_events().len(), 2);
 		}
 
-		/// An event that a full sink drops still takes its sequence number, so
+		/// An event that a full sink drops takes its sequence number too, so
 		/// the gap marks where the sink cut the record.
 		#[test]
 		fn a_dropped_event_still_takes_its_sequence_number() {
 			let collector = collector_with_max_events(1);
 			collector.emit(events::START, "kept");
 			collector.emit(events::END, "dropped");
+
 			let before = collector.drain_events();
+
 			collector.emit(events::END, "after the drain");
 
 			let after = collector.drain_events();
@@ -1719,16 +1888,13 @@ mod tests {
 		#[test]
 		fn sink_without_instrumentation_config_still_receives_events() {
 			let collector = TraceCollector::from(TraceConfig::builder().with_sink(UnboundedSink::default()).build());
-
 			collector.emit(events::START, "only");
-
 			assert_eq!(collector.drain_events().len(), 1);
 		}
 
 		#[test]
 		fn sink_events_carry_contiguous_seq() {
 			let collector = TraceCollector::from(TraceConfig::builder().with_sink(UnboundedSink::default()).build());
-
 			collector.emit(events::START, "first");
 			collector.emit(events::END, "second");
 
@@ -1768,7 +1934,7 @@ mod tests {
 		}
 
 		impl AdoptionProbe {
-			/// Note whether the write lock that an adoption takes is free now.
+			/// Notes whether an adoption's write lock is free at this moment.
 			fn note(&self) {
 				let state = self.state.get().and_then(Weak::upgrade);
 				let state = state.expect("the probe watches a live collector");

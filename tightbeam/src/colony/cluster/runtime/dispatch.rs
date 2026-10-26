@@ -35,13 +35,13 @@ enum RequestAdmission {
 }
 
 impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
-	/// Route one unary gateway request from frame decode through dispatch.
+	/// Route one unary gateway request from the gates through its handler.
 	///
 	/// Gate policies run first, and export gates run on the work arm only,
 	/// once the decoded envelope names the servlet target.
 	///
-	/// - `frame`: the admitted unary control frame
-	/// - `session`: the caller identity facts for the connection
+	/// - `frame`: the unary control frame of the call, before the gates run
+	/// - `session`: the identity facts of the caller's connection
 	pub(crate) async fn handle_request(
 		self,
 		frame: Frame,
@@ -79,7 +79,8 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 		let work = match self.admit_request(&frame, &session)? {
 			RequestAdmission::Admitted(ClusterRequest::Work(request)) => request,
 			RequestAdmission::Admitted(_) => {
-				let refusal = ClusterWorkResponse::err(TransitStatus::PermissionDenied);
+				let status = self.refuse_edge_call("unary", &session)?;
+				let refusal = ClusterWorkResponse::err(status);
 				return ReplyForm::Plain.reply(frame.metadata().id(), refusal);
 			}
 			RequestAdmission::Refused(status) => {

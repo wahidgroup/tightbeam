@@ -32,12 +32,12 @@ use tightbeam::{
 	der::Sequence,
 	exactly,
 	instrumentation::events,
+	prelude::TightBeamSocketAddr,
 	servlet, tb_assert_spec, tb_process_spec, tb_scenario,
-	testing::{SetupEnv, TestFrame},
+	testing::{ScenarioConfig, ScenarioConfigError, SetupEnv, TestFrame},
 	trace::TraceCollector,
 	transport::{tcp::r#async::TokioListener, ConnectionBuilder, ConnectionPool, PoolConfig},
-	urn::Urn,
-	Beamable,
+	Beamable, Frame,
 };
 
 #[cfg(feature = "x509")]
@@ -56,14 +56,6 @@ use tightbeam::{
 	error::TightBeamError,
 };
 
-pub(crate) const ACQUIRE_CLIENT: Urn<'static> = tightbeam::urn!("test", "event:connection-pool/acquire-client");
-pub(crate) const MESSAGE_COUNT: Urn<'static> = tightbeam::urn!("test", "event:connection-pool/message-count");
-pub(crate) const POOL_CREATE: Urn<'static> = tightbeam::urn!("test", "event:connection-pool/pool-create");
-pub(crate) const RECEIVE_RESPONSE: Urn<'static> = tightbeam::urn!("test", "event:connection-pool/receive-response");
-pub(crate) const SEND_MESSAGE: Urn<'static> = tightbeam::urn!("test", "event:connection-pool/send-message");
-pub(crate) const SERVLET1_COUNT: Urn<'static> = tightbeam::urn!("test", "event:connection-pool/servlet1-count");
-pub(crate) const SERVLET2_COUNT: Urn<'static> = tightbeam::urn!("test", "event:connection-pool/servlet2-count");
-
 // The tests exchange this message type.
 
 #[derive(Clone, Debug, PartialEq, Beamable, Sequence)]
@@ -71,7 +63,7 @@ struct TestMessage {
 	content: String,
 }
 
-// The tests share this helper.
+// The tests share this function.
 
 #[cfg(feature = "x509")]
 fn make_server_trust_store() -> Result<Arc<dyn CertificateTrust>, TightBeamError> {
@@ -85,26 +77,25 @@ fn make_server_trust_store() -> Result<Arc<dyn CertificateTrust>, TightBeamError
 
 // These specs state the event contract of each scenario.
 
+// Each lease of the reuse scenarios takes its connection, carries one frame
+// through the servlet's gate, and returns the connection before the next
+// lease reuses it.
 tb_process_spec! {
 	pub PoolReuseProcess,
 	events {
-		observable { POOL_CREATE, ACQUIRE_CLIENT, SEND_MESSAGE, RECEIVE_RESPONSE, events::POOL_RELEASED }
+		observable { events::POOL_DIAL, events::POOL_REUSE_READY, events::GATE_ACCEPT, events::POOL_RELEASED }
 		hidden { }
 	}
 	states {
-		Init => { POOL_CREATE => PoolReady },
-		PoolReady => { ACQUIRE_CLIENT => Acquired1 },
-		Acquired1 => { SEND_MESSAGE => Sent1 },
-		Sent1 => { RECEIVE_RESPONSE => Received1 },
-		Received1 => { events::POOL_RELEASED => Released1 },
-		Released1 => { ACQUIRE_CLIENT => Acquired2 },
-		Acquired2 => { SEND_MESSAGE => Sent2 },
-		Sent2 => { RECEIVE_RESPONSE => Received2 },
-		Received2 => { events::POOL_RELEASED => Released2 },
-		Released2 => { ACQUIRE_CLIENT => Acquired3 },
-		Acquired3 => { SEND_MESSAGE => Sent3 },
-		Sent3 => { RECEIVE_RESPONSE => Received3 },
-		Received3 => { events::POOL_RELEASED => Complete }
+		Init => { events::POOL_DIAL => Leased1 },
+		Leased1 => { events::GATE_ACCEPT => Served1 },
+		Served1 => { events::POOL_RELEASED => Released1 },
+		Released1 => { events::POOL_REUSE_READY => Leased2 },
+		Leased2 => { events::GATE_ACCEPT => Served2 },
+		Served2 => { events::POOL_RELEASED => Released2 },
+		Released2 => { events::POOL_REUSE_READY => Leased3 },
+		Leased3 => { events::GATE_ACCEPT => Served3 },
+		Served3 => { events::POOL_RELEASED => Complete }
 	}
 	terminal { Complete }
 }
@@ -114,32 +105,11 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(POOL_CREATE, exactly!(1)),
-			(ACQUIRE_CLIENT, exactly!(3)),
-			(SEND_MESSAGE, exactly!(3)),
-			(RECEIVE_RESPONSE, exactly!(3)),
 			(events::POOL_RELEASED, exactly!(3)),
 			(events::POOL_DIAL, exactly!(1)),
 			(events::POOL_REUSE_READY, exactly!(2)),
 			(events::POOL_EXHAUSTED, exactly!(0)),
-			(MESSAGE_COUNT, exactly!(1), equals!(3u64))
-		]
-	},
-	// Version 1.1.0 adds the round-trip outcome to the contract. Every response
-	// event must carry proof that the pooled emit returned a reply, so the spec
-	// verifies delivery instead of an inline assert.
-	V(1,1,0): {
-		mode: Accept,
-		assertions: [
-			(POOL_CREATE, exactly!(1)),
-			(ACQUIRE_CLIENT, exactly!(3)),
-			(SEND_MESSAGE, exactly!(3)),
-			(RECEIVE_RESPONSE, exactly!(3), equals!(1u64)),
-			(events::POOL_RELEASED, exactly!(3)),
-			(events::POOL_DIAL, exactly!(1)),
-			(events::POOL_REUSE_READY, exactly!(2)),
-			(events::POOL_EXHAUSTED, exactly!(0)),
-			(MESSAGE_COUNT, exactly!(1), equals!(3u64))
+			(events::GATE_ACCEPT, exactly!(3))
 		]
 	}
 }
@@ -149,36 +119,30 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(POOL_CREATE, exactly!(1)),
-			(ACQUIRE_CLIENT, exactly!(3)),
-			(SEND_MESSAGE, exactly!(3)),
-			(RECEIVE_RESPONSE, exactly!(3)),
 			(events::POOL_RELEASED, exactly!(3)),
 			(events::POOL_DIAL, exactly!(2)),
 			(events::POOL_REUSE_READY, exactly!(1)),
 			(events::POOL_EXHAUSTED, exactly!(0)),
-			(SERVLET1_COUNT, exactly!(1), equals!(2u64)),
-			(SERVLET2_COUNT, exactly!(1), equals!(1u64))
-		]
-	},
-	// Version 1.1.0 adds the round-trip outcome to the contract. Every response
-	// event must carry proof that the pooled emit returned a reply, so the spec
-	// verifies delivery instead of an inline assert.
-	V(1,1,0): {
-		mode: Accept,
-		assertions: [
-			(POOL_CREATE, exactly!(1)),
-			(ACQUIRE_CLIENT, exactly!(3)),
-			(SEND_MESSAGE, exactly!(3)),
-			(RECEIVE_RESPONSE, exactly!(3), equals!(1u64)),
-			(events::POOL_RELEASED, exactly!(3)),
-			(events::POOL_DIAL, exactly!(2)),
-			(events::POOL_REUSE_READY, exactly!(1)),
-			(events::POOL_EXHAUSTED, exactly!(0)),
-			(SERVLET1_COUNT, exactly!(1), equals!(2u64)),
-			(SERVLET2_COUNT, exactly!(1), equals!(1u64))
+			(events::GATE_ACCEPT, exactly!(3))
 		]
 	}
+}
+
+/// Grades `PoolReuseSpec`, and orders the pool and gate events by
+/// `PoolReuseProcess` in a build with `testing-csp`.
+#[cfg(all(
+	feature = "x509",
+	feature = "transport-policy",
+	feature = "secp256k1",
+	feature = "signature",
+	feature = "sha3",
+	feature = "aead"
+))]
+fn pool_reuse_config() -> Result<ScenarioConfig, ScenarioConfigError> {
+	let builder = ScenarioConfig::builder().with_spec(PoolReuseSpec::latest());
+	#[cfg(feature = "testing-csp")]
+	let builder = builder.with_csp(PoolReuseProcess);
+	builder.build()
 }
 
 // The pool scenarios share this echo servlet fixture.
@@ -249,8 +213,32 @@ fn pool_echo_conf(
 	feature = "sha3",
 	feature = "aead"
 ))]
-async fn start_pool_echo_servlet(message_count: Arc<AtomicUsize>) -> Result<PoolEchoServlet, TightBeamError> {
-	PoolEchoServlet::start(Arc::new(TraceCollector::default()), pool_echo_conf(message_count)?).await
+async fn start_pool_echo_servlet(
+	trace: TraceCollector,
+	message_count: Arc<AtomicUsize>,
+) -> Result<PoolEchoServlet, TightBeamError> {
+	PoolEchoServlet::start(Arc::new(trace), pool_echo_conf(message_count)?).await
+}
+
+/// Leases a connection to `addr` from `pool`, sends one frame that carries
+/// `label` on it, and returns the reply. The lease returns to the pool when
+/// the step ends.
+#[cfg(all(
+	feature = "x509",
+	feature = "transport-policy",
+	feature = "secp256k1",
+	feature = "signature",
+	feature = "sha3",
+	feature = "aead"
+))]
+async fn pooled_emit(
+	pool: &Arc<ConnectionPool<TokioListener>>,
+	addr: TightBeamSocketAddr,
+	label: impl AsRef<str>,
+) -> Result<Option<Frame>, TightBeamError> {
+	let mut client = pool.connect(addr).await?;
+	let reply = client.conn()?.emit(TestFrame::v0(Some(label.as_ref()), None), None).await?;
+	Ok(reply)
 }
 
 // Scenario: the pool reuses one connection across three acquire cycles.
@@ -265,14 +253,11 @@ async fn start_pool_echo_servlet(message_count: Arc<AtomicUsize>) -> Result<Pool
 ))]
 tb_scenario! {
 	name: connection_pool_reuse,
-	spec: PoolReuseSpec,
+	config: pool_reuse_config(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
-			let message_count = Arc::new(AtomicUsize::new(0));
-			let servlet = start_pool_echo_servlet(Arc::clone(&message_count)).await?;
+			let servlet = start_pool_echo_servlet(trace.share(), Arc::default()).await?;
 			let server_addr = servlet.addr().to_owned();
-
-			trace.event(POOL_CREATE)?;
 
 			let pool = Arc::new(
 				ConnectionPool::<TokioListener>::builder()
@@ -284,29 +269,21 @@ tb_scenario! {
 					.build(),
 			);
 
-			for i in 1..=3 {
-				trace.event(ACQUIRE_CLIENT)?;
-
-				let mut client = pool.connect(server_addr).await?;
-
-				trace.event(SEND_MESSAGE)?;
-
-				let msg = TestFrame::v0(Some(&format!("test{i}")), None);
-				let reply = client.conn()?.emit(msg, None).await?;
-				trace.event_with(RECEIVE_RESPONSE, &[], u64::from(reply.is_some()))?;
-			}
-
-			trace.event_with(MESSAGE_COUNT, &[], message_count.load(Ordering::SeqCst) as u64)?;
-
+			let first = pooled_emit(&pool, server_addr, "test1").await?;
+			let second = pooled_emit(&pool, server_addr, "test2").await?;
+			let third = pooled_emit(&pool, server_addr, "test3").await?;
+			assert!(first.is_some(), "the first pooled emit must return its echo");
+			assert!(second.is_some(), "the second pooled emit must return its echo");
+			assert!(third.is_some(), "the third pooled emit must return its echo");
 			Ok(())
 		}
 	}
 }
 
-// Regression: the connection accounting holds across reuse cycles.
+// Scenario: the connection accounting holds across reuse cycles.
 
 /// A full cycle of acquire, release, reuse, and release must leave the pool's
-/// connection accounting intact. The pool must still admit a later brand-new
+/// connection accounting intact. The pool must then admit a later brand-new
 /// connection to another destination, which the reuse path cannot serve.
 #[cfg(all(
 	feature = "x509",
@@ -320,8 +297,8 @@ tb_scenario! {
 async fn pool_admits_new_connections_after_reuse_cycle() -> Result<(), Box<dyn std::error::Error>> {
 	let count1 = Arc::new(AtomicUsize::new(0));
 	let count2 = Arc::new(AtomicUsize::new(0));
-	let servlet1 = start_pool_echo_servlet(Arc::clone(&count1)).await?;
-	let servlet2 = start_pool_echo_servlet(Arc::clone(&count2)).await?;
+	let servlet1 = start_pool_echo_servlet(TraceCollector::default(), Arc::clone(&count1)).await?;
+	let servlet2 = start_pool_echo_servlet(TraceCollector::default(), Arc::clone(&count2)).await?;
 	let addr1 = servlet1.addr().to_owned();
 	let addr2 = servlet2.addr().to_owned();
 
@@ -359,11 +336,10 @@ async fn pool_admits_new_connections_after_reuse_cycle() -> Result<(), Box<dyn s
 	Ok(())
 }
 
-// The single-flight envelope bound holds on both sides of the ceiling.
-// Content near the default encrypted ceiling (256 KiB) round-trips, and the
-// client refuses content past it locally with a typed `SizeExceeded`
-// (CWE-400). The refusal must not be a connection reset from the server's
-// fail-before-read path.
+// The single-flight envelope bound holds on both sides of the default
+// encrypted ceiling (256 KiB): content near it round-trips, and the client
+// refuses content past it locally with a typed `SizeExceeded` (CWE-400) in
+// place of a connection reset from the server's fail-before-read path.
 #[cfg(all(
 	feature = "x509",
 	feature = "transport-policy",
@@ -377,7 +353,7 @@ async fn envelope_ceiling_refuses_oversize_locally() -> Result<(), Box<dyn std::
 	use tightbeam::transport::error::{TransportError, TransportFailure};
 
 	let count = Arc::new(AtomicUsize::new(0));
-	let servlet = start_pool_echo_servlet(Arc::clone(&count)).await?;
+	let servlet = start_pool_echo_servlet(TraceCollector::default(), Arc::clone(&count)).await?;
 	let addr = servlet.addr().to_owned();
 	// The round trip near the ceiling is CPU work that a loaded machine
 	// stretches, so the default operation deadline bounds it.
@@ -431,12 +407,10 @@ tb_scenario! {
 		exec: |SetupEnv { trace, .. }| async move {
 			let count1 = Arc::new(AtomicUsize::new(0));
 			let count2 = Arc::new(AtomicUsize::new(0));
-			let servlet1 = start_pool_echo_servlet(Arc::clone(&count1)).await?;
-			let servlet2 = start_pool_echo_servlet(Arc::clone(&count2)).await?;
+			let servlet1 = start_pool_echo_servlet(trace.share(), Arc::clone(&count1)).await?;
+			let servlet2 = start_pool_echo_servlet(trace.share(), Arc::clone(&count2)).await?;
 			let addr1 = servlet1.addr().to_owned();
 			let addr2 = servlet2.addr().to_owned();
-
-			trace.event(POOL_CREATE)?;
 
 			let pool = Arc::new(
 				ConnectionPool::<TokioListener>::builder()
@@ -446,21 +420,15 @@ tb_scenario! {
 					.build(),
 			);
 
-			for (addr, name) in [(addr1, "addr1-test"), (addr2, "addr2-test"), (addr1, "addr1-test2")] {
-				trace.event(ACQUIRE_CLIENT)?;
+			let first = pooled_emit(&pool, addr1, "addr1-test").await?;
+			let second = pooled_emit(&pool, addr2, "addr2-test").await?;
+			let third = pooled_emit(&pool, addr1, "addr1-test2").await?;
+			assert!(first.is_some(), "the first emit to servlet 1 must return its echo");
+			assert!(second.is_some(), "the emit to servlet 2 must return its echo");
+			assert!(third.is_some(), "the second emit to servlet 1 must return its echo");
 
-				let mut client = pool.connect(addr).await?;
-
-				trace.event(SEND_MESSAGE)?;
-
-				let reply = client.conn()?.emit(TestFrame::v0(Some(name), None), None).await?;
-
-				trace.event_with(RECEIVE_RESPONSE, &[], u64::from(reply.is_some()))?;
-			}
-
-			trace.event_with(SERVLET1_COUNT, &[], count1.load(Ordering::SeqCst) as u64)?;
-			trace.event_with(SERVLET2_COUNT, &[], count2.load(Ordering::SeqCst) as u64)?;
-
+			assert_eq!(count1.load(Ordering::SeqCst), 2, "servlet 1 must serve both of its messages");
+			assert_eq!(count2.load(Ordering::SeqCst), 1, "servlet 2 must serve its one message");
 			Ok(())
 		}
 	}
@@ -478,14 +446,11 @@ tb_scenario! {
 ))]
 tb_scenario! {
 	name: pool_concurrent_access,
-	spec: PoolReuseSpec,
+	config: pool_reuse_config(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
-			let message_count = Arc::new(AtomicUsize::new(0));
-			let servlet = start_pool_echo_servlet(Arc::clone(&message_count)).await?;
+			let servlet = start_pool_echo_servlet(trace.share(), Arc::default()).await?;
 			let server_addr = servlet.addr().to_owned();
-
-			trace.event(POOL_CREATE)?;
 
 			let pool = Arc::new(
 				ConnectionPool::<TokioListener>::builder()
@@ -495,21 +460,12 @@ tb_scenario! {
 					.build(),
 			);
 
-			for _ in 0..3 {
-				trace.event(ACQUIRE_CLIENT)?;
-				let mut client = pool.connect(server_addr).await?;
-				trace.event(SEND_MESSAGE)?;
-
-				let reply = client
-					.conn()?
-					.emit(TestFrame::v0(Some("concurrent-test"), None), None)
-					.await?;
-
-				trace.event_with(RECEIVE_RESPONSE, &[], u64::from(reply.is_some()))?;
-			}
-
-			trace.event_with(MESSAGE_COUNT, &[], message_count.load(Ordering::SeqCst) as u64)?;
-
+			let first = pooled_emit(&pool, server_addr, "concurrent-test").await?;
+			let second = pooled_emit(&pool, server_addr, "concurrent-test").await?;
+			let third = pooled_emit(&pool, server_addr, "concurrent-test").await?;
+			assert!(first.is_some(), "the first pooled emit must return its echo");
+			assert!(second.is_some(), "the second pooled emit must return its echo");
+			assert!(third.is_some(), "the third pooled emit must return its echo");
 			Ok(())
 		}
 	}

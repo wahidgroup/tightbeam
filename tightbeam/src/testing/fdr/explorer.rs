@@ -5,6 +5,7 @@
 //! - [`RefinementChecker`] runs the trace, failures, and divergence refinement checks.
 //! - [`MemoizationCache`] keeps the computed sets of a process for the refinement checker.
 
+use core::ops::Range;
 use std::collections::HashSet;
 
 #[cfg(feature = "testing-timing")]
@@ -14,7 +15,7 @@ use std::collections::HashMap;
 
 use super::config::FdrConfig;
 use super::verdict::{Failure, Trace};
-use crate::testing::specs::csp::{Event, Process, State};
+use crate::testing::specs::csp::{Event, Process, SearchStructure, State};
 
 #[cfg(feature = "testing-fault")]
 use crate::testing::fdr::config::InjectedFaultRecord;
@@ -34,11 +35,49 @@ pub trait ExplorationCore {
 	/// Explores the schedule of `seed` and returns its result.
 	fn explore_seed(&mut self, seed: u64) -> SeedResult;
 
+	/// Explores the schedule of each seed in `seeds`, records each result, and
+	/// returns each seed with its result, in the order of the seeds.
+	///
+	/// - The explorer runs every seed of a process through this method and reads the results it returns.
+	/// - The default calls [`Self::explore_seed`] and then [`Self::add_seed_result`] once for each seed.
+	/// - The call returns the results it recorded, the last entries of [`Self::seed_results`].
+	/// - [`DefaultExplorationEngine`](super::DefaultExplorationEngine)
+	///   overrides it to run the seeds in parallel in a build with `rayon`.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::testing::fdr::{DefaultExplorationEngine, ExplorationCore, FdrConfig};
+	/// use tightbeam::testing::specs::csp::{Event, Process, State};
+	///
+	/// let process = Process::builder("Send")
+	///     .initial_state(State("S0"))
+	///     .add_observable(Event("send"))
+	///     .add_transition(State("S0"), Event("send"), State("S1"))
+	///     .add_terminal(State("S1"))
+	///     .build()?;
+	///
+	/// let mut engine = DefaultExplorationEngine::new(&process, Arc::new(FdrConfig::default()));
+	/// let results = engine.explore_seeds(0..4);
+	/// let seeds: Vec<u64> = results.iter().map(|(seed, _result)| *seed).collect();
+	/// assert_eq!(seeds, [0, 1, 2, 3]);
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	fn explore_seeds(&mut self, seeds: Range<u64>) -> &[(u64, SeedResult)] {
+		let start = self.seed_results().len();
+		for seed in seeds {
+			let result = self.explore_seed(seed);
+			self.add_seed_result(seed, result);
+		}
+
+		let recorded = self.seed_results();
+		recorded.get(start..).unwrap_or_default()
+	}
+
 	/// The traces that the recorded seeds explored.
 	fn traces(&self) -> Vec<Trace>;
-
-	/// The failures that the recorded seeds collected.
-	fn failures(&self) -> Vec<Failure>;
 
 	/// The states that exploration visited.
 	///
@@ -62,27 +101,70 @@ pub trait ExplorationCore {
 	///     .build()?;
 	///
 	/// let mut engine = DefaultExplorationEngine::new(&process, Arc::new(FdrConfig::default()));
-	/// let result = engine.explore_seed(0);
-	/// engine.add_seed_result(0, result);
+	/// engine.explore_seeds(0..1);
 	/// assert_eq!(engine.visited_states().len(), 2);
 	/// # Ok::<(), Box<dyn core::error::Error>>(())
 	/// ```
 	fn visited_states(&self) -> &HashSet<State>;
 
-	/// The number of seed results that the engine holds.
-	fn seeds_completed(&self) -> u32;
+	/// The number of seed results that the engine holds, the length of
+	/// [`Self::seed_results`], up to [`u32::MAX`].
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::testing::fdr::{DefaultExplorationEngine, ExplorationCore, FdrConfig};
+	/// use tightbeam::testing::specs::csp::{Event, Process, State};
+	///
+	/// let process = Process::builder("Send")
+	///     .initial_state(State("S0"))
+	///     .add_observable(Event("send"))
+	///     .add_transition(State("S0"), Event("send"), State("S1"))
+	///     .add_terminal(State("S1"))
+	///     .build()?;
+	///
+	/// let mut engine = DefaultExplorationEngine::new(&process, Arc::new(FdrConfig::default()));
+	/// engine.explore_seeds(0..3);
+	/// assert_eq!(engine.seeds_completed(), 3);
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	fn seeds_completed(&self) -> u32 {
+		let held = self.seed_results().len();
+		u32::try_from(held).unwrap_or(u32::MAX)
+	}
 
-	/// Adds the count of branches that a parallel seed pruned for timing. The
-	/// default drops the count.
-	fn add_timing_pruned(&mut self, _count: usize) {}
-
-	/// Records the result of a seed that ran outside the engine, such as a
-	/// parallel seed.
+	/// Records `result`, the result of `seed`, as the last entry of
+	/// [`Self::seed_results`].
 	fn add_seed_result(&mut self, seed: u64, result: SeedResult);
 
-	/// Adds the states that a seed outside the engine visited, such as a
-	/// parallel seed.
-	fn update_visited_states(&mut self, visited: &HashSet<State>);
+	/// Each seed with the result that the engine recorded for it, in the order
+	/// of the records.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::testing::fdr::{DefaultExplorationEngine, ExplorationCore, FdrConfig};
+	/// use tightbeam::testing::specs::csp::{Event, Process, State};
+	///
+	/// let process = Process::builder("Send")
+	///     .initial_state(State("S0"))
+	///     .add_observable(Event("send"))
+	///     .add_transition(State("S0"), Event("send"), State("S1"))
+	///     .add_terminal(State("S1"))
+	///     .build()?;
+	///
+	/// let mut engine = DefaultExplorationEngine::new(&process, Arc::new(FdrConfig::default()));
+	/// engine.explore_seeds(0..2);
+	/// engine.explore_seeds(2..3);
+	/// let seeds: Vec<u64> = engine.seed_results().iter().map(|(seed, _result)| *seed).collect();
+	/// assert_eq!(seeds, [0, 1, 2]);
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	fn seed_results(&self) -> &[(u64, SeedResult)];
 
 	/// The number of exploration branches pruned for timing violations.
 	///
@@ -96,7 +178,9 @@ pub trait ExplorationCore {
 	/// `None` at an unstable state.
 	///
 	/// The default reads [`Process::failure_refusals`], the one home of the
-	/// rule.
+	/// rule. The walk of
+	/// [`DefaultExplorationEngine`](super::DefaultExplorationEngine) records
+	/// each failure of a seed through this method.
 	///
 	/// # Examples
 	///
@@ -195,7 +279,7 @@ pub trait RefinementChecker {
 	/// `None` at an unstable state.
 	///
 	/// The default reads [`Process::failure_refusals`], the one home of the
-	/// rule, so an outside checker holds no copy of it.
+	/// rule, so an outside checker applies the same rule as the house checker.
 	///
 	/// # Examples
 	///
@@ -229,36 +313,97 @@ pub trait RefinementChecker {
 
 /// A memoization cache of the trace, failure, and divergence sets.
 ///
-/// The refinement checker computes each set of a process once and reads it
-/// from the cache for each later refinement check.
+/// The refinement checker computes each set of a process once for each depth
+/// bound, and reads it from the cache for each later refinement check.
 ///
-/// Each key is a structure digest ([`Process::structure_digest`]), because
-/// algebra operators (`hide`, `rename`) give one name to structurally
-/// different results, so a name key would collide and serve a wrong verdict.
+/// Each entry keys on a [`CacheKey`], the structure of a process and the depth
+/// bound of its search.
 pub trait MemoizationCache {
-	/// The cached traces of the process with the digest `structure`, and
-	/// whether the set is complete, or `None` when the cache holds none.
-	fn get_cached_traces(&self, structure: u64) -> Option<(Vec<Trace>, bool)>;
+	/// The cached traces under `key`, and whether the set is complete, or
+	/// `None` when the cache holds none.
+	fn get_cached_traces(&self, key: &CacheKey) -> Option<(Vec<Trace>, bool)>;
 
-	/// Stores the traces of the process with the digest `structure`, and
-	/// whether the set is `complete`.
-	fn cache_traces(&mut self, structure: u64, traces: impl IntoIterator<Item = Trace>, complete: bool);
+	/// Stores the traces under `key`, and whether the set is `complete`.
+	fn cache_traces(&mut self, key: CacheKey, traces: impl IntoIterator<Item = Trace>, complete: bool);
 
-	/// The cached failures of the process with the digest `structure`, and
-	/// whether the set is complete, or `None` when the cache holds none.
-	fn get_cached_failures(&self, structure: u64) -> Option<(Vec<Failure>, bool)>;
+	/// The cached failures under `key`, and whether the set is complete, or
+	/// `None` when the cache holds none.
+	fn get_cached_failures(&self, key: &CacheKey) -> Option<(Vec<Failure>, bool)>;
 
-	/// Stores the failures of the process with the digest `structure`, and
-	/// whether the set is `complete`.
-	fn cache_failures(&mut self, structure: u64, failures: impl IntoIterator<Item = Failure>, complete: bool);
+	/// Stores the failures under `key`, and whether the set is `complete`.
+	fn cache_failures(&mut self, key: CacheKey, failures: impl IntoIterator<Item = Failure>, complete: bool);
 
-	/// The cached divergences of the process with the digest `structure`, and
-	/// whether the set is complete, or `None` when the cache holds none.
-	fn get_cached_divergences(&self, structure: u64) -> Option<(Vec<Trace>, bool)>;
+	/// The cached divergences under `key`, and whether the set is complete, or
+	/// `None` when the cache holds none.
+	fn get_cached_divergences(&self, key: &CacheKey) -> Option<(Vec<Trace>, bool)>;
 
-	/// Stores the divergences of the process with the digest `structure`, and
-	/// whether the set is `complete`.
-	fn cache_divergences(&mut self, structure: u64, divergences: impl IntoIterator<Item = Trace>, complete: bool);
+	/// Stores the divergences under `key`, and whether the set is `complete`.
+	fn cache_divergences(&mut self, key: CacheKey, divergences: impl IntoIterator<Item = Trace>, complete: bool);
+}
+
+/// The key of one memoized set: the structure of a process and the depth
+/// bound, in observable events, of the search that computed the set.
+///
+/// - The structure is the initial state and, each in sorted order, the
+///   states, the accepting states, the choice points, the two alphabets, and
+///   the transitions.
+/// - Two keys are equal only when both parts are equal, so a set of one depth
+///   never answers a search at another, and a hash collision never serves
+///   the set of another process.
+/// - The name stays out of the key, because the algebra operators (`hide`,
+///   `rename`) give one name to processes of different structure.
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam::testing::fdr::CacheKey;
+/// use tightbeam::testing::specs::csp::{Event, Process, State};
+///
+/// let process = Process::builder("Send")
+///     .initial_state(State("S0"))
+///     .add_observable(Event("send"))
+///     .add_transition(State("S0"), Event("send"), State("S1"))
+///     .add_terminal(State("S1"))
+///     .build()?;
+///
+/// assert_eq!(CacheKey::new(&process, 8), CacheKey::new(&process, 8));
+/// assert_ne!(CacheKey::new(&process, 8), CacheKey::new(&process, 16));
+/// # Ok::<(), Box<dyn core::error::Error>>(())
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CacheKey {
+	/// The structure of the process that the search read.
+	structure: SearchStructure,
+	/// The depth bound of the search.
+	max_depth: usize,
+}
+
+impl CacheKey {
+	/// The key of a set of `process` that a search to `max_depth` observable
+	/// events computes.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::fdr::CacheKey;
+	/// use tightbeam::testing::specs::csp::{Event, Process, State};
+	///
+	/// let named = |name| {
+	///     Process::builder(name)
+	///         .initial_state(State("S0"))
+	///         .add_observable(Event("send"))
+	///         .add_transition(State("S0"), Event("send"), State("S1"))
+	///         .add_terminal(State("S1"))
+	///         .build()
+	/// };
+	///
+	/// assert_eq!(CacheKey::new(&named("Send")?, 8), CacheKey::new(&named("Post")?, 8));
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	pub fn new(process: &Process, max_depth: usize) -> Self {
+		let structure = process.search_structure();
+		Self { structure, max_depth }
+	}
 }
 
 /// The result of one seed of exploration.
@@ -320,7 +465,7 @@ impl SeedResult {
 /// holds.
 #[derive(Debug, Clone)]
 pub struct ExplorationState {
-	/// The process state that the branch has reached.
+	/// The process state that the branch reached.
 	pub process_state: State,
 
 	/// The observable events of the branch so far.
@@ -330,10 +475,10 @@ pub struct ExplorationState {
 	/// event resets.
 	pub internal_run: usize,
 
-	/// Every state that the branch has passed through, from the initial state.
+	/// Every state that the branch passed through, from the initial state.
 	pub state_path: Vec<State>,
 
-	/// Every hidden event that the branch has taken, across its runs.
+	/// Every hidden event that the branch took, across its runs.
 	pub hidden_events: Vec<Event>,
 
 	/// The elapsed time of the branch, the sum of the worst-case execution
@@ -447,8 +592,8 @@ impl SeededRng {
 
 	/// The next pseudo-random number of the linear congruential generator.
 	pub fn get_next(&mut self) -> u64 {
-		// The multiplier and the increment are the LCG constants of Numerical
-		// Recipes.
+		// The multiplier and the increment are Knuth's MMIX LCG constants, and
+		// `crate::constants` cites Numerical Recipes § 7.1.4 for them.
 		self.state = self
 			.state
 			.wrapping_mul(crate::constants::LCG_MULTIPLIER)
@@ -481,9 +626,10 @@ mod tests {
 		fn deterministic_sequences() {
 			let mut rng1 = SeededRng::new(42);
 			let mut rng2 = SeededRng::new(42);
-			for _ in 0..10 {
-				assert_eq!(rng1.get_next(), rng2.get_next());
-			}
+
+			let first: Vec<_> = (0..10).map(|_| rng1.get_next()).collect();
+			let second: Vec<_> = (0..10).map(|_| rng2.get_next()).collect();
+			assert_eq!(first, second);
 		}
 
 		#[test]
@@ -601,6 +747,30 @@ mod tests {
 			assert_eq!(exp_state.event_times.len(), 2);
 			assert_eq!(exp_state.event_times[1].0, event2);
 			assert_eq!(exp_state.event_times[1].1, Duration::from_millis(15));
+		}
+	}
+
+	// These tests cover `CacheKey`.
+	#[cfg(feature = "testing-timing")]
+	mod cache_key {
+		use super::*;
+		use crate::testing::specs::csp::ProcessBuildError;
+
+		#[test]
+		fn a_timed_transition_is_part_of_the_key() -> Result<(), ProcessBuildError> {
+			let without = Process::builder("Keyed")
+				.initial_state(State("S0"))
+				.add_state(State("S1"))
+				.add_observable(Event("arm"))
+				.build()?;
+			let with = Process::builder("Keyed")
+				.initial_state(State("S0"))
+				.add_observable(Event("arm"))
+				.add_timed_transition(State("S0"), Event("arm"), State("S1"), None, Vec::new())
+				.build()?;
+
+			assert_ne!(CacheKey::new(&without, 8), CacheKey::new(&with, 8));
+			Ok(())
 		}
 	}
 }

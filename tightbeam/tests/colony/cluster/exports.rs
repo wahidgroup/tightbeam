@@ -14,7 +14,7 @@
 //!   for external peers, relayed requests, and anonymous sessions, while
 //!   A's own first-party origin traffic and exported targets stay routable.
 //! - **Grants**: a positive `ExportGrant` opens one unexported target to a
-//!   selected caller identity, and the ads still leave that target out.
+//!   selected caller identity, while the ads leave that target out.
 //!
 //! # Harness
 //!
@@ -131,7 +131,7 @@ fn exporter_conf_with_gate(
 		.build()
 }
 
-/// An exporter on a fast beat toward `peer_addr`, carrying one grant.
+/// An exporter on a fast beat toward `peer_addr`, which carries one grant.
 ///
 /// The ad-filter scenario, which tests discoverability itself, uses it. The
 /// grant proves that the slate stays filtered even when a grant opens an
@@ -253,22 +253,17 @@ async fn start_split_stream_hive(
 	Ok(hive)
 }
 
-/// Emit work and record the doubled echo under `marker`.
-async fn record_echo(
-	trace: &TraceCollector,
+/// Emits work under `type_name`, and returns the servlet's decoded echo.
+async fn typed_echo(
 	client: &mut GenericClient<TokioListener>,
 	key: &Secp256k1SigningKey,
 	type_name: impl AsRef<str>,
 	id: impl AsRef<[u8]>,
-	marker: Urn<'static>,
-) -> Result<(), TightBeamError> {
+) -> Result<PingResponse, TightBeamError> {
 	let type_name = type_name.as_ref();
 	let id = id.as_ref();
-	trace.event(WORK_SENT)?;
 	let servlet_frame = emit_typed_work(client, key, type_name, id).await?;
-	let ping_response = decode_ping_echo(&servlet_frame)?;
-	trace.event_with(marker, &[], u64::from(ping_response.doubled))?;
-	Ok(())
+	decode_ping_echo(&servlet_frame)
 }
 
 /// A client that dials `server_trust`'s gateway under `identity`, for a
@@ -295,22 +290,20 @@ tb_assert_spec! {
 		mode: Accept,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
-			(events::CLUSTER_PEER_ADVERTISED, at_least!(1)),
-			(PEER_ROUTES_AFTER_INSTALLS, exactly!(1), equals!(1u64)),
-			(EXPORT_HIDDEN_ROUTES, exactly!(1), equals!(0u64))
+			(events::CLUSTER_PEER_ADVERTISED, at_least!(1))
 		]
 	}
 }
 
 // # Discoverability
 //
-// The beat advertises only the exported slate. The exporter serves "ping"
-// and "ledger" but exports "ping" alone, while a grant opens "ledger" to
-// B's key. Every beat frame (direct ad and slate rumor) carries the filtered
-// slate, so the observer installs exactly one ping trail and zero ledger
-// trails. The grant stays out of ads. One ad carries the whole slate, so
-// once the ping trail installs, the absent ledger trail is decisive and not
-// a race.
+// The exporter serves "ping" and "ledger", exports "ping" alone, and grants
+// "ledger" to B's key.
+//
+// - Every beat frame (direct ad and slate rumor) carries the filtered slate, so
+//   the observer installs exactly one ping trail and zero ledger trails.
+// - One ad carries the whole slate, so once the ping trail installs, the
+//   absent ledger trail is decisive and not a race.
 tb_scenario! {
 	name: cluster_export_list_filters_advertised_slate,
 	spec: ClusterExportAdFilterSpec,
@@ -334,8 +327,9 @@ tb_scenario! {
 
 			let installed = wait_for_type_routes(&observer, "ping", 1, 100, Duration::from_millis(100)).await;
 			wait_for_direct_advertisement(&trace, 100, Duration::from_millis(100)).await;
-			trace.event_with(PEER_ROUTES_AFTER_INSTALLS, &[], installed as u64)?;
-			trace.event_with(EXPORT_HIDDEN_ROUTES, &[], type_route_count(&observer, "ledger") as u64)?;
+			let hidden = type_route_count(&observer, "ledger");
+			assert_eq!(installed, 1, "the observer installs the one exported ping trail");
+			assert_eq!(hidden, 0, "the export list keeps ledger out of every advertised slate");
 
 			exporter.stop();
 			observer.stop();
@@ -351,26 +345,20 @@ tb_assert_spec! {
 		mode: Accept,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
-			(PEER_ADVERTISE_SENT, exactly!(1)),
-			(PEER_AD_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
-			(PEER_ROUTES_AFTER, exactly!(1), equals!(2u64)),
-			(WORK_SENT, exactly!(4)),
+			(events::CLUSTER_PEER_ADVERTISED, exactly!(1)),
+			(events::CLUSTER_PEER_ADVERTISE_REFUSED, absent!()),
 			(events::CLUSTER_EXPORT_REFUSED, exactly!(2)),
-			(EXPORT_DENIED_STATUS, exactly!(2), equals!(TransitStatus::PermissionDenied)),
-			(events::CLUSTER_WORK_FORWARDED, exactly!(2)),
-			(EXPORT_PEER_ECHOED, exactly!(1), equals!(42u64)),
-			(EXPORT_LOCAL_ECHOED, exactly!(1), equals!(42u64))
+			(events::CLUSTER_WORK_FORWARDED, exactly!(2))
 		]
 	}
 }
 
 // # Enforcement (unary)
 //
-// The boundary refuses what the filter hides. B holds injected trails for
-// both of A's types, as if it had learned them before the export list
-// narrowed (a guessed name and a stale trail are the same attack).
-// The scenario drives all four verdicts the fail-closed allowlist
-// distinguishes:
+// The boundary refuses what the filter hides. B holds injected trails for both
+// of A's types, as if it had learned them before the export list narrowed (a
+// guessed name and a stale trail are the same attack). The fail-closed
+// allowlist gives four verdicts:
 //
 // 1. B relays "ledger": the request spent relay budget, so the allowlist
 //    refuses it (`PermissionDenied`, `CLUSTER_EXPORT_REFUSED`).
@@ -398,8 +386,7 @@ tb_scenario! {
 			// The route claim B would hold from before the list
 			// narrowed: A's own signature, both types.
 			let a_addr = gateway_a.addr().to_string();
-			advertise_peer_signed(
-				&trace,
+			let ad_reply = advertise_peer_signed(
 				&ctx.b,
 				&ctx.a.key,
 				&gateway_b,
@@ -407,25 +394,27 @@ tb_scenario! {
 				vec![servlet_urn("ping"), servlet_urn("ledger")],
 			)
 			.await?;
+			assert_eq!(ad_reply, TransitStatus::Ok, "the gateway admits the advertisement");
+			assert_eq!(gateway_b.peer_servlets()?.len(), 2, "B holds a claim for both of A's types");
 
 			let mut client_b = connect_cluster(&ctx.b, gateway_b.addr()).await?;
-			trace.event(WORK_SENT)?;
 
 			let refused_work = emit_typed_work(&mut client_b, &ctx.b.key, "ledger", b"export-relayed-work").await;
 			let relayed_denied = work_refusal_status(refused_work)?;
-			trace.event_with(EXPORT_DENIED_STATUS, &[], relayed_denied)?;
+			assert_eq!(relayed_denied, TransitStatus::PermissionDenied, "the export boundary refuses the relayed call");
 
-			record_echo(&trace, &mut client_b, &ctx.b.key, "ping", b"export-peer-work", EXPORT_PEER_ECHOED).await?;
+			let echo = typed_echo(&mut client_b, &ctx.b.key, "ping", b"export-peer-work").await?;
+			assert_eq!(echo.doubled, 42, "the work echoes");
 
 			let mut peer_direct = connect_with_identity(Arc::clone(&ctx.a.trust), &ctx.b, gateway_a.addr()).await?;
-			trace.event(WORK_SENT)?;
 
 			let refused_work = emit_typed_work(&mut peer_direct, &ctx.b.key, "ledger", b"export-identity-work").await;
 			let identity_denied = work_refusal_status(refused_work)?;
-			trace.event_with(EXPORT_DENIED_STATUS, &[], identity_denied)?;
+			assert_eq!(identity_denied, TransitStatus::PermissionDenied, "the export boundary refuses the peer's call");
 
 			let mut client_a = connect_with_identity(Arc::clone(&ctx.a.trust), &ctx.a, gateway_a.addr()).await?;
-			record_echo(&trace, &mut client_a, &ctx.a.key, "ledger", b"export-local-work", EXPORT_LOCAL_ECHOED).await?;
+			let echo = typed_echo(&mut client_a, &ctx.a.key, "ledger", b"export-local-work").await?;
+			assert_eq!(echo.doubled, 42, "the work echoes");
 
 			gateway_b.stop();
 			gateway_a.stop();
@@ -441,15 +430,11 @@ tb_assert_spec! {
 		mode: Accept,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
-			(PEER_ADVERTISE_SENT, exactly!(1)),
-			(PEER_AD_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
-			(PEER_ROUTES_AFTER, exactly!(1), equals!(1u64)),
-			(WORK_SENT, exactly!(2)),
+			(events::CLUSTER_PEER_ADVERTISED, exactly!(1)),
+			(events::CLUSTER_PEER_ADVERTISE_REFUSED, absent!()),
 			(events::CLUSTER_EXPORT_GRANTED, exactly!(1), equals!(true)),
 			(events::CLUSTER_WORK_FORWARDED, exactly!(1)),
-			(EXPORT_GRANT_ECHOED, exactly!(1), equals!(42u64)),
-			(events::CLUSTER_EXPORT_REFUSED, exactly!(1), equals!(false)),
-			(EXPORT_DENIED_STATUS, exactly!(1), equals!(TransitStatus::PermissionDenied))
+			(events::CLUSTER_EXPORT_REFUSED, exactly!(1), equals!(false))
 		]
 	}
 }
@@ -460,7 +445,7 @@ tb_assert_spec! {
 // injected ledger claim (the URN a granted partner knows out of band).
 //
 // 1. B relays "ledger": the built-in allowlist refuses it, the grant
-//    matches B's session key, and the work is served. The audit event
+//    matches B's session key, and A serves the work. The audit event
 //    carries the relayed flag (`CLUSTER_EXPORT_GRANTED` value `true`).
 // 2. C dials A directly with an admitted but ungranted identity and sends
 //    "ledger" at the origin budget: no allow source matches, so the
@@ -492,8 +477,7 @@ tb_scenario! {
 
 			// The ledger claim a granted partner holds out of band.
 			let a_addr = gateway_a.addr().to_string();
-			advertise_peer_signed(
-				&trace,
+			let ad_reply = advertise_peer_signed(
 				&ctx.b,
 				&ctx.a.key,
 				&gateway_b,
@@ -501,16 +485,18 @@ tb_scenario! {
 				vec![servlet_urn("ledger")],
 			)
 			.await?;
+			assert_eq!(ad_reply, TransitStatus::Ok, "the gateway admits the advertisement");
+			assert_eq!(gateway_b.peer_servlets()?.len(), 1, "B holds the ledger claim");
 
 			let mut client_b = connect_cluster(&ctx.b, gateway_b.addr()).await?;
-			record_echo(&trace, &mut client_b, &ctx.b.key, "ledger", b"export-grant-work", EXPORT_GRANT_ECHOED).await?;
+			let echo = typed_echo(&mut client_b, &ctx.b.key, "ledger", b"export-grant-work").await?;
+			assert_eq!(echo.doubled, 42, "the work echoes");
 
 			let mut client_c = connect_with_identity(Arc::clone(&ctx.a.trust), &ctx.c, gateway_a.addr()).await?;
-			trace.event(WORK_SENT)?;
 
 			let refused_work = emit_typed_work(&mut client_c, &ctx.c.key, "ledger", b"export-ungranted-work").await;
 			let ungranted_denied = work_refusal_status(refused_work)?;
-			trace.event_with(EXPORT_DENIED_STATUS, &[], ungranted_denied)?;
+			assert_eq!(ungranted_denied, TransitStatus::PermissionDenied, "the boundary refuses the ungranted call");
 
 			gateway_b.stop();
 			gateway_a.stop();
@@ -526,19 +512,13 @@ tb_assert_spec! {
 		mode: Accept,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
-			(PEER_ADVERTISE_SENT, exactly!(1)),
-			(PEER_AD_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
-			(PEER_ROUTES_AFTER, exactly!(1), equals!(2u64)),
-			(WORK_SENT, exactly!(4)),
+			(events::CLUSTER_PEER_ADVERTISED, exactly!(1)),
+			(events::CLUSTER_PEER_ADVERTISE_REFUSED, absent!()),
 			(events::CLUSTER_EXPORT_REFUSED, exactly!(3)),
 			(events::CLUSTER_EXPORT_IDENTITY_UNAVAILABLE, exactly!(1)),
 			(events::CLUSTER_EXPORT_UNBOUNDED, exactly!(1)),
-			(EXPORT_STREAM_REFUSED, exactly!(1), equals!(true)),
-			(EXPORT_DUPLEX_REFUSED, exactly!(1), equals!(true)),
-			(EXPORT_ANON_REFUSED, exactly!(1), equals!(true)),
 			(events::CLUSTER_WORK_FORWARDED, exactly!(1)),
-			(STREAM_SERVLET_HANDLED, exactly!(1)),
-			(STREAM_ECHOED, exactly!(1), equals!(8u64))
+			(STREAM_SERVLET_HANDLED, exactly!(1))
 		]
 	}
 }
@@ -574,8 +554,7 @@ tb_scenario! {
 			hive.register_with_cluster(gateway_a.addr()).await?;
 
 			let a_addr = gateway_a.addr().to_string();
-			advertise_peer_signed(
-				&trace,
+			let ad_reply = advertise_peer_signed(
 				&ctx.b,
 				&ctx.a.key,
 				&gateway_b,
@@ -583,32 +562,29 @@ tb_scenario! {
 				vec![servlet_urn("stream-echo"), servlet_urn("vault")],
 			)
 			.await?;
+			assert_eq!(ad_reply, TransitStatus::Ok, "the gateway admits the advertisement");
+			assert_eq!(gateway_b.peer_servlets()?.len(), 2, "B holds a claim for both of A's types");
 
 			let client = pooled_cluster_client(&trace, &ctx.b, gateway_b.addr()).await?;
-
-			trace.event(WORK_SENT)?;
 
 			let (sink, response) = client.open_stream_to(servlet_urn("vault"))?;
 			sink.close_with(b"denied").await?;
 
 			let stream_refused = response.await.is_err();
-			trace.event_with(EXPORT_STREAM_REFUSED, &[], stream_refused)?;
-			trace.event(WORK_SENT)?;
+			assert!(stream_refused, "the export boundary refuses the spliced stream open");
 
 			let (sink, mut body) = client.open_duplex_to(servlet_urn("vault"))?;
 			sink.close_with(b"denied").await?;
 
 			let duplex_refused = body.chunk().await.is_err();
-			trace.event_with(EXPORT_DUPLEX_REFUSED, &[], duplex_refused)?;
-			trace.event(WORK_SENT)?;
+			assert!(duplex_refused, "the export boundary refuses the spliced duplex open");
 
 			let anon_client = pooled_cluster_client(&trace, &ctx.a, gateway_a.addr()).await?;
 			let (sink, response) = anon_client.open_stream_to(servlet_urn("vault"))?;
 			sink.close_with(b"denied").await?;
 
 			let anon_refused = response.await.is_err();
-			trace.event_with(EXPORT_ANON_REFUSED, &[], anon_refused)?;
-			trace.event(WORK_SENT)?;
+			assert!(anon_refused, "the export boundary refuses the anonymous stream open");
 
 			let (mut sink, response) = client.open_stream_to(servlet_urn("stream-echo"))?;
 			sink.push(b"abcd").await?;
@@ -616,7 +592,7 @@ tb_scenario! {
 
 			let reply = response.await?.ok_or(TightBeamError::MissingResponse)?;
 			let echoed: PingResponse = decode(reply.message())?;
-			trace.event_with(STREAM_ECHOED, &[], u64::from(echoed.doubled))?;
+			assert_eq!(echoed.doubled, 8, "the exported type splices through B to A's servlet");
 
 			gateway_b.stop();
 			gateway_a.stop();
@@ -656,14 +632,10 @@ tb_assert_spec! {
 		mode: Accept,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
-			(PEER_ADVERTISE_SENT, exactly!(1)),
-			(PEER_AD_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
-			(PEER_ROUTES_AFTER, exactly!(1), equals!(1u64)),
-			(WORK_SENT, exactly!(2)),
+			(events::CLUSTER_PEER_ADVERTISED, exactly!(1)),
+			(events::CLUSTER_PEER_ADVERTISE_REFUSED, absent!()),
 			(events::CLUSTER_EXPORT_REFUSED, exactly!(1), equals!(true)),
-			(EXPORT_DENIED_STATUS, exactly!(1), equals!(TransitStatus::PermissionDenied)),
-			(events::CLUSTER_WORK_FORWARDED, exactly!(1)),
-			(EXPORT_LOCAL_ECHOED, exactly!(1), equals!(42u64))
+			(events::CLUSTER_WORK_FORWARDED, exactly!(1))
 		]
 	}
 }
@@ -674,8 +646,8 @@ tb_assert_spec! {
 // gate then denies exactly B's authenticated session key:
 //
 // 1. B relays ping work: A's session shows B's certificate from the
-//    mutual-TLS handshake, the gate matches its public key, and the work
-//    refuses with `CLUSTER_EXPORT_REFUSED`.
+//    mutual-TLS handshake, the gate matches its public key, and A refuses the
+//    work with `CLUSTER_EXPORT_REFUSED`.
 // 2. A's own client, presenting A's identity on the same mutual-TLS accept
 //    plane, reaches ping untouched: the denial keys on the session identity
 //    rather than on the target or the plane.
@@ -698,18 +670,20 @@ tb_scenario! {
 			hive.register_with_cluster(gateway_a.addr()).await?;
 
 			let a_addr = gateway_a.addr().to_string();
-			advertise_peer_signed(&trace, &ctx.b, &ctx.a.key, &gateway_b, a_addr.as_bytes(), vec![servlet_urn("ping")])
+			let ad_reply = advertise_peer_signed(&ctx.b, &ctx.a.key, &gateway_b, a_addr.as_bytes(), vec![servlet_urn("ping")])
 				.await?;
+			assert_eq!(ad_reply, TransitStatus::Ok, "the gateway admits the advertisement");
+			assert_eq!(gateway_b.peer_servlets()?.len(), 1, "B holds the ping claim");
 
 			let mut client_b = connect_cluster(&ctx.b, gateway_b.addr()).await?;
-			trace.event(WORK_SENT)?;
 
 			let refused_work = emit_typed_work(&mut client_b, &ctx.b.key, "ping", b"gate-denied-work").await;
 			let denied = work_refusal_status(refused_work)?;
-			trace.event_with(EXPORT_DENIED_STATUS, &[], denied)?;
+			assert_eq!(denied, TransitStatus::PermissionDenied, "the custom gate refuses B's call");
 
 			let mut client_a = connect_with_identity(Arc::clone(&ctx.a.trust), &ctx.a, gateway_a.addr()).await?;
-			record_echo(&trace, &mut client_a, &ctx.a.key, "ping", b"gate-local-work", EXPORT_LOCAL_ECHOED).await?;
+			let echo = typed_echo(&mut client_a, &ctx.a.key, "ping", b"gate-local-work").await?;
+			assert_eq!(echo.doubled, 42, "the work echoes");
 
 			gateway_b.stop();
 			gateway_a.stop();
@@ -717,4 +691,35 @@ tb_scenario! {
 			Ok(())
 		}
 	}
+}
+
+/// A federated configuration with no export list, bound at `bind`, that
+/// beats toward one peer that never answers.
+fn unbounded_federated_conf(certs: &ClusterTestCerts, bind: impl Into<String>) -> ClusterConfig {
+	ClusterConfig::builder(cluster_tls_config(certs))
+		.with_bind_addr(bind)
+		.with_peers(["127.0.0.1:65211"])
+		.expect("fixture peers name sockets")
+		.with_advertise_interval(Duration::from_millis(100))
+		.build()
+}
+
+// A gateway reports its export posture once it decides the address it
+// advertises. A federated gateway that refuses its wildcard bind reports no
+// posture, and the same gateway on a loopback bind reports it once.
+#[tokio::test]
+async fn a_gateway_reports_its_export_posture_only_once_it_starts() -> Result<(), TightBeamError> {
+	let certs = cluster_certs();
+	let refused_trace = TraceCollector::new();
+	let refused = start_cluster(&refused_trace, unbounded_federated_conf(&certs, "0.0.0.0:0")).await;
+	let started_trace = TraceCollector::new();
+	let started = start_cluster(&started_trace, unbounded_federated_conf(&certs, "127.0.0.1:0")).await?;
+	started.stop();
+
+	let refused_posture = refused_trace.recorded(events::CLUSTER_EXPORT_UNBOUNDED);
+	let started_posture = started_trace.recorded(events::CLUSTER_EXPORT_UNBOUNDED);
+	assert!(refused.is_err(), "a federated gateway refuses its wildcard bind");
+	assert_eq!(refused_posture, 0, "a gateway that refuses to start reports no posture");
+	assert_eq!(started_posture, 1, "a gateway that starts reports its posture once");
+	Ok(())
 }

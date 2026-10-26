@@ -35,8 +35,8 @@ use crate::der::Decode;
 use crate::der::Encode;
 use crate::policy::GatePolicy;
 use crate::policy::TransitStatus;
-use crate::transport::envelopes::{ArrivingEnvelope, TransportEnvelope, WireEnvelope};
-use crate::transport::error::TransportFailure;
+use crate::transport::envelopes::{TransportEnvelope, WireEnvelope};
+use crate::transport::error::{ArrivalCause, ArrivalRefusal, TransportFailure};
 use crate::transport::handshake::{BoxedServerHandshake, HandshakeProvider};
 use crate::transport::io::{EnvelopeSink, EnvelopeSource};
 use crate::transport::policy::RestartPolicy;
@@ -69,6 +69,10 @@ use crate::transport::handshake::negotiation::MuxSettings;
 	any(feature = "transport-cms", feature = "transport-hpke")
 ))]
 use crate::transport::handshake::negotiation::TransportOffer;
+#[cfg(feature = "instrument")]
+use crate::transport::handshake::SessionPeer;
+#[cfg(feature = "instrument")]
+use crate::transport::io::TransportRefusal;
 #[cfg(feature = "tokio")]
 use crate::transport::protocols::{AsyncByteRead, AsyncByteStream, AsyncByteWrite};
 #[cfg(feature = "tokio")]
@@ -230,7 +234,8 @@ impl<P: CryptoProvider + Send + Sync + 'static> TokioListener<P> {
 	}
 
 	/// Accepts one connection as a transport built from this listener's
-	/// configuration.
+	/// configuration, which names the address it accepted the connection
+	/// from.
 	///
 	/// # Errors
 	///
@@ -239,6 +244,9 @@ impl<P: CryptoProvider + Send + Sync + 'static> TokioListener<P> {
 		let (stream, peer_addr) = self.listener.accept().await?;
 		let tokio_stream = TokioStream::from(stream);
 		let transport = TcpTransport::new(tokio_stream, self.config.clone());
+
+		#[cfg(feature = "instrument")]
+		let transport = transport.accepted_from_peer(peer_addr);
 
 		Ok((transport, peer_addr))
 	}
@@ -304,7 +312,7 @@ impl<S: AsyncProtocolStream, P: CryptoProvider + Send + Sync> TcpTransport<S, P>
 where
 	TransportError: From<S::Error>,
 {
-	/// Reports whether the underlying stream still appears connected.
+	/// Reports whether the underlying stream appears connected.
 	///
 	/// External protocols need this liveness hook to implement
 	/// [`PersistentConnection`] for pooled connections, and the stream itself
@@ -518,7 +526,7 @@ where
 /// The wire mode a split receive half reads, with the cipher an encrypted
 /// session needs.
 enum SplitRecv {
-	/// The endpoint named cleartext, so envelopes carry NO confidentiality,
+	/// The endpoint names cleartext, so envelopes carry NO confidentiality,
 	/// integrity, replay, or deletion protection.
 	Cleartext,
 	/// The receive-direction cipher of the established session.
@@ -534,27 +542,12 @@ impl SplitRecv {
 		}
 	}
 
-	/// Admits `arriving` in the mode of this half, and returns the DER of the
-	/// transport envelope it carries: a cleartext envelope as it arrived, or
-	/// the content of a record this half's receive cipher opened in place.
-	///
-	/// The half refuses an arrival of the other mode before any decode.
-	///
-	/// # Errors
-	///
-	/// - [`TransportError::OperationFailed`] with
-	///   [`TransportFailure::EncryptionFailed`] -- a record arrived on a
-	///   cleartext half.
-	/// - [`TransportError::MissingEncryption`] -- a cleartext envelope arrived on an encrypted half.
-	/// - [`TransportError`] -- the errors of [`RecvCipher::open`].
-	fn admit<'w>(&self, arriving: ArrivingEnvelope<'w>) -> TransportResult<&'w [u8]> {
-		match (self, arriving) {
-			(Self::Cleartext, ArrivingEnvelope::Cleartext(contents)) => Ok(contents),
-			(Self::Encrypted(recv_key), ArrivingEnvelope::Encrypted(record)) => Ok(recv_key.open(record)?),
-			(Self::Cleartext, ArrivingEnvelope::Encrypted(_)) => {
-				Err(TransportError::OperationFailed(TransportFailure::EncryptionFailed))
-			}
-			(Self::Encrypted(_), ArrivingEnvelope::Cleartext(_)) => Err(TransportError::MissingEncryption),
+	/// The receive cipher of an encrypted half, or `None` for a cleartext
+	/// half, under which an arrival admits.
+	const fn cipher(&self) -> Option<&RecvCipher> {
+		match self {
+			Self::Cleartext => None,
+			Self::Encrypted(recv_key) => Some(recv_key),
 		}
 	}
 }
@@ -562,18 +555,28 @@ impl SplitRecv {
 /// The wire mode a split send half writes, with the cipher an encrypted
 /// session needs.
 enum SplitSend {
-	/// The endpoint named cleartext.
+	/// The endpoint names cleartext.
 	Cleartext,
 	/// The send-direction cipher of the established session.
 	Encrypted(SendCipher),
 }
 
+#[cfg(feature = "instrument")]
+impl SplitSend {
+	/// The send cipher of an encrypted half, or `None` for a cleartext half.
+	const fn cipher(&self) -> Option<&SendCipher> {
+		match self {
+			Self::Cleartext => None,
+			Self::Encrypted(send_key) => Some(send_key),
+		}
+	}
+}
+
 /// The exclusive receive half of a split transport.
 ///
-/// It carries the wire mode that its session held when it split. An
-/// encrypted half owns the receive-direction cipher, so decryption needs no
-/// locks and can run concurrently with a [`TransportWriter`] on the same
-/// connection.
+/// It carries the wire mode of its session at the split. An encrypted half
+/// owns the receive-direction cipher, so decryption needs no locks and can run
+/// concurrently with a [`TransportWriter`] on the same connection.
 pub struct TransportReader<R>
 where
 	R: AsyncReadStream,
@@ -588,6 +591,10 @@ where
 	/// [`EnvelopeSource::trace`].
 	#[cfg(feature = "instrument")]
 	trace: Option<TraceCollector>,
+	/// The peer of the session this half split from, which the record of a
+	/// refused envelope names.
+	#[cfg(feature = "instrument")]
+	peer: Option<Arc<SessionPeer>>,
 }
 
 impl<R> TransportReader<R>
@@ -610,18 +617,10 @@ where
 
 		self
 	}
-}
 
-impl<R> EnvelopeSource for TransportReader<R>
-where
-	R: AsyncReadStream,
-	TransportError: From<R::Error>,
-{
-	/// Reads one envelope in the wire mode this half took from the split.
-	///
-	/// The operation deadline bounds the read in either mode, so a peer that
-	/// stops mid-frame cannot pin the reader task (CWE-400).
-	async fn read_envelope(&mut self) -> TransportResult<TransportEnvelope> {
+	/// Reads the bytes of one envelope in the wire mode this half took from the
+	/// split, under the operation deadline.
+	async fn read_wire(&mut self) -> TransportResult<Vec<u8>> {
 		let cap = self.limits.envelope_ceiling(self.mode.wire_mode());
 
 		// A split half belongs to an established session, so the read runs
@@ -637,20 +636,61 @@ where
 		#[cfg(not(all(feature = "tokio", feature = "std")))]
 		let wire_bytes = self.stream.read_frame(policy.cap()).await?;
 
+		Ok(wire_bytes)
+	}
+
+	/// Reads one envelope in the wire mode this half took from the split,
+	/// under the operation deadline.
+	async fn read_in_mode(&mut self) -> Result<TransportEnvelope, ArrivalRefusal> {
 		// A record opens in the buffer it arrived in, so the buffer wipes when
 		// it drops. The outer tag names the mode, so the half refuses a mode
 		// other than its own before any decode.
-		let mut wire_bytes = Zeroizing::new(wire_bytes);
-		let arriving = WireEnvelope::admit(&mut wire_bytes)?;
-		let contents = self.mode.admit(arriving)?;
-		let envelope = TransportEnvelope::from_der(contents)?;
+		let read = self.read_wire().await;
+		let mut wire_bytes = Zeroizing::new(read.map_err(|error| self.refuse(error))?);
+		let arriving =
+			WireEnvelope::admit(&mut wire_bytes).map_err(|error| self.refuse(TransportError::DerError(error)))?;
+		let contents = arriving.admit_under(self.mode.cipher()).map_err(|cause| self.refuse(cause))?;
+		let envelope = TransportEnvelope::from_der(contents);
 
-		Ok(envelope)
+		envelope.map_err(|error| self.refuse(TransportError::DerError(error)))
 	}
 
-	/// Returns the number of records still readable before the receive cipher
-	/// demands a rekey. A cleartext half never demands one, so it reports
-	/// `u64::MAX`.
+	/// The refusal of an arrival on this half for `cause`, with the peer of the
+	/// session that the half split from.
+	fn refuse(&self, cause: impl Into<ArrivalCause>) -> ArrivalRefusal {
+		#[cfg(feature = "instrument")]
+		let peer = self.peer.as_ref();
+		#[cfg(not(feature = "instrument"))]
+		let peer = None;
+
+		ArrivalRefusal::new(cause, peer)
+	}
+}
+
+impl<R> EnvelopeSource for TransportReader<R>
+where
+	R: AsyncReadStream,
+	TransportError: From<R::Error>,
+{
+	/// Reads one envelope in the wire mode this half took from the split.
+	///
+	/// The operation deadline bounds the read in either mode, so a peer that
+	/// stops mid-frame cannot pin the reader task (CWE-400). A traced half
+	/// records a refused envelope as [`TRANSPORT_ENVELOPE_REFUSED`].
+	///
+	/// [`TRANSPORT_ENVELOPE_REFUSED`]: crate::instrumentation::events::TRANSPORT_ENVELOPE_REFUSED
+	async fn read_envelope(&mut self) -> TransportResult<TransportEnvelope> {
+		let read = self.read_in_mode().await;
+
+		#[cfg(feature = "instrument")]
+		let read = TransportRefusal::audit_read(read, self.trace.as_ref());
+
+		Ok(read?)
+	}
+
+	/// Returns the number of records that the half can read before the receive
+	/// cipher demands a rekey. A cleartext half never demands one, so it
+	/// reports `u64::MAX`.
 	fn remaining_records(&self) -> u64 {
 		match &self.mode {
 			SplitRecv::Cleartext => u64::MAX,
@@ -683,10 +723,10 @@ where
 
 /// The exclusive send half of a split transport.
 ///
-/// It carries the wire mode that its session held when it split. An
-/// encrypted half owns the send-direction cipher and its record sequence,
-/// so encryption needs no locks and can run concurrently with a
-/// [`TransportReader`] on the same connection.
+/// It carries the wire mode of its session at the split. An encrypted half
+/// owns the send-direction cipher and its record sequence, so encryption needs
+/// no locks and can run concurrently with a [`TransportReader`] on the same
+/// connection.
 pub struct TransportWriter<W>
 where
 	W: AsyncWriteStream,
@@ -735,6 +775,11 @@ where
 {
 	/// Writes one envelope in the wire mode this half took from the split,
 	/// under the operation deadline in either mode.
+	///
+	/// A traced half records an envelope that its send cipher refuses at the
+	/// record limit as [`TRANSPORT_REKEY_REQUIRED`].
+	///
+	/// [`TRANSPORT_REKEY_REQUIRED`]: crate::instrumentation::events::TRANSPORT_REKEY_REQUIRED
 	async fn write_envelope(&mut self, envelope: TransportEnvelope) -> TransportResult<()> {
 		let builder = EnvelopeBuilder::transport(envelope).with_limits(self.limits);
 		let builder = match &self.mode {
@@ -742,7 +787,12 @@ where
 			SplitSend::Encrypted(send_key) => builder.with_wire_mode(WireMode::Encrypted).with_encryptor(send_key),
 		};
 
-		let wire_envelope = builder.finish()?;
+		let sealed = builder.finish();
+
+		#[cfg(feature = "instrument")]
+		let sealed = TransportRefusal::audit_send(sealed, self.trace.as_ref(), self.mode.cipher());
+
+		let wire_envelope = sealed?;
 		let wire_bytes = wire_envelope.to_der()?;
 
 		#[cfg(all(feature = "tokio", feature = "std"))]
@@ -754,9 +804,9 @@ where
 		Ok(())
 	}
 
-	/// Returns the number of records still writable before the send cipher
-	/// demands a rekey. A cleartext half never demands one, so it reports
-	/// `u64::MAX`.
+	/// Returns the number of records that the half can write before the send
+	/// cipher demands a rekey. A cleartext half never demands one, so it
+	/// reports `u64::MAX`.
 	fn remaining_records(&self) -> u64 {
 		match &self.mode {
 			SplitSend::Cleartext => u64::MAX,
@@ -813,7 +863,7 @@ where
 	///   [`TransportReader`] and its send key into the [`TransportWriter`].
 	///   Directional keys make this a transfer of ownership, so the halves
 	///   share no mutable cryptographic state.
-	/// - A transport named cleartext splits into cleartext halves, which carry
+	/// - A transport that names cleartext splits into cleartext halves, which carry
 	///   NO confidentiality, integrity, replay, or deletion protection.
 	///
 	/// The operation deadline carries onto both halves and bounds every read
@@ -826,6 +876,11 @@ where
 	/// - [`TransportError::InvalidState`] -- the session is provisioned for
 	///   encryption and its handshake has not completed.
 	pub fn into_split(mut self) -> TransportResult<SplitTransport<S>> {
+		// The split takes the session apart, so the reader keeps its peer for
+		// the record of a refused envelope.
+		#[cfg(feature = "instrument")]
+		let peer = self.state.session_peer().cloned();
+
 		let (recv_mode, send_mode) = match self.state.phase() {
 			SessionPhase::Cleartext => (SplitRecv::Cleartext, SplitSend::Cleartext),
 			SessionPhase::Encrypted(_) => {
@@ -852,6 +907,8 @@ where
 			clock: Arc::clone(&clock),
 			#[cfg(feature = "instrument")]
 			trace: trace.as_ref().map(TraceCollector::share),
+			#[cfg(feature = "instrument")]
+			peer,
 		};
 		let writer = TransportWriter {
 			stream: write_half,
@@ -868,7 +925,7 @@ where
 
 #[cfg(feature = "tokio")]
 impl<P: CryptoProvider + Send + Sync + 'static> AsyncListenerTrait for TokioListener<P> {
-	/// It delegates to the inherent [`TokioListener::accept`], so both entry
+	/// Delegates to the inherent [`TokioListener::accept`], so both entry
 	/// points install the full listener state.
 	async fn accept(&self) -> Result<(Self::Transport, Self::Address), Self::Error> {
 		{
@@ -1030,6 +1087,10 @@ mod tests {
 	use crate::transport::{MessageCollector, MessageEmitter, TransportEncryptionConfig};
 	use crate::utils::time::{ManualClock, SystemClock};
 
+	#[cfg(feature = "instrument")]
+	use crate::crypto::aead::SessionKeys;
+	#[cfg(feature = "instrument")]
+	use crate::crypto::hash::{Digest, Sha3_256};
 	#[cfg(feature = "transport-hpke")]
 	use crate::crypto::key::Secp256k1KeyProvider;
 	#[cfg(feature = "transport-hpke")]
@@ -1038,16 +1099,24 @@ mod tests {
 	use crate::crypto::x509::error::CertificateValidationError::CertificateNotTrusted;
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	use crate::crypto::x509::policy::{CertificateValidation, DirectTrustValidator};
+	#[cfg(feature = "instrument")]
+	use crate::instrumentation::{events, TbInstrumentationConfig};
+	#[cfg(feature = "instrument")]
+	use crate::trace::TraceConfig;
 	#[cfg(feature = "transport-hpke")]
 	use crate::transport::client::ClientBuilder;
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	use crate::transport::handshake::tests::create_test_signed_data;
+	#[cfg(feature = "instrument")]
+	use crate::transport::handshake::EstablishedSession;
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	use crate::transport::handshake::HandshakeMessage;
 	#[cfg(feature = "transport-hpke")]
 	use crate::transport::handshake::PeerAuthentication;
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	use crate::transport::handshake::ValidatorChain;
+	#[cfg(feature = "instrument")]
+	use crate::transport::state::SessionState;
 
 	/// Serves one single-flight request.
 	///
@@ -1122,8 +1191,8 @@ mod tests {
 			writer_under(mode, TransportLimits::default())
 		}
 
-		/// A write half hands out the clock of the connection it was split
-		/// from, so a plane assembled over it reads the endpoint's clock.
+		/// A write half hands out the clock of the connection it split from, so
+		/// a plane assembled over it reads the endpoint's clock.
 		#[test]
 		fn a_split_writer_hands_out_the_connection_clock() {
 			let clock = Arc::new(ManualClock::default());
@@ -1155,6 +1224,8 @@ mod tests {
 				clock: Arc::new(SystemClock),
 				#[cfg(feature = "instrument")]
 				trace: None,
+				#[cfg(feature = "instrument")]
+				peer: None,
 			}
 		}
 
@@ -1277,6 +1348,8 @@ mod tests {
 				clock: Arc::new(SystemClock),
 				#[cfg(feature = "instrument")]
 				trace: None,
+				#[cfg(feature = "instrument")]
+				peer: None,
 			};
 
 			let outcome = reader.read_envelope().await;
@@ -1301,6 +1374,8 @@ mod tests {
 				clock,
 				#[cfg(feature = "instrument")]
 				trace: None,
+				#[cfg(feature = "instrument")]
+				peer: None,
 			};
 			let started = tokio::time::Instant::now();
 
@@ -1347,13 +1422,13 @@ mod tests {
 
 		/// A frame stream whose every read yields the one wire envelope it
 		/// holds.
-		struct OneFrameStream(&'static [u8]);
+		struct OneFrameStream(Vec<u8>);
 
 		impl AsyncReadStream for OneFrameStream {
 			type Error = IoError;
 
 			async fn read_frame(&mut self, _cap: usize) -> Result<Vec<u8>, Self::Error> {
-				Ok(self.0.to_vec())
+				Ok(self.0.clone())
 			}
 		}
 
@@ -1366,14 +1441,16 @@ mod tests {
 		const UNOPENED_RECORD: &[u8] = &[0xa1, 0x02, 0x05, 0x00];
 
 		/// A receive half in `mode` over a stream that yields `frame`.
-		fn reading(mode: SplitRecv, frame: &'static [u8]) -> TransportReader<OneFrameStream> {
+		fn reading(mode: SplitRecv, frame: impl AsRef<[u8]>) -> TransportReader<OneFrameStream> {
 			TransportReader {
-				stream: OneFrameStream(frame),
+				stream: OneFrameStream(frame.as_ref().to_vec()),
 				mode,
 				limits: TransportLimits::default(),
 				clock: Arc::new(SystemClock),
 				#[cfg(feature = "instrument")]
 				trace: None,
+				#[cfg(feature = "instrument")]
+				peer: None,
 			}
 		}
 
@@ -1396,6 +1473,112 @@ mod tests {
 			let outcome = reader.read_envelope().await;
 			let refused = matches!(outcome, Err(TransportError::OperationFailed(failure)) if failure == expected);
 			assert!(refused);
+		}
+
+		/// The audit record that a traced half files for an envelope it
+		/// refuses.
+		#[cfg(feature = "instrument")]
+		mod refusal_audit {
+			use super::*;
+			use crate::crypto::hash::{Digest, Sha3_256};
+			use crate::instrumentation::{events, TbInstrumentationConfig};
+			use crate::testing::TestCertificate;
+			use crate::trace::TraceConfig;
+
+			/// A traced half records the envelope it refuses, by the name of
+			/// the failure and by the canonical key of the peer of its
+			/// session.
+			#[tokio::test]
+			async fn a_traced_half_records_the_envelope_it_refuses() -> Result<(), Box<dyn std::error::Error>> {
+				let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+				let peer = SessionPeer::try_from(Arc::new(certificate))?;
+				let expected: [u8; 32] = Sha3_256::digest(peer.key().as_der()).into();
+
+				let config = TbInstrumentationConfig { enable_payloads: true, ..TbInstrumentationConfig::default() };
+				let trace = TraceCollector::from(TraceConfig::with_instrumentation(config));
+				let mut reader = reading(SplitRecv::Encrypted(test_receiver()), UNDECODABLE_CLEARTEXT);
+				reader.trace = Some(trace.share());
+				reader.peer = Some(Arc::new(peer));
+
+				let outcome = reader.read_envelope().await;
+				assert!(matches!(outcome, Err(TransportError::MissingEncryption)));
+
+				let recorded = trace.drain_events();
+				let refusal = recorded.iter().find(|event| event.urn == events::TRANSPORT_ENVELOPE_REFUSED);
+				let refusal = refusal.ok_or("a traced half records the refusal")?;
+				assert_eq!(refusal.label.as_deref(), Some("MissingEncryption"));
+				assert_eq!(refusal.payload_hash, Some(expected));
+				Ok(())
+			}
+
+			/// A record that a client-to-server send cipher of `epoch` seals,
+			/// as its wire envelope.
+			fn sealed_at(epoch: u32) -> Result<Vec<u8>, TightBeamError> {
+				let sender = SendCipher::new(test_runtime(), epoch, RecordDirection::ClientToServer);
+				let record = sender.encrypt_next(PLAINTEXT)?;
+				Ok(WireEnvelope::Encrypted(record).to_der()?)
+			}
+
+			/// The record of epoch 0 with its last octet flipped. The octet
+			/// lies in the tag of the record, so the record fails to open.
+			fn with_its_tag_flipped() -> Result<Vec<u8>, TightBeamError> {
+				let mut forged = sealed_at(0)?;
+				let last = forged.last_mut().expect("a sealed record holds octets");
+				*last ^= 0x01;
+
+				Ok(forged)
+			}
+
+			/// A record that a client-to-server send cipher of epoch 0 seals at
+			/// `sequence`, in place of the sequence that the half expects.
+			fn sealed_at_sequence(sequence: u64) -> Result<Vec<u8>, TightBeamError> {
+				let sender = SendCipher::new(test_runtime(), 0, RecordDirection::ClientToServer);
+				let record = sender.seal_at(PLAINTEXT, sequence)?;
+				Ok(WireEnvelope::Encrypted(record).to_der()?)
+			}
+
+			/// A record that a client-to-server send cipher of epoch 0 seals
+			/// with an OCTET STRING in place of its position.
+			fn sealed_with_an_undecodable_position() -> Result<Vec<u8>, TightBeamError> {
+				let sender = SendCipher::new(test_runtime(), 0, RecordDirection::ClientToServer);
+				let position = crate::der::Any::encode_from(&crate::der::asn1::OctetString::new([0u8; 4])?)?;
+				let record = sender.seal_with_position(PLAINTEXT, position)?;
+				Ok(WireEnvelope::Encrypted(record).to_der()?)
+			}
+
+			/// The labels of the envelope refusals that `trace` recorded, in
+			/// the order it recorded them.
+			fn refusal_labels(trace: &TraceCollector) -> Vec<Option<String>> {
+				let recorded = trace.drain_events();
+				recorded
+					.into_iter()
+					.filter(|event| event.urn == events::TRANSPORT_ENVELOPE_REFUSED)
+					.map(|event| event.label)
+					.collect()
+			}
+
+			// A traced half records a forged record by its cause, once.
+			crate::tb_cases! {
+				fn a_traced_half_records_a_forged_record((forged, cause): (Result<Vec<u8>, TightBeamError>, &str))
+					-> Result<(), Box<dyn std::error::Error>>
+				{
+					let trace = TraceCollector::new();
+					let mut reader = reading(SplitRecv::Encrypted(test_receiver()), forged?);
+					reader.trace = Some(trace.share());
+
+					let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build()?;
+					let outcome = runtime.block_on(reader.read_envelope());
+					assert!(outcome.is_err());
+					assert_eq!(refusal_labels(&trace), [Some(String::from(cause))]);
+					Ok(())
+				}
+				cases {
+					past_the_record_limit => (sealed_at_sequence(crate::constants::DEFAULT_REKEY_RECORD_LIMIT), "OpenFailed"),
+					whose_position_does_not_decode => (sealed_with_an_undecodable_position(), "OpenFailed"),
+					whose_tag_fails => (with_its_tag_flipped(), "OpenFailed"),
+					of_another_epoch => (sealed_at(1), "WrongEpoch"),
+				}
+			}
 		}
 	}
 
@@ -1509,8 +1692,8 @@ mod tests {
 		let identity = TestIdentity::insecure_fixed();
 
 		// Without a trust store, the dialer rule builds the client only when it
-		// names cleartext. The handshake the test then drives must still refuse
-		// to run blind.
+		// names cleartext. The handshake that the test drives over that client
+		// must refuse to run blind all the same.
 		let allow_cleartext = trust_store.is_none();
 		let encryption = EncryptionConfig {
 			trust_store,
@@ -1804,7 +1987,7 @@ mod tests {
 
 	/// A server transport over one end of a loopback connection, beside the
 	/// raw stream of its peer. The server reads its deadlines on `clock`, and
-	/// its handshake began at the clock's reading.
+	/// its handshake begins at the clock's reading.
 	async fn handshaking_server(clock: &Arc<ManualClock>) -> (TcpTransport<TokioStream>, TcpStream) {
 		let bound = TcpListener::bind("127.0.0.1:0").await;
 		let listener = bound.expect("a loopback port binds");
@@ -1851,6 +2034,60 @@ mod tests {
 		let driven = transport.perform_server_handshake(message).await;
 		let refused = matches!(driven, Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded)));
 		assert!(refused);
+		Ok(())
+	}
+
+	/// A split hands the peer of its session to the reader half, so the record
+	/// of an envelope that the half refuses names that peer.
+	#[cfg(feature = "instrument")]
+	#[tokio::test]
+	async fn a_split_reader_names_the_peer_of_its_session() -> Result<(), Box<dyn std::error::Error>> {
+		let clock = Arc::new(ManualClock::default());
+		let (transport, mut raw_peer) = handshaking_server(&clock).await;
+		let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+		let peer = SessionPeer::try_from(Arc::new(certificate))?;
+		let expected: [u8; 32] = Sha3_256::digest(peer.key().as_der()).into();
+
+		let config = TbInstrumentationConfig { enable_payloads: true, ..TbInstrumentationConfig::default() };
+		let trace = TraceCollector::from(TraceConfig::with_instrumentation(config));
+		let keys = SessionKeys::for_server(TestKey::insecure_directional_keys());
+		let phase = SessionPhase::Encrypted(Box::new(EstablishedSession::forged(keys, None, Some(peer))));
+		let mut transport = transport.with_trace(trace.share());
+		transport.state = SessionState::at(EncryptionConfig::unconfigured(), phase);
+		let (mut reader, _writer) = transport.into_split()?;
+		raw_peer.write_all(WAITING_FRAME).await?;
+
+		let refused = reader.read_envelope().await;
+		assert!(matches!(refused, Err(TransportError::MissingEncryption)));
+
+		let recorded = trace.drain_events();
+		let refusal = recorded.iter().find(|event| event.urn == events::TRANSPORT_ENVELOPE_REFUSED);
+		let evidence = refusal.and_then(|event| event.payload_hash);
+		assert_eq!(evidence, Some(expected));
+		Ok(())
+	}
+
+	/// A traced server records the handshake that its deadline ends, as the
+	/// outcome of that handshake.
+	#[cfg(all(feature = "transport-hpke", feature = "instrument"))]
+	#[tokio::test]
+	async fn a_handshake_past_the_deadline_records_its_expiry() -> TransportResult<()> {
+		let clock = Arc::new(ManualClock::default());
+		let trace = TraceCollector::new();
+		let (transport, _peer) = handshaking_server(&clock).await;
+		let mut transport = transport.with_trace(trace.share());
+		let message = HandshakeMessage::try_from(create_test_signed_data(b"late"))?;
+		clock.advance(transport.limits.handshake_timeout);
+
+		let driven = transport.perform_server_handshake(message).await;
+		assert!(matches!(
+			driven,
+			Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded))
+		));
+
+		let recorded = trace.drain_events();
+		let expiries = recorded.iter().filter(|event| event.urn == events::SESSION_HANDSHAKE_EXPIRED);
+		assert_eq!(expiries.count(), 1);
 		Ok(())
 	}
 

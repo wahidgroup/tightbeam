@@ -17,6 +17,7 @@ use tightbeam::{compose, servlet};
 use super::currency::MonetaryAmount;
 use super::harness::{PaymentHarness, PAYMENT_TAG};
 
+use tightbeam::der::asn1::OctetString;
 use tightbeam::urn::Urn;
 
 /// The HPKE `info` under which the key manager opens a sealed secret.
@@ -25,8 +26,6 @@ pub(crate) const KEY_MANAGER_HPKE_INFO: &[u8] = b"tb/test/payments/hpke/v1";
 pub(crate) const AUTHORIZATION_APPROVED: Urn<'static> =
 	tightbeam::urn!("test", "event:servlets/authorization-approved");
 pub(crate) const CAPTURE_COMPLETED: Urn<'static> = tightbeam::urn!("test", "event:servlets/capture-completed");
-pub(crate) const CHAIN_BROKEN: Urn<'static> = tightbeam::urn!("test", "event:servlets/chain-broken");
-pub(crate) const CHAIN_VALID: Urn<'static> = tightbeam::urn!("test", "event:servlets/chain-valid");
 pub(crate) const CURRENCY_BHD_PROCESSED: Urn<'static> =
 	tightbeam::urn!("test", "event:servlets/currency-bhd-processed");
 pub(crate) const CURRENCY_JPY_PROCESSED: Urn<'static> =
@@ -48,21 +47,14 @@ use super::messages::{
 
 /// Calculates the message priority from the transaction amount.
 ///
-/// The function normalizes the amount to USD-equivalent quanta and then
-/// picks the priority:
+/// The function converts the amount to US cents with
+/// [`MonetaryAmount::to_usd_cents`] and then picks the priority:
 ///
-/// - A high-value amount over 100,000 quanta gets [`MessagePriority::Expedited`].
-/// - An amount over 10,000 quanta gets [`MessagePriority::LowLatency`].
+/// - A high-value amount over 100,000 cents gets [`MessagePriority::Expedited`].
+/// - An amount over 10,000 cents gets [`MessagePriority::LowLatency`].
 /// - Any other amount gets [`MessagePriority::Standard`].
 pub fn to_priority(amount: &MonetaryAmount) -> MessagePriority {
-	// Each arm converts the amount to USD-equivalent quanta at a rough rate.
-	let normalized = match &amount.currency {
-		b"JPY" => amount.value / 100,  // ~100 JPY = 1 USD
-		b"KRW" => amount.value / 1300, // ~1300 KRW = 1 USD
-		b"BHD" => amount.value * 26,   // 1 BHD = ~2.65 USD, counted in fils as * 10 * 2.65
-		b"KWD" => amount.value * 32,   // 1 KWD = ~3.25 USD
-		_ => amount.value,             // Any other currency counts as 2-decimal, like USD
-	};
+	let normalized = amount.to_usd_cents();
 
 	if normalized > 100_000 {
 		MessagePriority::Expedited
@@ -74,44 +66,43 @@ pub fn to_priority(amount: &MonetaryAmount) -> MessagePriority {
 }
 
 servlet! {
-	pub AuthorizationServlet<CreditTransferTransaction, EnvConfig = ()>,
+	pub AuthorizationServlet<CreditTransferTransaction, EnvConfig = PaymentHarness>,
 	protocol: TokioListener,
 	handle: |req, frame, ctx| async move {
 		let trace = &ctx.trace();
-		let harness = PaymentHarness::new(Arc::clone(trace));
+		let harness: &PaymentHarness = ctx.env_config();
 
-		if let Some(cached) = harness.check_dedup_cache(&frame)? {
+		if let Some(cached) = harness.check_dedup_cache(&frame, trace)? {
 			return Ok(Some(compose! {
 				V2: id: frame.metadata().id(),
 					message: cached
 			}?));
 		}
 
-		// The message-integrity commitment must recompute over the
-		// decrypted transaction body, so this event proves cryptographic
-		// verification of what the client committed to. The presence of a
-		// commitment alone does not satisfy it.
+		// The message-integrity commitment must recompute over the decrypted
+		// transaction body, so this event proves cryptographic verification of
+		// what the client committed to, beyond the presence of a commitment.
 		let commitment_verified = frame.verify_commitment_of::<Sha3_256, _>(&req, [])?;
 		trace.event_with(INTEGRITY_VERIFIED, &[PAYMENT_TAG], commitment_verified)?;
 
-		match &req.instructed_amount.currency {
-			b"JPY" => trace.event_with(CURRENCY_JPY_PROCESSED, &[PAYMENT_TAG], true)?,
-			b"USD" => trace.event_with(CURRENCY_USD_PROCESSED, &[PAYMENT_TAG], true)?,
-			b"BHD" => trace.event_with(CURRENCY_BHD_PROCESSED, &[PAYMENT_TAG], true)?,
-			_ => trace.event_with(CURRENCY_OTHER_PROCESSED, &[PAYMENT_TAG], true)?,
+		match req.instructed_amount.currency.as_bytes() {
+			b"JPY" => trace.event_with(CURRENCY_JPY_PROCESSED, &[PAYMENT_TAG], ())?,
+			b"USD" => trace.event_with(CURRENCY_USD_PROCESSED, &[PAYMENT_TAG], ())?,
+			b"BHD" => trace.event_with(CURRENCY_BHD_PROCESSED, &[PAYMENT_TAG], ())?,
+			_ => trace.event_with(CURRENCY_OTHER_PROCESSED, &[PAYMENT_TAG], ())?,
 		};
 
 		let priority = to_priority(&req.instructed_amount);
 		if priority == MessagePriority::Expedited {
-			trace.event_with(HIGH_VALUE_EXPEDITED, &[PAYMENT_TAG], true)?;
+			trace.event_with(HIGH_VALUE_EXPEDITED, &[PAYMENT_TAG], ())?;
 		}
 
 		let auth_code = format!("AUTH{:08X}", req.creation_datetime as u32).into_bytes();
-		let response = TransactionStatus::approved(req.payment_id.to_owned(), auth_code);
+		let response = TransactionStatus::approved(req.payment_id.to_owned(), auth_code)?;
 
 		harness.dedup.cache_response(&frame, response.to_owned())?;
 
-		trace.event_with(AUTHORIZATION_APPROVED, &[PAYMENT_TAG], true)?;
+		trace.event_with(AUTHORIZATION_APPROVED, &[PAYMENT_TAG], ())?;
 
 		Ok(Some(compose! {
 			V2: id: frame.metadata().id(),
@@ -121,39 +112,34 @@ servlet! {
 }
 
 servlet! {
-	pub CaptureServlet<CaptureTransaction, EnvConfig = ()>,
+	pub CaptureServlet<CaptureTransaction, EnvConfig = PaymentHarness>,
 	protocol: TokioListener,
 	handle: |req, frame, ctx| async move {
 		let trace = &ctx.trace();
-		let harness = PaymentHarness::new(Arc::clone(trace));
+		let harness: &PaymentHarness = ctx.env_config();
 
-		if let Some(cached) = harness.check_dedup_cache(&frame)? {
+		// A capture links back to its authorization through `previous_frame`,
+		// and the chain of the harness records whether the link matches the
+		// authorization that the flow saw last.
+		if let Some(cached) = harness.check_dedup_cache(&frame, trace)? {
 			return Ok(Some(compose! {
 				V2: id: frame.metadata().id(),
 					message: cached
 			}?));
 		}
 
-		// A capture links back to its authorization frame through
-		// `previous_frame`, and this check reads only whether the link is set.
-		if frame.metadata().previous_frame().is_some() {
-			trace.event_with(CHAIN_VALID, &[PAYMENT_TAG], true)?;
-		} else {
-			trace.event_with(CHAIN_BROKEN, &[PAYMENT_TAG], true)?;
-		}
-
 		let payment_id = PaymentIdentification::new(
 			b"CAPTURE",
-			req.original_end_to_end_id.to_owned(),
+			req.original_end_to_end_id.as_bytes(),
 			format!("CAP{}", req.capture_datetime).as_bytes(),
-		);
+		)?;
 
 		let settlement_code = format!("SETTLE{:08X}", req.capture_datetime as u32).into_bytes();
-		let response = TransactionStatus::captured(payment_id, settlement_code);
+		let response = TransactionStatus::captured(payment_id, settlement_code)?;
 
 		harness.dedup.cache_response(&frame, response.to_owned())?;
 
-		trace.event_with(CAPTURE_COMPLETED, &[PAYMENT_TAG], true)?;
+		trace.event_with(CAPTURE_COMPLETED, &[PAYMENT_TAG], ())?;
 
 		Ok(Some(compose! {
 			V2: id: frame.metadata().id(),
@@ -187,21 +173,21 @@ servlet! {
 		match req {
 			KeyManagerRequest::GetPublicKey(_) => {
 				let response = GetPublicKeyResponse {
-					public_key: secret_key.public_key().to_sec1_bytes().to_vec(),
+					public_key: OctetString::new(secret_key.public_key().to_sec1_bytes().to_vec())?,
 				};
-				trace.event_with(KEYMANAGER_PUBKEY_SERVED, &[PAYMENT_TAG], true)?;
+				trace.event_with(KEYMANAGER_PUBKEY_SERVED, &[PAYMENT_TAG], ())?;
 				Ok(Some(compose! {
 					V2: id: frame.metadata().id(),
 						message: response
 				}?))
 			}
 			KeyManagerRequest::Decrypt(decrypt_req) => {
-				let sealed = HpkeMessage::<HpkeSecp256k1Sha256Aes256Gcm>::from_bytes(&decrypt_req.ciphertext)?;
+				let sealed = HpkeMessage::<HpkeSecp256k1Sha256Aes256Gcm>::from_bytes(decrypt_req.ciphertext.as_bytes())?;
 				let plaintext_secret = secret_key.as_ref().open(&sealed, KEY_MANAGER_HPKE_INFO, b"")?;
-				let plaintext = plaintext_secret.to_insecure().to_vec();
+				let plaintext = OctetString::new(plaintext_secret.to_insecure().to_vec())?;
 				let response = DecryptResponse { plaintext };
 
-				trace.event_with(KEYMANAGER_DECRYPT_SUCCESS, &[PAYMENT_TAG], true)?;
+				trace.event_with(KEYMANAGER_DECRYPT_SUCCESS, &[PAYMENT_TAG], ())?;
 
 				Ok(Some(compose! {
 					V2: id: frame.metadata().id(),
@@ -229,14 +215,10 @@ mod tests {
 	}
 
 	#[test]
-	fn priority_jpy_normalized() {
-		// 1,000,100 JPY / 100 = 10,001 normalized: LowLatency, not Expedited.
-		let amount = MonetaryAmount::new(1_000_100, *b"JPY");
+	fn priority_jpy_converts_to_us_cents() {
+		// 100,000 JPY is about 1,000 USD, which is 100,000 cents.
+		let amount = MonetaryAmount::new(100_000, *b"JPY");
 		assert_eq!(to_priority(&amount), MessagePriority::LowLatency);
-
-		// 100,000,000 JPY / 100 = 1,000,000 normalized: Expedited.
-		let amount_large = MonetaryAmount::new(100_000_000, *b"JPY");
-		assert_eq!(to_priority(&amount_large), MessagePriority::Expedited);
 	}
 
 	#[test]

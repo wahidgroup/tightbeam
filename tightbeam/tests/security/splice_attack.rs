@@ -37,25 +37,23 @@ use tightbeam::{
 	crypto::{
 		hash::{Digest, Sha3_256},
 		key::{KeyBackend, KeyError, SigningKeyProvider},
-		profiles::DefaultCryptoProvider,
 		sign::SigningIdentity,
 		x509::policy::{CertificateValidation, ExpiryValidator},
 	},
-	exactly, job,
+	exactly,
+	instrumentation::events,
+	job,
 	spki::AlgorithmIdentifierOwned,
 	tb_assert_spec, tb_process_spec, tb_scenario,
 	testing::{ScenarioConfig, SetupEnv},
 	trace::TraceCollector,
-	transport::handshake::{negotiation::SecurityOffer, Handshake, HandshakeError, PeerAuthentication},
-	urn::Urn,
 	utils::marker::MaybeSendFuture,
 	TightBeamError,
 };
 
-use crate::common::security::{
-	default_security_profile, hpke_client_config_presenting, hpke_server_config, pinning_validator, ClientMaterials,
-	ServerMaterials,
-};
+use crate::common::security::{ClientMaterials, ServerMaterials};
+use crate::security::common::HandshakeBackendKind;
+use crate::security::live::LiveHandshake;
 
 /// A key provider that claims the public key of `claimed` and signs under
 /// the key of `signer`, as software the attacker runs may.
@@ -106,18 +104,12 @@ impl SigningKeyProvider for LiftedSignatureProvider {
 	}
 }
 
-pub(crate) const SPLICED_CLOSING_REJECTED: Urn<'static> =
-	tightbeam::urn!("test", "event:splice-attack/spliced-closing-rejected");
-pub(crate) const LIFTED_FINISHED_REJECTED: Urn<'static> =
-	tightbeam::urn!("test", "event:splice-attack/lifted-finished-rejected");
-
 tb_assert_spec! {
 	pub SpliceAttackSpec,
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(SPLICED_CLOSING_REJECTED, exactly!(1u32), equals!(true)),
-			(LIFTED_FINISHED_REJECTED, exactly!(1u32), equals!(true))
+			(events::SESSION_CERT_REJECTED, exactly!(2u32), equals!("signature"))
 		]
 	}
 }
@@ -125,45 +117,35 @@ tb_assert_spec! {
 tb_process_spec! {
 	pub SpliceAttackProcess,
 	events {
-		observable { SPLICED_CLOSING_REJECTED, LIFTED_FINISHED_REJECTED }
+		observable { events::SESSION_CERT_REJECTED }
 		hidden { }
 	}
 	states {
-		Idle => { SPLICED_CLOSING_REJECTED => Spliced },
-		Spliced => { LIFTED_FINISHED_REJECTED => Done },
+		Idle => { events::SESSION_CERT_REJECTED => Spliced },
+		Spliced => { events::SESSION_CERT_REJECTED => Done },
 		Done => { }
 	}
 	terminal { Done }
 	annotations { description: "Splice attack: the client Finished must verify under the offered certificate" }
 }
 
-/// The verdict of a mutual server of `materials` on the closing of a client
-/// that offers the certificate of `victim` and signs through `provider`. The
-/// client is a real one, so it computes the key-confirmation tag for its own
-/// secrets.
-async fn verdict_on(
+/// A live handshake with a mutual server of `materials`, which files its
+/// verdict in `trace`, and a client that offers the certificate of `victim`
+/// and signs through `provider`. The client is a real one, so it computes the
+/// key-confirmation tag for its own secrets.
+fn forged_by(
 	materials: &ServerMaterials,
 	victim: &ClientMaterials,
 	provider: Arc<dyn SigningKeyProvider>,
-) -> Result<Result<(), HandshakeError>, TightBeamError> {
-	let profile = default_security_profile();
+	trace: &TraceCollector,
+) -> Result<LiveHandshake, TightBeamError> {
 	let spliced = SigningIdentity::new(Arc::clone(&victim.certificate), provider)?;
-	let validator = pinning_validator(&materials.certificate);
-	let mut config = hpke_client_config_presenting::<DefaultCryptoProvider>(validator, spliced);
-	config.security_offer = Some(SecurityOffer::new(vec![profile]));
-
-	let mut client = Handshake::client(config);
 
 	// The server holds a validator, so it requires client authentication.
 	let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator);
-	let mut server_config = hpke_server_config::<DefaultCryptoProvider>(materials, [profile]);
-	server_config.peer_authentication = PeerAuthentication::mutual([validator]);
-
-	let mut server = Handshake::server(server_config);
-
-	let reply = server.reply(client.start()?).await?;
-	let closing = client.respond(reply).await?;
-	Ok(server.finish(closing).await)
+	let handshake = LiveHandshake::new(HandshakeBackendKind::Hpke, materials.to_owned());
+	let handshake = handshake.with_client_validators([validator]).with_client_identity(spliced);
+	Ok(handshake.audit_server(trace))
 }
 
 tb_scenario! {
@@ -184,32 +166,28 @@ job! {
 	async fn run((trace,): (Arc<TraceCollector>,)) -> Result<(), TightBeamError> {
 		let materials = ServerMaterials::generate();
 
-		// The victim holds an authenticated identity whose certificate is
-		// public. The first attacker offers that certificate and proves it
-		// with its own key, behind a provider that claims the key of the
-		// victim.
+		// The first attacker offers the public certificate of the victim and
+		// proves it with its own key, behind a provider that claims the key of
+		// the victim.
 		let victim = ClientMaterials::deterministic();
 		let attacker = ClientMaterials::generate();
 		let claimed = Arc::clone(&victim.key_provider);
 		let signer = Arc::clone(&attacker.key_provider);
-		let spliced = verdict_on(&materials, &victim, Arc::new(SplicedKeyProvider { claimed, signer })).await?;
+		let splicer = Arc::new(SplicedKeyProvider { claimed, signer });
+		let spliced = forged_by(&materials, &victim, splicer, &trace)?.run().await?;
 
 		// The signature of the client Finished is the control, so the refusal
 		// must name it. The key confirmation and the validator both admit the
 		// closing of the attacker, so no other check refuses it first.
-		let refused = matches!(spliced, Err(HandshakeError::SignatureVerificationFailed));
-		trace.event_with(SPLICED_CLOSING_REJECTED, &[], refused)?;
+		spliced.refused_by_server("server admitted a spliced client Finished")?;
 
 		// The second forger holds a signature of the victim's own key over
 		// another message, so the right key signed the wrong transcript.
 		let other = Sha3_256::digest(b"the client Finished of another handshake");
 		let lifted = victim.key_provider.sign_prehash(&other).await?;
-		let forger = LiftedSignatureProvider { victim: Arc::clone(&victim.key_provider), lifted };
-		let lifted = verdict_on(&materials, &victim, Arc::new(forger)).await?;
+		let forger = Arc::new(LiftedSignatureProvider { victim: Arc::clone(&victim.key_provider), lifted });
+		let lifted = forged_by(&materials, &victim, forger, &trace)?.run().await?;
 
-		let refused = matches!(lifted, Err(HandshakeError::SignatureVerificationFailed));
-		trace.event_with(LIFTED_FINISHED_REJECTED, &[], refused)?;
-
-		Ok(())
+		lifted.refused_by_server("server admitted a lifted client Finished")
 	}
 }

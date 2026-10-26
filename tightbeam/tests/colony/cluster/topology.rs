@@ -2,9 +2,9 @@
 
 use super::common::*;
 
-/// Shared fixture for the topology scenarios: gateway certs plus the
-/// selection set the [`RecordingBalancer`] populates. The scenario
-/// reduces the set to a `BALANCER_SPREAD` boolean event the spec pins.
+/// The shared fixture of the topology scenarios: the gateway certificates and
+/// the selection set that the [`RecordingBalancer`] fills. The scenario checks
+/// that the set holds both instances.
 struct TopologyCtx {
 	certs: Arc<GatewayCerts>,
 	selected: Arc<Mutex<HashSet<usize>>>,
@@ -61,11 +61,10 @@ fn topology_cluster_conf(
 	ClusterConfig::builder(tls).with_load_balancer(load_balancer).build()
 }
 
-/// Register two live ping servlets as instances of one type and route
+/// Registers two live ping servlets as instances of one type and routes
 /// `routes` work requests through the gateway. Every submission must
-/// serve a response frame, which proves that the gateway reported
-/// [`TransitStatus::Ok`], and the helper records that status as a valued
-/// event for the spec.
+/// serve a response frame, which proves that the gateway reports
+/// [`TransitStatus::Ok`], and the gateway counts each routed request.
 async fn drive_topology_routes(
 	trace: &TraceCollector,
 	ctx: &TopologyCtx,
@@ -83,9 +82,7 @@ async fn drive_topology_routes(
 
 	let mut client = connect_cluster(ctx.certs.as_ref(), cluster.addr()).await?;
 
-	let registered = register_signed_hive(&mut client, &ctx.certs.key, b"topo-reg", hive_addr).await?;
-	let value = registered.status;
-	trace.event_with(TOPOLOGY_REGISTER_STATUS, &[], value)?;
+	register_signed_hive(&mut client, &ctx.certs.key, b"topo-reg", hive_addr).await?;
 
 	let added = vec![
 		servlet_info(&ctx.certs, "ping", addr_a.as_bytes()),
@@ -93,14 +90,11 @@ async fn drive_topology_routes(
 	];
 	let removed = vec![];
 	let request = servlet_address_update(hive_addr, added, removed);
-	let added = emit_servlet_update(&mut client, &ctx.certs.key, b"topo-add", request).await?;
-	let value = added.status;
-	trace.event_with(TOPOLOGY_ADD_STATUS, &[], value)?;
+	emit_servlet_update(&mut client, &ctx.certs.key, b"topo-add", request).await?;
 
 	for round in 0..routes {
 		let id = format!("topo-work-{round}");
 		emit_ping_work(&mut client, &ctx.certs.key, id.as_bytes()).await?;
-		trace.event_with(TOPOLOGY_ROUTE_STATUS, &[], TransitStatus::Ok)?;
 	}
 
 	servlet_a.stop();
@@ -108,22 +102,19 @@ async fn drive_topology_routes(
 	Ok(())
 }
 
-/// Drive `routes` requests and record whether the strategy selected both
-/// instances as `BALANCER_SPREAD`. Every topology scenario shares this
-/// helper, so they differ only in strategy and volume. The offer widths
-/// travel as `BALANCER_OFFERED` events the spec value-asserts.
-async fn record_topology_spread(
+/// Drives `routes` requests, and returns the indices of the instances that
+/// the strategy selected. Every topology scenario shares this function, so
+/// they differ only in strategy and volume. The offer widths travel as
+/// `BALANCER_OFFERED` events whose values the spec asserts.
+async fn topology_spread(
 	trace: &TraceCollector,
 	ctx: &TopologyCtx,
 	cluster: &ClusterGateway,
 	routes: usize,
-) -> Result<(), TightBeamError> {
+) -> Result<HashSet<usize>, TightBeamError> {
 	drive_topology_routes(trace, ctx, cluster, routes).await?;
 
-	let spread = ctx.selected_indices() == HashSet::from([0usize, 1usize]);
-	trace.event_with(BALANCER_SPREAD, &[], u64::from(spread))?;
-
-	Ok(())
+	Ok(ctx.selected_indices())
 }
 
 tb_assert_spec! {
@@ -134,11 +125,7 @@ tb_assert_spec! {
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(events::CLUSTER_UPDATE_ACCEPTED, exactly!(1)),
 			(events::CLUSTER_WORK_ROUTED, at_least!(4)),
-			(BALANCER_OFFERED, at_least!(4), equals!(2u64)),
-			(BALANCER_SPREAD, exactly!(1), equals!(1u64)),
-			(TOPOLOGY_REGISTER_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
-			(TOPOLOGY_ADD_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
-			(TOPOLOGY_ROUTE_STATUS, at_least!(4), equals!(TransitStatus::Ok))
+			(BALANCER_OFFERED, at_least!(4), equals!(2u64))
 		]
 	}
 }
@@ -156,7 +143,8 @@ tb_scenario! {
 			start_cluster(&trace, conf).await
 		},
 		client: |ClusterEnv { trace, context: ctx, cluster }| async move {
-			record_topology_spread(&trace, &ctx, &cluster, 4).await?;
+			let selected = topology_spread(&trace, &ctx, &cluster, 4).await?;
+			assert_eq!(selected, HashSet::from([0, 1]), "the strategy picks both instances");
 			cluster.stop();
 			Ok(())
 		}
@@ -177,7 +165,8 @@ tb_scenario! {
 			start_cluster(&trace, conf).await
 		},
 		client: |ClusterEnv { trace, context: ctx, cluster }| async move {
-			record_topology_spread(&trace, &ctx, &cluster, 12).await?;
+			let selected = topology_spread(&trace, &ctx, &cluster, 12).await?;
+			assert_eq!(selected, HashSet::from([0, 1]), "the strategy picks both instances");
 			cluster.stop();
 			Ok(())
 		}

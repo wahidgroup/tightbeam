@@ -1,16 +1,20 @@
-//! A refinement checker that an outside crate brings, built through the
-//! public API of tightbeam alone.
+//! A refinement checker and a memoization cache that an outside crate brings,
+//! built through the public API of tightbeam alone.
 //!
 //! The checker reads the failure rule through the default
 //! [`RefinementChecker::compute_refusals`] and the divergence rule through
 //! [`Process::divergent_states`], so each rule keeps its one home in
-//! tightbeam.
+//! tightbeam. The cache keys each set on its [`CacheKey`] and serves it to a
+//! second [`DefaultRefinementChecker`].
 
-use std::collections::HashSet;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use tightbeam::testing::fdr::{
-	DefaultExplorationEngine, Failure, FdrConfig, FdrExplorer, FdrVerdict, RefinementChecker, RefinementOutcome, Trace,
+	CacheKey, DefaultExplorationEngine, DefaultRefinementChecker, Failure, FdrConfig, FdrExplorer, FdrVerdict,
+	MemoizationCache, RefinementChecker, RefinementOutcome, Trace,
 };
 use tightbeam::testing::specs::csp::{Event, Process, ProcessBuildError, ProcessBuilder, State};
 
@@ -164,5 +168,82 @@ fn an_outside_checker_finds_an_accepting_refusal_through_the_failure_rule() -> R
 
 	let every_event = Some((vec![], HashSet::from([Event("a"), Event("b")])));
 	assert_eq!(verdict.failures_refinement_witness, every_event, "it can stop at `Idle`");
+	Ok(())
+}
+
+/// A memoization cache that counts each read that finds a set under its key,
+/// and each set that it stores.
+#[derive(Default)]
+struct CountingCache {
+	/// The traces under each key, and whether the set is complete.
+	traces: HashMap<CacheKey, (Vec<Trace>, bool)>,
+	/// The failures under each key, and whether the set is complete.
+	failures: HashMap<CacheKey, (Vec<Failure>, bool)>,
+	/// The divergences under each key, and whether the set is complete.
+	divergences: HashMap<CacheKey, (Vec<Trace>, bool)>,
+	/// The count of the reads that found a set.
+	hits: Cell<usize>,
+	/// The count of the sets stored.
+	stores: usize,
+}
+
+impl CountingCache {
+	/// The set that `sets` holds under `key`, counted as a hit when it holds
+	/// one.
+	fn read<T: Clone>(&self, sets: &HashMap<CacheKey, (Vec<T>, bool)>, key: &CacheKey) -> Option<(Vec<T>, bool)> {
+		let found = sets.get(key).cloned();
+		let hit = usize::from(found.is_some());
+		self.hits.set(self.hits.get() + hit);
+
+		found
+	}
+}
+
+impl MemoizationCache for CountingCache {
+	fn get_cached_traces(&self, key: &CacheKey) -> Option<(Vec<Trace>, bool)> {
+		self.read(&self.traces, key)
+	}
+
+	fn cache_traces(&mut self, key: CacheKey, traces: impl IntoIterator<Item = Trace>, complete: bool) {
+		self.stores += 1;
+		self.traces.insert(key, (traces.into_iter().collect(), complete));
+	}
+
+	fn get_cached_failures(&self, key: &CacheKey) -> Option<(Vec<Failure>, bool)> {
+		self.read(&self.failures, key)
+	}
+
+	fn cache_failures(&mut self, key: CacheKey, failures: impl IntoIterator<Item = Failure>, complete: bool) {
+		self.stores += 1;
+		self.failures.insert(key, (failures.into_iter().collect(), complete));
+	}
+
+	fn get_cached_divergences(&self, key: &CacheKey) -> Option<(Vec<Trace>, bool)> {
+		self.read(&self.divergences, key)
+	}
+
+	fn cache_divergences(&mut self, key: CacheKey, divergences: impl IntoIterator<Item = Trace>, complete: bool) {
+		self.stores += 1;
+		self.divergences.insert(key, (divergences.into_iter().collect(), complete));
+	}
+}
+
+#[test]
+fn a_second_checker_reads_the_set_that_an_outside_cache_holds() -> Result<(), ProcessBuildError> {
+	let process = steady()?;
+	let config = Arc::new(FdrConfig::default());
+	let cache = Rc::new(RefCell::new(CountingCache::default()));
+	let mut first = DefaultRefinementChecker::new(&process, Arc::clone(&config), Rc::clone(&cache));
+	let mut second = DefaultRefinementChecker::new(&process, config, Rc::clone(&cache));
+
+	let (computed, _complete) = first.compute_traces(&process, 8);
+	let (served, _complete) = second.compute_traces(&process, 8);
+
+	let counts = (cache.borrow().hits.get(), cache.borrow().stores);
+	assert_eq!(
+		(served, counts),
+		(computed, (1, 1)),
+		"the second checker reads the set that the first one stored"
+	);
 	Ok(())
 }

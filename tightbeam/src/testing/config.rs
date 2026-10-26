@@ -12,7 +12,7 @@ use std::{sync::Arc, vec::Vec};
 
 use crate::error::TightBeamError;
 use crate::testing::macros::{BuiltAssertSpec, TraceCollector};
-use crate::testing::result::{Layer3, ScenarioVerdict};
+use crate::testing::result::{Layer3, ScenarioResult, ScenarioVerdict};
 use crate::testing::specs::{CspValidationResult, Layer, SpecViolation, TBSpec, Violations};
 use crate::trace::ConsumedTrace;
 use crate::Errorizable;
@@ -283,14 +283,12 @@ impl ScenarioConfig {
 			return explorer.explore_into(exploration);
 		};
 
-		// An empty spec list puts the explorer in state-space exploration mode.
+		// The spec model answers deadlock and divergence freedom, and the specs
+		// of the FDR configuration grade the recorded trace alone.
 		let spec_process_cow = csp_spec.to_process_cow();
-		let mut exploration_cfg = (**fdr_cfg).clone();
-		exploration_cfg.specs = Vec::new();
-
-		let exploration_cfg = Arc::new(exploration_cfg);
-		let mut explorer = DefaultFdrExplorer::with_defaults(&spec_process_cow, exploration_cfg);
-		let verdict = explorer.explore_into(exploration)?;
+		let model_cfg = Arc::clone(fdr_cfg);
+		let mut explorer = DefaultFdrExplorer::with_defaults(&spec_process_cow, model_cfg);
+		let verdict = explorer.explore_state_space_into(exploration)?;
 		if fdr_cfg.specs.is_empty() {
 			return Ok(verdict);
 		}
@@ -313,7 +311,7 @@ impl ScenarioConfig {
 		Some(Arc::new(constraints))
 	}
 
-	/// Returns `None`, because a build without `testing-fdr` holds no FDR spec.
+	/// Returns `None`, because FDR specs need a build with `testing-fdr`.
 	#[cfg(all(feature = "testing-timing", not(feature = "testing-fdr")))]
 	fn spec_timing_constraints(&self) -> Option<Arc<TimingConstraints>> {
 		None
@@ -394,9 +392,9 @@ impl ScenarioConfigBuilder {
 
 	/// Whether `layer` can produce a rejection in this configuration.
 	///
-	/// A layer with no verifier cannot, and neither can an assertion layer
-	/// whose every spec grades nothing, so this is the one predicate both the
-	/// effective-verifier check and the expectation check ask.
+	/// A layer rejects only through a verifier, and the assertion layer rejects
+	/// only through a spec that grades something. This is the one predicate
+	/// that both the effective-verifier check and the expectation check ask.
 	fn can_reject_at(&self, layer: Layer) -> bool {
 		match layer {
 			Layer::Assertion => self.specs.iter().any(|spec| spec.can_reject()),
@@ -447,12 +445,14 @@ impl ScenarioConfigBuilder {
 /// What a hook observes: the recorded trace, the first assertion spec, and
 /// the [`ScenarioVerdict`] that every layer contributed to.
 ///
-/// The fields are private because [`HookContext::build`] assembles the
-/// verdict once, and an observer only reads it.
+/// The fields are private because [`HookContext::build`] grades the run once,
+/// through [`ScenarioResult::graded`], and an observer only reads it.
 pub struct HookContext {
-	assert_spec: Option<&'static BuiltAssertSpec>,
-	trace: ConsumedTrace,
-	verdict: ScenarioVerdict,
+	/// The graded run, with its trace, its specs, its verdict, and its
+	/// expectation.
+	result: ScenarioResult,
+	/// The outcome of `result`, read once, so the observer and the harness read
+	/// the same answer.
 	outcome: Result<(), Violations>,
 
 	#[cfg(feature = "testing-csp")]
@@ -464,8 +464,8 @@ pub struct HookContext {
 impl HookContext {
 	/// Assembles the observer's view of a finished scenario.
 	///
-	/// [`ScenarioConfig::verify`] grades the consumed trace, so the context
-	/// carries the one verdict that decides the scenario.
+	/// [`ScenarioResult::graded`] grades the consumed trace, so the context
+	/// carries the one graded run that decides the scenario.
 	///
 	/// # Errors
 	///
@@ -498,13 +498,11 @@ impl HookContext {
 		let mut consumed_trace = ConsumedTrace::new();
 		consumed_trace.populate_from_collector(trace);
 
-		let verdict = config.verify(&consumed_trace, execution)?;
-		let outcome = verdict.outcome(config.expect());
+		let result = ScenarioResult::graded(config, consumed_trace, execution)?;
+		let outcome = result.outcome();
 
 		let context = Self {
-			assert_spec: config.specs().first().copied(),
-			trace: consumed_trace,
-			verdict,
+			result,
 			outcome,
 			#[cfg(feature = "testing-csp")]
 			process: config.csp().map(Arc::clone),
@@ -517,17 +515,17 @@ impl HookContext {
 
 	/// The first assertion spec of the configuration.
 	pub fn assert_spec(&self) -> Option<&'static BuiltAssertSpec> {
-		self.assert_spec
+		self.result.assert_spec()
 	}
 
 	/// The trace the run recorded.
 	pub fn trace(&self) -> &ConsumedTrace {
-		&self.trace
+		self.result.trace()
 	}
 
 	/// What each verification layer decided.
 	pub fn verdict(&self) -> &ScenarioVerdict {
-		&self.verdict
+		self.result.verdict()
 	}
 
 	/// What the scenario decided, folded across every layer and measured
@@ -727,7 +725,7 @@ mod tests {
 		/// The three exploration events.
 		const EXPLORATION_EVENTS: [Urn<'static>; 3] = [ENABLED_SET_SAMPLE, REFUSAL_SNAPSHOT, DIVERGENCE_DETECT];
 
-		/// Instrumentation settings that ask for every exploration event.
+		/// Returns the settings that ask for every exploration event.
 		fn every_flag() -> TbInstrumentationConfig {
 			TbInstrumentationConfig {
 				sample_enabled_sets: true,

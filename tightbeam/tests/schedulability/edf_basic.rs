@@ -1,8 +1,7 @@
-//! EDF schedulability integration tests
+//! The integration tests of EDF schedulability.
 
 use core::time::Duration;
 
-use tightbeam::builder::TypeBuilder;
 use tightbeam::testing::fdr::FdrConfig;
 use tightbeam::testing::{ScenarioConfig, SetupEnv};
 use tightbeam::urn::Urn;
@@ -12,7 +11,7 @@ pub(crate) const TASK1: Urn<'static> = tightbeam::urn!("test", "event:edf-basic/
 pub(crate) const TASK2: Urn<'static> = tightbeam::urn!("test", "event:edf-basic/task2");
 pub(crate) const TASK3: Urn<'static> = tightbeam::urn!("test", "event:edf-basic/task3");
 
-// Define a real-time process with EDF scheduling
+// The real-time process gives each task a WCET and a period under EDF.
 tb_process_spec! {
 	pub EdfSchedulableProcess,
 	events {
@@ -42,10 +41,9 @@ tb_process_spec! {
 	}
 }
 
-// EDF schedulable task set integration test with FDR
-// Utilization: 3/10 + 5/20 + 2/30 = 0.3 + 0.25 + 0.067 = 0.617
-// EDF bound: 1.0
-// 0.617 < 1.0, so schedulable
+// The FDR scenario below runs a task set that is schedulable under EDF:
+// - Utilization: 3/10 + 5/20 + 2/30 = 0.3 + 0.25 + 0.067 = 0.617.
+// - The EDF bound is 1.0, and 0.617 < 1.0.
 tb_assert_spec! {
 	pub EdfAssertSpec,
 	V(1,0,0): {

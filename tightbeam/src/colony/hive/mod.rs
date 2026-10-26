@@ -11,7 +11,7 @@
 
 pub mod error;
 pub mod gates;
-pub mod runtime;
+mod runtime;
 mod scaling;
 
 pub use runtime::{HiveContextImpl, HiveRuntime};
@@ -50,7 +50,7 @@ use crate::utils::time::{Clock, SystemClock};
 use crate::utils::BasisPoints;
 use crate::{Frame, TightBeamError};
 
-pub use crate::crypto::x509::store::CertificateTrust;
+use crate::crypto::x509::store::CertificateTrust;
 
 /// The spawner that a hive calls to add one servlet instance on a scale-up.
 ///
@@ -206,12 +206,13 @@ impl ServletPlacement {
 
 /// A registration a [`ServletRegistry`] refused, handed back to its caller.
 ///
-/// The registration travels with the error, so the caller still holds the
-/// servlet and stops it the one way [`ServletBox::stop_boxed`] names.
+/// The registration travels with the error, so the caller holds the servlet
+/// and stops it the one way [`ServletBox::stop_boxed`] names.
 pub struct RefusedRegistration {
 	/// Why the registry refused the insert.
 	pub error: TightBeamError,
-	/// The registration the registry refused, whose servlet still runs.
+	/// The registration the registry refused. Its servlet runs until the
+	/// caller stops it.
 	pub registration: ServletRegistration,
 }
 
@@ -232,6 +233,12 @@ impl RefusedRegistration {
 /// implementation MAY shard its storage for high concurrency.
 pub trait ServletRegistry: Send + Sync {
 	/// Stores `registration` under `key`.
+	///
+	/// - A registration under a key the registry already holds replaces the one there.
+	/// - The implementation MUST stop the servlet of the replaced registration
+	///   through [`ServletBox::stop_boxed`], because no stop or drain of the
+	///   hive reaches a servlet once the registry drops its registration.
+	/// - [`HashMapRegistry`] stops the replaced servlet once the registry lock is free.
 	///
 	/// # Errors
 	///
@@ -323,13 +330,20 @@ impl HashMapRegistry {
 
 impl ServletRegistry for HashMapRegistry {
 	/// Takes every registration, so the result is always `Ok`.
+	///
+	/// A registration under a key the registry holds replaces the one there,
+	/// and the replaced servlet stops through [`ServletBox::stop_boxed`] once
+	/// the registry lock is free.
 	fn insert(
 		&self,
 		key: impl Into<Vec<u8>>,
 		registration: ServletRegistration,
 	) -> Result<(), Box<RefusedRegistration>> {
 		let key: Vec<u8> = key.into();
-		self.map().insert(key, registration);
+		let replaced = self.map().insert(key, registration);
+		if let Some(previous) = replaced {
+			previous.servlet.stop_boxed();
+		}
 
 		Ok(())
 	}
@@ -458,6 +472,11 @@ pub trait Hive: Sized + Send + Sync {
 	///
 	/// - [`TightBeamError::AlreadyEstablished`] -- the hive is already established.
 	/// - [`TightBeamError`] -- the control plane fails to bind, as the protocol's error converts.
+	/// - [`TightBeamError`] -- `trace` refuses the [`HIVE_ESTABLISHED`] event,
+	///   the fault the `testing-fault` feature injects. The hive stays
+	///   provisional, so a later establish can succeed.
+	///
+	/// [`HIVE_ESTABLISHED`]: crate::instrumentation::events::HIVE_ESTABLISHED
 	fn establish(&mut self, trace: Arc<TraceCollector>) -> impl Future<Output = Result<(), TightBeamError>> + Send;
 
 	/// Returns the shared intra-hive communication context.
@@ -560,8 +579,8 @@ impl HiveTlsConfig {
 	///
 	/// A hive presents one identity everywhere: to dial a gateway, to dial a
 	/// sibling servlet, and to accept on its own control plane. One decode
-	/// here gives those three one shared certificate, in place of a fresh
-	/// decode of the specification on every control-plane event.
+	/// here gives those three roles one shared certificate, and every
+	/// control-plane event reads that certificate.
 	///
 	/// # Errors
 	///

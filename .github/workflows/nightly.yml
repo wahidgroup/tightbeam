@@ -1,11 +1,11 @@
 name: Nightly
 
-# This workflow runs the time-based checks. `make ci` (see
-# .github/workflows/ci.yml) gates every pull request and runs everything a
-# change can invalidate. These two jobs fire without a change:
+# This workflow runs the checks that need a schedule. `make ci` (see
+# .github/workflows/ci.yml) gates every pull request. These jobs run here:
 #
-# - A new RustSec advisory invalidates a green build.
+# - A new RustSec advisory invalidates a green build with no change.
 # - A fuzz campaign needs more run time than a PR can hold.
+# - Miri interprets each test it runs, so its pass needs more run time than a PR can hold.
 
 on:
   schedule:
@@ -70,3 +70,22 @@ jobs:
           name: fuzz-findings
           path: built/fuzz/out/
           retention-days: 14
+
+  miri:
+    name: Miri
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: nightly
+          components: miri, rust-src
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Miri
+        run: make miri

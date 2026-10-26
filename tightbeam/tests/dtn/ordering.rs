@@ -1,13 +1,13 @@
-//! Frame ordering and out-of-order buffer management for DTN
+//! The frame ordering of a DTN node.
 //!
-//! Handles automatic reordering of frames that arrive out of sequence,
-//! buffering them until missing frames arrive to maintain proper order.
+//! [`OutOfOrderBuffer`] holds each frame that arrives out of sequence and
+//! releases the held frames in order once the missing frames arrive.
 
 use std::collections::HashMap;
 
 use tightbeam::{asn1::Frame, testing::error::TestingError, TightBeamError};
 
-/// Invalid sequence error - out-of-sequence frame
+/// The error of a frame whose order sits below the next expected order.
 #[derive(Debug, Clone)]
 pub struct InvalidSequenceError {
 	pub message: String,
@@ -25,7 +25,7 @@ impl From<InvalidSequenceError> for TightBeamError {
 	}
 }
 
-/// Buffer full error - ordering buffer exceeded capacity
+/// The error of an out-of-order frame that finds the buffer full.
 #[derive(Debug, Clone)]
 pub struct BufferFullError {
 	pub message: String,
@@ -43,39 +43,39 @@ impl From<BufferFullError> for TightBeamError {
 	}
 }
 
-/// Buffer for handling out-of-order frame delivery
+/// The buffer that restores the order of frames that arrive out of sequence.
 ///
-/// Maintains frames that arrive out of sequence and releases them
-/// in order once gaps are filled. This is critical for DTN where
-/// network delays can cause frames to arrive in different orders.
+/// It holds each frame that arrives ahead of its turn and releases the held
+/// frames in order once the gap before them fills. A DTN path needs it,
+/// because network delays can deliver frames in another order.
 pub struct OutOfOrderBuffer {
-	/// Buffered frames indexed by their order number
+	/// The held frames, keyed by their order number.
 	buffer: HashMap<u64, Frame>,
-	/// Next expected frame order number
+	/// The order number of the next frame that the buffer expects.
 	next_expected: u64,
-	/// Maximum number of frames to buffer
+	/// The most frames that the buffer holds at once.
 	max_buffer_size: usize,
 }
 
 impl OutOfOrderBuffer {
-	/// Create a new out-of-order buffer
+	/// Creates an empty buffer that expects order 1 first.
 	///
 	/// # Arguments
-	/// * `max_buffer_size` - Maximum frames to buffer before rejecting new ones
+	/// - `max_buffer_size`: the most frames that the buffer holds before it refuses another.
 	pub fn new(max_buffer_size: usize) -> Self {
 		Self { buffer: HashMap::new(), next_expected: 1, max_buffer_size }
 	}
 
-	/// Insert a frame and potentially get back ordered frames to process
+	/// Inserts a frame, and returns the frames that it releases in order.
 	///
 	/// # Returns
-	/// - `Ok(Some(frames))` - Frame completed a sequence, process these frames in order
-	/// - `Ok(None)` - Frame was buffered, waiting for missing frames
-	/// - `Err(_)` - Buffer full or invalid sequence
+	/// - `Ok(Some(frames))`: the frame completed a sequence, and `frames` holds it and the frames after it.
+	/// - `Ok(None)`: the buffer holds the frame until the frames before it arrive.
+	/// - `Err(_)`: [`BufferFullError`] for a full buffer, or [`InvalidSequenceError`] for a repeated order.
 	pub fn insert(&mut self, frame: Frame) -> Result<Option<Vec<Frame>>, TightBeamError> {
 		let order = frame.metadata().order();
 
-		// Check if this is a duplicate
+		// An order below the next expected one repeats a released frame.
 		if order < self.next_expected {
 			return Err(InvalidSequenceError {
 				message: format!("Frame order {} already processed (expected >= {})", order, self.next_expected),
@@ -83,18 +83,17 @@ impl OutOfOrderBuffer {
 			.into());
 		}
 
-		// If this is the next expected frame, process immediately
+		// The expected frame releases at once, with the held frames behind it.
 		if order == self.next_expected {
 			self.next_expected += 1;
 			let mut result = vec![frame];
 
-			// Drain any sequential frames from buffer
 			result.extend(self.drain_sequential());
 
 			return Ok(Some(result));
 		}
 
-		// Frame is out of order, buffer it
+		// A frame ahead of its turn waits in the buffer while there is room.
 		if self.buffer.len() >= self.max_buffer_size {
 			return Err(BufferFullError {
 				message: format!(
@@ -109,7 +108,8 @@ impl OutOfOrderBuffer {
 		Ok(None)
 	}
 
-	/// Drain all sequential frames starting from next_expected
+	/// Removes and returns the held frames that run in sequence from the next
+	/// expected order, and advances that order past them.
 	fn drain_sequential(&mut self) -> Vec<Frame> {
 		let mut result = Vec::new();
 		while let Some(frame) = self.buffer.remove(&self.next_expected) {
@@ -120,25 +120,23 @@ impl OutOfOrderBuffer {
 		result
 	}
 
-	/// Get the number of buffered frames
+	/// Returns the number of held frames.
 	pub fn buffered_count(&self) -> usize {
 		self.buffer.len()
 	}
 
-	/// Get the next expected order number
+	/// Returns the order number of the next frame that the buffer expects.
 	pub fn next_expected(&self) -> u64 {
 		self.next_expected
 	}
 
-	/// Set the next expected order number
-	/// This is used to synchronize the buffer with the global chain state
+	/// Sets the order number of the next frame that the buffer expects, which
+	/// aligns the buffer with the global chain state.
 	pub fn set_next_expected(&mut self, order: u64) {
 		self.next_expected = order;
 	}
 
-	/// Clear all buffered frames (for testing/reset)
-	/// Clear all buffered frames
-	/// NOTE: Available for scenarios requiring buffer reset between test phases
+	/// Drops every held frame, for a scenario that resets between test phases.
 	#[allow(dead_code)]
 	pub fn clear(&mut self) {
 		self.buffer.clear();
@@ -155,30 +153,19 @@ mod tests {
 	fn in_order_frames() -> Result<(), TightBeamError> {
 		let mut buffer = OutOfOrderBuffer::new(10);
 
-		// Create frames in order
 		let frame1 = compose! {
 			V0: id: "frame-1",
 				order: 1,
-				message: DtnPayload {
-					content: b"first".to_vec(),
-					source_node: "test".to_string(),
-					dest_node: "test".to_string(),
-					hop_count: 0,
-				}
+				message: DtnPayload::new(b"first", "test", "test", 0)?
 		}?;
 
 		let frame2 = compose! {
 			V0: id: "frame-2",
 				order: 2,
-				message: DtnPayload {
-					content: b"second".to_vec(),
-					source_node: "test".to_string(),
-					dest_node: "test".to_string(),
-					hop_count: 0,
-				}
+				message: DtnPayload::new(b"second", "test", "test", 0)?
 		}?;
 
-		// Process in order
+		// Each frame in order releases at once.
 		let result1 = buffer.insert(frame1)?;
 		let Some(result1) = result1 else {
 			return Err(TightBeamError::TestingError(TestingError::InvariantViolated));
@@ -201,41 +188,25 @@ mod tests {
 	fn out_of_order_reordering() -> Result<(), TightBeamError> {
 		let mut buffer = OutOfOrderBuffer::new(10);
 
-		// Create frames
 		let frame1 = compose! {
 			V0: id: "frame-1",
 				order: 1,
-				message: DtnPayload {
-					content: b"first".to_vec(),
-					source_node: "test".to_string(),
-					dest_node: "test".to_string(),
-					hop_count: 0,
-				}
+				message: DtnPayload::new(b"first", "test", "test", 0)?
 		}?;
 
 		let frame3 = compose! {
 			V0: id: "frame-3",
 				order: 3,
-				message: DtnPayload {
-					content: b"third".to_vec(),
-					source_node: "test".to_string(),
-					dest_node: "test".to_string(),
-					hop_count: 0,
-				}
+				message: DtnPayload::new(b"third", "test", "test", 0)?
 		}?;
 
 		let frame2 = compose! {
 			V0: id: "frame-2",
 			order: 2,
-			message: DtnPayload {
-				content: b"second".to_vec(),
-				source_node: "test".to_string(),
-				dest_node: "test".to_string(),
-				hop_count: 0,
-			}
+			message: DtnPayload::new(b"second", "test", "test", 0)?
 		}?;
 
-		// Insert frame 1 (in order)
+		// Frame 1 is next, so it releases at once.
 		let result1 = buffer.insert(frame1)?;
 		let Some(result1) = result1 else {
 			return Err(TightBeamError::TestingError(TestingError::InvariantViolated));
@@ -243,13 +214,13 @@ mod tests {
 		assert_eq!(result1.len(), 1);
 		assert_eq!(buffer.next_expected(), 2);
 
-		// Insert frame 3 (out of order, should buffer)
+		// Frame 3 arrives ahead of frame 2, so the buffer holds it.
 		let result3 = buffer.insert(frame3)?;
 		assert!(result3.is_none());
 		assert_eq!(buffer.buffered_count(), 1);
 		assert_eq!(buffer.next_expected(), 2);
 
-		// Insert frame 2 (fills gap, should return both 2 and 3)
+		// Frame 2 fills the gap, so frames 2 and 3 release together.
 		let result2 = buffer.insert(frame2)?;
 		let Some(frames) = result2 else {
 			return Err(TightBeamError::TestingError(TestingError::InvariantViolated));
@@ -267,41 +238,35 @@ mod tests {
 	fn buffer_full() -> Result<(), TightBeamError> {
 		let mut buffer = OutOfOrderBuffer::new(2);
 
-		let payload = |content: &[u8]| DtnPayload {
-			content: content.to_vec(),
-			source_node: "test".to_string(),
-			dest_node: "test".to_string(),
-			hop_count: 0,
-		};
+		let payload = |content: &[u8]| DtnPayload::new(content, "test", "test", 0);
 
-		// Insert frame 1
 		let frame1 = compose! {
 			V0: id: "frame-1",
 				order: 1,
-				message: payload(b"first")
+				message: payload(b"first")?
 		}?;
 		buffer.insert(frame1)?;
 
-		// Buffer frames 3 and 4 (fills buffer)
+		// Frames 3 and 4 wait for frame 2 and fill the buffer of two.
 		let frame3 = compose! {
 			V0: id: "frame-3",
 			order: 3,
-			message: payload(b"third")
+			message: payload(b"third")?
 		}?;
 		buffer.insert(frame3)?;
 
 		let frame4 = compose! {
 			V0: id: "frame-4",
 				order: 4,
-				message: payload(b"fourth")
+				message: payload(b"fourth")?
 		}?;
 		buffer.insert(frame4)?;
 
-		// Try to buffer frame 5 (should fail)
+		// Frame 5 finds the buffer full, so its insert fails.
 		let frame5 = compose! {
 			V0: id: "frame-5",
 				order: 5,
-				message: payload(b"fifth")
+				message: payload(b"fifth")?
 		}?;
 		let result = buffer.insert(frame5);
 		assert!(result.is_err());
@@ -313,25 +278,20 @@ mod tests {
 	fn duplicate_frame_rejection() -> Result<(), TightBeamError> {
 		let mut buffer = OutOfOrderBuffer::new(10);
 
-		let payload = |content: &[u8]| DtnPayload {
-			content: content.to_vec(),
-			source_node: "test".to_string(),
-			dest_node: "test".to_string(),
-			hop_count: 0,
-		};
+		let payload = |content: &[u8]| DtnPayload::new(content, "test", "test", 0);
 
 		let frame1 = compose! {
 			V0: id: "frame-1",
 			order: 1,
-			message: payload(b"first")
+			message: payload(b"first")?
 		}?;
 		buffer.insert(frame1)?;
 
-		// Try to insert order 1 again
+		// A second frame of order 1 repeats a released order, so it fails.
 		let frame1_dup = compose! {
 			V0: id: "frame-1-dup",
 			order: 1,
-			message: payload(b"duplicate")
+			message: payload(b"duplicate")?
 		}?;
 		let result = buffer.insert(frame1_dup);
 		assert!(result.is_err());

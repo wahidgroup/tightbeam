@@ -27,20 +27,24 @@ use tightbeam::{
 		},
 		secret::SecretSlice,
 		sign::ecdsa::{Secp256k1Signature, Secp256k1VerifyingKey},
+		sign::SigningIdentity,
 	},
 	der::{asn1::OctetString, asn1::OctetStringRef, Any, Decode, Encode},
 	prelude::TightBeamSocketAddr,
 	testing::error::{FdrConfigError, TestingError},
 	transport::handshake::{
 		negotiation::{ProfilePolicy, SecurityOffer},
-		Client, ClientFlow, ClientHandshakeProtocol, ClientHello, Handshake, HandshakeMessage, HandshakeProvider, Hpke,
-		Server, ServerFlow, ServerHandshake, ServerHandshakeProtocol,
+		Client, ClientFlow, ClientHandshakeProtocol, ClientHello, Handshake, HandshakeMessage, HandshakeProtocolKind,
+		HandshakeProvider, Hpke, Server, ServerFlow, ServerHandshake, ServerHandshakeProtocol,
 	},
 	transport::tcp::r#async::TokioListener,
 	transport::wire_der::WireDer,
-	transport::{EncryptedProtocol, TransportEncryptionConfig},
+	transport::{ClientBuilder, ConnectionBuilder, EncryptedProtocol, TransportEncryptionConfig},
 	TightBeamError,
 };
+
+use crate::common::security::pinning_trust_store;
+use crate::security::live::{AttackStep, FrameSlot, LiveHandshake};
 
 // The shared fixtures live in the crate-wide `common` module, so each threat
 // suite depends only on that module.
@@ -142,9 +146,9 @@ pub struct CapturedMessage {
 /// [`HandshakeProtocol::capture_full`] returns it.
 #[derive(Debug, Clone)]
 pub struct CapturedHandshake {
-	/// Every message the flow produced, in send order.
+	/// Every message that the flow produces, in send order.
 	pub messages: Vec<CapturedMessage>,
-	/// The handshake backend that produced the capture.
+	/// The handshake backend that produces the capture.
 	pub kind: HandshakeBackendKind,
 }
 
@@ -170,18 +174,6 @@ impl CapturedHandshake {
 	pub fn message_at(&self, step: usize) -> Option<&CapturedMessage> {
 		self.messages.iter().find(|m| m.step == step)
 	}
-}
-
-/// The outcome of a message injected into a handshake.
-#[derive(Debug)]
-#[allow(dead_code)]
-pub enum InjectionOutcome {
-	/// The handshake continued or completed, so the control under test let the
-	/// injected message through.
-	Accepted,
-	/// The handshake rejected the message with this error, so the control
-	/// under test refused the injection.
-	Rejected(TightBeamError),
 }
 
 /// The boxed future a flow step returns, which borrows the session it runs on.
@@ -226,8 +218,9 @@ pub struct FlowStep {
 /// A handshake flow described as its ordered steps.
 ///
 /// A backend states its step table and how one step advances to the next.
-/// [`HandshakeProtocol`] walks that table for both capture and injection, so
-/// the two drive the same sequence.
+/// [`HandshakeProtocol`] walks that table to capture a handshake, and
+/// [`HandshakeBackendKind::slot_of`] reads it to place an injection on the
+/// wire, so the two name the same sequence.
 pub trait HandshakeFlow: Send {
 	/// The backend this flow belongs to.
 	fn backend(&self) -> HandshakeBackendKind;
@@ -250,7 +243,7 @@ pub trait HandshakeFlow: Send {
 /// The protocol-agnostic handshake operations that a threat test drives.
 ///
 /// Every [`HandshakeFlow`] implements this trait from its step table, so a
-/// backend states its sequence once and gets capture and injection from it.
+/// backend states its sequence once and gets its capture from it.
 #[allow(dead_code)]
 pub trait HandshakeProtocol: Send {
 	/// Return the backend kind for this session.
@@ -258,10 +251,6 @@ pub trait HandshakeProtocol: Send {
 
 	/// Run a complete handshake, and capture every message it exchanges.
 	fn capture_full(&mut self) -> FlowFuture<'_, CapturedHandshake>;
-
-	/// Run the handshake up to `step`, then hand `msg` to the endpoint that
-	/// receives that step in place of the real message.
-	fn inject_at_step(&mut self, step: usize, msg: &[u8]) -> FlowFuture<'_, InjectionOutcome>;
 }
 
 impl<F: HandshakeFlow> HandshakeProtocol for F {
@@ -288,40 +277,7 @@ impl<F: HandshakeFlow> HandshakeProtocol for F {
 			Ok(CapturedHandshake { messages, kind: backend })
 		})
 	}
-
-	fn inject_at_step(&mut self, step: usize, msg: &[u8]) -> FlowFuture<'_, InjectionOutcome> {
-		let msg = msg.to_vec();
-		Box::pin(async move {
-			let steps = self.steps();
-			if !steps.iter().any(|candidate| candidate.index == step) {
-				return Err(invalid_step_error("step is not part of this handshake flow"));
-			}
-
-			// The client builds the opening message only when a step before the
-			// target needs it, so an injection at step 0 leaves the client
-			// untouched.
-			let mut pending = None;
-			for candidate in steps.iter().take_while(|candidate| candidate.index != step) {
-				let payload = match pending {
-					Some(payload) => payload,
-					None => self.open().await?,
-				};
-
-				pending = self.advance(candidate.index, &payload).await?;
-			}
-
-			match self.advance(step, &msg).await {
-				Ok(_) => Ok(InjectionOutcome::Accepted),
-				Err(e) => Ok(InjectionOutcome::Rejected(e)),
-			}
-		})
-	}
 }
-
-/// The total number of handshake backends the security harness exercises.
-pub const BACKEND_COUNT: usize = 1 + cfg!(feature = "transport-cms") as usize;
-/// The value of [`BACKEND_COUNT`] as a `u32`, for the spec macros.
-pub const BACKEND_COUNT_U32: u32 = BACKEND_COUNT as u32;
 
 /// The handshake backends the harness can run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -344,6 +300,52 @@ impl HandshakeBackendKind {
 		}
 	}
 
+	/// The ordered steps of this backend's flow.
+	fn steps(self) -> &'static [FlowStep] {
+		match self {
+			Self::Hpke => HPKE_FLOW,
+			#[cfg(feature = "transport-cms")]
+			Self::Cms => CMS_FLOW,
+		}
+	}
+
+	/// The step of this backend's flow at `index`.
+	fn step(self, index: usize) -> Result<&'static FlowStep, TightBeamError> {
+		let step = self.steps().iter().find(|step| step.index == index);
+		step.ok_or_else(|| invalid_step_error("step is not part of this handshake flow"))
+	}
+
+	/// The handshake protocol that a transport of this backend runs.
+	pub fn protocol(self) -> HandshakeProtocolKind {
+		match self {
+			Self::Hpke => HandshakeProtocolKind::Hpke,
+			#[cfg(feature = "transport-cms")]
+			Self::Cms => HandshakeProtocolKind::Cms,
+		}
+	}
+
+	/// The encryption configuration of a server of this backend over
+	/// `materials`, under the default transport limits.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError`] -- the CMS pair refuses its key-agreement identity.
+	pub fn server_config(
+		self,
+		materials: &ServerMaterials,
+	) -> Result<TransportEncryptionConfig<DefaultCryptoProvider>, TightBeamError> {
+		let config = match self {
+			Self::Hpke => TransportEncryptionConfig::new(materials.identity()),
+			#[cfg(feature = "transport-cms")]
+			Self::Cms => {
+				let config = TransportEncryptionConfig::new(materials.cms.signing_identity());
+				config.with_key_agreement(materials.cms.key_agreement_identity())?
+			}
+		};
+
+		Ok(config)
+	}
+
 	/// Bind a listener on a free local port that serves this backend under
 	/// the default transport limits, beside its address.
 	///
@@ -354,28 +356,72 @@ impl HandshakeBackendKind {
 		self,
 		materials: &ServerMaterials,
 	) -> Result<(TokioListener, SocketAddr), TightBeamError> {
-		let config: TransportEncryptionConfig<DefaultCryptoProvider> = match self {
-			Self::Hpke => TransportEncryptionConfig::new(materials.identity()),
+		let config = self.server_config(materials)?;
+		bind_on_loopback(config).await
+	}
+
+	/// A client builder of this backend that trusts the server of
+	/// `materials` alone.
+	///
+	/// - An HPKE client pins the server certificate, and presents `identity` when it holds one.
+	/// - A CMS client seals its opening to the key-agreement certificate of
+	///   the server and signs its Finished, so it presents `identity`, or a
+	///   fresh identity in its place.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError`] -- the trust store refuses the server certificate.
+	pub fn client_builder(
+		self,
+		materials: &ServerMaterials,
+		identity: Option<SigningIdentity>,
+	) -> Result<ClientBuilder<TokioListener>, TightBeamError> {
+		let builder = ClientBuilder::<TokioListener>::builder().with_handshake_protocol(self.protocol());
+		let (builder, identity) = match self {
+			Self::Hpke => {
+				let store = pinning_trust_store(&materials.certificate)?;
+				(builder.with_trust_store(store), identity)
+			}
 			#[cfg(feature = "transport-cms")]
 			Self::Cms => {
-				let config = TransportEncryptionConfig::new(materials.cms.signing_identity());
-				config.with_key_agreement(materials.cms.key_agreement_identity())?
+				let identity = identity.unwrap_or_else(|| ClientMaterials::generate().identity());
+				(builder.with_cms_server(materials.cms.trust()), Some(identity))
 			}
 		};
 
-		let addr = "127.0.0.1:0".parse::<TightBeamSocketAddr>()?;
-		let (listener, bound) = TokioListener::bind_with(addr, config).await?;
-		Ok((listener, *bound))
+		let builder = match identity {
+			Some(identity) => builder.with_client_identity(identity),
+			None => builder,
+		};
+
+		Ok(builder)
 	}
 
-	/// Return every enabled backend.
-	pub fn all() -> Vec<Self> {
-		let mut kinds = vec![Self::Hpke];
-		#[cfg(feature = "transport-cms")]
-		{
-			kinds.push(Self::Cms);
-		}
-		kinds
+	/// The frame that carries the message at step `index` of this backend's
+	/// flow.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError`] -- the flow holds no step at `index`.
+	pub fn slot_of(self, index: usize) -> Result<FrameSlot, TightBeamError> {
+		let step = self.step(index)?;
+		let earlier = self.steps().iter().take_while(|earlier| earlier.index <= index);
+		let ordinal = earlier.filter(|earlier| earlier.direction == step.direction).count();
+		Ok(FrameSlot { direction: step.direction, ordinal })
+	}
+
+	/// The attack step that hands its endpoint `payload`, the DER of a
+	/// message captured at step `index`, in place of the message at that
+	/// step.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError`] -- the flow holds no step at `index`, or `payload`
+	///   is no message in the container of that step.
+	pub fn replacement(self, index: usize, payload: impl AsRef<[u8]>) -> Result<AttackStep, TightBeamError> {
+		let slot = self.slot_of(index)?;
+		let message = self.step(index)?.container.message(payload.as_ref())?;
+		Ok(AttackStep::replace(slot, message))
 	}
 
 	/// Flip one byte of the signed content in this backend's server message.
@@ -427,14 +473,28 @@ fn flip_first_byte(bytes: &[u8]) -> Result<Vec<u8>, TightBeamError> {
 	Ok(flipped)
 }
 
+/// Bind a listener under `config` on a free loopback port, beside its
+/// address.
+///
+/// # Errors
+///
+/// - [`TightBeamError`] -- the socket fails to bind.
+pub async fn bind_on_loopback(
+	config: TransportEncryptionConfig<DefaultCryptoProvider>,
+) -> Result<(TokioListener, SocketAddr), TightBeamError> {
+	let addr = "127.0.0.1:0".parse::<TightBeamSocketAddr>()?;
+	let (listener, bound) = TokioListener::bind_with(addr, config).await?;
+	Ok((listener, *bound))
+}
+
 use tightbeam::trace::TraceCollector;
 use tightbeam::urn::Urn;
 
 /// A harness that spawns handshake sessions across every enabled backend.
 ///
 /// The harness can hold a [`TraceCollector`]. When it does, each spawn records
-/// the internal (hidden) events of the path it takes, so a process spec can
-/// validate internal state.
+/// the observable events of the path it takes, so a process spec orders the
+/// steps of the harness beside the events of the attack.
 #[derive(Clone)]
 pub struct SecurityThreatHarness {
 	materials: ServerMaterials,
@@ -448,20 +508,22 @@ impl Default for SecurityThreatHarness {
 }
 
 impl SecurityThreatHarness {
-	/// Hidden CSP event: the harness is about to build a handshake session.
+	/// Observable CSP event: the harness is about to build a handshake session.
 	pub const HARNESS_SPAWN_SESSION: Urn<'static> = tightbeam::urn!("test", "event:security-harness/spawn-session");
-	/// Hidden CSP event: the harness selects the HPKE backend for the session.
+	/// Observable CSP event: the harness selects the HPKE backend for the
+	/// session.
 	pub const HARNESS_SPAWN_HPKE: Urn<'static> = tightbeam::urn!("test", "event:security-harness/spawn-hpke");
-	/// Hidden CSP event: the harness selects the CMS backend for the session.
+	/// Observable CSP event: the harness selects the CMS backend for the
+	/// session.
 	pub const HARNESS_SPAWN_CMS: Urn<'static> = tightbeam::urn!("test", "event:security-harness/spawn-cms");
-	/// Hidden CSP event: the harness enters the weak-cipher spawn path.
+	/// Observable CSP event: the harness enters the weak-cipher spawn path.
 	pub const HARNESS_SPAWN_WEAK: Urn<'static> = tightbeam::urn!("test", "event:security-harness/spawn-weak");
-	/// Hidden CSP event: the harness selects the weak HPKE backend.
+	/// Observable CSP event: the harness selects the weak HPKE backend.
 	pub const HARNESS_SPAWN_HPKE_WEAK: Urn<'static> = tightbeam::urn!("test", "event:security-harness/spawn-hpke-weak");
-	/// Hidden CSP event: the harness selects the weak CMS backend.
+	/// Observable CSP event: the harness selects the weak CMS backend.
 	pub const HARNESS_SPAWN_CMS_WEAK: Urn<'static> = tightbeam::urn!("test", "event:security-harness/spawn-cms-weak");
 
-	/// Create a harness that records its hidden events into `trace`.
+	/// Create a harness that records its spawn events into `trace`.
 	pub fn with_trace(trace: Arc<TraceCollector>) -> Self {
 		Self { materials: ServerMaterials::generate(), trace: Some(trace) }
 	}
@@ -471,7 +533,7 @@ impl SecurityThreatHarness {
 		&self.materials
 	}
 
-	/// Emit a hidden event when the harness holds a trace collector.
+	/// Emit a spawn event when the harness holds a trace collector.
 	fn emit(&self, event: Urn<'static>) -> Result<(), TightBeamError> {
 		if let Some(ref trace) = self.trace {
 			trace.event(event)?;
@@ -484,7 +546,7 @@ impl SecurityThreatHarness {
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError`] -- the trace collector refused a hidden event, as in
+	/// - [`TightBeamError`] -- the trace collector refuses a spawn event, as in
 	///   [`Self::spawn_with_profiles`].
 	pub fn spawn(&self, kind: HandshakeBackendKind) -> Result<Box<dyn HandshakeProtocol>, TightBeamError> {
 		let client_profiles = vec![default_security_profile()];
@@ -500,7 +562,7 @@ impl SecurityThreatHarness {
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError`] -- the trace collector refused a hidden event, as
+	/// - [`TightBeamError`] -- the trace collector refuses a spawn event, as
 	///   an injected fault of a `testing-fault` run does.
 	pub fn spawn_with_profiles(
 		&self,
@@ -512,25 +574,44 @@ impl SecurityThreatHarness {
 		let server_profiles: Vec<SecurityProfileDesc> = server_profiles.into_iter().collect();
 
 		self.emit(Self::HARNESS_SPAWN_SESSION)?;
+		self.emit(Self::spawn_event(kind))?;
 
 		match kind {
-			HandshakeBackendKind::Hpke => {
-				self.emit(Self::HARNESS_SPAWN_HPKE)?;
-				Ok(Box::new(Session::<Hpke, DefaultCryptoProvider>::with_profiles(
-					&self.materials,
-					client_profiles,
-					server_profiles,
-				)))
-			}
+			HandshakeBackendKind::Hpke => Ok(Box::new(Session::<Hpke, DefaultCryptoProvider>::with_profiles(
+				&self.materials,
+				client_profiles,
+				server_profiles,
+			))),
 			#[cfg(feature = "transport-cms")]
-			HandshakeBackendKind::Cms => {
-				self.emit(Self::HARNESS_SPAWN_CMS)?;
-				Ok(Box::new(Session::<Cms, DefaultCryptoProvider>::with_profiles(
-					&self.materials,
-					client_profiles,
-					server_profiles,
-				)))
-			}
+			HandshakeBackendKind::Cms => Ok(Box::new(Session::<Cms, DefaultCryptoProvider>::with_profiles(
+				&self.materials,
+				client_profiles,
+				server_profiles,
+			))),
+		}
+	}
+
+	/// Start a live handshake of `kind` over the server materials of this
+	/// harness, for the attack of a threat scenario. It records the spawn
+	/// events that [`Self::spawn`] records for `kind`.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError`] -- the trace collector refuses a spawn event, as
+	///   an injected fault of a `testing-fault` run does.
+	pub fn live(&self, kind: HandshakeBackendKind) -> Result<LiveHandshake, TightBeamError> {
+		self.emit(Self::HARNESS_SPAWN_SESSION)?;
+		self.emit(Self::spawn_event(kind))?;
+
+		Ok(LiveHandshake::new(kind, self.materials.to_owned()))
+	}
+
+	/// The spawn event that names the backend `kind` of a session.
+	fn spawn_event(kind: HandshakeBackendKind) -> Urn<'static> {
+		match kind {
+			HandshakeBackendKind::Hpke => Self::HARNESS_SPAWN_HPKE,
+			#[cfg(feature = "transport-cms")]
+			HandshakeBackendKind::Cms => Self::HARNESS_SPAWN_CMS,
 		}
 	}
 
@@ -545,7 +626,7 @@ impl SecurityThreatHarness {
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError`] -- the trace collector refused a hidden event, as
+	/// - [`TightBeamError`] -- the trace collector refuses a spawn event, as
 	///   an injected fault of a `testing-fault` run does.
 	pub fn spawn_weak(&self, kind: HandshakeBackendKind) -> Result<Box<dyn HandshakeProtocol>, TightBeamError> {
 		self.emit(Self::HARNESS_SPAWN_WEAK)?;
@@ -773,8 +854,6 @@ const CMS_FLOW: &[FlowStep] = &[
 pub trait SessionFlow<P: HandshakeProvider>: ClientFlow<P> + ServerFlow<P> {
 	/// The backend this flow belongs to.
 	const BACKEND: HandshakeBackendKind;
-	/// The ordered steps this flow exchanges.
-	const STEPS: &'static [FlowStep];
 
 	/// A client that admits the server of `materials`, sends `offer`, and
 	/// admits the selection under `policy`.
@@ -795,7 +874,6 @@ pub trait SessionFlow<P: HandshakeProvider>: ClientFlow<P> + ServerFlow<P> {
 
 impl<P: HandshakeProvider> SessionFlow<P> for Hpke {
 	const BACKEND: HandshakeBackendKind = HandshakeBackendKind::Hpke;
-	const STEPS: &'static [FlowStep] = HPKE_FLOW;
 
 	fn client(
 		materials: &ServerMaterials,
@@ -822,7 +900,6 @@ impl<P: HandshakeProvider> SessionFlow<P> for Hpke {
 #[cfg(feature = "transport-cms")]
 impl<P: HandshakeProvider<Kem = DhKemSecp256k1>> SessionFlow<P> for Cms {
 	const BACKEND: HandshakeBackendKind = HandshakeBackendKind::Cms;
-	const STEPS: &'static [FlowStep] = CMS_FLOW;
 
 	/// The client pins the server's key-agreement certificate and presents a
 	/// fresh identity.
@@ -882,7 +959,7 @@ impl<F: SessionFlow<P>, P: HandshakeProvider> HandshakeFlow for Session<F, P> {
 	}
 
 	fn steps(&self) -> &'static [FlowStep] {
-		F::STEPS
+		F::BACKEND.steps()
 	}
 
 	fn open(&mut self) -> FlowFuture<'_, Vec<u8>> {
@@ -899,8 +976,7 @@ impl<F: SessionFlow<P>, P: HandshakeProvider> HandshakeFlow for Session<F, P> {
 	) -> FlowFuture<'a, Option<Vec<u8>>> {
 		let msg = msg.as_ref();
 		Box::pin(async move {
-			let step = F::STEPS.iter().find(|step| step.index == index);
-			let step = step.ok_or_else(|| invalid_step_error("step is not part of this handshake flow"))?;
+			let step = F::BACKEND.step(index)?;
 
 			// The server answers the opening with its reply and ends the flow
 			// at the closing. The client answers the reply with its closing.

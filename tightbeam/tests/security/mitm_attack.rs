@@ -1,8 +1,8 @@
 //! # Man-in-the-middle tampering threat
 //!
 //! ## Weakness
-//! Handshake messages that are not integrity-bound to a verified transcript can
-//! be modified in transit without detection.
+//! A MITM can modify, without detection, a handshake message in transit that
+//! is not integrity-bound to a verified transcript.
 //!
 //! ## Attack
 //! 1. The client and the server begin a handshake on every enabled backend (HPKE, CMS).
@@ -23,23 +23,20 @@
 use std::sync::Arc;
 
 use tightbeam::{
-	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
+	exactly,
+	instrumentation::events,
+	job, tb_assert_spec, tb_process_spec, tb_scenario,
 	testing::{ScenarioConfig, SetupEnv},
 	trace::TraceCollector,
-	transport::handshake::HandshakeError::SignatureVerificationFailed,
 	urn::Urn,
 	TightBeamError,
 };
 
-use crate::security::common::{
-	expectation_failure, Direction, HandshakeBackendKind, InjectionOutcome, SecurityThreatHarness, BACKEND_COUNT_U32,
-};
+use crate::security::common::{expectation_failure, HandshakeBackendKind, SecurityThreatHarness};
 
 pub(crate) const MITM_CAPTURE_HANDSHAKE: Urn<'static> =
 	tightbeam::urn!("test", "event:mitm-attack/mitm-capture-handshake");
 pub(crate) const MITM_INJECT_TAMPERED: Urn<'static> = tightbeam::urn!("test", "event:mitm-attack/mitm-inject-tampered");
-pub(crate) const MITM_TAMPERING_DETECTED: Urn<'static> =
-	tightbeam::urn!("test", "event:mitm-attack/mitm-tampering-detected");
 pub(crate) const MITM_TAMPER_MESSAGE: Urn<'static> = tightbeam::urn!("test", "event:mitm-attack/mitm-tamper-message");
 
 tb_assert_spec! {
@@ -47,10 +44,10 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(MITM_CAPTURE_HANDSHAKE, exactly!(BACKEND_COUNT_U32)),
-			(MITM_TAMPER_MESSAGE, exactly!(BACKEND_COUNT_U32)),
-			(MITM_INJECT_TAMPERED, exactly!(BACKEND_COUNT_U32)),
-			(MITM_TAMPERING_DETECTED, exactly!(BACKEND_COUNT_U32), equals!(true))
+			(MITM_CAPTURE_HANDSHAKE, exactly!(1)),
+			(MITM_TAMPER_MESSAGE, exactly!(1)),
+			(MITM_INJECT_TAMPERED, exactly!(1)),
+			(events::SESSION_CERT_REJECTED, exactly!(1), equals!("signature"))
 		]
 	}
 }
@@ -63,7 +60,7 @@ tb_process_spec! {
 			MITM_CAPTURE_HANDSHAKE,
 			MITM_TAMPER_MESSAGE,
 			MITM_INJECT_TAMPERED,
-			MITM_TAMPERING_DETECTED,
+			events::SESSION_CERT_REJECTED,
 			SecurityThreatHarness::HARNESS_SPAWN_SESSION,
 			SecurityThreatHarness::HARNESS_SPAWN_HPKE,
 			SecurityThreatHarness::HARNESS_SPAWN_CMS
@@ -84,72 +81,73 @@ tb_process_spec! {
 			SecurityThreatHarness::HARNESS_SPAWN_CMS => AttackReady
 		},
 		AttackReady => { MITM_INJECT_TAMPERED => Injected },
-		Injected => { MITM_TAMPERING_DETECTED => Idle }
+		Injected => { events::SESSION_CERT_REJECTED => Idle }
 	}
 	terminal { Idle }
 	annotations { description: "MITM attack: message tampering detection via transcript signatures" }
 }
 
 tb_scenario! {
-	name: mitm_attack,
+	name: mitm_attack_hpke,
 	config: ScenarioConfig::builder()
 		.with_spec(MitmAttackSpec::latest())
 		.with_csp(MitmAttackProcess)
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
-			MitmAttackScenario::run((trace.into(),)).await
+			MitmAttackScenario::run((trace.into(), HandshakeBackendKind::Hpke)).await
+		}
+	}
+}
+
+#[cfg(feature = "transport-cms")]
+tb_scenario! {
+	name: mitm_attack_cms,
+	config: ScenarioConfig::builder()
+		.with_spec(MitmAttackSpec::latest())
+		.with_csp(MitmAttackProcess)
+		.build(),
+	environment Bare {
+		exec: |SetupEnv { trace, .. }| async move {
+			MitmAttackScenario::run((trace.into(), HandshakeBackendKind::Cms)).await
 		}
 	}
 }
 
 job! {
 	name: MitmAttackScenario,
-	async fn run((trace,): (Arc<TraceCollector>,)) -> Result<(), TightBeamError> {
+	async fn run((trace, kind): (Arc<TraceCollector>, HandshakeBackendKind)) -> Result<(), TightBeamError> {
 		let harness = SecurityThreatHarness::with_trace(Arc::clone(&trace));
-		for kind in HandshakeBackendKind::all() {
-			// Step 1: Capture a complete handshake.
-			let mut session = harness.spawn(kind)?;
-			let captured = session.capture_full().await?;
 
-			trace.event(MITM_CAPTURE_HANDSHAKE)?;
+		// Step 1: Capture a complete handshake.
+		let mut session = harness.spawn(kind)?;
+		let captured = session.capture_full().await?;
 
-			// Step 2: Find a server-to-client message to tamper: the reply
-			// (step 1) for HPKE, and the ServerFinished (step 2) for CMS.
-			let target = captured
-				.messages
-				.iter()
-				.find(|m| m.direction == Direction::ServerToClient)
-				.ok_or_else(|| expectation_failure("no server-to-client messages captured"))?;
+		trace.event(MITM_CAPTURE_HANDSHAKE)?;
 
-			// The tamper models a MITM that modifies the message in transit.
-			let tampered_payload = kind.tamper_server_message(&target.payload)?;
+		// Step 2: Find a server-to-client message to tamper: the reply
+		// (step 1) for HPKE, and the ServerFinished (step 2) for CMS.
+		let target = captured.server_reply();
+		let target = target.ok_or_else(|| expectation_failure("no server-to-client messages captured"))?;
 
-			// Verify that the tamper changed the payload.
-			if tampered_payload == target.payload {
-				return Err(expectation_failure("tampering did not modify payload"));
-			}
+		// The tamper models a MITM that modifies the message in transit.
+		let tampered_payload = kind.tamper_server_message(&target.payload)?;
 
-			trace.event(MITM_TAMPER_MESSAGE)?;
+		// Only a changed payload puts the control under test.
+		assert_ne!(tampered_payload, target.payload, "the tamper must change the payload");
 
-			// Step 3: Inject the tampered message into a fresh session.
-			let mut attack_session = harness.spawn(kind)?;
-			trace.event(MITM_INJECT_TAMPERED)?;
+		trace.event(MITM_TAMPER_MESSAGE)?;
 
-			match attack_session.inject_at_step(target.step, &tampered_payload).await? {
-				InjectionOutcome::Rejected(error) => {
-					// The tampered message differs from the one the sender
-					// signed, so its signature fails.
-					let detected = matches!(error, TightBeamError::HandshakeError(SignatureVerificationFailed));
-					trace.event_with(MITM_TAMPERING_DETECTED, &[], detected)?;
-				}
-				InjectionOutcome::Accepted => {
-					// Acceptance means the control missed the tamper.
-					return Err(expectation_failure("tampered message was accepted"));
-				}
-			}
-		}
+		// Step 3: Inject the tampered message into a live handshake, whose
+		// client files its verdict in the scenario trace.
+		let injection = kind.replacement(target.step, &tampered_payload)?;
+		let attack = harness.live(kind)?.audit_client(&trace).with_step(injection);
 
-		Ok(())
+		trace.event(MITM_INJECT_TAMPERED)?;
+
+		// The tampered message differs from the one the sender signed, so its
+		// signature fails, and acceptance means the control missed the tamper.
+		let outcome = attack.run().await?;
+		outcome.refused_by_client("tampered message was accepted")
 	}
 }

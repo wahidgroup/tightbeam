@@ -28,36 +28,30 @@
 use std::sync::Arc;
 
 use tightbeam::{
-	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
+	exactly,
+	instrumentation::events,
+	job, tb_assert_spec, tb_process_spec, tb_scenario,
 	testing::{ScenarioConfig, SetupEnv},
 	trace::TraceCollector,
-	transport::handshake::HandshakeError::SignatureVerificationFailed,
 	urn::Urn,
 	TightBeamError,
 };
 
-use crate::security::common::{
-	expectation_failure, HandshakeBackendKind, InjectionOutcome, SecurityThreatHarness, BACKEND_COUNT_U32,
-};
+use crate::security::common::{expectation_failure, HandshakeBackendKind, SecurityThreatHarness};
 
 pub(crate) const DOWNGRADE_CAPTURE_STRONG: Urn<'static> =
 	tightbeam::urn!("test", "event:downgrade-attack/downgrade-capture-strong");
 pub(crate) const DOWNGRADE_CAPTURE_WEAK: Urn<'static> =
 	tightbeam::urn!("test", "event:downgrade-attack/downgrade-capture-weak");
-pub(crate) const DOWNGRADE_PROFILES_DIFFER: Urn<'static> =
-	tightbeam::urn!("test", "event:downgrade-attack/downgrade-profiles-differ");
-pub(crate) const DOWNGRADE_SUBSTITUTION_REJECTED: Urn<'static> =
-	tightbeam::urn!("test", "event:downgrade-attack/downgrade-substitution-rejected");
 
 tb_assert_spec! {
 	pub DowngradeAttackSpec,
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(DOWNGRADE_CAPTURE_STRONG, exactly!(BACKEND_COUNT_U32)),
-			(DOWNGRADE_CAPTURE_WEAK, exactly!(BACKEND_COUNT_U32)),
-			(DOWNGRADE_PROFILES_DIFFER, exactly!(BACKEND_COUNT_U32)),
-			(DOWNGRADE_SUBSTITUTION_REJECTED, exactly!(BACKEND_COUNT_U32), equals!(true))
+			(DOWNGRADE_CAPTURE_STRONG, exactly!(1)),
+			(DOWNGRADE_CAPTURE_WEAK, exactly!(1)),
+			(events::SESSION_CERT_REJECTED, exactly!(1), equals!("signature"))
 		]
 	}
 }
@@ -69,8 +63,7 @@ tb_process_spec! {
 
 			DOWNGRADE_CAPTURE_STRONG,
 			DOWNGRADE_CAPTURE_WEAK,
-			DOWNGRADE_PROFILES_DIFFER,
-			DOWNGRADE_SUBSTITUTION_REJECTED,
+			events::SESSION_CERT_REJECTED,
 			SecurityThreatHarness::HARNESS_SPAWN_SESSION,
 			SecurityThreatHarness::HARNESS_SPAWN_HPKE,
 			SecurityThreatHarness::HARNESS_SPAWN_CMS,
@@ -96,90 +89,89 @@ tb_process_spec! {
 			SecurityThreatHarness::HARNESS_SPAWN_CMS_WEAK => WeakReady
 		},
 		WeakReady => { DOWNGRADE_CAPTURE_WEAK => WeakCaptured },
-		WeakCaptured => { DOWNGRADE_PROFILES_DIFFER => ProfilesDiffer },
-		ProfilesDiffer => { SecurityThreatHarness::HARNESS_SPAWN_SESSION => SpawningAttack },
+		WeakCaptured => { SecurityThreatHarness::HARNESS_SPAWN_SESSION => SpawningAttack },
 		SpawningAttack => {
 			SecurityThreatHarness::HARNESS_SPAWN_HPKE => AttackReady,
 			SecurityThreatHarness::HARNESS_SPAWN_CMS => AttackReady
 		},
-		AttackReady => { DOWNGRADE_SUBSTITUTION_REJECTED => Idle }
+		AttackReady => { events::SESSION_CERT_REJECTED => Idle }
 	}
 	terminal { Idle }
 	annotations { description: "Downgrade attack: AES-256 vs AES-128 cross-session substitution" }
 }
 
 tb_scenario! {
-	name: downgrade_attack,
+	name: downgrade_attack_hpke,
 	config: ScenarioConfig::builder()
 		.with_spec(DowngradeAttackSpec::latest())
 		.with_csp(DowngradeAttackProcess)
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
-			DowngradeAttackScenario::run((trace.into(),)).await
+			DowngradeAttackScenario::run((trace.into(), HandshakeBackendKind::Hpke)).await
+		}
+	}
+}
+
+#[cfg(feature = "transport-cms")]
+tb_scenario! {
+	name: downgrade_attack_cms,
+	config: ScenarioConfig::builder()
+		.with_spec(DowngradeAttackSpec::latest())
+		.with_csp(DowngradeAttackProcess)
+		.build(),
+	environment Bare {
+		exec: |SetupEnv { trace, .. }| async move {
+			DowngradeAttackScenario::run((trace.into(), HandshakeBackendKind::Cms)).await
 		}
 	}
 }
 
 job! {
 	name: DowngradeAttackScenario,
-	async fn run((trace,): (Arc<TraceCollector>,)) -> Result<(), TightBeamError> {
+	async fn run((trace, kind): (Arc<TraceCollector>, HandshakeBackendKind)) -> Result<(), TightBeamError> {
 		let harness = SecurityThreatHarness::with_trace(Arc::clone(&trace));
-		for kind in HandshakeBackendKind::all() {
-			// Step 1: Capture the strong handshake (AES-256-GCM) under
-			// DefaultCryptoProvider.
-			let mut strong_session = harness.spawn(kind)?;
-			let strong_handshake = strong_session.capture_full().await?;
 
-			trace.event(DOWNGRADE_CAPTURE_STRONG)?;
+		// Step 1: Capture the strong handshake (AES-256-GCM) under
+		// DefaultCryptoProvider.
+		let mut strong_session = harness.spawn(kind)?;
+		let strong_handshake = strong_session.capture_full().await?;
 
-			// Step 2: Capture the weak handshake (AES-128-GCM) under
-			// Aes128CryptoProvider, which runs AES-128 at the cipher level.
-			let mut weak_session = harness.spawn_weak(kind)?;
-			let weak_handshake = weak_session.capture_full().await?;
+		trace.event(DOWNGRADE_CAPTURE_STRONG)?;
 
-			trace.event(DOWNGRADE_CAPTURE_WEAK)?;
+		// Step 2: Capture the weak handshake (AES-128-GCM) under
+		// Aes128CryptoProvider, which runs AES-128 at the cipher level.
+		let mut weak_session = harness.spawn_weak(kind)?;
+		let weak_handshake = weak_session.capture_full().await?;
 
-			// Step 3: Verify that the two openings differ in their wire bytes.
-			// Their cipher OIDs differ, so their `SecurityOffer` values differ.
-			let strong_hello = strong_handshake
-				.client_messages()
-				.next()
-				.ok_or_else(|| expectation_failure("no strong client messages"))?;
+		trace.event(DOWNGRADE_CAPTURE_WEAK)?;
 
-			let weak_hello = weak_handshake
-				.client_messages()
-				.next()
-				.ok_or_else(|| expectation_failure("no weak client messages"))?;
+		// Step 3: Verify that the two openings differ in their wire bytes.
+		// Their cipher OIDs differ, so their `SecurityOffer` values differ.
+		let strong_hello = strong_handshake
+			.client_messages()
+			.next()
+			.ok_or_else(|| expectation_failure("no strong client messages"))?;
 
-			if strong_hello.payload == weak_hello.payload {
-				return Err(expectation_failure("AES-256 and AES-128 messages are identical"));
-			}
+		let weak_hello = weak_handshake
+			.client_messages()
+			.next()
+			.ok_or_else(|| expectation_failure("no weak client messages"))?;
 
-			trace.event(DOWNGRADE_PROFILES_DIFFER)?;
+		assert_ne!(strong_hello.payload, weak_hello.payload, "the AES-256 and AES-128 openings must differ");
 
-			// Step 4: Attempt the downgrade substitution, and hand the reply to
-			// the weak opening to a strong client.
-			let weak_reply = weak_handshake.server_reply();
-			let weak_reply = weak_reply.ok_or_else(|| expectation_failure("no weak reply"))?;
+		// Step 4: Attempt the downgrade substitution, and hand the reply to
+		// the weak opening to a live strong client, whose verdict the
+		// scenario trace files.
+		let weak_reply = weak_handshake.server_reply();
+		let weak_reply = weak_reply.ok_or_else(|| expectation_failure("no weak reply"))?;
 
-			let mut attack_session = harness.spawn(kind)?;
-			match attack_session.inject_at_step(weak_reply.step, &weak_reply.payload).await? {
-				InjectionOutcome::Rejected(error) => {
-					// The reply signs a transcript of the weak opening, and the
-					// strong client binds its own, so the signature fails
-					// before the client reads the weak selection.
-					let bound = matches!(error, TightBeamError::HandshakeError(SignatureVerificationFailed));
-					trace.event_with(DOWNGRADE_SUBSTITUTION_REJECTED, &[], bound)?;
-				}
-				InjectionOutcome::Accepted => {
-					// A strong client that accepts the reply to a weak opening
-					// is a downgrade. The control MUST reject it.
-					return Err(expectation_failure("downgrade substitution was accepted"));
-				}
-			}
-		}
+		let substitution = kind.replacement(weak_reply.step, &weak_reply.payload)?;
+		let attack = harness.live(kind)?.audit_client(&trace).with_step(substitution);
 
-		Ok(())
+		// A strong client that accepts the reply to a weak opening is a
+		// downgrade, so the expected control of the module doc MUST reject it.
+		let outcome = attack.run().await?;
+		outcome.refused_by_client("downgrade substitution was accepted")
 	}
 }

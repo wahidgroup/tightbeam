@@ -22,37 +22,32 @@
 use std::sync::Arc;
 
 use tightbeam::{
-	crypto::cms::EnvelopeError::AuthenticatedAttribute,
-	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
+	exactly,
+	instrumentation::events,
+	job, tb_assert_spec, tb_process_spec, tb_scenario,
 	testing::{ScenarioConfig, SetupEnv},
 	trace::TraceCollector,
-	transport::handshake::HandshakeError::SealedClosing,
 	urn::Urn,
 	TightBeamError,
 };
 
-use crate::security::common::{
-	expectation_failure, HandshakeBackendKind, InjectionOutcome, SecurityThreatHarness, BACKEND_COUNT_U32,
-};
+use crate::security::common::{expectation_failure, HandshakeBackendKind, SecurityThreatHarness};
 
 #[cfg(feature = "testing-fault")]
 use tightbeam::testing::{error::TestingError, FaultModel};
 
 pub(crate) const REPLAY_ATTEMPT: Urn<'static> = tightbeam::urn!("test", "event:replay-attack/replay-attempt");
-pub(crate) const REPLAY_DETECTED: Urn<'static> = tightbeam::urn!("test", "event:replay-attack/replay-detected");
 pub(crate) const REPLAY_INIT_HANDSHAKE: Urn<'static> =
 	tightbeam::urn!("test", "event:replay-attack/replay-initial-handshake");
-pub(crate) const REPLAY_REJECTED: Urn<'static> = tightbeam::urn!("test", "event:replay-attack/replay-rejected");
 
 tb_assert_spec! {
 	pub ReplayAttackSpec,
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(REPLAY_INIT_HANDSHAKE, exactly!(BACKEND_COUNT_U32)),
-			(REPLAY_ATTEMPT, exactly!(BACKEND_COUNT_U32)),
-			(REPLAY_DETECTED, exactly!(BACKEND_COUNT_U32), equals!(true)),
-			(REPLAY_REJECTED, exactly!(BACKEND_COUNT_U32))
+			(REPLAY_INIT_HANDSHAKE, exactly!(1)),
+			(REPLAY_ATTEMPT, exactly!(1)),
+			(events::SESSION_CERT_REJECTED, exactly!(1), equals!("sealed-closing/authenticated-attribute"))
 		]
 	}
 }
@@ -64,8 +59,7 @@ tb_process_spec! {
 
 			REPLAY_INIT_HANDSHAKE,
 			REPLAY_ATTEMPT,
-			REPLAY_DETECTED,
-			REPLAY_REJECTED,
+			events::SESSION_CERT_REJECTED,
 			SecurityThreatHarness::HARNESS_SPAWN_SESSION,
 			SecurityThreatHarness::HARNESS_SPAWN_HPKE,
 			SecurityThreatHarness::HARNESS_SPAWN_CMS
@@ -85,63 +79,66 @@ tb_process_spec! {
 			SecurityThreatHarness::HARNESS_SPAWN_CMS => AttackSessionReady
 		},
 		AttackSessionReady => { REPLAY_ATTEMPT => AttackObserved },
-		AttackObserved => { REPLAY_DETECTED => ReplaySuppressed },
-		ReplaySuppressed => { REPLAY_REJECTED => Idle }
+		AttackObserved => { events::SESSION_CERT_REJECTED => Idle }
 	}
 	terminal { Idle }
 	annotations { description: "Replay attack detection state machine" }
 }
 
 tb_scenario! {
-	name: replay_attack,
+	name: replay_attack_hpke,
 	config: ScenarioConfig::builder()
 		.with_spec(ReplayAttackSpec::latest())
 		.with_csp(ReplayAttackProcess)
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
-			ReplayAttackScenario::run((trace.into(),)).await
+			ReplayAttackScenario::run((trace.into(), HandshakeBackendKind::Hpke)).await
+		}
+	}
+}
+
+#[cfg(feature = "transport-cms")]
+tb_scenario! {
+	name: replay_attack_cms,
+	config: ScenarioConfig::builder()
+		.with_spec(ReplayAttackSpec::latest())
+		.with_csp(ReplayAttackProcess)
+		.build(),
+	environment Bare {
+		exec: |SetupEnv { trace, .. }| async move {
+			ReplayAttackScenario::run((trace.into(), HandshakeBackendKind::Cms)).await
 		}
 	}
 }
 
 job! {
 	name: ReplayAttackScenario,
-	async fn run((trace,): (Arc<TraceCollector>,)) -> Result<(), TightBeamError> {
+	async fn run((trace, kind): (Arc<TraceCollector>, HandshakeBackendKind)) -> Result<(), TightBeamError> {
 		let harness = SecurityThreatHarness::with_trace(Arc::clone(&trace));
-		for kind in HandshakeBackendKind::all() {
-			// Capture a complete handshake.
-			let mut session = harness.spawn(kind)?;
-			let captured = session.capture_full().await?;
 
-			trace.event(REPLAY_INIT_HANDSHAKE)?;
+		// Capture a complete handshake.
+		let mut session = harness.spawn(kind)?;
+		let captured = session.capture_full().await?;
 
-			// The final client message is the replay target on every backend.
-			let target = captured
-				.final_client_message()
-				.ok_or_else(|| expectation_failure("no client messages captured"))?;
+		trace.event(REPLAY_INIT_HANDSHAKE)?;
 
-			// Attempt the replay on a fresh session.
-			let mut attack_session = harness.spawn(captured.kind)?;
+		// The final client message is the replay target on every backend.
+		let target = captured
+			.final_client_message()
+			.ok_or_else(|| expectation_failure("no client messages captured"))?;
 
-			trace.event(REPLAY_ATTEMPT)?;
+		// Attempt the replay on a live handshake, whose server files its
+		// verdict in the scenario trace.
+		let injection = captured.kind.replacement(target.step, &target.payload)?;
+		let attack = harness.live(captured.kind)?.audit_server(&trace).with_step(injection);
 
-			match attack_session.inject_at_step(target.step, &target.payload).await? {
-				InjectionOutcome::Rejected(error) => {
-					// The closing authenticates the transcript of the session
-					// it was sealed in, so the fresh session refuses it by
-					// that binding.
-					let bound = matches!(error, TightBeamError::HandshakeError(SealedClosing(AuthenticatedAttribute)));
-					trace.event_with(REPLAY_DETECTED, &[], bound)?;
-					trace.event(REPLAY_REJECTED)?;
-				}
-				InjectionOutcome::Accepted => {
-					return Err(expectation_failure("replay was accepted"));
-				}
-			}
-		}
+		trace.event(REPLAY_ATTEMPT)?;
 
-		Ok(())
+		// The closing authenticates the transcript of the session that
+		// sealed it, so the fresh session refuses it by that binding.
+		let outcome = attack.run().await?;
+		outcome.refused_by_server("replay was accepted")
 	}
 }
 
@@ -155,7 +152,7 @@ async fn a_fault_at_the_session_spawn_fails_the_scenario() -> Result<(), Box<dyn
 	let model = FaultModel::default().with_event_fault(spawn, fault, tightbeam::bps!(10000));
 	let trace = Arc::new(TraceCollector::new().with_fault_model(model));
 
-	let outcome = ReplayAttackScenario::run((trace,)).await;
+	let outcome = ReplayAttackScenario::run((trace, HandshakeBackendKind::Hpke)).await;
 	let injected = matches!(outcome, Err(TightBeamError::TestingError(TestingError::InvariantViolated)));
 	assert!(injected);
 	Ok(())

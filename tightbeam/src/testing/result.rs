@@ -7,7 +7,8 @@
 
 use core::fmt::{Display, Formatter};
 
-use crate::testing::config::Expect;
+use crate::error::TightBeamError;
+use crate::testing::config::{Expect, ScenarioConfig};
 use crate::testing::fdr::{Decision, FdrVerdict};
 use crate::testing::macros::BuiltAssertSpec;
 use crate::testing::specs::{CspValidationResult, Layer, SpecViolation, Violations};
@@ -15,8 +16,8 @@ use crate::trace::ConsumedTrace;
 
 /// What one verification layer reported about a run.
 ///
-/// A refutation meets an expected-violation expectation and an undecided
-/// check does not, so the two are separate variants.
+/// A refutation meets an expected-violation expectation, and an undecided
+/// check fails every expectation, so the two are separate variants.
 enum Reported {
 	/// The layer accepted the run, or the configuration skipped the layer.
 	Accepted,
@@ -223,18 +224,57 @@ impl Default for ScenarioVerdict {
 #[derive(Debug)]
 pub struct ScenarioResult {
 	trace: ConsumedTrace,
-	assert_spec: Option<BuiltAssertSpec>,
-	assert_specs: Vec<BuiltAssertSpec>,
+	assert_specs: Vec<&'static BuiltAssertSpec>,
 	verdict: ScenarioVerdict,
 	expect: Expect,
 }
 
 impl ScenarioResult {
+	/// Grades a finished run under `config`.
+	///
+	/// [`ScenarioConfig::verify`] grades `trace` and the body's own result.
+	/// The result holds the trace, the assertion specs of `config`, and the
+	/// expectation that [`ScenarioResult::outcome`] measures the verdict
+	/// against, so each getter answers from the one run it graded.
+	///
+	/// # Errors
+	///
+	/// - The error of the first exploration event that the exploration trace refused.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::specs::csp::{Event, Process, State};
+	/// use tightbeam::testing::{ScenarioConfig, ScenarioResult};
+	/// use tightbeam::trace::ConsumedTrace;
+	///
+	/// let process = Process::builder("Send")
+	///     .initial_state(State("S0"))
+	///     .add_observable(Event("send"))
+	///     .add_transition(State("S0"), Event("send"), State("S1"))
+	///     .add_terminal(State("S1"))
+	///     .build()?;
+	///
+	/// let config = ScenarioConfig::builder().with_csp(process).build()?;
+	/// let result = ScenarioResult::graded(&config, ConsumedTrace::new(), Ok(()))?;
+	/// assert!(result.verdict().csp().is_some());
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	pub fn graded(
+		config: &ScenarioConfig,
+		trace: impl Into<ConsumedTrace>,
+		execution: Result<(), TightBeamError>,
+	) -> Result<Self, TightBeamError> {
+		let trace = trace.into();
+		let verdict = config.verify(&trace, execution)?;
+		let assert_specs = config.specs().to_vec();
+		Ok(Self { trace, assert_specs, verdict, expect: config.expect() })
+	}
+
 	/// Builds a scenario result from the Layer 1 result alone.
 	pub fn from_spec_result(result: Result<(), SpecViolation>) -> Self {
 		Self {
 			trace: ConsumedTrace::new(),
-			assert_spec: None,
 			assert_specs: Vec::new(),
 			verdict: ScenarioVerdict::from_layers(result, None, None),
 			expect: Expect::Pass,
@@ -246,13 +286,13 @@ impl ScenarioResult {
 		&self.trace
 	}
 
-	/// The single assertion spec of the result, when it holds one.
-	pub fn assert_spec(&self) -> Option<&BuiltAssertSpec> {
-		self.assert_spec.as_ref()
+	/// The first assertion spec of the configuration, when it names one.
+	pub fn assert_spec(&self) -> Option<&'static BuiltAssertSpec> {
+		self.assert_specs.first().copied()
 	}
 
-	/// Every assertion spec that the result holds.
-	pub fn assert_specs(&self) -> &[BuiltAssertSpec] {
+	/// Every assertion spec of the configuration, in the order it names them.
+	pub fn assert_specs(&self) -> &[&'static BuiltAssertSpec] {
 		&self.assert_specs
 	}
 
@@ -279,7 +319,6 @@ impl Default for ScenarioResult {
 	fn default() -> Self {
 		Self {
 			trace: ConsumedTrace::new(),
-			assert_spec: None,
 			assert_specs: Vec::new(),
 			verdict: ScenarioVerdict::default(),
 			expect: Expect::Pass,
@@ -292,6 +331,110 @@ impl Display for ScenarioResult {
 		match self.outcome() {
 			Ok(()) => write!(f, "Verification passed"),
 			Err(violations) => write!(f, "Verification failed: {violations}"),
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use core::error::Error;
+
+	use super::ScenarioVerdict;
+	use crate::testing::config::Expect;
+	use crate::testing::specs::{Layer, SpecViolation};
+
+	/// The rejections, in layer order, that [`ScenarioVerdict::outcome`] finds
+	/// in `verdict` under `expect`.
+	fn rejections(verdict: &ScenarioVerdict, expect: Expect) -> Vec<SpecViolation> {
+		let outcome = verdict.outcome(expect);
+		let found = outcome.err().map(|violations| violations.iter().cloned().collect());
+		found.unwrap_or_default()
+	}
+
+	#[test]
+	fn an_expected_assertion_rejection_passes() -> Result<(), Box<dyn Error>> {
+		let verdict = ScenarioVerdict::from_layers(Err(SpecViolation::ResponseValidationFailed), None, None);
+		let found = rejections(&verdict, Expect::Violation(Layer::Assertion));
+		assert!(found.is_empty(), "{found:?}");
+		Ok(())
+	}
+
+	#[test]
+	fn a_rejection_from_a_layer_the_scenario_did_not_name_fails() -> Result<(), Box<dyn Error>> {
+		let verdict = ScenarioVerdict::from_layers(Err(SpecViolation::ResponseValidationFailed), None, None);
+
+		let found = rejections(&verdict, Expect::Violation(Layer::Csp));
+		let unmet = SpecViolation::ExpectationUnmet(Layer::Csp);
+		assert_eq!(found, [SpecViolation::ResponseValidationFailed, unmet]);
+		Ok(())
+	}
+
+	/// A result that [`ScenarioResult::graded`] builds answers from the
+	/// configuration that graded it.
+	mod graded {
+		use core::error::Error;
+
+		use crate::testing::config::{Expect, ScenarioConfig};
+		use crate::testing::macros::BuiltAssertSpec;
+		use crate::testing::result::ScenarioResult;
+		use crate::testing::specs::Layer;
+		use crate::trace::ConsumedTrace;
+		use crate::urn::Urn;
+
+		const STEP: Urn<'static> = crate::urn!("test", "event:result/step");
+		const REPLY: Urn<'static> = crate::urn!("test", "event:result/reply");
+
+		crate::tb_assert_spec! {
+			pub StepSpec,
+			V(1,0,0): {
+				mode: Accept,
+				assertions: [ (STEP, crate::exactly!(1)) ]
+			},
+		}
+
+		crate::tb_assert_spec! {
+			pub ReplySpec,
+			V(1,0,0): {
+				mode: Accept,
+				assertions: [ (REPLY, crate::exactly!(1)) ]
+			},
+		}
+
+		/// The address of each spec, so two lists compare by identity.
+		fn addresses<'a>(specs: impl IntoIterator<Item = &'a &'static BuiltAssertSpec>) -> Vec<*const BuiltAssertSpec> {
+			specs.into_iter().map(|spec| core::ptr::from_ref(*spec)).collect()
+		}
+
+		#[test]
+		fn a_graded_result_names_the_first_spec_of_its_configuration() -> Result<(), Box<dyn Error>> {
+			let specs = [StepSpec::latest(), ReplySpec::latest()];
+			let config = ScenarioConfig::builder().with_specs(specs).build()?;
+
+			let result = ScenarioResult::graded(&config, ConsumedTrace::new(), Ok(()))?;
+			let first = result.assert_spec().map(core::ptr::from_ref);
+			assert_eq!(first, Some(core::ptr::from_ref(StepSpec::latest())));
+			Ok(())
+		}
+
+		#[test]
+		fn a_graded_result_holds_every_spec_of_its_configuration() -> Result<(), Box<dyn Error>> {
+			let specs = [StepSpec::latest(), ReplySpec::latest()];
+			let config = ScenarioConfig::builder().with_specs(specs).build()?;
+
+			let result = ScenarioResult::graded(&config, ConsumedTrace::new(), Ok(()))?;
+			assert_eq!(addresses(result.assert_specs()), addresses(&specs));
+			Ok(())
+		}
+
+		#[test]
+		fn a_graded_result_meets_the_expectation_of_its_configuration() -> Result<(), Box<dyn Error>> {
+			let expect = Expect::Violation(Layer::Assertion);
+			let builder = ScenarioConfig::builder().with_spec(StepSpec::latest());
+			let config = builder.with_expect(expect).build()?;
+
+			let result = ScenarioResult::graded(&config, ConsumedTrace::new(), Ok(()))?;
+			assert_eq!(result.outcome(), Ok(()), "the spec rejects the trace with no step");
+			Ok(())
 		}
 	}
 }

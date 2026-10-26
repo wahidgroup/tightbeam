@@ -73,7 +73,7 @@ pub(crate) trait GateInbound: GateAudit {
 	/// # Verdicts
 	///
 	/// - `frame` is [`None`] for a mux streaming or duplex open that has no
-	///   request frame at dispatch. Session-scoped gates still evaluate.
+	///   request frame at dispatch. Session-scoped gates judge it too.
 	/// - A gate that returns [`TransitStatus::Unknown`] signals a local bug, so
 	///   [`TransitStatus::normalized_verdict`] maps it to
 	///   [`TransitStatus::Internal`] and the peer sees a server fault.
@@ -82,7 +82,6 @@ pub(crate) trait GateInbound: GateAudit {
 	///
 	/// - The injected error, when the runtime fault model injects a fault at
 	///   the event of the evaluation or the verdict.
-	/// - [`TightBeamError::LockPoisoned`] -- the fault-state lock of the trace is poisoned.
 	fn gate_inbound<G>(
 		&self,
 		gate: &G,
@@ -106,9 +105,10 @@ pub(crate) trait GateInbound: GateAudit {
 
 			// As evidence, the status names why and the canonical form of the
 			// peer's key names who, so one peer leaves one audit identity in
-			// either SEC 1 form of its key.
+			// either SEC 1 form of its key. The status is also the value that a
+			// spec asserts.
 			let peer = session.peer_key().map(CanonicalKey::as_der);
-			trace.emit_event_with_evidence(event, status.as_str(), peer)?;
+			trace.emit_event_with_value_and_evidence(event, status.as_str(), status, peer)?;
 		}
 
 		Ok(status)
@@ -117,7 +117,71 @@ pub(crate) trait GateInbound: GateAudit {
 
 impl<A: GateAudit + ?Sized> GateInbound for A {}
 
-/// The handler span every [`GateAudit`] plane records.
+/// What one call that a plane admitted came to, as
+/// [`HandlerAudit::run_handler`] names it from the result of the handler and
+/// from the span around it.
+#[cfg(feature = "std")]
+#[derive(Debug)]
+pub(crate) enum HandlerOutcome<T> {
+	/// The handler ran and answered with its value.
+	Answered(T),
+	/// The handler ran and failed with its own error.
+	Failed(TightBeamError),
+	/// The handler is the default of a kind or an operation that its service
+	/// leaves out, which refuses the call with [`TransportError::NotServed`].
+	NotServed,
+	/// The trace injected a fault at the entry of the handler, which stopped
+	/// the handler before it ran, or at the exit of a handler that answered.
+	Faulted(TightBeamError),
+}
+
+#[cfg(feature = "std")]
+impl<T> HandlerOutcome<T> {
+	/// The outcome of a handler that returned `outcome`, in a span whose exit
+	/// record returned `exited`.
+	///
+	/// The error of a handler comes first, so a fault the trace injects at
+	/// the exit leaves it in place.
+	pub(crate) fn of(outcome: Result<T, TightBeamError>, exited: Result<(), TightBeamError>) -> Self {
+		match (outcome, exited) {
+			(Err(error), _) if error.is_not_served() => Self::NotServed,
+			(Err(error), _) => Self::Failed(error),
+			(Ok(_), Err(fault)) => Self::Faulted(fault),
+			(Ok(value), Ok(())) => Self::Answered(value),
+		}
+	}
+
+	/// Settles this outcome on a stream of `plane`: the status that the
+	/// stream reads, beside the value of an answered call. A failed handler
+	/// records its failure on the trail of `plane`, with the status that the
+	/// failure carries.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::NotServed`] -- the service leaves out the kind of
+	///   the stream, which the responder records and answers.
+	/// - The injected error, when the runtime fault model injects a fault at the record of a failure.
+	#[cfg(pooled_mux)]
+	pub(crate) fn settle_stream(
+		self,
+		plane: &(impl HandlerAudit + ?Sized),
+	) -> TransportResult<(TransitStatus, Option<T>)> {
+		match self {
+			Self::Answered(value) => Ok((TransitStatus::Ok, Some(value))),
+			Self::Failed(error) => {
+				let status = error.failure_status();
+				plane.audit_failure(status)?;
+
+				Ok((status, None))
+			}
+			Self::NotServed => Err(TransportError::NotServed),
+			Self::Faulted(fault) => Ok((fault.failure_status(), None)),
+		}
+	}
+}
+
+/// The handler span, and the answer of a failed handler, that every
+/// [`GateAudit`] plane records.
 ///
 /// The mux planes and the single-flight turn of the async and the blocking
 /// `server!` run each admitted handler through it. The trait is a
@@ -126,18 +190,12 @@ impl<A: GateAudit + ?Sized> GateInbound for A {}
 pub(crate) trait HandlerAudit: GateAudit {
 	/// Runs `handler`, the application handler of one call that this plane
 	/// admitted, between the internal events `HANDLER_ENTER` and
-	/// `HANDLER_EXIT` of the plane's audit trail.
+	/// `HANDLER_EXIT` of the plane's audit trail, and names what the call came
+	/// to.
 	///
-	/// The plane lends its audit trail when the call starts, so the returned
-	/// future borrows the trail alone.
-	///
-	/// # Errors
-	///
-	/// - The error of `handler`. It comes first, so a fault the trace injects at the exit leaves it in place.
-	/// - The injected error, when the runtime fault model injects a fault at
-	///   the entry, which stops `handler` before it runs, or at the exit.
-	/// - [`TightBeamError::LockPoisoned`] -- the fault-state lock of the trace is poisoned.
-	fn run_handler<'a, T, F>(&'a self, handler: F) -> impl Future<Output = Result<T, TightBeamError>> + MaybeSend + 'a
+	/// The returned future borrows the trail alone. A fault the trace injects
+	/// at the entry stops `handler` before it runs.
+	fn run_handler<'a, T, F>(&'a self, handler: F) -> impl Future<Output = HandlerOutcome<T>> + MaybeSend + 'a
 	where
 		F: Future<Output = Result<T, TightBeamError>> + MaybeSend + 'a,
 	{
@@ -147,24 +205,75 @@ pub(crate) trait HandlerAudit: GateAudit {
 		async move {
 			#[cfg(feature = "instrument")]
 			if let Some(trace) = trace {
-				trace.emit_internal_event(InternalEvent::HandlerEnter)?;
+				if let Err(fault) = trace.emit_internal_event(InternalEvent::HandlerEnter) {
+					return HandlerOutcome::Faulted(fault);
+				}
 			}
 
 			let outcome = handler.await;
 
 			#[cfg(feature = "instrument")]
-			if let Some(trace) = trace {
-				let exited = trace.emit_internal_event(InternalEvent::HandlerExit);
-				return outcome.and_then(|value| exited.map(|()| value));
-			}
+			let exited = trace.map_or(Ok(()), |trace| trace.emit_internal_event(InternalEvent::HandlerExit));
+			#[cfg(not(feature = "instrument"))]
+			let exited = Ok(());
 
-			outcome
+			HandlerOutcome::of(outcome, exited)
 		}
+	}
+
+	/// Records `status`, the answer of a call whose handler failed with an
+	/// error of its own, on the plane's audit trail as `HANDLER_FAILED`.
+	///
+	/// A plane calls it for [`HandlerOutcome::Failed`] alone, at the step
+	/// where it maps the failure to the answer.
+	///
+	/// # Errors
+	///
+	/// - The injected error, when the runtime fault model injects a fault at the record.
+	fn audit_failure(&self, status: TransitStatus) -> Result<(), TightBeamError> {
+		#[cfg(feature = "instrument")]
+		if let Some(trace) = self.audit_trace() {
+			trace.emit_event_with_value(events::HANDLER_FAILED, status.as_str(), status)?;
+		}
+
+		#[cfg(not(feature = "instrument"))]
+		let _ = status;
+
+		Ok(())
 	}
 }
 
 #[cfg(feature = "std")]
 impl<A: GateAudit + ?Sized> HandlerAudit for A {}
+
+/// The acceptance of a connection that a server records.
+///
+/// The service of an accepted connection records it once, ahead of the
+/// negotiation of multiplexing. The trait is a crate-private extension, as
+/// [`GateInbound`] is.
+#[cfg(feature = "tokio")]
+pub(crate) trait ConnectionAudit: GateAudit + crate::transport::state::EncryptedProtocolState {
+	/// Records the acceptance of this connection on its audit trail, as
+	/// `CONNECTION_ACCEPTED`, with the address that the listener accepted the
+	/// connection from as its evidence.
+	///
+	/// # Errors
+	///
+	/// - The injected error, when the runtime fault model injects a fault at the record.
+	fn audit_accepted(&self) -> Result<(), TightBeamError> {
+		#[cfg(feature = "instrument")]
+		if let Some(trace) = self.audit_trace() {
+			let peer = self.accepted_from();
+			let evidence = || peer.map(|peer| peer.to_string());
+			trace.emit_event_with_rendered_evidence(events::CONNECTION_ACCEPTED, evidence)?;
+		}
+
+		Ok(())
+	}
+}
+
+#[cfg(feature = "tokio")]
+impl<A: GateAudit + crate::transport::state::EncryptedProtocolState> ConnectionAudit for A {}
 
 #[derive(Debug)]
 /// A frame routed through retries, modeled on a physical letter that can
@@ -460,8 +569,9 @@ mod tests {
 	use crate::instrumentation::events;
 	use crate::policy::{GateChain, GatePolicy};
 	use crate::testing::TestFrame;
-	use crate::trace::TraceCollector;
+	use crate::trace::{AssertionLabel, AssertionValue, TraceCollector};
 	use crate::transport::policy::RestartLinearBackoff;
+	use crate::urn::Urn;
 	use crate::utils::marker::MaybeSendFuture;
 	use crate::utils::time::{Clock, MonotonicInstant, UnixMillis};
 	use crate::TightBeamError;
@@ -601,6 +711,78 @@ mod tests {
 		assert!(matches!(refused, Err(TightBeamError::ChannelClosed)));
 	}
 
+	/// The values that `trace` recorded for `event`, in the order it recorded
+	/// them.
+	fn recorded_values(trace: &TraceCollector, event: Urn<'static>) -> Vec<Option<AssertionValue>> {
+		let label = AssertionLabel::Custom(event.to_string().into());
+		let recorded = trace.drain_assertions();
+		recorded
+			.into_iter()
+			.filter(|record| record.label == label)
+			.map(|record| record.value)
+			.collect()
+	}
+
+	/// A gate verdict records its normalized status as the value that a spec
+	/// asserts.
+	#[test]
+	fn a_gate_verdict_records_its_status_as_its_value() -> Result<(), TightBeamError> {
+		let audit = AuditProbe(TraceCollector::new());
+		audit.gate_inbound(&DenyGate, None, &SessionContext::default())?;
+
+		let denied = Some(AssertionValue::from(TransitStatus::PermissionDenied));
+		assert_eq!(recorded_values(&audit.0, events::GATE_REJECT), [denied]);
+		Ok(())
+	}
+
+	/// A plane records the answer of a failed handler as `HANDLER_FAILED`,
+	/// with the status that the call answers as its value.
+	#[test]
+	fn a_failed_handler_records_the_status_it_answers() -> Result<(), TightBeamError> {
+		let audit = AuditProbe(TraceCollector::new());
+		audit.audit_failure(TransitStatus::PermissionDenied)?;
+
+		let denied = Some(AssertionValue::from(TransitStatus::PermissionDenied));
+		assert_eq!(recorded_values(&audit.0, events::HANDLER_FAILED), [denied]);
+		Ok(())
+	}
+
+	/// The outcome of a handler, the record of its exit, and the name of the
+	/// outcome that the two make.
+	type OutcomeCase = (Result<(), TightBeamError>, Result<(), TightBeamError>, &'static str);
+
+	/// The name of the variant of `outcome`.
+	fn outcome_name(outcome: &HandlerOutcome<()>) -> &'static str {
+		match outcome {
+			HandlerOutcome::Answered(()) => "answered",
+			HandlerOutcome::Failed(_) => "failed",
+			HandlerOutcome::NotServed => "not-served",
+			HandlerOutcome::Faulted(_) => "faulted",
+		}
+	}
+
+	// A call comes to what its handler returned, and the error of a handler
+	// comes ahead of a fault at its exit. A default that refuses its kind is
+	// no failure of a handler.
+	crate::tb_cases! {
+		fn a_call_comes_to_what_its_handler_returned((outcome, exited, expected): OutcomeCase) {
+			let settled = HandlerOutcome::of(outcome, exited);
+			assert_eq!(outcome_name(&settled), expected);
+		}
+		cases {
+			answered => (Ok(()), Ok(()), "answered"),
+			failed => (Err(TightBeamError::MissingResponse), Ok(()), "failed"),
+			failed_ahead_of_a_fault_at_its_exit => (
+				Err(TightBeamError::MissingResponse),
+				Err(TightBeamError::ChannelClosed),
+				"failed",
+			),
+			not_served => (Err(TransportError::NotServed.into()), Ok(()), "not-served"),
+			faulted_at_its_exit => (Ok(()), Err(TightBeamError::ChannelClosed), "faulted"),
+			unimplemented_of_its_own => (Err(TransportError::from(TransitStatus::Unimplemented).into()), Ok(()), "failed"),
+		}
+	}
+
 	/// The evidence a gate verdict records of its peer, read from a session
 	/// that `SessionContext::for_peer` binds to a certificate.
 	#[cfg(feature = "colony")]
@@ -708,7 +890,7 @@ mod tests {
 			};
 
 			let outcome = audit.run_handler(handler).await;
-			assert!(matches!(outcome, Err(TightBeamError::ChannelClosed)));
+			assert!(matches!(outcome, HandlerOutcome::Faulted(TightBeamError::ChannelClosed)));
 			assert!(!ran.load(Ordering::SeqCst));
 		}
 
@@ -719,7 +901,7 @@ mod tests {
 		async fn a_fault_at_the_handler_exit_fails_the_call() {
 			let audit = probe_faulting_at(events::HANDLER_EXIT);
 			let outcome = audit.run_handler(async { Ok(()) }).await;
-			assert!(matches!(outcome, Err(TightBeamError::ChannelClosed)));
+			assert!(matches!(outcome, HandlerOutcome::Faulted(TightBeamError::ChannelClosed)));
 		}
 
 		/// The error of a handler comes ahead of a fault the trace injects at
@@ -730,7 +912,7 @@ mod tests {
 			let audit = probe_faulting_at(events::HANDLER_EXIT);
 			let handler = async { Err::<(), _>(TightBeamError::MissingResponse) };
 			let outcome = audit.run_handler(handler).await;
-			assert!(matches!(outcome, Err(TightBeamError::MissingResponse)));
+			assert!(matches!(outcome, HandlerOutcome::Failed(TightBeamError::MissingResponse)));
 		}
 	}
 }

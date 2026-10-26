@@ -12,6 +12,7 @@ mod select;
 #[cfg(test)]
 mod tests;
 
+use core::num::NonZeroUsize;
 use core::time::Duration;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -31,6 +32,7 @@ pub use config::{
 	DEFAULT_EVAPORATION_RATE_BPS, DEFAULT_INITIAL_PHEROMONE, DEFAULT_REINFORCEMENT_BOOST, DEFAULT_WEAKENING_PENALTY,
 };
 pub use entry::{DialTarget, PeerRoute, PeerRouteInfo, RelayRoute, RouteKind, ServletEntry};
+pub use select::Weakened;
 
 /// One route as the registry holds it: the entry and when it was placed.
 ///
@@ -72,7 +74,7 @@ struct Bucket<'a> {
 ///
 /// A route key appears in `entries` and in exactly the index rows its
 /// entry declares. One lock covers all three, so a slate swap is atomic
-/// and a reader sees index rows that name entries the map still holds
+/// and a reader sees index rows that name only entries the map holds
 /// (CWE-362).
 #[derive(Default)]
 pub(super) struct Routes {
@@ -148,7 +150,7 @@ impl Routes {
 		}
 	}
 
-	/// Stores `entry` in place of a route its owner already holds at its key.
+	/// Stores `entry` at its key, in place of any route its owner holds there.
 	///
 	/// A replaced peer route keeps its pheromone and trial state, so a
 	/// re-advertisement keeps the score a route earned.
@@ -188,7 +190,7 @@ impl Routes {
 		Some(installed.entry)
 	}
 
-	/// Drops the index rows of whatever currently sits at `address`.
+	/// Drops the index rows of whatever sits at `address`.
 	fn unindex(&mut self, address: impl AsRef<[u8]>) {
 		let address = address.as_ref();
 		let Some(previous) = self.entries.get(address).map(|installed| Arc::clone(&installed.entry)) else {
@@ -234,7 +236,7 @@ impl Routes {
 		bucket: Bucket<'_>,
 		slate: impl IntoIterator<Item = ServletEntry>,
 		now: MonotonicInstant,
-	) -> Result<(), ClusterError> {
+	) -> Result<SlateChange, ClusterError> {
 		let slate: Vec<ServletEntry> = slate.into_iter().collect();
 		for entry in &slate {
 			self.admits(entry)?;
@@ -242,13 +244,19 @@ impl Routes {
 
 		// The sweep below removes what the bucket held, so every route in
 		// it must be this owner's to remove.
-		for address in self.addresses_in_bucket(bucket.id) {
+		let held = self.addresses_in_bucket(bucket.id);
+		for address in held {
 			self.held_by(RouteClaim { owner: bucket.owner, key: address.as_ref() })?;
 		}
 
+		let mut change = SlateChange { held: held.len(), installed: 0, withdrawn: 0 };
 		let mut fresh: Vec<SharedId> = Vec::with_capacity(slate.len());
 		for entry in slate {
-			fresh.push(Arc::clone(entry.route_key()));
+			let key = Arc::clone(entry.route_key());
+			let is_new = self.get(key.as_ref()).is_none();
+			change.installed = change.installed.saturating_add(usize::from(is_new));
+
+			fresh.push(key);
 			self.place(entry, now);
 		}
 
@@ -258,12 +266,13 @@ impl Routes {
 			.filter(|address| !fresh.iter().any(|kept| kept.as_ref() == address.as_ref()))
 			.map(Arc::clone)
 			.collect();
-
 		for address in &stale {
 			self.remove(address.as_ref());
 		}
 
-		Ok(())
+		change.withdrawn = stale.len();
+
+		Ok(change)
 	}
 
 	/// Removes every route in `bucket` that `bucket.owner` holds.
@@ -340,7 +349,7 @@ impl Routes {
 	/// 1. It refuses a slate older than the bucket's last applied order.
 	/// 2. It refuses a slate that would pass the kind's caps.
 	/// 3. [`Self::reconcile`] asks the one decider about every key, socket, and swept route.
-	/// 4. An emptied direct slate also withdraws the relay trails learned from it.
+	/// 4. An emptied direct slate also withdraws, and counts, the relay trails learned from it.
 	/// 5. The ledger records the order the slate applied at.
 	///
 	/// Every step reads and writes under that one guard, so concurrent
@@ -360,7 +369,7 @@ impl Routes {
 		order: UnixMillis,
 		tombstone: Tombstone,
 		now: MonotonicInstant,
-	) -> Result<(), ClusterError> {
+	) -> Result<SlateChange, ClusterError> {
 		let slate: Vec<ServletEntry> = slate.into_iter().collect();
 		if self.ad_orders.get(bucket.id).is_some_and(|&applied| order < applied) {
 			return Err(ClusterError::StalePeerAd);
@@ -370,18 +379,18 @@ impl Routes {
 		}
 
 		let clearing = slate.is_empty();
-
-		self.reconcile(bucket, slate, now)?;
+		let mut change = self.reconcile(bucket, slate, now)?;
 
 		// A withdrawn direct slate withdraws the relay fallbacks learned
 		// from it, in the same step that withdraws the direct routes.
 		if clearing && caps.kind == RouteKind::Peer {
-			self.remove_relay_trails_for_origin(bucket.id);
+			let trails = self.remove_relay_trails_for_origin(bucket.id);
+			change.withdrawn = change.withdrawn.saturating_add(trails);
 		}
 
 		self.record_ad_order(Arc::from(bucket.id), order, tombstone);
 
-		Ok(())
+		Ok(change)
 	}
 
 	/// Drops the relay trails installed more than `max_age` before `now`.
@@ -397,7 +406,6 @@ impl Routes {
 			.filter(|installed| now.saturating_duration_since(installed.at) > max_age)
 			.map(|installed| Arc::clone(installed.entry.route_key()))
 			.collect();
-
 		for route_key in &stale {
 			self.remove(route_key.as_ref());
 		}
@@ -414,7 +422,6 @@ impl Routes {
 			.filter(|entry| entry.owner_id().as_ref() == origin_id)
 			.map(|entry| Arc::clone(entry.route_key()))
 			.collect();
-
 		for route_key in &stale {
 			self.remove(route_key.as_ref());
 		}
@@ -422,25 +429,28 @@ impl Routes {
 		stale.len()
 	}
 
-	/// Drops every peer route that dials `gateway`.
+	/// Drops every peer route that dials `gateway`, and returns how many it
+	/// dropped.
 	///
 	/// - A relay trail through the socket dials it, so it leaves with the direct routes.
 	/// - A fallback trail to the same origin through another relay dials that relay, so it stays.
-	pub(super) fn remove_peer_routes_dialing(&mut self, gateway: PeerAddress) {
+	pub(super) fn remove_peer_routes_dialing(&mut self, gateway: PeerAddress) -> usize {
 		let dials_gateway = |entry: &&Arc<ServletEntry>| entry.is_peer_route_to(gateway);
 		let dialing: Vec<Arc<ServletEntry>> = self.values().filter(dials_gateway).map(Arc::clone).collect();
 
 		for entry in &dialing {
 			self.remove(entry.route_key().as_ref());
 		}
+
+		dialing.len()
 	}
 
 	/// Records the order this bucket last applied at.
 	///
 	/// A row lives as long as its bucket holds entries. Once the bucket
 	/// empties, the row survives one freshness window as a tombstone, so a
-	/// replayed older advertisement still loses to the withdrawal it would
-	/// otherwise undo (CWE-294).
+	/// replayed older advertisement loses to the withdrawal it would otherwise
+	/// undo (CWE-294).
 	fn record_ad_order(&mut self, bucket: SharedId, order: UnixMillis, tombstone: Tombstone) {
 		self.ad_orders.insert(bucket, order);
 
@@ -525,19 +535,57 @@ pub(super) struct Tombstone {
 	pub(super) now: UnixMillis,
 }
 
-/// Registry of servlet entries with pheromone-based routing.
+/// What one slate swap changed in its bucket.
+///
+/// A refresh of a route the bucket already held counts as neither an
+/// install nor a withdrawal, so each count names a change of the routes
+/// alone.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SlateChange {
+	/// The count of routes the bucket held before the swap.
+	held: usize,
+	/// The count of routes the swap placed at a key that held no route.
+	installed: usize,
+	/// The count of routes the swap removed, with the relay trails that an
+	/// emptied direct slate withdraws.
+	withdrawn: usize,
+}
+
+impl SlateChange {
+	/// The count of new routes, or [`None`] when the swap installed none.
+	#[must_use]
+	pub(crate) fn installed(&self) -> Option<NonZeroUsize> {
+		NonZeroUsize::new(self.installed)
+	}
+
+	/// The count of routes withdrawn, or [`None`] when the swap withdrew
+	/// none.
+	#[must_use]
+	pub(crate) fn withdrawn(&self) -> Option<NonZeroUsize> {
+		NonZeroUsize::new(self.withdrawn)
+	}
+
+	/// Whether the swap placed routes in a bucket that held none, so the
+	/// bucket's trail is new.
+	#[must_use]
+	pub(crate) fn opens_bucket(&self) -> bool {
+		self.held == 0 && self.installed > 0
+	}
+}
+
+/// A registry of servlet entries with pheromone-based routing.
 ///
 /// The registry tracks servlet instances across hives and peer gateways.
 /// Reinforcement and evaporation steer selection, and trial limits abandon
 /// dead routes.
 pub struct ServletRegistry {
-	/// Entries and the two reverse indexes derived from them.
+	/// The entries and the two reverse indexes derived from them.
 	pub(super) routes: RwLock<Routes>,
 	/// How long a dead bucket's order tombstone survives.
 	pub(super) ad_tombstone_window: Duration,
 	/// The clock that measures tombstones, route installs, and relay-trail age.
 	pub(super) clock: Arc<dyn Clock>,
-	/// Pheromone score and lifecycle configuration.
+	/// The pheromone score and lifecycle configuration.
 	pub(super) config: PheromoneConfig,
 }
 
@@ -556,7 +604,7 @@ impl ServletRegistry {
 		}
 	}
 
-	/// The tombstone bound for an advertisement admitted now.
+	/// The tombstone bound for an advertisement admitted at this clock reading.
 	pub(super) fn tombstone(&self) -> Tombstone {
 		Tombstone { window: self.ad_tombstone_window, now: self.clock.unix() }
 	}

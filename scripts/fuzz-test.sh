@@ -70,10 +70,15 @@ for FUZZ_TARGET in "${FUZZ_TARGETS[@]}"; do
 	# fallback, because AFL refuses to start with an empty input directory.
 	CORPUS="tightbeam/fuzz/${NAME#fuzz_}/seeds"
 	IN_DIR="built/fuzz/in/$NAME"
+	rm -rf "$IN_DIR"
 	mkdir -p "$IN_DIR"
-	if [ -d "$CORPUS" ] && [ -n "$(find "$CORPUS" -type f -print -quit)" ]; then
-		find "$CORPUS" -type f -exec cp {} "$IN_DIR/" \;
-		echo "[$NAME] corpus: $CORPUS"
+	SEEDS=()
+	if [ -d "$CORPUS" ]; then
+		mapfile -t SEEDS < <("$(dirname "$0")/fuzz-run.sh" --seeds "$CORPUS")
+	fi
+	if [ "${#SEEDS[@]}" -gt 0 ]; then
+		cp "${SEEDS[@]}" "$IN_DIR/"
+		echo "[$NAME] corpus: $CORPUS (${#SEEDS[@]} seeds)"
 	else
 		echo "seed" > "$IN_DIR/seed.txt"
 		echo "[$NAME] corpus: none, using a generic seed"

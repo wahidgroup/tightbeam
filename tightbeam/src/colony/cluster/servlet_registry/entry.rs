@@ -41,7 +41,7 @@ pub struct DialTarget(Endpoint);
 /// What a [`DialTarget`] names, beside the bytes it renders as.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Endpoint {
-	/// A socket, claimed by a peer gateway or registered by a hive, with its
+	/// A socket that a peer gateway claimed or a hive registered, with its
 	/// canonical rendering.
 	Socket { address: PeerAddress, rendering: SharedId },
 	/// A servlet or control address a hive registered that names no socket,
@@ -51,8 +51,8 @@ enum Endpoint {
 }
 
 impl DialTarget {
-	/// An address a hive registered, for one of its servlets or for its own
-	/// control plane.
+	/// Returns the target of an address a hive registered, for one of its
+	/// servlets or for its own control plane.
 	///
 	/// An address that spells a socket becomes that socket, so it compares
 	/// with a claimed peer socket. Any other address is a name the protocol
@@ -64,14 +64,14 @@ impl DialTarget {
 		}
 	}
 
-	/// A socket a peer gateway claimed, which this gateway's dial policy
-	/// admitted as `dial`.
+	/// Returns the target of a socket a peer gateway claimed, which this
+	/// gateway's dial policy admitted as `dial`.
 	pub(crate) fn of_claimed(dial: AdmittedDial) -> Self {
 		Self::of_socket(dial.address())
 	}
 
-	/// The target of `dial`, which shares the rendering of this target when
-	/// this target names the socket `dial` admitted.
+	/// Returns the target of `dial`, which shares the rendering of this target
+	/// when this target names the socket `dial` admitted.
 	///
 	/// The entries of one slate dial one socket, so they share one rendering
 	/// of it. A target of another socket renders `dial` on its own, so an
@@ -85,14 +85,14 @@ impl DialTarget {
 		Self::of_socket(address)
 	}
 
-	/// The target of `address`, rendered through
+	/// Returns the target of `address`, rendered through
 	/// [`PeerAddress::route_bytes`], the one home for the spelling.
 	fn of_socket(address: PeerAddress) -> Self {
 		let rendering = address.route_bytes();
 		Self(Endpoint::Socket { address, rendering })
 	}
 
-	/// The socket this target names, when it names one.
+	/// Returns the socket this target names, when it names one.
 	///
 	/// # Examples
 	///
@@ -119,7 +119,7 @@ impl DialTarget {
 		}
 	}
 
-	/// The bytes a caller gossips or displays this target by.
+	/// Returns the bytes a caller gossips or displays this target by.
 	///
 	/// The target derives them from its endpoint where it is built, so they
 	/// agree with the endpoint. A socket renders through
@@ -146,7 +146,7 @@ impl DialTarget {
 		self.rendering()
 	}
 
-	/// The rendering as the shared bytes a route record holds.
+	/// Returns the rendering as the shared bytes a route record holds.
 	fn rendering(&self) -> &SharedId {
 		match &self.0 {
 			Endpoint::Socket { rendering, .. } => rendering,
@@ -154,7 +154,7 @@ impl DialTarget {
 		}
 	}
 
-	/// This target as the address type of the protocol that dials it.
+	/// Returns this target as the address type of the protocol that dials it.
 	///
 	/// This is the one place a dial becomes a protocol address:
 	///
@@ -301,12 +301,12 @@ pub(super) struct Owner<'a> {
 }
 
 impl<'a> Owner<'a> {
-	/// The hive at `id`, owner of the local routes it registered.
+	/// Returns the hive at `id`, the owner of the local routes it registered.
 	pub(super) fn hive(id: &'a [u8]) -> Self {
 		Self { id, kind: RouteKind::Local }
 	}
 
-	/// The peer gateway whose certificate fingerprint is `id`.
+	/// Returns the peer gateway whose certificate fingerprint is `id`.
 	pub(super) fn peer(id: &'a [u8]) -> Self {
 		Self { id, kind: RouteKind::Peer }
 	}
@@ -542,7 +542,7 @@ impl ServletEntry {
 		&self.route_key
 	}
 
-	/// The endpoint that a forward through this entry dials.
+	/// Returns the endpoint that a forward through this entry dials.
 	#[must_use]
 	pub fn dial_target(&self) -> &DialTarget {
 		&self.dial
@@ -556,13 +556,13 @@ impl ServletEntry {
 		&self.owner_id
 	}
 
-	/// The reconcile bucket this entry lives under in the hive index.
+	/// Returns the reconcile bucket this entry lives under in the hive index.
 	#[must_use]
 	pub fn bucket(&self) -> &SharedId {
 		&self.bucket
 	}
 
-	/// The identity this route belongs to, on its plane.
+	/// Returns the identity this route belongs to, on its plane.
 	pub(super) fn owner(&self) -> Owner<'_> {
 		Owner { id: &self.owner_id, kind: self.route_kind }
 	}
@@ -574,21 +574,21 @@ impl ServletEntry {
 		self.relay_id.as_ref()
 	}
 
-	/// The plane this entry dials on, and the party that must answer: the
-	/// signer the servlet's registration names for a local route, the gateway
-	/// that advertised the type for a direct route, and the relay for a relay
-	/// trail.
+	/// Returns the plane this entry dials on, and the party that must answer:
+	/// the signer the servlet's registration names for a local route, the
+	/// gateway that advertised the type for a direct route, and the relay for a
+	/// relay trail.
 	pub(crate) fn plane(&self) -> RoutePlane {
 		self.plane.clone()
 	}
 
-	/// The key bytes of the servlet type, which the type index looks up.
+	/// Returns the servlet type's key bytes, which the type index looks up.
 	#[must_use]
 	pub fn servlet_type(&self) -> &SharedId {
 		&self.servlet_type
 	}
 
-	/// The kind of this route: local, direct peer, or peer relay.
+	/// Returns the kind of this route: local, direct peer, or peer relay.
 	#[must_use]
 	pub fn route_kind(&self) -> RouteKind {
 		self.route_kind
@@ -600,13 +600,13 @@ impl ServletEntry {
 		self.route_kind.is_peer() && self.dial.as_socket() == Some(&gateway)
 	}
 
-	/// The count of consecutive failures toward abandonment.
+	/// Returns the count of consecutive failures toward abandonment.
 	#[must_use]
 	pub fn trial_count(&self) -> u32 {
 		self.trial_count.load(Ordering::Relaxed)
 	}
 
-	/// The operator view of the peer route fields, when this entry is
+	/// Returns the operator view of the peer route fields, when this entry is
 	/// peer-routed.
 	///
 	/// [`PeerRouteInfo::peer_id`] is the origin that advertised the type, for
@@ -636,7 +636,7 @@ impl ServletEntry {
 		!self.is_abandoned()
 	}
 
-	/// The current pheromone level that weighted selection reads.
+	/// Returns the current pheromone level that weighted selection reads.
 	#[must_use]
 	pub fn pheromone_level(&self) -> u64 {
 		self.pheromone.load(Ordering::Relaxed)
@@ -645,12 +645,10 @@ impl ServletEntry {
 	/// Raises the pheromone after a successful request and clears the
 	/// failure streak.
 	///
-	/// One `fetch_update` applies the reinforcement, so a concurrent
-	/// evaporation cannot discard it.
+	/// One atomic read-modify-write applies the reinforcement, so it survives
+	/// a concurrent evaporation.
 	pub fn reinforce(&self, quality: u64) {
-		let _ = self.pheromone.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-			Some(current.saturating_add(quality).min(MAX_PHEROMONE))
-		});
+		self.update_pheromone(|current| current.saturating_add(quality).min(MAX_PHEROMONE));
 		self.trial_count.store(0, Ordering::Relaxed);
 	}
 
@@ -659,27 +657,52 @@ impl ServletEntry {
 		self.trial_count.fetch_add(1, Ordering::Relaxed);
 	}
 
+	/// Counts one failure toward abandonment, and reports whether this
+	/// failure reached the abandonment limit.
+	///
+	/// The count rises in one atomic step, so of concurrent failures exactly
+	/// one reports that it reached the limit.
+	pub(super) fn weaken_to_limit(&self) -> bool {
+		let before = self.trial_count.fetch_add(1, Ordering::Relaxed);
+		before.saturating_add(1) == self.abandonment_limit
+	}
+
 	/// Counts one failure and subtracts `penalty` from the pheromone when the
 	/// penalty is nonzero.
 	pub fn weaken_with_penalty(&self, penalty: u64) {
 		self.trial_count.fetch_add(1, Ordering::Relaxed);
 		if penalty > 0 {
-			let _ = self.pheromone.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-				Some(current.saturating_sub(penalty))
-			});
+			self.update_pheromone(|current| current.saturating_sub(penalty));
 		}
 	}
 
 	/// Decays the pheromone by `rate` basis points.
 	pub fn evaporate(&self, rate: BasisPoints) {
-		let _ = self.pheromone.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+		self.update_pheromone(|current| {
 			let decay = current.saturating_mul(rate.get() as u64) / 10000;
-			Some(current.saturating_sub(decay))
+			current.saturating_sub(decay)
 		});
 	}
 
-	/// Carries pheromone and trial state across a replacement when both the
-	/// old and the new route are peer-routed.
+	/// Applies `step` to the pheromone level in one atomic read-modify-write.
+	///
+	/// A concurrent write fails the exchange and hands back the level it
+	/// wrote, so the loop applies `step` again to that level, and each update
+	/// lands on the level before it.
+	fn update_pheromone(&self, step: impl Fn(u64) -> u64) {
+		let pheromone = &self.pheromone;
+		let mut current = pheromone.load(Ordering::Relaxed);
+		loop {
+			let next = step(current);
+			match pheromone.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+				Ok(_) => return,
+				Err(written) => current = written,
+			}
+		}
+	}
+
+	/// Carries the pheromone and trial state of `prev` across a replacement
+	/// when both `prev` and this route are peer-routed.
 	///
 	/// The install instant stays with the registry's map value, so a
 	/// replacement ages from the reconcile that placed it.

@@ -12,18 +12,18 @@
 //! # Peer federation
 //!
 //! Gateways advertise exported servlet types to peer gateways, honor relay
-//! budgets, and learn remote routes through gossip. Trust anchors live on
+//! budgets, and learn remote routes through gossip. The trust anchors live on
 //! [`ClusterTlsConfig::peer_trust`]. Every address a peer claims passes
 //! [`PeerConfig::admit_dial`], and the [`AdmittedDial`] it returns is the one
 //! form a claimed address takes on the way to a dial.
 //!
 //! # Export boundary
 //!
-//! [`PeerConfig::exported_types`], [`ClusterConfig::export_grants`] (a
-//! list of [`export::ExportGrant`]), and [`ClusterConfig::export_gates`] (a
-//! list of [`export::ExportGate`]) govern what external peers may discover
-//! and reach. Enforcement order is allowlist, then grants, then deny gates.
-//! See the [`export`] module.
+//! [`PeerConfig::exported_types`], [`ClusterConfig::export_grants`] (a list of
+//! [`export::ExportGrant`]), and [`ClusterConfig::export_gates`] (a list of
+//! [`export::ExportGate`]) govern what external peers may discover and reach.
+//! The enforcement order is the allowlist, then the grants, then the deny
+//! gates. See the [`export`] module.
 //!
 //! # Gossip
 //!
@@ -73,8 +73,8 @@ pub(crate) use runtime::{ColonyConfig, ColonyDialProtocol};
 pub(crate) use servlet_registry::HiveSlate;
 pub use servlet_registry::{
 	DialTarget, PeerCaps, PeerRoute, PeerRouteInfo, PheromoneConfig, RelayRoute, RouteKind, ServletEntry,
-	ServletRegistry, DEFAULT_ABANDONMENT_LIMIT, DEFAULT_EVAPORATION_INTERVAL_SECS, DEFAULT_EVAPORATION_RATE_BPS,
-	DEFAULT_INITIAL_PHEROMONE, DEFAULT_REINFORCEMENT_BOOST, DEFAULT_WEAKENING_PENALTY,
+	ServletRegistry, Weakened, DEFAULT_ABANDONMENT_LIMIT, DEFAULT_EVAPORATION_INTERVAL_SECS,
+	DEFAULT_EVAPORATION_RATE_BPS, DEFAULT_INITIAL_PHEROMONE, DEFAULT_REINFORCEMENT_BOOST, DEFAULT_WEAKENING_PENALTY,
 };
 
 #[cfg(test)]
@@ -427,8 +427,8 @@ impl core::fmt::Debug for ClusterTlsConfig {
 /// The peer-federation dial list, the advertise beat and address, and the
 /// policy that admits the dial addresses peers claim.
 ///
-/// Trust anchors stay on [`ClusterTlsConfig::peer_trust`]. Export
-/// discoverability and enforcement share [`PeerConfig::exported_types`].
+/// The trust anchors stay on [`ClusterTlsConfig::peer_trust`]. Export
+/// discoverability and export enforcement share [`PeerConfig::exported_types`].
 #[derive(Clone)]
 pub struct PeerConfig {
 	/// The peer gateway addresses this gateway dials to advertise exported
@@ -466,8 +466,8 @@ pub struct PeerConfig {
 	/// The discovery table, which holds `peers` as un-evictable anchors beside
 	/// the bounded, prefix-bucketed learned peers.
 	///
-	/// - The config builder rebuilds it, so anchors always derive from
-	///   `peers` and the injected [`PeerStore`] rehydrates learned peers
+	/// - The config builder rebuilds it, so the anchors always derive from
+	///   `peers` and the injected [`PeerStore`] rehydrates the learned peers
 	///   through the capped admission path.
 	/// - The field is private because the builder derives it. Read it with [`PeerConfig::table`].
 	table: Arc<PeerTable>,
@@ -497,8 +497,8 @@ pub struct PeerConfig {
 	tried_per_signer: Option<NonZeroUsize>,
 	/// The advertisement-rumor refresh interval, as the operator configured it.
 	///
-	/// The beat floods the slate rumor when the slate or flood target set
-	/// changed, plus one refresh on this interval.
+	/// The beat floods the slate rumor when the slate or the flood target set
+	/// changes, plus one refresh on this interval.
 	///
 	/// The field is private because the clamped value is the one every caller
 	/// wants. Set it with [`ClusterConfigBuilder::with_rumor_refresh`] and
@@ -590,7 +590,7 @@ impl core::fmt::Debug for PeerConfig {
 /// Build one with [`ClusterConfigBuilder`] or [`ClusterConfig::new`]. The
 /// load balancer defaults to [`StochasticForager`].
 pub struct ClusterConfig {
-	/// The naming scope of inbound resource URNs.
+	/// The namespace that scopes inbound resource URNs.
 	///
 	/// The gateway refuses a register, update, or work request that names a
 	/// foreign authority or realm.
@@ -607,13 +607,13 @@ pub struct ClusterConfig {
 	/// servlet target.
 	///
 	/// All gates must pass, so they compose as an intersection with the allow
-	/// sources (exported list, grants, and the first-party origin rule).
+	/// sources: the exported list, the grants, and the first-party origin rule.
 	pub export_gates: Vec<Arc<dyn ExportGate>>,
 	/// The positive export grants, which the gateway evaluates when the
 	/// built-in allowlist refuses a target.
 	///
-	/// Allow sources compose as a union: exported, granted, or first-party
-	/// origin. Deny gates still override a grant. The advertised slate lists
+	/// The allow sources compose as a union: exported, granted, or first-party
+	/// origin. A deny gate overrides a grant. The advertised slate lists
 	/// exported types alone, so a granted type stays off it.
 	pub export_grants: Vec<Arc<dyn ExportGrant>>,
 	/// The outbound connection pool settings for hive and peer dials. The
@@ -639,7 +639,7 @@ pub struct ClusterConfig {
 	/// - The edge listener admits `Work` frames only. It refuses control frames
 	///   with `PermissionDenied`, so an edge client can never join the colony
 	///   control plane.
-	/// - Hives still register on `bind_addr`.
+	/// - Hives register on `bind_addr` in either case.
 	pub edge_bind_addr: Option<String>,
 	/// The peer-federation dial list, advertise beat and address, and dial
 	/// policy.
@@ -681,8 +681,8 @@ impl ClusterConfig {
 	/// A refresh slower than the gossip freshness window would re-publish
 	/// rumors that peers refuse as stale, so this method clamps the configured
 	/// interval to [`GossipConfig::seen_ttl`]. The window itself narrows at
-	/// startup to journal retention, so this method derives the interval on
-	/// each read and the two stay in agreement.
+	/// startup to the journal retention, so this method derives the interval
+	/// on each read and the two stay in agreement.
 	#[must_use]
 	pub fn rumor_refresh(&self) -> Duration {
 		self.peer.rumor_refresh.min(self.gossip.seen_ttl)

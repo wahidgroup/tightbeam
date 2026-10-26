@@ -1,9 +1,9 @@
-//! Process Composition Specifications
+//! The specifications that compose CSP processes into one concurrent system.
 //!
-//! Provides CSP parallel composition operators and process algebra operations
-//! for composing multiple processes into complex concurrent systems.
+//! The module holds the CSP parallel operators and the process algebra
+//! operations that build one process from two or more.
 //!
-//! Based on Hoare's CSP theory and Roscoe's refinement checking.
+//! The operators follow Hoare's CSP theory and Roscoe's refinement checking.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -12,65 +12,65 @@ use crate::testing::specs::csp::{CspValidationResult, Event, Process, ProcessBui
 use crate::trace::ConsumedTrace;
 use crate::Errorizable;
 
-// Submodules
 pub mod algebra;
 pub mod operators;
 pub mod verification;
 
-// Re-export key types
 pub use verification::{DeadlockChecker, DeterminismChecker, LivelockChecker};
 
-/// CSP Parallel Composition Operators
+/// The parallel operators that compose two CSP processes.
 ///
-/// Defines the different ways processes can be composed in parallel,
-/// following standard CSP theory notation.
+/// Each variant names one operator and its symbol in the standard CSP
+/// notation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CompositionOperator {
-	/// Synchronized parallel (||) - synchronize on ALL shared events
-	/// Events in both alphabets must occur together; unique events interleave
+	/// Synchronized parallel, `||`. The processes synchronize on every shared
+	/// event, so an event of both alphabets must occur in both together, and
+	/// an event of one alphabet interleaves.
 	Synchronized,
 
-	/// Interleaved parallel (|||) - no synchronization, pure interleaving
-	/// All events from both processes interleave independently
+	/// Interleaved parallel, `|||`. Every event of both processes interleaves
+	/// independently.
 	Interleaved,
 
-	/// Interface parallel ([| A |]) - synchronize only on specified events
-	/// Events in alphabet A must synchronize; all others interleave
+	/// Interface parallel, `[| A |]`. The processes synchronize only on the
+	/// events of the alphabet `A`, and every other event interleaves.
 	Interface { events: Vec<&'static str> },
 
-	/// Alphabetized parallel ([| αP | αQ |]) - custom alphabets per process
-	/// Each process restricted to its alphabet, synchronize on intersection
+	/// Alphabetized parallel, `[| αP | αQ |]`. Each process keeps to its own
+	/// alphabet, and the processes synchronize on the intersection.
 	Alphabetized { left: Vec<&'static str>, right: Vec<&'static str> },
 }
 
-/// Trait for process composition specifications
+/// A specification of how two or more processes compose into one.
 ///
-/// Similar to `ProcessSpec`, this trait allows both declarative macro usage
-/// (`tb_compose_spec!`) and manual implementation for defining how multiple
-/// processes are composed.
+/// As with [`ProcessSpec`], the declarative
+/// [`tb_compose_spec!`](crate::tb_compose_spec) macro implements it, and a
+/// manual implementation is also valid.
 pub trait CompositionSpec {
-	/// Get the composed process
+	/// Returns the composed process.
 	fn process() -> Process;
 
-	/// Get composition metadata
+	/// Returns the metadata of the composition.
 	fn metadata() -> CompositionMetadata {
 		CompositionMetadata::default()
 	}
 
-	/// Verify composition properties (deadlock-free, livelock-free, etc.)
+	/// Checks the properties that the composition claims, such as deadlock
+	/// freedom, livelock freedom, and determinism. The default returns `Ok`.
 	fn verify_properties() -> Result<(), CompositionError> {
 		Ok(())
 	}
 }
 
-/// Blanket implementation of ProcessSpec for CompositionSpec types
+/// Every [`CompositionSpec`] is a [`ProcessSpec`].
 ///
-/// This allows composed processes to be used directly in tb_scenario! and
-/// other testing macros that expect a ProcessSpec.
+/// A composed process serves `tb_scenario!` and every other testing macro
+/// that takes a process spec.
 ///
-/// Note: CompositionSpecs are typically zero-sized structs (ZSTs) generated
-/// by `tb_compose_spec!`. The `process()` method constructs the Process, so we
-/// return Cow::Owned. This is only called once per test.
+/// A composition spec is usually a zero-sized struct that `tb_compose_spec!`
+/// generates. [`CompositionSpec::process`] builds the process on each call, so
+/// `to_process_cow` returns `Cow::Owned`. A test calls it once.
 impl<T: CompositionSpec> ProcessSpec for T {
 	fn validate_trace(&self, trace: &ConsumedTrace) -> CspValidationResult {
 		let process = T::process();
@@ -82,22 +82,23 @@ impl<T: CompositionSpec> ProcessSpec for T {
 	}
 }
 
-/// Metadata about a process composition
+/// The metadata of a process composition.
 #[derive(Debug, Clone)]
 pub struct CompositionMetadata {
-	/// Name of the composition
+	/// The name of the composition.
 	pub name: &'static str,
 
-	/// Optional description
+	/// The description of the composition, when the spec states one.
 	pub description: Option<&'static str>,
 
-	/// Names of component processes
+	/// The names of the component processes.
 	pub component_processes: Vec<&'static str>,
 
-	/// Synchronization alphabet (events that must synchronize)
+	/// The synchronization alphabet, which holds the events that must
+	/// synchronize.
 	pub sync_alphabet: HashSet<Event>,
 
-	/// Expected properties of the composition
+	/// The properties that the spec expects of the composition.
 	pub properties: CompositionProperties,
 }
 
@@ -113,71 +114,84 @@ impl Default for CompositionMetadata {
 	}
 }
 
-/// Properties expected of a composition
+/// The properties that a spec expects of a composition. The
+/// `verify_properties` of [`tb_compose_spec!`](crate::tb_compose_spec) checks
+/// each property that reads `Some(true)`, and `None` leaves it unchecked.
 #[derive(Debug, Clone, Default)]
 pub struct CompositionProperties {
-	/// Should be deadlock-free (None = not checked)
+	/// Whether the spec expects the composition to be deadlock-free.
 	pub deadlock_free: Option<bool>,
 
-	/// Should be livelock-free (None = not checked)
+	/// Whether the spec expects the composition to be livelock-free.
 	pub livelock_free: Option<bool>,
 
-	/// Should be deterministic (None = not checked)
+	/// Whether the spec expects the composition to be deterministic.
 	pub deterministic: Option<bool>,
 }
 
-/// Errors that can occur during composition
+/// The errors of a process composition and of its property checks.
 #[derive(Errorizable, Debug, Clone)]
 pub enum CompositionError {
-	/// Alphabets don't match expectations
+	/// An alphabet differs from the alphabet that the composition expects.
 	#[error("Alphabet mismatch: expected {expected:?}, got {actual:?}")]
 	AlphabetMismatch { expected: HashSet<Event>, actual: HashSet<Event> },
 
-	/// Deadlock detected at a state
+	/// The process deadlocks at `state`.
 	#[error("Deadlock detected at state {state}")]
 	DeadlockDetected { state: State },
 
-	/// Livelock detected (infinite τ-cycle)
+	/// The process livelocks in `cycle`, a τ cycle that can repeat forever.
 	#[error("Livelock detected in cycle: {cycle:?}")]
 	LivelockDetected { cycle: Vec<State> },
 
-	/// Non-determinism detected
+	/// The process is nondeterministic at `state` on `events`.
 	#[error("Non-determinism at state {state}: events {events:?}")]
 	NonDeterminismDetected { state: State, events: Vec<Event> },
 
-	/// Invalid composition structure
+	/// The structure of the composition is invalid for the stated `reason`.
 	#[error("Invalid composition: {reason}")]
 	InvalidComposition { reason: String },
 
-	/// Process construction failed
+	/// The operands state timing that does not agree for one event: two
+	/// timing constraints, or two schedulability periods.
+	#[error("the operands state timing for the event {event} that does not agree")]
+	ConflictingTiming {
+		/// The event whose timing the operands state twice.
+		event: Event,
+	},
+
+	/// The operands name different schedulers for schedulability analysis.
+	#[error("the operands name different schedulers")]
+	ConflictingScheduler,
+
+	/// The process builder refuses the composed process.
 	#[error("Process construction failed: {0}")]
 	#[from]
 	ProcessConstructionFailed(ProcessBuildError),
 }
 
-/// Process expression AST for composition
+/// The syntax tree of a CSP process algebra expression.
 ///
-/// Represents CSP process algebra expressions that can be evaluated
-/// to produce concrete Process instances.
+/// [`ProcessExpr::evaluate`] turns an expression into a concrete [`Process`].
 #[derive(Debug, Clone)]
 pub enum ProcessExpr {
-	/// Reference to an atomic process
+	/// An atomic process under its name.
 	Atomic { name: &'static str, process: Box<Process> },
 
-	/// Synchronized parallel: P || Q
-	/// Processes synchronize on ALL shared events
+	/// Synchronized parallel, `P || Q`. The processes synchronize on every
+	/// shared event.
 	Synchronized { left: Box<ProcessExpr>, right: Box<ProcessExpr> },
 
-	/// Interleaved parallel: P ||| Q
-	/// Processes run independently with no synchronization
+	/// Interleaved parallel, `P ||| Q`. The processes run independently, and
+	/// every event interleaves.
 	Interleaved { left: Box<ProcessExpr>, right: Box<ProcessExpr> },
 
-	/// Interface parallel: P [| A |] Q
-	/// Processes synchronize only on events in alphabet A
+	/// Interface parallel, `P [| A |] Q`. The processes synchronize only on
+	/// the events of the alphabet `A`.
 	InterfaceParallel { left: Box<ProcessExpr>, sync_alphabet: HashSet<Event>, right: Box<ProcessExpr> },
 
-	/// Alphabetized parallel: P [| αP | αQ |] Q
-	/// Each process restricted to its alphabet, sync on intersection
+	/// Alphabetized parallel, `P [| αP | αQ |] Q`. Each process keeps to its
+	/// alphabet, and the processes synchronize on the intersection.
 	AlphabetizedParallel {
 		left: Box<ProcessExpr>,
 		left_alphabet: HashSet<Event>,
@@ -185,34 +199,34 @@ pub enum ProcessExpr {
 		right: Box<ProcessExpr>,
 	},
 
-	/// Sequential composition: P ; Q
-	/// When P terminates, start Q
+	/// Sequential composition, `P ; Q`. When `P` terminates, `Q` starts.
 	Sequential { first: Box<ProcessExpr>, second: Box<ProcessExpr> },
 
-	/// Hiding: P \ A
-	/// Make events in A hidden (internal τ-transitions)
+	/// Hiding, `P \ A`. The events of `A` become hidden, so their transitions
+	/// are internal τ transitions.
 	Hiding { process: Box<ProcessExpr>, hidden_events: HashSet<Event> },
 
-	/// Renaming: P [[ old <- new ]]
-	/// Rename events according to mapping
+	/// Renaming, `P [[ old <- new ]]`. Each old event of `mapping` becomes its
+	/// new event.
 	Renaming { process: Box<ProcessExpr>, mapping: HashMap<Event, Event> },
 
-	/// External choice: P [] Q
-	/// Environment determines which process (first event decides)
+	/// External choice, `P [] Q`. The environment chooses the process with the
+	/// first observable event.
 	ExternalChoice { left: Box<ProcessExpr>, right: Box<ProcessExpr> },
 
-	/// Internal choice: P |~| Q
-	/// Process non-deterministically chooses
+	/// Internal choice, `P |~| Q`. The process chooses an operand
+	/// nondeterministically.
 	InternalChoice { left: Box<ProcessExpr>, right: Box<ProcessExpr> },
 }
 
 impl ProcessExpr {
-	/// Create an atomic process expression
+	/// Returns the atomic expression of `process` under `name`.
 	pub fn atomic(name: &'static str, process: Process) -> Self {
 		Self::Atomic { name, process: Box::new(process) }
 	}
 
-	/// Get the name of this expression (for debugging/error messages)
+	/// Returns the name of the expression in CSP notation, for debug output
+	/// and error messages.
 	pub fn name(&self) -> String {
 		match self {
 			Self::Atomic { name, .. } => name.to_string(),
@@ -238,10 +252,10 @@ impl ProcessExpr {
 		}
 	}
 
-	/// Evaluate this expression to a concrete Process
+	/// Evaluates the expression into a concrete [`Process`].
 	///
-	/// This recursively evaluates the expression tree and applies
-	/// the appropriate composition operators.
+	/// The evaluation recurses through the expression tree, and each node
+	/// applies its composition operator to the processes of its operands.
 	pub fn evaluate(&self) -> Result<Process, CompositionError> {
 		match self {
 			Self::Atomic { process, .. } => Ok((**process).clone()),
@@ -278,7 +292,7 @@ impl ProcessExpr {
 
 			Self::Hiding { process, hidden_events } => {
 				let p = process.evaluate()?;
-				p.hide(hidden_events.clone())
+				Ok(p.hide(hidden_events.clone()))
 			}
 
 			Self::Renaming { process, mapping } => {

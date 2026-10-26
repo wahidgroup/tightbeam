@@ -114,7 +114,16 @@ echo "[14/18] Test: Sync server stack (std + tcp + HPKE, no tokio)"
 cargo test --manifest-path "$ROOT/consumers/sync/Cargo.toml" \
 	--target-dir "$ROOT/target/probe-sync"
 
-echo "[15/18] Test: Crate defaults plus the dev feature set"
+# The dev feature set leaves `rayon` off, so this step runs the suite on the
+# sequential FDR walk and step 16 runs it on the parallel one. A dev feature
+# that turns `rayon` on fails the step before the run.
+echo "[15/18] Test: Crate defaults plus the dev feature set, without rayon"
+# A tree with no `rayon` in it exits non-zero, which reads as the empty tree.
+RAYON_TREE="$(cargo tree --package tightbeam-rs --edges features --invert rayon 2>/dev/null || true)"
+if grep -q 'feature "rayon"' <<<"$RAYON_TREE"; then
+	echo "  FAIL: the dev feature set turns on rayon, so no step runs the suite without it." >&2
+	exit 1
+fi
 cargo test --package tightbeam-rs
 
 echo "[16/18] Test: Workspace all features"

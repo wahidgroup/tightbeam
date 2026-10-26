@@ -4,11 +4,55 @@
 //! `narrow` enables `testing` alone, and `wide` adds `testing-csp`,
 //! `testing-fdr`, `testing-timing`, and `instrument`. A
 //! `#[cfg(feature = ...)]` on [`SpecViolation::CspProcessViolation`] or
-//! [`EventOrderViolationDetail`] stops `narrow` from building, and so does a
+//! [`EventOrderViolationDetail`] breaks the `narrow` build, and so does a
 //! `#[cfg]` on `ScenarioVerdict::exploration`, which the observer reads.
 
 use tightbeam::testing::specs::{EventOrderViolationDetail, SpecViolation};
 use tightbeam::testing::TestHooks;
+
+/// Under `narrow`, a `tb_assert_spec!` block whose feature is off fails to
+/// compile, so a spec keeps every check it states.
+///
+/// The `schedulability:` block needs `testing-timing`:
+///
+/// ```compile_fail
+/// const RAN: tightbeam::urn::Urn<'static> = tightbeam::urn!("test", "event:consumer-expansion/scenario-ran");
+///
+/// tightbeam::tb_assert_spec! {
+///     pub ScheduleBlockSpec,
+///     V(1,0,0): {
+///         mode: Accept,
+///         assertions: [
+///             (RAN, tightbeam::exactly!(1))
+///         ],
+///         schedulability: {
+///             task_set: tightbeam::testing::schedulability::TaskSet {
+///                 tasks: vec![],
+///                 scheduler: tightbeam::testing::schedulability::SchedulerType::RateMonotonic,
+///             },
+///             scheduler: RateMonotonic,
+///             must_be_schedulable: true,
+///         }
+///     }
+/// }
+/// ```
+///
+/// The `events:` list needs `instrument`:
+///
+/// ```compile_fail
+/// const RAN: tightbeam::urn::Urn<'static> = tightbeam::urn!("test", "event:consumer-expansion/scenario-ran");
+///
+/// tightbeam::tb_assert_spec! {
+///     pub OrderedSpec,
+///     V(1,0,0): {
+///         mode: Accept,
+///         assertions: [],
+///         events: [ RAN ]
+///     }
+/// }
+/// ```
+#[cfg(not(feature = "wide"))]
+pub struct RefusedSpecForms;
 
 /// Names the verification layer that produced a violation.
 ///
@@ -59,11 +103,10 @@ mod tests {
 		}
 	}
 
-	// `narrow` leaves `testing-timing` off and `wide` turns it on. Under
-	// `narrow`, this spec proves that the schedulability block expands to
-	// nothing, so it leaves no name for the consumer to resolve. The macro
-	// drops the `task_set:` expression with the block, so that expression may
-	// name a type behind `testing-timing`.
+	// `wide` turns `testing-timing` on, so the schedulability block expands
+	// to its assertion. Under `narrow` the block fails to compile, as the
+	// `compile_fail` examples of `RefusedSpecForms` show.
+	#[cfg(feature = "wide")]
 	tightbeam::tb_assert_spec! {
 		pub ScheduleBlockSpec,
 		V(1,0,0): {

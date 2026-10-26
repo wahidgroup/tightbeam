@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::testing::fdr::config::FdrConfig;
-use crate::testing::fdr::explorer::{MemoizationCache, RefinementChecker, RefinementOutcome};
+use crate::testing::fdr::explorer::{CacheKey, MemoizationCache, RefinementChecker, RefinementOutcome};
 use crate::testing::fdr::verdict::{Failure, Trace};
 use crate::testing::specs::csp::{Action, Event, Process, State};
 use crate::utils::time::{Clock, MonotonicInstant, SystemClock};
@@ -113,10 +113,10 @@ where
 	/// and divergence computations run on.
 	///
 	/// - `on_state` runs once at each pair of state and trace that the traversal reaches.
-	/// - A state takes each step that [`Action::keeps_within`] admits, so a
-	///   state whose trace holds `max_depth` events is visited and takes its
-	///   hidden steps alone. The traversal therefore covers each trace of at
-	///   most `max_depth` events.
+	/// - A state takes each step that [`Action::keeps_within`] admits, so the
+	///   traversal visits a state whose trace holds `max_depth` events, and
+	///   that state takes its hidden steps alone. The traversal therefore
+	///   covers each trace of at most `max_depth` events.
 	/// - The returned `bool` is `true` when the traversal ran to exhaustion,
 	///   and `false` when the queue limit, the visited limit, or the timeout
 	///   cut it.
@@ -195,7 +195,7 @@ where
 	///
 	/// The shared visited set is the only bound on τ exploration. A timeout or
 	/// a resource limit yields `Inconclusive` instead of `Absent`, because a
-	/// bounded search that ran out of budget is not a counterexample.
+	/// bounded search that runs out of budget is not a counterexample.
 	fn trace_exists_in_spec(
 		spec: &Process,
 		target_trace: &Trace,
@@ -263,13 +263,11 @@ where
 		let (impl_traces, impl_complete) = self.compute_traces(impl_process, self.config.max_depth);
 
 		// The check projects each trace onto the observable alphabet of the
-		// spec, because an implementation recorded from a running system also
-		// carries the steps that the spec models internally. See
-		// `Process::project`.
+		// spec before the comparison, as `Process::project` explains.
 		let projected: HashSet<Trace> = impl_traces.iter().map(|trace| spec.project(trace)).collect();
 
-		// Sorted iteration keeps the reported witness deterministic
-		// regardless of HashSet ordering.
+		// Sorted iteration keeps the reported witness deterministic, whatever
+		// the order of the HashSet.
 		let mut ordered: Vec<&Trace> = projected.iter().collect();
 		ordered.sort_unstable();
 
@@ -358,8 +356,8 @@ where
 	}
 
 	fn compute_traces(&mut self, process: &Process, max_depth: usize) -> (HashSet<Trace>, bool) {
-		let structure = process.structure_digest();
-		if let Some((cached, complete)) = self.cache.borrow().get_cached_traces(structure) {
+		let key = CacheKey::new(process, max_depth);
+		if let Some((cached, complete)) = self.cache.borrow().get_cached_traces(&key) {
 			return (cached.into_iter().collect(), complete);
 		}
 
@@ -415,14 +413,14 @@ where
 		}
 
 		let traces_vec: Vec<Trace> = traces.iter().cloned().collect();
-		self.cache.borrow_mut().cache_traces(structure, traces_vec, complete);
+		self.cache.borrow_mut().cache_traces(key, traces_vec, complete);
 
 		(traces, complete)
 	}
 
 	fn compute_failures(&mut self, process: &Process, max_depth: usize) -> (Vec<Failure>, bool) {
-		let structure = process.structure_digest();
-		if let Some((cached, complete)) = self.cache.borrow().get_cached_failures(structure) {
+		let key = CacheKey::new(process, max_depth);
+		if let Some((cached, complete)) = self.cache.borrow().get_cached_failures(&key) {
 			return (cached, complete);
 		}
 
@@ -438,7 +436,7 @@ where
 			}
 		});
 
-		self.cache.borrow_mut().cache_failures(structure, failures.clone(), complete);
+		self.cache.borrow_mut().cache_failures(key, failures.clone(), complete);
 
 		(failures, complete)
 	}
@@ -451,8 +449,8 @@ where
 	/// `true` when the set covers each trace of at most `max_depth` events, and
 	/// `false` when a timeout or a resource limit cut the search short.
 	fn compute_divergences(&mut self, process: &Process, max_depth: usize) -> (HashSet<Trace>, bool) {
-		let structure = process.structure_digest();
-		if let Some((cached, complete)) = self.cache.borrow().get_cached_divergences(structure) {
+		let key = CacheKey::new(process, max_depth);
+		if let Some((cached, complete)) = self.cache.borrow().get_cached_divergences(&key) {
 			return (cached.into_iter().collect(), complete);
 		}
 
@@ -465,7 +463,7 @@ where
 		});
 
 		let divergences_vec: Vec<Trace> = divergences.iter().cloned().collect();
-		self.cache.borrow_mut().cache_divergences(structure, divergences_vec, complete);
+		self.cache.borrow_mut().cache_divergences(key, divergences_vec, complete);
 
 		(divergences, complete)
 	}
@@ -482,7 +480,7 @@ mod tests {
 	use crate::testing::fdr::{DefaultCache, FdrConfig, RefinementChecker, RefinementOutcome};
 	use crate::testing::specs::csp::{Event, Process, ProcessBuildError, State};
 
-	/// A process that can stop at `Idle`, where it still offers `a`, and at
+	/// A process that can stop at `Idle`, which also offers `a`, and at
 	/// `Done`, which `a` leads to.
 	fn accepting() -> Result<Process, ProcessBuildError> {
 		Process::builder("Accepting")
@@ -491,6 +489,18 @@ mod tests {
 			.add_observable(Event("b"))
 			.add_transition(State("Idle"), Event("a"), State("Done"))
 			.add_terminal(State("Idle"))
+			.add_terminal(State("Done"))
+			.build()
+	}
+
+	/// The process of [`accepting`] with `Done` its one accepting state, so
+	/// `Idle` refuses `b` alone.
+	fn idling() -> Result<Process, ProcessBuildError> {
+		Process::builder("Idling")
+			.initial_state(State("Idle"))
+			.add_observable(Event("a"))
+			.add_observable(Event("b"))
+			.add_transition(State("Idle"), Event("a"), State("Done"))
 			.add_terminal(State("Done"))
 			.build()
 	}
@@ -829,6 +839,54 @@ mod tests {
 
 		let outcome = checker.check_trace_refinement(&process, &process);
 		assert_eq!(outcome, RefinementOutcome::Holds { complete: true });
+		Ok(())
+	}
+
+	#[test]
+	fn failures_refinement_refutes_a_refusal_that_the_spec_lacks() -> Result<(), ProcessBuildError> {
+		let spec = idling()?;
+		let subject = accepting()?;
+		let mut checker = checker_of(&subject);
+
+		let outcome = checker.check_failures_refinement(&spec, &subject);
+		let refused_at_idle = (vec![], HashSet::from([Event("a"), Event("b")]));
+		assert_eq!(outcome, RefinementOutcome::Violated(refused_at_idle));
+		Ok(())
+	}
+
+	#[test]
+	fn failures_refinement_holds_for_a_refusal_that_the_spec_allows() -> Result<(), ProcessBuildError> {
+		let spec = accepting()?;
+		let subject = idling()?;
+		let mut checker = checker_of(&subject);
+
+		let outcome = checker.check_failures_refinement(&spec, &subject);
+		assert_eq!(outcome, RefinementOutcome::Holds { complete: true });
+		Ok(())
+	}
+
+	#[test]
+	fn a_set_cached_at_one_depth_answers_no_search_at_another() -> Result<(), ProcessBuildError> {
+		let process = spinning_after_a_b()?;
+		let mut checker = checker_of(&process);
+		let (_within_one, _complete) = checker.compute_divergences(&process, 1);
+
+		let (within_eight, _complete) = checker.compute_divergences(&process, 8);
+		let after_a_b = HashSet::from([vec![Event("a"), Event("b")]]);
+		assert_eq!(within_eight, after_a_b, "`S2` lies two events deep, within a bound of eight");
+		Ok(())
+	}
+
+	#[test]
+	fn a_cache_serves_each_process_its_own_set() -> Result<(), ProcessBuildError> {
+		let first = once(Event("a"))?;
+		let second = once(Event("b"))?;
+		let mut checker = checker_of(&first);
+		let (_first_traces, _complete) = checker.compute_traces(&first, 8);
+
+		let (traces, _complete) = checker.compute_traces(&second, 8);
+		let empty_and_b = HashSet::from([vec![], vec![Event("b")]]);
+		assert_eq!(traces, empty_and_b, "the two processes share a name alone");
 		Ok(())
 	}
 }

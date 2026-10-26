@@ -12,6 +12,8 @@ use crate::cms::signed_data::SignerIdentifier;
 use crate::colony::cluster::{ClusterError, ColonyConfig, ColonyDialProtocol, DialTarget};
 use crate::crypto::x509::utils::CertificateExt;
 use crate::crypto::x509::Certificate;
+use crate::instrumentation::events::CLUSTER_DIAL_REFUSED;
+use crate::trace::TraceCollector;
 use crate::transport::client::ConnectionPool;
 use crate::transport::{PooledClient, Protocol};
 
@@ -71,11 +73,6 @@ impl<'a, P> BoundDial<'a, P> {
 		Self { target, expected }
 	}
 
-	/// The endpoint this dial reaches.
-	pub(crate) fn target(&self) -> &DialTarget {
-		&self.target
-	}
-
 	/// Connects to the target on `pool` and returns the client once the party
 	/// that answered proved to be the one this dial expects.
 	///
@@ -86,6 +83,7 @@ impl<'a, P> BoundDial<'a, P> {
 	/// 3. Refuse an answer with no certificate, or one the expected signer does not name.
 	/// 4. Take a refused answer's connection out of the pool, so a later dial
 	///    of the address meets the party that answers it then.
+	/// 5. Record the refusal on `trace` as [`CLUSTER_DIAL_REFUSED`], with the dialed address as its payload.
 	///
 	/// # Errors
 	///
@@ -94,7 +92,12 @@ impl<'a, P> BoundDial<'a, P> {
 	/// - [`ClusterError::PeerMismatch`] -- the answer presented another party's certificate, or none.
 	/// - [`ClusterError::Transport`] -- the runtime fault model injects a fault
 	///   at the eviction of the refused connection.
-	pub(crate) async fn connect(self, pool: &Arc<ConnectionPool<P>>) -> Result<PooledClient<P>, ClusterError>
+	/// - [`ClusterError::Frame`] -- the runtime fault model injects a fault at the refusal event.
+	pub(crate) async fn connect(
+		self,
+		pool: &Arc<ConnectionPool<P>>,
+		trace: &TraceCollector,
+	) -> Result<PooledClient<P>, ClusterError>
 	where
 		P: ColonyDialProtocol,
 	{
@@ -108,6 +111,8 @@ impl<'a, P> BoundDial<'a, P> {
 		let admitted = answer.is_some_and(|answer| self.expected.admits(answer));
 		if !admitted {
 			client.discard()?;
+			let refused = self.target.as_bytes();
+			trace.emit_event_with_value_and_evidence(CLUSTER_DIAL_REFUSED, "PeerMismatch", (), Some(refused))?;
 			return Err(ClusterError::PeerMismatch);
 		}
 

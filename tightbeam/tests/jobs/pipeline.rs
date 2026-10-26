@@ -1,26 +1,23 @@
-//! Integration tests for job pipeline orchestration with tb_scenario!
+//! The integration tests of job pipeline orchestration under `tb_scenario!`.
 //!
-//! Tests demonstrate:
-//! - Auto-emitted URN trace events from PipelineBuilder
-//! - CSP process specification for state machine validation
-//! - L1 assertion specs for event cardinality
+//! The tests show:
+//! - the URN trace events that `PipelineBuilder` emits on its own,
+//! - a CSP process spec that checks the state machine, and
+//! - L1 assertion specs that count the events.
 
 #![cfg(all(feature = "testing", feature = "std"))]
 
 use tightbeam::der::Sequence;
-use tightbeam::urn::Urn;
 use tightbeam::utils::task::Pipeline;
-use tightbeam::{compose, exactly, job, tb_assert_spec, tb_scenario, testing::SetupEnv};
+use tightbeam::{compose, job};
 use tightbeam::{Beamable, Frame, TightBeamError};
 
 #[cfg(feature = "testing-csp")]
-use tightbeam::tb_process_spec;
-#[cfg(feature = "testing-csp")]
 use tightbeam::testing::ScenarioConfig;
-
-pub(crate) const FALLBACK_TRIGGERED: Urn<'static> = tightbeam::urn!("test", "event:pipeline/fallback-triggered");
-pub(crate) const PIPELINE_COMPLETE: Urn<'static> = tightbeam::urn!("test", "event:pipeline/pipeline-complete");
-pub(crate) const PIPELINE_START: Urn<'static> = tightbeam::urn!("test", "event:pipeline/pipeline-start");
+#[cfg(feature = "testing-csp")]
+use tightbeam::urn::Urn;
+#[cfg(feature = "testing-csp")]
+use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario};
 
 #[cfg(feature = "testing-csp")]
 pub(crate) const CREATE_TEST_FRAME_START: Urn<'static> =
@@ -40,16 +37,15 @@ pub(crate) const VALIDATE_FRAME_START: Urn<'static> = tightbeam::urn!("tightbeam
 pub(crate) const VALIDATE_FRAME_SUCCESS: Urn<'static> =
 	tightbeam::urn!("tightbeam", "event:job/validate-frame-success");
 
-// Test message types
 #[derive(Beamable, Clone, Debug, PartialEq, Sequence)]
 struct TestMessage {
 	content: String,
 }
 
-// Test jobs using tuple-destructured parameters (implements Job trait)
-// Note: Job trait Input type must be owned (no borrowed types)
+// The `job!` items implement `Job` over tuple-destructured parameters. A `Job`
+// input must be an owned type, with no borrow.
 job! {
-	/// Creates a test frame with given content.
+	/// Creates a test frame with the given content.
 	name: CreateTestFrame,
 	fn run((id, content): (String, String)) -> Result<Frame, TightBeamError> {
 		compose! {
@@ -60,7 +56,7 @@ job! {
 }
 
 job! {
-	/// Validates a frame (passthrough for testing).
+	/// Passes the frame through unchanged, as the validation step of the tests.
 	name: ValidateFrame,
 	fn run((frame,): (Frame,)) -> Result<Frame, TightBeamError> {
 		Ok(frame)
@@ -68,7 +64,7 @@ job! {
 }
 
 job! {
-	/// Transforms frame content by appending "_transformed".
+	/// Appends "_transformed" to the content of the frame.
 	name: TransformContent,
 	fn run((frame,): (Frame,)) -> Result<Frame, TightBeamError> {
 		let msg: TestMessage = tightbeam::decode(frame.message())?;
@@ -82,43 +78,25 @@ job! {
 	}
 }
 
-// ============================================================================
-// L1: Assertion Specification - Manual Events
-// ============================================================================
+// Direct result pipeline test
 
-tb_assert_spec! {
-	pub ManualEventSpec,
-	V(1,0,0): {
-		mode: Accept,
-		assertions: [
-			(PIPELINE_START, exactly!(1)),
-			(PIPELINE_COMPLETE, exactly!(1))
-		]
-	}
+/// A pipeline over plain results runs its three jobs in order, so the last
+/// job transforms the frame that the first job created.
+#[test]
+fn test_pipeline_direct_results() -> Result<(), TightBeamError> {
+	// A pipeline of plain results runs outside `PipelineBuilder`, so it records
+	// no trace.
+	let frame = CreateTestFrame::run(("test-001".to_string(), "content".to_string()))
+		.and_then(|f| ValidateFrame::run((f,)))
+		.and_then(|f| TransformContent::run((f,)))
+		.run()?;
+
+	let message: TestMessage = tightbeam::decode(frame.message())?;
+	assert_eq!(message.content, "content_transformed", "the three jobs ran out of order");
+	Ok(())
 }
 
-tb_scenario! {
-	name: test_pipeline_manual_events,
-	spec: ManualEventSpec,
-	environment Bare {
-		exec: |SetupEnv { trace, .. }| {
-			trace.event(PIPELINE_START)?;
-
-			// Direct Result pipeline (no PipelineBuilder = no auto-trace)
-			let _frame = CreateTestFrame::run(("test-001".to_string(), "content".to_string()))
-				.and_then(|f| ValidateFrame::run((f,)))
-				.and_then(|f| TransformContent::run((f,)))
-				.run()?;
-
-			trace.event(PIPELINE_COMPLETE)?;
-			Ok(())
-		}
-	}
-}
-
-// ============================================================================
-// L1: Assertion Specification - Auto URN Events from PipelineBuilder
-// ============================================================================
+// L1: the assertion spec of the URN events that `PipelineBuilder` emits
 
 #[cfg(feature = "testing-csp")]
 tb_assert_spec! {
@@ -126,7 +104,8 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			// Auto-emitted job URNs from PipelineBuilder (urn:tightbeam:event:job/...)
+			// `PipelineBuilder` emits the job URNs on its own
+			// (`urn:tightbeam:event:job/...`).
 			(CREATE_TEST_FRAME_START, exactly!(1)),
 			(CREATE_TEST_FRAME_SUCCESS, exactly!(1)),
 			(VALIDATE_FRAME_START, exactly!(1)),
@@ -137,9 +116,7 @@ tb_assert_spec! {
 	}
 }
 
-// ============================================================================
-// L2: CSP Process Specification - Valid State Transitions
-// ============================================================================
+// L2: the CSP process spec of the valid state transitions
 
 #[cfg(feature = "testing-csp")]
 tb_process_spec! {
@@ -187,38 +164,23 @@ tb_scenario! {
 	}
 }
 
-// ============================================================================
-// Fallback Pipeline Test
-// ============================================================================
+// Fallback pipeline test
 
-tb_assert_spec! {
-	pub FallbackSpec,
-	V(1,0,0): {
-		mode: Accept,
-		assertions: [
-			(FALLBACK_TRIGGERED, exactly!(1))
-		]
-	}
-}
+/// A failed result runs its fallback, which builds the frame in its place.
+#[test]
+fn test_pipeline_with_fallback() -> Result<(), TightBeamError> {
+	let failing: Result<Frame, TightBeamError> = Err(TightBeamError::InvalidOrder);
+	let frame = failing
+		.or_else(|_| {
+			compose! {
+				V0: id: b"fallback",
+					message: TestMessage {
+						content: "fallback_content".to_string()
+					}
+			}
+		})
+		.run()?;
 
-tb_scenario! {
-	name: test_pipeline_with_fallback,
-	spec: FallbackSpec,
-	environment Bare {
-		exec: |SetupEnv { trace, .. }| {
-			// Pipeline with fallback on error
-			let failing: Result<Frame, TightBeamError> = Err(TightBeamError::InvalidOrder);
-			let _frame = failing.or_else(|_| {
-				trace.event(FALLBACK_TRIGGERED)?;
-				compose! {
-					V0: id: b"fallback",
-						message: TestMessage {
-							content: "fallback_content".to_string()
-						}
-				}
-			}).run()?;
-
-			Ok(())
-		}
-	}
+	assert_eq!(frame.metadata().id(), b"fallback", "the fallback did not build the frame");
+	Ok(())
 }

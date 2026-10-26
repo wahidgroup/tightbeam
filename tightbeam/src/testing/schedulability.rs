@@ -1,43 +1,43 @@
-//! Schedulability analysis for real-time systems
+//! The schedulability analysis of real-time systems.
 //!
-//! Provides schedulability tests for real-time task sets:
-//! - Rate Monotonic Analysis (RMA)
-//! - Earliest Deadline First (EDF)
-//! - Response Time Analysis (exact test)
+//! The module provides three schedulability tests for a real-time task set:
+//! - Rate Monotonic Analysis (RMA).
+//! - Earliest Deadline First (EDF).
+//! - Response Time Analysis, the exact test.
 
 use crate::Errorizable;
 use core::time::Duration;
 
-/// Real-time task model
+/// A task of the real-time task model.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Task {
-	/// Task identifier
+	/// The identifier of the task.
 	pub id: String,
-	/// T - task period
+	/// The period `T` of the task.
 	pub period: Duration,
-	/// D - relative deadline
+	/// The relative deadline `D` of the task.
 	pub deadline: Duration,
-	/// C - worst-case execution time
+	/// The worst-case execution time `C` of the task.
 	pub wcet: Duration,
-	/// Priority (for RMA: rate monotonic priority)
+	/// The task priority, which under RMA is the rate-monotonic priority.
 	pub priority: Option<u32>,
 }
 
-/// Task set for schedulability analysis
+/// A task set for the schedulability analysis.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TaskSet {
-	/// Tasks in the set
+	/// The tasks of the set.
 	pub tasks: Vec<Task>,
-	/// Scheduler type
+	/// The scheduler that runs the set.
 	pub scheduler: SchedulerType,
 }
 
-/// Scheduler type
+/// The scheduling policy of a task set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchedulerType {
-	/// Rate Monotonic Scheduling
+	/// Rate Monotonic Scheduling.
 	RateMonotonic,
-	/// Earliest Deadline First
+	/// Earliest Deadline First.
 	EarliestDeadlineFirst,
 }
 
@@ -50,59 +50,59 @@ impl core::fmt::Display for SchedulerType {
 	}
 }
 
-/// Schedulability result
+/// The result of a schedulability test.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SchedulabilityResult {
-	/// Scheduler type used for analysis
+	/// The scheduler that the analysis assumed.
 	pub scheduler: SchedulerType,
 	/// Whether the task set is schedulable
 	pub is_schedulable: bool,
-	/// Total utilization (Σ(Ci/Ti))
+	/// The total utilization, Σ(Ci/Ti).
 	pub utilization: f64,
-	/// Utilization bound for the scheduler
+	/// The utilization bound of the scheduler.
 	pub utilization_bound: f64,
-	/// Violations (if any)
+	/// The violations that the test found, empty for a schedulable set.
 	pub violations: Vec<TaskViolationDetail>,
 }
 
-/// Per-task violation detail
+/// The detail of one violation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskViolationDetail {
-	/// Task ID (or "system" for system-level violations)
+	/// The ID of the task, or `"system"` for a violation of the whole set.
 	pub task_id: String,
-	/// Violation message
+	/// The message that describes the violation.
 	pub message: String,
 }
 
-/// Schedulability error
+/// The errors of a schedulability analysis.
 #[derive(Errorizable, Debug, Clone, PartialEq, Eq)]
 pub enum SchedulabilityError {
-	/// Missing period for an event
+	/// An event has no period.
 	#[error("Missing period for event: {0}")]
 	MissingPeriod(String),
-	/// Task set contains no tasks
+	/// The task set holds no task.
 	#[error("Task set contains no tasks")]
 	EmptyTaskSet,
-	/// Task has a zero period
+	/// A task has a zero period.
 	#[error("Task `{task}` has a zero period")]
 	ZeroPeriod { task: String },
-	/// Task deadline exceeds its period (analyses assume D <= T)
+	/// A task's deadline exceeds its period, and the analyses assume D <= T.
 	#[error("Task `{task}` deadline exceeds its period (D <= T required)")]
 	DeadlineExceedsPeriod { task: String },
-	/// Response time analysis requires a fixed-priority scheduler
+	/// The task set names a scheduler other than a fixed-priority one, which
+	/// response time analysis requires.
 	#[error("Response time analysis requires a fixed-priority scheduler, got {scheduler}")]
 	FixedPriorityRequired { scheduler: SchedulerType },
 }
 
 impl TaskSet {
-	/// Validate structural preconditions shared by every analysis.
+	/// Validates the structural preconditions that every analysis shares.
 	///
 	/// # Errors
 	///
-	/// - [`SchedulabilityError::EmptyTaskSet`] -- no tasks.
-	/// - [`SchedulabilityError::ZeroPeriod`] -- a task period of zero.
-	/// - [`SchedulabilityError::DeadlineExceedsPeriod`] -- a deadline past
-	///   its own period.
+	/// - [`SchedulabilityError::EmptyTaskSet`] -- the set holds no task.
+	/// - [`SchedulabilityError::ZeroPeriod`] -- a task has a period of zero.
+	/// - [`SchedulabilityError::DeadlineExceedsPeriod`] -- a task has a deadline past its own period.
 	fn validate(&self) -> Result<(), SchedulabilityError> {
 		if self.tasks.is_empty() {
 			return Err(SchedulabilityError::EmptyTaskSet);
@@ -120,14 +120,14 @@ impl TaskSet {
 		Ok(())
 	}
 
-	/// Total utilization Σ(Ci/Ti).
+	/// The total utilization Σ(Ci/Ti).
 	///
-	/// Reads periods directly, so [`Self::validate`] runs first.
+	/// The sum reads the periods directly, so [`Self::validate`] runs first.
 	fn utilization(&self) -> f64 {
 		self.tasks.iter().map(|t| t.wcet.as_secs_f64() / t.period.as_secs_f64()).sum()
 	}
 
-	/// Tasks sorted rate-monotonically: a shorter period is a higher
+	/// The tasks in rate-monotonic order, where a shorter period is a higher
 	/// priority.
 	fn by_rate(&self) -> Vec<Task> {
 		let mut tasks = self.tasks.clone();
@@ -138,17 +138,17 @@ impl TaskSet {
 	/// Rate Monotonic Analysis (RMA) schedulability test.
 	///
 	/// The Liu & Layland utilization bound Σ(Ci/Ti) ≤ n(2^(1/n) - 1) is
-	/// *sufficient only* and assumes implicit deadlines (D = T): task sets
-	/// below the bound are schedulable, but sets above it *may* still be
-	/// schedulable. Where the bound is inconclusive (utilization above it,
-	/// or constrained deadlines D < T),
-	/// [`Self::response_time_analysis`] arbitrates.
+	/// *sufficient only* and assumes implicit deadlines (D = T):
+	/// - A task set below the bound is schedulable.
+	/// - A task set above the bound *may* be schedulable too.
+	/// - Where the bound is inconclusive, for a utilization above it or a
+	///   constrained deadline D < T, [`Self::response_time_analysis`] decides.
 	///
 	/// # Errors
 	///
-	/// - [`SchedulabilityError::EmptyTaskSet`], [`SchedulabilityError::ZeroPeriod`],
-	///   or [`SchedulabilityError::DeadlineExceedsPeriod`] -- the task set
-	///   fails structural validation.
+	/// - [`SchedulabilityError::EmptyTaskSet`] -- the set holds no task.
+	/// - [`SchedulabilityError::ZeroPeriod`] -- a task has a period of zero.
+	/// - [`SchedulabilityError::DeadlineExceedsPeriod`] -- a task has a deadline past its own period.
 	pub fn is_rm_schedulable(&self) -> Result<SchedulabilityResult, SchedulabilityError> {
 		self.validate()?;
 
@@ -179,7 +179,7 @@ impl TaskSet {
 		Ok(SchedulabilityResult { scheduler, is_schedulable, utilization, utilization_bound, violations })
 	}
 
-	/// Run RTA and collect per-task deadline misses and non-convergence
+	/// Runs RTA and collects each task's deadline miss or non-convergence.
 	fn rta_violations(&self) -> Result<Vec<TaskViolationDetail>, SchedulabilityError> {
 		let tasks = self.by_rate();
 		let response_times = self.response_time_analysis()?;
@@ -204,15 +204,15 @@ impl TaskSet {
 
 	/// Earliest Deadline First (EDF) schedulability test.
 	///
-	/// Utilization bound: Σ(Ci/Ti) ≤ 1. This test is exact (necessary and
-	/// sufficient) for implicit deadlines (D = T). For constrained
-	/// deadlines (D < T) it is necessary only.
+	/// The utilization bound is Σ(Ci/Ti) ≤ 1. This test is exact (necessary and
+	/// sufficient) for implicit deadlines (D = T). For constrained deadlines
+	/// (D < T), it is necessary only.
 	///
 	/// # Errors
 	///
-	/// - [`SchedulabilityError::EmptyTaskSet`], [`SchedulabilityError::ZeroPeriod`],
-	///   or [`SchedulabilityError::DeadlineExceedsPeriod`] -- the task set
-	///   fails structural validation.
+	/// - [`SchedulabilityError::EmptyTaskSet`] -- the set holds no task.
+	/// - [`SchedulabilityError::ZeroPeriod`] -- a task has a period of zero.
+	/// - [`SchedulabilityError::DeadlineExceedsPeriod`] -- a task has a deadline past its own period.
 	pub fn is_edf_schedulable(&self) -> Result<SchedulabilityResult, SchedulabilityError> {
 		self.validate()?;
 
@@ -232,28 +232,26 @@ impl TaskSet {
 		Ok(SchedulabilityResult { scheduler, is_schedulable, utilization, utilization_bound, violations })
 	}
 
-	/// Response Time Analysis (exact fixed-priority schedulability test, D ≤ T)
+	/// Response Time Analysis, the exact fixed-priority test for D ≤ T.
 	///
-	/// Iterative calculation: R_i = C_i + Σ_{j∈hp(i)} ⌈R_i / T_j⌉ * C_j
-	/// where hp(i) = tasks with higher priority than task i.
+	/// The analysis iterates R_i = C_i + Σ_{j∈hp(i)} ⌈R_i / T_j⌉ * C_j, where
+	/// hp(i) is the set of tasks with a higher priority than task i.
 	///
-	/// The recurrence only models fixed-priority scheduling, so dynamic-priority
-	/// schedulers (EDF) are rejected with
-	/// [`SchedulabilityError::FixedPriorityRequired`].
+	/// The result holds one response time per task, in rate-monotonic priority
+	/// order (shortest period first):
 	///
-	/// Returns per-task response times in rate-monotonic priority order
-	/// (shortest period first). `Some(r)` is the converged response time, or a
-	/// lower bound that already exceeds the task deadline (definitive miss).
-	/// `None` marks a recurrence that did not converge within the iteration
-	/// budget (inconclusive).
+	/// - `Some(r)` is the converged response time, or a lower bound that
+	///   already exceeds the task deadline, which is a definitive miss.
+	/// - `None` marks a recurrence that did not converge within the iteration budget, which is inconclusive.
 	///
 	/// # Errors
 	///
-	/// - [`SchedulabilityError::FixedPriorityRequired`] -- the task set
-	///   names a dynamic-priority scheduler.
-	/// - [`SchedulabilityError::EmptyTaskSet`], [`SchedulabilityError::ZeroPeriod`],
-	///   or [`SchedulabilityError::DeadlineExceedsPeriod`] -- the task set
-	///   fails structural validation.
+	/// - [`SchedulabilityError::FixedPriorityRequired`] -- the task set names a
+	///   dynamic-priority scheduler (EDF), because the recurrence models
+	///   fixed-priority scheduling alone.
+	/// - [`SchedulabilityError::EmptyTaskSet`] -- the set holds no task.
+	/// - [`SchedulabilityError::ZeroPeriod`] -- a task has a period of zero.
+	/// - [`SchedulabilityError::DeadlineExceedsPeriod`] -- a task has a deadline past its own period.
 	pub fn response_time_analysis(&self) -> Result<Vec<Option<Duration>>, SchedulabilityError> {
 		if self.scheduler != SchedulerType::RateMonotonic {
 			return Err(SchedulabilityError::FixedPriorityRequired { scheduler: self.scheduler });
@@ -272,7 +270,7 @@ impl TaskSet {
 }
 
 impl Task {
-	/// Solve the RTA recurrence for this task against its higher-priority set.
+	/// Solves the RTA recurrence for this task against its higher-priority set.
 	fn response_time(&self, higher_priority: impl AsRef<[Task]>) -> Option<Duration> {
 		let higher_priority = higher_priority.as_ref();
 		const MAX_ITERATIONS: u32 = 1000;
@@ -296,8 +294,8 @@ impl Task {
 
 			let mut interference = Duration::ZERO;
 			for hp in higher_priority {
-				// Periods are validated non-zero; div_ceil in u128 nanoseconds
-				// keeps the preemption count exact.
+				// The validation refuses a zero period, and `div_ceil` in u128
+				// nanoseconds keeps the preemption count exact.
 				let preemptions = r.as_nanos().div_ceil(hp.period.as_nanos());
 				let preemptions = u32::try_from(preemptions).unwrap_or(u32::MAX);
 				interference = interference.saturating_add(hp.wcet.saturating_mul(preemptions));
@@ -314,24 +312,15 @@ impl Task {
 mod tests {
 	use super::*;
 
-	/// Test case for schedulability tests (RMA/EDF)
+	/// One case of the RMA and EDF schedulability tables.
 	struct SchedulabilityTestCase {
-		/// Task data: (id, period_ms, deadline_ms, wcet_ms, priority)
+		/// The task rows, each (id, period_ms, deadline_ms, wcet_ms, priority).
 		tasks: &'static [(&'static str, u64, u64, u64, Option<u32>)],
-		scheduler: SchedulerType,
 		expected_schedulable: bool,
-		expected_utilization: Option<f64>,
+		expected_utilization: f64,
 	}
 
-	/// Test case for response time analysis
-	struct ResponseTimeTestCase {
-		/// Task data: (id, period_ms, deadline_ms, wcet_ms, priority)
-		tasks: &'static [(&'static str, u64, u64, u64, Option<u32>)],
-		scheduler: SchedulerType,
-		expected_response_times: &'static [u64], // in milliseconds
-	}
-
-	/// Helper to create TaskSet from task data
+	/// Creates a [`TaskSet`] from the task rows.
 	fn create_task_set_from_data(
 		tasks_data: &[(&'static str, u64, u64, u64, Option<u32>)],
 		scheduler: SchedulerType,
@@ -350,154 +339,106 @@ mod tests {
 		TaskSet { tasks, scheduler }
 	}
 
-	/// Run RMA schedulability test case
-	fn run_rm_test_case(case: &SchedulabilityTestCase) -> Result<(), SchedulabilityError> {
-		let task_set = create_task_set_from_data(case.tasks, case.scheduler);
-		let result = task_set.is_rm_schedulable()?;
-		assert_eq!(result.is_schedulable, case.expected_schedulable);
-		if let Some(expected_util) = case.expected_utilization {
-			assert!((result.utilization - expected_util).abs() < 0.01);
+	// Each task set gets the rate-monotonic verdict and the utilization of its
+	// row.
+	crate::tb_cases! {
+		fn rm_schedulability(case: SchedulabilityTestCase) -> Result<(), SchedulabilityError> {
+			let task_set = create_task_set_from_data(case.tasks, SchedulerType::RateMonotonic);
+
+			let result = task_set.is_rm_schedulable()?;
+
+			assert_eq!(result.is_schedulable, case.expected_schedulable);
+			assert!((result.utilization - case.expected_utilization).abs() < 0.01);
+			Ok(())
 		}
 
-		Ok(())
-	}
-
-	/// Run EDF schedulability test case
-	fn run_edf_test_case(case: &SchedulabilityTestCase) -> Result<(), SchedulabilityError> {
-		let task_set = create_task_set_from_data(case.tasks, case.scheduler);
-		let result = task_set.is_edf_schedulable()?;
-		assert_eq!(result.is_schedulable, case.expected_schedulable);
-		if let Some(expected_util) = case.expected_utilization {
-			assert!((result.utilization - expected_util).abs() < 0.01);
-		}
-
-		Ok(())
-	}
-
-	/// Run response time analysis test case
-	fn run_rta_test_case(case: &ResponseTimeTestCase) -> Result<(), SchedulabilityError> {
-		let task_set = create_task_set_from_data(case.tasks, case.scheduler);
-		let response_times = task_set.response_time_analysis()?;
-		assert_eq!(response_times.len(), case.expected_response_times.len());
-		for (actual, expected_ms) in response_times.iter().zip(case.expected_response_times.iter()) {
-			assert_eq!(*actual, Some(Duration::from_millis(*expected_ms)));
-		}
-
-		Ok(())
-	}
-
-	const RMA_TEST_CASES: &[SchedulabilityTestCase] = &[
-		SchedulabilityTestCase {
+		cases {
 			// Utilization: 3/10 + 5/20 = 0.3 + 0.25 = 0.55
 			// Bound for n=2: 2*(2^(1/2) - 1) ≈ 0.828
-			// 0.55 < 0.828, so schedulable via the L&L bound
-			tasks: &[("T1", 10, 10, 3, Some(1)), ("T2", 20, 20, 5, Some(2))],
-			scheduler: SchedulerType::RateMonotonic,
-			expected_schedulable: true,
-			expected_utilization: Some(0.55),
-		},
-		SchedulabilityTestCase {
+			// 0.55 < 0.828, so the L&L bound proves the set schedulable.
+			under_the_utilization_bound => SchedulabilityTestCase {
+				tasks: &[("T1", 10, 10, 3, Some(1)), ("T2", 20, 20, 5, Some(2))],
+				expected_schedulable: true,
+				expected_utilization: 0.55,
+			},
 			// Utilization: 8/10 + 5/20 = 0.8 + 0.25 = 1.05 > bound ≈ 0.828
-			// RTA arbitrates: R1 = 8 <= 10, but R2 diverges past its
-			// 20ms deadline (5 + ⌈13/10⌉*8 = 21), so not schedulable
-			tasks: &[("T1", 10, 10, 8, Some(1)), ("T2", 20, 20, 5, Some(2))],
-			scheduler: SchedulerType::RateMonotonic,
-			expected_schedulable: false,
-			expected_utilization: Some(1.05),
-		},
-		SchedulabilityTestCase {
+			// RTA decides: R1 = 8 <= 10, but R2 passes its 20ms deadline
+			// (5 + ⌈13/10⌉*8 = 21), so the set is not schedulable.
+			past_a_deadline => SchedulabilityTestCase {
+				tasks: &[("T1", 10, 10, 8, Some(1)), ("T2", 20, 20, 5, Some(2))],
+				expected_schedulable: false,
+				expected_utilization: 1.05,
+			},
 			// Utilization: 1/2 + 1/4 + 2/8 = 1.0 > bound for n=3 ≈ 0.780,
 			// yet RTA proves the harmonic set schedulable:
 			// R1 = 1 <= 2, R2 = 2 <= 4, R3 = 8 <= 8
-			// (bound is sufficient-only; above it is not a verdict)
-			tasks: &[("T1", 2, 2, 1, Some(1)), ("T2", 4, 4, 1, Some(2)), ("T3", 8, 8, 2, Some(3))],
-			scheduler: SchedulerType::RateMonotonic,
-			expected_schedulable: true,
-			expected_utilization: Some(1.0),
-		},
-		SchedulabilityTestCase {
-			// Constrained deadline (D < T) bypasses the L&L bound even at
-			// low utilization; RTA: R1 = 3 <= 4, R2 = 5 + ⌈5/10⌉*3 = 8 <= 15
-			tasks: &[("T1", 10, 4, 3, Some(1)), ("T2", 20, 15, 5, Some(2))],
-			scheduler: SchedulerType::RateMonotonic,
-			expected_schedulable: true,
-			expected_utilization: Some(0.55),
-		},
-	];
+			harmonic_past_the_utilization_bound => SchedulabilityTestCase {
+				tasks: &[("T1", 2, 2, 1, Some(1)), ("T2", 4, 4, 1, Some(2)), ("T3", 8, 8, 2, Some(3))],
+				expected_schedulable: true,
+				expected_utilization: 1.0,
+			},
+			// A constrained deadline (D < T) bypasses the L&L bound even at a
+			// low utilization. RTA: R1 = 3 <= 4, R2 = 5 + ⌈5/10⌉*3 = 8 <= 15
+			constrained_deadline => SchedulabilityTestCase {
+				tasks: &[("T1", 10, 4, 3, Some(1)), ("T2", 20, 15, 5, Some(2))],
+				expected_schedulable: true,
+				expected_utilization: 0.55,
+			},
+		}
+	}
 
-	const EDF_TEST_CASES: &[SchedulabilityTestCase] = &[
-		SchedulabilityTestCase {
+	// Each task set gets the EDF verdict and the utilization of its row. The
+	// EDF bound is a utilization of 1.0.
+	crate::tb_cases! {
+		fn edf_schedulability(case: SchedulabilityTestCase) -> Result<(), SchedulabilityError> {
+			let task_set = create_task_set_from_data(case.tasks, SchedulerType::EarliestDeadlineFirst);
+			let result = task_set.is_edf_schedulable()?;
+			assert_eq!(result.is_schedulable, case.expected_schedulable);
+			assert!((result.utilization - case.expected_utilization).abs() < 0.01);
+			Ok(())
+		}
+
+		cases {
 			// Utilization: 3/10 + 5/20 = 0.3 + 0.25 = 0.55
-			// Bound: 1.0
-			// 0.55 < 1.0, so schedulable
-			tasks: &[("T1", 10, 10, 3, None), ("T2", 20, 20, 5, None)],
-			scheduler: SchedulerType::EarliestDeadlineFirst,
-			expected_schedulable: true,
-			expected_utilization: Some(0.55),
-		},
-		SchedulabilityTestCase {
+			at_55_percent_utilization => SchedulabilityTestCase {
+				tasks: &[("T1", 10, 10, 3, None), ("T2", 20, 20, 5, None)],
+				expected_schedulable: true,
+				expected_utilization: 0.55,
+			},
 			// Utilization: 6/10 + 5/20 = 0.6 + 0.25 = 0.85
-			// Bound: 1.0
-			// 0.85 < 1.0, so schedulable
-			tasks: &[("T1", 10, 10, 6, None), ("T2", 20, 20, 5, None)],
-			scheduler: SchedulerType::EarliestDeadlineFirst,
-			expected_schedulable: true,
-			expected_utilization: Some(0.85),
-		},
-		SchedulabilityTestCase {
+			at_85_percent_utilization => SchedulabilityTestCase {
+				tasks: &[("T1", 10, 10, 6, None), ("T2", 20, 20, 5, None)],
+				expected_schedulable: true,
+				expected_utilization: 0.85,
+			},
 			// Utilization: 7/10 + 5/20 = 0.7 + 0.25 = 0.95
-			// Bound: 1.0
-			// 0.95 < 1.0, so schedulable
-			tasks: &[("T1", 10, 10, 7, None), ("T2", 20, 20, 5, None)],
-			scheduler: SchedulerType::EarliestDeadlineFirst,
-			expected_schedulable: true,
-			expected_utilization: Some(0.95),
-		},
-		SchedulabilityTestCase {
-			// Utilization: 8/10 + 5/20 = 0.8 + 0.25 = 1.05
-			// Bound: 1.0
-			// 1.05 > 1.0, so not schedulable
-			tasks: &[("T1", 10, 10, 8, None), ("T2", 20, 20, 5, None)],
-			scheduler: SchedulerType::EarliestDeadlineFirst,
-			expected_schedulable: false,
-			expected_utilization: Some(1.05),
-		},
-	];
-
-	const RTA_TEST_CASES: &[ResponseTimeTestCase] = &[ResponseTimeTestCase {
-		// T1 (higher priority): R1 = C1 = 3ms
-		// T2 (lower priority): R2 = C2 + ⌈R2/T1⌉ * C1
-		// Iteration: R2 = 5 + ⌈5/10⌉ * 3 = 5 + 1 * 3 = 8
-		// R2 = 5 + ⌈8/10⌉ * 3 = 5 + 1 * 3 = 8 (converged)
-		tasks: &[("T1", 10, 10, 3, Some(1)), ("T2", 20, 20, 5, Some(2))],
-		scheduler: SchedulerType::RateMonotonic,
-		expected_response_times: &[3, 8],
-	}];
-
-	#[test]
-	fn test_rm_schedulability() -> Result<(), SchedulabilityError> {
-		for case in RMA_TEST_CASES {
-			run_rm_test_case(case)?;
+			at_95_percent_utilization => SchedulabilityTestCase {
+				tasks: &[("T1", 10, 10, 7, None), ("T2", 20, 20, 5, None)],
+				expected_schedulable: true,
+				expected_utilization: 0.95,
+			},
+			// Utilization: 8/10 + 5/20 = 0.8 + 0.25 = 1.05 > 1.0
+			past_full_utilization => SchedulabilityTestCase {
+				tasks: &[("T1", 10, 10, 8, None), ("T2", 20, 20, 5, None)],
+				expected_schedulable: false,
+				expected_utilization: 1.05,
+			},
 		}
-
-		Ok(())
 	}
 
-	#[test]
-	fn test_edf_schedulability() -> Result<(), SchedulabilityError> {
-		for case in EDF_TEST_CASES {
-			run_edf_test_case(case)?;
-		}
-
-		Ok(())
-	}
-
+	// T1 (higher priority): R1 = C1 = 3ms
+	// T2 (lower priority): R2 = C2 + ⌈R2/T1⌉ * C1
+	// Iteration: R2 = 5 + ⌈5/10⌉ * 3 = 5 + 1 * 3 = 8
+	// R2 = 5 + ⌈8/10⌉ * 3 = 5 + 1 * 3 = 8 (converged)
 	#[test]
 	fn test_response_time_analysis() -> Result<(), SchedulabilityError> {
-		for case in RTA_TEST_CASES {
-			run_rta_test_case(case)?;
-		}
+		let tasks = [("T1", 10, 10, 3, Some(1)), ("T2", 20, 20, 5, Some(2))];
+		let task_set = create_task_set_from_data(&tasks, SchedulerType::RateMonotonic);
 
+		let response_times = task_set.response_time_analysis()?;
+
+		let expected = [Some(Duration::from_millis(3)), Some(Duration::from_millis(8))];
+		assert_eq!(response_times, expected);
 		Ok(())
 	}
 

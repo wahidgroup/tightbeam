@@ -1,3 +1,4 @@
+use core::num::NonZeroUsize;
 use core::time::Duration;
 use std::sync::Arc;
 
@@ -138,8 +139,9 @@ impl ServletRegistry {
 		Ok(result)
 	}
 
-	/// Weakens every live route attributed to a peer identity and returns how
-	/// many it weakened.
+	/// Weakens every live route attributed to a peer identity, and returns
+	/// what the weakening did: how many routes it weakened, and how many of
+	/// them it drove to their abandonment limit.
 	///
 	/// A route is attributed to the peer when it is one of these:
 	///
@@ -150,42 +152,69 @@ impl ServletRegistry {
 	/// # Errors
 	///
 	/// - [`ClusterError::LockPoisoned`] -- the route lock is poisoned.
-	pub fn weaken_peer(&self, peer_id: impl AsRef<[u8]>) -> Result<usize, ClusterError> {
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::colony::cluster::{PheromoneConfig, ServletRegistry};
+	/// use tightbeam::utils::time::SystemClock;
+	///
+	/// let registry = ServletRegistry::new(PheromoneConfig::default(), Arc::new(SystemClock));
+	/// let weakened = registry.weaken_peer(b"peer-fingerprint")?;
+	///
+	/// assert_eq!(weakened.count(), 0);
+	/// # Ok::<(), tightbeam::colony::cluster::ClusterError>(())
+	/// ```
+	pub fn weaken_peer(&self, peer_id: impl AsRef<[u8]>) -> Result<Weakened, ClusterError> {
 		let peer_id = peer_id.as_ref();
 		let attributed = |entry: &ServletEntry| {
 			entry.owner_id().as_ref() == peer_id || entry.relay_id().is_some_and(|relay| relay.as_ref() == peer_id)
 		};
 
 		let routes = self.routes.read()?;
-		let weakened = routes
+		let live = routes
 			.values()
 			.filter(|entry| entry.route_kind().is_peer())
 			.filter(|entry| entry.is_live())
-			.filter(|entry| attributed(entry))
-			.map(|entry| entry.weaken())
-			.count();
+			.filter(|entry| attributed(entry));
 
-		Ok(weakened)
+		Ok(Weakened::all(live))
 	}
 
 	/// Weakens every live peer route that dials `gateway`, relay trails
-	/// included, and returns how many it weakened. Misbehavior at one gateway
-	/// therefore weakens every trail through it.
+	/// included, and returns what the weakening did. Misbehavior at one
+	/// gateway therefore weakens every trail through it.
 	///
 	/// # Errors
 	///
 	/// - [`ClusterError::LockPoisoned`] -- the route lock is poisoned.
-	pub fn weaken_peer_by_dial(&self, gateway: impl Into<PeerAddress>) -> Result<usize, ClusterError> {
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::colony::cluster::{PeerAddress, PheromoneConfig, ServletRegistry};
+	/// use tightbeam::utils::time::SystemClock;
+	///
+	/// let registry = ServletRegistry::new(PheromoneConfig::default(), Arc::new(SystemClock));
+	/// let gateway = PeerAddress::from("127.0.0.1:9000".parse::<std::net::SocketAddr>()?);
+	/// let weakened = registry.weaken_peer_by_dial(gateway)?;
+	///
+	/// assert!(weakened.abandoned().is_none());
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	pub fn weaken_peer_by_dial(&self, gateway: impl Into<PeerAddress>) -> Result<Weakened, ClusterError> {
 		let gateway: PeerAddress = gateway.into();
 		let routes = self.routes.read()?;
-		let weakened = routes
+		let live = routes
 			.values()
 			.filter(|entry| entry.is_peer_route_to(gateway))
-			.filter(|entry| entry.is_live())
-			.map(|entry| entry.weaken())
-			.count();
+			.filter(|entry| entry.is_live());
 
-		Ok(weakened)
+		Ok(Weakened::all(live))
 	}
 
 	/// Evaporates pheromone on every tracked entry at the configured rate.
@@ -217,27 +246,36 @@ impl ServletRegistry {
 	pub(in crate::colony::cluster) fn prune_stale_relay_trails(
 		&self,
 		max_age: Duration,
-	) -> Result<usize, ClusterError> {
+	) -> Result<Option<NonZeroUsize>, ClusterError> {
 		let now = self.clock.monotonic();
-		Ok(self.routes.write()?.prune_stale_relay_trails(now, max_age))
+		let pruned = self.routes.write()?.prune_stale_relay_trails(now, max_age);
+		Ok(NonZeroUsize::new(pruned))
 	}
 
-	/// Drops every entry that reached its abandonment limit and returns how
-	/// many it dropped.
-	pub(in crate::colony::cluster) fn remove_abandoned(&self) -> Result<usize, ClusterError> {
+	/// Drops every entry that reached its abandonment limit and returns the
+	/// count of peer routes among the dropped entries, or [`None`] when it
+	/// drops none.
+	///
+	/// A local route at its limit leaves too. The count names the peer routes
+	/// alone, because it is the count the sweep withdraws from the peer plane.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::LockPoisoned`] -- the route lock is poisoned.
+	pub(in crate::colony::cluster) fn remove_abandoned(&self) -> Result<Option<NonZeroUsize>, ClusterError> {
 		let mut routes = self.routes.write()?;
-		let abandoned: Vec<SharedId> = routes
+		let abandoned: Vec<(SharedId, bool)> = routes
 			.values()
 			.filter(|entry| entry.is_abandoned())
-			.map(|entry| Arc::clone(entry.route_key()))
+			.map(|entry| (Arc::clone(entry.route_key()), entry.route_kind().is_peer()))
 			.collect();
 
-		let count = abandoned.len();
-		for address in &abandoned {
+		let peers = abandoned.iter().filter(|(_, is_peer)| *is_peer).count();
+		for (address, _) in &abandoned {
 			routes.remove(address.as_ref());
 		}
 
-		Ok(count)
+		Ok(NonZeroUsize::new(peers))
 	}
 
 	/// Returns the configuration of the pheromone scores and the lifecycle.
@@ -263,5 +301,75 @@ impl ServletRegistry {
 	pub fn is_empty(&self) -> Result<bool, ClusterError> {
 		let is_empty = self.len()? == 0;
 		Ok(is_empty)
+	}
+}
+
+/// What one weakening of a set of live peer routes did, as the weakenings
+/// [`ServletRegistry::weaken_peer`] and
+/// [`ServletRegistry::weaken_peer_by_dial`] return it.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::Arc;
+///
+/// use tightbeam::colony::cluster::{PheromoneConfig, ServletRegistry, Weakened};
+/// use tightbeam::utils::time::SystemClock;
+///
+/// let registry = ServletRegistry::new(PheromoneConfig::default(), Arc::new(SystemClock));
+/// let weakened: Weakened = registry.weaken_peer(b"peer-fingerprint")?;
+///
+/// assert_eq!(weakened, Weakened::default());
+/// # Ok::<(), tightbeam::colony::cluster::ClusterError>(())
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Weakened {
+	/// The count of live routes the weakening reached.
+	weakened: usize,
+	/// The count of those routes that this weakening drove to their
+	/// abandonment limit.
+	abandoned: usize,
+}
+
+impl Weakened {
+	/// Counts one failure against each route of `live`, and records what the
+	/// failures did.
+	fn all(live: impl IntoIterator<Item = impl AsRef<ServletEntry>>) -> Self {
+		live.into_iter().fold(Self::default(), |weakened, entry| {
+			let reached_limit = entry.as_ref().weaken_to_limit();
+			Self {
+				weakened: weakened.weakened.saturating_add(1),
+				abandoned: weakened.abandoned.saturating_add(usize::from(reached_limit)),
+			}
+		})
+	}
+
+	/// Returns the count of live routes the weakening reached.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::colony::cluster::Weakened;
+	///
+	/// assert_eq!(Weakened::default().count(), 0);
+	/// ```
+	#[must_use]
+	pub fn count(&self) -> usize {
+		self.weakened
+	}
+
+	/// Returns the count of routes that this weakening drove to their
+	/// abandonment limit, or [`None`] when it drove none there.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::colony::cluster::Weakened;
+	///
+	/// assert!(Weakened::default().abandoned().is_none());
+	/// ```
+	#[must_use]
+	pub fn abandoned(&self) -> Option<NonZeroUsize> {
+		NonZeroUsize::new(self.abandoned)
 	}
 }

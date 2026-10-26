@@ -1,21 +1,21 @@
-//! Multi-organization federation tests for the flood boundary at the
+//! The multi-organization federation tests of the flood boundary at the
 //! gateway edge.
 //!
 //! One transport trust store admits two colonies and one outside identity:
 //!
 //! - Colony "main" runs the entry and origin gateways.
 //! - Colony "other" holds one trusted gateway identity.
-//! - A third identity is trusted for transport but belongs to no colony.
+//! - The store also trusts a third identity, which belongs to no colony.
 //!
 //! Both colonies are inside one flood: gossip and work cross the organization
-//! edge, and every in-organization route stays intact. The outside identity
-//! is refused on every gossip path, because it carries no colony URN.
+//! edge, and every in-organization route stays intact. Every gossip path
+//! refuses the outside identity, because it carries no colony URN.
 //!
 //! Transitive discovery over live beats lives in `federation`.
 
 use super::common::*;
 use super::federation::{drive_until_advertised, federation_conf, flood_ad_rumor, type_route_count};
-use super::gossip::{relay_application_rumor, RumorRelay};
+use super::gossip::relay_application_rumor;
 use tightbeam::utils::time::{Clock, ManualClock};
 
 #[cfg(feature = "testing-fdr")]
@@ -32,8 +32,8 @@ struct MultiOrgCtx {
 	/// [`member_identity`].
 	origin: Arc<ClusterTestCerts>,
 	/// The gateway identity of colony "other". Transport admits it, and it is
-	/// inside the flood. It carries full gateway certs, so a scenario can also
-	/// run it as a live gateway.
+	/// inside the flood. It carries the full gateway certificates, so a
+	/// scenario can also run it as a live gateway.
 	neighbor: Arc<ClusterTestCerts>,
 	/// A "main" member whose advertisement claims a type from a foreign realm.
 	/// The outer relay gate admits it and the inner advertisement admission
@@ -41,13 +41,13 @@ struct MultiOrgCtx {
 	rogue_key: Secp256k1SigningKey,
 	/// A trusted transport identity with no colony SAN.
 	stranger_key: Secp256k1SigningKey,
-	/// The peer-plane store for `entry`, excluding its own identity. Peer
+	/// The peer-plane store of `entry`, without its own identity. Peer
 	/// membership wins on the hive plane, so a member's hive registrations
 	/// must not verify on its own peer store.
 	peers_of_entry: Arc<dyn CertificateTrust>,
-	/// The peer-plane store for `origin`, excluding its own identity.
+	/// The peer-plane store of `origin`, without its own identity.
 	peers_of_origin: Arc<dyn CertificateTrust>,
-	/// The peer-plane store for `neighbor`, excluding its own identity.
+	/// The peer-plane store of `neighbor`, without its own identity.
 	peers_of_neighbor: Arc<dyn CertificateTrust>,
 }
 
@@ -94,19 +94,13 @@ tb_assert_spec! {
 		mode: Accept,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
-			(PEER_AD_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
 			(events::CLUSTER_PEER_AD_LEARNED, exactly!(1)),
-			(PEER_ROUTES_AFTER_INSTALLS, exactly!(1), equals!(1u64)),
-			(WORK_SENT, exactly!(1)),
+			(events::CLUSTER_PEER_ROUTES_INSTALLED, exactly!(1), equals!(1u64)),
 			(events::CLUSTER_WORK_FORWARDED, exactly!(1)),
-			(WORK_ECHOED, exactly!(1), equals!(42u64)),
-			(GOSSIP_RELAY_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
-			(GOSSIP_STRANGER_STATUS, exactly!(1), equals!(TransitStatus::PermissionDenied)),
-			(events::CLUSTER_GOSSIP_REFUSED, exactly!(1)),
+			(events::CLUSTER_GOSSIP_ADMITTED, exactly!(3)),
+			(events::CLUSTER_GOSSIP_REFUSED, exactly!(1), equals!(TransitStatus::PermissionDenied)),
 			(events::CLUSTER_GOSSIP_RELAY_WEAKENED, exactly!(0)),
-			(GOSSIP_PUBLISH_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
-			(events::CLUSTER_PEER_AD_DROPPED, exactly!(1)),
-			(PEER_ROUTES_AFTER, exactly!(1), equals!(1u64))
+			(events::CLUSTER_PEER_AD_DROPPED, exactly!(1))
 		]
 	}
 }
@@ -191,28 +185,28 @@ tb_scenario! {
 				b"origin-ad",
 			)
 			.await?;
-			trace.event_with(PEER_AD_STATUS, &[], status)?;
-			trace.event_with(PEER_ROUTES_AFTER_INSTALLS, &[], count_u64(type_route_count(&gateway_entry, "ping")))?;
+			assert_eq!(status, TransitStatus::Ok, "the entry gateway admits the advertisement rumor of the origin");
+			assert_eq!(type_route_count(&gateway_entry, "ping"), 1, "the rumor of the origin installs one ping route");
 
 			let mut client = connect_cluster(&ctx.entry, gateway_entry.addr()).await?;
-			trace.event(WORK_SENT)?;
 
 			let servlet_frame = emit_ping_work(&mut client, &ctx.entry.key, b"multi-org-work").await?;
 			let ping_response = decode_ping_echo(&servlet_frame)?;
-			trace.event_with(WORK_ECHOED, &[], u64::from(ping_response.doubled))?;
+			assert_eq!(ping_response.doubled, 42, "the ping servlet doubles the request");
 
 			// Cross-organization relay: colony "other" is inside the flood,
-			// so its rumor is admitted.
+			// so the gateway admits its rumor.
 			let neighbor = &ctx.neighbor.key;
-			relay_application_rumor(&trace, &ctx.entry, &gateway_entry, neighbor, neighbor, "other-org").await?;
+			let replied = relay_application_rumor(&ctx.entry, &gateway_entry, neighbor, neighbor, "other-org").await?;
+			assert_eq!(replied, TransitStatus::Ok, "the gateway admits the rumor");
 
 			// No-colony relay: a trusted identity outside every organization
 			// is outside the flood, so only the membership proof can refuse.
 			let stranger = &ctx.stranger_key;
-			let refused = RumorRelay { origin_key: stranger, relay_key: stranger, marker: GOSSIP_STRANGER_STATUS };
-			refused.send(&trace, &ctx.entry, &gateway_entry, "stranger").await?;
+			let replied = relay_application_rumor(&ctx.entry, &gateway_entry, stranger, stranger, "stranger").await?;
+			assert_eq!(replied, TransitStatus::PermissionDenied, "the gateway refuses a stranger's rumor");
 
-			// The relay envelope is admitted, so only the inner realm
+			// The gateway admits the relay envelope, so only the inner realm
 			// admission can drop this one.
 			let foreign_ns =
 				ColonyNamespace::new("tightbeam", "other-realm").map_err(|_| TightBeamError::MissingResponse)?;
@@ -227,10 +221,14 @@ tb_scenario! {
 				b"rogue-realm-ad",
 			)
 			.await?;
-			trace.event_with(GOSSIP_PUBLISH_STATUS, &[], status)?;
+			assert_eq!(
+				status,
+				TransitStatus::Ok,
+				"the entry gateway admits the relay envelope of the rogue advertisement"
+			);
 
 			// The in-organization route stays intact through every refusal.
-			trace.event_with(PEER_ROUTES_AFTER, &[], count_u64(type_route_count(&gateway_entry, "ping")))?;
+			assert_eq!(type_route_count(&gateway_entry, "ping"), 1, "the in-organization route survives every refusal");
 
 			gateway_entry.stop();
 			gateway_origin.stop();
@@ -241,10 +239,10 @@ tb_scenario! {
 }
 
 /// Polls until gateways have learned `count` slate rumors, or five seconds
-/// pass.
-async fn wait_for_learned_slates(trace: &TraceCollector, count: usize) -> bool {
+/// pass. The spec judges the count, so the wait answers nothing.
+async fn wait_for_learned_slates(trace: &TraceCollector, count: usize) {
 	let learned = || trace.recorded(events::CLUSTER_PEER_AD_LEARNED) >= count;
-	poll_until(50, Duration::from_millis(100), learned).await
+	poll_until(50, Duration::from_millis(100), learned).await;
 }
 
 tb_assert_spec! {
@@ -257,16 +255,14 @@ tb_assert_spec! {
 			(events::CLUSTER_GOSSIP_FANOUT_UNREACHED, exactly!(0)),
 			(events::CLUSTER_GOSSIP_RELAY_WEAKENED, exactly!(0)),
 			(events::CLUSTER_PEER_AD_LEARNED, at_least!(1)),
-			(events::CLUSTER_PEER_AD_DROPPED, exactly!(0)),
-			(PEER_ROUTES_AFTER, exactly!(1), equals!(0u64))
+			(events::CLUSTER_PEER_AD_DROPPED, exactly!(0))
 		]
 	}
 }
 
-// A real gateway's beat drives this run, so the counts are bounds rather than
-// exacts. The entry gateway admits the neighbor's direct advertisement and the
-// slate rumor its beat floods, because colony "other" is inside the flood. The
-// slate is empty, so the rumor is learned and installs no route.
+// A real gateway's beat drives this run, so the counts are bounds. The entry
+// gateway admits the neighbor's direct advertisement and the slate rumor its
+// beat floods, because colony "other" is inside the flood.
 tb_scenario! {
 	name: cluster_live_neighbor_beat_floods_its_slate_across_the_org_edge,
 	spec: ClusterLiveNeighborGatewaySpec,
@@ -287,7 +283,7 @@ tb_scenario! {
 			drive_until_advertised(&clock, &trace, 2).await;
 			wait_for_learned_slates(&trace, 1).await;
 
-			trace.event_with(PEER_ROUTES_AFTER, &[], count_u64(cluster.peer_routes()?.len()))?;
+			assert!(cluster.peer_routes()?.is_empty(), "an empty neighbor slate installs no route");
 
 			gateway_neighbor.stop();
 			cluster.stop();
@@ -302,25 +298,19 @@ tb_assert_spec! {
 		mode: Accept,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
-			(PEER_AD_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
-			(PEER_ROUTES_AFTER, exactly!(1), equals!(1u64)),
-			(PEER_NEIGHBOR_CANDIDATES, exactly!(1), equals!(1u64)),
-			(WORK_SENT, exactly!(1)),
-			(events::CLUSTER_WORK_FORWARDED, exactly!(1)),
-			(WORK_ECHOED, exactly!(1), equals!(42u64))
+			(events::CLUSTER_PEER_ADVERTISED, exactly!(1)),
+			(events::CLUSTER_PEER_ADVERTISE_REFUSED, absent!()),
+			(events::CLUSTER_PEER_HINTS_LEARNED, exactly!(1), equals!(1u64)),
+			(events::CLUSTER_WORK_FORWARDED, exactly!(1))
 		]
 	}
 }
 
-// A gateway of another colony serves work by direct peering.
+// A gateway of colony "other" serves work by direct peering, through the route
+// that its signed advertisement installs at the entry gateway.
 //
-// The neighbor is a gateway of colony "other". It serves ping, and the
-// scenario places its advertisement at the entry gateway, signed with the
-// neighbor's key.
-//
-// - The advertisement installs its route (PEER_ROUTES_AFTER).
-// - The advertiser is inside the flood, so the peer table learns it (PEER_NEIGHBOR_CANDIDATES).
-// - Work is forwarded and served, because the gateway that answers is the advertiser (WORK_ECHOED).
+// - The advertiser is inside the flood, so the peer table learns it.
+// - The gateway that answers is the advertiser, so the entry forwards the work.
 tb_scenario! {
 	name: cluster_neighbor_colony_serves_work_and_enters_discovery,
 	spec: ClusterNeighborColonySpec,
@@ -335,24 +325,21 @@ tb_scenario! {
 			hive.register_with_cluster(gateway_neighbor.addr()).await?;
 
 			let entry_conf = quiet_member_conf(&ctx.entry, Arc::clone(&ctx.peers_of_entry));
-			let table = Arc::clone(entry_conf.peer.table());
 			let gateway_entry = start_cluster(&trace, entry_conf).await?;
 
 			let neighbor_key = &ctx.neighbor.key;
 			let neighbor_addr = gateway_neighbor.addr().to_string();
 			let claimed = neighbor_addr.as_bytes();
 			let types = vec![servlet_urn("ping")];
-			advertise_peer_signed(&trace, &ctx.entry, neighbor_key, &gateway_entry, claimed, types).await?;
-
-			let (candidates, _) = table.learned()?;
-			trace.event_with(PEER_NEIGHBOR_CANDIDATES, &[], count_u64(candidates))?;
+			let ad_reply = advertise_peer_signed(&ctx.entry, neighbor_key, &gateway_entry, claimed, types).await?;
+			assert_eq!(ad_reply, TransitStatus::Ok, "the gateway admits the advertisement");
+			assert_eq!(gateway_entry.peer_servlets()?.len(), 1, "the advertisement of the neighbor installs its route");
 
 			let mut client = connect_cluster(&ctx.entry, gateway_entry.addr()).await?;
-			trace.event(WORK_SENT)?;
 
 			let servlet_frame = emit_ping_work(&mut client, &ctx.entry.key, b"neighbor-work").await?;
 			let ping_response = decode_ping_echo(&servlet_frame)?;
-			trace.event_with(WORK_ECHOED, &[], u64::from(ping_response.doubled))?;
+			assert_eq!(ping_response.doubled, 42, "the ping servlet doubles the request");
 
 			gateway_entry.stop();
 			gateway_neighbor.stop();
@@ -368,31 +355,22 @@ tb_assert_spec! {
 		mode: Accept,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
-			(PEER_AD_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
-			(PEER_ROUTES_AFTER, exactly!(1), equals!(1u64)),
 			(events::CLUSTER_PEER_ADVERTISED, at_least!(3)),
+			(events::CLUSTER_PEER_ADVERTISE_REFUSED, absent!()),
 			(events::CLUSTER_GOSSIP_REFUSED, exactly!(0)),
 			(events::CLUSTER_GOSSIP_FANOUT_UNREACHED, exactly!(0)),
 			(events::CLUSTER_PEER_AD_LEARNED, at_least!(1)),
-			(PEER_ROUTES_AFTER_BEATS, exactly!(1), equals!(1u64)),
-			(WORK_SENT, exactly!(1)),
-			(events::CLUSTER_WORK_FORWARDED, exactly!(1)),
-			(WORK_ECHOED, exactly!(1), equals!(42u64))
+			(events::CLUSTER_WORK_FORWARDED, exactly!(1))
 		]
 	}
 }
 
-// A configured peer of another colony keeps its routes through live beats.
+// A configured peer of colony "other" keeps its routes through two live beats
+// of the entry gateway, after its signed advertisement installs them.
 //
-// The neighbor is a gateway of colony "other". The entry gateway lists it as a
-// peer and beats on a clock only this test moves. The neighbor serves ping,
-// and the scenario places its advertisement at the entry gateway, signed with
-// the neighbor's key. Two beats then dial the neighbor.
-//
-// - Each beat advertises to the neighbor, which admits it (CLUSTER_PEER_ADVERTISED).
-// - Each beat reconciles with the neighbor, and the routes stay (PEER_ROUTES_AFTER_BEATS).
-// - The neighbor admits the slate rumor the first beat floods (CLUSTER_PEER_AD_LEARNED).
-// - Work is forwarded and served, because the gateway that answers is the advertiser (WORK_ECHOED).
+// - The neighbor admits the advertisement of each beat and the slate rumor
+//   that the first beat floods, and each reconcile leaves the routes in place.
+// - The gateway that answers is the advertiser, so the entry forwards the work.
 tb_scenario! {
 	name: cluster_neighbor_anchor_keeps_its_routes_through_the_beat,
 	spec: ClusterNeighborAnchorSpec,
@@ -417,21 +395,22 @@ tb_scenario! {
 			let neighbor_key = &ctx.neighbor.key;
 			let claimed = neighbor_addr.as_bytes();
 			let types = vec![servlet_urn("ping")];
-			advertise_peer_signed(&trace, &ctx.entry, neighbor_key, &gateway_entry, claimed, types).await?;
+			let ad_reply = advertise_peer_signed(&ctx.entry, neighbor_key, &gateway_entry, claimed, types).await?;
+			assert_eq!(ad_reply, TransitStatus::Ok, "the gateway admits the advertisement");
+			assert_eq!(gateway_entry.peer_servlets()?.len(), 1, "the advertisement of the neighbor installs its route");
 
 			// One advertisement is the neighbor's own, placed above. The other
 			// two are the entry gateway's, one from each of two beats.
 			drive_until_advertised(&clock, &trace, 3).await;
 
 			let routes = type_route_count(&gateway_entry, "ping");
-			trace.event_with(PEER_ROUTES_AFTER_BEATS, &[], count_u64(routes))?;
+			assert_eq!(routes, 1, "the neighbor keeps its route through the beats");
 
 			let mut client = connect_cluster(&ctx.entry, gateway_entry.addr()).await?;
-			trace.event(WORK_SENT)?;
 
 			let servlet_frame = emit_ping_work(&mut client, &ctx.entry.key, b"neighbor-anchor-work").await?;
 			let ping_response = decode_ping_echo(&servlet_frame)?;
-			trace.event_with(WORK_ECHOED, &[], u64::from(ping_response.doubled))?;
+			assert_eq!(ping_response.doubled, 42, "the ping servlet doubles the request");
 
 			gateway_entry.stop();
 			gateway_neighbor.stop();

@@ -1,8 +1,7 @@
-//! RMA schedulability integration tests
+//! The integration test of rate-monotonic analysis (RMA) with FDR.
 
 use core::time::Duration;
 
-use tightbeam::builder::TypeBuilder;
 use tightbeam::testing::fdr::FdrConfig;
 use tightbeam::testing::specs::csp::Event;
 use tightbeam::testing::{ScenarioConfig, SetupEnv, TestHooks};
@@ -13,7 +12,7 @@ use tightbeam::{tb_assert_spec, tb_process_spec, tb_scenario};
 pub(crate) const TASK1: Urn<'static> = tightbeam::urn!("test", "event:rma-basic/task1");
 pub(crate) const TASK2: Urn<'static> = tightbeam::urn!("test", "event:rma-basic/task2");
 
-// Define a real-time process with timing and schedulability constraints
+// This process states the WCET and the period of each task.
 tb_process_spec! {
 	pub RmaSchedulableProcess,
 	events {
@@ -40,10 +39,9 @@ tb_process_spec! {
 	}
 }
 
-// RMA schedulable task set integration test with FDR
-// Utilization: 3/10 + 5/20 = 0.3 + 0.25 = 0.55
-// RMA bound for n=2: 2*(2^(1/2) - 1) ≈ 0.828
-// 0.55 < 0.828, so schedulable
+// The task set is schedulable under RMA, because its utilization,
+// `3/10 + 5/20 = 0.3 + 0.25 = 0.55`, sits under the bound for two tasks,
+// `2 * (2^(1/2) - 1)`, which is about 0.828.
 tb_assert_spec! {
 	pub RmaAssertSpec,
 	V(1,0,0): {

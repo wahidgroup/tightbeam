@@ -32,7 +32,7 @@ pub mod state;
 
 mod limits;
 
-#[cfg(feature = "tokio")]
+#[cfg(feature = "std")]
 pub mod accept;
 #[cfg(any(feature = "tcp", feature = "tokio", feature = "async-transport"))]
 pub(crate) mod framing;
@@ -183,7 +183,7 @@ impl<P: CryptoProvider> EndpointConfig<P> {
 		Self::new(DialableEncryption::cleartext(), Arc::new(SystemClock))
 	}
 
-	/// Replace the negotiation input each transport built from this
+	/// Replaces the negotiation input each transport built from this
 	/// configuration starts with.
 	#[must_use]
 	pub(crate) fn with_negotiation(mut self, negotiation: Negotiation) -> Self {
@@ -191,21 +191,21 @@ impl<P: CryptoProvider> EndpointConfig<P> {
 		self
 	}
 
-	/// Replace every ceiling this endpoint enforces.
+	/// Replaces every ceiling this endpoint enforces.
 	#[must_use]
 	pub fn with_limits(mut self, limits: TransportLimits) -> Self {
 		self.limits = limits;
 		self
 	}
 
-	/// Replace the clock this endpoint measures deadlines and backoff against.
+	/// Replaces the clock this endpoint measures deadlines and backoff against.
 	#[must_use]
 	pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
 		self.clock = clock;
 		self
 	}
 
-	/// Attach the production instrumentation collector each transport built
+	/// Attaches the production instrumentation collector each transport built
 	/// from this configuration shares.
 	#[cfg(feature = "instrument")]
 	#[must_use]
@@ -214,12 +214,12 @@ impl<P: CryptoProvider> EndpointConfig<P> {
 		self
 	}
 
-	/// Return the provisioning this endpoint holds.
+	/// Returns the provisioning this endpoint holds.
 	pub fn encryption(&self) -> &EncryptionConfig<P> {
 		self.encryption.encryption()
 	}
 
-	/// Return every ceiling this endpoint enforces.
+	/// Returns every ceiling this endpoint enforces.
 	pub fn limits(&self) -> &TransportLimits {
 		&self.limits
 	}
@@ -255,7 +255,7 @@ impl<P: CryptoProvider> TryFrom<TransportEncryptionConfig<P>> for EndpointConfig
 }
 
 impl<P: CryptoProvider> TransportEncryptionConfig<P> {
-	/// Create a server configuration that presents `identity`.
+	/// Creates a server configuration that presents `identity`.
 	///
 	/// The identity pairs the certificate with the key that signs for it, so
 	/// the two arrive checked against each other.
@@ -270,7 +270,7 @@ impl<P: CryptoProvider> TransportEncryptionConfig<P> {
 		}
 	}
 
-	/// Name the validators that authenticate the client.
+	/// Names the validators that authenticate the client.
 	///
 	/// `validators` accepts any iterator of shared [`CertificateValidation`]
 	/// values. A non-empty set demands mutual authentication, and it replaces
@@ -280,7 +280,7 @@ impl<P: CryptoProvider> TransportEncryptionConfig<P> {
 	///
 	/// [`PeerAuthentication::mutual`] decides that an empty set demands
 	/// nothing, so an empty set leaves the endpoint as it is, and an
-	/// endpoint that demands mutual authentication still demands it.
+	/// endpoint that demands mutual authentication keeps that demand.
 	#[must_use]
 	pub fn with_client_validators(
 		mut self,
@@ -294,19 +294,19 @@ impl<P: CryptoProvider> TransportEncryptionConfig<P> {
 		self
 	}
 
-	/// Replace every ceiling this endpoint enforces.
+	/// Replaces every ceiling this endpoint enforces.
 	#[must_use]
 	pub fn with_limits(mut self, limits: TransportLimits) -> Self {
 		self.limits = limits;
 		self
 	}
 
-	/// Return every ceiling this endpoint enforces.
+	/// Returns every ceiling this endpoint enforces.
 	pub fn limits(&self) -> &TransportLimits {
 		&self.limits
 	}
 
-	/// Set the key purpose of each role: the purpose the server's own
+	/// Sets the key purpose of each role: the purpose the server's own
 	/// certificates carry, and the purpose a client's certificate carries.
 	/// The default is [`KeyPurposes::HOUSE`].
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -316,7 +316,7 @@ impl<P: CryptoProvider> TransportEncryptionConfig<P> {
 		self
 	}
 
-	/// Return the identity certificate this endpoint presents during the
+	/// Returns the identity certificate this endpoint presents during the
 	/// handshake, the one whose key signs its replies.
 	pub fn certificate(&self) -> &Certificate {
 		self.identity.signing().certificate()
@@ -325,7 +325,7 @@ impl<P: CryptoProvider> TransportEncryptionConfig<P> {
 
 #[cfg(feature = "transport-cms")]
 impl<P: CryptoProvider> TransportEncryptionConfig<P> {
-	/// Pair the signing identity this endpoint presents with `key_agreement`,
+	/// Pairs the signing identity this endpoint presents with `key_agreement`,
 	/// the identity the CMS opening seals to, once, as a
 	/// [`CmsIdentityPair`].
 	///
@@ -504,7 +504,7 @@ mod tests {
 		Ok(())
 	}
 
-	/// A builder with no configured limits still enforces the defaults.
+	/// A builder with no configured limits enforces the defaults.
 	///
 	/// A default endpoint reads cleartext under a bound. Every other limit test
 	/// sets a ceiling explicitly, so only this test covers the default.
@@ -529,7 +529,7 @@ mod tests {
 	/// The encrypted ceiling measures the sealed wire form instead of the
 	/// plaintext.
 	///
-	/// With a ceiling of exactly the plaintext length, the builder must still
+	/// Even with a ceiling of exactly the plaintext length, the builder must
 	/// refuse the payload. The AEAD tag, the nonce, and the `WireEnvelope`
 	/// wrapper all come after the encode, so a measurement before them would
 	/// let an oversized envelope reach the peer as a connection reset.

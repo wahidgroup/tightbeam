@@ -8,16 +8,16 @@ use crate::dtn::chain_processor::ProcessResult;
 
 use super::FinalizeChainUpdate;
 
-/// Result of chain verification - either valid frames or a gap detected.
+/// The result of chain verification: valid frames, or a detected gap.
 pub enum VerifyResult {
-	/// Frames are valid and ready for finalization.
+	/// The frames are valid and ready for finalization.
 	Valid(Vec<Frame>),
-	/// Chain gap detected, need to request missing frames.
+	/// The chain has a gap, so the node must request the missing frames.
 	Gap { current_head: Vec<u8>, missing_hash: Vec<u8> },
 }
 
 impl VerifyResult {
-	/// Finalize verification into a ProcessResult.
+	/// Finalizes the verification into a `ProcessResult`.
 	pub fn finalize(self, chain_state: Arc<RwLock<MessageChainState>>) -> Result<ProcessResult, TightBeamError> {
 		match self {
 			Self::Gap { current_head, missing_hash } => Ok(ProcessResult::ChainGap { current_head, missing_hash }),
@@ -27,7 +27,8 @@ impl VerifyResult {
 }
 
 job! {
-	/// Verifies chain integrity and validates frames against chain state.
+	/// Verifies the integrity of the chain and validates the frames against
+	/// the chain state.
 	name: ValidateChain,
 	fn run(
 		(frames, store, chain_state): (Vec<Frame>, Arc<RwLock<FrameStore>>, Arc<RwLock<MessageChainState>>)
@@ -44,20 +45,21 @@ job! {
 			return Ok(VerifyResult::Gap { current_head, missing_hash });
 		}
 
+		// The buffer releases consecutive orders, and `verify_chain` links each
+		// frame of the batch to the frame before it, so the chain state judges
+		// the first frame alone.
 		let chain_state_guard = chain_state.read()?;
-		let invalid_frame = frames
-			.iter()
-			.find(|frame| !chain_state_guard.validate_frame(frame).unwrap_or(false));
-
-		if let Some(frame) = invalid_frame {
-			let current_head = chain_state_guard.last_hash.to_vec();
-			let missing_hash = frame
-				.metadata()
-				.previous_frame()
-				.as_ref()
-				.map(|d| d.digest.as_bytes().to_vec())
-				.unwrap_or_default();
-			return Ok(VerifyResult::Gap { current_head, missing_hash });
+		if let Some(first) = frames.first() {
+			if !chain_state_guard.validate_frame(first)? {
+				let current_head = chain_state_guard.last_hash.to_vec();
+				let missing_hash = first
+					.metadata()
+					.previous_frame()
+					.as_ref()
+					.map(|d| d.digest.as_bytes().to_vec())
+					.unwrap_or_default();
+				return Ok(VerifyResult::Gap { current_head, missing_hash });
+			}
 		}
 
 		Ok(VerifyResult::Valid(frames))

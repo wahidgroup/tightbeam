@@ -1,4 +1,4 @@
-//! Integration tests for the Hive with X.509 certificates.
+//! The integration tests of the Hive with X.509 certificates.
 //!
 //! The tests drive the Hive lifecycle through its public interface with TLS.
 
@@ -59,46 +59,7 @@ fn servlet_urn(name: &(impl AsRef<str> + ?Sized)) -> Urn<'static> {
 	colony_ns().servlet(name).expect("test names satisfy the mint grammar")
 }
 
-pub(crate) const BACKPRESSURE_HEARTBEAT_HEARTBEAT_SHAPE: Urn<'static> =
-	tightbeam::urn!("test", "event:hive/backpressure-heartbeat-heartbeat-shape");
-pub(crate) const BACKPRESSURE_MANAGE_MANAGE_SHAPE: Urn<'static> =
-	tightbeam::urn!("test", "event:hive/backpressure-manage-manage-shape");
-pub(crate) const BACKPRESSURE_SPAWN_SPAWN_SHAPE: Urn<'static> =
-	tightbeam::urn!("test", "event:hive/backpressure-spawn-spawn-shape");
-pub(crate) const DRAINING_HEARTBEAT_ACCEPTED: Urn<'static> =
-	tightbeam::urn!("test", "event:hive/draining-heartbeat-accepted");
-pub(crate) const DRAINING_MANAGE_MANAGE_SHAPE: Urn<'static> =
-	tightbeam::urn!("test", "event:hive/draining-manage-manage-shape");
-pub(crate) const DRAINING_SPAWN_SPAWN_SHAPE: Urn<'static> =
-	tightbeam::urn!("test", "event:hive/draining-spawn-spawn-shape");
-pub(crate) const DRAIN_REFUSAL_UNAVAILABLE: Urn<'static> =
-	tightbeam::urn!("test", "event:hive/drain-refusal-unavailable");
-pub(crate) const DRAIN_REFUSAL_REPLAY_REFUSED: Urn<'static> =
-	tightbeam::urn!("test", "event:hive/drain-refusal-replay-refused");
-pub(crate) const FIRST_SPAWN_UNAVAILABLE: Urn<'static> = tightbeam::urn!("test", "event:hive/first-spawn-unavailable");
-pub(crate) const FORGED_HEARTBEAT_DENIED: Urn<'static> = tightbeam::urn!("test", "event:hive/forged-heartbeat-denied");
-pub(crate) const HIVE_ESTABLISHED: Urn<'static> = tightbeam::urn!("test", "event:hive/hive-established");
-pub(crate) const HIVE_STARTED: Urn<'static> = tightbeam::urn!("test", "event:hive/hive-started");
-pub(crate) const REGISTER_BEFORE_ESTABLISH: Urn<'static> =
-	tightbeam::urn!("test", "event:hive/register-before-establish");
-pub(crate) const OPEN_BREAKER_HEARTBEAT_SHAPE: Urn<'static> =
-	tightbeam::urn!("test", "event:hive/open-breaker-heartbeat-shape");
-pub(crate) const RETRY_SPAWN_ACCEPTED: Urn<'static> = tightbeam::urn!("test", "event:hive/retry-spawn-accepted");
-pub(crate) const SEQUENCE_BOTH_REFUSED: Urn<'static> = tightbeam::urn!("test", "event:hive/sequence-both-refused");
-pub(crate) const SEQUENCE_EMPTY_REFUSED: Urn<'static> = tightbeam::urn!("test", "event:hive/sequence-empty-refused");
-pub(crate) const SEQUENCE_HEARTBEAT_REFUSED: Urn<'static> =
-	tightbeam::urn!("test", "event:hive/sequence-heartbeat-refused");
-pub(crate) const SERVLET_RECEIVE: Urn<'static> = tightbeam::urn!("test", "event:hive/servlet-receive");
-pub(crate) const SERVLET_RESPOND: Urn<'static> = tightbeam::urn!("test", "event:hive/servlet-respond");
 pub(crate) const SERVLET_STOPPED: Urn<'static> = tightbeam::urn!("test", "event:hive/servlet-stopped");
-pub(crate) const SIGNED_HEARTBEAT_ACCEPTED: Urn<'static> =
-	tightbeam::urn!("test", "event:hive/signed-heartbeat-accepted");
-pub(crate) const SPAWN_NON_UTF8_FORBIDDEN: Urn<'static> =
-	tightbeam::urn!("test", "event:hive/spawn-non-utf8-forbidden");
-pub(crate) const UNSIGNED_HEARTBEAT_HEARTBEAT_SHAPE: Urn<'static> =
-	tightbeam::urn!("test", "event:hive/unsigned-heartbeat-heartbeat-shape");
-pub(crate) const UNSIGNED_MANAGE_MANAGE_SHAPE: Urn<'static> =
-	tightbeam::urn!("test", "event:hive/unsigned-manage-manage-shape");
 
 /// The request whose `value` the hive's test servlets double.
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
@@ -117,11 +78,7 @@ pub struct HiveTestResponse {
 servlet! {
 	HiveTestServlet<HiveTestRequest, EnvConfig = ()>,
 	protocol: TokioListener,
-	handle: |req, frame, ctx| async move {
-		let trace = ctx.trace();
-		trace.event(SERVLET_RECEIVE)?;
-		trace.event(SERVLET_RESPOND)?;
-
+	handle: |req, frame, _ctx| async move {
 		Ok(Some(compose! {
 			V0: id: frame.metadata().id(),
 				message: HiveTestResponse { doubled: req.value * 2 }
@@ -139,21 +96,18 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(HIVE_STARTED, exactly!(1)),
-			(HIVE_ESTABLISHED, exactly!(1), equals!(1u64))
+			(events::HIVE_ESTABLISHED, exactly!(1), equals!(1u64))
 		]
 	}
 }
 
-/// Registers a test servlet, establishes the hive, and records the
-/// establish events on the scenario trace. `HIVE_ESTABLISHED` carries
-/// the registered-servlet count for the spec to value-assert.
+/// Registers a test servlet and establishes the hive on the scenario trace,
+/// where the hive records [`events::HIVE_ESTABLISHED`] with the count of
+/// servlets it registered.
 async fn establish_registered_hive(
 	trace: &TraceCollector,
 	conf: Option<HiveConfig>,
 ) -> Result<HiveX509Test, TightBeamError> {
-	trace.event(HIVE_STARTED)?;
-
 	let servlet = HiveTestServlet::start(Arc::new(trace.share()), ServletConfig::cleartext()).await?;
 	let mut hive = HiveX509Test::new(conf)?;
 	hive.register(servlet_urn("test_servlet"), servlet, |t| {
@@ -161,7 +115,6 @@ async fn establish_registered_hive(
 	})?;
 	hive.establish(Arc::new(trace.share())).await?;
 
-	trace.event_with(HIVE_ESTABLISHED, &[], hive.servlet_addresses().len() as u64)?;
 	Ok(hive)
 }
 
@@ -190,6 +143,30 @@ tb_scenario! {
 			Ok(())
 		}
 	}
+}
+
+// A trace that refuses `HIVE_ESTABLISHED` fails the establish before the
+// control plane serves, so the hive stays provisional, with no address, and a
+// later establish on a trace that records the event succeeds.
+#[cfg(feature = "testing-fault")]
+#[tokio::test]
+async fn a_refused_established_event_leaves_the_hive_provisional() -> Result<(), TightBeamError> {
+	use tightbeam::testing::FaultModel;
+
+	let refused = || TightBeamError::ChannelClosed;
+	let model = FaultModel::default().with_event_fault(events::HIVE_ESTABLISHED, refused, tightbeam::bps!(10000));
+	let refusing = Arc::new(TraceCollector::new().with_fault_model(model));
+	let mut hive = HiveX509Test::new(Some(HiveConfig { hive_tls: Some(Arc::new(hive_tls())), ..Default::default() }))?;
+
+	let first = hive.establish(refusing).await;
+	let unbound = hive.addr().is_none();
+	let second = hive.establish(Arc::new(TraceCollector::new())).await;
+	hive.stop();
+
+	assert!(matches!(first, Err(TightBeamError::ChannelClosed)));
+	assert!(unbound);
+	second?;
+	Ok(())
 }
 
 /// Builds a fresh heartbeat command body. Freshness binds to
@@ -372,8 +349,7 @@ async fn emit_command(
 
 /// Requires the response to name the heartbeat alternative. When
 /// `sealed_capacity` is set, the reply must not leak capacity before
-/// authentication. Returns the status for the caller to record as a
-/// valued event the spec asserts.
+/// authentication. Returns the status for the caller to assert.
 fn heartbeat_shape_status(
 	response: ClusterCommandResponse,
 	sealed_capacity: bool,
@@ -393,7 +369,7 @@ fn heartbeat_shape_status(
 }
 
 /// Requires the response to name the manage/stop alternative. Returns the
-/// stop status for the caller to record as a valued event.
+/// stop status for the caller to assert.
 fn manage_stop_shape_status(response: ClusterCommandResponse) -> Result<TransitStatus, TightBeamError> {
 	match response {
 		ClusterCommandResponse::Manage(HiveManagementOutcome::Stop(stop)) => Ok(stop.status),
@@ -405,7 +381,7 @@ fn manage_stop_shape_status(response: ClusterCommandResponse) -> Result<TransitS
 }
 
 /// Requires the response to name the manage/spawn alternative. Returns the
-/// spawn status for the caller to record as a valued event.
+/// spawn status for the caller to assert.
 fn manage_spawn_shape_status(response: ClusterCommandResponse) -> Result<TransitStatus, TightBeamError> {
 	match response {
 		ClusterCommandResponse::Manage(HiveManagementOutcome::Spawn(spawn)) => Ok(spawn.status),
@@ -455,40 +431,26 @@ async fn signed_spawn_frame(
 	Ok(frame)
 }
 
+// The refusals carry three statuses, and `equals!` binds every record of its
+// label, so the spec counts the refusals and the client asserts each status.
 tb_assert_spec! {
 	pub HiveGateShapeSpec,
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(UNSIGNED_HEARTBEAT_HEARTBEAT_SHAPE, exactly!(1), equals!(TransitStatus::Unauthenticated)),
-			(UNSIGNED_MANAGE_MANAGE_SHAPE, exactly!(1), equals!(TransitStatus::Unauthenticated)),
-			(SIGNED_HEARTBEAT_ACCEPTED, exactly!(1), equals!(TransitStatus::Ok)),
-			(OPEN_BREAKER_HEARTBEAT_SHAPE, exactly!(1), equals!(TransitStatus::PermissionDenied))
+			(events::HIVE_COMMAND_REFUSED, exactly!(3))
 		]
 	},
 	V(1,1,0): {
 		mode: Accept,
 		assertions: [
-			(UNSIGNED_HEARTBEAT_HEARTBEAT_SHAPE, exactly!(1), equals!(TransitStatus::Unauthenticated)),
-			(UNSIGNED_MANAGE_MANAGE_SHAPE, exactly!(1), equals!(TransitStatus::Unauthenticated)),
-			(SIGNED_HEARTBEAT_ACCEPTED, exactly!(1), equals!(TransitStatus::Ok)),
-			(DRAINING_MANAGE_MANAGE_SHAPE, exactly!(1), equals!(TransitStatus::Unavailable)),
-			(DRAINING_SPAWN_SPAWN_SHAPE, exactly!(1), equals!(TransitStatus::Unavailable)),
-			(FORGED_HEARTBEAT_DENIED, exactly!(1), equals!(TransitStatus::PermissionDenied)),
-			(OPEN_BREAKER_HEARTBEAT_SHAPE, exactly!(1), equals!(TransitStatus::PermissionDenied))
+			(events::HIVE_COMMAND_REFUSED, exactly!(6))
 		]
 	},
 	V(1,2,0): {
 		mode: Accept,
 		assertions: [
-			(UNSIGNED_HEARTBEAT_HEARTBEAT_SHAPE, exactly!(1), equals!(TransitStatus::Unauthenticated)),
-			(UNSIGNED_MANAGE_MANAGE_SHAPE, exactly!(1), equals!(TransitStatus::Unauthenticated)),
-			(SIGNED_HEARTBEAT_ACCEPTED, exactly!(1), equals!(TransitStatus::Ok)),
-			(DRAINING_HEARTBEAT_ACCEPTED, exactly!(1), equals!(TransitStatus::Ok)),
-			(DRAINING_MANAGE_MANAGE_SHAPE, exactly!(1), equals!(TransitStatus::Unavailable)),
-			(DRAINING_SPAWN_SPAWN_SHAPE, exactly!(1), equals!(TransitStatus::Unavailable)),
-			(FORGED_HEARTBEAT_DENIED, exactly!(1), equals!(TransitStatus::PermissionDenied)),
-			(OPEN_BREAKER_HEARTBEAT_SHAPE, exactly!(1), equals!(TransitStatus::PermissionDenied))
+			(events::HIVE_COMMAND_REFUSED, exactly!(6))
 		]
 	}
 }
@@ -507,46 +469,56 @@ tb_scenario! {
 			conf.control.circuit_breaker_cooldown = Duration::from_secs(60);
 			start_trusted_hive(&trace, &signer, conf).await
 		},
-		client: |HiveEnv { trace, context: signer, hive }| async move {
+		client: |HiveEnv { context: signer, hive, .. }| async move {
 			let mut client = connect_hive(&hive, &signer).await?;
 
 			// An unsigned heartbeat must come back in the heartbeat CHOICE
 			// with no capacity data before authentication.
 			let unsigned_heartbeat = command_frame(b"hb-unsigned", heartbeat_command())?;
 			let response = emit_command(&mut client, unsigned_heartbeat).await?;
-			trace.event_with(UNSIGNED_HEARTBEAT_HEARTBEAT_SHAPE, &[], heartbeat_shape_status(response, true)?)?;
+			let status = heartbeat_shape_status(response, true)?;
+			assert_eq!(
+				status,
+				TransitStatus::Unauthenticated,
+				"the hive refuses an unsigned heartbeat in the heartbeat shape"
+			);
 
 			// An unsigned manage command must come back in the manage CHOICE
 			// as a security verdict, not a drain probe.
 			let unsigned_stop = stop_command_frame(b"manage-unsigned")?;
 			let response = emit_command(&mut client, unsigned_stop).await?;
-			trace.event_with(UNSIGNED_MANAGE_MANAGE_SHAPE, &[], manage_stop_shape_status(response)?)?;
+			let status = manage_stop_shape_status(response)?;
+			assert_eq!(status, TransitStatus::Unauthenticated, "the hive refuses an unsigned stop in the manage shape");
 
 			// The hive must accept a signed heartbeat end to end.
 			let signed_heartbeat = signed_heartbeat_frame(&signer.identity, b"hb-signed").await?;
 			let response = emit_command(&mut client, signed_heartbeat).await?;
-			trace.event_with(SIGNED_HEARTBEAT_ACCEPTED, &[], heartbeat_shape_status(response, false)?)?;
+			let status = heartbeat_shape_status(response, false)?;
+			assert_eq!(status, TransitStatus::Ok, "the hive answers a signed heartbeat");
 
 			hive.drain().await?;
 
 			// The hive answers a signed heartbeat during drain, because a
-			// liveness command survives the drain, so the cluster still reads
-			// the hive's health.
+			// liveness command survives the drain, so the cluster reads the
+			// hive's health through it.
 			let signed_heartbeat = signed_heartbeat_frame(&signer.identity, b"hb-draining").await?;
 			let response = emit_command(&mut client, signed_heartbeat).await?;
-			trace.event_with(DRAINING_HEARTBEAT_ACCEPTED, &[], heartbeat_shape_status(response, false)?)?;
+			let status = heartbeat_shape_status(response, false)?;
+			assert_eq!(status, TransitStatus::Ok, "a draining hive still answers a signed heartbeat");
 
 			// A signed manage command during drain must come back
 			// Unavailable in the manage CHOICE.
 			let signed_stop = signed_stop_frame(&signer.identity, b"manage-draining").await?;
 			let response = emit_command(&mut client, signed_stop).await?;
-			trace.event_with(DRAINING_MANAGE_MANAGE_SHAPE, &[], manage_stop_shape_status(response)?)?;
+			let status = manage_stop_shape_status(response)?;
+			assert_eq!(status, TransitStatus::Unavailable, "a draining hive refuses a signed stop");
 
 			// A spawn refused by the drain answers in the spawn alternative,
 			// which is the one its sender decodes.
 			let signed_spawn = signed_spawn_frame(&signer.identity, b"spawn-draining", "orphan").await?;
 			let response = emit_command(&mut client, signed_spawn).await?;
-			trace.event_with(DRAINING_SPAWN_SPAWN_SHAPE, &[], manage_spawn_shape_status(response)?)?;
+			let status = manage_spawn_shape_status(response)?;
+			assert_eq!(status, TransitStatus::Unavailable, "a draining hive refuses a signed spawn in the spawn shape");
 
 			// Trip the breaker at threshold 1. A trusted signer identity with a
 			// signature transplanted from a different frame is the one failure
@@ -561,14 +533,20 @@ tb_scenario! {
 			forged.attach_signer_info(transplanted)?;
 
 			let response = emit_command(&mut client, forged).await?;
-			trace.event_with(FORGED_HEARTBEAT_DENIED, &[], heartbeat_shape_status(response, false)?)?;
+			let status = heartbeat_shape_status(response, false)?;
+			assert_eq!(status, TransitStatus::PermissionDenied, "the hive refuses a transplanted signature");
 
 			// With the breaker open, the hive refuses a valid heartbeat during
 			// cooldown but keeps the heartbeat CHOICE, so the cluster records a
 			// reply instead of MalformedResponse eviction pressure.
 			let signed_heartbeat = signed_heartbeat_frame(&signer.identity, b"hb-open").await?;
 			let response = emit_command(&mut client, signed_heartbeat).await?;
-			trace.event_with(OPEN_BREAKER_HEARTBEAT_SHAPE, &[], heartbeat_shape_status(response, true)?)?;
+			let status = heartbeat_shape_status(response, true)?;
+			assert_eq!(
+				status,
+				TransitStatus::PermissionDenied,
+				"an open breaker refuses a valid heartbeat in the heartbeat shape"
+			);
 
 			hive.stop();
 
@@ -582,9 +560,7 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(BACKPRESSURE_MANAGE_MANAGE_SHAPE, exactly!(1), equals!(TransitStatus::ResourceExhausted)),
-			(BACKPRESSURE_SPAWN_SPAWN_SHAPE, exactly!(1), equals!(TransitStatus::ResourceExhausted)),
-			(BACKPRESSURE_HEARTBEAT_HEARTBEAT_SHAPE, exactly!(1), equals!(TransitStatus::ResourceExhausted))
+			(events::HIVE_COMMAND_REFUSED, exactly!(2), equals!(TransitStatus::ResourceExhausted))
 		]
 	}
 }
@@ -597,31 +573,46 @@ tb_scenario! {
 	spec: HiveBackpressureShapeSpec,
 	environment Hive {
 		context: trusted_signer("CN=Hive Backpressure Cluster"),
-		// A zero threshold means idle utilization already saturates the gate,
-		// so every manage command sees the backpressure verdict.
+		// Under a zero threshold, idle utilization saturates the gate, so every
+		// manage command sees the backpressure verdict.
 		start: |SetupEnv { trace, context: signer }| async move {
 			let mut conf = HiveConfig::default();
 			conf.control.backpressure_threshold = BasisPoints::default();
 
 			start_trusted_hive(&trace, &signer, conf).await
 		},
-		client: |HiveEnv { trace, context: signer, hive }| async move {
+		client: |HiveEnv { context: signer, hive, .. }| async move {
 			let mut client = connect_hive(&hive, &signer).await?;
 
 			let signed_stop = signed_stop_frame(&signer.identity, b"manage-bp").await?;
 			let response = emit_command(&mut client, signed_stop).await?;
-			trace.event_with(BACKPRESSURE_MANAGE_MANAGE_SHAPE, &[], manage_stop_shape_status(response)?)?;
+			let status = manage_stop_shape_status(response)?;
+			assert_eq!(
+				status,
+				TransitStatus::ResourceExhausted,
+				"a saturated hive refuses a signed stop in the manage shape"
+			);
 
 			let signed_spawn = signed_spawn_frame(&signer.identity, b"spawn-bp", "orphan").await?;
 			let response = emit_command(&mut client, signed_spawn).await?;
-			trace.event_with(BACKPRESSURE_SPAWN_SPAWN_SHAPE, &[], manage_spawn_shape_status(response)?)?;
+			let status = manage_spawn_shape_status(response)?;
+			assert_eq!(
+				status,
+				TransitStatus::ResourceExhausted,
+				"a saturated hive refuses a signed spawn in the spawn shape"
+			);
 
 			// A signed heartbeat is exempt from the gate. The hive answers it
 			// in the heartbeat CHOICE with real capacity data, and the
 			// ResourceExhausted status reflects saturation.
 			let signed_heartbeat = signed_heartbeat_frame(&signer.identity, b"hb-bp").await?;
 			let response = emit_command(&mut client, signed_heartbeat).await?;
-			trace.event_with(BACKPRESSURE_HEARTBEAT_HEARTBEAT_SHAPE, &[], heartbeat_shape_status(response, false)?)?;
+			let status = heartbeat_shape_status(response, false)?;
+			assert_eq!(
+				status,
+				TransitStatus::ResourceExhausted,
+				"a saturated hive answers a signed heartbeat with its load"
+			);
 
 			hive.stop();
 
@@ -644,35 +635,20 @@ tb_scenario! {
 	}
 }
 
-tb_assert_spec! {
-	pub HiveRegisterBeforeEstablishSpec,
-	V(1,0,0): {
-		mode: Accept,
-		assertions: [
-			(REGISTER_BEFORE_ESTABLISH, exactly!(1), equals!(true))
-		]
-	}
-}
+/// A provisional `addr` from `Hive::new` must not reach the cluster, so the
+/// hive refuses registration before establish with `NotEstablished`.
+#[tokio::test]
+async fn hive_register_before_establish_refused() -> Result<(), TightBeamError> {
+	let hive = HiveX509Test::new(None)?;
+	let cluster_addr: <TokioListener as Protocol>::Address = "127.0.0.1:9".parse()?;
+	let refused = hive.register_with_cluster(&cluster_addr).await;
+	hive.stop();
 
-// A provisional `addr` from `Hive::new` must not reach the cluster, so the hive
-// refuses registration before establish with `NotEstablished`.
-tb_scenario! {
-	name: hive_register_before_establish_refused,
-	spec: HiveRegisterBeforeEstablishSpec,
-	environment Bare {
-		exec: |SetupEnv { trace, .. }| async move {
-			let hive = HiveX509Test::new(None)?;
-			let cluster_addr: <TokioListener as Protocol>::Address = "127.0.0.1:9".parse()?;
-			let refused = matches!(
-				hive.register_with_cluster(&cluster_addr).await,
-				Err(TightBeamError::NotEstablished)
-			);
-
-			trace.event_with(REGISTER_BEFORE_ESTABLISH, &[], refused)?;
-			hive.stop();
-			Ok(())
-		}
-	}
+	assert!(
+		matches!(refused, Err(TightBeamError::NotEstablished)),
+		"a provisional hive refuses to register"
+	);
+	Ok(())
 }
 
 tb_assert_spec! {
@@ -680,9 +656,7 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(SEQUENCE_EMPTY_REFUSED, exactly!(1), equals!(TransitStatus::InvalidArgument)),
-			(SEQUENCE_HEARTBEAT_REFUSED, exactly!(1), equals!(TransitStatus::InvalidArgument)),
-			(SEQUENCE_BOTH_REFUSED, exactly!(1), equals!(TransitStatus::InvalidArgument))
+			(events::HIVE_COMMAND_REFUSED, exactly!(3), equals!(TransitStatus::InvalidArgument))
 		]
 	}
 }
@@ -698,25 +672,32 @@ tb_scenario! {
 		start: |SetupEnv { trace, context: signer }| async move {
 			start_trusted_hive(&trace, &signer, HiveConfig::default()).await
 		},
-		client: |HiveEnv { trace, context: signer, hive }| async move {
+		client: |HiveEnv { context: signer, hive, .. }| async move {
 			let mut client = connect_hive(&hive, &signer).await?;
 			let empty = SequenceShapedCommand::empty();
 			let empty = signed_sequence_command_frame(&signer.identity, b"cmd-empty", empty).await?;
 			let response = emit_command(&mut client, empty).await?;
 
-			trace.event_with(SEQUENCE_EMPTY_REFUSED, &[], manage_stop_shape_status(response)?)?;
+			let status = manage_stop_shape_status(response)?;
+			assert_eq!(status, TransitStatus::InvalidArgument, "the hive refuses a body that sets no field");
 
 			let heartbeat = SequenceShapedCommand::heartbeat();
 			let heartbeat = signed_sequence_command_frame(&signer.identity, b"cmd-heartbeat", heartbeat).await?;
 			let response = emit_command(&mut client, heartbeat).await?;
 
-			trace.event_with(SEQUENCE_HEARTBEAT_REFUSED, &[], manage_stop_shape_status(response)?)?;
+			let status = manage_stop_shape_status(response)?;
+			assert_eq!(
+				status,
+				TransitStatus::InvalidArgument,
+				"the hive refuses a body that sets its heartbeat field alone"
+			);
 
 			let both = SequenceShapedCommand::both();
 			let both = signed_sequence_command_frame(&signer.identity, b"cmd-both", both).await?;
 			let response = emit_command(&mut client, both).await?;
 
-			trace.event_with(SEQUENCE_BOTH_REFUSED, &[], manage_stop_shape_status(response)?)?;
+			let status = manage_stop_shape_status(response)?;
+			assert_eq!(status, TransitStatus::InvalidArgument, "the hive refuses a body that sets both fields");
 
 			hive.stop();
 			Ok(())
@@ -729,8 +710,7 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(FIRST_SPAWN_UNAVAILABLE, exactly!(1), equals!(TransitStatus::Unavailable)),
-			(RETRY_SPAWN_ACCEPTED, exactly!(1), equals!(TransitStatus::Ok))
+			(events::HIVE_COMMAND_REFUSED, exactly!(1), equals!(TransitStatus::Unavailable))
 		]
 	}
 }
@@ -770,16 +750,18 @@ tb_scenario! {
 			hive.establish(Arc::new(trace.share())).await?;
 			Ok(hive)
 		},
-		client: |HiveEnv { trace, context: signer, hive }| async move {
+		client: |HiveEnv { context: signer, hive, .. }| async move {
 			let mut client = connect_hive(&hive, &signer).await?;
 			let signed = signed_spawn_frame(&signer.identity, b"spawn-retry", "flaky").await?;
 			let replay = signed.to_owned();
 
 			let first = emit_command(&mut client, signed).await?;
-			trace.event_with(FIRST_SPAWN_UNAVAILABLE, &[], manage_spawn_shape_status(first)?)?;
+			let status = manage_spawn_shape_status(first)?;
+			assert_eq!(status, TransitStatus::Unavailable, "the hive refuses a spawn whose spawner fails");
 
 			let second = emit_command(&mut client, replay).await?;
-			trace.event_with(RETRY_SPAWN_ACCEPTED, &[], manage_spawn_shape_status(second)?)?;
+			let status = manage_spawn_shape_status(second)?;
+			assert_eq!(status, TransitStatus::Ok, "the hive admits the signed retry");
 
 			hive.stop();
 			Ok(())
@@ -792,8 +774,7 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(DRAIN_REFUSAL_UNAVAILABLE, exactly!(1), equals!(TransitStatus::Unavailable)),
-			(DRAIN_REFUSAL_REPLAY_REFUSED, exactly!(1), equals!(TransitStatus::PermissionDenied))
+			(events::HIVE_COMMAND_REFUSED, exactly!(2))
 		]
 	}
 }
@@ -809,7 +790,7 @@ tb_scenario! {
 		start: |SetupEnv { trace, context: signer }| async move {
 			start_trusted_hive(&trace, &signer, HiveConfig::default()).await
 		},
-		client: |HiveEnv { trace, context: signer, hive }| async move {
+		client: |HiveEnv { context: signer, hive, .. }| async move {
 			let mut client = connect_hive(&hive, &signer).await?;
 			hive.drain().await?;
 
@@ -817,10 +798,12 @@ tb_scenario! {
 			let replay = signed.to_owned();
 
 			let first = emit_command(&mut client, signed).await?;
-			trace.event_with(DRAIN_REFUSAL_UNAVAILABLE, &[], manage_stop_shape_status(first)?)?;
+			let status = manage_stop_shape_status(first)?;
+			assert_eq!(status, TransitStatus::Unavailable, "a drain refuses the stop");
 
 			let second = emit_command(&mut client, replay).await?;
-			trace.event_with(DRAIN_REFUSAL_REPLAY_REFUSED, &[], manage_stop_shape_status(second)?)?;
+			let status = manage_stop_shape_status(second)?;
+			assert_eq!(status, TransitStatus::PermissionDenied, "the hive refuses the resent frame as a replay");
 
 			hive.stop();
 			Ok(())
@@ -861,14 +844,14 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(SPAWN_NON_UTF8_FORBIDDEN, exactly!(1), equals!(TransitStatus::PermissionDenied)),
+			(events::HIVE_COMMAND_REFUSED, exactly!(1), equals!(TransitStatus::PermissionDenied)),
 			(SERVLET_STOPPED, exactly!(1))
 		]
 	}
 }
 
 // The hive must refuse registration of a manage spawn whose locator is not
-// UTF-8, and still tear the orphaned servlet down through `stop_boxed`.
+// UTF-8, and tear the orphaned servlet down through `stop_boxed`.
 tb_scenario! {
 	name: hive_manage_spawn_non_utf8_stops_orphan,
 	spec: HiveSpawnNonUtf8Spec,
@@ -900,11 +883,12 @@ tb_scenario! {
 			hive.establish(Arc::new(trace.share())).await?;
 			Ok(hive)
 		},
-		client: |HiveEnv { trace, context: signer, hive }| async move {
+		client: |HiveEnv { context: signer, hive, .. }| async move {
 			let mut client = connect_hive(&hive, &signer).await?;
 			let signed = signed_spawn_frame(&signer.identity, b"spawn-orphan", "orphan").await?;
 			let response = emit_command(&mut client, signed).await?;
-			trace.event_with(SPAWN_NON_UTF8_FORBIDDEN, &[], manage_spawn_shape_status(response)?)?;
+			let status = manage_spawn_shape_status(response)?;
+			assert_eq!(status, TransitStatus::PermissionDenied, "the hive refuses a spawn it cannot name");
 
 			hive.stop();
 			Ok(())
@@ -922,8 +906,8 @@ tb_assert_spec! {
 	}
 }
 
-// A hive dropped without `stop`, as a scenario that panics drops it, must still
-// stop every registered servlet.
+// A hive that drops without `stop`, as a scenario that panics drops it, must
+// stop every registered servlet as `stop` does.
 tb_scenario! {
 	name: hive_drop_stops_registered_servlets,
 	spec: HiveDropStopsServletsSpec,
@@ -950,18 +934,12 @@ tb_scenario! {
 	}
 }
 
-pub(crate) const HIVE_CALL_SIGNED: Urn<'static> = tightbeam::urn!("test", "event:hive/call-signed");
-pub(crate) const HIVE_CALL_PREVIOUS: Urn<'static> = tightbeam::urn!("test", "event:hive/call-previous");
 pub(crate) const CONTRACT_FRAME_CLIENT_ID: Urn<'static> =
 	tightbeam::urn!("test", "event:hive/contract-frame-client-id");
 pub(crate) const CONTRACT_FRAME_SIGNED: Urn<'static> = tightbeam::urn!("test", "event:hive/contract-frame-signed");
 pub(crate) const CONTRACT_FRAME_PREVIOUS: Urn<'static> = tightbeam::urn!("test", "event:hive/contract-frame-previous");
 pub(crate) const CONTRACT_FRAME_SIG_VALID: Urn<'static> =
 	tightbeam::urn!("test", "event:hive/contract-frame-sig-valid");
-pub(crate) const HIVE_CALL_REPLY_ID: Urn<'static> = tightbeam::urn!("test", "event:hive/call-reply-id");
-pub(crate) const HIVE_CALL_REPLY_SIGNED: Urn<'static> = tightbeam::urn!("test", "event:hive/call-reply-signed");
-pub(crate) const HIVE_CALL_REPLY_SIG_VALID: Urn<'static> = tightbeam::urn!("test", "event:hive/call-reply-sig-valid");
-pub(crate) const HIVE_CALL_ECHOED: Urn<'static> = tightbeam::urn!("test", "event:hive/call-echoed");
 
 /// Returns the deterministic contract key that the caller and the sibling
 /// servlet share, so each side can verify the other's frame signature
@@ -1037,15 +1015,17 @@ fn contract_servlet_conf(
 		.build())
 }
 
-/// Starts an established hive with one `FrameContractServlet` sibling.
-/// The intra-hive pool pins the servlet certificate and offers mux.
+/// Starts an established hive on `trace` with one `FrameContractServlet`
+/// sibling on `servlet_trace`. The intra-hive pool pins the servlet
+/// certificate and offers mux.
 async fn start_contract_hive(
 	trace: TraceCollector,
+	servlet_trace: TraceCollector,
 	materials: &ServerMaterials,
 ) -> Result<HiveX509Test, TightBeamError> {
 	let config = contract_servlet_conf(materials)?;
-	let trace = Arc::new(trace.share());
-	let servlet = FrameContractServlet::start(Arc::clone(&trace), config).await?;
+	let trace = Arc::new(trace);
+	let servlet = FrameContractServlet::start(Arc::new(servlet_trace), config).await?;
 
 	let trust_store = pinning_trust_store(&materials.certificate)?;
 	let mut conf = HiveConfig { trust_store: Some(trust_store), ..Default::default() };
@@ -1064,32 +1044,26 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(HIVE_CALL_SIGNED, exactly!(1), equals!(1u32)),
-			(HIVE_CALL_PREVIOUS, exactly!(1), equals!(1u32)),
 			(CONTRACT_FRAME_CLIENT_ID, exactly!(1), equals!(1u32)),
 			(CONTRACT_FRAME_SIGNED, exactly!(1), equals!(1u32)),
 			(CONTRACT_FRAME_PREVIOUS, exactly!(1), equals!(1u32)),
-			(CONTRACT_FRAME_SIG_VALID, exactly!(1), equals!(1u32)),
-			(HIVE_CALL_REPLY_ID, exactly!(1), equals!(1u32)),
-			(HIVE_CALL_REPLY_SIGNED, exactly!(1), equals!(1u32)),
-			(HIVE_CALL_REPLY_SIG_VALID, exactly!(1), equals!(1u32)),
-			(HIVE_CALL_ECHOED, exactly!(1), equals!(42u64))
+			(CONTRACT_FRAME_SIG_VALID, exactly!(1), equals!(1u32))
 		]
 	}
 }
 
-// The presence probes witness only that an id, a signature block, and a
-// previous-frame digest exist. The two SIG_VALID assertions prove byte
-// fidelity, because a signature verifies only over the bytes its signer signed.
+// The servlet's SIG_VALID probe and the client's check of the reply signature
+// prove byte fidelity, because a signature verifies only over the bytes its
+// signer signed.
 tb_scenario! {
 	name: hive_context_call_delivers_signed_frame,
 	spec: HiveCallFrameDeliverySpec,
 	environment Hive {
 		context: ServerMaterials::generate(),
 		start: |SetupEnv { trace, context: materials }| async move {
-			start_contract_hive(trace, &materials).await
+			start_contract_hive(trace.share(), trace, &materials).await
 		},
-		client: |HiveEnv { trace, hive, .. }| async move {
+		client: |HiveEnv { hive, .. }| async move {
 			let unsigned = FrameBuilder::from(Version::V2)
 				.with_id(b"hive-signed-call")
 				.with_order(UnixMillis::now().get())
@@ -1099,8 +1073,8 @@ tb_scenario! {
 
 			let signed = sign_contract_frame(unsigned).await?;
 
-			trace.event_with(HIVE_CALL_SIGNED, &[], u32::from(signed.nonrepudiation().is_some()))?;
-			trace.event_with(HIVE_CALL_PREVIOUS, &[], u32::from(signed.metadata().previous_frame().is_some()))?;
+			assert!(signed.nonrepudiation().is_some(), "the caller signs its frame");
+			assert!(signed.metadata().previous_frame().is_some(), "the caller links its frame to a previous frame");
 
 			// The public surface under test is `HiveContext::call`. The
 			// caller's complete signed frame goes out as composed, and the
@@ -1109,12 +1083,19 @@ tb_scenario! {
 			let contract = servlet_urn("contract");
 			let reply = ctx.call(&contract, signed).await?;
 
-			trace.event_with(HIVE_CALL_REPLY_ID, &[], u32::from(reply.metadata().id() == b"hive-contract-reply"))?;
-			trace.event_with(HIVE_CALL_REPLY_SIGNED, &[], u32::from(reply.nonrepudiation().is_some()))?;
-			trace.event_with(HIVE_CALL_REPLY_SIG_VALID, &[], u32::from(contract_signature_verifies(&reply)))?;
+			assert_eq!(
+				reply.metadata().id(),
+				b"hive-contract-reply",
+				"HiveContext::call returns the servlet's reply frame"
+			);
+			assert!(reply.nonrepudiation().is_some(), "the reply keeps the servlet's signature");
+			assert!(
+				contract_signature_verifies(&reply),
+				"the reply signature verifies over the bytes the caller received"
+			);
 
 			let response: HiveTestResponse = decode(reply.message())?;
-			trace.event_with(HIVE_CALL_ECHOED, &[], u64::from(response.doubled))?;
+			assert_eq!(response.doubled, 42, "the contract servlet doubles 21");
 
 			hive.stop();
 			Ok(())
@@ -1122,10 +1103,10 @@ tb_scenario! {
 	}
 }
 
-/// The gate verdicts that a hive's own trace records as its control plane
-/// answers one heartbeat. The client dials with a default endpoint, so the
-/// trace holds the events of the hive alone.
-async fn hive_gate_verdicts() -> Result<Vec<Urn<'static>>, TightBeamError> {
+/// The events among `kept` that a hive's own trace records, in order, as its
+/// control plane answers one unsigned heartbeat. The client dials with a
+/// default endpoint, so the trace holds the events of the hive alone.
+async fn hive_trail(kept: &[Urn<'static>]) -> Result<Vec<Urn<'static>>, TightBeamError> {
 	let trace = TraceCollector::new();
 	let signer = trusted_signer("CN=Hive Trail Cluster");
 	let hive = start_trusted_hive(&trace, &signer, HiveConfig::default()).await?;
@@ -1133,14 +1114,26 @@ async fn hive_gate_verdicts() -> Result<Vec<Urn<'static>>, TightBeamError> {
 	emit_command(&mut client, command_frame(b"hb-trail", heartbeat_command())?).await?;
 	hive.stop();
 
-	Ok(TestTrace::trail(&trace, &[events::GATE_ACCEPT, events::GATE_REJECT]))
+	Ok(TestTrace::trail(&trace, kept))
 }
 
 /// A hive's trace records the gate verdict of each command its control plane
 /// answers.
 #[tokio::test]
 async fn a_hive_records_the_gate_verdicts_of_its_control_plane_on_its_own_trace() -> Result<(), TightBeamError> {
-	assert_eq!(hive_gate_verdicts().await?, [events::GATE_ACCEPT]);
+	assert_eq!(
+		hive_trail(&[events::GATE_ACCEPT, events::GATE_REJECT]).await?,
+		[events::GATE_ACCEPT]
+	);
+	Ok(())
+}
+
+/// A hive's trace records its refusal of an unsigned command after the
+/// verdict of the transport gate that admitted the frame.
+#[tokio::test]
+async fn a_hive_records_its_refusal_after_the_gate_verdict_on_its_own_trace() -> Result<(), TightBeamError> {
+	let trail = hive_trail(&[events::GATE_ACCEPT, events::HIVE_COMMAND_REFUSED]).await?;
+	assert_eq!(trail, [events::GATE_ACCEPT, events::HIVE_COMMAND_REFUSED]);
 	Ok(())
 }
 
@@ -1201,5 +1194,35 @@ async fn hive_trace_after_refused_peers() -> Result<(Vec<Urn<'static>>, bool), T
 #[tokio::test]
 async fn refused_peers_fill_the_trace_of_a_hive_ahead_of_its_own_events() -> Result<(), TightBeamError> {
 	assert_eq!(hive_trace_after_refused_peers().await?, (vec![], true));
+	Ok(())
+}
+
+/// The dials that a hive's own trace records as a caller reaches a sibling
+/// servlet through the hive context. The servlet records into a trace of its
+/// own, so the hive's trace holds the dials of the hive's servlet pool alone.
+async fn hive_sibling_dials() -> Result<Vec<Urn<'static>>, TightBeamError> {
+	let trace = TraceCollector::new();
+	let materials = ServerMaterials::generate();
+	let hive = start_contract_hive(trace.share(), TraceCollector::new(), &materials).await?;
+	let unsigned = FrameBuilder::from(Version::V2)
+		.with_id(b"hive-pool-dial")
+		.with_order(UnixMillis::now().get())
+		.with_previous_hash(TestDigest::info())
+		.with_message(HiveTestRequest { value: 21 })
+		.build()?;
+
+	let signed = sign_contract_frame(unsigned).await?;
+
+	hive.context().call(&servlet_urn("contract"), signed).await?;
+	hive.stop();
+
+	Ok(TestTrace::trail(&trace, &[events::POOL_DIAL]))
+}
+
+/// A hive records each dial of its servlet pool on its own trace, the trace
+/// it establishes with.
+#[tokio::test]
+async fn a_hive_records_the_dials_of_its_servlet_pool_on_its_own_trace() -> Result<(), TightBeamError> {
+	assert_eq!(hive_sibling_dials().await?, [events::POOL_DIAL]);
 	Ok(())
 }

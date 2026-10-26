@@ -1,4 +1,4 @@
-//! URN builder for constructing URNs with validation
+//! The URN builder, which validates each URN it constructs.
 
 use crate::urn::{Urn, UrnComponents, UrnSpec, UrnValidationError};
 
@@ -13,36 +13,36 @@ use std::{borrow::Cow, boxed::Box, collections::HashMap};
 #[cfg(feature = "builder")]
 use crate::builder::TypeBuilder;
 
-/// Spec builder function type
+/// The closure that builds the NSS of a spec on a builder.
 type SpecBuilderFn<'a> = dyn FnOnce(&mut UrnBuilder<'a>) -> Result<Cow<'static, str>, UrnValidationError> + 'a;
 
-/// Builder for constructing URNs with validation
+/// A builder that constructs URNs and validates them.
 #[derive(Default)]
 pub struct UrnBuilder<'a> {
-	/// Namespace Identifier
+	/// The Namespace Identifier (NID) of the URN.
 	pub(crate) nid: Option<Cow<'a, str>>,
 
-	/// Hierarchical components for NSS construction
+	/// The hierarchical components that the NSS is constructed from.
 	pub(crate) components: HashMap<&'static str, Cow<'a, str>>,
 
-	/// NSS building mode - either direct NSS or spec-based
+	/// The mode that builds the NSS, from a direct NSS or from a spec.
 	nss_mode: NssMode<'a>,
 }
 
-/// NSS construction mode - mutually exclusive
+/// The one mode of NSS construction that a builder holds.
 #[derive(Default)]
 enum NssMode<'a> {
-	/// Not yet set
+	/// The caller set no mode, so the NSS comes from the components.
 	#[default]
 	Unset,
-	/// Direct NSS string provided via `with_nss()`
+	/// The NSS string that `with_nss()` provides.
 	Direct(Cow<'a, str>),
-	/// Spec-based building via `with_spec()` - stores the building closure
+	/// The building closure that `with_spec()` stores.
 	Spec(Box<SpecBuilderFn<'a>>),
 }
 
 impl<'a> UrnBuilder<'a> {
-	/// Get a component value by key
+	/// Returns the component value of `key`.
 	#[inline]
 	pub fn get(&self, key: &'static str) -> Option<&Cow<'a, str>> {
 		self.components.get(key)
@@ -88,43 +88,41 @@ impl<'a> UrnComponents<'a> for UrnBuilder<'a> {
 }
 
 impl<'a> UrnBuilder<'a> {
-	/// Set a component value by key
+	/// Sets the component value of `key`.
 	///
-	/// Keys can be hierarchical using dot notation (e.g., "resource.type")
+	/// A key can be hierarchical in dot notation, such as `"resource.type"`.
 	#[inline]
 	pub fn set(mut self, key: &'static str, value: impl Into<Cow<'a, str>>) -> Self {
 		self.components.insert(key, value.into());
 		self
 	}
 
-	/// Set the Namespace Identifier (NID)
+	/// Sets the Namespace Identifier (NID).
 	#[inline]
 	pub fn with_nid(mut self, nid: impl Into<Cow<'a, str>>) -> Self {
 		self.nid = Some(nid.into());
 		self
 	}
 
-	/// Set the NSS directly
+	/// Sets the NSS directly.
 	///
-	/// This method cannot be used together with `with_spec()`. If both are
-	/// called, `build()` will return an error.
+	/// The builder holds one NSS mode, so this call replaces the spec that an
+	/// earlier `with_spec()` set.
 	pub fn with_nss(mut self, nss: impl Into<Cow<'a, str>>) -> Self {
 		self.nss_mode = NssMode::Direct(nss.into());
 		self
 	}
 
-	/// Configure the builder to use a spec for validation and NSS construction
+	/// Configures a spec for the validation and the NSS construction.
 	///
-	/// This method cannot be used together with `with_nss()`. If both are
-	/// called, `build()` will return an error.
+	/// The builder holds one NSS mode, so this call replaces the NSS that an
+	/// earlier `with_nss()` set.
 	pub fn with_spec<S: UrnSpec>(mut self) -> Self {
-		// Capture the spec's building logic in a closure
+		// The closure defers the work of the spec to `build()`.
 		let spec_builder = move |builder: &mut UrnBuilder<'a>| -> Result<Cow<'static, str>, UrnValidationError> {
-			// Transform: spec mutates components via UrnComponents trait
+			// The spec transforms the components before it validates them.
 			S::transform(builder as &mut dyn UrnComponents<'a>);
-			// Validate using UrnComponents trait
 			S::validate(builder as &dyn UrnComponents<'a>)?;
-			// Build NSS using UrnComponents trait
 			S::build_nss(builder as &dyn UrnComponents<'a>)
 		};
 
@@ -134,11 +132,11 @@ impl<'a> UrnBuilder<'a> {
 }
 
 impl<'a, S: UrnSpec> From<S> for UrnBuilder<'a> {
-	/// Create a URN builder from a spec type
+	/// Creates a URN builder from a spec type.
 	///
-	/// Pre-configures the builder with the spec's NID (Namespace Identifier)
-	/// and applies the spec's validation and NSS building logic. The builder
-	/// is ready to use - no need to call `with_spec::<S>()` separately.
+	/// The builder takes the NID (Namespace Identifier) of the spec and applies
+	/// the spec's validation and NSS building logic. The builder is ready to
+	/// use, because this call applies `with_spec::<S>()` itself.
 	#[inline]
 	fn from(_: S) -> Self {
 		let mut builder = UrnBuilder::default().with_spec::<S>();
@@ -148,44 +146,46 @@ impl<'a, S: UrnSpec> From<S> for UrnBuilder<'a> {
 }
 
 impl<'a> UrnBuilder<'a> {
-	/// Build the URN using the configured NSS mode
+	/// Builds the URN with the configured NSS mode.
 	///
-	/// The NSS can be provided via:
-	/// - `with_nss()`: Direct NSS string
-	/// - `with_spec()`: Spec-based validation and construction
-	/// - Default: Constructed from components in lexicographic key order
+	/// The NSS comes from one of three modes:
+	/// - `with_nss()` provides the NSS string directly.
+	/// - `with_spec()` validates the components and constructs the NSS from them.
+	/// - The default joins the components in lexicographic key order.
 	///
-	/// `with_nss()` and `with_spec()` are mutually exclusive. If neither is
-	/// called, the NSS is constructed from components.
+	/// `with_nss()` and `with_spec()` are mutually exclusive, so the later call
+	/// replaces the earlier. With neither call, the default mode applies.
 	///
 	/// # RFC 8141 Compliance
 	///
 	/// This method produces a URN in the format `urn:<NID>:<NSS>` where:
-	/// - NID is validated to be 2-32 characters, alphanumeric plus hyphens,
-	///   starting with a letter and ending with a letter or digit
-	/// - NSS is constructed according to the selected mode
+	/// - The NID has 2-32 characters of letters, digits, and hyphens, starts
+	///   with a letter, and ends with a letter or digit.
+	/// - The selected mode constructs the NSS.
 	///
 	/// # Errors
-	/// Returns an error if:
-	/// - NID is missing
-	/// - NID format is invalid (not RFC 8141 compliant)
-	/// - Both `with_nss()` and `with_spec()` were called (mutually exclusive)
-	/// - NSS cannot be constructed (empty components when using default mode)
+	/// - [`UrnValidationError::RequiredFieldMissing`] -- the NID is missing,
+	///   the NSS is empty, or the default mode has no components.
+	/// - [`UrnValidationError::InvalidNidLength`] -- the NID is not 2-32 characters long.
+	/// - [`UrnValidationError::InvalidNidStart`] -- the NID starts with a character other than a letter.
+	/// - [`UrnValidationError::InvalidNidCharacters`] -- the NID holds a
+	///   character other than a letter, a digit, or a hyphen, or it ends with a
+	///   hyphen.
+	/// - Any error of the spec's `validate` or `build_nss`, in the `with_spec()` mode.
 	pub fn build(mut self) -> Result<Urn<'a>, UrnValidationError> {
 		// A spec's own validation runs before assembly and may compare the
 		// NID, so a malformed NID is reported first with its own error.
 		let nid_ref = self.nid.as_ref().ok_or(UrnValidationError::RequiredFieldMissing("nid"))?;
 		Urn::validate_nid(nid_ref)?;
 
-		// Validate NID format first
-		// Take the mode out so the Spec closure can borrow the builder,
-		// and match exhaustively: no mode leaves an unhandled case.
+		// Take the mode out so the Spec closure can borrow the builder. The
+		// match is exhaustive, so every mode has a case.
 		let nss = match core::mem::replace(&mut self.nss_mode, NssMode::Unset) {
 			NssMode::Spec(builder_fn) => builder_fn(&mut self)?,
 			NssMode::Direct(nss) => nss,
 			NssMode::Unset => {
-				// Collect and sort keys for deterministic ordering (important
-				// for HashMap)
+				// A `HashMap` iterates in no fixed order, so the sorted keys
+				// make the NSS deterministic.
 				let mut keys: Vec<&'static str> = self.components.keys().copied().collect();
 				keys.sort();
 
@@ -224,7 +224,7 @@ mod tests {
 	use crate::urn::builders::spec::Pattern;
 
 	crate::urn_spec! {
-		/// Test URN spec for testing URN builder functionality
+		/// The URN spec that the builder tests use.
 		TestUrnSpec,
 		nid: "test",
 		nss_structure {
@@ -235,66 +235,65 @@ mod tests {
 		nss_format: "{}:{}/{}"
 	}
 
-	#[test]
-	fn test_urn_builder_with_nss() -> Result<(), UrnValidationError> {
-		// (nid, nss, expected_urn_string)
-		let test_cases: &[(&str, &str, &str)] = &[
-			("tightbeam", "test:resource", "urn:tightbeam:test:resource"),
-			("example", "path/to/resource", "urn:example:path/to/resource"),
-			("test", "simple", "urn:test:simple"),
-		];
-
-		for (nid, nss, expected) in test_cases {
-			let nid = *nid;
-			let nss = *nss;
+	// Each case is (nid, nss, the rendered URN).
+	crate::tb_cases! {
+		fn test_urn_builder_with_nss((nid, nss, expected): (&str, &str, &str)) -> Result<(), UrnValidationError> {
 			let urn = UrnBuilder::default().with_nid(nid).with_nss(nss).build()?;
-			assert_eq!(urn.nid, *nid);
-			assert_eq!(urn.nss, *nss);
-			assert_eq!(urn.to_string(), *expected);
+			assert_eq!(urn.nid, nid);
+			assert_eq!(urn.nss, nss);
+			assert_eq!(urn.to_string(), expected);
+			Ok(())
 		}
-
-		Ok(())
+		cases {
+			colon_path => ("tightbeam", "test:resource", "urn:tightbeam:test:resource"),
+			slash_path => ("example", "path/to/resource", "urn:example:path/to/resource"),
+			simple => ("test", "simple", "urn:test:simple"),
+		}
 	}
 
-	#[test]
-	fn test_urn_builder_with_components() -> Result<(), UrnValidationError> {
-		// (nid, components, expected_urn_string)
-		// Components are sorted by key in lexicographic order
-		type ComponentsTestCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a str);
-		let test_cases: &[ComponentsTestCase] = &[
-			("example", &[("type", "book"), ("id", "123")], "urn:example:123:book"),
-			("test", &[("a", "1"), ("b", "2"), ("c", "3")], "urn:test:1:2:3"),
-			("ns", &[("z", "last"), ("a", "first")], "urn:ns:first:last"),
-		];
+	/// The NID of one component case, its components, and the URN it renders.
+	type ComponentsTestCase = (&'static str, &'static [(&'static str, &'static str)], &'static str);
 
-		for (nid, components, expected) in test_cases {
-			let nid = *nid;
-			let mut builder = UrnBuilder::default().with_nid(nid);
-			for (key, value) in *components {
-				builder = builder.set(key, *value);
-			}
-
-			let urn = builder.build()?;
-			assert_eq!(urn.nid, *nid);
-			assert_eq!(urn.to_string(), *expected);
-		}
-
-		Ok(())
+	/// A builder of `nid` that holds each of `components`, in their order.
+	fn builder_of(nid: &'static str, components: &'static [(&'static str, &'static str)]) -> UrnBuilder<'static> {
+		let builder = UrnBuilder::default().with_nid(nid);
+		components
+			.iter()
+			.fold(builder, |builder, (key, value)| builder.set(key, *value))
 	}
 
-	#[test]
-	fn test_urn_builder_missing_nid() {
-		let test_cases: &[&str] = &["test", "resource:path", ""];
-		for nss in test_cases {
-			let nss = *nss;
+	// The builder sorts the components by key, in lexicographic order.
+	crate::tb_cases! {
+		fn test_urn_builder_with_components((nid, components, expected): ComponentsTestCase)
+			-> Result<(), UrnValidationError>
+		{
+			let urn = builder_of(nid, components).build()?;
+			assert_eq!(urn.nid, nid);
+			assert_eq!(urn.to_string(), expected);
+			Ok(())
+		}
+		cases {
+			two_keys => ("example", &[("type", "book"), ("id", "123")], "urn:example:123:book"),
+			sorted_keys => ("test", &[("a", "1"), ("b", "2"), ("c", "3")], "urn:test:1:2:3"),
+			reversed_keys => ("ns", &[("z", "last"), ("a", "first")], "urn:ns:first:last"),
+		}
+	}
+
+	crate::tb_cases! {
+		fn test_urn_builder_missing_nid(nss: &str) {
 			let result = UrnBuilder::default().with_nss(nss).build();
 			assert!(matches!(result, Err(UrnValidationError::RequiredFieldMissing(_))));
+		}
+		cases {
+			simple => "test",
+			path => "resource:path",
+			empty => "",
 		}
 	}
 
 	#[test]
 	fn test_urn_builder_with_spec() -> Result<(), UrnValidationError> {
-		// Macro to reduce repetition in spec-based builder tests
+		// The spec-based builder cases share one body through this macro.
 		macro_rules! build_with_spec {
 			(values: [$($k:literal = $v:literal),+], nss: $expected_nss:literal, urn: $expected_urn:literal) => {{
 				let urn = UrnBuilder::from(TestUrnSpec)
@@ -306,7 +305,7 @@ mod tests {
 			}};
 		}
 
-		// Test all resource types with valid data
+		// Each resource type builds from valid data.
 		build_with_spec!(
 			values: ["category" = "instrumentation", "type" = "trace", "id" = "abc-123"],
 			nss: "instrumentation:trace/abc-123",
@@ -336,7 +335,7 @@ mod tests {
 
 	#[test]
 	fn test_urn_builder_with_spec_missing_fields() {
-		// Macro to test missing required fields
+		// The missing-field cases share one body through this macro.
 		macro_rules! missing_field {
 			(values: [$($k:literal = $v:literal),*], field: $expected:literal) => {{
 				let mut builder = UrnBuilder::from(TestUrnSpec);
@@ -346,7 +345,7 @@ mod tests {
 			}};
 		}
 
-		// Test each required field being missing
+		// Each case leaves one required field out.
 		missing_field!(values: ["type" = "trace", "id" = "123"], field: "category");
 		missing_field!(values: ["category" = "instrumentation", "id" = "123"], field: "type");
 		missing_field!(values: ["category" = "instrumentation", "type" = "trace"], field: "id");
@@ -354,7 +353,7 @@ mod tests {
 
 	#[test]
 	fn test_urn_builder_with_spec_invalid_fields() {
-		// Macro to test invalid field values
+		// The invalid-field cases share one body through this macro.
 		macro_rules! invalid_field {
 			(values: [$($k:literal = $v:literal),+], field: $expected:literal) => {{
 				let result = UrnBuilder::from(TestUrnSpec)
@@ -364,29 +363,31 @@ mod tests {
 			}};
 		}
 
-		// Test constraint violations
+		// A value outside the allowed set breaks a constraint.
 		invalid_field!(values: ["category" = "invalid", "type" = "trace", "id" = "123"], field: "category");
 		invalid_field!(values: ["category" = "instrumentation", "type" = "invalid", "id" = "123"], field: "type");
 
-		// Test pattern violations
+		// A value outside the allowed characters breaks a pattern.
 		invalid_field!(values: ["category" = "instrumentation", "type" = "trace", "id" = "invalid_chars!"], field: "id");
 		invalid_field!(values: ["category" = "instrumentation", "type" = "trace", "id" = "space here"], field: "id");
 		invalid_field!(values: ["category" = "instrumentation", "type" = "trace", "id" = "underscore_here"], field: "id");
 	}
 
-	#[test]
-	fn test_urn_builder_empty_components() {
-		let test_cases: &[&str] = &["tightbeam", "test", "example"];
-		for nid in test_cases {
-			let nid = *nid;
+	crate::tb_cases! {
+		fn test_urn_builder_empty_components(nid: &str) {
 			let result = UrnBuilder::default().with_nid(nid).build();
 			assert!(matches!(result, Err(UrnValidationError::RequiredFieldMissing(_))));
 		}
+		cases {
+			tightbeam => "tightbeam",
+			test => "test",
+			example => "example",
+		}
 	}
 
-	// The builder assembled a `Urn` with a struct literal, so an NSS the
-	// constructors refuse reached a value through it. Each row is one way
-	// the builder can end up holding an empty NSS.
+	// The builder assembles its `Urn` through the one checked constructor, so
+	// it refuses an NSS that the constructors refuse. Each row is one way the
+	// builder can end up holding an empty NSS.
 	#[test]
 	fn the_builder_refuses_an_empty_nss() {
 		let direct = UrnBuilder::default().with_nid("test").with_nss("").build();
@@ -405,8 +406,7 @@ mod tests {
 		);
 	}
 
-	// Error ordering: a malformed NID is named as such before anything
-	// about the NSS is considered.
+	// The builder names a malformed NID before it checks the NSS.
 	#[test]
 	fn the_builder_names_a_malformed_nid_before_an_empty_nss() {
 		let result = UrnBuilder::default().with_nid("9bad").with_nss("").build();

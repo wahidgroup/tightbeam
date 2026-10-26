@@ -1,7 +1,8 @@
-//! Frame request handler worker - handles FrameRequest messages
+//! The frame request handler worker, which handles `FrameRequest` messages.
 //!
-//! Business logic: Check if we have the requested frames, decide to respond or cascade.
-//! Returns frames and action for servlet to execute.
+//! The worker checks whether this node holds the requested frames, and then
+//! responds with them or cascades the request upstream. It returns the frames
+//! and the action for the servlet to execute.
 
 use std::sync::Arc;
 
@@ -16,28 +17,28 @@ use crate::dtn::{
 	ultimate::{gap_recovery_event, GapRecoveryStep},
 };
 
-/// Frame request handler request
+/// The request to the frame request handler.
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 pub struct FrameRequestHandlerRequest {
 	pub request: FrameRequest,
 	pub node_name: String,
 }
 
-/// Action to take after processing frame request
+/// The action that follows the handling of a frame request.
 #[derive(Beamable, Choice, Clone, Debug, PartialEq)]
 pub enum FrameRequestAction {
-	/// Respond with frames
+	/// Respond with the frames this node holds.
 	#[asn1(context_specific = "0")]
 	Respond(u8),
-	/// Cascade upstream
+	/// Cascade the request upstream.
 	#[asn1(context_specific = "1")]
 	Cascade(u8),
-	/// No action
+	/// Take no action, because this node is the origin.
 	#[asn1(context_specific = "2")]
 	NoAction(u8),
 }
 
-/// Frame request handler response
+/// The response of the frame request handler.
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 pub struct FrameRequestHandlerResponse {
 	pub action: FrameRequestAction,
@@ -53,28 +54,27 @@ worker! {
 	handle: |request, trace, config| async move {
 		trace.event(gap_recovery_event(&request.node_name, GapRecoveryStep::ReceiveFrameRequest))?;
 
-		// Check if we have the requested frames
 		let missing_frames = config.chain_processor.request_missing_frames(
-			request.request.requester_head,
-			request.request.last_received_hash,
+			&request.request.requester_head,
+			&request.request.last_received_hash,
 		)?;
 
 		if !missing_frames.is_empty() {
-			// We have frames - respond
+			// This node holds the frames, so it responds with them.
 			trace.event(gap_recovery_event(&request.node_name, GapRecoveryStep::SendFrameResponse))?;
 			Ok(FrameRequestHandlerResponse {
 				action: FrameRequestAction::Respond(0),
 				missing_frames,
 			})
 		} else if config.can_cascade {
-			// We don't have frames - cascade upstream
+			// This node holds none of the frames, so it cascades upstream.
 			trace.event(gap_recovery_event(&request.node_name, GapRecoveryStep::CascadeFrameRequest))?;
 			Ok(FrameRequestHandlerResponse {
 				action: FrameRequestAction::Cascade(0),
 				missing_frames: vec![],
 			})
 		} else {
-			// Can't cascade (we're the origin)
+			// The origin has no upstream to cascade to.
 			Ok(FrameRequestHandlerResponse {
 				action: FrameRequestAction::NoAction(0),
 				missing_frames: vec![],

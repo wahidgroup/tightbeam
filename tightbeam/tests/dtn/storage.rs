@@ -1,9 +1,10 @@
-//! Frame storage and chain verification for the DTN tests.
+//! The frame storage and chain verification of the DTN tests.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tightbeam::asn1::{DigestInfo, Frame};
 use tightbeam::crypto::hash::{Digest, Sha3_256};
+use tightbeam::der::asn1::OctetString;
 use tightbeam::der::{Decode, Encode, Sequence};
 use tightbeam::random::{OsRng, RngCore};
 use tightbeam::{Beamable, TightBeamError};
@@ -12,13 +13,35 @@ use tightbeam::{Beamable, TightBeamError};
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 pub struct DtnPayload {
 	/// The application bytes of the payload.
-	pub content: Vec<u8>,
+	pub content: OctetString,
 	/// The identifier of the node that sent the payload.
 	pub source_node: String,
 	/// The identifier of the node the payload is for.
 	pub dest_node: String,
 	/// The number of hops the payload has crossed, which tracks its path.
 	pub hop_count: u32,
+}
+
+impl DtnPayload {
+	/// A payload of `content` that `source_node` sends to `dest_node`, after
+	/// `hop_count` hops.
+	///
+	/// # Errors
+	///
+	/// - [`tightbeam::der::Error`] -- `content` is longer than an OCTET STRING holds.
+	pub fn new(
+		content: impl Into<Vec<u8>>,
+		source_node: impl Into<String>,
+		dest_node: impl Into<String>,
+		hop_count: u32,
+	) -> tightbeam::der::Result<Self> {
+		Ok(Self {
+			content: OctetString::new(content)?,
+			source_node: source_node.into(),
+			dest_node: dest_node.into(),
+			hop_count,
+		})
+	}
 }
 
 /// The verdict of a cryptographic chain verification.
@@ -33,7 +56,7 @@ pub struct ChainVerdict {
 	pub verified_count: usize,
 }
 
-/// Filesystem frame storage for the DTN simulation.
+/// The filesystem frame storage of the DTN simulation.
 ///
 /// The store shows that tightbeam frames persist and load back across
 /// network delays without a custody transfer protocol.
@@ -193,8 +216,8 @@ impl StorageRoot {
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError::IoError`] -- the directory cannot be created, which
-	///   includes a directory of that name that exists already.
+	/// - [`TightBeamError::IoError`] -- the call fails to create the directory,
+	///   as it does when a directory of that name exists.
 	pub fn create() -> Result<Self, TightBeamError> {
 		let suffix = OsRng.next_u64();
 		let name = format!("tightbeam-dtn-{}-{suffix:016x}", std::process::id());
@@ -229,12 +252,7 @@ mod tests {
 		let root = StorageRoot::create()?;
 		let mut store = FrameStore::new(root.node("store"))?;
 
-		let payload = DtnPayload {
-			content: b"test payload".to_vec(),
-			source_node: "test".to_string(),
-			dest_node: "test".to_string(),
-			hop_count: 0,
-		};
+		let payload = DtnPayload::new(b"test payload", "test", "test", 0)?;
 
 		let frame = compose! {
 			V0: id: "test-frame",
@@ -247,7 +265,7 @@ mod tests {
 
 		let retrieved = store.retrieve(&frame_id)?;
 		let retrieved_payload = DtnPayload::from_der(retrieved.message())?;
-		assert_eq!(retrieved_payload.content, b"test payload");
+		assert_eq!(retrieved_payload.content.as_bytes(), b"test payload");
 
 		store.clear()?;
 
@@ -267,12 +285,7 @@ mod tests {
 		// The five frames carry the orders 1 to 5.
 		let mut frames = Vec::new();
 		for i in 1..=5 {
-			let payload = DtnPayload {
-				content: format!("message-{}", i).into_bytes(),
-				source_node: "test".to_string(),
-				dest_node: "test".to_string(),
-				hop_count: 0,
-			};
+			let payload = DtnPayload::new(format!("message-{}", i), "test", "test", 0)?;
 			let frame = compose! {
 				V0: id: format!("frame-{}", i),
 				order: i,
@@ -302,7 +315,7 @@ mod tests {
 			}
 		}
 
-		// The buffer released all five frames, in order.
+		// The buffer releases all five frames, in order.
 		assert_eq!(processed_frames.len(), 5, "All 5 frames should be processed");
 		for (i, frame) in processed_frames.iter().enumerate() {
 			assert_eq!(

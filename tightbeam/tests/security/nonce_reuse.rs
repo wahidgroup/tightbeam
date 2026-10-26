@@ -15,7 +15,7 @@
 //! ephemeral, which the opening carries and the signed transcript binds. A
 //! fresh client binds its own opening, so a replayed reply MUST fail its
 //! signature (`SignatureVerificationFailed`). A client that accepts the reply
-//! is the defect, and `NONCE_REPLAY_ACCEPTED` records it.
+//! is the defect, and it fails the scenario.
 //!
 //! ## References
 //! - CWE-323: Reusing a Nonce, Key Pair in Encryption <https://cwe.mitre.org/data/definitions/323.html>
@@ -25,34 +25,28 @@
 use std::sync::Arc;
 
 use tightbeam::{
-	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
+	exactly,
+	instrumentation::events,
+	job, tb_assert_spec, tb_process_spec, tb_scenario,
 	testing::{ScenarioConfig, SetupEnv},
 	trace::TraceCollector,
-	transport::handshake::HandshakeError::SignatureVerificationFailed,
 	urn::Urn,
 	TightBeamError,
 };
 
-use crate::security::common::{
-	expectation_failure, HandshakeBackendKind, InjectionOutcome, SecurityThreatHarness, BACKEND_COUNT_U32,
-};
+use crate::security::common::{expectation_failure, HandshakeBackendKind, SecurityThreatHarness};
 
 pub(crate) const NONCE_CAPTURE_VALID: Urn<'static> = tightbeam::urn!("test", "event:nonce-reuse/nonce-capture-valid");
 pub(crate) const NONCE_REPLAY_ATTEMPT: Urn<'static> = tightbeam::urn!("test", "event:nonce-reuse/nonce-replay-attempt");
-pub(crate) const NONCE_REPLAY_REJECTED: Urn<'static> =
-	tightbeam::urn!("test", "event:nonce-reuse/nonce-replay-rejected");
-pub(crate) const NONCE_REPLAY_ACCEPTED: Urn<'static> =
-	tightbeam::urn!("test", "event:nonce-reuse/nonce-replay-accepted");
 
 tb_assert_spec! {
 	pub NonceReuseSpec,
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(NONCE_CAPTURE_VALID, exactly!(BACKEND_COUNT_U32)),
-			(NONCE_REPLAY_ATTEMPT, exactly!(BACKEND_COUNT_U32)),
-			(NONCE_REPLAY_REJECTED, exactly!(BACKEND_COUNT_U32), equals!(true)),
-			(NONCE_REPLAY_ACCEPTED, exactly!(0))
+			(NONCE_CAPTURE_VALID, exactly!(1)),
+			(NONCE_REPLAY_ATTEMPT, exactly!(1)),
+			(events::SESSION_CERT_REJECTED, exactly!(1), equals!("signature"))
 		]
 	}
 }
@@ -64,8 +58,7 @@ tb_process_spec! {
 
 			NONCE_CAPTURE_VALID,
 			NONCE_REPLAY_ATTEMPT,
-			NONCE_REPLAY_REJECTED,
-			NONCE_REPLAY_ACCEPTED,
+			events::SESSION_CERT_REJECTED,
 			SecurityThreatHarness::HARNESS_SPAWN_SESSION,
 			SecurityThreatHarness::HARNESS_SPAWN_HPKE,
 			SecurityThreatHarness::HARNESS_SPAWN_CMS
@@ -85,61 +78,63 @@ tb_process_spec! {
 			SecurityThreatHarness::HARNESS_SPAWN_CMS => ReplayReady
 		},
 		ReplayReady => { NONCE_REPLAY_ATTEMPT => ReplayAttempted },
-		ReplayAttempted => {
-			NONCE_REPLAY_REJECTED => Idle,
-			NONCE_REPLAY_ACCEPTED => Idle
-		}
+		ReplayAttempted => { events::SESSION_CERT_REJECTED => Idle }
 	}
 	terminal { Idle }
 	annotations { description: "Nonce reuse attack: freshness via the opening bound into the signed transcript" }
 }
 
 tb_scenario! {
-	name: nonce_reuse,
+	name: nonce_reuse_hpke,
 	config: ScenarioConfig::builder()
 		.with_spec(NonceReuseSpec::latest())
 		.with_csp(NonceReuseProcess)
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
-			NonceReuseScenario::run((trace.into(),)).await
+			NonceReuseScenario::run((trace.into(), HandshakeBackendKind::Hpke)).await
+		}
+	}
+}
+
+#[cfg(feature = "transport-cms")]
+tb_scenario! {
+	name: nonce_reuse_cms,
+	config: ScenarioConfig::builder()
+		.with_spec(NonceReuseSpec::latest())
+		.with_csp(NonceReuseProcess)
+		.build(),
+	environment Bare {
+		exec: |SetupEnv { trace, .. }| async move {
+			NonceReuseScenario::run((trace.into(), HandshakeBackendKind::Cms)).await
 		}
 	}
 }
 
 job! {
 	name: NonceReuseScenario,
-	async fn run((trace,): (Arc<TraceCollector>,)) -> Result<(), TightBeamError> {
+	async fn run((trace, kind): (Arc<TraceCollector>, HandshakeBackendKind)) -> Result<(), TightBeamError> {
 		let harness = SecurityThreatHarness::with_trace(Arc::clone(&trace));
 
-		for kind in HandshakeBackendKind::all() {
-			// 1. Capture a handshake, whose reply the server signed over the
-			//    transcript of one opening and its nonce.
-			let mut capture_session = harness.spawn(kind)?;
-			let captured = capture_session.capture_full().await?;
+		// 1. Capture a handshake, whose reply the server signed over the
+		//    transcript of one opening and its nonce.
+		let mut capture_session = harness.spawn(kind)?;
+		let captured = capture_session.capture_full().await?;
 
-			trace.event(NONCE_CAPTURE_VALID)?;
+		trace.event(NONCE_CAPTURE_VALID)?;
 
-			let target = captured.server_reply().ok_or_else(|| expectation_failure("no reply captured"))?;
+		let target = captured.server_reply().ok_or_else(|| expectation_failure("no reply captured"))?;
 
-			// 2. Replay the reply to a fresh client, whose opening carries a nonce of its own.
-			let mut replay_session = harness.spawn(kind)?;
+		// 2. Replay the reply to a live client, whose opening carries a nonce
+		//    of its own and whose verdict the scenario trace files.
+		let injection = kind.replacement(target.step, &target.payload)?;
+		let replay = harness.live(kind)?.audit_client(&trace).with_step(injection);
 
-			trace.event(NONCE_REPLAY_ATTEMPT)?;
+		trace.event(NONCE_REPLAY_ATTEMPT)?;
 
-			match replay_session.inject_at_step(target.step, &target.payload).await? {
-				InjectionOutcome::Rejected(error) => {
-					// The fresh client binds its own opening, so the reply's
-					// signature over the captured one fails.
-					let bound = matches!(error, TightBeamError::HandshakeError(SignatureVerificationFailed));
-					trace.event_with(NONCE_REPLAY_REJECTED, &[], bound)?;
-				}
-				InjectionOutcome::Accepted => {
-					trace.event(NONCE_REPLAY_ACCEPTED)?;
-				}
-			}
-		}
-
-		Ok(())
+		// The fresh client binds its own opening, so the reply's signature
+		// over the captured one fails.
+		let outcome = replay.run().await?;
+		outcome.refused_by_client("the fresh client accepted a replayed reply")
 	}
 }

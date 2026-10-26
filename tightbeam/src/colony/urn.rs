@@ -1,4 +1,4 @@
-//! Colony resource naming: URN vocabulary, minting, and validation.
+//! The URN vocabulary of colony resources, with its minting and validation.
 //!
 //! An RFC 8141 URN names each colony resource, in a fixed positional
 //! grammar of typed segments after the ARN model:
@@ -33,16 +33,16 @@ use crate::colony::protocol::ServletInfo;
 use crate::urn::{Urn, UrnValidationError};
 use crate::TightBeamError;
 
-/// Default naming authority for colony resources.
+/// The default naming authority for colony resources.
 pub const COLONY_NID: &str = "tightbeam";
 
 const SERVLET_SEGMENT: &str = "servlet";
 const HIVE_SEGMENT: &str = "hive";
 const COLONY_SEGMENT: &str = "colony";
 
-/// Naming scope for a colony deployment: authority (NID) plus an
-/// optional realm segment. All resource URNs for the deployment are
-/// minted from and validated against one namespace.
+/// The naming scope of a colony deployment: an authority (NID) and an
+/// optional realm segment. One namespace mints and validates every resource
+/// URN of the deployment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ColonyNamespace {
 	nid: Cow<'static, str>,
@@ -55,19 +55,20 @@ impl Default for ColonyNamespace {
 	}
 }
 
-/// A validated colony resource, borrowed from the URN it was parsed from.
+/// A validated colony resource, which borrows from its source URN.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ColonyResource<'a> {
 	/// A servlet type, optionally narrowed to one instance.
 	Servlet {
 		/// The name of the servlet type.
 		name: &'a str,
-		/// Instance tail (the locator after `/`), when present.
+		/// The instance tail (the locator after `/`), when present.
 		instance: Option<&'a str>,
 	},
 	/// A hive identity.
 	Hive {
-		/// The registration locator the identity is minted from.
+		/// The registration locator that [`ColonyNamespace::hive`] mints the
+		/// identity from.
 		addr: &'a str,
 	},
 	/// A colony membership identity, carried in a certificate's URI
@@ -79,11 +80,14 @@ pub enum ColonyResource<'a> {
 }
 
 impl ColonyNamespace {
-	/// Build a namespace with a custom authority and realm.
+	/// Builds a namespace with a custom authority and realm.
 	///
-	/// The NID is validated against RFC 8141 § 2.3.1. The realm must not
-	/// contain `:` (it is one positional segment of the grammar) or `/`
-	/// (the first `/` in a canonical URN marks the instance tail).
+	/// # Errors
+	///
+	/// - The errors of [`Urn::validate_nid`] -- the NID breaks RFC 8141 § 2.1.
+	/// - [`UrnValidationError::InvalidFormat`] -- the realm contains `:`, which
+	///   would split its one positional segment of the grammar, or `/`, which
+	///   marks the instance tail in a canonical URN.
 	pub fn new(
 		nid: impl Into<Cow<'static, str>>,
 		realm: impl Into<Cow<'static, str>>,
@@ -99,13 +103,13 @@ impl ColonyNamespace {
 		Ok(Self { nid, realm })
 	}
 
-	/// Mint the URN that names a servlet type.
+	/// Mints the URN that names a servlet type.
 	///
-	/// A name with a `/` or a `:` is refused, because a `/` would parse back
-	/// as an instance tail and a `:` as an extra positional segment, so
-	/// [`ColonyNamespace::validate`] would read the minted URN as a different
-	/// resource. An empty name is refused for the same reason validation
-	/// refuses an empty `resource-id`.
+	/// The function refuses a name with a `/` or a `:`, because a `/` would
+	/// parse back as an instance tail and a `:` as an extra positional segment,
+	/// so [`ColonyNamespace::validate`] would read the minted URN as a
+	/// different resource. It refuses an empty name for the same reason that
+	/// validation refuses an empty `resource-id`.
 	pub fn servlet(&self, name: impl AsRef<str>) -> Result<Urn<'static>, UrnValidationError> {
 		let name = name.as_ref();
 		Self::validate_single_segment_name(name)?;
@@ -113,7 +117,7 @@ impl ColonyNamespace {
 		self.mint(SERVLET_SEGMENT, name)
 	}
 
-	/// Mint the URN that names a colony.
+	/// Mints the URN that names a colony.
 	///
 	/// A colony URN travels in a certificate's URI Subject Alternative
 	/// Name (RFC 5280 §4.2.1.6) and asserts colony membership for
@@ -128,7 +132,7 @@ impl ColonyNamespace {
 		self.mint(COLONY_SEGMENT, name)
 	}
 
-	/// Refuse a `resource-id` that is empty or carries a grammar
+	/// Refuses a `resource-id` that is empty or carries a grammar
 	/// delimiter, so a minted URN always validates back as the same
 	/// resource.
 	fn validate_single_segment_name(name: impl AsRef<str>) -> Result<(), UrnValidationError> {
@@ -143,11 +147,12 @@ impl ColonyNamespace {
 		Ok(())
 	}
 
-	/// Mint the URN that identifies a hive by its registration locator.
+	/// Mints the URN that identifies a hive by its registration locator.
 	///
-	/// An empty locator is refused, because validation requires a nonempty
-	/// `resource-id`. A locator may carry `:` and `/` (`host:port`, URL
-	/// paths), because the hive `resource-id` is the whole remaining tail.
+	/// The function refuses an empty locator, because validation requires a
+	/// nonempty `resource-id`. A locator may carry `:` and `/` (`host:port`,
+	/// URL paths), because the hive `resource-id` is the whole tail after the
+	/// resource type.
 	pub fn hive(&self, addr: impl AsRef<str>) -> Result<Urn<'static>, UrnValidationError> {
 		let addr = addr.as_ref();
 		if addr.is_empty() {
@@ -157,7 +162,7 @@ impl ColonyNamespace {
 		self.mint(HIVE_SEGMENT, addr)
 	}
 
-	/// Mint the hive URN for a locator carried as bytes.
+	/// Mints the hive URN for a locator carried as bytes.
 	///
 	/// It returns [`None`] when the bytes are not UTF-8 or [`Self::hive`]
 	/// refuses the locator. Wire and configuration both hand the locator over
@@ -191,13 +196,13 @@ impl ColonyNamespace {
 		}
 	}
 
-	/// Mint `urn:{nid}:{realm}:{resource_type}:{id}` under this namespace.
+	/// Mints `urn:{nid}:{realm}:{resource_type}:{id}` under this namespace.
 	///
 	/// # Errors
 	///
-	/// - Whatever [`Urn::from_parts`] refuses. A namespace built through its
-	///   own constructor never causes a refusal, but no type carries that proof
-	///   for the namespace's parts.
+	/// - The errors of [`Urn::from_parts`]. A namespace from its own
+	///   constructor never causes one, but no type carries that proof for the
+	///   parts of the namespace.
 	fn mint(&self, resource_type: impl AsRef<str>, id: impl AsRef<str>) -> Result<Urn<'static>, UrnValidationError> {
 		let resource_type = resource_type.as_ref();
 		let id = id.as_ref();
@@ -205,7 +210,7 @@ impl ColonyNamespace {
 		Urn::from_parts(self.nid.as_ref(), nss)
 	}
 
-	/// Validate a URN against this namespace and parse its resource.
+	/// Validates a URN against this namespace and parses its resource.
 	///
 	/// The grammar check runs before any registry lookup. Every comparison is
 	/// exact and case-sensitive, which is stricter than RFC 8141 § 3.1 (NID
@@ -269,21 +274,21 @@ impl ColonyNamespace {
 }
 
 impl Urn<'_> {
-	/// Mint the instance URN under a servlet type: the type's URN with a
+	/// Mints the instance URN under a servlet type: the type's URN with a
 	/// `/{addr}` tail. The instance inherits the authority and realm of the
 	/// type, so the call needs no namespace handle.
 	///
 	/// # Errors
 	///
-	/// - Whatever [`Urn::from_parts`] refuses. Every checked constructor
-	///   already satisfies it, so only a URN built through
-	///   `Urn::new_unchecked` outside [`urn!`](crate::urn!) can see an error.
+	/// - The errors of [`Urn::from_parts`]. Every checked constructor meets
+	///   its rules, so only a URN that `Urn::new_unchecked` builds outside
+	///   [`urn!`](crate::urn!) can see one.
 	pub fn servlet_instance(&self, addr: impl AsRef<str>) -> Result<Urn<'static>, UrnValidationError> {
 		let nss = format!("{}/{}", self.nss(), addr.as_ref());
 		Urn::from_parts(self.nid(), nss)
 	}
 
-	/// Mint the instance URN under a servlet type from a locator carried as
+	/// Mints the instance URN under a servlet type from a locator carried as
 	/// bytes, which become the `resource-id` tail.
 	///
 	/// # Errors
@@ -302,17 +307,17 @@ impl Urn<'_> {
 		Ok(self.servlet_instance(addr)?)
 	}
 
-	/// Canonical bytes of a URN: its display form (`urn:nid:nss`).
+	/// The canonical bytes of a URN: its display form (`urn:nid:nss`).
 	///
-	/// Registries key by this form so lookups agree across processes
-	/// regardless of how the URN was built.
+	/// Registries key by this form, so lookups agree across processes for a
+	/// URN from any constructor.
 	pub fn canonical_bytes(&self) -> Vec<u8> {
 		self.to_string().into_bytes()
 	}
 
-	/// Canonical bytes with any instance tail stripped: the type key an
-	/// instance belongs to. NID, realm, and servlet name exclude `/`, so
-	/// the first `/` in the canonical form always marks the tail.
+	/// The canonical bytes with any instance tail cut off, which form the type
+	/// key of an instance. The NID, the realm, and the servlet name exclude
+	/// `/`, so the first `/` in the canonical form always marks the tail.
 	pub fn type_canonical_bytes(&self) -> Vec<u8> {
 		let mut canonical = self.to_string();
 		if let Some(tail) = canonical.find('/') {
@@ -322,8 +327,8 @@ impl Urn<'_> {
 		canonical.into_bytes()
 	}
 
-	/// Byte prefix of every instance key under a servlet type: the type's
-	/// canonical bytes plus the tail delimiter. The delimiter keeps the prefix
+	/// The byte prefix of every instance key under a servlet type: the type's
+	/// canonical bytes and the tail delimiter. The delimiter keeps the prefix
 	/// of one type off the keys of another, so `beam` matches `beam/...` alone
 	/// and `beam2/...` stays with its own type.
 	pub fn type_prefix_bytes(&self) -> Vec<u8> {
@@ -336,8 +341,8 @@ impl Urn<'_> {
 /// A URN proven to be a bare servlet type in one namespace.
 ///
 /// Route selection keys on the canonical bytes this carries, so it cannot
-/// run on an instance locator or a foreign realm: the namespace check runs
-/// where the key is minted, once.
+/// run on an instance locator or a foreign realm. The namespace check runs
+/// once, where [`ColonyNamespace::servlet_type_key`] mints the key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServletTypeKey(Vec<u8>);
 
@@ -348,12 +353,12 @@ impl ServletTypeKey {
 		&self.0
 	}
 
-	/// A key from bytes a registry fixture already holds.
+	/// Builds a key from bytes that a registry fixture holds.
 	///
 	/// Production mints every key through
-	/// [`ColonyNamespace::servlet_type_key`], which is what proves the URN
-	/// is a bare servlet type in this colony. Registry fixtures exercise
-	/// the map rather than the parse, so they name their rows directly.
+	/// [`ColonyNamespace::servlet_type_key`], which proves that the URN is a
+	/// bare servlet type in this colony. Registry fixtures test the map and
+	/// skip the parse, so they name their rows directly.
 	#[cfg(test)]
 	pub(crate) fn from_route_bytes(bytes: impl Into<Vec<u8>>) -> Self {
 		Self(bytes.into())
@@ -382,8 +387,8 @@ impl ColonyNamespace {
 	/// Whether `urn` is a bare servlet type in this namespace (no tail).
 	///
 	/// [`ColonyNamespace::servlet_type_key`] answers the same question and
-	/// hands back the route key the answer is about, so it is what a
-	/// caller that goes on to use the value should ask.
+	/// also returns the route key, so a caller that uses the key calls that
+	/// function instead.
 	#[must_use]
 	pub(crate) fn is_bare_servlet_type(&self, urn: &Urn<'_>) -> bool {
 		self.servlet_type_key(urn).is_some()
@@ -401,6 +406,13 @@ mod tests {
 	fn servlet(namespace: &ColonyNamespace, name: &(impl AsRef<str> + ?Sized)) -> Urn<'static> {
 		let name = name.as_ref();
 		namespace.servlet(name).expect("test names satisfy the mint grammar")
+	}
+
+	/// An instance of the servlet type `beam` whose locator is empty.
+	fn empty_instance() -> Urn<'static> {
+		servlet(&prod(), "beam")
+			.servlet_instance("")
+			.expect("a servlet type URN yields an instance URN")
 	}
 
 	/// An instance locator in this namespace, which names a servlet but is
@@ -447,114 +459,102 @@ mod tests {
 		namespace.colony(name).expect("test names satisfy the mint grammar")
 	}
 
-	#[test]
-	fn minted_urns_round_trip_through_validate() {
-		let prod = prod();
-		let bare = ColonyNamespace::default();
-		let cases = [
-			(
-				&prod,
-				servlet(&prod, "beam"),
-				"urn:tightbeam:prod-us:servlet:beam",
-				ColonyResource::Servlet { name: "beam", instance: None },
-			),
-			(
-				&prod,
-				servlet(&prod, "beam")
-					.servlet_instance("10.0.0.5:9100")
-					.expect("a servlet type URN yields an instance URN"),
-				"urn:tightbeam:prod-us:servlet:beam/10.0.0.5:9100",
-				ColonyResource::Servlet { name: "beam", instance: Some("10.0.0.5:9100") },
-			),
-			(
-				&prod,
-				hive(&prod, "10.0.0.5:9000"),
-				"urn:tightbeam:prod-us:hive:10.0.0.5:9000",
-				ColonyResource::Hive { addr: "10.0.0.5:9000" },
-			),
-			(
-				&prod,
-				colony(&prod, "main"),
-				"urn:tightbeam:prod-us:colony:main",
-				ColonyResource::Colony { name: "main" },
-			),
-			(
-				&bare,
-				servlet(&bare, "beam"),
-				"urn:tightbeam::servlet:beam",
-				ColonyResource::Servlet { name: "beam", instance: None },
-			),
-			(
-				&bare,
-				colony(&bare, "main"),
-				"urn:tightbeam::colony:main",
-				ColonyResource::Colony { name: "main" },
-			),
-		];
-		for (namespace, urn, display, resource) in cases {
+	/// One minted URN: the namespace that validates it, the URN, its display
+	/// form, and the resource it names.
+	type MintedCase = (ColonyNamespace, Urn<'static>, &'static str, ColonyResource<'static>);
+
+	crate::tb_cases! {
+		fn minted_urns_round_trip_through_validate((namespace, urn, display, resource): MintedCase) {
 			assert_eq!(urn.to_string(), display);
 			assert_eq!(namespace.validate(&urn), Ok(resource));
 		}
-	}
-
-	#[test]
-	fn foreign_or_malformed_urns_are_refused() {
-		let namespace = prod();
-		let cases = [
-			(crate::urn!("acme", "prod-us:servlet:beam"), UrnValidationError::NidMismatch),
-			(
-				crate::urn!("tightbeam", "staging:servlet:beam"),
-				UrnValidationError::RealmMismatch,
+		cases {
+			servlet_type => (
+				prod(),
+				servlet(&prod(), "beam"),
+				"urn:tightbeam:prod-us:servlet:beam",
+				ColonyResource::Servlet { name: "beam", instance: None },
 			),
-			(
-				crate::urn!("tightbeam", "prod-us:queue:beam"),
-				UrnValidationError::InvalidFormat { field: "resource-type", pattern: None },
+			servlet_instance => (
+				prod(),
+				instance_of(&servlet(&prod(), "beam")),
+				"urn:tightbeam:prod-us:servlet:beam/10.0.0.5:9100",
+				ColonyResource::Servlet { name: "beam", instance: Some("10.0.0.5:9100") },
 			),
-			(
-				crate::urn!("tightbeam", "prod-us"),
-				UrnValidationError::RequiredFieldMissing("resource-type"),
+			hive => (
+				prod(),
+				hive(&prod(), "10.0.0.5:9000"),
+				"urn:tightbeam:prod-us:hive:10.0.0.5:9000",
+				ColonyResource::Hive { addr: "10.0.0.5:9000" },
 			),
-			(
-				crate::urn!("tightbeam", "prod-us:servlet:"),
-				UrnValidationError::RequiredFieldMissing("resource-id"),
+			colony => (
+				prod(),
+				colony(&prod(), "main"),
+				"urn:tightbeam:prod-us:colony:main",
+				ColonyResource::Colony { name: "main" },
 			),
-			(
-				servlet(&namespace, "beam")
-					.servlet_instance("")
-					.expect("a servlet type URN yields an instance URN"),
-				UrnValidationError::RequiredFieldMissing("instance"),
+			bare_servlet => (
+				ColonyNamespace::default(),
+				servlet(&ColonyNamespace::default(), "beam"),
+				"urn:tightbeam::servlet:beam",
+				ColonyResource::Servlet { name: "beam", instance: None },
 			),
-			(
-				crate::urn!("tightbeam", "prod-us:colony:main/tail"),
-				UrnValidationError::InvalidFormat { field: "resource-id", pattern: None },
+			bare_colony => (
+				ColonyNamespace::default(),
+				colony(&ColonyNamespace::default(), "main"),
+				"urn:tightbeam::colony:main",
+				ColonyResource::Colony { name: "main" },
 			),
-			(
-				crate::urn!("tightbeam", "prod-us:colony:main:extra"),
-				UrnValidationError::InvalidFormat { field: "resource-id", pattern: None },
-			),
-		];
-		for (urn, error) in cases {
-			assert_eq!(namespace.validate(&urn), Err(error));
 		}
 	}
 
-	#[test]
-	fn invalid_namespace_parts_are_refused_at_construction() {
-		let cases = [
-			(
+	crate::tb_cases! {
+		fn foreign_or_malformed_urns_are_refused((urn, error): (Urn<'static>, UrnValidationError)) {
+			assert_eq!(prod().validate(&urn), Err(error));
+		}
+		cases {
+			foreign_nid => (crate::urn!("acme", "prod-us:servlet:beam"), UrnValidationError::NidMismatch),
+			foreign_realm => (crate::urn!("tightbeam", "staging:servlet:beam"), UrnValidationError::RealmMismatch),
+			unknown_resource_type => (
+				crate::urn!("tightbeam", "prod-us:queue:beam"),
+				UrnValidationError::InvalidFormat { field: "resource-type", pattern: None },
+			),
+			realm_alone => (
+				crate::urn!("tightbeam", "prod-us"),
+				UrnValidationError::RequiredFieldMissing("resource-type"),
+			),
+			empty_resource_id => (
+				crate::urn!("tightbeam", "prod-us:servlet:"),
+				UrnValidationError::RequiredFieldMissing("resource-id"),
+			),
+			empty_instance => (empty_instance(), UrnValidationError::RequiredFieldMissing("instance")),
+			colony_with_instance => (
+				crate::urn!("tightbeam", "prod-us:colony:main/tail"),
+				UrnValidationError::InvalidFormat { field: "resource-id", pattern: None },
+			),
+			colony_with_extra_segment => (
+				crate::urn!("tightbeam", "prod-us:colony:main:extra"),
+				UrnValidationError::InvalidFormat { field: "resource-id", pattern: None },
+			),
+		}
+	}
+
+	crate::tb_cases! {
+		fn invalid_namespace_parts_are_refused_at_construction((nid, realm, error): (&str, &str, UrnValidationError)) {
+			assert_eq!(ColonyNamespace::new(nid, realm).err(), Some(error));
+		}
+		cases {
+			realm_with_colon => (
 				"tightbeam",
 				"prod:us",
 				UrnValidationError::InvalidFormat { field: "realm", pattern: None },
 			),
-			(
+			realm_with_slash => (
 				"tightbeam",
 				"prod/us",
 				UrnValidationError::InvalidFormat { field: "realm", pattern: None },
 			),
-			("9bad", "", UrnValidationError::InvalidNidStart),
-		];
-		for (nid, realm, error) in cases {
-			assert_eq!(ColonyNamespace::new(nid, realm).err(), Some(error));
+			digit_first_nid => ("9bad", "", UrnValidationError::InvalidNidStart),
 		}
 	}
 
@@ -588,32 +588,33 @@ mod tests {
 		assert!(!beam2_instance.starts_with(&prefix));
 	}
 
-	#[test]
-	fn delimiter_and_empty_names_are_refused_at_mint() {
-		let namespace = prod();
-		let cases = [
-			(namespace.servlet(""), UrnValidationError::RequiredFieldMissing("resource-id")),
-			(
-				namespace.servlet("beam/10.0.0.5"),
-				UrnValidationError::InvalidFormat { field: "resource-id", pattern: None },
-			),
-			(
-				namespace.servlet("beam:extra"),
-				UrnValidationError::InvalidFormat { field: "resource-id", pattern: None },
-			),
-			(namespace.hive(""), UrnValidationError::RequiredFieldMissing("resource-id")),
-			(namespace.colony(""), UrnValidationError::RequiredFieldMissing("resource-id")),
-			(
-				namespace.colony("main/tail"),
-				UrnValidationError::InvalidFormat { field: "resource-id", pattern: None },
-			),
-			(
-				namespace.colony("main:extra"),
-				UrnValidationError::InvalidFormat { field: "resource-id", pattern: None },
-			),
-		];
-		for (minted, error) in cases {
+	/// The outcome of one mint, and the refusal it must be.
+	type MintCase = (Result<Urn<'static>, UrnValidationError>, UrnValidationError);
+
+	crate::tb_cases! {
+		fn delimiter_and_empty_names_are_refused_at_mint((minted, error): MintCase) {
 			assert_eq!(minted.err(), Some(error));
+		}
+		cases {
+			empty_servlet => (prod().servlet(""), UrnValidationError::RequiredFieldMissing("resource-id")),
+			servlet_with_instance => (
+				prod().servlet("beam/10.0.0.5"),
+				UrnValidationError::InvalidFormat { field: "resource-id", pattern: None },
+			),
+			servlet_with_extra_segment => (
+				prod().servlet("beam:extra"),
+				UrnValidationError::InvalidFormat { field: "resource-id", pattern: None },
+			),
+			empty_hive => (prod().hive(""), UrnValidationError::RequiredFieldMissing("resource-id")),
+			empty_colony => (prod().colony(""), UrnValidationError::RequiredFieldMissing("resource-id")),
+			colony_with_instance => (
+				prod().colony("main/tail"),
+				UrnValidationError::InvalidFormat { field: "resource-id", pattern: None },
+			),
+			colony_with_extra_segment => (
+				prod().colony("main:extra"),
+				UrnValidationError::InvalidFormat { field: "resource-id", pattern: None },
+			),
 		}
 	}
 }

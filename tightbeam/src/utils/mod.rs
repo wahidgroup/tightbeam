@@ -92,8 +92,7 @@ pub fn digest<D: digest::Digest + crate::der::oid::AssociatedOid>(
 /// Finalize `hasher` into the [`DigestInfo`] that names its algorithm.
 ///
 /// Callers whose preimage arrives in pieces stream it into `hasher` and end
-/// here, so no caller has to concatenate a preimage into one buffer to get a
-/// `DigestInfo` back.
+/// here, so the pieces reach a `DigestInfo` with no copy into one buffer.
 ///
 /// [`DigestInfo`]: crate::asn1::DigestInfo
 #[cfg(feature = "digest")]
@@ -117,42 +116,41 @@ mod tests {
 	use crate::der::ErrorKind;
 	use crate::error::TightBeamError::SerializationError;
 
-	#[test]
-	fn data_driven_der_round_trip() -> Result<(), TightBeamError> {
-		let oid_cases = [
-			ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1"),
-			ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.1"),
-			ObjectIdentifier::new_unwrap("2.5.4.3"),
-		];
-
-		// The octet string cases vary in size and pattern.
-		let octet_cases: &[&[u8]] = &[
-			b"",
-			b"a",
-			b"hello",
-			b"The quick brown fox jumps over the lazy dog",
-			&(0u16..64).map(|v| (v % 251) as u8).collect::<Vec<u8>>(),
-		];
-
-		for oid in oid_cases {
+	crate::tb_cases! {
+		fn data_driven_der_round_trip_of_an_oid(oid: ObjectIdentifier) -> Result<(), TightBeamError> {
 			let enc = encode(&oid)?;
 			assert!(!enc.is_empty());
 			assert_eq!(enc[0], 0x06);
 
 			let dec: ObjectIdentifier = decode(&enc)?;
 			assert_eq!(dec, oid);
+			Ok(())
 		}
+		cases {
+			rsa_encryption => ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1"),
+			server_auth => ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.1"),
+			common_name => ObjectIdentifier::new_unwrap("2.5.4.3"),
+		}
+	}
 
-		for data in octet_cases {
-			let oct = OctetStringRef::new(data)?;
+	// The octet string cases vary in size and pattern.
+	crate::tb_cases! {
+		fn data_driven_der_round_trip_of_an_octet_string(data: Vec<u8>) -> Result<(), TightBeamError> {
+			let oct = OctetStringRef::new(&data)?;
 			let enc = encode(&oct)?;
 			assert_eq!(enc[0], 0x04);
 
 			let dec: OctetStringRef<'_> = decode(&enc)?;
-			assert_eq!(dec.as_bytes(), *data);
+			assert_eq!(dec.as_bytes(), data);
+			Ok(())
 		}
-
-		Ok(())
+		cases {
+			empty => b"".to_vec(),
+			one_octet => b"a".to_vec(),
+			word => b"hello".to_vec(),
+			sentence => b"The quick brown fox jumps over the lazy dog".to_vec(),
+			counting => (0u16..64).map(|v| (v % 251) as u8).collect(),
+		}
 	}
 
 	#[test]

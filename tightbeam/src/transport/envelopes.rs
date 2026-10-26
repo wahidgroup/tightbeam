@@ -13,22 +13,15 @@ use alloc::vec::Vec;
 use std::sync::Arc;
 
 use crate::asn1::Frame;
+use crate::crypto::aead::RecvCipher;
 use crate::der::{
 	Choice, Decode, Encode, EncodeValue, ErrorKind, Header, Length, Reader, Result as DerResult, SliceReader, Tag,
 	TagNumber, Tagged, Writer,
 };
 use crate::policy::TransitStatus;
+use crate::transport::error::{ArrivalCause, TransportError, TransportFailure};
 use crate::Beamable;
 
-#[cfg(any(
-	feature = "transport-cms",
-	feature = "transport-hpke",
-	all(
-		feature = "transport-multiplex",
-		any(feature = "tokio", feature = "async-transport")
-	)
-))]
-use crate::transport::error::TransportError;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::HandshakeMessage;
 
@@ -105,26 +98,13 @@ pub struct ResponsePackage {
 }
 
 impl ResponsePackage {
-	/// The terminal response for a unary or streaming service outcome.
-	///
-	/// It is the inverse of [`Self::resolve`]: a success carries the frame, and
-	/// a failure carries its status alone. The two together are the whole
-	/// round trip of one service call.
-	#[cfg(pooled_mux)]
-	pub(crate) fn from_outcome(outcome: Result<Option<Frame>, crate::TightBeamError>) -> Self {
-		match outcome {
-			Ok(message) => Self::new(TransitStatus::Ok, message),
-			Err(error) => Self::new(error.failure_status(), None),
-		}
-	}
-
-	/// The caller-facing result this response carries.
+	/// The result that this response hands its caller.
 	///
 	/// A non-[`TransitStatus::Ok`] status is the error, so a caller reads
 	/// the frame only where the responder reported success.
 	///
 	/// The frame moves out of its `Arc` where this is the last holder, and
-	/// copies only where the inbound path still shares it.
+	/// copies only where another holder on the inbound path shares it.
 	///
 	/// # Errors
 	///
@@ -198,8 +178,8 @@ impl<'a> Decode<'a> for ResponsePackage {
 /// The first u32 code that applications own in the multiplexing reason-code
 /// space.
 ///
-/// Codes below the floor are reserved for the TightBeam protocol. HTTP/2
-/// error codes and QUIC application-close codes set the precedent.
+/// The TightBeam protocol reserves the codes below the floor. HTTP/2 error
+/// codes and QUIC application-close codes set the precedent.
 ///
 /// # Sources
 ///
@@ -208,7 +188,7 @@ impl<'a> Decode<'a> for ResponsePackage {
 #[cfg(feature = "transport-multiplex")]
 pub const MUX_APPLICATION_CODE_FLOOR: u32 = 0x1000;
 
-/// The reason a single stream was cancelled
+/// The reason an endpoint cancels a single stream
 /// ([RFC 9113 § 6.4][rfc9113-6.4]).
 ///
 /// The u32 code space is open:
@@ -280,8 +260,8 @@ pub enum GoAwayReason {
 	/// The session budget is spent down to the drain headroom. The epoch's
 	/// negotiated data volume is exhausted, and the sender drains.
 	BudgetExhausted,
-	/// Settlement of the session agreement failed, or was revoked after
-	/// activation.
+	/// The settlement of the session agreement failed, or a revocation ended
+	/// the agreement after activation.
 	SettlementFailed,
 	/// An application-defined code at or above
 	/// [`MUX_APPLICATION_CODE_FLOOR`], or a TB code newer than this build.
@@ -393,7 +373,7 @@ pub enum MuxStreamKind {
 	/// unary `End`.
 	Streaming = 1,
 	/// The responder consumes the body incrementally, and the reply streams
-	/// back as `Data*` records ahead of the closing trailer.
+	/// back as `Data*` records ahead of the trailer that closes the stream.
 	Duplex = 2,
 }
 
@@ -410,7 +390,7 @@ pub enum MuxStreamKind {
 ///
 /// - A unary request whose frame fits one chunk is a single `Open(last = true)` record.
 /// - Chunks concatenate in arrival order into the message frame DER. The
-///   ordered AEAD channel with strict counter sequencing already proves order
+///   ordered AEAD channel and its strict counter already prove order
 ///   and completeness, so chunks carry no sequence numbers.
 /// - Stream correlation metadata travels inside the encrypted envelope payload.
 ///
@@ -430,7 +410,7 @@ pub struct MuxOpenPackage {
 	/// The relay budget, with the same contract as the unary `hops_remaining`
 	/// field.
 	///
-	/// - The value is the number of gateway forwards the stream may still spend, and each hop decrements it.
+	/// - The value is the number of gateway forwards left to the stream, and each hop decrements it.
 	/// - The origin stamps the [`DEFAULT_HOP_BUDGET`] sentinel, and every
 	///   gateway clamps to its own `max_hops`.
 	/// - A gateway serves a `0` open locally and never re-forwards it.
@@ -478,7 +458,7 @@ impl MuxOpenPackage {
 		self.last
 	}
 
-	/// The interaction shape that the opening call stamped on the stream.
+	/// The stream's interaction shape, which the call that opens it stamps.
 	pub fn kind(&self) -> MuxStreamKind {
 		self.kind
 	}
@@ -495,8 +475,8 @@ impl MuxOpenPackage {
 	}
 
 	/// The relay budget left on this open, which is the number of gateway
-	/// forwards it may still spend. A gateway serves a `0` open locally and
-	/// never re-forwards it.
+	/// forwards it may spend. A gateway serves a `0` open locally and never
+	/// re-forwards it.
 	pub fn hops_remaining(&self) -> u8 {
 		self.hops_remaining
 	}
@@ -516,7 +496,7 @@ mux_chunk_package! {
 ///
 /// A unary response whose frame fits one chunk is a single `End` record. An
 /// empty payload after zero `Data` chunks means a message-less response. A
-/// frame never encodes to zero bytes, so emptiness is unambiguous. See
+/// frame encodes to at least one byte, so emptiness is unambiguous. See
 /// [`MuxOpenPackage`] for the stream grammar.
 #[cfg(feature = "transport-multiplex")]
 #[derive(Sequence, Debug, Clone, PartialEq, Eq)]
@@ -880,7 +860,7 @@ impl FixedTag for MuxRekeyDonePackage {
 
 /// Every multiplexing message, nested under one [`TransportEnvelope`] arm.
 ///
-/// The nesting lets the mux plane evolve while the top-level envelope grammar
+/// The one arm lets the mux plane evolve while the top-level envelope grammar
 /// stays fixed, and only mux code matches a mux variant.
 #[cfg(feature = "transport-multiplex")]
 #[derive(Choice, Clone, Debug, PartialEq)]
@@ -931,9 +911,9 @@ pub enum TransportEnvelope {
 	/// The response to a single-flight request.
 	#[asn1(context_specific = "1", constructed = "true")]
 	Response(ResponsePackage),
-	// Tags 2, 5, and 6 stay reserved, in that order, for the retired
-	// `EnvelopedData` and `EncryptedData` containers and the retired HPKE key
-	// exchange, so an archived capture never decodes a stale meaning.
+	// Tags 2, 5, and 6 stay reserved, in that order, for the `EnvelopedData`
+	// and `EncryptedData` containers and the HPKE key exchange that archived
+	// captures hold, so a capture never decodes a stale meaning.
 	/// A signed handshake container, kept with the bytes that carried it.
 	#[asn1(context_specific = "3", constructed = "true")]
 	SignedData(Box<WireDer<SignedData>>),
@@ -967,8 +947,8 @@ const RECORD_TAG: Tag = Tag::ContextSpecific { constructed: true, number: TagNum
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum WireEnvelope {
-	/// A transport envelope sent without encryption, as handshake containers
-	/// and cleartext endpoints send it.
+	/// A transport envelope sent in cleartext, as handshake containers and
+	/// cleartext endpoints send it.
 	Cleartext(TransportEnvelope),
 	/// A transport envelope sealed under the session's send cipher, as one
 	/// record: an `AuthEnvelopedData` with one `KEKRecipientInfo` under the
@@ -1008,21 +988,21 @@ impl Tagged for WireEnvelope {
 /// A wire envelope as it arrived: a cleartext envelope decoded, or the record
 /// of an encrypted one left in the buffer it arrived in.
 pub enum Arrived<'a> {
-	/// A transport envelope sent without encryption.
+	/// A transport envelope sent in cleartext.
 	Cleartext(TransportEnvelope),
 	/// The DER of the record's `AuthEnvelopedData`, a slice of the arrived
 	/// buffer that the session's receive cipher opens in place.
 	Encrypted(&'a mut [u8]),
 }
 
-/// A wire envelope whose outer header was read, with the contents of its arm
+/// A wire envelope with its outer header read and the contents of its arm
 /// left undecoded in the buffer it arrived in.
 ///
 /// The variant is the wire mode the outer tag named, so a reader applies the
 /// ceiling and the session phase of that mode before a byte of the contents
 /// decodes, from one read of the tag.
 pub(crate) enum ArrivingEnvelope<'a> {
-	/// The DER of a transport envelope sent without encryption.
+	/// The DER of a transport envelope sent in cleartext.
 	Cleartext(&'a [u8]),
 	/// The DER of the record's `AuthEnvelopedData`, which the session's
 	/// receive cipher opens in place.
@@ -1035,6 +1015,31 @@ impl<'a> ArrivingEnvelope<'a> {
 		match self {
 			Self::Cleartext(_) => WireMode::Cleartext,
 			Self::Encrypted(_) => WireMode::Encrypted,
+		}
+	}
+
+	/// Admits this arrival under `recv`, the receive cipher of the reader, or
+	/// `None` for a reader that holds no keys, and returns the DER of the
+	/// transport envelope it carries.
+	///
+	/// - A reader that holds keys admits records alone, and opens each in place.
+	/// - A reader that holds no keys admits cleartext alone.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::MissingEncryption`] -- cleartext arrived on a reader that holds keys (CWE-319).
+	/// - [`TransportError::OperationFailed`] with
+	///   [`TransportFailure::EncryptionFailed`] -- a record arrived on a reader
+	///   that holds no keys.
+	/// - The cause of a record that `recv` refused to open, which [`ArrivalCause::of_open`] names.
+	pub(crate) fn admit_under(self, recv: Option<&RecvCipher>) -> Result<&'a [u8], ArrivalCause> {
+		match (recv, self) {
+			(Some(key), Self::Encrypted(record)) => key.open(record).map_err(ArrivalCause::of_open),
+			(Some(_), Self::Cleartext(_)) => Err(TransportError::MissingEncryption.into()),
+			(None, Self::Cleartext(contents)) => Ok(contents),
+			(None, Self::Encrypted(_)) => {
+				Err(TransportError::OperationFailed(TransportFailure::EncryptionFailed).into())
+			}
 		}
 	}
 
@@ -1198,6 +1203,8 @@ mod tests {
 	#[cfg(feature = "transport-multiplex")]
 	use crate::testing::{unhex, TestKey};
 
+	/// One package case: the message of its frame, the status of its
+	/// response, and whether the response carries the frame.
 	struct PackageTestCase {
 		message_value: &'static str,
 		expected_status: TransitStatus,
@@ -1205,6 +1212,10 @@ mod tests {
 	}
 
 	impl PackageTestCase {
+		const fn new(message_value: &'static str, expected_status: TransitStatus, should_have_message: bool) -> Self {
+			Self { message_value, expected_status, should_have_message }
+		}
+
 		fn create_request(&self) -> RequestPackage {
 			RequestPackage::new(TestFrame::v0(Some(self.message_value), None))
 		}
@@ -1221,65 +1232,44 @@ mod tests {
 		}
 	}
 
-	fn as_test_cases() -> Vec<PackageTestCase> {
-		vec![
-			PackageTestCase {
-				message_value: "Hi",
-				expected_status: TransitStatus::Ok,
-				should_have_message: true,
-			},
-			PackageTestCase {
-				// cspell:disable-next-line
-				message_value: "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.",
-				expected_status: TransitStatus::Ok,
-				should_have_message: true,
-			},
-			PackageTestCase {
-				message_value: "",
-				expected_status: TransitStatus::Ok,
-				should_have_message: true,
-			},
-			PackageTestCase {
-				message_value: "ResourceExhausted",
-				expected_status: TransitStatus::ResourceExhausted,
-				should_have_message: false,
-			},
-			PackageTestCase {
-				message_value: "Unauthenticated",
-				expected_status: TransitStatus::Unauthenticated,
-				should_have_message: false,
-			},
-			PackageTestCase {
-				message_value: "NotFound",
-				expected_status: TransitStatus::NotFound,
-				should_have_message: false,
-			},
-		]
-	}
+	/// A message of many words.
+	// cspell:disable-next-line
+	const LOREM: &str = "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.";
 
-	#[test]
-	fn test_request_package_encode_decode() -> Result<(), Box<dyn Error>> {
-		for test_case in as_test_cases() {
+	// Each case encodes and decodes the request it builds.
+	crate::tb_cases! {
+		fn test_request_package_encode_decode(test_case: PackageTestCase) -> Result<(), Box<dyn Error>> {
 			let original = test_case.create_request();
-			let encoded = original.to_der()?;
-			let decoded = RequestPackage::from_der(&encoded)?;
-			assert_eq!(original, decoded);
+			let decoded = round_trip(&original)?;
+			assert_eq!(decoded, original);
+			Ok(())
 		}
-
-		Ok(())
+		cases {
+			short_message => PackageTestCase::new("Hi", TransitStatus::Ok, true),
+			long_message => PackageTestCase::new(LOREM, TransitStatus::Ok, true),
+			empty_message => PackageTestCase::new("", TransitStatus::Ok, true),
+			resource_exhausted => PackageTestCase::new("ResourceExhausted", TransitStatus::ResourceExhausted, false),
+			unauthenticated => PackageTestCase::new("Unauthenticated", TransitStatus::Unauthenticated, false),
+			not_found => PackageTestCase::new("NotFound", TransitStatus::NotFound, false),
+		}
 	}
 
-	#[test]
-	fn test_response_package_encode_decode() -> Result<(), Box<dyn Error>> {
-		for test_case in as_test_cases() {
+	// Each case encodes and decodes the response it builds.
+	crate::tb_cases! {
+		fn test_response_package_encode_decode(test_case: PackageTestCase) -> Result<(), Box<dyn Error>> {
 			let original = test_case.create_response();
-			let encoded = original.to_der()?;
-			let decoded = ResponsePackage::from_der(&encoded)?;
-			assert_eq!(original.status, decoded.status);
-			assert_eq!(original.message, decoded.message);
+			let decoded = round_trip(&original)?;
+			assert_eq!(decoded, original);
+			Ok(())
 		}
-
-		Ok(())
+		cases {
+			short_message => PackageTestCase::new("Hi", TransitStatus::Ok, true),
+			long_message => PackageTestCase::new(LOREM, TransitStatus::Ok, true),
+			empty_message => PackageTestCase::new("", TransitStatus::Ok, true),
+			resource_exhausted => PackageTestCase::new("ResourceExhausted", TransitStatus::ResourceExhausted, false),
+			unauthenticated => PackageTestCase::new("Unauthenticated", TransitStatus::Unauthenticated, false),
+			not_found => PackageTestCase::new("NotFound", TransitStatus::NotFound, false),
+		}
 	}
 
 	#[test]
@@ -1287,7 +1277,7 @@ mod tests {
 		let original = RequestPackage::new(TestFrame::v0(None, None));
 		let mut encoded = original.to_der()?;
 
-		// Corrupt one byte after encoding. The start of the encoding holds the
+		// Corrupt one byte near the start of the encoding, which holds the
 		// length octets of the nested sequences.
 		if encoded.len() > 10 {
 			let corrupt_pos = 5;
@@ -1336,46 +1326,47 @@ mod tests {
 		Ok(payload)
 	}
 
-	/// Reason accessors derive from the encoded code field, so struct
-	/// equality covers them.
-	#[cfg(feature = "transport-multiplex")]
-	fn assert_round_trip<T>(cases: impl IntoIterator<Item = T>) -> Result<(), Box<dyn Error>>
+	/// The value that the encoding of `original` decodes back to. Reason
+	/// accessors derive from the encoded code field, so struct equality of
+	/// the two covers them.
+	fn round_trip<T>(original: &T) -> Result<T, Box<dyn Error>>
 	where
-		T: Encode + for<'a> Decode<'a> + PartialEq + core::fmt::Debug,
+		T: Encode + for<'a> Decode<'a>,
 	{
-		for original in cases {
-			let encoded = original.to_der()?;
-			let decoded = T::from_der(&encoded)?;
-			assert_eq!(original, decoded);
-		}
-
-		Ok(())
+		let encoded = original.to_der()?;
+		Ok(T::from_der(&encoded)?)
 	}
 
 	#[cfg(feature = "transport-multiplex")]
-	#[test]
-	fn test_mux_open_package_encode_decode() -> Result<(), Box<dyn Error>> {
-		assert_round_trip([
-			MuxOpenPackage::new(1, true, MuxStreamKind::Unary, frame_payload("open-unary")?)?,
-			MuxOpenPackage::new(3, false, MuxStreamKind::Streaming, frame_payload("open-chunked")?)?,
-			MuxOpenPackage::new(5, false, MuxStreamKind::Duplex, frame_payload("open-duplex")?)?,
-			MuxOpenPackage::new(u32::MAX, false, MuxStreamKind::Unary, Vec::new())?,
-		])
+	crate::tb_cases! {
+		fn test_mux_open_package_encode_decode(original: MuxOpenPackage) -> Result<(), Box<dyn Error>> {
+			let decoded = round_trip(&original)?;
+			assert_eq!(decoded, original);
+			Ok(())
+		}
+		cases {
+			unary => MuxOpenPackage::new(1, true, MuxStreamKind::Unary, frame_payload("open-unary")?)?,
+			chunked => MuxOpenPackage::new(3, false, MuxStreamKind::Streaming, frame_payload("open-chunked")?)?,
+			duplex => MuxOpenPackage::new(5, false, MuxStreamKind::Duplex, frame_payload("open-duplex")?)?,
+			last_stream_id => MuxOpenPackage::new(u32::MAX, false, MuxStreamKind::Unary, Vec::new())?,
+		}
 	}
 
 	// The kind is the dispatch discriminator, so every variant must survive
 	// encoding unchanged.
 	#[cfg(feature = "transport-multiplex")]
-	#[test]
-	fn test_mux_open_package_kind_round_trips_every_variant() -> Result<(), Box<dyn Error>> {
-		let kinds = [MuxStreamKind::Unary, MuxStreamKind::Streaming, MuxStreamKind::Duplex];
-		for kind in kinds {
+	crate::tb_cases! {
+		fn test_mux_open_package_kind_round_trips_every_variant(kind: MuxStreamKind) -> Result<(), Box<dyn Error>> {
 			let package = MuxOpenPackage::new(7, false, kind, vec![1u8; 4])?;
 			let decoded = MuxOpenPackage::from_der(&package.to_der()?)?;
 			assert_eq!(decoded.kind(), kind);
+			Ok(())
 		}
-
-		Ok(())
+		cases {
+			unary => MuxStreamKind::Unary,
+			streaming => MuxStreamKind::Streaming,
+			duplex => MuxStreamKind::Duplex,
+		}
 	}
 
 	// An unrouted open carries no target and the origin budget, and the
@@ -1398,8 +1389,8 @@ mod tests {
 	}
 
 	// A default open must encode to the exact bytes of the unrouted shape.
-	// The DER-optional target and the DEFAULT-budget hops add nothing, so
-	// existing peers decode it unchanged.
+	// The DER-optional target and the DEFAULT-budget hops encode to zero
+	// octets, so a peer that knows neither field decodes it unchanged.
 	#[cfg(feature = "transport-multiplex")]
 	#[test]
 	fn test_mux_open_package_unrouted_is_wire_stable() -> Result<(), Box<dyn Error>> {
@@ -1415,54 +1406,74 @@ mod tests {
 	}
 
 	#[cfg(feature = "transport-multiplex")]
-	#[test]
-	fn test_mux_data_package_encode_decode() -> Result<(), Box<dyn Error>> {
-		assert_round_trip([
-			MuxDataPackage::new(1, false, vec![0xAB; 64])?,
-			MuxDataPackage::new(1, true, vec![0xCD])?,
-			MuxDataPackage::new(u32::MAX, true, Vec::new())?,
-		])
+	crate::tb_cases! {
+		fn test_mux_data_package_encode_decode(original: MuxDataPackage) -> Result<(), Box<dyn Error>> {
+			let decoded = round_trip(&original)?;
+			assert_eq!(decoded, original);
+			Ok(())
+		}
+		cases {
+			a_chunk => MuxDataPackage::new(1, false, vec![0xAB; 64])?,
+			a_last_chunk => MuxDataPackage::new(1, true, vec![0xCD])?,
+			an_empty_last_chunk => MuxDataPackage::new(u32::MAX, true, Vec::new())?,
+		}
 	}
 
 	#[cfg(feature = "transport-multiplex")]
-	#[test]
-	fn test_mux_end_package_encode_decode() -> Result<(), Box<dyn Error>> {
-		assert_round_trip([
-			MuxEndPackage::new(1, TransitStatus::Ok, frame_payload("end-unary")?)?,
-			MuxEndPackage::new(3, TransitStatus::ResourceExhausted, Vec::new())?,
-			MuxEndPackage::new(u32::MAX, TransitStatus::Unauthenticated, Vec::new())?,
-		])
+	crate::tb_cases! {
+		fn test_mux_end_package_encode_decode(original: MuxEndPackage) -> Result<(), Box<dyn Error>> {
+			let decoded = round_trip(&original)?;
+			assert_eq!(decoded, original);
+			Ok(())
+		}
+		cases {
+			ok => MuxEndPackage::new(1, TransitStatus::Ok, frame_payload("end-unary")?)?,
+			resource_exhausted => MuxEndPackage::new(3, TransitStatus::ResourceExhausted, Vec::new())?,
+			unauthenticated => MuxEndPackage::new(u32::MAX, TransitStatus::Unauthenticated, Vec::new())?,
+		}
 	}
 
 	#[cfg(feature = "transport-multiplex")]
-	#[test]
-	fn test_mux_credit_package_encode_decode() -> Result<(), Box<dyn Error>> {
-		assert_round_trip([
-			MuxCreditPackage::new(1, 0),
-			MuxCreditPackage::new(3, 4096),
-			MuxCreditPackage::new(u32::MAX, u64::MAX),
-		])
+	crate::tb_cases! {
+		fn test_mux_credit_package_encode_decode(original: MuxCreditPackage) -> Result<(), Box<dyn Error>> {
+			let decoded = round_trip(&original)?;
+			assert_eq!(decoded, original);
+			Ok(())
+		}
+		cases {
+			no_credit => MuxCreditPackage::new(1, 0),
+			some_credit => MuxCreditPackage::new(3, 4096),
+			the_most_credit => MuxCreditPackage::new(u32::MAX, u64::MAX),
+		}
 	}
 
 	#[cfg(feature = "transport-multiplex")]
-	#[test]
-	fn test_mux_cancel_package_encode_decode() -> Result<(), Box<dyn Error>> {
-		assert_round_trip([
-			MuxCancelPackage::new(1, CancelReason::Cancelled),
-			MuxCancelPackage::new(3, CancelReason::Timeout),
-			MuxCancelPackage::new(5, CancelReason::Application(MUX_APPLICATION_CODE_FLOOR + 7)),
-			MuxCancelPackage::new(u32::MAX, CancelReason::Rejected),
-		])
+	crate::tb_cases! {
+		fn test_mux_cancel_package_encode_decode(original: MuxCancelPackage) -> Result<(), Box<dyn Error>> {
+			let decoded = round_trip(&original)?;
+			assert_eq!(decoded, original);
+			Ok(())
+		}
+		cases {
+			cancelled => MuxCancelPackage::new(1, CancelReason::Cancelled),
+			timeout => MuxCancelPackage::new(3, CancelReason::Timeout),
+			application => MuxCancelPackage::new(5, CancelReason::Application(MUX_APPLICATION_CODE_FLOOR + 7)),
+			rejected => MuxCancelPackage::new(u32::MAX, CancelReason::Rejected),
+		}
 	}
 
 	#[cfg(feature = "transport-multiplex")]
-	#[test]
-	fn test_mux_ping_package_encode_decode() -> Result<(), Box<dyn Error>> {
-		assert_round_trip([
-			MuxPingPackage::new(false, 0),
-			MuxPingPackage::new(true, 1),
-			MuxPingPackage::new(false, u64::MAX),
-		])
+	crate::tb_cases! {
+		fn test_mux_ping_package_encode_decode(original: MuxPingPackage) -> Result<(), Box<dyn Error>> {
+			let decoded = round_trip(&original)?;
+			assert_eq!(decoded, original);
+			Ok(())
+		}
+		cases {
+			first_ping => MuxPingPackage::new(false, 0),
+			an_ack => MuxPingPackage::new(true, 1),
+			the_last_opaque => MuxPingPackage::new(false, u64::MAX),
+		}
 	}
 
 	/// A `SignerInfo` the CMS signer made over an epoch receipt body, for
@@ -1499,9 +1510,9 @@ mod tests {
 	}
 
 	/// The DER of a rekey request of 32 `0x01` octets of randomness and the
-	/// secp256k1 generator: a SEQUENCE of two OCTET STRINGs, the second the
-	/// 33-octet compressed point. An independent DER encoding (Python) gave
-	/// these octets.
+	/// secp256k1 generator: a SEQUENCE of two OCTET STRINGs, the second of
+	/// which holds the 33-octet compressed point. An independent DER encoding
+	/// (Python) gave these octets.
 	#[cfg(feature = "transport-multiplex")]
 	const SECP256K1_REKEY_REQUEST: &str = "304504200101010101010101010101010101010101010101010101010101010101010101\
 		04210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
@@ -1514,7 +1525,7 @@ mod tests {
 		04210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
 
 	/// A rekey request of a secp256k1 point carries its compressed form,
-	/// whatever form the point was read from.
+	/// whatever form the point came from.
 	#[cfg(feature = "transport-multiplex")]
 	#[test]
 	fn a_secp256k1_rekey_request_matches_its_known_answer() -> Result<(), Box<dyn Error>> {
@@ -1524,7 +1535,7 @@ mod tests {
 	}
 
 	/// A rekey response of a secp256k1 point carries its compressed form,
-	/// whatever form the point was read from.
+	/// whatever form the point came from.
 	#[cfg(feature = "transport-multiplex")]
 	#[test]
 	fn a_secp256k1_rekey_response_matches_its_known_answer() -> Result<(), Box<dyn Error>> {
@@ -1534,107 +1545,131 @@ mod tests {
 	}
 
 	#[cfg(feature = "transport-multiplex")]
-	#[test]
-	fn test_mux_rekey_request_package_encode_decode() -> Result<(), Box<dyn Error>> {
-		let point = secp256k1_generator();
-		assert_round_trip([
-			MuxRekeyRequestPackage::new([0u8; 32], &point)?,
-			MuxRekeyRequestPackage::new([0xFF; 32], &point)?,
-			MuxRekeyRequestPackage::new(Vec::new(), &point)?,
-		])
+	crate::tb_cases! {
+		fn test_mux_rekey_request_package_encode_decode(original: MuxRekeyRequestPackage)
+			-> Result<(), Box<dyn Error>>
+		{
+			let decoded = round_trip(&original)?;
+			assert_eq!(decoded, original);
+			Ok(())
+		}
+		cases {
+			zero_randomness => MuxRekeyRequestPackage::new([0u8; 32], &secp256k1_generator())?,
+			full_randomness => MuxRekeyRequestPackage::new([0xFF; 32], &secp256k1_generator())?,
+			no_randomness => MuxRekeyRequestPackage::new(Vec::new(), &secp256k1_generator())?,
+		}
 	}
 
 	#[cfg(feature = "transport-multiplex")]
-	#[test]
-	fn test_mux_rekey_response_package_encode_decode() -> Result<(), Box<dyn Error>> {
-		let point = secp256k1_generator();
-		assert_round_trip([
-			MuxRekeyResponsePackage::new([7u8; 32], &point, Some(sample_signed_data()?))?,
-			MuxRekeyResponsePackage::new([9u8; 32], &point, None)?,
-		])
+	crate::tb_cases! {
+		fn test_mux_rekey_response_package_encode_decode(original: MuxRekeyResponsePackage)
+			-> Result<(), Box<dyn Error>>
+		{
+			let decoded = round_trip(&original)?;
+			assert_eq!(decoded, original);
+			Ok(())
+		}
+		cases {
+			with_a_receipt => {
+				MuxRekeyResponsePackage::new([7u8; 32], &secp256k1_generator(), Some(sample_signed_data()?))?
+			},
+			with_no_receipt => MuxRekeyResponsePackage::new([9u8; 32], &secp256k1_generator(), None)?,
+		}
 	}
 
 	#[cfg(feature = "transport-multiplex")]
-	#[test]
-	fn test_mux_rekey_ack_package_encode_decode() -> Result<(), Box<dyn Error>> {
-		assert_round_trip([
-			MuxRekeyAckPackage::new(Some(sample_signer_info()?)),
-			MuxRekeyAckPackage::new(None),
-		])
+	crate::tb_cases! {
+		fn test_mux_rekey_ack_package_encode_decode(original: MuxRekeyAckPackage) -> Result<(), Box<dyn Error>> {
+			let decoded = round_trip(&original)?;
+			assert_eq!(decoded, original);
+			Ok(())
+		}
+		cases {
+			with_a_countersignature => MuxRekeyAckPackage::new(Some(sample_signer_info()?)),
+			with_no_countersignature => MuxRekeyAckPackage::new(None),
+		}
 	}
 
 	#[cfg(feature = "transport-multiplex")]
 	#[test]
 	fn test_mux_rekey_done_package_encode_decode() -> Result<(), Box<dyn Error>> {
-		assert_round_trip([MuxRekeyDonePackage::default()])
+		let original = MuxRekeyDonePackage::default();
+		let decoded = round_trip(&original)?;
+		assert_eq!(decoded, original);
+		Ok(())
 	}
 
 	#[cfg(feature = "transport-multiplex")]
-	#[test]
-	fn test_go_away_package_encode_decode() -> Result<(), Box<dyn Error>> {
-		assert_round_trip([
-			GoAwayPackage::new(0, GoAwayReason::Shutdown),
-			GoAwayPackage::new(7, GoAwayReason::ProtocolError),
-			GoAwayPackage::new(9, GoAwayReason::EnhanceYourCalm),
-			GoAwayPackage::new(11, GoAwayReason::Application(MUX_APPLICATION_CODE_FLOOR)),
-			GoAwayPackage::new(13, GoAwayReason::BudgetExhausted),
-			GoAwayPackage::new(15, GoAwayReason::SettlementFailed),
-			GoAwayPackage::new(u32::MAX, GoAwayReason::Shutdown),
-		])
-	}
-
-	#[cfg(feature = "transport-multiplex")]
-	#[test]
-	fn test_go_away_reason_labels() {
-		let cases = [
-			(GoAwayReason::Shutdown, "shutdown"),
-			(GoAwayReason::ProtocolError, "protocol-error"),
-			(GoAwayReason::EnhanceYourCalm, "enhance-your-calm"),
-			(GoAwayReason::BudgetExhausted, "budget-exhausted"),
-			(GoAwayReason::SettlementFailed, "settlement-failed"),
-			(GoAwayReason::Application(MUX_APPLICATION_CODE_FLOOR), "application"),
-		];
-		for (reason, label) in cases {
-			assert_eq!(reason.as_str(), label);
+	crate::tb_cases! {
+		fn test_go_away_package_encode_decode(original: GoAwayPackage) -> Result<(), Box<dyn Error>> {
+			let decoded = round_trip(&original)?;
+			assert_eq!(decoded, original);
+			Ok(())
+		}
+		cases {
+			shutdown => GoAwayPackage::new(0, GoAwayReason::Shutdown),
+			protocol_error => GoAwayPackage::new(7, GoAwayReason::ProtocolError),
+			enhance_your_calm => GoAwayPackage::new(9, GoAwayReason::EnhanceYourCalm),
+			application => GoAwayPackage::new(11, GoAwayReason::Application(MUX_APPLICATION_CODE_FLOOR)),
+			budget_exhausted => GoAwayPackage::new(13, GoAwayReason::BudgetExhausted),
+			settlement_failed => GoAwayPackage::new(15, GoAwayReason::SettlementFailed),
+			last_stream_id => GoAwayPackage::new(u32::MAX, GoAwayReason::Shutdown),
 		}
 	}
 
 	#[cfg(feature = "transport-multiplex")]
-	#[test]
-	fn test_cancel_reason_code_space_round_trip() {
-		let known = [
-			(0u32, CancelReason::Cancelled),
-			(1, CancelReason::Timeout),
-			(2, CancelReason::Rejected),
-		];
-		for (code, reason) in known {
+	crate::tb_cases! {
+		fn test_go_away_reason_labels((reason, label): (GoAwayReason, &str)) {
+			assert_eq!(reason.as_str(), label);
+		}
+		cases {
+			shutdown => (GoAwayReason::Shutdown, "shutdown"),
+			protocol_error => (GoAwayReason::ProtocolError, "protocol-error"),
+			enhance_your_calm => (GoAwayReason::EnhanceYourCalm, "enhance-your-calm"),
+			budget_exhausted => (GoAwayReason::BudgetExhausted, "budget-exhausted"),
+			settlement_failed => (GoAwayReason::SettlementFailed, "settlement-failed"),
+			application => (GoAwayReason::Application(MUX_APPLICATION_CODE_FLOOR), "application"),
+		}
+	}
+
+	// Each case is a known code and its reason. A code past the floor reads
+	// as an application reason.
+	#[cfg(feature = "transport-multiplex")]
+	crate::tb_cases! {
+		fn test_cancel_reason_code_space_round_trip((code, reason): (u32, CancelReason)) {
 			assert_eq!(CancelReason::from(code), reason);
 			assert_eq!(u32::from(reason), code);
 		}
-
-		let app_code = MUX_APPLICATION_CODE_FLOOR + 42;
-		assert_eq!(CancelReason::from(app_code), CancelReason::Application(app_code));
-		assert_eq!(u32::from(CancelReason::Application(app_code)), app_code);
+		cases {
+			cancelled => (0, CancelReason::Cancelled),
+			timeout => (1, CancelReason::Timeout),
+			rejected => (2, CancelReason::Rejected),
+			application => (
+				MUX_APPLICATION_CODE_FLOOR + 42,
+				CancelReason::Application(MUX_APPLICATION_CODE_FLOOR + 42),
+			),
+		}
 	}
 
+	// Each case is a known code and its reason. A code past the floor reads
+	// as an application reason.
 	#[cfg(feature = "transport-multiplex")]
-	#[test]
-	fn test_go_away_reason_code_space_round_trip() {
-		let known = [
-			(0u32, GoAwayReason::Shutdown),
-			(1, GoAwayReason::ProtocolError),
-			(2, GoAwayReason::EnhanceYourCalm),
-			(3, GoAwayReason::BudgetExhausted),
-			(4, GoAwayReason::SettlementFailed),
-		];
-		for (code, reason) in known {
+	crate::tb_cases! {
+		fn test_go_away_reason_code_space_round_trip((code, reason): (u32, GoAwayReason)) {
 			assert_eq!(GoAwayReason::from(code), reason);
 			assert_eq!(u32::from(reason), code);
 		}
-
-		let app_code = MUX_APPLICATION_CODE_FLOOR + 42;
-		assert_eq!(GoAwayReason::from(app_code), GoAwayReason::Application(app_code));
-		assert_eq!(u32::from(GoAwayReason::Application(app_code)), app_code);
+		cases {
+			shutdown => (0, GoAwayReason::Shutdown),
+			protocol_error => (1, GoAwayReason::ProtocolError),
+			enhance_your_calm => (2, GoAwayReason::EnhanceYourCalm),
+			budget_exhausted => (3, GoAwayReason::BudgetExhausted),
+			settlement_failed => (4, GoAwayReason::SettlementFailed),
+			application => (
+				MUX_APPLICATION_CODE_FLOOR + 42,
+				GoAwayReason::Application(MUX_APPLICATION_CODE_FLOOR + 42),
+			),
+		}
 	}
 
 	#[cfg(feature = "transport-multiplex")]
@@ -1652,31 +1687,31 @@ mod tests {
 	}
 
 	#[cfg(feature = "transport-multiplex")]
-	#[test]
-	fn test_mux_envelope_variants_round_trip() -> Result<(), Box<dyn Error>> {
-		assert_round_trip([
-			TransportEnvelope::from(MuxOpenPackage::new(1, true, MuxStreamKind::Unary, frame_payload("mux-open")?)?),
-			TransportEnvelope::from(MuxDataPackage::new(1, false, vec![0xEF; 16])?),
-			TransportEnvelope::from(MuxEndPackage::new(1, TransitStatus::Ok, frame_payload("mux-end")?)?),
-			TransportEnvelope::from(MuxCreditPackage::new(1, 128)),
-			TransportEnvelope::from(MuxCancelPackage::new(5, CancelReason::Cancelled)),
-			TransportEnvelope::from(GoAwayPackage::new(3, GoAwayReason::Shutdown)),
-			TransportEnvelope::from(MuxPingPackage::new(false, 7)),
-			{
-				let rekey_request = MuxRekeyRequestPackage::new([1u8; 32], &secp256k1_generator())?;
-				TransportEnvelope::from(rekey_request)
+	crate::tb_cases! {
+		fn test_mux_envelope_variants_round_trip(original: TransportEnvelope) -> Result<(), Box<dyn Error>> {
+			let decoded = round_trip(&original)?;
+			assert_eq!(decoded, original);
+			Ok(())
+		}
+		cases {
+			open => {
+				TransportEnvelope::from(MuxOpenPackage::new(1, true, MuxStreamKind::Unary, frame_payload("mux-open")?)?)
 			},
-			{
-				let signed = sample_signed_data()?;
-				let rekey_response = MuxRekeyResponsePackage::new([2u8; 32], &secp256k1_generator(), Some(signed))?;
-				TransportEnvelope::from(rekey_response)
-			},
-			{
-				let signer = sample_signer_info()?;
-				TransportEnvelope::from(MuxRekeyAckPackage::new(Some(signer)))
-			},
-			TransportEnvelope::from(MuxRekeyDonePackage::default()),
-		])
+			data => TransportEnvelope::from(MuxDataPackage::new(1, false, vec![0xEF; 16])?),
+			end => TransportEnvelope::from(MuxEndPackage::new(1, TransitStatus::Ok, frame_payload("mux-end")?)?),
+			credit => TransportEnvelope::from(MuxCreditPackage::new(1, 128)),
+			cancel => TransportEnvelope::from(MuxCancelPackage::new(5, CancelReason::Cancelled)),
+			go_away => TransportEnvelope::from(GoAwayPackage::new(3, GoAwayReason::Shutdown)),
+			ping => TransportEnvelope::from(MuxPingPackage::new(false, 7)),
+			rekey_request => TransportEnvelope::from(MuxRekeyRequestPackage::new([1u8; 32], &secp256k1_generator())?),
+			rekey_response => TransportEnvelope::from(MuxRekeyResponsePackage::new(
+				[2u8; 32],
+				&secp256k1_generator(),
+				Some(sample_signed_data()?),
+			)?),
+			rekey_ack => TransportEnvelope::from(MuxRekeyAckPackage::new(Some(sample_signer_info()?))),
+			rekey_done => TransportEnvelope::from(MuxRekeyDonePackage::default()),
+		}
 	}
 
 	/// An authenticated-enveloped handshake container travels under context

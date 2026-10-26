@@ -24,7 +24,6 @@ use crate::colony::cluster::runtime::advertise::Advertiser;
 use crate::colony::cluster::runtime::bounds::{ClusterPool, ColonyConfig, ColonyDialProtocol};
 use crate::colony::cluster::{ClusterError, DialTarget, HiveEntry};
 use crate::crypto::x509::Certificate;
-use crate::instrumentation::events::CLUSTER_DIAL_REFUSED;
 use crate::trace::TraceCollector;
 use crate::transport::TransportResult;
 use crate::transport::{PooledClient, Protocol};
@@ -262,21 +261,13 @@ impl<P: ColonyDialProtocol> Hop<'_, P> {
 	/// - The target becomes a protocol address through
 	///   [`DialTarget::protocol_address`], so a stream open and a unary emit
 	///   reach a peer through the one conversion every dial uses.
-	/// - A refused answer records [`CLUSTER_DIAL_REFUSED`] with the dialed address as its payload.
+	/// - [`BoundDial::connect`] records a refused answer on the trace of this hop's plane.
 	///
 	/// # Errors
 	///
 	/// - [`ClusterError`] -- the errors of [`BoundDial::connect`].
-	/// - [`ClusterError::Frame`] -- `trace` refused the refusal event.
 	pub(crate) async fn connect(self) -> Result<PooledClient<P>, ClusterError> {
-		let target = self.dial.target().clone();
-		let connected = self.dial.connect(self.pool).await;
-		if matches!(connected, Err(ClusterError::PeerMismatch)) {
-			let refused = target.as_bytes();
-			self.trace.event(CLUSTER_DIAL_REFUSED)?.with_payload(refused).emit();
-		}
-
-		connected
+		self.dial.connect(self.pool, self.trace).await
 	}
 
 	/// Dials the target, emits `frame`, and returns the reply frame.
@@ -304,6 +295,8 @@ mod tests {
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
 	use crate::crypto::x509::utils::CertificateExt;
+	#[cfg(feature = "testing")]
+	use crate::instrumentation::events::CLUSTER_DIAL_REFUSED;
 	use crate::testing::TestCertificate;
 	use crate::transport::client::PoolConfig;
 	use crate::transport::error::TransportError;
@@ -386,8 +379,8 @@ mod tests {
 			let mut config = ClusterConfig::new(tls_of(&dialing).with_hive_trust(Some(hive_trust)));
 			config.pool_config = pool;
 
-			let pools = config.tls.pools::<TokioListener>(&config.pool_config, &config.clock);
 			let trace = Arc::new(TraceCollector::default());
+			let pools = config.tls.pools::<TokioListener>(&config.pool_config, &config.clock, &trace);
 			let plane = HivePlane::new(Arc::clone(&pools.hive), trace);
 
 			Self {
@@ -453,6 +446,19 @@ mod tests {
 		Ok(())
 	}
 
+	// A refused answer records the refusal on the trace of the hop's plane.
+	#[cfg(feature = "testing")]
+	#[tokio::test]
+	async fn a_refused_hop_records_its_refusal_on_its_plane() -> TestResult {
+		let dialer = Dialer::start(PoolConfig::default()).await;
+
+		let refused = dialer.member_hop_to(&dialer.stranger).connect().await;
+		let recorded = dialer.plane.trace.recorded(CLUSTER_DIAL_REFUSED);
+		assert!(matches!(refused, Err(ClusterError::PeerMismatch)));
+		assert_eq!(recorded, 1);
+		Ok(())
+	}
+
 	/// Dials the stranger and then the member on `pool`, each bound to the
 	/// signer of the member, and returns both answers.
 	async fn refuse_then_admit(pool: PoolConfig) -> [Result<PooledClient<TokioListener>, ClusterError>; 2] {
@@ -464,7 +470,7 @@ mod tests {
 	}
 
 	// A refused answer gives back the slot of its connection, so a pool of one
-	// connection still reaches the party a dial names.
+	// connection reaches the party that the next dial names.
 	#[tokio::test]
 	async fn a_refused_hop_gives_back_its_slot() -> TestResult {
 		let [refused, admitted] = refuse_then_admit(Dialer::one_connection(false)).await;

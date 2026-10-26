@@ -5,7 +5,7 @@
 //! - [`LivelockChecker`] finds a reachable state that can diverge.
 //! - [`DeterminismChecker`] finds a state where one event leads to more than one state.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 
 use crate::testing::specs::composition::CompositionError;
 use crate::testing::specs::csp::{Event, Process, State};
@@ -130,24 +130,29 @@ impl DeterminismChecker {
 	/// Checks that each event of each state leads to one state at most.
 	///
 	/// A process is nondeterministic when one of its states has an event that
-	/// leads to more than one state. The check reads every state of the
-	/// process, reachable or not.
+	/// leads to more than one state.
+	///
+	/// - The check reads every state of the process, reachable or not.
+	/// - It reads the states in name order and the events of each state in
+	///   the order of [`Process::enabled`], so each run names the same witness.
 	///
 	/// # Errors
 	///
 	/// - [`NonDeterminismError`] -- a state has an event that leads to more
-	///   than one state, and the error names one such pair.
+	///   than one state, and the error names the first such pair.
 	pub fn check(process: &Process) -> Result<(), NonDeterminismError> {
-		for state in &process.states {
-			let event_targets: HashMap<Event, HashSet<State>> =
-				process.enabled(*state).into_iter().fold(HashMap::new(), |mut acc, action| {
-					let targets = process.step(*state, &action.event);
-					acc.entry(action.event).or_insert_with(HashSet::new).extend(targets);
-					acc
-				});
+		let mut states: Vec<State> = process.states.iter().copied().collect();
+		states.sort_unstable();
 
-			if let Some((event, targets)) = event_targets.into_iter().find(|(_, targets)| targets.len() > 1) {
-				return Err(NonDeterminismError { state: *state, event, targets: targets.into_iter().collect() });
+		for state in states {
+			for action in process.enabled(state) {
+				let mut targets = process.step(state, &action.event);
+				targets.sort_unstable();
+				targets.dedup();
+
+				if targets.len() > 1 {
+					return Err(NonDeterminismError { state, event: action.event, targets });
+				}
 			}
 		}
 
@@ -163,7 +168,7 @@ pub struct NonDeterminismError {
 	pub state: State,
 	/// The event that leads to more than one state.
 	pub event: Event,
-	/// Every state that the event leads to from `state`.
+	/// Every state that the event leads to from `state`, sorted by name.
 	pub targets: Vec<State>,
 }
 
@@ -262,6 +267,37 @@ mod tests {
 		assert!(result.is_ok());
 	}
 
+	/// A process where `x` and `y` each lead from every state of `a` to `l`
+	/// to the four states `t0` to `t3`.
+	fn nondeterministic_everywhere() -> Process {
+		let sources = ["f", "c", "a", "e", "b", "d", "l", "h", "k", "g", "j", "i"];
+		let targets = ["t2", "t0", "t3", "t1"];
+		let mut builder = Process::builder("Everywhere")
+			.initial_state(State("a"))
+			.add_observable(Event("y"))
+			.add_observable(Event("x"));
+
+		for from in sources {
+			for event in ["y", "x"] {
+				for to in targets {
+					builder = builder.add_transition(State(from), Event(event), State(to));
+				}
+			}
+		}
+
+		builder.build().expect("a process with an initial state builds")
+	}
+
+	#[test]
+	fn the_witness_names_the_first_state_and_event_by_name_with_sorted_targets() {
+		let process = nondeterministic_everywhere();
+		let checked = DeterminismChecker::check(&process);
+
+		let witness = checked.err().map(|error| (error.state, error.event, error.targets));
+		let targets = vec![State("t0"), State("t1"), State("t2"), State("t3")];
+		assert_eq!(witness, Some((State("a"), Event("x"), targets)));
+	}
+
 	#[test]
 	fn test_livelock_detection_no_livelock() {
 		let p = deterministic_process();
@@ -289,7 +325,6 @@ mod tests {
 	#[test]
 	fn a_hidden_cycle_with_an_observable_exit_is_a_livelock() -> Result<(), ProcessBuildError> {
 		let process = spinning()?;
-
 		let checked = LivelockChecker::check(&process);
 
 		let cycle = checked.err().map(|error| error.cycle);

@@ -87,3 +87,70 @@ impl AssertionContract {
 		}
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use core::error::Error;
+
+	use super::{Assertion, AssertionContract, AssertionLabel, AssertionValue};
+	use crate::testing::macros::Cardinality;
+	use crate::trace::IntoEventLabel;
+	use crate::urn::Urn;
+
+	const STEP: Urn<'static> = crate::urn!("test", "event:contract/step");
+
+	/// The label that every assertion and contract of these tests carries.
+	fn step() -> AssertionLabel {
+		AssertionLabel::Custom(STEP.into_label())
+	}
+
+	/// An assertion of `STEP` that carries `tags` and no value.
+	fn tagged(seq: usize, tags: Vec<&'static str>) -> Assertion {
+		Assertion::new(seq, step(), tags, None)
+	}
+
+	/// An assertion of `STEP` that carries `value`.
+	fn valued(seq: usize, value: u32) -> Assertion {
+		Assertion::with_value(seq, step(), Vec::new(), None, AssertionValue::from(value))
+	}
+
+	#[test]
+	fn a_contract_holds_when_its_label_reaches_its_count() -> Result<(), Box<dyn Error>> {
+		let contract = AssertionContract::new(step(), Cardinality::exactly(1));
+		let held = contract.is_satisfied_by([tagged(0, Vec::new())]);
+		assert!(held);
+		Ok(())
+	}
+
+	#[test]
+	fn a_contract_fails_when_its_label_misses_its_count() -> Result<(), Box<dyn Error>> {
+		let contract = AssertionContract::new(step(), Cardinality::exactly(2));
+		let held = contract.is_satisfied_by([tagged(0, Vec::new())]);
+		assert!(!held);
+		Ok(())
+	}
+
+	#[test]
+	fn a_tag_filter_counts_only_the_assertions_that_carry_its_tags() -> Result<(), Box<dyn Error>> {
+		let contract = AssertionContract::new(step(), Cardinality::exactly(1)).with_tag_filter(vec!["hot"]);
+		let held = contract.is_satisfied_by([tagged(0, vec!["cold"])]);
+		assert!(!held);
+		Ok(())
+	}
+
+	#[test]
+	fn a_tag_filter_counts_the_assertion_that_carries_its_tags() -> Result<(), Box<dyn Error>> {
+		let contract = AssertionContract::new(step(), Cardinality::exactly(1)).with_tag_filter(vec!["hot"]);
+		let held = contract.is_satisfied_by([tagged(0, vec!["hot"]), tagged(1, vec!["cold"])]);
+		assert!(held);
+		Ok(())
+	}
+
+	#[test]
+	fn an_expected_value_fails_on_another_value() -> Result<(), Box<dyn Error>> {
+		let contract = AssertionContract::new(step(), Cardinality::exactly(1)).with_value(AssertionValue::from(1u32));
+		let held = contract.is_satisfied_by([valued(0, 2)]);
+		assert!(!held);
+		Ok(())
+	}
+}

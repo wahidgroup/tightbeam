@@ -9,9 +9,9 @@
 //! Wahid Group, LLC holds IANA PEN 64586, so its arc is `1.3.6.1.4.1.64586`.
 //!
 //! - `.1` holds the handshake, session, and record attributes, content types, and profiles.
-//! - `.1.100` is reserved, because published releases gave it to another key exchange profile.
+//! - `.1.100` is reserved, because published releases assign it to another key exchange profile.
 //! - `.2` holds the algorithms, such as zstd and DHKEM over secp256k1.
-//! - `.2.2` is reserved, because published releases gave it to an HPKE suite.
+//! - `.2.2` is reserved, because published releases assign it to an HPKE suite.
 //! - `.3` holds the key purposes of `extendedKeyUsage` (RFC 5280 §4.2.1.12).
 
 use crate::der::asn1::ObjectIdentifier;
@@ -104,9 +104,9 @@ pub const COMPRESSION_ZLIB: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2
 /// Zstandard (zstd) compression.
 ///
 /// RFC 8878 defines the format and the media type only, and neither the IETF
-/// nor the S/MIME algorithm registry (RFC 7107) assigns an OID for zstd. This
-/// OID is therefore assigned under Wahid Group, LLC IANA PEN 64586, in the
-/// algorithms arc `.2`.
+/// nor the S/MIME algorithm registry (RFC 7107) assigns an OID for zstd.
+/// Wahid Group, LLC therefore assigns this OID under its IANA PEN 64586, in
+/// the algorithms arc `.2`.
 ///
 /// # Sources
 ///
@@ -117,10 +117,10 @@ pub const COMPRESSION_ZSTD: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3
 /// DHKEM(secp256k1, HKDF-SHA256), HPKE KEM `0x0016`, as the `kem` of a CMS
 /// `KEMRecipientInfo`. Its parameters are absent.
 ///
-/// No registry assigns an OID to a DHKEM over secp256k1. This OID is therefore
-/// assigned under Wahid Group, LLC IANA PEN 64586, in the algorithms arc `.2`,
-/// and `docs/dhkem-secp256k1.md` specifies its use in the shape of RFC 9629
-/// §6.1.
+/// No registry assigns an OID to a DHKEM over secp256k1. Wahid Group, LLC
+/// therefore assigns this OID under its IANA PEN 64586, in the algorithms arc
+/// `.2`, and `docs/dhkem-secp256k1.md` specifies its use in the shape of
+/// RFC 9629 §6.1.
 ///
 /// # Sources
 ///
@@ -134,8 +134,8 @@ pub const DHKEM_SECP256K1: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.
 /// `KeyPurposeId` of `extendedKeyUsage`.
 ///
 /// No registry names a purpose for a CMS frame signer, and RFC 5280 lets any
-/// organization define one. This OID is therefore assigned under Wahid Group,
-/// LLC IANA PEN 64586, in the key purposes arc `.3`.
+/// organization define one. Wahid Group, LLC therefore assigns this OID under
+/// its IANA PEN 64586, in the key purposes arc `.3`.
 ///
 /// # Sources
 ///
@@ -381,51 +381,50 @@ pub const HANDSHAKE_TRANSPORT_OFFER: ObjectIdentifier = ObjectIdentifier::new_un
 /// multiplexing.
 pub const HANDSHAKE_TRANSPORT_ACCEPT: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.16");
 
-// 1.3.6.1.4.1.64586.1.13 is reserved for the retired client certificate
-// attribute, and 1.3.6.1.4.1.64586.1.14 for the retired client signature
-// attribute. The client identity travels sealed under the handshake secret in
-// both protocols.
+// 1.3.6.1.4.1.64586.1.13 and 1.3.6.1.4.1.64586.1.14 are reserved for the
+// client certificate and client signature attributes of published releases.
+// Both protocols seal the client identity under the handshake secret.
 
-// 1.3.6.1.4.1.64586.1.17 is reserved for the retired bare receipt signature.
-// Receipt signatures travel as SignerInfos inside the receipt SignedData
-// artifact.
+// 1.3.6.1.4.1.64586.1.17 is reserved for the bare receipt signature of
+// published releases. Receipt signatures travel as SignerInfos inside the
+// receipt SignedData artifact.
 
-/// Session receipt acknowledgement OID. The value is an OCTET STRING that
-/// holds the DER of an `AuthEnvelopedData`. The envelope seals the client's
-/// receipt `SignerInfo` (countersignature plus confidential settlement
-/// answer) under a key derived from the handshake secret.
+/// The OID of the session receipt acknowledgement. The value is an OCTET
+/// STRING that holds the DER of an `AuthEnvelopedData`. The envelope seals the
+/// client's receipt `SignerInfo` (the countersignature and the confidential
+/// settlement answer) under a key derived from the handshake secret.
 pub const RECEIPT_ACK: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.18");
 
-/// Session receipt artifact OID (CMS attribute carriage). The value is
-/// the receipt `SignedData`
+/// The OID of the session receipt artifact, carried as a CMS attribute. The
+/// value is the receipt `SignedData`
 /// ([RFC 5652 §5](https://datatracker.ietf.org/doc/html/rfc5652#section-5)).
 pub const SESSION_RECEIPT: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.19");
 
-/// `eContentType` of the session receipt body inside the receipt
+/// The `eContentType` of the session receipt body inside the receipt
 /// SignedData artifact.
 pub const SESSION_RECEIPT_CONTENT: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.20");
 
-/// Signed attribute that binds a receipt `SignerInfo` to its role
+/// The signed attribute that binds a receipt `SignerInfo` to its role
 /// (INTEGER: 0 server, 1 client), so one party's signature cannot be
 /// spliced into the other role (CWE-347).
 pub const RECEIPT_ROLE: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.21");
 
-/// Signed attribute that carries the client's settlement answer (OCTET STRING)
-/// inside its receipt `SignerInfo`, so the countersignature covers the answer
-/// the standard CMS way.
+/// The signed attribute that carries the client's settlement answer (OCTET
+/// STRING) inside its receipt `SignerInfo`, so the countersignature covers the
+/// answer the standard CMS way.
 pub const RECEIPT_ANSWER: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.22");
 
-/// Server ephemeral public key OID (CMS attribute carriage). The value is an
-/// `OriginatorPublicKey` ([RFC 5652 §6.2.2][rfc5652-6.2.2]) on the server
-/// Finished, inside the transcript the Finished signs.
+/// The OID of the server ephemeral public key, carried as a CMS attribute.
+/// The value is an `OriginatorPublicKey` ([RFC 5652 §6.2.2][rfc5652-6.2.2]) on
+/// the server Finished, inside the transcript the Finished signs.
 ///
 /// [rfc5652-6.2.2]: https://datatracker.ietf.org/doc/html/rfc5652#section-6.2.2
 pub const HANDSHAKE_SERVER_EPHEMERAL: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.23");
 
-/// Key-confirmation tag OID (CMS attribute carriage). The value is an OCTET
-/// STRING as wide as the negotiated digest, an HMAC under a key of the
-/// handshake secret. The closing carries the client's tag, and the HPKE reply
-/// carries the server Finished.
+/// The OID of the key-confirmation tag, carried as a CMS attribute. The value
+/// is an OCTET STRING as wide as the negotiated digest: an HMAC under a key of
+/// the handshake secret. The closing carries the client's tag, and the HPKE
+/// reply carries the server Finished.
 pub const HANDSHAKE_KEY_CONFIRMATION: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.24");
 
 /// The content type of the CMS opening, sealed in its `AuthEnvelopedData`.
@@ -442,24 +441,26 @@ pub const HANDSHAKE_REPLY_CONTENT: ObjectIdentifier = ObjectIdentifier::new_unwr
 /// value is `RecordSequence ::= SEQUENCE { epoch INTEGER, sequence INTEGER }`.
 pub const RECORD_SEQUENCE: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.27");
 
-/// PKCS #9 content-type signed attribute ([RFC 5652 §11.1][rfc5652-11.1]).
+/// The PKCS #9 content-type signed attribute ([RFC 5652 §11.1][rfc5652-11.1]).
 ///
 /// [rfc5652-11.1]: https://datatracker.ietf.org/doc/html/rfc5652#section-11.1
 pub const ATTR_CONTENT_TYPE: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.3");
 
-/// PKCS #9 message-digest signed attribute ([RFC 5652 §11.2][rfc5652-11.2]).
+/// The PKCS #9 message-digest signed attribute
+/// ([RFC 5652 §11.2][rfc5652-11.2]).
 ///
 /// [rfc5652-11.2]: https://datatracker.ietf.org/doc/html/rfc5652#section-11.2
 pub const ATTR_MESSAGE_DIGEST: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.4");
 
-/// CMS algorithm identifier protection signed attribute,
+/// The CMS algorithm identifier protection signed attribute,
 /// `id-aa-CMSAlgorithmProtection` ([RFC 6211 §2][rfc6211-2]).
 ///
 /// [rfc6211-2]: https://datatracker.ietf.org/doc/html/rfc6211#section-2
 pub const ATTR_CMS_ALGORITHM_PROTECTION: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.52");
 
-/// The arcs of the private arc that no constant takes, each reserved for the
-/// meaning a published release gave it, so each arc keeps one meaning.
+/// The arcs of the private arc that no constant takes. Each one is reserved
+/// for the meaning that a published release assigns it, so each arc keeps one
+/// meaning.
 #[cfg(test)]
 const RESERVED_ARCS: [ObjectIdentifier; 9] = [
 	ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.3"),
@@ -510,6 +511,7 @@ mod tests {
 			(CURVE_NIST_P256, "1.2.840.10045.3.1.7"),
 			(CURVE_NIST_P384, "1.3.132.0.34"),
 			(CURVE_NIST_P521, "1.3.132.0.35"),
+			(CURVE_X962_C_TWO, "1.2.840.10045.3.0"),
 			(CURVE_X25519, "1.3.101.110"),
 			(KEM_ML_KEM_1024, "2.16.840.1.101.3.4.4.3"),
 			(HANDSHAKE_PROTOCOL_VERSION, "1.3.6.1.4.1.64586.1.1"),
@@ -538,12 +540,40 @@ mod tests {
 			(ATTR_CMS_ALGORITHM_PROTECTION, "1.2.840.113549.1.9.52"),
 		];
 
-		for (oid, expected) in pinned {
-			assert_eq!(*oid, ObjectIdentifier::new_unwrap(expected));
-		}
+		let values: Vec<String> = pinned.iter().map(|(oid, _)| oid.to_string()).collect();
+		let expected: Vec<&str> = pinned.iter().map(|(_, dotted)| *dotted).collect();
+		assert_eq!(values, expected);
 		// Each reserved arc stays apart from the constants, so each arc keeps
 		// one meaning.
 		let reused = pinned.iter().filter(|(oid, _)| RESERVED_ARCS.contains(oid)).count();
 		assert_eq!(reused, 0);
+	}
+
+	/// The test pins the 18 SEC 2 curves over a binary field, which a key
+	/// refuses, to their dotted-decimal values (SEC 2 v1.0 Appendix A).
+	#[test]
+	fn binary_field_curves_are_pinned() {
+		let values = BINARY_FIELD_CURVES.map(|oid| oid.to_string());
+		let sec2 = [
+			"1.3.132.0.1",  // sect163k1
+			"1.3.132.0.2",  // sect163r1
+			"1.3.132.0.3",  // sect239k1
+			"1.3.132.0.4",  // sect113r1
+			"1.3.132.0.5",  // sect113r2
+			"1.3.132.0.15", // sect163r2
+			"1.3.132.0.16", // sect283k1
+			"1.3.132.0.17", // sect283r1
+			"1.3.132.0.22", // sect131r1
+			"1.3.132.0.23", // sect131r2
+			"1.3.132.0.24", // sect193r1
+			"1.3.132.0.25", // sect193r2
+			"1.3.132.0.26", // sect233k1
+			"1.3.132.0.27", // sect233r1
+			"1.3.132.0.36", // sect409k1
+			"1.3.132.0.37", // sect409r1
+			"1.3.132.0.38", // sect571k1
+			"1.3.132.0.39", // sect571r1
+		];
+		assert_eq!(values, sec2);
 	}
 }

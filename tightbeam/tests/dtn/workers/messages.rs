@@ -1,23 +1,24 @@
-//! Message types for DTN workers
+//! The message types of the DTN workers.
 //!
-//! Defines input/output message structures for worker-based command execution,
+//! Each worker takes a request and returns a result, for command execution,
 //! instrument selection, and telemetry building.
 
-use tightbeam::{der::Sequence, Beamable};
+use tightbeam::{
+	der::{asn1::OctetString, Sequence},
+	Beamable,
+};
 
 use crate::dtn::messages::RoverInstrument;
 
-// ============================================================================
-// Command Execution Messages
-// ============================================================================
+// The messages of command execution.
 
-/// Request to execute a rover command (command type as u8)
+/// A request to execute the rover command that `command_type` names.
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 pub struct CommandExecutionRequest {
 	pub command_type: u8,
 }
 
-/// Result of command execution
+/// The result of one command execution.
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 pub struct CommandExecutionResult {
 	pub success: bool,
@@ -25,34 +26,30 @@ pub struct CommandExecutionResult {
 	pub data_snippet: String,
 }
 
-// ============================================================================
-// Instrument Selection Messages
-// ============================================================================
+// The messages of instrument selection.
 
-/// Request to select instrument based on command
+/// A request to select the instrument for a command.
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 #[allow(dead_code)]
 pub struct InstrumentSelectionRequest {
 	pub command_type: u8,
 }
 
-/// Selected instrument with sample data
+/// The instrument that a selection picks, with its sample data.
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 #[allow(dead_code)]
 pub struct InstrumentSelection {
 	pub instrument: RoverInstrument,
 	pub instrument_name: String,
-	pub sample_data: Vec<u8>,
+	pub sample_data: OctetString,
 }
 
-// ============================================================================
-// Telemetry Building Messages
-// ============================================================================
+// The messages of telemetry building.
 
-/// Request to build telemetry message
+/// A request to build a telemetry message.
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 pub struct TelemetryBuildRequest {
 	pub instrument: RoverInstrument,
-	pub data: Vec<u8>,
+	pub data: OctetString,
 	pub mission_time_ms: u64,
 }

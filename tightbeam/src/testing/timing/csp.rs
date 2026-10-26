@@ -38,6 +38,29 @@ pub enum TimingGuard {
 }
 
 impl TimingGuard {
+	/// The name of the clock that this guard reads.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use core::time::Duration;
+	///
+	/// use tightbeam::testing::timing::TimingGuard;
+	///
+	/// let guard = TimingGuard::ClockLessEqual("clk".to_string(), Duration::from_millis(5));
+	/// assert_eq!(guard.clock(), "clk");
+	/// ```
+	pub fn clock(&self) -> &str {
+		match self {
+			TimingGuard::ClockLessThan(name, _)
+			| TimingGuard::ClockLessEqual(name, _)
+			| TimingGuard::ClockGreaterThan(name, _)
+			| TimingGuard::ClockGreaterEqual(name, _)
+			| TimingGuard::ClockEquals(name, _)
+			| TimingGuard::ClockInRange(name, _, _) => name,
+		}
+	}
+
 	/// Whether this guard holds for `clock_values`.
 	///
 	/// A clock the guard names but the map omits leaves the guard
@@ -87,6 +110,15 @@ impl TimedTransition {
 		let clocks: Vec<String> = clocks.into_iter().collect();
 		self.reset_clocks = clocks;
 		self
+	}
+
+	/// The clocks that this transition names: the clock of its guard, then
+	/// each clock it resets.
+	pub(crate) fn clocks(&self) -> impl Iterator<Item = &str> {
+		let guarded = self.guard.iter().map(TimingGuard::clock);
+		let reset = self.reset_clocks.iter().map(String::as_str);
+
+		guarded.chain(reset)
 	}
 
 	/// Whether this transition is enabled at `clock_values`.

@@ -11,9 +11,9 @@ use crate::{Errorizable, TightBeamError};
 
 /// Why [`HiveInstances::insert`] registered no servlet.
 ///
-/// Either way, the insert already stopped the servlet through
-/// [`ServletBox::stop_boxed`], so the caller only chooses its answer. The
-/// cause travels as the error's source.
+/// Either way, the insert stops the servlet through
+/// [`ServletBox::stop_boxed`] before it returns, so the caller only chooses its
+/// answer. The cause travels as the error's source.
 ///
 /// [`ServletBox::stop_boxed`]: crate::colony::hive::ServletBox::stop_boxed
 #[derive(Debug, Errorizable)]
@@ -67,7 +67,6 @@ impl<'a, R: ServletRegistry, P: Protocol> HiveInstances<'a, R, P> {
 			Ok(placement) => placement,
 			Err(error) => {
 				let refused = RefusedRegistration { error, registration };
-
 				return Err(InsertRefusal::Unnameable(refused.stop_servlet()));
 			}
 		};
@@ -158,7 +157,7 @@ mod tests {
 	/// instant the hive stops it.
 	///
 	/// The order of a removal is observable only from inside the stop, so
-	/// this probe records whether a route still named its type then.
+	/// this probe records whether a route names its type at that instant.
 	struct RouteProbe {
 		routes: Arc<HiveContextImpl<TokioListener>>,
 		servlet_type: Urn<'static>,
@@ -257,7 +256,6 @@ mod tests {
 		signer: Option<SignerIdentifier>,
 	) -> ServletRegistration {
 		let probe = StopProbe { stopped: Arc::clone(stopped), signer };
-
 		ServletRegistration { servlet: Box::new(probe), spawner: probe_spawner(), servlet_type }
 	}
 
@@ -302,11 +300,31 @@ mod tests {
 		let registration = probe_registration(servlet_type.clone(), &stopped, Some(ServletInfo::fixture_signer()));
 
 		let inserted = HiveInstances::new(&servlets, &routes).insert(registration);
-
 		assert!(matches!(inserted, Err(InsertRefusal::Registry(TightBeamError::NonceExhausted))));
+
 		let unrouted = routes.call(&servlet_type, call_frame()).await;
 		assert!(matches!(unrouted, Err(TightBeamError::RouterError(RouterError::UnknownRoute))));
 		assert!(stopped.load(Ordering::SeqCst));
+		Ok(())
+	}
+
+	/// A registration under a key the registry holds replaces the one there,
+	/// and the replaced servlet stops the one way the trait names.
+	#[test]
+	fn a_replaced_registration_stops_its_servlet() -> Result<(), Box<dyn Error>> {
+		let servlet_type = ColonyNamespace::default().servlet("echo")?;
+		let servlets = HashMapRegistry::default();
+		let replaced = Arc::new(AtomicBool::new(false));
+		let replacing = Arc::new(AtomicBool::new(false));
+
+		let first = servlets.insert(b"echo".to_vec(), probe_registration(servlet_type.clone(), &replaced, None));
+		first.map_err(|refused| refused.stop_servlet())?;
+
+		let second = servlets.insert(b"echo".to_vec(), probe_registration(servlet_type, &replacing, None));
+		second.map_err(|refused| refused.stop_servlet())?;
+		assert!(replaced.load(Ordering::SeqCst));
+		assert!(!replacing.load(Ordering::SeqCst));
+		assert_eq!(servlets.count(), 1);
 		Ok(())
 	}
 
@@ -323,7 +341,6 @@ mod tests {
 		let placed = instances.insert(registration)?;
 
 		let removed = instances.remove(placed.instance.canonical_bytes());
-
 		assert!(removed.is_some());
 		assert!(!routed_at_stop.load(Ordering::SeqCst));
 		Ok(())

@@ -182,6 +182,42 @@ impl ClusterError {
 			_ => false,
 		}
 	}
+
+	/// Whether a refused peer slate or relay trail is the fault of the
+	/// gateway that advertised it.
+	///
+	/// - A slate that conflicts with a held route, a slate past a cap, and a
+	///   stale advertisement are the advertiser's.
+	/// - Every other error is this gateway's own, such as a poisoned registry lock.
+	///
+	/// The direct advertisement answers the advertiser's fault with
+	/// `PermissionDenied` and its own with `Unavailable`. The rumor path drops
+	/// a rumor for the advertiser's fault and ends its loop for its own.
+	#[must_use]
+	pub(crate) fn blames_the_advertiser(&self) -> bool {
+		match self {
+			Self::PeerSlateConflict | Self::PeerCapExceeded | Self::StalePeerAd => true,
+			Self::LockPoisoned
+			| Self::InvalidPeerAddress
+			| Self::AdvertiseAddressRequired
+			| Self::UnknownServletType(_)
+			| Self::NoHivesAvailable(_)
+			| Self::ConnectFailed
+			| Self::PeerMismatch
+			| Self::NoResponse
+			| Self::Transport(_)
+			| Self::Frame(_)
+			| Self::MalformedResponse
+			| Self::RegistrationFailed
+			| Self::InvalidAddress(_)
+			| Self::ServletNotOwned
+			| Self::ServletNotFound
+			| Self::SignerMismatch
+			| Self::GossipJournalAtCapacity
+			| Self::GossipJournalUnavailable
+			| Self::OversizedReconcileReply => false,
+		}
+	}
 }
 
 impl<T> From<std::sync::PoisonError<T>> for ClusterError {
@@ -201,7 +237,6 @@ mod tests {
 	tb_cases! {
 		fn transit_status_of((error, expected): (ClusterError, TransitStatus)) {
 			let status = error.transit_status();
-
 			assert_eq!(status, expected);
 		}
 
@@ -214,12 +249,10 @@ mod tests {
 
 	// A hop that never reached its gateway answers unavailable, so the trail
 	// weakens and the bounded retry takes the next route. A hop that may have
-	// delivered answers unknown, so a gateway upstream keeps it on its first
-	// route.
+	// delivered answers unknown, so an upstream gateway keeps its first route.
 	tb_cases! {
 		fn forward_status_of((error, expected): (ClusterError, TransitStatus)) {
 			let status = error.forward_status();
-
 			assert_eq!(status, expected);
 		}
 
@@ -239,12 +272,11 @@ mod tests {
 	}
 
 	// A fault before the frame's write completed, or the far end's own
-	// `Unavailable`, proves the frame never ran. A fault after the write proves
-	// nothing.
+	// `Unavailable`, proves the frame never ran. A fault after the write leaves
+	// open whether the frame ran.
 	tb_cases! {
 		fn proves_undelivered_of((error, expected): (ClusterError, bool)) {
 			let undelivered = error.proves_undelivered();
-
 			assert_eq!(undelivered, expected);
 		}
 
@@ -267,6 +299,22 @@ mod tests {
 			a_reply_that_never_came_does_not => (ClusterError::NoResponse, false),
 			a_closed_connection_does_not => (ClusterError::Transport(TransportError::ConnectionClosed), false),
 			a_malformed_reply_does_not => (ClusterError::MalformedResponse, false),
+		}
+	}
+
+	// A slate the registry judged and refused is the advertiser's fault. A
+	// registry this gateway cannot read is its own.
+	tb_cases! {
+		fn blames_the_advertiser_of((error, expected): (ClusterError, bool)) {
+			let blamed = error.blames_the_advertiser();
+			assert_eq!(blamed, expected);
+		}
+
+		cases {
+			a_conflicting_slate_is_the_advertisers => (ClusterError::PeerSlateConflict, true),
+			a_slate_past_a_cap_is_the_advertisers => (ClusterError::PeerCapExceeded, true),
+			a_stale_advertisement_is_the_advertisers => (ClusterError::StalePeerAd, true),
+			a_poisoned_registry_is_the_gateways => (ClusterError::LockPoisoned, false),
 		}
 	}
 }

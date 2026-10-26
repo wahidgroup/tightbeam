@@ -1,4 +1,4 @@
-//! Dual-signed session receipts.
+//! The dual-signed session receipts of the handshake.
 //!
 //! A [`SessionReceipt`] binds the handshake transcript, the granted session
 //! budgets, and an optional settlement challenge into one DER body. The body
@@ -10,9 +10,9 @@
 //!
 //! - The server signs the body inside its handshake response.
 //! - The client countersigns inside its closing leg and may answer the challenge through a signed attribute.
-//! - Each signature covers the signed attributes of the receipt profile:
-//!   content type, message digest, algorithm protection, the role, and for
-//!   the client its answer.
+//! - Each signature covers the signed attributes of the receipt profile: the
+//!   content type, the message digest, the algorithm protection, the role,
+//!   and, for the client, its answer.
 //!
 //! The completed artifact, held as a [`StoredReceipt`], carries the
 //! certificate of each signer in its `certificates` (RFC 5652 §5.1). A third
@@ -22,10 +22,10 @@
 //!
 //! # Price binding
 //!
-//! Price binding is application truth, and the [`TransportAuthorizer`] and
-//! [`ReceiptApprover`] hooks enforce it. TightBeam treats the challenge and
-//! the response as opaque bytes, so the check of an instrument amount against
-//! `budgets x credit_unit` belongs to those hooks.
+//! The application owns the price binding, and its [`TransportAuthorizer`]
+//! and [`ReceiptApprover`] hooks enforce it. TightBeam treats the challenge
+//! and the response as opaque bytes, so those hooks check an instrument amount
+//! against `budgets x credit_unit`.
 //!
 //! # Confidentiality
 //!
@@ -110,28 +110,28 @@ use crate::x509::Certificate;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::negotiation::TransportAuthorizer;
 
-/// Session agreement body the server issues for every budget-bearing
-/// session.
+/// The session agreement body that the server issues for every
+/// budget-bearing session.
 ///
 /// Both receipt signatures cover every field, so the receipt binds the
 /// transcript, the metered terms, and the settlement challenge together.
 #[derive(Clone, Debug, Eq, PartialEq, Beamable, Sequence)]
 pub struct SessionReceipt {
-	/// Handshake transcript digest, encoded as a `DigestInfo` per
+	/// The digest of the handshake transcript, encoded as a `DigestInfo` per
 	/// [RFC 8017 §9.2][rfc8017-9.2].
 	///
-	/// The digest pins the receipt to one handshake. Replaying the receipt
-	/// against another session changes the transcript and breaks the pin.
+	/// The digest pins the receipt to one handshake. A replay of the receipt
+	/// against another session meets another transcript, which breaks the pin.
 	///
 	/// [rfc8017-9.2]: https://datatracker.ietf.org/doc/html/rfc8017#section-9.2
 	pub transcript_hash: DigestInfo,
-	/// Per-direction session budgets granted, in credits. Both sides
-	/// countersign them as the metered session terms.
+	/// The session budgets that the server grants per direction, in credits.
+	/// Both sides countersign them as the metered session terms.
 	pub budgets: MuxBudgets,
-	/// Bytes per credit that the accept fixes for both directions. Both sides
-	/// countersign it with the budgets.
+	/// The bytes per credit that the accept fixes for both directions. Both
+	/// sides countersign it with the budgets.
 	pub credit_unit: u32,
-	/// Opaque settlement challenge from the server's authorizer, such as an
+	/// The opaque settlement challenge of the server's authorizer, such as an
 	/// unsigned transaction or an invoice.
 	///
 	/// TightBeam treats it as opaque bytes. It travels in the cleartext
@@ -140,16 +140,16 @@ pub struct SessionReceipt {
 	pub ancillary: Option<OctetString>,
 }
 
-/// Role a receipt `SignerInfo` holds, bound by the [`RECEIPT_ROLE`]
-/// signed attribute so one party's signature cannot be spliced into the
-/// other role (CWE-347).
+/// The role that a receipt `SignerInfo` holds. The [`RECEIPT_ROLE`] signed
+/// attribute binds it, so an attacker cannot splice one party's signature
+/// into the other role (CWE-347).
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReceiptRole {
-	/// The issuing server, which signs the receipt body alone.
+	/// The server, which issues the receipt and signs its body alone.
 	Server,
-	/// The countersigning client, which also binds its settlement answer
-	/// through the [`RECEIPT_ANSWER`] signed attribute.
+	/// The client, which countersigns the receipt and also binds its
+	/// settlement answer through the [`RECEIPT_ANSWER`] signed attribute.
 	Client,
 }
 
@@ -206,8 +206,8 @@ fn receipt_content<'a>(
 	Ok(content)
 }
 
-/// Find at most one single-valued signed attribute, failing closed on
-/// duplicates or multi-valued attributes.
+/// Finds at most one single-valued signed attribute under `oid`. A duplicate
+/// or a multi-valued attribute fails closed.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 fn find_signed_attr(attrs: &SignedAttributes, oid: ObjectIdentifier) -> Result<Option<&Any>, HandshakeError> {
 	let mut found = None;
@@ -225,8 +225,8 @@ fn find_signed_attr(attrs: &SignedAttributes, oid: ObjectIdentifier) -> Result<O
 	Ok(found)
 }
 
-/// Role declared by a `SignerInfo`'s signed attributes, `None` when the
-/// signer carries no role tag.
+/// The role that the signed attributes of a `SignerInfo` declare, or `None`
+/// when the signer carries no role tag.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 fn signer_role(signer: &SignerInfo) -> Result<Option<ReceiptRole>, HandshakeError> {
 	let Some(attrs) = signer.signed_attrs.as_ref() else {
@@ -241,7 +241,7 @@ fn signer_role(signer: &SignerInfo) -> Result<Option<ReceiptRole>, HandshakeErro
 	Ok(Some(role))
 }
 
-/// Settlement answer declared by a client `SignerInfo`, before
+/// The settlement answer that a client `SignerInfo` declares, before
 /// normalization.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 fn signer_answer(signer: &SignerInfo) -> Result<Option<OctetString>, HandshakeError> {
@@ -256,7 +256,7 @@ fn signer_answer(signer: &SignerInfo) -> Result<Option<OctetString>, HandshakeEr
 	Ok(Some(decoded))
 }
 
-/// Sign the receipt body into a role-tagged `SignerInfo` under `identity`.
+/// Signs the receipt body into a role-tagged `SignerInfo` under `identity`.
 ///
 /// # Errors
 ///
@@ -275,7 +275,7 @@ async fn signer_info_over_receipt(
 	Ok(identity.sign(content).await?)
 }
 
-/// Completed dual-signed receipt retained after the handshake.
+/// The completed dual-signed receipt an endpoint keeps after the handshake.
 ///
 /// The receipt is a validated view over the CMS `SignedData` artifact. The
 /// body parses, exactly one `SignerInfo` per role is present, and the
@@ -286,10 +286,10 @@ async fn signer_info_over_receipt(
 pub struct StoredReceipt {
 	/// The dual-signed `SignedData` artifact, the single source of truth.
 	artifact: Signed<SignedData>,
-	/// Body parsed out of the artifact's `eContent` at construction.
+	/// The body that construction parses out of the artifact's `eContent`.
 	receipt: SessionReceipt,
-	/// Normalized settlement answer parsed out of the client
-	/// `SignerInfo` at construction.
+	/// The normalized settlement answer that construction parses out of the
+	/// client `SignerInfo`.
 	ancillary_response: Option<OctetString>,
 }
 
@@ -334,14 +334,14 @@ impl StoredReceipt {
 		&self.receipt
 	}
 
-	/// Application settlement answer that the client's signed attributes
+	/// The application settlement answer that the client's signed attributes
 	/// bind. TightBeam treats it as opaque bytes. The answer is a bearer
 	/// secret, so `Debug` output redacts it.
 	pub fn ancillary_response(&self) -> Option<&OctetString> {
 		self.ancillary_response.as_ref()
 	}
 
-	/// The underlying CMS `SignedData` artifact.
+	/// The CMS `SignedData` artifact of the receipt.
 	pub fn artifact(&self) -> &Signed<SignedData> {
 		&self.artifact
 	}
@@ -349,20 +349,20 @@ impl StoredReceipt {
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl StoredReceipt {
-	/// DER encoding of the artifact for persistence.
+	/// Returns the DER encoding of the artifact, for persistence.
 	pub fn to_der(&self) -> Result<Vec<u8>, HandshakeError> {
 		let der = self.artifact.to_der()?;
 		Ok(der)
 	}
 
-	/// The `SignerInfo` that holds `role`. Construction validated its
-	/// presence and uniqueness.
+	/// The `SignerInfo` that holds `role`. Construction checks its presence
+	/// and uniqueness.
 	pub fn signer(&self, role: ReceiptRole) -> Result<&SignerInfo, HandshakeError> {
 		self.artifact.signer_for_role(role)?.ok_or(HandshakeError::ReceiptMismatch)
 	}
 
 	/// The certificate the artifact carries for `role`, which the `sid` of its
-	/// `SignerInfo` names (RFC 5652 §5.3). Construction validated its presence.
+	/// `SignerInfo` names (RFC 5652 §5.3). Construction checks its presence.
 	///
 	/// A third-party verifier takes both certificates from here, admits each
 	/// against its own trust, and passes them to [`Self::verify`]. The decode
@@ -417,7 +417,7 @@ impl StoredReceipt {
 		named.ok_or(HandshakeError::ReceiptMismatch)
 	}
 
-	/// Verify both signatures from the artifact and the two certificates
+	/// Verifies both signatures from the artifact and the two certificates
 	/// alone, each admitted for signing under the provider `P`.
 	///
 	/// This is the canonical third-party check, and [`Self::certificate`]
@@ -462,7 +462,8 @@ impl StoredReceipt {
 	}
 }
 
-/// Length-only stand-in for settlement-answer bytes in `Debug` output.
+/// A length-only stand-in for the bytes of a settlement answer in `Debug`
+/// output.
 ///
 /// The answer is a bearer secret, so only its presence and its length may
 /// reach logs.
@@ -489,7 +490,7 @@ impl fmt::Debug for StoredReceipt {
 	}
 }
 
-/// Refusal verdict from a [`ReceiptApprover`].
+/// The refusal verdict of a [`ReceiptApprover`].
 ///
 /// The refusal carries an application-defined code from the shared u32 code
 /// space.
@@ -502,17 +503,17 @@ impl fmt::Debug for StoredReceipt {
 /// [`MUX_APPLICATION_CODE_FLOOR`]: crate::transport::envelopes::MUX_APPLICATION_CODE_FLOOR
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ApprovalRefusal {
-	/// Refusal code from the u32 space that settlement refusals also use.
+	/// The refusal code, from the u32 space that settlement refusals also use.
 	pub code: u32,
 }
 
-/// Client policy for countersigning a [`SessionReceipt`] and answering
-/// its settlement challenge.
+/// The client policy that decides whether to countersign a
+/// [`SessionReceipt`] and how to answer its settlement challenge.
 ///
-/// The hook runs after the client verified the server Finished of the
+/// The hook runs after the client verifies the server Finished of the
 /// handshake response, before its closing leg. The handshake awaits it inline
-/// with **no library deadline**, so bound long work, such as paying an
-/// invoice or prompting a user, in the hook.
+/// with **no library deadline**, so bound long work, such as the payment of
+/// an invoice or a prompt to a user, in the hook.
 ///
 /// # Verdicts
 ///
@@ -528,7 +529,7 @@ pub struct ApprovalRefusal {
 /// challenge-bearing receipt aborts the handshake with
 /// [`SETTLEMENT_UNSUPPORTED_CODE`].
 pub trait ReceiptApprover: MaybeSend + MaybeSync {
-	/// Approve the receipt and optionally attach a settlement answer.
+	/// Approves the receipt and optionally attaches a settlement answer.
 	///
 	/// # Errors
 	///
@@ -539,18 +540,18 @@ pub trait ReceiptApprover: MaybeSend + MaybeSync {
 	) -> MaybeSendFuture<'a, Result<Option<OctetString>, ApprovalRefusal>>;
 }
 
-/// Terminal verdict of a budget-bearing session's receipt lifecycle,
-/// as the server observed it.
+/// The terminal verdict of the receipt lifecycle of a budget-bearing
+/// session, as the server observes it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionVerdict {
 	/// The countersignature verified and settlement succeeded, so the
 	/// session activated.
 	Activated,
 	/// The countersignature verified, and the authorizer refused settlement
-	/// with an application code. The countersigned receipt is still the
+	/// with an application code. The countersigned receipt stays the
 	/// strongest evidence of the disputed agreement.
 	SettlementRejected {
-		/// Application-defined refusal code from the shared u32 space.
+		/// The application-defined refusal code, from the shared u32 space.
 		code: u32,
 	},
 	/// The client returned no countersignature for the issued receipt, so
@@ -562,7 +563,7 @@ pub enum SessionVerdict {
 	CountersignatureInvalid,
 }
 
-/// Server-side record of how a budget-bearing session concluded.
+/// The server-side record of how a budget-bearing session concludes.
 ///
 /// The library produces the evidence, and the application owns the ledger.
 /// TightBeam is `no_std`-capable and has no clock and no storage, so
@@ -572,17 +573,17 @@ pub enum SessionVerdict {
 ///
 /// The receipt body pins the transcript hash, and through it the identities
 /// and the negotiation. The artifact carries the certificate of each signer
-/// it holds, so a third party can verify the record without replaying the
+/// it holds, so a third party can verify the record without a replay of the
 /// handshake.
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct SessionOutcome {
 	/// The server-issued receipt body.
 	pub receipt: SessionReceipt,
-	/// Receipt artifact as the server holds it. It is dual-signed when the
-	/// countersignature verified, and server-signed only otherwise.
+	/// The receipt artifact as the server holds it. It is dual-signed when
+	/// the countersignature verified, and server-signed only otherwise.
 	pub artifact: Signed<SignedData>,
-	/// Client receipt `SignerInfo` DER as received.
+	/// The DER of the client receipt `SignerInfo`, as the server receives it.
 	///
 	/// - It is `None` exactly when the verdict is [`SessionVerdict::CountersignatureMissing`].
 	/// - It is present and unverified when the verdict is [`SessionVerdict::CountersignatureInvalid`].
@@ -590,14 +591,14 @@ pub struct SessionOutcome {
 	/// Its signed attributes carry the settlement answer, so `Debug` output
 	/// redacts it with the answer.
 	pub countersignature: Option<OctetString>,
-	/// Application settlement answer recovered from the countersignature's
-	/// signed attributes, when the client attached one. The answer is a
-	/// bearer secret, so `Debug` output redacts it.
+	/// The application settlement answer that the server recovers from the
+	/// countersignature's signed attributes, when the client attached one.
+	/// The answer is a bearer secret, so `Debug` output redacts it.
 	pub ancillary_response: Option<OctetString>,
-	/// Certificate the client authenticated with, identifying the
-	/// counterparty of record.
+	/// The certificate that the client authenticated with, which identifies
+	/// the counterparty of record.
 	pub client_certificate: Option<Arc<Certificate>>,
-	/// Terminal lifecycle verdict observed by the server.
+	/// The terminal lifecycle verdict that the server observes.
 	pub verdict: SessionVerdict,
 }
 
@@ -613,8 +614,8 @@ impl fmt::Debug for SessionOutcome {
 	}
 }
 
-/// Server hook receiving the [`SessionOutcome`] of every budget-bearing
-/// session whose receipt exchange concluded.
+/// The server hook that receives the [`SessionOutcome`] of every
+/// budget-bearing session whose receipt exchange concludes.
 ///
 /// The hook sees every ending: activated, authorizer-refused, and
 /// countersignature missing or invalid. Observation is a record: the hook
@@ -628,17 +629,17 @@ impl fmt::Debug for SessionOutcome {
 /// - The outcome is borrowed, so call `to_owned` on what you retain.
 /// - Stamp your own clock, and persist to your own ledger for your dispute window.
 pub trait SessionObserver: MaybeSend + MaybeSync {
-	/// Observe a terminal receipt outcome.
+	/// Observes a terminal receipt outcome.
 	fn on_outcome<'a>(&'a self, outcome: &'a SessionOutcome) -> MaybeSendFuture<'a, ()>;
 }
 
-/// Canonical form of a settlement answer, in which zero bytes means no answer.
+/// The canonical form of a settlement answer: zero bytes means no answer.
 ///
 /// An absent [`RECEIPT_ANSWER`] attribute and an empty one carry the same
 /// meaning. Every boundary where an answer enters the lifecycle normalizes
 /// through this function, at approval and at recovery from a received
 /// `SignerInfo`. Without it, the two endpoints of one exchange could retain
-/// diverging receipts for the same signature.
+/// receipts that diverge for the same signature.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 fn normalize_answer<T>(answer: Option<T>) -> Option<T>
 where
@@ -649,7 +650,7 @@ where
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl SessionOutcome {
-	/// Report this outcome to `observer`, then resolve its verdict.
+	/// Reports this outcome to `observer`, then resolves its verdict.
 	///
 	/// It returns the [`StoredReceipt`] when the verdict is
 	/// [`SessionVerdict::Activated`]. Every concluded receipt exchange reaches
@@ -682,7 +683,7 @@ impl SessionOutcome {
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl SessionReceipt {
-	/// Build the [`SessionReceipt`] body and the server-signed `SignedData`
+	/// Builds the [`SessionReceipt`] body and the server-signed `SignedData`
 	/// artifact around it.
 	///
 	/// Both handshake carriages share this function, so they build the body
@@ -716,12 +717,12 @@ impl SessionReceipt {
 		Ok((receipt, artifact))
 	}
 
-	/// Verify one receipt `SignerInfo` against the receipt body, the expected
-	/// role, and the expected signer.
+	/// Verifies one receipt `SignerInfo` against the receipt body, the
+	/// expected role, and the expected signer.
 	///
 	/// - The CMS signer requires the signed attributes to equal the set for
-	///   the role byte for byte: content type, message digest, algorithm
-	///   protection, the role, and for the client its answer.
+	///   the role byte for byte: the content type, the message digest, the
+	///   algorithm protection, the role, and, for the client, its answer.
 	/// - The `sid` must name `certificate`, and the signature must verify
 	///   under the certificate's key, over the attributes DER.
 	///
@@ -762,7 +763,7 @@ impl SessionReceipt {
 		Ok(normalize_answer(answer))
 	}
 
-	/// Check the terms this receipt states against the terms the verifier
+	/// Checks the terms this receipt states against the terms the verifier
 	/// expects: the transcript it pins, the budgets, and the credit unit.
 	///
 	/// # Errors
@@ -787,7 +788,7 @@ impl SessionReceipt {
 		Ok(())
 	}
 
-	/// Match a server-issued receipt against the negotiated accept.
+	/// Matches a server-issued receipt against the negotiated accept.
 	///
 	/// Both handshake carriages share this function, so the presence matrix
 	/// and the transcript, budget, and credit-unit binding have one home. It
@@ -796,7 +797,7 @@ impl SessionReceipt {
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError::ReceiptMissing`] -- budgets were granted and no receipt came.
+	/// - [`HandshakeError::ReceiptMissing`] -- the accept granted budgets and no receipt came.
 	/// - [`HandshakeError::ReceiptMismatch`] -- a receipt came for an unmetered
 	///   session, or its transcript, budgets, or credit unit disagree with the
 	///   accept.
@@ -819,7 +820,8 @@ impl SessionReceipt {
 		Ok(Some(receipt))
 	}
 
-	/// Approve a receipt and answer its settlement challenge, or fail closed.
+	/// Approves a receipt and answers its settlement challenge, or fails
+	/// closed.
 	///
 	/// # Without an approver
 	///
@@ -828,7 +830,7 @@ impl SessionReceipt {
 	///
 	/// # Normalization
 	///
-	/// An empty answer is stored, signed, and sent as no answer
+	/// The client stores, signs, and sends an empty answer as no answer
 	/// ([`normalize_answer`]).
 	pub(crate) async fn approve(
 		&self,
@@ -849,7 +851,7 @@ impl SessionReceipt {
 		Ok(normalized)
 	}
 
-	/// Create the client half of the receipt's dual signature, which proves
+	/// Creates the client half of the receipt's dual signature, which proves
 	/// that the caller accepted the session terms this receipt states.
 	///
 	/// The role is fixed to `Client`, so a caller creates its own half here and
@@ -859,7 +861,7 @@ impl SessionReceipt {
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError`] -- encoding or signing failed in the receipt or the key provider.
+	/// - [`HandshakeError`] -- the receipt fails to encode, or the key provider fails to sign.
 	pub(crate) async fn countersign(
 		&self,
 		answer: Option<&[u8]>,
@@ -873,10 +875,10 @@ impl SessionReceipt {
 	}
 }
 
-/// Reads on a CMS receipt artifact.
+/// The reads of a CMS receipt artifact.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub(crate) trait ReceiptArtifact: Sized {
-	/// Parse the [`SessionReceipt`] body out of this artifact.
+	/// Parses the [`SessionReceipt`] body out of this artifact.
 	///
 	/// # Errors
 	///
@@ -885,7 +887,7 @@ pub(crate) trait ReceiptArtifact: Sized {
 	/// - [`HandshakeError::DerError`] -- the body fails to decode.
 	fn receipt(&self) -> Result<SessionReceipt, HandshakeError>;
 
-	/// Find this artifact's `SignerInfo` for one role.
+	/// Finds the `SignerInfo` of this artifact for `role`.
 	///
 	/// # Errors
 	///
@@ -924,12 +926,12 @@ impl ReceiptArtifact for SignedData {
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl SessionReceipt {
-	/// Verify the client's countersignature `ack` under `certificate` and
-	/// settle into a terminal verdict, beside the settlement answer and the
+	/// Verifies the client's countersignature `ack` under `certificate` and
+	/// settles into a terminal verdict, beside the settlement answer and the
 	/// countersignature that verified.
 	///
-	/// - A failing countersignature is still a verdict instead of an early
-	///   error, so the attempt reaches the observer as evidence.
+	/// - A countersignature that fails is a verdict instead of an early error,
+	///   so the attempt reaches the observer as evidence.
 	/// - With no authorizer installed, the session activates once the signature verifies.
 	/// - A verified countersignature returns beside `certificate`, which its `sid` names.
 	pub(crate) async fn settle_ack<P>(
@@ -1014,15 +1016,18 @@ mod tests {
 		Ok(receipt)
 	}
 
-	#[test]
-	fn test_session_receipt_der_round_trip() -> Result<(), DerError> {
-		for ancillary in [Some(b"lnbc-invoice".as_slice()), None] {
+	crate::tb_cases! {
+		fn test_session_receipt_der_round_trip(ancillary: Option<&[u8]>) -> Result<(), DerError> {
 			let receipt = sample_receipt(ancillary)?;
 			let der = receipt.to_der()?;
 			let decoded = SessionReceipt::from_der(&der)?;
 			assert_eq!(decoded, receipt);
+			Ok(())
 		}
-		Ok(())
+		cases {
+			with_ancillary_data => Some(b"lnbc-invoice".as_slice()),
+			with_no_ancillary_data => None,
+		}
 	}
 
 	// The known answer locks the receipt body DER encoding, because an
@@ -1069,34 +1074,50 @@ mod tests {
 			Ok(())
 		}
 
-		#[test]
-		fn every_binding_drift_is_a_mismatch() -> Result<(), DerError> {
-			let receipt = sample_receipt(None)?;
-			let granted = receipt.budgets;
-			let unit = receipt.credit_unit;
-			let match_accept = SessionReceipt::match_accept;
+		/// A change of one binding of a receipt.
+		type Drift = fn(&mut SessionReceipt) -> Result<(), DerError>;
 
-			let mut wrong_transcript = receipt.to_owned();
-			wrong_transcript.transcript_hash.digest = OctetString::new([8u8; 32])?;
+		// Each case drifts one binding of the receipt away from the session.
+		crate::tb_cases! {
+			fn every_binding_drift_is_a_mismatch(drift: Drift) -> Result<(), DerError> {
+				let receipt = sample_receipt(None)?;
+				let granted = receipt.budgets;
+				let unit = receipt.credit_unit;
 
-			let mut wrong_algorithm = receipt.to_owned();
-			wrong_algorithm.transcript_hash.algorithm.oid = crate::oids::HASH_SHA256;
-
-			let mut wrong_budgets = receipt.to_owned();
-			wrong_budgets.budgets.client_to_server += 1;
-
-			let mut wrong_unit = receipt.to_owned();
-			wrong_unit.credit_unit += 1;
-
-			for drifted in [wrong_transcript, wrong_algorithm, wrong_budgets, wrong_unit] {
+				let mut drifted = receipt;
+				drift(&mut drifted)?;
 				assert!(matches!(
-					match_accept(Some(drifted), Some(granted), Some(unit), &sample_transcript()),
+					SessionReceipt::match_accept(Some(drifted), Some(granted), Some(unit), &sample_transcript()),
 					Err(HandshakeError::ReceiptMismatch)
 				));
+				Ok(())
 			}
+			cases {
+				transcript => |receipt| {
+					receipt.transcript_hash.digest = OctetString::new([8u8; 32])?;
+					Ok(())
+				},
+				algorithm => |receipt| {
+					receipt.transcript_hash.algorithm.oid = crate::oids::HASH_SHA256;
+					Ok(())
+				},
+				budgets => |receipt| {
+					receipt.budgets.client_to_server += 1;
+					Ok(())
+				},
+				credit_unit => |receipt| {
+					receipt.credit_unit += 1;
+					Ok(())
+				},
+			}
+		}
 
+		#[test]
+		fn a_receipt_with_no_negotiated_credit_unit_is_a_mismatch() -> Result<(), DerError> {
+			let receipt = sample_receipt(None)?;
+			let granted = receipt.budgets;
 			assert!(matches!(
-				match_accept(Some(receipt), Some(granted), None, &sample_transcript()),
+				SessionReceipt::match_accept(Some(receipt), Some(granted), None, &sample_transcript()),
 				Err(HandshakeError::ReceiptMismatch)
 			));
 			Ok(())
@@ -1294,8 +1315,8 @@ mod tests {
 			Ok(())
 		}
 
-		/// A receipt signer whose version breaks the RFC 5652 §5.3 rule is
-		/// refused.
+		/// The receipt check refuses a receipt signer whose version breaks the
+		/// RFC 5652 §5.3 rule.
 		#[tokio::test]
 		async fn a_receipt_signer_of_the_wrong_version_is_refused() -> Result<(), HandshakeError> {
 			let (receipt, artifact, server) = server_signed(None).await?;
@@ -1465,7 +1486,7 @@ mod tests {
 			Ok(())
 		}
 
-		/// A countersignature that verifies beside a refused settlement still
+		/// A countersignature that verifies beside a refused settlement also
 		/// returns beside its countersigner, so the refused artifact carries it
 		/// as the evidence of the dispute.
 		#[tokio::test]

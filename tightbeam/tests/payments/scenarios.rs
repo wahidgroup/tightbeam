@@ -23,7 +23,7 @@ use tightbeam::{
 	colony::{
 		cluster::{Cluster, ClusterConfig, ClusterTlsConfig},
 		hive::{Hive, HiveConfig, HiveTlsConfig},
-		servlet::ServletConfig,
+		servlet::{ServletConfig, ServletFuture},
 		urn::ColonyNamespace,
 		SubmitWork,
 	},
@@ -46,17 +46,22 @@ use tightbeam::{
 		},
 	},
 	decode,
+	der::asn1::OctetString,
+	encode,
 	instrumentation::events,
 	policy::TransitStatus,
 	random::OsRng,
 	tb_assert_spec, tb_scenario,
 	testing::{ClientEnv, ServletEnv, SetupEnv},
+	trace::TraceCollector,
 	transport::{
-		handshake::negotiation::TransportOffer, tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder,
-		TransportError,
+		handshake::negotiation::TransportOffer,
+		tcp::{r#async::TokioListener, TightBeamSocketAddr},
+		ClientBuilder, ConnectionBuilder, GenericClient, TransportError,
 	},
 	urn::Urn,
-	Frame, TightBeamError, Version,
+	utils::digest,
+	Frame, Message, TightBeamError, Version,
 };
 
 use crate::common::hive::scenario_hive_config;
@@ -65,27 +70,16 @@ use crate::common::x509::create_test_cert_with_key;
 
 use super::cluster::PaymentGatewayCluster;
 use super::currency::MonetaryAmount;
+use super::harness::{PaymentHarness, CHAIN_BROKEN, CHAIN_VALID, DEDUP_CACHE_HIT};
 use super::hives::PaymentProcessorHive;
 use super::messages::{
-	CreditTransferTransaction, DecryptRequest, DecryptResponse, GetPublicKeyRequest, GetPublicKeyResponse,
-	PaymentIdentification, TransactionStatus,
+	CaptureTransaction, CreditTransferTransaction, DecryptRequest, DecryptResponse, GetPublicKeyRequest,
+	GetPublicKeyResponse, PaymentIdentification, TransactionStatus,
 };
 use super::servlets::{
-	AuthorizationServlet, KeyManagerRequest, KeyManagerServlet, AUTHORIZATION_APPROVED, INTEGRITY_VERIFIED,
-	KEYMANAGER_DECRYPT_SUCCESS, KEYMANAGER_PUBKEY_SERVED, KEY_MANAGER_HPKE_INFO,
+	AuthorizationServlet, CaptureServlet, KeyManagerRequest, KeyManagerServlet, AUTHORIZATION_APPROVED,
+	CAPTURE_COMPLETED, INTEGRITY_VERIFIED, KEYMANAGER_DECRYPT_SUCCESS, KEYMANAGER_PUBKEY_SERVED, KEY_MANAGER_HPKE_INFO,
 };
-
-/// Client-observed work reply status (`TransitStatus` on the wire response).
-pub(crate) const WORK_STATUS: Urn<'static> = tightbeam::urn!("test", "event:scenarios/work-status");
-
-/// Client-observed approval decoded from inside the servlet's response frame.
-pub(crate) const CLIENT_AUTH_APPROVED: Urn<'static> = tightbeam::urn!("test", "event:scenarios/client-auth-approved");
-
-/// Client-observed plaintext of the key manager's reply to a sealed card token.
-pub(crate) const OPENED_CARD_TOKEN: Urn<'static> = tightbeam::urn!("test", "event:scenarios/opened-card-token");
-
-/// Client-observed status of the key manager's reply to a tampered card token.
-pub(crate) const TAMPERED_TOKEN_STATUS: Urn<'static> = tightbeam::urn!("test", "event:scenarios/tampered-token-status");
 
 /// The card token that the client seals to the key manager.
 const CARD_TOKEN: &str = "tok_4111_1111_1111_1111";
@@ -157,20 +151,19 @@ fn hive_tls_config(certs: &TestCerts) -> HiveConfig {
 	}
 }
 
-fn servlet_tls_config(
+fn servlet_tls_config<M: Message>(
 	certs: &TestCerts,
-) -> Result<ServletConfig<TokioListener, CreditTransferTransaction, DefaultCryptoProvider>, TightBeamError> {
+	harness: &Arc<PaymentHarness>,
+) -> Result<ServletConfig<TokioListener, M, DefaultCryptoProvider, PaymentHarness>, TightBeamError> {
 	let (certificate, key) = certs.hive_identity();
-	Ok(
-		ServletConfig::<TokioListener, CreditTransferTransaction, DefaultCryptoProvider>::builder()
-			.with_certificate(certificate, key, vec![])?
-			// The servlet offers mux as the cluster and the hive do, so work
-			// forwards negotiate mux.
-			.with_mux_offer(Some(TransportOffer::mux(8)))
-			.with_message_decryptor(shared_payment_cipher())
-			.with_config(Arc::new(()))
-			.build(),
-	)
+	Ok(ServletConfig::<TokioListener, M, DefaultCryptoProvider>::builder()
+		.with_certificate(certificate, key, vec![])?
+		// The servlet offers mux as the cluster and the hive do, so work
+		// forwards negotiate mux.
+		.with_mux_offer(Some(TransportOffer::mux(8)))
+		.with_message_decryptor(shared_payment_cipher())
+		.with_config(Arc::clone(harness))
+		.build())
 }
 
 /// The shared key-encryption key of the client-to-servlet confidential body.
@@ -190,18 +183,88 @@ fn create_auth_transaction(end_to_end_id: impl AsRef<[u8]>, amount: MonetaryAmou
 		.map(|d| d.as_millis() as u64)
 		.unwrap_or(0);
 
-	CreditTransferTransaction::new(
-		PaymentIdentification::new(
-			format!("INST{}", timestamp).as_bytes(),
-			end_to_end_id,
-			format!("TXN{}", timestamp).as_bytes(),
-		),
+	let payment_id = PaymentIdentification::new(
+		format!("INST{}", timestamp).as_bytes(),
+		end_to_end_id,
+		format!("TXN{}", timestamp).as_bytes(),
+	);
+
+	let payment_id = payment_id.expect("short identifiers fit an OCTET STRING");
+	let transaction = CreditTransferTransaction::new(
+		payment_id,
 		amount,
 		b"CRED_ACCT_TOKEN",
 		b"DEB_ACCT_TOKEN",
 		Some(b"Payment for services".to_vec()),
 		timestamp,
-	)
+	);
+	transaction.expect("short references fit an OCTET STRING")
+}
+
+/// The frame that carries `transaction` to an authorization servlet: hashed,
+/// witnessed, sealed under the shared payment cipher, and signed by the
+/// cluster key.
+fn authorization_frame(certs: &TestCerts, transaction: CreditTransferTransaction) -> Frame {
+	let signer = CertifiedKey::new(&certs.cluster_cert, certs.cluster_key.to_owned());
+	let frame = Version::V1
+		.compose()
+		.with_id(b"payment-auth-txn")
+		.with_order(0)
+		.with_message(transaction)
+		.with_message_hasher::<Sha3_256>([])
+		.with_witness_hasher::<Sha3_256>()
+		.with_encryptor(shared_payment_cipher())
+		.with_signer::<Secp256k1Signature, _>(signer.expect("the cluster key certifies"))
+		.build();
+
+	frame.expect("an authorization frame builds")
+}
+
+/// The start of an authorization instance, which the hive calls for each
+/// instance it spawns.
+///
+/// Each instance presents the hive certificate, offers mux, opens the
+/// confidential body with the shared payment cipher, and records into the
+/// payment flow of `harness`.
+fn authorization_spawner(
+	certs: Arc<TestCerts>,
+	harness: Arc<PaymentHarness>,
+) -> impl Fn(Arc<TraceCollector>) -> ServletFuture<AuthorizationServlet> + Send + Sync + 'static {
+	move |trace| {
+		let config = servlet_tls_config(&certs, &harness);
+		Box::pin(async move { AuthorizationServlet::start(trace, config?).await })
+	}
+}
+
+/// A client that trusts the hive certificate, connected to the servlet at
+/// `addr`.
+async fn hive_client(certs: &TestCerts, addr: TightBeamSocketAddr) -> GenericClient<TokioListener> {
+	let builder = ClientBuilder::<TokioListener>::builder()
+		.with_trust_store(Arc::clone(&certs.hive_trust))
+		.build();
+
+	builder.connect(addr).await.expect("a client of the hive certificate connects")
+}
+
+/// The capture of `capture`, linked to the authorization of `authorized`
+/// through the digest of its body.
+fn capture_frame(certs: &TestCerts, capture: CaptureTransaction, authorized: &CreditTransferTransaction) -> Frame {
+	let body = encode(authorized).expect("a credit transfer encodes");
+	let previous = digest::<Sha3_256>(&body).expect("SHA3-256 digests the body");
+	let signer = CertifiedKey::new(&certs.cluster_cert, certs.cluster_key.to_owned());
+	let frame = Version::V2
+		.compose()
+		.with_id(b"payment-capture-txn")
+		.with_order(1)
+		.with_message(capture)
+		.with_message_hasher::<Sha3_256>([])
+		.with_witness_hasher::<Sha3_256>()
+		.with_encryptor(shared_payment_cipher())
+		.with_signer::<Secp256k1Signature, _>(signer.expect("the cluster key certifies"))
+		.with_previous_hash(previous)
+		.build();
+
+	frame.expect("a capture frame builds")
 }
 
 tb_assert_spec! {
@@ -215,10 +278,8 @@ tb_assert_spec! {
 			(events::CLUSTER_WORK_UNAVAILABLE, exactly!(0)),
 			(events::CLUSTER_WORK_FAILED, exactly!(0)),
 			(events::CLUSTER_REGISTER_REFUSED, exactly!(0)),
-			(WORK_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
-			(AUTHORIZATION_APPROVED, exactly!(1), equals!(true)),
-			(INTEGRITY_VERIFIED, exactly!(1), equals!(true)),
-			(CLIENT_AUTH_APPROVED, exactly!(1), equals!(true))
+			(AUTHORIZATION_APPROVED, exactly!(1)),
+			(INTEGRITY_VERIFIED, exactly!(1), equals!(true))
 		]
 	}
 }
@@ -238,46 +299,36 @@ tb_scenario! {
 			let cluster = PaymentGatewayCluster::start(Arc::new(trace.share()), cluster_conf).await?;
 			let cluster_addr = cluster.addr();
 
-			let servlet_conf = servlet_tls_config(&certs)?;
-			let servlet = AuthorizationServlet::start(Arc::new(trace.share()), servlet_conf).await?;
+			let spawner = authorization_spawner(Arc::clone(&certs), Arc::default());
+			let servlet = spawner(Arc::new(trace.share())).await?;
 
 			let mut hive_conf = hive_tls_config(&certs);
 			hive_conf.pool.mux_offer = Some(Arc::new(TransportOffer::mux(8)));
 
 			let mut hive = PaymentProcessorHive::new(Some(hive_conf))?;
-			let spawner = |t| AuthorizationServlet::start(t, ServletConfig::cleartext());
 			hive.register(authorization_urn(), servlet, spawner)?;
 			hive.establish(Arc::new(trace.share())).await?;
 
 			let _reg_response = hive.register_with_cluster(cluster_addr).await?;
 
 			let transaction = create_auth_transaction(b"E2E-001", MonetaryAmount::new(10000, *b"USD"));
-			let inner = Version::V1.compose()
-				.with_id(b"payment-auth-txn")
-				.with_order(0)
-				.with_message(transaction)
-				.with_message_hasher::<Sha3_256>([])
-				.with_witness_hasher::<Sha3_256>()
-				.with_encryptor(shared_payment_cipher())
-				.with_signer::<Secp256k1Signature, _>(CertifiedKey::new(&certs.cluster_cert, certs.cluster_key.to_owned())?)
-				.build()?;
+			let inner = authorization_frame(&certs, transaction);
 
 			let builder = ClientBuilder::<TokioListener>::builder()
 				.with_trust_store(Arc::clone(&certs.cluster_trust))
 				.build();
 
-			// `submit_work_to` returns the servlet's frame under an `Ok`
-			// gateway status alone (`ClusterWorkResponse::served`), so the
-			// event after it records the wire status that the spec asserts.
+			// The spec asserts the routing decision that the gateway records
+			// as `CLUSTER_WORK_ROUTED`. The gateway returns the servlet's frame
+			// under an `Ok` status alone (`ClusterWorkResponse::served`).
 			let mut client = builder.connect(cluster_addr.to_owned()).await?;
 			let servlet_frame = client.submit_work_to(authorization_urn(), &inner).await?;
-			trace.event_with(WORK_STATUS, &[], TransitStatus::Ok)?;
 
 			// The gateway returns the servlet's complete response frame. The
 			// typed approval decodes from inside it, which proves that the
 			// response envelope survived the route back to the client.
 			let status: TransactionStatus = decode(servlet_frame.message())?;
-			trace.event_with(CLIENT_AUTH_APPROVED, &[], status.status.is_success())?;
+			assert!(status.status.is_success(), "the client decoded no approval from the servlet frame");
 
 			hive.stop();
 			cluster.stop();
@@ -323,10 +374,9 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(KEYMANAGER_PUBKEY_SERVED, exactly!(1), equals!(true)),
-			(KEYMANAGER_DECRYPT_SUCCESS, exactly!(1), equals!(true)),
-			(OPENED_CARD_TOKEN, exactly!(1), equals!(CARD_TOKEN)),
-			(TAMPERED_TOKEN_STATUS, exactly!(1), equals!(TransitStatus::Internal))
+			(KEYMANAGER_PUBKEY_SERVED, exactly!(1)),
+			(KEYMANAGER_DECRYPT_SUCCESS, exactly!(1)),
+			(events::HANDLER_FAILED, exactly!(1), equals!(TransitStatus::Internal))
 		]
 	}
 }
@@ -356,25 +406,139 @@ tb_scenario! {
 			let client = builder.connect(addr).await?;
 			Ok(client)
 		},
-		client: |ServletEnv { trace, mut client, .. }| async move {
+		client: |ServletEnv { mut client, .. }| async move {
 			let key_request = KeyManagerRequest::GetPublicKey(GetPublicKeyRequest { _placeholder: None });
 			let key_reply = client.emit(key_manager_frame(b"key-manager-public-key", key_request), None).await?;
 			let key_frame = key_reply.ok_or(TightBeamError::MissingResponse)?;
 			let served: GetPublicKeyResponse = decode(key_frame.message())?;
-			let public_key = PublicKey::from_sec1_bytes(&served.public_key)?;
+			let public_key = PublicKey::from_sec1_bytes(served.public_key.as_bytes())?;
 			let sealed = public_key.seal::<HpkeSecp256k1Sha256Aes256Gcm>(KEY_MANAGER_HPKE_INFO, b"", CARD_TOKEN, None)?;
 			let ciphertext = sealed.to_bytes();
 			let tampered = with_flipped_tag(&ciphertext);
 
-			let open_request = KeyManagerRequest::Decrypt(DecryptRequest { ciphertext });
+			let open_request = KeyManagerRequest::Decrypt(DecryptRequest { ciphertext: OctetString::new(ciphertext)? });
 			let open_reply = client.emit(key_manager_frame(b"key-manager-open", open_request), None).await?;
 			let open_frame = open_reply.ok_or(TightBeamError::MissingResponse)?;
 			let opened: DecryptResponse = decode(open_frame.message())?;
-			trace.event_with(OPENED_CARD_TOKEN, &[], String::from_utf8_lossy(&opened.plaintext).into_owned())?;
+			assert_eq!(opened.plaintext.as_bytes(), CARD_TOKEN.as_bytes(), "the key manager returned another plaintext");
 
-			let tampered_request = KeyManagerRequest::Decrypt(DecryptRequest { ciphertext: tampered });
+			let tampered_request = KeyManagerRequest::Decrypt(DecryptRequest { ciphertext: OctetString::new(tampered)? });
 			let tampered_reply = client.emit(key_manager_frame(b"key-manager-tampered", tampered_request), None).await;
-			trace.event_with(TAMPERED_TOKEN_STATUS, &[], refusal_status(tampered_reply)?)?;
+			let tampered_status = refusal_status(tampered_reply)?;
+			assert_eq!(tampered_status, TransitStatus::Internal, "the key manager refused a tampered token with another status");
+
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub SpawnedAuthorizationSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(INTEGRITY_VERIFIED, exactly!(1), equals!(true)),
+			(AUTHORIZATION_APPROVED, exactly!(1))
+		]
+	}
+}
+
+// An instance that the hive's spawner starts presents the hive certificate
+// and holds the payment decryptor, so it approves a confidential transfer as
+// the first instance does.
+tb_scenario! {
+	name: a_spawned_authorization_instance_opens_a_confidential_transfer,
+	spec: SpawnedAuthorizationSpec,
+	environment Servlet {
+		context: TestCerts::generate(),
+		start: |SetupEnv { trace, context: certs }| async move {
+			let spawn = authorization_spawner(certs, Arc::default());
+			spawn(Arc::new(trace)).await
+		},
+		setup: |ClientEnv { addr, context: certs, .. }| async move {
+			Ok(hive_client(&certs, addr).await)
+		},
+		client: |ServletEnv { mut client, context: certs, .. }| async move {
+			let transaction = create_auth_transaction(b"E2E-SPAWNED", MonetaryAmount::new(10000, *b"USD"));
+			let reply = client.emit(authorization_frame(&certs, transaction), None).await?;
+			let reply = reply.ok_or(TightBeamError::MissingResponse)?;
+			let status: TransactionStatus = decode(reply.message())?;
+			assert!(status.status.is_success(), "the client decoded no approval from the servlet frame");
+
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub ReplaySpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(AUTHORIZATION_APPROVED, exactly!(1)),
+			(DEDUP_CACHE_HIT, exactly!(1))
+		]
+	}
+}
+
+// The servlet answers a replayed authorization frame from its dedup cache, so
+// it approves the transfer once.
+tb_scenario! {
+	name: a_replayed_authorization_is_answered_from_the_dedup_cache,
+	spec: ReplaySpec,
+	environment Servlet {
+		context: TestCerts::generate(),
+		start: |SetupEnv { trace, context: certs }| async move {
+			AuthorizationServlet::start(Arc::new(trace), servlet_tls_config(&certs, &Arc::default())?).await
+		},
+		setup: |ClientEnv { addr, context: certs, .. }| async move {
+			Ok(hive_client(&certs, addr).await)
+		},
+		client: |ServletEnv { mut client, context: certs, .. }| async move {
+			let transaction = create_auth_transaction(b"E2E-REPLAY", MonetaryAmount::new(10000, *b"USD"));
+			let transfer = authorization_frame(&certs, transaction);
+			client.emit(transfer.to_owned(), None).await?;
+			client.emit(transfer, None).await?;
+
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub CaptureSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(AUTHORIZATION_APPROVED, exactly!(1)),
+			(CHAIN_VALID, exactly!(2)),
+			(CHAIN_BROKEN, exactly!(0)),
+			(CAPTURE_COMPLETED, exactly!(1))
+		]
+	}
+}
+
+// The client authorizes a transfer and then captures it, with the capture's
+// `previous_frame` set to the digest of the authorization, so the payment
+// chain links the two frames.
+tb_scenario! {
+	name: a_capture_links_to_its_authorization,
+	spec: CaptureSpec,
+	environment Bare {
+		context: TestCerts::generate(),
+		exec: |SetupEnv { trace, context: certs }| async move {
+			let harness = Arc::default();
+			let authorizer = AuthorizationServlet::start(Arc::new(trace.share()), servlet_tls_config(&certs, &harness)?).await?;
+			let capturer = CaptureServlet::start(Arc::new(trace.share()), servlet_tls_config(&certs, &harness)?).await?;
+			let amount = MonetaryAmount::new(10000, *b"USD");
+			let authorized = create_auth_transaction(b"E2E-CAPTURE", amount.to_owned());
+			let capture = CaptureTransaction::new(b"E2E-CAPTURE", amount, authorized.creation_datetime)?;
+			let capture = capture_frame(&certs, capture, &authorized);
+			let mut authorization_client = hive_client(&certs, *authorizer.addr()).await;
+			let mut capture_client = hive_client(&certs, *capturer.addr()).await;
+
+			authorization_client.emit(authorization_frame(&certs, authorized), None).await?;
+			capture_client.emit(capture, None).await?;
 
 			Ok(())
 		}

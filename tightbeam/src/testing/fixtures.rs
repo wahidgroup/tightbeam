@@ -1,4 +1,4 @@
-//! Test material the suite builds scenarios from.
+//! The test material that the suite builds scenarios from.
 //!
 //! Each owner type names the material it makes, so a reader who looks for a
 //! certificate, a frame, or a key finds one place for it.
@@ -44,6 +44,8 @@ use hash::*;
 
 #[cfg(all(feature = "std", feature = "digest", feature = "random"))]
 mod random_id {
+	pub use std::borrow::Cow;
+
 	pub use crate::crypto::hash::Digest;
 	pub use crate::random::generate_random_bytes;
 }
@@ -356,7 +358,7 @@ fn test_certificate_named(
 	Certificate { tbs_certificate, signature_algorithm: algorithm, signature }
 }
 
-/// Wrap a DER-encodable extension value in a critical `Extension` (RFC 5280
+/// Wraps a DER-encodable extension value in a critical `Extension` (RFC 5280
 /// §4.2).
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 fn test_extension<T>(value: &T) -> Extension
@@ -368,7 +370,7 @@ where
 	Extension { extn_id: T::OID, critical: true, extn_value }
 }
 
-/// Wrap a DER-encodable extension value in a non-critical `Extension`, the
+/// Wraps a DER-encodable extension value in a non-critical `Extension`, the
 /// form RFC 5280 §4.2.1.1 and §4.2.1.2 give a key identifier.
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 fn test_noncritical_extension<T>(value: &T) -> Extension
@@ -401,7 +403,7 @@ pub struct TestCertificateChain {
 
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 impl TestCertificateChain {
-	/// Return the chain as a shared `[root, intermediate, leaf]` slice for the
+	/// Returns the chain as a shared `[root, intermediate, leaf]` slice for the
 	/// handshake.
 	pub fn to_arc(&self) -> Arc<[Certificate]> {
 		Arc::from([self.root.to_owned(), self.intermediate.to_owned(), self.leaf.to_owned()])
@@ -427,7 +429,7 @@ fn test_cn_name(cn: impl AsRef<str>) -> TbResult<RdnSequence> {
 	Ok(name)
 }
 
-/// Sign `tbs` with `key` under the test ECDSA-SHA3-256 algorithm.
+/// Signs `tbs` with `key` under the test ECDSA-SHA3-256 algorithm.
 ///
 /// The `signatureValue` is the DER `ECDSA-Sig-Value` (RFC 3279 §2.2.3).
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
@@ -518,7 +520,7 @@ macro_rules! test_builder {
 	};
 }
 
-/// Match a [`Frame`] against an expected value in one of these forms:
+/// Matches a [`Frame`] against an expected value in one of these forms:
 ///
 /// - A `Frame` or an `Arc<Frame>` compares `metadata.id`.
 /// - A `Result<Frame, E>` compares `metadata.id` of the `Ok` frame, and an `Err` matches no frame.
@@ -587,7 +589,7 @@ macro_rules! test_worker {
 			};
 
 			// The shutdown runs before the result returns, so a failed
-			// assertion still stops the worker.
+			// assertion stops the worker too.
 			worker.kill().await?;
 
 			result
@@ -595,7 +597,7 @@ macro_rules! test_worker {
 	};
 }
 
-/// Frames in the shapes the suite sends.
+/// The frames in the shapes that the suite sends.
 pub struct TestFrame;
 
 impl TestFrame {
@@ -617,6 +619,10 @@ impl TestFrame {
 		runtime.block_on(frame.decrypt::<T>(decryptor, inflator))
 	}
 
+	/// A V0 frame of [`TestMessage::sample`] with `content`, under `id`.
+	///
+	/// With no `id`, a build with `std`, `digest`, and `random` draws a fresh
+	/// id, and any other build takes `test-message-id`.
 	pub fn v0(content: Option<&str>, id: Option<&str>) -> Frame {
 		let message = TestMessage::sample(content);
 
@@ -627,19 +633,13 @@ impl TestFrame {
 		let order: u64 = 1_700_000_000;
 
 		#[cfg(all(feature = "std", feature = "digest", feature = "random"))]
-		let id = id.unwrap_or({
-			let mut bytes: [u8; 32] = [0; 32];
-			generate_random_bytes(&mut bytes, None).expect("Failed to generate random bytes");
-
-			let hash = Sha3_256::digest(bytes);
-			Box::leak(format!("{hash:x}").into_boxed_str())
-		});
+		let id = id.map_or_else(|| Cow::Owned(Self::random_id()), Cow::Borrowed);
 
 		#[cfg(not(all(feature = "std", feature = "digest", feature = "random")))]
 		let id = id.unwrap_or("test-message-id");
 
 		let result = compose! {
-			V0: id: id,
+			V0: id: id.as_bytes(),
 				order: order,
 				message: message
 		};
@@ -647,7 +647,17 @@ impl TestFrame {
 		result.expect("Failed to create TightBeam message")
 	}
 
-	/// Build a V1 frame that carries a SHA3-256 frame integrity (FI) digest.
+	/// A fresh frame id: the hex SHA3-256 digest of 32 random octets.
+	#[cfg(all(feature = "std", feature = "digest", feature = "random"))]
+	fn random_id() -> String {
+		let mut bytes: [u8; 32] = [0; 32];
+		generate_random_bytes(&mut bytes, None).expect("Failed to generate random bytes");
+
+		let hash = Sha3_256::digest(bytes);
+		format!("{hash:x}")
+	}
+
+	/// Builds a V1 frame that carries a SHA3-256 frame integrity (FI) digest.
 	#[cfg(all(feature = "builder", feature = "digest", feature = "sha3"))]
 	pub fn with_integrity() -> Frame {
 		let message = TestMessage::sample(None);
@@ -660,7 +670,7 @@ impl TestFrame {
 		.expect("Failed to create frame with frame integrity")
 	}
 
-	/// Build a V2 frame that carries a priority, a field that V0 and V1 forbid.
+	/// Builds a V2 frame that carries a priority, which V0 and V1 forbid.
 	#[cfg(feature = "builder")]
 	pub fn prioritized() -> Frame {
 		let message = TestMessage::sample(None);
@@ -824,7 +834,7 @@ impl CurvePoints for TestP256Points {
 	}
 }
 
-/// Signing and cipher keys with fixed, test-only material.
+/// The signing and cipher keys with fixed, test-only material.
 pub struct TestKey;
 
 impl TestKey {
@@ -946,7 +956,8 @@ impl TestKey {
 	}
 }
 
-/// Certificates and chains in the shapes the trust stores accept or refuse.
+/// The certificates and chains in the shapes that the trust stores accept or
+/// refuse.
 pub struct TestCertificate;
 
 impl TestCertificate {
@@ -994,7 +1005,7 @@ impl TestCertificate {
 		certificate
 	}
 
-	/// Build CA issuer extensions: `basicConstraints` (RFC 5280 §4.2.1.9) and
+	/// Builds CA issuer extensions: `basicConstraints` (RFC 5280 §4.2.1.9) and
 	/// `keyUsage` (§4.2.1.3), as required for certificate-path validation.
 	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 	pub fn ca_extensions(ca: bool, key_cert_sign: bool, path_len: Option<u8>) -> Vec<Extension> {
@@ -1246,7 +1257,7 @@ impl TestCertificate {
 		[first, second]
 	}
 
-	/// Create a valid certificate chain in which a root signs an intermediate
+	/// Creates a valid certificate chain in which a root signs an intermediate
 	/// and the intermediate signs a leaf.
 	///
 	/// Each certificate names the subject of its signer as its issuer, and
@@ -1339,7 +1350,7 @@ impl TestCertificate {
 		Ok(TestCertificateChain { root, intermediate, leaf, root_key, intermediate_key, leaf_key })
 	}
 
-	/// Create an expired test certificate for the validation tests.
+	/// Creates an expired test certificate for the validation tests.
 	///
 	/// This certificate from ssl.com expired on August 17, 2019, so it
 	/// exercises the expiry validation logic.
@@ -1385,7 +1396,7 @@ impl TestCertificate {
 	}
 }
 
-/// Signer material for CMS structures.
+/// The signer material of CMS structures.
 ///
 /// The CMS signer signs fixed placeholder content under the fixed test key,
 /// because these tests exercise the encoding of a frame's signature slot.
@@ -1404,7 +1415,7 @@ impl TestSigner {
 	}
 }
 
-/// Readers of the signed attributes of a `SignerInfo`, which the tests of
+/// The readers of the signed attributes of a `SignerInfo`, which the tests of
 /// signed structures share.
 #[cfg(feature = "signature")]
 pub struct TestAttributes;
@@ -1612,7 +1623,7 @@ impl TestCmsServer {
 	}
 }
 
-/// Signing identities, each a certificate beside the key that proves it.
+/// The signing identities, each a certificate beside the key that proves it.
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 pub struct TestIdentity;
 
@@ -1648,8 +1659,8 @@ impl TestIdentity {
 	}
 }
 
-/// Gossip rumors that the fixed test key signs, as a gateway's verification
-/// hands them to admission.
+/// The gossip rumors that the fixed test key signs, as a gateway's
+/// verification hands them to admission.
 #[cfg(feature = "colony")]
 pub struct TestRumor;
 
@@ -1681,8 +1692,8 @@ impl TestRumor {
 	}
 }
 
-/// Traces for the tests of the internal events, and the trail a test reads
-/// back from one.
+/// The traces of the tests of the internal events, and the trail a test
+/// reads back from one.
 #[cfg(feature = "instrument")]
 pub struct TestTrace;
 
@@ -1729,7 +1740,7 @@ impl TestTrace {
 	}
 }
 
-/// Digest material for CMS structures.
+/// The digest material of CMS structures.
 pub struct TestDigest;
 
 impl TestDigest {
@@ -1818,6 +1829,12 @@ mod tests {
 		let message = TestMessage::sample(Some("Test content"));
 		assert_eq!(message.content, "Test content");
 		Ok(())
+	}
+
+	#[test]
+	fn a_test_frame_carries_the_id_its_caller_names() {
+		let frame = TestFrame::v0(None, Some("named-id"));
+		assert_eq!(frame.metadata().id(), b"named-id");
 	}
 
 	test_builder! {

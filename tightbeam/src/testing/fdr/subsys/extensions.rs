@@ -9,10 +9,13 @@ use std::collections::HashSet;
 use std::io::Write;
 
 use crate::policy::TransitStatus;
-use crate::testing::assertions::AssertionLabel;
+use crate::testing::assertions::{Assertion, AssertionLabel};
 use crate::testing::fdr::verdict::AcceptanceSet;
-use crate::testing::specs::csp::{intern, Event, Observation, Process, State, TransitionRelation};
+use crate::testing::specs::csp::{intern, Action, Event, Observation, Process, State, TransitionRelation};
 use crate::trace::{ConsumedTrace, InternalEvent};
+
+#[cfg(feature = "instrument")]
+use crate::urn::Urn;
 
 /// The state label of a trace before its gate decides.
 pub const INITIAL: &str = "initial";
@@ -31,8 +34,12 @@ pub const TERMINAL: &str = "terminal";
 /// [`Process`] of FDR refinement checking, from the events that the trace
 /// captured under its [`TbInstrumentationConfig`].
 ///
-/// `FullInstrumentation` reads the hidden events, which a trace captures
-/// when its [`TbInstrumentationConfig`] sets `enable_internal_detail`.
+/// - `FullInstrumentation` reads the hidden events, which a trace captures
+///   when its [`TbInstrumentationConfig`] sets `enable_internal_detail`.
+/// - The two instrumentation modes read each assertion from its own record,
+///   `assert/label`, `assert/payload`, or `timing/wcet`, so each event enters
+///   once, in the order that the trace recorded it.
+/// - A sink that drops records also drops the assertions among them.
 ///
 /// [`TbInstrumentationConfig`]: crate::instrumentation::TbInstrumentationConfig
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,6 +63,88 @@ pub enum TraceProcessMode {
 	/// `enable_internal_detail: true`.
 	#[cfg(feature = "instrument")]
 	FullInstrumentation,
+}
+
+impl TraceProcessMode {
+	/// The events of `trace` that this mode selects, each as an action of its
+	/// alphabet, in the order that the trace recorded them.
+	fn chain(self, trace: &ConsumedTrace) -> Vec<Action> {
+		match self {
+			Self::AssertionsOnly => trace.assertions.iter().map(Self::assertion_action).collect(),
+			#[cfg(feature = "instrument")]
+			Self::WithObservableInstrumentation | Self::FullInstrumentation => {
+				let records = trace.instrument_events.iter();
+				let selected = records.filter_map(|record| {
+					let kind = Record::of(&record.urn).filter(|kind| self.admits(*kind))?;
+					let label = intern(record.label.as_deref()?);
+					match kind {
+						Record::Hidden => Some(Action::hidden(label)),
+						Record::Observable | Record::Measured => Some(Action::observable(label)),
+					}
+				});
+
+				selected.collect()
+			}
+		}
+	}
+
+	/// The observable action of `assertion`, named by its label.
+	fn assertion_action(assertion: &Assertion) -> Action {
+		let AssertionLabel::Custom(label) = &assertion.label;
+		let name: &'static str = match label {
+			Cow::Borrowed(name) => name,
+			Cow::Owned(name) => intern(name.as_str()),
+		};
+
+		Action::observable(name)
+	}
+
+	/// Whether this mode admits an instrumentation record of `kind`.
+	#[cfg(feature = "instrument")]
+	fn admits(self, kind: Record) -> bool {
+		kind != Record::Hidden || self == Self::FullInstrumentation
+	}
+}
+
+/// The kind of an instrumentation record, as the process of a trace reads it.
+#[cfg(feature = "instrument")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Record {
+	/// An observable instrumentation event: `gate/accept`, `gate/reject`,
+	/// `transport/request-recv`, `transport/response-send`, or `assert/label`,
+	/// the record of an assertion with no value.
+	Observable,
+	/// The record of an assertion with a value or a duration, `assert/payload`
+	/// or `timing/wcet`.
+	Measured,
+	/// A hidden instrumentation event, an internal event or `process/hidden`.
+	Hidden,
+}
+
+#[cfg(feature = "instrument")]
+impl Record {
+	/// The kind of a record of `urn`, or `None` for a record that the process
+	/// of a trace leaves out.
+	fn of(urn: &Urn<'static>) -> Option<Self> {
+		use crate::instrumentation::events;
+
+		let observable = [
+			events::GATE_ACCEPT,
+			events::GATE_REJECT,
+			events::REQUEST_RECV,
+			events::RESPONSE_SEND,
+		];
+		if observable.contains(urn) || *urn == events::ASSERT_LABEL {
+			return Some(Self::Observable);
+		}
+
+		if *urn == events::ASSERT_PAYLOAD || *urn == events::TIMING_WCET {
+			return Some(Self::Measured);
+		}
+
+		let hidden = InternalEvent::of(urn).is_some() || *urn == events::PROCESS_HIDDEN;
+		hidden.then_some(Self::Hidden)
+	}
 }
 
 /// An extension trait that adds FDR analysis to a [`ConsumedTrace`].
@@ -117,7 +206,7 @@ pub trait FdrTraceExt {
 impl FdrTraceExt for ConsumedTrace {
 	fn csp_valid(&self) -> bool {
 		// A run whose gate accepted is valid when it shows an assertion or a
-		// response. A run with no gate decision took no gate, so it passes.
+		// response. A run with no gate decision takes no gate, so it passes.
 		if matches!(self.gate_decision, Some(TransitStatus::Ok))
 			&& self.assertions.is_empty()
 			&& self.response.is_none()
@@ -130,14 +219,14 @@ impl FdrTraceExt for ConsumedTrace {
 
 	fn terminated_in_valid_state(&self) -> bool {
 		match self.gate_decision {
-			// An accepted run ends validly when the handler left a response
+			// An accepted run ends validly when the handler leaves a response
 			// or an assertion.
 			Some(TransitStatus::Ok) => self.response.is_some() || !self.assertions.is_empty(),
-			// A gate that reached no decision did not terminate.
+			// A gate whose status is unknown leaves the run unterminated.
 			Some(TransitStatus::Unknown) => false,
 			// Every other status is a rejection, which is terminal.
 			Some(_) => true,
-			// A run that took no gate passes, because the check reads the
+			// A run that takes no gate passes, because the check reads the
 			// gate decision alone.
 			None => true,
 		}
@@ -150,16 +239,12 @@ impl FdrTraceExt for ConsumedTrace {
 		let mut acceptance = AcceptanceSet::new();
 		match state_label {
 			INITIAL => {
-				// Before the gate decides, the state accepts the request.
 				acceptance.insert(Event("request"));
 			}
 			GATE_ACCEPT => {
-				// After the gate accepts, the state accepts the handler entry.
 				acceptance.insert(Event(InternalEvent::HandlerEnter.label()));
 			}
 			HANDLER => {
-				// While the handler runs, the state accepts the handler exit
-				// and the response.
 				acceptance.insert(Event(InternalEvent::HandlerExit.label()));
 				acceptance.insert(Event("response"));
 			}
@@ -167,7 +252,6 @@ impl FdrTraceExt for ConsumedTrace {
 				// A rejected or terminal state has an empty acceptance set.
 			}
 			_ => {
-				// An unknown state label has no acceptance set.
 				return None;
 			}
 		}
@@ -198,28 +282,18 @@ impl FdrTraceExt for ConsumedTrace {
 
 	#[cfg(feature = "instrument")]
 	fn project_to_observable(&self) -> Vec<String> {
-		use crate::instrumentation::events;
-
 		self.instrument_events
 			.iter()
-			.filter(|e| {
-				e.urn == events::GATE_ACCEPT
-					|| e.urn == events::GATE_REJECT
-					|| e.urn == events::REQUEST_RECV
-					|| e.urn == events::RESPONSE_SEND
-					|| e.urn == events::ASSERT_LABEL
-			})
+			.filter(|e| Record::of(&e.urn) == Some(Record::Observable))
 			.filter_map(|e| e.label.as_ref().map(|s| s.to_string()))
 			.collect()
 	}
 
 	#[cfg(feature = "instrument")]
 	fn project_to_hidden(&self) -> Vec<String> {
-		use crate::instrumentation::events;
-
 		self.instrument_events
 			.iter()
-			.filter(|e| InternalEvent::of(&e.urn).is_some() || e.urn == events::PROCESS_HIDDEN)
+			.filter(|e| Record::of(&e.urn) == Some(Record::Hidden))
 			.filter_map(|e| e.label.as_ref().map(|s| s.to_string()))
 			.collect()
 	}
@@ -259,141 +333,32 @@ impl FdrTraceExt for ConsumedTrace {
 		let s_terminal = State(TERMINAL);
 
 		states.insert(s_initial);
-		states.insert(s_terminal);
-		terminal.insert(s_terminal);
-
-		// An event of the trace, with the sequence number that orders it.
-		#[derive(Clone)]
-		enum TraceEvent {
-			Assertion {
-				seq: usize,
-				label: &'static str,
-			},
-			#[cfg(feature = "instrument")]
-			ObservableInstrumentation {
-				seq: u32,
-				label: String,
-			},
-			#[cfg(feature = "instrument")]
-			HiddenInstrumentation {
-				seq: u32,
-				label: String,
-			},
-		}
-
-		let mut events: Vec<TraceEvent> = Vec::new();
-
-		// Every mode includes the assertions.
-		for assertion in &self.assertions {
-			let AssertionLabel::Custom(label) = &assertion.label;
-			let static_label: &'static str = match label {
-				Cow::Borrowed(s) => s,
-				Cow::Owned(s) => intern(s.as_str()),
-			};
-
-			events.push(TraceEvent::Assertion { seq: assertion.seq, label: static_label });
-		}
-
-		// The mode selects the instrumentation events that join the
-		// assertions.
-		#[cfg(feature = "instrument")]
-		{
-			match mode {
-				TraceProcessMode::AssertionsOnly => {
-					// This mode takes the assertions alone.
-				}
-				TraceProcessMode::WithObservableInstrumentation | TraceProcessMode::FullInstrumentation => {
-					// Both modes take the observable instrumentation events.
-					use crate::instrumentation::events;
-					for event in &self.instrument_events {
-						if event.urn == events::GATE_ACCEPT
-							|| event.urn == events::GATE_REJECT
-							|| event.urn == events::REQUEST_RECV
-							|| event.urn == events::RESPONSE_SEND
-							|| event.urn == events::ASSERT_LABEL
-						{
-							if let Some(label) = &event.label {
-								events.push(TraceEvent::ObservableInstrumentation {
-									seq: event.seq,
-									label: label.clone(),
-								});
-							}
-						}
-					}
-				}
-			}
-
-			if matches!(mode, TraceProcessMode::FullInstrumentation) {
-				// `FullInstrumentation` also takes the hidden instrumentation
-				// events.
-				use crate::instrumentation::events;
-				for event in &self.instrument_events {
-					if InternalEvent::of(&event.urn).is_some() || event.urn == events::PROCESS_HIDDEN {
-						if let Some(label) = &event.label {
-							events.push(TraceEvent::HiddenInstrumentation { seq: event.seq, label: label.clone() });
-						}
-					}
-				}
-			}
-		}
-
-		// The events sort by sequence number, so each kind keeps its recorded
-		// order. An assertion counts the assertions before it, and an
-		// instrumentation event counts the instrumentation events before it,
-		// so the two kinds interleave by those two counts.
-		events.sort_by(|a, b| {
-			let seq_a = match a {
-				TraceEvent::Assertion { seq, .. } => *seq as u64,
-				#[cfg(feature = "instrument")]
-				TraceEvent::ObservableInstrumentation { seq, .. } | TraceEvent::HiddenInstrumentation { seq, .. } => *seq as u64,
-			};
-			let seq_b = match b {
-				TraceEvent::Assertion { seq, .. } => *seq as u64,
-				#[cfg(feature = "instrument")]
-				TraceEvent::ObservableInstrumentation { seq, .. } | TraceEvent::HiddenInstrumentation { seq, .. } => *seq as u64,
-			};
-
-			seq_a.cmp(&seq_b)
-		});
 
 		// Each event takes one state of the chain to the next.
-		if !events.is_empty() {
-			let mut from_state = s_initial;
-			for (idx, event) in events.iter().enumerate() {
-				let (event, is_hidden) = match event {
-					TraceEvent::Assertion { label, .. } => (Event(label), false),
-					#[cfg(feature = "instrument")]
-					TraceEvent::ObservableInstrumentation { label, .. } => (Event(intern(label.as_str())), false),
-					#[cfg(feature = "instrument")]
-					TraceEvent::HiddenInstrumentation { label, .. } => (Event(intern(label.as_str())), true),
-				};
-
-				// A hidden instrumentation event joins the hidden alphabet, and
-				// every other event joins the observable alphabet.
-				if is_hidden {
-					hidden.insert(event);
-				} else {
-					observable.insert(event);
-				}
-
-				// The last event reaches the terminal state, and each earlier
-				// event reaches an intermediate state of its own.
-				let to_state = if idx == events.len() - 1 {
-					s_terminal
-				} else {
-					let to_state = State(intern(format!("trace_state_{idx}")));
-					states.insert(to_state);
-
-					to_state
-				};
-
-				transitions.add(from_state, event, to_state);
-				from_state = to_state;
+		let chain = mode.chain(self);
+		let last = chain.len().saturating_sub(1);
+		let mut from_state = s_initial;
+		for (idx, action) in chain.into_iter().enumerate() {
+			if action.is_hidden() {
+				hidden.insert(action.event);
+			} else {
+				observable.insert(action.event);
 			}
+
+			let to_state = if idx == last {
+				s_terminal
+			} else {
+				State(intern(format!("trace_state_{idx}")))
+			};
+
+			states.insert(to_state);
+			transitions.add(from_state, action.event, to_state);
+			from_state = to_state;
 		}
 
-		// A trace with no event leaves the initial state with no transition,
-		// and that state is not terminal, so the process is STOP.
+		// The run ends where the chain ends, so that state is accepting. A
+		// trace with no event ends at its initial state.
+		terminal.insert(from_state);
 
 		let description = match mode {
 			TraceProcessMode::AssertionsOnly => "Process derived from ConsumedTrace (assertion events only)",
@@ -446,5 +411,114 @@ impl ConsumedTrace {
 	/// conversion.
 	pub fn to_process_with_mode(&self, mode: TraceProcessMode) -> Process {
 		<Self as FdrTraceExt>::to_process_with_mode(self, mode)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::testing::fdr::{Decision, DefaultFdrExplorer, FdrConfig};
+	use crate::trace::TraceCollector;
+	use crate::urn::Urn;
+	use crate::TightBeamError;
+
+	#[cfg(feature = "instrument")]
+	use crate::instrumentation::events::GATE_ACCEPT;
+
+	/// An assertion that a run records first.
+	const FIRST: Urn<'static> = crate::urn!("test", "event:extensions/first");
+
+	/// An assertion that a run records after its gate decides.
+	#[cfg(feature = "instrument")]
+	const AFTER: Urn<'static> = crate::urn!("test", "event:extensions/after");
+
+	/// The trace that `collector` recorded, with `gate` as its gate decision.
+	fn consumed(collector: &TraceCollector, gate: Option<TransitStatus>) -> ConsumedTrace {
+		let mut trace = ConsumedTrace::new();
+		trace.populate_from_collector(collector);
+		trace.gate_decision = gate;
+		trace
+	}
+
+	/// The events along the one chain of `process`, from its initial state.
+	#[cfg(feature = "instrument")]
+	fn chain_of(process: &Process) -> Vec<&'static str> {
+		let mut chain = Vec::new();
+		let mut state = process.initial;
+		while let Some(action) = process.enabled(state).into_iter().next() {
+			chain.push(action.event.0);
+			let Some(next) = process.step(state, &action.event).into_iter().next() else {
+				break;
+			};
+
+			state = next;
+		}
+
+		chain
+	}
+
+	#[test]
+	fn a_run_whose_gate_accepted_with_no_assertion_and_no_response_is_invalid() {
+		let trace = consumed(&TraceCollector::new(), Some(TransitStatus::Ok));
+		assert!(!trace.csp_valid(), "an accepted run shows neither an assertion nor a response");
+	}
+
+	#[test]
+	fn a_run_whose_gate_accepted_with_an_assertion_is_valid() -> Result<(), TightBeamError> {
+		let collector = TraceCollector::new();
+		collector.event(FIRST)?.emit();
+
+		let trace = consumed(&collector, Some(TransitStatus::Ok));
+		assert!(trace.csp_valid(), "the accepted run recorded an assertion");
+		Ok(())
+	}
+
+	#[test]
+	fn a_gate_that_reached_no_decision_ends_in_an_invalid_state() {
+		let trace = consumed(&TraceCollector::new(), Some(TransitStatus::Unknown));
+		assert!(!trace.terminated_in_valid_state(), "an undecided gate did not terminate");
+	}
+
+	#[test]
+	fn a_rejected_run_ends_in_a_valid_state() {
+		let trace = consumed(&TraceCollector::new(), Some(TransitStatus::PermissionDenied));
+
+		assert!(trace.terminated_in_valid_state(), "a rejection is terminal");
+	}
+
+	#[test]
+	fn a_trace_with_no_event_converts_to_a_process_free_of_deadlock() {
+		let process = ConsumedTrace::new().to_process();
+		let mut explorer = DefaultFdrExplorer::with_defaults(&process, FdrConfig::default());
+
+		let verdict = explorer.explore();
+		assert_eq!(verdict.deadlock_free, Decision::Holds, "the run ended where it started");
+	}
+
+	#[cfg(feature = "instrument")]
+	#[test]
+	fn a_valueless_assertion_enters_the_chain_once() -> Result<(), TightBeamError> {
+		let collector = TraceCollector::new();
+		collector.event(FIRST)?.emit();
+		let trace = consumed(&collector, None);
+
+		let process = trace.to_process_with_mode(TraceProcessMode::WithObservableInstrumentation);
+		let first = FIRST.to_string();
+		assert_eq!(chain_of(&process), [first.as_str()]);
+		Ok(())
+	}
+
+	#[cfg(feature = "instrument")]
+	#[test]
+	fn an_instrumentation_event_keeps_its_place_among_the_assertions() -> Result<(), TightBeamError> {
+		let collector = TraceCollector::new();
+		collector.emit_event_with_evidence(GATE_ACCEPT, "Ok", None)?;
+		collector.event(AFTER)?.emit();
+		let trace = consumed(&collector, None);
+
+		let process = trace.to_process_with_mode(TraceProcessMode::WithObservableInstrumentation);
+		let (gate, after) = (GATE_ACCEPT.to_string(), AFTER.to_string());
+		assert_eq!(chain_of(&process), [gate.as_str(), "Ok", after.as_str()]);
+		Ok(())
 	}
 }

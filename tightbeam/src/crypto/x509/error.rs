@@ -65,10 +65,6 @@ pub enum CertificateValidationError {
 	#[error("Fingerprint length mismatch: {0}")]
 	FingerprintLength(crate::error::ReceivedExpectedError<usize, usize>),
 
-	/// The certificate encoding is invalid.
-	#[error("Invalid certificate encoding")]
-	InvalidCertificateEncoding,
-
 	/// The trust store does not hold the certificate.
 	#[error("Certificate not trusted")]
 	CertificateNotTrusted,
@@ -203,6 +199,69 @@ pub enum CertificateValidationError {
 	#[cfg(feature = "signature")]
 	#[error("Signature verification failed: {0}")]
 	SignatureVerificationFailed(signature::Error),
+}
+
+// The audit records of a refused handshake and of a refused failover alone
+// name a refusal, so the names take the gate of those records.
+#[cfg(all(
+	feature = "instrument",
+	any(feature = "transport-cms", feature = "transport-hpke")
+))]
+impl CertificateValidationError {
+	crate::macros::names::refusal_names! {
+		[
+			/// The stable kebab-case name of this refusal, for audit labels.
+			///
+			/// The name leaves out the fields a refusal carries, so one
+			/// refusal reads as one label whatever certificate it names. The
+			/// refusal of a pooled failover alone labels its record with the
+			/// bare name.
+			#[cfg(pooled_mux)]
+			fn as_str = "";
+			/// The label of a handshake that refuses the certificate of its
+			/// peer for this cause: `certificate/` and the stable kebab-case
+			/// name of the refusal.
+			fn refusal_label = "certificate/";
+		]
+		{
+			Self::Expired => "expired",
+			Self::NotYetValid => "not-yet-valid",
+			Self::EmptyPublicKey => "empty-public-key",
+			Self::EmptySignature => "empty-signature",
+			Self::InvalidTimestamp => "invalid-timestamp",
+			Self::UnsupportedAlgorithm(_) => "unsupported-algorithm",
+			Self::EncodingError(_) => "encoding-error",
+			Self::AlgorithmMismatch => "algorithm-mismatch",
+			Self::SpkiError(_) => "spki-error",
+			Self::PublicKeyNotPinned => "public-key-not-pinned",
+			Self::CertificateNotPinned => "certificate-not-pinned",
+			Self::CertificateDenied => "certificate-denied",
+			Self::FingerprintLength(_) => "fingerprint-length",
+			Self::CertificateNotTrusted => "certificate-not-trusted",
+			Self::InvalidChain { .. } => "invalid-chain",
+			Self::AmbiguousIssuer { .. } => "ambiguous-issuer",
+			Self::PathCycle { .. } => "path-cycle",
+			Self::EmptyChain => "empty-chain",
+			Self::SkidCollision { .. } => "skid-collision",
+			Self::PublicKeyCollision { .. } => "public-key-collision",
+			Self::IssuerNotCa => "issuer-not-ca",
+			Self::MissingKeyCertSign => "missing-key-cert-sign",
+			Self::MissingKeyUsage(_) => "missing-key-usage",
+			Self::ExcludedKeyUsage(_) => "excluded-key-usage",
+			Self::ExcludedKeyPurpose => "excluded-key-purpose",
+			Self::DuplicateExtension(_) => "duplicate-extension",
+			Self::PathLenExceeded => "path-len-exceeded",
+			Self::UnprocessedCriticalExtension(_) => "unprocessed-critical-extension",
+			Self::NameConstraintsUnapplied => "name-constraints-unapplied",
+			Self::EndEntityIsCa => "end-entity-is-ca",
+			Self::CertificateRevoked => "certificate-revoked",
+			Self::RevocationStatusUnknown => "revocation-status-unknown",
+			#[cfg(feature = "signature")]
+			Self::PublicKeyError(_) => "public-key-error",
+			#[cfg(feature = "signature")]
+			Self::SignatureVerificationFailed(_) => "signature-verification-failed",
+		}
+	}
 }
 
 crate::impl_from!(der::Error => CertificateValidationError::EncodingError);

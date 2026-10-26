@@ -229,6 +229,10 @@ macro_rules! impl_tcp_common {
 			/// The instrumentation collector of this connection.
 			#[cfg(feature = "instrument")]
 			pub(crate) trace: Option<$crate::trace::TraceCollector>,
+			/// The address of the peer that a listener accepted this connection
+			/// from, which the record of the acceptance names.
+			#[cfg(feature = "instrument")]
+			pub(crate) accepted_from: Option<core::net::SocketAddr>,
 		}
 
 		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> $transport<S, P>
@@ -262,6 +266,8 @@ macro_rules! impl_tcp_common {
 					server_handshake: None,
 					#[cfg(feature = "instrument")]
 					trace,
+					#[cfg(feature = "instrument")]
+					accepted_from: None,
 				}
 			}
 
@@ -343,6 +349,14 @@ macro_rules! impl_tcp_common {
 			#[cfg(feature = "instrument")]
 			pub fn trace(&self) -> Option<$crate::trace::TraceCollector> {
 				self.trace.as_ref().map($crate::trace::TraceCollector::share)
+			}
+
+			/// This connection, which a listener accepted from `peer`.
+			#[cfg(feature = "instrument")]
+			#[must_use]
+			pub(crate) fn accepted_from_peer(mut self, peer: core::net::SocketAddr) -> Self {
+				self.accepted_from = Some(peer);
+				self
 			}
 		}
 
@@ -450,6 +464,11 @@ macro_rules! impl_tcp_common {
 			#[cfg(feature = "instrument")]
 			fn with_trace(self, trace: TraceCollector) -> Self {
 				Self::with_trace(self, trace)
+			}
+
+			#[cfg(feature = "instrument")]
+			fn accepted_from(&self) -> Option<core::net::SocketAddr> {
+				self.accepted_from
 			}
 		}
 	};

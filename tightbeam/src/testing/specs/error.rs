@@ -1,4 +1,4 @@
-//! Spec verification error types
+//! The error types of spec verification.
 
 use core::fmt::{Display, Formatter};
 
@@ -14,75 +14,90 @@ use crate::policy::TransitStatus;
 use crate::testing::schedulability::{SchedulabilityError, SchedulabilityResult};
 use crate::Errorizable;
 
-/// Gate decision mismatch details
+/// The gate decision that a spec expects, and the one the trace recorded.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GateDecisionMismatch {
+	/// The gate decision that the spec expects.
 	pub expected: TransitStatus,
+	/// The gate decision that the trace recorded, or `None` for no decision.
 	pub actual: Option<TransitStatus>,
 }
 
-/// Assertion contract violation details
+/// The label, tag filter, and cardinality of a broken assertion contract,
+/// with the count that the trace holds.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AssertionViolationDetail {
+	/// The label of the broken contract.
 	pub label: AssertionLabel,
+	/// The tag filter of the contract, or `None` when the contract has none.
 	pub tags: Option<Vec<&'static str>>,
+	/// The cardinality that the contract requires, as text.
 	pub expected: String,
+	/// The count of the trace assertions that match the label and the filter.
 	pub actual: usize,
 }
 
-/// Event ordering violation details
+/// The first required event that the trace lacks in order, and its index
+/// among the required events.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EventOrderViolationDetail {
+	/// The first required event that the trace lacks in order.
 	pub expected_kind: crate::urn::Urn<'static>,
+	/// The index of that event among the required events.
 	pub position: usize,
 }
 
-/// Event count mismatch details
+/// An event kind, with the count that a spec expects and the actual count.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EventCountMismatchDetail {
+	/// The event kind that the spec counts.
 	pub kind: crate::urn::Urn<'static>,
+	/// The count that the spec expects.
 	pub expected: usize,
+	/// The count that the trace holds.
 	pub actual: usize,
 }
 
-/// Spec violation error type
+/// The error that the verification of a scenario reports.
 #[derive(Clone, Debug, PartialEq, Errorizable)]
 pub enum SpecViolation {
-	/// The scenario body itself returned an error, carrying its rendering
+	/// The scenario body itself returned an error, and the string renders it.
 	#[error("Execution failed: {0}")]
 	ExecutionFailed(String),
-	/// Response assertion mismatch
+	/// A spec forbids a response, and the trace holds one.
 	#[error("Response present but spec forbids it")]
 	ResponseUnexpectedPresence,
+	/// A spec requires a response, and the trace holds none.
 	#[error("Response absent but spec requires it")]
 	ResponseUnexpectedAbsence,
+	/// The response fails the response validation of the spec.
 	#[error("Response validation failed")]
 	ResponseValidationFailed,
-	/// Execution mode mismatch
+	/// The execution mode of the run differs from the mode the spec names.
 	#[error("Execution mode mismatch: {0}")]
 	ModeMismatch(ReceivedExpectedError<ExecutionMode, ExecutionMode>),
-	/// Gate decision mismatch
+	/// The gate decision of the run differs from the decision the spec expects.
 	#[error("Gate decision mismatch: {0:?}")]
 	GateDecisionMismatch(GateDecisionMismatch),
-	/// Assertion contract violated
+	/// The trace breaks the cardinality of an assertion contract.
 	#[error("Assertion contract violated: {0:?}")]
 	AssertionViolation(AssertionViolationDetail),
-	/// Event ordering violation (instrumentation)
+	/// The trace lacks the required instrumentation events in their order.
 	#[error("Event order violation: {0:?}")]
 	EventOrderViolation(EventOrderViolationDetail),
-	/// Event count mismatch
+	/// The count of an event kind differs from the count a spec expects.
 	#[error("Event count mismatch: {0:?}")]
 	EventCountMismatch(EventCountMismatchDetail),
-	/// CSP process validation failed (Layer 2)
+	/// The trace violates the CSP process of Layer 2.
 	#[error("CSP process violation: {0:?}")]
 	CspProcessViolation(Vec<CspViolation>),
-	/// Refinement checking rejected the scenario (Layer 3)
+	/// The refinement check of Layer 3 rejected the scenario.
 	///
 	/// The witness for each failed check is on the verdict itself, reachable
 	/// through [`ScenarioVerdict::fdr`](crate::testing::ScenarioVerdict::fdr).
 	#[error("Refinement check failed")]
 	RefinementViolation,
-	/// Refinement checking did not conclude (Layer 3)
+	/// The refinement check of Layer 3 stopped before it decided.
 	///
 	/// Exploration stopped on a bound or a timeout, so the layer neither
 	/// refuted the run nor cleared it. The bounds are on the verdict itself,
@@ -90,14 +105,14 @@ pub enum SpecViolation {
 	/// [`ScenarioVerdict::fdr`](crate::testing::ScenarioVerdict::fdr).
 	#[error("Refinement check did not conclude within its exploration bounds")]
 	RefinementInconclusive,
-	/// A layer the scenario expected a violation from accepted the run
+	/// The layer that the scenario expects a violation from accepted the run.
 	#[error("Expected a violation from {0:?}, which accepted the run")]
 	ExpectationUnmet(Layer),
-	/// Schedulability violation (analysis failed)
+	/// The schedulability analysis contradicts the assertion of the spec.
 	#[cfg(feature = "testing-timing")]
 	#[error("Schedulability violation: {0:?}")]
 	SchedulabilityViolation(SchedulabilityResult),
-	/// Schedulability analysis error (couldn't perform analysis)
+	/// The schedulability analysis could not run.
 	#[cfg(feature = "testing-timing")]
 	#[error("Schedulability analysis error: {0}")]
 	#[from]
@@ -147,3 +162,6 @@ impl Display for Violations {
 		Ok(())
 	}
 }
+
+// A grading returns this type as its error, so a caller can carry it with `?`.
+impl core::error::Error for Violations {}

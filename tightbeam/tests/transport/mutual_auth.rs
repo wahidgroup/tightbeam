@@ -22,7 +22,6 @@ use std::sync::Arc;
 use crate::common::static_pair::{client_pinning, CLIENT_CERT, CLIENT_KEY, SERVER_CERT, SERVER_KEY};
 use tightbeam::crypto::sign::SigningIdentity;
 use tightbeam::{
-	at_least,
 	colony::servlet::ServletConfig,
 	compose,
 	crypto::{
@@ -38,20 +37,12 @@ use tightbeam::{
 	instrumentation::events,
 	prelude::*,
 	servlet, tb_assert_spec, tb_scenario,
-	testing::{assertions::Presence, macros::IsSome},
 	trace::TraceCollector,
 	transport::{tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder, MessageEmitter},
-	urn::Urn,
 	Beamable,
 };
 
-pub(crate) const AUTHENTICATED: Urn<'static> = tightbeam::urn!("test", "event:mutual-auth/authenticated");
-pub(crate) const RESPONSE_RECEIVED: Urn<'static> = tightbeam::urn!("test", "event:mutual-auth/response-received");
-pub(crate) const SERVER_ID: Urn<'static> = tightbeam::urn!("test", "event:mutual-auth/server-id");
-pub(crate) const CLIENT_CERT_REJECTED: Urn<'static> = tightbeam::urn!("test", "event:mutual-auth/client-cert-rejected");
-pub(crate) const SERVER_CERT_REJECTED: Urn<'static> = tightbeam::urn!("test", "event:mutual-auth/server-cert-rejected");
-
-// The tests share this helper.
+// Every scenario trusts the server certificate through this store.
 
 fn make_server_trust_store() -> Result<Arc<dyn CertificateTrust>, TightBeamError> {
 	let server_cert = Certificate::try_from(SERVER_CERT)?;
@@ -97,15 +88,15 @@ servlet! {
 
 // The positive scenario authenticates both ends and exchanges one request.
 
-// The spec checks the reply of the authenticated exchange.
+// The servlet admits the pinned client and completes the handshake. The
+// servlet alone records into the scenario trace, so each event is its own.
 tb_assert_spec! {
 	MutualAuthSpec,
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(RESPONSE_RECEIVED, exactly!(1), equals!(IsSome)),
-			(SERVER_ID, exactly!(1), equals!("mutual-auth-server")),
-			(AUTHENTICATED, exactly!(1), equals!(true))
+			(events::SESSION_HANDSHAKE_COMPLETE, exactly!(1)),
+			(events::SESSION_CERT_REJECTED, exactly!(0))
 		]
 	}
 }
@@ -136,7 +127,7 @@ tb_scenario! {
 			Ok(client)
 		},
 		client: |env| async move {
-			let (trace, mut client) = (env.trace, env.client);
+			let mut client = env.client;
 			let request = AuthRequest {
 				client_id: "test-client-mutual-001".to_string(),
 			};
@@ -146,26 +137,22 @@ tb_scenario! {
 				message: request
 			}?;
 
-			// Each trace event fires unconditionally for the spec to check.
 			let response_frame: Option<Frame> = client.emit(request_frame, None).await?;
-			trace.event_with(RESPONSE_RECEIVED, &[], Presence::of_option(&response_frame))?;
-
 			let response_frame = response_frame.ok_or(TightBeamError::MissingResponse)?;
 			let response: AuthResponse = decode(response_frame.message())?;
 
-			trace.event_with(SERVER_ID, &[], response.server_id)?;
-			trace.event_with(AUTHENTICATED, &[], response.authenticated)?;
-
+			assert_eq!(response.server_id, "mutual-auth-server", "the reply must name the servlet");
+			assert!(response.authenticated, "the servlet must accept the client id");
 			Ok(())
 		}
 	}
 }
 
-/// Drive the lazy encryption handshake to a verdict: `connect` only
-/// dials, so a certificate rejection surfaces on the first exchange. The
-/// probe is a well-formed request, so a decode failure cannot masquerade as
-/// a handshake refusal. The client transport carries the scenario
-/// collector, so the collector records its own handshake verdicts.
+/// Drives the lazy encryption handshake to a verdict, and returns whether it
+/// refused: `connect` only dials, so a certificate rejection surfaces on the
+/// first exchange. The probe is a well-formed request, so a decode failure
+/// cannot masquerade as a handshake refusal. The client transport carries the
+/// scenario collector, so the collector records its own handshake verdicts.
 async fn handshake_rejected(
 	builder: ClientBuilder<TokioListener>,
 	addr: TightBeamSocketAddr,
@@ -186,13 +173,16 @@ async fn handshake_rejected(
 	Ok(result.is_err())
 }
 
-// Negative test A: the server refuses an invalid client certificate.
+// Negative test A: the server refuses an invalid client certificate. The
+// servlet's pinning validator records the refusal, and the HPKE client, which
+// completes when it sends the closing, records its completion.
 tb_assert_spec! {
 	pub InvalidClientSpec,
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(CLIENT_CERT_REJECTED, exactly!(1), equals!(true))
+			(events::SESSION_CERT_REJECTED, exactly!(1), equals!("certificate/public-key-not-pinned")),
+			(events::SESSION_HANDSHAKE_COMPLETE, exactly!(1))
 		]
 	}
 }
@@ -229,11 +219,8 @@ tb_scenario! {
 				.with_client_identity(SigningIdentity::from_spec(certificate, provider)?)
 				.build();
 
-			// The pinning server must refuse this identity during the
-			// handshake: a successful exchange records `false` and fails
-			// the spec, so a wrongly-accepting handshake is visible.
 			let rejected = handshake_rejected(builder, env.addr, &env.trace).await?;
-			env.trace.event_with(CLIENT_CERT_REJECTED, &[], rejected)?;
+			assert!(rejected, "the pinning server must refuse the client identity");
 			Ok(())
 		},
 		client: |_env| async move {
@@ -243,15 +230,14 @@ tb_scenario! {
 }
 
 // Negative test B: the client refuses an invalid server certificate. The
-// client transport carries the scenario collector, so the client-side
-// rejection must also record the production audit event.
+// client transport carries the scenario collector, and the servlet reads the
+// close outside its handshake, so the one refusal on the trail is the client's.
 tb_assert_spec! {
 	pub InvalidServerSpec,
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(SERVER_CERT_REJECTED, exactly!(1), equals!(true)),
-			(events::SESSION_CERT_REJECTED, at_least!(1))
+			(events::SESSION_CERT_REJECTED, exactly!(1), equals!("certificate/certificate-not-trusted"))
 		]
 	}
 }
@@ -265,10 +251,9 @@ tb_scenario! {
 			use tightbeam::crypto::key::Secp256k1KeyProvider;
 			use tightbeam::testing::fixtures::{TestKey, TestCertificate};
 
-			// The server presents a certificate outside the client's trust
-			// store. Its certificate and signing provider share one fresh key,
-			// so the rejection is the trust check and not a key/certificate
-			// mismatch.
+			// The server certificate sits outside the client's trust store. Its
+			// certificate and signing provider share one fresh key, so the
+			// rejection is the trust check and not a key/certificate mismatch.
 			let invalid_server_key = TestKey::insecure_fixed_signing();
 			let invalid_server_cert = TestCertificate::self_signed(&invalid_server_key);
 
@@ -291,10 +276,8 @@ tb_scenario! {
 				.with_client_identity(SigningIdentity::from_spec(CLIENT_CERT, key)?)
 				.build();
 
-			// A successful exchange records `false` and fails the spec,
-			// so a wrongly-accepting validation is visible.
 			let rejected = handshake_rejected(builder, env.addr, &env.trace).await?;
-			env.trace.event_with(SERVER_CERT_REJECTED, &[], rejected)?;
+			assert!(rejected, "the client must refuse the untrusted server certificate");
 			Ok(())
 		},
 		client: |_env| async move {

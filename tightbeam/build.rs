@@ -1,5 +1,5 @@
 // `cfg_aliases!` parses its predicate token-by-token through recursive
-// macro rules: the five-clause alias overflows the default limit of 128.
+// macro rules, so the five-clause alias overflows the default limit of 128.
 #![recursion_limit = "256"]
 
 use cfg_aliases::cfg_aliases;
@@ -8,6 +8,11 @@ fn main() {
 	// Declare the `fuzzing` cfg so rustc check-cfg accepts IJON and fuzz
 	// gates in the library. AFL harnesses set it through RUSTFLAGS.
 	println!("cargo::rustc-check-cfg=cfg(fuzzing)");
+
+	// Declare the `tightbeam_loom` cfg, under which `make loom` builds the
+	// library tests with the atomics of `loom`. The name is the crate's own,
+	// because tokio reads `loom` and drops its networking under it.
+	println!("cargo::rustc-check-cfg=cfg(tightbeam_loom)");
 
 	// The aliases name the compound predicates that gate whole subsystems, so
 	// the build graph holds one definition of each predicate instead of copied

@@ -1,9 +1,9 @@
-//! FMEA analysis functions
+//! The FMEA ratings of a fault and of a run.
 //!
-//! Provides automatic calculation of:
-//! - Severity (from CSP criticality analysis)
-//! - Occurrence (from probability basis points)
-//! - Detection (from error recovery statistics)
+//! The module computes three ratings automatically:
+//! - The severity, from the CSP criticality analysis.
+//! - The occurrence, from the probability in basis points.
+//! - The detection, from the error-recovery statistics.
 
 use crate::testing::fdr::{FdrVerdict, InjectedFaultRecord};
 use crate::testing::fmea::SeverityScale;
@@ -11,30 +11,32 @@ use crate::testing::specs::csp::Process;
 use std::collections::{HashSet, VecDeque};
 
 impl InjectedFaultRecord {
-	/// Severity of this fault, from CSP criticality analysis.
+	/// The severity of this fault, from the CSP criticality analysis.
 	///
-	/// Reachability from the fault state decides the rating:
-	/// - Deadlock (no transitions, not terminal) is catastrophic.
-	/// - No reachable terminal state is hazardous.
-	/// - A large state-space restriction is major.
-	/// - A small restriction is minor.
+	/// Reachability from the fault state decides the rating. The cases run from
+	/// the most severe, and ISO 26262 rates the first two alike:
+	/// - A deadlock, which is a reachable non-terminal state with no enabled event.
+	/// - Terminal states that the fault state cannot reach.
+	/// - A reach of less than half of the states, which is a large restriction.
+	/// - A reach of less than 80 percent of the states.
+	/// - Any other reach, which is a small restriction.
 	pub fn severity(&self, process: &Process, scale: SeverityScale) -> u8 {
-		// Production fault records key states as "process.state". bare state names
-		// are accepted for records built directly against a process.
+		// A production fault record keys its state as "process.state". The
+		// match also accepts a bare state name, for a record built against a
+		// process.
 		let state_name = self
 			.csp_state
 			.strip_prefix(process.name)
 			.and_then(|rest| rest.strip_prefix('.'))
 			.unwrap_or(self.csp_state.as_str());
 
-		// Find the state where the fault occurs
 		let fault_state = process.states.iter().find(|s| s.0 == state_name).copied();
 		let Some(fault_state) = fault_state else {
-			// Unknown state = medium severity (uncertain impact)
+			// An unknown state has an uncertain impact, so it rates mid-scale.
 			return scale.mid_value();
 		};
 
-		// BFS to explore reachable states from fault point
+		// A breadth-first search collects the states the fault state reaches.
 		let mut visited = HashSet::new();
 		visited.insert(fault_state);
 
@@ -44,20 +46,18 @@ impl InjectedFaultRecord {
 		let mut has_deadlock = false;
 		let mut can_reach_terminal = false;
 		while let Some(current_state) = queue.pop_front() {
-			// Check if terminal
 			if process.is_terminal(current_state) {
 				can_reach_terminal = true;
 				continue;
 			}
 
-			// Check for deadlock
+			// A non-terminal state with no enabled event is a deadlock.
 			let enabled = process.enabled(current_state);
 			if enabled.is_empty() {
 				has_deadlock = true;
 				continue;
 			}
 
-			// Explore successors
 			for action in enabled {
 				let successors = process.step(current_state, &action.event);
 				for next_state in successors {
@@ -68,36 +68,37 @@ impl InjectedFaultRecord {
 			}
 		}
 
-		// Calculate severity based on criticality
+		// The restriction ratio is the reached share of the states.
 		let total_states = process.states.len();
 		let reachable_count = visited.len();
 		let restriction_ratio = (reachable_count as f64) / (total_states as f64);
 
 		match scale {
 			SeverityScale::MilStd1629 => {
-				// MIL-STD-1629: 1-10 scale
+				// MIL-STD-1629 rates on a scale of 1 to 10.
 				if has_deadlock {
-					10 // Catastrophic: System completely stops
+					10 // Catastrophic: the system stops completely.
 				} else if !can_reach_terminal && !process.terminal.is_empty() {
-					9 // Critical: Cannot complete normal operation
+					9 // Critical: normal operation cannot complete.
 				} else if restriction_ratio < 0.5 {
-					7 // Severe: More than half of states unreachable
+					7 // Severe: more than half of the states are unreachable.
 				} else if restriction_ratio < 0.8 {
-					5 // Moderate: Significant state restriction
+					5 // Moderate: over a fifth of the states are unreachable.
 				} else {
-					3 // Minor: Limited impact
+					3 // Minor: the impact is limited.
 				}
 			}
 			SeverityScale::Iso26262 => {
-				// ISO 26262: 1-4 scale (catastrophic, hazardous, major, minor)
+				// ISO 26262 rates on a scale of 1 to 4: catastrophic,
+				// hazardous, major, and minor.
 				if has_deadlock || (!can_reach_terminal && !process.terminal.is_empty()) {
-					4 // Catastrophic: Complete system failure or cannot reach safe terminal
+					4 // Catastrophic: the system fails or cannot end safely.
 				} else if restriction_ratio < 0.5 {
-					3 // Hazardous: Severely restricted functionality
+					3 // Hazardous: the functionality is severely restricted.
 				} else if restriction_ratio < 0.8 {
-					2 // Major: Noticeable degradation
+					2 // Major: the degradation is noticeable.
 				} else {
-					1 // Minor: Limited impact
+					1 // Minor: the impact is limited.
 				}
 			}
 		}
@@ -105,7 +106,7 @@ impl InjectedFaultRecord {
 }
 
 impl FdrVerdict {
-	/// Detection rating from this run's error-recovery statistics.
+	/// The detection rating of this run, from its error-recovery statistics.
 	///
 	/// A run with no recovery attempts has nothing to rate, so it reports
 	/// the scale's midpoint.
@@ -127,21 +128,21 @@ impl SeverityScale {
 	/// Occurrence rating for a probability in basis points.
 	pub fn occurrence(&self, probability_bps: u16) -> u16 {
 		let normalized = match self {
-			Self::MilStd1629 => probability_bps / 1000, // 0-10000 -> 0-10
-			Self::Iso26262 => probability_bps / 2500,   // 0-10000 -> 0-4
+			Self::MilStd1629 => probability_bps / 1000, // 0-10000 maps to 0-10.
+			Self::Iso26262 => probability_bps / 2500,   // 0-10000 maps to 0-4.
 		};
 
 		(normalized + 1).min(self.max_value())
 	}
 
-	/// Wire discriminant for this scale.
+	/// The wire discriminant of this scale.
 	pub(crate) fn wire_code(&self) -> u8 {
 		match self {
 			Self::MilStd1629 => 0,
 			Self::Iso26262 => 1,
 		}
 	}
-	/// Maximum value for this scale
+	/// The maximum value of this scale.
 	pub(crate) const fn max_value(&self) -> u16 {
 		match self {
 			Self::MilStd1629 => 10,
@@ -149,7 +150,7 @@ impl SeverityScale {
 		}
 	}
 
-	/// Mid-range value for this scale
+	/// The mid-range value of this scale.
 	pub(crate) const fn mid_value(&self) -> u8 {
 		match self {
 			Self::MilStd1629 => 5,
@@ -307,38 +308,38 @@ mod tests {
 		Ok(())
 	}
 
-	#[test]
-	fn test_convert_occurrence_boundaries() {
-		let test_cases = [
-			(0, SeverityScale::MilStd1629, 1),
-			(5000, SeverityScale::MilStd1629, 6),
-			(10000, SeverityScale::MilStd1629, 10),
-			(0, SeverityScale::Iso26262, 1),
-			(5000, SeverityScale::Iso26262, 3),
-			(10000, SeverityScale::Iso26262, 4),
-		];
-
-		for (bps, scale, expected) in test_cases {
+	// Each row is (basis points, scale, expected occurrence rating).
+	crate::tb_cases! {
+		fn occurrence_boundary((bps, scale, expected): (u16, SeverityScale, u16)) {
 			assert_eq!(scale.occurrence(bps), expected);
+		}
+
+		cases {
+			mil_std_1629_at_zero => (0, SeverityScale::MilStd1629, 1),
+			mil_std_1629_at_half => (5000, SeverityScale::MilStd1629, 6),
+			mil_std_1629_at_full => (10000, SeverityScale::MilStd1629, 10),
+			iso_26262_at_zero => (0, SeverityScale::Iso26262, 1),
+			iso_26262_at_half => (5000, SeverityScale::Iso26262, 3),
+			iso_26262_at_full => (10000, SeverityScale::Iso26262, 4),
 		}
 	}
 
-	#[test]
-	fn test_detection_ratings() {
-		// (recoveries successful, recoveries failed, scale, expected rating)
-		let test_cases = [
-			(10, 0, SeverityScale::MilStd1629, 1),
-			(0, 10, SeverityScale::MilStd1629, 10),
-			(5, 5, SeverityScale::MilStd1629, 5),
-		];
-
-		for (success, failed, scale, expected) in test_cases {
+	// Each row is (recoveries successful, recoveries failed, scale, expected
+	// detection rating).
+	crate::tb_cases! {
+		fn detection_rating((success, failed, scale, expected): (usize, usize, SeverityScale, u8)) {
 			let verdict = FdrVerdict {
 				error_recovery_successful: success,
 				error_recovery_failed: failed,
 				..Default::default()
 			};
 			assert_eq!(verdict.detection(scale), expected);
+		}
+
+		cases {
+			every_recovery_succeeds => (10, 0, SeverityScale::MilStd1629, 1),
+			every_recovery_fails => (0, 10, SeverityScale::MilStd1629, 10),
+			half_the_recoveries_succeed => (5, 5, SeverityScale::MilStd1629, 5),
 		}
 	}
 }

@@ -2429,7 +2429,7 @@ The accepting endpoint uses `MuxRole::Server` with the same assembly sequence. E
 Test multiplexed services with `environment ServiceClient`. The `server:` closure starts a `server!` accept loop advertising `with_mux_offer`. The `client:` closure drives a mux-offering `ConnectionPool` against the bound address. Peers that decline the offer fall back to single-flight. The same scenario shape covers both paths.
 
 ```rust,ignore
-const ECHO_OVER_MUX: Urn<'static> = urn!("test", "event:mux/echo-over-mux");
+use tightbeam::instrumentation::events;
 
 tb_assert_spec! {
 	pub EchoOverMuxSpec,
@@ -2437,7 +2437,7 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(ECHO_OVER_MUX, exactly!(1), equals!(true))
+			(events::POOL_DIAL, exactly!(1))
 		]
 	}
 }
@@ -2458,13 +2458,13 @@ tb_scenario! {
 			Ok((handle, addr))
 		},
 		client: |ClientEnv { trace, context: materials, addr }| async move {
-			let pool = mux_pool(&materials, Some(TransportOffer::mux(8)))?;
+			let pool = mux_pool(&materials, Some(TransportOffer::mux(8)), &trace)?;
 			let mut lease = pool.connect(addr).await?;
 
 			let frame = create_v0_tightbeam(Some("ping"), None);
 			let reply = lease.emit(frame.clone(), None).await?;
 
-			trace.event_with(ECHO_OVER_MUX, &[], reply == Some(frame))?;
+			assert_eq!(reply, Some(frame), "the server echoes the frame");
 
 			Ok(())
 		}
@@ -2906,11 +2906,11 @@ Servlets with workers can be tested using `environment Servlet`:
 
 ```rust,ignore
 use tightbeam::{tb_scenario, tb_assert_spec, exactly, servlet, worker};
+use tightbeam::instrumentation::events;
+use tightbeam::testing::{fixtures::TestTrace, ScenarioConfig};
 
-const SERVLET_RECEIVE: Urn<'static> = urn!("test", "event:servlet/receive");
+// The doubler worker records this marker in its own handler.
 const WORKER_PROCESS: Urn<'static> = urn!("test", "event:servlet/worker-process");
-const SERVLET_RESPOND: Urn<'static> = urn!("test", "event:servlet/respond");
-const RESULT_VERIFIED: Urn<'static> = urn!("test", "event:servlet/result-verified");
 
 tb_assert_spec! {
 	pub CalcServletSpec,
@@ -2918,17 +2918,20 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(SERVLET_RECEIVE, exactly!(1)),
+			(events::HANDLER_ENTER, exactly!(1)),
 			(WORKER_PROCESS, exactly!(1)),
-			(SERVLET_RESPOND, exactly!(1)),
-			(RESULT_VERIFIED, exactly!(1), equals!(10u32))
+			(events::HANDLER_EXIT, exactly!(1))
 		]
 	}
 }
 
 tb_scenario! {
 	name: test_calc_servlet,
-	spec: CalcServletSpec,
+	// The handler events are internal detail, so the trace turns detail on.
+	config: ScenarioConfig::builder()
+		.with_spec(CalcServletSpec::latest())
+		.with_trace(TestTrace::with_detail(true))
+		.build(),
 	environment Servlet {
 		context: CalcServletConfig { multiplier: 2 },
 		start: |env| async move {
@@ -2948,7 +2951,7 @@ tb_scenario! {
 			Ok(client)
 		},
 		client: |env| async move {
-			let (trace, mut client) = (env.trace, env.client);
+			let mut client = env.client;
 			let request = compose! {
 				V0: id: b"calc-req",
 					message: CalcRequest { value: 5 }
@@ -2958,7 +2961,7 @@ tb_scenario! {
 				.ok_or(TightBeamError::MissingResponse)?;
 			let response: CalcResponse = decode(response_frame.message())?;
 
-			trace.event_with(RESULT_VERIFIED, &[], response.result)?;
+			assert_eq!(response.result, 10, "the doubler doubles 5");
 			Ok(())
 		}
 	}
@@ -2970,7 +2973,7 @@ The `environment Servlet` syntax provides:
 - `context`: Scenario fixture shared as `Arc<C>` with every closure (unit when omitted)
 - `start`: Configures and starts the servlet with workers from a `SetupEnv`
 - `setup`: Builds the client connection from a `ClientEnv` (optional). Default connects a plain `TokioListener` client
-- `client`: Sends requests through `ServletEnv` and validates responses via trace events
+- `client`: Sends requests through `ServletEnv` and asserts each response on the scenario task
 
 #### 9.3.3 I: Hives
 
@@ -3152,8 +3155,7 @@ pub struct HiveConfig {
 Standalone hive behavior (control plane gates, circuit breaker, backpressure, drain) is tested with `environment Hive`:
 
 ```rust,ignore
-const BACKPRESSURE_MANAGE_SHAPE: Urn<'static> =
-	urn!("test", "event:hive/backpressure-manage-shape");
+use tightbeam::instrumentation::events;
 
 tb_assert_spec! {
 	pub HiveBackpressureShapeSpec,
@@ -3161,7 +3163,7 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(BACKPRESSURE_MANAGE_SHAPE, exactly!(1), equals!(TransitStatus::ResourceExhausted))
+			(events::HIVE_COMMAND_REFUSED, exactly!(1), equals!(TransitStatus::ResourceExhausted))
 		]
 	}
 }
@@ -3179,15 +3181,16 @@ tb_scenario! {
 			start_trusted_hive(&trace, &signer, conf).await
 		},
 		// Owns the hive for drain, registry checks, and stop
-		client: |HiveEnv { trace, context: signer, hive }| async move {
+		client: |HiveEnv { context: signer, hive, .. }| async move {
 			let mut client = connect_hive(&hive, &signer).await?;
 
 			let signed_stop = signed_stop_frame(&signer.identity, b"manage-bp").await?;
 			let response = emit_command(&mut client, signed_stop).await?;
 
-			// The status is read from the stop alternative, so a reply in
-			// any other alternative fails the scenario.
-			trace.event_with(BACKPRESSURE_MANAGE_SHAPE, &[], manage_stop_shape_status(response)?)?;
+			// The client reads the status from the stop alternative, so a
+			// reply in any other alternative fails the scenario.
+			let status = manage_stop_shape_status(response)?;
+			assert_eq!(status, TransitStatus::ResourceExhausted, "a saturated hive refuses a signed stop");
 
 			hive.stop();
 			Ok(())
@@ -3585,8 +3588,7 @@ An advance wakes sleeping beats, but their work runs on separate tasks. Poll `Tr
 ```rust,ignore
 use tightbeam::{tb_scenario, tb_assert_spec, exactly, cluster, hive};
 
-const WORK_SENT: Urn<'static> = urn!("test", "event:cluster/work-sent");
-const ROUTING_ACCEPTED: Urn<'static> = urn!("test", "event:cluster/routing-accepted");
+use tightbeam::instrumentation::events;
 
 tb_assert_spec! {
 	pub ClusterRoutingSpec,
@@ -3594,8 +3596,7 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(WORK_SENT, exactly!(1)),
-			(ROUTING_ACCEPTED, exactly!(1))
+			(events::CLUSTER_WORK_ROUTED, exactly!(1))
 		]
 	}
 }
@@ -3606,11 +3607,11 @@ tb_scenario! {
 	environment Cluster {
 		// Shared as Arc<C> with every closure
 		context: ClusterTestCerts::generate(),
-		start: |SetupEnv { context: certs, .. }| async move {
+		start: |SetupEnv { trace, context: certs }| async move {
 			let mut conf = ClusterConfig::new(cluster_tls_config(&certs));
 			// Both offers set: client -> cluster and cluster -> hive run multiplexed
 			conf.pool_config.mux_offer = Some(TransportOffer::mux(8));
-			ClusterGateway::start(Arc::new(TraceCollector::new()), conf).await
+			ClusterGateway::start(Arc::new(trace), conf).await
 		},
 		// Optional: awaited and registered with the cluster.
 		// Omit when driving registration from the client.
@@ -3623,8 +3624,8 @@ tb_scenario! {
 			Ok(hive)
 		}],
 		// Owns the cluster for registry checks and stop
-		client: |ClusterEnv { trace, context: certs, cluster }| async move {
-			trace.event(WORK_SENT)?;
+		client: |ClusterEnv { context: certs, cluster, .. }| async move {
+			let mut client = connect_cluster(&certs, cluster.addr()).await?;
 
 			// The end-to-end work frame the servlet receives unmodified.
 			let work = compose! {
@@ -3634,12 +3635,10 @@ tb_scenario! {
 			// submit_work_to wraps the frame in the hop-local transport
 			// envelope and resolves the reply to the servlet's response
 			// frame. A refusal would surface as WorkRefused.
-			let mut client = connect_cluster(&certs, cluster.addr()).await?;
 			let response = client.submit_work_to(ping_type(), &work).await?;
 			let echoed: PingResponse = decode(&response.message)?;
-			assert_eq!(echoed.doubled, 42);
 
-			trace.event(ROUTING_ACCEPTED)?;
+			assert_eq!(echoed.doubled, 42, "the ping servlet doubles the request");
 
 			cluster.stop();
 			Ok(())
@@ -3690,11 +3689,42 @@ Each emitted event carries a kind URN from the closed inventory in `tightbeam::i
 urn:tightbeam:event:<domain>/<event-name>
 ```
 
-Domains include `core`, `gate`, `transport`, `connection`, `assert`, `mux`, `pool`, `session`, `hive`, and `cluster`. The `process` and `fdr` domains need the `testing-csp` and `testing-fdr` features. `tightbeam::instrumentation::events` lists every event.
+Domains include `core`, `gate`, `handler`, `transport`, `connection`, `assert`, `mux`, `pool`, `session`, `hive`, and `cluster`. The `process` and `fdr` domains need the `testing-csp` and `testing-fdr` features. `tightbeam::instrumentation::events` lists every event.
+
+A decision of production code records an event on the trace of the component that decides it. Two emit paths carry these events:
+- The colony path: a gateway or a hive emits through `TraceCollector::emit_event_with_value_and_evidence`, which compiles under `colony` or `instrument`:
+  - A `testing` build records the value for a spec.
+  - An `instrument` build files the event under its own URN, with its label, the payload hash, and the trace clock stamp. An event whose doc names no label files an empty label.
+- The instrument path: a transport, a pool, or a server plane emits through `emit_event` and its value and evidence forms under `instrument`, and a `testing` build also records the value for a spec.
+
+The label of an event names why the event fired, its value is what a spec asserts with `equals!`, and its payload names who, such as an address, a fingerprint, or a canonical public key.
+
+A scenario asserts these refusal and decision events in place of a test marker (see [§12.2.8](#1228-recording-trace-events)):
+
+| Domain | Refusal and decision events |
+| --- | --- |
+| `cluster` (gateway) | `gate-blocked`, `hive-registered`, `register-refused`, `update-accepted`, `update-refused`, `work-routed`, `work-refused`, `work-unavailable`, `work-failed`, `work-forwarded`, `edge-refused`, `heartbeat-failed`, `hive-evicted`, `dial-refused` |
+| `cluster` (exports) | `export-granted`, `export-refused`, `export-unbounded`, `export-identity-unavailable` |
+| `cluster` (peer advertisement) | `peer-advertised`, `peer-advertise-refused`, `peer-ad-learned`, `peer-ad-dropped`, `peer-ad-publish-failed`, `peer-discovered`, `peer-evicted`, `peer-expelled`, `peer-hints-learned`, `peer-routes-installed`, `peer-routes-withdrawn`, `peer-route-abandoned` |
+| `cluster` (relay) | `relay-trail-installed` |
+| `cluster` (gossip) | `gossip-admitted`, `gossip-delivered`, `gossip-duplicate`, `gossip-refused`, `gossip-relay-weakened`, `gossip-drop-signal`, `gossip-fanout-unreached`, `gossip-origin-unknown`, `gossip-origin-refused-by-peer`, `gossip-repair-pushed`, `reconcile-answered`, `reconcile-failed` |
+| `hive` | `established`, `command-refused`, `reregistered` |
+| `gate` | `accept`, `reject`, with the normalized status of the verdict as the value |
+| `handler` | `failed`, for a handler error that a plane answers with a status other than `Unimplemented` |
+| `mux` | `stream-refused`, `budget-refused`, `streams-exhausted`, `emit-draining`, `protocol-error`, `cancel-budget`, `rekey-refused`, `rekey-verify-failed`, `rekey-expired`, `rekey-renewed`, `goaway-sent`, `goaway-recv` |
+| `connection` | `accepted`, `closed` |
+| `pool` | `exhausted`, `mux-declined`, `failover`, `failover-refused`, `evicted` |
+| `session` | `cert-rejected`, `receipt-refused`, `receipt-settled`, `authorization-refused`, `handshake-expired` |
+| `transport` | `envelope-refused`, `rekey-required` |
 
 `enable_internal_detail` turns on the internal events `handler/enter`, `handler/exit`, `policy/eval`, `route/step`, `crypto/step`, and `compress/step`. The doc of each constant in `tightbeam::instrumentation::events` names the step where it fires. Accept and refuse events always fire, and so does `mux/stream-cancelled`, which closes a call that the peer cancels on a mux stream in place of its `handler/exit`.
 
-> Warning: A servlet, a hive, and a gateway record every connection they accept into their own trace, from before the handshake, so their trace also holds the handshake refusal of a peer that never authenticates. The default `BoundedMemorySink` keeps the first `max_events` events, drops each later one, the owner's own refusals included, and sets its overflow latch. A long-lived owner needs an `EventSink` that forwards each event, or a reader that drains the trace.
+> Warning: A long-lived owner of a trace needs an `EventSink` that forwards each event, or a reader that drains the trace, because the trace of a servlet, a hive, or a gateway fills:
+- A servlet, a hive, and a gateway record every connection they accept into their own trace, from before the handshake, so their trace also holds the handshake refusal of a peer that never authenticates.
+- A hive and a gateway also record every connection they dial, so the pool and session events of each dial land on the same trace:
+  - The hive dials for its registrations, its scaling updates, and the calls between its servlets.
+  - The gateway dials through its hive and peer pools.
+- The default `BoundedMemorySink` keeps the first `max_events` events, drops each later one, the owner's own refusals included, and sets its overflow latch.
 
 `FdrExplorer::explore_into` records the `fdr` exploration events that three flags ask for, one per state of each explored process, in the order of the state names. A scenario explores into a trace of its own, under the instrumentation settings and the clock of the scenario's trace. `ScenarioVerdict::exploration` returns that trace, so the exploration events stay apart from the trace of the run. The `overflowed` field of that trace reads `true` when its sink dropped events. Each label names the process, the state, and the events in CSPM notation.
 
@@ -4277,8 +4307,8 @@ V(major, minor, patch): {
 		("label", cardinality, equals!(value)),
 		...
 	],
-	events: [Kind, ...]                 // Optional: when instrumentation enabled
-	schedulability: {                   // Optional: when testing-schedulability enabled
+	events: [Kind, ...]                 // Optional: needs instrument, or the spec fails to compile
+	schedulability: {                   // Optional: needs testing-timing, or the spec fails to compile
 		task_set: <TaskSet>,
 		scheduler: RateMonotonic | EarliestDeadlineFirst,
 		must_be_schedulable: <bool>
@@ -4389,6 +4419,56 @@ An assertion can carry arbitrary string tags, which a spec categorizes and filte
 - `trace.event_with(URN, &["tag"], value)` adds tags plus an optional value (`Into<AssertionValue>`).
 - `trace.recorded(URN)` (feature `testing`) counts the recorded assertions that carry that label, without draining them. A scenario that waits on a background task polls it for the event the task traces.
 
+A test marker is a `test`-namespace URN that a test records itself. It records a fact that the suite itself decides or observes, for one of these reasons:
+
+- The testing framework is the subject, and the marker is a synthetic input to FDR, CSP, fault injection, FMEA, timing, or the spec macros.
+- An application that the suite defines emits it from its own handlers, such as the DTN rover or the payment servlets.
+- A harness step orders a process together with production events, such as the capture, the tamper, and the inject of an attacker.
+- A test double observes the fact on a task of its own, such as a servlet that a frame reached, where the verdict of the scenario reads the trace.
+
+A marker sits next to its one user, or in the shared module of the test doubles that record it, and takes the name of what it records. Two other kinds of fact take another form:
+- A decision of production code is a production event (§10.2).
+- A value that a scenario reads on its own task is a plain assertion.
+
+**Scenario shape:**
+
+A scenario drives production code with the scenario trace and asserts what production decided:
+
+1. A decision of production code is a production event in the spec, such as `(events::CLUSTER_REGISTER_REFUSED, exactly!(1), equals!(TransitStatus::Unauthenticated))`. Before the step, the scenario gives the trace to every component whose decision it asserts:
+   - `start_cluster(&trace, ..)` gives it to a gateway.
+   - `establish(Arc::new(trace.share()))` gives it to a hive.
+   - `with_trace(trace.share())` gives it to a server, a pool, or a transport, before its first handshake message.
+2. A wait polls the event of the decision that it waits for, not state: `poll_until(n, interval, || trace.recorded(events::CLUSTER_PEER_EVICTED) >= 1)`. A wait polls state only where no event can stand for it:
+   - The state of a test double, or of an application that the suite defines.
+   - A value that no event carries and that the scenario then asserts, such as the receipt that a renewal rotates.
+   - A step that records no event, such as a rumor that waits in the gossip journal.
+   - The routes or peers of one gateway, where several gateways record the same event on one trace, because a count is the sum over the gateways (rule 7).
+3. The scenario task asserts each value that the test reads: `assert_eq!(cluster.hive_count()?, 0, "a refused registration installs no hive")`. It asserts a reply field, an echo, an accessor, and a counter of a test double where it reads each one.
+4. For one event with mixed values in one scenario, the spec counts the event and the body asserts each status that the client received. A spec holds one assertion per label, and `equals!` binds every matching record.
+5. A zero count on a production event, `absent!()` or `exactly!(0)`, has a positive control in the same spec that proves the trace reached the component, such as `(events::POLICY_EVAL, exactly!(1))` beside `(events::HANDLER_ENTER, absent!())`.
+6. A spec that asserts production events has no spec-wide `tag_filter`, because production assertions carry no tags.
+7. Every gateway of a scenario writes to the one trace, so a count is the sum over the gateways. `at_least!` fits only where a beat repeats a decision a nondeterministic number of times, and `exactly!` fits everywhere else.
+8. A spec with nothing left to assert means the scenario is a plain `#[tokio::test]`, because `ScenarioConfigBuilder::build` refuses a configuration that cannot fail.
+
+```rust,ignore
+tb_assert_spec! {
+	pub ClusterUnsignedRegistrationSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(events::CLUSTER_REGISTER_REFUSED, exactly!(1), equals!(TransitStatus::Unauthenticated))
+		]
+	}
+}
+
+// client body
+let response: RegisterHiveResponse = decode(response_frame.message())?;
+assert!(response.hive_id.is_none(), "a refused registration assigns no hive id");
+assert_eq!(cluster.hive_count()?, 0, "a refused registration installs no hive");
+```
+
+**Recording a marker:**
+
 ```rust,ignore
 use tightbeam::urn::Urn;
 
@@ -4447,11 +4527,14 @@ tb_scenario! {
 }
 ```
 
-Layer 1 matches the assertion stream (`AssertionLabel` exact URN string). With `instrument` enabled, the same emit also writes `ASSERT_LABEL` / `ASSERT_PAYLOAD` into the §10 event sink. Control-plane inventory URNs (`events::CLUSTER_*`, and so on) are separate emit paths (`emit_event` / `emit`).
+Layer 1 matches the assertion stream (`AssertionLabel` exact URN string). With `instrument` enabled, the same emit also writes `ASSERT_LABEL` / `ASSERT_PAYLOAD` into the §10 event sink. A production event takes its own emit path instead (§10.2):
+- A gateway or a hive emits on the colony path.
+- A transport, a pool, or a server plane emits through `emit_event` and its value and evidence forms.
+- Each path records the value for a spec under `testing`, so a spec asserts a production event as it asserts a marker, and the sink files the event under its own URN.
 
 #### 12.2.9 Schedulability Analysis
 
-Assertion specs support schedulability verification via the `schedulability: { }` block when `testing-schedulability` is enabled:
+Assertion specs support schedulability verification via the `schedulability: { }` block when `testing-timing` is enabled. A spec with the block fails to compile without it:
 
 ```rust,ignore
 schedulability: {
@@ -4496,12 +4579,12 @@ tb_process_spec! {
 		S0 => { "event1" => S1 },                  // State transitions
 		S1 => { "event2" => S2, "event3" => S3 },  // Nondeterministic branching
 		S2 => { "event4" [ clock1 < 10ms ] => S3 },  // Timed transition with guard
-		S3 => { "event5" [ clock2 >= 5ms, reset: ["clock1"] ] => S4 },  // Guard with clock reset
+		S3 => { "event5" [ clock2 >= 5ms, reset: [clock1] ] => S4 },  // Guard with clock reset
 		S4 => {}                                  // Terminal state
 	}
 	terminal { S4 }                               // Valid end states
 	choice { S1 }                                 // Nondeterministic states
-	clocks: { "clock1", "clock2" }                // Optional: when testing-timing enabled
+	clocks: { clock1, clock2 }                    // Required by a guard: when testing-timing enabled
 	timing {                                      // Optional: when testing-timing enabled
 		wcet:     { "event1" => wcet!(10ms) },
 		jitter:   { "event2" => jitter!(5ms) },
@@ -4556,7 +4639,9 @@ tb_process_spec! {
 
 #### 12.3.5 Timing and Schedulability Verification
 
-When `testing-timing` is enabled, process specifications support timing constraints and timed automata semantics.
+When `testing-timing` is enabled, process specifications support timing constraints and timed automata semantics. Each timing part of a spec fails to compile without its feature:
+- A `clocks:` or `timing` block, or a guard, needs `testing-timing`.
+- A `schedulability` block needs `testing-schedulability`.
 
 **Timing Constraints:**
 
@@ -4571,23 +4656,23 @@ Process specs support four types of timing constraints via the `timing: { }` blo
 
 Process specs support timed automata semantics with clock variables and timing guards:
 
-- **Clock Variables**: `clocks: { "clock1", "clock2" }` - Named clocks that advance during execution
+- **Clock Variables**: `clocks: { clock1, clock2 }` - Named clocks that start at zero and advance during execution. Each clock that a guard or a reset names needs a declaration here, so a misspelt clock name fails the build
 - **Timing Guards**: `"event" [ clock1 < 10ms ] => State` - Transitions enabled only when guard conditions are satisfied
-- **Clock Resets**: `"event" [ clock2 >= 5ms, reset: ["clock1"] ] => State` - Clocks that reset to zero when the transition fires
+- **Clock Resets**: `"event" [ clock2 >= 5ms, reset: [clock1] ] => State` - Clocks that reset to zero when the transition fires
 
 Guard expressions support: `<`, `<=`, `>`, `>=`, `==`, and ranges (`5ms <= x <= 10ms`).
 
 A guard takes effect only in a check that reads the clocks:
 
-- FDR exploration takes a guarded transition only where the clocks satisfy its guard. Exploration starts each clock unset, and a guard on an unset clock does not hold.
+- FDR exploration takes a guarded transition only where the clocks satisfy its guard. Exploration starts each clock at zero.
 - The CSP trace check of `tb_scenario!` and the FDR refinement checks ignore the clocks, so they accept a guarded event at any time.
 - Hiding, renaming, sequential composition, and the two choices keep each guard. A parallel composition (§12.3.6) refuses a process that has a timed transition.
+- Every composition keeps the timing constraints and the schedulability periods of its operands, and refuses two operands whose timing for one event does not agree.
 
 **Early Pruning and FDR Integration:**
 
-Timing violations automatically prune traces during FDR exploration:
+FDR exploration works from the model alone, so each observable event adds its WCET to the elapsed time of its trace. The runtime timing check compares each measured duration with its WCET. Timing violations prune traces during FDR exploration:
 
-- Per-event WCET violations prune immediately
 - Deadline violations prune when detected
 - Path-based WCET violations prune compositional violations
 - Exploration offers a guarded transition only where its guard holds, and a non-terminal state with nothing left to offer is a deadlock
@@ -4706,7 +4791,7 @@ fdr: FdrConfig {
 	seeds: 64,               // Number of exploration seeds
 	max_depth: 128,          // Maximum trace depth
 	max_internal_run: 32,    // Divergence detection threshold
-	timeout_ms: 5000,        // Per-seed timeout
+	timeout_ms: 5000,        // Time budget of each refinement search
 	specs: vec![],           // Processes for refinement checking (empty = exploration mode)
 	fail_fast: true,         // Stop on first violation (default: true)
 	expect_failure: false,   // Expect refinement to fail (default: false)
@@ -4727,7 +4812,9 @@ fdr: FdrConfig {
 - `seeds`: Number of different scheduler strategies to explore
 - `max_depth`: Maximum length of observable trace
 - `max_internal_run`: The most hidden events in one run. A longer run is a divergence, and so is a run that reaches a cycle of hidden events, whatever its length
-- `timeout_ms`: Timeout for each seed exploration
+- `timeout_ms`: The time budget, in milliseconds, of each search of the refinement checker. A search that spends it stops with an incomplete answer, so a check that found no violation decides `Unknown`. The budget covers each of these searches:
+  - The trace, failure, and divergence searches of a process.
+  - The search of a spec for the traces of the subject.
 - `specs`: Specification processes for refinement checking (empty vector = exploration mode)
 - `fail_fast`: Stop on first refinement violation (default: true)
 - `expect_failure`: Expect refinement to fail for negative tests (default: false)
@@ -4944,7 +5031,7 @@ fdr: FdrConfig {
     seeds: 64,              // Explore 64 different scheduling
     max_depth: 128,         // Bound trace length
     max_internal_run: 32,   // Divergence detection threshold
-    timeout_ms: 5000,       // Per-seed timeout
+    timeout_ms: 5000,       // Time budget of each refinement search
 }
 ```
 

@@ -1,84 +1,56 @@
-//! Cleartext mux parity: interleaved echo, cancel budget, chunked credit.
+//! The mux tests on a cleartext link, which hold it to the behavior of an
+//! encrypted link for interleaved echo, the cancel budget, and chunked credit.
 
 use core::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
+use tokio::sync::Notify;
+
 use tightbeam::der::Encode;
 use tightbeam::exactly;
+use tightbeam::instrumentation::events;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_process_spec;
 use tightbeam::tb_scenario;
 use tightbeam::testing::{ScenarioConfig, SetupEnv};
+use tightbeam::trace::TraceCollector;
 use tightbeam::transport::envelopes::GoAwayReason;
 use tightbeam::transport::handshake::negotiation::MuxSettings;
 use tightbeam::transport::multiplex::MuxRole;
-use tokio::sync::Notify;
+use tightbeam::urn::Urn;
+use tightbeam::TightBeamError;
 
 use super::common::*;
 use crate::transport::support::mux_frame;
 
-use tightbeam::instrumentation::events;
-use tightbeam::urn::Urn;
-
-pub(crate) const CLEARTEXT_BUDGETS_UNMETERED: Urn<'static> =
-	tightbeam::urn!("test", "event:cleartext/cleartext-budgets-unmetered");
-pub(crate) const CLEARTEXT_CHUNKED_ECHO: Urn<'static> =
-	tightbeam::urn!("test", "event:cleartext/cleartext-chunked-echo");
-pub(crate) const FIRST_STREAM_ECHOED: Urn<'static> = tightbeam::urn!("test", "event:cleartext/first-stream-echoed");
 pub(crate) const RESPONDER_POLICY_REJECTION: Urn<'static> =
 	tightbeam::urn!("test", "event:cleartext/responder-policy-rejection");
-pub(crate) const SECOND_STREAM_ECHOED: Urn<'static> = tightbeam::urn!("test", "event:cleartext/second-stream-echoed");
 
-tb_assert_spec! {
-	pub MuxCleartextInterleavedSpec,
-	V(1,0,0): {
-		mode: Accept,
-		assertions: [
-			(FIRST_STREAM_ECHOED, exactly!(1), equals!(true)),
-			(SECOND_STREAM_ECHOED, exactly!(1), equals!(true))
-		]
-	}
-}
+/// The mux runs over raw TCP with no handshake and symmetric out-of-band
+/// settings, and it answers two interleaved streams out of order.
+#[tokio::test]
+async fn mux_cleartext_interleaved_echo() -> Result<(), TightBeamError> {
+	let (client, server) = establish_cleartext_transports().await?;
+	let settings = MuxSettings::symmetric(4);
+	let (client_end, _client_responder) =
+		spawn_cleartext_mux_endpoint(client, MuxRole::Client, settings, None, TraceCollector::new())?;
+	let (_server_end, server_responder) =
+		spawn_cleartext_mux_endpoint(server, MuxRole::Server, settings, None, TraceCollector::new())?;
 
-// Cleartext mux over raw TCP: no handshake, symmetric out-of-band
-// settings, two interleaved streams answered out of order.
-tb_scenario! {
-	name: mux_cleartext_interleaved_echo,
-	spec: MuxCleartextInterleavedSpec,
-	environment Bare {
-		exec: |SetupEnv { trace, .. }| async move {
-			let (client, server) = establish_cleartext_transports().await?;
-			let settings = MuxSettings::symmetric(4);
-			let (client_end, _client_responder) =
-				spawn_cleartext_mux_endpoint(client, MuxRole::Client, settings, None, trace.share())?;
-			let (_server_end, server_responder) =
-				spawn_cleartext_mux_endpoint(server, MuxRole::Server, settings, None, trace.share())?;
+	let frame_first = mux_frame("clear-first");
+	let frame_second = mux_frame("clear-second");
+	let gate = Arc::new(Notify::new());
+	let handler = order_forcing_echo(frame_first.to_owned(), gate);
+	let _server_serve = tokio::spawn(server_responder.serve(handler));
 
-			let frame_first = mux_frame("clear-first");
-			let frame_second = mux_frame("clear-second");
-			let gate = Arc::new(Notify::new());
-			let handler = order_forcing_echo(frame_first.to_owned(), gate);
-			let _server_serve = tokio::spawn(server_responder.serve(handler));
+	let (first, second) = tokio::join!(
+		client_end.handle.emit_on_stream(&frame_first),
+		client_end.handle.emit_on_stream(&frame_second),
+	);
 
-			let (first, second) = tokio::join!(
-				client_end.handle.emit_on_stream(&frame_first),
-				client_end.handle.emit_on_stream(&frame_second),
-			);
-
-			trace.event_with(
-				FIRST_STREAM_ECHOED,
-				&[],
-				is_echo(first?, &frame_first),
-			)?;
-			trace.event_with(
-				SECOND_STREAM_ECHOED,
-				&[],
-				is_echo(second?, &frame_second),
-			)?;
-
-			Ok(())
-		}
-	}
+	assert!(is_echo(first?, &frame_first), "the held first stream must echo its own frame");
+	assert!(is_echo(second?, &frame_second), "the second stream must echo its own frame");
+	Ok(())
 }
 
 tb_assert_spec! {
@@ -112,8 +84,8 @@ tb_process_spec! {
 	terminal { Done }
 }
 
-// Cancel-budget hardening holds on cleartext links too: budget + 1
-// open/cancel pairs answered with GoAway(EnhanceYourCalm).
+// The cancel budget holds on a cleartext link too, so budget + 1 open and
+// cancel pairs draw a GoAway(EnhanceYourCalm).
 tb_scenario! {
 	name: mux_cleartext_cancel_budget,
 	config: ScenarioConfig::builder()
@@ -137,98 +109,65 @@ tb_scenario! {
 	}
 }
 
-tb_assert_spec! {
-	pub MuxCleartextChunkedSpec,
-	V(1,0,0): {
-		mode: Accept,
-		assertions: [
-			(CLEARTEXT_BUDGETS_UNMETERED, exactly!(1), equals!(true)),
-			(CLEARTEXT_CHUNKED_ECHO, exactly!(1), equals!(true))
-		]
-	}
+/// The mux settings of the cleartext tests: a cap of 4 and 1 KiB chunks, with
+/// the budgets the symmetric settings leave unmetered.
+fn chunked_cleartext_settings() -> MuxSettings {
+	let mut settings = MuxSettings::symmetric(4);
+	settings.send_chunk_size = 1024;
+	settings.recv_chunk_size = 1024;
+	settings
 }
 
-// Cleartext parity: chunking and stream credit run over symmetric
-// out-of-band settings while the budget machinery stays inert
-// (unmetered by construction, no epoch to renew).
-tb_scenario! {
-	name: mux_cleartext_chunked_parity,
-	spec: MuxCleartextChunkedSpec,
-	environment Bare {
-		exec: |SetupEnv { trace, .. }| async move {
-			let (client, server) = establish_cleartext_transports().await?;
-			let mut settings = MuxSettings::symmetric(4);
-			settings.send_chunk_size = 1024;
-			settings.recv_chunk_size = 1024;
-
-			trace.event_with(
-				CLEARTEXT_BUDGETS_UNMETERED,
-				&[],
-				settings.send_budget.is_none() && settings.recv_budget.is_none(),
-			)?;
-
-			let (client_end, _client_responder) =
-				spawn_cleartext_mux_endpoint(client, MuxRole::Client, settings, None, trace.share())?;
-			let (_server_end, server_responder) =
-				spawn_cleartext_mux_endpoint(server, MuxRole::Server, settings, None, trace.share())?;
-			let _serve = spawn_immediate_echo(server_responder);
-
-			let frame = large_mux_frame("mux-cleartext-chunked");
-			let echoed = client_end.handle.emit_on_stream(&frame).await?;
-			trace.event_with(CLEARTEXT_CHUNKED_ECHO, &[], is_echo(echoed, &frame))?;
-
-			Ok(())
-		}
-	}
+/// Symmetric cleartext settings leave both budgets unmetered, because the link
+/// has no epoch to renew.
+#[test]
+fn mux_cleartext_budgets_unmetered() {
+	let settings = chunked_cleartext_settings();
+	let unmetered = settings.send_budget.is_none() && settings.recv_budget.is_none();
+	assert!(unmetered, "symmetric cleartext settings must leave both budgets unmetered");
 }
 
-pub(crate) const CLEARTEXT_STREAMING_ECHO: Urn<'static> =
-	tightbeam::urn!("test", "event:cleartext/cleartext-streaming-echo");
-pub(crate) const CLEARTEXT_STREAMING_CHUNKED: Urn<'static> =
-	tightbeam::urn!("test", "event:cleartext/cleartext-streaming-chunked");
+/// On a cleartext link, chunking and stream credit run over symmetric
+/// out-of-band settings while the budget machinery stays inert.
+#[tokio::test]
+async fn mux_cleartext_chunked_parity() -> Result<(), TightBeamError> {
+	let (client, server) = establish_cleartext_transports().await?;
+	let settings = chunked_cleartext_settings();
+	let (client_end, _client_responder) =
+		spawn_cleartext_mux_endpoint(client, MuxRole::Client, settings, None, TraceCollector::new())?;
+	let (_server_end, server_responder) =
+		spawn_cleartext_mux_endpoint(server, MuxRole::Server, settings, None, TraceCollector::new())?;
+	let _serve = spawn_immediate_echo(server_responder);
 
-tb_assert_spec! {
-	pub MuxCleartextStreamingSpec,
-	V(1,0,0): {
-		mode: Accept,
-		assertions: [
-			(CLEARTEXT_STREAMING_ECHO, exactly!(1), equals!(true)),
-			(CLEARTEXT_STREAMING_CHUNKED, exactly!(1), equals!(true))
-		]
-	}
+	let frame = large_mux_frame("mux-cleartext-chunked");
+	let echoed = client_end.handle.emit_on_stream(&frame).await?;
+	assert!(is_echo(echoed, &frame), "a chunked frame must echo over cleartext");
+	Ok(())
 }
 
-// Streaming on cleartext links (the ws-style embedding): open_stream
-// pushes against serve_streaming with only chunking and stream credit
-// in play.
-tb_scenario! {
-	name: mux_cleartext_streaming_echo,
-	spec: MuxCleartextStreamingSpec,
-	environment Bare {
-		exec: |SetupEnv { trace, .. }| async move {
-			let (client, server) = establish_cleartext_transports().await?;
-			let mut settings = MuxSettings::symmetric(4);
-			settings.send_chunk_size = 1024;
-			settings.recv_chunk_size = 1024;
+/// A cleartext link carries a stream, as the ws-style embedding does:
+/// `open_stream` pushes against `serve_streaming` with only chunking and
+/// stream credit in play.
+#[tokio::test]
+async fn mux_cleartext_streaming_echo() -> Result<(), TightBeamError> {
+	let (client, server) = establish_cleartext_transports().await?;
+	let settings = chunked_cleartext_settings();
+	let (client_end, _client_responder) =
+		spawn_cleartext_mux_endpoint(client, MuxRole::Client, settings, None, TraceCollector::new())?;
+	let (_server_end, server_responder) =
+		spawn_cleartext_mux_endpoint(server, MuxRole::Server, settings, None, TraceCollector::new())?;
 
-			let (client_end, _client_responder) =
-				spawn_cleartext_mux_endpoint(client, MuxRole::Client, settings, None, trace.share())?;
-			let (_server_end, server_responder) =
-				spawn_cleartext_mux_endpoint(server, MuxRole::Server, settings, None, trace.share())?;
+	let chunks_seen = Arc::new(AtomicUsize::new(0));
+	let _serve = tokio::spawn(server_responder.serve_streaming(streaming_echo_handler(Arc::clone(&chunks_seen))));
 
-			let chunks_seen = Arc::new(AtomicUsize::new(0));
-			let _serve = tokio::spawn(server_responder.serve_streaming(streaming_echo_handler(Arc::clone(&chunks_seen))));
+	let frame = large_mux_frame("mux-cleartext-streaming");
+	let payload = frame.to_der()?;
+	let (sink, response) = client_end.handle.open_stream()?;
+	push_split(sink, &payload).await?;
 
-			let frame = large_mux_frame("mux-cleartext-streaming");
-			let payload = frame.to_der()?;
-			let (sink, response) = client_end.handle.open_stream()?;
-			push_split(sink, &payload).await?;
-
-			let echoed = response.await?;
-			trace.event_with(CLEARTEXT_STREAMING_ECHO, &[], is_echo(echoed, &frame))?;
-			trace.event_with(CLEARTEXT_STREAMING_CHUNKED, &[], saw_multiple_chunks(&chunks_seen))?;
-
-			Ok(())
-		}
-	}
+	let echoed = response.await?;
+	let chunked = saw_multiple_chunks(&chunks_seen);
+	assert!(is_echo(echoed, &frame), "a streamed request must echo over cleartext");
+	assert!(chunked, "the streaming handler must see more than one chunk");
+	Ok(())
 }

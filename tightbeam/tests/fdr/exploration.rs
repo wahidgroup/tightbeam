@@ -7,7 +7,7 @@
 //! second engine reports every state of its process as visited, so its
 //! events show that a divergence event names a state where a seed diverged.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -15,10 +15,10 @@ use std::sync::Arc;
 use tightbeam::instrumentation::events::{DIVERGENCE_DETECT, ENABLED_SET_SAMPLE};
 use tightbeam::instrumentation::TbInstrumentationConfig;
 use tightbeam::testing::fdr::{
-	DefaultCache, DefaultExplorationEngine, DefaultRefinementChecker, ExplorationCore, Failure, FdrConfig, FdrExplorer,
+	DefaultCache, DefaultExplorationEngine, DefaultRefinementChecker, ExplorationCore, FdrConfig, FdrExplorer,
 	SeedResult, Trace,
 };
-use tightbeam::testing::specs::csp::{DivergentStates, Event, Process, ProcessBuildError, State};
+use tightbeam::testing::specs::csp::{Event, Process, ProcessBuildError, State};
 use tightbeam::trace::{TraceCollector, TraceConfig};
 use tightbeam::urn::Urn;
 
@@ -32,15 +32,15 @@ struct OutsideEngine<'a> {
 	results: Vec<(u64, SeedResult)>,
 	/// The states that the seeds visited.
 	visited: HashSet<State>,
-	/// The divergent states of the process, which each seed reads.
-	divergent: DivergentStates,
+	/// The engine that walks each seed.
+	walker: DefaultExplorationEngine<'a>,
 }
 
 impl<'a> OutsideEngine<'a> {
 	/// An engine of `process` under `config`, before its first seed.
 	fn new(process: &'a Process, config: Arc<FdrConfig>) -> Self {
-		let divergent = process.divergent_states();
-		Self { process, config, results: Vec::new(), visited: HashSet::new(), divergent }
+		let walker = DefaultExplorationEngine::new(process, Arc::clone(&config));
+		Self { process, config, results: Vec::new(), visited: HashSet::new(), walker }
 	}
 }
 
@@ -54,9 +54,8 @@ impl ExplorationCore for OutsideEngine<'_> {
 	}
 
 	fn explore_seed(&mut self, seed: u64) -> SeedResult {
-		let explored = DefaultExplorationEngine::explore_seed_static(self.process, &self.config, &self.divergent, seed);
-		let (result, visited, _pruned) = explored;
-		self.visited.extend(visited);
+		let result = self.walker.explore_seed(seed);
+		self.visited.extend(self.walker.visited_states());
 		result
 	}
 
@@ -64,24 +63,16 @@ impl ExplorationCore for OutsideEngine<'_> {
 		Vec::new()
 	}
 
-	fn failures(&self) -> Vec<Failure> {
-		Vec::new()
-	}
-
 	fn visited_states(&self) -> &HashSet<State> {
 		&self.visited
-	}
-
-	fn seeds_completed(&self) -> u32 {
-		u32::try_from(self.results.len()).unwrap_or(u32::MAX)
 	}
 
 	fn add_seed_result(&mut self, seed: u64, result: SeedResult) {
 		self.results.push((seed, result));
 	}
 
-	fn update_visited_states(&mut self, visited: &HashSet<State>) {
-		self.visited.extend(visited.iter().copied());
+	fn seed_results(&self) -> &[(u64, SeedResult)] {
+		&self.results
 	}
 }
 
@@ -144,25 +135,94 @@ impl ExplorationCore for OverReportingEngine<'_> {
 		Vec::new()
 	}
 
-	fn failures(&self) -> Vec<Failure> {
-		Vec::new()
-	}
-
 	fn visited_states(&self) -> &HashSet<State> {
 		&self.inner.process.states
-	}
-
-	fn seeds_completed(&self) -> u32 {
-		self.inner.seeds_completed()
 	}
 
 	fn add_seed_result(&mut self, seed: u64, result: SeedResult) {
 		self.inner.add_seed_result(seed, result);
 	}
 
-	fn update_visited_states(&mut self, visited: &HashSet<State>) {
-		self.inner.update_visited_states(visited);
+	fn seed_results(&self) -> &[(u64, SeedResult)] {
+		self.inner.seed_results()
 	}
+}
+
+/// An exploration engine that counts the seeds it walks.
+struct CountingEngine<'a> {
+	/// The engine that explores each seed.
+	inner: OutsideEngine<'a>,
+	/// The count of the seeds that the engine walked.
+	walked: Rc<Cell<u64>>,
+}
+
+impl ExplorationCore for CountingEngine<'_> {
+	fn process(&self) -> &Process {
+		self.inner.process
+	}
+
+	fn config(&self) -> &FdrConfig {
+		&self.inner.config
+	}
+
+	fn explore_seed(&mut self, seed: u64) -> SeedResult {
+		self.walked.set(self.walked.get() + 1);
+		self.inner.explore_seed(seed)
+	}
+
+	fn traces(&self) -> Vec<Trace> {
+		Vec::new()
+	}
+
+	fn visited_states(&self) -> &HashSet<State> {
+		self.inner.visited_states()
+	}
+
+	fn add_seed_result(&mut self, seed: u64, result: SeedResult) {
+		self.inner.add_seed_result(seed, result);
+	}
+
+	fn seed_results(&self) -> &[(u64, SeedResult)] {
+		self.inner.seed_results()
+	}
+}
+
+#[test]
+fn an_outside_engine_walks_every_seed() -> Result<(), ProcessBuildError> {
+	let process = ready()?;
+	let config = Arc::new(FdrConfig { seeds: 4, ..Default::default() });
+	let walked = Rc::new(Cell::new(0));
+	let engine = CountingEngine {
+		inner: OutsideEngine::new(&process, Arc::clone(&config)),
+		walked: Rc::clone(&walked),
+	};
+
+	let cache = Rc::new(RefCell::new(DefaultCache::new()));
+	let checker = DefaultRefinementChecker::new(&process, Arc::clone(&config), cache);
+	let mut explorer = FdrExplorer::new_with_arc(&process, config, engine, checker);
+
+	explorer.explore();
+
+	assert_eq!(walked.get(), 4, "the explorer hands each of the four seeds to the engine");
+	Ok(())
+}
+
+#[test]
+fn the_verdict_reads_each_result_that_an_outside_engine_records() -> Result<(), ProcessBuildError> {
+	let process = ready()?;
+	let config = Arc::new(FdrConfig { seeds: 4, ..Default::default() });
+	let engine = OutsideEngine::new(&process, Arc::clone(&config));
+	let cache = Rc::new(RefCell::new(DefaultCache::new()));
+	let checker = DefaultRefinementChecker::new(&process, Arc::clone(&config), cache);
+	let mut explorer = FdrExplorer::new_with_arc(&process, config, engine, checker);
+
+	let verdict = explorer.explore();
+
+	assert_eq!(
+		verdict.seeds_completed, 4,
+		"the provided `explore_seeds` records each of the four results"
+	);
+	Ok(())
 }
 
 /// A process whose hidden `t` and `u` take `S1` to `S2` and back, with the

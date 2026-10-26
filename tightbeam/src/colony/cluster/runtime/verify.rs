@@ -2,22 +2,23 @@
 //!
 //! The gateway runs these predicates before or beside request dispatch:
 //!
-//! - Gate policies evaluate on every admitted session.
-//! - The export boundary evaluates once a servlet target is known.
+//! - Gate policies run on every unary request and stream open of an admitted session.
+//! - The export boundary runs once the gateway knows the servlet target.
 //! - Origin and freshness checks apply to signed control frames on the hive and peer planes.
 //!
 //! # Gate policies
 //!
-//! [`ClusterConfig::evaluate_gates`] runs configured [`GatePolicy`] instances
-//! before the gateway decodes the request envelope. Stream opens carry no
-//! request frame, so they pass `None` for the frame argument.
+//! [`ClusterConfig::evaluate_gates`] runs the configured [`GatePolicy`]
+//! instances before the gateway decodes the request envelope. Stream opens
+//! carry no request frame, so they pass `None` for the frame argument.
 //!
 //! # Export boundary
 //!
 //! [`ColonyConfig::evaluate_export_gates`] runs [`ExportPolicy`] where the
-//! gateway resolves the servlet target: allowlist, then grants, then deny
-//! gates. [`HopBudget::is_relayed`] supplies the `relayed` flag. Verdict
-//! algebra and posture warnings live in [`crate::colony::cluster::export`].
+//! gateway resolves the servlet target: the allowlist, then the grants, then
+//! the deny gates. [`HopBudget::is_relayed`] supplies the `relayed` flag. The
+//! verdict algebra and the posture warnings live in
+//! [`crate::colony::cluster::export`].
 //!
 //! # Origin and freshness
 //!
@@ -50,8 +51,8 @@ use crate::TightBeamError;
 
 /// One caller under export-boundary audit.
 ///
-/// A refusal and a grant that decides the outcome describe the same caller,
-/// so they share one enrichment convention.
+/// A refusal and a grant that decides the outcome describe the same caller, so
+/// both records carry the same label, value, and payload.
 struct ExportAudit<'a> {
 	trace: &'a TraceCollector,
 	session: &'a SessionContext,
@@ -59,30 +60,36 @@ struct ExportAudit<'a> {
 }
 
 impl ExportAudit<'_> {
-	/// Emit `outcome` for this caller.
-	///
-	/// The assertion value is the `relayed` flag, and the instrument record
-	/// names it as its label, `relayed` or `direct`. Where mutual TLS captured
-	/// a caller certificate, the record's payload is its fingerprint under the
-	/// colony's digest `D`. The record of an anonymous session carries the
-	/// label alone.
-	fn record<D: Digest>(&self, outcome: Urn<'static>) -> Result<(), TightBeamError> {
-		let caller = self.session.peer_certificate();
-		let fingerprint = caller.and_then(ColonyCertificate::fingerprint_id::<D>);
-		let evidence = fingerprint.as_deref();
-		let route = if self.relayed {
+	/// The route of the request in the audit label: `relayed` for a request
+	/// that a peer relayed, and `direct` for an origin request.
+	fn route(&self) -> &'static str {
+		if self.relayed {
 			"relayed"
 		} else {
 			"direct"
-		};
+		}
+	}
+
+	/// Emit `outcome` for this caller, answered with `status`.
+	///
+	/// - The assertion value is the `relayed` flag.
+	/// - The label is `<status>/<route>`, such as `Ok/relayed`, because the
+	///   sink keeps the label and drops the value.
+	/// - The payload is the fingerprint of the caller's certificate under the
+	///   colony's digest `D`, where mutual TLS captured one.
+	fn record<D: Digest>(&self, outcome: Urn<'static>, status: TransitStatus) -> Result<(), TightBeamError> {
+		let caller = self.session.peer_certificate();
+		let fingerprint = caller.and_then(ColonyCertificate::fingerprint_id::<D>);
+		let evidence = fingerprint.as_deref();
+		let label = format!("{}/{}", status.as_str(), self.route());
 		let trace = self.trace;
-		trace.emit_event_with_value_and_evidence(outcome, route, self.relayed, evidence)?;
+		trace.emit_event_with_value_and_evidence(outcome, label, self.relayed, evidence)?;
 
 		Ok(())
 	}
 }
 
-/// The owned slate key created with [`VerifiedControlFrame`].
+/// The owned slate key that each [`VerifiedControlFrame`] carries.
 ///
 /// Only [`ColonyConfig::verify_plane`] constructs this. Gossip may carry the
 /// id across `.await` without the borrowed certificate, and the newtype keeps
@@ -126,7 +133,7 @@ pub(crate) enum VerifyRefusal {
 }
 
 impl From<VerifyRefusal> for TransitStatus {
-	/// The status a refused frame is answered with.
+	/// The status that answers a refused frame.
 	///
 	/// A frame with no signature is unauthenticated. Every other refusal
 	/// names a signer this plane does not admit.
@@ -144,7 +151,7 @@ impl From<VerifyRefusal> for TransitStatus {
 
 impl VerifyRefusal {
 	/// Settles a refused rumor origin for the relay that carried the rumor,
-	/// and returns the status the relay is answered with.
+	/// and returns the status that answers the relay.
 	///
 	/// Trust stores need not agree, so an origin this gateway does not hold
 	/// is the edge of a subnet and no fault of the relay.
@@ -156,10 +163,10 @@ impl VerifyRefusal {
 	///   tells the relay to stop its offers of that origin here. With the
 	///   bucket empty it answers [`TransitStatus::ResourceExhausted`]. A
 	///   backend fault of the admission answers [`TransitStatus::Unavailable`].
-	/// - Every other refusal is a rumor the relay should have refused itself, so the relay is scored.
+	/// - Every other refusal marks a rumor the relay should have refused, so the gateway scores the relay.
 	/// - `frame` is the relay's own signed frame, whose signer keys that
-	///   bucket. A frame that names no signer has no bucket to spend, so it is
-	///   scored too.
+	///   bucket. A frame that names no signer has no bucket to spend, so the
+	///   gateway scores its relay too.
 	///
 	/// # Errors
 	///
@@ -176,8 +183,9 @@ impl VerifyRefusal {
 				let now = pipeline.config.clock.unix();
 				match pipeline.config.gossip.admission.allow(&relay_key, now) {
 					Ok(true) => {
-						let event = pipeline.trace.event(CLUSTER_GOSSIP_ORIGIN_UNKNOWN)?;
-						event.with_payload(relay.as_shared().as_ref()).emit();
+						let trace = &pipeline.trace;
+						let evidence = || Some(relay.as_shared().as_ref());
+						trace.emit_marker_with_evidence(CLUSTER_GOSSIP_ORIGIN_UNKNOWN, evidence)?;
 
 						Ok(TransitStatus::Unauthenticated)
 					}
@@ -197,9 +205,9 @@ impl VerifyRefusal {
 
 /// One verified inbound control frame.
 ///
-/// Only [`ColonyConfig::verify_hive`] or [`ColonyConfig::verify_peer`]
-/// creates one. The signature check runs once. [`Party`] comes from
-/// [`TrustPlanes::classify`] on the certificate that check resolved, so a
+/// Only [`ColonyConfig::verify_hive`] or [`ColonyConfig::verify_peer`] creates
+/// one. The signature check runs once, and [`Party`] comes from
+/// [`TrustPlanes::classify`] on the certificate that the check resolved, so a
 /// later step reuses this verification and this signer lookup.
 pub(crate) struct VerifiedControlFrame<'a> {
 	frame: &'a Frame,
@@ -248,8 +256,8 @@ impl<'a> VerifiedControlFrame<'a> {
 }
 
 impl ClusterConfig {
-	/// Run configured [`GatePolicy`] instances and leave the audit event to
-	/// the caller.
+	/// Run the configured [`GatePolicy`] instances and leave the audit event
+	/// to the caller.
 	pub(crate) fn policies_allow(&self, frame: Option<&Frame>, session: &SessionContext) -> Result<(), TransitStatus> {
 		let config = self;
 		for policy in config.policies.iter() {
@@ -268,9 +276,9 @@ impl ClusterConfig {
 	/// Each configured policy must return [`TransitStatus::Ok`], so the first
 	/// refusal short-circuits dispatch.
 	///
-	/// - `frame`: request envelope when present, or `None` for stream opens that carry no unary frame
-	/// - `session`: caller identity and transport facts for the admitted connection
-	/// - `trace`: collector that receives [`CLUSTER_GATE_BLOCKED`] on refusal
+	/// - `frame`: the request envelope when present, or `None` for a stream open that carries no unary frame
+	/// - `session`: the identity and transport facts of the caller's admitted connection
+	/// - `trace`: the collector that receives [`CLUSTER_GATE_BLOCKED`] on a refusal
 	pub(crate) fn evaluate_gates(
 		&self,
 		frame: Option<&Frame>,
@@ -282,7 +290,7 @@ impl ClusterConfig {
 			return Ok(TransitStatus::Ok);
 		};
 
-		trace.event(CLUSTER_GATE_BLOCKED)?.emit();
+		trace.emit_event_with_value_and_evidence(CLUSTER_GATE_BLOCKED, status.as_str(), status, None)?;
 
 		Ok(status)
 	}
@@ -291,11 +299,11 @@ impl ClusterConfig {
 impl<P: Protocol> ColonyConfig<P> {
 	/// Verify `frame` once on `required` and classify the resolved certificate.
 	///
-	/// Peer membership wins: a public key enrolled in `tls.peer_trust`
-	/// is [`Party::Peer`], so a hive-plane parse refuses it even when the
-	/// presented certificate object lives only in `hive_trust`. A missing
-	/// store or a failed signature refuses. A frame without a signature
-	/// is unauthenticated.
+	/// Peer membership wins: a public key enrolled in `tls.peer_trust` is
+	/// [`Party::Peer`], so a hive-plane parse refuses it even when the
+	/// presented certificate object lives only in `hive_trust`. An absent store
+	/// or a failed signature refuses, and a frame without a signature is
+	/// unauthenticated.
 	fn verify_plane<'a>(
 		&'a self,
 		frame: &'a Frame,
@@ -334,27 +342,27 @@ impl<P: Protocol> ColonyConfig<P> {
 
 	/// Enforce the export boundary on a resolved servlet target.
 	///
-	/// The verdict algebra lives in [`ExportPolicy`], read from live
+	/// The verdict algebra lives in [`ExportPolicy`], read from the live
 	/// configuration so enforcement stays aligned with the advertise filter.
 	/// This wrapper adds the audit plane.
 	///
-	/// 1. Run [`ExportPolicy::verdict`] (allowlist, grants, then deny gates).
+	/// 1. Run [`ExportPolicy::verdict`] (the allowlist, the grants, then the deny gates).
 	/// 2. Trace [`CLUSTER_EXPORT_REFUSED`] or [`CLUSTER_EXPORT_GRANTED`] with
-	///    the caller certificate fingerprint under the colony digest and the
-	///    relayed flag.
+	///    the status, the caller certificate fingerprint under the colony
+	///    digest, and the relayed flag.
 	///
 	/// The granted event fires only when the full verdict passes, because a
-	/// grant overridden by a deny gate did not decide the outcome.
+	/// deny gate that overrides a grant decides the outcome itself.
 	///
-	/// - `target`: servlet type under enforcement
-	/// - `session`: caller identity facts for the admitted connection
+	/// - `target`: the servlet type under enforcement
+	/// - `session`: the identity facts of the caller's admitted connection
 	/// - `relayed`: `true` when [`HopBudget::is_relayed`] marks the request as peer-relayed
-	/// - `trace`: collector that receives the boundary audit events
+	/// - `trace`: the collector that receives the boundary audit events
 	///
 	/// # Call sites
 	///
-	/// - Unary work arm in [`super::dispatch`]
-	/// - Streaming and duplex open handlers in [`super`]
+	/// - The unary work arm in [`super::dispatch`]
+	/// - The streaming and duplex open handlers in [`super`]
 	///
 	/// # Sources
 	///
@@ -377,15 +385,15 @@ impl<P: Protocol> ColonyConfig<P> {
 			Err(status) => (CLUSTER_EXPORT_REFUSED, status),
 		};
 
-		audit.record::<ColonyDigest<P>>(outcome)?;
+		audit.record::<ColonyDigest<P>>(outcome, status)?;
 		Ok(status)
 	}
 
 	/// Verify one hive-plane control frame.
 	///
 	/// The result carries the signer certificate and [`Party::FirstParty`].
-	/// A public key that `tls.peer_trust` also enrolls is [`Party::Peer`]
-	/// and is refused: peer membership wins by key identity, so a rotated
+	/// A public key that `tls.peer_trust` also enrolls is [`Party::Peer`], and
+	/// the parse refuses it: peer membership wins by key identity, so a rotated
 	/// certificate for a peer key never acts on the hive plane.
 	///
 	/// # Sources
@@ -750,6 +758,7 @@ mod tests {
 	fn peer_origin_names_a_plane_with_no_store() {
 		let frame = signed_control_frame(&peer_key());
 		let config = house(exporting_config());
+
 		let verified = config.verify_peer(&frame);
 		assert!(matches!(verified, Err(VerifyRefusal::NoStore)));
 	}
@@ -814,6 +823,7 @@ mod tests {
 		let mut config = exporting_config();
 		config.tls.hive_trust = Some(trust_of(&cert));
 		config.tls.peer_trust = Some(trust_of(&cert));
+
 		let config = house(config);
 		assert!(matches!(config.verify_peer(&frame), Ok(verified) if verified.party() == Party::Peer));
 	}
@@ -855,17 +865,45 @@ mod tests {
 			Ok(())
 		}
 
+		// A refusal names its status and its route in its label, because the
+		// sink keeps the label and drops the value that carries the relayed
+		// flag.
 		tb_cases! {
-			fn a_refusal_names_the_route_of_its_caller((relayed, route): (bool, &str)) -> Result<(), TightBeamError> {
+			fn a_refusal_names_its_status_and_route((relayed, expected): (bool, &str)) -> Result<(), TightBeamError> {
 				let records = refusal_records(&SessionContext::default(), relayed)?;
 				let labels: Vec<Option<String>> = records.into_iter().map(|record| record.label).collect();
-				assert_eq!(labels, [Some(route.to_string())]);
+				assert_eq!(labels, [Some(String::from(expected))]);
 				Ok(())
 			}
 			cases {
-				direct => (false, "direct"),
-				relayed => (true, "relayed"),
+				direct => (false, "PermissionDenied/direct"),
+				relayed => (true, "PermissionDenied/relayed"),
 			}
+		}
+
+		// A refusal after the frame verified on its plane names the
+		// fingerprint of the signer that the verification proved.
+		#[test]
+		fn a_verified_refusal_names_its_signer() -> Result<(), TightBeamError> {
+			use crate::colony::cluster::runtime::refuse::Refusal;
+			use crate::instrumentation::events::CLUSTER_GOSSIP_REFUSED;
+
+			let config = TbInstrumentationConfig { enable_payloads: true, ..TbInstrumentationConfig::default() };
+			let trace = TraceCollector::from(TraceConfig::with_instrumentation(config));
+			let frame = signed_control_frame(&peer_key());
+			let gateway = house(config_enrolling(&TestCertificate::self_signed(&peer_key())));
+			let signer = gateway.verify_peer(&frame).map(|verified| verified.fingerprint());
+			let signer = signer.map_err(|_| TightBeamError::MissingSignature)?;
+
+			let refusal = Refusal::to(&frame, &trace).by(&signer);
+			refusal.gossip(TransitStatus::PermissionDenied)?;
+
+			let expected: [u8; 32] = Sha3_256::digest(signer.as_shared().as_ref()).into();
+			let drained = trace.drain_events().into_iter();
+			let recorded = drained.filter(|event| event.urn == CLUSTER_GOSSIP_REFUSED);
+			let evidence: Vec<Option<[u8; 32]>> = recorded.map(|event| event.payload_hash).collect();
+			assert_eq!(evidence, [Some(expected)]);
+			Ok(())
 		}
 	}
 }

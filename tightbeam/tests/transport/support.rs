@@ -1,4 +1,4 @@
-//! Shared helpers for the transport integration tests.
+//! Shared functions for the transport integration tests.
 
 #![cfg(all(
 	feature = "transport-hpke",
@@ -32,7 +32,6 @@ use tightbeam::transport::{
 	Arrived, ClientBuilder, ConnectionBuilder, EncryptedMessageIO, EncryptedProtocol, MessageCollector, MessageIO,
 	TransportEncryptionConfig, TransportError, TransportLimits, WireEnvelope,
 };
-use tightbeam::urn::Urn;
 use tightbeam::x509::Certificate;
 use tightbeam::Frame;
 use tightbeam::TightBeamError;
@@ -50,11 +49,11 @@ use tokio::sync::Notify;
 use crate::common::poll::poll_until;
 use crate::common::security::{expectation_failure, pinning_validator, ClientMaterials, ServerMaterials};
 
-/// Number of reads a transport wait takes, one every 5 ms for 2 s.
+/// The number of reads a transport wait takes, one every 5 ms for 2 s.
 #[cfg(feature = "transport-multiplex")]
 const TRANSPORT_WAIT_ATTEMPTS: u32 = 400;
 
-/// Interval between the reads of a transport wait.
+/// The interval between the reads of a transport wait.
 #[cfg(feature = "transport-multiplex")]
 const TRANSPORT_WAIT_INTERVAL: Duration = Duration::from_millis(5);
 
@@ -63,7 +62,7 @@ const TRANSPORT_WAIT_INTERVAL: Duration = Duration::from_millis(5);
 #[cfg(feature = "transport-multiplex")]
 const SCENARIO_WAIT_DEADLINE: Duration = Duration::from_secs(5);
 
-/// Polls `ready` on the transport cadence and answers whether it held.
+/// Polls `ready` on the transport cadence and returns whether it held.
 #[cfg(feature = "transport-multiplex")]
 pub async fn await_transport(ready: impl FnMut() -> bool) -> bool {
 	poll_until(TRANSPORT_WAIT_ATTEMPTS, TRANSPORT_WAIT_INTERVAL, ready).await
@@ -114,7 +113,7 @@ impl HandlerSignal {
 	}
 }
 
-/// Poll until the epoch receipt differs from `previous`, and answer the new
+/// Polls until the epoch receipt differs from `previous`, and returns the new
 /// one, or `None` when the wait runs out.
 #[cfg(feature = "transport-multiplex")]
 pub async fn await_receipt_rotation<F>(current: F, previous: Option<&StoredReceipt>) -> Option<Arc<StoredReceipt>>
@@ -131,7 +130,7 @@ where
 	settled.then_some(rotated).flatten()
 }
 
-/// Serve one single-flight request. The reply carries the gate's status, and
+/// Serves one single-flight request. The reply carries the gate's status, and
 /// the accepted frame back when that status is `Ok`.
 pub async fn respond_echo<T: MessageCollector + Send>(mut transport: T) -> Result<(), TransportError> {
 	let (request, status) = transport.collect_message().await?;
@@ -152,13 +151,6 @@ pub fn mux_frame(label: impl AsRef<str>) -> Frame {
 /// A multiplexing offer that advertises `cap` peer-initiated streams.
 pub fn mux_offer(cap: u32) -> TransportOffer {
 	TransportOffer::mux(cap)
-}
-
-/// Record an event outcome from a spawned task, where no `Result` return
-/// exists for `?`. A failure to record panics the task, and the spec then
-/// reports it as the missing event.
-pub fn record_spawned_event(trace: &TraceCollector, urn: Urn<'static>, value: bool) {
-	trace.event_with(urn, &[], value).expect("spawned task must record its event");
 }
 
 pub async fn await_ok<T, E>(task: JoinHandle<Result<T, E>>, panic_msg: &'static str) -> Result<T, TightBeamError>
@@ -206,7 +198,7 @@ pub async fn bind_mutual_listener(
 	bind_mutual_listener_under(materials, client_certificate, KeyPurposes::HOUSE).await
 }
 
-/// Bind a listener that presents `materials`, pins `client_certificate` as
+/// Binds a listener that presents `materials`, pins `client_certificate` as
 /// its one client, and admits each role under `key_purposes`.
 pub async fn bind_mutual_listener_under(
 	materials: &ServerMaterials,
@@ -218,7 +210,7 @@ pub async fn bind_mutual_listener_under(
 	bind_with_config(config.with_key_purposes(key_purposes)).await
 }
 
-/// Bind a listener that presents the CMS server of `materials`, its signing
+/// Binds a listener that presents the CMS server of `materials`, its signing
 /// identity paired with its key-agreement identity, and pins
 /// `client_certificate` as its one client.
 #[cfg(feature = "transport-cms")]
@@ -240,7 +232,7 @@ pub async fn connect_mutual_client(
 	connect_mutual_client_under(addr, server_certificate, client, KeyPurposes::HOUSE).await
 }
 
-/// Connect a client that presents `client`, pins `server_certificate`, and
+/// Connects a client that presents `client`, pins `server_certificate`, and
 /// admits each role under `key_purposes`.
 pub async fn connect_mutual_client_under(
 	addr: SocketAddr,
@@ -256,34 +248,34 @@ pub async fn connect_mutual_client_under(
 	Ok(adopted.into_transport())
 }
 
-/// Optional per-session hooks for mutual-auth handshakes.
+/// The optional per-session hooks for mutual-auth handshakes.
 #[derive(Default)]
 pub struct MutualSessionHooks {
-	/// Transport authorizer that the server installs, when set.
+	/// The transport authorizer that the server installs, when set.
 	pub authorizer: Option<Arc<dyn TransportAuthorizer>>,
-	/// Receipt approver that the client installs, when set.
+	/// The receipt approver that the client installs, when set.
 	pub approver: Option<Arc<dyn ReceiptApprover>>,
-	/// Session observer that the server notifies, when set.
+	/// The session observer that the server notifies, when set.
 	pub observer: Option<Arc<dyn SessionObserver>>,
-	/// Trace collector attached to both endpoints, whose production
+	/// The trace collector attached to both endpoints, whose production
 	/// instrumentation emits session labels for spec assertions.
 	pub trace: Option<TraceCollector>,
 }
 
-/// Established mutual-auth transports plus peer identities for receipt
-/// verification.
+/// The established mutual-auth transports, with the peer identities that
+/// receipt verification needs.
 pub struct MutualTransports {
-	/// Client transport whose handshake completed.
+	/// The client transport, with its handshake complete.
 	pub client: TcpTransport<TokioStream>,
-	/// Server transport whose handshake completed.
+	/// The server transport, with its handshake complete.
 	pub server: TcpTransport<TokioStream>,
-	/// Certificate the server presented.
+	/// The certificate that the server presents.
 	pub server_certificate: Arc<Certificate>,
-	/// Certificate the client presented.
+	/// The certificate that the client presents.
 	pub client_certificate: Arc<Certificate>,
 }
 
-/// Establish a mutual-auth client and server transport pair.
+/// Establishes a mutual-auth client and server transport pair.
 ///
 /// A budget-bearing session requires a client countersignature over the
 /// session receipt.
@@ -298,7 +290,7 @@ pub async fn establish_mutual_transports(
 	establish_mutual_transports_of(client_offer, server_offer, hooks, &materials, &client_materials, key_purposes).await
 }
 
-/// Establish a mutual-auth pair in which the server presents `materials`,
+/// Establishes a mutual-auth pair in which the server presents `materials`,
 /// the client presents `client_materials`, and both endpoints admit each
 /// role under `key_purposes`.
 pub async fn establish_mutual_transports_of(

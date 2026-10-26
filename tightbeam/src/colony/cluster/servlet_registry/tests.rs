@@ -1,4 +1,5 @@
 use core::mem::discriminant;
+use core::num::NonZeroUsize;
 use core::str::from_utf8;
 use core::time::Duration;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8,7 +9,8 @@ use std::thread;
 use super::entry::LocalRoute;
 use super::{
 	ClusterError, DialTarget, HiveSlate, KindCaps, PeerCaps, PeerRoute, PheromoneConfig, RelayRoute, RouteKind,
-	RoutePlane, Routes, ServletEntry, ServletRegistry, SharedId, DEFAULT_ABANDONMENT_LIMIT, DEFAULT_INITIAL_PHEROMONE,
+	RoutePlane, Routes, ServletEntry, ServletRegistry, SharedId, SlateChange, DEFAULT_ABANDONMENT_LIMIT,
+	DEFAULT_INITIAL_PHEROMONE,
 };
 use crate::cms::signed_data::SignerIdentifier;
 use crate::colony::cluster::peer::{AdmittedPeerAd, RelayTrail};
@@ -169,14 +171,22 @@ fn admitted_with_order(
 	AdmittedPeerAd { peer_hive_id: Arc::from(hive), dial, slate, order: UnixMillis::new(order) }
 }
 
-/// Installs one direct peer slate for `peer` that dials the fixture socket.
+/// Installs one direct peer slate for `peer` that dials the fixture socket,
+/// and returns what the slate changed.
 fn install_peer_slate(
 	registry: &ServletRegistry,
 	peer: impl AsRef<[u8]>,
 	slate: impl IntoIterator<Item = ServletEntry>,
-) -> Result<(), ClusterError> {
+) -> Result<SlateChange, ClusterError> {
 	let peer = peer.as_ref();
 	registry.reconcile_peer_slate(admitted(peer, b"127.0.0.1:9000", slate), PeerCaps::default())
+}
+
+/// The installed and the withdrawn counts of `change`, with 0 for none.
+fn counts(change: SlateChange) -> (usize, usize) {
+	let installed = change.installed().map_or(0, NonZeroUsize::get);
+	let withdrawn = change.withdrawn().map_or(0, NonZeroUsize::get);
+	(installed, withdrawn)
 }
 
 /// A relay trail under the composite `origin NUL relay` bucket.
@@ -250,7 +260,6 @@ tb_cases! {
 	fn entry_reinforce_pheromone((initial, amount, expected): (u64, u64, u64)) {
 		let entry = test_entry(initial, 5);
 		entry.reinforce(amount);
-
 		assert_eq!(entry.pheromone_level(), expected);
 	}
 	cases {
@@ -292,7 +301,6 @@ tb_cases! {
 	fn entry_trials_count_toward_the_limit((weakened, expected_trials, abandoned): (u32, u32, bool)) {
 		let entry = test_entry(5000, 3);
 		weaken_entry_times(&entry, weakened);
-
 		assert_eq!(entry.trial_count(), expected_trials);
 		assert_eq!(entry.is_abandoned(), abandoned);
 	}
@@ -301,6 +309,16 @@ tb_cases! {
 		one_short => (2, 2, false),
 		at_the_limit => (3, 3, true),
 	}
+}
+
+// Of the failures against one entry, the one that reaches the limit alone
+// reports it, and a failure past the limit reports nothing.
+#[test]
+fn entry_reports_the_failure_that_reaches_its_limit() {
+	let entry = test_entry(5000, 3);
+	let reached: Vec<bool> = (0..4).map(|_| entry.weaken_to_limit()).collect();
+	assert_eq!(reached, vec![false, false, true, false]);
+	assert!(entry.is_abandoned());
 }
 
 #[test]
@@ -499,9 +517,7 @@ fn local_servlets_tracks_adds_and_removes() -> Result<(), ClusterError> {
 fn reconcile_peer_slate_installs_multi_type_slate() -> Result<(), ClusterError> {
 	let registry = registry();
 	let slate = vec![peer_entry(b"urn:t:a", b"gw"), peer_entry(b"urn:t:b", b"gw")];
-
 	install_peer_slate(&registry, b"gw", slate)?;
-
 	assert_eq!(registry.peer_entries()?.len(), 2);
 	Ok(())
 }
@@ -517,6 +533,41 @@ fn reconcile_peer_slate_prunes_stale_routes() -> Result<(), ClusterError> {
 	let peers = registry.peer_entries()?;
 	let types: Vec<SharedId> = peers.iter().map(|entry| Arc::clone(entry.servlet_type())).collect();
 	assert_eq!(types, vec![SharedId::from(b"urn:t:a".as_slice())]);
+	Ok(())
+}
+
+/// The servlet types that one slate names.
+type SlateTypes = &'static [&'static [u8]];
+
+// A second slate for one bucket counts the routes it adds and the routes it
+// leaves out, and a route both slates name counts as neither.
+tb_cases! {
+	fn reconcile_peer_slate_counts_what_the_slate_changed((first, second, expected): (SlateTypes, SlateTypes, (usize, usize))) -> Result<(), ClusterError> {
+		let registry = registry();
+		let slate = |types: SlateTypes| types.iter().map(|servlet| peer_entry(servlet, b"gw")).collect::<Vec<_>>();
+		install_peer_slate(&registry, b"gw", slate(first))?;
+
+		let change = install_peer_slate(&registry, b"gw", slate(second))?;
+		assert_eq!(counts(change), expected);
+		Ok(())
+	}
+	cases {
+		a_refresh_changes_nothing => (&[b"urn:t:a", b"urn:t:b"], &[b"urn:t:a", b"urn:t:b"], (0, 0)),
+		a_growth_installs_the_new_route => (&[b"urn:t:a"], &[b"urn:t:a", b"urn:t:b"], (1, 0)),
+		a_shrink_withdraws_the_dropped_route => (&[b"urn:t:a", b"urn:t:b"], &[b"urn:t:a"], (0, 1)),
+		a_swap_installs_and_withdraws => (&[b"urn:t:a"], &[b"urn:t:b"], (1, 1)),
+		an_empty_slate_withdraws_every_route => (&[b"urn:t:a", b"urn:t:b"], &[], (0, 2)),
+	}
+}
+
+#[test]
+fn reconcile_peer_slate_counts_a_first_slate_as_installed() -> Result<(), ClusterError> {
+	let registry = registry();
+	let slate = vec![peer_entry(b"urn:t:a", b"gw"), peer_entry(b"urn:t:b", b"gw")];
+
+	let change = install_peer_slate(&registry, b"gw", slate)?;
+	assert_eq!(counts(change), (2, 0));
+	assert!(change.opens_bucket());
 	Ok(())
 }
 
@@ -609,7 +660,8 @@ type Claim = fn(&ServletRegistry, &[u8]) -> Result<(), ClusterError>;
 /// A peer `gw` that claims `claimed` as its gateway socket.
 fn claimed_by_a_peer(registry: &ServletRegistry, claimed: &[u8]) -> Result<(), ClusterError> {
 	let claim = admitted(b"gw", claimed, vec![peer_entry_dial(b"calc", b"gw", claimed)]);
-	registry.reconcile_peer_slate(claim, PeerCaps::default())
+	registry.reconcile_peer_slate(claim, PeerCaps::default())?;
+	Ok(())
 }
 
 /// A second hive that registers a servlet at `claimed`.
@@ -756,11 +808,12 @@ fn withdraw_peer_by_dial_drops_the_routes_that_dial_the_socket() -> Result<(), C
 	let other_slate = vec![peer_entry_dial(b"pong", b"peer-b", b"127.0.0.1:9001")];
 	let other = admitted(b"peer-b", b"127.0.0.1:9001", other_slate);
 	registry.reconcile_peer_slate(other, PeerCaps::default())?;
-	registry.withdraw_peer_by_dial(PeerAddress::fixture("127.0.0.1:9000"))?;
+	let withdrawn = registry.withdraw_peer_by_dial(PeerAddress::fixture("127.0.0.1:9000"))?;
 
 	let live = registry.peer_entries()?;
 	let owners: Vec<SharedId> = live.iter().map(|entry| Arc::clone(entry.owner_id())).collect();
 	let kinds: Vec<RouteKind> = live.iter().map(|entry| entry.route_kind()).collect();
+	assert_eq!(withdrawn, NonZeroUsize::new(2));
 	assert_eq!(owners, vec![SharedId::from(b"peer-b".as_slice())]);
 	assert_eq!(kinds, vec![RouteKind::Peer]);
 	Ok(())
@@ -789,9 +842,10 @@ fn withdraw_peer_by_dial_keeps_the_fallback_trail_through_another_relay() -> Res
 fn withdraw_peer_by_dial_keeps_a_local_route_at_the_socket() -> Result<(), ClusterError> {
 	let registry = registry();
 	registry.add(named_entry(b"127.0.0.1:9000", b"calc", b"hive1"))?;
-	registry.withdraw_peer_by_dial(PeerAddress::fixture("127.0.0.1:9000"))?;
 
+	let withdrawn = registry.withdraw_peer_by_dial(PeerAddress::fixture("127.0.0.1:9000"))?;
 	let owner = owner_of(&registry, b"127.0.0.1:9000");
+	assert_eq!(withdrawn, None);
 	assert_eq!(owner, Some(SharedId::from(b"hive1".as_slice())));
 	Ok(())
 }
@@ -817,8 +871,8 @@ fn relay_reconcile_replaces_only_its_bucket() -> Result<(), ClusterError> {
 	Ok(())
 }
 
-// A direct gateway at its cap still admits a relay trail, because relay
-// buckets spend their own budget.
+// A gateway at its direct cap admits a relay trail, because relay buckets
+// spend their own budget.
 #[test]
 fn relay_buckets_do_not_spend_the_direct_gateway_cap() -> Result<(), ClusterError> {
 	let registry = registry();
@@ -860,6 +914,36 @@ fn empty_direct_slate_clears_relay_trails_for_origin() -> Result<(), ClusterErro
 	install_peer_slate(&registry, b"origin", Vec::new())?;
 
 	assert!(registry.peer_entries()?.is_empty());
+	Ok(())
+}
+
+// An emptied direct slate counts the relay trails it withdraws with the
+// direct routes, because both leave in the one step.
+#[test]
+fn empty_direct_slate_counts_the_relay_trails_it_withdraws() -> Result<(), ClusterError> {
+	let registry = registry();
+	install_peer_slate(&registry, b"origin", vec![peer_entry(b"calc", b"origin")])?;
+
+	let trail = relay_trail(b"origin", b"relay", b"calc", b"127.0.0.1:9001");
+	registry.reconcile_relay_trail(trail, PeerCaps::default())?;
+
+	let change = install_peer_slate(&registry, b"origin", Vec::new())?;
+	assert_eq!(counts(change), (0, 2));
+	Ok(())
+}
+
+// A relay trail is new when its bucket held no route. A refresh of the
+// trail, or a trail that replaces its type, finds the bucket held.
+#[test]
+fn a_relay_trail_opens_its_bucket_once() -> Result<(), ClusterError> {
+	let registry = registry();
+	let trail = |servlet_type: &[u8]| relay_trail(b"origin", b"relay", servlet_type, b"127.0.0.1:9001");
+	let first = registry.reconcile_relay_trail(trail(b"calc"), PeerCaps::default())?;
+	let refreshed = registry.reconcile_relay_trail(trail(b"calc"), PeerCaps::default())?;
+	let replaced = registry.reconcile_relay_trail(trail(b"sum"), PeerCaps::default())?;
+
+	let opened = [first.opens_bucket(), refreshed.opens_bucket(), replaced.opens_bucket()];
+	assert_eq!(opened, [true, false, false]);
 	Ok(())
 }
 
@@ -973,7 +1057,7 @@ fn registry_with_relay_trail(clock: &Arc<ManualClock>) -> ServletRegistry {
 /// The route kinds left in a registry after a prune at `max_age`, and how
 /// many routes that prune dropped.
 fn kinds_after_prune(registry: &ServletRegistry, max_age: Duration) -> Result<(usize, Vec<RouteKind>), ClusterError> {
-	let pruned = registry.prune_stale_relay_trails(max_age)?;
+	let pruned = registry.prune_stale_relay_trails(max_age)?.map_or(0, NonZeroUsize::get);
 	let mut kinds: Vec<RouteKind> = registry.peer_entries()?.iter().map(|entry| entry.route_kind()).collect();
 	kinds.sort_by_key(|kind| match kind {
 		RouteKind::Local => 0,
@@ -1019,7 +1103,7 @@ fn a_refreshed_relay_trail_survives_the_prune() -> Result<(), ClusterError> {
 	registry.reconcile_relay_trail(RelayTrail { order: UnixMillis::new(1), ..refresh }, PeerCaps::default())?;
 
 	let pruned = registry.prune_stale_relay_trails(Duration::from_secs(600))?;
-	assert_eq!(pruned, 0);
+	assert_eq!(pruned, None);
 	Ok(())
 }
 
@@ -1034,8 +1118,8 @@ fn weaken_peer_scores_relay_trails_through_the_peer() -> Result<(), ClusterError
 	let trail = relay_trail(b"origin", b"relay", b"urn:t:a", b"127.0.0.1:9001");
 	registry.reconcile_relay_trail(trail, PeerCaps::default())?;
 
-	assert_eq!(registry.weaken_peer(b"relay")?, 2);
-	assert_eq!(registry.weaken_peer(b"origin")?, 1);
+	assert_eq!(registry.weaken_peer(b"relay")?.count(), 2);
+	assert_eq!(registry.weaken_peer(b"origin")?.count(), 1);
 	Ok(())
 }
 
@@ -1044,6 +1128,7 @@ fn reconcile_peer_slate_refuses_over_gateway_cap() -> Result<(), ClusterError> {
 	let registry = registry();
 	let caps = PeerCaps { max_gateways: 1, ..Default::default() };
 	let first_ad = admitted(b"fp1", b"127.0.0.1:9000", vec![peer_entry(b"a", b"fp1")]);
+
 	registry.reconcile_peer_slate(first_ad, caps)?;
 
 	let second_ad = admitted(b"fp2", b"127.0.0.1:9001", vec![peer_entry(b"a", b"fp2")]);
@@ -1146,9 +1231,7 @@ fn removing_a_hive_leaves_a_peers_routes_under_the_same_bucket() -> Result<(), C
 fn a_peer_may_share_bytes_with_a_local_address() -> Result<(), ClusterError> {
 	let registry = registry();
 	registry.add(named_entry(b"gw", b"calc", b"hive1"))?;
-
 	install_peer_slate(&registry, b"gw", vec![peer_entry(b"calc", b"gw")])?;
-
 	assert_eq!(registry.len()?, 2);
 	Ok(())
 }
@@ -1224,16 +1307,22 @@ fn registry_remove_after_reregistration_clears_entry() -> Result<(), ClusterErro
 	Ok(())
 }
 
+// The sweep drops a local route and a peer route at their limit, and counts
+// the peer route alone.
 #[test]
 fn registry_remove_abandoned_prunes_entries() -> Result<(), ClusterError> {
 	let limit = 2;
 	let registry = registry_abandoning_after(limit);
 	registry.add(test_entry(5000, limit))?;
+	let peer = peer_entry_limit(b"urn:t:a", b"fp-a", limit);
+	let peer_key = Arc::clone(peer.route_key());
+	registry.add(peer)?;
 
 	weaken_times(&registry, b"addr", limit)?;
+	weaken_times(&registry, &peer_key, limit)?;
 
 	let removed = registry.remove_abandoned()?;
-	assert_eq!(removed, 1);
+	assert_eq!(removed, NonZeroUsize::new(1));
 	assert_eq!(registry.len()?, 0);
 	Ok(())
 }
@@ -1246,7 +1335,7 @@ fn weaken_peer_targets_all_routes_of_one_peer() -> Result<(), ClusterError> {
 	registry.add(peer_entry(b"urn:t:a", b"fp-b"))?;
 
 	let weakened = registry.weaken_peer(b"fp-a")?;
-	assert_eq!(weakened, 2);
+	assert_eq!(weakened.count(), 2);
 	Ok(())
 }
 
@@ -1256,7 +1345,7 @@ fn weaken_peer_skips_local_routes() -> Result<(), ClusterError> {
 	registry.add(named_entry(b"addr", b"urn:t:a", b"hive-a"))?;
 
 	let weakened = registry.weaken_peer(b"hive-a")?;
-	assert_eq!(weakened, 0);
+	assert_eq!(weakened.count(), 0);
 	Ok(())
 }
 
@@ -1283,7 +1372,7 @@ fn weaken_peer_skips_already_abandoned_routes() -> Result<(), ClusterError> {
 	weaken_peer_times(&registry, b"fp-a", limit)?;
 
 	let weakened = registry.weaken_peer(b"fp-a")?;
-	assert_eq!(weakened, 0);
+	assert_eq!(weakened.count(), 0);
 	Ok(())
 }
 
@@ -1295,7 +1384,38 @@ fn weaken_peer_by_dial_targets_matching_gateway() -> Result<(), ClusterError> {
 	registry.add(peer_entry_dial(b"urn:t:a", b"fp-b", b"127.0.0.1:9200"))?;
 
 	let weakened = registry.weaken_peer_by_dial(PeerAddress::fixture("127.0.0.1:9100"))?;
-	assert_eq!(weakened, 2);
+	assert_eq!(weakened.count(), 2);
+	Ok(())
+}
+
+// Each weakening counts the routes it reached, and the one that drives them
+// to their limit counts them as abandoned. A weakening past the limit
+// reaches no live route.
+#[test]
+fn weaken_peer_counts_the_routes_it_abandons() -> Result<(), ClusterError> {
+	let limit = 2;
+	let registry = registry();
+	registry.add(peer_entry_limit(b"urn:t:a", b"fp-a", limit))?;
+	registry.add(peer_entry_limit(b"urn:t:b", b"fp-a", limit))?;
+	registry.add(peer_entry_limit(b"urn:t:a", b"fp-b", limit))?;
+
+	let rounds: Vec<(usize, usize)> = (0..3)
+		.map(|_| registry.weaken_peer(b"fp-a"))
+		.map(|weakened| weakened.map(|weakened| (weakened.count(), weakened.abandoned().map_or(0, NonZeroUsize::get))))
+		.collect::<Result<_, _>>()?;
+	assert_eq!(rounds, vec![(2, 0), (2, 2), (0, 0)]);
+	Ok(())
+}
+
+#[test]
+fn weaken_peer_by_dial_counts_the_routes_it_abandons() -> Result<(), ClusterError> {
+	let registry = registry();
+	registry.add(peer_entry_limit(b"urn:t:a", b"fp-a", 1))?;
+	registry.add(peer_entry(b"urn:t:b", b"fp-a"))?;
+
+	let weakened = registry.weaken_peer_by_dial(PeerAddress::fixture("127.0.0.1:9000"))?;
+	assert_eq!(weakened.count(), 2);
+	assert_eq!(weakened.abandoned().map(NonZeroUsize::get), Some(1));
 	Ok(())
 }
 
@@ -1305,7 +1425,7 @@ fn weaken_peer_by_dial_ignores_unknown_gateway() -> Result<(), ClusterError> {
 	registry.add(peer_entry_dial(b"urn:t:a", b"fp-a", b"127.0.0.1:9100"))?;
 
 	let weakened = registry.weaken_peer_by_dial(PeerAddress::fixture("127.0.0.1:9999"))?;
-	assert_eq!(weakened, 0);
+	assert_eq!(weakened.count(), 0);
 	Ok(())
 }
 
@@ -1462,6 +1582,5 @@ fn a_shared_target_of_another_socket_leaves_an_entry_its_own_dial() {
 	let other = DialTarget::of_claimed(admitted_dial(b"127.0.0.1:9001"));
 
 	let entry = ServletEntry::peer_sharing(route, &other, DEFAULT_INITIAL_PHEROMONE, DEFAULT_ABANDONMENT_LIMIT);
-
 	assert_eq!(entry.dial_target().as_bytes(), b"127.0.0.1:9000");
 }

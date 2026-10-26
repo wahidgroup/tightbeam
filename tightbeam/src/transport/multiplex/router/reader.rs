@@ -2,6 +2,7 @@
 //! payloads under granted credit, and buffers control-plane replies so the
 //! read loop keeps running while the writer queue is full.
 
+use core::convert::Infallible;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
@@ -58,6 +59,43 @@ use crate::transport::rekey::{EpochInstall, RekeyDriver, RequestAnswer, ServerAc
 /// - CVE-2019-9512, HTTP/2 Ping Flood: <https://nvd.nist.gov/vuln/detail/CVE-2019-9512>
 const MAX_PENDING_PING_ACKS: usize = 4;
 
+/// Why the reader of a connection stopped, as the label of
+/// `CONNECTION_CLOSED` names it.
+#[cfg(feature = "instrument")]
+enum ReaderEnd {
+	/// The reader refused what the peer sent: a break of the mux grammar, an
+	/// envelope that does not decode, a frame that ends early, or an envelope
+	/// that the read step refuses, which `TRANSPORT_ENVELOPE_REFUSED` names.
+	InvalidMessage,
+	/// The connection ended under the reader, such as a close by the peer, a
+	/// read failure, a stall past the read deadline, or a writer driver that
+	/// is gone.
+	ConnectionClosed,
+}
+
+#[cfg(feature = "instrument")]
+impl ReaderEnd {
+	/// The label that names this end.
+	fn label(&self) -> &'static str {
+		match self {
+			Self::InvalidMessage => "invalid-message",
+			Self::ConnectionClosed => "connection-closed",
+		}
+	}
+}
+
+/// The end of a reader that `error` ended: a refusal of what the peer sent,
+/// by [`TransportError::peer_refusal`], or else a connection that ended.
+#[cfg(feature = "instrument")]
+impl From<&TransportError> for ReaderEnd {
+	fn from(error: &TransportError) -> Self {
+		match error.peer_refusal() {
+			Some(_) => Self::InvalidMessage,
+			None => Self::ConnectionClosed,
+		}
+	}
+}
+
 /// A peer-initiated event that the reader routes to the responder.
 pub enum InboundEvent {
 	/// A unary-kind stream, reassembled into its message frame.
@@ -86,8 +124,8 @@ fn refusal_reason(code: u32) -> GoAwayReason {
 	GoAwayReason::SettlementFailed
 }
 
-/// The receiver-side state of one inbound stream direction: the credit it was
-/// granted, and the bytes it reassembled.
+/// The receiver-side state of one inbound stream direction: the credit this
+/// endpoint granted it, and the bytes it reassembled.
 struct RecvStream {
 	/// The chunks, concatenated in arrival order under the stream and
 	/// connection ceilings. The AEAD channel already proves order and
@@ -146,7 +184,7 @@ where
 	recv_chunk_size: ChunkSize,
 	/// The initial chunk limit granted to each inbound stream direction.
 	initial_recv_credit: u64,
-	/// The credits that the peer may still spend inbound, or `None` when the
+	/// The credits that the peer has left to spend inbound, or `None` when the
 	/// session is unmetered.
 	recv_budget: Option<u64>,
 	/// The reassembly of peer-initiated request streams.
@@ -303,8 +341,12 @@ where
 		self.rekey = Some(driver);
 	}
 
-	/// Runs the driver until the connection ends. Pending streams observe the
-	/// failure.
+	/// Runs the driver until the connection ends, and returns the error that
+	/// ended it.
+	///
+	/// The connection's trail records the end as `CONNECTION_CLOSED`, labelled
+	/// with why the reader stopped. The driver then drops, and its drop fails
+	/// every pending stream and ping.
 	///
 	/// # Errors
 	///
@@ -312,13 +354,37 @@ where
 	///   and the reader queued a best-effort GoAway.
 	/// - [`TransportError::ConnectionClosed`] -- the writer driver is gone.
 	/// - The read or receive-cipher install failure of the [`EnvelopeSource`].
+	/// - The injected error, when the runtime fault model injects a fault at
+	///   the record of the end, in place of the error that ended the reader.
 	pub async fn drive(mut self) -> TransportResult<()> {
-		self.route_envelopes().await
+		let Err(ended) = self.route_envelopes().await;
+
+		#[cfg(feature = "instrument")]
+		self.record_end(&ended)?;
+
+		Err(ended)
+	}
+
+	/// Records the end of this reader on the connection's trail, as
+	/// `CONNECTION_CLOSED`, labelled with why `error` ended it.
+	///
+	/// # Errors
+	///
+	/// - The injected error, when the runtime fault model injects a fault at the record.
+	#[cfg(feature = "instrument")]
+	fn record_end(&self, error: &TransportError) -> TransportResult<()> {
+		let Some(trace) = self.link.shared().trace.as_ref() else {
+			return Ok(());
+		};
+
+		let end = ReaderEnd::from(error);
+		Ok(trace.emit_event_with_evidence(events::CONNECTION_CLOSED, end.label(), None)?)
 	}
 
 	/// Routes inbound envelopes to their pending streams or handlers, and
-	/// interleaves body-drain reports into credit replenishment.
-	async fn route_envelopes(&mut self) -> TransportResult<()> {
+	/// interleaves body-drain reports into credit replenishment, until an
+	/// error ends the connection.
+	async fn route_envelopes(&mut self) -> TransportResult<Infallible> {
 		loop {
 			match self.next_event().await? {
 				ReaderEvent::Envelope(envelope) => {
@@ -819,7 +885,7 @@ where
 		self.evict_credit(stream_id);
 
 		// The sender debited its ledgers for this record whether or not the
-		// stream is still pending, so the reader accounts it either way.
+		// stream is pending, so the reader accounts it either way.
 		if !package.payload().is_empty() {
 			self.charge_inbound_chunk(package.payload())?;
 		}
@@ -907,9 +973,9 @@ where
 			return self.dispatch_request(stream_id, package.payload()).await;
 		}
 
-		// A conforming sender keeps its in-flight opens under the cap it was
-		// advertised, so one more partial stream is a violation and not
-		// backpressure.
+		// A conforming sender keeps its in-flight opens under the cap that this
+		// endpoint advertised, so one more partial stream is a violation and
+		// not backpressure.
 		if self.live_peer_streams() >= cap_as_usize(self.peer_cap) {
 			return Err(self.protocol_violation());
 		}
@@ -984,8 +1050,8 @@ where
 
 	/// Refuses an open past this endpoint's GoAway watermark.
 	///
-	/// The chunk still crossed the wire under the sender's ledgers, so the
-	/// reader debits it inbound.
+	/// The chunk crossed the wire under the sender's ledgers, so the reader
+	/// debits it inbound.
 	fn reject_draining_open(&mut self, stream_id: u32, package: MuxOpenPackage) -> TransportResult<()> {
 		#[cfg(feature = "instrument")]
 		self.link.shared().emit_event(events::MUX_OPEN_DRAINING)?;
@@ -1001,8 +1067,8 @@ where
 		let stream_id = package.stream_id();
 
 		// Empty payloads travel only in trailers. A `last`-flagged empty
-		// record closes a request body whose end was unknown at the final
-		// push (see `RequestSink::close`).
+		// record closes a request body whose final push carried no `last`
+		// flag (see `RequestSink::close`).
 		if package.payload().is_empty() && !package.last() {
 			return Err(self.protocol_violation());
 		}
@@ -1065,8 +1131,8 @@ where
 		}
 
 		let Some(stream) = self.peer_reassembly.remove(&stream_id) else {
-			// A refused or cancelled stream may still flush chunks it had
-			// credit for. A stream beyond the high-water mark never opened.
+			// A refused or cancelled stream may flush the chunks it had credit
+			// for. A stream beyond the high-water mark never opened.
 			if stream_id <= self.link.shared().last_peer_stream_id() {
 				return Ok(());
 			}
@@ -1672,9 +1738,9 @@ mod tests {
 	}
 
 	/// A peer that keeps opening streams into this endpoint's drain, or past
-	/// the cap it was advertised, costs itself nothing per open, so the
-	/// refusals it can buffer while the writer is stalled stop at the fixture's
-	/// peer cap (CWE-770).
+	/// the cap that this endpoint advertised, costs itself nothing per open, so
+	/// the refusals it can buffer while the writer is stalled stop at the
+	/// fixture's peer cap (CWE-770).
 	#[test]
 	fn test_refusal_backlog_is_capped_at_the_peer_cap() {
 		let mut fixture = reader_with_full_queue(Vec::new());
@@ -1720,5 +1786,28 @@ mod tests {
 		let (sender, _ack) = oneshot::channel();
 		let pinged = shared.allocate_ping(sender);
 		assert!(matches!(pinged, Err(TransportError::ConnectionClosed)));
+	}
+
+	// The reader names its end by the error that ended it: a refusal of what
+	// the peer sent, or a connection that ended under the reader.
+	#[cfg(feature = "instrument")]
+	crate::tb_cases! {
+		fn a_reader_end_is_named_by_the_error_that_ended_it((error, label): (TransportError, &str)) {
+			assert_eq!(ReaderEnd::from(&error).label(), label);
+		}
+		cases {
+			broken_grammar => (TransportError::InvalidMessage, "invalid-message"),
+			undecodable_envelope => (crate::der::Error::from(crate::der::ErrorKind::Failed).into(), "invalid-message"),
+			record_out_of_sequence => (crate::transport::TransportFailure::TamperDetected.into(), "invalid-message"),
+			envelope_past_its_ceiling => (
+				TransportError::OperationFailed(crate::transport::TransportFailure::SizeExceeded),
+				"invalid-message"
+			),
+			cleartext_on_an_encrypted_half => (TransportError::MissingEncryption, "invalid-message"),
+			record_on_a_cleartext_half => (crate::transport::TransportFailure::EncryptionFailed.into(), "invalid-message"),
+			record_past_the_volume_bound => (crate::transport::TransportFailure::RekeyRequired.into(), "invalid-message"),
+			closed_by_the_peer => (TransportError::ConnectionClosed, "connection-closed"),
+			stalled_past_the_deadline => (crate::transport::TransportFailure::DeadlineExceeded.into(), "connection-closed"),
+		}
 	}
 }

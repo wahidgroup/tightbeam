@@ -75,6 +75,13 @@ impl From<Piece> for u8 {
 	}
 }
 
+impl From<PieceKind> for u8 {
+	/// The board code of the white piece of `kind`.
+	fn from(kind: PieceKind) -> Self {
+		kind as u8
+	}
+}
+
 // The twelve pieces, one constant for each kind and color.
 pub const WHITE_PAWN: Piece = Piece::as_white(PieceKind::Pawn);
 pub const WHITE_ROOK: Piece = Piece::as_white(PieceKind::Rook);
@@ -103,6 +110,21 @@ pub const QUEEN_DIRECTIONS: &[(i8, i8)] = &[(0, 1), (0, -1), (1, 0), (-1, 0), (1
 pub const KNIGHT_OFFSETS: &[(i8, i8)] = &[(2, 1), (2, -1), (-2, 1), (-2, -1), (1, 2), (1, -2), (-1, 2), (-1, -2)];
 
 impl PieceKind {
+	/// The kinds that a pawn on the last row can become, the queen first.
+	pub const PROMOTIONS: [Self; 4] = [Self::Queen, Self::Rook, Self::Bishop, Self::Knight];
+
+	/// The promotion kind whose white board code is `code`: a rook, a knight,
+	/// a bishop, or a queen. Any other code names no promotion.
+	pub const fn from_promotion_code(code: u8) -> Option<Self> {
+		match code {
+			2 => Some(Self::Rook),
+			3 => Some(Self::Knight),
+			4 => Some(Self::Bishop),
+			5 => Some(Self::Queen),
+			_ => None,
+		}
+	}
+
 	/// The directions of a piece that moves along lines (rook, bishop, queen),
 	/// or `None` for a pawn, a knight, or a king.
 	pub fn as_move_directions(&self) -> Option<&'static [(i8, i8)]> {
@@ -136,6 +158,23 @@ impl PieceKind {
 }
 
 impl Color {
+	/// The row that the king and the rooks of this color start on.
+	pub fn to_back_row(self) -> u8 {
+		match self {
+			Color::White => 0,
+			Color::Black => 7,
+		}
+	}
+
+	/// The row on which a pawn of this color promotes, the back row of the
+	/// other side.
+	pub fn to_promotion_row(self) -> u8 {
+		match self {
+			Color::White => 7,
+			Color::Black => 0,
+		}
+	}
+
 	/// The start row of a pawn of this color.
 	pub fn to_pawn_start_row(self) -> u8 {
 		match self {

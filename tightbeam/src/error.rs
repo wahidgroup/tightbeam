@@ -92,8 +92,8 @@ impl<T> InjectedError for T where T: core::fmt::Debug + core::fmt::Display + Sen
 
 /// The errors collected from one operation.
 ///
-/// Rendering the list is behavior of the collection, so the chain owns it
-/// through its `Display` impl. Every [`TightBeamError`] message therefore
+/// The rendering of the list is behavior of the collection, so the chain owns
+/// it through its `Display` impl. Every [`TightBeamError`] message therefore
 /// stays a single format string.
 #[derive(Debug)]
 pub struct ErrorChain(Vec<TightBeamError>);
@@ -172,8 +172,8 @@ pub enum TightBeamError {
 
 	/// A cluster gateway reported an error.
 	///
-	/// The error is boxed because a cluster error can carry a frame error in
-	/// turn. `From<ClusterError>` boxes a cluster error into this variant.
+	/// `From<ClusterError>` boxes a cluster error into this variant, because a
+	/// cluster error can carry a frame error in turn.
 	#[cfg(feature = "colony")]
 	#[error("Cluster error: {0}")]
 	#[source]
@@ -311,7 +311,7 @@ pub enum TightBeamError {
 	#[source]
 	SpkiError(crate::spki::Error),
 
-	/// Building an X.509 certificate failed.
+	/// The X.509 certificate builder failed.
 	#[cfg(feature = "builder")]
 	#[error("X.509 builder error: {0}")]
 	#[source]
@@ -363,8 +363,7 @@ pub enum TightBeamError {
 	#[error("Missing feature: {0}")]
 	MissingFeature(&'static str),
 
-	/// A message type's marker requires a protection the builder was not
-	/// given.
+	/// A message type's marker requires a protection that the builder lacks.
 	///
 	/// `marker` names the [`Message`](crate::core::Message) constant, and
 	/// `call` names the builder method that satisfies it.
@@ -584,12 +583,14 @@ impl TightBeamError {
 	///   the handler ran up to its failure. A peer reads `Unavailable` as a
 	///   refusal before any handler ran, which a gate answers, and a gateway
 	///   retries such a frame on another instance.
+	/// - A kind or an operation that the endpoint leaves out answers [`TransitStatus::Unimplemented`].
 	/// - Any other failure answers [`TransitStatus::Internal`], so a peer
 	///   tells a failure apart from an accepted empty reply and the failure
 	///   stays attributable.
 	///
 	/// [`TransitStatus::Internal`]: crate::policy::TransitStatus::Internal
 	/// [`TransitStatus::Unavailable`]: crate::policy::TransitStatus::Unavailable
+	/// [`TransitStatus::Unimplemented`]: crate::policy::TransitStatus::Unimplemented
 	/// [`TransitStatus::Unknown`]: crate::policy::TransitStatus::Unknown
 	#[cfg(pooled_mux)]
 	#[must_use]
@@ -603,16 +604,15 @@ impl TightBeamError {
 		error.failure_status()
 	}
 
-	/// Returns the refusal behind every [`MuxService`] default.
+	/// Returns the refusal behind every [`MuxService`] default: the kind or
+	/// the operation that a call names is not served, which a peer reads as
+	/// `Unimplemented`.
 	///
 	/// [`MuxService`]: crate::transport::multiplex::MuxService
 	#[cfg(pooled_mux)]
 	#[must_use]
 	pub(crate) fn unimplemented() -> Self {
-		use crate::policy::TransitStatus;
-		use crate::transport::TransportError;
-
-		TransportError::from(TransitStatus::Unimplemented).into()
+		crate::transport::TransportError::NotServed.into()
 	}
 }
 
@@ -636,8 +636,8 @@ impl From<crate::crypto::sign::SignerError> for TightBeamError {
 	}
 }
 
-// A generic source type cannot go through impl_from!, so the unit-variant
-// conversion is written out.
+// A generic source type cannot go through `impl_from!`, so this impl writes
+// the unit-variant conversion out.
 #[cfg(feature = "std")]
 impl<T> From<std::sync::PoisonError<T>> for TightBeamError {
 	fn from(_: std::sync::PoisonError<T>) -> Self {
@@ -684,7 +684,7 @@ mod tests {
 	}
 
 	/// A protocol error converts into the transport error it names, and the
-	/// crate error carries that conversion rather than a fixed variant.
+	/// crate error carries the converted error.
 	#[cfg(all(feature = "transport", feature = "policy"))]
 	#[test]
 	fn transport_wraps_the_converted_protocol_error() {
@@ -719,7 +719,6 @@ mod tests {
 	crate::tb_cases! {
 		fn failure_status_of((failure, expected): (TightBeamError, TransitStatus)) {
 			let status = failure.failure_status();
-
 			assert_eq!(status, expected);
 		}
 

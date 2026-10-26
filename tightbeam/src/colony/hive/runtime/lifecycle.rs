@@ -10,7 +10,7 @@ use core::pin::Pin;
 use core::str::FromStr;
 use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 
 use crate::colony::hive::runtime::control::{InFlight, Settled};
 use crate::colony::hive::runtime::{ClusterLink, HiveContextImpl, HiveControlCtx, ScalingLoop};
@@ -21,12 +21,13 @@ use crate::colony::protocol::RegisterHiveResponse;
 use crate::colony::urn::ColonyResource;
 use crate::colony::TaskGroup;
 use crate::constants::DEFAULT_MAX_SERVER_CONNECTIONS;
+use crate::instrumentation::events::HIVE_ESTABLISHED;
 use crate::macros::server::AcceptedConnection;
 use crate::policy::TransitStatus;
 use crate::runtime::rt;
 use crate::trace::TraceCollector;
 use crate::transport::accept::AcceptPlane;
-use crate::transport::client::{ConnectionBuilder, ConnectionPool};
+use crate::transport::client::{ConnectionBuilder, ConnectionPool, ConnectionPoolBuilder};
 use crate::transport::handshake::HandshakeProvider;
 use crate::transport::multiplex::{MuxCapable, MuxConnector};
 use crate::transport::policy::PolicyConfig;
@@ -67,7 +68,7 @@ enum Lifecycle<P: Protocol> {
 }
 
 impl<P: Protocol> Lifecycle<P> {
-	/// The control plane, for a hive that established one.
+	/// Returns the control plane, for a hive that established one.
 	fn control(&self) -> Option<&ControlPlane<P>> {
 		match self {
 			Self::Established { control } => control.as_ref(),
@@ -75,7 +76,7 @@ impl<P: Protocol> Lifecycle<P> {
 		}
 	}
 
-	/// Whether servlet registration is still open.
+	/// Whether servlet registration is open.
 	fn is_provisional(&self) -> bool {
 		matches!(self, Self::Provisional)
 	}
@@ -118,12 +119,11 @@ pub struct HiveRuntime<P: Protocol> {
 	config: HiveConfig,
 	trace: Arc<TraceCollector>,
 	lifecycle: Lifecycle<P>,
-	/// Every background task this runtime started.
+	/// Every background task that this runtime starts.
 	tasks: TaskGroup,
 	utilization: Arc<AtomicU16>,
-	utilization_map: Arc<Mutex<HashMap<Vec<u8>, u16>>>,
 	drain: DrainMode,
-	/// Commands in flight, which a drain waits to reach zero.
+	/// The count of commands in flight, which a drain waits to see at zero.
 	in_flight: InFlight,
 	cluster_addrs: Arc<RwLock<Vec<P::Address>>>,
 	hive_context: Arc<HiveContextImpl<P>>,
@@ -163,6 +163,46 @@ impl<P: Protocol> HiveRuntime<P> {
 		}
 	}
 
+	/// Builds the pool the hive's servlets call their siblings on, which reads
+	/// `config` and records its dials and the sessions they open into `trace`.
+	///
+	/// # Warning
+	///
+	/// The trace holds the session of each sibling dial, a session that the
+	/// sibling fails included. The default `BoundedMemorySink` drops each
+	/// event past `max_events`, the hive's own included, so a long-lived hive
+	/// needs an `EventSink` that forwards each event, or a reader that drains
+	/// the trace.
+	// The `instrument` build alone attaches a trace to a pool, so that build
+	// alone reads `trace`.
+	#[cfg_attr(not(feature = "instrument"), allow(unused_variables))]
+	fn servlet_pool(config: &HiveConfig, trace: &TraceCollector) -> Arc<ConnectionPool<P>> {
+		let builder = ConnectionPoolBuilder::new(config.pool.clone(), Arc::clone(&config.clock));
+		#[cfg(feature = "instrument")]
+		let builder = builder.with_trace(trace.share());
+		Arc::new(config.sibling_dials(builder).build())
+	}
+
+	/// Records [`HIVE_ESTABLISHED`] on `trace` for a hive of `servlet_count`
+	/// servlets that serves its control plane at `control_addr`, or serves
+	/// none.
+	///
+	/// # Errors
+	///
+	/// - The injected error, when the runtime fault model injects a fault at the event.
+	fn record_established(
+		trace: &TraceCollector,
+		servlet_count: usize,
+		control_addr: Option<P::Address>,
+	) -> Result<(), TightBeamError> {
+		let label = match control_addr {
+			Some(_) => "control-plane",
+			None => "no-control-plane",
+		};
+		let evidence = move || -> Option<Vec<u8>> { control_addr.map(Into::into) };
+		trace.emit_event_with_value_and_rendered_evidence(HIVE_ESTABLISHED, label, servlet_count, evidence)
+	}
+
 	/// The control plane's one admission gate, which trusts `store` and reads
 	/// the hive clock.
 	fn security_gate(&self, store: &Arc<dyn CertificateTrust>) -> ClusterSecurityGate {
@@ -183,10 +223,10 @@ where
 	P::Address: Clone + Copy + Send + Sync + 'static,
 	P::Stream: Send + 'static,
 	P::Error: Send + 'static,
-	P::Transport: MessageEmitter + Send + 'static,
+	P::Transport: MessageEmitter + MuxCapable + EncryptedProtocolState + Send + 'static,
 	TightBeamError: From<P::Error>,
 {
-	/// Binds this hive's slate, gateways, address, and configuration.
+	/// Binds this hive's slate, gateways, address, configuration, and trace.
 	///
 	/// It returns [`None`] for a hive with no control plane, which has no
 	/// address to register and which no cluster can reach.
@@ -198,6 +238,7 @@ where
 			Arc::clone(&self.cluster_addrs),
 			addr,
 			Arc::new(self.config.clone()),
+			Arc::clone(&self.trace),
 		))
 	}
 
@@ -239,23 +280,18 @@ where
 
 	fn new(config: Option<HiveConfig>) -> Result<Self, TightBeamError> {
 		let config = config.unwrap_or_default();
-		let pool_builder = ConnectionPool::<P>::builder()
-			.with_config(config.pool.clone())
-			.with_clock(Arc::clone(&config.clock));
-
-		let pool_builder = config.sibling_dials(pool_builder);
-		let servlet_pool = Arc::new(pool_builder.build());
-		let hive_context = Arc::new(HiveContextImpl::new(servlet_pool));
+		let trace = Arc::new(TraceCollector::default());
+		let servlet_pool = Self::servlet_pool(&config, &trace);
+		let hive_context = Arc::new(HiveContextImpl::new(servlet_pool).with_trace(Arc::clone(&trace)));
 
 		Ok(Self {
 			servlets: Arc::new(HashMapRegistry::default()),
 			spawners: Arc::new(HashMap::new()),
 			config,
-			trace: Arc::new(TraceCollector::default()),
+			trace,
 			lifecycle: Lifecycle::Provisional,
 			tasks: TaskGroup::default(),
 			utilization: Arc::new(AtomicU16::new(0)),
-			utilization_map: Arc::new(Mutex::new(HashMap::new())),
 			drain: DrainMode::default(),
 			in_flight: InFlight::default(),
 			cluster_addrs: Arc::new(RwLock::new(Vec::new())),
@@ -308,23 +344,33 @@ where
 			return Err(TightBeamError::AlreadyEstablished);
 		}
 
+		// 1. Bind the control plane, for a hive with an identity to present.
+		let bound = Self::bind_control_listener(&self.config).await?;
+		let hive_addr = bound.as_ref().map(|(_, addr)| *addr);
+
+		// 2. Record the establish ahead of every step that the hive cannot
+		//    undo, so a trace that refuses the event drops the bound listener
+		//    and leaves the hive provisional.
+		Self::record_established(&trace, self.servlets.count(), hive_addr)?;
+
+		// 3. The pool and the refused dials record into the trace of the hive
+		//    that builds the pool, so the established hive dials its servlets
+		//    on a plane of its own trace.
+		let servlet_pool = Self::servlet_pool(&self.config, &trace);
+		self.hive_context.establish_plane(servlet_pool, Arc::clone(&trace))?;
+
 		self.trace = trace;
 		self.spawners = Arc::new(self.servlets.spawners());
-
 		self.hive_context.seed_routes(&self.servlets);
 
-		let control = match Self::bind_control_listener(&self.config).await? {
-			Some((listener, addr)) => {
-				let mux_offer = self.config.pool.mux_offer.as_ref().map(Arc::clone);
-				let plane = AcceptPlane::new(DEFAULT_MAX_SERVER_CONNECTIONS, Arc::clone(&self.config.clock));
-				let handle = self.build_control_ctx().serve(listener, plane, mux_offer);
+		// 4. Serve the control plane, and commit the lifecycle.
+		let control = bound.map(|(listener, addr)| {
+			let mux_offer = self.config.pool.mux_offer.as_ref().map(Arc::clone);
+			let plane = AcceptPlane::new(DEFAULT_MAX_SERVER_CONNECTIONS, Arc::clone(&self.config.clock));
+			let handle = self.build_control_ctx().serve(listener, plane, mux_offer);
 
-				Some(ControlPlane { handle, addr })
-			}
-			None => None,
-		};
-
-		let hive_addr = control.as_ref().map(|plane| plane.addr);
+			ControlPlane { handle, addr }
+		});
 		self.lifecycle = Lifecycle::Established { control };
 
 		self.tasks.adopt(
@@ -333,7 +379,6 @@ where
 				spawners: Arc::clone(&self.spawners),
 				trace: Arc::clone(&self.trace),
 				utilization: Arc::clone(&self.utilization),
-				utilization_map: Arc::clone(&self.utilization_map),
 				cluster_addrs: Arc::clone(&self.cluster_addrs),
 				hive_context: Arc::clone(&self.hive_context),
 				hive_addr,
@@ -343,10 +388,10 @@ where
 			.spawn(),
 		);
 
-		// Gateway registries are soft state, so the hive re-announces its slate
-		// each interval. A hive with no control plane has nothing to announce.
+		// Gateway registries are soft state, so a hive with a control plane
+		// re-announces its slate each interval.
 		if let Some(link) = self.cluster_link() {
-			self.tasks.adopt(link.spawn_reregister(Arc::clone(&self.trace)));
+			self.tasks.adopt(link.spawn_reregister());
 		}
 
 		Ok(())

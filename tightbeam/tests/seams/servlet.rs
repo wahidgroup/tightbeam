@@ -39,8 +39,6 @@ use crate::common::security::{random_signing_key, test_certificate};
 use crate::common::x509::GatewayCerts;
 
 const OUTSIDE_SERVLET_RAN: Urn<'static> = tightbeam::urn!("test", "event:seams/outside-servlet-ran");
-const OUTSIDE_WORK_ECHOED: Urn<'static> = tightbeam::urn!("test", "event:seams/outside-work-echoed");
-const OUTSIDE_WORK_REFUSED: Urn<'static> = tightbeam::urn!("test", "event:seams/outside-work-refused");
 
 /// The content the client's work frame carries and the servlet echoes.
 const OUTSIDE_CONTENT: &str = "routed to an outside box";
@@ -66,7 +64,7 @@ cluster! {
 	protocol: TokioListener
 }
 
-/// A [`ServletBox`] an outside crate writes: it holds a running servlet, and
+/// A [`ServletBox`] an outside crate writes: it holds a live servlet, and
 /// its registration names `signer` as the identity that servlet answers
 /// under.
 struct OutsideServlet {
@@ -188,7 +186,6 @@ tb_assert_spec! {
 		mode: Accept,
 		assertions: [
 			(OUTSIDE_SERVLET_RAN, exactly!(1)),
-			(OUTSIDE_WORK_ECHOED, exactly!(1), equals!(true)),
 			(events::CLUSTER_DIAL_REFUSED, exactly!(0))
 		]
 	}
@@ -205,11 +202,11 @@ tb_scenario! {
 			SeamCluster::start(Arc::new(trace.share()), seam_cluster_conf(&certs)).await
 		},
 		hives: |SetupEnv { trace, context: certs }| vec![start_hive_naming_its_signer(trace, certs)],
-		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+		client: |ClusterEnv { context: certs, cluster, .. }| async move {
 			let echoed = submit_echo(&certs, cluster.addr()).await?;
 
 			let content: TestMessage = decode(echoed.message())?;
-			trace.event_with(OUTSIDE_WORK_ECHOED, &[], content.content == OUTSIDE_CONTENT)?;
+			assert_eq!(content.content, OUTSIDE_CONTENT, "the routed work echoes");
 
 			cluster.stop();
 			Ok(())
@@ -223,15 +220,15 @@ tb_assert_spec! {
 		mode: Accept,
 		assertions: [
 			(OUTSIDE_SERVLET_RAN, exactly!(0)),
-			(OUTSIDE_WORK_REFUSED, exactly!(1), equals!(true)),
-			(events::CLUSTER_DIAL_REFUSED, exactly!(1))
+			(events::CLUSTER_DIAL_REFUSED, exactly!(1)),
+			(events::CLUSTER_WORK_FAILED, exactly!(1))
 		]
 	}
 }
 
-// The gateway's dial refuses an outside box whose registration names another
-// signer than the one its servlet answers under, before the frame leaves, and
-// the client hears that no instance was available.
+// The gateway's dial refuses an outside box whose registration names a signer
+// other than the one its servlet answers under, before the frame leaves, and
+// the client hears that no instance is available.
 tb_scenario! {
 	name: an_outside_servlet_box_that_names_another_signer_is_refused,
 	spec: OutsideServletRefusedSpec,
@@ -241,11 +238,11 @@ tb_scenario! {
 			SeamCluster::start(Arc::new(trace.share()), seam_cluster_conf(&certs)).await
 		},
 		hives: |SetupEnv { trace, context: certs }| vec![start_hive_naming_a_stranger(trace, certs)],
-		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+		client: |ClusterEnv { context: certs, cluster, .. }| async move {
 			let refused = submit_echo(&certs, cluster.addr()).await;
 
 			let unavailable = matches!(refused, Err(TightBeamError::WorkRefused(TransitStatus::Unavailable)));
-			trace.event_with(OUTSIDE_WORK_REFUSED, &[], unavailable)?;
+			assert!(unavailable, "the client hears that no instance was available");
 
 			cluster.stop();
 			Ok(())

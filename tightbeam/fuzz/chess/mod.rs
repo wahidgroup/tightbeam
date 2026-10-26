@@ -233,7 +233,8 @@ tb_scenario! {
 				// The next 4 input bytes give the move.
 				let move_req = match (oracle.fuzz_u8(), oracle.fuzz_u8(), oracle.fuzz_u8(), oracle.fuzz_u8()) {
 					(Ok(fr), Ok(fc), Ok(tr), Ok(tc)) => {
-						// The bytes name the from and to squares.
+						// The bytes name the from and to squares, and the high
+						// bits of the third byte name a promotion piece.
 						ChessMove::from((fr, fc, tr, tc)).to_request()
 					},
 					// A short read gives the synthetic move of zeros.
@@ -296,7 +297,7 @@ tb_scenario! {
 				// client keeps its own move tracking.
 				if let Some(asn1_matrix) = response_frame.metadata().matrix() {
 					if client_game_state.update_board_from_matrix(asn1_matrix).is_err() {
-						// A malformed matrix leaves the board as it was.
+						// A malformed matrix leaves the board unchanged.
 					}
 				}
 
@@ -315,7 +316,7 @@ tb_scenario! {
 						order += 2; // The client move and the server move.
 					}
 					GameStatusCode::Checkmate | GameStatusCode::Stalemate => {
-						// A game-ending response still validated the move.
+						// A game-ending response also validates the move.
 						trace.event(events::CLIENT_MOVE_VALIDATED)?;
 						trace.event(events::CLIENT_SERVER_MOVE)?;
 						stats.move_validated_count += 1;

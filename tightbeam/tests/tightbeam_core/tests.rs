@@ -1,8 +1,8 @@
-//! Integration tests for TightBeam protocol workflows.
+//! The integration tests of TightBeam protocol workflows.
 //! TODO Enhance with instrumentation when available.
 //!
-//! Scenarios are defined declaratively so that each protocol version is
-//! validated with the metadata it permits (and rejects).
+//! Each protocol version builds a frame with the metadata that it permits, and
+//! each test checks one property of those frames against its version.
 
 #![allow(unexpected_cfgs)]
 
@@ -14,28 +14,12 @@ use tightbeam::crypto::key::Aes256GcmKeyProvider;
 use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
 use tightbeam::crypto::x509::{KeyPurposes, PeerCertificate, Signing};
-use tightbeam::der::ValueOrd;
 use tightbeam::prelude::*;
-use tightbeam::testing::assertions::Presence;
-use tightbeam::testing::macros::{IsNone, IsSome};
-use tightbeam::testing::{ScenarioConfig, SetupEnv, TestCertificate, TestFrame, TestIdentity};
-use tightbeam::urn::Urn;
+use tightbeam::testing::{TestCertificate, TestFrame, TestIdentity};
 use tightbeam::utils;
-use tightbeam::{exactly, tb_assert_spec, tb_scenario, TightBeamError};
+use tightbeam::{tb_cases, TightBeamError};
 
-pub(crate) const CONFIDENTIALITY: Urn<'static> = tightbeam::urn!("test", "event:tightbeam-core-tests/confidentiality");
-pub(crate) const INTEGRITY: Urn<'static> = tightbeam::urn!("test", "event:tightbeam-core-tests/integrity");
-pub(crate) const INTEGRITY_OK: Urn<'static> = tightbeam::urn!("test", "event:tightbeam-core-tests/integrity-ok");
-pub(crate) const LIFETIME: Urn<'static> = tightbeam::urn!("test", "event:tightbeam-core-tests/lifetime");
-pub(crate) const MATRIX: Urn<'static> = tightbeam::urn!("test", "event:tightbeam-core-tests/matrix");
-pub(crate) const NONREPUDIATION: Urn<'static> = tightbeam::urn!("test", "event:tightbeam-core-tests/nonrepudiation");
-pub(crate) const PREVIOUS_FRAME: Urn<'static> = tightbeam::urn!("test", "event:tightbeam-core-tests/previous-frame");
-pub(crate) const PRIORITY: Urn<'static> = tightbeam::urn!("test", "event:tightbeam-core-tests/priority");
-pub(crate) const ROUNDTRIP_OK: Urn<'static> = tightbeam::urn!("test", "event:tightbeam-core-tests/roundtrip-ok");
-pub(crate) const SIG_VALID: Urn<'static> = tightbeam::urn!("test", "event:tightbeam-core-tests/sig-valid");
-pub(crate) const VERSION: Urn<'static> = tightbeam::urn!("test", "event:tightbeam-core-tests/version");
-
-/// Simple test message
+/// The test message, which carries one string of content.
 #[derive(tightbeam::Beamable, Clone, Debug, PartialEq, Sequence)]
 struct TestMessage {
 	content: String,
@@ -47,7 +31,7 @@ impl AsRef<[u8]> for TestMessage {
 	}
 }
 
-/// Custom test matrix for message metadata
+/// The development-mode flag of the custom test matrix of message metadata.
 #[derive(tightbeam::Flaggable)]
 #[repr(u8)]
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,7 +41,7 @@ enum FlagTestDevelopmentMode {
 	IsMaintenanceMode = 2,
 }
 
-/// Custom test matrix for message metadata
+/// The debug-level flag of the custom test matrix of message metadata.
 #[derive(tightbeam::Flaggable)]
 #[repr(u8)]
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,7 +51,7 @@ enum FlagTestDebugLevel {
 	Basic = 1,
 }
 
-// Define the flag set with automatic position assignment
+// The flag set of both flags, whose positions the macro assigns.
 tightbeam::flagset!(TestFlagSet: FlagTestDevelopmentMode, FlagTestDebugLevel);
 
 struct TestCrypto {
@@ -84,17 +68,19 @@ fn build_crypto(seed: u8) -> Result<TestCrypto, TightBeamError> {
 	Ok(TestCrypto { cipher, signing_key, signer })
 }
 
-/// Build a test frame for the given version with appropriate capabilities
-fn build_version_frame(
-	version: asn1::Version,
-	message: &TestMessage,
-	crypto: &TestCrypto,
-	message_hash: &tightbeam::DigestInfo,
-) -> Result<tightbeam::Frame, TightBeamError> {
+/// The message that every frame of these tests carries.
+fn sample_message() -> TestMessage {
+	TestMessage { content: "Hello from workflow".to_string() }
+}
+
+/// Builds a test frame of `version` with each capability the version permits.
+fn build_version_frame(version: asn1::Version, crypto: &TestCrypto) -> Result<tightbeam::Frame, TightBeamError> {
+	let message = sample_message();
+	let parent_hash = utils::digest::<Sha3_256>(&message)?;
 	let mut builder = FrameBuilder::from(version)
 		.with_id("test")
 		.with_order(1_696_521_700)
-		.with_message(message.to_owned());
+		.with_message(message);
 
 	if version >= asn1::Version::V1 {
 		builder = builder
@@ -106,7 +92,7 @@ fn build_version_frame(
 		builder = builder
 			.with_priority(asn1::MessagePriority::Expedited)
 			.with_lifetime(3_600)
-			.with_previous_hash(message_hash.to_owned());
+			.with_previous_hash(parent_hash);
 	}
 	if version == asn1::Version::V3 {
 		builder = builder.with_matrix(tightbeam::flags![
@@ -119,144 +105,156 @@ fn build_version_frame(
 	builder.build()
 }
 
-tb_assert_spec! {
-	pub VersionSpec,
-	V(0,0,0): {
-		mode: Accept,
-		tag_filter: ["v0"],
-		assertions: [
-			(ROUNDTRIP_OK, exactly!(1), equals!(true)),
-			(NONREPUDIATION, exactly!(1), equals!(IsNone)),
-			(INTEGRITY, exactly!(1), equals!(IsNone)),
-			(CONFIDENTIALITY, exactly!(1), equals!(IsNone)),
-			(PRIORITY, exactly!(1), equals!(IsNone)),
-			(LIFETIME, exactly!(1), equals!(IsNone)),
-			(PREVIOUS_FRAME, exactly!(1), equals!(IsNone)),
-			(MATRIX, exactly!(1), equals!(IsNone)),
-			(VERSION, exactly!(1), equals!(asn1::Version::V0))
-		]
-	},
-	V(1,0,0): {
-		mode: Accept,
-		tag_filter: ["v1"],
-		assertions: [
-			(ROUNDTRIP_OK, exactly!(1), equals!(true)),
-			(SIG_VALID, exactly!(1), equals!(true)),
-			(INTEGRITY_OK, exactly!(1), equals!(true)),
-			(CONFIDENTIALITY, exactly!(1), equals!(IsSome)),
-			(PRIORITY, exactly!(1), equals!(IsNone)),
-			(LIFETIME, exactly!(1), equals!(IsNone)),
-			(PREVIOUS_FRAME, exactly!(1), equals!(IsNone)),
-			(MATRIX, exactly!(1), equals!(IsNone)),
-			(VERSION, exactly!(1), equals!(asn1::Version::V1))
-		]
-	},
-	V(2,0,0): {
-		mode: Accept,
-		tag_filter: ["v2"],
-		assertions: [
-			(ROUNDTRIP_OK, exactly!(1), equals!(true)),
-			(SIG_VALID, exactly!(1), equals!(true)),
-			(INTEGRITY_OK, exactly!(1), equals!(true)),
-			(CONFIDENTIALITY, exactly!(1), equals!(IsSome)),
-			(PRIORITY, exactly!(1), equals!(Some(asn1::MessagePriority::Expedited))),
-			(LIFETIME, exactly!(1), equals!(Some(3_600u64))),
-			(PREVIOUS_FRAME, exactly!(1), equals!(IsSome)),
-			(MATRIX, exactly!(1), equals!(IsNone)),
-			(VERSION, exactly!(1), equals!(asn1::Version::V2))
-		]
-	},
-	V(3,0,0): {
-		mode: Accept,
-		tag_filter: ["v3"],
-		assertions: [
-			(ROUNDTRIP_OK, exactly!(1), equals!(true)),
-			(SIG_VALID, exactly!(1), equals!(true)),
-			(INTEGRITY_OK, exactly!(1), equals!(true)),
-			(CONFIDENTIALITY, exactly!(1), equals!(IsSome)),
-			(PRIORITY, exactly!(1), equals!(Some(asn1::MessagePriority::Expedited))),
-			(LIFETIME, exactly!(1), equals!(Some(3_600u64))),
-			(PREVIOUS_FRAME, exactly!(1), equals!(IsSome)),
-			(MATRIX, exactly!(1), equals!(IsSome)),
-			(VERSION, exactly!(1), equals!(asn1::Version::V3))
-		]
+/// The fields of a frame that its version gates, each read as its presence or
+/// its value.
+#[derive(Debug, PartialEq)]
+struct GatedFields {
+	version: asn1::Version,
+	signed: bool,
+	frame_integrity: bool,
+	message_integrity: bool,
+	confidential: bool,
+	priority: Option<asn1::MessagePriority>,
+	lifetime: Option<u64>,
+	chained: bool,
+	matrix: bool,
+}
+
+impl GatedFields {
+	/// The gated fields that `frame` carries.
+	fn of(frame: &tightbeam::Frame) -> Self {
+		let metadata = frame.metadata();
+		Self {
+			version: frame.version(),
+			signed: frame.nonrepudiation().is_some(),
+			frame_integrity: frame.integrity().is_some(),
+			message_integrity: metadata.integrity().is_some(),
+			confidential: metadata.confidentiality().is_some(),
+			priority: metadata.priority(),
+			lifetime: metadata.lifetime(),
+			chained: metadata.previous_frame().is_some(),
+			matrix: metadata.matrix().is_some(),
+		}
 	}
 }
 
-tb_scenario! {
-	name: version_check_all,
-	config: ScenarioConfig::builder()
-		.with_specs(vec![
-			VersionSpec::get(0, 0, 0).expect("VersionSpec 0.0.0"),
-			VersionSpec::get(1, 0, 0).expect("VersionSpec 1.0.0"),
-			VersionSpec::get(2, 0, 0).expect("VersionSpec 2.0.0"),
-			VersionSpec::get(3, 0, 0).expect("VersionSpec 3.0.0")
-		])
-		.build(),
-	environment Bare {
-		exec: |SetupEnv { trace, .. }| {
-			let message = TestMessage { content: "Hello from workflow".to_string() };
-			let crypto = build_crypto(0x44)?;
-			let message_hash = utils::digest::<Sha3_256>(&message)?;
+// Each version carries the fields that it permits and that these tests ask
+// for, and no field that it forbids.
+tb_cases! {
+	fn a_frame_carries_the_fields_its_version_permits(permitted: GatedFields) -> Result<(), TightBeamError> {
+		let crypto = build_crypto(0x44)?;
+		let frame = build_version_frame(permitted.version, &crypto)?;
+		assert_eq!(GatedFields::of(&frame), permitted, "the frame carries other fields than its version permits");
+		Ok(())
+	}
+	cases {
+		v0 => GatedFields {
+			version: asn1::Version::V0,
+			signed: false,
+			frame_integrity: false,
+			message_integrity: false,
+			confidential: false,
+			priority: None,
+			lifetime: None,
+			chained: false,
+			matrix: false,
+		},
+		v1 => GatedFields {
+			version: asn1::Version::V1,
+			signed: true,
+			frame_integrity: false,
+			message_integrity: true,
+			confidential: true,
+			priority: None,
+			lifetime: None,
+			chained: false,
+			matrix: false,
+		},
+		v2 => GatedFields {
+			version: asn1::Version::V2,
+			signed: true,
+			frame_integrity: false,
+			message_integrity: true,
+			confidential: true,
+			priority: Some(asn1::MessagePriority::Expedited),
+			lifetime: Some(3_600),
+			chained: true,
+			matrix: false,
+		},
+		v3 => GatedFields {
+			version: asn1::Version::V3,
+			signed: true,
+			frame_integrity: false,
+			message_integrity: true,
+			confidential: true,
+			priority: Some(asn1::MessagePriority::Expedited),
+			lifetime: Some(3_600),
+			chained: true,
+			matrix: true,
+		},
+	}
+}
 
-			// Build frames for each version
-			let v0_frame = build_version_frame(asn1::Version::V0, &message, &crypto, &message_hash)?;
-			let v1_frame = build_version_frame(asn1::Version::V1, &message, &crypto, &message_hash)?;
-			let v2_frame = build_version_frame(asn1::Version::V2, &message, &crypto, &message_hash)?;
-			let v3_frame = build_version_frame(asn1::Version::V3, &message, &crypto, &message_hash)?;
+/// A V0 body is cleartext, so it decodes to the message as it stands.
+#[test]
+fn a_v0_body_decodes_to_the_message() -> Result<(), TightBeamError> {
+	let crypto = build_crypto(0x44)?;
+	let frame = build_version_frame(asn1::Version::V0, &crypto)?;
 
-			// Roundtrip checks
-			let v0_roundtrip: TestMessage = tightbeam::decode(v0_frame.message())?;
-			trace.event_with(ROUNDTRIP_OK, &["v0"], v0_roundtrip == message)?;
+	let roundtrip: TestMessage = tightbeam::decode(frame.message())?;
+	assert_eq!(roundtrip, sample_message(), "the V0 body decodes to another message");
+	Ok(())
+}
 
-			// V1+ signature checks (before decrypt, which consumes the frame)
-			trace.event_with(SIG_VALID, &["v1"], v1_frame.verify(&crypto.signer).is_ok())?;
-			trace.event_with(SIG_VALID, &["v2"], v2_frame.verify(&crypto.signer).is_ok())?;
-			trace.event_with(SIG_VALID, &["v3"], v3_frame.verify(&crypto.signer).is_ok())?;
+// A V1 or later frame verifies under the certificate of its signer.
+tb_cases! {
+	fn a_signed_frame_verifies_under_its_signer(version: asn1::Version) -> Result<(), TightBeamError> {
+		let crypto = build_crypto(0x44)?;
+		let frame = build_version_frame(version, &crypto)?;
 
-			// V1+ integrity checks (before decrypt)
-			let v1_integrity = v1_frame.metadata().integrity().ok_or(TightBeamError::MissingDigestInfo)?;
-			let v2_integrity = v2_frame.metadata().integrity().ok_or(TightBeamError::MissingDigestInfo)?;
-			let v3_integrity = v3_frame.metadata().integrity().ok_or(TightBeamError::MissingDigestInfo)?;
-			trace.event_with(INTEGRITY_OK, &["v1"], v1_integrity.value_cmp(&message_hash).is_ok())?;
-			trace.event_with(INTEGRITY_OK, &["v2"], v2_integrity.value_cmp(&message_hash).is_ok())?;
-			trace.event_with(INTEGRITY_OK, &["v3"], v3_integrity.value_cmp(&message_hash).is_ok())?;
+		let verdict = frame.verify(&crypto.signer);
+		assert!(verdict.is_ok(), "the signature does not verify under its signer: {verdict:?}");
+		Ok(())
+	}
+	cases {
+		v1 => asn1::Version::V1,
+		v2 => asn1::Version::V2,
+		v3 => asn1::Version::V3,
+	}
+}
 
-			// Frame-level fields (before decrypt)
-			trace.event_with(NONREPUDIATION, &["v0"], Presence::of_option(&v0_frame.nonrepudiation()))?;
-			trace.event_with(NONREPUDIATION, &["v1", "v2", "v3"], Presence::of_option(&v1_frame.nonrepudiation()))?;
-			trace.event_with(INTEGRITY, &["v0"], Presence::of_option(&v0_frame.integrity()))?;
-			trace.event_with(INTEGRITY, &["v1", "v2", "v3"], Presence::of_option(&v1_frame.integrity()))?;
+// The message integrity commitment of a V1 or later frame opens to the message
+// it carries.
+tb_cases! {
+	fn the_message_commitment_opens_to_the_message(version: asn1::Version) -> Result<(), TightBeamError> {
+		let crypto = build_crypto(0x44)?;
+		let frame = build_version_frame(version, &crypto)?;
 
-			// Metadata fields (before decrypt)
-			trace.event_with(CONFIDENTIALITY, &["v0"], Presence::of_option(&v0_frame.metadata().confidentiality()))?;
-			trace.event_with(CONFIDENTIALITY, &["v1", "v2", "v3"], Presence::of_option(&v1_frame.metadata().confidentiality()))?;
-			trace.event_with(PRIORITY, &["v0", "v1"], v0_frame.metadata().priority())?;
-			trace.event_with(PRIORITY, &["v2"], v2_frame.metadata().priority())?;
-			trace.event_with(PRIORITY, &["v3"], v3_frame.metadata().priority())?;
-			trace.event_with(LIFETIME, &["v0", "v1"], v0_frame.metadata().lifetime())?;
-			trace.event_with(LIFETIME, &["v2"], v2_frame.metadata().lifetime())?;
-			trace.event_with(LIFETIME, &["v3"], v3_frame.metadata().lifetime())?;
-			trace.event_with(PREVIOUS_FRAME, &["v0", "v1"], Presence::of_option(&v0_frame.metadata().previous_frame()))?;
-			trace.event_with(PREVIOUS_FRAME, &["v2", "v3"], Presence::of_option(&v2_frame.metadata().previous_frame()))?;
-			trace.event_with(MATRIX, &["v0", "v1", "v2"], Presence::of_option(&v0_frame.metadata().matrix()))?;
-			trace.event_with(MATRIX, &["v3"], Presence::of_option(&v3_frame.metadata().matrix()))?;
+		let opens = frame.verify_commitment_of::<Sha3_256, _>(&sample_message(), [])?;
+		assert!(opens, "the message commitment does not open to the message");
+		Ok(())
+	}
+	cases {
+		v1 => asn1::Version::V1,
+		v2 => asn1::Version::V2,
+		v3 => asn1::Version::V3,
+	}
+}
 
-			// Version checks - each version is unique (before decrypt)
-			trace.event_with(VERSION, &["v0"], v0_frame.version())?;
-			trace.event_with(VERSION, &["v1"], v1_frame.version())?;
-			trace.event_with(VERSION, &["v2"], v2_frame.version())?;
-			trace.event_with(VERSION, &["v3"], v3_frame.version())?;
+// The body of a V1 or later frame is enveloped, and it decrypts to the message
+// under the shared cipher.
+tb_cases! {
+	fn an_enveloped_body_decrypts_to_the_message(version: asn1::Version) -> Result<(), TightBeamError> {
+		let crypto = build_crypto(0x44)?;
+		let frame = build_version_frame(version, &crypto)?;
 
-			// Decrypt (consumes frames, so must be last)
-			let v1_roundtrip = TestFrame::decrypted::<TestMessage>(v1_frame, &crypto.cipher, None)?;
-			let v2_roundtrip = TestFrame::decrypted::<TestMessage>(v2_frame, &crypto.cipher, None)?;
-			let v3_roundtrip = TestFrame::decrypted::<TestMessage>(v3_frame, &crypto.cipher, None)?;
-			trace.event_with(ROUNDTRIP_OK, &["v1"], v1_roundtrip == message)?;
-			trace.event_with(ROUNDTRIP_OK, &["v2"], v2_roundtrip == message)?;
-			trace.event_with(ROUNDTRIP_OK, &["v3"], v3_roundtrip == message)?;
-
-			Ok(())
-		}
+		let roundtrip = TestFrame::decrypted::<TestMessage>(frame, &crypto.cipher, None)?;
+		assert_eq!(roundtrip, sample_message(), "the body decrypts to another message");
+		Ok(())
+	}
+	cases {
+		v1 => asn1::Version::V1,
+		v2 => asn1::Version::V2,
+		v3 => asn1::Version::V3,
 	}
 }

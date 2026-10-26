@@ -23,23 +23,23 @@ pub(crate) const fn assert_wire_dimension<const N: usize>() {
 	assert!(N >= 1 && N <= 255, "a wire dimension must be 1..=255");
 }
 
-/// Common interface for row-major N×N flag matrices with `u8` cells.
+/// The common interface of row-major N×N flag matrices with `u8` cells.
 pub trait MatrixLike {
-	/// Return the dimension `N` of the N×N matrix.
+	/// Returns the dimension `N` of the N×N matrix.
 	fn n(&self) -> u8;
 
-	/// Return the cell at row `r` and column `c`, or 0 when the cell is out of
+	/// Returns the cell at row `r` and column `c`, or 0 when the cell is out of
 	/// bounds.
 	fn get(&self, r: u8, c: u8) -> u8;
 
-	/// Set the cell at row `r` and column `c` to `value`. An out-of-bounds
+	/// Sets the cell at row `r` and column `c` to `value`. An out-of-bounds
 	/// write leaves the matrix unchanged.
 	fn set(&mut self, r: u8, c: u8, value: u8);
 
-	/// Fill every cell with `value`.
+	/// Fills every cell with `value`.
 	fn fill(&mut self, value: u8);
 
-	/// Clear every cell to zero.
+	/// Clears every cell to zero.
 	fn clear(&mut self) {
 		self.fill(0);
 	}
@@ -71,7 +71,7 @@ where
 	}
 }
 
-/// Runtime-sized N×N matrix of u8 flags (row-major).
+/// A runtime-sized N×N matrix of `u8` flags in row-major order.
 ///
 /// This is the wire type for the V3 metadata matrix. Its fields are private,
 /// and each constructor builds exactly `n * n` cells, so `data.len() == n * n`
@@ -93,7 +93,7 @@ impl Default for MatrixDyn {
 }
 
 impl MatrixDyn {
-	/// Construct a matrix from `n * n` row-major bytes.
+	/// Constructs a matrix from `n * n` row-major bytes.
 	///
 	/// The length MUST be `n * n`. A zero `n` or another length returns `None`.
 	pub fn from_row_major(n: u8, bytes: impl Into<Vec<u8>>) -> Option<Self> {
@@ -122,17 +122,17 @@ impl MatrixDyn {
 		index.filter(|i| *i < self.data.len())
 	}
 
-	/// Borrow the underlying row-major bytes.
+	/// Borrows the underlying row-major bytes.
 	pub fn as_bytes(&self) -> &[u8] {
 		&self.data
 	}
 
-	/// Borrow the underlying row-major bytes mutably.
+	/// Borrows the underlying row-major bytes mutably.
 	pub fn as_bytes_mut(&mut self) -> &mut [u8] {
 		&mut self.data
 	}
 
-	/// Borrow a single row as a slice.
+	/// Borrows a single row as a slice.
 	pub fn row(&self, r: u8) -> Option<&[u8]> {
 		if r >= self.n {
 			return None;
@@ -150,8 +150,8 @@ impl crate::der::FixedTag for MatrixDyn {
 }
 
 impl<'a> crate::der::DecodeValue<'a> for MatrixDyn {
-	/// Read `n` and the row-major bytes within the length of the `SEQUENCE`,
-	/// then hand both to the one constructor, which owns the length check.
+	/// Reads `n` and the row-major bytes within the length of the `SEQUENCE`,
+	/// then hands both to the one constructor, which owns the length check.
 	fn decode_value<R: crate::der::Reader<'a>>(reader: &mut R, header: crate::der::Header) -> crate::der::Result<Self> {
 		use crate::der::asn1::OctetString;
 		use crate::der::Decode;
@@ -207,7 +207,7 @@ impl MatrixLike for MatrixDyn {
 	}
 }
 
-/// Compile-time N×N matrix of u8 flags (row-major).
+/// A compile-time N×N matrix of `u8` flags in row-major order.
 ///
 /// The wire format bounds the dimension to 1..=255. A matrix with `N`
 /// outside that range fails to compile:
@@ -230,12 +230,12 @@ impl<const N: usize> Default for Matrix<N> {
 }
 
 impl<const N: usize> Matrix<N> {
-	/// Create a zero-initialized matrix.
+	/// Creates a zero-initialized matrix.
 	pub fn new() -> Self {
 		Self::default()
 	}
 
-	/// Borrow a row by index.
+	/// Borrows a row by index.
 	pub fn row(&self, r: u8) -> Option<&[u8; N]> {
 		self.data.get(r as usize)
 	}
@@ -273,13 +273,13 @@ macro_rules! validate_n {
 impl<const N: usize> TryFrom<&[u8]> for Matrix<N> {
 	type Error = MatrixError;
 
-	/// Read `N * N` row-major bytes.
+	/// Reads `N * N` row-major bytes.
 	///
 	/// # Errors
 	///
 	/// - [`MatrixError::LengthMismatch`] -- the slice is not exactly `N * N`
-	///   bytes. Padding or dropping bytes would move every cell after the
-	///   first difference.
+	///   bytes. A pad or a cut would move every cell after the first
+	///   difference.
 	fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
 		const { assert_wire_dimension::<N>() };
 
@@ -373,7 +373,7 @@ mod tests {
 		// Paint the identity on any `MatrixLike`.
 		fn paint_diag<M: MatrixLike>(m: &mut M) {
 			let n = m.n();
-			// Zero the off-diagonal cells first.
+			// Clear every cell first, so each off-diagonal cell reads zero.
 			m.clear();
 			for i in 0..n {
 				m.set(i, i, 1);
@@ -446,28 +446,31 @@ mod tests {
 		Ok(())
 	}
 
+	// Wire format compliance (n ∈ [1, 255], data.len == n*n), for four
+	// matrix sizes from 1 to 255.
+	#[cfg(feature = "std")]
+	crate::tb_cases! {
+		fn test_matrix_wire_format_compliance((n, data): (u8, Vec<u8>)) -> crate::error::Result<()> {
+			let expected_len = (n as usize) * (n as usize);
+			assert_eq!(data.len(), expected_len);
+
+			let shaped = MatrixDyn::from_row_major(n, data.clone());
+			let matrix_dyn = shaped.ok_or(crate::testing::error::TestingError::InvariantViolated)?;
+			assert_eq!(matrix_dyn.n(), n);
+			assert_eq!(matrix_dyn.as_bytes(), data.as_slice());
+			Ok(())
+		}
+		cases {
+			one => (1u8, vec![42u8]),
+			two => (2u8, vec![1, 2, 3, 4]),
+			three => (3u8, (0u8..9u8).collect()),
+			largest => (255u8, vec![0u8; 255 * 255]),
+		}
+	}
+
 	#[test]
 	#[cfg(feature = "std")]
 	fn test_matrix_specification_compliance() -> crate::error::Result<()> {
-		// Test data for four matrix sizes, from 1 to 255.
-		let test_matrices = vec![
-			(1u8, vec![42u8]),
-			(2u8, vec![1, 2, 3, 4]),
-			(3u8, (0u8..9u8).collect()),
-			(255u8, vec![0u8; 255 * 255]),
-		];
-
-		// Test 1: Wire format compliance (n ∈ [1, 255], data.len == n*n).
-		for (n, data) in &test_matrices {
-			let expected_len = (*n as usize) * (*n as usize);
-			assert_eq!(data.len(), expected_len);
-
-			let matrix_dyn =
-				MatrixDyn::from_row_major(*n, data.clone()).expect("n*n bytes is the shape the constructor accepts");
-			assert_eq!(matrix_dyn.n(), *n);
-			assert_eq!(matrix_dyn.as_bytes(), data.as_slice());
-		}
-
 		// Test 2: Error handling for an invalid n (n == 0).
 		let invalid_n = MatrixDyn::try_from(0u8);
 		assert!(invalid_n.is_err());

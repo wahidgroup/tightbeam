@@ -44,14 +44,14 @@
 //! cargo test --features "std,testing-fuzz,testing-csp" fuzz::tests
 //! ```
 //!
-//! The key tests, and what each one checks:
+//! Each key test checks one property:
 //! - `oracle_fuzz_from_bytes_reaches_terminal`: the oracle reads bytes as choices up to a terminal state.
 //! - `oracle_coverage_increases_during_fuzzing`: the coverage score rises as the run visits states.
 //! - `oracle_track_state_differs_between_states`: two states give two different hashes.
 //! - `oracle_crash_context_provides_debug_info`: the crash context names the state, trace, and coverage.
 //!
 //! ## IJON Feature Test
-//! Check that the IJON feature compiles and that fuzzing still works:
+//! Check that the IJON feature compiles and that a fuzz run passes with it:
 //! ```bash
 //! cargo test --features "std,testing-fuzz,testing-fuzz-ijon,testing-csp" oracle_ijon_feature_enabled
 //! ```
@@ -165,7 +165,7 @@ impl From<FuzzError> for TestingError {
 /// A `tb_scenario!` body needs the oracle itself, so the collector a guided
 /// run hands it, [`FuzzTraceCollector`], holds one by construction.
 pub trait OracleAccess {
-	/// The CSP oracle this collector was built with.
+	/// The CSP oracle that this collector holds.
 	fn oracle(&self) -> &FuzzContext;
 }
 
@@ -310,7 +310,7 @@ impl OracleAccess for FuzzTraceCollector {
 ///
 /// ## AFL Integration
 /// - AFL discovers code coverage through its compile-time instrumentation.
-/// - The oracle steers AFL toward valid protocol states, so random bytes still form a valid trace.
+/// - The oracle steers AFL toward valid protocol states, so even random bytes form a valid trace.
 /// - [`Self::track_state`] and [`Self::coverage_score`] feed IJON state-space guidance.
 ///
 /// ## Usage Pattern
@@ -375,9 +375,9 @@ impl CspOracle {
 	///
 	/// A terminal state yields an empty list.
 	///
-	/// The list is sorted by event label (through [`Process::enabled`]), so the
-	/// mapping from a byte to an index in [`Self::fuzz_from_bytes`] picks the
-	/// same event on every run. AFL replay and corpus minimization rely on
+	/// [`Process::enabled`] sorts the list by event label, so the mapping from
+	/// a byte to an index in [`Self::fuzz_from_bytes`] picks the same event on
+	/// every run. AFL replay and corpus minimization rely on
 	/// that contract.
 	pub fn valid_events(&self) -> Vec<Event> {
 		if self.is_terminal() {
@@ -488,8 +488,8 @@ impl CspOracle {
 	/// afl::ijon_set!(oracle.track_state());
 	/// ```
 	///
-	/// Through `ijon_set!`, AFL favors inputs that produce a state hash it has
-	/// not seen.
+	/// Through `ijon_set!`, AFL favors inputs that produce an unseen state
+	/// hash.
 	///
 	/// ## When to Use
 	/// - The protocol has a large state space.
@@ -642,7 +642,6 @@ impl CspOracle {
 				return Err(FuzzError::Deadlock { state: self.current_state });
 			}
 
-			// The byte picks the event, modulo the count of valid events.
 			let choice = (input[byte_idx] as usize) % valid.len();
 			let event = valid[choice];
 
@@ -732,7 +731,7 @@ impl FuzzContextInner {
 		self.input.len().saturating_sub(self.cursor)
 	}
 
-	/// Reads `n` bytes without advancing.
+	/// Reads `n` bytes and leaves the cursor in place.
 	///
 	/// # Errors
 	///
@@ -1007,6 +1006,7 @@ impl FuzzContext {
 
 /// Unit tests of the oracle and the fuzz context, which macros group into one
 /// module per concern.
+#[cfg(test)]
 mod tests {
 	use super::*;
 	use crate::urn::Urn;
@@ -1015,7 +1015,6 @@ mod tests {
 
 	/// Builds a one-step process in which `event` moves `S0` to the terminal
 	/// `S1`.
-	#[allow(dead_code)]
 	fn build_simple_process(event: &'static str) -> Process {
 		Process::builder("TestProc")
 			.initial_state(State("S0"))
@@ -1028,7 +1027,6 @@ mod tests {
 
 	/// Builds a two-step process in which `e1` moves `S0` to `S1` and `e2`
 	/// moves `S1` to the terminal `S2`.
-	#[allow(dead_code)]
 	fn build_two_step_process(e1: &'static str, e2: &'static str) -> Process {
 		Process::builder("TestProc")
 			.initial_state(State("S0"))
@@ -1043,7 +1041,6 @@ mod tests {
 
 	/// Builds a three-step process in which `a`, `b`, and `c` move `S0`
 	/// through `S1` and `S2` to the terminal `S3`.
-	#[allow(dead_code)]
 	fn build_three_step_process() -> Process {
 		Process::builder("TestProc")
 			.initial_state(State("S0"))
@@ -1060,7 +1057,6 @@ mod tests {
 
 	/// Builds a choice process in which `choice` moves `S0` to `S1` or `S2`,
 	/// both terminal.
-	#[allow(dead_code)]
 	fn build_choice_process() -> Process {
 		Process::builder("TestProc")
 			.initial_state(State("S0"))
@@ -1076,7 +1072,6 @@ mod tests {
 
 	/// Builds a branching process in which `a`, `b`, and `c` move `S0` to
 	/// `S1`, `S2`, and `S3`, all terminal.
-	#[allow(dead_code)]
 	fn build_branching_process() -> Process {
 		Process::builder("TestProc")
 			.initial_state(State("S0"))
@@ -1095,7 +1090,6 @@ mod tests {
 
 	/// Builds a one-step process whose transition label is the full URN
 	/// `event`, which moves `S0` to the terminal `S1`.
-	#[allow(dead_code)]
 	fn build_urn_step_process(event: Urn<'static>) -> Process {
 		Process::builder("UrnStep")
 			.initial_state(State("S0"))
@@ -1316,9 +1310,8 @@ mod tests {
 						})
 						.collect();
 
-					for trace in &traces {
-						assert_eq!(trace, &traces[0]);
-					}
+					let distinct: std::collections::HashSet<&Vec<super::Event>> = traces.iter().collect();
+					assert_eq!(distinct.len(), 1, "every oracle maps the byte to one trace");
 				}
 
 				#[test]
@@ -1422,35 +1415,24 @@ mod tests {
 	macro_rules! generate_advanced_tests {
 		($module_name:ident) => {
 			mod $module_name {
-				#[test]
-				fn oracle_input_modulo_selection() {
-					let proc = super::build_branching_process();
-					let oracle_ref = super::CspOracle::new(proc.clone());
-					let valid = oracle_ref.valid_events();
-					assert_eq!(valid.len(), 3);
+				// A byte picks the event at `byte % 3` among the three
+				// that `S0` enables, in the name order `a`, `b`, `c`.
+				crate::tb_cases! {
+					fn oracle_input_modulo_selection((input_byte, expected): (u8, super::State)) {
+						let mut oracle = super::CspOracle::new(super::build_branching_process());
 
-					let state_for_choice: Vec<super::State> = (0..3)
-						.map(|choice| {
-							let mut oracle = super::CspOracle::new(proc.clone());
-							oracle
-								.fuzz_from_bytes(&[choice as u8])
-								.expect("oracle accepts a valid choice byte");
-							oracle.current_state()
-						})
-						.collect();
+						let stepped = oracle.fuzz_from_bytes(&[input_byte]);
 
-					let test_cases = vec![
-						(0, 0, "byte=0: 0 % 3 = 0 -> first event"),
-						(1, 1, "byte=1: 1 % 3 = 1 -> second event"),
-						(2, 2, "byte=2: 2 % 3 = 2 -> third event"),
-						(3, 0, "byte=3: 3 % 3 = 0 -> wraps to first"),
-						(255, 0, "byte=255: 255 % 3 = 0 -> wraps to first"),
-					];
+						assert!(stepped.is_ok());
+						assert_eq!(oracle.current_state(), expected);
+					}
 
-					for (input_byte, expected_choice, desc) in test_cases {
-						let mut oracle = super::CspOracle::new(proc.clone());
-						assert!(oracle.fuzz_from_bytes(&[input_byte]).is_ok());
-						assert_eq!(oracle.current_state(), state_for_choice[expected_choice], "{}", desc);
+					cases {
+						first_event => (0, super::State("S1")),
+						second_event => (1, super::State("S2")),
+						third_event => (2, super::State("S3")),
+						wraps_to_the_first_event => (3, super::State("S1")),
+						wraps_from_the_top_byte => (255, super::State("S1")),
 					}
 				}
 
